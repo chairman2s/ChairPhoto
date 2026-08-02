@@ -1,0 +1,144 @@
+[package]
+name = "chairphoto"
+version = "2026.8.0"
+description = "ChairPhoto — catalog-first photo organizer"
+authors = ["Andreas Henden <chairman2s.ah+github@gmail.com>"]
+license = "GPL-3.0-only"
+readme = "../README.md"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+# The `_lib` suffix may seem redundant but it is necessary
+# to make the lib name unique and wouldn't conflict with the bin name.
+# This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
+name = "chairphoto_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+# Optional plugin backends. A feature can be omitted (--no-default-features) to
+# compile that plugin's Rust out of the binary entirely. See docs/plugin-system.md.
+[features]
+default = ["ai", "edit", "raw", "instagram", "collage", "slideshow", "localsend", "map", "faces", "smarttags"]
+ai = ["dep:reqwest"]
+# Send a photo to a device on the LAN over LocalSend's documented v2 HTTP protocol (UDP
+# multicast discovery + prepare-upload/upload). Send-only. Reuses `reqwest` (HTTP) and the
+# already-on tokio "full" (UDP via tokio::net::UdpSocket) — no new deps. See docs/localsend.md.
+localsend = ["dep:reqwest"]
+# Publish to Flickr / SmugMug via their official OAuth 1.0a APIs (HMAC-SHA1 signing +
+# HTTP upload). Pure-Rust deps, so they compile anywhere. Each is a separate module, and
+# neither is in `default` — opt in with `--features flickr,smugmug`.
+flickr = ["dep:reqwest", "dep:hmac", "dep:sha1"]
+smugmug = ["dep:reqwest", "dep:hmac", "dep:sha1"]
+# Browser automation to post an export to Instagram (drives a real Chrome over the
+# DevTools Protocol). Needs Chrome/Chromium at runtime. Pure-Rust deps, so it compiles
+# anywhere; build without it via `--no-default-features --features ai,edit,raw`.
+instagram = ["dep:chromiumoxide", "dep:futures-util", "dep:reqwest"]
+# The basic editor's render engine (crop + tone). No extra deps — `image` is already
+# a core dependency — so this is purely a compile gate. See docs/editing.md.
+edit = []
+# The map & geo-tagging module's backend (polygon geofences + Nominatim reverse-geocoder
+# with an SQLite cache). Uses `reqwest` for the geocoder HTTP client; Leaflet is a
+# frontend-only dep. See docs/map-and-geotagging.md.
+map = ["dep:reqwest"]
+# The collage compositor (justified-mosaic layout + render). No extra deps — `image`
+# is already a core dependency — so this is purely a compile gate. See docs/collage.md.
+collage = []
+# The face-tagging module's backend (ONNX face detection + recognition). Pulls in `ort`
+# (ONNX Runtime) for inference; the runtime shared library is downloaded by `ort`'s default
+# strategy at build/run time. Everything ort-related is gated behind this feature, so
+# `--no-default-features` stays green on machines without it. `reqwest` (already optional) is
+# reused to fetch the model files. See docs/face-tagging.md.
+faces = ["dep:ort", "dep:reqwest"]
+# Optional GPU acceleration for face inference: enables `ort`'s CUDA execution provider
+# (NVIDIA GPUs). Additive — implies `faces`. When compiled in, the session builder tries to
+# register the CUDA EP and falls back to CPU (never crashing) when the CUDA runtime/cuDNN or a
+# GPU is missing; a setting (`faces.force_cpu`) forces CPU even when CUDA is available. The
+# `ort` `download-binaries` strategy fetches a CUDA-enabled ONNX Runtime (cu13/cu12 picked from
+# the detected toolkit). Off by default so the standard build stays CPU-only and portable.
+# See docs/face-tagging.md (CUDA section).
+faces-cuda = ["faces", "ort/cuda"]
+# The Smart Tagging module's backend (local CLIP image embeddings → kNN tag suggestions).
+# Like `faces`, it pulls in `ort` (ONNX Runtime) for local inference and reuses `reqwest`
+# (already optional) to fetch the CLIP model on first use. Everything ort-related is gated
+# behind this feature so `--no-default-features` stays green. See docs/ai-tagging.md (Smart
+# Tagging section).
+smarttags = ["dep:ort", "dep:reqwest"]
+# Optional GPU acceleration for Smart Tagging embedding (NVIDIA CUDA execution provider),
+# mirroring `faces-cuda`. Additive — implies `smarttags`. Falls back to CPU (never crashing)
+# when the CUDA runtime/cuDNN or a GPU is missing.
+smarttags-cuda = ["smarttags", "ort/cuda"]
+# The slideshow → movie engine (renders selected photos to an .mp4 via ffmpeg). No extra
+# Rust deps — it shells out to the external `ffmpeg` binary (detected on PATH at runtime,
+# like exiftool/Chrome) — so this is purely a compile gate. See docs/slideshow.md.
+slideshow = []
+# Full RAW decode via the system LibRaw (FFI), used for full-resolution edited export
+# (docs/editing.md, Phase 3). Needs LibRaw + a working clang/libclang at build time
+# (bindgen reads the installed header so the ABI matches exactly). Build without it on
+# machines that lack LibRaw: `--no-default-features --features ai,edit`.
+raw = []
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+# Only used when the `raw` feature is on (gated inside build.rs by CARGO_FEATURE_RAW);
+# they compile regardless but do no work unless invoked.
+bindgen = "0.70"
+pkg-config = "0.3"
+
+[dependencies]
+tauri = { version = "2", features = ["protocol-asset"] }
+tauri-plugin-opener = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rusqlite = { version = "0.31", features = ["bundled"] }
+uuid = { version = "1", features = ["v4"] }
+walkdir = "2"
+quick-xml = { version = "0.37", features = ["serialize"] }
+tokio = { version = "1", features = ["full"] }
+image = "0.25"
+lru = "0.12"
+thiserror = "2"
+base64 = "0.22"
+xmltree = "0.11"
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+sha2 = "0.10"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+# Only compiled when the `ai`/`instagram`/`flickr`/`smugmug` feature is on (see [features]).
+# Flickr's upload is multipart/form-data, but we build that body by hand (avoids reqwest's
+# `multipart` feature and its uncached `mime_guess` dep).
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"], optional = true }
+# OAuth 1.0a request signing for the Flickr/SmugMug modules (HMAC-SHA1). Pure Rust.
+hmac = { version = "0.12", optional = true }
+sha1 = { version = "0.10", optional = true }
+# Only compiled when the `instagram` feature is on (drives Chrome over CDP, on tokio).
+chromiumoxide = { version = "0.9", optional = true }
+futures-util = { version = "0.3", optional = true }
+tauri-plugin-dialog = "2.7.1"
+# Only compiled when the `faces` feature is on. ONNX Runtime bindings for face detection
+# (YuNet) + embedding (AuraFace). 2.0.0-rc line; default `download-binaries` strategy fetches
+# a prebuilt ONNX Runtime shared library.
+ort = { version = "2.0.0-rc.10", optional = true }
+# Data-parallelism for the face-indexing batch (bounded concurrent detect+embed calls).
+# The connection-per-worker pattern is avoided: rayon runs the CPU-heavy detect step in
+# parallel; DB writes are serialised on the calling thread via a sequential collect pass.
+# Used unconditionally (not just under `faces`) so the test suite compiles without the feature.
+rayon = "1"
+
+# chairphoto:// OS-level deep links (desktop only): deep-link registers the scheme and
+# delivers URLs; single-instance (with its deep-link feature) forwards a second launch's
+# URL argv to the running instance on Linux/Windows.
+[target."cfg(any(target_os = \"macos\", windows, target_os = \"linux\"))".dependencies]
+tauri-plugin-deep-link = "2"
+tauri-plugin-single-instance = { version = "2", features = ["deep-link"] }
+
+# Optimize image-decoding crates even in dev builds. Our own code stays in debug
+# (fast incremental builds), but decoding a 66 MP embedded RAW preview is ~20x
+# slower unoptimized — this brings debug-mode decode close to release speed.
+# These dependencies compile once, so the hit to iteration time is negligible.
+[profile.dev.package.image]
+opt-level = 3
+[profile.dev.package.zune-jpeg]
+opt-level = 3
+[profile.dev.package.zune-core]
+opt-level = 3
+

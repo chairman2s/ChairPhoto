@@ -1,0 +1,526 @@
+/* Statistics module — dashboard of catalog stats.
+   All classes prefixed .st- to avoid collisions with app or other modules. */
+
+.st-root {
+  height: 100%;
+  overflow-y: auto;
+  padding: 20px;
+  background:
+    radial-gradient(1200px 400px at 50% -10%, rgba(59, 130, 246, 0.08), transparent 60%),
+    var(--bg);
+  color: var(--text);
+  font-size: 13px;
+  box-sizing: border-box;
+}
+
+.st-inner {
+  max-width: 1100px;
+  margin: 0 auto;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+/* Entrance animation */
+@media (prefers-reduced-motion: no-preference) {
+  .st-card,
+  .st-stat-card,
+  .st-fact {
+    animation: st-fade-in 0.35s ease both;
+  }
+  @keyframes st-fade-in {
+    from { opacity: 0; transform: translateY(6px) scale(0.995); }
+    to   { opacity: 1; transform: none; }
+  }
+}
+
+/* ── Scope chip ───────────────────────────────────────────────── */
+.st-scope-chip {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 7px 14px;
+  border-radius: 8px;
+  background: rgba(59, 130, 246, 0.10);
+  border: 1px solid rgba(59, 130, 246, 0.28);
+  border-left: 3px solid #3B82F6;
+}
+
+.st-scope-label {
+  font-size: 12px;
+  font-weight: 600;
+  color: #93C5FD;
+  white-space: nowrap;
+}
+
+.st-scope-hint {
+  font-size: 11px;
+  color: var(--text-mute);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* ── Loading / error ──────────────────────────────────────────── */
+.st-loading {
+  color: var(--text-mute);
+  padding: 32px 16px;
+  font-size: 13px;
+}
+
+.st-error {
+  padding: 8px 12px;
+  border-radius: 6px;
+  background: rgba(239, 68, 68, 0.15);
+  border: 1px solid #ef4444;
+  color: #fecaca;
+  font-size: 12px;
+}
+
+/* ── Card ─────────────────────────────────────────────────────── */
+.st-card {
+  position: relative;
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.02), transparent 40%),
+    var(--bg-panel);
+  border: 1px solid var(--border);
+  border-top-color: #3d4c66;
+  border-radius: 12px;
+  padding: 16px;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.25);
+}
+
+/* ── Panel head (card title) ──────────────────────────────────── */
+.st-panel-head {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+  margin-bottom: 12px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.st-footnote {
+  margin-top: 8px;
+  font-size: 11px;
+  color: var(--text-mute);
+}
+
+/* ── Header row — 4 stat cards ────────────────────────────────── */
+.st-header {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 16px;
+}
+
+.st-stat-card {
+  position: relative;
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.02), transparent 40%),
+    var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  overflow: hidden;
+}
+
+.st-stat-card::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 3px;
+}
+.st-accent-blue::before   { background: linear-gradient(90deg, #3B82F6, #60A5FA); }
+.st-accent-violet::before { background: linear-gradient(90deg, #8B5CF6, #a78bfa); }
+.st-accent-amber::before  { background: linear-gradient(90deg, #F59E0B, #fbbf24); }
+.st-accent-teal::before   { background: linear-gradient(90deg, #14B8A6, #2dd4bf); }
+
+.st-stat-num {
+  font-size: 22px;
+  font-weight: 800;
+  font-variant-numeric: tabular-nums;
+  line-height: 1.15;
+  background: linear-gradient(180deg, #ffffff, #cbd5e1);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+.st-stat-sm {
+  font-size: 14px;
+  font-weight: 700;
+  padding-top: 3px;
+}
+
+.st-stat-lbl {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+  color: var(--text-mute);
+}
+
+/* ── Fun-facts strip ──────────────────────────────────────────── */
+.st-facts {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 16px;
+}
+
+.st-fact {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  background: var(--bg-tile);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 12px 14px;
+}
+
+.st-fact-emoji {
+  font-size: 20px;
+  line-height: 1;
+  flex: 0 0 auto;
+}
+
+.st-fact-body { min-width: 0; }
+
+.st-fact-lbl {
+  font-size: 9.5px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-mute);
+  margin-bottom: 2px;
+}
+
+.st-fact-val {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* ── Two-column grid ──────────────────────────────────────────── */
+.st-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 16px;
+}
+
+/* ── Area timeline (hero) ─────────────────────────────────────── */
+.st-area-wrap {
+  position: relative;
+}
+.st-area-svg {
+  width: 100%;
+  display: block;
+  overflow: visible;
+}
+.st-area-line {
+  stroke: #60A5FA;
+  stroke-width: 2;
+  stroke-linejoin: round;
+  stroke-linecap: round;
+  vector-effect: non-scaling-stroke;
+}
+.st-grid-line {
+  stroke: rgba(148, 163, 184, 0.14);
+  stroke-width: 1;
+  vector-effect: non-scaling-stroke;
+}
+.st-grid-tick {
+  stroke: rgba(148, 163, 184, 0.08);
+  stroke-width: 1;
+  vector-effect: non-scaling-stroke;
+}
+.st-grid-label {
+  fill: var(--text-mute);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+.st-hover-line {
+  stroke: rgba(147, 197, 253, 0.5);
+  stroke-width: 1;
+  vector-effect: non-scaling-stroke;
+}
+.st-hover-dot {
+  fill: #93C5FD;
+  stroke: var(--bg-panel);
+  stroke-width: 2;
+}
+.st-tick {
+  fill: var(--text-mute);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+.st-area-readout {
+  position: absolute;
+  top: 4px;
+  right: 8px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-dim);
+  background: rgba(15, 23, 42, 0.7);
+  padding: 2px 8px;
+  border-radius: 999px;
+  pointer-events: none;
+  font-variant-numeric: tabular-nums;
+}
+
+/* ── Radial clock ─────────────────────────────────────────────── */
+.st-clock-wrap {
+  display: flex;
+  justify-content: center;
+  padding: 4px 0;
+}
+.st-clock-svg {
+  width: 100%;
+  height: auto;
+}
+.st-clock-seg {
+  transition: filter 0.1s;
+}
+.st-clock-seg:hover {
+  filter: brightness(1.25);
+}
+.st-clock-ring-lbl {
+  fill: var(--text-mute);
+  font-size: 10px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+.st-clock-center-num {
+  fill: var(--text);
+  font-size: 22px;
+  font-weight: 800;
+  font-variant-numeric: tabular-nums;
+}
+.st-clock-center-sub {
+  fill: var(--text-mute);
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+/* ── Vertical gradient bars ───────────────────────────────────── */
+.st-vbars {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.st-vbars-svg {
+  width: 100%;
+  display: block;
+  overflow: visible;
+}
+.st-vbar-peaknum {
+  fill: #93C5FD;
+  font-size: 7px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+.st-vbars-labels {
+  display: flex;
+  justify-content: space-around;
+}
+.st-vbar-lbl {
+  flex: 1 1 0;
+  text-align: center;
+  font-size: 11px;
+  color: var(--text-mute);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.st-vbar-lbl.st-star {
+  color: var(--star, #ffd700);
+  font-size: 9px;
+  letter-spacing: -1px;
+}
+
+/* ── Camera donut ─────────────────────────────────────────────── */
+.st-camera-split {
+  display: grid;
+  grid-template-columns: 200px 1fr;
+  gap: 20px;
+  align-items: center;
+}
+@media (max-width: 640px) {
+  .st-camera-split { grid-template-columns: 1fr; }
+}
+.st-donut-wrap {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+}
+.st-donut-svg {
+  width: 100%;
+  height: auto;
+}
+.st-donut-num {
+  fill: var(--text);
+  font-size: 24px;
+  font-weight: 800;
+  font-variant-numeric: tabular-nums;
+}
+.st-donut-sub {
+  fill: var(--text-mute);
+  font-size: 8.5px;
+  font-weight: 700;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+}
+.st-donut-legend {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  width: 100%;
+}
+.st-legend-chip {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 11px;
+}
+.st-legend-dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 3px;
+  flex: 0 0 auto;
+}
+.st-legend-name {
+  flex: 1 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-dim);
+}
+.st-legend-pct {
+  color: var(--text-mute);
+  font-variant-numeric: tabular-nums;
+}
+.st-camera-list { min-width: 0; }
+
+/* ── Ranked list ──────────────────────────────────────────────── */
+.st-rank-list {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+}
+
+.st-rank-row {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 3px 4px;
+  margin: 0 -4px;
+  border: none;
+  background: transparent;
+  color: var(--text);
+  cursor: default;
+  text-align: left;
+  width: 100%;
+  border-radius: 6px;
+}
+
+.st-rank-row.clickable { cursor: pointer; }
+.st-rank-row.clickable:hover {
+  background: rgba(59, 130, 246, 0.08);
+}
+
+.st-rank-num {
+  flex: 0 0 16px;
+  text-align: right;
+  font-size: 11px;
+  color: var(--text-mute);
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+}
+
+.st-rank-name {
+  flex: 0 0 130px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text);
+  font-size: 12px;
+}
+.st-rank-row.clickable .st-rank-name {
+  text-decoration: underline;
+  text-decoration-color: transparent;
+  text-underline-offset: 2px;
+  transition: text-decoration-color 0.12s;
+}
+.st-rank-row.clickable:hover .st-rank-name {
+  text-decoration-color: var(--text-mute);
+}
+
+.st-rank-track {
+  flex: 1 1 auto;
+  height: 6px;
+  border-radius: 999px;
+  background: #243049;
+  overflow: hidden;
+}
+
+.st-rank-fill {
+  display: block;
+  height: 100%;
+  border-radius: 999px;
+}
+
+/* Per-card hue families */
+.st-hue-blue   .st-rank-fill { background: linear-gradient(90deg, #2563EB, #60A5FA); }
+.st-hue-violet .st-rank-fill { background: linear-gradient(90deg, #7c3aed, #a78bfa); }
+.st-hue-teal   .st-rank-fill { background: linear-gradient(90deg, #0d9488, #2dd4bf); }
+
+/* Top-3 rows slightly brighter */
+.st-hue-blue.top3   .st-rank-fill { background: linear-gradient(90deg, #3B82F6, #93C5FD); }
+.st-hue-violet.top3 .st-rank-fill { background: linear-gradient(90deg, #8B5CF6, #c4b5fd); }
+.st-hue-teal.top3   .st-rank-fill { background: linear-gradient(90deg, #14B8A6, #5eead4); }
+
+.st-rank-count {
+  flex: 0 0 46px;
+  text-align: right;
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+  font-size: 11px;
+  font-weight: 600;
+}
+.st-rank-pct {
+  flex: 0 0 30px;
+  text-align: right;
+  color: var(--text-mute);
+  font-variant-numeric: tabular-nums;
+  font-size: 10px;
+}
+
+.st-rank-more {
+  padding: 4px 4px 0;
+  font-size: 11px;
+  color: var(--text-mute);
+  font-style: italic;
+}
+
+/* ── Empty state ──────────────────────────────────────────────── */
+.st-empty {
+  color: var(--text-mute);
+  font-size: 12px;
+  padding: 16px 0;
+  text-align: center;
+}
+
+.st-star {
+  color: var(--star, #ffd700);
+}

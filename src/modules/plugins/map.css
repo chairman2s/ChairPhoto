@@ -1,0 +1,556 @@
+/* Map module — full-surface Leaflet map view. All classes prefixed .mp- to avoid
+   collisions with the app's own rules and with Leaflet's own .leaflet-* classes. */
+
+/* ── Root layout ─────────────────────────────────────────────── */
+.mp-root {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  width: 100%;
+  min-height: 0;
+  position: relative;
+  background: var(--bg);
+  color: var(--text);
+  font-size: 13px;
+}
+
+/* ── The Leaflet map container ───────────────────────────────── */
+.mp-map {
+  flex: 1 1 auto;
+  min-height: 0;
+  position: relative;
+  z-index: 0;
+}
+
+/* Drawing mode: crosshair cursor on the map. */
+.mp-map.mp-map-drawing {
+  cursor: crosshair;
+}
+.mp-map.mp-map-drawing .leaflet-container {
+  cursor: crosshair !important;
+}
+
+/* Make sure Leaflet tiles fill the container */
+.mp-map .leaflet-container {
+  height: 100%;
+  width: 100%;
+  background: #1e293b;
+}
+
+/* ── Status / loading overlay ────────────────────────────────── */
+.mp-overlay {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  z-index: 500;
+  padding: 10px 18px;
+  border-radius: var(--r, 8px);
+  background: rgba(30, 41, 59, 0.9);
+  border: 1px solid var(--border);
+  color: var(--text);
+  font-size: 13px;
+  pointer-events: none;
+}
+
+.mp-error {
+  position: absolute;
+  top: 12px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 500;
+  padding: 8px 14px;
+  border-radius: var(--r-sm, 6px);
+  background: rgba(239, 68, 68, 0.18);
+  border: 1px solid #ef4444;
+  color: #fecaca;
+  font-size: 12px;
+  max-width: 460px;
+  text-align: center;
+  pointer-events: none;
+}
+
+/* ── Bottom status strip ─────────────────────────────────────── */
+.mp-status {
+  flex: 0 0 auto;
+  height: 26px;
+  display: flex;
+  align-items: center;
+  padding: 0 12px;
+  border-top: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--text-mute);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  gap: 12px;
+}
+
+.mp-status-drawing {
+  color: #3b82f6;
+  font-weight: 600;
+}
+
+/* ── Empty state ─────────────────────────────────────────────── */
+.mp-empty {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  z-index: 400;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  color: var(--text-mute);
+  font-size: 13px;
+  pointer-events: none;
+}
+
+.mp-empty-icon {
+  font-size: 40px;
+  line-height: 1;
+  opacity: 0.4;
+}
+
+/* ── Shared button base ──────────────────────────────────────── */
+.mp-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 6px 12px;
+  border-radius: var(--r-sm, 6px);
+  border: 1px solid var(--border);
+  background: var(--bg-panel);
+  color: var(--text);
+  font-size: 12px;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background 0.1s, border-color 0.1s;
+  user-select: none;
+}
+.mp-btn:hover:not(:disabled) {
+  background: var(--bg);
+  border-color: var(--accent);
+}
+.mp-btn:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+.mp-btn-primary {
+  background: var(--grad-primary, var(--accent));
+  border-color: transparent;
+  color: #fff;
+}
+.mp-btn-primary:hover:not(:disabled) {
+  opacity: 0.88;
+  background: var(--grad-primary, var(--accent));
+}
+.mp-btn-danger {
+  color: #ef4444;
+  border-color: rgba(239, 68, 68, 0.3);
+}
+.mp-btn-danger:hover:not(:disabled) {
+  background: rgba(239, 68, 68, 0.1);
+  border-color: #ef4444;
+}
+.mp-btn-active {
+  background: rgba(59, 130, 246, 0.15);
+  border-color: #3b82f6;
+  color: #3b82f6;
+}
+.mp-btn-sm {
+  padding: 4px 10px;
+  font-size: 12px;
+}
+.mp-btn-xs {
+  padding: 3px 8px;
+  font-size: 11px;
+}
+
+/* ── Fence list panel (left-side overlay) ────────────────────── */
+.mp-fence-panel {
+  position: absolute;
+  top: 10px;
+  left: 10px;
+  z-index: 600;
+  width: 240px;
+  max-height: calc(100% - 46px); /* leave room for status strip */
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+  background: var(--bg-panel, rgba(20, 28, 40, 0.95));
+  border: 1px solid var(--border);
+  border-radius: var(--r, 8px);
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
+  overflow: hidden;
+}
+
+.mp-fence-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
+.mp-fence-title {
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--text);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.mp-fence-empty {
+  padding: 10px;
+  font-size: 11px;
+  color: var(--text-mute);
+  line-height: 1.5;
+}
+
+.mp-fence-drawing-hint {
+  padding: 8px 10px;
+  font-size: 11px;
+  color: #3b82f6;
+  background: rgba(59, 130, 246, 0.08);
+  border-bottom: 1px solid rgba(59, 130, 246, 0.2);
+  line-height: 1.5;
+  flex-shrink: 0;
+}
+
+.mp-fence-list {
+  flex: 1 1 auto;
+  overflow-y: auto;
+  min-height: 0;
+}
+
+.mp-fence-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--border);
+  cursor: pointer;
+  transition: background 0.1s;
+}
+.mp-fence-item:last-child {
+  border-bottom: none;
+}
+.mp-fence-item:hover {
+  background: var(--bg-hover, rgba(255, 255, 255, 0.04));
+}
+.mp-fence-item-selected {
+  background: rgba(59, 130, 246, 0.1);
+  border-left: 3px solid #3b82f6;
+}
+.mp-fence-item-selected.mp-fence-item {
+  padding-left: 7px; /* compensate for the 3px left border */
+}
+
+.mp-fence-item-color {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  margin-top: 3px;
+  flex-shrink: 0;
+}
+
+.mp-fence-item-body {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.mp-fence-item-name {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.mp-fence-item-path {
+  font-size: 10px;
+  color: var(--text-mute);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.mp-fence-item-actions {
+  display: flex;
+  gap: 4px;
+  margin-top: 5px;
+  flex-wrap: wrap;
+}
+
+.mp-fence-footer {
+  padding: 8px 10px;
+  border-top: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
+/* ── Fence editor dialog ─────────────────────────────────────── */
+.mp-dialog-backdrop {
+  position: absolute;
+  inset: 0;
+  z-index: 800;
+  background: rgba(0, 0, 0, 0.5);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.mp-dialog {
+  background: var(--bg-panel, #1e293b);
+  border: 1px solid var(--border);
+  border-radius: var(--r, 8px);
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
+  padding: 20px;
+  width: 340px;
+  max-width: 90vw;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.mp-dialog-title {
+  font-size: 14px;
+  font-weight: 700;
+  color: var(--text);
+}
+
+.mp-dialog-row {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.mp-dialog-label {
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+  color: var(--text-mute);
+}
+
+.mp-dialog-input {
+  padding: 7px 10px;
+  border-radius: var(--r-sm, 6px);
+  border: 1px solid var(--border);
+  background: var(--bg, #0f172a);
+  color: var(--text);
+  font-size: 13px;
+  outline: none;
+  width: 100%;
+  box-sizing: border-box;
+}
+.mp-dialog-input:focus {
+  border-color: var(--accent, #3b82f6);
+}
+
+.mp-dialog-hint {
+  font-size: 11px;
+  color: var(--text-mute);
+  line-height: 1.5;
+}
+
+.mp-dialog-error {
+  font-size: 11px;
+  color: #ef4444;
+  padding: 6px 8px;
+  border-radius: var(--r-sm, 6px);
+  background: rgba(239, 68, 68, 0.1);
+  border: 1px solid rgba(239, 68, 68, 0.3);
+}
+
+.mp-dialog-actions {
+  display: flex;
+  gap: 8px;
+}
+
+/* ── Bottom-docked filmstrip ─────────────────────────────────── */
+.mp-filmstrip {
+  flex: 0 0 auto;
+  display: flex;
+  flex-direction: column;
+  border-top: 1px solid var(--border);
+  background: var(--bg-panel, rgba(20, 28, 40, 0.97));
+  z-index: 600;
+  max-height: 160px;
+}
+
+/* When the filmstrip is open the map should not fill all remaining height; instead it
+   shares the column with the strip and the status bar. The flex layout on .mp-root
+   already handles this — the strip is flex: 0 0 auto so the map (flex: 1) shrinks. */
+.mp-map.mp-map-with-strip {
+  /* No extra rule needed — flex: 1 1 auto already yields space to siblings. */
+}
+
+.mp-filmstrip-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+  gap: 8px;
+}
+
+.mp-filmstrip-count {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text);
+  white-space: nowrap;
+}
+
+.mp-filmstrip-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.mp-filmstrip-close {
+  font-size: 16px;
+  line-height: 1;
+  padding: 2px 8px;
+}
+
+/* Horizontal scrollable row of thumb buttons */
+.mp-filmstrip-row {
+  display: flex;
+  flex-direction: row;
+  gap: 4px;
+  padding: 6px 8px;
+  overflow-x: auto;
+  overflow-y: hidden;
+  flex: 1 1 auto;
+  min-height: 0;
+  scroll-behavior: smooth;
+  /* Use thin scrollbar so the strip stays compact */
+  scrollbar-width: thin;
+  scrollbar-color: var(--border) transparent;
+}
+
+.mp-filmstrip-row::-webkit-scrollbar {
+  height: 4px;
+}
+.mp-filmstrip-row::-webkit-scrollbar-track {
+  background: transparent;
+}
+.mp-filmstrip-row::-webkit-scrollbar-thumb {
+  background: var(--border);
+  border-radius: 2px;
+}
+
+/* Individual thumb button */
+.mp-filmstrip-thumb {
+  flex: 0 0 auto;
+  width: 88px;
+  height: 88px;
+  border-radius: var(--r-sm, 6px);
+  border: 2px solid transparent;
+  background: var(--bg, #0f172a);
+  cursor: pointer;
+  padding: 0;
+  overflow: hidden;
+  position: relative;
+  transition: border-color 0.12s;
+}
+
+.mp-filmstrip-thumb:hover {
+  border-color: var(--accent, #3b82f6);
+}
+
+.mp-filmstrip-thumb-active {
+  border-color: var(--accent, #3b82f6);
+  box-shadow: 0 0 0 1px var(--accent, #3b82f6);
+}
+
+.mp-filmstrip-thumb-img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+
+/* ── Settings panel (in Preferences) ────────────────────────── */
+.mp-settings {
+  padding: 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.mp-settings-title {
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--text);
+}
+
+.mp-settings-row {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.mp-settings-label {
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+  color: var(--text-mute);
+}
+
+.mp-settings-input {
+  padding: 7px 10px;
+  border-radius: var(--r-sm, 6px);
+  border: 1px solid var(--border);
+  background: var(--bg-panel);
+  color: var(--text);
+  font-size: 13px;
+  outline: none;
+  width: 100%;
+  box-sizing: border-box;
+}
+
+.mp-settings-input:focus {
+  border-color: var(--accent);
+}
+
+.mp-settings-hint {
+  font-size: 11px;
+  color: var(--text-mute);
+  line-height: 1.5;
+}
+
+.mp-settings-btn {
+  padding: 8px 14px;
+  border-radius: var(--r-sm, 6px);
+  border: 1px solid var(--border);
+  background: var(--bg-panel);
+  color: var(--text);
+  font-size: 13px;
+  cursor: pointer;
+  align-self: flex-start;
+}
+
+.mp-settings-btn:hover {
+  background: var(--bg);
+  border-color: var(--accent);
+}
+
+.mp-settings-btn-primary {
+  background: var(--grad-primary, var(--accent));
+  border-color: transparent;
+  color: #fff;
+}
+
+.mp-settings-btn-primary:hover {
+  opacity: 0.88;
+  background: var(--grad-primary, var(--accent));
+}

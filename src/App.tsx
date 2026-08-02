@@ -1,0 +1,1884 @@
+import { useCallback, useEffect, useRef, useState } from "react";
+import { confirm } from "@tauri-apps/plugin-dialog";
+import {
+  analyzeBurstSharpness,
+  applyAutoTags,
+  assignTag,
+  cacheImages,
+  CullingFilter,
+  ingestFromCard,
+  DeepLinkView,
+  getPhotoByUuid,
+  initCatalog,
+  listPhotos,
+  onCatalogSwitched,
+  onDeepLinkPhoto,
+  onDeepLinkTag,
+  PhotoSort,
+  PhotoVersion,
+  listTags,
+  moveTag,
+  setTagPrivate,
+  rotatePhoto,
+  onCacheProgress,
+  onDevelopProgress,
+  onImportProgress,
+  onScanProgress,
+  rescanLibrary,
+  revealPhoto,
+  videoServerPort,
+  relocatePhoto,
+  removePhotoFromCatalog,
+  removeTag,
+  restorePhoto,
+  pickFile,
+  getLibraryRoot,
+  setLabel,
+  setPickState,
+  setRating,
+  TagWithCount,
+} from "./modules/api";
+import type { Photo, ToolbarAction } from "./modules/registry";
+
+// Human label for a photo's storage state (shown in the right-click menu / loupe).
+function storageLabel(s?: StorageStatus): string {
+  switch (s) {
+    case "localOnly":
+      return "On local disk";
+    case "backedUp":
+      return "Local + NAS backup";
+    case "archived":
+      return "On NAS";
+    case "offline":
+      return "On NAS (offline)";
+    case "missing":
+      return "Missing — no copy found";
+    default:
+      return "";
+  }
+}
+import {
+  addPhotosToAlbum,
+  applyOffloadPolicy,
+  getSetting,
+  listPendingOperations,
+  listVolumes,
+  photoStatuses,
+  reconcileNow,
+  StorageStatus,
+  StorageTier,
+  versionCounts,
+} from "./modules/api";
+import { CatalogGrid } from "./components/CatalogGrid";
+import { Splash, BOOT_STAGES } from "./components/Splash";
+import { TagPanel } from "./components/TagPanel";
+import { AlbumsPanel } from "./components/AlbumsPanel";
+import { SmartAlbumsPanel } from "./components/SmartAlbumsPanel";
+import { BatchesPanel } from "./components/BatchesPanel";
+import { FilterBar } from "./components/FilterBar";
+import { TagEditor } from "./components/TagEditor";
+import { PhotoInspector } from "./components/PhotoInspector";
+import { ZoomableImage } from "./components/ZoomableImage";
+import { QuickTagBar } from "./components/QuickTagBar";
+import { TagGroupsManager } from "./components/TagGroupsManager";
+import { broadcastPhoto, onLoupeReady, openLoupeWindow } from "./modules/loupe";
+import { prefetch, isVideoPath, videoUrl, setVideoPort } from "./modules/previewCache";
+import {
+  activeEditRenderer,
+  initHost,
+  mainViews,
+  panelsForSlot,
+  setActiveVersion as setHostActiveVersion,
+  setChangeSink,
+  setEditingTagContext,
+  setFilterContext,
+  setNavSink,
+  setSelection,
+  toolbarActions,
+  activateToolbarAction,
+  useHost,
+} from "./modules/host";
+import { BUNDLED_MODULES } from "./modules/bundled";
+import { Preferences } from "./components/Preferences";
+import { ExportPanel } from "./components/ExportPanel";
+import { PublishDialog } from "./components/PublishDialog";
+import { ImportPanel } from "./components/ImportPanel";
+import { BundleExportDialog } from "./components/BundleExportDialog";
+import { BundleImportDialog } from "./components/BundleImportDialog";
+import { CatalogSwitcher } from "./components/CatalogSwitcher";
+import { EditorView } from "./components/EditorView";
+import { parseEdit } from "./modules/editing";
+import { ImportBatch } from "./modules/api";
+import "./App.css";
+
+const FILTERS: CullingFilter[] = ["all", "unrated", "pick", "reject", "edited"];
+
+// Single-key culling shortcuts, ported from the old app's review shortcuts.
+const COLOR_KEYS: Record<string, string> = {
+  r: "Red",
+  y: "Yellow",
+  g: "Green",
+  b: "Blue",
+  v: "Purple",
+  n: "",
+};
+
+export default function App() {
+  useHost(); // re-render when modules contribute/remove views & other contributions
+  const [ready, setReady] = useState(false);
+  // Startup splash: the current boot stage (null = boot finished, splash fades out).
+  const [bootStage, setBootStage] = useState<string | null>(BOOT_STAGES[0]);
+  // The splash ends only when BOTH the init chain (catalog+modules) and the first photo
+  // list are in — whichever finishes last dismisses it.
+  const bootDone = useRef({ init: false, photos: false });
+  const finishBootPart = (part: "init" | "photos") => {
+    bootDone.current[part] = true;
+    if (bootDone.current.init && bootDone.current.photos) setBootStage(null);
+  };
+  const [status, setStatus] = useState("");
+  const [photos, setPhotos] = useState<Photo[]>([]);
+  const [statuses, setStatuses] = useState<Map<number, StorageStatus>>(new Map());
+  const [versionCnt, setVersionCounts] = useState<Map<number, number>>(new Map());
+  // Per-photo thumbnail cache-bust, bumped after a photo's file is recovered
+  // (relocate / retrieve-from-NAS) so its tile refreshes instead of staying black.
+  const [thumbBusts, setThumbBusts] = useState<Map<number, number>>(new Map());
+  const bustThumb = useCallback((id: number) => {
+    setThumbBusts((m) => new Map(m).set(id, (m.get(id) ?? 0) + 1));
+  }, []);
+  // Non-destructive orientation fix: rotate the displayed image by ±90° (or 180°), then
+  // bust the photo's cached image so the grid tile and loupe re-fetch the new orientation.
+  const rotateSelected = useCallback(
+    (id: number, delta: number) => {
+      rotatePhoto(id, delta)
+        .then(() => bustThumb(id))
+        .catch((e) => setStatus(`Rotate failed: ${e}`));
+    },
+    [bustThumb],
+  );
+  // Editing: the selected version (null = Original), the rendered loupe src for it, and
+  // the version currently open in the editor modal.
+  const [activeVersion, setActiveVersion] = useState<PhotoVersion | null>(null);
+  const [editedSrc, setEditedSrc] = useState<string>("");
+  const [develop, setDevelop] = useState(false); // the Develop (editor) view is active
+  const [tags, setTags] = useState<TagWithCount[]>([]);
+  const [activeTagId, setActiveTagId] = useState<number | null>(null);
+  const [activeAlbumId, setActiveAlbumId] = useState<number | null>(null);
+  const [albumsKey, setAlbumsKey] = useState(0); // bump to refresh album counts
+  const [activeBatchId, setActiveBatchId] = useState<number | null>(null);
+  const [activeBatch, setActiveBatch] = useState<ImportBatch | null>(null);
+  const [batchesKey, setBatchesKey] = useState(0); // bump to refresh batches
+  const [activeSmartAlbumId, setActiveSmartAlbumId] = useState<number | null>(null);
+  const [smartAlbumsKey, setSmartAlbumsKey] = useState(0); // bump to refresh smart-album counts
+  const [filter, setFilter] = useState<CullingFilter>("all");
+  const [storageTier, setStorageTier] = useState<StorageTier>("all");
+  const [activeFacets, setActiveFacets] = useState<string[]>([]);
+  const [photoSort, setPhotoSort] = useState<PhotoSort>("date");
+  // Conservative default: 15.0 (mirrors SOFT_THRESHOLD_DEFAULT in facets.rs).
+  const [softThreshold, setSoftThreshold] = useState<number>(15.0);
+  const [activeCamera, setActiveCamera] = useState<string | null>(null);
+  const [activeLens, setActiveLens] = useState<string | null>(null);
+  // Colour-label filter, OR-combined ("" = the No-label dot). Empty = off.
+  const [activeLabels, setActiveLabels] = useState<string[]>([]);
+  const [selectedId, setSelectedId] = useState<number | null>(null); // active/primary
+  const [selectedIds, setSelectedIds] = useState<number[]>([]); // full selection
+  // Fixed anchor for Shift range selection (mouse Shift-click and Shift+Arrow). Set on any
+  // plain/toggle selection; the range spans anchor↔active while Shift extends it. A ref so
+  // extending doesn't move the anchor and doesn't trigger re-renders.
+  const selectAnchor = useRef<number | null>(null);
+  const [extraPhoto, setExtraPhoto] = useState<Photo | null>(null); // an off-grid photo (stack child) being viewed
+  const [stackOrigin, setStackOrigin] = useState<number | null>(null); // master to return to from a stack-child view
+  const [loupeInline, setLoupeInline] = useState(false);
+  const [cachePreviews, setCachePreviews] = useState(true);
+
+  // Side-panel layout: widths (px) and hidden state, persisted to localStorage.
+  const [leftW, setLeftW] = useState(() => +(localStorage.getItem("panel.leftW") || 250));
+  const [rightW, setRightW] = useState(() => +(localStorage.getItem("panel.rightW") || 300));
+  const [leftHidden, setLeftHidden] = useState(
+    () => localStorage.getItem("panel.leftHidden") === "1",
+  );
+  const [rightHidden, setRightHidden] = useState(
+    () => localStorage.getItem("panel.rightHidden") === "1",
+  );
+  useEffect(() => {
+    localStorage.setItem("panel.leftW", String(leftW));
+    localStorage.setItem("panel.rightW", String(rightW));
+    localStorage.setItem("panel.leftHidden", leftHidden ? "1" : "0");
+    localStorage.setItem("panel.rightHidden", rightHidden ? "1" : "0");
+  }, [leftW, rightW, leftHidden, rightHidden]);
+
+  // Drag a column edge to resize. `side` picks which width to adjust; the right
+  // column grows when dragged left, so its delta is inverted.
+  const startResize = (side: "left" | "right") => (e: React.MouseEvent) => {
+    e.preventDefault();
+    const startX = e.clientX;
+    const startW = side === "left" ? leftW : rightW;
+    const onMove = (ev: MouseEvent) => {
+      const delta = side === "left" ? ev.clientX - startX : startX - ev.clientX;
+      const w = Math.max(140, Math.min(640, startW + delta));
+      if (side === "left") setLeftW(w);
+      else setRightW(w);
+    };
+    const onUp = () => {
+      document.removeEventListener("mousemove", onMove);
+      document.removeEventListener("mouseup", onUp);
+      document.body.style.cursor = "";
+      document.body.style.userSelect = "";
+    };
+    document.body.style.cursor = "col-resize";
+    document.body.style.userSelect = "none";
+    document.addEventListener("mousemove", onMove);
+    document.addEventListener("mouseup", onUp);
+  };
+  const [editingTag, setEditingTag] = useState<TagWithCount | null>(null);
+  const [showCatalogSwitcher, setShowCatalogSwitcher] = useState(false);
+  const [showPrefs, setShowPrefs] = useState(false);
+  const [showExport, setShowExport] = useState(false);
+  const [showPublish, setShowPublish] = useState(false);
+  const [showImport, setShowImport] = useState(false);
+  // Bundle export dialog state — set to the batch to export, null = closed.
+  const [bundleExportBatch, setBundleExportBatch] = useState<ImportBatch | null>(null);
+  // Bundle import dialog open/closed.
+  const [showBundleImport, setShowBundleImport] = useState(false);
+  const [importProgress, setImportProgress] = useState<{ done: number; total: number } | null>(
+    null,
+  );
+  const [scanProgress, setScanProgress] = useState<{
+    phase: string;
+    done: number;
+    total: number;
+  } | null>(null);
+  const [developStatus, setDevelopStatus] = useState<{ phase: string; editor: string } | null>(
+    null,
+  );
+  const [pendingCount, setPendingCount] = useState(0);
+  const reconciling = useRef(false); // guards against overlapping background drains
+  const [tagClipboard, setTagClipboard] = useState<number[]>([]); // copied tag ids
+  const [showGroups, setShowGroups] = useState(false);
+  const [groupsKey, setGroupsKey] = useState(0); // bump to refresh the quick-tag bar
+  const [activeViewId, setActiveViewId] = useState<string | null>(null); // null = Library
+  // A module toolbar action currently open as a modal (its render(close) overlay).
+  const [modalAction, setModalAction] = useState<ToolbarAction | null>(null);
+  // Right-click context menu on a grid tile.
+  const [ctxMenu, setCtxMenu] = useState<{ x: number; y: number; photoId: number } | null>(null);
+
+  // Normally the active photo is the selected grid tile. A stacked child (hidden from the
+  // grid) can also be opened for viewing via `viewPhoto`; it's held in `extraPhoto` so the
+  // loupe/inspector can show it even though it isn't in `photos`.
+  const selected =
+    photos.find((p) => p.id === selectedId) ??
+    (extraPhoto && extraPhoto.id === selectedId ? extraPhoto : null);
+
+  // Full-surface views contributed by modules (e.g. Map). The active one, if its
+  // module is still enabled — otherwise we fall back to the built-in Library view.
+  const moduleViews = mainViews();
+  const activeView = moduleViews.find((v) => v.id === activeViewId) ?? null;
+  // The Basic Editor module gates the Develop view and per-version editing.
+  const canEdit = activeEditRenderer() !== null;
+  const inDevelop = develop && selectedId != null && canEdit;
+
+  // Select a photo with modifier-key semantics: plain = single; Ctrl/Cmd = toggle;
+  // Shift = range from the active anchor. `selectedId` is the active/primary photo
+  // (shown in the inspector/loupe); `selectedIds` is the whole selection.
+  const selectPhoto = (id: number, mods?: { ctrl?: boolean; shift?: boolean }) => {
+    const anchor = selectAnchor.current ?? selectedId;
+    if (mods?.shift && anchor != null) {
+      selectAnchor.current = anchor; // pin it, so further Shift steps span the same origin
+      const a = photos.findIndex((p) => p.id === anchor);
+      const b = photos.findIndex((p) => p.id === id);
+      if (a !== -1 && b !== -1) {
+        const [lo, hi] = a < b ? [a, b] : [b, a];
+        setSelectedIds(photos.slice(lo, hi + 1).map((p) => p.id));
+      }
+    } else if (mods?.ctrl) {
+      setSelectedIds((prev) =>
+        prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id],
+      );
+      selectAnchor.current = id; // subsequent Shift ranges from this toggle
+    } else {
+      setSelectedIds([id]);
+      selectAnchor.current = id;
+    }
+    setSelectedId(id);
+    setExtraPhoto(null); // a grid selection supersedes an off-grid stack-child view
+    setStackOrigin(null);
+  };
+
+  // View any stack member in the loupe. A grid photo (the master) selects normally; a stacked
+  // child is off-grid, so it's held in `extraPhoto` and we remember its master for the loupe's
+  // "Back to original" shortcut.
+  const viewPhoto = (p: Photo) => {
+    if (photos.some((g) => g.id === p.id)) {
+      setExtraPhoto(null);
+      setStackOrigin(null);
+    } else {
+      setExtraPhoto(p);
+      setStackOrigin(p.stackParentId ?? selectedId);
+    }
+    setSelectedId(p.id);
+    setSelectedIds([p.id]);
+    setLoupeInline(true);
+  };
+
+  // Return from a stacked-child view to its master (the original grid photo).
+  const backToOriginal = () => {
+    const origin = stackOrigin;
+    setStackOrigin(null);
+    if (origin != null) selectPhoto(origin);
+  };
+
+  // The version to broadcast to the pop-out loupe: the active version's edit record,
+  // guarded to the selected photo — on photo change the broadcast effect can fire
+  // before the reset-version effect, so a stale other-photo version must not leak.
+  const loupeEditJson =
+    activeVersion && activeVersion.photoId === selectedId ? activeVersion.editJson : null;
+
+  // Keep any open pop-out loupe window in sync with the current selection and the
+  // active version (so picking a version updates the pop-out too), and
+  // re-send when a loupe window announces it just opened.
+  // Also preload neighbours so navigation is instant (the AGENTS.md preload
+  // invariant). We prefetch further ahead than behind, since culling moves forward:
+  // the next 5 photos and the previous 2.
+  useEffect(() => {
+    broadcastPhoto(selectedId, loupeEditJson);
+    if (selectedId == null) return;
+    const idx = photos.findIndex((p) => p.id === selectedId);
+    if (idx === -1) return;
+    for (let d = 1; d <= 5; d++) prefetch(photos[idx + d]?.id);
+    prefetch(photos[idx - 1]?.id);
+    prefetch(photos[idx - 2]?.id);
+  }, [selectedId, loupeEditJson, photos]);
+
+  useEffect(() => {
+    const unlisten = onLoupeReady(() => broadcastPhoto(selectedId, loupeEditJson));
+    return () => {
+      unlisten.then((f) => f());
+    };
+  }, [selectedId, loupeEditJson]);
+
+  // --- chairphoto://<uuid>[/loupe|/develop] deep links ----------------------
+  // A link (e.g. from an Obsidian note) opens/focuses the app on that photo —
+  // in the Library grid by default, or straight into the loupe / Develop view.
+  // Links can arrive before the catalog is open, so buffer the uuid and handle
+  // it once `ready`. Window focus itself is handled Rust-side (single-instance).
+  const pendingDeepLink = useRef<{ uuid: string; view: DeepLinkView } | null>(null);
+  const [deepLinkTick, setDeepLinkTick] = useState(0);
+  const [deepLinkTarget, setDeepLinkTarget] = useState<{
+    photo: Photo;
+    view: DeepLinkView;
+  } | null>(null);
+  useEffect(() => {
+    const unlisten = onDeepLinkPhoto((uuid, view) => {
+      pendingDeepLink.current = { uuid, view };
+      setDeepLinkTick((t) => t + 1);
+    });
+    return () => {
+      unlisten.then((f) => f());
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!ready || !pendingDeepLink.current) return;
+    const { uuid, view } = pendingDeepLink.current;
+    pendingDeepLink.current = null;
+    getPhotoByUuid(uuid)
+      .then((p) => {
+        // The photo may be outside the current scope — clear every primary
+        // filter and chip so the unfiltered grid contains it. Changing these
+        // changes `refresh`'s identity, so the list effect re-fetches.
+        setActiveViewId(null); // back to Library
+        setDevelop(false);
+        setActiveTagId(null);
+        setActiveAlbumId(null);
+        setActiveBatchId(null);
+        setActiveBatch(null);
+        setActiveSmartAlbumId(null);
+        setFilter("all");
+        setStorageTier("all");
+        setActiveFacets([]);
+        setActiveCamera(null);
+        setActiveLens(null);
+        setActiveLabels([]);
+        setDeepLinkTarget({ photo: p, view }); // selection happens once the grid has it
+      })
+      .catch(() => setStatus(`Deep link: no photo ${uuid} in this catalog`));
+  }, [ready, deepLinkTick]);
+
+  // Select the staged target once the (now unfiltered) photo list contains it,
+  // then apply the requested surface. A stacked child never appears in the grid —
+  // view it off-grid via `viewPhoto`. The stackParentId guard keeps the stale-list
+  // race (this effect fires once with the old filtered list) from prematurely
+  // falling back for a grid photo.
+  useEffect(() => {
+    if (!deepLinkTarget) return;
+    const { photo: target, view } = deepLinkTarget;
+    const applyView = () => {
+      // /develop falls back to the Library if no editor module is enabled
+      // (inDevelop requires canEdit); /loupe opens the inline loupe.
+      if (view === "loupe") setLoupeInline(true);
+      else if (view === "develop") setDevelop(true);
+    };
+    if (photos.some((p) => p.id === target.id)) {
+      selectPhoto(target.id);
+      applyView();
+      setDeepLinkTarget(null);
+    } else if (target.stackParentId != null) {
+      viewPhoto(target); // already opens the inline loupe
+      applyView();
+      setDeepLinkTarget(null);
+    }
+    // otherwise: keep waiting — the unfiltered refresh hasn't landed yet.
+  }, [photos, deepLinkTarget]);
+
+  // --- chairphoto://tag/<uuid> deep links -----------------------------------
+  // A link (e.g. from an Obsidian tag note) filters the Library to that tag.
+  // Tags are matched by their stable uuid against the loaded tag tree, so the
+  // link survives renames/moves. Buffer until the tree is in.
+  const pendingTagLink = useRef<string | null>(null);
+  const [tagLinkTick, setTagLinkTick] = useState(0);
+  useEffect(() => {
+    const unlisten = onDeepLinkTag((uuid) => {
+      pendingTagLink.current = uuid;
+      setTagLinkTick((t) => t + 1);
+    });
+    return () => {
+      unlisten.then((f) => f());
+    };
+  }, []);
+  useEffect(() => {
+    if (!ready || !pendingTagLink.current || tags.length === 0) return;
+    const uuid = pendingTagLink.current;
+    pendingTagLink.current = null;
+    const tag = tags.find((t) => t.uuid === uuid);
+    if (!tag) {
+      setStatus(`Deep link: no tag ${uuid} in this catalog`);
+      return;
+    }
+    setActiveViewId(null); // back to Library
+    setDevelop(false);
+    selectTag(tag.id); // clears the other primary scopes
+  }, [ready, tagLinkTick, tags]);
+
+  // Open the default catalog once on startup, then start the plugin host. Each step
+  // reports its boot stage to the splash overlay.
+  useEffect(() => {
+    initCatalog()
+      // Populate auto-tags (e.g. monochrome) for photos imported before the rule.
+      .then(() => {
+        setBootStage(BOOT_STAGES[1]); // Updating auto-tags…
+        return applyAutoTags().catch(() => {});
+      })
+      .then(() => {
+        setBootStage(BOOT_STAGES[2]); // Starting modules…
+        setReady(true);
+        // The sidebar panels (albums / smart albums / batches) and the FilterBar fetch
+        // their lists in mount effects, which fire BEFORE this initCatalog() chain has
+        // opened the catalog — those first fetches fail ("No catalog is open") and are
+        // swallowed. Bump their reload keys now that the catalog is open, mirroring the
+        // catalog-switch path.
+        setAlbumsKey((k) => k + 1);
+        setBatchesKey((k) => k + 1);
+        setSmartAlbumsKey((k) => k + 1);
+        setGroupsKey((k) => k + 1);
+        return initHost(BUNDLED_MODULES);
+      })
+      .then(() => {
+        setBootStage(BOOT_STAGES[3]); // Loading photos…
+        finishBootPart("init");
+      })
+      .catch((e) => {
+        setStatus(`Failed to open catalog: ${e}`);
+        setBootStage(null); // never leave the splash hanging on a failed boot
+      });
+    // Learn the loopback video-server port so the <video> player can stream files.
+    videoServerPort()
+      .then(setVideoPort)
+      .catch(() => {});
+  }, []);
+
+  // Keep the plugin host's notion of the selection in sync, so modules (e.g. AI
+  // tagging) can act on the active photo or the whole multi-selection.
+  useEffect(() => {
+    const sel = photos.filter((p) => selectedIds.includes(p.id));
+    setSelection(sel, selectedId);
+  }, [selectedIds, selectedId, photos]);
+
+  // Keep the host's active-version in sync so publishing modules can default to the
+  // version the user is viewing.
+  useEffect(() => {
+    setHostActiveVersion(activeVersion?.id ?? null);
+  }, [activeVersion]);
+
+  // Keep the host's filter context in sync so modules (e.g. Statistics) can reflect
+  // the active sidebar scope (tag / album / import batch).
+  useEffect(() => {
+    setFilterContext({ tagId: activeTagId, albumId: activeAlbumId, batchId: activeBatchId });
+  }, [activeTagId, activeAlbumId, activeBatchId]);
+
+  // Keep the host's editing-tag in sync so "tag-editor" slot panels (e.g. the
+  // Obsidian tag note) know which tag the tag editor modal is showing.
+  useEffect(() => {
+    setEditingTagContext(editingTag);
+  }, [editingTag]);
+
+  // Dismiss the right-click menu on Escape.
+  useEffect(() => {
+    if (!ctxMenu) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setCtxMenu(null);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [ctxMenu]);
+
+  const refresh = useCallback(async () => {
+    const [nextPhotos, nextTags] = await Promise.all([
+      listPhotos(
+        activeTagId,
+        activeAlbumId,
+        activeBatchId,
+        activeFacets,
+        filter,
+        activeSmartAlbumId,
+        storageTier,
+        activeCamera,
+        activeLens,
+        photoSort,
+        activeLabels,
+      ),
+      listTags(),
+    ]);
+    setPhotos(nextPhotos);
+    setTags(nextTags);
+    const ids = nextPhotos.map((p) => p.id);
+    // Fetch storage status for the visible set (for the grid's local/NAS icons).
+    photoStatuses(ids)
+      .then((pairs) => setStatuses(new Map(pairs)))
+      .catch(() => setStatuses(new Map()));
+    // Version counts for the grid's "N versions" badge.
+    versionCounts(ids)
+      .then((pairs) => setVersionCounts(new Map(pairs)))
+      .catch(() => setVersionCounts(new Map()));
+  }, [activeTagId, activeAlbumId, activeBatchId, activeSmartAlbumId, activeFacets, filter, storageTier, activeCamera, activeLens, activeLabels, photoSort]);
+
+  // --- recovery actions for a photo whose original can't be shown ----------
+  // Shared by the right-click menu and the loupe's "unavailable" state.
+  const photoName = (id: number) =>
+    photos.find((p) => p.id === id)?.path.split("/").pop() ?? `photo ${id}`;
+
+  const relocatePhotoAction = async (id: number) => {
+    const root = await getLibraryRoot().catch(() => undefined);
+    const picked = await pickFile(root);
+    if (!picked) return;
+    try {
+      await relocatePhoto(id, picked);
+      bustThumb(id);
+      await refresh();
+      setStatus("Photo relocated to its new file.");
+    } catch (e) {
+      setStatus(`Couldn't relocate: ${e}`);
+    }
+  };
+
+  const retrieveFromNasAction = async (id: number) => {
+    setStatus("Retrieving from NAS…");
+    try {
+      await restorePhoto(id);
+      bustThumb(id);
+      await refresh();
+      setStatus("Retrieved from NAS.");
+    } catch (e) {
+      setStatus(`Couldn't retrieve from NAS: ${e}`);
+    }
+  };
+
+  const removeFromCatalogAction = async (id: number) => {
+    const ok = await confirm(
+      `Remove "${photoName(id)}" from the catalog? This deletes its catalog entry ` +
+        "(tags, rating, versions) but never deletes the file on disk or the NAS.",
+      { title: "Remove from catalog", kind: "warning" },
+    );
+    if (!ok) return;
+    try {
+      await removePhotoFromCatalog(id);
+      await refresh();
+      setStatus("Removed from catalog (files left untouched).");
+    } catch (e) {
+      setStatus(`Couldn't remove: ${e}`);
+    }
+  };
+
+  // The tag / album / batch / smart-album scopes are mutually exclusive: each is a single
+  // primary filter (the culling chips + facets still AND on top, see docs/smart-albums.md).
+  // Picking one clears the other three.
+  const selectTag = (tagId: number | null) => {
+    setActiveTagId(tagId);
+    if (tagId != null) {
+      setActiveAlbumId(null);
+      setActiveBatchId(null);
+      setActiveBatch(null);
+      setActiveSmartAlbumId(null);
+    }
+  };
+  const selectAlbum = (albumId: number | null) => {
+    setActiveAlbumId(albumId);
+    if (albumId != null) {
+      setActiveTagId(null);
+      setActiveBatchId(null);
+      setActiveBatch(null);
+      setActiveSmartAlbumId(null);
+    }
+  };
+  const selectBatch = (batch: ImportBatch | null) => {
+    setActiveBatchId(batch?.id ?? null);
+    setActiveBatch(batch);
+    if (batch != null) {
+      setActiveTagId(null);
+      setActiveAlbumId(null);
+      setActiveSmartAlbumId(null);
+    }
+  };
+  const selectSmartAlbum = (smartAlbumId: number | null) => {
+    setActiveSmartAlbumId(smartAlbumId);
+    if (smartAlbumId != null) {
+      setActiveTagId(null);
+      setActiveAlbumId(null);
+      setActiveBatchId(null);
+      setActiveBatch(null);
+    }
+  };
+
+  // Add the current selection (or active photo) to an album.
+  const addSelectionToAlbum = async (albumId: number) => {
+    const targets = selectedIds.length
+      ? selectedIds
+      : selectedId != null
+        ? [selectedId]
+        : [];
+    if (!targets.length) return;
+    await addPhotosToAlbum(albumId, targets);
+    setStatus(`Added ${targets.length} to album`);
+    setAlbumsKey((k) => k + 1);
+    await refresh();
+  };
+
+  const firstRefresh = useRef(true);
+  useEffect(() => {
+    if (!ready) return;
+    // Load the soft-threshold setting whenever the catalog or filter changes. It's a
+    // catalog setting (may differ per-catalog) so we read it here, not on module init.
+    getSetting("sharpness.soft_threshold").then((raw) => {
+      const v = raw != null ? parseFloat(raw) : NaN;
+      if (isFinite(v) && v > 0) setSoftThreshold(v);
+      else setSoftThreshold(15.0);
+    }).catch(() => {});
+    const p = refresh();
+    if (firstRefresh.current) {
+      firstRefresh.current = false;
+      // First photo list is in (or failed) — release the splash's "photos" half.
+      p.finally(() => finishBootPart("photos"));
+    }
+  }, [ready, refresh]);
+
+  // Assign a tag to the whole current selection (or the active photo) — used by the
+  // quick-tag bar.
+  const assignToSelection = async (tagId: number) => {
+    const targets = selectedIds.length
+      ? selectedIds
+      : selectedId != null
+        ? [selectedId]
+        : [];
+    for (const id of targets) await assignTag(id, tagId);
+    await refresh();
+    setGroupsKey((k) => k + 1); // refresh the quick-tag bar's "Recently used" group
+  };
+
+  // Remove a tag from the whole selection (mirrors assignToSelection). The inspector's
+  // tag list shows the active photo's tags, but the remove action applies to every
+  // selected photo so multi-select edits don't silently hit only the active one.
+  const removeFromSelection = async (tagId: number) => {
+    const targets = selectedIds.length
+      ? selectedIds
+      : selectedId != null
+        ? [selectedId]
+        : [];
+    for (const id of targets) await removeTag(id, tagId);
+    await refresh();
+    setGroupsKey((k) => k + 1);
+  };
+
+  // Copy/paste tags between photos: snapshot one photo's tag ids, then apply them to the
+  // current selection.
+  const copyTags = (tagIds: number[]) => {
+    setTagClipboard(tagIds);
+    setStatus(
+      tagIds.length ? `Copied ${tagIds.length} tag(s)` : "That photo has no tags to copy",
+    );
+  };
+  const pasteTagsToSelection = async () => {
+    if (tagClipboard.length === 0) return;
+    const targets = selectedIds.length
+      ? selectedIds
+      : selectedId != null
+        ? [selectedId]
+        : [];
+    if (targets.length === 0) return;
+    for (const id of targets) for (const tagId of tagClipboard) await assignTag(id, tagId);
+    await refresh();
+    setGroupsKey((k) => k + 1);
+    setStatus(`Pasted ${tagClipboard.length} tag(s) onto ${targets.length} photo(s)`);
+  };
+
+  // Let modules (e.g. AI tagging) ask the app to refresh after they change data.
+  // Also refresh the quick-tag bar so module tagging updates "Recently used".
+  useEffect(() => {
+    setChangeSink(() => {
+      refresh();
+      setGroupsKey((k) => k + 1);
+      // Smart-album membership is derived, so any data change can shift its counts.
+      setSmartAlbumsKey((k) => k + 1);
+    });
+  }, [refresh]);
+
+  // Let a module (Tag Graph) navigate the Library: filter by a tag, or select a photo.
+  // selectPhotoSilent sets the selection without switching the active view (used by the
+  // Map filmstrip so the pop-out loupe follows without leaving the map).
+  useEffect(() => {
+    setNavSink({
+      filterByTag: (tagId) => {
+        setActiveViewId(null); // back to Library
+        selectTag(tagId);
+      },
+      selectPhoto: (photoId) => {
+        setActiveViewId(null);
+        setSelectedId(photoId);
+        setSelectedIds([photoId]);
+      },
+      selectPhotoSilent: (photoId) => {
+        // Update app-wide selection (loupe follows), but do NOT change the active view.
+        setSelectedId(photoId);
+        setSelectedIds([photoId]);
+      },
+    });
+  }, []);
+
+  const refreshPending = useCallback(async () => {
+    try {
+      // Count only actionable (pending) ops — a permanently-failed op shouldn't keep
+      // the badge lit or trigger the prompt forever.
+      const ops = await listPendingOperations();
+      setPendingCount(ops.filter((o) => o.status === "pending").length);
+    } catch {
+      setPendingCount(0);
+    }
+  }, []);
+
+  // Drain the backup queue in the background (no blocking dialog). Guarded so
+  // overlapping triggers (focus events) don't start parallel drains.
+  const runReconcile = useCallback(async () => {
+    if (reconciling.current) return;
+    reconciling.current = true;
+    try {
+      const before = (await listPendingOperations()).filter((o) => o.status === "pending").length;
+      if (before > 0) setStatus(`Backing up ${before} to NAS…`);
+      const result = await reconcileNow();
+      if (!result.skippedOffline && result.ran + result.failed > 0) {
+        setStatus(`Backed up ${result.ran}` + (result.failed ? `, ${result.failed} failed` : ""));
+      }
+      // Now that backups are current, apply the "keep last N days local" policy: offload
+      // older, backed-up photos to free local space. No-op when the policy is off or the
+      // NAS is unreachable.
+      if (!result.skippedOffline) {
+        try {
+          const n = await applyOffloadPolicy();
+          if (n > 0) setStatus(`Offloaded ${n} older photo(s) to the NAS`);
+        } catch {
+          /* offload is best-effort; never block the UI */
+        }
+      }
+      await Promise.all([refresh(), refreshPending()]);
+    } catch (e) {
+      setStatus(`Backup failed: ${e}`);
+    } finally {
+      reconciling.current = false;
+    }
+  }, [refresh, refreshPending]);
+
+  // On launch / window focus: if a backup volume is reachable and ops are queued, run
+  // the backup in the background (no modal). Refresh the pending count regardless.
+  const checkReconcile = useCallback(async () => {
+    try {
+      const [ops, volumes] = await Promise.all([listPendingOperations(), listVolumes()]);
+      const pending = ops.filter((o) => o.status === "pending").length;
+      setPendingCount(pending);
+      const backupReachable = volumes.some((v) => v.kind === "backup" && v.reachable);
+      if (pending > 0 && backupReachable) runReconcile();
+    } catch {
+      /* ignore */
+    }
+  }, [runReconcile]);
+
+  // Detect the NAS on launch and whenever the window regains focus.
+  useEffect(() => {
+    if (!ready) return;
+    refreshPending();
+    checkReconcile();
+    const onFocus = () => checkReconcile();
+    window.addEventListener("focus", onFocus);
+    return () => window.removeEventListener("focus", onFocus);
+  }, [ready, checkReconcile, refreshPending]);
+
+  const onScan = async () => {
+    setStatus("Scanning library…");
+    try {
+      const result = await rescanLibrary();
+      setStatus(
+        `Scanned ${result.scanned}, imported ${result.imported} (${result.created} new)` +
+          (result.errors ? `, ${result.errors} errors` : ""),
+      );
+      await refresh();
+      refreshPending(); // scan auto-enqueues backups for new photos
+      setBatchesKey((k) => k + 1); // a scan may have created a new import batch
+      // Pre-cache so browsing is instant. Thumbnails always; previews if opted in.
+      // Progress is shown via the cache:progress listener below.
+      cacheImages(cachePreviews)
+        .then(() => setStatus("Cache ready"))
+        .catch((e) => setStatus(`Cache failed: ${e}`));
+    } catch (e) {
+      setStatus(`Scan failed: ${e}`);
+    }
+  };
+
+  // Burst-relative sharpness analysis (H16e): run over the current selection, or
+  // all visible photos if nothing is selected. Groups into H15b clusters, flags
+  // soft-in-burst / sharpest-of-burst, then refreshes the grid.
+  const runBurstAnalysis = async () => {
+    const targets = selectedIds.length
+      ? selectedIds
+      : photos.map((p) => p.id);
+    if (targets.length === 0) {
+      setStatus("No photos to analyse — scan or select some first.");
+      return;
+    }
+    setStatus(`Analysing burst sharpness for ${targets.length} photos…`);
+    try {
+      const result = await analyzeBurstSharpness(targets);
+      setStatus(
+        `Burst analysis done — ${result.clusters} cluster(s), ` +
+          `${result.flaggedBest} best frame(s), ${result.flaggedSoft} soft-in-burst.`,
+      );
+      await refresh();
+    } catch (e) {
+      setStatus(`Burst analysis failed: ${e}`);
+    }
+  };
+
+  // Surface batch-cache progress in the status bar.
+  useEffect(() => {
+    const unlisten = onCacheProgress((p) => {
+      setStatus(
+        p.done < p.total ? `Caching ${p.done}/${p.total}…` : `Cache ready (${p.total})`,
+      );
+    });
+    return () => {
+      unlisten.then((f) => f());
+    };
+  }, []);
+
+  // Card import runs in the background (the dialog closes immediately) — track its copy
+  // progress for the topbar indicator.
+  useEffect(() => {
+    const unlisten = onImportProgress((p) => setImportProgress(p));
+    return () => {
+      unlisten.then((f) => f());
+    };
+  }, []);
+
+  // Throttle for live-scan grid refreshes: don't hammer listPhotos on every
+  // COMMIT_EVERY (500-file) event — that would refetch the whole list hundreds of times
+  // for a large NAS scan. Both Phase A ("indexing") and Phase B ("metadata") emit at the
+  // same COMMIT_EVERY=500 cadence, so both need a 2-second throttle. "finalizing" emits
+  // only a single event and is fine without throttling. "done" always refreshes immediately
+  // to clear any residual placeholder tiles.
+  const lastIndexingRefresh = useRef(0);
+  const lastMetadataRefresh = useRef(0);
+
+  // Folder/NAS scans run on a background connection (see run_blocking_scan); stream their
+  // progress to the topbar. Refresh the grid on every "indexing" commit (throttled) so
+  // newly-inserted Phase A rows appear as placeholder tiles in real time. "metadata" commits
+  // are also throttled (same COMMIT_EVERY cadence as indexing). The "done" event does a final
+  // unconditional refresh that flips any residual placeholders to real tiles.
+  useEffect(() => {
+    const unlisten = onScanProgress((p) => {
+      if (p.phase === "done") {
+        setScanProgress(null);
+        lastIndexingRefresh.current = 0; // reset so the next scan starts fresh
+        lastMetadataRefresh.current = 0;
+        refresh();
+      } else {
+        setScanProgress(p);
+        if (p.phase === "indexing") {
+          const now = Date.now();
+          if (now - lastIndexingRefresh.current >= 2000) {
+            lastIndexingRefresh.current = now;
+            refresh();
+          }
+        } else if (p.phase === "metadata") {
+          // Phase B emits at the same COMMIT_EVERY=500 cadence as Phase A — throttle
+          // identically to prevent the same per-event query storm.
+          const now = Date.now();
+          if (now - lastMetadataRefresh.current >= 2000) {
+            lastMetadataRefresh.current = now;
+            refresh();
+          }
+        } else {
+          // "finalizing" and any other single-shot phases: refresh immediately.
+          refresh();
+        }
+      }
+    });
+    return () => {
+      unlisten.then((f) => f());
+    };
+  }, [refresh]);
+
+  // External-develop round-trip status (darktable/RawTherapee/ART) for the topbar.
+  useEffect(() => {
+    const unlisten = onDevelopProgress((p) => {
+      setDevelopStatus(["done", "nochange", "error"].includes(p.phase) ? null : p);
+    });
+    return () => {
+      unlisten.then((f) => f());
+    };
+  }, []);
+
+  // On catalog:switched (emitted by switch_catalog after teardown + reinit), reset ALL
+  // transient React state so nothing from the previous catalog bleeds into the new one,
+  // then refresh the photo list and tags against the new catalog.
+  useEffect(() => {
+    const unlisten = onCatalogSwitched(() => {
+      // Selection
+      setSelectedId(null);
+      setSelectedIds([]);
+      selectAnchor.current = null;
+      setExtraPhoto(null);
+      setStackOrigin(null);
+      // Filters / scope
+      setActiveTagId(null);
+      setActiveAlbumId(null);
+      setActiveBatchId(null);
+      setActiveBatch(null);
+      setActiveSmartAlbumId(null);
+      setFilter("all");
+      setStorageTier("all");
+      setActiveFacets([]);
+      setPhotoSort("date");
+      setActiveCamera(null);
+      setActiveLens(null);
+      setActiveLabels([]);
+      // View state
+      setActiveViewId(null);
+      setDevelop(false);
+      setLoupeInline(false);
+      setActiveVersion(null);
+      setEditedSrc("");
+      // Progress indicators
+      setScanProgress(null);
+      setImportProgress(null);
+      setDevelopStatus(null);
+      setPendingCount(0);
+      // Clear photo/tag arrays immediately so the grid shows nothing while the
+      // async refresh resolves — prevents the previous catalog's rows from being
+      // visible (with stale IDs) during the switch.
+      setPhotos([]);
+      setTags([]);
+      // Reload keys — bump so sidebar panels re-query the new catalog.
+      setAlbumsKey((k) => k + 1);
+      setBatchesKey((k) => k + 1);
+      setSmartAlbumsKey((k) => k + 1);
+      setGroupsKey((k) => k + 1);
+      // Tag clipboard / dialogs — clear to prevent stale IDs crossing catalogs.
+      setTagClipboard([]);
+      setEditingTag(null);
+      // Status
+      setStatus("Catalog opened.");
+      // NOTE: do NOT call refresh() here. The dependency-chain useEffect([ready, refresh])
+      // below will fire once the state resets above have committed and the new `refresh`
+      // closure has stabilised with clean filter/tag/album deps. Calling refresh() here
+      // would capture the OLD closure (stale filter state) and query the new catalog with
+      // tag/album IDs that belonged to the previous catalog, producing a flash of wrong data.
+    });
+    return () => {
+      unlisten.then((f) => f());
+    };
+  }, [refresh]);
+
+  // Reset the active version to Original whenever the selected photo changes.
+  useEffect(() => {
+    setActiveVersion(null);
+    setEditedSrc("");
+  }, [selectedId]);
+
+  // Render the active version's edit for the loupe (via the editing module's renderer).
+  // Falls back to the unedited preview when there's no version, no renderer, or on error.
+  useEffect(() => {
+    const renderer = activeEditRenderer();
+    if (selectedId == null || activeVersion == null || !renderer) {
+      setEditedSrc("");
+      return;
+    }
+    let cancelled = false;
+    renderer
+      .render(selectedId, parseEdit(activeVersion.editJson) as Record<string, unknown>)
+      .then((url) => !cancelled && setEditedSrc(url))
+      .catch(() => !cancelled && setEditedSrc(""));
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedId, activeVersion]);
+
+  // Zoom-in render for the active version (ZoomableImage fetches it lazily on first
+  // zoom): the same edit over the native-size preview, so a cropped version has real
+  // pixels to magnify. Falls back to zooming the fast render if the module's renderer
+  // doesn't offer a hi-res variant.
+  const renderHiVersion = useCallback(() => {
+    const renderHi = activeEditRenderer()?.renderHi;
+    if (selectedId == null || activeVersion == null || !renderHi) {
+      return Promise.resolve("");
+    }
+    return renderHi(selectedId, parseEdit(activeVersion.editJson) as Record<string, unknown>);
+  }, [selectedId, activeVersion]);
+
+  // Kick off a background import from a card. The ImportPanel collects the source folder
+  // and optional name, then closes; progress shows in the topbar via import:progress.
+  const startImport = useCallback(
+    async (source: string, name: string, selected?: string[]) => {
+      setImportProgress({ done: 0, total: 0 });
+      setStatus("Importing from card…");
+      try {
+        const r = await ingestFromCard(source, name || undefined, selected);
+        setStatus(
+          `Imported ${r.created} new of ${r.scanned} on card` +
+            (r.skipped ? `, ${r.skipped} already imported` : "") +
+            (r.errors ? `, ${r.errors} errors` : ""),
+        );
+        await refresh();
+        refreshPending();
+        setBatchesKey((k) => k + 1);
+      } catch (e) {
+        setStatus(`Import failed: ${e}`);
+      } finally {
+        setImportProgress(null);
+      }
+    },
+    [refresh, refreshPending],
+  );
+
+  // Keyboard culling. Active whenever a photo is selected and focus isn't in an input.
+  useEffect(() => {
+    const handler = async (e: KeyboardEvent) => {
+      if (activeView || inDevelop) return; // a full-surface view owns input
+      const target = e.target as HTMLElement;
+      if (target.tagName === "INPUT" || target.tagName === "TEXTAREA") return;
+
+      const key = e.key.toLowerCase();
+
+      // Ctrl/Cmd+A: select every photo in the current view (works with nothing selected yet).
+      if ((e.ctrlKey || e.metaKey) && key === "a") {
+        if (photos.length) {
+          setSelectedIds(photos.map((p) => p.id));
+          const active = selectedId ?? photos[0].id;
+          setSelectedId(active);
+          selectAnchor.current = active;
+        }
+        e.preventDefault();
+        return;
+      }
+
+      if (!selected) return; // the shortcuts below act on the active photo
+      const idx = photos.findIndex((p) => p.id === selected.id);
+      const single = (id: number) => {
+        setSelectedId(id);
+        setSelectedIds([id]);
+        selectAnchor.current = id; // plain navigation resets the Shift anchor
+      };
+      // Auto-advance to the next photo after a cull decision (single-selection only).
+      const advance = () => {
+        if (idx < photos.length - 1) single(photos[idx + 1].id);
+      };
+      // Culling applies to the whole selection (batch) — advance only if culling one.
+      const targets = selectedIds.length ? selectedIds : [selected.id];
+      const applyAll = async (fn: (id: number) => Promise<unknown>) => {
+        for (const id of targets) await fn(id);
+        await refresh();
+        if (targets.length === 1) advance();
+      };
+
+      if (e.key === "Enter") {
+        setLoupeInline((v) => !v);
+      } else if (e.key === "Escape") {
+        setLoupeInline(false);
+      } else if (e.key === "ArrowRight" || e.key === "ArrowDown") {
+        // Shift extends the selection from the anchor; plain moves a single selection.
+        if (idx < photos.length - 1) {
+          if (e.shiftKey) selectPhoto(photos[idx + 1].id, { shift: true });
+          else single(photos[idx + 1].id);
+        }
+      } else if (e.key === "ArrowLeft" || e.key === "ArrowUp") {
+        if (idx > 0) {
+          if (e.shiftKey) selectPhoto(photos[idx - 1].id, { shift: true });
+          else single(photos[idx - 1].id);
+        }
+      } else if (key >= "0" && key <= "5") {
+        await applyAll((id) => setRating(id, parseInt(key, 10)));
+      } else if (key === "p") {
+        await applyAll((id) => setPickState(id, "pick"));
+      } else if (key === "x") {
+        await applyAll((id) => setPickState(id, "reject"));
+      } else if (key === "u") {
+        await applyAll((id) => setPickState(id, "none"));
+      } else if (key in COLOR_KEYS) {
+        await applyAll((id) => setLabel(id, COLOR_KEYS[key]));
+      } else {
+        return;
+      }
+      e.preventDefault();
+    };
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  }, [selected, selectedId, selectedIds, photos, refresh, activeView, inDevelop]);
+
+  return (
+    <div className="app">
+      <Splash stage={bootStage} />
+      <header className="topbar">
+        <button
+          className={`chip panel-toggle ${leftHidden ? "" : "chip-on"}`}
+          onClick={() => setLeftHidden((v) => !v)}
+          title={leftHidden ? "Show left panel" : "Hide left panel"}
+        >
+          ⬛ Tags
+        </button>
+        <span className="brand">ChairPhoto</span>
+        <span className="topbar-sep" aria-hidden />
+        <button className="btn-primary" onClick={onScan} disabled={!ready} title="Re-index your library folder">
+          Rescan library
+        </button>
+        <button className="btn-ghost" onClick={() => setShowImport(true)} disabled={!ready} title="Copy from a card into your library">
+          Import card
+        </button>
+        <button className="btn-ghost" onClick={() => setShowBundleImport(true)} disabled={!ready} title="Import a .chairphoto bundle from another machine">
+          Import bundle
+        </button>
+        <label className="cache-opt" title="Pre-generate full previews on import (slower import, instant loupe)">
+          <input
+            type="checkbox"
+            checked={cachePreviews}
+            onChange={(e) => setCachePreviews(e.target.checked)}
+          />
+          Cache previews
+        </label>
+        {(moduleViews.length > 0 || activeViewId !== null || canEdit) && (
+          <div className="view-switcher">
+            <div className="seg">
+              <button
+                className={`seg-item ${activeView === null && !inDevelop ? "on" : ""}`}
+                onClick={() => {
+                  setActiveViewId(null);
+                  setDevelop(false);
+                }}
+              >
+                {/* Grid glyph — matches the app's 13px stroke icon language. */}
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+                  <rect x="3" y="3" width="7" height="7" />
+                  <rect x="14" y="3" width="7" height="7" />
+                  <rect x="14" y="14" width="7" height="7" />
+                  <rect x="3" y="14" width="7" height="7" />
+                </svg>
+                Library
+              </button>
+              {canEdit && (
+                <button
+                  className={`seg-item ${inDevelop ? "on" : ""}`}
+                  onClick={() => {
+                    setActiveViewId(null);
+                    setDevelop(true);
+                  }}
+                  disabled={!selected}
+                  title="Develop the selected photo (crop & tone)"
+                >
+                  {/* Sliders glyph. */}
+                  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+                    <line x1="21" y1="6" x2="14" y2="6" />
+                    <line x1="10" y1="6" x2="3" y2="6" />
+                    <line x1="21" y1="18" x2="12" y2="18" />
+                    <line x1="8" y1="18" x2="3" y2="18" />
+                    <line x1="14" y1="4" x2="14" y2="8" />
+                    <line x1="8" y1="16" x2="8" y2="20" />
+                  </svg>
+                  Develop
+                </button>
+              )}
+              {moduleViews.map((v) => (
+                <button
+                  key={v.id}
+                  className={`seg-item ${activeViewId === v.id ? "on" : ""}`}
+                  onClick={() => {
+                    setActiveViewId(v.id);
+                    setDevelop(false);
+                  }}
+                  title={v.label}
+                >
+                  {v.icon}
+                  {v.label}
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
+        <span className="topbar-sep" aria-hidden />
+        <div className="loupe-controls">
+          <button
+            className={`btn-ghost ${loupeInline ? "chip-on" : ""}`}
+            onClick={() => setLoupeInline((v) => !v)}
+            disabled={!selected || activeView !== null}
+            title="Toggle large view (Enter)"
+          >
+            Loupe
+          </button>
+          <button
+            className="btn-ghost"
+            onClick={() => openLoupeWindow()}
+            title="Open loupe in a separate window (move it to another screen)"
+          >
+            Pop out ⧉
+          </button>
+        </div>
+        {pendingCount > 0 && (
+          <button
+            className="chip chip-on"
+            onClick={runReconcile}
+            title="Back up photos waiting for the NAS"
+          >
+            ⤓ Back up ({pendingCount})
+          </button>
+        )}
+        <span className="topbar-sep" aria-hidden />
+        <button
+          className="btn-ghost"
+          onClick={() => setShowExport(true)}
+          disabled={selectedIds.length === 0 && selectedId == null}
+          title="Export the selected photo(s) to files (RAW + XMP, or JPEG)"
+        >
+          Export
+        </button>
+        <button
+          className="btn-ghost"
+          onClick={() => setShowPublish(true)}
+          disabled={selectedId == null}
+          title="Publish the selected photo to Instagram, Flickr, SmugMug…"
+        >
+          Publish
+        </button>
+        <button
+          className="btn-ghost"
+          onClick={runBurstAnalysis}
+          disabled={!ready}
+          title={
+            selectedIds.length
+              ? `Rank burst sharpness for ${selectedIds.length} selected photo(s)`
+              : "Rank burst sharpness for all visible photos (H16e)"
+          }
+        >
+          Analyse burst
+        </button>
+        {toolbarActions().map((action) => (
+          <button
+            key={action.id}
+            className="btn-ghost module-action"
+            onClick={() =>
+              action.render
+                ? setModalAction(action)
+                : activateToolbarAction(action.id)
+            }
+            title={action.label}
+          >
+            {action.icon ? `${action.icon} ${action.label}` : action.label}
+          </button>
+        ))}
+        <button
+          className="btn-ghost"
+          onClick={() => setShowCatalogSwitcher(true)}
+          title="Open or create a catalog"
+        >
+          Catalogs
+        </button>
+        <button className="btn-ghost" onClick={() => setShowPrefs(true)} title="Preferences (storage, AI, modules)">
+          ⚙ Preferences
+        </button>
+        {importProgress && (
+          <div
+            className="import-progress"
+            title="Importing from card"
+            role="progressbar"
+            aria-valuenow={importProgress.done}
+            aria-valuemax={importProgress.total || undefined}
+          >
+            <span className="import-progress-label">
+              Importing{" "}
+              {importProgress.total
+                ? `${importProgress.done}/${importProgress.total}`
+                : "…"}
+            </span>
+            <div className="progress-track">
+              <div
+                className="progress-fill"
+                style={{
+                  width: importProgress.total
+                    ? `${Math.round((importProgress.done / importProgress.total) * 100)}%`
+                    : "30%",
+                }}
+              />
+            </div>
+          </div>
+        )}
+        <span className="topbar-sep" aria-hidden />
+        <button
+          className={`chip panel-toggle ${rightHidden ? "" : "chip-on"}`}
+          onClick={() => setRightHidden((v) => !v)}
+          title={rightHidden ? "Show inspector panel" : "Hide inspector panel"}
+        >
+          Inspector ⬛
+        </button>
+        {scanProgress && (
+          <div
+            className="import-progress"
+            title="Scanning the library / NAS"
+            role="progressbar"
+            aria-valuenow={scanProgress.done}
+            aria-valuemax={scanProgress.total || undefined}
+          >
+            <span className="import-progress-label">
+              {scanProgress.phase === "metadata"
+                ? `Reading metadata ${scanProgress.done.toLocaleString()}/${scanProgress.total.toLocaleString()}`
+                : scanProgress.phase === "finalizing"
+                  ? "Finalizing…"
+                  : `Indexing ${scanProgress.done.toLocaleString()}…`}
+            </span>
+            <div className="progress-track">
+              <div
+                className="progress-fill"
+                style={{
+                  width:
+                    scanProgress.total > 0
+                      ? `${Math.round((scanProgress.done / scanProgress.total) * 100)}%`
+                      : "40%",
+                }}
+              />
+            </div>
+          </div>
+        )}
+        {developStatus && (
+          <div className="import-progress" title="External develop round-trip">
+            <span className="import-progress-label">
+              {developStatus.phase === "rendering"
+                ? `Rendering ${developStatus.editor}…`
+                : `Editing in ${developStatus.editor}…`}
+            </span>
+            <div className="progress-track">
+              <div className="progress-fill" style={{ width: "40%" }} />
+            </div>
+          </div>
+        )}
+        <span className="status">{status}</span>
+      </header>
+
+      <FilterBar
+        filters={FILTERS}
+        filter={filter}
+        onFilter={setFilter}
+        activeTagLabel={tags.find((t) => t.id === activeTagId)?.name ?? null}
+        onClearTag={() => selectTag(null)}
+        activeAlbumId={activeAlbumId}
+        onClearAlbum={() => selectAlbum(null)}
+        activeBatchId={activeBatchId}
+        onClearBatch={() => selectBatch(null)}
+        activeFacets={activeFacets}
+        onToggleFacet={(key) =>
+          setActiveFacets((prev) =>
+            prev.includes(key) ? prev.filter((k) => k !== key) : [...prev, key],
+          )
+        }
+        storageTier={storageTier}
+        onStorageTier={setStorageTier}
+        photoSort={photoSort}
+        onPhotoSort={setPhotoSort}
+        activeCamera={activeCamera}
+        onCamera={setActiveCamera}
+        activeLens={activeLens}
+        onLens={setActiveLens}
+        activeLabels={activeLabels}
+        onToggleLabel={(label) =>
+          setActiveLabels((prev) =>
+            prev.includes(label) ? prev.filter((l) => l !== label) : [...prev, label],
+          )
+        }
+        reloadKey={groupsKey}
+      />
+
+      <div
+        className="body"
+        style={{
+          gridTemplateColumns: `${leftHidden ? 0 : leftW}px 1fr ${
+            rightHidden ? 0 : rightW
+          }px`,
+        }}
+      >
+        {!leftHidden && (
+        <div className="leftcol">
+          <div
+            className="col-resizer col-resizer-right"
+            onMouseDown={startResize("left")}
+            title="Drag to resize"
+          />
+          <TagPanel
+            tags={tags}
+            activeTagId={activeTagId}
+            onSelectTag={selectTag}
+            onEditTag={setEditingTag}
+            onMoveTag={(tagId, newParentId) =>
+              moveTag(tagId, newParentId)
+                .then(refresh)
+                .catch((e) => setStatus(`Move failed: ${e}`))
+            }
+            onSetPrivate={(tagId, isPrivate, recursive) =>
+              setTagPrivate(tagId, isPrivate, recursive)
+                .then((n) => {
+                  setStatus(
+                    `${n} tag${n === 1 ? "" : "s"} marked ${isPrivate ? "private" : "public"}.`,
+                  );
+                  return refresh();
+                })
+                .catch((e) => setStatus(`Privacy change failed: ${e}`))
+            }
+            onTagsChanged={refresh}
+          />
+          <AlbumsPanel
+            activeAlbumId={activeAlbumId}
+            onSelectAlbum={selectAlbum}
+            selectionCount={selectedIds.length}
+            onAddSelection={addSelectionToAlbum}
+            reloadKey={albumsKey}
+          />
+          <SmartAlbumsPanel
+            activeSmartAlbumId={activeSmartAlbumId}
+            onSelectSmartAlbum={selectSmartAlbum}
+            // The panel owns the SmartAlbumEditor modal; this just selects the album being
+            // edited so the grid previews its rule.
+            onEditRule={(album) => selectSmartAlbum(album.id)}
+            reloadKey={smartAlbumsKey}
+          />
+          <BatchesPanel
+            activeBatchId={activeBatchId}
+            onSelectBatch={selectBatch}
+            onExportBatch={setBundleExportBatch}
+            reloadKey={batchesKey}
+          />
+        </div>
+        )}
+        <main className={`grid-wrap ${inDevelop ? "develop-wrap" : ""}`}>
+          {inDevelop && selected ? (
+            <EditorView
+              photoId={selected.id}
+              photoW={selected.width}
+              photoH={selected.height}
+              activeVersionId={activeVersion?.id ?? null}
+              onPickVersion={setActiveVersion}
+              onSavedActive={(editJson) =>
+                setActiveVersion((cur) => (cur ? { ...cur, editJson } : cur))
+              }
+              onChanged={() => {
+                refresh();
+              }}
+              onBack={() => setDevelop(false)}
+            />
+          ) : activeView ? (
+            <div className="module-view">{activeView.render()}</div>
+          ) : loupeInline && selected ? (
+            <div className="loupe-inline">
+              <div className="loupe-bar">
+                <button className="chip" onClick={() => setLoupeInline(false)}>
+                  ‹ Back to grid (Esc)
+                </button>
+                {extraPhoto && stackOrigin != null && (
+                  <button
+                    className="chip"
+                    title="Return to the original this is stacked under"
+                    onClick={backToOriginal}
+                  >
+                    ‹ Back to original
+                  </button>
+                )}
+                <button
+                  className="chip"
+                  title="Rotate left (non-destructive)"
+                  onClick={() => rotateSelected(selected.id, -90)}
+                >
+                  ↺
+                </button>
+                <button
+                  className="chip"
+                  title="Rotate right (non-destructive)"
+                  onClick={() => rotateSelected(selected.id, 90)}
+                >
+                  ↻
+                </button>
+                <span className="loupe-filename">
+                  {selected.path.split("/").pop()}
+                  {selected.pickState === "reject" && (
+                    <span className="loupe-tag reject"> rejected</span>
+                  )}
+                  {selected.pickState === "pick" && (
+                    <span className="loupe-tag pick"> pick</span>
+                  )}
+                  {selected.rating > 0 && (
+                    <span className="loupe-tag"> {"★".repeat(selected.rating)}</span>
+                  )}
+                  {selected.sharpness != null && selected.sharpness < softThreshold && (
+                    <span
+                      className="loupe-tag loupe-soft"
+                      title={`Sharpness score ${selected.sharpness.toFixed(1)} is below threshold ${softThreshold} (method: ${selected.sharpnessMethod ?? "tile"})`}
+                    >
+                      soft
+                    </span>
+                  )}
+                  {selected.burstFlag === "soft-in-burst" && (
+                    <span
+                      className="loupe-tag loupe-soft"
+                      title="Soft in burst — below 60% of cluster median sharpness"
+                    >
+                      soft-in-burst
+                    </span>
+                  )}
+                  {selected.burstFlag === "sharpest-of-burst" && (
+                    <span
+                      className="loupe-tag loupe-version"
+                      title="Sharpest of burst — best frame in this cluster"
+                    >
+                      ♛ sharpest of burst
+                    </span>
+                  )}
+                  {activeVersion && (
+                    <span className="loupe-tag loupe-version"> · {activeVersion.name}</span>
+                  )}
+                </span>
+                <span className="loupe-hint">
+                  scroll zoom · drag pan · dbl-click 100% · P pick · X reject · F faces · ← →
+                </span>
+              </div>
+              {isVideoPath(selected.path) ? (
+                <div className="loupe-video-wrap">
+                  {/* keyed by id so switching photos reloads the source */}
+                  <video
+                    key={selected.id}
+                    className="loupe-video"
+                    src={videoUrl(selected.id)}
+                    controls
+                    autoPlay
+                  />
+                </div>
+              ) : (
+                // Wrap the ZoomableImage in a relative-positioned container so that
+                // loupe-slot module panels (e.g. the face overlay) can position
+                // themselves absolutely over the image. The wrapper inherits the same
+                // flex-1 sizing that .zoom-container already has.
+                <div style={{ position: "relative", display: "flex", flexDirection: "column", flex: 1, minHeight: 0 }}>
+                  <ZoomableImage
+                    photoId={selected.id}
+                    bust={thumbBusts.get(selected.id)}
+                    srcOverride={editedSrc || undefined}
+                    hiSrcOverride={editedSrc ? renderHiVersion : undefined}
+                    unavailableActions={
+                      <div className="loupe-actions">
+                        <button className="chip" onClick={() => relocatePhotoAction(selected.id)}>
+                          Relocate…
+                        </button>
+                        <button className="chip" onClick={() => retrieveFromNasAction(selected.id)}>
+                          Retrieve from NAS
+                        </button>
+                        <button
+                          className="chip ctx-item-danger"
+                          onClick={() => removeFromCatalogAction(selected.id)}
+                        >
+                          Remove from catalog
+                        </button>
+                      </div>
+                    }
+                  />
+                  {/* Loupe-slot panels from enabled modules (e.g. face overlay). Each
+                      panel is expected to render an absolute-positioned overlay. */}
+                  {panelsForSlot("loupe").map((panel) => (
+                    <div key={panel.id} style={{ position: "absolute", inset: 0, pointerEvents: "none" }}>
+                      {panel.render()}
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          ) : (
+            <CatalogGrid
+              photos={photos}
+              selectedId={selectedId}
+              selectedIds={selectedIds}
+              statuses={statuses}
+              versionCounts={versionCnt}
+              thumbBusts={thumbBusts}
+              softThreshold={softThreshold}
+              emptyMessage={
+                storageTier === "nas"
+                  ? "No NAS-only photos yet. Older photos move here when offloaded — set a day count in Preferences → Storage → Local / NAS tiering, or click “Offload older now”."
+                  : storageTier === "local" ||
+                      filter !== "all" ||
+                      activeTagId != null ||
+                      activeAlbumId != null ||
+                      activeBatchId != null ||
+                      activeSmartAlbumId != null ||
+                      activeFacets.length > 0 ||
+                      activeLabels.length > 0
+                    ? "No photos match the current filters."
+                    : undefined
+              }
+              onSelect={(p, mods) => selectPhoto(p.id, mods)}
+              onOpen={(p) => {
+                selectPhoto(p.id);
+                setLoupeInline(true);
+              }}
+              onContextMenu={(p, e) => {
+                selectPhoto(p.id);
+                setCtxMenu({ x: e.clientX, y: e.clientY, photoId: p.id });
+              }}
+            />
+          )}
+          {!inDevelop && !activeView && !(loupeInline && selected) && photos.length > 0 && (
+            <div className="grid-statusbar">
+              <span className="grid-statusbar-count">{photos.length.toLocaleString()}</span>
+              <span>photos</span>
+              {selectedIds.length > 1 && (
+                <span className="grid-statusbar-sel">
+                  {selectedIds.length.toLocaleString()} selected
+                </span>
+              )}
+            </div>
+          )}
+        </main>
+        {!inDevelop && !rightHidden && (
+        <div className="rightcol">
+          <div
+            className="col-resizer col-resizer-left"
+            onMouseDown={startResize("right")}
+            title="Drag to resize"
+          />
+          <PhotoInspector
+            photo={selected}
+            onChanged={() => {
+              refresh();
+              refreshPending();
+              setGroupsKey((k) => k + 1); // inspector tagging updates "Recently used"
+            }}
+            allTags={tags}
+            status={selected ? statuses.get(selected.id) ?? null : null}
+            activeVersionId={activeVersion?.id ?? null}
+            onSelectVersion={setActiveVersion}
+            canEditVersions={canEdit}
+            onEditVersion={(v) => {
+              setActiveVersion(v);
+              setDevelop(true);
+            }}
+            clipboardCount={tagClipboard.length}
+            selectionCount={selectedIds.length}
+            onCopyTags={copyTags}
+            onPasteTags={pasteTagsToSelection}
+            onAssignTag={assignToSelection}
+            onRemoveTag={removeFromSelection}
+            onRotate={rotateSelected}
+            onViewPhoto={viewPhoto}
+          />
+          <QuickTagBar
+            reloadKey={groupsKey}
+            selectionCount={selectedIds.length}
+            onAssign={assignToSelection}
+            onManage={() => setShowGroups(true)}
+          />
+        </div>
+        )}
+      </div>
+
+      {editingTag && (
+        <TagEditor
+          tagId={editingTag.id}
+          tagName={editingTag.name}
+          tagPath={editingTag.fullPath}
+          tagDescription={editingTag.description}
+          onClose={() => setEditingTag(null)}
+          onChanged={refresh}
+        />
+      )}
+
+      {showCatalogSwitcher && (
+        <CatalogSwitcher
+          onClose={() => setShowCatalogSwitcher(false)}
+        />
+      )}
+
+      {showPrefs && (
+        <Preferences
+          onClose={() => setShowPrefs(false)}
+          onLibraryRootChanged={() => {
+            refresh();
+            refreshPending();
+            setStatus("Library folder changed — click Rescan library to index it.");
+          }}
+        />
+      )}
+
+      {showImport && (
+        <ImportPanel
+          onClose={() => setShowImport(false)}
+          onImport={(source, name, selected) => {
+            setShowImport(false);
+            void startImport(source, name, selected);
+          }}
+        />
+      )}
+
+      {showExport && (
+        <ExportPanel
+          photoIds={selectedIds.length ? selectedIds : selectedId != null ? [selectedId] : []}
+          versionId={activeVersion?.id ?? null}
+          versionName={activeVersion?.name ?? null}
+          activeBatch={activeBatch}
+          onExportBatch={(batch) => {
+            setShowExport(false);
+            setBundleExportBatch(batch);
+          }}
+          onClose={() => setShowExport(false)}
+        />
+      )}
+
+      {showPublish && <PublishDialog onClose={() => setShowPublish(false)} />}
+
+      {bundleExportBatch && (
+        <BundleExportDialog
+          batchId={bundleExportBatch.id}
+          batchLabel={
+            bundleExportBatch.sourceLabel.replace(/\/+$/, "").split("/").pop() ||
+            bundleExportBatch.sourceLabel ||
+            "(ingest)"
+          }
+          onClose={() => setBundleExportBatch(null)}
+          onExport={(result) => {
+            setStatus(
+              `Bundle exported: ${result.exported} original${result.exported === 1 ? "" : "s"}` +
+                (result.skippedOffline > 0
+                  ? ` (${result.skippedOffline} offline/missing)`
+                  : "") +
+                (result.errors > 0 ? `, ${result.errors} error(s)` : ""),
+            );
+          }}
+          onClear={() => setImportProgress(null)}
+        />
+      )}
+
+      {showBundleImport && (
+        <BundleImportDialog
+          onClose={() => setShowBundleImport(false)}
+          onImport={(result) => {
+            setStatus(
+              result.merge.photosAdded > 0
+                ? `Bundle imported: ${result.merge.photosAdded} new photo${result.merge.photosAdded === 1 ? "" : "s"}` +
+                    (result.merge.tagsCreated > 0
+                      ? `, ${result.merge.tagsCreated} tag${result.merge.tagsCreated === 1 ? "" : "s"} created`
+                      : "") +
+                    (result.errors > 0 ? `, ${result.errors} error(s)` : "")
+                : "Bundle imported — all photos already present (no duplicates added).",
+            );
+            refresh().catch(() => {});
+            refreshPending().catch(() => {});
+            setBatchesKey((k) => k + 1);
+          }}
+          onClear={() => setImportProgress(null)}
+        />
+      )}
+
+      {ctxMenu && (() => {
+        const id = ctxMenu.photoId;
+        const st = statuses.get(id);
+        // A backup might exist unless the photo is provably local-only or fully missing.
+        // (Status is derived from volume kind, so a deleted-local photo still reads
+        // "backedUp" — keep Retrieve enabled for it.)
+        const canRetrieve = st !== undefined && st !== "localOnly" && st !== "missing";
+        const close = () => setCtxMenu(null);
+        return (
+          <div
+            className="ctx-backdrop"
+            onClick={close}
+            onContextMenu={(e) => {
+              e.preventDefault();
+              close();
+            }}
+          >
+            <div
+              className="ctx-menu"
+              style={{ left: ctxMenu.x, top: ctxMenu.y }}
+              onClick={(e) => e.stopPropagation()}
+            >
+              <div className="ctx-header">
+                <span className="ctx-header-name" title={photoName(id)}>{photoName(id)}</span>
+                {st && <span className="ctx-header-status">{storageLabel(st)}</span>}
+              </div>
+              <button
+                className="ctx-item"
+                onClick={() => {
+                  close();
+                  revealPhoto(id).catch((e) =>
+                    setStatus(`Couldn't reveal: ${e} (the file may be offline)`),
+                  );
+                }}
+              >
+                Reveal in Files
+              </button>
+              <button className="ctx-item" onClick={() => { close(); relocatePhotoAction(id); }}>
+                Relocate…
+              </button>
+              <button
+                className="ctx-item"
+                disabled={!canRetrieve}
+                title={canRetrieve ? undefined : "No NAS backup to retrieve"}
+                onClick={() => { close(); retrieveFromNasAction(id); }}
+              >
+                Retrieve from NAS
+              </button>
+              <div className="ctx-sep" />
+              <button
+                className="ctx-item ctx-item-danger"
+                onClick={() => { close(); removeFromCatalogAction(id); }}
+              >
+                Remove from catalog
+              </button>
+            </div>
+          </div>
+        );
+      })()}
+
+      {modalAction?.render && modalAction.render(() => setModalAction(null))}
+
+      {showGroups && (
+        <TagGroupsManager
+          onClose={() => {
+            setShowGroups(false);
+            setGroupsKey((k) => k + 1); // refresh quick-tag bar with any changes
+          }}
+        />
+      )}
+    </div>
+  );
+}

@@ -1,0 +1,137 @@
+/* Face-tagging module styles — People view (H13e) */
+
+/* ── People view root ──────────────────────────────────────────────────────── */
+
+.fa-pv-root {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  overflow: hidden;
+  background: var(--bg);
+  color: var(--text);
+}
+
+/* ── Header bar ─────────────────────────────────────────────────────────────── */
+
+.fa-pv-header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 20px;
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
+/* ── Section title ──────────────────────────────────────────────────────────── */
+
+.fa-pv-section-title {
+  font-size: 13px;
+  font-weight: 600;
+  opacity: 0.85;
+  margin-bottom: 12px;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+}
+
+/* ── Card grid ──────────────────────────────────────────────────────────────── */
+
+.fa-pv-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+
+/* ── Empty state ────────────────────────────────────────────────────────────── */
+
+.fa-pv-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  padding: 48px 24px;
+  text-align: center;
+  opacity: 0.55;
+  font-size: 14px;
+}
+
+/* ── Face overlay chip button (loupe) ──────────────────────────────────────── */
+
+.fa-chip-btn {
+  background: none;
+  border: 1px solid rgba(255, 255, 255, 0.35);
+  border-radius: 3px;
+  padding: 1px 5px;
+  font-size: 11px;
+  color: #f8fafc;
+  cursor: pointer;
+  line-height: 1.4;
+  transition: background 0.1s;
+}
+
+.fa-chip-btn:hover {
+  background: rgba(255, 255, 255, 0.12);
+}
+
+.fa-chip-btn-danger {
+  border-color: rgba(239, 68, 68, 0.6);
+  color: #fca5a5;
+}
+
+.fa-chip-btn-danger:hover {
+  background: rgba(239, 68, 68, 0.15);
+}
+
+/* ── Face panel (inspector) ─────────────────────────────────────────────────── */
+
+.fa-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.fa-panel-row {
+  display: flex;
+  gap: 8px;
+  padding: 6px 0;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+.fa-panel-num {
+  font-size: 11px;
+  opacity: 0.45;
+  min-width: 20px;
+  padding-top: 2px;
+}
+
+.fa-panel-body {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.fa-panel-name {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  flex-wrap: wrap;
+}
+
+.fa-panel-conf {
+  font-size: 11px;
+  opacity: 0.65;
+}
+
+.fa-panel-state {
+  font-size: 10px;
+  opacity: 0.45;
+  text-transform: lowercase;
+}
+
+/* ── Reassign dropdown ──────────────────────────────────────────────────────── */
+
+.fa-drop-item {
+  transition: background 0.1s;
+}

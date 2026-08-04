@@ -117,7 +117,14 @@ tauri-plugin-dialog = "2.7.1"
 # Only compiled when the `faces` feature is on. ONNX Runtime bindings for face detection
 # (YuNet) + embedding (AuraFace). 2.0.0-rc line; default `download-binaries` strategy fetches
 # a prebuilt ONNX Runtime shared library.
-ort = { version = "2.0.0-rc.10", optional = true }
+#
+# `pkg-config` lets the build link the *system* ONNX Runtime instead. ort-sys probes
+# `libonnxruntime` before its download path and returns early on success, so this is additive:
+# with a new-enough system library installed the build links it and downloads nothing; without
+# one, `download-binaries` still applies and dev builds behave exactly as before. A system
+# library whose minor version is below ort's API level (24 here) is ignored rather than linked.
+# Distro packaging depends on this — see packaging/PKGBUILD.
+ort = { version = "2.0.0-rc.10", optional = true, features = ["pkg-config"] }
 # Data-parallelism for the face-indexing batch (bounded concurrent detect+embed calls).
 # The connection-per-worker pattern is avoided: rayon runs the CPU-heavy detect step in
 # parallel; DB writes are serialised on the calling thread via a sequential collect pass.

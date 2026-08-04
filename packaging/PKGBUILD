@@ -1,0 +1,129 @@
+# Maintainer: Andreas Henden <chairman2s.ah+github@gmail.com>
+
+pkgname=chairphoto
+pkgver=2026.8.0
+pkgrel=1
+pkgdesc="Catalog-first photo organizer for large RAW collections"
+arch=('x86_64')
+url="https://github.com/chairman2s/ChairPhoto"
+license=('GPL-3.0-only')
+
+# gtk3/librsvg arrive via webkit2gtk-4.1, but ChairPhoto links them directly, so they are
+# named here rather than left to the dependency chain.
+#   libraw          full-resolution RAW decode, linked at build time by the `raw` feature
+#   onnxruntime-cpu face detection/recognition and Smart Tagging inference. ort probes for
+#                   `libonnxruntime` via pkg-config and links the system library; without it
+#                   the build would silently fall back to downloading its own copy, which
+#                   build() rejects.
+depends=(
+  'gtk3'
+  'hicolor-icon-theme'
+  'libraw'
+  'librsvg'
+  'onnxruntime-cpu'
+  'webkit2gtk-4.1'
+)
+
+# clang/pkgconf are for the LibRaw bindgen step in src-tauri/build.rs, which reads the
+# installed header so the struct ABI matches the linked library exactly.
+makedepends=(
+  'cargo'
+  'clang'
+  'nodejs>=24'
+  'npm'
+  'pkgconf'
+)
+
+# Missing runtime tools degrade one feature each; they never crash the app.
+optdepends=(
+  'perl-image-exiftool: EXIF/IPTC/XMP extraction and RAW preview fallback'
+  'exiv2: primary embedded-preview extractor for RAW thumbnails'
+  'ffmpeg: video poster frames and slideshow .mp4 rendering'
+  'imagemagick: HEIF/HEIC (iPhone) decoding'
+  'libheif: HEIF/HEIC delegate for ImageMagick'
+  'chromium: posting exports to Instagram'
+)
+
+# makepkg enables LTO globally, which breaks this build. libsqlite3-sys (bundled SQLite) and
+# ring compile C/assembly through the `cc` crate, so they inherit -flto=auto and emit bitcode,
+# but rustc links with -fuse-ld=lld and no -flto and never runs the LTO codegen step. The
+# result is undefined sqlite3_* and ring_core_* symbols at link time. Pure-Rust dependencies
+# are unaffected, which is why only these two show up.
+options=(!lto)
+
+source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz"
+        "$pkgname.desktop")
+# Regenerate with `updpkgsums` after tagging the release; see README.md in this directory.
+sha256sums=('SKIP'
+            'SKIP')
+
+prepare() {
+  cd "ChairPhoto-$pkgver"
+
+  # Both fetches need network. makepkg does not sandbox the network, but they are kept in
+  # prepare() so build() is a pure compile step.
+  npm ci
+  cargo fetch --locked --manifest-path src-tauri/Cargo.toml
+}
+
+build() {
+  cd "ChairPhoto-$pkgver"
+
+  export RUSTUP_TOOLCHAIN=stable
+  export CARGO_TARGET_DIR=target
+
+  # ort tries pkg-config before its download path and *silently* falls back to fetching a
+  # prebuilt ONNX Runtime when the probe fails, which would make this package build depend on
+  # a network blob instead of the onnxruntime-cpu dependency. It also ignores a system library
+  # older than the API level it wants (24), so check the version the same way ort does.
+  local ort_minor
+  if ! ort_minor=$(pkg-config --modversion libonnxruntime 2>/dev/null); then
+    echo "==> ERROR: pkg-config cannot find libonnxruntime; is onnxruntime-cpu installed?" >&2
+    return 1
+  fi
+  ort_minor=$(echo "$ort_minor" | cut -d. -f2)
+  if (( ort_minor < 24 )); then
+    echo "==> ERROR: onnxruntime 1.$ort_minor is older than the API level ort requires (24)." >&2
+    echo "    ort would ignore it and download its own copy instead." >&2
+    return 1
+  fi
+
+  # Upstream defaults: ai, edit, raw, instagram, collage, slideshow, localsend, map, faces,
+  # smarttags. The flickr and smugmug publishing modules are opt-in upstream and stay off
+  # here; add `-- --features flickr,smugmug` to ship them.
+  # --no-bundle stops Tauri from also producing deb/rpm/AppImage images we would discard.
+  npm run tauri build -- --no-bundle
+}
+
+check() {
+  cd "ChairPhoto-$pkgver"
+
+  # The probe in build() is a precondition, not proof. ort only *prefers* pkg-config: if the
+  # `pkg-config` feature is missing from src-tauri/Cargo.toml, or the probe fails inside the
+  # build script for any reason, ort quietly downloads its own runtime and the build still
+  # succeeds — producing a package that ignores the onnxruntime-cpu dependency it declares.
+  # Assert the outcome instead of trusting it.
+  if ! ldd "src-tauri/target/release/$pkgname" | grep -qE 'libonnxruntime\.so[^ ]* => /usr/lib/'; then
+    echo "==> ERROR: the binary does not link the system libonnxruntime." >&2
+    echo "    ort most likely downloaded its own runtime. Check that the ort dependency in" >&2
+    echo "    src-tauri/Cargo.toml still enables the \`pkg-config\` feature." >&2
+    return 1
+  fi
+}
+
+package() {
+  cd "ChairPhoto-$pkgver"
+
+  install -Dm755 "src-tauri/target/release/$pkgname" "$pkgdir/usr/bin/$pkgname"
+  install -Dm644 "$srcdir/$pkgname.desktop" "$pkgdir/usr/share/applications/$pkgname.desktop"
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+
+  install -Dm644 "src-tauri/icons/32x32.png" \
+    "$pkgdir/usr/share/icons/hicolor/32x32/apps/$pkgname.png"
+  install -Dm644 "src-tauri/icons/128x128.png" \
+    "$pkgdir/usr/share/icons/hicolor/128x128/apps/$pkgname.png"
+  install -Dm644 "src-tauri/icons/128x128@2x.png" \
+    "$pkgdir/usr/share/icons/hicolor/256x256/apps/$pkgname.png"
+  install -Dm644 "src-tauri/icons/icon.png" \
+    "$pkgdir/usr/share/icons/hicolor/512x512/apps/$pkgname.png"
+}

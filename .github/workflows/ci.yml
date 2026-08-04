@@ -14,10 +14,10 @@ jobs:
     name: Frontend (typecheck + tests)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
-          node-version: 20
+          node-version: 24
           cache: npm
       - run: npm ci
       - name: Typecheck
@@ -29,7 +29,7 @@ jobs:
     name: Backend (tests + feature gating)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # ChairPhoto links LibRaw at build time and shells out to the metadata/image
       # tools at runtime. See the Requirements section of the README.

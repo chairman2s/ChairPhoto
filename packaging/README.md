@@ -36,6 +36,23 @@ rather than letting either case slide.
 (`faces-cuda`, `smarttags-cuda`), so GPU inference needs a separate package variant rather
 than a swapped dependency.
 
+## Why `options=(!lto)`
+
+makepkg turns LTO on globally (`OPTIONS=(... lto)` with `LTOFLAGS="-flto=auto"`). Two
+dependencies compile C or assembly through the `cc` crate — `libsqlite3-sys`, which builds
+the bundled SQLite, and `ring` — so they pick up `-flto=auto` and emit bitcode. rustc then
+links with `-fuse-ld=lld` and no `-flto`, so the LTO codegen step never runs and those
+objects contribute no symbols:
+
+```
+ld.lld: error: undefined symbol: sqlite3_step
+ld.lld: error: undefined symbol: ring_core_0_17_14__aes_nohw_encrypt
+```
+
+Pure-Rust dependencies link fine, which is why only these two appear. This failure only
+shows up under `makepkg` — the flags come from `/etc/makepkg.conf`, not from the project, so
+an ordinary `cargo build` never reproduces it.
+
 ## Cutting a release
 
 1. Make sure `package.json`, `src-tauri/Cargo.toml`, and `src-tauri/tauri.conf.json` all

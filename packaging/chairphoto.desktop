@@ -1,0 +1,18 @@
+[Desktop Entry]
+Type=Application
+Name=ChairPhoto
+GenericName=Photo Organizer
+Comment=Catalog-first photo organizer for large RAW collections
+# %u passes a chairphoto:// URL through to the running instance. The deep-link and
+# single-instance plugins forward it to the existing window rather than starting a
+# second copy — see docs/plugin-system.md and the deep-link notes.
+Exec=chairphoto %u
+Icon=chairphoto
+Terminal=false
+Categories=Graphics;2DGraphics;RasterGraphics;Photography;Viewer;
+# Registers the chairphoto:// scheme declared in src-tauri/tauri.conf.json so
+# links from Obsidian and other apps open the catalog at the right photo or tag.
+MimeType=x-scheme-handler/chairphoto;
+StartupNotify=true
+StartupWMClass=chairphoto
+Keywords=photo;photography;raw;catalog;organizer;culling;xmp;

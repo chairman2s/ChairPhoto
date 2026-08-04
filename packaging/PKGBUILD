@@ -95,6 +95,22 @@ build() {
   npm run tauri build -- --no-bundle
 }
 
+check() {
+  cd "ChairPhoto-$pkgver"
+
+  # The probe in build() is a precondition, not proof. ort only *prefers* pkg-config: if the
+  # `pkg-config` feature is missing from src-tauri/Cargo.toml, or the probe fails inside the
+  # build script for any reason, ort quietly downloads its own runtime and the build still
+  # succeeds — producing a package that ignores the onnxruntime-cpu dependency it declares.
+  # Assert the outcome instead of trusting it.
+  if ! ldd "src-tauri/target/release/$pkgname" | grep -qE 'libonnxruntime\.so[^ ]* => /usr/lib/'; then
+    echo "==> ERROR: the binary does not link the system libonnxruntime." >&2
+    echo "    ort most likely downloaded its own runtime. Check that the ort dependency in" >&2
+    echo "    src-tauri/Cargo.toml still enables the \`pkg-config\` feature." >&2
+    return 1
+  fi
+}
+
 package() {
   cd "ChairPhoto-$pkgver"
 

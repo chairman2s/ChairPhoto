@@ -53,9 +53,9 @@ options=(!lto)
 
 source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz"
         "$pkgname.desktop")
-# Regenerate with `updpkgsums` after tagging the release; see README.md in this directory.
-sha256sums=('SKIP'
-            'SKIP')
+# Regenerate with `updpkgsums` after every pkgver bump; see README.md in this directory.
+sha256sums=('9243bce8e428bf534228c598f0b5e78cb932684adf4fa91965d583bd1ebb2ebf'
+            'f886deeefb89b0ac96497bf02e6307539175fbb99a498ba3f40ed8ff14e10f00')
 
 prepare() {
   cd "ChairPhoto-$pkgver"

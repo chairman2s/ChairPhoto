@@ -5,6 +5,9 @@
   "description": "ChairPhoto — catalog-first photo organizer",
   "license": "GPL-3.0-only",
   "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
@@ -36,5 +39,8 @@
     "typescript": "~5.8.3",
     "vite": "^7.0.4",
     "vitest": "^4.1.10"
+  },
+  "allowScripts": {
+    "esbuild@0.27.7": true
   }
 }

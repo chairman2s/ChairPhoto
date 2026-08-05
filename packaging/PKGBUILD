@@ -8,18 +8,31 @@ arch=('x86_64')
 url="https://github.com/chairman2s/ChairPhoto"
 license=('GPL-3.0-only')
 
-# gtk3/librsvg arrive via webkit2gtk-4.1, but ChairPhoto links them directly, so they are
-# named here rather than left to the dependency chain.
+# Every direct library dependency is listed, per the packaging guidelines: several of these
+# would also arrive through gtk3 or webkit2gtk-4.1, but relying on a transitive edge breaks
+# the moment that intermediate package drops it. Regenerate after changing linked libraries:
+#   readelf -d usr/bin/chairphoto | grep NEEDED   ->   pacman -Qoq /usr/lib/<soname>
+#
 #   libraw          full-resolution RAW decode, linked at build time by the `raw` feature
 #   onnxruntime-cpu face detection/recognition and Smart Tagging inference. ort probes for
 #                   `libonnxruntime` via pkg-config and links the system library; without it
 #                   the build would silently fall back to downloading its own copy, which
 #                   build() rejects.
+#   librsvg         the only entry here that is *not* a direct link: gdk-pixbuf loads it as a
+#                   runtime module to rasterise SVG assets, so ldd cannot see it.
+#   hicolor-icon-theme  owns the /usr/share/icons/hicolor directories this package installs into.
 depends=(
+  'cairo'
+  'dbus'
+  'gdk-pixbuf2'
+  'glib2'
+  'glibc'
   'gtk3'
   'hicolor-icon-theme'
+  'libgcc'
   'libraw'
   'librsvg'
+  'libsoup3'
   'onnxruntime-cpu'
   'webkit2gtk-4.1'
 )
@@ -60,10 +73,12 @@ sha256sums=('9243bce8e428bf534228c598f0b5e78cb932684adf4fa91965d583bd1ebb2ebf'
 prepare() {
   cd "ChairPhoto-$pkgver"
 
-  # Both fetches need network. makepkg does not sandbox the network, but they are kept in
-  # prepare() so build() is a pure compile step.
+  # Both fetches need network, and are kept here so build() can run entirely offline.
+  # --locked pins the Cargo.lock versions; --target limits the fetch to this host.
+  export RUSTUP_TOOLCHAIN=stable
   npm ci
-  cargo fetch --locked --manifest-path src-tauri/Cargo.toml
+  cargo fetch --locked --manifest-path src-tauri/Cargo.toml \
+    --target "$(rustc -vV | sed -n 's/host: //p')"
 }
 
 build() {
@@ -71,19 +86,22 @@ build() {
 
   export RUSTUP_TOOLCHAIN=stable
   export CARGO_TARGET_DIR=target
+  # Equivalent to cargo's --frozen, which cannot be passed through the Tauri CLI: the build
+  # may only use what prepare() already fetched, so dependency resolution cannot drift.
+  export CARGO_NET_OFFLINE=true
 
   # ort tries pkg-config before its download path and *silently* falls back to fetching a
   # prebuilt ONNX Runtime when the probe fails, which would make this package build depend on
   # a network blob instead of the onnxruntime-cpu dependency. It also ignores a system library
   # older than the API level it wants (24), so check the version the same way ort does.
-  local ort_minor
-  if ! ort_minor=$(pkg-config --modversion libonnxruntime 2>/dev/null); then
+  local _ort_minor
+  if ! _ort_minor=$(pkg-config --modversion libonnxruntime 2>/dev/null); then
     echo "==> ERROR: pkg-config cannot find libonnxruntime; is onnxruntime-cpu installed?" >&2
     return 1
   fi
-  ort_minor=$(echo "$ort_minor" | cut -d. -f2)
-  if (( ort_minor < 24 )); then
-    echo "==> ERROR: onnxruntime 1.$ort_minor is older than the API level ort requires (24)." >&2
+  _ort_minor=$(echo "$_ort_minor" | cut -d. -f2)
+  if (( _ort_minor < 24 )); then
+    echo "==> ERROR: onnxruntime 1.$_ort_minor is older than the API level ort requires (24)." >&2
     echo "    ort would ignore it and download its own copy instead." >&2
     return 1
   fi
@@ -103,7 +121,8 @@ check() {
   # build script for any reason, ort quietly downloads its own runtime and the build still
   # succeeds — producing a package that ignores the onnxruntime-cpu dependency it declares.
   # Assert the outcome instead of trusting it.
-  if ! ldd "src-tauri/target/release/$pkgname" | grep -qE 'libonnxruntime\.so[^ ]* => /usr/lib/'; then
+  local _linked='libonnxruntime\.so[^ ]* => /usr/lib/'
+  if ! ldd "src-tauri/target/release/$pkgname" | grep -qE "$_linked"; then
     echo "==> ERROR: the binary does not link the system libonnxruntime." >&2
     echo "    ort most likely downloaded its own runtime. Check that the ort dependency in" >&2
     echo "    src-tauri/Cargo.toml still enables the \`pkg-config\` feature." >&2

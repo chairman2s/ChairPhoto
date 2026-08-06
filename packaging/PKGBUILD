@@ -18,9 +18,11 @@ license=('GPL-3.0-only')
 #                   `libonnxruntime` via pkg-config and links the system library; without it
 #                   the build would silently fall back to downloading its own copy, which
 #                   build() rejects.
-#   librsvg         the only entry here that is *not* a direct link: gdk-pixbuf loads it as a
-#                   runtime module to rasterise SVG assets, so ldd cannot see it.
 #   hicolor-icon-theme  owns the /usr/share/icons/hicolor directories this package installs into.
+#
+# librsvg is deliberately absent. Tauri's Linux prerequisites name it, but this package ships
+# only PNG icons and nothing links it, so namcap flags it as unneeded. gtk3 depends on it
+# regardless, so it remains installed for anything that does want it.
 depends=(
   'cairo'
   'dbus'
@@ -31,7 +33,6 @@ depends=(
   'hicolor-icon-theme'
   'libgcc'
   'libraw'
-  'librsvg'
   'libsoup3'
   'onnxruntime-cpu'
   'webkit2gtk-4.1'

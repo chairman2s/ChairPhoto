@@ -53,23 +53,111 @@ Pure-Rust dependencies link fine, which is why only these two appear. This failu
 shows up under `makepkg` — the flags come from `/etc/makepkg.conf`, not from the project, so
 an ordinary `cargo build` never reproduces it.
 
+## Signing, and switching to a verified source
+
+The guidelines ask that sources be verified with PGP signatures wherever possible. The
+`sha256sums` in `PKGBUILD` already prove *integrity* — that the tarball has not changed since
+the hash was written — but not *authenticity*, that it came from this project at all. A signed
+tag closes that, and also defends against a force-pushed tag silently changing what a release
+points at.
+
+The signing key exists and the repository is configured to sign tags:
+
+```
+F811994B5376B3AF01DD2896589E06E08AD289E9   ed25519, expires 2028-08-05
+```
+
+`git config --local tag.gpgsign true` is set, so `git tag` signs by default. Commit signing is
+deliberately left off — it prompts for the passphrase on every commit and buys nothing here.
+
+**This is not active yet.** `v2026.8.0` was tagged before the key existed, and a recipe that
+demands a signed tag cannot build an unsigned one. Retagging it would be a force-push, which
+the guidelines specifically warn against. So the switch below applies at the **next** release,
+whose tag will be signed.
+
+### The switch
+
+Apply all of this together, never piecemeal — a signed source with an unsigned tag fails, and
+a git source with the tarball's directory layout fails too.
+
+```diff
+ makedepends=(
+   'cargo'
+   'clang'
++  'git'
+   'nodejs>=24'
+   'npm'
+   'pkgconf'
+ )
+
++# git rev-parse "v$pkgver" — the *tag object* hash, not the commit it points at. Pinning the
++# object means a force-pushed tag changes the hash and fails the build instead of silently
++# altering what gets packaged.
++_tag=0000000000000000000000000000000000000000
++validpgpkeys=('F811994B5376B3AF01DD2896589E06E08AD289E9')
++
+-source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz"
++source=("$pkgname::git+$url.git?signed#tag=$_tag"
+         "$pkgname.desktop")
+-sha256sums=('9243bce8e428bf534228c598f0b5e78cb932684adf4fa91965d583bd1ebb2ebf'
++# SKIP is correct for a VCS source: integrity comes from the pinned tag object and its
++# signature, which `?signed` makes makepkg verify against validpgpkeys.
++sha256sums=('SKIP'
+             'f886deeefb89b0ac96497bf02e6307539175fbb99a498ba3f40ed8ff14e10f00')
++
++# Guards against bumping pkgver without updating _tag: the version is derived from the tag
++# that was actually checked out.
++pkgver() {
++  cd "$pkgname"
++  git describe --tags | sed 's/^v//'
++}
+```
+
+Then replace every `cd "ChairPhoto-$pkgver"` with `cd "$pkgname"` — makepkg names a git
+checkout after the `name::` prefix, not `<repo>-<version>` as with a tarball.
+
+Naming the source `$pkgname::` keeps that directory stable across releases; without it the
+clone is named after the repository (`ChairPhoto`), which is capitalised differently.
+
+### Publishing the public key
+
+Anyone verifying the tag needs the public key. Export it with:
+
+```bash
+gpg --export --armor F811994B5376B3AF01DD2896589E06E08AD289E9
+```
+
+Adding it to GitHub is optional and only affects the "Verified" badge on tags. The `gh` CLI
+needs a scope the current token lacks:
+
+```bash
+gh auth refresh -s admin:gpg_key
+gh gpg-key add <(gpg --export --armor F811994B5376B3AF01DD2896589E06E08AD289E9)
+```
+
+The key expires 2028-08-05. Extend it with `gpg --edit-key` before then, or signature
+verification on new releases starts failing.
+
 ## Cutting a release
 
 1. Make sure `package.json`, `src-tauri/Cargo.toml`, and `src-tauri/tauri.conf.json` all
    carry the same version — calendar versioning, unpadded month (`2026.8.0`, never
    `2026.08.0`, which is not valid semver).
-2. Tag and push:
+2. Tag and push. `-s` signs it; `tag.gpgsign` makes that the default, but being explicit
+   documents the intent:
    ```bash
-   git tag -a v2026.8.0 -m "ChairPhoto 2026.8.0"
-   git push origin v2026.8.0
+   git tag -s v2026.8.1 -m "ChairPhoto 2026.8.1"
+   git verify-tag v2026.8.1        # confirm before pushing
+   git push origin v2026.8.1
    ```
 3. Create the GitHub release for that tag so the source tarball URL resolves.
-4. Set `pkgver` in `PKGBUILD` to match, then fill in the checksums:
+4. Set `pkgver` in `PKGBUILD` to match, then refresh the checksums:
    ```bash
    cd packaging
    updpkgsums          # from pacman-contrib
    ```
-   `sha256sums` ships as `SKIP` placeholders; a release package must carry real hashes.
+   Every source needs a real hash. The one exception is a VCS source, where `SKIP` is correct
+   because integrity comes from the pinned tag object instead — see the section above.
 5. Build and install locally to verify:
    ```bash
    makepkg -si

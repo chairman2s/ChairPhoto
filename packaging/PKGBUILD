@@ -108,10 +108,16 @@ build() {
   fi
 
   # Upstream defaults: ai, edit, raw, instagram, collage, slideshow, localsend, map, faces,
-  # smarttags. The flickr and smugmug publishing modules are opt-in upstream and stay off
-  # here; add `-- --features flickr,smugmug` to ship them.
+  # smarttags — plus flickr and smugmug, which are opt-in upstream but shipped here.
+  #
+  # Their Rust backends are compiled in (docs/plugin-system.md: no hot-loading), so a user
+  # cannot add them later without rebuilding, and splitting them into their own package would
+  # mean a second conflicting build of the same binary. Enabling them costs one pure-Rust
+  # crate (hmac) and no new system libraries — `cargo tree` adds no -sys crates — so depends
+  # is unaffected and the only price is a slightly larger binary.
+  #
   # --no-bundle stops Tauri from also producing deb/rpm/AppImage images we would discard.
-  npm run tauri build -- --no-bundle
+  npm run tauri build -- --no-bundle --features flickr,smugmug
 }
 
 check() {

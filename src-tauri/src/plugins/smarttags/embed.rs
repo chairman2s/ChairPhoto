@@ -373,6 +373,24 @@ fn run_clip(model_path_setting: Option<&str>, input: &[f32]) -> Result<Vec<f32>,
 mod tests {
     use super::*;
 
+    /// `true` when a usable ONNX Runtime is installed, otherwise `false` with a printed
+    /// reason.
+    ///
+    /// ONNX Runtime is loaded at runtime rather than linked, so it is an optional dependency
+    /// a developer — or a CI runner — may not have. Any test that reaches a session must skip
+    /// without it, the same way the model-dependent tests already skip on absent models.
+    /// Without this the suite fails on a machine that simply chose not to install inference.
+    #[cfg(feature = "smarttags")]
+    fn onnx_ready_or_skip(what: &str) -> bool {
+        match crate::plugins::onnx::ensure_available() {
+            Ok(_) => true,
+            Err(e) => {
+                eprintln!("skipping {what}: no usable ONNX Runtime ({e})");
+                false
+            }
+        }
+    }
+
     fn solid(w: u32, h: u32, rgb: [u8; 3]) -> RgbImage {
         let mut img = RgbImage::new(w, h);
         for p in img.pixels_mut() {
@@ -423,10 +441,8 @@ mod tests {
     fn missing_model_is_graceful_error() {
         // `build_pool` now rejects a missing ONNX Runtime before it looks at the model, so
         // without one this would assert against the runtime's error instead of the model's
-        // and quietly stop testing what it claims to. Skip rather than pass for the wrong
-        // reason — CI runners have no runtime installed.
-        if let Err(e) = crate::plugins::onnx::ensure_available() {
-            eprintln!("skipping missing_model_is_graceful_error: no ONNX Runtime ({e})");
+        // and quietly stop testing what it claims to — passing for the wrong reason.
+        if !onnx_ready_or_skip("missing_model_is_graceful_error") {
             return;
         }
         let err = match build_pool(Some("/nonexistent/smarttags/model.onnx")) {
@@ -450,6 +466,9 @@ mod tests {
     #[cfg(feature = "smarttags")]
     #[test]
     fn synthetic_onnx_roundtrip_is_unit_vector() {
+        if !onnx_ready_or_skip("synthetic_onnx_roundtrip_is_unit_vector") {
+            return;
+        }
         let dir = std::env::temp_dir().join(format!("st-onnx-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let model = dir.join("tiny.onnx");
@@ -477,6 +496,9 @@ mod tests {
         let Ok(path) = std::env::var("SMARTTAGS_TEST_MODEL") else {
             return; // no model configured → nothing to assert
         };
+        if !onnx_ready_or_skip("real_clip_model_when_env_set") {
+            return;
+        }
         let img = solid(256, 256, [90, 120, 200]);
         let emb = encode_rgb(&img, Some(&path)).expect("real CLIP embed");
         let norm: f32 = emb.iter().map(|x| x * x).sum::<f32>().sqrt();

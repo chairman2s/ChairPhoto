@@ -317,11 +317,12 @@ fn auraface_pool() -> Result<&'static Pool<ort::session::Session>, EngineError> 
 /// be cached in the `OnceLock` (`ModelError`/session errors aren't `Clone`); the caller
 /// re-wraps them into [`EngineError::Inference`]. A missing model surfaces its `ModelError`
 /// text (e.g. "model yunet not downloaded"), so the caller can still prompt a download rather
-/// than crash.
+/// than crash, and is reported before any session is built — so it needs no ONNX Runtime to
+/// diagnose. A missing *runtime* surfaces from [`crate::plugins::onnx::build_session`], which
+/// every session goes through precisely so that absence is reported instead of hung on.
 #[cfg(feature = "faces")]
 fn build_pool(spec: &models::ModelSpec) -> Result<Pool<ort::session::Session>, String> {
     use std::sync::atomic::Ordering;
-    // Before anything reaches ort. ONNX Runtime is loaded at runtime, and ort's own loader
     let path = models::verify(spec).map_err(|e| e.to_string())?;
     let size = POOL_SIZE.load(Ordering::Relaxed).max(1);
     let intra = INTRA_THREADS.load(Ordering::Relaxed).max(1);

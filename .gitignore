@@ -15,6 +15,14 @@ dist-ssr
 # Agent tooling and local workflow state
 .claude/
 
+# Working notes agents exchange with each other — reviews, findings, hand-offs between
+# sessions or between different agents. The directory and its README are tracked so the
+# convention survives a clone; everything an agent actually writes stays local. Keeping a
+# named home for these stops them landing in the repo root, where `git add -A` sweeps them
+# into unrelated commits.
+/agent-notes/*
+!/agent-notes/README.md
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json

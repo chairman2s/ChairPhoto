@@ -49,6 +49,7 @@ degrade one feature; they never crash the app** — but you'll want them.
 | **exiv2** | Primary embedded-preview extractor for RAW | Slower/failed RAW thumbnails |
 | **ffmpeg** | Video poster frames, slideshow `.mp4` render | No video thumbs, no slideshow |
 | **ImageMagick** *(with the libheif delegate)* | HEIF/HEIC (iPhone) decode | HEIC tiles show "no preview" |
+| **ONNX Runtime** *(1.24 or newer)* | Face tagging and Smart Tagging inference | Those two modules report the runtime is missing; everything else is unaffected |
 | **LibRaw** | Full-resolution RAW decode (build-time link) | Build fails unless you disable the `raw` feature |
 
 Building additionally needs a Rust toolchain, Node.js, and the usual Tauri Linux
@@ -62,6 +63,10 @@ sudo pacman -S --needed \
   perl-image-exiftool exiv2 ffmpeg imagemagick libheif libraw \
   clang pkgconf webkit2gtk-4.1 gtk3 librsvg \
   rust nodejs npm
+
+# Only for face tagging / Smart Tagging. onnxruntime-cuda substitutes for the CPU build
+# on an NVIDIA GPU, but the GPU is only used in a `faces-cuda`/`smarttags-cuda` build.
+sudo pacman -S --needed onnxruntime-cpu
 ```
 
 ### Debian / Ubuntu
@@ -72,6 +77,9 @@ sudo apt install \
   clang pkg-config libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev \
   nodejs npm
 # Rust via https://rustup.rs
+# ONNX Runtime (face tagging / Smart Tagging) is not packaged by Debian; install a
+# 1.24+ build from https://github.com/microsoft/onnxruntime/releases and point
+# ORT_DYLIB_PATH at its libonnxruntime.so, or skip those two features.
 ```
 
 *(Arch package names verified on the development machine; Debian names are the
@@ -112,8 +120,8 @@ cargo build --no-default-features --features edit,collage,slideshow
 |---|---|---|
 | `raw` | Full-res RAW decode | LibRaw + libclang at build time |
 | `edit` | Crop/tone render engine | none |
-| `faces` | Local face detect + recognise | ONNX Runtime + model download |
-| `smarttags` | Local CLIP tag suggestions | ONNX Runtime + ~350 MB model |
+| `faces` | Local face detect + recognise | ONNX Runtime at runtime + model download |
+| `smarttags` | Local CLIP tag suggestions | ONNX Runtime at runtime + ~350 MB model |
 | `ai` | Vision-model tag suggestions (Ollama or cloud) | network for cloud providers |
 | `map` | Geofences + reverse geocoding | network for the geocoder |
 | `flickr`, `smugmug` | Publishing via official APIs | — |

@@ -18,6 +18,7 @@ Read only the documents triggered by the task:
 | Storage, catalog roots, import, backup, merge | `docs/storage-and-import.md` |
 | Tags, vocabulary, XMP keywords | `docs/taxonomy.md` |
 | Modules and host API | `docs/plugin-system.md` |
+| What third-party modules can/cannot do, and why | `docs/module-capabilities.md` |
 | Editing and versions | `docs/editing.md` |
 | Publications and platform integrations | `docs/publications.md`, then the platform doc |
 | AI, Smart Tagging, faces, sharpness | `docs/ai-tagging.md`, `docs/face-tagging.md`, `docs/sharpness-culling.md` |

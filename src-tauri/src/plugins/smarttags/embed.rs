@@ -288,14 +288,11 @@ fn build_pool(model_path_setting: Option<&str>) -> Result<Pool<ort::session::Ses
     let mut sessions = Vec::with_capacity(size);
     let mut used_cuda = false;
     for _ in 0..size {
-        let mut builder = ort::session::Session::builder()
-            .map_err(|e| e.to_string())?
-            .with_intra_threads(intra)
-            .map_err(|e| e.to_string())?;
-        if try_register_cuda(&mut builder) {
-            used_cuda = true;
-        }
-        let session = builder.commit_from_file(&path).map_err(|e| e.to_string())?;
+        // `build_session` runs the ONNX Runtime preflight; a session must never be built
+        // directly, or a missing runtime hangs instead of erroring. See plugins::onnx.
+        let (session, cuda) =
+            crate::plugins::onnx::build_session(&path, intra, try_register_cuda)?;
+        used_cuda |= cuda;
         sessions.push(session);
     }
     set_active_ep(if used_cuda { ActiveEp::Cuda } else { ActiveEp::Cpu });
@@ -369,6 +366,24 @@ fn run_clip(model_path_setting: Option<&str>, input: &[f32]) -> Result<Vec<f32>,
 mod tests {
     use super::*;
 
+    /// `true` when a usable ONNX Runtime is installed, otherwise `false` with a printed
+    /// reason.
+    ///
+    /// ONNX Runtime is loaded at runtime rather than linked, so it is an optional dependency
+    /// a developer — or a CI runner — may not have. Any test that reaches a session must skip
+    /// without it, the same way the model-dependent tests already skip on absent models.
+    /// Without this the suite fails on a machine that simply chose not to install inference.
+    #[cfg(feature = "smarttags")]
+    fn onnx_ready_or_skip(what: &str) -> bool {
+        match crate::plugins::onnx::ensure_available() {
+            Ok(_) => true,
+            Err(e) => {
+                eprintln!("skipping {what}: no usable ONNX Runtime ({e})");
+                false
+            }
+        }
+    }
+
     fn solid(w: u32, h: u32, rgb: [u8; 3]) -> RgbImage {
         let mut img = RgbImage::new(w, h);
         for p in img.pixels_mut() {
@@ -417,6 +432,10 @@ mod tests {
     #[cfg(feature = "smarttags")]
     #[test]
     fn missing_model_is_graceful_error() {
+        // Runs without an ONNX Runtime: `build_pool` resolves and verifies the model before
+        // `build_session` performs the runtime preflight, so a missing model is reported on
+        // its own terms. This briefly needed a skip guard, when the preflight ran first and
+        // the runtime's error would have been asserted against instead of the model's.
         let err = match build_pool(Some("/nonexistent/smarttags/model.onnx")) {
             Err(e) => e,
             Ok(_) => panic!("a missing model must fail cleanly, not build a pool"),
@@ -438,6 +457,9 @@ mod tests {
     #[cfg(feature = "smarttags")]
     #[test]
     fn synthetic_onnx_roundtrip_is_unit_vector() {
+        if !onnx_ready_or_skip("synthetic_onnx_roundtrip_is_unit_vector") {
+            return;
+        }
         let dir = std::env::temp_dir().join(format!("st-onnx-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let model = dir.join("tiny.onnx");
@@ -465,6 +487,9 @@ mod tests {
         let Ok(path) = std::env::var("SMARTTAGS_TEST_MODEL") else {
             return; // no model configured → nothing to assert
         };
+        if !onnx_ready_or_skip("real_clip_model_when_env_set") {
+            return;
+        }
         let img = solid(256, 256, [90, 120, 200]);
         let emb = encode_rgb(&img, Some(&path)).expect("real CLIP embed");
         let norm: f32 = emb.iter().map(|x| x * x).sum::<f32>().sqrt();

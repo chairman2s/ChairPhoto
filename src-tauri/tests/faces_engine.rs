@@ -15,9 +15,18 @@
 
 use chairphoto_lib::plugins::faces::{self, engine};
 
-/// Ensure the models are available, or return `false` (with a skip message) when they are not
-/// and downloading was not opted into.
+/// Ensure the models *and* the ONNX Runtime are available, or return `false` (with a skip
+/// message) when they are not and downloading was not opted into.
+///
+/// ONNX Runtime is loaded at runtime rather than linked, so it is an optional dependency a
+/// developer may not have installed. Skipping keeps `cargo test` green on such a machine, the
+/// same way absent models already do — the runtime's own failure path is covered by the unit
+/// tests in `plugins::onnx`, which need no runtime to assert against.
 fn models_ready_or_skip(what: &str) -> bool {
+    if let Err(e) = chairphoto_lib::plugins::onnx::ensure_available() {
+        eprintln!("skipping {what}: no usable ONNX Runtime ({e})");
+        return false;
+    }
     if faces::models::status().ready {
         return true;
     }

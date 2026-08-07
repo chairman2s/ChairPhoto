@@ -322,25 +322,21 @@ fn auraface_pool() -> Result<&'static Pool<ort::session::Session>, EngineError> 
 fn build_pool(spec: &models::ModelSpec) -> Result<Pool<ort::session::Session>, String> {
     use std::sync::atomic::Ordering;
     // Before anything reaches ort. ONNX Runtime is loaded at runtime, and ort's own loader
-    // hangs indefinitely rather than erroring when it is absent, so this is the only place a
-    // missing runtime can be turned into a reportable failure. See plugins::onnx.
-    crate::plugins::onnx::ensure_available()?;
     let path = models::verify(spec).map_err(|e| e.to_string())?;
     let size = POOL_SIZE.load(Ordering::Relaxed).max(1);
     let intra = INTRA_THREADS.load(Ordering::Relaxed).max(1);
     let mut sessions = Vec::with_capacity(size);
     let mut used_cuda = false;
     for _ in 0..size {
-        let mut builder = ort::session::Session::builder()
-            .map_err(|e| e.to_string())?
-            .with_intra_threads(intra)
-            .map_err(|e| e.to_string())?;
-        // Try GPU first (only in a `faces-cuda` build, and only if not forced to CPU). On
-        // any failure this logs and leaves the builder on CPU — never an error, never a crash.
-        if try_register_cuda(&mut builder) {
-            used_cuda = true;
-        }
-        let session = builder.commit_from_file(&path).map_err(|e| e.to_string())?;
+        // `build_session` runs the ONNX Runtime preflight; a session must never be built
+        // directly, or a missing runtime hangs instead of erroring. See plugins::onnx.
+        //
+        // GPU is tried first (only in a `faces-cuda` build, and only if not forced to CPU).
+        // On any failure `try_register_cuda` logs and leaves the builder on CPU — never an
+        // error, never a crash.
+        let (session, cuda) =
+            crate::plugins::onnx::build_session(&path, intra, try_register_cuda)?;
+        used_cuda |= cuda;
         sessions.push(session);
     }
     // Record where this pool landed. The first pool built wins the global (both models build

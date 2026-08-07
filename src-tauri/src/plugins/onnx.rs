@@ -184,6 +184,42 @@ pub fn ensure_available() -> Result<&'static str, String> {
     }
 }
 
+/// Build one ONNX session against the model at `model_path`.
+///
+/// **This is the only supported way to obtain an `ort` session.** Constructing one directly
+/// skips [`ensure_available`], and ort's loader does not fail when the runtime is missing —
+/// it hangs indefinitely with no error. A module that forgot the preflight would not fail
+/// loudly during review; it would ship, and then wedge for any user without the runtime
+/// installed. `ort_sessions_are_only_built_through_this_module` fails the build rather than
+/// relying on the next author knowing that.
+///
+/// `register_ep` is where a caller adds an execution provider, because that part genuinely
+/// differs per module: the CUDA feature gates (`faces-cuda`, `smarttags-cuda`) and the
+/// force-CPU settings are owned by each plugin. It returns whether its provider was
+/// registered, which is returned alongside the session so callers can report GPU-vs-CPU.
+/// Registering must never be fatal — a provider that fails to attach leaves the builder on
+/// CPU.
+#[cfg(any(feature = "faces", feature = "smarttags"))]
+pub fn build_session<F>(
+    model_path: &std::path::Path,
+    intra_threads: usize,
+    register_ep: F,
+) -> Result<(ort::session::Session, bool), String>
+where
+    F: FnOnce(&mut ort::session::builder::SessionBuilder) -> bool,
+{
+    ensure_available()?;
+    let mut builder = ort::session::Session::builder()
+        .map_err(|e| e.to_string())?
+        .with_intra_threads(intra_threads.max(1))
+        .map_err(|e| e.to_string())?;
+    let registered = register_ep(&mut builder);
+    let session = builder
+        .commit_from_file(model_path)
+        .map_err(|e| e.to_string())?;
+    Ok((session, registered))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -228,6 +264,44 @@ mod tests {
         assert!(
             err.contains("could not be loaded"),
             "error should explain the runtime is missing, got: {err}"
+        );
+    }
+
+    /// No module may construct an ort session itself; [`build_session`] is the only route,
+    /// because it is the only one that runs the preflight.
+    ///
+    /// This is the point of the facade. A future plugin — a car detector, anything — that
+    /// calls `Session::builder()` directly compiles cleanly, passes review, and then hangs
+    /// forever for every user without ONNX Runtime installed. Nothing else catches that: the
+    /// author gets a working build because *their* machine has the runtime, exactly as
+    /// happened when this change was first written. So the rule is enforced here instead of
+    /// documented and hoped for.
+    ///
+    /// Scans source rather than relying on visibility because Rust has no way to restrict a
+    /// dependency to one module within a crate.
+    #[test]
+    fn ort_sessions_are_only_built_through_this_module() {
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let facade = src.join("plugins").join("onnx.rs");
+
+        let offenders: Vec<String> = walkdir::WalkDir::new(&src)
+            .into_iter()
+            .filter_map(Result::ok)
+            .filter(|e| e.file_type().is_file())
+            .filter(|e| e.path().extension().is_some_and(|x| x == "rs"))
+            .filter(|e| e.path() != facade)
+            .filter(|e| {
+                std::fs::read_to_string(e.path())
+                    .is_ok_and(|text| text.contains("Session::builder"))
+            })
+            .map(|e| e.path().display().to_string())
+            .collect();
+
+        assert!(
+            offenders.is_empty(),
+            "these build an ort session directly and so skip the runtime preflight, which \
+             means they hang instead of erroring when ONNX Runtime is absent — use \
+             plugins::onnx::build_session instead: {offenders:?}"
         );
     }
 

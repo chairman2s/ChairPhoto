@@ -6,7 +6,7 @@ Reviewed at `010027c`. CI green (Backend 5m0s, Frontend 18s).
 Self-review: the same session wrote this code, so these are the defects found by
 re-examining it, not an independent assessment.
 
-All findings below are resolved as of `6e78000` unless their **Status** says otherwise.
+All findings below are resolved as of `203afec` unless their **Status** says otherwise.
 Each finding keeps its original wording; status lines were added afterwards.
 See [Resolution](#resolution) at the end.
 
@@ -75,10 +75,21 @@ safer and faster. Replace the comment with why the handle is intentionally kept.
 
 **Severity:** medium — silent future breakage
 **Where:** `src-tauri/src/plugins/onnx.rs:31`, `src-tauri/Cargo.toml` (ort feature list)
-**Status:** partly fixed in `6e78000`. Both declarations now cross-reference each other, and
-`min_minor_matches_the_enabled_ort_api_feature` fails if the constant moves. That is a
-**tripwire, not a derived check** — the `cfg!` ladder suggested below was judged not worth
-its cost, which is a reasonable call to disagree with.
+**Status:** properly fixed in `203afec`. The first attempt (`6e78000`) did not work and was
+described too generously here as a "tripwire": `assert_eq!(MIN_MINOR, 24)` only fires when
+someone edits *the constant*, which is the harmless direction. The dangerous direction —
+`Cargo.toml` moving to `api-25` while the constant stays — passed straight through it. It
+could not detect the drift at all, under a name and doc comment claiming it did.
+
+ort already exposes the value: `pub const MINOR_VERSION: u32 = ort_sys::ORT_API_VERSION`
+(`ort/src/lib.rs:86`), computed from whichever `api-*` feature is enabled. `MIN_MINOR` is now
+derived from it, so the drift class is gone rather than watched for, and the misleading test
+is deleted. The derived value resolves to 24, identical to the literal it replaced.
+
+That trade introduces a smaller risk in its place: the floor is no longer readable in the
+file, so a bad derivation would be invisible, and a floor of `0` would accept every runtime
+while every test still passed. The probe test now prints the floor and asserts it is at least
+17, the oldest API ort supports — checking the derivation rather than restating the value.
 
 The probe's floor is a hand-written constant. ort's requirement comes from its `api-24`
 feature. Upgrade ort to `api-25` and the probe keeps accepting 1.24 runtimes, ort rejects
@@ -263,8 +274,9 @@ Fixed in `6e78000`, across five files:
 
 | File | Addresses |
 |---|---|
-| `src-tauri/src/plugins/onnx.rs` | self-review 1, 2, 3, 4 |
+| `src-tauri/src/plugins/onnx.rs` | self-review 1, 2, 3 (redone in `203afec`), 4 |
 | `src-tauri/Cargo.toml` | Codex 2, self-review 3 |
+| *(follow-up)* `203afec` | self-review 3, properly |
 | `packaging/PKGBUILD` | Codex spec, packaging note |
 | `packaging/README.md` | Codex 1 |
 | `README.md` | follow-up sweep |
@@ -281,3 +293,19 @@ runtime would satisfy the dependency and still run on CPU. Corrected before comm
 `ORT_DYLIB_PATH` pointed at a nonexistent file — all exit 0, 524 passed, 0 failed, no warnings.
 `makepkg` exits 0 with `check()` executing; namcap reports only the known `ld-linux` false
 positive. CI green on `6e78000` (run 31171578795).
+
+### Follow-up review pass (`203afec`)
+
+A second Codex pass confirmed findings 1, 2, 4, the packaging spec finding, and the doc
+cleanups, and rejected the fix for finding 3 as not catching the drift it claimed to. That was
+correct — see finding 3's status. Fixed by deriving from `ort::MINOR_VERSION`.
+
+That pass explicitly did not rerun `makepkg` or the full test suite, so both were rerun here
+after the change: `cargo test` in both runtime conditions (523 passed, 0 failed — one fewer
+than `6e78000`, the deleted tripwire), plus a full package build.
+
+Two review passes have now each caught a class the other missed. The self-review went deep on
+the new file and ignored what the change invalidated elsewhere; the follow-up caught that blast
+radius and then caught a fix that asserted the wrong invariant under a confident name. The
+recurring failure is not missing detail — it is stating a conclusion more strongly than the
+evidence supports.

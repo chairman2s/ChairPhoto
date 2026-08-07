@@ -281,10 +281,6 @@ fn clip_pool(
 #[cfg(feature = "smarttags")]
 fn build_pool(model_path_setting: Option<&str>) -> Result<Pool<ort::session::Session>, String> {
     use std::sync::atomic::Ordering;
-    // Before anything reaches ort. ONNX Runtime is loaded at runtime, and ort's own loader
-    // hangs indefinitely rather than erroring when it is absent, so this is the only place a
-    // missing runtime can be turned into a reportable failure. See plugins::onnx.
-    crate::plugins::onnx::ensure_available()?;
     let (path, custom) = models::resolve_model_path(model_path_setting).map_err(|e| e.to_string())?;
     let path = models::verify(&path, custom).map_err(|e| e.to_string())?;
     let size = POOL_SIZE.load(Ordering::Relaxed).max(1);
@@ -292,14 +288,11 @@ fn build_pool(model_path_setting: Option<&str>) -> Result<Pool<ort::session::Ses
     let mut sessions = Vec::with_capacity(size);
     let mut used_cuda = false;
     for _ in 0..size {
-        let mut builder = ort::session::Session::builder()
-            .map_err(|e| e.to_string())?
-            .with_intra_threads(intra)
-            .map_err(|e| e.to_string())?;
-        if try_register_cuda(&mut builder) {
-            used_cuda = true;
-        }
-        let session = builder.commit_from_file(&path).map_err(|e| e.to_string())?;
+        // `build_session` runs the ONNX Runtime preflight; a session must never be built
+        // directly, or a missing runtime hangs instead of erroring. See plugins::onnx.
+        let (session, cuda) =
+            crate::plugins::onnx::build_session(&path, intra, try_register_cuda)?;
+        used_cuda |= cuda;
         sessions.push(session);
     }
     set_active_ep(if used_cuda { ActiveEp::Cuda } else { ActiveEp::Cpu });
@@ -439,12 +432,10 @@ mod tests {
     #[cfg(feature = "smarttags")]
     #[test]
     fn missing_model_is_graceful_error() {
-        // `build_pool` now rejects a missing ONNX Runtime before it looks at the model, so
-        // without one this would assert against the runtime's error instead of the model's
-        // and quietly stop testing what it claims to — passing for the wrong reason.
-        if !onnx_ready_or_skip("missing_model_is_graceful_error") {
-            return;
-        }
+        // Runs without an ONNX Runtime: `build_pool` resolves and verifies the model before
+        // `build_session` performs the runtime preflight, so a missing model is reported on
+        // its own terms. This briefly needed a skip guard, when the preflight ran first and
+        // the runtime's error would have been asserted against instead of the model's.
         let err = match build_pool(Some("/nonexistent/smarttags/model.onnx")) {
             Err(e) => e,
             Ok(_) => panic!("a missing model must fail cleanly, not build a pool"),

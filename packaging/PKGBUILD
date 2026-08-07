@@ -45,7 +45,10 @@ makedepends=(
 
 # Missing runtime tools degrade one feature each; they never crash the app.
 optdepends=(
-  'onnxruntime-cpu: face detection/recognition and Smart Tagging'
+  # onnxruntime-cuda satisfies this too (same soname, and it conflicts with onnxruntime-cpu),
+  # but it buys nothing here: GPU inference needs the faces-cuda/smarttags-cuda features,
+  # which this package does not build. See packaging/README.md.
+  'onnxruntime-cpu: face detection/recognition and Smart Tagging (1.24 or newer)'
   'perl-image-exiftool: EXIF/IPTC/XMP extraction and RAW preview fallback'
   'exiv2: primary embedded-preview extractor for RAW thumbnails'
   'ffmpeg: video poster frames and slideshow .mp4 rendering'
@@ -108,7 +111,11 @@ check() {
   # silently becomes a hard requirement again — every user would be made to install a ~25 MB
   # inference runtime, while this recipe still advertises it as optional. Nothing else in the
   # build fails when that happens, so assert it here.
-  if ldd "src-tauri/target/release/$pkgname" | grep -q 'libonnxruntime'; then
+  #
+  # readelf, not ldd: ldd prints the whole resolved closure, so it would also fire on a
+  # dependency that pulled ONNX Runtime in transitively — a binary this recipe has no quarrel
+  # with. NEEDED is the invariant, so read NEEDED.
+  if readelf -d "src-tauri/target/release/$pkgname" | grep NEEDED | grep -q 'libonnxruntime'; then
     echo "==> ERROR: the binary links libonnxruntime; it must dlopen it instead." >&2
     echo "    Check that the ort dependency in src-tauri/Cargo.toml still sets" >&2
     echo "    default-features = false with the \`load-dynamic\` feature." >&2

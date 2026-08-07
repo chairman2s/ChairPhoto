@@ -53,9 +53,13 @@ faces = ["dep:ort", "dep:reqwest", "dep:libloading"]
 # Optional GPU acceleration for face inference: enables `ort`'s CUDA execution provider
 # (NVIDIA GPUs). Additive — implies `faces`. When compiled in, the session builder tries to
 # register the CUDA EP and falls back to CPU (never crashing) when the CUDA runtime/cuDNN or a
-# GPU is missing; a setting (`faces.force_cpu`) forces CPU even when CUDA is available. The
-# `ort` `download-binaries` strategy fetches a CUDA-enabled ONNX Runtime (cu13/cu12 picked from
-# the detected toolkit). Off by default so the standard build stays CPU-only and portable.
+# GPU is missing; a setting (`faces.force_cpu`) forces CPU even when CUDA is available.
+#
+# Since ONNX Runtime is now loaded rather than downloaded, whether this actually reaches the
+# GPU depends on *which runtime is installed*, not on how the binary was built: a CUDA-enabled
+# ONNX Runtime (Arch: onnxruntime-cuda, which provides the same soname as onnxruntime-cpu and
+# conflicts with it) registers the EP, and a CPU-only one falls back. The same binary works
+# either way. Off by default so the standard build stays CPU-only and portable.
 # See docs/face-tagging.md (CUDA section).
 faces-cuda = ["faces", "ort/cuda"]
 # The Smart Tagging module's backend (local CLIP image embeddings → kNN tag suggestions).
@@ -126,6 +130,11 @@ tauri-plugin-dialog = "2.7.1"
 # The cost is that ort's loader does not fail cleanly when the library is absent: it hangs
 # indefinitely with no error. Nothing may call into ort before `plugins::onnx` has confirmed
 # the runtime is loadable. See docs/face-tagging.md and packaging/PKGBUILD.
+#
+# `api-24` and `MIN_MINOR` in plugins/onnx.rs must move together: the probe enforces the same
+# floor ort does, and a raise here without one there leaves the probe accepting runtimes ort
+# rejects — which is the hang again. `min_minor_matches_the_enabled_ort_api_feature` fails
+# when they drift.
 ort = { version = "2.0.0-rc.10", optional = true, default-features = false, features = [
   "load-dynamic",
   "ndarray",

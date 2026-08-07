@@ -11,30 +11,40 @@ separate source of truth.
 | `PKGBUILD` | The package recipe. |
 | `chairphoto.desktop` | Launcher entry, plus the `chairphoto://` scheme registration. |
 
-## Why `onnxruntime-cpu` is a hard dependency
+## Why `onnxruntime-cpu` is an *optional* dependency
 
 Face tagging and Smart Tagging run inference through `ort`. Left alone, `ort` downloads its
 own ONNX Runtime during the build — fine for development, wrong for a distro package, which
 must build from declared dependencies rather than an unpinned network fetch.
 
-`src-tauri/Cargo.toml` enables ort's `pkg-config` feature. `ort-sys` probes for
-`libonnxruntime` *before* its download path and returns early when it finds a usable one, so
-the change is additive: a machine with `onnxruntime-cpu` installed links the system library
-and downloads nothing, and a machine without one behaves exactly as before.
+`src-tauri/Cargo.toml` turns `download-binaries` off and enables ort's `load-dynamic`
+instead, so the binary carries no `libonnxruntime` in its `NEEDED` entries and `dlopen`s the
+library on first use. That is what lets this recipe list it under `optdepends`: a user who
+never opens face tagging or Smart Tagging does not install a ~25 MB inference runtime to run
+a photo organiser. It matches how `exiftool`, `ffmpeg`, and ImageMagick are already treated —
+missing one degrades its feature and nothing else.
 
-Two details make this worth guarding rather than trusting:
+The catch is that ort does not degrade politely. Its loader **hangs indefinitely with no
+error** when the library is absent, which is worse than crashing: no message, no recovery,
+and a wedged worker. So `src-tauri/src/plugins/onnx.rs` loads the library itself first,
+caches the verdict, and returns an error before anything reaches ort. It mirrors ort's own
+resolution (`ORT_DYLIB_PATH`, then next to the executable, then the loader's search path) and
+asks the same three questions ort asks — symbol present, version at or above the floor, and
+`GetApi` non-null at that level — because a probe answering a different question would let
+the hang through.
 
-- ort **ignores** a system library whose minor version is below the C API level it targets
-  (24, from its default `api-24` feature) and quietly downloads instead.
-- The fallback is silent. A missing `.pc` file produces a working package that ignored its
-  own dependency.
+`check()` asserts the outcome rather than trusting it: if `libonnxruntime` ever reappears in
+`NEEDED`, the `load-dynamic` feature was lost somewhere and this "optional" dependency
+quietly became mandatory again, with nothing else in the build objecting.
 
-So `build()` checks for `libonnxruntime` and its version explicitly and fails the build
-rather than letting either case slide.
+### GPU
 
-`onnxruntime-cuda` exists in `extra` too, but CUDA support is a compile-time feature
-(`faces-cuda`, `smarttags-cuda`), so GPU inference needs a separate package variant rather
-than a swapped dependency.
+`onnxruntime-cuda` provides the same soname and conflicts with `onnxruntime-cpu`, so the two
+are drop-in alternatives — the same binary runs against either. Whether the GPU is actually
+used is decided at *build* time, though: the CUDA execution provider only exists in a build
+with the `faces-cuda` / `smarttags-cuda` features, which this package does not enable.
+Installing `onnxruntime-cuda` alongside this package therefore satisfies the runtime and
+still runs on CPU. GPU inference needs a package variant built with those features.
 
 ## Why `options=(!lto)`
 

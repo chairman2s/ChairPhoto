@@ -18,9 +18,11 @@
 //! 1. `ORT_DYLIB_PATH` when set and non-empty, else the platform default name;
 //! 2. a relative name is tried against the executable's directory first, then left bare for
 //!    the dynamic loader's own search path;
-//! 3. `OrtGetApiBase` must be present, and the runtime's minor version must be at least
-//!    [`MIN_MINOR`] — ort refuses an older runtime, and refusing it here means an explicit
-//!    error instead of that same hang.
+//! 3. `OrtGetApiBase` must be present, the runtime's minor version must be at least
+//!    [`MIN_MINOR`], and `GetApi(MIN_MINOR)` must return non-null — the last because that is
+//!    the call ort actually makes and unwraps, so a runtime can report a new enough version
+//!    and still panic there. Refusing all three here means an explicit error instead of that
+//!    same hang or panic.
 
 use std::ffi::{c_char, c_void, CStr};
 use std::path::PathBuf;
@@ -32,8 +34,8 @@ const MIN_MINOR: u32 = 24;
 
 /// The two entry points every ONNX Runtime exports. This is the C API's stable entry
 /// struct — the one part whose layout cannot change without breaking every consumer — so
-/// declaring it here avoids taking a direct dependency on `ort-sys` just to read a version.
-/// Only the leading two members are declared because only they are read.
+/// declaring it here avoids taking a direct dependency on `ort-sys` just to run this check.
+/// Only the leading two members are declared because only they are called.
 #[repr(C)]
 struct OrtApiBase {
     get_api: unsafe extern "C" fn(u32) -> *const c_void,
@@ -76,56 +78,91 @@ const fn default_dylib_name() -> &'static str {
     }
 }
 
-/// Load the runtime and read its version. The [`libloading::Library`] is dropped on the way
-/// out: this only answers "would ort succeed?", and ort keeps its own handle. Unloading and
-/// reloading the same shared object is cheap because the OS keeps it mapped for the process.
+/// Load the runtime, read its version, and confirm it serves the API level ort will ask for.
 fn probe() -> Result<String, String> {
     probe_at(&dylib_path())
 }
 
 /// [`probe`] against an explicit path, so tests can exercise the failure path without
 /// mutating `ORT_DYLIB_PATH` — which would race every other test in the binary.
+///
+/// On success the [`libloading::Library`] handle is deliberately leaked. ort dlopens the same
+/// file moments later; keeping this handle makes that a refcount bump instead of an unload
+/// followed by a fresh map. Dropping it here would take the refcount to zero — nothing else
+/// holds a reference at probe time — and unloading a library that registers atexit handlers
+/// and thread-local destructors, as ONNX Runtime does, only to immediately reload it is risk
+/// taken for nothing. One handle per process, and only when the runtime is usable.
 fn probe_at(path: &std::path::Path) -> Result<String, String> {
+    // Deliberately worded to avoid the "not available"/"no file" phrasing the model managers
+    // use: a runtime failure and a missing-model failure must stay tellable apart, including
+    // by the tests that assert on each.
+    //
     // SAFETY: loading a shared library runs its initialisers, which is exactly what ort will
-    // do moments later. Reading `OrtGetApiBase` and calling `GetVersionString` matches the
-    // documented C API; both are infallible once the symbol resolves.
-    unsafe {
-        // Deliberately worded to avoid the "not available"/"no file" phrasing the model
-        // managers use: a runtime failure and a missing-model failure must stay tellable
-        // apart, including by the tests that assert on each.
-        let lib = libloading::Library::new(path).map_err(|e| {
-            format!(
-                "ONNX Runtime could not be loaded from `{}` ({e}). \
-                 Install onnxruntime (Arch: onnxruntime-cpu), or set ORT_DYLIB_PATH.",
-                path.display()
-            )
-        })?;
+    // do moments later.
+    let lib = unsafe { libloading::Library::new(path) }.map_err(|e| {
+        format!(
+            "ONNX Runtime could not be loaded from `{}` ({e}). \
+             Install onnxruntime (Arch: onnxruntime-cpu, or onnxruntime-cuda for GPU), \
+             or set ORT_DYLIB_PATH.",
+            path.display()
+        )
+    })?;
+
+    // Scoped so the symbol's borrow of `lib` ends before the handle is leaked below.
+    let probed = (|| -> Result<String, String> {
+        // SAFETY: `OrtGetApiBase` and the two members read from it are the ONNX Runtime C
+        // API's documented entry points, and their layout is fixed by that contract.
         let base_getter: libloading::Symbol<unsafe extern "C" fn() -> *const OrtApiBase> =
-            lib.get(b"OrtGetApiBase").map_err(|_| {
+            unsafe { lib.get(b"OrtGetApiBase") }.map_err(|_| {
                 format!(
                     "`{}` is not an ONNX Runtime library (no OrtGetApiBase symbol).",
                     path.display()
                 )
             })?;
-        let base = base_getter();
+        let base = unsafe { base_getter() };
         if base.is_null() {
             return Err(format!("`{}` returned a null OrtApiBase.", path.display()));
         }
-        let version = CStr::from_ptr(((*base).get_version_string)())
+
+        let version = unsafe { CStr::from_ptr(((*base).get_version_string)()) }
             .to_string_lossy()
             .into_owned();
-        let minor = version
-            .split('.')
-            .nth(1)
-            .and_then(|m| m.parse::<u32>().ok())
-            .unwrap_or(0);
+        let Some(minor) = version.split('.').nth(1).and_then(|m| m.parse::<u32>().ok()) else {
+            // Distinct from "too old": an unparseable version is not evidence of an old
+            // runtime, and telling the user to upgrade a current one wastes their time.
+            return Err(format!(
+                "could not read a version from the ONNX Runtime at `{}` (got {version:?}).",
+                path.display()
+            ));
+        };
         if minor < MIN_MINOR {
             return Err(format!(
                 "ONNX Runtime {version} at `{}` is too old; 1.{MIN_MINOR} or newer is required.",
                 path.display()
             ));
         }
+
+        // The version string is not the check that matters. ort calls
+        // `GetApi(ORT_API_VERSION)` and unwraps the result, so a runtime that reports a new
+        // enough version but declines that API level would pass every check above and then
+        // panic inside ort. Ask the same question ort asks.
+        if unsafe { ((*base).get_api)(MIN_MINOR) }.is_null() {
+            return Err(format!(
+                "ONNX Runtime {version} at `{}` does not provide API version {MIN_MINOR}.",
+                path.display()
+            ));
+        }
+
         Ok(version)
+    })();
+
+    match probed {
+        Ok(version) => {
+            std::mem::forget(lib);
+            Ok(version)
+        }
+        // Unusable: let the handle drop, since nothing will load it.
+        Err(e) => Err(e),
     }
 }
 
@@ -178,6 +215,20 @@ mod tests {
         assert!(
             err.contains("could not be loaded"),
             "error should explain the runtime is missing, got: {err}"
+        );
+    }
+
+    /// `MIN_MINOR` must match the `api-N` feature enabled on ort in Cargo.toml. They are
+    /// separate declarations in separate files with no compile-time relationship, so an ort
+    /// upgrade can raise the API level and leave the probe accepting runtimes ort will
+    /// reject — restoring the hang for exactly the users this module protects. Fails loudly
+    /// if the `api-24` assumption ever stops holding.
+    #[test]
+    fn min_minor_matches_the_enabled_ort_api_feature() {
+        assert_eq!(
+            MIN_MINOR, 24,
+            "MIN_MINOR must track ort's enabled api-N feature in Cargo.toml; \
+             update both together"
         );
     }
 

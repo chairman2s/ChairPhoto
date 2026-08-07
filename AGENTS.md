@@ -197,6 +197,11 @@ Commit messages, reviews, and status reports are part of the engineering record.
   without asking; never push without permission.
 - Do not add work on top of unrelated uncommitted changes; surface them first.
 - Before committing, confirm repository-local identity and review the staged diff and trailers.
+- Working notes — review findings, hand-offs between agents — go in `agent-notes/`, which is
+  ignored except for its README. Anything a future reader would need belongs in `docs/`, a
+  comment, or a commit message instead.
+- `git add -A` stages whatever is lying around. Check `git status --short` before it, and
+  `git ls-files <path>` rather than memory when asserting a file is untracked.
 
 ### Versioning
 

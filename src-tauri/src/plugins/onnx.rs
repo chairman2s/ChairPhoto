@@ -28,9 +28,13 @@ use std::ffi::{c_char, c_void, CStr};
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
-/// The ONNX Runtime minor version ort targets, from its `api-24` feature (`1.24.x`). ort
-/// rejects anything older, so the probe must apply the same floor.
-const MIN_MINOR: u32 = 24;
+/// The ONNX Runtime minor version ort requires, taken from ort itself rather than restated
+/// here. `ort::MINOR_VERSION` is `ort_sys::ORT_API_VERSION`, which is computed from whichever
+/// `api-*` feature is enabled, so raising that feature raises this floor with it and the two
+/// cannot drift. A hand-written constant could sit at 24 while the feature moved to 25,
+/// leaving the probe to accept runtimes ort then rejects — which is the hang this module
+/// exists to prevent.
+const MIN_MINOR: u32 = ort::MINOR_VERSION;
 
 /// The two entry points every ONNX Runtime exports. This is the C API's stable entry
 /// struct — the one part whose layout cannot change without breaking every consumer — so
@@ -190,6 +194,15 @@ mod tests {
     /// matching `tests/faces_engine.rs`; the failure path is covered unconditionally below.
     #[test]
     fn probe_accepts_an_installed_runtime() {
+        // The floor is derived from ort's enabled api-* feature, so it is not readable from
+        // this file. Print it: a wrong derivation would otherwise be invisible here, since
+        // too low a floor accepts everything and asserts nothing.
+        eprintln!("probe floor: ONNX Runtime 1.{MIN_MINOR} or newer");
+        assert!(
+            MIN_MINOR >= 17,
+            "derived floor {MIN_MINOR} is below the oldest API ort supports; \
+             ort::MINOR_VERSION did not resolve to a real API level"
+        );
         match ensure_available() {
             Ok(version) => {
                 let minor: u32 = version
@@ -215,20 +228,6 @@ mod tests {
         assert!(
             err.contains("could not be loaded"),
             "error should explain the runtime is missing, got: {err}"
-        );
-    }
-
-    /// `MIN_MINOR` must match the `api-N` feature enabled on ort in Cargo.toml. They are
-    /// separate declarations in separate files with no compile-time relationship, so an ort
-    /// upgrade can raise the API level and leave the probe accepting runtimes ort will
-    /// reject — restoring the hang for exactly the users this module protects. Fails loudly
-    /// if the `api-24` assumption ever stops holding.
-    #[test]
-    fn min_minor_matches_the_enabled_ort_api_feature() {
-        assert_eq!(
-            MIN_MINOR, 24,
-            "MIN_MINOR must track ort's enabled api-N feature in Cargo.toml; \
-             update both together"
         );
     }
 

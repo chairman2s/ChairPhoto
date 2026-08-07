@@ -6,7 +6,9 @@ Reviewed at `010027c`. CI green (Backend 5m0s, Frontend 18s).
 Self-review: the same session wrote this code, so these are the defects found by
 re-examining it, not an independent assessment.
 
-Nothing here is fixed. Four findings plus one accepted risk.
+All findings below are resolved as of `6e78000` unless their **Status** says otherwise.
+Each finding keeps its original wording; status lines were added afterwards.
+See [Resolution](#resolution) at the end.
 
 ---
 
@@ -14,6 +16,9 @@ Nothing here is fixed. Four findings plus one accepted risk.
 
 **Severity:** high — leaves the change's stated goal partly unmet
 **Where:** `src-tauri/src/plugins/onnx.rs:39`, `:114`
+**Status:** fixed in `6e78000`. `get_api(MIN_MINOR)` is called and a null return rejected.
+Adding the check risked rejecting a *good* runtime, so it was verified the other way too:
+the probe still accepts the installed 1.27.1 and real inference still detects 4 faces.
 
 `probe_at` validates the runtime's *version string* and stops there. ort does more:
 
@@ -40,6 +45,8 @@ error naming the API version that was refused.
 
 **Severity:** medium — latent stability risk, one-line fix
 **Where:** `src-tauri/src/plugins/onnx.rs:96-129`
+**Status:** fixed in `6e78000`. The handle is leaked on success via `std::mem::forget`, and
+the comment that defended the drop is replaced with why it is kept.
 
 `lib` is dropped at the end of `probe_at`, which calls `dlclose`. Nothing else holds a
 reference at that point, so the refcount reaches zero and the library may be fully unloaded —
@@ -68,6 +75,10 @@ safer and faster. Replace the comment with why the handle is intentionally kept.
 
 **Severity:** medium — silent future breakage
 **Where:** `src-tauri/src/plugins/onnx.rs:31`, `src-tauri/Cargo.toml` (ort feature list)
+**Status:** partly fixed in `6e78000`. Both declarations now cross-reference each other, and
+`min_minor_matches_the_enabled_ort_api_feature` fails if the constant moves. That is a
+**tripwire, not a derived check** — the `cfg!` ladder suggested below was judged not worth
+its cost, which is a reasonable call to disagree with.
 
 The probe's floor is a hand-written constant. ort's requirement comes from its `api-24`
 feature. Upgrade ort to `api-25` and the probe keeps accepting 1.24 runtimes, ort rejects
@@ -87,6 +98,8 @@ survive a hurried version bump. A stronger option is deriving the floor from the
 
 **Severity:** low — misleading diagnosis
 **Where:** `src-tauri/src/plugins/onnx.rs:117-127`
+**Status:** fixed in `6e78000`. An unparseable version now reports that it could not be
+read, separately from being below the floor.
 
 `unwrap_or(0)` turns any unparseable version into `0`, which then fails the `< MIN_MINOR`
 check. A user with an unusual build gets told to upgrade a runtime that may be current.
@@ -99,6 +112,9 @@ check. A user with an unusual build gets told to upgrade a runtime that may be c
 
 **Severity:** informational; no fix proposed
 **Where:** `src-tauri/src/plugins/onnx.rs:155`, `.github/workflows/ci.yml`
+**Status:** unchanged and still accepted. CI continues to prove only that the probe rejects
+bad runtimes. The `get_api` check added for finding 1 widens what an untested success path
+now covers, which makes this slightly more consequential than when first written.
 
 `probe_accepts_an_installed_runtime` skips on CI because runners have no ONNX Runtime, and
 apt offers no package to install one. Every ONNX-dependent test skips there for the same
@@ -129,6 +145,11 @@ step no longer says anything about whether inference works.
 `optdepends` also carries no version constraint while the code requires ≥ 1.24. This degrades
 correctly — a 1.23 runtime produces the probe's clear error rather than a hang — so it is
 cosmetic, but stating the minimum in the optdepends text would save a support round trip.
+
+**Status:** the version note is fixed in `6e78000` (`onnxruntime-cpu: … (1.24 or newer)`).
+The coverage trade is **not** fixed and is inherent: the package can still build, pass
+`check()`, and ship with inference non-functional. `check()` now asserts only that the
+runtime is *not* linked.
 
 ---
 
@@ -201,3 +222,62 @@ the self-review above.
 - Targeted missing-runtime tests with
   `ORT_DYLIB_PATH=/nonexistent/libonnxruntime.so` passed/skipped cleanly without hanging.
 - `git diff --check 2ee763cfb068f233f2661727fd21291d95bd7dbe...HEAD` passed.
+
+### Status of the Codex findings
+
+All addressed in `6e78000` except the duplication smell.
+
+1. **Stale `packaging/README.md`** — fixed. The section headed "Why `onnxruntime-cpu` is a hard
+   dependency" argued the reverse of what the recipe now does; it is rewritten as "…is an
+   *optional* dependency", the deleted `pkg-config` guard description is gone, and a GPU
+   subsection was added.
+2. **Stale `Cargo.toml:57`** — fixed. It claimed `download-binaries` fetches a CUDA-enabled
+   runtime. The comment now records the actual behaviour, which this PR improved without
+   anyone noticing: `onnxruntime-cuda` provides the same soname and conflicts with
+   `onnxruntime-cpu`, so one binary runs against either and the installed package decides.
+3. **Duplication smell** — **not fixed, deliberately.** Two lines at two call sites, and the two
+   skip helpers live in different scopes (integration test vs unit-test module), so unifying
+   costs more than it saves. Worth revisiting if a third ONNX consumer appears.
+4. **Spec finding, `ldd` vs `NEEDED`** — fixed. `check()` reads `readelf -d … | grep NEEDED`.
+   Because an assertion that always passes is indistinguishable from one whose invariant holds,
+   it was checked against a positive control: the same pipeline detects `libraw`, which *is*
+   linked.
+
+### Found by the follow-up sweep, in neither review
+
+**`README.md` was stale and is the most user-visible of the five files.** Its requirements table
+listed exiftool, exiv2, ffmpeg, ImageMagick and LibRaw but not ONNX Runtime, and the Arch
+install line omitted it — so a reader could install everything documented and still have face
+tagging fail. Fixed in `6e78000`: added to the requirements table, both install sections, and
+the modules table (which now distinguishes runtime cost from build-time cost).
+
+Neither review listed it. It surfaced only by grepping every ONNX mention repo-wide rather
+than reviewing the files already under change — which is the lesson the Codex findings taught,
+since all three of theirs were the same class.
+
+---
+
+## Resolution
+
+Fixed in `6e78000`, across five files:
+
+| File | Addresses |
+|---|---|
+| `src-tauri/src/plugins/onnx.rs` | self-review 1, 2, 3, 4 |
+| `src-tauri/Cargo.toml` | Codex 2, self-review 3 |
+| `packaging/PKGBUILD` | Codex spec, packaging note |
+| `packaging/README.md` | Codex 1 |
+| `README.md` | follow-up sweep |
+
+Deliberately unresolved: self-review 5 (CI blind spot), the `check()` coverage trade, and
+Codex 3 (duplication).
+
+An error was caught during the fixing itself: the first `optdepends` line advertised
+`onnxruntime-cuda` as the GPU option, but this package does not build `faces-cuda`, so that
+runtime would satisfy the dependency and still run on CPU. Corrected before commit.
+
+**Verification at `6e78000`:** `cargo check --all-features --all-targets`, `cargo check
+--no-default-features`, and `cargo test` run twice — with the runtime present and with
+`ORT_DYLIB_PATH` pointed at a nonexistent file — all exit 0, 524 passed, 0 failed, no warnings.
+`makepkg` exits 0 with `check()` executing; namcap reports only the known `ld-linux` false
+positive. CI green on `6e78000` (run 31171578795).

@@ -131,10 +131,8 @@ tauri-plugin-dialog = "2.7.1"
 # indefinitely with no error. Nothing may call into ort before `plugins::onnx` has confirmed
 # the runtime is loadable. See docs/face-tagging.md and packaging/PKGBUILD.
 #
-# `api-24` and `MIN_MINOR` in plugins/onnx.rs must move together: the probe enforces the same
-# floor ort does, and a raise here without one there leaves the probe accepting runtimes ort
-# rejects — which is the hang again. `min_minor_matches_the_enabled_ort_api_feature` fails
-# when they drift.
+# Raising `api-24` needs no matching edit elsewhere: plugins/onnx.rs derives its version floor
+# from `ort::MINOR_VERSION`, which is computed from whichever `api-*` feature is enabled here.
 ort = { version = "2.0.0-rc.10", optional = true, default-features = false, features = [
   "load-dynamic",
   "ndarray",

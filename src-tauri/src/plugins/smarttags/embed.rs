@@ -281,6 +281,10 @@ fn clip_pool(
 #[cfg(feature = "smarttags")]
 fn build_pool(model_path_setting: Option<&str>) -> Result<Pool<ort::session::Session>, String> {
     use std::sync::atomic::Ordering;
+    // Before anything reaches ort. ONNX Runtime is loaded at runtime, and ort's own loader
+    // hangs indefinitely rather than erroring when it is absent, so this is the only place a
+    // missing runtime can be turned into a reportable failure. See plugins::onnx.
+    crate::plugins::onnx::ensure_available()?;
     let (path, custom) = models::resolve_model_path(model_path_setting).map_err(|e| e.to_string())?;
     let path = models::verify(&path, custom).map_err(|e| e.to_string())?;
     let size = POOL_SIZE.load(Ordering::Relaxed).max(1);
@@ -417,6 +421,14 @@ mod tests {
     #[cfg(feature = "smarttags")]
     #[test]
     fn missing_model_is_graceful_error() {
+        // `build_pool` now rejects a missing ONNX Runtime before it looks at the model, so
+        // without one this would assert against the runtime's error instead of the model's
+        // and quietly stop testing what it claims to. Skip rather than pass for the wrong
+        // reason — CI runners have no runtime installed.
+        if let Err(e) = crate::plugins::onnx::ensure_available() {
+            eprintln!("skipping missing_model_is_graceful_error: no ONNX Runtime ({e})");
+            return;
+        }
         let err = match build_pool(Some("/nonexistent/smarttags/model.onnx")) {
             Err(e) => e,
             Ok(_) => panic!("a missing model must fail cleanly, not build a pool"),

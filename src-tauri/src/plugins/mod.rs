@@ -13,5 +13,9 @@ pub mod faces;
 #[cfg(feature = "map")]
 pub mod map;
 
+/// Shared by the two ONNX-backed plugins; see the module docs for why it must run before ort.
+#[cfg(any(feature = "faces", feature = "smarttags"))]
+pub mod onnx;
+
 #[cfg(feature = "smarttags")]
 pub mod smarttags;

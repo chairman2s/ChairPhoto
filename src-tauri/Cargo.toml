@@ -45,11 +45,11 @@ map = ["dep:reqwest"]
 # is already a core dependency — so this is purely a compile gate. See docs/collage.md.
 collage = []
 # The face-tagging module's backend (ONNX face detection + recognition). Pulls in `ort`
-# (ONNX Runtime) for inference; the runtime shared library is downloaded by `ort`'s default
-# strategy at build/run time. Everything ort-related is gated behind this feature, so
-# `--no-default-features` stays green on machines without it. `reqwest` (already optional) is
-# reused to fetch the model files. See docs/face-tagging.md.
-faces = ["dep:ort", "dep:reqwest"]
+# (ONNX Runtime) for inference; the runtime shared library is loaded at runtime, not linked,
+# so it is an optional dependency the user may not have. Everything ort-related is gated
+# behind this feature, so `--no-default-features` stays green on machines without it.
+# `reqwest` (already optional) is reused to fetch the model files. See docs/face-tagging.md.
+faces = ["dep:ort", "dep:reqwest", "dep:libloading"]
 # Optional GPU acceleration for face inference: enables `ort`'s CUDA execution provider
 # (NVIDIA GPUs). Additive — implies `faces`. When compiled in, the session builder tries to
 # register the CUDA EP and falls back to CPU (never crashing) when the CUDA runtime/cuDNN or a
@@ -59,11 +59,11 @@ faces = ["dep:ort", "dep:reqwest"]
 # See docs/face-tagging.md (CUDA section).
 faces-cuda = ["faces", "ort/cuda"]
 # The Smart Tagging module's backend (local CLIP image embeddings → kNN tag suggestions).
-# Like `faces`, it pulls in `ort` (ONNX Runtime) for local inference and reuses `reqwest`
-# (already optional) to fetch the CLIP model on first use. Everything ort-related is gated
-# behind this feature so `--no-default-features` stays green. See docs/ai-tagging.md (Smart
-# Tagging section).
-smarttags = ["dep:ort", "dep:reqwest"]
+# Like `faces`, it pulls in `ort` (ONNX Runtime) — loaded at runtime rather than linked — and
+# reuses `reqwest` (already optional) to fetch the CLIP model on first use. Everything
+# ort-related is gated behind this feature so `--no-default-features` stays green. See
+# docs/ai-tagging.md (Smart Tagging section).
+smarttags = ["dep:ort", "dep:reqwest", "dep:libloading"]
 # Optional GPU acceleration for Smart Tagging embedding (NVIDIA CUDA execution provider),
 # mirroring `faces-cuda`. Additive — implies `smarttags`. Falls back to CPU (never crashing)
 # when the CUDA runtime/cuDNN or a GPU is missing.
@@ -114,17 +114,27 @@ sha1 = { version = "0.10", optional = true }
 chromiumoxide = { version = "0.9", optional = true }
 futures-util = { version = "0.3", optional = true }
 tauri-plugin-dialog = "2.7.1"
-# Only compiled when the `faces` feature is on. ONNX Runtime bindings for face detection
-# (YuNet) + embedding (AuraFace). 2.0.0-rc line; default `download-binaries` strategy fetches
-# a prebuilt ONNX Runtime shared library.
+# Only compiled when the `faces` or `smarttags` feature is on. ONNX Runtime bindings for face
+# detection (YuNet), embedding (AuraFace), and CLIP image embeddings. 2.0.0-rc line.
 #
-# `pkg-config` lets the build link the *system* ONNX Runtime instead. ort-sys probes
-# `libonnxruntime` before its download path and returns early on success, so this is additive:
-# with a new-enough system library installed the build links it and downloads nothing; without
-# one, `download-binaries` still applies and dev builds behave exactly as before. A system
-# library whose minor version is below ort's API level (24 here) is ignored rather than linked.
-# Distro packaging depends on this — see packaging/PKGBUILD.
-ort = { version = "2.0.0-rc.10", optional = true, features = ["pkg-config"] }
+# `load-dynamic` makes ONNX Runtime a *runtime* dependency rather than a link-time one: the
+# binary carries no `libonnxruntime` NEEDED entry and dlopens it on first use instead. That is
+# what lets a package list it as an optional dependency, so users who never touch face or
+# smart tagging do not install a ~25 MB inference runtime. The default `download-binaries`
+# strategy is off deliberately — a build must not fetch an unpinned binary.
+#
+# The cost is that ort's loader does not fail cleanly when the library is absent: it hangs
+# indefinitely with no error. Nothing may call into ort before `plugins::onnx` has confirmed
+# the runtime is loadable. See docs/face-tagging.md and packaging/PKGBUILD.
+ort = { version = "2.0.0-rc.10", optional = true, default-features = false, features = [
+  "load-dynamic",
+  "ndarray",
+  "tracing",
+  "api-24",
+] }
+# Used only to probe for that runtime before ort touches it (plugins/onnx.rs). ort's own
+# loader panics-or-hangs when the library is absent, so the check cannot be delegated to it.
+libloading = { version = "0.8", optional = true }
 # Data-parallelism for the face-indexing batch (bounded concurrent detect+embed calls).
 # The connection-per-worker pattern is avoided: rayon runs the CPU-heavy detect step in
 # parallel; DB writes are serialised on the calling thread via a sequential collect pass.

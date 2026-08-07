@@ -321,6 +321,10 @@ fn auraface_pool() -> Result<&'static Pool<ort::session::Session>, EngineError> 
 #[cfg(feature = "faces")]
 fn build_pool(spec: &models::ModelSpec) -> Result<Pool<ort::session::Session>, String> {
     use std::sync::atomic::Ordering;
+    // Before anything reaches ort. ONNX Runtime is loaded at runtime, and ort's own loader
+    // hangs indefinitely rather than erroring when it is absent, so this is the only place a
+    // missing runtime can be turned into a reportable failure. See plugins::onnx.
+    crate::plugins::onnx::ensure_available()?;
     let path = models::verify(spec).map_err(|e| e.to_string())?;
     let size = POOL_SIZE.load(Ordering::Relaxed).max(1);
     let intra = INTRA_THREADS.load(Ordering::Relaxed).max(1);

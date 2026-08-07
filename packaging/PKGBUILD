@@ -14,10 +14,6 @@ license=('GPL-3.0-only')
 #   readelf -d usr/bin/chairphoto | grep NEEDED   ->   pacman -Qoq /usr/lib/<soname>
 #
 #   libraw          full-resolution RAW decode, linked at build time by the `raw` feature
-#   onnxruntime-cpu face detection/recognition and Smart Tagging inference. ort probes for
-#                   `libonnxruntime` via pkg-config and links the system library; without it
-#                   the build would silently fall back to downloading its own copy, which
-#                   build() rejects.
 #   hicolor-icon-theme  owns the /usr/share/icons/hicolor directories this package installs into.
 #
 # librsvg is deliberately absent. Tauri's Linux prerequisites name it, but this package ships
@@ -34,7 +30,6 @@ depends=(
   'libgcc'
   'libraw'
   'libsoup3'
-  'onnxruntime-cpu'
   'webkit2gtk-4.1'
 )
 
@@ -50,6 +45,7 @@ makedepends=(
 
 # Missing runtime tools degrade one feature each; they never crash the app.
 optdepends=(
+  'onnxruntime-cpu: face detection/recognition and Smart Tagging'
   'perl-image-exiftool: EXIF/IPTC/XMP extraction and RAW preview fallback'
   'exiv2: primary embedded-preview extractor for RAW thumbnails'
   'ffmpeg: video poster frames and slideshow .mp4 rendering'
@@ -91,22 +87,6 @@ build() {
   # may only use what prepare() already fetched, so dependency resolution cannot drift.
   export CARGO_NET_OFFLINE=true
 
-  # ort tries pkg-config before its download path and *silently* falls back to fetching a
-  # prebuilt ONNX Runtime when the probe fails, which would make this package build depend on
-  # a network blob instead of the onnxruntime-cpu dependency. It also ignores a system library
-  # older than the API level it wants (24), so check the version the same way ort does.
-  local _ort_minor
-  if ! _ort_minor=$(pkg-config --modversion libonnxruntime 2>/dev/null); then
-    echo "==> ERROR: pkg-config cannot find libonnxruntime; is onnxruntime-cpu installed?" >&2
-    return 1
-  fi
-  _ort_minor=$(echo "$_ort_minor" | cut -d. -f2)
-  if (( _ort_minor < 24 )); then
-    echo "==> ERROR: onnxruntime 1.$_ort_minor is older than the API level ort requires (24)." >&2
-    echo "    ort would ignore it and download its own copy instead." >&2
-    return 1
-  fi
-
   # Upstream defaults: ai, edit, raw, instagram, collage, slideshow, localsend, map, faces,
   # smarttags — plus flickr and smugmug, which are opt-in upstream but shipped here.
   #
@@ -123,16 +103,15 @@ build() {
 check() {
   cd "ChairPhoto-$pkgver"
 
-  # The probe in build() is a precondition, not proof. ort only *prefers* pkg-config: if the
-  # `pkg-config` feature is missing from src-tauri/Cargo.toml, or the probe fails inside the
-  # build script for any reason, ort quietly downloads its own runtime and the build still
-  # succeeds — producing a package that ignores the onnxruntime-cpu dependency it declares.
-  # Assert the outcome instead of trusting it.
-  local _linked='libonnxruntime\.so[^ ]* => /usr/lib/'
-  if ! ldd "src-tauri/target/release/$pkgname" | grep -qE "$_linked"; then
-    echo "==> ERROR: the binary does not link the system libonnxruntime." >&2
-    echo "    ort most likely downloaded its own runtime. Check that the ort dependency in" >&2
-    echo "    src-tauri/Cargo.toml still enables the \`pkg-config\` feature." >&2
+  # ONNX Runtime must be loaded at runtime, never linked. If it appears in the binary's
+  # NEEDED entries then ort's `load-dynamic` feature was lost somewhere, and onnxruntime-cpu
+  # silently becomes a hard requirement again — every user would be made to install a ~25 MB
+  # inference runtime, while this recipe still advertises it as optional. Nothing else in the
+  # build fails when that happens, so assert it here.
+  if ldd "src-tauri/target/release/$pkgname" | grep -q 'libonnxruntime'; then
+    echo "==> ERROR: the binary links libonnxruntime; it must dlopen it instead." >&2
+    echo "    Check that the ort dependency in src-tauri/Cargo.toml still sets" >&2
+    echo "    default-features = false with the \`load-dynamic\` feature." >&2
     return 1
   fi
 }

@@ -145,8 +145,9 @@ pub struct AppState {
     /// the job id so the UI can ignore events from a superseded run.
     pub phash_job_seq: std::sync::atomic::AtomicU64,
     /// Abort flag for the Smart Tagging embedding-index job (H7b). Same swappable-Arc
-    /// pattern as `sharpness_abort`: `smarttags_index_photos` installs a fresh flag,
-    /// `smarttags_index_cancel` trips it.
+    /// pattern as `faces_abort`: `smarttags_index_photos` installs a fresh flag,
+    /// `smarttags_index_cancel` trips it, and `switch_catalog` trips it under the catalog
+    /// lock so a job can never keep indexing a catalog the user has left.
     #[cfg(feature = "smarttags")]
     pub smarttags_abort: Mutex<Arc<AtomicBool>>,
     /// Monotonic id source for Smart Tagging index jobs. Progress/done events carry the

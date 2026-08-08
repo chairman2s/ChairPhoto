@@ -10,8 +10,9 @@ use tauri::{AppHandle, Emitter, Manager, State};
 
 /// Switch the active catalog with a safe teardown → reinit lifecycle (I4b).
 ///
-/// 1. Signals any in-flight scan to abort (`scan_abort`) so it stops writing before the
-///    old catalog is torn down — nothing lands in a catalog that's about to be closed.
+/// 1. Signals every in-flight background job to abort (scan, faces, sharpness, pHash and
+///    Smart Tagging) so they stop writing before the old catalog is torn down — nothing
+///    lands in a catalog that's about to be closed.
 /// 2. Closes the active catalog: drops the mutex-held handle (flushing the WAL) so the
 ///    old connection is released before the new one is opened.
 /// 3. Opens (or, when `create` is set, creates) the catalog at `catalog_path` rooted at
@@ -36,7 +37,7 @@ pub async fn switch_catalog(
 
     // Existence checks mirror open_catalog / create_catalog so the error messages match.
     // They run before anything is mutated: previously they sat after the abort flags were
-    // tripped, so a switch rejected here had already stopped all four switch-managed jobs.
+    // tripped, so a switch rejected here had already stopped every switch-managed job.
     if create {
         if catalog_path_buf.exists() {
             return Err(format!(
@@ -51,48 +52,9 @@ pub async fn switch_catalog(
         ));
     }
 
-    // 1. Detach the outgoing catalog: trip the scan, faces, sharpness and pHash generations
-    //    AND drop the catalog handle in ONE transition, holding the catalog lock across
-    //    both. (Smart Tagging keeps its own abort flag, which this function does not yet
-    //    touch at all — a separate pre-existing gap, tracked on its own.)
-    //
-    //    Tripping and releasing separately is not enough for the Faces start, which takes
-    //    catalog -> faces_abort -> slot. If the trip happened outside the catalog lock it
-    //    could install a fresh un-tripped generation *after* the only abort signal and
-    //    then index a catalog this function is about to close — and step 3's replacement
-    //    would overwrite that generation without tripping it, leaving the worker
-    //    unreachable by Cancel, by a later start, and by the next switch.
-    //
-    //    Holding the catalog lock across the trip gives that start only two outcomes: it
-    //    completes first and is tripped here, or it blocks and then finds no catalog open.
-    //    Dropping the handle under the same lock also flushes the WAL before the new
-    //    connection opens, and leaves no stale handle if the open below fails.
-    //
-    //    The scan, sharpness and pHash starts do the opposite — they install their
-    //    generation and release that lock *before* reading the catalog, so this phase
-    //    cannot fence them. Step 3 covers them instead, by tripping whatever it finds
-    //    installed before replacing it.
-    //
-    //    Every guard is acquired before anything is stored, so a poisoned mutex fails the
-    //    whole phase instead of leaving some generations tripped and others live.
-    //
-    //    Nested acquisition is always catalog -> abort, here and in every job start that
-    //    takes both, so this cannot invert.
-    {
-        let mut cat_guard = state.catalog.lock().map_err(|e| e.to_string())?;
-        let scan_guard = state.scan_abort.lock().map_err(|e| e.to_string())?;
-        #[cfg(feature = "faces")]
-        let faces_guard = state.faces_abort.lock().map_err(|e| e.to_string())?;
-        let sharpness_guard = state.sharpness_abort.lock().map_err(|e| e.to_string())?;
-        let phash_guard = state.phash_abort.lock().map_err(|e| e.to_string())?;
-
-        scan_guard.store(true, Ordering::Relaxed);
-        #[cfg(feature = "faces")]
-        faces_guard.store(true, Ordering::Relaxed);
-        sharpness_guard.store(true, Ordering::Relaxed);
-        phash_guard.store(true, Ordering::Relaxed);
-        *cat_guard = None;
-    }
+    // 1 + 2. Detach the outgoing catalog: trip every switch-managed job generation and drop
+    //        the catalog handle in ONE transition. See `detach_catalog_and_trip_jobs`.
+    detach_catalog_and_trip_jobs(state.inner())?;
 
     // 3. Open (creating first if requested) the new catalog off the async executor.
     let catalog = tauri::async_runtime::spawn_blocking({
@@ -121,52 +83,10 @@ pub async fn switch_catalog(
     });
     let actual_root = catalog.root().to_path_buf();
 
-    // 3. Publish the new catalog and its fresh un-tripped flags in ONE transition, again
-    //    holding the catalog lock across both. Installing the flags after releasing it
-    //    would let a start that snapshotted the new catalog install its own live generation
-    //    first, only for the assignments below to overwrite it without tripping it —
-    //    leaving a worker running that nothing can reach.
-    //
-    //    Whatever is installed at this point is tripped before being replaced. Faces takes
-    //    the catalog lock before claiming, so it cannot have installed anything while this
-    //    function held it — but scan, sharpness and pHash install their generation *before*
-    //    reading the catalog. One of those can therefore hold a live, un-tripped generation
-    //    right now, blocked on the catalog read. Replacing it silently would leave its
-    //    worker running with a handle no Cancel, later start or subsequent switch can
-    //    reach. Tripping first means such a start loses this race with an already-aborted
-    //    flag and stops immediately; a start that arrives after the replacement becomes the
-    //    current generation and proceeds normally.
-    //
-    //    The flags tripped in step 1 are deliberately not cleared: the old workers still
-    //    hold those Arcs and must stay aborted. Swapping in new ones lets future jobs start
-    //    clean against the new catalog.
-    //
-    //    As in step 1, every guard is acquired before anything is written, so a poisoned
-    //    mutex cannot leave a prefix of the generations replaced.
-    let fresh_abort = Arc::new(AtomicBool::new(false));
-    {
-        let mut cat_guard = state.catalog.lock().map_err(|e| e.to_string())?;
-        let mut scan_guard = state.scan_abort.lock().map_err(|e| e.to_string())?;
-        #[cfg(feature = "faces")]
-        let mut faces_guard = state.faces_abort.lock().map_err(|e| e.to_string())?;
-        let mut sharpness_guard = state.sharpness_abort.lock().map_err(|e| e.to_string())?;
-        let mut phash_guard = state.phash_abort.lock().map_err(|e| e.to_string())?;
-
-        scan_guard.store(true, Ordering::Relaxed);
-        #[cfg(feature = "faces")]
-        faces_guard.store(true, Ordering::Relaxed);
-        sharpness_guard.store(true, Ordering::Relaxed);
-        phash_guard.store(true, Ordering::Relaxed);
-
-        *scan_guard = fresh_abort.clone();
-        #[cfg(feature = "faces")]
-        {
-            *faces_guard = Arc::new(AtomicBool::new(false));
-        }
-        *sharpness_guard = Arc::new(AtomicBool::new(false));
-        *phash_guard = Arc::new(AtomicBool::new(false));
-        *cat_guard = Some(catalog);
-    }
+    // 4. Publish the new catalog and its fresh un-tripped flags in ONE transition. See
+    //    `publish_catalog_and_reset_jobs`; the returned flag is this catalog's new scan
+    //    generation, which the auto-resume below hands to its detached Phase B.
+    let fresh_abort = publish_catalog_and_reset_jobs(state.inner(), catalog)?;
     // A different catalog may have entirely different volumes — drop stale reachability.
     state.volume_health.invalidate();
 
@@ -179,7 +99,7 @@ pub async fn switch_catalog(
     })
     .await;
 
-    // 4. Tell the frontend to reset and refresh against the new catalog.
+    // 5. Tell the frontend to reset and refresh against the new catalog.
     let _ = app.emit("catalog:switched", &catalog_path);
 
     // I6d: auto-resume Phase B if the new catalog has pending enrichment rows (crash/quit
@@ -196,6 +116,122 @@ pub async fn switch_catalog(
     }
 
     Ok(())
+}
+
+/// Phase one of a catalog switch: trip the scan, faces, sharpness, pHash and Smart Tagging
+/// generations AND drop the catalog handle in ONE transition, holding the catalog lock
+/// across all of them.
+///
+/// Tripping and releasing separately is not enough for the Faces and Smart Tagging starts,
+/// which take catalog -> abort -> slot. If the trip happened outside the catalog lock such a
+/// start could install a fresh un-tripped generation *after* the only abort signal and then
+/// index a catalog this function is about to close — and phase two's replacement would
+/// overwrite that generation without tripping it, leaving the worker unreachable by Cancel,
+/// by a later start, and by the next switch.
+///
+/// Holding the catalog lock across the trip gives those starts only two outcomes: one
+/// completes first and is tripped here, or it blocks and then finds no catalog open.
+/// Dropping the handle under the same lock also flushes the WAL before the new connection
+/// opens, and leaves no stale handle if the open fails.
+///
+/// The scan, sharpness and pHash starts do the opposite — they install their generation and
+/// release that lock *before* reading the catalog, so this phase cannot fence them. Phase
+/// two covers them instead, by tripping whatever it finds installed before replacing it.
+///
+/// Every guard is acquired before anything is stored, so a poisoned mutex fails the whole
+/// phase instead of leaving some generations tripped and others live.
+///
+/// Nested acquisition is always catalog -> abort -> slot, here and in every job start that
+/// takes more than one, so this cannot invert. Both switch phases are also the only places
+/// that hold two abort locks at once, and they take them in the same order (scan, faces,
+/// sharpness, pHash, Smart Tagging).
+///
+/// Extracted from `switch_catalog` so the ownership transition can be driven directly by
+/// the interleaving tests in `commands::smarttags`, which have no Tauri `AppHandle`.
+pub(super) fn detach_catalog_and_trip_jobs(state: &AppState) -> Result<(), String> {
+    let mut cat_guard = state.catalog.lock().map_err(|e| e.to_string())?;
+    let scan_guard = state.scan_abort.lock().map_err(|e| e.to_string())?;
+    #[cfg(feature = "faces")]
+    let faces_guard = state.faces_abort.lock().map_err(|e| e.to_string())?;
+    let sharpness_guard = state.sharpness_abort.lock().map_err(|e| e.to_string())?;
+    let phash_guard = state.phash_abort.lock().map_err(|e| e.to_string())?;
+    #[cfg(feature = "smarttags")]
+    let smarttags_guard = state.smarttags_abort.lock().map_err(|e| e.to_string())?;
+
+    scan_guard.store(true, Ordering::Relaxed);
+    #[cfg(feature = "faces")]
+    faces_guard.store(true, Ordering::Relaxed);
+    sharpness_guard.store(true, Ordering::Relaxed);
+    phash_guard.store(true, Ordering::Relaxed);
+    #[cfg(feature = "smarttags")]
+    smarttags_guard.store(true, Ordering::Relaxed);
+    *cat_guard = None;
+    Ok(())
+}
+
+/// Phase two of a catalog switch: publish `catalog` and its fresh un-tripped flags in ONE
+/// transition, again holding the catalog lock across both. Returns the new scan generation
+/// (the caller hands it to an auto-resumed Phase B).
+///
+/// Installing the flags after releasing the catalog lock would let a start that snapshotted
+/// the new catalog install its own live generation first, only for the assignments here to
+/// overwrite it without tripping it — leaving a worker running that nothing can reach.
+///
+/// Whatever is installed at this point is tripped before being replaced. Faces and Smart
+/// Tagging take the catalog lock before claiming, so neither can have installed anything
+/// while this function held it — but scan, sharpness and pHash install their generation
+/// *before* reading the catalog. One of those can therefore hold a live, un-tripped
+/// generation right now, blocked on the catalog read. Replacing it silently would leave its
+/// worker running with a handle no Cancel, later start or subsequent switch can reach.
+/// Tripping first means such a start loses this race with an already-aborted flag and stops
+/// immediately; a start that arrives after the replacement becomes the current generation
+/// and proceeds normally.
+///
+/// The flags tripped in phase one are deliberately not cleared: the old workers still hold
+/// those Arcs and must stay aborted. Swapping in new ones lets future jobs start clean
+/// against the new catalog. The Faces and Smart Tagging *status slots* are likewise left
+/// alone — each aborted worker clears its own slot on the way out, and only if it still owns
+/// it, so clearing here would race a job that has already been superseded by a newer start.
+///
+/// As in phase one, every guard is acquired before anything is written, so a poisoned mutex
+/// cannot leave a prefix of the generations replaced.
+pub(super) fn publish_catalog_and_reset_jobs(
+    state: &AppState,
+    catalog: Catalog,
+) -> Result<Arc<AtomicBool>, String> {
+    let fresh_abort = Arc::new(AtomicBool::new(false));
+
+    let mut cat_guard = state.catalog.lock().map_err(|e| e.to_string())?;
+    let mut scan_guard = state.scan_abort.lock().map_err(|e| e.to_string())?;
+    #[cfg(feature = "faces")]
+    let mut faces_guard = state.faces_abort.lock().map_err(|e| e.to_string())?;
+    let mut sharpness_guard = state.sharpness_abort.lock().map_err(|e| e.to_string())?;
+    let mut phash_guard = state.phash_abort.lock().map_err(|e| e.to_string())?;
+    #[cfg(feature = "smarttags")]
+    let mut smarttags_guard = state.smarttags_abort.lock().map_err(|e| e.to_string())?;
+
+    scan_guard.store(true, Ordering::Relaxed);
+    #[cfg(feature = "faces")]
+    faces_guard.store(true, Ordering::Relaxed);
+    sharpness_guard.store(true, Ordering::Relaxed);
+    phash_guard.store(true, Ordering::Relaxed);
+    #[cfg(feature = "smarttags")]
+    smarttags_guard.store(true, Ordering::Relaxed);
+
+    *scan_guard = fresh_abort.clone();
+    #[cfg(feature = "faces")]
+    {
+        *faces_guard = Arc::new(AtomicBool::new(false));
+    }
+    *sharpness_guard = Arc::new(AtomicBool::new(false));
+    *phash_guard = Arc::new(AtomicBool::new(false));
+    #[cfg(feature = "smarttags")]
+    {
+        *smarttags_guard = Arc::new(AtomicBool::new(false));
+    }
+    *cat_guard = Some(catalog);
+
+    Ok(fresh_abort)
 }
 
 /// List recently-accessed catalogs, ordered by last-opened (most recent first).

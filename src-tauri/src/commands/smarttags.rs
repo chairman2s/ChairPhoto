@@ -97,6 +97,59 @@ pub struct SmarttagsIndexDone {
     pub error: Option<String>,
 }
 
+/// Claim ownership of the Smart Tagging index job: snapshot the catalog, allocate the job
+/// id, trip the previous job, install this job's abort flag and claim the status slot as
+/// ONE transition, holding all three locks throughout. Returns the catalog's db path and
+/// root, the new job's abort flag, and its id.
+///
+/// Two starts can run concurrently, since Tauri dispatches commands onto its runtime. If
+/// the abort lock were released before the slot write they could interleave: A installs its
+/// flag, B trips A and claims the slot, then A — already aborted — overwrites the slot with
+/// itself and the panel tracks a dead job. Job ids cannot arbitrate that, because they are
+/// allocated after the flag is installed.
+///
+/// The catalog lock is held for the same reason, against `switch_catalog` rather than
+/// against another start — this is what brings the job under catalog-switch ownership. The
+/// switch holds that same lock while it trips the current flag and drops the handle, and
+/// again while it publishes the new catalog and fresh flags, so only three interleavings
+/// exist: the switch completes first and this job snapshots the new catalog; it runs
+/// entirely after and trips the generation installed here; or it is mid-switch, in which
+/// case the catalog reads as `None` here and this job returns having touched nothing.
+/// Snapshotting the catalog outside this block — as this command used to — allows a fourth:
+/// install an un-tripped generation after the switch's only abort signal, then index the
+/// catalog it is about to close, with a handle no Cancel, later start or subsequent switch
+/// can reach.
+///
+/// Every *nested* acquisition in the backend is catalog → abort → slot: this block, the
+/// same block in `faces_index_photos`, and both `switch_catalog` phases. The scan, sharpness
+/// and pHash starts install their abort generation and release that lock before reading the
+/// catalog, so they never hold two at once and cannot invert against this order;
+/// `switch_catalog` covers them instead by tripping whatever is installed before it replaces
+/// anything. `smarttags_index_cancel` takes only the abort lock and workers only the slot
+/// lock.
+///
+/// Everything fallible here is read-only and precedes the first mutation, so an error
+/// cannot leave the previous job aborted with no successor.
+#[cfg(feature = "smarttags")]
+fn begin_smarttags_job(
+    state: &AppState,
+) -> Result<(PathBuf, PathBuf, Arc<AtomicBool>, u64), String> {
+    let cat_guard = state.catalog.lock().map_err(|e| e.to_string())?;
+    let c = cat_guard.as_ref().ok_or("No catalog is open")?;
+    let (db_path, root) = (c.db_path().to_path_buf(), c.root().to_path_buf());
+
+    let mut abort_guard = state.smarttags_abort.lock().map_err(|e| e.to_string())?;
+    let mut slot_guard = state.smarttags_job.lock().map_err(|e| e.to_string())?;
+    let job = state.smarttags_job_seq.fetch_add(1, Ordering::Relaxed) + 1;
+    abort_guard.store(true, Ordering::Relaxed);
+    let fresh = Arc::new(AtomicBool::new(false));
+    *abort_guard = fresh.clone();
+    // Claim the slot (total is unknown until the queue is populated) so a status query
+    // between "command returned" and "first progress event" already sees it running.
+    *slot_guard = Some(SmarttagsJobStatus { job, done: 0, total: 0 });
+    Ok((db_path, root, fresh, job))
+}
+
 /// Begin (or resume) the background Smart Tagging embedding-index job (H7b). Opens its
 /// own secondary catalog connection so the UI thread is never blocked.
 ///
@@ -106,9 +159,11 @@ pub struct SmarttagsIndexDone {
 ///   3. Encodes a CLIP embedding (`embed::encode_jpeg`).
 ///   4. Upserts the f32-LE BLOB into `smarttags__embeddings`.
 ///
-/// Re-invoking while a job is running trips the old job's abort flag first (same pattern
-/// as `index_sharpness`/`index_phashes`), then starts a fresh run. Photos already in
-/// `smarttags__embeddings` are skipped automatically (the implicit queue is a LEFT JOIN).
+/// Re-invoking while a job is running trips the old job's abort flag first (same ownership
+/// transition as `faces_index_photos` — see `begin_smarttags_job`), then starts a fresh run.
+/// A catalog switch trips it too, so a job never outlives the catalog it was started
+/// against. Photos already in `smarttags__embeddings` are skipped automatically (the
+/// implicit queue is a LEFT JOIN).
 ///
 /// Returns the new job's id (also carried by `smarttags:progress` and
 /// `smarttags:index_done` events) so the caller can tell this run's events apart from a
@@ -139,42 +194,14 @@ pub async fn smarttags_index_photos(
         );
     }
 
-    // Read catalog path + root under a brief lock, then release it. This and the model
-    // check above are the only fallible steps, and both run before the ownership
-    // transition below — so a failure can never leave the previous job aborted with no
-    // replacement installed.
-    let (db_path, root) = {
-        let guard = state.catalog.lock().map_err(|e| e.to_string())?;
-        let c = guard.as_ref().ok_or("No catalog is open")?;
-        (c.db_path().to_path_buf(), c.root().to_path_buf())
-    };
-
     // Clone the job status slot so the worker can update it.
     let job_slot = state.smarttags_job.clone();
 
-    // Allocate the job id, trip the previous job, install this job's abort flag and claim
-    // the status slot as ONE transition, holding both locks throughout.
-    //
-    // Tauri dispatches commands onto its runtime, so two starts can run concurrently. If
-    // the abort lock were released before the slot write, they could interleave: A
-    // installs its flag, B trips A and claims the slot, then A — already aborted —
-    // overwrites the slot with itself and the panel tracks a dead job. Job ids cannot
-    // arbitrate that, because they are allocated after the flag is installed. Both locks
-    // are taken before anything is mutated, so a poisoned slot cannot leave the previous
-    // job aborted with no successor. Workers only ever take the slot lock, never the
-    // abort lock, so this order introduces no inversion.
-    let (abort, job) = {
-        let mut abort_guard = state.smarttags_abort.lock().map_err(|e| e.to_string())?;
-        let mut slot_guard = job_slot.lock().map_err(|e| e.to_string())?;
-        let job = state.smarttags_job_seq.fetch_add(1, Ordering::Relaxed) + 1;
-        abort_guard.store(true, Ordering::Relaxed);
-        let fresh = Arc::new(AtomicBool::new(false));
-        *abort_guard = fresh.clone();
-        // Claim the slot (total is unknown until the queue is populated) so a status query
-        // between "command returned" and "first progress event" already sees it running.
-        *slot_guard = Some(SmarttagsJobStatus { job, done: 0, total: 0 });
-        (fresh, job)
-    };
+    // Snapshot the catalog, allocate the job id, trip the previous job, install this job's
+    // abort flag and claim the status slot as ONE transition. The model check above is the
+    // only other fallible step and runs before it, so a failure can never leave the
+    // previous job aborted with no replacement installed.
+    let (db_path, root, abort, job) = begin_smarttags_job(state.inner())?;
 
     tauri::async_runtime::spawn_blocking(move || {
         use crate::catalog::Catalog;
@@ -530,5 +557,297 @@ pub async fn smarttags_train_classifiers(
         })
     })
     .await
+}
+
+// ── Catalog-switch job ownership ─────────────────────────────────────────────
+//
+// These drive the real ownership transitions — `begin_smarttags_job` and the two
+// `switch_catalog` phases — against a real `AppState` and real catalogs. The commands
+// themselves need a Tauri `AppHandle`, which a unit test has no way to build, so the
+// transitions are called directly; everything between them (opening the catalog file,
+// the recent-catalogs registry, the `catalog:switched` emit) touches none of this state.
+//
+// The two acceptance cases are forced by construction, never by timing: the switch runs
+// inside the indexer's own progress callback, and the mid-switch start is driven to the
+// exact state a blocked start observes. The third test is a contention net whose assertion
+// holds under every legal interleaving; it samples rather than forces, so it backs the
+// first two up instead of standing in for them.
+#[cfg(test)]
+mod smarttags_ownership_tests {
+    use super::*;
+    use crate::commands::catalog::{
+        detach_catalog_and_trip_jobs, publish_catalog_and_reset_jobs,
+    };
+    use crate::plugins::smarttags::indexer;
+    use std::path::Path;
+
+    /// A fresh catalog in its own temp dir with `photos` files imported.
+    fn temp_catalog(tag: &str, photos: usize) -> (Catalog, PathBuf, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("chairphoto-smarttags-own-{tag}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let root = dir.join("photos");
+        std::fs::create_dir_all(&root).unwrap();
+        let db = dir.join("catalog.chairphoto");
+        let catalog = Catalog::open(&db, &root).unwrap();
+        for i in 0..photos {
+            let p = root.join(format!("p{i}.jpg"));
+            std::fs::write(&p, b"jpeg").unwrap();
+            catalog.upsert_photo(&p, None, 1, 4).unwrap();
+        }
+        (catalog, db, root)
+    }
+
+    /// An `AppState` holding `catalog` as the open catalog.
+    fn state_with(catalog: Catalog) -> AppState {
+        let state = AppState::default();
+        *state.catalog.lock().unwrap() = Some(catalog);
+        state
+    }
+
+    /// Rows in `smarttags__embeddings`, counting an absent table as zero — the table is
+    /// created lazily by the first index run, so "never touched" reads as 0 either way.
+    fn embedding_count(db: &Path) -> i64 {
+        let conn = rusqlite::Connection::open(db).unwrap();
+        conn.query_row("SELECT COUNT(*) FROM smarttags__embeddings", [], |r| {
+            r.get::<_, i64>(0)
+        })
+        .unwrap_or(0)
+    }
+
+    /// A synthetic unit embedding — the injected stand-in for CLIP, so these tests need
+    /// neither a model nor an ONNX Runtime.
+    fn unit_embedding() -> Vec<f32> {
+        let mut v = vec![0.0f32; 512];
+        v[0] = 1.0;
+        v
+    }
+
+    /// A catalog switch stops a running Smart Tagging job at its next cancellation point:
+    /// no progress after the switch, no further rows in the catalog it was indexing, and
+    /// nothing at all in the catalog the user switched to.
+    ///
+    /// The interleaving is forced rather than timed: the switch runs inside the indexer's
+    /// own progress callback, so it lands between photo 1 and photo 2 every time.
+    #[test]
+    fn catalog_switch_stops_a_running_index_job() {
+        let (cat_a, db_a, root_a) = temp_catalog("switch-a", 4);
+        let (cat_b, db_b, _root_b) = temp_catalog("switch-b", 0);
+        let state = state_with(cat_a);
+
+        // Start a job exactly the way `smarttags_index_photos` does.
+        let (db_path, root, abort, job) = begin_smarttags_job(&state).unwrap();
+        assert_eq!(db_path, db_a);
+        assert_eq!(root, root_a);
+        assert_eq!(
+            state.smarttags_job.lock().unwrap().map(|s| s.job),
+            Some(job),
+            "the start must claim the status slot"
+        );
+
+        // The worker: the real indexer over a real secondary connection to catalog A.
+        let sec = Catalog::open_secondary(&db_path, &root).unwrap();
+        let switch_to = Mutex::new(Some(cat_b));
+        let mut progress: Vec<usize> = Vec::new();
+
+        let outcome = indexer::run_index(
+            sec.conn(),
+            // One photo per chunk, so every photo is a cancellation point.
+            1,
+            |id| Ok(Some(root.join(format!("p{id}.jpg")))),
+            |_path| Ok(vec![0xFFu8, 0xD8, 0xFF, 0xE0]),
+            |_jpeg| Some(unit_embedding()),
+            &abort,
+            |p: indexer::SmarttagsProgress| {
+                progress.push(p.done);
+                // The user switches catalogs while this worker is still running.
+                if let Some(cat) = switch_to.lock().unwrap().take() {
+                    detach_catalog_and_trip_jobs(&state).unwrap();
+                    publish_catalog_and_reset_jobs(&state, cat).unwrap();
+                }
+            },
+        )
+        .unwrap();
+
+        assert!(outcome.aborted, "the switch must abort the running job");
+        assert_eq!(outcome.total, 4, "all four photos were queued");
+        assert_eq!(
+            outcome.done, 1,
+            "only the photo already committed when the switch happened"
+        );
+        assert_eq!(progress, vec![1], "no progress event after the switch");
+        assert_eq!(
+            embedding_count(&db_a),
+            1,
+            "the aborted worker must write no rows after the switch"
+        );
+        assert_eq!(
+            embedding_count(&db_b),
+            0,
+            "nothing may land in the catalog that was switched to"
+        );
+
+        // The old job's flag stays tripped, and the generation installed for the new
+        // catalog is a different, un-tripped Arc — so the old worker cannot be revived by
+        // it, and a Cancel or a later switch acts on the new generation only.
+        assert!(abort.load(Ordering::Relaxed), "the old flag must stay tripped");
+        let installed = state.smarttags_abort.lock().unwrap().clone();
+        assert!(
+            !Arc::ptr_eq(&installed, &abort),
+            "the switch must install a fresh generation, not reuse the aborted one"
+        );
+        assert!(
+            !installed.load(Ordering::Relaxed),
+            "the new catalog's generation starts un-tripped"
+        );
+    }
+
+    /// A start cannot install a fresh unreachable generation during a switch.
+    ///
+    /// Between the two switch phases the catalog reads as `None`, so a start returns having
+    /// touched nothing: no generation installed, no job id burned, status slot unchanged.
+    /// That is exactly the state a start blocked on the catalog lock sees when the switch
+    /// hands it over — the lock is held across the whole transition precisely so that the
+    /// blocked case and this one are the same case.
+    #[test]
+    fn start_during_a_switch_installs_nothing() {
+        let (cat_a, db_a, _root_a) = temp_catalog("mid-a", 1);
+        let (cat_b, db_b, root_b) = temp_catalog("mid-b", 0);
+        let state = state_with(cat_a);
+
+        let (first_db, _root, first_abort, first_job) = begin_smarttags_job(&state).unwrap();
+        assert_eq!(first_db, db_a);
+
+        // Phase one: the running job is tripped and the outgoing catalog is detached.
+        detach_catalog_and_trip_jobs(&state).unwrap();
+        assert!(
+            first_abort.load(Ordering::Relaxed),
+            "phase one must trip the running job"
+        );
+
+        let before = state.smarttags_abort.lock().unwrap().clone();
+        let seq_before = state.smarttags_job_seq.load(Ordering::Relaxed);
+        let slot_before = *state.smarttags_job.lock().unwrap();
+
+        let err = begin_smarttags_job(&state).unwrap_err();
+        assert_eq!(err, "No catalog is open");
+
+        let after = state.smarttags_abort.lock().unwrap().clone();
+        assert!(
+            Arc::ptr_eq(&before, &after),
+            "a start mid-switch must not install a generation"
+        );
+        assert!(
+            after.load(Ordering::Relaxed),
+            "the installed generation is still the tripped one"
+        );
+        assert_eq!(
+            state.smarttags_job_seq.load(Ordering::Relaxed),
+            seq_before,
+            "a rejected start must not burn a job id"
+        );
+        assert_eq!(
+            state.smarttags_job.lock().unwrap().map(|s| s.job),
+            slot_before.map(|s| s.job),
+            "a rejected start must leave the status slot alone"
+        );
+
+        // Phase two publishes the new catalog with a fresh generation — and does not clear
+        // the old job's flag, whose worker must stay aborted.
+        publish_catalog_and_reset_jobs(&state, cat_b).unwrap();
+        assert!(
+            first_abort.load(Ordering::Relaxed),
+            "phase two must not resurrect the superseded job"
+        );
+
+        // A start after the switch snapshots the NEW catalog and becomes the reachable
+        // generation.
+        let (db, root, abort2, job2) = begin_smarttags_job(&state).unwrap();
+        assert_eq!(db, db_b, "the new job must index the catalog switched to");
+        assert_eq!(root, root_b);
+        assert_ne!(job2, first_job, "each start gets its own job id");
+        assert!(!abort2.load(Ordering::Relaxed));
+        let installed = state.smarttags_abort.lock().unwrap().clone();
+        assert!(
+            Arc::ptr_eq(&abort2, &installed),
+            "the new job's flag must be the installed generation"
+        );
+        assert_eq!(
+            state.smarttags_job.lock().unwrap().map(|s| s.job),
+            Some(job2),
+            "the new job owns the status slot"
+        );
+    }
+
+    /// Under real contention between starts and switches, every start that returned `Ok`
+    /// must satisfy: its generation is tripped (a switch reached it), or it is the installed
+    /// generation AND it snapshotted the catalog that is now open. A live generation that is
+    /// not installed is an orphan nothing can cancel; a live generation indexing a catalog
+    /// the switch has already left is the write-after-switch this issue is about.
+    ///
+    /// The invariant holds under every legal interleaving, so the assertion never depends on
+    /// which one the scheduler picks — but the interleavings it *samples* do, which is why
+    /// the two deterministic tests above carry the load and this one is a net over the rest.
+    /// It is checked after every round, not only at the end, so a bad install cannot be
+    /// papered over by the next round's abort.
+    #[test]
+    fn concurrent_starts_and_switches_leave_no_unreachable_generation() {
+        let (cat_a, db_a, root_a) = temp_catalog("race-a", 0);
+        let (cat_b, db_b, root_b) = temp_catalog("race-b", 0);
+        // Each round re-opens the catalog it switches to, as a real switch does; the two
+        // alternate so a stale snapshot is distinguishable from a fresh one.
+        drop(cat_b);
+        let state = state_with(cat_a);
+
+        let started: Mutex<Vec<(PathBuf, Arc<AtomicBool>)>> = Mutex::new(Vec::new());
+        // One uncontended start, so the check below cannot be vacuous even in the unlikely
+        // case that every racing start lands in the mid-switch window.
+        let (db, _root, first, _job) = begin_smarttags_job(&state).unwrap();
+        started.lock().unwrap().push((db, first));
+
+        for round in 0..50 {
+            let (next_db, next_root) = if round % 2 == 0 {
+                (&db_b, &root_b)
+            } else {
+                (&db_a, &root_a)
+            };
+            std::thread::scope(|s| {
+                s.spawn(|| {
+                    if let Ok((db, _root, abort, _job)) = begin_smarttags_job(&state) {
+                        started.lock().unwrap().push((db, abort));
+                    }
+                });
+                s.spawn(|| {
+                    detach_catalog_and_trip_jobs(&state).unwrap();
+                    let cat = Catalog::open(next_db, next_root).unwrap();
+                    publish_catalog_and_reset_jobs(&state, cat).unwrap();
+                });
+            });
+
+            let installed = state.smarttags_abort.lock().unwrap().clone();
+            let open_db = state
+                .catalog
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|c| c.db_path().to_path_buf());
+            for (i, (db, abort)) in started.lock().unwrap().iter().enumerate() {
+                if abort.load(Ordering::Relaxed) {
+                    continue;
+                }
+                assert!(
+                    Arc::ptr_eq(abort, &installed),
+                    "round {round}: start #{i} left a live generation that no cancel or \
+                     switch can reach"
+                );
+                assert_eq!(
+                    Some(db.clone()),
+                    open_db,
+                    "round {round}: start #{i} is still live against a catalog the switch \
+                     has left"
+                );
+            }
+        }
+    }
 }
 

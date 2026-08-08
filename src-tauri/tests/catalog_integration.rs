@@ -3768,3 +3768,265 @@ fn concurrent_opens_of_fresh_catalog_all_succeed() {
 
     std::fs::remove_dir_all(base).unwrap();
 }
+
+// ---------------------------------------------------------------------------
+// Photo identity binding (AGENTS.md, "Photo identity": the UUID lives in BOTH
+// SQLite and xmp:Identifier, and the sidecar write is never skipped).
+//
+// A sidecar write that could not complete used to be an eprintln! and an Ok — the
+// catalog kept the row and the photo silently lost its portable identity. These
+// tests pin the replacement: the row is kept AND the debt is queued, and a repair
+// pass puts the identity on disk once the obstacle is gone.
+// ---------------------------------------------------------------------------
+
+/// Restores a directory's permissions when it drops, so a failing assertion cannot
+/// leave a read-only directory behind for the next run to trip over.
+#[cfg(unix)]
+struct ReadOnlyDir(PathBuf);
+
+#[cfg(unix)]
+impl Drop for ReadOnlyDir {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+    }
+}
+
+/// Make `dir` reject new files for the lifetime of the guard. Returns `None` when the
+/// mode bits do not actually block writes (i.e. running as root), so a test that cannot
+/// reproduce the failure skips loudly instead of passing without proving anything.
+#[cfg(unix)]
+fn read_only_dir(dir: &std::path::Path) -> Option<ReadOnlyDir> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let guard = ReadOnlyDir(dir.to_path_buf());
+    let probe = dir.join(".chairphoto-write-probe");
+    match std::fs::write(&probe, b"x") {
+        Ok(()) => {
+            let _ = std::fs::remove_file(&probe);
+            eprintln!(
+                "SKIPPED: writes to a 0555 directory succeed here (root?), so the \
+                 unwritable-sidecar path cannot be reproduced"
+            );
+            None
+        }
+        Err(_) => Some(guard),
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn unwritable_sidecar_queues_a_repair_that_later_succeeds() {
+    use chairphoto_lib::catalog::SidecarIdentity;
+
+    let (catalog, root) = temp_catalog("identity-unwritable");
+    let dir = root.join("2026/06/28");
+    std::fs::create_dir_all(&dir).unwrap();
+    let photo = dir.join("DSC0001.ARW");
+    std::fs::write(&photo, b"raw-bytes").unwrap();
+    let up = catalog.upsert_photo(&photo, None, 1, 9).unwrap();
+
+    // The photo's storage goes read-only (a NAS export mounted ro, a locked-down
+    // archive) — the sidecar cannot be created.
+    let Some(guard) = read_only_dir(&dir) else { return };
+
+    let outcome = catalog
+        .ensure_sidecar_identity(up.id, &photo, &up.uuid, None)
+        .unwrap();
+    assert!(
+        matches!(outcome, SidecarIdentity::Unwritable(_)),
+        "an unwritable folder must report the failure, got {outcome:?}"
+    );
+    assert!(
+        chairphoto_lib::xmp::read_identifier(&photo).is_none(),
+        "no sidecar could be written, so nothing is on disk yet"
+    );
+
+    // The row is still catalogued — and the identity debt is durable, not stderr.
+    let pending = catalog.list_pending_identity().unwrap();
+    assert_eq!(pending.len(), 1, "the failure is queued for repair");
+    assert_eq!(pending[0].photo_id, up.id);
+    assert_eq!(
+        pending[0].uuid, up.uuid,
+        "the queue names the identity that must still reach the disk"
+    );
+    assert!(
+        pending[0].error.contains("sidecar write failed"),
+        "the reason is kept for diagnosis, got {:?}",
+        pending[0].error
+    );
+
+    // Retrying while the storage is still read-only leaves it queued and counts the try.
+    let retry = catalog.repair_pending_identity().unwrap();
+    assert_eq!(
+        (retry.repaired, retry.failed, retry.unreachable),
+        (0, 1, 0),
+        "a repair against read-only storage fails and stays queued"
+    );
+    assert_eq!(catalog.list_pending_identity().unwrap()[0].attempts, 2);
+
+    // Once the obstacle is gone the repair binds the identity and clears the queue —
+    // portable identity was deferred, never lost.
+    drop(guard);
+    let summary = catalog.repair_pending_identity().unwrap();
+    assert_eq!((summary.repaired, summary.failed, summary.unreachable), (1, 0, 0));
+    assert_eq!(
+        chairphoto_lib::xmp::read_identifier(&photo).as_deref(),
+        Some(up.uuid.as_str()),
+        "the catalog UUID is now on disk"
+    );
+    assert_eq!(catalog.count_pending_identity().unwrap(), 0);
+}
+
+#[test]
+fn malformed_sidecar_is_preserved_and_queued() {
+    use chairphoto_lib::catalog::SidecarIdentity;
+
+    let (catalog, root) = temp_catalog("identity-malformed");
+    let photo = root.join("DSC0002.ARW");
+    std::fs::write(&photo, b"raw-bytes").unwrap();
+    // A truncated sidecar — half-written by an interrupted third-party tool.
+    let sidecar = root.join("DSC0002.ARW.xmp");
+    let corrupt: &[u8] = b"<x:xmpmeta xmlns:x=\"adobe:ns:meta/\"><rdf:RDF";
+    std::fs::write(&sidecar, corrupt).unwrap();
+
+    let up = catalog.upsert_photo(&photo, None, 1, 9).unwrap();
+    assert!(
+        chairphoto_lib::xmp::read_identifier(&photo).is_none(),
+        "a sidecar that does not parse yields no identifier"
+    );
+
+    let outcome = catalog
+        .ensure_sidecar_identity(up.id, &photo, &up.uuid, None)
+        .unwrap();
+    assert!(
+        matches!(outcome, SidecarIdentity::Unwritable(_)),
+        "a sidecar that cannot be parsed cannot be merged into, got {outcome:?}"
+    );
+    assert_eq!(
+        std::fs::read(&sidecar).unwrap(),
+        corrupt,
+        "the unreadable sidecar is left byte-identical — XMP safety says preserve"
+    );
+    assert_eq!(catalog.count_pending_identity().unwrap(), 1);
+    assert_eq!(
+        catalog.repair_pending_identity().unwrap().failed,
+        1,
+        "repair does not paper over a corrupt sidecar"
+    );
+
+    // With the corrupt file out of the way, the queued repair completes.
+    std::fs::remove_file(&sidecar).unwrap();
+    let summary = catalog.repair_pending_identity().unwrap();
+    assert_eq!((summary.repaired, summary.failed), (1, 0));
+    assert_eq!(
+        chairphoto_lib::xmp::read_identifier(&photo).as_deref(),
+        Some(up.uuid.as_str())
+    );
+    assert_eq!(catalog.count_pending_identity().unwrap(), 0);
+}
+
+#[test]
+fn a_foreign_identity_in_the_sidecar_is_never_overwritten() {
+    use chairphoto_lib::catalog::SidecarIdentity;
+
+    let (catalog, root) = temp_catalog("identity-conflict");
+    let photo = root.join("DSC0003.ARW");
+    std::fs::write(&photo, b"raw-bytes").unwrap();
+    let up = catalog.upsert_photo(&photo, None, 1, 9).unwrap();
+
+    // The file already carries somebody else's identity (a copied sidecar, another
+    // catalog's photo). Binding must not resolve that by destroying it.
+    const FOREIGN: &str = "11111111-2222-3333-4444-555555555555";
+    chairphoto_lib::xmp::write_identifier(&photo, FOREIGN).unwrap();
+    let found = chairphoto_lib::xmp::read_identifier(&photo);
+
+    let outcome = catalog
+        .ensure_sidecar_identity(up.id, &photo, &up.uuid, found.as_deref())
+        .unwrap();
+    assert_eq!(outcome, SidecarIdentity::Conflict(FOREIGN.to_string()));
+    assert_eq!(
+        chairphoto_lib::xmp::read_identifier(&photo).as_deref(),
+        Some(FOREIGN),
+        "the foreign identity stays on disk"
+    );
+
+    let pending = catalog.list_pending_identity().unwrap();
+    assert_eq!(pending.len(), 1);
+    assert!(
+        pending[0].error.contains("different identity"),
+        "the divergence is described, got {:?}",
+        pending[0].error
+    );
+
+    // A repair pass keeps reporting it rather than clobbering — this one needs a human.
+    let summary = catalog.repair_pending_identity().unwrap();
+    assert_eq!((summary.repaired, summary.failed), (0, 1));
+    assert_eq!(
+        chairphoto_lib::xmp::read_identifier(&photo).as_deref(),
+        Some(FOREIGN)
+    );
+}
+
+#[test]
+fn an_unreachable_original_leaves_the_repair_queued() {
+    let (catalog, root) = temp_catalog("identity-unreachable");
+    let photo = root.join("DSC0004.ARW");
+    std::fs::write(&photo, b"raw-bytes").unwrap();
+    let up = catalog.upsert_photo(&photo, None, 1, 9).unwrap();
+    std::fs::write(
+        root.join("DSC0004.ARW.xmp"),
+        b"<x:xmpmeta xmlns:x=\"adobe:ns:meta/\"><rdf:RDF",
+    )
+    .unwrap();
+    catalog
+        .ensure_sidecar_identity(up.id, &photo, &up.uuid, None)
+        .unwrap();
+    assert_eq!(catalog.count_pending_identity().unwrap(), 1);
+
+    // The volume goes away (unmounted NAS, disconnected disk). Missing storage is a
+    // normal state: the repair is not a failure and not a reason to drop the row.
+    std::fs::remove_file(&photo).unwrap();
+    let summary = catalog.repair_pending_identity().unwrap();
+    assert_eq!(
+        (summary.repaired, summary.failed, summary.unreachable),
+        (0, 0, 1)
+    );
+    assert_eq!(catalog.count_pending_identity().unwrap(), 1, "still queued");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_scan_onto_read_only_storage_keeps_every_identity_recoverable() {
+    let (catalog, root) = temp_catalog("identity-scan-readonly");
+    seed_jpgs(&root, 3);
+    let Some(guard) = read_only_dir(&root) else { return };
+
+    // The scan still imports — one unwritable folder must not cost the user the rows.
+    let abort = AtomicBool::new(false);
+    let result = chairphoto_lib::scanner::scan_folder(&catalog, &root, &abort, &|_| {}).unwrap();
+    assert_eq!(result.created, 3, "the scan indexes every file");
+    assert_eq!(
+        catalog.count_pending_identity().unwrap(),
+        3,
+        "every photo whose sidecar could not be written owes an identity repair"
+    );
+
+    // Remount read-write and repair: every catalog UUID reaches its sidecar.
+    drop(guard);
+    let summary = catalog.repair_pending_identity().unwrap();
+    assert_eq!((summary.repaired, summary.failed, summary.unreachable), (3, 0, 0));
+    let photos = catalog
+        .list_photos(None, None, None, &[], "all", None, "all", None, None, &[], None)
+        .unwrap();
+    assert_eq!(photos.len(), 3);
+    for photo in &photos {
+        assert_eq!(
+            chairphoto_lib::xmp::read_identifier(&root.join(&photo.path)).as_deref(),
+            Some(photo.uuid.as_str()),
+            "{} carries its catalog identity after the repair",
+            photo.path
+        );
+    }
+    assert_eq!(catalog.count_pending_identity().unwrap(), 0);
+}

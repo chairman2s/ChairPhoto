@@ -321,6 +321,8 @@ pub fn run() {
             commands::restore_photo,
             commands::remove_photo_from_catalog,
             commands::relocate_photo,
+            commands::list_pending_identity,
+            commands::repair_pending_identity,
             commands::find_unavailable_photos,
             commands::purge_unavailable_photos,
             commands::find_empty_photos,

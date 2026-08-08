@@ -132,8 +132,14 @@ pub fn remove_photo_from_catalog(state: State<'_, AppState>, photo_id: i64) -> R
 
 /// Re-point a photo at a file the user moved to a new location (under the library root):
 /// update its path/stats/primary-location, clear `missing`, and bind the file's sidecar
-/// to the photo's UUID (best-effort, merge-safe). For the "Relocate…" option. The new
-/// file must be under the library root, else this errors with a clear message.
+/// to the photo's UUID (merge-safe). For the "Relocate…" option. The new file must be
+/// under the library root, else this errors with a clear message.
+///
+/// The relocation and the identity binding are one operation: if the sidecar can't be
+/// bound the row still moves (the user asked for that, and the file is where they said),
+/// but the debt is queued in `pending_sidecar_identity` for `repair_pending_identity`
+/// instead of being logged and forgotten. Sidecar IO runs off the catalog lock — a
+/// hung mount must not stall every other catalog user.
 #[tauri::command]
 pub async fn relocate_photo(
     state: State<'_, AppState>,
@@ -143,18 +149,46 @@ pub async fn relocate_photo(
     let path = expand_home(&new_path);
     let target = path.clone();
     let uuid = with_catalog_blocking(&state, move |c| c.relocate_photo(photo_id, &target)).await?;
-    // Keep the UUID on disk so future moves/re-roots match (binding invariant). The file
-    // usually already carries it (its sidecar moved with it); only write when absent.
-    // Both the read and the write parse XML, so they run off the main thread.
-    tauri::async_runtime::spawn_blocking(move || {
-        if crate::xmp::read_identifier(&path).is_none() {
-            if let Err(e) = crate::xmp::write_identifier(&path, &uuid) {
-                eprintln!("relocate: couldn't write UUID sidecar for {}: {e}", path.display());
-            }
-        }
+    // The file usually already carries the UUID (its sidecar moved with it); a sidecar
+    // holding somebody else's identity is left alone and recorded as a conflict.
+    let outcome = tauri::async_runtime::spawn_blocking(move || {
+        let found = crate::xmp::read_identifier(&path);
+        crate::catalog::bind_sidecar_identity(&path, &uuid, found.as_deref())
     })
     .await
-    .map_err(|e| e.to_string())
+    .map_err(|e| e.to_string())?;
+    with_catalog(&state, |c| c.record_sidecar_identity(photo_id, &outcome))
+}
+
+/// Photos whose UUID is in the catalog but not (yet) in their XMP sidecar — the
+/// identity debt left by an unwritable, unparseable, or offline sidecar.
+#[tauri::command]
+pub async fn list_pending_identity(
+    state: State<'_, AppState>,
+) -> Result<Vec<crate::catalog::PendingIdentity>, String> {
+    with_catalog_blocking(&state, |c| c.list_pending_identity()).await
+}
+
+/// Retry every queued identity repair, clearing the ones that now succeed. Runs the
+/// plan → IO → record split per photo so the sidecar parsing/writing (possibly over a
+/// slow mount) never holds the catalog lock. Photos whose file is unreachable stay
+/// queued; so do sidecars that still can't be written or that carry a conflicting
+/// identity — those need a human, and the queue is what remembers them.
+#[tauri::command]
+pub async fn repair_pending_identity(
+    state: State<'_, AppState>,
+) -> Result<crate::catalog::IdentityRepairSummary, String> {
+    let plans = with_catalog_blocking(&state, |c| c.plan_identity_repairs()).await?;
+    let mut summary = crate::catalog::IdentityRepairSummary::default();
+    for plan in plans {
+        let photo_id = plan.photo_id;
+        let outcome = tauri::async_runtime::spawn_blocking(move || plan.run())
+            .await
+            .map_err(|e| e.to_string())?;
+        with_catalog(&state, |c| c.record_sidecar_identity(photo_id, &outcome))?;
+        summary.tally(&outcome);
+    }
+    Ok(summary)
 }
 
 /// A catalog photo whose original is gone (for the cleanup preview/report).

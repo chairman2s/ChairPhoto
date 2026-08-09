@@ -558,5 +558,3 @@ mod job_temp_dir_tests {
     }
 }
 
-// --- Flickr ---
-

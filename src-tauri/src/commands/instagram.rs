@@ -146,7 +146,3 @@ fn find_chrome() -> Option<String> {
     None
 }
 
-// --- Flickr / SmugMug publishing (official OAuth 1.0a APIs) ----------------------------
-// Shared helpers (compiled when either module's feature is on): render the selected version
-// to a temp JPEG, and read/write the module's namespaced settings (api_key/secret/tokens).
-

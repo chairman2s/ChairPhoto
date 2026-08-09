@@ -165,12 +165,13 @@ pub async fn faces_index_photos(
     // allow a fourth — install an un-tripped generation after the switch's only abort
     // signal, then index the catalog it is about to close.
     //
-    // Every *nested* acquisition in the backend is catalog → abort → slot: this block and
-    // both switch_catalog phases. The scan, sharpness and pHash starts install their abort
-    // generation and release that lock before reading the catalog, so they never hold two
-    // at once and cannot invert against this order; switch_catalog covers them instead by
-    // tripping whatever is installed before it replaces anything. faces_index_cancel takes
-    // only the abort lock and workers only the slot lock.
+    // Every *nested* acquisition in the backend is catalog → abort → slot: this block, the
+    // same block in `begin_smarttags_job`, and both switch_catalog phases. The scan,
+    // sharpness and pHash starts install their abort generation and release that lock
+    // before reading the catalog, so they never hold two at once and cannot invert against
+    // this order; switch_catalog covers them instead by tripping whatever is installed
+    // before it replaces anything. faces_index_cancel takes only the abort lock and workers
+    // only the slot lock.
     //
     // Everything fallible either precedes this block or is read-only within it, so an
     // error cannot leave the previous job aborted with no successor.

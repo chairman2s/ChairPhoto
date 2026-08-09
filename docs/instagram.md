@@ -34,6 +34,13 @@ Every attempt reports one of three outcomes:
 A publication is recorded **only on a confirmed post**. After a supervised run ChairPhoto
 asks whether you completed it, because it cannot see a click it did not make.
 
+**The render outlives a supervised post.** ChairPhoto hands Chrome the *path* to the
+rendered JPEG, not its bytes — the composer's file input reads from disk when you click
+Share, even though the image is already on screen. So a post left **awaitingReview** keeps
+its temp directory (one per post, mode 0700), and the next publish sweeps it once it is a
+day old. A confirmed **posted**, or a **needsLogin** that never reached the file input,
+deletes it as soon as the command returns.
+
 ## Signing in
 
 There is no key or token to paste. ChairPhoto launches Chrome with its **own persistent
@@ -65,7 +72,8 @@ is never overwritten.
 - `src-tauri/src/instagram/mod.rs` — the Chrome automation.
 - `src-tauri/src/commands/instagram.rs` — `post_to_instagram` and
   `build_instagram_caption`, both gated on the `instagram` feature. The render goes to a
-  temp JPEG.
+  temp JPEG in a directory belonging to that post alone (`publishing::JobTempDir`), whose
+  lifetime follows the outcome as described above.
 - `src/modules/plugins/instagram.tsx` — the publish target in the unified Publish dialog:
   version picker, caption box, auto-publish toggle, and the post-run confirmation.
 

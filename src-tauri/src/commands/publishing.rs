@@ -33,6 +33,9 @@ use tauri::{AppHandle, Manager};
 #[cfg(any(feature = "flickr", feature = "smugmug", feature = "instagram", feature = "localsend"))]
 pub(super) struct JobTempDir {
     path: PathBuf,
+    /// Set by [`JobTempDir::keep`] when something outside this process still needs the
+    /// render; the sweep takes over from there.
+    kept: bool,
 }
 
 /// The name every job directory starts with — what the sweep recognizes as ours.
@@ -76,18 +79,38 @@ impl JobTempDir {
         let owner = None;
         sweep_abandoned(&root, ABANDONED_AFTER, owner);
 
-        Ok(Self { path })
+        Ok(Self { path, kept: false })
     }
 
     /// A path for `name` inside this job's directory.
     pub(super) fn join(&self, name: &str) -> PathBuf {
         self.path.join(name)
     }
+
+    /// Leave the directory on disk instead of removing it when the guard drops.
+    ///
+    /// For the one shape of job that is not finished when the command returns: a supervised
+    /// Instagram post, where Chrome holds the render as a `File` it reads from disk only
+    /// when the user finally clicks Share. Deleting it at return would break that click.
+    /// The directory is not leaked — it stays at mode 0700 and `sweep_abandoned` reclaims
+    /// it once it is stale.
+    ///
+    /// Gated on `instagram` because that supervised flow is the only caller: every other
+    /// publish path has sent its bytes by the time the command returns, and a general
+    /// "leave this behind" method they could reach for would be a way to reintroduce the
+    /// leak this sweep exists to clean up.
+    #[cfg(feature = "instagram")]
+    pub(super) fn keep(mut self) {
+        self.kept = true;
+    }
 }
 
 #[cfg(any(feature = "flickr", feature = "smugmug", feature = "instagram", feature = "localsend"))]
 impl Drop for JobTempDir {
     fn drop(&mut self) {
+        if self.kept {
+            return;
+        }
         // Best-effort: a failure here leaves a temp directory behind, which must not turn a
         // successful publish into an error. Takes the sidecars exiftool may have written
         // next to the render with it.
@@ -365,6 +388,23 @@ mod job_temp_dir_tests {
         };
         let dir_path = render.parent().unwrap();
         assert!(!dir_path.exists(), "{} outlived its job", dir_path.display());
+    }
+
+    /// A kept guard leaves the render for whoever still needs it (the supervised Instagram
+    /// composer), rather than deleting it out from under them.
+    #[cfg(feature = "instagram")]
+    #[test]
+    fn a_kept_guard_leaves_the_render_in_place() {
+        let dir = JobTempDir::new("instagram").unwrap();
+        let render = dir.join("chairphoto-instagram.jpg");
+        std::fs::write(&render, b"jpeg").unwrap();
+        dir.keep();
+        assert!(
+            render.exists(),
+            "the render Chrome still reads from was deleted at return"
+        );
+        // Left to `sweep_abandoned` in production; this test does not wait 24 hours for it.
+        std::fs::remove_dir_all(render.parent().unwrap()).unwrap();
     }
 
     /// …and when the job fails after rendering (the upload errors out).

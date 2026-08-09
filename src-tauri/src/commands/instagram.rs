@@ -33,10 +33,12 @@ pub async fn post_to_instagram(
         .next()
         .ok_or("Photo is unavailable (original offline?)")?;
 
-    // One temp directory per post, removed when `dir` drops — on the error paths below as
-    // well. The old fixed `<temp>/chairphoto-instagram.jpg` let two concurrent posts render
-    // over each other (the second post could upload the first post's photo) and put a
-    // predictable, guessable path in a shared /tmp. The filename Chrome sees is unchanged.
+    // One temp directory per post, removed when `dir` drops — including on the render error
+    // below, which happens before Chrome has ever seen the path. The old fixed
+    // `<temp>/chairphoto-instagram.jpg` let two concurrent posts render over each other (the
+    // second post could upload the first post's photo) and put a predictable, guessable path
+    // in a shared /tmp. The filename Chrome sees is unchanged. Whether the directory survives
+    // the *post* depends on the outcome — see the match below.
     let dir = JobTempDir::new("instagram")?;
     let img_path = dir.join("chairphoto-instagram.jpg");
     let out = img_path.clone();
@@ -50,12 +52,32 @@ pub async fn post_to_instagram(
     let chrome = find_chrome().ok_or(
         "Chrome/Chromium not found — install Google Chrome or Chromium to post to Instagram",
     )?;
-    let outcome =
-        crate::instagram::post(&img_path, &caption, &profile_dir, &chrome, publish).await?;
+    let outcome = crate::instagram::post(&img_path, &caption, &profile_dir, &chrome, publish).await;
+
+    // Unlike an API upload, this command returning does not mean the bytes have been sent.
+    // `DOM.setFileInputFiles` hands Chrome a *path*: the `File` on the composer's input
+    // reads from disk lazily, so the render has to outlive us whenever the post is still
+    // open in a browser we deliberately do not own.
+    //
+    // Measured over CDP against Chrome 150 with the same call `crate::instagram` makes —
+    // attach the file, draw it as a preview, delete it, then read it back: `arrayBuffer()`
+    // fails with `NotFoundError`, a `FormData` POST fails with `TypeError: Failed to fetch`,
+    // and `file.size` reads 0. Displaying the image does not cache it. So deleting the
+    // render at `AwaitingReview` would leave the user a composed post whose Share click
+    // cannot work.
+    //
+    // Posted — Instagram has the bytes and confirmed it. NeedsLogin — we returned before
+    // touching the file input. Both are done with the render. An error can land either side
+    // of the attach and leaves the composer on screen, so it is treated as still in use.
+    // Nothing is leaked: `sweep_abandoned` reclaims a kept directory once it is stale.
+    match &outcome {
+        Ok(crate::instagram::PostOutcome::Posted | crate::instagram::PostOutcome::NeedsLogin) => {}
+        Ok(crate::instagram::PostOutcome::AwaitingReview) | Err(_) => dir.keep(),
+    }
 
     // The Instagram module (frontend) records the publication when the outcome is "posted",
     // through the same api.recordPublication contract as the other publishers.
-    Ok(serde_json::to_value(outcome)
+    Ok(serde_json::to_value(outcome?)
         .ok()
         .and_then(|v| v.as_str().map(String::from))
         .unwrap_or_else(|| "posted".into()))

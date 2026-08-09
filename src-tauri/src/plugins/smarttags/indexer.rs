@@ -179,6 +179,21 @@ where
                     outcome.failed += 1;
                 }
                 EmbedResult::Embedded(emb) => {
+                    // Check abort BEFORE writing, not after. Embedding one photo takes orders
+                    // of magnitude longer than everything around it, so a switch almost always
+                    // lands inside the embed — and checking afterwards meant the row and its
+                    // progress event were still written against the catalog the user had just
+                    // left. Measured: firing a switch from inside the embed produced one
+                    // `smarttags__embeddings` row and one `smarttags:progress` event after both
+                    // switch phases had completed.
+                    //
+                    // Discarding a finished embedding is the cheap side of this trade: it costs
+                    // one photo's work on the next run, where writing it costs a row in the
+                    // wrong catalog that nothing will clean up.
+                    if abort.load(Ordering::Relaxed) {
+                        outcome.aborted = true;
+                        break;
+                    }
                     let blob = store::embedding_to_blob(&emb);
                     store::upsert_embedding(conn, photo_id, &blob)
                         .map_err(|e| e.to_string())?;

@@ -216,13 +216,7 @@ pub async fn smarttags_index_photos(
         // adopt a job it can never see finish and sit in "indexing" forever. Clearing
         // first means a missed terminal necessarily reads back as idle, or as a newer
         // job that is genuinely still running.
-        let clear_job_slot = || {
-            if let Ok(mut slot) = job_slot.lock() {
-                if slot.as_ref().map(|s| s.job) == Some(job) {
-                    *slot = None;
-                }
-            }
-        };
+        let clear_job_slot = || clear_slot_if_owner(&job_slot, job);
 
         // Secondary connection — never contends with the primary's UI reads.
         let sec = match Catalog::open_secondary(&db_path, &root) {
@@ -284,15 +278,7 @@ pub async fn smarttags_index_photos(
             // (plugins/smarttags/indexer.rs:186-189), so a superseded run can still arrive
             // here. Without the guard it would rewrite the slot back to itself and then
             // clear it on the way out, leaving the newer run invisible to status queries.
-            if let Ok(mut slot) = job_slot_clone.lock() {
-                if slot.as_ref().map(|s| s.job) == Some(job) {
-                    *slot = Some(SmarttagsJobStatus {
-                        job,
-                        done: p.done as usize,
-                        total: p.total as usize,
-                    });
-                }
-            }
+            write_slot_if_owner(&job_slot_clone, job, p.done as usize, p.total as usize);
         };
 
         let resolve_fn = |photo_id: i64| {
@@ -579,6 +565,36 @@ pub async fn smarttags_train_classifiers(
 //
 // The last test is a contention net whose assertion holds under every legal interleaving; it
 // samples rather than forces, so it backs the other three up instead of standing in for them.
+
+/// Write `done`/`total` into the status slot, but only when `job` still owns it.
+///
+/// Extracted so the production path and its test share one implementation. Both call sites
+/// used to inline this comparison, which meant a test could only ever check a copy of the
+/// logic — and a copy stays green when the real guard is deleted.
+#[cfg(feature = "smarttags")]
+fn write_slot_if_owner(
+    slot: &Arc<Mutex<Option<SmarttagsJobStatus>>>,
+    job: u64,
+    done: usize,
+    total: usize,
+) {
+    if let Ok(mut s) = slot.lock() {
+        if s.as_ref().map(|x| x.job) == Some(job) {
+            *s = Some(SmarttagsJobStatus { job, done, total });
+        }
+    }
+}
+
+/// Clear the status slot, but only when `job` still owns it. See [`write_slot_if_owner`].
+#[cfg(feature = "smarttags")]
+fn clear_slot_if_owner(slot: &Arc<Mutex<Option<SmarttagsJobStatus>>>, job: u64) {
+    if let Ok(mut s) = slot.lock() {
+        if s.as_ref().map(|x| x.job) == Some(job) {
+            *s = None;
+        }
+    }
+}
+
 #[cfg(test)]
 mod smarttags_ownership_tests {
     use super::*;
@@ -947,5 +963,61 @@ mod smarttags_ownership_tests {
             }
         }
     }
+
+    /// Acceptance criterion 3: "Status/progress/terminal updates remain scoped to the owning
+    /// job id." The two guards that enforce it — `clear_job_slot` (smarttags.rs:221) and the
+    /// slot write inside `emit_fn` (smarttags.rs:288) — had no coverage at all: a reviewer
+    /// deleted both and the whole lib suite stayed green.
+    ///
+    /// The guards exist because a superseded run can still arrive at either point after a
+    /// newer one has claimed the slot. Without them it rewrites the slot back to itself and
+    /// then clears it on the way out, leaving the newer, genuinely-running job invisible to
+    /// `smarttags_index_status` — the panel reads idle and stops showing progress for a job
+    /// that is still working.
+    ///
+    /// This exercises the guard conditions directly rather than through a live indexer,
+    /// because reproducing the race in a real run means winning it. Both branches are
+    /// asserted: the owner's write lands, the superseded one's does not.
+    #[test]
+    fn slot_writes_are_scoped_to_the_owning_job() {
+        let slot: Arc<Mutex<Option<SmarttagsJobStatus>>> = Arc::new(Mutex::new(None));
+
+        // A newer job (id 2) owns the slot.
+        *slot.lock().unwrap() = Some(SmarttagsJobStatus { job: 2, done: 5, total: 100 });
+
+        // The superseded run (id 1) tries to report progress. The guard must reject it.
+        write_slot_if_owner(&slot, 1, 42, 100);
+        let after = slot.lock().unwrap().clone();
+        assert_eq!(
+            after.as_ref().map(|s| (s.job, s.done)),
+            Some((2, 5)),
+            "a superseded job (1) overwrote the slot owned by a newer job (2); \
+             without this guard the newer run becomes invisible to status queries"
+        );
+
+        // The owner's own write must still land, or the guard has broken progress entirely.
+        write_slot_if_owner(&slot, 2, 7, 100);
+        assert_eq!(
+            slot.lock().unwrap().as_ref().map(|s| (s.job, s.done)),
+            Some((2, 7)),
+            "the owning job's progress write was rejected"
+        );
+
+        // The superseded run finishing must not clear the newer job's slot.
+        clear_slot_if_owner(&slot, 1);
+        assert!(
+            slot.lock().unwrap().is_some(),
+            "a superseded job cleared the slot out from under the running one; \
+             the panel would read idle while indexing is still in progress"
+        );
+
+        // The owner clearing on completion must work.
+        clear_slot_if_owner(&slot, 2);
+        assert!(
+            slot.lock().unwrap().is_none(),
+            "the owning job could not clear its own slot on completion"
+        );
+    }
+
 }
 

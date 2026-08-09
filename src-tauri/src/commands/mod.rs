@@ -116,8 +116,9 @@ pub struct AppState {
     pub scan_abort: Mutex<Arc<AtomicBool>>,
     /// Abort flag for any in-flight face-indexing job (H13b). Same swappable-Arc pattern
     /// as `scan_abort`: `faces_index_photos` installs a fresh flag, `faces_index_cancel`
-    /// trips it. The worker holds a clone of its generation's flag so a cancel never races
-    /// a subsequent re-index.
+    /// trips it, and a catalog switch trips it under the catalog lock (both phases). The
+    /// worker holds a clone of its generation's flag so a cancel never races a subsequent
+    /// re-index.
     #[cfg(feature = "faces")]
     pub faces_abort: Mutex<Arc<AtomicBool>>,
     /// Live status of the face-indexing job, `None` when idle. Written by the worker

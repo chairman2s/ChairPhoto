@@ -3,8 +3,9 @@
 //!
 //! Send-only. Gated on the `localsend` Cargo feature; see `docs/localsend.md`.
 
+use super::publishing::{upload_file_name, JobTempDir};
 use super::*;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tauri::{AppHandle, Emitter, Manager};
 
 /// Discover LocalSend devices on the LAN. `timeout_ms` defaults to ~2.5s — long enough for
@@ -58,7 +59,9 @@ pub async fn localsend_send(
     // Render every selected photo to a temp JPEG off the catalog lock (RAW decode is slow).
     // `selected_version_id` applies only to its own photo; the rest send unedited (same
     // semantics as export). Unreachable originals are skipped and counted as failed.
-    let paths = render_localsend_jpegs(&app, &photo_ids, version_id).await?;
+    // `_dir` is this send's own temp directory; it is removed when this function returns,
+    // whichever way it returns.
+    let (_dir, paths) = render_localsend_jpegs(&app, &photo_ids, version_id).await?;
     let skipped = photo_ids.len().saturating_sub(paths.len());
     if paths.is_empty() {
         return Err("None of the selected photos are available (originals offline?).".into());
@@ -80,11 +83,7 @@ pub async fn localsend_send(
     .await
     .map_err(|e| e.to_string())?;
 
-    // Clean up the temp renders regardless of outcome.
-    for p in &paths {
-        let _ = std::fs::remove_file(p);
-    }
-
+    // The temp renders (and any sidecar exiftool wrote beside them) go with `_dir`.
     result?;
     Ok(SendResult {
         sent: total,
@@ -95,12 +94,14 @@ pub async fn localsend_send(
 /// Render `photo_ids` (the selected version where it matches) to temp full-res JPEGs, named
 /// after each source for a meaningful filename on the receiving device. Mirrors the
 /// Flickr/SmugMug `render_export_jpeg` naming, but produces one path per resolvable photo.
+/// Returns the send's own temp directory alongside the paths — hold it until the transfer
+/// is done; dropping it deletes the renders.
 #[cfg(feature = "localsend")]
 async fn render_localsend_jpegs(
     app: &AppHandle,
     photo_ids: &[i64],
     version_id: Option<i64>,
-) -> Result<Vec<PathBuf>, String> {
+) -> Result<(JobTempDir, Vec<PathBuf>), String> {
     let resolved = {
         let state = app.state::<AppState>();
         let guard = state.catalog.lock().map_err(|e| e.to_string())?;
@@ -108,22 +109,24 @@ async fn render_localsend_jpegs(
         crate::export::resolve_originals(catalog, photo_ids, &[], version_id)
     };
 
-    let dir = std::env::temp_dir().join("chairphoto-upload").join("localsend");
+    let dir = JobTempDir::new("localsend")?;
     let mut out = Vec::with_capacity(resolved.items.len());
     for item in resolved.items {
         // Name the file after the source (with the version suffix), like the service path.
-        let stem = item
-            .original
-            .file_stem()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "photo".into());
-        let mut name = stem;
-        if let Some(v) = &item.version_name {
-            name.push_str(" - ");
-            name.push_str(v);
-        }
-        let name = format!("{}.jpg", sanitize_upload_filename(&name));
-        let target = dir.join(name);
+        // Two selected photos can share a stem (the same basename in different folders), so
+        // disambiguate inside this send's directory rather than rendering over the earlier
+        // one and sending it twice under the other photo's name.
+        let name = upload_file_name(&item.original, item.version_name.as_deref());
+        let target = match unique_in_dir(&dir, &name) {
+            Ok(t) => t,
+            // Skip this photo, like a failed render below: it is then counted as failed,
+            // which is the truth. Sending it under a name another render already owns is
+            // the one thing we must not do.
+            Err(e) => {
+                eprintln!("localsend: {e}");
+                continue;
+            }
+        };
         let t = target.clone();
         // Full resolution (no downscale): the device decides what to do with it (Snapchat
         // downscales to 9:16 on the phone). Skip a photo whose render fails rather than
@@ -138,28 +141,72 @@ async fn render_localsend_jpegs(
             Err(e) => eprintln!("localsend: render failed for a photo: {e}"),
         }
     }
-    Ok(out)
+    Ok((dir, out))
 }
 
-/// Keep a filename to safe ASCII for the outgoing render (filename-friendly), collapsing
-/// anything else to `_`. Standalone copy so it compiles without the flickr/smugmug features.
+/// The highest `" (n)"` suffix tried before `unique_in_dir` gives up.
 #[cfg(feature = "localsend")]
-fn sanitize_upload_filename(name: &str) -> String {
-    let s: String = name
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || matches!(c, ' ' | '-' | '_' | '.' | '(' | ')') {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    let s = s.trim().to_string();
-    if s.is_empty() {
-        "photo".into()
-    } else {
-        s
+const MAX_DISAMBIGUATION: u32 = 9_999;
+
+/// `dir/name`, suffixed `" (2)"`, `" (3)"`… if a previous render in this send already took
+/// it. The directory belongs to this send alone, so `exists()` sees only our own renders.
+///
+/// Erroring when every suffix is taken is the point: returning the taken path instead would
+/// reintroduce exactly the overwrite this exists to prevent, in the one case where the
+/// collision is not hypothetical but proven.
+#[cfg(feature = "localsend")]
+fn unique_in_dir(dir: &JobTempDir, name: &str) -> Result<PathBuf, String> {
+    unique_in_dir_up_to(dir, name, MAX_DISAMBIGUATION)
+}
+
+#[cfg(feature = "localsend")]
+fn unique_in_dir_up_to(dir: &JobTempDir, name: &str, max: u32) -> Result<PathBuf, String> {
+    let first = dir.join(name);
+    if !first.exists() {
+        return Ok(first);
+    }
+    let base = Path::new(name);
+    let stem = base.file_stem().and_then(|s| s.to_str()).unwrap_or("photo");
+    let ext = base.extension().and_then(|s| s.to_str()).unwrap_or("jpg");
+    for n in 2..=max {
+        let candidate = dir.join(&format!("{stem} ({n}).{ext}"));
+        if !candidate.exists() {
+            return Ok(candidate);
+        }
+    }
+    Err(format!(
+        "no free name for \"{name}\" in this send's temp directory after {max} tries — \
+         skipping this photo rather than overwriting an earlier render"
+    ))
+}
+
+#[cfg(all(test, feature = "localsend"))]
+mod tests {
+    use super::*;
+
+    /// Two selected photos sharing a basename must reach the device as two files.
+    #[test]
+    fn a_taken_name_is_disambiguated_rather_than_reused() {
+        let dir = JobTempDir::new("localsend").unwrap();
+        let first = unique_in_dir(&dir, "DSC01234.jpg").unwrap();
+        std::fs::write(&first, b"first").unwrap();
+        let second = unique_in_dir(&dir, "DSC01234.jpg").unwrap();
+        assert_ne!(first, second, "the second render would overwrite the first");
+        assert_eq!(second.file_name().unwrap(), "DSC01234 (2).jpg");
+        std::fs::write(&second, b"second").unwrap();
+        assert_eq!(std::fs::read(&first).unwrap(), b"first");
+    }
+
+    /// Running out of suffixes must fail, not hand back the name already in use.
+    #[test]
+    fn exhausting_the_suffixes_errors_instead_of_colliding() {
+        let dir = JobTempDir::new("localsend").unwrap();
+        for name in ["DSC01234.jpg", "DSC01234 (2).jpg", "DSC01234 (3).jpg"] {
+            std::fs::write(dir.join(name), b"taken").unwrap();
+        }
+        let err = unique_in_dir_up_to(&dir, "DSC01234.jpg", 3)
+            .expect_err("every candidate name is taken");
+        assert!(err.contains("DSC01234.jpg"), "{err}");
     }
 }
 

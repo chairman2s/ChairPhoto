@@ -3,6 +3,7 @@
 //! Gated on the `instagram` Cargo feature; see `docs/instagram.md`. Brittle web automation by nature: it is
 //! supervised by default and stops before Share. See `instagram/`.
 
+use super::publishing::JobTempDir;
 use super::*;
 use std::path::PathBuf;
 use tauri::{AppHandle, Manager, State};
@@ -32,7 +33,14 @@ pub async fn post_to_instagram(
         .next()
         .ok_or("Photo is unavailable (original offline?)")?;
 
-    let img_path = std::env::temp_dir().join("chairphoto-instagram.jpg");
+    // One temp directory per post, removed when `dir` drops — including on the render error
+    // below, which happens before Chrome has ever seen the path. The old fixed
+    // `<temp>/chairphoto-instagram.jpg` let two concurrent posts render over each other (the
+    // second post could upload the first post's photo) and put a predictable, guessable path
+    // in a shared /tmp. The filename Chrome sees is unchanged. Whether the directory survives
+    // the *post* depends on the outcome — see the match below.
+    let dir = JobTempDir::new("instagram")?;
+    let img_path = dir.join("chairphoto-instagram.jpg");
     let out = img_path.clone();
     tauri::async_runtime::spawn_blocking(move || {
         crate::export::write_item_jpeg(&item, Some(1080), &out)
@@ -44,12 +52,31 @@ pub async fn post_to_instagram(
     let chrome = find_chrome().ok_or(
         "Chrome/Chromium not found — install Google Chrome or Chromium to post to Instagram",
     )?;
-    let outcome =
-        crate::instagram::post(&img_path, &caption, &profile_dir, &chrome, publish).await?;
+    let outcome = crate::instagram::post(&img_path, &caption, &profile_dir, &chrome, publish).await;
+
+    // Unlike an API upload, this command returning does not mean the bytes have been sent.
+    // `DOM.setFileInputFiles` hands Chrome a *path*: the `File` on the composer's input
+    // reads from disk lazily, so the render has to outlive us whenever the post is still
+    // open in a browser we deliberately do not own.
+    //
+    // Measured over CDP against Chrome 150 with the same call `crate::instagram` makes —
+    // attach the file, draw it as a preview, delete it, then read it back: `arrayBuffer()`
+    // fails with `NotFoundError`, a `FormData` POST fails with `TypeError: Failed to fetch`,
+    // and `file.size` reads 0. Displaying the image does not cache it. So deleting the
+    // render at `AwaitingReview` would leave the user a composed post whose Share click
+    // cannot work.
+    //
+    // Posted — Instagram has the bytes and confirmed it. NeedsLogin — we returned before
+    // touching the file input. Both are done with the render. An error can land either side
+    // of the attach and leaves the composer on screen, so it is treated as still in use.
+    // Nothing is leaked: `sweep_abandoned` reclaims a kept directory once it is stale.
+    if render_still_needed(&outcome) {
+        dir.keep();
+    }
 
     // The Instagram module (frontend) records the publication when the outcome is "posted",
     // through the same api.recordPublication contract as the other publishers.
-    Ok(serde_json::to_value(outcome)
+    Ok(serde_json::to_value(outcome?)
         .ok()
         .and_then(|v| v.as_str().map(String::from))
         .unwrap_or_else(|| "posted".into()))
@@ -118,7 +145,55 @@ fn find_chrome() -> Option<String> {
     None
 }
 
-// --- Flickr / SmugMug publishing (official OAuth 1.0a APIs) ----------------------------
-// Shared helpers (compiled when either module's feature is on): render the selected version
-// to a temp JPEG, and read/write the module's namespaced settings (api_key/secret/tokens).
+/// Whether the composed post may still read the render from disk after this command returns.
+///
+/// Extracted from the cleanup site so it can be tested. Inlined in a `match` on a `Result` it
+/// had no coverage at all: a reviewer inverted the arms — so a supervised post deleted the
+/// render Chrome still needed and a confirmed post kept it forever — and the whole suite
+/// stayed green.
+///
+/// `Posted` and `NeedsLogin` are finished with it: Instagram has the bytes, or we returned
+/// before touching the file input. `AwaitingReview` is not — the composer is on screen and the
+/// Share click reads the file. An `Err` can land on either side of the attach, so it is treated
+/// as still in use; the startup and on-publish sweeps bound how long that costs.
+#[cfg(feature = "instagram")]
+fn render_still_needed(outcome: &Result<crate::instagram::PostOutcome, String>) -> bool {
+    match outcome {
+        Ok(crate::instagram::PostOutcome::Posted | crate::instagram::PostOutcome::NeedsLogin) => {
+            false
+        }
+        Ok(crate::instagram::PostOutcome::AwaitingReview) | Err(_) => true,
+    }
+}
 
+#[cfg(all(test, feature = "instagram"))]
+mod instagram_cleanup_tests {
+    use super::render_still_needed;
+    use crate::instagram::PostOutcome;
+
+    /// Acceptance criterion: the render must survive exactly as long as the composed post can
+    /// still read it. Both directions matter and each fails differently — deleting too early
+    /// breaks a Share click the user is about to make; keeping forever leaks a full-resolution
+    /// JPEG per publish.
+    #[test]
+    fn the_render_outlives_exactly_the_outcomes_that_still_read_it() {
+        assert!(
+            render_still_needed(&Ok(PostOutcome::AwaitingReview)),
+            "a supervised post still on screen had its render deleted; the Share click reads \
+             the file from disk and would fail"
+        );
+        assert!(
+            !render_still_needed(&Ok(PostOutcome::Posted)),
+            "a confirmed post kept its render; Instagram already has the bytes, so this leaks \
+             a full-resolution JPEG"
+        );
+        assert!(
+            !render_still_needed(&Ok(PostOutcome::NeedsLogin)),
+            "NeedsLogin returns before the file input is touched, so keeping the render leaks it"
+        );
+        assert!(
+            render_still_needed(&Err("couldn't find Instagram's New-post button".into())),
+            "an error is treated as still-in-use because it can land either side of the attach"
+        );
+    }
+}

@@ -62,13 +62,15 @@ pub async fn post_to_flickr(
     let (key, secret) = read_app_keys(&app, "flickr")?;
     let (token, token_secret) = read_access(&app, "flickr")?;
     let max_long_edge = read_max_long_edge(&app, "flickr");
+    // `img` owns the job temp directory: it must outlive the upload, and dropping it after
+    // this function returns removes the render on both the success and the error path.
     let img = render_export_jpeg(&app, photo_id, version_id, "flickr", max_long_edge).await?;
     let flickr_photo_id = crate::flickr::upload(
         &key,
         &secret,
         &token,
         &token_secret,
-        &img,
+        img.path(),
         &title,
         &description,
         &tags,

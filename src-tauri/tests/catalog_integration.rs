@@ -852,6 +852,45 @@ fn per_photo_storage_status_from_locations() {
 }
 
 #[test]
+fn grid_badge_batch_queries_accept_more_than_one_parameter_chunk() {
+    let (catalog, root) = temp_catalog("grid-badge-chunks");
+    let total = 1_100;
+    let mut ids = Vec::with_capacity(total);
+
+    for index in 0..total {
+        let path = root.join(format!("chunked-{index:04}.arw"));
+        std::fs::write(&path, b"x").unwrap();
+        let id = catalog
+            .upsert_photo(&path, None, index as i64, 1)
+            .unwrap()
+            .id;
+        if index % 10 == 0 {
+            catalog.create_version(id, "Edit").unwrap();
+        }
+        ids.push(id);
+    }
+
+    let reachable: std::collections::HashMap<i64, bool> = catalog
+        .list_volumes()
+        .unwrap()
+        .into_iter()
+        .map(|v| (v.id, v.reachable))
+        .collect();
+    let statuses = catalog.photo_storage_statuses(&ids, &reachable).unwrap();
+    assert_eq!(statuses.len(), ids.len());
+    assert!(
+        statuses
+            .iter()
+            .all(|(_, status)| *status == StorageStatus::LocalOnly),
+        "all synthetic photos have only their local primary location"
+    );
+
+    let counts = catalog.version_counts(&ids).unwrap();
+    assert_eq!(counts.len(), total / 10);
+    assert_eq!(counts[0], (ids[0], 1));
+}
+
+#[test]
 fn rerooting_moves_the_catalog_root_volume() {
     let dir = std::env::temp_dir().join("chairphoto-test-reroot");
     let _ = std::fs::remove_dir_all(&dir);

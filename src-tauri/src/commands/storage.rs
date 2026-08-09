@@ -5,6 +5,7 @@
 //! "Nothing ever leaves home" is binding here — see `docs/storage-and-import.md`.
 
 use super::*;
+use std::collections::HashMap;
 use tauri::State;
 
 /// The reconcile queue — storage ops deferred until the NAS is reachable.
@@ -400,22 +401,32 @@ pub async fn photo_statuses(
         let pairs: Vec<(i64, String)> = {
             let guard = catalog.lock().map_err(|e| e.to_string())?;
             let c = guard.as_ref().ok_or("No catalog is open")?;
-            c.volume_rows()
-                .map_err(|e| e.to_string())?
-                .into_iter()
-                .map(|v| (v.id, v.base_path))
-                .collect()
+            grid_status_volume_pairs(c).map_err(|e| e.to_string())?
         };
         // 2. Off the lock, on this worker: stat (or reuse cached) reachability.
         let reachable = health.refresh(&pairs);
         // 3. Back under the lock: derive statuses using the off-lock reachability.
         let guard = catalog.lock().map_err(|e| e.to_string())?;
         let c = guard.as_ref().ok_or("No catalog is open")?;
-        c.photo_storage_statuses(&photo_ids, &reachable)
-            .map_err(|e| e.to_string())
+        grid_photo_statuses_with_reachability(c, &photo_ids, &reachable).map_err(|e| e.to_string())
     })
     .await
     .map_err(|e| e.to_string())?
+}
+
+pub(crate) fn grid_status_volume_pairs(c: &Catalog) -> crate::catalog::Result<Vec<(i64, String)>> {
+    Ok(c.volume_rows()?
+        .into_iter()
+        .map(|v| (v.id, v.base_path))
+        .collect())
+}
+
+pub(crate) fn grid_photo_statuses_with_reachability(
+    c: &Catalog,
+    photo_ids: &[i64],
+    reachable: &HashMap<i64, bool>,
+) -> crate::catalog::Result<Vec<(i64, crate::catalog::StorageStatus)>> {
+    c.photo_storage_statuses(photo_ids, reachable)
 }
 
 /// Remove a storage volume registration (not the default catalog-root volume). This

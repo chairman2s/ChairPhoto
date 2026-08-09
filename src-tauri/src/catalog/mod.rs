@@ -25,6 +25,9 @@ mod stats;
 mod tag_path;
 mod terms;
 
+#[cfg(test)]
+mod performance_harness;
+
 pub use facets::{Facet, SOFT_THRESHOLD_DEFAULT, SOFT_THRESHOLD_KEY};
 pub use identity::{
     bind_sidecar_identity, IdentityRepairPlan, IdentityRepairSummary, PendingIdentity,
@@ -71,6 +74,14 @@ pub enum CatalogError {
 // Match the 60-second migration lock wait; catalog opens run on blocking workers.
 const WAL_BUSY_RETRY_TIMEOUT: Duration = Duration::from_secs(60);
 const WAL_BUSY_RETRY_DELAY: Duration = Duration::from_millis(10);
+
+// SQLite's default bind-parameter ceiling is commonly 999. Keep chunked `IN`
+// queries below that so callers can safely pass large grid result sets.
+pub(crate) const SQLITE_PARAM_CHUNK: usize = 900;
+
+pub(crate) fn sqlite_param_placeholders(count: usize) -> String {
+    vec!["?"; count].join(",")
+}
 
 fn enable_wal(conn: &Connection) -> Result<()> {
     let started = Instant::now();

@@ -11,7 +11,9 @@
 //! e.g. a future B&W edit can drive the monochrome facet / filters. XMP mirroring of
 //! edits can ride along later with the (currently deferred) scan-time sidecar writes.
 
-use super::{Catalog, CatalogError, PhotoVersion, Result};
+use super::{
+    sqlite_param_placeholders, Catalog, CatalogError, PhotoVersion, Result, SQLITE_PARAM_CHUNK,
+};
 use rusqlite::{params, OptionalExtension};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -208,14 +210,18 @@ impl Catalog {
         if photo_ids.is_empty() {
             return Ok(Vec::new());
         }
-        let placeholders = vec!["?"; photo_ids.len()].join(",");
-        let mut stmt = self.conn.prepare(&format!(
-            "SELECT photo_id, COUNT(*) FROM photo_versions
-             WHERE photo_id IN ({placeholders}) GROUP BY photo_id"
-        ))?;
-        let params = rusqlite::params_from_iter(photo_ids.iter());
-        let rows = stmt.query_map(params, |r| Ok((r.get(0)?, r.get(1)?)))?;
-        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        let mut counts = Vec::new();
+        for chunk in photo_ids.chunks(SQLITE_PARAM_CHUNK) {
+            let placeholders = sqlite_param_placeholders(chunk.len());
+            let mut stmt = self.conn.prepare(&format!(
+                "SELECT photo_id, COUNT(*) FROM photo_versions
+                 WHERE photo_id IN ({placeholders}) GROUP BY photo_id"
+            ))?;
+            let params = rusqlite::params_from_iter(chunk.iter());
+            let rows = stmt.query_map(params, |r| Ok((r.get(0)?, r.get(1)?)))?;
+            counts.extend(rows.collect::<rusqlite::Result<Vec<_>>>()?);
+        }
+        Ok(counts)
     }
 }
 

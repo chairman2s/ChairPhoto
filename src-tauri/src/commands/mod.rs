@@ -55,7 +55,7 @@ mod publications;
 // Shared publish/transfer helpers. Compiled for LocalSend and Instagram too: they render
 // through the same job-scoped temp directories (`publishing::JobTempDir`).
 #[cfg(any(feature = "flickr", feature = "smugmug", feature = "instagram", feature = "localsend"))]
-mod publishing;
+pub(crate) mod publishing;
 mod scan;
 mod settings;
 #[cfg(feature = "slideshow")]

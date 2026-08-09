@@ -134,13 +134,46 @@ impl Drop for JobTempDir {
 ///   read as a symlink and skipped, rather than as the directory it points at;
 /// - only real directories, and (on Unix) only ones with our uid, so another user's
 ///   identically named directory is never even attempted;
-/// - only ones older than `older_than`, which is what keeps a *live* job — including a
-///   supervised Instagram post still on screen — out of reach.
+/// - only ones older than `older_than`. That protects a live job only *within* that window:
+///   a supervised Instagram composer left open past `ABANDONED_AFTER` has its render swept
+///   by the next publish, and the Share click then fails in exactly the way `keep()` exists
+///   to prevent. The window is a bound on the leak, not a guarantee for the composer.
 ///
 /// Errors are silent by design: this is opportunistic housekeeping on someone else's turn,
 /// and a directory we cannot remove is not a reason to fail their publish.
+/// Reclaim abandoned upload renders at startup.
+///
+/// Without this, a directory kept by `JobTempDir::keep` — a supervised Instagram post, or any
+/// publish that errored — is reclaimed only when someone happens to publish again, because the
+/// sweep ran solely as a side effect of `JobTempDir::new`. A user who publishes once, hits an
+/// error, and never publishes again keeps that render forever.
+///
+/// Same narrow rules as the on-publish sweep: prefix, uid, real directories, age. Opportunistic
+/// and silent; startup must not fail because a temp directory would not delete.
 #[cfg(any(feature = "flickr", feature = "smugmug", feature = "instagram", feature = "localsend"))]
-fn sweep_abandoned(root: &Path, older_than: std::time::Duration, owner_uid: Option<u32>) {
+pub(crate) fn sweep_abandoned_uploads_at_startup() {
+    let root = std::env::temp_dir();
+    // Read our uid the same way `JobTempDir::new` does — from a directory we just made —
+    // rather than pulling in libc for one call. If the probe cannot be created there is
+    // nothing to sweep into anyway, so give up silently.
+    #[cfg(unix)]
+    let owner = {
+        use std::os::unix::fs::MetadataExt;
+        let probe = root.join(format!("{JOB_DIR_PREFIX}uidprobe-{}", std::process::id()));
+        let uid = std::fs::create_dir(&probe)
+            .ok()
+            .and_then(|_| std::fs::metadata(&probe).ok())
+            .map(|m| m.uid());
+        let _ = std::fs::remove_dir(&probe);
+        uid
+    };
+    #[cfg(not(unix))]
+    let owner = None;
+    sweep_abandoned(&root, ABANDONED_AFTER, owner);
+}
+
+#[cfg(any(feature = "flickr", feature = "smugmug", feature = "instagram", feature = "localsend"))]
+pub(crate) fn sweep_abandoned(root: &Path, older_than: std::time::Duration, owner_uid: Option<u32>) {
     let _ = owner_uid; // read only on Unix, where a uid exists
     let Ok(entries) = std::fs::read_dir(root) else {
         return;

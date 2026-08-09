@@ -70,9 +70,8 @@ pub async fn post_to_instagram(
     // touching the file input. Both are done with the render. An error can land either side
     // of the attach and leaves the composer on screen, so it is treated as still in use.
     // Nothing is leaked: `sweep_abandoned` reclaims a kept directory once it is stale.
-    match &outcome {
-        Ok(crate::instagram::PostOutcome::Posted | crate::instagram::PostOutcome::NeedsLogin) => {}
-        Ok(crate::instagram::PostOutcome::AwaitingReview) | Err(_) => dir.keep(),
+    if render_still_needed(&outcome) {
+        dir.keep();
     }
 
     // The Instagram module (frontend) records the publication when the outcome is "posted",
@@ -146,3 +145,55 @@ fn find_chrome() -> Option<String> {
     None
 }
 
+/// Whether the composed post may still read the render from disk after this command returns.
+///
+/// Extracted from the cleanup site so it can be tested. Inlined in a `match` on a `Result` it
+/// had no coverage at all: a reviewer inverted the arms — so a supervised post deleted the
+/// render Chrome still needed and a confirmed post kept it forever — and the whole suite
+/// stayed green.
+///
+/// `Posted` and `NeedsLogin` are finished with it: Instagram has the bytes, or we returned
+/// before touching the file input. `AwaitingReview` is not — the composer is on screen and the
+/// Share click reads the file. An `Err` can land on either side of the attach, so it is treated
+/// as still in use; the startup and on-publish sweeps bound how long that costs.
+#[cfg(feature = "instagram")]
+fn render_still_needed(outcome: &Result<crate::instagram::PostOutcome, String>) -> bool {
+    match outcome {
+        Ok(crate::instagram::PostOutcome::Posted | crate::instagram::PostOutcome::NeedsLogin) => {
+            false
+        }
+        Ok(crate::instagram::PostOutcome::AwaitingReview) | Err(_) => true,
+    }
+}
+
+#[cfg(all(test, feature = "instagram"))]
+mod instagram_cleanup_tests {
+    use super::render_still_needed;
+    use crate::instagram::PostOutcome;
+
+    /// Acceptance criterion: the render must survive exactly as long as the composed post can
+    /// still read it. Both directions matter and each fails differently — deleting too early
+    /// breaks a Share click the user is about to make; keeping forever leaks a full-resolution
+    /// JPEG per publish.
+    #[test]
+    fn the_render_outlives_exactly_the_outcomes_that_still_read_it() {
+        assert!(
+            render_still_needed(&Ok(PostOutcome::AwaitingReview)),
+            "a supervised post still on screen had its render deleted; the Share click reads \
+             the file from disk and would fail"
+        );
+        assert!(
+            !render_still_needed(&Ok(PostOutcome::Posted)),
+            "a confirmed post kept its render; Instagram already has the bytes, so this leaks \
+             a full-resolution JPEG"
+        );
+        assert!(
+            !render_still_needed(&Ok(PostOutcome::NeedsLogin)),
+            "NeedsLogin returns before the file input is touched, so keeping the render leaks it"
+        );
+        assert!(
+            render_still_needed(&Err("couldn't find Instagram's New-post button".into())),
+            "an error is treated as still-in-use because it can land either side of the attach"
+        );
+    }
+}

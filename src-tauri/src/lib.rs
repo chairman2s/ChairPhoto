@@ -83,6 +83,17 @@ pub fn run() {
         // <video> on WebKitGTK uses GStreamer, which can't read custom URI schemes — so we
         // serve videos over a loopback HTTP server (range-capable) it can fetch instead.
         .setup(|app| {
+            // Reclaim upload renders left behind by a previous run. Kept directories — a
+            // supervised Instagram post, or any publish that errored — were otherwise
+            // reclaimed only when someone happened to publish again, so a user who
+            // publishes once and hits an error kept a full-resolution JPEG forever.
+            #[cfg(any(
+                feature = "flickr",
+                feature = "smugmug",
+                feature = "instagram",
+                feature = "localsend"
+            ))]
+            crate::commands::publishing::sweep_abandoned_uploads_at_startup();
             // Dev builds aren't installed, so no .desktop/registry entry registers the
             // chairphoto:// scheme — register it at runtime (writes a handler .desktop
             // pointing at this binary on Linux). Bundles register via tauri.conf.json.

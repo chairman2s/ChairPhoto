@@ -83,6 +83,29 @@ wrapper in `src/modules/api.ts`, which takes an explicit platform.
 - **Filtering:** dynamic facets keyed `published:<platform>` are appended by
   `available_facets()` and reuse the existing FilterBar chips — no dedicated filter UI.
 
+## Progress and cancellation
+
+What each publish path reports while it runs, as of this writing:
+
+| path | progress | cancellation |
+|---|---|---|
+| Flickr, SmugMug | none — one render, one upload request, and the command returns when it finishes | none |
+| Instagram | none — the supervised flow ends by handing you the composer, which *is* the progress report | none |
+| LocalSend | `localsend:progress` `{ done, total }` after each file, rendered by `SendToDevicePanel.tsx` | none — the protocol's `POST /cancel?sessionId=` exists but ChairPhoto never calls it |
+
+**Nothing in the publish UI stops a publish once it has started.** That is a real gap for a
+multi-photo LocalSend send, where a wrong selection means waiting out every file; it is much
+less of one for the single-photo services, where by the time a user reaches for Cancel the
+request is usually already in flight and aborting it would leave the service holding a
+partial upload it may or may not commit. Instagram cannot be cancelled by us at all in the
+supervised case — the post is finished by the user, in a browser ChairPhoto deliberately
+does not own; closing that window is the cancel.
+
+Temp renders do not depend on any of this. Each job renders into a directory of its own that
+is removed when the job ends, whichever way it ends — see `publishing::JobTempDir` in
+`src-tauri/src/commands/publishing.rs`, and [instagram.md](instagram.md) for the one flow
+whose render outlives the command on purpose.
+
 ## Migration
 
 Schema v15 backfills the legacy flat `"instagram"` tag: every photo carrying it gets one

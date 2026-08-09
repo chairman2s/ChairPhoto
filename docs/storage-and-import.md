@@ -44,6 +44,30 @@ has a path." All path resolution goes through a **resolver** that returns the be
 *available* copy. This is core, because everything — the image protocol, editor
 launch, export — asks "where is this file?"
 
+### Identity that fails to reach the disk
+
+The catalog half of the identity cannot fail; the disk half can. Storage is mounted
+read-only, an existing sidecar does not parse, the volume goes offline mid-scan, or
+the sidecar already carries a *different* `xmp:Identifier` that must not be
+overwritten (XMP safety: when uncertain, preserve). A row whose sidecar never
+received the UUID has lost its portable identity — a merge or a re-import can no
+longer recognise the file, and the catalog is then the only copy of that fact.
+
+So the operation is **upsert (or relocate) the row AND bind the sidecar identity, or
+record a retryable repair** — never "log it and continue". `catalog/identity.rs`
+owns it: `bind_sidecar_identity` is pure filesystem work (safe off the catalog lock),
+`record_sidecar_identity` writes the outcome, and everything that creates or re-points
+a row — the local scan, the NAS in-place scan, card ingest, the bundle indexer,
+`relocate_photo` — goes through `ensure_sidecar_identity`. Failures land in
+`pending_sidecar_identity` with the reason and an attempt count.
+
+`repair_pending_identity` retries the queue (planned under the lock, sidecar IO off
+it, recorded under it) and clears what succeeds. Unreachable files stay queued — an
+unmounted volume is a normal state. So does an identity **conflict**: the file keeps
+the identifier it has, and the divergence stays visible for a human rather than being
+resolved by clobbering somebody else's identity. A sidecar failure never aborts a
+scan: one unwritable file must not cost the user the other 99,999 rows.
+
 ## Volumes (named storage locations)
 
 Locations never store absolute paths. They reference a **named volume** + a relative
@@ -399,6 +423,9 @@ catalog start un-aborted.
 - `albums` — id, name; `album_photos` — album_id, photo_id (manual M:N).
 - `smart_albums` — id, name, rule definition (AND conditions).
 - `pending_operations` — kind (backup/offload/restore), photo_id, target, status.
+- `pending_sidecar_identity` — photo_id, attempts, error, timestamps: photos whose
+  UUID is in SQLite but not yet in their sidecar. No uuid column — `photos.uuid` is
+  the single source of truth for identity.
 
 ## Storage model
 

@@ -131,7 +131,7 @@ impl Drop for JobTempDir {
 /// Deliberately narrow, because `root` is a shared `/tmp`:
 /// - only entries whose name starts with `chairphoto-upload-`;
 /// - `symlink_metadata`, so a symlink another user planted under one of those names is
-///   skipped rather than followed into whatever it points at;
+///   read as a symlink and skipped, rather than as the directory it points at;
 /// - only real directories, and (on Unix) only ones with our uid, so another user's
 ///   identically named directory is never even attempted;
 /// - only ones older than `older_than`, which is what keeps a *live* job — including a
@@ -151,8 +151,12 @@ fn sweep_abandoned(root: &Path, older_than: std::time::Duration, owner_uid: Opti
             continue;
         }
         let path = entry.path();
-        // Never follow a symlink here: `remove_dir_all` on one would be a way for another
-        // user to aim our cleanup at a directory of theirs (or ours) that isn't a job dir.
+        // `symlink_metadata`, not `metadata`, so the test below sees a planted symlink for
+        // what it is instead of the directory it points at. Measured on this toolchain,
+        // `remove_dir_all` on a symlink removes the link and leaves the target intact — so
+        // this is not the only thing standing between us and someone else's directory, but
+        // deciding a symlink is a job directory of ours is not a judgement to delegate to
+        // std's error handling.
         let Ok(meta) = std::fs::symlink_metadata(&path) else {
             continue;
         };

@@ -567,11 +567,18 @@ pub async fn smarttags_train_classifiers(
 // transitions are called directly; everything between them (opening the catalog file,
 // the recent-catalogs registry, the `catalog:switched` emit) touches none of this state.
 //
-// The two acceptance cases are forced by construction, never by timing: the switch runs
-// inside the indexer's own progress callback, and the mid-switch start is driven to the
-// exact state a blocked start observes. The third test is a contention net whose assertion
-// holds under every legal interleaving; it samples rather than forces, so it backs the
-// first two up instead of standing in for them.
+// The switch side is forced by construction, never by timing: the switch runs inside the
+// indexer's own progress callback, and the start that runs between the two switch phases is
+// driven to the exact state a blocked start observes.
+//
+// The start side needs a test of its own, because a start that runs after phase one is
+// rejected by the *pre-fix* shape too — it reads no catalog either way, so
+// `start_between_switch_phases_touches_nothing` passes on both.
+// `a_blocked_start_keeps_holding_the_catalog_lock` is the one that discriminates: it parks a
+// start inside its claim and observes which locks it is holding there.
+//
+// The last test is a contention net whose assertion holds under every legal interleaving; it
+// samples rather than forces, so it backs the other three up instead of standing in for them.
 #[cfg(test)]
 mod smarttags_ownership_tests {
     use super::*;
@@ -580,6 +587,7 @@ mod smarttags_ownership_tests {
     };
     use crate::plugins::smarttags::indexer;
     use std::path::Path;
+    use std::time::{Duration, Instant};
 
     /// A fresh catalog in its own temp dir with `photos` files imported.
     fn temp_catalog(tag: &str, photos: usize) -> (Catalog, PathBuf, PathBuf) {
@@ -621,6 +629,39 @@ mod smarttags_ownership_tests {
         let mut v = vec![0.0f32; 512];
         v[0] = 1.0;
         v
+    }
+
+    /// Wait until `state.catalog` has been locked *continuously* for `window`, giving up
+    /// after `timeout`.
+    ///
+    /// One failed `try_lock` would prove nothing: the pre-fix start held the catalog lock
+    /// too, for the microseconds it took to copy two paths out of the catalog, so a single
+    /// sample can catch it by luck. The observation that discriminates is that the lock
+    /// stays held — which only happens when the holder is parked while owning it.
+    ///
+    /// `try_lock` never blocks, so a caller holding `smarttags_abort` can probe the catalog
+    /// lock from here without inverting the catalog → abort order.
+    fn catalog_stays_locked(state: &AppState, window: Duration, timeout: Duration) -> bool {
+        let give_up = Instant::now() + timeout;
+        while Instant::now() < give_up {
+            let locked = state.catalog.try_lock().is_err();
+            if locked {
+                let until = Instant::now() + window;
+                let mut still_locked = true;
+                while Instant::now() < until {
+                    if state.catalog.try_lock().is_ok() {
+                        still_locked = false;
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                if still_locked {
+                    return true;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        false
     }
 
     /// A catalog switch stops a running Smart Tagging job at its next cancellation point:
@@ -702,15 +743,18 @@ mod smarttags_ownership_tests {
         );
     }
 
-    /// A start cannot install a fresh unreachable generation during a switch.
-    ///
     /// Between the two switch phases the catalog reads as `None`, so a start returns having
     /// touched nothing: no generation installed, no job id burned, status slot unchanged.
-    /// That is exactly the state a start blocked on the catalog lock sees when the switch
-    /// hands it over — the lock is held across the whole transition precisely so that the
-    /// blocked case and this one are the same case.
+    /// Phase two then publishes the new catalog without resurrecting the superseded job, and
+    /// the next start targets the catalog that was switched to.
+    ///
+    /// Scope, deliberately narrow: this test starts with the catalog **already detached**, so
+    /// it exercises the switch side only and would pass on the pre-fix start as well. It does
+    /// not show that a start racing the switch ends up here rather than sailing past — that
+    /// is `a_blocked_start_keeps_holding_the_catalog_lock`, which is what makes the blocked
+    /// case and this case the same case.
     #[test]
-    fn start_during_a_switch_installs_nothing() {
+    fn start_between_switch_phases_touches_nothing() {
         let (cat_a, db_a, _root_a) = temp_catalog("mid-a", 1);
         let (cat_b, db_b, root_b) = temp_catalog("mid-b", 0);
         let state = state_with(cat_a);
@@ -777,6 +821,60 @@ mod smarttags_ownership_tests {
             Some(job2),
             "the new job owns the status slot"
         );
+    }
+
+    /// A start that is blocked partway through its claim is *still holding the catalog lock*.
+    ///
+    /// This is the start-side half of the protocol, and the only test here that discriminates
+    /// it. The switch-side tests above pass on the pre-fix shape too: a start that runs after
+    /// phase one reads no catalog either way. What closes the window is that the claim takes
+    /// the catalog lock **first** and keeps it across the abort-flag install, leaving a switch
+    /// only two outcomes — it takes the catalog lock before the start (and the start then
+    /// finds no catalog open) or after it (and phase one trips the generation the start just
+    /// installed). The pre-fix shape read the catalog under its own short-lived lock and
+    /// released it before touching the abort flag, which admitted a third outcome: snapshot
+    /// catalog A, let the switch trip every generation, then install a live generation that
+    /// no Cancel, later start or subsequent switch can reach.
+    ///
+    /// Holding `smarttags_abort` parks a start exactly at that seam, because the claim order
+    /// is catalog → abort → slot: to be waiting on the abort lock it must already own the
+    /// catalog lock. So the catalog lock stays held for as long as this test holds the abort
+    /// lock — and under the pre-fix shape it would be free, because that start had already
+    /// let go of it before it ever reached the abort lock.
+    #[test]
+    fn a_blocked_start_keeps_holding_the_catalog_lock() {
+        let (cat_a, db_a, _root_a) = temp_catalog("blocked-a", 0);
+        let state = state_with(cat_a);
+
+        // Take the lock the claim needs second, then park a start behind it.
+        let abort_held = state.smarttags_abort.lock().unwrap();
+
+        std::thread::scope(|scope| {
+            let start = scope.spawn(|| begin_smarttags_job(&state));
+
+            assert!(
+                catalog_stays_locked(&state, Duration::from_millis(100), Duration::from_secs(5)),
+                "a start waiting on the abort lock must still be holding the catalog lock; \
+                 one that reads the catalog and releases it first leaves a window in which a \
+                 switch can trip every generation and still be overtaken by this start"
+            );
+
+            // Release it and confirm the claim it was parked in the middle of completes
+            // normally — the test observes a stalled transition, it does not break one.
+            drop(abort_held);
+            let (db, _root, abort, job) = start.join().unwrap().unwrap();
+            assert_eq!(db, db_a, "the parked start indexes the catalog it snapshotted");
+            let installed = state.smarttags_abort.lock().unwrap().clone();
+            assert!(
+                Arc::ptr_eq(&abort, &installed),
+                "the unblocked start's flag must be the installed generation"
+            );
+            assert_eq!(
+                state.smarttags_job.lock().unwrap().map(|s| s.job),
+                Some(job),
+                "and it must own the status slot"
+            );
+        });
     }
 
     /// Under real contention between starts and switches, every start that returned `Ok`

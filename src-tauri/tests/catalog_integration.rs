@@ -888,6 +888,32 @@ fn grid_badge_batch_queries_accept_more_than_one_parameter_chunk() {
     let counts = catalog.version_counts(&ids).unwrap();
     assert_eq!(counts.len(), total / 10);
     assert_eq!(counts[0], (ids[0], 1));
+
+    // The rows above only prove that per-chunk results stitch back together: 1,100 binds
+    // fit under `SQLITE_MAX_VARIABLE_NUMBER`, which is 32766 in the SQLite we bundle, so
+    // an unchunked `IN (...)` would still pass. Pad past that ceiling to cover the
+    // chunking itself — a 100k-photo grid refresh passes every returned id, and
+    // unchunked this fails with "too many SQL variables". Padding ids need no rows; they
+    // only have to survive being bound.
+    const SQLITE_MAX_VARIABLE_NUMBER: usize = 32_766;
+    let padding_start = ids.last().unwrap() + 1;
+    let mut padded = ids.clone();
+    padded.extend(padding_start..padding_start + SQLITE_MAX_VARIABLE_NUMBER as i64);
+    assert!(
+        padded.len() > SQLITE_MAX_VARIABLE_NUMBER,
+        "the padded batch must exceed the bind-parameter ceiling"
+    );
+
+    let padded_statuses = catalog.photo_storage_statuses(&padded, &reachable).unwrap();
+    assert_eq!(padded_statuses.len(), padded.len());
+    assert_eq!(
+        &padded_statuses[..total],
+        statuses.as_slice(),
+        "the real ids keep their status and order when the batch spans many chunks"
+    );
+
+    let padded_counts = catalog.version_counts(&padded).unwrap();
+    assert_eq!(padded_counts, counts, "padding ids contribute no version rows");
 }
 
 #[test]

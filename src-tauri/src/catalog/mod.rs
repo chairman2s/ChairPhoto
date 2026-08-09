@@ -75,8 +75,10 @@ pub enum CatalogError {
 const WAL_BUSY_RETRY_TIMEOUT: Duration = Duration::from_secs(60);
 const WAL_BUSY_RETRY_DELAY: Duration = Duration::from_millis(10);
 
-// SQLite's default bind-parameter ceiling is commonly 999. Keep chunked `IN`
-// queries below that so callers can safely pass large grid result sets.
+// SQLite's bind-parameter ceiling (`SQLITE_MAX_VARIABLE_NUMBER`) depends on the build:
+// 32766 since 3.32, and 999 in older builds. We bundle 3.45, but the chunk stays below
+// the older 999 too, so chunked `IN` queries hold if this ever links a system SQLite.
+// A 100k-photo grid refresh passes every returned id, which exceeds both ceilings.
 pub(crate) const SQLITE_PARAM_CHUNK: usize = 900;
 
 pub(crate) fn sqlite_param_placeholders(count: usize) -> String {

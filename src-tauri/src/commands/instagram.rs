@@ -3,6 +3,7 @@
 //! Gated on the `instagram` Cargo feature; see `docs/instagram.md`. Brittle web automation by nature: it is
 //! supervised by default and stops before Share. See `instagram/`.
 
+use super::publishing::JobTempDir;
 use super::*;
 use std::path::PathBuf;
 use tauri::{AppHandle, Manager, State};
@@ -32,7 +33,12 @@ pub async fn post_to_instagram(
         .next()
         .ok_or("Photo is unavailable (original offline?)")?;
 
-    let img_path = std::env::temp_dir().join("chairphoto-instagram.jpg");
+    // One temp directory per post, removed when `dir` drops — on the error paths below as
+    // well. The old fixed `<temp>/chairphoto-instagram.jpg` let two concurrent posts render
+    // over each other (the second post could upload the first post's photo) and put a
+    // predictable, guessable path in a shared /tmp. The filename Chrome sees is unchanged.
+    let dir = JobTempDir::new("instagram")?;
+    let img_path = dir.join("chairphoto-instagram.jpg");
     let out = img_path.clone();
     tauri::async_runtime::spawn_blocking(move || {
         crate::export::write_item_jpeg(&item, Some(1080), &out)

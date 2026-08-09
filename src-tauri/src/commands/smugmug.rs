@@ -81,9 +81,18 @@ pub async fn post_to_smugmug(
     let (key, secret) = read_app_keys(&app, "smugmug")?;
     let (token, token_secret) = read_access(&app, "smugmug")?;
     let max_long_edge = read_max_long_edge(&app, "smugmug");
+    // `img` owns the job temp directory: it must outlive the upload, and dropping it after
+    // this function returns removes the render on both the success and the error path.
     let img = render_export_jpeg(&app, photo_id, version_id, "smugmug", max_long_edge).await?;
     crate::smugmug::upload(
-        &key, &secret, &token, &token_secret, &album_uri, &img, &title, &caption,
+        &key,
+        &secret,
+        &token,
+        &token_secret,
+        &album_uri,
+        img.path(),
+        &title,
+        &caption,
     )
     .await
 }

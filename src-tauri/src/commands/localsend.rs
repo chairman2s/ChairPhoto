@@ -3,6 +3,7 @@
 //!
 //! Send-only. Gated on the `localsend` Cargo feature; see `docs/localsend.md`.
 
+use super::publishing::{upload_file_name, JobTempDir};
 use super::*;
 use std::path::PathBuf;
 use tauri::{AppHandle, Emitter, Manager};
@@ -58,7 +59,9 @@ pub async fn localsend_send(
     // Render every selected photo to a temp JPEG off the catalog lock (RAW decode is slow).
     // `selected_version_id` applies only to its own photo; the rest send unedited (same
     // semantics as export). Unreachable originals are skipped and counted as failed.
-    let paths = render_localsend_jpegs(&app, &photo_ids, version_id).await?;
+    // `_dir` is this send's own temp directory; it is removed when this function returns,
+    // whichever way it returns.
+    let (_dir, paths) = render_localsend_jpegs(&app, &photo_ids, version_id).await?;
     let skipped = photo_ids.len().saturating_sub(paths.len());
     if paths.is_empty() {
         return Err("None of the selected photos are available (originals offline?).".into());
@@ -80,11 +83,7 @@ pub async fn localsend_send(
     .await
     .map_err(|e| e.to_string())?;
 
-    // Clean up the temp renders regardless of outcome.
-    for p in &paths {
-        let _ = std::fs::remove_file(p);
-    }
-
+    // The temp renders (and any sidecar exiftool wrote beside them) go with `_dir`.
     result?;
     Ok(SendResult {
         sent: total,
@@ -95,12 +94,14 @@ pub async fn localsend_send(
 /// Render `photo_ids` (the selected version where it matches) to temp full-res JPEGs, named
 /// after each source for a meaningful filename on the receiving device. Mirrors the
 /// Flickr/SmugMug `render_export_jpeg` naming, but produces one path per resolvable photo.
+/// Returns the send's own temp directory alongside the paths — hold it until the transfer
+/// is done; dropping it deletes the renders.
 #[cfg(feature = "localsend")]
 async fn render_localsend_jpegs(
     app: &AppHandle,
     photo_ids: &[i64],
     version_id: Option<i64>,
-) -> Result<Vec<PathBuf>, String> {
+) -> Result<(JobTempDir, Vec<PathBuf>), String> {
     let resolved = {
         let state = app.state::<AppState>();
         let guard = state.catalog.lock().map_err(|e| e.to_string())?;
@@ -108,22 +109,12 @@ async fn render_localsend_jpegs(
         crate::export::resolve_originals(catalog, photo_ids, &[], version_id)
     };
 
-    let dir = std::env::temp_dir().join("chairphoto-upload").join("localsend");
+    let dir = JobTempDir::new("localsend")?;
     let mut out = Vec::with_capacity(resolved.items.len());
     for item in resolved.items {
         // Name the file after the source (with the version suffix), like the service path.
-        let stem = item
-            .original
-            .file_stem()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "photo".into());
-        let mut name = stem;
-        if let Some(v) = &item.version_name {
-            name.push_str(" - ");
-            name.push_str(v);
-        }
-        let name = format!("{}.jpg", sanitize_upload_filename(&name));
-        let target = dir.join(name);
+        let name = upload_file_name(&item.original, item.version_name.as_deref());
+        let target = dir.join(&name);
         let t = target.clone();
         // Full resolution (no downscale): the device decides what to do with it (Snapchat
         // downscales to 9:16 on the phone). Skip a photo whose render fails rather than
@@ -138,28 +129,6 @@ async fn render_localsend_jpegs(
             Err(e) => eprintln!("localsend: render failed for a photo: {e}"),
         }
     }
-    Ok(out)
-}
-
-/// Keep a filename to safe ASCII for the outgoing render (filename-friendly), collapsing
-/// anything else to `_`. Standalone copy so it compiles without the flickr/smugmug features.
-#[cfg(feature = "localsend")]
-fn sanitize_upload_filename(name: &str) -> String {
-    let s: String = name
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || matches!(c, ' ' | '-' | '_' | '.' | '(' | ')') {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    let s = s.trim().to_string();
-    if s.is_empty() {
-        "photo".into()
-    } else {
-        s
-    }
+    Ok((dir, out))
 }
 

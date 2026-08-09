@@ -31,10 +31,7 @@ pub mod regions;
 pub mod store;
 
 pub use engine::{cosine, detect_faces, detect_faces_rgb, embed_face, DetectedFace, EngineError};
-pub use indexer::{
-    load_force_cpu, load_indexing_plan, FacesProgress, IndexedFace, IndexingPlan, IndexingSpeed,
-    FORCE_CPU_SETTING, INDEXING_SPEED_SETTING,
-};
+pub use indexer::{load_force_cpu, FacesProgress, IndexedFace, FORCE_CPU_SETTING};
 pub use matcher::{
     hungarian_min_cost, run_matching, MatchOutcome, MatchSettings, PEOPLE_ROOT_DEFAULT,
     PEOPLE_ROOT_SETTING, THRESHOLD_DEFAULT, THRESHOLD_SETTING,

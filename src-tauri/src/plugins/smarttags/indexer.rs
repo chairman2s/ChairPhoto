@@ -19,7 +19,7 @@
 //! and [`crate::phash_indexer`]: resolve sequentially (the `Connection` is not `Sync`),
 //! run preview-load + embed in **rayon** parallel, then collect results back to a
 //! sequential loop for the SQLite writes. Workers are bounded by `parallelism` from the
-//! [`crate::plugins::faces::indexer::IndexingPlan`] (shared `indexing.speed` setting).
+//! [`crate::plugins::indexing::IndexingPlan`] (shared `indexing.speed` setting).
 //!
 //! ## Resume safety
 //!
@@ -70,7 +70,7 @@ pub struct IndexOutcome {
 ///
 /// - `conn`            — a *secondary* catalog connection (no lock contention with the UI).
 /// - `parallelism`     — number of concurrent embed workers (from the resolved
-///                       [`crate::plugins::faces::indexer::IndexingPlan`]).
+///                       [`crate::plugins::indexing::IndexingPlan`]).
 /// - `resolve_path_fn` — closure: `photo_id → Ok(Some(path))` when reachable, `Ok(None)`
 ///                       when offline, `Err` on failure. Calls `catalog.resolve_photo_path`.
 /// - `preview_fn`      — closure: `&Path → Ok(JPEG bytes)`. Loads the 2048 px cached

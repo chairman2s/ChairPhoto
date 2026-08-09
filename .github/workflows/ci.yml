@@ -61,11 +61,18 @@ jobs:
         working-directory: src-tauri
         run: cargo check --no-default-features
 
-      # Flickr and SmugMug are deliberately NOT in `default`, which means every step above
-      # compiles right past them. Without this step a syntax error in src/flickr/ ships green.
-      - name: Check opt-in publishing modules
+      # Single-feature checks catch hidden coupling between optional backends. Cargo's default
+      # and all-feature builds can both pass while `--features smarttags` alone fails.
+      - name: Check individual backend features
         working-directory: src-tauri
-        run: cargo check --all-targets --features flickr,smugmug
+        env:
+          RUSTFLAGS: "-D warnings"
+        run: |
+          for feature in ai edit raw instagram collage slideshow localsend map faces smarttags flickr smugmug; do
+            echo "::group::cargo check --no-default-features --features ${feature} --all-targets"
+            cargo check --no-default-features --features "${feature}" --all-targets
+            echo "::endgroup::"
+          done
 
       # The tree is rustc-warning-clean and should stay that way.
       - name: Deny rustc warnings

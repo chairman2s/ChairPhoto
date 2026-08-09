@@ -205,8 +205,8 @@ pub async fn smarttags_index_photos(
 
     tauri::async_runtime::spawn_blocking(move || {
         use crate::catalog::Catalog;
-        use crate::plugins::faces::indexer as faces_indexer;
         use crate::plugins::smarttags::{embed, indexer, models};
+        use crate::plugins::indexing as shared_indexing;
 
         // Release the status slot — but only if a newer job hasn't already claimed it.
         //
@@ -249,7 +249,7 @@ pub async fn smarttags_index_photos(
 
         // Size the CLIP session pool from the shared `indexing.speed` setting (same knob
         // as face indexing). `configure` is a no-op once a pool exists (first run wins).
-        let plan = faces_indexer::load_indexing_plan(sec.conn());
+        let plan = shared_indexing::load_indexing_plan(sec.conn());
         embed::configure(plan.parallelism, plan.intra_threads);
 
         // Embed closure: JPEG → L2-normalized CLIP embedding. Errors degrade gracefully.
@@ -1020,4 +1020,3 @@ mod smarttags_ownership_tests {
     }
 
 }
-

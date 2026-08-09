@@ -148,16 +148,21 @@ pub async fn relocate_photo(
 ) -> Result<(), String> {
     let path = expand_home(&new_path);
     let target = path.clone();
-    let uuid = with_catalog_blocking(&state, move |c| c.relocate_photo(photo_id, &target)).await?;
+    let bind_path = path.clone();
+    let (uuid, db_path, root) = with_catalog_blocking(&state, move |c| {
+        let uuid = c.relocate_photo(photo_id, &target)?;
+        Ok((uuid, c.db_path().to_path_buf(), c.root().to_path_buf()))
+    })
+    .await?;
     // The file usually already carries the UUID (its sidecar moved with it); a sidecar
     // holding somebody else's identity is left alone and recorded as a conflict.
     let outcome = tauri::async_runtime::spawn_blocking(move || {
-        let found = crate::xmp::read_identifier(&path);
-        crate::catalog::bind_sidecar_identity(&path, &uuid, found.as_deref())
+        let found = crate::xmp::read_identifier(&bind_path);
+        crate::catalog::bind_sidecar_identity(&bind_path, &uuid, found.as_deref())
     })
     .await
     .map_err(|e| e.to_string())?;
-    with_catalog(&state, |c| c.record_sidecar_identity(photo_id, &outcome))
+    record_identity_on_catalog(db_path, root, photo_id, path, outcome).await
 }
 
 /// Photos whose UUID is in the catalog but not (yet) in their XMP sidecar — the
@@ -169,26 +174,40 @@ pub async fn list_pending_identity(
     with_catalog_blocking(&state, |c| c.list_pending_identity()).await
 }
 
-/// Retry every queued identity repair, clearing the ones that now succeed. Runs the
-/// plan → IO → record split per photo so the sidecar parsing/writing (possibly over a
-/// slow mount) never holds the catalog lock. Photos whose file is unreachable stay
+/// Retry every queued identity repair, clearing the copies that now succeed. Runs the
+/// work on a secondary connection so the sidecar parsing/writing (possibly over a slow
+/// mount) never holds the app's catalog lock. Copies whose file is unreachable stay
 /// queued; so do sidecars that still can't be written or that carry a conflicting
 /// identity — those need a human, and the queue is what remembers them.
 #[tauri::command]
 pub async fn repair_pending_identity(
     state: State<'_, AppState>,
 ) -> Result<crate::catalog::IdentityRepairSummary, String> {
-    let plans = with_catalog_blocking(&state, |c| c.plan_identity_repairs()).await?;
-    let mut summary = crate::catalog::IdentityRepairSummary::default();
-    for plan in plans {
-        let photo_id = plan.photo_id;
-        let outcome = tauri::async_runtime::spawn_blocking(move || plan.run())
-            .await
-            .map_err(|e| e.to_string())?;
-        with_catalog(&state, |c| c.record_sidecar_identity(photo_id, &outcome))?;
-        summary.tally(&outcome);
-    }
-    Ok(summary)
+    let (db_path, root) =
+        with_catalog(&state, |c| Ok((c.db_path().to_path_buf(), c.root().to_path_buf())))?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let catalog = Catalog::open_secondary(&db_path, &root).map_err(|e| e.to_string())?;
+        catalog.repair_pending_identity().map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+async fn record_identity_on_catalog(
+    db_path: PathBuf,
+    root: PathBuf,
+    photo_id: i64,
+    target_path: PathBuf,
+    outcome: crate::catalog::SidecarIdentity,
+) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let catalog = Catalog::open_secondary(&db_path, &root).map_err(|e| e.to_string())?;
+        catalog
+            .record_sidecar_identity(photo_id, &target_path, &outcome)
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// A catalog photo whose original is gone (for the cleanup preview/report).
@@ -417,4 +436,3 @@ pub fn get_photo_locations(
 ) -> Result<Vec<PhotoLocation>, String> {
     with_catalog(&state, |c| c.photo_locations(photo_id))
 }
-

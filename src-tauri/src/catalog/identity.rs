@@ -28,7 +28,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub enum SidecarIdentity {
     /// The sidecar carries this photo's UUID (it already did, or we just wrote it).
     Bound,
-    /// No copy of the file is reachable right now (offline/unmounted volume, or the
+    /// The queued copy is not reachable right now (offline/unmounted volume, or the
     /// original is gone). A normal state, not corruption — retry when it returns.
     Unreachable,
     /// The sidecar could not be written: read-only storage, an unparseable existing
@@ -45,7 +45,7 @@ impl SidecarIdentity {
     fn error_text(&self) -> String {
         match self {
             SidecarIdentity::Bound => String::new(),
-            SidecarIdentity::Unreachable => "no reachable copy of this photo".to_string(),
+            SidecarIdentity::Unreachable => "queued copy is not reachable".to_string(),
             SidecarIdentity::Unwritable(e) => format!("sidecar write failed: {e}"),
             SidecarIdentity::Conflict(found) => {
                 format!("sidecar carries a different identity ({found}); left untouched")
@@ -84,28 +84,36 @@ pub struct PendingIdentity {
     pub uuid: String,
     /// The photo's catalog-root-relative logical path, for display.
     pub path: String,
+    /// The volume that contains the copy whose sidecar is pending.
+    pub volume_id: i64,
+    /// Absolute path to the copy whose sidecar is pending, for display/diagnostics.
+    pub target_path: String,
     pub attempts: i64,
     pub error: String,
     pub queued_at: i64,
     pub last_attempt_at: i64,
 }
 
-/// One photo's repair, planned under the catalog lock and runnable without it.
+/// One copy's repair, planned under the catalog lock and runnable without it.
 pub struct IdentityRepairPlan {
     pub photo_id: i64,
+    volume_id: i64,
+    relative_path: String,
     uuid: String,
-    /// Where the file might be, best role first (from the resolver's candidate list).
-    candidates: Vec<PathBuf>,
+    /// The physical copy whose sidecar failed earlier.
+    target_path: PathBuf,
 }
 
 impl IdentityRepairPlan {
-    /// Retry the binding. Pure filesystem work — call this OFF the catalog lock.
+    /// Retry the binding for the queued copy. Pure filesystem work — call this OFF
+    /// the catalog lock.
     pub fn run(&self) -> SidecarIdentity {
-        let Some(path) = self.candidates.iter().find(|p| p.exists()) else {
+        if !self.target_path.exists() {
             return SidecarIdentity::Unreachable;
-        };
-        let found = crate::xmp::read_identifier(path);
-        bind_sidecar_identity(path, &self.uuid, found.as_deref())
+        }
+
+        let found = crate::xmp::read_identifier(&self.target_path);
+        bind_sidecar_identity(&self.target_path, &self.uuid, found.as_deref())
     }
 }
 
@@ -113,9 +121,9 @@ impl IdentityRepairPlan {
 #[derive(Debug, Default, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct IdentityRepairSummary {
-    /// Identity now on disk; the pending row was cleared.
+    /// Identity now on disk for this queued copy; the pending row was cleared.
     pub repaired: usize,
-    /// No copy reachable right now — left queued for the next pass.
+    /// The queued copy is not reachable right now — left queued for the next pass.
     pub unreachable: usize,
     /// Retried and still failing (unwritable sidecar, or an identity conflict a
     /// human has to resolve). Left queued.
@@ -133,34 +141,47 @@ impl IdentityRepairSummary {
 }
 
 impl Catalog {
-    /// Record the outcome of an identity binding: clear the photo's repair row when the
-    /// identity reached the sidecar, otherwise queue (or re-stamp) it for repair.
+    /// Record the outcome of an identity binding for one physical copy: clear that
+    /// copy's repair row when the identity reached its sidecar, otherwise queue (or
+    /// re-stamp) that same copy for repair.
     ///
-    /// This is the *only* place the queue is written, so "bound" and "not bound" can
-    /// never both be true for a photo. It also means a re-scan doubles as a repair
-    /// pass: every file it re-reads clears or re-stamps that photo's row.
+    /// This is the *only* place the queue is written, so a re-scan doubles as a repair
+    /// pass for the file it re-reads without hiding debt for another copy.
     pub fn record_sidecar_identity(
         &self,
         photo_id: i64,
+        photo_path: &Path,
+        outcome: &SidecarIdentity,
+    ) -> Result<()> {
+        let (volume_id, relative_path) = self.volume_for_path(photo_path)?;
+        self.record_sidecar_identity_target(photo_id, volume_id, &relative_path, outcome)
+    }
+
+    fn record_sidecar_identity_target(
+        &self,
+        photo_id: i64,
+        volume_id: i64,
+        relative_path: &str,
         outcome: &SidecarIdentity,
     ) -> Result<()> {
         if matches!(outcome, SidecarIdentity::Bound) {
             self.conn.execute(
-                "DELETE FROM pending_sidecar_identity WHERE photo_id = ?1",
-                params![photo_id],
+                "DELETE FROM pending_sidecar_identity
+                 WHERE photo_id = ?1 AND volume_id = ?2 AND relative_path = ?3",
+                params![photo_id, volume_id, relative_path],
             )?;
             return Ok(());
         }
         let ts = now();
         self.conn.execute(
             "INSERT INTO pending_sidecar_identity
-                 (photo_id, attempts, error, queued_at, last_attempt_at)
-             VALUES(?1, 1, ?2, ?3, ?3)
-             ON CONFLICT(photo_id) DO UPDATE SET
+                 (photo_id, volume_id, relative_path, attempts, error, queued_at, last_attempt_at)
+             VALUES(?1, ?2, ?3, 1, ?4, ?5, ?5)
+             ON CONFLICT(photo_id, volume_id, relative_path) DO UPDATE SET
                  attempts        = attempts + 1,
                  error           = excluded.error,
                  last_attempt_at = excluded.last_attempt_at",
-            params![photo_id, outcome.error_text(), ts],
+            params![photo_id, volume_id, relative_path, outcome.error_text(), ts],
         )?;
         Ok(())
     }
@@ -180,54 +201,74 @@ impl Catalog {
         found: Option<&str>,
     ) -> Result<SidecarIdentity> {
         let outcome = bind_sidecar_identity(photo_path, uuid, found);
-        self.record_sidecar_identity(photo_id, &outcome)?;
+        self.record_sidecar_identity(photo_id, photo_path, &outcome)?;
         Ok(outcome)
     }
 
-    /// Every photo whose sidecar still owes it its UUID, oldest first.
+    /// Every copy whose sidecar still owes it its UUID, oldest first.
     pub fn list_pending_identity(&self) -> Result<Vec<PendingIdentity>> {
         let mut stmt = self.conn.prepare(
-            "SELECT q.photo_id, p.uuid, p.path, q.attempts, q.error, q.queued_at, q.last_attempt_at
-             FROM pending_sidecar_identity q JOIN photos p ON p.id = q.photo_id
-             ORDER BY q.queued_at, q.photo_id",
+            "SELECT q.photo_id, p.uuid, p.path, q.volume_id, v.base_path, q.relative_path,
+                    q.attempts, q.error, q.queued_at, q.last_attempt_at
+             FROM pending_sidecar_identity q
+             JOIN photos p ON p.id = q.photo_id
+             JOIN volumes v ON v.id = q.volume_id
+             ORDER BY q.queued_at, q.photo_id, q.volume_id, q.relative_path",
         )?;
         let rows = stmt.query_map([], |r| {
+            let base: String = r.get(4)?;
+            let relative_path: String = r.get(5)?;
+            let target_path = Path::new(&base)
+                .join(&relative_path)
+                .to_string_lossy()
+                .to_string();
             Ok(PendingIdentity {
                 photo_id: r.get(0)?,
                 uuid: r.get(1)?,
                 path: r.get(2)?,
-                attempts: r.get(3)?,
-                error: r.get(4)?,
-                queued_at: r.get(5)?,
-                last_attempt_at: r.get(6)?,
+                volume_id: r.get(3)?,
+                target_path,
+                attempts: r.get(6)?,
+                error: r.get(7)?,
+                queued_at: r.get(8)?,
+                last_attempt_at: r.get(9)?,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
-    /// How many photos are missing their identity on disk.
+    /// How many known photo copies are missing their identity on disk.
     pub fn count_pending_identity(&self) -> Result<i64> {
         Ok(self
             .conn
             .query_row("SELECT count(*) FROM pending_sidecar_identity", [], |r| r.get(0))?)
     }
 
-    /// Plan the repair of every queued photo. PURE SQL (the resolver's candidate list
-    /// never stats the filesystem), so it is safe to call while holding the catalog
-    /// lock; run each plan off the lock and record the outcome afterwards.
+    /// Plan the repair of every queued copy. PURE SQL, so it is safe to call while
+    /// holding the catalog lock; run each plan off the lock and record the outcome
+    /// afterwards.
     pub fn plan_identity_repairs(&self) -> Result<Vec<IdentityRepairPlan>> {
         let mut plans = Vec::new();
-        for pending in self.list_pending_identity()? {
-            let candidates = self
-                .photo_path_candidates(pending.photo_id)?
-                .into_iter()
-                .map(|c| c.path)
-                .collect();
-            plans.push(IdentityRepairPlan {
-                photo_id: pending.photo_id,
-                uuid: pending.uuid,
-                candidates,
-            });
+        let mut stmt = self.conn.prepare(
+            "SELECT q.photo_id, p.uuid, q.volume_id, q.relative_path, v.base_path
+             FROM pending_sidecar_identity q
+             JOIN photos p ON p.id = q.photo_id
+             JOIN volumes v ON v.id = q.volume_id
+             ORDER BY q.queued_at, q.photo_id, q.volume_id, q.relative_path",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            let relative_path: String = r.get(3)?;
+            let base: String = r.get(4)?;
+            Ok(IdentityRepairPlan {
+                photo_id: r.get(0)?,
+                uuid: r.get(1)?,
+                volume_id: r.get(2)?,
+                target_path: Path::new(&base).join(&relative_path),
+                relative_path,
+            })
+        })?;
+        for plan in rows {
+            plans.push(plan?);
         }
         Ok(plans)
     }
@@ -239,7 +280,12 @@ impl Catalog {
         let mut summary = IdentityRepairSummary::default();
         for plan in self.plan_identity_repairs()? {
             let outcome = plan.run();
-            self.record_sidecar_identity(plan.photo_id, &outcome)?;
+            self.record_sidecar_identity_target(
+                plan.photo_id,
+                plan.volume_id,
+                &plan.relative_path,
+                &outcome,
+            )?;
             summary.tally(&outcome);
         }
         Ok(summary)

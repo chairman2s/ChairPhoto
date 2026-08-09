@@ -3995,6 +3995,87 @@ fn an_unreachable_original_leaves_the_repair_queued() {
     assert_eq!(catalog.count_pending_identity().unwrap(), 1, "still queued");
 }
 
+#[test]
+fn identity_repair_keeps_copy_debt_when_another_copy_is_reachable() {
+    use chairphoto_lib::catalog::SidecarIdentity;
+
+    let (catalog, root) = temp_catalog("identity-copy-target");
+    let primary = root.join("DSC0005.ARW");
+    std::fs::write(&primary, b"primary-raw").unwrap();
+    let up = catalog.upsert_photo(&primary, None, 1, 11).unwrap();
+
+    let backup_dir = root.parent().unwrap().join("backup-identity");
+    std::fs::create_dir_all(&backup_dir).unwrap();
+    let backup = backup_dir.join("DSC0005.ARW");
+    std::fs::write(&backup, b"backup-raw").unwrap();
+    let backup_volume = catalog
+        .add_volume("Backup", &backup_dir, VolumeKind::Backup)
+        .unwrap();
+    catalog
+        .add_location(up.id, backup_volume, "DSC0005.ARW", LocationRole::Backup)
+        .unwrap();
+
+    let corrupt_sidecar = root.join("DSC0005.ARW.xmp");
+    std::fs::write(
+        &corrupt_sidecar,
+        b"<x:xmpmeta xmlns:x=\"adobe:ns:meta/\"><rdf:RDF",
+    )
+    .unwrap();
+
+    let outcome = catalog
+        .ensure_sidecar_identity(up.id, &primary, &up.uuid, None)
+        .unwrap();
+    assert!(
+        matches!(outcome, SidecarIdentity::Unwritable(_)),
+        "the corrupt primary sidecar must be queued, got {outcome:?}"
+    );
+    let pending = catalog.list_pending_identity().unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(PathBuf::from(&pending[0].target_path), primary);
+
+    std::fs::remove_file(&primary).unwrap();
+    let summary = catalog.repair_pending_identity().unwrap();
+    assert_eq!(
+        (summary.repaired, summary.failed, summary.unreachable),
+        (0, 0, 1),
+        "a reachable backup must not clear debt for the missing primary copy"
+    );
+    assert_eq!(catalog.count_pending_identity().unwrap(), 1);
+    assert!(
+        chairphoto_lib::xmp::read_identifier(&backup).is_none(),
+        "repair is scoped to the queued primary copy"
+    );
+
+    let backup_outcome = catalog
+        .ensure_sidecar_identity(up.id, &backup, &up.uuid, None)
+        .unwrap();
+    assert_eq!(backup_outcome, SidecarIdentity::Bound);
+    assert_eq!(
+        chairphoto_lib::xmp::read_identifier(&backup).as_deref(),
+        Some(up.uuid.as_str())
+    );
+    let pending = catalog.list_pending_identity().unwrap();
+    assert_eq!(
+        pending.len(),
+        1,
+        "binding the backup copy must not erase the primary copy's debt"
+    );
+    assert_eq!(PathBuf::from(&pending[0].target_path), primary);
+
+    std::fs::write(&primary, b"primary-raw").unwrap();
+    std::fs::remove_file(&corrupt_sidecar).unwrap();
+    let summary = catalog.repair_pending_identity().unwrap();
+    assert_eq!(
+        (summary.repaired, summary.failed, summary.unreachable),
+        (1, 0, 0)
+    );
+    assert_eq!(
+        chairphoto_lib::xmp::read_identifier(&primary).as_deref(),
+        Some(up.uuid.as_str())
+    );
+    assert_eq!(catalog.count_pending_identity().unwrap(), 0);
+}
+
 #[cfg(unix)]
 #[test]
 fn a_scan_onto_read_only_storage_keeps_every_identity_recoverable() {

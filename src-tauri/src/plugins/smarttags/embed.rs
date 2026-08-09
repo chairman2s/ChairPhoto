@@ -9,7 +9,7 @@
 //!
 //! - A tiny lazily-built **session pool** ([`Pool`]/[`Checkout`]) so several embeds run in
 //!   parallel without a per-model mutex; sized by [`configure`] off the indexer's
-//!   [`super::super::faces::IndexingPlan`] (shared `indexing.speed` setting).
+//!   [`crate::plugins::indexing::IndexingPlan`] (shared `indexing.speed` setting).
 //! - A **CUDA execution provider with graceful CPU fallback** ([`try_register_cuda`]) — GPU is
 //!   tried only in a `smarttags-cuda` build and never crashes when CUDA/cuDNN/a GPU is absent.
 //! - The model path is **configurable** (`smarttags.model_path`) and a **missing model degrades
@@ -37,7 +37,7 @@ const CLIP_STD: [f32; 3] = [0.268_629_54, 0.261_302_6, 0.275_777_1];
 
 /// The intra-op thread count each ONNX session is built with, and the number of sessions in the
 /// pool. Set once, before the first session is built, by [`configure`] (from the indexer, off the
-/// resolved [`super::super::faces::IndexingPlan`] — Smart Tagging rides the same `indexing.speed`
+/// resolved [`crate::plugins::indexing::IndexingPlan`] — Smart Tagging rides the same `indexing.speed`
 /// setting). A session built before `configure` runs (e.g. a single inspector embed) uses the
 /// responsive defaults below.
 #[cfg(feature = "smarttags")]
@@ -90,7 +90,7 @@ pub fn active_ep() -> ActiveEp {
 
 /// Configure the session-pool size and per-session intra-op thread count for the *next* pool
 /// build. Call once before an index run (from the indexer, off the resolved
-/// [`super::super::faces::IndexingPlan`]); no-op once a pool exists (the first build wins).
+/// [`crate::plugins::indexing::IndexingPlan`]); no-op once a pool exists (the first build wins).
 #[cfg(feature = "smarttags")]
 pub fn configure(pool_size: usize, intra_threads: usize) {
     use std::sync::atomic::Ordering;

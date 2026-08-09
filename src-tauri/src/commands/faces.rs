@@ -54,7 +54,7 @@ pub fn faces_inference_info(state: State<'_, AppState>) -> Result<FacesInference
     let guard = state.catalog.lock().map_err(|e| e.to_string())?;
     let catalog = guard.as_ref().ok_or("No catalog is open")?;
     let speed = match catalog
-        .get_setting(crate::plugins::faces::indexer::INDEXING_SPEED_SETTING)
+        .get_setting(crate::plugins::indexing::INDEXING_SPEED_SETTING)
         .map_err(|e| e.to_string())?
     {
         Some(s) if s.trim().eq_ignore_ascii_case("full") => "full",
@@ -80,7 +80,7 @@ pub fn faces_set_indexing_speed(state: State<'_, AppState>, speed: String) -> Re
     let guard = state.catalog.lock().map_err(|e| e.to_string())?;
     let catalog = guard.as_ref().ok_or("No catalog is open")?;
     catalog
-        .set_setting(crate::plugins::faces::indexer::INDEXING_SPEED_SETTING, &v)
+        .set_setting(crate::plugins::indexing::INDEXING_SPEED_SETTING, &v)
         .map_err(|e| e.to_string())
 }
 
@@ -195,6 +195,7 @@ pub async fn faces_index_photos(
     tauri::async_runtime::spawn_blocking(move || {
         use crate::catalog::Catalog;
         use crate::plugins::faces::indexer;
+        use crate::plugins::indexing as shared_indexing;
 
         // Release the status slot — but only if a newer job hasn't already claimed it.
         let clear_job_slot = || {
@@ -288,7 +289,7 @@ pub async fn faces_index_photos(
         // against the host's core count, then size the ONNX session pool + intra-op threads
         // to it before the first inference builds the pool. `configure` is a no-op once a
         // pool exists (first run wins), so `background` stays the responsive default.
-        let plan = indexer::load_indexing_plan(sec.conn());
+        let plan = shared_indexing::load_indexing_plan(sec.conn());
         crate::plugins::faces::engine::configure(plan.parallelism, plan.intra_threads);
         // Honor the `faces.force_cpu` setting: in a `faces-cuda` build this keeps inference on
         // CPU even when a GPU is available (inert in a CPU-only build). Also a no-op once the
@@ -930,4 +931,3 @@ pub async fn faces_suggestion_list(
 }
 
 // ── H16b: Sharpness index job ────────────────────────────────────────────────
-

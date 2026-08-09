@@ -10,6 +10,10 @@ pub mod edit;
 #[cfg(feature = "faces")]
 pub mod faces;
 
+/// Shared indexing-job settings for independently optional backend modules.
+#[cfg(any(feature = "faces", feature = "smarttags"))]
+pub mod indexing;
+
 #[cfg(feature = "map")]
 pub mod map;
 

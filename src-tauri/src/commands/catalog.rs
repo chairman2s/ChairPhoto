@@ -1,8 +1,10 @@
 //! Catalog lifecycle commands: open / create / switch, the recent-catalogs registry,
 //! the library root, rescan, the enrichment-queue drain, and VACUUM.
 //!
-//! Switching is a safe teardown → reinit: the outgoing catalog's scan generation is
-//! tripped first so no in-flight Phase B can write to a torn-down catalog.
+//! Switching is a safe teardown → reinit: every background job generation — scan, faces,
+//! sharpness, pHash and Smart Tagging — is tripped under the catalog lock before the handle
+//! is dropped, so nothing in flight can write to a torn-down catalog. See
+//! `detach_catalog_and_trip_jobs` and `publish_catalog_and_reset_jobs`.
 
 use super::*;
 use std::path::{Path, PathBuf};
@@ -14,11 +16,16 @@ use tauri::{AppHandle, Emitter, Manager, State};
 ///    Smart Tagging) so they stop writing before the old catalog is torn down — nothing
 ///    lands in a catalog that's about to be closed.
 /// 2. Closes the active catalog: drops the mutex-held handle (flushing the WAL) so the
-///    old connection is released before the new one is opened.
+///    old connection is released before the new one is opened. Steps 1 and 2 are one
+///    transition under one catalog lock — see `detach_catalog_and_trip_jobs`.
 /// 3. Opens (or, when `create` is set, creates) the catalog at `catalog_path` rooted at
-///    `root`, records it in the recent-catalogs registry, and drops stale volume health.
-/// 4. Emits `catalog:switched` so the frontend resets all React state (selection, filters,
+///    `root`.
+/// 4. Publishes it as the active catalog with fresh un-tripped job generations (see
+///    `publish_catalog_and_reset_jobs`), drops stale volume health, and records it in the
+///    recent-catalogs registry.
+/// 5. Emits `catalog:switched` so the frontend resets all React state (selection, filters,
 ///    albums, scan progress) and refreshes against the new catalog.
+/// 6. Auto-resumes enrichment Phase B (I6d) if the new catalog has pending rows.
 ///
 /// The scan runs on its own secondary connection (see `run_blocking_scan`), so the shared
 /// `catalog` mutex is free during a scan and the swap here does not block on it; setting
@@ -102,10 +109,10 @@ pub async fn switch_catalog(
     // 5. Tell the frontend to reset and refresh against the new catalog.
     let _ = app.emit("catalog:switched", &catalog_path);
 
-    // I6d: auto-resume Phase B if the new catalog has pending enrichment rows (crash/quit
-    // mid-scan in a prior session). Only start the detached worker (and burn an
-    // abort-flag generation) if there is actually something to do — avoids a wasted
-    // secondary connection on every catalog switch against a fully-enriched catalog.
+    // 6. Auto-resume Phase B (I6d) if the new catalog has pending enrichment rows
+    //    (crash/quit mid-scan in a prior session). Only start the detached worker (and burn
+    //    an abort-flag generation) if there is actually something to do — avoids a wasted
+    //    secondary connection on every catalog switch against a fully-enriched catalog.
     let pending_count = {
         let guard = state.catalog.lock().map_err(|e| e.to_string())?;
         let c = guard.as_ref().ok_or("No catalog is open")?;

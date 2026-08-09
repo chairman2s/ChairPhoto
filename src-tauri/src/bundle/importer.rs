@@ -198,22 +198,23 @@ pub fn extract_originals(
             if dest_size == orig_bytes.len() as u64 {
                 // Same-size → already imported, skip the copy.
                 result.skipped_duplicate += 1;
-                // Ensure the sidecar UUID is in place so the upsert can match by it.
-                // write_identifier is merge-safe and a no-op if the sidecar already
-                // has the UUID (which it will on the second import, but not always on
-                // the very first run if the original arrived via a different path).
-                let sidecar = {
-                    let mut s = dest.as_os_str().to_os_string();
-                    s.push(".xmp");
-                    PathBuf::from(s)
-                };
-                if crate::xmp::read_identifier(&dest).as_deref() != Some(&bp.uuid) {
-                    if let Err(e) = crate::xmp::write_identifier(&dest, &bp.uuid) {
-                        eprintln!(
-                            "bundle import: couldn't write UUID sidecar for {} (non-fatal): {e}",
-                            sidecar.display()
-                        );
-                    }
+                // Put the UUID in the sidecar so the upsert can match by it. The file was
+                // here before this import, so it may already carry a *different*
+                // identity — `bind_sidecar_identity` leaves that one alone rather than
+                // overwriting another photo's identity on the strength of a same-size
+                // filename collision. This phase holds no catalog connection, so an
+                // unbound identity is only reported here; index_bundle records it durably.
+                let found = crate::xmp::read_identifier(&dest);
+                let outcome = crate::catalog::bind_sidecar_identity(
+                    &dest,
+                    &bp.uuid,
+                    found.as_deref(),
+                );
+                if outcome != crate::catalog::SidecarIdentity::Bound {
+                    eprintln!(
+                        "bundle import: identity not bound for {} ({outcome:?}) — queued for repair",
+                        dest.display()
+                    );
                 }
                 // Still record as extracted so the indexer can upsert its location.
                 extracted.push(ExtractedItem {
@@ -281,11 +282,13 @@ pub fn extract_originals(
         };
         // If no bundle sidecar landed, write a bare UUID sidecar so the identity is
         // in place for the index phase. This satisfies the AGENTS.md invariant: every
-        // catalogued photo's XMP sidecar carries its UUID.
+        // catalogued photo's XMP sidecar carries its UUID. A failure here is not the
+        // end of it — the photo has no catalog row yet, so index_bundle is the one that
+        // records the repair once the row exists.
         if !bundle_sidecar_extracted && !sidecar_dest.exists() {
             if let Err(e) = crate::xmp::write_identifier(&dest, &bp.uuid) {
                 eprintln!(
-                    "bundle import: couldn't write UUID sidecar for {} (non-fatal): {e}",
+                    "bundle import: couldn't write UUID sidecar for {} — queued for repair: {e}",
                     dest.display()
                 );
             }
@@ -365,17 +368,25 @@ pub fn index_bundle(
             .unwrap_or(0);
         let size = meta.len() as i64;
 
-        // extract_originals guarantees a UUID sidecar exists beside this file
-        // (either from the bundle or written from the bundle's photo UUID). Reading
-        // it here is the critical UUID-match step that prevents re-import duplicates.
+        // extract_originals normally leaves a UUID sidecar beside this file (either from
+        // the bundle or written from the bundle's photo UUID). Reading it here is the
+        // critical UUID-match step that prevents re-import duplicates.
         let sidecar_uuid = crate::xmp::read_identifier(path);
+
+        // The sidecar wins when it has an identity — it describes the file that is
+        // actually on disk, which for a same-size collision need not be the bundle's
+        // photo. When it has none (the copy phase's write failed, or the existing
+        // sidecar doesn't parse), fall back to the manifest: this photo's identity is
+        // known, so minting a fresh UUID here would be inventing a second one for it
+        // and leaving `merge_bundle` to insert the bundle's photo a second time.
+        let identity = sidecar_uuid.as_deref().unwrap_or(item.photo_uuid.as_str());
 
         let upsert = match catalog.upsert_photo_with_identity(
             path,
             Some(folder_id),
             mtime_ns,
             size,
-            sidecar_uuid.as_deref(),
+            Some(identity),
         ) {
             Ok(u) => u,
             Err(e) => {
@@ -385,18 +396,21 @@ pub fn index_bundle(
             }
         };
 
+        // Bind the identity to the file, or queue a repair (AGENTS.md, "Photo identity").
+        // This runs for EVERY extracted photo, not only newly-created ones: an already-
+        // catalogued photo whose sidecar lost its identity owes the same debt, and the
+        // copy phase's sidecar write is best-effort — this is where its failure is caught.
+        if let Err(e) =
+            catalog.ensure_sidecar_identity(upsert.id, path, &upsert.uuid, sidecar_uuid.as_deref())
+        {
+            eprintln!(
+                "bundle import: couldn't queue identity repair for {}: {e}",
+                path.display()
+            );
+        }
+
         if upsert.created {
             newly_created.push(upsert.id);
-
-            // Safety net: write UUID sidecar if somehow still absent.
-            if sidecar_uuid.is_none() {
-                if let Err(e) = crate::xmp::write_identifier(path, &upsert.uuid) {
-                    eprintln!(
-                        "bundle import: couldn't write UUID sidecar for {}: {e}",
-                        path.display()
-                    );
-                }
-            }
 
             // Apply the bundle's non-destructive state for this brand-new photo.
             // The F1c merge won't do this because the upsert already made the photo

@@ -138,10 +138,11 @@ impl Catalog {
     }
 
     /// Find the volume that contains `absolute` (longest matching base path) and the
-    /// path relative to it. Falls back to the default volume (catalog root).
+    /// path relative to it. Falls back to the default volume (catalog root). PURE SQL:
+    /// reachability checks are deliberately left to resolver callers that run off-lock.
     pub fn volume_for_path(&self, absolute: &Path) -> Result<(i64, String)> {
         let mut best: Option<(i64, usize, String)> = None;
-        for volume in self.list_volumes()? {
+        for volume in self.volume_rows()? {
             let base = PathBuf::from(&volume.base_path);
             if let Ok(rel) = absolute.strip_prefix(&base) {
                 let len = volume.base_path.len();

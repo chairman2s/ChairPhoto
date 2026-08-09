@@ -12,6 +12,7 @@ mod batches;
 mod edits;
 mod facets;
 mod groups;
+mod identity;
 mod lifecycle;
 mod merge;
 mod reconcile;
@@ -25,6 +26,10 @@ mod tag_path;
 mod terms;
 
 pub use facets::{Facet, SOFT_THRESHOLD_DEFAULT, SOFT_THRESHOLD_KEY};
+pub use identity::{
+    bind_sidecar_identity, IdentityRepairPlan, IdentityRepairSummary, PendingIdentity,
+    SidecarIdentity,
+};
 pub use locations::PathCandidate;
 pub use lifecycle::{copy_and_verify, verify_and_delete_locals, BackupPlan, OffloadPlan, RestorePlan};
 pub use merge::MergeSummary;

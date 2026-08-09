@@ -228,8 +228,8 @@ pub fn scan_folder_phase_a(
 
     // Phase A: fast walk — upsert path/uuid/mtime/size, mark new/changed rows as
     // metadata_ready=0, emit scan:progress {phase:"indexing"}, return import list.
-    // The UUID sidecar write (J5) happens inside upsert_one, so identity exists before
-    // Phase B begins.
+    // The UUID sidecar binding (J5) happens inside upsert_one, so identity exists on
+    // disk before Phase B begins — or its repair is queued in pending_sidecar_identity.
     let (result, imported, newly_created) = phase_a_walk(
         catalog,
         folder,
@@ -418,8 +418,9 @@ pub fn scan_external_folder_phase_a(
 
     // Phase A: fast walk — upsert path/uuid/mtime/size, mark new/changed rows as
     // metadata_ready=0, emit scan:progress {phase:"indexing"}, return import list.
-    // The UUID sidecar write (J5) happens inside upsert_external_one, so identity
-    // exists before Phase B begins. A NAS in-place scan tracks no folder row, so
+    // The UUID sidecar binding (J5) happens inside upsert_external_one, so identity
+    // exists on disk before Phase B begins — or its repair is queued in
+    // pending_sidecar_identity. A NAS in-place scan tracks no folder row, so
     // there is no folder_id to mark finished (folder_id = None).
     let (result, imported, _newly_created) = phase_a_walk(
         catalog,
@@ -460,10 +461,13 @@ pub(crate) fn upsert_external_one(catalog: &Catalog, path: &Path) -> Result<(i64
     let res = catalog
         .upsert_photo_on_volume(path, mtime_ns, size, sidecar_uuid.as_deref())
         .map_err(|e| e.to_string())?;
-    if sidecar_uuid.is_none() {
-        if let Err(e) = crate::xmp::write_identifier(path, &res.uuid) {
-            eprintln!("nas-scan: couldn't write UUID sidecar for {}: {e}", path.display());
-        }
+    // Same binding invariant as the local scan (see `upsert_one`): bind the identity to
+    // the file, or queue a repair. A NAS scan is exactly where this matters — an archive
+    // mounted read-only would otherwise index thousands of photos whose identity exists
+    // in one SQLite file and nowhere else.
+    if let Err(e) = catalog.ensure_sidecar_identity(res.id, path, &res.uuid, sidecar_uuid.as_deref())
+    {
+        eprintln!("nas-scan: couldn't queue identity repair for {}: {e}", path.display());
     }
     Ok((res.id, res.created, res.unchanged))
 }
@@ -837,13 +841,15 @@ fn upsert_one(catalog: &Catalog, path: &Path, folder_id: i64) -> Result<(i64, bo
         .upsert_photo_with_identity(path, Some(folder_id), mtime_ns, size, sidecar_uuid.as_deref())
         .map_err(|e| e.to_string())?;
 
-    // Honor the binding invariant: ensure the file's sidecar carries this photo's UUID so
-    // future moves/re-roots can match by it. Only write when the sidecar lacks it (don't
-    // rewrite on every scan, and never clobber a UUID already on disk). Merge-safe.
-    if sidecar_uuid.is_none() {
-        if let Err(e) = crate::xmp::write_identifier(path, &res.uuid) {
-            eprintln!("scan: couldn't write UUID sidecar for {}: {e}", path.display());
-        }
+    // Honor the binding invariant: the file's sidecar must carry this photo's UUID so
+    // future moves/re-roots can match by it. Writes only when the sidecar lacks it (don't
+    // rewrite on every scan, never clobber a UUID already on disk); when the write can't
+    // happen, the debt is queued for `repair_pending_identity` rather than logged and
+    // forgotten. A sidecar failure still never aborts the scan — one unwritable file must
+    // not cost the user the other 99,999 rows.
+    if let Err(e) = catalog.ensure_sidecar_identity(res.id, path, &res.uuid, sidecar_uuid.as_deref())
+    {
+        eprintln!("scan: couldn't queue identity repair for {}: {e}", path.display());
     }
     Ok((res.id, res.created, res.unchanged))
 }

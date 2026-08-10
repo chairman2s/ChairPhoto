@@ -513,37 +513,121 @@ pub struct SmarttagsTrainResult {
 ///   the classifier was last trained (`trained_at` < most-recent suggestion
 ///   `updated_at` with state `accepted`/`rejected`).
 ///
-/// Fresh classifiers with no newer feedback are skipped. The command is
-/// intentionally synchronous (runs inside `spawn_blocking`): training 512-d
-/// logistic regression over a few hundred photos takes well under a second per
-/// tag, and the blended suggestions are only computed on-demand from the frontend.
+/// Fresh classifiers with no newer feedback are skipped.
+///
+/// ## Why this is not one `with_catalog_blocking` call
+///
+/// Training is CPU-bound — 200 full-data passes of 512-d dot products per tag, over every
+/// stale tag in the catalog. Running that inside `with_catalog_blocking` holds the primary
+/// catalog mutex for the whole run, so every UI read (grid, inspector, tag panel) blocks
+/// behind it. The per-tag cost is small; the whole-catalog cost on a large library is not.
+///
+/// So the run is split into three phases, and the lock is **released** around the only part
+/// that does not touch SQLite:
+///
+/// 1. **Scan** (locked, cheap) — read the min-samples setting and decide which tags are
+///    stale. Counts and timestamps only, never embeddings.
+/// 2. **Load and train** (per tag) — take the lock just long enough to read one tag's
+///    embeddings, release it, then train with no lock held. Only the trained classifier
+///    (weights + bias, a few KB) is kept, so peak memory is one tag's training set rather
+///    than the whole catalog's — which is what snapshotting every stale tag up front would
+///    have cost.
+/// 3. **Persist** (locked, one transaction) — write every classifier back at once.
+///
+/// ## Catalog switches
+///
+/// Releasing the lock means the catalog handle can be replaced mid-run by `switch_catalog`
+/// or `set_library_root`. Writing phase-3 results into a catalog the user has left would
+/// violate the ownership invariant, so each re-acquisition checks that the open catalog is
+/// still the same database and abandons the run if it is not. This is deliberately a guard
+/// rather than an abort generation: the run holds no job slot, publishes no progress, and
+/// nothing can observe it except its own return value.
 #[cfg(feature = "smarttags")]
 #[tauri::command]
 pub async fn smarttags_train_classifiers(
     state: State<'_, AppState>,
 ) -> Result<SmarttagsTrainResult, String> {
-    use crate::plugins::smarttags::{train_all, MIN_TRAIN_SAMPLES_DEFAULT, MIN_TRAIN_SAMPLES_KEY};
+    let catalog = state.catalog.clone();
+    tauri::async_runtime::spawn_blocking(move || train_classifiers_phased(&catalog, || {}))
+        .await
+        .map_err(|e| e.to_string())?
+}
 
-    with_catalog_blocking(&state, move |c| {
-        // Read the min-samples setting (stored as a string); fall back to the default.
-        let min_samples: usize = c
-            .get_setting(MIN_TRAIN_SAMPLES_KEY)
-            .ok()
-            .flatten()
-            .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(MIN_TRAIN_SAMPLES_DEFAULT);
+/// The body of [`smarttags_train_classifiers`], minus Tauri.
+///
+/// Split out so the lock behaviour is testable: a unit test has no way to build a
+/// `State<'_, AppState>`, but it can hand this the same `Arc<Mutex<Option<Catalog>>>` the
+/// command would.
+///
+/// `between_load_and_train` runs at the one moment that matters — after a tag's embeddings
+/// have been read and the lock released, before the CPU-bound training starts. Production
+/// passes a no-op; tests use it to observe that the lock really is free there, and to force
+/// a catalog switch into that exact window. It is a hook, not a progress callback: it
+/// carries no data and fires once per tag that has a training set.
+#[cfg(feature = "smarttags")]
+fn train_classifiers_phased(
+    catalog: &Arc<Mutex<Option<Catalog>>>,
+    mut between_load_and_train: impl FnMut(),
+) -> Result<SmarttagsTrainResult, String> {
+    use crate::plugins::smarttags::{
+        classifier, MIN_TRAIN_SAMPLES_DEFAULT, MIN_TRAIN_SAMPLES_KEY,
+    };
 
-        let outcome = train_all(c.conn(), min_samples)
-            .map_err(crate::catalog::CatalogError::Validation)?;
+    {
+        // The database this run belongs to. Every later re-acquisition is checked against
+        // it, so a switch mid-run ends the run instead of writing into the new catalog.
+        let (db_path, scan) = {
+            let guard = catalog.lock().map_err(|e| e.to_string())?;
+            let c = guard.as_ref().ok_or("No catalog is open")?;
+            let min_samples: usize = c
+                .get_setting(MIN_TRAIN_SAMPLES_KEY)
+                .ok()
+                .flatten()
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(MIN_TRAIN_SAMPLES_DEFAULT);
+            let scan = classifier::scan_stale_tags(c.conn(), min_samples)?;
+            (c.db_path().to_path_buf(), scan)
+        };
+
+        let mut trained = Vec::new();
+        for tag_path in &scan.stale {
+            let set = {
+                let guard = catalog.lock().map_err(|e| e.to_string())?;
+                let c = guard.as_ref().ok_or("No catalog is open")?;
+                if c.db_path() != db_path {
+                    return Err(SWITCHED_MID_TRAIN.to_string());
+                }
+                classifier::load_training_set(c.conn(), tag_path)?
+            };
+            // Lock released — the expensive part runs without it.
+            let Some(set) = set else { continue };
+            between_load_and_train();
+            if let Some(clf) = classifier::train(&set.positives, &set.negatives) {
+                trained.push((set.tag_path, clf));
+            }
+        }
+
+        let written = {
+            let guard = catalog.lock().map_err(|e| e.to_string())?;
+            let c = guard.as_ref().ok_or("No catalog is open")?;
+            if c.db_path() != db_path {
+                return Err(SWITCHED_MID_TRAIN.to_string());
+            }
+            classifier::persist_classifiers(c.conn(), &trained)?
+        };
 
         Ok(SmarttagsTrainResult {
-            examined: outcome.examined,
-            trained: outcome.trained,
-            skipped: outcome.skipped,
+            examined: scan.examined,
+            trained: written,
+            skipped: scan.skipped,
         })
-    })
-    .await
+    }
 }
+
+/// Returned when the open catalog was replaced while a training run had the lock released.
+#[cfg(feature = "smarttags")]
+const SWITCHED_MID_TRAIN: &str =
+    "The catalog changed while classifiers were training; no classifiers were written.";
 
 // ── Catalog-switch job ownership ─────────────────────────────────────────────
 //
@@ -592,6 +676,133 @@ fn clear_slot_if_owner(slot: &Arc<Mutex<Option<SmarttagsJobStatus>>>, job: u64) 
         if s.as_ref().map(|x| x.job) == Some(job) {
             *s = None;
         }
+    }
+}
+
+/// Classifier training holds the catalog lock only for its two SQLite phases, and abandons
+/// the write if the catalog is replaced in between.
+///
+/// Both interleavings are forced through `train_classifiers_phased`'s hook rather than
+/// timed: it fires at exactly the point the lock is supposed to be free, so these tests
+/// observe the property directly instead of racing it.
+#[cfg(all(test, feature = "smarttags"))]
+mod smarttags_training_lock_tests {
+    use super::*;
+    use crate::plugins::smarttags::{classifier, store};
+    use std::path::Path;
+
+    /// A catalog with `photos` photos, half of them carrying one tag and **all** of them
+    /// carrying a CLIP embedding — so the trainer sees exactly one stale tag with both
+    /// positives and negatives to work on.
+    fn trainable_catalog(tag: &str, photos: usize) -> (Catalog, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("chairphoto-smarttags-train-{tag}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let root = dir.join("photos");
+        std::fs::create_dir_all(&root).unwrap();
+        let db = dir.join("catalog.chairphoto");
+        let catalog = Catalog::open(&db, &root).unwrap();
+
+        store::ensure_schema(catalog.conn()).unwrap();
+        classifier::ensure_schema(catalog.conn()).unwrap();
+        // The staleness scan reads `smarttags__suggestions`, which neither of the schemas
+        // above creates — `suggest::ensure_suggestions_schema` does, on the suggestion
+        // path. A real catalog has it by the time training runs; the fixture matches that.
+        crate::plugins::smarttags::suggest::ensure_suggestions_schema(catalog.conn()).unwrap();
+        let tag_id = catalog.create_tag("Test/Trainable").unwrap();
+
+        // A unit embedding, varied slightly per photo so positives and negatives are not
+        // literally the same vector.
+        for i in 0..photos {
+            let p = root.join(format!("p{i}.jpg"));
+            std::fs::write(&p, b"jpeg").unwrap();
+            catalog.upsert_photo(&p, None, 1, 4).unwrap();
+        }
+        let ids: Vec<i64> = {
+            let mut stmt = catalog.conn().prepare("SELECT id FROM photos ORDER BY id").unwrap();
+            let rows = stmt
+                .query_map([], |r| r.get::<_, i64>(0))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            rows
+        };
+        for (n, id) in ids.iter().enumerate() {
+            let mut v = vec![0.0f32; 512];
+            v[n % 512] = 1.0;
+            store::upsert_embedding(catalog.conn(), *id, &store::embedding_to_blob(&v)).unwrap();
+            // Tag the first half; the rest are the negative class.
+            if n < ids.len() / 2 {
+                catalog.assign_tag(*id, tag_id).unwrap();
+            }
+        }
+        (catalog, db)
+    }
+
+    /// An `AppState` holding `catalog` as the open catalog.
+    fn state_with(catalog: Catalog) -> AppState {
+        let state = AppState::default();
+        *state.catalog.lock().unwrap() = Some(catalog);
+        state
+    }
+
+    /// Rows in `smarttags__classifiers`, counting an absent table as zero.
+    fn classifier_count(db: &Path) -> i64 {
+        let conn = rusqlite::Connection::open(db).unwrap();
+        conn.query_row("SELECT COUNT(*) FROM smarttags__classifiers", [], |r| {
+            r.get::<_, i64>(0)
+        })
+        .unwrap_or(0)
+    }
+
+    /// The acceptance criterion, observed rather than argued: at the moment training is
+    /// about to burn CPU, the catalog lock is free for the UI to take.
+    ///
+    /// Mutation-checked: wrapping the load/train loop in a held catalog guard (the shape
+    /// this change replaced) makes the `try_lock` assertion fail.
+    #[test]
+    fn cpu_training_runs_with_the_catalog_lock_released() {
+        let (catalog, db) = trainable_catalog("lock-free", 24);
+        let state = state_with(catalog);
+
+        let mut hook_fired = 0usize;
+        let result = train_classifiers_phased(&state.catalog, || {
+            assert!(
+                state.catalog.try_lock().is_ok(),
+                "the catalog lock was held while training burned CPU"
+            );
+            hook_fired += 1;
+        })
+        .unwrap();
+
+        assert_eq!(hook_fired, 1, "hook never fired — the assertion above proved nothing");
+        assert_eq!(result.examined, 1);
+        assert_eq!(result.trained, 1);
+        assert_eq!(result.skipped, 0);
+        assert_eq!(classifier_count(&db), 1);
+    }
+
+    /// A catalog swapped in while the lock is released must not receive this run's
+    /// classifiers, and the run must say it failed rather than report a partial success.
+    #[test]
+    fn a_catalog_switch_mid_training_writes_nothing() {
+        let (catalog, db) = trainable_catalog("switch-src", 24);
+        let (other, other_db) = trainable_catalog("switch-dst", 24);
+        let state = state_with(catalog);
+
+        // Forced, not timed: the swap happens inside the one window where the trainer has
+        // let go of the lock.
+        let mut swap = Some(other);
+        let err = train_classifiers_phased(&state.catalog, || {
+            if let Some(next) = swap.take() {
+                *state.catalog.lock().unwrap() = Some(next);
+            }
+        })
+        .unwrap_err();
+
+        assert_eq!(err, SWITCHED_MID_TRAIN);
+        assert_eq!(classifier_count(&db), 0, "wrote into the catalog the user left");
+        assert_eq!(classifier_count(&other_db), 0, "wrote into the catalog it switched to");
     }
 }
 

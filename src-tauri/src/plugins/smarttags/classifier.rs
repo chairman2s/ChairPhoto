@@ -272,25 +272,43 @@ pub const MIN_TRAIN_SAMPLES_DEFAULT: usize = 10;
 /// Settings key for the minimum sample count.
 pub const MIN_TRAIN_SAMPLES_KEY: &str = "smarttags.min_train_samples";
 
-/// Train (or retrain) logistic-regression classifiers for every tag that has at least
-/// `min_samples` confirmed CLIP embeddings.
+/// The outcome of [`scan_stale_tags`]: which tags need retraining, and the counters
+/// that describe the tags it decided *not* to retrain.
+#[derive(Debug, Clone, Default)]
+pub struct StaleScan {
+    /// Tags examined (those with ≥ `min_samples` confirmed CLIP embeddings).
+    pub examined: usize,
+    /// Tags whose classifier was still fresh, so they were not queued for training.
+    pub skipped: usize,
+    /// `full_path` of every tag that needs a classifier built or rebuilt.
+    pub stale: Vec<String>,
+}
+
+/// One tag's training data, detached from the connection it was read through.
 ///
-/// A classifier is "stale" when `trained_at` < the timestamp of the most recent
-/// accept/reject for that tag's suggestions. We rebuild whenever that condition holds
-/// *or* when the row doesn't exist yet.
+/// This is the unit that crosses the catalog-lock boundary: [`load_training_set`] fills
+/// it under the lock, [`train`] consumes it with no lock held, and only the resulting
+/// [`Classifier`] (a few KB) travels back to [`persist_classifiers`].
+#[derive(Debug, Clone)]
+pub struct TrainingSet {
+    /// The tag this data trains a classifier for.
+    pub tag_path: String,
+    /// Embeddings of photos confirmed to carry the tag.
+    pub positives: Vec<Vec<f32>>,
+    /// Embeddings of photos that do not carry it, bounded to `3 × positives`.
+    pub negatives: Vec<Vec<f32>>,
+}
+
+/// Find the tags that qualify for training and decide which of them are stale.
 ///
-/// For each qualifying tag we pull:
-/// - **positives** — embeddings of photos confirmed to carry the tag (via `photo_tags`).
-/// - **negatives** — a random sample (≤ `3 × positives` to keep training fast) of
-///   embeddings from photos that do *not* carry the tag.
+/// A tag "qualifies" when it has at least `min_samples` photos that both carry the tag
+/// and have a CLIP embedding. Its classifier is "stale" when the row does not exist yet,
+/// or when the most recent accept/reject for that tag's suggestions is newer than
+/// `trained_at`.
 ///
-/// The negative sample is bounded to 3× the positive count to keep the training set
-/// roughly balanced without loading tens of thousands of embeddings into RAM when a
-/// catalog is large.
-pub fn train_all(
-    conn: &Connection,
-    min_samples: usize,
-) -> Result<TrainOutcome, String> {
+/// This is the cheap half of training: it reads counts and timestamps, never embeddings,
+/// so it is safe to run under the catalog lock.
+pub fn scan_stale_tags(conn: &Connection, min_samples: usize) -> Result<StaleScan, String> {
     ensure_schema(conn).map_err(|e| e.to_string())?;
     super::store::ensure_schema(conn).map_err(|e| e.to_string())?;
 
@@ -327,8 +345,7 @@ pub fn train_all(
         rows
     };
 
-    let mut outcome = TrainOutcome::default();
-    outcome.examined = qualifying.len();
+    let mut scan = StaleScan { examined: qualifying.len(), ..Default::default() };
 
     for (tag_path, _confirmed_count, clf_trained_at) in qualifying {
         // ── 2. Staleness check ────────────────────────────────────────────────
@@ -357,12 +374,31 @@ pub fn train_all(
         };
 
         if !is_stale {
-            outcome.skipped += 1;
+            scan.skipped += 1;
             continue;
         }
 
-        // ── 3. Load positive embeddings ───────────────────────────────────────
-        let pos_blobs: Vec<Vec<u8>> = {
+        scan.stale.push(tag_path);
+    }
+
+    Ok(scan)
+}
+
+/// Load one tag's positive and negative embeddings.
+///
+/// Returns `None` when the tag has no usable positive embeddings — the caller counts
+/// that as neither trained nor skipped, matching the original inline behaviour.
+///
+/// This is the expensive read: it pulls up to `4 × positives` embeddings into memory.
+/// Callers holding the catalog lock should load **one** tag at a time and release the
+/// lock before training, so peak memory stays at one tag's training set rather than the
+/// whole catalog's.
+pub fn load_training_set(
+    conn: &Connection,
+    tag_path: &str,
+) -> Result<Option<TrainingSet>, String> {
+    // ── 3. Load positive embeddings ───────────────────────────────────────
+    let pos_blobs: Vec<Vec<u8>> = {
             let mut stmt = conn
                 .prepare(
                     "SELECT e.vector
@@ -382,20 +418,20 @@ pub fn train_all(
             rows
         };
 
-        let positives: Vec<Vec<f32>> = pos_blobs
-            .iter()
-            .filter_map(|b| blob_to_embedding(b).ok())
-            .collect();
+    let positives: Vec<Vec<f32>> = pos_blobs
+        .iter()
+        .filter_map(|b| blob_to_embedding(b).ok())
+        .collect();
 
-        if positives.is_empty() {
-            continue;
-        }
+    if positives.is_empty() {
+        return Ok(None);
+    }
 
-        // ── 4. Load a bounded negative sample ────────────────────────────────
-        // Limit negatives to 3× positives so the training set is roughly
-        // balanced and doesn't balloon on large catalogs.
-        let neg_limit = (positives.len() * 3).max(1) as i64;
-        let neg_blobs: Vec<Vec<u8>> = {
+    // ── 4. Load a bounded negative sample ────────────────────────────────
+    // Limit negatives to 3× positives so the training set is roughly
+    // balanced and doesn't balloon on large catalogs.
+    let neg_limit = (positives.len() * 3).max(1) as i64;
+    let neg_blobs: Vec<Vec<u8>> = {
             let mut stmt = conn
                 .prepare(
                     "SELECT e.vector
@@ -421,19 +457,71 @@ pub fn train_all(
             rows
         };
 
-        let negatives: Vec<Vec<f32>> = neg_blobs
-            .iter()
-            .filter_map(|b| blob_to_embedding(b).ok())
-            .collect();
+    let negatives: Vec<Vec<f32>> = neg_blobs
+        .iter()
+        .filter_map(|b| blob_to_embedding(b).ok())
+        .collect();
 
-        // ── 5. Train and persist ──────────────────────────────────────────────
-        if let Some(clf) = train(&positives, &negatives) {
-            upsert_classifier(conn, &tag_path, &clf).map_err(|e| e.to_string())?;
-            outcome.trained += 1;
+    Ok(Some(TrainingSet { tag_path: tag_path.to_string(), positives, negatives }))
+}
+
+/// Write a batch of trained classifiers back in **one** transaction, and report how many
+/// rows were written.
+///
+/// Training is a read-snapshot → CPU → write-back cycle with the catalog lock released in
+/// the middle, so the write has to be all-or-nothing: a partial write would leave some
+/// tags with classifiers trained against one catalog state and some against another, and
+/// `trained_at` would then mark the inconsistent set as fresh.
+pub fn persist_classifiers(
+    conn: &Connection,
+    trained: &[(String, Classifier)],
+) -> Result<usize, String> {
+    if trained.is_empty() {
+        return Ok(0);
+    }
+    ensure_schema(conn).map_err(|e| e.to_string())?;
+    let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+    for (tag_path, clf) in trained {
+        upsert_classifier(&tx, tag_path, clf).map_err(|e| e.to_string())?;
+    }
+    tx.commit().map_err(|e| e.to_string())?;
+    Ok(trained.len())
+}
+
+/// Train (or retrain) logistic-regression classifiers for every tag that has at least
+/// `min_samples` confirmed CLIP embeddings, start to finish on one connection.
+///
+/// A classifier is "stale" when `trained_at` < the timestamp of the most recent
+/// accept/reject for that tag's suggestions. We rebuild whenever that condition holds
+/// *or* when the row doesn't exist yet.
+///
+/// For each qualifying tag we pull:
+/// - **positives** — embeddings of photos confirmed to carry the tag (via `photo_tags`).
+/// - **negatives** — a random sample (≤ `3 × positives` to keep training fast) of
+///   embeddings from photos that do *not* carry the tag.
+///
+/// The negative sample is bounded to 3× the positive count to keep the training set
+/// roughly balanced without loading tens of thousands of embeddings into RAM when a
+/// catalog is large.
+///
+/// This composes [`scan_stale_tags`], [`load_training_set`], [`train`] and
+/// [`persist_classifiers`] with no lock handling, which makes it the right entry point
+/// for tests and for any caller that already owns its connection exclusively. The Tauri
+/// command uses the four steps directly instead, so it can drop the catalog lock around
+/// the CPU-bound [`train`] call.
+pub fn train_all(conn: &Connection, min_samples: usize) -> Result<TrainOutcome, String> {
+    let scan = scan_stale_tags(conn, min_samples)?;
+    let mut trained = Vec::new();
+    for tag_path in &scan.stale {
+        let Some(set) = load_training_set(conn, tag_path)? else {
+            continue;
+        };
+        if let Some(clf) = train(&set.positives, &set.negatives) {
+            trained.push((set.tag_path, clf));
         }
     }
-
-    Ok(outcome)
+    let count = persist_classifiers(conn, &trained)?;
+    Ok(TrainOutcome { examined: scan.examined, trained: count, skipped: scan.skipped })
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────

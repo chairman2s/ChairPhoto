@@ -250,6 +250,13 @@ async fn with_catalog_blocking<T: Send + 'static>(
     state: &State<'_, AppState>,
     f: impl FnOnce(&Catalog) -> crate::catalog::Result<T> + Send + 'static,
 ) -> Result<T, String> {
+    with_catalog_in_state_blocking(state, f).await
+}
+
+async fn with_catalog_in_state_blocking<T: Send + 'static>(
+    state: &AppState,
+    f: impl FnOnce(&Catalog) -> crate::catalog::Result<T> + Send + 'static,
+) -> Result<T, String> {
     let catalog = state.catalog.clone();
     tauri::async_runtime::spawn_blocking(move || {
         let guard = catalog.lock().map_err(|e| e.to_string())?;
@@ -354,4 +361,3 @@ fn expand_home(path: &str) -> PathBuf {
     }
     PathBuf::from(path)
 }
-

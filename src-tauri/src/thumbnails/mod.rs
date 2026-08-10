@@ -739,6 +739,40 @@ mod tests {
     // var and the registry can't be mutated by two tests at once.
     use std::sync::atomic::AtomicUsize;
 
+    /// A test's own temp directory, removed on drop.
+    ///
+    /// The name carries the process id. Keying only on a constant — as these tests did —
+    /// gives every `cargo test` process on the machine the same path, and each test's
+    /// cleanup then deletes a directory another process is still writing into, which
+    /// surfaces as `No such file or directory` from `write_test_jpeg` rather than as
+    /// anything to do with thumbnails. Two worktrees, or a targeted run beside a full one,
+    /// is enough to trigger it.
+    ///
+    /// Dropping rather than calling `remove_dir_all` at the end of each test also means a
+    /// panicking test cleans up after itself; the old placement left the directory behind,
+    /// which is how 7.9 GB of fixtures accumulated in `/tmp`.
+    struct TestTmpDir(PathBuf);
+
+    impl TestTmpDir {
+        fn new(name: &str) -> Self {
+            let dir = std::env::temp_dir()
+                .join(format!("cp-thumb-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TestTmpDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
     fn test_lock() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
@@ -783,8 +817,8 @@ mod tests {
     #[test]
     fn analyzer_hook_fires_once_per_decode() {
         let _guard = test_lock();
-        let tmp = std::env::temp_dir().join(format!("cp-thumb-hook-{:016x}", fnv1a("hook")));
-        std::fs::create_dir_all(&tmp).unwrap();
+        let tmp_dir = TestTmpDir::new("hook");
+        let tmp = tmp_dir.path().to_path_buf();
         std::env::set_var("XDG_CACHE_HOME", tmp.join("cache"));
         let counter = install_decode_counter();
 
@@ -809,14 +843,13 @@ mod tests {
         if let Ok(mut list) = analyzers().lock() {
             list.clear();
         }
-        std::fs::remove_dir_all(&tmp).ok();
     }
 
     #[test]
     fn single_small_request_does_not_over_decode() {
         let _guard = test_lock();
-        let tmp = std::env::temp_dir().join(format!("cp-thumb-nodecode-{:016x}", fnv1a("nodecode")));
-        std::fs::create_dir_all(&tmp).unwrap();
+        let tmp_dir = TestTmpDir::new("nodecode");
+        let tmp = tmp_dir.path().to_path_buf();
         std::env::set_var("XDG_CACHE_HOME", tmp.join("cache"));
         let counter = install_decode_counter();
 
@@ -843,14 +876,13 @@ mod tests {
         if let Ok(mut list) = analyzers().lock() {
             list.clear();
         }
-        std::fs::remove_dir_all(&tmp).ok();
     }
 
     #[test]
     fn chain_matches_independent_generation() {
         let _guard = test_lock();
-        let tmp = std::env::temp_dir().join(format!("cp-thumb-chain-{:016x}", fnv1a("chain")));
-        std::fs::create_dir_all(&tmp).unwrap();
+        let tmp_dir = TestTmpDir::new("chain");
+        let tmp = tmp_dir.path().to_path_buf();
 
         // Two identical rasters at distinct paths → distinct cache keys, no cross-talk.
         let chain_img = write_test_jpeg(&tmp, "chain.jpg", 2400, 1600);
@@ -886,6 +918,5 @@ mod tests {
         if let Ok(mut list) = analyzers().lock() {
             list.clear();
         }
-        std::fs::remove_dir_all(&tmp).ok();
     }
 }

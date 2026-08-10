@@ -522,26 +522,40 @@ pub struct SmarttagsTrainResult {
 /// catalog mutex for the whole run, so every UI read (grid, inspector, tag panel) blocks
 /// behind it. The per-tag cost is small; the whole-catalog cost on a large library is not.
 ///
-/// So the run is split into three phases, and the lock is **released** around the only part
-/// that does not touch SQLite:
+/// So the run is split into three phases, and the primary lock is held only for the first
+/// and last:
 ///
-/// 1. **Scan** (locked, cheap) — read the min-samples setting and decide which tags are
-///    stale. Counts and timestamps only, never embeddings.
-/// 2. **Load and train** (per tag) — take the lock just long enough to read one tag's
-///    embeddings, release it, then train with no lock held. Only the trained classifier
-///    (weights + bias, a few KB) is kept, so peak memory is one tag's training set rather
-///    than the whole catalog's — which is what snapshotting every stale tag up front would
-///    have cost.
+/// 1. **Locate** (locked, trivial) — read the database path and the min-samples setting.
+/// 2. **Read and train** (unlocked) — on a **secondary connection**, inside a single
+///    deferred read transaction: decide which tags are stale, then per tag load its
+///    embeddings and train. Only the trained classifier (weights + bias, a few KB) is kept.
 /// 3. **Persist** (locked, one transaction) — write every classifier back at once.
+///
+/// ## Why a read transaction, and why per tag
+///
+/// The reads have to agree with each other. Without a transaction each `SELECT` is its own
+/// implicit read, so the staleness scan and the per-tag loads could see different states —
+/// a tag could gain photos between being judged stale and having its embeddings read, and
+/// the resulting classifier would describe a catalog that never existed. Holding the primary
+/// mutex would not have fixed that: the embedding writer is the Smart Tagging index job,
+/// which writes through its own secondary connection and never takes that lock. The old
+/// single-lock version had the same hole; it was just narrower.
+///
+/// WAL gives a deferred read transaction a stable snapshot for its whole life without
+/// blocking writers, so the run reads one consistent catalog while the app keeps working.
+///
+/// Loading **per tag** inside that snapshot, rather than snapshotting every stale tag's
+/// embeddings up front, is what keeps peak memory at one training set. Consistency comes
+/// from the transaction, not from holding everything in RAM at once.
 ///
 /// ## Catalog switches
 ///
-/// Releasing the lock means the catalog handle can be replaced mid-run by `switch_catalog`
-/// or `set_library_root`. Writing phase-3 results into a catalog the user has left would
-/// violate the ownership invariant, so each re-acquisition checks that the open catalog is
-/// still the same database and abandons the run if it is not. This is deliberately a guard
-/// rather than an abort generation: the run holds no job slot, publishes no progress, and
-/// nothing can observe it except its own return value.
+/// The catalog handle can be replaced mid-run by `switch_catalog` or `set_library_root`.
+/// Writing phase-3 results into a catalog the user has left would violate the ownership
+/// invariant, so the write re-acquisition checks that the open catalog is still the same
+/// database and abandons the run if it is not. This is deliberately a guard rather than an
+/// abort generation: the run holds no job slot, publishes no progress, and nothing can
+/// observe it except its own return value.
 #[cfg(feature = "smarttags")]
 #[tauri::command]
 pub async fn smarttags_train_classifiers(
@@ -573,55 +587,57 @@ fn train_classifiers_phased(
         classifier, MIN_TRAIN_SAMPLES_DEFAULT, MIN_TRAIN_SAMPLES_KEY,
     };
 
-    {
-        // The database this run belongs to. Every later re-acquisition is checked against
-        // it, so a switch mid-run ends the run instead of writing into the new catalog.
-        let (db_path, scan) = {
-            let guard = catalog.lock().map_err(|e| e.to_string())?;
-            let c = guard.as_ref().ok_or("No catalog is open")?;
-            let min_samples: usize = c
-                .get_setting(MIN_TRAIN_SAMPLES_KEY)
-                .ok()
-                .flatten()
-                .and_then(|s| s.parse::<usize>().ok())
-                .unwrap_or(MIN_TRAIN_SAMPLES_DEFAULT);
-            let scan = classifier::scan_stale_tags(c.conn(), min_samples)?;
-            (c.db_path().to_path_buf(), scan)
-        };
+    // Phase 1 — locked, trivial: which database, and how many samples qualify a tag. The
+    // path is what every later step is checked against, so a switch mid-run ends the run
+    // instead of writing into the new catalog.
+    let (db_path, root, min_samples) = {
+        let guard = catalog.lock().map_err(|e| e.to_string())?;
+        let c = guard.as_ref().ok_or("No catalog is open")?;
+        let min_samples: usize = c
+            .get_setting(MIN_TRAIN_SAMPLES_KEY)
+            .ok()
+            .flatten()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(MIN_TRAIN_SAMPLES_DEFAULT);
+        (c.db_path().to_path_buf(), c.root().to_path_buf(), min_samples)
+    };
 
-        let mut trained = Vec::new();
-        for tag_path in &scan.stale {
-            let set = {
-                let guard = catalog.lock().map_err(|e| e.to_string())?;
-                let c = guard.as_ref().ok_or("No catalog is open")?;
-                if c.db_path() != db_path {
-                    return Err(SWITCHED_MID_TRAIN.to_string());
-                }
-                classifier::load_training_set(c.conn(), tag_path)?
-            };
-            // Lock released — the expensive part runs without it.
-            let Some(set) = set else { continue };
-            between_load_and_train();
-            if let Some(clf) = classifier::train(&set.positives, &set.negatives) {
-                trained.push((set.tag_path, clf));
-            }
+    // Phase 2 — unlocked: one secondary connection, one deferred read transaction, so the
+    // staleness scan and every per-tag load see the same catalog.
+    let reader = Catalog::open_secondary(&db_path, &root).map_err(|e| e.to_string())?;
+    let snapshot = reader.conn().unchecked_transaction().map_err(|e| e.to_string())?;
+
+    let scan = classifier::scan_stale_tags(&snapshot, min_samples)?;
+    let mut trained = Vec::new();
+    for tag_path in &scan.stale {
+        let Some(set) = classifier::load_training_set(&snapshot, tag_path)? else {
+            continue;
+        };
+        between_load_and_train();
+        if let Some(clf) = classifier::train(&set.positives, &set.negatives) {
+            trained.push((set.tag_path, clf));
         }
-
-        let written = {
-            let guard = catalog.lock().map_err(|e| e.to_string())?;
-            let c = guard.as_ref().ok_or("No catalog is open")?;
-            if c.db_path() != db_path {
-                return Err(SWITCHED_MID_TRAIN.to_string());
-            }
-            classifier::persist_classifiers(c.conn(), &trained)?
-        };
-
-        Ok(SmarttagsTrainResult {
-            examined: scan.examined,
-            trained: written,
-            skipped: scan.skipped,
-        })
     }
+    // Read-only: end the snapshot explicitly rather than letting the drop roll it back, so
+    // the WAL stops being pinned the moment training is done.
+    snapshot.finish().map_err(|e| e.to_string())?;
+    drop(reader);
+
+    // Phase 3 — locked, one transaction.
+    let written = {
+        let guard = catalog.lock().map_err(|e| e.to_string())?;
+        let c = guard.as_ref().ok_or("No catalog is open")?;
+        if c.db_path() != db_path {
+            return Err(SWITCHED_MID_TRAIN.to_string());
+        }
+        classifier::persist_classifiers(c.conn(), &trained)?
+    };
+
+    Ok(SmarttagsTrainResult {
+        examined: scan.examined,
+        trained: written,
+        skipped: scan.skipped,
+    })
 }
 
 /// Returned when the open catalog was replaced while a training run had the lock released.
@@ -746,6 +762,62 @@ mod smarttags_training_lock_tests {
         state
     }
 
+    const TAG_A: &str = "Test/TrainableA";
+    const TAG_B: &str = "Test/TrainableB";
+
+    /// Two stale tags, 12 embedded photos each, disjoint. `scan_stale_tags` orders by
+    /// `full_path`, so A is always trained before B.
+    fn two_tag_trainable_catalog(tag: &str) -> (Catalog, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("chairphoto-smarttags-train2-{tag}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let root = dir.join("photos");
+        std::fs::create_dir_all(&root).unwrap();
+        let db = dir.join("catalog.chairphoto");
+        let catalog = Catalog::open(&db, &root).unwrap();
+
+        store::ensure_schema(catalog.conn()).unwrap();
+        classifier::ensure_schema(catalog.conn()).unwrap();
+        crate::plugins::smarttags::suggest::ensure_suggestions_schema(catalog.conn()).unwrap();
+        let a = catalog.create_tag(TAG_A).unwrap();
+        let b = catalog.create_tag(TAG_B).unwrap();
+
+        for i in 0..24usize {
+            let p = root.join(format!("p{i}.jpg"));
+            std::fs::write(&p, b"jpeg").unwrap();
+            let id = catalog.upsert_photo(&p, None, 1, 4).unwrap().id;
+            let mut v = vec![0.0f32; 512];
+            v[i % 512] = 1.0;
+            store::upsert_embedding(catalog.conn(), id, &store::embedding_to_blob(&v)).unwrap();
+            catalog.assign_tag(id, if i < 12 { a } else { b }).unwrap();
+        }
+        (catalog, db)
+    }
+
+    /// Photos currently carrying `tag_path`.
+    fn tagged_photo_count(db: &Path, tag_path: &str) -> usize {
+        let conn = rusqlite::Connection::open(db).unwrap();
+        conn.query_row(
+            "SELECT COUNT(*) FROM photo_tags pt JOIN tags t ON t.id = pt.tag_id
+              WHERE t.full_path = ?1",
+            [tag_path],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap_or(0) as usize
+    }
+
+    /// `sample_count` on the persisted classifier — the number of positives training
+    /// actually used, which is what makes the snapshot observable after the fact.
+    fn persisted_sample_count(db: &Path, tag_path: &str) -> i64 {
+        let conn = rusqlite::Connection::open(db).unwrap();
+        conn.query_row(
+            "SELECT sample_count FROM smarttags__classifiers WHERE tag_path = ?1",
+            [tag_path],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap_or(-1)
+    }
+
     /// Rows in `smarttags__classifiers`, counting an absent table as zero.
     fn classifier_count(db: &Path) -> i64 {
         let conn = rusqlite::Connection::open(db).unwrap();
@@ -775,11 +847,68 @@ mod smarttags_training_lock_tests {
         })
         .unwrap();
 
+
         assert_eq!(hook_fired, 1, "hook never fired — the assertion above proved nothing");
         assert_eq!(result.examined, 1);
         assert_eq!(result.trained, 1);
         assert_eq!(result.skipped, 0);
         assert_eq!(classifier_count(&db), 1);
+    }
+
+    /// Everything the run reads comes from one snapshot, so a write that lands mid-run
+    /// cannot be half-included.
+    ///
+    /// The hook adds a 13th tagged photo *after* the staleness scan and after this tag's
+    /// embeddings were read. Without the read transaction the two reads are independent, so
+    /// whether the new photo is trained on depends on when it landed. With it, the run is
+    /// reading a catalog that predates the write, and `sample_count` — persisted from the
+    /// positives actually used — proves which one it saw.
+    ///
+    /// The write goes through the primary connection while phase 2 holds none of it, which
+    /// is the real interleaving: the Smart Tagging indexer writes embeddings the same way,
+    /// through a connection that never takes the catalog lock.
+    #[test]
+    fn training_reads_one_snapshot_even_when_the_catalog_changes_under_it() {
+        // Two stale tags, processed in `full_path` order, so tag B is still unread when the
+        // hook fires for tag A. A single-tag fixture cannot test this: its only read has
+        // already happened by the time the hook runs, so the write can never be observed
+        // and the test passes with or without the transaction.
+        let (catalog, db) = two_tag_trainable_catalog("snapshot");
+        let b_before = tagged_photo_count(&db, TAG_B);
+        let state = state_with(catalog);
+
+        let mut wrote = false;
+        let result = train_classifiers_phased(&state.catalog, || {
+            if wrote {
+                return;
+            }
+            wrote = true;
+            // Add a photo to tag B while tag A trains — before B has been read.
+            let guard = state.catalog.lock().unwrap();
+            let c = guard.as_ref().unwrap();
+            let tag_id = c.find_tag_id_by_path(TAG_B).unwrap().unwrap();
+            let p = c.root().join("late.jpg");
+            std::fs::write(&p, b"jpeg").unwrap();
+            let id = c.upsert_photo(&p, None, 1, 4).unwrap().id;
+            let mut v = vec![0.0f32; 512];
+            v[7] = 1.0;
+            store::upsert_embedding(c.conn(), id, &store::embedding_to_blob(&v)).unwrap();
+            c.assign_tag(id, tag_id).unwrap();
+        })
+        .unwrap();
+
+        assert!(wrote, "hook never fired — nothing was written under the run");
+        assert_eq!(result.trained, 2, "both tags should have been trained");
+        assert_eq!(
+            tagged_photo_count(&db, TAG_B),
+            b_before + 1,
+            "the fixture's own write did not land, so this proves nothing"
+        );
+        assert_eq!(
+            persisted_sample_count(&db, TAG_B),
+            b_before as i64,
+            "tag B was read after the write and picked it up — the run is not on one snapshot"
+        );
     }
 
     /// A catalog swapped in while the lock is released must not receive this run's

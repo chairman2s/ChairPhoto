@@ -474,58 +474,204 @@ fn faces_write_regions(c: &crate::catalog::Catalog, photo_id: i64) {
 // commands only wire it to the open catalog. Confirming a face also assigns the person tag
 // to the *photo* through the catalog's `assign_tag` (XMP export + cross-catalog merge).
 
-/// Run the full seed / match / cluster pipeline over all indexed faces. Idempotent and
-/// re-runnable (confirmed/ignored/manual faces are never touched, rejected pairs never
-/// re-proposed). Returns per-step counters for the UI. Runs on a blocking worker so the UI
-/// thread is never stalled.
-/// Progress payload (`faces:progress`) for a matching run: the pipeline step label plus
-/// counts. Carries no `job` field — the settings panel treats job-less progress events as
-/// matching progress (model download emits nothing).
+/// Progress payload for `faces:match_progress`: the pipeline step label plus counts, and
+/// the job id so the UI can drop stragglers from a superseded run.
+///
+/// Matching used to share `faces:progress` with indexing and be told apart by the *absence*
+/// of a `job` field. Now that matching is a real job it has a job id of its own, so it also
+/// has an event of its own — discriminating two job families by a missing field does not
+/// survive both of them having one.
 #[cfg(feature = "faces")]
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct FacesMatchProgressEvent {
     pub done: usize,
     pub total: usize,
     pub phase: &'static str,
+    pub job: u64,
 }
 
+/// Terminal event payload for `faces:match_done`.
+///
+/// The pipeline counters live here rather than in the command's return value: the command
+/// returns as soon as the job has *started*, so this event is the run's actual result, not
+/// a progress notification. `aborted` says why `outcome` may be short.
+#[cfg(feature = "faces")]
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct FacesMatchDone {
+    pub ok: bool,
+    pub outcome: Option<crate::plugins::faces::MatchOutcome>,
+    pub aborted: bool,
+    pub job: u64,
+    pub error: Option<String>,
+}
+
+/// Claim ownership of the face-matching job: snapshot the catalog, allocate the job id,
+/// trip the previous match, install this job's abort flag and claim the status slot as ONE
+/// transition, holding all three locks throughout.
+///
+/// This is `begin_smarttags_job`'s protocol applied to matching, and it is load-bearing for
+/// the same reasons — see that function for why releasing any of the three locks early
+/// leaves either a dead job owning the status slot or a worker no cancel can reach. The
+/// nested order is the repo-wide catalog -> abort -> slot.
+///
+/// Extracted from `faces_run_matching` so the transition can be driven directly by tests,
+/// which have no Tauri `AppHandle`.
+#[cfg(feature = "faces")]
+fn begin_faces_match_job(
+    state: &AppState,
+) -> Result<(PathBuf, PathBuf, Arc<AtomicBool>, u64), String> {
+    use crate::plugins::faces::matcher::MatchPhase;
+
+    let cat_guard = state.catalog.lock().map_err(|e| e.to_string())?;
+    let c = cat_guard.as_ref().ok_or("No catalog is open")?;
+    let (db_path, root) = (c.db_path().to_path_buf(), c.root().to_path_buf());
+
+    let mut abort_guard = state.faces_match_abort.lock().map_err(|e| e.to_string())?;
+    let mut slot_guard = state.faces_match_job.lock().map_err(|e| e.to_string())?;
+    let job = state.faces_match_job_seq.fetch_add(1, Ordering::Relaxed) + 1;
+    abort_guard.store(true, Ordering::Relaxed);
+    let fresh = Arc::new(AtomicBool::new(false));
+    *abort_guard = fresh.clone();
+    *slot_guard =
+        Some(FacesMatchJobStatus { job, done: 0, total: 0, phase: MatchPhase::Seed.label() });
+    Ok((db_path, root, fresh, job))
+}
+
+/// Run the full seed / match / cluster pipeline over all indexed faces as a background job.
+/// Idempotent and re-runnable (confirmed/ignored/manual faces are never touched, rejected
+/// pairs never re-proposed).
+///
+/// The command returns as soon as the job has STARTED, yielding its job id; progress arrives
+/// as `faces:match_progress` and the counters as a terminal `faces:match_done`. It runs on a
+/// blocking worker against its own secondary connection, so a matching pass no longer holds
+/// the primary catalog mutex for its whole run — which on a large library meant every grid
+/// and inspector read queued behind clustering.
+///
+/// Re-invoking while a match is running trips the old job's abort flag first, then starts a
+/// fresh run. The claim below is the same catalog -> abort -> slot transition as
+/// `faces_index_photos`; see that command for why all three locks are held across it. The
+/// matching job has its own flag and slot, so cancelling a match does not stop an index.
 #[cfg(feature = "faces")]
 #[tauri::command]
-pub async fn faces_run_matching(
-    app: AppHandle,
-    state: State<'_, AppState>,
-) -> Result<crate::plugins::faces::MatchOutcome, String> {
+pub async fn faces_run_matching(app: AppHandle, state: State<'_, AppState>) -> Result<u64, String> {
     use crate::plugins::faces::matcher::{self, MatchPhase, MatchSettings};
-    with_catalog_blocking(&state, move |c| {
-        let conn = c.conn();
-        let settings = MatchSettings::load(conn)?;
-        let now = now_secs();
+
+    let job_slot = state.faces_match_job.clone();
+    let (db_path, root, abort, job) = begin_faces_match_job(&state)?;
+
+    tauri::async_runtime::spawn_blocking(move || {
+        use crate::catalog::Catalog;
+
+        // Release the status slot — but only if a newer job hasn't already claimed it.
+        let clear_job_slot = || {
+            if let Ok(mut slot) = job_slot.lock() {
+                if slot.map(|s| s.job) == Some(job) {
+                    *slot = None;
+                }
+            }
+        };
+
+        let fail = |app: &AppHandle, error: String| {
+            let _ = app.emit(
+                "faces:match_done",
+                FacesMatchDone { ok: false, outcome: None, aborted: false, job, error: Some(error) },
+            );
+        };
+
+        // Secondary connection — never contends with the primary's UI reads.
+        let sec = match Catalog::open_secondary(&db_path, &root) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("faces_match: couldn't open secondary connection: {e}");
+                clear_job_slot();
+                fail(&app, format!("couldn't open catalog connection: {e}"));
+                return;
+            }
+        };
+
+        let settings = match MatchSettings::load(sec.conn()) {
+            Ok(s) => s,
+            Err(e) => {
+                clear_job_slot();
+                fail(&app, e.to_string());
+                return;
+            }
+        };
+
         // Forward pipeline progress to the UI, throttled: phase changes and phase ends
         // always fire; within a phase, every 25th item (steps iterate thousands of
-        // faces and per-item events would flood the IPC bridge).
+        // faces and per-item events would flood the IPC bridge). The abort flag is read
+        // on EVERY call, not only the ones that emit — throttling progress must not
+        // throttle cancellation.
         let mut last: Option<(MatchPhase, usize)> = None;
-        let mut on_progress = |phase: MatchPhase, done: usize, total: usize| {
+        let mut on_progress = |phase: MatchPhase, done: usize, total: usize| -> bool {
+            if abort.load(Ordering::Relaxed) {
+                return false;
+            }
             let fire = match last {
                 Some((p, d)) => p != phase || done >= total || done >= d + 25,
                 None => true,
             };
-            if !fire {
-                return;
+            if fire {
+                last = Some((phase, done));
+                if let Ok(mut slot) = job_slot.lock() {
+                    if slot.map(|s| s.job) == Some(job) {
+                        *slot =
+                            Some(FacesMatchJobStatus { job, done, total, phase: phase.label() });
+                    }
+                }
+                let _ = app.emit(
+                    "faces:match_progress",
+                    FacesMatchProgressEvent { done, total, phase: phase.label(), job },
+                );
             }
-            last = Some((phase, done));
-            let _ = app.emit(
-                "faces:progress",
-                FacesMatchProgressEvent { done, total, phase: phase.label() },
-            );
+            true
         };
-        Ok(matcher::run_matching_with_progress(
-            conn,
-            &settings,
-            now,
-            &mut on_progress,
-        )?)
-    })
-    .await
+
+        let result =
+            matcher::run_matching_with_progress(sec.conn(), &settings, now_secs(), &mut on_progress);
+        let aborted = abort.load(Ordering::Relaxed);
+
+        // Clear the slot before the terminal event, and only if this job still owns it.
+        clear_job_slot();
+        let _ = app.emit(
+            "faces:match_done",
+            match result {
+                Ok(outcome) => {
+                    FacesMatchDone { ok: !aborted, outcome: Some(outcome), aborted, job, error: None }
+                }
+                Err(e) => FacesMatchDone {
+                    ok: false,
+                    outcome: None,
+                    aborted,
+                    job,
+                    error: Some(e.to_string()),
+                },
+            },
+        );
+    });
+
+    Ok(job)
+}
+
+/// Snapshot of the running face-matching job, `None` when idle. Lets the panel re-attach to
+/// a run that is still going after a remount instead of showing idle.
+#[cfg(feature = "faces")]
+#[tauri::command]
+pub async fn faces_match_status(
+    state: State<'_, AppState>,
+) -> Result<Option<FacesMatchJobStatus>, String> {
+    Ok(*state.faces_match_job.lock().map_err(|e| e.to_string())?)
+}
+
+/// Cancel the running match. The pipeline stops at its next item and still emits
+/// `faces:match_done`, with `aborted: true`.
+#[cfg(feature = "faces")]
+#[tauri::command]
+pub async fn faces_match_cancel(state: State<'_, AppState>) -> Result<(), String> {
+    let guard = state.faces_match_abort.lock().map_err(|e| e.to_string())?;
+    guard.store(true, Ordering::Relaxed);
+    Ok(())
 }
 
 /// Confirm a suggested/seeded face: mark it `confirmed` AND assign the person tag to the
@@ -931,3 +1077,103 @@ pub async fn faces_suggestion_list(
 }
 
 // ── H16b: Sharpness index job ────────────────────────────────────────────────
+
+/// The face-matching job is a real job now, which means the catalog-switch protocol has to
+/// reach it: a match left running against a catalog the user has left would keep writing
+/// suggestions into it, and would keep owning a status slot the panel re-queries on mount.
+///
+/// These drive the two switch phases directly, as `commands::smarttags`' ownership tests do
+/// — the commands need a Tauri `AppHandle`, which a unit test cannot build.
+#[cfg(all(test, feature = "faces"))]
+mod faces_match_ownership_tests {
+    use super::*;
+    use crate::commands::catalog::{detach_catalog_and_trip_jobs, publish_catalog_and_reset_jobs};
+
+    fn temp_catalog(tag: &str) -> (Catalog, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("chairphoto-faces-match-own-{tag}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let root = dir.join("photos");
+        std::fs::create_dir_all(&root).unwrap();
+        let db = dir.join("catalog.chairphoto");
+        (Catalog::open(&db, &root).unwrap(), db)
+    }
+
+    fn state_with(catalog: Catalog) -> AppState {
+        let state = AppState::default();
+        *state.catalog.lock().unwrap() = Some(catalog);
+        state
+    }
+
+    /// Phase one trips the running match **and** clears its status slot. Tripping alone
+    /// would leave the old job reachable as the slot's owner, so `faces_match_status`
+    /// would keep reporting a run belonging to a catalog that is gone.
+    #[test]
+    fn a_catalog_switch_trips_and_unpublishes_a_running_match() {
+        let (cat_a, db_a) = temp_catalog("switch-a");
+        let (cat_b, _db_b) = temp_catalog("switch-b");
+        let state = state_with(cat_a);
+
+        let (db, _root, abort, job) = begin_faces_match_job(&state).unwrap();
+        assert_eq!(db, db_a);
+        assert!(!abort.load(Ordering::Relaxed));
+        assert_eq!(state.faces_match_job.lock().unwrap().map(|s| s.job), Some(job));
+
+        detach_catalog_and_trip_jobs(&state).unwrap();
+
+        assert!(abort.load(Ordering::Relaxed), "phase one must trip the running match");
+        assert!(
+            state.faces_match_job.lock().unwrap().is_none(),
+            "phase one must clear the slot, or the panel re-adopts a dead job"
+        );
+
+        // Phase two installs a fresh, un-tripped generation without reviving the old one.
+        publish_catalog_and_reset_jobs(&state, cat_b).unwrap();
+        let current = state.faces_match_abort.lock().unwrap().clone();
+        assert!(!current.load(Ordering::Relaxed), "the new generation must start clean");
+        assert!(!Arc::ptr_eq(&current, &abort), "phase two must not reuse the tripped flag");
+        assert!(abort.load(Ordering::Relaxed), "the old worker's flag must stay tripped");
+    }
+
+    /// A start that lands between the two switch phases finds no catalog and must touch
+    /// nothing — no new generation, no slot, no consumed job id — so the switch's abort
+    /// signal cannot be stranded behind a fresh, live flag.
+    #[test]
+    fn a_match_start_between_switch_phases_touches_nothing() {
+        let (cat_a, _db_a) = temp_catalog("between-a");
+        let state = state_with(cat_a);
+
+        detach_catalog_and_trip_jobs(&state).unwrap();
+
+        let before = state.faces_match_abort.lock().unwrap().clone();
+        let seq_before = state.faces_match_job_seq.load(Ordering::Relaxed);
+
+        let err = begin_faces_match_job(&state).unwrap_err();
+        assert_eq!(err, "No catalog is open");
+
+        let after = state.faces_match_abort.lock().unwrap().clone();
+        assert!(Arc::ptr_eq(&before, &after), "a start mid-switch must not install a generation");
+        assert_eq!(
+            state.faces_match_job_seq.load(Ordering::Relaxed),
+            seq_before,
+            "a rejected start must not consume a job id"
+        );
+        assert!(state.faces_match_job.lock().unwrap().is_none());
+    }
+
+    /// Starting a second match trips the first: two matching runs on one catalog would
+    /// race each other's suggestion writes.
+    #[test]
+    fn a_second_match_start_trips_the_first() {
+        let (cat, _db) = temp_catalog("supersede");
+        let state = state_with(cat);
+
+        let (_d1, _r1, first_abort, first_job) = begin_faces_match_job(&state).unwrap();
+        let (_d2, _r2, second_abort, second_job) = begin_faces_match_job(&state).unwrap();
+
+        assert!(first_abort.load(Ordering::Relaxed), "the superseded run must be tripped");
+        assert!(!second_abort.load(Ordering::Relaxed));
+        assert_ne!(first_job, second_job);
+        assert_eq!(state.faces_match_job.lock().unwrap().map(|s| s.job), Some(second_job));
+    }
+}

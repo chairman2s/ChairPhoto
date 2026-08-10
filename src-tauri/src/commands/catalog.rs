@@ -151,7 +151,7 @@ pub async fn switch_catalog(
 /// Nested acquisition is always catalog -> abort -> slot, here and in every job start that
 /// takes more than one, so this cannot invert. Both switch phases are also the only places
 /// that hold two abort locks at once, and they take them in the same order (scan, faces,
-/// sharpness, pHash, Smart Tagging).
+/// face matching, sharpness, pHash, Smart Tagging).
 ///
 /// Extracted from `switch_catalog` so the ownership transition can be driven directly by
 /// the interleaving tests in `commands::smarttags`, which have no Tauri `AppHandle`.
@@ -160,6 +160,8 @@ pub(super) fn detach_catalog_and_trip_jobs(state: &AppState) -> Result<(), Strin
     let scan_guard = state.scan_abort.lock().map_err(|e| e.to_string())?;
     #[cfg(feature = "faces")]
     let faces_guard = state.faces_abort.lock().map_err(|e| e.to_string())?;
+    #[cfg(feature = "faces")]
+    let faces_match_guard = state.faces_match_abort.lock().map_err(|e| e.to_string())?;
     let sharpness_guard = state.sharpness_abort.lock().map_err(|e| e.to_string())?;
     let phash_guard = state.phash_abort.lock().map_err(|e| e.to_string())?;
     #[cfg(feature = "smarttags")]
@@ -176,10 +178,14 @@ pub(super) fn detach_catalog_and_trip_jobs(state: &AppState) -> Result<(), Strin
     // two a newer start can already own the slot, and clearing there would wipe it.
     #[cfg(feature = "smarttags")]
     let mut smarttags_slot = state.smarttags_job.lock().map_err(|e| e.to_string())?;
+    #[cfg(feature = "faces")]
+    let mut faces_match_slot = state.faces_match_job.lock().map_err(|e| e.to_string())?;
 
     scan_guard.store(true, Ordering::Relaxed);
     #[cfg(feature = "faces")]
     faces_guard.store(true, Ordering::Relaxed);
+    #[cfg(feature = "faces")]
+    faces_match_guard.store(true, Ordering::Relaxed);
     sharpness_guard.store(true, Ordering::Relaxed);
     phash_guard.store(true, Ordering::Relaxed);
     #[cfg(feature = "smarttags")]
@@ -187,6 +193,10 @@ pub(super) fn detach_catalog_and_trip_jobs(state: &AppState) -> Result<(), Strin
     #[cfg(feature = "smarttags")]
     {
         *smarttags_slot = None;
+    }
+    #[cfg(feature = "faces")]
+    {
+        *faces_match_slot = None;
     }
     *cat_guard = None;
     Ok(())
@@ -201,7 +211,8 @@ pub(super) fn detach_catalog_and_trip_jobs(state: &AppState) -> Result<(), Strin
 /// overwrite it without tripping it — leaving a worker running that nothing can reach.
 ///
 /// Whatever is installed at this point is tripped before being replaced. Faces and Smart
-/// Tagging take the catalog lock before claiming, so neither can have installed anything
+/// Tagging — including the face *matching* job — take the catalog lock before claiming, so
+/// none of them can have installed anything
 /// while this function held it — but scan, sharpness and pHash install their generation
 /// *before* reading the catalog. One of those can therefore hold a live, un-tripped
 /// generation right now, blocked on the catalog read. Replacing it silently would leave its
@@ -228,6 +239,8 @@ pub(super) fn publish_catalog_and_reset_jobs(
     let mut scan_guard = state.scan_abort.lock().map_err(|e| e.to_string())?;
     #[cfg(feature = "faces")]
     let mut faces_guard = state.faces_abort.lock().map_err(|e| e.to_string())?;
+    #[cfg(feature = "faces")]
+    let mut faces_match_guard = state.faces_match_abort.lock().map_err(|e| e.to_string())?;
     let mut sharpness_guard = state.sharpness_abort.lock().map_err(|e| e.to_string())?;
     let mut phash_guard = state.phash_abort.lock().map_err(|e| e.to_string())?;
     #[cfg(feature = "smarttags")]
@@ -236,6 +249,8 @@ pub(super) fn publish_catalog_and_reset_jobs(
     scan_guard.store(true, Ordering::Relaxed);
     #[cfg(feature = "faces")]
     faces_guard.store(true, Ordering::Relaxed);
+    #[cfg(feature = "faces")]
+    faces_match_guard.store(true, Ordering::Relaxed);
     sharpness_guard.store(true, Ordering::Relaxed);
     phash_guard.store(true, Ordering::Relaxed);
     #[cfg(feature = "smarttags")]
@@ -245,6 +260,10 @@ pub(super) fn publish_catalog_and_reset_jobs(
     #[cfg(feature = "faces")]
     {
         *faces_guard = Arc::new(AtomicBool::new(false));
+    }
+    #[cfg(feature = "faces")]
+    {
+        *faces_match_guard = Arc::new(AtomicBool::new(false));
     }
     *sharpness_guard = Arc::new(AtomicBool::new(false));
     *phash_guard = Arc::new(AtomicBool::new(false));

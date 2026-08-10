@@ -133,6 +133,20 @@ pub struct AppState {
     /// so the UI can ignore events from a superseded job.
     #[cfg(feature = "faces")]
     pub faces_job_seq: std::sync::atomic::AtomicU64,
+    /// Abort flag for the face **matching** job (H13c), separate from `faces_abort` so
+    /// cancelling a match does not stop an index and vice versa. Same swappable-Arc
+    /// pattern: `faces_run_matching` installs a fresh flag, `faces_match_cancel` trips it,
+    /// and a catalog switch trips it under the catalog lock in both phases.
+    #[cfg(feature = "faces")]
+    pub faces_match_abort: Mutex<Arc<AtomicBool>>,
+    /// Live status of the face-matching job, `None` when idle. Same ownership rules as
+    /// `faces_job`: the worker clears it on the way out, and only if it still owns it.
+    #[cfg(feature = "faces")]
+    pub faces_match_job: Arc<Mutex<Option<FacesMatchJobStatus>>>,
+    /// Monotonic id source for face-matching jobs, independent of `faces_job_seq` so the
+    /// two job families never collide on an id.
+    #[cfg(feature = "faces")]
+    pub faces_match_job_seq: std::sync::atomic::AtomicU64,
     /// Abort flag for the sharpness-indexing job (H16b). Same swappable-Arc pattern as
     /// `scan_abort` and `faces_abort`: `index_sharpness` installs a fresh flag,
     /// `sharpness_index_cancel` trips it.
@@ -172,6 +186,19 @@ pub struct FacesJobStatus {
     pub job: u64,
     pub done: usize,
     pub total: usize,
+}
+
+/// Snapshot of the running face-matching job (`faces_match_status`).
+///
+/// Carries the pipeline step as well as the counters, because matching's `total` restarts
+/// at each phase — a bare `done`/`total` would look like the job was going backwards.
+#[cfg(feature = "faces")]
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+pub struct FacesMatchJobStatus {
+    pub job: u64,
+    pub done: usize,
+    pub total: usize,
+    pub phase: &'static str,
 }
 
 /// Snapshot of the running Smart Tagging embedding-index job (`smarttags_index_status`).

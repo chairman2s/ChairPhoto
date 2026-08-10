@@ -160,7 +160,15 @@ impl MatchPhase {
 /// Progress callback: `(phase, done, total)`. Called once with `done = 0` when a phase
 /// starts (so empty phases still announce themselves) and then per processed item —
 /// callers who forward this to the UI should throttle.
-pub type MatchProgress<'a> = &'a mut dyn FnMut(MatchPhase, usize, usize);
+///
+/// **Returns whether to keep going.** `false` stops the pipeline at the next item, which
+/// is how a cancelled or superseded job gets out of a long phase without waiting for it
+/// to finish. Callers that never cancel return `true` unconditionally.
+///
+/// Stopping early is safe because the whole pipeline is idempotent: a partial run leaves
+/// confirmed, ignored and manual faces untouched, and re-running resets and recomputes the
+/// pending ones. It is a stop, not a rollback — suggestions already written stay written.
+pub type MatchProgress<'a> = &'a mut dyn FnMut(MatchPhase, usize, usize) -> bool;
 
 // ── Internal working types ──────────────────────────────────────────────────────
 
@@ -187,7 +195,7 @@ struct Centroid {
 ///
 /// `now` is the timestamp stamped on new rows (unix seconds), injected for deterministic tests.
 pub fn run_matching(conn: &Connection, settings: &MatchSettings, now: i64) -> rusqlite::Result<MatchOutcome> {
-    run_matching_with_progress(conn, settings, now, &mut |_, _, _| {})
+    run_matching_with_progress(conn, settings, now, &mut |_, _, _| true)
 }
 
 /// [`run_matching`] with a progress callback — see [`MatchProgress`] for the contract.
@@ -201,11 +209,29 @@ pub fn run_matching_with_progress(
 
     let mut outcome = MatchOutcome::default();
 
+    // A phase that is told to stop returns early, but returning from one phase does not by
+    // itself end the pipeline — the next would start, do its own setup queries, and call
+    // progress again before stopping. Remember the refusal so the steps below can bail at
+    // the next boundary. `Cell` because the wrapper closure below borrows `progress`
+    // mutably for its whole life, and these checks read the flag while it is alive.
+    let cancelled = std::cell::Cell::new(false);
+    let mut stop_aware = |phase: MatchPhase, done: usize, total: usize| -> bool {
+        let go = progress(phase, done, total);
+        if !go {
+            cancelled.set(true);
+        }
+        go
+    };
+    let progress: MatchProgress = &mut stop_aware;
+
     // Resolve the set of person tag ids (strict descendants of the people root branch).
     let person_tags = person_tag_ids(conn, &settings.people_root)?;
 
     // Step 1 — auto-seed.
     outcome.seeded = auto_seed(conn, &person_tags, now, progress)?;
+    if cancelled.get() {
+        return Ok(outcome);
+    }
 
     // Clear stale suggestions/cluster assignments so the run is idempotent and never stacks
     // duplicate rows. Only faces that are still unassigned/suggested are reset — confirmed,
@@ -233,6 +259,9 @@ pub fn run_matching_with_progress(
             now,
             progress,
         )?;
+        if cancelled.get() {
+            return Ok(outcome);
+        }
 
         // Step 4 — open matching: nearest centroid above threshold for the remainder.
         outcome.open = open_match(
@@ -244,6 +273,9 @@ pub fn run_matching_with_progress(
             now,
             progress,
         )?;
+        if cancelled.get() {
+            return Ok(outcome);
+        }
     }
 
     // Step 5 — incremental greedy clustering for everything left.
@@ -323,10 +355,14 @@ fn auto_seed(
         .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))?
         .collect::<rusqlite::Result<_>>()?;
 
-    progress(MatchPhase::Seed, 0, candidates.len());
+    if !progress(MatchPhase::Seed, 0, candidates.len()) {
+        return Ok(0);
+    }
     let mut seeded = 0usize;
     for (done, &(photo_id, face_id)) in candidates.iter().enumerate() {
-        progress(MatchPhase::Seed, done + 1, candidates.len());
+        if !progress(MatchPhase::Seed, done + 1, candidates.len()) {
+            break;
+        }
         // The single face must still be a raw unassigned detection.
         let state: String = conn.query_row(
             "SELECT state FROM faces__faces WHERE id = ?1",
@@ -495,10 +531,14 @@ fn constrained_match(
         centroids.iter().map(|c| (c.tag_id, &c.vec)).collect();
 
     let total_photos = by_photo.len();
-    progress(MatchPhase::Constrained, 0, total_photos);
+    if !progress(MatchPhase::Constrained, 0, total_photos) {
+        return Ok(0);
+    }
     let mut suggested = 0usize;
     for (done, (photo_id, face_idxs)) in by_photo.into_iter().enumerate() {
-        progress(MatchPhase::Constrained, done + 1, total_photos);
+        if !progress(MatchPhase::Constrained, done + 1, total_photos) {
+            break;
+        }
         let ptags = photo_person_tags(conn, photo_id, person_tags)?;
         // Only people that actually have a centroid can be matched.
         let people: Vec<i64> = ptags
@@ -563,10 +603,14 @@ fn open_match(
     now: i64,
     progress: MatchProgress,
 ) -> rusqlite::Result<usize> {
-    progress(MatchPhase::Open, 0, pending.len());
+    if !progress(MatchPhase::Open, 0, pending.len()) {
+        return Ok(0);
+    }
     let mut suggested = 0usize;
     for (done, f) in pending.iter().enumerate() {
-        progress(MatchPhase::Open, done + 1, pending.len());
+        if !progress(MatchPhase::Open, done + 1, pending.len()) {
+            break;
+        }
         // Skip faces already resolved by constrained matching (step 3).
         if resolved.contains(&f.id) {
             continue;
@@ -615,10 +659,14 @@ fn cluster_leftovers(
     conn.execute("DELETE FROM faces__clusters", [])?;
     let mut clusters: Vec<(i64, Vec<f32>, usize)> = Vec::new();
 
-    progress(MatchPhase::Cluster, 0, pending.len());
+    if !progress(MatchPhase::Cluster, 0, pending.len()) {
+        return Ok(0);
+    }
     let mut clustered = 0usize;
     for (done, f) in pending.iter().enumerate() {
-        progress(MatchPhase::Cluster, done + 1, pending.len());
+        if !progress(MatchPhase::Cluster, done + 1, pending.len()) {
+            break;
+        }
         if resolved.contains(&f.id) {
             continue;
         }
@@ -1067,6 +1115,56 @@ mod tests {
     // ── Auto-seed rules ───────────────────────────────────────────────────────────
 
     /// 1 face + 1 person tag → seeded (confirmed, source=seed).
+    /// A progress callback that returns `false` stops the pipeline instead of running it
+    /// to completion — the mechanism `faces_run_matching` uses to honour Cancel and to get
+    /// out of a superseded run without waiting for clustering to finish.
+    ///
+    /// Seeding is the first phase, so stopping at its first item means nothing downstream
+    /// runs: no suggestions, no clusters. The comparison run is the same fixture with a
+    /// callback that always returns `true`, which is what makes this a cancellation test
+    /// rather than a test that the fixture happens to produce nothing.
+    #[test]
+    fn a_progress_callback_returning_false_stops_the_pipeline() {
+        let build = || {
+            let conn = mem_conn();
+            let alice = add_person(&conn, 100, "Alice");
+            for photo in 1..=6i64 {
+                add_photo(&conn, photo);
+                tag_photo(&conn, photo, alice);
+                add_face(&conn, photo, &embed(0, 0.01 * photo as f32));
+            }
+            conn
+        };
+        let settings = MatchSettings::default();
+
+        // Baseline: run to completion.
+        let full = build();
+        let mut calls = 0usize;
+        let done = run_matching_with_progress(&full, &settings, 0, &mut |_, _, _| {
+            calls += 1;
+            true
+        })
+        .unwrap();
+        assert!(done.seeded > 0, "fixture seeds nothing, so stopping it would prove nothing");
+        let full_calls = calls;
+
+        // Cancelled: refuse to continue at the very first callback.
+        let stopped_conn = build();
+        let mut seen = 0usize;
+        let stopped = run_matching_with_progress(&stopped_conn, &settings, 0, &mut |_, _, _| {
+            seen += 1;
+            false
+        })
+        .unwrap();
+
+        assert_eq!(seen, 1, "the pipeline kept calling progress after being told to stop");
+        assert!(seen < full_calls);
+        assert_eq!(stopped.seeded, 0);
+        assert_eq!(stopped.constrained, 0);
+        assert_eq!(stopped.open, 0);
+        assert_eq!(stopped.clustered, 0);
+    }
+
     #[test]
     fn seed_one_face_one_tag() {
         let conn = mem_conn();

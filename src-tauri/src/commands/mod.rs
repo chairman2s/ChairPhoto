@@ -247,7 +247,7 @@ fn with_catalog<T>(
 /// Like `with_catalog`, but runs the closure on a blocking worker thread so the
 /// main thread and the async runtime are never stalled by SQLite work.
 async fn with_catalog_blocking<T: Send + 'static>(
-    state: &State<'_, AppState>,
+    state: &AppState,
     f: impl FnOnce(&Catalog) -> crate::catalog::Result<T> + Send + 'static,
 ) -> Result<T, String> {
     let catalog = state.catalog.clone();
@@ -354,4 +354,3 @@ fn expand_home(path: &str) -> PathBuf {
     }
     PathBuf::from(path)
 }
-

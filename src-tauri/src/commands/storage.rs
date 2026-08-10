@@ -148,9 +148,17 @@ pub async fn relocate_photo(
     new_path: String,
 ) -> Result<(), String> {
     let path = expand_home(&new_path);
+    relocate_photo_in_state(&state, photo_id, path).await
+}
+
+async fn relocate_photo_in_state(
+    state: &AppState,
+    photo_id: i64,
+    path: PathBuf,
+) -> Result<(), String> {
     let target = path.clone();
     let bind_path = path.clone();
-    let (uuid, db_path, root) = with_catalog_blocking(&state, move |c| {
+    let (uuid, db_path, root) = with_catalog_blocking(state, move |c| {
         let uuid = c.relocate_photo(photo_id, &target)?;
         Ok((uuid, c.db_path().to_path_buf(), c.root().to_path_buf()))
     })
@@ -209,6 +217,88 @@ async fn record_identity_on_catalog(
     })
     .await
     .map_err(|e| e.to_string())?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::catalog::{Catalog, LocationRole, VolumeKind};
+
+    fn temp_catalog(tag: &str) -> (Catalog, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("chairphoto-storage-command-test-{tag}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let root = dir.join("photos");
+        std::fs::create_dir_all(&root).unwrap();
+        let catalog = Catalog::open(&dir.join("test.chairphoto"), &root).unwrap();
+        (catalog, root)
+    }
+
+    fn state_with(catalog: Catalog) -> AppState {
+        let state = AppState::default();
+        *state.catalog.lock().unwrap() = Some(catalog);
+        state
+    }
+
+    #[test]
+    fn relocate_records_identity_debt_for_the_moved_copy() {
+        let (catalog, root) = temp_catalog("relocate-identity-target");
+        let old = root.join("old/DSC0007.ARW");
+        std::fs::create_dir_all(old.parent().unwrap()).unwrap();
+        std::fs::write(&old, b"old-raw").unwrap();
+        let up = catalog.upsert_photo(&old, None, 1, 7).unwrap();
+
+        let backup_dir = root.parent().unwrap().join("backup-relocate");
+        std::fs::create_dir_all(&backup_dir).unwrap();
+        let backup = backup_dir.join("DSC0007.ARW");
+        std::fs::write(&backup, b"backup-raw").unwrap();
+        let backup_volume = catalog
+            .add_volume("Backup", &backup_dir, VolumeKind::Backup)
+            .unwrap();
+        catalog
+            .add_location(up.id, backup_volume, "DSC0007.ARW", LocationRole::Backup)
+            .unwrap();
+
+        let moved = root.join("new/DSC0007.ARW");
+        std::fs::create_dir_all(moved.parent().unwrap()).unwrap();
+        std::fs::write(&moved, b"moved-raw").unwrap();
+        std::fs::write(
+            crate::xmp::sidecar_path(&moved),
+            b"<x:xmpmeta xmlns:x=\"adobe:ns:meta/\"><rdf:RDF",
+        )
+        .unwrap();
+
+        let state = state_with(catalog);
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(relocate_photo_in_state(&state, up.id, moved.clone()))
+            .unwrap();
+
+        let guard = state.catalog.lock().unwrap();
+        let catalog = guard.as_ref().unwrap();
+        let pending = catalog.list_pending_identity().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].photo_id, up.id);
+        assert_eq!(pending[0].field, "identifier");
+        assert_eq!(PathBuf::from(&pending[0].target_path), moved);
+        assert!(
+            pending[0].error.contains("sidecar write failed"),
+            "the corrupt moved sidecar should be recorded, got {:?}",
+            pending[0].error
+        );
+
+        std::fs::remove_file(&moved).unwrap();
+        let summary = catalog.repair_pending_identity().unwrap();
+        assert_eq!(
+            (summary.repaired, summary.failed, summary.unreachable),
+            (0, 0, 1),
+            "repair must stay scoped to the moved copy, even while another copy is reachable"
+        );
+        assert!(
+            crate::xmp::read_identifier(&backup).is_none(),
+            "repairing the moved copy's debt must not bind the backup copy"
+        );
+        assert_eq!(catalog.count_pending_identity().unwrap(), 1);
+    }
 }
 
 /// A catalog photo whose original is gone (for the cleanup preview/report).

@@ -4015,7 +4015,7 @@ fn scan_read_only_storage_queues_import_batch_sidecar_debt() {
 
 #[cfg(unix)]
 #[test]
-fn card_ingest_queues_import_batch_sidecar_debt_and_repairs_it() {
+fn card_ingest_queues_identity_and_import_batch_sidecar_debt() {
     use chairphoto_lib::scanner::{copy_from_card, index_ingested};
 
     let (catalog, root) = temp_catalog("batch-sidecar-ingest-readonly");
@@ -4061,11 +4061,115 @@ fn card_ingest_queues_import_batch_sidecar_debt_and_repairs_it() {
         (summary.repaired, summary.failed, summary.unreachable),
         (2, 0, 0)
     );
+    let photo = catalog
+        .list_photos(
+            None,
+            None,
+            None,
+            &[],
+            "all",
+            None,
+            "all",
+            None,
+            None,
+            &[],
+            None,
+        )
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+    assert_eq!(
+        chairphoto_lib::xmp::read_identifier(&dest).as_deref(),
+        Some(photo.uuid.as_str())
+    );
     assert_eq!(
         chairphoto_lib::xmp::read_import_batch(&dest).as_deref(),
         Some(batch_uuid.as_str())
     );
     assert!(catalog.list_pending_identity().unwrap().is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn bundle_import_queues_identity_sidecar_debt_for_unwritable_extracted_copy() {
+    use chairphoto_lib::bundle::importer::{extract_originals, index_bundle, open_bundle};
+    use chairphoto_lib::bundle::writer::{gather_bundle, write_bundle};
+
+    let (cat_a, _root_a, _uuid1, _uuid2, batch_id_a) = setup_catalog_a("identity-bundle-a");
+    let bundle_zip = std::env::temp_dir().join(format!(
+        "chairphoto-bundle-identity-readonly-{}.chairphoto",
+        std::process::id()
+    ));
+    let _guard = {
+        struct Rm(PathBuf);
+        impl Drop for Rm {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+        Rm(bundle_zip.clone())
+    };
+    let gathered = gather_bundle(&cat_a, batch_id_a)
+        .unwrap()
+        .expect("batch must export");
+    write_bundle(&gathered, &bundle_zip, |_, _| {}).unwrap();
+
+    let (cat_b, root_b) = temp_catalog("identity-bundle-b");
+    let (manifest, mut archive) = open_bundle(&bundle_zip).unwrap();
+    let (extracted, partial) =
+        extract_originals(&manifest, &mut archive, &root_b, |_, _| {}).unwrap();
+    assert_eq!(extracted.len(), 2);
+
+    let target = extracted[0].dest.clone();
+    let target_uuid = extracted[0].photo_uuid.clone();
+    let sidecar = chairphoto_lib::xmp::sidecar_path(&target);
+    assert!(
+        sidecar.exists(),
+        "extract_originals normally writes the bundle UUID before indexing"
+    );
+    std::fs::remove_file(&sidecar).unwrap();
+    let sidecar_dir = target.parent().unwrap().to_path_buf();
+    let Some(guard) = read_only_dir(&sidecar_dir) else {
+        return;
+    };
+
+    let result = index_bundle(&cat_b, &manifest, &extracted, &root_b, partial).unwrap();
+    assert_eq!(result.errors, 0, "the bundle import still succeeds");
+    let imported = cat_b
+        .get_photo_by_uuid(&target_uuid)
+        .expect("the extracted photo is catalogued");
+
+    let pending = cat_b.list_pending_identity().unwrap();
+    assert_eq!(
+        pending_sidecar_field_count(&pending, "identifier"),
+        1,
+        "the bundle indexer records UUID sidecar debt for the imported copy"
+    );
+    let identifier = pending.iter().find(|p| p.field == "identifier").unwrap();
+    assert_eq!(identifier.photo_id, imported.id);
+    assert_eq!(PathBuf::from(&identifier.target_path), target);
+    assert!(
+        chairphoto_lib::xmp::read_identifier(&target).is_none(),
+        "the read-only destination could not be updated yet"
+    );
+
+    drop(guard);
+    let summary = cat_b.repair_pending_identity().unwrap();
+    assert_eq!(
+        (summary.failed, summary.unreachable),
+        (0, 0),
+        "the queued UUID repair should complete once the destination is writable"
+    );
+    assert!(
+        summary.repaired >= 1,
+        "at least the queued UUID field should be repaired"
+    );
+    assert_eq!(
+        chairphoto_lib::xmp::read_identifier(&target).as_deref(),
+        Some(imported.uuid.as_str())
+    );
+    assert!(cat_b.list_pending_identity().unwrap().is_empty());
 }
 
 #[test]

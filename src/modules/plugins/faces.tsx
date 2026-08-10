@@ -2453,7 +2453,10 @@ function FacesSettings({ api }: { api: ChairPhotoAPI }) {
         >
           {jobPhase === "matching" ? "Matching…" : "Run matching"}
         </button>
-        {jobPhase === "indexing" && (
+        {/* Shown for either job. `handleCancel` trips whichever flag belongs to the one
+            that is running — gating this on "indexing" alone would leave matching
+            cancellable by the backend and by the docs, but not by the user. */}
+        {jobPhase !== "idle" && (
           <button className="chip" onClick={handleCancel}>
             Cancel
           </button>

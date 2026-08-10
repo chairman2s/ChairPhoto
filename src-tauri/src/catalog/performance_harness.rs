@@ -777,9 +777,9 @@ fn seed_photos(
         tx.prepare("INSERT INTO pending_enrichment(photo_id, queued_at) VALUES(?1, ?2)")?;
     let mut insert_pending_identity = tx.prepare(
         "INSERT INTO pending_sidecar_identity(
-            photo_id, volume_id, relative_path, attempts, error, queued_at, last_attempt_at
+            photo_id, field, volume_id, relative_path, attempts, error, queued_at, last_attempt_at
          )
-         VALUES(?1, ?2, ?3, 1, ?4, ?5, ?5)",
+         VALUES(?1, 'identifier', ?2, ?3, 1, ?4, ?5, ?5)",
     )?;
 
     for index in 0..config.photo_count {

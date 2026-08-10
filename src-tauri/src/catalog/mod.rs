@@ -298,6 +298,7 @@ impl Catalog {
             .get_setting("schema_version")?
             .and_then(|v| v.parse().ok())
             .unwrap_or(0);
+        self.migrate_sidecar_identity_fields()?;
         if prior_version < 2 {
             // Introduce the physical-location layer: default volume + backfill.
             self.backfill_default_volume()?;
@@ -341,6 +342,44 @@ impl Catalog {
             self.conn
                 .execute(&format!("ALTER TABLE {table} ADD COLUMN {column} {declaration}"), [])?;
         }
+        Ok(())
+    }
+
+    /// Schema v21: generalize the sidecar repair queue from one UUID debt per copy to
+    /// one sidecar-field debt per copy. SQLite cannot alter a primary key in place, so
+    /// v20 catalogs are rebuilt and their existing rows become `field = 'identifier'`.
+    fn migrate_sidecar_identity_fields(&self) -> Result<()> {
+        let mut stmt = self.conn.prepare("PRAGMA table_info(pending_sidecar_identity)")?;
+        let columns: Vec<String> = stmt
+            .query_map([], |r| r.get::<_, String>(1))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        if columns.iter().any(|column| column == "field") {
+            return Ok(());
+        }
+
+        self.conn.execute_batch(
+            "CREATE TABLE pending_sidecar_identity_v21 (
+                photo_id        INTEGER NOT NULL REFERENCES photos(id) ON DELETE CASCADE,
+                field           TEXT NOT NULL DEFAULT 'identifier'
+                                CHECK (field IN ('identifier', 'import_batch')),
+                volume_id       INTEGER NOT NULL REFERENCES volumes(id) ON DELETE CASCADE,
+                relative_path   TEXT NOT NULL,
+                attempts        INTEGER NOT NULL DEFAULT 1,
+                error           TEXT NOT NULL DEFAULT '',
+                queued_at       INTEGER NOT NULL,
+                last_attempt_at INTEGER NOT NULL,
+                PRIMARY KEY(photo_id, field, volume_id, relative_path)
+             );
+             INSERT OR IGNORE INTO pending_sidecar_identity_v21
+                (photo_id, field, volume_id, relative_path, attempts, error, queued_at, last_attempt_at)
+             SELECT photo_id, 'identifier', volume_id, relative_path, attempts, error,
+                    queued_at, last_attempt_at
+             FROM pending_sidecar_identity;
+             DROP TABLE pending_sidecar_identity;
+             ALTER TABLE pending_sidecar_identity_v21 RENAME TO pending_sidecar_identity;
+             CREATE INDEX IF NOT EXISTS idx_pending_sidecar_identity_photo
+                ON pending_sidecar_identity(photo_id);",
+        )?;
         Ok(())
     }
 

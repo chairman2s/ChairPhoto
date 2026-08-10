@@ -1,5 +1,5 @@
-//! Photo identity binding: keeping a photo's UUID in BOTH the catalog row and the
-//! file's `xmp:Identifier` sidecar (AGENTS.md, "Photo identity").
+//! Sidecar identity binding: keeping portable catalog identity in BOTH SQLite and the
+//! file's XMP sidecar.
 //!
 //! The catalog half is trivial — the row cannot exist without a UUID. The disk half
 //! can fail: the storage may be read-only, the existing sidecar may not parse, the
@@ -9,7 +9,7 @@
 //! a merge or a re-import can no longer recognise the file, and nothing in the catalog
 //! remembers that it should.
 //!
-//! So the observable operation is: **bind the identity, or record a retryable repair**.
+//! So the observable operation is: **bind the sidecar field, or record a retryable repair**.
 //! [`bind_sidecar_identity`] is the pure-IO half (no catalog, safe to run off the lock),
 //! [`Catalog::record_sidecar_identity`] the DB half, and [`Catalog::ensure_sidecar_identity`]
 //! composes them for callers that already hold a connection off the main lock (the
@@ -17,16 +17,48 @@
 //! queue; the plan → IO → record split ([`Catalog::plan_identity_repairs`] +
 //! [`IdentityRepairPlan::run`]) exists so the command layer can do the sidecar IO
 //! without holding the catalog lock, mirroring the storage lifecycle in `lifecycle.rs`.
+//!
+//! `pending_sidecar_identity` is still named for the original UUID debt, but it now carries
+//! a `field` discriminator so the same retry path also covers `chairphoto:ImportBatch`.
 
 use super::{Catalog, Result};
 use rusqlite::params;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// What happened when we tried to put a photo's UUID in its sidecar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SidecarField {
+    Identifier,
+    ImportBatch,
+}
+
+impl SidecarField {
+    fn as_db_str(self) -> &'static str {
+        match self {
+            SidecarField::Identifier => "identifier",
+            SidecarField::ImportBatch => "import_batch",
+        }
+    }
+
+    fn from_db_str(value: &str) -> Self {
+        match value {
+            "import_batch" => SidecarField::ImportBatch,
+            _ => SidecarField::Identifier,
+        }
+    }
+
+    fn missing_value_message(self) -> String {
+        match self {
+            SidecarField::Identifier => "photo UUID is missing".to_string(),
+            SidecarField::ImportBatch => "photo has no import batch UUID".to_string(),
+        }
+    }
+}
+
+/// What happened when we tried to put a portable identity field in a sidecar.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SidecarIdentity {
-    /// The sidecar carries this photo's UUID (it already did, or we just wrote it).
+    /// The sidecar carries the requested value (it already did, or we just wrote it).
     Bound,
     /// The queued copy is not reachable right now (offline/unmounted volume, or the
     /// original is gone). A normal state, not corruption — retry when it returns.
@@ -75,13 +107,37 @@ pub fn bind_sidecar_identity(
     }
 }
 
-/// A photo whose sidecar still owes it its UUID, with the last failure.
+fn bind_sidecar_import_batch(photo_path: &Path, batch_uuid: &str) -> SidecarIdentity {
+    match crate::xmp::write_import_batch(photo_path, batch_uuid) {
+        Ok(()) => SidecarIdentity::Bound,
+        Err(e) => SidecarIdentity::Unwritable(e),
+    }
+}
+
+fn pending_sidecar_value(
+    field_text: &str,
+    photo_uuid: &str,
+    import_batch_uuid: Option<String>,
+) -> (SidecarField, Option<String>) {
+    let field = SidecarField::from_db_str(field_text);
+    let value = match field {
+        SidecarField::Identifier => Some(photo_uuid.to_string()),
+        SidecarField::ImportBatch => import_batch_uuid,
+    };
+    (field, value)
+}
+
+/// A photo whose sidecar still owes it a portable identity field, with the last failure.
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PendingIdentity {
     pub photo_id: i64,
     /// The identity that must reach the sidecar (`photos.uuid`).
     pub uuid: String,
+    /// The sidecar field still owed by this copy: `identifier` or `import_batch`.
+    pub field: String,
+    /// The value that must be written for `field` (photo UUID or import batch UUID).
+    pub value: Option<String>,
     /// The photo's catalog-root-relative logical path, for display.
     pub path: String,
     /// The volume that contains the copy whose sidecar is pending.
@@ -97,9 +153,10 @@ pub struct PendingIdentity {
 /// One copy's repair, planned under the catalog lock and runnable without it.
 pub struct IdentityRepairPlan {
     pub photo_id: i64,
+    field: SidecarField,
     volume_id: i64,
     relative_path: String,
-    uuid: String,
+    value: Option<String>,
     /// The physical copy whose sidecar failed earlier.
     target_path: PathBuf,
 }
@@ -112,16 +169,25 @@ impl IdentityRepairPlan {
             return SidecarIdentity::Unreachable;
         }
 
-        let found = crate::xmp::read_identifier(&self.target_path);
-        bind_sidecar_identity(&self.target_path, &self.uuid, found.as_deref())
+        let Some(value) = self.value.as_deref() else {
+            return SidecarIdentity::Unwritable(self.field.missing_value_message());
+        };
+
+        match self.field {
+            SidecarField::Identifier => {
+                let found = crate::xmp::read_identifier(&self.target_path);
+                bind_sidecar_identity(&self.target_path, value, found.as_deref())
+            }
+            SidecarField::ImportBatch => bind_sidecar_import_batch(&self.target_path, value),
+        }
     }
 }
 
-/// Outcome of a repair pass over the pending-identity queue.
+/// Outcome of a repair pass over the pending sidecar-identity queue.
 #[derive(Debug, Default, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct IdentityRepairSummary {
-    /// Identity now on disk for this queued copy; the pending row was cleared.
+    /// Sidecar field now on disk for this queued copy; the pending row was cleared.
     pub repaired: usize,
     /// The queued copy is not reachable right now — left queued for the next pass.
     pub unreachable: usize,
@@ -141,9 +207,9 @@ impl IdentityRepairSummary {
 }
 
 impl Catalog {
-    /// Record the outcome of an identity binding for one physical copy: clear that
-    /// copy's repair row when the identity reached its sidecar, otherwise queue (or
-    /// re-stamp) that same copy for repair.
+    /// Record the outcome of a UUID binding for one physical copy: clear that copy's
+    /// identifier repair row when the identity reached its sidecar, otherwise queue
+    /// (or re-stamp) that same copy for repair.
     ///
     /// This is the *only* place the queue is written, so a re-scan doubles as a repair
     /// pass for the file it re-reads without hiding debt for another copy.
@@ -154,12 +220,35 @@ impl Catalog {
         outcome: &SidecarIdentity,
     ) -> Result<()> {
         let (volume_id, relative_path) = self.volume_for_path(photo_path)?;
-        self.record_sidecar_identity_target(photo_id, volume_id, &relative_path, outcome)
+        self.record_sidecar_field_target(
+            photo_id,
+            SidecarField::Identifier,
+            volume_id,
+            &relative_path,
+            outcome,
+        )
     }
 
-    fn record_sidecar_identity_target(
+    fn record_sidecar_import_batch(
         &self,
         photo_id: i64,
+        photo_path: &Path,
+        outcome: &SidecarIdentity,
+    ) -> Result<()> {
+        let (volume_id, relative_path) = self.volume_for_path(photo_path)?;
+        self.record_sidecar_field_target(
+            photo_id,
+            SidecarField::ImportBatch,
+            volume_id,
+            &relative_path,
+            outcome,
+        )
+    }
+
+    fn record_sidecar_field_target(
+        &self,
+        photo_id: i64,
+        field: SidecarField,
         volume_id: i64,
         relative_path: &str,
         outcome: &SidecarIdentity,
@@ -167,21 +256,28 @@ impl Catalog {
         if matches!(outcome, SidecarIdentity::Bound) {
             self.conn.execute(
                 "DELETE FROM pending_sidecar_identity
-                 WHERE photo_id = ?1 AND volume_id = ?2 AND relative_path = ?3",
-                params![photo_id, volume_id, relative_path],
+                 WHERE photo_id = ?1 AND field = ?2 AND volume_id = ?3 AND relative_path = ?4",
+                params![photo_id, field.as_db_str(), volume_id, relative_path],
             )?;
             return Ok(());
         }
         let ts = now();
         self.conn.execute(
             "INSERT INTO pending_sidecar_identity
-                 (photo_id, volume_id, relative_path, attempts, error, queued_at, last_attempt_at)
-             VALUES(?1, ?2, ?3, 1, ?4, ?5, ?5)
-             ON CONFLICT(photo_id, volume_id, relative_path) DO UPDATE SET
+                 (photo_id, field, volume_id, relative_path, attempts, error, queued_at, last_attempt_at)
+             VALUES(?1, ?2, ?3, ?4, 1, ?5, ?6, ?6)
+             ON CONFLICT(photo_id, field, volume_id, relative_path) DO UPDATE SET
                  attempts        = attempts + 1,
                  error           = excluded.error,
                  last_attempt_at = excluded.last_attempt_at",
-            params![photo_id, volume_id, relative_path, outcome.error_text(), ts],
+            params![
+                photo_id,
+                field.as_db_str(),
+                volume_id,
+                relative_path,
+                outcome.error_text(),
+                ts
+            ],
         )?;
         Ok(())
     }
@@ -205,43 +301,67 @@ impl Catalog {
         Ok(outcome)
     }
 
-    /// Every copy whose sidecar still owes it its UUID, oldest first.
+    /// Bind the photo's immutable import-batch UUID to the sidecar, or queue a repair.
+    pub fn ensure_sidecar_import_batch(
+        &self,
+        photo_id: i64,
+        photo_path: &Path,
+        batch_uuid: &str,
+    ) -> Result<SidecarIdentity> {
+        let outcome = bind_sidecar_import_batch(photo_path, batch_uuid);
+        self.record_sidecar_import_batch(photo_id, photo_path, &outcome)?;
+        Ok(outcome)
+    }
+
+    /// Every copy whose sidecar still owes it a portable identity field, oldest first.
     pub fn list_pending_identity(&self) -> Result<Vec<PendingIdentity>> {
         let mut stmt = self.conn.prepare(
-            "SELECT q.photo_id, p.uuid, p.path, q.volume_id, v.base_path, q.relative_path,
-                    q.attempts, q.error, q.queued_at, q.last_attempt_at
+            "SELECT q.photo_id, p.uuid, p.path, q.field, q.volume_id, v.base_path, q.relative_path,
+                    q.attempts, q.error, q.queued_at, q.last_attempt_at, b.uuid
              FROM pending_sidecar_identity q
              JOIN photos p ON p.id = q.photo_id
              JOIN volumes v ON v.id = q.volume_id
-             ORDER BY q.queued_at, q.photo_id, q.volume_id, q.relative_path",
+             LEFT JOIN import_batches b ON b.id = p.import_batch_id
+             ORDER BY q.queued_at, q.photo_id, q.field, q.volume_id, q.relative_path",
         )?;
         let rows = stmt.query_map([], |r| {
-            let base: String = r.get(4)?;
-            let relative_path: String = r.get(5)?;
+            let field_text: String = r.get(3)?;
+            let photo_uuid: String = r.get(1)?;
+            let import_batch_uuid: Option<String> = r.get(11)?;
+            let (field, value) =
+                pending_sidecar_value(&field_text, &photo_uuid, import_batch_uuid);
+            let base: String = r.get(5)?;
+            let relative_path: String = r.get(6)?;
             let target_path = Path::new(&base)
                 .join(&relative_path)
                 .to_string_lossy()
                 .to_string();
             Ok(PendingIdentity {
                 photo_id: r.get(0)?,
-                uuid: r.get(1)?,
+                uuid: photo_uuid,
+                field: field.as_db_str().to_string(),
+                value,
                 path: r.get(2)?,
-                volume_id: r.get(3)?,
+                volume_id: r.get(4)?,
                 target_path,
-                attempts: r.get(6)?,
-                error: r.get(7)?,
-                queued_at: r.get(8)?,
-                last_attempt_at: r.get(9)?,
+                attempts: r.get(7)?,
+                error: r.get(8)?,
+                queued_at: r.get(9)?,
+                last_attempt_at: r.get(10)?,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
-    /// How many known photo copies are missing their identity on disk.
+    /// How many known photo copies are missing their UUID identity on disk.
     pub fn count_pending_identity(&self) -> Result<i64> {
         Ok(self
             .conn
-            .query_row("SELECT count(*) FROM pending_sidecar_identity", [], |r| r.get(0))?)
+            .query_row(
+                "SELECT count(*) FROM pending_sidecar_identity WHERE field = 'identifier'",
+                [],
+                |r| r.get(0),
+            )?)
     }
 
     /// Plan the repair of every queued copy. PURE SQL, so it is safe to call while
@@ -250,21 +370,28 @@ impl Catalog {
     pub fn plan_identity_repairs(&self) -> Result<Vec<IdentityRepairPlan>> {
         let mut plans = Vec::new();
         let mut stmt = self.conn.prepare(
-            "SELECT q.photo_id, p.uuid, q.volume_id, q.relative_path, v.base_path
+            "SELECT q.photo_id, p.uuid, q.field, q.volume_id, q.relative_path, v.base_path, b.uuid
              FROM pending_sidecar_identity q
              JOIN photos p ON p.id = q.photo_id
              JOIN volumes v ON v.id = q.volume_id
-             ORDER BY q.queued_at, q.photo_id, q.volume_id, q.relative_path",
+             LEFT JOIN import_batches b ON b.id = p.import_batch_id
+             ORDER BY q.queued_at, q.photo_id, q.field, q.volume_id, q.relative_path",
         )?;
         let rows = stmt.query_map([], |r| {
-            let relative_path: String = r.get(3)?;
-            let base: String = r.get(4)?;
+            let photo_uuid: String = r.get(1)?;
+            let field_text: String = r.get(2)?;
+            let import_batch_uuid: Option<String> = r.get(6)?;
+            let (field, value) =
+                pending_sidecar_value(&field_text, &photo_uuid, import_batch_uuid);
+            let relative_path: String = r.get(4)?;
+            let base: String = r.get(5)?;
             Ok(IdentityRepairPlan {
                 photo_id: r.get(0)?,
-                uuid: r.get(1)?,
-                volume_id: r.get(2)?,
+                field,
+                volume_id: r.get(3)?,
                 target_path: Path::new(&base).join(&relative_path),
                 relative_path,
+                value,
             })
         })?;
         for plan in rows {
@@ -280,8 +407,9 @@ impl Catalog {
         let mut summary = IdentityRepairSummary::default();
         for plan in self.plan_identity_repairs()? {
             let outcome = plan.run();
-            self.record_sidecar_identity_target(
+            self.record_sidecar_field_target(
                 plan.photo_id,
+                plan.field,
                 plan.volume_id,
                 &plan.relative_path,
                 &outcome,

@@ -292,7 +292,7 @@ pub fn write_identifier(photo_path: &Path, uuid: &str) -> Result<(), String> {
 /// `chairphoto:ImportBatch`, merge-safe: only that field (and
 /// `chairphoto:LastWrite`) are touched; all other content is preserved.
 /// The batch UUID lets the batch survive catalog loss / catalog merge across
-/// machines (the deferred part of D1 / K3).
+/// machines.
 /// Backs up a pre-existing foreign sidecar once before the first write,
 /// mirroring the invariant in [`write_identifier`].
 pub fn write_import_batch(photo_path: &Path, batch_uuid: &str) -> Result<(), String> {

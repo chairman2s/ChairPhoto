@@ -166,8 +166,8 @@ pub async fn relocate_photo(
     record_identity_on_catalog(db_path, root, photo_id, path, outcome).await
 }
 
-/// Photos whose UUID is in the catalog but not (yet) in their XMP sidecar — the
-/// identity debt left by an unwritable, unparseable, or offline sidecar.
+/// Sidecar identity fields that are in the catalog but not (yet) in XMP: photo UUID
+/// (`xmp:Identifier`) and import batch UUID (`chairphoto:ImportBatch`).
 #[tauri::command]
 pub async fn list_pending_identity(
     state: State<'_, AppState>,
@@ -175,11 +175,11 @@ pub async fn list_pending_identity(
     with_catalog_blocking(&state, |c| c.list_pending_identity()).await
 }
 
-/// Retry every queued identity repair, clearing the copies that now succeed. Runs the
-/// work on a secondary connection so the sidecar parsing/writing (possibly over a slow
-/// mount) never holds the app's catalog lock. Copies whose file is unreachable stay
-/// queued; so do sidecars that still can't be written or that carry a conflicting
-/// identity — those need a human, and the queue is what remembers them.
+/// Retry every queued sidecar identity repair, clearing the copies that now succeed.
+/// Runs the work on a secondary connection so the sidecar parsing/writing (possibly
+/// over a slow mount) never holds the app's catalog lock. Copies whose file is
+/// unreachable stay queued; so do sidecars that still can't be written or that carry a
+/// conflicting photo identity — those need a human, and the queue remembers them.
 #[tauri::command]
 pub async fn repair_pending_identity(
     state: State<'_, AppState>,

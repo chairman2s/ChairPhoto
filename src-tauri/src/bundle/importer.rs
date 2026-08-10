@@ -355,6 +355,7 @@ pub fn index_bundle(
         .collect();
 
     let mut newly_created: Vec<i64> = Vec::new();
+    let mut upserted_copies: Vec<(i64, PathBuf)> = Vec::new();
 
     let tx = catalog.begin().map_err(|e| e.to_string())?;
     for item in extracted {
@@ -408,6 +409,7 @@ pub fn index_bundle(
                 path.display()
             );
         }
+        upserted_copies.push((upsert.id, path.clone()));
 
         if upsert.created {
             newly_created.push(upsert.id);
@@ -495,16 +497,17 @@ pub fn index_bundle(
         }
     }
 
-    // Step C — K3: write the bundle batch UUID into each extracted file's sidecar so
-    // the batch survives catalog loss/merge across machines. `write_import_batch` is
-    // merge-safe (preserves foreign XMP elements). Best-effort.
-    let batch_uuid = &manifest.batch.uuid;
-    for item in extracted {
-        if let Err(e) = crate::xmp::write_import_batch(&item.dest, batch_uuid) {
-            eprintln!(
-                "bundle import: couldn't write ImportBatch sidecar for {}: {e}",
-                item.dest.display()
-            );
+    // Step C — K3: write each photo's immutable batch UUID into its sidecar so the
+    // batch survives catalog loss/merge across machines. Failures are queued as
+    // retryable sidecar debt.
+    for (photo_id, path) in &upserted_copies {
+        if let Ok(Some(batch_uuid)) = catalog.import_batch_uuid_for_photo(*photo_id) {
+            if let Err(e) = catalog.ensure_sidecar_import_batch(*photo_id, path, &batch_uuid) {
+                eprintln!(
+                    "bundle import: couldn't record ImportBatch sidecar debt for {}: {e}",
+                    path.display()
+                );
+            }
         }
     }
 

@@ -158,7 +158,7 @@ async fn relocate_photo_in_state(
 ) -> Result<(), String> {
     let target = path.clone();
     let bind_path = path.clone();
-    let (uuid, db_path, root) = with_catalog_in_state_blocking(state, move |c| {
+    let (uuid, db_path, root) = with_catalog_blocking(state, move |c| {
         let uuid = c.relocate_photo(photo_id, &target)?;
         Ok((uuid, c.db_path().to_path_buf(), c.root().to_path_buf()))
     })

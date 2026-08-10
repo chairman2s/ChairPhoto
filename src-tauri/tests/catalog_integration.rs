@@ -4097,8 +4097,10 @@ fn bundle_import_queues_identity_sidecar_debt_for_unwritable_extracted_copy() {
     use chairphoto_lib::bundle::writer::{gather_bundle, write_bundle};
 
     let (cat_a, _root_a, _uuid1, _uuid2, batch_id_a) = setup_catalog_a("identity-bundle-a");
-    let bundle_zip =
-        std::env::temp_dir().join("chairphoto-bundle-identity-readonly-test.chairphoto");
+    let bundle_zip = std::env::temp_dir().join(format!(
+        "chairphoto-bundle-identity-readonly-{}.chairphoto",
+        std::process::id()
+    ));
     let _guard = {
         struct Rm(PathBuf);
         impl Drop for Rm {

@@ -97,11 +97,22 @@ and cross-catalog merge by tag UUID for free.
 Everything except auto-seeding is a suggestion you confirm — the same non-destructive contract as
 AI Tagging.
 
+The pass runs as a background job with its own catalog connection, so a match over a large
+library does not hold the catalog against the UI. `faces_run_matching` returns the job id as
+soon as the run has started; progress arrives as `faces:match_progress {done, total, phase, job}`
+and the counters as a terminal `faces:match_done`. It is cancellable, stopping at the next face
+and again at the next phase boundary, and a catalog switch stops it the same way. Stopping is a
+stop, not a rollback: the pass is idempotent, so suggestions already written stay and a re-run
+recomputes the rest.
+
 ## Indexing
 
 A background worker with its own catalog connection, bounded parallelism,
-`faces:progress {done, total}` events, abort-safe, and resumable through a persistent queue.
+`faces:progress {done, total, job}` events, abort-safe, and resumable through a persistent queue.
 Triggered by an explicit "Index faces" action.
+
+Indexing and matching are separate jobs with separate abort flags and status slots, so
+cancelling one does not stop the other.
 
 Parallelism follows the `indexing.speed` preference:
 

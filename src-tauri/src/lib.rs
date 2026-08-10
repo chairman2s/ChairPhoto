@@ -494,6 +494,10 @@ pub fn run() {
             #[cfg(feature = "faces")]
             commands::faces_run_matching,
             #[cfg(feature = "faces")]
+            commands::faces_match_status,
+            #[cfg(feature = "faces")]
+            commands::faces_match_cancel,
+            #[cfg(feature = "faces")]
             commands::faces_accept,
             #[cfg(feature = "faces")]
             commands::faces_reject,

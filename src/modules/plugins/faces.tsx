@@ -95,15 +95,29 @@ interface FaceRow {
   source: FaceSource;
 }
 
-/** Progress event for `faces_index_photos` and `faces_run_matching`. */
+/** Progress event for `faces_index_photos` (`faces:progress`). */
 interface FacesProgress {
   done: number;
   total: number;
-  /** Indexing-job id (absent on matching progress). Events from a superseded indexing
-   * job carry its old id — filter on this to ignore them. */
-  job?: number;
-  /** Matching pipeline step label (matching progress only), e.g. "clustering unknowns". */
-  phase?: string;
+  /** Which indexing run this belongs to. Events from a superseded job carry its old id —
+   * filter on this to ignore them. */
+  job: number;
+}
+
+/**
+ * Progress event for `faces_run_matching` (`faces:match_progress`).
+ *
+ * Matching used to share `faces:progress` and be identified by having no `job` field.
+ * It is a real job now, so it has its own id and its own event: two job families cannot
+ * be told apart by a missing field once both have one.
+ */
+interface FacesMatchProgress {
+  done: number;
+  total: number;
+  /** Pipeline step label, e.g. "clustering unknowns". `total` restarts each step. */
+  phase: string;
+  /** Which matching run this belongs to. */
+  job: number;
 }
 
 /** Per-model presence report, as returned inside `FacesModelsStatus`. */
@@ -210,6 +224,26 @@ interface FacesIndexDone {
   error: string | null;
 }
 
+/** Terminal event for `faces_run_matching` (`faces:match_done`). */
+interface FacesMatchDone {
+  ok: boolean;
+  /** The run's counters, or null when it failed before producing any. */
+  outcome: MatchOutcome | null;
+  /** True when the run stopped early (cancel, superseded by a newer run, catalog switch). */
+  aborted: boolean;
+  /** Which run finished — compare against the id `facesRunMatching` returned. */
+  job: number;
+  error: string | null;
+}
+
+/** Snapshot of a running face-matching job (`faces_match_status`), null when idle. */
+interface FacesMatchJobStatus {
+  job: number;
+  done: number;
+  total: number;
+  phase: string;
+}
+
 /** Snapshot of a running face-indexing job (`faces_index_status`), null when idle. */
 interface FacesJobStatus {
   job: number;
@@ -245,14 +279,26 @@ const facesIndexStatus = (api: FacesCommandApi) =>
   api.invoke<FacesJobStatus | null>("faces_index_status");
 
 /**
- * Run the seed/match/cluster pass to assign suggestions to already-indexed faces.
- * Should be called after indexing. Blocks until done; returns what the run did.
+ * Start the seed/match/cluster pass over already-indexed faces. Should be called after
+ * indexing.
+ *
+ * Returns the new job's id as soon as the job has STARTED — the counters arrive later on
+ * the terminal `faces:match_done` event, not from this promise. Starting a new match
+ * aborts a running one.
  */
 const facesRunMatching = (api: FacesCommandApi) =>
-  api.invoke<MatchOutcome>("faces_run_matching");
+  api.invoke<number>("faces_run_matching");
+
+/** Snapshot of the running face-matching job, or null when idle. */
+const facesMatchStatus = (api: FacesCommandApi) =>
+  api.invoke<FacesMatchJobStatus | null>("faces_match_status");
+
+/** Cancel an in-flight face-matching job. Its terminal event still arrives. */
+const facesCancelMatch = (api: FacesCommandApi) =>
+  api.invoke<void>("faces_match_cancel");
 
 /**
- * Subscribe to faces index/match progress events (`faces:progress`).
+ * Subscribe to face-indexing progress events (`faces:progress`).
  *
  * `onEvent` is an optional host-API member, so this resolves to `null` on a host that
  * predates it. Callers must treat null as "no progress updates will arrive" rather than
@@ -275,7 +321,29 @@ const onFacesIndexDone = (
 ): Promise<(() => void) | null> =>
   api.onEvent?.<FacesIndexDone>("faces:index_done", handler) ?? Promise.resolve(null);
 
-/** Cancel an in-flight faces index or match job. */
+/**
+ * Subscribe to face-matching progress events (`faces:match_progress`).
+ *
+ * Resolves to `null` when the host has no `onEvent`; see `onFacesProgress`.
+ */
+const onFacesMatchProgress = (
+  api: FacesEventApi,
+  handler: (p: FacesMatchProgress) => void,
+): Promise<(() => void) | null> =>
+  api.onEvent?.<FacesMatchProgress>("faces:match_progress", handler) ?? Promise.resolve(null);
+
+/**
+ * Subscribe to the face-matching terminal event (`faces:match_done`).
+ *
+ * Resolves to `null` when the host has no `onEvent`; see `onFacesProgress`.
+ */
+const onFacesMatchDone = (
+  api: FacesEventApi,
+  handler: (p: FacesMatchDone) => void,
+): Promise<(() => void) | null> =>
+  api.onEvent?.<FacesMatchDone>("faces:match_done", handler) ?? Promise.resolve(null);
+
+/** Cancel an in-flight faces index job. */
 const facesCancelJob = (api: FacesCommandApi) =>
   api.invoke<void>("faces_index_cancel");
 
@@ -491,6 +559,9 @@ const REATTACH_NO_EVENT_SUPPORT =
 
 /** Outcome of acquiring the required `faces:index_done` listener. */
 type DoneAcquire = "ok" | "unsupported" | "failed";
+
+/** What the progress bar renders. Indexing has no `phase`; matching always does. */
+type ProgressDisplay = { done: number; total: number; phase?: string };
 
 /** A live subscription tagged with the lease token that installed it, so only its owner
  *  can release it. */
@@ -1482,7 +1553,7 @@ function FacesSettings({ api }: { api: ChairPhotoAPI }) {
   const [jobPhase, setJobPhase] = useState<"idle" | "indexing" | "matching">("idle");
   // Persistent outcome of the last finished job — a toast alone vanishes too fast to read.
   const [lastResult, setLastResult] = useState("");
-  const [progress, setProgress] = useState<FacesProgress | null>(null);
+  const [progress, setProgress] = useState<ProgressDisplay | null>(null);
   const [jobError, setJobError] = useState("");
   // Listeners are stored with the lease token that installed them. Under StrictMode an
   // attempt can be torn down while its registration is still pending, so a global
@@ -1494,6 +1565,10 @@ function FacesSettings({ api }: { api: ChairPhotoAPI }) {
   // running one, whose progress/done events keep arriving with the OLD id — everything
   // event-driven filters on this so a superseded run can't hijack the panel state.
   const jobIdRef = useRef<number | null>(null);
+  /** The running match's id, so its progress and terminal events can be told from a
+   *  superseded run's. Separate from `jobIdRef`: the two job families number themselves
+   *  independently, so an id alone does not say which family it belongs to. */
+  const matchJobIdRef = useRef<number | null>(null);
 
   // False once unmounted, so a registration that resolves after cleanup is released
   // immediately instead of being stored into a ref nobody will drain again.
@@ -1611,10 +1686,9 @@ function FacesSettings({ api }: { api: ChairPhotoAPI }) {
     try {
       unlisten = await onFacesProgress(api, (p) => {
         // Drop stragglers from a superseded indexing run (its in-flight chunk keeps
-        // emitting briefly after a new run aborts it). Matching progress carries no job
-        // id and always passes.
-        if (p.job != null && jobIdRef.current != null && p.job !== jobIdRef.current) return;
-        setProgress(p);
+        // emitting briefly after a new run aborts it).
+        if (jobIdRef.current != null && p.job !== jobIdRef.current) return;
+        setProgress({ done: p.done, total: p.total });
       });
     } catch {
       unlisten = null;
@@ -1696,6 +1770,59 @@ function FacesSettings({ api }: { api: ChairPhotoAPI }) {
       // Install only while still holding the lease. If the attempt was torn down and
       // replaced during the await, this registration belongs to nobody: stop it rather
       // than overwriting (and orphaning) the replacement's listener.
+      if (!mountedRef.current || claimRef.current !== token) {
+        stop();
+        return "failed";
+      }
+      releaseDoneListener(token);
+      doneUnlistenRef.current = { owner: token, stop };
+      return "ok";
+    },
+    [api, releaseDoneListener],
+  );
+
+  /**
+   * Subscribe to `faces:match_progress`. Cosmetic, exactly like `subscribeToProgress`:
+   * a host without `onEvent` just means no progress bar, and matching still runs.
+   */
+  const subscribeToMatchProgress = useCallback(async (token: symbol): Promise<boolean> => {
+    const stillOurs = () => stillOwns(token);
+    if (unlistenRef.current) return stillOurs();
+    let unlisten: (() => void) | null = null;
+    try {
+      unlisten = await onFacesMatchProgress(api, (p) => {
+        if (matchJobIdRef.current != null && p.job !== matchJobIdRef.current) return;
+        setProgress({ done: p.done, total: p.total, phase: p.phase });
+      });
+    } catch {
+      unlisten = null;
+    }
+    if (!stillOurs()) {
+      unlisten?.();
+      return false;
+    }
+    if (unlisten) {
+      unlistenRef.current = { owner: token, stop: unlisten };
+      setProgressLive(true);
+    }
+    return true;
+  }, [api, stillOwns]);
+
+  /**
+   * Acquire the `faces:match_done` listener. Required for the same reason as the indexing
+   * one: it is now the only place the run's counters arrive, so a match started without it
+   * would sit in "matching" forever and never report what it did.
+   */
+  const acquireMatchDoneListener = useCallback(
+    async (token: symbol, handler: (d: FacesMatchDone) => void): Promise<DoneAcquire> => {
+      if (!api.onEvent) return "unsupported";
+      let stop: (() => void) | null = null;
+      try {
+        stop = await onFacesMatchDone(api, handler);
+      } catch {
+        return "failed";
+      }
+      if (!stop) return "unsupported";
       if (!mountedRef.current || claimRef.current !== token) {
         stop();
         return "failed";
@@ -1863,7 +1990,7 @@ function FacesSettings({ api }: { api: ChairPhotoAPI }) {
           unsubscribeProgress(token);
           return;
         }
-        setProgress({ done: now.s.done, total: now.s.total, job: now.s.job });
+        setProgress({ done: now.s.done, total: now.s.total });
       } finally {
         endExclusive(token);
       }
@@ -1889,15 +2016,33 @@ function FacesSettings({ api }: { api: ChairPhotoAPI }) {
     handleIndexDone,
   ]);
 
+  // A matching job survives a panel remount just as an indexing one does, and the panel
+  // has no adopt protocol for it. Rather than show idle — and let the user start a second
+  // run that would abort the first — mark the panel untracked and let the poll below
+  // re-enable it. Matching is short next to indexing, so adopting it in full would be a
+  // lot of machinery for a brief window.
+  useEffect(() => {
+    let cancelled = false;
+    facesMatchStatus(api)
+      .then((s) => {
+        if (s && !cancelled && mountedRef.current) setUntracked(true);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [api]);
+
   // While untracked, poll status at a low rate purely to re-enable the buttons once the
   // backend goes idle. This deliberately reports nothing — no result message, no
-  // finishIndexing — so `faces:index_done` remains the single definition of "finished".
+  // finishIndexing — so the terminal events remain the single definition of "finished".
+  // Both job families are checked: either one still running means still untracked.
   useEffect(() => {
     if (!untracked) return;
     const id = setInterval(() => {
-      facesIndexStatus(api)
-        .then((s) => {
-          if (!s && mountedRef.current) {
+      Promise.all([facesIndexStatus(api), facesMatchStatus(api)])
+        .then(([index, match]) => {
+          if (!index && !match && mountedRef.current) {
             setUntracked(false);
             setJobError("");
           }
@@ -1973,23 +2118,33 @@ function FacesSettings({ api }: { api: ChairPhotoAPI }) {
     }
   };
 
-  const handleRunMatching = async () => {
-    // `untracked` means an indexing job we cannot follow is still running; matching
-    // would conflict with it. The exclusive claim also covers the window where an
-    // indexing start or reattach is mid-await and jobPhase is still "idle".
-    if (jobPhase !== "idle" || untracked) return;
-    const token = beginExclusive();
-    if (!token) return;
-    setJobPhase("matching");
-    setJobError("");
-    setLastResult("");
+  /** Clear everything a finished match owned. Mirrors `finishIndexing`. */
+  const finishMatching = useCallback(() => {
+    matchJobIdRef.current = null;
+    setJobPhase("idle");
     setProgress(null);
-    try {
-      // Matching emits job-less faces:progress events with a pipeline-step label —
-      // subscribe for the duration of the run so the panel shows what is going on.
-      if (!(await subscribeToProgress(token))) return;
-      const o = await facesRunMatching(api);
-      if (!stillOwns(token)) return;
+    unsubscribeProgress();
+    releaseDoneListener();
+  }, [unsubscribeProgress, releaseDoneListener]);
+
+  /** Turn a finished match into the panel's result line. */
+  const handleMatchDone = useCallback(
+    (d: FacesMatchDone) => {
+      finishMatching();
+      if (d.error) {
+        setJobError(`Matching failed: ${d.error}`);
+        return;
+      }
+      if (d.aborted) {
+        setLastResult("Matching cancelled — partial results were kept.");
+        api.notifyChange();
+        return;
+      }
+      const o = d.outcome;
+      if (!o) {
+        setJobError("Matching finished without reporting what it did.");
+        return;
+      }
       const suggested = o.constrained + o.open;
       const msg =
         o.seeded + suggested + o.clustered === 0
@@ -2000,23 +2155,75 @@ function FacesSettings({ api }: { api: ChairPhotoAPI }) {
       setLastResult(msg);
       api.showToast(msg);
       api.notifyChange(); // refresh inspector panels
-    } catch (e: unknown) {
-      if (stillOwns(token)) setJobError(`Matching failed: ${String(e)}`);
-    } finally {
-      // The reset is a UI write, so it is skipped once the panel is gone or the lease has
-      // moved on; dropping the listener and the claim is not optional either way.
-      if (stillOwns(token)) {
-        setJobPhase("idle");
-        setProgress(null);
+    },
+    [api, finishMatching],
+  );
+
+  // Like indexing, the command returns as soon as the job has STARTED; the counters
+  // arrive later on faces:match_done. The panel stays in "matching" until that event.
+  const handleRunMatching = async () => {
+    // `untracked` means a faces job we cannot follow is still running; a second one
+    // would conflict with it. The exclusive claim also covers the window where an
+    // indexing start or reattach is mid-await and jobPhase is still "idle".
+    if (jobPhase !== "idle" || untracked) return;
+    const token = beginExclusive();
+    if (!token) return;
+    setJobError("");
+    setLastResult("");
+    setProgress(null);
+    matchJobIdRef.current = null;
+    // Same ordering problem as indexing: the listener has to be up before the invoke so a
+    // fast run cannot finish in the gap, but our job id is not known until the invoke
+    // resolves. Park terminal events until then, and replay ours if it already arrived.
+    const pendingDone: FacesMatchDone[] = [];
+    try {
+      const attached = await acquireMatchDoneListener(token, (d) => {
+        if (matchJobIdRef.current === null) {
+          pendingDone.push(d);
+          return;
+        }
+        if (d.job !== matchJobIdRef.current) return;
+        handleMatchDone(d);
+      });
+      if (attached !== "ok") {
+        if (stillOwns(token)) {
+          setJobError(attached === "unsupported" ? NO_EVENT_SUPPORT : EVENT_SUBSCRIBE_FAILED);
+        }
+        return;
       }
-      unsubscribeProgress(token);
+      setJobPhase("matching");
+      try {
+        if (!(await subscribeToMatchProgress(token))) return;
+        const job = await facesRunMatching(api); // job started — completion handled above
+        if (!stillOwns(token)) return;
+        matchJobIdRef.current = job;
+        const ours = pendingDone.find((d) => d.job === job);
+        if (ours) handleMatchDone(ours);
+      } catch (e: unknown) {
+        // Start-up failure (no catalog open) — no terminal event will come.
+        if (stillOwns(token)) {
+          finishMatching();
+          setJobError(`Matching failed: ${String(e)}`);
+        } else {
+          unsubscribeProgress(token);
+          releaseDoneListener(token);
+        }
+      }
+    } finally {
       endExclusive(token);
     }
   };
 
-  // Trips the indexer's abort flag; the worker stops after the current photo and then
-  // emits faces:index_done, which resets the UI — so don't reset jobPhase here.
+  // Trips the running job's abort flag; the worker stops at its next item and then emits
+  // its terminal event, which resets the UI — so don't reset jobPhase here. Which flag to
+  // trip depends on which job is running: they have separate ones, so cancelling a match
+  // must not stop an index.
   const handleCancel = async () => {
+    if (jobPhase === "matching") {
+      await facesCancelMatch(api).catch(() => {});
+      setLastResult("Cancelling — stops at the next face…");
+      return;
+    }
     await facesCancelJob(api).catch(() => {});
     setLastResult("Cancelling — stops after the current photo…");
   };
@@ -2246,7 +2453,10 @@ function FacesSettings({ api }: { api: ChairPhotoAPI }) {
         >
           {jobPhase === "matching" ? "Matching…" : "Run matching"}
         </button>
-        {jobPhase === "indexing" && (
+        {/* Shown for either job. `handleCancel` trips whichever flag belongs to the one
+            that is running — gating this on "indexing" alone would leave matching
+            cancellable by the backend and by the docs, but not by the user. */}
+        {jobPhase !== "idle" && (
           <button className="chip" onClick={handleCancel}>
             Cancel
           </button>

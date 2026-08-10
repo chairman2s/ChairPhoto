@@ -7,9 +7,7 @@
 
 use super::*;
 use serde::Serialize;
-#[cfg(feature = "ai")]
-use tauri::Emitter;
-use tauri::{AppHandle, State};
+use tauri::State;
 
 /// A tag suggestion from the AI plugin, resolved against the current taxonomy.
 #[derive(serde::Serialize)]
@@ -356,16 +354,6 @@ pub struct GroupedDispatchResult {
     pub propagated: usize,
 }
 
-/// Progress payload emitted as `ai:grouped:progress` while dispatching representatives.
-/// Only constructed on the `ai` code path (mirrors the `Region` convention).
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-#[cfg_attr(not(feature = "ai"), allow(dead_code))]
-pub struct GroupedProgress {
-    pub done: usize,
-    pub total: usize,
-}
-
 /// Grouped batch suggestion run (H15c). Instead of dispatching every selected photo to
 /// the provider, cluster the selection (H15b: capture-time gaps → perceptual-hash
 /// confirmation), send only each cluster's **representative** frame to the provider, and
@@ -378,16 +366,21 @@ pub struct GroupedProgress {
 /// This is the ~90% cost cut on burst-heavy shoots. A later direct per-photo run
 /// (`ai_suggest_tags`) supersedes that photo's propagated rows. Local Ollama and cloud
 /// providers alike go through this path; representatives are dispatched sequentially
-/// (local Ollama is single-GPU) with `ai:grouped:progress` events.
+/// (local Ollama is single-GPU).
+///
+/// The command reports no progress while it runs: the frontend awaits it behind a busy
+/// flag and shows the result. It used to emit `ai:grouped:progress`, which nothing ever
+/// listened to — removed in #12 rather than left looking like working progress reporting.
+/// Restoring progress here means the full job treatment (id, abort flag, terminal event),
+/// not re-adding a bare emit.
 #[tauri::command]
 pub async fn ai_suggest_tags_grouped(
-    app: AppHandle,
     state: State<'_, AppState>,
     photo_ids: Vec<i64>,
 ) -> Result<GroupedDispatchResult, String> {
     #[cfg(not(feature = "ai"))]
     {
-        let _ = (&app, &state, photo_ids);
+        let _ = (&state, photo_ids);
         Err("AI backend not included in this build".into())
     }
     #[cfg(feature = "ai")]
@@ -410,7 +403,7 @@ pub async fn ai_suggest_tags_grouped(
         let mut dispatched = 0usize;
         let mut propagated = 0usize;
 
-        for (idx, cluster) in clusters.iter().enumerate() {
+        for cluster in clusters.iter() {
             let rep_id = cluster.representative_id();
 
             // Per-representative inputs: image path + this photo's rejections. If the
@@ -424,13 +417,7 @@ pub async fn ai_suggest_tags_grouped(
             .await;
             let (image_path, rejected) = match prep {
                 Ok(v) => v,
-                Err(_) => {
-                    let _ = app.emit(
-                        "ai:grouped:progress",
-                        GroupedProgress { done: idx + 1, total: representatives },
-                    );
-                    continue;
-                }
+                Err(_) => continue,
             };
 
             // Decode the representative's preview off the async thread.
@@ -441,13 +428,7 @@ pub async fn ai_suggest_tags_grouped(
             .map_err(|e| e.to_string())?;
             let image = match image {
                 Ok(bytes) => bytes,
-                Err(_) => {
-                    let _ = app.emit(
-                        "ai:grouped:progress",
-                        GroupedProgress { done: idx + 1, total: representatives },
-                    );
-                    continue;
-                }
+                Err(_) => continue,
             };
             let image_b64 = base64::engine::general_purpose::STANDARD.encode(&image);
 
@@ -456,11 +437,7 @@ pub async fn ai_suggest_tags_grouped(
                 Ok(r) => r,
                 Err(_) => {
                     // Provider failure leaves the cluster untouched — a later re-run can
-                    // retry it. Report progress and move on.
-                    let _ = app.emit(
-                        "ai:grouped:progress",
-                        GroupedProgress { done: idx + 1, total: representatives },
-                    );
+                    // retry it. Move on.
                     continue;
                 }
             };
@@ -483,11 +460,6 @@ pub async fn ai_suggest_tags_grouped(
                     |path| Ok(c.find_tag_id_by_path(path)?.is_some()),
                 )
             })?;
-
-            let _ = app.emit(
-                "ai:grouped:progress",
-                GroupedProgress { done: idx + 1, total: representatives },
-            );
         }
 
         Ok(GroupedDispatchResult {

@@ -260,14 +260,17 @@ pub fn scan_folder_phase_a(
 
     // Write the batch UUID into the sidecar of each newly-created photo (K3).
     // Done after the phase_a_walk commits so the batch row is durable before we touch
-    // the filesystem. Best-effort: a sidecar write failure never aborts the scan.
+    // the filesystem. Failures are queued as retryable sidecar debt, not just logged.
     if let Some(ref batch_uuid) = batch_uuid_for_new {
         // Build a set of newly-created ids for O(1) lookup.
         let created_ids: std::collections::HashSet<i64> = newly_created.iter().copied().collect();
         for (path, photo_id, _) in &imported {
             if created_ids.contains(photo_id) {
-                if let Err(e) = crate::xmp::write_import_batch(path, batch_uuid) {
-                    eprintln!("scan: couldn't write ImportBatch sidecar for {}: {e}", path.display());
+                if let Err(e) = catalog.ensure_sidecar_import_batch(*photo_id, path, batch_uuid) {
+                    eprintln!(
+                        "scan: couldn't record ImportBatch sidecar debt for {}: {e}",
+                        path.display()
+                    );
                 }
             }
         }
@@ -659,7 +662,7 @@ pub fn index_ingested(
     let mut newly_created: Vec<i64> = Vec::new();
     // K3: track the dest path for each newly-created photo so we can write the batch
     // UUID to its sidecar after the catalog transaction commits.
-    let mut newly_created_paths: Vec<PathBuf> = Vec::new();
+    let mut newly_created_copies: Vec<(i64, PathBuf)> = Vec::new();
     let tx = catalog.begin().map_err(|e| e.to_string())?;
     for item in &copied {
         match upsert_one(catalog, &item.dest, folder_id) {
@@ -668,7 +671,7 @@ pub fn index_ingested(
                 if created {
                     result.created += 1;
                     newly_created.push(photo_id);
-                    newly_created_paths.push(item.dest.clone());
+                    newly_created_copies.push((photo_id, item.dest.clone()));
                 }
                 // Reuse the source file's metadata for the copy (same bytes).
                 if let Some(m) = &item.meta {
@@ -704,11 +707,14 @@ pub fn index_ingested(
     tx.commit().map_err(|e| e.to_string())?;
 
     // Write the batch UUID into the sidecar of each newly-created photo (K3).
-    // Best-effort: a sidecar write failure never aborts the import.
+    // Failures are queued as retryable sidecar debt.
     if let Some(ref batch_uuid) = batch_uuid_for_new {
-        for path in &newly_created_paths {
-            if let Err(e) = crate::xmp::write_import_batch(path, batch_uuid) {
-                eprintln!("ingest: couldn't write ImportBatch sidecar for {}: {e}", path.display());
+        for (photo_id, path) in &newly_created_copies {
+            if let Err(e) = catalog.ensure_sidecar_import_batch(*photo_id, path, batch_uuid) {
+                eprintln!(
+                    "ingest: couldn't record ImportBatch sidecar debt for {}: {e}",
+                    path.display()
+                );
             }
         }
     }

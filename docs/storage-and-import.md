@@ -194,12 +194,12 @@ a negative film roll. All photos from that ingest belong to it forever.
 
 - Batches are **auto-created, immutable**, and shown in their **own list**, separate
   from user albums.
-- The batch ID **should be written to each photo's XMP** (like the UUID) for
-  permanence and portability. (Decision: yes.) Still **deferred** — but the scan-time
-  **UUID write now ships**: the scanner writes `xmp:Identifier` into each file's sidecar
-  (merge-safe, only when absent) and matches a moved/re-rooted file to its existing row
-  by that UUID instead of duplicating (`Catalog::upsert_photo_with_identity`). The batch
-  ID can ride the same path next.
+- The batch UUID is written to each photo's XMP as `chairphoto:ImportBatch` for
+  permanence and portability, beside the photo UUID in `xmp:Identifier`. The writes are
+  merge-safe and preserve foreign sidecar content. If either sidecar field cannot be
+  written (read-only storage, malformed XMP, offline volume), the catalog records a
+  retryable row in `pending_sidecar_identity` instead of logging and forgetting it;
+  `repair_pending_identity` retries both fields.
 - The batch is the natural unit for: culling on a trip, "not backed up" status,
   NAS reconcile, and merging home.
 
@@ -207,9 +207,10 @@ a negative film roll. All photos from that ingest belong to it forever.
 `catalog/batches.rs` (create / assign-immutably / list with counts); each scan that
 imports new photos creates one batch (source = scanned folder) and assigns only the
 new photos; `list_photos` takes a `batch_id` filter; a read-only Batches sidebar
-section + a filter-bar chip. **Batch UUID in XMP sidecar** — the scanner
-and bundle importer both write `chairphoto:ImportBatch` (merge-safe, beside the
-`chairphoto:LastWrite` field) so the batch survives catalog loss and merge.
+section + a filter-bar chip. **Batch UUID in XMP sidecar** — the scanner, card ingest,
+and bundle importer write `chairphoto:ImportBatch` (merge-safe, beside the
+`chairphoto:LastWrite` field) so the batch survives catalog loss and merge; failed
+writes are queued for the same repair pass as missing `xmp:Identifier` values.
 
 ## Organizational axes (sidebar)
 
@@ -423,9 +424,9 @@ catalog start un-aborted.
 - `albums` — id, name; `album_photos` — album_id, photo_id (manual M:N).
 - `smart_albums` — id, name, rule definition (AND conditions).
 - `pending_operations` — kind (backup/offload/restore), photo_id, target, status.
-- `pending_sidecar_identity` — photo_id, attempts, error, timestamps: photos whose
-  UUID is in SQLite but not yet in their sidecar. No uuid column — `photos.uuid` is
-  the single source of truth for identity.
+- `pending_sidecar_identity` — photo_id, field (`identifier` or `import_batch`), attempts,
+  error, timestamps: sidecar identity fields that are in SQLite but not yet on disk.
+  No value column — `photos.uuid` and `import_batches.uuid` are the sources of truth.
 
 ## Storage model
 
@@ -450,4 +451,3 @@ catalog start un-aborted.
 - **Restore (temporary local copy).** Pulling older NAS folders back to local for fast
   editing (e.g. a 2015 shoot) is the `restore` lifecycle op, the inverse of
   offload.
-

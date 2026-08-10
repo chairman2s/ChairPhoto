@@ -3,9 +3,9 @@
 //! are their own sidebar axis (distinct from albums and tags) and filterable. See
 //! docs/storage-and-import.md.
 //!
-//! The batch id is also meant to be mirrored to each photo's XMP (like the UUID); that
-//! write is deferred together with the scan-time UUID write (scanning does not write to
-//! the user's photo folders yet).
+//! The batch UUID is mirrored to each photo's XMP as `chairphoto:ImportBatch` (like the
+//! photo UUID in `xmp:Identifier`). If the sidecar cannot be written, the failure is
+//! queued in `pending_sidecar_identity` for the shared repair path.
 
 use super::{Catalog, ImportBatch, Result};
 use rusqlite::{params, OptionalExtension};
@@ -65,6 +65,21 @@ impl Catalog {
             .query_row(
                 "SELECT id FROM import_batches WHERE uuid = ?1",
                 rusqlite::params![uuid],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
+    /// Return the immutable import-batch UUID for a photo, when it belongs to one.
+    pub fn import_batch_uuid_for_photo(&self, photo_id: i64) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT b.uuid
+                 FROM photos p
+                 JOIN import_batches b ON b.id = p.import_batch_id
+                 WHERE p.id = ?1",
+                rusqlite::params![photo_id],
                 |r| r.get(0),
             )
             .optional()?)

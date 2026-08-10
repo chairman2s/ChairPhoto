@@ -5,7 +5,7 @@
 //!  2. Photo `path` is stored RELATIVE to the catalog root (see the
 //!     `catalog_root` setting), so a catalog can be remapped on import.
 
-pub const SCHEMA_VERSION: i64 = 20;
+pub const SCHEMA_VERSION: i64 = 21;
 
 pub const SCHEMA_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS settings (
@@ -310,29 +310,31 @@ CREATE TABLE IF NOT EXISTS pending_enrichment (
     queued_at  INTEGER NOT NULL
 );
 
--- Photo identity that is in SQLite but NOT yet on disk (schema v20). The binding
--- invariant (AGENTS.md, "Photo identity") is that a photo's UUID lives in BOTH
--- photos.uuid and the file's xmp:Identifier — a catalog row whose sidecar lacks the
--- UUID has lost its portable identity, and a catalog merge or a re-import can no
--- longer recognise the file. When the sidecar write cannot complete (read-only
--- storage, an unparseable existing sidecar, an offline volume, or a sidecar that
--- already carries a DIFFERENT identity we must not clobber), the debt is recorded
--- here instead of being logged and forgotten, and `repair_pending_identity` retries
--- it. One row per photo copy; CASCADE clears it with the photo or volume.
+-- Sidecar identity that is in SQLite but NOT yet on disk (schema v21). The binding
+-- invariant is that portable identity fields live in both SQLite and the sidecar:
+-- `photos.uuid` -> `xmp:Identifier`, and immutable import batch UUID ->
+-- `chairphoto:ImportBatch`. When the sidecar write cannot complete (read-only storage,
+-- an unparseable existing sidecar, an offline volume, or an identifier conflict we must
+-- not clobber), the debt is recorded here instead of being logged and forgotten, and
+-- `repair_pending_identity` retries it. One row per photo copy per field; CASCADE
+-- clears it with the photo or volume.
 --
 -- There is deliberately no uuid column: photos.uuid is the single source of truth
--- for identity, and a copy here could disagree with it. The target is the same
--- volume-relative location model as photo_locations; `error` is the last failure
--- reason, kept for the UI and for diagnosing storage that never becomes writable.
+-- for identity, and import batch UUID is derived from photos.import_batch_id ->
+-- import_batches.uuid. A copy here could disagree with either. The target is the same
+-- volume-relative location model as photo_locations; `error` is the last failure reason,
+-- kept for the UI and for diagnosing storage that never becomes writable.
 CREATE TABLE IF NOT EXISTS pending_sidecar_identity (
     photo_id        INTEGER NOT NULL REFERENCES photos(id) ON DELETE CASCADE,
+    field           TEXT NOT NULL DEFAULT 'identifier'
+                    CHECK (field IN ('identifier', 'import_batch')),
     volume_id       INTEGER NOT NULL REFERENCES volumes(id) ON DELETE CASCADE,
     relative_path   TEXT NOT NULL,
     attempts        INTEGER NOT NULL DEFAULT 1,
     error           TEXT NOT NULL DEFAULT '',
     queued_at       INTEGER NOT NULL,
     last_attempt_at INTEGER NOT NULL,
-    PRIMARY KEY(photo_id, volume_id, relative_path)
+    PRIMARY KEY(photo_id, field, volume_id, relative_path)
 );
 
 CREATE INDEX IF NOT EXISTS idx_pending_sidecar_identity_photo ON pending_sidecar_identity(photo_id);

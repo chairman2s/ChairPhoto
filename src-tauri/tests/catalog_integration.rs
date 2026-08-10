@@ -3879,6 +3879,13 @@ fn read_only_dir(dir: &std::path::Path) -> Option<ReadOnlyDir> {
     }
 }
 
+fn pending_sidecar_field_count(
+    pending: &[chairphoto_lib::catalog::PendingIdentity],
+    field: &str,
+) -> usize {
+    pending.iter().filter(|p| p.field == field).count()
+}
+
 #[cfg(unix)]
 #[test]
 fn unwritable_sidecar_queues_a_repair_that_later_succeeds() {
@@ -3941,6 +3948,124 @@ fn unwritable_sidecar_queues_a_repair_that_later_succeeds() {
         "the catalog UUID is now on disk"
     );
     assert_eq!(catalog.count_pending_identity().unwrap(), 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn scan_read_only_storage_queues_import_batch_sidecar_debt() {
+    let (catalog, root) = temp_catalog("batch-sidecar-scan-readonly");
+    seed_jpgs(&root, 2);
+    let Some(guard) = read_only_dir(&root) else {
+        return;
+    };
+
+    let abort = AtomicBool::new(false);
+    let result = chairphoto_lib::scanner::scan_folder(&catalog, &root, &abort, &|_| {}).unwrap();
+    assert_eq!(
+        result.created, 2,
+        "read-only sidecars must not abort the scan"
+    );
+    let batch_uuid = catalog.list_import_batches().unwrap()[0].uuid.clone();
+
+    let pending = catalog.list_pending_identity().unwrap();
+    assert_eq!(
+        pending_sidecar_field_count(&pending, "identifier"),
+        2,
+        "UUID sidecar debt is still recorded per photo"
+    );
+    assert_eq!(
+        pending_sidecar_field_count(&pending, "import_batch"),
+        2,
+        "ImportBatch sidecar debt must be recorded instead of printed to stderr"
+    );
+
+    drop(guard);
+    let summary = catalog.repair_pending_identity().unwrap();
+    assert_eq!(
+        (summary.repaired, summary.failed, summary.unreachable),
+        (4, 0, 0),
+        "repair drains both UUID and ImportBatch sidecar debt"
+    );
+    for photo in catalog
+        .list_photos(
+            None,
+            None,
+            None,
+            &[],
+            "all",
+            None,
+            "all",
+            None,
+            None,
+            &[],
+            None,
+        )
+        .unwrap()
+    {
+        let path = root.join(&photo.path);
+        assert_eq!(
+            chairphoto_lib::xmp::read_import_batch(&path).as_deref(),
+            Some(batch_uuid.as_str()),
+            "{} carries its import batch after repair",
+            photo.path
+        );
+    }
+    assert!(catalog.list_pending_identity().unwrap().is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn card_ingest_queues_import_batch_sidecar_debt_and_repairs_it() {
+    use chairphoto_lib::scanner::{copy_from_card, index_ingested};
+
+    let (catalog, root) = temp_catalog("batch-sidecar-ingest-readonly");
+    let card = root.parent().unwrap().join("card-readonly-sidecar");
+    std::fs::create_dir_all(&card).unwrap();
+    std::fs::write(card.join("IMG_1.jpg"), b"\xff\xd8one").unwrap();
+
+    let (copy_result, copied) = copy_from_card(&card, &root, None, |_, _| {}).unwrap();
+    assert_eq!(copied.len(), 1);
+    let dest = copied[0].dest.clone();
+    let sidecar_dir = dest.parent().unwrap().to_path_buf();
+    let Some(guard) = read_only_dir(&sidecar_dir) else {
+        return;
+    };
+
+    let result = index_ingested(
+        &catalog,
+        &root,
+        &card,
+        copied,
+        Some("Malformed sidecar ingest"),
+        copy_result,
+    )
+    .unwrap();
+    assert_eq!(result.created, 1, "the photo is still indexed");
+    let batch_uuid = catalog.list_import_batches().unwrap()[0].uuid.clone();
+
+    let pending = catalog.list_pending_identity().unwrap();
+    assert_eq!(pending_sidecar_field_count(&pending, "identifier"), 1);
+    assert_eq!(
+        pending_sidecar_field_count(&pending, "import_batch"),
+        1,
+        "the ingest-side ImportBatch write failure is retryable catalog debt"
+    );
+    assert!(
+        chairphoto_lib::xmp::read_import_batch(&dest).is_none(),
+        "the read-only destination could not be updated yet"
+    );
+
+    drop(guard);
+    let summary = catalog.repair_pending_identity().unwrap();
+    assert_eq!(
+        (summary.repaired, summary.failed, summary.unreachable),
+        (2, 0, 0)
+    );
+    assert_eq!(
+        chairphoto_lib::xmp::read_import_batch(&dest).as_deref(),
+        Some(batch_uuid.as_str())
+    );
+    assert!(catalog.list_pending_identity().unwrap().is_empty());
 }
 
 #[test]
@@ -4158,10 +4283,14 @@ fn a_scan_onto_read_only_storage_keeps_every_identity_recoverable() {
         "every photo whose sidecar could not be written owes an identity repair"
     );
 
-    // Remount read-write and repair: every catalog UUID reaches its sidecar.
+    // Remount read-write and repair: every queued sidecar identity field is retried;
+    // this scan also queued the import-batch field for each photo.
     drop(guard);
     let summary = catalog.repair_pending_identity().unwrap();
-    assert_eq!((summary.repaired, summary.failed, summary.unreachable), (3, 0, 0));
+    assert_eq!(
+        (summary.repaired, summary.failed, summary.unreachable),
+        (6, 0, 0)
+    );
     let photos = catalog
         .list_photos(None, None, None, &[], "all", None, "all", None, None, &[], None)
         .unwrap();

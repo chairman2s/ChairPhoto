@@ -786,6 +786,39 @@ mod tests {
 mod tone_match_tests {
     use super::render_export_jpeg;
     use image::{GenericImageView, Rgb, RgbImage};
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TEST_IMAGE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    struct TempJpeg {
+        dir: PathBuf,
+        path: PathBuf,
+    }
+
+    impl TempJpeg {
+        fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl Drop for TempJpeg {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn write_temp_jpeg(prefix: &str, jpeg: &[u8]) -> TempJpeg {
+        let seq = TEST_IMAGE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "chairphoto-{prefix}-{}-{seq}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("synthetic.jpg");
+        std::fs::write(&path, jpeg).unwrap();
+        TempJpeg { dir, path }
+    }
 
     /// A synthetic image with a full tonal range and colour so a WB/EV/contrast/B&W edit
     /// exercises the whole look pipeline (a flat patch would hide most divergences). A
@@ -842,12 +875,8 @@ mod tone_match_tests {
         // Export path: the real `render_export_jpeg` on a non-RAW source file. `image::open`
         // decodes the JPEG we just wrote, then the same `render_image` runs, so any tonal
         // divergence between the two callers would show up here.
-        let dir = std::env::temp_dir().join(format!("chairphoto-k1-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("synthetic.jpg");
-        std::fs::write(&path, &jpeg).unwrap();
-        let export = render_export_jpeg(&path, edit_json, true, None).unwrap();
-        let _ = std::fs::remove_file(&path);
+        let source = write_temp_jpeg("tone-match", &jpeg);
+        let export = render_export_jpeg(source.path(), edit_json, true, None).unwrap();
 
         let diff = mean_abs_diff(&preview, &export);
         assert!(
@@ -899,12 +928,8 @@ mod tone_match_tests {
         let jpeg = to_jpeg(&src);
         let edit = r#"{"crop":{"x":0.0,"y":0.0,"w":0.5,"h":0.6,"aspect":"1:1"}}"#;
         let preview = crate::plugins::edit::render_jpeg(&jpeg, edit, 0).unwrap();
-        let dir = std::env::temp_dir().join(format!("chairphoto-k1g-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("synthetic.jpg");
-        std::fs::write(&path, &jpeg).unwrap();
-        let export = render_export_jpeg(&path, edit, true, None).unwrap();
-        let _ = std::fs::remove_file(&path);
+        let source = write_temp_jpeg("geometry-match", &jpeg);
+        let export = render_export_jpeg(source.path(), edit, true, None).unwrap();
         let dp = image::load_from_memory(&preview).unwrap().dimensions();
         let de = image::load_from_memory(&export).unwrap().dimensions();
         assert_eq!(dp, de, "preview {dp:?} and export {de:?} geometry must match");

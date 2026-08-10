@@ -852,6 +852,71 @@ fn per_photo_storage_status_from_locations() {
 }
 
 #[test]
+fn grid_badge_batch_queries_accept_more_than_one_parameter_chunk() {
+    let (catalog, root) = temp_catalog("grid-badge-chunks");
+    let total = 1_100;
+    let mut ids = Vec::with_capacity(total);
+
+    for index in 0..total {
+        let path = root.join(format!("chunked-{index:04}.arw"));
+        std::fs::write(&path, b"x").unwrap();
+        let id = catalog
+            .upsert_photo(&path, None, index as i64, 1)
+            .unwrap()
+            .id;
+        if index % 10 == 0 {
+            catalog.create_version(id, "Edit").unwrap();
+        }
+        ids.push(id);
+    }
+
+    let reachable: std::collections::HashMap<i64, bool> = catalog
+        .list_volumes()
+        .unwrap()
+        .into_iter()
+        .map(|v| (v.id, v.reachable))
+        .collect();
+    let statuses = catalog.photo_storage_statuses(&ids, &reachable).unwrap();
+    assert_eq!(statuses.len(), ids.len());
+    assert!(
+        statuses
+            .iter()
+            .all(|(_, status)| *status == StorageStatus::LocalOnly),
+        "all synthetic photos have only their local primary location"
+    );
+
+    let counts = catalog.version_counts(&ids).unwrap();
+    assert_eq!(counts.len(), total / 10);
+    assert_eq!(counts[0], (ids[0], 1));
+
+    // The rows above only prove that per-chunk results stitch back together: 1,100 binds
+    // fit under `SQLITE_MAX_VARIABLE_NUMBER`, which is 32766 in the SQLite we bundle, so
+    // an unchunked `IN (...)` would still pass. Pad past that ceiling to cover the
+    // chunking itself — a 100k-photo grid refresh passes every returned id, and
+    // unchunked this fails with "too many SQL variables". Padding ids need no rows; they
+    // only have to survive being bound.
+    const SQLITE_MAX_VARIABLE_NUMBER: usize = 32_766;
+    let padding_start = ids.last().unwrap() + 1;
+    let mut padded = ids.clone();
+    padded.extend(padding_start..padding_start + SQLITE_MAX_VARIABLE_NUMBER as i64);
+    assert!(
+        padded.len() > SQLITE_MAX_VARIABLE_NUMBER,
+        "the padded batch must exceed the bind-parameter ceiling"
+    );
+
+    let padded_statuses = catalog.photo_storage_statuses(&padded, &reachable).unwrap();
+    assert_eq!(padded_statuses.len(), padded.len());
+    assert_eq!(
+        &padded_statuses[..total],
+        statuses.as_slice(),
+        "the real ids keep their status and order when the batch spans many chunks"
+    );
+
+    let padded_counts = catalog.version_counts(&padded).unwrap();
+    assert_eq!(padded_counts, counts, "padding ids contribute no version rows");
+}
+
+#[test]
 fn rerooting_moves_the_catalog_root_volume() {
     let dir = std::env::temp_dir().join("chairphoto-test-reroot");
     let _ = std::fs::remove_dir_all(&dir);

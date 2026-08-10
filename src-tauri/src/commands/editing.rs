@@ -313,8 +313,14 @@ pub async fn version_counts(
     state: State<'_, AppState>,
     photo_ids: Vec<i64>,
 ) -> Result<Vec<(i64, i64)>, String> {
-    with_catalog_blocking(&state, move |c| c.version_counts(&photo_ids)).await
+    with_catalog_blocking(&state, move |c| grid_version_counts(c, &photo_ids)).await
+}
+
+pub(crate) fn grid_version_counts(
+    c: &Catalog,
+    photo_ids: &[i64],
+) -> crate::catalog::Result<Vec<(i64, i64)>> {
+    c.version_counts(photo_ids)
 }
 
 // --- publications (where a photo was posted + which version, see docs/publications.md) ---
-

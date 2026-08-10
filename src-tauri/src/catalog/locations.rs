@@ -12,7 +12,8 @@
 //! top of it without changing the read path.
 
 use super::{
-    Catalog, CatalogError, LocationRole, PhotoLocation, Result, StorageStatus, Volume, VolumeKind,
+    sqlite_param_placeholders, Catalog, CatalogError, LocationRole, PhotoLocation, Result,
+    StorageStatus, Volume, VolumeKind, SQLITE_PARAM_CHUNK,
 };
 use rusqlite::{params, OptionalExtension};
 use std::path::{Path, PathBuf};
@@ -405,23 +406,24 @@ impl Catalog {
         if photo_ids.is_empty() {
             return Ok(Vec::new());
         }
-        // Gather every (photo_id, kind, volume_id) for the requested photos.
-        let placeholders = vec!["?"; photo_ids.len()].join(",");
-        let mut stmt = self.conn.prepare(&format!(
-            "SELECT l.photo_id, v.kind, v.id FROM photo_locations l
-             JOIN volumes v ON v.id = l.volume_id
-             WHERE l.photo_id IN ({placeholders})"
-        ))?;
-        let binds: Vec<&dyn rusqlite::ToSql> =
-            photo_ids.iter().map(|i| i as &dyn rusqlite::ToSql).collect();
         let mut per_photo: std::collections::HashMap<i64, Vec<(String, i64)>> =
             std::collections::HashMap::new();
-        let rows = stmt.query_map(binds.as_slice(), |r| {
-            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?))
-        })?;
-        for row in rows {
-            let (pid, kind, vid) = row?;
-            per_photo.entry(pid).or_default().push((kind, vid));
+        for chunk in photo_ids.chunks(SQLITE_PARAM_CHUNK) {
+            let placeholders = sqlite_param_placeholders(chunk.len());
+            let mut stmt = self.conn.prepare(&format!(
+                "SELECT l.photo_id, v.kind, v.id FROM photo_locations l
+                 JOIN volumes v ON v.id = l.volume_id
+                 WHERE l.photo_id IN ({placeholders})"
+            ))?;
+            let binds: Vec<&dyn rusqlite::ToSql> =
+                chunk.iter().map(|i| i as &dyn rusqlite::ToSql).collect();
+            let rows = stmt.query_map(binds.as_slice(), |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?))
+            })?;
+            for row in rows {
+                let (pid, kind, vid) = row?;
+                per_photo.entry(pid).or_default().push((kind, vid));
+            }
         }
         Ok(photo_ids
             .iter()

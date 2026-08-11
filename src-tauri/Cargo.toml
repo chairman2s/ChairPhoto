@@ -24,7 +24,7 @@ ai = ["dep:reqwest"]
 # Send a photo to a device on the LAN over LocalSend's documented v2 HTTP protocol (UDP
 # multicast discovery + prepare-upload/upload). Send-only. Reuses `reqwest` (HTTP) and the
 # already-on tokio "full" (UDP via tokio::net::UdpSocket) — no new deps. See docs/localsend.md.
-localsend = ["dep:reqwest"]
+localsend = ["dep:reqwest", "dep:socket2", "dep:libc"]
 # Publish to Flickr / SmugMug via their official OAuth 1.0a APIs (HMAC-SHA1 signing +
 # HTTP upload). Pure-Rust deps, so they compile anywhere. Each is a separate module, and
 # neither is in `default` — opt in with `--features flickr,smugmug`.
@@ -147,6 +147,13 @@ libloading = { version = "0.8", optional = true }
 # parallel; DB writes are serialised on the calling thread via a sequential collect pass.
 # Used unconditionally (not just under `faces`) so the test suite compiles without the feature.
 rayon = "1"
+# Only compiled when the `localsend` feature is on. Sets SO_REUSEADDR/SO_REUSEPORT on the
+# discovery socket (so it can bind :53317 alongside another LocalSend-speaking process already
+# holding it) and IP_MULTICAST_IF per announce (localsend/mod.rs). Already resolved in
+# Cargo.lock at 0.6.4 via tokio's and hyper-util's dependency trees (`cargo tree -i socket2`),
+# so promoting it to a direct dependency is no new download and no new compile unit — only
+# visibility for our own `use socket2::…`.
+socket2 = { version = "0.6", optional = true }
 
 # chairphoto:// OS-level deep links (desktop only): deep-link registers the scheme and
 # delivers URLs; single-instance (with its deep-link feature) forwards a second launch's
@@ -154,6 +161,16 @@ rayon = "1"
 [target."cfg(any(target_os = \"macos\", windows, target_os = \"linux\"))".dependencies]
 tauri-plugin-deep-link = "2"
 tauri-plugin-single-instance = { version = "2", features = ["deep-link"] }
+
+# Only compiled when the `localsend` feature is on, on unix (Linux/macOS). `getifaddrs(3)` for
+# per-interface multicast join/announce (localsend/mod.rs) — std has no portable interface
+# enumeration. Already resolved in Cargo.lock at a single unified version (0.2.186) via
+# tokio/mio's dependency tree on every platform (`cargo tree -i libc`), so promoting it to a
+# direct dependency here is the same no-new-download/no-new-compile-unit story as `socket2`
+# above, just target-scoped since `getifaddrs` isn't a Windows API. Windows falls back to the
+# pre-existing `Ipv4Addr::UNSPECIFIED` join (see `local_multicast_interfaces`).
+[target."cfg(unix)".dependencies]
+libc = { version = "0.2", optional = true }
 
 # Optimize image-decoding crates even in dev builds. Our own code stays in debug
 # (fast incremental builds), but decoding a 66 MP embedded RAW preview is ~20x

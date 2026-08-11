@@ -176,11 +176,19 @@ async fn relocate_photo_in_state(
 
 /// Sidecar identity fields that are in the catalog but not (yet) in XMP: photo UUID
 /// (`xmp:Identifier`) and import batch UUID (`chairphoto:ImportBatch`).
+///
+/// Bounded: the queue reached 74,488 rows on the 100k harness shape in #20 (tens of MB of
+/// JSON if pulled whole), so this always pages via `LIMIT`/`OFFSET` — the debt panel
+/// fetches one page at a time and shows "showing N of M" (review finding F1a). There is no
+/// unbounded frontend-facing variant; internal Rust callers that need the whole queue (the
+/// repair pass, tests) use `Catalog::list_pending_identity()` directly, off the IPC boundary.
 #[tauri::command]
 pub async fn list_pending_identity(
     state: State<'_, AppState>,
+    limit: i64,
+    offset: i64,
 ) -> Result<Vec<crate::catalog::PendingIdentity>, String> {
-    with_catalog_blocking(&state, |c| c.list_pending_identity()).await
+    with_catalog_blocking(&state, move |c| c.list_pending_identity_page(limit, offset)).await
 }
 
 /// Cheap counts (total debt + conflicts) over the pending-identity queue, for a summary
@@ -299,7 +307,7 @@ mod tests {
         std::fs::remove_file(&moved).unwrap();
         let summary = catalog.repair_pending_identity().unwrap();
         assert_eq!(
-            (summary.repaired, summary.failed, summary.unreachable),
+            (summary.bound, summary.failed, summary.unreachable),
             (0, 0, 1),
             "repair must stay scoped to the moved copy, even while another copy is reachable"
         );

@@ -73,12 +73,24 @@ pub enum SidecarIdentity {
 }
 
 // Distinguishing prefixes of the non-`Bound` `error_text()` outputs below. `error_text()`
-// is the only writer of `pending_sidecar_identity.error` (see `record_sidecar_field_target`),
-// so a stored row's prefix reliably identifies which `SidecarIdentity` variant produced it —
+// is the only PRODUCTION writer of `pending_sidecar_identity.error` (see
+// `record_sidecar_field_target`) — but it is not the *only* writer: `performance_harness.rs`
+// inserts a synthetic `"synthetic harness: local sidecar not materialized"` string directly
+// for its benchmark fixture, bypassing `error_text()` entirely. That string matches neither
+// prefix below, so it reads as `"unreachable"` via the fallback in `debt_state_from_error`
+// — harmless for the harness, but proof this is a string match standing in for a real state
+// column, not an invariant the type system enforces. A stored row's prefix reliably
+// identifies which `SidecarIdentity` variant produced it for every *real* writer —
 // `debt_state_from_error` uses this to recover a coarse state for display (CONTEXT.md §
-// Identity: Unreachable / Unwritable / Conflict) without a redundant DB column. Both
-// `error_text` and `debt_state_from_error` are defined from these same consts, so they
-// cannot drift apart.
+// Identity: Unreachable / Unwritable / Conflict) without a redundant DB column, and
+// `error_text` / `debt_state_from_error` are defined from these same consts so they can't
+// drift apart from EACH OTHER. Before #33 hangs Adopt/Overwrite/Dismiss actions off this
+// state, it should read from an actual enum/column instead of sniffing prose.
+//
+// `summarize_pending_identity`'s SQL matches these same consts with `GLOB` (case-sensitive,
+// `*`/`?` wildcards) rather than `LIKE` (case-insensitive, and `_`/`%` are wildcards) so it
+// agrees with this Rust-side case-sensitive `starts_with` rather than silently diverging on
+// a differently-cased error string.
 const UNWRITABLE_PREFIX: &str = "sidecar write failed";
 const CONFLICT_PREFIX: &str = "sidecar carries a different identity";
 
@@ -99,10 +111,11 @@ impl SidecarIdentity {
 /// Recover the coarse CONTEXT.md § Identity state — `"unreachable"`, `"unwritable"`, or
 /// `"conflict"` — from a stored `pending_sidecar_identity.error`, for display. `Bound`
 /// copies are deleted from the queue (see `record_sidecar_field_target`), so it never
-/// appears here. Unrecognised text (there should be none — `error_text` is the only
-/// writer) falls back to `"unreachable"`, the reading that costs a user the least if the
-/// prefix match is ever wrong: repair keeps retrying rather than a legitimately queued
-/// copy silently reading as a hard failure.
+/// appears here. Unrecognised text — there should be none from `error_text()` (the only
+/// PRODUCTION writer), but `performance_harness.rs` inserts a synthetic string directly
+/// (see the const doc above) — falls back to `"unreachable"`, the reading that costs a
+/// user the least if the prefix match is ever wrong: repair keeps retrying rather than a
+/// legitimately queued copy silently reading as a hard failure.
 fn debt_state_from_error(error: &str) -> &'static str {
     if error.starts_with(CONFLICT_PREFIX) {
         "conflict"
@@ -154,16 +167,69 @@ fn pending_sidecar_value(
     (field, value)
 }
 
+/// Shared by [`Catalog::list_pending_identity`] and
+/// [`Catalog::list_pending_identity_page`] so the two can't drift apart. `ORDER BY` is
+/// oldest-queued first so paging is stable across calls.
+const PENDING_IDENTITY_QUERY: &str =
+    "SELECT q.photo_id, p.uuid, p.path, q.field, q.volume_id, v.base_path, q.relative_path,
+            q.attempts, q.error, q.queued_at, q.last_attempt_at, b.uuid
+     FROM pending_sidecar_identity q
+     JOIN photos p ON p.id = q.photo_id
+     JOIN volumes v ON v.id = q.volume_id
+     LEFT JOIN import_batches b ON b.id = p.import_batch_id
+     ORDER BY q.queued_at, q.photo_id, q.field, q.volume_id, q.relative_path";
+
+/// Row mapper for [`PENDING_IDENTITY_QUERY`] (with or without a `LIMIT`/`OFFSET` suffix).
+fn map_pending_identity_row(r: &rusqlite::Row) -> rusqlite::Result<PendingIdentity> {
+    let field_text: String = r.get(3)?;
+    let photo_uuid: String = r.get(1)?;
+    let import_batch_uuid: Option<String> = r.get(11)?;
+    let (field, value) = pending_sidecar_value(&field_text, &photo_uuid, import_batch_uuid);
+    let base: String = r.get(5)?;
+    let relative_path: String = r.get(6)?;
+    let target_path = Path::new(&base)
+        .join(&relative_path)
+        .to_string_lossy()
+        .to_string();
+    let error: String = r.get(8)?;
+    let state = debt_state_from_error(&error).to_string();
+    Ok(PendingIdentity {
+        photo_id: r.get(0)?,
+        uuid: photo_uuid,
+        field: field.as_db_str().to_string(),
+        value,
+        path: r.get(2)?,
+        volume_id: r.get(4)?,
+        relative_path,
+        target_path,
+        state,
+        attempts: r.get(7)?,
+        error,
+        queued_at: r.get(9)?,
+        last_attempt_at: r.get(10)?,
+    })
+}
+
 /// A photo whose sidecar still owes it a portable identity field, with the last failure.
+///
+/// Fields marked `skip_serializing` below are real, tested Rust fields — used by
+/// `Catalog::list_pending_identity()`'s own test suite and by internal callers — but are
+/// deliberately NOT shipped to the frontend: the read-only debt panel (issue #50) never
+/// renders them, and shipping them anyway was ~a third of the panel's IPC payload for
+/// nothing (review finding F1d). Render one, or keep it off the wire.
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PendingIdentity {
     pub photo_id: i64,
-    /// The identity that must reach the sidecar (`photos.uuid`).
+    /// The identity that must reach the sidecar (`photos.uuid`). Not rendered by the
+    /// debt panel; kept for internal/test use (see struct doc).
+    #[serde(skip_serializing)]
     pub uuid: String,
     /// The sidecar field still owed by this copy: `identifier` or `import_batch`.
     pub field: String,
     /// The value that must be written for `field` (photo UUID or import batch UUID).
+    /// Not rendered by the debt panel; kept for internal/test use (see struct doc).
+    #[serde(skip_serializing)]
     pub value: Option<String>,
     /// The photo's catalog-root-relative logical path, for display.
     pub path: String,
@@ -175,6 +241,9 @@ pub struct PendingIdentity {
     /// independently, per issue #50).
     pub relative_path: String,
     /// Absolute path to the copy whose sidecar is pending, for display/diagnostics.
+    /// Not rendered by the debt panel — derivable client-side from `volume_id` +
+    /// `relative_path` — so it's kept for internal/test use only (see struct doc).
+    #[serde(skip_serializing)]
     pub target_path: String,
     /// The coarse CONTEXT.md § Identity state this copy is in: `"unreachable"`,
     /// `"unwritable"`, or `"conflict"` — never `"bound"` (bound copies are cleared from
@@ -183,18 +252,28 @@ pub struct PendingIdentity {
     pub state: String,
     pub attempts: i64,
     pub error: String,
+    /// Not rendered by the debt panel (only `last_attempt_at` is); kept for internal/test
+    /// use and as the queue's sort key (see struct doc).
+    #[serde(skip_serializing)]
     pub queued_at: i64,
     pub last_attempt_at: i64,
 }
 
 /// Coarse counts over `pending_sidecar_identity`, for a summary badge that doesn't need
 /// every row. See [`Catalog::summarize_pending_identity`].
+///
+/// Both counts are in **copies** (`DISTINCT photo_id, volume_id, relative_path`), not queue
+/// rows: `PRIMARY KEY(photo_id, field, volume_id, relative_path)` means one copy owing both
+/// `identifier` and `import_batch` is two rows but one copy, and CONTEXT.md's "Copy" / issue
+/// #50's "the number of copies currently in identity debt" are both about the physical copy,
+/// not the (copy, field) pair.
 #[derive(Debug, Default, Clone, Copy, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PendingIdentitySummary {
-    /// Every queued copy, any field, any state (`Unreachable` / `Unwritable` / `Conflict`).
+    /// Every queued copy (any field, any state) — counted once even if it owes both fields.
     pub total: i64,
-    /// Of `total`, how many are `Conflict` — need a human, not a retry.
+    /// Of `total`, how many copies have at least one field in `Conflict` — need a human,
+    /// not a retry.
     pub conflicts: i64,
 }
 
@@ -236,20 +315,29 @@ impl IdentityRepairPlan {
 #[serde(rename_all = "camelCase")]
 pub struct IdentityRepairSummary {
     /// Sidecar field now on disk for this queued copy; the pending row was cleared.
-    pub repaired: usize,
-    /// The queued copy is not reachable right now — left queued for the next pass.
+    /// "Bound" is the canonical CONTEXT.md § Identity term for this outcome — not
+    /// "repaired" (review finding F5).
+    pub bound: usize,
+    /// The queued copy is not reachable right now — left queued for the next pass. A
+    /// normal state, not a failure.
     pub unreachable: usize,
-    /// Retried and still failing (unwritable sidecar, or an identity conflict a
-    /// human has to resolve). Left queued.
+    /// The sidecar already carries a different identity. **Not a failure** — the file was
+    /// deliberately left untouched ("when uncertain, preserve") and a human has to resolve
+    /// it (#33), not retry it. Kept out of `failed` so the UI never reports a Conflict as
+    /// an error (review finding F5).
+    pub conflicts: usize,
+    /// Retried and is still genuinely failing (unwritable sidecar: read-only storage, an
+    /// unparseable sidecar, a full disk). Left queued.
     pub failed: usize,
 }
 
 impl IdentityRepairSummary {
     pub fn tally(&mut self, outcome: &SidecarIdentity) {
         match outcome {
-            SidecarIdentity::Bound => self.repaired += 1,
+            SidecarIdentity::Bound => self.bound += 1,
             SidecarIdentity::Unreachable => self.unreachable += 1,
-            SidecarIdentity::Unwritable(_) | SidecarIdentity::Conflict(_) => self.failed += 1,
+            SidecarIdentity::Conflict(_) => self.conflicts += 1,
+            SidecarIdentity::Unwritable(_) => self.failed += 1,
         }
     }
 }
@@ -362,46 +450,38 @@ impl Catalog {
     }
 
     /// Every copy whose sidecar still owes it a portable identity field, oldest first.
+    ///
+    /// Unbounded — pulls the whole queue, which reached 74,488 rows on the 100k harness
+    /// shape in #20 (tens of MB of JSON if this crossed IPC). Kept for internal/test
+    /// callers that need the complete set (see `PendingIdentity`'s struct doc); the Tauri
+    /// command layer and the frontend debt panel use
+    /// [`Catalog::list_pending_identity_page`] instead (review finding F1a).
     pub fn list_pending_identity(&self) -> Result<Vec<PendingIdentity>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT q.photo_id, p.uuid, p.path, q.field, q.volume_id, v.base_path, q.relative_path,
-                    q.attempts, q.error, q.queued_at, q.last_attempt_at, b.uuid
-             FROM pending_sidecar_identity q
-             JOIN photos p ON p.id = q.photo_id
-             JOIN volumes v ON v.id = q.volume_id
-             LEFT JOIN import_batches b ON b.id = p.import_batch_id
-             ORDER BY q.queued_at, q.photo_id, q.field, q.volume_id, q.relative_path",
-        )?;
-        let rows = stmt.query_map([], |r| {
-            let field_text: String = r.get(3)?;
-            let photo_uuid: String = r.get(1)?;
-            let import_batch_uuid: Option<String> = r.get(11)?;
-            let (field, value) =
-                pending_sidecar_value(&field_text, &photo_uuid, import_batch_uuid);
-            let base: String = r.get(5)?;
-            let relative_path: String = r.get(6)?;
-            let target_path = Path::new(&base)
-                .join(&relative_path)
-                .to_string_lossy()
-                .to_string();
-            let error: String = r.get(8)?;
-            let state = debt_state_from_error(&error).to_string();
-            Ok(PendingIdentity {
-                photo_id: r.get(0)?,
-                uuid: photo_uuid,
-                field: field.as_db_str().to_string(),
-                value,
-                path: r.get(2)?,
-                volume_id: r.get(4)?,
-                relative_path,
-                target_path,
-                state,
-                attempts: r.get(7)?,
-                error,
-                queued_at: r.get(9)?,
-                last_attempt_at: r.get(10)?,
-            })
-        })?;
+        let mut stmt = self.conn.prepare(PENDING_IDENTITY_QUERY)?;
+        let rows = stmt.query_map([], map_pending_identity_row)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// A bounded window over the pending-identity queue, same ordering as
+    /// [`Catalog::list_pending_identity`] — for the Tauri command and the debt panel, so a
+    /// 74k-row queue is never pulled across IPC in one payload (review finding F1a).
+    ///
+    /// There is no index on `queued_at` (only `idx_pending_sidecar_identity_photo`, on
+    /// `photo_id`), so this still sorts the whole matching set before applying
+    /// `LIMIT`/`OFFSET`. At the queue sizes seen so far (tens of thousands of rows) an
+    /// in-memory sort is a few milliseconds, and the queue is meant to be small in the
+    /// steady state (rows leave it as soon as a copy binds) — so this file does NOT add a
+    /// migration for a `queued_at` index. Revisit if a real deployment keeps tens/hundreds
+    /// of thousands of rows queued for a long time and paging is measurably slow.
+    pub fn list_pending_identity_page(
+        &self,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<PendingIdentity>> {
+        let mut stmt = self
+            .conn
+            .prepare(&format!("{PENDING_IDENTITY_QUERY} LIMIT ?1 OFFSET ?2"))?;
+        let rows = stmt.query_map(params![limit, offset], map_pending_identity_row)?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
@@ -418,14 +498,29 @@ impl Catalog {
 
     /// Coarse counts over the whole pending-identity queue (every field, not just
     /// `identifier`) — cheap enough to compute without pulling every row across IPC, for
-    /// a summary badge/header. `total` matches `list_pending_identity().len()`;
-    /// `conflicts` is the subset a human must resolve rather than one a repair pass can
-    /// retry into success (see CONTEXT.md § Identity).
+    /// a summary badge/header.
+    ///
+    /// Both counts are in **copies** (`DISTINCT photo_id, volume_id, relative_path`), not
+    /// queue rows: `total` matches the number of distinct copies `list_pending_identity`
+    /// would return grouped by copy, NOT `list_pending_identity().len()` — a copy owing
+    /// both `identifier` and `import_batch` is two rows but one copy (review finding F2,
+    /// CONTEXT.md's "Copy", issue #50's "the number of copies currently in identity
+    /// debt"). `conflicts` is the subset of those copies with at least one field in
+    /// `Conflict` — needs a human, not a retry (see CONTEXT.md § Identity).
+    ///
+    /// Matches `error` with `GLOB` (case-sensitive, `*`/`?` wildcards), not `LIKE`
+    /// (case-insensitive, `_`/`%` wildcards), so this agrees with `debt_state_from_error`'s
+    /// case-sensitive Rust `starts_with` instead of silently diverging on a differently
+    /// cased error string (review finding F3).
     pub fn summarize_pending_identity(&self) -> Result<PendingIdentitySummary> {
         Ok(self.conn.query_row(
-            "SELECT count(*), count(*) FILTER (WHERE error LIKE ?1)
-             FROM pending_sidecar_identity",
-            params![format!("{CONFLICT_PREFIX}%")],
+            "SELECT count(*), coalesce(sum(has_conflict), 0)
+             FROM (
+                 SELECT max(error GLOB ?1) AS has_conflict
+                 FROM pending_sidecar_identity
+                 GROUP BY photo_id, volume_id, relative_path
+             )",
+            params![format!("{CONFLICT_PREFIX}*")],
             |r| {
                 Ok(PendingIdentitySummary {
                     total: r.get(0)?,
@@ -502,14 +597,51 @@ fn now() -> i64 {
 mod tests {
     use super::*;
 
-    fn temp_catalog(tag: &str) -> (Catalog, PathBuf) {
-        let dir = std::env::temp_dir().join(format!("chairphoto-identity-test-{tag}"));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let root = dir.join("photos");
+    /// A test's own temp directory, keyed by pid + tag and removed on drop — mirrors
+    /// `thumbnails::tests::TestTmpDir` (see `src-tauri/src/thumbnails/mod.rs`).
+    ///
+    /// This file previously keyed on `tag` alone (`chairphoto-identity-test-{tag}`),
+    /// which every `cargo test` process on the machine shares; `remove_dir_all` on entry
+    /// then deletes a directory another process is still writing into, and nothing
+    /// cleans up after a panicking test either. That is the exact bug #45 / commit
+    /// 9cd6d83 fixed for the thumbnail tests, reintroduced here one commit later (review
+    /// finding F8). `src-tauri/src/test_support.rs` on the #45 branch adds a shared
+    /// `TestTmpDir` with this same shape but is not merged yet; this is a local copy in
+    /// the same shape so the two converge trivially once it lands — collapse this into
+    /// `test_support::TestTmpDir` post-merge instead of keeping both.
+    struct TestTmpDir(PathBuf);
+
+    impl TestTmpDir {
+        fn new(tag: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "chairphoto-identity-test-{tag}-{}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TestTmpDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Returns the catalog, its photo root, and the `TestTmpDir` guard — bind the guard
+    /// too (`let (catalog, root, _dir) = temp_catalog(...)`) so it lives for the whole
+    /// test; dropping it early deletes the directory the test is still using.
+    fn temp_catalog(tag: &str) -> (Catalog, PathBuf, TestTmpDir) {
+        let dir = TestTmpDir::new(tag);
+        let root = dir.path().join("photos");
         std::fs::create_dir_all(&root).unwrap();
-        let catalog = Catalog::open(&dir.join("test.chairphoto"), &root).unwrap();
-        (catalog, root)
+        let catalog = Catalog::open(&dir.path().join("test.chairphoto"), &root).unwrap();
+        (catalog, root, dir)
     }
 
     fn seed_photo(catalog: &Catalog, root: &Path, name: &str) -> (i64, PathBuf) {
@@ -525,7 +657,7 @@ mod tests {
     /// `Conflict` (needs a human) or an `Unwritable` failure, per issue #50.
     #[test]
     fn list_pending_identity_reports_the_state_matching_each_outcome() {
-        let (catalog, root) = temp_catalog("state-per-variant");
+        let (catalog, root, _dir) = temp_catalog("state-per-variant");
         let (unreachable_id, unreachable_path) = seed_photo(&catalog, &root, "unreachable.arw");
         let (unwritable_id, unwritable_path) = seed_photo(&catalog, &root, "unwritable.arw");
         let (conflict_id, conflict_path) = seed_photo(&catalog, &root, "conflict.arw");
@@ -573,7 +705,7 @@ mod tests {
     /// rows/states — issue #50 explicitly calls out not collapsing them.
     #[test]
     fn two_copies_of_one_photo_on_different_volumes_stay_two_rows() {
-        let (catalog, root) = temp_catalog("two-copies-two-volumes");
+        let (catalog, root, _dir) = temp_catalog("two-copies-two-volumes");
         let (photo_id, local_path) = seed_photo(&catalog, &root, "same-photo.arw");
 
         let other_dir = root.parent().unwrap().join("second-volume");
@@ -611,7 +743,7 @@ mod tests {
         // Deliberately unbalanced (2 unwritable, 1 unreachable, 1 conflict) so a
         // `conflicts` count that accidentally matched the wrong state would produce a
         // visibly different number, not a coincidentally-equal one.
-        let (catalog, root) = temp_catalog("summarize");
+        let (catalog, root, _dir) = temp_catalog("summarize");
         let (a, a_path) = seed_photo(&catalog, &root, "a.arw");
         let (b, b_path) = seed_photo(&catalog, &root, "b.arw");
         let (b2, b2_path) = seed_photo(&catalog, &root, "b2.arw");
@@ -638,7 +770,7 @@ mod tests {
     /// `summarize_pending_identity` must not double-count against a stale total.
     #[test]
     fn summarize_pending_identity_drops_repaired_rows() {
-        let (catalog, root) = temp_catalog("summarize-repair");
+        let (catalog, root, _dir) = temp_catalog("summarize-repair");
         let (a, a_path) = seed_photo(&catalog, &root, "a.arw");
         catalog.record_sidecar_identity(a, &a_path, &SidecarIdentity::Unreachable).unwrap();
         assert_eq!(catalog.summarize_pending_identity().unwrap().total, 1);
@@ -648,5 +780,111 @@ mod tests {
         let summary = catalog.summarize_pending_identity().unwrap();
         assert_eq!(summary.total, 0);
         assert_eq!(summary.conflicts, 0);
+    }
+
+    /// `total`/`conflicts` must count DISTINCT copies (`photo_id, volume_id,
+    /// relative_path`), not queue rows — `PRIMARY KEY(photo_id, field, volume_id,
+    /// relative_path)` means one copy owing both `identifier` and `import_batch` is two
+    /// rows but one copy. Mutation M5 (review finding F2) added `WHERE field =
+    /// 'identifier'` to `summarize_pending_identity`, and every existing test stayed
+    /// green because every fixture row used `field = 'identifier'`. This test seeds a
+    /// copy that owes ONLY `import_batch` — which such a filter would silently drop from
+    /// the count — and a copy that owes BOTH fields — which a naive `count(*)` would
+    /// double-count — so either mistake changes the numbers asserted below.
+    #[test]
+    fn summarize_pending_identity_counts_copies_not_field_pairs() {
+        let (catalog, root, _dir) = temp_catalog("summarize-copies-not-pairs");
+        let (a, a_path) = seed_photo(&catalog, &root, "a.arw");
+        let (b, b_path) = seed_photo(&catalog, &root, "b.arw");
+        let (c, c_path) = seed_photo(&catalog, &root, "c.arw");
+
+        // Copy A owes only `identifier`.
+        catalog
+            .record_sidecar_identity(a, &a_path, &SidecarIdentity::Unreachable)
+            .unwrap();
+        // Copy B owes only `import_batch` — a `field = 'identifier'` filter would drop
+        // this copy from the count entirely.
+        catalog
+            .record_sidecar_import_batch(b, &b_path, &SidecarIdentity::Unreachable)
+            .unwrap();
+        // Copy C owes BOTH fields: two queue rows, but ONE copy, and its import_batch
+        // field is the only Conflict — so `conflicts` must also count copies, not rows.
+        catalog
+            .record_sidecar_identity(c, &c_path, &SidecarIdentity::Unreachable)
+            .unwrap();
+        catalog
+            .record_sidecar_import_batch(
+                c,
+                &c_path,
+                &SidecarIdentity::Conflict("other-uuid".to_string()),
+            )
+            .unwrap();
+
+        // Sanity: 4 queue rows across 3 copies.
+        assert_eq!(catalog.list_pending_identity().unwrap().len(), 4);
+
+        let summary = catalog.summarize_pending_identity().unwrap();
+        assert_eq!(summary.total, 3, "3 copies, not 4 (copy, field) rows");
+        assert_eq!(
+            summary.conflicts, 1,
+            "copy C is one conflicted COPY, not two conflicted rows"
+        );
+    }
+
+    /// `Conflict` is "not an error and not repairable by retrying" — `tally()` must route
+    /// it to its own bucket, never into `failed`, so a post-repair summary never calls a
+    /// Conflict a failure (review finding F5).
+    #[test]
+    fn repair_summary_tally_keeps_conflict_out_of_failed() {
+        let mut summary = IdentityRepairSummary::default();
+        summary.tally(&SidecarIdentity::Bound);
+        summary.tally(&SidecarIdentity::Unreachable);
+        summary.tally(&SidecarIdentity::Unwritable("disk full".to_string()));
+        summary.tally(&SidecarIdentity::Conflict("other-uuid".to_string()));
+
+        assert_eq!(summary.bound, 1);
+        assert_eq!(summary.unreachable, 1);
+        assert_eq!(summary.failed, 1, "only Unwritable is a genuine failure");
+        assert_eq!(
+            summary.conflicts, 1,
+            "Conflict needs a human, not a retry — must never land in `failed`"
+        );
+    }
+
+    /// The paged listing must return the same rows, in the same order, as the unbounded
+    /// listing — just windowed — so the debt panel's "showing N of M" pages line up with
+    /// a full fetch, and a large queue is never pulled across IPC in one payload (review
+    /// finding F1a).
+    #[test]
+    fn list_pending_identity_page_windows_the_unbounded_queue() {
+        let (catalog, root, _dir) = temp_catalog("page-windows");
+        let names = ["a.arw", "b.arw", "c.arw", "d.arw", "e.arw"];
+        for name in names {
+            let (id, path) = seed_photo(&catalog, &root, name);
+            catalog
+                .record_sidecar_identity(id, &path, &SidecarIdentity::Unreachable)
+                .unwrap();
+        }
+
+        let all = catalog.list_pending_identity().unwrap();
+        assert_eq!(all.len(), 5);
+
+        let page1 = catalog.list_pending_identity_page(2, 0).unwrap();
+        let page2 = catalog.list_pending_identity_page(2, 2).unwrap();
+        let page3 = catalog.list_pending_identity_page(2, 4).unwrap();
+        assert_eq!(page1.len(), 2);
+        assert_eq!(page2.len(), 2);
+        assert_eq!(page3.len(), 1, "the last page is partial, not padded or empty");
+
+        let paged_ids: Vec<i64> = [page1, page2, page3]
+            .into_iter()
+            .flatten()
+            .map(|p| p.photo_id)
+            .collect();
+        let unbounded_ids: Vec<i64> = all.iter().map(|p| p.photo_id).collect();
+        assert_eq!(paged_ids, unbounded_ids, "paging must not reorder or drop rows");
+
+        // Past the end of the queue: empty, not an error.
+        assert!(catalog.list_pending_identity_page(2, 10).unwrap().is_empty());
     }
 }

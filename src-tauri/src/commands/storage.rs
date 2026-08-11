@@ -245,15 +245,53 @@ async fn record_identity_on_catalog(
 mod tests {
     use super::*;
     use crate::catalog::{Catalog, LocationRole, VolumeKind};
+    use std::path::Path;
 
-    fn temp_catalog(tag: &str) -> (Catalog, PathBuf) {
-        let dir = std::env::temp_dir().join(format!("chairphoto-storage-command-test-{tag}"));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let root = dir.join("photos");
+    /// A test's own temp directory, keyed by pid + tag and removed on drop — mirrors
+    /// `thumbnails::tests::TestTmpDir` (`src-tauri/src/thumbnails/mod.rs`) and
+    /// `catalog::identity::tests::TestTmpDir`.
+    ///
+    /// This fixture used to key on `tag` alone (`chairphoto-storage-command-test-{tag}`),
+    /// which every `cargo test` process on the machine shares; `remove_dir_all` on entry
+    /// then deletes a directory another process is still writing into. That's the exact
+    /// bug #45 / commit 9cd6d83 fixed for the thumbnail tests and identity.rs's own
+    /// `temp_catalog` was fixed to avoid in this same review pass — this file's copy was
+    /// missed in that pass despite editing the same test module (issue #50 review, defect
+    /// 2). Collapse this into `test_support::TestTmpDir` once the #45 branch merges,
+    /// instead of keeping a third copy of the same shape.
+    struct TestTmpDir(PathBuf);
+
+    impl TestTmpDir {
+        fn new(tag: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "chairphoto-storage-command-test-{tag}-{}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TestTmpDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Returns the catalog, its photo root, and the `TestTmpDir` guard — bind the guard
+    /// too (`let (catalog, root, _dir) = temp_catalog(...)`) so it lives for the whole
+    /// test; dropping it early deletes the directory the test is still using.
+    fn temp_catalog(tag: &str) -> (Catalog, PathBuf, TestTmpDir) {
+        let dir = TestTmpDir::new(tag);
+        let root = dir.path().join("photos");
         std::fs::create_dir_all(&root).unwrap();
-        let catalog = Catalog::open(&dir.join("test.chairphoto"), &root).unwrap();
-        (catalog, root)
+        let catalog = Catalog::open(&dir.path().join("test.chairphoto"), &root).unwrap();
+        (catalog, root, dir)
     }
 
     fn state_with(catalog: Catalog) -> AppState {
@@ -264,7 +302,7 @@ mod tests {
 
     #[test]
     fn relocate_records_identity_debt_for_the_moved_copy() {
-        let (catalog, root) = temp_catalog("relocate-identity-target");
+        let (catalog, root, _dir) = temp_catalog("relocate-identity-target");
         let old = root.join("old/DSC0007.ARW");
         std::fs::create_dir_all(old.parent().unwrap()).unwrap();
         std::fs::write(&old, b"old-raw").unwrap();

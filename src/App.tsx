@@ -239,7 +239,10 @@ export default function App() {
   const [showImport, setShowImport] = useState(false);
   const [showIdentityDebt, setShowIdentityDebt] = useState(false);
   // Total pending-identity-debt count (issue #50) — badges the topbar entry point.
-  const [identityDebtCount, setIdentityDebtCount] = useState(0);
+  // `null` means "unknown" (not yet fetched, or the last fetch failed) — distinct from a
+  // confirmed 0, so a transient IPC error can never masquerade as "no debt" and quietly
+  // remove the panel's only entry point (review finding F4).
+  const [identityDebtCount, setIdentityDebtCount] = useState<number | null>(null);
   // Bundle export dialog state — set to the batch to export, null = closed.
   const [bundleExportBatch, setBundleExportBatch] = useState<ImportBatch | null>(null);
   // Bundle import dialog open/closed.
@@ -784,7 +787,9 @@ export default function App() {
       const s = await summarizePendingIdentity();
       setIdentityDebtCount(s.total);
     } catch {
-      setIdentityDebtCount(0);
+      // Leave the count as it was: an IPC error means "unknown", not "zero". Resetting
+      // to 0 here used to hide the topbar chip and silently remove the panel's only
+      // entry point on a transient failure (review finding F4).
     }
   }, []);
 
@@ -854,6 +859,11 @@ export default function App() {
       );
       await refresh();
       refreshPending(); // scan auto-enqueues backups for new photos
+      // The scanner is the primary producer of identity debt (unwritable/unreachable
+      // sidecars found during indexing) — refresh the badge here too, not just at boot
+      // and on panel close, or debt from this scan stays invisible until restart
+      // (review finding F4).
+      refreshIdentityDebtCount();
       setBatchesKey((k) => k + 1); // a scan may have created a new import batch
       // Pre-cache so browsing is instant. Thumbnails always; previews if opted in.
       // Progress is shown via the cache:progress listener below.
@@ -1279,13 +1289,18 @@ export default function App() {
             ⤓ Back up ({pendingCount})
           </button>
         )}
-        {identityDebtCount > 0 && (
+        {(identityDebtCount === null || identityDebtCount > 0) && (
           <button
             className="chip chip-on"
             onClick={() => setShowIdentityDebt(true)}
-            title="Photo copies whose sidecar doesn't carry their identity yet"
+            title={
+              identityDebtCount === null
+                ? "Identity debt count could not be checked — open to see the current queue"
+                : "Photo copies whose sidecar doesn't carry their identity yet. Most of this " +
+                  "is normally Unreachable (an offline volume), not a failure."
+            }
           >
-            ⚠ Identity debt ({identityDebtCount})
+            Identity debt ({identityDebtCount === null ? "?" : identityDebtCount})
           </button>
         )}
         <span className="topbar-sep" aria-hidden />

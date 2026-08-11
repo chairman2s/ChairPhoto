@@ -3113,14 +3113,17 @@ body {
 
 /* Identity debt panel (issue #50) — read-only pending-identity queue + repair trigger. */
 .modal.identity-debt {
-  width: 760px;
+  width: 1040px;
+  max-width: 96vw;
 }
 .identity-debt-list {
   height: 420px;
   overflow-y: auto;
+  overflow-x: auto;
   border: 1px solid var(--border);
-  border-radius: 6px;
-  margin-top: 8px;
+  border-radius: 6px 6px 0 0;
+  border-top: none;
+  margin-top: 0;
 }
 .identity-debt-row {
   display: flex;
@@ -3131,15 +3134,33 @@ body {
   border-bottom: 1px solid var(--border);
   font-size: 12px;
 }
+/* The (non-virtualized, always-visible) column header — same widths as a data row, but
+ * bold and immune to the state-badge/detail-text treatment below (review finding F7). */
+.identity-debt-header {
+  height: 30px;
+  font-weight: 600;
+  color: var(--text-dim);
+  border: 1px solid var(--border);
+  border-bottom: none;
+  border-radius: 6px 6px 0 0;
+  margin-top: 8px;
+}
 .identity-debt-path,
-.identity-debt-relpath {
+.identity-debt-relpath,
+.identity-debt-error {
   flex: 1;
-  min-width: 0;
+  min-width: 120px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 .identity-debt-relpath {
+  color: var(--text-dim);
+}
+/* The single most useful fact on a Conflict row: which identity the file actually
+ * carries (review finding F7). Rendered for every state, not just Conflict, so the
+ * column doesn't jump around. */
+.identity-debt-error {
   color: var(--text-dim);
 }
 .identity-debt-volume {
@@ -3157,13 +3178,22 @@ body {
 }
 .identity-debt-attempts {
   color: var(--text-dim);
-  width: 34px;
+  width: 46px;
   flex: none;
   text-align: right;
 }
-/* State badges. Unreachable is a NORMAL state (an unmounted volume), never styled as a
- * failure — it gets the same neutral treatment as the rest of the row. Unwritable and
- * Conflict both need a person's attention, so they're visually distinct from it. */
+.identity-debt-lastattempt {
+  color: var(--text-dim);
+  width: 150px;
+  flex: none;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* State badges. Unreachable is a NORMAL state (an unmounted volume, or a file this pass
+ * couldn't find), never styled as a failure — it gets the same neutral treatment as the
+ * rest of the row. Unwritable and Conflict both need a person's attention, so they're
+ * visually distinct from it. */
 .identity-state-badge {
   flex: none;
   width: 86px;

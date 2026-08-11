@@ -723,53 +723,63 @@ export type IdentityDebtState = "unreachable" | "unwritable" | "conflict";
 
 /** One copy still owing a sidecar field (`identifier` = xmp:Identifier, `import_batch` =
  *  chairphoto:ImportBatch). Matches `pending_sidecar_identity`, keyed by
- *  (photoId, field, volumeId, relative path) — never collapse two rows into one. */
+ *  (photoId, field, volumeId, relative path) — never collapse two rows into one.
+ *
+ *  Backend fields `uuid`, `value`, `targetPath`, and `queuedAt` exist in Rust but are
+ *  deliberately not shipped here — the panel never renders them, and doing so was ~a
+ *  third of its IPC payload for nothing (review finding F1d). `targetPath` is derivable
+ *  client-side from `volumeId` + `relativePath` if ever needed. */
 export interface PendingIdentity {
   photoId: number;
-  /** The identity that must reach the sidecar (`photos.uuid`). */
-  uuid: string;
   field: "identifier" | "import_batch";
-  /** The value that must be written for `field`; null if not yet known. */
-  value: string | null;
   /** The photo's catalog-root-relative logical path, for display. */
   path: string;
   volumeId: number;
   /** This copy's path relative to its volume's base — pair with `volumeId` to show
    *  "which volume" and "which path" independently. */
   relativePath: string;
-  /** Absolute path to this specific copy, for display/diagnostics. */
-  targetPath: string;
   state: IdentityDebtState;
   attempts: number;
-  /** Human-readable detail (e.g. the write error, or the conflicting UUID found). */
+  /** Human-readable detail (e.g. the write error, or the conflicting UUID found). The
+   *  single most useful fact on a Conflict row — render it. */
   error: string;
-  queuedAt: number;
   lastAttemptAt: number;
 }
 
 /** Cheap counts over the whole pending-identity queue — safe to call to show a badge
- *  without pulling every row (the queue can hold tens of thousands of rows). */
+ *  without pulling every row (the queue can hold tens of thousands of rows). Both counts
+ *  are in COPIES (`photoId` + `volumeId` + `relativePath`), not queue rows: a copy owing
+ *  both `identifier` and `import_batch` is one copy, not two. */
 export interface PendingIdentitySummary {
   /** Every queued copy, any field, any state. */
   total: number;
-  /** Of `total`, how many are `conflict` — need a human, not a retry. */
+  /** Of `total`, how many have at least one field in `conflict` — need a human, not a
+   *  retry. */
   conflicts: number;
 }
 
 export interface IdentityRepairSummary {
   /** Now bound; cleared from the queue. */
-  repaired: number;
+  bound: number;
   /** Still not reachable; left queued. */
   unreachable: number;
-  /** Retried and still failing (unwritable or a conflict); left queued. */
+  /** The sidecar carries a different identity — needs a human (#33), not a retry. NOT a
+   *  failure: left untouched ("when uncertain, preserve"), same as before the pass. */
+  conflicts: number;
+  /** Retried and is still genuinely failing (unwritable sidecar); left queued. */
   failed: number;
 }
 
-/** Full per-copy identity-debt list, oldest first. Can be large — pair with a virtualized
- *  list, never render every row eagerly into the DOM. */
-export const listPendingIdentity = () =>
-  invoke<PendingIdentity[]>("list_pending_identity");
-/** Total debt + conflict counts, without transferring every row. */
+/** One page of the identity-debt list, oldest first. The queue can hold tens of
+ *  thousands of rows (74,488 on the 100k harness shape in #20), so this always pages via
+ *  `limit`/`offset` rather than returning the whole queue in one IPC payload — pair with
+ *  `summarizePendingIdentity()` for the total, and a virtualized list for the page itself
+ *  (review finding F1a). */
+export const listPendingIdentity = (limit: number, offset: number) =>
+  invoke<PendingIdentity[]>("list_pending_identity", { limit, offset });
+/** Total debt + conflict counts, without transferring every row. Independent of
+ *  `listPendingIdentity` — call/await it separately so a slow list fetch never delays the
+ *  cheap header count (review finding F1b). */
 export const summarizePendingIdentity = () =>
   invoke<PendingIdentitySummary>("summarize_pending_identity");
 /** Retry every queued copy now. Unreachable/unwritable/conflicted copies stay queued. */

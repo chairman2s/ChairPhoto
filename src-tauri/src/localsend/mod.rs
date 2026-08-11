@@ -306,7 +306,8 @@ fn announce_on_interfaces(socket: &Socket, joined: &[Ipv4Addr], announcement: &s
     }
 }
 
-/// Every UP, multicast-capable, non-loopback IPv4 address on this host, via `getifaddrs(3)`.
+/// Every IPv4 address on this host whose interface qualifies per [`interface_flags_qualify`]
+/// (up, running, multicast-capable, neither loopback nor point-to-point), via `getifaddrs(3)`.
 /// Never errors: enumeration failures or a host with nothing qualifying return an empty list,
 /// and callers fall back to the pre-existing `Ipv4Addr::UNSPECIFIED` join in that case.
 #[cfg(unix)]
@@ -349,19 +350,29 @@ fn local_multicast_interfaces() -> Vec<Ipv4Addr> {
 }
 
 /// Whether an interface carrying `flags` (`ifaddrs.ifa_flags`, see `getifaddrs(3)`) qualifies
-/// for a discovery join: administratively up, multicast-capable, and not loopback. Pulled out
-/// of [`local_multicast_interfaces`] as a pure function of the flag bits so this rule — in
-/// particular the loopback exclusion — is unit-testable without depending on this host's real
-/// interfaces. (It can't be exercised host-dependently in general: on at least one dev/test
-/// machine, `lo` doesn't carry `IFF_MULTICAST` at all, so a test built only from that host's
-/// actual `getifaddrs()` output cannot tell "loopback correctly excluded" apart from
-/// "already excluded by the multicast check, loopback check untested".)
+/// for a discovery join: administratively up, carrier-present (`IFF_RUNNING`), multicast-
+/// capable, and neither loopback nor point-to-point. Pulled out of
+/// [`local_multicast_interfaces`] as a pure function of the flag bits so this rule is
+/// unit-testable without depending on this host's real interfaces. (It can't always be
+/// exercised host-dependently: on at least one dev/test machine, `lo` doesn't carry
+/// `IFF_MULTICAST` at all, so a test built only from that host's actual `getifaddrs()` output
+/// cannot tell "loopback correctly excluded" apart from "already excluded by the multicast
+/// check, loopback check untested".)
+///
+/// `IFF_RUNNING` (not just `IFF_UP`) excludes administratively-up-but-carrier-down interfaces —
+/// measured on the machine this was written on: a Docker bridge (`docker0`) is `UP` with no
+/// cable/link, and without this check it was being joined and announced on every discovery
+/// call for no reachability benefit. `IFF_POINTOPOINT` excludes VPN/tunnel interfaces (`tun0`,
+/// `tailscale0`-style WireGuard/OpenVPN devices) — multicast group membership on a
+/// point-to-point link doesn't reach a LAN peer and only adds noise.
 #[cfg(unix)]
 fn interface_flags_qualify(flags: u32) -> bool {
     let up = flags & (libc::IFF_UP as u32) != 0;
+    let running = flags & (libc::IFF_RUNNING as u32) != 0;
     let multicast = flags & (libc::IFF_MULTICAST as u32) != 0;
     let loopback = flags & (libc::IFF_LOOPBACK as u32) != 0;
-    up && multicast && !loopback
+    let point_to_point = flags & (libc::IFF_POINTOPOINT as u32) != 0;
+    up && running && multicast && !loopback && !point_to_point
 }
 
 /// No `getifaddrs`-equivalent is wired up for non-unix targets — falls back to the
@@ -589,17 +600,32 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn interface_flags_qualify_requires_up_and_multicast_but_excludes_loopback() {
+    fn interface_flags_qualify_requires_up_running_multicast_excludes_loopback_and_p2p() {
         let up = libc::IFF_UP as u32;
+        let running = libc::IFF_RUNNING as u32;
         let multicast = libc::IFF_MULTICAST as u32;
         let loopback = libc::IFF_LOOPBACK as u32;
+        let p2p = libc::IFF_POINTOPOINT as u32;
 
-        assert!(interface_flags_qualify(up | multicast), "up + multicast alone must qualify");
-        assert!(!interface_flags_qualify(multicast), "a down interface must not qualify");
-        assert!(!interface_flags_qualify(up), "a non-multicast interface must not qualify");
         assert!(
-            !interface_flags_qualify(up | multicast | loopback),
-            "loopback must be excluded even when up and multicast-capable"
+            interface_flags_qualify(up | running | multicast),
+            "up + running + multicast alone must qualify"
+        );
+        assert!(
+            !interface_flags_qualify(up | multicast),
+            "carrier-down (no IFF_RUNNING) must not qualify — this is what excludes a \
+             cable-unplugged NIC or an administratively-up-but-link-down bridge like docker0"
+        );
+        assert!(!interface_flags_qualify(multicast | running), "a down interface must not qualify");
+        assert!(!interface_flags_qualify(up | running), "a non-multicast interface must not qualify");
+        assert!(
+            !interface_flags_qualify(up | running | multicast | loopback),
+            "loopback must be excluded even when up, running, and multicast-capable"
+        );
+        assert!(
+            !interface_flags_qualify(up | running | multicast | p2p),
+            "point-to-point interfaces (tun0, tailscale0-style VPN devices) must be excluded \
+             even when up, running, and multicast-capable"
         );
         assert!(!interface_flags_qualify(0));
     }

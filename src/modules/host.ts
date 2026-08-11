@@ -78,22 +78,162 @@ let filterContext: { tagId: number | null; albumId: number | null; batchId: numb
   batchId: null,
 };
 
-// --- React subscription -------------------------------------------------
-const listeners = new Set<() => void>();
-let version = 0;
-function notify() {
-  version++;
-  listeners.forEach((l) => l());
+// --- React subscription ---------------------------------------------------
+//
+// One version-counter "channel" per concern a consumer might care about, so a change to
+// one (e.g. the photo selection) does not force a re-render in a consumer that only reads
+// another (e.g. the Modules panel, which reads only lifecycle). Each channel is a small,
+// independent pub/sub — pure and unit-testable without React via `__channels` below (see
+// src/modules/__tests__/host.test.ts; `useSyncExternalStore` can't be driven outside a
+// component, which is why the pure store and the hook are kept separate). `useHost()` (no
+// selector) is the union of every channel, for consumers that legitimately need to react to
+// any host change (e.g. App).
+const legacyListeners = new Set<() => void>();
+let legacyVersion = 0;
+function bumpLegacy() {
+  legacyVersion++;
+  legacyListeners.forEach((l) => l());
 }
-function subscribe(l: () => void) {
-  listeners.add(l);
+function subscribeLegacy(l: () => void) {
+  legacyListeners.add(l);
   return () => {
-    listeners.delete(l);
+    legacyListeners.delete(l);
   };
 }
-/** Re-renders the caller whenever modules/contributions change. */
+
+function createChannel() {
+  const listeners = new Set<() => void>();
+  let version = 0;
+  return {
+    subscribe(l: () => void) {
+      listeners.add(l);
+      return () => {
+        listeners.delete(l);
+      };
+    },
+    getVersion: () => version,
+    /** Bump this channel's own subscribers, and the legacy "any change" channel
+     *  `useHost()` reads, so a call site never has to remember to notify both. */
+    notify() {
+      version++;
+      listeners.forEach((l) => l());
+      bumpLegacy();
+    },
+  };
+}
+
+/** Contributions a module registers: panels, actions, main views, publish targets, and
+ *  the edit renderer. Consumers: PhotoInspector (inspector panels), TagEditor (tag-editor
+ *  panels), PublishDialog (publish targets), App (main views / toolbar actions). Also
+ *  bumped by `enableModule`/`disableModule` (see `notifyModuleSetChanged`), since every
+ *  getter here filters by `.enabled`. */
+const contributionsChannel = createChannel();
+/** The photo selection / active photo / active version (`setSelection`,
+ *  `setActiveVersion`). Consumers: module panels that read `api.getActivePhotoId()` /
+ *  `getActiveVersionId()` (AI tagging, Faces, Obsidian, Smart Tagging). */
+const selectionChannel = createChannel();
+/** The sidebar filter context (`setFilterContext`), read via `api.getFilterContext()`. */
+const filterContextChannel = createChannel();
+/** Settings panels a module registers (`registerSettingsPanel`). Kept separate from
+ *  `contributionsChannel` because Preferences needs exactly this slice, not panel/action/
+ *  main-view churn from modules it isn't showing a settings tab for. Also bumped by
+ *  `enableModule`/`disableModule`. */
+const settingsPanelsChannel = createChannel();
+/** A module's enabled/disabled state and the module registry itself (`register`,
+ *  `enableModule`, `disableModule`, `initHost`). Consumers: ModulesPanel, Preferences. */
+const lifecycleChannel = createChannel();
+/** The tag open in the tag-editor modal (`setEditingTagContext`), read via
+ *  `api.getEditingTag()`. Consumer: the Obsidian module's tag-note panel. */
+const editingTagChannel = createChannel();
+
+/** Enabling/disabling a module changes not just its own `enabled` flag but everything
+ *  every contribution getter returns, because each one filters by `.enabled`
+ *  (`panelsForSlot`, `settingsPanels`/`settingsPanelsForModule`, `publishTargets`,
+ *  `mainViews`, `toolbarActions`, `activeEditRenderer`). So a lifecycle change must notify
+ *  all three channels those getters feed, not lifecycle alone — otherwise, e.g., disabling
+ *  a module would silently stop notifying a consumer subscribed only to contributions. */
+function notifyModuleSetChanged() {
+  lifecycleChannel.notify();
+  contributionsChannel.notify();
+  settingsPanelsChannel.notify();
+}
+
+/** Re-renders the caller on ANY host change (module lifecycle, contributions, selection,
+ *  filter context, settings panels, or the editing-tag context). Prefer a narrower
+ *  `useHostX()` selector below when the consumer only cares about one slice — e.g. a
+ *  selection change should not invalidate a settings-only consumer like Preferences. */
 export function useHost(): number {
-  return useSyncExternalStore(subscribe, () => version);
+  return useSyncExternalStore(subscribeLegacy, () => legacyVersion);
+}
+
+/** Re-renders on module contribution changes (panels/actions/main views/publish
+ *  targets/edit renderer) and on module enable/disable (which changes what those getters
+ *  return). Does NOT re-render on selection, filter context, or settings-panel-only
+ *  changes. */
+export function useHostContributions(): number {
+  return useSyncExternalStore(contributionsChannel.subscribe, contributionsChannel.getVersion);
+}
+
+/** Re-renders on photo selection / active photo / active version changes only. */
+export function useHostSelection(): number {
+  return useSyncExternalStore(selectionChannel.subscribe, selectionChannel.getVersion);
+}
+
+/** Re-renders when the sidebar filter context changes only. */
+export function useHostFilterContext(): number {
+  return useSyncExternalStore(filterContextChannel.subscribe, filterContextChannel.getVersion);
+}
+
+/** Re-renders on settings-panel contributions and module enable/disable (which changes
+ *  which modules' settings panels are live). Does NOT re-render on other contribution
+ *  types (inspector panels, actions, …) or on selection. */
+export function useHostSettingsPanels(): number {
+  return useSyncExternalStore(settingsPanelsChannel.subscribe, settingsPanelsChannel.getVersion);
+}
+
+/** Re-renders on module enable/disable and module-registry changes only (not on the
+ *  contributions those modules register, nor on selection). */
+export function useHostLifecycle(): number {
+  return useSyncExternalStore(lifecycleChannel.subscribe, lifecycleChannel.getVersion);
+}
+
+/** Re-renders when the tag open in the tag-editor modal changes only. */
+export function useHostEditingTag(): number {
+  return useSyncExternalStore(editingTagChannel.subscribe, editingTagChannel.getVersion);
+}
+
+/** Test-only access to the per-channel pub/sub, so subscription/notify semantics — and the
+ *  isolation the safe dispatcher below provides — can be unit-tested without a React render.
+ *  Mirrors the `__events` convention in `src/__test_stubs__/tauri.ts`. Not part of the host
+ *  API surface modules use. */
+export const __channels = {
+  contributions: contributionsChannel,
+  selection: selectionChannel,
+  filterContext: filterContextChannel,
+  settingsPanels: settingsPanelsChannel,
+  lifecycle: lifecycleChannel,
+  editingTag: editingTagChannel,
+};
+
+// --- Safe callback dispatch ------------------------------------------------
+//
+// Every module-authored callback the host calls directly (`onLoad`, `onUnload`,
+// `onPhotoSelected`) runs through `callSafely` so one module's throw can never abort the
+// host operation invoking it: `enableModule` still rolls back cleanly, `disableModule`
+// still clears contributions/persists/notifies, and `setSelection` still reaches every
+// other enabled module and still updates host state. See AGENTS.md "Background work and
+// ownership" — a required terminal step (finishing enable/disable/select) must not be
+// skipped because a module misbehaved.
+/** Invoke `fn`, catching and logging (never silently swallowing) any throw. Returns true
+ *  if `fn` completed without throwing, false if it threw (already logged). */
+function callSafely(label: string, fn: () => void): boolean {
+  try {
+    fn();
+    return true;
+  } catch (e) {
+    console.error(label, e);
+    return false;
+  }
 }
 
 /** Set a toast sink (the app wires its own toast here). */
@@ -115,18 +255,19 @@ export function setNavSink(fn: typeof navSink) {
  *  "tag-editor" slot panels can read it via getEditingTag(). */
 export function setEditingTagContext(tag: import("./registry").Tag | null) {
   editingTag = tag;
-  notify();
+  editingTagChannel.notify();
 }
 
 /** Update the sidebar filter context (App → host sink, same style as setSelection).
- *  Calls notify() so modules that read the context (e.g. Statistics) re-render. */
+ *  Notifies filterContextChannel so modules that read the context (e.g. Statistics)
+ *  re-render. */
 export function setFilterContext(ctx: {
   tagId: number | null;
   albumId: number | null;
   batchId: number | null;
 }) {
   filterContext = ctx;
-  notify();
+  filterContextChannel.notify();
 }
 
 // --- semver: a tiny in-repo matcher (no new dep) ------------------------
@@ -263,27 +404,27 @@ function apiFor(mod: ChairPhotoModule): ChairPhotoAPI {
       setEditRecord(photoId, JSON.stringify(record)),
     registerEditRenderer: (renderer) => {
       reg.renderer = renderer;
-      notify();
+      contributionsChannel.notify();
     },
     registerPanel: (p) => {
       reg.panels.push(p);
-      notify();
+      contributionsChannel.notify();
     },
     registerAction: (a) => {
       reg.actions.push(a);
-      notify();
+      contributionsChannel.notify();
     },
     registerPublishTarget: (t) => {
       reg.publishTargets.push(t);
-      notify();
+      contributionsChannel.notify();
     },
     registerSettingsPanel: (render) => {
       reg.settings.push(render);
-      notify();
+      settingsPanelsChannel.notify();
     },
     registerMainView: (v) => {
       reg.mainViews.push(v);
-      notify();
+      contributionsChannel.notify();
     },
     showToast: (m) => toast(m),
     notifyChange: () => changeSink(),
@@ -326,7 +467,10 @@ export async function initHost(bundled: ChairPhotoModule[]) {
   await loadExternalModules();
   const csv = (await getSetting("modules.enabled").catch(() => null)) ?? "";
   for (const id of csv.split(",").filter(Boolean)) enableModule(id, false);
-  notify();
+  // Each enableModule() call above already fired notifyModuleSetChanged() for the modules
+  // it enabled. This covers the remaining case: modules that got register()'d (bundled or
+  // external stubs) but were never enabled — the Modules panel still needs to see them.
+  lifecycleChannel.notify();
 }
 
 /**
@@ -486,13 +630,14 @@ export function enableModule(id: string, persist = true, seen = new Set<string>(
   reg.publishTargets = [];
   reg.renderer = null;
   // onLoad runs untrusted third-party code for external modules (H8a browser-extension
-  // trust model). Isolate a throw so one bad module can't crash the shared enable pass
-  // (initHost's settings loop) and take down every module after it. Roll back to a clean
-  // disabled state and skip it — the rest of the loop, and notify(), still run.
-  try {
-    reg.module.onLoad(apiFor(reg.module));
-  } catch (e) {
-    console.error(`[modules] "${id}" onLoad() threw; leaving it disabled:`, e);
+  // trust model). Isolate a throw (via callSafely) so one bad module can't crash the shared
+  // enable pass (initHost's settings loop) and take down every module after it. Roll back to
+  // a clean disabled state and skip it — the rest of the loop, and notifyModuleSetChanged(),
+  // still run.
+  const loaded = callSafely(`[modules] "${id}" onLoad() threw; leaving it disabled:`, () =>
+    reg.module.onLoad(apiFor(reg.module)),
+  );
+  if (!loaded) {
     reg.enabled = false;
     reg.panels = [];
     reg.actions = [];
@@ -504,7 +649,7 @@ export function enableModule(id: string, persist = true, seen = new Set<string>(
     return;
   }
   if (persist) persistEnabled();
-  notify();
+  notifyModuleSetChanged();
 }
 
 export function disableModule(id: string, persist = true) {
@@ -519,7 +664,12 @@ export function disableModule(id: string, persist = true) {
   }
 
   reg.enabled = false;
-  reg.module.onUnload?.();
+  // A throwing onUnload must not leave the rest of teardown half-done: contributions must
+  // still be cleared, the enabled set still persisted, and subscribers still notified — a
+  // module's broken cleanup can't be allowed to leave the module looking enabled on disk
+  // (persistEnabled skipped) or the UI un-refreshed (notify skipped). callSafely logs the
+  // throw and lets execution continue.
+  callSafely(`[modules] "${id}" onUnload() threw:`, () => reg.module.onUnload?.());
   reg.panels = [];
   reg.actions = [];
   reg.settings = [];
@@ -527,7 +677,7 @@ export function disableModule(id: string, persist = true) {
   reg.publishTargets = [];
   reg.renderer = null;
   if (persist) persistEnabled();
-  notify();
+  notifyModuleSetChanged();
 }
 
 function persistEnabled() {
@@ -555,14 +705,20 @@ function enabledIdsInDepOrder(): string[] {
   return out;
 }
 
-/** Notify enabled modules that the photo selection changed. */
+/** Notify enabled modules that the photo selection changed. One module's throwing
+ *  `onPhotoSelected` must not stop other modules from being notified, nor block the host's
+ *  own selection state (and its subscribers) from updating — callSafely isolates each call
+ *  so the loop always finishes and the channel is always notified. */
 export function setSelection(photos: Photo[], active: number | null) {
   selection = photos;
   activeId = active;
   for (const reg of modules.values()) {
-    if (reg.enabled) reg.module.onPhotoSelected?.(photos, apiFor(reg.module));
+    if (!reg.enabled) continue;
+    callSafely(`[modules] "${reg.module.id}" onPhotoSelected() threw:`, () =>
+      reg.module.onPhotoSelected?.(photos, apiFor(reg.module)),
+    );
   }
-  notify(); // let module panels (which read the active photo) re-render
+  selectionChannel.notify(); // let module panels (which read the active photo) re-render
 }
 
 /** Tell the host which version is active in the inspector/loupe (null = Original), so
@@ -570,7 +726,7 @@ export function setSelection(photos: Photo[], active: number | null) {
 export function setActiveVersion(versionId: number | null) {
   if (activeVersionId === versionId) return;
   activeVersionId = versionId;
-  notify();
+  selectionChannel.notify();
 }
 
 // --- queries for the app ------------------------------------------------

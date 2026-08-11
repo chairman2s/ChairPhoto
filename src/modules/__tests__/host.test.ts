@@ -24,8 +24,11 @@ import {
   disableModule,
   listModules,
   backendAvailable,
+  setSelection,
+  panelsForSlot,
+  __channels,
 } from "../host";
-import type { ChairPhotoAPI, ChairPhotoModule } from "../registry";
+import type { ChairPhotoAPI, ChairPhotoModule, Photo } from "../registry";
 import { __events } from "../../__test_stubs__/tauri";
 
 // ── Helper ────────────────────────────────────────────────────────────────────
@@ -371,5 +374,231 @@ describe("ChairPhotoAPI.onEvent()", () => {
 
     expect(a).toEqual([1]);
     expect(b).toEqual([]);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Per-selector subscriptions (issue #16) — the pure channel store behind useHostX().
+// useSyncExternalStore can't be driven outside a React render (vitest here runs with
+// environment: "node", no jsdom/testing-library — see vitest.config.ts), so these tests
+// exercise the pure pub/sub directly via `__channels`, and the host functions that notify
+// it, rather than the React hooks. That is the layer the issue asks to keep pure/testable.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** Subscribe a counting listener to every channel in `__channels`, and return which
+ *  channel names actually fired since the subscription (in `channels`, sans the tag
+ *  itself), for asserting cross-channel isolation in one shot. */
+function watchAllChannels(): { fired: Set<string>; unsubscribeAll: () => void } {
+  const fired = new Set<string>();
+  const unsubs = Object.entries(__channels).map(([name, ch]) =>
+    ch.subscribe(() => fired.add(name)),
+  );
+  return { fired, unsubscribeAll: () => unsubs.forEach((u) => u()) };
+}
+
+describe("per-channel isolation", () => {
+  it("subscribe/unsubscribe on one channel does not touch another", () => {
+    const seenSelection: number[] = [];
+    const seenLifecycle: number[] = [];
+    const unsubSel = __channels.selection.subscribe(() => seenSelection.push(1));
+    const unsubLife = __channels.lifecycle.subscribe(() => seenLifecycle.push(1));
+
+    setSelection([], null);
+    expect(seenSelection).toHaveLength(1);
+    expect(seenLifecycle).toHaveLength(0); // a selection change must not fire lifecycle
+
+    unsubSel();
+    setSelection([], 1);
+    expect(seenSelection).toHaveLength(1); // unsubscribed: no further deliveries
+
+    unsubLife();
+  });
+
+  it("setSelection() notifies only the selection channel", () => {
+    const { fired, unsubscribeAll } = watchAllChannels();
+    setSelection([], 1);
+    expect([...fired]).toEqual(["selection"]);
+    unsubscribeAll();
+  });
+
+  it("enableModule()/disableModule() notify lifecycle+contributions+settingsPanels, " +
+    "not selection/filterContext/editingTag", () => {
+    register(makeModule("h16-lifecycle-fanout"));
+    const { fired, unsubscribeAll } = watchAllChannels();
+
+    enableModule("h16-lifecycle-fanout", false);
+    expect([...fired].sort()).toEqual(["contributions", "lifecycle", "settingsPanels"]);
+
+    fired.clear();
+    disableModule("h16-lifecycle-fanout", false);
+    expect([...fired].sort()).toEqual(["contributions", "lifecycle", "settingsPanels"]);
+
+    unsubscribeAll();
+  });
+
+  it("a module's registerPanel() (after it's already enabled) notifies only contributions", () => {
+    let api: ChairPhotoAPI | undefined;
+    register(
+      makeModule("h16-register-panel", {
+        onLoad: (a) => {
+          api = a;
+        },
+      }),
+    );
+    enableModule("h16-register-panel", false);
+    if (!api) throw new Error("onLoad did not run");
+
+    const { fired, unsubscribeAll } = watchAllChannels();
+    api.registerPanel({ id: "p1", slot: "inspector", label: "Panel", render: () => null });
+    expect([...fired]).toEqual(["contributions"]);
+
+    unsubscribeAll();
+    disableModule("h16-register-panel", false);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Safe callback dispatch — onUnload and onPhotoSelected must not be able to abort the
+// host operation that calls them (onLoad's isolation is covered above under
+// enableModule()). Mutation-tested: removing the try/catch around either call makes the
+// corresponding "does not throw" / "still notifies" assertion below fail.
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("safe callback dispatch — onUnload", () => {
+  it("does not propagate a throw out of disableModule()", () => {
+    register(
+      makeModule("h16-unload-throws", {
+        onUnload: () => {
+          throw new Error("onUnload exploded");
+        },
+      }),
+    );
+    enableModule("h16-unload-throws", false);
+
+    expect(() => disableModule("h16-unload-throws", false)).not.toThrow();
+  });
+
+  it("still clears the module's contributions after a throwing onUnload", () => {
+    register(
+      makeModule("h16-unload-throws-cleanup", {
+        onLoad: (api) => {
+          api.registerPanel({
+            id: "leftover",
+            slot: "inspector",
+            label: "Leftover",
+            render: () => null,
+          });
+        },
+        onUnload: () => {
+          throw new Error("onUnload exploded");
+        },
+      }),
+    );
+    enableModule("h16-unload-throws-cleanup", false);
+    expect(panelsForSlot("inspector").some((p) => p.id === "leftover")).toBe(true);
+
+    disableModule("h16-unload-throws-cleanup", false);
+
+    // The panel must be gone — cleanup must run even though onUnload threw first.
+    expect(panelsForSlot("inspector").some((p) => p.id === "leftover")).toBe(false);
+    expect(listModules().find((m) => m.id === "h16-unload-throws-cleanup")?.enabled).toBe(false);
+  });
+
+  it("still persists and notifies after a throwing onUnload (disable is not half-done)", () => {
+    // disableModule's body is: onUnload -> clear contributions -> `if (persist)
+    // persistEnabled()` -> notifyModuleSetChanged(), with no branch between the persist
+    // call and the notify call. Observing the notify therefore proves persistEnabled() was
+    // reached (not skipped) even though onUnload threw first.
+    register(
+      makeModule("h16-unload-throws-persist", {
+        onUnload: () => {
+          throw new Error("onUnload exploded");
+        },
+      }),
+    );
+    enableModule("h16-unload-throws-persist", false);
+
+    const { fired, unsubscribeAll } = watchAllChannels();
+    disableModule("h16-unload-throws-persist", true); // persist=true, unlike the other tests
+    expect([...fired].sort()).toEqual(["contributions", "lifecycle", "settingsPanels"]);
+    unsubscribeAll();
+  });
+
+  it("cascade-disables a dependent even when the dependency's onUnload throws", () => {
+    register(makeModule("h16-unload-dep", { onUnload: () => {
+      throw new Error("dep onUnload exploded");
+    } }));
+    register(
+      makeModule("h16-unload-dependent", {
+        requires: [{ id: "h16-unload-dep" }],
+      }),
+    );
+    enableModule("h16-unload-dependent", false); // pulls in the dependency first
+    expect(listModules().find((m) => m.id === "h16-unload-dependent")?.enabled).toBe(true);
+
+    expect(() => disableModule("h16-unload-dep", false)).not.toThrow();
+
+    // Cascade: disabling the dependency must still disable its dependent, even though the
+    // dependency's own onUnload threw partway through the cascade.
+    expect(listModules().find((m) => m.id === "h16-unload-dependent")?.enabled).toBe(false);
+    expect(listModules().find((m) => m.id === "h16-unload-dep")?.enabled).toBe(false);
+  });
+});
+
+describe("safe callback dispatch — onPhotoSelected", () => {
+  it("one module's throwing onPhotoSelected does not stop another module's from running", () => {
+    const seenByB: Photo[][] = [];
+    register(
+      makeModule("h16-select-throws-a", {
+        onPhotoSelected: () => {
+          throw new Error("A exploded");
+        },
+      }),
+    );
+    register(
+      makeModule("h16-select-b", {
+        onPhotoSelected: (photos) => {
+          seenByB.push(photos);
+        },
+      }),
+    );
+    enableModule("h16-select-throws-a", false);
+    enableModule("h16-select-b", false);
+
+    const photos: Photo[] = [];
+    expect(() => setSelection(photos, 42)).not.toThrow();
+    expect(seenByB).toEqual([photos]);
+
+    disableModule("h16-select-throws-a", false);
+    disableModule("h16-select-b", false);
+  });
+
+  it("still updates host state and notifies subscribers when a module's onPhotoSelected throws", () => {
+    let apiRef: ChairPhotoAPI | undefined;
+    register(
+      makeModule("h16-select-throws-solo", {
+        onLoad: (api) => {
+          apiRef = api;
+        },
+        onPhotoSelected: () => {
+          throw new Error("exploded");
+        },
+      }),
+    );
+    enableModule("h16-select-throws-solo", false);
+    if (!apiRef) throw new Error("onLoad did not run");
+
+    let notified = 0;
+    const unsub = __channels.selection.subscribe(() => notified++);
+
+    const photos: Photo[] = [];
+    setSelection(photos, 7);
+
+    expect(notified).toBe(1); // the selection channel still fired
+    expect(apiRef.getSelectedPhotos()).toBe(photos); // host state still updated
+    expect(apiRef.getActivePhotoId()).toBe(7);
+
+    unsub();
+    disableModule("h16-select-throws-solo", false);
   });
 });

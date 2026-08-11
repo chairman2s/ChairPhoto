@@ -171,13 +171,14 @@ fn pending_sidecar_value(
 /// (copy, field) pair) accessor kept for internal Rust callers and this file's own test
 /// suite — never shipped over IPC (see [`PendingIdentityRow`]'s doc). The frontend-facing,
 /// paged accessor is [`Catalog::list_pending_identity_page`], which groups by COPY instead
-/// (defect 1: the two used to share this same flat query, which is exactly why a copy
-/// owing both `identifier` and `import_batch` came back as 2 rows there while
-/// `summarize_pending_identity` counted it as 1 — "Showing 1–4 of 3" at small scale, "of
-/// 74488" at real scale). `ORDER BY` is oldest-queued first so paging is stable across
-/// calls; nothing about this query's performance matters for the UI thread since it is
-/// never called from a paging click (see `list_pending_identity_page`'s doc for the query
-/// that IS on that path, and why it's shaped differently).
+/// — sharing this flat query between the two would let a copy owing both `identifier` and
+/// `import_batch` come back as 2 rows there while `summarize_pending_identity` counted it
+/// as 1 (e.g. a paging label reading "Showing 1–4 of 3" at small scale, "of 74488" at real
+/// scale), so the two are kept deliberately separate. `ORDER BY` is oldest-queued first so
+/// paging is stable across calls; nothing about this query's performance matters for the
+/// UI thread since it is never called from a paging click (see
+/// `list_pending_identity_page`'s doc for the query that IS on that path, and why it's
+/// shaped differently).
 const PENDING_IDENTITY_QUERY: &str =
     "SELECT q.photo_id, p.uuid, p.path, q.field, q.volume_id, v.base_path, q.relative_path,
             q.attempts, q.error, q.queued_at, q.last_attempt_at, b.uuid
@@ -189,9 +190,9 @@ const PENDING_IDENTITY_QUERY: &str =
 
 /// The first of [`Catalog::list_pending_identity_page`]'s two queries — pages the
 /// DISTINCT copies. Named/`const`, not inlined, so a test can run `EXPLAIN QUERY PLAN`
-/// against the exact SQL that ships, and assert it never regresses to a temp-b-tree sort
-/// (defect 4). See that method's doc comment for the full reasoning on why this orders by
-/// natural key rather than `queued_at`, and why it needs `idx_pending_sidecar_identity_copy`
+/// against the exact SQL that ships, and assert it never regresses to a temp-b-tree sort.
+/// See that method's doc comment for the full reasoning on why this orders by natural key
+/// rather than `queued_at`, and why it needs `idx_pending_sidecar_identity_copy`
 /// (`schema.rs`) to avoid one.
 const PENDING_IDENTITY_COPY_PAGE_QUERY: &str =
     "SELECT q.photo_id, p.path, q.volume_id, q.relative_path
@@ -237,10 +238,11 @@ fn map_pending_identity_row(r: &rusqlite::Row) -> rusqlite::Result<PendingIdenti
 ///
 /// This is [`Catalog::list_pending_identity`]'s row type only. It is never sent over IPC
 /// (no `Serialize`) — the frontend debt panel (issue #50) renders
-/// [`Catalog::list_pending_identity_page`]'s copy-grouped [`PendingIdentity`] instead
-/// (defect 1). This flat/field-grain shape is kept because the repair pass's own
-/// plan/tests, and this file's test suite, want one assertion per (copy, field), not
-/// pre-folded into a copy.
+/// [`Catalog::list_pending_identity_page`]'s copy-grouped [`PendingIdentity`] instead. This
+/// flat/field-grain shape is kept for this file's own test suite, which wants one
+/// assertion per (copy, field), not pre-folded into a copy; production code has no caller
+/// for it (the repair pass uses its own field-grained query,
+/// [`Catalog::plan_identity_repairs`]).
 #[derive(Debug, Clone)]
 pub struct PendingIdentityRow {
     pub photo_id: i64,
@@ -292,10 +294,10 @@ pub struct PendingIdentityField {
 ///
 /// Grouped by `(photo_id, volume_id, relative_path)` — CONTEXT.md's "Copy", and the same
 /// unit [`PendingIdentitySummary::total`] counts. A copy owing both `identifier` and
-/// `import_batch` is ONE of these, with both entries in `fields` — never two rows (defect
-/// 1: before this, the paged list shared the flat (copy, field)-row query with
-/// `list_pending_identity`, so its row count could exceed the copy-counted `total` the
-/// summary reported, e.g. `pagingLabel` rendering "Showing 1–4 of 3").
+/// `import_batch` is ONE of these, with both entries in `fields` — never two rows: sharing
+/// the flat (copy, field)-row query with `list_pending_identity` would let this list's row
+/// count exceed the copy-counted `total` the summary reports, e.g. `pagingLabel` rendering
+/// "Showing 1–4 of 3", which is exactly what keeps the two queries separate.
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PendingIdentity {
@@ -369,7 +371,7 @@ impl IdentityRepairPlan {
 pub struct IdentityRepairSummary {
     /// Sidecar field now on disk for this queued copy; the pending row was cleared.
     /// "Bound" is the canonical CONTEXT.md § Identity term for this outcome — not
-    /// "repaired" (review finding F5).
+    /// "repaired".
     pub bound: usize,
     /// The queued copy is not reachable right now — left queued for the next pass. A
     /// normal state, not a failure.
@@ -377,7 +379,7 @@ pub struct IdentityRepairSummary {
     /// The sidecar already carries a different identity. **Not a failure** — the file was
     /// deliberately left untouched ("when uncertain, preserve") and a human has to resolve
     /// it (#33), not retry it. Kept out of `failed` so the UI never reports a Conflict as
-    /// an error (review finding F5).
+    /// an error.
     pub conflicts: usize,
     /// Retried and is still genuinely failing (unwritable sidecar: read-only storage, an
     /// unparseable sidecar, a full disk). Left queued.
@@ -508,9 +510,11 @@ impl Catalog {
     /// Unbounded — pulls the whole queue, which reached 74,488 rows on the 100k harness
     /// shape in #20 (tens of MB of JSON if this crossed IPC — but it never does: this is
     /// Rust-only, not a Tauri command). Kept for internal/test callers that want one
-    /// assertion per (copy, field) — see [`PendingIdentityRow`]'s struct doc. The IPC
-    /// command and the frontend debt panel use [`Catalog::list_pending_identity_page`]
-    /// instead, which groups by copy (review finding F1a; defect 1).
+    /// assertion per (copy, field) — see [`PendingIdentityRow`]'s struct doc: this file's
+    /// own test suite is the only caller today (no production code path uses it — the
+    /// repair pass has its own field-grained query, [`Catalog::plan_identity_repairs`]).
+    /// The IPC command and the frontend debt panel use
+    /// [`Catalog::list_pending_identity_page`] instead, which groups by copy.
     pub fn list_pending_identity(&self) -> Result<Vec<PendingIdentityRow>> {
         let mut stmt = self.conn.prepare(PENDING_IDENTITY_QUERY)?;
         let rows = stmt.query_map([], map_pending_identity_row)?;
@@ -519,51 +523,64 @@ impl Catalog {
 
     /// A bounded window over the pending-identity queue, grouped by COPY — for the Tauri
     /// command and the debt panel, so a 74k-row queue is never pulled across IPC in one
-    /// payload (review finding F1a), AND so the page's row count is always a slice of the
-    /// same unit [`Catalog::summarize_pending_identity`] counts (copies), never more (defect
-    /// 1). A copy owing both `identifier` and `import_batch` is ONE row on this page, with
-    /// both fields folded into `PendingIdentity::fields` — before this fix, this function
-    /// shared [`PENDING_IDENTITY_QUERY`] (flat, one row per (copy, field)) with
-    /// [`Catalog::list_pending_identity`], so that copy came back as two rows, and the
-    /// panel's own paging label could read "Showing 1–4 of 3" (`summarize_pending_identity`
-    /// correctly counted 3 copies; the list handed back 4 rows for them).
+    /// payload, AND so the page's row count is always a slice of the same unit
+    /// [`Catalog::summarize_pending_identity`] counts (copies), never more. A copy owing
+    /// both `identifier` and `import_batch` is ONE row on this page, with both fields
+    /// folded into `PendingIdentity::fields`, never split across two rows the way
+    /// [`PENDING_IDENTITY_QUERY`] (flat, one row per (copy, field)) would — that split is
+    /// exactly what would let this page's row count exceed
+    /// `summarize_pending_identity`'s copy-counted total, e.g. a paging label reading
+    /// "Showing 1–4 of 3".
     ///
     /// Two-step, both index-driven (see `idx_pending_sidecar_identity_copy` in
-    /// `schema.rs`): (1) page the DISTINCT copies — `GROUP BY photo_id, volume_id,
-    /// relative_path`, ordered and LIMIT/OFFSET'd by that same natural key; (2) for each
-    /// copy on the page, a second small query fetches the field(s) it owes (at most 2,
-    /// indexed by `photo_id`).
+    /// `schema.rs`) and run inside one read transaction (below): (1) page the DISTINCT
+    /// copies — `GROUP BY photo_id, volume_id, relative_path`, ordered and LIMIT/OFFSET'd
+    /// by that same natural key; (2) for each copy on the page, a second small query
+    /// fetches the field(s) it owes (at most 2, indexed by `photo_id`). The transaction
+    /// exists because these two statements would otherwise run as independent autocommit
+    /// reads: a write committed by another connection (a scan on its own
+    /// `Catalog::open_secondary` connection is the expected case, not a contrived one —
+    /// see `scanner/mod.rs`) strictly between them would be visible to statement (2) but
+    /// not (1), so a copy step (1) had just listed could come back from step (2) with
+    /// `fields: []` — contradicting [`PendingIdentity::fields`]'s "never 0" doc. Wrapping
+    /// both in one `BEGIN DEFERRED` transaction gives them the same snapshot, so the pair
+    /// can only ever agree.
     ///
-    /// **Ordered by the copy's natural key, not by `queued_at`.** This was a deliberate
-    /// change from the pre-defect-1 "oldest queued first", for two reasons: (a) once a copy
-    /// can own two fields queued at different times, "this copy's queued_at" is ambiguous —
-    /// natural-key order has no such ambiguity, and the stability guarantee paging actually
-    /// needs ("Prev/Next never skips or repeats a copy") only requires SOME deterministic
-    /// total order, not a specific one; (b) it is the only ordering [`EXPLAIN QUERY PLAN`]
-    /// confirms `idx_pending_sidecar_identity_copy` can serve directly — no
+    /// **Ordered by the copy's natural key, not by `queued_at`.** This is a deliberate
+    /// choice, for two reasons: (a) once a copy can own two fields queued at different
+    /// times, "this copy's queued_at" is ambiguous — natural-key order has no such
+    /// ambiguity, and the stability guarantee paging actually needs ("Prev/Next never
+    /// skips or repeats a copy") only requires SOME deterministic total order, not a
+    /// specific one; (b) it is the only ordering [`EXPLAIN QUERY PLAN`] confirms
+    /// `idx_pending_sidecar_identity_copy` can serve directly — no
     /// `USE TEMP B-TREE FOR ORDER BY`. Ordering by `MIN(queued_at)` per copy was tried and
     /// rejected: SQLite must fully materialize and sort the grouped result before applying
     /// `LIMIT`/`OFFSET` regardless of any index, because no btree can be simultaneously
     /// sorted by a grouping key and by an aggregate computed FROM that grouping.
     ///
-    /// This corrects an earlier version of this comment, which claimed paging bounded the
-    /// cost of an un-indexed sort. It didn't: `EXPLAIN QUERY PLAN` on the query this
-    /// function used to run showed `USE TEMP B-TREE FOR ORDER BY` — SQLite sorted the
-    /// WHOLE matching set before applying `LIMIT`/`OFFSET`, on every page turn, while
-    /// `with_catalog_blocking` held the shared catalog mutex for the duration. Measured on
-    /// a synthetic 74,488-row table (the #20 harness shape): 17–50 ms per page depending on
-    /// offset, un-indexed; 0.6–25 ms indexed and ordered as above (offset still costs
-    /// something — SQLite's `OFFSET` walks the skipped rows even off an index — but no
-    /// longer sorts the table to do it). Given the mutex is shared with every other catalog
-    /// read, this file now adds `idx_pending_sidecar_identity_copy` rather than re-decline
-    /// with a corrected number (defect 4; see the migration note on the index itself in
-    /// `schema.rs` for why no `SCHEMA_VERSION` bump was needed).
+    /// Without `idx_pending_sidecar_identity_copy`, `EXPLAIN QUERY PLAN` on this query
+    /// shows `USE TEMP B-TREE FOR ORDER BY` — SQLite sorts the WHOLE matching set before
+    /// applying `LIMIT`/`OFFSET`, on every page turn, while `with_catalog_blocking` holds
+    /// the shared catalog mutex for the duration; the index removes that sort (pinned by
+    /// `list_pending_identity_page_query_plan_has_no_temp_btree_sort` below). It does not
+    /// make deep offsets cheap — SQLite's `OFFSET` still walks the skipped rows even off an
+    /// index — only the sort. Measured end to end (this function, mutex held) on a
+    /// 74,488-row table shaped like the #20 harness (50,000 distinct copies, 24,488 of them
+    /// owing both fields), `LIMIT 500`: ~5 ms at offset 0, ~45 ms at offset 25,000, ~73 ms
+    /// at offset 49,500 — cost scales with offset, not with table size once the index is
+    /// in place.
     pub fn list_pending_identity_page(
         &self,
         limit: i64,
         offset: i64,
     ) -> Result<Vec<PendingIdentity>> {
-        let mut copy_stmt = self.conn.prepare(PENDING_IDENTITY_COPY_PAGE_QUERY)?;
+        // Both statements run inside one read transaction so they share a single
+        // snapshot: see this method's doc comment for why an autocommit pair could
+        // otherwise return a copy the first statement (`PENDING_IDENTITY_COPY_PAGE_QUERY`)
+        // just listed with `fields: []` from the second, if another connection deletes or
+        // inserts rows for that copy in between.
+        let tx = self.conn.unchecked_transaction()?;
+        let mut copy_stmt = tx.prepare(PENDING_IDENTITY_COPY_PAGE_QUERY)?;
         let copies = copy_stmt
             .query_map(params![limit, offset], |r| {
                 Ok((
@@ -575,7 +592,7 @@ impl Catalog {
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
 
-        let mut field_stmt = self.conn.prepare(
+        let mut field_stmt = tx.prepare(
             "SELECT field, error, attempts, last_attempt_at
              FROM pending_sidecar_identity
              WHERE photo_id = ?1 AND volume_id = ?2 AND relative_path = ?3
@@ -605,6 +622,9 @@ impl Catalog {
                 fields,
             });
         }
+        drop(copy_stmt);
+        drop(field_stmt);
+        tx.commit()?;
         Ok(out)
     }
 
@@ -627,16 +647,15 @@ impl Catalog {
     /// queue rows: `total` matches the total row count [`Catalog::list_pending_identity_page`]
     /// would return across all its pages, NOT `list_pending_identity().len()` (that one is
     /// flat, one row per (copy, field) — see its struct doc) — a copy owing both
-    /// `identifier` and `import_batch` is two rows there but one copy here (review finding
-    /// F2, CONTEXT.md's "Copy", issue #50's "the number of copies currently in identity
-    /// debt"; defect 1 made `list_pending_identity_page` agree with this same unit).
-    /// `conflicts` is the subset of those copies with at least one field in `Conflict` —
-    /// needs a human, not a retry (see CONTEXT.md § Identity).
+    /// `identifier` and `import_batch` is two rows there but one copy here, matching
+    /// CONTEXT.md's "Copy" and issue #50's "the number of copies currently in identity
+    /// debt". `conflicts` is the subset of those copies with at least one field in
+    /// `Conflict` — needs a human, not a retry (see CONTEXT.md § Identity).
     ///
     /// Matches `error` with `GLOB` (case-sensitive, `*`/`?` wildcards), not `LIKE`
     /// (case-insensitive, `_`/`%` wildcards), so this agrees with `debt_state_from_error`'s
     /// case-sensitive Rust `starts_with` instead of silently diverging on a differently
-    /// cased error string (review finding F3).
+    /// cased error string.
     pub fn summarize_pending_identity(&self) -> Result<PendingIdentitySummary> {
         Ok(self.conn.query_row(
             "SELECT count(*), coalesce(sum(has_conflict), 0)
@@ -910,9 +929,9 @@ mod tests {
     /// `total`/`conflicts` must count DISTINCT copies (`photo_id, volume_id,
     /// relative_path`), not queue rows — `PRIMARY KEY(photo_id, field, volume_id,
     /// relative_path)` means one copy owing both `identifier` and `import_batch` is two
-    /// rows but one copy. Mutation M5 (review finding F2) added `WHERE field =
-    /// 'identifier'` to `summarize_pending_identity`, and every existing test stayed
-    /// green because every fixture row used `field = 'identifier'`. This test seeds a
+    /// rows but one copy. A version of `summarize_pending_identity` that filtered to
+    /// `WHERE field = 'identifier'` would pass every OTHER test in this file, because
+    /// every other fixture row happens to use `field = 'identifier'`. This test seeds a
     /// copy that owes ONLY `import_batch` — which such a filter would silently drop from
     /// the count — and a copy that owes BOTH fields — which a naive `count(*)` would
     /// double-count — so either mistake changes the numbers asserted below.
@@ -958,7 +977,7 @@ mod tests {
 
     /// `Conflict` is "not an error and not repairable by retrying" — `tally()` must route
     /// it to its own bucket, never into `failed`, so a post-repair summary never calls a
-    /// Conflict a failure (review finding F5).
+    /// Conflict a failure.
     #[test]
     fn repair_summary_tally_keeps_conflict_out_of_failed() {
         let mut summary = IdentityRepairSummary::default();
@@ -979,11 +998,11 @@ mod tests {
     /// The paged listing must page over COPIES, not (copy, field) rows — a copy owing
     /// both `identifier` and `import_batch` must occupy exactly ONE slot on the page, with
     /// both fields folded into `.fields`, so `rows.length` never exceeds
-    /// `summarize_pending_identity().total` for the same queue (defect 1: before this fix,
-    /// the paged list shared its query with the flat, field-grain `list_pending_identity`,
-    /// so this exact fixture — 5 single-field copies + 1 two-field copy, 6 copies / 7 rows
-    /// — would return 7 rows across the same pages, and the panel's `pagingLabel` would
-    /// read "Showing 1–7 of 6"). Also covers a partial last page and past-the-end paging.
+    /// `summarize_pending_identity().total` for the same queue. If the paged list instead
+    /// shared its query with the flat, field-grain `list_pending_identity`, this exact
+    /// fixture — 5 single-field copies + 1 two-field copy, 6 copies / 7 rows — would
+    /// return 7 rows across the same pages, and the panel's `pagingLabel` would read
+    /// "Showing 1–7 of 6". Also covers a partial last page and past-the-end paging.
     #[test]
     fn list_pending_identity_page_windows_every_copy_exactly_once() {
         let (catalog, root, _dir) = temp_catalog("page-windows");
@@ -1051,12 +1070,12 @@ mod tests {
     }
 
     /// The paged listing orders copies by their natural key (`photo_id, volume_id,
-    /// relative_path`), NOT by `queued_at` — a deliberate change from the pre-defect-1
-    /// "oldest queued first" (see the doc comment on `list_pending_identity_page`): once a
-    /// copy can own two fields queued at different times, "this copy's queued_at" is
-    /// ambiguous, and natural-key order is what lets `idx_pending_sidecar_identity_copy`
-    /// drive the GROUP BY / ORDER BY / LIMIT-OFFSET without a temp b-tree sort (defect 4).
-    /// `queued_at` is forced to run in the OPPOSITE order from `photo_id` via a direct
+    /// relative_path`), NOT by `queued_at` (see the doc comment on
+    /// `list_pending_identity_page` for why): once a copy can own two fields queued at
+    /// different times, "this copy's queued_at" is ambiguous, and natural-key order is
+    /// what lets `idx_pending_sidecar_identity_copy` drive the GROUP BY / ORDER BY /
+    /// LIMIT-OFFSET without a temp b-tree sort. `queued_at` is forced to run in the
+    /// OPPOSITE order from `photo_id` via a direct
     /// UPDATE (real wall-clock timestamps at second resolution can't be trusted to differ
     /// within a fast test) — a query that still (wrongly) sorted by `queued_at` would
     /// return the photos in reverse.
@@ -1094,10 +1113,10 @@ mod tests {
         );
     }
 
-    /// Guards defect 4 directly, not just by measurement: runs `EXPLAIN QUERY PLAN`
-    /// against the exact SQL [`Catalog::list_pending_identity_page`] ships
-    /// (`PENDING_IDENTITY_COPY_PAGE_QUERY`) and asserts no plan step is a temp b-tree
-    /// sort. A mutation that reverts the `ORDER BY` to an aggregate like
+    /// Guards the query shape directly, not just by measurement: runs
+    /// `EXPLAIN QUERY PLAN` against the exact SQL [`Catalog::list_pending_identity_page`]
+    /// ships (`PENDING_IDENTITY_COPY_PAGE_QUERY`) and asserts no plan step is a temp
+    /// b-tree sort. A change that reverts the `ORDER BY` to an aggregate like
     /// `MIN(queued_at)`, or that drops/renames `idx_pending_sidecar_identity_copy`
     /// (`schema.rs`), fails this test immediately instead of only showing up as a slow
     /// page turn at 74k rows.
@@ -1115,7 +1134,7 @@ mod tests {
             .unwrap();
         assert!(
             !plan.iter().any(|line| line.contains("B-TREE")),
-            "query plan uses a temp b-tree sort — defect 4 regressed: {plan:?}"
+            "query plan uses a temp b-tree sort — the index or ORDER BY regressed: {plan:?}"
         );
         // Sanity: the plan must actually use the covering index, not just happen to
         // avoid a b-tree some other way (e.g. a full unordered scan would also lack one).
@@ -1124,5 +1143,73 @@ mod tests {
                 .any(|line| line.contains("idx_pending_sidecar_identity_copy")),
             "expected the copy-covering index to drive this query, got: {plan:?}"
         );
+    }
+
+    /// D3: `list_pending_identity_page` runs a copy-page query, then — for each copy on
+    /// the page — a field-lookup query. Outside a shared transaction, these are two
+    /// independent autocommit reads: a write another connection commits strictly between
+    /// them is visible to the second statement but not the first, so a copy the first
+    /// statement already listed can come back from the second with `fields: []`,
+    /// contradicting [`PendingIdentity::fields`]'s "never 0" doc. That other connection is
+    /// not contrived — a concurrent scan writes this exact table on its own
+    /// `Catalog::open_secondary` connection (see `scanner/mod.rs`).
+    ///
+    /// Forces exactly that interleaving deterministically, without any thread-timing
+    /// gamble: register an `authorizer` on the primary connection (SQLite invokes it once
+    /// per top-level `SELECT` it compiles) and, on the SECOND `Select` action — which is
+    /// `list_pending_identity_page`'s field-lookup query; the copy-page query, and every
+    /// row it returns, is already fully executed in Rust by the time that statement is
+    /// even prepared — delete the seeded copy's row from a SEPARATE connection standing in
+    /// for the concurrent scan, and commit it. If the two statements do not share a
+    /// snapshot, the field lookup sees the deletion and comes back empty.
+    #[test]
+    fn list_pending_identity_page_survives_a_write_committed_between_its_two_queries() {
+        let (catalog, root, _dir) = temp_catalog("page-torn-read");
+        let (id, path) = seed_photo(&catalog, &root, "a.arw");
+        catalog
+            .record_sidecar_identity(id, &path, &SidecarIdentity::Unreachable)
+            .unwrap();
+
+        let secondary = Catalog::open_secondary(catalog.db_path(), &root).unwrap();
+        let secondary = std::panic::AssertUnwindSafe(secondary);
+        let selects_seen = std::sync::atomic::AtomicUsize::new(0);
+        catalog.conn().authorizer(Some(move |ctx: rusqlite::hooks::AuthContext<'_>| {
+            // Force whole-value capture of `secondary` (an `AssertUnwindSafe` wrapper)
+            // rather than RFC 2229 disjoint capture of its `.0` field, which would recover
+            // the un-wrapped `Catalog` and defeat the wrapper's purpose.
+            let secondary = &secondary;
+            if matches!(ctx.action, rusqlite::hooks::AuthAction::Select) {
+                let n = selects_seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                if n == 2 {
+                    secondary
+                        .0
+                        .conn()
+                        .execute(
+                            "DELETE FROM pending_sidecar_identity WHERE photo_id = ?1",
+                            params![id],
+                        )
+                        .unwrap();
+                }
+            }
+            rusqlite::hooks::Authorization::Allow
+        }));
+
+        let page = catalog.list_pending_identity_page(10, 0).unwrap();
+        catalog
+            .conn()
+            .authorizer(None::<fn(rusqlite::hooks::AuthContext<'_>) -> rusqlite::hooks::Authorization>);
+
+        assert_eq!(page.len(), 1, "the copy was already paged before the concurrent delete");
+        assert_eq!(
+            page[0].fields.len(),
+            1,
+            "the field lookup must see the SAME snapshot the copy-page query saw — an \
+             empty `fields` here is exactly the torn read D3 describes"
+        );
+
+        // Sanity: the delete really did commit — a fresh call (a new transaction, a new
+        // snapshot) now sees it gone.
+        let after = catalog.list_pending_identity_page(10, 0).unwrap();
+        assert!(after.is_empty(), "the concurrent delete must be visible to a NEW call");
     }
 }

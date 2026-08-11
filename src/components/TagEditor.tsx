@@ -13,7 +13,7 @@ import {
   tagExportPreview,
   TagTerm,
 } from "../modules/api";
-import { panelsForSlot, useHost } from "../modules/host";
+import { panelsForSlot, useHostContributions } from "../modules/host";
 
 // Modal for managing a tag's taxonomy: per-language translations and synonyms,
 // each synonym with its own export checkbox, plus a live preview of what would be
@@ -45,7 +45,7 @@ export function TagEditor({
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [error, setError] = useState("");
 
-  useHost(); // re-render when modules contribute/remove tag-editor panels
+  useHostContributions(); // re-render when modules contribute/remove tag-editor panels
 
   const [trLang, setTrLang] = useState("");
   const [trText, setTrText] = useState("");

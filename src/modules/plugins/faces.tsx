@@ -38,7 +38,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { ChairPhotoAPI, ChairPhotoModule, Tag } from "../registry";
-import { useHost } from "../host";
+import { useHostSelection } from "../host";
 import "./faces.css";
 import { thumbnailUrl, createTag } from "../api";
 
@@ -1321,7 +1321,7 @@ export function FaceOverlay({ photoId, api }: FaceOverlayProps) {
 // ── FacesInspectorPanel — per-photo face review list ─────────────────────────
 
 function FacesInspectorPanel({ api }: { api: ChairPhotoAPI }) {
-  useHost(); // re-render on photo change
+  useHostSelection(); // re-render on photo change
   const photoId = api.getActivePhotoId();
   const [faces, setFaces] = useState<FaceRow[]>([]);
   const [loading, setLoading] = useState(false);
@@ -2534,7 +2534,7 @@ function FacesSettings({ api }: { api: ChairPhotoAPI }) {
 // wrapper that fills the same space.
 
 function FaceOverlayPanel({ api }: { api: ChairPhotoAPI }) {
-  useHost(); // re-render on active photo change
+  useHostSelection(); // re-render on active photo change
   const photoId = api.getActivePhotoId();
   return <FaceOverlay photoId={photoId} api={api} />;
 }

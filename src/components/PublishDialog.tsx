@@ -1,11 +1,11 @@
 import { useState } from "react";
-import { publishTargets, useHost } from "../modules/host";
+import { publishTargets, useHostContributions } from "../modules/host";
 
 // Unified publish dialog: pick a destination (Instagram / Flickr / SmugMug / …) and fill
 // in its site-specific form. Destinations are contributed by enabled publishing modules via
 // api.registerPublishTarget — this dialog just lists them and renders the selected one.
 export function PublishDialog({ onClose }: { onClose: () => void }) {
-  useHost(); // re-render when modules enable/disable or register targets
+  useHostContributions(); // re-render when modules enable/disable or register targets
   const targets = publishTargets();
   const [selected, setSelected] = useState(0);
   const active = targets[Math.min(selected, Math.max(0, targets.length - 1))];

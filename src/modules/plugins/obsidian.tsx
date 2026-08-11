@@ -10,7 +10,7 @@
 import { useEffect, useState } from "react";
 import type { ChairPhotoAPI, ChairPhotoModule, Photo, Tag } from "../registry";
 import { listTagTerms, openExternal } from "../api";
-import { useHost } from "../host";
+import { useHostEditingTag, useHostSelection } from "../host";
 
 interface NoteRecord {
   vault: string;
@@ -117,7 +117,7 @@ function tagNoteContent(t: Tag, aliases: string[]): string {
 /** "Note" section inside the tag editor modal: a companion note for the TAG
  *  (a detailed explanation of what it means), linked both ways like photo notes. */
 function ObsidianTagPanel({ api }: { api: ChairPhotoAPI }) {
-  useHost(); // re-render when the editing tag changes
+  useHostEditingTag(); // re-render when the editing tag changes
   const tag = api.getEditingTag();
   const [note, setNote] = useState<NoteRecord | null>(null);
   const [busy, setBusy] = useState(false);
@@ -217,7 +217,7 @@ function ObsidianTagPanel({ api }: { api: ChairPhotoAPI }) {
 }
 
 function ObsidianPanel({ api }: { api: ChairPhotoAPI }) {
-  useHost(); // re-render when the active photo changes
+  useHostSelection(); // re-render when the active photo changes
   const photoId = api.getActivePhotoId();
   const [photo, setPhoto] = useState<Photo | null>(null);
   const [note, setNote] = useState<NoteRecord | null>(null);

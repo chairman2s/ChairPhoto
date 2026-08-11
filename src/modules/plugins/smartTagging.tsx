@@ -13,7 +13,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { ChairPhotoAPI, ChairPhotoModule } from "../registry";
-import { useHost } from "../host";
+import { useHostSelection } from "../host";
 
 // ── Backend commands and events (owned by this module) ────────────────────────
 // Per the module contract these go through `ChairPhotoAPI.invoke` / `.onEvent`
@@ -360,7 +360,7 @@ const REATTACH_VALIDATE_FAILED =
   "Could not check whether indexing is running. Waiting until the catalog answers again.";
 
 function SimilarTagsPanel({ api }: { api: ChairPhotoAPI }) {
-  useHost(); // re-render when the active photo changes
+  useHostSelection(); // re-render when the active photo changes
   const photoId = api.getActivePhotoId();
   const [suggestions, setSuggestions] = useState<SmarttagsSuggestion[] | null>(null);
   const [busy, setBusy] = useState(false);

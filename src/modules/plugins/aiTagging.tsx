@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
 import type { ChairPhotoAPI, ChairPhotoModule } from "../registry";
-import { useHost } from "../host";
+import { useHostSelection } from "../host";
 
 // The AI Tagging plugin — the first real chairphoto module. It contributes an
 // inspector panel ("AI tags") and a settings panel (provider config). Its backend
@@ -119,7 +119,7 @@ function groupSuggestions(suggestions: AiSuggestion[]): SuggestionGroup[] {
 }
 
 function AiPanel({ api }: { api: ChairPhotoAPI }) {
-  useHost(); // re-render when the active photo changes
+  useHostSelection(); // re-render when the active photo changes
   const photoId = api.getActivePhotoId();
   const [suggestions, setSuggestions] = useState<AiSuggestion[] | null>(null);
   const [busy, setBusy] = useState(false);

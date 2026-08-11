@@ -1013,6 +1013,14 @@ export default function App() {
       setImportProgress(null);
       setDevelopStatus(null);
       setPendingCount(0);
+      // Identity debt is per-catalog, so the previous catalog's count must not keep
+      // showing as current (defect 3 in the issue #50 review): `null` (not `0`) so the
+      // chip reads "(?)" rather than disappearing while the real count is unknown — same
+      // reasoning as an IPC error in `refreshIdentityDebtCount` (review finding F4).
+      // `ready` only flips true once at boot, so the `[ready, ...]` mount effect that
+      // normally calls `refreshIdentityDebtCount` never re-fires on a catalog switch;
+      // call it directly below instead of relying on that effect.
+      setIdentityDebtCount(null);
       // Clear photo/tag arrays immediately so the grid shows nothing while the
       // async refresh resolves — prevents the previous catalog's rows from being
       // visible (with stale IDs) during the switch.
@@ -1033,11 +1041,17 @@ export default function App() {
       // closure has stabilised with clean filter/tag/album deps. Calling refresh() here
       // would capture the OLD closure (stale filter state) and query the new catalog with
       // tag/album IDs that belonged to the previous catalog, producing a flash of wrong data.
+      //
+      // `refreshIdentityDebtCount`, unlike `refresh`, closes over no filter/tag state, so
+      // it's safe to call directly here rather than wait on an effect (defect 3: it used
+      // to not be called at all on a catalog switch, and `ready` never flips back to
+      // false, so nothing else was ever going to call it either).
+      refreshIdentityDebtCount();
     });
     return () => {
       unlisten.then((f) => f());
     };
-  }, [refresh]);
+  }, [refresh, refreshIdentityDebtCount]);
 
   // Reset the active version to Original whenever the selected photo changes.
   useEffect(() => {
@@ -1776,6 +1790,10 @@ export default function App() {
           onLibraryRootChanged={() => {
             refresh();
             refreshPending();
+            // A root change can leave stale/newly-unreachable copies behind — refresh the
+            // badge here too, not just at boot/scan/panel-close (defect 3 in the issue #50
+            // review).
+            refreshIdentityDebtCount();
             setStatus("Library folder changed — click Rescan library to index it.");
           }}
         />
@@ -1853,6 +1871,11 @@ export default function App() {
             );
             refresh().catch(() => {});
             refreshPending().catch(() => {});
+            // A bundle import can queue new identity debt for extracted copies whose
+            // sidecar can't be written immediately (e.g. onto read-only storage) — refresh
+            // the badge here too, not just at boot/scan/panel-close (defect 3 in the issue
+            // #50 review).
+            refreshIdentityDebtCount().catch(() => {});
             setBatchesKey((k) => k + 1);
           }}
           onClear={() => setImportProgress(null)}

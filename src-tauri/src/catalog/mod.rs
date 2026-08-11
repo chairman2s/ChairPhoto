@@ -31,7 +31,7 @@ mod performance_harness;
 pub use facets::{Facet, SOFT_THRESHOLD_DEFAULT, SOFT_THRESHOLD_KEY};
 pub use identity::{
     bind_sidecar_identity, IdentityRepairPlan, IdentityRepairSummary, PendingIdentity,
-    SidecarIdentity,
+    PendingIdentitySummary, SidecarIdentity,
 };
 pub use locations::PathCandidate;
 pub use lifecycle::{copy_and_verify, verify_and_delete_locals, BackupPlan, OffloadPlan, RestorePlan};

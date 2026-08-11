@@ -183,6 +183,16 @@ pub async fn list_pending_identity(
     with_catalog_blocking(&state, |c| c.list_pending_identity()).await
 }
 
+/// Cheap counts (total debt + conflicts) over the pending-identity queue, for a summary
+/// badge/header that shouldn't have to pull every row — the queue reached 74,488 rows on
+/// the 100k harness shape in #20. Prefer this over `list_pending_identity().len()`.
+#[tauri::command]
+pub async fn summarize_pending_identity(
+    state: State<'_, AppState>,
+) -> Result<crate::catalog::PendingIdentitySummary, String> {
+    with_catalog_blocking(&state, |c| c.summarize_pending_identity()).await
+}
+
 /// Retry every queued sidecar identity repair, clearing the copies that now succeed.
 /// Runs the work on a secondary connection so the sidecar parsing/writing (possibly
 /// over a slow mount) never holds the app's catalog lock. Copies whose file is

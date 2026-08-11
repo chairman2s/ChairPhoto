@@ -72,17 +72,44 @@ pub enum SidecarIdentity {
     Conflict(String),
 }
 
+// Distinguishing prefixes of the non-`Bound` `error_text()` outputs below. `error_text()`
+// is the only writer of `pending_sidecar_identity.error` (see `record_sidecar_field_target`),
+// so a stored row's prefix reliably identifies which `SidecarIdentity` variant produced it —
+// `debt_state_from_error` uses this to recover a coarse state for display (CONTEXT.md §
+// Identity: Unreachable / Unwritable / Conflict) without a redundant DB column. Both
+// `error_text` and `debt_state_from_error` are defined from these same consts, so they
+// cannot drift apart.
+const UNWRITABLE_PREFIX: &str = "sidecar write failed";
+const CONFLICT_PREFIX: &str = "sidecar carries a different identity";
+
 impl SidecarIdentity {
     /// The message stored in `pending_sidecar_identity.error`; empty when bound.
     fn error_text(&self) -> String {
         match self {
             SidecarIdentity::Bound => String::new(),
             SidecarIdentity::Unreachable => "queued copy is not reachable".to_string(),
-            SidecarIdentity::Unwritable(e) => format!("sidecar write failed: {e}"),
+            SidecarIdentity::Unwritable(e) => format!("{UNWRITABLE_PREFIX}: {e}"),
             SidecarIdentity::Conflict(found) => {
-                format!("sidecar carries a different identity ({found}); left untouched")
+                format!("{CONFLICT_PREFIX} ({found}); left untouched")
             }
         }
+    }
+}
+
+/// Recover the coarse CONTEXT.md § Identity state — `"unreachable"`, `"unwritable"`, or
+/// `"conflict"` — from a stored `pending_sidecar_identity.error`, for display. `Bound`
+/// copies are deleted from the queue (see `record_sidecar_field_target`), so it never
+/// appears here. Unrecognised text (there should be none — `error_text` is the only
+/// writer) falls back to `"unreachable"`, the reading that costs a user the least if the
+/// prefix match is ever wrong: repair keeps retrying rather than a legitimately queued
+/// copy silently reading as a hard failure.
+fn debt_state_from_error(error: &str) -> &'static str {
+    if error.starts_with(CONFLICT_PREFIX) {
+        "conflict"
+    } else if error.starts_with(UNWRITABLE_PREFIX) {
+        "unwritable"
+    } else {
+        "unreachable"
     }
 }
 
@@ -142,12 +169,33 @@ pub struct PendingIdentity {
     pub path: String,
     /// The volume that contains the copy whose sidecar is pending.
     pub volume_id: i64,
+    /// This copy's path relative to its volume's base — the other half of `volume_id`
+    /// that identifies which physical copy owes the debt (`target_path` is the two
+    /// joined; kept separate here so display can show "which volume" and "which path"
+    /// independently, per issue #50).
+    pub relative_path: String,
     /// Absolute path to the copy whose sidecar is pending, for display/diagnostics.
     pub target_path: String,
+    /// The coarse CONTEXT.md § Identity state this copy is in: `"unreachable"`,
+    /// `"unwritable"`, or `"conflict"` — never `"bound"` (bound copies are cleared from
+    /// the queue, see `record_sidecar_field_target`). Derived from `error` by
+    /// `debt_state_from_error`; display code should key off this, not the prose text.
+    pub state: String,
     pub attempts: i64,
     pub error: String,
     pub queued_at: i64,
     pub last_attempt_at: i64,
+}
+
+/// Coarse counts over `pending_sidecar_identity`, for a summary badge that doesn't need
+/// every row. See [`Catalog::summarize_pending_identity`].
+#[derive(Debug, Default, Clone, Copy, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingIdentitySummary {
+    /// Every queued copy, any field, any state (`Unreachable` / `Unwritable` / `Conflict`).
+    pub total: i64,
+    /// Of `total`, how many are `Conflict` — need a human, not a retry.
+    pub conflicts: i64,
 }
 
 /// One copy's repair, planned under the catalog lock and runnable without it.
@@ -336,6 +384,8 @@ impl Catalog {
                 .join(&relative_path)
                 .to_string_lossy()
                 .to_string();
+            let error: String = r.get(8)?;
+            let state = debt_state_from_error(&error).to_string();
             Ok(PendingIdentity {
                 photo_id: r.get(0)?,
                 uuid: photo_uuid,
@@ -343,9 +393,11 @@ impl Catalog {
                 value,
                 path: r.get(2)?,
                 volume_id: r.get(4)?,
+                relative_path,
                 target_path,
+                state,
                 attempts: r.get(7)?,
-                error: r.get(8)?,
+                error,
                 queued_at: r.get(9)?,
                 last_attempt_at: r.get(10)?,
             })
@@ -362,6 +414,25 @@ impl Catalog {
                 [],
                 |r| r.get(0),
             )?)
+    }
+
+    /// Coarse counts over the whole pending-identity queue (every field, not just
+    /// `identifier`) — cheap enough to compute without pulling every row across IPC, for
+    /// a summary badge/header. `total` matches `list_pending_identity().len()`;
+    /// `conflicts` is the subset a human must resolve rather than one a repair pass can
+    /// retry into success (see CONTEXT.md § Identity).
+    pub fn summarize_pending_identity(&self) -> Result<PendingIdentitySummary> {
+        Ok(self.conn.query_row(
+            "SELECT count(*), count(*) FILTER (WHERE error LIKE ?1)
+             FROM pending_sidecar_identity",
+            params![format!("{CONFLICT_PREFIX}%")],
+            |r| {
+                Ok(PendingIdentitySummary {
+                    total: r.get(0)?,
+                    conflicts: r.get(1)?,
+                })
+            },
+        )?)
     }
 
     /// Plan the repair of every queued copy. PURE SQL, so it is safe to call while
@@ -425,4 +496,157 @@ fn now() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_catalog(tag: &str) -> (Catalog, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("chairphoto-identity-test-{tag}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let root = dir.join("photos");
+        std::fs::create_dir_all(&root).unwrap();
+        let catalog = Catalog::open(&dir.join("test.chairphoto"), &root).unwrap();
+        (catalog, root)
+    }
+
+    fn seed_photo(catalog: &Catalog, root: &Path, name: &str) -> (i64, PathBuf) {
+        let path = root.join(name);
+        std::fs::write(&path, b"raw-bytes").unwrap();
+        let up = catalog.upsert_photo(&path, None, 1, 9).unwrap();
+        (up.id, path)
+    }
+
+    /// Each non-`Bound` `SidecarIdentity` variant must round-trip through
+    /// `list_pending_identity` as the matching CONTEXT.md § Identity state — this is
+    /// what lets the UI tell an `Unreachable` copy (normal, not an error) apart from a
+    /// `Conflict` (needs a human) or an `Unwritable` failure, per issue #50.
+    #[test]
+    fn list_pending_identity_reports_the_state_matching_each_outcome() {
+        let (catalog, root) = temp_catalog("state-per-variant");
+        let (unreachable_id, unreachable_path) = seed_photo(&catalog, &root, "unreachable.arw");
+        let (unwritable_id, unwritable_path) = seed_photo(&catalog, &root, "unwritable.arw");
+        let (conflict_id, conflict_path) = seed_photo(&catalog, &root, "conflict.arw");
+
+        catalog
+            .record_sidecar_identity(unreachable_id, &unreachable_path, &SidecarIdentity::Unreachable)
+            .unwrap();
+        catalog
+            .record_sidecar_identity(
+                unwritable_id,
+                &unwritable_path,
+                &SidecarIdentity::Unwritable("disk full".to_string()),
+            )
+            .unwrap();
+        catalog
+            .record_sidecar_identity(
+                conflict_id,
+                &conflict_path,
+                &SidecarIdentity::Conflict("some-other-uuid".to_string()),
+            )
+            .unwrap();
+
+        let pending = catalog.list_pending_identity().unwrap();
+        assert_eq!(pending.len(), 3);
+        let state_for = |id: i64| {
+            pending
+                .iter()
+                .find(|p| p.photo_id == id)
+                .unwrap_or_else(|| panic!("no pending row for photo {id}"))
+                .state
+                .clone()
+        };
+        assert_eq!(state_for(unreachable_id), "unreachable");
+        assert_eq!(state_for(unwritable_id), "unwritable");
+        assert_eq!(state_for(conflict_id), "conflict");
+
+        // relative_path must identify the specific copy (independent of volume_id), not
+        // come back empty/placeholder — the UI shows it next to the volume, per #50.
+        let row = pending.iter().find(|p| p.photo_id == conflict_id).unwrap();
+        assert_eq!(row.relative_path, "conflict.arw");
+        assert!(row.target_path.ends_with("conflict.arw"));
+    }
+
+    /// Two copies of the SAME photo on different volumes must stay two independent
+    /// rows/states — issue #50 explicitly calls out not collapsing them.
+    #[test]
+    fn two_copies_of_one_photo_on_different_volumes_stay_two_rows() {
+        let (catalog, root) = temp_catalog("two-copies-two-volumes");
+        let (photo_id, local_path) = seed_photo(&catalog, &root, "same-photo.arw");
+
+        let other_dir = root.parent().unwrap().join("second-volume");
+        std::fs::create_dir_all(&other_dir).unwrap();
+        let other_volume = catalog
+            .add_volume("Second", &other_dir, crate::catalog::VolumeKind::Backup)
+            .unwrap();
+        let other_path = other_dir.join("same-photo.arw");
+        std::fs::write(&other_path, b"raw-bytes-2").unwrap();
+
+        catalog
+            .record_sidecar_identity(photo_id, &local_path, &SidecarIdentity::Unreachable)
+            .unwrap();
+        catalog
+            .record_sidecar_identity(
+                photo_id,
+                &other_path,
+                &SidecarIdentity::Conflict("different-uuid".to_string()),
+            )
+            .unwrap();
+
+        let pending = catalog.list_pending_identity().unwrap();
+        assert_eq!(pending.len(), 2, "one photo, two volumes, must be two rows: {pending:?}");
+        assert!(pending.iter().all(|p| p.photo_id == photo_id));
+        let volumes: std::collections::HashSet<i64> = pending.iter().map(|p| p.volume_id).collect();
+        assert_eq!(volumes.len(), 2, "each copy must keep its own volume_id");
+        assert!(volumes.contains(&other_volume));
+        let states: std::collections::HashSet<&str> =
+            pending.iter().map(|p| p.state.as_str()).collect();
+        assert_eq!(states, std::collections::HashSet::from(["unreachable", "conflict"]));
+    }
+
+    #[test]
+    fn summarize_pending_identity_counts_conflicts_separately_from_total() {
+        // Deliberately unbalanced (2 unwritable, 1 unreachable, 1 conflict) so a
+        // `conflicts` count that accidentally matched the wrong state would produce a
+        // visibly different number, not a coincidentally-equal one.
+        let (catalog, root) = temp_catalog("summarize");
+        let (a, a_path) = seed_photo(&catalog, &root, "a.arw");
+        let (b, b_path) = seed_photo(&catalog, &root, "b.arw");
+        let (b2, b2_path) = seed_photo(&catalog, &root, "b2.arw");
+        let (c, c_path) = seed_photo(&catalog, &root, "c.arw");
+
+        catalog.record_sidecar_identity(a, &a_path, &SidecarIdentity::Unreachable).unwrap();
+        catalog
+            .record_sidecar_identity(b, &b_path, &SidecarIdentity::Unwritable("nope".to_string()))
+            .unwrap();
+        catalog
+            .record_sidecar_identity(b2, &b2_path, &SidecarIdentity::Unwritable("nope2".to_string()))
+            .unwrap();
+        catalog
+            .record_sidecar_identity(c, &c_path, &SidecarIdentity::Conflict("other".to_string()))
+            .unwrap();
+
+        let summary = catalog.summarize_pending_identity().unwrap();
+        assert_eq!(summary.total, 4);
+        assert_eq!(summary.conflicts, 1, "only the Conflict row should count, not the two Unwritable rows");
+        assert_eq!(summary.total as usize, catalog.list_pending_identity().unwrap().len());
+    }
+
+    /// A repair pass that clears a row (bound) must also drop out of the summary —
+    /// `summarize_pending_identity` must not double-count against a stale total.
+    #[test]
+    fn summarize_pending_identity_drops_repaired_rows() {
+        let (catalog, root) = temp_catalog("summarize-repair");
+        let (a, a_path) = seed_photo(&catalog, &root, "a.arw");
+        catalog.record_sidecar_identity(a, &a_path, &SidecarIdentity::Unreachable).unwrap();
+        assert_eq!(catalog.summarize_pending_identity().unwrap().total, 1);
+
+        // Clearing (Bound) must delete the row, not just relabel it.
+        catalog.record_sidecar_identity(a, &a_path, &SidecarIdentity::Bound).unwrap();
+        let summary = catalog.summarize_pending_identity().unwrap();
+        assert_eq!(summary.total, 0);
+        assert_eq!(summary.conflicts, 0);
+    }
 }

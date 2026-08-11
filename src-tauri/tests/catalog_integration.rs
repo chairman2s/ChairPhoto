@@ -4254,7 +4254,7 @@ fn a_foreign_identity_in_the_sidecar_is_never_overwritten() {
     );
 
     // A repair pass keeps reporting it rather than clobbering — this one needs a human.
-    // A Conflict is NOT a failure (review finding F5): it lands in `conflicts`, not
+    // A Conflict is NOT a failure: it lands in `conflicts`, not
     // `failed` — retrying it forever would be pointless, and calling it a failure would
     // contradict the "left untouched until a person resolves it" story the UI tells.
     let summary = catalog.repair_pending_identity().unwrap();

@@ -3127,7 +3127,7 @@ body {
 }
 .identity-debt-row {
   display: flex;
-  /* flex-start, not center (defect 1): a row's per-field columns (State/Field/Tries/Last
+  /* flex-start, not center: a row's per-field columns (State/Field/Tries/Last
    * attempt/Detail) can now stack 1 or 2 lines depending on how many fields the copy
    * owes, so the row's height varies — the per-copy columns (Path/Volume/Relative path)
    * stay individually centered against that height instead (see below), rather than the
@@ -3140,7 +3140,7 @@ body {
   font-size: 12px;
 }
 /* The (non-virtualized, always-visible) column header — same widths as a data row, but
- * bold and immune to the state-badge/detail-text treatment below (review finding F7). */
+ * bold and immune to the state-badge/detail-text treatment below. */
 .identity-debt-header {
   height: 30px;
   font-weight: 600;
@@ -3178,7 +3178,7 @@ body {
 }
 /* Per-FIELD columns: State/Field/Tries/Last attempt/Detail. A copy owing two fields
  * stacks two lines here, one per field, in the same top-to-bottom order across all five
- * columns (defect 1: this panel used to render one row per (copy, field); now it's one
+ * columns (this panel used to render one row per (copy, field); now it's one
  * row per copy, with these columns holding 1–2 stacked lines instead of always 1).
  * `.identity-debt-fieldcol` alone sizes the Field column; the modifiers below size the
  * others to match their historical single-line widths. */
@@ -3223,7 +3223,7 @@ body {
   white-space: nowrap;
 }
 /* The single most useful fact on a Conflict row: which identity the file actually
- * carries (review finding F7). Rendered for every field, not just Conflict, so the
+ * carries. Rendered for every field, not just Conflict, so the
  * column doesn't jump around. `flex: none; width: 100%` (not the header's `flex: 1`):
  * nested in a `flex-direction: column` field-stack, `flex: 1` would grow the item's
  * HEIGHT (the column's main axis), not its width. */

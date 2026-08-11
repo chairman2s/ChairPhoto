@@ -747,9 +747,9 @@ mod tests {
     /// This file previously keyed on `tag` alone (`chairphoto-identity-test-{tag}`),
     /// which every `cargo test` process on the machine shares; `remove_dir_all` on entry
     /// then deletes a directory another process is still writing into, and nothing
-    /// cleans up after a panicking test either. That is the exact bug #45 / commit
-    /// 9cd6d83 fixed for the thumbnail tests, reintroduced here one commit later (review
-    /// finding F8). `src-tauri/src/test_support.rs` on the #45 branch adds a shared
+    /// cleans up after a panicking test either. That is the same bug #45 / commit
+    /// 9cd6d83 fixed for the thumbnail tests. `src-tauri/src/test_support.rs` on the
+    /// #45 branch adds a shared
     /// `TestTmpDir` with this same shape but is not merged yet; this is a local copy in
     /// the same shape so the two converge trivially once it lands — collapse this into
     /// `test_support::TestTmpDir` post-merge instead of keeping both.

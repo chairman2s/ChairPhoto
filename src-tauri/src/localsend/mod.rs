@@ -111,6 +111,18 @@ pub fn our_info(fingerprint: &str, announce: bool) -> serde_json::Value {
 /// uses this to advertise the port its discovery socket actually bound — which may not be
 /// [`OUR_PORT`] if 53317 was unavailable even with `SO_REUSEADDR`/`SO_REUSEPORT` — rather than
 /// a port owned by whatever else is listening on 53317.
+///
+/// Deliberate, not accidental: `discover()` advertises a port on which ChairPhoto runs no TCP
+/// listener at all — normally 53317, since we usually do win that bind. This is exactly why a
+/// spec-conformant peer's HTTP `POST /api/localsend/v2/register` to that port fails and the
+/// peer falls back to the UDP reply this module is built to receive. Absent a listener, this is
+/// the least-bad choice: the announcement must name *some* port, and the port we actually bound
+/// is at least honest about where we are (not) listening. What it doesn't cover: if a
+/// co-resident LocalSend desktop app happens to serve real HTTP on that same port (its normal,
+/// non-`--hidden` mode), the peer's register POST succeeds against *that* process instead of
+/// failing, no UDP fallback is ever sent, and ChairPhoto is invisible again even though
+/// everything in this module is working correctly. If that turns out to be the owner's actual
+/// failure mode, the fix is an inbound register receiver, not another change here.
 fn our_info_with_port(fingerprint: &str, announce: bool, port: u16) -> serde_json::Value {
     serde_json::json!({
         "alias": OUR_ALIAS,

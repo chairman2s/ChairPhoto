@@ -4,6 +4,7 @@ import {
   IdentityDebtState,
   IdentityRepairSummary,
   PendingIdentity,
+  PendingIdentityField,
   PendingIdentitySummary,
   Volume,
   listPendingIdentity,
@@ -37,7 +38,22 @@ function fmtWhen(unixSeconds: number): string {
   }
 }
 
-const ROW_HEIGHT = 40;
+function fieldLabel(f: PendingIdentityField): string {
+  return f.field === "identifier" ? "UUID" : "import batch";
+}
+
+/** Height of one owed-field line within a copy's row (State/Field/Tries/Last
+ *  attempt/Detail are one stacked line per field a copy owes — defect 1: a row can now
+ *  represent a copy owing 1 or 2 fields, not always exactly 1). */
+const FIELD_LINE_HEIGHT = 22;
+/** Breathing room above/below a row's field-line stack. */
+const ROW_PADDING = 10;
+/** A copy's row height: one `FIELD_LINE_HEIGHT` per owed field, never less than one
+ *  line's worth even if `fields` were ever empty. Exact, not an estimate — every row's
+ *  field count is already known before the virtualizer asks. */
+function rowHeight(p: PendingIdentity): number {
+  return Math.max(1, p.fields.length) * FIELD_LINE_HEIGHT + ROW_PADDING;
+}
 /** IPC page size (review finding F1a) — bounds a single `list_pending_identity` payload
  *  regardless of how large the queue gets (74,488 rows on the 100k harness shape in #20). */
 const PAGE_SIZE = 500;
@@ -151,7 +167,7 @@ export function IdentityDebtPanel({ onClose }: { onClose: () => void }) {
   const rowVirtualizer = useVirtualizer({
     count: list.length,
     getScrollElement: () => parentRef.current,
-    estimateSize: () => ROW_HEIGHT,
+    estimateSize: (index) => rowHeight(list[index]),
     overscan: 10,
   });
 
@@ -172,8 +188,9 @@ export function IdentityDebtPanel({ onClose }: { onClose: () => void }) {
         </div>
         <div className="modal-body">
           <div className="modal-sub">
-            Each row is one copy of a photo whose file doesn't carry its identity yet.{" "}
-            <strong>Unreachable</strong> means that copy could not be found just now —
+            Each row is one copy of a photo, listing every identity field it still owes
+            (a copy can owe both its UUID and its import batch). <strong>Unreachable</strong>{" "}
+            means that copy could not be found just now —
             normal, not an error, whether its volume is offline or the file was moved,
             renamed, or deleted outside ChairPhoto; a repair pass picks it up again once
             the file is reachable at its known location. <strong>Unwritable</strong> means
@@ -209,15 +226,20 @@ export function IdentityDebtPanel({ onClose }: { onClose: () => void }) {
             <div className="panel-empty">No identity debt — every known copy is bound.</div>
           ) : (
             <>
+              {/* Header cells share the body's column-sizing wrapper classes (rather than
+                  duplicating pixel widths) so the two can't drift apart — a copy's field
+                  columns stack 1-2 lines, but the header always has exactly one. */}
               <div className="identity-debt-row identity-debt-header">
-                <span className="identity-state-badge">State</span>
+                <span className="identity-debt-fieldcol identity-debt-statecol">State</span>
                 <span className="identity-debt-path">Path</span>
                 <span className="identity-debt-volume">Volume</span>
                 <span className="identity-debt-relpath">Relative path (on volume)</span>
-                <span className="identity-debt-field">Field</span>
-                <span className="identity-debt-attempts">Tries</span>
-                <span className="identity-debt-lastattempt">Last attempt</span>
-                <span className="identity-debt-error">Detail</span>
+                <span className="identity-debt-fieldcol">Field</span>
+                <span className="identity-debt-fieldcol identity-debt-attemptscol">Tries</span>
+                <span className="identity-debt-fieldcol identity-debt-lastattemptcol">
+                  Last attempt
+                </span>
+                <span className="identity-debt-fieldcol identity-debt-errorcol">Detail</span>
               </div>
               {rows.length === 0 ? (
                 <div className="panel-empty">
@@ -239,7 +261,7 @@ export function IdentityDebtPanel({ onClose }: { onClose: () => void }) {
                       const p = list[vi.index];
                       return (
                         <div
-                          key={`${p.photoId}-${p.field}-${p.volumeId}-${p.relativePath}`}
+                          key={`${p.photoId}-${p.volumeId}-${p.relativePath}`}
                           className="identity-debt-row"
                           style={{
                             position: "absolute",
@@ -250,8 +272,21 @@ export function IdentityDebtPanel({ onClose }: { onClose: () => void }) {
                             transform: `translateY(${vi.start}px)`,
                           }}
                         >
-                          <span className={`identity-state-badge ${STATE_CLASS[p.state]}`}>
-                            {STATE_LABEL[p.state]}
+                          {/* State/Field/Tries/Last attempt/Detail are per-FIELD — a copy
+                              owing both `identifier` and `import_batch` stacks two lines
+                              here, one per owed field (defect 1: this used to be one row
+                              per (copy, field); now it's one row per copy). Path/Volume/
+                              Relative path are per-COPY, so they render once and stay
+                              vertically centered against however tall the stack is. */}
+                          <span className="identity-debt-fieldcol identity-debt-statecol">
+                            {p.fields.map((f) => (
+                              <span
+                                key={f.field}
+                                className={`identity-state-badge ${STATE_CLASS[f.state]}`}
+                              >
+                                {STATE_LABEL[f.state]}
+                              </span>
+                            ))}
                           </span>
                           <span className="identity-debt-path" title={p.path}>
                             {p.path}
@@ -262,17 +297,37 @@ export function IdentityDebtPanel({ onClose }: { onClose: () => void }) {
                           <span className="identity-debt-relpath" title={p.relativePath}>
                             {p.relativePath}
                           </span>
-                          <span className="identity-debt-field">
-                            {p.field === "identifier" ? "UUID" : "import batch"}
+                          <span className="identity-debt-fieldcol">
+                            {p.fields.map((f) => (
+                              <span key={f.field} className="identity-debt-field">
+                                {fieldLabel(f)}
+                              </span>
+                            ))}
                           </span>
-                          <span className="identity-debt-attempts" title={`${p.attempts} attempts`}>
-                            {p.attempts}×
+                          <span className="identity-debt-fieldcol identity-debt-attemptscol">
+                            {p.fields.map((f) => (
+                              <span
+                                key={f.field}
+                                className="identity-debt-attempts"
+                                title={`${f.attempts} attempts`}
+                              >
+                                {f.attempts}×
+                              </span>
+                            ))}
                           </span>
-                          <span className="identity-debt-lastattempt">
-                            {fmtWhen(p.lastAttemptAt)}
+                          <span className="identity-debt-fieldcol identity-debt-lastattemptcol">
+                            {p.fields.map((f) => (
+                              <span key={f.field} className="identity-debt-lastattempt">
+                                {fmtWhen(f.lastAttemptAt)}
+                              </span>
+                            ))}
                           </span>
-                          <span className="identity-debt-error" title={p.error}>
-                            {p.error || "—"}
+                          <span className="identity-debt-fieldcol identity-debt-errorcol">
+                            {p.fields.map((f) => (
+                              <span key={f.field} className="identity-debt-error" title={f.error}>
+                                {f.error || "—"}
+                              </span>
+                            ))}
                           </span>
                         </div>
                       );

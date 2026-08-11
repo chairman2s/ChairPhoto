@@ -95,4 +95,20 @@ describe("pagingLabel", () => {
   it("omits the total while the summary hasn't resolved yet", () => {
     expect(pagingLabel(0, 500, null)).toBe("Showing 1–500");
   });
+
+  // Issue #50 review, defect 1: before the fix, `listPendingIdentity` returned one row
+  // per (copy, field) while `summarizePendingIdentity().total` counted copies, so a copy
+  // owing both `identifier` and `import_batch` made `rows.length` (shown) exceed `total`
+  // — this exact shape (4 rows shown, 3 total copies) rendered "Showing 1–4 of 3", and at
+  // the #20 harness scale "Showing 74501–75000 of 74488". The real fix is upstream: the
+  // backend now groups `listPendingIdentity`'s rows by copy
+  // (`list_pending_identity_page_windows_every_copy_exactly_once` in `identity.rs`), so
+  // `shown` can no longer exceed `total` in production. `pagingLabel` itself has no
+  // defense against a mismatched pair — it just formats what it's given — so this test
+  // pins down that fact deliberately: if the units ever regress to field-granularity,
+  // this is exactly the nonsensical label a screenshot/review would need to catch, not
+  // something this function would hide or clamp.
+  it("does not hide a shown>total mismatch — would render exactly the reported bug shape", () => {
+    expect(pagingLabel(0, 4, 3)).toBe("Showing 1–4 of 3");
+  });
 });

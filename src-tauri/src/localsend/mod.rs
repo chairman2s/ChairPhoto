@@ -6,14 +6,18 @@
 //! frontend module renders the device picker and (for Snapchat) records the publication.
 //! Endpoints per the LocalSend v2 protocol (github.com/localsend/protocol).
 //!
-//! No new crates: HTTP reuses [`reqwest`] (already on for `ai`/`flickr`/…), UDP uses
-//! `tokio::net::UdpSocket` from the already-on tokio "full" feature.
+//! HTTP reuses [`reqwest`] (already on for `ai`/`flickr`/…), UDP uses `tokio::net::UdpSocket`
+//! from the already-on tokio "full" feature. `socket2` (discovery-socket options) and, on
+//! unix, `libc` (interface enumeration) were promoted from transitive to direct dependencies
+//! for this — both were already fully resolved in `Cargo.lock` via tokio/mio/hyper-util, so
+//! this is no new download and no new compile unit (see `Cargo.toml`'s comments on each).
 
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::path::Path;
 use std::time::Duration;
 
+use socket2::{Domain, Protocol as SockProtocol, SockAddr, Socket, Type};
 use tokio::net::UdpSocket;
 
 /// LocalSend's well-known multicast group + port for discovery announcements.
@@ -21,7 +25,11 @@ const MULTICAST_ADDR: Ipv4Addr = Ipv4Addr::new(224, 0, 0, 167);
 const MULTICAST_PORT: u16 = 53317;
 /// The protocol version we speak / announce.
 const PROTOCOL_VERSION: &str = "2.0";
-/// Our advertised alias + (nominal) HTTP port for the send-only role.
+/// Our advertised alias + nominal HTTP port for the send-only role. `OUR_PORT` is used as-is
+/// in [`our_info`] (the send path's prepare-upload `info` block — there is no listener behind
+/// it either way, see the module docs). `discover()` does **not** use it for the port it
+/// announces: it advertises whatever port its discovery socket actually bound, via
+/// [`our_info_with_port`], since that can differ from 53317 (see `open_reusable_udp_socket`).
 const OUR_ALIAS: &str = "ChairPhoto";
 const OUR_PORT: u16 = 53317;
 
@@ -96,13 +104,21 @@ pub fn fingerprint() -> String {
 /// Our own announcement / `info` object, as sent in discovery and prepare-upload.
 /// `announce` is true when broadcasting (so peers reply), false inside prepare-upload.
 pub fn our_info(fingerprint: &str, announce: bool) -> serde_json::Value {
+    our_info_with_port(fingerprint, announce, OUR_PORT)
+}
+
+/// As [`our_info`], but advertising `port` instead of the hardcoded [`OUR_PORT`]. `discover()`
+/// uses this to advertise the port its discovery socket actually bound — which may not be
+/// [`OUR_PORT`] if 53317 was unavailable even with `SO_REUSEADDR`/`SO_REUSEPORT` — rather than
+/// a port owned by whatever else is listening on 53317.
+fn our_info_with_port(fingerprint: &str, announce: bool, port: u16) -> serde_json::Value {
     serde_json::json!({
         "alias": OUR_ALIAS,
         "version": PROTOCOL_VERSION,
         "deviceModel": "ChairPhoto",
         "deviceType": "desktop",
         "fingerprint": fingerprint,
-        "port": OUR_PORT,
+        "port": port,
         "protocol": "http",
         "download": false,
         "announce": announce,
@@ -136,21 +152,35 @@ fn parse_announcement(json: &str, ip: &str, our_fingerprint: &str) -> Option<Dev
     })
 }
 
-/// Discover LocalSend devices on the LAN for `timeout_ms`: join the multicast group, send our
-/// announcement (so peers reply), then collect replying announcements. Deduped by fingerprint
-/// (falling back to ip:port when a peer omits a fingerprint). Tolerant — a blocked multicast
-/// just yields an empty list, and the manual-IP path is the fallback (handled in LS2/LS3).
+/// Discover LocalSend devices on the LAN for `timeout_ms`: join the multicast group on every
+/// UP, multicast-capable interface, announce on each of them (so peers reply), then collect
+/// replying announcements. Deduped by fingerprint (falling back to ip:port when a peer omits
+/// a fingerprint). Tolerant of a blocked/degraded multicast join — that yields an empty list
+/// rather than an error, and the manual-IP path is the fallback (handled in LS2/LS3). Socket
+/// setup and join/announce failures are still surfaced (logged), so a persistently empty list
+/// is diagnosable instead of indistinguishable from "no peers answered".
 pub async fn discover(timeout_ms: u64) -> Result<Vec<Device>, String> {
     let our_fp = fingerprint();
 
-    let socket = bind_multicast()
-        .await
-        .map_err(|e| format!("LocalSend discovery: couldn't open multicast socket: {e}"))?;
+    let socket = open_reusable_udp_socket(MULTICAST_PORT)
+        .map_err(|e| format!("LocalSend discovery: couldn't open a UDP socket: {e}"))?;
 
-    // Announce ourselves so listening peers send their announcement back.
-    let announcement = our_info(&our_fp, true).to_string();
-    let group = SocketAddrV4::new(MULTICAST_ADDR, MULTICAST_PORT);
-    let _ = socket.send_to(announcement.as_bytes(), group).await;
+    // Advertise the port we actually bound (may not be `MULTICAST_PORT`/`OUR_PORT` if that was
+    // unavailable even with SO_REUSEADDR/SO_REUSEPORT) rather than a port some other process
+    // owns.
+    let bound_port = socket
+        .local_addr()
+        .ok()
+        .and_then(|a| a.as_socket_ipv4())
+        .map(|a| a.port())
+        .unwrap_or(OUR_PORT);
+
+    let interfaces = local_multicast_interfaces();
+    let joined = join_multicast_on_all_interfaces(&socket, &interfaces);
+    announce_on_interfaces(&socket, &joined, &our_info_with_port(&our_fp, true, bound_port));
+
+    let socket = UdpSocket::from_std(socket.into())
+        .map_err(|e| format!("LocalSend discovery: couldn't hand the socket to tokio: {e}"))?;
 
     let mut seen: HashMap<String, Device> = HashMap::new();
     let deadline = Duration::from_millis(timeout_ms);
@@ -172,7 +202,10 @@ pub async fn discover(timeout_ms: u64) -> Result<Vec<Device>, String> {
                         seen.entry(key).or_insert(dev);
                     }
                 }
-                Err(_) => break,
+                Err(e) => {
+                    eprintln!("localsend: discovery recv stopped early: {e}");
+                    break;
+                }
             }
         }
     };
@@ -181,18 +214,149 @@ pub async fn discover(timeout_ms: u64) -> Result<Vec<Device>, String> {
     Ok(seen.into_values().collect())
 }
 
-/// Bind a UDP socket joined to LocalSend's multicast group. Uses std to set the reuse-addr +
-/// membership options (so multiple LocalSend apps can share the port), then hands it to tokio.
-async fn bind_multicast() -> std::io::Result<UdpSocket> {
-    use std::net::UdpSocket as StdUdpSocket;
-    // SO_REUSEADDR via socket2 isn't available without a new dep; std's UdpSocket can still
-    // join the group and receive replies addressed to the group. Bind to the wildcard so we
-    // get unicast replies too.
-    let std_sock = StdUdpSocket::bind((Ipv4Addr::UNSPECIFIED, MULTICAST_PORT))
-        .or_else(|_| StdUdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)))?;
-    std_sock.set_nonblocking(true)?;
-    let _ = std_sock.join_multicast_v4(&MULTICAST_ADDR, &Ipv4Addr::UNSPECIFIED);
-    UdpSocket::from_std(std_sock)
+/// Open a UDP socket for LocalSend discovery with `SO_REUSEADDR` and (on unix) `SO_REUSEPORT`
+/// set *before* binding, so we can bind `port` alongside another LocalSend-speaking process
+/// that already holds it — notably the official desktop app, which autostarts and holds
+/// `MULTICAST_PORT` for as long as the user is logged in (see `agent-notes` diagnosis for
+/// issue #39; without this, discovery silently lands on an ephemeral port and can never
+/// receive anything addressed to the well-known group port). Falls back to an ephemeral port
+/// if even a reuse-enabled bind fails, logging why. Returns the raw `socket2` socket (not yet
+/// handed to tokio) so the caller can still use `set_multicast_if_v4` per announce — an option
+/// tokio's `UdpSocket` doesn't expose.
+fn open_reusable_udp_socket(port: u16) -> std::io::Result<Socket> {
+    let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(SockProtocol::UDP))?;
+    socket.set_reuse_address(true)?;
+    #[cfg(unix)]
+    socket.set_reuse_port(true)?;
+
+    let wanted = SockAddr::from(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port));
+    if let Err(e) = socket.bind(&wanted) {
+        eprintln!(
+            "localsend: couldn't bind UDP {port} even with SO_REUSEADDR/SO_REUSEPORT ({e}); \
+             falling back to an ephemeral port — peers replying to the well-known port won't \
+             reach us"
+        );
+        let fallback = SockAddr::from(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0));
+        socket.bind(&fallback)?;
+    }
+    socket.set_nonblocking(true)?;
+    Ok(socket)
+}
+
+/// Join LocalSend's multicast group on every address in `interfaces` (see
+/// [`local_multicast_interfaces`]), instead of joining once via `Ipv4Addr::UNSPECIFIED` (which
+/// the kernel resolves to a single OS-picked interface — on a multi-NIC host, silently missing
+/// the others). Returns the interfaces actually joined; a failed join on one interface doesn't
+/// stop the others, but is logged rather than silently dropped. Falls back to the old
+/// `UNSPECIFIED` join when `interfaces` is empty (non-unix targets, or a host with no
+/// qualifying interface reported), preserving prior behavior in that case. Takes the interface
+/// list as a parameter (rather than calling [`local_multicast_interfaces`] itself) so the
+/// join/fallback logic is testable without depending on the host's real network state.
+fn join_multicast_on_all_interfaces(socket: &Socket, interfaces: &[Ipv4Addr]) -> Vec<Ipv4Addr> {
+    let mut joined = Vec::new();
+    if interfaces.is_empty() {
+        match socket.join_multicast_v4(&MULTICAST_ADDR, &Ipv4Addr::UNSPECIFIED) {
+            Ok(()) => joined.push(Ipv4Addr::UNSPECIFIED),
+            Err(e) => eprintln!("localsend: couldn't join the multicast group: {e}"),
+        }
+        return joined;
+    }
+    for iface in interfaces {
+        match socket.join_multicast_v4(&MULTICAST_ADDR, iface) {
+            Ok(()) => joined.push(*iface),
+            Err(e) => eprintln!("localsend: couldn't join the multicast group on {iface}: {e}"),
+        }
+    }
+    joined
+}
+
+/// Send `announcement` to the multicast group once per interface in `joined`, selecting each
+/// as the outgoing interface first (`IP_MULTICAST_IF`) — a single send on a wildcard-bound
+/// socket only egresses via whichever interface the OS's default route picks, which under-
+/// covers a multi-NIC host exactly like the join above. Errors are logged, not propagated:
+/// one interface failing to send must not stop the others or fail discovery outright.
+fn announce_on_interfaces(socket: &Socket, joined: &[Ipv4Addr], announcement: &serde_json::Value) {
+    let bytes = announcement.to_string();
+    let group = SockAddr::from(SocketAddrV4::new(MULTICAST_ADDR, MULTICAST_PORT));
+    for iface in joined {
+        if *iface != Ipv4Addr::UNSPECIFIED {
+            if let Err(e) = socket.set_multicast_if_v4(iface) {
+                eprintln!(
+                    "localsend: couldn't select {iface} as the outgoing interface for the \
+                     announce: {e}"
+                );
+                continue;
+            }
+        }
+        if let Err(e) = socket.send_to(bytes.as_bytes(), &group) {
+            eprintln!("localsend: announce over {iface} failed: {e}");
+        }
+    }
+}
+
+/// Every UP, multicast-capable, non-loopback IPv4 address on this host, via `getifaddrs(3)`.
+/// Never errors: enumeration failures or a host with nothing qualifying return an empty list,
+/// and callers fall back to the pre-existing `Ipv4Addr::UNSPECIFIED` join in that case.
+#[cfg(unix)]
+fn local_multicast_interfaces() -> Vec<Ipv4Addr> {
+    let mut result = Vec::new();
+    // SAFETY: `getifaddrs` either returns non-zero and leaves `head` untouched (the null we
+    // initialized it with, which we then don't dereference), or returns 0 and sets `head` to
+    // the first node of a valid linked list that must be freed with `freeifaddrs`. We only
+    // read fields `getifaddrs(3)` documents as always present on a returned node, and we free
+    // the list exactly once, on every path that obtained one.
+    unsafe {
+        let mut head: *mut libc::ifaddrs = std::ptr::null_mut();
+        if libc::getifaddrs(&mut head) != 0 {
+            eprintln!(
+                "localsend: getifaddrs failed ({}); joining only via the OS-picked interface",
+                std::io::Error::last_os_error()
+            );
+            return result;
+        }
+        let mut cur = head;
+        while !cur.is_null() {
+            let ifa = &*cur;
+            cur = ifa.ifa_next;
+
+            if !interface_flags_qualify(ifa.ifa_flags as u32) || ifa.ifa_addr.is_null() {
+                continue;
+            }
+            if (*ifa.ifa_addr).sa_family as i32 != libc::AF_INET {
+                continue;
+            }
+            let sin = ifa.ifa_addr as *const libc::sockaddr_in;
+            let addr = Ipv4Addr::from(u32::from_be((*sin).sin_addr.s_addr));
+            if !result.contains(&addr) {
+                result.push(addr);
+            }
+        }
+        libc::freeifaddrs(head);
+    }
+    result
+}
+
+/// Whether an interface carrying `flags` (`ifaddrs.ifa_flags`, see `getifaddrs(3)`) qualifies
+/// for a discovery join: administratively up, multicast-capable, and not loopback. Pulled out
+/// of [`local_multicast_interfaces`] as a pure function of the flag bits so this rule — in
+/// particular the loopback exclusion — is unit-testable without depending on this host's real
+/// interfaces. (It can't be exercised host-dependently in general: on at least one dev/test
+/// machine, `lo` doesn't carry `IFF_MULTICAST` at all, so a test built only from that host's
+/// actual `getifaddrs()` output cannot tell "loopback correctly excluded" apart from
+/// "already excluded by the multicast check, loopback check untested".)
+#[cfg(unix)]
+fn interface_flags_qualify(flags: u32) -> bool {
+    let up = flags & (libc::IFF_UP as u32) != 0;
+    let multicast = flags & (libc::IFF_MULTICAST as u32) != 0;
+    let loopback = flags & (libc::IFF_LOOPBACK as u32) != 0;
+    up && multicast && !loopback
+}
+
+/// No `getifaddrs`-equivalent is wired up for non-unix targets — falls back to the
+/// pre-existing `Ipv4Addr::UNSPECIFIED` join via [`join_multicast_on_all_interfaces`].
+#[cfg(not(unix))]
+fn local_multicast_interfaces() -> Vec<Ipv4Addr> {
+    Vec::new()
 }
 
 /// Build the prepare-upload request body: `{ info, files: { <fileId>: { id, fileName, size,
@@ -399,6 +563,149 @@ fn urlencode(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- issue #39: discovery-socket fixes -------------------------------------------------
+
+    #[test]
+    fn our_info_with_port_advertises_given_port_not_the_constant() {
+        let info = our_info_with_port("fp", true, 51586);
+        assert_eq!(info["port"], 51586);
+        assert_ne!(info["port"].as_u64().unwrap(), OUR_PORT as u64);
+        // `our_info` (the send-path helper) is unaffected — still the nominal constant.
+        assert_eq!(our_info("fp", true)["port"], OUR_PORT);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn interface_flags_qualify_requires_up_and_multicast_but_excludes_loopback() {
+        let up = libc::IFF_UP as u32;
+        let multicast = libc::IFF_MULTICAST as u32;
+        let loopback = libc::IFF_LOOPBACK as u32;
+
+        assert!(interface_flags_qualify(up | multicast), "up + multicast alone must qualify");
+        assert!(!interface_flags_qualify(multicast), "a down interface must not qualify");
+        assert!(!interface_flags_qualify(up), "a non-multicast interface must not qualify");
+        assert!(
+            !interface_flags_qualify(up | multicast | loopback),
+            "loopback must be excluded even when up and multicast-capable"
+        );
+        assert!(!interface_flags_qualify(0));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_multicast_interfaces_never_includes_loopback_or_unspecified() {
+        // Best-effort against this host's real interfaces (a sandboxed runner may have zero
+        // UP, non-loopback ones — that's fine, the function must simply not panic and must
+        // never report loopback or the wildcard address as if it were a real interface).
+        let ifaces = local_multicast_interfaces();
+        for addr in &ifaces {
+            assert_ne!(*addr, Ipv4Addr::LOCALHOST, "loopback must be excluded: {addr}");
+            assert_ne!(*addr, Ipv4Addr::UNSPECIFIED, "must be a real interface address: {addr}");
+        }
+    }
+
+    #[test]
+    fn open_reusable_udp_socket_shares_a_port_already_held_by_another_reusable_socket() {
+        // First holder: bind an ephemeral port the same way a second LocalSend-speaking
+        // process would already have bound it (SO_REUSEADDR/SO_REUSEPORT before bind) — this
+        // is what the real LocalSend desktop app does on the owner's machine (see the issue
+        // #39 diagnosis), simulated here without depending on that process actually running.
+        let holder = open_reusable_udp_socket(0).expect("first bind must succeed");
+        let held_port = holder
+            .local_addr()
+            .unwrap()
+            .as_socket_ipv4()
+            .unwrap()
+            .port();
+
+        // A second reuse-enabled open of the *same* port must land on that exact port, not
+        // silently fall back to a different one.
+        let second =
+            open_reusable_udp_socket(held_port).expect("reuse-enabled bind must succeed");
+        let second_port = second
+            .local_addr()
+            .unwrap()
+            .as_socket_ipv4()
+            .unwrap()
+            .port();
+
+        assert_eq!(second_port, held_port, "expected to share the held port, not fall back");
+    }
+
+    #[test]
+    fn open_reusable_udp_socket_falls_back_to_ephemeral_port_when_a_plain_socket_holds_it() {
+        // A plain socket (no SO_REUSEADDR/SO_REUSEPORT) exclusively holds a port — a process
+        // that hasn't opted into sharing. Verified separately that Linux actually refuses the
+        // reuse-enabled second bind in this case (asymmetric reuse doesn't share); this test
+        // pins that observed behavior against a regression, not the OS's general contract.
+        let exclusive = std::net::UdpSocket::bind(("127.0.0.1", 0)).unwrap();
+        let held_port = exclusive.local_addr().unwrap().port();
+
+        let socket =
+            open_reusable_udp_socket(held_port).expect("must fall back, not error out");
+        let bound_port = socket.local_addr().unwrap().as_socket_ipv4().unwrap().port();
+
+        assert_ne!(bound_port, held_port, "must not silently claim to be on the held port");
+        assert_ne!(bound_port, 0, "must report the real ephemeral port, not the wildcard");
+    }
+
+    #[test]
+    fn advertised_port_matches_the_port_actually_bound() {
+        // End-to-end across `open_reusable_udp_socket` + `our_info_with_port`, the way
+        // `discover()` wires them together: whatever port the socket lands on (bound or
+        // fallback) is exactly the port the announcement claims.
+        let exclusive = std::net::UdpSocket::bind(("127.0.0.1", 0)).unwrap();
+        let contended_port = exclusive.local_addr().unwrap().port();
+
+        let socket = open_reusable_udp_socket(contended_port).unwrap();
+        let bound_port = socket.local_addr().unwrap().as_socket_ipv4().unwrap().port();
+        let announcement = our_info_with_port("fp", true, bound_port);
+
+        assert_eq!(announcement["port"].as_u64().unwrap(), bound_port as u64);
+        assert_ne!(bound_port, contended_port);
+    }
+
+    #[test]
+    fn join_multicast_falls_back_to_unspecified_when_no_interfaces_given() {
+        let socket = open_reusable_udp_socket(0).unwrap();
+        let joined = join_multicast_on_all_interfaces(&socket, &[]);
+        assert_eq!(joined, vec![Ipv4Addr::UNSPECIFIED]);
+    }
+
+    #[test]
+    fn join_multicast_skips_an_interface_it_cannot_join_without_panicking() {
+        let socket = open_reusable_udp_socket(0).unwrap();
+        // TEST-NET-3 (RFC 5737) — guaranteed not to be a local interface address.
+        let bogus = Ipv4Addr::new(203, 0, 113, 42);
+        let joined = join_multicast_on_all_interfaces(&socket, &[bogus]);
+        assert!(
+            joined.is_empty(),
+            "a join on a non-local interface must not be reported as joined: {joined:?}"
+        );
+    }
+
+    #[test]
+    fn join_multicast_reports_exactly_the_interfaces_it_joined() {
+        let socket = open_reusable_udp_socket(0).unwrap();
+        // Loopback is a real, always-present, multicast-capable interface, so this join
+        // should succeed — unlike the bogus-address case above.
+        let joined = join_multicast_on_all_interfaces(&socket, &[Ipv4Addr::LOCALHOST]);
+        assert_eq!(joined, vec![Ipv4Addr::LOCALHOST]);
+    }
+
+    #[test]
+    fn announce_on_interfaces_handles_empty_and_unspecified_without_panicking() {
+        let socket = open_reusable_udp_socket(0).unwrap();
+        let info = our_info_with_port("fp", true, 12345);
+        // Neither call should panic or return a value (both are fire-and-forget); this is a
+        // smoke test that the empty-list no-op path and the UNSPECIFIED
+        // skip-set_multicast_if_v4 path are both exercised safely.
+        announce_on_interfaces(&socket, &[], &info);
+        announce_on_interfaces(&socket, &[Ipv4Addr::UNSPECIFIED], &info);
+    }
+
+    // --- pre-existing coverage --------------------------------------------------------------
 
     #[test]
     fn fingerprint_is_non_empty_and_unique() {

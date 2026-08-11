@@ -229,17 +229,28 @@ pub async fn discover(timeout_ms: u64) -> Result<Vec<Device>, String> {
 /// Open a UDP socket for LocalSend discovery with `SO_REUSEADDR` and (on unix) `SO_REUSEPORT`
 /// set *before* binding, so we can bind `port` alongside another LocalSend-speaking process
 /// that already holds it — notably the official desktop app, which autostarts and holds
-/// `MULTICAST_PORT` for as long as the user is logged in (see `agent-notes` diagnosis for
-/// issue #39; without this, discovery silently lands on an ephemeral port and can never
-/// receive anything addressed to the well-known group port). Falls back to an ephemeral port
-/// if even a reuse-enabled bind fails, logging why. Returns the raw `socket2` socket (not yet
-/// handed to tokio) so the caller can still use `set_multicast_if_v4` per announce — an option
-/// tokio's `UdpSocket` doesn't expose.
+/// `MULTICAST_PORT` for as long as the user is logged in. Without this, discovery silently
+/// lands on an ephemeral port and can never receive anything addressed to the well-known group
+/// port. Falls back to an ephemeral port if even a reuse-enabled bind fails, logging why.
+/// Returns the raw `socket2` socket (not yet handed to tokio) so the caller can still use
+/// `set_multicast_if_v4` per announce — an option tokio's `UdpSocket` doesn't expose directly.
+///
+/// unix only: on Windows, `SO_REUSEADDR` is *not* the BSD "share the port" semantic — Winsock
+/// lets a later binder forcibly capture datagrams away from an earlier one (Microsoft's own
+/// guidance is to use `SO_EXCLUSIVEADDRUSE` for the sharing case instead, which this doesn't
+/// set). The entire motivation here — coexisting with a co-resident LocalSend desktop app on
+/// `:53317` — is a unix scenario we can build and test; setting `SO_REUSEADDR` on Windows would
+/// risk ChairPhoto silently stealing the port from a co-resident LocalSend desktop app rather
+/// than sharing it. We cannot build or test Windows in this environment, so Windows
+/// deliberately keeps its pre-existing behavior (fall back to an ephemeral port on contention)
+/// rather than risk that on a platform we can't verify.
 fn open_reusable_udp_socket(port: u16) -> std::io::Result<Socket> {
     let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(SockProtocol::UDP))?;
-    socket.set_reuse_address(true)?;
     #[cfg(unix)]
-    socket.set_reuse_port(true)?;
+    {
+        socket.set_reuse_address(true)?;
+        socket.set_reuse_port(true)?;
+    }
 
     let wanted = SockAddr::from(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port));
     if let Err(e) = socket.bind(&wanted) {
@@ -643,12 +654,17 @@ mod tests {
         }
     }
 
+    // unix only: SO_REUSEADDR/SO_REUSEPORT sharing is a unix-only behavior of
+    // `open_reusable_udp_socket` (see its doc comment) — on Windows, `SO_REUSEADDR` steals a
+    // port instead of sharing it, so we deliberately don't set it there, and this test's
+    // "second open lands on the same port" expectation would not hold.
+    #[cfg(unix)]
     #[test]
     fn open_reusable_udp_socket_shares_a_port_already_held_by_another_reusable_socket() {
         // First holder: bind an ephemeral port the same way a second LocalSend-speaking
         // process would already have bound it (SO_REUSEADDR/SO_REUSEPORT before bind) — this
-        // is what the real LocalSend desktop app does on the owner's machine (see the issue
-        // #39 diagnosis), simulated here without depending on that process actually running.
+        // is what the real LocalSend desktop app does on the owner's machine, simulated here
+        // without depending on that process actually running.
         let holder = open_reusable_udp_socket(0).expect("first bind must succeed");
         let held_port = holder
             .local_addr()

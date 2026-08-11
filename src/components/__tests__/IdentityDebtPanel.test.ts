@@ -1,9 +1,9 @@
 /**
- * Issue #50 review finding F9 — the identity-debt panel had no frontend tests at all.
- * `vitest.config.ts` runs in plain Node (no jsdom), so rendering `IdentityDebtPanel`
- * itself is out of scope here (that would need harness/config work this fix doesn't do).
- * `STATE_LABEL`/`STATE_CLASS` and the header/paging plural-singular logic are pure and
- * exported specifically so they're testable without a DOM.
+ * Frontend tests for the identity-debt panel (issue #50). `vitest.config.ts` runs in
+ * plain Node (no jsdom), so rendering `IdentityDebtPanel` itself is out of scope here
+ * (that would need harness/config work this fix doesn't do). `STATE_LABEL`/`STATE_CLASS`
+ * and the header/paging plural-singular logic are pure and exported specifically so
+ * they're testable without a DOM.
  */
 
 import { describe, it, expect } from "vitest";
@@ -96,19 +96,22 @@ describe("pagingLabel", () => {
     expect(pagingLabel(0, 500, null)).toBe("Showing 1–500");
   });
 
-  // Issue #50 review, defect 1: before the fix, `listPendingIdentity` returned one row
-  // per (copy, field) while `summarizePendingIdentity().total` counted copies, so a copy
-  // owing both `identifier` and `import_batch` made `rows.length` (shown) exceed `total`
-  // — this exact shape (4 rows shown, 3 total copies) rendered "Showing 1–4 of 3", and at
-  // the #20 harness scale "Showing 74501–75000 of 74488". The real fix is upstream: the
-  // backend now groups `listPendingIdentity`'s rows by copy
-  // (`list_pending_identity_page_windows_every_copy_exactly_once` in `identity.rs`), so
-  // `shown` can no longer exceed `total` in production. `pagingLabel` itself has no
-  // defense against a mismatched pair — it just formats what it's given — so this test
-  // pins down that fact deliberately: if the units ever regress to field-granularity,
-  // this is exactly the nonsensical label a screenshot/review would need to catch, not
-  // something this function would hide or clamp.
-  it("does not hide a shown>total mismatch — would render exactly the reported bug shape", () => {
-    expect(pagingLabel(0, 4, 3)).toBe("Showing 1–4 of 3");
+  // The backend keeps `shown` (rows.length, refetched on every page turn) and `total`
+  // (summarizePendingIdentity, fetched once when the panel mounts) in the same unit —
+  // copies — and pins that with `list_pending_identity_page_windows_every_copy_exactly_once`
+  // in `identity.rs`. But the two are still fetched independently: a concurrent scan or
+  // repair can grow or shrink the queue while the panel is open, and nothing re-fetches
+  // `total` until the panel closes and reopens — so `total` can be stale even though
+  // neither backend query is wrong. `pagingLabel` must not trust a stale `total` at face
+  // value: it must never render a range whose upper bound is larger than the total it
+  // claims, e.g. "Showing 1–4 of 3".
+  it("clamps a stale total so the label can never contradict itself", () => {
+    expect(pagingLabel(0, 4, 3)).toBe("Showing 1–4 of 4");
+    expect(pagingLabel(500, 4, 3)).toBe("Showing 501–504 of 504");
+  });
+
+  it("uses the real total once it catches up to (or exceeds) what's shown", () => {
+    expect(pagingLabel(0, 4, 10)).toBe("Showing 1–4 of 10");
+    expect(pagingLabel(0, 4, 4)).toBe("Showing 1–4 of 4");
   });
 });

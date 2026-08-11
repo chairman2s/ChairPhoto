@@ -43,8 +43,8 @@ function fieldLabel(f: PendingIdentityField): string {
 }
 
 /** Height of one owed-field line within a copy's row (State/Field/Tries/Last
- *  attempt/Detail are one stacked line per field a copy owes — defect 1: a row can now
- *  represent a copy owing 1 or 2 fields, not always exactly 1). */
+ *  attempt/Detail are one stacked line per field a copy owes — a row represents a copy
+ *  owing 1 or 2 fields, not always exactly 1). */
 const FIELD_LINE_HEIGHT = 22;
 /** Breathing room above/below a row's field-line stack. */
 const ROW_PADDING = 10;
@@ -54,15 +54,16 @@ const ROW_PADDING = 10;
 function rowHeight(p: PendingIdentity): number {
   return Math.max(1, p.fields.length) * FIELD_LINE_HEIGHT + ROW_PADDING;
 }
-/** IPC page size (review finding F1a) — bounds a single `list_pending_identity` payload
- *  regardless of how large the queue gets (74,488 rows on the 100k harness shape in #20). */
+/** IPC page size — bounds a single `list_pending_identity` payload regardless of how large
+ *  the queue gets (74,488 rows on the 100k harness shape in #20). */
 const PAGE_SIZE = 500;
 
 /**
  * Pure — the header line under "Identity debt", e.g. "3 copies owe their identity to a
  * sidecar — 1 conflict". `null` means the summary hasn't loaded yet. Exported so it's
- * testable without a DOM: `vitest.config.ts` runs in plain Node (review finding F9), but
- * this plural/singular + conflict logic is ordinary string math.
+ * testable without a DOM: `vitest.config.ts` runs in plain Node, so rendering this
+ * component isn't testable here, but this plural/singular + conflict logic is ordinary
+ * string math and doesn't need one.
  */
 export function summaryHeadline(summary: PendingIdentitySummary | null): string {
   if (!summary) return "Loading…";
@@ -76,15 +77,25 @@ export function summaryHeadline(summary: PendingIdentitySummary | null): string 
 }
 
 /**
- * Pure — "Showing N–M of T" for the current page (review finding F1a: the panel must not
- * pretend it fetched the whole queue). `total === null` means the summary hasn't
- * resolved yet, so the "of T" half is omitted rather than shown as 0.
+ * Pure — "Showing N–M of T" for the current page: the panel must not pretend it fetched
+ * the whole queue. `total === null` means the summary hasn't resolved yet, so the "of T"
+ * half is omitted rather than shown as 0.
+ *
+ * `total` comes from `summary`, fetched once when the panel mounts, while `shown` comes
+ * from the CURRENT page's rows, refetched on every page change (see
+ * `IdentityDebtPanel`'s effects below). A concurrent repair or scan can grow or shrink the
+ * queue while the panel stays open, leaving `total` stale for the rest of its life — this
+ * function has no way to refresh it, so it clamps instead: the displayed total is never
+ * rendered smaller than what's already shown, so the label can never read something
+ * self-contradictory like "Showing 1–4 of 3".
  */
 export function pagingLabel(offset: number, shown: number, total: number | null): string {
   if (shown === 0) return total === 0 ? "No pending copies" : "No rows on this page";
   const from = offset + 1;
   const to = offset + shown;
-  return total === null ? `Showing ${from}–${to}` : `Showing ${from}–${to} of ${total}`;
+  if (total === null) return `Showing ${from}–${to}`;
+  const displayedTotal = Math.max(total, to);
+  return `Showing ${from}–${to} of ${displayedTotal}`;
 }
 
 /**
@@ -95,10 +106,9 @@ export function pagingLabel(offset: number, shown: number, total: number | null)
  *
  * The header total (`summarizePendingIdentity`, one COUNT query) and the per-copy page
  * (`listPendingIdentity`, LIMIT/OFFSET-bound) are two independent IPC calls, not one
- * `Promise.all` — a slow/large page fetch must never delay the cheap header (review
- * finding F1b). The page itself is bounded to `PAGE_SIZE` rows regardless of queue size
- * (review finding F1a) — never the strategy of fetching everything and virtualizing only
- * the DOM.
+ * `Promise.all` — a slow/large page fetch must never delay the cheap header. The page
+ * itself is bounded to `PAGE_SIZE` rows regardless of queue size — never the strategy of
+ * fetching everything and virtualizing only the DOM.
  *
  * Deliberately does NOT resolve conflicts (that's #33 — Adopt/Overwrite/Dismiss) and
  * does NOT expose repair progress/cancellation (that's #34). Both hang their actions off
@@ -274,10 +284,10 @@ export function IdentityDebtPanel({ onClose }: { onClose: () => void }) {
                         >
                           {/* State/Field/Tries/Last attempt/Detail are per-FIELD — a copy
                               owing both `identifier` and `import_batch` stacks two lines
-                              here, one per owed field (defect 1: this used to be one row
-                              per (copy, field); now it's one row per copy). Path/Volume/
-                              Relative path are per-COPY, so they render once and stay
-                              vertically centered against however tall the stack is. */}
+                              here, one per owed field, because this row represents one
+                              copy, not one (copy, field) pair. Path/Volume/Relative path
+                              are per-COPY, so they render once and stay vertically
+                              centered against however tall the stack is. */}
                           <span className="identity-debt-fieldcol identity-debt-statecol">
                             {p.fields.map((f) => (
                               <span

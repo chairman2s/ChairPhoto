@@ -25,11 +25,32 @@ import {
   listModules,
   backendAvailable,
   setSelection,
+  setActiveVersion,
+  setEditingTagContext,
+  setFilterContext,
+  initHost,
   panelsForSlot,
+  activateToolbarAction,
   __channels,
+  __legacy,
 } from "../host";
 import type { ChairPhotoAPI, ChairPhotoModule, Photo } from "../registry";
 import { __events } from "../../__test_stubs__/tauri";
+
+// initHost() (used only by the M17 regression test far below) discovers external modules
+// via listExternalModules(), which the shared Tauri stub resolves to `null` (its `invoke`
+// stub always resolves `null`, command-agnostic) — `for (const m of manifests)` would throw
+// on that. Override just this one export so initHost() can run; every other export (and
+// every other test in this file, none of which call initHost()) keeps the real stub-backed
+// behaviour.
+vi.mock("../api", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../api")>();
+  return {
+    ...actual,
+    listExternalModules: () => Promise.resolve([]),
+    pluginFeatures: () => Promise.resolve([]),
+  };
+});
 
 // ── Helper ────────────────────────────────────────────────────────────────────
 
@@ -258,6 +279,26 @@ describe("enableModule()", () => {
     const info = listModules().find((m) => m.id === "h8e-enable-throws");
     // Module is rolled back to disabled (the host's error-isolation contract).
     expect(info?.enabled).toBe(false);
+  });
+
+  it("notifies lifecycle even when onLoad throws and the rollback returns early " +
+    "(review Finding 5 — a caller like ModulesPanel's checkbox needs a render to " +
+    "reconcile with the rolled-back disabled state)", () => {
+    register(
+      makeModule("h16-enable-throws-notifies", {
+        onLoad: () => {
+          throw new Error("onLoad exploded");
+        },
+      }),
+    );
+
+    let notified = 0;
+    const unsub = __channels.lifecycle.subscribe(() => notified++);
+
+    enableModule("h16-enable-throws-notifies", false);
+
+    expect(notified).toBeGreaterThan(0);
+    unsub();
   });
 
   it("is idempotent — calling enable twice invokes onLoad only once", () => {
@@ -600,5 +641,217 @@ describe("safe callback dispatch — onPhotoSelected", () => {
 
     unsub();
     disableModule("h16-select-throws-solo", false);
+  });
+});
+
+describe("safe callback dispatch — activateToolbarAction (Finding 7)", () => {
+  it("does not propagate a throw from a toolbar action's onActivate", () => {
+    register(
+      makeModule("h16-toolbar-throws", {
+        onLoad: (api) => {
+          api.registerAction({
+            id: "boom-action",
+            label: "Boom",
+            onActivate: () => {
+              throw new Error("onActivate exploded");
+            },
+          });
+        },
+      }),
+    );
+    enableModule("h16-toolbar-throws", false);
+
+    expect(() => activateToolbarAction("boom-action")).not.toThrow();
+
+    disableModule("h16-toolbar-throws", false);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Review follow-up (issue #16 review, Finding 3): only 2 of 12 notify() call sites were
+// pinned by a test. `useHost()`'s entire backward-compatibility mechanism — every channel
+// notify also bumping the legacy version — had zero coverage (mutation M4: deleting
+// `bumpLegacy()` from `notify()` left all 38 tests green). This section pins the legacy
+// bump itself, then every notify call site that previously could be deleted outright
+// without a test noticing (M8–M15, M17).
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("legacy bump — useHost() backward compatibility (Finding 3 / M4)", () => {
+  it("every channel notify also bumps the legacy version useHost() reads", () => {
+    // This is the mutation the review's M4 found unpinned: deleting `bumpLegacy();` from
+    // `createChannel().notify()` (host.ts) leaves this assertion — and only this kind of
+    // assertion — red. Every pre-#16 useHost() consumer relies on it.
+    const before = __legacy.getVersion();
+    setSelection([], 321);
+    expect(__legacy.getVersion()).toBe(before + 1);
+  });
+
+  it("bumps legacy on every channel, not just selection", () => {
+    const before = __legacy.getVersion();
+    setFilterContext({ tagId: null, albumId: null, batchId: null });
+    expect(__legacy.getVersion()).toBe(before + 1);
+  });
+});
+
+describe("notify() resilience — a throwing channel subscriber (Finding 4)", () => {
+  it("does not stop the legacy bump", () => {
+    const before = __legacy.getVersion();
+    const unsubThrow = __channels.selection.subscribe(() => {
+      throw new Error("boom");
+    });
+
+    expect(() => setSelection([], 654)).not.toThrow();
+    expect(__legacy.getVersion()).toBe(before + 1);
+
+    unsubThrow();
+  });
+
+  it("does not stop delivery to other subscribers on the same channel", () => {
+    const calls: number[] = [];
+    const unsubThrow = __channels.selection.subscribe(() => {
+      throw new Error("boom");
+    });
+    const unsubOk = __channels.selection.subscribe(() => calls.push(1));
+
+    expect(() => setSelection([], 655)).not.toThrow();
+    expect(calls).toEqual([1]);
+
+    unsubThrow();
+    unsubOk();
+  });
+
+  it("a throwing legacy listener does not stop other legacy listeners", () => {
+    const calls: number[] = [];
+    const unsubThrow = __legacy.subscribe(() => {
+      throw new Error("boom");
+    });
+    const unsubOk = __legacy.subscribe(() => calls.push(1));
+
+    expect(() => setSelection([], 656)).not.toThrow();
+    expect(calls).toEqual([1]);
+
+    unsubThrow();
+    unsubOk();
+  });
+});
+
+describe("notify call-site coverage — the remaining single-notify mutators (M8–M15)", () => {
+  it("setEditingTagContext() notifies only the editingTag channel (M8)", () => {
+    const { fired, unsubscribeAll } = watchAllChannels();
+    setEditingTagContext(null);
+    expect([...fired]).toEqual(["editingTag"]);
+    unsubscribeAll();
+  });
+
+  it("setFilterContext() notifies only the filterContext channel (M9)", () => {
+    const { fired, unsubscribeAll } = watchAllChannels();
+    setFilterContext({ tagId: 1, albumId: null, batchId: null });
+    expect([...fired]).toEqual(["filterContext"]);
+    unsubscribeAll();
+  });
+
+  it("a module's registerSettingsPanel() notifies only settingsPanels (M10)", () => {
+    let api: ChairPhotoAPI | undefined;
+    register(makeModule("h16-register-settings", { onLoad: (a) => { api = a; } }));
+    enableModule("h16-register-settings", false);
+    if (!api) throw new Error("onLoad did not run");
+
+    const { fired, unsubscribeAll } = watchAllChannels();
+    api.registerSettingsPanel(() => null);
+    expect([...fired]).toEqual(["settingsPanels"]);
+
+    unsubscribeAll();
+    disableModule("h16-register-settings", false);
+  });
+
+  it("setActiveVersion() notifies only the selection channel (M11)", () => {
+    const { fired, unsubscribeAll } = watchAllChannels();
+    setActiveVersion(999001); // distinct from any other test's value (no-op guard on equal)
+    expect([...fired]).toEqual(["selection"]);
+    unsubscribeAll();
+  });
+
+  it("a module's registerAction() notifies only contributions (M12)", () => {
+    let api: ChairPhotoAPI | undefined;
+    register(makeModule("h16-register-action", { onLoad: (a) => { api = a; } }));
+    enableModule("h16-register-action", false);
+    if (!api) throw new Error("onLoad did not run");
+
+    const { fired, unsubscribeAll } = watchAllChannels();
+    api.registerAction({ id: "a1", label: "Action" });
+    expect([...fired]).toEqual(["contributions"]);
+
+    unsubscribeAll();
+    disableModule("h16-register-action", false);
+  });
+
+  it("a module's registerMainView() notifies only contributions (M13)", () => {
+    let api: ChairPhotoAPI | undefined;
+    register(makeModule("h16-register-mainview", { onLoad: (a) => { api = a; } }));
+    enableModule("h16-register-mainview", false);
+    if (!api) throw new Error("onLoad did not run");
+
+    const { fired, unsubscribeAll } = watchAllChannels();
+    api.registerMainView({ id: "v1", label: "View", render: () => null });
+    expect([...fired]).toEqual(["contributions"]);
+
+    unsubscribeAll();
+    disableModule("h16-register-mainview", false);
+  });
+
+  it("a module's registerPublishTarget() notifies only contributions (M14)", () => {
+    let api: ChairPhotoAPI | undefined;
+    register(makeModule("h16-register-publishtarget", { onLoad: (a) => { api = a; } }));
+    enableModule("h16-register-publishtarget", false);
+    if (!api) throw new Error("onLoad did not run");
+
+    const { fired, unsubscribeAll } = watchAllChannels();
+    api.registerPublishTarget({ id: "t1", label: "Target", render: () => null });
+    expect([...fired]).toEqual(["contributions"]);
+
+    unsubscribeAll();
+    disableModule("h16-register-publishtarget", false);
+  });
+
+  it("a module's registerEditRenderer() notifies only contributions (M15)", () => {
+    let api: ChairPhotoAPI | undefined;
+    register(makeModule("h16-register-editrenderer", { onLoad: (a) => { api = a; } }));
+    enableModule("h16-register-editrenderer", false);
+    if (!api) throw new Error("onLoad did not run");
+
+    const { fired, unsubscribeAll } = watchAllChannels();
+    api.registerEditRenderer({ id: "h16-register-editrenderer", render: async () => "" });
+    expect([...fired]).toEqual(["contributions"]);
+
+    unsubscribeAll();
+    disableModule("h16-register-editrenderer", false);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// initHost()'s final lifecycle notify (M17) — placed last in the file on purpose.
+// initHost() sets module-scoped state (hostVersion, features) that other describe blocks
+// above assume is still unset ("hostVersion is '' at this point (initHost has not been
+// called)", see e.g. the unmetRequirement()/enableModule() tests). Vitest runs tests in
+// file order by default, so keeping this after everything else means those assumptions
+// hold for the whole rest of the suite.
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("initHost() — final lifecycle notify (M17)", () => {
+  it("notifies lifecycle even when no module ends up enabled from settings", async () => {
+    // Settings ("modules.enabled") resolve to null via the shared invoke stub -> csv "" ->
+    // the enableModule loop never runs -> the ONLY lifecycle notify initHost can produce
+    // is its unconditional final `lifecycleChannel.notify()`. Registered-but-never-enabled
+    // modules still need ModulesPanel to learn about them (see the comment at that call
+    // site in host.ts), which is what this notify is for.
+    register(makeModule("h16-inithost-registered-only"));
+
+    let notified = 0;
+    const unsub = __channels.lifecycle.subscribe(() => notified++);
+
+    await initHost([]);
+
+    expect(notified).toBeGreaterThan(0);
+    unsub();
   });
 });

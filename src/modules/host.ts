@@ -90,9 +90,13 @@ let filterContext: { tagId: number | null; albumId: number | null; batchId: numb
 // any host change (e.g. App).
 const legacyListeners = new Set<() => void>();
 let legacyVersion = 0;
+/** Bump the legacy "any change" version and run every legacy listener. Each listener runs
+ *  through `callSafely` (defined below the safe-dispatch section; hoisted, so the forward
+ *  reference is fine) so one throwing listener — e.g. a broken `useHost()` consumer — can't
+ *  stop the rest from being notified. */
 function bumpLegacy() {
   legacyVersion++;
-  legacyListeners.forEach((l) => l());
+  legacyListeners.forEach((l) => callSafely("[host] legacy listener threw:", l));
 }
 function subscribeLegacy(l: () => void) {
   legacyListeners.add(l);
@@ -113,10 +117,13 @@ function createChannel() {
     },
     getVersion: () => version,
     /** Bump this channel's own subscribers, and the legacy "any change" channel
-     *  `useHost()` reads, so a call site never has to remember to notify both. */
+     *  `useHost()` reads, so a call site never has to remember to notify both. Each
+     *  channel listener runs through `callSafely` so a throw can't make `bumpLegacy()`
+     *  unreachable (issue #16 Finding 4) — the legacy bump is the compatibility guarantee
+     *  every pre-#16 `useHost()` consumer still relies on. */
     notify() {
       version++;
-      listeners.forEach((l) => l());
+      listeners.forEach((l) => callSafely("[host] channel listener threw:", l));
       bumpLegacy();
     },
   };
@@ -213,6 +220,14 @@ export const __channels = {
   settingsPanels: settingsPanelsChannel,
   lifecycle: lifecycleChannel,
   editingTag: editingTagChannel,
+};
+
+/** Test-only access to the legacy "any change" bus `useHost()` reads, so its
+ *  backward-compatibility guarantee — every channel notify also bumps this — can be
+ *  asserted directly instead of taken on faith. */
+export const __legacy = {
+  subscribe: subscribeLegacy,
+  getVersion: () => legacyVersion,
 };
 
 // --- Safe callback dispatch ------------------------------------------------
@@ -646,6 +661,11 @@ export function enableModule(id: string, persist = true, seen = new Set<string>(
     reg.publishTargets = [];
     reg.renderer = null;
     toast(`Can't enable ${reg.module.name}: it failed to load`);
+    // Nothing was persisted (the module was never added to the enabled set), but a
+    // caller like ModulesPanel's checkbox needs a render to reconcile with the rolled-
+    // back `enabled: false` — without this, a controlled checkbox can be left visually
+    // checked after a failed enable until some unrelated host change forces a re-render.
+    notifyModuleSetChanged();
     return;
   }
   if (persist) persistEnabled();
@@ -819,7 +839,12 @@ export function activateToolbarAction(actionId: string) {
     if (!reg.enabled) continue;
     const action = reg.actions.find((a) => a.id === actionId);
     if (action) {
-      action.onActivate?.(apiFor(reg.module));
+      // Outside the issue's original list (onLoad/onUnload/onPhotoSelected) but the same
+      // category of untrusted, host-invoked callback — a throw here would otherwise
+      // propagate straight into the React event handler that triggered the click.
+      callSafely(`[modules] "${reg.module.id}" toolbar action "${actionId}" onActivate() threw:`, () =>
+        action.onActivate?.(apiFor(reg.module)),
+      );
       return;
     }
   }

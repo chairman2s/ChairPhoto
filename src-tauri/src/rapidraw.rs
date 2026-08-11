@@ -413,9 +413,7 @@ mod tests {
 
     #[test]
     fn unique_output_path_bumps_on_collision() {
-        let dir = std::env::temp_dir().join("chairphoto-rapidraw-unique");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_support::TestTmpDir::new("rapidraw-unique");
         let source = dir.join("DSC1.ARW");
         std::fs::write(&source, b"raw").unwrap();
 
@@ -429,9 +427,7 @@ mod tests {
 
     #[test]
     fn wait_for_stable_output_returns_when_size_settles() {
-        let dir = std::env::temp_dir().join("chairphoto-rapidraw-stable");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_support::TestTmpDir::new("rapidraw-stable");
         let out = dir.join("out.tiff");
 
         // Writer thread: create the file, grow it once, then leave it stable.
@@ -477,9 +473,7 @@ mod tests {
 
     #[test]
     fn wait_for_stable_output_bails_on_cancel() {
-        let dir = std::env::temp_dir().join("chairphoto-rapidraw-cancel");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_support::TestTmpDir::new("rapidraw-cancel");
         let out = dir.join("never.tiff"); // never created
 
         let cancel = Arc::new(AtomicBool::new(false));

@@ -402,16 +402,13 @@ mod tests {
         BundleBatch, BundleManifest, BundlePhoto, BundleTag, BundleTagTerm, BundleVersion,
     };
     use crate::catalog::{IptcFields, PickState};
-    use std::path::PathBuf;
 
-    fn temp_catalog(tag: &str) -> (Catalog, PathBuf) {
-        let dir = std::env::temp_dir().join(format!("chairphoto-merge-test-{tag}"));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+    fn temp_catalog(tag: &str) -> (Catalog, crate::test_support::TestSubPath) {
+        let dir = crate::test_support::TestTmpDir::new(&format!("merge-{tag}"));
         let root = dir.join("photos");
         std::fs::create_dir_all(&root).unwrap();
         let catalog = Catalog::open(&dir.join("test.chairphoto"), &root).unwrap();
-        (catalog, root)
+        (catalog, dir.into_subpath("photos"))
     }
 
     /// A manifest with one tagged, rated, edited photo + a two-level taxonomy.

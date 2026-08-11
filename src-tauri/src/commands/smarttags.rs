@@ -710,10 +710,8 @@ mod smarttags_training_lock_tests {
     /// A catalog with `photos` photos, half of them carrying one tag and **all** of them
     /// carrying a CLIP embedding — so the trainer sees exactly one stale tag with both
     /// positives and negatives to work on.
-    fn trainable_catalog(tag: &str, photos: usize) -> (Catalog, PathBuf) {
-        let dir = std::env::temp_dir().join(format!("chairphoto-smarttags-train-{tag}"));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+    fn trainable_catalog(tag: &str, photos: usize) -> (Catalog, crate::test_support::TestSubPath) {
+        let dir = crate::test_support::TestTmpDir::new(&format!("smarttags-train-{tag}"));
         let root = dir.join("photos");
         std::fs::create_dir_all(&root).unwrap();
         let db = dir.join("catalog.chairphoto");
@@ -752,7 +750,7 @@ mod smarttags_training_lock_tests {
                 catalog.assign_tag(*id, tag_id).unwrap();
             }
         }
-        (catalog, db)
+        (catalog, dir.into_subpath("catalog.chairphoto"))
     }
 
     /// An `AppState` holding `catalog` as the open catalog.
@@ -767,10 +765,8 @@ mod smarttags_training_lock_tests {
 
     /// Two stale tags, 12 embedded photos each, disjoint. `scan_stale_tags` orders by
     /// `full_path`, so A is always trained before B.
-    fn two_tag_trainable_catalog(tag: &str) -> (Catalog, PathBuf) {
-        let dir = std::env::temp_dir().join(format!("chairphoto-smarttags-train2-{tag}"));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+    fn two_tag_trainable_catalog(tag: &str) -> (Catalog, crate::test_support::TestSubPath) {
+        let dir = crate::test_support::TestTmpDir::new(&format!("smarttags-train2-{tag}"));
         let root = dir.join("photos");
         std::fs::create_dir_all(&root).unwrap();
         let db = dir.join("catalog.chairphoto");
@@ -791,7 +787,7 @@ mod smarttags_training_lock_tests {
             store::upsert_embedding(catalog.conn(), id, &store::embedding_to_blob(&v)).unwrap();
             catalog.assign_tag(id, if i < 12 { a } else { b }).unwrap();
         }
-        (catalog, db)
+        (catalog, dir.into_subpath("catalog.chairphoto"))
     }
 
     /// Photos currently carrying `tag_path`.
@@ -946,10 +942,11 @@ mod smarttags_ownership_tests {
     use std::time::{Duration, Instant};
 
     /// A fresh catalog in its own temp dir with `photos` files imported.
-    fn temp_catalog(tag: &str, photos: usize) -> (Catalog, PathBuf, PathBuf) {
-        let dir = std::env::temp_dir().join(format!("chairphoto-smarttags-own-{tag}"));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+    fn temp_catalog(
+        tag: &str,
+        photos: usize,
+    ) -> (Catalog, crate::test_support::TestSubPath, PathBuf) {
+        let dir = crate::test_support::TestTmpDir::new(&format!("smarttags-own-{tag}"));
         let root = dir.join("photos");
         std::fs::create_dir_all(&root).unwrap();
         let db = dir.join("catalog.chairphoto");
@@ -959,7 +956,7 @@ mod smarttags_ownership_tests {
             std::fs::write(&p, b"jpeg").unwrap();
             catalog.upsert_photo(&p, None, 1, 4).unwrap();
         }
-        (catalog, db, root)
+        (catalog, dir.into_subpath("catalog.chairphoto"), root)
     }
 
     /// An `AppState` holding `catalog` as the open catalog.
@@ -1034,7 +1031,7 @@ mod smarttags_ownership_tests {
 
         // Start a job exactly the way `smarttags_index_photos` does.
         let (db_path, root, abort, job) = begin_smarttags_job(&state).unwrap();
-        assert_eq!(db_path, db_a);
+        assert_eq!(db_path, db_a.to_path_buf());
         assert_eq!(root, root_a);
         assert_eq!(
             state.smarttags_job.lock().unwrap().map(|s| s.job),
@@ -1116,7 +1113,7 @@ mod smarttags_ownership_tests {
         let state = state_with(cat_a);
 
         let (first_db, _root, first_abort, first_job) = begin_smarttags_job(&state).unwrap();
-        assert_eq!(first_db, db_a);
+        assert_eq!(first_db, db_a.to_path_buf());
 
         // Phase one: the running job is tripped and the outgoing catalog is detached.
         detach_catalog_and_trip_jobs(&state).unwrap();
@@ -1163,7 +1160,7 @@ mod smarttags_ownership_tests {
         // A start after the switch snapshots the NEW catalog and becomes the reachable
         // generation.
         let (db, root, abort2, job2) = begin_smarttags_job(&state).unwrap();
-        assert_eq!(db, db_b, "the new job must index the catalog switched to");
+        assert_eq!(db, db_b.to_path_buf(), "the new job must index the catalog switched to");
         assert_eq!(root, root_b);
         assert_ne!(job2, first_job, "each start gets its own job id");
         assert!(!abort2.load(Ordering::Relaxed));
@@ -1219,7 +1216,7 @@ mod smarttags_ownership_tests {
             // normally — the test observes a stalled transition, it does not break one.
             drop(abort_held);
             let (db, _root, abort, job) = start.join().unwrap().unwrap();
-            assert_eq!(db, db_a, "the parked start indexes the catalog it snapshotted");
+            assert_eq!(db, db_a.to_path_buf(), "the parked start indexes the catalog it snapshotted");
             let installed = state.smarttags_abort.lock().unwrap().clone();
             assert!(
                 Arc::ptr_eq(&abort, &installed),

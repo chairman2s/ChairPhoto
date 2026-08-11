@@ -1026,9 +1026,7 @@ mod tests {
 
     #[test]
     fn creates_sidecar_with_iptc() {
-        let dir = std::env::temp_dir().join("chairphoto-xmp-create");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_support::TestTmpDir::new("xmp-create");
         let photo = dir.join("DSC1.ARW");
         std::fs::write(&photo, b"raw").unwrap();
 
@@ -1051,9 +1049,7 @@ mod tests {
 
     #[test]
     fn merge_preserves_foreign_elements() {
-        let dir = std::env::temp_dir().join("chairphoto-xmp-merge");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_support::TestTmpDir::new("xmp-merge");
         let photo = dir.join("DSC2.ARW");
         std::fs::write(&photo, b"raw").unwrap();
 
@@ -1085,9 +1081,7 @@ mod tests {
 
     #[test]
     fn identifier_round_trips_and_preserves_foreign() {
-        let dir = std::env::temp_dir().join("chairphoto-xmp-uuid");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_support::TestTmpDir::new("xmp-uuid");
         let photo = dir.join("DSC9.ARW");
         std::fs::write(&photo, b"raw").unwrap();
 
@@ -1109,9 +1103,7 @@ mod tests {
 
     #[test]
     fn rewrites_not_duplicates_on_second_write() {
-        let dir = std::env::temp_dir().join("chairphoto-xmp-rewrite");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_support::TestTmpDir::new("xmp-rewrite");
         let photo = dir.join("DSC3.ARW");
         std::fs::write(&photo, b"raw").unwrap();
 
@@ -1126,9 +1118,7 @@ mod tests {
 
     #[test]
     fn import_batch_round_trips_and_preserves_foreign() {
-        let dir = std::env::temp_dir().join("chairphoto-xmp-batch");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_support::TestTmpDir::new("xmp-batch");
         let photo = dir.join("DSC10.ARW");
         std::fs::write(&photo, b"raw").unwrap();
 
@@ -1160,9 +1150,7 @@ mod tests {
 
     #[test]
     fn import_batch_preserves_foreign_elements() {
-        let dir = std::env::temp_dir().join("chairphoto-xmp-batch-foreign");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_support::TestTmpDir::new("xmp-batch-foreign");
         let photo = dir.join("DSC11.ARW");
         std::fs::write(&photo, b"raw").unwrap();
 
@@ -1189,18 +1177,16 @@ mod tests {
 
     // ── MWG face regions (H13f) ────────────────────────────────────────────────
 
-    fn region_dir(name: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(name);
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    fn region_dir(tag: &str) -> crate::test_support::TestTmpDir {
+        crate::test_support::TestTmpDir::new(tag)
     }
 
     /// Write regions, read them back: names + top-left bboxes survive the center↔corner
     /// conversion round-trip, and AppliedToDimensions is written with the oriented pixel size.
     #[test]
     fn face_regions_round_trip() {
-        let photo = region_dir("chairphoto-xmp-regions-rt").join("DSC20.ARW");
+        let dir = region_dir("xmp-regions-rt");
+        let photo = dir.join("DSC20.ARW");
         std::fs::write(&photo, b"raw").unwrap();
 
         let regions = vec![
@@ -1234,7 +1220,8 @@ mod tests {
     /// The center↔top-left conversion is exact: a region's stArea:x/y equal the bbox center.
     #[test]
     fn face_region_center_conversion() {
-        let photo = region_dir("chairphoto-xmp-regions-center").join("DSC21.ARW");
+        let dir = region_dir("xmp-regions-center");
+        let photo = dir.join("DSC21.ARW");
         std::fs::write(&photo, b"raw").unwrap();
 
         // Top-left (0.2, 0.3), size (0.4, 0.2) → center (0.4, 0.4).
@@ -1259,7 +1246,8 @@ mod tests {
     /// region and darktable data are untouched.
     #[test]
     fn face_regions_preserve_foreign_content() {
-        let photo = region_dir("chairphoto-xmp-regions-foreign").join("DSC22.ARW");
+        let dir = region_dir("xmp-regions-foreign");
+        let photo = dir.join("DSC22.ARW");
         std::fs::write(&photo, b"raw").unwrap();
 
         // Existing sidecar: darktable develop history + a digiKam-style foreign face region.
@@ -1327,7 +1315,8 @@ mod tests {
     /// replaces Alice (no duplicate) and still preserves the foreign region.
     #[test]
     fn face_regions_rewrite_updates_only_ours() {
-        let photo = region_dir("chairphoto-xmp-regions-rewrite").join("DSC23.ARW");
+        let dir = region_dir("xmp-regions-rewrite");
+        let photo = dir.join("DSC23.ARW");
         std::fs::write(&photo, b"raw").unwrap();
 
         // First write: a foreign region (simulated by pre-writing) + our Alice.
@@ -1406,7 +1395,8 @@ mod tests {
     /// Reading regions from a sidecar with no Regions property (or no sidecar) yields empty.
     #[test]
     fn read_face_regions_absent_is_empty() {
-        let photo = region_dir("chairphoto-xmp-regions-absent").join("DSC24.ARW");
+        let dir = region_dir("xmp-regions-absent");
+        let photo = dir.join("DSC24.ARW");
         std::fs::write(&photo, b"raw").unwrap();
         // No sidecar.
         assert!(read_face_regions(&photo).is_empty());

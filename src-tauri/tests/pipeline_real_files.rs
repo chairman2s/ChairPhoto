@@ -10,6 +10,8 @@ use chairphoto_lib::scanner::scan_folder;
 use chairphoto_lib::thumbnails::{preview_bytes, thumbnail_bytes};
 use std::path::{Path, PathBuf};
 
+mod common;
+
 /// Scanning real files should populate both metadata tiers: promoted columns
 /// (camera model, etc.) and the generic key-value entries. Skips if absent.
 #[test]
@@ -20,9 +22,7 @@ fn scan_populates_metadata() {
         eprintln!("skipping: {} not present", sample.display());
         return;
     }
-    let tmp = std::env::temp_dir().join("chairphoto-metadata-test");
-    let _ = std::fs::remove_dir_all(&tmp);
-    std::fs::create_dir_all(&tmp).unwrap();
+    let tmp = common::TestTmpDir::new("metadata-test");
     let catalog = Catalog::open(&tmp.join("t.chairphoto"), &root).unwrap();
     scan_folder(&catalog, &sample, &chairphoto_lib::scanner::never_abort(), &|_| {}).unwrap();
 
@@ -65,9 +65,7 @@ fn migrates_real_v1_catalog_and_backfills_locations() {
         eprintln!("skipping: no real catalog at {}", real.display());
         return;
     }
-    let tmp = std::env::temp_dir().join("chairphoto-migrate-test");
-    let _ = std::fs::remove_dir_all(&tmp);
-    std::fs::create_dir_all(&tmp).unwrap();
+    let tmp = common::TestTmpDir::new("migrate-test");
     let copy = tmp.join("copy.chairphoto");
     std::fs::copy(&real, &copy).unwrap();
 
@@ -102,9 +100,7 @@ fn scans_real_folder_and_extracts_raw_thumbnail() {
         return;
     }
 
-    let tmp = std::env::temp_dir().join("chairphoto-pipeline-test");
-    let _ = std::fs::remove_dir_all(&tmp);
-    std::fs::create_dir_all(&tmp).unwrap();
+    let tmp = common::TestTmpDir::new("pipeline-test");
     let catalog = Catalog::open(&tmp.join("t.chairphoto"), &root).unwrap();
 
     let result = scan_folder(&catalog, &sample, &chairphoto_lib::scanner::never_abort(), &|_| {}).unwrap();

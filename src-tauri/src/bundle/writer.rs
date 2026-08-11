@@ -480,9 +480,10 @@ mod tests {
     use std::io::Read;
     use zip::ZipArchive;
 
-    /// Return a temp file path that will be cleaned up on drop.
-    fn tmp_bundle(name: &str) -> std::path::PathBuf {
-        std::env::temp_dir().join(format!("chairphoto-bundle-test-{name}.chairphoto"))
+    /// Return a temp bundle-file path that will be cleaned up on drop.
+    fn tmp_bundle(name: &str) -> crate::test_support::TestSubPath {
+        crate::test_support::TestTmpDir::new(&format!("bundle-{name}"))
+            .into_subpath("test.chairphoto")
     }
 
     /// Build a minimal manifest + empty originals map and write it to a zip; verify
@@ -504,7 +505,6 @@ mod tests {
         };
 
         let dest = tmp_bundle("v1");
-        let _guard = defer_remove(&dest);
         write_bundle(&bundle, &dest, |_, _| {}).expect("write_bundle");
 
         // Verify the zip is readable and contains manifest.json
@@ -539,7 +539,6 @@ mod tests {
         };
 
         let dest = tmp_bundle("v2");
-        let _guard = defer_remove(&dest);
         let result = write_bundle(&bundle, &dest, |_, _| {}).unwrap();
 
         assert_eq!(result.exported, 0);
@@ -581,7 +580,6 @@ mod tests {
         let bundle = GatheredBundle { manifest, originals };
 
         let dest = tmp_bundle("v3");
-        let _guard = defer_remove(&dest);
         let result = write_bundle(&bundle, &dest, |_, _| {}).unwrap();
 
         assert_eq!(result.skipped_offline, 1, "offline should be skipped");
@@ -634,7 +632,6 @@ mod tests {
         };
 
         let dest = tmp_bundle("v4");
-        let _guard = defer_remove(&dest);
 
         let calls = std::sync::Mutex::new(Vec::<(usize, usize)>::new());
         write_bundle(&bundle, &dest, |done, total| {
@@ -696,7 +693,6 @@ mod tests {
         let bundle = GatheredBundle { manifest: manifest.clone(), originals };
 
         let dest = tmp_bundle("v5");
-        let _guard = defer_remove(&dest);
         write_bundle(&bundle, &dest, |_, _| {}).unwrap();
 
         let file = std::fs::File::open(&dest).unwrap();
@@ -713,9 +709,8 @@ mod tests {
     #[test]
     fn real_file_is_copied_to_originals() {
         // Create a tiny fake "original" file.
-        let src = std::env::temp_dir().join("chairphoto-test-orig.jpg");
+        let src = crate::test_support::TestTmpDir::new("orig").into_subpath("orig.jpg");
         std::fs::write(&src, b"FAKE JPEG BYTES").unwrap();
-        let _guard_src = defer_remove(&src);
 
         let mut manifest = BundleManifest::new(
             crate::bundle::BundleBatch {
@@ -739,12 +734,11 @@ mod tests {
         });
 
         let mut originals = HashMap::new();
-        originals.insert("p-real".to_string(), Some(src.clone()));
+        originals.insert("p-real".to_string(), Some(src.to_path_buf()));
 
         let bundle = GatheredBundle { manifest, originals };
 
         let dest = tmp_bundle("v6");
-        let _guard = defer_remove(&dest);
         let result = write_bundle(&bundle, &dest, |_, _| {}).unwrap();
 
         // The preview will fail (not a real JPEG), but the original should copy.
@@ -761,16 +755,5 @@ mod tests {
         let mut bytes = Vec::new();
         entry.read_to_end(&mut bytes).unwrap();
         assert_eq!(bytes, b"FAKE JPEG BYTES");
-    }
-
-    // Helper: remove a file when this value is dropped (best-effort cleanup in tests).
-    struct DeferRemove(std::path::PathBuf);
-    impl Drop for DeferRemove {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_file(&self.0);
-        }
-    }
-    fn defer_remove(p: &std::path::Path) -> DeferRemove {
-        DeferRemove(p.to_path_buf())
     }
 }

@@ -559,24 +559,25 @@ mod tests {
     use crate::catalog::Catalog;
     use std::collections::HashMap;
 
-    fn temp_dir(tag: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("chairphoto-import-test-{tag}"));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).unwrap();
-        d
+    fn temp_dir(tag: &str) -> crate::test_support::TestTmpDir {
+        crate::test_support::TestTmpDir::new(&format!("import-{tag}"))
     }
 
-    fn temp_catalog(tag: &str) -> (Catalog, PathBuf) {
+    fn temp_catalog(tag: &str) -> (Catalog, crate::test_support::TestSubPath) {
         let dir = temp_dir(tag);
         let root = dir.join("photos");
         std::fs::create_dir_all(&root).unwrap();
         let catalog = Catalog::open(&dir.join("test.chairphoto"), &root).unwrap();
-        (catalog, root)
+        (catalog, dir.into_subpath("photos"))
     }
 
     /// Build a minimal bundle zip with one "original" file (fake bytes) and write it
     /// to a temp path.
-    fn make_test_bundle(tag: &str, photo_uuid: &str, relative_path: &str) -> PathBuf {
+    fn make_test_bundle(
+        tag: &str,
+        photo_uuid: &str,
+        relative_path: &str,
+    ) -> crate::test_support::TestSubPath {
         use crate::bundle::BundlePhoto;
         use crate::catalog::{IptcFields, PickState};
 
@@ -615,7 +616,7 @@ mod tests {
         let bundle = GatheredBundle { manifest, originals };
         let dest = dir.join("test.chairphoto");
         write_bundle(&bundle, &dest, |_, _| {}).expect("write_bundle");
-        dest
+        dir.into_subpath("test.chairphoto")
     }
 
     #[test]
@@ -703,7 +704,7 @@ mod tests {
         let (manifest, mut archive) = open_bundle(&bundle_path).expect("open_bundle");
 
         let (catalog, root) = temp_catalog("index");
-        let dest_base = root.clone();
+        let dest_base = root.to_path_buf();
 
         let (extracted, partial) =
             extract_originals(&manifest, &mut archive, &dest_base, |_, _| {})

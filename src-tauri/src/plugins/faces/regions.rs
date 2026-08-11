@@ -374,9 +374,7 @@ mod tests {
         let f = store::insert_face(&conn, 1, "[0.1,0.1,0.2,0.2]", "[]", 0.9, None, "detect", 0).unwrap();
 
         // Write a foreign sidecar fixture next to a temp "photo" file.
-        let dir = std::env::temp_dir().join("chairphoto-faces-import-fixture");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_support::TestTmpDir::new("faces-import-fixture");
         let photo_path = dir.join("DSC30.ARW");
         std::fs::write(&photo_path, b"raw").unwrap();
         let sidecar = crate::xmp::sidecar_path(&photo_path);

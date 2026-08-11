@@ -311,11 +311,8 @@ mod external_module_tests {
     use super::test_env_helpers::EnvGuard;
     use std::path::Path;
 
-    fn temp_xdg(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("chairphoto-test-extmod-{tag}"));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    fn temp_xdg(tag: &str) -> crate::test_support::TestTmpDir {
+        crate::test_support::TestTmpDir::new(&format!("extmod-{tag}"))
     }
 
     /// Write a manifest JSON file into `<xdg>/chairphoto/modules/<id>/chairphoto-module.json`.

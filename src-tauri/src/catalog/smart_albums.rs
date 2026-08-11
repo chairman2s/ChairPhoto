@@ -504,7 +504,6 @@ fn now() -> i64 {
 mod tests {
     use super::*;
     use crate::catalog::Catalog;
-    use std::path::PathBuf;
 
     /// Translate, asserting success, and return (wheres, bind count).
     fn tr(rule: &str) -> (Vec<String>, usize) {
@@ -679,14 +678,12 @@ mod tests {
         ));
     }
 
-    fn temp_catalog(tag: &str) -> (Catalog, PathBuf) {
-        let dir = std::env::temp_dir().join(format!("chairphoto-sa-test-{tag}"));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+    fn temp_catalog(tag: &str) -> (Catalog, crate::test_support::TestSubPath) {
+        let dir = crate::test_support::TestTmpDir::new(&format!("sa-{tag}"));
         let root = dir.join("photos");
         std::fs::create_dir_all(&root).unwrap();
         let catalog = Catalog::open(&dir.join("test.chairphoto"), &root).unwrap();
-        (catalog, root)
+        (catalog, dir.into_subpath("photos"))
     }
 
     #[test]

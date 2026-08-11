@@ -157,13 +157,9 @@ pub fn pick_existing(candidates: &[PathCandidate], health: &VolumeHealth) -> Opt
 mod tests {
     use super::*;
 
-    /// A unique temp dir for one test (mirrors the integration tests' approach; avoids a
-    /// `tempfile` dev-dependency).
-    fn temp_dir(tag: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("chairphoto-vh-{tag}"));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    /// A unique temp dir for one test, removed on drop. See `crate::test_support`.
+    fn temp_dir(tag: &str) -> crate::test_support::TestTmpDir {
+        crate::test_support::TestTmpDir::new(&format!("vh-{tag}"))
     }
 
     #[test]

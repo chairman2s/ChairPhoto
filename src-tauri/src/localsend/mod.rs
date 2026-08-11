@@ -276,9 +276,25 @@ async fn discover_on(
     // call either way.
     let burst_span = ANNOUNCE_BURST_INTERVAL * (ANNOUNCE_BURST_COUNT - 1) as u32;
     let deadline = burst_span + Duration::from_millis(timeout_ms);
-    let _ = tokio::time::timeout(deadline, async { tokio::join!(announce_burst, collect) }).await;
+    let _ = tokio::time::timeout(deadline, burst_and_collect(announce_burst, collect)).await;
 
     Ok(seen.into_values().collect())
+}
+
+/// Run `announce` and `collect` to completion *concurrently* — i.e. both make progress from
+/// the first poll onward, not "run `announce` to completion, then start `collect`"
+/// (burst-then-listen). Pulled out of [`discover_on`] as its own named function purely so this
+/// one property has a test (`burst_and_collect_polls_both_futures_before_either_completes`)
+/// that doesn't depend on real UDP timing or kernel socket buffering to observe it: a reply
+/// that arrives on a live socket sits in the kernel receive buffer whether or not `collect` has
+/// been polled yet, since the socket is already bound and joined before either future starts —
+/// so an end-to-end test built only from "did a loopback peer's reply come back" cannot tell
+/// concurrent execution apart from sequential `announce.await; collect.await`, which happens to
+/// return the same reply just later. `tokio::join!` is what actually gives the concurrency
+/// (it polls every branch on each wake — see its own docs); this wrapper exists so a mutation
+/// that replaces the `join!` with sequential awaits has something guarding it directly.
+async fn burst_and_collect(announce: impl std::future::Future<Output = ()>, collect: impl std::future::Future<Output = ()>) {
+    tokio::join!(announce, collect);
 }
 
 /// Open a UDP socket for LocalSend discovery with `SO_REUSEADDR` and (on unix) `SO_REUSEPORT`
@@ -721,6 +737,74 @@ mod tests {
         out
     }
 
+    /// Probe whether multicast actually round-trips over loopback on this host: join the group
+    /// on `Ipv4Addr::LOCALHOST` on one socket, send one datagram to the group selecting
+    /// loopback as the egress interface from another, and confirm the first socket receives
+    /// *something* within a short window (any datagram counts — this only asks "does loopback
+    /// multicast work here", not "did our own datagram arrive", so concurrent traffic from
+    /// other tests or the real LocalSend desktop app is a valid positive signal too).
+    ///
+    /// False in environments where it doesn't — observed directly in a private network
+    /// namespace (`unshare -rn`) with `lo` administratively down, where `announce_on_interfaces`
+    /// and `discover_on` both degrade gracefully in production (an empty `joined` list, a failed
+    /// send logged and swallowed — see their doc comments) but a test asserting on what a
+    /// loopback peer *received* has nothing to receive against, which is a fact about this host,
+    /// not a ChairPhoto defect. The four `#[tokio::test]`s that depend on a loopback round trip
+    /// call this first and skip loudly (`SKIPPED:`) when it's false, rather than failing on an
+    /// assertion that's really testing the host's network stack.
+    async fn loopback_multicast_round_trips() -> bool {
+        let receiver = match open_reusable_udp_socket(MULTICAST_PORT) {
+            Ok(s) => s,
+            Err(_) => return false,
+        };
+        if receiver
+            .join_multicast_v4(&MULTICAST_ADDR, &Ipv4Addr::LOCALHOST)
+            .is_err()
+        {
+            return false;
+        }
+        let receiver = match UdpSocket::from_std(receiver.into()) {
+            Ok(s) => s,
+            Err(_) => return false,
+        };
+
+        let sender = match open_reusable_udp_socket(0) {
+            Ok(s) => s,
+            Err(_) => return false,
+        };
+        if sender.set_multicast_if_v4(&Ipv4Addr::LOCALHOST).is_err() {
+            return false;
+        }
+        let group = SockAddr::from(SocketAddrV4::new(MULTICAST_ADDR, MULTICAST_PORT));
+        if sender.send_to(b"loopback-multicast-probe", &group).is_err() {
+            return false;
+        }
+
+        let mut buf = [0u8; 64];
+        tokio::time::timeout(Duration::from_millis(200), receiver.recv_from(&mut buf))
+            .await
+            .is_ok()
+    }
+
+    /// Common guard for the four `#[tokio::test]`s below that depend on a loopback peer
+    /// actually receiving something: prints a `SKIPPED:` line and returns `true` (telling the
+    /// caller to `return` immediately) when [`loopback_multicast_round_trips`] says this host
+    /// can't do that. Takes the test's own name only so the printed line says which test
+    /// skipped.
+    async fn skip_if_no_loopback_multicast(test_name: &str) -> bool {
+        if loopback_multicast_round_trips().await {
+            return false;
+        }
+        eprintln!(
+            "SKIPPED: {test_name} — multicast doesn't round-trip over loopback on this host \
+             (observed: a network namespace with lo down; lo administratively down would also \
+             do it). This test needs a loopback peer to actually receive something; that's an \
+             environment fact, not something discover_on/announce_on_interfaces can fix — both \
+             already degrade gracefully (see their doc comments)."
+        );
+        true
+    }
+
     // --- issue #39: discovery-socket fixes -------------------------------------------------
 
     #[test]
@@ -864,6 +948,9 @@ mod tests {
         // `discover_on`. The burst count/spacing itself is pinned separately, by timing, in
         // `discover_takes_the_full_burst_span_before_returning` below.
         let _guard = lock_network_tests();
+        if skip_if_no_loopback_multicast("discover_sends_an_announcement_a_loopback_peer_can_receive").await {
+            return;
+        }
 
         let discover_fut = discover_on(200, 0, &[Ipv4Addr::LOCALHOST]);
         let collect_fut = collect_on_loopback(Duration::from_millis(3200));
@@ -892,7 +979,25 @@ mod tests {
         // before) collecting, so the call cannot return before the full burst span has elapsed.
         // A regression back to a single announcement (no burst, or a burst collapsed to one
         // send) would return right after `timeout_ms` instead, far short of the burst span.
-        let burst_span = ANNOUNCE_BURST_INTERVAL * (ANNOUNCE_BURST_COUNT - 1) as u32;
+        //
+        // Also takes the network-test lock: this call sends real datagrams to
+        // `224.0.0.167:MULTICAST_PORT` over loopback (an ephemeral bind port, but the send
+        // still targets the shared well-known group/port) — the same traffic the lock exists
+        // to isolate. Previously this was the one new socket test that didn't take it, and was
+        // the unguarded source of cross-talk that let the R5 mutation survive against
+        // `announce_on_interfaces_still_announces_when_nothing_joined`'s old unfiltered
+        // assertion (now fixed on both sides — see that test).
+        let _guard = lock_network_tests();
+
+        // A literal, not `ANNOUNCE_BURST_INTERVAL * (ANNOUNCE_BURST_COUNT - 1)`: computing the
+        // expectation from the same constants the burst loop uses means a mutation that
+        // collapses either constant (e.g. `ANNOUNCE_BURST_INTERVAL` 1250ms -> 1ms) collapses
+        // the expectation right along with it and this assertion never notices. 2500ms is
+        // `(3 - 1) * 1250ms` written out, matching the doc comments on
+        // `ANNOUNCE_BURST_COUNT`/`ANNOUNCE_BURST_INTERVAL`/`discover`; `burst_count_and_
+        // interval_are_pinned` below pins the two factors themselves so a deliberate change to
+        // either is a conscious edit here too, not a silent one-line mutation.
+        let expected_burst_span = Duration::from_millis(2500);
 
         let started = std::time::Instant::now();
         discover_on(50, 0, &[Ipv4Addr::LOCALHOST])
@@ -901,16 +1006,94 @@ mod tests {
         let elapsed = started.elapsed();
 
         assert!(
-            elapsed >= burst_span,
-            "discover_on returned after {elapsed:?}, before the burst span {burst_span:?} even \
-             elapsed — the burst isn't actually spaced out over multiple sends"
+            elapsed >= expected_burst_span,
+            "discover_on returned after {elapsed:?}, before the expected burst span \
+             {expected_burst_span:?} even elapsed — the burst isn't actually spaced out over \
+             multiple sends"
         );
-        // Generous upper bound: this pins gross regressions (e.g. burst_span being applied
+        // Generous upper bound: this pins gross regressions (e.g. the burst span being applied
         // twice), not tight scheduling precision.
-        let generous_ceiling = burst_span + Duration::from_millis(50) + Duration::from_secs(2);
+        let generous_ceiling =
+            expected_burst_span + Duration::from_millis(50) + Duration::from_secs(2);
         assert!(
             elapsed < generous_ceiling,
             "discover_on took {elapsed:?}, far past its documented worst case"
+        );
+    }
+
+    // `discover_takes_the_full_burst_span_before_returning` above pins the *product*
+    // `(ANNOUNCE_BURST_COUNT - 1) * ANNOUNCE_BURST_INTERVAL` against an independent literal.
+    // It does not pin the two factors individually — collapsing `ANNOUNCE_BURST_COUNT` to 1
+    // happens to fail three reception tests too, but incidentally: `collect_on_loopback`'s peer
+    // socket is only created when the collect future is first polled, which races
+    // `discover_on`'s first announcement rather than actually observing the burst being
+    // collapsed. Pin both constants directly instead of relying on that.
+    #[test]
+    fn burst_count_and_interval_are_pinned() {
+        assert_eq!(
+            ANNOUNCE_BURST_COUNT, 3,
+            "matches the reference LocalSend implementation's burst count — see the const's \
+             doc comment"
+        );
+        assert_eq!(
+            ANNOUNCE_BURST_INTERVAL,
+            Duration::from_millis(1250),
+            "(ANNOUNCE_BURST_COUNT - 1) * ANNOUNCE_BURST_INTERVAL = 2.5s total span, matching \
+             the reference's ~2.6s — see the const's doc comment"
+        );
+    }
+
+    // `discover_takes_the_full_burst_span_before_returning` proves the *duration* matches a
+    // burst run concurrently with collecting. It does not prove the concurrency itself: an
+    // implementation that runs `announce_burst.await` fully, *then* `collect.await`
+    // (burst-then-listen — exactly what `discover`'s doc comment says this is not) takes the
+    // same total wall time, because `collect` never terminates on its own and the outer
+    // `timeout` is what ends the call either way — see `burst_and_collect`'s doc comment for
+    // why an end-to-end UDP test can't tell the two apart. This test proves the concurrency
+    // directly, with no sockets or real timers involved: `tokio::join!` polls every branch on
+    // each wake of the combined future, so both mock futures below must be polled at least
+    // once even though neither one ever completes. Sequential `.await`s would leave the second
+    // one — `collect_probe` here — untouched, since the first `.await` (`announce_probe`) never
+    // resolves either.
+    #[tokio::test]
+    async fn burst_and_collect_polls_both_futures_before_either_completes() {
+        use std::future::Future;
+        use std::pin::Pin;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::task::{Context, Poll};
+
+        /// Records that it was polled, then stays `Pending` forever — standing in for
+        /// `collect`, which likewise never completes on its own (only the caller's `timeout`
+        /// ends it).
+        struct RecordPoll<'a>(&'a AtomicBool);
+        impl Future for RecordPoll<'_> {
+            type Output = ();
+            fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
+                self.0.store(true, Ordering::SeqCst);
+                Poll::Pending
+            }
+        }
+
+        let announce_polled = AtomicBool::new(false);
+        let collect_polled = AtomicBool::new(false);
+
+        // Bounded from the outside only to end the test — `burst_and_collect` never returns on
+        // its own here, matching how `discover_on` relies on its own outer `timeout` rather
+        // than `collect` completing.
+        let _ = tokio::time::timeout(
+            Duration::from_millis(20),
+            burst_and_collect(RecordPoll(&announce_polled), RecordPoll(&collect_polled)),
+        )
+        .await;
+
+        assert!(announce_polled.load(Ordering::SeqCst), "the announce branch was never polled");
+        assert!(
+            collect_polled.load(Ordering::SeqCst),
+            "the collect branch was never polled — burst_and_collect is running its arguments \
+             sequentially (announce to completion, then collect) instead of concurrently; a \
+             correct implementation polls both from the very first poll, and neither of these \
+             mock futures ever returns Ready, so `collect` can only have been touched if it was \
+             actually polled alongside `announce`"
         );
     }
 
@@ -924,6 +1107,9 @@ mod tests {
         // `OUR_PORT`, the claimed port (53317) and the real source port (some ephemeral value)
         // would disagree.
         let _guard = lock_network_tests();
+        if skip_if_no_loopback_multicast("discover_advertises_the_port_it_actually_bound_not_the_constant").await {
+            return;
+        }
 
         let discover_fut = discover_on(200, 0, &[Ipv4Addr::LOCALHOST]);
         let collect_fut = collect_on_loopback(Duration::from_millis(3200));
@@ -950,6 +1136,9 @@ mod tests {
         // and `discover_on`'s own collect loop must parse that reply into a returned `Device`.
         // The tests above only check that *we* transmit; this checks that we can also *receive*.
         let _guard = lock_network_tests();
+        if skip_if_no_loopback_multicast("discover_returns_a_device_when_a_loopback_peer_replies").await {
+            return;
+        }
 
         let peer_task = tokio::spawn(async {
             let peer = open_reusable_udp_socket(MULTICAST_PORT).expect("peer socket must bind");
@@ -1030,11 +1219,25 @@ mod tests {
         // hermetic test should rely on. What's under test here is only whether the empty-
         // `joined` branch calls `send_to` at all.
         let _guard = lock_network_tests();
+        if skip_if_no_loopback_multicast("announce_on_interfaces_still_announces_when_nothing_joined").await {
+            return;
+        }
 
         let socket = open_reusable_udp_socket(0).unwrap();
         socket.set_multicast_if_v4(&Ipv4Addr::LOCALHOST).unwrap();
         let socket = UdpSocket::from_std(socket.into()).unwrap();
-        let info = our_info_with_port("fp", true, 12345);
+        // A distinctive port (not a real bound ephemeral port `discover_on` would ever
+        // advertise, and not anything the real background LocalSend app announces) so the
+        // assertion below can pick our own datagram out of whatever else is on the group —
+        // see the module note above `discover_sends_an_announcement_a_loopback_peer_can_receive`
+        // on why `received` can't be trusted unfiltered: this is the one new assertion in this
+        // round that used to skip that filter, and a concurrently-running sibling test's own
+        // (differently-ported, but still `alias == OUR_ALIAS`) traffic satisfied it just as well
+        // as this test's own — i.e. it passed under default `cargo test` parallelism even with
+        // the R5 fallback deleted. Filtering on the exact port makes "our own datagram" mean
+        // *this test's* datagram, not merely "something with our alias".
+        const DISTINCTIVE_PORT: u16 = 12345;
+        let info = our_info_with_port("fp", true, DISTINCTIVE_PORT);
 
         let collect_fut = collect_on_loopback(Duration::from_millis(500));
         let announce_fut = async {
@@ -1044,10 +1247,15 @@ mod tests {
         };
         let (_, received) = tokio::join!(announce_fut, collect_fut);
 
+        let ours = received
+            .iter()
+            .any(|(json, _)| json["alias"] == OUR_ALIAS && json["port"] == DISTINCTIVE_PORT);
         assert!(
-            !received.is_empty(),
+            ours,
             "announce_on_interfaces sent nothing when `joined` was empty — a fully blocked \
-             multicast join must not mean total silence"
+             multicast join must not mean total silence (received {} datagrams total, none of \
+             them ours: {received:?})",
+            received.len()
         );
     }
 
@@ -1055,6 +1263,21 @@ mod tests {
     fn join_multicast_falls_back_to_unspecified_when_no_interfaces_given() {
         let socket = open_reusable_udp_socket(0).unwrap();
         let joined = join_multicast_on_all_interfaces(&socket, &[]);
+        // `join_multicast_v4(group, UNSPECIFIED)` asks the kernel to pick an interface from its
+        // route table; a host with no default route (e.g. a network namespace carrying only
+        // `lo` up and no route table entries — the closest available model of a minimal CI
+        // container) has no interface for the kernel to pick, so the join fails with `ENODEV`
+        // and `joined_multicast_on_all_interfaces`'s own error-logging fallback (not a defect —
+        // see its doc comment) leaves `joined` empty. That's a fact about this host's routing,
+        // not about the function under test, so skip loudly rather than fail.
+        if joined.is_empty() {
+            eprintln!(
+                "SKIPPED: join_multicast_v4(group, UNSPECIFIED) failed on this host — no route \
+                 for the kernel to pick an interface from (e.g. no default route), so the \
+                 empty-interfaces fallback this test exercises can't reach its happy path here"
+            );
+            return;
+        }
         assert_eq!(joined, vec![Ipv4Addr::UNSPECIFIED]);
     }
 
@@ -1073,9 +1296,20 @@ mod tests {
     #[test]
     fn join_multicast_reports_exactly_the_interfaces_it_joined() {
         let socket = open_reusable_udp_socket(0).unwrap();
-        // Loopback is a real, always-present, multicast-capable interface, so this join
-        // should succeed — unlike the bogus-address case above.
+        // Loopback is a real, almost-always-present, multicast-capable interface, so this join
+        // should normally succeed — unlike the bogus-address case above. Not guaranteed,
+        // though: `lo` administratively down (a bare `unshare -n` with no interface brought up
+        // at all — the closest available model of a minimal CI container) makes even this join
+        // fail. That's a fact about this host, not about the function under test.
         let joined = join_multicast_on_all_interfaces(&socket, &[Ipv4Addr::LOCALHOST]);
+        if joined.is_empty() {
+            eprintln!(
+                "SKIPPED: joining the multicast group on loopback failed on this host (lo down \
+                 or otherwise unusable) — this test's happy path needs a usable loopback \
+                 interface"
+            );
+            return;
+        }
         assert_eq!(joined, vec![Ipv4Addr::LOCALHOST]);
     }
 

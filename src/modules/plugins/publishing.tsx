@@ -4,11 +4,13 @@
 // inspector's "Published to" panel and the published:* filter facets).
 //
 // These are bundled first-party plugins, so they import only from the module contract
-// (../registry) and the command wrappers (../api), per the module isolation rule.
+// (../registry), the command wrappers (../api), and host hooks (../host) — never
+// window.__TAURI__ or other app internals — per the module isolation rule (AGENTS.md).
 
 import { useCallback, useEffect, useState } from "react";
 import type { ChairPhotoAPI } from "../registry";
 import { listVersions, openExternal, PhotoVersion } from "../api";
+import { useHostSelection } from "../host";
 
 /**
  * An upload-target album, as used by `PublishService.listAlbums`/`createAlbum`.
@@ -178,6 +180,10 @@ export function OAuthSettings({ api, svc }: { api: ChairPhotoAPI; svc: PublishSe
 }
 
 export function PublishPanel({ api, svc }: { api: ChairPhotoAPI; svc: PublishService }) {
+  // Rendered inside PublishDialog, which (issue #16) now subscribes only to
+  // contributions — it no longer re-renders on selection changes, so this panel needs
+  // its own subscription to pick up the active photo/version.
+  useHostSelection();
   const photoId = api.getActivePhotoId();
   const [versions, setVersions] = useState<PhotoVersion[]>([]);
   const [versionId, setVersionId] = useState<number | null>(api.getActiveVersionId());

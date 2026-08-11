@@ -8,14 +8,15 @@
 // `preflight` aspect check (rendered as a non-blocking warning above Send). The LocalSend
 // target passes neither — same UI, pure transfer.
 //
-// Bundled first-party plugin: imports only from the module contract (../registry) and
-// core command wrappers (../api), per the module isolation rule. Mirrors publishing.tsx.
-// The localsend_* commands and the localsend:progress subscription are owned here and go
-// through ChairPhotoAPI, never through core api.ts or Tauri directly.
+// Bundled first-party plugin: imports only from the module contract (../registry), core
+// command wrappers (../api), and host hooks (../host), per the module isolation rule.
+// Mirrors publishing.tsx. The localsend_* commands and the localsend:progress subscription
+// are owned here and go through ChairPhotoAPI, never through core api.ts or Tauri directly.
 
 import { useCallback, useEffect, useState } from "react";
 import type { ChairPhotoAPI, Photo } from "../registry";
 import { listVersions, PhotoVersion } from "../api";
+import { useHostSelection } from "../host";
 
 // ── Backend commands (owned by this shared publishing/transfer surface) ───────
 // Per the module contract, a module's own commands go through `ChairPhotoAPI.invoke`
@@ -91,6 +92,11 @@ export interface SendToDevicePanelProps {
 const DEFAULT_PORT = 53317;
 
 export function SendToDevicePanel({ api, onSent, preflight }: SendToDevicePanelProps) {
+  // Rendered inside PublishDialog (via the LocalSend/Snapchat publish targets), which
+  // (issue #16) now subscribes only to contributions — it no longer re-renders on
+  // selection changes, so this panel needs its own subscription to pick up the active
+  // photo/selection/version.
+  useHostSelection();
   const photoId = api.getActivePhotoId();
   const selected = api.getSelectedPhotos();
   const photoIds = selected.length ? selected.map((p) => p.id) : photoId != null ? [photoId] : [];

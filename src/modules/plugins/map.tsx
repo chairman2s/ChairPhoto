@@ -27,6 +27,7 @@ import "leaflet.markercluster/dist/MarkerCluster.Default.css";
 import "leaflet.markercluster";
 import type { ChairPhotoAPI, ChairPhotoModule } from "../registry";
 import { thumbnailUrl } from "../api";
+import { useHostSelection } from "../host";
 import "./map.css";
 
 // ── Backend commands (owned by this module) ───────────────────────────────────
@@ -1260,6 +1261,10 @@ function MapSettings({ api }: { api: ChairPhotoAPI }) {
 // `geocode_to_iptc` command.
 
 function GeocodePanelContent({ api }: { api: ChairPhotoAPI }) {
+  // Rendered inside PhotoInspector, which (issue #16) now subscribes only to
+  // contributions — it no longer re-renders on selection changes, so this panel needs
+  // its own subscription to pick up the active photo.
+  useHostSelection();
   const [status, setStatus] = useState<string>("");
   const [busy, setBusy] = useState(false);
 

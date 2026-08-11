@@ -241,7 +241,7 @@ export default function App() {
   // Total pending-identity-debt count (issue #50) — badges the topbar entry point.
   // `null` means "unknown" (not yet fetched, or the last fetch failed) — distinct from a
   // confirmed 0, so a transient IPC error can never masquerade as "no debt" and quietly
-  // remove the panel's only entry point (review finding F4).
+  // remove the panel's only entry point.
   const [identityDebtCount, setIdentityDebtCount] = useState<number | null>(null);
   // Bundle export dialog state — set to the batch to export, null = closed.
   const [bundleExportBatch, setBundleExportBatch] = useState<ImportBatch | null>(null);
@@ -788,8 +788,8 @@ export default function App() {
       setIdentityDebtCount(s.total);
     } catch {
       // Leave the count as it was: an IPC error means "unknown", not "zero". Resetting
-      // to 0 here used to hide the topbar chip and silently remove the panel's only
-      // entry point on a transient failure (review finding F4).
+      // to 0 here would hide the topbar chip and silently remove the panel's only entry
+      // point on a transient failure.
     }
   }, []);
 
@@ -861,8 +861,7 @@ export default function App() {
       refreshPending(); // scan auto-enqueues backups for new photos
       // The scanner is the primary producer of identity debt (unwritable/unreachable
       // sidecars found during indexing) — refresh the badge here too, not just at boot
-      // and on panel close, or debt from this scan stays invisible until restart
-      // (review finding F4).
+      // and on panel close, or debt from this scan stays invisible until restart.
       refreshIdentityDebtCount();
       setBatchesKey((k) => k + 1); // a scan may have created a new import batch
       // Pre-cache so browsing is instant. Thumbnails always; previews if opted in.
@@ -1014,9 +1013,9 @@ export default function App() {
       setDevelopStatus(null);
       setPendingCount(0);
       // Identity debt is per-catalog, so the previous catalog's count must not keep
-      // showing as current (defect 3 in the issue #50 review): `null` (not `0`) so the
-      // chip reads "(?)" rather than disappearing while the real count is unknown — same
-      // reasoning as an IPC error in `refreshIdentityDebtCount` (review finding F4).
+      // showing as current: `null` (not `0`) so the chip reads "(?)" rather than
+      // disappearing while the real count is unknown — same reasoning as an IPC error in
+      // `refreshIdentityDebtCount` above.
       // `ready` only flips true once at boot, so the `[ready, ...]` mount effect that
       // normally calls `refreshIdentityDebtCount` never re-fires on a catalog switch;
       // call it directly below instead of relying on that effect.
@@ -1043,9 +1042,8 @@ export default function App() {
       // tag/album IDs that belonged to the previous catalog, producing a flash of wrong data.
       //
       // `refreshIdentityDebtCount`, unlike `refresh`, closes over no filter/tag state, so
-      // it's safe to call directly here rather than wait on an effect (defect 3: it used
-      // to not be called at all on a catalog switch, and `ready` never flips back to
-      // false, so nothing else was ever going to call it either).
+      // it's safe to call directly here rather than wait on an effect — nothing else
+      // calls it on a catalog switch, since `ready` never flips back to false.
       refreshIdentityDebtCount();
     });
     return () => {
@@ -1791,8 +1789,7 @@ export default function App() {
             refresh();
             refreshPending();
             // A root change can leave stale/newly-unreachable copies behind — refresh the
-            // badge here too, not just at boot/scan/panel-close (defect 3 in the issue #50
-            // review).
+            // badge here too, not just at boot/scan/panel-close.
             refreshIdentityDebtCount();
             setStatus("Library folder changed — click Rescan library to index it.");
           }}
@@ -1873,8 +1870,7 @@ export default function App() {
             refreshPending().catch(() => {});
             // A bundle import can queue new identity debt for extracted copies whose
             // sidecar can't be written immediately (e.g. onto read-only storage) — refresh
-            // the badge here too, not just at boot/scan/panel-close (defect 3 in the issue
-            // #50 review).
+            // the badge here too, not just at boot/scan/panel-close.
             refreshIdentityDebtCount().catch(() => {});
             setBatchesKey((k) => k + 1);
           }}

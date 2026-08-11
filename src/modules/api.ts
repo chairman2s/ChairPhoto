@@ -737,14 +737,14 @@ export interface PendingIdentityField {
 /** One COPY still owing at least one sidecar field. Matches `pending_sidecar_identity`
  *  grouped by (photoId, volumeId, relativePath) — CONTEXT.md's "Copy", and the same unit
  *  `PendingIdentitySummary.total` counts. A copy owing both `identifier` and
- *  `import_batch` is ONE of these, with both entries in `fields` — never two rows (defect
- *  1: the list used to return one row per (copy, field), so its length could exceed
- *  `total`, e.g. rendering "Showing 1–4 of 3").
+ *  `import_batch` is ONE of these, with both entries in `fields` — never two rows: a list
+ *  that instead returned one row per (copy, field) could exceed `total`, e.g. rendering
+ *  "Showing 1–4 of 3".
  *
  *  Backend fields `uuid`, `value`, `targetPath`, and `queuedAt` exist in Rust but are
  *  deliberately not shipped here — the panel never renders them, and doing so was ~a
- *  third of its IPC payload for nothing (review finding F1d). `targetPath` is derivable
- *  client-side from `volumeId` + `relativePath` if ever needed. */
+ *  third of its IPC payload for nothing. `targetPath` is derivable client-side from
+ *  `volumeId` + `relativePath` if ever needed. */
 export interface PendingIdentity {
   photoId: number;
   /** The photo's catalog-root-relative logical path, for display. */
@@ -786,12 +786,12 @@ export interface IdentityRepairSummary {
  *  of thousands of rows (74,488 on the 100k harness shape in #20), so this always pages
  *  via `limit`/`offset` rather than returning the whole queue in one IPC payload — pair
  *  with `summarizePendingIdentity()` for the total (same unit: copies), and a virtualized
- *  list for the page itself (review finding F1a). */
+ *  list for the page itself. */
 export const listPendingIdentity = (limit: number, offset: number) =>
   invoke<PendingIdentity[]>("list_pending_identity", { limit, offset });
 /** Total debt + conflict counts, without transferring every row. Independent of
  *  `listPendingIdentity` — call/await it separately so a slow list fetch never delays the
- *  cheap header count (review finding F1b). */
+ *  cheap header count. */
 export const summarizePendingIdentity = () =>
   invoke<PendingIdentitySummary>("summarize_pending_identity");
 /** Retry every queued copy now. Unreachable/unwritable/conflicted copies stay queued. */

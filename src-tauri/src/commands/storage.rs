@@ -179,13 +179,15 @@ async fn relocate_photo_in_state(
 ///
 /// One row per COPY, not per (copy, field) — a copy owing both fields is one entry here
 /// with both folded into `fields` — so `limit`/`offset` and this list's length are always
-/// in the same unit `summarize_pending_identity`'s `total` counts (defect 1). Bounded: the
-/// queue reached 74,488 rows on the 100k harness shape in #20 (tens of MB of JSON if
-/// pulled whole), so this always pages via `LIMIT`/`OFFSET` — the debt panel fetches one
-/// page at a time and shows "showing N of M" (review finding F1a). There is no unbounded
-/// frontend-facing variant; internal Rust callers that need the whole (flat, field-grain)
-/// queue (the repair pass, tests) use `Catalog::list_pending_identity()` directly, off the
-/// IPC boundary.
+/// in the same unit `summarize_pending_identity`'s `total` counts. Bounded: the queue
+/// reached 74,488 rows on the 100k harness shape in #20 (tens of MB of JSON if pulled
+/// whole), so this always pages via `LIMIT`/`OFFSET` — the debt panel fetches one page at
+/// a time and shows "showing N of M". There is no unbounded frontend-facing variant.
+/// `Catalog::list_pending_identity()` returns the whole (flat, field-grain) queue instead,
+/// off the IPC boundary — but it has no production caller today: the repair pass
+/// (`Catalog::repair_pending_identity`, below) plans its own field-grained query
+/// (`Catalog::plan_identity_repairs`), since each repair needs the target value bound
+/// per field. `list_pending_identity()` is exercised only by this crate's tests.
 #[tauri::command]
 pub async fn list_pending_identity(
     state: State<'_, AppState>,
@@ -254,11 +256,11 @@ mod tests {
     /// This fixture used to key on `tag` alone (`chairphoto-storage-command-test-{tag}`),
     /// which every `cargo test` process on the machine shares; `remove_dir_all` on entry
     /// then deletes a directory another process is still writing into. That's the exact
-    /// bug #45 / commit 9cd6d83 fixed for the thumbnail tests and identity.rs's own
-    /// `temp_catalog` was fixed to avoid in this same review pass — this file's copy was
-    /// missed in that pass despite editing the same test module (issue #50 review, defect
-    /// 2). Collapse this into `test_support::TestTmpDir` once the #45 branch merges,
-    /// instead of keeping a third copy of the same shape.
+    /// bug #45 / commit 9cd6d83 fixed for the thumbnail tests, and this same fix round
+    /// gave `catalog::identity::tests::TestTmpDir` the same pid+tag key; this file's copy
+    /// was fixed to match rather than left keyed on `tag` alone. Collapse this into
+    /// `test_support::TestTmpDir` once the #45 branch merges, instead of keeping a third
+    /// copy of the same shape.
     struct TestTmpDir(PathBuf);
 
     impl TestTmpDir {

@@ -338,6 +338,17 @@ CREATE TABLE IF NOT EXISTS pending_sidecar_identity (
 );
 
 CREATE INDEX IF NOT EXISTS idx_pending_sidecar_identity_photo ON pending_sidecar_identity(photo_id);
+-- Covers Catalog::list_pending_identity_page's copy-grouped paging query (defect 4 in the
+-- issue #50 review): GROUP BY + ORDER BY photo_id, volume_id, relative_path, LIMIT/OFFSET.
+-- `EXPLAIN QUERY PLAN` confirms this index lets SQLite drive that whole query as an
+-- ordered index scan with no `USE TEMP B-TREE FOR ORDER BY` — without it, every page turn
+-- sorts the full matching set while `with_catalog_blocking` holds the shared catalog
+-- mutex (measured ~17-50ms at 74,488 rows depending on offset; ~0.6-25ms with this index).
+-- No SCHEMA_VERSION bump needed: this file (SCHEMA_SQL) runs unconditionally via
+-- `execute_batch` on every catalog open (see `Catalog::migrate_locked`), and
+-- `CREATE INDEX IF NOT EXISTS` is naturally idempotent, so an existing catalog picks this
+-- up the next time it opens — same as `idx_pending_sidecar_identity_photo` above.
+CREATE INDEX IF NOT EXISTS idx_pending_sidecar_identity_copy ON pending_sidecar_identity(photo_id, volume_id, relative_path);
 CREATE INDEX IF NOT EXISTS idx_photo_locations_photo  ON photo_locations(photo_id);
 CREATE INDEX IF NOT EXISTS idx_photos_folder         ON photos(folder_id);
 CREATE INDEX IF NOT EXISTS idx_photos_missing        ON photos(missing);

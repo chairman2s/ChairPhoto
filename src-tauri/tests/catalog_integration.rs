@@ -3880,7 +3880,7 @@ fn read_only_dir(dir: &std::path::Path) -> Option<ReadOnlyDir> {
 }
 
 fn pending_sidecar_field_count(
-    pending: &[chairphoto_lib::catalog::PendingIdentity],
+    pending: &[chairphoto_lib::catalog::PendingIdentityRow],
     field: &str,
 ) -> usize {
     pending.iter().filter(|p| p.field == field).count()

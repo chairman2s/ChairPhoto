@@ -167,9 +167,17 @@ fn pending_sidecar_value(
     (field, value)
 }
 
-/// Shared by [`Catalog::list_pending_identity`] and
-/// [`Catalog::list_pending_identity_page`] so the two can't drift apart. `ORDER BY` is
-/// oldest-queued first so paging is stable across calls.
+/// Used ONLY by [`Catalog::list_pending_identity`], the unbounded flat (one row per
+/// (copy, field) pair) accessor kept for internal Rust callers and this file's own test
+/// suite — never shipped over IPC (see [`PendingIdentityRow`]'s doc). The frontend-facing,
+/// paged accessor is [`Catalog::list_pending_identity_page`], which groups by COPY instead
+/// (defect 1: the two used to share this same flat query, which is exactly why a copy
+/// owing both `identifier` and `import_batch` came back as 2 rows there while
+/// `summarize_pending_identity` counted it as 1 — "Showing 1–4 of 3" at small scale, "of
+/// 74488" at real scale). `ORDER BY` is oldest-queued first so paging is stable across
+/// calls; nothing about this query's performance matters for the UI thread since it is
+/// never called from a paging click (see `list_pending_identity_page`'s doc for the query
+/// that IS on that path, and why it's shaped differently).
 const PENDING_IDENTITY_QUERY: &str =
     "SELECT q.photo_id, p.uuid, p.path, q.field, q.volume_id, v.base_path, q.relative_path,
             q.attempts, q.error, q.queued_at, q.last_attempt_at, b.uuid
@@ -179,8 +187,22 @@ const PENDING_IDENTITY_QUERY: &str =
      LEFT JOIN import_batches b ON b.id = p.import_batch_id
      ORDER BY q.queued_at, q.photo_id, q.field, q.volume_id, q.relative_path";
 
-/// Row mapper for [`PENDING_IDENTITY_QUERY`] (with or without a `LIMIT`/`OFFSET` suffix).
-fn map_pending_identity_row(r: &rusqlite::Row) -> rusqlite::Result<PendingIdentity> {
+/// The first of [`Catalog::list_pending_identity_page`]'s two queries — pages the
+/// DISTINCT copies. Named/`const`, not inlined, so a test can run `EXPLAIN QUERY PLAN`
+/// against the exact SQL that ships, and assert it never regresses to a temp-b-tree sort
+/// (defect 4). See that method's doc comment for the full reasoning on why this orders by
+/// natural key rather than `queued_at`, and why it needs `idx_pending_sidecar_identity_copy`
+/// (`schema.rs`) to avoid one.
+const PENDING_IDENTITY_COPY_PAGE_QUERY: &str =
+    "SELECT q.photo_id, p.path, q.volume_id, q.relative_path
+     FROM pending_sidecar_identity q
+     JOIN photos p ON p.id = q.photo_id
+     GROUP BY q.photo_id, q.volume_id, q.relative_path
+     ORDER BY q.photo_id, q.volume_id, q.relative_path
+     LIMIT ?1 OFFSET ?2";
+
+/// Row mapper for [`PENDING_IDENTITY_QUERY`].
+fn map_pending_identity_row(r: &rusqlite::Row) -> rusqlite::Result<PendingIdentityRow> {
     let field_text: String = r.get(3)?;
     let photo_uuid: String = r.get(1)?;
     let import_batch_uuid: Option<String> = r.get(11)?;
@@ -193,7 +215,7 @@ fn map_pending_identity_row(r: &rusqlite::Row) -> rusqlite::Result<PendingIdenti
         .to_string();
     let error: String = r.get(8)?;
     let state = debt_state_from_error(&error).to_string();
-    Ok(PendingIdentity {
+    Ok(PendingIdentityRow {
         photo_id: r.get(0)?,
         uuid: photo_uuid,
         field: field.as_db_str().to_string(),
@@ -210,53 +232,84 @@ fn map_pending_identity_row(r: &rusqlite::Row) -> rusqlite::Result<PendingIdenti
     })
 }
 
-/// A photo whose sidecar still owes it a portable identity field, with the last failure.
+/// One (copy, field) pair still owing a portable identity field, with the last failure.
+/// Flat: a copy owing both `identifier` and `import_batch` is TWO of these.
 ///
-/// Fields marked `skip_serializing` below are real, tested Rust fields — used by
-/// `Catalog::list_pending_identity()`'s own test suite and by internal callers — but are
-/// deliberately NOT shipped to the frontend: the read-only debt panel (issue #50) never
-/// renders them, and shipping them anyway was ~a third of the panel's IPC payload for
-/// nothing (review finding F1d). Render one, or keep it off the wire.
-#[derive(Debug, Clone, serde::Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PendingIdentity {
+/// This is [`Catalog::list_pending_identity`]'s row type only. It is never sent over IPC
+/// (no `Serialize`) — the frontend debt panel (issue #50) renders
+/// [`Catalog::list_pending_identity_page`]'s copy-grouped [`PendingIdentity`] instead
+/// (defect 1). This flat/field-grain shape is kept because the repair pass's own
+/// plan/tests, and this file's test suite, want one assertion per (copy, field), not
+/// pre-folded into a copy.
+#[derive(Debug, Clone)]
+pub struct PendingIdentityRow {
     pub photo_id: i64,
-    /// The identity that must reach the sidecar (`photos.uuid`). Not rendered by the
-    /// debt panel; kept for internal/test use (see struct doc).
-    #[serde(skip_serializing)]
+    /// The identity that must reach the sidecar (`photos.uuid`).
     pub uuid: String,
     /// The sidecar field still owed by this copy: `identifier` or `import_batch`.
     pub field: String,
     /// The value that must be written for `field` (photo UUID or import batch UUID).
-    /// Not rendered by the debt panel; kept for internal/test use (see struct doc).
-    #[serde(skip_serializing)]
     pub value: Option<String>,
-    /// The photo's catalog-root-relative logical path, for display.
+    /// The photo's catalog-root-relative logical path.
     pub path: String,
     /// The volume that contains the copy whose sidecar is pending.
     pub volume_id: i64,
     /// This copy's path relative to its volume's base — the other half of `volume_id`
-    /// that identifies which physical copy owes the debt (`target_path` is the two
-    /// joined; kept separate here so display can show "which volume" and "which path"
-    /// independently, per issue #50).
+    /// that identifies which physical copy owes the debt.
     pub relative_path: String,
-    /// Absolute path to the copy whose sidecar is pending, for display/diagnostics.
-    /// Not rendered by the debt panel — derivable client-side from `volume_id` +
-    /// `relative_path` — so it's kept for internal/test use only (see struct doc).
-    #[serde(skip_serializing)]
+    /// Absolute path to the copy whose sidecar is pending.
     pub target_path: String,
-    /// The coarse CONTEXT.md § Identity state this copy is in: `"unreachable"`,
+    /// The coarse CONTEXT.md § Identity state this row is in: `"unreachable"`,
     /// `"unwritable"`, or `"conflict"` — never `"bound"` (bound copies are cleared from
     /// the queue, see `record_sidecar_field_target`). Derived from `error` by
-    /// `debt_state_from_error`; display code should key off this, not the prose text.
+    /// `debt_state_from_error`.
     pub state: String,
     pub attempts: i64,
     pub error: String,
-    /// Not rendered by the debt panel (only `last_attempt_at` is); kept for internal/test
-    /// use and as the queue's sort key (see struct doc).
-    #[serde(skip_serializing)]
+    /// The queue's sort key for this file's `ORDER BY oldest-queued-first`.
     pub queued_at: i64,
     pub last_attempt_at: i64,
+}
+
+/// One field a COPY still owes (`identifier` or `import_batch`), with its own retry
+/// history — an entry in [`PendingIdentity::fields`]. A copy can owe up to both, queued
+/// and retried independently, so each keeps its own attempts/error/last-attempt.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingIdentityField {
+    /// `identifier` or `import_batch`.
+    pub field: String,
+    /// The coarse CONTEXT.md § Identity state this FIELD is in: `"unreachable"`,
+    /// `"unwritable"`, or `"conflict"`. Derived from `error` by `debt_state_from_error`.
+    pub state: String,
+    pub attempts: i64,
+    pub error: String,
+    pub last_attempt_at: i64,
+}
+
+/// One COPY that still owes at least one sidecar field — [`Catalog::list_pending_identity_page`]'s
+/// row type, and the only `PendingIdentity*` shape shipped over IPC.
+///
+/// Grouped by `(photo_id, volume_id, relative_path)` — CONTEXT.md's "Copy", and the same
+/// unit [`PendingIdentitySummary::total`] counts. A copy owing both `identifier` and
+/// `import_batch` is ONE of these, with both entries in `fields` — never two rows (defect
+/// 1: before this, the paged list shared the flat (copy, field)-row query with
+/// `list_pending_identity`, so its row count could exceed the copy-counted `total` the
+/// summary reported, e.g. `pagingLabel` rendering "Showing 1–4 of 3").
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingIdentity {
+    pub photo_id: i64,
+    /// The photo's catalog-root-relative logical path, for display.
+    pub path: String,
+    /// The volume that contains this copy.
+    pub volume_id: i64,
+    /// This copy's path relative to its volume's base — pair with `volume_id` to show
+    /// "which volume" and "which path" independently, per issue #50.
+    pub relative_path: String,
+    /// Every sidecar field this copy still owes — 1 or 2 entries, never 0 (a copy with no
+    /// owed field isn't in the queue at all).
+    pub fields: Vec<PendingIdentityField>,
 }
 
 /// Coarse counts over `pending_sidecar_identity`, for a summary badge that doesn't need
@@ -449,40 +502,110 @@ impl Catalog {
         Ok(outcome)
     }
 
-    /// Every copy whose sidecar still owes it a portable identity field, oldest first.
+    /// Every (copy, field) row still owing a portable identity field, oldest first. Flat —
+    /// a copy owing both `identifier` and `import_batch` is two of these.
     ///
     /// Unbounded — pulls the whole queue, which reached 74,488 rows on the 100k harness
-    /// shape in #20 (tens of MB of JSON if this crossed IPC). Kept for internal/test
-    /// callers that need the complete set (see `PendingIdentity`'s struct doc); the Tauri
-    /// command layer and the frontend debt panel use
-    /// [`Catalog::list_pending_identity_page`] instead (review finding F1a).
-    pub fn list_pending_identity(&self) -> Result<Vec<PendingIdentity>> {
+    /// shape in #20 (tens of MB of JSON if this crossed IPC — but it never does: this is
+    /// Rust-only, not a Tauri command). Kept for internal/test callers that want one
+    /// assertion per (copy, field) — see [`PendingIdentityRow`]'s struct doc. The IPC
+    /// command and the frontend debt panel use [`Catalog::list_pending_identity_page`]
+    /// instead, which groups by copy (review finding F1a; defect 1).
+    pub fn list_pending_identity(&self) -> Result<Vec<PendingIdentityRow>> {
         let mut stmt = self.conn.prepare(PENDING_IDENTITY_QUERY)?;
         let rows = stmt.query_map([], map_pending_identity_row)?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
-    /// A bounded window over the pending-identity queue, same ordering as
-    /// [`Catalog::list_pending_identity`] — for the Tauri command and the debt panel, so a
-    /// 74k-row queue is never pulled across IPC in one payload (review finding F1a).
+    /// A bounded window over the pending-identity queue, grouped by COPY — for the Tauri
+    /// command and the debt panel, so a 74k-row queue is never pulled across IPC in one
+    /// payload (review finding F1a), AND so the page's row count is always a slice of the
+    /// same unit [`Catalog::summarize_pending_identity`] counts (copies), never more (defect
+    /// 1). A copy owing both `identifier` and `import_batch` is ONE row on this page, with
+    /// both fields folded into `PendingIdentity::fields` — before this fix, this function
+    /// shared [`PENDING_IDENTITY_QUERY`] (flat, one row per (copy, field)) with
+    /// [`Catalog::list_pending_identity`], so that copy came back as two rows, and the
+    /// panel's own paging label could read "Showing 1–4 of 3" (`summarize_pending_identity`
+    /// correctly counted 3 copies; the list handed back 4 rows for them).
     ///
-    /// There is no index on `queued_at` (only `idx_pending_sidecar_identity_photo`, on
-    /// `photo_id`), so this still sorts the whole matching set before applying
-    /// `LIMIT`/`OFFSET`. At the queue sizes seen so far (tens of thousands of rows) an
-    /// in-memory sort is a few milliseconds, and the queue is meant to be small in the
-    /// steady state (rows leave it as soon as a copy binds) — so this file does NOT add a
-    /// migration for a `queued_at` index. Revisit if a real deployment keeps tens/hundreds
-    /// of thousands of rows queued for a long time and paging is measurably slow.
+    /// Two-step, both index-driven (see `idx_pending_sidecar_identity_copy` in
+    /// `schema.rs`): (1) page the DISTINCT copies — `GROUP BY photo_id, volume_id,
+    /// relative_path`, ordered and LIMIT/OFFSET'd by that same natural key; (2) for each
+    /// copy on the page, a second small query fetches the field(s) it owes (at most 2,
+    /// indexed by `photo_id`).
+    ///
+    /// **Ordered by the copy's natural key, not by `queued_at`.** This was a deliberate
+    /// change from the pre-defect-1 "oldest queued first", for two reasons: (a) once a copy
+    /// can own two fields queued at different times, "this copy's queued_at" is ambiguous —
+    /// natural-key order has no such ambiguity, and the stability guarantee paging actually
+    /// needs ("Prev/Next never skips or repeats a copy") only requires SOME deterministic
+    /// total order, not a specific one; (b) it is the only ordering [`EXPLAIN QUERY PLAN`]
+    /// confirms `idx_pending_sidecar_identity_copy` can serve directly — no
+    /// `USE TEMP B-TREE FOR ORDER BY`. Ordering by `MIN(queued_at)` per copy was tried and
+    /// rejected: SQLite must fully materialize and sort the grouped result before applying
+    /// `LIMIT`/`OFFSET` regardless of any index, because no btree can be simultaneously
+    /// sorted by a grouping key and by an aggregate computed FROM that grouping.
+    ///
+    /// This corrects an earlier version of this comment, which claimed paging bounded the
+    /// cost of an un-indexed sort. It didn't: `EXPLAIN QUERY PLAN` on the query this
+    /// function used to run showed `USE TEMP B-TREE FOR ORDER BY` — SQLite sorted the
+    /// WHOLE matching set before applying `LIMIT`/`OFFSET`, on every page turn, while
+    /// `with_catalog_blocking` held the shared catalog mutex for the duration. Measured on
+    /// a synthetic 74,488-row table (the #20 harness shape): 17–50 ms per page depending on
+    /// offset, un-indexed; 0.6–25 ms indexed and ordered as above (offset still costs
+    /// something — SQLite's `OFFSET` walks the skipped rows even off an index — but no
+    /// longer sorts the table to do it). Given the mutex is shared with every other catalog
+    /// read, this file now adds `idx_pending_sidecar_identity_copy` rather than re-decline
+    /// with a corrected number (defect 4; see the migration note on the index itself in
+    /// `schema.rs` for why no `SCHEMA_VERSION` bump was needed).
     pub fn list_pending_identity_page(
         &self,
         limit: i64,
         offset: i64,
     ) -> Result<Vec<PendingIdentity>> {
-        let mut stmt = self
-            .conn
-            .prepare(&format!("{PENDING_IDENTITY_QUERY} LIMIT ?1 OFFSET ?2"))?;
-        let rows = stmt.query_map(params![limit, offset], map_pending_identity_row)?;
-        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        let mut copy_stmt = self.conn.prepare(PENDING_IDENTITY_COPY_PAGE_QUERY)?;
+        let copies = copy_stmt
+            .query_map(params![limit, offset], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, i64>(2)?,
+                    r.get::<_, String>(3)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        let mut field_stmt = self.conn.prepare(
+            "SELECT field, error, attempts, last_attempt_at
+             FROM pending_sidecar_identity
+             WHERE photo_id = ?1 AND volume_id = ?2 AND relative_path = ?3
+             ORDER BY field",
+        )?;
+        let mut out = Vec::with_capacity(copies.len());
+        for (photo_id, path, volume_id, relative_path) in copies {
+            let fields = field_stmt
+                .query_map(params![photo_id, volume_id, relative_path], |r| {
+                    let field: String = r.get(0)?;
+                    let error: String = r.get(1)?;
+                    let state = debt_state_from_error(&error).to_string();
+                    Ok(PendingIdentityField {
+                        field,
+                        state,
+                        attempts: r.get(2)?,
+                        error,
+                        last_attempt_at: r.get(3)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            out.push(PendingIdentity {
+                photo_id,
+                path,
+                volume_id,
+                relative_path,
+                fields,
+            });
+        }
+        Ok(out)
     }
 
     /// How many known photo copies are missing their UUID identity on disk.
@@ -501,12 +624,14 @@ impl Catalog {
     /// a summary badge/header.
     ///
     /// Both counts are in **copies** (`DISTINCT photo_id, volume_id, relative_path`), not
-    /// queue rows: `total` matches the number of distinct copies `list_pending_identity`
-    /// would return grouped by copy, NOT `list_pending_identity().len()` — a copy owing
-    /// both `identifier` and `import_batch` is two rows but one copy (review finding F2,
-    /// CONTEXT.md's "Copy", issue #50's "the number of copies currently in identity
-    /// debt"). `conflicts` is the subset of those copies with at least one field in
-    /// `Conflict` — needs a human, not a retry (see CONTEXT.md § Identity).
+    /// queue rows: `total` matches the total row count [`Catalog::list_pending_identity_page`]
+    /// would return across all its pages, NOT `list_pending_identity().len()` (that one is
+    /// flat, one row per (copy, field) — see its struct doc) — a copy owing both
+    /// `identifier` and `import_batch` is two rows there but one copy here (review finding
+    /// F2, CONTEXT.md's "Copy", issue #50's "the number of copies currently in identity
+    /// debt"; defect 1 made `list_pending_identity_page` agree with this same unit).
+    /// `conflicts` is the subset of those copies with at least one field in `Conflict` —
+    /// needs a human, not a retry (see CONTEXT.md § Identity).
     ///
     /// Matches `error` with `GLOB` (case-sensitive, `*`/`?` wildcards), not `LIKE`
     /// (case-insensitive, `_`/`%` wildcards), so this agrees with `debt_state_from_error`'s
@@ -851,12 +976,16 @@ mod tests {
         );
     }
 
-    /// The paged listing must return the same rows, in the same order, as the unbounded
-    /// listing — just windowed — so the debt panel's "showing N of M" pages line up with
-    /// a full fetch, and a large queue is never pulled across IPC in one payload (review
-    /// finding F1a).
+    /// The paged listing must page over COPIES, not (copy, field) rows — a copy owing
+    /// both `identifier` and `import_batch` must occupy exactly ONE slot on the page, with
+    /// both fields folded into `.fields`, so `rows.length` never exceeds
+    /// `summarize_pending_identity().total` for the same queue (defect 1: before this fix,
+    /// the paged list shared its query with the flat, field-grain `list_pending_identity`,
+    /// so this exact fixture — 5 single-field copies + 1 two-field copy, 6 copies / 7 rows
+    /// — would return 7 rows across the same pages, and the panel's `pagingLabel` would
+    /// read "Showing 1–7 of 6"). Also covers a partial last page and past-the-end paging.
     #[test]
-    fn list_pending_identity_page_windows_the_unbounded_queue() {
+    fn list_pending_identity_page_windows_every_copy_exactly_once() {
         let (catalog, root, _dir) = temp_catalog("page-windows");
         let names = ["a.arw", "b.arw", "c.arw", "d.arw", "e.arw"];
         for name in names {
@@ -865,26 +994,135 @@ mod tests {
                 .record_sidecar_identity(id, &path, &SidecarIdentity::Unreachable)
                 .unwrap();
         }
+        // A 6th copy owes BOTH fields — must still occupy exactly one page slot.
+        let (both_id, both_path) = seed_photo(&catalog, &root, "both.arw");
+        catalog
+            .record_sidecar_identity(both_id, &both_path, &SidecarIdentity::Unreachable)
+            .unwrap();
+        catalog
+            .record_sidecar_import_batch(both_id, &both_path, &SidecarIdentity::Unreachable)
+            .unwrap();
 
-        let all = catalog.list_pending_identity().unwrap();
-        assert_eq!(all.len(), 5);
+        let total = catalog.summarize_pending_identity().unwrap().total;
+        assert_eq!(total, 6, "6 distinct copies, one of which owes two fields");
+        assert_eq!(
+            catalog.list_pending_identity().unwrap().len(),
+            7,
+            "sanity: 7 flat (copy, field) rows behind those 6 copies"
+        );
 
-        let page1 = catalog.list_pending_identity_page(2, 0).unwrap();
-        let page2 = catalog.list_pending_identity_page(2, 2).unwrap();
-        let page3 = catalog.list_pending_identity_page(2, 4).unwrap();
-        assert_eq!(page1.len(), 2);
-        assert_eq!(page2.len(), 2);
-        assert_eq!(page3.len(), 1, "the last page is partial, not padded or empty");
+        let page1 = catalog.list_pending_identity_page(4, 0).unwrap();
+        let page2 = catalog.list_pending_identity_page(4, 4).unwrap();
+        assert_eq!(page1.len(), 4);
+        assert_eq!(page2.len(), 2, "the last page is partial, not padded or empty");
+        assert!(
+            catalog.list_pending_identity_page(4, 6).unwrap().is_empty(),
+            "past the end of the queue: empty, not an error"
+        );
 
-        let paged_ids: Vec<i64> = [page1, page2, page3]
-            .into_iter()
-            .flatten()
-            .map(|p| p.photo_id)
-            .collect();
-        let unbounded_ids: Vec<i64> = all.iter().map(|p| p.photo_id).collect();
-        assert_eq!(paged_ids, unbounded_ids, "paging must not reorder or drop rows");
+        let both_row = page1
+            .iter()
+            .chain(page2.iter())
+            .find(|p| p.photo_id == both_id)
+            .expect("the two-field copy must appear on some page");
+        assert_eq!(
+            both_row.fields.len(),
+            2,
+            "the copy owing both fields is ONE row with two fields, not two rows"
+        );
+        let field_names: std::collections::HashSet<&str> =
+            both_row.fields.iter().map(|f| f.field.as_str()).collect();
+        assert_eq!(
+            field_names,
+            std::collections::HashSet::from(["identifier", "import_batch"])
+        );
 
-        // Past the end of the queue: empty, not an error.
-        assert!(catalog.list_pending_identity_page(2, 10).unwrap().is_empty());
+        let paged_ids: Vec<i64> = page1.iter().chain(page2.iter()).map(|p| p.photo_id).collect();
+        assert_eq!(
+            paged_ids.len() as i64,
+            total,
+            "every distinct copy covered exactly once, matching summarize_pending_identity's unit"
+        );
+        let mut unique_ids: std::collections::HashSet<i64> = std::collections::HashSet::new();
+        assert!(
+            paged_ids.iter().all(|id| unique_ids.insert(*id)),
+            "no copy repeated across pages: {paged_ids:?}"
+        );
+    }
+
+    /// The paged listing orders copies by their natural key (`photo_id, volume_id,
+    /// relative_path`), NOT by `queued_at` — a deliberate change from the pre-defect-1
+    /// "oldest queued first" (see the doc comment on `list_pending_identity_page`): once a
+    /// copy can own two fields queued at different times, "this copy's queued_at" is
+    /// ambiguous, and natural-key order is what lets `idx_pending_sidecar_identity_copy`
+    /// drive the GROUP BY / ORDER BY / LIMIT-OFFSET without a temp b-tree sort (defect 4).
+    /// `queued_at` is forced to run in the OPPOSITE order from `photo_id` via a direct
+    /// UPDATE (real wall-clock timestamps at second resolution can't be trusted to differ
+    /// within a fast test) — a query that still (wrongly) sorted by `queued_at` would
+    /// return the photos in reverse.
+    #[test]
+    fn list_pending_identity_page_orders_by_natural_key_not_queued_at() {
+        let (catalog, root, _dir) = temp_catalog("page-natural-key-order");
+        let names = ["a.arw", "b.arw", "c.arw", "d.arw", "e.arw"];
+        let mut ids = Vec::new();
+        for name in names {
+            let (id, path) = seed_photo(&catalog, &root, name);
+            catalog
+                .record_sidecar_identity(id, &path, &SidecarIdentity::Unreachable)
+                .unwrap();
+            ids.push(id);
+        }
+        for (i, id) in ids.iter().enumerate() {
+            let reversed_queued_at = (ids.len() - i) as i64; // a=5, b=4, c=3, d=2, e=1
+            catalog
+                .conn()
+                .execute(
+                    "UPDATE pending_sidecar_identity SET queued_at = ?1 WHERE photo_id = ?2",
+                    params![reversed_queued_at, id],
+                )
+                .unwrap();
+        }
+
+        let page = catalog.list_pending_identity_page(10, 0).unwrap();
+        let paged_ids: Vec<i64> = page.iter().map(|p| p.photo_id).collect();
+        let mut expected = ids.clone();
+        expected.sort();
+        assert_eq!(
+            paged_ids, expected,
+            "must order by (photo_id, volume_id, relative_path) ascending, not by \
+             queued_at — got {paged_ids:?}, photo_id order is {expected:?}"
+        );
+    }
+
+    /// Guards defect 4 directly, not just by measurement: runs `EXPLAIN QUERY PLAN`
+    /// against the exact SQL [`Catalog::list_pending_identity_page`] ships
+    /// (`PENDING_IDENTITY_COPY_PAGE_QUERY`) and asserts no plan step is a temp b-tree
+    /// sort. A mutation that reverts the `ORDER BY` to an aggregate like
+    /// `MIN(queued_at)`, or that drops/renames `idx_pending_sidecar_identity_copy`
+    /// (`schema.rs`), fails this test immediately instead of only showing up as a slow
+    /// page turn at 74k rows.
+    #[test]
+    fn list_pending_identity_page_query_plan_has_no_temp_btree_sort() {
+        let (catalog, _root, _dir) = temp_catalog("page-query-plan");
+        let mut stmt = catalog
+            .conn()
+            .prepare(&format!("EXPLAIN QUERY PLAN {PENDING_IDENTITY_COPY_PAGE_QUERY}"))
+            .unwrap();
+        let plan: Vec<String> = stmt
+            .query_map(params![500i64, 0i64], |r| r.get::<_, String>(3))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert!(
+            !plan.iter().any(|line| line.contains("B-TREE")),
+            "query plan uses a temp b-tree sort — defect 4 regressed: {plan:?}"
+        );
+        // Sanity: the plan must actually use the covering index, not just happen to
+        // avoid a b-tree some other way (e.g. a full unordered scan would also lack one).
+        assert!(
+            plan.iter()
+                .any(|line| line.contains("idx_pending_sidecar_identity_copy")),
+            "expected the copy-covering index to drive this query, got: {plan:?}"
+        );
     }
 }

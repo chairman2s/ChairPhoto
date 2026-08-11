@@ -177,11 +177,15 @@ async fn relocate_photo_in_state(
 /// Sidecar identity fields that are in the catalog but not (yet) in XMP: photo UUID
 /// (`xmp:Identifier`) and import batch UUID (`chairphoto:ImportBatch`).
 ///
-/// Bounded: the queue reached 74,488 rows on the 100k harness shape in #20 (tens of MB of
-/// JSON if pulled whole), so this always pages via `LIMIT`/`OFFSET` — the debt panel
-/// fetches one page at a time and shows "showing N of M" (review finding F1a). There is no
-/// unbounded frontend-facing variant; internal Rust callers that need the whole queue (the
-/// repair pass, tests) use `Catalog::list_pending_identity()` directly, off the IPC boundary.
+/// One row per COPY, not per (copy, field) — a copy owing both fields is one entry here
+/// with both folded into `fields` — so `limit`/`offset` and this list's length are always
+/// in the same unit `summarize_pending_identity`'s `total` counts (defect 1). Bounded: the
+/// queue reached 74,488 rows on the 100k harness shape in #20 (tens of MB of JSON if
+/// pulled whole), so this always pages via `LIMIT`/`OFFSET` — the debt panel fetches one
+/// page at a time and shows "showing N of M" (review finding F1a). There is no unbounded
+/// frontend-facing variant; internal Rust callers that need the whole (flat, field-grain)
+/// queue (the repair pass, tests) use `Catalog::list_pending_identity()` directly, off the
+/// IPC boundary.
 #[tauri::command]
 pub async fn list_pending_identity(
     state: State<'_, AppState>,

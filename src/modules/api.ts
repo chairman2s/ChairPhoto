@@ -711,6 +711,71 @@ export const enqueueOperation = (kind: string, photoId: number) =>
   invoke<number>("enqueue_operation", { kind, photoId });
 export const reconcileNow = () => invoke<DrainSummary>("reconcile_now");
 
+// --- identity debt (sidecar UUID / import-batch binding, see CONTEXT.md § Identity) ---
+//
+// Debt is per COPY, not per photo: the same photo can owe two independent debts on two
+// different volumes. `Unreachable` is a normal state (an unmounted volume owes exactly as
+// much as a failed write), not a failure — never render it as an error.
+
+/** One of the CONTEXT.md § Identity states a queued copy can be in. `bound` never appears
+ *  here — a copy is removed from the queue the moment it's bound. */
+export type IdentityDebtState = "unreachable" | "unwritable" | "conflict";
+
+/** One copy still owing a sidecar field (`identifier` = xmp:Identifier, `import_batch` =
+ *  chairphoto:ImportBatch). Matches `pending_sidecar_identity`, keyed by
+ *  (photoId, field, volumeId, relative path) — never collapse two rows into one. */
+export interface PendingIdentity {
+  photoId: number;
+  /** The identity that must reach the sidecar (`photos.uuid`). */
+  uuid: string;
+  field: "identifier" | "import_batch";
+  /** The value that must be written for `field`; null if not yet known. */
+  value: string | null;
+  /** The photo's catalog-root-relative logical path, for display. */
+  path: string;
+  volumeId: number;
+  /** This copy's path relative to its volume's base — pair with `volumeId` to show
+   *  "which volume" and "which path" independently. */
+  relativePath: string;
+  /** Absolute path to this specific copy, for display/diagnostics. */
+  targetPath: string;
+  state: IdentityDebtState;
+  attempts: number;
+  /** Human-readable detail (e.g. the write error, or the conflicting UUID found). */
+  error: string;
+  queuedAt: number;
+  lastAttemptAt: number;
+}
+
+/** Cheap counts over the whole pending-identity queue — safe to call to show a badge
+ *  without pulling every row (the queue can hold tens of thousands of rows). */
+export interface PendingIdentitySummary {
+  /** Every queued copy, any field, any state. */
+  total: number;
+  /** Of `total`, how many are `conflict` — need a human, not a retry. */
+  conflicts: number;
+}
+
+export interface IdentityRepairSummary {
+  /** Now bound; cleared from the queue. */
+  repaired: number;
+  /** Still not reachable; left queued. */
+  unreachable: number;
+  /** Retried and still failing (unwritable or a conflict); left queued. */
+  failed: number;
+}
+
+/** Full per-copy identity-debt list, oldest first. Can be large — pair with a virtualized
+ *  list, never render every row eagerly into the DOM. */
+export const listPendingIdentity = () =>
+  invoke<PendingIdentity[]>("list_pending_identity");
+/** Total debt + conflict counts, without transferring every row. */
+export const summarizePendingIdentity = () =>
+  invoke<PendingIdentitySummary>("summarize_pending_identity");
+/** Retry every queued copy now. Unreachable/unwritable/conflicted copies stay queued. */
+export const repairPendingIdentity = () =>
+  invoke<IdentityRepairSummary>("repair_pending_identity");
+
 // --- export (one-way) ---
 
 export type ExportPreset = "handOff" | "showOff" | "instagram";

@@ -3110,3 +3110,79 @@ body {
   background: var(--accent, #4a9eff);
   transition: width 0.15s ease;
 }
+
+/* Identity debt panel (issue #50) — read-only pending-identity queue + repair trigger. */
+.modal.identity-debt {
+  width: 760px;
+}
+.identity-debt-list {
+  height: 420px;
+  overflow-y: auto;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  margin-top: 8px;
+}
+.identity-debt-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 0 10px;
+  height: 100%;
+  border-bottom: 1px solid var(--border);
+  font-size: 12px;
+}
+.identity-debt-path,
+.identity-debt-relpath {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.identity-debt-relpath {
+  color: var(--text-dim);
+}
+.identity-debt-volume {
+  color: var(--text-dim);
+  width: 110px;
+  flex: none;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.identity-debt-field {
+  color: var(--text-dim);
+  width: 84px;
+  flex: none;
+}
+.identity-debt-attempts {
+  color: var(--text-dim);
+  width: 34px;
+  flex: none;
+  text-align: right;
+}
+/* State badges. Unreachable is a NORMAL state (an unmounted volume), never styled as a
+ * failure — it gets the same neutral treatment as the rest of the row. Unwritable and
+ * Conflict both need a person's attention, so they're visually distinct from it. */
+.identity-state-badge {
+  flex: none;
+  width: 86px;
+  text-align: center;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  padding: 2px 0;
+  border-radius: 4px;
+}
+.identity-state-normal {
+  background: var(--bg-tile);
+  color: var(--text-dim);
+}
+.identity-state-warn {
+  background: #3a1f1f;
+  color: #e08a8a;
+}
+.identity-state-attention {
+  background: #3a2f1a;
+  color: #e0b87f;
+}

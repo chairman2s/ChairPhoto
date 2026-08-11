@@ -67,6 +67,7 @@ import {
   reconcileNow,
   StorageStatus,
   StorageTier,
+  summarizePendingIdentity,
   versionCounts,
 } from "./modules/api";
 import { CatalogGrid } from "./components/CatalogGrid";
@@ -100,6 +101,7 @@ import {
 } from "./modules/host";
 import { BUNDLED_MODULES } from "./modules/bundled";
 import { Preferences } from "./components/Preferences";
+import { IdentityDebtPanel } from "./components/IdentityDebtPanel";
 import { ExportPanel } from "./components/ExportPanel";
 import { PublishDialog } from "./components/PublishDialog";
 import { ImportPanel } from "./components/ImportPanel";
@@ -235,6 +237,9 @@ export default function App() {
   const [showExport, setShowExport] = useState(false);
   const [showPublish, setShowPublish] = useState(false);
   const [showImport, setShowImport] = useState(false);
+  const [showIdentityDebt, setShowIdentityDebt] = useState(false);
+  // Total pending-identity-debt count (issue #50) — badges the topbar entry point.
+  const [identityDebtCount, setIdentityDebtCount] = useState(0);
   // Bundle export dialog state — set to the batch to export, null = closed.
   const [bundleExportBatch, setBundleExportBatch] = useState<ImportBatch | null>(null);
   // Bundle import dialog open/closed.
@@ -772,6 +777,17 @@ export default function App() {
     }
   }, []);
 
+  // Cheap count-only refresh (issue #50) — never pulls the full pending-identity list
+  // just to badge the topbar entry point.
+  const refreshIdentityDebtCount = useCallback(async () => {
+    try {
+      const s = await summarizePendingIdentity();
+      setIdentityDebtCount(s.total);
+    } catch {
+      setIdentityDebtCount(0);
+    }
+  }, []);
+
   // Drain the backup queue in the background (no blocking dialog). Guarded so
   // overlapping triggers (focus events) don't start parallel drains.
   const runReconcile = useCallback(async () => {
@@ -822,10 +838,11 @@ export default function App() {
     if (!ready) return;
     refreshPending();
     checkReconcile();
+    refreshIdentityDebtCount();
     const onFocus = () => checkReconcile();
     window.addEventListener("focus", onFocus);
     return () => window.removeEventListener("focus", onFocus);
-  }, [ready, checkReconcile, refreshPending]);
+  }, [ready, checkReconcile, refreshPending, refreshIdentityDebtCount]);
 
   const onScan = async () => {
     setStatus("Scanning library…");
@@ -1260,6 +1277,15 @@ export default function App() {
             title="Back up photos waiting for the NAS"
           >
             ⤓ Back up ({pendingCount})
+          </button>
+        )}
+        {identityDebtCount > 0 && (
+          <button
+            className="chip chip-on"
+            onClick={() => setShowIdentityDebt(true)}
+            title="Photo copies whose sidecar doesn't carry their identity yet"
+          >
+            ⚠ Identity debt ({identityDebtCount})
           </button>
         )}
         <span className="topbar-sep" aria-hidden />
@@ -1736,6 +1762,15 @@ export default function App() {
             refresh();
             refreshPending();
             setStatus("Library folder changed — click Rescan library to index it.");
+          }}
+        />
+      )}
+
+      {showIdentityDebt && (
+        <IdentityDebtPanel
+          onClose={() => {
+            setShowIdentityDebt(false);
+            refreshIdentityDebtCount(); // a repair pass may have cleared some debt
           }}
         />
       )}

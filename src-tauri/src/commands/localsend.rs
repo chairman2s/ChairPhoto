@@ -8,9 +8,12 @@ use super::*;
 use std::path::{Path, PathBuf};
 use tauri::{AppHandle, Emitter, Manager};
 
-/// Discover LocalSend devices on the LAN. `timeout_ms` defaults to ~2.5s — long enough for
-/// peers to reply to our announcement, short enough to keep Refresh snappy. A blocked
-/// multicast just yields an empty list (the UI's manual-IP field is the fallback).
+/// Discover LocalSend devices on the LAN. `timeout_ms` (default 2500ms) is the reply window
+/// `crate::localsend::discover` keeps open *after* the last of its burst of 3 announcements,
+/// not the call's total duration — see that function's doc comment for why a single
+/// announcement plus a short window is unreliable on wifi. Worst case for one Refresh is
+/// therefore ~5s (2.5s announce-burst span + the 2.5s default reply window), not ~2.5s. A
+/// blocked multicast just yields an empty list (the UI's manual-IP field is the fallback).
 #[cfg(feature = "localsend")]
 #[tauri::command]
 pub async fn localsend_discover(

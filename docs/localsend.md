@@ -76,8 +76,12 @@ Tauri directly. `onEvent` is an optional host-API member, so the panel guards fo
 that predate it, in which case progress simply does not display.
 
 Unit tests cover the discovery-JSON parse, the prepare-upload body and response shapes, the
-device-info builder, the host's `satisfies` semver helper, and the Snapchat aspect helper —
-no live network in tests.
+device-info builder, the host's `satisfies` semver helper, and the Snapchat aspect helper.
+The discovery-socket tests (issue #39) are the exception: they bind the real well-known UDP
+port, join the real multicast group, and send/receive real datagrams over loopback — see the
+`#[cfg(test)] mod tests` doc comments in `src-tauri/src/localsend/mod.rs` for what that costs
+(serialized against each other and against a co-resident LocalSend desktop app) and how it's
+kept hermetic (loopback only, never the LAN).
 
 ## Snapchat
 

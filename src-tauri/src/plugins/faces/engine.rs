@@ -1,8 +1,9 @@
 //! Face detect + embed core (docs/face-tagging.md, model stack section).
 //!
-//! Two ONNX models, loaded lazily and cached (each [`ort`] `Session` is built once on first
-//! use and reused for every subsequent call — see [`yunet_session`]/[`auraface_session`] —
-//! so the graph optimization cost is paid once, not per face):
+//! Two ONNX models, loaded lazily and cached keyed by the configuration that shapes them —
+//! see [`yunet_pool`]/[`auraface_pool`] and [`PoolKey`] — so the graph optimization cost is
+//! paid once per distinct configuration, not per face, but a change to pool size, intra-op
+//! threads or `faces.force_cpu` still rebuilds rather than being silently ignored (issue #18):
 //!
 //! - **YuNet 2023mar** (detection): SCRFD-style multi-output ONNX, fixed 640×640 input.
 //!   [`detect_faces`] resizes the JPEG to 640×640, runs the net, decodes the per-stride
@@ -21,13 +22,15 @@ use image::RgbImage;
 use super::models::{self, ModelError};
 
 #[cfg(feature = "faces")]
-use std::sync::{Condvar, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex};
 
 /// The intra-op thread count each ONNX session is configured with, and the number of sessions
-/// per model in the pool. Set once, before any session is built, by [`configure`] (from the
-/// indexer, off the resolved [`super::indexer::IndexingPlan`]). If a session is built before
-/// `configure` runs — e.g. a single loupe/inspector detect call — the responsive defaults
-/// below are used (matching the old `background` throttle: 1 session, 2 intra-op threads).
+/// per model in the pool. Set by [`configure`] (from the indexer, off the resolved
+/// [`super::indexer::IndexingPlan`]). Read into a [`PoolKey`] on every pool fetch — see
+/// [`current_pool_key`] — so a value change here rebuilds the pool the next time one is
+/// needed rather than being frozen at whatever the first caller saw. A session built before
+/// `configure` ever runs — e.g. a single loupe/inspector detect call — uses the responsive
+/// defaults below (matching the old `background` throttle: 1 session, 2 intra-op threads).
 #[cfg(feature = "faces")]
 static POOL_SIZE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
 #[cfg(feature = "faces")]
@@ -35,9 +38,11 @@ static INTRA_THREADS: std::sync::atomic::AtomicUsize = std::sync::atomic::Atomic
 
 /// When `true`, the CUDA execution provider is **never** registered even in a `faces-cuda`
 /// build — every session runs on CPU. Set by [`configure_force_cpu`] (from the indexer, off
-/// the `faces.force_cpu` setting) before the first pool build. Default `false`: a `faces-cuda`
-/// build tries GPU first and falls back to CPU on its own if CUDA is unavailable. In a plain
-/// `faces` (no-CUDA) build this flag has no effect — there is no CUDA EP to register.
+/// the `faces.force_cpu` setting). Like [`POOL_SIZE`]/[`INTRA_THREADS`], part of [`PoolKey`],
+/// so flipping it rebuilds the pool on the next fetch instead of only ever taking effect on
+/// the very first one. Default `false`: a `faces-cuda` build tries GPU first and falls back to
+/// CPU on its own if CUDA is unavailable. In a plain `faces` (no-CUDA) build this flag has no
+/// effect — there is no CUDA EP to register.
 #[cfg(feature = "faces")]
 static FORCE_CPU: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -82,13 +87,24 @@ pub fn active_ep() -> ActiveEp {
 }
 
 /// Configure the session pool size and per-session intra-op thread count for the *next* pool
-/// build. Call this once before an index run (from the indexer, off the resolved
-/// [`super::indexer::IndexingPlan`]); it is a no-op once a pool has been built (the sessions
-/// are cached in a `OnceLock`, so the first build wins). Single-call callers that never
-/// configure fall back to the responsive defaults.
+/// fetch. Call this before an index run (from the indexer, off the resolved
+/// [`super::indexer::IndexingPlan`]). Unlike the old `OnceLock`-backed pool, this is never a
+/// no-op: the pool is keyed by [`PoolKey`] (see [`yunet_pool`]/[`auraface_pool`]), so a value
+/// change here rebuilds the pool the next time `detect_faces`/`embed_face` runs. Single-call
+/// callers that never configure fall back to the responsive defaults.
 ///
 /// `pool_size` = concurrent inference slots per model; `intra_threads` = ONNX intra-op
 /// threads per session.
+///
+/// Because [`POOL_SIZE`]/[`INTRA_THREADS`] are process-global, two index runs of the *same*
+/// family overlapping (a second `faces_index_photos` call trips the first job's abort flag —
+/// see `commands::faces::begin_faces_index_job`) can move these values out from under the
+/// first run's still-in-flight chunk. That chunk's checkout already holds its own `Arc` clone
+/// of the pool it fetched (see [`onnx::KeyedCache`](crate::plugins::onnx::KeyedCache)), so it
+/// finishes correctly on the pool it started with; only its *next* fetch — after it notices
+/// the abort flag, at most one chunk later — could observe the newer job's configuration. A
+/// single run's own workers never see this, because `configure`/[`configure_force_cpu`] are
+/// each called exactly once, before that run's parallel loop starts.
 #[cfg(feature = "faces")]
 pub fn configure(pool_size: usize, intra_threads: usize) {
     use std::sync::atomic::Ordering;
@@ -96,14 +112,49 @@ pub fn configure(pool_size: usize, intra_threads: usize) {
     INTRA_THREADS.store(intra_threads.max(1), Ordering::Relaxed);
 }
 
-/// Force every session onto CPU even in a `faces-cuda` build (setting `faces.force_cpu`). Call
-/// before the first pool build (same lifecycle as [`configure`]); no-op once a pool exists. In
-/// a non-CUDA build this is inert. Useful when the GPU is needed for other work, when a driver
-/// is flaky, or to A/B GPU-vs-CPU output.
+/// Force every session onto CPU even in a `faces-cuda` build (setting `faces.force_cpu`).
+/// Same lifecycle and cross-job caveat as [`configure`]: it rebuilds the pool on the next
+/// fetch rather than only ever taking effect on the first one. In a non-CUDA build this is
+/// inert. Useful when the GPU is needed for other work, when a driver is flaky, or to A/B
+/// GPU-vs-CPU output.
 #[cfg(feature = "faces")]
 pub fn configure_force_cpu(force: bool) {
     use std::sync::atomic::Ordering;
     FORCE_CPU.store(force, Ordering::Relaxed);
+}
+
+/// Everything that determines what a built session pool looks like. Two fetches with an equal
+/// key reuse the same pool; any difference rebuilds. Deliberately narrow: it captures exactly
+/// the levers [`configure`]/[`configure_force_cpu`] expose (issue #18 — "key the pools by the
+/// configuration that affects them"), not the model itself (the pool key is bundled together
+/// with the model spec by [`yunet_pool`]/[`auraface_pool`] each owning a distinct
+/// [`crate::plugins::onnx::KeyedCache`], so a key never needs to disambiguate YuNet vs
+/// AuraFace).
+///
+/// `force_cpu` doubles as "execution provider mode" here: today's engine has exactly two
+/// modes — CPU-only (`force_cpu = true`, or a plain non-CUDA build where it is moot) and
+/// "try CUDA, fall back to CPU" (`force_cpu = false` in a `faces-cuda` build) — so the one
+/// boolean fully captures it. A future explicit provider setting would extend this struct,
+/// not replace it.
+#[cfg(feature = "faces")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PoolKey {
+    pool_size: usize,
+    intra_threads: usize,
+    force_cpu: bool,
+}
+
+/// Snapshot [`POOL_SIZE`]/[`INTRA_THREADS`]/[`FORCE_CPU`] into a [`PoolKey`]. Called on every
+/// pool fetch (not just the first), which is what makes a `configure`/`configure_force_cpu`
+/// call before the next fetch take effect instead of being ignored.
+#[cfg(feature = "faces")]
+fn current_pool_key() -> PoolKey {
+    use std::sync::atomic::Ordering;
+    PoolKey {
+        pool_size: POOL_SIZE.load(Ordering::Relaxed).max(1),
+        intra_threads: INTRA_THREADS.load(Ordering::Relaxed).max(1),
+        force_cpu: FORCE_CPU.load(Ordering::Relaxed),
+    }
 }
 
 /// The 512-d embedding AuraFace produces.
@@ -288,60 +339,73 @@ impl<T> Drop for Checkout<'_, T> {
     }
 }
 
-/// Lazily build a pool of ONNX sessions for a model once and reuse it. A `Session` is `Send`
-/// but its `run` takes `&mut self`, so several are built and lent out from a [`Pool`]: up to
-/// `POOL_SIZE` inferences of one model run at once (was single-flighted behind one `Mutex`).
-/// Each session gets `INTRA_THREADS` intra-op threads. The first build streams a full SHA-256
-/// verify of the model before loading it, guaranteeing on-disk integrity before it reaches ONNX.
+/// Process-global keyed caches, one per model — see [`PoolKey`] and
+/// [`crate::plugins::onnx::KeyedCache`]. Separate slots (rather than one cache keyed by model
+/// too) because each model has its own fixed spec; the pool *configuration* is what's shared.
 #[cfg(feature = "faces")]
-fn yunet_pool() -> Result<&'static Pool<ort::session::Session>, EngineError> {
-    static CELL: OnceLock<Result<Pool<ort::session::Session>, String>> = OnceLock::new();
-    match CELL.get_or_init(|| build_pool(&models::YUNET)) {
-        Ok(p) => Ok(p),
-        Err(msg) => Err(EngineError::Inference(msg.clone())),
-    }
+static YUNET_CACHE: crate::plugins::onnx::KeyedCache<PoolKey, Pool<ort::session::Session>> =
+    crate::plugins::onnx::KeyedCache::new();
+#[cfg(feature = "faces")]
+static AURAFACE_CACHE: crate::plugins::onnx::KeyedCache<PoolKey, Pool<ort::session::Session>> =
+    crate::plugins::onnx::KeyedCache::new();
+
+/// Fetch (building or rebuilding as needed) the YuNet session pool for the current
+/// [`current_pool_key`]. A `Session` is `Send` but its `run` takes `&mut self`, so several are
+/// built and lent out from a [`Pool`]: up to `pool_size` inferences of this model run at once.
+/// Each session gets `intra_threads` intra-op threads. Building streams a full SHA-256 verify
+/// of the model before loading it, guaranteeing on-disk integrity before it reaches ONNX — paid
+/// again on every rebuild, which is the cost of a config change actually taking effect.
+#[cfg(feature = "faces")]
+fn yunet_pool() -> Result<Arc<Pool<ort::session::Session>>, EngineError> {
+    let key = current_pool_key();
+    YUNET_CACHE
+        .get_or_build(key.clone(), || build_pool(&models::YUNET, &key))
+        .map_err(EngineError::Inference)
 }
 
 /// As [`yunet_pool`], for the AuraFace embedding model.
 #[cfg(feature = "faces")]
-fn auraface_pool() -> Result<&'static Pool<ort::session::Session>, EngineError> {
-    static CELL: OnceLock<Result<Pool<ort::session::Session>, String>> = OnceLock::new();
-    match CELL.get_or_init(|| build_pool(&models::AURAFACE)) {
-        Ok(p) => Ok(p),
-        Err(msg) => Err(EngineError::Inference(msg.clone())),
-    }
+fn auraface_pool() -> Result<Arc<Pool<ort::session::Session>>, EngineError> {
+    let key = current_pool_key();
+    AURAFACE_CACHE
+        .get_or_build(key.clone(), || build_pool(&models::AURAFACE, &key))
+        .map_err(EngineError::Inference)
 }
 
-/// Verify a model on disk (full checksum) and build a [`Pool`] of `POOL_SIZE` ONNX sessions,
-/// each configured with `INTRA_THREADS` intra-op threads. Errors are stringified so they can
-/// be cached in the `OnceLock` (`ModelError`/session errors aren't `Clone`); the caller
-/// re-wraps them into [`EngineError::Inference`]. A missing model surfaces its `ModelError`
-/// text (e.g. "model yunet not downloaded"), so the caller can still prompt a download rather
-/// than crash, and is reported before any session is built — so it needs no ONNX Runtime to
-/// diagnose. A missing *runtime* surfaces from [`crate::plugins::onnx::build_session`], which
-/// every session goes through precisely so that absence is reported instead of hung on.
+/// Verify a model on disk (full checksum) and build a [`Pool`] of `key.pool_size` ONNX
+/// sessions, each configured with `key.intra_threads` intra-op threads and forced to CPU when
+/// `key.force_cpu`. Errors are stringified so [`crate::plugins::onnx::KeyedCache`] can pass
+/// them through without requiring `Clone` (`ModelError`/session errors aren't `Clone`); the
+/// caller re-wraps them into [`EngineError::Inference`]. A missing model surfaces its
+/// `ModelError` text (e.g. "model yunet not downloaded"), so the caller can still prompt a
+/// download rather than crash, and is reported before any session is built — so it needs no
+/// ONNX Runtime to diagnose. A missing *runtime* surfaces from
+/// [`crate::plugins::onnx::build_session`], which every session goes through precisely so that
+/// absence is reported instead of hung on. A build failure is not cached by `KeyedCache`, so a
+/// later retry (e.g. once the model finishes downloading) gets a fresh attempt.
 #[cfg(feature = "faces")]
-fn build_pool(spec: &models::ModelSpec) -> Result<Pool<ort::session::Session>, String> {
-    use std::sync::atomic::Ordering;
+fn build_pool(spec: &models::ModelSpec, key: &PoolKey) -> Result<Pool<ort::session::Session>, String> {
     let path = models::verify(spec).map_err(|e| e.to_string())?;
-    let size = POOL_SIZE.load(Ordering::Relaxed).max(1);
-    let intra = INTRA_THREADS.load(Ordering::Relaxed).max(1);
-    let mut sessions = Vec::with_capacity(size);
+    let mut sessions = Vec::with_capacity(key.pool_size);
     let mut used_cuda = false;
-    for _ in 0..size {
+    for _ in 0..key.pool_size {
         // `build_session` runs the ONNX Runtime preflight; a session must never be built
         // directly, or a missing runtime hangs instead of erroring. See plugins::onnx.
         //
         // GPU is tried first (only in a `faces-cuda` build, and only if not forced to CPU).
         // On any failure `try_register_cuda` logs and leaves the builder on CPU — never an
-        // error, never a crash.
-        let (session, cuda) =
-            crate::plugins::onnx::build_session(&path, intra, try_register_cuda)?;
+        // error, never a crash. `key.force_cpu` — not the live `FORCE_CPU` atomic — decides
+        // it, so the built pool always matches the key it was cached under even if a
+        // concurrent `configure_force_cpu` call is landing at the same moment.
+        let (session, cuda) = crate::plugins::onnx::build_session(&path, key.intra_threads, |b| {
+            try_register_cuda(b, key.force_cpu)
+        })?;
         used_cuda |= cuda;
         sessions.push(session);
     }
-    // Record where this pool landed. The first pool built wins the global (both models build
-    // identically), which is all the indexer needs to report GPU-vs-CPU honestly.
+    // Record where this pool landed. `active_ep()` reflects whichever pool (yunet or
+    // auraface, any key) was built most recently — a best-effort "where did we last run"
+    // signal for the indexer/UI, not a per-call guarantee under concurrent rebuilds.
     set_active_ep(if used_cuda { ActiveEp::Cuda } else { ActiveEp::Cpu });
     if used_cuda {
         eprintln!(
@@ -356,7 +420,8 @@ fn build_pool(spec: &models::ModelSpec) -> Result<Pool<ort::session::Session>, S
 /// registered successfully. GRACEFUL by construction:
 ///
 /// - In a plain `faces` (non-CUDA) build this is compiled out entirely — always `false`, CPU.
-/// - When `faces.force_cpu` is set ([`configure_force_cpu`]) it skips registration — CPU.
+/// - When `force_cpu` is set (the pool's [`PoolKey::force_cpu`], not the live `FORCE_CPU`
+///   atomic — see the call site in [`build_pool`]) it skips registration — CPU.
 /// - When the CUDA runtime/driver/cuDNN or a GPU is missing, `register` returns an `Err`; we
 ///   log it clearly and return `false`, so the caller's `commit_from_file` still succeeds on
 ///   CPU. Never panics, never propagates the error.
@@ -364,9 +429,8 @@ fn build_pool(spec: &models::ModelSpec) -> Result<Pool<ort::session::Session>, S
 /// We register the EP *explicitly* (rather than `with_execution_providers`, which swallows the
 /// outcome) precisely so we can detect failure and report which provider actually took effect.
 #[cfg(all(feature = "faces", feature = "faces-cuda"))]
-fn try_register_cuda(builder: &mut ort::session::builder::SessionBuilder) -> bool {
-    use std::sync::atomic::Ordering;
-    if FORCE_CPU.load(Ordering::Relaxed) {
+fn try_register_cuda(builder: &mut ort::session::builder::SessionBuilder, force_cpu: bool) -> bool {
+    if force_cpu {
         return false;
     }
     use ort::ep::ExecutionProvider;
@@ -387,7 +451,7 @@ fn try_register_cuda(builder: &mut ort::session::builder::SessionBuilder) -> boo
 /// Non-CUDA build: no CUDA EP exists, so this is always CPU. Kept as a same-signature stub so
 /// [`build_pool`] needs no `cfg` at the call site.
 #[cfg(all(feature = "faces", not(feature = "faces-cuda")))]
-fn try_register_cuda(_builder: &mut ort::session::builder::SessionBuilder) -> bool {
+fn try_register_cuda(_builder: &mut ort::session::builder::SessionBuilder, _force_cpu: bool) -> bool {
     false
 }
 
@@ -396,9 +460,8 @@ fn run_yunet(input: &[f32]) -> Result<YunetOutputs, EngineError> {
     use ort::inputs;
     use ort::value::Tensor;
 
-    let mut session = yunet_pool()?
-        .checkout()
-        .map_err(EngineError::Inference)?;
+    let pool = yunet_pool()?;
+    let mut session = pool.checkout().map_err(EngineError::Inference)?;
 
     let shape = [1i64, 3, DET_SIZE as i64, DET_SIZE as i64];
     let tensor = Tensor::from_array((shape, input.to_vec()))
@@ -555,9 +618,8 @@ fn run_auraface(input: &[f32]) -> Result<[f32; EMBED_DIM], EngineError> {
     use ort::inputs;
     use ort::value::Tensor;
 
-    let mut session = auraface_pool()?
-        .checkout()
-        .map_err(EngineError::Inference)?;
+    let pool = auraface_pool()?;
+    let mut session = pool.checkout().map_err(EngineError::Inference)?;
 
     let shape = [1i64, 3, ALIGN_SIZE as i64, ALIGN_SIZE as i64];
     let tensor = Tensor::from_array((shape, input.to_vec()))
@@ -949,5 +1011,49 @@ mod tests {
         let norm: f32 = u.iter().map(|x| x * x).sum::<f32>().sqrt();
         assert!((norm - 1.0).abs() < 1e-5, "norm={norm}");
         assert!((cosine(&u, &u) - 1.0).abs() < 1e-5);
+    }
+
+    // ── PoolKey / configure (issue #18) ─────────────────────────────────────────
+    //
+    // `yunet_pool`/`auraface_pool` fetch through `crate::plugins::onnx::KeyedCache`, whose
+    // rebuild-on-key-change policy is proven generically (no ONNX needed) by
+    // `plugins::onnx::tests`. What's specific to this module is that `configure`/
+    // `configure_force_cpu` actually produce a different key — that's what this test covers.
+
+    /// `configure`/`configure_force_cpu` update the atomics `current_pool_key` reads — the
+    /// mechanism that makes a settings change rebuild the pool instead of being silently
+    /// ignored until restart. Deliberately a single test rather than several: it would race
+    /// itself over the process-global atomics if split up and run in parallel with copies of
+    /// itself, and no *other* test in this binary touches `POOL_SIZE`/`INTRA_THREADS`/
+    /// `FORCE_CPU` — real pools are only ever built through `tests/faces_engine.rs`, a
+    /// separate process.
+    #[cfg(feature = "faces")]
+    #[test]
+    fn configure_calls_change_the_current_pool_key() {
+        configure(2, 3);
+        configure_force_cpu(false);
+        let a = current_pool_key();
+        assert_eq!(a, PoolKey { pool_size: 2, intra_threads: 3, force_cpu: false });
+
+        configure(5, 1);
+        let b = current_pool_key();
+        assert_ne!(a, b, "changing pool_size/intra_threads must change the key");
+        assert_eq!(b, PoolKey { pool_size: 5, intra_threads: 1, force_cpu: false });
+
+        configure_force_cpu(true);
+        let c = current_pool_key();
+        assert_ne!(b, c, "flipping force_cpu must change the key");
+        assert_eq!(c, PoolKey { pool_size: 5, intra_threads: 1, force_cpu: true });
+
+        // Reading it again without reconfiguring returns an equal key — this is what lets an
+        // unchanged configuration reuse the cached pool instead of rebuilding on every call.
+        assert_eq!(current_pool_key(), c);
+
+        // Zero is clamped to 1 — a degenerate resolved plan must still make progress.
+        configure(0, 0);
+        assert_eq!(
+            current_pool_key(),
+            PoolKey { pool_size: 1, intra_threads: 1, force_cpu: true }
+        );
     }
 }

@@ -2,6 +2,7 @@
 // shooting patterns, cameras, lenses, focal lengths, ratings and top tags. Frontend-only;
 // all figures come from the `catalog_stats` command. See docs/statistics.md.
 import { useEffect, useState, useRef, useId } from "react";
+import { useHostFilterContext } from "../host";
 import type { ChairPhotoAPI, ChairPhotoModule } from "../registry";
 import "./statistics.css";
 
@@ -540,9 +541,11 @@ function StatsView({ api }: { api: ChairPhotoAPI }) {
   // Cache of all tags — fetched once and used to resolve tag names for the scope chip.
   const tagCacheRef = useRef<Map<number, string>>(new Map());
 
-  // Read the current filter context each render (api.getFilterContext() reads a
-  // module-level variable updated by App's useEffect + notify(), so after the first
-  // render following a scope change, the value is current).
+  // Subscribe to the filter-context channel, then read it. The subscription is what
+  // re-renders this panel when the sidebar scope changes; without it the panel would
+  // depend on an ancestor happening to re-render on the same change, and narrowing any
+  // ancestor's subscription would silently leave these figures on the previous scope.
+  useHostFilterContext();
   const ctx = api.getFilterContext();
 
   // Fetch tags once on mount so we can show tag names in the scope chip.

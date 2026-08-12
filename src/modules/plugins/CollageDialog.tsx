@@ -186,6 +186,9 @@ function CanvasTile({
 }
 
 export function CollageDialog({ api, onClose }: { api: ChairPhotoAPI; onClose: () => void }) {
+  // Snapshot the selection once on open, deliberately unsubscribed: the arranged layout
+  // below is keyed by these photo ids, so re-reading the selection mid-dialog would
+  // invalidate an arrangement the user has already made.
   const order = useMemo<Photo[]>(() => api.getSelectedPhotos(), [api]);
   const photoById = useMemo(() => new Map(order.map((p) => [p.id, p])), [order]);
 

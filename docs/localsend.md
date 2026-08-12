@@ -76,8 +76,16 @@ on success — mirroring how `publishing.tsx` is shared by Flickr and SmugMug.
   - `POST /upload?sessionId=&fileId=&token=` — raw file bytes as the body → `200`.
   - `POST /cancel?sessionId=` — abort.
 - **TLS** — the device's announced `protocol` is honoured. For `https`, which on a LAN
-  means self-signed, a cert-accepting `reqwest` client is used; LocalSend itself pins by
-  fingerprint. ChairPhoto generates its own random `fingerprint` for sending.
+  means self-signed, the `reqwest` client both accepts the peer's certificate **and presents
+  one of its own**. Some peers require a client certificate and abort the handshake with
+  `certificate required` without it — observed on LocalSend mobile v2.2, where
+  `danger_accept_invalid_certs` alone is not enough because that governs only how we treat
+  *their* certificate. Peers that do not require one ignore it (verified against the desktop
+  app v2.1), so it is presented unconditionally rather than negotiated. The certificate is
+  self-signed, generated once per installation and stored under the app data directory
+  (`localsend-client-identity.pem`, `0600`); it authenticates nothing, since every
+  certificate in this protocol is self-signed and LocalSend pins by fingerprint. See
+  `localsend/identity.rs`. ChairPhoto generates its own random `fingerprint` for sending.
 
 ## Implementation
 

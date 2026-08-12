@@ -20,7 +20,12 @@ import {
   tidyRedundantTags,
   vacuumCatalog,
 } from "../modules/api";
-import { listModules, settingsPanelsForModule, useHost } from "../modules/host";
+import {
+  listModules,
+  settingsPanelsForModule,
+  useHostLifecycle,
+  useHostSettingsPanels,
+} from "../modules/host";
 import { VolumesSection } from "./VolumesPanel";
 import { ModulesSection } from "./ModulesPanel";
 
@@ -35,7 +40,10 @@ export function Preferences({
   /** Called after the library root is re-rooted, so the app can prompt a rescan. */
   onLibraryRootChanged: () => void;
 }) {
-  useHost(); // re-render when modules enable/disable or contribute settings
+  // Re-render when modules enable/disable (moduleTabs filters by m.enabled) or contribute
+  // settings panels (settingsPanelsForModule) — not on selection or other contribution types.
+  useHostLifecycle();
+  useHostSettingsPanels();
   const moduleTabs = listModules().filter(
     (m) => m.enabled && settingsPanelsForModule(m.id).length > 0,
   );

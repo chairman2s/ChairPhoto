@@ -6,6 +6,7 @@
 import { useCallback, useEffect, useState } from "react";
 import type { ChairPhotoAPI, ChairPhotoModule } from "../registry";
 import { listVersions, PhotoVersion } from "../api";
+import { useHostSelection } from "../host";
 
 // ── Backend commands (owned by this module) ───────────────────────────────────
 // Per the module contract, a module's own commands go through `ChairPhotoAPI.invoke`
@@ -47,6 +48,10 @@ interface PendingReview {
 }
 
 function InstagramForm({ api }: { api: ChairPhotoAPI }) {
+  // Rendered inside PublishDialog, which (issue #16) now subscribes only to
+  // contributions — it no longer re-renders on selection changes, so this form needs
+  // its own subscription to pick up the active photo/version.
+  useHostSelection();
   const photoId = api.getActivePhotoId();
   const [versions, setVersions] = useState<PhotoVersion[]>([]);
   const [versionId, setVersionId] = useState<number | null>(api.getActiveVersionId());

@@ -96,7 +96,7 @@ import {
   setSelection,
   toolbarActions,
   activateToolbarAction,
-  useHost,
+  useHostContributions,
 } from "./modules/host";
 import { BUNDLED_MODULES } from "./modules/bundled";
 import { Preferences } from "./components/Preferences";
@@ -124,7 +124,12 @@ const COLOR_KEYS: Record<string, string> = {
 };
 
 export default function App() {
-  useHost(); // re-render when modules contribute/remove views & other contributions
+  // App reads only contributions state (mainViews/activeEditRenderer/toolbarActions/
+  // panelsForSlot("loupe")) — it *writes* selection/filterContext/editingTag via
+  // setSelection/setHostActiveVersion/setFilterContext/setEditingTagContext but never
+  // reads them back, so a narrower subscription here (vs. the old useHost() union) means
+  // a selection change no longer re-renders App and its whole subtree (issue #16 AC1).
+  useHostContributions();
   const [ready, setReady] = useState(false);
   // Startup splash: the current boot stage (null = boot finished, splash fades out).
   const [bootStage, setBootStage] = useState<string | null>(BOOT_STAGES[0]);

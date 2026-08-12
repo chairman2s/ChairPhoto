@@ -1,12 +1,12 @@
 import { useEffect, useState } from "react";
 import { getModulesDir } from "../modules/api";
-import { disableModule, enableModule, listModules, useHost } from "../modules/host";
+import { disableModule, enableModule, listModules, useHostLifecycle } from "../modules/host";
 
 // Modules section (Preferences → Modules): enable/disable bundled modules and any
 // user-installed (external) modules discovered at startup. A module's own settings live
 // elsewhere (e.g. the AI tab); this is just the on/off registry.
 export function ModulesSection() {
-  useHost(); // re-render on module/contribution changes
+  useHostLifecycle(); // re-render on module enable/disable/registration changes
   const all = listModules();
   const bundled = all.filter((m) => !m.external);
   const external = all.filter((m) => m.external);

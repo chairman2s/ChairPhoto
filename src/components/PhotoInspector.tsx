@@ -118,7 +118,7 @@ import { MetadataPanel } from "./MetadataPanel";
 import { IptcPanel } from "./IptcPanel";
 import { VersionsPanel } from "./VersionsPanel";
 import { PublishedPanel } from "./PublishedPanel";
-import { panelsForSlot, useHost } from "../modules/host";
+import { panelsForSlot, useHostContributions } from "../modules/host";
 
 const LABELS = COLOR_LABELS;
 
@@ -467,7 +467,7 @@ export function PhotoInspector({
   const [storageMsg, setStorageMsg] = useState("");
   const [versionCount, setVersionCount] = useState(0);
   const [publications, setPublications] = useState<Publication[]>([]);
-  useHost(); // re-render when modules contribute/remove inspector panels
+  useHostContributions(); // re-render when modules contribute/remove inspector panels
 
   // Load the persisted time window once.
   useEffect(() => {

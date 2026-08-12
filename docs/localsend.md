@@ -69,6 +69,19 @@ on success — mirroring how `publishing.tsx` is shared by Flickr and SmugMug.
   The listener is released when the pass ends. See
   [`docs/adr/0001-localsend-register-listener.md`](adr/0001-localsend-register-listener.md)
   for why an inbound port is justified in a local-first app, and `localsend/register.rs`.
+- **Subnet sweep** — some devices never participate in multicast at all, and no amount of
+  listening finds them. Measured: an iPhone running LocalSend v2.2 answers `ping`, accepts TCP
+  on `:53317` in 6–49 ms and returns HTTP 200 from `/info`, while multicast discovery sees only
+  the desktop app on the sending machine. So each pass also sweeps the local subnet: a TCP
+  connect to `:53317` on every host address, then `GET /api/localsend/v2/info` on the few that
+  answer. Peers found this way are merged into the same result and deduped by fingerprint, so a
+  device that answers both paths still appears once.
+
+  It runs **on every pass, alongside multicast**, not as a fallback when multicast finds
+  nothing — on a machine that also runs the LocalSend desktop app, multicast never finds
+  nothing, so a fallback would never fire and the phone would stay invisible. It is bounded to
+  finish inside the discovery window described below, and the same deadline cuts it off if it
+  ever runs long, so it does not lengthen a Refresh. See `localsend/scan.rs`.
 - **HTTP base** `http(s)://<ip>:<port>/api/localsend/v2/…`:
   - `POST /prepare-upload` — body `{ info:<our device info>, files:{ <fileId>:{ id,
     fileName, size, fileType } } }` → `{ sessionId, files:{ <fileId>:<token> } }`. A
@@ -92,8 +105,10 @@ on success — mirroring how `publishing.tsx` is shared by Flickr and SmugMug.
 All I/O is in Rust. `src-tauri/src/localsend/mod.rs`, behind a `localsend` Cargo feature,
 reuses `reqwest` and does UDP through tokio:
 
-- `discover(timeout_ms) -> Vec<Device>` — multicast listen and announce, yielding
-  `Device { alias, deviceModel, deviceType, ip, port, protocol, fingerprint }`.
+- `discover(timeout_ms) -> Vec<Device>` — multicast listen and announce, plus a concurrent
+  subnet sweep, yielding `Device { alias, deviceModel, deviceType, ip, port, protocol,
+  fingerprint }`. The three sources (UDP announcement, register POST, sweep) feed one channel
+  and one dedupe map, so each peer yields one `Device` however many ways it was heard.
 - `send_files(device, [paths], pin?)` — prepare-upload then per-file upload, emitting a
   `localsend:progress` event stream like card import.
 
@@ -117,6 +132,14 @@ port, join the real multicast group, and send/receive real datagrams over loopba
 `#[cfg(test)] mod tests` doc comments in `src-tauri/src/localsend/mod.rs` for what that costs
 (serialized against each other and against a co-resident LocalSend desktop app) and how it's
 kept hermetic (loopback only, never the LAN).
+
+The sweep keeps that hermeticity: its subnet arithmetic and info-body parsing are pure
+functions with no network at all, and the end-to-end tests drive it against a loopback stub on
+an ephemeral port. The multicast tests pass an explicitly empty target list, so `cargo test`
+never sweeps the developer's real network. One test (`discover_returns_a_device_found_only_by_
+the_subnet_sweep`) exists purely to fail if the sweep is ever dropped from `discover_on` —
+without it, the feature could be deleted from the wiring and every other test would stay
+green.
 
 ## Snapchat
 
@@ -178,4 +201,27 @@ since a 0.x bump is treated as breaking. See [plugin-system.md](plugin-system.md
   published spec and should be sanity-checked against the current LocalSend protocol
   version on first real send.
 - The protocol can drift between LocalSend versions; this implementation targets v2.
-- Multicast is blocked on some networks — the manual-IP path is the fallback.
+- Multicast is blocked on some networks. The subnet sweep covers most of what that used to
+  cost; manual IP remains the last resort, for a peer on a non-default port or on another
+  subnet.
+- The sweep probes the well-known port only. A peer that has moved off `:53317` is found by
+  multicast or by manual IP, not by the sweep.
+
+## Privacy posture
+
+ChairPhoto is local-first, and discovery is the one place it speaks to the network without
+being asked to send something. What that involves, precisely:
+
+- **Multicast announcement** — the alias `ChairPhoto`, a randomly generated per-run
+  fingerprint, and a port. Group-addressed, so it reaches the local link only.
+- **Subnet sweep** — a TCP connection attempt to `:53317` on each address in the interface's
+  own subnet, and nothing else until a host answers. A host that is absent or running something
+  unrelated receives one connect and is never contacted again; only a host that returns a valid
+  LocalSend `/info` body becomes a device.
+- **Where it will not go.** The sweep is confined to the local link by construction. Loopback
+  and point-to-point interfaces are excluded, so a VPN or tunnel subnet is never swept, and any
+  network wider than a /24 is declined outright rather than sampled — a decision logged with
+  its reason, not silent. No catalog data, photo, or filename is sent at any point in
+  discovery.
+- **Sending is still separate and still explicit.** Discovery finding a device does nothing on
+  its own; photos leave only when you pick that device and send.

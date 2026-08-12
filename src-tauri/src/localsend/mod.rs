@@ -24,6 +24,7 @@ use tokio::net::UdpSocket;
 
 mod identity;
 mod register;
+mod scan;
 
 /// LocalSend's well-known multicast group + port for discovery announcements.
 const MULTICAST_ADDR: Ipv4Addr = Ipv4Addr::new(224, 0, 0, 167);
@@ -194,27 +195,48 @@ fn parse_announcement(json: &str, ip: &str, our_fingerprint: &str) -> Option<Dev
 /// (5s) worst case for one Refresh — up from the previous single-announcement design's ~2.5s,
 /// traded for actually being able to hear back on wifi.
 ///
+/// Concurrently with all of that, sweeps the local subnet for peers that never answer
+/// multicast at all (issue #58, [`scan`]) — an iPhone running LocalSend v2.2 is reachable on
+/// `:53317` and silent on multicast, so the announce/reply protocol alone cannot see it. The
+/// sweep is bounded well inside the window above and adds nothing to the worst case; in the
+/// pathological case where it would run long, the same deadline cuts it off, so this
+/// function's duration is set by the deadline either way. Multicast stays primary: the sweep
+/// only adds peers, and a peer that answers both paths is deduped to one device.
+///
 /// Deduped by fingerprint (falling back to ip:port when a peer omits a fingerprint). Tolerant
-/// of a blocked/degraded multicast join — that yields an empty list rather than an error, and
-/// the manual-IP path is the fallback (handled in LS2/LS3); see [`announce_on_interfaces`] for
-/// why a degraded join still announces. Socket setup and join/announce failures are still
-/// surfaced (logged), so a persistently empty list is diagnosable instead of indistinguishable
-/// from "no peers answered".
+/// of a blocked/degraded multicast join — that yields whatever the sweep found rather than an
+/// error, with the manual-IP path (handled in LS2/LS3) as the last resort; see
+/// [`announce_on_interfaces`] for why a degraded join still announces. Socket setup and
+/// join/announce failures are still surfaced (logged), as is any subnet the sweep declines, so
+/// a persistently empty list is diagnosable instead of indistinguishable from "no peers
+/// answered".
 pub async fn discover(timeout_ms: u64) -> Result<Vec<Device>, String> {
-    discover_on(timeout_ms, MULTICAST_PORT, &local_multicast_interfaces()).await
+    discover_on(
+        timeout_ms,
+        MULTICAST_PORT,
+        &local_multicast_interfaces(),
+        &scan_targets(),
+    )
+    .await
 }
 
-/// As [`discover`], but taking the local bind port and interface list as parameters instead of
-/// reaching for [`MULTICAST_PORT`] / [`local_multicast_interfaces`] itself — mirrors
-/// [`join_multicast_on_all_interfaces`]'s own testability seam. `discover()` always passes
-/// `MULTICAST_PORT`; tests pass `0` (an ephemeral port) and a loopback-only interface list, so
-/// the whole join/burst/collect sequence is exercisable against a same-host peer without
-/// depending on real network hardware or contending with whatever else may hold the well-known
-/// port on the host running the test.
+/// As [`discover`], but taking the local bind port, interface list and sweep targets as
+/// parameters instead of reaching for [`MULTICAST_PORT`] / [`local_multicast_interfaces`] /
+/// [`scan_targets`] itself — mirrors [`join_multicast_on_all_interfaces`]'s own testability
+/// seam. `discover()` always passes `MULTICAST_PORT`; tests pass `0` (an ephemeral port) and a
+/// loopback-only interface list, so the whole join/burst/collect sequence is exercisable
+/// against a same-host peer without depending on real network hardware or contending with
+/// whatever else may hold the well-known port on the host running the test.
+///
+/// `scan_targets` is separate from `interfaces` because the two qualify differently
+/// ([`interface_flags_qualify`] vs [`interface_flags_qualify_for_scan`]) and because the
+/// multicast tests must be able to pass an empty sweep: sweeping the developer's real subnet
+/// on every `cargo test` would break their hermeticity claim outright.
 async fn discover_on(
     timeout_ms: u64,
     bind_port: u16,
     interfaces: &[Ipv4Addr],
+    scan_targets: &[SocketAddrV4],
 ) -> Result<Vec<Device>, String> {
     let our_fp = fingerprint();
 
@@ -254,13 +276,17 @@ async fn discover_on(
 
     let announcement = our_info_with_port(&our_fp, true, advertised_port);
 
-    // Peers now reach us two ways: a UDP `announce:false` datagram on the shared socket, or an
-    // HTTP register POST on the listener above. Both feed the same `seen` map. Rather than have
-    // two futures contend for a mutable borrow of `seen`, both *send* on one channel and a
-    // single `collect` future owns the map and drains it. That also keeps the dedupe rule in
-    // one place, so a peer heard on both paths still yields one Device.
+    // Peers now reach us three ways: a UDP `announce:false` datagram on the shared socket, an
+    // HTTP register POST on the listener above, or the subnet sweep below finding them without
+    // their participation at all. All feed the same `seen` map. Rather than have three futures
+    // contend for a mutable borrow of `seen`, each *sends* on one channel and a single
+    // `collect` future owns the map and drains it. That also keeps the dedupe rule in one
+    // place, so a peer heard on more than one path still yields one Device — which the sweep
+    // makes routine rather than incidental, since any peer that does answer multicast is also
+    // sitting on an open :53317 for the sweep to find.
     let (found_tx, mut found_rx) = tokio::sync::mpsc::unbounded_channel::<Device>();
     let udp_tx = found_tx.clone();
+    let scan_tx = found_tx.clone();
 
     let mut seen: HashMap<String, Device> = HashMap::new();
 
@@ -312,6 +338,13 @@ async fn discover_on(
         }
     };
 
+    // The subnet-scan half (issue #58): reaches peers that never answer multicast at all.
+    // Concurrent with the burst rather than a fallback after it — see [`scan`]'s module docs
+    // for why an "only when multicast found nothing" trigger would never fire on the machine
+    // this was reported from. It shares the deadline below and is bounded well inside it, so
+    // the worst case this function documents is unchanged.
+    let subnet_scan = scan::run(scan_targets, &our_fp, scan_tx);
+
     // Collect indefinitely; the outer `timeout` below is what bounds it.
     let collect = async {
         while let Some(dev) = found_rx.recv().await {
@@ -324,10 +357,12 @@ async fn discover_on(
         }
     };
 
-    // Everything that listens, as one future, so `burst_and_collect`'s two-argument shape (and
+    // Every source of peers, as one future, so `burst_and_collect`'s two-argument shape (and
     // the guarantee its doc comment makes about concurrent progress) still describes what runs.
+    // Two of the three listen and one probes, but they are alike in the way that matters here:
+    // each must make progress from the first poll rather than wait its turn.
     let collect = async {
-        tokio::join!(udp_collect, serve_register, collect);
+        tokio::join!(udp_collect, serve_register, subnet_scan, collect);
     };
 
     // Bounded total: the burst span plus a reply window past the last announcement (see the
@@ -473,23 +508,28 @@ fn announce_on_interfaces(socket: &UdpSocket, joined: &[Ipv4Addr], announcement:
     }
 }
 
-/// Every IPv4 address on this host whose interface qualifies per [`interface_flags_qualify`]
-/// (up, running, multicast-capable, neither loopback nor point-to-point), via `getifaddrs(3)`.
-/// Never errors: enumeration failures or a host with nothing qualifying return an empty list,
-/// and callers fall back to the pre-existing `Ipv4Addr::UNSPECIFIED` join in that case.
+/// Every IPv4 address on this host, paired with its netmask and its interface's flags, via
+/// `getifaddrs(3)`. One `unsafe` walk shared by both consumers rather than two near-identical
+/// ones: [`local_multicast_interfaces`] needs only the addresses, [`local_ipv4_networks`] needs
+/// the masks as well. Filtering is left to them, since they qualify interfaces differently.
+///
+/// Never errors: enumeration failure returns an empty list, and each caller documents its own
+/// fallback for that case.
 #[cfg(unix)]
-fn local_multicast_interfaces() -> Vec<Ipv4Addr> {
+fn local_ipv4_interfaces() -> Vec<(Ipv4Addr, Option<Ipv4Addr>, u32)> {
     let mut result = Vec::new();
     // SAFETY: `getifaddrs` either returns non-zero and leaves `head` untouched (the null we
     // initialized it with, which we then don't dereference), or returns 0 and sets `head` to
     // the first node of a valid linked list that must be freed with `freeifaddrs`. We only
-    // read fields `getifaddrs(3)` documents as always present on a returned node, and we free
-    // the list exactly once, on every path that obtained one.
+    // read fields `getifaddrs(3)` documents as always present on a returned node — plus
+    // `ifa_netmask`, which it documents as *possibly null* and which is null-checked below —
+    // and we free the list exactly once, on every path that obtained one.
     unsafe {
         let mut head: *mut libc::ifaddrs = std::ptr::null_mut();
         if libc::getifaddrs(&mut head) != 0 {
             eprintln!(
-                "localsend: getifaddrs failed ({}); joining only via the OS-picked interface",
+                "localsend: getifaddrs failed ({}); joining only via the OS-picked interface \
+                 and skipping the subnet scan",
                 std::io::Error::last_os_error()
             );
             return result;
@@ -499,7 +539,7 @@ fn local_multicast_interfaces() -> Vec<Ipv4Addr> {
             let ifa = &*cur;
             cur = ifa.ifa_next;
 
-            if !interface_flags_qualify(ifa.ifa_flags as u32) || ifa.ifa_addr.is_null() {
+            if ifa.ifa_addr.is_null() {
                 continue;
             }
             if (*ifa.ifa_addr).sa_family as i32 != libc::AF_INET {
@@ -507,11 +547,57 @@ fn local_multicast_interfaces() -> Vec<Ipv4Addr> {
             }
             let sin = ifa.ifa_addr as *const libc::sockaddr_in;
             let addr = Ipv4Addr::from(u32::from_be((*sin).sin_addr.s_addr));
-            if !result.contains(&addr) {
-                result.push(addr);
-            }
+
+            // An interface with no netmask (some tunnels) contributes no scannable network but
+            // is still a valid multicast target, so this is `None` rather than a `continue`.
+            // The family check is what Linux guarantees for an AF_INET entry; a platform that
+            // zeroes it instead loses only the scan on that interface, which is a documented
+            // degradation rather than a wrong answer.
+            let netmask = if ifa.ifa_netmask.is_null()
+                || (*ifa.ifa_netmask).sa_family as i32 != libc::AF_INET
+            {
+                None
+            } else {
+                let mask = ifa.ifa_netmask as *const libc::sockaddr_in;
+                Some(Ipv4Addr::from(u32::from_be((*mask).sin_addr.s_addr)))
+            };
+
+            result.push((addr, netmask, ifa.ifa_flags as u32));
         }
         libc::freeifaddrs(head);
+    }
+    result
+}
+
+/// Every IPv4 address on this host whose interface qualifies per [`interface_flags_qualify`]
+/// (up, running, multicast-capable, neither loopback nor point-to-point).
+/// Never errors: a host with nothing qualifying returns an empty list, and callers fall back
+/// to the pre-existing `Ipv4Addr::UNSPECIFIED` join in that case.
+#[cfg(unix)]
+fn local_multicast_interfaces() -> Vec<Ipv4Addr> {
+    let mut result = Vec::new();
+    for (addr, _, flags) in local_ipv4_interfaces() {
+        if interface_flags_qualify(flags) && !result.contains(&addr) {
+            result.push(addr);
+        }
+    }
+    result
+}
+
+/// Every `(address, netmask)` on this host whose interface qualifies for a subnet sweep per
+/// [`interface_flags_qualify_for_scan`]. Interfaces with no netmask are dropped: without one
+/// there is no subnet to derive.
+#[cfg(unix)]
+fn local_ipv4_networks() -> Vec<(Ipv4Addr, Ipv4Addr)> {
+    let mut result = Vec::new();
+    for (addr, netmask, flags) in local_ipv4_interfaces() {
+        if !interface_flags_qualify_for_scan(flags) {
+            continue;
+        }
+        let Some(netmask) = netmask else { continue };
+        if !result.contains(&(addr, netmask)) {
+            result.push((addr, netmask));
+        }
     }
     result
 }
@@ -534,12 +620,29 @@ fn local_multicast_interfaces() -> Vec<Ipv4Addr> {
 /// point-to-point link doesn't reach a LAN peer and only adds noise.
 #[cfg(unix)]
 fn interface_flags_qualify(flags: u32) -> bool {
+    interface_flags_qualify_for_scan(flags) && flags & (libc::IFF_MULTICAST as u32) != 0
+}
+
+/// Whether an interface carrying `flags` qualifies for a **subnet sweep** (issue #58): up,
+/// carrier-present, and neither loopback nor point-to-point — [`interface_flags_qualify`]
+/// minus the multicast requirement.
+///
+/// Dropping `IFF_MULTICAST` is the entire point of the sweep rather than an oversight: it
+/// exists to reach peers multicast does not, and an interface that cannot join a group can
+/// still carry a TCP connection to a peer on its subnet. Every other exclusion is kept, and
+/// each is load-bearing here for a reason the multicast join does not have:
+///
+/// - **loopback** — sweeping 127.0.0.0/8 probes only this machine;
+/// - **point-to-point** — a VPN/tunnel subnet is not the user's LAN, and sweeping one sends
+///   connects to an operator's network. This is the check that keeps the privacy posture in
+///   this module's docs true.
+#[cfg(unix)]
+fn interface_flags_qualify_for_scan(flags: u32) -> bool {
     let up = flags & (libc::IFF_UP as u32) != 0;
     let running = flags & (libc::IFF_RUNNING as u32) != 0;
-    let multicast = flags & (libc::IFF_MULTICAST as u32) != 0;
     let loopback = flags & (libc::IFF_LOOPBACK as u32) != 0;
     let point_to_point = flags & (libc::IFF_POINTOPOINT as u32) != 0;
-    up && running && multicast && !loopback && !point_to_point
+    up && running && !loopback && !point_to_point
 }
 
 /// No `getifaddrs`-equivalent is wired up for non-unix targets — falls back to the
@@ -547,6 +650,43 @@ fn interface_flags_qualify(flags: u32) -> bool {
 #[cfg(not(unix))]
 fn local_multicast_interfaces() -> Vec<Ipv4Addr> {
     Vec::new()
+}
+
+/// Likewise, no interface enumeration on non-unix targets, so there is no subnet to derive and
+/// the sweep contributes nothing. Multicast discovery and the manual-IP path are unaffected.
+#[cfg(not(unix))]
+fn local_ipv4_networks() -> Vec<(Ipv4Addr, Ipv4Addr)> {
+    Vec::new()
+}
+
+/// Every address the subnet sweep should probe on this host: the union of each qualifying
+/// interface's host range, minus our own addresses.
+///
+/// Deduped across interfaces, and filtered against *all* local addresses rather than only the
+/// one [`scan::subnet_hosts`] was called with — a host with two addresses on the same subnet
+/// would otherwise probe itself through the other. A network the sweep declines is logged
+/// once per pass with the reason, so an empty scan is diagnosable rather than
+/// indistinguishable from "nothing answered", matching how [`discover`] treats join failures.
+fn scan_targets() -> Vec<SocketAddrV4> {
+    let networks = local_ipv4_networks();
+    let ours: Vec<Ipv4Addr> = networks.iter().map(|(addr, _)| *addr).collect();
+    let mut hosts = Vec::new();
+    for (addr, netmask) in &networks {
+        match scan::subnet_hosts(*addr, *netmask) {
+            Some(found) => hosts.extend(found),
+            None => eprintln!(
+                "localsend: not sweeping {addr}/{netmask} — wider than a /24, or no usable \
+                 host range; multicast and the manual-IP path still cover that interface"
+            ),
+        }
+    }
+    hosts.sort_unstable();
+    hosts.dedup();
+    hosts.retain(|host| !ours.contains(host));
+    hosts
+        .into_iter()
+        .map(|host| SocketAddrV4::new(host, scan::SCAN_PORT))
+        .collect()
 }
 
 /// Build the prepare-upload request body: `{ info, files: { <fileId>: { id, fileName, size,
@@ -828,6 +968,15 @@ mod tests {
         NETWORK_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// No subnet sweep, for the multicast tests below.
+    ///
+    /// Not incidental: their hermeticity claim — loopback only, never the LAN — would be false
+    /// if `discover_on` swept this machine's real subnet, and a suite that quietly port-scans
+    /// the developer's network on every `cargo test` is exactly what the sweep's privacy
+    /// posture rules out. `scan`'s own tests drive the sweep against a loopback stub on an
+    /// ephemeral port instead.
+    const NO_SCAN: &[SocketAddrV4] = &[];
+
     /// Test-only "fake LocalSend peer": joins the multicast group on loopback and binds
     /// [`MULTICAST_PORT`] (reuse-enabled, via the same [`open_reusable_udp_socket`] production
     /// uses, so it coexists with `discover_on`'s own socket and with anything real already on
@@ -967,6 +1116,72 @@ mod tests {
         assert!(!interface_flags_qualify(0));
     }
 
+    #[test]
+    #[cfg(unix)]
+    fn scan_qualification_drops_multicast_but_keeps_every_other_exclusion() {
+        let up = libc::IFF_UP as u32;
+        let running = libc::IFF_RUNNING as u32;
+        let multicast = libc::IFF_MULTICAST as u32;
+        let loopback = libc::IFF_LOOPBACK as u32;
+        let p2p = libc::IFF_POINTOPOINT as u32;
+
+        // The difference that makes the sweep worth having: an interface that cannot join a
+        // multicast group can still carry a TCP connection to a peer on its subnet.
+        assert!(
+            interface_flags_qualify_for_scan(up | running),
+            "a non-multicast interface must still be swept"
+        );
+        assert!(
+            !interface_flags_qualify(up | running),
+            "...and must still be excluded from the multicast join, unchanged by #58"
+        );
+
+        // Everything else is kept, and these two are what keep the documented privacy posture
+        // true rather than aspirational.
+        assert!(
+            !interface_flags_qualify_for_scan(up | running | multicast | loopback),
+            "sweeping loopback would probe only this machine"
+        );
+        assert!(
+            !interface_flags_qualify_for_scan(up | running | multicast | p2p),
+            "sweeping a VPN/tunnel subnet sends connects into an operator's network, which is \
+             exactly what this module's docs promise it does not do"
+        );
+        assert!(!interface_flags_qualify_for_scan(up), "carrier-down must not be swept");
+        assert!(!interface_flags_qualify_for_scan(running), "a down interface must not be swept");
+        assert!(!interface_flags_qualify_for_scan(0));
+
+        // The relationship the refactor rests on: multicast qualification is scan
+        // qualification plus IFF_MULTICAST, so the join can never widen without this noticing.
+        for flags in 0u32..64 {
+            assert_eq!(
+                interface_flags_qualify(flags),
+                interface_flags_qualify_for_scan(flags) && flags & multicast != 0,
+                "flags {flags:#b} disagree"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn scan_targets_never_includes_our_own_addresses_or_loopback() {
+        // Host-dependent, so it asserts the invariants rather than a specific list — the same
+        // shape as `local_multicast_interfaces_never_includes_loopback_or_unspecified`, and
+        // for the same reason: the developer's real interfaces are not a fixture.
+        let ours: Vec<Ipv4Addr> = local_ipv4_networks().into_iter().map(|(a, _)| a).collect();
+        for target in scan_targets() {
+            let ip = *target.ip();
+            assert!(
+                !ours.contains(&ip),
+                "{ip} is one of this host's own addresses; sweeping it probes ourselves"
+            );
+            assert!(!ip.is_loopback(), "{ip} is loopback");
+            assert!(!ip.is_unspecified(), "{ip} is 0.0.0.0");
+            assert!(!ip.is_broadcast(), "{ip} is 255.255.255.255");
+            assert_eq!(target.port(), scan::SCAN_PORT, "sweep must target the LocalSend port");
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn local_multicast_interfaces_never_includes_loopback_or_unspecified() {
@@ -1036,7 +1251,7 @@ mod tests {
     // calling `discover`/`discover_on`, so it could not regress with the code it was meant to
     // guard. The tests below drive `discover_on` itself against a loopback fake peer.
     //
-    // `discover_on(_, 0, &[Ipv4Addr::LOCALHOST])`'s own worst case is `(ANNOUNCE_BURST_COUNT -
+    // `discover_on(_, 0, &[Ipv4Addr::LOCALHOST], NO_SCAN)`'s own worst case is `(ANNOUNCE_BURST_COUNT -
     // 1) * ANNOUNCE_BURST_INTERVAL + timeout_ms` = 2 * 1250ms + 200ms = 2700ms; the peer's own
     // collect window below is given headroom past that.
     //
@@ -1071,7 +1286,7 @@ mod tests {
             return;
         }
 
-        let discover_fut = discover_on(200, 0, &[Ipv4Addr::LOCALHOST]);
+        let discover_fut = discover_on(200, 0, &[Ipv4Addr::LOCALHOST], NO_SCAN);
         let collect_fut = collect_on_loopback(Duration::from_millis(3200));
         let (devices, received) = tokio::join!(discover_fut, collect_fut);
         devices.expect("discover_on must not error");
@@ -1119,7 +1334,7 @@ mod tests {
         let expected_burst_span = Duration::from_millis(2500);
 
         let started = std::time::Instant::now();
-        discover_on(50, 0, &[Ipv4Addr::LOCALHOST])
+        discover_on(50, 0, &[Ipv4Addr::LOCALHOST], NO_SCAN)
             .await
             .expect("discover_on must not error");
         let elapsed = started.elapsed();
@@ -1291,7 +1506,7 @@ mod tests {
             Some((advertised, String::from_utf8_lossy(&response).into_owned()))
         });
 
-        let devices = discover_on(1500, 0, &[Ipv4Addr::LOCALHOST])
+        let devices = discover_on(1500, 0, &[Ipv4Addr::LOCALHOST], NO_SCAN)
             .await
             .expect("discover_on must not error");
         let (advertised, response) = peer_task
@@ -1368,7 +1583,7 @@ mod tests {
         });
 
         // Needs the real MULTICAST_PORT for the same reason as the round-trip test below.
-        let devices = discover_on(500, MULTICAST_PORT, &[Ipv4Addr::LOCALHOST])
+        let devices = discover_on(500, MULTICAST_PORT, &[Ipv4Addr::LOCALHOST], NO_SCAN)
             .await
             .expect("discover_on must not error");
         peer_task.await.expect("peer task must not panic");
@@ -1443,7 +1658,7 @@ mod tests {
         // it, no matter how correct the rest of the round trip is. `open_reusable_udp_socket`'s
         // SO_REUSEADDR/SO_REUSEPORT is what lets this coexist with the peer above and with the
         // real background LocalSend app, all three bound to 53317 at once.
-        let devices = discover_on(500, MULTICAST_PORT, &[Ipv4Addr::LOCALHOST])
+        let devices = discover_on(500, MULTICAST_PORT, &[Ipv4Addr::LOCALHOST], NO_SCAN)
             .await
             .expect("discover_on must not error");
         peer_task.await.expect("peer task must not panic");
@@ -1453,6 +1668,65 @@ mod tests {
             "expected the loopback peer's reply to show up as a discovered Device, got: \
              {devices:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn discover_returns_a_device_found_only_by_the_subnet_sweep() {
+        // The wiring guard for #58. `scan`'s own tests prove the sweep finds a peer; this
+        // proves `discover_on` actually *runs* it and folds the result into what it returns.
+        // Without this, deleting `subnet_scan` from the `join!` would leave the whole suite
+        // green while the feature did nothing — the sweep's unit tests would still pass,
+        // because they call `scan::run` directly.
+        //
+        // The stub speaks only HTTP on an ephemeral port and never touches multicast, which is
+        // exactly the peer shape this issue is about: reachable, and silent on the announce/
+        // reply protocol.
+        let _guard = lock_network_tests();
+
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind a loopback stub");
+        let port = listener.local_addr().unwrap().port();
+        let stub = tokio::spawn(async move {
+            let body = r#"{"alias":"Sweep Only Phone","fingerprint":"sweep-fp","version":"2.0"}"#;
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    use tokio::io::AsyncWriteExt;
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                         Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                    let _ = stream.shutdown().await;
+                });
+            }
+        });
+
+        // Ephemeral UDP port: this test asserts nothing about multicast, and binding 0 keeps it
+        // off the well-known port entirely rather than contending for it.
+        let devices = discover_on(
+            200,
+            0,
+            &[Ipv4Addr::LOCALHOST],
+            &[SocketAddrV4::new(Ipv4Addr::LOCALHOST, port)],
+        )
+        .await
+        .expect("discover_on must not error");
+        stub.abort();
+
+        let found = devices
+            .iter()
+            .find(|d| d.alias == "Sweep Only Phone")
+            .expect("the swept peer must be in discover_on's result");
+        assert_eq!(found.fingerprint, "sweep-fp");
+        assert_eq!(found.ip, "127.0.0.1");
+        assert_eq!(found.port, port, "the device must carry the port it was found on");
+        assert_eq!(found.protocol, "http");
     }
 
     #[tokio::test]

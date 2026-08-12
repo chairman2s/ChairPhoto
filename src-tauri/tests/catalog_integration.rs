@@ -1089,6 +1089,93 @@ fn reconcile_missing_hides_orphans_but_spares_offline_backups() {
     assert!(visible.contains(&offline_id), "offline NAS photo is spared (has a backup)");
 }
 
+/// A scan reconciles the `missing` flag for the folder it walked — including rows whose
+/// file has been deleted since last time, which the walk by definition never sees — and
+/// leaves the rest of the catalog alone. Reconciling everything made each scan an
+/// O(total photos) stat pass over storage the scan never looked at.
+#[test]
+fn scan_reconciles_the_scanned_folder_and_leaves_the_rest_of_the_catalog_alone() {
+    let (catalog, root) = temp_catalog("scan-scope-reconcile");
+    let abort = chairphoto_lib::scanner::never_abort();
+    let trip = root.join("trip");
+    let other = root.join("other");
+    std::fs::create_dir_all(&trip).unwrap();
+    std::fs::create_dir_all(&other).unwrap();
+    let in_scope = trip.join("a.jpg");
+    let out_of_scope = other.join("b.jpg");
+    std::fs::write(&in_scope, b"x").unwrap();
+    std::fs::write(&out_of_scope, b"x").unwrap();
+
+    chairphoto_lib::scanner::scan_folder(&catalog, &root, &abort, &|_| {}).unwrap();
+    let visible = |catalog: &Catalog| -> Vec<String> {
+        catalog
+            .list_photos(None, None, None, &[], "all", None, "all", None, None, &[], None)
+            .unwrap()
+            .into_iter()
+            .map(|p| p.path)
+            .collect()
+    };
+    assert_eq!(visible(&catalog).len(), 2, "both photos indexed");
+
+    // Both files disappear, but only `trip` is re-scanned.
+    std::fs::remove_file(&in_scope).unwrap();
+    std::fs::remove_file(&out_of_scope).unwrap();
+    chairphoto_lib::scanner::scan_folder(&catalog, &trip, &abort, &|_| {}).unwrap();
+
+    let after = visible(&catalog);
+    assert!(
+        !after.contains(&"trip/a.jpg".to_string()),
+        "the scanned folder's vanished row is hidden: {after:?}"
+    );
+    assert!(
+        after.contains(&"other/b.jpg".to_string()),
+        "a folder this scan never walked is not reconciled: {after:?}"
+    );
+
+    // Scanning the parent covers both, so nothing is permanently stranded.
+    chairphoto_lib::scanner::scan_folder(&catalog, &root, &abort, &|_| {}).unwrap();
+    assert!(visible(&catalog).is_empty());
+}
+
+/// The offline-NAS case at the scan boundary: a photo whose only copy is a backup on an
+/// unmounted volume sits squarely in the scanned scope, and reconciliation must still
+/// spare it. Unmounted storage is a normal state, not a missing row (AGENTS.md).
+#[test]
+fn scan_reconciliation_spares_an_offline_nas_photo_in_scope() {
+    let (catalog, root) = temp_catalog("scan-scope-offline-nas");
+    let abort = chairphoto_lib::scanner::never_abort();
+    let archived = root.join("trip/archived.jpg");
+    std::fs::create_dir_all(archived.parent().unwrap()).unwrap();
+    std::fs::write(&archived, b"x").unwrap();
+    let id = catalog.upsert_photo(&archived, None, 1, 1).unwrap().id;
+
+    // Offload it: the bytes now live only on a NAS volume whose mount point is absent.
+    std::fs::remove_file(&archived).unwrap();
+    let nas = catalog
+        .add_volume(
+            "NAS",
+            &root.parent().unwrap().join("nas-not-mounted"),
+            VolumeKind::Backup,
+        )
+        .unwrap();
+    catalog
+        .add_location(id, nas, "trip/archived.jpg", LocationRole::Backup)
+        .unwrap();
+
+    chairphoto_lib::scanner::scan_folder(&catalog, &root.join("trip"), &abort, &|_| {}).unwrap();
+
+    let visible: Vec<i64> = catalog
+        .list_photos(None, None, None, &[], "all", None, "all", None, None, &[], None)
+        .unwrap()
+        .into_iter()
+        .map(|p| p.id)
+        .collect();
+    assert!(
+        visible.contains(&id),
+        "an offline NAS photo in the scanned scope stays visible"
+    );
+}
+
 #[test]
 fn recently_used_tags_tracks_manual_use_and_excludes_auto_tags() {
     let (catalog, root) = temp_catalog("recently-used");

@@ -61,7 +61,11 @@ and compare:
   as the grid refresh path: volume-health reachability, storage statuses, and version counts.
 - `resolver`: sampled candidate-path and resolved-path counts, including offline backup candidates.
 - `pendingEnrichment`: queued rows versus rows loadable through the resolver.
-- `reconcile`: rows checked by `reconcile_missing` and resulting missing count.
+- `reconcileScannedScope`: what a scan's finalizing pass costs — the scope query
+  (`photo_ids_under` over one seeded year folder) plus `reconcile_missing_for` over just
+  that scope, with the scope size against the catalog size.
+- `reconcile`: rows checked by the whole-catalog `reconcile_missing` (explicit maintenance,
+  no longer run by every scan) and resulting missing count.
 
 By default the harness reports thresholds without enforcing them. Set
 `CHAIRPHOTO_PERF_ENFORCE_THRESHOLDS=1` when you want a local run to fail on a clear regression.

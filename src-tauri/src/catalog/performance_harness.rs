@@ -172,6 +172,32 @@ fn large_catalog_shape() {
         },
     );
 
+    // What a scan's finalizing pass costs now: one year-folder of the seeded
+    // `YYYY/MM/DD` tree (the scanned scope), not the whole catalog.
+    let scanned_folder = temp.photo_root.join("2020");
+    let scoped_reconcile = required_operation(
+        &mut operations,
+        &config,
+        Operation::ReconcileMissingScannedScope,
+        || {
+            let scope = catalog.photo_ids_under(&scanned_folder)?;
+            let rows_changed = catalog.reconcile_missing_for(&scope)?;
+            let summary = ScopedReconcileSummary {
+                scanned_folder: scanned_folder.display().to_string(),
+                scope_photo_ids: scope.len(),
+                catalog_photos: config.photo_count,
+                rows_changed,
+            };
+            let payload = measurement_payload(
+                Operation::ReconcileMissingScannedScope,
+                json!({ "scannedFolder": summary.scanned_folder }),
+                &summary,
+            );
+            let rows = summary.scope_photo_ids;
+            Ok(Measured::new(summary, Some(rows), Some(payload)))
+        },
+    );
+
     let reconcile = required_operation(
         &mut operations,
         &config,
@@ -213,6 +239,7 @@ fn large_catalog_shape() {
         grid_badges_all_returned_ids: all_badges,
         resolver,
         pending_enrichment,
+        reconcile_scanned_scope: scoped_reconcile,
         reconcile,
         operations,
     };
@@ -278,6 +305,7 @@ struct HarnessReport {
     grid_badges_all_returned_ids: BadgeSummary,
     resolver: ResolverSummary,
     pending_enrichment: PendingSummary,
+    reconcile_scanned_scope: ScopedReconcileSummary,
     reconcile: ReconcileSummary,
     operations: Vec<OperationMetric>,
 }
@@ -358,6 +386,7 @@ enum Operation {
     GridBadgesAllReturnedIds,
     ResolverSample,
     LoadPendingEnrichment,
+    ReconcileMissingScannedScope,
     ReconcileMissing,
 }
 
@@ -390,6 +419,9 @@ impl Operation {
             Operation::ResolverSample => OperationInfo::fixed("resolver_sample", 10_000.0),
             Operation::LoadPendingEnrichment => {
                 OperationInfo::scaled("load_pending_enrichment", 60_000.0)
+            }
+            Operation::ReconcileMissingScannedScope => {
+                OperationInfo::scaled("reconcile_missing_scanned_scope", 60_000.0)
             }
             Operation::ReconcileMissing => OperationInfo::scaled("reconcile_missing", 180_000.0),
         }
@@ -546,6 +578,17 @@ struct PendingSummary {
 struct ReconcileSummary {
     photos_checked: usize,
     missing_after_reconcile: usize,
+}
+
+/// What one scan's finalizing pass now costs: the scope query plus the reconciliation of
+/// just that scope, against the whole-catalog pass measured separately.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ScopedReconcileSummary {
+    scanned_folder: String,
+    scope_photo_ids: usize,
+    catalog_photos: usize,
+    rows_changed: usize,
 }
 
 struct TempCatalog {

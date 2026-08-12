@@ -73,9 +73,15 @@ impl ScanProgress {
 /// `imported` is the `(path, photo_id, needs_extract)` list built by the walk;
 /// `folder_id` is the scanned folder's catalog id for the local scan (so Phase B can
 /// mark the scan finished), or `None` for a NAS in-place scan (which tracks no folder).
+///
+/// `scope_root` is the folder that was walked. Phase B reconciles the `missing` flag for
+/// the catalog rows under it — including rows whose file was deleted since the last scan,
+/// which the walk by definition never sees. `None` (the enrichment-resume path) means the
+/// scope is just the photos in `imported`, since no folder was walked.
 pub struct PendingEnrich {
     pub imported: Vec<(PathBuf, i64, bool)>,
     pub folder_id: Option<i64>,
+    pub scope_root: Option<PathBuf>,
 }
 
 /// A never-aborting flag, for callers (tests, one-shot indexing) that don't drive a
@@ -98,7 +104,7 @@ pub fn resume_pending_enrichment(catalog: &Catalog) -> Result<Option<PendingEnri
     if imported.is_empty() {
         return Ok(None);
     }
-    Ok(Some(PendingEnrich { imported, folder_id: None }))
+    Ok(Some(PendingEnrich { imported, folder_id: None, scope_root: None }))
 }
 
 pub fn is_raw(path: &Path) -> bool {
@@ -280,7 +286,12 @@ pub fn scan_folder_phase_a(
     // finalizing pass (auto-tags, RAW/JPEG stacking, missing reconciliation, and marking
     // the scan finished) all happen in phase_b_enrich — run inline by scan_folder, or
     // detached on its own connection by the command layer (I6c).
-    Ok((result, PendingEnrich { imported, folder_id: Some(folder_id) }))
+    let pending = PendingEnrich {
+        imported,
+        folder_id: Some(folder_id),
+        scope_root: Some(folder.to_path_buf()),
+    };
+    Ok((result, pending))
 }
 
 /// Scan `folder` recursively: Phase A (fast walk) followed immediately by Phase B
@@ -301,7 +312,8 @@ pub fn scan_folder(
 /// Phase B of the two-phase live scan (I6c): extract EXIF/IPTC/XMP for the new/changed
 /// files in `pending`, persist it in `COMMIT_EVERY` batches (flipping each row's
 /// `metadata_ready` to 1 and recording external-editor sidecars), then run the finalizing
-/// pass (auto-tags, RAW/JPEG stacking, missing reconciliation, mark scan finished).
+/// pass (auto-tags, RAW/JPEG stacking, missing reconciliation over the SCANNED SCOPE,
+/// mark scan finished).
 ///
 /// Only new/changed files are extracted — a re-scan of an unchanged library does no
 /// exiftool work at all. exiftool runs per batch (and across cores), not per file. The
@@ -319,7 +331,7 @@ pub fn phase_b_enrich(
     abort: &AtomicBool,
     progress: &dyn Fn(ScanProgress),
 ) -> Result<(), String> {
-    let PendingEnrich { imported, folder_id } = pending;
+    let PendingEnrich { imported, folder_id, scope_root } = pending;
 
     let to_extract: Vec<PathBuf> = imported
         .iter()
@@ -329,6 +341,9 @@ pub fn phase_b_enrich(
     let mut meta = extract_batch(&to_extract);
     let meta_total = to_extract.len();
     let mut done = 0usize;
+    // Every photo this phase touched, for the scoped `missing` reconciliation below. The
+    // resume path (no walked folder) has nothing else to scope by.
+    let mut enriched_ids: Vec<i64> = Vec::with_capacity(imported.len());
     // Collect ids of photos whose metadata was just extracted — their GPS columns are now
     // populated, so the fence-apply step in the finalizing pass has fresh coordinates.
     // Gated on the `map` feature so there is no overhead when the feature is off.
@@ -343,6 +358,7 @@ pub fn phase_b_enrich(
             tx.commit().map_err(|e| e.to_string())?;
             return Err(SCAN_ABORTED.to_string());
         }
+        enriched_ids.push(photo_id);
         if needs {
             if let Some(m) = meta.remove(&path) {
                 let _ = catalog.set_photo_metadata(photo_id, &m.promoted, &m.entries);
@@ -390,9 +406,22 @@ pub fn phase_b_enrich(
     // Stack any newly-imported camera JPEGs under their sibling RAW (same folder + stem).
     let _ = catalog.pair_raw_jpeg_stacks();
 
-    // Self-heal the `missing` flag: hide rows whose original can't be found and
-    // have no backup (e.g. orphan rows left by a re-root), un-hide resolvable ones.
-    let _ = catalog.reconcile_missing();
+    // Self-heal the `missing` flag: hide rows whose original can't be found and have no
+    // backup (e.g. orphan rows left by a re-root), un-hide resolvable ones.
+    //
+    // Scoped to what this scan actually covered — the rows under the walked folder, plus
+    // the photos this phase enriched (the resume path walks no folder at all). Reconciling
+    // the WHOLE catalog here made every scan an O(total photos) stat pass over storage the
+    // scan never looked at, including an offline NAS; the full pass is explicit maintenance
+    // now (`Catalog::reconcile_missing`). The folder-scoped id set is deliberately wider
+    // than `imported`: a file deleted since the last scan is absent from the walk, and
+    // hiding its row is exactly what reconciliation is for.
+    let mut scope: Vec<i64> = match &scope_root {
+        Some(root) => catalog.photo_ids_under(root).unwrap_or_default(),
+        None => Vec::new(),
+    };
+    scope.extend(enriched_ids);
+    let _ = catalog.reconcile_missing_for(&scope);
 
     // Mark the scan finished for the local scan (NAS in-place scans track no folder).
     if let Some(folder_id) = folder_id {
@@ -433,7 +462,12 @@ pub fn scan_external_folder_phase_a(
         |path| upsert_external_one(catalog, path),
     )?;
 
-    Ok((result, PendingEnrich { imported, folder_id: None }))
+    let pending = PendingEnrich {
+        imported,
+        folder_id: None,
+        scope_root: Some(folder.to_path_buf()),
+    };
+    Ok((result, pending))
 }
 
 /// Scan a NAS-resident folder in place: Phase A (fast walk) followed immediately by

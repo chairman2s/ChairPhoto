@@ -124,9 +124,10 @@ thread_local! {
     static CANDIDATE_STATS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-/// The single existence check for one candidate copy. Funnelled through one function so
-/// the test counter above sees every stat [`pick_existing`] performs.
-fn candidate_exists(path: &Path) -> bool {
+/// The single existence check for one candidate copy. Every resolver stat — here and in
+/// [`crate::catalog::Catalog::resolve_photo_path`] — goes through this one function, so the
+/// test counter above sees all of them.
+pub(crate) fn candidate_exists(path: &Path) -> bool {
     #[cfg(test)]
     CANDIDATE_STATS.with(|c| c.set(c.get() + 1));
     path.exists()

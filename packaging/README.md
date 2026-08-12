@@ -37,6 +37,15 @@ the hang through.
 `NEEDED`, the `load-dynamic` feature was lost somewhere and this "optional" dependency
 quietly became mandatory again, with nothing else in the build objecting.
 
+That assertion only proves the runtime isn't hard-linked; a package can still pass it while
+inference is wholly unwired, in either direction — the probe rejecting a good runtime, or a
+missing one hanging instead of erroring. Nothing else in packaging said anything about that
+until #43: `check()` also runs `plugins::onnx`'s and `plugins::smarttags::embed`'s own unit
+tests, unconditionally proving a missing/unusable runtime is reported rather than hung on, and
+(self-skipping, loudly, when the build host has no runtime to find — a clean chroot never
+does, since onnxruntime-cpu is an optdepend) proving a present one is accepted and can actually
+build and run a session.
+
 ### GPU
 
 `onnxruntime-cuda` provides the same soname and conflicts with `onnxruntime-cpu`, so the two

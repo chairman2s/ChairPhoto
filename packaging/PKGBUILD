@@ -2,7 +2,7 @@
 
 pkgname=chairphoto
 pkgver=2026.8.0
-pkgrel=1
+pkgrel=2
 pkgdesc="Catalog-first photo organizer for large RAW collections"
 arch=('x86_64')
 url="https://github.com/chairman2s/ChairPhoto"
@@ -121,6 +121,38 @@ check() {
     echo "    default-features = false with the \`load-dynamic\` feature." >&2
     return 1
   fi
+
+  # The assertion above only proves the runtime is *not* hard-linked; it says nothing about
+  # whether inference actually works either way (#43). Exercise the dynamic path itself, in
+  # both directions, through the unit tests that already assert it:
+  #
+  #   - plugins::onnx::tests::missing_runtime_reports_an_error runs unconditionally and proves
+  #     an absent/unusable runtime surfaces as a typed Err rather than the indefinite hang
+  #     ort's own loader exhibits. faces::engine and smarttags::embed both propagate that Err
+  #     with `?`, so this is what keeps a user without onnxruntime-cpu installed at a "module
+  #     unavailable" state instead of a wedged app — the half users actually hit.
+  #   - plugins::onnx::tests::probe_accepts_an_installed_runtime and
+  #     plugins::smarttags::embed::tests::synthetic_onnx_roundtrip_is_unit_vector prove the
+  #     opposite direction: when a runtime *is* present, the probe accepts it and `ort` can
+  #     actually build and run a session. The latter runs against a tiny in-memory ONNX graph
+  #     (no model download, no network), so it exercises the real session-creation code path
+  #     unconditionally on any machine that has the runtime.
+  #
+  # onnxruntime-cpu is an optdepend, not a build/check dependency, so a clean chroot has no
+  # runtime to find: the two "present" tests self-skip and print why, `SKIPPED: ...`, matching
+  # the convention `plugins::onnx`'s own tests already use (issue #42) and AGENTS.md's rule
+  # for environment-gated tests. --nocapture is required for that line to reach this log at
+  # all — cargo swallows stdout/stderr on a passing test otherwise — so a silently green run
+  # here would read as "proven", which is the exact gap #43 tracks. This is a fresh `cargo
+  # test` profile build, independent of the release artifact checked above; --offline reuses
+  # what prepare() already fetched.
+  echo "==> Checking the dynamic ONNX Runtime path (present and absent)..."
+  export RUSTUP_TOOLCHAIN=stable
+  cargo test --locked --offline --manifest-path src-tauri/Cargo.toml \
+    --features flickr,smugmug --lib -- --nocapture \
+    plugins::onnx::tests::missing_runtime_reports_an_error \
+    plugins::onnx::tests::probe_accepts_an_installed_runtime \
+    plugins::smarttags::embed::tests::synthetic_onnx_roundtrip_is_unit_vector
 }
 
 package() {

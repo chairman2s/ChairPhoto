@@ -13,7 +13,9 @@ aliases:
 
 Send a selected photo or version from ChairPhoto to a [LocalSend](https://localsend.org)
 device — a phone or laptop — over the local network, using LocalSend's **documented HTTP
-protocol** rather than scraping. ChairPhoto **sends**; it does not run a receiver.
+protocol** rather than scraping. ChairPhoto **sends**; it never accepts a photo from the
+network. Discovery does bind a short-lived inbound port to hear peers' register replies
+(see *Discovery* below), but that port answers `register` and refuses uploads.
 
 This also underpins the **Snapchat** module: no good API posts to a Snapchat story, so the
 workflow is *send the photo to the phone via LocalSend, then post it by hand from the
@@ -42,6 +44,16 @@ on success — mirroring how `publishing.tsx` is shared by Flickr and SmugMug.
   announcement JSON `{ alias, version:"2.0", deviceModel, deviceType, fingerprint, port,
   protocol:"http"|"https", download }`; replying with our own announcement makes us visible
   too. When multicast is blocked, a manual `IP:port` is the fallback.
+
+  Discovery is **two-sided**: a peer that hears our announcement replies with `POST
+  /api/localsend/v2/register` to the `port` we advertised, and only falls back to a UDP
+  `announce:false` datagram if that fails. So for the duration of one discovery pass
+  ChairPhoto binds an **ephemeral** TCP port and advertises that — not `53317`, which
+  another LocalSend-speaking process on the same machine may hold. It answers `register`
+  and refuses every other route, `prepare-upload` and `upload` explicitly with `403`.
+  The listener is released when the pass ends. See
+  [`docs/adr/0001-localsend-register-listener.md`](adr/0001-localsend-register-listener.md)
+  for why an inbound port is justified in a local-first app, and `localsend/register.rs`.
 - **HTTP base** `http(s)://<ip>:<port>/api/localsend/v2/…`:
   - `POST /prepare-upload` — body `{ info:<our device info>, files:{ <fileId>:{ id,
     fileName, size, fileType } } }` → `{ sessionId, files:{ <fileId>:<token> } }`. A

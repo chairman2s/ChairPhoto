@@ -1,6 +1,8 @@
 //! Send a photo to a device on the LAN over LocalSend's documented v2 HTTP protocol
 //! (the `localsend` Cargo feature). Pure transport: UDP multicast discovery + the
-//! prepare-upload/upload handshake. **Send only** — there is no receiver here.
+//! prepare-upload/upload handshake. **Send only** — no photo is ever accepted *from* the
+//! network. Discovery does bind a short-lived inbound port to hear peers' register replies
+//! (see [`register`], issue #55); that port answers `register` and refuses uploads.
 //!
 //! Commands in `commands.rs` wire these to the catalog and the render path (LS2); the
 //! frontend module renders the device picker and (for Snapchat) records the publication.
@@ -19,6 +21,8 @@ use std::time::Duration;
 
 use socket2::{Domain, Protocol as SockProtocol, SockAddr, SockRef, Socket, Type};
 use tokio::net::UdpSocket;
+
+mod register;
 
 /// LocalSend's well-known multicast group + port for discovery announcements.
 const MULTICAST_ADDR: Ipv4Addr = Ipv4Addr::new(224, 0, 0, 167);
@@ -117,22 +121,20 @@ pub fn our_info(fingerprint: &str, announce: bool) -> serde_json::Value {
     our_info_with_port(fingerprint, announce, OUR_PORT)
 }
 
-/// As [`our_info`], but advertising `port` instead of the hardcoded [`OUR_PORT`]. `discover()`
-/// uses this to advertise the port its discovery socket actually bound — which may not be
-/// [`OUR_PORT`] if 53317 was unavailable even with `SO_REUSEADDR`/`SO_REUSEPORT` — rather than
-/// a port owned by whatever else is listening on 53317.
+/// As [`our_info`], but advertising `port` instead of the hardcoded [`OUR_PORT`].
 ///
-/// Deliberate, not accidental: `discover()` advertises a port on which ChairPhoto runs no TCP
-/// listener at all — normally 53317, since we usually do win that bind. This is exactly why a
-/// spec-conformant peer's HTTP `POST /api/localsend/v2/register` to that port fails and the
-/// peer falls back to the UDP reply this module is built to receive. Absent a listener, this is
-/// the least-bad choice: the announcement must name *some* port, and the port we actually bound
-/// is at least honest about where we are (not) listening. What it doesn't cover: if a
-/// co-resident LocalSend desktop app happens to serve real HTTP on that same port (its normal,
-/// non-`--hidden` mode), the peer's register POST succeeds against *that* process instead of
-/// failing, no UDP fallback is ever sent, and ChairPhoto is invisible again even though
-/// everything in this module is working correctly. If that turns out to be the owner's actual
-/// failure mode, the fix is an inbound register receiver, not another change here.
+/// `discover()` passes the port of the [`register`] listener it bound for that pass — an
+/// ephemeral port ChairPhoto genuinely serves HTTP on, so a spec-conformant peer's `POST
+/// /api/localsend/v2/register` reaches *us*. That is the point of issue #55: advertising
+/// 53317 while running no listener there meant a co-resident LocalSend desktop app answered
+/// those POSTs instead, the peer therefore never sent its UDP `announce:false` fallback, and
+/// ChairPhoto stayed invisible with every line of this module working correctly.
+///
+/// If the listener can't be bound at all, `discover()` falls back to advertising the port its
+/// UDP discovery socket bound — no listener behind it, so peers fail their register and use
+/// the UDP fallback, which is the pre-#55 behavior and still works whenever nothing else holds
+/// the port. Either way the advertised port is one ChairPhoto actually bound, never a port
+/// owned by another process.
 fn our_info_with_port(fingerprint: &str, announce: bool, port: u16) -> serde_json::Value {
     serde_json::json!({
         "alias": OUR_ALIAS,
@@ -215,25 +217,48 @@ async fn discover_on(
     let socket = open_reusable_udp_socket(bind_port)
         .map_err(|e| format!("LocalSend discovery: couldn't open a UDP socket: {e}"))?;
 
-    // Advertise the port we actually bound (may not be `bind_port`/`OUR_PORT` if that was
-    // unavailable even with SO_REUSEADDR/SO_REUSEPORT) rather than a port some other process
-    // owns.
-    let bound_port = socket
+    // The UDP port we actually bound (may not be `bind_port`/`OUR_PORT` if that was
+    // unavailable even with SO_REUSEADDR/SO_REUSEPORT). Only the fallback advertisement below
+    // uses it; normally we advertise the register listener's port instead.
+    let udp_port = socket
         .local_addr()
         .ok()
         .and_then(|a| a.as_socket_ipv4())
         .map(|a| a.port())
         .unwrap_or(OUR_PORT);
 
+    // Bind the inbound register listener for the length of this pass and advertise *its*
+    // port, so a peer's HTTP register reply reaches ChairPhoto rather than whatever else may
+    // hold 53317 (issue #55). A bind failure is not fatal: fall back to the pre-#55
+    // advertisement and rely on peers' UDP fallback, degraded rather than broken.
+    let (listener, advertised_port) = match register::bind().await {
+        Ok((listener, port)) => (Some(listener), port),
+        Err(e) => {
+            eprintln!(
+                "localsend: couldn't bind the register listener ({e}); falling back to \
+                 advertising the UDP port with no listener behind it — peers that can't \
+                 register will still be heard via their UDP fallback"
+            );
+            (None, udp_port)
+        }
+    };
+
     let joined = join_multicast_on_all_interfaces(&socket, interfaces);
 
     let socket = UdpSocket::from_std(socket.into())
         .map_err(|e| format!("LocalSend discovery: couldn't hand the socket to tokio: {e}"))?;
 
-    let announcement = our_info_with_port(&our_fp, true, bound_port);
+    let announcement = our_info_with_port(&our_fp, true, advertised_port);
+
+    // Peers now reach us two ways: a UDP `announce:false` datagram on the shared socket, or an
+    // HTTP register POST on the listener above. Both feed the same `seen` map. Rather than have
+    // two futures contend for a mutable borrow of `seen`, both *send* on one channel and a
+    // single `collect` future owns the map and drains it. That also keeps the dedupe rule in
+    // one place, so a peer heard on both paths still yields one Device.
+    let (found_tx, mut found_rx) = tokio::sync::mpsc::unbounded_channel::<Device>();
+    let udp_tx = found_tx.clone();
 
     let mut seen: HashMap<String, Device> = HashMap::new();
-    let mut buf = vec![0u8; 64 * 1024];
 
     // Announce a burst, concurrently with collecting replies — not burst-then-listen (see the
     // doc comment on `discover`).
@@ -246,20 +271,20 @@ async fn discover_on(
         }
     };
 
-    // Collect indefinitely; the outer `timeout` below is what bounds it.
-    let collect = async {
+    // The UDP half: unchanged in behavior, but it now hands finds to `collect` instead of
+    // inserting them itself. Owns its own receive buffer so nothing is borrowed across the
+    // concurrent futures below.
+    let udp_collect = async {
+        let mut buf = vec![0u8; 64 * 1024];
         loop {
             match socket.recv_from(&mut buf).await {
                 Ok((n, from)) => {
                     let text = String::from_utf8_lossy(&buf[..n]);
                     let ip = from.ip().to_string();
                     if let Some(dev) = parse_announcement(&text, &ip, &our_fp) {
-                        let key = if dev.fingerprint.is_empty() {
-                            format!("{}:{}", dev.ip, dev.port)
-                        } else {
-                            dev.fingerprint.clone()
-                        };
-                        seen.entry(key).or_insert(dev);
+                        if udp_tx.send(dev).is_err() {
+                            break; // collector gone; nothing left to report to
+                        }
                     }
                 }
                 Err(e) => {
@@ -268,6 +293,37 @@ async fn discover_on(
                 }
             }
         }
+    };
+
+    // The HTTP half (issue #55). Serves only for this pass: when the deadline below fires,
+    // this future is dropped, taking the listener and every in-flight handler with it.
+    let serve_register = async {
+        match listener {
+            Some(listener) => {
+                register::serve(listener, our_fp.clone(), advertised_port, found_tx).await
+            }
+            // No listener bound. Drop our sender so the channel can close once the UDP half
+            // is done, instead of holding `collect` open on a source that will never produce.
+            None => drop(found_tx),
+        }
+    };
+
+    // Collect indefinitely; the outer `timeout` below is what bounds it.
+    let collect = async {
+        while let Some(dev) = found_rx.recv().await {
+            let key = if dev.fingerprint.is_empty() {
+                format!("{}:{}", dev.ip, dev.port)
+            } else {
+                dev.fingerprint.clone()
+            };
+            seen.entry(key).or_insert(dev);
+        }
+    };
+
+    // Everything that listens, as one future, so `burst_and_collect`'s two-argument shape (and
+    // the guarantee its doc comment makes about concurrent progress) still describes what runs.
+    let collect = async {
+        tokio::join!(udp_collect, serve_register, collect);
     };
 
     // Bounded total: the burst span plus a reply window past the last announcement (see the
@@ -1097,36 +1153,167 @@ mod tests {
         );
     }
 
+    // --- issue #55: the inbound register listener ------------------------------------------
+
     #[tokio::test]
-    async fn discover_advertises_the_port_it_actually_bound_not_the_constant() {
-        // Kills the exact defect this branch fixes: `discover_on` reverting to
-        // `let bound_port = OUR_PORT;` instead of reading `socket.local_addr()`. `bind_port =
-        // 0` forces the discovery socket onto an ephemeral, non-53317 port; the loopback peer's
-        // `from.port()` is the OS-controlled ground truth for that real port, independent of
-        // whatever the announcement JSON claims. If `bound_port` were hardcoded back to
-        // `OUR_PORT`, the claimed port (53317) and the real source port (some ephemeral value)
-        // would disagree.
+    async fn discover_advertises_a_port_it_actually_serves_register_on() {
+        // Supersedes the pre-#55 assertion that the announced port equalled the *UDP* socket's
+        // own source port. That invariant is deliberately gone: we now announce the TCP
+        // register listener's port, which is a different port by construction. What replaces
+        // it is stronger — the announced port must be one ChairPhoto has really bound and
+        // really answers `register` on — and this asserts it end to end, from the peer's side.
+        //
+        // The fake peer here sends **no UDP reply at all**. It is discovered purely because its
+        // HTTP register POST reached us, which is the exact path issue #55 was about: with a
+        // co-resident LocalSend app holding 53317, that POST is the only way a peer can arrive.
         let _guard = lock_network_tests();
-        if skip_if_no_loopback_multicast("discover_advertises_the_port_it_actually_bound_not_the_constant").await {
+        if skip_if_no_loopback_multicast("discover_advertises_a_port_it_actually_serves_register_on").await {
             return;
         }
 
-        let discover_fut = discover_on(200, 0, &[Ipv4Addr::LOCALHOST]);
-        let collect_fut = collect_on_loopback(Duration::from_millis(3200));
-        let (devices, received) = tokio::join!(discover_fut, collect_fut);
-        devices.expect("discover_on must not error");
+        let peer_task = tokio::spawn(async {
+            let peer = open_reusable_udp_socket(MULTICAST_PORT).expect("peer socket must bind");
+            peer.join_multicast_v4(&MULTICAST_ADDR, &Ipv4Addr::LOCALHOST)
+                .expect("peer must join the group on loopback");
+            let peer = UdpSocket::from_std(peer.into()).expect("peer must hand off to tokio");
 
-        let (json, actual_source_port) = received
-            .iter()
-            .find(|(json, _)| json["alias"] == OUR_ALIAS)
-            .expect("a loopback peer must have received at least one of our announcements");
-        let claimed_port = json["port"].as_u64().unwrap() as u16;
+            // Wait specifically for *our* announcement and take the port it advertises — a real
+            // LocalSend process on this host announces on the same group (see the module note).
+            let mut buf = vec![0u8; 64 * 1024];
+            let wait_for_ours = async {
+                loop {
+                    if let Ok((n, _)) = peer.recv_from(&mut buf).await {
+                        if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&buf[..n]) {
+                            if json["alias"] == OUR_ALIAS {
+                                return json["port"].as_u64().map(|p| p as u16);
+                            }
+                        }
+                    }
+                }
+            };
+            let advertised = tokio::time::timeout(Duration::from_secs(3), wait_for_ours)
+                .await
+                .ok()
+                .flatten()?;
 
-        assert_eq!(
-            claimed_port, *actual_source_port,
-            "the announced port must match the port the socket actually sent from"
+            // Reply the way a spec-conformant peer does: HTTP register to the advertised port.
+            // Independently written rather than built from `our_info_with_port`, so this tests
+            // the wire shape a real peer sends and not our own serializer against itself.
+            let body = serde_json::json!({
+                "alias": "Register Peer Phone",
+                "version": "2.0",
+                "deviceModel": "Test",
+                "deviceType": "mobile",
+                "fingerprint": "register-peer-fingerprint",
+                "port": 53317,
+                "protocol": "http",
+                "download": false,
+            })
+            .to_string();
+            let mut client = tokio::net::TcpStream::connect(("127.0.0.1", advertised))
+                .await
+                .ok()?;
+            let request = format!(
+                "POST /api/localsend/v2/register HTTP/1.1\r\nHost: localhost\r\n\
+                 Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            );
+            tokio::io::AsyncWriteExt::write_all(&mut client, request.as_bytes())
+                .await
+                .ok()?;
+            let mut response = Vec::new();
+            tokio::io::AsyncReadExt::read_to_end(&mut client, &mut response)
+                .await
+                .ok()?;
+            Some((advertised, String::from_utf8_lossy(&response).into_owned()))
+        });
+
+        let devices = discover_on(1500, 0, &[Ipv4Addr::LOCALHOST])
+            .await
+            .expect("discover_on must not error");
+        let (advertised, response) = peer_task
+            .await
+            .expect("peer task must not panic")
+            .expect("the peer must have heard an announcement and reached the advertised port");
+
+        assert_ne!(advertised, OUR_PORT, "an ephemeral listener must not land on 53317");
+        assert!(
+            response.starts_with("HTTP/1.1 200 OK"),
+            "the advertised port must answer register with 200; got: {response}"
         );
-        assert_ne!(claimed_port, OUR_PORT, "bind_port=0 must not coincidentally land on 53317");
+        assert!(
+            devices.iter().any(|d| d.alias == "Register Peer Phone"),
+            "a peer that replied only by HTTP register must still be discovered, got: {devices:?}"
+        );
+
+        // The listener is scoped to the pass: `discover_on` has returned, so the port it
+        // advertised must be free again. Nothing of ChairPhoto's stays LAN-reachable between
+        // discoveries.
+        tokio::net::TcpListener::bind(("0.0.0.0", advertised))
+            .await
+            .expect("the register listener must be released when the discovery pass ends");
+    }
+
+    #[tokio::test]
+    async fn discover_still_hears_the_udp_fallback() {
+        // The register listener must not have displaced the UDP path — that stays the fallback
+        // for peers whose register fails, which is every peer whenever the listener could not
+        // be bound at all. Same round trip as the pre-#55 test, re-asserted after the rewrite
+        // of the collect loop into channel-fed form.
+        let _guard = lock_network_tests();
+        if skip_if_no_loopback_multicast("discover_still_hears_the_udp_fallback").await {
+            return;
+        }
+
+        let peer_task = tokio::spawn(async {
+            let peer = open_reusable_udp_socket(MULTICAST_PORT).expect("peer socket must bind");
+            peer.join_multicast_v4(&MULTICAST_ADDR, &Ipv4Addr::LOCALHOST)
+                .expect("peer must join the group on loopback");
+            peer.set_multicast_if_v4(&Ipv4Addr::LOCALHOST)
+                .expect("peer must select loopback as its outgoing interface");
+            let peer = UdpSocket::from_std(peer.into()).expect("peer must hand off to tokio");
+
+            let mut buf = vec![0u8; 64 * 1024];
+            let wait_for_ours = async {
+                loop {
+                    if let Ok((n, _from)) = peer.recv_from(&mut buf).await {
+                        if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&buf[..n]) {
+                            if json["alias"] == OUR_ALIAS {
+                                return;
+                            }
+                        }
+                    }
+                }
+            };
+            let _ = tokio::time::timeout(Duration::from_secs(3), wait_for_ours).await;
+
+            let reply = serde_json::json!({
+                "alias": "UDP Fallback Phone",
+                "version": "2.0",
+                "deviceModel": "Test",
+                "deviceType": "mobile",
+                "fingerprint": "udp-fallback-fingerprint",
+                "port": 9999,
+                "protocol": "http",
+                "download": false,
+                "announce": false,
+            })
+            .to_string();
+            let group = SockAddr::from(SocketAddrV4::new(MULTICAST_ADDR, MULTICAST_PORT));
+            let sock_ref = SockRef::from(&peer);
+            let _ = sock_ref.send_to(reply.as_bytes(), &group);
+        });
+
+        // Needs the real MULTICAST_PORT for the same reason as the round-trip test below.
+        let devices = discover_on(500, MULTICAST_PORT, &[Ipv4Addr::LOCALHOST])
+            .await
+            .expect("discover_on must not error");
+        peer_task.await.expect("peer task must not panic");
+
+        assert!(
+            devices.iter().any(|d| d.alias == "UDP Fallback Phone"),
+            "the UDP fallback must still produce a Device, got: {devices:?}"
+        );
     }
 
     #[tokio::test]

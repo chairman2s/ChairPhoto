@@ -23,10 +23,25 @@ phone* — and ChairPhoto records it as published to Snapchat.
 
 ## Where it lives
 
-A **publish target**, "Device (LocalSend)", in the unified **Publish** dialog. It reuses
-the per-photo, version-picking, full-res EXIF-preserving render path
-(`render_export_jpeg`) built for SmugMug, and sends the current selection of one or more
-photos.
+A **publish target**, "Device (LocalSend)", in the unified **Publish** dialog. It sends the
+current selection of one or more photos.
+
+Rendering is `render_localsend_jpegs` (`commands/localsend.rs`) — **not**
+`commands::publishing::render_export_jpeg`, the SmugMug/Flickr helper. The two are siblings
+built from the same `export` primitives (`resolve_originals`, `upload_file_name`,
+`JobTempDir`, `write_item_jpeg`), not one calling the other, so they share behaviour by
+construction rather than by delegation:
+
+- **Shared.** Version-picking (the selected version where it matches), and EXIF/GPS carried
+  into the render — `write_item_jpeg` re-encodes, which strips metadata, then copies EXIF+GPS
+  and embeds keywords/rating/IPTC back via exiftool. Best-effort: without `exiftool` the
+  pixels still send and the metadata copy is logged and skipped.
+- **Different.** One output path per resolvable photo, rather than one render for one photo.
+  Always full resolution — the publish path applies a per-module long-edge limit
+  (`write_item_jpeg_with_long_edge`); LocalSend never downscales, and lets the device decide.
+  A photo whose render fails, or whose filename would collide with an earlier render in the
+  same send, is skipped and counted as failed rather than aborting the whole send or being
+  sent under another photo's name.
 
 Unlike the service targets it is a **transfer, not a publication**, so it does **not** call
 `api.recordPublication` — the publish-target contract lets a target's `render()` do

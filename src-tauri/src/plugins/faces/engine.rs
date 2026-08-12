@@ -1055,5 +1055,14 @@ mod tests {
             current_pool_key(),
             PoolKey { pool_size: 1, intra_threads: 1, force_cpu: true }
         );
+
+        // Restore the responsive defaults: these atomics are process-global, so leaving
+        // `force_cpu` at `true` would silently short-circuit CUDA registration for any test
+        // that runs later in the same binary and never calls `configure_force_cpu` itself
+        // (there is no such test in *this* binary today, but a model-dependent CUDA test
+        // living in `tests/faces_engine.rs` runs in a separate process either way — this
+        // reset is what keeps that true rather than an accident of file layout).
+        configure(1, 2);
+        configure_force_cpu(false);
     }
 }

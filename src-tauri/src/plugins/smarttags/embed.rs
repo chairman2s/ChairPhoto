@@ -570,6 +570,15 @@ mod tests {
         let c = resolve_pool_key(None).unwrap();
         assert_eq!(c.pool_size, 1);
         assert_eq!(c.intra_threads, 1);
+
+        // Restore the responsive defaults: these atomics are process-global, so leaving
+        // `force_cpu` at `true` would silently short-circuit CUDA registration for
+        // `reconfiguring_between_calls_rebuilds_without_breaking_encoding` below if it runs
+        // later in the same binary — confirmed by running this file's tests single-threaded
+        // before this reset existed: the CUDA-unavailable fallback message never printed,
+        // because this test's leftover `force_cpu = true` short-circuited it silently.
+        configure(1, 2);
+        configure_force_cpu(false);
     }
 
     /// `true` when the pinned default CLIP model is present and verified on disk (already

@@ -139,7 +139,7 @@ fn begin_smarttags_job(
     let (db_path, root) = (c.db_path().to_path_buf(), c.root().to_path_buf());
 
     let mut abort_guard = state.smarttags_abort.lock().map_err(|e| e.to_string())?;
-    let mut slot_guard = state.smarttags_job.lock().map_err(|e| e.to_string())?;
+    let mut slot_guard = state.jobs.smarttags.lock().map_err(|e| e.to_string())?;
     let job = state.smarttags_job_seq.fetch_add(1, Ordering::Relaxed) + 1;
     abort_guard.store(true, Ordering::Relaxed);
     let fresh = Arc::new(AtomicBool::new(false));
@@ -195,7 +195,7 @@ pub async fn smarttags_index_photos(
     }
 
     // Clone the job status slot so the worker can update it.
-    let job_slot = state.smarttags_job.clone();
+    let job_slot = state.jobs.smarttags.clone();
 
     // Snapshot the catalog, allocate the job id, trip the previous job, install this job's
     // abort flag and claim the status slot as ONE transition. The model check above is the
@@ -356,7 +356,7 @@ pub async fn smarttags_index_cancel(state: State<'_, AppState>) -> Result<(), St
 pub async fn smarttags_index_status(
     state: State<'_, AppState>,
 ) -> Result<Option<SmarttagsJobStatus>, String> {
-    Ok(*state.smarttags_job.lock().map_err(|e| e.to_string())?)
+    Ok(*state.jobs.smarttags.lock().map_err(|e| e.to_string())?)
 }
 
 // ── H7c — kNN suggestion engine ──────────────────────────────────────────────
@@ -1034,7 +1034,7 @@ mod smarttags_ownership_tests {
         assert_eq!(db_path, db_a.to_path_buf());
         assert_eq!(root, root_a);
         assert_eq!(
-            state.smarttags_job.lock().unwrap().map(|s| s.job),
+            state.jobs.smarttags.lock().unwrap().map(|s| s.job),
             Some(job),
             "the start must claim the status slot"
         );
@@ -1124,7 +1124,7 @@ mod smarttags_ownership_tests {
 
         let before = state.smarttags_abort.lock().unwrap().clone();
         let seq_before = state.smarttags_job_seq.load(Ordering::Relaxed);
-        let slot_before = *state.smarttags_job.lock().unwrap();
+        let slot_before = *state.jobs.smarttags.lock().unwrap();
 
         let err = begin_smarttags_job(&state).unwrap_err();
         assert_eq!(err, "No catalog is open");
@@ -1144,7 +1144,7 @@ mod smarttags_ownership_tests {
             "a rejected start must not burn a job id"
         );
         assert_eq!(
-            state.smarttags_job.lock().unwrap().map(|s| s.job),
+            state.jobs.smarttags.lock().unwrap().map(|s| s.job),
             slot_before.map(|s| s.job),
             "a rejected start must leave the status slot alone"
         );
@@ -1170,7 +1170,7 @@ mod smarttags_ownership_tests {
             "the new job's flag must be the installed generation"
         );
         assert_eq!(
-            state.smarttags_job.lock().unwrap().map(|s| s.job),
+            state.jobs.smarttags.lock().unwrap().map(|s| s.job),
             Some(job2),
             "the new job owns the status slot"
         );
@@ -1223,7 +1223,7 @@ mod smarttags_ownership_tests {
                 "the unblocked start's flag must be the installed generation"
             );
             assert_eq!(
-                state.smarttags_job.lock().unwrap().map(|s| s.job),
+                state.jobs.smarttags.lock().unwrap().map(|s| s.job),
                 Some(job),
                 "and it must own the status slot"
             );

@@ -251,7 +251,10 @@ mod tests {
                     "probe accepted ONNX Runtime {version}, below the 1.{MIN_MINOR} floor"
                 );
             }
-            Err(e) => eprintln!("skipping: no usable ONNX Runtime on this machine ({e})"),
+            Err(e) => {
+                eprintln!("SKIPPED: no usable ONNX Runtime on this machine ({e})");
+                return;
+            }
         }
     }
 
@@ -311,7 +314,8 @@ mod tests {
     fn non_onnx_library_is_rejected() {
         let libc = std::path::Path::new("/usr/lib/libc.so.6");
         if !libc.exists() {
-            return; // not a glibc system; nothing to assert against
+            eprintln!("SKIPPED: /usr/lib/libc.so.6 not present (not a glibc system)");
+            return;
         }
         let err = probe_at(libc).expect_err("libc is not an ONNX Runtime");
         assert!(

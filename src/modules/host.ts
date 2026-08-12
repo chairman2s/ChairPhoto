@@ -116,6 +116,13 @@ function createChannel() {
       };
     },
     getVersion: () => version,
+    /** Test-only: drop every subscriber without touching `version`. A test that subscribes
+     *  and then fails before its unsubscribe would otherwise leave a live listener that
+     *  later tests' `notify()` calls still invoke — the same leak `__resetForTests` exists
+     *  to stop, one layer down. */
+    clearListeners() {
+      listeners.clear();
+    },
     /** Bump this channel's own subscribers, and the legacy "any change" channel
      *  `useHost()` reads, so a call site never has to remember to notify both. Each
      *  channel listener runs through `callSafely` so a throw can't make `bumpLegacy()`
@@ -229,6 +236,35 @@ export const __legacy = {
   subscribe: subscribeLegacy,
   getVersion: () => legacyVersion,
 };
+
+/** Test-only: return every piece of this module's file-scoped state to its initial value.
+ *
+ *  The registry and the host state around it are module-level mutable singletons, so a test
+ *  that fails partway through leaves whatever it registered behind, and every later test that
+ *  iterates enabled modules — anything calling `setSelection`, for one — fails too. One real
+ *  failure then reads as a cascade, and the first failure in the list is the only true one
+ *  with nothing in the output saying so (issue #54).
+ *
+ *  Call from a global `afterEach`, never from a test body: the point is that it runs on the
+ *  failure path, which a last-line call in an `it` does not.
+ *
+ *  Modules are dropped rather than disabled through `disableModule`, so teardown cannot itself
+ *  throw or depend on a module's `onUnload` behaving. Everything a module contributes (panels,
+ *  actions, settings, main views, publish targets, edit renderer) lives inside its `Registered`
+ *  entry, so clearing the map clears the contributions with it — there is no separate
+ *  settings-panel or contribution registry to miss. */
+export function __resetForTests() {
+  modules.clear();
+  features = [];
+  hostVersion = "";
+  selection = [];
+  activeId = null;
+  activeVersionId = null;
+  editingTag = null;
+  filterContext = { tagId: null, albumId: null, batchId: null };
+  for (const channel of Object.values(__channels)) channel.clearListeners();
+  legacyListeners.clear();
+}
 
 // --- Safe callback dispatch ------------------------------------------------
 //

@@ -498,7 +498,10 @@ mod tests {
     #[test]
     fn real_render_produces_correct_mp4() {
         let (Some(_ff), Some(probe)) = (ffmpeg_path(), ffprobe_path()) else {
-            eprintln!("skipping real_render_produces_correct_mp4: ffmpeg/ffprobe not on PATH");
+            eprintln!(
+                "SKIPPED: real_render_produces_correct_mp4 — ffmpeg/ffprobe not on PATH, so no \
+                 real render was exercised"
+            );
             return;
         };
 

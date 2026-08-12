@@ -19,7 +19,10 @@ fn scan_populates_metadata() {
     let root = home();
     let sample = root.join("Pictures/Raw");
     if !sample.is_dir() {
-        eprintln!("skipping: {} not present", sample.display());
+        eprintln!(
+            "SKIPPED: scan_populates_metadata — {} not present, so no real file was scanned",
+            sample.display()
+        );
         return;
     }
     let tmp = common::TestTmpDir::new("metadata-test");
@@ -62,7 +65,11 @@ fn migrates_real_v1_catalog_and_backfills_locations() {
     let home = home();
     let real = home.join(".local/share/chairphoto/default.chairphoto");
     if !real.is_file() {
-        eprintln!("skipping: no real catalog at {}", real.display());
+        eprintln!(
+            "SKIPPED: migrates_real_v1_catalog_and_backfills_locations — no real catalog at {}, \
+             so the v1→v2 migration was never exercised",
+            real.display()
+        );
         return;
     }
     let tmp = common::TestTmpDir::new("migrate-test");
@@ -96,7 +103,11 @@ fn scans_real_folder_and_extracts_raw_thumbnail() {
     let root = home();
     let sample = root.join("Pictures/Raw");
     if !sample.is_dir() {
-        eprintln!("skipping: {} not present", sample.display());
+        eprintln!(
+            "SKIPPED: scans_real_folder_and_extracts_raw_thumbnail — {} not present, so no RAW \
+             embedded-preview extraction was exercised",
+            sample.display()
+        );
         return;
     }
 

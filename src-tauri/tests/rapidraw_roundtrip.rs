@@ -275,7 +275,10 @@ fn imports_only_after_size_is_stable() {
 fn exif_carryover_resets_orientation_to_upright() {
     let _exec = exec_guard();
     if std::process::Command::new("exiftool").arg("-ver").output().is_err() {
-        eprintln!("exiftool not installed — skipping");
+        eprintln!(
+            "SKIPPED: exif_carryover_resets_orientation_to_upright — exiftool not installed, so \
+             the EXIF carry-over was never exercised"
+        );
         return;
     }
     let (db, root, source, id) = setup("orient");

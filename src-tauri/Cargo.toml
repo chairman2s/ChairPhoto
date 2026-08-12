@@ -23,8 +23,9 @@ default = ["ai", "edit", "raw", "instagram", "collage", "slideshow", "localsend"
 ai = ["dep:reqwest"]
 # Send a photo to a device on the LAN over LocalSend's documented v2 HTTP protocol (UDP
 # multicast discovery + prepare-upload/upload). Send-only. Reuses `reqwest` (HTTP) and the
-# already-on tokio "full" (UDP via tokio::net::UdpSocket) — no new deps. See docs/localsend.md.
-localsend = ["dep:reqwest", "dep:socket2", "dep:libc"]
+# already-on tokio "full" (UDP via tokio::net::UdpSocket); `socket2`/`libc` and `rcgen` are
+# its only added deps, each commented below. See docs/localsend.md.
+localsend = ["dep:reqwest", "dep:socket2", "dep:libc", "dep:rcgen"]
 # Publish to Flickr / SmugMug via their official OAuth 1.0a APIs (HMAC-SHA1 signing +
 # HTTP upload). Pure-Rust deps, so they compile anywhere. Each is a separate module, and
 # neither is in `default` — opt in with `--features flickr,smugmug`.
@@ -162,6 +163,16 @@ rayon = "1"
 # so promoting it to a direct dependency is no new download and no new compile unit — only
 # visibility for our own `use socket2::…`.
 socket2 = { version = "0.6", optional = true }
+# Generates the self-signed TLS *client* certificate we present to LocalSend peers: some
+# require one and abort the handshake with `certificate required` without it (issue #56).
+# Unlike `socket2`/`libc` this is a genuinely new dependency, so it is trimmed to the two
+# features we need — `default-features = false` drops `x509-parser`, which rcgen uses only for
+# parsing an existing CA and which alone would pull in asn1-rs/der-parser/oid-registry and
+# four more. What remains compiles two new units, `rcgen` and `pem`: its `ring`,
+# `rustls-pki-types`, `time` and `base64` are already built for `reqwest`/`rustls`. Shelling
+# out to `openssl` instead would make a runtime tool load-bearing for a core send path, which
+# the Runtime Notes in AGENTS.md do not allow.
+rcgen = { version = "0.14.9", default-features = false, features = ["pem", "ring"], optional = true }
 
 # chairphoto:// OS-level deep links (desktop only): deep-link registers the scheme and
 # delivers URLs; single-instance (with its deep-link feature) forwards a second launch's

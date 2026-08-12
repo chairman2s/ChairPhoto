@@ -22,6 +22,7 @@ use std::time::Duration;
 use socket2::{Domain, Protocol as SockProtocol, SockAddr, SockRef, Socket, Type};
 use tokio::net::UdpSocket;
 
+mod identity;
 mod register;
 
 /// LocalSend's well-known multicast group + port for discovery announcements.
@@ -584,12 +585,23 @@ fn base_url(device: &Device) -> String {
     )
 }
 
-/// An HTTP client honoring the device's protocol — for https LAN peers (self-signed certs,
-/// pinned by fingerprint at the LocalSend layer) we accept invalid certs.
+/// An HTTP client honoring the device's protocol.
+///
+/// For https LAN peers (self-signed certs, pinned by fingerprint at the LocalSend layer) we
+/// accept their certificate *and* present one of our own. Some peers — LocalSend mobile among
+/// them — require a client certificate and abort the handshake with `certificate required`
+/// without one, before any LocalSend request is read; `danger_accept_invalid_certs` governs
+/// only how we treat theirs. Peers that do not require one ignore it. See [`identity`].
+///
+/// A missing identity is not fatal: the client is still built, so http peers and https peers
+/// that do not demand a certificate keep working (see [`identity::client_identity`]).
 fn client_for(device: &Device) -> Result<reqwest::Client, String> {
     let mut builder = reqwest::Client::builder();
     if device.protocol.eq_ignore_ascii_case("https") {
         builder = builder.danger_accept_invalid_certs(true);
+        if let Some(id) = identity::client_identity() {
+            builder = builder.identity(id);
+        }
     }
     builder
         .build()

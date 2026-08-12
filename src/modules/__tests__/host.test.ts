@@ -33,6 +33,7 @@ import {
   activateToolbarAction,
   __channels,
   __legacy,
+  __resetForTests,
 } from "../host";
 import type { ChairPhotoAPI, ChairPhotoModule, Photo } from "../registry";
 import { __events } from "../../__test_stubs__/tauri";
@@ -77,6 +78,19 @@ function makeModule(
 beforeEach(() => {
   vi.spyOn(console, "warn").mockImplementation(() => {});
   vi.spyOn(console, "error").mockImplementation(() => {});
+});
+
+// Return the host's file-scoped state to its initial value after every test, pass or fail
+// (issue #54).
+//
+// Most tests below clean up on the last line of their own `it` block, which only runs when
+// everything above it passed. An assertion that throws first leaves its module registered and
+// enabled, and every later test that iterates enabled modules then fails too — one real
+// failure presenting as six, with the five bystanders indistinguishable from the cause.
+// Observed twice independently during #16's review rounds. Vitest runs `afterEach` on the
+// failure path; a last-line call does not, which is the whole difference.
+afterEach(() => {
+  __resetForTests();
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -825,6 +839,31 @@ describe("notify call-site coverage — the remaining single-notify mutators (M8
 
     unsubscribeAll();
     disableModule("h16-register-editrenderer", false);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The afterEach itself (issue #54)
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("registry teardown on the failure path", () => {
+  // The pair below is the whole point of #54, asserted rather than assumed. `it.fails`
+  // passes precisely when its body throws, so the first test genuinely aborts mid-body —
+  // after registering and enabling, before any cleanup line it might have had — and the
+  // suite still ends green. The second then proves the global `afterEach` ran anyway.
+  //
+  // Delete the `afterEach` and the second test fails, which is the regression guard: it is
+  // the only test here that can tell "cleanup runs on failures" from "every test happened
+  // to pass".
+  it.fails("a test that throws mid-body leaves its module behind without teardown", () => {
+    register(makeModule("h54-aborts-mid-body"));
+    enableModule("h54-aborts-mid-body", false);
+    expect(listModules().map((m) => m.id)).toContain("h54-aborts-mid-body");
+    throw new Error("deliberate mid-body failure — see the test above this one");
+  });
+
+  it("…and the failed test above left nothing registered or enabled", () => {
+    expect(listModules()).toHaveLength(0);
   });
 });
 

@@ -311,6 +311,7 @@ pub struct TrainingSet {
 pub fn scan_stale_tags(conn: &Connection, min_samples: usize) -> Result<StaleScan, String> {
     ensure_schema(conn).map_err(|e| e.to_string())?;
     super::store::ensure_schema(conn).map_err(|e| e.to_string())?;
+    super::suggest::ensure_suggestions_schema(conn).map_err(|e| e.to_string())?;
 
     // ── 1. Find qualifying tags ───────────────────────────────────────────────
     // A tag "qualifies" when it has at least `min_samples` photos that (a) carry the
@@ -990,5 +991,82 @@ mod tests {
         assert_eq!(outcome.examined, 1, "Forest should qualify (10 samples)");
         assert_eq!(outcome.trained, 1, "Forest must retrain: updated_at(600) > trained_at(500)");
         assert_eq!(outcome.skipped, 0);
+    }
+
+    /// Regression test for issue #32: training should work on a catalog that has
+    /// embeddings and tags but has never produced a suggestion (so
+    /// smarttags__suggestions does not yet exist).
+    ///
+    /// Without the fix, scan_stale_tags would query smarttags__suggestions and fail with
+    /// "no such table: smarttags__suggestions". With the fix, scan_stale_tags ensures
+    /// the table exists before the query, so training succeeds.
+    #[test]
+    fn train_all_works_without_prior_suggestions() {
+        let conn = Connection::open_in_memory().unwrap();
+        // Manually set up the schema WITHOUT smarttags__suggestions, simulating a catalog
+        // that has indexed embeddings and tags but never run suggestions.
+        conn.execute_batch(
+            "PRAGMA foreign_keys = OFF;
+             CREATE TABLE IF NOT EXISTS photos (
+                 id   INTEGER PRIMARY KEY,
+                 uuid TEXT NOT NULL DEFAULT '',
+                 path TEXT NOT NULL DEFAULT ''
+             );
+             CREATE TABLE IF NOT EXISTS tags (
+                 id            INTEGER PRIMARY KEY,
+                 name          TEXT NOT NULL DEFAULT '',
+                 name_norm     TEXT NOT NULL DEFAULT '',
+                 parent_id     INTEGER,
+                 full_path     TEXT NOT NULL DEFAULT '',
+                 full_path_norm TEXT NOT NULL DEFAULT '',
+                 description   TEXT NOT NULL DEFAULT '',
+                 auto_rule     TEXT,
+                 exportable    INTEGER NOT NULL DEFAULT 1,
+                 private       INTEGER NOT NULL DEFAULT 0,
+                 last_used_at  INTEGER,
+                 created_at    INTEGER NOT NULL DEFAULT 0,
+                 updated_at    INTEGER NOT NULL DEFAULT 0
+             );
+             CREATE TABLE IF NOT EXISTS photo_tags (
+                 photo_id   INTEGER NOT NULL,
+                 tag_id     INTEGER NOT NULL,
+                 created_at INTEGER NOT NULL DEFAULT 0,
+                 PRIMARY KEY (photo_id, tag_id)
+             );",
+        )
+        .unwrap();
+        // Ensure embeddings and classifiers schemas, but NOT suggestions.
+        super::super::store::ensure_schema(&conn).unwrap();
+        ensure_schema(&conn).unwrap();
+        // Note: we do NOT call super::suggest::ensure_suggestions_schema(&conn).unwrap();
+        // That's the whole point — scan_stale_tags must handle the missing table gracefully.
+
+        let dim = 8;
+
+        // Insert a tag with 10 confirmed photos and embeddings (qualifies for training).
+        insert_tag(&conn, 1, "Nature/Trees");
+        for id in 1i64..=10 {
+            insert_photo(&conn, id);
+            assign_tag(&conn, id, 1);
+            upsert_emb(&conn, id, &unit_axis(dim, 0, 1.0));
+        }
+
+        // Add some negative embeddings for training.
+        for id in 20i64..=25 {
+            insert_photo(&conn, id);
+            upsert_emb(&conn, id, &unit_axis(dim, 0, -1.0));
+        }
+
+        // This should NOT fail with "no such table: smarttags__suggestions".
+        // The fix ensures the table is created in scan_stale_tags before the staleness query.
+        let outcome = train_all(&conn, 10).unwrap();
+        assert_eq!(outcome.examined, 1, "Nature/Trees should qualify (10 samples)");
+        assert_eq!(outcome.trained, 1, "Nature/Trees should be trained on first run");
+        assert_eq!(outcome.skipped, 0);
+
+        // Verify the classifier was actually persisted.
+        let clf = load_classifier(&conn, "Nature/Trees").unwrap().unwrap();
+        let pos_score = clf.predict(&unit_axis(dim, 0, 1.0));
+        assert!(pos_score > 0.7, "Classifier must score positive embeddings > 0.7, got {pos_score}");
     }
 }

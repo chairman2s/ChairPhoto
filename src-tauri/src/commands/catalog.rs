@@ -166,20 +166,23 @@ pub(super) fn detach_catalog_and_trip_jobs(state: &AppState) -> Result<(), Strin
     let phash_guard = state.phash_abort.lock().map_err(|e| e.to_string())?;
     #[cfg(feature = "smarttags")]
     let smarttags_guard = state.smarttags_abort.lock().map_err(|e| e.to_string())?;
-    // The status slot is cleared here too, not just the abort flag. Tripping alone leaves the
-    // old job reachable as the slot's owner: `smarttags_index_status` keeps reporting it as
-    // running, and the panel re-queries on mount, so after a switch it adopts a job belonging
-    // to the catalog the user has left and shows "indexing" against the new one.
+    // The status slots are cleared here too, not just the abort flags. Tripping alone leaves
+    // the old job reachable as a slot's owner: `smarttags_index_status` /
+    // `faces_index_status` / `faces_match_status` keep reporting it as running, and the panel
+    // re-queries on mount, so after a switch it adopts a job belonging to the catalog the user
+    // has left and shows "indexing" against the new one.
     //
     // Clearing is safe in *this* phase specifically, which is why it is not done in phase two.
     // Phase one already holds the catalog lock, so no start can be inside its
     // catalog -> abort -> slot claim; the slot's owner is necessarily the job being tripped.
     // Between the phases the catalog is `None`, so every start fails before claiming. In phase
     // two a newer start can already own the slot, and clearing there would wipe it.
-    #[cfg(feature = "smarttags")]
-    let mut smarttags_slot = state.smarttags_job.lock().map_err(|e| e.to_string())?;
-    #[cfg(feature = "faces")]
-    let mut faces_match_slot = state.faces_match_job.lock().map_err(|e| e.to_string())?;
+    //
+    // Every slot goes through `JobStatusSlots`, not a hand-written list: this used to name
+    // smarttags and face matching individually and silently omitted face *indexing*, which is
+    // issue #51. `lock_all`/`clear_all` enumerate the group exhaustively, so a slot added
+    // later cannot be missed here without a compile error.
+    let job_guards = state.jobs.lock_all()?;
 
     scan_guard.store(true, Ordering::Relaxed);
     #[cfg(feature = "faces")]
@@ -190,14 +193,7 @@ pub(super) fn detach_catalog_and_trip_jobs(state: &AppState) -> Result<(), Strin
     phash_guard.store(true, Ordering::Relaxed);
     #[cfg(feature = "smarttags")]
     smarttags_guard.store(true, Ordering::Relaxed);
-    #[cfg(feature = "smarttags")]
-    {
-        *smarttags_slot = None;
-    }
-    #[cfg(feature = "faces")]
-    {
-        *faces_match_slot = None;
-    }
+    job_guards.clear_all();
     *cat_guard = None;
     Ok(())
 }

@@ -115,6 +115,60 @@ pub struct FacesProgressEvent {
     pub job: u64,
 }
 
+/// Claim ownership of the face-**indexing** job: snapshot the catalog, allocate the job id,
+/// trip the previous job, install this job's abort flag and claim the status slot as ONE
+/// transition, holding all three locks.
+///
+/// Two starts can run concurrently, since Tauri dispatches commands onto its runtime. If the
+/// abort lock were released before the slot write they could interleave: A installs its flag,
+/// B trips A and claims the slot, then A — already aborted — overwrites the slot with itself
+/// and the panel tracks a dead job. Job ids cannot arbitrate that, because they are allocated
+/// after the flag is installed.
+///
+/// The catalog lock is held for the same reason, against switch_catalog rather than against
+/// another start. The switch holds that same lock while it trips the current flag and drops
+/// the handle, and again while it publishes the new catalog and fresh flags, so only three
+/// interleavings exist: the switch completes first and this job snapshots the new catalog; it
+/// runs entirely after and trips the generation installed here; or it is mid-switch, in which
+/// case the catalog reads as None and this job returns having touched nothing. Snapshotting
+/// outside this block would allow a fourth — install an un-tripped generation after the
+/// switch's only abort signal, then index the catalog it is about to close.
+///
+/// Every *nested* acquisition in the backend is catalog -> abort -> slot: this function, the
+/// same block in `begin_smarttags_job` and `begin_faces_match_job`, and both switch_catalog
+/// phases. The scan, sharpness and pHash starts install their abort generation and release
+/// that lock before reading the catalog, so they never hold two at once and cannot invert
+/// against this order; switch_catalog covers them instead by tripping whatever is installed
+/// before it replaces anything. faces_index_cancel takes only the abort lock and workers only
+/// the slot lock.
+///
+/// Everything fallible either precedes this function or is read-only within it, so an error
+/// cannot leave the previous job aborted with no successor.
+///
+/// Extracted from `faces_index_photos` — as `begin_smarttags_job` and `begin_faces_match_job`
+/// already were — so the transition can be driven directly by the interleaving tests, which
+/// have no Tauri `AppHandle`. Face indexing was the one job family without this seam, and it
+/// was also the one whose status slot a catalog switch forgot to clear (issue #51).
+#[cfg(feature = "faces")]
+fn begin_faces_index_job(
+    state: &AppState,
+) -> Result<(PathBuf, PathBuf, Arc<AtomicBool>, u64), String> {
+    let cat_guard = state.catalog.lock().map_err(|e| e.to_string())?;
+    let c = cat_guard.as_ref().ok_or("No catalog is open")?;
+    let (db_path, root) = (c.db_path().to_path_buf(), c.root().to_path_buf());
+
+    let mut abort_guard = state.faces_abort.lock().map_err(|e| e.to_string())?;
+    let mut slot_guard = state.jobs.faces.lock().map_err(|e| e.to_string())?;
+    let job = state.faces_job_seq.fetch_add(1, Ordering::Relaxed) + 1;
+    abort_guard.store(true, Ordering::Relaxed);
+    let fresh = Arc::new(AtomicBool::new(false));
+    *abort_guard = fresh.clone();
+    // Claim the slot (total is unknown until the queue is populated) so a status query
+    // between "command returned" and "first progress event" already sees it running.
+    *slot_guard = Some(FacesJobStatus { job, done: 0, total: 0 });
+    Ok((db_path, root, fresh, job))
+}
+
 /// Begin (or resume) the background face-indexing job. Opens its own secondary catalog
 /// connection so the UI thread is never blocked. Detection + embedding run through the
 /// engine (YuNet + AuraFace) — the command returns as soon as the job has STARTED; progress
@@ -144,53 +198,8 @@ pub async fn faces_index_photos(
         );
     }
 
-    let job_slot = state.faces_job.clone();
-
-    // Snapshot the catalog, allocate the job id, trip the previous job, install this job's
-    // abort flag and claim the status slot as ONE transition, holding all three locks.
-    //
-    // Two starts can run concurrently, since Tauri dispatches commands onto its runtime.
-    // If the abort lock were released before the slot write they could interleave: A
-    // installs its flag, B trips A and claims the slot, then A — already aborted —
-    // overwrites the slot with itself and the panel tracks a dead job. Job ids cannot
-    // arbitrate that, because they are allocated after the flag is installed.
-    //
-    // The catalog lock is held for the same reason, against switch_catalog rather than
-    // against another start. The switch now holds that same lock while it trips the
-    // current flag and drops the handle, and again while it publishes the new catalog and
-    // fresh flags, so only three interleavings exist: the switch completes first and this
-    // job snapshots the new catalog; it runs entirely after and trips the generation
-    // installed here; or it is mid-switch, in which case the catalog reads as None above
-    // and this job returns having touched nothing. Snapshotting outside this block would
-    // allow a fourth — install an un-tripped generation after the switch's only abort
-    // signal, then index the catalog it is about to close.
-    //
-    // Every *nested* acquisition in the backend is catalog → abort → slot: this block, the
-    // same block in `begin_smarttags_job`, and both switch_catalog phases. The scan,
-    // sharpness and pHash starts install their abort generation and release that lock
-    // before reading the catalog, so they never hold two at once and cannot invert against
-    // this order; switch_catalog covers them instead by tripping whatever is installed
-    // before it replaces anything. faces_index_cancel takes only the abort lock and workers
-    // only the slot lock.
-    //
-    // Everything fallible either precedes this block or is read-only within it, so an
-    // error cannot leave the previous job aborted with no successor.
-    let (db_path, root, abort, job) = {
-        let cat_guard = state.catalog.lock().map_err(|e| e.to_string())?;
-        let c = cat_guard.as_ref().ok_or("No catalog is open")?;
-        let (db_path, root) = (c.db_path().to_path_buf(), c.root().to_path_buf());
-
-        let mut abort_guard = state.faces_abort.lock().map_err(|e| e.to_string())?;
-        let mut slot_guard = job_slot.lock().map_err(|e| e.to_string())?;
-        let job = state.faces_job_seq.fetch_add(1, Ordering::Relaxed) + 1;
-        abort_guard.store(true, Ordering::Relaxed);
-        let fresh = Arc::new(AtomicBool::new(false));
-        *abort_guard = fresh.clone();
-        // Claim the slot (total is unknown until the queue is populated) so a status query
-        // between "command returned" and "first progress event" already sees it running.
-        *slot_guard = Some(FacesJobStatus { job, done: 0, total: 0 });
-        (db_path, root, fresh, job)
-    };
+    let job_slot = state.jobs.faces.clone();
+    let (db_path, root, abort, job) = begin_faces_index_job(state.inner())?;
 
     tauri::async_runtime::spawn_blocking(move || {
         use crate::catalog::Catalog;
@@ -376,7 +385,7 @@ pub async fn faces_index_photos(
 pub async fn faces_index_status(
     state: State<'_, AppState>,
 ) -> Result<Option<FacesJobStatus>, String> {
-    Ok(*state.faces_job.lock().map_err(|e| e.to_string())?)
+    Ok(*state.jobs.faces.lock().map_err(|e| e.to_string())?)
 }
 
 #[cfg(feature = "faces")]
@@ -527,7 +536,7 @@ fn begin_faces_match_job(
     let (db_path, root) = (c.db_path().to_path_buf(), c.root().to_path_buf());
 
     let mut abort_guard = state.faces_match_abort.lock().map_err(|e| e.to_string())?;
-    let mut slot_guard = state.faces_match_job.lock().map_err(|e| e.to_string())?;
+    let mut slot_guard = state.jobs.faces_match.lock().map_err(|e| e.to_string())?;
     let job = state.faces_match_job_seq.fetch_add(1, Ordering::Relaxed) + 1;
     abort_guard.store(true, Ordering::Relaxed);
     let fresh = Arc::new(AtomicBool::new(false));
@@ -556,7 +565,7 @@ fn begin_faces_match_job(
 pub async fn faces_run_matching(app: AppHandle, state: State<'_, AppState>) -> Result<u64, String> {
     use crate::plugins::faces::matcher::{self, MatchPhase, MatchSettings};
 
-    let job_slot = state.faces_match_job.clone();
+    let job_slot = state.jobs.faces_match.clone();
     let (db_path, root, abort, job) = begin_faces_match_job(&state)?;
 
     tauri::async_runtime::spawn_blocking(move || {
@@ -661,7 +670,7 @@ pub async fn faces_run_matching(app: AppHandle, state: State<'_, AppState>) -> R
 pub async fn faces_match_status(
     state: State<'_, AppState>,
 ) -> Result<Option<FacesMatchJobStatus>, String> {
-    Ok(*state.faces_match_job.lock().map_err(|e| e.to_string())?)
+    Ok(*state.jobs.faces_match.lock().map_err(|e| e.to_string())?)
 }
 
 /// Cancel the running match. The pipeline stops at its next item and still emits
@@ -1078,14 +1087,16 @@ pub async fn faces_suggestion_list(
 
 // ── H16b: Sharpness index job ────────────────────────────────────────────────
 
-/// The face-matching job is a real job now, which means the catalog-switch protocol has to
-/// reach it: a match left running against a catalog the user has left would keep writing
-/// suggestions into it, and would keep owning a status slot the panel re-queries on mount.
+/// Catalog-switch ownership for both face job families, indexing and matching.
+///
+/// Each is a real background job, which means the catalog-switch protocol has to reach it: a
+/// job left running against a catalog the user has left would keep writing into it, and would
+/// keep owning a status slot the panel re-queries on mount.
 ///
 /// These drive the two switch phases directly, as `commands::smarttags`' ownership tests do
 /// — the commands need a Tauri `AppHandle`, which a unit test cannot build.
 #[cfg(all(test, feature = "faces"))]
-mod faces_match_ownership_tests {
+mod faces_job_ownership_tests {
     use super::*;
     use crate::commands::catalog::{detach_catalog_and_trip_jobs, publish_catalog_and_reset_jobs};
 
@@ -1116,13 +1127,13 @@ mod faces_match_ownership_tests {
         let (db, _root, abort, job) = begin_faces_match_job(&state).unwrap();
         assert_eq!(db, db_a.to_path_buf());
         assert!(!abort.load(Ordering::Relaxed));
-        assert_eq!(state.faces_match_job.lock().unwrap().map(|s| s.job), Some(job));
+        assert_eq!(state.jobs.faces_match.lock().unwrap().map(|s| s.job), Some(job));
 
         detach_catalog_and_trip_jobs(&state).unwrap();
 
         assert!(abort.load(Ordering::Relaxed), "phase one must trip the running match");
         assert!(
-            state.faces_match_job.lock().unwrap().is_none(),
+            state.jobs.faces_match.lock().unwrap().is_none(),
             "phase one must clear the slot, or the panel re-adopts a dead job"
         );
 
@@ -1157,7 +1168,7 @@ mod faces_match_ownership_tests {
             seq_before,
             "a rejected start must not consume a job id"
         );
-        assert!(state.faces_match_job.lock().unwrap().is_none());
+        assert!(state.jobs.faces_match.lock().unwrap().is_none());
     }
 
     /// Starting a second match trips the first: two matching runs on one catalog would
@@ -1173,6 +1184,79 @@ mod faces_match_ownership_tests {
         assert!(first_abort.load(Ordering::Relaxed), "the superseded run must be tripped");
         assert!(!second_abort.load(Ordering::Relaxed));
         assert_ne!(first_job, second_job);
-        assert_eq!(state.faces_match_job.lock().unwrap().map(|s| s.job), Some(second_job));
+        assert_eq!(state.jobs.faces_match.lock().unwrap().map(|s| s.job), Some(second_job));
+    }
+
+    // --- issue #51: the face *indexing* slot ------------------------------------------
+
+    /// The #51 regression. A switch tripped the indexing abort flag but never cleared the
+    /// indexing status slot — it cleared Smart Tagging's and face matching's and omitted this
+    /// one — so between the switch and the worker next noticing its flag,
+    /// `faces_index_status` returned a `FacesJobStatus` describing the replaced catalog.
+    ///
+    /// The interleaving is forced, not timed: the job is claimed through the real
+    /// `begin_faces_index_job` (the same transition `faces_index_photos` runs), the switch is
+    /// driven synchronously, and the slot is read straight afterwards. No worker runs at all,
+    /// so there is no window for one to clean up on our behalf and make this pass for the
+    /// wrong reason — which is exactly what made the original defect invisible.
+    #[test]
+    fn a_catalog_switch_trips_and_unpublishes_a_running_index() {
+        let (cat_a, db_a) = temp_catalog("index-switch-a");
+        let (cat_b, _db_b) = temp_catalog("index-switch-b");
+        let state = state_with(cat_a);
+
+        let (db, _root, abort, job) = begin_faces_index_job(&state).unwrap();
+        assert_eq!(db, db_a.to_path_buf());
+        assert!(!abort.load(Ordering::Relaxed));
+        assert_eq!(
+            state.jobs.faces.lock().unwrap().map(|s| s.job),
+            Some(job),
+            "the start must own the slot before the switch"
+        );
+
+        detach_catalog_and_trip_jobs(&state).unwrap();
+
+        assert!(abort.load(Ordering::Relaxed), "phase one must trip the running index");
+        assert!(
+            state.jobs.faces.lock().unwrap().is_none(),
+            "phase one must clear the face-indexing slot too — leaving it is #51, where \
+             faces_index_status reports a job against the catalog the user has left"
+        );
+
+        // Phase two installs a fresh, un-tripped generation without reviving the old one.
+        publish_catalog_and_reset_jobs(&state, cat_b).unwrap();
+        let current = state.faces_abort.lock().unwrap().clone();
+        assert!(!current.load(Ordering::Relaxed), "the new generation must start clean");
+        assert!(!Arc::ptr_eq(&current, &abort), "phase two must not reuse the tripped flag");
+        assert!(abort.load(Ordering::Relaxed), "the old worker's flag must stay tripped");
+        assert!(
+            state.jobs.faces.lock().unwrap().is_none(),
+            "phase two must not resurrect a slot phase one cleared"
+        );
+    }
+
+    /// All three slots, one switch. The per-family tests above each prove their own slot is
+    /// cleared; this one pins that a single switch clears *every* slot together, which is the
+    /// property #51 is actually about — two of three were cleared, and nothing asserted the
+    /// third alongside them.
+    #[test]
+    fn a_catalog_switch_clears_every_job_status_slot_at_once() {
+        let (cat_a, _db_a) = temp_catalog("all-slots-a");
+        let (cat_b, _db_b) = temp_catalog("all-slots-b");
+        let state = state_with(cat_a);
+
+        let (_db, _root, _index_abort, index_job) = begin_faces_index_job(&state).unwrap();
+        let (_db2, _root2, _match_abort, match_job) = begin_faces_match_job(&state).unwrap();
+        assert_eq!(state.jobs.faces.lock().unwrap().map(|s| s.job), Some(index_job));
+        assert_eq!(state.jobs.faces_match.lock().unwrap().map(|s| s.job), Some(match_job));
+
+        detach_catalog_and_trip_jobs(&state).unwrap();
+
+        assert!(state.jobs.faces.lock().unwrap().is_none(), "face indexing slot");
+        assert!(state.jobs.faces_match.lock().unwrap().is_none(), "face matching slot");
+        #[cfg(feature = "smarttags")]
+        assert!(state.jobs.smarttags.lock().unwrap().is_none(), "smart tagging slot");
+
+        publish_catalog_and_reset_jobs(&state, cat_b).unwrap();
     }
 }

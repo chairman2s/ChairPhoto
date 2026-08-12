@@ -24,6 +24,26 @@ Design docs live in `docs/`.
 - **Original** — the camera file (RAW/JPEG) as first ingested. Never modified,
   never leaves home outbound without an explicit user action per operation.
 
+## Identity
+
+- **Photo identity** — the UUID a photo is given at first import and keeps forever.
+  Unique across the catalog: no two photos share one. It is what catalog merge matches
+  on, never the path.
+- **Copy** — one file of a photo at one location. A photo may have several. Each copy
+  carries its own sidecar, so identity is discharged per copy, not per photo.
+- **Bound** — a copy whose sidecar carries the photo's identity. The settled state.
+- **Identity debt** — a copy whose sidecar does not yet carry it. Normal and transient:
+  an unreachable volume owes just as much as a failed write. Debt is per copy.
+- **Conflict** — a copy whose sidecar carries a *different* photo's identity. Not an
+  error and not repairable by retrying: the file is left alone, because overwriting it
+  would destroy whatever that identifier belongs to.
+- **Adopt** — the catalog takes the identity already in the copy's sidecar. Changes the
+  catalog, never the file. Refused if another photo already holds that identity.
+- **Overwrite** — the copy's sidecar takes the catalog's identity. Changes the file, and
+  destroys the identifier that was there. Backs the sidecar up first.
+- **Dismiss** — stop retrying this copy. Changes neither the catalog nor the file; the
+  record is kept, and the copy stops counting as debt.
+
 ## Removing things
 
 - **Evict** — remove locally cached bytes from a non-home device (e.g. free laptop

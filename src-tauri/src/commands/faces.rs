@@ -1259,4 +1259,93 @@ mod faces_job_ownership_tests {
 
         publish_catalog_and_reset_jobs(&state, cat_b).unwrap();
     }
+
+    // --- issue #22: set_library_root runs the same transition -------------------------
+
+    /// The #22 regression. `set_library_root` replaces the catalog handle exactly as a switch
+    /// does, but used to hold the lock across persist -> reopen -> swap and trip nothing, so a
+    /// running job kept indexing a catalog the app had replaced.
+    ///
+    /// This drives the transition the command now runs — the same seam the switch tests above
+    /// use, since the command itself needs a Tauri `State` a unit test cannot build. The
+    /// interleaving is forced: a real indexing job is claimed first, phase one runs
+    /// synchronously, and the assertions read the flag and slot directly. No worker exists to
+    /// tidy up and make this pass for the wrong reason.
+    ///
+    /// It also pins the ordering constraint peculiar to re-rooting: `catalog_root` is written
+    /// through the *outgoing* handle inside phase one, because `Catalog::open` adopts the
+    /// stored setting over its `root` argument. Persisting after the reopen — or skipping the
+    /// write — would silently re-root back to the old path, which the final assertion catches.
+    #[tokio::test]
+    async fn a_root_change_trips_running_jobs_and_persists_the_new_root() {
+        use crate::commands::catalog::reroot_library;
+
+        let dir = crate::test_support::TestTmpDir::new("reroot-ownership");
+        let old_root = dir.join("photos-old");
+        let new_root = dir.join("photos-new");
+        std::fs::create_dir_all(&old_root).unwrap();
+        let db = dir.join("catalog.chairphoto");
+        let state = state_with(Catalog::open(&db, &old_root).unwrap());
+
+        let (_db, _root, abort, job) = begin_faces_index_job(&state).unwrap();
+        assert_eq!(state.jobs.faces.lock().unwrap().map(|s| s.job), Some(job));
+
+        // The command's real body, not the transition it delegates to — see
+        // `reroot_library`'s doc comment for why that distinction is the whole test.
+        reroot_library(&state, new_root.clone(), db.clone()).await.unwrap();
+
+        assert!(
+            abort.load(Ordering::Relaxed),
+            "a root change must trip a running index — leaving it live is #22, where the \
+             worker keeps writing into a catalog the app has replaced"
+        );
+        assert!(
+            state.jobs.faces.lock().unwrap().is_none(),
+            "a root change must clear the status slot, like a switch does"
+        );
+
+        let current = state.faces_abort.lock().unwrap().clone();
+        assert!(!current.load(Ordering::Relaxed), "the new generation must start clean");
+        assert!(!Arc::ptr_eq(&current, &abort), "phase two must not reuse the tripped flag");
+        assert!(abort.load(Ordering::Relaxed), "the old worker's flag must stay tripped");
+
+        // The re-root actually took, and took through the persisted setting: `Catalog::open`
+        // adopts the stored `catalog_root` over its `root` argument, so had the write not
+        // happened inside phase one this would still read the old root.
+        let guard = state.catalog.lock().unwrap();
+        assert_eq!(
+            guard.as_ref().unwrap().root(),
+            new_root.as_path(),
+            "the published catalog must be rooted at the new path"
+        );
+    }
+
+    /// A failing persist must abort the whole transition rather than leave a half-applied one:
+    /// nothing tripped, slot intact, catalog still open. That is why `before_drop` runs after
+    /// every guard is acquired but before the first mutation.
+    #[test]
+    fn a_failed_root_persist_leaves_the_transition_untouched() {
+        use crate::commands::catalog::detach_catalog_and_trip_jobs_with;
+
+        let (cat_a, _db_a) = temp_catalog("reroot-fail");
+        let state = state_with(cat_a);
+        let (_db, _root, abort, job) = begin_faces_index_job(&state).unwrap();
+
+        let err = detach_catalog_and_trip_jobs_with(&state, |_| {
+            Err("simulated persist failure".to_string())
+        })
+        .unwrap_err();
+        assert_eq!(err, "simulated persist failure");
+
+        assert!(!abort.load(Ordering::Relaxed), "a failed persist must not trip the job");
+        assert_eq!(
+            state.jobs.faces.lock().unwrap().map(|s| s.job),
+            Some(job),
+            "a failed persist must not clear the status slot"
+        );
+        assert!(
+            state.catalog.lock().unwrap().is_some(),
+            "a failed persist must leave the catalog open"
+        );
+    }
 }

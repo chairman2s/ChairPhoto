@@ -156,6 +156,28 @@ pub async fn switch_catalog(
 /// Extracted from `switch_catalog` so the ownership transition can be driven directly by
 /// the interleaving tests in `commands::smarttags`, which have no Tauri `AppHandle`.
 pub(super) fn detach_catalog_and_trip_jobs(state: &AppState) -> Result<(), String> {
+    detach_catalog_and_trip_jobs_with(state, |_| Ok(()))
+}
+
+/// As [`detach_catalog_and_trip_jobs`], but runs `before_drop` against the outgoing catalog
+/// while this phase still holds its lock, immediately before the handle is dropped.
+///
+/// `set_library_root` needs exactly this. It has to persist `catalog_root` **through the
+/// still-open handle** — `Catalog::open` adopts the stored setting over the `root` argument
+/// it is given (`catalog/mod.rs`, "Adopt the stored root"), so a reopen before the write
+/// would silently re-root back to the old value. Doing that write in its own critical
+/// section and then detaching would leave a window where the setting and the live handle
+/// disagree; running it here keeps persist, trip and drop in the single transition this
+/// function already exists to provide (issue #22).
+///
+/// `before_drop` runs after every guard is acquired but before the first mutation, so a
+/// failing callback aborts the whole phase with nothing tripped and the catalog still open.
+/// It must not take any `AppState` lock: this holds the catalog lock, all six abort locks
+/// and all status-slot locks, so anything reaching back for one deadlocks.
+pub(super) fn detach_catalog_and_trip_jobs_with(
+    state: &AppState,
+    before_drop: impl FnOnce(Option<&Catalog>) -> Result<(), String>,
+) -> Result<(), String> {
     let mut cat_guard = state.catalog.lock().map_err(|e| e.to_string())?;
     let scan_guard = state.scan_abort.lock().map_err(|e| e.to_string())?;
     #[cfg(feature = "faces")]
@@ -183,6 +205,16 @@ pub(super) fn detach_catalog_and_trip_jobs(state: &AppState) -> Result<(), Strin
     // issue #51. `lock_all`/`clear_all` enumerate the group exhaustively, so a slot added
     // later cannot be missed here without a compile error.
     let job_guards = state.jobs.lock_all()?;
+
+    // Everything is locked and nothing is mutated yet — the only point where a fallible
+    // caller-supplied step can still back out cleanly.
+    //
+    // `Option`, not `&Catalog`: this phase has always tolerated being run with no catalog
+    // open (it ends with an unconditional `*cat_guard = None`), and `switch_catalog` relies
+    // on that. A caller that *does* require one — `set_library_root`, which cannot persist a
+    // setting without a handle — fails closed inside the closure, still inside this
+    // transition, rather than having its precondition checked in some earlier window.
+    before_drop(cat_guard.as_ref())?;
 
     scan_guard.store(true, Ordering::Relaxed);
     #[cfg(feature = "faces")]
@@ -423,29 +455,67 @@ pub fn get_library_root(state: State<'_, AppState>) -> Result<String, String> {
 /// Re-root the catalog at `path` (the library folder). Photos are stored relative to
 /// the root, so this is a "point at my library" action — existing entries won't resolve
 /// until re-scanned. Reopens the default catalog rooted there. `~` is expanded.
+///
+/// This replaces the active catalog handle, so it runs the **same two-phase ownership
+/// transition as `switch_catalog`** rather than a hand-rolled swap (issue #22). It used to
+/// hold the catalog lock across persist → reopen → swap and trip nothing, which left a scan,
+/// face index, face match, Smart Tagging index, sharpness or pHash job running against a
+/// catalog the app had replaced — the invariant in AGENTS.md ("a newer job start or catalog
+/// switch must make older workers abortable and unreachable as owners") applied to a function
+/// nobody had connected to it.
+///
+/// The one thing it does that a switch does not: `catalog_root` must be written **through the
+/// outgoing handle**, before the reopen, because `Catalog::open` adopts the stored setting
+/// over the root argument it is passed. That write rides inside phase one via
+/// `detach_catalog_and_trip_jobs_with`, so persist, trip and drop stay one transition.
 #[tauri::command]
 pub async fn set_library_root(state: State<'_, AppState>, path: String) -> Result<(), String> {
-    let new_root = expand_home(&path);
-    let catalog_path = default_catalog_path()?;
-    let catalog = state.catalog.clone();
-    // mkdir + reopen (which runs migrations) are far too slow for the main thread, so the
-    // whole critical section moves to a blocking worker. The lock is still held across
-    // persist → reopen → swap inside that worker, so no concurrent command can observe the
-    // catalog mid-reroot.
-    tauri::async_runtime::spawn_blocking(move || {
-        std::fs::create_dir_all(&new_root).map_err(|e| e.to_string())?;
-        let mut guard = catalog.lock().map_err(|e| e.to_string())?;
-        {
-            let open = guard.as_ref().ok_or("No catalog is open")?;
-            open.set_setting("catalog_root", &new_root.to_string_lossy())
-                .map_err(|e| e.to_string())?;
-        }
-        let reopened = Catalog::open(&catalog_path, &new_root).map_err(|e| e.to_string())?;
-        *guard = Some(reopened);
-        Ok::<(), String>(())
+    reroot_library(state.inner(), expand_home(&path), default_catalog_path()?).await
+}
+
+/// The body of [`set_library_root`], taking `&AppState` instead of a Tauri `State`.
+///
+/// Extracted for the same reason `detach_catalog_and_trip_jobs` was: so a test can drive the
+/// real thing. Testing the two phases directly is not enough here — #22 *is* "this function
+/// does not run the shared transition", so a test that calls the transition itself would
+/// still pass if this body were reverted to a hand-rolled swap. Verified: with the test
+/// pointed at the phases, restoring the pre-#22 body left the suite green.
+pub(super) async fn reroot_library(
+    state: &AppState,
+    new_root: PathBuf,
+    catalog_path: PathBuf,
+) -> Result<(), String> {
+    // Creating the directory is disk work; keep it off the async executor, and do it before
+    // anything is tripped so a bad path fails with every job still running.
+    tauri::async_runtime::spawn_blocking({
+        let root = new_root.clone();
+        move || std::fs::create_dir_all(&root).map_err(|e| e.to_string())
     })
     .await
     .map_err(|e| e.to_string())??;
+
+    // Phase one: persist the new root through the outgoing handle, trip every job generation,
+    // clear every status slot, drop the handle — one transition under the catalog lock. A
+    // failed persist leaves the catalog open and nothing tripped.
+    detach_catalog_and_trip_jobs_with(state, |catalog| {
+        catalog
+            .ok_or("No catalog is open")?
+            .set_setting("catalog_root", &new_root.to_string_lossy())
+            .map_err(|e| e.to_string())
+    })?;
+
+    // Reopen off the async executor — this runs migrations.
+    let reopened = tauri::async_runtime::spawn_blocking({
+        let path = catalog_path.clone();
+        let root = new_root.clone();
+        move || Catalog::open(&path, &root).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+
+    // Phase two: publish it with fresh un-tripped generations, tripping whatever a racing
+    // start installed while the catalog was `None` so it cannot survive unreachable.
+    publish_catalog_and_reset_jobs(state, reopened)?;
     // The catalog-root volume's base path just moved — drop cached reachability.
     state.volume_health.invalidate();
     Ok(())

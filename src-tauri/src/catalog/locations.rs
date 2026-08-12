@@ -123,12 +123,17 @@ impl Catalog {
     /// All volumes, each flagged with whether its base path currently exists. This
     /// STATS each volume, so it must not be called while holding a lock that a hung NAS
     /// stat could serialize; it's kept for the Volumes preferences UI and cold callers.
+    ///
+    /// Reachability is the *only* thing this adds over [`volume_rows`]. Anything that just
+    /// needs base paths — [`ResolveMode::PathClassification`] work such as
+    /// [`volume_for_path`] — must use `volume_rows` and pay nothing when a volume is
+    /// offline.
     pub fn list_volumes(&self) -> Result<Vec<Volume>> {
         Ok(self
             .volume_rows()?
             .into_iter()
             .map(|mut v| {
-                v.reachable = Path::new(&v.base_path).is_dir();
+                v.reachable = volume_base_is_dir(&v.base_path);
                 v
             })
             .collect())
@@ -188,8 +193,14 @@ impl Catalog {
     }
 
     /// Find the volume that contains `absolute` (longest matching base path) and the
-    /// path relative to it. Falls back to the default volume (catalog root). PURE SQL:
-    /// reachability checks are deliberately left to resolver callers that run off-lock.
+    /// path relative to it. Falls back to the default volume (catalog root).
+    ///
+    /// [`ResolveMode::PathClassification`]: the answer is a prefix comparison over the
+    /// `volumes` rows, so this reads [`volume_rows`] and performs ZERO base-path stats.
+    /// Import runs it once per scanned file, and it runs under the catalog lock — statting
+    /// every volume here (as it did before) put a NAS round-trip in front of each file and
+    /// could serialize the whole app behind a hung mount. Reachability is deliberately left
+    /// to resolver callers that run off-lock.
     pub fn volume_for_path(&self, absolute: &Path) -> Result<(i64, String)> {
         let mut best: Option<(i64, usize, String)> = None;
         for volume in self.volume_rows()? {
@@ -581,6 +592,28 @@ impl Catalog {
     }
 }
 
+// Per-thread count of volume base-path stats, so a unit test can prove that
+// `ResolveMode::PathClassification` work performs none of them. Thread-local: `cargo test`
+// runs tests in parallel threads, and each test drives its own catalog.
+#[cfg(test)]
+thread_local! {
+    static VOLUME_BASE_STATS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The single reachability stat for a volume base path, funnelled through one function so
+/// the test counter above sees every one of them.
+fn volume_base_is_dir(base: &str) -> bool {
+    #[cfg(test)]
+    VOLUME_BASE_STATS.with(|c| c.set(c.get() + 1));
+    Path::new(base).is_dir()
+}
+
+/// Take and reset this thread's volume base-path stat count (tests only).
+#[cfg(test)]
+fn take_volume_base_stats() -> usize {
+    VOLUME_BASE_STATS.with(|c| c.replace(0))
+}
+
 /// Pure status derivation from a photo's `(volume_kind, volume_id)` locations and a
 /// map of volume reachability. Kept separate so it's trivially unit-testable.
 fn status_from_locations(
@@ -737,6 +770,47 @@ mod tests {
             !is_missing(&catalog, id),
             "a photo whose copy is reachable must never be flagged missing"
         );
+    }
+
+    /// `volume_for_path` is [`ResolveMode::PathClassification`] work: it must answer from
+    /// the `volumes` rows and stat nothing. Import calls it per scanned file under the
+    /// catalog lock, so a stat here is a NAS round-trip per file.
+    ///
+    /// Pinned by counting base-path stats rather than timing: `list_volumes` (the only
+    /// caller that legitimately wants reachability) shows the counter working.
+    #[test]
+    fn volume_for_path_classifies_without_statting_any_volume() {
+        let (catalog, dir, root) = temp_catalog("volume-for-path-no-stat");
+        // Two volumes whose base paths do NOT exist — an unmounted NAS and a detached card.
+        let nas_base = dir.join("nas-not-mounted");
+        let card_base = dir.join("card-not-inserted");
+        let nas = catalog
+            .add_volume("NAS", &nas_base, VolumeKind::Backup)
+            .unwrap();
+        catalog
+            .add_volume("Card", &card_base, VolumeKind::Local)
+            .unwrap();
+
+        let _ = take_volume_base_stats();
+        let (vid, rel) = catalog.volume_for_path(&nas_base.join("2019/a.arw")).unwrap();
+        assert_eq!(
+            take_volume_base_stats(),
+            0,
+            "classification must not stat any volume base path"
+        );
+        assert_eq!(vid, nas, "an unmounted volume still classifies its own paths");
+        assert_eq!(rel, "2019/a.arw");
+
+        // The catalog-root volume is picked for paths under the root, still without stats.
+        let (root_vid, root_rel) = catalog.volume_for_path(&root.join("b.arw")).unwrap();
+        assert_eq!(take_volume_base_stats(), 0);
+        assert_eq!(root_vid, catalog.ensure_default_volume().unwrap());
+        assert_eq!(root_rel, "b.arw");
+
+        // Counter sanity: the reachability-reporting call does stat, once per volume.
+        let volumes = catalog.list_volumes().unwrap();
+        assert_eq!(take_volume_base_stats(), volumes.len());
+        assert_eq!(volumes.len(), 3, "catalog-root + NAS + card");
     }
 
     /// Even with the NAS genuinely gone, a photo with a backup location is spared. This is

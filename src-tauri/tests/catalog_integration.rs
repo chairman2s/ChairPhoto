@@ -3845,9 +3845,11 @@ impl Drop for ReadOnlyDir {
 
 /// Make `dir` reject new files for the lifetime of the guard. Returns `None` when the
 /// mode bits do not actually block writes (i.e. running as root), so a test that cannot
-/// reproduce the failure skips loudly instead of passing without proving anything.
+/// reproduce the failure skips loudly instead of passing without proving anything. `what` is
+/// the calling test's name, so the skip line says which test did not run — the same shape as
+/// `onnx_ready_or_skip` / `models_ready_or_skip` / `skip_if_no_loopback_multicast`.
 #[cfg(unix)]
-fn read_only_dir(dir: &std::path::Path) -> Option<ReadOnlyDir> {
+fn read_only_dir(what: &str, dir: &std::path::Path) -> Option<ReadOnlyDir> {
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o555)).unwrap();
     let guard = ReadOnlyDir(dir.to_path_buf());
@@ -3856,7 +3858,7 @@ fn read_only_dir(dir: &std::path::Path) -> Option<ReadOnlyDir> {
         Ok(()) => {
             let _ = std::fs::remove_file(&probe);
             eprintln!(
-                "SKIPPED: writes to a 0555 directory succeed here (root?), so the \
+                "SKIPPED: {what} — writes to a 0555 directory succeed here (root?), so the \
                  unwritable-sidecar path cannot be reproduced"
             );
             None
@@ -3886,7 +3888,7 @@ fn unwritable_sidecar_queues_a_repair_that_later_succeeds() {
 
     // The photo's storage goes read-only (a NAS export mounted ro, a locked-down
     // archive) — the sidecar cannot be created.
-    let Some(guard) = read_only_dir(&dir) else { return };
+    let Some(guard) = read_only_dir("unwritable_sidecar_queues_a_repair_that_later_succeeds", &dir) else { return };
 
     let outcome = catalog
         .ensure_sidecar_identity(up.id, &photo, &up.uuid, None)
@@ -3941,7 +3943,7 @@ fn unwritable_sidecar_queues_a_repair_that_later_succeeds() {
 fn scan_read_only_storage_queues_import_batch_sidecar_debt() {
     let (catalog, root) = temp_catalog("batch-sidecar-scan-readonly");
     seed_jpgs(&root, 2);
-    let Some(guard) = read_only_dir(&root) else {
+    let Some(guard) = read_only_dir("scan_read_only_storage_queues_import_batch_sidecar_debt", &root) else {
         return;
     };
 
@@ -4013,7 +4015,7 @@ fn card_ingest_queues_identity_and_import_batch_sidecar_debt() {
     assert_eq!(copied.len(), 1);
     let dest = copied[0].dest.clone();
     let sidecar_dir = dest.parent().unwrap().to_path_buf();
-    let Some(guard) = read_only_dir(&sidecar_dir) else {
+    let Some(guard) = read_only_dir("card_ingest_queues_identity_and_import_batch_sidecar_debt", &sidecar_dir) else {
         return;
     };
 
@@ -4116,7 +4118,7 @@ fn bundle_import_queues_identity_sidecar_debt_for_unwritable_extracted_copy() {
     );
     std::fs::remove_file(&sidecar).unwrap();
     let sidecar_dir = target.parent().unwrap().to_path_buf();
-    let Some(guard) = read_only_dir(&sidecar_dir) else {
+    let Some(guard) = read_only_dir("bundle_import_queues_identity_sidecar_debt_for_unwritable_extracted_copy", &sidecar_dir) else {
         return;
     };
 
@@ -4364,7 +4366,7 @@ fn identity_repair_keeps_copy_debt_when_another_copy_is_reachable() {
 fn a_scan_onto_read_only_storage_keeps_every_identity_recoverable() {
     let (catalog, root) = temp_catalog("identity-scan-readonly");
     seed_jpgs(&root, 3);
-    let Some(guard) = read_only_dir(&root) else { return };
+    let Some(guard) = read_only_dir("a_scan_onto_read_only_storage_keeps_every_identity_recoverable", &root) else { return };
 
     // The scan still imports — one unwritable folder must not cost the user the rows.
     let abort = AtomicBool::new(false);

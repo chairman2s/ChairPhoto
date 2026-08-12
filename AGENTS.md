@@ -165,6 +165,12 @@ cargo check --no-default-features
 `cargo check --all-features --all-targets` includes `#[cfg(test)]` code; plain
 `cargo check` does not. Keep every feature combination warning-clean.
 
+Tests that cannot run on a given machine — no ONNX Runtime, no `ffmpeg`, no model behind
+`SMARTTAGS_TEST_MODEL`, no loopback multicast — skip rather than fail, and announce it as
+`SKIPPED: <test_name> — <why>`. `cargo test` captures that line for a *passing* test, so run
+`cargo test -- --nocapture` when you need to know what actually executed. A plain green run
+does not distinguish "passed" from "never ran".
+
 ### Verify, then report
 
 Commit messages, reviews, and status reports are part of the engineering record.

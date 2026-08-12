@@ -24,7 +24,7 @@ use chairphoto_lib::plugins::faces::{self, engine};
 /// tests in `plugins::onnx`, which need no runtime to assert against.
 fn models_ready_or_skip(what: &str) -> bool {
     if let Err(e) = chairphoto_lib::plugins::onnx::ensure_available() {
-        eprintln!("skipping {what}: no usable ONNX Runtime ({e})");
+        eprintln!("SKIPPED: {what} — no usable ONNX Runtime ({e})");
         return false;
     }
     if faces::models::status().ready {
@@ -32,7 +32,7 @@ fn models_ready_or_skip(what: &str) -> bool {
     }
     if std::env::var_os("CHAIRPHOTO_TEST_DOWNLOAD_MODELS").is_none() {
         eprintln!(
-            "skipping {what}: face models not present and CHAIRPHOTO_TEST_DOWNLOAD_MODELS unset"
+            "SKIPPED: {what} — face models not present and CHAIRPHOTO_TEST_DOWNLOAD_MODELS unset"
         );
         return false;
     }

@@ -378,7 +378,7 @@ mod tests {
         match crate::plugins::onnx::ensure_available() {
             Ok(_) => true,
             Err(e) => {
-                eprintln!("skipping {what}: no usable ONNX Runtime ({e})");
+                eprintln!("SKIPPED: {what} — no usable ONNX Runtime ({e})");
                 false
             }
         }
@@ -485,7 +485,12 @@ mod tests {
     #[test]
     fn real_clip_model_when_env_set() {
         let Ok(path) = std::env::var("SMARTTAGS_TEST_MODEL") else {
-            return; // no model configured → nothing to assert
+            eprintln!(
+                "SKIPPED: real_clip_model_when_env_set — SMARTTAGS_TEST_MODEL is unset, so no \
+                 real CLIP model was exercised. Point it at a CLIP image-encoder .onnx to run \
+                 this against the true production path."
+            );
+            return;
         };
         if !onnx_ready_or_skip("real_clip_model_when_env_set") {
             return;

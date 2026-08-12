@@ -27,7 +27,7 @@ import { useHostSelection } from "../host";
 /**
  * A LocalSend device, as discovered (UDP multicast) or a manual-IP favorite. Pass a
  * discovered object straight back to `localsendSend`. The camelCase fields mirror the
- * backend DTO. A manual favorite is `{ alias: "Manual", ip, port: 53317, protocol: "http",
+ * backend DTO. A manual favorite is `{ alias: "Manual", ip, port: 53317, protocol: "",
  * fingerprint: "" }`.
  */
 interface LocalSendDevice {
@@ -36,7 +36,8 @@ interface LocalSendDevice {
   deviceType?: string | null;
   ip: string;
   port: number;
-  protocol: "http" | "https";
+  /** `""` means "not announced — the backend probes it"; only a manual entry uses that. */
+  protocol: "http" | "https" | "";
   fingerprint: string;
 }
 
@@ -165,7 +166,12 @@ export function SendToDevicePanel({ api, onSent, preflight }: SendToDevicePanelP
     const ip = manualIp.trim();
     if (!ip) return null;
     const port = Number(manualPort) || DEFAULT_PORT;
-    return { alias: "Manual", ip, port, protocol: "http", fingerprint: "" };
+    // Empty protocol = "unknown, probe it". A manually typed address carries no announced
+    // scheme, and the two share port 53317: hardcoding "http" here sent plain HTTP at the TLS
+    // listener every current LocalSend build runs, and also skipped the client certificate,
+    // which `client_for` attaches only for https. The backend resolves it (see
+    // `localsend::probe_protocol`).
+    return { alias: "Manual", ip, port, protocol: "", fingerprint: "" };
   };
 
   const send = async () => {

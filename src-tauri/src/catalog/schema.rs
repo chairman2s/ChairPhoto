@@ -338,6 +338,25 @@ CREATE TABLE IF NOT EXISTS pending_sidecar_identity (
 );
 
 CREATE INDEX IF NOT EXISTS idx_pending_sidecar_identity_photo ON pending_sidecar_identity(photo_id);
+-- Covers Catalog::list_pending_identity_page's copy-grouped paging query: GROUP BY +
+-- ORDER BY photo_id, volume_id, relative_path, LIMIT/OFFSET. `EXPLAIN QUERY PLAN` confirms
+-- this index lets SQLite drive that whole query as an ordered index scan with no
+-- `USE TEMP B-TREE FOR ORDER BY` — without it, every page turn sorts the full matching set
+-- while `with_catalog_blocking` holds the shared catalog mutex. It does not make deep
+-- offsets cheap (SQLite's `OFFSET` still walks the skipped rows off an index), only the
+-- sort: measured end to end on a 74,488-row table (50,000 distinct copies, 24,488 owing
+-- both fields), `LIMIT 500` — ~5ms at offset 0, ~45ms at offset 25,000, ~73ms at offset
+-- 49,500 (see Catalog::list_pending_identity_page's doc for the full measurement).
+-- No SCHEMA_VERSION bump needed: this file (SCHEMA_SQL) runs unconditionally via
+-- `execute_batch` on every catalog open (see `Catalog::migrate_locked`), and
+-- `CREATE INDEX IF NOT EXISTS` is naturally idempotent, so an existing catalog picks this
+-- up the next time it opens. On a catalog still at schema v20 (no `field` column on
+-- `pending_sidecar_identity`), `Catalog::migrate_sidecar_identity_fields` drops and
+-- rebuilds this table AFTER this file runs, which would otherwise drop this index right
+-- back out for that one session — it explicitly recreates both this index and
+-- `idx_pending_sidecar_identity_photo` above once the rebuild is done, so a v20 catalog
+-- has both on its very first open, not just "eventually, next time".
+CREATE INDEX IF NOT EXISTS idx_pending_sidecar_identity_copy ON pending_sidecar_identity(photo_id, volume_id, relative_path);
 CREATE INDEX IF NOT EXISTS idx_photo_locations_photo  ON photo_locations(photo_id);
 CREATE INDEX IF NOT EXISTS idx_photos_folder         ON photos(folder_id);
 CREATE INDEX IF NOT EXISTS idx_photos_missing        ON photos(missing);

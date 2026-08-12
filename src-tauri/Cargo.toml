@@ -82,6 +82,14 @@ slideshow = []
 # machines that lack LibRaw: `--no-default-features --features ai,edit`.
 raw = []
 
+# Test-only. `hooks` gives rusqlite's authorizer callback, which one identity test uses to
+# force a deterministic interleaving between the paged copy query and the per-copy field
+# lookup (the alternative is a thread-timing race, which this suite has been burned by).
+# Declared here rather than in [dependencies] so the release binary does not carry it —
+# verified by inspecting target/release/.fingerprint/rusqlite-*/lib-rusqlite.json.
+[dev-dependencies]
+rusqlite = { version = "0.31", features = ["hooks"] }
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 # Only used when the `raw` feature is on (gated inside build.rs by CARGO_FEATURE_RAW);

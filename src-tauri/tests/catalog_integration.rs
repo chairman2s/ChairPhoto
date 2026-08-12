@@ -3866,7 +3866,7 @@ fn read_only_dir(dir: &std::path::Path) -> Option<ReadOnlyDir> {
 }
 
 fn pending_sidecar_field_count(
-    pending: &[chairphoto_lib::catalog::PendingIdentity],
+    pending: &[chairphoto_lib::catalog::PendingIdentityRow],
     field: &str,
 ) -> usize {
     pending.iter().filter(|p| p.field == field).count()
@@ -3917,7 +3917,7 @@ fn unwritable_sidecar_queues_a_repair_that_later_succeeds() {
     // Retrying while the storage is still read-only leaves it queued and counts the try.
     let retry = catalog.repair_pending_identity().unwrap();
     assert_eq!(
-        (retry.repaired, retry.failed, retry.unreachable),
+        (retry.bound, retry.failed, retry.unreachable),
         (0, 1, 0),
         "a repair against read-only storage fails and stays queued"
     );
@@ -3927,7 +3927,7 @@ fn unwritable_sidecar_queues_a_repair_that_later_succeeds() {
     // portable identity was deferred, never lost.
     drop(guard);
     let summary = catalog.repair_pending_identity().unwrap();
-    assert_eq!((summary.repaired, summary.failed, summary.unreachable), (1, 0, 0));
+    assert_eq!((summary.bound, summary.failed, summary.unreachable), (1, 0, 0));
     assert_eq!(
         chairphoto_lib::xmp::read_identifier(&photo).as_deref(),
         Some(up.uuid.as_str()),
@@ -3968,7 +3968,7 @@ fn scan_read_only_storage_queues_import_batch_sidecar_debt() {
     drop(guard);
     let summary = catalog.repair_pending_identity().unwrap();
     assert_eq!(
-        (summary.repaired, summary.failed, summary.unreachable),
+        (summary.bound, summary.failed, summary.unreachable),
         (4, 0, 0),
         "repair drains both UUID and ImportBatch sidecar debt"
     );
@@ -4044,7 +4044,7 @@ fn card_ingest_queues_identity_and_import_batch_sidecar_debt() {
     drop(guard);
     let summary = catalog.repair_pending_identity().unwrap();
     assert_eq!(
-        (summary.repaired, summary.failed, summary.unreachable),
+        (summary.bound, summary.failed, summary.unreachable),
         (2, 0, 0)
     );
     let photo = catalog
@@ -4148,7 +4148,7 @@ fn bundle_import_queues_identity_sidecar_debt_for_unwritable_extracted_copy() {
         "the queued UUID repair should complete once the destination is writable"
     );
     assert!(
-        summary.repaired >= 1,
+        summary.bound >= 1,
         "at least the queued UUID field should be repaired"
     );
     assert_eq!(
@@ -4198,7 +4198,7 @@ fn malformed_sidecar_is_preserved_and_queued() {
     // With the corrupt file out of the way, the queued repair completes.
     std::fs::remove_file(&sidecar).unwrap();
     let summary = catalog.repair_pending_identity().unwrap();
-    assert_eq!((summary.repaired, summary.failed), (1, 0));
+    assert_eq!((summary.bound, summary.failed), (1, 0));
     assert_eq!(
         chairphoto_lib::xmp::read_identifier(&photo).as_deref(),
         Some(up.uuid.as_str())
@@ -4240,8 +4240,11 @@ fn a_foreign_identity_in_the_sidecar_is_never_overwritten() {
     );
 
     // A repair pass keeps reporting it rather than clobbering — this one needs a human.
+    // A Conflict is NOT a failure: it lands in `conflicts`, not
+    // `failed` — retrying it forever would be pointless, and calling it a failure would
+    // contradict the "left untouched until a person resolves it" story the UI tells.
     let summary = catalog.repair_pending_identity().unwrap();
-    assert_eq!((summary.repaired, summary.failed), (0, 1));
+    assert_eq!((summary.bound, summary.failed, summary.conflicts), (0, 0, 1));
     assert_eq!(
         chairphoto_lib::xmp::read_identifier(&photo).as_deref(),
         Some(FOREIGN)
@@ -4269,7 +4272,7 @@ fn an_unreachable_original_leaves_the_repair_queued() {
     std::fs::remove_file(&photo).unwrap();
     let summary = catalog.repair_pending_identity().unwrap();
     assert_eq!(
-        (summary.repaired, summary.failed, summary.unreachable),
+        (summary.bound, summary.failed, summary.unreachable),
         (0, 0, 1)
     );
     assert_eq!(catalog.count_pending_identity().unwrap(), 1, "still queued");
@@ -4316,7 +4319,7 @@ fn identity_repair_keeps_copy_debt_when_another_copy_is_reachable() {
     std::fs::remove_file(&primary).unwrap();
     let summary = catalog.repair_pending_identity().unwrap();
     assert_eq!(
-        (summary.repaired, summary.failed, summary.unreachable),
+        (summary.bound, summary.failed, summary.unreachable),
         (0, 0, 1),
         "a reachable backup must not clear debt for the missing primary copy"
     );
@@ -4346,7 +4349,7 @@ fn identity_repair_keeps_copy_debt_when_another_copy_is_reachable() {
     std::fs::remove_file(&corrupt_sidecar).unwrap();
     let summary = catalog.repair_pending_identity().unwrap();
     assert_eq!(
-        (summary.repaired, summary.failed, summary.unreachable),
+        (summary.bound, summary.failed, summary.unreachable),
         (1, 0, 0)
     );
     assert_eq!(
@@ -4378,7 +4381,7 @@ fn a_scan_onto_read_only_storage_keeps_every_identity_recoverable() {
     drop(guard);
     let summary = catalog.repair_pending_identity().unwrap();
     assert_eq!(
-        (summary.repaired, summary.failed, summary.unreachable),
+        (summary.bound, summary.failed, summary.unreachable),
         (6, 0, 0)
     );
     let photos = catalog

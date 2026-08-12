@@ -3110,3 +3110,160 @@ body {
   background: var(--accent, #4a9eff);
   transition: width 0.15s ease;
 }
+
+/* Identity debt panel (issue #50) — read-only pending-identity queue + repair trigger. */
+.modal.identity-debt {
+  width: 1040px;
+  max-width: 96vw;
+}
+.identity-debt-list {
+  height: 420px;
+  overflow-y: auto;
+  overflow-x: auto;
+  border: 1px solid var(--border);
+  border-radius: 6px 6px 0 0;
+  border-top: none;
+  margin-top: 0;
+}
+.identity-debt-row {
+  display: flex;
+  /* flex-start, not center: a row's per-field columns (State/Field/Tries/Last
+   * attempt/Detail) can now stack 1 or 2 lines depending on how many fields the copy
+   * owes, so the row's height varies — the per-copy columns (Path/Volume/Relative path)
+   * stay individually centered against that height instead (see below), rather than the
+   * whole row centering around whichever cell happens to be tallest. */
+  align-items: flex-start;
+  gap: 10px;
+  padding: 5px 10px;
+  height: 100%;
+  border-bottom: 1px solid var(--border);
+  font-size: 12px;
+}
+/* The (non-virtualized, always-visible) column header — same widths as a data row, but
+ * bold and immune to the state-badge/detail-text treatment below. */
+.identity-debt-header {
+  height: 30px;
+  font-weight: 600;
+  color: var(--text-dim);
+  border: 1px solid var(--border);
+  border-bottom: none;
+  border-radius: 6px 6px 0 0;
+  margin-top: 8px;
+  align-items: center;
+  padding: 0 10px;
+}
+.identity-debt-path,
+.identity-debt-relpath {
+  flex: 1;
+  min-width: 120px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  align-self: center;
+}
+.identity-debt-relpath {
+  color: var(--text-dim);
+}
+/* Per-COPY columns (Path/Volume/Relative path) render once per row regardless of how
+ * many fields the copy owes, and stay vertically centered against the row's full height
+ * (set by the tallest per-field stack — see `.identity-debt-fieldcol` below). */
+.identity-debt-volume {
+  color: var(--text-dim);
+  width: 110px;
+  flex: none;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  align-self: center;
+}
+/* Per-FIELD columns: State/Field/Tries/Last attempt/Detail. A copy owing two fields
+ * stacks two lines here, one per field, in the same top-to-bottom order across all five
+ * columns (this panel used to render one row per (copy, field); now it's one
+ * row per copy, with these columns holding 1–2 stacked lines instead of always 1).
+ * `.identity-debt-fieldcol` alone sizes the Field column; the modifiers below size the
+ * others to match their historical single-line widths. */
+.identity-debt-fieldcol {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  width: 84px;
+  flex: none;
+}
+.identity-debt-fieldcol.identity-debt-statecol {
+  width: 86px;
+}
+.identity-debt-fieldcol.identity-debt-attemptscol {
+  width: 46px;
+}
+.identity-debt-fieldcol.identity-debt-lastattemptcol {
+  width: 150px;
+}
+.identity-debt-fieldcol.identity-debt-errorcol {
+  width: auto;
+  flex: 1;
+  min-width: 120px;
+}
+.identity-debt-field {
+  color: var(--text-dim);
+  height: 18px;
+  line-height: 18px;
+}
+.identity-debt-attempts {
+  color: var(--text-dim);
+  height: 18px;
+  line-height: 18px;
+  text-align: right;
+}
+.identity-debt-lastattempt {
+  color: var(--text-dim);
+  height: 18px;
+  line-height: 18px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* The single most useful fact on a Conflict row: which identity the file actually
+ * carries. Rendered for every field, not just Conflict, so the
+ * column doesn't jump around. `flex: none; width: 100%` (not the header's `flex: 1`):
+ * nested in a `flex-direction: column` field-stack, `flex: 1` would grow the item's
+ * HEIGHT (the column's main axis), not its width. */
+.identity-debt-errorcol .identity-debt-error {
+  flex: none;
+  width: 100%;
+}
+.identity-debt-error {
+  color: var(--text-dim);
+  height: 18px;
+  line-height: 18px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* State badges. Unreachable is a NORMAL state (an unmounted volume, or a file this pass
+ * couldn't find), never styled as a failure — it gets the same neutral treatment as the
+ * rest of the row. Unwritable and Conflict both need a person's attention, so they're
+ * visually distinct from it. */
+.identity-state-badge {
+  flex: none;
+  width: 86px;
+  height: 18px;
+  line-height: 14px;
+  text-align: center;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  padding: 2px 0;
+  border-radius: 4px;
+}
+.identity-state-normal {
+  background: var(--bg-tile);
+  color: var(--text-dim);
+}
+.identity-state-warn {
+  background: #3a1f1f;
+  color: #e08a8a;
+}
+.identity-state-attention {
+  background: #3a2f1a;
+  color: #e0b87f;
+}

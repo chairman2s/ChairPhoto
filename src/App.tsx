@@ -67,6 +67,7 @@ import {
   reconcileNow,
   StorageStatus,
   StorageTier,
+  summarizePendingIdentity,
   versionCounts,
 } from "./modules/api";
 import { CatalogGrid } from "./components/CatalogGrid";
@@ -100,6 +101,7 @@ import {
 } from "./modules/host";
 import { BUNDLED_MODULES } from "./modules/bundled";
 import { Preferences } from "./components/Preferences";
+import { IdentityDebtPanel } from "./components/IdentityDebtPanel";
 import { ExportPanel } from "./components/ExportPanel";
 import { PublishDialog } from "./components/PublishDialog";
 import { ImportPanel } from "./components/ImportPanel";
@@ -240,6 +242,12 @@ export default function App() {
   const [showExport, setShowExport] = useState(false);
   const [showPublish, setShowPublish] = useState(false);
   const [showImport, setShowImport] = useState(false);
+  const [showIdentityDebt, setShowIdentityDebt] = useState(false);
+  // Total pending-identity-debt count (issue #50) — badges the topbar entry point.
+  // `null` means "unknown" (not yet fetched, or the last fetch failed) — distinct from a
+  // confirmed 0, so a transient IPC error can never masquerade as "no debt" and quietly
+  // remove the panel's only entry point.
+  const [identityDebtCount, setIdentityDebtCount] = useState<number | null>(null);
   // Bundle export dialog state — set to the batch to export, null = closed.
   const [bundleExportBatch, setBundleExportBatch] = useState<ImportBatch | null>(null);
   // Bundle import dialog open/closed.
@@ -777,6 +785,19 @@ export default function App() {
     }
   }, []);
 
+  // Cheap count-only refresh (issue #50) — never pulls the full pending-identity list
+  // just to badge the topbar entry point.
+  const refreshIdentityDebtCount = useCallback(async () => {
+    try {
+      const s = await summarizePendingIdentity();
+      setIdentityDebtCount(s.total);
+    } catch {
+      // Leave the count as it was: an IPC error means "unknown", not "zero". Resetting
+      // to 0 here would hide the topbar chip and silently remove the panel's only entry
+      // point on a transient failure.
+    }
+  }, []);
+
   // Drain the backup queue in the background (no blocking dialog). Guarded so
   // overlapping triggers (focus events) don't start parallel drains.
   const runReconcile = useCallback(async () => {
@@ -827,10 +848,11 @@ export default function App() {
     if (!ready) return;
     refreshPending();
     checkReconcile();
+    refreshIdentityDebtCount();
     const onFocus = () => checkReconcile();
     window.addEventListener("focus", onFocus);
     return () => window.removeEventListener("focus", onFocus);
-  }, [ready, checkReconcile, refreshPending]);
+  }, [ready, checkReconcile, refreshPending, refreshIdentityDebtCount]);
 
   const onScan = async () => {
     setStatus("Scanning library…");
@@ -842,6 +864,10 @@ export default function App() {
       );
       await refresh();
       refreshPending(); // scan auto-enqueues backups for new photos
+      // The scanner is the primary producer of identity debt (unwritable/unreachable
+      // sidecars found during indexing) — refresh the badge here too, not just at boot
+      // and on panel close, or debt from this scan stays invisible until restart.
+      refreshIdentityDebtCount();
       setBatchesKey((k) => k + 1); // a scan may have created a new import batch
       // Pre-cache so browsing is instant. Thumbnails always; previews if opted in.
       // Progress is shown via the cache:progress listener below.
@@ -991,6 +1017,14 @@ export default function App() {
       setImportProgress(null);
       setDevelopStatus(null);
       setPendingCount(0);
+      // Identity debt is per-catalog, so the previous catalog's count must not keep
+      // showing as current: `null` (not `0`) so the chip reads "(?)" rather than
+      // disappearing while the real count is unknown — same reasoning as an IPC error in
+      // `refreshIdentityDebtCount` above.
+      // `ready` only flips true once at boot, so the `[ready, ...]` mount effect that
+      // normally calls `refreshIdentityDebtCount` never re-fires on a catalog switch;
+      // call it directly below instead of relying on that effect.
+      setIdentityDebtCount(null);
       // Clear photo/tag arrays immediately so the grid shows nothing while the
       // async refresh resolves — prevents the previous catalog's rows from being
       // visible (with stale IDs) during the switch.
@@ -1011,11 +1045,16 @@ export default function App() {
       // closure has stabilised with clean filter/tag/album deps. Calling refresh() here
       // would capture the OLD closure (stale filter state) and query the new catalog with
       // tag/album IDs that belonged to the previous catalog, producing a flash of wrong data.
+      //
+      // `refreshIdentityDebtCount`, unlike `refresh`, closes over no filter/tag state, so
+      // it's safe to call directly here rather than wait on an effect — nothing else
+      // calls it on a catalog switch, since `ready` never flips back to false.
+      refreshIdentityDebtCount();
     });
     return () => {
       unlisten.then((f) => f());
     };
-  }, [refresh]);
+  }, [refresh, refreshIdentityDebtCount]);
 
   // Reset the active version to Original whenever the selected photo changes.
   useEffect(() => {
@@ -1265,6 +1304,20 @@ export default function App() {
             title="Back up photos waiting for the NAS"
           >
             ⤓ Back up ({pendingCount})
+          </button>
+        )}
+        {(identityDebtCount === null || identityDebtCount > 0) && (
+          <button
+            className="chip chip-on"
+            onClick={() => setShowIdentityDebt(true)}
+            title={
+              identityDebtCount === null
+                ? "Identity debt count could not be checked — open to see the current queue"
+                : "Photo copies whose sidecar doesn't carry their identity yet. Most of this " +
+                  "is normally Unreachable (an offline volume), not a failure."
+            }
+          >
+            Identity debt ({identityDebtCount === null ? "?" : identityDebtCount})
           </button>
         )}
         <span className="topbar-sep" aria-hidden />
@@ -1740,7 +1793,19 @@ export default function App() {
           onLibraryRootChanged={() => {
             refresh();
             refreshPending();
+            // A root change can leave stale/newly-unreachable copies behind — refresh the
+            // badge here too, not just at boot/scan/panel-close.
+            refreshIdentityDebtCount();
             setStatus("Library folder changed — click Rescan library to index it.");
+          }}
+        />
+      )}
+
+      {showIdentityDebt && (
+        <IdentityDebtPanel
+          onClose={() => {
+            setShowIdentityDebt(false);
+            refreshIdentityDebtCount(); // a repair pass may have cleared some debt
           }}
         />
       )}
@@ -1808,6 +1873,10 @@ export default function App() {
             );
             refresh().catch(() => {});
             refreshPending().catch(() => {});
+            // A bundle import can queue new identity debt for extracted copies whose
+            // sidecar can't be written immediately (e.g. onto read-only storage) — refresh
+            // the badge here too, not just at boot/scan/panel-close.
+            refreshIdentityDebtCount().catch(() => {});
             setBatchesKey((k) => k + 1);
           }}
           onClear={() => setImportProgress(null)}

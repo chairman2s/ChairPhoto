@@ -176,11 +176,35 @@ async fn relocate_photo_in_state(
 
 /// Sidecar identity fields that are in the catalog but not (yet) in XMP: photo UUID
 /// (`xmp:Identifier`) and import batch UUID (`chairphoto:ImportBatch`).
+///
+/// One row per COPY, not per (copy, field) — a copy owing both fields is one entry here
+/// with both folded into `fields` — so `limit`/`offset` and this list's length are always
+/// in the same unit `summarize_pending_identity`'s `total` counts. Bounded: the queue
+/// reached 74,488 rows on the 100k harness shape in #20 (tens of MB of JSON if pulled
+/// whole), so this always pages via `LIMIT`/`OFFSET` — the debt panel fetches one page at
+/// a time and shows "showing N of M". There is no unbounded frontend-facing variant.
+/// `Catalog::list_pending_identity()` returns the whole (flat, field-grain) queue instead,
+/// off the IPC boundary — but it has no production caller today: the repair pass
+/// (`Catalog::repair_pending_identity`, below) plans its own field-grained query
+/// (`Catalog::plan_identity_repairs`), since each repair needs the target value bound
+/// per field. `list_pending_identity()` is exercised only by this crate's tests.
 #[tauri::command]
 pub async fn list_pending_identity(
     state: State<'_, AppState>,
+    limit: i64,
+    offset: i64,
 ) -> Result<Vec<crate::catalog::PendingIdentity>, String> {
-    with_catalog_blocking(&state, |c| c.list_pending_identity()).await
+    with_catalog_blocking(&state, move |c| c.list_pending_identity_page(limit, offset)).await
+}
+
+/// Cheap counts (total debt + conflicts) over the pending-identity queue, for a summary
+/// badge/header that shouldn't have to pull every row — the queue reached 74,488 rows on
+/// the 100k harness shape in #20. Prefer this over `list_pending_identity().len()`.
+#[tauri::command]
+pub async fn summarize_pending_identity(
+    state: State<'_, AppState>,
+) -> Result<crate::catalog::PendingIdentitySummary, String> {
+    with_catalog_blocking(&state, |c| c.summarize_pending_identity()).await
 }
 
 /// Retry every queued sidecar identity repair, clearing the copies that now succeed.
@@ -287,7 +311,7 @@ mod tests {
         std::fs::remove_file(&moved).unwrap();
         let summary = catalog.repair_pending_identity().unwrap();
         assert_eq!(
-            (summary.repaired, summary.failed, summary.unreachable),
+            (summary.bound, summary.failed, summary.unreachable),
             (0, 0, 1),
             "repair must stay scoped to the moved copy, even while another copy is reachable"
         );

@@ -31,7 +31,7 @@ mod performance_harness;
 pub use facets::{Facet, SOFT_THRESHOLD_DEFAULT, SOFT_THRESHOLD_KEY};
 pub use identity::{
     bind_sidecar_identity, IdentityRepairPlan, IdentityRepairSummary, PendingIdentity,
-    SidecarIdentity,
+    PendingIdentityField, PendingIdentityRow, PendingIdentitySummary, SidecarIdentity,
 };
 pub use locations::PathCandidate;
 pub use lifecycle::{copy_and_verify, verify_and_delete_locals, BackupPlan, OffloadPlan, RestorePlan};
@@ -378,7 +378,9 @@ impl Catalog {
              DROP TABLE pending_sidecar_identity;
              ALTER TABLE pending_sidecar_identity_v21 RENAME TO pending_sidecar_identity;
              CREATE INDEX IF NOT EXISTS idx_pending_sidecar_identity_photo
-                ON pending_sidecar_identity(photo_id);",
+                ON pending_sidecar_identity(photo_id);
+             CREATE INDEX IF NOT EXISTS idx_pending_sidecar_identity_copy
+                ON pending_sidecar_identity(photo_id, volume_id, relative_path);",
         )?;
         Ok(())
     }
@@ -2109,4 +2111,88 @@ fn now() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `migrate_sidecar_identity_fields` rebuilds `pending_sidecar_identity` via
+    /// `DROP TABLE` + rename whenever it finds a v20-shaped table (no `field` column) —
+    /// necessary because SQLite can't alter a PRIMARY KEY in place. `DROP TABLE` drops the
+    /// table's indexes along with it, including `idx_pending_sidecar_identity_copy`, which
+    /// `schema::SCHEMA_SQL` (run moments earlier in the same `migrate_locked` pass, against
+    /// the still-v20 table) had just created. Without recreating it inside the rebuild, a
+    /// v20-to-v21 upgrade would lose that index for its entire first session — the session
+    /// most likely to carry a large pending-identity queue, since it self-heals (via
+    /// `CREATE INDEX IF NOT EXISTS` in `SCHEMA_SQL`) on the NEXT open. Assert both indexes
+    /// exist after the very FIRST open of a v20 catalog, not a later one, so a self-healing
+    /// regression can't hide behind this test.
+    #[test]
+    fn v20_to_v21_migration_keeps_both_pending_sidecar_identity_indexes_on_first_open() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!(
+            "chairphoto-v20-migration-test-{}-{suffix}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let catalog_path = dir.join("v20.chairphoto");
+        let root = dir.join("photos");
+        std::fs::create_dir_all(&root).unwrap();
+
+        // Simulate a v20 catalog: only `pending_sidecar_identity` is pre-created, in its
+        // pre-field shape (one UUID debt per copy, no `field` column, and no `idx_*`
+        // indexes of its own yet — those come from `SCHEMA_SQL`/the migration, same as a
+        // real upgrade). Every other table is created fresh by `SCHEMA_SQL` on the open
+        // below, exactly as it would be for any other upgrade.
+        {
+            let raw = Connection::open(&catalog_path).unwrap();
+            raw.execute_batch(
+                "CREATE TABLE pending_sidecar_identity (
+                    photo_id        INTEGER NOT NULL,
+                    volume_id       INTEGER NOT NULL,
+                    relative_path   TEXT NOT NULL,
+                    attempts        INTEGER NOT NULL DEFAULT 1,
+                    error           TEXT NOT NULL DEFAULT '',
+                    queued_at       INTEGER NOT NULL,
+                    last_attempt_at INTEGER NOT NULL,
+                    PRIMARY KEY(photo_id, volume_id, relative_path)
+                );",
+            )
+            .unwrap();
+        }
+
+        let catalog = Catalog::open(&catalog_path, &root).unwrap();
+        let indexes: Vec<String> = {
+            let mut stmt = catalog
+                .conn
+                .prepare(
+                    "SELECT name FROM sqlite_master
+                     WHERE type = 'index' AND tbl_name = 'pending_sidecar_identity'",
+                )
+                .unwrap();
+            stmt.query_map([], |r| r.get::<_, String>(0))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        assert!(
+            indexes.iter().any(|n| n == "idx_pending_sidecar_identity_photo"),
+            "expected idx_pending_sidecar_identity_photo on the FIRST open of a v20 \
+             catalog, got {indexes:?}"
+        );
+        assert!(
+            indexes.iter().any(|n| n == "idx_pending_sidecar_identity_copy"),
+            "expected idx_pending_sidecar_identity_copy on the FIRST open of a v20 catalog \
+             — migrate_sidecar_identity_fields's DROP TABLE rebuild must recreate it, not \
+             just the neighbouring index (D1), got {indexes:?}"
+        );
+
+        drop(catalog);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

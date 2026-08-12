@@ -57,8 +57,14 @@ pub async fn render_edit(
         };
         let health = state.volume_health.clone();
         let bytes = tauri::async_runtime::spawn_blocking(move || {
-            let path = crate::volume_health::pick_existing(&candidates, &health)
-                .ok_or_else(|| format!("no reachable copy of photo {photo_id}"))?;
+            // OriginalRequired: an edit render needs the real original, so a
+            // cached-unreachable flag must never stand in for a stat.
+            let path = crate::volume_health::pick_existing(
+                &candidates,
+                &health,
+                crate::catalog::ResolveMode::OriginalRequired,
+            )
+            .ok_or_else(|| format!("no reachable copy of photo {photo_id}"))?;
             let jpeg = if hi_res.unwrap_or(false) {
                 crate::thumbnails::zoom_bytes(&path)?
             } else {
@@ -101,8 +107,14 @@ pub async fn render_edit_batch(
         };
         let health = state.volume_health.clone();
         tauri::async_runtime::spawn_blocking(move || {
-            let path = crate::volume_health::pick_existing(&candidates, &health)
-                .ok_or_else(|| format!("no reachable copy of photo {photo_id}"))?;
+            // OriginalRequired: an edit render needs the real original, so a
+            // cached-unreachable flag must never stand in for a stat.
+            let path = crate::volume_health::pick_existing(
+                &candidates,
+                &health,
+                crate::catalog::ResolveMode::OriginalRequired,
+            )
+            .ok_or_else(|| format!("no reachable copy of photo {photo_id}"))?;
             let jpeg = crate::thumbnails::preview_bytes(&path)?;
             let mut img = image::load_from_memory(&jpeg).map_err(|e| e.to_string())?;
             // Pre-scale once to ~2× the thumbnail edge; each per-record render then
@@ -270,11 +282,19 @@ pub async fn set_version_edit(
             // The flag was set but no version is B&W anymore: fall back to the
             // pixel-derived signal (the photo itself may still be monochrome).
             let health = state.volume_health.clone();
+            // OriginalRequired: the outcome is PERSISTED (`set_grayscale` + auto-tags), so
+            // it must not be decided by a cached reachability flag. (Pre-existing and out
+            // of scope here: when the original is genuinely offline this still falls back
+            // to `false` and clears the flag — recorded, not fixed, in this change.)
             tauri::async_runtime::spawn_blocking(move || {
-                crate::volume_health::pick_existing(&candidates, &health)
-                    .and_then(|p| thumbnail_bytes(&p).ok())
-                    .map(|t| crate::thumbnails::is_grayscale_jpeg(&t))
-                    .unwrap_or(false)
+                crate::volume_health::pick_existing(
+                    &candidates,
+                    &health,
+                    crate::catalog::ResolveMode::OriginalRequired,
+                )
+                .and_then(|p| thumbnail_bytes(&p).ok())
+                .map(|t| crate::thumbnails::is_grayscale_jpeg(&t))
+                .unwrap_or(false)
             })
             .await
             .map_err(|e| e.to_string())?

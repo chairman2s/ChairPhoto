@@ -37,6 +37,55 @@ pub struct PathCandidate {
     pub volume_id: Option<i64>,
 }
 
+/// Which resolver policy a caller needs.
+///
+/// The resolver answers "where is this photo?" for every caller — grid pixels, edit,
+/// export, import path classification, `missing` reconciliation. With one shared "best
+/// available copy" policy they all paid the same filesystem stats even though their needs
+/// differ, so display and scan paths touched slow or offline storage for no benefit. These
+/// modes split that policy at the resolver's seam: the pure-SQL half
+/// ([`Catalog::photo_path_candidates`] / [`Catalog::volume_rows`]) and the statting half
+/// ([`crate::volume_health::pick_existing`]).
+///
+/// The invariant that constrains all of this (AGENTS.md): *missing/unmounted storage is a
+/// normal state, not evidence that the catalog row is invalid*. Only [`Self::FastDisplay`]
+/// may answer "no copy" while a copy might in fact sit on a cached-unreachable volume, and
+/// it is therefore allowed **only** where that answer feeds a display fallback. It must
+/// never reach code that flags a row `missing`, removes/hides a row, or persists derived
+/// state — those callers use [`Self::OriginalRequired`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResolveMode {
+    /// Grid/loupe pixels, where a kept persistent thumbnail is an acceptable answer.
+    /// Trusts the volume-reachability cache: a candidate on a *cached-unreachable* volume
+    /// is not statted at all, so an offline (or hung) NAS never delays the fallback.
+    /// Consequently this mode may return `None` while a copy exists — see the type docs.
+    FastDisplay,
+    /// Edit, export, video streaming, cache warm-up, and `missing` reconciliation: every
+    /// caller that needs the real original bytes, or that records a decision about a row.
+    /// Two passes, so the reachability cache may only *reorder* stats, never change the
+    /// answer — a stale "unreachable" flag costs one deferred stat and nothing else.
+    OriginalRequired,
+    /// "Which volume and relative path does this absolute path belong to?" — answered from
+    /// the `volumes` rows alone ([`Catalog::volume_rows`]). Never stats, so it is safe
+    /// under the catalog lock and costs nothing when a volume is offline.
+    PathClassification,
+}
+
+impl ResolveMode {
+    /// Whether this mode may touch the filesystem at all. False only for
+    /// [`Self::PathClassification`], which is answered from DB rows.
+    pub const fn stats_filesystem(self) -> bool {
+        !matches!(self, Self::PathClassification)
+    }
+
+    /// Whether a candidate on a cached-unreachable volume must still be statted before the
+    /// resolver may answer "no copy exists". True for every mode allowed to decide
+    /// something about a row; false only for [`Self::FastDisplay`].
+    pub const fn verifies_unreachable(self) -> bool {
+        matches!(self, Self::OriginalRequired)
+    }
+}
+
 impl Catalog {
     // --- volumes ------------------------------------------------------------
 
@@ -492,6 +541,12 @@ impl Catalog {
     /// Single source of truth: builds the candidate list ([`photo_path_candidates`]) and
     /// returns the first path that exists. Statting callers on the hot path should split
     /// this themselves (candidates under the lock, `pick_existing` off it).
+    ///
+    /// This convenience form is always [`ResolveMode::OriginalRequired`]: it consults no
+    /// reachability cache and stats every candidate in priority order, so it can be used
+    /// by callers that record a decision about the row. Hot display paths must NOT use it
+    /// — they hold the catalog lock across the stats and cannot ask for
+    /// [`ResolveMode::FastDisplay`]; use the split form instead.
     pub fn resolve_photo_path(&self, photo_id: i64) -> Result<Option<PathBuf>> {
         Ok(self
             .photo_path_candidates(photo_id)?
@@ -560,4 +615,143 @@ fn now() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::TestTmpDir;
+    use crate::volume_health::VolumeHealth;
+    use std::time::Duration;
+
+    /// A catalog rooted at `<tmp>/photos`, plus the fixture dir (kept alive for cleanup).
+    fn temp_catalog(tag: &str) -> (Catalog, TestTmpDir, PathBuf) {
+        let dir = TestTmpDir::new(tag);
+        let root = dir.join("photos");
+        std::fs::create_dir_all(&root).unwrap();
+        let catalog = Catalog::open(&dir.join("t.chairphoto"), &root).unwrap();
+        (catalog, dir, root)
+    }
+
+    /// Index a photo whose ONLY copy lives on a separate "NAS" volume, then take the mount
+    /// away so a `VolumeHealth` refresh caches it as unreachable — while the file itself is
+    /// still readable through its original path. That is the stale-flag case the resolver
+    /// modes have to disagree about, and it is forced here rather than waited for.
+    ///
+    /// Returns `(photo_id, nas_volume_id, nas_base, nas_file)`.
+    fn photo_on_detachable_nas(
+        catalog: &Catalog,
+        dir: &TestTmpDir,
+        root: &Path,
+    ) -> (i64, i64, PathBuf, PathBuf) {
+        // The catalog-root copy is never created: the NAS holds the only bytes.
+        let id = catalog
+            .upsert_photo(&root.join("archive/a.arw"), None, 1, 1)
+            .unwrap()
+            .id;
+        let nas_base = dir.join("nas");
+        let nas_file = nas_base.join("archive/a.arw");
+        std::fs::create_dir_all(nas_file.parent().unwrap()).unwrap();
+        std::fs::write(&nas_file, b"x").unwrap();
+        let nas = catalog
+            .add_volume("NAS", &nas_base, VolumeKind::Backup)
+            .unwrap();
+        catalog
+            .add_location(id, nas, "archive/a.arw", LocationRole::Backup)
+            .unwrap();
+        (id, nas, nas_base, nas_file)
+    }
+
+    /// The `missing` flag, read straight from the column (it is not on [`super::Photo`]).
+    fn is_missing(catalog: &Catalog, photo_id: i64) -> bool {
+        catalog
+            .conn
+            .query_row(
+                "SELECT missing FROM photos WHERE id = ?1",
+                params![photo_id],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap()
+            != 0
+    }
+
+    /// End-to-end through the real resolver seam (catalog candidates → `pick_existing`):
+    /// with the NAS cached-unreachable, display gives up immediately so the grid can serve
+    /// its persistent thumbnail, while every original-required caller still gets the file.
+    #[test]
+    fn offline_nas_splits_display_from_original_required() {
+        let (catalog, dir, root) = temp_catalog("resolve-mode-offline-nas");
+        let (id, nas, nas_base, nas_file) = photo_on_detachable_nas(&catalog, &dir, &root);
+
+        // Force "NAS offline": point the health check at the mount while it is renamed
+        // away, so the cached verdict is `false`. Restoring it makes the flag stale — the
+        // file is present again but the cache still says unreachable.
+        let detached = dir.join("nas-detached");
+        std::fs::rename(&nas_base, &detached).unwrap();
+        let health = VolumeHealth::with_ttl(Duration::MAX);
+        health.refresh(&[(nas, nas_base.to_string_lossy().to_string())]);
+        assert_eq!(health.reachable(nas), Some(false));
+        std::fs::rename(&detached, &nas_base).unwrap();
+
+        let candidates = catalog.photo_path_candidates(id).unwrap();
+        assert!(
+            candidates.iter().any(|c| c.volume_id == Some(nas)),
+            "the NAS copy must be among the candidates"
+        );
+
+        assert_eq!(
+            crate::volume_health::pick_existing(&candidates, &health, ResolveMode::FastDisplay),
+            None,
+            "display must fall back rather than stat a cached-unreachable volume"
+        );
+        assert_eq!(
+            crate::volume_health::pick_existing(&candidates, &health, ResolveMode::OriginalRequired),
+            Some(nas_file.clone()),
+            "edit/export must still reach the original: the cache only reorders stats"
+        );
+        // The convenience resolver is OriginalRequired by construction (no cache at all).
+        assert_eq!(catalog.resolve_photo_path(id).unwrap(), Some(nas_file));
+    }
+
+    /// The invariant this whole split is fenced by (AGENTS.md): unmounted storage is a
+    /// normal state, never evidence that the row is invalid. `FastDisplay` answering `None`
+    /// must therefore leave `missing` alone — reconciliation runs OriginalRequired.
+    #[test]
+    fn fast_display_none_never_marks_a_photo_missing() {
+        let (catalog, dir, root) = temp_catalog("resolve-mode-missing-flag");
+        let (id, nas, nas_base, _) = photo_on_detachable_nas(&catalog, &dir, &root);
+
+        let health = VolumeHealth::with_ttl(Duration::MAX);
+        let detached = dir.join("nas-detached");
+        std::fs::rename(&nas_base, &detached).unwrap();
+        health.refresh(&[(nas, nas_base.to_string_lossy().to_string())]);
+        std::fs::rename(&detached, &nas_base).unwrap();
+
+        let candidates = catalog.photo_path_candidates(id).unwrap();
+        assert_eq!(
+            crate::volume_health::pick_existing(&candidates, &health, ResolveMode::FastDisplay),
+            None
+        );
+        catalog.reconcile_missing().unwrap();
+        assert!(
+            !is_missing(&catalog, id),
+            "a photo whose copy is reachable must never be flagged missing"
+        );
+    }
+
+    /// Even with the NAS genuinely gone, a photo with a backup location is spared. This is
+    /// the offline-NAS half of reconciliation: "offline" is not "missing".
+    #[test]
+    fn reconcile_spares_a_photo_whose_only_copy_is_on_an_unmounted_volume() {
+        let (catalog, dir, root) = temp_catalog("resolve-mode-offline-reconcile");
+        let (id, _nas, nas_base, _) = photo_on_detachable_nas(&catalog, &dir, &root);
+        std::fs::rename(&nas_base, dir.join("nas-detached")).unwrap();
+
+        assert_eq!(catalog.resolve_photo_path(id).unwrap(), None);
+        catalog.reconcile_missing().unwrap();
+        assert!(
+            !is_missing(&catalog, id),
+            "an unmounted backup is a normal state, not a missing row"
+        );
+    }
 }

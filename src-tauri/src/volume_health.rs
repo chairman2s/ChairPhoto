@@ -6,11 +6,14 @@
 //! and remembers each volume's reachability for a short TTL, so repeated status/render
 //! passes reuse a fresh answer instead of re-statting every time.
 //!
-//! Reachability here only ever *reorders* or *annotates* work — it must never change
-//! which physical copy the resolver returns (see [`pick_existing`]). The resolver's
-//! "best available copy" invariant (AGENTS.md) is preserved even under a stale cache.
+//! What reachability is allowed to do depends on the caller's [`ResolveMode`]. Under
+//! `OriginalRequired` it only ever *reorders* or *annotates* work — never changing which
+//! physical copy the resolver returns (see [`pick_existing`]), so the "best available copy"
+//! invariant (AGENTS.md) holds even under a stale cache. `FastDisplay` deliberately trusts
+//! a cached-unreachable volume and falls back instead of statting it; that answer is only
+//! ever a display fallback and never a statement that a row or file is gone.
 
-use crate::catalog::PathCandidate;
+use crate::catalog::{PathCandidate, ResolveMode};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::RwLock;
@@ -112,20 +115,59 @@ impl VolumeHealth {
     }
 }
 
+// Per-thread count of candidate existence stats performed by `pick_existing`, so unit
+// tests can assert how much filesystem work a `ResolveMode` actually avoids rather than
+// timing it. Thread-local: `cargo test` runs tests in parallel threads, and each test
+// resolves on its own thread.
+#[cfg(test)]
+thread_local! {
+    static CANDIDATE_STATS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The single existence check for one candidate copy. Funnelled through one function so
+/// the test counter above sees every stat [`pick_existing`] performs.
+fn candidate_exists(path: &Path) -> bool {
+    #[cfg(test)]
+    CANDIDATE_STATS.with(|c| c.set(c.get() + 1));
+    path.exists()
+}
+
+/// Take and reset this thread's candidate-stat count (tests only).
+#[cfg(test)]
+pub fn take_candidate_stats() -> usize {
+    CANDIDATE_STATS.with(|c| c.replace(0))
+}
+
 /// Pick the best *available* physical copy from a resolver's candidate list, statting
 /// OFF the catalog lock. `candidates` must already be in read-preference order (best
 /// role first, catalog-root fallback last); a copy is the answer only if it exists on disk.
 ///
-/// The reachability cache may only REORDER the stats, never change the answer. Two passes
-/// preserve "best available copy" (AGENTS.md) even under a stale cache:
-///   1. stat candidates whose volume is cached-reachable, unknown, or has no volume
-///      (the legacy catalog-root fallback) — the likely-live ones, in priority order;
-///   2. only if none of those exist, stat the deferred (cached-unreachable) ones too.
+/// `mode` is the caller's resolver policy (see [`ResolveMode`]) and decides what happens to
+/// candidates whose volume the reachability cache currently believes is unreachable:
+///   1. Both statting modes first stat the candidates whose volume is cached-reachable,
+///      unknown, or has no volume (the legacy catalog-root fallback) — the likely-live
+///      ones, in priority order.
+///   2. [`ResolveMode::OriginalRequired`] then stats the deferred (cached-unreachable)
+///      ones too, so the cache may only REORDER stats, never change the answer: a stale
+///      "unreachable" flag costs one deferred stat and "best available copy" (AGENTS.md)
+///      still holds. [`ResolveMode::FastDisplay`] skips this pass and answers `None`
+///      immediately, trading that guarantee for never touching an offline/hung NAS — only
+///      legal where `None` means "show the persistent thumbnail", never where it decides
+///      that a row or a file is gone.
 ///
-/// So a stale "unreachable" flag merely DEFERS a stat; if that copy is in fact present
-/// and is the best-priority one, pass 2 still finds it. This must be called from a
-/// blocking/worker context (each `exists()` may block on I/O).
-pub fn pick_existing(candidates: &[PathCandidate], health: &VolumeHealth) -> Option<PathBuf> {
+/// [`ResolveMode::PathClassification`] asks no filesystem question at all and therefore
+/// always yields `None` here; such callers want [`crate::catalog::Catalog::volume_for_path`]
+/// or [`crate::catalog::Catalog::photo_path_candidates`] instead.
+///
+/// Must be called from a blocking/worker context (each stat may block on I/O).
+pub fn pick_existing(
+    candidates: &[PathCandidate],
+    health: &VolumeHealth,
+    mode: ResolveMode,
+) -> Option<PathBuf> {
+    if !mode.stats_filesystem() {
+        return None;
+    }
     let mut deferred: Vec<&PathCandidate> = Vec::new();
 
     // Pass 1: candidates on reachable/unknown volumes (and the root fallback).
@@ -135,7 +177,7 @@ pub fn pick_existing(candidates: &[PathCandidate], health: &VolumeHealth) -> Opt
             Some(vid) => health.reachable(vid) != Some(false),
         };
         if likely_live {
-            if cand.path.exists() {
+            if candidate_exists(&cand.path) {
                 return Some(cand.path.clone());
             }
         } else {
@@ -143,10 +185,13 @@ pub fn pick_existing(candidates: &[PathCandidate], health: &VolumeHealth) -> Opt
         }
     }
 
-    // Pass 2: the cached-unreachable ones — the cache might be stale.
-    for cand in deferred {
-        if cand.path.exists() {
-            return Some(cand.path.clone());
+    // Pass 2: the cached-unreachable ones — the cache might be stale. Skipped by
+    // FastDisplay, which would rather fall back than wait on an offline volume.
+    if mode.verifies_unreachable() {
+        for cand in deferred {
+            if candidate_exists(&cand.path) {
+                return Some(cand.path.clone());
+            }
         }
     }
 
@@ -237,19 +282,146 @@ mod tests {
         std::fs::write(&cache_file, b"x").unwrap();
         std::fs::write(&primary_file, b"x").unwrap();
         let health = VolumeHealth::with_ttl(Duration::MAX);
-        assert_eq!(pick_existing(&cands, &health), Some(cache_file.clone()));
+        assert_eq!(
+            pick_existing(&cands, &health, ResolveMode::OriginalRequired),
+            Some(cache_file.clone())
+        );
 
         // Now mark volume 1 cached-unreachable and remove its file. Pass 1 skips it and
         // finds the primary (exists) — graceful fallback, answer still correct.
         std::fs::remove_file(&cache_file).unwrap();
         health.refresh(&[(1i64, "/nonexistent/deadbeef/mount".to_string())]);
         assert_eq!(health.reachable(1), Some(false));
-        assert_eq!(pick_existing(&cands, &health), Some(primary_file.clone()));
+        assert_eq!(
+            pick_existing(&cands, &health, ResolveMode::OriginalRequired),
+            Some(primary_file.clone())
+        );
 
         // A cached-unreachable volume that is in fact the ONLY copy is still found — pass 2
         // stats the deferred candidate, so a stale flag never wrongly yields None.
         std::fs::remove_file(&primary_file).unwrap();
         std::fs::write(&cache_file, b"x").unwrap();
-        assert_eq!(pick_existing(&cands, &health), Some(cache_file));
+        assert_eq!(
+            pick_existing(&cands, &health, ResolveMode::OriginalRequired),
+            Some(cache_file)
+        );
+    }
+
+    /// The offline-NAS split: the ONLY copy sits on a volume the cache believes is
+    /// unreachable, and the flag is stale (the file is actually there).
+    ///
+    /// - `FastDisplay` must not stat that volume at all — it answers `None` at once so the
+    ///   caller can serve the persistent thumbnail instead of waiting on the NAS.
+    /// - `OriginalRequired` must still find the copy; a cached flag may never turn a
+    ///   present original into "gone".
+    ///
+    /// The stat counter makes the avoided filesystem work observable rather than timed.
+    #[test]
+    fn fast_display_skips_cached_unreachable_volumes_that_original_required_still_stats() {
+        use crate::catalog::LocationRole;
+        let dir = temp_dir("fast-display");
+        let nas_dir = dir.join("nas");
+        std::fs::create_dir_all(&nas_dir).unwrap();
+        let nas_file = nas_dir.join("a.arw");
+        std::fs::write(&nas_file, b"x").unwrap();
+        let missing_local = dir.join("local").join("a.arw"); // never created
+
+        let cands = vec![
+            PathCandidate {
+                path: missing_local.clone(),
+                role: LocationRole::LocalCache,
+                volume_id: Some(1),
+            },
+            PathCandidate {
+                path: nas_file.clone(),
+                role: LocationRole::Backup,
+                volume_id: Some(2),
+            },
+        ];
+
+        // Force the offline condition: volume 2's base path does not exist, so a refresh
+        // caches "unreachable" — while the candidate FILE itself is still there. That is
+        // exactly a stale flag (NAS unmounted at check time, remounted since).
+        let health = VolumeHealth::with_ttl(Duration::MAX);
+        health.refresh(&[(2i64, dir.join("unmounted").to_string_lossy().to_string())]);
+        assert_eq!(health.reachable(2), Some(false), "volume 2 is cached-unreachable");
+
+        let _ = take_candidate_stats();
+        assert_eq!(
+            pick_existing(&cands, &health, ResolveMode::FastDisplay),
+            None,
+            "FastDisplay falls back instead of waiting on a cached-unreachable volume"
+        );
+        let fast_stats = take_candidate_stats();
+        assert_eq!(
+            fast_stats, 1,
+            "FastDisplay stats only the likely-live candidate, never the deferred one"
+        );
+
+        assert_eq!(
+            pick_existing(&cands, &health, ResolveMode::OriginalRequired),
+            Some(nas_file),
+            "OriginalRequired must still find the copy: the cache may only reorder stats"
+        );
+        let strict_stats = take_candidate_stats();
+        assert_eq!(
+            strict_stats, 2,
+            "OriginalRequired pays one extra stat to verify the cached-unreachable copy"
+        );
+        assert!(
+            fast_stats < strict_stats,
+            "the mode split is what saves the stat ({fast_stats} < {strict_stats})"
+        );
+    }
+
+    /// `FastDisplay` only ever *defers* to the fallback because of the CACHE. With no
+    /// cached "unreachable" verdict it stats normally and finds the same copy the strict
+    /// mode does — so an unmounted-but-unknown volume is never silently written off.
+    #[test]
+    fn fast_display_matches_strict_when_reachability_is_unknown() {
+        use crate::catalog::LocationRole;
+        let dir = temp_dir("fast-display-unknown");
+        let nas_dir = dir.join("nas");
+        std::fs::create_dir_all(&nas_dir).unwrap();
+        let nas_file = nas_dir.join("a.arw");
+        std::fs::write(&nas_file, b"x").unwrap();
+
+        let cands = vec![PathCandidate {
+            path: nas_file.clone(),
+            role: LocationRole::Backup,
+            volume_id: Some(2),
+        }];
+        let health = VolumeHealth::with_ttl(Duration::MAX); // nothing cached
+        assert_eq!(health.reachable(2), None);
+        assert_eq!(
+            pick_existing(&cands, &health, ResolveMode::FastDisplay),
+            Some(nas_file.clone())
+        );
+        assert_eq!(
+            pick_existing(&cands, &health, ResolveMode::OriginalRequired),
+            Some(nas_file)
+        );
+    }
+
+    /// `PathClassification` asks no filesystem question, so it performs zero stats even
+    /// when a candidate plainly exists. It is a DB-rows-only mode.
+    #[test]
+    fn path_classification_never_stats() {
+        use crate::catalog::LocationRole;
+        let dir = temp_dir("path-classification");
+        let file = dir.join("a.arw");
+        std::fs::write(&file, b"x").unwrap();
+        let cands = vec![PathCandidate {
+            path: file,
+            role: LocationRole::Primary,
+            volume_id: None,
+        }];
+        let health = VolumeHealth::with_ttl(Duration::MAX);
+        let _ = take_candidate_stats();
+        assert_eq!(
+            pick_existing(&cands, &health, ResolveMode::PathClassification),
+            None
+        );
+        assert_eq!(take_candidate_stats(), 0);
     }
 }

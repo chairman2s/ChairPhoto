@@ -13,7 +13,7 @@
 // Mirrors publishing.tsx. The localsend_* commands and the localsend:progress subscription
 // are owned here and go through ChairPhotoAPI, never through core api.ts or Tauri directly.
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import type { ChairPhotoAPI, Photo } from "../registry";
 import { listVersions, PhotoVersion } from "../api";
 import { useHostSelection } from "../host";
@@ -113,6 +113,14 @@ export function SendToDevicePanel({ api, onSent, preflight }: SendToDevicePanelP
   const [busy, setBusy] = useState(false);
   const [progress, setProgress] = useState<{ done: number; total: number } | null>(null);
   const [status, setStatus] = useState("");
+  /** The latest manual IP, readable from inside an in-flight scan. The scan below starts on
+   *  mount and resolves seconds later; its closure would otherwise still hold the empty
+   *  string it captured, and auto-select a discovered device over an address the user has
+   *  typed in the meantime — sending to the wrong device with no visible cause. */
+  const manualIpRef = useRef("");
+  /** Guards the mount scan against React StrictMode's deliberate double-invoke in dev, which
+   *  would otherwise fire two overlapping discovery passes on every open. */
+  const scannedOnMount = useRef(false);
 
   const reload = useCallback(() => {
     if (photoId == null) {
@@ -144,7 +152,14 @@ export function SendToDevicePanel({ api, onSent, preflight }: SendToDevicePanelP
     try {
       const found = await localsendDiscover(api);
       setDevices(found);
-      if (found.length && !found.some((d) => d.fingerprint === selectedFingerprint)) {
+      // Auto-select the first device only when the user has not typed an address. They are
+      // mutually exclusive inputs (`chosenDevice` prefers a selected device), so claiming the
+      // selection here would override a manual IP entered while this scan was in flight.
+      if (
+        found.length &&
+        !manualIpRef.current.trim() &&
+        !found.some((d) => d.fingerprint === selectedFingerprint)
+      ) {
         setSelectedFingerprint(found[0].fingerprint);
       }
       setStatus(found.length ? "" : "No devices found — enter an IP below.");
@@ -154,6 +169,20 @@ export function SendToDevicePanel({ api, onSent, preflight }: SendToDevicePanelP
       setScanning(false);
     }
   };
+
+  // Scan once when the panel opens. Without this the device list is empty until the user
+  // finds Refresh, which reads as "discovery is broken" — it was the first thing to go wrong
+  // when this panel was tested against a real device. Deliberately not re-run on any
+  // dependency: a pass takes about five seconds and re-scanning mid-interaction would fight
+  // the user's selection. Refresh stays the way to scan again.
+  useEffect(() => {
+    if (scannedOnMount.current) return;
+    scannedOnMount.current = true;
+    void discover();
+    // `discover` is recreated each render; depending on it would re-run this on every
+    // keystroke. The ref above is what makes "once" true, not the dependency list.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const activeVersion = versionId != null ? versions.find((v) => v.id === versionId) ?? null : null;
   const activePhoto = selected.find((p) => p.id === photoId) ?? null;
@@ -246,8 +275,10 @@ export function SendToDevicePanel({ api, onSent, preflight }: SendToDevicePanelP
             placeholder="Manual IP (e.g. 192.168.1.42)"
             value={manualIp}
             onChange={(e) => {
-              setManualIp(e.target.value);
-              if (e.target.value.trim()) setSelectedFingerprint("");
+              const next = e.target.value;
+              setManualIp(next);
+              manualIpRef.current = next;
+              if (next.trim()) setSelectedFingerprint("");
             }}
           />
           <input

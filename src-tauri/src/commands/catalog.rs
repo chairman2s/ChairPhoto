@@ -534,11 +534,8 @@ mod catalog_registry_tests {
     use super::test_env_helpers::EnvGuard;
 
     /// Create a unique temp dir for a test's `XDG_DATA_HOME` override.
-    fn temp_xdg(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("chairphoto-test-registry-{tag}"));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    fn temp_xdg(tag: &str) -> crate::test_support::TestTmpDir {
+        crate::test_support::TestTmpDir::new(&format!("registry-{tag}"))
     }
 
     // -----------------------------------------------------------------

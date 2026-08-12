@@ -6,8 +6,10 @@ use chairphoto_lib::catalog::{Catalog, LocationRole, PickState, StorageStatus, V
 use chairphoto_lib::catalog::PathCandidate;
 use std::path::PathBuf;
 
+mod common;
+
 /// Recursively collect `.jpg` files under a directory (test helper).
-fn walkdir_jpgs(dir: &PathBuf) -> Vec<PathBuf> {
+fn walkdir_jpgs(dir: &std::path::Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     if let Ok(entries) = std::fs::read_dir(dir) {
         for e in entries.flatten() {
@@ -23,14 +25,12 @@ fn walkdir_jpgs(dir: &PathBuf) -> Vec<PathBuf> {
 }
 
 /// Build a catalog in a unique temp dir and return (catalog, root).
-fn temp_catalog(tag: &str) -> (Catalog, PathBuf) {
-    let dir = std::env::temp_dir().join(format!("chairphoto-test-{tag}"));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+fn temp_catalog(tag: &str) -> (Catalog, common::TestSubPath) {
+    let dir = common::TestTmpDir::new(tag);
     let root = dir.join("photos");
     std::fs::create_dir_all(&root).unwrap();
     let catalog = Catalog::open(&dir.join("test.chairphoto"), &root).unwrap();
-    (catalog, root)
+    (catalog, dir.into_subpath("photos"))
 }
 
 #[test]
@@ -353,7 +353,8 @@ fn relocate_photo_repoints_path_and_clears_missing() {
     assert_eq!(catalog.resolve_photo_path(id).unwrap(), Some(moved.clone()));
 
     // A file outside the catalog root is rejected.
-    let outside = std::env::temp_dir().join("chairphoto-test-relocate-outside.ARW");
+    let outside_dir = common::TestTmpDir::new("relocate-outside");
+    let outside = outside_dir.join("outside.ARW");
     std::fs::write(&outside, b"x").unwrap();
     assert!(catalog.relocate_photo(id, &outside).is_err());
 }
@@ -918,8 +919,7 @@ fn grid_badge_batch_queries_accept_more_than_one_parameter_chunk() {
 
 #[test]
 fn rerooting_moves_the_catalog_root_volume() {
-    let dir = std::env::temp_dir().join("chairphoto-test-reroot");
-    let _ = std::fs::remove_dir_all(&dir);
+    let dir = common::TestTmpDir::new("reroot");
     let db = dir.join("c.chairphoto");
     let root_a = dir.join("libA");
     let root_b = dir.join("libB");
@@ -2040,7 +2040,9 @@ fn smart_album_combines_conditions_from_many_groups() {
 /// (one tag will pre-exist in catalog B to test overlapping taxonomy),
 /// ratings, pick state, an IPTC headline, a named version, and an edit record.
 /// Returns (catalog_a, root_a, photo1_uuid, photo2_uuid, batch_id).
-fn setup_catalog_a(tag: &str) -> (chairphoto_lib::catalog::Catalog, PathBuf, String, String, i64) {
+fn setup_catalog_a(
+    tag: &str,
+) -> (chairphoto_lib::catalog::Catalog, common::TestSubPath, String, String, i64) {
     use chairphoto_lib::catalog::{IptcFields, PickState};
 
     let (cat, root) = temp_catalog(tag);
@@ -2095,15 +2097,8 @@ fn bundle_round_trip_export_import_and_idempotent_reimport() {
         setup_catalog_a("bundle-rt-a");
 
     // Export the batch as a bundle zip.
-    let bundle_zip = std::env::temp_dir()
-        .join("chairphoto-bundle-roundtrip-test.chairphoto");
-    let _guard = {
-        struct Rm(PathBuf);
-        impl Drop for Rm {
-            fn drop(&mut self) { let _ = std::fs::remove_file(&self.0); }
-        }
-        Rm(bundle_zip.clone())
-    };
+    let bundle_zip = common::TestTmpDir::new("bundle-roundtrip-test")
+        .into_subpath("bundle.chairphoto");
 
     let gathered = gather_bundle(&cat_a, batch_id_a)
         .expect("gather_bundle must not fail")
@@ -2267,13 +2262,8 @@ fn bundle_import_merges_with_pre_existing_local_taxonomy() {
     let (cat_a, _root_a, uuid1, _uuid2, batch_id_a) =
         setup_catalog_a("bundle-tax-a");
 
-    let bundle_zip = std::env::temp_dir()
-        .join("chairphoto-bundle-taxonomy-test.chairphoto");
-    let _guard = {
-        struct Rm(PathBuf);
-        impl Drop for Rm { fn drop(&mut self) { let _ = std::fs::remove_file(&self.0); } }
-        Rm(bundle_zip.clone())
-    };
+    let bundle_zip = common::TestTmpDir::new("bundle-taxonomy-test")
+        .into_subpath("bundle.chairphoto");
 
     let gathered = gather_bundle(&cat_a, batch_id_a).unwrap().unwrap();
     write_bundle(&gathered, &bundle_zip, |_, _| {}).unwrap();
@@ -2552,15 +2542,14 @@ fn scan_folder_aborts_mid_run_and_stops_early() {
 // ---------------------------------------------------------------------------
 
 /// Create a named catalog in a fresh temp dir and return (Catalog, db_path, root).
-fn temp_catalog_named(tag: &str) -> (Catalog, PathBuf, PathBuf) {
-    let dir = std::env::temp_dir().join(format!("chairphoto-multi-{tag}"));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+fn temp_catalog_named(tag: &str) -> (Catalog, common::TestSubPath, PathBuf) {
+    let dir = common::TestTmpDir::new(&format!("multi-{tag}"));
     let root = dir.join("photos");
     std::fs::create_dir_all(&root).unwrap();
-    let db = dir.join(format!("{tag}.chairphoto"));
+    let db_name = format!("{tag}.chairphoto");
+    let db = dir.join(&db_name);
     let catalog = Catalog::open(&db, &root).unwrap();
-    (catalog, db, root)
+    (catalog, dir.into_subpath(&db_name), root)
 }
 
 // -----------------------------------------------------------------
@@ -2621,9 +2610,8 @@ fn open_catalog_keeps_stored_root_on_reopen() {
     drop(catalog);
 
     // Open again but supply a different root — the catalog must keep its stored root.
-    let root_b = std::env::temp_dir()
-        .join("chairphoto-multi-reroot-alt")
-        .join("photos");
+    let dir_b = common::TestTmpDir::new("multi-reroot-alt");
+    let root_b = dir_b.join("photos");
     std::fs::create_dir_all(&root_b).unwrap();
 
     let catalog2 = Catalog::open(&db, &root_b).unwrap();
@@ -2648,9 +2636,7 @@ fn open_catalog_keeps_stored_root_on_reopen() {
 // -----------------------------------------------------------------
 #[test]
 fn catalog_open_creates_file_when_absent() {
-    let dir = std::env::temp_dir().join("chairphoto-multi-absent");
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = common::TestTmpDir::new("multi-absent");
     let db = dir.join("fresh.chairphoto");
     let root = dir.join("photos");
 

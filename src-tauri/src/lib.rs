@@ -31,6 +31,8 @@ pub mod sharpness_indexer;
 pub mod sharpness_regions;
 #[cfg(feature = "slideshow")]
 pub mod slideshow;
+#[cfg(test)]
+mod test_support;
 pub mod thumbnails;
 mod volume_health;
 pub mod xmp;

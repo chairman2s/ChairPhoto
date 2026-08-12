@@ -1089,14 +1089,13 @@ mod faces_match_ownership_tests {
     use super::*;
     use crate::commands::catalog::{detach_catalog_and_trip_jobs, publish_catalog_and_reset_jobs};
 
-    fn temp_catalog(tag: &str) -> (Catalog, PathBuf) {
-        let dir = std::env::temp_dir().join(format!("chairphoto-faces-match-own-{tag}"));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+    fn temp_catalog(tag: &str) -> (Catalog, crate::test_support::TestSubPath) {
+        let dir = crate::test_support::TestTmpDir::new(&format!("faces-match-own-{tag}"));
         let root = dir.join("photos");
         std::fs::create_dir_all(&root).unwrap();
         let db = dir.join("catalog.chairphoto");
-        (Catalog::open(&db, &root).unwrap(), db)
+        let catalog = Catalog::open(&db, &root).unwrap();
+        (catalog, dir.into_subpath("catalog.chairphoto"))
     }
 
     fn state_with(catalog: Catalog) -> AppState {
@@ -1115,7 +1114,7 @@ mod faces_match_ownership_tests {
         let state = state_with(cat_a);
 
         let (db, _root, abort, job) = begin_faces_match_job(&state).unwrap();
-        assert_eq!(db, db_a);
+        assert_eq!(db, db_a.to_path_buf());
         assert!(!abort.load(Ordering::Relaxed));
         assert_eq!(state.faces_match_job.lock().unwrap().map(|s| s.job), Some(job));
 

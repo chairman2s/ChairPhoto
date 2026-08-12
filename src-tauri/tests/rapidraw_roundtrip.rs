@@ -12,6 +12,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, MutexGuard};
 
+mod common;
+
 /// Serialises the tests in this file — take it as the first line of every test.
 ///
 /// Each test writes an executable mock script and then execs it. The harness runs tests as
@@ -33,10 +35,8 @@ fn exec_guard() -> MutexGuard<'static, ()> {
 /// Build a catalog + root in a unique temp dir, index one source photo under the root, and
 /// return `(catalog, root, source_path, source_photo_id)`. The source resolves via the default
 /// volume, so `run_roundtrip`'s import + stack works against a real, resolvable original.
-fn setup(tag: &str) -> (PathBuf, PathBuf, PathBuf, i64) {
-    let dir = std::env::temp_dir().join(format!("chairphoto-rapidraw-it-{tag}"));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+fn setup(tag: &str) -> (common::TestSubPath, PathBuf, PathBuf, i64) {
+    let dir = common::TestTmpDir::new(&format!("rapidraw-it-{tag}"));
     let root = dir.join("photos");
     std::fs::create_dir_all(&root).unwrap();
     let db_path = dir.join("test.chairphoto");
@@ -57,7 +57,7 @@ fn setup(tag: &str) -> (PathBuf, PathBuf, PathBuf, i64) {
         .id;
     // Drop the catalog handle: run_roundtrip opens its own secondary connection.
     drop(catalog);
-    (db_path, root, source, source_id)
+    (dir.into_subpath("test.chairphoto"), root, source, source_id)
 }
 
 /// A 1x1 valid image; the format is inferred from `path`'s extension (jpg/tiff), so exiftool

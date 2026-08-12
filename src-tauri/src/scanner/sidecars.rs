@@ -109,9 +109,7 @@ mod tests {
 
     #[test]
     fn detects_rawtherapee_and_art_by_extension() {
-        let dir = std::env::temp_dir().join("chairphoto-sidecars-ext");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_support::TestTmpDir::new("sidecars-ext");
         let photo = dir.join("DSC1.ARW");
         touch(&photo, "raw");
         touch(&dir.join("DSC1.ARW.pp3"), "rt");
@@ -125,9 +123,7 @@ mod tests {
 
     #[test]
     fn attributes_xmp_to_darktable_and_lightroom() {
-        let dir = std::env::temp_dir().join("chairphoto-sidecars-xmp");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_support::TestTmpDir::new("sidecars-xmp");
 
         let dt = dir.join("DT.ARW");
         touch(&dt, "raw");
@@ -149,9 +145,7 @@ mod tests {
 
     #[test]
     fn chairphoto_own_xmp_is_not_an_external_edit() {
-        let dir = std::env::temp_dir().join("chairphoto-sidecars-own");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_support::TestTmpDir::new("sidecars-own");
         let photo = dir.join("MINE.ARW");
         touch(&photo, "raw");
         // Resembles chairphoto's own sidecar: dc:subject + chairphoto namespace, no
@@ -171,9 +165,7 @@ mod tests {
         // RapidRAW writes a `<filename>.rrdata` JSON sidecar next to the source. It must not
         // be mistaken for an external develop sidecar (that would falsely mark the RAW
         // "edited" and would break the "edited" filter).
-        let dir = std::env::temp_dir().join("chairphoto-sidecars-rrdata");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_support::TestTmpDir::new("sidecars-rrdata");
         let photo = dir.join("DSC1.ARW");
         touch(&photo, "raw");
         touch(&dir.join("DSC1.ARW.rrdata"), r#"{"edits":{}}"#);
@@ -182,9 +174,7 @@ mod tests {
 
     #[test]
     fn no_sidecars_means_no_editors() {
-        let dir = std::env::temp_dir().join("chairphoto-sidecars-none");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_support::TestTmpDir::new("sidecars-none");
         let photo = dir.join("PLAIN.ARW");
         touch(&photo, "raw");
         assert!(detect_external_editors(&photo).is_empty());

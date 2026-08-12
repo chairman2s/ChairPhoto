@@ -101,6 +101,36 @@ partial upload it may or may not commit. Instagram cannot be cancelled by us at 
 supervised case — the post is finished by the user, in a browser ChairPhoto deliberately
 does not own; closing that window is the cancel.
 
+## Rendering and upload strategy: render-first by design
+
+Every upload path renders to a JPEG first and reads the whole render into memory before sending:
+
+| Path | How it reads the render | Approx. peak |
+|---|---|---|
+| Flickr (`flickr/mod.rs:739`) | `fs::read()` into memory | ~5–25 MB |
+| SmugMug (`smugmug/mod.rs:208`) | `fs::read()` into memory | ~5–25 MB |
+| LocalSend (`localsend/mod.rs:310`) | `tokio::fs::read()` into memory, one file per loop iteration | ~5–25 MB |
+| Instagram (`commands/instagram.rs`) | rendered to disk, path passed to Chrome (not uploaded by ChairPhoto) | ~200 KB (1080px cap) |
+
+This design is deliberate. **Peak exposure is roughly one full-resolution JPEG** (~5–25 MB for Flickr,
+SmugMug, and LocalSend; ~200 KB for Instagram). LocalSend's batch loop reads one file at a time
+(not fifty simultaneously), so a 50-photo send peaks at one JPEG in memory, not fifty. Streaming
+would add async-body plumbing and OAuth signing complexity across multiple modules to save memory
+that is not scarce at these sizes.
+
+### The tripwire: originals and video
+
+**If any upload path is changed to send an original rather than a render, it must stream the body
+first.** This is a condition on future change:
+
+- A RAW original is 25–80 MB.
+- A video original runs to gigabytes. `fs::read()` on one is a real problem, not a theoretical
+  concern.
+
+Today every path renders to JPEG specifically because RAW decode is slow, so the constraint is not
+yet active. It is recorded here against the condition that would trigger it, so that whoever changes
+an upload path to send originals meets the requirement before writing the code rather than after.
+
 Temp renders do not depend on any of this. Each job renders into a directory of its own that
 is removed when the job ends, whichever way it ends — see `publishing::JobTempDir` in
 `src-tauri/src/commands/publishing.rs`, and [instagram.md](instagram.md) for the one flow

@@ -45,6 +45,9 @@ const ANNOUNCE_BURST_INTERVAL: Duration = Duration::from_millis(1250);
 /// it either way, see the module docs). `discover()` does **not** use it for the port it
 /// announces: it advertises whatever port its discovery socket actually bound, via
 /// [`our_info_with_port`], since that can differ from 53317 (see `open_reusable_udp_socket`).
+/// How long each scheme gets in [`probe_protocol`]. Short: it is a LAN round trip against a
+/// device the user just typed the address of, and a wrong guess costs the whole send.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(4);
 const OUR_ALIAS: &str = "ChairPhoto";
 const OUR_PORT: u16 = 53317;
 
@@ -636,6 +639,42 @@ fn parse_prepare_response(text: &str) -> Result<UploadSession, String> {
     Ok(UploadSession { session_id, tokens })
 }
 
+/// Which scheme a peer at `ip:port` actually speaks, by asking `/info` over each.
+///
+/// A discovered device announces its own `protocol`, but a **manually entered** address does
+/// not — there is no announcement to read, and the two schemes share port 53317. Guessing
+/// wrong is not a graceful degradation: an `http` request to a TLS listener fails with a
+/// transport error that says nothing useful, and (since [`client_for`] only attaches our
+/// client certificate for `https`) it also skips the identity that peers requiring mutual TLS
+/// demand.
+///
+/// `https` is tried first because current LocalSend builds use it — verified against the
+/// desktop app v2.1 and iOS v2.2, both of which serve https and neither of which answers
+/// plain http on that port. Returns `None` when neither answers, leaving the caller to pick a
+/// default and let the real error surface rather than inventing one here.
+pub async fn probe_protocol(ip: &str, port: u16) -> Option<&'static str> {
+    for scheme in ["https", "http"] {
+        let probe = Device {
+            alias: String::new(),
+            device_model: None,
+            device_type: None,
+            ip: ip.to_string(),
+            port,
+            protocol: scheme.to_string(),
+            fingerprint: String::new(),
+        };
+        let Ok(client) = client_for(&probe) else { continue };
+        let url = format!("{}/info", base_url(&probe));
+        let attempt = tokio::time::timeout(PROBE_TIMEOUT, client.get(&url).send()).await;
+        if let Ok(Ok(resp)) = attempt {
+            if resp.status().is_success() {
+                return Some(scheme);
+            }
+        }
+    }
+    None
+}
+
 /// Send `paths` to `device` over LocalSend v2: prepare-upload (retrying with `?pin=` on a 401
 /// from a PIN-protected receiver), then upload each file's raw bytes. `progress(done, total)`
 /// is called after each file completes (LS2 forwards it to a `localsend:progress` event).
@@ -648,6 +687,18 @@ pub async fn send_files(
     if paths.is_empty() {
         return Err("LocalSend: nothing to send".into());
     }
+
+    // A manually entered address carries no announced scheme (see `probe_protocol`). Resolve
+    // it once here rather than guessing, so the send and the client certificate both target
+    // what the peer actually speaks.
+    let resolved;
+    let device = if device.protocol.trim().is_empty() {
+        let scheme = probe_protocol(&device.ip, device.port).await.unwrap_or("https");
+        resolved = Device { protocol: scheme.to_string(), ..device.clone() };
+        &resolved
+    } else {
+        device
+    };
 
     // Build per-file metadata, keying each by a stable id (its index).
     let metas: Vec<FileMeta> = paths

@@ -193,6 +193,28 @@ pub fn write_identifier(photo_path: &Path, uuid: &str) -> Result<(), String> {
     doc.commit()
 }
 
+/// Replace an `xmp:Identifier` that belongs to somebody else with `uuid` — the Overwrite
+/// half of resolving an identity conflict (issue #33), and the ONLY writer allowed to
+/// destroy an identifier it did not write. Everything else in the sidecar is preserved,
+/// exactly as in [`write_identifier`].
+///
+/// Returns the path the previous sidecar was copied to, or `None` if nothing was backed up
+/// (no sidecar existed yet, or a backup from an earlier write is already there and was
+/// deliberately not replaced). Unlike [`write_identifier`], the backup does not depend on
+/// `chairphoto:LastWrite`: a sidecar chairphoto has written can still carry a foreign
+/// identifier, and that is precisely the case this function exists for. See
+/// `document::BackupPolicy`.
+pub fn overwrite_identifier(photo_path: &Path, uuid: &str) -> Result<Option<PathBuf>, String> {
+    let mut doc = SidecarDocument::open_forcing_backup(photo_path)?;
+    let backup = doc.backup().map(|p| p.to_path_buf());
+    doc.replace_owned(
+        &[(NS_XMP, "Identifier")],
+        vec![plain("xmp", NS_XMP, "Identifier", uuid)],
+    );
+    doc.commit()?;
+    Ok(backup)
+}
+
 /// Write the import-batch UUID into the photo's XMP sidecar as
 /// `chairphoto:ImportBatch`, merge-safe: only that field (and
 /// `chairphoto:LastWrite`) are touched; all other content is preserved.
@@ -882,6 +904,92 @@ mod tests {
         let xmp = read(&sidecar_path(&photo));
         assert_eq!(xmp.matches("xmp:Identifier").count(), 2, "one open + one close tag only");
         assert!(xmp.contains("x"), "IPTC field survived the identifier rewrite");
+    }
+
+    /// Overwrite (issue #33) destroys an identifier chairphoto did not write, so the
+    /// pre-existing sidecar must be preserved verbatim first — and everything else in that
+    /// sidecar (here darktable's element) must survive the rewrite, exactly as
+    /// `write_identifier` guarantees.
+    #[test]
+    fn overwrite_identifier_backs_up_the_foreign_sidecar_and_preserves_the_rest() {
+        let dir = crate::test_support::TestTmpDir::new("xmp-overwrite-foreign");
+        let photo = dir.join("DSC20.ARW");
+        std::fs::write(&photo, b"raw").unwrap();
+        let existing = r#"<?xml version="1.0" encoding="UTF-8"?>
+<x:xmpmeta xmlns:x="adobe:ns:meta/">
+ <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+  <rdf:Description rdf:about="" xmlns:darktable="http://darktable.sf.net/"
+    xmlns:xmp="http://ns.adobe.com/xap/1.0/">
+   <darktable:history_end>7</darktable:history_end>
+   <xmp:Identifier>somebody-elses-uuid</xmp:Identifier>
+  </rdf:Description>
+ </rdf:RDF>
+</x:xmpmeta>"#;
+        std::fs::write(sidecar_path(&photo), existing).unwrap();
+
+        let backup = overwrite_identifier(&photo, "our-uuid").unwrap();
+        assert_eq!(backup.as_deref(), Some(sidecar_backup_path(&sidecar_path(&photo)).as_path()));
+        assert_eq!(std::fs::read_to_string(backup.unwrap()).unwrap(), existing,
+            "the destroyed identifier must survive verbatim in the backup");
+
+        assert_eq!(read_identifier(&photo).as_deref(), Some("our-uuid"));
+        let xmp = read(&sidecar_path(&photo));
+        assert!(xmp.contains("history_end"), "foreign element clobbered by the overwrite");
+        assert!(!xmp.contains("somebody-elses-uuid"), "the conflicting identifier must be gone");
+        assert_eq!(xmp.matches("xmp:Identifier").count(), 2, "one open + one close tag only");
+    }
+
+    /// The case plain `write_identifier` would NOT back up: a sidecar chairphoto has already
+    /// written (it carries `chairphoto:LastWrite`) that nevertheless holds a foreign
+    /// identifier — the ordinary result of duplicating a file after import. Overwrite must
+    /// still preserve it, because it is about to destroy that identifier.
+    #[test]
+    fn overwrite_identifier_backs_up_even_a_chairphoto_written_sidecar() {
+        let dir = crate::test_support::TestTmpDir::new("xmp-overwrite-ours");
+        let photo = dir.join("DSC21.ARW");
+        std::fs::write(&photo, b"raw").unwrap();
+        // chairphoto writes it once (stamping LastWrite), then the file is duplicated and
+        // ends up under a row whose catalog uuid is different.
+        write_identifier(&photo, "uuid-of-the-original").unwrap();
+        let backup_path = sidecar_backup_path(&sidecar_path(&photo));
+        assert!(!backup_path.exists(), "no backup yet: nothing existed before the first write");
+        let before = read(&sidecar_path(&photo));
+
+        let backup = overwrite_identifier(&photo, "uuid-of-the-duplicate").unwrap();
+        assert_eq!(backup.as_deref(), Some(backup_path.as_path()),
+            "a chairphoto-written sidecar must still be backed up before Overwrite destroys \
+             an identifier — `chairphoto:LastWrite` does not make the identifier ours");
+        assert_eq!(std::fs::read_to_string(&backup_path).unwrap(), before);
+        assert_eq!(read_identifier(&photo).as_deref(), Some("uuid-of-the-duplicate"));
+    }
+
+    /// A backup that already exists is the earliest state we ever saw. A later Overwrite
+    /// must not trade it away for a newer, chairphoto-written one.
+    #[test]
+    fn overwrite_identifier_never_replaces_an_existing_backup() {
+        let dir = crate::test_support::TestTmpDir::new("xmp-overwrite-keeps-backup");
+        let photo = dir.join("DSC22.ARW");
+        std::fs::write(&photo, b"raw").unwrap();
+        let original = r#"<?xml version="1.0" encoding="UTF-8"?>
+<x:xmpmeta xmlns:x="adobe:ns:meta/">
+ <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+  <rdf:Description rdf:about="" xmlns:xmp="http://ns.adobe.com/xap/1.0/">
+   <xmp:Identifier>first-foreign-uuid</xmp:Identifier>
+  </rdf:Description>
+ </rdf:RDF>
+</x:xmpmeta>"#;
+        std::fs::write(sidecar_path(&photo), original).unwrap();
+
+        overwrite_identifier(&photo, "second-uuid").unwrap();
+        let backup_path = sidecar_backup_path(&sidecar_path(&photo));
+        assert_eq!(std::fs::read_to_string(&backup_path).unwrap(), original);
+
+        // A second Overwrite reports no new backup and leaves the original snapshot intact.
+        let backup = overwrite_identifier(&photo, "third-uuid").unwrap();
+        assert_eq!(backup, None, "an existing backup is left alone, and reported as such");
+        assert_eq!(std::fs::read_to_string(&backup_path).unwrap(), original,
+            "the earliest snapshot must survive later overwrites");
+        assert_eq!(read_identifier(&photo).as_deref(), Some("third-uuid"));
     }
 
     #[test]

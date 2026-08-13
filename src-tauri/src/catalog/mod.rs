@@ -30,8 +30,9 @@ mod performance_harness;
 
 pub use facets::{Facet, SOFT_THRESHOLD_DEFAULT, SOFT_THRESHOLD_KEY};
 pub use identity::{
-    bind_sidecar_identity, IdentityRepairPlan, IdentityRepairSummary, PendingIdentity,
-    PendingIdentityField, PendingIdentityRow, PendingIdentitySummary, SidecarIdentity,
+    bind_sidecar_identity, IdentityConflictAction, IdentityConflictOutcome, IdentityRepairPlan,
+    IdentityRepairSummary, PendingIdentity, PendingIdentityField, PendingIdentityRow,
+    PendingIdentitySummary, SidecarIdentity,
 };
 pub use locations::{PathCandidate, ResolveMode};
 pub use lifecycle::{copy_and_verify, verify_and_delete_locals, BackupPlan, OffloadPlan, RestorePlan};
@@ -299,6 +300,14 @@ impl Catalog {
             .and_then(|v| v.parse().ok())
             .unwrap_or(0);
         self.migrate_sidecar_identity_fields()?;
+        // Schema v22 (#33): a dismissed conflict stops being retried and stops counting as
+        // debt. Must run AFTER `migrate_sidecar_identity_fields`, whose v20→v21 rebuild
+        // recreates the table without this column.
+        self.ensure_column(
+            "pending_sidecar_identity",
+            "dismissed_at",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
         if prior_version < 2 {
             // Introduce the physical-location layer: default volume + backfill.
             self.backfill_default_volume()?;
@@ -2194,5 +2203,111 @@ mod tests {
 
         drop(catalog);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Schema v22 (#33) adds `pending_sidecar_identity.dismissed_at`, and it must be there
+    /// after the FIRST open of an older catalog — every query in `catalog/identity.rs` now
+    /// names that column, so a catalog missing it does not degrade, it fails outright.
+    ///
+    /// Both older shapes are exercised, because they take different routes to the column: a
+    /// **v21** catalog already has the table (`SCHEMA_SQL`'s `CREATE TABLE IF NOT EXISTS` is
+    /// a no-op) and gets the column from `ensure_column`; a **v20** catalog is additionally
+    /// rebuilt by `migrate_sidecar_identity_fields`, whose `CREATE TABLE`/`DROP TABLE` does
+    /// NOT include `dismissed_at` — so ordering `ensure_column` before that rebuild, rather
+    /// than after it, would leave a v20 upgrade without the column while a v21 upgrade
+    /// passed. Existing rows must default to 0 (not dismissed): the column records a human
+    /// decision, and nobody has made one for a row that predates the feature.
+    ///
+    /// The v21 fixture carries a pre-existing queue row and asserts it comes back not
+    /// dismissed. The v20 one deliberately does not: `migrate_sidecar_identity_fields`
+    /// copies rows into a table that declares `REFERENCES photos(id)`, so a synthetic row
+    /// pointing at no photo would abort the whole open on a foreign-key violation — which
+    /// says nothing about this column.
+    #[test]
+    fn older_catalogs_gain_the_dismissed_at_column_on_first_open() {
+        for (label, create_sql, seeded_row) in [
+            (
+                "v21",
+                "CREATE TABLE pending_sidecar_identity (
+                    photo_id        INTEGER NOT NULL,
+                    field           TEXT NOT NULL DEFAULT 'identifier',
+                    volume_id       INTEGER NOT NULL,
+                    relative_path   TEXT NOT NULL,
+                    attempts        INTEGER NOT NULL DEFAULT 1,
+                    error           TEXT NOT NULL DEFAULT '',
+                    queued_at       INTEGER NOT NULL,
+                    last_attempt_at INTEGER NOT NULL,
+                    PRIMARY KEY(photo_id, field, volume_id, relative_path)
+                 );
+                 INSERT INTO pending_sidecar_identity
+                    (photo_id, field, volume_id, relative_path, queued_at, last_attempt_at)
+                 VALUES(1, 'identifier', 1, 'old.arw', 10, 10);",
+                true,
+            ),
+            (
+                "v20",
+                "CREATE TABLE pending_sidecar_identity (
+                    photo_id        INTEGER NOT NULL,
+                    volume_id       INTEGER NOT NULL,
+                    relative_path   TEXT NOT NULL,
+                    attempts        INTEGER NOT NULL DEFAULT 1,
+                    error           TEXT NOT NULL DEFAULT '',
+                    queued_at       INTEGER NOT NULL,
+                    last_attempt_at INTEGER NOT NULL,
+                    PRIMARY KEY(photo_id, volume_id, relative_path)
+                 );",
+                false,
+            ),
+        ] {
+            let suffix = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            let dir = std::env::temp_dir().join(format!(
+                "chairphoto-v22-migration-{label}-{}-{suffix}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            let root = dir.join("photos");
+            std::fs::create_dir_all(&root).unwrap();
+            let catalog_path = dir.join("old.chairphoto");
+            {
+                let raw = Connection::open(&catalog_path).unwrap();
+                raw.execute_batch(create_sql).unwrap();
+            }
+
+            let catalog = Catalog::open(&catalog_path, &root).unwrap();
+            let columns: Vec<String> = {
+                let mut stmt = catalog
+                    .conn
+                    .prepare("PRAGMA table_info(pending_sidecar_identity)")
+                    .unwrap();
+                stmt.query_map([], |r| r.get::<_, String>(1))
+                    .unwrap()
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .unwrap()
+            };
+            assert!(
+                columns.iter().any(|c| c == "dismissed_at"),
+                "{label}: expected dismissed_at on the FIRST open, got {columns:?}"
+            );
+            if seeded_row {
+                let dismissed: i64 = catalog
+                    .conn
+                    .query_row(
+                        "SELECT dismissed_at FROM pending_sidecar_identity
+                         WHERE relative_path = 'old.arw'",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(dismissed, 0, "{label}: a pre-existing row is not dismissed");
+            }
+            // The queue is usable end to end, not merely column-complete.
+            catalog.summarize_pending_identity().unwrap();
+
+            drop(catalog);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 }

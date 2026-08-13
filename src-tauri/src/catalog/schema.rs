@@ -5,7 +5,7 @@
 //!  2. Photo `path` is stored RELATIVE to the catalog root (see the
 //!     `catalog_root` setting), so a catalog can be remapped on import.
 
-pub const SCHEMA_VERSION: i64 = 21;
+pub const SCHEMA_VERSION: i64 = 22;
 
 pub const SCHEMA_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS settings (
@@ -334,6 +334,12 @@ CREATE TABLE IF NOT EXISTS pending_sidecar_identity (
     error           TEXT NOT NULL DEFAULT '',
     queued_at       INTEGER NOT NULL,
     last_attempt_at INTEGER NOT NULL,
+    -- Schema v22 (#33). When non-zero, a human decided to stop retrying this (copy, field):
+    -- the row is kept for the record, the repair pass skips it, and it stops counting as
+    -- debt (CONTEXT.md § Identity, "Dismiss"). Only conflicts can be dismissed today, and
+    -- the decision is reversible (Restore sets it back to 0). Existing catalogs get the
+    -- column from `Catalog::ensure_column`, defaulting every queued row to "not dismissed".
+    dismissed_at    INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY(photo_id, field, volume_id, relative_path)
 );
 

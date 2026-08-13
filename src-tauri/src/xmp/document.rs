@@ -23,12 +23,36 @@
 //! sidecar produced by export is a throwaway copy, not the in-library original, so
 //! [`SidecarDocument::open_no_backup`] skips the backup entirely. Only [`super::write_keywords`]
 //! (the export keyword writer) uses it today.
+//!
+//! One writer needs the *stronger* rule: resolving an identity conflict by Overwrite (issue
+//! #33) deliberately destroys the `xmp:Identifier` another tool put in the file, which the
+//! `chairphoto:LastWrite` test alone would not protect — a sidecar chairphoto has already
+//! written can still carry a foreign identifier (a file duplicated after import is the
+//! ordinary way that happens). [`SidecarDocument::open_forcing_backup`] therefore backs up
+//! regardless of `chairphoto:LastWrite`. It still never *replaces* an existing backup: the
+//! backup slot holds the earliest state we ever saw, which is strictly more valuable than
+//! the current one.
 
 use std::path::{Path, PathBuf};
 use xmltree::{Element, Namespace, XMLNode};
 
 use super::{child_mut, declare_namespaces, new_root, now, plain, sidecar_backup_path,
     sidecar_path, NS_CHAIRPHOTO, NS_RDF};
+
+/// When [`SidecarDocument::open`] copies the existing sidecar to `<sidecar>.chairphoto-backup`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum BackupPolicy {
+    /// AGENTS.md "XMP safety": back up an existing sidecar that lacks `chairphoto:LastWrite`
+    /// — i.e. one chairphoto has never written — before the first mutation. Every in-library
+    /// writer uses this.
+    BeforeFirstWrite,
+    /// Back up an existing sidecar even if chairphoto has written it before, because this
+    /// write destroys data no other writer touches (see the module docs). Never overwrites a
+    /// backup that already exists.
+    Always,
+    /// Never back up — export destination copies only (AGENTS.md).
+    Never,
+}
 
 /// A parsed (or freshly created) XMP sidecar document, mid-transaction.
 ///
@@ -39,6 +63,9 @@ use super::{child_mut, declare_namespaces, new_root, now, plain, sidecar_backup_
 pub(super) struct SidecarDocument {
     path: PathBuf,
     root: Element,
+    /// Where this open copied the pre-existing sidecar, if it did. Reported so a
+    /// destructive writer can tell the user what it preserved and where.
+    backup: Option<PathBuf>,
 }
 
 impl SidecarDocument {
@@ -47,17 +74,24 @@ impl SidecarDocument {
     /// present (defaulting to `""`), applies the backup-once policy (see module docs), and
     /// declares the base chairphoto namespace set every writer needs.
     pub(super) fn open(photo_path: &Path) -> Result<Self, String> {
-        Self::open_impl(photo_path, true)
+        Self::open_impl(photo_path, BackupPolicy::BeforeFirstWrite)
     }
 
     /// Same as [`Self::open`], but never backs up — for export destination writers, which are
     /// not subject to the in-library backup-once rule (AGENTS.md: "Export-only destination
     /// copies are not subject to this rule").
     pub(super) fn open_no_backup(photo_path: &Path) -> Result<Self, String> {
-        Self::open_impl(photo_path, false)
+        Self::open_impl(photo_path, BackupPolicy::Never)
     }
 
-    fn open_impl(photo_path: &Path, apply_backup_policy: bool) -> Result<Self, String> {
+    /// Same as [`Self::open`], but backs up an existing sidecar even when chairphoto has
+    /// written it before — for the one writer that destroys a field it does not own
+    /// ([`super::overwrite_identifier`], issue #33's Overwrite). See the module docs.
+    pub(super) fn open_forcing_backup(photo_path: &Path) -> Result<Self, String> {
+        Self::open_impl(photo_path, BackupPolicy::Always)
+    }
+
+    fn open_impl(photo_path: &Path, backup_policy: BackupPolicy) -> Result<Self, String> {
         let path = sidecar_path(photo_path);
         let existed = path.exists();
 
@@ -74,15 +108,35 @@ impl SidecarDocument {
             .entry("rdf:about".to_string())
             .or_insert_with(String::new);
 
-        // Back up a foreign sidecar exactly once (before we've ever marked it) — a
-        // document-level decision, made before any writer-specific mutation runs.
-        if apply_backup_policy && existed && !has_chairphoto_last_write(desc) {
-            std::fs::copy(&path, sidecar_backup_path(&path)).ok();
-        }
+        // Back up the existing sidecar before any writer-specific mutation runs — a
+        // document-level decision (see module docs), not a per-writer one.
+        let wants_backup = existed
+            && match backup_policy {
+                BackupPolicy::BeforeFirstWrite => !has_chairphoto_last_write(desc),
+                BackupPolicy::Always => true,
+                BackupPolicy::Never => false,
+            };
+        let backup_path = sidecar_backup_path(&path);
+        // An existing backup is never replaced: it is the earliest state we ever saw, and
+        // `BackupPolicy::Always` must not trade that away for a newer, chairphoto-written
+        // one. `BeforeFirstWrite` cannot reach an existing backup twice anyway (the first
+        // write stamps `chairphoto:LastWrite`), so this only ever binds for `Always`.
+        let backup = if wants_backup && !backup_path.exists() {
+            std::fs::copy(&path, &backup_path).ok().map(|_| backup_path)
+        } else {
+            None
+        };
 
         declare_namespaces(desc);
 
-        Ok(Self { path, root })
+        Ok(Self { path, root, backup })
+    }
+
+    /// Where this open copied the pre-existing sidecar, if it did. `None` when nothing was
+    /// backed up — a fresh sidecar, a policy that skipped it, or a backup that already
+    /// existed and was therefore left alone.
+    pub(super) fn backup(&self) -> Option<&Path> {
+        self.backup.as_deref()
     }
 
     /// The `rdf:Description` element every writer mutates.
@@ -206,6 +260,48 @@ mod tests {
 
         let _doc = SidecarDocument::open(&p).unwrap();
         assert!(!backup.exists(), "a sidecar chairphoto already wrote must not be re-backed-up");
+    }
+
+    /// `open_forcing_backup` backs up a sidecar chairphoto has already written — the case
+    /// `BeforeFirstWrite` deliberately skips — and reports where. This is what makes
+    /// Overwrite (issue #33) safe when the conflicting identifier sits in a sidecar we wrote.
+    #[test]
+    fn open_forcing_backup_backs_up_even_after_chairphoto_wrote() {
+        let (_dir, p) = photo("doc-force-backup", "H.ARW");
+        SidecarDocument::open(&p).unwrap().commit().unwrap(); // stamps LastWrite
+        let backup = sidecar_backup_path(&sidecar_path(&p));
+        assert!(!backup.exists());
+        let written = std::fs::read_to_string(sidecar_path(&p)).unwrap();
+
+        let doc = SidecarDocument::open_forcing_backup(&p).unwrap();
+        assert_eq!(doc.backup(), Some(backup.as_path()), "must report the backup it took");
+        assert_eq!(std::fs::read_to_string(&backup).unwrap(), written);
+    }
+
+    /// `open_forcing_backup` never replaces an existing backup — the earliest state we saw
+    /// outranks the current one — and says so by reporting `None`.
+    #[test]
+    fn open_forcing_backup_keeps_an_existing_backup() {
+        let (_dir, p) = photo("doc-force-keep", "I.ARW");
+        std::fs::write(sidecar_path(&p), FOREIGN).unwrap();
+        SidecarDocument::open(&p).unwrap().commit().unwrap(); // backs FOREIGN up
+        let backup = sidecar_backup_path(&sidecar_path(&p));
+        assert_eq!(std::fs::read_to_string(&backup).unwrap(), FOREIGN);
+
+        let doc = SidecarDocument::open_forcing_backup(&p).unwrap();
+        assert_eq!(doc.backup(), None, "no NEW backup was taken");
+        assert_eq!(std::fs::read_to_string(&backup).unwrap(), FOREIGN,
+            "the pre-chairphoto snapshot must not be traded for a newer one");
+    }
+
+    /// Nothing to preserve, nothing to report: forcing a backup on a photo with no sidecar
+    /// yet must not invent an empty one.
+    #[test]
+    fn open_forcing_backup_does_nothing_without_an_existing_sidecar() {
+        let (_dir, p) = photo("doc-force-fresh", "J.ARW");
+        let doc = SidecarDocument::open_forcing_backup(&p).unwrap();
+        assert_eq!(doc.backup(), None);
+        assert!(!sidecar_backup_path(&sidecar_path(&p)).exists());
     }
 
     /// `open_no_backup` never backs up, even when the sidecar is foreign — the export

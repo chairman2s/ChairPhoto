@@ -718,8 +718,10 @@ export const reconcileNow = () => invoke<DrainSummary>("reconcile_now");
 // much as a failed write), not a failure — never render it as an error.
 
 /** One of the CONTEXT.md § Identity states a queued copy can be in. `bound` never appears
- *  here — a copy is removed from the queue the moment it's bound. */
-export type IdentityDebtState = "unreachable" | "unwritable" | "conflict";
+ *  here — a copy is removed from the queue the moment it's bound. `dismissed` is a decision
+ *  rather than a failure: the row is kept for the record, never retried, and not counted as
+ *  debt (see `resolveIdentityConflict`). */
+export type IdentityDebtState = "unreachable" | "unwritable" | "conflict" | "dismissed";
 
 /** One field a COPY still owes (`identifier` = xmp:Identifier, `import_batch` =
  *  chairphoto:ImportBatch), with its own retry history. A copy can owe up to both,
@@ -729,9 +731,13 @@ export interface PendingIdentityField {
   state: IdentityDebtState;
   attempts: number;
   /** Human-readable detail (e.g. the write error, or the conflicting UUID found). The
-   *  single most useful fact on a Conflict field — render it. */
+   *  single most useful fact on a Conflict field — render it. Survives a dismissal, so a
+   *  user deciding whether to restore can still see what the conflict was. */
   error: string;
   lastAttemptAt: number;
+  /** When this field was dismissed, or 0. Per FIELD: a copy on the active page can carry a
+   *  dismissed field while still owing the other one. */
+  dismissedAt: number;
 }
 
 /** One COPY still owing at least one sidecar field. Matches `pending_sidecar_identity`
@@ -762,11 +768,16 @@ export interface PendingIdentity {
  *  are in COPIES (`photoId` + `volumeId` + `relativePath`), not queue rows: a copy owing
  *  both `identifier` and `import_batch` is one copy, not two. */
 export interface PendingIdentitySummary {
-  /** Every queued copy, any field, any state. */
+  /** Every queued copy still owing something, any field, any state. A copy whose every
+   *  field has been dismissed is in `dismissed` instead — the two are disjoint. */
   total: number;
-  /** Of `total`, how many have at least one field in `conflict` — need a human, not a
-   *  retry. */
+  /** Of `total`, how many have at least one un-dismissed field in `conflict` — need a
+   *  human, not a retry. */
   conflicts: number;
+  /** Copies whose every queued field was dismissed: kept on the record, never retried, and
+   *  deliberately not debt (CONTEXT.md § Identity). List them with
+   *  `listPendingIdentity(…, true)` to restore one. */
+  dismissed: number;
 }
 
 export interface IdentityRepairSummary {
@@ -786,17 +797,70 @@ export interface IdentityRepairSummary {
  *  of thousands of rows (74,488 on the 100k harness shape in #20), so this always pages
  *  via `limit`/`offset` rather than returning the whole queue in one IPC payload — pair
  *  with `summarizePendingIdentity()` for the total (same unit: copies), and a virtualized
- *  list for the page itself. */
-export const listPendingIdentity = (limit: number, offset: number) =>
-  invoke<PendingIdentity[]>("list_pending_identity", { limit, offset });
+ *  list for the page itself.
+ *
+ *  `includeDismissed` widens the page from the active queue (a slice of `summary.total`) to
+ *  every copy including dismissed ones (a slice of `total + dismissed`). It is the only way
+ *  back to a dismissal, so pair it with the `restore` action rather than offering it as a
+ *  bare "show more". */
+export const listPendingIdentity = (limit: number, offset: number, includeDismissed = false) =>
+  invoke<PendingIdentity[]>("list_pending_identity", { limit, offset, includeDismissed });
 /** Total debt + conflict counts, without transferring every row. Independent of
  *  `listPendingIdentity` — call/await it separately so a slow list fetch never delays the
  *  cheap header count. */
 export const summarizePendingIdentity = () =>
   invoke<PendingIdentitySummary>("summarize_pending_identity");
-/** Retry every queued copy now. Unreachable/unwritable/conflicted copies stay queued. */
+/** Retry every queued copy now. Unreachable/unwritable/conflicted copies stay queued;
+ *  dismissed ones are skipped entirely. */
 export const repairPendingIdentity = () =>
   invoke<IdentityRepairSummary>("repair_pending_identity");
+
+/** What to do about one conflicted copy — CONTEXT.md § Identity's vocabulary verbatim.
+ *  There is no default: the backend rejects anything that isn't one of these four, so a
+ *  missing or mistyped choice can never fall through to the destructive one. */
+export type IdentityConflictAction = "adopt" | "overwrite" | "dismiss" | "restore";
+
+/** What one `resolveIdentityConflict` actually did. Report it — never infer the result
+ *  from the action that was requested. */
+export interface IdentityConflictOutcome {
+  action: IdentityConflictAction;
+  photoId: number;
+  /** The photo's UUID after the resolution. Only `adopt` changes it. */
+  catalogUuid: string;
+  /** The identifier the sidecar carried before: the adopted value, or the one `overwrite`
+   *  destroyed. Empty for `dismiss`/`restore`, which read no file. */
+  previousSidecarUuid: string;
+  /** Other copies of this photo an `adopt` re-checked, because the photo's identity
+   *  changed under them. */
+  recheckedCopies: number;
+  /** Where `overwrite` preserved the previous sidecar. `null` when an older backup was
+   *  already there and was deliberately left alone. */
+  sidecarBackup: string | null;
+}
+
+/** Resolve one conflicted copy (issue #33). Identified by copy — `photoId` + `volumeId` +
+ *  `relativePath` — because debt is per copy: resolving one says nothing about the same
+ *  photo's other copies.
+ *
+ *  `adopt` changes the catalog's UUID for this photo, which is what catalog merge matches
+ *  on and what `chairphoto://<uuid>` links address; `overwrite` destroys the identifier in
+ *  the file (after backing the sidecar up). Both are consequential enough that the UI must
+ *  make the user pick one by name, and confirm the destructive one.
+ *
+ *  Rejections come back as messages naming what was refused — notably an adopt of an
+ *  identity another photo already holds, which is checked before anything is written. */
+export const resolveIdentityConflict = (
+  photoId: number,
+  volumeId: number,
+  relativePath: string,
+  action: IdentityConflictAction,
+) =>
+  invoke<IdentityConflictOutcome>("resolve_identity_conflict", {
+    photoId,
+    volumeId,
+    relativePath,
+    action,
+  });
 
 // --- export (one-way) ---
 

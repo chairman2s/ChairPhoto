@@ -103,7 +103,12 @@ function similarTagsPanel(api: ChairPhotoAPI): ReactNode {
   const withRegistration = makeApi({
     ...api,
     registerPanel: (panel) => {
-      if (panel.id === "smarttags-similar") node = panel.render();
+      if (panel.id !== "smarttags-similar") return;
+      // `render` is optional since #46 (external modules use `mount` instead), but
+      // Smart Tagging is bundled and must keep contributing React — asserting that
+      // here is the point, not a formality.
+      if (!panel.render) throw new Error("the smarttags-similar panel lost its render()");
+      node = panel.render();
     },
   });
   smartTaggingModule.onLoad(withRegistration);

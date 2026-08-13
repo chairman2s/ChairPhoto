@@ -68,6 +68,54 @@ the identifier it has, and the divergence stays visible for a human rather than 
 resolved by clobbering somebody else's identity. A sidecar failure never aborts a
 scan: one unwritable file must not cost the user the other 99,999 rows.
 
+### Resolving a conflict
+
+A conflict is not repairable by retrying, so it needs a person. The decision is made per
+**copy** — resolving one copy says nothing about the same photo's other copies — through
+`Catalog::resolve_identity_conflict` (`resolve_identity_conflict` over IPC, the identity
+debt panel in the UI). There is no default: an action is required, and the three outcomes
+are CONTEXT.md § Identity's, verbatim.
+
+| Decision | Changes the catalog | Changes the file |
+|---|---|---|
+| **Adopt** — the catalog takes the identity in the sidecar | `photos.uuid` | never |
+| **Overwrite** — the sidecar takes the catalog's identity | no | `xmp:Identifier`, after a backup |
+| **Dismiss** — stop retrying this copy | `dismissed_at` only | no |
+
+Dismiss (undone by Restore) keeps the queue row for the record while taking it out of the
+repair pass and out of the debt count. That is what lets a catalog whose only remaining
+debts are conflicts reach a clean terminal state instead of reporting the same
+unresolvable copies on every pass forever.
+
+Both file-reading decisions re-read the sidecar at decision time rather than trusting the
+queue row's recorded reason, which describes the last attempt, not the file now.
+
+**Adopt is refused if another photo already holds that identity**, naming the photo that
+does. `photos.uuid` is `UNIQUE`, so the write would fail regardless — but as an opaque
+constraint error, and resolving one conflict must not manufacture another.
+
+**Adopt changes what merge matches on.** Identity is the merge key (`merge_photo` looks up
+`photos WHERE uuid = ?`), so a catalog that has already been merged or bundled elsewhere
+holds the *previous* identity for that photo:
+
+- A bundle already written keeps the old UUID. Re-merging it creates a SECOND row for the
+  same photo rather than matching the adopted one; the two are then independent rows with
+  independent state. Adopt is therefore right when the sidecar is authoritative (a photo
+  re-imported into a fresh catalog, which is the case it exists for) and wrong as a way to
+  "tidy up" a photo whose identity has already travelled.
+- Any `chairphoto://<uuid>` deep link (Obsidian notes, the tag/photo links) still points at
+  the old identity and stops resolving.
+- The photo's other copies were bound to the old identity, so Adopt re-reads each of them
+  (never writes) and re-queues the ones that now diverge, rather than leaving the catalog
+  believing they are bound.
+
+**Overwrite** goes through `xmp::overwrite_identifier`, the one writer permitted to destroy
+an identifier it did not write. It preserves the sidecar first even when the file carries
+`chairphoto:LastWrite` — which the ordinary backup-once rule would skip, and which is
+exactly the case here, since a file duplicated after import carries both our stamp and
+somebody else's identity. An existing backup is never replaced: the earliest state we ever
+saw outranks the current one.
+
 ## Volumes (named storage locations)
 
 Locations never store absolute paths. They reference a **named volume** + a relative
@@ -425,8 +473,11 @@ catalog start un-aborted.
 - `smart_albums` — id, name, rule definition (AND conditions).
 - `pending_operations` — kind (backup/offload/restore), photo_id, target, status.
 - `pending_sidecar_identity` — photo_id, field (`identifier` or `import_batch`), attempts,
-  error, timestamps: sidecar identity fields that are in SQLite but not yet on disk.
-  No value column — `photos.uuid` and `import_batches.uuid` are the sources of truth.
+  error, timestamps, `dismissed_at`: sidecar identity fields that are in SQLite but not yet
+  on disk. No value column — `photos.uuid` and `import_batches.uuid` are the sources of
+  truth. A non-zero `dismissed_at` is a human's "stop retrying this copy" (see Resolving a
+  conflict): the row stays for the record, and leaves both the repair pass and the debt
+  count.
 
 ## Storage model
 

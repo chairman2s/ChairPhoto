@@ -378,8 +378,10 @@ root setting rather than silently using whatever the caller passed.
 
 `switch_catalog` performs a safe handoff in four steps:
 
-1. **Abort any in-flight scan** — sets `AppState::scan_abort` (`Arc<AtomicBool>`) so the
-   scan's per-file loop exits at its next cancellation point. The scan runs on its own
+1. **Abort every in-flight job** — trips the installed abort generation of every family in
+   `AppState::jobs` (scan, face indexing, face matching, sharpness, pHash, Smart Tagging)
+   and clears every queryable status slot, so a running job exits at its next cancellation
+   point and stops being reachable as a slot's owner. The scan runs on its own
    `open_secondary` connection, so the mutex is not held and the swap is not blocked by a
    running scan.
 2. **Close the current catalog** — drops the `Option<Catalog>` under the mutex. This
@@ -389,8 +391,12 @@ root setting rather than silently using whatever the caller passed.
 4. **Emit `catalog:switched`** — the frontend resets all React state (selection, filters,
    albums, scan progress) and re-queries the new catalog.
 
-The abort flag is cleared after the new catalog is open so subsequent scans on the new
-catalog start un-aborted.
+A *fresh* abort generation is installed for each family after the new catalog is open, so
+subsequent jobs start un-aborted while the old workers keep the flag they were given (and
+stay aborted). Steps 1–2 and the publish in step 3 are the two phases of one ownership
+transition; both, and every job start, live in `commands/jobs.rs`, which also carries the
+backend-wide lock order (catalog → abort generations → status slots). `set_library_root`
+runs the same transition — it replaces the catalog handle exactly as a switch does.
 
 ### Invariants
 

@@ -67,9 +67,12 @@ pub fn faces_inference_info(state: State<'_, AppState>) -> Result<FacesInference
     })
 }
 
-/// Set the global `indexing.speed` setting (`"background"` | `"full"`). Takes effect on
-/// the NEXT app start: the inference session pool is sized once at first build and cached
-/// for the process lifetime (see `engine::configure`).
+/// Set the global `indexing.speed` setting (`"background"` | `"full"`). Takes effect on the
+/// NEXT face-indexing run: `faces_index_photos` re-reads this setting and calls
+/// `engine::configure` before its parallel loop starts, and the session pool is now keyed by
+/// that configuration (`engine::PoolKey`, issue #18), so a changed value rebuilds it rather
+/// than being ignored until restart. A run already in progress keeps the pool it started
+/// with — see `engine::configure`'s doc comment for the cross-job edge case.
 #[cfg(feature = "faces")]
 #[tauri::command]
 pub fn faces_set_indexing_speed(state: State<'_, AppState>, speed: String) -> Result<(), String> {
@@ -296,13 +299,15 @@ pub async fn faces_index_photos(
 
         // Resolve the indexing-speed plan (setting `indexing.speed`, default `background`)
         // against the host's core count, then size the ONNX session pool + intra-op threads
-        // to it before the first inference builds the pool. `configure` is a no-op once a
-        // pool exists (first run wins), so `background` stays the responsive default.
+        // to it before the first inference builds the pool. The pool is keyed by this
+        // configuration (`engine::PoolKey`), so a value that changed since the last run
+        // rebuilds it here rather than reusing a stale pool.
         let plan = shared_indexing::load_indexing_plan(sec.conn());
         crate::plugins::faces::engine::configure(plan.parallelism, plan.intra_threads);
         // Honor the `faces.force_cpu` setting: in a `faces-cuda` build this keeps inference on
-        // CPU even when a GPU is available (inert in a CPU-only build). Also a no-op once the
-        // pool exists, so it must be set before the first inference — same lifecycle as above.
+        // CPU even when a GPU is available (inert in a CPU-only build). Same lifecycle as
+        // above — set before this run's first inference, which is what makes a toggle since
+        // the last run rebuild the pool instead of being stuck on whatever it built with.
         crate::plugins::faces::engine::configure_force_cpu(indexer::load_force_cpu(sec.conn()));
 
         // Run the indexer. Uses c.conn() (pub(crate)) to access the raw rusqlite connection

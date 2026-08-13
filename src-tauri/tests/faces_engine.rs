@@ -133,14 +133,59 @@ fn embeddings_are_unit_and_discriminative() {
     assert!(same > 0.5, "same-face cosine too low: {same:.3}");
 }
 
+/// End-to-end proof that reconfiguring between calls (issue #18) actually rebuilds a real ONNX
+/// session pool rather than silently keeping the old one — the process-global-atomics unit
+/// tests in `plugins::faces::engine::tests` prove the *key* changes, this proves the whole
+/// pipeline (verify → `build_session` → new `Pool`) survives doing that more than once in one
+/// process without crashing, deadlocking, or corrupting results.
+///
+/// Deliberately a correctness/liveness smoke test, not a "which pool got used" assertion: the
+/// public API exposes no per-call pool identity, and asserting on wall-clock time (rebuild
+/// pays a fresh SHA-256 + session commit, reuse doesn't) would be a flaky proxy for the same
+/// fact this already checks directly. Run with `--nocapture` to see each `configure` call's
+/// resolved plan and the detection counts, which is the visible evidence a rebuild happened
+/// without needing a timing assertion.
+#[test]
+fn reconfiguring_between_calls_rebuilds_without_breaking_detection() {
+    if !models_ready_or_skip("reconfiguring_between_calls_rebuilds_without_breaking_detection") {
+        return;
+    }
+    let bytes = fixture();
+
+    // Three distinct pool_size/intra_threads pairs — each one a different `PoolKey`, so each
+    // call after the first forces `yunet_pool`/`auraface_pool` to rebuild rather than reuse.
+    for (pool_size, intra_threads) in [(1, 1), (2, 2), (1, 4)] {
+        engine::configure(pool_size, intra_threads);
+        eprintln!("reconfigure: pool_size={pool_size} intra_threads={intra_threads}");
+        let faces = engine::detect_faces(&bytes, 0.7, 0.3)
+            .unwrap_or_else(|e| panic!("detect after configure({pool_size},{intra_threads}): {e}"));
+        assert!(
+            faces.len() >= 2,
+            "reconfigure({pool_size},{intra_threads}) broke detection: {} faces",
+            faces.len()
+        );
+
+        // The embed path (a second, independently-cached pool) must survive the same
+        // reconfiguration.
+        let img = image::load_from_memory(&bytes).unwrap().to_rgb8();
+        let emb = engine::embed_face(&img, &faces[0].landmarks)
+            .unwrap_or_else(|e| panic!("embed after configure({pool_size},{intra_threads}): {e}"));
+        let norm: f32 = emb.iter().map(|x| x * x).sum::<f32>().sqrt();
+        assert!((1.0 - norm).abs() < 1e-3, "embedding not unit after reconfigure: |{norm}|");
+    }
+}
+
 /// GPU path (`faces-cuda`): the CUDA execution provider must produce the *same* result as CPU
 /// on the fixture — same face count and near-equal embeddings — since it runs the identical
-/// ONNX graph. The engine caches one pool per process (`OnceLock`), so CPU-vs-CUDA can't be
-/// A/B'd in a single process; instead we let the pool build (CUDA if the runtime is present,
-/// else its own CPU fallback), report which EP took effect, and assert the *invariants* the
-/// CPU test asserts. Cross-EP numeric parity against known-good CPU baselines is covered by the
-/// `cuda_parity_baseline_*` constants below (captured from the CPU run). This is the honest
-/// "never crash, always produce sane output" guarantee for the GPU build.
+/// ONNX graph. The engine's pool cache is keyed by configuration (`engine::PoolKey`, issue
+/// #18), not by execution provider, so this test still can't cleanly force "CUDA build, CPU
+/// build" side by side within the assertions below (that would need two different
+/// `force_cpu` keys, which `force_cpu_setting_keeps_inference_on_cpu` covers separately);
+/// instead we let the pool build (CUDA if the runtime is present, else its own CPU fallback),
+/// report which EP took effect, and assert the *invariants* the CPU test asserts. Cross-EP
+/// numeric parity against known-good CPU baselines is covered by the `cuda_parity_baseline_*`
+/// constants below (captured from the CPU run). This is the honest "never crash, always
+/// produce sane output" guarantee for the GPU build.
 #[cfg(feature = "faces-cuda")]
 #[test]
 fn cuda_matches_cpu_within_tolerance() {
@@ -180,10 +225,14 @@ fn cuda_matches_cpu_within_tolerance() {
 }
 
 /// Forcing CPU (`configure_force_cpu(true)`) in a `faces-cuda` build must keep inference on the
-/// CPU EP — the setting escape hatch. Runs first-thing so it wins the pool build; other tests
-/// in this binary tolerate whichever EP is active, so ordering is not load-bearing beyond the
-/// `OnceLock` first-build-wins rule (each `cargo test` spawns fresh processes per test only
-/// when `--test-threads` differs; we gate on the observed EP rather than assume isolation).
+/// CPU EP — the setting escape hatch. Since the pool cache is keyed by configuration (issue
+/// #18), this call's own `detect_faces` deterministically resolves a `force_cpu: true` pool —
+/// it can no longer be shadowed by an earlier test's pool the way an `OnceLock`-cached one
+/// could be. The one thing still not strictly assertable is `engine::active_ep()` itself: it
+/// is a single process-global "whichever pool was built most recently, any key" signal (for
+/// the indexer/UI, not a per-call guarantee), so a concurrently-running test's build can
+/// overwrite it between this call returning and the read below. We gate on the observed EP
+/// rather than assume isolation.
 #[cfg(feature = "faces-cuda")]
 #[test]
 fn force_cpu_setting_keeps_inference_on_cpu() {

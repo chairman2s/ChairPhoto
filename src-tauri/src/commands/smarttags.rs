@@ -248,7 +248,10 @@ pub async fn smarttags_index_photos(
             .flatten();
 
         // Size the CLIP session pool from the shared `indexing.speed` setting (same knob
-        // as face indexing). `configure` is a no-op once a pool exists (first run wins).
+        // as face indexing). The pool is keyed by this configuration (`embed::PoolKey`,
+        // issue #18), so a value that changed since the last run rebuilds it here instead of
+        // reusing a stale pool; `model_path_setting` below is part of the same key, so a
+        // changed `smarttags.model_path` rebuilds too.
         let plan = shared_indexing::load_indexing_plan(sec.conn());
         embed::configure(plan.parallelism, plan.intra_threads);
 

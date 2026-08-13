@@ -26,7 +26,7 @@
 
 use std::ffi::{c_char, c_void, CStr};
 use std::path::PathBuf;
-use std::sync::OnceLock;
+use std::sync::{Arc, Mutex, OnceLock};
 
 /// The ONNX Runtime minor version ort requires, taken from ort itself rather than restated
 /// here. `ort::MINOR_VERSION` is `ort_sys::ORT_API_VERSION`, which is computed from whichever
@@ -220,6 +220,69 @@ where
     Ok((session, registered))
 }
 
+// ── Keyed session-pool cache (issue #18) ────────────────────────────────────────
+//
+// `faces::engine` and `smarttags::embed` each used to cache their ONNX session pool behind a
+// plain `OnceLock`: the first pool built won, permanently, so a later change to
+// `indexing.speed`, `faces.force_cpu`, or `smarttags.model_path` had no effect until restart.
+// [`KeyedCache`] replaces that: every fetch compares the configuration it was asked to build
+// against whatever is cached, and rebuilds when it differs.
+
+/// A process-global slot holding at most one built `V`, tagged with the `K` that produced it.
+///
+/// [`get_or_build`](KeyedCache::get_or_build) is the whole interface: an equal key returns the
+/// cached `Arc` (cheap, no rebuild); a different key builds a fresh value, replaces the slot,
+/// and returns that. A caller already holding a clone of the *old* `Arc` — e.g. a worker
+/// mid-inference on a pool checked out before the swap — keeps it alive and unaffected, because
+/// the guarantee is `Arc` reference counting, not a lock held across the value's use. The old
+/// value is only ever dropped once every clone of it is gone. The *next* fetch is what observes
+/// the new value.
+///
+/// A failed build is **not** cached: the slot is left exactly as it was, so the next call
+/// retries the builder instead of being stuck behind a transient failure until restart — the
+/// same staleness this type exists to remove, just for the error case too.
+#[cfg(any(feature = "faces", feature = "smarttags"))]
+pub struct KeyedCache<K, V> {
+    slot: Mutex<Option<(K, Arc<V>)>>,
+}
+
+#[cfg(any(feature = "faces", feature = "smarttags"))]
+impl<K, V> KeyedCache<K, V> {
+    /// An empty cache. `const` so it can back a `static` the same way `OnceLock::new()` did.
+    pub const fn new() -> Self {
+        KeyedCache { slot: Mutex::new(None) }
+    }
+}
+
+#[cfg(any(feature = "faces", feature = "smarttags"))]
+impl<K, V> Default for KeyedCache<K, V> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(any(feature = "faces", feature = "smarttags"))]
+impl<K: Clone + PartialEq, V> KeyedCache<K, V> {
+    /// Return the value cached for `key`, building (and caching) a fresh one with `build` if
+    /// nothing is cached yet or the cached entry's key differs. `build`'s error is returned but
+    /// never cached — see the type docs.
+    pub fn get_or_build<E>(
+        &self,
+        key: K,
+        build: impl FnOnce() -> Result<V, E>,
+    ) -> Result<Arc<V>, E> {
+        let mut slot = self.slot.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((cached_key, value)) = slot.as_ref() {
+            if *cached_key == key {
+                return Ok(value.clone());
+            }
+        }
+        let value = Arc::new(build()?);
+        *slot = Some((key, value.clone()));
+        Ok(value)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -322,5 +385,93 @@ mod tests {
             err.contains("OrtGetApiBase"),
             "error should name the missing symbol, got: {err}"
         );
+    }
+
+    // ── KeyedCache (issue #18) ──────────────────────────────────────────────────
+    //
+    // Exercised with plain `u32`/`String` values rather than real ONNX sessions — same
+    // reasoning as `faces::engine::Pool`'s own tests: the caching/rebuild *policy* has no
+    // model dependency, so it is unit-tested offline and the ONNX-backed callers only need to
+    // prove they feed it the right key (see the `PoolKey` tests alongside them).
+
+    #[cfg(any(feature = "faces", feature = "smarttags"))]
+    #[test]
+    fn same_key_reuses_the_cached_value_without_rebuilding() {
+        let cache: KeyedCache<u32, u32> = KeyedCache::new();
+        let builds = std::sync::atomic::AtomicUsize::new(0);
+        let build = || {
+            builds.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok::<u32, ()>(100)
+        };
+
+        let a = cache.get_or_build(1, build).unwrap();
+        let b = cache.get_or_build(1, build).unwrap();
+        assert_eq!(*a, 100);
+        assert!(Arc::ptr_eq(&a, &b), "an equal key must return the same cached Arc, not rebuild");
+        assert_eq!(builds.load(std::sync::atomic::Ordering::Relaxed), 1, "built exactly once");
+    }
+
+    #[cfg(any(feature = "faces", feature = "smarttags"))]
+    #[test]
+    fn a_different_key_rebuilds() {
+        let cache: KeyedCache<u32, u32> = KeyedCache::new();
+        let builds = std::sync::atomic::AtomicUsize::new(0);
+
+        let a = cache
+            .get_or_build(1, || {
+                builds.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Ok::<u32, ()>(10)
+            })
+            .unwrap();
+        let b = cache
+            .get_or_build(2, || {
+                builds.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Ok::<u32, ()>(20)
+            })
+            .unwrap();
+
+        assert_eq!(*a, 10);
+        assert_eq!(*b, 20, "a changed key must produce the new value, not the stale one");
+        assert_eq!(builds.load(std::sync::atomic::Ordering::Relaxed), 2, "rebuilt on the key change");
+
+        // The cache now serves key 2 without rebuilding again.
+        let b2 = cache
+            .get_or_build::<()>(2, || panic!("must not rebuild for an unchanged key"))
+            .unwrap();
+        assert!(Arc::ptr_eq(&b, &b2));
+    }
+
+    /// The ownership property the doc comment promises: a caller holding a clone of the old
+    /// `Arc` when a rebuild happens keeps a live, correct value — the rebuild only ever affects
+    /// what the *next* fetch sees. Models the "sessions in flight when a job's settings change"
+    /// scenario without needing a real ONNX session.
+    #[cfg(any(feature = "faces", feature = "smarttags"))]
+    #[test]
+    fn an_in_flight_arc_survives_a_rebuild() {
+        let cache: KeyedCache<u32, u32> = KeyedCache::new();
+        let in_flight = cache.get_or_build(1, || Ok::<u32, ()>(111)).unwrap();
+
+        // A different key rebuilds and replaces the slot...
+        let rebuilt = cache.get_or_build(2, || Ok::<u32, ()>(222)).unwrap();
+
+        // ...but the value the "in-flight worker" is still holding is untouched.
+        assert_eq!(*in_flight, 111, "an in-flight checkout must not see the rebuild");
+        assert_eq!(*rebuilt, 222);
+        assert!(!Arc::ptr_eq(&in_flight, &rebuilt));
+    }
+
+    /// A failed build must not poison the cache — the very next call (even with the same key)
+    /// gets to try again, unlike the `OnceLock` this replaces (which cached `Err` forever).
+    #[cfg(any(feature = "faces", feature = "smarttags"))]
+    #[test]
+    fn a_failed_build_is_not_cached_so_a_retry_can_succeed() {
+        let cache: KeyedCache<u32, u32> = KeyedCache::new();
+
+        let err = cache.get_or_build(1, || Err::<u32, &'static str>("model not downloaded"));
+        assert_eq!(err, Err("model not downloaded"));
+
+        // Same key, but this time the builder succeeds — must not still be "cached" as an error.
+        let ok = cache.get_or_build(1, || Ok::<u32, &'static str>(7)).unwrap();
+        assert_eq!(*ok, 7);
     }
 }

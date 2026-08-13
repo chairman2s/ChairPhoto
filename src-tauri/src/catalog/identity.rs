@@ -2418,10 +2418,16 @@ mod tests {
     ///
     /// Driven through `refresh` → resolution → `run` → `record` by hand rather than by
     /// timing, because that IS the interleaving — the pass has already committed to its
-    /// sidecar IO and the decision arrives underneath it. Before #34 the record was an
-    /// unconditional `INSERT … ON CONFLICT DO UPDATE`, so it re-created as a conflict the
-    /// very row the Adopt had just cleared, and the catalog went back to reporting debt for
-    /// a copy a human had already settled.
+    /// sidecar IO and the decision arrives underneath it.
+    ///
+    /// Pins the **"the pass never INSERTs"** half of the rule specifically. Adopt deletes
+    /// the queue row, so the compare-and-set has nothing to compare; what stops the row
+    /// coming back is that a retry which cannot find its row has nothing to say. Before #34
+    /// the record was an unconditional `INSERT … ON CONFLICT DO UPDATE`, which re-created as
+    /// a conflict the very row the Adopt had just cleared, and the catalog went back to
+    /// reporting debt for a copy a human had already settled. The compare-and-set half is
+    /// `a_dismissal_landing_during_a_rows_io_is_not_undone_by_its_record` and
+    /// `a_concurrent_scans_record_is_not_overwritten_by_a_pass_that_had_started` below.
     #[test]
     fn a_resolution_landing_mid_pass_does_not_get_overwritten_by_it() {
         let (catalog, root, _dir) = temp_catalog("repair-vs-resolution");
@@ -2468,28 +2474,142 @@ mod tests {
         );
     }
 
-    /// The other half of the same window: the decision lands before the pass reaches the
-    /// row at all. The refresh must then skip it — no sidecar read, no write, no counter —
-    /// and the pass must report it as `superseded` rather than as one of the four outcomes,
-    /// which would claim an effect it did not have.
+    /// **Forced race, by construction.** The same window, for the resolution that KEEPS the
+    /// row: a Dismiss lands while the pass is mid-IO on that very row.
     ///
-    /// Forced from inside a real `run_identity_repair`: the progress callback resolves the
-    /// SECOND row while the pass is still finishing the first, so the interleaving is fixed
-    /// by construction rather than by thread timing.
+    /// This is the case an Adopt cannot cover. Adopt deletes the row, so the pass's record
+    /// finds nothing to update whatever its predicate says; a Dismiss leaves the row right
+    /// where it was, so only the compare-and-set — on `dismissed_at = 0`, pinned literally
+    /// rather than remembered — stops the pass from bumping `attempts` on a copy a human
+    /// has just taken out of the queue, and from reporting it as a conflict it found.
     #[test]
-    fn a_resolution_landing_before_the_pass_reaches_a_row_skips_it_as_superseded() {
+    fn a_dismissal_landing_during_a_rows_io_is_not_undone_by_its_record() {
+        let (catalog, root, _dir) = temp_catalog("repair-vs-dismiss");
+        let (photo_id, path, _) =
+            seed_conflicted_copy(&catalog, &root, "dismissed-mid-io.arw", "foreign-uuid");
+        let (volume_id, relative_path) = copy_of(&catalog, &path);
+
+        let mut plan = catalog
+            .plan_identity_repairs_page(None, 10)
+            .unwrap()
+            .pop()
+            .expect("the conflicted copy must be planned");
+        assert!(
+            catalog.refresh_identity_repair(&mut plan).unwrap(),
+            "sanity: the row is live when the pass picks it up"
+        );
+
+        let secondary = Catalog::open_secondary(catalog.db_path(), &root).unwrap();
+        secondary
+            .resolve_identity_conflict(
+                photo_id,
+                volume_id,
+                &relative_path,
+                IdentityConflictAction::Dismiss,
+            )
+            .unwrap();
+        let (attempts_after_dismiss, _, dismissed_at) =
+            queue_row(&catalog, photo_id, &path).expect("Dismiss keeps the row");
+        assert_ne!(dismissed_at, 0);
+
+        let outcome = plan.run();
+        assert!(
+            !catalog.record_planned_repair(&plan, &outcome).unwrap(),
+            "the pass recorded over a dismissal that landed under it"
+        );
+        let (attempts, _, still_dismissed) = queue_row(&catalog, photo_id, &path).unwrap();
+        assert_eq!(still_dismissed, dismissed_at, "the dismissal must survive the pass");
+        assert_eq!(
+            attempts, attempts_after_dismiss,
+            "a dismissed row must not have its attempt counter bumped by a pass that had \
+             already started on it"
+        );
+    }
+
+    /// **Forced race, by construction.** The version half of the compare-and-set, against
+    /// the other writer of this table: a scan re-recording the same copy on its own
+    /// connection (`scanner/mod.rs` opens one) while the pass is mid-IO on that row.
+    ///
+    /// The row still exists and is still un-dismissed, so only `attempts` /
+    /// `last_attempt_at` can tell the pass its premise moved. Without them the pass's older
+    /// reading overwrites the scan's fresher one, and the queue reports the wrong reason —
+    /// which is what a user acts on.
+    #[test]
+    fn a_concurrent_scans_record_is_not_overwritten_by_a_pass_that_had_started() {
+        let (catalog, root, _dir) = temp_catalog("repair-vs-scan-record");
+        let (photo_id, path) = seed_photo(&catalog, &root, "rerecorded.arw");
+        catalog
+            .record_sidecar_identity(photo_id, &path, &SidecarIdentity::Unreachable)
+            .unwrap();
+        // Make the copy unreachable for real, so the pass's own outcome is `Unreachable`
+        // and differs from the scan's — a same-text overwrite would prove nothing.
+        std::fs::remove_file(&path).unwrap();
+
+        let mut plan = catalog
+            .plan_identity_repairs_page(None, 10)
+            .unwrap()
+            .pop()
+            .expect("the queued copy must be planned");
+        assert!(catalog.refresh_identity_repair(&mut plan).unwrap());
+
+        let secondary = Catalog::open_secondary(catalog.db_path(), &root).unwrap();
+        secondary
+            .record_sidecar_identity(
+                photo_id,
+                &path,
+                &SidecarIdentity::Unwritable("scan says the volume is read-only".to_string()),
+            )
+            .unwrap();
+
+        let outcome = plan.run();
+        assert_eq!(outcome, SidecarIdentity::Unreachable, "sanity: a different reading");
+        assert!(
+            !catalog.record_planned_repair(&plan, &outcome).unwrap(),
+            "the pass recorded over a fresher write from another connection"
+        );
+        let (_, error, _) = queue_row(&catalog, photo_id, &path).unwrap();
+        assert!(
+            error.contains("scan says the volume is read-only"),
+            "the newer writer's reason must stand, got: {error}"
+        );
+    }
+
+    /// The other half of the same window: the decision lands before the pass reaches the
+    /// row at all. The refresh must then skip it entirely — no sidecar write, no counter —
+    /// and the pass must report it as `superseded` rather than as one of the four outcomes,
+    /// which would claim an effect it did not have. "Dismiss changes neither the catalog
+    /// nor the file" has to hold against a pass that had already planned the row.
+    ///
+    /// Forced from inside a real `run_identity_repair`: the progress callback dismisses the
+    /// two LATER rows while the pass is still finishing the first, so the interleaving is
+    /// fixed by construction rather than by thread timing. Two, because the row must be
+    /// skipped however its `dismissed_at` got set — through `resolve_identity_conflict`
+    /// (only conflicts can be dismissed that way) and as a plain column value. The
+    /// writable one is what discriminates a genuine skip from "wrote the file, then had the
+    /// record rejected": only the former leaves the sidecar alone.
+    #[test]
+    fn a_row_dismissed_after_it_was_planned_is_skipped_without_being_written_to() {
         let (catalog, root, _dir) = temp_catalog("repair-skips-resolved");
-        // Row 1 is an ordinary repairable copy; row 2 is the one that gets dismissed
-        // mid-pass. `photo_id` ascending is the pass's scan order, and `seed_photo` /
-        // `seed_conflicted_copy` insert in call order.
+        // Row 1 is an ordinary repairable copy; rows 2 and 3 get dismissed mid-pass.
+        // `photo_id` ascending is the pass's scan order, and the seed helpers insert in
+        // call order.
         let (first_id, first_path) = seed_photo(&catalog, &root, "first.arw");
         catalog
             .record_sidecar_identity(first_id, &first_path, &SidecarIdentity::Unreachable)
             .unwrap();
-        let (second_id, second_path, _) =
-            seed_conflicted_copy(&catalog, &root, "second.arw", "foreign-uuid");
-        let (second_volume, second_relative) = copy_of(&catalog, &second_path);
-        assert!(first_id < second_id, "fixture assumes ascending scan order");
+        // Reachable, with no identifier in its sidecar — so a pass that got as far as the
+        // IO would WRITE it.
+        let (writable_id, writable_path) = seed_photo(&catalog, &root, "writable.arw");
+        catalog
+            .record_sidecar_identity(writable_id, &writable_path, &SidecarIdentity::Unreachable)
+            .unwrap();
+        let (conflicted_id, conflicted_path, _) =
+            seed_conflicted_copy(&catalog, &root, "zconflicted.arw", "foreign-uuid");
+        let (conflicted_volume, conflicted_relative) = copy_of(&catalog, &conflicted_path);
+        assert!(
+            first_id < writable_id && writable_id < conflicted_id,
+            "fixture assumes ascending scan order"
+        );
 
         let secondary = Catalog::open_secondary(catalog.db_path(), &root).unwrap();
         let dismissed = std::cell::Cell::new(false);
@@ -2498,10 +2618,18 @@ mod tests {
                 if s.done() == 1 && !dismissed.get() {
                     dismissed.set(true);
                     secondary
+                        .conn()
+                        .execute(
+                            "UPDATE pending_sidecar_identity SET dismissed_at = 1
+                             WHERE photo_id = ?1",
+                            params![writable_id],
+                        )
+                        .unwrap();
+                    secondary
                         .resolve_identity_conflict(
-                            second_id,
-                            second_volume,
-                            &second_relative,
+                            conflicted_id,
+                            conflicted_volume,
+                            &conflicted_relative,
                             IdentityConflictAction::Dismiss,
                         )
                         .unwrap();
@@ -2516,28 +2644,110 @@ mod tests {
             "only the first copy was actually acted on: {summary:?}"
         );
         assert_eq!(
-            summary.superseded, 1,
-            "the dismissed copy must be reported as decided-by-someone-else, not as a \
-             conflict this pass found: {summary:?}"
+            summary.superseded, 2,
+            "the dismissed copies must be reported as decided-by-someone-else, not as \
+             outcomes this pass produced: {summary:?}"
         );
-        assert_eq!(summary.done(), 2, "both rows were visited: {summary:?}");
+        assert_eq!(summary.done(), 3, "every row was visited: {summary:?}");
 
-        let (attempts, _, dismissed_at) =
-            queue_row(&catalog, second_id, &second_path).expect("a dismissal keeps the row");
-        assert_ne!(dismissed_at, 0, "the pass un-dismissed a copy a human had dismissed");
-        assert_eq!(attempts, 1, "a skipped row must not have its attempt counter bumped");
+        assert!(
+            crate::xmp::read_identifier(&writable_path).is_none(),
+            "the pass wrote the sidecar of a copy that had been dismissed before it got \
+             there — a skip has to happen BEFORE the IO, not be undone after it"
+        );
+        for (id, path) in [(writable_id, &writable_path), (conflicted_id, &conflicted_path)] {
+            let (attempts, _, dismissed_at) =
+                queue_row(&catalog, id, path).expect("a dismissal keeps the row");
+            assert_ne!(dismissed_at, 0, "photo {id}: the pass un-dismissed a dismissed copy");
+            assert_eq!(attempts, 1, "photo {id}: a skipped row must not be re-stamped");
+        }
     }
 
-    /// **Forced race, real threads.** A pass and a stream of resolutions running
-    /// concurrently on two connections. Whatever the interleaving, a decision that committed
-    /// must still be in force at the end: a dismissed copy stays dismissed, and an adopted
-    /// one stays out of the queue.
+    /// The refresh re-reads the plan's VALUE, not just its version — and that is the part
+    /// no compare-and-set can stand in for.
     ///
-    /// The deterministic tests above carry the load; this is the net over the interleavings
-    /// they cannot name. It asserts only the invariant, never a particular winner, so it
-    /// cannot depend on which thread the scheduler favours.
+    /// An Adopt rewrites `photos.uuid`. It leaves the queue rows of the photo's other copies
+    /// exactly as they were when those copies carry no identifier at all
+    /// (`recheck_other_copies_after_adopt` deliberately does not touch them: they owe an
+    /// ordinary write, not a decision). So their version is unchanged, the compare-and-set
+    /// accepts the record — and a plan read before the Adopt would put the photo's PREVIOUS
+    /// identity into that sidecar. Not a lost counter: a wrong identifier in a user's file,
+    /// which the next pass then reports as a conflict.
     #[test]
-    fn concurrent_resolutions_and_a_pass_never_undo_a_decision() {
+    fn the_pass_re_reads_a_plans_value_before_writing_it() {
+        let (catalog, root, _dir) = temp_catalog("repair-refreshes-value");
+        let (photo_id, path, old_uuid) =
+            seed_conflicted_copy(&catalog, &root, "adopted.arw", "identity-from-the-file");
+
+        // A second copy of the same photo, reachable, with nothing in its sidecar yet.
+        let other_dir = root.parent().unwrap().join("second-volume-refresh");
+        std::fs::create_dir_all(&other_dir).unwrap();
+        let other_volume = catalog
+            .add_volume("Second", &other_dir, crate::catalog::VolumeKind::Backup)
+            .unwrap();
+        let other_path = other_dir.join("adopted.arw");
+        std::fs::write(&other_path, b"raw-bytes-2").unwrap();
+        catalog
+            .add_location(photo_id, other_volume, "adopted.arw", crate::catalog::LocationRole::Backup)
+            .unwrap();
+        catalog
+            .record_sidecar_identity(photo_id, &other_path, &SidecarIdentity::Unreachable)
+            .unwrap();
+
+        // The pass plans BOTH rows, then the user adopts the first copy's identity.
+        let mut plans = catalog.plan_identity_repairs_page(None, 10).unwrap();
+        assert_eq!(plans.len(), 2, "both copies of the photo are queued");
+        let mut other_plan = plans
+            .drain(..)
+            .find(|p| p.volume_id == other_volume)
+            .expect("the second copy must be planned");
+
+        let (volume_id, relative_path) = copy_of(&catalog, &path);
+        let secondary = Catalog::open_secondary(catalog.db_path(), &root).unwrap();
+        secondary
+            .resolve_identity_conflict(
+                photo_id,
+                volume_id,
+                &relative_path,
+                IdentityConflictAction::Adopt,
+            )
+            .unwrap();
+        assert_eq!(photo_uuid(&catalog, photo_id), "identity-from-the-file");
+
+        // The pass now reaches the second copy. Its plan predates the Adopt.
+        assert!(catalog.refresh_identity_repair(&mut other_plan).unwrap());
+        let outcome = other_plan.run();
+        assert_eq!(outcome, SidecarIdentity::Bound);
+        assert!(catalog.record_planned_repair(&other_plan, &outcome).unwrap());
+
+        assert_eq!(
+            crate::xmp::read_identifier(&other_path).as_deref(),
+            Some("identity-from-the-file"),
+            "the pass wrote the identity the photo had when the page was planned, not the \
+             one it has now — the sidecar now carries {old_uuid}, which belongs to nobody"
+        );
+    }
+
+    /// A pass and a stream of resolutions running concurrently on two real connections.
+    /// Whatever the interleaving, a decision that committed must still be in force at the
+    /// end: a dismissed copy stays dismissed, and an adopted one stays out of the queue.
+    ///
+    /// **This is a contention net, not a proof of the window.** It exercises two
+    /// connections writing `pending_sidecar_identity` at once — the shape `commands::storage`
+    /// actually runs, one secondary connection per call — and would catch a lock/busy
+    /// regression or an invariant broken across a wide interleaving. It does *not* reliably
+    /// reproduce the narrow one: the window is a single row's refresh → sidecar read →
+    /// record, tens of microseconds, and a resolution has to land inside it. Measured
+    /// directly: with the compare-and-set replaced by the pre-#34 unconditional upsert, this
+    /// test passed 15 runs out of 15, while the step-driven tests around it failed every
+    /// time. So the mechanism is pinned by
+    /// `a_resolution_landing_mid_pass_does_not_get_overwritten_by_it`,
+    /// `a_dismissal_landing_during_a_rows_io_is_not_undone_by_its_record` and
+    /// `a_concurrent_scans_record_is_not_overwritten_by_a_pass_that_had_started`, which
+    /// drive the pass's own methods one step at a time and place the decision exactly in the
+    /// window rather than hoping a scheduler does.
+    #[test]
+    fn a_pass_and_resolutions_on_two_connections_keep_every_decision_that_committed() {
         let (catalog, root, _dir) = temp_catalog("repair-race-resolutions");
         let mut copies = Vec::new();
         for i in 0..24 {

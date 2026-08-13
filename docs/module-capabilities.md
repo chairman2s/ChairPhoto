@@ -9,9 +9,9 @@ description: "What a third-party module can do today, what stops it, and the cha
 gap between that contract and a module system a third party can actually build against, and
 the pieces of work that close it.
 
-Status: step 1 (the rendering ABI, #46) is implemented and is described in the past tense
-below. Steps 2–4 — the CSP lockdown, per-module permissions, and host-mediated capabilities —
-are still design, and are marked as such.
+Status: step 1 (the rendering ABI, #46) and step 2 (the CSP lockdown, #47) are implemented and
+are described in the past tense below. Steps 3 and 4 — per-module permissions and
+host-mediated capabilities — are still design, and are marked as such.
 
 ## What already works
 
@@ -155,25 +155,73 @@ no import map, an external module cannot reach Tauri directly. The `api` object 
 gate it per module whenever it decides to. Most plugin systems never get this boundary; here
 it exists by construction.
 
-**Network, however, is not gated at all.** `tauri.conf.json` sets `"csp": null`, so there is
-no Content-Security-Policy and an installed module can `fetch()` any CORS-permitting endpoint
+**Network used not to be gated at all.** `tauri.conf.json` set `"csp": null`, so there was no
+Content-Security-Policy and an installed module could `fetch()` any CORS-permitting endpoint
 directly, never touching the host API. Measured against the binding invariant that nothing
-leaves the machine without an explicit, feature-specific opt-in, that is a live gap, not a
+leaves the machine without an explicit, feature-specific opt-in, that was a live gap, not a
 theoretical one. The trust model in `plugin-system.md` acknowledges that installed modules are
 fully trusted, but it describes the risk as modules "calling network-capable backend
-commands" — the actual exposure needs no backend command at all.
+commands" — the actual exposure needed no backend command at all. That is now closed; see
+[The policy](#the-policy).
 
-That second fact also supplies the design. Close the direct route, then mediate it:
+Together the two facts supply the design. Close the direct route, then mediate it:
 
 ```
-CSP: connect-src 'self' ipc:      direct fetch() is blocked
+CSP: connect-src 'self' ipc:      direct fetch() is blocked          — done
 api.fetch(url, init)              proxied through Rust, so CORS does not apply either
 manifest "permissions": [...]     declared per module
 host gates api.fetch per module   least privilege, enforceable because api is the only route
 ```
 
 Locking the door is what makes selling keys meaningful. Without the CSP the permission list is
-decoration.
+decoration. The lock went on first, deliberately, while nothing depended on the door being
+open: tightening `connect-src` after `api.fetch` exists would break modules written against
+the looser policy.
+
+### The policy
+
+`src-tauri/tauri.conf.json` → `app.security.csp`:
+
+| Directive | Sources | Why |
+|---|---|---|
+| `default-src` | `'self'` | Baseline for anything not listed below. |
+| `connect-src` | `'self' ipc: http://ipc.localhost` | **The lockdown.** `fetch`/`XHR`/`WebSocket`/`EventSource` may reach the app's own origin and the Tauri IPC bridge, nothing else. Tauri's bridge is literally `fetch(convertFileSrc(cmd, "ipc"))` — `ipc://localhost/<cmd>` on Linux/macOS, `http://ipc.localhost/<cmd>` on Windows — so both forms are required for commands to work at all. |
+| `script-src` | `'self' asset: http://asset.localhost` | The app bundle, plus external module entrypoints, which `host.ts` imports through `convertFileSrc` (the asset protocol, scoped to `$DATA/chairphoto/modules/**`). No `'unsafe-eval'`. |
+| `style-src` | `'self' 'unsafe-inline'` | The bundled stylesheet, plus the pre-paint `<style>` in `index.html`. Tauri rewrites that tag with a nonce at build time and appends the nonce here, which makes browsers ignore `'unsafe-inline'`; it is kept as the fallback for a build where no nonce is injected. React sets styles through CSSOM (`node.style`), which CSP does not govern either way. |
+| `img-src` | `'self' data: blob: asset: thumb: preview: zoom:` + the `http://<scheme>.localhost` forms + `https:` + loopback | The three native media protocols (`src-tauri/src/lib.rs`), edit renderer output (data/blob URLs), and map tiles. Tile URLs are a user setting (`map.tileUrl`), so this cannot be pinned to one host. |
+| `media-src` | `'self' data: blob: http://127.0.0.1:* http://localhost:*` | `<video>` is served by the loopback HTTP server in `src-tauri/src/protocol.rs` — WebKitGTK decodes video through GStreamer, which cannot read custom URI schemes. The port is chosen at bind time, hence the wildcard. |
+| `font-src` | `'self' data:` | Bundled Inter woff2. |
+| `object-src` | `'none'` | No `<object>`/`<embed>` anywhere. |
+
+`src-tauri/tests/csp.rs` pins the properties (not the exact text): a CSP exists, `connect-src`
+carries the IPC bridge and nothing remote, the media protocols and the module asset path stay
+loadable, and the asset-protocol scope stays on the modules directory.
+
+### What it stops, and what it does not
+
+Stops:
+
+- A module calling `fetch`, `XMLHttpRequest`, `WebSocket` or `EventSource` against any
+  origin other than the app itself. It has to go through `api.invoke` — i.e. through Rust,
+  where the host can see and (later) gate it.
+- Loading and running remote script.
+
+Does **not** stop:
+
+- **Egress through `img-src`.** A module can encode data in a URL and set it as an image
+  source on any `https:` host; the response is discarded but the request is made. Closing
+  that would break user-configured map tiles, and `connect-src` is where the issue's stated
+  gap lives. This is a known residual channel, not an oversight.
+- **Anything a backend command already does.** An installed module still has unrestricted
+  `api.invoke` (`plugin-system.md` § "Trust model"), so it can reach the network by asking a
+  network-capable command to. That is what steps 3 and 4 are for; the CSP is the half that
+  needed no new machinery.
+- **Anything outside the webview.** The CSP governs the page, not the process.
+- **Anything in `tauri dev`.** On desktop, `tauri dev` points the webview at the Vite dev
+  server (`build.devUrl`), and Tauri only attaches the CSP header to assets it serves itself
+  over `tauri://localhost` (`get_asset` in `tauri`'s `manager/mod.rs`). So HMR is unaffected
+  *because the policy is not in force there at all*. It applies to `tauri build` and
+  `tauri build --debug`, which is where installed modules are a real concern.
 
 ### The capability set
 
@@ -211,14 +259,16 @@ just the grid and tagging.
 
 1. ~~**Blocker 1**, in isolation. Modules can render; nothing about the security model
    changes.~~ Done — see [Rendering ABI](#rendering-abi-was-blocker-1--a-module-cannot-render).
-2. **CSP lockdown**, before any capability exists to grant. It is a breaking change for
-   anything currently relying on direct `fetch`, so it goes first while nothing does.
+2. ~~**CSP lockdown**, before any capability exists to grant. It is a breaking change for
+   anything currently relying on direct `fetch`, so it goes first while nothing does.~~
+   Done — see [The policy](#the-policy).
 3. **Per-module permissions** — manifest field, host enforcement in `api.invoke` and
    `api.fetch`, review surfaced at enable time. *Deferred by owner decision.*
 4. **Capabilities**, one at a time, each gated by 3. *Deferred by owner decision.*
 
 Steps 2–4 are one unit in practice: shipping a generic fetch primitive without the permission
-gate would widen the hole this is meant to close.
+gate would widen the hole this is meant to close. Step 2 shipped on its own because it is only
+ever harder later, and because it stands alone: it needs no new machinery and grants nothing.
 
 ## Open questions
 

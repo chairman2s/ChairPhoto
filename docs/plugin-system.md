@@ -304,8 +304,15 @@ There is no sandbox and no per-command permission prompt: **an installed module 
 with the same full access as a bundled one**, including unrestricted `api.invoke(command,
 args)` to *any* backend Tauri command whose feature is compiled in — not only its own
 `backendFeature`. It executes in the app's WebView with the app's privileges; a malicious
-or buggy module can read/modify the catalog, drive file I/O through backend commands, and
-reach the network the same way the app can.
+or buggy module can read/modify the catalog and drive file I/O through backend commands.
+
+**One exception, added later:** it can no longer reach the network *directly*. A
+Content-Security-Policy pins `connect-src` to the app's own origin and the Tauri IPC bridge,
+so `fetch`/`XHR`/`WebSocket`/`EventSource` from module code cannot reach an arbitrary origin.
+A module can still get to the network by invoking a network-capable backend command — the
+CSP closes the route that needed no backend command at all. See
+`docs/module-capabilities.md` § "The policy" for the exact directives and for what the
+policy does *not* stop (notably `img-src`).
 
 This is a deliberate trade-off (get external modules working against the *existing*
 stable contract without first building a capability system), not a claim that it is safe.
@@ -324,8 +331,9 @@ owner — the same reasoning browsers use for unpacked extensions.
 - **No auto-install, no auto-update, no live FS watching.** Modules are discovered only at
   startup; adding one requires an explicit restart. We never fetch or update
   module code on the user's behalf. There is no marketplace.
-- "Nothing ever leaves home" still binds the *app's* behaviour, but a fully-trusted module
-  can call network-capable backend commands — another reason review-before-install matters.
+- "Nothing ever leaves home" still binds the *app's* behaviour. A fully-trusted module can no
+  longer open its own socket to an arbitrary origin (the CSP above), but it can still call
+  network-capable backend commands — another reason review-before-install matters.
 
 **A stronger mitigation, not implemented:** a **per-module invoke allowlist** — each
 module declares the backend commands (or capability groups) it needs, the host enforces

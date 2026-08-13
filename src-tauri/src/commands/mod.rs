@@ -44,6 +44,9 @@ mod flickr;
 mod graph;
 mod images;
 mod indexing;
+// Not a command module: the shared job-ownership protocol (abort generations, job ids,
+// status slots, and the start/switch transitions) every background job family runs.
+pub mod jobs;
 #[cfg(feature = "instagram")]
 mod instagram;
 #[cfg(feature = "localsend")]
@@ -82,6 +85,14 @@ pub use flickr::*;
 pub use graph::*;
 pub use images::*;
 pub use indexing::*;
+// Re-exported flat like the command modules so the domain submodules pick these up through
+// their `use super::*`. The rest of the ownership vocabulary (`AbortGeneration`, `JobFamily`,
+// `JobSlot`) is reached through the registry, so it stays namespaced under `jobs::`.
+pub use jobs::JobRegistry;
+// Only the families with a queryable status slot need these, and they are the ones this pair
+// of features gates — see the "Status slots" section of `jobs`.
+#[cfg(any(feature = "faces", feature = "smarttags"))]
+pub use jobs::{JobClaim, JobStatus};
 #[cfg(feature = "instagram")]
 pub use instagram::*;
 #[cfg(feature = "localsend")]
@@ -108,175 +119,11 @@ pub struct AppState {
     /// Short-TTL cache of per-volume reachability, so NAS stats happen off the catalog
     /// lock (on a blocking worker). See `volume_health`.
     pub volume_health: Arc<crate::volume_health::VolumeHealth>,
-    /// Abort flag for the currently-running scan generation (I4b/I6c). Held as a
-    /// **swappable** `Arc<AtomicBool>`: a catalog switch trips the current flag so an
-    /// in-flight scan (Phase A *or* a detached Phase B) stops writing before the old
-    /// catalog is torn down. Each new scan installs a *fresh* flag via
-    /// [`begin_scan_generation`], which also trips the previous one — so a second scan
-    /// aborts the earlier scan's still-running detached Phase B instead of racing it on
-    /// the same catalog. The worker threads each hold a clone of their generation's flag.
-    pub scan_abort: Mutex<Arc<AtomicBool>>,
-    /// Abort flag for any in-flight face-indexing job (H13b). Same swappable-Arc pattern
-    /// as `scan_abort`: `faces_index_photos` installs a fresh flag, `faces_index_cancel`
-    /// trips it, and a catalog switch trips it under the catalog lock (both phases). The
-    /// worker holds a clone of its generation's flag so a cancel never races a subsequent
-    /// re-index.
-    #[cfg(feature = "faces")]
-    pub faces_abort: Mutex<Arc<AtomicBool>>,
-    /// Monotonic id source for face-indexing jobs. Progress/done events carry the job id
-    /// so the UI can ignore events from a superseded job.
-    #[cfg(feature = "faces")]
-    pub faces_job_seq: std::sync::atomic::AtomicU64,
-    /// Abort flag for the face **matching** job (H13c), separate from `faces_abort` so
-    /// cancelling a match does not stop an index and vice versa. Same swappable-Arc
-    /// pattern: `faces_run_matching` installs a fresh flag, `faces_match_cancel` trips it,
-    /// and a catalog switch trips it under the catalog lock in both phases.
-    #[cfg(feature = "faces")]
-    pub faces_match_abort: Mutex<Arc<AtomicBool>>,
-    /// Monotonic id source for face-matching jobs, independent of `faces_job_seq` so the
-    /// two job families never collide on an id.
-    #[cfg(feature = "faces")]
-    pub faces_match_job_seq: std::sync::atomic::AtomicU64,
-    /// Abort flag for the sharpness-indexing job (H16b). Same swappable-Arc pattern as
-    /// `scan_abort` and `faces_abort`: `index_sharpness` installs a fresh flag,
-    /// `sharpness_index_cancel` trips it.
-    pub sharpness_abort: Mutex<Arc<AtomicBool>>,
-    /// Monotonic id source for sharpness-indexing jobs. Progress/done events carry the
-    /// job id so the UI can ignore events from a superseded run.
-    pub sharpness_job_seq: std::sync::atomic::AtomicU64,
-    /// Abort flag for the perceptual-hash indexing job (H15a). Same swappable-Arc pattern
-    /// as `sharpness_abort`: `index_phashes` installs a fresh flag, `phash_index_cancel`
-    /// trips it.
-    pub phash_abort: Mutex<Arc<AtomicBool>>,
-    /// Monotonic id source for perceptual-hash indexing jobs. Progress/done events carry
-    /// the job id so the UI can ignore events from a superseded run.
-    pub phash_job_seq: std::sync::atomic::AtomicU64,
-    /// Abort flag for the Smart Tagging embedding-index job (H7b). Same swappable-Arc
-    /// pattern as `faces_abort`: `smarttags_index_photos` installs a fresh flag,
-    /// `smarttags_index_cancel` trips it, and `switch_catalog` trips it under the catalog
-    /// lock so a job can never keep indexing a catalog the user has left.
-    #[cfg(feature = "smarttags")]
-    pub smarttags_abort: Mutex<Arc<AtomicBool>>,
-    /// Monotonic id source for Smart Tagging index jobs. Progress/done events carry the
-    /// job id so the UI can ignore events from a superseded run.
-    #[cfg(feature = "smarttags")]
-    pub smarttags_job_seq: std::sync::atomic::AtomicU64,
-    /// Every queryable job-status slot. Grouped rather than left as loose fields so a
-    /// catalog switch cannot clear some and miss others — see [`JobStatusSlots`].
-    pub jobs: JobStatusSlots,
-}
-
-/// Every queryable job-status slot in the app, gathered in one place.
-///
-/// Grouped rather than left as individual `AppState` fields because a catalog switch has to
-/// clear all of them, and loose fields made that a list someone had to remember to extend.
-/// It was not extended: slot-clearing entered `switch_catalog` in `1741b09` scoped to Smart
-/// Tagging, the face-*matching* slot added in `526b5a0` copied the new pattern, and
-/// `faces_job` — which predates both — was never backfilled, so a switch left the face
-/// *indexing* status describing a catalog the app had already replaced (issue #51).
-///
-/// The grouping is what makes that structural rather than remembered: [`Self::lock_all`]
-/// names every field to build [`JobStatusGuards`], and [`JobStatusGuards::clear_all`]
-/// destructures it with no `..`, so adding a slot here does not compile until both handle
-/// it. **Declare new job-status slots here, never directly on `AppState`.**
-///
-/// This is the narrow, #51-shaped piece of the job registry #13 proposes; when that lands it
-/// should subsume this rather than sit beside it.
-#[derive(Default)]
-pub struct JobStatusSlots {
-    /// Live status of the face-indexing job, `None` when idle. Written by the worker
-    /// (created at job start, updated on each progress event, cleared on completion —
-    /// only if a newer job hasn't overwritten it). Lets the UI re-attach to a running
-    /// job after a panel remount instead of believing it's idle (`faces_index_status`).
-    #[cfg(feature = "faces")]
-    pub faces: Arc<Mutex<Option<FacesJobStatus>>>,
-    /// Live status of the face-matching job, `None` when idle. Same ownership rules as
-    /// [`Self::faces`]: the worker clears it on the way out, and only if it still owns it.
-    #[cfg(feature = "faces")]
-    pub faces_match: Arc<Mutex<Option<FacesMatchJobStatus>>>,
-    /// Live status of the Smart Tagging indexing job, `None` when idle. Written by the
-    /// worker (created at job start, updated on each progress event, cleared on completion —
-    /// only if a newer job hasn't overwritten it). Lets the UI re-attach to a running job
-    /// after a panel remount instead of believing it's idle (`smarttags_index_status`).
-    #[cfg(feature = "smarttags")]
-    pub smarttags: Arc<Mutex<Option<SmarttagsJobStatus>>>,
-}
-
-impl JobStatusSlots {
-    /// Lock every slot **without** writing to any of them.
-    ///
-    /// Two-step (lock here, write in [`JobStatusGuards::clear_all`]) so a caller can acquire
-    /// these alongside the other locks of an ownership transition before its first mutation,
-    /// which AGENTS.md requires: a poisoned mutex must not leave a prefix of the transition
-    /// applied. `switch_catalog` phase one needs exactly that — it holds the catalog and six
-    /// abort locks, and must not have tripped any of them if a slot lock then fails.
-    ///
-    /// Callers hold the catalog and abort locks already; taking slot locks last keeps the
-    /// backend-wide catalog → abort → slot order.
-    pub fn lock_all(&self) -> Result<JobStatusGuards<'_>, String> {
-        // Destructured, not field-accessed, and deliberately without `..`: this is what makes
-        // a new slot a compile error here rather than a silent omission at the call site. Do
-        // not replace this with `self.faces.lock()` etc., and do not add `..`.
-        let Self {
-            #[cfg(feature = "faces")]
-            faces,
-            #[cfg(feature = "faces")]
-            faces_match,
-            #[cfg(feature = "smarttags")]
-            smarttags,
-        } = self;
-        Ok(JobStatusGuards {
-            _marker: std::marker::PhantomData,
-            #[cfg(feature = "faces")]
-            faces: faces.lock().map_err(|e| e.to_string())?,
-            #[cfg(feature = "faces")]
-            faces_match: faces_match.lock().map_err(|e| e.to_string())?,
-            #[cfg(feature = "smarttags")]
-            smarttags: smarttags.lock().map_err(|e| e.to_string())?,
-        })
-    }
-}
-
-/// Every job-status slot, locked. Produced by [`JobStatusSlots::lock_all`].
-pub struct JobStatusGuards<'a> {
-    /// Keeps `'a` used under `--no-default-features`, where every slot below is compiled
-    /// out and the struct would otherwise have no field borrowing from the slots.
-    _marker: std::marker::PhantomData<&'a ()>,
-    #[cfg(feature = "faces")]
-    faces: std::sync::MutexGuard<'a, Option<FacesJobStatus>>,
-    #[cfg(feature = "faces")]
-    faces_match: std::sync::MutexGuard<'a, Option<FacesMatchJobStatus>>,
-    #[cfg(feature = "smarttags")]
-    smarttags: std::sync::MutexGuard<'a, Option<SmarttagsJobStatus>>,
-}
-
-impl JobStatusGuards<'_> {
-    /// Clear every slot. Consumes the guards, so the locks are released together once every
-    /// slot has been cleared rather than one at a time.
-    ///
-    /// The destructuring below is deliberately exhaustive — no `..` — so a new slot added to
-    /// [`JobStatusSlots`] fails to compile here until it is handled. That is the whole point
-    /// of the grouping; do not "fix" a future compile error by adding `..`.
-    pub fn clear_all(self) {
-        let Self {
-            _marker: _,
-            #[cfg(feature = "faces")]
-            mut faces,
-            #[cfg(feature = "faces")]
-            mut faces_match,
-            #[cfg(feature = "smarttags")]
-            mut smarttags,
-        } = self;
-        #[cfg(feature = "faces")]
-        {
-            *faces = None;
-            *faces_match = None;
-        }
-        #[cfg(feature = "smarttags")]
-        {
-            *smarttags = None;
-        }
-    }
+    /// Every background job's ownership state — abort generations, job-id sequences and
+    /// queryable status slots — behind the one protocol they all run. Grouped rather than
+    /// left as loose fields so a catalog switch cannot reach some families and miss others.
+    /// **Declare new job families in [`JobRegistry`], never directly here.**
+    pub jobs: JobRegistry,
 }
 
 /// Snapshot of the running face-indexing job (`faces_index_status`).
@@ -286,6 +133,13 @@ pub struct FacesJobStatus {
     pub job: u64,
     pub done: usize,
     pub total: usize,
+}
+
+#[cfg(feature = "faces")]
+impl JobStatus for FacesJobStatus {
+    fn job_id(&self) -> u64 {
+        self.job
+    }
 }
 
 /// Snapshot of the running face-matching job (`faces_match_status`).
@@ -301,6 +155,13 @@ pub struct FacesMatchJobStatus {
     pub phase: &'static str,
 }
 
+#[cfg(feature = "faces")]
+impl JobStatus for FacesMatchJobStatus {
+    fn job_id(&self) -> u64 {
+        self.job
+    }
+}
+
 /// Snapshot of the running Smart Tagging embedding-index job (`smarttags_index_status`).
 #[cfg(feature = "smarttags")]
 #[derive(Debug, Clone, Copy, serde::Serialize)]
@@ -308,6 +169,13 @@ pub struct SmarttagsJobStatus {
     pub job: u64,
     pub done: usize,
     pub total: usize,
+}
+
+#[cfg(feature = "smarttags")]
+impl JobStatus for SmarttagsJobStatus {
+    fn job_id(&self) -> u64 {
+        self.job
+    }
 }
 
 const _: () = {
@@ -325,13 +193,12 @@ const _: () = {
 /// scan. Because the previous scan's workers hold a clone of the *old* Arc (now tripped),
 /// and this scan holds the fresh one, a second scan cannot race the earlier scan's
 /// detached Phase B on the same catalog.
+///
+/// The scan publishes no queryable status slot (its progress is event-only), so the whole
+/// transition is [`jobs::AbortGeneration::install_fresh`] — the slot-less half of what
+/// `jobs::JobFamily::begin` does for Faces and Smart Tagging.
 fn begin_scan_generation(state: &AppState) -> Result<Arc<AtomicBool>, String> {
-    let mut guard = state.scan_abort.lock().map_err(|e| e.to_string())?;
-    // Trip the previous generation so its workers (Phase A / detached Phase B) bail.
-    guard.store(true, Ordering::Relaxed);
-    let fresh = Arc::new(AtomicBool::new(false));
-    *guard = fresh.clone();
-    Ok(fresh)
+    state.jobs.scan.install_fresh()
 }
 
 /// Run a closure against the open catalog, or return an error if none is open.

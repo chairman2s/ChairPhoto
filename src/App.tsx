@@ -101,6 +101,7 @@ import {
 } from "./modules/host";
 import { ModuleActionModal, ModuleContent, isModalAction } from "./modules/ModuleContent";
 import { BUNDLED_MODULES } from "./modules/bundled";
+import { useOwnedSubscription } from "./modules/ownedEvents";
 import { Preferences } from "./components/Preferences";
 import { IdentityDebtPanel } from "./components/IdentityDebtPanel";
 import { ExportPanel } from "./components/ExportPanel";
@@ -907,17 +908,18 @@ export default function App() {
     }
   };
 
-  // Surface batch-cache progress in the status bar.
-  useEffect(() => {
-    const unlisten = onCacheProgress((p) => {
-      setStatus(
-        p.done < p.total ? `Caching ${p.done}/${p.total}…` : `Cache ready (${p.total})`,
-      );
-    });
-    return () => {
-      unlisten.then((f) => f());
-    };
-  }, []);
+  // Surface batch-cache progress in the status bar. `useOwnedSubscription` owns the async
+  // registration (issue #13): one that resolves after this effect is cleaned up is stopped
+  // rather than left running.
+  useOwnedSubscription(
+    () =>
+      onCacheProgress((p) => {
+        setStatus(
+          p.done < p.total ? `Caching ${p.done}/${p.total}…` : `Cache ready (${p.total})`,
+        );
+      }),
+    [],
+  );
 
   // Card import runs in the background (the dialog closes immediately) — track its copy
   // progress for the topbar indicator.
@@ -942,39 +944,39 @@ export default function App() {
   // newly-inserted Phase A rows appear as placeholder tiles in real time. "metadata" commits
   // are also throttled (same COMMIT_EVERY cadence as indexing). The "done" event does a final
   // unconditional refresh that flips any residual placeholders to real tiles.
-  useEffect(() => {
-    const unlisten = onScanProgress((p) => {
-      if (p.phase === "done") {
-        setScanProgress(null);
-        lastIndexingRefresh.current = 0; // reset so the next scan starts fresh
-        lastMetadataRefresh.current = 0;
-        refresh();
-      } else {
-        setScanProgress(p);
-        if (p.phase === "indexing") {
-          const now = Date.now();
-          if (now - lastIndexingRefresh.current >= 2000) {
-            lastIndexingRefresh.current = now;
-            refresh();
-          }
-        } else if (p.phase === "metadata") {
-          // Phase B emits at the same COMMIT_EVERY=500 cadence as Phase A — throttle
-          // identically to prevent the same per-event query storm.
-          const now = Date.now();
-          if (now - lastMetadataRefresh.current >= 2000) {
-            lastMetadataRefresh.current = now;
-            refresh();
-          }
-        } else {
-          // "finalizing" and any other single-shot phases: refresh immediately.
+  // Same owned registration as the cache listener above (issue #13).
+  useOwnedSubscription(
+    () =>
+      onScanProgress((p) => {
+        if (p.phase === "done") {
+          setScanProgress(null);
+          lastIndexingRefresh.current = 0; // reset so the next scan starts fresh
+          lastMetadataRefresh.current = 0;
           refresh();
+        } else {
+          setScanProgress(p);
+          if (p.phase === "indexing") {
+            const now = Date.now();
+            if (now - lastIndexingRefresh.current >= 2000) {
+              lastIndexingRefresh.current = now;
+              refresh();
+            }
+          } else if (p.phase === "metadata") {
+            // Phase B emits at the same COMMIT_EVERY=500 cadence as Phase A — throttle
+            // identically to prevent the same per-event query storm.
+            const now = Date.now();
+            if (now - lastMetadataRefresh.current >= 2000) {
+              lastMetadataRefresh.current = now;
+              refresh();
+            }
+          } else {
+            // "finalizing" and any other single-shot phases: refresh immediately.
+            refresh();
+          }
         }
-      }
-    });
-    return () => {
-      unlisten.then((f) => f());
-    };
-  }, [refresh]);
+      }),
+    [refresh],
+  );
 
   // External-develop round-trip status (darktable/RawTherapee/ART) for the topbar.
   useEffect(() => {

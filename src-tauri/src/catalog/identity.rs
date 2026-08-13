@@ -13,17 +13,44 @@
 //! [`bind_sidecar_identity`] is the pure-IO half (no catalog, safe to run off the lock),
 //! [`Catalog::record_sidecar_identity`] the DB half, and [`Catalog::ensure_sidecar_identity`]
 //! composes them for callers that already hold a connection off the main lock (the
-//! scanner, the bundle indexer). [`Catalog::repair_pending_identity`] retries the whole
-//! queue; the plan → IO → record split ([`Catalog::plan_identity_repairs`] +
+//! scanner, the bundle indexer). [`Catalog::run_identity_repair`] retries the queue a page
+//! at a time; the plan → IO → record split ([`Catalog::plan_identity_repairs_page`] +
 //! [`IdentityRepairPlan::run`]) exists so the command layer can do the sidecar IO
 //! without holding the catalog lock, mirroring the storage lifecycle in `lifecycle.rs`.
 //!
 //! `pending_sidecar_identity` is still named for the original UUID debt, but it now carries
 //! a `field` discriminator so the same retry path also covers `chairphoto:ImportBatch`.
+//!
+//! # Who owns a queue row (#34)
+//!
+//! Two writers reach the same `pending_sidecar_identity` row from two connections: the
+//! repair pass ([`Catalog::run_identity_repair`], one job, on a blocking worker) and a
+//! human's decision ([`Catalog::resolve_identity_conflict`], one copy, on another). Before
+//! #34 they were serialized only by SQLite's write lock, which orders the statements but
+//! decides nothing: a resolution landing while the pass was between "read the file" and
+//! "record the outcome" was overwritten by the pass's stale record, so an Adopt could be
+//! silently undone and a Dismiss could be re-queued.
+//!
+//! The rule now is **the pass owns a row only while the row is still the one it planned**:
+//!
+//! 1. Every plan carries the row's version — its `attempts` and `last_attempt_at`.
+//! 2. The value and version are re-read immediately before the sidecar IO
+//!    ([`Catalog::refresh_identity_repair`]), so a page-old plan never acts on stale data
+//!    and a row resolved or dismissed since is skipped without touching the file.
+//! 3. The record is a compare-and-set on that version *and* on `dismissed_at = 0`
+//!    ([`Catalog::record_planned_repair`]). If anyone wrote the row during the IO the
+//!    pass's result is dropped, counted as [`IdentityRepairSummary::superseded`], and the
+//!    newer decision stands.
+//!
+//! A resolution is therefore always the winner, and deliberately does **not** trip the
+//! pass: killing a 74k-row pass because one row got a decision would be a far worse trade
+//! than dropping that row's result. The pass's own ownership — job id, abort flag, status
+//! slot, catalog switch — is the `commands::jobs` protocol, one layer up.
 
 use super::{Catalog, CatalogError, Result};
 use rusqlite::{params, OptionalExtension};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -424,6 +451,34 @@ pub struct IdentityConflictOutcome {
     pub sidecar_backup: Option<String>,
 }
 
+/// The version of one queue row, as the repair pass saw it.
+///
+/// `attempts` moves on every non-`Bound` record and the row disappears on a `Bound` one, so
+/// the pair is enough to tell "nobody has touched this row since I planned it" from "someone
+/// did" — see this module's § Who owns a queue row. `dismissed_at` is deliberately *not*
+/// here: a planned row is always un-dismissed (the planning query filters on it), so the
+/// compare-and-set pins it to `0` literally rather than to a remembered value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct QueueRowVersion {
+    attempts: i64,
+    last_attempt_at: i64,
+}
+
+/// Where a page of [`Catalog::plan_identity_repairs_page`] left off — the queue's primary
+/// key, which is also its scan order.
+///
+/// Keyset, not `OFFSET`: the pass DELETES the rows it binds, so every page turn would shift
+/// an offset window left and skip exactly as many rows as the previous page repaired. A
+/// cursor over the key the scan is already ordered by cannot skip, and costs an index seek
+/// instead of walking the rows behind it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IdentityRepairCursor {
+    photo_id: i64,
+    field: &'static str,
+    volume_id: i64,
+    relative_path: String,
+}
+
 /// One copy's repair, planned under the catalog lock and runnable without it.
 pub struct IdentityRepairPlan {
     pub photo_id: i64,
@@ -433,6 +488,22 @@ pub struct IdentityRepairPlan {
     value: Option<String>,
     /// The physical copy whose sidecar failed earlier.
     target_path: PathBuf,
+    /// The queue row as this plan last read it. Refreshed by
+    /// [`Catalog::refresh_identity_repair`] and checked by
+    /// [`Catalog::record_planned_repair`].
+    version: QueueRowVersion,
+}
+
+impl IdentityRepairPlan {
+    /// This plan's position in the queue's scan order, for the next page.
+    pub fn cursor(&self) -> IdentityRepairCursor {
+        IdentityRepairCursor {
+            photo_id: self.photo_id,
+            field: self.field.as_db_str(),
+            volume_id: self.volume_id,
+            relative_path: self.relative_path.clone(),
+        }
+    }
 }
 
 impl IdentityRepairPlan {
@@ -458,7 +529,7 @@ impl IdentityRepairPlan {
 }
 
 /// Outcome of a repair pass over the pending sidecar-identity queue.
-#[derive(Debug, Default, Clone, serde::Serialize)]
+#[derive(Debug, Default, Clone, Copy, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct IdentityRepairSummary {
     /// Sidecar field now on disk for this queued copy; the pending row was cleared.
@@ -476,6 +547,21 @@ pub struct IdentityRepairSummary {
     /// Retried and is still genuinely failing (unwritable sidecar: read-only storage, an
     /// unparseable sidecar, a full disk). Left queued.
     pub failed: usize,
+    /// Rows somebody else decided while this pass held them: a conflict resolved, a copy
+    /// dismissed, a scan re-recording the same copy (#34). The pass's own result for such a
+    /// row is **discarded**, never written over the newer decision, so it is reported here
+    /// rather than in any of the four buckets above — counting it as `bound` or `failed`
+    /// would claim an effect the pass did not have. Not a failure: the row was decided,
+    /// just not by this pass.
+    pub superseded: usize,
+    /// Un-dismissed queue rows when the pass started — the denominator its progress is
+    /// reported against. The queue can grow (a concurrent scan) or shrink (a resolution)
+    /// underneath it, so `done()` is not guaranteed to reach this.
+    pub total: usize,
+    /// True when the pass stopped before the end of the queue: a cancel, a newer pass, or a
+    /// catalog switch. Every counter below is then partial, and the UI must say so rather
+    /// than present them as a finished result.
+    pub aborted: bool,
 }
 
 impl IdentityRepairSummary {
@@ -486,6 +572,12 @@ impl IdentityRepairSummary {
             SidecarIdentity::Conflict(_) => self.conflicts += 1,
             SidecarIdentity::Unwritable(_) => self.failed += 1,
         }
+    }
+
+    /// Rows this pass has finished with, whatever the outcome — the numerator of its
+    /// progress against [`Self::total`].
+    pub fn done(&self) -> usize {
+        self.bound + self.unreachable + self.conflicts + self.failed + self.superseded
     }
 }
 
@@ -790,26 +882,50 @@ impl Catalog {
         )?)
     }
 
-    /// Plan the repair of every queued copy. PURE SQL, so it is safe to call while
-    /// holding the catalog lock; run each plan off the lock and record the outcome
-    /// afterwards.
+    /// How many un-dismissed queue rows there are — the repair pass's denominator.
+    ///
+    /// Rows, not copies: the pass retries each owed FIELD, so a copy owing both
+    /// `identifier` and `import_batch` is two units of work here, while
+    /// [`Catalog::summarize_pending_identity`] counts it as one copy of debt. The two answer
+    /// different questions and are deliberately not the same number.
+    pub fn count_active_identity_repairs(&self) -> Result<i64> {
+        Ok(self.conn.query_row(
+            "SELECT count(*) FROM pending_sidecar_identity WHERE dismissed_at = 0",
+            [],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// Plan the repair of the next `limit` queued copies after `after`. PURE SQL, so it is
+    /// safe to call while holding the catalog lock; run each plan off the lock and record
+    /// the outcome afterwards.
+    ///
+    /// **Paged, and by keyset.** The queue reached 74,488 rows on the 100k harness shape in
+    /// #20, and the un-paged predecessor materialized every one of them into a `Vec` — with
+    /// its `target_path` — before a single byte of IO. Paging bounds that; doing it by
+    /// keyset rather than `LIMIT/OFFSET` is what makes it *correct*, because the pass
+    /// deletes the rows it binds: an offset window would move left under every page turn
+    /// and skip exactly as many rows as the previous page repaired.
+    ///
+    /// Ordered by the queue's `PRIMARY KEY(photo_id, field, volume_id, relative_path)`,
+    /// which SQLite's automatic index serves directly — no temp b-tree sort, and the
+    /// cursor is an index seek rather than a walk over the rows already done (pinned by
+    /// `identity_repair_page_query_plan_seeks_and_has_no_temp_btree_sort`). The order the
+    /// queue is retried in carries no meaning of its own, so nothing is lost by not
+    /// ordering on `queued_at` (which needed a sort, and which a two-field copy makes
+    /// ambiguous anyway — see [`Catalog::list_pending_identity_page`]).
     ///
     /// Dismissed rows (#33) are skipped: "stop retrying this copy" is the whole content of
     /// a Dismiss, so a dismissed row must cost the pass neither a sidecar read nor a line
     /// in its summary. This is what lets a catalog whose only remaining debts are resolved
     /// or dismissed conflicts finish a pass with every counter at zero.
-    pub fn plan_identity_repairs(&self) -> Result<Vec<IdentityRepairPlan>> {
-        let mut plans = Vec::new();
-        let mut stmt = self.conn.prepare(
-            "SELECT q.photo_id, p.uuid, q.field, q.volume_id, q.relative_path, v.base_path, b.uuid
-             FROM pending_sidecar_identity q
-             JOIN photos p ON p.id = q.photo_id
-             JOIN volumes v ON v.id = q.volume_id
-             LEFT JOIN import_batches b ON b.id = p.import_batch_id
-             WHERE q.dismissed_at = 0
-             ORDER BY q.queued_at, q.photo_id, q.field, q.volume_id, q.relative_path",
-        )?;
-        let rows = stmt.query_map([], |r| {
+    pub fn plan_identity_repairs_page(
+        &self,
+        after: Option<&IdentityRepairCursor>,
+        limit: i64,
+    ) -> Result<Vec<IdentityRepairPlan>> {
+        let mut stmt = self.conn.prepare(&identity_repair_page_sql(after.is_some()))?;
+        let map = |r: &rusqlite::Row| {
             let photo_uuid: String = r.get(1)?;
             let field_text: String = r.get(2)?;
             let import_batch_uuid: Option<String> = r.get(6)?;
@@ -824,12 +940,126 @@ impl Catalog {
                 target_path: Path::new(&base).join(&relative_path),
                 relative_path,
                 value,
+                version: QueueRowVersion {
+                    attempts: r.get(7)?,
+                    last_attempt_at: r.get(8)?,
+                },
             })
-        })?;
-        for plan in rows {
-            plans.push(plan?);
-        }
+        };
+        let plans = match after {
+            None => stmt.query_map(params![limit], map)?.collect::<rusqlite::Result<Vec<_>>>(),
+            Some(c) => stmt
+                .query_map(
+                    params![limit, c.photo_id, c.field, c.volume_id, c.relative_path],
+                    map,
+                )?
+                .collect::<rusqlite::Result<Vec<_>>>(),
+        }?;
         Ok(plans)
+    }
+
+    /// Re-read `plan`'s value and queue-row version straight before its sidecar IO, so a
+    /// page-old plan never acts on data a resolution has since changed. Returns `false` when
+    /// the row is gone or has been dismissed, meaning: leave the file alone entirely.
+    ///
+    /// The value matters as much as the version. Adopt rewrites `photos.uuid`, so a plan
+    /// read before an Adopt carries the identity the photo no longer has — writing that into
+    /// another copy's sidecar would be an actual wrong write, not merely a lost counter.
+    /// One indexed primary-key lookup per row is nothing beside the sidecar parse and write
+    /// it precedes (a network round trip each, on a NAS), and it shrinks the window in which
+    /// a plan can be stale from "the whole page" to "this row's own IO".
+    fn refresh_identity_repair(&self, plan: &mut IdentityRepairPlan) -> Result<bool> {
+        let row: Option<(String, Option<String>, i64, i64, i64)> = self
+            .conn
+            .query_row(
+                "SELECT p.uuid, b.uuid, q.attempts, q.last_attempt_at, q.dismissed_at
+                 FROM pending_sidecar_identity q
+                 JOIN photos p ON p.id = q.photo_id
+                 LEFT JOIN import_batches b ON b.id = p.import_batch_id
+                 WHERE q.photo_id = ?1 AND q.field = ?2 AND q.volume_id = ?3
+                   AND q.relative_path = ?4",
+                params![
+                    plan.photo_id,
+                    plan.field.as_db_str(),
+                    plan.volume_id,
+                    plan.relative_path
+                ],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .optional()?;
+        let Some((photo_uuid, import_batch_uuid, attempts, last_attempt_at, dismissed_at)) = row
+        else {
+            return Ok(false); // resolved (Adopt/Overwrite) or the photo is gone
+        };
+        if dismissed_at != 0 {
+            return Ok(false); // dismissed since the page was planned
+        }
+        let (_, value) = pending_sidecar_value(
+            plan.field.as_db_str(),
+            &photo_uuid,
+            import_batch_uuid,
+        );
+        plan.value = value;
+        plan.version = QueueRowVersion { attempts, last_attempt_at };
+        Ok(true)
+    }
+
+    /// Record a planned repair's outcome, but **only** if the queue row is still the one the
+    /// plan last read: same `attempts`, same `last_attempt_at`, still un-dismissed. Returns
+    /// whether it applied.
+    ///
+    /// This is the compare-and-set of this module's § Who owns a queue row. Without it, a
+    /// resolution landing during a row's sidecar IO is silently undone — an Adopt's cleared
+    /// row is re-inserted as a conflict, a Dismiss is un-dismissed by the next `attempts +
+    /// 1` — because the pass's `INSERT … ON CONFLICT DO UPDATE` predecessor wrote
+    /// unconditionally and would happily re-create a row somebody had just resolved away.
+    ///
+    /// `dismissed_at = 0` is pinned literally rather than compared against a remembered
+    /// value: a planned row is un-dismissed by construction, and this is what makes a
+    /// Dismiss during the IO window reject the write too.
+    ///
+    /// The pass only ever UPDATEs or DELETEs, never INSERTs. Queueing new debt is
+    /// `record_sidecar_field_target`'s job (the scanner, the bundle indexer, a resolution);
+    /// a retry of an existing row that can no longer find that row has nothing to say.
+    fn record_planned_repair(
+        &self,
+        plan: &IdentityRepairPlan,
+        outcome: &SidecarIdentity,
+    ) -> Result<bool> {
+        let key = params![
+            plan.photo_id,
+            plan.field.as_db_str(),
+            plan.volume_id,
+            plan.relative_path,
+            plan.version.attempts,
+            plan.version.last_attempt_at,
+        ];
+        let changed = if matches!(outcome, SidecarIdentity::Bound) {
+            self.conn.execute(
+                "DELETE FROM pending_sidecar_identity
+                 WHERE photo_id = ?1 AND field = ?2 AND volume_id = ?3 AND relative_path = ?4
+                   AND attempts = ?5 AND last_attempt_at = ?6 AND dismissed_at = 0",
+                key,
+            )?
+        } else {
+            self.conn.execute(
+                "UPDATE pending_sidecar_identity
+                    SET attempts = attempts + 1, error = ?7, last_attempt_at = ?8
+                  WHERE photo_id = ?1 AND field = ?2 AND volume_id = ?3 AND relative_path = ?4
+                    AND attempts = ?5 AND last_attempt_at = ?6 AND dismissed_at = 0",
+                params![
+                    plan.photo_id,
+                    plan.field.as_db_str(),
+                    plan.volume_id,
+                    plan.relative_path,
+                    plan.version.attempts,
+                    plan.version.last_attempt_at,
+                    outcome.error_text(),
+                    now(),
+                ],
+            )?
+        };
+        Ok(changed == 1)
     }
 
     /// Resolve ONE conflicted copy the way a human decided to (#33): Adopt the identifier
@@ -1097,24 +1327,107 @@ impl Catalog {
         Ok(rechecked)
     }
 
-    /// Retry every queued repair on this connection, clearing the ones that succeed.
-    /// Composes plan → IO → record for tests and simple callers; the Tauri command
-    /// runs the same three steps with the lock released around the IO.
-    pub fn repair_pending_identity(&self) -> Result<IdentityRepairSummary> {
-        let mut summary = IdentityRepairSummary::default();
-        for plan in self.plan_identity_repairs()? {
-            let outcome = plan.run();
-            self.record_sidecar_field_target(
-                plan.photo_id,
-                plan.field,
-                plan.volume_id,
-                &plan.relative_path,
-                &outcome,
-            )?;
-            summary.tally(&outcome);
+    /// Retry every queued repair on this connection, clearing the ones that succeed, one
+    /// page at a time until the queue is exhausted or `abort` trips.
+    ///
+    /// The whole pass, minus the ownership that surrounds it: `commands::storage`'s
+    /// `repair_pending_identity` claims the identity job family
+    /// (`commands::jobs::JobRegistry::identity`) and hands its abort generation in here, so
+    /// a newer pass, a Cancel, or a catalog switch stops this one. `progress` is called
+    /// after each row with the running summary; the command turns that into the
+    /// `identity:repair_progress` event.
+    ///
+    /// `abort` is checked before each row rather than only between pages, so cancelling a
+    /// pass against an unmounted NAS costs at most one file's timeout instead of the rest
+    /// of the page's. A tripped flag stops the pass with `aborted` set and the counters
+    /// partial; nothing already recorded is rolled back — a bound sidecar stays bound.
+    ///
+    /// Per row the sequence is refresh → IO → compare-and-set record; see this module's
+    /// § Who owns a queue row for why the first and last exist.
+    pub fn run_identity_repair(
+        &self,
+        abort: &AtomicBool,
+        mut progress: impl FnMut(&IdentityRepairSummary),
+    ) -> Result<IdentityRepairSummary> {
+        let mut summary = IdentityRepairSummary {
+            total: self.count_active_identity_repairs()? as usize,
+            ..Default::default()
+        };
+        let mut cursor: Option<IdentityRepairCursor> = None;
+        loop {
+            if abort.load(Ordering::Relaxed) {
+                summary.aborted = true;
+                return Ok(summary);
+            }
+            let page = self.plan_identity_repairs_page(cursor.as_ref(), REPAIR_PAGE_SIZE)?;
+            if page.is_empty() {
+                return Ok(summary);
+            }
+            for mut plan in page {
+                if abort.load(Ordering::Relaxed) {
+                    summary.aborted = true;
+                    return Ok(summary);
+                }
+                cursor = Some(plan.cursor());
+                // Resolved or dismissed since the page was planned: the decision is
+                // somebody else's and this pass has nothing to add to it.
+                if !self.refresh_identity_repair(&mut plan)? {
+                    summary.superseded += 1;
+                    progress(&summary);
+                    continue;
+                }
+                let outcome = plan.run();
+                if self.record_planned_repair(&plan, &outcome)? {
+                    summary.tally(&outcome);
+                } else {
+                    summary.superseded += 1;
+                }
+                progress(&summary);
+            }
         }
-        Ok(summary)
     }
+
+    /// Retry every queued repair, uninterruptibly and without reporting progress.
+    /// Composes plan → IO → record for tests and simple callers; the Tauri command runs the
+    /// same steps under a job's abort flag (see [`Catalog::run_identity_repair`]).
+    pub fn repair_pending_identity(&self) -> Result<IdentityRepairSummary> {
+        self.run_identity_repair(&AtomicBool::new(false), |_| {})
+    }
+}
+
+/// Queue rows planned per round trip to SQLite.
+///
+/// Bounds what the pass holds at once — 74,488 rows with their absolute paths is tens of
+/// megabytes, and the un-paged predecessor built exactly that before its first byte of IO.
+/// Large enough that the planning query is noise beside a page's worth of sidecar parses and
+/// writes (a network round trip each on a NAS), small enough that a page is a fraction of a
+/// second of allocation.
+const REPAIR_PAGE_SIZE: i64 = 256;
+
+/// The exact SQL [`Catalog::plan_identity_repairs_page`] runs, with or without its keyset
+/// cursor predicate — two statements rather than one `?1 = 0 OR …`, so SQLite can *seek* the
+/// primary-key index for a later page instead of re-scanning the rows already done.
+///
+/// A function rather than two consts because the shared 6 lines would otherwise be written
+/// twice and could drift; `EXPLAIN QUERY PLAN` in the tests runs whatever this returns, so
+/// the plan is pinned against the SQL that actually ships either way.
+fn identity_repair_page_sql(with_cursor: bool) -> String {
+    let cursor = if with_cursor {
+        "AND (q.photo_id, q.field, q.volume_id, q.relative_path) > (?2, ?3, ?4, ?5)"
+    } else {
+        ""
+    };
+    format!(
+        "SELECT q.photo_id, p.uuid, q.field, q.volume_id, q.relative_path, v.base_path,
+                b.uuid, q.attempts, q.last_attempt_at
+         FROM pending_sidecar_identity q
+         JOIN photos p ON p.id = q.photo_id
+         JOIN volumes v ON v.id = q.volume_id
+         LEFT JOIN import_batches b ON b.id = p.import_batch_id
+         WHERE q.dismissed_at = 0 {cursor}
+         ORDER BY q.photo_id, q.field, q.volume_id, q.relative_path
+         LIMIT ?1"
+    )
 }
 
 fn now() -> i64 {
@@ -1180,6 +1493,23 @@ mod tests {
         std::fs::write(&path, b"raw-bytes").unwrap();
         let up = catalog.upsert_photo(&path, None, 1, 9).unwrap();
         (up.id, path)
+    }
+
+    /// The queue row for one (copy, `identifier`) pair, or `None` if it is gone.
+    /// `(attempts, error, dismissed_at)` — the three things a race can move.
+    fn queue_row(catalog: &Catalog, photo_id: i64, path: &Path) -> Option<(i64, String, i64)> {
+        let (volume_id, relative_path) = copy_of(catalog, path);
+        catalog
+            .conn()
+            .query_row(
+                "SELECT attempts, error, dismissed_at FROM pending_sidecar_identity
+                 WHERE photo_id = ?1 AND field = 'identifier' AND volume_id = ?2
+                   AND relative_path = ?3",
+                params![photo_id, volume_id, relative_path],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()
+            .unwrap()
     }
 
     /// A copy that is genuinely in `Conflict`, produced by the real path rather than by
@@ -1872,7 +2202,8 @@ mod tests {
         let summary = catalog.summarize_pending_identity().unwrap();
         assert_eq!((summary.total, summary.conflicts, summary.dismissed), (0, 0, 1));
         assert_eq!(catalog.count_pending_identity().unwrap(), 0);
-        assert_eq!(catalog.plan_identity_repairs().unwrap().len(), 0);
+        assert_eq!(catalog.count_active_identity_repairs().unwrap(), 0);
+        assert!(catalog.plan_identity_repairs_page(None, 50).unwrap().is_empty());
         let attempts_before = pending[0].attempts;
         let repair = catalog.repair_pending_identity().unwrap();
         assert_eq!(
@@ -2077,6 +2408,346 @@ mod tests {
                 serde_json::from_str::<IdentityConflictAction>(text).is_err(),
                 "{text} must not deserialize to an action"
             );
+        }
+    }
+
+    // --- the repair pass: paging, cancellation, and row ownership (#34) -----------
+
+    /// **Forced race, by construction.** The window #33's hand-off named: a resolution that
+    /// lands while the pass is between reading the file and recording what it found.
+    ///
+    /// Driven through `refresh` → resolution → `run` → `record` by hand rather than by
+    /// timing, because that IS the interleaving — the pass has already committed to its
+    /// sidecar IO and the decision arrives underneath it. Before #34 the record was an
+    /// unconditional `INSERT … ON CONFLICT DO UPDATE`, so it re-created as a conflict the
+    /// very row the Adopt had just cleared, and the catalog went back to reporting debt for
+    /// a copy a human had already settled.
+    #[test]
+    fn a_resolution_landing_mid_pass_does_not_get_overwritten_by_it() {
+        let (catalog, root, _dir) = temp_catalog("repair-vs-resolution");
+        let (photo_id, path, _) =
+            seed_conflicted_copy(&catalog, &root, "contested.arw", "identity-from-the-file");
+        let (volume_id, relative_path) = copy_of(&catalog, &path);
+
+        // The pass plans the row and refreshes it, exactly as `run_identity_repair` does.
+        let mut plan = catalog
+            .plan_identity_repairs_page(None, 10)
+            .unwrap()
+            .pop()
+            .expect("the conflicted copy must be planned");
+        assert!(catalog.refresh_identity_repair(&mut plan).unwrap());
+
+        // The human decides, on their own connection, while the pass is mid-flight.
+        let secondary = Catalog::open_secondary(catalog.db_path(), &root).unwrap();
+        secondary
+            .resolve_identity_conflict(
+                photo_id,
+                volume_id,
+                &relative_path,
+                IdentityConflictAction::Adopt,
+            )
+            .unwrap();
+        assert_eq!(photo_uuid(&catalog, photo_id), "identity-from-the-file");
+        assert!(queue_row(&catalog, photo_id, &path).is_none(), "the Adopt cleared the row");
+
+        // The pass finishes its IO and tries to record. It must lose.
+        let outcome = plan.run();
+        assert!(matches!(outcome, SidecarIdentity::Conflict(_)), "got {outcome:?}");
+        assert!(
+            !catalog.record_planned_repair(&plan, &outcome).unwrap(),
+            "the pass recorded over a resolution that landed under it"
+        );
+        assert!(
+            queue_row(&catalog, photo_id, &path).is_none(),
+            "the Adopt's cleared row was re-queued as a conflict by the superseded pass"
+        );
+        assert_eq!(
+            photo_uuid(&catalog, photo_id),
+            "identity-from-the-file",
+            "the adopted identity must still stand"
+        );
+    }
+
+    /// The other half of the same window: the decision lands before the pass reaches the
+    /// row at all. The refresh must then skip it — no sidecar read, no write, no counter —
+    /// and the pass must report it as `superseded` rather than as one of the four outcomes,
+    /// which would claim an effect it did not have.
+    ///
+    /// Forced from inside a real `run_identity_repair`: the progress callback resolves the
+    /// SECOND row while the pass is still finishing the first, so the interleaving is fixed
+    /// by construction rather than by thread timing.
+    #[test]
+    fn a_resolution_landing_before_the_pass_reaches_a_row_skips_it_as_superseded() {
+        let (catalog, root, _dir) = temp_catalog("repair-skips-resolved");
+        // Row 1 is an ordinary repairable copy; row 2 is the one that gets dismissed
+        // mid-pass. `photo_id` ascending is the pass's scan order, and `seed_photo` /
+        // `seed_conflicted_copy` insert in call order.
+        let (first_id, first_path) = seed_photo(&catalog, &root, "first.arw");
+        catalog
+            .record_sidecar_identity(first_id, &first_path, &SidecarIdentity::Unreachable)
+            .unwrap();
+        let (second_id, second_path, _) =
+            seed_conflicted_copy(&catalog, &root, "second.arw", "foreign-uuid");
+        let (second_volume, second_relative) = copy_of(&catalog, &second_path);
+        assert!(first_id < second_id, "fixture assumes ascending scan order");
+
+        let secondary = Catalog::open_secondary(catalog.db_path(), &root).unwrap();
+        let dismissed = std::cell::Cell::new(false);
+        let summary = catalog
+            .run_identity_repair(&AtomicBool::new(false), |s| {
+                if s.done() == 1 && !dismissed.get() {
+                    dismissed.set(true);
+                    secondary
+                        .resolve_identity_conflict(
+                            second_id,
+                            second_volume,
+                            &second_relative,
+                            IdentityConflictAction::Dismiss,
+                        )
+                        .unwrap();
+                }
+            })
+            .unwrap();
+
+        assert!(dismissed.get(), "the fixture never got to land its decision");
+        assert_eq!(
+            (summary.bound, summary.unreachable, summary.conflicts, summary.failed),
+            (1, 0, 0, 0),
+            "only the first copy was actually acted on: {summary:?}"
+        );
+        assert_eq!(
+            summary.superseded, 1,
+            "the dismissed copy must be reported as decided-by-someone-else, not as a \
+             conflict this pass found: {summary:?}"
+        );
+        assert_eq!(summary.done(), 2, "both rows were visited: {summary:?}");
+
+        let (attempts, _, dismissed_at) =
+            queue_row(&catalog, second_id, &second_path).expect("a dismissal keeps the row");
+        assert_ne!(dismissed_at, 0, "the pass un-dismissed a copy a human had dismissed");
+        assert_eq!(attempts, 1, "a skipped row must not have its attempt counter bumped");
+    }
+
+    /// **Forced race, real threads.** A pass and a stream of resolutions running
+    /// concurrently on two connections. Whatever the interleaving, a decision that committed
+    /// must still be in force at the end: a dismissed copy stays dismissed, and an adopted
+    /// one stays out of the queue.
+    ///
+    /// The deterministic tests above carry the load; this is the net over the interleavings
+    /// they cannot name. It asserts only the invariant, never a particular winner, so it
+    /// cannot depend on which thread the scheduler favours.
+    #[test]
+    fn concurrent_resolutions_and_a_pass_never_undo_a_decision() {
+        let (catalog, root, _dir) = temp_catalog("repair-race-resolutions");
+        let mut copies = Vec::new();
+        for i in 0..24 {
+            let (id, path, _) = seed_conflicted_copy(
+                &catalog,
+                &root,
+                &format!("contested-{i}.arw"),
+                &format!("foreign-uuid-{i}"),
+            );
+            let (volume_id, relative_path) = copy_of(&catalog, &path);
+            copies.push((id, path, volume_id, relative_path));
+        }
+
+        // Half dismissed, half adopted, so both the "row kept" and the "row deleted"
+        // resolutions race the pass.
+        let decisions: Vec<_> = copies
+            .iter()
+            .enumerate()
+            .map(|(i, (id, _, volume_id, relative_path))| {
+                let action = if i % 2 == 0 {
+                    IdentityConflictAction::Dismiss
+                } else {
+                    IdentityConflictAction::Adopt
+                };
+                (*id, *volume_id, relative_path.clone(), action)
+            })
+            .collect();
+
+        // A `Catalog` owns a `rusqlite::Connection`, which is `Send` but not `Sync`, so each
+        // thread gets its own — which is what a real pass and a real resolution have anyway
+        // (`commands::storage` opens a secondary connection per call).
+        let db_path = catalog.db_path().to_path_buf();
+        let pass_root = root.clone();
+        let resolver_root = root.clone();
+        std::thread::scope(|s| {
+            s.spawn(move || {
+                let pass = Catalog::open_secondary(&db_path, &pass_root).unwrap();
+                // Several passes, so a resolution can land in any of the pass's phases
+                // (planning, refresh, IO, record) rather than only in the first.
+                for _ in 0..4 {
+                    pass.run_identity_repair(&AtomicBool::new(false), |_| {}).unwrap();
+                }
+            });
+            let resolver_db = catalog.db_path().to_path_buf();
+            s.spawn(move || {
+                let resolver = Catalog::open_secondary(&resolver_db, &resolver_root).unwrap();
+                for (id, volume_id, relative_path, action) in &decisions {
+                    // A refusal is a legitimate outcome here (the pass may have bound the
+                    // copy first, making the recorded conflict stale), so failures are not
+                    // asserted away — only what happened to the ones that succeeded.
+                    let _ = resolver.resolve_identity_conflict(
+                        *id,
+                        *volume_id,
+                        relative_path,
+                        *action,
+                    );
+                }
+            });
+        });
+
+        for (i, (id, path, _, _)) in copies.iter().enumerate() {
+            match queue_row(&catalog, *id, path) {
+                Some((_, _, dismissed_at)) if i % 2 == 0 => assert_ne!(
+                    dismissed_at, 0,
+                    "copy {id} was dismissed, and the pass un-dismissed it"
+                ),
+                Some((_, error, _)) => assert!(
+                    !error.starts_with(CONFLICT_PREFIX),
+                    "copy {id} was adopted, and the pass re-queued it as a conflict: {error}"
+                ),
+                // Dismissals keep the row, so a missing row means the Dismiss never landed
+                // (the pass bound the copy first) — legitimate, nothing to check.
+                None => {}
+            }
+        }
+    }
+
+    /// The pass stops at its abort flag between rows, not merely between pages: a cancel
+    /// against an unmounted NAS must cost one file's timeout, not the rest of the page's.
+    /// Counters stay partial and `aborted` says so — a UI that showed them as a finished
+    /// result would report a queue as clean when most of it was never looked at.
+    #[test]
+    fn the_pass_stops_at_its_abort_flag_between_rows() {
+        let (catalog, root, _dir) = temp_catalog("repair-abort");
+        let mut seeded = Vec::new();
+        for i in 0..5 {
+            let (id, path) = seed_photo(&catalog, &root, &format!("abort-{i}.arw"));
+            catalog
+                .record_sidecar_identity(id, &path, &SidecarIdentity::Unreachable)
+                .unwrap();
+            seeded.push((id, path));
+        }
+
+        let abort = AtomicBool::new(false);
+        let summary = catalog
+            .run_identity_repair(&abort, |s| {
+                if s.done() == 1 {
+                    abort.store(true, Ordering::Relaxed);
+                }
+            })
+            .unwrap();
+
+        assert!(summary.aborted, "a tripped flag must be reported, not swallowed: {summary:?}");
+        assert_eq!(summary.done(), 1, "the pass ran on past its abort flag: {summary:?}");
+        assert_eq!(summary.total, 5, "the denominator is the queue at start: {summary:?}");
+        let still_queued = seeded
+            .iter()
+            .filter(|(id, path)| queue_row(&catalog, *id, path).is_some())
+            .count();
+        assert_eq!(still_queued, 4, "the un-visited rows must be left exactly as they were");
+    }
+
+    /// The pass pages the queue instead of materializing it, and the paging is keyset —
+    /// which is what makes it correct, not merely bounded. Every bound row is DELETED, so an
+    /// `OFFSET` window would slide left under each page turn and skip as many rows as the
+    /// previous page repaired: with one full page plus a remainder, an offset-paged pass
+    /// would bind the first `REPAIR_PAGE_SIZE` copies and never see the rest.
+    #[test]
+    fn the_pass_pages_the_queue_without_skipping_what_it_deletes() {
+        let (catalog, root, _dir) = temp_catalog("repair-paging");
+        let count = REPAIR_PAGE_SIZE as usize + 4;
+        let mut seeded = Vec::new();
+        for i in 0..count {
+            let (id, path) = seed_photo(&catalog, &root, &format!("page-{i:04}.arw"));
+            catalog
+                .record_sidecar_identity(id, &path, &SidecarIdentity::Unreachable)
+                .unwrap();
+            seeded.push((id, path));
+        }
+        assert_eq!(catalog.count_active_identity_repairs().unwrap() as usize, count);
+
+        // Each page is bounded, and the pass never holds more than one at a time.
+        assert_eq!(
+            catalog.plan_identity_repairs_page(None, REPAIR_PAGE_SIZE).unwrap().len(),
+            REPAIR_PAGE_SIZE as usize,
+            "the planning query must be bounded by its limit"
+        );
+
+        let summary = catalog.repair_pending_identity().unwrap();
+        assert_eq!(
+            (summary.bound, summary.superseded, summary.aborted),
+            (count, 0, false),
+            "every queued copy must be bound, including the ones past the first page: \
+             {summary:?}"
+        );
+        assert_eq!(catalog.count_active_identity_repairs().unwrap(), 0);
+        for (id, path) in &seeded {
+            assert!(
+                crate::xmp::read_identifier(path).is_some(),
+                "photo {id} past the first page never had its sidecar written"
+            );
+        }
+    }
+
+    /// Guards the planning query's shape directly, as
+    /// `list_pending_identity_page_query_plan_has_no_temp_btree_sort` does for the panel's:
+    /// `EXPLAIN QUERY PLAN` over the exact SQL `plan_identity_repairs_page` ships, in both
+    /// its forms. Neither may sort into a temp b-tree, and the cursor form must *seek* the
+    /// primary-key index rather than scan from the top — otherwise every page turn re-walks
+    /// the rows already repaired and the pass is quadratic in the queue.
+    #[test]
+    fn identity_repair_page_query_plan_seeks_and_has_no_temp_btree_sort() {
+        let (catalog, _root, _dir) = temp_catalog("repair-query-plan");
+        let plan_of = |sql: &str, params: &[&dyn rusqlite::ToSql]| -> Vec<String> {
+            let mut stmt = catalog
+                .conn()
+                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .unwrap();
+            stmt.query_map(params, |r| r.get::<_, String>(3))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+
+        for (with_cursor, params) in [
+            (false, vec![&256i64 as &dyn rusqlite::ToSql]),
+            (
+                true,
+                vec![
+                    &256i64 as &dyn rusqlite::ToSql,
+                    &1i64,
+                    &"identifier",
+                    &1i64,
+                    &"a.arw",
+                ],
+            ),
+        ] {
+            let sql = identity_repair_page_sql(with_cursor);
+            let plan = plan_of(&sql, &params);
+            assert!(
+                !plan.iter().any(|line| line.contains("B-TREE")),
+                "with_cursor={with_cursor}: the ORDER BY fell back to a temp b-tree sort, so \
+                 every page sorts the whole queue: {plan:?}"
+            );
+            let queue_step = plan
+                .iter()
+                .find(|line| line.contains("pending_sidecar_identity"))
+                .unwrap_or_else(|| panic!("no step reads the queue at all: {plan:?}"));
+            assert!(
+                queue_step.contains("USING INDEX") || queue_step.contains("USING COVERING INDEX"),
+                "with_cursor={with_cursor}: the queue must be driven by its primary-key \
+                 index, got: {queue_step}"
+            );
+            if with_cursor {
+                assert!(
+                    queue_step.contains('>'),
+                    "the cursor form must SEEK the index (a `>` constraint), not scan it from \
+                     the top and filter: {queue_step}"
+                );
+            }
         }
     }
 

@@ -9,6 +9,17 @@ import { resolve } from "path";
 // Only the pure-logic exports (satisfies, hostSatisfies, unmetRequirement,
 // register, enableModule, …) are exercised; the Tauri-backed runtime paths
 // are tested indirectly via those helpers.
+//
+// Environment (issue #57): the default stays "node" so the pure-logic suite (no DOM,
+// no component render) keeps its fast, no-jsdom-overhead path. A test that renders a
+// component needs jsdom instead — opt in per file with a leading
+//   // @vitest-environment jsdom
+// comment (a Vitest/Jest convention: the whole file, not just Testing Library's render(),
+// switches environment). Vitest ships the jsdom adapter itself; only the `jsdom` package
+// needs to be a devDependency, alongside `@testing-library/react` for rendering and
+// querying. See src/modules/plugins/__tests__/*.test.tsx for the pattern — those files
+// import "@testing-library/react", whose auto-cleanup registers via the `afterEach` global
+// this config's `globals: true` already provides, so no extra setup file is needed.
 
 export default defineConfig({
   test: {

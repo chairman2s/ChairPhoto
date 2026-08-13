@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import {
+  IdentityConflictAction,
   IdentityDebtState,
   IdentityRepairSummary,
   PendingIdentity,
@@ -10,6 +11,7 @@ import {
   listPendingIdentity,
   listVolumes,
   repairPendingIdentity,
+  resolveIdentityConflict,
   summarizePendingIdentity,
 } from "../modules/api";
 
@@ -17,16 +19,20 @@ export const STATE_LABEL: Record<IdentityDebtState, string> = {
   unreachable: "Unreachable",
   unwritable: "Unwritable",
   conflict: "Conflict",
+  dismissed: "Dismissed",
 };
 
 // Unreachable is a normal state (an unmounted/offline volume, or a file this pass
 // couldn't find) — never styled as a failure. Unwritable and Conflict both need a
 // person's attention, so they read differently, but only Unwritable is a hard failure;
-// Conflict is "needs a decision", not an error (see CONTEXT.md § Identity).
+// Conflict is "needs a decision", not an error (see CONTEXT.md § Identity). Dismissed is a
+// decision already taken — the copy is on the record and asks nothing of anyone, so it
+// reads as neutral, not as an outstanding problem.
 export const STATE_CLASS: Record<IdentityDebtState, string> = {
   unreachable: "identity-state-normal",
   unwritable: "identity-state-warn",
   conflict: "identity-state-attention",
+  dismissed: "identity-state-normal",
 };
 
 function fmtWhen(unixSeconds: number): string {
@@ -73,7 +79,57 @@ export function summaryHeadline(summary: PendingIdentitySummary | null): string 
   if (summary.conflicts > 0) {
     line += ` — ${summary.conflicts} conflict${summary.conflicts === 1 ? "" : "s"}`;
   }
+  // Dismissed copies are deliberately outside `total`: they are a decision on the record,
+  // not outstanding debt. Naming them separately is what stops "0 copies owe…" reading as
+  // "nothing was ever wrong here".
+  if (summary.dismissed > 0) {
+    line += `${summary.conflicts > 0 ? "," : " —"} ${summary.dismissed} dismissed`;
+  }
   return line;
+}
+
+/** The conflicted `identifier` field of a copy, if it has one and it has not been
+ *  dismissed — the field the Adopt/Overwrite/Dismiss actions act on. Only `identifier` can
+ *  conflict (an import batch write never reports one), so this is deliberately not a
+ *  general "first field in some state" helper. Pure, and exported for tests. */
+export function conflictField(p: PendingIdentity): PendingIdentityField | null {
+  return p.fields.find((f) => f.field === "identifier" && f.state === "conflict") ?? null;
+}
+
+/** The dismissed `identifier` field of a copy, if any — the one Restore puts back. */
+export function dismissedField(p: PendingIdentity): PendingIdentityField | null {
+  return p.fields.find((f) => f.field === "identifier" && f.state === "dismissed") ?? null;
+}
+
+/** The line shown after a resolution: what happened, in the vocabulary of CONTEXT.md §
+ *  Identity, stated from the OUTCOME the backend returned rather than from the action that
+ *  was requested. Pure, and exported for tests. */
+export function resolutionMessage(outcome: {
+  action: IdentityConflictAction;
+  catalogUuid: string;
+  previousSidecarUuid: string;
+  recheckedCopies: number;
+  sidecarBackup: string | null;
+}): string {
+  switch (outcome.action) {
+    case "adopt": {
+      const others =
+        outcome.recheckedCopies > 0
+          ? ` ${outcome.recheckedCopies} other cop${outcome.recheckedCopies === 1 ? "y" : "ies"} of this photo re-checked.`
+          : "";
+      return `Adopted ${outcome.catalogUuid} from the sidecar. The catalog now uses it.${others}`;
+    }
+    case "overwrite": {
+      const backup = outcome.sidecarBackup
+        ? ` The previous sidecar is at ${outcome.sidecarBackup}.`
+        : " An earlier backup of this sidecar was already kept and left untouched.";
+      return `Overwrote the sidecar with ${outcome.catalogUuid}, replacing ${outcome.previousSidecarUuid}.${backup}`;
+    }
+    case "dismiss":
+      return "Dismissed. The copy stays on the record but is neither retried nor counted as debt.";
+    case "restore":
+      return "Restored. The copy is queued again.";
+  }
 }
 
 /**
@@ -110,21 +166,32 @@ export function pagingLabel(offset: number, shown: number, total: number | null)
  * itself is bounded to `PAGE_SIZE` rows regardless of queue size — never the strategy of
  * fetching everything and virtualizing only the DOM.
  *
- * Deliberately does NOT resolve conflicts (that's #33 — Adopt/Overwrite/Dismiss) and
- * does NOT expose repair progress/cancellation (that's #34). Both hang their actions off
- * this same list once it exists; this issue only has to make the list and the "start a
- * repair pass" button reachable.
+ * Resolving a conflict (#33) hangs off this same list: a conflicted copy gets Adopt /
+ * Overwrite / Dismiss, and a dismissed one gets Restore. Overwrite is destructive (it
+ * replaces the identifier in the file), so it is the one action behind a confirm step —
+ * Adopt is consequential but reversible-by-decision, and there is no default action for
+ * either.
+ *
+ * Still does NOT expose repair progress/cancellation (that's #34).
  */
 export function IdentityDebtPanel({ onClose }: { onClose: () => void }) {
   const [summary, setSummary] = useState<PendingIdentitySummary | null>(null);
   const [rows, setRows] = useState<PendingIdentity[] | null>(null);
   const [volumes, setVolumes] = useState<Volume[]>([]);
   const [page, setPage] = useState(0);
+  const [showDismissed, setShowDismissed] = useState(false);
   const [summaryError, setSummaryError] = useState("");
   const [listError, setListError] = useState("");
   const [actionError, setActionError] = useState("");
   const [repairing, setRepairing] = useState(false);
   const [repairResult, setRepairResult] = useState<IdentityRepairSummary | null>(null);
+  /** The copy whose Overwrite is awaiting confirmation, keyed like the row itself. Only one
+   *  at a time: a pending destructive action must be visible where it will happen. */
+  const [confirmOverwrite, setConfirmOverwrite] = useState<string | null>(null);
+  /** The copy a resolution is currently in flight for — disables that row's buttons so a
+   *  double click can't send two decisions about one copy. */
+  const [resolving, setResolving] = useState<string | null>(null);
+  const [resolveResult, setResolveResult] = useState("");
 
   const reloadSummary = useCallback(() => {
     setSummaryError("");
@@ -133,9 +200,9 @@ export function IdentityDebtPanel({ onClose }: { onClose: () => void }) {
       .catch((e) => setSummaryError(String(e)));
   }, []);
 
-  const reloadPage = useCallback((p: number) => {
+  const reloadPage = useCallback((p: number, includeDismissed: boolean) => {
     setListError("");
-    listPendingIdentity(PAGE_SIZE, p * PAGE_SIZE)
+    listPendingIdentity(PAGE_SIZE, p * PAGE_SIZE, includeDismissed)
       .then(setRows)
       .catch((e) => setListError(String(e)));
   }, []);
@@ -147,8 +214,8 @@ export function IdentityDebtPanel({ onClose }: { onClose: () => void }) {
   }, [reloadSummary]);
 
   useEffect(() => {
-    reloadPage(page);
-  }, [reloadPage, page]);
+    reloadPage(page, showDismissed);
+  }, [reloadPage, page, showDismissed]);
 
   const volumeName = (id: number) => volumes.find((v) => v.id === id)?.name ?? `volume ${id}`;
 
@@ -163,12 +230,110 @@ export function IdentityDebtPanel({ onClose }: { onClose: () => void }) {
       // start over rather than show a page that no longer lines up with anything.
       setPage(0);
       reloadSummary();
-      reloadPage(0);
+      reloadPage(0, showDismissed);
     } catch (e) {
       setActionError(String(e));
     } finally {
       setRepairing(false);
     }
+  };
+
+  const rowKey = (p: PendingIdentity) => `${p.photoId}-${p.volumeId}-${p.relativePath}`;
+
+  const resolve = async (p: PendingIdentity, action: IdentityConflictAction) => {
+    const key = rowKey(p);
+    setResolving(key);
+    setActionError("");
+    setResolveResult("");
+    try {
+      const outcome = await resolveIdentityConflict(p.photoId, p.volumeId, p.relativePath, action);
+      setResolveResult(resolutionMessage(outcome));
+      setConfirmOverwrite(null);
+      // A resolved copy leaves (or joins) the queue, shifting every later offset — same
+      // reason the repair pass returns to the first page.
+      setPage(0);
+      reloadSummary();
+      reloadPage(0, showDismissed);
+    } catch (e) {
+      // A refusal (most importantly "another photo already holds that identity") is the
+      // backend's message, shown verbatim: it names what it refused and why.
+      setActionError(String(e));
+    } finally {
+      setResolving(null);
+    }
+  };
+
+  /** The three (or one) decisions available for a copy, or nothing if it isn't in a state
+   *  that asks for one. Rendered per copy, not per field: only `identifier` conflicts. */
+  const rowActions = (p: PendingIdentity) => {
+    const key = rowKey(p);
+    const busy = resolving === key;
+    const conflict = conflictField(p);
+    if (conflict) {
+      if (confirmOverwrite === key) {
+        return (
+          <>
+            {/* The identifier about to be destroyed is named in `error` (the Detail
+                column) — shown here as the backend wrote it rather than picked apart with
+                a regex over prose. */}
+            <span className="identity-debt-confirm" title={conflict.error}>
+              Replace the identifier in the file?
+            </span>
+            <button
+              className="chip chip-danger"
+              disabled={busy}
+              onClick={() => resolve(p, "overwrite")}
+            >
+              Overwrite
+            </button>
+            <button className="chip" disabled={busy} onClick={() => setConfirmOverwrite(null)}>
+              Cancel
+            </button>
+          </>
+        );
+      }
+      return (
+        <>
+          <button
+            className="chip"
+            disabled={busy}
+            title="The catalog takes the identity already in this copy's sidecar. Changes the catalog, never the file."
+            onClick={() => resolve(p, "adopt")}
+          >
+            Adopt
+          </button>
+          <button
+            className="chip"
+            disabled={busy}
+            title="This copy's sidecar takes the catalog's identity. Changes the file and destroys the identifier that was there."
+            onClick={() => setConfirmOverwrite(key)}
+          >
+            Overwrite…
+          </button>
+          <button
+            className="chip"
+            disabled={busy}
+            title="Stop retrying this copy. Changes neither the catalog nor the file."
+            onClick={() => resolve(p, "dismiss")}
+          >
+            Dismiss
+          </button>
+        </>
+      );
+    }
+    if (dismissedField(p)) {
+      return (
+        <button
+          className="chip"
+          disabled={busy}
+          title="Put this copy back in the queue."
+          onClick={() => resolve(p, "restore")}
+        >
+          Restore
+        </button>
+      );
+    }
+    return null;
   };
 
   // Virtualized so a large page never renders every row into the DOM at once either.
@@ -207,7 +372,12 @@ export function IdentityDebtPanel({ onClose }: { onClose: () => void }) {
             the file was found but its sidecar could not be written (read-only storage, a
             corrupt sidecar, a full disk) — see Detail for why.{" "}
             <strong>Conflict</strong> means the file's sidecar already carries a different
-            identity — left untouched until a person resolves it; see Detail for which.
+            identity — the file is left untouched until you decide: <strong>Adopt</strong>{" "}
+            the identity that is in the file (changes the catalog, never the file),{" "}
+            <strong>Overwrite</strong> the file with the catalog's (destroys the identifier
+            that was there; the sidecar is backed up first), or <strong>Dismiss</strong> the
+            copy (changes nothing, stops the retries). Adopting an identity another photo
+            already holds is refused — no two photos may share one.
           </div>
 
           <div className="row" style={{ marginTop: 10, marginBottom: 10, alignItems: "center" }}>
@@ -219,6 +389,17 @@ export function IdentityDebtPanel({ onClose }: { onClose: () => void }) {
             >
               {repairing ? "Repairing…" : "Start repair pass"}
             </button>
+            <label className="modal-sub" title="Dismissed copies are kept on the record but are not debt — list them to restore one">
+              <input
+                type="checkbox"
+                checked={showDismissed}
+                onChange={(e) => {
+                  setPage(0);
+                  setShowDismissed(e.target.checked);
+                }}
+              />{" "}
+              Show dismissed{summary && summary.dismissed > 0 ? ` (${summary.dismissed})` : ""}
+            </label>
             {repairResult && (
               <span className="modal-sub">
                 Bound {repairResult.bound} · still unreachable {repairResult.unreachable} ·
@@ -226,6 +407,7 @@ export function IdentityDebtPanel({ onClose }: { onClose: () => void }) {
               </span>
             )}
           </div>
+          {resolveResult && <div className="modal-sub">{resolveResult}</div>}
           {summaryError && <div className="modal-error">{summaryError}</div>}
           {listError && <div className="modal-error">{listError}</div>}
           {actionError && <div className="modal-error">{actionError}</div>}
@@ -233,7 +415,21 @@ export function IdentityDebtPanel({ onClose }: { onClose: () => void }) {
           {rows === null ? (
             <div className="panel-empty">Loading…</div>
           ) : rows.length === 0 && page === 0 ? (
-            <div className="panel-empty">No identity debt — every known copy is bound.</div>
+            <div className="panel-empty">
+              No identity debt — every known copy is bound.
+              {/* "Bound" would be a lie about a dismissed copy: it still isn't bound, we
+                  just stopped asking. Say so, and offer the way to it. */}
+              {!showDismissed && summary && summary.dismissed > 0 && (
+                <>
+                  {" "}
+                  {summary.dismissed} dismissed cop{summary.dismissed === 1 ? "y is" : "ies are"}{" "}
+                  hidden.{" "}
+                  <button className="chip" onClick={() => setShowDismissed(true)}>
+                    Show dismissed
+                  </button>
+                </>
+              )}
+            </div>
           ) : (
             <>
               {/* Header cells share the body's column-sizing wrapper classes (rather than
@@ -250,6 +446,7 @@ export function IdentityDebtPanel({ onClose }: { onClose: () => void }) {
                   Last attempt
                 </span>
                 <span className="identity-debt-fieldcol identity-debt-errorcol">Detail</span>
+                <span className="identity-debt-actions">Resolve</span>
               </div>
               {rows.length === 0 ? (
                 <div className="panel-empty">
@@ -339,6 +536,11 @@ export function IdentityDebtPanel({ onClose }: { onClose: () => void }) {
                               </span>
                             ))}
                           </span>
+                          {/* Per COPY, not per field: only `identifier` can conflict, and
+                              the decision is about this copy's file. Absent for copies in
+                              a state that asks nothing of anyone (Unreachable/Unwritable
+                              need a repair pass, not a decision). */}
+                          <span className="identity-debt-actions">{rowActions(p)}</span>
                         </div>
                       );
                     })}
@@ -347,7 +549,17 @@ export function IdentityDebtPanel({ onClose }: { onClose: () => void }) {
               )}
               <div className="row" style={{ marginTop: 8, alignItems: "center", gap: 8 }}>
                 <span className="modal-sub">
-                  {pagingLabel(page * PAGE_SIZE, rows.length, summary?.total ?? null)}
+                  {/* The page's total is whatever the page is showing: the active queue is
+                      `total`, and "show dismissed" widens it to the two disjoint groups
+                      (`total` + `dismissed`), so the label never counts a copy twice or
+                      claims a smaller total than the rows on screen. */}
+                  {pagingLabel(
+                    page * PAGE_SIZE,
+                    rows.length,
+                    summary === null
+                      ? null
+                      : summary.total + (showDismissed ? summary.dismissed : 0),
+                  )}
                 </span>
                 <button className="chip" disabled={!canPrev} onClick={() => setPage((p) => Math.max(0, p - 1))}>
                   ← Prev

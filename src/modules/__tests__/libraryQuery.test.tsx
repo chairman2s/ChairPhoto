@@ -260,6 +260,30 @@ describe("useLibraryQuery — badges follow the visible window", () => {
     expect(statusCallIds(0)).toEqual([3]);
     expect(result.current.statuses.get(3)).toBe("archived");
   });
+
+  it("keeps the requested photo's badge across a refresh that cleared it", async () => {
+    // The active photo is row 99 — far outside the two rows the grid is showing — and the
+    // user rates it, which refreshes. Without re-asking, the inspector's storage line
+    // would go blank until the selection changed.
+    mockListPhotos.mockResolvedValue(page(Array.from({ length: 100 }, (_, i) => i + 1)));
+    mockPhotoStatuses.mockResolvedValue([[99, "offline"]]);
+
+    const { result } = renderHook(() => useLibraryQuery(EMPTY_QUERY));
+    await act(async () => {
+      await result.current.refresh();
+    });
+    act(() => result.current.setVisibleRange(0, 2));
+    await act(async () => {
+      result.current.requestStatuses([99]);
+    });
+    expect(result.current.statuses.get(99)).toBe("offline");
+
+    await act(async () => {
+      await result.current.refresh();
+    });
+    expect(statusCallIds(2)).toEqual([1, 2, 99]);
+    expect(result.current.statuses.get(99)).toBe("offline");
+  });
 });
 
 describe("useLibraryQuery — clear", () => {

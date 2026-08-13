@@ -86,6 +86,12 @@ export function useLibraryQuery(query: PhotoQuery): LibraryQuery {
   // The latest rows and visible range, readable from callbacks without re-creating them.
   const photosRef = useRef<Photo[]>([]);
   const range = useRef<[number, number]>([0, 0]);
+  // The ids most recently asked for by id rather than by window — in practice the active
+  // photo. A refresh clears the badges, so these are re-fetched alongside the window;
+  // otherwise the inspector's storage line would go blank after a rating change whenever
+  // the active photo sits outside the rows the grid is showing. Replaced, not
+  // accumulated: re-fetching every id ever pinned would be the whole-result fetch again.
+  const pinned = useRef<number[]>([]);
 
   const fetchStatuses = useCallback((gen: number, ids: number[]) => {
     const missing = ids.filter((id) => !requested.current.has(id));
@@ -110,7 +116,10 @@ export function useLibraryQuery(query: PhotoQuery): LibraryQuery {
   }, []);
 
   const requestStatuses = useCallback(
-    (ids: number[]) => fetchStatuses(generation.current, ids),
+    (ids: number[]) => {
+      pinned.current = ids;
+      fetchStatuses(generation.current, ids);
+    },
     [fetchStatuses],
   );
 
@@ -144,7 +153,10 @@ export function useLibraryQuery(query: PhotoQuery): LibraryQuery {
     // again. Before the grid has ever reported (the first refresh of a session) the range
     // is empty and this fetches nothing; the grid's mount effect asks a moment later.
     const [start, end] = range.current;
-    fetchStatuses(gen, page.photos.slice(start, end).map((p) => p.id));
+    fetchStatuses(gen, [
+      ...page.photos.slice(start, end).map((p) => p.id),
+      ...pinned.current,
+    ]);
   }, [query, fetchStatuses]);
 
   const clear = useCallback(() => {
@@ -153,6 +165,7 @@ export function useLibraryQuery(query: PhotoQuery): LibraryQuery {
     generation.current += 1;
     photosRef.current = [];
     requested.current = new Set();
+    pinned.current = [];
     setPhotos([]);
     setTotal(0);
     setStatuses(new Map());

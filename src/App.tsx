@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { confirm } from "@tauri-apps/plugin-dialog";
 import {
   analyzeBurstSharpness,
@@ -10,7 +10,6 @@ import {
   DeepLinkView,
   getPhotoByUuid,
   initCatalog,
-  listPhotos,
   onCatalogSwitched,
   onDeepLinkPhoto,
   onDeepLinkTag,
@@ -63,12 +62,13 @@ import {
   getSetting,
   listPendingOperations,
   listVolumes,
-  photoStatuses,
+  PhotoQuery,
   reconcileNow,
   StorageStatus,
   StorageTier,
   summarizePendingIdentity,
 } from "./modules/api";
+import { useLibraryQuery } from "./modules/libraryQuery";
 import { CatalogGrid } from "./components/CatalogGrid";
 import { Splash, BOOT_STAGES } from "./components/Splash";
 import { TagPanel } from "./components/TagPanel";
@@ -144,11 +144,6 @@ export default function App() {
     if (bootDone.current.init && bootDone.current.photos) setBootStage(null);
   };
   const [status, setStatus] = useState("");
-  const [photos, setPhotos] = useState<Photo[]>([]);
-  // How many photos match the current query. Equal to `photos.length` while the grid asks
-  // for every row; a windowed fetch is what separates them (issue #10).
-  const [photoTotal, setPhotoTotal] = useState(0);
-  const [statuses, setStatuses] = useState<Map<number, StorageStatus>>(new Map());
   // Per-photo thumbnail cache-bust, bumped after a photo's file is recovered
   // (relocate / retrieve-from-NAS) so its tile refreshes instead of staying black.
   const [thumbBusts, setThumbBusts] = useState<Map<number, number>>(new Map());
@@ -189,6 +184,44 @@ export default function App() {
   const [activeLens, setActiveLens] = useState<string | null>(null);
   // Colour-label filter, OR-combined ("" = the No-label dot). Empty = off.
   const [activeLabels, setActiveLabels] = useState<string[]>([]);
+
+  // --- the library view -----------------------------------------------------
+  // Every filter above, as the one typed query the backend takes (issue #10). Memoized
+  // because it is what `library.refresh` depends on: a new object per render would refetch
+  // per render.
+  const photoQuery = useMemo<PhotoQuery>(
+    () => ({
+      tagId: activeTagId,
+      albumId: activeAlbumId,
+      batchId: activeBatchId,
+      smartAlbumId: activeSmartAlbumId,
+      facets: activeFacets,
+      cullingFilter: filter,
+      storageTier,
+      camera: activeCamera,
+      lens: activeLens,
+      labels: activeLabels,
+      sort: photoSort,
+    }),
+    [
+      activeTagId,
+      activeAlbumId,
+      activeBatchId,
+      activeSmartAlbumId,
+      activeFacets,
+      filter,
+      storageTier,
+      activeCamera,
+      activeLens,
+      activeLabels,
+      photoSort,
+    ],
+  );
+  // The photo rows, their total, and the grid's storage-status badges — including the
+  // refresh generation that stops a slow badge response from an older filter repainting a
+  // newer grid. `App` no longer owns any of that state; see modules/libraryQuery.ts.
+  const library = useLibraryQuery(photoQuery);
+  const { photos, statuses, clear: clearLibrary } = library;
   const [selectedId, setSelectedId] = useState<number | null>(null); // active/primary
   const [selectedIds, setSelectedIds] = useState<number[]>([]); // full selection
   // Fixed anchor for Shift range selection (mouse Shift-click and Shift+Arrow). Set on any
@@ -549,34 +582,21 @@ export default function App() {
     return () => window.removeEventListener("keydown", onKey);
   }, [ctxMenu]);
 
+  // Re-run the library query and reload the tag tree. The photo rows, their badges and the
+  // stale-response guard live in `useLibraryQuery`; the tag tree is the shell's own.
+  const refreshLibrary = library.refresh;
   const refresh = useCallback(async () => {
-    // Every filter as one typed query, and one window of the answer (issue #10). No
-    // window is passed yet, so this is still the whole matching set — but it now arrives
-    // as a page that knows its own total.
-    const [page, nextTags] = await Promise.all([
-      listPhotos({
-        tagId: activeTagId,
-        albumId: activeAlbumId,
-        batchId: activeBatchId,
-        smartAlbumId: activeSmartAlbumId,
-        facets: activeFacets,
-        cullingFilter: filter,
-        storageTier,
-        camera: activeCamera,
-        lens: activeLens,
-        labels: activeLabels,
-        sort: photoSort,
-      }),
-      listTags(),
-    ]);
-    setPhotos(page.photos);
-    setPhotoTotal(page.total);
+    const [, nextTags] = await Promise.all([refreshLibrary(), listTags()]);
     setTags(nextTags);
-    // Fetch storage status for the visible set (for the grid's local/NAS icons).
-    photoStatuses(page.photos.map((p) => p.id))
-      .then((pairs) => setStatuses(new Map(pairs)))
-      .catch(() => setStatuses(new Map()));
-  }, [activeTagId, activeAlbumId, activeBatchId, activeSmartAlbumId, activeFacets, filter, storageTier, activeCamera, activeLens, activeLabels, photoSort]);
+  }, [refreshLibrary]);
+
+  // Storage status for the active photo, which the inspector, the loupe and the
+  // right-click menu all read. The grid asks for the rows it is showing; a photo reached
+  // some other way (a deep link straight into the loupe, a stack child) never was one.
+  const { requestStatuses } = library;
+  useEffect(() => {
+    if (selectedId != null) requestStatuses([selectedId]);
+  }, [selectedId, requestStatuses]);
 
   // --- recovery actions for a photo whose original can't be shown ----------
   // Shared by the right-click menu and the loupe's "unavailable" state.
@@ -1033,8 +1053,9 @@ export default function App() {
       setIdentityDebtCount(null);
       // Clear photo/tag arrays immediately so the grid shows nothing while the
       // async refresh resolves — prevents the previous catalog's rows from being
-      // visible (with stale IDs) during the switch.
-      setPhotos([]);
+      // visible (with stale IDs) during the switch. `clear()` also disowns a refresh
+      // still running against the catalog that just closed.
+      clearLibrary();
       setTags([]);
       // Reload keys — bump so sidebar panels re-query the new catalog.
       setAlbumsKey((k) => k + 1);
@@ -1060,7 +1081,7 @@ export default function App() {
     return () => {
       unlisten.then((f) => f());
     };
-  }, [refresh, refreshIdentityDebtCount]);
+  }, [clearLibrary, refresh, refreshIdentityDebtCount]);
 
   // Reset the active version to Original whenever the selected photo changes.
   useEffect(() => {
@@ -1696,6 +1717,7 @@ export default function App() {
               selectedId={selectedId}
               selectedIds={selectedIds}
               statuses={statuses}
+              onVisibleRange={library.setVisibleRange}
               thumbBusts={thumbBusts}
               softThreshold={softThreshold}
               emptyMessage={
@@ -1723,11 +1745,11 @@ export default function App() {
               }}
             />
           )}
-          {!inDevelop && !activeView && !(loupeInline && selected) && photoTotal > 0 && (
+          {!inDevelop && !activeView && !(loupeInline && selected) && library.total > 0 && (
             <div className="grid-statusbar">
               {/* The MATCHING count, which a windowed fetch would no longer equal
                   `photos.length` (issue #10). */}
-              <span className="grid-statusbar-count">{photoTotal.toLocaleString()}</span>
+              <span className="grid-statusbar-count">{library.total.toLocaleString()}</span>
               <span>photos</span>
               {selectedIds.length > 1 && (
                 <span className="grid-statusbar-sel">

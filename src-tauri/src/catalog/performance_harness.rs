@@ -138,6 +138,24 @@ fn large_catalog_shape() {
         .copied()
         .take(config.grid_window_size)
         .collect();
+    // What a grid refresh costs *now*: storage status for the visible window only. The
+    // version count no longer has a side query at all — it rides the photo row.
+    let window_statuses = required_operation(
+        &mut operations,
+        &config,
+        Operation::GridStatusesWindow,
+        || {
+            let measured = measure_grid_statuses(&catalog, &volume_health, &window_ids)?;
+            Ok(Measured::new(
+                measured.summary,
+                Some(window_ids.len()),
+                Some(measured.payload_bytes),
+            ))
+        },
+    );
+
+    // …and the two it replaced: both badge maps, for a window and then for every returned
+    // id, which is what `App.refresh` did on every filter change (issue #10).
     let _window_badges = required_operation(
         &mut operations,
         &config,
@@ -264,6 +282,7 @@ fn large_catalog_shape() {
             first: first_window,
             deep: deep_window,
         },
+        grid_statuses_window: window_statuses,
         result_counts: ResultCounts {
             all_photos: all_ids.len(),
             tag_filtered: tag_filtered.len(),
@@ -340,6 +359,7 @@ struct HarnessReport {
     result_counts: ResultCounts,
     /// The first and last window of the full ordered set, through `photo_page`.
     windows: WindowSummaries,
+    grid_statuses_window: BadgeSummary,
     grid_badges_all_returned_ids: BadgeSummary,
     resolver: ResolverSummary,
     pending_enrichment: PendingSummary,
@@ -422,6 +442,7 @@ enum Operation {
     ListPhotosOfflineNas,
     ListTagsWithCounts,
     VolumeReachability,
+    GridStatusesWindow,
     GridBadgesWindow,
     GridBadgesAllReturnedIds,
     ResolverSample,
@@ -460,6 +481,9 @@ impl Operation {
                 OperationInfo::scaled("list_tags_with_counts", 20_000.0)
             }
             Operation::VolumeReachability => OperationInfo::fixed("volume_reachability", 1_000.0),
+            Operation::GridStatusesWindow => {
+                OperationInfo::fixed("grid_statuses_window", 5_000.0)
+            }
             Operation::GridBadgesWindow => OperationInfo::fixed("grid_badges_window", 5_000.0),
             Operation::GridBadgesAllReturnedIds => {
                 OperationInfo::scaled("grid_badges_all_returned_ids", 20_000.0)
@@ -1131,6 +1155,35 @@ fn measure_resolver(
     })
 }
 
+/// Storage status for a set of ids — the one badge side query production still makes, and
+/// it makes it per visible window (issue #10).
+fn measure_grid_statuses(
+    catalog: &Catalog,
+    volume_health: &crate::volume_health::VolumeHealth,
+    photo_ids: &[i64],
+) -> Result<BadgeMeasurement> {
+    let reachable = load_volume_reachability(catalog, volume_health)?;
+    let statuses =
+        crate::commands::grid_photo_statuses_with_reachability(catalog, photo_ids, &reachable)?;
+    let payload_bytes = command_payload(
+        "photo_statuses",
+        json!({ "photoIds": photo_ids }),
+        &statuses,
+    );
+    Ok(BadgeMeasurement {
+        summary: BadgeSummary {
+            requested_ids: photo_ids.len(),
+            storage_rows: statuses.len(),
+            version_rows: 0,
+            statuses: count_statuses(&statuses),
+        },
+        payload_bytes,
+    })
+}
+
+/// Both badge maps for a set of ids — what a refresh cost *before* the version count moved
+/// onto the row and the status fetch moved to the visible window. Kept as the baseline the
+/// harness report compares against.
 fn measure_grid_badges(
     catalog: &Catalog,
     volume_health: &crate::volume_health::VolumeHealth,

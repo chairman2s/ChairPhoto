@@ -61,8 +61,12 @@ and compare:
   the windowed path the grid uses (`list_photos_window_first` / `list_photos_window_deep`),
   including the `COUNT` that yields `total`. A deep window costing what a shallow one does
   is the claim windowing rests on; compare both against `list_photos_all_date`.
-- `gridBadgesAllReturnedIds`: current full-result badge shape. This uses the same command helpers
-  as the grid refresh path: volume-health reachability, storage statuses, and version counts.
+- `gridStatusesWindow`: what a grid refresh costs now — storage status for the visible
+  window only. The version count has no side query at all any more: it rides the photo row.
+- `gridBadgesAllReturnedIds`: the shape that replaced, kept as the baseline — both badge
+  maps for every returned id, which is what `App.refresh` did on each filter change. It
+  uses the same command helpers as the grid path: volume-health reachability, storage
+  statuses, and version counts.
 - `resolver`: sampled candidate-path and resolved-path counts, including offline backup candidates.
 - `pendingEnrichment`: queued rows versus rows loadable through the resolver.
 - `reconcileScannedScope`: what a scan's finalizing pass costs — the scope query

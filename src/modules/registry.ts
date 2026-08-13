@@ -45,6 +45,13 @@ export interface Photo {
    * `"sharpest-of-burst"` = sharpest frame in its cluster (the keeper candidate).
    */
   burstFlag: string | null;
+  /**
+   * Named edit versions of this photo, for the grid's "N versions" badge (issue #10).
+   * Carried on the row so a grid refresh needs no per-id side query. Optional because a
+   * `Photo` built by an older host (or a fixture) may predate the field; treat a missing
+   * value as 0.
+   */
+  versionCount?: number;
 }
 
 export interface Tag {

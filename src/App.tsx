@@ -68,7 +68,6 @@ import {
   StorageStatus,
   StorageTier,
   summarizePendingIdentity,
-  versionCounts,
 } from "./modules/api";
 import { CatalogGrid } from "./components/CatalogGrid";
 import { Splash, BOOT_STAGES } from "./components/Splash";
@@ -146,8 +145,10 @@ export default function App() {
   };
   const [status, setStatus] = useState("");
   const [photos, setPhotos] = useState<Photo[]>([]);
+  // How many photos match the current query. Equal to `photos.length` while the grid asks
+  // for every row; a windowed fetch is what separates them (issue #10).
+  const [photoTotal, setPhotoTotal] = useState(0);
   const [statuses, setStatuses] = useState<Map<number, StorageStatus>>(new Map());
-  const [versionCnt, setVersionCounts] = useState<Map<number, number>>(new Map());
   // Per-photo thumbnail cache-bust, bumped after a photo's file is recovered
   // (relocate / retrieve-from-NAS) so its tile refreshes instead of staying black.
   const [thumbBusts, setThumbBusts] = useState<Map<number, number>>(new Map());
@@ -549,33 +550,32 @@ export default function App() {
   }, [ctxMenu]);
 
   const refresh = useCallback(async () => {
-    const [nextPhotos, nextTags] = await Promise.all([
-      listPhotos(
-        activeTagId,
-        activeAlbumId,
-        activeBatchId,
-        activeFacets,
-        filter,
-        activeSmartAlbumId,
+    // Every filter as one typed query, and one window of the answer (issue #10). No
+    // window is passed yet, so this is still the whole matching set — but it now arrives
+    // as a page that knows its own total.
+    const [page, nextTags] = await Promise.all([
+      listPhotos({
+        tagId: activeTagId,
+        albumId: activeAlbumId,
+        batchId: activeBatchId,
+        smartAlbumId: activeSmartAlbumId,
+        facets: activeFacets,
+        cullingFilter: filter,
         storageTier,
-        activeCamera,
-        activeLens,
-        photoSort,
-        activeLabels,
-      ),
+        camera: activeCamera,
+        lens: activeLens,
+        labels: activeLabels,
+        sort: photoSort,
+      }),
       listTags(),
     ]);
-    setPhotos(nextPhotos);
+    setPhotos(page.photos);
+    setPhotoTotal(page.total);
     setTags(nextTags);
-    const ids = nextPhotos.map((p) => p.id);
     // Fetch storage status for the visible set (for the grid's local/NAS icons).
-    photoStatuses(ids)
+    photoStatuses(page.photos.map((p) => p.id))
       .then((pairs) => setStatuses(new Map(pairs)))
       .catch(() => setStatuses(new Map()));
-    // Version counts for the grid's "N versions" badge.
-    versionCounts(ids)
-      .then((pairs) => setVersionCounts(new Map(pairs)))
-      .catch(() => setVersionCounts(new Map()));
   }, [activeTagId, activeAlbumId, activeBatchId, activeSmartAlbumId, activeFacets, filter, storageTier, activeCamera, activeLens, activeLabels, photoSort]);
 
   // --- recovery actions for a photo whose original can't be shown ----------
@@ -1696,7 +1696,6 @@ export default function App() {
               selectedId={selectedId}
               selectedIds={selectedIds}
               statuses={statuses}
-              versionCounts={versionCnt}
               thumbBusts={thumbBusts}
               softThreshold={softThreshold}
               emptyMessage={
@@ -1724,9 +1723,11 @@ export default function App() {
               }}
             />
           )}
-          {!inDevelop && !activeView && !(loupeInline && selected) && photos.length > 0 && (
+          {!inDevelop && !activeView && !(loupeInline && selected) && photoTotal > 0 && (
             <div className="grid-statusbar">
-              <span className="grid-statusbar-count">{photos.length.toLocaleString()}</span>
+              {/* The MATCHING count, which a windowed fetch would no longer equal
+                  `photos.length` (issue #10). */}
+              <span className="grid-statusbar-count">{photoTotal.toLocaleString()}</span>
               <span>photos</span>
               {selectedIds.length > 1 && (
                 <span className="grid-statusbar-sel">

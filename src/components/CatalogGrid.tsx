@@ -45,7 +45,6 @@ interface TileProps {
   isSelected: boolean;
   isActive: boolean;
   status: StorageStatus | undefined;
-  versionCount: number | undefined;
   bust: number | undefined;
   /** If non-null and photo.sharpness < softThreshold, show a soft badge. */
   softThreshold: number | null;
@@ -59,7 +58,6 @@ const Tile = React.memo(function Tile({
   isSelected,
   isActive,
   status,
-  versionCount,
   bust,
   softThreshold,
   onSelect,
@@ -103,9 +101,9 @@ const Tile = React.memo(function Tile({
             style={{ background: LABEL_COLORS[photo.label] }}
           />
         )}
-        {(versionCount ?? 0) > 0 && (
-          <span className="badge badge-versions" title={`${versionCount} version(s)`}>
-            ⧉ {versionCount}
+        {(photo.versionCount ?? 0) > 0 && (
+          <span className="badge badge-versions" title={`${photo.versionCount} version(s)`}>
+            ⧉ {photo.versionCount}
           </span>
         )}
         {(photo.stackCount ?? 0) > 0 && (
@@ -174,7 +172,6 @@ export function CatalogGrid({
   selectedId,
   selectedIds,
   statuses,
-  versionCounts,
   thumbBusts,
   softThreshold = null,
   emptyMessage,
@@ -186,8 +183,6 @@ export function CatalogGrid({
   selectedId: number | null;
   selectedIds: number[];
   statuses?: Map<number, StorageStatus>;
-  /** Number of named versions per photo, for the tile badge. */
-  versionCounts?: Map<number, number>;
   /** Per-photo cache-bust nonce, bumped after a photo's file is recovered. */
   thumbBusts?: Map<number, number>;
   /**
@@ -337,7 +332,6 @@ export function CatalogGrid({
                   isSelected={selectedSet.has(photo.id)}
                   isActive={photo.id === selectedId}
                   status={statuses?.get(photo.id)}
-                  versionCount={versionCounts?.get(photo.id)}
                   bust={thumbBusts?.get(photo.id)}
                   softThreshold={softThreshold}
                   onSelect={stableOnSelect}

@@ -57,6 +57,10 @@ and compare:
   counts (`request`, `response`, `total`), and any truncated recorded error per measured operation.
 - `resultCounts`: returned rows for broad, tag-filtered, single-facet, combined-facet, and offline
   NAS library queries.
+- `windows`: the first and the last window of the full ordered set, through `photo_page` —
+  the windowed path the grid uses (`list_photos_window_first` / `list_photos_window_deep`),
+  including the `COUNT` that yields `total`. A deep window costing what a shallow one does
+  is the claim windowing rests on; compare both against `list_photos_all_date`.
 - `gridBadgesAllReturnedIds`: current full-result badge shape. This uses the same command helpers
   as the grid refresh path: volume-health reachability, storage statuses, and version counts.
 - `resolver`: sampled candidate-path and resolved-path counts, including offline backup candidates.

@@ -254,7 +254,7 @@ a negative film roll. All photos from that ingest belong to it forever.
 `import_batches` table + `photos.import_batch_id` (schema v9);
 `catalog/batches.rs` (create / assign-immutably / list with counts); each scan that
 imports new photos creates one batch (source = scanned folder) and assigns only the
-new photos; `list_photos` takes a `batch_id` filter; a read-only Batches sidebar
+new photos; the library query carries a `batchId` filter; a read-only Batches sidebar
 section + a filter-bar chip. **Batch UUID in XMP sidecar** — the scanner, card ingest,
 and bundle importer write `chairphoto:ImportBatch` (merge-safe, beside the
 `chairphoto:LastWrite` field) so the batch survives catalog loss and merge; failed
@@ -269,7 +269,7 @@ Four independent axes:
 3. **Albums** — manual curated collections; photos from anywhere. (`albums` +
    `album_photos` junction.) Ordered membership, sidebar section,
    add-from-selection; album viewing composes with the culling filter via
-   `list_photos(.., album_id, ..)`. Deleting an album never deletes photos.
+   the library query's `albumId`. Deleting an album never deletes photos.
 4. **Smart albums** — rule-based, auto-populated from metadata. currently a list of AND
    conditions over fields (camera, lens, ISO, date, rating, label, pick, tag, batch).
    Nested AND/OR is not implemented.

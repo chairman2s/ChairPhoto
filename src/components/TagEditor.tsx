@@ -14,6 +14,7 @@ import {
   TagTerm,
 } from "../modules/api";
 import { panelsForSlot, useHostContributions } from "../modules/host";
+import { ModuleContent } from "../modules/ModuleContent";
 
 // Modal for managing a tag's taxonomy: per-language translations and synonyms,
 // each synonym with its own export checkbox, plus a live preview of what would be
@@ -323,7 +324,7 @@ export function TagEditor({
           {panelsForSlot("tag-editor").map((panel) => (
             <section className="editor-section" key={panel.id}>
               <h3>{panel.label}</h3>
-              {panel.render()}
+              <ModuleContent view={panel} />
             </section>
           ))}
         </div>

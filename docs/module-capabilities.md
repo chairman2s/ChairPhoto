@@ -1,15 +1,17 @@
 ---
 title: Module capabilities
-description: "What a third-party module can do today, what stops it, and the two changes that would remove those limits."
+description: "What a third-party module can do today, what stops it, and the changes that remove those limits."
 ---
 
 # Module capabilities
 
 `docs/plugin-system.md` describes the module contract as it exists. This document covers the
 gap between that contract and a module system a third party can actually build against, and
-the two pieces of work that close it.
+the pieces of work that close it.
 
-It is a design document. Nothing here is implemented.
+Status: step 1 (the rendering ABI, #46) is implemented and is described in the past tense
+below. Steps 2–4 — the CSP lockdown, per-module permissions, and host-mediated capabilities —
+are still design, and are marked as such.
 
 ## What already works
 
@@ -22,19 +24,21 @@ validated the default export, registered it, enabled it from persisted settings,
 namespaced key `hello.loaded_at`, so per-module setting isolation works too.
 
 So discovery, versioning, requirements, registration, enablement, lifecycle, and the settings
-API are all real. A third party cannot use them for anything substantial, for two reasons.
+API are all real. What used to stop a third party using them for anything substantial was two
+things: a module could not draw, and it could not reach a capability the host lacks. The first
+is fixed; the second is not.
 
-## Blocker 1 — a module cannot render
+## Rendering ABI (was: blocker 1 — a module cannot render)
 
-Every UI contribution point returns `ReactNode`:
+Every UI contribution point used to return `ReactNode` and nothing else:
 
 | Contribution | Declared in |
 |---|---|
-| `ModulePanel.render()` | `src/modules/registry.ts:88` |
-| `MainView.icon` / `.render()` | `:124`, `:125` |
-| `ToolbarAction.render()` | `:141` |
-| publish target / edit renderer | `:153` |
-| `registerSettingsPanel()` | `:205` |
+| `ModulePanel` | `src/modules/registry.ts` |
+| `MainView` | same |
+| `ToolbarAction` | same |
+| `PublishTarget` / `EditRenderer` | same |
+| `registerSettingsPanel()` | same |
 
 A bundled module satisfies that by being compiled with the app and sharing its React
 instance. An external module is imported straight from disk and has no route to React:
@@ -46,11 +50,10 @@ instance. An external module is imported straight from disk and has no route to 
 - bundling its own copy would not work either, because two React instances break hooks and
   context.
 
-`ReactNode` includes strings, so an external module can return bare text. That is the entire
-ceiling. The example module in `examples/modules/hello/` returns a string for exactly this
-reason, not as a simplification.
+`ReactNode` includes strings, so an external module could return bare text. That was the
+entire ceiling.
 
-### Options
+### Options that were considered
 
 **Expose the host's React on a global.** Around ten lines: publish `React` on a namespaced
 global at startup, and modules destructure it. Same instance, so hooks and context work.
@@ -62,13 +65,73 @@ same ABI-coupling problem.
 
 **Make the ABI framework-agnostic.** Contribution points hand the module a DOM element and a
 `mount(el)` / `unmount()` pair instead of asking for a `ReactNode`. The module owns what it
-renders and how. This is the option to take if third-party modules are a long-term goal: a
-plugin ABI coupled to the host's UI framework means a React major upgrade breaks every
-third-party module ever written, and their authors — not you — have to fix them. It is also
-the largest change, and bundled modules must keep working across it, which probably means
-both paths coexist: `ReactNode` for bundled, `mount()` for external.
+renders and how.
 
-Nothing here is decided.
+### Decision — `mount(el)` / `unmount(el)`
+
+The third option was taken. Both cheaper options put React's version in the ABI: a React
+major upgrade would break every third-party module ever written, and their authors — not
+this project — would have to fix them. A module system whose stability promise is
+"additive-only within a host major" (`docs/plugin-system.md`) cannot honour that promise while
+its rendering contract is a re-export of somebody else's framework. `mount(el)` costs more
+once, here, instead of costing every module author later. Nothing in the ABI names React, so
+the host is free to change or replace its UI framework without touching the contract.
+
+The contract is `ModuleMount` in `src/modules/registry.ts`:
+
+```ts
+interface ModuleMount {
+  mount?(el: HTMLElement): void;
+  unmount?(el: HTMLElement): void;
+}
+```
+
+`ModulePanel`, `MainView`, `PublishTarget` and `ToolbarAction` each extend it, `render()`
+is now optional on all of them, and `registerSettingsPanel` accepts a React thunk *or* a
+`ModuleMount`. `ToolbarAction` is the one contribution whose draw call takes an argument, so
+its DOM form is `mount(el, close)`, mirroring `render(close)`.
+
+Rules:
+
+- Provide exactly one path. If a contribution has both, **`render` wins**, so a bundled
+  module is never routed through the DOM adapter.
+- `unmount(el)` releases what lives *outside* `el` (listeners on `document`, timers,
+  observers). The host empties `el` itself, which is what makes `mount` safe to call again.
+- The pair can run more than once for one contribution: React StrictMode mounts, unmounts and
+  remounts every effect in development. `mount` must build from scratch.
+- Both calls are wrapped in try/catch by the host, for the same reason `onLoad` is: an
+  installed module is untrusted code, and a throw from it must not take down the panel
+  rendering it.
+
+### Both paths coexist, and which is which
+
+Bundled modules keep using `render(): ReactNode`. They are compiled with the app, share its
+React instance, and rewriting ~20k lines of first-party TSX to DOM calls would buy nothing —
+the ABI-coupling argument does not apply to code that ships in the same binary as the
+framework. External modules use `mount()`.
+
+Carrying two paths is acceptable because the second one is nine lines of type and one adapter
+component (`src/modules/ModuleContent.tsx`), and every slot goes through that single adapter:
+`ModuleContent` picks the path, so no call site knows there are two. The React path is a
+pass-through that emits no DOM of its own, so a bundled module's output lands exactly where
+it did before the adapter existed — asserted in
+`src/modules/__tests__/moduleContent.test.tsx`.
+
+This answers the open question below ("Does `ReactNode` stay for bundled modules…"): yes, and
+yes.
+
+### Worked example
+
+`examples/modules/hello/` is an external module that renders into the `inspector` panel slot:
+plain JavaScript, no React import, no build step, loaded from
+`<app_data_dir>/modules/hello/`. It shows the full shape of a stateful external panel —
+`mount(el)` builds DOM and remembers the element, `unmount(el)` forgets it, and
+`onPhotoSelected` repaints every element still mounted, which is how an external module
+reacts to host state without a React render loop.
+
+The last case in `src/modules/__tests__/moduleContent.test.tsx` dynamically imports that same
+file — the shipped one, not a copy — registers it through the real host, renders it through
+the real adapter, and drives `setSelection()` to prove the repaint.
 
 ## Blocker 2 — a module cannot reach a capability the host lacks
 
@@ -79,7 +142,7 @@ heard of has no route to it, and would need a Rust backend compiled into the app
 That is why Flickr and SmugMug are bundled rather than external. Flickr is ~1500 lines of Rust
 (OAuth 1.0a signing, multipart upload, REST calls) and ~570 lines of TSX. Its Rust half cannot
 be loaded at runtime — `plugin-system.md` states backends are compiled in with no safe
-hot-loading — and its TSX half would hit Blocker 1 anyway.
+hot-loading — and its TSX half would have had no way to draw before the rendering ABI landed.
 
 ### The security shape this has to fit
 
@@ -146,12 +209,13 @@ just the grid and tagging.
 
 ## Order
 
-1. **Blocker 1**, in isolation. Modules can render; nothing about the security model changes.
+1. ~~**Blocker 1**, in isolation. Modules can render; nothing about the security model
+   changes.~~ Done — see [Rendering ABI](#rendering-abi-was-blocker-1--a-module-cannot-render).
 2. **CSP lockdown**, before any capability exists to grant. It is a breaking change for
    anything currently relying on direct `fetch`, so it goes first while nothing does.
 3. **Per-module permissions** — manifest field, host enforcement in `api.invoke` and
-   `api.fetch`, review surfaced at enable time.
-4. **Capabilities**, one at a time, each gated by 3.
+   `api.fetch`, review surfaced at enable time. *Deferred by owner decision.*
+4. **Capabilities**, one at a time, each gated by 3. *Deferred by owner decision.*
 
 Steps 2–4 are one unit in practice: shipping a generic fetch primitive without the permission
 gate would widen the hole this is meant to close.
@@ -162,5 +226,6 @@ gate would widen the hole this is meant to close.
   `get_modules_dir()` currently returns a single user-scoped path, so a distro package cannot
   ship a module at all today.
 - Are permissions reviewed at install time from the manifest, or prompted at first use?
-- Does `ReactNode` stay for bundled modules if external modules move to `mount()`, and is
-  carrying two contribution paths acceptable?
+- ~~Does `ReactNode` stay for bundled modules if external modules move to `mount()`, and is
+  carrying two contribution paths acceptable?~~ Answered: yes to both, see
+  [Both paths coexist](#both-paths-coexist-and-which-is-which).

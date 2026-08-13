@@ -1441,6 +1441,13 @@ body {
   height: 100%;
 }
 
+/* The element an external module's mount(el) fills. It is the module's own canvas: the
+   host sizes it to the slot and styles nothing inside it. See ModuleContent.tsx. */
+.module-mount {
+  width: 100%;
+  height: 100%;
+}
+
 /* Tag Graph module styles live in src/modules/plugins/tagGraph.css (.tg-* classes). */
 
 /* Quick-tag bar */

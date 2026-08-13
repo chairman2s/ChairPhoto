@@ -99,6 +99,7 @@ import {
   activateToolbarAction,
   useHostContributions,
 } from "./modules/host";
+import { ModuleActionModal, ModuleContent, isModalAction } from "./modules/ModuleContent";
 import { BUNDLED_MODULES } from "./modules/bundled";
 import { Preferences } from "./components/Preferences";
 import { IdentityDebtPanel } from "./components/IdentityDebtPanel";
@@ -269,8 +270,11 @@ export default function App() {
   const [showGroups, setShowGroups] = useState(false);
   const [groupsKey, setGroupsKey] = useState(0); // bump to refresh the quick-tag bar
   const [activeViewId, setActiveViewId] = useState<string | null>(null); // null = Library
-  // A module toolbar action currently open as a modal (its render(close) overlay).
+  // A module toolbar action currently open as a modal (its render(close)/mount(el, close)
+  // overlay). `closeModalAction` is stable so ModuleActionModal's mount effect — which
+  // keys on it — runs once per opened modal rather than once per App render.
   const [modalAction, setModalAction] = useState<ToolbarAction | null>(null);
+  const closeModalAction = useCallback(() => setModalAction(null), []);
   // Right-click context menu on a grid tile.
   const [ctxMenu, setCtxMenu] = useState<{ x: number; y: number; photoId: number } | null>(null);
 
@@ -1354,7 +1358,7 @@ export default function App() {
             key={action.id}
             className="btn-ghost module-action"
             onClick={() =>
-              action.render
+              isModalAction(action)
                 ? setModalAction(action)
                 : activateToolbarAction(action.id)
             }
@@ -1560,7 +1564,9 @@ export default function App() {
               onBack={() => setDevelop(false)}
             />
           ) : activeView ? (
-            <div className="module-view">{activeView.render()}</div>
+            <div className="module-view">
+              <ModuleContent view={activeView} />
+            </div>
           ) : loupeInline && selected ? (
             <div className="loupe-inline">
               <div className="loupe-bar">
@@ -1676,7 +1682,7 @@ export default function App() {
                       panel is expected to render an absolute-positioned overlay. */}
                   {panelsForSlot("loupe").map((panel) => (
                     <div key={panel.id} style={{ position: "absolute", inset: 0, pointerEvents: "none" }}>
-                      {panel.render()}
+                      <ModuleContent view={panel} />
                     </div>
                   ))}
                 </div>
@@ -1943,7 +1949,7 @@ export default function App() {
         );
       })()}
 
-      {modalAction?.render && modalAction.render(() => setModalAction(null))}
+      {modalAction && <ModuleActionModal action={modalAction} close={closeModalAction} />}
 
       {showGroups && (
         <TagGroupsManager

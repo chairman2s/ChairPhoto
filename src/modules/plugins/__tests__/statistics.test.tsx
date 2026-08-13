@@ -18,6 +18,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanup, render, screen, waitFor } from "@testing-library/react";
 
 import { __resetForTests, enableModule, mainViews, register, setFilterContext } from "../../host";
+import { ModuleContent } from "../../ModuleContent";
 import { statisticsModule } from "../statistics";
 
 vi.mock("@tauri-apps/api/core", async (importOriginal) => {
@@ -85,9 +86,11 @@ describe("Statistics panel — re-renders on a host filter-context notify (issue
     const view = mainViews().find((v) => v.id === "statistics");
     if (!view) throw new Error("statistics module did not register a main view");
 
-    // Rendered once. The element itself never changes — only a host channel notify can
-    // make the panel show something different from here on.
-    const { container } = render(<>{view.render()}</>);
+    // Rendered once, through the same adapter App uses for a main view, so this covers the
+    // real path rather than a direct `view.render()` the app no longer makes. The element
+    // itself never changes — only a host channel notify can make the panel show something
+    // different from here on.
+    const { container } = render(<ModuleContent view={view} />);
 
     // The Photos stat card, scoped by class since "5" alone also matches an SVG axis label.
     await waitFor(() =>

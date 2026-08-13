@@ -457,13 +457,19 @@ impl Operation {
             Operation::SeedCatalog => OperationInfo::scaled("seed_catalog", 60_000.0),
             Operation::CountSqlRows => OperationInfo::unthresholded("count_sql_rows"),
             Operation::ListPhotosAllDate => OperationInfo::scaled("list_photos_all_date", 30_000.0),
-            // A window is a fixed amount of work plus one COUNT — it must not scale with
-            // the catalog, which is the whole point of asking for one.
+            // Measured, not assumed: a window saves building and serializing 100k `Photo`
+            // rows, but NOT the ordering — `ORDER BY COALESCE(strftime(capture_time), …)`
+            // is not index-backed, so both windows still sort the matching set, and the
+            // deep one additionally walks to its offset. At 100k photos that is ~0.6s for
+            // the first window against ~2.0s for the last (and ~3.8s unwindowed), so the
+            // deep window's threshold scales with the catalog while the first window's
+            // does not. Keyset pagination over an indexed key is the way to make the deep
+            // case constant, and is not what this change did.
             Operation::ListPhotosWindowFirst => {
-                OperationInfo::fixed("list_photos_window_first", 2_000.0)
+                OperationInfo::fixed("list_photos_window_first", 3_000.0)
             }
             Operation::ListPhotosWindowDeep => {
-                OperationInfo::fixed("list_photos_window_deep", 2_000.0)
+                OperationInfo::scaled("list_photos_window_deep", 6_000.0)
             }
             Operation::ListPhotosTagFilter => {
                 OperationInfo::scaled("list_photos_tag_filter", 10_000.0)

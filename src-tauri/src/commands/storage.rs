@@ -6,7 +6,8 @@
 
 use super::*;
 use std::collections::HashMap;
-use tauri::State;
+use std::time::{Duration, Instant};
+use tauri::{AppHandle, Emitter, State};
 
 /// The reconcile queue — storage ops deferred until the NAS is reachable.
 #[tauri::command]
@@ -215,23 +216,163 @@ pub async fn summarize_pending_identity(
     with_catalog_blocking(&state, |c| c.summarize_pending_identity()).await
 }
 
-/// Retry every queued sidecar identity repair, clearing the copies that now succeed.
-/// Runs the work on a secondary connection so the sidecar parsing/writing (possibly
-/// over a slow mount) never holds the app's catalog lock. Copies whose file is
-/// unreachable stay queued; so do sidecars that still can't be written or that carry a
-/// conflicting photo identity — those need a human, and the queue remembers them.
+// ── The identity repair job (#34) ────────────────────────────────────────────
+
+/// Progress event for `identity:repair_progress`. Carries the job id so the UI can drop a
+/// superseded pass's stragglers.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IdentityRepairProgress {
+    pub done: usize,
+    pub total: usize,
+    pub job: u64,
+}
+
+/// Terminal event for `identity:repair_done`.
+///
+/// The summary carries `aborted` and `total` itself, so a pass stopped by a Cancel or a
+/// catalog switch reports partial counters that say they are partial rather than reading as
+/// a finished result. `ok: false` with an `error` is the other terminal shape — a pass that
+/// could not run at all.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IdentityRepairDone {
+    pub ok: bool,
+    pub job: u64,
+    pub summary: crate::catalog::IdentityRepairSummary,
+    pub error: Option<String>,
+}
+
+/// How often the pass emits `identity:repair_progress`.
+///
+/// Time-based, not every-Nth-row: rows differ by four orders of magnitude in cost (a local
+/// sidecar already carrying its identity versus a file on an unmounted NAS at its timeout),
+/// so any row count is either tens of thousands of events on a fast local queue or a frozen
+/// bar on a slow remote one. The final row always emits regardless.
+const REPAIR_PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Claim ownership of the identity repair pass: snapshot the catalog, allocate the job id,
+/// trip the previous pass, install this one's abort flag and claim the status slot as ONE
+/// transition, holding catalog → abort → slot throughout.
+///
+/// The transition itself is [`crate::commands::jobs::JobFamily::begin`], shared with both
+/// face-job families and Smart Tagging and fenced by the same locks as the two
+/// `switch_catalog` phases; read that function for why each lock is held across the whole
+/// claim. This wrapper only supplies the initial status snapshot — `total` is not known
+/// until the worker has counted the queue, and claiming with `0` anyway is what lets a
+/// status query between "command returned" and "first progress event" already see the pass
+/// running.
+///
+/// Named rather than inlined so the interleaving tests below can drive the start exactly as
+/// the command does; they have no Tauri `AppHandle`.
+fn begin_identity_repair_job(
+    state: &AppState,
+) -> Result<JobClaim<IdentityRepairJobStatus>, String> {
+    state
+        .jobs
+        .identity
+        .begin(&state.catalog, |job| IdentityRepairJobStatus { job, done: 0, total: 0 })
+}
+
+/// Start a pass over the queued sidecar identity repairs, clearing the copies that now
+/// succeed. Returns the new pass's **job id**; the result arrives as `identity:repair_done`.
+///
+/// Copies whose file is unreachable stay queued; so do sidecars that still can't be written
+/// or that carry a conflicting photo identity — those need a human (#33), and the queue
+/// remembers them.
+///
+/// The work runs on a secondary connection on a blocking worker, so the sidecar parsing and
+/// writing — a network round trip per copy on a NAS, over a queue that reached 74,488 rows
+/// on the 100k harness shape in #20 — never holds the app's catalog lock. That part was
+/// always right and is unchanged; what #34 added is the ownership around it:
+///
+/// * a job id, on every `identity:repair_progress` and the `identity:repair_done` event;
+/// * an abort flag the pass polls before each row, tripped by `identity_repair_cancel`;
+/// * a status slot, so the debt panel can re-attach after a remount, cleared before the
+///   terminal event and only while this pass still owns it;
+/// * and a catalog switch that trips it, so a pass cannot outlive the catalog it was
+///   started against — the AGENTS.md invariant this command was the last one to violate.
+///
+/// Starting a second pass supersedes the first rather than running both at the queue.
 #[tauri::command]
 pub async fn repair_pending_identity(
+    app: AppHandle,
     state: State<'_, AppState>,
-) -> Result<crate::catalog::IdentityRepairSummary, String> {
-    let (db_path, root) =
-        with_catalog(&state, |c| Ok((c.db_path().to_path_buf(), c.root().to_path_buf())))?;
+) -> Result<u64, String> {
+    // Snapshot the catalog, allocate the job id, trip the previous pass, install this
+    // pass's abort flag and claim the status slot as ONE transition. Nothing fallible
+    // precedes it, so it cannot leave a previous pass aborted with no successor.
+    let JobClaim { db_path, root, abort, job, slot } = begin_identity_repair_job(state.inner())?;
+
     tauri::async_runtime::spawn_blocking(move || {
-        let catalog = Catalog::open_secondary(&db_path, &root).map_err(|e| e.to_string())?;
-        catalog.repair_pending_identity().map_err(|e| e.to_string())
-    })
-    .await
-    .map_err(|e| e.to_string())?
+        // Release the status slot — but only if a newer pass hasn't already claimed it.
+        // Always BEFORE the terminal event: see `JobSlot::clear`.
+        let finish = |summary: crate::catalog::IdentityRepairSummary, error: Option<String>| {
+            slot.clear();
+            let _ = app.emit(
+                "identity:repair_done",
+                IdentityRepairDone { ok: error.is_none(), job, summary, error },
+            );
+        };
+
+        // Secondary connection — never contends with the primary's UI reads.
+        let catalog = match Catalog::open_secondary(&db_path, &root) {
+            Ok(c) => c,
+            Err(e) => {
+                finish(
+                    Default::default(),
+                    Some(format!("couldn't open catalog connection: {e}")),
+                );
+                return;
+            }
+        };
+
+        let emit_app = app.clone();
+        let progress_slot = slot.clone();
+        let mut last_emit: Option<Instant> = None;
+        let result = catalog.run_identity_repair(&abort, |s| {
+            // Throttled, but never at the cost of the last update: a pass that ends inside
+            // the interval must still leave the panel showing the count it finished on.
+            let due = last_emit.is_none_or(|t| t.elapsed() >= REPAIR_PROGRESS_INTERVAL);
+            if !due && s.done() < s.total {
+                return;
+            }
+            last_emit = Some(Instant::now());
+            let (done, total) = (s.done(), s.total);
+            let _ = emit_app.emit(
+                "identity:repair_progress",
+                IdentityRepairProgress { done, total, job },
+            );
+            // A superseded pass reaches here routinely — a newer start trips its flag, but
+            // the row it is already on finishes first. `JobSlot::publish` is the shared
+            // guard that stops it overwriting the newer pass's slot.
+            progress_slot.publish(|job| IdentityRepairJobStatus { job, done, total });
+        });
+
+        match result {
+            Ok(summary) => finish(summary, None),
+            Err(e) => finish(Default::default(), Some(e.to_string())),
+        }
+    });
+
+    Ok(job)
+}
+
+/// Trip the abort flag of any running identity repair pass. The pass stops before its next
+/// copy, so a pass against an unmounted NAS costs one more file's timeout rather than the
+/// rest of the queue's. No-op when nothing is running.
+#[tauri::command]
+pub async fn identity_repair_cancel(state: State<'_, AppState>) -> Result<(), String> {
+    state.jobs.identity.cancel()
+}
+
+/// The live status of the running identity repair pass, or `None` when idle — so the debt
+/// panel re-attaches to a pass in flight instead of reopening as if nothing were happening.
+#[tauri::command]
+pub async fn identity_repair_status(
+    state: State<'_, AppState>,
+) -> Result<Option<IdentityRepairJobStatus>, String> {
+    state.jobs.identity.status()
 }
 
 /// Resolve one conflicted copy the way the user decided (#33): `adopt` the identifier the
@@ -360,6 +501,224 @@ mod tests {
             "repairing the moved copy's debt must not bind the backup copy"
         );
         assert_eq!(catalog.count_pending_identity().unwrap(), 1);
+    }
+}
+
+#[cfg(test)]
+mod identity_repair_ownership_tests {
+    use super::*;
+    use crate::commands::catalog::{detach_catalog_and_trip_jobs, publish_catalog_and_reset_jobs};
+    use crate::catalog::SidecarIdentity;
+    use std::path::Path;
+
+    /// A catalog with `photos` files, each already owing its sidecar identity — the queue a
+    /// repair pass exists to work through. Every file is reachable and its sidecar carries no
+    /// identifier, so a pass that reaches a row BINDS it, which is what makes "did the
+    /// aborted worker keep going?" observable on disk.
+    fn temp_catalog_with_debt(
+        tag: &str,
+        photos: usize,
+    ) -> (Catalog, crate::test_support::TestSubPath, PathBuf) {
+        let dir = crate::test_support::TestTmpDir::new(&format!("identity-own-{tag}"));
+        let root = dir.join("photos");
+        std::fs::create_dir_all(&root).unwrap();
+        let db = dir.join("catalog.chairphoto");
+        let catalog = Catalog::open(&db, &root).unwrap();
+        for i in 0..photos {
+            let p = root.join(format!("p{i}.arw"));
+            std::fs::write(&p, b"raw").unwrap();
+            let up = catalog.upsert_photo(&p, None, 1, 3).unwrap();
+            catalog
+                .record_sidecar_identity(up.id, &p, &SidecarIdentity::Unreachable)
+                .unwrap();
+        }
+        (catalog, dir.into_subpath("catalog.chairphoto"), root)
+    }
+
+    fn state_with(catalog: Catalog) -> AppState {
+        let state = AppState::default();
+        *state.catalog.lock().unwrap() = Some(catalog);
+        state
+    }
+
+    /// Un-dismissed queue rows in the catalog at `db`, read on a connection of this test's
+    /// own — so it reports what is durably in the file, not what some handle believes.
+    fn queued_rows(db: &Path) -> i64 {
+        let conn = rusqlite::Connection::open(db).unwrap();
+        conn.query_row(
+            "SELECT count(*) FROM pending_sidecar_identity WHERE dismissed_at = 0",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap_or(0)
+    }
+
+    /// **Forced race.** A catalog switch stops a running repair pass at its next row: no
+    /// further sidecar written, no further queue row cleared in the catalog the user left,
+    /// and nothing at all in the catalog they switched to.
+    ///
+    /// This is the AGENTS.md invariant the pass was the last command to violate — before
+    /// #34 it held its own secondary connection to the old database and nothing could trip
+    /// it, so a pass started against a 74k-row queue kept writing sidecars for a catalog the
+    /// app had already closed.
+    ///
+    /// The interleaving is forced, not timed: the switch runs inside the pass's own progress
+    /// callback, so it lands between copy 1 and copy 2 every time.
+    #[test]
+    fn a_catalog_switch_stops_a_running_repair_pass() {
+        let (cat_a, db_a, root_a) = temp_catalog_with_debt("switch-a", 4);
+        let (cat_b, db_b, _root_b) = temp_catalog_with_debt("switch-b", 0);
+        let state = state_with(cat_a);
+
+        // Start the pass exactly the way `repair_pending_identity` does.
+        let JobClaim { db_path, root, abort, job, slot } =
+            begin_identity_repair_job(&state).unwrap();
+        assert_eq!(db_path, db_a.to_path_buf());
+        assert_eq!(root, root_a);
+        assert_eq!(
+            state.jobs.identity.status().unwrap().map(|s| s.job),
+            Some(job),
+            "the start must claim the status slot before the command returns"
+        );
+
+        let sec = Catalog::open_secondary(&db_path, &root).unwrap();
+        let switch_to = Mutex::new(Some(cat_b));
+        let mut progress: Vec<usize> = Vec::new();
+        let summary = sec
+            .run_identity_repair(&abort, |s| {
+                progress.push(s.done());
+                slot.publish(|job| IdentityRepairJobStatus {
+                    job,
+                    done: s.done(),
+                    total: s.total,
+                });
+                // The user switches catalogs while this worker is still running.
+                if let Some(cat) = switch_to.lock().unwrap().take() {
+                    detach_catalog_and_trip_jobs(&state).unwrap();
+                    publish_catalog_and_reset_jobs(&state, cat).unwrap();
+                }
+            })
+            .unwrap();
+
+        assert!(summary.aborted, "the switch must abort the running pass");
+        assert_eq!(summary.total, 4, "all four copies were queued");
+        assert_eq!(
+            (summary.bound, summary.done()),
+            (1, 1),
+            "only the copy already recorded when the switch happened: {summary:?}"
+        );
+        assert_eq!(progress, vec![1], "no progress after the switch");
+        assert_eq!(
+            queued_rows(&db_a),
+            3,
+            "the aborted worker must clear no further rows in the catalog it was repairing"
+        );
+        assert!(
+            crate::xmp::read_identifier(&root_a.join("p0.arw")).is_some(),
+            "sanity: the pass really did bind the copy it reached"
+        );
+        for i in 1..4 {
+            assert!(
+                crate::xmp::read_identifier(&root_a.join(format!("p{i}.arw"))).is_none(),
+                "the aborted worker wrote a sidecar for copy {i} after the switch"
+            );
+        }
+        assert_eq!(queued_rows(&db_b), 0, "nothing may land in the catalog switched to");
+
+        // The switch made the pass unreachable as an OWNER, not just abortable: its slot was
+        // cleared, and the straggler it published above could not put it back.
+        assert!(
+            state.jobs.identity.status().unwrap().is_none(),
+            "phase one must clear the status slot, or the debt panel re-adopts a dead pass"
+        );
+        assert!(!slot.owns());
+
+        // The old flag stays tripped and the new catalog's generation is a different,
+        // un-tripped Arc, so no Cancel or later switch can revive the old worker.
+        assert!(abort.load(Ordering::Relaxed), "the old flag must stay tripped");
+        let installed = state.jobs.identity.installed().unwrap();
+        assert!(
+            !Arc::ptr_eq(&installed, &abort),
+            "the switch must install a fresh generation, not reuse the aborted one"
+        );
+        assert!(!installed.load(Ordering::Relaxed));
+    }
+
+    /// **Forced race.** `identity_repair_cancel` stops the pass at its next row — the point
+    /// of the whole exercise for a pass against an unmounted NAS, where every remaining row
+    /// costs a mount timeout.
+    ///
+    /// Cancel runs inside the pass's own progress callback, so it lands between copy 1 and
+    /// copy 2 every time rather than whenever a test thread happens to get scheduled.
+    #[test]
+    fn a_cancel_stops_the_running_repair_pass_at_its_next_copy() {
+        let (cat, db, root) = temp_catalog_with_debt("cancel", 5);
+        let state = state_with(cat);
+        let JobClaim { db_path, root: claim_root, abort, job: _, slot: _ } =
+            begin_identity_repair_job(&state).unwrap();
+
+        let sec = Catalog::open_secondary(&db_path, &claim_root).unwrap();
+        let cancelled = std::cell::Cell::new(false);
+        let summary = sec
+            .run_identity_repair(&abort, |_| {
+                if !cancelled.get() {
+                    cancelled.set(true);
+                    // Exactly what the Cancel command does.
+                    state.jobs.identity.cancel().unwrap();
+                }
+            })
+            .unwrap();
+
+        assert!(cancelled.get(), "the fixture never got to cancel");
+        assert!(summary.aborted, "a cancelled pass must say it was cancelled: {summary:?}");
+        assert_eq!(summary.done(), 1, "the pass ran on past the cancel: {summary:?}");
+        assert_eq!(queued_rows(&db), 4, "four copies must be left for the next pass");
+        assert!(
+            crate::xmp::read_identifier(&root.join("p4.arw")).is_none(),
+            "a cancelled pass must not keep writing sidecars"
+        );
+    }
+
+    /// A second pass supersedes the first rather than running both at the queue: the first
+    /// is tripped, loses the status slot, and its handle knows it.
+    #[test]
+    fn a_second_repair_pass_trips_the_first_and_takes_the_slot() {
+        let (cat, _db, _root) = temp_catalog_with_debt("supersede", 2);
+        let state = state_with(cat);
+
+        let first = begin_identity_repair_job(&state).unwrap();
+        let second = begin_identity_repair_job(&state).unwrap();
+
+        assert!(first.abort.load(Ordering::Relaxed), "the superseded pass must be tripped");
+        assert!(!second.abort.load(Ordering::Relaxed));
+        assert_ne!(first.job, second.job, "the two passes must be told apart by id");
+        assert!(!first.slot.owns());
+        assert!(second.slot.owns());
+        assert_eq!(state.jobs.identity.status().unwrap().map(|s| s.job), Some(second.job));
+
+        // And the superseded pass's straggler cannot overwrite the running one's slot.
+        first.slot.publish(|job| IdentityRepairJobStatus { job, done: 99, total: 99 });
+        assert_eq!(
+            state.jobs.identity.status().unwrap().map(|s| (s.job, s.done)),
+            Some((second.job, 0)),
+            "a superseded pass republished over the running one"
+        );
+    }
+
+    /// A repair pass started with no catalog open must touch nothing — no generation
+    /// installed, no job id consumed, no slot claimed. This is the state a start blocked
+    /// between the two switch phases observes.
+    #[test]
+    fn a_repair_start_with_no_catalog_open_touches_nothing() {
+        let state = AppState::default();
+        let before = state.jobs.identity.installed().unwrap();
+
+        let err = begin_identity_repair_job(&state).unwrap_err();
+
+        assert_eq!(err, "No catalog is open");
+        assert!(Arc::ptr_eq(&before, &state.jobs.identity.installed().unwrap()));
+        assert_eq!(state.jobs.identity.abort().job_ids_issued(), 0);
+        assert!(state.jobs.identity.status().unwrap().is_none());
     }
 }
 

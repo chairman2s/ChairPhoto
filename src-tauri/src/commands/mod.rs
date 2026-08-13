@@ -89,9 +89,8 @@ pub use indexing::*;
 // their `use super::*`. The rest of the ownership vocabulary (`AbortGeneration`, `JobFamily`,
 // `JobSlot`) is reached through the registry, so it stays namespaced under `jobs::`.
 pub use jobs::JobRegistry;
-// Only the families with a queryable status slot need these, and they are the ones this pair
-// of features gates — see the "Status slots" section of `jobs`.
-#[cfg(any(feature = "faces", feature = "smarttags"))]
+// Every family with a queryable status slot needs these. Unconditional since #34: identity
+// repair publishes one and is not feature-gated — see the "Status slots" section of `jobs`.
 pub use jobs::{JobClaim, JobStatus};
 #[cfg(feature = "instagram")]
 pub use instagram::*;
@@ -173,6 +172,28 @@ pub struct SmarttagsJobStatus {
 
 #[cfg(feature = "smarttags")]
 impl JobStatus for SmarttagsJobStatus {
+    fn job_id(&self) -> u64 {
+        self.job
+    }
+}
+
+/// Snapshot of the running sidecar-identity repair pass (`identity_repair_status`), #34.
+///
+/// `total` is the un-dismissed queue ROWS when the pass started, not copies: the pass
+/// retries each owed field, so a copy owing both `identifier` and `import_batch` is two
+/// units of work here while the debt panel's header counts it as one copy. The two answer
+/// different questions and are deliberately not the same number.
+///
+/// Unlike every other status here this is not feature-gated — identity debt is core.
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IdentityRepairJobStatus {
+    pub job: u64,
+    pub done: usize,
+    pub total: usize,
+}
+
+impl JobStatus for IdentityRepairJobStatus {
     fn job_id(&self) -> u64 {
         self.job
     }

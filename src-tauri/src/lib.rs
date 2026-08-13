@@ -337,6 +337,8 @@ pub fn run() {
             commands::list_pending_identity,
             commands::summarize_pending_identity,
             commands::repair_pending_identity,
+            commands::identity_repair_cancel,
+            commands::identity_repair_status,
             commands::resolve_identity_conflict,
             commands::find_unavailable_photos,
             commands::purge_unavailable_photos,

@@ -30,7 +30,7 @@
 //!
 //! **catalog → abort generations → status slots**, and within each of the last two groups
 //! the declaration order of [`JobRegistry`]: scan, face indexing, face matching, sharpness,
-//! pHash, Smart Tagging.
+//! pHash, Smart Tagging, identity repair.
 //!
 //! Every nested acquisition in the backend obeys it:
 //!
@@ -50,16 +50,12 @@
 //! Every transition here acquires **all** of its guards before its first mutation, so a
 //! poisoned mutex fails the whole transition rather than leaving a prefix of it applied.
 
-// `Catalog` and `PathBuf` are only reached through the slot-publishing families' start
-// transition, which is compiled out under `--no-default-features`.
-#[cfg(any(feature = "faces", feature = "smarttags"))]
 use crate::catalog::Catalog;
-use std::marker::PhantomData;
-#[cfg(any(feature = "faces", feature = "smarttags"))]
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
+use super::IdentityRepairJobStatus;
 #[cfg(feature = "faces")]
 use super::{FacesJobStatus, FacesMatchJobStatus};
 #[cfg(feature = "smarttags")]
@@ -140,14 +136,13 @@ fn trip_and_replace(guard: &mut MutexGuard<'_, Arc<AtomicBool>>) -> Arc<AtomicBo
 
 // ── Status slots ─────────────────────────────────────────────────────────────
 //
-// Everything from here to the end of this section is gated on
-// `any(feature = "faces", feature = "smarttags")`: those are the only families that publish a
-// queryable status slot, and under `--no-default-features` the whole group would otherwise be
-// dead code. The slot-less families (scan, sharpness, pHash) use `AbortGeneration` directly
-// and stay compiled in every configuration.
+// This section used to be gated on `any(feature = "faces", feature = "smarttags")`, the two
+// features that then owned every slot-publishing family; under `--no-default-features` the
+// whole group was dead code. Identity repair (#34) is core — every catalog can owe identity
+// debt, feature-gated or not — so the gate is gone and this compiles in every configuration.
+// The slot-less families (scan, sharpness, pHash) still use `AbortGeneration` directly.
 
 /// A queryable job-status snapshot. The job id is what scopes every write to its owner.
-#[cfg(any(feature = "faces", feature = "smarttags"))]
 pub trait JobStatus: Copy {
     /// Which job this snapshot describes.
     fn job_id(&self) -> u64;
@@ -164,13 +159,11 @@ pub trait JobStatus: Copy {
 ///
 /// Handed out by [`JobFamily::begin`]; cloneable so a worker can give its progress callback
 /// one and keep another for the terminal path.
-#[cfg(any(feature = "faces", feature = "smarttags"))]
 pub struct JobSlot<S> {
     slot: Arc<Mutex<Option<S>>>,
     job: u64,
 }
 
-#[cfg(any(feature = "faces", feature = "smarttags"))]
 // Manual, because `derive(Clone)` would demand `S: Clone` for no reason — only the `Arc` and
 // the id are cloned.
 impl<S> Clone for JobSlot<S> {
@@ -179,7 +172,6 @@ impl<S> Clone for JobSlot<S> {
     }
 }
 
-#[cfg(any(feature = "faces", feature = "smarttags"))]
 impl<S: JobStatus> JobSlot<S> {
     /// Attach to `slot` as `job`. Production handles come from [`JobFamily::begin`]; this is
     /// for tests that need to drive the ownership guards without starting a job.
@@ -233,13 +225,11 @@ impl<S: JobStatus> JobSlot<S> {
 
 /// A job family that publishes a queryable status slot: its abort generation, its job-id
 /// source and the slot itself, so the start transition can claim all three together.
-#[cfg(any(feature = "faces", feature = "smarttags"))]
 pub struct JobFamily<S> {
     abort: AbortGeneration,
     slot: Arc<Mutex<Option<S>>>,
 }
 
-#[cfg(any(feature = "faces", feature = "smarttags"))]
 // Manual, because `derive(Default)` would demand `S: Default`; an idle slot is `None`.
 impl<S> Default for JobFamily<S> {
     fn default() -> Self {
@@ -249,7 +239,6 @@ impl<S> Default for JobFamily<S> {
 
 /// What a start transition hands its worker: where the catalog it claimed lives, the abort
 /// flag to poll, the job id its events carry, and its owner-scoped status slot.
-#[cfg(any(feature = "faces", feature = "smarttags"))]
 pub struct JobClaim<S> {
     /// The claimed catalog's database file — open a secondary connection to it, never the
     /// primary handle, so the worker cannot block UI reads.
@@ -264,7 +253,6 @@ pub struct JobClaim<S> {
     pub slot: JobSlot<S>,
 }
 
-#[cfg(any(feature = "faces", feature = "smarttags"))]
 // Manual, because `derive(Debug)` would demand `S: Debug` and the slot is a live mutex, not
 // something worth formatting. Exists so `Result<JobClaim<S>, String>::unwrap_err()` compiles
 // in the tests that assert a start was *rejected*.
@@ -279,7 +267,6 @@ impl<S> std::fmt::Debug for JobClaim<S> {
     }
 }
 
-#[cfg(any(feature = "faces", feature = "smarttags"))]
 impl<S: JobStatus> JobFamily<S> {
     /// Claim ownership of this family: snapshot the catalog, allocate the job id, trip the
     /// previous job, install this job's abort flag and claim the status slot as **one**
@@ -396,6 +383,13 @@ pub struct JobRegistry {
     /// The Smart Tagging embedding index (H7b).
     #[cfg(feature = "smarttags")]
     pub smarttags: JobFamily<SmarttagsJobStatus>,
+    /// The sidecar-identity repair pass (#34) — retries `pending_sidecar_identity`.
+    ///
+    /// Not feature-gated, and the first family here that isn't: identity debt is core, so
+    /// this is the family that made the status-slot machinery above unconditional. It
+    /// publishes a slot because the debt panel is a modal that remounts, and a pass over a
+    /// 74k-row queue on a NAS long outlives one open/close of it.
+    pub identity: JobFamily<IdentityRepairJobStatus>,
 }
 
 impl JobRegistry {
@@ -425,15 +419,16 @@ impl JobRegistry {
             phash: _,
             #[cfg(feature = "smarttags")]
             smarttags,
+            identity,
         } = self;
         let slots = SlotGuards {
-            _marker: PhantomData,
             #[cfg(feature = "faces")]
             faces: faces.slot.lock().map_err(|e| e.to_string())?,
             #[cfg(feature = "faces")]
             faces_match: faces_match.slot.lock().map_err(|e| e.to_string())?,
             #[cfg(feature = "smarttags")]
             smarttags: smarttags.slot.lock().map_err(|e| e.to_string())?,
+            identity: identity.slot.lock().map_err(|e| e.to_string())?,
         };
         Ok(DetachGuards { aborts, slots })
     }
@@ -456,6 +451,7 @@ impl JobRegistry {
             phash,
             #[cfg(feature = "smarttags")]
             smarttags,
+            identity,
         } = self;
         Ok(AbortGuards {
             scan: scan.lock()?,
@@ -467,6 +463,7 @@ impl JobRegistry {
             phash: phash.lock()?,
             #[cfg(feature = "smarttags")]
             smarttags: smarttags.abort.lock()?,
+            identity: identity.abort.lock()?,
         })
     }
 }
@@ -482,6 +479,7 @@ pub struct AbortGuards<'a> {
     phash: MutexGuard<'a, Arc<AtomicBool>>,
     #[cfg(feature = "smarttags")]
     smarttags: MutexGuard<'a, Arc<AtomicBool>>,
+    identity: MutexGuard<'a, Arc<AtomicBool>>,
 }
 
 impl AbortGuards<'_> {
@@ -497,6 +495,7 @@ impl AbortGuards<'_> {
             phash,
             #[cfg(feature = "smarttags")]
             smarttags,
+            identity,
         } = self;
         scan.store(true, Ordering::Relaxed);
         #[cfg(feature = "faces")]
@@ -507,6 +506,7 @@ impl AbortGuards<'_> {
         phash.store(true, Ordering::Relaxed);
         #[cfg(feature = "smarttags")]
         smarttags.store(true, Ordering::Relaxed);
+        identity.store(true, Ordering::Relaxed);
     }
 
     /// Trip every installed generation and replace each with a fresh, un-tripped one,
@@ -539,6 +539,7 @@ impl AbortGuards<'_> {
             ref mut phash,
             #[cfg(feature = "smarttags")]
                 ref mut smarttags,
+            ref mut identity,
         } = self;
         let fresh_scan = Arc::new(AtomicBool::new(false));
         **scan = fresh_scan.clone();
@@ -553,21 +554,23 @@ impl AbortGuards<'_> {
         {
             **smarttags = Arc::new(AtomicBool::new(false));
         }
+        **identity = Arc::new(AtomicBool::new(false));
         fresh_scan
     }
 }
 
 /// Every status slot, locked. Part of [`DetachGuards`].
 pub struct SlotGuards<'a> {
-    /// Keeps `'a` used under `--no-default-features`, where every slot below is compiled out
-    /// and the struct would otherwise borrow nothing.
-    _marker: PhantomData<&'a ()>,
     #[cfg(feature = "faces")]
     faces: MutexGuard<'a, Option<FacesJobStatus>>,
     #[cfg(feature = "faces")]
     faces_match: MutexGuard<'a, Option<FacesMatchJobStatus>>,
     #[cfg(feature = "smarttags")]
     smarttags: MutexGuard<'a, Option<SmarttagsJobStatus>>,
+    /// Unconditional, so this struct always borrows `'a` — it used to need a `PhantomData`
+    /// to keep the lifetime used under `--no-default-features`, where every other slot here
+    /// is compiled out.
+    identity: MutexGuard<'a, Option<IdentityRepairJobStatus>>,
 }
 
 impl SlotGuards<'_> {
@@ -575,13 +578,13 @@ impl SlotGuards<'_> {
     /// [`JobRegistry`] fails to compile here until it is handled.
     fn clear_all(self) {
         let Self {
-            _marker: _,
             #[cfg(feature = "faces")]
             mut faces,
             #[cfg(feature = "faces")]
             mut faces_match,
             #[cfg(feature = "smarttags")]
             mut smarttags,
+            mut identity,
         } = self;
         #[cfg(feature = "faces")]
         {
@@ -592,6 +595,7 @@ impl SlotGuards<'_> {
         {
             *smarttags = None;
         }
+        *identity = None;
     }
 }
 
@@ -631,20 +635,17 @@ mod tests {
     /// A status shape standing in for the real ones, so these tests pin the shared module
     /// rather than one family's use of it. `Copy`, as every real status slot is.
     #[derive(Debug, Clone, Copy, PartialEq)]
-    #[cfg(any(feature = "faces", feature = "smarttags"))]
     struct TestStatus {
         job: u64,
         done: usize,
     }
 
-    #[cfg(any(feature = "faces", feature = "smarttags"))]
     impl JobStatus for TestStatus {
         fn job_id(&self) -> u64 {
             self.job
         }
     }
 
-    #[cfg(any(feature = "faces", feature = "smarttags"))]
     fn status(job: u64, done: usize) -> TestStatus {
         TestStatus { job, done }
     }
@@ -672,7 +673,6 @@ mod tests {
     /// the race in a real run means winning it — the forced-interleaving tests below cover
     /// the transitions that *create* the two competing owners.
     #[test]
-    #[cfg(any(feature = "faces", feature = "smarttags"))]
     fn slot_writes_are_scoped_to_the_owning_job() {
         let slot: Arc<Mutex<Option<TestStatus>>> = Arc::new(Mutex::new(None));
         let superseded = JobSlot::attach(slot.clone(), 1);
@@ -712,7 +712,6 @@ mod tests {
     /// `publish` builds its snapshot from the *owning* id, so a worker cannot write a
     /// mismatched job id into the slot even by accident — the closure never sees any other.
     #[test]
-    #[cfg(any(feature = "faces", feature = "smarttags"))]
     fn publish_stamps_the_owning_job_id() {
         let slot: Arc<Mutex<Option<TestStatus>>> = Arc::new(Mutex::new(None));
         let owner = JobSlot::attach(slot.clone(), 9);
@@ -726,7 +725,6 @@ mod tests {
     /// A start claims the slot before it returns, so a status query between "command
     /// returned" and "first progress event" already sees the job running.
     #[test]
-    #[cfg(any(feature = "faces", feature = "smarttags"))]
     fn a_start_claims_the_slot_before_returning() {
         let (catalog, db) = open_catalog("claim");
         let family: JobFamily<TestStatus> = JobFamily::default();
@@ -743,7 +741,6 @@ mod tests {
     /// A second start trips the first and takes the slot from it, and the superseded job's
     /// handle knows it no longer owns anything.
     #[test]
-    #[cfg(any(feature = "faces", feature = "smarttags"))]
     fn a_second_start_trips_the_first_and_takes_the_slot() {
         let (catalog, _db) = open_catalog("supersede");
         let family: JobFamily<TestStatus> = JobFamily::default();
@@ -763,7 +760,6 @@ mod tests {
     /// consumed, slot untouched. This is the state a start blocked mid-switch observes, and
     /// it is what keeps a switch's abort signal from being stranded behind a fresh live flag.
     #[test]
-    #[cfg(any(feature = "faces", feature = "smarttags"))]
     fn a_rejected_start_touches_nothing() {
         let catalog: Mutex<Option<Catalog>> = Mutex::new(None);
         let family: JobFamily<TestStatus> = JobFamily::default();
@@ -793,7 +789,6 @@ mod tests {
     /// discriminates is that the lock stays held, which only happens when the holder is
     /// parked while owning it.
     #[test]
-    #[cfg(any(feature = "faces", feature = "smarttags"))]
     fn a_blocked_start_keeps_holding_the_catalog_lock() {
         let (catalog, db) = open_catalog("blocked");
         let family: JobFamily<TestStatus> = JobFamily::default();
@@ -824,7 +819,6 @@ mod tests {
     /// Wait until `catalog` has been locked *continuously* for `window`, giving up after
     /// `timeout`. `try_lock` never blocks, so a caller holding an abort lock can probe from
     /// here without inverting the catalog → abort order.
-    #[cfg(any(feature = "faces", feature = "smarttags"))]
     fn catalog_stays_locked(
         catalog: &Mutex<Option<Catalog>>,
         window: Duration,
@@ -852,6 +846,25 @@ mod tests {
     }
 
     // ── The switch transitions ───────────────────────────────────────────────
+    //
+    // These drive a REAL registry field rather than the `TestStatus` stand-in above, because
+    // the transitions they exercise are the registry's, not one family's. They used to pick
+    // Smart Tagging for that and were `#[cfg(feature = "smarttags")]` as a result, so
+    // `--no-default-features` — the configuration where a switch has the fewest families to
+    // reach and the most room for one to be missed — ran none of them. Identity repair (#34)
+    // is the first slot-publishing family that is always compiled, so they run everywhere
+    // now.
+
+    /// Start the identity repair family, the way `commands::storage`'s
+    /// `begin_identity_repair_job` does.
+    fn begin_identity(
+        registry: &JobRegistry,
+        catalog: &Mutex<Option<Catalog>>,
+    ) -> Result<JobClaim<IdentityRepairJobStatus>, String> {
+        registry
+            .identity
+            .begin(catalog, |job| IdentityRepairJobStatus { job, done: 0, total: 0 })
+    }
 
     /// Phase one trips the running job **and** clears its status slot; phase two installs a
     /// fresh generation without reviving the old one or resurrecting the slot.
@@ -865,6 +878,7 @@ mod tests {
         let scan = registry.scan.install_fresh().unwrap();
         let sharpness = registry.sharpness.install_fresh().unwrap();
 
+        let identity = begin_identity(&registry, &catalog).unwrap();
         #[cfg(feature = "smarttags")]
         let smarttags = registry
             .smarttags
@@ -875,13 +889,16 @@ mod tests {
 
         assert!(scan.load(Ordering::Relaxed), "phase one must trip the scan generation");
         assert!(sharpness.load(Ordering::Relaxed), "phase one must trip sharpness too");
+        assert!(identity.abort.load(Ordering::Relaxed), "and the identity repair pass");
+        assert!(
+            registry.identity.status().unwrap().is_none(),
+            "phase one must clear the status slot, or the panel re-adopts a dead job"
+        );
+        assert!(!identity.slot.owns());
         #[cfg(feature = "smarttags")]
         {
             assert!(smarttags.abort.load(Ordering::Relaxed));
-            assert!(
-                registry.smarttags.status().unwrap().is_none(),
-                "phase one must clear the status slot, or the panel re-adopts a dead job"
-            );
+            assert!(registry.smarttags.status().unwrap().is_none());
             assert!(!smarttags.slot.owns());
         }
 
@@ -889,13 +906,12 @@ mod tests {
         assert!(!fresh_scan.load(Ordering::Relaxed), "the new generation must start clean");
         assert!(!Arc::ptr_eq(&fresh_scan, &scan), "phase two must not reuse the tripped flag");
         assert!(scan.load(Ordering::Relaxed), "the old worker's flag must stay tripped");
-        #[cfg(feature = "smarttags")]
         assert!(
-            registry.smarttags.status().unwrap().is_none(),
+            registry.identity.status().unwrap().is_none(),
             "phase two must not resurrect a slot phase one cleared"
         );
-        // Used only by the `smarttags` arm above; keep it live under --no-default-features.
-        let _ = catalog.lock().unwrap().is_some();
+        #[cfg(feature = "smarttags")]
+        assert!(registry.smarttags.status().unwrap().is_none());
     }
 
     /// **Forced race.** A superseded worker's straggler, arriving after a switch has cleared
@@ -909,33 +925,28 @@ mod tests {
     ///
     /// The interleaving is forced by construction, not by timing: the switch is driven
     /// synchronously and the straggler is then delivered by hand.
-    #[cfg(feature = "smarttags")]
     #[test]
     fn a_straggler_cannot_republish_a_slot_a_switch_cleared() {
         let (catalog, _db) = open_catalog("straggler");
         let registry = JobRegistry::default();
-        let claim = registry
-            .smarttags
-            .begin(&catalog, |job| SmarttagsJobStatus { job, done: 0, total: 0 })
-            .unwrap();
+        let claim = begin_identity(&registry, &catalog).unwrap();
 
         registry.lock_for_detach().unwrap().trip_and_clear_all();
 
         // The worker has not noticed its flag yet and emits one more progress event.
-        claim.slot.publish(|job| SmarttagsJobStatus { job, done: 99, total: 100 });
+        claim.slot.publish(|job| IdentityRepairJobStatus { job, done: 99, total: 100 });
         assert!(
-            registry.smarttags.status().unwrap().is_none(),
+            registry.identity.status().unwrap().is_none(),
             "a straggler re-published a slot the switch had already cleared"
         );
 
         // And its terminal clear is a no-op rather than an error.
         claim.slot.clear();
-        assert!(registry.smarttags.status().unwrap().is_none());
+        assert!(registry.identity.status().unwrap().is_none());
     }
 
     /// **Forced race.** A start that lands between the two switch phases finds no catalog,
     /// touches nothing, and does not survive as a live generation nothing can reach.
-    #[cfg(feature = "smarttags")]
     #[test]
     fn a_start_between_the_switch_phases_touches_nothing() {
         let (catalog, _db) = open_catalog("between");
@@ -944,16 +955,13 @@ mod tests {
         registry.lock_for_detach().unwrap().trip_and_clear_all();
         *catalog.lock().unwrap() = None; // phase one drops the handle
 
-        let before = registry.smarttags.installed().unwrap();
-        let err = registry
-            .smarttags
-            .begin(&catalog, |job| SmarttagsJobStatus { job, done: 0, total: 0 })
-            .unwrap_err();
+        let before = registry.identity.installed().unwrap();
+        let err = begin_identity(&registry, &catalog).unwrap_err();
 
         assert_eq!(err, "No catalog is open");
-        assert!(Arc::ptr_eq(&before, &registry.smarttags.installed().unwrap()));
+        assert!(Arc::ptr_eq(&before, &registry.identity.installed().unwrap()));
         assert!(before.load(Ordering::Relaxed), "the installed generation is still the tripped one");
-        assert_eq!(registry.smarttags.abort().job_ids_issued(), 0);
+        assert_eq!(registry.identity.abort().job_ids_issued(), 0);
     }
 
     /// **Forced race, real threads.** Starts and switches running concurrently must never
@@ -964,7 +972,6 @@ mod tests {
     /// which one the scheduler picks — the deterministic tests above carry the load and this
     /// is a net over the rest. Checked after every round, so a bad install cannot be papered
     /// over by the next round's abort.
-    #[cfg(feature = "smarttags")]
     #[test]
     fn concurrent_starts_and_switches_leave_no_unreachable_generation() {
         let dir = crate::test_support::TestTmpDir::new("jobs-race");
@@ -980,10 +987,7 @@ mod tests {
         let started: Mutex<Vec<(PathBuf, Arc<AtomicBool>)>> = Mutex::new(Vec::new());
         // One uncontended start, so the check below cannot be vacuous even if every racing
         // start lands in the mid-switch window.
-        let first = registry
-            .smarttags
-            .begin(&catalog, |job| SmarttagsJobStatus { job, done: 0, total: 0 })
-            .unwrap();
+        let first = begin_identity(&registry, &catalog).unwrap();
         started.lock().unwrap().push((first.db_path.clone(), first.abort.clone()));
 
         for round in 0..50 {
@@ -991,10 +995,7 @@ mod tests {
                 if round % 2 == 0 { (&db_b, &root_b) } else { (&db_a, &root_a) };
             std::thread::scope(|s| {
                 s.spawn(|| {
-                    if let Ok(c) = registry
-                        .smarttags
-                        .begin(&catalog, |job| SmarttagsJobStatus { job, done: 0, total: 0 })
-                    {
+                    if let Ok(c) = begin_identity(&registry, &catalog) {
                         started.lock().unwrap().push((c.db_path, c.abort));
                     }
                 });
@@ -1012,7 +1013,7 @@ mod tests {
                 });
             });
 
-            let installed = registry.smarttags.installed().unwrap();
+            let installed = registry.identity.installed().unwrap();
             let open_db =
                 catalog.lock().unwrap().as_ref().map(|c| c.db_path().to_path_buf());
             for (i, (db, abort)) in started.lock().unwrap().iter().enumerate() {

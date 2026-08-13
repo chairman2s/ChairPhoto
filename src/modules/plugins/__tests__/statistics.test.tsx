@@ -2,9 +2,11 @@
 /**
  * Component test for the Statistics panel re-rendering on a host channel notify
  * (issue #57). #53 recorded that `useHostFilterContext()` was asserted only at the
- * channel layer (src/modules/__tests__/host.test.ts:746-ish, the M9 notify-coverage case)
- * — "the Statistics panel re-renders when the scope changes" was not testable because
- * nothing could render a component. This is that missing layer.
+ * channel layer — "setFilterContext() notifies only the filterContext channel (M9)" in
+ * src/modules/__tests__/host.test.ts (line ~760 as of this writing; the issue's own
+ * ":746" pointed a few tests earlier, at an unrelated throwing-listener case — line
+ * numbers drift) — but "the Statistics panel re-renders when the scope changes" was not
+ * testable because nothing could render a component. This is that missing layer.
  *
  * The panel is exercised through the real host wiring (`register` + `enableModule`, the
  * same pattern host.test.ts uses to capture a module's injected `ChairPhotoAPI`) rather

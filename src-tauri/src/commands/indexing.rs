@@ -45,21 +45,12 @@ pub async fn index_sharpness(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<u64, String> {
-    // Install a fresh abort flag, tripping any in-flight job.
-    let abort = {
-        let mut guard = state
-            .sharpness_abort
-            .lock()
-            .map_err(|e| e.to_string())?;
-        guard.store(true, Ordering::Relaxed);
-        let fresh = Arc::new(AtomicBool::new(false));
-        *guard = fresh.clone();
-        fresh
-    };
-    let job = state
-        .sharpness_job_seq
-        .fetch_add(1, Ordering::Relaxed)
-        + 1;
+    // Install a fresh abort flag, tripping any in-flight job. This family publishes no
+    // queryable status slot, so the whole ownership transition is `install_fresh` — the
+    // abort lock is taken and released before the catalog is read below, which is why the
+    // switch covers this family in phase two rather than phase one (see `jobs`' lock order).
+    let abort = state.jobs.sharpness.install_fresh()?;
+    let job = state.jobs.sharpness.next_job_id();
 
     // Read catalog path + root under a brief lock, then release it.
     let (db_path, root) = {
@@ -180,12 +171,7 @@ pub async fn index_sharpness(
 /// the next run. No-op if no job is running.
 #[tauri::command]
 pub async fn sharpness_index_cancel(state: State<'_, AppState>) -> Result<(), String> {
-    let guard = state
-        .sharpness_abort
-        .lock()
-        .map_err(|e| e.to_string())?;
-    guard.store(true, Ordering::Relaxed);
-    Ok(())
+    state.jobs.sharpness.trip()
 }
 
 // ── H15a: Perceptual-hash index job ──────────────────────────────────────────
@@ -223,15 +209,10 @@ pub struct PhashIndexDone {
 /// IS NULL`. Returns the new job's id (also carried by progress/done events).
 #[tauri::command]
 pub async fn index_phashes(app: AppHandle, state: State<'_, AppState>) -> Result<u64, String> {
-    // Install a fresh abort flag, tripping any in-flight job.
-    let abort = {
-        let mut guard = state.phash_abort.lock().map_err(|e| e.to_string())?;
-        guard.store(true, Ordering::Relaxed);
-        let fresh = Arc::new(AtomicBool::new(false));
-        *guard = fresh.clone();
-        fresh
-    };
-    let job = state.phash_job_seq.fetch_add(1, Ordering::Relaxed) + 1;
+    // Install a fresh abort flag, tripping any in-flight job. Slot-less family, same shape
+    // as `index_sharpness` above.
+    let abort = state.jobs.phash.install_fresh()?;
+    let job = state.jobs.phash.next_job_id();
 
     let (db_path, root) = {
         let guard = state.catalog.lock().map_err(|e| e.to_string())?;
@@ -330,9 +311,7 @@ pub async fn index_phashes(app: AppHandle, state: State<'_, AppState>) -> Result
 /// next run. No-op if no job is running.
 #[tauri::command]
 pub async fn phash_index_cancel(state: State<'_, AppState>) -> Result<(), String> {
-    let guard = state.phash_abort.lock().map_err(|e| e.to_string())?;
-    guard.store(true, Ordering::Relaxed);
-    Ok(())
+    state.jobs.phash.trip()
 }
 
 // ── H7a: Smart Tagging model manager ─────────────────────────────────────────

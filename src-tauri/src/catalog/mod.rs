@@ -33,7 +33,7 @@ pub use identity::{
     bind_sidecar_identity, IdentityRepairPlan, IdentityRepairSummary, PendingIdentity,
     PendingIdentityField, PendingIdentityRow, PendingIdentitySummary, SidecarIdentity,
 };
-pub use locations::PathCandidate;
+pub use locations::{PathCandidate, ResolveMode};
 pub use lifecycle::{copy_and_verify, verify_and_delete_locals, BackupPlan, OffloadPlan, RestorePlan};
 pub use merge::MergeSummary;
 pub use models::{

@@ -10,6 +10,7 @@
 //! photo id to its file and renders. Work happens on a worker thread so the webview
 //! networking thread is never blocked.
 
+use crate::catalog::ResolveMode;
 use crate::commands::AppState;
 use crate::image_pool::{ImagePool, JobKey};
 use crate::thumbnails::{preview_bytes, thumbnail_bytes, zoom_bytes};
@@ -118,7 +119,14 @@ pub fn render_bytes<R: Runtime>(
         let rotation = catalog.photo_rotation(id).unwrap_or(0);
         (candidates, rotation)
     };
-    let resolved = crate::volume_health::pick_existing(&candidates, &state.volume_health);
+    // A thumbnail has a persistent fallback below, so it resolves in FastDisplay: a
+    // cached-unreachable volume is never statted and the grid falls back at once. Preview
+    // and zoom have no fallback — they need the original, so they keep strict checking.
+    let mode = match kind {
+        ImageKind::Thumb => ResolveMode::FastDisplay,
+        ImageKind::Preview | ImageKind::Zoom => ResolveMode::OriginalRequired,
+    };
+    let resolved = crate::volume_health::pick_existing(&candidates, &state.volume_health, mode);
     match resolved {
         Some(absolute) => match kind {
             ImageKind::Thumb => {
@@ -228,7 +236,14 @@ fn serve_video<R: Runtime>(mut stream: TcpStream, app: tauri::AppHandle<R>) -> s
             None => return write_simple(&mut stream, "404 Not Found", ""),
         }
     };
-    let path = crate::volume_health::pick_existing(&candidates, &state.volume_health);
+    // Video playback streams the original file itself — there is no cached proxy to fall
+    // back to, so this is OriginalRequired: a stale "unreachable" flag must not turn a
+    // playable file into a 404.
+    let path = crate::volume_health::pick_existing(
+        &candidates,
+        &state.volume_health,
+        ResolveMode::OriginalRequired,
+    );
     let Some(path) = path else {
         return write_simple(&mut stream, "404 Not Found", "");
     };

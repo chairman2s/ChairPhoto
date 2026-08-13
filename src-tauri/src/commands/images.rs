@@ -53,7 +53,14 @@ pub async fn cache_images(
             .into_iter()
             .filter_map(|(id, cands)| {
                 // Skip photos whose originals aren't currently reachable (e.g. offline NAS).
-                crate::volume_health::pick_existing(&cands, &health).map(|abs| (id, abs))
+                // OriginalRequired: this builds the cache *from* originals, so a stale
+                // reachability flag must not silently drop a photo from the warm-up.
+                crate::volume_health::pick_existing(
+                    &cands,
+                    &health,
+                    crate::catalog::ResolveMode::OriginalRequired,
+                )
+                .map(|abs| (id, abs))
             })
             .collect()
     })
@@ -152,9 +159,16 @@ async fn image_data_uri(
     // lock in `pick_existing` so a slow/offline NAS can't serialize the app.
     let candidates = with_catalog(state, |c| c.photo_path_candidates(photo_id))?;
     let health = state.volume_health.clone();
+    // OriginalRequired: this is the base64 fallback for the `thumb://`/`preview://`
+    // protocols, so it is the last thing standing between the caller and an error — it
+    // must not report "unreachable" on the strength of a cached flag alone.
     let bytes = tauri::async_runtime::spawn_blocking(move || {
-        let absolute = crate::volume_health::pick_existing(&candidates, &health)
-            .ok_or_else(|| format!("no reachable copy of photo {photo_id}"))?;
+        let absolute = crate::volume_health::pick_existing(
+            &candidates,
+            &health,
+            crate::catalog::ResolveMode::OriginalRequired,
+        )
+        .ok_or_else(|| format!("no reachable copy of photo {photo_id}"))?;
         render(&absolute)
     })
     .await

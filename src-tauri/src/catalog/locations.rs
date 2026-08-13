@@ -37,6 +37,55 @@ pub struct PathCandidate {
     pub volume_id: Option<i64>,
 }
 
+/// Which resolver policy a caller needs.
+///
+/// The resolver answers "where is this photo?" for every caller — grid pixels, edit,
+/// export, import path classification, `missing` reconciliation. With one shared "best
+/// available copy" policy they all paid the same filesystem stats even though their needs
+/// differ, so display and scan paths touched slow or offline storage for no benefit. These
+/// modes split that policy at the resolver's seam: the pure-SQL half
+/// ([`Catalog::photo_path_candidates`] / [`Catalog::volume_rows`]) and the statting half
+/// ([`crate::volume_health::pick_existing`]).
+///
+/// The invariant that constrains all of this (AGENTS.md): *missing/unmounted storage is a
+/// normal state, not evidence that the catalog row is invalid*. Only [`Self::FastDisplay`]
+/// may answer "no copy" while a copy might in fact sit on a cached-unreachable volume, and
+/// it is therefore allowed **only** where that answer feeds a display fallback. It must
+/// never reach code that flags a row `missing`, removes/hides a row, or persists derived
+/// state — those callers use [`Self::OriginalRequired`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResolveMode {
+    /// Grid/loupe pixels, where a kept persistent thumbnail is an acceptable answer.
+    /// Trusts the volume-reachability cache: a candidate on a *cached-unreachable* volume
+    /// is not statted at all, so an offline (or hung) NAS never delays the fallback.
+    /// Consequently this mode may return `None` while a copy exists — see the type docs.
+    FastDisplay,
+    /// Edit, export, video streaming, cache warm-up, and `missing` reconciliation: every
+    /// caller that needs the real original bytes, or that records a decision about a row.
+    /// Two passes, so the reachability cache may only *reorder* stats, never change the
+    /// answer — a stale "unreachable" flag costs one deferred stat and nothing else.
+    OriginalRequired,
+    /// "Which volume and relative path does this absolute path belong to?" — answered from
+    /// the `volumes` rows alone ([`Catalog::volume_rows`]). Never stats, so it is safe
+    /// under the catalog lock and costs nothing when a volume is offline.
+    PathClassification,
+}
+
+impl ResolveMode {
+    /// Whether this mode may touch the filesystem at all. False only for
+    /// [`Self::PathClassification`], which is answered from DB rows.
+    pub const fn stats_filesystem(self) -> bool {
+        !matches!(self, Self::PathClassification)
+    }
+
+    /// Whether a candidate on a cached-unreachable volume must still be statted before the
+    /// resolver may answer "no copy exists". True for every mode allowed to decide
+    /// something about a row; false only for [`Self::FastDisplay`].
+    pub const fn verifies_unreachable(self) -> bool {
+        matches!(self, Self::OriginalRequired)
+    }
+}
+
 impl Catalog {
     // --- volumes ------------------------------------------------------------
 
@@ -74,12 +123,17 @@ impl Catalog {
     /// All volumes, each flagged with whether its base path currently exists. This
     /// STATS each volume, so it must not be called while holding a lock that a hung NAS
     /// stat could serialize; it's kept for the Volumes preferences UI and cold callers.
+    ///
+    /// Reachability is the *only* thing this adds over [`volume_rows`]. Anything that just
+    /// needs base paths — [`ResolveMode::PathClassification`] work such as
+    /// [`volume_for_path`] — must use `volume_rows` and pay nothing when a volume is
+    /// offline.
     pub fn list_volumes(&self) -> Result<Vec<Volume>> {
         Ok(self
             .volume_rows()?
             .into_iter()
             .map(|mut v| {
-                v.reachable = Path::new(&v.base_path).is_dir();
+                v.reachable = volume_base_is_dir(&v.base_path);
                 v
             })
             .collect())
@@ -139,8 +193,14 @@ impl Catalog {
     }
 
     /// Find the volume that contains `absolute` (longest matching base path) and the
-    /// path relative to it. Falls back to the default volume (catalog root). PURE SQL:
-    /// reachability checks are deliberately left to resolver callers that run off-lock.
+    /// path relative to it. Falls back to the default volume (catalog root).
+    ///
+    /// [`ResolveMode::PathClassification`]: the answer is a prefix comparison over the
+    /// `volumes` rows, so this reads [`volume_rows`] and performs ZERO base-path stats.
+    /// Import runs it once per scanned file, and it runs under the catalog lock — statting
+    /// every volume here (as it did before) put a NAS round-trip in front of each file and
+    /// could serialize the whole app behind a hung mount. Reachability is deliberately left
+    /// to resolver callers that run off-lock.
     pub fn volume_for_path(&self, absolute: &Path) -> Result<(i64, String)> {
         let mut best: Option<(i64, usize, String)> = None;
         for volume in self.volume_rows()? {
@@ -217,12 +277,116 @@ impl Catalog {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
-    /// Reconcile the `missing` flag across all photos after a scan: a photo is hidden
+    /// Every photo id with a recorded copy under `folder` — the *scanned scope*.
+    ///
+    /// [`ResolveMode::PathClassification`]: pure prefix comparison over `volumes` and
+    /// `photo_locations`, never a stat, so it is safe under the catalog lock and costs
+    /// nothing when a volume is offline. This is what makes post-scan reconciliation
+    /// proportional to the folder that was scanned instead of to the whole catalog.
+    ///
+    /// It is deliberately wider than "the files the walk saw": a row whose file was
+    /// DELETED since the last scan never appears in the walk, and reconciling it is
+    /// exactly the point. Volumes that merely *sit inside* `folder` are included whole.
+    pub fn photo_ids_under(&self, folder: &Path) -> Result<Vec<i64>> {
+        let mut ids: std::collections::BTreeSet<i64> = std::collections::BTreeSet::new();
+        for volume in self.volume_rows()? {
+            let base = PathBuf::from(&volume.base_path);
+            let prefix = if let Ok(rel) = folder.strip_prefix(&base) {
+                // `folder` sits inside this volume — restrict to its subtree ("" = all).
+                let rel = rel.to_string_lossy().replace('\\', "/");
+                if rel.is_empty() {
+                    None
+                } else {
+                    Some(format!("{rel}/"))
+                }
+            } else if base.starts_with(folder) {
+                None // the whole volume sits inside the scanned folder
+            } else {
+                continue;
+            };
+            self.collect_location_photo_ids(volume.id, prefix.as_deref(), &mut ids)?;
+        }
+
+        // Legacy rows with no location at all resolve only through the catalog-root
+        // fallback, so match them on `photos.path` (root-relative by invariant).
+        let root_prefix = if let Ok(rel) = folder.strip_prefix(self.root()) {
+            let rel = rel.to_string_lossy().replace('\\', "/");
+            if rel.is_empty() {
+                Some(None)
+            } else {
+                Some(Some(format!("{rel}/")))
+            }
+        } else if self.root().starts_with(folder) {
+            Some(None)
+        } else {
+            None
+        };
+        if let Some(prefix) = root_prefix {
+            let sql = "SELECT id FROM photos p
+                       WHERE NOT EXISTS(SELECT 1 FROM photo_locations l WHERE l.photo_id = p.id)";
+            match prefix {
+                None => {
+                    let mut stmt = self.conn.prepare(sql)?;
+                    for row in stmt.query_map([], |r| r.get::<_, i64>(0))? {
+                        ids.insert(row?);
+                    }
+                }
+                Some(p) => {
+                    let mut stmt = self
+                        .conn
+                        .prepare(&format!("{sql} AND substr(p.path, 1, ?1) = ?2"))?;
+                    let len = p.chars().count() as i64;
+                    for row in stmt.query_map(params![len, p], |r| r.get::<_, i64>(0))? {
+                        ids.insert(row?);
+                    }
+                }
+            }
+        }
+        Ok(ids.into_iter().collect())
+    }
+
+    /// Photo ids with a location on `volume_id`, optionally restricted to a relative-path
+    /// prefix. `substr` rather than `LIKE` so a path containing `%`/`_` needs no escaping.
+    fn collect_location_photo_ids(
+        &self,
+        volume_id: i64,
+        prefix: Option<&str>,
+        out: &mut std::collections::BTreeSet<i64>,
+    ) -> Result<()> {
+        match prefix {
+            None => {
+                let mut stmt = self
+                    .conn
+                    .prepare("SELECT photo_id FROM photo_locations WHERE volume_id = ?1")?;
+                for row in stmt.query_map(params![volume_id], |r| r.get::<_, i64>(0))? {
+                    out.insert(row?);
+                }
+            }
+            Some(p) => {
+                let mut stmt = self.conn.prepare(
+                    "SELECT photo_id FROM photo_locations
+                     WHERE volume_id = ?1 AND substr(relative_path, 1, ?2) = ?3",
+                )?;
+                let len = p.chars().count() as i64;
+                for row in stmt.query_map(params![volume_id, len, p], |r| r.get::<_, i64>(0))? {
+                    out.insert(row?);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Reconcile the `missing` flag across the WHOLE catalog: a photo is hidden
     /// (missing = 1) when its original can't be resolved AND it has no backup copy —
     /// i.e. genuinely gone (e.g. orphan rows left by a re-root). Photos that are merely
     /// offline (on an unmounted NAS) keep a backup location, so they're NOT hidden.
-    /// Resolvable photos are un-hidden. Called at the end of a scan.
-    pub fn reconcile_missing(&self) -> Result<()> {
+    /// Resolvable photos are un-hidden.
+    ///
+    /// This is O(catalog) and stats, so it is **explicit maintenance**, not something a
+    /// scan runs for free — scans reconcile their own scope with
+    /// [`reconcile_missing_for`]. Kept for callers that genuinely change the whole
+    /// catalog at once (bundle import) and for the performance harness.
+    pub fn reconcile_missing(&self) -> Result<usize> {
         let ids: Vec<i64> = {
             let mut stmt = self.conn.prepare("SELECT id FROM photos")?;
             let ids = stmt
@@ -230,22 +394,69 @@ impl Catalog {
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             ids
         };
-        for id in ids {
-            let resolvable = self.resolve_photo_path(id)?.is_some();
-            let has_backup: bool = self.conn.query_row(
-                "SELECT EXISTS(
-                    SELECT 1 FROM photo_locations l JOIN volumes v ON v.id = l.volume_id
-                    WHERE l.photo_id = ?1 AND v.kind = 'backup')",
-                params![id],
-                |r| r.get(0),
-            )?;
-            let missing = !resolvable && !has_backup;
+        self.reconcile_missing_for(&ids)
+    }
+
+    /// Reconcile the `missing` flag for a bounded set of photos (duplicates and unknown
+    /// ids are ignored). Returns how many rows actually changed.
+    ///
+    /// [`ResolveMode::OriginalRequired`] — it decides whether to hide a row, so it stats
+    /// candidates itself and consults no reachability cache. Two things keep it cheap:
+    ///
+    /// - `missing = !resolvable && !has_backup`, so a photo with ANY backup location is
+    ///   never missing whatever the disk says. `has_backup` is pure SQL, so it is computed
+    ///   FIRST and the stats are skipped entirely for those photos. On a NAS-backed
+    ///   library that is most of them, and it is also the case where the stat is most
+    ///   expensive (an unmounted NAS path).
+    /// - Plan → stat → write: the stats happen outside any transaction, and only the rows
+    ///   whose flag actually changes are written, in one short transaction at the end.
+    pub fn reconcile_missing_for(&self, photo_ids: &[i64]) -> Result<usize> {
+        if photo_ids.is_empty() {
+            return Ok(0);
+        }
+        // Plan (pure SQL): current flag + whether a backup copy is recorded. The SELECT
+        // also de-duplicates ids and drops any that no longer exist.
+        let mut planned: Vec<(i64, bool, bool)> = Vec::new();
+        for chunk in photo_ids.chunks(SQLITE_PARAM_CHUNK) {
+            let placeholders = sqlite_param_placeholders(chunk.len());
+            let mut stmt = self.conn.prepare(&format!(
+                "SELECT p.id, p.missing,
+                        EXISTS(SELECT 1 FROM photo_locations l JOIN volumes v ON v.id = l.volume_id
+                               WHERE l.photo_id = p.id AND v.kind = 'backup')
+                 FROM photos p WHERE p.id IN ({placeholders})"
+            ))?;
+            let binds: Vec<&dyn rusqlite::ToSql> =
+                chunk.iter().map(|i| i as &dyn rusqlite::ToSql).collect();
+            let rows = stmt.query_map(binds.as_slice(), |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)? != 0, r.get::<_, bool>(2)?))
+            })?;
+            for row in rows {
+                planned.push(row?);
+            }
+        }
+
+        // Stat (no transaction held): only for photos that a backup can't already spare.
+        let mut changed: Vec<(i64, bool)> = Vec::new();
+        for (id, missing_now, has_backup) in planned {
+            let missing = !has_backup && self.resolve_photo_path(id)?.is_none();
+            if missing != missing_now {
+                changed.push((id, missing));
+            }
+        }
+
+        // Write only what changed, in one transaction.
+        if changed.is_empty() {
+            return Ok(0);
+        }
+        let tx = self.begin()?;
+        for (id, missing) in &changed {
             self.conn.execute(
                 "UPDATE photos SET missing = ?1 WHERE id = ?2",
-                params![missing as i64, id],
+                params![*missing as i64, id],
             )?;
         }
-        Ok(())
+        tx.commit()?;
+        Ok(changed.len())
     }
 
     /// Photos that are provably gone: no copy exists on any *reachable* volume, and no
@@ -492,11 +703,17 @@ impl Catalog {
     /// Single source of truth: builds the candidate list ([`photo_path_candidates`]) and
     /// returns the first path that exists. Statting callers on the hot path should split
     /// this themselves (candidates under the lock, `pick_existing` off it).
+    ///
+    /// This convenience form is always [`ResolveMode::OriginalRequired`]: it consults no
+    /// reachability cache and stats every candidate in priority order, so it can be used
+    /// by callers that record a decision about the row. Hot display paths must NOT use it
+    /// — they hold the catalog lock across the stats and cannot ask for
+    /// [`ResolveMode::FastDisplay`]; use the split form instead.
     pub fn resolve_photo_path(&self, photo_id: i64) -> Result<Option<PathBuf>> {
         Ok(self
             .photo_path_candidates(photo_id)?
             .into_iter()
-            .find(|c| c.path.exists())
+            .find(|c| crate::volume_health::candidate_exists(&c.path))
             .map(|c| c.path))
     }
 
@@ -524,6 +741,28 @@ impl Catalog {
         }
         Ok(())
     }
+}
+
+// Per-thread count of volume base-path stats, so a unit test can prove that
+// `ResolveMode::PathClassification` work performs none of them. Thread-local: `cargo test`
+// runs tests in parallel threads, and each test drives its own catalog.
+#[cfg(test)]
+thread_local! {
+    static VOLUME_BASE_STATS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The single reachability stat for a volume base path, funnelled through one function so
+/// the test counter above sees every one of them.
+fn volume_base_is_dir(base: &str) -> bool {
+    #[cfg(test)]
+    VOLUME_BASE_STATS.with(|c| c.set(c.get() + 1));
+    Path::new(base).is_dir()
+}
+
+/// Take and reset this thread's volume base-path stat count (tests only).
+#[cfg(test)]
+fn take_volume_base_stats() -> usize {
+    VOLUME_BASE_STATS.with(|c| c.replace(0))
 }
 
 /// Pure status derivation from a photo's `(volume_kind, volume_id)` locations and a
@@ -560,4 +799,278 @@ fn now() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::TestTmpDir;
+    use crate::volume_health::VolumeHealth;
+    use std::time::Duration;
+
+    /// A catalog rooted at `<tmp>/photos`, plus the fixture dir (kept alive for cleanup).
+    fn temp_catalog(tag: &str) -> (Catalog, TestTmpDir, PathBuf) {
+        let dir = TestTmpDir::new(tag);
+        let root = dir.join("photos");
+        std::fs::create_dir_all(&root).unwrap();
+        let catalog = Catalog::open(&dir.join("t.chairphoto"), &root).unwrap();
+        (catalog, dir, root)
+    }
+
+    /// Index a photo whose ONLY copy lives on a separate "NAS" volume, then take the mount
+    /// away so a `VolumeHealth` refresh caches it as unreachable — while the file itself is
+    /// still readable through its original path. That is the stale-flag case the resolver
+    /// modes have to disagree about, and it is forced here rather than waited for.
+    ///
+    /// Returns `(photo_id, nas_volume_id, nas_base, nas_file)`.
+    fn photo_on_detachable_nas(
+        catalog: &Catalog,
+        dir: &TestTmpDir,
+        root: &Path,
+    ) -> (i64, i64, PathBuf, PathBuf) {
+        // The catalog-root copy is never created: the NAS holds the only bytes.
+        let id = catalog
+            .upsert_photo(&root.join("archive/a.arw"), None, 1, 1)
+            .unwrap()
+            .id;
+        let nas_base = dir.join("nas");
+        let nas_file = nas_base.join("archive/a.arw");
+        std::fs::create_dir_all(nas_file.parent().unwrap()).unwrap();
+        std::fs::write(&nas_file, b"x").unwrap();
+        let nas = catalog
+            .add_volume("NAS", &nas_base, VolumeKind::Backup)
+            .unwrap();
+        catalog
+            .add_location(id, nas, "archive/a.arw", LocationRole::Backup)
+            .unwrap();
+        (id, nas, nas_base, nas_file)
+    }
+
+    /// The `missing` flag, read straight from the column (it is not on [`super::Photo`]).
+    fn is_missing(catalog: &Catalog, photo_id: i64) -> bool {
+        catalog
+            .conn
+            .query_row(
+                "SELECT missing FROM photos WHERE id = ?1",
+                params![photo_id],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap()
+            != 0
+    }
+
+    /// End-to-end through the real resolver seam (catalog candidates → `pick_existing`):
+    /// with the NAS cached-unreachable, display gives up immediately so the grid can serve
+    /// its persistent thumbnail, while every original-required caller still gets the file.
+    #[test]
+    fn offline_nas_splits_display_from_original_required() {
+        let (catalog, dir, root) = temp_catalog("resolve-mode-offline-nas");
+        let (id, nas, nas_base, nas_file) = photo_on_detachable_nas(&catalog, &dir, &root);
+
+        // Force "NAS offline": point the health check at the mount while it is renamed
+        // away, so the cached verdict is `false`. Restoring it makes the flag stale — the
+        // file is present again but the cache still says unreachable.
+        let detached = dir.join("nas-detached");
+        std::fs::rename(&nas_base, &detached).unwrap();
+        let health = VolumeHealth::with_ttl(Duration::MAX);
+        health.refresh(&[(nas, nas_base.to_string_lossy().to_string())]);
+        assert_eq!(health.reachable(nas), Some(false));
+        std::fs::rename(&detached, &nas_base).unwrap();
+
+        let candidates = catalog.photo_path_candidates(id).unwrap();
+        assert!(
+            candidates.iter().any(|c| c.volume_id == Some(nas)),
+            "the NAS copy must be among the candidates"
+        );
+
+        assert_eq!(
+            crate::volume_health::pick_existing(&candidates, &health, ResolveMode::FastDisplay),
+            None,
+            "display must fall back rather than stat a cached-unreachable volume"
+        );
+        assert_eq!(
+            crate::volume_health::pick_existing(&candidates, &health, ResolveMode::OriginalRequired),
+            Some(nas_file.clone()),
+            "edit/export must still reach the original: the cache only reorders stats"
+        );
+        // The convenience resolver is OriginalRequired by construction (no cache at all).
+        assert_eq!(catalog.resolve_photo_path(id).unwrap(), Some(nas_file));
+    }
+
+    /// The invariant this whole split is fenced by (AGENTS.md): unmounted storage is a
+    /// normal state, never evidence that the row is invalid. `FastDisplay` answering `None`
+    /// must therefore leave `missing` alone — reconciliation runs OriginalRequired.
+    #[test]
+    fn fast_display_none_never_marks_a_photo_missing() {
+        let (catalog, dir, root) = temp_catalog("resolve-mode-missing-flag");
+        let (id, nas, nas_base, _) = photo_on_detachable_nas(&catalog, &dir, &root);
+
+        let health = VolumeHealth::with_ttl(Duration::MAX);
+        let detached = dir.join("nas-detached");
+        std::fs::rename(&nas_base, &detached).unwrap();
+        health.refresh(&[(nas, nas_base.to_string_lossy().to_string())]);
+        std::fs::rename(&detached, &nas_base).unwrap();
+
+        let candidates = catalog.photo_path_candidates(id).unwrap();
+        assert_eq!(
+            crate::volume_health::pick_existing(&candidates, &health, ResolveMode::FastDisplay),
+            None
+        );
+        catalog.reconcile_missing().unwrap();
+        assert!(
+            !is_missing(&catalog, id),
+            "a photo whose copy is reachable must never be flagged missing"
+        );
+    }
+
+    /// `volume_for_path` is [`ResolveMode::PathClassification`] work: it must answer from
+    /// the `volumes` rows and stat nothing. Import calls it per scanned file under the
+    /// catalog lock, so a stat here is a NAS round-trip per file.
+    ///
+    /// Pinned by counting base-path stats rather than timing: `list_volumes` (the only
+    /// caller that legitimately wants reachability) shows the counter working.
+    #[test]
+    fn volume_for_path_classifies_without_statting_any_volume() {
+        let (catalog, dir, root) = temp_catalog("volume-for-path-no-stat");
+        // Two volumes whose base paths do NOT exist — an unmounted NAS and a detached card.
+        let nas_base = dir.join("nas-not-mounted");
+        let card_base = dir.join("card-not-inserted");
+        let nas = catalog
+            .add_volume("NAS", &nas_base, VolumeKind::Backup)
+            .unwrap();
+        catalog
+            .add_volume("Card", &card_base, VolumeKind::Local)
+            .unwrap();
+
+        let _ = take_volume_base_stats();
+        let (vid, rel) = catalog.volume_for_path(&nas_base.join("2019/a.arw")).unwrap();
+        assert_eq!(
+            take_volume_base_stats(),
+            0,
+            "classification must not stat any volume base path"
+        );
+        assert_eq!(vid, nas, "an unmounted volume still classifies its own paths");
+        assert_eq!(rel, "2019/a.arw");
+
+        // The catalog-root volume is picked for paths under the root, still without stats.
+        let (root_vid, root_rel) = catalog.volume_for_path(&root.join("b.arw")).unwrap();
+        assert_eq!(take_volume_base_stats(), 0);
+        assert_eq!(root_vid, catalog.ensure_default_volume().unwrap());
+        assert_eq!(root_rel, "b.arw");
+
+        // Counter sanity: the reachability-reporting call does stat, once per volume.
+        let volumes = catalog.list_volumes().unwrap();
+        assert_eq!(take_volume_base_stats(), volumes.len());
+        assert_eq!(volumes.len(), 3, "catalog-root + NAS + card");
+    }
+
+    /// `photo_ids_under` is the scan scope. It must include a row whose FILE is gone (the
+    /// walk never sees it, and hiding it is the point of reconciliation) and exclude rows
+    /// that live in a sibling folder the scan never looked at.
+    #[test]
+    fn photo_ids_under_covers_deleted_rows_and_stops_at_the_folder() {
+        let (catalog, _dir, root) = temp_catalog("photo-ids-under");
+        let mk = |rel: &str| {
+            let p = root.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, b"x").unwrap();
+            (catalog.upsert_photo(&p, None, 1, 1).unwrap().id, p)
+        };
+        let (a_kept, _) = mk("trip/a.arw");
+        let (a_gone, a_gone_path) = mk("trip/gone.arw");
+        let (b, _) = mk("other/b.arw");
+        std::fs::remove_file(&a_gone_path).unwrap();
+
+        let scope = catalog.photo_ids_under(&root.join("trip")).unwrap();
+        assert!(scope.contains(&a_kept));
+        assert!(scope.contains(&a_gone), "a row whose file is gone is still in scope");
+        assert!(!scope.contains(&b), "a sibling folder is out of scope");
+
+        // Scanning the root covers everything; an unrelated folder covers nothing.
+        let all = catalog.photo_ids_under(&root).unwrap();
+        assert!([a_kept, a_gone, b].iter().all(|id| all.contains(id)));
+        assert!(catalog
+            .photo_ids_under(&root.join("nowhere"))
+            .unwrap()
+            .is_empty());
+    }
+
+    /// The scoped pass reconciles exactly its scope: a row under the scanned folder whose
+    /// file vanished is hidden, and a row outside it is left alone even though its file is
+    /// equally gone. Reconciling the untouched half is what made every scan an O(catalog)
+    /// stat pass.
+    #[test]
+    fn reconcile_missing_for_touches_only_the_given_scope() {
+        let (catalog, _dir, root) = temp_catalog("reconcile-scope");
+        let mk = |rel: &str| {
+            let p = root.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, b"x").unwrap();
+            let id = catalog.upsert_photo(&p, None, 1, 1).unwrap().id;
+            std::fs::remove_file(&p).unwrap();
+            id
+        };
+        let inside = mk("trip/a.arw");
+        let outside = mk("other/b.arw");
+
+        let scope = catalog.photo_ids_under(&root.join("trip")).unwrap();
+        assert_eq!(catalog.reconcile_missing_for(&scope).unwrap(), 1);
+        assert!(is_missing(&catalog, inside));
+        assert!(!is_missing(&catalog, outside), "out-of-scope rows are untouched");
+
+        // The full pass is still available as explicit maintenance and catches the rest.
+        assert_eq!(catalog.reconcile_missing().unwrap(), 1);
+        assert!(is_missing(&catalog, outside));
+        // Idempotent: nothing left to change.
+        assert_eq!(catalog.reconcile_missing().unwrap(), 0);
+    }
+
+    /// `missing = !resolvable && !has_backup`, so a recorded backup already decides the
+    /// answer and the stats are pure waste. Counting them proves the short-circuit: the
+    /// backed-up photo costs zero candidate stats even though its NAS is unmounted, which
+    /// is exactly the copy that would be slowest to stat.
+    #[test]
+    fn reconcile_skips_the_stats_for_backed_up_photos() {
+        let (catalog, dir, root) = temp_catalog("reconcile-short-circuit");
+        let plain = root.join("plain.arw");
+        std::fs::write(&plain, b"x").unwrap();
+        let plain_id = catalog.upsert_photo(&plain, None, 1, 1).unwrap().id;
+
+        let (backed_id, _nas, nas_base, _) = photo_on_detachable_nas(&catalog, &dir, &root);
+        std::fs::rename(&nas_base, dir.join("nas-detached")).unwrap(); // NAS offline
+
+        // Baseline: what the un-backed-up photo costs on its own (reconciliation is
+        // idempotent, so measuring it twice is safe).
+        let _ = crate::volume_health::take_candidate_stats();
+        catalog.reconcile_missing_for(&[plain_id]).unwrap();
+        let alone = crate::volume_health::take_candidate_stats();
+        assert!(alone > 0, "the photo with no backup really is statted");
+
+        catalog
+            .reconcile_missing_for(&[plain_id, backed_id])
+            .unwrap();
+        assert_eq!(
+            crate::volume_health::take_candidate_stats(),
+            alone,
+            "the backed-up photo on an unmounted NAS adds no stats at all"
+        );
+        assert!(!is_missing(&catalog, plain_id));
+        assert!(!is_missing(&catalog, backed_id));
+    }
+
+    /// Even with the NAS genuinely gone, a photo with a backup location is spared. This is
+    /// the offline-NAS half of reconciliation: "offline" is not "missing".
+    #[test]
+    fn reconcile_spares_a_photo_whose_only_copy_is_on_an_unmounted_volume() {
+        let (catalog, dir, root) = temp_catalog("resolve-mode-offline-reconcile");
+        let (id, _nas, nas_base, _) = photo_on_detachable_nas(&catalog, &dir, &root);
+        std::fs::rename(&nas_base, dir.join("nas-detached")).unwrap();
+
+        assert_eq!(catalog.resolve_photo_path(id).unwrap(), None);
+        catalog.reconcile_missing().unwrap();
+        assert!(
+            !is_missing(&catalog, id),
+            "an unmounted backup is a normal state, not a missing row"
+        );
+    }
 }

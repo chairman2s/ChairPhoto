@@ -188,13 +188,21 @@ async fn relocate_photo_in_state(
 /// (`Catalog::repair_pending_identity`, below) plans its own field-grained query
 /// (`Catalog::plan_identity_repairs`), since each repair needs the target value bound
 /// per field. `list_pending_identity()` is exercised only by this crate's tests.
+///
+/// `includeDismissed` switches the page from the active queue to every copy in it,
+/// including the ones a human dismissed (#33) — the only way back to a dismissal, so it is
+/// paired with Restore, not offered as a bare "show more".
 #[tauri::command]
 pub async fn list_pending_identity(
     state: State<'_, AppState>,
     limit: i64,
     offset: i64,
+    include_dismissed: bool,
 ) -> Result<Vec<crate::catalog::PendingIdentity>, String> {
-    with_catalog_blocking(&state, move |c| c.list_pending_identity_page(limit, offset)).await
+    with_catalog_blocking(&state, move |c| {
+        c.list_pending_identity_page(limit, offset, include_dismissed)
+    })
+    .await
 }
 
 /// Cheap counts (total debt + conflicts) over the pending-identity queue, for a summary
@@ -221,6 +229,38 @@ pub async fn repair_pending_identity(
     tauri::async_runtime::spawn_blocking(move || {
         let catalog = Catalog::open_secondary(&db_path, &root).map_err(|e| e.to_string())?;
         catalog.repair_pending_identity().map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Resolve one conflicted copy the way the user decided (#33): `adopt` the identifier the
+/// file already carries, `overwrite` the file with the catalog's, `dismiss` the copy, or
+/// `restore` a dismissed one. There is no default — the action is required, and an
+/// unrecognised one fails to deserialize rather than falling back to the destructive path.
+///
+/// Runs on a secondary connection on a blocking worker, exactly like
+/// `repair_pending_identity`: `adopt` reads the sidecar and `overwrite` rewrites it, and
+/// neither may hold the app's catalog lock across a (possibly network) sidecar IO.
+///
+/// Refusals come back as plain messages naming what was refused — most importantly
+/// "another photo already holds that identity", which is checked before the write rather
+/// than left to surface as a UNIQUE-constraint error.
+#[tauri::command]
+pub async fn resolve_identity_conflict(
+    state: State<'_, AppState>,
+    photo_id: i64,
+    volume_id: i64,
+    relative_path: String,
+    action: crate::catalog::IdentityConflictAction,
+) -> Result<crate::catalog::IdentityConflictOutcome, String> {
+    let (db_path, root) =
+        with_catalog(&state, |c| Ok((c.db_path().to_path_buf(), c.root().to_path_buf())))?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let catalog = Catalog::open_secondary(&db_path, &root).map_err(|e| e.to_string())?;
+        catalog
+            .resolve_identity_conflict(photo_id, volume_id, &relative_path, action)
+            .map_err(|e| e.to_string())
     })
     .await
     .map_err(|e| e.to_string())?

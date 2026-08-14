@@ -38,6 +38,17 @@ import type {
 
 interface Registered {
   module: ChairPhotoModule;
+  /**
+   * The module's id, read ONCE at registration and never again.
+   *
+   * `module.id` is a property on an object a third party wrote, so it can be an accessor
+   * that returns one value while the loader is validating it against the manifest and
+   * another afterwards. Everything that decides what a module may do — the permission
+   * lookup, the settings namespace, the publication marker, the grant the Modules panel
+   * records — keys on THIS string, so a module cannot answer "who are you?" differently
+   * depending on when it is asked.
+   */
+  id: string;
   enabled: boolean;
   /** True if loaded from disk (external), false for a bundled module. */
   external: boolean;
@@ -650,8 +661,17 @@ function dependentsOf(id: string): Registered[] {
 }
 
 // --- API injected into each module --------------------------------------
-function apiFor(mod: ChairPhotoModule): ChairPhotoAPI {
-  const reg = modules.get(mod.id)!;
+/**
+ * Build the host API for one registered module.
+ *
+ * Takes the registry ENTRY rather than the module object, and reads identity from
+ * `reg.id` — the id captured once at registration. Resolving `mod.id` per call would let a
+ * module define `id` as an accessor that returns its own id while the host validates it and
+ * another module's afterwards, which is enough to borrow that module's permission grant,
+ * settings namespace and publication marker. See `Registered.id`.
+ */
+function apiFor(reg: Registered): ChairPhotoAPI {
+  const id = reg.id;
   return {
     getSelectedPhotos: () => selection,
     getActivePhotoId: () => activeId,
@@ -662,17 +682,17 @@ function apiFor(mod: ChairPhotoModule): ChairPhotoAPI {
     // Stamp THIS module's marker (declared publicationMarker, or its id) so a module
     // never handles the platform string — the host enforces the fallback rule.
     recordPublication: (photoId, versionId, url) =>
-      recordPublication(photoId, versionId, getPublicationMarker(mod.id), url ?? null).then(
+      recordPublication(photoId, versionId, getPublicationMarker(id), url ?? null).then(
         () => {},
       ),
     listPublications: (photoId) => listPublications(photoId),
-    deletePublication: (id) => deletePublication(id),
+    deletePublication: (publicationId) => deletePublication(publicationId),
     // Identity comes from the closure, exactly as `recordPublication` above takes its
-    // marker from `mod.id` instead of letting a module pass a platform string. A module
-    // never handles its own id here, so it has nothing to forge: the permission lookup is
-    // keyed on the registry entry the host built, not on anything the caller supplies.
+    // marker from the module rather than letting it pass a platform string. A module never
+    // handles its own id here, so it has nothing to forge: the permission lookup is keyed
+    // on `reg.id`, captured when the host registered it.
     invoke: <T,>(command: string, args?: Record<string, unknown>): Promise<T> =>
-      permits(mod.id, command) ? invoke<T>(command, args) : refuseInvoke(mod.id, command),
+      permits(id, command) ? invoke<T>(command, args) : refuseInvoke(id, command),
     // Adapter over Tauri's `listen`: unwraps `event.payload` and returns a
     // contract-owned `Unsubscribe`, so no Tauri type reaches the module surface.
     onEvent: <T,>(event: string, handler: (payload: T) => void) =>
@@ -682,8 +702,8 @@ function apiFor(mod: ChairPhotoModule): ChairPhotoAPI {
             unlisten();
           },
       ),
-    getSetting: (key) => getSetting(`${mod.id}.${key}`),
-    setSetting: (key, value) => setSetting(`${mod.id}.${key}`, value),
+    getSetting: (key) => getSetting(`${id}.${key}`),
+    setSetting: (key, value) => setSetting(`${id}.${key}`, value),
     getEditRecord: async (photoId) => {
       const json = await getEditRecord(photoId);
       return json ? (JSON.parse(json) as EditRecord) : null;
@@ -734,10 +754,15 @@ export function register(
     permissions?: ModulePermissions;
   } = {},
 ) {
-  if (!modules.has(mod.id)) {
+  // Read `mod.id` exactly once. Every later use goes through the snapshot on the entry, so
+  // an accessor that changes its answer cannot make the map key and the identity the host
+  // enforces on disagree. See `Registered.id`.
+  const id = mod.id;
+  if (!modules.has(id)) {
     const external = opts.external ?? false;
-    modules.set(mod.id, {
+    modules.set(id, {
       module: mod,
+      id,
       enabled: false,
       external,
       minHostVersion: opts.minHostVersion ?? "",
@@ -967,7 +992,7 @@ export function enableModule(id: string, persist = true, seen = new Set<string>(
   // a clean disabled state and skip it — the rest of the loop, and notifyModuleSetChanged(),
   // still run.
   const loaded = callSafely(`[modules] "${id}" onLoad() threw; leaving it disabled:`, () =>
-    reg.module.onLoad(apiFor(reg.module)),
+    reg.module.onLoad(apiFor(reg)),
   );
   if (!loaded) {
     reg.enabled = false;
@@ -996,7 +1021,7 @@ export function disableModule(id: string, persist = true) {
   // Cascade: disable any enabled module that requires this one, so no dependent is
   // left orphaned (depth-first, before we tear this module down).
   for (const dep of dependentsOf(id)) {
-    disableModule(dep.module.id, false);
+    disableModule(dep.id, false);
     toast(`Disabled ${dep.module.name} (it requires ${reg.module.name})`);
   }
 
@@ -1025,7 +1050,7 @@ function persistEnabled() {
 
 /** Enabled module ids, topologically sorted so each module follows its requirements. */
 function enabledIdsInDepOrder(): string[] {
-  const enabled = [...modules.values()].filter((r) => r.enabled).map((r) => r.module.id);
+  const enabled = [...modules.values()].filter((r) => r.enabled).map((r) => r.id);
   const enabledSet = new Set(enabled);
   const out: string[] = [];
   const placed = new Set<string>();
@@ -1051,8 +1076,8 @@ export function setSelection(photos: Photo[], active: number | null) {
   activeId = active;
   for (const reg of modules.values()) {
     if (!reg.enabled) continue;
-    callSafely(`[modules] "${reg.module.id}" onPhotoSelected() threw:`, () =>
-      reg.module.onPhotoSelected?.(photos, apiFor(reg.module)),
+    callSafely(`[modules] "${reg.id}" onPhotoSelected() threw:`, () =>
+      reg.module.onPhotoSelected?.(photos, apiFor(reg)),
     );
   }
   selectionChannel.notify(); // let module panels (which read the active photo) re-render
@@ -1105,7 +1130,10 @@ export interface ModuleInfo {
 
 export function listModules(): ModuleInfo[] {
   return [...modules.values()].map((r) => ({
-    id: r.module.id,
+    // The captured id, not `r.module.id`: the Modules panel feeds this straight back into
+    // `grantPermissions(id)` / `enableModule(id)`, so a row that named a module other than
+    // the one it describes would record a grant against the wrong module.
+    id: r.id,
     name: r.module.name,
     version: r.module.version,
     description: r.module.description,
@@ -1121,9 +1149,9 @@ export function listModules(): ModuleInfo[] {
         satisfies(dep.module.version, req.version);
       return { id: req.id, name: dep?.module.name ?? req.id, version: req.version, met };
     }),
-    blockedReason: r.enabled ? null : unmetRequirement(r.module.id),
-    permissions: declaredPermissions(r.module.id),
-    pendingPermissions: pendingPermissions(r.module.id),
+    blockedReason: r.enabled ? null : unmetRequirement(r.id),
+    permissions: declaredPermissions(r.id),
+    pendingPermissions: pendingPermissions(r.id),
   }));
 }
 
@@ -1169,8 +1197,8 @@ export function activateToolbarAction(actionId: string) {
       // Outside the issue's original list (onLoad/onUnload/onPhotoSelected) but the same
       // category of untrusted, host-invoked callback — a throw here would otherwise
       // propagate straight into the React event handler that triggered the click.
-      callSafely(`[modules] "${reg.module.id}" toolbar action "${actionId}" onActivate() threw:`, () =>
-        action.onActivate?.(apiFor(reg.module)),
+      callSafely(`[modules] "${reg.id}" toolbar action "${actionId}" onActivate() threw:`, () =>
+        action.onActivate?.(apiFor(reg)),
       );
       return;
     }

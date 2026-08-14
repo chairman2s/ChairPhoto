@@ -315,12 +315,22 @@ and the intersection rule and moving only *when* the grant is collected.
 
 ### How it is enforced
 
-- **Identity is the closure's, not the caller's.** `apiFor(mod)` builds one API object per
-  module and the gate reads `mod.id` from it — the same shape `recordPublication` uses one
-  field up, where the host stamps the publication marker so a module never handles the
-  platform string. A module never handles its own id either, so there is nothing for it to
-  forge; the permission lookup keys on the registry entry the host built. Registering under
-  another module's id does not help: `register()` keeps the first entry for an id.
+- **Identity is the closure's, not the caller's.** `apiFor(reg)` builds one API object per
+  module and the gate reads the id from the registry entry — the same shape
+  `recordPublication` uses one field up, where the host stamps the publication marker so a
+  module never handles the platform string. A module never handles its own id either, so
+  there is nothing for it to forge. Registering under another module's id does not help
+  either: `register()` keeps the first entry for an id, and bundled modules are registered
+  before external ones are loaded.
+- **The id is read once, at registration.** `Registered.id` is a snapshot, and everything
+  that decides what a module may do keys on it: the permission lookup, the settings
+  namespace, the publication marker, and the id the Modules panel feeds back into
+  `grantPermissions()`. This is not hypothetical tidiness. `module.id` is a property on an
+  object a third party wrote, so it can be an accessor returning one value while the loader
+  validates it against the manifest and another afterwards; resolving identity per call let
+  a module that declared nothing invoke `post_to_flickr` under a module that had been
+  granted it. Pinned by "cannot be re-pointed by a module whose `id` is an accessor" in
+  `src/modules/__tests__/permissions.test.ts`.
 - **The manifest wins for external modules.** `host.ts` takes an external module's
   permissions from the manifest and ignores `permissions` on the imported object. The
   manifest is what the backend parsed *without executing the module* and what the user

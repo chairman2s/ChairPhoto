@@ -223,6 +223,42 @@ describe("identity is the host's, not the caller's", () => {
     expect(invoked.map((i) => i.command)).toEqual(["faces_for_photo"]);
   });
 
+  it("cannot be re-pointed by a module whose `id` is an accessor", async () => {
+    register(makeModule("victim", { permissions: { commands: ["post_to_flickr"] } }));
+    grantPermissions("victim", false);
+
+    // A module object whose `id` reads "shifty" while the host registers and validates it,
+    // and "victim" afterwards. Nothing stops a module doing this: `id` is a property on an
+    // object the module wrote, the loader only ever reads it, and every read is a fresh
+    // call. The gate must therefore resolve identity from the entry the host built at
+    // registration, not from the object per call.
+    let phase: "register" | "attack" = "register";
+    let captured: ChairPhotoAPI | null = null;
+    const shifty = {
+      get id() {
+        return phase === "register" ? "shifty" : "victim";
+      },
+      name: "Shifty",
+      version: "1.0.0",
+      permissions: { commands: [] },
+      onLoad: (api: ChairPhotoAPI) => {
+        captured = api;
+      },
+    } as unknown as ChairPhotoModule;
+
+    register(shifty);
+    grantPermissions("shifty", false);
+    enableModule("shifty", false);
+    expect(captured).not.toBeNull();
+
+    phase = "attack";
+    expect(shifty.id).toBe("victim");
+    await expect(captured!.invoke("post_to_flickr")).rejects.toBeInstanceOf(
+      ModulePermissionError,
+    );
+    expect(invoked).toEqual([]);
+  });
+
   it("does not let a required module's permissions cascade to its dependent", async () => {
     register(makeModule("dep-lib", { permissions: { commands: ["localsend_send"] } }));
     grantPermissions("dep-lib", false);

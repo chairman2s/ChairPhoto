@@ -105,6 +105,9 @@ interface ChairPhotoModule {
   id: string; name: string; version: string;
   // declares the Cargo feature its backend needs, if any (e.g. "ai").
   backendFeature?: string;
+  // declares the backend commands api.invoke() may reach. Bundled modules are NOT exempt;
+  // for an external module the manifest's copy wins and this one is ignored.
+  permissions?: { commands?: string[] };
   onLoad(api: ChairPhotoAPI): void;     // register contributions here
  onUnload?: void;
   onPhotoSelected?(photos: Photo[], api: ChairPhotoAPI): void;
@@ -121,7 +124,7 @@ interface ChairPhotoAPI {
  listTags: Promise<TagWithCount[]>;
   assignTag(photoId, tagId): Promise<void>;
   // backend
-  invoke<T>(command: string, args?): Promise<T>;     // gated to the module's feature
+  invoke<T>(command: string, args?): Promise<T>;     // only commands declared AND granted
   // module-scoped settings (namespaced in the settings table)
   getSetting(key): Promise<string | null>;
   setSetting(key, value): Promise<void>;
@@ -285,10 +288,12 @@ host/modules of a given version.
 ## External / third-party modules
 
 > The trust model below was approved by the owner
-> (2026-07-23). The manifest spec, install convention, and host-version compatibility
-> rules are in effect. `hostSatisfies` enforces the `minHostVersion` floor;
-> failures surface as a `blockedReason` in the Modules panel. Unit-tested in
-> `src/modules/__tests__/host.test.ts`.
+> (2026-07-23) and narrowed since: direct network egress is closed by the CSP (#47) and
+> `api.invoke` is gated per module (#48). The manifest spec, install convention, and
+> host-version compatibility rules are in effect. `hostSatisfies` enforces the
+> `minHostVersion` floor; failures surface as a `blockedReason` in the Modules panel.
+> Unit-tested in `src/modules/__tests__/host.test.ts`, with the permission gate in
+> `src/modules/__tests__/permissions.test.ts`.
 
 Everything above (the `ChairPhotoModule` contract, the host API, `requires`/version
 matching, plugin-owned tables) applies unchanged to external modules — an external module
@@ -298,50 +303,49 @@ model**, an on-disk **manifest**, an **install directory**, and **host-version c
 
 ### Trust model
 
-**Explicit user install ⇒ implicit trust** — the browser-extension model. When a user
-places a module in the install directory (below), they have granted it trust to run.
-There is no sandbox and no per-command permission prompt: **an installed module runs
-with the same full access as a bundled one**, including unrestricted `api.invoke(command,
-args)` to *any* backend Tauri command whose feature is compiled in — not only its own
-`backendFeature`. It executes in the app's WebView with the app's privileges; a malicious
-or buggy module can read/modify the catalog and drive file I/O through backend commands.
+**Explicit user install ⇒ implicit trust to run** — the browser-extension model. When a user
+places a module in the install directory (below), they have granted it trust to *load*. It
+executes in the app's WebView with the app's privileges, with no sandbox and no isolation
+from the rest of the app.
 
-**One exception, added later:** it can no longer reach the network *directly*. A
-Content-Security-Policy pins `connect-src` to the app's own origin and the Tauri IPC bridge,
-so `fetch`/`XHR`/`WebSocket`/`EventSource` from module code cannot reach an arbitrary origin.
-A module can still get to the network by invoking a network-capable backend command — the
-CSP closes the route that needed no backend command at all. See
-`docs/module-capabilities.md` § "The policy" for the exact directives and for what the
-policy does *not* stop (notably `img-src`).
+**What it may reach is no longer unrestricted.** Two limits were added after the model above
+was written, and they are the difference between "trusted to run" and "trusted with
+everything":
 
-This is a deliberate trade-off (get external modules working against the *existing*
-stable contract without first building a capability system), not a claim that it is safe.
-It is acceptable only because installation is an explicit, deliberate act by the machine's
-owner — the same reasoning browsers use for unpacked extensions.
+1. **No direct network access.** A Content-Security-Policy pins `connect-src` to the app's
+   own origin and the Tauri IPC bridge, so `fetch`/`XHR`/`WebSocket`/`EventSource` from
+   module code cannot reach an arbitrary origin. See `docs/module-capabilities.md`
+   § "The policy" for the exact directives and for what the policy does *not* stop (notably
+   `img-src`).
+2. **No undeclared backend commands.** `api.invoke` is gated per module: a command must be
+   listed in the module's manifest `permissions` **and** granted by the user when the module
+   was enabled. Anything else is refused — the promise rejects with a `ModulePermissionError`
+   and the user is told which module asked for what. So a module can still reach the network
+   by invoking a network-capable command, but only one it declared and the user approved. See
+   `docs/module-capabilities.md` § "Per-module permissions" for the enforcement rules and for
+   why review happens at enable time rather than at first use.
+
+What remains fully trusted is everything *outside* `api`: a module shares the page with the
+app, so this is a least-privilege boundary on the backend surface, not a sandbox.
 
 **Security caveats (must be surfaced to the user and honoured by us):**
 
-- Installed modules are **fully trusted code**. There is no isolation between a module and
-  the rest of the app. Treat installing a module as equivalent to running a program on your
-  machine.
+- Installed modules run **without isolation** from the rest of the app. Treat installing a
+  module as equivalent to running a program on your machine, even though its backend reach is
+  now bounded by what it declared.
 - **Recommend reading the source before installing.** External modules are plain JS/TS; the
-  install UI should tell the user to review a module's code (and its author/origin)
-  before dropping it in the modules directory, and warn that a module can invoke any
-  backend command.
+  install UI tells the user to review a module's code (and its author/origin) before dropping
+  it in the modules directory, and the permission list it declares is shown before the module
+  is ever enabled.
 - **No auto-install, no auto-update, no live FS watching.** Modules are discovered only at
   startup; adding one requires an explicit restart. We never fetch or update
   module code on the user's behalf. There is no marketplace.
-- "Nothing ever leaves home" still binds the *app's* behaviour. A fully-trusted module can no
-  longer open its own socket to an arbitrary origin (the CSP above), but it can still call
-  network-capable backend commands — another reason review-before-install matters.
-
-**A stronger mitigation, not implemented:** a **per-module invoke allowlist** — each
-module declares the backend commands (or capability groups) it needs, the host enforces
-that `api.invoke` only reaches allowlisted commands, and the user reviews/grants that set at
-install time (again browser-extension-style: "this module wants to: read the catalog, access
-the network"). This is the intended path to real least-privilege; it is not implemented.
-Were it added, the manifest would gain a `permissions` field and `api.invoke` would be gated
-per-module rather than per-compiled-feature.
+- "Nothing ever leaves home" still binds the *app's* behaviour. A module can no longer open
+  its own socket to an arbitrary origin (the CSP above), and can only call the
+  network-capable backend commands it declared and was granted.
+- **Updating a module can change what it asks for.** A module that grows its declared
+  permission set is refused and flagged for review again rather than inheriting the old
+  grant — see the intersection rule in `docs/module-capabilities.md`.
 
 ### Manifest — `chairphoto-module.json`
 
@@ -361,7 +365,13 @@ root of its install directory. It is JSON with these fields:
   "requires": [                      // optional. inter-module deps (same shape as ChairPhotoModule.requires)
     { "id": "localsend", "version": "^0.1.0" }
   ],
-  "minHostVersion": "0.1.0"          // required. lowest host (app) version this module supports
+  "minHostVersion": "0.1.0",         // required. lowest host (app) version this module supports
+  "permissions": {                   // optional. the backend surface this module may reach.
+    "commands": [                    //   omitted = none: api.invoke refuses everything.
+      "get_photo",                   //   exact command names; NO wildcards, so "*" grants
+      "get_photo_tags"               //   nothing but a command literally named "*".
+    ]
+  }
 }
 ```
 
@@ -370,6 +380,12 @@ root of its install directory. It is JSON with these fields:
   shape; a mismatched `id` is a load error). The manifest exists so the host can read
   identity/compat **without executing** the module (discovery) and so the Modules
   panel can list a module even when its `entrypoint` fails to load.
+- `permissions` is the one field where the manifest is **authoritative over the code**. The
+  host reads it here, without running the module, and shows it to the user before the module
+  is enabled; a `permissions` field on the exported `ChairPhotoModule` object is ignored for
+  an external module. Declaring is not granting — the user approves the list at enable time,
+  and `api.invoke` accepts only commands that are in both the declaration and the grant. See
+  `docs/module-capabilities.md` § "Per-module permissions".
 - `entrypoint` is resolved relative to the module directory and loaded via Tauri's
  `convertFileSrc` + dynamic `import`. Its default export must be a valid
   `ChairPhotoModule`.
@@ -427,8 +443,9 @@ the upper bound implicitly until the next major.
 - Dynamic Rust plugin loading (`.so`) — not planned; Cargo features instead. External
   modules are **frontend-only** JS loaded from disk; their backend, if any, must already
   be a compiled-in Cargo feature (`backendFeature`).
-- A **per-module invoke allowlist / capability system** (the long-term trust mitigation
-  above) — external modules run fully trusted.
+- A **sandbox**. The per-module invoke allowlist described under
+  [Trust model](#trust-model) bounds what a module can ask the *backend* for; it does not
+  isolate module code from the page it shares with the app.
 - A module marketplace, auto-update, and live filesystem watching of the install dir
   (discovery happens at startup only; the `requires` mechanism covers basic inter-module
   dependencies).

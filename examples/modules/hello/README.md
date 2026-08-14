@@ -70,6 +70,21 @@ listed in the Modules panel with the reason, but its code is never imported.
 
 `backendFeature` and `requires` are optional; `docs/plugin-system.md` documents both.
 
+`permissions` is optional and empty here on purpose: this module calls no backend command, so
+it asks for nothing, and `api.invoke` would refuse anything it tried. Everything it does use
+— `api.setSetting`, `api.getSelectedPhotos` — is part of the host API, which every module
+gets. Add a command to `permissions.commands` only when you actually call it:
+
+```jsonc
+"permissions": { "commands": ["get_photo", "get_photo_tags"] }
+```
+
+Names are matched exactly, so there is no wildcard to reach for. The user sees this list when
+they enable the module and has to approve it before the module runs at all; growing it later
+means being asked again. The manifest is what the host reads and what the user reviews — a
+`permissions` field on the exported module object is ignored. See
+`docs/module-capabilities.md` § "Per-module permissions".
+
 ## Failure modes
 
 A module that throws while importing, or whose default export is the wrong shape, is skipped

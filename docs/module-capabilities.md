@@ -9,10 +9,10 @@ description: "What a third-party module can do today, what stops it, and the cha
 gap between that contract and a module system a third party can actually build against, and
 the pieces of work that close it.
 
-Status: step 1 (the rendering ABI, #46), step 2 (the CSP lockdown, #47) and step 3
-(per-module permissions, #48) are implemented and are described in the past tense below.
-Step 4 — host-mediated capabilities such as `api.fetch` — is still design, and is marked as
-such.
+Status: all four steps are implemented and are described in the past tense below — the
+rendering ABI (#46), the CSP lockdown (#47), per-module permissions (#48), and the first
+host-mediated capability, `api.fetch` (#49). The capabilities beside `api.fetch` in
+[The capability set](#the-capability-set) — reading photo bytes in particular — are not.
 
 ## What already works
 
@@ -136,9 +136,11 @@ the real adapter, and drives `setSelection()` to prove the repaint.
 
 ## Blocker 2 — a module cannot reach a capability the host lacks
 
-A module composes commands that already exist. There are no generic primitives — no HTTP
-command, no file-bytes read. A module that wants to talk to a service ChairPhoto has never
-heard of has no route to it, and would need a Rust backend compiled into the app.
+A module composed commands that already existed. There were no generic primitives — no HTTP
+command, no file-bytes read — so a module that wanted to talk to a service ChairPhoto had
+never heard of had no route to it, and would have needed a Rust backend compiled into the app.
+The HTTP half of that is now closed by [`api.fetch`](#host-mediated-apifetch-49); the
+file-bytes half is not.
 
 That is why Flickr and SmugMug are bundled rather than external. Flickr is ~1500 lines of Rust
 (OAuth 1.0a signing, multipart upload, REST calls) and ~570 lines of TSX. Its Rust half cannot
@@ -172,8 +174,8 @@ Together the two facts supply the design. Close the direct route, then mediate i
 CSP: connect-src 'self' ipc:      direct fetch() is blocked          — done
 manifest "permissions": {...}     declared per module                — done
 host gates api.invoke per module  least privilege, enforceable because api is the only route
-api.fetch(url, init)              proxied through Rust, so CORS does not apply either
-host gates api.fetch per module   the same gate, extended to the network capability
+api.fetch(url, init)              proxied through Rust, so CORS does not apply either — done
+host gates api.fetch per module   the same gate, extended to the network capability — done
 ```
 
 Locking the door is what makes selling keys meaningful. Without the CSP the permission list is
@@ -239,14 +241,18 @@ registers, related to it or not. It is now gated on two things at once.
 
 ```jsonc
 "permissions": {
-  "commands": ["faces_for_photo", "faces_accept"]
+  "commands": ["faces_for_photo", "faces_accept"],
+  "origins": ["https://api.flickr.com"]
 }
 ```
 
-A struct rather than the flat string list this document originally sketched, so step 4 can
-add host-scoped network access as a sibling field without breaking manifests already on
-disk. Matching is exact string equality — there are no wildcards, so `"*"` is permission to
-invoke a command literally named `*`.
+A struct rather than the flat string list this document originally sketched, which is what
+let step 4 add `origins` beside `commands` without breaking manifests already on disk: a
+pre-#49 manifest parses unchanged and declares no origins, i.e. reaches nothing. Matching in
+both lists is exact string equality — there are no wildcards, so `"*"` is permission to
+invoke a command literally named `*`. `origins` is documented under
+[Host-mediated `api.fetch`](#host-mediated-apifetch-49); everything below about declaring,
+granting, intersection and review applies to both fields at once.
 
 **Granted** comes from the user, at the moment they enable the module, and is persisted
 under the `modules.permissions` setting.
@@ -372,10 +378,12 @@ command is a permission the user was asked to approve for nothing.
   `import` from `modules/api.ts` directly, so for them the declaration documents their
   backend surface and exercises the gate; it does not confine them. The confinement is real
   for external modules, which reach the backend only through the injected `ChairPhotoAPI`.
-- **The curated host API is not gated.** `listTags`, `assignTag`, `getSetting`,
+- **The rest of the curated host API is not gated.** `listTags`, `assignTag`, `getSetting`,
   `getEditRecord`, `renderEdit` and the rest of `ChairPhotoAPI` are the host's own surface,
   deliberately available to every module. The permission list covers the *module-owned*
-  command surface — the part that was a raw pass-through.
+  command surface — the part that was a raw pass-through — plus `api.fetch`, which is gated by
+  `permissions.origins` because it is a route off the machine rather than a curated operation
+  on the user's own catalog.
 - **`api.onEvent` is not gated.** A module can subscribe to any backend event. Events carry
   payloads but take no arguments and cause no action, so this is a read channel, not a
   capability. Gating it would want a second manifest field and is not part of #48.
@@ -388,12 +396,16 @@ Enough for the modules that exist to have been written as JavaScript:
 
 | Capability | Needed by | Notes |
 |---|---|---|
-| `api.fetch` | flickr, smugmug, map | Host-proxied; sidesteps CORS, which is why Flickr's upload had to be Rust |
-| read photo/export bytes | flickr, smugmug | Scoped to catalog roots and export outputs; never arbitrary paths |
+| `api.fetch` | flickr, smugmug, map | **Exists** (#49) — host-proxied, so CORS does not apply. See [Host-mediated `api.fetch`](#host-mediated-apifetch-49) |
+| read photo/export bytes | flickr, smugmug | Not built. Would be scoped to catalog roots and export outputs; never arbitrary paths |
 | plugin storage | all | Exists — namespaced settings plus `<id>__*` tables |
 | crypto | flickr, smugmug | Exists — WebCrypto does HMAC-SHA1 |
 
-`api.fetch` is the dangerous one and should be scoped by host, not granted wholesale.
+`api.fetch` was the dangerous one, and it is scoped by origin rather than granted wholesale.
+Without "read photo bytes" the set is still short of what a JavaScript Flickr would need: a
+module can talk to Flickr's API but cannot obtain a photo's bytes to upload, and `api.fetch`
+takes a text body only. That is a deliberate stopping point, not an oversight — see
+[What #49 does not do](#what-49-does-not-do).
 
 ### What this does not reach
 
@@ -414,6 +426,161 @@ JavaScript and orchestrate rather than implement. That is the VS Code shape, and
 cheaper, but it means the core stays capability-rich even though its user-facing surface is
 just the grid and tagging.
 
+## Host-mediated `api.fetch` (#49)
+
+Step 4, and the first capability granted through the machinery step 3 built. A module that
+needs to talk to a service ChairPhoto has never heard of now can:
+
+```ts
+if (!api.fetch) return;                       // optional member; absent on older hosts
+const res = await api.fetch("https://api.flickr.com/services/rest?method=…", {
+  method: "POST",
+  headers: { Authorization: "OAuth …" },
+  body: "…",
+});
+```
+
+The request is made **by Rust** (`src-tauri/src/commands/net.rs`), which is what makes it
+possible at all: `connect-src` (see [The policy](#the-policy)) stops module code opening its
+own socket, and going through the host also means CORS never applies, because the request no
+longer originates in a browsing context. That was the specific thing that forced Flickr's
+upload into Rust in the first place.
+
+### Destinations are per module, and the unit is the origin
+
+`permissions.origins` is a list of full origins — `https://host` or `https://host:port` —
+matched exactly after normalisation (lower-cased scheme and host, IDN punycoded, default port
+dropped). It is not a "network: yes" switch, and it is not a host list either.
+
+**Why the origin and not the host.** A host-granularity grant for `api.flickr.com` would also
+be spendable on `http://api.flickr.com`: the same destination with the transport security
+removed, so the data the user meant for Flickr also reaches everyone on the network path. The
+scheme has to be part of the grant. The port comes along for the same reason it does in every
+other same-origin decision on the web — `https://host:8443` is a different service.
+
+**Why not a path prefix, which sounds tighter.** It is not a boundary. The path space is the
+server's to define, any API worth granting has enough surface under one prefix to do whatever
+the origin allows, a prefix breaks the moment the service adds an endpoint, and the pressure
+that creates is to write `/` and be done. What actually decides whether data leaves for
+somewhere the user did not agree to is *which machine receives it* — which is exactly what an
+origin names, and nothing more. This document previously asked for scoping "by host"; an
+origin is that plus the scheme and port qualifiers, so it is strictly tighter than what was
+asked for.
+
+**No wildcards.** `https://*.example.com` covers hosts that do not exist yet and can be
+created at will by whoever runs the domain. Note that `new URL` parses that string quite
+happily — `*` is not a forbidden host code point — so a declared origin also has to pass a
+host-shape check, or a wildcard would read as a wildcard grant in the review dialog while
+actually naming a host that cannot exist. A declaration carrying a path, query, fragment,
+credentials, a trailing dot, or a non-`https` scheme is dropped on the fail-closed principle
+step 3 established: junk narrows a declaration, it never widens one.
+
+### What the grant authorises — say it plainly
+
+**A granted origin is permission to send that origin arbitrary data.** `api.fetch` takes a
+method, headers and a body; a module that can read photos or catalog rows through its other
+granted commands can put them in that body. This is not a leak in the proxy, it is what the
+capability *is*, and pretending otherwise would be the actual privacy failure. So:
+
+- The permission is the opt-in the binding invariant requires, and it is
+  feature-specific in the way that matters — it names the destination.
+- The review dialog says the module "can **send data to**" each destination, and spells out
+  that whatever it can read it can send there. A dialog reading "can connect to" would
+  describe half the decision.
+- The declared origins stay visible in the module's row in Preferences → Modules, granted or
+  not, so the decision remains inspectable long after it was made.
+- Network origins are **never grandfathered**. Command grandfathering is safe because before
+  the gate an enabled module's `api.invoke` reached any command at all, so recording its
+  declaration narrows it. The reverse holds here: before #49 no module could reach the network
+  through the host, so writing origins into a grandfathered grant would manufacture consent to
+  send data off the machine. A module upgraded across both changes keeps its commands and is
+  sent through review for its origins.
+
+### The invariants Rust holds regardless
+
+The per-module allowlist lives in `src/modules/host.ts`, because the frontend host is the only
+layer that knows *which* module is calling — the same boundary, with the same limits, as the
+`api.invoke` gate. `commands/net.rs` separately enforces what any request from this app may
+do, and no grant lifts these:
+
+| Invariant | What it stops |
+|---|---|
+| `https:` only | A cleartext route to a granted host. |
+| **No redirects followed** | The obvious bypass: a permitted host answering `302` to a non-permitted one. |
+| Public unicast addresses only | A grant for `example.com` becoming a route to `127.0.0.1`, the LAN, or `169.254.169.254`. |
+| The vetted addresses are the ones dialled | A second DNS answer rebinding the connection after the check. |
+| No proxies | The vetting describing a host that is not the one contacted. |
+| No cookie jar | Ambient authority — the thing that turns a fetch proxy into a confused deputy. |
+| 8 MiB each way, 30 s | A module wedging the process or exhausting memory. |
+| Method + header allowlists | `CONNECT`/`TRACE`, and request smuggling via module-set framing headers. |
+
+Two of those are worth their own paragraph.
+
+**Redirects.** They are not followed at all. A `3xx` comes back to the module as an ordinary
+result with its `location` header intact, and the module may call `api.fetch` again with that
+URL — which re-enters the origin gate like any other call. Following-with-a-recheck was the
+alternative, and it is more machinery for a worse guarantee: every hop needs the origin check
+*and* re-resolution *and* a hop limit, and it still has to decide what happens to the request
+body and `Authorization` header on a cross-origin `307`, where the browser's answer is to
+replay them. Making the module ask again keeps every hop inside its grant, and keeps it
+visible.
+
+**Local and private addresses.** The host is resolved before the request and *every* answer
+must be a public unicast address — one loopback, private, carrier-NAT, link-local,
+documentation, benchmarking, multicast or reserved answer refuses the whole request rather
+than picking the good one, because a name resolving to both is either broken or attacking.
+IPv6 forms that wrap an IPv4 address (v4-mapped, 6to4, NAT64) are judged on the address
+inside, or `::ffff:127.0.0.1` walks straight through; the same unwrapping keeps DNS64 networks
+working, since refusing `64:ff9b::/96` outright would break IPv6-only hosts reaching ordinary
+sites. The connection is then pinned to the vetted addresses, so the resolver cannot answer
+differently the second time. Certificate validation still uses the hostname, so pinning
+weakens nothing about TLS.
+
+### What the module sees of the response
+
+Status, canonical status text, `ok`, the requested URL, the headers, and the body as text.
+
+- **`set-cookie` is withheld.** The proxy keeps no cookie jar — `reqwest` is built without the
+  `cookies` feature at all — so a cookie cannot be honoured by the host; handing the raw
+  credential to module code, which runs unsandboxed in the app's page, would widen things for
+  nothing. A module that needs authenticated calls sends its own `Authorization` header, whose
+  value it already had. Cookie-session APIs are therefore not usable through `api.fetch`; that
+  is a refusal, not an omission.
+- **The body is text.** A response that is not valid UTF-8 is an error rather than lossily
+  mangled text. This proxy is for JSON/XML/form-encoded protocols; binary responses are not
+  supported.
+
+### The one place the two halves meet
+
+The host passes the origin it approved alongside the WHATWG-normalised URL, and `net.rs`
+re-derives the origin with its own parser and refuses a mismatch. That is not circular
+reasoning about a caller-supplied value: it catches a URL that the browser's parser and Rust's
+read differently, which is otherwise a way to be granted one origin and reach another. What it
+is *not* is a second trust boundary — see below.
+
+### What #49 does not do
+
+- **It is not a sandbox, and the origin gate is not enforced against a module that forges
+  IPC.** Module code shares the page with the app; `docs/plugin-system.md` § "Trust model" has
+  always said so. The origin allowlist is a host-side policy in the webview, exactly like the
+  `api.invoke` gate and exactly like the CSP, and all three are least-privilege boundaries over
+  the *designed* path rather than isolation. Passing the module's allowlist down to Rust and
+  calling that enforcement would be theatre — the caller would be supplying the list it is
+  checked against. The honest split is the one implemented: identity policy where identity is
+  known, transport invariants where they can be held unconditionally.
+- **No binary request bodies, so no photo upload.** `body` is text. Combined with the fact
+  that "read photo bytes" is a separate capability that does not exist, a JavaScript Flickr is
+  still not writable: a module can drive Flickr's REST API but cannot obtain or send a photo
+  file. Both halves would have to land together to be worth anything, and the second one wants
+  its own scoping design (catalog roots and export outputs, never arbitrary paths).
+- **No proxy support.** A user behind a corporate HTTP proxy cannot use `api.fetch` at all,
+  because honouring the proxy would mean the address vetting above describes a host that is
+  never contacted. Refused rather than half-supported.
+- **`img-src` egress is still open**, unchanged from #47: a module can encode data in a URL
+  and set it as an image source on any `https:` host. That residual channel is why `api.fetch`
+  being tightly scoped is a real improvement and not a complete one.
+- **No streaming, no WebSocket, no `EventSource`.** One request, one buffered response.
+
 ## Order
 
 1. ~~**Blocker 1**, in isolation. Modules can render; nothing about the security model
@@ -423,13 +590,15 @@ just the grid and tagging.
    Done — see [The policy](#the-policy).
 3. ~~**Per-module permissions** — manifest field, host enforcement in `api.invoke`, review
    surfaced at enable time.~~ Done — see
-   [Per-module permissions](#per-module-permissions). `api.fetch` does not exist yet, so
-   there is nothing there to gate; the gate it will use is built.
-4. **Capabilities**, one at a time, each gated by 3. `api.fetch` is #49.
+   [Per-module permissions](#per-module-permissions).
+4. ~~**Capabilities**, one at a time, each gated by 3. `api.fetch` is #49.~~ `api.fetch` is
+   done — see [Host-mediated `api.fetch`](#host-mediated-apifetch-49). The next capability in
+   [the set](#the-capability-set), reading photo/export bytes, is not filed.
 
-Steps 2–4 are one unit in practice: shipping a generic fetch primitive without the permission
-gate would widen the hole this is meant to close. Step 2 shipped on its own because it is only
-ever harder later, and because it stands alone: it needs no new machinery and grants nothing.
+Steps 2–4 were one unit in practice: shipping a generic fetch primitive without the permission
+gate would have widened the hole this is meant to close. Step 2 shipped on its own because it
+is only ever harder later, and because it stands alone: it needs no new machinery and grants
+nothing.
 
 ## Open questions
 

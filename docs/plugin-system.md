@@ -105,9 +105,10 @@ interface ChairPhotoModule {
   id: string; name: string; version: string;
   // declares the Cargo feature its backend needs, if any (e.g. "ai").
   backendFeature?: string;
-  // declares the backend commands api.invoke() may reach. Bundled modules are NOT exempt;
-  // for an external module the manifest's copy wins and this one is ignored.
-  permissions?: { commands?: string[] };
+  // declares the backend commands api.invoke() may reach and the origins api.fetch() may
+  // reach. Bundled modules are NOT exempt; for an external module the manifest's copy wins
+  // and this one is ignored.
+  permissions?: { commands?: string[]; origins?: string[] };
   onLoad(api: ChairPhotoAPI): void;     // register contributions here
  onUnload?: void;
   onPhotoSelected?(photos: Photo[], api: ChairPhotoAPI): void;
@@ -125,6 +126,8 @@ interface ChairPhotoAPI {
   assignTag(photoId, tagId): Promise<void>;
   // backend
   invoke<T>(command: string, args?): Promise<T>;     // only commands declared AND granted
+  // network, proxied through Rust — only origins declared AND granted (optional member)
+  fetch?(url: string, init?): Promise<ModuleFetchResponse>;
   // module-scoped settings (namespaced in the settings table)
   getSetting(key): Promise<string | null>;
   setSetting(key, value): Promise<void>;
@@ -288,12 +291,14 @@ host/modules of a given version.
 ## External / third-party modules
 
 > The trust model below was approved by the owner
-> (2026-07-23) and narrowed since: direct network egress is closed by the CSP (#47) and
-> `api.invoke` is gated per module (#48). The manifest spec, install convention, and
+> (2026-07-23) and narrowed since: direct network egress is closed by the CSP (#47),
+> `api.invoke` is gated per module (#48), and the mediated network route `api.fetch` is gated
+> per module by declared origins (#49). The manifest spec, install convention, and
 > host-version compatibility rules are in effect. `hostSatisfies` enforces the
 > `minHostVersion` floor; failures surface as a `blockedReason` in the Modules panel.
-> Unit-tested in `src/modules/__tests__/host.test.ts`, with the permission gate in
-> `src/modules/__tests__/permissions.test.ts`.
+> Unit-tested in `src/modules/__tests__/host.test.ts`, with the permission gates in
+> `src/modules/__tests__/permissions.test.ts` and
+> `src/modules/__tests__/moduleFetch.test.ts`.
 
 Everything above (the `ChairPhotoModule` contract, the host API, `requires`/version
 matching, plugin-owned tables) applies unchanged to external modules — an external module
@@ -324,6 +329,13 @@ everything":
    by invoking a network-capable command, but only one it declared and the user approved. See
    `docs/module-capabilities.md` § "Per-module permissions" for the enforcement rules and for
    why review happens at enable time rather than at first use.
+3. **No undeclared network destinations.** `api.fetch` is the mediated route back: one HTTPS
+   request made by Rust, to an origin listed in `permissions.origins` **and** granted at
+   enable time. Anything else rejects with a `ModuleNetworkPermissionError` and toasts the
+   user. The scope is the origin — scheme, host and port — with no wildcards; redirects are
+   not followed, only public unicast addresses are reachable, and there is no cookie jar. A
+   granted origin is permission to **send** that origin arbitrary data, which is what the
+   review dialog says. See `docs/module-capabilities.md` § "Host-mediated `api.fetch`".
 
 What remains fully trusted is everything *outside* `api`: a module shares the page with the
 app, so this is a least-privilege boundary on the backend surface, not a sandbox.
@@ -341,8 +353,10 @@ app, so this is a least-privilege boundary on the backend surface, not a sandbox
   startup; adding one requires an explicit restart. We never fetch or update
   module code on the user's behalf. There is no marketplace.
 - "Nothing ever leaves home" still binds the *app's* behaviour. A module can no longer open
-  its own socket to an arbitrary origin (the CSP above), and can only call the
-  network-capable backend commands it declared and was granted.
+  its own socket to an arbitrary origin (the CSP above), can only call the network-capable
+  backend commands it declared and was granted, and can only `api.fetch` the origins it
+  declared and was granted. Approving an origin is approving that the module may **send data
+  to it** — the feature-specific opt-in the privacy invariant asks for.
 - **Updating a module can change what it asks for.** A module that grows its declared
   permission set is refused and flagged for review again rather than inheriting the old
   grant — see the intersection rule in `docs/module-capabilities.md`.
@@ -366,11 +380,14 @@ root of its install directory. It is JSON with these fields:
     { "id": "localsend", "version": "^0.1.0" }
   ],
   "minHostVersion": "0.1.0",         // required. lowest host (app) version this module supports
-  "permissions": {                   // optional. the backend surface this module may reach.
+  "permissions": {                   // optional. the surface this module may reach.
     "commands": [                    //   omitted = none: api.invoke refuses everything.
       "get_photo",                   //   exact command names; NO wildcards, so "*" grants
       "get_photo_tags"               //   nothing but a command literally named "*".
-    ]
+    ],
+    "origins": [                     //   omitted = none: api.fetch refuses everything.
+      "https://api.flickr.com"       //   full https origins, matched exactly after
+    ]                                //   normalisation. NO wildcards, no paths, no http.
   }
 }
 ```
@@ -383,9 +400,11 @@ root of its install directory. It is JSON with these fields:
 - `permissions` is the one field where the manifest is **authoritative over the code**. The
   host reads it here, without running the module, and shows it to the user before the module
   is enabled; a `permissions` field on the exported `ChairPhotoModule` object is ignored for
-  an external module. Declaring is not granting — the user approves the list at enable time,
-  and `api.invoke` accepts only commands that are in both the declaration and the grant. See
-  `docs/module-capabilities.md` § "Per-module permissions".
+  an external module. Declaring is not granting — the user approves the lists at enable time,
+  and `api.invoke`/`api.fetch` accept only what is in both the declaration and the grant. An
+  entry either side does not understand is dropped rather than honoured, so a malformed
+  declaration always yields a module that can do *less*. See
+  `docs/module-capabilities.md` § "Per-module permissions" and § "Host-mediated `api.fetch`".
 - `entrypoint` is resolved relative to the module directory and loaded via Tauri's
  `convertFileSrc` + dynamic `import`. Its default export must be a valid
   `ChairPhotoModule`.
@@ -443,9 +462,14 @@ the upper bound implicitly until the next major.
 - Dynamic Rust plugin loading (`.so`) — not planned; Cargo features instead. External
   modules are **frontend-only** JS loaded from disk; their backend, if any, must already
   be a compiled-in Cargo feature (`backendFeature`).
-- A **sandbox**. The per-module invoke allowlist described under
-  [Trust model](#trust-model) bounds what a module can ask the *backend* for; it does not
-  isolate module code from the page it shares with the app.
+- A **sandbox**. The per-module invoke and origin allowlists described under
+  [Trust model](#trust-model) bound what a module can ask the *backend* for and where it can
+  send data; they do not isolate module code from the page it shares with the app.
+- **General-purpose networking.** `api.fetch` is one buffered HTTPS request at a time: no
+  streaming, no WebSocket, no `EventSource`, no redirect following, no proxy support, and a
+  text-only body — so a module cannot upload a photo file through it. Reading photo bytes is a
+  separate capability that does not exist; see
+  `docs/module-capabilities.md` § "What #49 does not do".
 - A module marketplace, auto-update, and live filesystem watching of the install dir
   (discovery happens at startup only; the `requires` mechanism covers basic inter-module
   dependencies).

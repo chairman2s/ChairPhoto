@@ -312,22 +312,78 @@ pub fn read_gps(photo_path: &Path) -> Option<(f64, f64)> {
     Some((lat, lng))
 }
 
+/// Split an absolute (unsigned, unrefed) decimal degree into a whole-degree/minutes DMS
+/// pair, rounding the minutes to the same six decimal places `decimal_to_dms_lat`/
+/// `decimal_to_dms_lng` format them to, and carrying into the degree when that rounding
+/// lands exactly on 60 minutes.
+///
+/// The carry decision is made by formatting the minutes with `{:.6}` and comparing the
+/// *string* to `"60.000000"`, not by separately rounding the `f64` and trusting it to
+/// agree with what `{:.6}` would later print. Two independent roundings (one hand-rolled,
+/// one done by the formatter) can disagree at the ULP level — that mismatch is exactly how
+/// this bug class survives a naive fix. Reusing the formatter's own output as the carry
+/// test makes disagreement impossible: there is only one rounding, done once.
+///
+/// A carry into 60, 90, or 180 whole degrees is a legitimate DMS value (a pole for
+/// latitude, the antimeridian for longitude) and is returned as-is — see the doc comments
+/// on `decimal_to_dms_lat`/`decimal_to_dms_lng` for why no special-casing is needed there.
+/// This function does not validate that `deg_abs` is within the 0..=90 / 0..=180 range
+/// coordinates normally occupy; an out-of-range input (or one that carries past it, e.g.
+/// 89.9999995 rounding through 90 becoming 90,0.0) is passed straight through. Range
+/// validation, if wanted, belongs in the caller — see the module-level doc comments below.
+fn dms_round_and_carry(deg_abs: f64) -> (u32, String) {
+    let d = deg_abs.trunc() as u32;
+    let m = (deg_abs - d as f64) * 60.0;
+    let m_str = format!("{m:.6}");
+    if m_str == "60.000000" {
+        (d + 1, "0.000000".to_string())
+    } else {
+        (d, m_str)
+    }
+}
+
 /// Convert a decimal-degree latitude to XMP EXIF DMS+ref format: `"DD,MM.SSSS[N|S]"`.
+///
+/// Rounding the minutes to six decimal places can land exactly on `60.000000` for a
+/// latitude a few ULPs below a whole degree (e.g. `45.99999999999999289457`); see
+/// `dms_round_and_carry` for how that's rounded once and carried into the degree so the
+/// output is never `"45,60.000000N"`.
+///
+/// A carry that reaches 90 degrees is a legitimate result: 90°N/90°S is the pole, a real,
+/// representable point, and `"90,0.000000N"` is a well-formed DMS string for it — no
+/// different in kind from any other carry, so it needs no special case. This function does
+/// not validate or clamp its input: a latitude magnitude above 90 (whether given directly
+/// or reached by carrying, e.g. an input already at 90.9999995) is passed through
+/// unchecked. Nothing upstream (`write_gps`, `plugins/map/mod.rs::set_photo_gps`) validates
+/// latitude range either, so enforcing it here would be new, unrequested scope rather than
+/// a rollover fix; a caller that needs a validated coordinate must check it before calling.
 pub fn decimal_to_dms_lat(deg: f64) -> String {
     let hemi = if deg >= 0.0 { 'N' } else { 'S' };
-    let abs = deg.abs();
-    let d = abs.trunc() as u32;
-    let m = (abs - d as f64) * 60.0;
-    format!("{},{:.6}{}", d, m, hemi)
+    let (d, m_str) = dms_round_and_carry(deg.abs());
+    format!("{d},{m_str}{hemi}")
 }
 
 /// Convert a decimal-degree longitude to XMP EXIF DMS+ref format: `"DDD,MM.SSSS[E|W]"`.
+///
+/// Rounding the minutes to six decimal places can land exactly on `60.000000` for a
+/// longitude a few ULPs below a whole degree; see `dms_round_and_carry` for how that's
+/// rounded once and carried into the degree so the output is never e.g.
+/// `"45,60.000000E"`.
+///
+/// A carry that reaches 180 degrees is a legitimate result: the antimeridian is a real
+/// meridian, and `"180,0.000000E"` is a well-formed DMS string for a point on it. This
+/// function keeps whatever hemisphere letter the *input's sign* implies (`>= 0.0` is `E`,
+/// negative is `W`) rather than picking one for the antimeridian itself — +180 and -180
+/// name the same meridian, conventions differ on which letter belongs there, and this
+/// function has no basis to prefer one over the other that the caller doesn't already have
+/// via the sign it passed in. This function does not validate or clamp its input: a
+/// longitude magnitude above 180 (whether given directly or reached by carrying) is passed
+/// through unchecked, for the same reason given on `decimal_to_dms_lat` — no caller
+/// upstream validates range, so adding it here would be new, unrequested scope.
 pub fn decimal_to_dms_lng(deg: f64) -> String {
     let hemi = if deg >= 0.0 { 'E' } else { 'W' };
-    let abs = deg.abs();
-    let d = abs.trunc() as u32;
-    let m = (abs - d as f64) * 60.0;
-    format!("{},{:.6}{}", d, m, hemi)
+    let (d, m_str) = dms_round_and_carry(deg.abs());
+    format!("{d},{m_str}{hemi}")
 }
 
 /// Parse an XMP EXIF DMS+ref string (e.g. `"59,23.456N"` or `"10,45.678E"`) back to
@@ -1587,5 +1643,89 @@ mod tests {
         assert!(!xmp.contains("Old|Path"), "old hierarchical keyword should be replaced, not duplicated");
         assert_eq!(xmp.matches("dc:subject").count(), 2, "one open + one close tag only");
         assert_eq!(xmp.matches("lr:hierarchicalSubject").count(), 2, "one open + one close tag only");
+    }
+
+    // ── decimal_to_dms_lat / decimal_to_dms_lng minute rollover (issue #65) ────────────
+    //
+    // `decimal_to_dms_lat(45.99999999999999289457)` used to format as `"45,60.000000N"`:
+    // the degree is taken by `trunc()` before the minutes are rounded by `{:.6}`, so a
+    // value a few ULPs below a whole degree rounded its minutes up to 60 with no path back
+    // to the degree. Sixty minutes is one degree, so that string was malformed, not merely
+    // imprecise. These pin the carry directly, plus the poles/antimeridian decision, plus
+    // that #62's pins (asserted above, in the write_gps block) are unaffected.
+
+    /// The exact repro from issue #65: a latitude a few ULPs below 46 degrees must carry,
+    /// not emit `60.000000` minutes.
+    #[test]
+    fn decimal_to_dms_lat_carries_minutes_into_degree() {
+        assert_eq!(decimal_to_dms_lat(45.99999999999999289457), "46,0.000000N");
+    }
+
+    /// The longitude twin of the carry case: `decimal_to_dms_lng` has the identical
+    /// trunc-before-round shape and needs its own coverage, not just its sibling's.
+    #[test]
+    fn decimal_to_dms_lng_carries_minutes_into_degree() {
+        assert_eq!(decimal_to_dms_lng(45.99999999999999289457), "46,0.000000E");
+    }
+
+    /// A carry in the southern hemisphere must still carry the degree, and must not flip
+    /// or drop the hemisphere letter while doing it.
+    #[test]
+    fn decimal_to_dms_lat_carries_in_southern_hemisphere() {
+        assert_eq!(decimal_to_dms_lat(-45.99999999999999289457), "46,0.000000S");
+    }
+
+    /// A carry in the western hemisphere must still carry the degree, and must not flip
+    /// or drop the hemisphere letter while doing it.
+    #[test]
+    fn decimal_to_dms_lng_carries_in_western_hemisphere() {
+        assert_eq!(decimal_to_dms_lng(-45.99999999999999289457), "46,0.000000W");
+    }
+
+    /// A latitude a few ULPs below 90 must carry cleanly into the pole: 90°N is a real,
+    /// representable point, so `"90,0.000000N"` is the correct output, not a value to
+    /// reject or clamp away from.
+    #[test]
+    fn decimal_to_dms_lat_carries_into_north_pole() {
+        assert_eq!(decimal_to_dms_lat(89.99999999999999289457), "90,0.000000N");
+    }
+
+    /// Same carry, southern pole: must land on `S`, not `N`.
+    #[test]
+    fn decimal_to_dms_lat_carries_into_south_pole() {
+        assert_eq!(decimal_to_dms_lat(-89.99999999999999289457), "90,0.000000S");
+    }
+
+    /// A longitude a few ULPs below 180 must carry cleanly onto the antimeridian.
+    /// `decimal_to_dms_lng` keeps whatever hemisphere the input's sign implied — `E` for a
+    /// non-negative input — rather than special-casing 180 to a fixed letter.
+    ///
+    /// `179.99999999999997` is the literal used deliberately: the ULP near 180 is coarser
+    /// than near 46 or 90, so the naive next-most-precise literal
+    /// (`179.99999999999999289457`, following the same digit pattern as the lat/45 and
+    /// lat/90 cases) actually parses to exactly `180.0_f64` — it would exercise the
+    /// "already at the boundary" path, not the carry, and would pass even against the
+    /// un-fixed code. This value is `f64::from_bits(180.0_f64.to_bits() - 1)`, confirmed
+    /// by bit-walk to be the largest `f64` strictly less than 180.0, so the un-fixed code
+    /// truncates it to `179,60.000000E`.
+    #[test]
+    fn decimal_to_dms_lng_carries_into_antimeridian_east() {
+        assert_eq!(decimal_to_dms_lng(179.99999999999997), "180,0.000000E");
+    }
+
+    /// Same carry from the negative side: keeps `W`, matching the input's sign.
+    #[test]
+    fn decimal_to_dms_lng_carries_into_antimeridian_west() {
+        assert_eq!(decimal_to_dms_lng(-179.99999999999997), "180,0.000000W");
+    }
+
+    /// #62's awkward-rounding pin, re-asserted directly against the conversion functions
+    /// (not just via `write_gps`'s sidecar text): `(0.1 * 60)` lands on
+    /// `5.999999999999978`, which must still round to a clean `"6.000000"` and must NOT be
+    /// mistaken for a carry by the new rollover logic. This is the case #65 warns a naive
+    /// fix could regress.
+    #[test]
+    fn decimal_to_dms_lat_awkward_rounding_does_not_spuriously_carry() {
+        assert_eq!(decimal_to_dms_lat(10.1), "10,6.000000N");
     }
 }

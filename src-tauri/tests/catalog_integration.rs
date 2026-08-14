@@ -2,7 +2,10 @@
 //! invariants from AGENTS.md: UUID assignment, relative-path storage,
 //! hierarchical tags, and culling.
 
-use chairphoto_lib::catalog::{Catalog, LocationRole, PickState, StorageStatus, VolumeKind};
+use chairphoto_lib::catalog::{
+    Catalog, CullingFilter, LocationRole, PhotoQuery, PhotoSort, PhotoWindow, PickState,
+    StorageStatus, StorageTier, VolumeKind,
+};
 use chairphoto_lib::catalog::PathCandidate;
 use std::path::PathBuf;
 
@@ -141,7 +144,7 @@ fn scan_external_indexes_nas_photos_in_place() {
     // It's catalogued as NAS-only: shows under the "nas" tier, resolves to the NAS file,
     // status Archived, and is NOT under "local".
     let nas_ids: Vec<i64> = catalog
-        .list_photos(None, None, None, &[], "all", None, "nas", None, None, &[], None)
+        .list_photos(&PhotoQuery { storage_tier: StorageTier::Nas, ..Default::default() })
         .unwrap()
         .into_iter()
         .map(|p| p.id)
@@ -151,14 +154,14 @@ fn scan_external_indexes_nas_photos_in_place() {
     assert_eq!(catalog.resolve_photo_path(id).unwrap(), Some(photo.clone()));
     assert_eq!(catalog.photo_storage_status(id).unwrap(), StorageStatus::Archived);
     assert!(
-        catalog.list_photos(None, None, None, &[], "all", None, "local", None, None, &[], None).unwrap().is_empty(),
+        catalog.list_photos(&PhotoQuery { storage_tier: StorageTier::Local, ..Default::default() }).unwrap().is_empty(),
         "a NAS-resident photo is not 'local'"
     );
 
     // Re-scan is idempotent — matched by location, no duplicate row.
     chairphoto_lib::scanner::scan_external_folder(&catalog, &nas_dir, &chairphoto_lib::scanner::never_abort(), &|_| {}).unwrap();
     assert_eq!(
-        catalog.list_photos(None, None, None, &[], "all", None, "all", None, None, &[], None).unwrap().len(),
+        catalog.list_photos(&PhotoQuery::default()).unwrap().len(),
         1
     );
 }
@@ -224,27 +227,27 @@ fn list_photos_filters_by_storage_tier() {
     catalog.add_location(arch_id, nas, "arch.jpg", LocationRole::Backup).unwrap();
     catalog.remove_locations_on_volume(arch_id, local_vol).unwrap(); // offloaded: NAS only
 
-    let ids = |tier: &str| -> Vec<i64> {
+    let ids = |storage_tier: StorageTier| -> Vec<i64> {
         catalog
-            .list_photos(None, None, None, &[], "all", None, tier, None, None, &[], None)
+            .list_photos(&PhotoQuery { storage_tier, ..Default::default() })
             .unwrap()
             .into_iter()
             .map(|p| p.id)
             .collect()
     };
 
-    let local = ids("local");
+    let local = ids(StorageTier::Local);
     assert!(local.contains(&local_id) && local.contains(&bak_id));
     assert!(!local.contains(&arch_id), "offloaded photo is not 'local'");
 
-    let nas_only = ids("nas");
+    let nas_only = ids(StorageTier::Nas);
     assert!(nas_only.contains(&arch_id), "offloaded photo is 'nas'");
     assert!(
         !nas_only.contains(&local_id) && !nas_only.contains(&bak_id),
         "on-disk photos are not 'nas-only'"
     );
 
-    assert_eq!(ids("all").len(), 3);
+    assert_eq!(ids(StorageTier::All).len(), 3);
 }
 
 #[test]
@@ -430,7 +433,7 @@ fn hierarchical_tags_and_assignment() {
 
     // Filtering by an ancestor tag includes photos tagged with a descendant.
     let root_tag = all.iter().find(|t| t.tag.name == "Transportation").unwrap();
-    let filtered = catalog.list_photos(Some(root_tag.tag.id), None, None, &[], "all", None, "all", None, None, &[], None).unwrap();
+    let filtered = catalog.list_photos(&PhotoQuery { tag_id: Some(root_tag.tag.id), ..Default::default() }).unwrap();
     assert_eq!(filtered.len(), 1);
 
     catalog.remove_tag(id, leaf).unwrap();
@@ -632,14 +635,14 @@ fn import_batches_assign_and_filter() {
 
     // Filter the view by batch (composes with culling).
     let in1: Vec<i64> = catalog
-        .list_photos(None, None, Some(batch1), &[], "all", None, "all", None, None, &[], None)
+        .list_photos(&PhotoQuery { batch_id: Some(batch1), ..Default::default() })
         .unwrap()
         .into_iter()
         .map(|p| p.id)
         .collect();
     assert_eq!(in1.len(), 2);
     assert!(in1.contains(&a) && in1.contains(&b));
-    let in2 = catalog.list_photos(None, None, Some(batch2), &[], "all", None, "all", None, None, &[], None).unwrap();
+    let in2 = catalog.list_photos(&PhotoQuery { batch_id: Some(batch2), ..Default::default() }).unwrap();
     assert_eq!(in2.len(), 1);
     assert_eq!(in2[0].id, c);
 }
@@ -673,7 +676,7 @@ fn ingest_from_card_copies_into_date_tree_and_indexes() {
     );
 
     // Indexed into the catalog, in one import batch, each queued for backup.
-    assert_eq!(catalog.list_photos(None, None, None, &[], "all", None, "all", None, None, &[], None).unwrap().len(), 2);
+    assert_eq!(catalog.list_photos(&PhotoQuery::default()).unwrap().len(), 2);
     let batches = catalog.list_import_batches().unwrap();
     assert_eq!(batches.len(), 1);
     assert_eq!(batches[0].photo_count, 2);
@@ -1079,7 +1082,7 @@ fn reconcile_missing_hides_orphans_but_spares_offline_backups() {
     catalog.reconcile_missing().unwrap();
 
     let visible: Vec<i64> = catalog
-        .list_photos(None, None, None, &[], "all", None, "all", None, None, &[], None)
+        .list_photos(&PhotoQuery::default())
         .unwrap()
         .into_iter()
         .map(|p| p.id)
@@ -1087,6 +1090,93 @@ fn reconcile_missing_hides_orphans_but_spares_offline_backups() {
     assert!(visible.contains(&present_id), "present photo stays visible");
     assert!(!visible.contains(&orphan_id), "orphan with no backup is hidden");
     assert!(visible.contains(&offline_id), "offline NAS photo is spared (has a backup)");
+}
+
+/// A scan reconciles the `missing` flag for the folder it walked — including rows whose
+/// file has been deleted since last time, which the walk by definition never sees — and
+/// leaves the rest of the catalog alone. Reconciling everything made each scan an
+/// O(total photos) stat pass over storage the scan never looked at.
+#[test]
+fn scan_reconciles_the_scanned_folder_and_leaves_the_rest_of_the_catalog_alone() {
+    let (catalog, root) = temp_catalog("scan-scope-reconcile");
+    let abort = chairphoto_lib::scanner::never_abort();
+    let trip = root.join("trip");
+    let other = root.join("other");
+    std::fs::create_dir_all(&trip).unwrap();
+    std::fs::create_dir_all(&other).unwrap();
+    let in_scope = trip.join("a.jpg");
+    let out_of_scope = other.join("b.jpg");
+    std::fs::write(&in_scope, b"x").unwrap();
+    std::fs::write(&out_of_scope, b"x").unwrap();
+
+    chairphoto_lib::scanner::scan_folder(&catalog, &root, &abort, &|_| {}).unwrap();
+    let visible = |catalog: &Catalog| -> Vec<String> {
+        catalog
+            .list_photos(&PhotoQuery::default())
+            .unwrap()
+            .into_iter()
+            .map(|p| p.path)
+            .collect()
+    };
+    assert_eq!(visible(&catalog).len(), 2, "both photos indexed");
+
+    // Both files disappear, but only `trip` is re-scanned.
+    std::fs::remove_file(&in_scope).unwrap();
+    std::fs::remove_file(&out_of_scope).unwrap();
+    chairphoto_lib::scanner::scan_folder(&catalog, &trip, &abort, &|_| {}).unwrap();
+
+    let after = visible(&catalog);
+    assert!(
+        !after.contains(&"trip/a.jpg".to_string()),
+        "the scanned folder's vanished row is hidden: {after:?}"
+    );
+    assert!(
+        after.contains(&"other/b.jpg".to_string()),
+        "a folder this scan never walked is not reconciled: {after:?}"
+    );
+
+    // Scanning the parent covers both, so nothing is permanently stranded.
+    chairphoto_lib::scanner::scan_folder(&catalog, &root, &abort, &|_| {}).unwrap();
+    assert!(visible(&catalog).is_empty());
+}
+
+/// The offline-NAS case at the scan boundary: a photo whose only copy is a backup on an
+/// unmounted volume sits squarely in the scanned scope, and reconciliation must still
+/// spare it. Unmounted storage is a normal state, not a missing row (AGENTS.md).
+#[test]
+fn scan_reconciliation_spares_an_offline_nas_photo_in_scope() {
+    let (catalog, root) = temp_catalog("scan-scope-offline-nas");
+    let abort = chairphoto_lib::scanner::never_abort();
+    let archived = root.join("trip/archived.jpg");
+    std::fs::create_dir_all(archived.parent().unwrap()).unwrap();
+    std::fs::write(&archived, b"x").unwrap();
+    let id = catalog.upsert_photo(&archived, None, 1, 1).unwrap().id;
+
+    // Offload it: the bytes now live only on a NAS volume whose mount point is absent.
+    std::fs::remove_file(&archived).unwrap();
+    let nas = catalog
+        .add_volume(
+            "NAS",
+            &root.parent().unwrap().join("nas-not-mounted"),
+            VolumeKind::Backup,
+        )
+        .unwrap();
+    catalog
+        .add_location(id, nas, "trip/archived.jpg", LocationRole::Backup)
+        .unwrap();
+
+    chairphoto_lib::scanner::scan_folder(&catalog, &root.join("trip"), &abort, &|_| {}).unwrap();
+
+    let visible: Vec<i64> = catalog
+        .list_photos(&PhotoQuery::default())
+        .unwrap()
+        .into_iter()
+        .map(|p| p.id)
+        .collect();
+    assert!(
+        visible.contains(&id),
+        "an offline NAS photo in the scanned scope stays visible"
+    );
 }
 
 #[test]
@@ -1178,6 +1268,32 @@ fn photo_versions_crud_and_counts() {
     catalog.delete_version(dup).unwrap();
     assert_eq!(catalog.list_versions(photo).unwrap().len(), 2);
     assert!(catalog.version_counts(&[photo]).unwrap() == vec![(photo, 2)]);
+}
+
+/// The grid's version badge rides the photo row (issue #10) — a listing needs no per-id
+/// side query to draw it. Every query that builds a `Photo` must carry the same number.
+#[test]
+fn the_version_count_rides_the_photo_row() {
+    let (catalog, root) = temp_catalog("row-version-count");
+    let edited = catalog.upsert_photo(&root.join("edited.arw"), None, 1, 1).unwrap().id;
+    let plain = catalog.upsert_photo(&root.join("plain.arw"), None, 1, 1).unwrap().id;
+    catalog.create_version(edited, "Square").unwrap();
+    catalog.create_version(edited, "Bright").unwrap();
+
+    let listed = catalog.list_photos(&PhotoQuery::default()).unwrap();
+    let count_of = |id: i64| listed.iter().find(|p| p.id == id).unwrap().version_count;
+    assert_eq!(count_of(edited), 2, "listed row carries its version count");
+    assert_eq!(count_of(plain), 0, "an unedited photo counts zero, not null");
+
+    // The same count from the single-photo paths the inspector and deep links use.
+    assert_eq!(catalog.get_photo(edited).unwrap().version_count, 2);
+    let uuid = catalog.get_photo(edited).unwrap().uuid;
+    assert_eq!(catalog.get_photo_by_uuid(&uuid).unwrap().version_count, 2);
+
+    // And it tracks deletions, since it is computed rather than stored.
+    let versions = catalog.list_versions(edited).unwrap();
+    catalog.delete_version(versions[0].id).unwrap();
+    assert_eq!(catalog.get_photo(edited).unwrap().version_count, 1);
 }
 
 #[test]
@@ -1441,10 +1557,10 @@ fn list_photos_culling_filters() {
     catalog.set_culling(keep, Some(5), None, Some(PickState::Pick)).unwrap();
     catalog.set_culling(toss, None, None, Some(PickState::Reject)).unwrap();
 
-    assert_eq!(catalog.list_photos(None, None, None, &[], "all", None, "all", None, None, &[], None).unwrap().len(), 2);
-    assert_eq!(catalog.list_photos(None, None, None, &[], "pick", None, "all", None, None, &[], None).unwrap().len(), 1);
-    assert_eq!(catalog.list_photos(None, None, None, &[], "reject", None, "all", None, None, &[], None).unwrap().len(), 1);
-    assert_eq!(catalog.list_photos(None, None, None, &[], "unrated", None, "all", None, None, &[], None).unwrap().len(), 1);
+    assert_eq!(catalog.list_photos(&PhotoQuery::default()).unwrap().len(), 2);
+    assert_eq!(catalog.list_photos(&PhotoQuery { culling_filter: CullingFilter::Pick, ..Default::default() }).unwrap().len(), 1);
+    assert_eq!(catalog.list_photos(&PhotoQuery { culling_filter: CullingFilter::Reject, ..Default::default() }).unwrap().len(), 1);
+    assert_eq!(catalog.list_photos(&PhotoQuery { culling_filter: CullingFilter::Unrated, ..Default::default() }).unwrap().len(), 1);
 }
 
 #[test]
@@ -1492,7 +1608,7 @@ fn albums_membership_and_composition_with_culling() {
     catalog.add_photos_to_album(trip, &[a]).unwrap();
 
     // Viewing the album returns members in insertion order (b, then a).
-    let ordered = catalog.list_photos(None, Some(trip), None, &[], "all", None, "all", None, None, &[], None).unwrap();
+    let ordered = catalog.list_photos(&PhotoQuery { album_id: Some(trip), ..Default::default() }).unwrap();
     assert_eq!(ordered.iter().map(|p| p.id).collect::<Vec<_>>(), vec![b, a]);
 
     let albums = catalog.list_albums().unwrap();
@@ -1501,13 +1617,13 @@ fn albums_membership_and_composition_with_culling() {
     assert_eq!(albums[0].photo_count, 2);
 
     // Viewing the album returns only its members.
-    let in_album = catalog.list_photos(None, Some(trip), None, &[], "all", None, "all", None, None, &[], None).unwrap();
+    let in_album = catalog.list_photos(&PhotoQuery { album_id: Some(trip), ..Default::default() }).unwrap();
     assert_eq!(in_album.len(), 2);
     assert!(in_album.iter().all(|p| p.id != c));
 
     // Album filter ANDs with the culling filter.
     catalog.set_culling(a, Some(5), None, Some(PickState::Pick)).unwrap();
-    let picks = catalog.list_photos(None, Some(trip), None, &[], "pick", None, "all", None, None, &[], None).unwrap();
+    let picks = catalog.list_photos(&PhotoQuery { album_id: Some(trip), culling_filter: CullingFilter::Pick, ..Default::default() }).unwrap();
     assert_eq!(picks.len(), 1);
     assert_eq!(picks[0].id, a);
 
@@ -1516,7 +1632,7 @@ fn albums_membership_and_composition_with_culling() {
     assert_eq!(catalog.list_albums().unwrap()[0].photo_count, 1);
     catalog.delete_album(trip).unwrap();
     assert!(catalog.list_albums().unwrap().is_empty());
-    assert_eq!(catalog.list_photos(None, None, None, &[], "all", None, "all", None, None, &[], None).unwrap().len(), 3);
+    assert_eq!(catalog.list_photos(&PhotoQuery::default()).unwrap().len(), 3);
 }
 
 #[test]
@@ -1550,7 +1666,7 @@ fn facets_filter_by_derived_exif() {
     let ids = |fs: &[&str]| {
         let fs: Vec<String> = fs.iter().map(|s| s.to_string()).collect();
         let mut v: Vec<i64> = catalog
-            .list_photos(None, None, None, &fs, "all", None, "all", None, None, &[], None)
+            .list_photos(&PhotoQuery { facets: fs.to_vec(), ..Default::default() })
             .unwrap()
             .into_iter()
             .map(|p| p.id)
@@ -1570,7 +1686,7 @@ fn facets_filter_by_derived_exif() {
     assert!(ids(&["mobile", "drone"]).is_empty());
     // Unknown facet is an error.
     assert!(catalog
-        .list_photos(None, None, None, &["bogus".to_string()], "all", None, "all", None, None, &[], None)
+        .list_photos(&PhotoQuery { facets: vec!["bogus".to_string()], ..Default::default() })
         .is_err());
 
     // Facets are reflected in the offered set.
@@ -1601,7 +1717,7 @@ fn soft_facet_and_sharpness_sort() {
 
     // `soft` facet: should include `soft` photo, exclude `sharp` and `unscored`.
     let soft_ids: Vec<i64> = catalog
-        .list_photos(None, None, None, &["soft".to_string()], "all", None, "all", None, None, &[], None)
+        .list_photos(&PhotoQuery { facets: vec!["soft".to_string()], ..Default::default() })
         .unwrap()
         .into_iter()
         .map(|p| p.id)
@@ -1614,7 +1730,7 @@ fn soft_facet_and_sharpness_sort() {
 
     // Sort by sharpness_asc: soft < sharp; unscored comes last.
     let asc: Vec<i64> = catalog
-        .list_photos(None, None, None, &[], "all", None, "all", None, None, &[], Some("sharpness_asc"))
+        .list_photos(&PhotoQuery { sort: PhotoSort::SharpnessAsc, ..Default::default() })
         .unwrap()
         .into_iter()
         .map(|p| p.id)
@@ -1625,7 +1741,7 @@ fn soft_facet_and_sharpness_sort() {
 
     // Sort by sharpness_desc: sharp < soft; unscored comes last.
     let desc: Vec<i64> = catalog
-        .list_photos(None, None, None, &[], "all", None, "all", None, None, &[], Some("sharpness_desc"))
+        .list_photos(&PhotoQuery { sort: PhotoSort::SharpnessDesc, ..Default::default() })
         .unwrap()
         .into_iter()
         .map(|p| p.id)
@@ -1635,15 +1751,255 @@ fn soft_facet_and_sharpness_sort() {
     assert_eq!(desc[2], unscored, "unscored photo last in sharpness_desc");
 
     // The sharpness value is surfaced on the Photo struct.
-    let all = catalog.list_photos(None, None, None, &[], "all", None, "all", None, None, &[], None).unwrap();
+    let all = catalog.list_photos(&PhotoQuery::default()).unwrap();
     let photo_sharp = all.iter().find(|p| p.id == sharp).unwrap();
     let photo_unscored = all.iter().find(|p| p.id == unscored).unwrap();
     assert!(photo_sharp.sharpness.is_some(), "sharpness must be Some for a scored photo");
     assert!(photo_unscored.sharpness.is_none(), "sharpness must be None for an unscored photo");
 
-    // Unknown sort falls back gracefully to date order (no error).
-    let result = catalog.list_photos(None, None, None, &[], "all", None, "all", None, None, &[], Some("bogus_sort"));
-    assert!(result.is_ok(), "unknown sort key must not error");
+    // A misspelled sort key used to reach here as a string and silently fall back to date
+    // order. `PhotoSort` is an enum now, so this call can no longer be written at all and
+    // the rejection happens at the IPC boundary instead — see
+    // `catalog::query::tests::a_misspelled_sort_is_rejected_at_the_boundary`.
+}
+
+/// A library of photos that tie on every sort key except the primary key: one shared
+/// capture time, and one pair of names that differ only in case (so they also tie under
+/// `path COLLATE NOCASE`). Returns the catalog and the ids in creation order.
+fn catalog_of_tied_photos(tag: &str, count: usize) -> (Catalog, common::TestSubPath, Vec<i64>) {
+    use chairphoto_lib::catalog::PromotedMetadata;
+    let (catalog, root) = temp_catalog(tag);
+    let mut ids = Vec::new();
+    for i in 0..count {
+        // The 3rd and 4th photos are "Dup.jpg" / "dup.jpg" — distinct rows (path is
+        // UNIQUE, and this runs on a case-sensitive filesystem) that compare EQUAL under
+        // the NOCASE tiebreaker the sort uses.
+        let name = match i {
+            2 => "Dup.jpg".to_string(),
+            3 => "dup.jpg".to_string(),
+            _ => format!("photo{i:02}.jpg"),
+        };
+        let id = catalog
+            .upsert_photo(&root.join(&name), None, 1, 1)
+            .unwrap()
+            .id;
+        catalog
+            .set_photo_metadata(
+                id,
+                &PromotedMetadata {
+                    capture_time: Some("2024-05-01T12:00:00".into()),
+                    ..Default::default()
+                },
+                &[],
+            )
+            .unwrap();
+        ids.push(id);
+    }
+    (catalog, root, ids)
+}
+
+/// Issue #10: a window only means something if the ordering is TOTAL. Tiled windows must
+/// reproduce the unwindowed listing exactly — no row seen twice, none skipped — even when
+/// every sort key but the primary key ties. Without the trailing `p.id`, SQLite is free to
+/// order the tied rows differently per statement, and a photo can appear in two windows
+/// while another appears in none.
+#[test]
+fn windows_tile_the_result_exactly_when_every_other_sort_key_ties() {
+    let (catalog, _root, ids) = catalog_of_tied_photos("window-total-order", 10);
+
+    for sort in [PhotoSort::Date, PhotoSort::SharpnessAsc, PhotoSort::SharpnessDesc] {
+        let query = PhotoQuery {
+            sort,
+            ..Default::default()
+        };
+        let full: Vec<i64> = catalog
+            .list_photos(&query)
+            .unwrap()
+            .into_iter()
+            .map(|p| p.id)
+            .collect();
+        assert_eq!(full.len(), ids.len(), "{sort:?}: every photo is listed once");
+
+        let mut tiled = Vec::new();
+        for offset in (0..ids.len()).step_by(3) {
+            let page = catalog
+                .photo_page(&PhotoQuery {
+                    window: Some(PhotoWindow::new(offset, 3)),
+                    ..query.clone()
+                })
+                .unwrap();
+            assert_eq!(page.offset, offset);
+            assert_eq!(page.total, ids.len(), "{sort:?}: total is the matching set");
+            tiled.extend(page.photos.into_iter().map(|p| p.id));
+        }
+        assert_eq!(tiled, full, "{sort:?}: tiled windows must equal the full listing");
+    }
+}
+
+/// The same window asked for twice returns the same rows. (Stability across calls is what
+/// lets the grid keep a page it already fetched instead of re-fetching on every render.)
+#[test]
+fn the_same_window_is_the_same_rows_every_time() {
+    let (catalog, _root, _ids) = catalog_of_tied_photos("window-stable", 10);
+    let window = PhotoQuery {
+        window: Some(PhotoWindow::new(2, 4)),
+        ..Default::default()
+    };
+    let first: Vec<i64> = catalog
+        .list_photos(&window)
+        .unwrap()
+        .into_iter()
+        .map(|p| p.id)
+        .collect();
+    let second: Vec<i64> = catalog
+        .list_photos(&window)
+        .unwrap()
+        .into_iter()
+        .map(|p| p.id)
+        .collect();
+    assert_eq!(first, second);
+    assert_eq!(first.len(), 4);
+}
+
+/// `photo_page` must report the size of the MATCHING set, never of the window — that is
+/// the number the grid sizes its scrollbar and its "N photos" readout from.
+#[test]
+fn photo_page_reports_the_matching_total_not_the_window() {
+    let (catalog, root, ids) = catalog_of_tied_photos("window-total", 10);
+
+    let unwindowed = catalog.photo_page(&PhotoQuery::default()).unwrap();
+    assert_eq!(unwindowed.offset, 0);
+    assert_eq!(unwindowed.photos.len(), 10);
+    assert_eq!(unwindowed.total, 10);
+
+    let head = catalog
+        .photo_page(&PhotoQuery {
+            window: Some(PhotoWindow::new(0, 3)),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(head.photos.len(), 3);
+    assert_eq!(head.total, 10, "a window does not shrink the total");
+
+    // A window that runs off the end: short, and the total is still the whole set.
+    let tail = catalog
+        .photo_page(&PhotoQuery {
+            window: Some(PhotoWindow::new(8, 5)),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(tail.photos.len(), 2);
+    assert_eq!(tail.total, 10);
+
+    // Entirely past the end. An empty page at a non-zero offset says nothing about where
+    // the result ends, so the total has to be counted rather than inferred from `offset`.
+    let past = catalog
+        .photo_page(&PhotoQuery {
+            window: Some(PhotoWindow::new(100, 5)),
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(past.photos.is_empty());
+    assert_eq!(past.total, 10, "an empty page must not report its offset as the total");
+
+    // A window that exactly fills: more rows may exist, so this is the counted path.
+    let exact = catalog
+        .photo_page(&PhotoQuery {
+            window: Some(PhotoWindow::new(0, 10)),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(exact.photos.len(), 10);
+    assert_eq!(exact.total, 10);
+
+    // The total is the FILTERED count, not the catalog's size.
+    catalog.set_culling(ids[0], None, None, Some(PickState::Pick)).unwrap();
+    let picks = catalog
+        .photo_page(&PhotoQuery {
+            culling_filter: CullingFilter::Pick,
+            window: Some(PhotoWindow::new(0, 3)),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(picks.total, 1);
+    assert_eq!(picks.photos.len(), 1);
+    let _ = root;
+}
+
+/// A window composes with the filters — it slices the *filtered* order, not the library.
+#[test]
+fn a_window_slices_the_filtered_ordering() {
+    let (catalog, _root, ids) = catalog_of_tied_photos("window-filtered", 6);
+    for id in ids.iter().take(4) {
+        catalog.set_culling(*id, None, None, Some(PickState::Pick)).unwrap();
+    }
+    let query = PhotoQuery {
+        culling_filter: CullingFilter::Pick,
+        ..Default::default()
+    };
+    let all_picks: Vec<i64> = catalog
+        .list_photos(&query)
+        .unwrap()
+        .into_iter()
+        .map(|p| p.id)
+        .collect();
+    assert_eq!(all_picks.len(), 4);
+
+    let second_half = catalog
+        .photo_page(&PhotoQuery {
+            window: Some(PhotoWindow::new(2, 2)),
+            ..query.clone()
+        })
+        .unwrap();
+    assert_eq!(
+        second_half.photos.iter().map(|p| p.id).collect::<Vec<_>>(),
+        all_picks[2..4].to_vec()
+    );
+    assert_eq!(second_half.total, 4);
+}
+
+/// An album view is ordered by album position; that ordering must be total too, so its
+/// windows tile the same way.
+#[test]
+fn album_windows_follow_album_order() {
+    let (catalog, root) = temp_catalog("window-album");
+    let album = catalog.create_album("Trip").unwrap();
+    let mut ids = Vec::new();
+    for i in 0..6 {
+        let id = catalog
+            .upsert_photo(&root.join(format!("a{i}.jpg")), None, 1, 1)
+            .unwrap()
+            .id;
+        ids.push(id);
+    }
+    // Add in reverse so album position and photo id disagree.
+    let reversed: Vec<i64> = ids.iter().rev().copied().collect();
+    catalog.add_photos_to_album(album, &reversed).unwrap();
+
+    let query = PhotoQuery {
+        album_id: Some(album),
+        ..Default::default()
+    };
+    let full: Vec<i64> = catalog
+        .list_photos(&query)
+        .unwrap()
+        .into_iter()
+        .map(|p| p.id)
+        .collect();
+    assert_eq!(full, reversed, "album order, not id order");
+
+    let mut tiled = Vec::new();
+    for offset in (0..6).step_by(2) {
+        let page = catalog
+            .photo_page(&PhotoQuery {
+                window: Some(PhotoWindow::new(offset, 2)),
+                ..query.clone()
+            })
+            .unwrap();
+        assert_eq!(page.total, 6);
+        tiled.extend(page.photos.into_iter().map(|p| p.id));
+    }
+    assert_eq!(tiled, full);
 }
 
 #[test]
@@ -1655,14 +2011,14 @@ fn external_editors_drive_the_edited_filter() {
     catalog.set_external_editors(edited, "darktable").unwrap();
     catalog.set_external_editors(plain, "").unwrap();
 
-    let edited_only = catalog.list_photos(None, None, None, &[], "edited", None, "all", None, None, &[], None).unwrap();
+    let edited_only = catalog.list_photos(&PhotoQuery { culling_filter: CullingFilter::Edited, ..Default::default() }).unwrap();
     assert_eq!(edited_only.len(), 1);
     assert_eq!(edited_only[0].id, edited);
     assert_eq!(edited_only[0].external_editors, "darktable");
 
     // Clearing it removes the photo from the filter again.
     catalog.set_external_editors(edited, "").unwrap();
-    assert_eq!(catalog.list_photos(None, None, None, &[], "edited", None, "all", None, None, &[], None).unwrap().len(), 0);
+    assert_eq!(catalog.list_photos(&PhotoQuery { culling_filter: CullingFilter::Edited, ..Default::default() }).unwrap().len(), 0);
 }
 
 #[test]
@@ -1833,7 +2189,7 @@ fn published_facet_filters_photos() {
         .any(|f| f.key == "published:instagram"));
 
     let filtered = catalog
-        .list_photos(None, None, None, &["published:instagram".to_string()], "all", None, "all", None, None, &[], None)
+        .list_photos(&PhotoQuery { facets: vec!["published:instagram".to_string()], ..Default::default() })
         .unwrap();
     let ids: Vec<i64> = filtered.iter().map(|p| p.id).collect();
     assert!(ids.contains(&posted));
@@ -1859,7 +2215,7 @@ fn smart_album_filters_list_photos_and_counts_live() {
 
     // Selecting the smart album in list_photos returns exactly the matching set.
     let matched = catalog
-        .list_photos(None, None, None, &[], "all", Some(id), "all", None, None, &[], None)
+        .list_photos(&PhotoQuery { smart_album_id: Some(id), ..Default::default() })
         .unwrap();
     let ids: Vec<i64> = matched.iter().map(|p| p.id).collect();
     assert_eq!(ids.len(), 2);
@@ -1878,7 +2234,7 @@ fn smart_album_filters_list_photos_and_counts_live() {
         .set_culling(keep_a, None, None, Some(PickState::Pick))
         .unwrap();
     let picks = catalog
-        .list_photos(None, None, None, &[], "pick", Some(id), "all", None, None, &[], None)
+        .list_photos(&PhotoQuery { smart_album_id: Some(id), culling_filter: CullingFilter::Pick, ..Default::default() })
         .unwrap();
     assert_eq!(picks.iter().map(|p| p.id).collect::<Vec<_>>(), vec![keep_a]);
 
@@ -1886,7 +2242,7 @@ fn smart_album_filters_list_photos_and_counts_live() {
     let narrower = r#"{"match":"all","conditions":[{"field":"rating","op":"gte","value":5}]}"#;
     catalog.set_smart_album_rule(id, narrower).unwrap();
     let only_best = catalog
-        .list_photos(None, None, None, &[], "all", Some(id), "all", None, None, &[], None)
+        .list_photos(&PhotoQuery { smart_album_id: Some(id), ..Default::default() })
         .unwrap();
     assert_eq!(only_best.iter().map(|p| p.id).collect::<Vec<_>>(), vec![keep_a]);
     assert_eq!(catalog.get_smart_album(id).unwrap().photo_count, 1);
@@ -1897,7 +2253,7 @@ fn smart_album_filters_list_photos_and_counts_live() {
         .unwrap();
     assert_eq!(
         catalog
-            .list_photos(None, None, None, &[], "all", Some(id), "all", None, None, &[], None)
+            .list_photos(&PhotoQuery { smart_album_id: Some(id), ..Default::default() })
             .unwrap()
             .len(),
         3
@@ -1921,7 +2277,7 @@ fn smart_album_color_label_matches_stored_casing() {
         assert_eq!(catalog.smart_album_count(&rule).unwrap(), 1, "value {value}");
         let id = catalog.create_smart_album(&format!("Reds {value}"), &rule).unwrap();
         let ids: Vec<i64> = catalog
-            .list_photos(None, None, None, &[], "all", Some(id), "all", None, None, &[], None)
+            .list_photos(&PhotoQuery { smart_album_id: Some(id), ..Default::default() })
             .unwrap()
             .iter()
             .map(|p| p.id)
@@ -2005,7 +2361,7 @@ fn smart_album_combines_conditions_from_many_groups() {
     assert_eq!(catalog.smart_album_count(&rule).unwrap(), 1);
     let id = catalog.create_smart_album("Sharp owls, June", &rule).unwrap();
     let matched = catalog
-        .list_photos(None, None, None, &[], "all", Some(id), "all", None, None, &[], None)
+        .list_photos(&PhotoQuery { smart_album_id: Some(id), ..Default::default() })
         .unwrap();
     assert_eq!(matched.iter().map(|p| p.id).collect::<Vec<_>>(), vec![hit]);
 
@@ -2023,7 +2379,7 @@ fn smart_album_combines_conditions_from_many_groups() {
     .to_string();
     catalog.set_smart_album_rule(id, &looser).unwrap();
     let mut ids: Vec<i64> = catalog
-        .list_photos(None, None, None, &[], "all", Some(id), "all", None, None, &[], None)
+        .list_photos(&PhotoQuery { smart_album_id: Some(id), ..Default::default() })
         .unwrap()
         .into_iter()
         .map(|p| p.id)
@@ -2238,7 +2594,7 @@ fn bundle_round_trip_export_import_and_idempotent_reimport() {
 
     // Exactly 2 photos in catalog B after the re-import.
     let count_b = cat_b
-        .list_photos(None, None, None, &[], "all", None, "all", None, None, &[], None)
+        .list_photos(&PhotoQuery::default())
         .unwrap()
         .len();
     assert_eq!(count_b, 2, "catalog B must have exactly 2 photos after re-import");
@@ -2475,7 +2831,7 @@ fn scan_folder_aborts_before_writing_anything() {
 
     // Nothing landed in the catalog — the switch can safely tear it down.
     let photos = catalog
-        .list_photos(None, None, None, &[], "all", None, "all", None, None, &[], None)
+        .list_photos(&PhotoQuery::default())
         .unwrap();
     assert!(photos.is_empty(), "aborted scan imported no photos, got {}", photos.len());
 }
@@ -2493,7 +2849,7 @@ fn scan_external_aborts_before_writing_anything() {
     assert_eq!(err, chairphoto_lib::scanner::SCAN_ABORTED);
     assert!(
         catalog
-            .list_photos(None, None, None, &[], "all", None, "all", None, None, &[], None)
+            .list_photos(&PhotoQuery::default())
             .unwrap()
             .is_empty(),
         "aborted external scan imported no photos"
@@ -2523,7 +2879,7 @@ fn scan_folder_aborts_mid_run_and_stops_early() {
     // Rows committed before the abort are durable (the first batch), but the scan stopped
     // early — it did not import all 1200 files.
     let count = catalog
-        .list_photos(None, None, None, &[], "all", None, "all", None, None, &[], None)
+        .list_photos(&PhotoQuery::default())
         .unwrap()
         .len();
     assert!(count < 1200, "aborted mid-run: fewer than all files imported, got {count}");
@@ -2579,7 +2935,7 @@ fn create_catalog_creates_new_file_and_data_survives_reopen() {
 
     // All data is still there.
     let photos = catalog2
-        .list_photos(None, None, None, &[], "all", None, "all", None, None, &[], None)
+        .list_photos(&PhotoQuery::default())
         .unwrap();
     assert_eq!(photos.len(), 1, "photo must survive the close/reopen cycle");
     let p = &photos[0];
@@ -2667,13 +3023,13 @@ fn two_catalogs_are_isolated() {
 
     // Each catalog sees exactly its own photo, not the other's.
     let photos_a = cat_a
-        .list_photos(None, None, None, &[], "all", None, "all", None, None, &[], None)
+        .list_photos(&PhotoQuery::default())
         .unwrap();
     assert_eq!(photos_a.len(), 1, "catalog A must hold exactly 1 photo");
     assert_eq!(photos_a[0].path, "alpha.jpg");
 
     let photos_b = cat_b
-        .list_photos(None, None, None, &[], "all", None, "all", None, None, &[], None)
+        .list_photos(&PhotoQuery::default())
         .unwrap();
     assert_eq!(photos_b.len(), 1, "catalog B must hold exactly 1 photo");
     assert_eq!(photos_b[0].path, "beta.jpg");
@@ -2696,7 +3052,7 @@ fn switch_catalog_old_state_not_visible_in_new() {
     // Verify A has 5 photos.
     assert_eq!(
         cat_a
-            .list_photos(None, None, None, &[], "all", None, "all", None, None, &[], None)
+            .list_photos(&PhotoQuery::default())
             .unwrap()
             .len(),
         5
@@ -2709,7 +3065,7 @@ fn switch_catalog_old_state_not_visible_in_new() {
     let (cat_b, _db_b, _root_b) = temp_catalog_named("switch-new");
     // B is freshly created — it must not see A's photos.
     let photos_b = cat_b
-        .list_photos(None, None, None, &[], "all", None, "all", None, None, &[], None)
+        .list_photos(&PhotoQuery::default())
         .unwrap();
     assert!(
         photos_b.is_empty(),
@@ -2754,7 +3110,7 @@ fn switch_catalog_with_aborted_scan_leaves_new_catalog_clean() {
     // Catalog B (opened after the switch) must be entirely clean.
     assert!(
         cat_b
-            .list_photos(None, None, None, &[], "all", None, "all", None, None, &[], None)
+            .list_photos(&PhotoQuery::default())
             .unwrap()
             .is_empty(),
         "aborted scan on catalog A must not write rows into catalog B"
@@ -2778,7 +3134,7 @@ fn phase_a_imports_unready_rows_then_phase_b_marks_ready() {
         chairphoto_lib::scanner::scan_folder_phase_a(&catalog, &root, &abort, &|_| {}).unwrap();
     assert_eq!(result.created, 4, "Phase A creates all 4 rows");
     let after_a = catalog
-        .list_photos(None, None, None, &[], "all", None, "all", None, None, &[], None)
+        .list_photos(&PhotoQuery::default())
         .unwrap();
     assert_eq!(after_a.len(), 4, "Phase A rows are visible in the grid");
     assert!(
@@ -2789,7 +3145,7 @@ fn phase_a_imports_unready_rows_then_phase_b_marks_ready() {
     // Phase B: enrich the pending rows; every one flips to ready.
     chairphoto_lib::scanner::phase_b_enrich(&catalog, pending, &abort, &|_| {}).unwrap();
     let after_b = catalog
-        .list_photos(None, None, None, &[], "all", None, "all", None, None, &[], None)
+        .list_photos(&PhotoQuery::default())
         .unwrap();
     assert!(
         after_b.iter().all(|p| p.metadata_ready == 1),
@@ -2814,7 +3170,7 @@ fn phase_b_aborts_and_leaves_rows_unready() {
         .expect_err("a pre-aborted Phase B returns SCAN_ABORTED");
     assert_eq!(err, chairphoto_lib::scanner::SCAN_ABORTED);
     let rows = catalog
-        .list_photos(None, None, None, &[], "all", None, "all", None, None, &[], None)
+        .list_photos(&PhotoQuery::default())
         .unwrap();
     assert!(
         rows.iter().all(|p| p.metadata_ready == 0),
@@ -2855,7 +3211,7 @@ fn i6d_pending_queue_persists_after_phase_a_and_drains_on_phase_b_completion() {
 
     // After the abort the rows are still not-ready.
     let after_abort = catalog
-        .list_photos(None, None, None, &[], "all", None, "all", None, None, &[], None)
+        .list_photos(&PhotoQuery::default())
         .unwrap();
     assert!(
         after_abort.iter().all(|p| p.metadata_ready == 0),
@@ -2888,7 +3244,7 @@ fn i6d_pending_queue_persists_after_phase_a_and_drains_on_phase_b_completion() {
 
     // (f) All rows must be metadata_ready=1 and the queue must be empty.
     let after_resume = catalog
-        .list_photos(None, None, None, &[], "all", None, "all", None, None, &[], None)
+        .list_photos(&PhotoQuery::default())
         .unwrap();
     assert!(
         after_resume.iter().all(|p| p.metadata_ready == 1),
@@ -2968,7 +3324,7 @@ fn i6d_stale_drain_via_rescan_handles_deleted_unchanged_and_changed_files() {
 
     // Collect photo_ids for A, B, C so we can assert on them later.
     let photos_after_scan1 = catalog
-        .list_photos(None, None, None, &[], "all", None, "all", None, None, &[], None)
+        .list_photos(&PhotoQuery::default())
         .unwrap();
     assert_eq!(photos_after_scan1.len(), 3);
     let find_id = |filename: &str| -> i64 {
@@ -2997,7 +3353,7 @@ fn i6d_stale_drain_via_rescan_handles_deleted_unchanged_and_changed_files() {
 
     // All three rows are still not-ready and still in pending_enrichment.
     let rows_after_abort = catalog
-        .list_photos(None, None, None, &[], "all", None, "all", None, None, &[], None)
+        .list_photos(&PhotoQuery::default())
         .unwrap();
     assert!(
         rows_after_abort.iter().all(|p| p.metadata_ready == 0),
@@ -3092,7 +3448,7 @@ fn i6d_stale_drain_via_rescan_handles_deleted_unchanged_and_changed_files() {
 
     // B and C must now be metadata_ready=1 (enriched).
     let photos_after = catalog
-        .list_photos(None, None, None, &[], "all", None, "all", None, None, &[], None)
+        .list_photos(&PhotoQuery::default())
         .unwrap();
     let ready_b = photos_after.iter().find(|p| p.id == id_b).map(|p| p.metadata_ready);
     let ready_c = photos_after.iter().find(|p| p.id == id_c).map(|p| p.metadata_ready);
@@ -3155,7 +3511,7 @@ fn i6e_unready_rows_survive_list_photos_and_done_clears_placeholders() {
     // Invariant 1: list_photos must include unready rows so the grid can render
     // placeholder tiles for them immediately after Phase A.
     let after_a = catalog
-        .list_photos(None, None, None, &[], "all", None, "all", None, None, &[], None)
+        .list_photos(&PhotoQuery::default())
         .unwrap();
     assert_eq!(after_a.len(), 3, "all 3 rows are visible as placeholder tiles");
     assert!(
@@ -3169,7 +3525,7 @@ fn i6e_unready_rows_survive_list_photos_and_done_clears_placeholders() {
     // placeholder state is cleared and all tiles are fully ready.
     chairphoto_lib::scanner::phase_b_enrich(&catalog, pending, &abort, &|_| {}).unwrap();
     let after_done = catalog
-        .list_photos(None, None, None, &[], "all", None, "all", None, None, &[], None)
+        .list_photos(&PhotoQuery::default())
         .unwrap();
     assert_eq!(after_done.len(), 3, "no rows were lost during Phase B");
     assert!(
@@ -3182,7 +3538,7 @@ fn i6e_unready_rows_survive_list_photos_and_done_clears_placeholders() {
     let extra = catalog.upsert_photo(&root.join("extra.jpg"), None, 1, 1).unwrap().id;
     catalog.set_metadata_ready(extra, false).unwrap();
     let mixed = catalog
-        .list_photos(None, None, None, &[], "all", None, "all", None, None, &[], None)
+        .list_photos(&PhotoQuery::default())
         .unwrap();
     assert_eq!(mixed.len(), 4, "ready and unready rows both appear in the grid");
     let ready_count = mixed.iter().filter(|p| p.metadata_ready == 1).count();
@@ -3442,7 +3798,7 @@ fn map_ingest_applies_fences_to_new_photos() {
 
     // Retrieve the photo and manually update its GPS (simulate EXIF extraction).
     let photos = catalog
-        .list_photos(None, None, None, &[], "all", None, "all", None, None, &[], None)
+        .list_photos(&PhotoQuery::default())
         .unwrap();
     assert_eq!(photos.len(), 1);
     let photo_id = photos[0].id;
@@ -3975,19 +4331,7 @@ fn scan_read_only_storage_queues_import_batch_sidecar_debt() {
         "repair drains both UUID and ImportBatch sidecar debt"
     );
     for photo in catalog
-        .list_photos(
-            None,
-            None,
-            None,
-            &[],
-            "all",
-            None,
-            "all",
-            None,
-            None,
-            &[],
-            None,
-        )
+        .list_photos(&PhotoQuery::default())
         .unwrap()
     {
         let path = root.join(&photo.path);
@@ -4050,19 +4394,7 @@ fn card_ingest_queues_identity_and_import_batch_sidecar_debt() {
         (2, 0, 0)
     );
     let photo = catalog
-        .list_photos(
-            None,
-            None,
-            None,
-            &[],
-            "all",
-            None,
-            "all",
-            None,
-            None,
-            &[],
-            None,
-        )
+        .list_photos(&PhotoQuery::default())
         .unwrap()
         .into_iter()
         .next()
@@ -4387,7 +4719,7 @@ fn a_scan_onto_read_only_storage_keeps_every_identity_recoverable() {
         (6, 0, 0)
     );
     let photos = catalog
-        .list_photos(None, None, None, &[], "all", None, "all", None, None, &[], None)
+        .list_photos(&PhotoQuery::default())
         .unwrap();
     assert_eq!(photos.len(), 3);
     for photo in &photos {

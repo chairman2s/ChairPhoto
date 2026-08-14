@@ -30,11 +30,10 @@ import type {
   ModulePanel,
   Photo,
   PublishTarget,
+  SettingsPanel,
   ToolbarAction,
   Unsubscribe,
 } from "./registry";
-
-type SettingsRender = () => React.ReactNode;
 
 interface Registered {
   module: ChairPhotoModule;
@@ -45,7 +44,9 @@ interface Registered {
   minHostVersion: string;
   panels: ModulePanel[];
   actions: ToolbarAction[];
-  settings: SettingsRender[];
+  /** A React thunk (bundled) or a `ModuleMount` (external); Preferences renders either
+   *  through `<ModuleSettings>`. */
+  settings: SettingsPanel[];
   mainViews: MainView[];
   publishTargets: PublishTarget[];
   renderer: EditRenderer | null;
@@ -469,8 +470,8 @@ function apiFor(mod: ChairPhotoModule): ChairPhotoAPI {
       reg.publishTargets.push(t);
       contributionsChannel.notify();
     },
-    registerSettingsPanel: (render) => {
-      reg.settings.push(render);
+    registerSettingsPanel: (panel) => {
+      reg.settings.push(panel);
       settingsPanelsChannel.notify();
     },
     registerMainView: (v) => {
@@ -903,12 +904,12 @@ export function panelsForSlot(slot: ModulePanel["slot"]): ModulePanel[] {
   return out;
 }
 
-export function settingsPanels(): SettingsRender[] {
+export function settingsPanels(): SettingsPanel[] {
   return [...modules.values()].filter((r) => r.enabled).flatMap((r) => r.settings);
 }
 
 /** Settings panels registered by one module (empty if it's disabled or absent). */
-export function settingsPanelsForModule(id: string): SettingsRender[] {
+export function settingsPanelsForModule(id: string): SettingsPanel[] {
   const reg = modules.get(id);
   return reg && reg.enabled ? reg.settings : [];
 }

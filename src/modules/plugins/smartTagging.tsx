@@ -14,6 +14,10 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { ChairPhotoAPI, ChairPhotoModule } from "../registry";
 import { useHostSelection } from "../host";
+// The shared owned-listener utility (issue #13). It imports nothing but React and the
+// contract's `Unsubscribe` type, so using it does not reach into app internals — the same
+// standing as `useHostSelection` above.
+import { forJob, terminalBuffer, useOwnedListeners } from "../ownedEvents";
 
 // ── Backend commands and events (owned by this module) ────────────────────────
 // Per the module contract these go through `ChairPhotoAPI.invoke` / `.onEvent`
@@ -206,75 +210,60 @@ function formatDownloadProgress(p: SmarttagsDownloadProgress | null): string {
   return `Downloading… ${doneMB} MB`;
 }
 
+/** Listener slot for `smarttags:download_progress`. See `useOwnedListeners`. */
+const DOWNLOAD_PROGRESS = "download-progress";
+
 /**
  * Hook that encapsulates the model download lifecycle: subscribes to
  * `smarttags:download_progress` while a download is in flight, keeps local
  * progress state, and cleans up the listener on unmount.
  *
- * Kept in this file (not extracted to a shared location) so it stays inside
- * the module boundary — modules must not import app internals.
+ * The listener lifecycle — an owner token per attempt, a late registration stopped rather
+ * than stored, release scoped to the attempt that installed it — is `useOwnedListeners`
+ * (issue #13), not hand-rolled here any more. What stays local is the *policy*: this stream
+ * is cosmetic, so an unsupported host or a failed registration must not stop the download.
  */
 function useModelDownload(api: ChairPhotoAPI, onSuccess: (s: SmarttagsModelStatus) => void) {
   const [downloading, setDownloading] = useState(false);
   const [downloadProgress, setDownloadProgress] = useState<SmarttagsDownloadProgress | null>(null);
   const [downloadError, setDownloadError] = useState("");
-  /** The listener is tagged with the attempt that installed it, so a late registration
-   *  cannot overwrite a newer attempt's and a finishing attempt cannot stop one it does
-   *  not own. `downloading` is state and has not updated by the time a second same-tick
-   *  click lands, so the ref is what actually excludes. */
-  const progressUnlistenRef = useRef<{ owner: symbol; stop: () => void } | null>(null);
+  const listeners = useOwnedListeners();
+  /** The in-flight attempt. `downloading` is state and has not updated by the time a second
+   *  same-tick click lands, so this ref is what actually excludes. */
   const attemptRef = useRef<symbol | null>(null);
-  const mountedRef = useRef(true);
 
-  /** Without an `owner` this drops whatever is installed (unmount); with one it drops
-   *  only that attempt's listener. */
-  const stopListening = useCallback((owner?: symbol) => {
-    const cur = progressUnlistenRef.current;
-    if (!cur) return;
-    if (owner !== undefined && cur.owner !== owner) return;
-    cur.stop();
-    progressUnlistenRef.current = null;
-  }, []);
-
-  useEffect(() => {
-    mountedRef.current = true;
-    return () => {
-      mountedRef.current = false;
+  useEffect(
+    () => () => {
+      // The listeners release themselves on unmount; the claim is this hook's own.
       attemptRef.current = null;
-      stopListening();
-    };
-  }, [stopListening]);
+    },
+    [],
+  );
 
   const startDownload = useCallback(async () => {
     if (downloading || attemptRef.current) return;
     const attempt = Symbol("smarttags-download");
     attemptRef.current = attempt;
-    const mine = () => mountedRef.current && attemptRef.current === attempt;
+    const mine = () => listeners.isMounted() && attemptRef.current === attempt;
     setDownloading(true);
     setDownloadError("");
     setDownloadProgress(null);
     try {
-      // Subscribe before invoking so we don't miss early chunks — but inside the try, and
-      // swallowing both an absent `onEvent` and a rejected registration. This stream is
-      // cosmetic: it drives the byte counter, while the outcome comes from the command's
-      // own result. Subscribing outside the try meant a host without events threw before
-      // the `finally`, leaving the button stuck on "Downloading…" with no download running.
-      let unlisten: (() => void) | null = null;
-      try {
-        unlisten = await onSmarttagsDownloadProgress(api, (p) => {
+      // Subscribe before invoking so we don't miss early chunks. Cosmetic: it drives the
+      // byte counter, while the outcome comes from the command's own result — so neither an
+      // absent `onEvent` nor a rejected registration is a reason to refuse the download.
+      const outcome = await listeners.attach(
+        DOWNLOAD_PROGRESS,
+        attempt,
+        () => onSmarttagsDownloadProgress(api, (p) => {
           if (mine()) setDownloadProgress(p);
-        });
-      } catch {
-        unlisten = null;
-      }
-      // The panel can unmount while that registration is pending. Cleanup saw an empty
-      // ref, so storing it now would leak a listener nothing can reach — and would start
-      // a ~350 MB download for a panel that is gone.
-      if (!mine()) {
-        unlisten?.();
-        return;
-      }
-      if (unlisten) progressUnlistenRef.current = { owner: attempt, stop: unlisten };
+        }),
+        mine,
+      );
+      // The panel can unmount, or a newer attempt take over, while that registration is
+      // pending. `attach` has already stopped the listener; what is left is not to start a
+      // ~350 MB download for a panel that is gone.
+      if (outcome === "superseded") return;
       const s = await smarttagsDownloadModel(api);
       if (mine()) onSuccess(s);
     } catch (e) {
@@ -282,14 +271,14 @@ function useModelDownload(api: ChairPhotoAPI, onSuccess: (s: SmarttagsModelStatu
     } finally {
       // Release this attempt's own listener and claim unconditionally; only the UI reset
       // needs the panel to still be here.
-      stopListening(attempt);
+      listeners.release(DOWNLOAD_PROGRESS, attempt);
       if (attemptRef.current === attempt) attemptRef.current = null;
-      if (mountedRef.current) {
+      if (listeners.isMounted()) {
         setDownloadProgress(null);
         setDownloading(false);
       }
     }
-  }, [api, downloading, onSuccess, stopListening]);
+  }, [api, downloading, onSuccess, listeners]);
 
   return { downloading, downloadProgress, downloadError, startDownload };
 }
@@ -359,6 +348,11 @@ const REATTACH_SUBSCRIBE_FAILED =
 const REATTACH_VALIDATE_FAILED =
   "Could not check whether indexing is running. Waiting until the catalog answers again.";
 
+/** Listener slot for the cosmetic `smarttags:progress` stream. */
+const PROGRESS = "progress";
+/** Listener slot for the required `smarttags:index_done` terminal event. */
+const INDEX_DONE = "index-done";
+
 function SimilarTagsPanel({ api }: { api: ChairPhotoAPI }) {
   useHostSelection(); // re-render when the active photo changes
   const photoId = api.getActivePhotoId();
@@ -379,18 +373,14 @@ function SimilarTagsPanel({ api }: { api: ChairPhotoAPI }) {
    *  the awaits where `indexing` is still false. */
   const [preparing, setPreparing] = useState(false);
   const [indexResult, setIndexResult] = useState("");
-  /** Listeners are stored with the lease token that installed them, so a stale attempt
-   *  can release only what it owns and cannot orphan a replacement's subscription. */
-  interface OwnedListener {
-    owner: symbol;
-    stop: () => void;
-  }
-  const unlistenRef = useRef<OwnedListener | null>(null);
-  const doneUnlistenRef = useRef<OwnedListener | null>(null);
+  /** Both event subscriptions, each tagged with the lease token that installed it, so a
+   *  stale attempt can release only what it owns and cannot orphan a replacement's — and a
+   *  registration that resolves after teardown is stopped rather than stored. That policy is
+   *  `useOwnedListeners` (issue #13); the slot names below are this panel's part of it. */
+  const listeners = useOwnedListeners();
   // Id of the indexing job this panel is following. Filtering on this allows detection
   // of stale events from a superseded run.
   const jobIdRef = useRef<number | null>(null);
-  const mountedRef = useRef(true);
   /** The single-flight claim shared by reattach and indexing. The ref is what actually
    *  excludes (synchronous); `preparing` only mirrors it into render. A token rather than
    *  a boolean because StrictMode mounts, cleans up and remounts: a torn-down attempt's
@@ -400,27 +390,23 @@ function SimilarTagsPanel({ api }: { api: ChairPhotoAPI }) {
   // model is missing, instead of silently failing on Index/Suggest.
   const [modelStatus, setModelStatus] = useState<SmarttagsModelStatus | null>(null);
 
-  // Drop event subscriptions if the panel unmounts mid-job. This releases unconditionally
-  // — it is the panel going away, not one attempt tidying up after itself — and clears the
-  // claim so a late `endExclusive` finds no matching token and writes no state.
-  useEffect(() => {
-    mountedRef.current = true;
-    return () => {
-      mountedRef.current = false;
+  // The panel going away releases both subscriptions (that is `useOwnedListeners`' own
+  // unmount cleanup, unconditional — it is the panel leaving, not one attempt tidying up
+  // after itself). What is left here is the claim, cleared so a late `endExclusive` finds
+  // no matching token and writes no state.
+  useEffect(
+    () => () => {
       claimRef.current = null;
-      unlistenRef.current?.stop();
-      unlistenRef.current = null;
-      doneUnlistenRef.current?.stop();
-      doneUnlistenRef.current = null;
-    };
-  }, []);
+    },
+    [],
+  );
 
   /** True while `token` still speaks for the panel: mounted, and the lease neither cleared
    *  by unmount nor handed to a replacement. UI and shared-state writes are gated on this;
    *  releasing this attempt's own listeners and lease never is. */
   const stillOwns = useCallback(
-    (token: symbol) => mountedRef.current && claimRef.current === token,
-    [],
+    (token: symbol) => listeners.isMounted() && claimRef.current === token,
+    [listeners],
   );
 
   /** Claim the single-flight slot shared by reattach and indexing, or null if another is
@@ -462,51 +448,44 @@ function SimilarTagsPanel({ api }: { api: ChairPhotoAPI }) {
   // Subscribe to smarttags progress events for the duration of an active job.
   const subscribeToProgress = useCallback(
     async (token: symbol): Promise<boolean> => {
-      if (unlistenRef.current) return stillOwns(token); // already subscribed
-      let unlisten: (() => void) | null = null;
-      try {
-        unlisten = await onSmarttagsProgress(api, (p) => {
-          // Drop stragglers from a superseded indexing run. Every progress event carries a
-          // job id, so the only reason not to filter is that we have not adopted one yet.
-          if (jobIdRef.current != null && p.job !== jobIdRef.current) return;
-          setIndexProgress(p);
-        });
-      } catch {
-        unlisten = null; // cosmetic: a rejected registration must not block the work
-      }
-      // The attempt may have been torn down and replaced while this registration was
-      // pending; a listener nobody owns must be stopped, not stored.
-      if (!stillOwns(token)) {
-        unlisten?.();
-        return false;
-      }
-      if (unlisten) {
-        unlistenRef.current = { owner: token, stop: unlisten };
-        setProgressLive(true);
-      }
+      if (listeners.has(PROGRESS)) return stillOwns(token); // already subscribed
+      // Cosmetic stream: an absent `onEvent` or a rejected registration must not block the
+      // work, so only "superseded" — the attempt no longer owning the panel — is a failure
+      // here. `forJob` drops stragglers from a superseded indexing run, reading the id per
+      // event so this one listener follows whichever job we end up adopting.
+      const outcome = await listeners.attach(
+        PROGRESS,
+        token,
+        () =>
+          onSmarttagsProgress(
+            api,
+            forJob<SmarttagsProgress>(() => jobIdRef.current, setIndexProgress),
+          ),
+        () => stillOwns(token),
+      );
+      if (outcome === "superseded") return false;
+      if (outcome === "installed") setProgressLive(true);
       return true;
     },
-    [api, stillOwns],
+    [api, stillOwns, listeners],
   );
 
   /** With an `owner` this releases only that attempt's listener; without one (end of run,
-   *  unmount) it releases whatever is there. */
-  const unsubscribeProgress = useCallback((owner?: symbol) => {
-    const cur = unlistenRef.current;
-    if (!cur) return;
-    if (owner !== undefined && cur.owner !== owner) return;
-    cur.stop();
-    unlistenRef.current = null;
-    setProgressLive(false);
-  }, []);
+   *  unmount) it releases whatever is there. The determinate bar follows the release, so it
+   *  can never claim to be live when no subscription is. */
+  const unsubscribeProgress = useCallback(
+    (owner?: symbol) => {
+      if (listeners.release(PROGRESS, owner)) setProgressLive(false);
+    },
+    [listeners],
+  );
 
-  const releaseDoneListener = useCallback((owner?: symbol) => {
-    const cur = doneUnlistenRef.current;
-    if (!cur) return;
-    if (owner !== undefined && cur.owner !== owner) return;
-    cur.stop();
-    doneUnlistenRef.current = null;
-  }, []);
+  const releaseDoneListener = useCallback(
+    (owner?: symbol) => {
+      listeners.release(INDEX_DONE, owner);
+    },
+    [listeners],
+  );
 
   // The run is over, so both listeners go regardless of which attempt installed them —
   // this is the job ending, not one attempt tidying up. Only the render-state reset needs
@@ -515,10 +494,10 @@ function SimilarTagsPanel({ api }: { api: ChairPhotoAPI }) {
     jobIdRef.current = null;
     unsubscribeProgress();
     releaseDoneListener();
-    if (!mountedRef.current) return;
+    if (!listeners.isMounted()) return;
     setIndexing(false);
     setIndexProgress(null);
-  }, [unsubscribeProgress, releaseDoneListener]);
+  }, [unsubscribeProgress, releaseDoneListener, listeners]);
 
   // Handle OUR run's terminal event (filtering by job id).
   const handleIndexDone = useCallback(
@@ -544,17 +523,17 @@ function SimilarTagsPanel({ api }: { api: ChairPhotoAPI }) {
     const own = { stale: false };
     const token = beginExclusive();
     if (!token) return;
-    // Terminal events that arrive before adoption completes are held here rather than
-    // handled: running finishIndexing against refs this effect has not populated yet
-    // would clear nothing, and the continuation would then enter "indexing" for a job
-    // that had already ended — a frozen panel plus a leaked listener.
+    // Terminal events that arrive before adoption completes are held by `terminalBuffer`
+    // rather than handled: running finishIndexing against refs this effect has not
+    // populated yet would clear nothing, and the continuation would then enter "indexing"
+    // for a job that had already ended — a frozen panel plus a leaked listener.
     //
     // `adopted` holds the job id we finally commit to, which is not necessarily the one
     // the first read observed: a newer run may have superseded it while we were
-    // attaching. Filtering the handler on this rather than on the first id is what lets
-    // the same live listener follow whichever job we end up adopting.
+    // attaching. The buffer reads it per event rather than capturing it, which is what
+    // lets the same live listener follow whichever job we end up adopting.
     let adopted: number | null = null;
-    const buffered: SmarttagsIndexDone[] = [];
+    const terminal = terminalBuffer<SmarttagsIndexDone>(() => adopted);
     (async () => {
       const first = await smarttagsIndexStatus(api).then(
         (v) => ({ ok: true, s: v }) as const,
@@ -570,28 +549,32 @@ function SimilarTagsPanel({ api }: { api: ChairPhotoAPI }) {
       if (!first.s || jobIdRef.current != null) return;
       // The terminal event is required, so acquire it before showing this panel as
       // indexing — adopting a run we could never see finish would freeze it there.
+      //
+      // `attach` installs only while this attempt still owns the panel; a registration
+      // that resolves after teardown belongs to nobody and is stopped rather than
+      // overwriting (and orphaning) a replacement's listener. Installing it under the slot
+      // straight away, rather than holding it in a local until adoption, also means the
+      // panel unmounting during the re-read below releases it.
       const observed = first.s.job;
-      const stop = await onSmarttagsIndexDone(api, (d) => {
-        if (adopted == null) {
-          buffered.push(d);
-          return;
-        }
-        if (d.job !== adopted) return;
-        handleIndexDone(d);
-      }).catch(() => undefined);
-      // Install only while this attempt still owns the panel. A registration that resolves
-      // after teardown belongs to nobody: stop it rather than overwriting (and orphaning)
-      // a replacement's listener.
-      if (own.stale || !stillOwns(token) || jobIdRef.current != null || doneUnlistenRef.current) {
-        stop?.();
-        return;
-      }
-      if (!stop) {
+      const outcome = await listeners.attach(
+        INDEX_DONE,
+        token,
+        () => onSmarttagsIndexDone(api, terminal.handler(handleIndexDone)),
+        () =>
+          !own.stale &&
+          stillOwns(token) &&
+          jobIdRef.current == null &&
+          !listeners.has(INDEX_DONE),
+      );
+      if (outcome === "superseded") return;
+      if (outcome !== "installed") {
         // A run is going that we cannot follow to completion. Keep Index disabled
         // rather than presenting the panel as idle, and distinguish an absent API
         // from a registration that rejected.
         setUntracked(true);
-        setError(stop === null ? REATTACH_NO_EVENT_SUPPORT : REATTACH_SUBSCRIBE_FAILED);
+        setError(
+          outcome === "unsupported" ? REATTACH_NO_EVENT_SUPPORT : REATTACH_SUBSCRIBE_FAILED,
+        );
         return;
       }
       // Re-read once with the listener already live. This is what keeps a run that
@@ -603,13 +586,13 @@ function SimilarTagsPanel({ api }: { api: ChairPhotoAPI }) {
         () => ({ ok: false, s: null }) as const,
       );
       if (own.stale || !stillOwns(token) || jobIdRef.current != null) {
-        stop();
+        releaseDoneListener(token);
         return;
       }
       if (!now.ok) {
         // A failed query is not evidence of idleness either; drop the listener but keep
         // conflicting actions disabled, since something may still be running untracked.
-        stop();
+        releaseDoneListener(token);
         setUntracked(true);
         setError(REATTACH_VALIDATE_FAILED);
         return;
@@ -618,21 +601,20 @@ function SimilarTagsPanel({ api }: { api: ChairPhotoAPI }) {
         // Confirmed idle — the only outcome that may return to an enabled panel. Replay
         // the observed run's terminal event if we caught it; never install a snapshot
         // of a job that has already ended.
-        stop();
-        const ended = buffered.find((d) => d.job === observed);
+        releaseDoneListener(token);
+        const ended = terminal.buffered(observed);
         if (ended) handleIndexDone(ended);
         return;
       }
       // Adopt whatever is actually running now — the observed job, or a newer one that
       // superseded it. Either way the listener is live and can see it finish.
       adopted = now.s.job;
-      doneUnlistenRef.current = { owner: token, stop };
       jobIdRef.current = adopted;
       setIndexing(true);
       setIndexProgress({ done: now.s.done, total: now.s.total, job: adopted });
       // Replay before subscribing to progress: the required path must not depend on
       // the cosmetic one, which can still reject here.
-      const ours = buffered.find((d) => d.job === adopted);
+      const ours = terminal.buffered(adopted);
       if (ours) {
         handleIndexDone(ours);
         return;
@@ -657,7 +639,17 @@ function SimilarTagsPanel({ api }: { api: ChairPhotoAPI }) {
       own.stale = true;
       endExclusive(token);
     };
-  }, [api, subscribeToProgress, handleIndexDone, beginExclusive, endExclusive, stillOwns]);
+  }, [
+    api,
+    subscribeToProgress,
+    unsubscribeProgress,
+    releaseDoneListener,
+    handleIndexDone,
+    beginExclusive,
+    endExclusive,
+    stillOwns,
+    listeners,
+  ]);
 
   // While untracked, poll status at a low rate purely to re-enable Index once the
   // backend goes idle. This deliberately reports nothing — no result message, no
@@ -700,31 +692,27 @@ function SimilarTagsPanel({ api }: { api: ChairPhotoAPI }) {
     setIndexProgress(null);
     jobIdRef.current = null;
 
-    const pendingDone: SmarttagsIndexDone[] = [];
+    // The run's id is not known until the start command answers, and the terminal listener
+    // has to be live before that — so hold anything that arrives in between.
+    const terminal = terminalBuffer<SmarttagsIndexDone>(() => jobIdRef.current);
     try {
       // Required, so it comes before the cosmetic progress stream and before the
       // command: a host that cannot deliver it must refuse the run rather than start
       // one that would sit in "indexing" forever.
-      const stop = await onSmarttagsIndexDone(api, (d) => {
-        if (jobIdRef.current === null) {
-          pendingDone.push(d);
-          return;
-        }
-        if (d.job !== jobIdRef.current) return;
-        handleIndexDone(d);
-      }).catch(() => undefined);
-      if (!stop) {
-        if (stillOwns(token)) {
-          setIndexing(false);
-          setError(stop === null ? NO_EVENT_SUPPORT : EVENT_SUBSCRIBE_FAILED);
-        }
+      const outcome = await listeners.attach(
+        INDEX_DONE,
+        token,
+        () => onSmarttagsIndexDone(api, terminal.handler(handleIndexDone)),
+        () => stillOwns(token),
+      );
+      // Lost the lease or the panel mid-registration: `attach` has already stopped the
+      // listener, and no run has been started, so there is nothing to report.
+      if (outcome === "superseded") return;
+      if (outcome !== "installed") {
+        setIndexing(false);
+        setError(outcome === "unsupported" ? NO_EVENT_SUPPORT : EVENT_SUBSCRIBE_FAILED);
         return;
       }
-      if (!stillOwns(token)) {
-        stop();
-        return;
-      }
-      doneUnlistenRef.current = { owner: token, stop };
       // Losing the lease or the panel during the cosmetic subscription must abort: a
       // remount's reattach may already have observed this panel idle, and starting the
       // backend run now would leave it untracked.
@@ -734,7 +722,7 @@ function SimilarTagsPanel({ api }: { api: ChairPhotoAPI }) {
       // attempt's — publishing them from a stale token would overwrite a replacement's.
       if (!stillOwns(token)) return;
       jobIdRef.current = job;
-      const ours = pendingDone.find((d) => d.job === job);
+      const ours = terminal.buffered(job);
       if (ours) handleIndexDone(ours);
     } catch (e: unknown) {
       // Start-up failure (no catalog open / model missing) — no done event will come.

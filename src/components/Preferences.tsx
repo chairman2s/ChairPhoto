@@ -26,6 +26,7 @@ import {
   useHostLifecycle,
   useHostSettingsPanels,
 } from "../modules/host";
+import { ModuleSettings } from "../modules/ModuleContent";
 import { VolumesSection } from "./VolumesPanel";
 import { ModulesSection } from "./ModulesPanel";
 
@@ -585,9 +586,9 @@ function ModuleSettingsTab({ moduleId }: { moduleId: string }) {
   }
   return (
     <div className="prefs-section">
-      {panels.map((render, i) => (
+      {panels.map((panel, i) => (
         <section key={i} className="editor-section">
-          {render()}
+          <ModuleSettings panel={panel} />
         </section>
       ))}
     </div>

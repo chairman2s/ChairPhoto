@@ -150,8 +150,9 @@ pub async fn switch_catalog(
 ///
 /// Nested acquisition is always catalog -> abort -> slot, here and in every job start that
 /// takes more than one, so this cannot invert. Both switch phases are also the only places
-/// that hold two abort locks at once, and they take them in the same order (scan, faces,
-/// face matching, sharpness, pHash, Smart Tagging).
+/// that hold two abort locks at once, and they take them in the same order — the field order
+/// of `commands::jobs::JobRegistry` (scan, face indexing, face matching, sharpness, pHash,
+/// Smart Tagging), which is where that order is now defined rather than copied.
 ///
 /// Extracted from `switch_catalog` so the ownership transition can be driven directly by
 /// the interleaving tests in `commands::smarttags`, which have no Tauri `AppHandle`.
@@ -179,32 +180,15 @@ pub(super) fn detach_catalog_and_trip_jobs_with(
     before_drop: impl FnOnce(Option<&Catalog>) -> Result<(), String>,
 ) -> Result<(), String> {
     let mut cat_guard = state.catalog.lock().map_err(|e| e.to_string())?;
-    let scan_guard = state.scan_abort.lock().map_err(|e| e.to_string())?;
-    #[cfg(feature = "faces")]
-    let faces_guard = state.faces_abort.lock().map_err(|e| e.to_string())?;
-    #[cfg(feature = "faces")]
-    let faces_match_guard = state.faces_match_abort.lock().map_err(|e| e.to_string())?;
-    let sharpness_guard = state.sharpness_abort.lock().map_err(|e| e.to_string())?;
-    let phash_guard = state.phash_abort.lock().map_err(|e| e.to_string())?;
-    #[cfg(feature = "smarttags")]
-    let smarttags_guard = state.smarttags_abort.lock().map_err(|e| e.to_string())?;
-    // The status slots are cleared here too, not just the abort flags. Tripping alone leaves
-    // the old job reachable as a slot's owner: `smarttags_index_status` /
-    // `faces_index_status` / `faces_match_status` keep reporting it as running, and the panel
-    // re-queries on mount, so after a switch it adopts a job belonging to the catalog the user
-    // has left and shows "indexing" against the new one.
-    //
-    // Clearing is safe in *this* phase specifically, which is why it is not done in phase two.
-    // Phase one already holds the catalog lock, so no start can be inside its
-    // catalog -> abort -> slot claim; the slot's owner is necessarily the job being tripped.
-    // Between the phases the catalog is `None`, so every start fails before claiming. In phase
-    // two a newer start can already own the slot, and clearing there would wipe it.
-    //
-    // Every slot goes through `JobStatusSlots`, not a hand-written list: this used to name
-    // smarttags and face matching individually and silently omitted face *indexing*, which is
-    // issue #51. `lock_all`/`clear_all` enumerate the group exhaustively, so a slot added
-    // later cannot be missed here without a compile error.
-    let job_guards = state.jobs.lock_all()?;
+    // Every abort generation AND every status slot, locked and unmutated. The status slots
+    // matter as much as the flags: tripping alone leaves the old job reachable as a slot's
+    // owner, so `smarttags_index_status` / `faces_index_status` / `faces_match_status` keep
+    // reporting it as running and a remounting panel adopts a job belonging to the catalog
+    // the user has left (issue #51). `JobRegistry` enumerates both groups exhaustively, so a
+    // family added later cannot be missed here without a compile error — see
+    // `jobs::JobRegistry::lock_for_detach` and `jobs::DetachGuards::trip_and_clear_all` for
+    // why clearing is safe in *this* phase and not in phase two.
+    let job_guards = state.jobs.lock_for_detach()?;
 
     // Everything is locked and nothing is mutated yet — the only point where a fallible
     // caller-supplied step can still back out cleanly.
@@ -216,16 +200,7 @@ pub(super) fn detach_catalog_and_trip_jobs_with(
     // transition, rather than having its precondition checked in some earlier window.
     before_drop(cat_guard.as_ref())?;
 
-    scan_guard.store(true, Ordering::Relaxed);
-    #[cfg(feature = "faces")]
-    faces_guard.store(true, Ordering::Relaxed);
-    #[cfg(feature = "faces")]
-    faces_match_guard.store(true, Ordering::Relaxed);
-    sharpness_guard.store(true, Ordering::Relaxed);
-    phash_guard.store(true, Ordering::Relaxed);
-    #[cfg(feature = "smarttags")]
-    smarttags_guard.store(true, Ordering::Relaxed);
-    job_guards.clear_all();
+    job_guards.trip_and_clear_all();
     *cat_guard = None;
     Ok(())
 }
@@ -261,44 +236,13 @@ pub(super) fn publish_catalog_and_reset_jobs(
     state: &AppState,
     catalog: Catalog,
 ) -> Result<Arc<AtomicBool>, String> {
-    let fresh_abort = Arc::new(AtomicBool::new(false));
-
     let mut cat_guard = state.catalog.lock().map_err(|e| e.to_string())?;
-    let mut scan_guard = state.scan_abort.lock().map_err(|e| e.to_string())?;
-    #[cfg(feature = "faces")]
-    let mut faces_guard = state.faces_abort.lock().map_err(|e| e.to_string())?;
-    #[cfg(feature = "faces")]
-    let mut faces_match_guard = state.faces_match_abort.lock().map_err(|e| e.to_string())?;
-    let mut sharpness_guard = state.sharpness_abort.lock().map_err(|e| e.to_string())?;
-    let mut phash_guard = state.phash_abort.lock().map_err(|e| e.to_string())?;
-    #[cfg(feature = "smarttags")]
-    let mut smarttags_guard = state.smarttags_abort.lock().map_err(|e| e.to_string())?;
-
-    scan_guard.store(true, Ordering::Relaxed);
-    #[cfg(feature = "faces")]
-    faces_guard.store(true, Ordering::Relaxed);
-    #[cfg(feature = "faces")]
-    faces_match_guard.store(true, Ordering::Relaxed);
-    sharpness_guard.store(true, Ordering::Relaxed);
-    phash_guard.store(true, Ordering::Relaxed);
-    #[cfg(feature = "smarttags")]
-    smarttags_guard.store(true, Ordering::Relaxed);
-
-    *scan_guard = fresh_abort.clone();
-    #[cfg(feature = "faces")]
-    {
-        *faces_guard = Arc::new(AtomicBool::new(false));
-    }
-    #[cfg(feature = "faces")]
-    {
-        *faces_match_guard = Arc::new(AtomicBool::new(false));
-    }
-    *sharpness_guard = Arc::new(AtomicBool::new(false));
-    *phash_guard = Arc::new(AtomicBool::new(false));
-    #[cfg(feature = "smarttags")]
-    {
-        *smarttags_guard = Arc::new(AtomicBool::new(false));
-    }
+    // Abort generations only — no status slots. `JobRegistry` enumerates them exhaustively,
+    // so a family added later cannot be missed. See `jobs::AbortGuards::trip_and_replace_all`
+    // for why whatever is installed is tripped before being replaced, and why the slots are
+    // deliberately left alone here.
+    let job_guards = state.jobs.lock_for_publish()?;
+    let fresh_abort = job_guards.trip_and_replace_all();
     *cat_guard = Some(catalog);
 
     Ok(fresh_abort)

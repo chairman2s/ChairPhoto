@@ -71,8 +71,8 @@ Read only the documents triggered by the task:
   are async or moved to a blocking worker; they must not block the UI thread.
 - A newer job start or catalog switch must make older workers abortable and unreachable as
   owners. Job status/progress/terminal mutation is scoped to the current job id.
-- Where a subsystem exposes a queryable job-status slot (currently Faces and Smart Tagging),
-  clear it before the terminal event and only if that job still owns it.
+- Where a subsystem exposes a queryable job-status slot (currently Faces, Smart Tagging and
+  identity repair), clear it before the terminal event and only if that job still owns it.
 - Acquire every lock needed for an ownership transition before the first mutation. Keep a
   documented global lock order; do not repair one side of a start/switch protocol in isolation.
 - Event listeners are resources: give each async registration an owner, stop late registrations,

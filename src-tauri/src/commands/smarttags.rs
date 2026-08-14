@@ -99,55 +99,23 @@ pub struct SmarttagsIndexDone {
 
 /// Claim ownership of the Smart Tagging index job: snapshot the catalog, allocate the job
 /// id, trip the previous job, install this job's abort flag and claim the status slot as
-/// ONE transition, holding all three locks throughout. Returns the catalog's db path and
-/// root, the new job's abort flag, and its id.
+/// ONE transition, holding catalog → abort → slot throughout.
 ///
-/// Two starts can run concurrently, since Tauri dispatches commands onto its runtime. If
-/// the abort lock were released before the slot write they could interleave: A installs its
-/// flag, B trips A and claims the slot, then A — already aborted — overwrites the slot with
-/// itself and the panel tracks a dead job. Job ids cannot arbitrate that, because they are
-/// allocated after the flag is installed.
+/// The transition itself lives in [`crate::commands::jobs::JobFamily::begin`] — one
+/// implementation shared with both face-job families and fenced by the same locks as the two
+/// `switch_catalog` phases. Read that function for why each of the three locks is held
+/// across the whole claim; this wrapper only supplies the initial status snapshot (`total`
+/// is unknown until the queue is populated — claiming anyway is what lets a status query
+/// between "command returned" and "first progress event" already see it running).
 ///
-/// The catalog lock is held for the same reason, against `switch_catalog` rather than
-/// against another start — this is what brings the job under catalog-switch ownership. The
-/// switch holds that same lock while it trips the current flag and drops the handle, and
-/// again while it publishes the new catalog and fresh flags, so only three interleavings
-/// exist: the switch completes first and this job snapshots the new catalog; it runs
-/// entirely after and trips the generation installed here; or it is mid-switch, in which
-/// case the catalog reads as `None` here and this job returns having touched nothing.
-/// Snapshotting the catalog outside this block — as this command used to — allows a fourth:
-/// install an un-tripped generation after the switch's only abort signal, then index the
-/// catalog it is about to close, with a handle no Cancel, later start or subsequent switch
-/// can reach.
-///
-/// Every *nested* acquisition in the backend is catalog → abort → slot: this block, the
-/// same block in `faces_index_photos`, and both `switch_catalog` phases. The scan, sharpness
-/// and pHash starts install their abort generation and release that lock before reading the
-/// catalog, so they never hold two at once and cannot invert against this order;
-/// `switch_catalog` covers them instead by tripping whatever is installed before it replaces
-/// anything. `smarttags_index_cancel` takes only the abort lock and workers only the slot
-/// lock.
-///
-/// Everything fallible here is read-only and precedes the first mutation, so an error
-/// cannot leave the previous job aborted with no successor.
+/// Kept as a named function rather than inlined so the interleaving tests below can drive
+/// the start exactly as `smarttags_index_photos` does; they have no Tauri `AppHandle`.
 #[cfg(feature = "smarttags")]
-fn begin_smarttags_job(
-    state: &AppState,
-) -> Result<(PathBuf, PathBuf, Arc<AtomicBool>, u64), String> {
-    let cat_guard = state.catalog.lock().map_err(|e| e.to_string())?;
-    let c = cat_guard.as_ref().ok_or("No catalog is open")?;
-    let (db_path, root) = (c.db_path().to_path_buf(), c.root().to_path_buf());
-
-    let mut abort_guard = state.smarttags_abort.lock().map_err(|e| e.to_string())?;
-    let mut slot_guard = state.jobs.smarttags.lock().map_err(|e| e.to_string())?;
-    let job = state.smarttags_job_seq.fetch_add(1, Ordering::Relaxed) + 1;
-    abort_guard.store(true, Ordering::Relaxed);
-    let fresh = Arc::new(AtomicBool::new(false));
-    *abort_guard = fresh.clone();
-    // Claim the slot (total is unknown until the queue is populated) so a status query
-    // between "command returned" and "first progress event" already sees it running.
-    *slot_guard = Some(SmarttagsJobStatus { job, done: 0, total: 0 });
-    Ok((db_path, root, fresh, job))
+fn begin_smarttags_job(state: &AppState) -> Result<JobClaim<SmarttagsJobStatus>, String> {
+    state
+        .jobs
+        .smarttags
+        .begin(&state.catalog, |job| SmarttagsJobStatus { job, done: 0, total: 0 })
 }
 
 /// Begin (or resume) the background Smart Tagging embedding-index job (H7b). Opens its
@@ -194,14 +162,12 @@ pub async fn smarttags_index_photos(
         );
     }
 
-    // Clone the job status slot so the worker can update it.
-    let job_slot = state.jobs.smarttags.clone();
-
     // Snapshot the catalog, allocate the job id, trip the previous job, install this job's
     // abort flag and claim the status slot as ONE transition. The model check above is the
     // only other fallible step and runs before it, so a failure can never leave the
     // previous job aborted with no replacement installed.
-    let (db_path, root, abort, job) = begin_smarttags_job(state.inner())?;
+    let JobClaim { db_path, root, abort, job, slot: job_slot } =
+        begin_smarttags_job(state.inner())?;
 
     tauri::async_runtime::spawn_blocking(move || {
         use crate::catalog::Catalog;
@@ -209,14 +175,9 @@ pub async fn smarttags_index_photos(
         use crate::plugins::indexing as shared_indexing;
 
         // Release the status slot — but only if a newer job hasn't already claimed it.
-        //
-        // Always called BEFORE emitting the terminal event, never after. A reattaching
-        // panel registers its listener and then re-reads status; if the slot were still
-        // set when the one terminal event had already been emitted, that panel would
-        // adopt a job it can never see finish and sit in "indexing" forever. Clearing
-        // first means a missed terminal necessarily reads back as idle, or as a newer
-        // job that is genuinely still running.
-        let clear_job_slot = || clear_slot_if_owner(&job_slot, job);
+        // `JobSlot::clear` is the shared guard; see its doc for why this always runs BEFORE
+        // the terminal event is emitted, never after.
+        let clear_job_slot = || job_slot.clear();
 
         // Secondary connection — never contends with the primary's UI reads.
         let sec = match Catalog::open_secondary(&db_path, &root) {
@@ -248,7 +209,10 @@ pub async fn smarttags_index_photos(
             .flatten();
 
         // Size the CLIP session pool from the shared `indexing.speed` setting (same knob
-        // as face indexing). `configure` is a no-op once a pool exists (first run wins).
+        // as face indexing). The pool is keyed by this configuration (`embed::PoolKey`,
+        // issue #18), so a value that changed since the last run rebuilds it here instead of
+        // reusing a stale pool; `model_path_setting` below is part of the same key, so a
+        // changed `smarttags.model_path` rebuilds too.
         let plan = shared_indexing::load_indexing_plan(sec.conn());
         embed::configure(plan.parallelism, plan.intra_threads);
 
@@ -276,9 +240,12 @@ pub async fn smarttags_index_photos(
             // newer job's slot. Starting a new run trips this one's abort flag, and the
             // indexer emits progress for the current photo before it checks that flag
             // (plugins/smarttags/indexer.rs:186-189), so a superseded run can still arrive
-            // here. Without the guard it would rewrite the slot back to itself and then
-            // clear it on the way out, leaving the newer run invisible to status queries.
-            write_slot_if_owner(&job_slot_clone, job, p.done as usize, p.total as usize);
+            // here. `JobSlot::publish` is the shared guard that rejects it.
+            job_slot_clone.publish(|job| SmarttagsJobStatus {
+                job,
+                done: p.done as usize,
+                total: p.total as usize,
+            });
         };
 
         let resolve_fn = |photo_id: i64| {
@@ -341,12 +308,7 @@ pub async fn smarttags_index_photos(
 #[cfg(feature = "smarttags")]
 #[tauri::command]
 pub async fn smarttags_index_cancel(state: State<'_, AppState>) -> Result<(), String> {
-    let guard = state
-        .smarttags_abort
-        .lock()
-        .map_err(|e| e.to_string())?;
-    guard.store(true, Ordering::Relaxed);
-    Ok(())
+    state.jobs.smarttags.cancel()
 }
 
 /// Query the live status of any running Smart Tagging indexing job, or `None` if idle.
@@ -356,7 +318,7 @@ pub async fn smarttags_index_cancel(state: State<'_, AppState>) -> Result<(), St
 pub async fn smarttags_index_status(
     state: State<'_, AppState>,
 ) -> Result<Option<SmarttagsJobStatus>, String> {
-    Ok(*state.jobs.smarttags.lock().map_err(|e| e.to_string())?)
+    state.jobs.smarttags.status()
 }
 
 // ── H7c — kNN suggestion engine ──────────────────────────────────────────────
@@ -665,35 +627,10 @@ const SWITCHED_MID_TRAIN: &str =
 //
 // The last test is a contention net whose assertion holds under every legal interleaving; it
 // samples rather than forces, so it backs the other three up instead of standing in for them.
-
-/// Write `done`/`total` into the status slot, but only when `job` still owns it.
-///
-/// Extracted so the production path and its test share one implementation. Both call sites
-/// used to inline this comparison, which meant a test could only ever check a copy of the
-/// logic — and a copy stays green when the real guard is deleted.
-#[cfg(feature = "smarttags")]
-fn write_slot_if_owner(
-    slot: &Arc<Mutex<Option<SmarttagsJobStatus>>>,
-    job: u64,
-    done: usize,
-    total: usize,
-) {
-    if let Ok(mut s) = slot.lock() {
-        if s.as_ref().map(|x| x.job) == Some(job) {
-            *s = Some(SmarttagsJobStatus { job, done, total });
-        }
-    }
-}
-
-/// Clear the status slot, but only when `job` still owns it. See [`write_slot_if_owner`].
-#[cfg(feature = "smarttags")]
-fn clear_slot_if_owner(slot: &Arc<Mutex<Option<SmarttagsJobStatus>>>, job: u64) {
-    if let Ok(mut s) = slot.lock() {
-        if s.as_ref().map(|x| x.job) == Some(job) {
-            *s = None;
-        }
-    }
-}
+//
+// The slot-ownership guards these used to test locally are now `JobSlot::publish` /
+// `JobSlot::clear`, tested once in `commands::jobs` — where the same implementation also
+// covers face indexing and face matching, which previously inlined five uncovered copies.
 
 /// Classifier training holds the catalog lock only for its two SQLite phases, and abandons
 /// the write if the catalog is replaced in between.
@@ -992,7 +929,7 @@ mod smarttags_ownership_tests {
     /// sample can catch it by luck. The observation that discriminates is that the lock
     /// stays held — which only happens when the holder is parked while owning it.
     ///
-    /// `try_lock` never blocks, so a caller holding `smarttags_abort` can probe the catalog
+    /// `try_lock` never blocks, so a caller holding the abort lock can probe the catalog
     /// lock from here without inverting the catalog → abort order.
     fn catalog_stays_locked(state: &AppState, window: Duration, timeout: Duration) -> bool {
         let give_up = Instant::now() + timeout;
@@ -1030,11 +967,11 @@ mod smarttags_ownership_tests {
         let state = state_with(cat_a);
 
         // Start a job exactly the way `smarttags_index_photos` does.
-        let (db_path, root, abort, job) = begin_smarttags_job(&state).unwrap();
+        let JobClaim { db_path, root, abort, job, slot: _ } = begin_smarttags_job(&state).unwrap();
         assert_eq!(db_path, db_a.to_path_buf());
         assert_eq!(root, root_a);
         assert_eq!(
-            state.jobs.smarttags.lock().unwrap().map(|s| s.job),
+            state.jobs.smarttags.status().unwrap().map(|s| s.job),
             Some(job),
             "the start must claim the status slot"
         );
@@ -1085,7 +1022,7 @@ mod smarttags_ownership_tests {
         // catalog is a different, un-tripped Arc — so the old worker cannot be revived by
         // it, and a Cancel or a later switch acts on the new generation only.
         assert!(abort.load(Ordering::Relaxed), "the old flag must stay tripped");
-        let installed = state.smarttags_abort.lock().unwrap().clone();
+        let installed = state.jobs.smarttags.installed().unwrap();
         assert!(
             !Arc::ptr_eq(&installed, &abort),
             "the switch must install a fresh generation, not reuse the aborted one"
@@ -1112,24 +1049,24 @@ mod smarttags_ownership_tests {
         let (cat_b, db_b, root_b) = temp_catalog("mid-b", 0);
         let state = state_with(cat_a);
 
-        let (first_db, _root, first_abort, first_job) = begin_smarttags_job(&state).unwrap();
-        assert_eq!(first_db, db_a.to_path_buf());
+        let first = begin_smarttags_job(&state).unwrap();
+        assert_eq!(first.db_path, db_a.to_path_buf());
 
         // Phase one: the running job is tripped and the outgoing catalog is detached.
         detach_catalog_and_trip_jobs(&state).unwrap();
         assert!(
-            first_abort.load(Ordering::Relaxed),
+            first.abort.load(Ordering::Relaxed),
             "phase one must trip the running job"
         );
 
-        let before = state.smarttags_abort.lock().unwrap().clone();
-        let seq_before = state.smarttags_job_seq.load(Ordering::Relaxed);
-        let slot_before = *state.jobs.smarttags.lock().unwrap();
+        let before = state.jobs.smarttags.installed().unwrap();
+        let seq_before = state.jobs.smarttags.abort().job_ids_issued();
+        let slot_before = state.jobs.smarttags.status().unwrap();
 
         let err = begin_smarttags_job(&state).unwrap_err();
         assert_eq!(err, "No catalog is open");
 
-        let after = state.smarttags_abort.lock().unwrap().clone();
+        let after = state.jobs.smarttags.installed().unwrap();
         assert!(
             Arc::ptr_eq(&before, &after),
             "a start mid-switch must not install a generation"
@@ -1139,12 +1076,12 @@ mod smarttags_ownership_tests {
             "the installed generation is still the tripped one"
         );
         assert_eq!(
-            state.smarttags_job_seq.load(Ordering::Relaxed),
+            state.jobs.smarttags.abort().job_ids_issued(),
             seq_before,
             "a rejected start must not burn a job id"
         );
         assert_eq!(
-            state.jobs.smarttags.lock().unwrap().map(|s| s.job),
+            state.jobs.smarttags.status().unwrap().map(|s| s.job),
             slot_before.map(|s| s.job),
             "a rejected start must leave the status slot alone"
         );
@@ -1153,27 +1090,32 @@ mod smarttags_ownership_tests {
         // the old job's flag, whose worker must stay aborted.
         publish_catalog_and_reset_jobs(&state, cat_b).unwrap();
         assert!(
-            first_abort.load(Ordering::Relaxed),
+            first.abort.load(Ordering::Relaxed),
             "phase two must not resurrect the superseded job"
         );
 
         // A start after the switch snapshots the NEW catalog and becomes the reachable
         // generation.
-        let (db, root, abort2, job2) = begin_smarttags_job(&state).unwrap();
-        assert_eq!(db, db_b.to_path_buf(), "the new job must index the catalog switched to");
-        assert_eq!(root, root_b);
-        assert_ne!(job2, first_job, "each start gets its own job id");
-        assert!(!abort2.load(Ordering::Relaxed));
-        let installed = state.smarttags_abort.lock().unwrap().clone();
+        let second = begin_smarttags_job(&state).unwrap();
+        assert_eq!(
+            second.db_path,
+            db_b.to_path_buf(),
+            "the new job must index the catalog switched to"
+        );
+        assert_eq!(second.root, root_b);
+        assert_ne!(second.job, first.job, "each start gets its own job id");
+        assert!(!second.abort.load(Ordering::Relaxed));
+        let installed = state.jobs.smarttags.installed().unwrap();
         assert!(
-            Arc::ptr_eq(&abort2, &installed),
+            Arc::ptr_eq(&second.abort, &installed),
             "the new job's flag must be the installed generation"
         );
         assert_eq!(
-            state.jobs.smarttags.lock().unwrap().map(|s| s.job),
-            Some(job2),
+            state.jobs.smarttags.status().unwrap().map(|s| s.job),
+            Some(second.job),
             "the new job owns the status slot"
         );
+        assert!(second.slot.owns(), "and its slot handle agrees");
     }
 
     /// A start that is blocked partway through its claim is *still holding the catalog lock*.
@@ -1189,7 +1131,7 @@ mod smarttags_ownership_tests {
     /// catalog A, let the switch trip every generation, then install a live generation that
     /// no Cancel, later start or subsequent switch can reach.
     ///
-    /// Holding `smarttags_abort` parks a start exactly at that seam, because the claim order
+    /// Holding the family's abort lock parks a start exactly at that seam, because the order
     /// is catalog → abort → slot: to be waiting on the abort lock it must already own the
     /// catalog lock. So the catalog lock stays held for as long as this test holds the abort
     /// lock — and under the pre-fix shape it would be free, because that start had already
@@ -1200,7 +1142,7 @@ mod smarttags_ownership_tests {
         let state = state_with(cat_a);
 
         // Take the lock the claim needs second, then park a start behind it.
-        let abort_held = state.smarttags_abort.lock().unwrap();
+        let abort_held = state.jobs.smarttags.abort().lock().unwrap();
 
         std::thread::scope(|scope| {
             let start = scope.spawn(|| begin_smarttags_job(&state));
@@ -1215,16 +1157,20 @@ mod smarttags_ownership_tests {
             // Release it and confirm the claim it was parked in the middle of completes
             // normally — the test observes a stalled transition, it does not break one.
             drop(abort_held);
-            let (db, _root, abort, job) = start.join().unwrap().unwrap();
-            assert_eq!(db, db_a.to_path_buf(), "the parked start indexes the catalog it snapshotted");
-            let installed = state.smarttags_abort.lock().unwrap().clone();
+            let claim = start.join().unwrap().unwrap();
+            assert_eq!(
+                claim.db_path,
+                db_a.to_path_buf(),
+                "the parked start indexes the catalog it snapshotted"
+            );
+            let installed = state.jobs.smarttags.installed().unwrap();
             assert!(
-                Arc::ptr_eq(&abort, &installed),
+                Arc::ptr_eq(&claim.abort, &installed),
                 "the unblocked start's flag must be the installed generation"
             );
             assert_eq!(
-                state.jobs.smarttags.lock().unwrap().map(|s| s.job),
-                Some(job),
+                state.jobs.smarttags.status().unwrap().map(|s| s.job),
+                Some(claim.job),
                 "and it must own the status slot"
             );
         });
@@ -1253,8 +1199,8 @@ mod smarttags_ownership_tests {
         let started: Mutex<Vec<(PathBuf, Arc<AtomicBool>)>> = Mutex::new(Vec::new());
         // One uncontended start, so the check below cannot be vacuous even in the unlikely
         // case that every racing start lands in the mid-switch window.
-        let (db, _root, first, _job) = begin_smarttags_job(&state).unwrap();
-        started.lock().unwrap().push((db, first));
+        let first = begin_smarttags_job(&state).unwrap();
+        started.lock().unwrap().push((first.db_path, first.abort));
 
         for round in 0..50 {
             let (next_db, next_root) = if round % 2 == 0 {
@@ -1264,8 +1210,8 @@ mod smarttags_ownership_tests {
             };
             std::thread::scope(|s| {
                 s.spawn(|| {
-                    if let Ok((db, _root, abort, _job)) = begin_smarttags_job(&state) {
-                        started.lock().unwrap().push((db, abort));
+                    if let Ok(c) = begin_smarttags_job(&state) {
+                        started.lock().unwrap().push((c.db_path, c.abort));
                     }
                 });
                 s.spawn(|| {
@@ -1275,7 +1221,7 @@ mod smarttags_ownership_tests {
                 });
             });
 
-            let installed = state.smarttags_abort.lock().unwrap().clone();
+            let installed = state.jobs.smarttags.installed().unwrap();
             let open_db = state
                 .catalog
                 .lock()
@@ -1302,58 +1248,50 @@ mod smarttags_ownership_tests {
     }
 
     /// Acceptance criterion 3: "Status/progress/terminal updates remain scoped to the owning
-    /// job id." The two guards that enforce it — `clear_job_slot` (smarttags.rs:221) and the
-    /// slot write inside `emit_fn` (smarttags.rs:288) — had no coverage at all: a reviewer
-    /// deleted both and the whole lib suite stayed green.
+    /// job id" — checked here on the **wiring**, not on the guard.
     ///
-    /// The guards exist because a superseded run can still arrive at either point after a
-    /// newer one has claimed the slot. Without them it rewrites the slot back to itself and
-    /// then clears it on the way out, leaving the newer, genuinely-running job invisible to
-    /// `smarttags_index_status` — the panel reads idle and stops showing progress for a job
-    /// that is still working.
+    /// The guard itself is `JobSlot::publish` / `JobSlot::clear`, tested once in
+    /// `commands::jobs` (`slot_writes_are_scoped_to_the_owning_job`) where the same
+    /// implementation also covers face indexing and matching. What that test cannot show is
+    /// that *this* command's worker handle points at the very slot `smarttags_index_status`
+    /// reads. So this one runs two real starts against a real `AppState` and drives the
+    /// superseded claim's handle: if the wiring were wrong — a handle onto some other
+    /// `Arc<Mutex<…>>` — the superseded run's clear would appear to succeed here.
     ///
-    /// This exercises the guard conditions directly rather than through a live indexer,
-    /// because reproducing the race in a real run means winning it. Both branches are
-    /// asserted: the owner's write lands, the superseded one's does not.
+    /// Both branches are asserted: the superseded run cannot clear, the owner can.
     #[test]
-    fn slot_writes_are_scoped_to_the_owning_job() {
-        let slot: Arc<Mutex<Option<SmarttagsJobStatus>>> = Arc::new(Mutex::new(None));
+    fn the_worker_handle_writes_the_slot_status_queries_read() {
+        let (cat, _db, _root) = temp_catalog("slot-wiring", 0);
+        let state = state_with(cat);
 
-        // A newer job (id 2) owns the slot.
-        *slot.lock().unwrap() = Some(SmarttagsJobStatus { job: 2, done: 5, total: 100 });
+        let superseded = begin_smarttags_job(&state).unwrap();
+        let owner = begin_smarttags_job(&state).unwrap();
 
-        // The superseded run (id 1) tries to report progress. The guard must reject it.
-        write_slot_if_owner(&slot, 1, 42, 100);
-        let after = slot.lock().unwrap().clone();
+        // The superseded run reports progress after a newer one claimed the slot.
+        superseded.slot.publish(|job| SmarttagsJobStatus { job, done: 42, total: 100 });
         assert_eq!(
-            after.as_ref().map(|s| (s.job, s.done)),
-            Some((2, 5)),
-            "a superseded job (1) overwrote the slot owned by a newer job (2); \
-             without this guard the newer run becomes invisible to status queries"
+            state.jobs.smarttags.status().unwrap().map(|s| (s.job, s.done)),
+            Some((owner.job, 0)),
+            "a superseded job overwrote the slot `smarttags_index_status` reads; \
+             the newer run would become invisible to status queries"
         );
 
-        // The owner's own write must still land, or the guard has broken progress entirely.
-        write_slot_if_owner(&slot, 2, 7, 100);
+        // The owner's write lands, and reaches the same status query.
+        owner.slot.publish(|job| SmarttagsJobStatus { job, done: 7, total: 100 });
         assert_eq!(
-            slot.lock().unwrap().as_ref().map(|s| (s.job, s.done)),
-            Some((2, 7)),
-            "the owning job's progress write was rejected"
+            state.jobs.smarttags.status().unwrap().map(|s| (s.job, s.done)),
+            Some((owner.job, 7))
         );
 
-        // The superseded run finishing must not clear the newer job's slot.
-        clear_slot_if_owner(&slot, 1);
+        // The superseded run finishing must not clear the running job's slot.
+        superseded.slot.clear();
         assert!(
-            slot.lock().unwrap().is_some(),
+            state.jobs.smarttags.status().unwrap().is_some(),
             "a superseded job cleared the slot out from under the running one; \
              the panel would read idle while indexing is still in progress"
         );
 
-        // The owner clearing on completion must work.
-        clear_slot_if_owner(&slot, 2);
-        assert!(
-            slot.lock().unwrap().is_none(),
-            "the owning job could not clear its own slot on completion"
-        );
+        owner.slot.clear();
+        assert!(state.jobs.smarttags.status().unwrap().is_none());
     }
-
 }

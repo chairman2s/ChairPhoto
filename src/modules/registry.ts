@@ -45,6 +45,13 @@ export interface Photo {
    * `"sharpest-of-burst"` = sharpest frame in its cluster (the keeper candidate).
    */
   burstFlag: string | null;
+  /**
+   * Named edit versions of this photo, for the grid's "N versions" badge (issue #10).
+   * Carried on the row so a grid refresh needs no per-id side query. Optional because a
+   * `Photo` built by an older host (or a fixture) may predate the field; treat a missing
+   * value as 0.
+   */
+  versionCount?: number;
 }
 
 export interface Tag {
@@ -78,14 +85,44 @@ export interface Publication {
   publishedAt: number;
 }
 
+/**
+ * The framework-agnostic half of a UI contribution: the host hands the module a plain
+ * DOM element to fill and calls `unmount` before discarding it.
+ *
+ * This is the rendering ABI **external** modules target. An external module is imported
+ * straight from disk and has no route to the host's React instance (no global, no import
+ * map, and a second React copy breaks hooks and context), so it cannot build a
+ * `ReactNode`. It can build DOM. Nothing here names React, so a host-side React upgrade
+ * cannot break a module written against it.
+ *
+ * Every contribution point below accepts `render()` (React, used by bundled modules) or
+ * `mount()` (DOM, used by external ones). Provide exactly one; if both are present
+ * `render` wins. See docs/module-capabilities.md § "Rendering ABI".
+ *
+ * Contract:
+ * - `mount(el)` is called once the host has an element in the document; fill it however
+ *   you like (`el.append(...)`, another framework, a canvas).
+ * - `unmount(el)` is called before the host drops the element — release listeners,
+ *   timers and observers that live *outside* `el`. The host empties `el` itself, so DOM
+ *   inside it needs no cleanup.
+ * - The pair can run more than once for one contribution (React StrictMode mounts,
+ *   unmounts and remounts in development). `mount` must therefore build from scratch
+ *   rather than assume it is the first call.
+ */
+export interface ModuleMount {
+  mount?(el: HTMLElement): void;
+  unmount?(el: HTMLElement): void;
+}
+
 /** A UI panel contributed by a module, rendered at a fixed slot. */
-export interface ModulePanel {
+export interface ModulePanel extends ModuleMount {
   id: string;
   label: string;
   /** "tag-editor" panels render inside the tag editor modal (read the tag being
    *  edited via getEditingTag()). */
   slot: "inspector" | "sidebar" | "loupe" | "tag-editor";
-  render(): ReactNode;
+  /** React contribution (bundled modules). External modules use `mount` instead. */
+  render?(): ReactNode;
 }
 
 /**
@@ -116,13 +153,15 @@ export interface EditRenderer {
  * switcher; selecting one replaces the central library area with `render()`. The
  * built-in grid/loupe is the default "Library" view.
  */
-export interface MainView {
+export interface MainView extends ModuleMount {
   id: string;
   label: string;
   /** Small icon shown in the view-switcher tab — prefer a 13px stroke SVG matching
-   *  the app's icon language (a plain string also works but renders as text). */
+   *  the app's icon language (a plain string also works but renders as text, which is
+   *  what an external module using `mount` should pass). */
   icon?: ReactNode;
-  render(): ReactNode;
+  /** React contribution (bundled modules). External modules use `mount` instead. */
+  render?(): ReactNode;
 }
 
 /**
@@ -132,6 +171,8 @@ export interface MainView {
  * - `render` — a modal action: clicking opens an overlay and renders `render(close)`
  *   (the form calls `close` to dismiss). Used by the Collage dialog. If both are set,
  *   `render` wins.
+ * - `mount` — the DOM equivalent of `render` for external modules: the host opens the
+ *   same overlay and calls `mount(el, close)`. `render` wins over `mount`.
  */
 export interface ToolbarAction {
   id: string;
@@ -139,6 +180,10 @@ export interface ToolbarAction {
   icon?: string;
   onActivate?(api: ChairPhotoAPI): void;
   render?(close: () => void): ReactNode;
+  /** DOM modal contribution (external modules). See `ModuleMount` for the contract;
+   *  the extra `close` argument mirrors `render`'s. */
+  mount?(el: HTMLElement, close: () => void): void;
+  unmount?(el: HTMLElement): void;
 }
 
 /**
@@ -147,11 +192,18 @@ export interface ToolbarAction {
  * (it reads the active photo/version via the host API and does the upload + records the
  * publication). One per publishing module.
  */
-export interface PublishTarget {
+export interface PublishTarget extends ModuleMount {
   id: string;
   label: string;
-  render(): ReactNode;
+  /** React contribution (bundled modules). External modules use `mount` instead. */
+  render?(): ReactNode;
 }
+
+/**
+ * A module's settings section, shown as that module's Preferences tab. Either a React
+ * thunk (bundled modules) or a `ModuleMount` (external modules).
+ */
+export type SettingsPanel = (() => ReactNode) | ModuleMount;
 
 /**
  * Stops an `onEvent` subscription. Contract-owned on purpose: the host adapts Tauri's
@@ -202,7 +254,8 @@ export interface ChairPhotoAPI {
   registerAction(action: ToolbarAction): void;
   /** Register a publishing destination shown in the app's Publish dialog. */
   registerPublishTarget(target: PublishTarget): void;
-  registerSettingsPanel(render: () => ReactNode): void;
+  /** A React thunk (bundled) or a `ModuleMount` (external) — see `SettingsPanel`. */
+  registerSettingsPanel(panel: SettingsPanel): void;
   /** Register a full-surface main view, shown via the app's view switcher. */
   registerMainView(view: MainView): void;
   /** Register the edit renderer (one per app; the editing module provides it). */

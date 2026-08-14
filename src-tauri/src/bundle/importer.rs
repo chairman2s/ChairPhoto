@@ -514,6 +514,10 @@ pub fn index_bundle(
     // Apply auto-tags (monochrome, long-exposure, etc.) and pair RAW+JPEG stacks.
     let _ = catalog.apply_auto_tags();
     let _ = catalog.pair_raw_jpeg_stacks();
+    // The WHOLE-catalog reconcile, deliberately: a bundle merge can insert metadata-only
+    // rows anywhere in the library (photos whose originals weren't in the bundle), so
+    // there is no folder that bounds the affected set. Scans use the scoped
+    // `reconcile_missing_for` instead — see `scanner::phase_b_enrich`.
     let _ = catalog.reconcile_missing();
 
     partial_result.merge = merge_summary;

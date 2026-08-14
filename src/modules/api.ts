@@ -257,33 +257,67 @@ export type StorageTier = "all" | "local" | "nas";
  */
 export type PhotoSort = "date" | "sharpness_asc" | "sharpness_desc";
 
-export const listPhotos = (
-  tagId: number | null,
-  albumId: number | null,
-  batchId: number | null,
-  facets: string[],
-  cullingFilter: CullingFilter,
-  smartAlbumId: number | null = null,
-  storageTier: StorageTier = "all",
-  camera: string | null = null,
-  lens: string | null = null,
-  sort: PhotoSort | null = null,
+/**
+ * Which photos the library view wants, in what order, and (optionally) which slice.
+ *
+ * The same object as `PhotoQuery` in `src-tauri/src/catalog/query.rs`, field for field
+ * (issue #10) — it used to be eleven positional arguments that TypeScript, the Tauri
+ * command and the SQL builder each had to spell identically. Two things keep the sides
+ * honest rather than merely parallel: the string unions below are Rust enums, and the Rust
+ * struct is `deny_unknown_fields`, so a field added here and not there fails loudly at the
+ * boundary instead of being silently ignored (a silently ignored filter looks like "the
+ * grid forgot my selection").
+ *
+ * Every field is optional; the defaults mean "the whole library, oldest first".
+ */
+export interface PhotoQuery {
+  /** Restrict to a tag *and its descendants*. */
+  tagId?: number | null;
+  /** Restrict to an album — also switches the sort to the album's own member order. */
+  albumId?: number | null;
+  /** Restrict to one import batch. */
+  batchId?: number | null;
+  /** Evaluate a saved smart-album rule live. */
+  smartAlbumId?: number | null;
+  /** Derived boolean facets, ANDed in (e.g. `has-gps`, `published:flickr`). */
+  facets?: string[];
+  cullingFilter?: CullingFilter;
+  storageTier?: StorageTier;
+  /** Exact camera model, from `distinctPhotoValues("camera")`. */
+  camera?: string | null;
+  /** Exact lens, from `distinctPhotoValues("lens")`. */
+  lens?: string | null;
   /** Colour labels to keep, OR-combined ("" = No label). Empty = no label filter. */
-  labels: string[] = [],
-) =>
-  invoke<Photo[]>("list_photos", {
-    tagId,
-    albumId,
-    batchId,
-    facets,
-    cullingFilter,
-    smartAlbumId,
-    storageTier,
-    camera,
-    lens,
-    sort,
-    labels,
-  });
+  labels?: string[];
+  sort?: PhotoSort;
+  /** The slice to fetch. Omit for every matching row. */
+  window?: PhotoWindow | null;
+}
+
+/** A half-open slice `[offset, offset + limit)` of the ordered result. */
+export interface PhotoWindow {
+  offset: number;
+  limit: number;
+}
+
+/**
+ * One window of a query's result, plus the size of the whole matching set.
+ *
+ * `total` is what sizes the scrollbar and the "N photos" readout; it is the count of
+ * matching photos, not of `photos`. A window is meaningful because the backend's ordering
+ * is total (every sort ends in the photo's primary key), so "rows 500..1000" names the
+ * same rows on every call.
+ */
+export interface PhotoPage {
+  photos: Photo[];
+  /** Ordered position of `photos[0]` in the whole matching set. */
+  offset: number;
+  total: number;
+}
+
+/** Run a library query. Omit `window` to get every matching row. */
+export const listPhotos = (query: PhotoQuery = {}) =>
+  invoke<PhotoPage>("list_photos", { query });
 
 /** Distinct camera models / lenses in the catalog, for the filter-bar dropdowns. */
 export const distinctPhotoValues = (kind: "camera" | "lens") =>
@@ -718,8 +752,10 @@ export const reconcileNow = () => invoke<DrainSummary>("reconcile_now");
 // much as a failed write), not a failure — never render it as an error.
 
 /** One of the CONTEXT.md § Identity states a queued copy can be in. `bound` never appears
- *  here — a copy is removed from the queue the moment it's bound. */
-export type IdentityDebtState = "unreachable" | "unwritable" | "conflict";
+ *  here — a copy is removed from the queue the moment it's bound. `dismissed` is a decision
+ *  rather than a failure: the row is kept for the record, never retried, and not counted as
+ *  debt (see `resolveIdentityConflict`). */
+export type IdentityDebtState = "unreachable" | "unwritable" | "conflict" | "dismissed";
 
 /** One field a COPY still owes (`identifier` = xmp:Identifier, `import_batch` =
  *  chairphoto:ImportBatch), with its own retry history. A copy can owe up to both,
@@ -729,9 +765,13 @@ export interface PendingIdentityField {
   state: IdentityDebtState;
   attempts: number;
   /** Human-readable detail (e.g. the write error, or the conflicting UUID found). The
-   *  single most useful fact on a Conflict field — render it. */
+   *  single most useful fact on a Conflict field — render it. Survives a dismissal, so a
+   *  user deciding whether to restore can still see what the conflict was. */
   error: string;
   lastAttemptAt: number;
+  /** When this field was dismissed, or 0. Per FIELD: a copy on the active page can carry a
+   *  dismissed field while still owing the other one. */
+  dismissedAt: number;
 }
 
 /** One COPY still owing at least one sidecar field. Matches `pending_sidecar_identity`
@@ -762,11 +802,16 @@ export interface PendingIdentity {
  *  are in COPIES (`photoId` + `volumeId` + `relativePath`), not queue rows: a copy owing
  *  both `identifier` and `import_batch` is one copy, not two. */
 export interface PendingIdentitySummary {
-  /** Every queued copy, any field, any state. */
+  /** Every queued copy still owing something, any field, any state. A copy whose every
+   *  field has been dismissed is in `dismissed` instead — the two are disjoint. */
   total: number;
-  /** Of `total`, how many have at least one field in `conflict` — need a human, not a
-   *  retry. */
+  /** Of `total`, how many have at least one un-dismissed field in `conflict` — need a
+   *  human, not a retry. */
   conflicts: number;
+  /** Copies whose every queued field was dismissed: kept on the record, never retried, and
+   *  deliberately not debt (CONTEXT.md § Identity). List them with
+   *  `listPendingIdentity(…, true)` to restore one. */
+  dismissed: number;
 }
 
 export interface IdentityRepairSummary {
@@ -779,6 +824,44 @@ export interface IdentityRepairSummary {
   conflicts: number;
   /** Retried and is still genuinely failing (unwritable sidecar); left queued. */
   failed: number;
+  /** Rows somebody else decided while the pass held them — a conflict resolved, a copy
+   *  dismissed, a scan re-recording the same copy. The pass discarded its own result for
+   *  those rather than writing over the newer decision, so they are counted here and in
+   *  none of the four above. Not a failure. */
+  superseded: number;
+  /** Queue rows when the pass started — its denominator. In ROWS, not copies: the pass
+   *  retries each owed field, so a copy owing both its UUID and its import batch is two
+   *  here and one in `PendingIdentitySummary.total`. */
+  total: number;
+  /** True when the pass stopped early — cancelled, superseded by a newer pass, or ended by
+   *  a catalog switch. Every count above is then partial, and must be labelled as such
+   *  rather than presented as a finished result. */
+  aborted: boolean;
+}
+
+/** Progress event for a running repair pass (`identity:repair_progress`). `job` is what
+ *  tells this pass's events from a superseded one's stragglers — filter on it. */
+export interface IdentityRepairProgress {
+  done: number;
+  total: number;
+  job: number;
+}
+
+/** Terminal event for a repair pass (`identity:repair_done`). The pass's RESULT — the
+ *  command itself only returns a job id. `ok: false` with an `error` means the pass could
+ *  not run at all; a pass that ran and was stopped is `ok: true` with `summary.aborted`. */
+export interface IdentityRepairDone {
+  ok: boolean;
+  job: number;
+  summary: IdentityRepairSummary;
+  error: string | null;
+}
+
+/** A repair pass in flight, as `identityRepairStatus()` reports it. */
+export interface IdentityRepairStatus {
+  job: number;
+  done: number;
+  total: number;
 }
 
 /** One page of the identity-debt list, one row per copy (never per field — see
@@ -786,17 +869,91 @@ export interface IdentityRepairSummary {
  *  of thousands of rows (74,488 on the 100k harness shape in #20), so this always pages
  *  via `limit`/`offset` rather than returning the whole queue in one IPC payload — pair
  *  with `summarizePendingIdentity()` for the total (same unit: copies), and a virtualized
- *  list for the page itself. */
-export const listPendingIdentity = (limit: number, offset: number) =>
-  invoke<PendingIdentity[]>("list_pending_identity", { limit, offset });
+ *  list for the page itself.
+ *
+ *  `includeDismissed` widens the page from the active queue (a slice of `summary.total`) to
+ *  every copy including dismissed ones (a slice of `total + dismissed`). It is the only way
+ *  back to a dismissal, so pair it with the `restore` action rather than offering it as a
+ *  bare "show more". */
+export const listPendingIdentity = (limit: number, offset: number, includeDismissed = false) =>
+  invoke<PendingIdentity[]>("list_pending_identity", { limit, offset, includeDismissed });
 /** Total debt + conflict counts, without transferring every row. Independent of
  *  `listPendingIdentity` — call/await it separately so a slow list fetch never delays the
  *  cheap header count. */
 export const summarizePendingIdentity = () =>
   invoke<PendingIdentitySummary>("summarize_pending_identity");
-/** Retry every queued copy now. Unreachable/unwritable/conflicted copies stay queued. */
-export const repairPendingIdentity = () =>
-  invoke<IdentityRepairSummary>("repair_pending_identity");
+/** Start a repair pass over the queued copies. Unreachable/unwritable/conflicted copies
+ *  stay queued; dismissed ones are skipped entirely.
+ *
+ *  Returns the pass's **job id**, not its result: the queue reached 74,488 rows on the 100k
+ *  harness shape in #20 and each row can be a network round trip, so the pass reports
+ *  through `onIdentityRepairProgress` and finishes with `onIdentityRepairDone` (#34).
+ *  Install both listeners BEFORE calling this — a pass over an empty queue finishes before
+ *  this promise resolves. Starting a second pass supersedes the first. */
+export const repairPendingIdentity = () => invoke<number>("repair_pending_identity");
+/** Stop the running repair pass at its next copy. No-op when none is running. */
+export const cancelIdentityRepair = () => invoke<void>("identity_repair_cancel");
+/** The repair pass in flight, or `null` when idle — so a remounted panel re-attaches to a
+ *  pass instead of reopening as if nothing were happening. */
+export const identityRepairStatus = () =>
+  invoke<IdentityRepairStatus | null>("identity_repair_status");
+/** Subscribe to repair-pass progress. Returns an unlisten function. */
+export const onIdentityRepairProgress = (
+  handler: (p: IdentityRepairProgress) => void,
+): Promise<UnlistenFn> =>
+  listen<IdentityRepairProgress>("identity:repair_progress", (e) => handler(e.payload));
+/** Subscribe to the repair pass's terminal event. Returns an unlisten function. */
+export const onIdentityRepairDone = (
+  handler: (d: IdentityRepairDone) => void,
+): Promise<UnlistenFn> =>
+  listen<IdentityRepairDone>("identity:repair_done", (e) => handler(e.payload));
+
+/** What to do about one conflicted copy — CONTEXT.md § Identity's vocabulary verbatim.
+ *  There is no default: the backend rejects anything that isn't one of these four, so a
+ *  missing or mistyped choice can never fall through to the destructive one. */
+export type IdentityConflictAction = "adopt" | "overwrite" | "dismiss" | "restore";
+
+/** What one `resolveIdentityConflict` actually did. Report it — never infer the result
+ *  from the action that was requested. */
+export interface IdentityConflictOutcome {
+  action: IdentityConflictAction;
+  photoId: number;
+  /** The photo's UUID after the resolution. Only `adopt` changes it. */
+  catalogUuid: string;
+  /** The identifier the sidecar carried before: the adopted value, or the one `overwrite`
+   *  destroyed. Empty for `dismiss`/`restore`, which read no file. */
+  previousSidecarUuid: string;
+  /** Other copies of this photo an `adopt` re-checked, because the photo's identity
+   *  changed under them. */
+  recheckedCopies: number;
+  /** Where `overwrite` preserved the previous sidecar. `null` when an older backup was
+   *  already there and was deliberately left alone. */
+  sidecarBackup: string | null;
+}
+
+/** Resolve one conflicted copy (issue #33). Identified by copy — `photoId` + `volumeId` +
+ *  `relativePath` — because debt is per copy: resolving one says nothing about the same
+ *  photo's other copies.
+ *
+ *  `adopt` changes the catalog's UUID for this photo, which is what catalog merge matches
+ *  on and what `chairphoto://<uuid>` links address; `overwrite` destroys the identifier in
+ *  the file (after backing the sidecar up). Both are consequential enough that the UI must
+ *  make the user pick one by name, and confirm the destructive one.
+ *
+ *  Rejections come back as messages naming what was refused — notably an adopt of an
+ *  identity another photo already holds, which is checked before anything is written. */
+export const resolveIdentityConflict = (
+  photoId: number,
+  volumeId: number,
+  relativePath: string,
+  action: IdentityConflictAction,
+) =>
+  invoke<IdentityConflictOutcome>("resolve_identity_conflict", {
+    photoId,
+    volumeId,
+    relativePath,
+    action,
+  });
 
 // --- export (one-way) ---
 

@@ -68,6 +68,91 @@ the identifier it has, and the divergence stays visible for a human rather than 
 resolved by clobbering somebody else's identity. A sidecar failure never aborts a
 scan: one unwritable file must not cost the user the other 99,999 rows.
 
+### The repair pass is a job
+
+The queue reached 74,488 rows on the 100k harness shape, and every row is a sidecar parse
+and rewrite — a network round trip each on a NAS. So the pass is a background job like face
+indexing or Smart Tagging (`JobRegistry::identity`, `commands/jobs.rs`): the command returns
+a **job id**, progress arrives as `identity:repair_progress`, the result as
+`identity:repair_done`, `identity_repair_cancel` stops it before its next copy, and
+`identity_repair_status` lets the debt panel re-attach after a remount. A newer pass or a
+catalog switch trips it, so no pass outlives the catalog it was started against.
+
+It plans the queue **one keyset page at a time**, ordered by the queue's primary key. Keyset
+rather than `LIMIT/OFFSET` because the pass deletes the rows it binds: an offset window
+slides left under every page turn and skips exactly as many rows as the previous page
+repaired.
+
+**Who owns a queue row.** The pass and `resolve_identity_conflict` write the same rows from
+two connections. The rule is that the pass owns a row only while the row is still the one it
+planned:
+
+- each plan carries the row's version (`attempts`, `last_attempt_at`);
+- the value *and* version are re-read immediately before the sidecar IO, so a page-old plan
+  never acts on data a resolution has changed, and a row resolved or dismissed since is
+  skipped without the file being touched;
+- the record is a compare-and-set on that version and on `dismissed_at = 0`, and the pass
+  only ever UPDATEs or DELETEs — never INSERTs, so a retry that cannot find its row has
+  nothing to say.
+
+A row somebody else decided is counted `superseded` and reported separately: it is not a
+failure, and it is not an outcome the pass produced. Re-reading the *value* is the part no
+compare-and-set can replace — Adopt rewrites `photos.uuid` and leaves the photo's other
+copies' queue rows untouched when they carry no identifier, so a stale plan would write the
+photo's previous identity into one of those sidecars.
+
+A resolution deliberately does **not** stop a running pass. Killing a 74k-row pass because
+one row got a decision is a worse trade than dropping that row's result, and the per-row
+ownership above is what makes coexistence safe.
+
+### Resolving a conflict
+
+A conflict is not repairable by retrying, so it needs a person. The decision is made per
+**copy** — resolving one copy says nothing about the same photo's other copies — through
+`Catalog::resolve_identity_conflict` (`resolve_identity_conflict` over IPC, the identity
+debt panel in the UI). There is no default: an action is required, and the three outcomes
+are CONTEXT.md § Identity's, verbatim.
+
+| Decision | Changes the catalog | Changes the file |
+|---|---|---|
+| **Adopt** — the catalog takes the identity in the sidecar | `photos.uuid` | never |
+| **Overwrite** — the sidecar takes the catalog's identity | no | `xmp:Identifier`, after a backup |
+| **Dismiss** — stop retrying this copy | `dismissed_at` only | no |
+
+Dismiss (undone by Restore) keeps the queue row for the record while taking it out of the
+repair pass and out of the debt count. That is what lets a catalog whose only remaining
+debts are conflicts reach a clean terminal state instead of reporting the same
+unresolvable copies on every pass forever.
+
+Both file-reading decisions re-read the sidecar at decision time rather than trusting the
+queue row's recorded reason, which describes the last attempt, not the file now.
+
+**Adopt is refused if another photo already holds that identity**, naming the photo that
+does. `photos.uuid` is `UNIQUE`, so the write would fail regardless — but as an opaque
+constraint error, and resolving one conflict must not manufacture another.
+
+**Adopt changes what merge matches on.** Identity is the merge key (`merge_photo` looks up
+`photos WHERE uuid = ?`), so a catalog that has already been merged or bundled elsewhere
+holds the *previous* identity for that photo:
+
+- A bundle already written keeps the old UUID. Re-merging it creates a SECOND row for the
+  same photo rather than matching the adopted one; the two are then independent rows with
+  independent state. Adopt is therefore right when the sidecar is authoritative (a photo
+  re-imported into a fresh catalog, which is the case it exists for) and wrong as a way to
+  "tidy up" a photo whose identity has already travelled.
+- Any `chairphoto://<uuid>` deep link (Obsidian notes, the tag/photo links) still points at
+  the old identity and stops resolving.
+- The photo's other copies were bound to the old identity, so Adopt re-reads each of them
+  (never writes) and re-queues the ones that now diverge, rather than leaving the catalog
+  believing they are bound.
+
+**Overwrite** goes through `xmp::overwrite_identifier`, the one writer permitted to destroy
+an identifier it did not write. It preserves the sidecar first even when the file carries
+`chairphoto:LastWrite` — which the ordinary backup-once rule would skip, and which is
+exactly the case here, since a file duplicated after import carries both our stamp and
+somebody else's identity. An existing backup is never replaced: the earliest state we ever
+saw outranks the current one.
+
 ## Volumes (named storage locations)
 
 Locations never store absolute paths. They reference a **named volume** + a relative
@@ -206,7 +291,7 @@ a negative film roll. All photos from that ingest belong to it forever.
 `import_batches` table + `photos.import_batch_id` (schema v9);
 `catalog/batches.rs` (create / assign-immutably / list with counts); each scan that
 imports new photos creates one batch (source = scanned folder) and assigns only the
-new photos; `list_photos` takes a `batch_id` filter; a read-only Batches sidebar
+new photos; the library query carries a `batchId` filter; a read-only Batches sidebar
 section + a filter-bar chip. **Batch UUID in XMP sidecar** — the scanner, card ingest,
 and bundle importer write `chairphoto:ImportBatch` (merge-safe, beside the
 `chairphoto:LastWrite` field) so the batch survives catalog loss and merge; failed
@@ -221,7 +306,7 @@ Four independent axes:
 3. **Albums** — manual curated collections; photos from anywhere. (`albums` +
    `album_photos` junction.) Ordered membership, sidebar section,
    add-from-selection; album viewing composes with the culling filter via
-   `list_photos(.., album_id, ..)`. Deleting an album never deletes photos.
+   the library query's `albumId`. Deleting an album never deletes photos.
 4. **Smart albums** — rule-based, auto-populated from metadata. currently a list of AND
    conditions over fields (camera, lens, ISO, date, rating, label, pick, tag, batch).
    Nested AND/OR is not implemented.
@@ -378,10 +463,12 @@ root setting rather than silently using whatever the caller passed.
 
 `switch_catalog` performs a safe handoff in four steps:
 
-1. **Abort any in-flight scan** — sets `AppState::scan_abort` (`Arc<AtomicBool>`) so the
-   scan's per-file loop exits at its next cancellation point. The scan runs on its own
-   `open_secondary` connection, so the mutex is not held and the swap is not blocked by a
-   running scan.
+1. **Abort every in-flight job** — trips the installed abort generation of every family in
+   `AppState::jobs` (scan, face indexing, face matching, sharpness, pHash, Smart Tagging,
+   identity repair) and clears every queryable status slot, so a running job exits at its
+   next cancellation point and stops being reachable as a slot's owner. The scan and the
+   identity repair pass each run on their own `open_secondary` connection, so the mutex is
+   not held and the swap is not blocked by either.
 2. **Close the current catalog** — drops the `Option<Catalog>` under the mutex. This
    releases the WAL write lock and flushes pending writes before the new catalog is opened.
 3. **Open (or create) the new catalog** — off the async executor, so the UI thread is
@@ -389,8 +476,12 @@ root setting rather than silently using whatever the caller passed.
 4. **Emit `catalog:switched`** — the frontend resets all React state (selection, filters,
    albums, scan progress) and re-queries the new catalog.
 
-The abort flag is cleared after the new catalog is open so subsequent scans on the new
-catalog start un-aborted.
+A *fresh* abort generation is installed for each family after the new catalog is open, so
+subsequent jobs start un-aborted while the old workers keep the flag they were given (and
+stay aborted). Steps 1–2 and the publish in step 3 are the two phases of one ownership
+transition; both, and every job start, live in `commands/jobs.rs`, which also carries the
+backend-wide lock order (catalog → abort generations → status slots). `set_library_root`
+runs the same transition — it replaces the catalog handle exactly as a switch does.
 
 ### Invariants
 
@@ -425,8 +516,11 @@ catalog start un-aborted.
 - `smart_albums` — id, name, rule definition (AND conditions).
 - `pending_operations` — kind (backup/offload/restore), photo_id, target, status.
 - `pending_sidecar_identity` — photo_id, field (`identifier` or `import_batch`), attempts,
-  error, timestamps: sidecar identity fields that are in SQLite but not yet on disk.
-  No value column — `photos.uuid` and `import_batches.uuid` are the sources of truth.
+  error, timestamps, `dismissed_at`: sidecar identity fields that are in SQLite but not yet
+  on disk. No value column — `photos.uuid` and `import_batches.uuid` are the sources of
+  truth. A non-zero `dismissed_at` is a human's "stop retrying this copy" (see Resolving a
+  conflict): the row stays for the record, and leaves both the repair pass and the debt
+  count.
 
 ## Storage model
 

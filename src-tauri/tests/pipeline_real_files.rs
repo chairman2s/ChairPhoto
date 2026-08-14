@@ -5,7 +5,7 @@
 //! Skips gracefully (passes) when the sample folder isn't present, so it's safe
 //! in CI or on another machine.
 
-use chairphoto_lib::catalog::Catalog;
+use chairphoto_lib::catalog::{Catalog, PhotoQuery};
 use chairphoto_lib::scanner::scan_folder;
 use chairphoto_lib::thumbnails::{preview_bytes, thumbnail_bytes};
 use std::path::{Path, PathBuf};
@@ -29,7 +29,7 @@ fn scan_populates_metadata() {
     let catalog = Catalog::open(&tmp.join("t.chairphoto"), &root).unwrap();
     scan_folder(&catalog, &sample, &chairphoto_lib::scanner::never_abort(), &|_| {}).unwrap();
 
-    let photos = catalog.list_photos(None, None, None, &[], "all", None, "all", None, None, &[], None).unwrap();
+    let photos = catalog.list_photos(&PhotoQuery::default()).unwrap();
     // Find an ARW (Sony) and check its promoted + generic metadata.
     let arw = photos
         .iter()
@@ -82,7 +82,7 @@ fn migrates_real_v1_catalog_and_backfills_locations() {
     let volumes = catalog.list_volumes().unwrap();
     assert!(!volumes.is_empty(), "migration should create the default volume");
 
-    let photos = catalog.list_photos(None, None, None, &[], "all", None, "all", None, None, &[], None).unwrap();
+    let photos = catalog.list_photos(&PhotoQuery::default()).unwrap();
     eprintln!("migrated catalog has {} photos", photos.len());
     for photo in photos.iter().take(5) {
         let locations = catalog.photo_locations(photo.id).unwrap();
@@ -123,7 +123,7 @@ fn scans_real_folder_and_extracts_raw_thumbnail() {
 
     // Exercise one file of each extension present (e.g. ARW and DNG) — they store
     // previews differently (Sony embeds JPEG, Adobe DNG embeds TIFF).
-    let photos = catalog.list_photos(None, None, None, &[], "all", None, "all", None, None, &[], None).unwrap();
+    let photos = catalog.list_photos(&PhotoQuery::default()).unwrap();
     let mut tested_extensions = std::collections::HashSet::new();
     for photo in &photos {
         let ext = Path::new(&photo.path)

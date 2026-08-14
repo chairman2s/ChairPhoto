@@ -40,7 +40,8 @@ Environment variables:
 - `CHAIRPHOTO_PERF_TAGS`: tag rows to seed, default `240`.
 - `CHAIRPHOTO_PERF_PENDING`: pending-enrichment rows, default `min(photos / 2, 50000)`.
 - `CHAIRPHOTO_PERF_RESOLVER_SAMPLE`: photo ids sampled through the resolver, default `1000`.
-- `CHAIRPHOTO_PERF_GRID_WINDOW`: ids used for the window-sized badge measurement, default `500`.
+- `CHAIRPHOTO_PERF_GRID_WINDOW`: rows in a measured grid window — both the `list_photos`
+  page size and the ids in the window-sized badge measurement, default `500`.
 - `CHAIRPHOTO_PERF_MATERIALIZED_FILES`: local files physically written under the temp root, default `512`.
 - `CHAIRPHOTO_PERF_ENFORCE_THRESHOLDS=1`: fail if a required operation exceeds its loose local
   threshold. Thresholds scale with the photo count where that is useful.
@@ -57,11 +58,26 @@ and compare:
   counts (`request`, `response`, `total`), and any truncated recorded error per measured operation.
 - `resultCounts`: returned rows for broad, tag-filtered, single-facet, combined-facet, and offline
   NAS library queries.
-- `gridBadgesAllReturnedIds`: current full-result badge shape. This uses the same command helpers
-  as the grid refresh path: volume-health reachability, storage statuses, and version counts.
+- `windows`: the first and the last window of the full ordered set, through `photo_page` —
+  the windowed path the grid uses (`list_photos_window_first` / `list_photos_window_deep`),
+  including the `COUNT` that yields `total`. Compare both against `list_photos_all_date`.
+  A window saves building and serializing every matching row, but not the ordering: the
+  date sort is not index-backed, so both windows still sort the matching set and the deep
+  one walks to its offset. Expect the first window to be a fraction of the full listing
+  and the deep window to sit between the two, growing with the catalog.
+- `gridStatusesWindow`: what a grid refresh costs now — storage status for the visible
+  window only. The version count has no side query at all any more: it rides the photo row.
+- `gridBadgesAllReturnedIds`: the shape that replaced, kept as the baseline — both badge
+  maps for every returned id, which is what `App.refresh` did on each filter change. It
+  uses the same command helpers as the grid path: volume-health reachability, storage
+  statuses, and version counts.
 - `resolver`: sampled candidate-path and resolved-path counts, including offline backup candidates.
 - `pendingEnrichment`: queued rows versus rows loadable through the resolver.
-- `reconcile`: rows checked by `reconcile_missing` and resulting missing count.
+- `reconcileScannedScope`: what a scan's finalizing pass costs — the scope query
+  (`photo_ids_under` over one seeded year folder) plus `reconcile_missing_for` over just
+  that scope, with the scope size against the catalog size.
+- `reconcile`: rows checked by the whole-catalog `reconcile_missing` (explicit maintenance,
+  no longer run by every scan) and resulting missing count.
 
 By default the harness reports thresholds without enforcing them. Set
 `CHAIRPHOTO_PERF_ENFORCE_THRESHOLDS=1` when you want a local run to fail on a clear regression.

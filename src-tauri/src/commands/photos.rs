@@ -4,43 +4,19 @@
 use super::*;
 use tauri::State;
 
+/// One window of the library view, plus how many photos match in total.
+///
+/// The whole filter/sort/window state travels as a single typed [`PhotoQuery`] (issue
+/// #10) instead of eleven positional arguments that TypeScript, this signature, and the
+/// SQL builder each had to spell identically. Omit `window` to get every matching row.
+///
+/// [`PhotoQuery`]: crate::catalog::PhotoQuery
 #[tauri::command]
 pub async fn list_photos(
     state: State<'_, AppState>,
-    tag_id: Option<i64>,
-    album_id: Option<i64>,
-    batch_id: Option<i64>,
-    facets: Option<Vec<String>>,
-    culling_filter: Option<String>,
-    smart_album_id: Option<i64>,
-    storage_tier: Option<String>,
-    camera: Option<String>,
-    lens: Option<String>,
-    // Colour labels to keep (OR-combined; "" = No label). Optional/empty = no filter.
-    labels: Option<Vec<String>>,
-    // Sort order: "date" (default), "sharpness_asc", "sharpness_desc". Optional.
-    sort: Option<String>,
-) -> Result<Vec<Photo>, String> {
-    let filter = culling_filter.unwrap_or_else(|| "all".into());
-    let facets = facets.unwrap_or_default();
-    let tier = storage_tier.unwrap_or_else(|| "all".into());
-    let labels = labels.unwrap_or_default();
-    with_catalog_blocking(&state, move |c| {
-        c.list_photos(
-            tag_id,
-            album_id,
-            batch_id,
-            &facets,
-            &filter,
-            smart_album_id,
-            &tier,
-            camera.as_deref(),
-            lens.as_deref(),
-            &labels,
-            sort.as_deref(),
-        )
-    })
-    .await
+    query: crate::catalog::PhotoQuery,
+) -> Result<crate::catalog::PhotoPage, String> {
+    with_catalog_blocking(&state, move |c| c.photo_page(&query)).await
 }
 
 /// Distinct camera models / lenses present in the catalog, for the filter-bar dropdowns.

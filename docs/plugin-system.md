@@ -128,7 +128,7 @@ interface ChairPhotoAPI {
   // UI contributions
   registerPanel(panel: ModulePanel): void;           // slot: 'inspector' | 'sidebar' | 'loupe'
   registerAction(action: ToolbarAction): void;
- registerSettingsPanel(render:  => ReactNode): void;
+  registerSettingsPanel(panel: SettingsPanel): void; // React thunk or ModuleMount
   showToast(message): void;
 }
 ```
@@ -139,6 +139,34 @@ slots — initially an `inspector` section list (below the built-in inspector) a
 can also contribute a **full-surface main view** via `registerMainView`:
 the topbar shows a view switcher (built-in *Library* + each module view), and the
 selected view replaces the central grid/loupe. The Map module uses this.
+
+**How a contribution draws — `render()` or `mount()`.** Every contribution point accepts two
+forms, and the host picks between them in one adapter (`src/modules/ModuleContent.tsx`) that
+every slot renders through:
+
+```ts
+render?(): ReactNode;                 // bundled modules — they share the app's React
+mount?(el: HTMLElement): void;        // external modules — a DOM handle, no framework
+unmount?(el: HTMLElement): void;
+```
+
+- **Bundled** modules use `render()`. They are compiled with the app and share its React
+  instance, so a `ReactNode` is the natural thing for them to produce.
+- **External** modules use `mount()`. They are imported straight from disk with no route to
+  the host's React instance, and nothing in `ModuleMount` names React — so a host-side React
+  upgrade cannot break a module already written. That is why the framework-agnostic form
+  exists; `docs/module-capabilities.md` § "Rendering ABI" records the decision and its trade.
+- Supply **exactly one**. If a contribution has both, `render` wins.
+- `unmount(el)` releases what lives outside `el` — listeners on `document`, timers,
+  observers. The host empties `el` itself, so DOM inside it needs no cleanup, and `mount` can
+  therefore be called again safely (React StrictMode does exactly that in development).
+- Both calls run inside the host's try/catch, like `onLoad`: a throw from an installed module
+  is logged and contained, never propagated into the slot rendering it.
+
+`ToolbarAction` is the one contribution whose draw call takes an argument, so its DOM form is
+`mount(el, close)`, mirroring `render(close)`. `examples/modules/hello/` is a worked external
+module using this path; `src/modules/__tests__/moduleContent.test.tsx` covers both paths,
+including that the React path adds no DOM of its own.
 
 **Lifecycle.** At startup the app imports all bundled modules and registers them in a
 registry. For each **enabled** module it calls `onLoad(api)`; the module registers its
@@ -276,8 +304,15 @@ There is no sandbox and no per-command permission prompt: **an installed module 
 with the same full access as a bundled one**, including unrestricted `api.invoke(command,
 args)` to *any* backend Tauri command whose feature is compiled in — not only its own
 `backendFeature`. It executes in the app's WebView with the app's privileges; a malicious
-or buggy module can read/modify the catalog, drive file I/O through backend commands, and
-reach the network the same way the app can.
+or buggy module can read/modify the catalog and drive file I/O through backend commands.
+
+**One exception, added later:** it can no longer reach the network *directly*. A
+Content-Security-Policy pins `connect-src` to the app's own origin and the Tauri IPC bridge,
+so `fetch`/`XHR`/`WebSocket`/`EventSource` from module code cannot reach an arbitrary origin.
+A module can still get to the network by invoking a network-capable backend command — the
+CSP closes the route that needed no backend command at all. See
+`docs/module-capabilities.md` § "The policy" for the exact directives and for what the
+policy does *not* stop (notably `img-src`).
 
 This is a deliberate trade-off (get external modules working against the *existing*
 stable contract without first building a capability system), not a claim that it is safe.
@@ -296,8 +331,9 @@ owner — the same reasoning browsers use for unpacked extensions.
 - **No auto-install, no auto-update, no live FS watching.** Modules are discovered only at
   startup; adding one requires an explicit restart. We never fetch or update
   module code on the user's behalf. There is no marketplace.
-- "Nothing ever leaves home" still binds the *app's* behaviour, but a fully-trusted module
-  can call network-capable backend commands — another reason review-before-install matters.
+- "Nothing ever leaves home" still binds the *app's* behaviour. A fully-trusted module can no
+  longer open its own socket to an arbitrary origin (the CSP above), but it can still call
+  network-capable backend commands — another reason review-before-install matters.
 
 **A stronger mitigation, not implemented:** a **per-module invoke allowlist** — each
 module declares the backend commands (or capability groups) it needs, the host enforces

@@ -31,15 +31,35 @@ XDG_DATA_HOME=/tmp/cp-test chairphoto
 
 Modules then load from `/tmp/cp-test/chairphoto/modules/`.
 
-## Why it renders a string
+## How it draws
 
-`render()` returns a bare string rather than elements. That is the current ceiling, not a
-simplification: an external module is imported straight from disk and has no way to reach the
-host's React instance — no global, no import map, and a second React copy would break hooks
-and context. `ReactNode` includes strings, so text is all that can be contributed today.
+Through `mount(el)` / `unmount(el)` — the host hands the panel a DOM element and the module
+fills it. There is no React import here and no build step: an external module is loaded
+straight from disk and has no route to the host's React instance (no global, no import map,
+and a second React copy would break hooks and context). Nothing in the rendering ABI names
+React, so a host-side React upgrade cannot break a module written against it.
 
-See `docs/module-capabilities.md` for what would lift that, and for what a module can and
-cannot reach through the host API.
+The three-part pattern in `index.js` is the whole shape of a stateful external panel:
+
+| Hook | Does |
+|---|---|
+| `mount(el)` | Build the DOM, and remember `el`. |
+| `unmount(el)` | Forget `el`. The host empties it, so the DOM inside needs no cleanup. |
+| `onPhotoSelected(photos, api)` | Repaint every element still mounted. |
+
+`onPhotoSelected` is how an external module reacts to host state without a React render
+loop — there is no re-render to hook into, so the module repaints its own elements.
+
+Two rules worth knowing before you copy this:
+
+- `mount` can run more than once for one contribution. React StrictMode mounts, unmounts and
+  remounts every effect in development, so build from scratch (`el.replaceChildren(...)`)
+  rather than assuming you are the first call.
+- If a contribution supplies both `render()` and `mount()`, `render` wins. Bundled modules
+  use `render`; external modules use `mount`.
+
+See `docs/plugin-system.md` § "How a contribution draws" for the contract, and
+`docs/module-capabilities.md` for what a module can and cannot reach through the host API.
 
 ## Manifest fields
 

@@ -12,6 +12,9 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use xmltree::{Element, Namespace, XMLNode};
 
+mod document;
+use document::SidecarDocument;
+
 const NS_X: &str = "adobe:ns:meta/";
 const NS_RDF: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#";
 const NS_DC: &str = "http://purl.org/dc/elements/1.1/";
@@ -31,7 +34,9 @@ const NS_STDIM: &str = "http://ns.adobe.com/xap/1.0/sType/Dimensions#";
 /// On write we remove any existing instances of these and re-add from the current
 /// field values; every other element in the sidecar is preserved.
 /// Note: `chairphoto:ImportBatch` is managed separately by [`write_import_batch`]
-/// and is intentionally NOT listed here so IPTC writes don't clobber it.
+/// and is intentionally NOT listed here so IPTC writes don't clobber it. Likewise
+/// `chairphoto:LastWrite` is not listed: every writer's completion stamp is applied
+/// uniformly by [`SidecarDocument::commit`], not per-writer.
 const MANAGED: &[(&str, &str)] = &[
     (NS_DC, "description"),
     (NS_DC, "title"),
@@ -44,7 +49,6 @@ const MANAGED: &[(&str, &str)] = &[
     (NS_PHOTOSHOP, "State"),
     (NS_PHOTOSHOP, "Country"),
     (NS_IPTC, "CountryCode"),
-    (NS_CHAIRPHOTO, "LastWrite"),
 ];
 
 /// The sidecar path for a photo: `<original_filename>.xmp` (darktable convention).
@@ -58,48 +62,22 @@ pub fn sidecar_path(photo_path: &Path) -> PathBuf {
 /// existing content. Creates the sidecar if absent; backs up a pre-existing
 /// non-chairphoto sidecar once before the first write.
 pub fn write_iptc(photo_path: &Path, fields: &IptcFields) -> Result<(), String> {
-    let path = sidecar_path(photo_path);
-    let existed = path.exists();
+    let mut doc = SidecarDocument::open(photo_path)?;
 
-    let mut root = if existed {
-        let file = std::fs::File::open(&path).map_err(|e| e.to_string())?;
-        Element::parse(file).map_err(|e| format!("cannot parse {}: {e}", path.display()))?
-    } else {
-        new_root()
-    };
-
-    let rdf = child_mut(&mut root, "rdf", NS_RDF, "RDF");
-    let desc = child_mut(rdf, "rdf", NS_RDF, "Description");
-    desc.attributes
-        .entry("rdf:about".to_string())
-        .or_insert_with(String::new);
-
-    // Back up a foreign sidecar exactly once (before we've ever marked it).
-    let chairphoto_written = desc.children.iter().any(|n| {
-        matches!(n, XMLNode::Element(e)
-            if e.namespace.as_deref() == Some(NS_CHAIRPHOTO) && e.name == "LastWrite")
-    });
-    if existed && !chairphoto_written {
-        let backup = sidecar_backup_path(&path);
-        std::fs::copy(&path, &backup).ok();
-    }
-
-    declare_namespaces(desc);
-    desc.children.retain(|n| !is_managed(n));
-
-    // Re-add managed properties from current values (skip empties).
+    // Build replacement nodes from current values (skip empties).
     let f = fields;
+    let mut replacements = Vec::new();
     if !f.description.is_empty() {
-        desc.children.push(lang_alt("description", &f.description));
+        replacements.push(lang_alt("description", &f.description));
     }
     if !f.title.is_empty() {
-        desc.children.push(lang_alt("title", &f.title));
+        replacements.push(lang_alt("title", &f.title));
     }
     if !f.copyright.is_empty() {
-        desc.children.push(lang_alt("rights", &f.copyright));
+        replacements.push(lang_alt("rights", &f.copyright));
     }
     if !f.creator.is_empty() {
-        desc.children.push(seq_creator(&f.creator));
+        replacements.push(seq_creator(&f.creator));
     }
     for (val, name) in [
         (&f.headline, "Headline"),
@@ -110,23 +88,15 @@ pub fn write_iptc(photo_path: &Path, fields: &IptcFields) -> Result<(), String> 
         (&f.country, "Country"),
     ] {
         if !val.is_empty() {
-            desc.children.push(plain("photoshop", NS_PHOTOSHOP, name, val));
+            replacements.push(plain("photoshop", NS_PHOTOSHOP, name, val));
         }
     }
     if !f.country_code.is_empty() {
-        desc.children
-            .push(plain("Iptc4xmpCore", NS_IPTC, "CountryCode", &f.country_code));
+        replacements.push(plain("Iptc4xmpCore", NS_IPTC, "CountryCode", &f.country_code));
     }
-    desc.children
-        .push(plain("chairphoto", NS_CHAIRPHOTO, "LastWrite", &now().to_string()));
 
-    let mut buf = Vec::new();
-    root.write(&mut buf).map_err(|e| e.to_string())?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).ok();
-    }
-    std::fs::write(&path, buf).map_err(|e| e.to_string())?;
-    Ok(())
+    doc.replace_owned(MANAGED, replacements);
+    doc.commit()
 }
 
 /// Write export keywords into the photo's XMP sidecar, merging with existing content.
@@ -143,50 +113,20 @@ pub fn write_keywords(
     flat: &[String],
     hierarchical: &[String],
 ) -> Result<(), String> {
-    let path = sidecar_path(photo_path);
-    let mut root = if path.exists() {
-        let file = std::fs::File::open(&path).map_err(|e| e.to_string())?;
-        Element::parse(file).map_err(|e| format!("cannot parse {}: {e}", path.display()))?
-    } else {
-        new_root()
-    };
+    // Export destination copy: not subject to the in-library backup-once rule (AGENTS.md).
+    let mut doc = SidecarDocument::open_no_backup(photo_path)?;
 
-    let rdf = child_mut(&mut root, "rdf", NS_RDF, "RDF");
-    let desc = child_mut(rdf, "rdf", NS_RDF, "Description");
-    desc.attributes
-        .entry("rdf:about".to_string())
-        .or_insert_with(String::new);
-
-    declare_namespaces(desc);
-    // Manage only our keyword props + LastWrite (re-stamped); everything else stays.
-    let managed = [
-        (NS_DC, "subject"),
-        (NS_LR, "hierarchicalSubject"),
-        (NS_CHAIRPHOTO, "LastWrite"),
-    ];
-    desc.children.retain(|n| {
-        !matches!(n, XMLNode::Element(e)
-            if managed.iter().any(|(ns, name)|
-                e.namespace.as_deref() == Some(*ns) && e.name == *name))
-    });
-
+    let owned = [(NS_DC, "subject"), (NS_LR, "hierarchicalSubject")];
+    let mut replacements = Vec::new();
     if !flat.is_empty() {
-        desc.children.push(bag("dc", NS_DC, "subject", flat));
+        replacements.push(bag("dc", NS_DC, "subject", flat));
     }
     if !hierarchical.is_empty() {
-        desc.children
-            .push(bag("lr", NS_LR, "hierarchicalSubject", hierarchical));
+        replacements.push(bag("lr", NS_LR, "hierarchicalSubject", hierarchical));
     }
-    desc.children
-        .push(plain("chairphoto", NS_CHAIRPHOTO, "LastWrite", &now().to_string()));
 
-    let mut buf = Vec::new();
-    root.write(&mut buf).map_err(|e| e.to_string())?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).ok();
-    }
-    std::fs::write(&path, buf).map_err(|e| e.to_string())?;
-    Ok(())
+    doc.replace_owned(&owned, replacements);
+    doc.commit()
 }
 
 /// Read the photo UUID (`xmp:Identifier`) from its sidecar, if present. Used by the
@@ -244,48 +184,35 @@ fn first_text(e: &Element) -> Option<String> {
 /// This is the binding invariant — the UUID must live on disk so moves/re-roots match.
 /// Backs up a pre-existing foreign sidecar once before the first write.
 pub fn write_identifier(photo_path: &Path, uuid: &str) -> Result<(), String> {
-    let path = sidecar_path(photo_path);
-    let existed = path.exists();
+    let mut doc = SidecarDocument::open(photo_path)?;
+    // Manage only xmp:Identifier (preserve everything else).
+    doc.replace_owned(
+        &[(NS_XMP, "Identifier")],
+        vec![plain("xmp", NS_XMP, "Identifier", uuid)],
+    );
+    doc.commit()
+}
 
-    let mut root = if existed {
-        let file = std::fs::File::open(&path).map_err(|e| e.to_string())?;
-        Element::parse(file).map_err(|e| format!("cannot parse {}: {e}", path.display()))?
-    } else {
-        new_root()
-    };
-
-    let rdf = child_mut(&mut root, "rdf", NS_RDF, "RDF");
-    let desc = child_mut(rdf, "rdf", NS_RDF, "Description");
-    desc.attributes
-        .entry("rdf:about".to_string())
-        .or_insert_with(String::new);
-
-    let chairphoto_written = desc.children.iter().any(|n| {
-        matches!(n, XMLNode::Element(e)
-            if e.namespace.as_deref() == Some(NS_CHAIRPHOTO) && e.name == "LastWrite")
-    });
-    if existed && !chairphoto_written {
-        std::fs::copy(&path, sidecar_backup_path(&path)).ok();
-    }
-
-    declare_namespaces(desc);
-    // Manage only xmp:Identifier + chairphoto:LastWrite (preserve everything else).
-    desc.children.retain(|n| {
-        !matches!(n, XMLNode::Element(e)
-            if (e.namespace.as_deref() == Some(NS_XMP) && e.name == "Identifier")
-                || (e.namespace.as_deref() == Some(NS_CHAIRPHOTO) && e.name == "LastWrite"))
-    });
-    desc.children.push(plain("xmp", NS_XMP, "Identifier", uuid));
-    desc.children
-        .push(plain("chairphoto", NS_CHAIRPHOTO, "LastWrite", &now().to_string()));
-
-    let mut buf = Vec::new();
-    root.write(&mut buf).map_err(|e| e.to_string())?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).ok();
-    }
-    std::fs::write(&path, buf).map_err(|e| e.to_string())?;
-    Ok(())
+/// Replace an `xmp:Identifier` that belongs to somebody else with `uuid` — the Overwrite
+/// half of resolving an identity conflict (issue #33), and the ONLY writer allowed to
+/// destroy an identifier it did not write. Everything else in the sidecar is preserved,
+/// exactly as in [`write_identifier`].
+///
+/// Returns the path the previous sidecar was copied to, or `None` if nothing was backed up
+/// (no sidecar existed yet, or a backup from an earlier write is already there and was
+/// deliberately not replaced). Unlike [`write_identifier`], the backup does not depend on
+/// `chairphoto:LastWrite`: a sidecar chairphoto has written can still carry a foreign
+/// identifier, and that is precisely the case this function exists for. See
+/// `document::BackupPolicy`.
+pub fn overwrite_identifier(photo_path: &Path, uuid: &str) -> Result<Option<PathBuf>, String> {
+    let mut doc = SidecarDocument::open_forcing_backup(photo_path)?;
+    let backup = doc.backup().map(|p| p.to_path_buf());
+    doc.replace_owned(
+        &[(NS_XMP, "Identifier")],
+        vec![plain("xmp", NS_XMP, "Identifier", uuid)],
+    );
+    doc.commit()?;
+    Ok(backup)
 }
 
 /// Write the import-batch UUID into the photo's XMP sidecar as
@@ -296,49 +223,13 @@ pub fn write_identifier(photo_path: &Path, uuid: &str) -> Result<(), String> {
 /// Backs up a pre-existing foreign sidecar once before the first write,
 /// mirroring the invariant in [`write_identifier`].
 pub fn write_import_batch(photo_path: &Path, batch_uuid: &str) -> Result<(), String> {
-    let path = sidecar_path(photo_path);
-    let existed = path.exists();
-
-    let mut root = if existed {
-        let file = std::fs::File::open(&path).map_err(|e| e.to_string())?;
-        Element::parse(file).map_err(|e| format!("cannot parse {}: {e}", path.display()))?
-    } else {
-        new_root()
-    };
-
-    let rdf = child_mut(&mut root, "rdf", NS_RDF, "RDF");
-    let desc = child_mut(rdf, "rdf", NS_RDF, "Description");
-    desc.attributes
-        .entry("rdf:about".to_string())
-        .or_insert_with(String::new);
-
-    let chairphoto_written = desc.children.iter().any(|n| {
-        matches!(n, XMLNode::Element(e)
-            if e.namespace.as_deref() == Some(NS_CHAIRPHOTO) && e.name == "LastWrite")
-    });
-    if existed && !chairphoto_written {
-        std::fs::copy(&path, sidecar_backup_path(&path)).ok();
-    }
-
-    declare_namespaces(desc);
-    // Manage only chairphoto:ImportBatch + chairphoto:LastWrite (preserve everything else).
-    desc.children.retain(|n| {
-        !matches!(n, XMLNode::Element(e)
-            if (e.namespace.as_deref() == Some(NS_CHAIRPHOTO) && e.name == "ImportBatch")
-                || (e.namespace.as_deref() == Some(NS_CHAIRPHOTO) && e.name == "LastWrite"))
-    });
-    desc.children
-        .push(plain("chairphoto", NS_CHAIRPHOTO, "ImportBatch", batch_uuid));
-    desc.children
-        .push(plain("chairphoto", NS_CHAIRPHOTO, "LastWrite", &now().to_string()));
-
-    let mut buf = Vec::new();
-    root.write(&mut buf).map_err(|e| e.to_string())?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).ok();
-    }
-    std::fs::write(&path, buf).map_err(|e| e.to_string())?;
-    Ok(())
+    let mut doc = SidecarDocument::open(photo_path)?;
+    // Manage only chairphoto:ImportBatch (preserve everything else).
+    doc.replace_owned(
+        &[(NS_CHAIRPHOTO, "ImportBatch")],
+        vec![plain("chairphoto", NS_CHAIRPHOTO, "ImportBatch", batch_uuid)],
+    );
+    doc.commit()
 }
 
 /// Read the import-batch UUID (`chairphoto:ImportBatch`) from the photo's
@@ -377,60 +268,16 @@ pub fn read_import_batch(photo_path: &Path) -> Option<String> {
 /// Backs up a pre-existing foreign sidecar once before the first write, mirroring the
 /// invariant in [`write_identifier`].
 pub fn write_gps(photo_path: &Path, lat: f64, lng: f64) -> Result<(), String> {
-    let path = sidecar_path(photo_path);
-    let existed = path.exists();
-
-    let mut root = if existed {
-        let file = std::fs::File::open(&path).map_err(|e| e.to_string())?;
-        Element::parse(file).map_err(|e| format!("cannot parse {}: {e}", path.display()))?
-    } else {
-        new_root()
-    };
-
-    let rdf = child_mut(&mut root, "rdf", NS_RDF, "RDF");
-    let desc = child_mut(rdf, "rdf", NS_RDF, "Description");
-    desc.attributes
-        .entry("rdf:about".to_string())
-        .or_insert_with(String::new);
-
-    let chairphoto_written = desc.children.iter().any(|n| {
-        matches!(n, XMLNode::Element(e)
-            if e.namespace.as_deref() == Some(NS_CHAIRPHOTO) && e.name == "LastWrite")
-    });
-    if existed && !chairphoto_written {
-        std::fs::copy(&path, sidecar_backup_path(&path)).ok();
-    }
-
-    declare_namespaces(desc);
-    // Manage only exif:GPSLatitude + exif:GPSLongitude + chairphoto:LastWrite.
-    desc.children.retain(|n| {
-        !matches!(n, XMLNode::Element(e)
-            if (e.namespace.as_deref() == Some(NS_EXIF) && e.name == "GPSLatitude")
-                || (e.namespace.as_deref() == Some(NS_EXIF) && e.name == "GPSLongitude")
-                || (e.namespace.as_deref() == Some(NS_CHAIRPHOTO) && e.name == "LastWrite"))
-    });
-    desc.children.push(plain(
-        "exif",
-        NS_EXIF,
-        "GPSLatitude",
-        &decimal_to_dms_lat(lat),
-    ));
-    desc.children.push(plain(
-        "exif",
-        NS_EXIF,
-        "GPSLongitude",
-        &decimal_to_dms_lng(lng),
-    ));
-    desc.children
-        .push(plain("chairphoto", NS_CHAIRPHOTO, "LastWrite", &now().to_string()));
-
-    let mut buf = Vec::new();
-    root.write(&mut buf).map_err(|e| e.to_string())?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).ok();
-    }
-    std::fs::write(&path, buf).map_err(|e| e.to_string())?;
-    Ok(())
+    let mut doc = SidecarDocument::open(photo_path)?;
+    // Manage only exif:GPSLatitude + exif:GPSLongitude (preserve everything else).
+    doc.replace_owned(
+        &[(NS_EXIF, "GPSLatitude"), (NS_EXIF, "GPSLongitude")],
+        vec![
+            plain("exif", NS_EXIF, "GPSLatitude", &decimal_to_dms_lat(lat)),
+            plain("exif", NS_EXIF, "GPSLongitude", &decimal_to_dms_lng(lng)),
+        ],
+    );
+    doc.commit()
 }
 
 /// Read the GPS coordinates (`exif:GPSLatitude` / `exif:GPSLongitude`) from the
@@ -567,32 +414,18 @@ pub fn write_face_regions(
     oriented_w: u32,
     oriented_h: u32,
 ) -> Result<(), String> {
-    let path = sidecar_path(photo_path);
-    let existed = path.exists();
+    let mut doc = SidecarDocument::open(photo_path)?;
+    doc.declare_extra_namespaces(&[
+        ("mwg-rs", NS_MWG_RS),
+        ("stArea", NS_STAREA),
+        ("stDim", NS_STDIM),
+    ]);
 
-    let mut root = if existed {
-        let file = std::fs::File::open(&path).map_err(|e| e.to_string())?;
-        Element::parse(file).map_err(|e| format!("cannot parse {}: {e}", path.display()))?
-    } else {
-        new_root()
-    };
-
-    let rdf = child_mut(&mut root, "rdf", NS_RDF, "RDF");
-    let desc = child_mut(rdf, "rdf", NS_RDF, "Description");
-    desc.attributes
-        .entry("rdf:about".to_string())
-        .or_insert_with(String::new);
-
-    let chairphoto_written = desc.children.iter().any(|n| {
-        matches!(n, XMLNode::Element(e)
-            if e.namespace.as_deref() == Some(NS_CHAIRPHOTO) && e.name == "LastWrite")
-    });
-    if existed && !chairphoto_written {
-        std::fs::copy(&path, sidecar_backup_path(&path)).ok();
-    }
-
-    declare_namespaces(desc);
-    declare_region_namespaces(desc);
+    // Regions don't fit `replace_owned`'s "strip a fixed set of (ns, name) pairs, push flat
+    // replacements" shape: which existing `rdf:li` entries to keep is decided per-entry by
+    // Name + center-Area matching (AGENTS.md), not by a static owned-node list. So this writer
+    // reaches into the Description directly instead.
+    let desc = doc.description_mut();
 
     // Split out any existing mwg-rs:Regions element; keep everything else in place.
     let existing_regions = take_child(desc, NS_MWG_RS, "Regions");
@@ -613,21 +446,7 @@ pub fn write_face_regions(
             .push(build_regions(oriented_w, oriented_h, lis));
     }
 
-    // Re-stamp LastWrite (managed by every writer).
-    desc.children.retain(|n| {
-        !matches!(n, XMLNode::Element(e)
-            if e.namespace.as_deref() == Some(NS_CHAIRPHOTO) && e.name == "LastWrite")
-    });
-    desc.children
-        .push(plain("chairphoto", NS_CHAIRPHOTO, "LastWrite", &now().to_string()));
-
-    let mut buf = Vec::new();
-    root.write(&mut buf).map_err(|e| e.to_string())?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).ok();
-    }
-    std::fs::write(&path, buf).map_err(|e| e.to_string())?;
-    Ok(())
+    doc.commit()
 }
 
 /// Read the MWG face regions (`mwg-rs:Regions`) from the photo's sidecar. Returns each region's
@@ -884,14 +703,6 @@ fn fmt_coord(v: f32) -> String {
     }
 }
 
-fn declare_region_namespaces(desc: &mut Element) {
-    let mut ns = desc.namespaces.take().unwrap_or_else(Namespace::empty);
-    ns.put("mwg-rs", NS_MWG_RS);
-    ns.put("stArea", NS_STAREA);
-    ns.put("stDim", NS_STDIM);
-    desc.namespaces = Some(ns);
-}
-
 // --- element construction helpers ----------------------------------------
 
 fn el(prefix: &str, ns: &str, name: &str) -> Element {
@@ -945,12 +756,6 @@ fn seq_creator(value: &str) -> XMLNode {
     let mut e = el("dc", NS_DC, "creator");
     e.children.push(XMLNode::Element(seq));
     XMLNode::Element(e)
-}
-
-fn is_managed(node: &XMLNode) -> bool {
-    matches!(node, XMLNode::Element(e)
-        if MANAGED.iter().any(|(ns, name)|
-            e.namespace.as_deref() == Some(*ns) && e.name == *name))
 }
 
 /// Find a child element by (namespace, name) or create it, returning a mut ref.
@@ -1099,6 +904,92 @@ mod tests {
         let xmp = read(&sidecar_path(&photo));
         assert_eq!(xmp.matches("xmp:Identifier").count(), 2, "one open + one close tag only");
         assert!(xmp.contains("x"), "IPTC field survived the identifier rewrite");
+    }
+
+    /// Overwrite (issue #33) destroys an identifier chairphoto did not write, so the
+    /// pre-existing sidecar must be preserved verbatim first — and everything else in that
+    /// sidecar (here darktable's element) must survive the rewrite, exactly as
+    /// `write_identifier` guarantees.
+    #[test]
+    fn overwrite_identifier_backs_up_the_foreign_sidecar_and_preserves_the_rest() {
+        let dir = crate::test_support::TestTmpDir::new("xmp-overwrite-foreign");
+        let photo = dir.join("DSC20.ARW");
+        std::fs::write(&photo, b"raw").unwrap();
+        let existing = r#"<?xml version="1.0" encoding="UTF-8"?>
+<x:xmpmeta xmlns:x="adobe:ns:meta/">
+ <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+  <rdf:Description rdf:about="" xmlns:darktable="http://darktable.sf.net/"
+    xmlns:xmp="http://ns.adobe.com/xap/1.0/">
+   <darktable:history_end>7</darktable:history_end>
+   <xmp:Identifier>somebody-elses-uuid</xmp:Identifier>
+  </rdf:Description>
+ </rdf:RDF>
+</x:xmpmeta>"#;
+        std::fs::write(sidecar_path(&photo), existing).unwrap();
+
+        let backup = overwrite_identifier(&photo, "our-uuid").unwrap();
+        assert_eq!(backup.as_deref(), Some(sidecar_backup_path(&sidecar_path(&photo)).as_path()));
+        assert_eq!(std::fs::read_to_string(backup.unwrap()).unwrap(), existing,
+            "the destroyed identifier must survive verbatim in the backup");
+
+        assert_eq!(read_identifier(&photo).as_deref(), Some("our-uuid"));
+        let xmp = read(&sidecar_path(&photo));
+        assert!(xmp.contains("history_end"), "foreign element clobbered by the overwrite");
+        assert!(!xmp.contains("somebody-elses-uuid"), "the conflicting identifier must be gone");
+        assert_eq!(xmp.matches("xmp:Identifier").count(), 2, "one open + one close tag only");
+    }
+
+    /// The case plain `write_identifier` would NOT back up: a sidecar chairphoto has already
+    /// written (it carries `chairphoto:LastWrite`) that nevertheless holds a foreign
+    /// identifier — the ordinary result of duplicating a file after import. Overwrite must
+    /// still preserve it, because it is about to destroy that identifier.
+    #[test]
+    fn overwrite_identifier_backs_up_even_a_chairphoto_written_sidecar() {
+        let dir = crate::test_support::TestTmpDir::new("xmp-overwrite-ours");
+        let photo = dir.join("DSC21.ARW");
+        std::fs::write(&photo, b"raw").unwrap();
+        // chairphoto writes it once (stamping LastWrite), then the file is duplicated and
+        // ends up under a row whose catalog uuid is different.
+        write_identifier(&photo, "uuid-of-the-original").unwrap();
+        let backup_path = sidecar_backup_path(&sidecar_path(&photo));
+        assert!(!backup_path.exists(), "no backup yet: nothing existed before the first write");
+        let before = read(&sidecar_path(&photo));
+
+        let backup = overwrite_identifier(&photo, "uuid-of-the-duplicate").unwrap();
+        assert_eq!(backup.as_deref(), Some(backup_path.as_path()),
+            "a chairphoto-written sidecar must still be backed up before Overwrite destroys \
+             an identifier — `chairphoto:LastWrite` does not make the identifier ours");
+        assert_eq!(std::fs::read_to_string(&backup_path).unwrap(), before);
+        assert_eq!(read_identifier(&photo).as_deref(), Some("uuid-of-the-duplicate"));
+    }
+
+    /// A backup that already exists is the earliest state we ever saw. A later Overwrite
+    /// must not trade it away for a newer, chairphoto-written one.
+    #[test]
+    fn overwrite_identifier_never_replaces_an_existing_backup() {
+        let dir = crate::test_support::TestTmpDir::new("xmp-overwrite-keeps-backup");
+        let photo = dir.join("DSC22.ARW");
+        std::fs::write(&photo, b"raw").unwrap();
+        let original = r#"<?xml version="1.0" encoding="UTF-8"?>
+<x:xmpmeta xmlns:x="adobe:ns:meta/">
+ <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+  <rdf:Description rdf:about="" xmlns:xmp="http://ns.adobe.com/xap/1.0/">
+   <xmp:Identifier>first-foreign-uuid</xmp:Identifier>
+  </rdf:Description>
+ </rdf:RDF>
+</x:xmpmeta>"#;
+        std::fs::write(sidecar_path(&photo), original).unwrap();
+
+        overwrite_identifier(&photo, "second-uuid").unwrap();
+        let backup_path = sidecar_backup_path(&sidecar_path(&photo));
+        assert_eq!(std::fs::read_to_string(&backup_path).unwrap(), original);
+
+        // A second Overwrite reports no new backup and leaves the original snapshot intact.
+        let backup = overwrite_identifier(&photo, "third-uuid").unwrap();
+        assert_eq!(backup, None, "an existing backup is left alone, and reported as such");
+        assert_eq!(std::fs::read_to_string(&backup_path).unwrap(), original,
+            "the earliest snapshot must survive later overwrites");
+        assert_eq!(read_identifier(&photo).as_deref(), Some("third-uuid"));
     }
 
     #[test]

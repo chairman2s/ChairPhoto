@@ -109,7 +109,7 @@ Every upload path renders to a JPEG first and reads the whole render into memory
 |---|---|---|
 | Flickr (`flickr/mod.rs:739`) | `fs::read()` into memory | ~5–25 MB |
 | SmugMug (`smugmug/mod.rs:208`) | `fs::read()` into memory | ~5–25 MB |
-| LocalSend (`localsend/mod.rs:310`) | `tokio::fs::read()` into memory, one file per loop iteration | ~5–25 MB |
+| LocalSend (`localsend/mod.rs:863`) | `tokio::fs::read()` into memory, one file per loop iteration | ~5–25 MB |
 | Instagram (`commands/instagram.rs`) | rendered to disk, path passed to Chrome (not uploaded by ChairPhoto) | ~200 KB (1080px cap) |
 
 This design is deliberate. **Peak exposure is roughly one full-resolution JPEG** (~5–25 MB for Flickr,

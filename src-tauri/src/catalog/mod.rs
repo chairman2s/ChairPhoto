@@ -19,6 +19,7 @@ mod reconcile;
 pub mod locations;
 mod models;
 mod publications;
+mod query;
 mod schema;
 mod smart_albums;
 mod stats;
@@ -30,10 +31,11 @@ mod performance_harness;
 
 pub use facets::{Facet, SOFT_THRESHOLD_DEFAULT, SOFT_THRESHOLD_KEY};
 pub use identity::{
-    bind_sidecar_identity, IdentityRepairPlan, IdentityRepairSummary, PendingIdentity,
-    PendingIdentityField, PendingIdentityRow, PendingIdentitySummary, SidecarIdentity,
+    bind_sidecar_identity, IdentityConflictAction, IdentityConflictOutcome, IdentityRepairCursor,
+    IdentityRepairPlan, IdentityRepairSummary, PendingIdentity, PendingIdentityField,
+    PendingIdentityRow, PendingIdentitySummary, SidecarIdentity,
 };
-pub use locations::PathCandidate;
+pub use locations::{PathCandidate, ResolveMode};
 pub use lifecycle::{copy_and_verify, verify_and_delete_locals, BackupPlan, OffloadPlan, RestorePlan};
 pub use merge::MergeSummary;
 pub use models::{
@@ -42,6 +44,7 @@ pub use models::{
     Publication, StorageStatus, SmartAlbum, Tag, TagGroup, TagTerm, TagWithCount, Volume,
     VolumeKind,
 };
+pub use query::{CullingFilter, PhotoPage, PhotoQuery, PhotoSort, PhotoWindow, StorageTier};
 pub use smart_albums::rule_to_sql;
 pub use reconcile::DrainSummary;
 
@@ -299,6 +302,14 @@ impl Catalog {
             .and_then(|v| v.parse().ok())
             .unwrap_or(0);
         self.migrate_sidecar_identity_fields()?;
+        // Schema v22 (#33): a dismissed conflict stops being retried and stops counting as
+        // debt. Must run AFTER `migrate_sidecar_identity_fields`, whose v20→v21 rebuild
+        // recreates the table without this column.
+        self.ensure_column(
+            "pending_sidecar_identity",
+            "dismissed_at",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
         if prior_version < 2 {
             // Introduce the physical-location layer: default volume + backfill.
             self.backfill_default_volume()?;
@@ -657,12 +668,10 @@ impl Catalog {
     pub fn get_photo(&self, photo_id: i64) -> Result<Photo> {
         self.conn
             .query_row(
-                "SELECT id, uuid, path, rating, color_label, pick_state, capture_time,
-                    width, height, camera_model, lens, aperture, shutter_speed, iso,
-                    external_editors, thumbnail_path,
-                    (SELECT COUNT(*) FROM photos c WHERE c.stack_parent_id = photos.id),
-                    stack_parent_id, metadata_ready, sharpness, sharpness_method, burst_flag
-                 FROM photos WHERE id = ?1",
+                &format!(
+                    "SELECT {cols} FROM photos WHERE id = ?1",
+                    cols = query::photo_columns("photos")
+                ),
                 params![photo_id],
                 row_to_photo,
             )
@@ -675,12 +684,10 @@ impl Catalog {
     pub fn get_photo_by_uuid(&self, uuid: &str) -> Result<Photo> {
         self.conn
             .query_row(
-                "SELECT id, uuid, path, rating, color_label, pick_state, capture_time,
-                    width, height, camera_model, lens, aperture, shutter_speed, iso,
-                    external_editors, thumbnail_path,
-                    (SELECT COUNT(*) FROM photos c WHERE c.stack_parent_id = photos.id),
-                    stack_parent_id, metadata_ready, sharpness, sharpness_method, burst_flag
-                 FROM photos WHERE uuid = ?1",
+                &format!(
+                    "SELECT {cols} FROM photos WHERE uuid = ?1",
+                    cols = query::photo_columns("photos")
+                ),
                 params![uuid],
                 row_to_photo,
             )
@@ -832,14 +839,10 @@ impl Catalog {
 
     /// The photos stacked under `parent_id` (e.g. the camera JPEG under a RAW).
     pub fn list_stack_children(&self, parent_id: i64) -> Result<Vec<Photo>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, uuid, path, rating, color_label, pick_state, capture_time,
-                width, height, camera_model, lens, aperture, shutter_speed, iso,
-                external_editors, thumbnail_path,
-                (SELECT COUNT(*) FROM photos c WHERE c.stack_parent_id = photos.id),
-                stack_parent_id, metadata_ready, sharpness, sharpness_method, burst_flag
-             FROM photos WHERE stack_parent_id = ?1 ORDER BY path COLLATE NOCASE",
-        )?;
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {cols} FROM photos WHERE stack_parent_id = ?1 ORDER BY path COLLATE NOCASE",
+            cols = query::photo_columns("photos")
+        ))?;
         let rows = stmt.query_map(params![parent_id], row_to_photo)?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
@@ -1022,10 +1025,6 @@ impl Catalog {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
-    /// List photos, optionally filtered by a tag (including its descendants), an
-    /// album, an import batch, derived `facets` (e.g. "has-gps", "mobile", "drone"),
-    /// and a culling filter ("all", "unrated", "pick", "reject", "edited"). All
-    /// supplied filters are ANDed. Missing photos are excluded.
     /// Distinct non-empty values of a photo column, for the camera/lens filter dropdowns.
     /// `column` is a fixed allowlist (camera_model | lens) — never user input.
     pub fn distinct_photo_values(&self, column: &str) -> Result<Vec<String>> {
@@ -1041,189 +1040,6 @@ impl Catalog {
         );
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
-        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
-    }
-
-    pub fn list_photos(
-        &self,
-        tag_id: Option<i64>,
-        album_id: Option<i64>,
-        batch_id: Option<i64>,
-        facets: &[String],
-        culling_filter: &str,
-        smart_album_id: Option<i64>,
-        storage_tier: &str,
-        camera: Option<&str>,
-        lens: Option<&str>,
-        // Colour-label filter, OR-combined: keep photos whose label is any of these
-        // (canonical "Red"… strings; "" = the No-label option). Empty slice = no filter.
-        labels: &[String],
-        // Sort order: None / "date" (oldest-first capture time, default),
-        // "sharpness_asc" (least-sharp first — puts suspect frames up front for
-        // culling), "sharpness_desc" (sharpest-first). Unscored photos
-        // (sharpness IS NULL) sort after scored ones in both sharpness orderings.
-        sort: Option<&str>,
-    ) -> Result<Vec<Photo>> {
-        let mut sql = String::from(
-            "SELECT DISTINCT p.id, p.uuid, p.path, p.rating, p.color_label, p.pick_state,
-                p.capture_time, p.width, p.height, p.camera_model, p.lens,
-                p.aperture, p.shutter_speed, p.iso,
-                p.external_editors, p.thumbnail_path,
-                (SELECT COUNT(*) FROM photos c WHERE c.stack_parent_id = p.id),
-                p.stack_parent_id, p.metadata_ready,
-                p.sharpness, p.sharpness_method, p.burst_flag
-             FROM photos p",
-        );
-        // Stacked derivatives (e.g. a camera JPEG under its RAW) are hidden from the
-        // main grid; they're reached via the master's Stack section in the inspector.
-        let mut wheres = vec![
-            "p.missing = 0".to_string(),
-            "p.stack_parent_id IS NULL".to_string(),
-        ];
-        let mut bind: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
-
-        if let Some(tid) = tag_id {
-            let ids = self.descendant_tag_ids(tid)?;
-            let placeholders = vec!["?"; ids.len()].join(",");
-            sql.push_str(" JOIN photo_tags pt ON pt.photo_id = p.id");
-            wheres.push(format!("pt.tag_id IN ({placeholders})"));
-            for id in ids {
-                bind.push(Box::new(id));
-            }
-        }
-
-        if let Some(aid) = album_id {
-            sql.push_str(" JOIN album_photos ap ON ap.photo_id = p.id");
-            wheres.push("ap.album_id = ?".to_string());
-            bind.push(Box::new(aid));
-        }
-
-        if let Some(bid) = batch_id {
-            wheres.push("p.import_batch_id = ?".to_string());
-            bind.push(Box::new(bid));
-        }
-
-        // Smart album: a saved RULE evaluated LIVE. Load its rule_json, translate it to
-        // WHERE fragments (over the same `p` alias) + bound parameters, and AND them in.
-        // The translator is the single source of truth for the field/op allowlist; every
-        // value it yields is already a bound parameter (see catalog/smart_albums.rs).
-        if let Some(sid) = smart_album_id {
-            let rule_json = self.smart_album_rule_json(sid)?;
-            let (rule_wheres, rule_binds) = smart_albums::rule_to_sql(&rule_json)?;
-            for w in rule_wheres {
-                wheres.push(w);
-            }
-            for b in rule_binds {
-                bind.push(b);
-            }
-        }
-
-        // Derived facets (internal, never exported): each is a boolean predicate, ANDed
-        // in. Most are computed from photos columns (no binds); the dynamic
-        // "published:<platform>" facets take the platform as a bound parameter; the `soft`
-        // facet uses a dynamic threshold from settings (via facet_predicate_owned).
-        for facet in facets {
-            if let Some(platform) = facet.strip_prefix("published:") {
-                wheres.push(
-                    "EXISTS (SELECT 1 FROM publications pub \
-                     WHERE pub.photo_id = p.id AND pub.platform = ?)"
-                        .to_string(),
-                );
-                bind.push(Box::new(platform.to_string()));
-            } else {
-                wheres.push(self.facet_predicate_owned(facet)?);
-            }
-        }
-
-        match culling_filter {
-            "all" => {}
-            "unrated" => wheres.push("p.rating = 0".into()),
-            "pick" => {
-                wheres.push("p.pick_state = 'pick'".into());
-            }
-            "reject" => {
-                wheres.push("p.pick_state = 'reject'".into());
-            }
-            "edited" => wheres.push("p.external_editors != ''".into()),
-            other => return Err(CatalogError::Tag(format!("unknown filter: {other}"))),
-        }
-
-        // Storage tier: where the photo's bytes live (by volume kind, matching the grid's
-        // status icons). "local" = has a copy on a local volume (recent, on-disk photos);
-        // "nas" = NAS-only, i.e. offloaded — no local copy but a backup exists.
-        match storage_tier {
-            "" | "all" => {}
-            "local" => wheres.push(
-                "EXISTS (SELECT 1 FROM photo_locations l JOIN volumes v ON v.id = l.volume_id \
-                 WHERE l.photo_id = p.id AND v.kind = 'local')"
-                    .into(),
-            ),
-            "nas" => wheres.push(
-                "NOT EXISTS (SELECT 1 FROM photo_locations l JOIN volumes v ON v.id = l.volume_id \
-                   WHERE l.photo_id = p.id AND v.kind = 'local') \
-                 AND EXISTS (SELECT 1 FROM photo_locations l JOIN volumes v ON v.id = l.volume_id \
-                   WHERE l.photo_id = p.id AND v.kind = 'backup')"
-                    .into(),
-            ),
-            other => return Err(CatalogError::Tag(format!("unknown storage tier: {other}"))),
-        }
-
-        // Camera / lens exact-match filters (values come from distinct_photo_values, bound).
-        if let Some(cam) = camera {
-            wheres.push("p.camera_model = ?".to_string());
-            bind.push(Box::new(cam.to_string()));
-        }
-        if let Some(l) = lens {
-            wheres.push("p.lens = ?".to_string());
-            bind.push(Box::new(l.to_string()));
-        }
-
-        // Colour labels, OR-combined within the filter (a photo has one label, so a
-        // multi-select is a set-membership test). "" is a valid member: the No-label
-        // option. NOCASE matches the smart-album text predicate's behaviour.
-        if !labels.is_empty() {
-            let placeholders = vec!["?"; labels.len()].join(",");
-            wheres.push(format!("p.color_label COLLATE NOCASE IN ({placeholders})"));
-            for label in labels {
-                bind.push(Box::new(label.clone()));
-            }
-        }
-
-        sql.push_str(" WHERE ");
-        sql.push_str(&wheres.join(" AND "));
-        // Albums are explicitly ordered collections — honour their member order when
-        // viewing one. Otherwise sort by "date taken", oldest first, with path as a
-        // deterministic tiebreaker for same-timestamp bursts. Prefer the EXIF capture
-        // time; when it's missing (e.g. iPhone HEICs / files stripped of EXIF) fall back
-        // to the file's modification time (mtime_ns, always recorded on scan) so those
-        // photos slot into the timeline chronologically instead of piling up at the end.
-        // capture_time is local-clock ISO ("YYYY-MM-DDTHH:MM:SS"); mtime is true unix
-        // seconds — the small tz skew at the EXIF/no-EXIF boundary is acceptable for sort.
-        if album_id.is_some() {
-            sql.push_str(" ORDER BY ap.position, p.path COLLATE NOCASE");
-        } else {
-            match sort.unwrap_or("date") {
-                // Sharpness sorts: unscored photos (NULL) always sort last so the ordering
-                // makes sense in both directions and newly-indexed photos don't jump around.
-                "sharpness_asc" => sql.push_str(
-                    " ORDER BY CASE WHEN p.sharpness IS NULL THEN 1 ELSE 0 END, \
-                     p.sharpness ASC, p.path COLLATE NOCASE",
-                ),
-                "sharpness_desc" => sql.push_str(
-                    " ORDER BY CASE WHEN p.sharpness IS NULL THEN 1 ELSE 0 END, \
-                     p.sharpness DESC, p.path COLLATE NOCASE",
-                ),
-                // Default ("date" or anything unknown): oldest-first by capture time.
-                _ => sql.push_str(
-                    " ORDER BY COALESCE(CAST(strftime('%s', p.capture_time) AS INTEGER), \
-                     p.mtime_ns / 1000000000), p.path COLLATE NOCASE",
-                ),
-            }
-        }
-
-        let params: Vec<&dyn rusqlite::ToSql> = bind.iter().map(|b| b.as_ref()).collect();
-        let mut stmt = self.conn.prepare(&sql)?;
-        let rows = stmt.query_map(params.as_slice(), row_to_photo)?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
@@ -2088,6 +1904,7 @@ fn row_to_photo(r: &Row) -> rusqlite::Result<Photo> {
         sharpness: r.get(19)?,
         sharpness_method: r.get(20)?,
         burst_flag: r.get(21)?,
+        version_count: r.get(22)?,
     })
 }
 
@@ -2194,5 +2011,111 @@ mod tests {
 
         drop(catalog);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Schema v22 (#33) adds `pending_sidecar_identity.dismissed_at`, and it must be there
+    /// after the FIRST open of an older catalog — every query in `catalog/identity.rs` now
+    /// names that column, so a catalog missing it does not degrade, it fails outright.
+    ///
+    /// Both older shapes are exercised, because they take different routes to the column: a
+    /// **v21** catalog already has the table (`SCHEMA_SQL`'s `CREATE TABLE IF NOT EXISTS` is
+    /// a no-op) and gets the column from `ensure_column`; a **v20** catalog is additionally
+    /// rebuilt by `migrate_sidecar_identity_fields`, whose `CREATE TABLE`/`DROP TABLE` does
+    /// NOT include `dismissed_at` — so ordering `ensure_column` before that rebuild, rather
+    /// than after it, would leave a v20 upgrade without the column while a v21 upgrade
+    /// passed. Existing rows must default to 0 (not dismissed): the column records a human
+    /// decision, and nobody has made one for a row that predates the feature.
+    ///
+    /// The v21 fixture carries a pre-existing queue row and asserts it comes back not
+    /// dismissed. The v20 one deliberately does not: `migrate_sidecar_identity_fields`
+    /// copies rows into a table that declares `REFERENCES photos(id)`, so a synthetic row
+    /// pointing at no photo would abort the whole open on a foreign-key violation — which
+    /// says nothing about this column.
+    #[test]
+    fn older_catalogs_gain_the_dismissed_at_column_on_first_open() {
+        for (label, create_sql, seeded_row) in [
+            (
+                "v21",
+                "CREATE TABLE pending_sidecar_identity (
+                    photo_id        INTEGER NOT NULL,
+                    field           TEXT NOT NULL DEFAULT 'identifier',
+                    volume_id       INTEGER NOT NULL,
+                    relative_path   TEXT NOT NULL,
+                    attempts        INTEGER NOT NULL DEFAULT 1,
+                    error           TEXT NOT NULL DEFAULT '',
+                    queued_at       INTEGER NOT NULL,
+                    last_attempt_at INTEGER NOT NULL,
+                    PRIMARY KEY(photo_id, field, volume_id, relative_path)
+                 );
+                 INSERT INTO pending_sidecar_identity
+                    (photo_id, field, volume_id, relative_path, queued_at, last_attempt_at)
+                 VALUES(1, 'identifier', 1, 'old.arw', 10, 10);",
+                true,
+            ),
+            (
+                "v20",
+                "CREATE TABLE pending_sidecar_identity (
+                    photo_id        INTEGER NOT NULL,
+                    volume_id       INTEGER NOT NULL,
+                    relative_path   TEXT NOT NULL,
+                    attempts        INTEGER NOT NULL DEFAULT 1,
+                    error           TEXT NOT NULL DEFAULT '',
+                    queued_at       INTEGER NOT NULL,
+                    last_attempt_at INTEGER NOT NULL,
+                    PRIMARY KEY(photo_id, volume_id, relative_path)
+                 );",
+                false,
+            ),
+        ] {
+            let suffix = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            let dir = std::env::temp_dir().join(format!(
+                "chairphoto-v22-migration-{label}-{}-{suffix}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            let root = dir.join("photos");
+            std::fs::create_dir_all(&root).unwrap();
+            let catalog_path = dir.join("old.chairphoto");
+            {
+                let raw = Connection::open(&catalog_path).unwrap();
+                raw.execute_batch(create_sql).unwrap();
+            }
+
+            let catalog = Catalog::open(&catalog_path, &root).unwrap();
+            let columns: Vec<String> = {
+                let mut stmt = catalog
+                    .conn
+                    .prepare("PRAGMA table_info(pending_sidecar_identity)")
+                    .unwrap();
+                stmt.query_map([], |r| r.get::<_, String>(1))
+                    .unwrap()
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .unwrap()
+            };
+            assert!(
+                columns.iter().any(|c| c == "dismissed_at"),
+                "{label}: expected dismissed_at on the FIRST open, got {columns:?}"
+            );
+            if seeded_row {
+                let dismissed: i64 = catalog
+                    .conn
+                    .query_row(
+                        "SELECT dismissed_at FROM pending_sidecar_identity
+                         WHERE relative_path = 'old.arw'",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(dismissed, 0, "{label}: a pre-existing row is not dismissed");
+            }
+            // The queue is usable end to end, not merely column-complete.
+            catalog.summarize_pending_identity().unwrap();
+
+            drop(catalog);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 }

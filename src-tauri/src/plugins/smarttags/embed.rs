@@ -15,6 +15,11 @@
 //! - The model path is **configurable** (`smarttags.model_path`) and a **missing model degrades
 //!   gracefully**: [`encode_jpeg`] returns a typed [`EmbedError`], never panics.
 //!
+//! The pool is cached keyed by [`PoolKey`] — model path, pool size, intra-op threads,
+//! force-CPU — through [`crate::plugins::onnx::KeyedCache`], not a plain `OnceLock` (issue
+//! #18): the old cache froze at whatever the first call resolved, so a `smarttags.model_path`
+//! change never took effect until restart. See [`clip_pool`].
+//!
 //! The pure preprocessing (resize + CLIP normalize into an NCHW tensor) and the L2-normalize are
 //! model-free, so they are unit-tested offline. The full session path is exercised by a test
 //! that builds a **tiny synthetic ONNX graph** in-process (no model download) — see the tests.
@@ -24,7 +29,7 @@ use image::RgbImage;
 use super::models::{self, ModelError};
 
 #[cfg(feature = "smarttags")]
-use std::sync::{Condvar, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex};
 
 /// CLIP's fixed square input side.
 pub const CLIP_SIZE: u32 = 224;
@@ -36,17 +41,20 @@ const CLIP_MEAN: [f32; 3] = [0.481_454_67, 0.457_827_5, 0.408_210_73];
 const CLIP_STD: [f32; 3] = [0.268_629_54, 0.261_302_6, 0.275_777_1];
 
 /// The intra-op thread count each ONNX session is built with, and the number of sessions in the
-/// pool. Set once, before the first session is built, by [`configure`] (from the indexer, off the
-/// resolved [`crate::plugins::indexing::IndexingPlan`] — Smart Tagging rides the same `indexing.speed`
-/// setting). A session built before `configure` runs (e.g. a single inspector embed) uses the
-/// responsive defaults below.
+/// pool. Set by [`configure`] (from the indexer, off the resolved
+/// [`crate::plugins::indexing::IndexingPlan`] — Smart Tagging rides the same `indexing.speed`
+/// setting). Read into a [`PoolKey`] on every pool fetch (see [`resolve_pool_key`]), so a
+/// value change here rebuilds the pool the next time one is needed rather than being frozen at
+/// whatever the first caller saw. A session built before `configure` ever runs (e.g. a single
+/// inspector embed) uses the responsive defaults below.
 #[cfg(feature = "smarttags")]
 static POOL_SIZE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
 #[cfg(feature = "smarttags")]
 static INTRA_THREADS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(2);
 
-/// When `true`, the CUDA EP is never registered even in a `smarttags-cuda` build — CPU only. Set
-/// by [`configure_force_cpu`] before the first pool build. Inert in a non-CUDA build.
+/// When `true`, the CUDA EP is never registered even in a `smarttags-cuda` build — CPU only.
+/// Set by [`configure_force_cpu`]. Like [`POOL_SIZE`]/[`INTRA_THREADS`], part of [`PoolKey`],
+/// so flipping it rebuilds the pool on the next fetch. Inert in a non-CUDA build.
 #[cfg(feature = "smarttags")]
 static FORCE_CPU: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -89,8 +97,18 @@ pub fn active_ep() -> ActiveEp {
 }
 
 /// Configure the session-pool size and per-session intra-op thread count for the *next* pool
-/// build. Call once before an index run (from the indexer, off the resolved
-/// [`crate::plugins::indexing::IndexingPlan`]); no-op once a pool exists (the first build wins).
+/// fetch. Call before an index run (from the indexer, off the resolved
+/// [`crate::plugins::indexing::IndexingPlan`]). Unlike the old `OnceLock`-backed pool, this is
+/// never a no-op: the pool is keyed by [`PoolKey`] (see [`clip_pool`]), so a value change here
+/// rebuilds the pool the next time `encode_jpeg`/`encode_rgb` runs.
+///
+/// [`POOL_SIZE`]/[`INTRA_THREADS`] are process-global, so two Smart Tagging index runs
+/// overlapping (a second `smarttags_index_photos` call trips the first job's abort flag — see
+/// `commands::smarttags::begin_smarttags_job`) can move these out from under the first run's
+/// still-in-flight chunk; see [`crate::plugins::faces::engine::configure`] for the full
+/// reasoning, which applies identically here. A single run's own workers never see this,
+/// because `configure`/[`configure_force_cpu`] are each called exactly once, before that run's
+/// parallel loop starts.
 #[cfg(feature = "smarttags")]
 pub fn configure(pool_size: usize, intra_threads: usize) {
     use std::sync::atomic::Ordering;
@@ -98,12 +116,50 @@ pub fn configure(pool_size: usize, intra_threads: usize) {
     INTRA_THREADS.store(intra_threads.max(1), Ordering::Relaxed);
 }
 
-/// Force every session onto CPU even in a `smarttags-cuda` build. Call before the first pool
-/// build; no-op afterward. Inert in a non-CUDA build.
+/// Force every session onto CPU even in a `smarttags-cuda` build. Same lifecycle and
+/// cross-job caveat as [`configure`]: rebuilds the pool on the next fetch rather than only
+/// ever taking effect on the first one. Inert in a non-CUDA build.
 #[cfg(feature = "smarttags")]
 pub fn configure_force_cpu(force: bool) {
     use std::sync::atomic::Ordering;
     FORCE_CPU.store(force, Ordering::Relaxed);
+}
+
+/// Everything that determines what a built CLIP session pool looks like: the resolved model
+/// path (`smarttags.model_path`, or the pinned default), whether that path is a user-supplied
+/// custom model (needed by [`models::verify`], which only checksums the pinned default), pool
+/// size, intra-op threads, and force-CPU. Two fetches with an equal key reuse the same pool;
+/// any difference — including a changed model path — rebuilds (issue #18).
+///
+/// `force_cpu` doubles as "execution provider mode": today's engine has exactly two modes —
+/// CPU-only and "try CUDA, fall back to CPU" — so the one boolean fully captures it, mirroring
+/// `faces::engine::PoolKey`.
+#[cfg(feature = "smarttags")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PoolKey {
+    model_path: std::path::PathBuf,
+    custom: bool,
+    pool_size: usize,
+    intra_threads: usize,
+    force_cpu: bool,
+}
+
+/// Resolve `model_path_setting` and snapshot [`POOL_SIZE`]/[`INTRA_THREADS`]/[`FORCE_CPU`]
+/// into a [`PoolKey`]. Called on every pool fetch (not just the first) — see [`clip_pool`] —
+/// which is what makes both a `smarttags.model_path` change and a
+/// `configure`/`configure_force_cpu` call take effect on the next fetch instead of being
+/// ignored until restart.
+#[cfg(feature = "smarttags")]
+fn resolve_pool_key(model_path_setting: Option<&str>) -> Result<PoolKey, EmbedError> {
+    use std::sync::atomic::Ordering;
+    let (model_path, custom) = models::resolve_model_path(model_path_setting)?;
+    Ok(PoolKey {
+        model_path,
+        custom,
+        pool_size: POOL_SIZE.load(Ordering::Relaxed).max(1),
+        intra_threads: INTRA_THREADS.load(Ordering::Relaxed).max(1),
+        force_cpu: FORCE_CPU.load(Ordering::Relaxed),
+    })
 }
 
 /// Failure modes of embedding. Model absence is surfaced as [`EmbedError::Model`] so the caller
@@ -258,58 +314,69 @@ impl<T> Drop for Checkout<'_, T> {
     }
 }
 
-/// Lazily build (once) and reuse a pool of ONNX sessions for the CLIP model resolved from the
-/// current `smarttags.model_path` setting. The first build wins and is cached for the process
-/// lifetime, so the graph-optimization cost is paid once. A model that changed path after the
-/// first build is *not* picked up until restart (matching the faces engine's `OnceLock` model
-/// caching); switching models is a rare, explicit action.
+/// Process-global keyed cache for the CLIP session pool — see [`PoolKey`] and
+/// [`crate::plugins::onnx::KeyedCache`].
+#[cfg(feature = "smarttags")]
+static CLIP_CACHE: crate::plugins::onnx::KeyedCache<PoolKey, Pool<ort::session::Session>> =
+    crate::plugins::onnx::KeyedCache::new();
+
+/// Fetch (building or rebuilding as needed) the CLIP session pool for the model resolved from
+/// the current `smarttags.model_path` setting and the current pool configuration. Equal
+/// [`PoolKey`]s reuse the same pool, so the graph-optimization cost is paid once per distinct
+/// configuration; a changed model path, pool size, intra-op thread count or force-CPU flag
+/// rebuilds on the next call instead of being frozen at whatever the first caller saw
+/// (issue #18) — switching models is a rare, explicit action, but it is no longer one that
+/// needs a restart to take effect.
 #[cfg(feature = "smarttags")]
 fn clip_pool(
     model_path_setting: Option<&str>,
-) -> Result<&'static Pool<ort::session::Session>, EmbedError> {
-    static CELL: OnceLock<Result<Pool<ort::session::Session>, String>> = OnceLock::new();
-    match CELL.get_or_init(|| build_pool(model_path_setting)) {
-        Ok(p) => Ok(p),
-        Err(msg) => Err(EmbedError::Inference(msg.clone())),
-    }
+) -> Result<Arc<Pool<ort::session::Session>>, EmbedError> {
+    let key = resolve_pool_key(model_path_setting)?;
+    CLIP_CACHE
+        .get_or_build(key.clone(), || build_pool(&key))
+        .map_err(EmbedError::Inference)
 }
 
-/// Resolve + verify the model on disk, then build a [`Pool`] of `POOL_SIZE` sessions, each with
-/// `INTRA_THREADS` intra-op threads. Errors are stringified so they can be cached in the
-/// `OnceLock`. A missing model surfaces its [`ModelError`] text so the caller can prompt a
-/// download rather than crash.
+/// Verify the model on disk, then build a [`Pool`] of `key.pool_size` sessions, each with
+/// `key.intra_threads` intra-op threads and forced to CPU when `key.force_cpu`. Errors are
+/// stringified so [`crate::plugins::onnx::KeyedCache`] can pass them through without requiring
+/// `Clone`. A missing model surfaces its [`ModelError`] text so the caller can prompt a
+/// download rather than crash. A build failure is not cached, so a later retry (e.g. once a
+/// custom model path is fixed) gets a fresh attempt.
 #[cfg(feature = "smarttags")]
-fn build_pool(model_path_setting: Option<&str>) -> Result<Pool<ort::session::Session>, String> {
-    use std::sync::atomic::Ordering;
-    let (path, custom) = models::resolve_model_path(model_path_setting).map_err(|e| e.to_string())?;
-    let path = models::verify(&path, custom).map_err(|e| e.to_string())?;
-    let size = POOL_SIZE.load(Ordering::Relaxed).max(1);
-    let intra = INTRA_THREADS.load(Ordering::Relaxed).max(1);
-    let mut sessions = Vec::with_capacity(size);
+fn build_pool(key: &PoolKey) -> Result<Pool<ort::session::Session>, String> {
+    let path = models::verify(&key.model_path, key.custom).map_err(|e| e.to_string())?;
+    let mut sessions = Vec::with_capacity(key.pool_size);
     let mut used_cuda = false;
-    for _ in 0..size {
+    for _ in 0..key.pool_size {
         // `build_session` runs the ONNX Runtime preflight; a session must never be built
         // directly, or a missing runtime hangs instead of erroring. See plugins::onnx.
-        let (session, cuda) =
-            crate::plugins::onnx::build_session(&path, intra, try_register_cuda)?;
+        // `key.force_cpu` — not the live `FORCE_CPU` atomic — decides CUDA registration, so
+        // the built pool always matches the key it is cached under. See the equivalent note
+        // in `faces::engine::build_pool`.
+        let (session, cuda) = crate::plugins::onnx::build_session(&path, key.intra_threads, |b| {
+            try_register_cuda(b, key.force_cpu)
+        })?;
         used_cuda |= cuda;
         sessions.push(session);
     }
     set_active_ep(if used_cuda { ActiveEp::Cuda } else { ActiveEp::Cpu });
     if used_cuda {
-        eprintln!("smarttags engine: {size} CLIP sessions built on the CUDA execution provider (GPU)");
+        eprintln!(
+            "smarttags engine: {} CLIP sessions built on the CUDA execution provider (GPU)",
+            key.pool_size
+        );
     }
     Ok(Pool::new(sessions))
 }
 
 /// Attempt to register the CUDA EP on `builder`; `true` only when it registered. GRACEFUL:
-/// compiled out entirely in a non-CUDA build (always CPU), skipped when `smarttags.force_cpu` is
-/// set, and on a missing runtime/driver/GPU it logs and returns `false` so the build still
-/// commits on CPU. Never panics, never propagates.
+/// compiled out entirely in a non-CUDA build (always CPU), skipped when `force_cpu` is set,
+/// and on a missing runtime/driver/GPU it logs and returns `false` so the build still commits
+/// on CPU. Never panics, never propagates.
 #[cfg(all(feature = "smarttags", feature = "smarttags-cuda"))]
-fn try_register_cuda(builder: &mut ort::session::builder::SessionBuilder) -> bool {
-    use std::sync::atomic::Ordering;
-    if FORCE_CPU.load(Ordering::Relaxed) {
+fn try_register_cuda(builder: &mut ort::session::builder::SessionBuilder, force_cpu: bool) -> bool {
+    if force_cpu {
         return false;
     }
     use ort::ep::ExecutionProvider;
@@ -329,7 +396,7 @@ fn try_register_cuda(builder: &mut ort::session::builder::SessionBuilder) -> boo
 
 /// Non-CUDA build: no CUDA EP exists, so this is always CPU.
 #[cfg(all(feature = "smarttags", not(feature = "smarttags-cuda")))]
-fn try_register_cuda(_builder: &mut ort::session::builder::SessionBuilder) -> bool {
+fn try_register_cuda(_builder: &mut ort::session::builder::SessionBuilder, _force_cpu: bool) -> bool {
     false
 }
 
@@ -340,9 +407,8 @@ fn try_register_cuda(_builder: &mut ort::session::builder::SessionBuilder) -> bo
 fn run_clip(model_path_setting: Option<&str>, input: &[f32]) -> Result<Vec<f32>, EmbedError> {
     use ort::value::Tensor;
 
-    let mut session = clip_pool(model_path_setting)?
-        .checkout()
-        .map_err(EmbedError::Inference)?;
+    let pool = clip_pool(model_path_setting)?;
+    let mut session = pool.checkout().map_err(EmbedError::Inference)?;
 
     let shape = [1i64, 3, CLIP_SIZE as i64, CLIP_SIZE as i64];
     let tensor = Tensor::from_array((shape, input.to_vec()))
@@ -425,10 +491,12 @@ mod tests {
 
     /// A missing model file is a typed error, never a panic — the graceful-degradation contract.
     ///
-    /// Asserted at the [`build_pool`] layer (not through [`encode_rgb`]) because the live session
-    /// pool is a process-global `OnceLock`: whichever feature-gated test builds it first wins, so
-    /// a second test cannot re-point the runtime at a different (missing) model. `build_pool`
-    /// takes the path directly and does not touch that cache, so it isolates the failure path.
+    /// Asserted at the [`build_pool`] layer (not through [`encode_rgb`]) so it needs no pixel
+    /// data and stays a pure "does resolving this key fail cleanly" check. This is no longer
+    /// load-bearing for isolation from other tests the way it once was: `clip_pool` is now a
+    /// [`crate::plugins::onnx::KeyedCache`] keyed on (among other things) the model path, so a
+    /// call with a different/missing path builds its own entry rather than being shadowed by
+    /// whichever test built the shared pool first.
     #[cfg(feature = "smarttags")]
     #[test]
     fn missing_model_is_graceful_error() {
@@ -436,7 +504,9 @@ mod tests {
         // `build_session` performs the runtime preflight, so a missing model is reported on
         // its own terms. This briefly needed a skip guard, when the preflight ran first and
         // the runtime's error would have been asserted against instead of the model's.
-        let err = match build_pool(Some("/nonexistent/smarttags/model.onnx")) {
+        let key = resolve_pool_key(Some("/nonexistent/smarttags/model.onnx"))
+            .expect("resolving a path never fails just because the file is missing");
+        let err = match build_pool(&key) {
             Err(e) => e,
             Ok(_) => panic!("a missing model must fail cleanly, not build a pool"),
         };
@@ -445,6 +515,114 @@ mod tests {
             err.to_lowercase().contains("not available") || err.to_lowercase().contains("no file"),
             "expected a graceful model-missing message, got: {err}"
         );
+    }
+
+    // ── PoolKey / configure (issue #18) ─────────────────────────────────────────
+    //
+    // `clip_pool` fetches through `crate::plugins::onnx::KeyedCache`, whose rebuild-on-key-
+    // change policy is proven generically (no ONNX needed) by `plugins::onnx::tests`. What's
+    // specific to this module is that `resolve_pool_key` actually reflects the model path
+    // setting and `configure`/`configure_force_cpu` — that's what these tests cover.
+
+    /// A different `smarttags.model_path` setting resolves to a different key, and an
+    /// unset/blank setting resolves to the pinned default's path both times (so re-reading an
+    /// unchanged blank setting does not spuriously invalidate the cache).
+    #[cfg(feature = "smarttags")]
+    #[test]
+    fn resolve_pool_key_reflects_the_model_path_setting() {
+        let default_a = resolve_pool_key(None).unwrap();
+        let default_b = resolve_pool_key(Some("   ")).unwrap();
+        assert_eq!(default_a, default_b, "unset and blank must resolve identically");
+        assert!(!default_a.custom);
+
+        let custom = resolve_pool_key(Some("/tmp/some-other-clip.onnx")).unwrap();
+        assert_ne!(default_a, custom, "a custom path must change the key");
+        assert!(custom.custom);
+        assert_eq!(custom.model_path, std::path::PathBuf::from("/tmp/some-other-clip.onnx"));
+    }
+
+    /// `configure`/`configure_force_cpu` change the pool_size/intra_threads/force_cpu fields of
+    /// the key `resolve_pool_key` produces — the mechanism that makes a settings change rebuild
+    /// the pool instead of being silently ignored until restart. A single test, not several, so
+    /// it does not race itself over the process-global atomics; no other test in this binary
+    /// touches `POOL_SIZE`/`INTRA_THREADS`/`FORCE_CPU` (real pools are only ever built by the
+    /// synthetic/real-model tests below, which don't call `configure`).
+    #[cfg(feature = "smarttags")]
+    #[test]
+    fn configure_calls_change_the_resolved_pool_key() {
+        configure(2, 3);
+        configure_force_cpu(false);
+        let a = resolve_pool_key(None).unwrap();
+        assert_eq!(a.pool_size, 2);
+        assert_eq!(a.intra_threads, 3);
+        assert!(!a.force_cpu);
+
+        configure(5, 1);
+        configure_force_cpu(true);
+        let b = resolve_pool_key(None).unwrap();
+        assert_ne!(a, b, "changing pool_size/intra_threads/force_cpu must change the key");
+        assert_eq!(b.pool_size, 5);
+        assert_eq!(b.intra_threads, 1);
+        assert!(b.force_cpu);
+
+        // Zero is clamped to 1 — a degenerate resolved plan must still make progress.
+        configure(0, 0);
+        let c = resolve_pool_key(None).unwrap();
+        assert_eq!(c.pool_size, 1);
+        assert_eq!(c.intra_threads, 1);
+
+        // Restore the responsive defaults: these atomics are process-global, so leaving
+        // `force_cpu` at `true` would silently short-circuit CUDA registration for
+        // `reconfiguring_between_calls_rebuilds_without_breaking_encoding` below if it runs
+        // later in the same binary — confirmed by running this file's tests single-threaded
+        // before this reset existed: the CUDA-unavailable fallback message never printed,
+        // because this test's leftover `force_cpu = true` short-circuited it silently.
+        configure(1, 2);
+        configure_force_cpu(false);
+    }
+
+    /// `true` when the pinned default CLIP model is present and verified on disk (already
+    /// downloaded, e.g. from an earlier in-app `smarttags_download_model` run), else `false`
+    /// with a skip message. A model-presence gate layered on top of `onnx_ready_or_skip`'s
+    /// runtime gate — mirrors `models_ready_or_skip` in `tests/faces_engine.rs`.
+    #[cfg(feature = "smarttags")]
+    fn default_model_ready_or_skip(what: &str) -> bool {
+        if !onnx_ready_or_skip(what) {
+            return false;
+        }
+        if models::status(None).ready {
+            return true;
+        }
+        eprintln!("SKIPPED: {what} — pinned default CLIP model not downloaded");
+        false
+    }
+
+    /// End-to-end proof that reconfiguring between calls (issue #18) rebuilds a real ONNX
+    /// session pool against the pinned default model rather than silently keeping the old
+    /// one. Mirrors
+    /// `tests/faces_engine.rs::reconfiguring_between_calls_rebuilds_without_breaking_detection`
+    /// — see that test for why this is a liveness/correctness smoke test (does reconfiguring
+    /// more than once in one process still work?) rather than a timing or pool-identity
+    /// assertion, neither of which the public API supports asserting on directly.
+    #[cfg(feature = "smarttags")]
+    #[test]
+    fn reconfiguring_between_calls_rebuilds_without_breaking_encoding() {
+        if !default_model_ready_or_skip(
+            "reconfiguring_between_calls_rebuilds_without_breaking_encoding",
+        ) {
+            return;
+        }
+        let img = solid(256, 256, [90, 120, 200]);
+        for (pool_size, intra_threads) in [(1, 1), (2, 2), (1, 4)] {
+            configure(pool_size, intra_threads);
+            eprintln!("reconfigure: pool_size={pool_size} intra_threads={intra_threads}");
+            let emb = encode_rgb(&img, None).unwrap_or_else(|e| {
+                panic!("encode after configure({pool_size},{intra_threads}): {e}")
+            });
+            let norm: f32 = emb.iter().map(|x| x * x).sum::<f32>().sqrt();
+            assert!((1.0 - norm).abs() < 1e-3, "embedding not unit after reconfigure: |{norm}|");
+            assert_eq!(emb.len(), 512, "CLIP ViT-B/32 embedding must be 512-d");
+        }
     }
 
     /// End-to-end session path over a **tiny synthetic ONNX graph** built in-process (no model

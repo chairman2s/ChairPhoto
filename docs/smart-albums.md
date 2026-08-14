@@ -81,8 +81,8 @@ No `smart_album_photos` table — membership is the query result.
 
 - `catalog/smart_albums.rs` — CRUD plus the `rule_to_sql` translator with its field/op
   allowlist, unit-tested per field and operator.
-- `list_photos` takes an optional `smart_album_id`; when set, the album's rule is
-  translated and ANDed into the existing WHERE builder.
+- The library query (`PhotoQuery`) carries an optional `smartAlbumId`; when set, the
+  album's rule is translated and ANDed into the existing WHERE builder.
 - Commands: `list_smart_albums`, `create_smart_album`, `rename_smart_album`,
   `set_smart_album_rule`, `delete_smart_album`, `reorder_smart_albums`, and
   `smart_album_count(ruleJson)` — a `COUNT(*)` through the translator that drives the
@@ -92,7 +92,7 @@ No `smart_album_photos` table — membership is the query result.
 list_smart_albums() -> [{ id, uuid, name, ruleJson, photoCount }]
 create_smart_album(name, ruleJson) -> id
 smart_album_count(ruleJson) -> number
-list_photos(..., smartAlbumId?)
+list_photos({ query: { smartAlbumId, ... } }) -> { photos, offset, total }
 ```
 
 - Frontend: `components/SmartAlbumsPanel.tsx` is the sidebar section (list with counts,

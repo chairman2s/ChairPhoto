@@ -1441,6 +1441,13 @@ body {
   height: 100%;
 }
 
+/* The element an external module's mount(el) fills. It is the module's own canvas: the
+   host sizes it to the slot and styles nothing inside it. See ModuleContent.tsx. */
+.module-mount {
+  width: 100%;
+  height: 100%;
+}
+
 /* Tag Graph module styles live in src/modules/plugins/tagGraph.css (.tg-* classes). */
 
 /* Quick-tag bar */
@@ -3266,4 +3273,21 @@ body {
 .identity-state-attention {
   background: #3a2f1a;
   color: #e0b87f;
+}
+/* Resolve column (#33): Adopt / Overwrite… / Dismiss for a conflicted copy, Restore for a
+ * dismissed one, nothing at all for a copy that needs a repair pass rather than a decision.
+ * Per COPY, so it centers against the row's full height like the other per-copy columns. */
+.identity-debt-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  align-items: center;
+  align-self: center;
+  justify-content: flex-end;
+  width: 240px;
+  flex: none;
+}
+.identity-debt-confirm {
+  color: var(--text-dim);
+  font-size: 11px;
 }

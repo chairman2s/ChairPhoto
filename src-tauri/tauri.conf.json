@@ -21,7 +21,16 @@
       }
     ],
     "security": {
-      "csp": null,
+      "csp": {
+        "default-src": "'self'",
+        "connect-src": "'self' ipc: http://ipc.localhost",
+        "script-src": "'self' asset: http://asset.localhost",
+        "style-src": "'self' 'unsafe-inline'",
+        "img-src": "'self' data: blob: asset: thumb: preview: zoom: http://asset.localhost http://thumb.localhost http://preview.localhost http://zoom.localhost https: http://127.0.0.1:* http://localhost:*",
+        "media-src": "'self' data: blob: http://127.0.0.1:* http://localhost:*",
+        "font-src": "'self' data:",
+        "object-src": "'none'"
+      },
       "assetProtocol": {
         "enable": true,
         "scope": ["$DATA/chairphoto/modules/**"]

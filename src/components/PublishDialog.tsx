@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { publishTargets, useHostContributions } from "../modules/host";
+import { ModuleContent } from "../modules/ModuleContent";
 
 // Unified publish dialog: pick a destination (Instagram / Flickr / SmugMug / …) and fill
 // in its site-specific form. Destinations are contributed by enabled publishing modules via
@@ -38,7 +39,9 @@ export function PublishDialog({ onClose }: { onClose: () => void }) {
                   </button>
                 ))}
               </div>
-              <div className="publish-form">{active?.render()}</div>
+              <div className="publish-form">
+                {active && <ModuleContent view={active} />}
+              </div>
             </>
           )}
         </div>

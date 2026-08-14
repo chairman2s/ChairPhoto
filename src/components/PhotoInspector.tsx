@@ -119,6 +119,7 @@ import { IptcPanel } from "./IptcPanel";
 import { VersionsPanel } from "./VersionsPanel";
 import { PublishedPanel } from "./PublishedPanel";
 import { panelsForSlot, useHostContributions } from "../modules/host";
+import { ModuleContent } from "../modules/ModuleContent";
 
 const LABELS = COLOR_LABELS;
 
@@ -847,7 +848,7 @@ export function PhotoInspector({
         {panelsForSlot("inspector").map((panel) => (
           <div className="ins-block" key={panel.id}>
             <div className="ins-label">{panel.label}</div>
-            {panel.render()}
+            <ModuleContent view={panel} />
           </div>
         ))}
       </div>

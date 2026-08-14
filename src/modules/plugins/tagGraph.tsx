@@ -382,19 +382,13 @@ function GraphView({ api }: { api: ChairPhotoAPI }) {
     setTopPhotos([]);
     if (!selNode || selNode.kind !== "tag") return;
     api
-      .invoke<{ id: number }[]>("list_photos", {
-        tagId: selNode.refId,
-        albumId: null,
-        batchId: null,
-        facets: [],
-        cullingFilter: "all",
-        smartAlbumId: null,
-        storageTier: "all",
-        camera: null,
-        lens: null,
+      // `list_photos` takes one typed query and answers with a window (issue #10), so the
+      // six thumbnails are six rows fetched, not the tag's whole photo set.
+      .invoke<{ photos: { id: number }[] }>("list_photos", {
+        query: { tagId: selNode.refId, window: { offset: 0, limit: 6 } },
       })
-      .then((photos) => {
-        if (alive) setTopPhotos(photos.slice(0, 6).map((p) => p.id));
+      .then((page) => {
+        if (alive) setTopPhotos(page.photos.map((p) => p.id));
       })
       .catch(() => {
         if (alive) setTopPhotos([]);

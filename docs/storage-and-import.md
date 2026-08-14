@@ -68,6 +68,43 @@ the identifier it has, and the divergence stays visible for a human rather than 
 resolved by clobbering somebody else's identity. A sidecar failure never aborts a
 scan: one unwritable file must not cost the user the other 99,999 rows.
 
+### The repair pass is a job
+
+The queue reached 74,488 rows on the 100k harness shape, and every row is a sidecar parse
+and rewrite — a network round trip each on a NAS. So the pass is a background job like face
+indexing or Smart Tagging (`JobRegistry::identity`, `commands/jobs.rs`): the command returns
+a **job id**, progress arrives as `identity:repair_progress`, the result as
+`identity:repair_done`, `identity_repair_cancel` stops it before its next copy, and
+`identity_repair_status` lets the debt panel re-attach after a remount. A newer pass or a
+catalog switch trips it, so no pass outlives the catalog it was started against.
+
+It plans the queue **one keyset page at a time**, ordered by the queue's primary key. Keyset
+rather than `LIMIT/OFFSET` because the pass deletes the rows it binds: an offset window
+slides left under every page turn and skips exactly as many rows as the previous page
+repaired.
+
+**Who owns a queue row.** The pass and `resolve_identity_conflict` write the same rows from
+two connections. The rule is that the pass owns a row only while the row is still the one it
+planned:
+
+- each plan carries the row's version (`attempts`, `last_attempt_at`);
+- the value *and* version are re-read immediately before the sidecar IO, so a page-old plan
+  never acts on data a resolution has changed, and a row resolved or dismissed since is
+  skipped without the file being touched;
+- the record is a compare-and-set on that version and on `dismissed_at = 0`, and the pass
+  only ever UPDATEs or DELETEs — never INSERTs, so a retry that cannot find its row has
+  nothing to say.
+
+A row somebody else decided is counted `superseded` and reported separately: it is not a
+failure, and it is not an outcome the pass produced. Re-reading the *value* is the part no
+compare-and-set can replace — Adopt rewrites `photos.uuid` and leaves the photo's other
+copies' queue rows untouched when they carry no identifier, so a stale plan would write the
+photo's previous identity into one of those sidecars.
+
+A resolution deliberately does **not** stop a running pass. Killing a 74k-row pass because
+one row got a decision is a worse trade than dropping that row's result, and the per-row
+ownership above is what makes coexistence safe.
+
 ### Resolving a conflict
 
 A conflict is not repairable by retrying, so it needs a person. The decision is made per
@@ -427,11 +464,11 @@ root setting rather than silently using whatever the caller passed.
 `switch_catalog` performs a safe handoff in four steps:
 
 1. **Abort every in-flight job** — trips the installed abort generation of every family in
-   `AppState::jobs` (scan, face indexing, face matching, sharpness, pHash, Smart Tagging)
-   and clears every queryable status slot, so a running job exits at its next cancellation
-   point and stops being reachable as a slot's owner. The scan runs on its own
-   `open_secondary` connection, so the mutex is not held and the swap is not blocked by a
-   running scan.
+   `AppState::jobs` (scan, face indexing, face matching, sharpness, pHash, Smart Tagging,
+   identity repair) and clears every queryable status slot, so a running job exits at its
+   next cancellation point and stops being reachable as a slot's owner. The scan and the
+   identity repair pass each run on their own `open_secondary` connection, so the mutex is
+   not held and the swap is not blocked by either.
 2. **Close the current catalog** — drops the `Option<Catalog>` under the mutex. This
    releases the WAL write lock and flushes pending writes before the new catalog is opened.
 3. **Open (or create) the new catalog** — off the async executor, so the UI thread is

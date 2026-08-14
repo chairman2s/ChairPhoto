@@ -12,7 +12,7 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
 import { onOpenUrl } from "@tauri-apps/plugin-deep-link";
 import { openUrl, revealItemInDir } from "@tauri-apps/plugin-opener";
-import type { Photo, Publication, Tag } from "./registry";
+import type { ModulePermissions, Photo, Publication, Tag } from "./registry";
 
 /**
  * Build the `thumb://` asset URL for a photo id. Wraps Tauri's `convertFileSrc`
@@ -130,6 +130,16 @@ export interface ExternalModuleManifest {
   requires?: { id: string; version?: string }[];
   /** Lowest host (app) version this module supports. */
   minHostVersion: string;
+  /**
+   * The backend surface the module declares it needs. Absent means "nothing declared",
+   * which the host enforces as "no `api.invoke` at all".
+   *
+   * Authoritative for an external module: the backend parses it here without executing
+   * the module, so it is reviewable before any of its code runs. `host.ts` therefore
+   * takes an external module's permissions from this field and ignores the
+   * `permissions` on the imported module object.
+   */
+  permissions?: ModulePermissions;
   /** Absolute path to the module directory on disk (backend-injected). */
   moduleDir: string;
 }

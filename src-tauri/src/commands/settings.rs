@@ -82,11 +82,34 @@ pub struct ExternalModuleManifest {
     /// Lowest host (app) version this module supports. The host refuses to enable the
     /// module when its own version is older than this.
     pub min_host_version: String,
+    /// The backend surface this module declares it needs. Absent means "nothing": the host
+    /// then refuses every `api.invoke` from it.
+    ///
+    /// This is read here, from the manifest, *without executing the module* — which is what
+    /// makes it reviewable before any of its code runs, and why the manifest (not the
+    /// imported module object) is authoritative for an external module's permissions.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub permissions: Option<ModulePermissions>,
     /// Absolute path to the module directory on disk. Injected by `list_external_modules`
     /// so the frontend can construct the full entrypoint path via `convertFileSrc`.
     /// Never present in the JSON file on disk — populated at runtime, so skip deserialization.
     #[serde(skip_deserializing, default)]
     pub module_dir: String,
+}
+
+/// The permissions a module declares in its manifest.
+///
+/// Deliberately a struct rather than a flat string list: step 4 of the module-capability
+/// work (issue #49) adds host-scoped network access as a sibling field, and a struct grows
+/// without either breaking existing manifests or inventing a permission mini-language.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ModulePermissions {
+    /// Exact backend command names the module may pass to `api.invoke`. Matching in the
+    /// host is exact string equality — there are no wildcards, so `"*"` is not a grant of
+    /// everything, it is a permission to invoke a command literally named `*`.
+    #[serde(default)]
+    pub commands: Vec<String>,
 }
 
 /// A single inter-module dependency declared in the manifest.
@@ -261,6 +284,24 @@ fn list_external_modules_blocking() -> Result<Vec<ExternalModuleManifest>, Strin
                     .collect()
             });
 
+        // `permissions` is parsed leniently but FAIL-CLOSED: anything the shape doesn't fit
+        // (a bare string, a number in `commands`, a missing `commands`) yields fewer
+        // permissions, never more. A malformed declaration therefore produces a module that
+        // cannot invoke, not one that can invoke anything.
+        let permissions = partial.get("permissions").map(|p| ModulePermissions {
+            commands: p
+                .get("commands")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|c| c.as_str())
+                        .filter(|c| !c.is_empty())
+                        .map(|c| c.to_owned())
+                        .collect()
+                })
+                .unwrap_or_default(),
+        });
+
         let module_dir_str = module_dir.to_string_lossy().into_owned();
 
         manifests.push(ExternalModuleManifest {
@@ -272,6 +313,7 @@ fn list_external_modules_blocking() -> Result<Vec<ExternalModuleManifest>, Strin
             backend_feature,
             requires,
             min_host_version,
+            permissions,
             module_dir: module_dir_str,
         });
     }
@@ -364,6 +406,9 @@ mod external_module_tests {
         assert_eq!(m.min_host_version, "0.1.0");
         assert!(m.backend_feature.is_none());
         assert!(m.requires.is_none());
+        // No `permissions` key at all: absent, which the host reads as "declares nothing"
+        // and therefore refuses every api.invoke. Fail-closed by omission.
+        assert!(m.permissions.is_none());
         // module_dir should end with the module id.
         assert!(
             m.module_dir.ends_with("my-module"),
@@ -394,6 +439,7 @@ mod external_module_tests {
                     { "id": "map" }
                 ],
                 "minHostVersion": "0.2.0",
+                "permissions": { "commands": ["ai_suggest_tags", "ai_get_suggestions"] },
                 "unknownFutureField": "ignored"
             }"#,
         );
@@ -408,6 +454,82 @@ mod external_module_tests {
         assert_eq!(reqs[0].version.as_deref(), Some("^0.1.0"));
         assert_eq!(reqs[1].id, "map");
         assert!(reqs[1].version.is_none());
+        let perms = m.permissions.as_ref().expect("permissions must be Some");
+        assert_eq!(perms.commands, vec!["ai_suggest_tags", "ai_get_suggestions"]);
+    }
+
+    // ── a malformed `permissions` block narrows, never widens ─────────────────
+    //
+    // The point of the assertions below is direction: every shape the parser does not
+    // understand must produce FEWER commands, never a wildcard or an "allow all". A
+    // permission parser that fails open is worse than no parser.
+
+    #[test]
+    fn malformed_permissions_fail_closed() {
+        let xdg = temp_xdg("perm-malformed");
+        let _g = EnvGuard::set("XDG_DATA_HOME", xdg.to_str().unwrap());
+
+        // `permissions` present but not an object → object accessors miss → no commands.
+        write_manifest(
+            &xdg,
+            "perm-string",
+            r#"{
+                "id": "perm-string",
+                "name": "Bare string",
+                "version": "1.0.0",
+                "description": "permissions is a string, not an object.",
+                "entrypoint": "index.js",
+                "minHostVersion": "0.1.0",
+                "permissions": "all"
+            }"#,
+        );
+        // `commands` present but not an array, plus non-string and empty entries elsewhere.
+        write_manifest(
+            &xdg,
+            "perm-mixed",
+            r#"{
+                "id": "perm-mixed",
+                "name": "Mixed entries",
+                "version": "1.0.0",
+                "description": "commands holds junk alongside one real command.",
+                "entrypoint": "index.js",
+                "minHostVersion": "0.1.0",
+                "permissions": { "commands": ["get_photo", 7, null, "", { "x": 1 }] }
+            }"#,
+        );
+        // An object with no `commands` key at all.
+        write_manifest(
+            &xdg,
+            "perm-empty",
+            r#"{
+                "id": "perm-empty",
+                "name": "Empty object",
+                "version": "1.0.0",
+                "description": "permissions object without commands.",
+                "entrypoint": "index.js",
+                "minHostVersion": "0.1.0",
+                "permissions": {}
+            }"#,
+        );
+
+        let result = list_external_modules_blocking().unwrap();
+        let by_id = |id: &str| {
+            result
+                .iter()
+                .find(|m| m.id == id)
+                .unwrap_or_else(|| panic!("{id} should still be discovered"))
+                .permissions
+                .as_ref()
+                .expect("permissions key present → Some")
+                .commands
+                .clone()
+        };
+
+        // None of the three is skipped — a bad permission block is not a bad manifest —
+        // and none of them ends up with anything it did not spell out as a string.
+        assert!(by_id("perm-string").is_empty());
+        assert_eq!(by_id("perm-mixed"), vec!["get_photo"]);
+        assert!(by_id("perm-empty").is_empty());
     }
 
     // ── malformed JSON is skipped; valid sibling is still returned ────────────

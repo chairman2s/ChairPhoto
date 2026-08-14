@@ -86,6 +86,33 @@ export interface Publication {
 }
 
 /**
+ * The backend surface a module declares it needs — and, once the user has granted it, the
+ * only backend surface the host lets that module reach through `api.invoke`.
+ *
+ * Declared in `ChairPhotoModule.permissions` for a bundled module, and in the
+ * `permissions` field of `chairphoto-module.json` for an external one. For an external
+ * module the **manifest is authoritative** and this field on the imported object is
+ * ignored: the manifest is what the host can read without executing the module, and it is
+ * what the user reviewed, so a module cannot ship a modest manifest and then widen itself
+ * from code.
+ *
+ * Deliberately a struct rather than a flat string list: step 4 of the module-capability
+ * work (issue #49) adds host-scoped network access as a sibling field, and a struct grows
+ * without breaking existing manifests or inventing a permission mini-language.
+ *
+ * See docs/module-capabilities.md § "Per-module permissions".
+ */
+export interface ModulePermissions {
+  /**
+   * Exact backend command names this module may pass to `api.invoke`. Matching is exact
+   * string equality — there are **no wildcards**, so `"*"` is not "everything", it is
+   * permission to invoke a command literally named `*`. An absent or empty list means the
+   * module cannot invoke any backend command at all.
+   */
+  commands?: string[];
+}
+
+/**
  * The framework-agnostic half of a UI contribution: the host hands the module a plain
  * DOM element to fill and calls `unmount` before discarding it.
  *
@@ -229,7 +256,18 @@ export interface ChairPhotoAPI {
   recordPublication(photoId: number, versionId: number | null, url?: string): Promise<void>;
   listPublications(photoId: number): Promise<Publication[]>;
   deletePublication(id: number): Promise<void>;
-  // backend (the module's own commands; gated to its Cargo feature)
+  /**
+   * Call a backend command.
+   *
+   * Gated twice: the command must be listed in this module's `permissions.commands` AND
+   * that permission must have been granted by the user when the module was enabled. A
+   * command failing either test is **refused**, not silently dropped — the returned promise
+   * rejects with a `ModulePermissionError` (see `host.ts`) and the host shows the user a
+   * toast naming the module and the command. Nothing reaches the backend.
+   *
+   * Declaring a command is not the same as it existing: a declared command whose Cargo
+   * feature was compiled out still fails, at the backend, as it always did.
+   */
   invoke<T>(command: string, args?: Record<string, unknown>): Promise<T>;
   /**
    * Subscribe to a backend event (e.g. a module's own `"<id>:progress"`), receiving the
@@ -303,6 +341,18 @@ export interface ChairPhotoModule {
    * exact `X.Y.Z`, `^X.Y.Z`, `>=X.Y.Z`). e.g. `[{ id: "localsend", version: "^0.1.0" }]`.
    */
   requires?: { id: string; version?: string }[];
+  /**
+   * The backend commands this module needs. The host refuses `api.invoke` for anything not
+   * listed here, and refuses to *enable* the module until the user has granted the list.
+   *
+   * **Bundled modules are not exempt.** A bundled module that omits this cannot invoke
+   * anything either — which is the point: the enforcement path is exercised by the modules
+   * that actually ship, not only by hypothetical external ones.
+   *
+   * Ignored for external modules, whose manifest is authoritative — see
+   * `ModulePermissions`.
+   */
+  permissions?: ModulePermissions;
   onLoad(api: ChairPhotoAPI): void;
   onUnload?(): void;
   onPhotoSelected?(photos: Photo[], api: ChairPhotoAPI): void;

@@ -256,57 +256,75 @@ pub async fn set_version_edit(
     }
     #[cfg(feature = "edit")]
     {
-        // Save + gather everything the monochrome refresh needs under one brief lock.
-        let (photo_id, any_bw, stored_gray, candidates) = {
-            let guard = state.catalog.lock().map_err(|e| e.to_string())?;
-            let catalog = guard.as_ref().ok_or("No catalog is open")?;
-            catalog
-                .set_version_edit(version_id, &edit_json)
-                .map_err(|e| e.to_string())?;
-            let photo_id = catalog.version_photo_id(version_id).map_err(|e| e.to_string())?;
-            let any_bw = catalog
-                .list_versions(photo_id)
-                .map_err(|e| e.to_string())?
-                .iter()
-                .any(|v| crate::plugins::edit::is_bw(&v.edit_json));
-            let stored = catalog.is_grayscale(photo_id).map_err(|e| e.to_string())?;
-            let cands = catalog.photo_path_candidates(photo_id).map_err(|e| e.to_string())?;
-            (photo_id, any_bw, stored, cands)
-        };
-        let gray = if any_bw {
-            true
-        } else if !stored_gray {
-            // Not B&W by edit and already not flagged — nothing can change.
-            return Ok(());
-        } else {
-            // The flag was set but no version is B&W anymore: fall back to the
-            // pixel-derived signal (the photo itself may still be monochrome).
-            let health = state.volume_health.clone();
-            // OriginalRequired: the outcome is PERSISTED (`set_grayscale` + auto-tags), so
-            // it must not be decided by a cached reachability flag. (Pre-existing and out
-            // of scope here: when the original is genuinely offline this still falls back
-            // to `false` and clears the flag — recorded, not fixed, in this change.)
-            tauri::async_runtime::spawn_blocking(move || {
-                crate::volume_health::pick_existing(
-                    &candidates,
-                    &health,
-                    crate::catalog::ResolveMode::OriginalRequired,
-                )
-                .and_then(|p| thumbnail_bytes(&p).ok())
-                .map(|t| crate::thumbnails::is_grayscale_jpeg(&t))
-                .unwrap_or(false)
-            })
-            .await
-            .map_err(|e| e.to_string())?
-        };
-        if gray != stored_gray {
-            with_catalog(&state, |c| {
-                c.set_grayscale(photo_id, gray)?;
-                c.apply_auto_tags()
-            })?;
-        }
-        Ok(())
+        set_version_edit_in_state(&state, version_id, &edit_json).await
     }
+}
+
+/// The testable body of [`set_version_edit`] under the `edit` feature: takes `&AppState`
+/// directly (rather than a Tauri-wrapped `State`) so tests can drive it without a live app.
+#[cfg(feature = "edit")]
+async fn set_version_edit_in_state(
+    state: &AppState,
+    version_id: i64,
+    edit_json: &str,
+) -> Result<(), String> {
+    // Save + gather everything the monochrome refresh needs under one brief lock.
+    let (photo_id, any_bw, stored_gray, candidates) = {
+        let guard = state.catalog.lock().map_err(|e| e.to_string())?;
+        let catalog = guard.as_ref().ok_or("No catalog is open")?;
+        catalog
+            .set_version_edit(version_id, edit_json)
+            .map_err(|e| e.to_string())?;
+        let photo_id = catalog.version_photo_id(version_id).map_err(|e| e.to_string())?;
+        let any_bw = catalog
+            .list_versions(photo_id)
+            .map_err(|e| e.to_string())?
+            .iter()
+            .any(|v| crate::plugins::edit::is_bw(&v.edit_json));
+        let stored = catalog.is_grayscale(photo_id).map_err(|e| e.to_string())?;
+        let cands = catalog.photo_path_candidates(photo_id).map_err(|e| e.to_string())?;
+        (photo_id, any_bw, stored, cands)
+    };
+    let gray = if any_bw {
+        true
+    } else if !stored_gray {
+        // Not B&W by edit and already not flagged — nothing can change.
+        return Ok(());
+    } else {
+        // The flag was set but no version is B&W anymore: fall back to the
+        // pixel-derived signal (the photo itself may still be monochrome).
+        let health = state.volume_health.clone();
+        // OriginalRequired: the outcome is PERSISTED (`set_grayscale` + auto-tags), so it
+        // must not be decided by a cached reachability flag — or by a decode failure.
+        // `None` here covers BOTH ways "could not tell" happens: no reachable copy
+        // (`pick_existing` fails) and a reachable copy that fails to decode
+        // (`thumbnail_bytes` fails). Both are "could not tell", not "not grayscale", so
+        // both skip the write below and leave the stored flag alone (AGENTS.md:
+        // missing/unmounted storage is normal, never evidence the row is wrong). Only an
+        // actual decoded verdict is ever persisted.
+        let outcome = tauri::async_runtime::spawn_blocking(move || {
+            crate::volume_health::pick_existing(
+                &candidates,
+                &health,
+                crate::catalog::ResolveMode::OriginalRequired,
+            )
+            .and_then(|p| thumbnail_bytes(&p).ok())
+            .map(|t| crate::thumbnails::is_grayscale_jpeg(&t))
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+        match outcome {
+            Some(g) => g,
+            None => return Ok(()),
+        }
+    };
+    if gray != stored_gray {
+        let guard = state.catalog.lock().map_err(|e| e.to_string())?;
+        let catalog = guard.as_ref().ok_or("No catalog is open")?;
+        catalog.set_grayscale(photo_id, gray).map_err(|e| e.to_string())?;
+        catalog.apply_auto_tags().map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -344,3 +362,178 @@ pub(crate) fn grid_version_counts(
 }
 
 // --- publications (where a photo was posted + which version, see docs/publications.md) ---
+
+#[cfg(all(test, feature = "edit"))]
+mod tests {
+    use super::*;
+    use crate::catalog::{Catalog, LocationRole, VolumeKind};
+    use crate::volume_health::VolumeHealth;
+    use std::time::Duration;
+
+    fn temp_catalog(tag: &str) -> (Catalog, crate::test_support::TestTmpDir, std::path::PathBuf) {
+        let dir = crate::test_support::TestTmpDir::new(&format!("set-version-edit-{tag}"));
+        let root = dir.join("photos");
+        std::fs::create_dir_all(&root).unwrap();
+        let catalog = Catalog::open(&dir.join("t.chairphoto"), &root).unwrap();
+        (catalog, dir, root)
+    }
+
+    fn state_with(catalog: Catalog, health: VolumeHealth) -> AppState {
+        let state = AppState::default();
+        *state.catalog.lock().unwrap() = Some(catalog);
+        AppState {
+            volume_health: std::sync::Arc::new(health),
+            ..state
+        }
+    }
+
+    /// A photo whose only copy lives on a separate "NAS" volume, with a version that has
+    /// no B&W edit, and `photos.grayscale` pre-seeded `true` (as if a real B&W develop had
+    /// set it earlier) — the exact state `set_version_edit_in_state`'s pixel-derived
+    /// fallback runs from. Mirrors `photo_on_detachable_nas` in
+    /// `catalog/locations.rs` (same fixture technique, reused rather than reinvented).
+    fn stale_grayscale_photo_on_nas(
+        catalog: &Catalog,
+        dir: &crate::test_support::TestTmpDir,
+        root: &std::path::Path,
+    ) -> (i64, i64, std::path::PathBuf, i64) {
+        let id = catalog
+            .upsert_photo(&root.join("archive/a.jpg"), None, 1, 1)
+            .unwrap()
+            .id;
+        let nas_base = dir.join("nas");
+        let nas_file = nas_base.join("archive/a.jpg");
+        std::fs::create_dir_all(nas_file.parent().unwrap()).unwrap();
+        std::fs::write(&nas_file, b"not-actually-decoded-while-online").unwrap();
+        let nas = catalog.add_volume("NAS", &nas_base, VolumeKind::Backup).unwrap();
+        catalog
+            .add_location(id, nas, "archive/a.jpg", LocationRole::Backup)
+            .unwrap();
+
+        catalog.set_grayscale(id, true).unwrap();
+        catalog.apply_auto_tags().unwrap();
+        let version_id = catalog.create_version(id, "V1").unwrap();
+        (id, nas, nas_base, version_id)
+    }
+
+    /// Write a small, solidly-coloured JPEG (well above the `is_grayscale_jpeg` chroma
+    /// threshold) so a decode of it is unambiguously "not grayscale".
+    fn write_colour_jpeg(path: &std::path::Path) {
+        let img = image::RgbImage::from_pixel(32, 32, image::Rgb([200, 30, 30]));
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(img)
+            .write_with_encoder(image::codecs::jpeg::JpegEncoder::new_with_quality(
+                &mut bytes, 90,
+            ))
+            .unwrap();
+        std::fs::write(path, bytes.into_inner()).unwrap();
+    }
+
+    /// **Offline original.** The photo's only copy sits on a volume renamed away (a
+    /// genuinely unreachable NAS, not merely a stale reachability flag — see the module
+    /// doc on `pick_existing`: `OriginalRequired` always re-verifies a cached-unreachable
+    /// candidate, so only an actually-missing file makes it return `None`). Forced, not
+    /// waited for, following the `#9` fixture technique in `volume_health.rs` /
+    /// `catalog/locations.rs`.
+    ///
+    /// Recomputing must leave both `photos.grayscale` and the monochrome auto-tag exactly
+    /// as they were — "could not tell" is not "not grayscale" (AGENTS.md: missing/unmounted
+    /// storage is normal, never evidence the row is wrong).
+    #[test]
+    fn recompute_leaves_grayscale_and_autotags_when_original_is_offline() {
+        let (catalog, dir, root) = temp_catalog("offline");
+        let (photo_id, nas, nas_base, version_id) = stale_grayscale_photo_on_nas(&catalog, &dir, &root);
+        assert!(
+            catalog.get_photo_tags(photo_id).unwrap().iter().any(|t| t.full_path == "Treatment/Black & White"),
+            "sanity: the photo starts tagged monochrome"
+        );
+
+        // Force the offline condition: rename the NAS mount away, let a refresh cache it
+        // unreachable, and leave it detached (a real unmounted NAS, not a restored one).
+        let detached = dir.join("nas-detached");
+        std::fs::rename(&nas_base, &detached).unwrap();
+        let health = VolumeHealth::with_ttl(Duration::MAX);
+        health.refresh(&[(nas, nas_base.to_string_lossy().to_string())]);
+        assert_eq!(health.reachable(nas), Some(false), "sanity: cached unreachable");
+
+        let state = state_with(catalog, health);
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(set_version_edit_in_state(&state, version_id, "{}"))
+            .unwrap();
+
+        let guard = state.catalog.lock().unwrap();
+        let catalog = guard.as_ref().unwrap();
+        assert!(
+            catalog.is_grayscale(photo_id).unwrap(),
+            "an unreachable original must not clear the stored grayscale flag"
+        );
+        assert!(
+            catalog.get_photo_tags(photo_id).unwrap().iter().any(|t| t.full_path == "Treatment/Black & White"),
+            "the monochrome auto-tag must survive an offline recompute untouched"
+        );
+    }
+
+    /// **Reachable but undecodable original.** The NAS is up and the file is right where
+    /// the catalog says it is, but its bytes are not a decodable image (a damaged file, an
+    /// unsupported format `image` can't parse and ImageMagick can't rescue). This is the
+    /// second failure mode the fix also has to cover — `pick_existing` succeeds but
+    /// `thumbnail_bytes` fails — and it must be treated exactly like "could not tell", not
+    /// "not grayscale".
+    #[test]
+    fn recompute_leaves_grayscale_when_reachable_original_fails_to_decode() {
+        let (catalog, _dir, root) = temp_catalog("undecodable");
+        std::fs::create_dir_all(root.join("archive")).unwrap();
+        let path = root.join("archive/broken.jpg");
+        std::fs::write(&path, b"this is not a jpeg, magick and image both give up").unwrap();
+        let photo_id = catalog.upsert_photo(&path, None, 1, 1).unwrap().id;
+        catalog.set_grayscale(photo_id, true).unwrap();
+        catalog.apply_auto_tags().unwrap();
+        let version_id = catalog.create_version(photo_id, "V1").unwrap();
+
+        let state = state_with(catalog, VolumeHealth::with_ttl(Duration::MAX));
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(set_version_edit_in_state(&state, version_id, "{}"))
+            .unwrap();
+
+        let guard = state.catalog.lock().unwrap();
+        let catalog = guard.as_ref().unwrap();
+        assert!(
+            catalog.is_grayscale(photo_id).unwrap(),
+            "a reachable-but-undecodable original must not clear the stored grayscale flag"
+        );
+        assert!(
+            catalog.get_photo_tags(photo_id).unwrap().iter().any(|t| t.full_path == "Treatment/Black & White"),
+            "the monochrome auto-tag must survive an undecodable recompute untouched"
+        );
+    }
+
+    /// **The positive path.** A reachable, decodable, genuinely colourful original must
+    /// still clear a stale `true` flag — the fix must not "fix" this bug by never writing.
+    #[test]
+    fn recompute_clears_grayscale_for_a_genuinely_colour_photo() {
+        let (catalog, _dir, root) = temp_catalog("colour");
+        std::fs::create_dir_all(root.join("archive")).unwrap();
+        let path = root.join("archive/colour.jpg");
+        write_colour_jpeg(&path);
+        let photo_id = catalog.upsert_photo(&path, None, 1, 1).unwrap().id;
+        catalog.set_grayscale(photo_id, true).unwrap();
+        catalog.apply_auto_tags().unwrap();
+        let version_id = catalog.create_version(photo_id, "V1").unwrap();
+
+        let state = state_with(catalog, VolumeHealth::with_ttl(Duration::MAX));
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(set_version_edit_in_state(&state, version_id, "{}"))
+            .unwrap();
+
+        let guard = state.catalog.lock().unwrap();
+        let catalog = guard.as_ref().unwrap();
+        assert!(
+            !catalog.is_grayscale(photo_id).unwrap(),
+            "a genuinely colour photo must still have its stale grayscale flag cleared"
+        );
+        assert!(
+            !catalog.get_photo_tags(photo_id).unwrap().iter().any(|t| t.full_path == "Treatment/Black & White"),
+            "the monochrome auto-tag must be removed once the flag correctly clears"
+        );
+    }
+}

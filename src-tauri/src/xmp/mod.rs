@@ -1295,4 +1295,297 @@ mod tests {
         write_iptc(&photo, &IptcFields { description: "x".into(), ..Default::default() }).unwrap();
         assert!(read_face_regions(&photo).is_empty());
     }
+
+    // ── write_gps (issue #62) ───────────────────────────────────────────────
+    //
+    // These pin `write_gps`'s DMS+ref string formatting directly against the raw sidecar
+    // text — NOT via `read_gps`/`dms_to_decimal` — because a round-trip through our own
+    // parser would still pass if both the write and read directions had the same sign or
+    // hemisphere bug. Expected strings below were computed by running the actual
+    // `decimal_to_dms_lat`/`decimal_to_dms_lng` formulas (not by hand) to avoid encoding an
+    // arithmetic mistake as the "expected" value.
+
+    fn gps_dir(tag: &str) -> crate::test_support::TestTmpDir {
+        crate::test_support::TestTmpDir::new(tag)
+    }
+
+    /// A northern + eastern coordinate (Oslo): the emitted `exif:GPSLatitude` /
+    /// `exif:GPSLongitude` strings must match exactly, hemisphere letters included.
+    #[test]
+    fn write_gps_pins_north_east_dms() {
+        let dir = gps_dir("xmp-gps-ne");
+        let photo = dir.join("DSC30.ARW");
+        std::fs::write(&photo, b"raw").unwrap();
+
+        write_gps(&photo, 59.9139, 10.7522).unwrap();
+
+        let xmp = read(&sidecar_path(&photo));
+        assert!(
+            xmp.contains("<exif:GPSLatitude>59,54.834000N</exif:GPSLatitude>"),
+            "unexpected latitude encoding in: {xmp}"
+        );
+        assert!(
+            xmp.contains("<exif:GPSLongitude>10,45.132000E</exif:GPSLongitude>"),
+            "unexpected longitude encoding in: {xmp}"
+        );
+    }
+
+    /// A southern + western coordinate (Santiago): catches a sign or hemisphere-reference
+    /// error that a northern/eastern-only test cannot — e.g. a flipped `>= 0.0` check would
+    /// still pass `write_gps_pins_north_east_dms` but fail here.
+    #[test]
+    fn write_gps_pins_south_west_dms() {
+        let dir = gps_dir("xmp-gps-sw");
+        let photo = dir.join("DSC31.ARW");
+        std::fs::write(&photo, b"raw").unwrap();
+
+        write_gps(&photo, -33.4489, -70.6693).unwrap();
+
+        let xmp = read(&sidecar_path(&photo));
+        assert!(
+            xmp.contains("<exif:GPSLatitude>33,26.934000S</exif:GPSLatitude>"),
+            "unexpected latitude encoding in: {xmp}"
+        );
+        assert!(
+            xmp.contains("<exif:GPSLongitude>70,40.158000W</exif:GPSLongitude>"),
+            "unexpected longitude encoding in: {xmp}"
+        );
+    }
+
+    /// The equator / prime-meridian origin: both components are exactly zero, and the sign
+    /// check (`>= 0.0`) must still resolve them to N/E, not leave them unsigned or flip them.
+    #[test]
+    fn write_gps_pins_equator_and_prime_meridian() {
+        let dir = gps_dir("xmp-gps-origin");
+        let photo = dir.join("DSC32.ARW");
+        std::fs::write(&photo, b"raw").unwrap();
+
+        write_gps(&photo, 0.0, 0.0).unwrap();
+
+        let xmp = read(&sidecar_path(&photo));
+        assert!(xmp.contains("<exif:GPSLatitude>0,0.000000N</exif:GPSLatitude>"));
+        assert!(xmp.contains("<exif:GPSLongitude>0,0.000000E</exif:GPSLongitude>"));
+    }
+
+    /// A coordinate whose minutes round awkwardly: `10.1` degrees is not exactly
+    /// representable in `f64`, so `(0.1 * 60)` lands on `5.999999999999978`, not `6.0`. The
+    /// `{:.6}` formatter must still round that up to a clean `"6.000000"` rather than
+    /// truncating or emitting the raw float noise.
+    #[test]
+    fn write_gps_pins_awkward_rounding() {
+        let dir = gps_dir("xmp-gps-awkward");
+        let photo = dir.join("DSC33.ARW");
+        std::fs::write(&photo, b"raw").unwrap();
+
+        write_gps(&photo, 10.1, 20.1).unwrap();
+
+        let xmp = read(&sidecar_path(&photo));
+        assert!(
+            xmp.contains("<exif:GPSLatitude>10,6.000000N</exif:GPSLatitude>"),
+            "unexpected latitude encoding in: {xmp}"
+        );
+        assert!(
+            xmp.contains("<exif:GPSLongitude>20,6.000000E</exif:GPSLongitude>"),
+            "unexpected longitude encoding in: {xmp}"
+        );
+    }
+
+    /// `write_gps` is a plain-property writer like `write_iptc`/`write_import_batch`: it must
+    /// go through the standard merge-safe path (foreign elements + namespaces preserved,
+    /// pre-existing foreign sidecar backed up once) and touch only its own two fields on a
+    /// rewrite — no duplication, no clobbering of the previous coordinate's stale value.
+    #[test]
+    fn write_gps_preserves_foreign_elements_backs_up_and_rewrites_cleanly() {
+        let dir = gps_dir("xmp-gps-merge");
+        let photo = dir.join("DSC34.ARW");
+        std::fs::write(&photo, b"raw").unwrap();
+
+        let existing = r#"<?xml version="1.0" encoding="UTF-8"?>
+<x:xmpmeta xmlns:x="adobe:ns:meta/">
+ <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+  <rdf:Description rdf:about="" xmlns:darktable="http://darktable.sf.net/">
+   <darktable:history_end>5</darktable:history_end>
+  </rdf:Description>
+ </rdf:RDF>
+</x:xmpmeta>"#;
+        std::fs::write(sidecar_path(&photo), existing).unwrap();
+
+        write_gps(&photo, 63.4305, 10.3951).unwrap(); // Trondheim (N/E)
+
+        let xmp = read(&sidecar_path(&photo));
+        assert!(xmp.contains("<exif:GPSLatitude>63,25.830000N</exif:GPSLatitude>"));
+        assert!(xmp.contains("<exif:GPSLongitude>10,23.706000E</exif:GPSLongitude>"));
+        assert!(xmp.contains("history_end"), "darktable data clobbered by GPS write!");
+        assert!(xmp.contains("darktable"), "darktable namespace lost by GPS write!");
+        assert!(
+            sidecar_backup_path(&sidecar_path(&photo)).exists(),
+            "foreign sidecar must be backed up on first write"
+        );
+
+        // Rewrite with a different coordinate: the old value must be gone, the new one
+        // present exactly once, and darktable's data still untouched.
+        write_gps(&photo, -1.0, -1.0).unwrap();
+        let xmp = read(&sidecar_path(&photo));
+        assert!(xmp.contains("<exif:GPSLatitude>1,0.000000S</exif:GPSLatitude>"));
+        assert!(xmp.contains("<exif:GPSLongitude>1,0.000000W</exif:GPSLongitude>"));
+        assert!(!xmp.contains("63,25.830000N"), "stale latitude must not survive a rewrite");
+        assert!(!xmp.contains("10,23.706000E"), "stale longitude must not survive a rewrite");
+        assert_eq!(xmp.matches("exif:GPSLatitude").count(), 2, "one open + one close tag only");
+        assert_eq!(xmp.matches("exif:GPSLongitude").count(), 2, "one open + one close tag only");
+        assert!(xmp.contains("history_end"), "darktable data clobbered by GPS rewrite!");
+    }
+
+    // ── write_keywords (issue #62) ──────────────────────────────────────────
+
+    fn keywords_dir(tag: &str) -> crate::test_support::TestTmpDir {
+        crate::test_support::TestTmpDir::new(tag)
+    }
+
+    /// Parse the sidecar and return the `rdf:li` text values of the `rdf:Bag` under the
+    /// (namespace, name) property on `rdf:Description` — used to check that flat keywords
+    /// land under `dc:subject` and hierarchical ones under `lr:hierarchicalSubject`, not
+    /// swapped or merged together.
+    fn bag_items(xmp: &str, ns: &str, name: &str) -> Vec<String> {
+        let root = Element::parse(xmp.as_bytes()).unwrap();
+        let rdf = root.get_child(("RDF", NS_RDF)).unwrap();
+        for node in &rdf.children {
+            let XMLNode::Element(desc) = node else { continue };
+            if desc.name != "Description" {
+                continue;
+            }
+            if let Some(prop) = child(desc, ns, name) {
+                if let Some(bag_el) = prop.get_child(("Bag", NS_RDF)) {
+                    return bag_el
+                        .children
+                        .iter()
+                        .filter_map(|n| match n {
+                            XMLNode::Element(li) => first_text(li),
+                            _ => None,
+                        })
+                        .collect();
+                }
+            }
+        }
+        Vec::new()
+    }
+
+    /// Flat keywords land in `dc:subject` and hierarchical keywords land in
+    /// `lr:hierarchicalSubject` — each in its own element, not swapped or merged.
+    #[test]
+    fn write_keywords_flat_and_hierarchical_land_in_right_elements() {
+        let dir = keywords_dir("xmp-kw-elements");
+        let photo = dir.join("DSC40.ARW");
+        std::fs::write(&photo, b"raw").unwrap();
+
+        let flat = vec!["Sunset".to_string(), "Beach".to_string()];
+        let hierarchical = vec![
+            "Nature|Landscape".to_string(),
+            "Nature|Landscape|Sunset".to_string(),
+        ];
+        write_keywords(&photo, &flat, &hierarchical).unwrap();
+
+        let xmp = read(&sidecar_path(&photo));
+        assert!(xmp.contains("dc:subject"), "dc:subject missing");
+        assert!(xmp.contains("lr:hierarchicalSubject"), "lr:hierarchicalSubject missing");
+
+        assert_eq!(bag_items(&xmp, NS_DC, "subject"), flat, "dc:subject content mismatch");
+        assert_eq!(
+            bag_items(&xmp, NS_LR, "hierarchicalSubject"),
+            hierarchical,
+            "lr:hierarchicalSubject content mismatch"
+        );
+    }
+
+    /// A pre-existing foreign sidecar's elements and namespace survive a keyword write —
+    /// same merge-safety invariant as the other managed-property writers.
+    #[test]
+    fn write_keywords_foreign_elements_survive() {
+        let dir = keywords_dir("xmp-kw-foreign");
+        let photo = dir.join("DSC41.ARW");
+        std::fs::write(&photo, b"raw").unwrap();
+
+        let existing = r#"<?xml version="1.0" encoding="UTF-8"?>
+<x:xmpmeta xmlns:x="adobe:ns:meta/">
+ <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+  <rdf:Description rdf:about="" xmlns:darktable="http://darktable.sf.net/">
+   <darktable:history_end>4</darktable:history_end>
+  </rdf:Description>
+ </rdf:RDF>
+</x:xmpmeta>"#;
+        std::fs::write(sidecar_path(&photo), existing).unwrap();
+
+        write_keywords(
+            &photo,
+            &["Ferry".to_string()],
+            &["Places|Norway".to_string()],
+        )
+        .unwrap();
+
+        let xmp = read(&sidecar_path(&photo));
+        assert!(xmp.contains("Ferry"), "flat keyword not written");
+        assert!(xmp.contains("Places|Norway"), "hierarchical keyword not written");
+        assert!(xmp.contains("history_end"), "darktable data clobbered by keyword write!");
+        assert!(xmp.contains("darktable"), "darktable namespace lost by keyword write!");
+    }
+
+    /// The documented exemption (AGENTS.md "Export-only destination copies are not subject
+    /// to this rule", `document.rs:24`): `write_keywords` uses `open_no_backup`, so even a
+    /// foreign, never-before-seen sidecar must NOT be backed up. This is the one property
+    /// that was previously only a comment, not a checked behavior.
+    #[test]
+    fn write_keywords_does_not_back_up_export_destination() {
+        let dir = keywords_dir("xmp-kw-no-backup");
+        let photo = dir.join("DSC42.ARW");
+        std::fs::write(&photo, b"raw").unwrap();
+
+        let existing = r#"<?xml version="1.0" encoding="UTF-8"?>
+<x:xmpmeta xmlns:x="adobe:ns:meta/">
+ <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+  <rdf:Description rdf:about="" xmlns:darktable="http://darktable.sf.net/">
+   <darktable:history_end>2</darktable:history_end>
+  </rdf:Description>
+ </rdf:RDF>
+</x:xmpmeta>"#;
+        std::fs::write(sidecar_path(&photo), existing).unwrap();
+        let backup = sidecar_backup_path(&sidecar_path(&photo));
+        assert!(!backup.exists());
+
+        write_keywords(&photo, &["Ferry".to_string()], &[]).unwrap();
+
+        assert!(
+            !backup.exists(),
+            "export-destination write must never create a .chairphoto-backup file"
+        );
+        let xmp = read(&sidecar_path(&photo));
+        assert!(xmp.contains("Ferry"), "keyword still must be written");
+    }
+
+    /// Re-writing keywords replaces, not duplicates, both properties.
+    #[test]
+    fn write_keywords_rewrite_replaces_not_duplicates() {
+        let dir = keywords_dir("xmp-kw-rewrite");
+        let photo = dir.join("DSC43.ARW");
+        std::fs::write(&photo, b"raw").unwrap();
+
+        write_keywords(
+            &photo,
+            &["First".to_string()],
+            &["Old|Path".to_string()],
+        )
+        .unwrap();
+        write_keywords(
+            &photo,
+            &["Second".to_string()],
+            &["New|Path".to_string()],
+        )
+        .unwrap();
+
+        let xmp = read(&sidecar_path(&photo));
+        assert!(xmp.contains("Second"));
+        assert!(!xmp.contains("First"), "old flat keyword should be replaced, not duplicated");
+        assert!(xmp.contains("New|Path"));
+        assert!(!xmp.contains("Old|Path"), "old hierarchical keyword should be replaced, not duplicated");
+        assert_eq!(xmp.matches("dc:subject").count(), 2, "one open + one close tag only");
+        assert_eq!(xmp.matches("lr:hierarchicalSubject").count(), 2, "one open + one close tag only");
+    }
 }

@@ -479,7 +479,7 @@ export class ModulePermissionError extends Error {
   }
 }
 
-/** Refusals already toasted, as `"<module id> <command>"`. A module retrying in a loop
+/** Refusals already toasted, as `"<module id>\u0000<command>"`. A module retrying in a loop
  *  would otherwise bury the UI in identical toasts; the console line is unconditional, so
  *  nothing is lost from the record. */
 const announcedRefusals = new Set<string>();
@@ -645,7 +645,7 @@ function refuseInvoke(id: string, command: string): Promise<never> {
   const error = new ModulePermissionError(id, command);
   const name = modules.get(id)?.module.name ?? id;
   console.error(`[modules] ${error.message}`);
-  const key = `${id} ${command}`;
+  const key = `${id}\u0000${command}`;
   if (!announcedRefusals.has(key)) {
     announcedRefusals.add(key);
     toast(`${name} tried to use "${command}", which it hasn't asked permission for.`);

@@ -36,6 +36,12 @@ pub fn plugin_features() -> Vec<String> {
     features.push("faces".to_string());
     #[cfg(feature = "smarttags")]
     features.push("smarttags".to_string());
+    // Not a plugin backend but reported the same way (#49): a module that cannot work without
+    // the host-mediated network proxy declares `backendFeature: "module-fetch"` and is blocked
+    // with "backend not included in this build" on a build that compiled it out, instead of
+    // enabling and then failing at its first request.
+    #[cfg(feature = "module-fetch")]
+    features.push("module-fetch".to_string());
     features
 }
 
@@ -99,9 +105,9 @@ pub struct ExternalModuleManifest {
 
 /// The permissions a module declares in its manifest.
 ///
-/// Deliberately a struct rather than a flat string list: step 4 of the module-capability
-/// work (issue #49) adds host-scoped network access as a sibling field, and a struct grows
-/// without either breaking existing manifests or inventing a permission mini-language.
+/// Deliberately a struct rather than a flat string list (#48), which is what let step 4
+/// (#49) add `origins` beside `commands` without breaking a manifest already on disk: a
+/// pre-#49 manifest simply declares no origins, and `api.fetch` refuses everything for it.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct ModulePermissions {
@@ -110,6 +116,16 @@ pub struct ModulePermissions {
     /// everything, it is a permission to invoke a command literally named `*`.
     #[serde(default)]
     pub commands: Vec<String>,
+    /// Origins the module may reach through `api.fetch` — `https://host` or
+    /// `https://host:port`, matched exactly after normalisation, with no wildcards for the
+    /// same reason `commands` has none: `*.example.com` would cover hosts that do not exist
+    /// yet and can be created by whoever controls the domain.
+    ///
+    /// The host (`src/modules/host.ts`) is what enforces this list, because it is the only
+    /// layer that knows which module is calling; `commands/net.rs` independently enforces the
+    /// invariants that hold for any request (https, no redirects, public addresses only).
+    #[serde(default)]
+    pub origins: Vec<String>,
 }
 
 /// A single inter-module dependency declared in the manifest.
@@ -288,9 +304,8 @@ fn list_external_modules_blocking() -> Result<Vec<ExternalModuleManifest>, Strin
         // (a bare string, a number in `commands`, a missing `commands`) yields fewer
         // permissions, never more. A malformed declaration therefore produces a module that
         // cannot invoke, not one that can invoke anything.
-        let permissions = partial.get("permissions").map(|p| ModulePermissions {
-            commands: p
-                .get("commands")
+        let string_list = |p: &serde_json::Value, key: &str| -> Vec<String> {
+            p.get(key)
                 .and_then(|v| v.as_array())
                 .map(|arr| {
                     arr.iter()
@@ -299,7 +314,13 @@ fn list_external_modules_blocking() -> Result<Vec<ExternalModuleManifest>, Strin
                         .map(|c| c.to_owned())
                         .collect()
                 })
-                .unwrap_or_default(),
+                .unwrap_or_default()
+        };
+        let permissions = partial.get("permissions").map(|p| ModulePermissions {
+            commands: string_list(p, "commands"),
+            // Passed through as written; the host normalises and validates each entry (an
+            // origin that is not `https://host[:port]` is dropped there, again fail-closed).
+            origins: string_list(p, "origins"),
         });
 
         let module_dir_str = module_dir.to_string_lossy().into_owned();
@@ -456,6 +477,50 @@ mod external_module_tests {
         assert!(reqs[1].version.is_none());
         let perms = m.permissions.as_ref().expect("permissions must be Some");
         assert_eq!(perms.commands, vec!["ai_suggest_tags", "ai_get_suggestions"]);
+        // A pre-#49 manifest declares no origins at all, which is the shape every manifest
+        // already on disk has. It must parse, and it must mean "reaches nothing".
+        assert!(perms.origins.is_empty());
+    }
+
+    // ── `origins` is a sibling field, so old manifests keep parsing ────────────
+
+    #[test]
+    fn network_origins_are_parsed_beside_commands() {
+        let xdg = temp_xdg("origins");
+        let _g = EnvGuard::set("XDG_DATA_HOME", xdg.to_str().unwrap());
+
+        write_manifest(
+            &xdg,
+            "net-module",
+            r#"{
+                "id": "net-module",
+                "name": "Net Module",
+                "version": "1.0.0",
+                "description": "Declares network destinations.",
+                "entrypoint": "index.js",
+                "minHostVersion": "0.1.0",
+                "permissions": {
+                    "commands": ["get_photo"],
+                    "origins": ["https://api.flickr.com", "https://up.flickr.com:8443", 7, ""]
+                }
+            }"#,
+        );
+
+        let result = list_external_modules_blocking().unwrap();
+        let perms = result
+            .iter()
+            .find(|m| m.id == "net-module")
+            .expect("net-module is discovered")
+            .permissions
+            .as_ref()
+            .expect("permissions key present → Some");
+        assert_eq!(perms.commands, vec!["get_photo"]);
+        // Junk entries are dropped here exactly as they are in `commands`; whether each
+        // surviving string is a usable origin is decided by the host, which normalises it.
+        assert_eq!(
+            perms.origins,
+            vec!["https://api.flickr.com", "https://up.flickr.com:8443"]
+        );
     }
 
     // ── a malformed `permissions` block narrows, never widens ─────────────────

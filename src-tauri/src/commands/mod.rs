@@ -53,6 +53,10 @@ mod instagram;
 mod localsend;
 #[cfg(feature = "map")]
 mod map;
+// The host-mediated `api.fetch` proxy (#49). Feature-gated because it is the only core
+// command needing an HTTP client, and `reqwest` is an optional dependency.
+#[cfg(feature = "module-fetch")]
+mod net;
 mod photos;
 mod publications;
 // Shared publish/transfer helpers. Compiled for LocalSend and Instagram too: they render
@@ -98,6 +102,8 @@ pub use instagram::*;
 pub use localsend::*;
 #[cfg(feature = "map")]
 pub use map::*;
+#[cfg(feature = "module-fetch")]
+pub use net::*;
 pub use photos::*;
 pub use publications::*;
 pub use scan::*;

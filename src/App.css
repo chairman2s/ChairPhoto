@@ -1278,6 +1278,47 @@ body {
   font-size: 12px;
   color: var(--text-dim);
 }
+/* Declared backend permissions (#48): collapsed by default in the row, expanded in the
+   review dialog. A module with 21 commands would otherwise dominate the list. */
+.module-permissions {
+  margin-top: 2px;
+}
+.module-permissions > summary {
+  cursor: pointer;
+  color: var(--text-dim);
+  font-size: 12px;
+}
+.module-permission-list {
+  list-style: none;
+  margin: 4px 0 0;
+  padding: 0 0 0 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.module-permission-list > li {
+  font-family: monospace;
+  font-size: 12px;
+  color: var(--text-dim);
+  word-break: break-all;
+}
+/* Ungranted entries in the review dialog: the ones the user is being asked about. */
+.module-permission-list > li.pending {
+  color: var(--text);
+}
+.module-permission-review {
+  max-width: 460px;
+}
+.module-permission-review .modal-body {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.module-permission-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
 
 /* IPTC panel */
 .iptc-row {

@@ -28,6 +28,7 @@ import type {
   EditRenderer,
   MainView,
   ModulePanel,
+  ModulePermissions,
   Photo,
   PublishTarget,
   SettingsPanel,
@@ -42,6 +43,10 @@ interface Registered {
   external: boolean;
   /** Lowest host version this module supports (external only; "" = unconstrained). */
   minHostVersion: string;
+  /** The backend commands this module DECLARED, snapshotted at registration. Declaring is
+   *  not granting: `permits()` also requires the user's grant. See the permissions section
+   *  below. */
+  declaredCommands: Set<string>;
   panels: ModulePanel[];
   actions: ToolbarAction[];
   /** A React thunk (bundled) or a `ModuleMount` (external); Preferences renders either
@@ -256,6 +261,8 @@ export const __legacy = {
  *  settings-panel or contribution registry to miss. */
 export function __resetForTests() {
   modules.clear();
+  grants.clear();
+  announcedRefusals.clear();
   features = [];
   hostVersion = "";
   selection = [];
@@ -411,6 +418,230 @@ export function unmetRequirement(id: string): string | null {
   return null;
 }
 
+// --- Per-module permissions (#48) ----------------------------------------
+//
+// `api.invoke` used to be a raw command-string pass-through: any enabled module could call
+// any Tauri command the app registers, related to it or not. It is now gated twice — a
+// command must be DECLARED by the module and GRANTED by the user.
+//
+// Declared comes from the module: `ChairPhotoModule.permissions` for a bundled module, the
+// manifest's `permissions` for an external one (the manifest wins there — see `register`).
+// Granted comes from the user, at the moment they enable the module, and is persisted.
+// Enforcement is the intersection: `granted ∩ declared`. Intersecting rather than trusting
+// the grant alone means a module that later *narrows* its declaration is held to the
+// narrower set without needing a re-review, and a stale grant for a command a module no
+// longer asks for is inert.
+//
+// Why enable-time review and not a first-use prompt: see docs/module-capabilities.md
+// § "Per-module permissions". In short — at enable time the module has not run yet, the
+// decision is the user's to initiate, and refusing is a real option; a first-use prompt
+// necessarily interrupts an action the user just asked for, where the only workable answer
+// is yes.
+//
+// This is a boundary for EXTERNAL modules, which reach the backend only through the
+// `ChairPhotoAPI` object the host hands them. A bundled module is compiled into the app and
+// could import `./api` directly; it declares permissions anyway so that the enforcement
+// path is exercised by the modules that actually ship, and so each module's backend surface
+// is written down. See docs/plugin-system.md § "Trust model".
+
+/**
+ * Grants the user has approved, keyed by module id. **Absence of a key means "never
+ * reviewed"**, which is deliberately distinct from a recorded empty set (a review that
+ * granted nothing). Loaded once by `initHost` from the `modules.permissions` setting.
+ */
+const grants = new Map<string, Set<string>>();
+
+/** The settings key holding `grants`, serialised as `{ "<module id>": ["<command>", …] }`. */
+const GRANTS_KEY = "modules.permissions";
+
+/** Thrown (as a promise rejection) by `api.invoke` when a module asks for a command it has
+ *  not declared, or has declared but not been granted. A named class so a module can tell a
+ *  refusal apart from a backend error, and so a test can assert on the refusal itself
+ *  rather than on message text. */
+export class ModulePermissionError extends Error {
+  constructor(
+    readonly moduleId: string,
+    readonly command: string,
+  ) {
+    super(`module "${moduleId}" is not permitted to invoke "${command}"`);
+    this.name = "ModulePermissionError";
+  }
+}
+
+/** Refusals already toasted, as `"<module id> <command>"`. A module retrying in a loop
+ *  would otherwise bury the UI in identical toasts; the console line is unconditional, so
+ *  nothing is lost from the record. */
+const announcedRefusals = new Set<string>();
+
+/** Normalise a declaration into a set of command names, dropping anything unusable. Junk
+ *  narrows the set; it can never widen it, so a malformed declaration yields a module that
+ *  can invoke less, never one that can invoke more. */
+function normalizeCommands(permissions?: ModulePermissions): Set<string> {
+  const out = new Set<string>();
+  for (const command of permissions?.commands ?? []) {
+    if (typeof command === "string" && command !== "") out.add(command);
+  }
+  return out;
+}
+
+/** The commands module `id` declared it needs (sorted; empty if unknown or none). */
+export function declaredPermissions(id: string): string[] {
+  return [...(modules.get(id)?.declaredCommands ?? [])].sort();
+}
+
+/** The commands module `id` has been granted, narrowed to what it still declares (sorted).
+ *  This is exactly the set `api.invoke` will accept. */
+export function grantedPermissions(id: string): string[] {
+  const reg = modules.get(id);
+  if (!reg) return [];
+  const granted = grants.get(id);
+  return [...reg.declaredCommands].filter((c) => granted?.has(c)).sort();
+}
+
+/** The commands module `id` declares but has not been granted (sorted). Non-empty means the
+ *  user has something to review — either a first enable, or a module that grew its
+ *  declaration since it was last reviewed (e.g. after being updated on disk). */
+export function pendingPermissions(id: string): string[] {
+  const reg = modules.get(id);
+  if (!reg) return [];
+  const granted = grants.get(id);
+  return [...reg.declaredCommands].filter((c) => !granted?.has(c)).sort();
+}
+
+/**
+ * Record the user's approval of everything module `id` currently declares. Called by the
+ * permission-review UI after the user has seen the list — never by `enableModule`, which is
+ * the whole point: granting is a decision, not a side effect of toggling.
+ *
+ * The grant is replaced rather than merged, so a module that narrows its declaration and is
+ * re-reviewed sheds the commands it dropped.
+ */
+export function grantPermissions(id: string, persist = true) {
+  const reg = modules.get(id);
+  if (!reg) return;
+  grants.set(id, new Set(reg.declaredCommands));
+  if (persist) persistGrants();
+  lifecycleChannel.notify();
+}
+
+/** Forget module `id`'s grant entirely, so enabling it requires a fresh review. */
+export function revokePermissions(id: string, persist = true) {
+  if (!grants.delete(id)) return;
+  if (persist) persistGrants();
+  lifecycleChannel.notify();
+}
+
+function persistGrants() {
+  const out: Record<string, string[]> = {};
+  for (const [id, commands] of grants) out[id] = [...commands].sort();
+  void setSetting(GRANTS_KEY, JSON.stringify(out));
+}
+
+/**
+ * Load persisted grants, reporting whether the row was there at all.
+ *
+ * The caller needs that distinction, and it is the whole reason this returns anything:
+ * **absent** means a pre-permissions install, which `grandfatherEnabledModules` treats as
+ * "these modules already had wider access, keep them working". **Present but unreadable**
+ * means something else — and must not be quietly upgraded into the same free pass, or a
+ * corrupt row would become a way to re-grant a module that had grown its declaration since
+ * the user last looked at it. Unreadable therefore means every module is unreviewed.
+ *
+ * Individual junk values (a grant that is not an array of strings) narrow that one module
+ * to "unreviewed" without taking the rest of the row down with them.
+ */
+async function loadGrants(): Promise<"absent" | "loaded"> {
+  grants.clear();
+  const raw = (await getSetting(GRANTS_KEY).catch(() => null)) ?? "";
+  if (!raw) return "absent";
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (e) {
+    console.error(
+      `[modules] could not parse ${GRANTS_KEY}; every module will need permission review:`,
+      e,
+    );
+    return "loaded";
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    console.error(
+      `[modules] ${GRANTS_KEY} is not an object; every module will need permission review`,
+    );
+    return "loaded";
+  }
+  for (const [id, commands] of Object.entries(parsed as Record<string, unknown>)) {
+    if (!Array.isArray(commands)) continue;
+    grants.set(id, new Set(commands.filter((c): c is string => typeof c === "string")));
+  }
+  return "loaded";
+}
+
+/**
+ * One-time compatibility pass for modules the user had already enabled before permissions
+ * existed. Their declared set is recorded as granted so they keep working across the
+ * upgrade.
+ *
+ * This is not a new grant: before this gate, an enabled module's `api.invoke` reached *any*
+ * command the app registers, so recording exactly what it now declares is strictly narrower
+ * than the access it already had. Only modules with no recorded grant at all are touched — a
+ * recorded empty grant is a decision the user made, and is left alone.
+ *
+ * A module the user has never enabled is untouched, so a newly installed module still goes
+ * through review at its first enable. Called only when the grants row was *absent* — see
+ * `loadGrants` for why an unreadable row is not the same thing.
+ */
+function grandfatherEnabledModules(enabledIds: string[]) {
+  let changed = false;
+  for (const id of enabledIds) {
+    const reg = modules.get(id);
+    if (!reg || grants.has(id)) continue;
+    grants.set(id, new Set(reg.declaredCommands));
+    changed = true;
+  }
+  if (changed) persistGrants();
+}
+
+/**
+ * Why module `id` cannot be enabled *for permission reasons*, or null. Kept out of
+ * `unmetRequirement` on purpose: an unmet requirement is a dead end the user cannot act on
+ * from the Modules panel (it disables the toggle), whereas ungranted permissions are
+ * precisely what the toggle is supposed to let them act on.
+ */
+function permissionBlockReason(id: string): string | null {
+  const pending = pendingPermissions(id);
+  if (pending.length === 0) return null;
+  return (
+    `needs permission for ${pending.length} backend ` +
+    `command${pending.length === 1 ? "" : "s"} — review it under Preferences → Modules.`
+  );
+}
+
+/** May module `id` invoke `command`? Declared AND granted, both required. */
+function permits(id: string, command: string): boolean {
+  const reg = modules.get(id);
+  if (!reg || !reg.declaredCommands.has(command)) return false;
+  return grants.get(id)?.has(command) ?? false;
+}
+
+/**
+ * Refuse an `api.invoke`, visibly. The command never reaches the backend; the module sees a
+ * rejected promise carrying a `ModulePermissionError`, and the user sees a toast naming the
+ * module and the command. Both halves matter — a silent no-op would leave a module looking
+ * broken for no stated reason.
+ */
+function refuseInvoke(id: string, command: string): Promise<never> {
+  const error = new ModulePermissionError(id, command);
+  const name = modules.get(id)?.module.name ?? id;
+  console.error(`[modules] ${error.message}`);
+  const key = `${id} ${command}`;
+  if (!announcedRefusals.has(key)) {
+    announcedRefusals.add(key);
+    toast(`${name} tried to use "${command}", which it hasn't asked permission for.`);
+  }
+  return Promise.reject(error);
+}
+
 /** Enabled modules that declare a requirement on `id` (direct dependents). */
 function dependentsOf(id: string): Registered[] {
   return [...modules.values()].filter(
@@ -436,7 +667,12 @@ function apiFor(mod: ChairPhotoModule): ChairPhotoAPI {
       ),
     listPublications: (photoId) => listPublications(photoId),
     deletePublication: (id) => deletePublication(id),
-    invoke: (command, args) => invoke(command, args),
+    // Identity comes from the closure, exactly as `recordPublication` above takes its
+    // marker from `mod.id` instead of letting a module pass a platform string. A module
+    // never handles its own id here, so it has nothing to forge: the permission lookup is
+    // keyed on the registry entry the host built, not on anything the caller supplies.
+    invoke: <T,>(command: string, args?: Record<string, unknown>): Promise<T> =>
+      permits(mod.id, command) ? invoke<T>(command, args) : refuseInvoke(mod.id, command),
     // Adapter over Tauri's `listen`: unwraps `event.payload` and returns a
     // contract-owned `Unsubscribe`, so no Tauri type reaches the module surface.
     onEvent: <T,>(event: string, handler: (payload: T) => void) =>
@@ -491,14 +727,26 @@ function apiFor(mod: ChairPhotoModule): ChairPhotoAPI {
 
 export function register(
   mod: ChairPhotoModule,
-  opts: { external?: boolean; minHostVersion?: string } = {},
+  opts: {
+    external?: boolean;
+    minHostVersion?: string;
+    /** The MANIFEST's permissions, for an external module. Ignored for a bundled one. */
+    permissions?: ModulePermissions;
+  } = {},
 ) {
   if (!modules.has(mod.id)) {
+    const external = opts.external ?? false;
     modules.set(mod.id, {
       module: mod,
       enabled: false,
-      external: opts.external ?? false,
+      external,
       minHostVersion: opts.minHostVersion ?? "",
+      // For an EXTERNAL module the manifest is authoritative and `mod.permissions` is
+      // ignored: the manifest is what the host read without executing the module and what
+      // the user reviewed, so a module cannot ship a modest manifest and then widen itself
+      // from code. Snapshotting into a Set also means a module mutating its own
+      // `permissions` array after registration changes nothing.
+      declaredCommands: normalizeCommands(external ? opts.permissions : mod.permissions),
       panels: [],
       actions: [],
       settings: [],
@@ -517,8 +765,14 @@ export async function initHost(bundled: ChairPhotoModule[]) {
   hostVersion = await appVersion().catch(() => "");
   bundled.forEach((m) => register(m));
   await loadExternalModules();
+  // Grants must be loaded before the enable pass below: `enableModule` refuses a module
+  // whose declaration is not fully granted, so restoring the user's enabled set depends on
+  // knowing what they already approved.
+  const grantsRow = await loadGrants();
   const csv = (await getSetting("modules.enabled").catch(() => null)) ?? "";
-  for (const id of csv.split(",").filter(Boolean)) enableModule(id, false);
+  const enabledIds = csv.split(",").filter(Boolean);
+  if (grantsRow === "absent") grandfatherEnabledModules(enabledIds);
+  for (const id of enabledIds) enableModule(id, false);
   // Each enableModule() call above already fired notifyModuleSetChanged() for the modules
   // it enabled. This covers the remaining case: modules that got register()'d (bundled or
   // external stubs) but were never enabled — the Modules panel still needs to see them.
@@ -584,7 +838,11 @@ export async function loadExternalModules() {
       continue;
     }
 
-    register(mod, { external: true, minHostVersion: manifest.minHostVersion });
+    register(mod, {
+      external: true,
+      minHostVersion: manifest.minHostVersion,
+      permissions: manifest.permissions,
+    });
   }
 }
 
@@ -604,7 +862,13 @@ function registerExternalStub(manifest: import("./api").ExternalModuleManifest) 
       requires: manifest.requires,
       onLoad: () => {},
     },
-    { external: true, minHostVersion: manifest.minHostVersion },
+    {
+      external: true,
+      minHostVersion: manifest.minHostVersion,
+      // Carried even though the stub's `onLoad` is a no-op, so the Modules panel can show
+      // what the module *would* ask for next to the reason it is blocked.
+      permissions: manifest.permissions,
+    },
   );
 }
 
@@ -663,11 +927,27 @@ export function enableModule(id: string, persist = true, seen = new Set<string>(
     return;
   }
 
+  // Permissions are granted by review, never by the toggle — that is what makes granting a
+  // decision rather than a side effect of enabling. A module whose declaration is not fully
+  // granted does not load at all: the grant is all-or-nothing per module, so a module never
+  // runs in a half-permitted state nobody wrote or tested for. ModulesPanel routes the user
+  // through the review dialog and calls `grantPermissions()` before retrying.
+  const permissionBlock = permissionBlockReason(id);
+  if (permissionBlock) {
+    toast(`Can't enable ${reg.module.name}: it ${permissionBlock}`);
+    console.warn(
+      `[modules] refused to enable "${id}": ungranted permissions: ` +
+        `${pendingPermissions(id).join(", ")}`,
+    );
+    return;
+  }
+
   // Enable required modules FIRST so onLoad order is deps-before-dependents.
   for (const req of reg.module.requires ?? []) {
     enableModule(req.id, false, seen);
     if (!modules.get(req.id)?.enabled) {
-      const why = unmetRequirement(req.id) ?? "could not be enabled";
+      const why =
+        unmetRequirement(req.id) ?? permissionBlockReason(req.id) ?? "could not be enabled";
       toast(`Can't enable ${reg.module.name}: dependency ${req.id} ${why}`);
       console.warn(`[modules] refused to enable "${id}": dependency "${req.id}" ${why}`);
       return;
@@ -811,8 +1091,16 @@ export interface ModuleInfo {
   external: boolean;
   /** Declared dependencies, resolved for display (empty if none). */
   requires: RequirementInfo[];
-  /** Why this module can't be enabled right now, or null if it can. */
+  /** Why this module can't be enabled right now, or null if it can. Hard blockers only
+   *  (missing dependency, uncompiled backend, host too old) — NOT ungranted permissions,
+   *  which the user can resolve from this very panel. */
   blockedReason: string | null;
+  /** Every backend command this module declares it needs (sorted; empty if none). Shown
+   *  whether or not it is granted, so a grant stays inspectable after the fact. */
+  permissions: string[];
+  /** The subset of `permissions` not yet granted (sorted). Non-empty means enabling this
+   *  module must go through permission review first. */
+  pendingPermissions: string[];
 }
 
 export function listModules(): ModuleInfo[] {
@@ -834,6 +1122,8 @@ export function listModules(): ModuleInfo[] {
       return { id: req.id, name: dep?.module.name ?? req.id, version: req.version, met };
     }),
     blockedReason: r.enabled ? null : unmetRequirement(r.module.id),
+    permissions: declaredPermissions(r.module.id),
+    pendingPermissions: pendingPermissions(r.module.id),
   }));
 }
 

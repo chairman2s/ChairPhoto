@@ -1002,6 +1002,23 @@ export const smartTaggingModule: ChairPhotoModule = {
   version: "0.1.0",
   description: "Suggest tags based on visual similarity using local CLIP embeddings.",
   backendFeature: "smarttags",
+  // Every `smarttags_*` command the module's helpers call (#48). `smarttags_download_model`
+  // is the only one that touches the network, and it fetches the pinned CLIP model.
+  permissions: {
+    commands: [
+      "smarttags_accept_suggestion",
+      "smarttags_delete_index",
+      "smarttags_download_model",
+      "smarttags_index_cancel",
+      "smarttags_index_photos",
+      "smarttags_index_status",
+      "smarttags_load_suggestions",
+      "smarttags_model_status",
+      "smarttags_reject_suggestion",
+      "smarttags_suggest_tags",
+      "smarttags_train_classifiers",
+    ],
+  },
   onLoad(api) {
     api.registerPanel({
       id: "smarttags-similar",

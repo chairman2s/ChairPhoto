@@ -15,6 +15,9 @@ export const localsendModule: ChairPhotoModule = {
   description:
     "Send a photo to a device on the local network (phone, laptop) via LocalSend's HTTP protocol. Transfer only — records no publication.",
   backendFeature: "localsend",
+  // Invoked from SendToDevicePanel, which this module hands its own `api` (#48). Both
+  // commands talk to the LAN — discovery is a multicast probe, send is an HTTP upload.
+  permissions: { commands: ["localsend_discover", "localsend_send"] },
   onLoad(api) {
     api.registerPublishTarget({
       id: "localsend",

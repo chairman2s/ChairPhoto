@@ -3216,6 +3216,33 @@ export const facesModule: ChairPhotoModule = {
     "Bootstraps names from existing person tags. Overlay in the loupe shows face regions " +
     "with confirm / reject / reassign actions. Requires the faces backend feature.",
   backendFeature: "faces",
+  // Every `faces_*` command the module's helpers call (#48). All of them are its own —
+  // face rows live in the plugin-prefixed `faces__*` tables.
+  permissions: {
+    commands: [
+      "faces_accept",
+      "faces_add_manual",
+      "faces_assign",
+      "faces_cluster_summary",
+      "faces_delete_drawn",
+      "faces_download_models",
+      "faces_for_photo",
+      "faces_ignore",
+      "faces_index_cancel",
+      "faces_index_photos",
+      "faces_index_status",
+      "faces_inference_info",
+      "faces_match_cancel",
+      "faces_match_status",
+      "faces_models_status",
+      "faces_name_cluster",
+      "faces_people_summary",
+      "faces_reject",
+      "faces_run_matching",
+      "faces_set_indexing_speed",
+      "faces_suggestion_list",
+    ],
+  },
 
   onLoad(api) {
     // People main view: wall of named people + unnamed clusters + suggestion queue.

@@ -1,6 +1,12 @@
 import { useEffect, useState } from "react";
 import { getModulesDir } from "../modules/api";
-import { disableModule, enableModule, listModules, useHostLifecycle } from "../modules/host";
+import {
+  disableModule,
+  enableModule,
+  grantPermissions,
+  listModules,
+  useHostLifecycle,
+} from "../modules/host";
 
 // Modules section (Preferences → Modules): enable/disable bundled modules and any
 // user-installed (external) modules discovered at startup. A module's own settings live
@@ -54,8 +60,9 @@ export function ModulesSection() {
             </div>
           )}
           <div className="modal-sub" style={{ marginTop: 4 }}>
-            Each module runs with full app access and can invoke any backend command —
-            review the source and verify the author/origin before installing.
+            A module can only reach the backend commands it declares and you approve, but it
+            still runs inside the app with no sandbox — review the source and verify the
+            author/origin before installing.
           </div>
         </div>
       </div>
@@ -71,6 +78,12 @@ interface ModuleRowProps {
 }
 
 function ModuleRow({ m, showExternalBadge }: ModuleRowProps) {
+  // Open when the user has asked to enable a module that still has ungranted permissions.
+  // Enabling is deliberately NOT attempted first: `enableModule` would refuse, and the
+  // point of the review is that the grant is a separate decision the user makes with the
+  // list in front of them.
+  const [reviewing, setReviewing] = useState(false);
+
   return (
     <div className="module-row">
       <div className="module-info">
@@ -106,6 +119,22 @@ function ModuleRow({ m, showExternalBadge }: ModuleRowProps) {
         {!m.enabled && m.blockedReason && m.backendAvailable && (
           <div className="modal-error">{m.blockedReason}</div>
         )}
+        {/* What this module can reach through api.invoke, always visible so a grant stays
+            inspectable long after it was given — not only in the moment of granting. */}
+        {m.permissions.length > 0 && (
+          <details className="module-permissions">
+            <summary>
+              Backend access: {m.permissions.length} command
+              {m.permissions.length === 1 ? "" : "s"}
+              {m.pendingPermissions.length > 0 && " (needs your approval)"}
+            </summary>
+            <ul className="module-permission-list">
+              {m.permissions.map((c) => (
+                <li key={c}>{c}</li>
+              ))}
+            </ul>
+          </details>
+        )}
       </div>
       <label
         className="term-export"
@@ -115,10 +144,103 @@ function ModuleRow({ m, showExternalBadge }: ModuleRowProps) {
           type="checkbox"
           disabled={!m.enabled && !!m.blockedReason}
           checked={m.enabled}
-          onChange={(e) => (e.target.checked ? enableModule(m.id) : disableModule(m.id))}
+          onChange={(e) => {
+            if (!e.target.checked) {
+              disableModule(m.id);
+              return;
+            }
+            // Ungranted permissions are not a blocker the user can only read about — they
+            // are the decision this dialog exists to put in front of them.
+            if (m.pendingPermissions.length > 0) setReviewing(true);
+            else enableModule(m.id);
+          }}
         />
         enabled
       </label>
+
+      {reviewing && (
+        <PermissionReview
+          m={m}
+          onClose={() => setReviewing(false)}
+          onAllow={() => {
+            setReviewing(false);
+            grantPermissions(m.id);
+            enableModule(m.id);
+          }}
+        />
+      )}
+    </div>
+  );
+}
+
+// ── Permission review ─────────────────────────────────────────────────────────
+
+interface PermissionReviewProps {
+  m: ReturnType<typeof listModules>[number];
+  onClose: () => void;
+  onAllow: () => void;
+}
+
+/**
+ * The consent step for a module's declared backend permissions (#48).
+ *
+ * Shown when the user turns a module on, before it has run a single line — which is the
+ * whole argument for reviewing here rather than prompting at first use: at this point the
+ * user chose the moment, nothing is half-done, and declining costs them nothing but the
+ * module. See docs/module-capabilities.md § "Per-module permissions".
+ *
+ * The grant is all-or-nothing. There is no per-command checkbox, because a module that got
+ * three of the five commands it needs would fail in ways nobody wrote or tested for.
+ */
+function PermissionReview({ m, onClose, onAllow }: PermissionReviewProps) {
+  const granted = m.permissions.filter((c) => !m.pendingPermissions.includes(c));
+  return (
+    <div className="modal-backdrop" onClick={onClose}>
+      <div
+        className="modal module-permission-review"
+        role="dialog"
+        aria-label={`Permissions for ${m.name}`}
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="modal-header">
+          <div className="modal-headinfo">
+            <div className="modal-title">{m.name} wants backend access</div>
+            <div className="modal-sub">
+              {m.external
+                ? "This module was installed from disk. It runs inside ChairPhoto with no sandbox."
+                : "This module ships with ChairPhoto."}
+            </div>
+          </div>
+        </div>
+
+        <div className="modal-body">
+          <div className="modal-sub">
+            It can call the {m.pendingPermissions.length} backend command
+            {m.pendingPermissions.length === 1 ? "" : "s"} below, and nothing else. Anything
+            it asks for that is not on this list is refused.
+          </div>
+          <ul className="module-permission-list">
+            {m.pendingPermissions.map((c) => (
+              <li key={c} className="pending">
+                {c}
+              </li>
+            ))}
+          </ul>
+          {granted.length > 0 && (
+            <div className="modal-sub">
+              Already approved: {granted.join(", ")}
+            </div>
+          )}
+          <div className="module-permission-actions">
+            <button className="chip" onClick={onClose}>
+              Cancel
+            </button>
+            <button className="chip" onClick={onAllow}>
+              Allow and enable
+            </button>
+          </div>
+        </div>
+      </div>
     </div>
   );
 }

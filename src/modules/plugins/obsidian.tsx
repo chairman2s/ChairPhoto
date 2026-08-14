@@ -375,6 +375,8 @@ export const obsidianModule: ChairPhotoModule = {
   version: "0.1.0",
   description:
     "Per-photo and per-tag notes in an Obsidian vault, linked both ways (obsidian:// out, chairphoto:// back).",
+  // Read-only: the note's front matter needs the photo row and its tags (#48).
+  permissions: { commands: ["get_photo", "get_photo_tags"] },
   onLoad(api) {
     api.registerPanel({
       id: "obsidian-note",

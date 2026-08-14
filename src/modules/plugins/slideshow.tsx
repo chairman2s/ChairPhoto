@@ -13,6 +13,8 @@ export const slideshowModule: ChairPhotoModule = {
   description:
     "Render the selected photos into a slideshow movie (.mp4) — pick per-photo duration, resolution/aspect preset, crossfade transitions and Ken Burns pan/zoom, reorder the photos, and render via ffmpeg.",
   backendFeature: "slideshow",
+  // Invoked from SlideshowDialog, which this module owns and hands its own `api` (#48).
+  permissions: { commands: ["make_slideshow"] },
   onLoad(api) {
     api.registerAction({
       id: "slideshow",

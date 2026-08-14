@@ -867,6 +867,8 @@ export const statisticsModule: ChairPhotoModule = {
   version: "0.2.0",
   description:
     "Dashboard of catalog stats — timeline, top tags, cameras, lenses, and shooting habits.",
+  // One aggregate query; everything else the dashboard shows comes from core wrappers (#48).
+  permissions: { commands: ["catalog_stats"] },
   onLoad(api) {
     api.registerMainView({
       id: "statistics",

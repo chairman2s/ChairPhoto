@@ -69,6 +69,17 @@ export const smugmugModule: ChairPhotoModule = {
   description: "Publish photos to a SmugMug album via the official API; records which version was posted.",
   backendFeature: "smugmug",
   publicationMarker: "smugmug",
+  // The OAuth 1.0a handshake, album listing/creation, and the upload (#48).
+  permissions: {
+    commands: [
+      "post_to_smugmug",
+      "smugmug_begin_auth",
+      "smugmug_complete_auth",
+      "smugmug_connected",
+      "smugmug_create_album",
+      "smugmug_list_albums",
+    ],
+  },
   onLoad(api) {
     const service = makeService(api);
     api.registerSettingsPanel(() => <OAuthSettings api={api} svc={service} />);

@@ -13,6 +13,9 @@ export const basicEditorModule: ChairPhotoModule = {
   description:
     "Non-destructive crop (with social aspect presets) and exposure/tone, saved as photo versions. Originals are never modified.",
   backendFeature: "edit",
+  // No `permissions` on purpose, not by omission (#48): this module never calls
+  // `api.invoke`. It renders through `renderEdit`, a core wrapper in `modules/api.ts`,
+  // which is part of the host API rather than the module-owned command surface.
   onLoad(api) {
     api.registerEditRenderer({
       id: "basic-editor",

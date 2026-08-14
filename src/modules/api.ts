@@ -154,6 +154,34 @@ export const listExternalModules = () =>
 export const getModulesDir = () => invoke<string>("get_modules_dir");
 
 /**
+ * The Rust half of `api.fetch` (#49): one HTTP request made outside the webview.
+ *
+ * **Not for modules to call.** It is a core command wrapper like the rest of this file, and
+ * the only caller is `apiFor()` in `host.ts`, which resolves the calling module's identity
+ * from the registration snapshot and matches `origin` against that module's granted set
+ * before getting here. Nothing in this signature carries a module id, precisely so that the
+ * identity cannot come from the caller.
+ *
+ * `url` is the WHATWG-normalised href and `origin` the origin the host already approved for
+ * it. The backend re-derives the origin from `url` with its own parser and refuses a
+ * mismatch, which closes the gap where two URL parsers read one string differently.
+ */
+export const moduleFetch = (
+  url: string,
+  origin: string,
+  method: string,
+  headers: Record<string, string>,
+  body: string | null,
+) =>
+  invoke<import("./registry").ModuleFetchResponse>("module_fetch", {
+    url,
+    origin,
+    method,
+    headers,
+    body,
+  });
+
+/**
  * Turn an absolute file path into an `asset:`-protocol URL loadable from the WebView (the
  * asset-protocol scope in tauri.conf.json must allow the path). Used to dynamically
  * `import()` an external module's entrypoint. Wraps `convertFileSrc` so modules/host code

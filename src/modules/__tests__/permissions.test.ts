@@ -437,9 +437,11 @@ describe("grants persist and reload", () => {
     // command, so its declared set is strictly narrower than the access it already had.
     expect(onLoad).toHaveBeenCalledTimes(1);
     expect(grantedPermissions("legacy")).toEqual(["a_cmd", "b_cmd"]);
-    // …and the grant is written down rather than re-derived on every launch.
+    // …and the grant is written down rather than re-derived on every launch. The row shape
+    // gained a `origins` sibling in #49; an empty one here is the point of that change —
+    // grandfathering carries commands forward and never invents a network grant.
     expect(JSON.parse(settings.get("modules.permissions")!)).toEqual({
-      legacy: ["a_cmd", "b_cmd"],
+      legacy: { commands: ["a_cmd", "b_cmd"], origins: [] },
     });
   });
 

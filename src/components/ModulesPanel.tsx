@@ -135,6 +135,23 @@ function ModuleRow({ m, showExternalBadge }: ModuleRowProps) {
             </ul>
           </details>
         )}
+        {/* And where it can send data (#49). Kept as its own line rather than folded into the
+            one above: "can call a backend command" and "can send data off this machine" are
+            different facts, and the second is the one the privacy invariant is about. */}
+        {m.origins.length > 0 && (
+          <details className="module-permissions">
+            <summary>
+              Network access: {m.origins.length} destination
+              {m.origins.length === 1 ? "" : "s"}
+              {m.pendingOrigins.length > 0 && " (needs your approval)"}
+            </summary>
+            <ul className="module-permission-list">
+              {m.origins.map((o) => (
+                <li key={o}>{o}</li>
+              ))}
+            </ul>
+          </details>
+        )}
       </div>
       <label
         className="term-export"
@@ -151,8 +168,9 @@ function ModuleRow({ m, showExternalBadge }: ModuleRowProps) {
             }
             // Ungranted permissions are not a blocker the user can only read about — they
             // are the decision this dialog exists to put in front of them.
-            if (m.pendingPermissions.length > 0) setReviewing(true);
-            else enableModule(m.id);
+            if (m.pendingPermissions.length > 0 || m.pendingOrigins.length > 0) {
+              setReviewing(true);
+            } else enableModule(m.id);
           }}
         />
         enabled
@@ -194,6 +212,13 @@ interface PermissionReviewProps {
  */
 function PermissionReview({ m, onClose, onAllow }: PermissionReviewProps) {
   const granted = m.permissions.filter((c) => !m.pendingPermissions.includes(c));
+  const grantedOrigins = m.origins.filter((o) => !m.pendingOrigins.includes(o));
+  const wants = [
+    m.pendingPermissions.length > 0 ? "backend" : null,
+    m.pendingOrigins.length > 0 ? "network" : null,
+  ]
+    .filter(Boolean)
+    .join(" and ");
   return (
     <div className="modal-backdrop" onClick={onClose}>
       <div
@@ -204,7 +229,9 @@ function PermissionReview({ m, onClose, onAllow }: PermissionReviewProps) {
       >
         <div className="modal-header">
           <div className="modal-headinfo">
-            <div className="modal-title">{m.name} wants backend access</div>
+            <div className="modal-title">
+              {m.name} wants {wants} access
+            </div>
             <div className="modal-sub">
               {m.external
                 ? "This module was installed from disk. It runs inside ChairPhoto with no sandbox."
@@ -214,21 +241,50 @@ function PermissionReview({ m, onClose, onAllow }: PermissionReviewProps) {
         </div>
 
         <div className="modal-body">
-          <div className="modal-sub">
-            It can call the {m.pendingPermissions.length} backend command
-            {m.pendingPermissions.length === 1 ? "" : "s"} below, and nothing else. Anything
-            it asks for that is not on this list is refused.
-          </div>
-          <ul className="module-permission-list">
-            {m.pendingPermissions.map((c) => (
-              <li key={c} className="pending">
-                {c}
-              </li>
-            ))}
-          </ul>
+          {m.pendingPermissions.length > 0 && (
+            <>
+              <div className="modal-sub">
+                It can call the {m.pendingPermissions.length} backend command
+                {m.pendingPermissions.length === 1 ? "" : "s"} below, and nothing else.
+                Anything it asks for that is not on this list is refused.
+              </div>
+              <ul className="module-permission-list">
+                {m.pendingPermissions.map((c) => (
+                  <li key={c} className="pending">
+                    {c}
+                  </li>
+                ))}
+              </ul>
+            </>
+          )}
+          {m.pendingOrigins.length > 0 && (
+            <>
+              {/* Worded as sending, not fetching. A grant to reach an origin is a grant to
+                  PUT data there — including photos and catalog rows the module can read —
+                  and a dialog that says "can connect to" would be describing half of it. */}
+              <div className="modal-sub">
+                It can <strong>send data to</strong> the {m.pendingOrigins.length} destination
+                {m.pendingOrigins.length === 1 ? "" : "s"} below, over HTTPS, and nowhere else.
+                Whatever this module can read — your photos and catalog included — it can send
+                there. Requests to anywhere else are refused.
+              </div>
+              <ul className="module-permission-list">
+                {m.pendingOrigins.map((o) => (
+                  <li key={o} className="pending">
+                    {o}
+                  </li>
+                ))}
+              </ul>
+            </>
+          )}
           {granted.length > 0 && (
             <div className="modal-sub">
               Already approved: {granted.join(", ")}
+            </div>
+          )}
+          {grantedOrigins.length > 0 && (
+            <div className="modal-sub">
+              Destinations already approved: {grantedOrigins.join(", ")}
             </div>
           )}
           <div className="module-permission-actions">

@@ -84,6 +84,39 @@ fn connect_src_reaches_the_ipc_bridge_and_nothing_remote() {
     }
 }
 
+/// Adding the host-mediated proxy (#49) must not have widened the policy that made it
+/// necessary.
+///
+/// The temptation this guards against is concrete: `api.fetch` gives modules a route to a
+/// declared origin, and the cheapest-looking way to make some future thing work would be to
+/// put that origin into `connect-src` — at which point every module can reach it directly,
+/// with no declaration, no grant, and no Rust in the path. `connect-src` staying at
+/// `'self' ipc: http://ipc.localhost` is what keeps the proxy the *only* route, and therefore
+/// what makes the per-module gate meaningful rather than advisory.
+///
+/// `default-src` is checked too: a `connect-src` deleted rather than narrowed would silently
+/// fall back to it.
+#[test]
+fn the_fetch_proxy_did_not_widen_connect_src() {
+    let connect = sources("connect-src");
+    let allowed = ["'self'", "ipc:", "http://ipc.localhost"];
+    for source in &connect {
+        assert!(
+            allowed.contains(&source.as_str()),
+            "connect-src gained `{source}` — module code could reach it without going through \
+             api.fetch, so the per-module origin grant would no longer bound anything"
+        );
+    }
+    // The fallback for any fetch-directive that is absent.
+    let default = sources("default-src");
+    assert_eq!(
+        default,
+        vec!["'self'"],
+        "default-src must stay 'self' — it is what connect-src falls back to if it is ever \
+         removed instead of narrowed: {default:?}"
+    );
+}
+
 #[test]
 fn the_native_media_protocols_stay_loadable() {
     let img = sources("img-src");

@@ -42,7 +42,7 @@ pub async fn cache_images(
     // check then happens off the lock, on the blocking worker, via `pick_existing`.
     let candidate_lists: Vec<(i64, Vec<crate::catalog::PathCandidate>)> = with_catalog(&state, |c| {
         let mut lists = Vec::new();
-        for photo in c.list_photos(None, None, None, &[], "all", None, "all", None, None, &[], None)? {
+        for photo in c.list_photos(&crate::catalog::PhotoQuery::default())? {
             lists.push((photo.id, c.photo_path_candidates(photo.id)?));
         }
         Ok(lists)

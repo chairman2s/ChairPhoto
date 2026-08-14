@@ -45,7 +45,6 @@ interface TileProps {
   isSelected: boolean;
   isActive: boolean;
   status: StorageStatus | undefined;
-  versionCount: number | undefined;
   bust: number | undefined;
   /** If non-null and photo.sharpness < softThreshold, show a soft badge. */
   softThreshold: number | null;
@@ -59,7 +58,6 @@ const Tile = React.memo(function Tile({
   isSelected,
   isActive,
   status,
-  versionCount,
   bust,
   softThreshold,
   onSelect,
@@ -103,9 +101,9 @@ const Tile = React.memo(function Tile({
             style={{ background: LABEL_COLORS[photo.label] }}
           />
         )}
-        {(versionCount ?? 0) > 0 && (
-          <span className="badge badge-versions" title={`${versionCount} version(s)`}>
-            ⧉ {versionCount}
+        {(photo.versionCount ?? 0) > 0 && (
+          <span className="badge badge-versions" title={`${photo.versionCount} version(s)`}>
+            ⧉ {photo.versionCount}
           </span>
         )}
         {(photo.stackCount ?? 0) > 0 && (
@@ -174,7 +172,7 @@ export function CatalogGrid({
   selectedId,
   selectedIds,
   statuses,
-  versionCounts,
+  onVisibleRange,
   thumbBusts,
   softThreshold = null,
   emptyMessage,
@@ -186,8 +184,15 @@ export function CatalogGrid({
   selectedId: number | null;
   selectedIds: number[];
   statuses?: Map<number, StorageStatus>;
-  /** Number of named versions per photo, for the tile badge. */
-  versionCounts?: Map<number, number>;
+  /**
+   * Which rows are mounted, as a half-open `[start, end)` range over `photos` (overscan
+   * included). The parent fetches per-window grid metadata from it — storage status is
+   * the one badge that cannot ride the photo row, so it is fetched for what is on screen
+   * rather than for every matching photo (issue #10).
+   *
+   * Must be stable across renders: it is an effect dependency here.
+   */
+  onVisibleRange?: (start: number, end: number) => void;
   /** Per-photo cache-bust nonce, bumped after a photo's file is recovered. */
   thumbBusts?: Map<number, number>;
   /**
@@ -292,6 +297,19 @@ export function CatalogGrid({
     rowVirtualizer.scrollToIndex(Math.ceil(photos.length / cols) - 1, { align: "end" });
   }, [measured, photos.length, cols, selectedId, rowVirtualizer]);
 
+  // Report the mounted range to the parent. Derived from the virtualizer's own items, so
+  // it already includes the overscan rows — the tiles a small scroll will reveal, which is
+  // exactly the set whose badges should be in hand before they appear. The effect keys on
+  // the first/last row index rather than the item array (a new array every scroll frame),
+  // so it fires when the window actually moves.
+  const virtualRows = rowVirtualizer.getVirtualItems();
+  const firstRow = virtualRows.length ? virtualRows[0].index : 0;
+  const lastRow = virtualRows.length ? virtualRows[virtualRows.length - 1].index : -1;
+  useEffect(() => {
+    if (!onVisibleRange || lastRow < 0) return;
+    onVisibleRange(firstRow * cols, Math.min((lastRow + 1) * cols, photos.length));
+  }, [onVisibleRange, firstRow, lastRow, cols, photos.length]);
+
   // Keep the selected photo on screen during keyboard navigation (it may be far off).
   useEffect(() => {
     if (selectedId == null) return;
@@ -312,7 +330,7 @@ export function CatalogGrid({
   return (
     <div ref={setScrollEl} className="grid-scroll">
       <div style={{ height: rowVirtualizer.getTotalSize(), width: "100%", position: "relative" }}>
-        {rowVirtualizer.getVirtualItems().map((vrow) => {
+        {virtualRows.map((vrow) => {
           const start = vrow.index * cols;
           const rowPhotos = photos.slice(start, Math.min(start + cols, photos.length));
           return (
@@ -337,7 +355,6 @@ export function CatalogGrid({
                   isSelected={selectedSet.has(photo.id)}
                   isActive={photo.id === selectedId}
                   status={statuses?.get(photo.id)}
-                  versionCount={versionCounts?.get(photo.id)}
                   bust={thumbBusts?.get(photo.id)}
                   softThreshold={softThreshold}
                   onSelect={stableOnSelect}

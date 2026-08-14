@@ -68,6 +68,11 @@ pub struct Photo {
     /// cluster), `"soft-in-burst"` = below ~60% of cluster median, `"sharpest-of-burst"` =
     /// sharpest frame in its cluster. Set only by `analyze_burst_sharpness`.
     pub burst_flag: Option<String>,
+    /// Named edit versions of this photo, for the grid's "N versions" badge (issue #10).
+    /// Carried on the row so a grid refresh needs no per-id side query: it is one
+    /// correlated `COUNT` over `idx_photo_versions_photo`, alongside the stack count that
+    /// was already computed this way. 0 = never edited.
+    pub version_count: i64,
 }
 
 /// Lightweight row used by the burst analysis engine to avoid fetching full Photo rows.

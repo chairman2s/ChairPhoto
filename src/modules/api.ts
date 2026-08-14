@@ -257,33 +257,67 @@ export type StorageTier = "all" | "local" | "nas";
  */
 export type PhotoSort = "date" | "sharpness_asc" | "sharpness_desc";
 
-export const listPhotos = (
-  tagId: number | null,
-  albumId: number | null,
-  batchId: number | null,
-  facets: string[],
-  cullingFilter: CullingFilter,
-  smartAlbumId: number | null = null,
-  storageTier: StorageTier = "all",
-  camera: string | null = null,
-  lens: string | null = null,
-  sort: PhotoSort | null = null,
+/**
+ * Which photos the library view wants, in what order, and (optionally) which slice.
+ *
+ * The same object as `PhotoQuery` in `src-tauri/src/catalog/query.rs`, field for field
+ * (issue #10) — it used to be eleven positional arguments that TypeScript, the Tauri
+ * command and the SQL builder each had to spell identically. Two things keep the sides
+ * honest rather than merely parallel: the string unions below are Rust enums, and the Rust
+ * struct is `deny_unknown_fields`, so a field added here and not there fails loudly at the
+ * boundary instead of being silently ignored (a silently ignored filter looks like "the
+ * grid forgot my selection").
+ *
+ * Every field is optional; the defaults mean "the whole library, oldest first".
+ */
+export interface PhotoQuery {
+  /** Restrict to a tag *and its descendants*. */
+  tagId?: number | null;
+  /** Restrict to an album — also switches the sort to the album's own member order. */
+  albumId?: number | null;
+  /** Restrict to one import batch. */
+  batchId?: number | null;
+  /** Evaluate a saved smart-album rule live. */
+  smartAlbumId?: number | null;
+  /** Derived boolean facets, ANDed in (e.g. `has-gps`, `published:flickr`). */
+  facets?: string[];
+  cullingFilter?: CullingFilter;
+  storageTier?: StorageTier;
+  /** Exact camera model, from `distinctPhotoValues("camera")`. */
+  camera?: string | null;
+  /** Exact lens, from `distinctPhotoValues("lens")`. */
+  lens?: string | null;
   /** Colour labels to keep, OR-combined ("" = No label). Empty = no label filter. */
-  labels: string[] = [],
-) =>
-  invoke<Photo[]>("list_photos", {
-    tagId,
-    albumId,
-    batchId,
-    facets,
-    cullingFilter,
-    smartAlbumId,
-    storageTier,
-    camera,
-    lens,
-    sort,
-    labels,
-  });
+  labels?: string[];
+  sort?: PhotoSort;
+  /** The slice to fetch. Omit for every matching row. */
+  window?: PhotoWindow | null;
+}
+
+/** A half-open slice `[offset, offset + limit)` of the ordered result. */
+export interface PhotoWindow {
+  offset: number;
+  limit: number;
+}
+
+/**
+ * One window of a query's result, plus the size of the whole matching set.
+ *
+ * `total` is what sizes the scrollbar and the "N photos" readout; it is the count of
+ * matching photos, not of `photos`. A window is meaningful because the backend's ordering
+ * is total (every sort ends in the photo's primary key), so "rows 500..1000" names the
+ * same rows on every call.
+ */
+export interface PhotoPage {
+  photos: Photo[];
+  /** Ordered position of `photos[0]` in the whole matching set. */
+  offset: number;
+  total: number;
+}
+
+/** Run a library query. Omit `window` to get every matching row. */
+export const listPhotos = (query: PhotoQuery = {}) =>
+  invoke<PhotoPage>("list_photos", { query });
 
 /** Distinct camera models / lenses in the catalog, for the filter-bar dropdowns. */
 export const distinctPhotoValues = (kind: "camera" | "lens") =>

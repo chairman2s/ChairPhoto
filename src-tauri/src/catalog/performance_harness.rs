@@ -4,7 +4,10 @@
 //! widening the production `Catalog` API. It is ignored by default; see
 //! `docs/performance-harness.md` for run instructions.
 
-use super::{Catalog, LocationRole, Result, StorageStatus, VolumeKind};
+use super::{
+    Catalog, LocationRole, PhotoQuery, PhotoSort, PhotoWindow, Result, StorageStatus, StorageTier,
+    VolumeKind,
+};
 use rusqlite::params;
 use serde::Serialize;
 use serde_json::json;
@@ -42,37 +45,66 @@ fn large_catalog_shape() {
         &mut operations,
         &config,
         Operation::ListPhotosAllDate,
-        || ListPhotosQuery::all_date().measure(&catalog),
+        || measure_list(&catalog, &queries::all_date()),
     );
     let all_ids: Vec<i64> = all_photos.iter().map(|p| p.id).collect();
     assert_eq!(all_ids.len(), config.photo_count);
+
+    // The same query as one window: what the grid asks for once it stops asking for
+    // everything. `..._deep` starts at the last window of the ordered set — the case a
+    // LIMIT/OFFSET scan is worst at, and the one a user reaches by scrolling to "today".
+    let first_window = required_operation(
+        &mut operations,
+        &config,
+        Operation::ListPhotosWindowFirst,
+        || {
+            measure_page(
+                &catalog,
+                &queries::all_date(),
+                PhotoWindow::new(0, config.grid_window_size),
+            )
+        },
+    );
+    let deep_window = required_operation(
+        &mut operations,
+        &config,
+        Operation::ListPhotosWindowDeep,
+        || {
+            let offset = config.photo_count.saturating_sub(config.grid_window_size);
+            measure_page(
+                &catalog,
+                &queries::all_date(),
+                PhotoWindow::new(offset, config.grid_window_size),
+            )
+        },
+    );
 
     let tag_filtered = required_operation(
         &mut operations,
         &config,
         Operation::ListPhotosTagFilter,
-        || ListPhotosQuery::tag_date(seed.summary.representative_tag_id).measure(&catalog),
+        || measure_list(&catalog, &queries::tag_date(seed.summary.representative_tag_id)),
     );
 
     let facet_filtered = required_operation(
         &mut operations,
         &config,
         Operation::ListPhotosFacetsAndSort,
-        || ListPhotosQuery::single_facet_and_sort().measure(&catalog),
+        || measure_list(&catalog, &queries::single_facet_and_sort()),
     );
 
     let combined_facet_filtered = required_operation(
         &mut operations,
         &config,
         Operation::ListPhotosCombinedFacetsAndFilters,
-        || ListPhotosQuery::combined_facets_and_filters().measure(&catalog),
+        || measure_list(&catalog, &queries::combined_facets_and_filters()),
     );
 
     let nas_photos = required_operation(
         &mut operations,
         &config,
         Operation::ListPhotosOfflineNas,
-        || ListPhotosQuery::offline_nas_date().measure(&catalog),
+        || measure_list(&catalog, &queries::offline_nas_date()),
     );
 
     let tags_count = required_operation(
@@ -106,6 +138,24 @@ fn large_catalog_shape() {
         .copied()
         .take(config.grid_window_size)
         .collect();
+    // What a grid refresh costs *now*: storage status for the visible window only. The
+    // version count no longer has a side query at all — it rides the photo row.
+    let window_statuses = required_operation(
+        &mut operations,
+        &config,
+        Operation::GridStatusesWindow,
+        || {
+            let measured = measure_grid_statuses(&catalog, &volume_health, &window_ids)?;
+            Ok(Measured::new(
+                measured.summary,
+                Some(window_ids.len()),
+                Some(measured.payload_bytes),
+            ))
+        },
+    );
+
+    // …and the two it replaced: both badge maps, for a window and then for every returned
+    // id, which is what `App.refresh` did on every filter change (issue #10).
     let _window_badges = required_operation(
         &mut operations,
         &config,
@@ -228,6 +278,11 @@ fn large_catalog_shape() {
         schema_version: super::schema::SCHEMA_VERSION,
         seed: seed.summary,
         row_counts,
+        windows: WindowSummaries {
+            first: first_window,
+            deep: deep_window,
+        },
+        grid_statuses_window: window_statuses,
         result_counts: ResultCounts {
             all_photos: all_ids.len(),
             tag_filtered: tag_filtered.len(),
@@ -302,6 +357,9 @@ struct HarnessReport {
     seed: SeedSummary,
     row_counts: RowCounts,
     result_counts: ResultCounts,
+    /// The first and last window of the full ordered set, through `photo_page`.
+    windows: WindowSummaries,
+    grid_statuses_window: BadgeSummary,
     grid_badges_all_returned_ids: BadgeSummary,
     resolver: ResolverSummary,
     pending_enrichment: PendingSummary,
@@ -376,12 +434,15 @@ enum Operation {
     SeedCatalog,
     CountSqlRows,
     ListPhotosAllDate,
+    ListPhotosWindowFirst,
+    ListPhotosWindowDeep,
     ListPhotosTagFilter,
     ListPhotosFacetsAndSort,
     ListPhotosCombinedFacetsAndFilters,
     ListPhotosOfflineNas,
     ListTagsWithCounts,
     VolumeReachability,
+    GridStatusesWindow,
     GridBadgesWindow,
     GridBadgesAllReturnedIds,
     ResolverSample,
@@ -396,6 +457,20 @@ impl Operation {
             Operation::SeedCatalog => OperationInfo::scaled("seed_catalog", 60_000.0),
             Operation::CountSqlRows => OperationInfo::unthresholded("count_sql_rows"),
             Operation::ListPhotosAllDate => OperationInfo::scaled("list_photos_all_date", 30_000.0),
+            // Measured, not assumed: a window saves building and serializing 100k `Photo`
+            // rows, but NOT the ordering — `ORDER BY COALESCE(strftime(capture_time), …)`
+            // is not index-backed, so both windows still sort the matching set, and the
+            // deep one additionally walks to its offset. At 100k photos that is ~0.6s for
+            // the first window against ~2.0s for the last (and ~3.8s unwindowed), so the
+            // deep window's threshold scales with the catalog while the first window's
+            // does not. Keyset pagination over an indexed key is the way to make the deep
+            // case constant, and is not what this change did.
+            Operation::ListPhotosWindowFirst => {
+                OperationInfo::fixed("list_photos_window_first", 3_000.0)
+            }
+            Operation::ListPhotosWindowDeep => {
+                OperationInfo::scaled("list_photos_window_deep", 6_000.0)
+            }
             Operation::ListPhotosTagFilter => {
                 OperationInfo::scaled("list_photos_tag_filter", 10_000.0)
             }
@@ -412,6 +487,9 @@ impl Operation {
                 OperationInfo::scaled("list_tags_with_counts", 20_000.0)
             }
             Operation::VolumeReachability => OperationInfo::fixed("volume_reachability", 1_000.0),
+            Operation::GridStatusesWindow => {
+                OperationInfo::fixed("grid_statuses_window", 5_000.0)
+            }
             Operation::GridBadgesWindow => OperationInfo::fixed("grid_badges_window", 5_000.0),
             Operation::GridBadgesAllReturnedIds => {
                 OperationInfo::scaled("grid_badges_all_returned_ids", 20_000.0)
@@ -615,82 +693,97 @@ impl TempCatalog {
     }
 }
 
-struct ListPhotosQuery {
-    tag_id: Option<i64>,
-    facets: Vec<String>,
-    culling_filter: &'static str,
-    storage_tier: &'static str,
-    camera: Option<&'static str>,
-    lens: Option<&'static str>,
-    labels: Vec<String>,
-    sort: Option<&'static str>,
+/// The harness's library queries, as the same [`PhotoQuery`] value the grid sends.
+/// Building them from the real type (rather than a parallel harness-only struct) means a
+/// field added to the query cannot be measured with a stale shape.
+mod queries {
+    use super::{PhotoQuery, PhotoSort, StorageTier};
+
+    pub fn all_date() -> PhotoQuery {
+        PhotoQuery::default()
+    }
+
+    pub fn tag_date(tag_id: i64) -> PhotoQuery {
+        PhotoQuery {
+            tag_id: Some(tag_id),
+            ..all_date()
+        }
+    }
+
+    pub fn single_facet_and_sort() -> PhotoQuery {
+        PhotoQuery {
+            facets: vec!["has-gps".to_string()],
+            storage_tier: StorageTier::Local,
+            sort: PhotoSort::SharpnessAsc,
+            ..all_date()
+        }
+    }
+
+    pub fn combined_facets_and_filters() -> PhotoQuery {
+        PhotoQuery {
+            facets: vec!["has-gps".to_string(), "mobile".to_string()],
+            camera: Some("Camera 00".to_string()),
+            labels: vec!["Red".to_string()],
+            sort: PhotoSort::SharpnessDesc,
+            ..all_date()
+        }
+    }
+
+    pub fn offline_nas_date() -> PhotoQuery {
+        PhotoQuery {
+            storage_tier: StorageTier::Nas,
+            ..all_date()
+        }
+    }
 }
 
-impl ListPhotosQuery {
-    fn all_date() -> Self {
-        Self {
-            tag_id: None,
-            facets: Vec::new(),
-            culling_filter: "all",
-            storage_tier: "all",
-            camera: None,
-            lens: None,
-            labels: Vec::new(),
-            sort: Some("date"),
-        }
-    }
+/// Run a query for every matching row (what the grid asked for before windowing) and
+/// account for it as the `list_photos` command would be.
+fn measure_list(catalog: &Catalog, query: &PhotoQuery) -> Result<Measured<Vec<super::Photo>>> {
+    let photos = catalog.list_photos(query)?;
+    let rows = photos.len();
+    let payload = list_photos_payload(query, &photos);
+    Ok(Measured::new(photos, Some(rows), Some(payload)))
+}
 
-    fn tag_date(tag_id: i64) -> Self {
-        Self {
-            tag_id: Some(tag_id),
-            ..Self::all_date()
-        }
-    }
+/// Run one window of a query through `photo_page` — the whole path the grid uses when it
+/// asks for a slice, including the `COUNT` that gives it the total.
+fn measure_page(
+    catalog: &Catalog,
+    query: &PhotoQuery,
+    window: PhotoWindow,
+) -> Result<Measured<PageSummary>> {
+    let windowed = PhotoQuery {
+        window: Some(window),
+        ..query.clone()
+    };
+    let page = catalog.photo_page(&windowed)?;
+    let payload = list_photos_payload(&windowed, &page);
+    let summary = PageSummary {
+        offset: page.offset,
+        returned: page.photos.len(),
+        total: page.total,
+    };
+    Ok(Measured::new(summary, Some(summary.returned), Some(payload)))
+}
 
-    fn single_facet_and_sort() -> Self {
-        Self {
-            facets: vec!["has-gps".to_string()],
-            storage_tier: "local",
-            sort: Some("sharpness_asc"),
-            ..Self::all_date()
-        }
-    }
+/// The measured windows, reported side by side: a deep window costing what a shallow one
+/// does is the claim windowing rests on.
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WindowSummaries {
+    first: PageSummary,
+    deep: PageSummary,
+}
 
-    fn combined_facets_and_filters() -> Self {
-        Self {
-            facets: vec!["has-gps".to_string(), "mobile".to_string()],
-            camera: Some("Camera 00"),
-            labels: vec!["Red".to_string()],
-            sort: Some("sharpness_desc"),
-            ..Self::all_date()
-        }
-    }
-
-    fn offline_nas_date() -> Self {
-        Self {
-            storage_tier: "nas",
-            ..Self::all_date()
-        }
-    }
-
-    fn measure(&self, catalog: &Catalog) -> Result<Measured<Vec<super::Photo>>> {
-        let photos = catalog.list_photos(
-            self.tag_id,
-            None,
-            None,
-            &self.facets,
-            self.culling_filter,
-            None,
-            self.storage_tier,
-            self.camera,
-            self.lens,
-            &self.labels,
-            self.sort,
-        )?;
-        let rows = photos.len();
-        let payload = list_photos_payload(self, &photos);
-        Ok(Measured::new(photos, Some(rows), Some(payload)))
-    }
+/// What one measured window returned — enough to see that a deep window is the same size
+/// as a shallow one and that the total is the whole matching set, not the window.
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PageSummary {
+    offset: usize,
+    returned: usize,
+    total: usize,
 }
 
 fn seed_catalog(catalog: &Catalog, photo_root: &Path, config: &HarnessConfig) -> Result<SeedData> {
@@ -1068,6 +1161,35 @@ fn measure_resolver(
     })
 }
 
+/// Storage status for a set of ids — the one badge side query production still makes, and
+/// it makes it per visible window (issue #10).
+fn measure_grid_statuses(
+    catalog: &Catalog,
+    volume_health: &crate::volume_health::VolumeHealth,
+    photo_ids: &[i64],
+) -> Result<BadgeMeasurement> {
+    let reachable = load_volume_reachability(catalog, volume_health)?;
+    let statuses =
+        crate::commands::grid_photo_statuses_with_reachability(catalog, photo_ids, &reachable)?;
+    let payload_bytes = command_payload(
+        "photo_statuses",
+        json!({ "photoIds": photo_ids }),
+        &statuses,
+    );
+    Ok(BadgeMeasurement {
+        summary: BadgeSummary {
+            requested_ids: photo_ids.len(),
+            storage_rows: statuses.len(),
+            version_rows: 0,
+            statuses: count_statuses(&statuses),
+        },
+        payload_bytes,
+    })
+}
+
+/// Both badge maps for a set of ids — what a refresh cost *before* the version count moved
+/// onto the row and the status fetch moved to the visible window. Kept as the baseline the
+/// harness report compares against.
 fn measure_grid_badges(
     catalog: &Catalog,
     volume_health: &crate::volume_health::VolumeHealth,
@@ -1266,24 +1388,10 @@ fn table_count_where(catalog: &Catalog, table: &str, predicate: &str) -> Result<
         .query_row(&sql, [], |row| row.get::<_, i64>(0))? as usize)
 }
 
-fn list_photos_payload<T: Serialize>(query: &ListPhotosQuery, response: &T) -> PayloadBytes {
-    command_payload(
-        "list_photos",
-        json!({
-            "tagId": query.tag_id,
-            "albumId": Option::<i64>::None,
-            "batchId": Option::<i64>::None,
-            "facets": &query.facets,
-            "cullingFilter": query.culling_filter,
-            "smartAlbumId": Option::<i64>::None,
-            "storageTier": query.storage_tier,
-            "camera": query.camera,
-            "lens": query.lens,
-            "labels": &query.labels,
-            "sort": query.sort,
-        }),
-        response,
-    )
+/// The IPC request is now the serialized query itself, so this cannot drift from what the
+/// command actually receives (it used to be a hand-copied `json!` of eleven arguments).
+fn list_photos_payload<T: Serialize>(query: &PhotoQuery, response: &T) -> PayloadBytes {
+    command_payload("list_photos", json!({ "query": query }), response)
 }
 
 fn command_payload<T: Serialize>(

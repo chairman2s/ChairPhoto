@@ -5,7 +5,7 @@
 //! ever launched. Each test exercises one branch of the completion state machine:
 //! happy path, error path, forwarded (exit-0-without-output) + cancel, and size-stability.
 
-use chairphoto_lib::catalog::Catalog;
+use chairphoto_lib::catalog::{Catalog, PhotoQuery};
 use chairphoto_lib::rapidraw::{run_roundtrip, Resolved};
 use chairphoto_lib::scanner::scan_folder;
 use std::path::{Path, PathBuf};
@@ -48,7 +48,7 @@ fn setup(tag: &str) -> (common::TestSubPath, PathBuf, PathBuf, i64) {
     let catalog = Catalog::open(&db_path, &root).unwrap();
     scan_folder(&catalog, &root, &chairphoto_lib::scanner::never_abort(), &|_| {}).unwrap();
     let photos = catalog
-        .list_photos(None, None, None, &[], "all", None, "all", None, None, &[], None)
+        .list_photos(&PhotoQuery::default())
         .unwrap();
     let source_id = photos
         .iter()

@@ -10,11 +10,9 @@ import {
   DeepLinkView,
   getPhotoByUuid,
   initCatalog,
-  listPhotos,
   onCatalogSwitched,
   onDeepLinkPhoto,
   onDeepLinkTag,
-  PhotoSort,
   PhotoVersion,
   listTags,
   moveTag,
@@ -63,13 +61,11 @@ import {
   getSetting,
   listPendingOperations,
   listVolumes,
-  photoStatuses,
   reconcileNow,
   StorageStatus,
-  StorageTier,
   summarizePendingIdentity,
-  versionCounts,
 } from "./modules/api";
+import { useLibrarySession } from "./modules/librarySession";
 import { CatalogGrid } from "./components/CatalogGrid";
 import { Splash, BOOT_STAGES } from "./components/Splash";
 import { TagPanel } from "./components/TagPanel";
@@ -145,9 +141,6 @@ export default function App() {
     if (bootDone.current.init && bootDone.current.photos) setBootStage(null);
   };
   const [status, setStatus] = useState("");
-  const [photos, setPhotos] = useState<Photo[]>([]);
-  const [statuses, setStatuses] = useState<Map<number, StorageStatus>>(new Map());
-  const [versionCnt, setVersionCounts] = useState<Map<number, number>>(new Map());
   // Per-photo thumbnail cache-bust, bumped after a photo's file is recovered
   // (relocate / retrieve-from-NAS) so its tile refreshes instead of staying black.
   const [thumbBusts, setThumbBusts] = useState<Map<number, number>>(new Map());
@@ -170,32 +163,25 @@ export default function App() {
   const [editedSrc, setEditedSrc] = useState<string>("");
   const [develop, setDevelop] = useState(false); // the Develop (editor) view is active
   const [tags, setTags] = useState<TagWithCount[]>([]);
-  const [activeTagId, setActiveTagId] = useState<number | null>(null);
-  const [activeAlbumId, setActiveAlbumId] = useState<number | null>(null);
   const [albumsKey, setAlbumsKey] = useState(0); // bump to refresh album counts
-  const [activeBatchId, setActiveBatchId] = useState<number | null>(null);
-  const [activeBatch, setActiveBatch] = useState<ImportBatch | null>(null);
   const [batchesKey, setBatchesKey] = useState(0); // bump to refresh batches
-  const [activeSmartAlbumId, setActiveSmartAlbumId] = useState<number | null>(null);
   const [smartAlbumsKey, setSmartAlbumsKey] = useState(0); // bump to refresh smart-album counts
-  const [filter, setFilter] = useState<CullingFilter>("all");
-  const [storageTier, setStorageTier] = useState<StorageTier>("all");
-  const [activeFacets, setActiveFacets] = useState<string[]>([]);
-  const [photoSort, setPhotoSort] = useState<PhotoSort>("date");
   // Conservative default: 15.0 (mirrors SOFT_THRESHOLD_DEFAULT in facets.rs).
   const [softThreshold, setSoftThreshold] = useState<number>(15.0);
-  const [activeCamera, setActiveCamera] = useState<string | null>(null);
-  const [activeLens, setActiveLens] = useState<string | null>(null);
-  // Colour-label filter, OR-combined ("" = the No-label dot). Empty = off.
-  const [activeLabels, setActiveLabels] = useState<string[]>([]);
-  const [selectedId, setSelectedId] = useState<number | null>(null); // active/primary
-  const [selectedIds, setSelectedIds] = useState<number[]>([]); // full selection
-  // Fixed anchor for Shift range selection (mouse Shift-click and Shift+Arrow). Set on any
-  // plain/toggle selection; the range spans anchor↔active while Shift extends it. A ref so
-  // extending doesn't move the anchor and doesn't trigger re-renders.
-  const selectAnchor = useRef<number | null>(null);
-  const [extraPhoto, setExtraPhoto] = useState<Photo | null>(null); // an off-grid photo (stack child) being viewed
-  const [stackOrigin, setStackOrigin] = useState<number | null>(null); // master to return to from a stack-child view
+
+  // --- the library view -----------------------------------------------------
+  // What the grid is asking for (the scope, and the one typed query derived from it), what
+  // it got back (rows, total, storage badges, and the refresh generation that stops a slow
+  // response from an older filter repainting a newer grid), and what is selected. The
+  // shell owns none of that state any more: see modules/librarySession.ts (issue #15) and
+  // modules/libraryQuery.ts (issue #10). What stays here is the composition — which panel
+  // gets which verb, and which surface is on screen.
+  const library = useLibrarySession();
+  const { photos, statuses, scope, selection } = library;
+  // Normally the active photo is the selected grid tile. A stacked child (hidden from the
+  // grid) can also be opened for viewing via `library.viewPhoto`; the session holds it
+  // aside so the loupe/inspector can show it even though it isn't in `photos`.
+  const selected = selection.active;
   const [loupeInline, setLoupeInline] = useState(false);
   const [cachePreviews, setCachePreviews] = useState(true);
 
@@ -279,76 +265,29 @@ export default function App() {
   // Right-click context menu on a grid tile.
   const [ctxMenu, setCtxMenu] = useState<{ x: number; y: number; photoId: number } | null>(null);
 
-  // Normally the active photo is the selected grid tile. A stacked child (hidden from the
-  // grid) can also be opened for viewing via `viewPhoto`; it's held in `extraPhoto` so the
-  // loupe/inspector can show it even though it isn't in `photos`.
-  const selected =
-    photos.find((p) => p.id === selectedId) ??
-    (extraPhoto && extraPhoto.id === selectedId ? extraPhoto : null);
-
   // Full-surface views contributed by modules (e.g. Map). The active one, if its
   // module is still enabled — otherwise we fall back to the built-in Library view.
   const moduleViews = mainViews();
   const activeView = moduleViews.find((v) => v.id === activeViewId) ?? null;
   // The Basic Editor module gates the Develop view and per-version editing.
   const canEdit = activeEditRenderer() !== null;
-  const inDevelop = develop && selectedId != null && canEdit;
+  const inDevelop = develop && selection.activeId != null && canEdit;
 
-  // Select a photo with modifier-key semantics: plain = single; Ctrl/Cmd = toggle;
-  // Shift = range from the active anchor. `selectedId` is the active/primary photo
-  // (shown in the inspector/loupe); `selectedIds` is the whole selection.
-  const selectPhoto = (id: number, mods?: { ctrl?: boolean; shift?: boolean }) => {
-    const anchor = selectAnchor.current ?? selectedId;
-    if (mods?.shift && anchor != null) {
-      selectAnchor.current = anchor; // pin it, so further Shift steps span the same origin
-      const a = photos.findIndex((p) => p.id === anchor);
-      const b = photos.findIndex((p) => p.id === id);
-      if (a !== -1 && b !== -1) {
-        const [lo, hi] = a < b ? [a, b] : [b, a];
-        setSelectedIds(photos.slice(lo, hi + 1).map((p) => p.id));
-      }
-    } else if (mods?.ctrl) {
-      setSelectedIds((prev) =>
-        prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id],
-      );
-      selectAnchor.current = id; // subsequent Shift ranges from this toggle
-    } else {
-      setSelectedIds([id]);
-      selectAnchor.current = id;
-    }
-    setSelectedId(id);
-    setExtraPhoto(null); // a grid selection supersedes an off-grid stack-child view
-    setStackOrigin(null);
-  };
-
-  // View any stack member in the loupe. A grid photo (the master) selects normally; a stacked
-  // child is off-grid, so it's held in `extraPhoto` and we remember its master for the loupe's
-  // "Back to original" shortcut.
-  const viewPhoto = (p: Photo) => {
-    if (photos.some((g) => g.id === p.id)) {
-      setExtraPhoto(null);
-      setStackOrigin(null);
-    } else {
-      setExtraPhoto(p);
-      setStackOrigin(p.stackParentId ?? selectedId);
-    }
-    setSelectedId(p.id);
-    setSelectedIds([p.id]);
+  // Open any stack member in the inline loupe. Which photo is *selected* is the session's
+  // business (a stacked child is off-grid, so it holds it aside); which surface is on
+  // screen is the shell's.
+  const viewPhotoInLoupe = (p: Photo) => {
+    library.viewPhoto(p);
     setLoupeInline(true);
-  };
-
-  // Return from a stacked-child view to its master (the original grid photo).
-  const backToOriginal = () => {
-    const origin = stackOrigin;
-    setStackOrigin(null);
-    if (origin != null) selectPhoto(origin);
   };
 
   // The version to broadcast to the pop-out loupe: the active version's edit record,
   // guarded to the selected photo — on photo change the broadcast effect can fire
   // before the reset-version effect, so a stale other-photo version must not leak.
   const loupeEditJson =
-    activeVersion && activeVersion.photoId === selectedId ? activeVersion.editJson : null;
+    activeVersion && activeVersion.photoId === selection.activeId
+      ? activeVersion.editJson
+      : null;
 
   // Keep any open pop-out loupe window in sync with the current selection and the
   // active version (so picking a version updates the pop-out too), and
@@ -357,21 +296,21 @@ export default function App() {
   // invariant). We prefetch further ahead than behind, since culling moves forward:
   // the next 5 photos and the previous 2.
   useEffect(() => {
-    broadcastPhoto(selectedId, loupeEditJson);
-    if (selectedId == null) return;
-    const idx = photos.findIndex((p) => p.id === selectedId);
+    broadcastPhoto(selection.activeId, loupeEditJson);
+    if (selection.activeId == null) return;
+    const idx = photos.findIndex((p) => p.id === selection.activeId);
     if (idx === -1) return;
     for (let d = 1; d <= 5; d++) prefetch(photos[idx + d]?.id);
     prefetch(photos[idx - 1]?.id);
     prefetch(photos[idx - 2]?.id);
-  }, [selectedId, loupeEditJson, photos]);
+  }, [selection.activeId, loupeEditJson, photos]);
 
   useEffect(() => {
-    const unlisten = onLoupeReady(() => broadcastPhoto(selectedId, loupeEditJson));
+    const unlisten = onLoupeReady(() => broadcastPhoto(selection.activeId, loupeEditJson));
     return () => {
       unlisten.then((f) => f());
     };
-  }, [selectedId, loupeEditJson]);
+  }, [selection.activeId, loupeEditJson]);
 
   // --- chairphoto://<uuid>[/loupe|/develop] deep links ----------------------
   // A link (e.g. from an Obsidian note) opens/focuses the app on that photo —
@@ -400,22 +339,12 @@ export default function App() {
     pendingDeepLink.current = null;
     getPhotoByUuid(uuid)
       .then((p) => {
-        // The photo may be outside the current scope — clear every primary
-        // filter and chip so the unfiltered grid contains it. Changing these
-        // changes `refresh`'s identity, so the list effect re-fetches.
+        // The photo may be outside the current scope — widen to the whole library so the
+        // grid contains it. That changes the query, hence `refresh`'s identity, so the
+        // list effect re-fetches.
         setActiveViewId(null); // back to Library
         setDevelop(false);
-        setActiveTagId(null);
-        setActiveAlbumId(null);
-        setActiveBatchId(null);
-        setActiveBatch(null);
-        setActiveSmartAlbumId(null);
-        setFilter("all");
-        setStorageTier("all");
-        setActiveFacets([]);
-        setActiveCamera(null);
-        setActiveLens(null);
-        setActiveLabels([]);
+        library.clearScope();
         setDeepLinkTarget({ photo: p, view }); // selection happens once the grid has it
       })
       .catch(() => setStatus(`Deep link: no photo ${uuid} in this catalog`));
@@ -423,7 +352,7 @@ export default function App() {
 
   // Select the staged target once the (now unfiltered) photo list contains it,
   // then apply the requested surface. A stacked child never appears in the grid —
-  // view it off-grid via `viewPhoto`. The stackParentId guard keeps the stale-list
+  // view it off-grid via `viewPhotoInLoupe`. The stackParentId guard keeps the stale-list
   // race (this effect fires once with the old filtered list) from prematurely
   // falling back for a grid photo.
   useEffect(() => {
@@ -436,11 +365,11 @@ export default function App() {
       else if (view === "develop") setDevelop(true);
     };
     if (photos.some((p) => p.id === target.id)) {
-      selectPhoto(target.id);
+      library.select(target.id);
       applyView();
       setDeepLinkTarget(null);
     } else if (target.stackParentId != null) {
-      viewPhoto(target); // already opens the inline loupe
+      viewPhotoInLoupe(target); // already opens the inline loupe
       applyView();
       setDeepLinkTarget(null);
     }
@@ -473,7 +402,7 @@ export default function App() {
     }
     setActiveViewId(null); // back to Library
     setDevelop(false);
-    selectTag(tag.id); // clears the other primary scopes
+    library.selectTag(tag.id); // clears the other primary scopes
   }, [ready, tagLinkTick, tags]);
 
   // Open the default catalog once on startup, then start the plugin host. Each step
@@ -516,9 +445,8 @@ export default function App() {
   // Keep the plugin host's notion of the selection in sync, so modules (e.g. AI
   // tagging) can act on the active photo or the whole multi-selection.
   useEffect(() => {
-    const sel = photos.filter((p) => selectedIds.includes(p.id));
-    setSelection(sel, selectedId);
-  }, [selectedIds, selectedId, photos]);
+    setSelection(selection.photos, selection.activeId);
+  }, [selection.photos, selection.activeId]);
 
   // Keep the host's active-version in sync so publishing modules can default to the
   // version the user is viewing.
@@ -529,8 +457,8 @@ export default function App() {
   // Keep the host's filter context in sync so modules (e.g. Statistics) can reflect
   // the active sidebar scope (tag / album / import batch).
   useEffect(() => {
-    setFilterContext({ tagId: activeTagId, albumId: activeAlbumId, batchId: activeBatchId });
-  }, [activeTagId, activeAlbumId, activeBatchId]);
+    setFilterContext({ tagId: scope.tagId, albumId: scope.albumId, batchId: scope.batchId });
+  }, [scope.tagId, scope.albumId, scope.batchId]);
 
   // Keep the host's editing-tag in sync so "tag-editor" slot panels (e.g. the
   // Obsidian tag note) know which tag the tag editor modal is showing.
@@ -548,35 +476,13 @@ export default function App() {
     return () => window.removeEventListener("keydown", onKey);
   }, [ctxMenu]);
 
+  // Re-run the library query and reload the tag tree. The photo rows, their badges and the
+  // stale-response guard live in `useLibrarySession`; the tag tree is the shell's own.
+  const refreshLibrary = library.refresh;
   const refresh = useCallback(async () => {
-    const [nextPhotos, nextTags] = await Promise.all([
-      listPhotos(
-        activeTagId,
-        activeAlbumId,
-        activeBatchId,
-        activeFacets,
-        filter,
-        activeSmartAlbumId,
-        storageTier,
-        activeCamera,
-        activeLens,
-        photoSort,
-        activeLabels,
-      ),
-      listTags(),
-    ]);
-    setPhotos(nextPhotos);
+    const [, nextTags] = await Promise.all([refreshLibrary(), listTags()]);
     setTags(nextTags);
-    const ids = nextPhotos.map((p) => p.id);
-    // Fetch storage status for the visible set (for the grid's local/NAS icons).
-    photoStatuses(ids)
-      .then((pairs) => setStatuses(new Map(pairs)))
-      .catch(() => setStatuses(new Map()));
-    // Version counts for the grid's "N versions" badge.
-    versionCounts(ids)
-      .then((pairs) => setVersionCounts(new Map(pairs)))
-      .catch(() => setVersionCounts(new Map()));
-  }, [activeTagId, activeAlbumId, activeBatchId, activeSmartAlbumId, activeFacets, filter, storageTier, activeCamera, activeLens, activeLabels, photoSort]);
+  }, [refreshLibrary]);
 
   // --- recovery actions for a photo whose original can't be shown ----------
   // Shared by the right-click menu and the loupe's "unavailable" state.
@@ -625,53 +531,9 @@ export default function App() {
     }
   };
 
-  // The tag / album / batch / smart-album scopes are mutually exclusive: each is a single
-  // primary filter (the culling chips + facets still AND on top, see docs/smart-albums.md).
-  // Picking one clears the other three.
-  const selectTag = (tagId: number | null) => {
-    setActiveTagId(tagId);
-    if (tagId != null) {
-      setActiveAlbumId(null);
-      setActiveBatchId(null);
-      setActiveBatch(null);
-      setActiveSmartAlbumId(null);
-    }
-  };
-  const selectAlbum = (albumId: number | null) => {
-    setActiveAlbumId(albumId);
-    if (albumId != null) {
-      setActiveTagId(null);
-      setActiveBatchId(null);
-      setActiveBatch(null);
-      setActiveSmartAlbumId(null);
-    }
-  };
-  const selectBatch = (batch: ImportBatch | null) => {
-    setActiveBatchId(batch?.id ?? null);
-    setActiveBatch(batch);
-    if (batch != null) {
-      setActiveTagId(null);
-      setActiveAlbumId(null);
-      setActiveSmartAlbumId(null);
-    }
-  };
-  const selectSmartAlbum = (smartAlbumId: number | null) => {
-    setActiveSmartAlbumId(smartAlbumId);
-    if (smartAlbumId != null) {
-      setActiveTagId(null);
-      setActiveAlbumId(null);
-      setActiveBatchId(null);
-      setActiveBatch(null);
-    }
-  };
-
   // Add the current selection (or active photo) to an album.
   const addSelectionToAlbum = async (albumId: number) => {
-    const targets = selectedIds.length
-      ? selectedIds
-      : selectedId != null
-        ? [selectedId]
-        : [];
+    const targets = selection.targets;
     if (!targets.length) return;
     await addPhotosToAlbum(albumId, targets);
     setStatus(`Added ${targets.length} to album`);
@@ -700,12 +562,7 @@ export default function App() {
   // Assign a tag to the whole current selection (or the active photo) — used by the
   // quick-tag bar.
   const assignToSelection = async (tagId: number) => {
-    const targets = selectedIds.length
-      ? selectedIds
-      : selectedId != null
-        ? [selectedId]
-        : [];
-    for (const id of targets) await assignTag(id, tagId);
+    for (const id of selection.targets) await assignTag(id, tagId);
     await refresh();
     setGroupsKey((k) => k + 1); // refresh the quick-tag bar's "Recently used" group
   };
@@ -714,12 +571,7 @@ export default function App() {
   // tag list shows the active photo's tags, but the remove action applies to every
   // selected photo so multi-select edits don't silently hit only the active one.
   const removeFromSelection = async (tagId: number) => {
-    const targets = selectedIds.length
-      ? selectedIds
-      : selectedId != null
-        ? [selectedId]
-        : [];
-    for (const id of targets) await removeTag(id, tagId);
+    for (const id of selection.targets) await removeTag(id, tagId);
     await refresh();
     setGroupsKey((k) => k + 1);
   };
@@ -734,11 +586,7 @@ export default function App() {
   };
   const pasteTagsToSelection = async () => {
     if (tagClipboard.length === 0) return;
-    const targets = selectedIds.length
-      ? selectedIds
-      : selectedId != null
-        ? [selectedId]
-        : [];
+    const targets = selection.targets;
     if (targets.length === 0) return;
     for (const id of targets) for (const tagId of tagClipboard) await assignTag(id, tagId);
     await refresh();
@@ -764,20 +612,18 @@ export default function App() {
     setNavSink({
       filterByTag: (tagId) => {
         setActiveViewId(null); // back to Library
-        selectTag(tagId);
+        library.selectTag(tagId);
       },
       selectPhoto: (photoId) => {
         setActiveViewId(null);
-        setSelectedId(photoId);
-        setSelectedIds([photoId]);
+        library.selectQuiet(photoId);
       },
       selectPhotoSilent: (photoId) => {
         // Update app-wide selection (loupe follows), but do NOT change the active view.
-        setSelectedId(photoId);
-        setSelectedIds([photoId]);
+        library.selectQuiet(photoId);
       },
     });
-  }, []);
+  }, [library.selectTag, library.selectQuiet]);
 
   const refreshPending = useCallback(async () => {
     try {
@@ -888,9 +734,9 @@ export default function App() {
   // all visible photos if nothing is selected. Groups into H15b clusters, flags
   // soft-in-burst / sharpest-of-burst, then refreshes the grid.
   const runBurstAnalysis = async () => {
-    const targets = selectedIds.length
-      ? selectedIds
-      : photos.map((p) => p.id);
+    // Unlike the tagging actions, the fallback here is the whole *view*, not the active
+    // photo: "analyse this burst" with nothing selected means the grid in front of you.
+    const targets = selection.ids.length ? selection.ids : photos.map((p) => p.id);
     if (targets.length === 0) {
       setStatus("No photos to analyse — scan or select some first.");
       return;
@@ -993,25 +839,12 @@ export default function App() {
   // then refresh the photo list and tags against the new catalog.
   useEffect(() => {
     const unlisten = onCatalogSwitched(() => {
-      // Selection
-      setSelectedId(null);
-      setSelectedIds([]);
-      selectAnchor.current = null;
-      setExtraPhoto(null);
-      setStackOrigin(null);
-      // Filters / scope
-      setActiveTagId(null);
-      setActiveAlbumId(null);
-      setActiveBatchId(null);
-      setActiveBatch(null);
-      setActiveSmartAlbumId(null);
-      setFilter("all");
-      setStorageTier("all");
-      setActiveFacets([]);
-      setPhotoSort("date");
-      setActiveCamera(null);
-      setActiveLens(null);
-      setActiveLabels([]);
+      // The library session: scope, selection, Shift anchor, and the rows themselves.
+      // Every id in there names something in the catalog that just closed. Dropping the
+      // rows immediately also stops the previous catalog's photos being on screen (with
+      // stale ids) while the new query resolves, and disowns a refresh still running
+      // against it. See modules/librarySession.ts.
+      library.reset();
       // View state
       setActiveViewId(null);
       setDevelop(false);
@@ -1031,10 +864,8 @@ export default function App() {
       // normally calls `refreshIdentityDebtCount` never re-fires on a catalog switch;
       // call it directly below instead of relying on that effect.
       setIdentityDebtCount(null);
-      // Clear photo/tag arrays immediately so the grid shows nothing while the
-      // async refresh resolves — prevents the previous catalog's rows from being
-      // visible (with stale IDs) during the switch.
-      setPhotos([]);
+      // The tag tree is the shell's, not the session's — clear it here for the same
+      // reason the session clears its rows.
       setTags([]);
       // Reload keys — bump so sidebar panels re-query the new catalog.
       setAlbumsKey((k) => k + 1);
@@ -1046,9 +877,9 @@ export default function App() {
       setEditingTag(null);
       // Status
       setStatus("Catalog opened.");
-      // NOTE: do NOT call refresh() here. The dependency-chain useEffect([ready, refresh])
-      // below will fire once the state resets above have committed and the new `refresh`
-      // closure has stabilised with clean filter/tag/album deps. Calling refresh() here
+      // NOTE: do NOT call refresh() here. `library.reset()` invalidates the query, so the
+      // dependency-chain useEffect([ready, refresh]) above fires once the resets have
+      // committed and `refresh` has stabilised on a clean scope. Calling refresh() here
       // would capture the OLD closure (stale filter state) and query the new catalog with
       // tag/album IDs that belonged to the previous catalog, producing a flash of wrong data.
       //
@@ -1060,31 +891,32 @@ export default function App() {
     return () => {
       unlisten.then((f) => f());
     };
-  }, [refresh, refreshIdentityDebtCount]);
+  }, [library.reset, refreshIdentityDebtCount]);
 
   // Reset the active version to Original whenever the selected photo changes.
   useEffect(() => {
     setActiveVersion(null);
     setEditedSrc("");
-  }, [selectedId]);
+  }, [selection.activeId]);
 
   // Render the active version's edit for the loupe (via the editing module's renderer).
   // Falls back to the unedited preview when there's no version, no renderer, or on error.
   useEffect(() => {
     const renderer = activeEditRenderer();
-    if (selectedId == null || activeVersion == null || !renderer) {
+    const photoId = selection.activeId;
+    if (photoId == null || activeVersion == null || !renderer) {
       setEditedSrc("");
       return;
     }
     let cancelled = false;
     renderer
-      .render(selectedId, parseEdit(activeVersion.editJson) as Record<string, unknown>)
+      .render(photoId, parseEdit(activeVersion.editJson) as Record<string, unknown>)
       .then((url) => !cancelled && setEditedSrc(url))
       .catch(() => !cancelled && setEditedSrc(""));
     return () => {
       cancelled = true;
     };
-  }, [selectedId, activeVersion]);
+  }, [selection.activeId, activeVersion]);
 
   // Zoom-in render for the active version (ZoomableImage fetches it lazily on first
   // zoom): the same edit over the native-size preview, so a cropped version has real
@@ -1092,11 +924,12 @@ export default function App() {
   // doesn't offer a hi-res variant.
   const renderHiVersion = useCallback(() => {
     const renderHi = activeEditRenderer()?.renderHi;
-    if (selectedId == null || activeVersion == null || !renderHi) {
+    const photoId = selection.activeId;
+    if (photoId == null || activeVersion == null || !renderHi) {
       return Promise.resolve("");
     }
-    return renderHi(selectedId, parseEdit(activeVersion.editJson) as Record<string, unknown>);
-  }, [selectedId, activeVersion]);
+    return renderHi(photoId, parseEdit(activeVersion.editJson) as Record<string, unknown>);
+  }, [selection.activeId, activeVersion]);
 
   // Kick off a background import from a card. The ImportPanel collects the source folder
   // and optional name, then closes; progress shows in the topbar via import:progress.
@@ -1134,33 +967,21 @@ export default function App() {
 
       // Ctrl/Cmd+A: select every photo in the current view (works with nothing selected yet).
       if ((e.ctrlKey || e.metaKey) && key === "a") {
-        if (photos.length) {
-          setSelectedIds(photos.map((p) => p.id));
-          const active = selectedId ?? photos[0].id;
-          setSelectedId(active);
-          selectAnchor.current = active;
-        }
+        library.selectAll();
         e.preventDefault();
         return;
       }
 
       if (!selected) return; // the shortcuts below act on the active photo
-      const idx = photos.findIndex((p) => p.id === selected.id);
-      const single = (id: number) => {
-        setSelectedId(id);
-        setSelectedIds([id]);
-        selectAnchor.current = id; // plain navigation resets the Shift anchor
-      };
-      // Auto-advance to the next photo after a cull decision (single-selection only).
-      const advance = () => {
-        if (idx < photos.length - 1) single(photos[idx + 1].id);
-      };
       // Culling applies to the whole selection (batch) — advance only if culling one.
-      const targets = selectedIds.length ? selectedIds : [selected.id];
+      const targets = selection.targets;
       const applyAll = async (fn: (id: number) => Promise<unknown>) => {
         for (const id of targets) await fn(id);
         await refresh();
-        if (targets.length === 1) advance();
+        // Auto-advance after a cull decision, over the rows this handler was created
+        // with — not the ones the refresh above just produced, from which the photo that
+        // was just rated may have dropped out of the current filter.
+        if (targets.length === 1) library.stepActive(1);
       };
 
       if (e.key === "Enter") {
@@ -1169,15 +990,9 @@ export default function App() {
         setLoupeInline(false);
       } else if (e.key === "ArrowRight" || e.key === "ArrowDown") {
         // Shift extends the selection from the anchor; plain moves a single selection.
-        if (idx < photos.length - 1) {
-          if (e.shiftKey) selectPhoto(photos[idx + 1].id, { shift: true });
-          else single(photos[idx + 1].id);
-        }
+        library.stepActive(1, e.shiftKey);
       } else if (e.key === "ArrowLeft" || e.key === "ArrowUp") {
-        if (idx > 0) {
-          if (e.shiftKey) selectPhoto(photos[idx - 1].id, { shift: true });
-          else single(photos[idx - 1].id);
-        }
+        library.stepActive(-1, e.shiftKey);
       } else if (key >= "0" && key <= "5") {
         await applyAll((id) => setRating(id, parseInt(key, 10)));
       } else if (key === "p") {
@@ -1195,7 +1010,17 @@ export default function App() {
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
-  }, [selected, selectedId, selectedIds, photos, refresh, activeView, inDevelop]);
+    // `selectAll`/`stepActive` close over the rows and the active photo, so they stand in
+    // for the `photos`/`selectedId` dependencies the handler used to name itself.
+  }, [
+    selected,
+    selection.targets,
+    library.selectAll,
+    library.stepActive,
+    refresh,
+    activeView,
+    inDevelop,
+  ]);
 
   return (
     <div className="app">
@@ -1330,7 +1155,7 @@ export default function App() {
         <button
           className="btn-ghost"
           onClick={() => setShowExport(true)}
-          disabled={selectedIds.length === 0 && selectedId == null}
+          disabled={selection.targets.length === 0}
           title="Export the selected photo(s) to files (RAW + XMP, or JPEG)"
         >
           Export
@@ -1338,7 +1163,7 @@ export default function App() {
         <button
           className="btn-ghost"
           onClick={() => setShowPublish(true)}
-          disabled={selectedId == null}
+          disabled={selection.activeId == null}
           title="Publish the selected photo to Instagram, Flickr, SmugMug…"
         >
           Publish
@@ -1348,8 +1173,8 @@ export default function App() {
           onClick={runBurstAnalysis}
           disabled={!ready}
           title={
-            selectedIds.length
-              ? `Rank burst sharpness for ${selectedIds.length} selected photo(s)`
+            selection.ids.length
+              ? `Rank burst sharpness for ${selection.ids.length} selected photo(s)`
               : "Rank burst sharpness for all visible photos (H16e)"
           }
         >
@@ -1458,34 +1283,26 @@ export default function App() {
 
       <FilterBar
         filters={FILTERS}
-        filter={filter}
-        onFilter={setFilter}
-        activeTagLabel={tags.find((t) => t.id === activeTagId)?.name ?? null}
-        onClearTag={() => selectTag(null)}
-        activeAlbumId={activeAlbumId}
-        onClearAlbum={() => selectAlbum(null)}
-        activeBatchId={activeBatchId}
-        onClearBatch={() => selectBatch(null)}
-        activeFacets={activeFacets}
-        onToggleFacet={(key) =>
-          setActiveFacets((prev) =>
-            prev.includes(key) ? prev.filter((k) => k !== key) : [...prev, key],
-          )
-        }
-        storageTier={storageTier}
-        onStorageTier={setStorageTier}
-        photoSort={photoSort}
-        onPhotoSort={setPhotoSort}
-        activeCamera={activeCamera}
-        onCamera={setActiveCamera}
-        activeLens={activeLens}
-        onLens={setActiveLens}
-        activeLabels={activeLabels}
-        onToggleLabel={(label) =>
-          setActiveLabels((prev) =>
-            prev.includes(label) ? prev.filter((l) => l !== label) : [...prev, label],
-          )
-        }
+        filter={scope.filter}
+        onFilter={library.setFilter}
+        activeTagLabel={tags.find((t) => t.id === scope.tagId)?.name ?? null}
+        onClearTag={() => library.selectTag(null)}
+        activeAlbumId={scope.albumId}
+        onClearAlbum={() => library.selectAlbum(null)}
+        activeBatchId={scope.batchId}
+        onClearBatch={() => library.selectBatch(null)}
+        activeFacets={scope.facets}
+        onToggleFacet={library.toggleFacet}
+        storageTier={scope.storageTier}
+        onStorageTier={library.setStorageTier}
+        photoSort={scope.sort}
+        onPhotoSort={library.setSort}
+        activeCamera={scope.camera}
+        onCamera={library.setCamera}
+        activeLens={scope.lens}
+        onLens={library.setLens}
+        activeLabels={scope.labels}
+        onToggleLabel={library.toggleLabel}
         reloadKey={groupsKey}
       />
 
@@ -1506,8 +1323,8 @@ export default function App() {
           />
           <TagPanel
             tags={tags}
-            activeTagId={activeTagId}
-            onSelectTag={selectTag}
+            activeTagId={scope.tagId}
+            onSelectTag={library.selectTag}
             onEditTag={setEditingTag}
             onMoveTag={(tagId, newParentId) =>
               moveTag(tagId, newParentId)
@@ -1527,23 +1344,23 @@ export default function App() {
             onTagsChanged={refresh}
           />
           <AlbumsPanel
-            activeAlbumId={activeAlbumId}
-            onSelectAlbum={selectAlbum}
-            selectionCount={selectedIds.length}
+            activeAlbumId={scope.albumId}
+            onSelectAlbum={library.selectAlbum}
+            selectionCount={selection.ids.length}
             onAddSelection={addSelectionToAlbum}
             reloadKey={albumsKey}
           />
           <SmartAlbumsPanel
-            activeSmartAlbumId={activeSmartAlbumId}
-            onSelectSmartAlbum={selectSmartAlbum}
+            activeSmartAlbumId={scope.smartAlbumId}
+            onSelectSmartAlbum={library.selectSmartAlbum}
             // The panel owns the SmartAlbumEditor modal; this just selects the album being
             // edited so the grid previews its rule.
-            onEditRule={(album) => selectSmartAlbum(album.id)}
+            onEditRule={(album) => library.selectSmartAlbum(album.id)}
             reloadKey={smartAlbumsKey}
           />
           <BatchesPanel
-            activeBatchId={activeBatchId}
-            onSelectBatch={selectBatch}
+            activeBatchId={scope.batchId}
+            onSelectBatch={library.selectBatch}
             onExportBatch={setBundleExportBatch}
             reloadKey={batchesKey}
           />
@@ -1575,11 +1392,11 @@ export default function App() {
                 <button className="chip" onClick={() => setLoupeInline(false)}>
                   ‹ Back to grid (Esc)
                 </button>
-                {extraPhoto && stackOrigin != null && (
+                {selection.extraPhoto && selection.stackOrigin != null && (
                   <button
                     className="chip"
                     title="Return to the original this is stacked under"
-                    onClick={backToOriginal}
+                    onClick={library.backToOriginal}
                   >
                     ‹ Back to original
                   </button>
@@ -1693,44 +1510,46 @@ export default function App() {
           ) : (
             <CatalogGrid
               photos={photos}
-              selectedId={selectedId}
-              selectedIds={selectedIds}
+              selectedId={selection.activeId}
+              selectedIds={selection.ids}
               statuses={statuses}
-              versionCounts={versionCnt}
+              onVisibleRange={library.setVisibleRange}
               thumbBusts={thumbBusts}
               softThreshold={softThreshold}
               emptyMessage={
-                storageTier === "nas"
+                scope.storageTier === "nas"
                   ? "No NAS-only photos yet. Older photos move here when offloaded — set a day count in Preferences → Storage → Local / NAS tiering, or click “Offload older now”."
-                  : storageTier === "local" ||
-                      filter !== "all" ||
-                      activeTagId != null ||
-                      activeAlbumId != null ||
-                      activeBatchId != null ||
-                      activeSmartAlbumId != null ||
-                      activeFacets.length > 0 ||
-                      activeLabels.length > 0
+                  : scope.storageTier === "local" ||
+                      scope.filter !== "all" ||
+                      scope.tagId != null ||
+                      scope.albumId != null ||
+                      scope.batchId != null ||
+                      scope.smartAlbumId != null ||
+                      scope.facets.length > 0 ||
+                      scope.labels.length > 0
                     ? "No photos match the current filters."
                     : undefined
               }
-              onSelect={(p, mods) => selectPhoto(p.id, mods)}
+              onSelect={(p, mods) => library.select(p.id, mods)}
               onOpen={(p) => {
-                selectPhoto(p.id);
+                library.select(p.id);
                 setLoupeInline(true);
               }}
               onContextMenu={(p, e) => {
-                selectPhoto(p.id);
+                library.select(p.id);
                 setCtxMenu({ x: e.clientX, y: e.clientY, photoId: p.id });
               }}
             />
           )}
-          {!inDevelop && !activeView && !(loupeInline && selected) && photos.length > 0 && (
+          {!inDevelop && !activeView && !(loupeInline && selected) && library.total > 0 && (
             <div className="grid-statusbar">
-              <span className="grid-statusbar-count">{photos.length.toLocaleString()}</span>
+              {/* The MATCHING count, which a windowed fetch would no longer equal
+                  `photos.length` (issue #10). */}
+              <span className="grid-statusbar-count">{library.total.toLocaleString()}</span>
               <span>photos</span>
-              {selectedIds.length > 1 && (
+              {selection.ids.length > 1 && (
                 <span className="grid-statusbar-sel">
-                  {selectedIds.length.toLocaleString()} selected
+                  {selection.ids.length.toLocaleString()} selected
                 </span>
               )}
             </div>
@@ -1760,17 +1579,17 @@ export default function App() {
               setDevelop(true);
             }}
             clipboardCount={tagClipboard.length}
-            selectionCount={selectedIds.length}
+            selectionCount={selection.ids.length}
             onCopyTags={copyTags}
             onPasteTags={pasteTagsToSelection}
             onAssignTag={assignToSelection}
             onRemoveTag={removeFromSelection}
             onRotate={rotateSelected}
-            onViewPhoto={viewPhoto}
+            onViewPhoto={viewPhotoInLoupe}
           />
           <QuickTagBar
             reloadKey={groupsKey}
-            selectionCount={selectedIds.length}
+            selectionCount={selection.ids.length}
             onAssign={assignToSelection}
             onManage={() => setShowGroups(true)}
           />
@@ -1830,10 +1649,10 @@ export default function App() {
 
       {showExport && (
         <ExportPanel
-          photoIds={selectedIds.length ? selectedIds : selectedId != null ? [selectedId] : []}
+          photoIds={selection.targets}
           versionId={activeVersion?.id ?? null}
           versionName={activeVersion?.name ?? null}
-          activeBatch={activeBatch}
+          activeBatch={scope.batch}
           onExportBatch={(batch) => {
             setShowExport(false);
             setBundleExportBatch(batch);

@@ -37,6 +37,32 @@
  * the culling chip you are already on must not refetch the library. The two resets are the
  * exception: they allocate unconditionally, because after a catalog switch the same
  * filters describe a different catalog and the rows must be fetched again.
+ *
+ * ### What is still missing: `query.window`
+ *
+ * Issue #10 built a windowed query end to end — `PhotoQuery.window`, `PhotoPage.offset`,
+ * `PhotoPage.total`, and a harness that measures it — and left the shell asking for every
+ * matching row, because selection indexes into the row array. The session moved that
+ * indexing behind an interface, but it did not make it windowable, and the remaining work
+ * is not this module's alone:
+ *
+ *  - `select(id, {shift})` finds both ends of the range in `photos`. Over a window, the
+ *    anchor is routinely in an unfetched gap, so a range needs the *ordered ids* of the
+ *    matching set — a query the backend does not expose (`list_photos` returns whole rows)
+ *    — or a selection expressed as a range over the query rather than as concrete ids.
+ *  - `selectAll` and the burst analysis's "all visible photos" would silently shrink to
+ *    the loaded window.
+ *  - `selection.active` resolves the active photo out of `photos`; scrolled far enough
+ *    away it would fall out of the window while the inspector and loupe are still showing
+ *    it, so an active row would have to be pinned.
+ *  - `CatalogGrid` sizes its virtualizer from `photos.length` and maps ids to row indices;
+ *    a windowed result needs `total` plus placeholder rows.
+ *
+ * It is also not a uniform win: the date sort is not index-backed, so a deep window sorts
+ * the matching set *and* walks to its offset. #10 measured ~0.6s for the first window and
+ * ~2.0s for a deep one against ~3.8s unwindowed, over 100k photos
+ * (`catalog/performance_harness.rs`). Cheap at the head, much less so at the tail, and
+ * constant-time paging needs a keyset over an indexed key.
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useLibraryQuery } from "./libraryQuery";

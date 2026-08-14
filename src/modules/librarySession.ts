@@ -287,7 +287,22 @@ export function useLibrarySession(): LibrarySession {
       labels: scope.labels,
       sort: scope.sort,
     }),
-    [scope],
+    // The fields, not the scope object: `batch` rides in the scope for the panels that
+    // need the row, and re-picking the same batch from a reloaded panel list hands over an
+    // equal-but-new object. That must not count as a new question for the backend.
+    [
+      scope.tagId,
+      scope.albumId,
+      scope.batchId,
+      scope.smartAlbumId,
+      scope.facets,
+      scope.filter,
+      scope.storageTier,
+      scope.camera,
+      scope.lens,
+      scope.labels,
+      scope.sort,
+    ],
   );
   const library = useLibraryQuery(query);
   const { photos, requestStatuses, clear: clearLibrary } = library;

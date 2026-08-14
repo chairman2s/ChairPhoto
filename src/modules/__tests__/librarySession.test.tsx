@@ -138,11 +138,15 @@ describe("useLibrarySession — a catalog switch", () => {
     // grid forever after switching between two catalogs the user never filtered.
     const { result } = await sessionWith([1, 2]);
     const before = result.current.query;
+    const beforeRefresh = result.current.refresh;
 
     act(() => result.current.reset());
 
     expect(result.current.query).not.toBe(before);
     expect(result.current.query).toEqual(before);
+    // What the shell actually watches: it re-runs the query when `refresh` changes
+    // identity, which is downstream of the query's.
+    expect(result.current.refresh).not.toBe(beforeRefresh);
   });
 
   it("disowns a refresh still running against the catalog that closed", async () => {
@@ -269,8 +273,15 @@ describe("useLibrarySession — the scope", () => {
     act(() => result.current.selectTag(null));
     expect(result.current.query).toBe(picked);
 
+    // Re-picking the batch that is already the scope, from a panel that has since reloaded
+    // its list: an equal-but-new row object is the same question for the backend.
+    act(() => result.current.selectBatch(BATCH));
+    const batched = result.current.query;
+    act(() => result.current.selectBatch({ ...BATCH }));
+    expect(result.current.query).toBe(batched);
+
     act(() => result.current.setFilter("reject"));
-    expect(result.current.query).not.toBe(picked);
+    expect(result.current.query).not.toBe(batched);
   });
 
   it("toggles facets and labels on and off", () => {

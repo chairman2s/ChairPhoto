@@ -219,7 +219,7 @@ export function useHostEditingTag(): number {
 
 /** Test-only access to the per-channel pub/sub, so subscription/notify semantics — and the
  *  isolation the safe dispatcher below provides — can be unit-tested without a React render.
- *  Mirrors the `__events` convention in `src/__test_stubs__/tauri.ts`. Not part of the host
+ *  Mirrors the `__events` convention in `src/__test_stubs__/tauri-api-event.ts`. Not part of the host
  *  API surface modules use. */
 export const __channels = {
   contributions: contributionsChannel,

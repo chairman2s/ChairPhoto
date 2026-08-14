@@ -36,7 +36,7 @@ import {
   __resetForTests,
 } from "../host";
 import type { ChairPhotoAPI, ChairPhotoModule, Photo } from "../registry";
-import { __events } from "../../__test_stubs__/tauri";
+import { __events } from "../../__test_stubs__/tauri-api-event";
 
 // initHost() (used only by the M17 regression test far below) discovers external modules
 // via listExternalModules(), which the shared Tauri stub resolves to `null` (its `invoke`

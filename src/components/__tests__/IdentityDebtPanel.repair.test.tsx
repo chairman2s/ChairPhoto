@@ -26,11 +26,13 @@
  * through the real `modules/api.ts` wrappers means these also pin the command and event NAMES
  * the backend publishes, not just the component's internal calls.
  *
- * **One `vi.mock`, not two.** `vitest.config.ts` aliases every `@tauri-apps/*` specifier to
- * the same stub file, so `vi.mock("@tauri-apps/api/core")` and
- * `vi.mock("@tauri-apps/api/event")` name one module — the second silently replaces the
- * first, and `invoke` goes back to the stub's no-op while every assertion here reads an empty
- * call log. So both `invoke` and `listen` come from a single factory.
+ * **Two `vi.mock` calls, one per specifier.** Issue #64: `vitest.config.ts` used to alias
+ * every `@tauri-apps/*` specifier to one shared stub file, so `vi.mock("@tauri-apps/api/core")`
+ * and `vi.mock("@tauri-apps/api/event")` named the same resolved module — the second silently
+ * replaced the first, and `invoke` went back to the stub's no-op while every assertion here
+ * read an empty call log. Fixed by giving each specifier its own resolved file (see the alias
+ * block in `vitest.config.ts`), so `invoke` and `listen` are now mocked independently below —
+ * each `vi.mock` call names a distinct path and both take effect.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
@@ -74,6 +76,13 @@ vi.mock("@tauri-apps/api/core", async (importOriginal) => {
           return Promise.resolve(null);
       }
     },
+  };
+});
+
+vi.mock("@tauri-apps/api/event", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@tauri-apps/api/event")>();
+  return {
+    ...actual,
     listen: (event: string, handler: (e: { payload: unknown }) => void) => {
       if (listenRejects.has(event)) return Promise.reject(new Error("no event bridge"));
       const list = handlers.get(event) ?? [];

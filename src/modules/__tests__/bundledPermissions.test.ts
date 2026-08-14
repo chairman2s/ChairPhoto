@@ -125,3 +125,19 @@ describe("bundled modules declare the commands they invoke (#48)", () => {
     expect(invokedCommands().size).toBeGreaterThan(50);
   });
 });
+
+describe("bundled modules declare no network origins (#49)", () => {
+  it("routes its own traffic through its own backend, not the generic proxy", () => {
+    // Not a security property — a bundled module is compiled into the app and could call
+    // `reqwest` from its own Rust — but a design one worth failing on. Every bundled module
+    // that talks to a service (Flickr, SmugMug, the map geocoder, the model downloads) does
+    // it from an audited command that knows its own protocol. A declaration here would mean
+    // one of them had been rerouted through `api.fetch`, which is the general-purpose,
+    // text-only, no-redirect path built for modules that cannot ship Rust — a downgrade for
+    // code that can, and one the user would now be asked to approve an origin for.
+    const declaring = BUNDLED_MODULES.filter((m) => (m.permissions?.origins ?? []).length > 0)
+      .map((m) => `${m.id} (${(m.permissions?.origins ?? []).join(", ")})`);
+
+    expect(declaring).toEqual([]);
+  });
+});

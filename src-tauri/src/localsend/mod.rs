@@ -1073,6 +1073,77 @@ mod tests {
         true
     }
 
+    /// Detect whether anything other than this test currently holds UDP `MULTICAST_PORT`
+    /// (53317) — the direct, protocol-agnostic signal for "a second real peer is sharing the
+    /// exact port/group these tests need a clean single-shot signal from" (issue #63).
+    ///
+    /// **Must be called after acquiring [`lock_network_tests`]**, so the only thing that can
+    /// still hold the port is a genuinely external process (a co-resident LocalSend app, or —
+    /// on a machine running more than one `cargo test` at once — a sibling process's own test
+    /// socket): the lock already serializes every one of *this* binary's own tests that touch
+    /// real 53317, so none of them can be the holder at the moment this runs.
+    ///
+    /// A plain, non-reuse bind is what makes this reliable: Linux only shares a port among
+    /// sockets that **all** set `SO_REUSEPORT`/`SO_REUSEADDR` (see
+    /// [`open_reusable_udp_socket`]'s doc comment and
+    /// `open_reusable_udp_socket_falls_back_to_ephemeral_port_when_a_plain_socket_holds_it`,
+    /// which pins the same asymmetry from the other direction) — so a plain bind is refused by
+    /// *any* existing holder, reuse-enabled or not, while never falsely refusing when the port
+    /// is genuinely free. Confirmed directly against the live condition on the machine this was
+    /// written on: `EADDRINUSE` while the real co-resident LocalSend app holds the port, and a
+    /// clean bind immediately after that same app was stopped.
+    ///
+    /// This replaces an earlier version of this guard that probed `/info` over HTTPS
+    /// ([`probe_protocol`]) and was wrong: verified live, the co-resident app on this machine
+    /// requires a client certificate and the probe never authenticated as one, so the guard
+    /// silently never fired (`SKIPPED` never printed, ten reps all green) while the underlying
+    /// flake — UDP contention on this exact port/group, not HTTP reachability — was untouched.
+    /// A bind check needs no TLS, no identity, and no assumption about which scheme or auth a
+    /// peer demands; it asks the one question that actually matters here.
+    fn co_resident_process_holds_udp_port() -> bool {
+        std::net::UdpSocket::bind(("0.0.0.0", MULTICAST_PORT)).is_err()
+    }
+
+    /// Common guard for the three `#[tokio::test]`s below (issue #63) whose assertion needs one
+    /// narrow, non-retried event — a single UDP reply, a single HTTP register — to reach a
+    /// socket the test itself binds to the real well-known port, alongside whatever a
+    /// co-resident LocalSend app is doing on that same port/group right now. Unlike
+    /// [`skip_if_no_loopback_multicast`] above (a fact about whether loopback multicast works
+    /// *at all* on this host), this is a fact about a second real peer contending for the exact
+    /// signal these specific tests need cleanly — see
+    /// `discover_advertises_a_port_it_actually_serves_register_on`'s own doc comment for why
+    /// that makes this a real, reproduced, environment-dependent flake (confirmed pre-existing:
+    /// reproduced on a base commit predating all related work) rather than a defect in
+    /// `discover_on`. Detected and skipped loudly, per AGENTS.md's documented convention for a
+    /// condition that cannot run cleanly on a given machine, rather than asserted around — a
+    /// version that merely filtered the co-resident app's traffic out of the result would prove
+    /// nothing about whether ChairPhoto's own signal got through, which is the entire point of
+    /// these three tests.
+    ///
+    /// Tests that only need "at least one of several loopback-sent datagrams arrived, filtered
+    /// by alias" (`discover_sends_an_announcement_a_loopback_peer_can_receive`,
+    /// `announce_on_interfaces_still_announces_when_nothing_joined`) do not use this guard: they
+    /// were already written to tolerate a chatty co-resident app by design (see their own doc
+    /// comments), asserting "at least one", not "exactly one" — a materially different claim
+    /// from these three tests' single non-retried round trip.
+    ///
+    /// Callers must hold `lock_network_tests`'s guard before calling this — see
+    /// [`co_resident_process_holds_udp_port`] for why.
+    fn skip_if_co_resident_localsend_app(test_name: &str) -> bool {
+        if !co_resident_process_holds_udp_port() {
+            return false;
+        }
+        eprintln!(
+            "SKIPPED: {test_name} — something other than this test holds UDP {MULTICAST_PORT} \
+             (most likely a co-resident LocalSend app — see docs/localsend.md's testing \
+             gotchas). This test needs a single, non-retried event to reach a loopback socket \
+             bound to the real well-known port, and a live peer sharing that same port/group is \
+             genuine, reproducible interference (issue #63), not something this test or \
+             discover_on can filter away."
+        );
+        true
+    }
+
     // --- issue #39: discovery-socket fixes -------------------------------------------------
 
     #[test]
@@ -1444,7 +1515,17 @@ mod tests {
         // The fake peer here sends **no UDP reply at all**. It is discovered purely because its
         // HTTP register POST reached us, which is the exact path issue #55 was about: with a
         // co-resident LocalSend app holding 53317, that POST is the only way a peer can arrive.
+        //
+        // That same co-resident app is also, independently, a source of test flakiness (issue
+        // #63): its own real traffic on 53317 can keep this test's loopback peer from cleanly
+        // hearing our one announcement inside the wait below, which is a fact about a second
+        // real peer sharing the port, not a defect in discover_on — see
+        // `skip_if_co_resident_localsend_app`'s doc comment. Checked *after* the lock below, so
+        // a sibling test in this same process serialized behind it is never mistaken for one.
         let _guard = lock_network_tests();
+        if skip_if_co_resident_localsend_app("discover_advertises_a_port_it_actually_serves_register_on") {
+            return;
+        }
         if skip_if_no_loopback_multicast("discover_advertises_a_port_it_actually_serves_register_on").await {
             return;
         }
@@ -1538,7 +1619,16 @@ mod tests {
         // for peers whose register fails, which is every peer whenever the listener could not
         // be bound at all. Same round trip as the pre-#55 test, re-asserted after the rewrite
         // of the collect loop into channel-fed form.
+        //
+        // Both `discover_on` and the fake peer below bind the *real* MULTICAST_PORT (needed so
+        // the peer's UDP reply, addressed to the group's well-known port, can reach either of
+        // them) — the same single-non-retried-event shape that makes
+        // `discover_advertises_a_port_it_actually_serves_register_on` flaky against a
+        // co-resident LocalSend app (issue #63), so it gets the same guard.
         let _guard = lock_network_tests();
+        if skip_if_co_resident_localsend_app("discover_still_hears_the_udp_fallback") {
+            return;
+        }
         if skip_if_no_loopback_multicast("discover_still_hears_the_udp_fallback").await {
             return;
         }
@@ -1600,7 +1690,14 @@ mod tests {
         // its own announcement (mimicking a real peer's UDP `announce:false` fallback reply),
         // and `discover_on`'s own collect loop must parse that reply into a returned `Device`.
         // The tests above only check that *we* transmit; this checks that we can also *receive*.
+        //
+        // Like `discover_still_hears_the_udp_fallback` just above, both `discover_on` and the
+        // fake peer bind the real MULTICAST_PORT for the reply to be deliverable at all — the
+        // same single-non-retried-event exposure as issue #63, so it gets the same guard.
         let _guard = lock_network_tests();
+        if skip_if_co_resident_localsend_app("discover_returns_a_device_when_a_loopback_peer_replies") {
+            return;
+        }
         if skip_if_no_loopback_multicast("discover_returns_a_device_when_a_loopback_peer_replies").await {
             return;
         }

@@ -133,6 +133,24 @@ port, join the real multicast group, and send/receive real datagrams over loopba
 (serialized against each other and against a co-resident LocalSend desktop app) and how it's
 kept hermetic (loopback only, never the LAN).
 
+Three of those tests need one narrow, non-retried event — one UDP reply, one HTTP register — to
+reach a socket bound to the real well-known port, and a co-resident LocalSend app sharing that
+same port/group is genuine, un-mockable interference with that, not something the test or
+`discover_on` can filter away (issue #63): `discover_advertises_a_port_it_actually_serves_
+register_on`, `discover_still_hears_the_udp_fallback`, and `discover_returns_a_device_when_a_
+loopback_peer_replies` check for a second holder of `MULTICAST_PORT` with a plain, non-reuse UDP
+bind — refused by *anything* already on the port, reuse-enabled or not, so it needs no scheme,
+auth, or response-shape assumption about what that peer is — and print `SKIPPED: <test> —
+something other than this test holds UDP 53317` rather than fail when the port is already taken.
+An earlier version of the guard instead probed `/info` over HTTPS the way a manually-entered
+address would; live testing showed that probe silently never fired against this machine's
+co-resident app (it requires a client certificate the probe never authenticated as), so it
+covered nothing while looking like coverage — the bind check replaced it because the actual
+interference these tests suffer is UDP port/group contention, not HTTP reachability. The tests
+that only need "at least one of several loopback-sent datagrams arrived" stay unchanged — see
+the module's own `skip_if_co_resident_localsend_app` doc comment for why that's a different,
+already-tolerant claim.
+
 The sweep keeps that hermeticity: its subnet arithmetic and info-body parsing are pure
 functions with no network at all, and the end-to-end tests drive it against a loopback stub on
 an ephemeral port. The multicast tests pass an explicitly empty target list, so `cargo test`

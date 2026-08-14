@@ -214,6 +214,8 @@ export const instagramModule: ChairPhotoModule = {
     "Post a photo to Instagram by driving Chrome; records which version was posted. Supervised by default.",
   backendFeature: "instagram",
   publicationMarker: "instagram",
+  // `post_to_instagram` drives a real browser session; the caption builder is local (#48).
+  permissions: { commands: ["build_instagram_caption", "post_to_instagram"] },
   onLoad(api) {
     api.registerPublishTarget({
       id: "instagram",

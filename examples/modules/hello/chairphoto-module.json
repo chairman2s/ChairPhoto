@@ -4,5 +4,8 @@
   "version": "1.0.0",
   "description": "Minimal external module proving the loader path end to end.",
   "entrypoint": "index.js",
-  "minHostVersion": "2026.8.0"
+  "minHostVersion": "2026.8.0",
+  "permissions": {
+    "commands": []
+  }
 }

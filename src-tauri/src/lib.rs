@@ -279,6 +279,8 @@ pub fn run() {
             commands::set_setting,
             commands::list_external_modules,
             commands::get_modules_dir,
+            #[cfg(feature = "module-fetch")]
+            commands::module_fetch,
             commands::ai_suggest_tags,
             commands::ai_ollama_models,
             commands::ai_default_prompt,

@@ -19,8 +19,16 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 # Optional plugin backends. A feature can be omitted (--no-default-features) to
 # compile that plugin's Rust out of the binary entirely. See docs/plugin-system.md.
 [features]
-default = ["ai", "edit", "raw", "instagram", "collage", "slideshow", "localsend", "map", "faces", "smarttags"]
+default = ["ai", "edit", "raw", "instagram", "collage", "slideshow", "localsend", "map", "faces", "smarttags", "module-fetch"]
 ai = ["dep:reqwest"]
+# Host-mediated `api.fetch` for modules (#49): one HTTP request made by Rust on a module's
+# behalf, to an origin that module declared and the user granted. Not a plugin backend — it is
+# part of the module contract — but it is gated like one because `reqwest` is optional and this
+# is the only core command that needs an HTTP client. Compiled out, `module_fetch` is not
+# registered and the host omits `api.fetch` from the API object it injects, which is the
+# documented way an optional host capability is absent (docs/plugin-system.md § Host-API
+# stability). See docs/module-capabilities.md § "Host-mediated `api.fetch`".
+module-fetch = ["dep:reqwest"]
 # Send a photo to a device on the LAN over LocalSend's documented v2 HTTP protocol (UDP
 # multicast discovery + prepare-upload/upload). Send-only. Reuses `reqwest` (HTTP) and the
 # already-on tokio "full" (UDP via tokio::net::UdpSocket); `socket2`/`libc` and `rcgen` are

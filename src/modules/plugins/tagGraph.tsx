@@ -923,6 +923,8 @@ export const tagGraphModule: ChairPhotoModule = {
   version: "0.1.0",
   description:
     "Visualize your library as a graph — tag communities, camera nodes, and a photo↔tag map. Select a node to inspect it.",
+  // The two graph projections, plus `list_photos` to resolve a selected node to photos (#48).
+  permissions: { commands: ["library_graph", "list_photos", "photo_tag_graph"] },
   onLoad(api) {
     api.registerMainView({
       id: "tag-graph",

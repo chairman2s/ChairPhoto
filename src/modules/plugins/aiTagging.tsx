@@ -953,6 +953,21 @@ export const aiTaggingModule: ChairPhotoModule = {
   description:
     "Suggest tags from your taxonomy (and propose new ones) using a vision model — local (Ollama) or cloud.",
   backendFeature: "ai",
+  // Every command this module reaches through `api.invoke` (#48). `get_preview` is the one
+  // that is not its own: the panel shows the photo it is about to describe to the model.
+  permissions: {
+    commands: [
+      "ai_accept_suggestion",
+      "ai_default_prompt",
+      "ai_get_suggestions",
+      "ai_grouped_estimate",
+      "ai_ollama_models",
+      "ai_reject_suggestion",
+      "ai_suggest_tags",
+      "ai_suggest_tags_grouped",
+      "get_preview",
+    ],
+  },
   onLoad(api) {
     api.registerPanel({
       id: "ai-tags",

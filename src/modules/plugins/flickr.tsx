@@ -550,6 +550,19 @@ export const flickrModule: ChairPhotoModule = {
   description: "Publish photos to Flickr via the official API; records which version was posted.",
   backendFeature: "flickr",
   publicationMarker: "flickr",
+  // The OAuth 1.0a handshake, the upload, and the published-photo import (#48). Every one
+  // of these talks to flickr.com from Rust, which is exactly what the user is approving.
+  permissions: {
+    commands: [
+      "flickr_begin_auth",
+      "flickr_complete_auth",
+      "flickr_connected",
+      "flickr_import_apply",
+      "flickr_import_published",
+      "flickr_suggest_tags",
+      "post_to_flickr",
+    ],
+  },
   onLoad(api) {
     const service = makeService(api);
     api.registerSettingsPanel(() => (

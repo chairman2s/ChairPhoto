@@ -17,7 +17,14 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanup, render, screen, waitFor } from "@testing-library/react";
 
-import { __resetForTests, enableModule, mainViews, register, setFilterContext } from "../../host";
+import {
+  __resetForTests,
+  enableModule,
+  grantPermissions,
+  mainViews,
+  register,
+  setFilterContext,
+} from "../../host";
 import { ModuleContent } from "../../ModuleContent";
 import { statisticsModule } from "../statistics";
 
@@ -81,6 +88,11 @@ afterEach(() => {
 describe("Statistics panel — re-renders on a host filter-context notify (issue #53)", () => {
   it("shows the scope chip after setFilterContext(), with no prop change from the test", async () => {
     register(statisticsModule);
+    // Statistics declares `catalog_stats` (#48), and the host refuses to enable a module
+    // whose declaration has not been granted — so the grant the Modules panel records after
+    // permission review has to be recorded here too. Nothing about this test is a special
+    // case: `enableModule` would refuse in production the same way.
+    grantPermissions("statistics", false);
     enableModule("statistics", false);
 
     const view = mainViews().find((v) => v.id === "statistics");

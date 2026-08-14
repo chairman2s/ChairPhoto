@@ -1319,6 +1319,21 @@ export const mapModule: ChairPhotoModule = {
   description:
     "Plot your photos on an OpenStreetMap map by GPS location. Click a marker or cluster to browse photos in a filmstrip; clicking a thumb selects it in the pop-out loupe without leaving the map. Draw geofences to auto-tag photos by location. Requires the map backend feature.",
   backendFeature: "map",
+  // Map points, geofence CRUD, and the reverse-geocode writers (#48). The `geocode_*`
+  // commands write IPTC location fields into the catalog and sidecars.
+  permissions: {
+    commands: [
+      "apply_all_fences",
+      "apply_fence",
+      "create_fence",
+      "delete_fence",
+      "geocode_all_to_iptc",
+      "geocode_to_iptc",
+      "list_fences",
+      "map_photo_points",
+      "update_fence",
+    ],
+  },
   onLoad(api) {
     api.registerMainView({
       id: "map",

@@ -13,6 +13,10 @@ export const collageModule: ChairPhotoModule = {
   description:
     "Composite the selected photos into one justified-mosaic image (JPEG/PNG) — pick the aspect, spacing, background, fit, border and rounded corners, reorder the tiles, and render.",
   backendFeature: "collage",
+  // Invoked from CollageDialog, which this module owns and hands its own `api` (#48).
+  permissions: {
+    commands: ["collage_auto_arrange", "make_collage_freeform", "save_collage_to_catalog"],
+  },
   onLoad(api) {
     api.registerAction({
       id: "collage",

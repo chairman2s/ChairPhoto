@@ -114,6 +114,10 @@ export const snapchatModule: ChairPhotoModule = {
   backendFeature: "localsend",
   publicationMarker: "snapchat",
   requires: [{ id: "localsend", version: "^0.1.0" }],
+  // Snapchat renders the same SendToDevicePanel but hands it ITS OWN `api`, so the calls
+  // are made under the snapchat identity and must be declared here too (#48). Requiring
+  // the localsend module does not inherit its permissions — grants do not cascade.
+  permissions: { commands: ["localsend_discover", "localsend_send"] },
   onLoad(api) {
     api.registerPublishTarget({
       id: "snapchat",

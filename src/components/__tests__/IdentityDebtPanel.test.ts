@@ -14,12 +14,15 @@ import {
   STATE_CLASS,
   conflictField,
   dismissedField,
+  repairProgressLine,
+  repairSummaryLine,
   resolutionMessage,
   summaryHeadline,
   pagingLabel,
 } from "../IdentityDebtPanel";
 import type {
   IdentityDebtState,
+  IdentityRepairSummary,
   PendingIdentity,
   PendingIdentityField,
   PendingIdentitySummary,
@@ -226,5 +229,66 @@ describe("pagingLabel", () => {
   it("uses the real total once it catches up to (or exceeds) what's shown", () => {
     expect(pagingLabel(0, 4, 10)).toBe("Showing 1–4 of 10");
     expect(pagingLabel(0, 4, 4)).toBe("Showing 1–4 of 4");
+  });
+});
+
+describe("repairSummaryLine", () => {
+  function summary(over: Partial<IdentityRepairSummary> = {}): IdentityRepairSummary {
+    return {
+      bound: 0,
+      unreachable: 0,
+      conflicts: 0,
+      failed: 0,
+      superseded: 0,
+      total: 0,
+      aborted: false,
+      ...over,
+    };
+  }
+
+  it("says nothing before a pass has reported", () => {
+    expect(repairSummaryLine(null)).toBe("");
+  });
+
+  it("reports a completed pass in the four CONTEXT.md outcomes", () => {
+    expect(
+      repairSummaryLine(summary({ bound: 3, unreachable: 2, conflicts: 1, failed: 4, total: 10 })),
+    ).toBe("Finished — bound 3 · still unreachable 2 · conflict 1 · failed 4");
+  });
+
+  // The whole point of `aborted`: a cancel can land on row 3 of 74,488. Presenting those
+  // counters the way a finished pass's are read as "the queue is now clean" — which the user
+  // acts on, by not running another pass.
+  it("labels a stopped pass as stopped, with how far it got", () => {
+    const line = repairSummaryLine(
+      summary({ bound: 2, unreachable: 1, total: 74488, aborted: true }),
+    );
+    expect(line).toContain("Stopped after 3 of 74488");
+    expect(line).not.toContain("Finished");
+  });
+
+  it("names superseded rows only when there were some", () => {
+    expect(repairSummaryLine(summary({ bound: 1, total: 1 }))).not.toContain("decided elsewhere");
+    // A row somebody else decided under the pass is not a failure, and not an outcome the
+    // pass produced (#34) — so it is reported, and reported apart from the four.
+    const line = repairSummaryLine(summary({ bound: 1, superseded: 2, total: 3 }));
+    expect(line).toContain("2 decided elsewhere while the pass ran");
+    expect(line).toContain("failed 0");
+  });
+
+  it("counts superseded rows toward how far a stopped pass got", () => {
+    expect(
+      repairSummaryLine(summary({ bound: 1, superseded: 1, total: 9, aborted: true })),
+    ).toContain("Stopped after 2 of 9");
+  });
+});
+
+describe("repairProgressLine", () => {
+  it("shows the denominator once the pass has counted the queue", () => {
+    expect(repairProgressLine(120, 74488)).toBe("Repairing… 120 of 74488");
+  });
+
+  it("omits it while the queue is still uncounted, rather than claiming a total of 0", () => {
+    expect(repairProgressLine(0, 0)).toBe("Repairing…");
   });
 });

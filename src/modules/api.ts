@@ -790,6 +790,44 @@ export interface IdentityRepairSummary {
   conflicts: number;
   /** Retried and is still genuinely failing (unwritable sidecar); left queued. */
   failed: number;
+  /** Rows somebody else decided while the pass held them — a conflict resolved, a copy
+   *  dismissed, a scan re-recording the same copy. The pass discarded its own result for
+   *  those rather than writing over the newer decision, so they are counted here and in
+   *  none of the four above. Not a failure. */
+  superseded: number;
+  /** Queue rows when the pass started — its denominator. In ROWS, not copies: the pass
+   *  retries each owed field, so a copy owing both its UUID and its import batch is two
+   *  here and one in `PendingIdentitySummary.total`. */
+  total: number;
+  /** True when the pass stopped early — cancelled, superseded by a newer pass, or ended by
+   *  a catalog switch. Every count above is then partial, and must be labelled as such
+   *  rather than presented as a finished result. */
+  aborted: boolean;
+}
+
+/** Progress event for a running repair pass (`identity:repair_progress`). `job` is what
+ *  tells this pass's events from a superseded one's stragglers — filter on it. */
+export interface IdentityRepairProgress {
+  done: number;
+  total: number;
+  job: number;
+}
+
+/** Terminal event for a repair pass (`identity:repair_done`). The pass's RESULT — the
+ *  command itself only returns a job id. `ok: false` with an `error` means the pass could
+ *  not run at all; a pass that ran and was stopped is `ok: true` with `summary.aborted`. */
+export interface IdentityRepairDone {
+  ok: boolean;
+  job: number;
+  summary: IdentityRepairSummary;
+  error: string | null;
+}
+
+/** A repair pass in flight, as `identityRepairStatus()` reports it. */
+export interface IdentityRepairStatus {
+  job: number;
+  done: number;
+  total: number;
 }
 
 /** One page of the identity-debt list, one row per copy (never per field — see
@@ -810,10 +848,31 @@ export const listPendingIdentity = (limit: number, offset: number, includeDismis
  *  cheap header count. */
 export const summarizePendingIdentity = () =>
   invoke<PendingIdentitySummary>("summarize_pending_identity");
-/** Retry every queued copy now. Unreachable/unwritable/conflicted copies stay queued;
- *  dismissed ones are skipped entirely. */
-export const repairPendingIdentity = () =>
-  invoke<IdentityRepairSummary>("repair_pending_identity");
+/** Start a repair pass over the queued copies. Unreachable/unwritable/conflicted copies
+ *  stay queued; dismissed ones are skipped entirely.
+ *
+ *  Returns the pass's **job id**, not its result: the queue reached 74,488 rows on the 100k
+ *  harness shape in #20 and each row can be a network round trip, so the pass reports
+ *  through `onIdentityRepairProgress` and finishes with `onIdentityRepairDone` (#34).
+ *  Install both listeners BEFORE calling this — a pass over an empty queue finishes before
+ *  this promise resolves. Starting a second pass supersedes the first. */
+export const repairPendingIdentity = () => invoke<number>("repair_pending_identity");
+/** Stop the running repair pass at its next copy. No-op when none is running. */
+export const cancelIdentityRepair = () => invoke<void>("identity_repair_cancel");
+/** The repair pass in flight, or `null` when idle — so a remounted panel re-attaches to a
+ *  pass instead of reopening as if nothing were happening. */
+export const identityRepairStatus = () =>
+  invoke<IdentityRepairStatus | null>("identity_repair_status");
+/** Subscribe to repair-pass progress. Returns an unlisten function. */
+export const onIdentityRepairProgress = (
+  handler: (p: IdentityRepairProgress) => void,
+): Promise<UnlistenFn> =>
+  listen<IdentityRepairProgress>("identity:repair_progress", (e) => handler(e.payload));
+/** Subscribe to the repair pass's terminal event. Returns an unlisten function. */
+export const onIdentityRepairDone = (
+  handler: (d: IdentityRepairDone) => void,
+): Promise<UnlistenFn> =>
+  listen<IdentityRepairDone>("identity:repair_done", (e) => handler(e.payload));
 
 /** What to do about one conflicted copy — CONTEXT.md § Identity's vocabulary verbatim.
  *  There is no default: the backend rejects anything that isn't one of these four, so a

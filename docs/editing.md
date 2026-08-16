@@ -93,6 +93,12 @@ CREATE TABLE photo_versions (
   "crop": { "x": 0.10, "y": 0.0, "w": 0.80, "h": 1.0, "aspect": "1:1" },
   // crop is FRACTIONS (0–1) of the original, so one record works on the small preview
   // proxy (live editing) and the full-res source (export) alike.
+  "straighten": 1.5,    // degrees; rotate about the centre to level the frame
+  "perspective": {      // four-corner keystone correction; absent = geometry untouched
+    "tl": [0.098, 0.171], "tr": [0.853, 0.106],   // the SUBJECT's corners, as fractions
+    "br": [0.878, 0.900], "bl": [0.083, 0.921],   // of the source (same units as crop)
+    "aspect": 0.79      // optional output width/height; absent = mean edge lengths
+  },
   "tone": {
     "ev": 0.5,          // exposure in stops
     "contrast": 0.0,    // -1..1
@@ -105,8 +111,38 @@ CREATE TABLE photo_versions (
 
 Decided tone set: **EV + contrast + highlights/shadows + white balance**. WB here is a
 post-decode RGB temperature/tint adjustment (approximate, not raw-domain WB) — adequate for
-a simple editor; true raw-domain WB is a later, RAW-pipeline concern. Straighten/rotate is
-not implemented; crop is axis-aligned.
+a simple editor; true raw-domain WB is a later, RAW-pipeline concern. Crop is axis-aligned;
+tilt is `straighten`'s job and off-axis shots are `perspective`'s.
+
+### Geometry, and why its order is fixed
+
+Three stages run before the look, always in this order — `perspective` → `straighten` →
+`crop` — because each redefines the frame the next one measures against:
+
+- **`perspective`** maps the named quadrilateral back onto a rectangle, undoing the
+  keystone of a picture or document photographed off-axis. It runs first and it changes the
+  canvas size, so `straighten`'s centre and `crop`'s fractions refer to the *rectified*
+  image, not the original. The engine solves the 8-DOF homography from the output rectangle
+  onto the quad and inverse-samples it bilinearly.
+- **`straighten`** rotates about the centre. The UI pairs it with an inscribed crop so the
+  rotation's black corners stay out of frame.
+- **`crop`** is axis-aligned, in fractions of whatever the two stages above produced.
+
+Two guards are load-bearing rather than defensive habit. A degenerate quad — collinear or
+coincident corners — has no well-defined rectification, so it leaves the geometry alone
+instead of failing the render, the same contract a missing LUT gets. And the output edge is
+capped at 4× the source's longest edge: the quad is user-supplied data, and without a cap a
+mis-dragged handle could ask for a multi-gigapixel canvas.
+
+`perspective.aspect` is optional because the engine cannot recover the subject's true
+ratio on its own — that needs the camera's focal length, and the engine is handed a JPEG,
+never EXIF. Absent, it derives the ratio from the quad's mean edge lengths, which is right
+for a roughly square-on shot; the UI writes an explicit value when it can do better.
+
+In the UI (Develop → Crop & Rotate → Perspective) the four corners are dragged onto the
+subject. While the handles are up the preview renders *without* the warp: the handles are
+aimed at the original's corners, so rectifying underneath them would move the target.
+Corner auto-detection is not implemented — the handles are placed by hand.
 
 ### Film looks
 
@@ -164,9 +200,11 @@ implemented — the crop fixes shape, resize would fix pixels.
 - **Core (Rust):** `photo_versions` table + CRUD/commands. No image processing.
 - **Module engine (Rust, behind an `edit` Cargo feature so the backend still builds
   `--no-default-features`):** `render_edit(source, edit_json) → JPEG` — applies normalized
-  crop + tone (EV→linear gain, contrast, highlights/shadows, WB) using the `image` crate.
-- **Module UI (TS):** crop overlay with the aspect presets, tone sliders, the Versions
-  panel, live preview, and `registerEditRenderer(...)` so the loupe shows the edited result.
+  geometry (perspective → straighten → crop) + tone (EV→linear gain, contrast,
+  highlights/shadows, WB) using the `image` crate.
+- **Module UI (TS):** crop overlay with the aspect presets, the perspective corner handles,
+  tone sliders, the Versions panel, live preview, and `registerEditRenderer(...)` so the
+  loupe shows the edited result.
 
 ## Rendering & export
 

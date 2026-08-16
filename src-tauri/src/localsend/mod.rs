@@ -668,10 +668,16 @@ fn local_ipv4_networks() -> Vec<(Ipv4Addr, Ipv4Addr)> {
 /// once per pass with the reason, so an empty scan is diagnosable rather than
 /// indistinguishable from "nothing answered", matching how [`discover`] treats join failures.
 fn scan_targets() -> Vec<SocketAddrV4> {
-    let networks = local_ipv4_networks();
+    scan_targets_on(&local_ipv4_networks())
+}
+
+/// Core target derivation for [`scan_targets`], parameterized over interface networks so
+/// multi-interface and dual-homed host behavior can be tested deterministically without
+/// depending on the host machine's live interfaces.
+fn scan_targets_on(networks: &[(Ipv4Addr, Ipv4Addr)]) -> Vec<SocketAddrV4> {
     let ours: Vec<Ipv4Addr> = networks.iter().map(|(addr, _)| *addr).collect();
     let mut hosts = Vec::new();
-    for (addr, netmask) in &networks {
+    for (addr, netmask) in networks {
         match scan::subnet_hosts(*addr, *netmask) {
             Some(found) => hosts.extend(found),
             None => eprintln!(
@@ -1231,6 +1237,51 @@ mod tests {
                 "flags {flags:#b} disagree"
             );
         }
+    }
+
+    #[test]
+    fn scan_targets_dual_homed_same_subnet_dedups_and_excludes_both_addresses() {
+        // Dual-homed on the same /24 subnet: 192.168.1.90 and 192.168.1.126
+        let iface1 = (Ipv4Addr::new(192, 168, 1, 90), Ipv4Addr::new(255, 255, 255, 0));
+        let iface2 = (Ipv4Addr::new(192, 168, 1, 126), Ipv4Addr::new(255, 255, 255, 0));
+        let targets = scan_targets_on(&[iface1, iface2]);
+
+        // A /24 has 254 usable host addresses (.1 .. .254).
+        // Excluding both local addresses (.90 and .126) yields exactly 252 targets.
+        assert_eq!(targets.len(), 252);
+
+        // Neither local address should be present in the targets list.
+        assert!(!targets.iter().any(|t| *t.ip() == Ipv4Addr::new(192, 168, 1, 90)));
+        assert!(!targets.iter().any(|t| *t.ip() == Ipv4Addr::new(192, 168, 1, 126)));
+
+        // Verify ports and ordering
+        for target in &targets {
+            assert_eq!(target.port(), scan::SCAN_PORT);
+            assert_eq!(target.ip().octets()[0..3], [192, 168, 1]);
+        }
+        let mut sorted = targets.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(targets, sorted);
+    }
+
+    #[test]
+    fn scan_targets_multiple_subnets_unions_without_over_collapsing() {
+        // Two interfaces on distinct subnets: 192.168.1.10/24 and 10.0.0.5/24
+        let iface1 = (Ipv4Addr::new(192, 168, 1, 10), Ipv4Addr::new(255, 255, 255, 0));
+        let iface2 = (Ipv4Addr::new(10, 0, 0, 5), Ipv4Addr::new(255, 255, 255, 0));
+        let targets = scan_targets_on(&[iface1, iface2]);
+
+        // Each /24 has 254 hosts, minus 1 local address each = 253 + 253 = 506 targets
+        assert_eq!(targets.len(), 506);
+
+        assert!(!targets.iter().any(|t| *t.ip() == Ipv4Addr::new(192, 168, 1, 10)));
+        assert!(!targets.iter().any(|t| *t.ip() == Ipv4Addr::new(10, 0, 0, 5)));
+
+        let net1_count = targets.iter().filter(|t| t.ip().octets()[0..3] == [192, 168, 1]).count();
+        let net2_count = targets.iter().filter(|t| t.ip().octets()[0..3] == [10, 0, 0]).count();
+        assert_eq!(net1_count, 253);
+        assert_eq!(net2_count, 253);
     }
 
     #[test]

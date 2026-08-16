@@ -12,6 +12,46 @@ export interface Crop {
   aspect?: string;
 }
 
+/** One corner of a {@link Perspective} quad, as fractions (0–1) of the source. */
+export type QuadPoint = [number, number];
+
+/**
+ * Four-corner perspective (keystone) correction: the source quadrilateral that should
+ * become the output rectangle, as fractions of the source — resolution-independent, so
+ * one record renders the same on the preview proxy and the full-size original.
+ *
+ * Corners are named by their position on the *subject*, not on the frame, so a tilted
+ * picture is expressed by which corner is which. One quad therefore carries rotation and
+ * keystone together and needs no angle beside it.
+ */
+export interface Perspective {
+  tl: QuadPoint;
+  tr: QuadPoint;
+  br: QuadPoint;
+  bl: QuadPoint;
+  /**
+   * Output aspect (width / height). Absent = the engine derives it from the quad's mean
+   * edge lengths, which is right for a roughly square-on shot. Recovering the subject's
+   * true ratio needs the camera's focal length, which the engine never sees.
+   */
+  aspect?: number;
+}
+
+/** The four corners in drawing order, so the overlay polygon and the handles agree. */
+export const QUAD_CORNERS = ["tl", "tr", "br", "bl"] as const;
+export type QuadCorner = (typeof QUAD_CORNERS)[number];
+
+/**
+ * The quad a fresh perspective edit starts from — the whole frame, inset far enough that
+ * all four handles are visible and grabbable instead of pinned under the frame's edge.
+ */
+export const DEFAULT_QUAD: Perspective = {
+  tl: [0.06, 0.06],
+  tr: [0.94, 0.06],
+  br: [0.94, 0.94],
+  bl: [0.06, 0.94],
+};
+
 export interface Tone {
   ev: number; // exposure, stops
   contrast: number; // -1..1
@@ -61,6 +101,8 @@ export interface LutRef {
 export interface VersionEdit {
   crop?: Crop;
   tone?: Tone;
+  /** Four-corner perspective correction; absent = leave the geometry alone. */
+  perspective?: Perspective;
   /** Straighten angle in degrees (rotate the image about its centre to level it). */
   straighten?: number;
   bw?: Bw;

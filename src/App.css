@@ -2372,6 +2372,41 @@ body {
   pointer-events: none;
   overflow: visible;
 }
+/* Perspective tool: four draggable corners joined by an outline, over the un-rectified
+   image. The handles sit above the crop layer so they stay grabbable at any zoom. */
+.quad-layer {
+  position: absolute;
+  inset: 0;
+  z-index: 6;
+}
+.quad-outline {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+  overflow: visible;
+}
+.quad-outline polygon {
+  fill: rgba(80, 160, 255, 0.12);
+  stroke: rgba(120, 190, 255, 0.95);
+  stroke-width: 1.5;
+  stroke-dasharray: 5 4;
+}
+.quad-handle {
+  position: absolute;
+  width: 16px;
+  height: 16px;
+  margin: -8px 0 0 -8px;
+  background: rgba(255, 255, 255, 0.95);
+  border: 2px solid rgba(40, 120, 210, 0.95);
+  border-radius: 50%;
+  box-sizing: border-box;
+  cursor: grab;
+}
+.quad-handle:active {
+  cursor: grabbing;
+}
 .crop-dims {
   position: absolute;
   left: 4px;

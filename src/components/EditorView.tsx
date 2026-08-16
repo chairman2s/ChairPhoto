@@ -18,6 +18,7 @@ import {
   clampStraighten,
   Crop,
   CropOverlay,
+  DEFAULT_QUAD,
   fitCrop,
   GOLDEN_SPIRAL_PATH,
   inscribedCrop,
@@ -27,6 +28,9 @@ import {
   OVERLAY_LINES,
   OVERLAYS,
   parseEdit,
+  Perspective,
+  QUAD_CORNERS,
+  QuadCorner,
   Split,
   STRAIGHTEN_MAX,
   Tone,
@@ -91,6 +95,8 @@ export function EditorView({
   const [aspect, setAspect] = useState<string>("Original");
   const [straighten, setStraighten] = useState(0); // degrees
   const [straightenMode, setStraightenMode] = useState(false); // drawing the level line
+  const [perspective, setPerspective] = useState<Perspective | null>(null);
+  const [perspectiveMode, setPerspectiveMode] = useState(false); // dragging the corners
   const [line, setLine] = useState<{ x1: number; y1: number; x2: number; y2: number } | null>(null);
   const [overlay, setOverlay] = useState<CropOverlay>("thirds");
   const [showSplit, setShowSplit] = useState(false); // split-tone sliders collapsed by default
@@ -210,6 +216,8 @@ export function EditorView({
     setAspect(init.crop?.aspect ?? "Original");
     setStraighten(init.straighten ?? 0);
     setStraightenMode(false);
+    setPerspective(init.perspective ?? null);
+    setPerspectiveMode(false);
     setView({ scale: 1, tx: 0, ty: 0 });
     // Reset before/after state when switching versions.
     setShowBefore(false);
@@ -229,7 +237,15 @@ export function EditorView({
     const editJson =
       activeVersionId == null
         ? "{}"
-        : JSON.stringify({ tone, straighten, ...lookFields(look) });
+        : JSON.stringify({
+            tone,
+            straighten,
+            // While the handles are up the backdrop stays un-rectified: the handles are
+            // aimed at the *original's* corners, and warping underneath them would move
+            // the very thing being aimed at. The warp reappears on leaving the mode.
+            perspective: perspectiveMode ? undefined : (perspective ?? undefined),
+            ...lookFields(look),
+          });
     const t = setTimeout(() => {
       renderEdit(photoId, editJson, PREVIEW_MAX)
         .then((url) => !cancelled && setBackdrop(url))
@@ -239,7 +255,7 @@ export function EditorView({
       cancelled = true;
       clearTimeout(t);
     };
-  }, [photoId, tone, look, straighten, activeVersionId]);
+  }, [photoId, tone, look, straighten, perspective, perspectiveMode, activeVersionId]);
 
   // Fetch the "before" (unedited) render the first time the Before toggle is activated.
   // Cache it in beforeBackdrop so we only fetch once per version session.
@@ -258,6 +274,7 @@ export function EditorView({
     const editJson = JSON.stringify({
       crop: crop ?? undefined,
       tone,
+      perspective: perspective ?? undefined,
       straighten: straighten || undefined,
       ...lookFields(look),
     });
@@ -271,7 +288,7 @@ export function EditorView({
     }, 250);
     return () => clearTimeout(t);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [tone, look, crop, straighten]);
+  }, [tone, look, crop, straighten, perspective]);
 
   const ratioFor = (label: string): number | null => {
     if (label === "Original" || label === "Free") return null;
@@ -330,7 +347,8 @@ export function EditorView({
     });
   };
 
-  // Reset all edits: tone/look back to zero, no crop, Original aspect, no straighten.
+  // Reset all edits: tone/look back to zero, no crop, Original aspect, no straighten,
+  // no perspective.
   const resetAll = () => {
     setTone({ ...ZERO_TONE });
     setLook({ ...ZERO_LOOK });
@@ -338,6 +356,46 @@ export function EditorView({
     setAspect("Original");
     setStraighten(0);
     setStraightenMode(false);
+    setPerspective(null);
+    setPerspectiveMode(false);
+  };
+
+  // Start (or resume) aiming the four corners. Any crop is dropped: crop fractions are
+  // relative to the *rectified* frame, and that frame is about to change shape, so
+  // keeping the old box would silently reframe the photo.
+  const startPerspective = () => {
+    setPerspective((p) => p ?? { ...DEFAULT_QUAD });
+    setPerspectiveMode(true);
+    setStraightenMode(false);
+    setCrop(null);
+    setAspect("Original");
+  };
+
+  const clearPerspective = () => {
+    setPerspective(null);
+    setPerspectiveMode(false);
+    setCrop(null);
+    setAspect("Original");
+  };
+
+  // Drag one corner of the perspective quad. Positions are fractions of the frame, which
+  // is what the engine stores, so no pixel conversion is needed in either direction.
+  const onQuadCornerDown = (e: React.MouseEvent, corner: QuadCorner) => {
+    if (!perspective || !frameRef.current) return;
+    e.preventDefault();
+    e.stopPropagation(); // don't start a pan
+    const rect = frameRef.current.getBoundingClientRect();
+    const move = (ev: MouseEvent) => {
+      const x = clamp01((ev.clientX - rect.left) / rect.width);
+      const y = clamp01((ev.clientY - rect.top) / rect.height);
+      setPerspective((p) => (p ? { ...p, [corner]: [x, y] } : p));
+    };
+    const up = () => {
+      window.removeEventListener("mousemove", move);
+      window.removeEventListener("mouseup", up);
+    };
+    window.addEventListener("mousemove", move);
+    window.addEventListener("mouseup", up);
   };
 
   // Draw a line on the image; on release, level it (to horizontal or vertical) by adding
@@ -680,6 +738,33 @@ export function EditorView({
                       ))}
                     </div>
                   )}
+                  {perspectiveMode && perspective && !showBefore && (
+                    <div className="quad-layer">
+                      <svg
+                        className="quad-outline"
+                        viewBox="0 0 100 100"
+                        preserveAspectRatio="none"
+                      >
+                        <polygon
+                          points={QUAD_CORNERS.map(
+                            (c) => `${perspective[c][0] * 100},${perspective[c][1] * 100}`,
+                          ).join(" ")}
+                          vectorEffect="non-scaling-stroke"
+                        />
+                      </svg>
+                      {QUAD_CORNERS.map((c) => (
+                        <span
+                          key={c}
+                          className="quad-handle"
+                          style={{
+                            left: `${perspective[c][0] * 100}%`,
+                            top: `${perspective[c][1] * 100}%`,
+                          }}
+                          onMouseDown={(e) => onQuadCornerDown(e, c)}
+                        />
+                      ))}
+                    </div>
+                  )}
                   {straightenMode && frameSize && (
                     <div className="straighten-capture" onMouseDown={onStraightenDown}>
                       {line && (
@@ -1012,6 +1097,32 @@ export function EditorView({
                 </div>
               )}
               {crop && <div className="editor-hint">Drag the box to move · drag a corner to resize.</div>}
+
+              {/* Perspective sub-group inside Crop & Rotate */}
+              <div className="panel-head develop-group-label" style={{ marginTop: 10 }}>
+                Perspective
+              </div>
+              <div className="editor-aspects">
+                <button
+                  className={`chip ${perspectiveMode ? "chip-on" : ""}`}
+                  onClick={() => (perspectiveMode ? setPerspectiveMode(false) : startPerspective())}
+                  title="Drag the four handles onto the corners of the picture, then press Done"
+                >
+                  {perspectiveMode ? "Done" : perspective ? "Adjust corners" : "Correct perspective"}
+                </button>
+                {perspective && (
+                  <button className="chip" onClick={clearPerspective} title="Reset perspective">
+                    Reset
+                  </button>
+                )}
+              </div>
+              <div className="editor-hint">
+                {perspectiveMode
+                  ? "Put each handle on the matching corner of the picture, then press Done."
+                  : perspective
+                    ? "Corners set — the frame is squared up."
+                    : "Squares up a picture or document photographed off-axis."}
+              </div>
 
               {/* Straighten sub-group inside Crop & Rotate */}
               <div className="panel-head develop-group-label" style={{ marginTop: 10 }}>

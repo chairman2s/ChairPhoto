@@ -76,6 +76,7 @@ import { FilterBar } from "./components/FilterBar";
 import { TagEditor } from "./components/TagEditor";
 import { PhotoInspector } from "./components/PhotoInspector";
 import { ZoomableImage } from "./components/ZoomableImage";
+import { CompareView, MAX_PANES } from "./components/CompareView";
 import { QuickTagBar } from "./components/QuickTagBar";
 import { TagGroupsManager } from "./components/TagGroupsManager";
 import { broadcastPhoto, onLoupeReady, openLoupeWindow } from "./modules/loupe";
@@ -183,6 +184,13 @@ export default function App() {
   // aside so the loupe/inspector can show it even though it isn't in `photos`.
   const selected = selection.active;
   const [loupeInline, setLoupeInline] = useState(false);
+  // Compare: the frames being compared, captured when the view is entered rather than
+  // read live from the selection. Culling inside Compare rejects frames, and a rejected
+  // frame can drop straight out of the current filter — so a live-derived pane list would
+  // rearrange itself underneath the decision that caused it. The ids are held; their rows
+  // are looked up fresh each render so badges stay current.
+  const [compareIds, setCompareIds] = useState<number[] | null>(null);
+  const [compareFocusId, setCompareFocusId] = useState<number | null>(null);
   const [cachePreviews, setCachePreviews] = useState(true);
 
   // Side-panel layout: widths (px) and hidden state, persisted to localStorage.
@@ -272,6 +280,37 @@ export default function App() {
   // The Basic Editor module gates the Develop view and per-version editing.
   const canEdit = activeEditRenderer() !== null;
   const inDevelop = develop && selection.activeId != null && canEdit;
+
+  // The compared rows, resolved from the held ids against the current result. Rows are
+  // looked up per render so a rating applied inside Compare shows up on its own pane; the
+  // id list itself is frozen (see `compareIds`). A row that has vanished entirely — the
+  // catalog switched, the photo was purged — is dropped rather than rendered blank.
+  const comparePhotos = compareIds
+    ? compareIds
+        .map((id) => photos.find((p) => p.id === id) ?? null)
+        .filter((p): p is Photo => p !== null)
+    : [];
+  const inCompare = compareIds !== null && comparePhotos.length > 0;
+
+  // Enter Compare on the current selection. Needs two frames to mean anything; more than
+  // MAX_PANES would make each pane too small to judge, so the rest are left behind.
+  const canCompare = selection.ids.length >= 2;
+  const openCompare = useCallback(() => {
+    const ids = selection.ids.slice(0, MAX_PANES);
+    if (ids.length < 2) return;
+    setCompareIds(ids);
+    setCompareFocusId(
+      // Start focused on the active photo when it is one of the panes, so the view opens
+      // on the frame the user was already looking at.
+      selection.activeId != null && ids.includes(selection.activeId) ? selection.activeId : ids[0],
+    );
+    setLoupeInline(false);
+  }, [selection.ids, selection.activeId]);
+
+  const closeCompare = useCallback(() => {
+    setCompareIds(null);
+    setCompareFocusId(null);
+  }, []);
 
   // Open any stack member in the inline loupe. Which photo is *selected* is the session's
   // business (a stacked child is off-grid, so it holds it aside); which surface is on
@@ -956,6 +995,24 @@ export default function App() {
     [refresh, refreshPending],
   );
 
+  // Resolve a comparison: the keeper becomes a pick, every other compared frame a reject.
+  // Reversible (U clears a pick state) and it touches no bytes — reject is a filterable
+  // metadata state, not deletion. Compare stays open on the result so the outcome is
+  // visible and can be undone in place rather than being an unseen side effect.
+  const keepInCompare = useCallback(
+    async (keeperId: number) => {
+      const ids = compareIds ?? [];
+      if (!ids.includes(keeperId)) return;
+      await setPickState(keeperId, "pick");
+      for (const id of ids) {
+        if (id !== keeperId) await setPickState(id, "reject");
+      }
+      setCompareFocusId(keeperId);
+      await refresh();
+    },
+    [compareIds, refresh],
+  );
+
   // Keyboard culling. Active whenever a photo is selected and focus isn't in an input.
   useEffect(() => {
     const handler = async (e: KeyboardEvent) => {
@@ -964,6 +1021,45 @@ export default function App() {
       if (target.tagName === "INPUT" || target.tagName === "TEXTAREA") return;
 
       const key = e.key.toLowerCase();
+
+      // --- Compare owns the keyboard while it is open --------------------------
+      // Deliberately ahead of every grid shortcut: culling keys must act on the FOCUSED
+      // PANE, not on the selection. Falling through to the grid handler would rate all
+      // the compared frames at once, which is the opposite of choosing between them.
+      if (inCompare) {
+        const ids = comparePhotos.map((p) => p.id);
+        const at = compareFocusId != null ? ids.indexOf(compareFocusId) : -1;
+        const focused = at >= 0 ? ids[at] : ids[0];
+        if (e.key === "Escape" || key === "c") {
+          closeCompare();
+        } else if (e.key === "ArrowRight" || e.key === "ArrowDown") {
+          setCompareFocusId(ids[(Math.max(at, 0) + 1) % ids.length]);
+        } else if (e.key === "ArrowLeft" || e.key === "ArrowUp") {
+          setCompareFocusId(ids[(Math.max(at, 0) - 1 + ids.length) % ids.length]);
+        } else if (key === "k") {
+          await keepInCompare(focused);
+        } else if (key >= "0" && key <= "5") {
+          await setRating(focused, parseInt(key, 10));
+          await refresh();
+        } else if (key === "p" || key === "x" || key === "u") {
+          await setPickState(focused, key === "p" ? "pick" : key === "x" ? "reject" : "none");
+          await refresh();
+        } else if (key in COLOR_KEYS) {
+          await setLabel(focused, COLOR_KEYS[key]);
+          await refresh();
+        } else {
+          return;
+        }
+        e.preventDefault();
+        return;
+      }
+
+      // Enter Compare from the grid. Needs two or more selected frames.
+      if (key === "c" && canCompare) {
+        openCompare();
+        e.preventDefault();
+        return;
+      }
 
       // Ctrl/Cmd+A: select every photo in the current view (works with nothing selected yet).
       if ((e.ctrlKey || e.metaKey) && key === "a") {
@@ -1020,6 +1116,15 @@ export default function App() {
     refresh,
     activeView,
     inDevelop,
+    // Compare's branch reads all of these; without them the listener would keep acting on
+    // the pane list and focus it was created with — rating the wrong frame after a step.
+    inCompare,
+    comparePhotos,
+    compareFocusId,
+    canCompare,
+    openCompare,
+    closeCompare,
+    keepInCompare,
   ]);
 
   return (
@@ -1119,6 +1224,18 @@ export default function App() {
             title="Toggle large view (Enter)"
           >
             Loupe
+          </button>
+          <button
+            className={`btn-ghost ${inCompare ? "chip-on" : ""}`}
+            onClick={() => (inCompare ? closeCompare() : openCompare())}
+            disabled={!inCompare && (!canCompare || activeView !== null)}
+            title={
+              canCompare || inCompare
+                ? `Compare the selected frames side by side, up to ${MAX_PANES} (C)`
+                : "Select two or more photos to compare them"
+            }
+          >
+            Compare
           </button>
           <button
             className="btn-ghost"
@@ -1386,6 +1503,15 @@ export default function App() {
             <div className="module-view">
               <ModuleContent view={activeView} />
             </div>
+          ) : inCompare ? (
+            <CompareView
+              photos={comparePhotos}
+              focusedId={compareFocusId}
+              softThreshold={softThreshold}
+              onFocus={setCompareFocusId}
+              onKeep={keepInCompare}
+              onExit={closeCompare}
+            />
           ) : loupeInline && selected ? (
             <div className="loupe-inline">
               <div className="loupe-bar">
@@ -1541,7 +1667,7 @@ export default function App() {
               }}
             />
           )}
-          {!inDevelop && !activeView && !(loupeInline && selected) && library.total > 0 && (
+          {!inDevelop && !activeView && !inCompare && !(loupeInline && selected) && library.total > 0 && (
             <div className="grid-statusbar">
               {/* The MATCHING count, which a windowed fetch would no longer equal
                   `photos.length` (issue #10). */}

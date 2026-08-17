@@ -171,6 +171,23 @@ impl Catalog {
     /// Stacked derivatives (a camera JPEG under its RAW) and missing photos are excluded;
     /// derivatives are reached through the master's Stack section.
     pub fn list_photos(&self, query: &PhotoQuery) -> Result<Vec<Photo>> {
+        let (sql, binds) = self.list_photos_sql(query)?;
+        let params: Vec<&dyn rusqlite::ToSql> = binds.iter().map(|b| b.as_ref()).collect();
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(params.as_slice(), super::row_to_photo)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// The exact statement (and its bound parameters) `list_photos` runs.
+    ///
+    /// Extracted so a test can `EXPLAIN QUERY PLAN` the *real* query rather than a
+    /// hand-copied approximation of it. That distinction matters here: the plan this
+    /// query gets depends on `order_by`'s expression matching `idx_photos_sort_date`
+    /// exactly, and a paraphrase in a test would keep passing after the two drifted apart.
+    pub(crate) fn list_photos_sql(
+        &self,
+        query: &PhotoQuery,
+    ) -> Result<(String, Vec<Box<dyn rusqlite::ToSql>>)> {
         let parts = self.build_query(query)?;
         let mut sql = format!(
             "SELECT DISTINCT {cols} FROM {from} WHERE {wheres}{order}",
@@ -185,10 +202,7 @@ impl Catalog {
             binds.push(Box::new(window.limit as i64));
             binds.push(Box::new(window.offset as i64));
         }
-        let params: Vec<&dyn rusqlite::ToSql> = binds.iter().map(|b| b.as_ref()).collect();
-        let mut stmt = self.conn.prepare(&sql)?;
-        let rows = stmt.query_map(params.as_slice(), super::row_to_photo)?;
-        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        Ok((sql, binds))
     }
 
     /// How many photos match `query`, ignoring its window. One aggregate over the same
@@ -387,6 +401,170 @@ fn order_by(query: &PhotoQuery) -> &'static str {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn temp_catalog(tag: &str) -> (Catalog, crate::test_support::TestSubPath) {
+        let dir = crate::test_support::TestTmpDir::new(&format!("query-{tag}"));
+        let root = dir.join("photos");
+        std::fs::create_dir_all(&root).unwrap();
+        let catalog = Catalog::open(&dir.join("test.chairphoto"), &root).unwrap();
+        (catalog, dir.into_subpath("photos"))
+    }
+
+    /// `EXPLAIN QUERY PLAN` for a statement, one row per line. `EXPLAIN` carries the same
+    /// parameter slots as the statement it explains, so the real binds must be passed
+    /// through — rusqlite rejects a count mismatch.
+    fn plan_of(catalog: &Catalog, sql: &str, binds: &[Box<dyn rusqlite::ToSql>]) -> String {
+        let params: Vec<&dyn rusqlite::ToSql> = binds.iter().map(|b| b.as_ref()).collect();
+        let mut stmt = catalog
+            .conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+            .unwrap();
+        let rows: Vec<String> = stmt
+            .query_map(params.as_slice(), |r| r.get::<_, String>(3))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        rows.join("\n")
+    }
+
+    /// The library grid's default ordering must be served by `idx_photos_sort_date`, not
+    /// by sorting the whole matching set in a temp B-tree.
+    ///
+    /// This is a **plan** assertion rather than a timing one on purpose: on an empty test
+    /// catalog every plan is instant, so a timing test would pass no matter what SQLite
+    /// chose. On the owner's 165k-photo catalog the difference this guards is 176 ms
+    /// versus 0.59 ms, because the temp-B-tree plan sorts all 144,242 matching rows to
+    /// return a 200-row window.
+    ///
+    /// What makes this fragile enough to be worth pinning: SQLite matches an index on an
+    /// expression by comparing parsed expressions, so `order_by`'s Date arm and
+    /// `idx_photos_sort_date` in `schema::SCHEMA_SQL` must stay identical. Edit one
+    /// without the other and the query keeps returning exactly the right rows — it just
+    /// silently goes back to being ~300x slower, which no correctness test would notice.
+    #[test]
+    fn the_default_library_ordering_is_served_by_an_index_not_a_temp_btree() {
+        let (cat, _root) = temp_catalog("sort-plan");
+        // The catalog must hold enough rows for the planner to care. On an empty table
+        // every strategy costs nothing, and SQLite happily picks the temp-B-tree sort —
+        // so an unpopulated version of this test fails for a reason that says nothing
+        // about the index. Populate, then refresh statistics, exactly as a finished scan
+        // does (`phase_b_enrich` calls `Catalog::optimize`).
+        cat.conn
+            .execute_batch(
+                "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i < 5000)
+                 INSERT INTO photos
+                   (uuid, path, mtime_ns, size, extension, capture_time, created_at, updated_at)
+                 SELECT 'u'||i, 'p'||i||'.arw', i * 1000000000, 1, 'arw',
+                        CASE WHEN i % 4 = 0 THEN NULL
+                             ELSE '2026-01-01T00:00:' || printf('%02d', i % 60) END,
+                        0, 0
+                 FROM n;",
+            )
+            .unwrap();
+        cat.optimize();
+
+        let query = PhotoQuery {
+            window: Some(PhotoWindow::new(0, 200)),
+            ..PhotoQuery::default()
+        };
+        assert_eq!(query.sort, PhotoSort::Date, "guarding the default sort");
+
+        let (sql, binds) = cat.list_photos_sql(&query).unwrap();
+        let plan = plan_of(&cat, &sql, &binds);
+
+        assert!(
+            !plan.contains("USE TEMP B-TREE FOR ORDER BY"),
+            "the default library ordering fell back to a full temp-B-tree sort — \
+             `order_by`'s Date arm and `idx_photos_sort_date` (catalog/schema.rs) have \
+             drifted apart, or the index is missing. Plan was:\n{plan}"
+        );
+        assert!(
+            plan.contains("idx_photos_sort_date"),
+            "expected the ordering to be served by idx_photos_sort_date. Plan was:\n{plan}"
+        );
+    }
+
+    /// The index has to exist on catalogs that predate it, not only on freshly created
+    /// ones. It lives in `SCHEMA_SQL`, which `migrate_locked` replays on every open, so
+    /// reopening is the upgrade path — this asserts that actually holds.
+    #[test]
+    fn the_sort_index_appears_on_an_existing_catalog_when_it_is_reopened() {
+        let dir = crate::test_support::TestTmpDir::new("query-sort-upgrade");
+        let root = dir.join("photos");
+        std::fs::create_dir_all(&root).unwrap();
+        let path = dir.join("test.chairphoto");
+
+        // Simulate a pre-index catalog: open once, then drop the index behind the app's
+        // back, exactly as an older ChairPhoto would have left it.
+        {
+            let cat = Catalog::open(&path, &root).unwrap();
+            cat.conn
+                .execute_batch("DROP INDEX IF EXISTS idx_photos_sort_date;")
+                .unwrap();
+            let count: i64 = cat
+                .conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_photos_sort_date'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 0, "precondition: the index is gone before reopening");
+        }
+
+        let cat = Catalog::open(&path, &root).unwrap();
+        let count: i64 = cat
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_photos_sort_date'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            count, 1,
+            "reopening an existing catalog must create idx_photos_sort_date — otherwise \
+             every catalog created before this change keeps the slow plan forever"
+        );
+    }
+
+    /// `Catalog::optimize` must actually populate `sqlite_stat1`, not merely return
+    /// without error.
+    ///
+    /// The distinction is the whole point: `optimize` swallows errors by contract, so
+    /// "it ran" proves nothing. An earlier draft of this test ran `ANALYZE` itself before
+    /// calling `optimize`, which made it pass against an implementation that did nothing —
+    /// and it did pass, while the real planner statistics stayed empty. Assert the
+    /// observable effect, with no help.
+    #[test]
+    fn optimize_populates_planner_statistics() {
+        let (cat, _root) = temp_catalog("optimize");
+        // ANALYZE records nothing for an empty table, so give it rows to sample.
+        // A recursive CTE rather than `generate_series` — the bundled SQLite this crate
+        // links is built without that extension.
+        cat.conn
+            .execute_batch(
+                "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i < 500)
+                 INSERT INTO photos (uuid, path, mtime_ns, size, extension, created_at, updated_at)
+                 SELECT 'u'||i, 'p'||i||'.arw', i, 1, 'arw', 0, 0 FROM n;",
+            )
+            .unwrap();
+        cat.optimize();
+
+        let has_stats: i64 = cat
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name='sqlite_stat1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(has_stats, 1, "expected ANALYZE to have created sqlite_stat1");
+
+        // And the catalog still answers queries afterwards.
+        let n = cat.count_photos(&PhotoQuery::default()).unwrap();
+        assert_eq!(n, 500);
+    }
 
     #[test]
     fn query_defaults_to_the_whole_library_oldest_first() {

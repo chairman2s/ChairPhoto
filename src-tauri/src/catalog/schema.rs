@@ -372,4 +372,34 @@ CREATE INDEX IF NOT EXISTS idx_tags_parent           ON tags(parent_id);
 CREATE INDEX IF NOT EXISTS idx_photo_tags_tag        ON photo_tags(tag_id);
 CREATE INDEX IF NOT EXISTS idx_photo_metadata_lookup ON photo_metadata(key, value_norm, photo_id);
 CREATE INDEX IF NOT EXISTS idx_photo_metadata_photo  ON photo_metadata(photo_id);
+
+-- The library grid's default ordering, as an INDEX ON AN EXPRESSION.
+--
+-- `catalog::query::order_by`'s Date sort is not a column — it is
+-- `COALESCE(CAST(strftime('%s', capture_time) AS INTEGER), mtime_ns / 1000000000)`,
+-- because photos with no EXIF capture time fall back to file mtime so they still slot
+-- into the timeline. `idx_photos_capture_time` indexes the bare column and therefore
+-- cannot satisfy it, so before this index every library listing sorted the WHOLE matching
+-- set in a temp B-tree just to return one 200-row window: measured 176 ms over 144,242
+-- rows on a 165k-photo catalog, versus 0.59 ms with this index (agent measurement,
+-- 2026-08-17). Deep windows improved 410 ms -> 110 ms.
+--
+-- The three expressions must stay BYTE-IDENTICAL to `order_by`'s Date arm (modulo the
+-- `p.` alias, which SQLite resolves away). SQLite matches an expression index by
+-- comparing the parsed expression: change the ORDER BY without changing this and the
+-- index silently stops being used — the query still returns correct rows, just slowly.
+-- `tests` asserts the plan has no temp B-tree, which is what catches that drift.
+--
+-- `strftime` is deterministic (no 'now' argument), which is what makes it legal in an
+-- index expression at all.
+--
+-- This index is INERT WITHOUT PLANNER STATISTICS. Measured on a 165k-photo catalog: with
+-- the index present and no `sqlite_stat1`, SQLite still chose the temp-B-tree sort and
+-- the query still took 167 ms; after `ANALYZE photos` it took 3 ms. Creating the index is
+-- therefore only half the change — see `Catalog::optimize` and its two call sites.
+CREATE INDEX IF NOT EXISTS idx_photos_sort_date ON photos(
+    COALESCE(CAST(strftime('%s', capture_time) AS INTEGER), mtime_ns / 1000000000),
+    path COLLATE NOCASE,
+    id
+);
 "#;

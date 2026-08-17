@@ -330,7 +330,67 @@ impl Catalog {
         self.sync_default_volume_root()?;
 
         self.set_setting("schema_version", &schema::SCHEMA_VERSION.to_string())?;
+        // Only on a catalog that has never been analysed — the one-time cost of catching
+        // up an existing library. Re-analysing on every open would put ~0.15 s of SQLite
+        // work in front of every catalog switch to re-derive statistics that did not
+        // change; a finished scan is what actually invalidates them, and `phase_b_enrich`
+        // calls `optimize` there.
+        if self.lacks_planner_statistics() {
+            self.optimize();
+        }
         Ok(())
+    }
+
+    /// Refresh the query planner's statistics (`sqlite_stat1`).
+    ///
+    /// Without this SQLite plans from heuristics alone. Measured consequence on a real
+    /// 165k-photo catalog (agent measurement, 2026-08-17): `sqlite_stat1` did not exist,
+    /// and the planner drove the library query through `idx_photos_missing` — an index on
+    /// a column with two distinct values, 144,242 of 165,093 rows matching — because
+    /// nothing told it the column was not selective. With statistics it correctly prefers
+    /// a scan.
+    ///
+    /// Analysed per table rather than catalog-wide, and unbounded rather than sampled.
+    /// Both choices are measurements, not taste (agent measurements, 2026-08-17):
+    ///
+    /// - **Not a bare `ANALYZE`.** That would also analyse `photo_metadata`, which on a
+    ///   real library holds ~274 rows per photo — 45 million rows and three indexes,
+    ///   ~82% of the catalog on disk. Measured at 0.8 s per 2 M rows, a full pass costs
+    ///   roughly 18 s. Nothing joins that table (every access is by `photo_id` through its
+    ///   primary key), so the statistics would buy nothing for the time.
+    /// - **Not `PRAGMA analysis_limit`.** Bounding the sample to 400 rows per index makes
+    ///   `ANALYZE` cheap but its output too coarse: with it, the planner still chose a
+    ///   full temp-B-tree sort over `idx_photos_sort_date` at both 5 k and 165 k rows.
+    ///   Sampled statistics are worse than useless here — they cost time and keep the bad
+    ///   plan. Unbounded `ANALYZE photos` measures 0.144 s at 165 k rows and gets it right.
+    /// - **`PRAGMA optimize` was tried first and rejected.** It returns `Ok` while
+    ///   declining to analyse anything, leaving `sqlite_stat1` empty.
+    ///
+    /// The listed tables are the ones real queries join or filter through; they are core
+    /// (`catalog/schema.rs`) so they always exist.
+    ///
+    /// **Best-effort by design.** Statistics are an optimization, never a correctness
+    /// requirement: every query returns the same rows with or without them. Failing an
+    /// open because another connection held the write lock for a moment would trade a
+    /// working catalog for a slightly better plan, so errors are swallowed here rather
+    /// than propagated.
+    pub(crate) fn optimize(&self) {
+        let _ = self.conn.execute_batch(
+            "ANALYZE photos; ANALYZE photo_tags; ANALYZE photo_locations; ANALYZE tags;",
+        );
+    }
+
+    /// True when the planner has no statistics at all — the state every catalog created
+    /// before `optimize` existed is in, and the one that produced the measured bad plan.
+    fn lacks_planner_statistics(&self) -> bool {
+        self.conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name = 'sqlite_stat1'",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .map(|n| n == 0)
+            .unwrap_or(false)
     }
 
     pub fn root(&self) -> &Path {

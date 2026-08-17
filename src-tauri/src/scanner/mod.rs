@@ -429,6 +429,13 @@ pub fn phase_b_enrich(
             .mark_folder_scan_finished(folder_id)
             .map_err(|e| e.to_string())?;
     }
+
+    // A scan is the one thing that changes row counts by orders of magnitude, so it is
+    // where the planner's statistics go stale. Refresh them here rather than waiting for
+    // the next open, so the grid the user is about to browse is planned against what the
+    // catalog now holds — without statistics SQLite ignores `idx_photos_sort_date` and
+    // sorts the whole library instead. Best-effort; see `Catalog::optimize`.
+    catalog.optimize();
     Ok(())
 }
 

@@ -50,7 +50,8 @@ Design docs live in `docs/`.
   space). Allowed only once home holds a verified copy. Pure cache management: never
   synchronized, never affects any other device, never touches home.
 - **Trash** — a per-photo metadata state ("in trash"). Hides the photo everywhere;
-  reversible; synchronizes like any other metadata. Touches no bytes anywhere.
+  reversible; touches no bytes anywhere. Catalog-local, like every other mutable
+  per-photo state: trashing a photo on one device tells no other device anything.
 - **Delete** — destroy an original at home. Only possible on the master, only from
   the trash, only by explicit manual confirmation. Never synchronized, never
   triggered by another device. Satellites have no delete capability at all.
@@ -60,3 +61,10 @@ Design docs live in `docs/`.
 - **Rating** — the catalog owner's single 0–5 star value per photo. One value per
   photo, not per person. Any per-reviewer scoring is a separate concept — such values
   are not Ratings and never overwrite one.
+- **Catalog-local state** — mutable per-photo state that lives in one catalog and does
+  not propagate: Rating, colour label, pick state, Trash. Merge is *additive* — it brings
+  over photos, tags and assignments the receiving catalog does not yet have, and never
+  carries a changed value onto a photo both catalogs already hold. So a device never
+  learns that another device re-rated, re-labelled, or trashed a photo. Propagating such
+  state is a separate concept that does not exist yet; describing any of it as
+  "synchronized" is wrong.

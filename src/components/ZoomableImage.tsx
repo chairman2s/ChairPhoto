@@ -1,18 +1,37 @@
 import { useEffect, useRef, useState } from "react";
 import { previewUrl, zoomUrl } from "../modules/previewCache";
 
+/**
+ * The pan/zoom transform, as a value. Exists so several images can share one — see
+ * `view`/`onViewChange` on {@link ZoomableImage}.
+ */
+export interface ZoomView {
+  /** 1 = fit to window. */
+  scale: number;
+  /** Pan offset in screen pixels, applied before the scale. */
+  tx: number;
+  ty: number;
+}
+
+export const FIT_VIEW: ZoomView = { scale: 1, tx: 0, ty: 0 };
+
 // Loupe image with zoom + pan.
 //
 // At fit (scale 1) it shows the fast 2048 preview. As soon as you zoom in it swaps
 // to the full-resolution embedded preview (`zoom://`) so detail is real, not an
 // upscaled thumbnail. Controls: scroll wheel zooms toward the cursor, drag pans,
 // double-click toggles between fit and 100% (1 image pixel per screen pixel).
+//
+// The transform is normally its own; pass `view` + `onViewChange` to lift it to the
+// caller so several images can be driven as one (Compare).
 export function ZoomableImage({
   photoId,
   srcOverride,
   hiSrcOverride,
   unavailableActions,
   bust,
+  view,
+  onViewChange,
 }: {
   photoId: number;
   /** When set (e.g. an edited version's rendered data URL), shown instead of the
@@ -26,15 +45,34 @@ export function ZoomableImage({
   unavailableActions?: React.ReactNode;
   /** Cache-bust nonce — bumped after a rotation so the loupe re-fetches. */
   bust?: number;
+  /**
+   * Pan/zoom, lifted to the caller. Pass `view` **and** `onViewChange` together to make
+   * this a controlled component: the transform then comes from the caller and every
+   * gesture is reported instead of applied locally, which is what lets Compare drive
+   * several panes from one shared value.
+   *
+   * Omit both (the loupe, Develop) and the component owns its own transform exactly as
+   * before — the uncontrolled path is unchanged, including the reset-on-photo-change
+   * effect, which would otherwise fight a caller that deliberately holds zoom across a
+   * photo swap.
+   */
+  view?: ZoomView;
+  onViewChange?: (next: ZoomView) => void;
 }) {
   const containerRef = useRef<HTMLDivElement>(null);
   const imgRef = useRef<HTMLImageElement>(null);
   const dragRef = useRef<{ x: number; y: number; tx: number; ty: number } | null>(null);
   const want100Ref = useRef(false);
 
-  const [scale, setScale] = useState(1);
-  const [tx, setTx] = useState(0);
-  const [ty, setTy] = useState(0);
+  // The transform, owned here unless the caller passed both `view` and `onViewChange`.
+  const [ownView, setOwnView] = useState<ZoomView>(FIT_VIEW);
+  const controlled = view != null && onViewChange != null;
+  const { scale, tx, ty } = controlled ? view : ownView;
+  const setView = (next: ZoomView) => {
+    if (controlled) onViewChange(next);
+    else setOwnView(next);
+  };
+
   const [hi, setHi] = useState(false); // use full-res source once zoomed
   const [failed, setFailed] = useState(false);
   // Hi-res render of srcOverride ("" = not loaded); fetch failure falls back to
@@ -42,16 +80,22 @@ export function ZoomableImage({
   const [hiOverride, setHiOverride] = useState("");
   const hiOverrideFailed = useRef(false);
 
-  // Reset view when the photo (or the overridden source, e.g. version) changes.
+  // Reset when the photo (or the overridden source, e.g. version) changes.
+  //
+  // The transform is reset only when uncontrolled. A controlled caller owns it, and
+  // Compare deliberately holds zoom while stepping frames — resetting it here would undo
+  // the caller's state on every swap and make a shared view impossible to keep in sync.
   useEffect(() => {
-    setScale(1);
-    setTx(0);
-    setTy(0);
+    if (!controlled) setOwnView(FIT_VIEW);
     setHi(false);
     setFailed(false);
     setHiOverride("");
     hiOverrideFailed.current = false;
     want100Ref.current = false;
+    // `controlled` is derived from props that are stable for a given call site (a caller
+    // does not switch modes mid-life), so it is deliberately not a dependency: including
+    // it would re-run this reset on any parent re-render that changed the view identity.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [photoId, srcOverride, bust]);
 
   // First zoom-in on an override source: fetch its hi-res render once.
@@ -99,19 +143,18 @@ export function ZoomableImage({
     // have fewer pixels than the window (its 100% is below fit), which would clamp
     // max to 1 and leave zoom completely dead. Some magnification beats none.
     const max = Math.max(maxScale(), srcOverride ? 4 : 1);
-    setScale((prevS) => {
-      const next = Math.min(Math.max(prevS * factor, 1), max);
-      if (next === prevS) return prevS;
-      if (next <= 1.0001) {
-        setTx(0);
-        setTy(0);
-      } else {
-        setTx((prevTx) => cx - (next / prevS) * (cx - prevTx));
-        setTy((prevTy) => cy - (next / prevS) * (cy - prevTy));
-        setHi(true);
-      }
-      return next;
-    });
+    const next = Math.min(Math.max(scale * factor, 1), max);
+    if (next === scale) return;
+    if (next <= 1.0001) {
+      setView(FIT_VIEW);
+    } else {
+      setView({
+        scale: next,
+        tx: cx - (next / scale) * (cx - tx),
+        ty: cy - (next / scale) * (cy - ty),
+      });
+      setHi(true);
+    }
   };
 
   const onWheel = (e: React.WheelEvent) => {
@@ -134,16 +177,12 @@ export function ZoomableImage({
     const cx = (clientX ?? rect.left + rect.width / 2) - rect.left - rect.width / 2;
     const cy = (clientY ?? rect.top + rect.height / 2) - rect.top - rect.height / 2;
     want100Ref.current = false;
-    setScale(s);
-    setTx(cx * (1 - s));
-    setTy(cy * (1 - s));
+    setView({ scale: s, tx: cx * (1 - s), ty: cy * (1 - s) });
   };
 
   const onDoubleClick = (e: React.MouseEvent) => {
     if (scale > 1.0001) {
-      setScale(1);
-      setTx(0);
-      setTy(0);
+      setView(FIT_VIEW);
     } else if (hires && imgRef.current?.naturalWidth) {
       applyHundred(e.clientX, e.clientY);
     } else {
@@ -164,8 +203,7 @@ export function ZoomableImage({
   const onMouseMove = (e: React.MouseEvent) => {
     const d = dragRef.current;
     if (!d) return;
-    setTx(d.tx + (e.clientX - d.x));
-    setTy(d.ty + (e.clientY - d.y));
+    setView({ scale, tx: d.tx + (e.clientX - d.x), ty: d.ty + (e.clientY - d.y) });
   };
   const endDrag = () => {
     dragRef.current = null;
@@ -219,9 +257,7 @@ export function ZoomableImage({
           onMouseDown={(e) => e.stopPropagation()}
           onClick={(e) => {
             e.stopPropagation();
-            setScale(1);
-            setTx(0);
-            setTy(0);
+            setView(FIT_VIEW);
             setHi(false);
             want100Ref.current = false;
           }}

@@ -3367,3 +3367,115 @@ body {
   color: var(--text-dim);
   font-size: 11px;
 }
+
+/* --------------------------------------------------------------------------
+   Compare: 2–4 frames side by side under one shared pan/zoom.
+   Mirrors .loupe-inline's shell (same background and bar) so switching between
+   the two surfaces doesn't feel like moving between two different apps.
+   -------------------------------------------------------------------------- */
+.compare-view {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  background: #0B1120;
+}
+.compare-count {
+  font-size: 11px;
+  color: var(--text-dim);
+}
+.compare-warn {
+  margin-left: auto;
+  font-size: 11px;
+  color: #f59e0b;
+  cursor: help;
+}
+.compare-panes {
+  flex: 1;
+  min-height: 0;
+  display: grid;
+  gap: 8px;
+  padding: 0 8px 8px;
+}
+/* Two and three frames read best in one row — vertical space is what a landscape
+   frame needs least. Four splits 2x2 rather than shrinking every pane to a quarter
+   width strip. */
+.compare-panes-2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.compare-panes-3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.compare-panes-4 {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-rows: repeat(2, minmax(0, 1fr));
+}
+@media (max-width: 900px) {
+  .compare-panes-3,
+  .compare-panes-4 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+.compare-pane {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  border: 1px solid #1e293b;
+  border-radius: 8px;
+  overflow: hidden;
+  background: #0B1120;
+}
+/* The focused pane is what the culling keys act on, so it has to be unmistakable
+   at a glance — this is the difference between rating the frame you meant and the
+   one next to it. */
+.compare-pane-focused {
+  border-color: var(--accent, #38bdf8);
+  box-shadow: 0 0 0 1px var(--accent, #38bdf8);
+}
+.compare-pane-rejected .compare-pane-img { opacity: 0.45; }
+.compare-pane-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 8px;
+  background: rgba(30, 41, 59, 0.55);
+  font-size: 11px;
+  color: var(--text-dim);
+}
+.compare-name {
+  font-weight: 600;
+  color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.compare-tag {
+  font-weight: 600;
+  border: 1px solid #475569;
+  border-radius: 6px;
+  padding: 1px 6px;
+  font-size: 10px;
+  white-space: nowrap;
+}
+.compare-tag.compare-pick { color: var(--ok); }
+.compare-tag.compare-reject { color: var(--danger-2); }
+.compare-tag.compare-soft { color: #f59e0b; font-style: italic; }
+.compare-swatch {
+  width: 10px;
+  height: 10px;
+  border-radius: 3px;
+  display: inline-block;
+}
+.compare-pane-img {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+}
+.compare-pane-foot {
+  display: flex;
+  justify-content: center;
+  padding: 6px;
+}
+.compare-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  gap: 6px;
+  background: #0B1120;
+}

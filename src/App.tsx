@@ -77,6 +77,7 @@ import { TagEditor } from "./components/TagEditor";
 import { PhotoInspector } from "./components/PhotoInspector";
 import { ZoomableImage } from "./components/ZoomableImage";
 import { CompareView, MAX_PANES } from "./components/CompareView";
+import { shellTarget } from "./modules/shellTarget";
 import { QuickTagBar } from "./components/QuickTagBar";
 import { TagGroupsManager } from "./components/TagGroupsManager";
 import { broadcastPhoto, onLoupeReady, openLoupeWindow } from "./modules/loupe";
@@ -312,6 +313,13 @@ export default function App() {
     setCompareFocusId(null);
   }, []);
 
+  // Compare's focused pane, when it has one — the second "current photo" that the
+  // inspector and pop-out have to be told about. See modules/shellTarget.ts.
+  const focusedComparePhoto =
+    inCompare && compareFocusId != null
+      ? comparePhotos.find((p) => p.id === compareFocusId) ?? null
+      : null;
+
   // Open any stack member in the inline loupe. Which photo is *selected* is the session's
   // business (a stacked child is off-grid, so it holds it aside); which surface is on
   // screen is the shell's.
@@ -328,28 +336,43 @@ export default function App() {
       ? activeVersion.editJson
       : null;
 
-  // Keep any open pop-out loupe window in sync with the current selection and the
-  // active version (so picking a version updates the pop-out too), and
-  // re-send when a loupe window announces it just opened.
+  // Resolve the selection and Compare's focus into the one photo the inspector and any
+  // pop-out loupe follow, plus the edit that may legitimately ride with it.
+  const {
+    photo: shellPhoto,
+    broadcastId: loupeBroadcastId,
+    editJson: loupeBroadcastEdit,
+  } = shellTarget({
+    selected,
+    activeId: selection.activeId,
+    compareFocus: focusedComparePhoto,
+    activeEditJson: loupeEditJson,
+  });
+
+  // Keep any open pop-out loupe window in sync, and re-send when a loupe window
+  // announces it just opened.
   // Also preload neighbours so navigation is instant (the AGENTS.md preload
   // invariant). We prefetch further ahead than behind, since culling moves forward:
-  // the next 5 photos and the previous 2.
+  // the next 5 photos and the previous 2. Preloading stays keyed on the *selection*: it
+  // exists for stepping through the grid, and the compared frames are already on screen.
   useEffect(() => {
-    broadcastPhoto(selection.activeId, loupeEditJson);
+    broadcastPhoto(loupeBroadcastId, loupeBroadcastEdit);
     if (selection.activeId == null) return;
     const idx = photos.findIndex((p) => p.id === selection.activeId);
     if (idx === -1) return;
     for (let d = 1; d <= 5; d++) prefetch(photos[idx + d]?.id);
     prefetch(photos[idx - 1]?.id);
     prefetch(photos[idx - 2]?.id);
-  }, [selection.activeId, loupeEditJson, photos]);
+  }, [selection.activeId, loupeBroadcastId, loupeBroadcastEdit, photos]);
 
   useEffect(() => {
-    const unlisten = onLoupeReady(() => broadcastPhoto(selection.activeId, loupeEditJson));
+    const unlisten = onLoupeReady(() =>
+      broadcastPhoto(loupeBroadcastId, loupeBroadcastEdit),
+    );
     return () => {
       unlisten.then((f) => f());
     };
-  }, [selection.activeId, loupeEditJson]);
+  }, [loupeBroadcastId, loupeBroadcastEdit]);
 
   // --- chairphoto://<uuid>[/loupe|/develop] deep links ----------------------
   // A link (e.g. from an Obsidian note) opens/focuses the app on that photo —
@@ -1689,15 +1712,20 @@ export default function App() {
             title="Drag to resize"
           />
           <PhotoInspector
-            photo={selected}
+            photo={shellPhoto}
             onChanged={() => {
               refresh();
               refreshPending();
               setGroupsKey((k) => k + 1); // inspector tagging updates "Recently used"
             }}
             allTags={tags}
-            status={selected ? statuses.get(selected.id) ?? null : null}
-            activeVersionId={activeVersion?.id ?? null}
+            status={shellPhoto ? statuses.get(shellPhoto.id) ?? null : null}
+            // `activeVersion` belongs to the selected photo; while Compare is showing a
+            // different frame there is no active version to speak of, and passing one
+            // would attribute another photo's edit to this one.
+            activeVersionId={
+              shellPhoto?.id === selection.activeId ? activeVersion?.id ?? null : null
+            }
             onSelectVersion={setActiveVersion}
             canEditVersions={canEdit}
             onEditVersion={(v) => {

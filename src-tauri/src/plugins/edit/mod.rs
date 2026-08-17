@@ -1,5 +1,6 @@
 //! The basic editor's **render engine** (behind the `edit` Cargo feature): applies a
-//! version's non-destructive edit record — a normalized crop + tone adjustments — to a
+//! version's non-destructive edit record — normalized geometry (perspective, straighten,
+//! crop) plus tone and look adjustments — to a
 //! source JPEG and returns a new JPEG. It never touches the original file; the caller
 //! feeds it the cached preview proxy (live editing/loupe) or, later, a full RAW decode
 //! (export). See docs/editing.md. The edit record shape is owned here but stays opaque
@@ -21,6 +22,9 @@ struct EditRecord {
     crop: Option<Crop>,
     #[serde(default)]
     tone: Tone,
+    /// Four-corner perspective (keystone) correction. `None` = leave the geometry alone.
+    #[serde(default)]
+    perspective: Option<Perspective>,
     /// Straighten angle in degrees (rotate the image about its centre to level it). The
     /// UI pairs this with an inscribed crop so the rotation's empty corners stay out of
     /// frame. Positive matches a line's screen-space tilt (y-down), so `-tilt` levels it.
@@ -74,6 +78,35 @@ struct Crop {
     #[serde(default)]
     aspect: Option<String>,
 }
+
+/// Four-corner perspective (keystone) correction: the source quadrilateral that should
+/// become the output rectangle, as fractions of the source in the same convention as
+/// [`Crop`] — so one record renders identically on the preview proxy and the full-size
+/// original. Photographing a framed picture or a document off-axis turns its rectangle
+/// into a trapezoid; mapping that quad back onto a rectangle undoes it.
+///
+/// Corners are named by their position *on the subject*, so a tilted subject is expressed
+/// by which corner is which — one quad carries rotation and keystone together, and no
+/// separate angle is needed alongside it.
+#[derive(Deserialize)]
+struct Perspective {
+    tl: [f32; 2],
+    tr: [f32; 2],
+    br: [f32; 2],
+    bl: [f32; 2],
+    /// Output aspect (width / height). Absent = derive it from the quad's mean edge
+    /// lengths, which is right for a roughly square-on shot and degrades gracefully
+    /// otherwise. Recovering the subject's true ratio needs the camera's focal length,
+    /// which this engine never sees — it is handed a JPEG, not EXIF — so the UI computes
+    /// that and writes an explicit value here.
+    #[serde(default)]
+    aspect: Option<f32>,
+}
+
+/// Largest output edge a [`Perspective`] record may ask for, as a multiple of the source's
+/// longest edge. The quad is user-supplied data: without a cap, a mis-dragged handle or a
+/// corrupt record could ask for a multi-gigapixel canvas and take the app down.
+const MAX_PERSPECTIVE_SCALE: f32 = 4.0;
 
 /// Parse an "A:B" aspect string into the ratio A/B (width over height). Returns `None`
 /// for "Free"/"Original"/unparseable values.
@@ -146,7 +179,7 @@ pub fn encode_jpeg(img: &DynamicImage, quality: u8) -> Result<Vec<u8>, String> {
     Ok(out.into_inner())
 }
 
-/// Apply the edits in `edit_json` (normalized crop + tone) to an already-decoded image.
+/// Apply the edits in `edit_json` (normalized geometry + tone) to an already-decoded image.
 /// `max_edge` (when > 0) downscales the result's longest edge. Used for both the JPEG
 /// proxy path ([`render_jpeg`]) and full-resolution edited export (RAW decode → here).
 pub fn render_image(
@@ -158,13 +191,23 @@ pub fn render_image(
     let edit: EditRecord = serde_json::from_str(if trimmed.is_empty() { "{}" } else { trimmed })
         .map_err(|e| format!("invalid edit record: {e}"))?;
 
-    // 0) Straighten: rotate about the centre. Corners exposed by the rotation are left
+    // 0) Perspective: map the named quad back onto a rectangle. First, because it
+    //    redefines the frame the later stages work within — straighten's centre and
+    //    crop's fractions both refer to the rectified image, not the original.
+    //    A degenerate quad is non-fatal and simply leaves the geometry alone.
+    if let Some(p) = &edit.perspective {
+        if let Some(warped) = perspective_warp(&img, p) {
+            img = warped;
+        }
+    }
+
+    // 1) Straighten: rotate about the centre. Corners exposed by the rotation are left
     //    black; the UI's inscribed crop keeps them out of the final frame.
     if edit.straighten.abs() > 0.01 {
         img = rotate_about_center(&img, edit.straighten);
     }
 
-    // 1) Crop (normalized → pixels), clamped to the image bounds.
+    // 2) Crop (normalized → pixels), clamped to the image bounds.
     if let Some(c) = &edit.crop {
         let (w, h) = img.dimensions();
         let x = (c.x.clamp(0.0, 1.0) * w as f32).round() as u32;
@@ -185,7 +228,7 @@ pub fn render_image(
         img = img.crop_imm(x, y, cw, ch);
     }
 
-    // 2) Optional downscale (preview speed).
+    // 3) Optional downscale (preview speed).
     if max_edge > 0 {
         let (w, h) = img.dimensions();
         if w.max(h) > max_edge {
@@ -193,7 +236,7 @@ pub fn render_image(
         }
     }
 
-    // 3) The look — tone, B&W mix, LUT, toning, fade, vignette — in the RGB domain.
+    // 4) The look — tone, B&W mix, LUT, toning, fade, vignette — in the RGB domain.
     // The LUT (if referenced) is resolved once per render through cube's mtime cache;
     // a missing/corrupt file is non-fatal and the render proceeds without it.
     let lut = edit.lut.as_ref().and_then(|l| {
@@ -205,6 +248,119 @@ pub fn render_image(
     look::apply_look(&mut rgb, &edit, lut.as_deref());
 
     Ok(DynamicImage::ImageRgb8(rgb))
+}
+
+/// Warp the quadrilateral named by `p` onto a rectangle, undoing the keystone of an
+/// off-axis shot. The output is sized from the quad's own edge lengths (or its explicit
+/// `aspect`), so a picture shot from below comes back at roughly the pixel count it was
+/// captured at rather than being stretched to the source's frame.
+///
+/// `None` for a degenerate quad — collinear or coincident corners have no well-defined
+/// rectification — which the caller treats as "leave the geometry alone", the same
+/// non-fatal degradation a missing LUT gets.
+fn perspective_warp(img: &DynamicImage, p: &Perspective) -> Option<DynamicImage> {
+    let src = img.to_rgb8();
+    let (w, h) = src.dimensions();
+    let (fw, fh) = (w as f32, h as f32);
+    let corner = |c: [f32; 2]| (c[0] * fw, c[1] * fh);
+    let (tl, tr, br, bl) = (corner(p.tl), corner(p.tr), corner(p.br), corner(p.bl));
+
+    let dist = |a: (f32, f32), b: (f32, f32)| (a.0 - b.0).hypot(a.1 - b.1);
+    let mean_w = (dist(tl, tr) + dist(bl, br)) / 2.0;
+    let mean_h = (dist(tl, bl) + dist(tr, br)) / 2.0;
+    if !mean_w.is_finite() || !mean_h.is_finite() || mean_w < 1.0 || mean_h < 1.0 {
+        return None;
+    }
+
+    // Height carries the size estimate and an explicit aspect then sets the width, so a
+    // locked ratio comes out exact instead of being the quotient of two independently
+    // rounded estimates — the same reasoning as `Crop`'s aspect lock.
+    let cap = (fw.max(fh) * MAX_PERSPECTIVE_SCALE).max(1.0);
+    let out_h = mean_h;
+    let out_w = match p.aspect {
+        Some(a) if a.is_finite() && a > 0.0 => out_h * a,
+        _ => mean_w,
+    };
+    let out_w = (out_w.round().clamp(1.0, cap)) as u32;
+    let out_h = (out_h.round().clamp(1.0, cap)) as u32;
+
+    // Solve the map from the OUTPUT rectangle onto the source quad. Sampling runs per
+    // output pixel, so dest → src is already the direction the loop needs; no inversion.
+    let (ow, oh) = (out_w as f32, out_h as f32);
+    let m = solve_homography(
+        [(0.0, 0.0), (ow, 0.0), (ow, oh), (0.0, oh)],
+        [tl, tr, br, bl],
+    )?;
+
+    let mut out = RgbImage::new(out_w, out_h);
+    for y in 0..out_h {
+        for x in 0..out_w {
+            let (u, v) = (x as f32 + 0.5, y as f32 + 0.5);
+            let denom = m[6] * u + m[7] * v + 1.0;
+            // The quad's horizon line maps to denom == 0; a pixel there has no finite
+            // source point, so it is background rather than a wild sample.
+            if denom.abs() < 1e-6 {
+                continue;
+            }
+            let sx = (m[0] * u + m[1] * v + m[2]) / denom;
+            let sy = (m[3] * u + m[4] * v + m[5]) / denom;
+            if !sx.is_finite() || !sy.is_finite() {
+                continue;
+            }
+            out.put_pixel(x, y, sample_bilinear(&src, sx - 0.5, sy - 0.5));
+        }
+    }
+    Some(DynamicImage::ImageRgb8(out))
+}
+
+/// Solve the eight coefficients of the projective map taking each `from[i]` to `to[i]`:
+///
+/// ```text
+/// x = (m0·u + m1·v + m2) / (m6·u + m7·v + 1)
+/// y = (m3·u + m4·v + m5) / (m6·u + m7·v + 1)
+/// ```
+///
+/// Each correspondence contributes two linear equations in the eight unknowns, giving an
+/// 8×8 system solved by Gauss-Jordan with partial pivoting. Accumulates in `f64`: the
+/// products of pixel coordinates in the last two columns are large enough that `f32`
+/// pivoting visibly bends long edges. `None` when the system is singular — a degenerate
+/// quad.
+fn solve_homography(from: [(f32, f32); 4], to: [(f32, f32); 4]) -> Option<[f32; 8]> {
+    let mut a = [[0f64; 9]; 8];
+    for i in 0..4 {
+        let (u, v) = (from[i].0 as f64, from[i].1 as f64);
+        let (x, y) = (to[i].0 as f64, to[i].1 as f64);
+        a[i * 2] = [u, v, 1.0, 0.0, 0.0, 0.0, -u * x, -v * x, x];
+        a[i * 2 + 1] = [0.0, 0.0, 0.0, u, v, 1.0, -u * y, -v * y, y];
+    }
+    for col in 0..8 {
+        let pivot = (col..8).max_by(|&r1, &r2| a[r1][col].abs().total_cmp(&a[r2][col].abs()))?;
+        if a[pivot][col].abs() < 1e-9 {
+            return None;
+        }
+        a.swap(col, pivot);
+        let d = a[col][col];
+        for k in col..9 {
+            a[col][k] /= d;
+        }
+        for r in 0..8 {
+            if r == col || a[r][col] == 0.0 {
+                continue;
+            }
+            let f = a[r][col];
+            for k in col..9 {
+                a[r][k] -= f * a[col][k];
+            }
+        }
+    }
+    let mut m = [0f32; 8];
+    for (i, row) in a.iter().enumerate() {
+        if !row[8].is_finite() {
+            return None;
+        }
+        m[i] = row[8] as f32;
+    }
+    Some(m)
 }
 
 /// Rotate an image about its centre by `degrees`, keeping the same canvas size. Pixels
@@ -329,6 +485,187 @@ mod tests {
         let out = render_jpeg(&src, r#"{"straighten":0}"#, 0).unwrap();
         let img = image::load_from_memory(&out).unwrap().to_rgb8();
         assert_eq!(img.get_pixel(0, 0).0, [200, 100, 50], "no rotation, corner intact");
+    }
+
+    /// Encode an image the tests built pixel-by-pixel, so a case can start from something
+    /// with structure rather than a flat colour.
+    fn jpeg_of(img: &RgbImage) -> Vec<u8> {
+        let mut out = std::io::Cursor::new(Vec::new());
+        DynamicImage::ImageRgb8(img.clone())
+            .write_with_encoder(JpegEncoder::new_with_quality(&mut out, 95))
+            .unwrap();
+        out.into_inner()
+    }
+
+    /// A black canvas with the convex quad `pts` (in order) painted white — a stand-in for
+    /// a framed picture photographed off-axis.
+    fn quad_image(w: u32, h: u32, pts: [(f32, f32); 4]) -> RgbImage {
+        let side = |a: (f32, f32), b: (f32, f32), px: f32, py: f32| {
+            (b.0 - a.0) * (py - a.1) - (b.1 - a.1) * (px - a.0)
+        };
+        let mut img = RgbImage::from_pixel(w, h, Rgb([0, 0, 0]));
+        for y in 0..h {
+            for x in 0..w {
+                let (px, py) = (x as f32 + 0.5, y as f32 + 0.5);
+                let s: [f32; 4] =
+                    std::array::from_fn(|i| side(pts[i], pts[(i + 1) % 4], px, py));
+                if s.iter().all(|v| *v >= 0.0) || s.iter().all(|v| *v <= 0.0) {
+                    img.put_pixel(x, y, Rgb([255, 255, 255]));
+                }
+            }
+        }
+        img
+    }
+
+    /// Mean brightness of one quadrant of `img`, inset by 12% so the quad's own boundary
+    /// (where bilinear sampling picks up the surround) can't sway the reading.
+    fn quadrant_mean(img: &RgbImage, right: bool, bottom: bool) -> f32 {
+        let (w, h) = img.dimensions();
+        let (iw, ih) = (w as f32 * 0.12, h as f32 * 0.12);
+        let x0 = if right { w as f32 / 2.0 } else { iw } as u32;
+        let x1 = if right { w as f32 - iw } else { w as f32 / 2.0 } as u32;
+        let y0 = if bottom { h as f32 / 2.0 } else { ih } as u32;
+        let y1 = if bottom { h as f32 - ih } else { h as f32 / 2.0 } as u32;
+        let mut sum = 0f64;
+        let mut n = 0f64;
+        for y in y0..y1 {
+            for x in x0..x1 {
+                sum += img.get_pixel(x, y).0[0] as f64;
+                n += 1.0;
+            }
+        }
+        (sum / n.max(1.0)) as f32
+    }
+
+    #[test]
+    fn perspective_rectifies_the_named_quad() {
+        // A white trapezoid on black — the shape a rectangular picture takes when shot
+        // from below and off-axis — with a dark notch inside its top-right corner so the
+        // test can tell a correct rectification from one that transposes or rotates the
+        // corners. A plain white quad cannot: it is symmetric under those mistakes.
+        let quad = [(20.0, 10.0), (78.0, 18.0), (86.0, 84.0), (12.0, 76.0)];
+        let mut canvas = quad_image(96, 96, quad);
+        let (tl, tr, bl) = (quad[0], quad[1], quad[3]);
+        let ex = (tr.0 - tl.0, tr.1 - tl.1);
+        let ey = (bl.0 - tl.0, bl.1 - tl.1);
+        let notch = (
+            tl.0 + 0.78 * ex.0 + 0.20 * ey.0,
+            tl.1 + 0.78 * ex.1 + 0.20 * ey.1,
+        );
+        for dy in -6i32..=6 {
+            for dx in -6i32..=6 {
+                let (x, y) = (notch.0 as i32 + dx, notch.1 as i32 + dy);
+                if x >= 0 && y >= 0 && (x as u32) < 96 && (y as u32) < 96 {
+                    canvas.put_pixel(x as u32, y as u32, Rgb([0, 0, 0]));
+                }
+            }
+        }
+        let src = jpeg_of(&canvas);
+        let out = render_jpeg(
+            &src,
+            r#"{"perspective":{"tl":[0.2083,0.1042],"tr":[0.8125,0.1875],
+                               "br":[0.8958,0.875],"bl":[0.125,0.7917]}}"#,
+            0,
+        )
+        .unwrap();
+
+        let (r, _, _) = mean_rgb(&out);
+        let (src_mean, _, _) = mean_rgb(&src);
+        // The source is only ~half subject, so a warp that ignored the corners could not
+        // fill the frame like this.
+        assert!(
+            r > src_mean + 70.0,
+            "rectified mean {r} must be far above the source's {src_mean}"
+        );
+
+        // Orientation: the notch must land in the top-right quadrant and nowhere else.
+        let img = image::load_from_memory(&out).unwrap().to_rgb8();
+        let top_right = quadrant_mean(&img, true, false);
+        let others = [
+            quadrant_mean(&img, false, false),
+            quadrant_mean(&img, false, true),
+            quadrant_mean(&img, true, true),
+        ];
+        let brightest_other = others.iter().cloned().fold(f32::MIN, f32::max);
+        let dimmest_other = others.iter().cloned().fold(f32::MAX, f32::min);
+        assert!(
+            top_right < dimmest_other - 20.0,
+            "the notch must rectify into the top-right quadrant: tr={top_right}, \
+             others={others:?} (brightest {brightest_other})"
+        );
+    }
+
+    #[test]
+    fn perspective_full_frame_quad_is_near_identity() {
+        // Corners at the frame edges describe "already rectangular" — the warp must give
+        // the pixels back unchanged, not resample them into a subtly different image.
+        let mut grad = RgbImage::new(96, 96);
+        for (x, y, p) in grad.enumerate_pixels_mut() {
+            *p = Rgb([(x * 2) as u8, (y * 2) as u8, 128]);
+        }
+        let src = jpeg_of(&grad);
+        let out = render_jpeg(
+            &src,
+            r#"{"perspective":{"tl":[0,0],"tr":[1,0],"br":[1,1],"bl":[0,1]}}"#,
+            0,
+        )
+        .unwrap();
+        let img = image::load_from_memory(&out).unwrap().to_rgb8();
+        assert_eq!(img.dimensions(), (96, 96), "a full-frame quad keeps the size");
+        let got = img.get_pixel(24, 48).0;
+        assert!(
+            (got[0] as i32 - 48).abs() < 12 && (got[1] as i32 - 96).abs() < 12,
+            "pixel should survive the round trip, got {got:?}"
+        );
+    }
+
+    #[test]
+    fn degenerate_perspective_quad_is_nonfatal() {
+        // Four coincident corners have no rectification. That must leave the geometry
+        // alone rather than fail the render — the same contract a missing LUT gets.
+        let src = solid_jpeg(90, 110, 130);
+        let out = render_jpeg(
+            &src,
+            r#"{"perspective":{"tl":[0.5,0.5],"tr":[0.5,0.5],"br":[0.5,0.5],"bl":[0.5,0.5]}}"#,
+            0,
+        )
+        .unwrap();
+        let plain = render_jpeg(&src, "{}", 0).unwrap();
+        assert_eq!(out, plain, "a degenerate quad must degrade to a no-op");
+    }
+
+    #[test]
+    fn perspective_aspect_forces_the_output_ratio() {
+        // An explicit aspect is what the UI writes once it has recovered the subject's
+        // true ratio; the engine must honour it rather than the quad's own proportions.
+        let src = jpeg_of(&RgbImage::from_pixel(64, 64, Rgb([200, 200, 200])));
+        let out = render_jpeg(
+            &src,
+            r#"{"perspective":{"tl":[0.1,0.1],"tr":[0.9,0.1],"br":[0.9,0.9],"bl":[0.1,0.9],
+                               "aspect":2.0}}"#,
+            0,
+        )
+        .unwrap();
+        let (w, h) = image::load_from_memory(&out).unwrap().dimensions();
+        let ratio = w as f32 / h as f32;
+        assert!((ratio - 2.0).abs() < 0.05, "aspect 2.0 requested, got {ratio} ({w}x{h})");
+    }
+
+    #[test]
+    fn absurd_perspective_quad_cannot_explode_the_canvas() {
+        // A mis-dragged handle or a corrupt record must not turn a 16px thumbnail into a
+        // multi-gigapixel allocation.
+        let src = solid_jpeg(120, 120, 120);
+        let out = render_jpeg(
+            &src,
+            r#"{"perspective":{"tl":[-500,-500],"tr":[500,-500],
+                               "br":[500,500],"bl":[-500,500]}}"#,
+            0,
+        )
+        .unwrap();
+        let (w, h) = image::load_from_memory(&out).unwrap().dimensions();
+        let cap = (16.0 * MAX_PERSPECTIVE_SCALE) as u32;
+        assert!(w <= cap && h <= cap, "output must stay capped, got {w}x{h} (cap {cap})");
     }
 
     #[test]

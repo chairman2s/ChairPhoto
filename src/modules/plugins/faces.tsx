@@ -36,7 +36,7 @@
 //     screen_p = C + (fit_p − C) * s + (tx, ty)
 //     screen_w = fit_w * s,  screen_h = fit_h * s
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { ChairPhotoAPI, ChairPhotoModule, Tag } from "../registry";
 import { useHostSelection } from "../host";
 import "./faces.css";
@@ -143,6 +143,29 @@ const facesForPhoto = (api: FacesCommandApi, photoId: number) =>
 /** Accept a face suggestion: sets state=confirmed, assigns the person tag to the photo. */
 const faceConfirm = (api: FacesCommandApi, faceId: number) =>
   api.invoke<void>("faces_accept", { faceId });
+
+/**
+ * Honest counters from a batch confirm (`faces_accept_person`) — every selected photo lands
+ * in exactly one bucket, so the UI can report what actually happened.
+ */
+interface AcceptPersonOutcome {
+  /** Photos where at least one suggested face became confirmed. */
+  photosConfirmed: number;
+  /** Faces moved suggested → confirmed, summed over every photo. */
+  facesConfirmed: number;
+  /** Photos that already had this person confirmed — nothing to do, and not a failure. */
+  photosAlreadyConfirmed: number;
+  /** Photos where this person was never suggested. They are NOT force-assigned. */
+  photosWithoutSuggestion: number;
+}
+
+/**
+ * Confirm a person across a multi-selection: accepts the faces already *suggested* as
+ * `tagId` on each photo (issue #68). Photos where the person was never suggested are
+ * reported back, not tagged — this accepts suggestions, it never invents them.
+ */
+const facesAcceptPerson = (api: FacesCommandApi, photoIds: number[], tagId: number) =>
+  api.invoke<AcceptPersonOutcome>("faces_accept_person", { photoIds, tagId });
 
 /** Reject a face suggestion: sets state=rejected so it is never re-proposed. */
 const faceReject = (api: FacesCommandApi, faceId: number) =>
@@ -1318,19 +1341,57 @@ export function FaceOverlay({ photoId, api }: FaceOverlayProps) {
   );
 }
 
+/**
+ * One line describing what a batch confirm actually did. Every selected photo falls in
+ * exactly one bucket, so photos the person was never suggested on are named rather than
+ * folded into the total — "confirmed on 6 of 9" has to mean what it says.
+ */
+function batchConfirmMessage(
+  out: AcceptPersonOutcome,
+  selectedCount: number,
+  person: string,
+): string {
+  const notes: string[] = [];
+  if (out.photosAlreadyConfirmed > 0) {
+    notes.push(`${out.photosAlreadyConfirmed} already confirmed`);
+  }
+  if (out.photosWithoutSuggestion > 0) {
+    notes.push(`${out.photosWithoutSuggestion} had no suggestion for ${person}`);
+  }
+  const tail = notes.length > 0 ? ` — ${notes.join(", ")}` : "";
+  if (out.photosConfirmed === 0) {
+    return `Nothing to confirm on the ${selectedCount} selected photos${tail}.`;
+  }
+  // Faces only when they outnumber photos (one person can be suggested twice in a photo).
+  const faces =
+    out.facesConfirmed !== out.photosConfirmed ? ` (${out.facesConfirmed} faces)` : "";
+  return `Confirmed ${person} on ${out.photosConfirmed} of ${selectedCount} selected photos${faces}${tail}.`;
+}
+
 // ── FacesInspectorPanel — per-photo face review list ─────────────────────────
 
 function FacesInspectorPanel({ api }: { api: ChairPhotoAPI }) {
-  useHostSelection(); // re-render on photo change
+  const selectionVersion = useHostSelection(); // re-render on photo/selection change
   const photoId = api.getActivePhotoId();
   const [faces, setFaces] = useState<FaceRow[]>([]);
   const [loading, setLoading] = useState(false);
   const [reassigning, setReassigning] = useState<number | null>(null);
+  // The face whose batch confirm is in flight, so its button can't be double-fired.
+  const [batchBusy, setBatchBusy] = useState<number | null>(null);
   const [peopleTags, setPeopleTags] = useState<Tag[]>([]);
   const [peopleRoot, setPeopleRoot] = useState("");
   // Guard against setState after unmount (e.g. user navigates away while a
   // loadFaces promise is in flight).
   const mountedRef = useRef(true);
+
+  // The photos a batch confirm would act on. The active photo is normally part of the
+  // selection, but union it in defensively: the panel shows *its* faces, so it must never
+  // be the one photo left out. `selectionVersion` is what makes this re-derive —
+  // `getSelectedPhotos()` is a live host read, not a value React can track on its own.
+  const selectedIds = useMemo(() => {
+    const ids = api.getSelectedPhotos().map((p) => p.id);
+    return photoId != null && !ids.includes(photoId) ? [...ids, photoId] : ids;
+  }, [api, photoId, selectionVersion]);
 
   useEffect(() => {
     mountedRef.current = true;
@@ -1380,6 +1441,25 @@ function FacesInspectorPanel({ api }: { api: ChairPhotoAPI }) {
     await faceConfirm(api, face.id).catch(() => {});
     loadFaces();
     api.notifyChange();
+  };
+
+  // Confirm this person on the whole selection, not just the photo on screen (issue #68).
+  // Only photos where the matcher already suggested them are touched; the rest are reported.
+  const handleConfirmOnSelection = async (face: FaceRow) => {
+    const tagId = face.personTagId;
+    if (tagId == null || selectedIds.length < 2) return;
+    const person = face.personName ?? "this person";
+    setBatchBusy(face.id);
+    try {
+      const out = await facesAcceptPerson(api, selectedIds, tagId);
+      api.showToast(batchConfirmMessage(out, selectedIds.length, person));
+      loadFaces();
+      api.notifyChange();
+    } catch {
+      api.showToast(`Could not confirm ${person} on the selected photos.`);
+    } finally {
+      if (mountedRef.current) setBatchBusy(null);
+    }
   };
 
   const handleReject = async (face: FaceRow) => {
@@ -1461,6 +1541,18 @@ function FacesInspectorPanel({ api }: { api: ChairPhotoAPI }) {
                 {isSuggested && (
                   <button className="chip" onClick={() => void handleConfirm(face)}>
                     ✓ confirm
+                  </button>
+                )}
+                {isSuggested && face.personTagId != null && selectedIds.length > 1 && (
+                  <button
+                    className="chip"
+                    disabled={batchBusy != null}
+                    onClick={() => void handleConfirmOnSelection(face)}
+                    title={`Confirm ${face.personName ?? "this person"} on all ${selectedIds.length} selected photos — only where they were already suggested`}
+                  >
+                    {batchBusy === face.id
+                      ? "confirming…"
+                      : `✓✓ confirm on ${selectedIds.length}`}
                   </button>
                 )}
                 {(isSuggested || face.state === "unassigned") && (
@@ -3221,6 +3313,7 @@ export const facesModule: ChairPhotoModule = {
   permissions: {
     commands: [
       "faces_accept",
+      "faces_accept_person",
       "faces_add_manual",
       "faces_assign",
       "faces_cluster_summary",

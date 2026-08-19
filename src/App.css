@@ -398,6 +398,12 @@ body {
 }
 
 /* Body layout */
+/* Three fixed tracks — left panel, grid, inspector — whose widths App.tsx overrides
+   inline (a hidden panel becomes a 0px track). The track count is constant but the
+   *children* are not: `.leftcol` and `.rightcol` are conditionally rendered. So every
+   column below declares its own `grid-column`; without that, auto-placement fills the
+   tracks in DOM order and hiding the left panel drops `<main>` into the 0px track,
+   blanking the grid (issue #71). A new column here needs an explicit track too. */
 .body {
   flex: 1;
   display: grid;
@@ -423,6 +429,7 @@ body {
 
 /* Left column: tags (top, grows) + albums (bottom, capped). */
 .leftcol {
+  grid-column: 1;
   display: flex;
   flex-direction: column;
   min-height: 0;
@@ -1440,6 +1447,7 @@ body {
 /* Right column: inspector (scrolls) on top, quick-tag bar pinned beneath it.
    Left side = organise/select; right side = act (rate, tag, AI, quick-tag). */
 .rightcol {
+  grid-column: 3;
   display: flex;
   flex-direction: column;
   min-height: 0;
@@ -1449,13 +1457,15 @@ body {
 
 /* Grid */
 .grid-wrap {
+  grid-column: 2;
   flex: 1;
   overflow-y: auto;
   padding: 12px;
   position: relative; /* positioning context for the virtualized .grid-scroll */
 }
 /* Develop view spans the main + right-column tracks so its controls land in the
-   right column (the inspector is hidden in develop). */
+   right column (the inspector is hidden in develop). The element carries both classes,
+   so this rule must stay *after* `.grid-wrap` — equal specificity, last one wins. */
 .develop-wrap {
   grid-column: 2 / 4;
   padding: 0;

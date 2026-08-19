@@ -40,6 +40,16 @@ export default defineConfig({
   test: {
     environment: "node",
     globals: true,
+    // Vitest stubs CSS imports to an empty string by default, which also empties a
+    // `?raw` import of one. `src/__tests__/bodyColumns.test.ts` asserts a layout
+    // invariant that lives in App.css (issue #71), so that one file is un-stubbed.
+    // Kept to a single file: processing every stylesheet (Leaflet's included) would
+    // slow the suite down for no other test's benefit.
+    //
+    // NOT end-anchored, deliberately: the pattern is matched against the module id,
+    // which carries the query — `/…/src/App.css?raw` — so `/App\.css$/` matches
+    // nothing and the file silently stays stubbed (an empty string, not an error).
+    css: { include: [/App\.css/] },
     include: ["src/**/*.test.ts", "src/**/*.test.tsx"],
     alias: {
       "@tauri-apps/api/core": resolve(__dirname, "src/__test_stubs__/tauri-api-core.ts"),

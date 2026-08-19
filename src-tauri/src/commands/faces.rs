@@ -645,6 +645,58 @@ pub async fn faces_accept(state: State<'_, AppState>, face_id: i64) -> Result<()
     .await
 }
 
+/// Confirm a person across a multi-selection (issue #68): for every photo in `photo_ids`,
+/// accept the faces the matcher already suggested as `tag_id`, assign the person tag to
+/// those photos through the catalog, and re-export their MWG regions.
+///
+/// This accepts suggestions; it does not create them. Photos where the person was never
+/// suggested are counted and returned, not force-assigned — see
+/// [`matcher::accept_person_on_photos`] for why. The returned counters are what the UI
+/// reports, so "confirmed on 6 of 9" stays honest.
+#[cfg(feature = "faces")]
+#[tauri::command]
+pub async fn faces_accept_person(
+    state: State<'_, AppState>,
+    photo_ids: Vec<i64>,
+    tag_id: i64,
+) -> Result<crate::plugins::faces::matcher::AcceptPersonOutcome, String> {
+    with_catalog_blocking(&state, move |c| {
+        let (outcome, changed) = accept_person_in_catalog(c, &photo_ids, tag_id)?;
+        // Sidecar writes are file I/O and best-effort, so they run after the commit: a NAS
+        // that went offline must not roll back a confirmation the catalog already recorded.
+        for photo_id in changed {
+            faces_write_regions(c, photo_id);
+        }
+        Ok(outcome)
+    })
+    .await
+}
+
+/// The catalog half of [`faces_accept_person`]: confirm the suggested faces and assign the
+/// person tag to the photos that changed, in one transaction — the face rows and the
+/// photo-level tags they imply land together, so a failure part-way cannot leave confirmed
+/// faces on photos that never got the tag. Split out from the command so it can be tested
+/// against a real catalog (the command itself needs a Tauri `State`).
+///
+/// Returns the counters and the photos that changed, which are the only ones needing a
+/// sidecar re-export.
+#[cfg(feature = "faces")]
+fn accept_person_in_catalog(
+    c: &crate::catalog::Catalog,
+    photo_ids: &[i64],
+    tag_id: i64,
+) -> crate::catalog::Result<(crate::plugins::faces::matcher::AcceptPersonOutcome, Vec<i64>)> {
+    use crate::plugins::faces::matcher;
+    let tx = c.conn().unchecked_transaction()?;
+    let (outcome, changed) = matcher::accept_person_on_photos(&tx, photo_ids, tag_id)?;
+    for &photo_id in &changed {
+        // Same connection as `tx`, so these participate in the open transaction.
+        c.assign_tag(photo_id, tag_id)?;
+    }
+    tx.commit()?;
+    Ok((outcome, changed))
+}
+
 /// Reject the face's currently-suggested person: remember the (face, person) pair so it is
 /// never re-proposed, and return the face to `unassigned`.
 #[cfg(feature = "faces")]
@@ -1310,5 +1362,174 @@ mod faces_job_ownership_tests {
             state.catalog.lock().unwrap().is_some(),
             "a failed persist must leave the catalog open"
         );
+    }
+}
+
+/// Batch confirm (issue #68) against a **real catalog**, which is where the bug actually
+/// lived: the face rows were only half the job — the person tag has to reach the photo too,
+/// through `assign_tag`, or the catalog and the face rows disagree about who is in the photo.
+/// The matcher's own unit tests cover which faces are selected; these cover the catalog side
+/// of the transaction.
+#[cfg(all(test, feature = "faces"))]
+mod accept_person_tests {
+    use super::*;
+    use crate::plugins::faces::store;
+    use rusqlite::OptionalExtension;
+
+    fn temp_catalog(tag: &str) -> (Catalog, crate::test_support::TestSubPath) {
+        let dir = crate::test_support::TestTmpDir::new(&format!("faces-accept-person-{tag}"));
+        let root = dir.join("photos");
+        std::fs::create_dir_all(&root).unwrap();
+        let db = dir.join("catalog.chairphoto");
+        let catalog = Catalog::open(&db, &root).unwrap();
+        store::ensure_schema(catalog.conn()).unwrap();
+        (catalog, dir.into_subpath("catalog.chairphoto"))
+    }
+
+    fn add_photo(c: &Catalog, id: i64) {
+        c.conn()
+            .execute(
+                "INSERT INTO photos (id, uuid, path, mtime_ns, size, extension, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, 0, 0, 'nef', 0, 0)",
+                rusqlite::params![id, format!("uuid-{id}"), format!("{id}.NEF")],
+            )
+            .unwrap();
+    }
+
+    /// A face already suggested as `tag_id`, as the matcher would leave it.
+    fn add_suggested_face(c: &Catalog, photo_id: i64, tag_id: i64) -> i64 {
+        let face_id = store::insert_face(
+            c.conn(),
+            photo_id,
+            "[0.1,0.1,0.2,0.2]",
+            "[]",
+            0.99,
+            None,
+            "detect",
+            0,
+        )
+        .unwrap();
+        c.conn()
+            .execute(
+                "UPDATE faces__faces
+                    SET person_tag_id = ?2, state = 'suggested', match_confidence = 0.9
+                  WHERE id = ?1",
+                rusqlite::params![face_id, tag_id],
+            )
+            .unwrap();
+        face_id
+    }
+
+    fn has_tag(c: &Catalog, photo_id: i64, tag_id: i64) -> bool {
+        c.conn()
+            .query_row(
+                "SELECT 1 FROM photo_tags WHERE photo_id = ?1 AND tag_id = ?2",
+                rusqlite::params![photo_id, tag_id],
+                |_| Ok(()),
+            )
+            .optional()
+            .unwrap()
+            .is_some()
+    }
+
+    fn face_state(c: &Catalog, face_id: i64) -> String {
+        c.conn()
+            .query_row(
+                "SELECT state FROM faces__faces WHERE id = ?1",
+                [face_id],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    /// The person tag reaches every photo whose suggestion was confirmed — and only those.
+    /// A photo where the person was never suggested keeps neither the tag nor a face row,
+    /// which is the whole point of accepting suggestions rather than force-assigning.
+    #[test]
+    fn accept_person_tags_exactly_the_photos_it_confirmed() {
+        let (c, _db) = temp_catalog("tags");
+        let alice = c.create_tag("People/Alice").unwrap();
+        let bob = c.create_tag("People/Bob").unwrap();
+        for id in 1..=3 {
+            add_photo(&c, id);
+        }
+        let f1 = add_suggested_face(&c, 1, alice);
+        let f2 = add_suggested_face(&c, 2, alice);
+        let f3 = add_suggested_face(&c, 3, bob); // Alice was never suggested here
+
+        let (outcome, changed) = accept_person_in_catalog(&c, &[1, 2, 3], alice).unwrap();
+
+        assert_eq!(outcome.photos_confirmed, 2);
+        assert_eq!(outcome.faces_confirmed, 2);
+        assert_eq!(outcome.photos_without_suggestion, 1);
+        assert_eq!(changed, vec![1, 2], "only these need a sidecar re-export");
+
+        assert_eq!(face_state(&c, f1), "confirmed");
+        assert_eq!(face_state(&c, f2), "confirmed");
+        assert_eq!(face_state(&c, f3), "suggested", "Bob's suggestion is untouched");
+
+        assert!(has_tag(&c, 1, alice), "the confirmed photo must carry the person tag");
+        assert!(has_tag(&c, 2, alice), "…on every confirmed photo, not just the last one");
+        assert!(!has_tag(&c, 3, alice), "a photo with no suggestion is not tagged");
+        assert!(!has_tag(&c, 3, bob), "and confirming Alice does not confirm Bob");
+    }
+
+    /// Confirming a person twice is harmless: the second call finds them already confirmed,
+    /// reports it as such, and leaves the photo-level tag exactly once.
+    #[test]
+    fn accept_person_is_idempotent() {
+        let (c, _db) = temp_catalog("idempotent");
+        let alice = c.create_tag("People/Alice").unwrap();
+        add_photo(&c, 1);
+        add_suggested_face(&c, 1, alice);
+
+        accept_person_in_catalog(&c, &[1], alice).unwrap();
+        let (outcome, changed) = accept_person_in_catalog(&c, &[1], alice).unwrap();
+
+        assert_eq!(outcome.photos_confirmed, 0);
+        assert_eq!(outcome.photos_already_confirmed, 1);
+        assert!(changed.is_empty(), "nothing changed, so nothing to re-export");
+        let tags: i64 = c
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM photo_tags WHERE photo_id = 1 AND tag_id = ?1",
+                [alice],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(tags, 1);
+    }
+
+    /// The batch is one transaction. A photo whose tagging fails part-way through must take
+    /// the whole call down with it: faces confirmed earlier in the same batch have to roll
+    /// back too, or the catalog ends up with faces confirmed as a person the photo was never
+    /// tagged with. The failure is injected with a trigger, because that seam — `assign_tag`
+    /// failing after the face rows are already updated — has no natural trigger in a test.
+    #[test]
+    fn a_failed_assignment_rolls_back_the_whole_batch() {
+        let (c, _db) = temp_catalog("rollback");
+        let alice = c.create_tag("People/Alice").unwrap();
+        add_photo(&c, 1);
+        add_photo(&c, 2);
+        let f1 = add_suggested_face(&c, 1, alice);
+        let f2 = add_suggested_face(&c, 2, alice);
+        // Photo 1 confirms and tags cleanly; photo 2's tag insert aborts.
+        c.conn()
+            .execute_batch(
+                "CREATE TRIGGER refuse_tagging_photo_2 BEFORE INSERT ON photo_tags
+                   WHEN NEW.photo_id = 2
+                   BEGIN SELECT RAISE(ABORT, 'injected tagging failure'); END;",
+            )
+            .unwrap();
+
+        assert!(accept_person_in_catalog(&c, &[1, 2], alice).is_err());
+
+        assert_eq!(
+            face_state(&c, f1),
+            "suggested",
+            "a failure on a later photo must roll back the earlier confirmation"
+        );
+        assert_eq!(face_state(&c, f2), "suggested");
+        assert!(!has_tag(&c, 1, alice), "…and its photo-level tag with it");
     }
 }

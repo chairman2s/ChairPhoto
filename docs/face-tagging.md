@@ -144,9 +144,11 @@ one we are writing *and* its center area is within `AREA_EPSILON = 0.02`. **When
 region is preserved.** Re-writing updates only ChairPhoto's own regions and can never duplicate
 or clobber a foreign face.
 
-**Writes** fire from the same hooks as keyword export — `faces_accept`, `faces_assign`,
-`faces_reject`, `faces_ignore`, `faces_name_cluster` — each writing the photo's full current
-confirmed set, so the sidecar stays in sync.
+**Writes** fire from the same hooks as keyword export — `faces_accept`, `faces_accept_person`,
+`faces_assign`, `faces_reject`, `faces_ignore`, `faces_name_cluster` — each writing the photo's
+full current confirmed set, so the sidecar stays in sync. The batch confirm writes only the
+photos it actually changed, after its transaction commits: a sidecar that cannot be written
+(offline volume) must not roll back a confirmation the catalog already recorded.
 
 **Reads** happen during indexing: existing `mwg-rs:Regions` are parsed and IoU-matched
 (≥ 0.5, greedy best-first, one-to-one) against the photo's still-unassigned detections. A named
@@ -158,6 +160,13 @@ previous ChairPhoto run are therefore ingested for free.
 
 - **Loupe overlay** — face rectangles on the photo, each with a chip showing the assigned or
   suggested name and confirm / reject / reassign / ignore actions.
+- **Inspector panel** — the active photo's face list with the same per-face actions. With more
+  than one photo selected, a suggested face also offers *confirm on N*: `faces_accept_person`
+  confirms that person across the whole selection in one transaction. It **accepts suggestions,
+  it never creates them** — a photo where the matcher never suggested that person is reported
+  back, not force-assigned, because inventing a face region for a person the detector never
+  proposed there would fabricate data. The result is reported by bucket (confirmed /
+  already confirmed / had no suggestion), so a count never claims more than happened.
 - **People view** — a wall of named people with face crops as avatars and photo counts, plus
   unnamed clusters waiting to be named. Clicking a person filters to their photos, and a review
   queue supports bulk confirmation.

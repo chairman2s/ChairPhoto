@@ -878,6 +878,91 @@ pub fn name_cluster(conn: &Connection, cluster_id: i64, tag_id: i64) -> rusqlite
     Ok(photos)
 }
 
+/// Counters from [`accept_person_on_photos`], so a batch confirm can report what it actually
+/// did instead of implying every selected photo changed.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AcceptPersonOutcome {
+    /// Photos where at least one suggested face became `confirmed`.
+    pub photos_confirmed: usize,
+    /// Faces moved `suggested` → `confirmed`, summed over every photo.
+    pub faces_confirmed: usize,
+    /// Photos that already had this person confirmed — nothing to do, and not a failure.
+    pub photos_already_confirmed: usize,
+    /// Photos with neither a suggestion nor a confirmation for this person.
+    pub photos_without_suggestion: usize,
+}
+
+/// Confirm, across `photo_ids`, the faces the matcher **already suggested** as `tag_id`
+/// (issue #68: confirming a person on a multi-selection, not just the active photo).
+///
+/// The criterion is exactly `state = 'suggested' AND person_tag_id = tag_id`, which is the
+/// same set the per-face confirm button acts on, one photo at a time. A photo where this
+/// person was never suggested is *reported*, never force-assigned: inventing a face region
+/// for a person the detector never proposed there would fabricate data, and assigning only
+/// the photo-level tag would leave the tag and the face rows disagreeing. Rejections need no
+/// special case — a rejected `(face, person)` pair is never re-suggested, so it cannot be in
+/// the selected set.
+///
+/// Returns the counters plus the distinct photos that actually changed, so the caller can
+/// `assign_tag` and re-export MWG regions for exactly those (this function owns no `Catalog`).
+pub fn accept_person_on_photos(
+    conn: &Connection,
+    photo_ids: &[i64],
+    tag_id: i64,
+) -> rusqlite::Result<(AcceptPersonOutcome, Vec<i64>)> {
+    let mut count_suggested = conn.prepare(
+        "SELECT COUNT(*) FROM faces__faces
+          WHERE photo_id = ?1 AND person_tag_id = ?2 AND state = ?3",
+    )?;
+    let mut has_confirmed = conn.prepare(
+        "SELECT 1 FROM faces__faces
+          WHERE photo_id = ?1 AND person_tag_id = ?2 AND state = ?3 LIMIT 1",
+    )?;
+    let mut confirm = conn.prepare(
+        "UPDATE faces__faces
+            SET state = ?4, match_confidence = 1.0, cluster_id = NULL
+          WHERE photo_id = ?1 AND person_tag_id = ?2 AND state = ?3",
+    )?;
+
+    let mut outcome = AcceptPersonOutcome::default();
+    let mut changed: Vec<i64> = Vec::new();
+    let mut seen: std::collections::HashSet<i64> = std::collections::HashSet::new();
+
+    for &photo_id in photo_ids {
+        // A selection can name the same photo twice (or the caller may union in the active
+        // photo); counting it twice would inflate the report.
+        if !seen.insert(photo_id) {
+            continue;
+        }
+        let suggested: i64 = count_suggested.query_row(
+            rusqlite::params![photo_id, tag_id, STATE_SUGGESTED],
+            |r| r.get(0),
+        )?;
+        if suggested > 0 {
+            confirm.execute(rusqlite::params![
+                photo_id,
+                tag_id,
+                STATE_SUGGESTED,
+                STATE_CONFIRMED
+            ])?;
+            outcome.photos_confirmed += 1;
+            outcome.faces_confirmed += suggested as usize;
+            changed.push(photo_id);
+        } else if has_confirmed
+            .query_row(rusqlite::params![photo_id, tag_id, STATE_CONFIRMED], |_| Ok(()))
+            .optional()?
+            .is_some()
+        {
+            outcome.photos_already_confirmed += 1;
+        } else {
+            outcome.photos_without_suggestion += 1;
+        }
+    }
+
+    Ok((outcome, changed))
+}
+
 // ── Math helpers ────────────────────────────────────────────────────────────────
 
 /// L2-normalize a vector into a unit vector (safe on a zero vector → returns it unchanged).
@@ -1576,6 +1661,125 @@ mod tests {
         // Cluster row is gone.
         let n: i64 = conn.query_row("SELECT COUNT(*) FROM faces__clusters WHERE id = ?1", [cid], |r| r.get(0)).unwrap();
         assert_eq!(n, 0);
+    }
+
+    // ── accept_person_on_photos (batch confirm, issue #68) ───────────────────────
+
+    /// Mark a face as the matcher would after suggesting `tag_id` for it.
+    fn set_suggested(conn: &Connection, face_id: i64, tag_id: i64) {
+        conn.execute(
+            "UPDATE faces__faces SET person_tag_id = ?2, state = ?3, match_confidence = 0.9
+              WHERE id = ?1",
+            rusqlite::params![face_id, tag_id, STATE_SUGGESTED],
+        )
+        .unwrap();
+    }
+
+    fn face_count(conn: &Connection, photo_id: i64) -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM faces__faces WHERE photo_id = ?1",
+            [photo_id],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    /// Against real matcher output: the seeded photo is reported as already confirmed, and
+    /// both suggested photos are confirmed in one call — the multi-select case from issue #68,
+    /// which previously only ever touched the active photo.
+    #[test]
+    fn accept_person_confirms_every_suggested_photo() {
+        let conn = mem_conn();
+        let alice = add_person(&conn, 100, "Alice");
+        // Photo 1: one face + one person tag ⇒ seeded (confirmed) and gives Alice a centroid.
+        add_photo(&conn, 1);
+        tag_photo(&conn, 1, alice);
+        add_face(&conn, 1, &embed(0, 0.0));
+        // Photos 2 and 3: untagged, faces close to Alice's centroid ⇒ suggested.
+        add_photo(&conn, 2);
+        let f2 = add_face(&conn, 2, &embed(0, 0.02));
+        add_photo(&conn, 3);
+        let f3 = add_face(&conn, 3, &embed(0, 0.03));
+
+        run_matching(&conn, &MatchSettings::default(), 1000).unwrap();
+        assert_eq!(face_state(&conn, f2).0, "suggested");
+        assert_eq!(face_state(&conn, f3).0, "suggested");
+
+        let (out, changed) = accept_person_on_photos(&conn, &[1, 2, 3], alice).unwrap();
+        assert_eq!(out.photos_confirmed, 2);
+        assert_eq!(out.faces_confirmed, 2);
+        assert_eq!(out.photos_already_confirmed, 1, "the seeded photo needed nothing");
+        assert_eq!(out.photos_without_suggestion, 0);
+        assert_eq!(changed, vec![2, 3], "only the photos that changed need a tag + sidecar");
+        assert_eq!(face_state(&conn, f2).0, "confirmed");
+        assert_eq!(face_state(&conn, f3).0, "confirmed");
+    }
+
+    /// The four buckets, on one call: two suggestions in one photo, another person's
+    /// suggestion, an already-confirmed photo, and a photo with nothing for this person.
+    /// A photo the person was never suggested on is reported, never force-assigned — no face
+    /// row is invented there.
+    #[test]
+    fn accept_person_reports_each_photo_honestly() {
+        let conn = mem_conn();
+        let alice = add_person(&conn, 100, "Alice");
+        let bob = add_person(&conn, 101, "Bob");
+
+        // Photo 1: Alice suggested on two faces. Open matching assigns each face its nearest
+        // centroid independently, so one person can be suggested twice in a photo (a mirror,
+        // a photo-of-a-photo). Both must be confirmed, but the photo counts once.
+        add_photo(&conn, 1);
+        let a1 = add_face(&conn, 1, &embed(0, 0.0));
+        let a2 = add_face(&conn, 1, &embed(0, 0.01));
+        set_suggested(&conn, a1, alice);
+        set_suggested(&conn, a2, alice);
+        // Photo 2: only Bob is suggested — Alice was never proposed here.
+        add_photo(&conn, 2);
+        let b1 = add_face(&conn, 2, &embed(3, 0.0));
+        set_suggested(&conn, b1, bob);
+        // Photo 3: Alice already confirmed.
+        add_photo(&conn, 3);
+        let c1 = add_face(&conn, 3, &embed(0, 0.02));
+        set_suggested(&conn, c1, alice);
+        accept(&conn, c1).unwrap();
+        // Photo 4: indexed, no faces detected at all.
+        add_photo(&conn, 4);
+
+        // Photo 1 appears twice: a duplicate id must not be counted twice.
+        let (out, changed) = accept_person_on_photos(&conn, &[1, 2, 3, 4, 1], alice).unwrap();
+
+        assert_eq!(out.photos_confirmed, 1);
+        assert_eq!(out.faces_confirmed, 2, "both of the photo's Alice faces");
+        assert_eq!(out.photos_already_confirmed, 1);
+        assert_eq!(out.photos_without_suggestion, 2, "Bob-only and face-less photos");
+        assert_eq!(changed, vec![1]);
+
+        assert_eq!(face_state(&conn, a1).0, "confirmed");
+        assert_eq!(face_state(&conn, a2).0, "confirmed");
+        // Bob's suggestion is untouched, and Alice is not forced onto his photo.
+        assert_eq!(face_state(&conn, b1), ("suggested".into(), Some(bob), "detect".into()));
+        assert_eq!(face_count(&conn, 2), 1, "no Alice face invented on Bob's photo");
+        assert_eq!(face_count(&conn, 4), 0, "no face invented on the face-less photo");
+    }
+
+    /// A `(face, person)` pair the user rejected is never resurrected by a batch confirm:
+    /// rejection clears `person_tag_id`, so the face cannot be in the suggested set.
+    #[test]
+    fn accept_person_does_not_resurrect_a_rejected_face() {
+        let conn = mem_conn();
+        let alice = add_person(&conn, 100, "Alice");
+        add_photo(&conn, 1);
+        let f = add_face(&conn, 1, &embed(0, 0.0));
+        set_suggested(&conn, f, alice);
+        reject(&conn, f, 1000).unwrap();
+
+        let (out, changed) = accept_person_on_photos(&conn, &[1], alice).unwrap();
+        assert_eq!(out.photos_without_suggestion, 1);
+        assert_eq!(out.photos_confirmed, 0);
+        assert_eq!(out.faces_confirmed, 0);
+        assert!(changed.is_empty());
+        assert_eq!(face_state(&conn, f).0, "unassigned");
+        assert!(is_rejected(&conn, f, alice).unwrap(), "the rejection still stands");
     }
 
     /// Person tags resolve correctly under a NON-ASCII people-root. `substr`/`length` count

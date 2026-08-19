@@ -508,6 +508,8 @@ pub fn run() {
             #[cfg(feature = "faces")]
             commands::faces_accept,
             #[cfg(feature = "faces")]
+            commands::faces_accept_person,
+            #[cfg(feature = "faces")]
             commands::faces_reject,
             #[cfg(feature = "faces")]
             commands::faces_ignore,

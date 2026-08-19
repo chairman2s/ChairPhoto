@@ -50,6 +50,7 @@ pub use smart_albums::rule_to_sql;
 pub use reconcile::DrainSummary;
 
 use rusqlite::{params, Connection, ErrorCode, OptionalExtension, Row};
+use std::cell::Cell;
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -120,6 +121,14 @@ pub struct Catalog {
     conn: Connection,
     root: PathBuf,
     path: PathBuf,
+    /// True when this catalog still carries the retired `photo_metadata.value_norm` column
+    /// (A7). Nothing reads it, but SQLite's `DROP COLUMN` rewrites all ~45 M rows, which is
+    /// far too slow to do silently at startup — so the column is shed by an explicit
+    /// compaction instead, and until then every INSERT still has to name it.
+    ///
+    /// Per connection, not per catalog: `open_secondary` skips migration, and scans write
+    /// metadata through exactly that connection.
+    legacy_value_norm: Cell<bool>,
 }
 
 impl Catalog {
@@ -141,8 +150,13 @@ impl Catalog {
             conn,
             root: root.to_path_buf(),
             path: catalog_path.to_path_buf(),
+            legacy_value_norm: Cell::new(false),
         };
         catalog.migrate()?;
+        // After migration: the table shape is settled by this point.
+        catalog
+            .legacy_value_norm
+            .set(has_column(&catalog.conn, "photo_metadata", "value_norm")?);
         Ok(catalog)
     }
 
@@ -155,10 +169,12 @@ impl Catalog {
         conn.execute_batch("PRAGMA foreign_keys = ON;")?;
         enable_wal(&conn)?;
         conn.execute_batch("PRAGMA busy_timeout = 5000;")?;
+        let legacy_value_norm = has_column(&conn, "photo_metadata", "value_norm")?;
         Ok(Self {
             conn,
             root: root.to_path_buf(),
             path: catalog_path.to_path_buf(),
+            legacy_value_norm: Cell::new(legacy_value_norm),
         })
     }
 
@@ -231,6 +247,15 @@ impl Catalog {
         self.conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_photos_import_batch ON photos(import_batch_id);",
         )?;
+        // A7: retire `idx_photo_metadata_lookup(key, value_norm, photo_id)`. It was staged
+        // for a "filter by EXIF key/value" feature that was never built — no code in the
+        // crate issues the `WHERE key = ?` probe it exists for — and measured 1,844 MB (22%
+        // of the catalog) while making metadata inserts ~2.8x slower on every scan. Dropping
+        // an index is instant and needs no table rewrite, so every catalog gets this on its
+        // next open; the `value_norm` column it indexed goes on the next compaction, which
+        // does rewrite. Rebuilding it is one CREATE INDEX if the feature ever lands.
+        self.conn
+            .execute_batch("DROP INDEX IF EXISTS idx_photo_metadata_lookup;")?;
         // Verified-hash on locations for the backup/offload lifecycle (schema v10).
         self.ensure_column("photo_locations", "verified_hash", "TEXT")?;
         // Pixel-derived B&W flag for the monochrome auto-tag (schema v12).
@@ -494,8 +519,29 @@ impl Catalog {
     /// Rebuild the database file, reclaiming free space left by deletions and
     /// defragmenting. Rewrites the whole file (needs ~2× space transiently) and holds the
     /// connection for the duration — run it off the UI thread. Data is unchanged.
-    pub fn vacuum(&self) -> Result<()> {
+    ///
+    /// Also sheds retired columns first (currently `photo_metadata.value_norm`). That is a
+    /// table rewrite of tens of millions of rows, which is exactly why it lives here rather
+    /// than in the startup migration: this operation is already explicit, already slow, and
+    /// already about reclaiming space. No behaviour changes — the column had no readers.
+    pub fn vacuum(&mut self) -> Result<()> {
+        self.drop_retired_columns()?;
         self.conn.execute_batch("VACUUM")?;
+        Ok(())
+    }
+
+    /// Drop columns the schema has retired but existing catalogs still carry, when the user
+    /// asks for a compaction. Idempotent: a catalog that has already shed them does nothing.
+    ///
+    /// `DROP COLUMN` is refused while an index references the column, so this depends on
+    /// migration having dropped `idx_photo_metadata_lookup` first — it runs on every open,
+    /// so by the time a user can press Compact it has happened.
+    fn drop_retired_columns(&mut self) -> Result<()> {
+        if has_column(&self.conn, "photo_metadata", "value_norm")? {
+            self.conn
+                .execute_batch("ALTER TABLE photo_metadata DROP COLUMN value_norm;")?;
+            self.legacy_value_norm.set(false);
+        }
         Ok(())
     }
 
@@ -794,18 +840,38 @@ impl Catalog {
         self.conn
             .execute("DELETE FROM photo_metadata WHERE photo_id = ?1", params![photo_id])?;
         {
-            let mut stmt = self.conn.prepare(
-                "INSERT OR IGNORE INTO photo_metadata(photo_id, key, group_name, value, value_norm)
-                 VALUES(?1, ?2, ?3, ?4, ?5)",
-            )?;
+            // `value_norm` is retired (A7): nothing ever read it, and normalizing every one
+            // of ~274 values per photo was pure cost on every scan. A catalog that still has
+            // the column gets an empty string — the column is NOT NULL and only a compaction
+            // can remove it — and the normalization is not computed either way.
+            let mut stmt = if self.legacy_value_norm.get() {
+                match self.conn.prepare(
+                    "INSERT OR IGNORE INTO photo_metadata(photo_id, key, group_name, value, value_norm)
+                     VALUES(?1, ?2, ?3, ?4, '')",
+                ) {
+                    Ok(stmt) => stmt,
+                    Err(_)
+                        if !has_column(&self.conn, "photo_metadata", "value_norm")? =>
+                    {
+                        // Compaction can run while a scan owns a secondary connection. Its
+                        // cached legacy shape is then stale, so switch that connection to
+                        // the new INSERT without making every metadata write query the schema.
+                        self.legacy_value_norm.set(false);
+                        self.conn.prepare(
+                            "INSERT OR IGNORE INTO photo_metadata(photo_id, key, group_name, value)
+                             VALUES(?1, ?2, ?3, ?4)",
+                        )?
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            } else {
+                self.conn.prepare(
+                    "INSERT OR IGNORE INTO photo_metadata(photo_id, key, group_name, value)
+                     VALUES(?1, ?2, ?3, ?4)",
+                )?
+            };
             for e in entries {
-                stmt.execute(params![
-                    photo_id,
-                    e.key,
-                    e.group_name,
-                    e.value,
-                    normalize_lookup(&e.value)
-                ])?;
+                stmt.execute(params![photo_id, e.key, e.group_name, e.value])?;
             }
         }
         self.conn.execute(
@@ -1982,6 +2048,16 @@ fn row_to_tag(r: &Row) -> rusqlite::Result<Tag> {
         uuid: r.get(6)?,
         private: r.get::<_, i64>(7)? != 0,
     })
+}
+
+/// Whether `table` currently has `column`. Used for the one shape difference a catalog can
+/// have that migration does not settle immediately — see `Catalog::legacy_value_norm`.
+fn has_column(conn: &Connection, table: &str, column: &str) -> Result<bool> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let columns: Vec<String> = stmt
+        .query_map([], |r| r.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(columns.iter().any(|c| c == column))
 }
 
 fn now() -> i64 {

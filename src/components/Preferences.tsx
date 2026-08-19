@@ -755,6 +755,12 @@ function MaintenanceSection({ onChanged }: { onChanged: () => void }) {
         VACUUM). Your data is unchanged. Worth running after large removals; it briefly
         needs ~double the catalog size in free space and the window may pause.
       </div>
+      <div className="modal-sub">
+        This also drops retired storage the catalog no longer uses — currently a per-metadata
+        column that was written on every scan and never read. On a large library that column
+        is worth a few hundred MB, and removing it rewrites the metadata table, which is why
+        it happens here rather than silently at startup.
+      </div>
       <div className="row">
         <button className="chip" disabled={busy} onClick={compact}>
           Compact database now

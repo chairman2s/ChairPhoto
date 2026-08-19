@@ -50,6 +50,7 @@ pub use smart_albums::rule_to_sql;
 pub use reconcile::DrainSummary;
 
 use rusqlite::{params, Connection, ErrorCode, OptionalExtension, Row};
+use std::cell::Cell;
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -127,7 +128,7 @@ pub struct Catalog {
     ///
     /// Per connection, not per catalog: `open_secondary` skips migration, and scans write
     /// metadata through exactly that connection.
-    legacy_value_norm: bool,
+    legacy_value_norm: Cell<bool>,
 }
 
 impl Catalog {
@@ -149,11 +150,13 @@ impl Catalog {
             conn,
             root: root.to_path_buf(),
             path: catalog_path.to_path_buf(),
-            legacy_value_norm: false,
+            legacy_value_norm: Cell::new(false),
         };
         catalog.migrate()?;
         // After migration: the table shape is settled by this point.
-        catalog.legacy_value_norm = has_column(&catalog.conn, "photo_metadata", "value_norm")?;
+        catalog
+            .legacy_value_norm
+            .set(has_column(&catalog.conn, "photo_metadata", "value_norm")?);
         Ok(catalog)
     }
 
@@ -171,7 +174,7 @@ impl Catalog {
             conn,
             root: root.to_path_buf(),
             path: catalog_path.to_path_buf(),
-            legacy_value_norm,
+            legacy_value_norm: Cell::new(legacy_value_norm),
         })
     }
 
@@ -537,7 +540,7 @@ impl Catalog {
         if has_column(&self.conn, "photo_metadata", "value_norm")? {
             self.conn
                 .execute_batch("ALTER TABLE photo_metadata DROP COLUMN value_norm;")?;
-            self.legacy_value_norm = false;
+            self.legacy_value_norm.set(false);
         }
         Ok(())
     }
@@ -841,11 +844,26 @@ impl Catalog {
             // of ~274 values per photo was pure cost on every scan. A catalog that still has
             // the column gets an empty string — the column is NOT NULL and only a compaction
             // can remove it — and the normalization is not computed either way.
-            let mut stmt = if self.legacy_value_norm {
-                self.conn.prepare(
+            let mut stmt = if self.legacy_value_norm.get() {
+                match self.conn.prepare(
                     "INSERT OR IGNORE INTO photo_metadata(photo_id, key, group_name, value, value_norm)
                      VALUES(?1, ?2, ?3, ?4, '')",
-                )?
+                ) {
+                    Ok(stmt) => stmt,
+                    Err(_)
+                        if !has_column(&self.conn, "photo_metadata", "value_norm")? =>
+                    {
+                        // Compaction can run while a scan owns a secondary connection. Its
+                        // cached legacy shape is then stale, so switch that connection to
+                        // the new INSERT without making every metadata write query the schema.
+                        self.legacy_value_norm.set(false);
+                        self.conn.prepare(
+                            "INSERT OR IGNORE INTO photo_metadata(photo_id, key, group_name, value)
+                             VALUES(?1, ?2, ?3, ?4)",
+                        )?
+                    }
+                    Err(error) => return Err(error.into()),
+                }
             } else {
                 self.conn.prepare(
                     "INSERT OR IGNORE INTO photo_metadata(photo_id, key, group_name, value)

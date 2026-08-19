@@ -4882,3 +4882,32 @@ fn compacting_sheds_the_retired_column_and_keeps_the_metadata() {
     // And compacting again is a no-op rather than an error.
     catalog.vacuum().unwrap();
 }
+
+/// A scan may already hold its own connection when the user compacts. That connection must
+/// notice the retired column disappeared before its next metadata write rather than keeping
+/// the table shape it observed when it opened.
+#[test]
+fn secondary_opened_before_compaction_writes_the_new_metadata_shape() {
+    use chairphoto_lib::catalog::{MetadataEntry, PromotedMetadata};
+    let (mut catalog, root, db) = legacy_metadata_catalog("a7-secondary-after-compact");
+    let id = catalog
+        .upsert_photo(&root.join("a.jpg"), None, 1, 1)
+        .unwrap()
+        .id;
+    let secondary = Catalog::open_secondary(&db, &root).unwrap();
+
+    catalog.vacuum().unwrap();
+
+    secondary
+        .set_photo_metadata(
+            id,
+            &PromotedMetadata::default(),
+            &[MetadataEntry {
+                key: "ISO".into(),
+                group_name: "EXIF".into(),
+                value: "800".into(),
+            }],
+        )
+        .unwrap();
+    assert_eq!(secondary.get_photo_metadata(id).unwrap()[0].value, "800");
+}

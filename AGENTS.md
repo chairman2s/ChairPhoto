@@ -114,7 +114,7 @@ commands and renders their results; it never reads photo files directly.
 | Path | Responsibility |
 |---|---|
 | `commands/` | Flat Tauri command surface; one submodule per domain. `mod.rs` holds `AppState` and genuinely shared helpers only. |
-| `catalog/` | SQLite schema, migrations, lifecycle, locations/resolver, vocabulary, albums, and merge. |
+| `catalog/` | SQLite schema, migrations, lifecycle, locations/resolver, vocabulary (incl. tag maintenance), albums, and merge. |
 | `scanner/`, `thumbnails/`, `image_pool/`, `protocol/` | Import/index, preview generation/cache, bounded decode work, and native media protocols. |
 | `xmp/` | Merge-safe sidecar reads/writes. |
 | `raw/`, `export/`, `bundle/` | Full RAW decode, one-way export, and portable catalogs. |

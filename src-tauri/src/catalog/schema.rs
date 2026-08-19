@@ -133,6 +133,25 @@ CREATE INDEX IF NOT EXISTS idx_tag_terms_tag ON tag_terms(tag_id);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_tag_terms_unique
     ON tag_terms(tag_id, text_norm, coalesce(language, ''));
 
+-- Tombstones for tags removed by a merge (A5). `tags.uuid` exists so shared taxonomies
+-- merge by identity rather than by name, which cuts both ways: `catalog/merge.rs` matches
+-- an incoming bundle tag by uuid first, so importing a bundle that still carries a merged-
+-- away tag would re-create it and quietly undo the reorg. A row here says "this uuid is now
+-- that tag", and the bundle importer consults it before creating anything.
+--
+-- Kept forever and deliberately: it is small (one row per merged tag), and its whole job is
+-- to answer a bundle that may be imported years later. A merge that repoints an earlier
+-- merge's target rewrites the older rows too, so a chain of merges never strands a uuid.
+CREATE TABLE IF NOT EXISTS tag_aliases (
+    dead_uuid     TEXT PRIMARY KEY,
+    target_tag_id INTEGER NOT NULL REFERENCES tags(id) ON DELETE CASCADE,
+    -- The path the tag had when it was merged away, for the audit trail: the uuid alone
+    -- says nothing to a human reading this table later.
+    dead_path     TEXT NOT NULL,
+    merged_at     INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_tag_aliases_target ON tag_aliases(target_tag_id);
+
 CREATE TABLE IF NOT EXISTS photo_tags (
     photo_id   INTEGER NOT NULL REFERENCES photos(id) ON DELETE CASCADE,
     tag_id     INTEGER NOT NULL REFERENCES tags(id) ON DELETE CASCADE,

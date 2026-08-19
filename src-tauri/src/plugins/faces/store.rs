@@ -29,6 +29,57 @@ use serde_json;
 /// on every connection open. Adding columns to a pre-existing table uses `ALTER TABLE … ADD
 /// COLUMN` and ignores "duplicate column" errors, the same resilient migration pattern used
 /// throughout the catalog.
+/// Repoint every face and rejection from `source_tag_ids` onto `target_tag_id`, for a core
+/// tag merge (A5). Returns `(faces, rejections)` repointed.
+///
+/// The plugin owns this because core must not know `faces__*` exists. It matters more than
+/// bookkeeping: `faces__faces.person_tag_id` is `ON DELETE SET NULL`, so a merge that did not
+/// call this would silently un-name every face on the source side — and merging two person
+/// tags is the most common merge there is. `faces__rejections.person_tag_id` has no FK at all,
+/// so its rows would be left pointing at a dead id and the rejection memory would detach.
+///
+/// Runs in the caller's transaction and must fail the whole merge if it fails: detached faces
+/// are data loss, not a cosmetic degradation. Returns `Ok((0, 0))` when the plugin's tables do
+/// not exist yet — nothing has been indexed, so there is genuinely nothing to repoint.
+pub fn repoint_person_tags(
+    conn: &Connection,
+    source_tag_ids: &[i64],
+    target_tag_id: i64,
+) -> rusqlite::Result<(usize, usize)> {
+    if !table_exists(conn, "faces__faces")? {
+        return Ok((0, 0));
+    }
+    let mut faces = 0usize;
+    let mut rejections = 0usize;
+    for &source in source_tag_ids {
+        faces += conn.execute(
+            "UPDATE faces__faces SET person_tag_id = ?2 WHERE person_tag_id = ?1",
+            rusqlite::params![source, target_tag_id],
+        )?;
+        // (face_id, person_tag_id) is the PK: a face that already rejected the target keeps
+        // that one row rather than colliding, and the now-duplicate source row is dropped.
+        rejections += conn.execute(
+            "UPDATE OR IGNORE faces__rejections SET person_tag_id = ?2 WHERE person_tag_id = ?1",
+            rusqlite::params![source, target_tag_id],
+        )?;
+        conn.execute(
+            "DELETE FROM faces__rejections WHERE person_tag_id = ?1",
+            [source],
+        )?;
+    }
+    Ok((faces, rejections))
+}
+
+fn table_exists(conn: &Connection, name: &str) -> rusqlite::Result<bool> {
+    conn.query_row(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1",
+        [name],
+        |_| Ok(()),
+    )
+    .optional()
+    .map(|r| r.is_some())
+}
+
 pub fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(
         "

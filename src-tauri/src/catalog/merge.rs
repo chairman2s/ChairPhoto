@@ -155,6 +155,21 @@ impl MergeCtx<'_> {
             {
                 return Ok(id);
             }
+            // (a2) By tombstone — this uuid was merged away here (A5). Without this the
+            // taxonomy union would treat it as a tag we have never seen and re-create it,
+            // silently undoing the merge on the next bundle import. Resolving to the merge
+            // target instead means the bundle's photos land on the tag that replaced it.
+            if let Some(id) = self
+                .tx
+                .query_row(
+                    "SELECT target_tag_id FROM tag_aliases WHERE dead_uuid = ?1",
+                    params![tag.uuid],
+                    |r| r.get::<_, i64>(0),
+                )
+                .optional()?
+            {
+                return Ok(id);
+            }
         }
 
         // (b) By normalized full path — same concept grown independently. Create any
@@ -624,6 +639,50 @@ mod tests {
         let tags = cat.get_photo_tags(photo.id).unwrap();
         assert_eq!(tags.len(), 1);
         assert_eq!(tags[0].id, owls);
+    }
+
+    /// A merged-away tag must not come back. `tags.uuid` is the strongest match here, and a
+    /// bundle exported before the merge still carries the dead uuid — without the `tag_aliases`
+    /// tombstone the union would treat it as a tag this catalog has never seen and re-create
+    /// it, quietly undoing the reorg. This is the test that makes A5 permanent rather than
+    /// cosmetic, so it asserts both halves: the tag stays gone, *and* the bundle's photo lands
+    /// on the tag that replaced it.
+    #[test]
+    fn a_merged_away_tag_is_not_resurrected_by_a_later_bundle_import() {
+        let (cat, _root) = temp_catalog("resurrect");
+        // The catalog has both tags and merges the bundle's one away into the survivor.
+        let owls = cat.create_tag("Birds/Owls").unwrap();
+        let raptors = cat.create_tag("Birds/Raptors").unwrap();
+        cat.conn()
+            .execute("UPDATE tags SET uuid = 'tag-owl' WHERE id = ?1", [owls])
+            .unwrap();
+
+        let report = crate::catalog::tag_maintenance::merge_tags(cat.conn(), &[owls], raptors, 1)
+            .unwrap();
+        assert_eq!(report.aliases_recorded, 1);
+        assert!(cat.get_tag(owls).is_err(), "the merged tag is gone");
+
+        // Now import a bundle whose taxonomy still names it by that uuid.
+        let summary = cat.merge_bundle(&sample_manifest()).unwrap();
+
+        assert_eq!(
+            summary.tags_created, 0,
+            "the dead uuid resolved through the tombstone instead of creating a tag"
+        );
+        assert!(
+            cat.list_tags_with_counts()
+                .unwrap()
+                .iter()
+                .all(|t| t.tag.full_path != "Birds/Owls"),
+            "Birds/Owls must not reappear"
+        );
+        let photo = cat.get_photo_by_uuid("photo-a").unwrap();
+        let tags = cat.get_photo_tags(photo.id).unwrap();
+        assert_eq!(
+            tags.iter().map(|t| t.id).collect::<Vec<_>>(),
+            vec![raptors],
+            "the bundle's photo lands on the tag that replaced the one it named"
+        );
     }
 
     #[test]

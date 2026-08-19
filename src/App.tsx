@@ -1482,6 +1482,8 @@ export default function App() {
                 .catch((e) => setStatus(`Privacy change failed: ${e}`))
             }
             onTagsChanged={refresh}
+            selectedPhotoIds={selection.ids}
+            onStatus={setStatus}
           />
           <AlbumsPanel
             activeAlbumId={scope.albumId}

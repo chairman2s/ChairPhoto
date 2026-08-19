@@ -1247,6 +1247,122 @@ export const deleteTag = (tagId: number) => invoke<void>("delete_tag", { tagId }
 export const moveTag = (tagId: number, newParentId: number | null) =>
   invoke<void>("move_tag", { tagId, newParentId });
 
+// --- tag maintenance (A5): merge, split, and the finders ---
+
+/** One tag a merge removed, as the report names it. */
+export interface MergedSource {
+  id: number;
+  path: string;
+  /** The uuid now tombstoned so a later bundle import cannot re-create the tag. */
+  uuid: string | null;
+}
+
+/**
+ * What a merge did — or, from a dry run, exactly what it would do. The dry run *is* the
+ * real mutation, rolled back, so these numbers cannot disagree with the committed result.
+ *
+ * The plugin fields are three-valued on purpose: `null` means that plugin is compiled out
+ * and nothing was checked; `0` means it was checked and had nothing to move.
+ */
+export interface TagMergeReport {
+  targetId: number;
+  targetPath: string;
+  sources: MergedSource[];
+  /** Photos that gained the target tag. */
+  photosRetagged: number;
+  /** Photos that already carried it, so two assignments became one. */
+  assignmentsCollapsed: number;
+  childrenReparented: number;
+  descendantsRepathed: number;
+  termsMoved: number;
+  /** Terms the target already had in that language, by text. */
+  termsSkipped: string[];
+  synonymsMoved: number;
+  groupsRepointed: number;
+  /** Smart albums whose rule named a source tag, by album name. */
+  smartAlbumsRewritten: string[];
+  aliasesRecorded: number;
+  /** Not refusals — things to read before committing. */
+  warnings: string[];
+  facesRepointed: number | null;
+  faceRejectionsRepointed: number | null;
+  classifiersDropped: number | null;
+  suggestionsRepointed: number | null;
+}
+
+/**
+ * Merge tags into one. With `dryRun`, everything runs and is rolled back, so the report is
+ * a true preview rather than an estimate.
+ *
+ * Rejects (rather than half-applies) when the merge would collide with an existing path,
+ * target an auto-tag, or put a tag inside its own subtree — the message names which.
+ */
+export const mergeTags = (sourceIds: number[], targetId: number, dryRun: boolean) =>
+  invoke<TagMergeReport>("merge_tags", { sourceIds, targetId, dryRun });
+
+/** What a split did, or would do. */
+export interface TagSplitReport {
+  sourcePath: string;
+  newTagId: number;
+  newTagPath: string;
+  photosMoved: number;
+  photosAlreadyTagged: number;
+  photosUntagged: number;
+  /** Named photos that never carried the source tag — reported, never tagged. */
+  photosWithoutSource: number;
+  createdNewTag: boolean;
+}
+
+/**
+ * Split a tag in two: give the named photos the tag at `newPath`, and unless `keepSource`
+ * take the source tag off exactly those photos. Only the photos named are touched — a split
+ * cannot guess which half a photo belongs to.
+ */
+export const splitTag = (
+  sourceId: number,
+  photoIds: number[],
+  newPath: string,
+  keepSource: boolean,
+  dryRun: boolean,
+) => invoke<TagSplitReport>("split_tag", { sourceId, photoIds, newPath, keepSource, dryRun });
+
+/** A tag holding no photos anywhere in its subtree. */
+export interface OrphanTag {
+  id: number;
+  path: string;
+  /** An empty *branch* is structure; an empty leaf is litter. Deleting a branch cascades. */
+  hasChildren: boolean;
+  isAutoTag: boolean;
+}
+
+/** Tags carrying no photos, anywhere in their subtree. */
+export const findOrphanTags = () => invoke<OrphanTag[]>("find_orphan_tags");
+
+/** Two tags that may mean the same thing. A suggestion for a human, never an action. */
+export interface SimilarTagPair {
+  aId: number;
+  aPath: string;
+  aPhotos: number;
+  bId: number;
+  bPath: string;
+  bPhotos: number;
+  /** 0–1 similarity of the two leaf names. 1 = identical names in different places. */
+  nameSimilarity: number;
+  /** How many photos carry both — what tells a typo apart from two real concepts. */
+  coOccurrence: number;
+  reason: string;
+}
+
+/**
+ * Candidate duplicate tags, most-alike first.
+ *
+ * Searches on **names** (co-occurrence is reported per candidate, but finding pairs by it
+ * would need an all-pairs join over every tagged photo), so two duplicates with unlike names
+ * will not appear here.
+ */
+export const findSimilarTags = (minSimilarity?: number) =>
+  invoke<SimilarTagPair[]>("find_similar_tags", { minSimilarity: minSimilarity ?? null });
+
 /** Re-apply auto-tags (e.g. monochrome) across the catalog. */
 export const applyAutoTags = () => invoke<void>("apply_auto_tags");
 

@@ -24,6 +24,7 @@ mod schema;
 mod smart_albums;
 mod stats;
 mod tag_path;
+pub mod tag_maintenance;
 mod terms;
 
 #[cfg(test)]

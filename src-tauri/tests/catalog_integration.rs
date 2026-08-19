@@ -4752,15 +4752,31 @@ fn legacy_metadata_catalog(tag: &str) -> (Catalog, common::TestSubPath, PathBuf)
     let db = dir.join("test.chairphoto");
     {
         // Opened and dropped so the schema exists; then rewound by hand. `Catalog::conn` is
-        // crate-private, so the shape is inspected through its own connection to the file —
-        // the same way `wal_is_enabled_on_open` already does.
+        // crate-private, so the shape is built through its own connection to the file — the
+        // same way `wal_is_enabled_on_open` already does.
+        //
+        // The table is REBUILT rather than patched with `ALTER TABLE ADD COLUMN`, and that
+        // detail is the whole point: SQLite refuses to add a NOT NULL column without a
+        // default, so patching produces `value_norm TEXT NOT NULL DEFAULT ''` — which quietly
+        // accepts an INSERT that omits the column. The real pre-A7 schema has no default, so
+        // the same INSERT fails with "NOT NULL constraint failed". A fixture with the default
+        // would let these tests pass even if the legacy write path were deleted outright.
         let _ = Catalog::open(&db, &root).unwrap();
         rusqlite::Connection::open(&db)
             .unwrap()
             .execute_batch(
-                "ALTER TABLE photo_metadata ADD COLUMN value_norm TEXT NOT NULL DEFAULT '';
+                "DROP TABLE photo_metadata;
+                 CREATE TABLE photo_metadata (
+                     photo_id   INTEGER NOT NULL REFERENCES photos(id) ON DELETE CASCADE,
+                     key        TEXT NOT NULL,
+                     group_name TEXT NOT NULL,
+                     value      TEXT NOT NULL,
+                     value_norm TEXT NOT NULL,
+                     PRIMARY KEY (photo_id, key, value)
+                 );
                  CREATE INDEX idx_photo_metadata_lookup
-                     ON photo_metadata(key, value_norm, photo_id);",
+                     ON photo_metadata(key, value_norm, photo_id);
+                 CREATE INDEX idx_photo_metadata_photo ON photo_metadata(photo_id);",
             )
             .unwrap();
     }

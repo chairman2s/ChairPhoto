@@ -159,12 +159,26 @@ CREATE TABLE IF NOT EXISTS photo_tags (
     PRIMARY KEY (photo_id, tag_id)
 );
 
+-- Every EXIF/IPTC/XMP field the app does not promote to a `photos` column, as EAV. Large:
+-- ~274 rows per photo, so a six-figure library holds tens of millions of rows and this is
+-- the biggest object in the catalog by a wide margin.
+--
+-- It carried a `value_norm` column and an `idx_photo_metadata_lookup(key, value_norm,
+-- photo_id)` index, staged for a "filter by EXIF key/value" feature that was never built.
+-- Measured on the owner's 165,093-photo catalog (A7, 2026-08-17): the index was 1,844 MB —
+-- 22% of the whole catalog — the column was written by one INSERT and read by nothing, and
+-- together they made metadata inserts ~2.8x slower on every scan of every photo. Both are
+-- retired here; an existing catalog drops the index on its next open, and sheds the column
+-- when the user compacts (see `Catalog::vacuum`). Rebuilding either is one statement if
+-- that feature is ever built.
+--
+-- Both reads lead with photo_id (`get_photo_metadata`, and the sharpness indexer's AF-point
+-- lookup), which the PK autoindex and `idx_photo_metadata_photo` serve.
 CREATE TABLE IF NOT EXISTS photo_metadata (
     photo_id   INTEGER NOT NULL REFERENCES photos(id) ON DELETE CASCADE,
     key        TEXT NOT NULL,
     group_name TEXT NOT NULL,
     value      TEXT NOT NULL,
-    value_norm TEXT NOT NULL,
     PRIMARY KEY (photo_id, key, value)
 );
 
@@ -389,7 +403,6 @@ CREATE INDEX IF NOT EXISTS idx_photos_capture_time   ON photos(capture_time);
 CREATE INDEX IF NOT EXISTS idx_photos_uuid           ON photos(uuid);
 CREATE INDEX IF NOT EXISTS idx_tags_parent           ON tags(parent_id);
 CREATE INDEX IF NOT EXISTS idx_photo_tags_tag        ON photo_tags(tag_id);
-CREATE INDEX IF NOT EXISTS idx_photo_metadata_lookup ON photo_metadata(key, value_norm, photo_id);
 CREATE INDEX IF NOT EXISTS idx_photo_metadata_photo  ON photo_metadata(photo_id);
 
 -- The library grid's default ordering, as an INDEX ON AN EXPRESSION.

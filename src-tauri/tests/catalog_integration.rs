@@ -168,7 +168,7 @@ fn scan_external_indexes_nas_photos_in_place() {
 
 #[test]
 fn vacuum_runs_and_reports_size() {
-    let (catalog, root) = temp_catalog("vacuum");
+    let (mut catalog, root) = temp_catalog("vacuum");
     catalog.upsert_photo(&root.join("a.jpg"), None, 1, 1).unwrap();
     let before = catalog.db_size_bytes().unwrap();
     assert!(before > 0);
@@ -4731,4 +4731,154 @@ fn a_scan_onto_read_only_storage_keeps_every_identity_recoverable() {
         );
     }
     assert_eq!(catalog.count_pending_identity().unwrap(), 0);
+}
+
+// ── A7: retiring photo_metadata's unused index and column ────────────────────
+//
+// Measured on the owner's 165,093-photo catalog: `idx_photo_metadata_lookup` was 1,844 MB —
+// 22% of the whole catalog — and with `value_norm` made metadata inserts ~2.8x slower on
+// every scan, for a "filter by EXIF key/value" feature that was never built. These pin the
+// two halves of retiring them, which have deliberately different costs: dropping the index
+// is instant and happens on every open, while dropping the column rewrites tens of millions
+// of rows and waits for an explicit compaction.
+
+/// Open a catalog, then put its `photo_metadata` back into the pre-A7 shape — column and
+/// index — so the migration has something real to find. Building the old shape by hand is
+/// the only way to test an upgrade path once the schema no longer produces it.
+fn legacy_metadata_catalog(tag: &str) -> (Catalog, common::TestSubPath, PathBuf) {
+    let dir = common::TestTmpDir::new(tag);
+    let root = dir.join("photos");
+    std::fs::create_dir_all(&root).unwrap();
+    let db = dir.join("test.chairphoto");
+    {
+        // Opened and dropped so the schema exists; then rewound by hand. `Catalog::conn` is
+        // crate-private, so the shape is inspected through its own connection to the file —
+        // the same way `wal_is_enabled_on_open` already does.
+        let _ = Catalog::open(&db, &root).unwrap();
+        rusqlite::Connection::open(&db)
+            .unwrap()
+            .execute_batch(
+                "ALTER TABLE photo_metadata ADD COLUMN value_norm TEXT NOT NULL DEFAULT '';
+                 CREATE INDEX idx_photo_metadata_lookup
+                     ON photo_metadata(key, value_norm, photo_id);",
+            )
+            .unwrap();
+    }
+    let catalog = Catalog::open(&db, &root).unwrap();
+    (catalog, dir.into_subpath("photos"), db)
+}
+
+fn has_index(db: &std::path::Path, name: &str) -> bool {
+    rusqlite::Connection::open(db)
+        .unwrap()
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?1",
+            [name],
+            |_| Ok(()),
+        )
+        .is_ok()
+}
+
+fn has_metadata_column(db: &std::path::Path, column: &str) -> bool {
+    let conn = rusqlite::Connection::open(db).unwrap();
+    let mut stmt = conn.prepare("PRAGMA table_info(photo_metadata)").unwrap();
+    let columns: Vec<String> = stmt
+        .query_map([], |r| r.get::<_, String>(1))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    columns.iter().any(|c| c == column)
+}
+
+/// A fresh catalog is born without either. (If this fails, the schema grew them back.)
+#[test]
+fn a_new_catalog_has_no_metadata_lookup_index_or_value_norm() {
+    let dir = common::TestTmpDir::new("a7-fresh");
+    let root = dir.join("photos");
+    std::fs::create_dir_all(&root).unwrap();
+    let db = dir.join("test.chairphoto");
+    let _catalog = Catalog::open(&db, &root).unwrap();
+
+    assert!(!has_index(&db, "idx_photo_metadata_lookup"));
+    assert!(!has_metadata_column(&db, "value_norm"));
+}
+
+/// Opening an existing catalog drops the index immediately — no table rewrite is involved,
+/// so there is no reason to make the user ask for it. The column survives that open, because
+/// dropping it is the expensive half.
+#[test]
+fn opening_an_old_catalog_drops_the_index_but_keeps_the_column() {
+    let (_catalog, _root, db) = legacy_metadata_catalog("a7-upgrade");
+    assert!(
+        !has_index(&db, "idx_photo_metadata_lookup"),
+        "the 1.8 GB index goes on open"
+    );
+    assert!(
+        has_metadata_column(&db, "value_norm"),
+        "the column waits for a compaction — dropping it rewrites every row"
+    );
+}
+
+/// Metadata still writes and reads correctly on a catalog that has the retired column, which
+/// is the state every existing library is in until it is compacted.
+#[test]
+fn metadata_round_trips_while_the_retired_column_is_still_present() {
+    use chairphoto_lib::catalog::{MetadataEntry, PromotedMetadata};
+    let (catalog, root, _db) = legacy_metadata_catalog("a7-legacy-write");
+    let id = catalog.upsert_photo(&root.join("a.jpg"), None, 1, 1).unwrap().id;
+
+    catalog
+        .set_photo_metadata(
+            id,
+            &PromotedMetadata::default(),
+            &[MetadataEntry {
+                key: "LensModel".into(),
+                group_name: "EXIF".into(),
+                value: "FE 24-70mm F2.8 GM".into(),
+            }],
+        )
+        .unwrap();
+
+    let entries = catalog.get_photo_metadata(id).unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].value, "FE 24-70mm F2.8 GM");
+}
+
+/// Compaction sheds the column, and the metadata survives it. This is the half that rewrites
+/// the table, so it runs only when the user asks — and afterwards writes take the new path.
+#[test]
+fn compacting_sheds_the_retired_column_and_keeps_the_metadata() {
+    use chairphoto_lib::catalog::{MetadataEntry, PromotedMetadata};
+    let (mut catalog, root, db) = legacy_metadata_catalog("a7-compact");
+    let id = catalog.upsert_photo(&root.join("a.jpg"), None, 1, 1).unwrap().id;
+    let entry = |key: &str, value: &str| MetadataEntry {
+        key: key.into(),
+        group_name: "EXIF".into(),
+        value: value.into(),
+    };
+    catalog
+        .set_photo_metadata(
+            id,
+            &PromotedMetadata::default(),
+            &[entry("LensModel", "FE 24-70mm F2.8 GM"), entry("ISO", "400")],
+        )
+        .unwrap();
+
+    catalog.vacuum().unwrap();
+
+    assert!(!has_metadata_column(&db, "value_norm"), "the column is gone");
+    let mut entries = catalog.get_photo_metadata(id).unwrap();
+    entries.sort_by(|a, b| a.key.cmp(&b.key));
+    assert_eq!(entries.len(), 2, "nothing was lost in the rewrite");
+    assert_eq!(entries[0].key, "ISO");
+    assert_eq!(entries[1].value, "FE 24-70mm F2.8 GM");
+
+    // The same connection now writes the new shape, without being reopened.
+    catalog
+        .set_photo_metadata(id, &PromotedMetadata::default(), &[entry("ISO", "800")])
+        .unwrap();
+    assert_eq!(catalog.get_photo_metadata(id).unwrap()[0].value, "800");
+
+    // And compacting again is a no-op rather than an error.
+    catalog.vacuum().unwrap();
 }

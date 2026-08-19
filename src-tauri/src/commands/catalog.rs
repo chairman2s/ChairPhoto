@@ -521,8 +521,10 @@ pub struct VacuumResult {
 pub async fn vacuum_catalog(app: AppHandle) -> Result<VacuumResult, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<AppState>();
-        let guard = state.catalog.lock().map_err(|e| e.to_string())?;
-        let catalog = guard.as_ref().ok_or("No catalog is open")?;
+        // `&mut`: compaction also sheds retired columns, which changes the connection's own
+        // view of the table shape (see `Catalog::vacuum`).
+        let mut guard = state.catalog.lock().map_err(|e| e.to_string())?;
+        let catalog = guard.as_mut().ok_or("No catalog is open")?;
         let before = catalog.db_size_bytes().map_err(|e| e.to_string())?;
         catalog.vacuum().map_err(|e| e.to_string())?;
         let after = catalog.db_size_bytes().map_err(|e| e.to_string())?;

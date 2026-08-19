@@ -58,6 +58,56 @@ use super::store::{blob_to_embedding, embedding_to_blob};
 // ── Schema ────────────────────────────────────────────────────────────────────
 
 /// Create `smarttags__classifiers` if it does not yet exist. Idempotent.
+/// Forget what was trained for tag paths that a core tag merge just removed (A5), and follow
+/// pending suggestions to the path that replaced them. Returns
+/// `(classifiers_dropped, suggestions_repointed)`.
+///
+/// Both tables key on the tag **path**, not an id, so a merge leaves them naming something
+/// that no longer exists: a classifier trained for the dead path can never fire again, and a
+/// pending suggestion for it can never be accepted. Dropping the classifier is right rather
+/// than renaming it — the target tag's photo set just changed, so its old weights are stale
+/// anyway and the next training pass rebuilds from the merged set.
+///
+/// Returns `Ok((0, 0))` when the tables do not exist yet (nothing indexed, nothing to clean).
+pub fn forget_merged_tag_paths(
+    conn: &Connection,
+    dead_paths: &[String],
+    target_path: &str,
+) -> rusqlite::Result<(usize, usize)> {
+    let mut dropped = 0usize;
+    let mut repointed = 0usize;
+    let classifiers = table_exists(conn, "smarttags__classifiers")?;
+    let suggestions = table_exists(conn, "smarttags__suggestions")?;
+    for path in dead_paths {
+        if classifiers {
+            dropped += conn.execute(
+                "DELETE FROM smarttags__classifiers WHERE tag_path = ?1",
+                [path],
+            )?;
+        }
+        if suggestions {
+            // (photo_id, path) is the PK: a photo already carrying a suggestion for the
+            // target keeps it, and the redundant one for the dead path is removed.
+            repointed += conn.execute(
+                "UPDATE OR IGNORE smarttags__suggestions SET path = ?2 WHERE path = ?1",
+                rusqlite::params![path, target_path],
+            )?;
+            conn.execute("DELETE FROM smarttags__suggestions WHERE path = ?1", [path])?;
+        }
+    }
+    Ok((dropped, repointed))
+}
+
+fn table_exists(conn: &Connection, name: &str) -> rusqlite::Result<bool> {
+    conn.query_row(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1",
+        [name],
+        |_| Ok(()),
+    )
+    .optional()
+    .map(|r| r.is_some())
+}
+
 pub fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS smarttags__classifiers (

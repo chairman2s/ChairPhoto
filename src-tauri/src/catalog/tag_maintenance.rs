@@ -81,6 +81,9 @@ pub struct TagMergeReport {
     /// Per-tag classifiers dropped because the tag path they were trained for is gone.
     /// `None` = smarttags compiled out.
     pub classifiers_dropped: Option<usize>,
+    /// Pending tag suggestions moved from a dead tag path onto the target's.
+    /// `None` = smarttags compiled out.
+    pub suggestions_repointed: Option<usize>,
 }
 
 /// One tag row, as the maintenance operations need it.

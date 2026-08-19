@@ -323,11 +323,14 @@ pub fn luts_dir() -> Result<PathBuf, String> {
 }
 
 /// Unix seconds, for stamping rows written by the command layer (AI/Smart Tagging
-/// suggestion timestamps, face matcher rejection memory and cluster creation).
+/// suggestion timestamps, face matcher rejection memory and cluster creation, tag-merge
+/// tombstones).
+///
+/// Ungated: tag maintenance is core, so this is reachable in a build with every plugin
+/// feature compiled out.
 ///
 /// Saturates to 0 rather than panicking if the system clock is before the epoch — a
 /// bad timestamp is not worth taking the app down for.
-#[cfg(any(feature = "ai", feature = "smarttags", feature = "faces"))]
 fn now_secs() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

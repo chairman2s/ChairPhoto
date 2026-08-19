@@ -1,6 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import type { TagWithCount } from "../modules/api";
+import type { TagMergeReport, TagWithCount } from "../modules/api";
 import { TagCreateModal } from "./TagCreateModal";
+import { TagMergeModal } from "./TagMergeModal";
+import { TagSplitModal } from "./TagSplitModal";
 
 // The id of the tag currently being dragged. A module-level variable (not React
 // state) so drag handlers read it synchronously — state updates from onDragStart
@@ -10,6 +12,29 @@ let draggedTagId: number | null = null;
 // Left sidebar: the hierarchical tag tree with photo counts. Clicking a tag filters
 // the grid to photos under it (incl. descendants). Tags are draggable: drop one onto
 // another tag to reparent it there, or onto "All photos" to move it to the top level.
+/**
+ * A committed merge, in one status line. Counts only what happened: a merge that moved no
+ * photos says so rather than implying it did work.
+ */
+function mergeSummary(report: TagMergeReport): string {
+  const source = report.sources.map((s) => s.path).join(", ") || "tag";
+  const parts: string[] = [];
+  if (report.photosRetagged > 0) {
+    parts.push(`${report.photosRetagged.toLocaleString()} photo${report.photosRetagged === 1 ? "" : "s"} moved`);
+  }
+  if (report.assignmentsCollapsed > 0) {
+    parts.push(`${report.assignmentsCollapsed.toLocaleString()} already tagged`);
+  }
+  if (report.childrenReparented > 0) {
+    parts.push(`${report.childrenReparented} child tag${report.childrenReparented === 1 ? "" : "s"} moved`);
+  }
+  if (report.smartAlbumsRewritten.length > 0) {
+    parts.push(`${report.smartAlbumsRewritten.length} smart album rule(s) rewritten`);
+  }
+  const detail = parts.length > 0 ? ` — ${parts.join(", ")}` : "";
+  return `Merged ${source} into ${report.targetPath}${detail}.`;
+}
+
 export function TagPanel({
   tags,
   activeTagId,
@@ -18,6 +43,8 @@ export function TagPanel({
   onMoveTag,
   onSetPrivate,
   onTagsChanged,
+  selectedPhotoIds = [],
+  onStatus,
 }: {
   tags: TagWithCount[];
   activeTagId: number | null;
@@ -26,6 +53,10 @@ export function TagPanel({
   onMoveTag: (tagId: number, newParentId: number | null) => void;
   onSetPrivate: (tagId: number, isPrivate: boolean, recursive: boolean) => void;
   onTagsChanged?: () => void;
+  /** The grid's current selection — what "split off these photos" acts on. */
+  selectedPhotoIds?: number[];
+  /** Report an outcome to the app's status line; a merge's counts are worth keeping. */
+  onStatus?: (message: string) => void;
 }) {
   const [overId, setOverId] = useState<number | "root" | null>(null);
   // ids of collapsed parents — their descendants are hidden from the list
@@ -36,6 +67,8 @@ export function TagPanel({
   const [moving, setMoving] = useState<TagWithCount | null>(null);
   const [moveFilter, setMoveFilter] = useState("");
   // "New tags" create modal: open flag + optional parentPath for child creation
+  const [merging, setMerging] = useState<TagWithCount | null>(null);
+  const [splitting, setSplitting] = useState<TagWithCount | null>(null);
   const [createModal, setCreateModal] = useState<{ open: boolean; parentPath: string | null }>({
     open: false,
     parentPath: null,
@@ -416,6 +449,28 @@ export function TagPanel({
           <button
             className="tag-menu-item"
             onClick={() => {
+              setMerging(menu.tag);
+              setMenu(null);
+            }}
+          >
+            Merge into…
+          </button>
+          {selectedPhotoIds.length > 0 && (
+            <button
+              className="tag-menu-item"
+              onClick={() => {
+                setSplitting(menu.tag);
+                setMenu(null);
+              }}
+              title={`Move the ${selectedPhotoIds.length} selected photos onto a different tag`}
+            >
+              Split off {selectedPhotoIds.length} selected…
+            </button>
+          )}
+          <div className="tag-menu-sep" />
+          <button
+            className="tag-menu-item"
+            onClick={() => {
               onEditTag(menu.tag);
               setMenu(null);
             }}
@@ -432,6 +487,32 @@ export function TagPanel({
             New child tags…
           </button>
         </div>
+      )}
+
+      {merging && (
+        <TagMergeModal
+          source={merging}
+          tags={tags}
+          onClose={() => setMerging(null)}
+          onMerged={(report) => {
+            setMerging(null);
+            onStatus?.(mergeSummary(report));
+            onTagsChanged?.();
+          }}
+        />
+      )}
+
+      {splitting && (
+        <TagSplitModal
+          source={splitting}
+          photoIds={selectedPhotoIds}
+          onClose={() => setSplitting(null)}
+          onSplit={(message) => {
+            setSplitting(null);
+            onStatus?.(message);
+            onTagsChanged?.();
+          }}
+        />
       )}
 
       {createModal.open && (

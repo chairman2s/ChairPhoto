@@ -18,8 +18,16 @@ import {
   setLibraryRoot,
   setSetting,
   tidyRedundantTags,
+  listTags,
+  deleteTag,
+  findSimilarTags,
+  findOrphanTags,
+  type OrphanTag,
+  type SimilarTagPair,
+  type TagWithCount,
   vacuumCatalog,
 } from "../modules/api";
+import { TagMergeModal } from "./TagMergeModal";
 import {
   listModules,
   settingsPanelsForModule,
@@ -70,6 +78,12 @@ export function Preferences({
               Storage
             </button>
             <button
+              className={`prefs-tab ${active === "tags" ? "prefs-tab-on" : ""}`}
+              onClick={() => setTab("tags")}
+            >
+              Tags
+            </button>
+            <button
               className={`prefs-tab ${active === "editors" ? "prefs-tab-on" : ""}`}
               onClick={() => setTab("editors")}
             >
@@ -100,6 +114,7 @@ export function Preferences({
                 <MaintenanceSection onChanged={onLibraryRootChanged} />
               </>
             )}
+            {active === "tags" && <TagMaintenanceSection onChanged={onLibraryRootChanged} />}
             {active === "editors" && <EditorsSection />}
             {active === "modules" && <ModulesSection />}
             {moduleTabs.some((m) => m.id === active) && <ModuleSettingsTab moduleId={active} />}
@@ -151,8 +166,77 @@ function LibrarySection({ onChanged }: { onChanged: () => void }) {
         </button>
       </div>
       {status && <div className="modal-sub">{status}</div>}
+    </div>
+  );
+}
 
-      <h3 style={{ marginTop: 18 }}>Tidy tags</h3>
+// Tag maintenance (A5): the operations that used to be hand-written SQL. Tidying, finding
+// duplicate and unused tags, and merging from the results — a merge always goes through the
+// same preview the tag tree's "Merge into…" uses, so there is one merge flow, not two.
+function TagMaintenanceSection({ onChanged }: { onChanged: () => void }) {
+  const [status, setStatus] = useState("");
+  const [tags, setTags] = useState<TagWithCount[]>([]);
+  const [duplicates, setDuplicates] = useState<SimilarTagPair[] | null>(null);
+  const [orphans, setOrphans] = useState<OrphanTag[] | null>(null);
+  const [busy, setBusy] = useState("");
+  const [merging, setMerging] = useState<TagWithCount | null>(null);
+
+  const reload = async () => {
+    setTags(await listTags().catch(() => []));
+  };
+  useEffect(() => {
+    void reload();
+  }, []);
+
+  const tagById = (id: number) => tags.find((t) => t.id === id) ?? null;
+
+  const findDuplicates = async () => {
+    setBusy("duplicates");
+    setStatus("");
+    try {
+      setDuplicates(await findSimilarTags());
+    } catch (e) {
+      setStatus(String(e));
+    } finally {
+      setBusy("");
+    }
+  };
+
+  const findUnused = async () => {
+    setBusy("orphans");
+    setStatus("");
+    try {
+      setOrphans(await findOrphanTags());
+    } catch (e) {
+      setStatus(String(e));
+    } finally {
+      setBusy("");
+    }
+  };
+
+  const removeOrphan = async (orphan: OrphanTag) => {
+    // Deleting a branch cascades to its children, which is not obvious from a list of paths.
+    if (orphan.hasChildren) {
+      const ok = await confirm(
+        `Delete ${orphan.path} and every tag under it?\n\nNone of them hold photos, but the ` +
+          `sub-tags are removed too.`,
+      );
+      if (!ok) return;
+    }
+    try {
+      await deleteTag(orphan.id);
+      setOrphans((prev) => prev?.filter((o) => o.id !== orphan.id) ?? null);
+      setStatus(`Deleted ${orphan.path}.`);
+      await reload();
+      onChanged();
+    } catch (e) {
+      setStatus(String(e));
+    }
+  };
+
+  return (
+    <div className="prefs-section">
+      <h3>Tidy tags</h3>
       <div className="modal-sub">
         Remove redundant ancestor tags across your library — when a photo has a more
         specific tag (e.g. <code>Harbor/Marina</code>), the parent it implies
@@ -175,6 +259,114 @@ function LibrarySection({ onChanged }: { onChanged: () => void }) {
           Tidy redundant tags
         </button>
       </div>
+
+      <h3 style={{ marginTop: 18 }}>Duplicate tags</h3>
+      <div className="modal-sub">
+        Tags whose names look alike, most similar first. Found by name — two tags meaning the
+        same thing under unlike names (<code>Bike</code> and <code>Velocipede</code>) will not
+        appear here. Merging is your call: “Cycling” and “Cycles” may be a typo, or two real
+        things.
+      </div>
+      <div className="row">
+        <button className="chip" disabled={busy !== ""} onClick={() => void findDuplicates()}>
+          {busy === "duplicates" ? "Looking…" : "Find duplicate tags"}
+        </button>
+      </div>
+      {duplicates?.length === 0 && (
+        <div className="modal-sub">No similar tag names found.</div>
+      )}
+      {duplicates && duplicates.length > 0 && (
+        <div className="tag-maint-list">
+          {duplicates.slice(0, 50).map((pair) => (
+            <div key={`${pair.aId}-${pair.bId}`} className="tag-maint-row">
+              <div className="tag-maint-pair">
+                <span>{pair.aPath}</span>
+                <span className="tag-count">{pair.aPhotos.toLocaleString()}</span>
+                <span className="tag-maint-vs">vs</span>
+                <span>{pair.bPath}</span>
+                <span className="tag-count">{pair.bPhotos.toLocaleString()}</span>
+              </div>
+              <div className="modal-sub">{pair.reason}</div>
+              <div className="row" style={{ gap: 6 }}>
+                <button
+                  className="chip"
+                  disabled={!tagById(pair.aId)}
+                  onClick={() => setMerging(tagById(pair.aId))}
+                >
+                  Merge {pair.aPath} away…
+                </button>
+                <button
+                  className="chip"
+                  disabled={!tagById(pair.bId)}
+                  onClick={() => setMerging(tagById(pair.bId))}
+                >
+                  Merge {pair.bPath} away…
+                </button>
+              </div>
+            </div>
+          ))}
+          {duplicates.length > 50 && (
+            <div className="modal-sub">
+              Showing the 50 most similar of {duplicates.length}.
+            </div>
+          )}
+        </div>
+      )}
+
+      <h3 style={{ marginTop: 18 }}>Unused tags</h3>
+      <div className="modal-sub">
+        Tags holding no photos anywhere beneath them. An empty branch is marked as such —
+        deleting it removes the tags under it too.
+      </div>
+      <div className="row">
+        <button className="chip" disabled={busy !== ""} onClick={() => void findUnused()}>
+          {busy === "orphans" ? "Looking…" : "Find unused tags"}
+        </button>
+      </div>
+      {orphans?.length === 0 && <div className="modal-sub">Every tag is in use.</div>}
+      {orphans && orphans.length > 0 && (
+        <div className="tag-maint-list">
+          {orphans.map((orphan) => (
+            <div key={orphan.id} className="tag-maint-row">
+              <div className="tag-maint-pair">
+                <span>{orphan.path}</span>
+                {orphan.hasChildren && <span className="tag-maint-vs">branch</span>}
+                {orphan.isAutoTag && (
+                  <span className="tag-maint-vs" title="Recreated by the auto-tag engine">
+                    auto-tag
+                  </span>
+                )}
+              </div>
+              <div className="row" style={{ gap: 6 }}>
+                <button className="chip" onClick={() => void removeOrphan(orphan)}>
+                  Delete
+                </button>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {status && <div className="modal-sub">{status}</div>}
+
+      {merging && (
+        <TagMergeModal
+          source={merging}
+          tags={tags}
+          onClose={() => setMerging(null)}
+          onMerged={(report) => {
+            setMerging(null);
+            setStatus(
+              `Merged ${report.sources.map((x) => x.path).join(", ")} into ${report.targetPath} — ` +
+                `${report.photosRetagged.toLocaleString()} photo(s) moved.`,
+            );
+            setDuplicates(null);
+            setOrphans(null);
+            void reload();
+            onChanged();
+          }}
+        />
+      )}
     </div>
   );
 }

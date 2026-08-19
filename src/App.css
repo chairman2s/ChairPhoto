@@ -711,6 +711,55 @@ body {
 .tag-move-modal {
   width: 460px;
 }
+/* Tag maintenance (A5): the duplicate/unused review lists in Preferences. */
+.tag-maint-list {
+  margin-top: 8px;
+  max-height: 320px;
+  overflow-y: auto;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+}
+.tag-maint-row {
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.tag-maint-row:last-child {
+  border-bottom: none;
+}
+.tag-maint-pair {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  font-size: 12px;
+}
+.tag-maint-vs {
+  opacity: 0.6;
+  font-size: 11px;
+}
+
+/* Tag maintenance (A5): the merge/split preview. The report is the feature — it gets room
+   to breathe rather than being squeezed into a confirm dialog's one line. */
+.tag-merge-modal {
+  min-width: 420px;
+  max-width: 560px;
+}
+.tag-merge-preview {
+  margin-top: 10px;
+}
+.tag-merge-lines {
+  margin: 6px 0 0;
+  padding-left: 18px;
+  font-size: 12px;
+  line-height: 1.7;
+}
+.tag-merge-lines li {
+  color: var(--text);
+}
+
 .tag-move-list {
   margin-top: 8px;
   max-height: 50vh;

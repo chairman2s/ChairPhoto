@@ -63,6 +63,101 @@ Sources: Getty intro to vocabularies; AAT (Wikipedia); Flickr machine tags
   Keywords are ordered by **specificity**: most-specific assigned tag first, leaf
   before ancestors — the stock-submission convention.
 
+## Tag maintenance (A5)
+
+A vocabulary of a few hundred roots needs surgery occasionally, and the operations that
+reshape it used to be hand-written SQL against a live catalog. They now live in
+`catalog/tag_maintenance.rs`, exposed through `commands/tags.rs`.
+
+**They are pure catalog transactions.** `xmp::write_keywords` has exactly one caller — the
+export destination — so there is no in-library sidecar to rewrite, no job family, no
+resumability. Every function takes a `&Connection` and never commits: the *caller* owns the
+transaction, which is what makes `dry_run` trustworthy. A preview is the real mutation rolled
+back, not a second implementation that can drift from the one that writes.
+
+### The operations
+
+| Operation | Where |
+|---|---|
+| **Merge** tags into one | `merge_tags` — new |
+| **Split** a tag by moving selected photos to another | `split_tag` — new |
+| **Find orphans** (tags holding no photos anywhere below them) | `find_orphan_tags` — new |
+| **Find near-duplicates** | `find_similar_tags` — new |
+| **Rename a subtree** | `Catalog::rename_tag` — already rewrites every descendant's path |
+| **Promote to a top-level axis** | `Catalog::move_tag(id, None)`; the tag tree's Move dialog calls this "↑ Top level" |
+
+The last two were on the A5 wish list and turned out to already exist. Note the vocabulary:
+promoting a tag makes it a top-level **axis** (People, Place, Brand), *not* a "facet" —
+facets are the EXIF-derived internal filters in `catalog/facets.rs`, are never exported, and
+are not tags at all.
+
+### Why a merge is not `UPDATE photo_tags SET tag_id`
+
+Each of these is handled, and each has a test:
+
+- **`tags.parent_id` cascades on delete.** Children are reparented onto the target *before*
+  the source row goes, or deleting the source takes its whole subtree with it.
+- **`full_path_norm` is UNIQUE.** Descendant paths are recomputed and every collision found
+  before the first write, then refused by name. Two sources whose children would land on one
+  path are refused the same way. Merging `A` into `B` when both own a child called `x` is a
+  refusal, not a recursive merge — merge that pair first.
+- **`photo_tags` PK `(photo_id, tag_id)`.** A photo carrying both collapses to one row
+  keeping the **earlier** `created_at` — when the user first said this about this photo.
+- **Smart album rules store tag ids.** `rule_json` conditions are rewritten and the albums
+  named in the report; a rule that will not parse is left exactly as found.
+- **Auto-tags recompute membership.** Merging *into* an auto-tag is refused (the engine
+  deletes and re-derives its assignments, so the merge would silently undo itself); merging
+  one *away* warns that the engine re-creates it by path, empty.
+- **Tags survive in bundles.** See the tombstone below.
+- **Plugins hold tag references.** See ownership below.
+
+`tag_synonyms.synonym_norm` is UNIQUE **catalog-wide**, so two tags can never hold the same
+normalized synonym and moving `tag_id` cannot collide. (The A5 design predicted a hazard the
+schema rules out.) `tag_terms` is unique per `(tag, text, language)`, so those genuinely can
+collide: they are skipped and **named** in the report.
+
+### The tombstone — what makes a merge permanent
+
+`tags.uuid` is how shared taxonomies merge by identity rather than name, and that cuts both
+ways: `catalog/merge.rs` matches an incoming bundle tag **by uuid first**, so importing a
+bundle exported before a merge would re-create the tag that was merged away, quietly undoing
+the reorg.
+
+`tag_aliases (dead_uuid, target_tag_id, dead_path, merged_at)` records where each merged-away
+uuid went, and the bundle importer consults it before creating anything. A merge that
+repoints an earlier merge's target rewrites the older rows too, so a chain never strands a
+uuid. Without this, A5 would be cosmetic — it would survive exactly until the next bundle
+import.
+
+### Plugin state, and who moves it
+
+Core owns no knowledge of `faces__*` or `smarttags__*`. Each plugin exposes its own repoint
+(`faces::store::repoint_person_tags`, `smarttags::classifier::forget_merged_tag_paths`) and
+`commands/tags.rs` composes them into the merge's single transaction.
+
+**Plugins move first, and the order is load-bearing.** `faces__faces.person_tag_id` is
+`ON DELETE SET NULL`, so the moment core deletes a source tag the cascade un-names every face
+that pointed at it — a repoint running afterwards finds nothing and reports a truthful-looking
+zero while the data is being lost. `faces__rejections.person_tag_id` has no FK at all and
+would simply dangle. Smart Tagging keys on the tag *path*, which likewise exists only while
+the tag does.
+
+A plugin failure **fails the whole merge**, inverting the usual "a missing optional capability
+degrades only the cosmetic behaviour" rule: faces detached from the person they belong to is
+data loss, not a missing nicety.
+
+Report counters are three-valued for plugin state: `None` = that plugin is compiled out and
+nothing was checked; `Some(0)` = checked, nothing there.
+
+### Finding duplicates
+
+`find_similar_tags` compares **leaf names** (so `Place/Bergen` and `People/Bergen` surface as
+a pair worth a glance) with a length prefilter, and reports per-pair co-occurrence — the
+signal that separates a typo from two real concepts. Co-occurrence is *not* used to find
+pairs: that needs an all-pairs self-join over `photo_tags`, tens of millions of rows on a
+six-figure catalog. The documented cost is that two duplicates with unlike names (`Bike`,
+`Velocipede`) will not appear.
+
 ## Faceted axes (insight from photo contests)
 
 Photo contests (Sony WPA, Nat Geo, National Wildlife, Nature Photography Contest, NY

@@ -3633,3 +3633,99 @@ body {
   text-align: center;
   color: var(--star);
 }
+
+/* ── Auto-stack proposals (C3) ────────────────────────────────────────────────
+   A review list, not a progress dialog: the frames are large enough to judge,
+   the keeper is obvious at a glance, and the two consequences of accepting
+   (re-homed stacks, unweighed frames) sit next to the button that causes them. */
+.modal.stack-proposals {
+  width: min(880px, 92vw);
+  max-height: 86vh;
+}
+.stack-proposals-note {
+  color: var(--text-dim);
+  line-height: 1.45;
+  padding: 8px 10px;
+  border-left: 2px solid var(--accent);
+  background: rgba(59, 130, 246, 0.08);
+  border-radius: var(--r-sm);
+}
+.stack-proposal {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px 0;
+  border-top: 1px solid var(--border);
+}
+.stack-proposal-head {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  flex-wrap: wrap;
+  color: var(--text-dim);
+}
+.stack-proposal-reason {
+  margin-left: auto;
+  color: var(--text-mute);
+  font-style: italic;
+}
+.stack-proposal-frames {
+  display: flex;
+  gap: 8px;
+  overflow-x: auto;
+  padding-bottom: 4px;
+}
+.stack-proposal-frame {
+  position: relative;
+  flex: 0 0 auto;
+  width: 132px;
+  padding: 0;
+  border: 2px solid transparent;
+  border-radius: var(--r-sm);
+  background: var(--bg-tile);
+  cursor: pointer;
+  overflow: hidden;
+}
+.stack-proposal-frame:hover {
+  border-color: var(--text-mute);
+}
+.stack-proposal-frame.is-keeper {
+  border-color: var(--accent);
+}
+.stack-proposal-frame img {
+  display: block;
+  width: 100%;
+  aspect-ratio: 3 / 2;
+  object-fit: cover;
+}
+.stack-proposal-frame-meta {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 5px;
+  font-size: 11px;
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+}
+.stack-proposal-crown {
+  color: var(--star);
+}
+.stack-proposal-stars {
+  color: var(--star);
+  margin-left: auto;
+}
+.stack-proposal-carries {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  padding: 1px 4px;
+  border-radius: var(--r-pill);
+  background: rgba(15, 23, 42, 0.8);
+  font-size: 10px;
+  color: var(--text-dim);
+}
+.stack-proposal-caveats {
+  color: var(--text-mute);
+  font-size: 11px;
+  line-height: 1.45;
+}

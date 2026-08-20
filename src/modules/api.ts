@@ -1523,3 +1523,68 @@ export interface PhotoSignals {
  */
 export const explainPhotoSignals = (photoId: number) =>
   invoke<PhotoSignals>("explain_photo_signals", { photoId });
+
+// ── C3 — auto-stack proposals ─────────────────────────────────────────────────
+
+/** One frame of a proposed stack. */
+export interface ProposalFrame {
+  photoId: number;
+  fileName: string;
+  sharpness: number | null;
+  rating: number;
+  burstFlag: string | null;
+  /** dHash distance from the proposed keeper; `null` when either is unhashed. */
+  hammingDistance: number | null;
+  /** Photos already stacked under this frame, which accepting would re-home. */
+  childCount: number;
+  isKeeper: boolean;
+}
+
+/** A group of frames the engine believes is one moment. */
+export interface StackProposal {
+  keeperId: number;
+  /** Why that frame won, in the terms the rule actually used. */
+  reason: string;
+  spanSecs: number;
+  /** Widest dHash distance from the keeper; `null` when frames are not all hashed. */
+  maxDistance: number | null;
+  unscored: number;
+  /** Photos stacked under a *member*, which accepting moves onto the keeper. */
+  absorbedChildren: number;
+  members: ProposalFrame[];
+}
+
+export interface StackProposals {
+  proposals: StackProposal[];
+  /** Photos examined — the requested ids that exist and are present. */
+  considered: number;
+  /** Requested photos left out because they are already stacked under something. */
+  skippedStacked: number;
+  /** More groups were found than one pass returns; run again after accepting these. */
+  truncated: boolean;
+  timeGapSecs: number;
+  hammingThreshold: number;
+}
+
+export interface StackApplied {
+  stacked: number;
+  /** Photos that were stacked under a member and are now under the keeper instead. */
+  absorbed: number;
+}
+
+/**
+ * Propose stacks over `photoIds` (C3) — the selection, or the whole view.
+ *
+ * Read-only: nothing is stacked until `applyStackProposal` is called for a group.
+ */
+export const proposeStacks = (photoIds: number[]) =>
+  invoke<StackProposals>("propose_stacks", { photoIds });
+
+/**
+ * Accept one proposal: stack `memberIds` under `keeperId`, in one transaction.
+ *
+ * Reversible one frame at a time through the inspector's Unstack. Refused if the keeper is
+ * itself stacked under another photo, which would build a stack two levels deep.
+ */
+export const applyStackProposal = (keeperId: number, memberIds: number[]) =>
+  invoke<StackApplied>("apply_stack_proposal", { keeperId, memberIds });

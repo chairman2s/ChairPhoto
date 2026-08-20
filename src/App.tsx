@@ -107,6 +107,7 @@ import { PublishDialog } from "./components/PublishDialog";
 import { ImportPanel } from "./components/ImportPanel";
 import { BundleExportDialog } from "./components/BundleExportDialog";
 import { BundleImportDialog } from "./components/BundleImportDialog";
+import { StackProposalsDialog } from "./components/StackProposalsDialog";
 import { CatalogSwitcher } from "./components/CatalogSwitcher";
 import { EditorView } from "./components/EditorView";
 import { parseEdit } from "./modules/editing";
@@ -270,6 +271,10 @@ export default function App() {
   // overlay). `closeModalAction` is stable so ModuleActionModal's mount effect — which
   // keys on it — runs once per opened modal rather than once per App render.
   const [modalAction, setModalAction] = useState<ToolbarAction | null>(null);
+  // Auto-stack proposals (C3). Holds the photo ids the pass examines, snapshotted when the
+  // dialog opens: the grid can refresh under it as groups are accepted, and re-proposing
+  // over a moving set would renumber the groups being reviewed.
+  const [stackTargets, setStackTargets] = useState<number[] | null>(null);
   const closeModalAction = useCallback(() => setModalAction(null), []);
   // Right-click context menu on a grid tile.
   const [ctxMenu, setCtxMenu] = useState<{ x: number; y: number; photoId: number } | null>(null);
@@ -816,6 +821,17 @@ export default function App() {
     }
   };
 
+  // Auto-stack proposals (C3): same scoping as burst analysis — the selection, else the
+  // whole view. Opening only *proposes*; each group is accepted individually in the dialog.
+  const openStackProposals = () => {
+    const targets = selection.ids.length ? selection.ids : photos.map((p) => p.id);
+    if (targets.length === 0) {
+      setStatus("No photos to group — scan or select some first.");
+      return;
+    }
+    setStackTargets(targets);
+  };
+
   // Surface batch-cache progress in the status bar. `useOwnedSubscription` owns the async
   // registration (issue #13): one that resolves after this effect is cleaned up is stopped
   // rather than left running.
@@ -1319,6 +1335,18 @@ export default function App() {
           }
         >
           Analyse burst
+        </button>
+        <button
+          className="btn-ghost"
+          onClick={openStackProposals}
+          disabled={!ready}
+          title={
+            selection.ids.length
+              ? `Propose stacks for ${selection.ids.length} selected photo(s)`
+              : "Propose stacks for all visible photos — review each group before it collapses"
+          }
+        >
+          Stack bursts
         </button>
         {toolbarActions().map((action) => (
           <button
@@ -1926,6 +1954,13 @@ export default function App() {
         );
       })()}
 
+      {stackTargets && (
+        <StackProposalsDialog
+          photoIds={stackTargets}
+          onClose={() => setStackTargets(null)}
+          onApplied={refresh}
+        />
+      )}
       {modalAction && <ModuleActionModal action={modalAction} close={closeModalAction} />}
 
       {showGroups && (

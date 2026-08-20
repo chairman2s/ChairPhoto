@@ -305,6 +305,19 @@ CREATE TABLE IF NOT EXISTS photo_edits (
 -- later pass can tell "carried and current" from "the local one has moved on since".
 -- `carried_mtime` is the SOURCE file's mtime at carry time, not the destination's: the
 -- question being answered is whether the local file has changed since we copied it.
+-- The photos a user should see. Everything that *lists* or *counts* photos for the user
+-- reads this instead of `photos`, so the visibility rule lives in one place rather than
+-- being re-spelled at every call site (it was spelled 36 times before this view existed).
+--
+-- Deliberately NOT used by: single-row lookups by id (the caller already has the row and
+-- wants it whatever its state), the background indexer queues, and maintenance/purge paths.
+-- Those must see hidden photos, and routing them here would silently change behaviour.
+--
+-- `SELECT *` on purpose: columns are added to `photos` by migration, and the view is
+-- re-resolved on use, so it keeps up without a second column list to maintain.
+DROP VIEW IF EXISTS photos_visible;
+CREATE VIEW photos_visible AS SELECT * FROM photos WHERE missing = 0;
+
 CREATE TABLE IF NOT EXISTS photo_location_companions (
     location_id   INTEGER NOT NULL REFERENCES photo_locations(id) ON DELETE CASCADE,
     -- File name of the companion at that location (e.g. `DSC1.ARW.xmp`).

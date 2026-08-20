@@ -27,6 +27,7 @@ mod stats;
 mod tag_path;
 pub mod tag_maintenance;
 mod terms;
+mod visibility;
 
 #[cfg(test)]
 mod performance_harness;
@@ -262,6 +263,15 @@ impl Catalog {
             .execute_batch("DROP INDEX IF EXISTS idx_photo_metadata_lookup;")?;
         // Verified-hash on locations for the backup/offload lifecycle (schema v10).
         self.ensure_column("photo_locations", "verified_hash", "TEXT")?;
+        // The user-visible photo view: everything that lists or counts photos for the
+        // user reads this, so the visibility rule lives in one place instead of being
+        // re-spelled per call site. Dropped and recreated on every open rather than
+        // `IF NOT EXISTS`, because its definition grows (trash joins the predicate in B2)
+        // and a view left at an older definition would silently apply an older rule.
+        self.conn.execute_batch(
+            "DROP VIEW IF EXISTS photos_visible;
+             CREATE VIEW photos_visible AS SELECT * FROM photos WHERE missing = 0;",
+        )?;
         // Companions carried alongside the image at a location (cluster B). A copy is the
         // image plus its declared companions; before this, backup carried only the image
         // and left darktable/RapidRAW edit state behind (#80).
@@ -1177,8 +1187,8 @@ impl Catalog {
             other => return Err(CatalogError::Tag(format!("unknown column: {other}"))),
         };
         let sql = format!(
-            "SELECT DISTINCT {col} FROM photos \
-             WHERE missing = 0 AND {col} IS NOT NULL AND {col} <> '' \
+            "SELECT DISTINCT {col} FROM photos_visible \
+             WHERE {col} IS NOT NULL AND {col} <> '' \
              ORDER BY {col} COLLATE NOCASE"
         );
         let mut stmt = self.conn.prepare(&sql)?;
@@ -1293,7 +1303,7 @@ impl Catalog {
         &self,
     ) -> Result<Vec<crate::flickr::CatalogPhotoRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, path, capture_time FROM photos WHERE missing = 0",
+            "SELECT id, path, capture_time FROM photos_visible",
         )?;
         let rows = stmt.query_map([], |r| {
             Ok(crate::flickr::CatalogPhotoRow {
@@ -1495,10 +1505,10 @@ impl Catalog {
         let mut stmt = self.conn.prepare(
             "SELECT t.id, t.name, t.full_path, t.parent_id, t.description, t.auto_rule,
                     t.uuid, t.private, COUNT(*) AS freq
-             FROM photos p
+             FROM photos_visible p
              JOIN photo_tags pt ON pt.photo_id = p.id
              JOIN tags t ON t.id = pt.tag_id
-             WHERE p.capture_time BETWEEN ?1 AND ?2 AND p.id != ?3 AND p.missing = 0
+             WHERE p.capture_time BETWEEN ?1 AND ?2 AND p.id != ?3
                AND t.id NOT IN (SELECT tag_id FROM photo_tags WHERE photo_id = ?3)
              GROUP BY t.id
              ORDER BY freq DESC, t.full_path_norm",
@@ -1612,7 +1622,7 @@ impl Catalog {
              -- Count only photos that are actually present (the grid hides missing/removed
              -- ones), so a tag's count matches what selecting it shows. Counting NULL p.id
              -- (a missing photo) is skipped by COUNT(DISTINCT …).
-             LEFT JOIN photos p ON p.id = pt.photo_id AND p.missing = 0
+             LEFT JOIN photos_visible p ON p.id = pt.photo_id
              GROUP BY t.id
              ORDER BY t.full_path_norm",
         )?;
@@ -1828,7 +1838,7 @@ impl Catalog {
             "SELECT t.id, t.full_path, COUNT(DISTINCT pt.photo_id) AS c
              FROM tags t
              JOIN photo_tags pt ON pt.tag_id = t.id
-             JOIN photos p ON p.id = pt.photo_id AND p.missing = 0
+             JOIN photos_visible p ON p.id = pt.photo_id
              GROUP BY t.id HAVING c > 0 ORDER BY c DESC",
         )?;
         let nodes = stmt
@@ -1839,7 +1849,7 @@ impl Catalog {
             "SELECT a.tag_id, b.tag_id, COUNT(*) AS w
              FROM photo_tags a
              JOIN photo_tags b ON a.photo_id = b.photo_id AND a.tag_id < b.tag_id
-             JOIN photos p ON p.id = a.photo_id AND p.missing = 0
+             JOIN photos_visible p ON p.id = a.photo_id
              GROUP BY a.tag_id, b.tag_id",
         )?;
         let edges = stmt
@@ -1870,7 +1880,7 @@ impl Catalog {
             "SELECT t.id, t.full_path, COUNT(DISTINCT pt.photo_id) AS c
              FROM tags t
              JOIN photo_tags pt ON pt.tag_id = t.id
-             JOIN photos p ON p.id = pt.photo_id AND p.missing = 0
+             JOIN photos_visible p ON p.id = pt.photo_id
              GROUP BY t.id HAVING c > 0 ORDER BY c DESC",
         )?;
         let tags = stmt
@@ -1879,7 +1889,7 @@ impl Catalog {
 
         // Camera nodes
         let mut stmt = self.conn.prepare(
-            "SELECT camera_model, COUNT(*) FROM photos WHERE missing = 0 AND camera_model IS NOT NULL AND camera_model != '' GROUP BY camera_model ORDER BY COUNT(*) DESC",
+            "SELECT camera_model, COUNT(*) FROM photos_visible WHERE camera_model IS NOT NULL AND camera_model != '' GROUP BY camera_model ORDER BY COUNT(*) DESC",
         )?;
         let cameras = stmt
             .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
@@ -1890,7 +1900,7 @@ impl Catalog {
             "SELECT a.tag_id, b.tag_id, COUNT(*) AS w
              FROM photo_tags a
              JOIN photo_tags b ON a.photo_id = b.photo_id AND a.tag_id < b.tag_id
-             JOIN photos p ON p.id = a.photo_id AND p.missing = 0
+             JOIN photos_visible p ON p.id = a.photo_id
              GROUP BY a.tag_id, b.tag_id",
         )?;
         let cooc_edges = stmt
@@ -1905,9 +1915,9 @@ impl Catalog {
 
         // Camera-tag edges
         let mut stmt = self.conn.prepare(
-            "SELECT p.camera_model, pt.tag_id, COUNT(*) FROM photos p
+            "SELECT p.camera_model, pt.tag_id, COUNT(*) FROM photos_visible p
              JOIN photo_tags pt ON pt.photo_id = p.id
-             WHERE p.missing = 0 AND p.camera_model IS NOT NULL AND p.camera_model != ''
+             WHERE p.camera_model IS NOT NULL AND p.camera_model != ''
              GROUP BY p.camera_model, pt.tag_id",
         )?;
         let camera_edges = stmt
@@ -1925,8 +1935,8 @@ impl Catalog {
     ) -> Result<(Vec<(i64, String, i64)>, Vec<(i64, String, i64)>, Vec<(i64, i64)>)> {
         let mut stmt = self.conn.prepare(
             "SELECT p.id, p.path, COUNT(pt.tag_id) AS c
-             FROM photos p JOIN photo_tags pt ON pt.photo_id = p.id
-             WHERE p.missing = 0 GROUP BY p.id",
+             FROM photos_visible p JOIN photo_tags pt ON pt.photo_id = p.id
+             GROUP BY p.id",
         )?;
         let photos = stmt
             .query_map([], |r| {
@@ -1940,7 +1950,7 @@ impl Catalog {
             "SELECT t.id, t.full_path, COUNT(DISTINCT pt.photo_id) AS c
              FROM tags t
              JOIN photo_tags pt ON pt.tag_id = t.id
-             JOIN photos p ON p.id = pt.photo_id AND p.missing = 0
+             JOIN photos_visible p ON p.id = pt.photo_id
              GROUP BY t.id HAVING c > 0",
         )?;
         let tags = stmt
@@ -1949,7 +1959,7 @@ impl Catalog {
 
         let mut stmt = self.conn.prepare(
             "SELECT pt.photo_id, pt.tag_id FROM photo_tags pt
-             JOIN photos p ON p.id = pt.photo_id AND p.missing = 0",
+             JOIN photos_visible p ON p.id = pt.photo_id",
         )?;
         let edges = stmt
             .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?

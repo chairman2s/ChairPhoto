@@ -109,7 +109,7 @@ pub fn gather_bundle(catalog: &Catalog, batch_id: i64) -> crate::catalog::Result
     // --- 2. Photo IDs in the batch (non-missing) -------------------------
     let photo_ids: Vec<i64> = {
         let mut stmt = catalog.conn().prepare(
-            "SELECT id FROM photos WHERE import_batch_id = ?1 AND missing = 0 ORDER BY id",
+            "SELECT id FROM photos_visible WHERE import_batch_id = ?1 ORDER BY id",
         )?;
         let ids = stmt.query_map(params![batch_id], |r| r.get(0))?
             .collect::<rusqlite::Result<Vec<_>>>()?;

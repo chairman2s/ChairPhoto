@@ -98,14 +98,14 @@ impl Catalog {
 
         // --- totals ---------------------------------------------------------
         let total_photos: i64 = self.conn.query_row(
-            &format!("SELECT COUNT(*) FROM photos p WHERE p.missing = 0{scope}"),
+            &format!("SELECT COUNT(*) FROM photos_visible p WHERE TRUE{scope}"),
             [],
             |r| r.get(0),
         )?;
 
         let with_capture_time: i64 = self.conn.query_row(
             &format!(
-                "SELECT COUNT(*) FROM photos p WHERE p.missing = 0 AND {TIME_OK}{scope}"
+                "SELECT COUNT(*) FROM photos_visible p WHERE {TIME_OK}{scope}"
             ),
             [],
             |r| r.get(0),
@@ -113,8 +113,8 @@ impl Catalog {
 
         let invalid_dates: i64 = self.conn.query_row(
             &format!(
-                "SELECT COUNT(*) FROM photos p
-                 WHERE p.missing = 0 AND p.capture_time IS NOT NULL AND p.capture_time != ''
+                "SELECT COUNT(*) FROM photos_visible p
+                 WHERE p.capture_time IS NOT NULL AND p.capture_time != ''
                    AND p.capture_time < '{SANE_DATE_FLOOR}'{scope}"
             ),
             [],
@@ -125,8 +125,8 @@ impl Catalog {
             .conn
             .query_row(
                 &format!(
-                    "SELECT MIN(substr(p.capture_time, 1, 7)) FROM photos p
-                     WHERE p.missing = 0 AND {TIME_OK}{scope}"
+                    "SELECT MIN(substr(p.capture_time, 1, 7)) FROM photos_visible p
+                     WHERE {TIME_OK}{scope}"
                 ),
                 [],
                 |r| r.get(0),
@@ -138,8 +138,8 @@ impl Catalog {
             .conn
             .query_row(
                 &format!(
-                    "SELECT MAX(substr(p.capture_time, 1, 7)) FROM photos p
-                     WHERE p.missing = 0 AND {TIME_OK}{scope}"
+                    "SELECT MAX(substr(p.capture_time, 1, 7)) FROM photos_visible p
+                     WHERE {TIME_OK}{scope}"
                 ),
                 [],
                 |r| r.get(0),
@@ -151,8 +151,8 @@ impl Catalog {
         let timeline: Vec<(String, i64)> = {
             let mut stmt = self.conn.prepare(&format!(
                 "SELECT substr(p.capture_time, 1, 7) AS ym, COUNT(*) AS c
-                 FROM photos p
-                 WHERE p.missing = 0 AND {TIME_OK}{scope}
+                 FROM photos_visible p
+                 WHERE {TIME_OK}{scope}
                  GROUP BY ym ORDER BY ym"
             ))?;
             let v = stmt
@@ -165,8 +165,8 @@ impl Catalog {
         let top_days: Vec<(String, i64)> = {
             let mut stmt = self.conn.prepare(&format!(
                 "SELECT substr(p.capture_time, 1, 10) AS d, COUNT(*) AS c
-                 FROM photos p
-                 WHERE p.missing = 0 AND {TIME_OK}{scope}
+                 FROM photos_visible p
+                 WHERE {TIME_OK}{scope}
                  GROUP BY d ORDER BY c DESC LIMIT 3"
             ))?;
             let v = stmt
@@ -180,8 +180,8 @@ impl Catalog {
             let mut counts = vec![0i64; 24];
             let mut stmt = self.conn.prepare(&format!(
                 "SELECT CAST(substr(p.capture_time, 12, 2) AS INTEGER) AS h, COUNT(*) AS c
-                 FROM photos p
-                 WHERE p.missing = 0 AND {TIME_OK}{scope}
+                 FROM photos_visible p
+                 WHERE {TIME_OK}{scope}
                  GROUP BY h"
             ))?;
             let rows: Vec<(i64, i64)> = stmt
@@ -200,8 +200,8 @@ impl Catalog {
             let mut counts = vec![0i64; 7];
             let mut stmt = self.conn.prepare(&format!(
                 "SELECT CAST(strftime('%w', p.capture_time) AS INTEGER) AS d, COUNT(*) AS c
-                 FROM photos p
-                 WHERE p.missing = 0 AND {TIME_OK}{scope}
+                 FROM photos_visible p
+                 WHERE {TIME_OK}{scope}
                    AND strftime('%w', p.capture_time) IS NOT NULL
                  GROUP BY d"
             ))?;
@@ -225,7 +225,7 @@ impl Catalog {
                 "SELECT t.id, t.full_path, COUNT(DISTINCT pt.photo_id) AS c
                  FROM tags t
                  JOIN photo_tags pt ON pt.tag_id = t.id
-                 JOIN photos p ON p.id = pt.photo_id AND p.missing = 0
+                 JOIN photos_visible p ON p.id = pt.photo_id
                  WHERE 1=1{scope}
                  GROUP BY t.id HAVING c > 0 ORDER BY c DESC LIMIT 15"
             ))?;
@@ -238,8 +238,8 @@ impl Catalog {
         // --- cameras --------------------------------------------------------
         let cameras: Vec<(String, i64)> = {
             let mut stmt = self.conn.prepare(&format!(
-                "SELECT p.camera_model, COUNT(*) AS c FROM photos p
-                 WHERE p.missing = 0 AND p.camera_model IS NOT NULL AND p.camera_model != ''{scope}
+                "SELECT p.camera_model, COUNT(*) AS c FROM photos_visible p
+                 WHERE p.camera_model IS NOT NULL AND p.camera_model != ''{scope}
                  GROUP BY p.camera_model ORDER BY c DESC"
             ))?;
             let v = stmt
@@ -251,8 +251,8 @@ impl Catalog {
         // --- lenses ---------------------------------------------------------
         let lenses: Vec<(String, i64)> = {
             let mut stmt = self.conn.prepare(&format!(
-                "SELECT p.lens, COUNT(*) AS c FROM photos p
-                 WHERE p.missing = 0 AND p.lens IS NOT NULL AND p.lens != ''{scope}
+                "SELECT p.lens, COUNT(*) AS c FROM photos_visible p
+                 WHERE p.lens IS NOT NULL AND p.lens != ''{scope}
                  GROUP BY p.lens ORDER BY c DESC"
             ))?;
             let v = stmt
@@ -264,8 +264,8 @@ impl Catalog {
         // --- focal lengths --------------------------------------------------
         let focal_lengths: Vec<(f64, i64)> = {
             let mut stmt = self.conn.prepare(&format!(
-                "SELECT p.focal_length, COUNT(*) AS c FROM photos p
-                 WHERE p.missing = 0 AND p.focal_length IS NOT NULL{scope}
+                "SELECT p.focal_length, COUNT(*) AS c FROM photos_visible p
+                 WHERE p.focal_length IS NOT NULL{scope}
                  GROUP BY p.focal_length ORDER BY p.focal_length"
             ))?;
             let v = stmt
@@ -278,8 +278,8 @@ impl Catalog {
         let ratings: Vec<i64> = {
             let mut counts = vec![0i64; 6];
             let mut stmt = self.conn.prepare(&format!(
-                "SELECT p.rating, COUNT(*) AS c FROM photos p
-                 WHERE p.missing = 0{scope}
+                "SELECT p.rating, COUNT(*) AS c FROM photos_visible p
+                 WHERE TRUE{scope}
                  GROUP BY p.rating"
             ))?;
             let rows: Vec<(Option<i64>, i64)> = stmt

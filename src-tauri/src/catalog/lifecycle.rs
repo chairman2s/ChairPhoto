@@ -356,9 +356,16 @@ impl Catalog {
             .map(|dt| dt.format("%Y-%m-%dT%H:%M:%S").to_string())
             .unwrap_or_default();
         // Candidates: non-missing photos older than the cutoff that have a local location.
+        //
+        // Reads `photos`, not `photos_visible` (includes-hidden: freeing space is
+        // maintenance, not browsing — a photo the user has hidden still occupies the disk,
+        // and is if anything a better offload candidate than one they look at daily).
         let candidates: Vec<i64> = {
             let mut stmt = self.conn.prepare(
-                "SELECT DISTINCT p.id FROM photos p
+                "-- includes-hidden: freeing space is maintenance, not browsing. A photo
+                 -- the user has hidden still occupies the disk, and is if anything a
+                 -- better offload candidate than one they look at daily.
+                 SELECT DISTINCT p.id FROM photos p
                  JOIN photo_locations l ON l.photo_id = p.id
                  JOIN volumes v ON v.id = l.volume_id AND v.kind = 'local'
                  WHERE p.missing = 0 AND (

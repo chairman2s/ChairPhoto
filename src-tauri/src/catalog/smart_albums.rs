@@ -148,7 +148,7 @@ impl Catalog {
     /// translated predicates as a `COUNT(*)`, so it always reflects the current library.
     pub fn smart_album_count(&self, rule_json: &str) -> Result<i64> {
         let (wheres, binds) = rule_to_sql(rule_json)?;
-        let mut sql = String::from("SELECT COUNT(*) FROM photos p WHERE p.missing = 0");
+        let mut sql = String::from("SELECT COUNT(*) FROM photos_visible p WHERE TRUE");
         for w in &wheres {
             sql.push_str(" AND ");
             sql.push_str(w);

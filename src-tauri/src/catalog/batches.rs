@@ -75,7 +75,9 @@ impl Catalog {
         Ok(self
             .conn
             .query_row(
-                "SELECT b.uuid
+                "-- includes-hidden: a lookup by photo id, which wants that batch
+                 -- whatever the visibility of the photo.
+                 SELECT b.uuid
                  FROM photos p
                  JOIN import_batches b ON b.id = p.import_batch_id
                  WHERE p.id = ?1",
@@ -97,8 +99,8 @@ impl Catalog {
     pub fn list_import_batches(&self) -> Result<Vec<ImportBatch>> {
         let mut stmt = self.conn.prepare(
             "SELECT b.id, b.uuid, b.source_label, b.note, b.created_at,
-                    (SELECT COUNT(*) FROM photos p
-                     WHERE p.import_batch_id = b.id AND p.missing = 0) AS photo_count
+                    (SELECT COUNT(*) FROM photos_visible p
+                     WHERE p.import_batch_id = b.id) AS photo_count
              FROM import_batches b
              ORDER BY b.created_at DESC, b.id DESC",
         )?;

@@ -142,6 +142,9 @@ pub(crate) fn photo_columns(alias: &str) -> String {
          {alias}.pick_state, {alias}.capture_time, {alias}.width, {alias}.height,
          {alias}.camera_model, {alias}.lens, {alias}.aperture, {alias}.shutter_speed,
          {alias}.iso, {alias}.external_editors, {alias}.thumbnail_path,
+         -- includes-hidden: the stack badge counts every derivative under this photo,
+         -- including ones the grid would not list on their own. A stack of three
+         -- showing as two because a child is offline is a worse lie than counting it.
          (SELECT COUNT(*) FROM photos c WHERE c.stack_parent_id = {alias}.id),
          {alias}.stack_parent_id, {alias}.metadata_ready, {alias}.sharpness,
          {alias}.sharpness_method, {alias}.burst_flag,
@@ -248,13 +251,10 @@ impl Catalog {
     /// Every value reaching SQL is bound; the only interpolated text is from fixed
     /// allowlists (the enums above and `facet_predicate_owned`).
     fn build_query(&self, query: &PhotoQuery) -> Result<QuerySql> {
-        let mut from = String::from("photos p");
+        let mut from = String::from("photos_visible p");
         // Stacked derivatives (e.g. a camera JPEG under its RAW) are hidden from the
         // main grid; they're reached via the master's Stack section in the inspector.
-        let mut wheres = vec![
-            "p.missing = 0".to_string(),
-            "p.stack_parent_id IS NULL".to_string(),
-        ];
+        let mut wheres = vec!["p.stack_parent_id IS NULL".to_string()];
         let mut bind: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
 
         if let Some(tid) = query.tag_id {

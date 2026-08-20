@@ -257,6 +257,160 @@ where
     0.0
 }
 
+// ── H16e — burst-relative sharpness flagging (pure rule) ─────────────────────
+
+/// What the burst-relative rule says about one frame in its cluster.
+///
+/// The two flagged variants are the strings persisted in `photos.burst_flag`
+/// ([`BurstVerdict::db_str`]); the two neutral ones both clear the column but are kept
+/// distinct because they mean different things to a reader — and because
+/// `analyze_burst_sharpness` counts only [`BurstVerdict::Unscored`] as "cleared".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BurstVerdict {
+    /// Sharpest scored frame in a multi-frame cluster.
+    Sharpest,
+    /// Scored below `median × soft_threshold`.
+    Soft,
+    /// Scored, but neither the best nor below the cutoff.
+    InRange,
+    /// No sharpness score, so the rule has nothing to compare.
+    Unscored,
+}
+
+impl BurstVerdict {
+    /// The `photos.burst_flag` value for this verdict; `None` clears the column.
+    pub fn db_str(self) -> Option<&'static str> {
+        match self {
+            BurstVerdict::Sharpest => Some("sharpest-of-burst"),
+            BurstVerdict::Soft => Some("soft-in-burst"),
+            BurstVerdict::InRange | BurstVerdict::Unscored => None,
+        }
+    }
+}
+
+/// The rule's output for one cluster: the verdict per member plus the numbers the
+/// verdict was derived from, so a caller can *explain* a flag and not merely apply it.
+#[derive(Debug, Clone)]
+pub struct ClusterFlagging {
+    /// One entry per input member, in the order they were passed in.
+    pub verdicts: Vec<(i64, BurstVerdict)>,
+    /// Median sharpness over scored members (see [`cluster_median`]), or `None` when no
+    /// member is scored.
+    pub median: Option<f64>,
+    /// `median × soft_threshold` — the score below which a frame is [`BurstVerdict::Soft`].
+    pub cutoff: Option<f64>,
+    /// The sharpest scored member `(id, score)`, or `None` when no member is scored.
+    pub best: Option<(i64, f64)>,
+    /// How many members carry a sharpness score.
+    pub scored: usize,
+}
+
+impl ClusterFlagging {
+    /// This member's 1-based rank among the cluster's *scored* members, sharpest first.
+    /// `None` for an unscored member (it has no place in the ordering) or an id that is
+    /// not in this cluster.
+    ///
+    /// Ties break by position in `members` — later wins — because that is how `max_by`
+    /// resolves [`ClusterFlagging::best`]. Ranking any other way would let a frame be
+    /// crowned sharpest while reading as rank 2.
+    pub fn rank_of(&self, photo_id: i64, members: &[BurstPhoto]) -> Option<usize> {
+        let at = members.iter().position(|m| m.id == photo_id)?;
+        let score = members[at].sharpness?;
+        let better = members
+            .iter()
+            .enumerate()
+            .filter(|(i, m)| match m.sharpness {
+                Some(other) => other > score || (other == score && *i > at),
+                None => false,
+            })
+            .count();
+        Some(better + 1)
+    }
+}
+
+/// Apply the H16e burst-relative sharpness rule to one cluster.
+///
+/// Within a cluster of more than one frame: the sharpest scored frame is crowned
+/// [`BurstVerdict::Sharpest`], and any scored frame below `median × soft_threshold` is
+/// [`BurstVerdict::Soft`]. Unscored frames get no verdict either way — the rule compares
+/// scores, and a missing score is not evidence of softness.
+///
+/// A single-frame cluster is not a burst: every member comes back
+/// [`BurstVerdict::Unscored`] so the caller clears any stale flag from a previous run
+/// over a different photo set.
+///
+/// Pure — this is the one place the rule lives. `analyze_burst_sharpness` calls it to
+/// *persist* flags and `explain_photo_signals` calls it to *explain* them, so the badge
+/// and its explanation cannot drift apart.
+pub fn flag_cluster(members: &[BurstPhoto], soft_threshold: f64) -> ClusterFlagging {
+    let scored: Vec<(i64, f64)> =
+        members.iter().filter_map(|m| m.sharpness.map(|s| (m.id, s))).collect();
+
+    // A lone frame has no cluster to be relatively soft in, and an all-unscored cluster
+    // has nothing to compare. Both clear.
+    if members.len() < 2 || scored.is_empty() {
+        return ClusterFlagging {
+            verdicts: members.iter().map(|m| (m.id, BurstVerdict::Unscored)).collect(),
+            median: None,
+            cutoff: None,
+            best: None,
+            scored: scored.len(),
+        };
+    }
+
+    let median = cluster_median(&scored.iter().map(|&(_, s)| s).collect::<Vec<_>>());
+    let cutoff = median * soft_threshold;
+    let best = scored
+        .iter()
+        .copied()
+        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+    let verdicts = members
+        .iter()
+        .map(|m| {
+            let verdict = match m.sharpness {
+                None => BurstVerdict::Unscored,
+                Some(s) => {
+                    if Some(m.id) == best.map(|(id, _)| id) {
+                        BurstVerdict::Sharpest
+                    } else if s < cutoff {
+                        BurstVerdict::Soft
+                    } else {
+                        BurstVerdict::InRange
+                    }
+                }
+            };
+            (m.id, verdict)
+        })
+        .collect();
+
+    ClusterFlagging {
+        verdicts,
+        median: Some(median),
+        cutoff: Some(cutoff),
+        best,
+        scored: scored.len(),
+    }
+}
+
+/// Median of a non-empty slice of sharpness scores.
+///
+/// Uses a sorted copy. For odd-length slices this is the exact median. For even-length
+/// slices it returns the **upper-middle** element (`sorted[len/2]`) rather than the
+/// average of the two middle elements — i.e. it is biased toward the higher value. For a
+/// 2-photo burst `[a, b]` (a ≤ b) this equals `b`, making the soft-in-burst cutoff 60% of
+/// the maximum rather than of the true median. The spec allows "~60%", so this is
+/// acceptable, but it makes the cutoff slightly stricter for even-length clusters than
+/// the mathematical median would imply.
+pub fn cluster_median(values: &[f64]) -> f64 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    let mut sorted = values.to_vec();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    sorted[sorted.len() / 2]
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -606,5 +760,31 @@ mod tests {
         ];
         let idx = select_representative::<fn(i64) -> Option<Vec<u8>>>(&members, None);
         assert_eq!(idx, 1, "member at index 1 has the highest sharpness");
+    }
+
+    // ── cluster_median ───────────────────────────────────────────────────────
+
+    #[test]
+    fn median_odd_count() {
+        // [1.0, 2.0, 3.0] → median is 2.0 (middle element after sort).
+        let m = cluster_median(&[3.0, 1.0, 2.0]);
+        assert!((m - 2.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn median_even_count_picks_upper_middle() {
+        // [1.0, 2.0, 3.0, 4.0] → sorted[4/2] = sorted[2] = 3.0 (upper-middle element).
+        let m = cluster_median(&[4.0, 1.0, 3.0, 2.0]);
+        assert!((m - 3.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn median_single_element() {
+        assert!((cluster_median(&[7.5]) - 7.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn median_empty_returns_zero() {
+        assert_eq!(cluster_median(&[]), 0.0);
     }
 }

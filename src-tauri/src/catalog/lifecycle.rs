@@ -509,8 +509,13 @@ pub fn copy_and_verify(src: &Path, dst: &Path, expected: Option<&str>) -> Result
     Ok(src_hash)
 }
 
-/// Re-verify the backup's hash, then delete the local files. Invariant 3: never delete
-/// a local copy unless the backup is present and still hashes to the recorded value.
+/// Re-verify the backup's hash, carry the local copy's companions home, then delete the
+/// local files. Invariant 3: never delete a local copy unless the backup is present and
+/// still hashes to the recorded value.
+///
+/// Returns the companions now confirmed at home, for the caller to record — which it must
+/// do *before* `commit_offload`, since that drops the local location rows and the companion
+/// rows cascade with them.
 pub fn verify_and_delete_locals(plan: &OffloadPlan) -> Result<Vec<CarriedCompanion>> {
     let current = sha256_file(&plan.backup_abs)?;
     if current != plan.expected_hash {

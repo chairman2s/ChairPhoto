@@ -116,6 +116,7 @@ const WINDOW_OPTIONS: { label: string; secs: number }[] = [
 ];
 import { MetadataPanel } from "./MetadataPanel";
 import { IptcPanel } from "./IptcPanel";
+import { SignalsPanel } from "./SignalsPanel";
 import { VersionsPanel } from "./VersionsPanel";
 import { PublishedPanel } from "./PublishedPanel";
 import { panelsForSlot, useHostContributions } from "../modules/host";
@@ -881,6 +882,24 @@ export function PhotoInspector({
         </Section>
 
         <DevelopSection key={photo.id} photo={photo} onChanged={onChanged} />
+
+        {/* C6 — the derivation behind the tile's badges. The collapsed summary reads the
+            flag already on the photo row; the body's `explain_photo_signals` call only
+            fires once the section is expanded, since `Section` does not mount a closed
+            body. */}
+        <Section
+          id="signals"
+          label="Culling signals"
+          summary={
+            photo.burstFlag === "soft-in-burst"
+              ? "Soft in burst"
+              : photo.burstFlag === "sharpest-of-burst"
+                ? "Sharpest of burst"
+                : null
+          }
+        >
+          <SignalsPanel key={photo.id} photoId={photo.id} />
+        </Section>
 
         <StackSection photo={photo} onChanged={onChanged} onViewPhoto={onViewPhoto} />
 

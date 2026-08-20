@@ -1440,3 +1440,86 @@ export interface BurstAnalysisResult {
  */
 export const analyzeBurstSharpness = (photoIds: number[]) =>
   invoke<BurstAnalysisResult>("analyze_burst_sharpness", { photoIds });
+
+// ── C6 — why is this flagged ──────────────────────────────────────────────────
+
+/** One frame of a burst, as the explanation shows it. */
+export interface ClusterFrame {
+  photoId: number;
+  /** Filename only — the catalog-relative path is not a location and is too long to read. */
+  fileName: string;
+  sharpness: number | null;
+  rating: number;
+  /** This frame's verdict under the same recomputation: `"soft-in-burst"` etc. */
+  verdict: string | null;
+  /**
+   * dHash distance from the subject; 0 = identical hash, `null` = either frame is not
+   * hashed yet. At or below `hammingThreshold` the engine calls it the same scene, which
+   * is the near-duplicate signal at burst scope.
+   */
+  hammingDistance: number | null;
+  isSubject: boolean;
+}
+
+/** The burst-relative reading behind a `~B` / `♛` badge. */
+export interface BurstSignal {
+  /** Frames in the cluster after both splits (time gap, then visual similarity). */
+  clusterSize: number;
+  /** Frames in the surrounding time run, before the visual split. */
+  timeGroupSize: number;
+  /** Cluster frames carrying a sharpness score — the only ones the rule compares. */
+  scored: number;
+  /** 1-based place among the scored frames, sharpest first. */
+  rank: number | null;
+  median: number | null;
+  /** `median × softFraction`: below this, a frame is soft-in-burst. */
+  cutoff: number | null;
+  /** The configured `sharpness.burst_soft_threshold`, not a hardcoded 0.60. */
+  softFraction: number;
+  /** The verdict the recomputation reaches now. */
+  verdict: string | null;
+  /** What `photos.burst_flag` holds, from the last analysis run. */
+  storedFlag: string | null;
+  /** The two disagree — the badge on the tile is out of date. */
+  stale: boolean;
+  /** The cluster could not be seen whole, so size/rank/median are lower bounds. */
+  truncated: boolean;
+  timeGapSecs: number;
+  hammingThreshold: number;
+  best: ClusterFrame | null;
+  /** At most 60 frames; always includes the subject and `best`. */
+  frames: ClusterFrame[];
+}
+
+/** The absolute sharpness score and the library-wide bar behind the `~` badge. */
+export interface SharpnessSignal {
+  score: number;
+  /** `"tile"` / `"face"` / `"afpoint"` — scores are not comparable across methods. */
+  method: string | null;
+  softThreshold: number;
+  belowThreshold: boolean;
+}
+
+/** Everything known about why one photo carries the badges it carries. */
+export interface PhotoSignals {
+  photoId: number;
+  /** `null` until the background indexer has scored this photo. */
+  sharpness: SharpnessSignal | null;
+  /** `null` when the photo has no usable capture time, so it belongs to no burst. */
+  burst: BurstSignal | null;
+  stack: { childCount: number; parentId: number | null };
+  versionCount: number;
+}
+
+/**
+ * Explain every culling signal on one photo (C6): the burst it was judged against, the
+ * median and cutoff behind its flag, its rank among the frames, and its sharpness against
+ * the library threshold.
+ *
+ * Recomputed on each call rather than read back, because the cluster a flag came from is
+ * never stored. That is what lets the result report `stale` when the badge no longer
+ * matches, and `truncated` when the burst was too long to see whole. Read-only: it never
+ * writes the fresh verdict back.
+ */
+export const explainPhotoSignals = (photoId: number) =>
+  invoke<PhotoSignals>("explain_photo_signals", { photoId });

@@ -127,7 +127,7 @@ const Tile = React.memo(function Tile({
         {photo.burstFlag === "soft-in-burst" && (
           <span
             className="badge badge-soft-in-burst"
-            title="Soft in burst — below 60% of cluster median sharpness"
+            title="Soft in burst — dimmer than the rest of its cluster. The inspector's Culling signals section shows the cluster, the median and the exact cutoff."
           >
             ~B
           </span>
@@ -135,7 +135,7 @@ const Tile = React.memo(function Tile({
         {photo.burstFlag === "sharpest-of-burst" && (
           <span
             className="badge badge-sharpest-of-burst"
-            title="Sharpest of burst — best frame in this cluster"
+            title="Sharpest of burst — the highest-scoring frame in its cluster. The inspector's Culling signals section shows the cluster and the scores."
           >
             ♛
           </span>

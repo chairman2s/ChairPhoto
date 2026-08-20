@@ -1588,7 +1588,7 @@ export default function App() {
                   {selected.burstFlag === "soft-in-burst" && (
                     <span
                       className="loupe-tag loupe-soft"
-                      title="Soft in burst — below 60% of cluster median sharpness"
+                      title="Soft in burst — dimmer than the rest of its cluster. The inspector's Culling signals section shows the cluster, the median and the exact cutoff."
                     >
                       soft-in-burst
                     </span>
@@ -1596,7 +1596,7 @@ export default function App() {
                   {selected.burstFlag === "sharpest-of-burst" && (
                     <span
                       className="loupe-tag loupe-version"
-                      title="Sharpest of burst — best frame in this cluster"
+                      title="Sharpest of burst — the highest-scoring frame in its cluster. The inspector's Culling signals section shows the cluster and the scores."
                     >
                       ♛ sharpest of burst
                     </span>

@@ -3538,3 +3538,98 @@ body {
   gap: 6px;
   background: #0B1120;
 }
+
+/* ── Inspector: culling signals (C6) ──────────────────────────────────────────
+   Reads as evidence, not chrome: numbers aligned, the frame you are looking at
+   marked, and the two disclosures (stale badge, truncated burst) given enough
+   weight to be noticed rather than tucked into a tooltip. */
+.signals {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.signals-block {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.signals-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  font-weight: 600;
+  color: var(--text-dim);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.signals-verdict {
+  text-transform: none;
+  letter-spacing: 0;
+  font-weight: 500;
+  color: var(--ok);
+}
+.signals-verdict.is-soft {
+  color: var(--danger);
+}
+.signals-line {
+  color: var(--text);
+  line-height: 1.5;
+}
+.signals-note {
+  color: var(--text-mute);
+  font-size: 11px;
+  line-height: 1.4;
+}
+.signals-warn {
+  border-left: 2px solid var(--star);
+  padding: 4px 0 4px 8px;
+  color: var(--text-dim);
+  line-height: 1.45;
+}
+.signals-frames {
+  width: 100%;
+  border-collapse: collapse;
+  margin-top: 4px;
+}
+.signals-frames th {
+  text-align: left;
+  font-weight: 500;
+  font-size: 11px;
+  color: var(--text-mute);
+  padding: 2px 4px;
+  border-bottom: 1px solid var(--border);
+}
+.signals-frames td {
+  padding: 2px 4px;
+  border-bottom: 1px solid rgba(51, 65, 85, 0.4);
+}
+.signals-frames .signals-num,
+.signals-frames th:nth-child(2),
+.signals-frames th:nth-child(3) {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+.signals-frame-name {
+  max-width: 0;
+  width: 60%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.signals-subject {
+  background: rgba(59, 130, 246, 0.12);
+}
+.signals-subject td {
+  color: var(--text);
+  font-weight: 600;
+}
+.signals-you {
+  color: var(--accent);
+  margin-right: 4px;
+}
+.signals-mark {
+  text-align: center;
+  color: var(--star);
+}

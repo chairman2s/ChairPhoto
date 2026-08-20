@@ -87,9 +87,42 @@ NOT NULL`.
 
 The sharper signal is **relative ranking inside a burst cluster** — same scene, same
 subject. A frame scoring below `cluster_median × 0.60` (the default
-`BURST_SOFT_THRESHOLD_DEFAULT`) is almost certainly a missed frame and is flagged
-`soft-in-burst`; the best frame of the cluster is flagged `sharpest-of-burst`. Flags are
-written to `photos.burst_flag` in a single transaction via `Catalog::set_burst_flags`.
+`BURST_SOFT_THRESHOLD_DEFAULT`, settable as `sharpness.burst_soft_threshold`) is almost
+certainly a missed frame and is flagged `soft-in-burst`; the best frame of the cluster is
+flagged `sharpest-of-burst`. Flags are written to `photos.burst_flag` in a single
+transaction via `Catalog::set_burst_flags`.
+
+The rule itself is `burst::flag_cluster`, a pure function over one cluster. It returns a
+verdict per member **and the numbers behind it** — median, cutoff, sharpest frame, scored
+count — because both callers need the derivation: `analyze_burst_sharpness` to persist the
+flag, and `explain_photo_signals` to explain it. Keeping one implementation is what stops
+a badge and its explanation from disagreeing.
+
+## Explaining a flag
+
+A badge is a verdict with its reasoning discarded. `explain_photo_signals`
+(`commands/culling.rs`) puts the reasoning back for one photo, and the inspector's
+**Culling signals** section renders it: the cluster with each frame's score, rating and
+dHash distance from the subject, the median and the cutoff it implies, this frame's rank
+among the scored, and the absolute score against `sharpness.soft_threshold`.
+
+Two properties of that surface are load-bearing rather than cosmetic:
+
+- **It recomputes; it does not read the cluster back.** No cluster is stored — a run
+  flags whatever photo set it was handed. `catalog::culling::burst_neighbourhood`
+  rebuilds the time run around the photo (walking outward while each step stays inside
+  `ai.burst_time_gap_secs`, over the photos the grid lists: present, not stacked), and the
+  real `group_into_clusters` splits it on visual similarity again.
+- **Disagreement and incompleteness are reported, not smoothed.** When the fresh verdict
+  differs from `photos.burst_flag`, both are shown and the badge is marked stale — the
+  stored flag came from a run over different neighbours, and that is the useful answer.
+  When the run is longer than one lookup can cover, the cluster is marked truncated so its
+  size, rank and median read as lower bounds.
+
+The command never writes the fresh verdict back. Repairing a badge as a side effect of
+looking at it would hide that the last analysis run is stale, and would make opening an
+inspector section a catalog mutation. Re-running burst analysis is the way to refresh a
+flag, and it stays an explicit action.
 
 ## Resolution and scheduling
 
@@ -108,9 +141,13 @@ runs on the UI thread.
 - The `soft` facet appears once at least one photo has been scored; `soft-in-burst` and
   `sharpest-of-burst` appear once at least one burst has been flagged. All three compose
   with the rest of the filter bar.
-- The grid shows a subtle tile badge. Two sort orders are available: `sharpness_asc`, which
-  puts the least sharp — and so most suspect — frames up front for culling, and
-  `sharpness_desc`. Unscored photos sort after scored ones in both.
+- The grid shows a subtle tile badge, and the inspector's Culling signals section shows
+  what the badge was derived from. Tile and loupe tooltips describe the comparison rather
+  than quoting a threshold: the fraction is a setting, so a hardcoded "60%" in a tooltip
+  is wrong the moment it is changed.
+- Two sort orders are available: `sharpness_asc`, which puts the least sharp — and so most
+  suspect — frames up front for culling, and `sharpness_desc`. Unscored photos sort after
+  scored ones in both.
 
 ## Not included
 
@@ -118,3 +155,7 @@ runs on the UI thread.
   be absurd and would break "nothing ever leaves home" for zero benefit.
 - **No auto-reject or auto-rating** from the score — facets and badges only.
 - **No aesthetic scoring.** This measures focus, nothing else.
+- **No blink or gaze verdict** in the signals panel. The face pipeline persists the
+  5-point ArcFace template — one centre per eye — from which eye-openness cannot be
+  derived at any confidence. That needs its own pinned model; until then an empty row
+  promising it would be worse than its absence.

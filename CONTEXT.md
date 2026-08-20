@@ -29,8 +29,13 @@ Design docs live in `docs/`.
 - **Photo identity** — the UUID a photo is given at first import and keeps forever.
   Unique across the catalog: no two photos share one. It is what catalog merge matches
   on, never the path.
-- **Copy** — one file of a photo at one location. A photo may have several. Each copy
-  carries its own sidecar, so identity is discharged per copy, not per photo.
+- **Copy** — a photo's image file at one location, together with its **companions**:
+  the declared sidecars that describe it (develop history, edit state). A photo may have
+  several copies. A copy is not safe until its companions are there too — the pixels
+  without the edit decisions is a different thing from the photo.
+- **Companion** — a file that belongs to a photo but is not the photo, and whose kind is
+  declared rather than inferred: `.xmp`, `.pp3`, `.arp`, `.rrdata`. Each copy carries its
+  own, so identity is discharged per copy, not per photo.
 - **Bound** — a copy whose sidecar carries the photo's identity. The settled state.
 - **Identity debt** — a copy whose sidecar does not yet carry it. Normal and transient:
   an unreachable volume owes just as much as a failed write. Debt is per copy.

@@ -196,6 +196,56 @@ derives this from the photo's locations' volume kinds and reachability. A backup
 chooses Archived vs Offline when there's no local copy). The grid shows two icons
 per tile — local (▣) and NAS (☁, dimmed when offline).
 
+### A copy is the image plus its declared companions
+
+A photo's edit state does not live in the image. darktable and Lightroom write develop
+history into `<raw>.xmp`, RawTherapee into `.pp3`, ART into `.arp`, and RapidRAW into
+`.rrdata` — all beside the original. Backup used to copy the image alone, so a photo could
+be reported **BACKED UP** while every edit decision made on it existed in exactly one
+place (issue #80).
+
+The set is **declared, never guessed** (`src-tauri/src/companions.rs`). An integration names
+its extension; the catalog does not sweep arbitrary neighbouring files, because backup must
+not behave differently depending on what happens to share a folder with the photo.
+
+Each kind also declares what its *presence* means, which is a separate question from whether
+it travels:
+
+| | carried | presence implies an edit |
+|---|---|---|
+| `.xmp` | yes | only by content — chairphoto writes this file too |
+| `.pp3`, `.arp` | yes | yes |
+| `.rrdata` | yes | **no** — RapidRAW writes it when it *opens* a photo |
+
+Both sidecar shapes are handled: appended (`DSC1.ARW.xmp`) and basename (`DSC1.xmp`,
+darktable's alternate mode). Destinations are derived from the destination *image*, so a
+copy whose `relative_path` differs between volumes still lands correctly rather than leaving
+an orphan.
+
+Three rules govern carrying:
+
+- **Backup and restore carry companions** through the same hash-verified atomic rename the
+  image uses, recording each in `photo_location_companions` against the exact
+  `photo_locations.id` — not (photo, volume), since one volume can hold several roles for
+  the same photo. What is recorded is the **source** mtime at carry time, which is the
+  reference point for answering "has the local file moved on since we copied it".
+- **Offload carries before it deletes.** Invariant 1 covers edit state too: freeing the
+  local image must not strand the history beside it. Companions go home first, then the
+  local ones are freed with the image, and `restore` brings them back.
+- **Divergence refuses; it never resolves.** A companion present on both sides with
+  different contents is two unreconciled edits. Backup leaves it untouched and does not
+  claim it as carried; offload refuses outright. Choosing a side would silently destroy
+  work.
+
+Carrying is idempotent — an identical file already at the destination is adopted rather
+than rewritten — so a companion placed there by any other means is absorbed on the next
+pass instead of being re-copied or causing a conflict.
+
+`verified_hash` deliberately stays a hash of the **image only**. The image is immutable, so
+a changed hash means bit rot; companions are mutable by design (darktable rewrites `.xmp` on
+every edit, and so does chairphoto on IPTC/GPS/face writes), so hashing them would report
+ordinary work as corruption.
+
 ### The key performance principle
 
 **Cull / browse / tag run entirely off the local preview cache** (already built).
@@ -235,7 +285,8 @@ and the owner asked for silent background backup. Backup entry (owner decision):
 
 ## Safety invariants (non-negotiable)
 
-1. **Never delete the last verified copy** of a photo.
+1. **Never delete the last verified copy** of a photo — including the companions that
+   carry its edit state.
 2. **Never offload** anything not verified-backed-up.
 3. **Hash-verify** the NAS copy before marking safe or deleting anything local.
 4. On a NAS-less machine, offload of un-backed-up photos is **unavailable**; they

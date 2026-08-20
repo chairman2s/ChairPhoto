@@ -772,6 +772,174 @@ fn lifecycle_backup_offload_restore_with_verification() {
     assert!(raw.exists(), "local kept because backup verification failed");
 }
 
+/// A copy is the image **plus its declared companions** (cluster B, D2). Before this,
+/// `backup_photo` copied one file, so darktable history and RapidRAW state stayed behind
+/// while the app reported the photo backed up — issue #80.
+#[test]
+fn backup_carries_companions_and_records_what_it_carried() {
+    let (catalog, root) = temp_catalog("companions-backup");
+    let nas_dir = root.parent().unwrap().join("nas");
+    std::fs::create_dir_all(&nas_dir).unwrap();
+    let nas = catalog.add_volume("NAS", &nas_dir, VolumeKind::Backup).unwrap();
+
+    let raw = root.join("2026/06/27/DSC1.ARW");
+    std::fs::create_dir_all(raw.parent().unwrap()).unwrap();
+    std::fs::write(&raw, b"original-bytes").unwrap();
+    // The two shapes and two owners that actually occur: darktable's appended sidecar and
+    // RapidRAW's mask blob.
+    std::fs::write(root.join("2026/06/27/DSC1.ARW.xmp"), b"<x>darktable:history</x>").unwrap();
+    std::fs::write(root.join("2026/06/27/DSC1.ARW.rrdata"), b"{\"adjustments\":{}}").unwrap();
+    // An undeclared neighbour must not be swept along.
+    std::fs::write(root.join("2026/06/27/DSC1.ARW.txt"), b"notes").unwrap();
+    let id = catalog.upsert_photo(&raw, None, 1, 14).unwrap().id;
+
+    catalog.backup_photo(id, nas).unwrap();
+
+    let at_nas = |n: &str| nas_dir.join("2026/06/27").join(n);
+    assert!(at_nas("DSC1.ARW").is_file(), "the image");
+    assert_eq!(
+        std::fs::read(at_nas("DSC1.ARW.xmp")).unwrap(),
+        b"<x>darktable:history</x>",
+        "the darktable history travels with it"
+    );
+    assert!(at_nas("DSC1.ARW.rrdata").is_file(), "and RapidRAW's state");
+    assert!(!at_nas("DSC1.ARW.txt").exists(), "but an undeclared neighbour does not");
+
+    let recorded: Vec<String> = catalog
+        .companions_at(id, nas, LocationRole::Backup)
+        .unwrap()
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect();
+    assert_eq!(recorded, vec!["DSC1.ARW.rrdata", "DSC1.ARW.xmp"]);
+}
+
+/// Some companions reached home by hand before this code existed, so a second pass must
+/// adopt them rather than fail or re-copy.
+#[test]
+fn backup_adopts_an_identical_companion_already_at_home() {
+    let (catalog, root) = temp_catalog("companions-idempotent");
+    let nas_dir = root.parent().unwrap().join("nas");
+    std::fs::create_dir_all(nas_dir.join("2026")).unwrap();
+    let nas = catalog.add_volume("NAS", &nas_dir, VolumeKind::Backup).unwrap();
+
+    let raw = root.join("2026/DSC1.ARW");
+    std::fs::create_dir_all(raw.parent().unwrap()).unwrap();
+    std::fs::write(&raw, b"bytes").unwrap();
+    std::fs::write(root.join("2026/DSC1.ARW.rrdata"), b"{}").unwrap();
+    // Placed at home by hand, byte-identical.
+    std::fs::write(nas_dir.join("2026/DSC1.ARW.rrdata"), b"{}").unwrap();
+    let id = catalog.upsert_photo(&raw, None, 1, 5).unwrap().id;
+
+    catalog.backup_photo(id, nas).unwrap();
+    catalog.backup_photo(id, nas).unwrap(); // and again — carrying is idempotent
+
+    assert_eq!(
+        catalog.companions_at(id, nas, LocationRole::Backup).unwrap().len(),
+        1,
+        "recorded once, not once per pass"
+    );
+}
+
+/// Two different edits exist. Overwriting either would destroy work, so backup carries
+/// neither and leaves the divergence for the freshness pass to report.
+#[test]
+fn backup_never_overwrites_a_companion_that_differs_at_home() {
+    let (catalog, root) = temp_catalog("companions-diverged");
+    let nas_dir = root.parent().unwrap().join("nas");
+    std::fs::create_dir_all(nas_dir.join("2026")).unwrap();
+    let nas = catalog.add_volume("NAS", &nas_dir, VolumeKind::Backup).unwrap();
+
+    let raw = root.join("2026/DSC1.ARW");
+    std::fs::create_dir_all(raw.parent().unwrap()).unwrap();
+    std::fs::write(&raw, b"bytes").unwrap();
+    std::fs::write(root.join("2026/DSC1.ARW.xmp"), b"local-edit").unwrap();
+    std::fs::write(nas_dir.join("2026/DSC1.ARW.xmp"), b"home-edit").unwrap();
+    let id = catalog.upsert_photo(&raw, None, 1, 5).unwrap().id;
+
+    catalog.backup_photo(id, nas).unwrap();
+
+    assert_eq!(
+        std::fs::read(nas_dir.join("2026/DSC1.ARW.xmp")).unwrap(),
+        b"home-edit",
+        "the copy at home is left exactly as it was"
+    );
+    assert!(
+        catalog.companions_at(id, nas, LocationRole::Backup).unwrap().is_empty(),
+        "and it is not claimed as carried, so it stays visible as divergence"
+    );
+}
+
+/// Offload frees local bytes. It must not strand the edit state beside them (#80), and a
+/// restore must bring that state back rather than bare pixels.
+#[test]
+fn offload_carries_companions_home_first_and_restore_brings_them_back() {
+    let (catalog, root) = temp_catalog("companions-offload");
+    let nas_dir = root.parent().unwrap().join("nas");
+    std::fs::create_dir_all(&nas_dir).unwrap();
+    let nas = catalog.add_volume("NAS", &nas_dir, VolumeKind::Backup).unwrap();
+    let local_id = catalog
+        .list_volumes()
+        .unwrap()
+        .into_iter()
+        .find(|v| v.kind == VolumeKind::Local)
+        .unwrap()
+        .id;
+
+    let raw = root.join("2026/DSC1.ARW");
+    std::fs::create_dir_all(raw.parent().unwrap()).unwrap();
+    std::fs::write(&raw, b"bytes").unwrap();
+    let id = catalog.upsert_photo(&raw, None, 1, 5).unwrap().id;
+    catalog.backup_photo(id, nas).unwrap();
+
+    // The edit happens *after* the backup — the case that produced #80.
+    let local_sidecar = root.join("2026/DSC1.ARW.rrdata");
+    std::fs::write(&local_sidecar, b"masks").unwrap();
+
+    catalog.offload_photo(id).unwrap();
+
+    assert!(!raw.exists(), "local image freed");
+    assert!(!local_sidecar.exists(), "and its companion freed with it");
+    assert_eq!(
+        std::fs::read(nas_dir.join("2026/DSC1.ARW.rrdata")).unwrap(),
+        b"masks",
+        "because the edit state was carried home before anything was deleted"
+    );
+
+    catalog.restore_photo(id, local_id).unwrap();
+    assert_eq!(
+        std::fs::read(&local_sidecar).unwrap(),
+        b"masks",
+        "and it comes back with the photo"
+    );
+}
+
+/// A companion that differs on the two sides is two unreconciled edits. Offload is not the
+/// place to choose between them, so it refuses — and nothing local is deleted.
+#[test]
+fn offload_refuses_when_a_companion_diverges() {
+    let (catalog, root) = temp_catalog("companions-offload-refuse");
+    let nas_dir = root.parent().unwrap().join("nas");
+    std::fs::create_dir_all(&nas_dir).unwrap();
+    let nas = catalog.add_volume("NAS", &nas_dir, VolumeKind::Backup).unwrap();
+
+    let raw = root.join("2026/DSC1.ARW");
+    std::fs::create_dir_all(raw.parent().unwrap()).unwrap();
+    std::fs::write(&raw, b"bytes").unwrap();
+    let id = catalog.upsert_photo(&raw, None, 1, 5).unwrap().id;
+    catalog.backup_photo(id, nas).unwrap();
+
+    std::fs::write(root.join("2026/DSC1.ARW.xmp"), b"local-edit").unwrap();
+    std::fs::write(nas_dir.join("2026/DSC1.ARW.xmp"), b"home-edit").unwrap();
+
+    let err = catalog.offload_photo(id).unwrap_err().to_string();
+
+    assert!(err.contains("refusing to offload"), "{err}");
+    assert!(raw.exists(), "the local image is untouched");
+    assert_eq!(std::fs::read(root.join("2026/DSC1.ARW.xmp")).unwrap(), b"local-edit");
+    assert_eq!(std::fs::read(nas_dir.join("2026/DSC1.ARW.xmp")).unwrap(), b"home-edit");
+}
+
 #[test]
 fn per_photo_storage_status_from_locations() {
     let (catalog, root) = temp_catalog("storage-status");

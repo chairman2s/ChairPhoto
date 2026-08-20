@@ -15,6 +15,7 @@ use super::{Catalog, CatalogError, LocationRole, Result, VolumeKind};
 use rusqlite::{params, OptionalExtension};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 pub struct BackupPlan {
     pub source: PathBuf,
@@ -25,6 +26,9 @@ pub struct BackupPlan {
 
 pub struct OffloadPlan {
     pub backup_abs: PathBuf,
+    /// The `photo_locations.id` of the backup copy, so companions carried during the
+    /// offload attach to the right row.
+    pub backup_location_id: i64,
     pub expected_hash: String,
     pub local_files: Vec<PathBuf>,
     pub local_volume_ids: Vec<i64>,
@@ -39,6 +43,10 @@ pub struct RestorePlan {
 }
 
 struct Copy {
+    /// `photo_locations.id`. Carried so companions can be attached to the exact row: a
+    /// volume can hold more than one role for the same photo (the owner's NAS has both
+    /// `primary` and `backup` rows), so (photo, volume) alone does not identify a copy.
+    location_id: i64,
     volume_id: i64,
     abs: PathBuf,
     verified_hash: Option<String>,
@@ -72,10 +80,20 @@ impl Catalog {
     }
 
     /// Sync convenience: back up a photo to a backup volume, returning the verified hash.
+    ///
+    /// Carries the photo's declared companions too — a copy is the image *plus* what
+    /// describes it (cluster B, D2). A companion that differs at the destination is left
+    /// alone rather than overwritten; it shows up as divergence for the freshness pass,
+    /// because two edits exist and backup is not the place to pick one.
     pub fn backup_photo(&self, photo_id: i64, backup_volume_id: i64) -> Result<String> {
         let plan = self.plan_backup(photo_id, backup_volume_id)?;
         let hash = copy_and_verify(&plan.source, &plan.dest, None)?;
         self.record_backup(photo_id, plan.volume_id, &plan.rel, &hash)?;
+        let carry = carry_companions(&plan.source, &plan.dest)?;
+        self.record_companions(
+            self.require_location_id(photo_id, plan.volume_id, LocationRole::Backup)?,
+            &carry.carried,
+        )?;
         Ok(hash)
     }
 
@@ -92,6 +110,7 @@ impl Catalog {
         local_volume_ids.sort_unstable();
         local_volume_ids.dedup();
         Ok(OffloadPlan {
+            backup_location_id: backup.location_id,
             backup_abs: backup.abs,
             expected_hash: backup.verified_hash.unwrap_or_default(),
             local_files: locals.into_iter().map(|c| c.abs).collect(),
@@ -115,8 +134,98 @@ impl Catalog {
     /// resolver falls back to it); a rescan/reconcile clears the stale records.
     pub fn offload_photo(&self, photo_id: i64) -> Result<()> {
         let plan = self.plan_offload(photo_id)?;
-        verify_and_delete_locals(&plan)?;
+        let carried = verify_and_delete_locals(&plan)?;
+        // Record before the local rows go away: `commit_offload` deletes the local
+        // location rows, and their companion rows cascade with them.
+        self.record_companions(plan.backup_location_id, &carried)?;
         self.commit_offload(photo_id, &plan.local_volume_ids)
+    }
+
+    /// Record companions confirmed present at one location.
+    ///
+    /// Upsert rather than insert: carrying is idempotent, and some companions reached home
+    /// by hand before this code existed — a second pass must refresh the reference point,
+    /// not fail on a conflict.
+    pub fn record_companions(&self, location_id: i64, carried: &[CarriedCompanion]) -> Result<()> {
+        if carried.is_empty() {
+            return Ok(());
+        }
+        let at = now();
+        for c in carried {
+            self.conn.execute(
+                "INSERT INTO photo_location_companions(location_id, name, carried_mtime, carried_at)
+                 VALUES(?1, ?2, ?3, ?4)
+                 ON CONFLICT(location_id, name)
+                 DO UPDATE SET carried_mtime = excluded.carried_mtime,
+                               carried_at    = excluded.carried_at",
+                params![location_id, c.name, c.source_mtime, at],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Record companions at the location identified by (photo, volume, role) — the form
+    /// the command layer has to hand, since it writes the location row and then needs to
+    /// attach to it.
+    pub fn record_companions_at(
+        &self,
+        photo_id: i64,
+        volume_id: i64,
+        role: LocationRole,
+        carried: &[CarriedCompanion],
+    ) -> Result<()> {
+        if carried.is_empty() {
+            return Ok(());
+        }
+        self.record_companions(self.require_location_id(photo_id, volume_id, role)?, carried)
+    }
+
+    /// As [`Catalog::location_id`], but an error when absent. Callers that have just
+    /// written the location row use this: a missing row there is a programming error, not
+    /// a state the user can reach.
+    fn require_location_id(
+        &self,
+        photo_id: i64,
+        volume_id: i64,
+        role: LocationRole,
+    ) -> Result<i64> {
+        self.location_id(photo_id, volume_id, role)?.ok_or_else(|| {
+            CatalogError::Validation("no location row to record companions against".into())
+        })
+    }
+
+    /// The `photo_locations.id` for one (photo, volume, role), if it exists.
+    fn location_id(&self, photo_id: i64, volume_id: i64, role: LocationRole) -> Result<Option<i64>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT id FROM photo_locations
+                 WHERE photo_id = ?1 AND volume_id = ?2 AND role = ?3",
+                params![photo_id, volume_id, role.as_db_str()],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()?)
+    }
+
+    /// Companion names recorded at one location, with the source mtime they were carried
+    /// from. Ordered by name so callers and tests see a stable sequence.
+    pub fn companions_at(
+        &self,
+        photo_id: i64,
+        volume_id: i64,
+        role: LocationRole,
+    ) -> Result<Vec<(String, i64)>> {
+        let Some(location_id) = self.location_id(photo_id, volume_id, role)? else {
+            return Ok(Vec::new());
+        };
+        let mut stmt = self.conn.prepare(
+            "SELECT name, carried_mtime FROM photo_location_companions
+             WHERE location_id = ?1 ORDER BY name",
+        )?;
+        let rows = stmt.query_map(params![location_id], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
     // --- restore -----------------------------------------------------------
@@ -146,10 +255,18 @@ impl Catalog {
     }
 
     /// Sync convenience: restore a photo's backup copy to a local volume.
+    ///
+    /// Brings the companions back with it, so a restored photo arrives with the edit
+    /// state an offload freed rather than as bare pixels.
     pub fn restore_photo(&self, photo_id: i64, local_volume_id: i64) -> Result<String> {
         let plan = self.plan_restore(photo_id, local_volume_id)?;
         let hash = copy_and_verify(&plan.source, &plan.dest, plan.expected_hash.as_deref())?;
         self.record_restore(photo_id, plan.volume_id, &plan.rel, &hash)?;
+        let carry = carry_companions(&plan.source, &plan.dest)?;
+        self.record_companions(
+            self.require_location_id(photo_id, plan.volume_id, LocationRole::LocalCache)?,
+            &carry.carried,
+        )?;
         Ok(hash)
     }
 
@@ -184,7 +301,7 @@ impl Catalog {
     /// A photo's copies on volumes of `kind`, as absolute paths + recorded hash.
     fn copies_on_kind(&self, photo_id: i64, kind: VolumeKind) -> Result<Vec<Copy>> {
         let mut stmt = self.conn.prepare(
-            "SELECT v.id, v.base_path, l.relative_path, l.verified_hash
+            "SELECT v.id, v.base_path, l.relative_path, l.verified_hash, l.id
              FROM photo_locations l JOIN volumes v ON v.id = l.volume_id
              WHERE l.photo_id = ?1 AND v.kind = ?2",
         )?;
@@ -192,6 +309,7 @@ impl Catalog {
             let base: String = r.get(1)?;
             let rel: String = r.get(2)?;
             Ok(Copy {
+                location_id: r.get(4)?,
                 volume_id: r.get(0)?,
                 abs: Path::new(&base).join(&rel),
                 verified_hash: r.get(3)?,
@@ -265,6 +383,76 @@ impl Catalog {
 }
 
 /// SHA-256 of a file as lowercase hex. Streams the file (constant memory).
+/// A companion confirmed present and byte-identical at a destination.
+#[derive(Debug, Clone)]
+pub struct CarriedCompanion {
+    /// File name at the destination (e.g. `DSC1.ARW.xmp`).
+    pub name: String,
+    /// The **source** file's mtime when it was carried — not the destination's. The
+    /// question a later pass asks is "has the local file moved on since we copied it",
+    /// so the local side is the reference point.
+    pub source_mtime: i64,
+}
+
+/// What one carry pass achieved.
+#[derive(Debug, Default, Clone)]
+pub struct CompanionCarry {
+    pub carried: Vec<CarriedCompanion>,
+    /// Companions that exist on both sides with different contents. Left untouched: the
+    /// two sides hold different edits and picking one would silently discard the other.
+    pub diverged: Vec<PathBuf>,
+}
+
+/// Ensure every declared companion beside `src_image` is present beside `dest_image`.
+///
+/// A copy is the image *plus* its declared companions (cluster B, D2). Before this,
+/// `backup_photo` copied one file, so darktable history and RapidRAW state never reached
+/// home while the app reported the photo backed up (#80).
+///
+/// Idempotent by construction, which matters because some companions were carried by hand
+/// before this code existed: a destination that already holds an identical file is recorded
+/// as carried without being rewritten, and a destination that differs is reported rather
+/// than overwritten. Copying is the same hash-verified atomic rename the image uses.
+///
+/// Pure file IO — no catalog lock, so it can run off-thread like the rest of this module.
+pub fn carry_companions(src_image: &Path, dest_image: &Path) -> Result<CompanionCarry> {
+    let mut out = CompanionCarry::default();
+    for found in crate::companions::carried_beside(src_image) {
+        let dest = found.destination(dest_image);
+        if dest.is_file() {
+            if sha256_file(&dest)? != sha256_file(&found.path)? {
+                out.diverged.push(found.path.clone());
+                continue;
+            }
+        } else {
+            copy_and_verify(&found.path, &dest, None)?;
+        }
+        out.carried.push(CarriedCompanion {
+            name: found.name(),
+            source_mtime: mtime_secs(&found.path)?,
+        });
+    }
+    Ok(out)
+}
+
+/// A file's mtime in whole seconds. Whole seconds because that is the resolution the
+/// catalog stores and compares at; sub-second precision would make every comparison
+/// filesystem-dependent.
+fn mtime_secs(path: &Path) -> Result<i64> {
+    let modified = std::fs::metadata(path).map_err(io)?.modified().map_err(io)?;
+    Ok(modified
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0))
+}
+
+fn now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
 pub fn sha256_file(path: &Path) -> Result<String> {
     let mut file = std::fs::File::open(path).map_err(io)?;
     let mut hasher = Sha256::new();
@@ -323,20 +511,43 @@ pub fn copy_and_verify(src: &Path, dst: &Path, expected: Option<&str>) -> Result
 
 /// Re-verify the backup's hash, then delete the local files. Invariant 3: never delete
 /// a local copy unless the backup is present and still hashes to the recorded value.
-pub fn verify_and_delete_locals(plan: &OffloadPlan) -> Result<()> {
+pub fn verify_and_delete_locals(plan: &OffloadPlan) -> Result<Vec<CarriedCompanion>> {
     let current = sha256_file(&plan.backup_abs)?;
     if current != plan.expected_hash {
         return Err(CatalogError::Validation(
             "backup hash changed — refusing to offload".into(),
         ));
     }
+
+    // Invariant 1 ("never delete the last copy") applies to companions too: freeing the
+    // local image must not strand the edit state sitting beside it (#80). Carry anything
+    // missing to home *before* deleting, and refuse outright when a companion differs on
+    // the two sides — that is two unreconciled edits, and offload is not the place to
+    // choose between them.
+    let mut carried = Vec::new();
     for file in &plan.local_files {
+        let carry = carry_companions(file, &plan.backup_abs)?;
+        if let Some(first) = carry.diverged.first() {
+            return Err(CatalogError::Validation(format!(
+                "{} differs from the copy at home — refusing to offload",
+                first.display()
+            )));
+        }
+        carried.extend(carry.carried);
+    }
+
+    for file in &plan.local_files {
+        // Companions first: if this fails part-way, the image is still local, so the
+        // photo is never left with its edit state gone and its bytes freed.
+        for found in crate::companions::carried_beside(file) {
+            std::fs::remove_file(&found.path).map_err(io)?;
+        }
         // Best-effort: an already-absent local file is fine (goal is "not local").
         if file.exists() {
             std::fs::remove_file(file).map_err(io)?;
         }
     }
-    Ok(())
+    Ok(carried)
 }
 
 fn io(e: std::io::Error) -> CatalogError {

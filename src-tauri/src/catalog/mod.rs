@@ -38,7 +38,10 @@ pub use identity::{
     PendingIdentityRow, PendingIdentitySummary, SidecarIdentity,
 };
 pub use locations::{PathCandidate, ResolveMode};
-pub use lifecycle::{copy_and_verify, verify_and_delete_locals, BackupPlan, OffloadPlan, RestorePlan};
+pub use lifecycle::{
+    carry_companions, copy_and_verify, verify_and_delete_locals, BackupPlan, CarriedCompanion,
+    CompanionCarry, OffloadPlan, RestorePlan,
+};
 pub use merge::MergeSummary;
 pub use models::{
     Album, BurstInput, ExportKeywords, ImportBatch, IptcFields, LocationRole, MetadataEntry,
@@ -259,6 +262,18 @@ impl Catalog {
             .execute_batch("DROP INDEX IF EXISTS idx_photo_metadata_lookup;")?;
         // Verified-hash on locations for the backup/offload lifecycle (schema v10).
         self.ensure_column("photo_locations", "verified_hash", "TEXT")?;
+        // Companions carried alongside the image at a location (cluster B). A copy is the
+        // image plus its declared companions; before this, backup carried only the image
+        // and left darktable/RapidRAW edit state behind (#80).
+        self.conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS photo_location_companions (
+                 location_id   INTEGER NOT NULL REFERENCES photo_locations(id) ON DELETE CASCADE,
+                 name          TEXT    NOT NULL,
+                 carried_mtime INTEGER NOT NULL,
+                 carried_at    INTEGER NOT NULL,
+                 PRIMARY KEY (location_id, name)
+             );",
+        )?;
         // Pixel-derived B&W flag for the monochrome auto-tag (schema v12).
         self.ensure_column("photos", "is_grayscale", "INTEGER")?;
         // Non-destructive user orientation override (degrees clockwise), schema v17.

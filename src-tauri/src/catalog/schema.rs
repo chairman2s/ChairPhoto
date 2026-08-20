@@ -299,6 +299,22 @@ CREATE TABLE IF NOT EXISTS photo_edits (
 -- Named, non-destructive versions of a photo (different crops/exposures). Each holds an
 -- opaque edit record (crop + tone), interpreted by the editing module, not core. The
 -- original photo is the implicit unedited base; these are derivatives. See docs/editing.md.
+-- Companion files carried alongside a photo's image at one location (cluster B, D2/D5).
+-- A copy is the image *plus* its declared companions; this records which ones were
+-- actually placed at that location and what the source looked like when they were, so a
+-- later pass can tell "carried and current" from "the local one has moved on since".
+-- `carried_mtime` is the SOURCE file's mtime at carry time, not the destination's: the
+-- question being answered is whether the local file has changed since we copied it.
+CREATE TABLE IF NOT EXISTS photo_location_companions (
+    location_id   INTEGER NOT NULL REFERENCES photo_locations(id) ON DELETE CASCADE,
+    -- File name of the companion at that location (e.g. `DSC1.ARW.xmp`).
+    name          TEXT    NOT NULL,
+    -- Source mtime in whole seconds when this companion was carried.
+    carried_mtime INTEGER NOT NULL,
+    carried_at    INTEGER NOT NULL,
+    PRIMARY KEY (location_id, name)
+);
+
 CREATE TABLE IF NOT EXISTS photo_versions (
     id         INTEGER PRIMARY KEY,
     photo_id   INTEGER NOT NULL REFERENCES photos(id) ON DELETE CASCADE,

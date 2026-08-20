@@ -42,13 +42,32 @@ async fn do_backup(state: &State<'_, AppState>, photo_id: i64, backup_id: i64) -
         let p = c.plan_backup(photo_id, backup_id)?;
         Ok((p.source, p.dest, p.rel, p.volume_id))
     })?;
+    // A copy is the image plus its declared companions, so the same worker carries the
+    // sidecars across. Doing it here rather than only in `Catalog::backup_photo` matters:
+    // this is the path the Back up button takes, and the sync wrapper is for tests and
+    // simple callers (see the lifecycle module docs). Missing it here is what #80 was.
+    let (src, dst) = (source.clone(), dest.clone());
     let hash = tauri::async_runtime::spawn_blocking(move || {
         crate::catalog::copy_and_verify(&source, &dest, None)
     })
     .await
     .map_err(|e| e.to_string())?
     .map_err(|e| e.to_string())?;
-    with_catalog(state, |c| c.record_backup(photo_id, volume_id, &rel, &hash))
+    let carry = tauri::async_runtime::spawn_blocking(move || {
+        crate::catalog::carry_companions(&src, &dst)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(|e| e.to_string())?;
+    with_catalog(state, |c| {
+        c.record_backup(photo_id, volume_id, &rel, &hash)?;
+        c.record_companions_at(
+            photo_id,
+            volume_id,
+            crate::catalog::LocationRole::Backup,
+            &carry.carried,
+        )
+    })
 }
 
 async fn do_offload(state: &State<'_, AppState>, photo_id: i64) -> Result<(), String> {
@@ -62,11 +81,18 @@ async fn do_offload(state: &State<'_, AppState>, photo_id: i64) -> Result<(), St
         })
         .await;
     }
-    tauri::async_runtime::spawn_blocking(move || crate::catalog::verify_and_delete_locals(&plan))
-        .await
-        .map_err(|e| e.to_string())?
-        .map_err(|e| e.to_string())?;
-    with_catalog(state, |c| c.commit_offload(photo_id, &volume_ids))
+    let backup_location_id = plan.backup_location_id;
+    let carried =
+        tauri::async_runtime::spawn_blocking(move || crate::catalog::verify_and_delete_locals(&plan))
+            .await
+            .map_err(|e| e.to_string())?
+            .map_err(|e| e.to_string())?;
+    with_catalog(state, |c| {
+        // Before `commit_offload`: it drops the local location rows, and companion rows
+        // cascade with them.
+        c.record_companions(backup_location_id, &carried)?;
+        c.commit_offload(photo_id, &volume_ids)
+    })
 }
 
 /// Setting key for the age-based offload policy ("keep last N days on local disk").

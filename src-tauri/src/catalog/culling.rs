@@ -207,6 +207,80 @@ fn window_side(
     Ok((out, seen >= SIDE_LIMIT))
 }
 
+/// A photo considered for an auto-stack proposal (C3).
+#[derive(Debug, Clone)]
+pub struct StackCandidate {
+    pub id: i64,
+    pub path: String,
+    /// `None` when the photo has no parseable capture time. The clustering engine puts
+    /// those in single-photo clusters, so they never become a proposal — but they are
+    /// still counted as considered, because they were.
+    pub capture_ts: Option<i64>,
+    pub phash: Option<u64>,
+    pub rating: i64,
+    pub sharpness: Option<f64>,
+    pub burst_flag: Option<String>,
+    /// Photos already stacked under this one. Stacking it under a keeper re-homes them
+    /// onto that keeper (`set_stack_parent` flattens), which the proposal must disclose.
+    pub child_count: i64,
+}
+
+/// The photos among `photo_ids` that can be proposed for stacking, and how many were
+/// dropped because they are already stacked under something.
+///
+/// Only top-level, present photos are candidates. A photo that is already a stack child is
+/// not shown in the grid and is already grouped; proposing to re-group it would silently
+/// move it out of the stack its owner put it in — most often the camera JPEG that
+/// `pair_raw_jpeg_stacks` paired with its RAW.
+pub fn stack_candidates(
+    conn: &Connection,
+    photo_ids: &[i64],
+) -> Result<(Vec<StackCandidate>, usize)> {
+    if photo_ids.is_empty() {
+        return Ok((Vec::new(), 0));
+    }
+    // Chunked to stay under SQLite's 999-variable limit, as `burst_inputs` is.
+    const CHUNK: usize = 999;
+    let mut out: Vec<StackCandidate> = Vec::with_capacity(photo_ids.len());
+    let mut found = 0usize;
+    for chunk in photo_ids.chunks(CHUNK) {
+        let placeholders = (1..=chunk.len()).map(|i| format!("?{i}")).collect::<Vec<_>>().join(",");
+        let sql = format!(
+            "SELECT id, path, capture_time, phash, rating, sharpness, burst_flag,
+                    stack_parent_id,
+                    (SELECT COUNT(*) FROM photos c WHERE c.stack_parent_id = p.id)
+             FROM photos p WHERE id IN ({placeholders}) AND missing = 0 ORDER BY id"
+        );
+        let params: Vec<&dyn rusqlite::ToSql> =
+            chunk.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(params.as_slice(), |r| {
+            Ok((
+                StackCandidate {
+                    id: r.get(0)?,
+                    path: r.get(1)?,
+                    capture_ts: r.get::<_, Option<String>>(2)?.as_deref().and_then(parse_capture),
+                    phash: r.get::<_, Option<i64>>(3)?.map(|v| v as u64),
+                    rating: r.get(4)?,
+                    sharpness: r.get(5)?,
+                    burst_flag: r.get(6)?,
+                    child_count: r.get(8)?,
+                },
+                r.get::<_, Option<i64>>(7)?,
+            ))
+        })?;
+        for row in rows {
+            let (candidate, stack_parent_id) = row?;
+            found += 1;
+            if stack_parent_id.is_none() {
+                out.push(candidate);
+            }
+        }
+    }
+    let skipped = found - out.len();
+    Ok((out, skipped))
+}
+
 fn parse_capture(s: &str) -> Option<i64> {
     chrono::NaiveDateTime::parse_from_str(s, CAPTURE_FMT)
         .ok()
@@ -353,6 +427,68 @@ mod tests {
             n.truncated,
             "the chain continues past the fetched window, so the cluster is not fully known"
         );
+    }
+
+    // ── stack_candidates (C3) ────────────────────────────────────────────────
+
+    #[test]
+    fn a_photo_already_stacked_under_something_is_not_a_candidate_but_is_counted() {
+        // It is not in the grid and is already grouped — most often the camera JPEG that
+        // `pair_raw_jpeg_stacks` paired with its RAW. Re-proposing it would silently move
+        // it out of the stack its owner put it in.
+        let (cat, _root) = catalog();
+        let c = cat.conn();
+        shot(&c, 1, 0, Some(100.0));
+        shot(&c, 2, 1, Some(90.0));
+        c.execute("UPDATE photos SET stack_parent_id = 1 WHERE id = 2", []).unwrap();
+
+        let (candidates, skipped) = stack_candidates(&c, &[1, 2]).unwrap();
+
+        assert_eq!(candidates.iter().map(|s| s.id).collect::<Vec<_>>(), vec![1]);
+        assert_eq!(skipped, 1, "so the caller can say what it left out");
+    }
+
+    #[test]
+    fn a_candidate_carries_the_count_of_what_is_stacked_under_it() {
+        let (cat, _root) = catalog();
+        let c = cat.conn();
+        shot(&c, 1, 0, Some(100.0));
+        shot(&c, 2, 1, Some(90.0));
+        shot(&c, 3, 2, Some(80.0));
+        c.execute("UPDATE photos SET stack_parent_id = 1 WHERE id IN (2, 3)", []).unwrap();
+
+        let (candidates, _) = stack_candidates(&c, &[1, 2, 3]).unwrap();
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].child_count, 2);
+    }
+
+    #[test]
+    fn a_missing_photo_is_neither_a_candidate_nor_counted_as_skipped() {
+        // "Skipped" means "already stacked"; a photo whose file is unreachable was never
+        // eligible, and folding it into that count would misreport why.
+        let (cat, _root) = catalog();
+        let c = cat.conn();
+        shot(&c, 1, 0, Some(100.0));
+        shot(&c, 2, 1, Some(90.0));
+        c.execute("UPDATE photos SET missing = 1 WHERE id = 2", []).unwrap();
+
+        let (candidates, skipped) = stack_candidates(&c, &[1, 2]).unwrap();
+
+        assert_eq!(candidates.iter().map(|s| s.id).collect::<Vec<_>>(), vec![1]);
+        assert_eq!(skipped, 0);
+    }
+
+    #[test]
+    fn an_id_that_is_not_in_the_catalog_is_simply_absent() {
+        let (cat, _root) = catalog();
+        let c = cat.conn();
+        shot(&c, 1, 0, Some(100.0));
+
+        let (candidates, skipped) = stack_candidates(&c, &[1, 999]).unwrap();
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(skipped, 0);
     }
 
     #[test]

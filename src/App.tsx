@@ -108,6 +108,7 @@ import { ImportPanel } from "./components/ImportPanel";
 import { BundleExportDialog } from "./components/BundleExportDialog";
 import { BundleImportDialog } from "./components/BundleImportDialog";
 import { StackProposalsDialog } from "./components/StackProposalsDialog";
+import { CullSession } from "./components/CullSession";
 import { CatalogSwitcher } from "./components/CatalogSwitcher";
 import { EditorView } from "./components/EditorView";
 import { parseEdit } from "./modules/editing";
@@ -275,6 +276,11 @@ export default function App() {
   // dialog opens: the grid can refresh under it as groups are accepted, and re-proposing
   // over a moving set would renumber the groups being reviewed.
   const [stackTargets, setStackTargets] = useState<number[] | null>(null);
+  // Cull session (C4). Holds the rows to cull, frozen at the start: culling changes the
+  // fields the view is filtered by, so a live list would delete photos out from under the
+  // cursor and skip frames unseen.
+  const [cullPhotos, setCullPhotos] = useState<Photo[] | null>(null);
+  const inCull = cullPhotos !== null && cullPhotos.length > 0;
   const closeModalAction = useCallback(() => setModalAction(null), []);
   // Right-click context menu on a grid tile.
   const [ctxMenu, setCtxMenu] = useState<{ x: number; y: number; photoId: number } | null>(null);
@@ -832,6 +838,19 @@ export default function App() {
     setStackTargets(targets);
   };
 
+  // Cull session (C4): the selection, else the whole view — the same scoping as the other
+  // two culling actions. Opening freezes the rows; the grid is refreshed once, on exit.
+  const startCullSession = () => {
+    const rows = selection.ids.length
+      ? photos.filter((p) => selection.ids.includes(p.id))
+      : photos;
+    if (rows.length === 0) {
+      setStatus("Nothing to cull — scan or select some photos first.");
+      return;
+    }
+    setCullPhotos(rows);
+  };
+
   // Surface batch-cache progress in the status bar. `useOwnedSubscription` owns the async
   // registration (issue #13): one that resolves after this effect is cleaned up is stopped
   // rather than left running.
@@ -1055,7 +1074,7 @@ export default function App() {
   // Keyboard culling. Active whenever a photo is selected and focus isn't in an input.
   useEffect(() => {
     const handler = async (e: KeyboardEvent) => {
-      if (activeView || inDevelop) return; // a full-surface view owns input
+      if (activeView || inDevelop || inCull) return; // a full-surface view owns input
       const target = e.target as HTMLElement;
       if (target.tagName === "INPUT" || target.tagName === "TEXTAREA") return;
 
@@ -1347,6 +1366,18 @@ export default function App() {
           }
         >
           Stack bursts
+        </button>
+        <button
+          className="btn-ghost"
+          onClick={startCullSession}
+          disabled={!ready}
+          title={
+            selection.ids.length
+              ? `Cull ${selection.ids.length} selected photo(s) full screen, keyboard only`
+              : "Cull the whole view full screen, keyboard only — resumes where you left off"
+          }
+        >
+          Cull
         </button>
         {toolbarActions().map((action) => (
           <button
@@ -1954,6 +1985,19 @@ export default function App() {
         );
       })()}
 
+      {inCull && cullPhotos && (
+        <CullSession
+          photos={cullPhotos}
+          onExit={(stats) => {
+            setCullPhotos(null);
+            setStatus(
+              `Cull session: ${stats.visited} reviewed, ${stats.picked} picked, ` +
+                `${stats.rejected} rejected, ${stats.remaining} left.`,
+            );
+            refresh();
+          }}
+        />
+      )}
       {stackTargets && (
         <StackProposalsDialog
           photoIds={stackTargets}

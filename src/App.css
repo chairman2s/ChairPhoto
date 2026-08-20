@@ -3729,3 +3729,186 @@ body {
   font-size: 11px;
   line-height: 1.45;
 }
+
+/* ── Cull session (C4) ────────────────────────────────────────────────────────
+   Full viewport, above everything: the point of the mode is that nothing else is
+   on screen. The HUD is dim and small — present enough to answer "where am I and
+   what did I just press", quiet enough to ignore. */
+.cull-session {
+  position: fixed;
+  inset: 0;
+  z-index: 90;
+  background: #000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  user-select: none;
+}
+.cull-stage {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 40px 24px 64px;
+}
+.cull-stage .loupe-img {
+  max-width: 100%;
+  max-height: 100%;
+  object-fit: contain;
+}
+.cull-empty {
+  color: var(--text-mute);
+}
+.cull-hud-top,
+.cull-hud-bottom {
+  position: absolute;
+  left: 0;
+  right: 0;
+  display: flex;
+  gap: 10px;
+  padding: 10px 16px;
+  pointer-events: none;
+}
+.cull-hud-top {
+  top: 0;
+  align-items: baseline;
+  color: var(--text-mute);
+  font-size: 12px;
+}
+.cull-pos {
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+}
+.cull-name {
+  color: var(--text-mute);
+}
+.cull-note {
+  color: var(--text-mute);
+  font-style: italic;
+}
+.cull-hud-bottom {
+  bottom: 0;
+  flex-direction: column;
+  gap: 6px;
+  align-items: center;
+}
+.cull-state {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 20px;
+  font-size: 13px;
+  letter-spacing: 0.06em;
+}
+.cull-stars {
+  color: var(--star);
+  font-size: 16px;
+}
+.cull-pick {
+  color: var(--ok);
+  font-weight: 700;
+}
+.cull-reject {
+  color: var(--danger);
+  font-weight: 700;
+}
+.cull-label {
+  width: 12px;
+  height: 12px;
+  border-radius: var(--r-pill);
+}
+.cull-progress {
+  width: min(560px, 70vw);
+  height: 2px;
+  background: rgba(148, 163, 184, 0.25);
+  border-radius: var(--r-pill);
+  overflow: hidden;
+}
+.cull-progress-fill {
+  height: 100%;
+  background: var(--accent);
+}
+.cull-hint {
+  color: var(--text-mute);
+  font-size: 11px;
+}
+.cull-help {
+  position: absolute;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.72);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.cull-help-card {
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: var(--r);
+  padding: 20px 24px;
+  max-width: 420px;
+  box-shadow: var(--shadow-pop);
+}
+.cull-help-title {
+  font-weight: 600;
+  margin-bottom: 10px;
+}
+.cull-help-card dl {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 4px 16px;
+  margin: 0 0 12px;
+}
+.cull-help-card dt {
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+}
+.cull-help-card dd {
+  margin: 0;
+  color: var(--text);
+}
+.cull-help-note {
+  color: var(--text-mute);
+  font-size: 12px;
+  line-height: 1.5;
+}
+.cull-summary {
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: var(--r);
+  padding: 24px 28px;
+  min-width: min(420px, 88vw);
+  box-shadow: var(--shadow-pop);
+}
+.cull-summary-title {
+  font-size: 18px;
+  font-weight: 600;
+}
+.cull-summary-lead {
+  color: var(--text-dim);
+  margin: 4px 0 16px;
+}
+.cull-summary-stats {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 6px 20px;
+  margin: 0 0 16px;
+}
+.cull-summary-stats dt {
+  color: var(--text-mute);
+}
+.cull-summary-stats dd {
+  margin: 0;
+  font-variant-numeric: tabular-nums;
+}
+.cull-summary-dim {
+  color: var(--text-mute);
+}
+.cull-summary-note {
+  color: var(--text-mute);
+  font-size: 12px;
+  margin-bottom: 16px;
+}
+.cull-failure {
+  color: var(--danger);
+}

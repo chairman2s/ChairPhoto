@@ -1,5 +1,6 @@
 pub mod bundle;
 pub mod burst;
+pub mod companions;
 pub mod catalog;
 #[cfg(feature = "collage")]
 pub mod collage;

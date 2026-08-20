@@ -13,6 +13,8 @@ jobs:
   frontend:
     name: Frontend (typecheck + tests)
     runs-on: ubuntu-latest
+    # Green in well under a minute; the cap is here so a wedged `npm ci` fails fast.
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v7
@@ -28,6 +30,9 @@ jobs:
   backend:
     name: Backend (tests + feature gating)
     runs-on: ubuntu-latest
+    # A green run finishes in ~5 minutes warm, well under 20 cold. Without a cap, a hung
+    # step (apt has stalled here for hours) holds the runner until the 6-hour default.
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
 

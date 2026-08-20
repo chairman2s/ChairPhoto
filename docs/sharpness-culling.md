@@ -124,6 +124,42 @@ looking at it would hide that the last analysis run is stale, and would make ope
 inspector section a catalog mutation. Re-running burst analysis is the way to refresh a
 flag, and it stays an explicit action.
 
+## Collapsing a burst to its keeper
+
+Burst clustering, perceptual hashing and capture time were three separate readings for a
+long time. **Auto-stack proposals** (`propose_stacks` / `apply_stack_proposal`,
+`commands/culling.rs`) state what they add up to: *these frames are one moment, and this is
+the keeper.* Accepting one moves the other frames under the keeper through the stacking
+that already exists, so the group collapses to a single grid tile, nothing is deleted, and
+the inspector's Stack section unstacks any frame again.
+
+The keeper is `burst::select_representative`'s choice — highest rating, then sharpest —
+the same rule the AI dispatch uses to pick which frame to send. The reviewer can pick a
+different frame, at which point the stated reason is withdrawn rather than reused: it
+explains the engine's choice, not theirs.
+
+Four rules keep the action honest:
+
+- **Proposing never stacks.** The pass is read-only and every group is accepted on its
+  own. Collapsing frames out of the grid is exactly the bulk edit that should not happen
+  as a side effect of asking a question, and "it is reversible" is what makes accepting
+  safe to do quickly, not a reason to accept a list unread.
+- **Already-stacked photos are not candidates**, and the count of them is reported. A
+  stack child is not in the grid and is already grouped — usually the camera JPEG that
+  `pair_raw_jpeg_stacks` paired with its RAW — so re-proposing it would silently move it
+  out of the stack its owner put it in.
+- **Absorbed stacks are disclosed first.** `set_stack_parent` flattens rather than nests,
+  so accepting re-homes anything stacked under a member onto the keeper. The proposal
+  carries that count, and a keeper that is itself stacked is refused outright — it would
+  build a two-deep stack the one-level Stack section cannot render, hiding frames instead
+  of grouping them.
+- **Unweighed frames are named.** A group where nothing has been scored says it had
+  nothing to choose by, rather than claiming a sharpest frame.
+
+Acceptance runs in one transaction: a half-applied group would leave some frames collapsed
+and the rest loose in the grid, which is neither the state asked for nor the one that was
+there before.
+
 ## Resolution and scheduling
 
 A 256 px thumbnail cannot show micro-blur — a back-focused eye looks fine at that size.

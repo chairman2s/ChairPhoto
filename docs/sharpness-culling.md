@@ -160,6 +160,48 @@ Acceptance runs in one transaction: a half-applied group would leave some frames
 and the rest loose in the grid, which is neither the state asked for nor the one that was
 there before.
 
+## Cull session
+
+The signals above are read in the grid and the loupe, both of which are surrounded by
+panels. **Cull session** (`components/CullSession.tsx`) is the mode for actually getting
+through a shoot: one photo, full viewport, keyboard only, resumable. Scoped like the other
+two culling actions — the selection if there is one, otherwise the whole view.
+
+The keymap is the app's existing culling keymap, **unchanged**: `0`–`5` rate, `p`/`x`/`u`
+pick/reject/clear, `r y g b v` label and `n` clears it, arrows navigate. A session mode
+earns its keep through muscle memory, so a second dialect of the same shortcuts would
+defeat its purpose. It adds only what a grid cannot have: `space` to move on without
+deciding, `h` for the key list, `Esc` to end. Every decision advances, exactly as it does
+in the grid; `←` goes back so a mis-hit is corrected in place.
+
+- **The cursor is a photo id in catalog settings** (`cull.cursor.photo_id`). An index would
+  point at a different frame next session, because the set differs; `localStorage` would be
+  wrong because a photo id means nothing outside the catalog it came from. On opening,
+  the session either resumes at that photo or says it is not in this set — never silently
+  starts over.
+- **The set is frozen at the start**, as Compare freezes its own. Culling changes the very
+  fields the view is usually filtered by, so a live list would delete photos out from under
+  the cursor the moment one was rated, skipping frames unseen.
+- **Decisions are held in the session and the grid refreshes once, on exit.** The grid's
+  own handler re-queries after every keystroke; at six-figure scale that is a full re-query
+  per keypress. The HUD reads the session's record of what it applied, so it stays correct
+  without one.
+
+Two implementation points that are load-bearing rather than incidental, both because keys
+arrive faster than the UI can respond:
+
+- The cursor is authoritative in a **ref**, not in render state. Holding `3` then `x` runs
+  both keydowns before either advance has rendered, so a handler reading the rendered index
+  would apply both decisions to one photo and step past the next unseen.
+- A decision **does not await its write**. Gating navigation on SQLite puts a round-trip
+  between the key and the next photo. The write is still watched: a failure takes the
+  decision back off the photo and shows the error, because a HUD displaying a rating the
+  catalog never received is worse than a visible failure.
+
+The session ends on a summary — reviewed, decided, picked, rejected, rated, labelled, what
+remains of the set, elapsed time and seconds per photo. A photo that was looked at and left
+alone counts as reviewed but not decided: leaving it alone was the decision.
+
 ## Resolution and scheduling
 
 A 256 px thumbnail cannot show micro-blur — a back-focused eye looks fine at that size.

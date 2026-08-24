@@ -328,6 +328,45 @@ and the owner asked for silent background backup. Backup entry (owner decision):
 **both** — every imported photo is auto-enqueued, and a manual per-photo "Back up"
 (run-or-queue) sits in the inspector alongside Offload / Restore (shown by status).
 
+## Trash and delete
+
+**Trash** hides a photo everywhere, reversibly, without touching a byte. It is
+`photos.trashed_at` plus one predicate in `photos_visible` — which is the whole of "every
+query must learn about trash", because everything that lists or counts photos for the user
+already reads that view. The grid, album counts, library stats, tag counts and the safety
+summary all pick it up at once.
+
+It is **not** `pick_state = 'reject'`: reject is a verdict on a photo that stays in the
+library and keeps appearing, while trash hides it. Two-pass culling uses one, deletion
+flows use the other. It is **not** a sidecar field either — no user culling state reaches
+an in-library sidecar today, so trash would be the first, and would mark the file trashed
+for every foreign tool that reads that sidecar on the strength of a reversible local
+decision.
+
+**Trashing a stack takes the whole stack.** Frames are hidden from the grid by
+`stack_parent_id IS NULL`, so hiding a master alone would leave its frames hidden by one
+predicate and their master hidden by another: the trash would list one photo and the rest
+would be reachable from nowhere. The nullable timestamp already chosen for ordering doubles
+as the group key — a master stamps its untrashed frames with the same value, and restoring
+clears exactly that value, so a frame trashed separately keeps its own and stays put. Its
+one seam is whole-second resolution: a master and an unrelated frame of the same stack
+trashed inside one second would restore together.
+
+A trashed frame stops counting toward its master's stack badge; an *offline* one still
+counts. The difference is that one is a decision about the photo and the other is a fact
+about a disk.
+
+**Delete** is the only path in the app that destroys an original, and it is gated twice:
+an explicit confirmation the backend requires rather than assumes, and **every known copy
+reachable**. Reachability rather than role, because master-ness is an advisory claim and an
+advisory claim cannot guard a verb with no undo. Every copy rather than just home, because
+deleting what is in reach while a disconnected disk holds one leaves a survivor that
+nothing points at. A volume missing from the reachability map counts as unreachable —
+failing open would destroy originals on the strength of an absent map entry.
+
+Companions are deleted with the image. Leaving them would strand sidecars on the one path
+where nothing can be recovered afterwards.
+
 ## Safety invariants (non-negotiable)
 
 1. **Never delete the last verified copy** of a photo — including the companions that

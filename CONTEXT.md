@@ -64,9 +64,21 @@ Design docs live in `docs/`.
 - **Trash** — a per-photo metadata state ("in trash"). Hides the photo everywhere;
   reversible; touches no bytes anywhere. Catalog-local, like every other mutable
   per-photo state: trashing a photo on one device tells no other device anything.
-- **Delete** — destroy an original at home. Only possible on the master, only from
-  the trash, only by explicit manual confirmation. Never synchronized, never
-  triggered by another device. Satellites have no delete capability at all.
+
+  Trashing a stack takes the whole stack. Frames are already hidden from the grid by
+  their master, so hiding the master alone would leave them reachable from nowhere.
+  Restoring returns exactly the frames that were trashed in the same act — a frame
+  trashed separately, earlier, stays where it was put.
+- **Delete** — destroy an original. Only from the trash, only by explicit manual
+  confirmation, and only when **every known copy is reachable**. Never synchronized,
+  never triggered by another device.
+
+  Reachability, not role, is the gate. Master-ness is an advisory claim, and an advisory
+  claim cannot guard the one verb with no undo; a device that cannot reach a copy cannot
+  destroy it, which is stronger and needs nothing to be true about identity. "Satellites
+  have no delete capability" then follows from what a device can reach rather than from a
+  flag. And *every* copy, not just the one at home: destroying the copies in reach while a
+  disconnected disk still holds one leaves a survivor that nothing points at.
 
 ## Metadata
 

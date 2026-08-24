@@ -591,15 +591,17 @@ impl Catalog {
     /// backed-up even if the NAS is currently unmounted (reachability only decides
     /// Archived vs Offline when there's no local copy).
     pub fn photo_storage_status(&self, photo_id: i64) -> Result<StorageStatus> {
+        // Delegates to the batch rather than running its own query. The two used to be
+        // separate statements over the same tables, which is exactly how one of them
+        // ends up with a rule the other lacks — the `role <> 'export'` filter was added
+        // to one and silently missing from the other.
         let reachable = self.volume_reachability()?;
-        let mut stmt = self.conn.prepare(
-            "SELECT v.kind, v.id FROM photo_locations l JOIN volumes v ON v.id = l.volume_id
-             WHERE l.photo_id = ?1",
-        )?;
-        let rows: Vec<(String, i64)> = stmt
-            .query_map(params![photo_id], |r| Ok((r.get(0)?, r.get(1)?)))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(status_from_locations(&rows, &reachable))
+        Ok(self
+            .photo_storage_statuses(&[photo_id], &reachable)?
+            .into_iter()
+            .next()
+            .map(|(_, status)| status)
+            .unwrap_or(StorageStatus::Missing))
     }
 
     /// Batch storage status for many photos (one query) — for the grid. Returns
@@ -622,9 +624,13 @@ impl Catalog {
         for chunk in photo_ids.chunks(SQLITE_PARAM_CHUNK) {
             let placeholders = sqlite_param_placeholders(chunk.len());
             let mut stmt = self.conn.prepare(&format!(
-                "SELECT l.photo_id, v.kind, v.id FROM photo_locations l
+                "-- An export copy is outbound and one-way (docs/storage-and-import.md,
+                 -- \"Export is one-way\"). It sits on whatever volume the user pointed the
+                 -- export at, which may well be a backup-kind disk — but it is a hand-off,
+                 -- not a safety copy, and must never make a photo read as backed up.
+                 SELECT l.photo_id, v.kind, v.id FROM photo_locations l
                  JOIN volumes v ON v.id = l.volume_id
-                 WHERE l.photo_id IN ({placeholders})"
+                 WHERE l.photo_id IN ({placeholders}) AND l.role <> 'export'"
             ))?;
             let binds: Vec<&dyn rusqlite::ToSql> =
                 chunk.iter().map(|i| i as &dyn rusqlite::ToSql).collect();

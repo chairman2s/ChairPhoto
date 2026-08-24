@@ -980,6 +980,21 @@ fn per_photo_storage_status_from_locations() {
     catalog.remove_locations_on_volume(missing, default_local).unwrap();
     assert_eq!(catalog.photo_storage_status(missing).unwrap(), StorageStatus::Missing);
 
+    // An EXPORT copy is a one-way hand-off, not a safety copy — even when the user pointed
+    // the export at a backup-kind disk. It must not make a photo read as backed up.
+    let exported = catalog.upsert_photo(&root.join("f.arw"), None, 1, 1).unwrap().id;
+    catalog.add_location(exported, nas, "f.arw", LocationRole::Export).unwrap();
+    assert_eq!(
+        catalog.photo_storage_status(exported).unwrap(),
+        StorageStatus::LocalOnly,
+        "an export copy on a backup volume is still only one real copy"
+    );
+
+    // And with no local copy either, an export copy leaves the photo Missing rather than
+    // Archived: there is nothing to browse from and nothing keeping it safe.
+    catalog.remove_locations_on_volume(exported, default_local).unwrap();
+    assert_eq!(catalog.photo_storage_status(exported).unwrap(), StorageStatus::Missing);
+
     // Batch returns one entry per requested id, matching the singles. The batch method
     // no longer stats — the caller supplies the reachability map (here from list_volumes,
     // which mirrors the old internal behaviour).

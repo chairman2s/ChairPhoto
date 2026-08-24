@@ -538,6 +538,9 @@ pub fn run() {
             commands::index_phashes,
             commands::phash_index_cancel,
             commands::analyze_burst_sharpness,
+            commands::explain_photo_signals,
+            commands::propose_stacks,
+            commands::apply_stack_proposal,
             #[cfg(feature = "smarttags")]
             commands::smarttags_model_status,
             #[cfg(feature = "smarttags")]

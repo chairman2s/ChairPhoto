@@ -35,6 +35,7 @@ mod burst;
 mod catalog;
 #[cfg(feature = "collage")]
 mod collage;
+mod culling;
 mod editing;
 mod export;
 #[cfg(feature = "faces")]
@@ -77,6 +78,7 @@ mod tags;
 pub use ai::*;
 pub use albums::*;
 pub use burst::*;
+pub use culling::*;
 pub use catalog::*;
 #[cfg(feature = "collage")]
 pub use collage::*;

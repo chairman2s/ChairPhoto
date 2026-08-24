@@ -110,7 +110,8 @@ Clustering runs cheapest-first, each tier refining the last:
    milliseconds per photo, no extra runtime). Within a time group, frames within
    `ai.burst_hamming_threshold` Hamming distance (default `10`) are the same scene; a jump splits
    the group. The hash lives in core rather than the plugin because near-duplicate detection and
-   auto-stacking reuse it.
+   auto-stacking reuse it — see "Collapsing a burst to its keeper" in `docs/sharpness-culling.md`
+   for the auto-stack proposals built on the same two tiers.
 
 The representative is the highest-rated frame where you have already expressed a preference,
 otherwise the sharpest by Laplacian-variance blur score.

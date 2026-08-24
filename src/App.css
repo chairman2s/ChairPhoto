@@ -3538,3 +3538,377 @@ body {
   gap: 6px;
   background: #0B1120;
 }
+
+/* ── Inspector: culling signals (C6) ──────────────────────────────────────────
+   Reads as evidence, not chrome: numbers aligned, the frame you are looking at
+   marked, and the two disclosures (stale badge, truncated burst) given enough
+   weight to be noticed rather than tucked into a tooltip. */
+.signals {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.signals-block {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.signals-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  font-weight: 600;
+  color: var(--text-dim);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.signals-verdict {
+  text-transform: none;
+  letter-spacing: 0;
+  font-weight: 500;
+  color: var(--ok);
+}
+.signals-verdict.is-soft {
+  color: var(--danger);
+}
+.signals-line {
+  color: var(--text);
+  line-height: 1.5;
+}
+.signals-note {
+  color: var(--text-mute);
+  font-size: 11px;
+  line-height: 1.4;
+}
+.signals-warn {
+  border-left: 2px solid var(--star);
+  padding: 4px 0 4px 8px;
+  color: var(--text-dim);
+  line-height: 1.45;
+}
+.signals-frames {
+  width: 100%;
+  border-collapse: collapse;
+  margin-top: 4px;
+}
+.signals-frames th {
+  text-align: left;
+  font-weight: 500;
+  font-size: 11px;
+  color: var(--text-mute);
+  padding: 2px 4px;
+  border-bottom: 1px solid var(--border);
+}
+.signals-frames td {
+  padding: 2px 4px;
+  border-bottom: 1px solid rgba(51, 65, 85, 0.4);
+}
+.signals-frames .signals-num,
+.signals-frames th:nth-child(2),
+.signals-frames th:nth-child(3) {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+.signals-frame-name {
+  max-width: 0;
+  width: 60%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.signals-subject {
+  background: rgba(59, 130, 246, 0.12);
+}
+.signals-subject td {
+  color: var(--text);
+  font-weight: 600;
+}
+.signals-you {
+  color: var(--accent);
+  margin-right: 4px;
+}
+.signals-mark {
+  text-align: center;
+  color: var(--star);
+}
+
+/* ── Auto-stack proposals (C3) ────────────────────────────────────────────────
+   A review list, not a progress dialog: the frames are large enough to judge,
+   the keeper is obvious at a glance, and the two consequences of accepting
+   (re-homed stacks, unweighed frames) sit next to the button that causes them. */
+.modal.stack-proposals {
+  width: min(880px, 92vw);
+  max-height: 86vh;
+}
+.stack-proposals-note {
+  color: var(--text-dim);
+  line-height: 1.45;
+  padding: 8px 10px;
+  border-left: 2px solid var(--accent);
+  background: rgba(59, 130, 246, 0.08);
+  border-radius: var(--r-sm);
+}
+.stack-proposal {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px 0;
+  border-top: 1px solid var(--border);
+}
+.stack-proposal-head {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  flex-wrap: wrap;
+  color: var(--text-dim);
+}
+.stack-proposal-reason {
+  margin-left: auto;
+  color: var(--text-mute);
+  font-style: italic;
+}
+.stack-proposal-frames {
+  display: flex;
+  gap: 8px;
+  overflow-x: auto;
+  padding-bottom: 4px;
+}
+.stack-proposal-frame {
+  position: relative;
+  flex: 0 0 auto;
+  width: 132px;
+  padding: 0;
+  border: 2px solid transparent;
+  border-radius: var(--r-sm);
+  background: var(--bg-tile);
+  cursor: pointer;
+  overflow: hidden;
+}
+.stack-proposal-frame:hover {
+  border-color: var(--text-mute);
+}
+.stack-proposal-frame.is-keeper {
+  border-color: var(--accent);
+}
+.stack-proposal-frame img {
+  display: block;
+  width: 100%;
+  aspect-ratio: 3 / 2;
+  object-fit: cover;
+}
+.stack-proposal-frame-meta {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 5px;
+  font-size: 11px;
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+}
+.stack-proposal-crown {
+  color: var(--star);
+}
+.stack-proposal-stars {
+  color: var(--star);
+  margin-left: auto;
+}
+.stack-proposal-carries {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  padding: 1px 4px;
+  border-radius: var(--r-pill);
+  background: rgba(15, 23, 42, 0.8);
+  font-size: 10px;
+  color: var(--text-dim);
+}
+.stack-proposal-caveats {
+  color: var(--text-mute);
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+/* ── Cull session (C4) ────────────────────────────────────────────────────────
+   Full viewport, above everything: the point of the mode is that nothing else is
+   on screen. The HUD is dim and small — present enough to answer "where am I and
+   what did I just press", quiet enough to ignore. */
+.cull-session {
+  position: fixed;
+  inset: 0;
+  z-index: 90;
+  background: #000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  user-select: none;
+}
+.cull-stage {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 40px 24px 64px;
+}
+.cull-stage .loupe-img {
+  max-width: 100%;
+  max-height: 100%;
+  object-fit: contain;
+}
+.cull-empty {
+  color: var(--text-mute);
+}
+.cull-hud-top,
+.cull-hud-bottom {
+  position: absolute;
+  left: 0;
+  right: 0;
+  display: flex;
+  gap: 10px;
+  padding: 10px 16px;
+  pointer-events: none;
+}
+.cull-hud-top {
+  top: 0;
+  align-items: baseline;
+  color: var(--text-mute);
+  font-size: 12px;
+}
+.cull-pos {
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+}
+.cull-name {
+  color: var(--text-mute);
+}
+.cull-note {
+  color: var(--text-mute);
+  font-style: italic;
+}
+.cull-hud-bottom {
+  bottom: 0;
+  flex-direction: column;
+  gap: 6px;
+  align-items: center;
+}
+.cull-state {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 20px;
+  font-size: 13px;
+  letter-spacing: 0.06em;
+}
+.cull-stars {
+  color: var(--star);
+  font-size: 16px;
+}
+.cull-pick {
+  color: var(--ok);
+  font-weight: 700;
+}
+.cull-reject {
+  color: var(--danger);
+  font-weight: 700;
+}
+.cull-label {
+  width: 12px;
+  height: 12px;
+  border-radius: var(--r-pill);
+}
+.cull-progress {
+  width: min(560px, 70vw);
+  height: 2px;
+  background: rgba(148, 163, 184, 0.25);
+  border-radius: var(--r-pill);
+  overflow: hidden;
+}
+.cull-progress-fill {
+  height: 100%;
+  background: var(--accent);
+}
+.cull-hint {
+  color: var(--text-mute);
+  font-size: 11px;
+}
+.cull-help {
+  position: absolute;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.72);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.cull-help-card {
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: var(--r);
+  padding: 20px 24px;
+  max-width: 420px;
+  box-shadow: var(--shadow-pop);
+}
+.cull-help-title {
+  font-weight: 600;
+  margin-bottom: 10px;
+}
+.cull-help-card dl {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 4px 16px;
+  margin: 0 0 12px;
+}
+.cull-help-card dt {
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+}
+.cull-help-card dd {
+  margin: 0;
+  color: var(--text);
+}
+.cull-help-note {
+  color: var(--text-mute);
+  font-size: 12px;
+  line-height: 1.5;
+}
+.cull-summary {
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: var(--r);
+  padding: 24px 28px;
+  min-width: min(420px, 88vw);
+  box-shadow: var(--shadow-pop);
+}
+.cull-summary-title {
+  font-size: 18px;
+  font-weight: 600;
+}
+.cull-summary-lead {
+  color: var(--text-dim);
+  margin: 4px 0 16px;
+}
+.cull-summary-stats {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 6px 20px;
+  margin: 0 0 16px;
+}
+.cull-summary-stats dt {
+  color: var(--text-mute);
+}
+.cull-summary-stats dd {
+  margin: 0;
+  font-variant-numeric: tabular-nums;
+}
+.cull-summary-dim {
+  color: var(--text-mute);
+}
+.cull-summary-note {
+  color: var(--text-mute);
+  font-size: 12px;
+  margin-bottom: 16px;
+}
+.cull-failure {
+  color: var(--danger);
+}

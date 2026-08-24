@@ -779,6 +779,16 @@ export interface DrainSummary {
 }
 export const listPendingOperations = () =>
   invoke<PendingOperation[]>("list_pending_operations");
+/**
+ * Queue an operation for many photos at once — the safety panel's batch action.
+ *
+ * Returns how many were *newly* queued; a photo already waiting is not counted. Nothing
+ * is copied here: the reconcile drain does the work when the NAS is reachable and reports
+ * its own progress, so queueing against an offline NAS is a promise kept later.
+ */
+export const enqueueOperations = (kind: string, photoIds: number[]) =>
+  invoke<number>("enqueue_operations", { kind, photoIds });
+
 export const enqueueOperation = (kind: string, photoId: number) =>
   invoke<number>("enqueue_operation", { kind, photoId });
 export const reconcileNow = () => invoke<DrainSummary>("reconcile_now");

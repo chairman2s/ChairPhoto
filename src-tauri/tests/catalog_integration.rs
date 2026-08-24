@@ -963,6 +963,45 @@ fn a_companion_edited_after_the_backup_makes_the_photo_stale() {
     assert_eq!(catalog.library_safety_summary().unwrap().stale, 1);
 }
 
+/// The safety panel's batch action queues a whole selection at once. The count it reports
+/// is "newly queued", not "statements run" — a photo already waiting must not be counted
+/// again, or the message tells the user work was created that was not.
+#[test]
+fn queueing_a_selection_counts_only_what_was_not_already_waiting() {
+    let (catalog, root) = temp_catalog("batch-enqueue");
+    let ids: Vec<i64> = (1..=4)
+        .map(|i| {
+            let p = root.join(format!("DSC{i}.arw"));
+            std::fs::write(&p, b"x").unwrap();
+            catalog.upsert_photo(&p, None, 1, 1).unwrap().id
+        })
+        .collect();
+
+    // One is already waiting, queued the per-photo way.
+    catalog.enqueue_operation("backup", ids[0]).unwrap();
+
+    let queued = catalog.enqueue_operations("backup", &ids).unwrap();
+
+    assert_eq!(queued, 3, "the one already waiting is not counted again");
+    assert_eq!(catalog.list_pending_operations().unwrap().len(), 4, "and not duplicated");
+
+    // Re-running queues nothing further: the action is safe to press twice.
+    assert_eq!(catalog.enqueue_operations("backup", &ids).unwrap(), 0);
+    assert_eq!(catalog.list_pending_operations().unwrap().len(), 4);
+}
+
+/// An unknown kind is rejected rather than queued as a row nothing will ever drain.
+#[test]
+fn queueing_an_unknown_operation_kind_is_refused() {
+    let (catalog, root) = temp_catalog("batch-enqueue-kind");
+    let p = root.join("a.arw");
+    std::fs::write(&p, b"x").unwrap();
+    let id = catalog.upsert_photo(&p, None, 1, 1).unwrap().id;
+
+    assert!(catalog.enqueue_operations("teleport", &[id]).is_err());
+    assert!(catalog.list_pending_operations().unwrap().is_empty());
+}
+
 /// The #80-era shape: a photo whose image was backed up before companions existed, so home
 /// has verified pixels and no sidecar, and the edit state sits in exactly one place.
 ///

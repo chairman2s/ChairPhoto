@@ -128,6 +128,14 @@ export function SafetySection({
             />
           )}
 
+          {(summary.atRisk > 0 || summary.stale > 0) && onShowTier && (
+            <div className="safety-next">
+              “Show me” filters the grid to that bucket. Select there and use{" "}
+              <b>Back up</b> in the toolbar to queue them — they copy when the NAS is
+              reachable, and the topbar badge tracks what is still waiting.
+            </div>
+          )}
+
           <div className="safety-caveats">
             {summary.companionsUnchecked > 0 && (
               <div>

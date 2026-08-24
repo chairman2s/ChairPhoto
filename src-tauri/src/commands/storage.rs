@@ -28,6 +28,20 @@ pub fn enqueue_operation(
     with_catalog(&state, |c| c.enqueue_operation(&kind, photo_id))
 }
 
+/// Queue an operation for many photos at once — the safety panel's batch action.
+///
+/// Returns how many were newly queued. Nothing is copied here: the existing reconcile
+/// drain does the work when the NAS is reachable, and reports its own progress, so a
+/// batch enqueue over an offline NAS is a promise kept later rather than an error now.
+#[tauri::command]
+pub async fn enqueue_operations(
+    state: State<'_, AppState>,
+    kind: String,
+    photo_ids: Vec<i64>,
+) -> Result<usize, String> {
+    with_catalog_blocking(&state, move |c| c.enqueue_operations(&kind, &photo_ids)).await
+}
+
 // --- shared async op runners (used by the per-photo commands AND the drain) ---
 // Each runs the E3 plan→IO→record split so the (possibly network) copy never holds
 // the catalog lock or blocks the UI thread.

@@ -82,6 +82,24 @@ describe("SafetySection", () => {
     expect(onShowTier).toHaveBeenCalledWith("atRisk");
   });
 
+  it("says how to act on the bucket, not just how to look at it", async () => {
+    // "Show me" only filters. Without naming the next step the panel is a viewer, and the
+    // batch action the design calls for has no discoverable path to it.
+    render(<SafetySection onShowTier={vi.fn()} />);
+
+    await waitFor(() => expect(text()).toMatch(/Show me. filters the grid/));
+    expect(text()).toMatch(/use Back up in the toolbar to queue them/);
+    expect(text()).toMatch(/copy when the NAS is reachable/);
+  });
+
+  it("drops the how-to once nothing is actionable", async () => {
+    respond = () => Promise.resolve(summary({ atRisk: 0, stale: 0 }));
+    render(<SafetySection onShowTier={vi.fn()} />);
+
+    await waitFor(() => expect(text()).toMatch(/Every photo has a copy at home/));
+    expect(text()).not.toMatch(/use Back up in the toolbar/);
+  });
+
   it("offers no action on a bucket that is already zero", async () => {
     respond = () => Promise.resolve(summary({ atRisk: 0, stale: 0 }));
     render(<SafetySection onShowTier={vi.fn()} />);

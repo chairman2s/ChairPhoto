@@ -3,6 +3,7 @@ import { confirm } from "@tauri-apps/plugin-dialog";
 import {
   analyzeBurstSharpness,
   trashPhotos,
+  enqueueOperations,
   applyAutoTags,
   assignTag,
   cacheImages,
@@ -830,6 +831,31 @@ export default function App() {
     }
   };
 
+  // Batch back-up (cluster B, B1/D6): the second half of the safety panel's "show me".
+  // The panel filters the grid to a bucket; this queues what you then select, through the
+  // same pending-operations queue the per-photo action uses — so the topbar badge and the
+  // reconcile drain report it, and an offline NAS defers rather than fails.
+  const backUpSelection = async () => {
+    const targets = selection.ids.length ? selection.ids : photos.map((p) => p.id);
+    if (targets.length === 0) {
+      setStatus("Nothing selected to back up.");
+      return;
+    }
+    try {
+      const queued = await enqueueOperations("backup", targets);
+      const already = targets.length - queued;
+      setStatus(
+        `Queued ${queued} for backup` +
+          (already ? ` (${already} already waiting)` : "") +
+          ". They copy when the NAS is reachable.",
+      );
+      await refreshPending();
+      runReconcile();
+    } catch (e) {
+      setStatus(`Could not queue backup: ${e}`);
+    }
+  };
+
   // Auto-stack proposals (C3): same scoping as burst analysis — the selection, else the
   // whole view. Opening only *proposes*; each group is accepted individually in the dialog.
   const openStackProposals = () => {
@@ -1345,6 +1371,18 @@ export default function App() {
           title="Publish the selected photo to Instagram, Flickr, SmugMug…"
         >
           Publish
+        </button>
+        <button
+          className="btn-ghost"
+          onClick={backUpSelection}
+          disabled={!ready}
+          title={
+            selection.ids.length
+              ? `Queue ${selection.ids.length} selected photo(s) to copy to the NAS`
+              : "Queue every photo in the current view to copy to the NAS"
+          }
+        >
+          Back up
         </button>
         <button
           className="btn-ghost"

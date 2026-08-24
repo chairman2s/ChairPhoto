@@ -46,6 +46,35 @@ impl Catalog {
         )?)
     }
 
+    /// Queue one kind of operation for many photos, in a single transaction.
+    ///
+    /// Returns how many rows were newly created — a photo already queued is not counted,
+    /// so "queued 12" means twelve photos that were not already waiting rather than twelve
+    /// statements that ran.
+    ///
+    /// A batch rather than a loop of [`Catalog::enqueue_operation`] because the safety
+    /// panel's "show me" can hand the grid six figures of photos: the owner's Unverified
+    /// bucket alone is 164,185, and one IPC round trip each would be unusable.
+    pub fn enqueue_operations(&self, kind: &str, photo_ids: &[i64]) -> Result<usize> {
+        if !KINDS.contains(&kind) {
+            return Err(CatalogError::Validation(format!("unknown operation: {kind}")));
+        }
+        let tx = self.conn.unchecked_transaction()?;
+        let at = now();
+        let mut queued = 0usize;
+        {
+            let mut stmt = self.conn.prepare(
+                "INSERT INTO pending_operations(kind, photo_id, created_at) VALUES(?1, ?2, ?3)
+                 ON CONFLICT(kind, photo_id) DO NOTHING",
+            )?;
+            for &id in photo_ids {
+                queued += stmt.execute(params![kind, id, at])?;
+            }
+        }
+        tx.commit()?;
+        Ok(queued)
+    }
+
     /// All queued operations, oldest first.
     pub fn list_pending_operations(&self) -> Result<Vec<PendingOperation>> {
         let mut stmt = self.conn.prepare(

@@ -359,6 +359,7 @@ pub fn run() {
             commands::scan_nas_folder_cmd,
             commands::list_pending_operations,
             commands::enqueue_operation,
+            commands::enqueue_operations,
             commands::reconcile_now,
             commands::assemble_hashtag_bundle,
             commands::get_photo,

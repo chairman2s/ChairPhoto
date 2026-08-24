@@ -74,7 +74,11 @@ impl Catalog {
     }
 
     /// Record a verified backup location (after the copy+verify IO succeeded).
-    pub fn record_backup(&self, photo_id: i64, volume_id: i64, rel: &str, hash: &str) -> Result<()> {
+    ///
+    /// Private on purpose: it records an image and nothing else, which is only half a copy.
+    /// [`Catalog::record_copy`] is the way in, so no path outside this module can record a
+    /// location while forgetting the companions that belong to it.
+    fn record_backup(&self, photo_id: i64, volume_id: i64, rel: &str, hash: &str) -> Result<()> {
         self.add_location(photo_id, volume_id, rel, LocationRole::Backup)?;
         self.set_location_verified_hash(photo_id, volume_id, LocationRole::Backup, hash)
     }
@@ -87,14 +91,9 @@ impl Catalog {
     /// because two edits exist and backup is not the place to pick one.
     pub fn backup_photo(&self, photo_id: i64, backup_volume_id: i64) -> Result<String> {
         let plan = self.plan_backup(photo_id, backup_volume_id)?;
-        let hash = copy_and_verify(&plan.source, &plan.dest, None)?;
-        self.record_backup(photo_id, plan.volume_id, &plan.rel, &hash)?;
-        let carry = carry_companions(&plan.source, &plan.dest)?;
-        self.record_companions(
-            self.require_location_id(photo_id, plan.volume_id, LocationRole::Backup)?,
-            &carry.carried,
-        )?;
-        Ok(hash)
+        let outcome = copy_with_companions(&plan.source, &plan.dest, None)?;
+        self.record_copy(photo_id, plan.volume_id, &plan.rel, LocationRole::Backup, &outcome)?;
+        Ok(outcome.hash)
     }
 
     // --- offload -----------------------------------------------------------
@@ -195,6 +194,28 @@ impl Catalog {
         Ok(updated)
     }
 
+    /// Record a completed lifecycle copy: the location, its verified hash, and the
+    /// companions that came with it.
+    ///
+    /// The single entry point for recording a copy, and the reason the two halves cannot
+    /// drift apart again. Before this existed, the shipping backup path carried companions
+    /// and the shipping restore path did not — the same omission as #80, in the other
+    /// direction, six weeks later.
+    pub fn record_copy(
+        &self,
+        photo_id: i64,
+        volume_id: i64,
+        rel: &str,
+        role: LocationRole,
+        outcome: &CopyOutcome,
+    ) -> Result<()> {
+        match role {
+            LocationRole::Backup => self.record_backup(photo_id, volume_id, rel, &outcome.hash)?,
+            _ => self.record_restore(photo_id, volume_id, rel, &outcome.hash)?,
+        }
+        self.record_companions_at(photo_id, volume_id, role, &outcome.carried)
+    }
+
     /// Record companions at the location identified by (photo, volume, role) — the form
     /// the command layer has to hand, since it writes the location row and then needs to
     /// attach to it.
@@ -280,7 +301,8 @@ impl Catalog {
         })
     }
 
-    pub fn record_restore(&self, photo_id: i64, volume_id: i64, rel: &str, hash: &str) -> Result<()> {
+    /// As [`Catalog::record_backup`], for a local cache copy. Private for the same reason.
+    fn record_restore(&self, photo_id: i64, volume_id: i64, rel: &str, hash: &str) -> Result<()> {
         self.add_location(photo_id, volume_id, rel, LocationRole::LocalCache)?;
         self.set_location_verified_hash(photo_id, volume_id, LocationRole::LocalCache, hash)
     }
@@ -291,14 +313,10 @@ impl Catalog {
     /// state an offload freed rather than as bare pixels.
     pub fn restore_photo(&self, photo_id: i64, local_volume_id: i64) -> Result<String> {
         let plan = self.plan_restore(photo_id, local_volume_id)?;
-        let hash = copy_and_verify(&plan.source, &plan.dest, plan.expected_hash.as_deref())?;
-        self.record_restore(photo_id, plan.volume_id, &plan.rel, &hash)?;
-        let carry = carry_companions(&plan.source, &plan.dest)?;
-        self.record_companions(
-            self.require_location_id(photo_id, plan.volume_id, LocationRole::LocalCache)?,
-            &carry.carried,
-        )?;
-        Ok(hash)
+        let outcome =
+            copy_with_companions(&plan.source, &plan.dest, plan.expected_hash.as_deref())?;
+        self.record_copy(photo_id, plan.volume_id, &plan.rel, LocationRole::LocalCache, &outcome)?;
+        Ok(outcome.hash)
     }
 
     // --- helpers -----------------------------------------------------------
@@ -439,6 +457,38 @@ pub struct CompanionCarry {
     /// Companions that exist on both sides with different contents. Left untouched: the
     /// two sides hold different edits and picking one would silently discard the other.
     pub diverged: Vec<PathBuf>,
+}
+
+/// The result of one lifecycle copy: the verified hash **and** the companions that
+/// travelled with it.
+///
+/// One value rather than two returns, because recording half of a copy is exactly what
+/// issue #80 was — the image reached home, the edit state did not, and the app said
+/// "backed up". [`Catalog::record_copy`] takes this whole thing, so there is no shape in
+/// which a caller records a location and forgets what came with it.
+#[derive(Debug, Clone)]
+pub struct CopyOutcome {
+    /// SHA-256 of the image, verified after the copy.
+    pub hash: String,
+    /// Companions now confirmed present and identical at the destination.
+    pub carried: Vec<CarriedCompanion>,
+    /// Companions that exist on both sides with different contents, left untouched.
+    pub diverged: Vec<PathBuf>,
+}
+
+/// Copy an image to `dest` and carry its declared companions with it, all verified.
+///
+/// The one IO half of every lifecycle copy — backup, restore, and the carry an offload does
+/// before it frees anything. Pure file work: no catalog lock, so it runs on a blocking
+/// worker like the rest of this module.
+pub fn copy_with_companions(
+    src: &Path,
+    dest: &Path,
+    expected: Option<&str>,
+) -> Result<CopyOutcome> {
+    let hash = copy_and_verify(src, dest, expected)?;
+    let carry = carry_companions(src, dest)?;
+    Ok(CopyOutcome { hash, carried: carry.carried, diverged: carry.diverged })
 }
 
 /// Ensure every declared companion beside `src_image` is present beside `dest_image`.

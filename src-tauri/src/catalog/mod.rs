@@ -42,8 +42,8 @@ pub use identity::{
 };
 pub use locations::{PathCandidate, ResolveMode};
 pub use lifecycle::{
-    carry_companions, copy_and_verify, verify_and_delete_locals, BackupPlan, CarriedCompanion,
-    CompanionCarry, OffloadPlan, RestorePlan,
+    carry_companions, copy_and_verify, copy_with_companions, verify_and_delete_locals, BackupPlan,
+    CarriedCompanion, CompanionCarry, CopyOutcome, OffloadPlan, RestorePlan,
 };
 pub use merge::MergeSummary;
 pub use models::{

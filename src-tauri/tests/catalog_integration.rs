@@ -995,6 +995,64 @@ fn scanning_the_home_copy_does_not_vouch_for_the_local_one() {
     assert_eq!(catalog.library_safety_summary().unwrap().stale, 1);
 }
 
+/// Restore must bring back what an offload moved home — all three companion shapes, not
+/// just the appended one that happens to be most common. The shipping restore path used to
+/// record the image alone; both paths now go through one copy/record seam, so this covers
+/// the shape of the operation rather than one caller of it.
+#[test]
+fn restore_brings_back_every_companion_shape() {
+    let (catalog, root) = temp_catalog("restore-companions");
+    let nas_dir = root.parent().unwrap().join("nas");
+    std::fs::create_dir_all(&nas_dir).unwrap();
+    let nas = catalog.add_volume("NAS", &nas_dir, VolumeKind::Backup).unwrap();
+    let local_id = catalog
+        .list_volumes()
+        .unwrap()
+        .into_iter()
+        .find(|v| v.kind == VolumeKind::Local)
+        .unwrap()
+        .id;
+
+    let raw = root.join("DSC1.ARW");
+    std::fs::write(&raw, b"bytes").unwrap();
+    std::fs::write(root.join("DSC1.ARW.xmp"), b"appended-history").unwrap(); // darktable
+    std::fs::write(root.join("DSC1.xmp"), b"basename-history").unwrap(); // darktable, alt mode
+    std::fs::write(root.join("DSC1.ARW.rrdata"), b"masks").unwrap(); // RapidRAW
+    let id = catalog.upsert_photo(&raw, None, 1, 5).unwrap().id;
+
+    catalog.backup_photo(id, nas).unwrap();
+    catalog.offload_photo(id).unwrap();
+
+    // Local is empty; home holds everything.
+    assert!(!raw.exists());
+    assert!(!root.join("DSC1.ARW.rrdata").exists());
+    assert!(nas_dir.join("DSC1.xmp").is_file(), "the basename form reached home too");
+
+    catalog.restore_photo(id, local_id).unwrap();
+
+    assert_eq!(std::fs::read(&raw).unwrap(), b"bytes", "the image");
+    assert_eq!(
+        std::fs::read(root.join("DSC1.ARW.xmp")).unwrap(),
+        b"appended-history",
+        "appended xmp"
+    );
+    assert_eq!(
+        std::fs::read(root.join("DSC1.xmp")).unwrap(),
+        b"basename-history",
+        "basename xmp"
+    );
+    assert_eq!(std::fs::read(root.join("DSC1.ARW.rrdata")).unwrap(), b"masks", "rrdata");
+
+    // And the restored location knows what came with it, so freshness has a reference.
+    let recorded: Vec<String> = catalog
+        .companions_at(id, local_id, LocationRole::LocalCache)
+        .unwrap()
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect();
+    assert_eq!(recorded, vec!["DSC1.ARW.rrdata", "DSC1.ARW.xmp", "DSC1.xmp"]);
+}
+
 /// A companion that differs on the two sides is two unreconciled edits. Offload is not the
 /// place to choose between them, so it refuses — and nothing local is deleted.
 #[test]

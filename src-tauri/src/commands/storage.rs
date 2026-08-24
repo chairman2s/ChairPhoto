@@ -43,31 +43,17 @@ async fn do_backup(state: &State<'_, AppState>, photo_id: i64, backup_id: i64) -
         let p = c.plan_backup(photo_id, backup_id)?;
         Ok((p.source, p.dest, p.rel, p.volume_id))
     })?;
-    // A copy is the image plus its declared companions, so the same worker carries the
-    // sidecars across. Doing it here rather than only in `Catalog::backup_photo` matters:
-    // this is the path the Back up button takes, and the sync wrapper is for tests and
-    // simple callers (see the lifecycle module docs). Missing it here is what #80 was.
-    let (src, dst) = (source.clone(), dest.clone());
-    let hash = tauri::async_runtime::spawn_blocking(move || {
-        crate::catalog::copy_and_verify(&source, &dest, None)
-    })
-    .await
-    .map_err(|e| e.to_string())?
-    .map_err(|e| e.to_string())?;
-    let carry = tauri::async_runtime::spawn_blocking(move || {
-        crate::catalog::carry_companions(&src, &dst)
+    // A copy is the image plus its declared companions, and `copy_with_companions` is the
+    // one place that knows it — so this path cannot carry a different set from the sync
+    // wrapper, or forget to carry at all. Missing that here is what #80 was.
+    let outcome = tauri::async_runtime::spawn_blocking(move || {
+        crate::catalog::copy_with_companions(&source, &dest, None)
     })
     .await
     .map_err(|e| e.to_string())?
     .map_err(|e| e.to_string())?;
     with_catalog(state, |c| {
-        c.record_backup(photo_id, volume_id, &rel, &hash)?;
-        c.record_companions_at(
-            photo_id,
-            volume_id,
-            crate::catalog::LocationRole::Backup,
-            &carry.carried,
-        )
+        c.record_copy(photo_id, volume_id, &rel, crate::catalog::LocationRole::Backup, &outcome)
     })
 }
 
@@ -421,13 +407,18 @@ async fn do_restore(state: &State<'_, AppState>, photo_id: i64, local_id: i64) -
         let p = c.plan_restore(photo_id, local_id)?;
         Ok((p.source, p.dest, p.rel, p.volume_id, p.expected_hash))
     })?;
-    let hash = tauri::async_runtime::spawn_blocking(move || {
-        crate::catalog::copy_and_verify(&source, &dest, expected_hash.as_deref())
+    // Companions come back with the image: a restored photo must arrive with the edit state
+    // an offload moved home, not as bare pixels. This path had drifted from the sync
+    // wrapper and did exactly that until the shared seam made it impossible.
+    let outcome = tauri::async_runtime::spawn_blocking(move || {
+        crate::catalog::copy_with_companions(&source, &dest, expected_hash.as_deref())
     })
     .await
     .map_err(|e| e.to_string())?
     .map_err(|e| e.to_string())?;
-    with_catalog(state, |c| c.record_restore(photo_id, volume_id, &rel, &hash))
+    with_catalog(state, |c| {
+        c.record_copy(photo_id, volume_id, &rel, crate::catalog::LocationRole::LocalCache, &outcome)
+    })
 }
 
 /// Back up a photo to the single backup volume. If the NAS is offline this errors;

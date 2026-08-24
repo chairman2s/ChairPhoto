@@ -75,8 +75,8 @@ pub struct BurstNeighbourhood {
 /// capture time (the engine gives those their own single-photo cluster, so there is no
 /// burst to explain) or is not one of the photos the grid lists.
 ///
-/// Considers the same photos the grid lists — present, and not stacked under another
-/// photo. A camera JPEG sitting under its RAW shares that RAW's capture time and very
+/// Considers the same photos the grid lists — visible (present, not trashed) and not
+/// stacked under another photo. A camera JPEG sitting under its RAW shares that RAW's capture time and very
 /// nearly its hash; counting it would inflate every burst and could crown the derivative
 /// over its own original.
 pub fn burst_neighbourhood(
@@ -86,7 +86,10 @@ pub fn burst_neighbourhood(
 ) -> Result<Option<BurstNeighbourhood>> {
     let capture: Option<String> = conn
         .query_row(
-            "SELECT capture_time FROM photos WHERE id = ?1",
+            "-- includes-hidden: a by-id read of the subject's own capture time, before
+             -- the window is built. A hidden subject still falls out below, because
+             -- it will not appear in its own neighbourhood.
+             SELECT capture_time FROM photos WHERE id = ?1",
             params![photo_id],
             |r| r.get::<_, Option<String>>(0),
         )
@@ -164,8 +167,8 @@ fn window_side(
     };
     let sql = format!(
         "SELECT id, path, capture_time, phash, rating, sharpness, sharpness_method, burst_flag
-         FROM photos
-         WHERE capture_time BETWEEN ?1 AND ?2 AND missing = 0 AND stack_parent_id IS NULL
+         FROM photos_visible
+         WHERE capture_time BETWEEN ?1 AND ?2 AND stack_parent_id IS NULL
          ORDER BY {order} LIMIT ?3"
     );
     let mut stmt = conn.prepare(&sql)?;
@@ -228,7 +231,7 @@ pub struct StackCandidate {
 /// The photos among `photo_ids` that can be proposed for stacking, and how many were
 /// dropped because they are already stacked under something.
 ///
-/// Only top-level, present photos are candidates. A photo that is already a stack child is
+/// Only top-level photos the grid lists are candidates. A photo that is already a stack child is
 /// not shown in the grid and is already grouped; proposing to re-group it would silently
 /// move it out of the stack its owner put it in — most often the camera JPEG that
 /// `pair_raw_jpeg_stacks` paired with its RAW.
@@ -248,8 +251,12 @@ pub fn stack_candidates(
         let sql = format!(
             "SELECT id, path, capture_time, phash, rating, sharpness, burst_flag,
                     stack_parent_id,
-                    (SELECT COUNT(*) FROM photos c WHERE c.stack_parent_id = p.id)
-             FROM photos p WHERE id IN ({placeholders}) AND missing = 0 ORDER BY id"
+                    -- includes-hidden: the frames already stacked under this one, counted
+                    -- so a proposal can disclose what accepting it would re-home. A
+                    -- trashed frame is not re-homed, so it does not count here either.
+                    (SELECT COUNT(*) FROM photos c
+                     WHERE c.stack_parent_id = p.id AND c.trashed_at IS NULL)
+             FROM photos_visible p WHERE id IN ({placeholders}) ORDER BY id"
         );
         let params: Vec<&dyn rusqlite::ToSql> =
             chunk.iter().map(|id| id as &dyn rusqlite::ToSql).collect();

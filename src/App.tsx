@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { confirm } from "@tauri-apps/plugin-dialog";
 import {
   analyzeBurstSharpness,
+  trashPhotos,
   applyAutoTags,
   assignTag,
   cacheImages,
@@ -109,6 +110,7 @@ import { BundleExportDialog } from "./components/BundleExportDialog";
 import { BundleImportDialog } from "./components/BundleImportDialog";
 import { StackProposalsDialog } from "./components/StackProposalsDialog";
 import { CullSession } from "./components/CullSession";
+import { TrashDialog } from "./components/TrashDialog";
 import { CatalogSwitcher } from "./components/CatalogSwitcher";
 import { EditorView } from "./components/EditorView";
 import { parseEdit } from "./modules/editing";
@@ -284,6 +286,7 @@ export default function App() {
   const closeModalAction = useCallback(() => setModalAction(null), []);
   // Right-click context menu on a grid tile.
   const [ctxMenu, setCtxMenu] = useState<{ x: number; y: number; photoId: number } | null>(null);
+  const [showTrash, setShowTrash] = useState(false);
 
   // Full-surface views contributed by modules (e.g. Map). The active one, if its
   // module is still enabled — otherwise we fall back to the built-in Library view.
@@ -1345,6 +1348,14 @@ export default function App() {
         </button>
         <button
           className="btn-ghost"
+          onClick={() => setShowTrash(true)}
+          disabled={!ready}
+          title="Photos you have hidden. Nothing there has been deleted — restoring is one click."
+        >
+          Trash
+        </button>
+        <button
+          className="btn-ghost"
           onClick={runBurstAnalysis}
           disabled={!ready}
           title={
@@ -1882,6 +1893,15 @@ export default function App() {
         />
       )}
 
+      {showTrash && (
+        <TrashDialog
+          onClose={() => setShowTrash(false)}
+          onChanged={() => {
+            refresh();
+            refreshPending();
+          }}
+        />
+      )}
       {showPublish && <PublishDialog onClose={() => setShowPublish(false)} />}
 
       {bundleExportBatch && (
@@ -1957,6 +1977,25 @@ export default function App() {
                 <span className="ctx-header-name" title={photoName(id)}>{photoName(id)}</span>
                 {st && <span className="ctx-header-status">{storageLabel(st)}</span>}
               </div>
+              <button
+                className="ctx-item"
+                title="Hide it everywhere, reversibly. Nothing is deleted and nothing is written to disk."
+                onClick={() => {
+                  close();
+                  // The selection if this photo is part of one, else just this photo —
+                  // right-clicking a tile outside the selection is about that tile.
+                  const ids = selection.ids.includes(id) ? selection.ids : [id];
+                  trashPhotos(ids)
+                    .then((s) => {
+                      const extra = s.cascaded ? ` (+${s.cascaded} stacked)` : "";
+                      setStatus(`Moved ${s.trashed} to the trash${extra}.`);
+                      refresh();
+                    })
+                    .catch((e) => setStatus(`Could not trash: ${e}`));
+                }}
+              >
+                Move to trash
+              </button>
               <button
                 className="ctx-item"
                 onClick={() => {

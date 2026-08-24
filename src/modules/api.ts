@@ -1629,3 +1629,64 @@ export const librarySafetySummary = () => invoke<SafetySummary>("library_safety_
 /** One photo's safety bucket. */
 export const photoSafetyStatus = (photoId: number) =>
   invoke<SafetyStatus>("photo_safety_status", { photoId });
+
+// ── Trash (cluster B, B2) ─────────────────────────────────────────────────────
+
+/** What one trash call did. */
+export interface TrashSummary {
+  /** Photos you named that were not already in the trash. */
+  trashed: number;
+  /** Stack frames hidden along with a master you named. */
+  cascaded: number;
+  /** Photos you named that were already in the trash. */
+  already: number;
+}
+
+/** What emptying the trash did — and what it refused to do. */
+export interface EmptyTrashReport {
+  /** Photos destroyed: every copy deleted, then the catalog row. */
+  deleted: number;
+  /** Files removed — images and their declared companions. */
+  filesDeleted: number;
+  /**
+   * Photos left alone because a volume holding a copy could not be reached. Deleting them
+   * would have destroyed the copies we can see and left an unreferenced survivor.
+   */
+  skippedUnreachable: number[];
+}
+
+/**
+ * Move photos to the trash. Reversible, touches no bytes, and takes each photo's stack
+ * with it — otherwise trashing a master would leave its frames unreachable from every
+ * surface at once.
+ *
+ * Catalog-local, like rating and colour label: trashing here tells no other device
+ * anything.
+ */
+export const trashPhotos = (photoIds: number[]) =>
+  invoke<TrashSummary>("trash_photos", { photoIds });
+
+/** Bring photos back, along with whatever was trashed in the same act. */
+export const restorePhotos = (photoIds: number[]) =>
+  invoke<number>("restore_photos", { photoIds });
+
+/** Everything in the trash, most recently trashed first. */
+export const listTrash = () => invoke<Photo[]>("list_trash");
+
+/**
+ * Destroy trashed photos — the only path in the app that deletes an original.
+ *
+ * Refuses without `confirm`, and refuses per photo unless *every* known copy is reachable:
+ * deleting what we can see while a disconnected disk still holds a copy would leave an
+ * unreferenced survivor. Those photos come back in `skippedUnreachable`.
+ */
+export const emptyTrash = (opts: {
+  photoIds?: number[];
+  olderThanDays?: number;
+  confirm: boolean;
+}) =>
+  invoke<EmptyTrashReport>("empty_trash", {
+    photoIds: opts.photoIds ?? null,
+    olderThanDays: opts.olderThanDays ?? null,
+    confirm: opts.confirm,
+  });

@@ -28,6 +28,7 @@ mod stats;
 mod tag_path;
 pub mod tag_maintenance;
 mod terms;
+mod trash;
 mod visibility;
 
 #[cfg(test)]
@@ -54,6 +55,7 @@ pub use models::{
 pub use query::{CullingFilter, PhotoPage, PhotoQuery, PhotoSort, PhotoWindow, StorageTier};
 pub use smart_albums::rule_to_sql;
 pub use reconcile::DrainSummary;
+pub use trash::TrashSummary;
 pub use safety::{SafetyStatus, SafetySummary};
 
 use rusqlite::{params, Connection, ErrorCode, OptionalExtension, Row};
@@ -265,6 +267,8 @@ impl Catalog {
             .execute_batch("DROP INDEX IF EXISTS idx_photo_metadata_lookup;")?;
         // Verified-hash on locations for the backup/offload lifecycle (schema v10).
         self.ensure_column("photo_locations", "verified_hash", "TEXT")?;
+        // Trash (cluster B, B2). Must precede the view below, which selects on it.
+        self.ensure_column("photos", "trashed_at", "INTEGER")?;
         // The user-visible photo view: everything that lists or counts photos for the
         // user reads this, so the visibility rule lives in one place instead of being
         // re-spelled per call site. Dropped and recreated on every open rather than
@@ -272,7 +276,8 @@ impl Catalog {
         // and a view left at an older definition would silently apply an older rule.
         self.conn.execute_batch(
             "DROP VIEW IF EXISTS photos_visible;
-             CREATE VIEW photos_visible AS SELECT * FROM photos WHERE missing = 0;",
+             CREATE VIEW photos_visible AS
+                 SELECT * FROM photos WHERE missing = 0 AND trashed_at IS NULL;",
         )?;
         // Companions carried alongside the image at a location (cluster B). A copy is the
         // image plus its declared companions; before this, backup carried only the image

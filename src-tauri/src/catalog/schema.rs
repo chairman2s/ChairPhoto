@@ -49,6 +49,11 @@ CREATE TABLE IF NOT EXISTS photos (
     -- applied ON TOP of the file's EXIF orientation when rendering. The original is never
     -- rewritten; survives rescans. See protocol.rs (render) and commands::rotate_photo.
     user_rotation          INTEGER NOT NULL DEFAULT 0,
+    -- Trash: when the user hid this photo, or NULL. A timestamp rather than a boolean so
+    -- the trash view can order by it, "empty trash older than N days" is expressible, and
+    -- restoring a stack can find the frames that were trashed *together* (cluster B, D8).
+    -- Catalog-local, like every other mutable per-photo state — see CONTEXT.md.
+    trashed_at             INTEGER,
     -- RAW+JPEG stacking: a derivative (e.g. the camera JPEG) points at its master photo
     -- (the RAW). Children are hidden from the main grid and grouped under the master.
     -- ON DELETE SET NULL so removing the master un-stacks the child (never deletes it).
@@ -316,7 +321,7 @@ CREATE TABLE IF NOT EXISTS photo_edits (
 -- `SELECT *` on purpose: columns are added to `photos` by migration, and the view is
 -- re-resolved on use, so it keeps up without a second column list to maintain.
 DROP VIEW IF EXISTS photos_visible;
-CREATE VIEW photos_visible AS SELECT * FROM photos WHERE missing = 0;
+CREATE VIEW photos_visible AS SELECT * FROM photos WHERE missing = 0 AND trashed_at IS NULL;
 
 CREATE TABLE IF NOT EXISTS photo_location_companions (
     location_id   INTEGER NOT NULL REFERENCES photo_locations(id) ON DELETE CASCADE,

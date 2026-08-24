@@ -147,10 +147,13 @@ pub(crate) fn photo_columns(alias: &str) -> String {
          {alias}.pick_state, {alias}.capture_time, {alias}.width, {alias}.height,
          {alias}.camera_model, {alias}.lens, {alias}.aperture, {alias}.shutter_speed,
          {alias}.iso, {alias}.external_editors, {alias}.thumbnail_path,
-         -- includes-hidden: the stack badge counts every derivative under this photo,
-         -- including ones the grid would not list on their own. A stack of three
-         -- showing as two because a child is offline is a worse lie than counting it.
-         (SELECT COUNT(*) FROM photos c WHERE c.stack_parent_id = {alias}.id),
+         -- includes-hidden: the stack badge counts derivatives the grid would not list
+         -- on their own. Offline children still count — a stack of three showing as two
+         -- because a disk is unplugged is a worse lie than counting it — but trashed ones
+         -- do not, because that is a decision the user made about this photo rather than
+         -- a fact about a disk.
+         (SELECT COUNT(*) FROM photos c
+          WHERE c.stack_parent_id = {alias}.id AND c.trashed_at IS NULL),
          {alias}.stack_parent_id, {alias}.metadata_ready, {alias}.sharpness,
          {alias}.sharpness_method, {alias}.burst_flag,
          (SELECT COUNT(*) FROM photo_versions pv WHERE pv.photo_id = {alias}.id)"

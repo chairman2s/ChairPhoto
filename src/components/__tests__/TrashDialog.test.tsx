@@ -21,7 +21,7 @@ import type { Photo } from "../../modules/registry";
 const calls: { command: string; args: Record<string, unknown> }[] = [];
 let trash: Photo[] = [];
 let emptyResult: () => Promise<unknown> = () =>
-  Promise.resolve({ deleted: 1, filesDeleted: 2, skippedUnreachable: [] });
+  Promise.resolve({ deleted: 1, filesDeleted: 2, skippedUnreachable: [], failed: [] });
 
 vi.mock("@tauri-apps/api/core", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@tauri-apps/api/core")>();
@@ -67,7 +67,7 @@ const sent = (c: string) => calls.filter((x) => x.command === c);
 beforeEach(() => {
   calls.length = 0;
   trash = [photo(1), photo(2), photo(3)];
-  emptyResult = () => Promise.resolve({ deleted: 1, filesDeleted: 2, skippedUnreachable: [] });
+  emptyResult = () => Promise.resolve({ deleted: 1, filesDeleted: 2, skippedUnreachable: [], failed: [] });
 });
 
 describe("TrashDialog", () => {
@@ -119,7 +119,7 @@ describe("TrashDialog", () => {
 
   it("reports what it refused to delete rather than implying success", async () => {
     emptyResult = () =>
-      Promise.resolve({ deleted: 2, filesDeleted: 4, skippedUnreachable: [7, 8] });
+      Promise.resolve({ deleted: 2, filesDeleted: 4, skippedUnreachable: [7, 8], failed: [] });
     render(<TrashDialog onClose={() => {}} onChanged={vi.fn()} />);
 
     await waitFor(() => expect(screen.getByText(/Delete all permanently/)).toBeTruthy());
@@ -130,6 +130,28 @@ describe("TrashDialog", () => {
     await waitFor(() => expect(text()).toMatch(/2 left alone/));
     expect(text()).toMatch(/could not be reached/);
     expect(text()).toMatch(/Reconnect the disk/);
+  });
+
+  it("shows a partial failure rather than letting it vanish into a count", async () => {
+    // A photo that could not be fully deleted keeps its catalog row on purpose, so the
+    // report has to say which and why — otherwise the user believes it is gone.
+    emptyResult = () =>
+      Promise.resolve({
+        deleted: 1,
+        filesDeleted: 1,
+        skippedUnreachable: [],
+        failed: [[9, "/nas/2026/DSC_0009.ARW could not be removed"]],
+      });
+    render(<TrashDialog onClose={() => {}} onChanged={vi.fn()} />);
+
+    await waitFor(() => expect(screen.getByText(/Delete all permanently/)).toBeTruthy());
+    fireEvent.click(screen.getByText(/Delete all permanently/));
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "delete" } });
+    fireEvent.click(screen.getByText("Delete"));
+
+    await waitFor(() => expect(text()).toMatch(/1 could not be fully deleted/));
+    expect(text()).toContain("DSC_0009.ARW could not be removed");
+    expect(text()).toMatch(/keep their place in the trash so you can retry/);
   });
 
   it("cancelling the confirmation destroys nothing", async () => {

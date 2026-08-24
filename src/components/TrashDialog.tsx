@@ -117,6 +117,19 @@ export function TrashDialog({
                   one behind that nothing points at. Reconnect the disk and try again.
                 </>
               )}
+              {report.failed.length > 0 && (
+                <>
+                  {" "}
+                  <b>{report.failed.length} could not be fully deleted.</b> Those photos
+                  keep their place in the trash so you can retry — a file we could not
+                  remove is recoverable, one with no catalog entry is not.
+                  <ul className="trash-failures">
+                    {report.failed.map(([id, why]) => (
+                      <li key={id}>{why}</li>
+                    ))}
+                  </ul>
+                </>
+              )}
             </div>
           )}
 

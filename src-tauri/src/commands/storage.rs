@@ -121,11 +121,11 @@ pub async fn list_trash(state: State<'_, AppState>) -> Result<Vec<Photo>, String
     with_catalog_blocking(&state, |c| c.list_trash()).await
 }
 
-/// What emptying the trash did — and, as importantly, what it refused to do.
+/// What emptying the trash did — and, as importantly, what it did not.
 #[derive(Debug, Clone, Default, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EmptyTrashReport {
-    /// Photos destroyed: every copy deleted, then the catalog row.
+    /// Photos destroyed: every expected file confirmed gone, then the catalog row.
     pub deleted: usize,
     /// Files removed — images and their declared companions.
     pub files_deleted: usize,
@@ -133,6 +133,21 @@ pub struct EmptyTrashReport {
     /// them would have destroyed the copies we *can* see while leaving an unreferenced
     /// survivor on a disconnected disk.
     pub skipped_unreachable: Vec<i64>,
+    /// Photos whose deletion failed part-way, with the reason. Their catalog rows are
+    /// **kept**: a row pointing at a file we could not remove is recoverable, whereas a
+    /// file with no row is an orphan nothing in the app can ever find again.
+    pub failed: Vec<(i64, String)>,
+}
+
+/// What became of one photo's copies.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum DeleteOutcome {
+    /// Every expected file is confirmed absent. Safe to forget the row.
+    Destroyed,
+    /// A volume holding a copy could not be reached; nothing was touched.
+    Unreachable,
+    /// Something survived. The message names the first path still present.
+    Failed(String),
 }
 
 /// Destroy trashed photos: the only path in the app that deletes an original.
@@ -191,9 +206,21 @@ pub async fn empty_trash(
         // 2. Off the lock: reachability, then the deletes themselves. Both can block on a
         //    slow mount and neither may hold the catalog.
         let reachable = health.refresh(&pairs);
-        let (mut report, destroyed) = delete_trashed_copies(plans, &reachable);
+        let mut report = EmptyTrashReport::default();
+        let mut destroyed: Vec<i64> = Vec::new();
+        for (id, locations) in &plans {
+            let (outcome, files) = delete_one_photos_copies(locations, &reachable);
+            report.files_deleted += files;
+            match outcome {
+                DeleteOutcome::Destroyed => destroyed.push(*id),
+                DeleteOutcome::Unreachable => report.skipped_unreachable.push(*id),
+                DeleteOutcome::Failed(why) => report.failed.push((*id, why)),
+            }
+        }
 
-        // 3. Back under the lock: forget the rows whose files are gone.
+        // 3. Back under the lock: forget only the rows whose files are confirmed gone. A
+        //    photo that failed keeps its row, so the trash can still find it and the user
+        //    can retry — the alternative is a file on disk that nothing points at.
         let guard = catalog.lock().map_err(|e| e.to_string())?;
         let c = guard.as_ref().ok_or("No catalog is open")?;
         for id in destroyed {
@@ -213,39 +240,58 @@ pub async fn empty_trash(
 /// IO — no catalog lock — so it runs on the blocking worker like the rest of the lifecycle.
 ///
 /// Returns the report and the ids whose files are now gone, for the caller to forget.
-pub(crate) fn delete_trashed_copies(
-    plans: Vec<(i64, Vec<crate::catalog::PathCandidate>)>,
+pub(crate) fn delete_one_photos_copies(
+    locations: &[crate::catalog::PathCandidate],
     reachable: &std::collections::HashMap<i64, bool>,
-) -> (EmptyTrashReport, Vec<i64>) {
-    let mut report = EmptyTrashReport::default();
-    let mut destroyed = Vec::new();
-    for (id, locations) in plans {
-        // Every known copy, not just the one at home: deleting what we can see while a
-        // disconnected disk still holds one would leave an unreferenced survivor.
-        let all_reachable = locations.iter().all(|cand| {
-            cand.volume_id
-                .map(|v| reachable.get(&v).copied().unwrap_or(false))
-                .unwrap_or(true)
-        });
-        if !all_reachable {
-            report.skipped_unreachable.push(id);
-            continue;
-        }
-        for cand in &locations {
-            // Companions first: if a delete fails part-way, the image is still there to
-            // say what the leftovers belonged to.
-            for found in crate::companions::carried_beside(&cand.path) {
-                if std::fs::remove_file(&found.path).is_ok() {
-                    report.files_deleted += 1;
-                }
-            }
-            if cand.path.exists() && std::fs::remove_file(&cand.path).is_ok() {
-                report.files_deleted += 1;
-            }
-        }
-        destroyed.push(id);
+) -> (DeleteOutcome, usize) {
+    // Every known copy, not just the one at home: deleting what we can see while a
+    // disconnected disk still holds one would leave an unreferenced survivor.
+    let all_reachable = locations.iter().all(|cand| {
+        cand.volume_id
+            .map(|v| reachable.get(&v).copied().unwrap_or(false))
+            .unwrap_or(true)
+    });
+    if !all_reachable {
+        return (DeleteOutcome::Unreachable, 0);
     }
-    (report, destroyed)
+
+    let mut files_deleted = 0usize;
+    // Collect what we are responsible for *before* deleting, so the survivor check below
+    // is against the full expected set rather than against whatever we happened to reach.
+    let mut expected: Vec<std::path::PathBuf> = Vec::new();
+    for cand in locations {
+        for found in crate::companions::carried_beside(&cand.path) {
+            expected.push(found.path.clone());
+        }
+        if cand.path.exists() {
+            expected.push(cand.path.clone());
+        }
+    }
+
+    for cand in locations {
+        // Companions first: if a delete fails part-way, the image is still there to say
+        // what the leftovers belonged to.
+        for found in crate::companions::carried_beside(&cand.path) {
+            if std::fs::remove_file(&found.path).is_ok() {
+                files_deleted += 1;
+            }
+        }
+        if cand.path.exists() && std::fs::remove_file(&cand.path).is_ok() {
+            files_deleted += 1;
+        }
+    }
+
+    // Success is *confirmed absence*, not "no error was returned". A permission error, a
+    // read-only mount, or a volume that dropped after the reachability probe all leave the
+    // file there — and reporting that photo deleted is how a catalog row disappears while
+    // its original survives with nothing pointing at it.
+    if let Some(survivor) = expected.iter().find(|p| p.exists()) {
+        return (
+            DeleteOutcome::Failed(format!("{} could not be removed", survivor.display())),
+            files_deleted,
+        );
+    }
+    (DeleteOutcome::Destroyed, files_deleted)
 }
 
 fn now_secs() -> i64 {
@@ -1172,10 +1218,19 @@ mod trash_delete_tests {
     use super::*;
     use crate::catalog::{LocationRole, PathCandidate};
     use std::collections::HashMap;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     fn candidate(path: PathBuf, volume_id: i64) -> PathCandidate {
         PathCandidate { path, role: LocationRole::Primary, volume_id: Some(volume_id) }
+    }
+
+    /// Make a directory refuse deletions, so a real IO failure can be forced rather than
+    /// simulated. Unix-only; the assertion it supports is skipped elsewhere.
+    #[cfg(unix)]
+    fn set_readonly(dir: &Path, readonly: bool) {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = if readonly { 0o555 } else { 0o755 };
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode)).unwrap();
     }
 
     /// Every copy goes, and its declared companions with it — otherwise emptying the trash
@@ -1195,19 +1250,16 @@ mod trash_delete_tests {
         // Not a declared companion — must survive, because backup never claimed it either.
         std::fs::write(local.join("DSC1.ARW.txt"), b"notes").unwrap();
 
-        let plans = vec![(
-            7,
-            vec![
-                candidate(local.join("DSC1.ARW"), 1),
-                candidate(nas.join("DSC1.ARW"), 2),
-            ],
-        )];
+        let locations = vec![
+            candidate(local.join("DSC1.ARW"), 1),
+            candidate(nas.join("DSC1.ARW"), 2),
+        ];
         let reachable = HashMap::from([(1, true), (2, true)]);
 
-        let (report, destroyed) = delete_trashed_copies(plans, &reachable);
+        let (outcome, files) = delete_one_photos_copies(&locations, &reachable);
 
-        assert_eq!(destroyed, vec![7]);
-        assert_eq!(report.files_deleted, 5, "2 images + 3 companions");
+        assert_eq!(outcome, DeleteOutcome::Destroyed);
+        assert_eq!(files, 5, "2 images + 3 companions");
         assert!(!local.join("DSC1.ARW").exists());
         assert!(!nas.join("DSC1.ARW").exists());
         assert!(!local.join("DSC1.ARW.rrdata").exists());
@@ -1224,21 +1276,16 @@ mod trash_delete_tests {
         std::fs::create_dir_all(&local).unwrap();
         std::fs::write(local.join("DSC1.ARW"), b"bytes").unwrap();
 
-        let plans = vec![(
-            7,
-            vec![
-                candidate(local.join("DSC1.ARW"), 1),
-                // Volume 2 is an unplugged disk: no path of ours, and unreachable.
-                candidate(dir.join("gone/DSC1.ARW"), 2),
-            ],
-        )];
-        let reachable = HashMap::from([(1, true), (2, false)]);
+        let locations = vec![
+            candidate(local.join("DSC1.ARW"), 1),
+            candidate(dir.join("gone/DSC1.ARW"), 2),
+        ];
 
-        let (report, destroyed) = delete_trashed_copies(plans, &reachable);
+        let (outcome, files) =
+            delete_one_photos_copies(&locations, &HashMap::from([(1, true), (2, false)]));
 
-        assert!(destroyed.is_empty(), "nothing is forgotten");
-        assert_eq!(report.skipped_unreachable, vec![7]);
-        assert_eq!(report.files_deleted, 0);
+        assert_eq!(outcome, DeleteOutcome::Unreachable);
+        assert_eq!(files, 0);
         assert!(local.join("DSC1.ARW").exists(), "the reachable copy is untouched");
     }
 
@@ -1250,12 +1297,12 @@ mod trash_delete_tests {
         std::fs::create_dir_all(dir.join("local")).unwrap();
         std::fs::write(dir.join("local/DSC1.ARW"), b"bytes").unwrap();
 
-        let plans = vec![(7, vec![candidate(dir.join("local/DSC1.ARW"), 99)])];
+        let (outcome, _) = delete_one_photos_copies(
+            &[candidate(dir.join("local/DSC1.ARW"), 1)],
+            &HashMap::new(),
+        );
 
-        let (report, destroyed) = delete_trashed_copies(plans, &HashMap::new());
-
-        assert!(destroyed.is_empty());
-        assert_eq!(report.skipped_unreachable, vec![7]);
+        assert_eq!(outcome, DeleteOutcome::Unreachable);
         assert!(dir.join("local/DSC1.ARW").exists());
     }
 
@@ -1266,10 +1313,86 @@ mod trash_delete_tests {
         let dir = crate::test_support::TestTmpDir::new("empty-trash-absent");
         std::fs::create_dir_all(dir.join("local")).unwrap();
 
-        let plans = vec![(7, vec![candidate(dir.join("local/DSC1.ARW"), 1)])];
-        let (report, destroyed) = delete_trashed_copies(plans, &HashMap::from([(1, true)]));
+        let (outcome, files) = delete_one_photos_copies(
+            &[candidate(dir.join("local/DSC1.ARW"), 1)],
+            &HashMap::from([(1, true)]),
+        );
 
-        assert_eq!(destroyed, vec![7]);
-        assert_eq!(report.files_deleted, 0);
+        assert_eq!(outcome, DeleteOutcome::Destroyed);
+        assert_eq!(files, 0);
+    }
+
+    /// The failure this contract exists for: `remove_file` returns an error, the file is
+    /// still there, and reporting the photo deleted would let its catalog row disappear
+    /// while the original survives with nothing pointing at it.
+    #[cfg(unix)]
+    #[test]
+    fn an_image_that_cannot_be_removed_is_a_failure_not_a_deletion() {
+        let dir = crate::test_support::TestTmpDir::new("empty-trash-readonly");
+        let local = dir.join("local");
+        std::fs::create_dir_all(&local).unwrap();
+        std::fs::write(local.join("DSC1.ARW"), b"bytes").unwrap();
+        set_readonly(&local, true);
+
+        let (outcome, _) = delete_one_photos_copies(
+            &[candidate(local.join("DSC1.ARW"), 1)],
+            &HashMap::from([(1, true)]),
+        );
+
+        set_readonly(&local, false); // so the fixture can clean itself up
+        assert!(
+            matches!(outcome, DeleteOutcome::Failed(ref why) if why.contains("DSC1.ARW")),
+            "expected a named failure, got {outcome:?}"
+        );
+        assert!(local.join("DSC1.ARW").exists(), "and the original is still there");
+    }
+
+    /// A companion that survives is just as much a failure as a surviving image: the point
+    /// of carrying companions is that they are part of the copy.
+    #[cfg(unix)]
+    #[test]
+    fn a_companion_that_cannot_be_removed_is_a_failure_too() {
+        let dir = crate::test_support::TestTmpDir::new("empty-trash-companion-readonly");
+        let local = dir.join("local");
+        let locked = local.join("locked");
+        std::fs::create_dir_all(&locked).unwrap();
+        std::fs::write(locked.join("DSC1.ARW"), b"bytes").unwrap();
+        std::fs::write(locked.join("DSC1.ARW.rrdata"), b"masks").unwrap();
+        set_readonly(&locked, true);
+
+        let (outcome, _) = delete_one_photos_copies(
+            &[candidate(locked.join("DSC1.ARW"), 1)],
+            &HashMap::from([(1, true)]),
+        );
+
+        set_readonly(&locked, false);
+        assert!(matches!(outcome, DeleteOutcome::Failed(_)), "got {outcome:?}");
+        assert!(locked.join("DSC1.ARW.rrdata").exists());
+    }
+
+    /// One copy of several fails. The photo must not be reported destroyed — some copies
+    /// are gone and one is not, which is precisely the state a catalog row is needed for.
+    #[cfg(unix)]
+    #[test]
+    fn a_partial_multi_copy_failure_is_not_a_deletion() {
+        let dir = crate::test_support::TestTmpDir::new("empty-trash-partial");
+        let ok = dir.join("ok");
+        let locked = dir.join("locked");
+        std::fs::create_dir_all(&ok).unwrap();
+        std::fs::create_dir_all(&locked).unwrap();
+        std::fs::write(ok.join("DSC1.ARW"), b"bytes").unwrap();
+        std::fs::write(locked.join("DSC1.ARW"), b"bytes").unwrap();
+        set_readonly(&locked, true);
+
+        let (outcome, files) = delete_one_photos_copies(
+            &[candidate(ok.join("DSC1.ARW"), 1), candidate(locked.join("DSC1.ARW"), 2)],
+            &HashMap::from([(1, true), (2, true)]),
+        );
+
+        set_readonly(&locked, false);
+        assert!(matches!(outcome, DeleteOutcome::Failed(_)), "got {outcome:?}");
+        assert_eq!(files, 1, "the reachable copy really was removed — and is reported");
+        assert!(!ok.join("DSC1.ARW").exists());
+        assert!(locked.join("DSC1.ARW").exists(), "the survivor keeps its catalog row");
     }
 }

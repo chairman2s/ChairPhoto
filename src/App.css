@@ -4031,3 +4031,8 @@ body {
   border-left: 2px solid var(--accent);
   padding-left: 8px;
 }
+.trash-failures {
+  margin: 4px 0 0;
+  padding-left: 18px;
+  color: var(--danger);
+}

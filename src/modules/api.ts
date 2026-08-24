@@ -1653,6 +1653,12 @@ export interface EmptyTrashReport {
    * would have destroyed the copies we can see and left an unreferenced survivor.
    */
   skippedUnreachable: number[];
+  /**
+   * Photos whose deletion failed part-way, with the reason. Their catalog rows are kept —
+   * a row pointing at a file we could not remove is recoverable, a file with no row is an
+   * orphan nothing can find again.
+   */
+  failed: [number, string][];
 }
 
 /**

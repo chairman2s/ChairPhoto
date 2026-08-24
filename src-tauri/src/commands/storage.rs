@@ -36,8 +36,34 @@ async fn do_backup(state: &State<'_, AppState>, photo_id: i64, backup_id: i64) -
     // Idempotent: if a verified backup file already exists, do NOT re-copy it. Re-copying
     // a good backup is pointless and — over a flaky mount — risks destroying it. A missing
     // backup returns false here, so it's still (re-)created below.
+    //
+    // But returning here entirely is what made #80 unfixable for the photos it was about.
+    // Every backup made before companions existed has a verified image and no carried
+    // sidecars, so this branch is *exactly* the affected population — and skipping straight
+    // out meant pressing Back up on them did nothing at all. The image is left alone; the
+    // companions are reconciled, which is idempotent and copies nothing when they are
+    // already there.
     if with_catalog(state, |c| c.has_verified_backup(photo_id))? {
-        return Ok(());
+        let (source, dest, rel, volume_id) = with_catalog(state, |c| {
+            let p = c.plan_backup(photo_id, backup_id)?;
+            Ok((p.source, p.dest, p.rel, p.volume_id))
+        })?;
+        let carried = tauri::async_runtime::spawn_blocking(move || {
+            crate::catalog::carry_companions(&source, &dest)
+        })
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())?;
+        return with_catalog(state, |c| {
+            c.record_companions_at(
+                photo_id,
+                volume_id,
+                crate::catalog::LocationRole::Backup,
+                &carried.carried,
+            )?;
+            let _ = rel;
+            Ok(())
+        });
     }
     let (source, dest, rel, volume_id) = with_catalog(state, |c| {
         let p = c.plan_backup(photo_id, backup_id)?;

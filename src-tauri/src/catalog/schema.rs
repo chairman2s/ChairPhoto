@@ -327,14 +327,19 @@ CREATE TABLE IF NOT EXISTS photo_location_companions (
     location_id   INTEGER NOT NULL REFERENCES photo_locations(id) ON DELETE CASCADE,
     -- File name of the companion at that location (e.g. `DSC1.ARW.xmp`).
     name          TEXT    NOT NULL,
-    -- Source mtime in whole seconds when this companion was carried.
-    carried_mtime INTEGER NOT NULL,
+    -- The source companion's mtime, in whole seconds, when it was carried here.
+    -- **NULL means never carried**: the scanner found this companion beside a local copy
+    -- and there is no copy of it at this location. That is a distinct state from "carried
+    -- and possibly out of date", and collapsing the two is what would let a photo whose
+    -- edit state exists in exactly one place report as safe (cluster B, D5).
+    carried_mtime INTEGER,
     -- The source file's mtime as the scanner last saw it. NULL = not looked at since the
-    -- carry. Greater than `carried_mtime` means the local file has moved on and home is
-    -- holding an older edit — the Stale bucket. Recorded rather than computed on read so
+    -- carry. Newer than `carried_mtime` — or present when `carried_mtime` is NULL — means
+    -- home is missing an edit this machine has. Recorded rather than computed on read so
     -- the safety summary stays pure SQL and an unreachable NAS cannot slow it down.
     source_mtime_seen INTEGER,
-    carried_at    INTEGER NOT NULL,
+    -- When it was carried. NULL alongside a NULL `carried_mtime`.
+    carried_at    INTEGER,
     PRIMARY KEY (location_id, name)
 );
 

@@ -180,18 +180,38 @@ impl Catalog {
     /// Returns how many companion rows were refreshed.
     pub fn note_companion_freshness(&self, photo_id: i64, image: &Path) -> Result<usize> {
         let scanned_volume = self.volume_for_path(image).map(|(id, _)| id).ok();
-        let mut updated = 0usize;
+        // The home locations this companion ought to reach. Resolved first so a companion
+        // that was never carried can still be *recorded* against them — an UPDATE alone
+        // could only refresh evidence that already existed, which left "exists locally,
+        // never carried home" invisible and reporting as safe (cluster B, D5).
+        let mut stmt = self.conn.prepare(
+            "SELECT l.id FROM photo_locations l JOIN volumes v ON v.id = l.volume_id
+             WHERE l.photo_id = ?1 AND v.kind = 'backup' AND l.role IN ('primary','backup')
+               AND (?2 IS NULL OR l.volume_id <> ?2)",
+        )?;
+        let homes: Vec<i64> = stmt
+            .query_map(params![photo_id, scanned_volume], |r| r.get::<_, i64>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(stmt);
+
+        let mut noted = 0usize;
         for found in crate::companions::carried_beside(image) {
             let Ok(mtime) = mtime_secs(&found.path) else { continue };
-            updated += self.conn.execute(
-                "UPDATE photo_location_companions SET source_mtime_seen = ?1
-                 WHERE name = ?2 AND location_id IN (
-                     SELECT id FROM photo_locations
-                     WHERE photo_id = ?3 AND (?4 IS NULL OR volume_id <> ?4))",
-                params![mtime, found.name(), photo_id, scanned_volume],
-            )?;
+            for home in &homes {
+                // Insert leaves `carried_mtime` NULL — this is evidence the companion
+                // exists here, not a claim that anything carried it. A row that *was*
+                // carried keeps its `carried_mtime` and only has its sighting refreshed.
+                self.conn.execute(
+                    "INSERT INTO photo_location_companions(location_id, name, source_mtime_seen)
+                     VALUES(?1, ?2, ?3)
+                     ON CONFLICT(location_id, name)
+                     DO UPDATE SET source_mtime_seen = excluded.source_mtime_seen",
+                    params![home, found.name(), mtime],
+                )?;
+                noted += 1;
+            }
         }
-        Ok(updated)
+        Ok(noted)
     }
 
     /// Record a completed lifecycle copy: the location, its verified hash, and the

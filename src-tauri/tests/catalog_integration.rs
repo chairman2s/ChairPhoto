@@ -963,6 +963,81 @@ fn a_companion_edited_after_the_backup_makes_the_photo_stale() {
     assert_eq!(catalog.library_safety_summary().unwrap().stale, 1);
 }
 
+/// The #80-era shape: a photo whose image was backed up before companions existed, so home
+/// has verified pixels and no sidecar, and the edit state sits in exactly one place.
+///
+/// The catalog has no record of that companion at all — nothing carried it — so a model
+/// that only compares an existing record's timestamps cannot see it, and the photo reports
+/// `Safe` while the work that made it is one disk failure from gone.
+#[test]
+fn an_uncarried_local_companion_is_stale_not_safe() {
+    let (catalog, root) = temp_catalog("uncarried-companion");
+    let nas_dir = root.parent().unwrap().join("nas");
+    std::fs::create_dir_all(&nas_dir).unwrap();
+    let nas = catalog.add_volume("NAS", &nas_dir, VolumeKind::Backup).unwrap();
+
+    let raw = root.join("DSC1.ARW");
+    std::fs::write(&raw, b"bytes").unwrap();
+    let id = catalog.upsert_photo(&raw, None, 1, 5).unwrap().id;
+    catalog.backup_photo(id, nas).unwrap();
+    assert_eq!(catalog.photo_safety_status(id).unwrap(), SafetyStatus::Safe);
+
+    // The edit happens now — after a backup that predates companions entirely. Home has
+    // no copy of it and no record that it should.
+    std::fs::write(root.join("DSC1.ARW.rrdata"), b"masks").unwrap();
+    assert!(
+        catalog.companions_at(id, nas, LocationRole::Backup).unwrap().is_empty(),
+        "nothing has ever been carried for this photo"
+    );
+
+    // A scan notices it. That sighting is the evidence the safety model needs.
+    catalog.note_companion_freshness(id, &raw).unwrap();
+
+    assert_eq!(
+        catalog.photo_safety_status(id).unwrap(),
+        SafetyStatus::Stale,
+        "the pixels are safe at home and this edit is not"
+    );
+    assert_eq!(catalog.library_safety_summary().unwrap().stale, 1);
+
+    // Backing up again reconciles it — the carry is what clears the bucket, and it is
+    // idempotent, so nothing is re-copied for the image.
+    let plan_source = raw.clone();
+    let plan_dest = nas_dir.join("DSC1.ARW");
+    let carried = chairphoto_lib::catalog::carry_companions(&plan_source, &plan_dest).unwrap();
+    catalog
+        .record_companions_at(id, nas, LocationRole::Backup, &carried.carried)
+        .unwrap();
+
+    assert_eq!(
+        std::fs::read(nas_dir.join("DSC1.ARW.rrdata")).unwrap(),
+        b"masks",
+        "and the edit state actually reached home"
+    );
+    assert_eq!(catalog.photo_safety_status(id).unwrap(), SafetyStatus::Safe);
+}
+
+/// A companion carried and left alone is not stale — the sighting matches what was
+/// carried. Without this, every scan would push every photo into the bucket.
+#[test]
+fn a_carried_companion_seen_unchanged_stays_safe() {
+    let (catalog, root) = temp_catalog("carried-unchanged");
+    let nas_dir = root.parent().unwrap().join("nas");
+    std::fs::create_dir_all(&nas_dir).unwrap();
+    let nas = catalog.add_volume("NAS", &nas_dir, VolumeKind::Backup).unwrap();
+
+    let raw = root.join("DSC1.ARW");
+    std::fs::write(&raw, b"bytes").unwrap();
+    std::fs::write(root.join("DSC1.ARW.rrdata"), b"masks").unwrap();
+    let id = catalog.upsert_photo(&raw, None, 1, 5).unwrap().id;
+    catalog.backup_photo(id, nas).unwrap();
+
+    catalog.note_companion_freshness(id, &raw).unwrap();
+
+    assert_eq!(catalog.photo_safety_status(id).unwrap(), SafetyStatus::Safe);
+    assert_eq!(catalog.library_safety_summary().unwrap().stale, 0);
+}
+
 /// A file cannot be evidence that it has diverged from itself. Scanning the NAS copy must
 /// not refresh the note that describes the *local* copy — that would make every carried
 /// companion read as permanently current, which is the failure that hides #80 all over

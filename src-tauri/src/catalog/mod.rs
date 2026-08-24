@@ -282,17 +282,31 @@ impl Catalog {
         // Companions carried alongside the image at a location (cluster B). A copy is the
         // image plus its declared companions; before this, backup carried only the image
         // and left darktable/RapidRAW edit state behind (#80).
+        // A NULL `carried_mtime` means "the scanner found this companion locally and it was
+        // never carried here" — a state the first shape of this table could not express,
+        // because both mtime columns were NOT NULL. The table has never shipped and holds
+        // nothing a scan plus a backup cannot re-derive, so an older shape is replaced
+        // outright rather than migrated in place.
+        let stale_shape: bool = self
+            .conn
+            .prepare("PRAGMA table_info(photo_location_companions)")?
+            .query_map([], |r| Ok((r.get::<_, String>(1)?, r.get::<_, i64>(3)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+            .iter()
+            .any(|(name, notnull)| name == "carried_mtime" && *notnull == 1);
+        if stale_shape {
+            self.conn.execute_batch("DROP TABLE photo_location_companions;")?;
+        }
         self.conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS photo_location_companions (
-                 location_id   INTEGER NOT NULL REFERENCES photo_locations(id) ON DELETE CASCADE,
-                 name          TEXT    NOT NULL,
-                 carried_mtime INTEGER NOT NULL,
-                 carried_at    INTEGER NOT NULL,
+                 location_id       INTEGER NOT NULL REFERENCES photo_locations(id) ON DELETE CASCADE,
+                 name              TEXT    NOT NULL,
+                 carried_mtime     INTEGER,
+                 source_mtime_seen INTEGER,
+                 carried_at        INTEGER,
                  PRIMARY KEY (location_id, name)
              );",
         )?;
-        // Freshness of a carried companion, as of the last scan (cluster B, D5).
-        self.ensure_column("photo_location_companions", "source_mtime_seen", "INTEGER")?;
         // Pixel-derived B&W flag for the monochrome auto-tag (schema v12).
         self.ensure_column("photos", "is_grayscale", "INTEGER")?;
         // Non-destructive user orientation override (degrees clockwise), schema v17.

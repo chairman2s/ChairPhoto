@@ -120,11 +120,18 @@ impl Catalog {
                 GROUP BY l.photo_id
             ),
             stale AS (
+                -- Two ways home can be behind: it holds an older copy of a companion, or
+                -- it holds none at all. `carried_mtime IS NULL` is the second — a companion
+                -- the scanner found beside a local copy that was never carried. Treating
+                -- only the first as stale is what would let a photo whose edit state exists
+                -- in exactly one place report as safe.
                 SELECT DISTINCT l.photo_id AS pid
                 FROM photo_location_companions c
                 JOIN photo_locations l ON l.id = c.location_id
-                WHERE c.source_mtime_seen IS NOT NULL
-                  AND c.source_mtime_seen > c.carried_mtime
+                JOIN volumes v ON v.id = l.volume_id
+                WHERE v.kind = 'backup' AND l.role IN ('primary','backup')
+                  AND c.source_mtime_seen IS NOT NULL
+                  AND (c.carried_mtime IS NULL OR c.source_mtime_seen > c.carried_mtime)
             )
             SELECT
                 SUM(CASE WHEN COALESCE(any_copy, 0) = 0 THEN 1 ELSE 0 END),
@@ -192,8 +199,12 @@ impl Catalog {
                            AND l.role IN ('primary','backup') AND l.verified_hash IS NOT NULL),
                  EXISTS (SELECT 1 FROM photo_location_companions c
                          JOIN photo_locations l ON l.id = c.location_id
-                         WHERE l.photo_id = ?1 AND c.source_mtime_seen IS NOT NULL
-                           AND c.source_mtime_seen > c.carried_mtime)",
+                         JOIN volumes v ON v.id = l.volume_id
+                         WHERE l.photo_id = ?1 AND v.kind = 'backup'
+                           AND l.role IN ('primary','backup')
+                           AND c.source_mtime_seen IS NOT NULL
+                           AND (c.carried_mtime IS NULL
+                                OR c.source_mtime_seen > c.carried_mtime))",
             [photo_id],
             |r| {
                 Ok((

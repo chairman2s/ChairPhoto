@@ -1659,6 +1659,13 @@ export interface EmptyTrashReport {
    * orphan nothing can find again.
    */
   failed: [number, string][];
+  /** Photos restored while this was running. Restore wins that race by design. */
+  restoredMeanwhile: number[];
+  /**
+   * The run stopped early because it stopped being the owner — a catalog switch, or a
+   * restore. What is reported happened; the rest did not.
+   */
+  aborted: boolean;
 }
 
 /**

@@ -117,6 +117,20 @@ export function TrashDialog({
                   one behind that nothing points at. Reconnect the disk and try again.
                 </>
               )}
+              {report.restoredMeanwhile.length > 0 && (
+                <>
+                  {" "}
+                  {report.restoredMeanwhile.length} were restored while this was running and
+                  were left alone.
+                </>
+              )}
+              {report.aborted && (
+                <>
+                  {" "}
+                  <b>Stopped early.</b> Something else took over — a restore, or the library
+                  being switched — so the rest of the trash was not touched.
+                </>
+              )}
               {report.failed.length > 0 && (
                 <>
                   {" "}

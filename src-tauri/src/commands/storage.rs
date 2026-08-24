@@ -5,6 +5,7 @@
 //! "Nothing ever leaves home" is binding here — see `docs/storage-and-import.md`.
 
 use super::*;
+use std::sync::atomic::Ordering;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, State};
@@ -107,11 +108,17 @@ pub async fn trash_photos(
 }
 
 /// Bring photos back, along with whatever was trashed in the same act.
+///
+/// Trips the trash job generation first. An `empty_trash` worker can be part-way through
+/// the filesystem with a plan minutes old; restoring is the user saying "keep this", and
+/// the only safe way to resolve that race is for the delete to stand down. Tripping before
+/// the restore, not after, means the worker cannot slip a deletion in between.
 #[tauri::command]
 pub async fn restore_photos(
     state: State<'_, AppState>,
     photo_ids: Vec<i64>,
 ) -> Result<usize, String> {
+    state.jobs.trash.trip()?;
     with_catalog_blocking(&state, move |c| c.restore_photos(&photo_ids)).await
 }
 
@@ -137,6 +144,11 @@ pub struct EmptyTrashReport {
     /// **kept**: a row pointing at a file we could not remove is recoverable, whereas a
     /// file with no row is an orphan nothing in the app can ever find again.
     pub failed: Vec<(i64, String)>,
+    /// Photos restored while this was running. Restore wins that race by design.
+    pub restored_meanwhile: Vec<i64>,
+    /// The run stopped early because it stopped being the owner — a catalog switch, or a
+    /// restore. Whatever is reported here happened; the rest did not.
+    pub aborted: bool,
 }
 
 /// What became of one photo's copies.
@@ -174,6 +186,12 @@ pub async fn empty_trash(
     if !confirm {
         return Err("emptying the trash needs an explicit confirmation".into());
     }
+    // Own this run through the job protocol before touching anything. A catalog switch
+    // trips every family, so an in-flight delete stops being an owner the moment the
+    // catalog under it is replaced — which is what stops one catalog's photo ids being
+    // applied to another's rows. `restore_photos` trips it too, so a user pulling a photo
+    // back out of the trash wins that race.
+    let abort = state.jobs.trash.install_fresh()?;
     let catalog = state.catalog.clone();
     let health = state.volume_health.clone();
     tauri::async_runtime::spawn_blocking(move || {
@@ -206,17 +224,16 @@ pub async fn empty_trash(
         // 2. Off the lock: reachability, then the deletes themselves. Both can block on a
         //    slow mount and neither may hold the catalog.
         let reachable = health.refresh(&pairs);
-        let mut report = EmptyTrashReport::default();
-        let mut destroyed: Vec<i64> = Vec::new();
-        for (id, locations) in &plans {
-            let (outcome, files) = delete_one_photos_copies(locations, &reachable);
-            report.files_deleted += files;
-            match outcome {
-                DeleteOutcome::Destroyed => destroyed.push(*id),
-                DeleteOutcome::Unreachable => report.skipped_unreachable.push(*id),
-                DeleteOutcome::Failed(why) => report.failed.push((*id, why)),
-            }
-        }
+        let (mut report, destroyed) = destroy_planned_photos(
+            &plans,
+            &reachable,
+            &abort,
+            &mut |id| {
+                let guard = catalog.lock().map_err(|e| e.to_string())?;
+                let c = guard.as_ref().ok_or("No catalog is open")?;
+                c.is_trashed(id).map_err(|e| e.to_string())
+            },
+        )?;
 
         // 3. Back under the lock: forget only the rows whose files are confirmed gone. A
         //    photo that failed keeps its row, so the trash can still find it and the user
@@ -224,6 +241,14 @@ pub async fn empty_trash(
         let guard = catalog.lock().map_err(|e| e.to_string())?;
         let c = guard.as_ref().ok_or("No catalog is open")?;
         for id in destroyed {
+            // Ownership is re-checked here too, not just before the IO: the rows belong to
+            // whichever catalog is installed *now*, and applying an old catalog's ids to a
+            // new one is the failure this whole protocol exists to prevent. The files are
+            // already gone; a rescan reconciles the rows, which is recoverable.
+            if abort.load(Ordering::Relaxed) {
+                report.aborted = true;
+                break;
+            }
             c.remove_photo(id).map_err(|e| e.to_string())?;
             report.deleted += 1;
         }
@@ -240,6 +265,48 @@ pub async fn empty_trash(
 /// IO — no catalog lock — so it runs on the blocking worker like the rest of the lifecycle.
 ///
 /// Returns the report and the ids whose files are now gone, for the caller to forget.
+/// Walk the planned photos, destroying each one's copies — the part of emptying the trash
+/// where ownership actually matters.
+///
+/// Split out because the two interleavings that make this dangerous are otherwise
+/// reachable only through a Tauri `State`, and a race nobody can test is a race nobody has
+/// checked. `still_trashed` is a callback so a test can make a photo come back mid-run the
+/// way Restore does.
+///
+/// Stops at the first sign it is no longer the owner. `abort` is tripped by a catalog
+/// switch (so an old worker cannot apply one catalog's ids to another's rows) and by
+/// Restore (so pulling a photo out of the trash beats a delete already in flight).
+pub(crate) fn destroy_planned_photos(
+    plans: &[(i64, Vec<crate::catalog::PathCandidate>)],
+    reachable: &std::collections::HashMap<i64, bool>,
+    abort: &std::sync::atomic::AtomicBool,
+    still_trashed: &mut dyn FnMut(i64) -> Result<bool, String>,
+) -> Result<(EmptyTrashReport, Vec<i64>), String> {
+    let mut report = EmptyTrashReport::default();
+    let mut destroyed: Vec<i64> = Vec::new();
+    for (id, locations) in plans {
+        if abort.load(Ordering::Relaxed) {
+            report.aborted = true;
+            break;
+        }
+        // Re-read trash membership immediately before deleting *this* photo, not once for
+        // the batch at plan time: the plan can be minutes old over a slow mount, and
+        // Restore clears `trashed_at` underneath it.
+        if !still_trashed(*id)? {
+            report.restored_meanwhile.push(*id);
+            continue;
+        }
+        let (outcome, files) = delete_one_photos_copies(locations, reachable);
+        report.files_deleted += files;
+        match outcome {
+            DeleteOutcome::Destroyed => destroyed.push(*id),
+            DeleteOutcome::Unreachable => report.skipped_unreachable.push(*id),
+            DeleteOutcome::Failed(why) => report.failed.push((*id, why)),
+        }
+    }
+    Ok((report, destroyed))
+}
+
 pub(crate) fn delete_one_photos_copies(
     locations: &[crate::catalog::PathCandidate],
     reachable: &std::collections::HashMap<i64, bool>,
@@ -1231,6 +1298,90 @@ mod trash_delete_tests {
         use std::os::unix::fs::PermissionsExt;
         let mode = if readonly { 0o555 } else { 0o755 };
         std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    use std::sync::atomic::AtomicBool;
+
+    /// One trashed photo with a real file, so a delete has something to destroy.
+    fn planned(dir: &Path, id: i64) -> (i64, Vec<PathCandidate>) {
+        let p = dir.join(format!("DSC{id}.ARW"));
+        std::fs::write(&p, b"bytes").unwrap();
+        (id, vec![candidate(p, 1)])
+    }
+
+    /// Restore must beat a delete already walking the filesystem. The plan is made once and
+    /// can be minutes old over a slow mount; a photo the user pulled back out of the trash
+    /// in the meantime must survive, files and row alike.
+    #[test]
+    fn a_photo_restored_mid_run_is_not_destroyed() {
+        let dir = crate::test_support::TestTmpDir::new("empty-trash-restored");
+        std::fs::create_dir_all(&*dir).unwrap();
+        let plans = vec![planned(&dir, 1), planned(&dir, 2), planned(&dir, 3)];
+        let reachable = HashMap::from([(1, true)]);
+        let abort = AtomicBool::new(false);
+
+        // Photo 2 comes back out of the trash while the run is in progress.
+        let mut still_trashed = |id: i64| Ok(id != 2);
+
+        let (report, destroyed) =
+            destroy_planned_photos(&plans, &reachable, &abort, &mut still_trashed).unwrap();
+
+        assert_eq!(destroyed, vec![1, 3]);
+        assert_eq!(report.restored_meanwhile, vec![2], "and it is reported, not silent");
+        assert!(dir.join("DSC2.ARW").exists(), "the restored photo keeps its file");
+        assert!(!dir.join("DSC1.ARW").exists());
+    }
+
+    /// A catalog switch trips every job family, including this one. The worker must stop
+    /// touching files the moment it stops being the owner — continuing would delete the old
+    /// catalog's files and then apply its numeric ids to the new catalog's rows.
+    #[test]
+    fn a_worker_that_loses_ownership_stops_deleting() {
+        let dir = crate::test_support::TestTmpDir::new("empty-trash-switch");
+        std::fs::create_dir_all(&*dir).unwrap();
+        let plans = vec![planned(&dir, 1), planned(&dir, 2), planned(&dir, 3)];
+        let reachable = HashMap::from([(1, true)]);
+        let abort = AtomicBool::new(false);
+
+        // Ownership is lost after the first photo — as a catalog switch would do.
+        let mut seen = 0;
+        let mut still_trashed = |_id: i64| {
+            seen += 1;
+            if seen == 1 {
+                abort.store(true, Ordering::Relaxed);
+            }
+            Ok(true)
+        };
+
+        let (report, destroyed) =
+            destroy_planned_photos(&plans, &reachable, &abort, &mut still_trashed).unwrap();
+
+        assert!(report.aborted, "the run says it stopped early");
+        assert_eq!(destroyed, vec![1], "only the photo already in flight");
+        assert!(dir.join("DSC2.ARW").exists(), "nothing after the switch was touched");
+        assert!(dir.join("DSC3.ARW").exists());
+    }
+
+    /// Ownership lost before the first photo means nothing is destroyed at all.
+    #[test]
+    fn a_run_that_never_owned_anything_destroys_nothing() {
+        let dir = crate::test_support::TestTmpDir::new("empty-trash-preempted");
+        std::fs::create_dir_all(&*dir).unwrap();
+        let plans = vec![planned(&dir, 1)];
+        let abort = AtomicBool::new(true);
+
+        let (report, destroyed) = destroy_planned_photos(
+            &plans,
+            &HashMap::from([(1, true)]),
+            &abort,
+            &mut |_| Ok(true),
+        )
+        .unwrap();
+
+        assert!(report.aborted);
+        assert!(destroyed.is_empty());
+        assert_eq!(report.files_deleted, 0);
+        assert!(dir.join("DSC1.ARW").exists());
     }
 
     /// Every copy goes, and its declared companions with it — otherwise emptying the trash

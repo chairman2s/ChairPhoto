@@ -3911,4 +3911,51 @@ body {
 }
 .cull-failure {
   color: var(--danger);
+/* ── Safety panel (cluster B, B1) ─────────────────────────────────────────────
+   A count you can act on: the number, what it means, and the way to see it. */
+.safety-row {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  padding: 8px 0;
+  border-top: 1px solid var(--border);
+}
+.safety-count {
+  min-width: 72px;
+  text-align: right;
+  font-size: 18px;
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+}
+.safety-ok {
+  color: var(--ok);
+}
+.safety-bad {
+  color: var(--danger);
+}
+.safety-mute {
+  color: var(--text-dim);
+}
+.safety-text {
+  flex: 1;
+  min-width: 0;
+}
+.safety-label {
+  font-weight: 500;
+}
+.safety-detail {
+  color: var(--text-mute);
+  font-size: 12px;
+  line-height: 1.45;
+}
+.safety-caveats {
+  margin-top: 12px;
+  padding-top: 10px;
+  border-top: 1px solid var(--border);
+  color: var(--text-mute);
+  font-size: 11px;
+  line-height: 1.5;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
 }

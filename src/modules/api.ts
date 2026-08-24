@@ -285,7 +285,7 @@ export const setLibraryRoot = (path: string) =>
 export const rescanLibrary = () => invoke<ScanResult>("rescan_library");
 
 /** Storage-tier filter for the library: all photos, on-disk only, or NAS-only. */
-export type StorageTier = "all" | "local" | "nas";
+export type StorageTier = "all" | "local" | "nas" | "atRisk" | "stale";
 
 /**
  * Photo sort order.
@@ -1588,3 +1588,44 @@ export const proposeStacks = (photoIds: number[]) =>
  */
 export const applyStackProposal = (keeperId: number, memberIds: number[]) =>
   invoke<StackApplied>("apply_stack_proposal", { keeperId, memberIds });
+
+// ── Safety: would I lose this photo if a disk died? (cluster B, B1) ───────────
+
+/**
+ * Where a photo sits on the safety axis — a *second* axis, separate from
+ * `StorageStatus` ("can I display this now"). Ordered worst to best.
+ */
+export type SafetyStatus = "missing" | "atRisk" | "unverified" | "stale" | "safe";
+
+/** Library-wide safety counts. */
+export interface SafetySummary {
+  /** No copy recorded anywhere. */
+  missing: number;
+  /** No copy at home. */
+  atRisk: number;
+  /** A copy at home that has never been hash-verified. */
+  unverified: number;
+  /** Verified at home, but a companion has moved on locally since it was carried. */
+  stale: number;
+  /** Verified at home, companions carried and current. */
+  safe: number;
+  /** `created_at` of the oldest at-risk photo — how long, not just how many. */
+  oldestAtRisk: number | null;
+  /** Carried companions the scanner has looked at since. Freshness is known only for these. */
+  companionsChecked: number;
+  /** Not looked at since being carried: while this is non-zero, `stale` is a floor. */
+  companionsUnchecked: number;
+}
+
+/**
+ * Library-wide safety counts (cluster B, B1).
+ *
+ * Pure SQL on the backend — it never stats a volume, so an unmounted NAS cannot make this
+ * hang. The flip side is that `stale` is only ever true as of the last scan; see
+ * `companionsUnchecked`.
+ */
+export const librarySafetySummary = () => invoke<SafetySummary>("library_safety_summary");
+
+/** One photo's safety bucket. */
+export const photoSafetyStatus = (photoId: number) =>
+  invoke<SafetyStatus>("photo_safety_status", { photoId });

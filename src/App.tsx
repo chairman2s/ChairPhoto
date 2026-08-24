@@ -1831,6 +1831,12 @@ export default function App() {
 
       {showPrefs && (
         <Preferences
+          onShowStorageTier={(tier) => {
+            // Filter first, then close: the panel's whole promise is that the number it
+            // showed you and the photos you land on are the same set.
+            library.setStorageTier(tier);
+            setShowPrefs(false);
+          }}
           onClose={() => setShowPrefs(false)}
           onLibraryRootChanged={() => {
             refresh();

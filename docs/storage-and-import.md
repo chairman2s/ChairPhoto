@@ -246,6 +246,51 @@ a changed hash means bit rot; companions are mutable by design (darktable rewrit
 every edit, and so does chairphoto on IPTC/GPS/face writes), so hashing them would report
 ordinary work as corruption.
 
+### Safety: a second axis
+
+`StorageStatus` answers *can I display this photo now* and drives the grid badge, so it is
+on the hot path and does not care whether anything was hash-verified. **`SafetyStatus`**
+answers *would I lose it*, is read by one panel, and is deliberately a separate enum rather
+than more variants on the first — overloading one would drag verification onto the grid's
+hot path.
+
+| bucket | meaning |
+|---|---|
+| `Missing` | no copy recorded anywhere |
+| `AtRisk` | no copy at home |
+| `Unverified` | a copy at home, never hash-verified |
+| `Stale` | verified at home, but a companion has moved on locally |
+| `Safe` | verified at home, companions carried and current |
+
+A photo lands in the first bucket it matches. `Stale` exists only because a copy is the
+image *plus* its companions: pixels safe at home with the develop history on one disk is
+not safe, and without the bucket the summary would call issue #80's exact situation `Safe`.
+
+**`AtRisk` is home-possession, not copy count** — see `CONTEXT.md`, which now says so in the
+vocabulary. An `export` copy never counts toward home: it is a one-way hand-off, even when
+the user pointed the export at a backup-kind disk.
+
+**Every query on this axis is pure SQL.** No volume is stat-ed, so an unmounted NAS cannot
+make the panel hang — the same reason `photo_statuses` moved its reachability check off the
+catalog lock. That constraint is what forces freshness to be *recorded* rather than
+measured on read: the scanner notes how each carried companion looks while it is already
+walking that file (`note_companion_freshness`), and the summary reads the note. Only *other*
+copies' rows are refreshed — a file cannot be evidence that it has not diverged from itself.
+
+Two consequences the UI must carry rather than hide:
+
+- **`Stale` is a floor, not a total**, while any carried companion has not been seen since
+  it was carried. The summary reports that count alongside it.
+- **The catalog speaks only for volumes it can see.** Redundancy inside a device, and any
+  off-site backup, are invisible; a photo reported safe is safe as far as this catalog
+  knows, and the panel says exactly that.
+
+The counting query is one grouped pass over `photo_locations`, measured at 0.24 s against a
+165,093-photo catalog versus 0.56 s for four correlated sub-selects per photo. The grid
+filter needs a per-row `EXISTS` instead, so the rule has two spellings; they share what they
+can and a test pins the rest, because a panel that reports one number and then lists a
+different set is worse than either number alone.
+
 ### The key performance principle
 
 **Cull / browse / tag run entirely off the local preview cache** (already built).

@@ -18,9 +18,16 @@ Design docs live in `docs/`.
 - **Dead** — a device the user has permanently declared broken/unrecoverable. A human
   declaration, never inferred from unreachability. Only death of the master justifies
   promoting another device.
-- **At risk** — the state of a photo that exists on exactly one disk (typically a
-  satellite after card ingest, before home holds a verified copy). Priority one of
-  any sync design is shrinking the time a photo spends at risk.
+- **At risk** — the state of a photo with **no copy at home** (typically a satellite
+  after card ingest, before home holds it). Priority one of any sync design is shrinking
+  the time a photo spends at risk.
+
+  Deliberately *not* "exists on exactly one disk". The two are not the same: home holding
+  the only copy is one disk, and is not at risk — home may be redundant, and is backed up
+  by means the catalog cannot see. Counting disks would raise an alarm about photos in no
+  danger, and an alarm that is wrong the first time is one nobody reads again. The price is
+  that ChairPhoto can only ever speak for the volumes it can see, and any surface reporting
+  safety has to say so.
 - **Original** — the camera file (RAW/JPEG) as first ingested. Never modified,
   never leaves home outbound without an explicit user action per operation.
 

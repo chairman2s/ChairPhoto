@@ -95,6 +95,166 @@ async fn do_offload(state: &State<'_, AppState>, photo_id: i64) -> Result<(), St
     })
 }
 
+// ── Trash (cluster B, B2) ────────────────────────────────────────────────────
+
+/// Move photos to the trash, taking each one's stack with it. Touches no bytes.
+#[tauri::command]
+pub async fn trash_photos(
+    state: State<'_, AppState>,
+    photo_ids: Vec<i64>,
+) -> Result<crate::catalog::TrashSummary, String> {
+    with_catalog_blocking(&state, move |c| c.trash_photos(&photo_ids)).await
+}
+
+/// Bring photos back, along with whatever was trashed in the same act.
+#[tauri::command]
+pub async fn restore_photos(
+    state: State<'_, AppState>,
+    photo_ids: Vec<i64>,
+) -> Result<usize, String> {
+    with_catalog_blocking(&state, move |c| c.restore_photos(&photo_ids)).await
+}
+
+/// Everything in the trash, most recently trashed first.
+#[tauri::command]
+pub async fn list_trash(state: State<'_, AppState>) -> Result<Vec<Photo>, String> {
+    with_catalog_blocking(&state, |c| c.list_trash()).await
+}
+
+/// What emptying the trash did — and, as importantly, what it refused to do.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EmptyTrashReport {
+    /// Photos destroyed: every copy deleted, then the catalog row.
+    pub deleted: usize,
+    /// Files removed — images and their declared companions.
+    pub files_deleted: usize,
+    /// Photos left alone because a volume holding a copy could not be reached. Deleting
+    /// them would have destroyed the copies we *can* see while leaving an unreferenced
+    /// survivor on a disconnected disk.
+    pub skipped_unreachable: Vec<i64>,
+}
+
+/// Destroy trashed photos: the only path in the app that deletes an original.
+///
+/// Two gates, both deliberate:
+///
+/// - **`confirm` must be true.** The backend fails closed rather than trusting that a
+///   caller meant it; this is the one verb with no undo.
+/// - **Every known copy must be reachable.** Not just home — deleting the copies we can
+///   see while a disconnected disk still holds one would leave an unreferenced survivor
+///   and a deleted catalog row, which is worse than refusing. This is what replaces
+///   "only on the master": a device that cannot reach a copy cannot destroy it, which is
+///   a stronger guarantee than a role flag and needs nothing to be true about identity.
+///
+/// Companions go with the image (cluster B, D2). Leaving them behind would strand sidecars
+/// at home — the mirror of #80, on the one path where nothing can be recovered afterwards.
+#[tauri::command]
+pub async fn empty_trash(
+    state: State<'_, AppState>,
+    photo_ids: Option<Vec<i64>>,
+    older_than_days: Option<i64>,
+    confirm: bool,
+) -> Result<EmptyTrashReport, String> {
+    if !confirm {
+        return Err("emptying the trash needs an explicit confirmation".into());
+    }
+    let catalog = state.catalog.clone();
+    let health = state.volume_health.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        // 1. Under the lock: which photos, and where every copy of each one lives.
+        let (candidates, plans, pairs) = {
+            let guard = catalog.lock().map_err(|e| e.to_string())?;
+            let c = guard.as_ref().ok_or("No catalog is open")?;
+            let candidates: Vec<i64> = match (photo_ids, older_than_days) {
+                (Some(ids), _) => ids,
+                (None, Some(days)) => {
+                    let cutoff = now_secs() - days.max(0) * 86_400;
+                    c.trashed_before(cutoff).map_err(|e| e.to_string())?
+                }
+                (None, None) => c.trashed_before(i64::MAX).map_err(|e| e.to_string())?,
+            };
+            let mut plans = Vec::new();
+            for &id in &candidates {
+                // Only ever destroys something already in the trash: emptying the trash
+                // must not be a way to delete a photo that was never put there.
+                if !c.is_trashed(id).map_err(|e| e.to_string())? {
+                    continue;
+                }
+                plans.push((id, c.photo_path_candidates(id).map_err(|e| e.to_string())?));
+            }
+            let pairs = grid_status_volume_pairs(c).map_err(|e| e.to_string())?;
+            (candidates.len(), plans, pairs)
+        };
+        let _ = candidates;
+
+        // 2. Off the lock: reachability, then the deletes themselves. Both can block on a
+        //    slow mount and neither may hold the catalog.
+        let reachable = health.refresh(&pairs);
+        let (mut report, destroyed) = delete_trashed_copies(plans, &reachable);
+
+        // 3. Back under the lock: forget the rows whose files are gone.
+        let guard = catalog.lock().map_err(|e| e.to_string())?;
+        let c = guard.as_ref().ok_or("No catalog is open")?;
+        for id in destroyed {
+            c.remove_photo(id).map_err(|e| e.to_string())?;
+            report.deleted += 1;
+        }
+        Ok(report)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Delete every copy of each photo, or none of them.
+///
+/// Split out of the command because this is where the destructive decision is made, and a
+/// decision reachable only through a Tauri `State` is a decision nobody can test. Pure file
+/// IO — no catalog lock — so it runs on the blocking worker like the rest of the lifecycle.
+///
+/// Returns the report and the ids whose files are now gone, for the caller to forget.
+pub(crate) fn delete_trashed_copies(
+    plans: Vec<(i64, Vec<crate::catalog::PathCandidate>)>,
+    reachable: &std::collections::HashMap<i64, bool>,
+) -> (EmptyTrashReport, Vec<i64>) {
+    let mut report = EmptyTrashReport::default();
+    let mut destroyed = Vec::new();
+    for (id, locations) in plans {
+        // Every known copy, not just the one at home: deleting what we can see while a
+        // disconnected disk still holds one would leave an unreferenced survivor.
+        let all_reachable = locations.iter().all(|cand| {
+            cand.volume_id
+                .map(|v| reachable.get(&v).copied().unwrap_or(false))
+                .unwrap_or(true)
+        });
+        if !all_reachable {
+            report.skipped_unreachable.push(id);
+            continue;
+        }
+        for cand in &locations {
+            // Companions first: if a delete fails part-way, the image is still there to
+            // say what the leftovers belonged to.
+            for found in crate::companions::carried_beside(&cand.path) {
+                if std::fs::remove_file(&found.path).is_ok() {
+                    report.files_deleted += 1;
+                }
+            }
+            if cand.path.exists() && std::fs::remove_file(&cand.path).is_ok() {
+                report.files_deleted += 1;
+            }
+        }
+        destroyed.push(id);
+    }
+    (report, destroyed)
+}
+
+fn now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
 /// Library-wide safety counts for the at-risk panel (cluster B, B1).
 ///
 /// Pure SQL — deliberately never stats a volume, so an unmounted NAS cannot make this hang
@@ -1005,4 +1165,111 @@ pub fn get_photo_locations(
     photo_id: i64,
 ) -> Result<Vec<PhotoLocation>, String> {
     with_catalog(&state, |c| c.photo_locations(photo_id))
+}
+
+#[cfg(test)]
+mod trash_delete_tests {
+    use super::*;
+    use crate::catalog::{LocationRole, PathCandidate};
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+
+    fn candidate(path: PathBuf, volume_id: i64) -> PathCandidate {
+        PathCandidate { path, role: LocationRole::Primary, volume_id: Some(volume_id) }
+    }
+
+    /// Every copy goes, and its declared companions with it — otherwise emptying the trash
+    /// strands sidecars on the one path where nothing can be recovered afterwards.
+    #[test]
+    fn deleting_a_photo_takes_every_copy_and_its_companions() {
+        let dir = crate::test_support::TestTmpDir::new("empty-trash");
+        let local = dir.join("local");
+        let nas = dir.join("nas");
+        std::fs::create_dir_all(&local).unwrap();
+        std::fs::create_dir_all(&nas).unwrap();
+        for base in [&local, &nas] {
+            std::fs::write(base.join("DSC1.ARW"), b"bytes").unwrap();
+            std::fs::write(base.join("DSC1.ARW.xmp"), b"history").unwrap();
+        }
+        std::fs::write(local.join("DSC1.ARW.rrdata"), b"masks").unwrap();
+        // Not a declared companion — must survive, because backup never claimed it either.
+        std::fs::write(local.join("DSC1.ARW.txt"), b"notes").unwrap();
+
+        let plans = vec![(
+            7,
+            vec![
+                candidate(local.join("DSC1.ARW"), 1),
+                candidate(nas.join("DSC1.ARW"), 2),
+            ],
+        )];
+        let reachable = HashMap::from([(1, true), (2, true)]);
+
+        let (report, destroyed) = delete_trashed_copies(plans, &reachable);
+
+        assert_eq!(destroyed, vec![7]);
+        assert_eq!(report.files_deleted, 5, "2 images + 3 companions");
+        assert!(!local.join("DSC1.ARW").exists());
+        assert!(!nas.join("DSC1.ARW").exists());
+        assert!(!local.join("DSC1.ARW.rrdata").exists());
+        assert!(local.join("DSC1.ARW.txt").exists(), "an undeclared neighbour is not ours");
+    }
+
+    /// An unreachable copy means refuse, not "delete what we can". Deleting the reachable
+    /// copies would leave an unreferenced survivor on the disconnected disk and a catalog
+    /// row that no longer points at it.
+    #[test]
+    fn one_unreachable_copy_saves_every_copy() {
+        let dir = crate::test_support::TestTmpDir::new("empty-trash-unreachable");
+        let local = dir.join("local");
+        std::fs::create_dir_all(&local).unwrap();
+        std::fs::write(local.join("DSC1.ARW"), b"bytes").unwrap();
+
+        let plans = vec![(
+            7,
+            vec![
+                candidate(local.join("DSC1.ARW"), 1),
+                // Volume 2 is an unplugged disk: no path of ours, and unreachable.
+                candidate(dir.join("gone/DSC1.ARW"), 2),
+            ],
+        )];
+        let reachable = HashMap::from([(1, true), (2, false)]);
+
+        let (report, destroyed) = delete_trashed_copies(plans, &reachable);
+
+        assert!(destroyed.is_empty(), "nothing is forgotten");
+        assert_eq!(report.skipped_unreachable, vec![7]);
+        assert_eq!(report.files_deleted, 0);
+        assert!(local.join("DSC1.ARW").exists(), "the reachable copy is untouched");
+    }
+
+    /// A volume the reachability map has never heard of is unreachable, not assumed fine.
+    /// Failing open here would delete originals on the strength of a missing map entry.
+    #[test]
+    fn an_unknown_volume_counts_as_unreachable() {
+        let dir = crate::test_support::TestTmpDir::new("empty-trash-unknown");
+        std::fs::create_dir_all(dir.join("local")).unwrap();
+        std::fs::write(dir.join("local/DSC1.ARW"), b"bytes").unwrap();
+
+        let plans = vec![(7, vec![candidate(dir.join("local/DSC1.ARW"), 99)])];
+
+        let (report, destroyed) = delete_trashed_copies(plans, &HashMap::new());
+
+        assert!(destroyed.is_empty());
+        assert_eq!(report.skipped_unreachable, vec![7]);
+        assert!(dir.join("local/DSC1.ARW").exists());
+    }
+
+    /// A copy already gone from disk is not an obstacle — the goal is "no copies left",
+    /// and one that has already been removed satisfies it.
+    #[test]
+    fn a_copy_whose_file_is_already_gone_does_not_block_the_delete() {
+        let dir = crate::test_support::TestTmpDir::new("empty-trash-absent");
+        std::fs::create_dir_all(dir.join("local")).unwrap();
+
+        let plans = vec![(7, vec![candidate(dir.join("local/DSC1.ARW"), 1)])];
+        let (report, destroyed) = delete_trashed_copies(plans, &HashMap::from([(1, true)]));
+
+        assert_eq!(destroyed, vec![7]);
+        assert_eq!(report.files_deleted, 0);
+    }
 }

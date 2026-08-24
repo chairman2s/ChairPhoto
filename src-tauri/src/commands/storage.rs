@@ -95,6 +95,28 @@ async fn do_offload(state: &State<'_, AppState>, photo_id: i64) -> Result<(), St
     })
 }
 
+/// Library-wide safety counts for the at-risk panel (cluster B, B1).
+///
+/// Pure SQL — deliberately never stats a volume, so an unmounted NAS cannot make this hang
+/// or fail. That is also why freshness is recorded by the scanner rather than measured
+/// here, and why `companionsUnchecked` matters: the `stale` count is a floor while it is
+/// non-zero, and the panel has to say so rather than implying it is a total.
+#[tauri::command]
+pub async fn library_safety_summary(
+    state: State<'_, AppState>,
+) -> Result<crate::catalog::SafetySummary, String> {
+    with_catalog_blocking(&state, |c| c.library_safety_summary()).await
+}
+
+/// One photo's safety bucket, for the inspector.
+#[tauri::command]
+pub async fn photo_safety_status(
+    state: State<'_, AppState>,
+    photo_id: i64,
+) -> Result<crate::catalog::SafetyStatus, String> {
+    with_catalog_blocking(&state, move |c| c.photo_safety_status(photo_id)).await
+}
+
 /// Setting key for the age-based offload policy ("keep last N days on local disk").
 /// Empty / "0" = disabled (no automatic offload).
 const OFFLOAD_AGE_SETTING: &str = "offload_age_days";

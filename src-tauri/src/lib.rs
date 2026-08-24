@@ -350,6 +350,8 @@ pub fn run() {
             commands::vacuum_catalog,
             commands::video_server_port,
             commands::apply_offload_policy,
+            commands::library_safety_summary,
+            commands::photo_safety_status,
             commands::scan_nas_folder_cmd,
             commands::list_pending_operations,
             commands::enqueue_operation,

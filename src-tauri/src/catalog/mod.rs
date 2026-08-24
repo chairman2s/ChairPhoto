@@ -17,6 +17,7 @@ mod identity;
 mod lifecycle;
 mod merge;
 mod reconcile;
+mod safety;
 pub mod locations;
 mod models;
 mod publications;
@@ -53,6 +54,7 @@ pub use models::{
 pub use query::{CullingFilter, PhotoPage, PhotoQuery, PhotoSort, PhotoWindow, StorageTier};
 pub use smart_albums::rule_to_sql;
 pub use reconcile::DrainSummary;
+pub use safety::{SafetyStatus, SafetySummary};
 
 use rusqlite::{params, Connection, ErrorCode, OptionalExtension, Row};
 use std::cell::Cell;
@@ -284,6 +286,8 @@ impl Catalog {
                  PRIMARY KEY (location_id, name)
              );",
         )?;
+        // Freshness of a carried companion, as of the last scan (cluster B, D5).
+        self.ensure_column("photo_location_companions", "source_mtime_seen", "INTEGER")?;
         // Pixel-derived B&W flag for the monochrome auto-tag (schema v12).
         self.ensure_column("photos", "is_grayscale", "INTEGER")?;
         // Non-destructive user orientation override (degrees clockwise), schema v17.

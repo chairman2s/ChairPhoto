@@ -119,6 +119,11 @@ pub enum StorageTier {
     Local,
     /// Offloaded: no local copy, but a backup exists.
     Nas,
+    /// No copy at home — the panel's "show me" for the at-risk count.
+    AtRisk,
+    /// A companion has moved on locally since it was carried home, so home holds an
+    /// older edit than this machine does.
+    Stale,
 }
 
 /// Sort order for the library view.
@@ -333,6 +338,20 @@ impl Catalog {
                    WHERE l.photo_id = p.id AND v.kind = 'local') \
                  AND EXISTS (SELECT 1 FROM photo_locations l JOIN volumes v ON v.id = l.volume_id \
                    WHERE l.photo_id = p.id AND v.kind = 'backup')"
+                    .into(),
+            ),
+            // The safety axis, shared with `library_safety_summary` through the same
+            // fragments so the panel's count and the list it shows you cannot disagree.
+            StorageTier::AtRisk => wheres.push(format!(
+                "{any} AND NOT {home}",
+                any = super::safety::ANY_COPY_EXISTS,
+                home = super::safety::HOME_COPY_EXISTS,
+            )),
+            StorageTier::Stale => wheres.push(
+                "EXISTS (SELECT 1 FROM photo_location_companions c \
+                   JOIN photo_locations l ON l.id = c.location_id \
+                   WHERE l.photo_id = p.id AND c.source_mtime_seen IS NOT NULL \
+                     AND c.source_mtime_seen > c.carried_mtime)"
                     .into(),
             ),
         }

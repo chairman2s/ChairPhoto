@@ -324,6 +324,11 @@ CREATE TABLE IF NOT EXISTS photo_location_companions (
     name          TEXT    NOT NULL,
     -- Source mtime in whole seconds when this companion was carried.
     carried_mtime INTEGER NOT NULL,
+    -- The source file's mtime as the scanner last saw it. NULL = not looked at since the
+    -- carry. Greater than `carried_mtime` means the local file has moved on and home is
+    -- holding an older edit — the Stale bucket. Recorded rather than computed on read so
+    -- the safety summary stays pure SQL and an unreachable NAS cannot slow it down.
+    source_mtime_seen INTEGER,
     carried_at    INTEGER NOT NULL,
     PRIMARY KEY (location_id, name)
 );

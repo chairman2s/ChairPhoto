@@ -89,6 +89,7 @@ describe("SafetySection", () => {
 
     await waitFor(() => expect(text()).toMatch(/Show me. filters the grid/));
     expect(text()).toMatch(/use Back up in the toolbar to queue them/);
+    expect(text()).toMatch(/Ctrl\+A takes the lot/, );
     expect(text()).toMatch(/copy when the NAS is reachable/);
   });
 

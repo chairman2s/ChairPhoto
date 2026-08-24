@@ -130,9 +130,10 @@ export function SafetySection({
 
           {(summary.atRisk > 0 || summary.stale > 0) && onShowTier && (
             <div className="safety-next">
-              “Show me” filters the grid to that bucket. Select there and use{" "}
-              <b>Back up</b> in the toolbar to queue them — they copy when the NAS is
-              reachable, and the topbar badge tracks what is still waiting.
+              “Show me” filters the grid to that bucket. Select there — <kbd>Ctrl</kbd>+
+              <kbd>A</kbd> takes the lot — and use <b>Back up</b> in the toolbar to queue
+              them. They copy when the NAS is reachable, and the topbar badge tracks what
+              is still waiting.
             </div>
           )}
 

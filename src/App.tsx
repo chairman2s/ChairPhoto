@@ -836,9 +836,13 @@ export default function App() {
   // same pending-operations queue the per-photo action uses — so the topbar badge and the
   // reconcile drain report it, and an offline NAS defers rather than fails.
   const backUpSelection = async () => {
-    const targets = selection.ids.length ? selection.ids : photos.map((p) => p.id);
+    // Requires an explicit selection, unlike the analyse/propose actions that fall back to
+    // the whole view. Those read; this one commits the library to copying every byte it
+    // names — on the owner's catalog an empty-selection fallback would silently queue
+    // 165,093 photos. It is additive and safe, and still not a thing to start by accident.
+    const targets = selection.ids;
     if (targets.length === 0) {
-      setStatus("Nothing selected to back up.");
+      setStatus("Select the photos to back up first — Back up does not act on the whole view.");
       return;
     }
     try {
@@ -1375,11 +1379,11 @@ export default function App() {
         <button
           className="btn-ghost"
           onClick={backUpSelection}
-          disabled={!ready}
+          disabled={!ready || selection.ids.length === 0}
           title={
             selection.ids.length
               ? `Queue ${selection.ids.length} selected photo(s) to copy to the NAS`
-              : "Queue every photo in the current view to copy to the NAS"
+              : "Select photos first — this queues a copy of everything it names, so it never assumes the whole view"
           }
         >
           Back up

@@ -164,6 +164,37 @@ impl Catalog {
         Ok(())
     }
 
+    /// Note how a photo's companions look on disk *right now*, for the freshness half of
+    /// [`SafetyStatus`](crate::catalog::SafetyStatus).
+    ///
+    /// `image` is a copy of the photo the scanner just walked. Companion rows recorded at
+    /// *other* locations get their `source_mtime_seen` set from what is beside this copy,
+    /// so "the local file has moved on since we carried it home" becomes answerable in
+    /// pure SQL later. Rows belonging to the scanned copy's own volume are skipped — a
+    /// file cannot be evidence that it has diverged from itself, and setting them from
+    /// the home copy would make every carried companion look permanently current.
+    ///
+    /// Cheap enough for the scanner's per-file loop: each update is two index probes
+    /// (`idx_photo_locations_photo`, then the companion primary key), and photos with no
+    /// carried companions match nothing.
+    ///
+    /// Returns how many companion rows were refreshed.
+    pub fn note_companion_freshness(&self, photo_id: i64, image: &Path) -> Result<usize> {
+        let scanned_volume = self.volume_for_path(image).map(|(id, _)| id).ok();
+        let mut updated = 0usize;
+        for found in crate::companions::carried_beside(image) {
+            let Ok(mtime) = mtime_secs(&found.path) else { continue };
+            updated += self.conn.execute(
+                "UPDATE photo_location_companions SET source_mtime_seen = ?1
+                 WHERE name = ?2 AND location_id IN (
+                     SELECT id FROM photo_locations
+                     WHERE photo_id = ?3 AND (?4 IS NULL OR volume_id <> ?4))",
+                params![mtime, found.name(), photo_id, scanned_volume],
+            )?;
+        }
+        Ok(updated)
+    }
+
     /// Record companions at the location identified by (photo, volume, role) — the form
     /// the command layer has to hand, since it writes the location row and then needs to
     /// attach to it.

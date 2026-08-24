@@ -4,8 +4,16 @@
 
 use chairphoto_lib::catalog::{
     Catalog, CullingFilter, LocationRole, PhotoQuery, PhotoSort, PhotoWindow, PickState,
-    StorageStatus, StorageTier, VolumeKind,
+    SafetyStatus, StorageStatus, StorageTier, VolumeKind,
 };
+
+/// Push a file's mtime forward, so "edited after the backup" is expressible without
+/// sleeping. `File::set_modified` avoids a `filetime` dependency for one assertion.
+fn set_mtime_ahead(path: &std::path::Path, secs: u64) {
+    let f = std::fs::File::options().write(true).open(path).unwrap();
+    f.set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(secs))
+        .unwrap();
+}
 use chairphoto_lib::catalog::PathCandidate;
 use std::path::PathBuf;
 
@@ -912,6 +920,79 @@ fn offload_carries_companions_home_first_and_restore_brings_them_back() {
         b"masks",
         "and it comes back with the photo"
     );
+}
+
+/// The freshness half of the safety axis (cluster B, D5): home holds the companion that
+/// was carried, and the local one has since been edited again. Nothing stats home to work
+/// this out — the scanner notes what it sees locally, and the summary reads the note.
+#[test]
+fn a_companion_edited_after_the_backup_makes_the_photo_stale() {
+    let (catalog, root) = temp_catalog("freshness");
+    let nas_dir = root.parent().unwrap().join("nas");
+    std::fs::create_dir_all(&nas_dir).unwrap();
+    let nas = catalog.add_volume("NAS", &nas_dir, VolumeKind::Backup).unwrap();
+
+    let raw = root.join("DSC1.ARW");
+    std::fs::write(&raw, b"bytes").unwrap();
+    let sidecar = root.join("DSC1.ARW.rrdata");
+    std::fs::write(&sidecar, b"first-edit").unwrap();
+    let id = catalog.upsert_photo(&raw, None, 1, 5).unwrap().id;
+    catalog.backup_photo(id, nas).unwrap();
+
+    // Carried and untouched: safe, and nothing is claimed about freshness yet.
+    assert_eq!(catalog.photo_safety_status(id).unwrap(), SafetyStatus::Safe);
+    assert_eq!(catalog.library_safety_summary().unwrap().companions_unchecked, 1);
+
+    // A scan that sees the companion exactly as it was carried leaves it safe, and now
+    // the freshness IS known rather than merely unclaimed.
+    catalog.note_companion_freshness(id, &raw).unwrap();
+    assert_eq!(catalog.photo_safety_status(id).unwrap(), SafetyStatus::Safe);
+    let s = catalog.library_safety_summary().unwrap();
+    assert_eq!((s.companions_checked, s.companions_unchecked), (1, 0));
+
+    // Edit the local companion again. Home still holds the older one.
+    std::fs::write(&sidecar, b"second-edit").unwrap();
+    set_mtime_ahead(&sidecar, 120);
+    catalog.note_companion_freshness(id, &raw).unwrap();
+
+    assert_eq!(
+        catalog.photo_safety_status(id).unwrap(),
+        SafetyStatus::Stale,
+        "the pixels are safe at home; this edit is not"
+    );
+    assert_eq!(catalog.library_safety_summary().unwrap().stale, 1);
+}
+
+/// A file cannot be evidence that it has diverged from itself. Scanning the NAS copy must
+/// not refresh the note that describes the *local* copy — that would make every carried
+/// companion read as permanently current, which is the failure that hides #80 all over
+/// again.
+#[test]
+fn scanning_the_home_copy_does_not_vouch_for_the_local_one() {
+    let (catalog, root) = temp_catalog("freshness-self");
+    let nas_dir = root.parent().unwrap().join("nas");
+    std::fs::create_dir_all(&nas_dir).unwrap();
+    let nas = catalog.add_volume("NAS", &nas_dir, VolumeKind::Backup).unwrap();
+
+    let raw = root.join("DSC1.ARW");
+    std::fs::write(&raw, b"bytes").unwrap();
+    let sidecar = root.join("DSC1.ARW.rrdata");
+    std::fs::write(&sidecar, b"first-edit").unwrap();
+    let id = catalog.upsert_photo(&raw, None, 1, 5).unwrap().id;
+    catalog.backup_photo(id, nas).unwrap();
+
+    // Local companion moves on.
+    std::fs::write(&sidecar, b"second-edit").unwrap();
+    set_mtime_ahead(&sidecar, 120);
+
+    // A scan of the NAS copy notes nothing: its own row is skipped.
+    let refreshed = catalog.note_companion_freshness(id, &nas_dir.join("DSC1.ARW")).unwrap();
+    assert_eq!(refreshed, 0, "the home copy vouches for nothing");
+    assert_eq!(catalog.library_safety_summary().unwrap().stale, 0);
+
+    // The local scan is what reveals it.
+    catalog.note_companion_freshness(id, &raw).unwrap();
+    assert_eq!(catalog.library_safety_summary().unwrap().stale, 1);
 }
 
 /// A companion that differs on the two sides is two unreconciled edits. Offload is not the

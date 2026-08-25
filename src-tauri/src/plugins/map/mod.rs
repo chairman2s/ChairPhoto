@@ -175,9 +175,9 @@ pub fn map_photo_points(
     conn: &rusqlite::Connection,
 ) -> rusqlite::Result<Vec<PhotoPoint>> {
     let mut stmt = conn.prepare(
-        "SELECT id, gps_latitude, gps_longitude FROM photos
+        "SELECT id, gps_latitude, gps_longitude FROM photos_visible
          WHERE gps_latitude IS NOT NULL AND gps_longitude IS NOT NULL
-           AND missing = 0",
+          ",
     )?;
     let rows = stmt.query_map([], |r| {
         Ok(PhotoPoint {
@@ -263,7 +263,8 @@ pub fn apply_fences_to_photo(
 ) -> crate::catalog::Result<usize> {
     // Read this photo's GPS columns.
     let row: Option<(f64, f64)> = catalog.conn().query_row(
-        "SELECT gps_latitude, gps_longitude FROM photos
+        "-- includes-hidden: by id.
+                 SELECT gps_latitude, gps_longitude FROM photos
          WHERE id = ?1 AND gps_latitude IS NOT NULL AND gps_longitude IS NOT NULL",
         rusqlite::params![photo_id],
         |r| Ok((r.get(0)?, r.get(1)?)),

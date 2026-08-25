@@ -1,5 +1,6 @@
 pub mod bundle;
 pub mod burst;
+pub mod companions;
 pub mod catalog;
 #[cfg(feature = "collage")]
 pub mod collage;
@@ -349,9 +350,16 @@ pub fn run() {
             commands::vacuum_catalog,
             commands::video_server_port,
             commands::apply_offload_policy,
+            commands::library_safety_summary,
+            commands::trash_photos,
+            commands::restore_photos,
+            commands::list_trash,
+            commands::empty_trash,
+            commands::photo_safety_status,
             commands::scan_nas_folder_cmd,
             commands::list_pending_operations,
             commands::enqueue_operation,
+            commands::enqueue_operations,
             commands::reconcile_now,
             commands::assemble_hashtag_bundle,
             commands::get_photo,

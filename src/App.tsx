@@ -2,6 +2,8 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { confirm } from "@tauri-apps/plugin-dialog";
 import {
   analyzeBurstSharpness,
+  trashPhotos,
+  enqueueOperations,
   applyAutoTags,
   assignTag,
   cacheImages,
@@ -109,6 +111,7 @@ import { BundleExportDialog } from "./components/BundleExportDialog";
 import { BundleImportDialog } from "./components/BundleImportDialog";
 import { StackProposalsDialog } from "./components/StackProposalsDialog";
 import { CullSession } from "./components/CullSession";
+import { TrashDialog } from "./components/TrashDialog";
 import { CatalogSwitcher } from "./components/CatalogSwitcher";
 import { EditorView } from "./components/EditorView";
 import { parseEdit } from "./modules/editing";
@@ -284,6 +287,7 @@ export default function App() {
   const closeModalAction = useCallback(() => setModalAction(null), []);
   // Right-click context menu on a grid tile.
   const [ctxMenu, setCtxMenu] = useState<{ x: number; y: number; photoId: number } | null>(null);
+  const [showTrash, setShowTrash] = useState(false);
 
   // Full-surface views contributed by modules (e.g. Map). The active one, if its
   // module is still enabled — otherwise we fall back to the built-in Library view.
@@ -827,6 +831,35 @@ export default function App() {
     }
   };
 
+  // Batch back-up (cluster B, B1/D6): the second half of the safety panel's "show me".
+  // The panel filters the grid to a bucket; this queues what you then select, through the
+  // same pending-operations queue the per-photo action uses — so the topbar badge and the
+  // reconcile drain report it, and an offline NAS defers rather than fails.
+  const backUpSelection = async () => {
+    // Requires an explicit selection, unlike the analyse/propose actions that fall back to
+    // the whole view. Those read; this one commits the library to copying every byte it
+    // names — on the owner's catalog an empty-selection fallback would silently queue
+    // 165,093 photos. It is additive and safe, and still not a thing to start by accident.
+    const targets = selection.ids;
+    if (targets.length === 0) {
+      setStatus("Select the photos to back up first — Back up does not act on the whole view.");
+      return;
+    }
+    try {
+      const queued = await enqueueOperations("backup", targets);
+      const already = targets.length - queued;
+      setStatus(
+        `Queued ${queued} for backup` +
+          (already ? ` (${already} already waiting)` : "") +
+          ". They copy when the NAS is reachable.",
+      );
+      await refreshPending();
+      runReconcile();
+    } catch (e) {
+      setStatus(`Could not queue backup: ${e}`);
+    }
+  };
+
   // Auto-stack proposals (C3): same scoping as burst analysis — the selection, else the
   // whole view. Opening only *proposes*; each group is accepted individually in the dialog.
   const openStackProposals = () => {
@@ -1345,6 +1378,26 @@ export default function App() {
         </button>
         <button
           className="btn-ghost"
+          onClick={backUpSelection}
+          disabled={!ready || selection.ids.length === 0}
+          title={
+            selection.ids.length
+              ? `Queue ${selection.ids.length} selected photo(s) to copy to the NAS`
+              : "Select photos first — this queues a copy of everything it names, so it never assumes the whole view"
+          }
+        >
+          Back up
+        </button>
+        <button
+          className="btn-ghost"
+          onClick={() => setShowTrash(true)}
+          disabled={!ready}
+          title="Photos you have hidden. Nothing there has been deleted — restoring is one click."
+        >
+          Trash
+        </button>
+        <button
+          className="btn-ghost"
           onClick={runBurstAnalysis}
           disabled={!ready}
           title={
@@ -1831,6 +1884,12 @@ export default function App() {
 
       {showPrefs && (
         <Preferences
+          onShowStorageTier={(tier) => {
+            // Filter first, then close: the panel's whole promise is that the number it
+            // showed you and the photos you land on are the same set.
+            library.setStorageTier(tier);
+            setShowPrefs(false);
+          }}
           onClose={() => setShowPrefs(false)}
           onLibraryRootChanged={() => {
             refresh();
@@ -1876,6 +1935,15 @@ export default function App() {
         />
       )}
 
+      {showTrash && (
+        <TrashDialog
+          onClose={() => setShowTrash(false)}
+          onChanged={() => {
+            refresh();
+            refreshPending();
+          }}
+        />
+      )}
       {showPublish && <PublishDialog onClose={() => setShowPublish(false)} />}
 
       {bundleExportBatch && (
@@ -1951,6 +2019,25 @@ export default function App() {
                 <span className="ctx-header-name" title={photoName(id)}>{photoName(id)}</span>
                 {st && <span className="ctx-header-status">{storageLabel(st)}</span>}
               </div>
+              <button
+                className="ctx-item"
+                title="Hide it everywhere, reversibly. Nothing is deleted and nothing is written to disk."
+                onClick={() => {
+                  close();
+                  // The selection if this photo is part of one, else just this photo —
+                  // right-clicking a tile outside the selection is about that tile.
+                  const ids = selection.ids.includes(id) ? selection.ids : [id];
+                  trashPhotos(ids)
+                    .then((s) => {
+                      const extra = s.cascaded ? ` (+${s.cascaded} stacked)` : "";
+                      setStatus(`Moved ${s.trashed} to the trash${extra}.`);
+                      refresh();
+                    })
+                    .catch((e) => setStatus(`Could not trash: ${e}`));
+                }}
+              >
+                Move to trash
+              </button>
               <button
                 className="ctx-item"
                 onClick={() => {

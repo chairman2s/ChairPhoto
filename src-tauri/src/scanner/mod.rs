@@ -376,6 +376,12 @@ pub fn phase_b_enrich(
         // since the last scan, adding a sidecar without touching the photo's bytes.
         let editors = sidecars::detect_external_editors_joined(&path);
         let _ = catalog.set_external_editors(photo_id, &editors);
+        // While we are already looking at what sits beside this file: note how its carried
+        // companions look now, so the safety panel can tell "carried and current" from "the
+        // local one has moved on since" without ever statting home (cluster B, D5). Best
+        // effort — a photo with no carried companions matches nothing, and a failure here
+        // must never fail a scan.
+        let _ = catalog.note_companion_freshness(photo_id, &path);
         since_commit += 1;
         if since_commit >= COMMIT_EVERY {
             tx.commit().map_err(|e| e.to_string())?;

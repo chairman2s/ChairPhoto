@@ -4,8 +4,16 @@
 
 use chairphoto_lib::catalog::{
     Catalog, CullingFilter, LocationRole, PhotoQuery, PhotoSort, PhotoWindow, PickState,
-    StorageStatus, StorageTier, VolumeKind,
+    SafetyStatus, StorageStatus, StorageTier, VolumeKind,
 };
+
+/// Push a file's mtime forward, so "edited after the backup" is expressible without
+/// sleeping. `File::set_modified` avoids a `filetime` dependency for one assertion.
+fn set_mtime_ahead(path: &std::path::Path, secs: u64) {
+    let f = std::fs::File::options().write(true).open(path).unwrap();
+    f.set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(secs))
+        .unwrap();
+}
 use chairphoto_lib::catalog::PathCandidate;
 use std::path::PathBuf;
 
@@ -772,6 +780,419 @@ fn lifecycle_backup_offload_restore_with_verification() {
     assert!(raw.exists(), "local kept because backup verification failed");
 }
 
+/// A copy is the image **plus its declared companions** (cluster B, D2). Before this,
+/// `backup_photo` copied one file, so darktable history and RapidRAW state stayed behind
+/// while the app reported the photo backed up — issue #80.
+#[test]
+fn backup_carries_companions_and_records_what_it_carried() {
+    let (catalog, root) = temp_catalog("companions-backup");
+    let nas_dir = root.parent().unwrap().join("nas");
+    std::fs::create_dir_all(&nas_dir).unwrap();
+    let nas = catalog.add_volume("NAS", &nas_dir, VolumeKind::Backup).unwrap();
+
+    let raw = root.join("2026/06/27/DSC1.ARW");
+    std::fs::create_dir_all(raw.parent().unwrap()).unwrap();
+    std::fs::write(&raw, b"original-bytes").unwrap();
+    // The two shapes and two owners that actually occur: darktable's appended sidecar and
+    // RapidRAW's mask blob.
+    std::fs::write(root.join("2026/06/27/DSC1.ARW.xmp"), b"<x>darktable:history</x>").unwrap();
+    std::fs::write(root.join("2026/06/27/DSC1.ARW.rrdata"), b"{\"adjustments\":{}}").unwrap();
+    // An undeclared neighbour must not be swept along.
+    std::fs::write(root.join("2026/06/27/DSC1.ARW.txt"), b"notes").unwrap();
+    let id = catalog.upsert_photo(&raw, None, 1, 14).unwrap().id;
+
+    catalog.backup_photo(id, nas).unwrap();
+
+    let at_nas = |n: &str| nas_dir.join("2026/06/27").join(n);
+    assert!(at_nas("DSC1.ARW").is_file(), "the image");
+    assert_eq!(
+        std::fs::read(at_nas("DSC1.ARW.xmp")).unwrap(),
+        b"<x>darktable:history</x>",
+        "the darktable history travels with it"
+    );
+    assert!(at_nas("DSC1.ARW.rrdata").is_file(), "and RapidRAW's state");
+    assert!(!at_nas("DSC1.ARW.txt").exists(), "but an undeclared neighbour does not");
+
+    let recorded: Vec<String> = catalog
+        .companions_at(id, nas, LocationRole::Backup)
+        .unwrap()
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect();
+    assert_eq!(recorded, vec!["DSC1.ARW.rrdata", "DSC1.ARW.xmp"]);
+}
+
+/// Some companions reached home by hand before this code existed, so a second pass must
+/// adopt them rather than fail or re-copy.
+#[test]
+fn backup_adopts_an_identical_companion_already_at_home() {
+    let (catalog, root) = temp_catalog("companions-idempotent");
+    let nas_dir = root.parent().unwrap().join("nas");
+    std::fs::create_dir_all(nas_dir.join("2026")).unwrap();
+    let nas = catalog.add_volume("NAS", &nas_dir, VolumeKind::Backup).unwrap();
+
+    let raw = root.join("2026/DSC1.ARW");
+    std::fs::create_dir_all(raw.parent().unwrap()).unwrap();
+    std::fs::write(&raw, b"bytes").unwrap();
+    std::fs::write(root.join("2026/DSC1.ARW.rrdata"), b"{}").unwrap();
+    // Placed at home by hand, byte-identical.
+    std::fs::write(nas_dir.join("2026/DSC1.ARW.rrdata"), b"{}").unwrap();
+    let id = catalog.upsert_photo(&raw, None, 1, 5).unwrap().id;
+
+    catalog.backup_photo(id, nas).unwrap();
+    catalog.backup_photo(id, nas).unwrap(); // and again — carrying is idempotent
+
+    assert_eq!(
+        catalog.companions_at(id, nas, LocationRole::Backup).unwrap().len(),
+        1,
+        "recorded once, not once per pass"
+    );
+}
+
+/// Two different edits exist. Overwriting either would destroy work, so backup carries
+/// neither and leaves the divergence for the freshness pass to report.
+#[test]
+fn backup_never_overwrites_a_companion_that_differs_at_home() {
+    let (catalog, root) = temp_catalog("companions-diverged");
+    let nas_dir = root.parent().unwrap().join("nas");
+    std::fs::create_dir_all(nas_dir.join("2026")).unwrap();
+    let nas = catalog.add_volume("NAS", &nas_dir, VolumeKind::Backup).unwrap();
+
+    let raw = root.join("2026/DSC1.ARW");
+    std::fs::create_dir_all(raw.parent().unwrap()).unwrap();
+    std::fs::write(&raw, b"bytes").unwrap();
+    std::fs::write(root.join("2026/DSC1.ARW.xmp"), b"local-edit").unwrap();
+    std::fs::write(nas_dir.join("2026/DSC1.ARW.xmp"), b"home-edit").unwrap();
+    let id = catalog.upsert_photo(&raw, None, 1, 5).unwrap().id;
+
+    catalog.backup_photo(id, nas).unwrap();
+
+    assert_eq!(
+        std::fs::read(nas_dir.join("2026/DSC1.ARW.xmp")).unwrap(),
+        b"home-edit",
+        "the copy at home is left exactly as it was"
+    );
+    assert!(
+        catalog.companions_at(id, nas, LocationRole::Backup).unwrap().is_empty(),
+        "and it is not claimed as carried, so it stays visible as divergence"
+    );
+}
+
+/// Offload frees local bytes. It must not strand the edit state beside them (#80), and a
+/// restore must bring that state back rather than bare pixels.
+#[test]
+fn offload_carries_companions_home_first_and_restore_brings_them_back() {
+    let (catalog, root) = temp_catalog("companions-offload");
+    let nas_dir = root.parent().unwrap().join("nas");
+    std::fs::create_dir_all(&nas_dir).unwrap();
+    let nas = catalog.add_volume("NAS", &nas_dir, VolumeKind::Backup).unwrap();
+    let local_id = catalog
+        .list_volumes()
+        .unwrap()
+        .into_iter()
+        .find(|v| v.kind == VolumeKind::Local)
+        .unwrap()
+        .id;
+
+    let raw = root.join("2026/DSC1.ARW");
+    std::fs::create_dir_all(raw.parent().unwrap()).unwrap();
+    std::fs::write(&raw, b"bytes").unwrap();
+    let id = catalog.upsert_photo(&raw, None, 1, 5).unwrap().id;
+    catalog.backup_photo(id, nas).unwrap();
+
+    // The edit happens *after* the backup — the case that produced #80.
+    let local_sidecar = root.join("2026/DSC1.ARW.rrdata");
+    std::fs::write(&local_sidecar, b"masks").unwrap();
+
+    catalog.offload_photo(id).unwrap();
+
+    assert!(!raw.exists(), "local image freed");
+    assert!(!local_sidecar.exists(), "and its companion freed with it");
+    assert_eq!(
+        std::fs::read(nas_dir.join("2026/DSC1.ARW.rrdata")).unwrap(),
+        b"masks",
+        "because the edit state was carried home before anything was deleted"
+    );
+
+    catalog.restore_photo(id, local_id).unwrap();
+    assert_eq!(
+        std::fs::read(&local_sidecar).unwrap(),
+        b"masks",
+        "and it comes back with the photo"
+    );
+}
+
+/// The freshness half of the safety axis (cluster B, D5): home holds the companion that
+/// was carried, and the local one has since been edited again. Nothing stats home to work
+/// this out — the scanner notes what it sees locally, and the summary reads the note.
+#[test]
+fn a_companion_edited_after_the_backup_makes_the_photo_stale() {
+    let (catalog, root) = temp_catalog("freshness");
+    let nas_dir = root.parent().unwrap().join("nas");
+    std::fs::create_dir_all(&nas_dir).unwrap();
+    let nas = catalog.add_volume("NAS", &nas_dir, VolumeKind::Backup).unwrap();
+
+    let raw = root.join("DSC1.ARW");
+    std::fs::write(&raw, b"bytes").unwrap();
+    let sidecar = root.join("DSC1.ARW.rrdata");
+    std::fs::write(&sidecar, b"first-edit").unwrap();
+    let id = catalog.upsert_photo(&raw, None, 1, 5).unwrap().id;
+    catalog.backup_photo(id, nas).unwrap();
+
+    // Carried and untouched: safe, and nothing is claimed about freshness yet.
+    assert_eq!(catalog.photo_safety_status(id).unwrap(), SafetyStatus::Safe);
+    assert_eq!(catalog.library_safety_summary().unwrap().companions_unchecked, 1);
+
+    // A scan that sees the companion exactly as it was carried leaves it safe, and now
+    // the freshness IS known rather than merely unclaimed.
+    catalog.note_companion_freshness(id, &raw).unwrap();
+    assert_eq!(catalog.photo_safety_status(id).unwrap(), SafetyStatus::Safe);
+    let s = catalog.library_safety_summary().unwrap();
+    assert_eq!((s.companions_checked, s.companions_unchecked), (1, 0));
+
+    // Edit the local companion again. Home still holds the older one.
+    std::fs::write(&sidecar, b"second-edit").unwrap();
+    set_mtime_ahead(&sidecar, 120);
+    catalog.note_companion_freshness(id, &raw).unwrap();
+
+    assert_eq!(
+        catalog.photo_safety_status(id).unwrap(),
+        SafetyStatus::Stale,
+        "the pixels are safe at home; this edit is not"
+    );
+    assert_eq!(catalog.library_safety_summary().unwrap().stale, 1);
+}
+
+/// The safety panel's batch action queues a whole selection at once. The count it reports
+/// is "newly queued", not "statements run" — a photo already waiting must not be counted
+/// again, or the message tells the user work was created that was not.
+#[test]
+fn queueing_a_selection_counts_only_what_was_not_already_waiting() {
+    let (catalog, root) = temp_catalog("batch-enqueue");
+    let ids: Vec<i64> = (1..=4)
+        .map(|i| {
+            let p = root.join(format!("DSC{i}.arw"));
+            std::fs::write(&p, b"x").unwrap();
+            catalog.upsert_photo(&p, None, 1, 1).unwrap().id
+        })
+        .collect();
+
+    // One is already waiting, queued the per-photo way.
+    catalog.enqueue_operation("backup", ids[0]).unwrap();
+
+    let queued = catalog.enqueue_operations("backup", &ids).unwrap();
+
+    assert_eq!(queued, 3, "the one already waiting is not counted again");
+    assert_eq!(catalog.list_pending_operations().unwrap().len(), 4, "and not duplicated");
+
+    // Re-running queues nothing further: the action is safe to press twice.
+    assert_eq!(catalog.enqueue_operations("backup", &ids).unwrap(), 0);
+    assert_eq!(catalog.list_pending_operations().unwrap().len(), 4);
+}
+
+/// An unknown kind is rejected rather than queued as a row nothing will ever drain.
+#[test]
+fn queueing_an_unknown_operation_kind_is_refused() {
+    let (catalog, root) = temp_catalog("batch-enqueue-kind");
+    let p = root.join("a.arw");
+    std::fs::write(&p, b"x").unwrap();
+    let id = catalog.upsert_photo(&p, None, 1, 1).unwrap().id;
+
+    assert!(catalog.enqueue_operations("teleport", &[id]).is_err());
+    assert!(catalog.list_pending_operations().unwrap().is_empty());
+}
+
+/// The #80-era shape: a photo whose image was backed up before companions existed, so home
+/// has verified pixels and no sidecar, and the edit state sits in exactly one place.
+///
+/// The catalog has no record of that companion at all — nothing carried it — so a model
+/// that only compares an existing record's timestamps cannot see it, and the photo reports
+/// `Safe` while the work that made it is one disk failure from gone.
+#[test]
+fn an_uncarried_local_companion_is_stale_not_safe() {
+    let (catalog, root) = temp_catalog("uncarried-companion");
+    let nas_dir = root.parent().unwrap().join("nas");
+    std::fs::create_dir_all(&nas_dir).unwrap();
+    let nas = catalog.add_volume("NAS", &nas_dir, VolumeKind::Backup).unwrap();
+
+    let raw = root.join("DSC1.ARW");
+    std::fs::write(&raw, b"bytes").unwrap();
+    let id = catalog.upsert_photo(&raw, None, 1, 5).unwrap().id;
+    catalog.backup_photo(id, nas).unwrap();
+    assert_eq!(catalog.photo_safety_status(id).unwrap(), SafetyStatus::Safe);
+
+    // The edit happens now — after a backup that predates companions entirely. Home has
+    // no copy of it and no record that it should.
+    std::fs::write(root.join("DSC1.ARW.rrdata"), b"masks").unwrap();
+    assert!(
+        catalog.companions_at(id, nas, LocationRole::Backup).unwrap().is_empty(),
+        "nothing has ever been carried for this photo"
+    );
+
+    // A scan notices it. That sighting is the evidence the safety model needs.
+    catalog.note_companion_freshness(id, &raw).unwrap();
+
+    assert_eq!(
+        catalog.photo_safety_status(id).unwrap(),
+        SafetyStatus::Stale,
+        "the pixels are safe at home and this edit is not"
+    );
+    assert_eq!(catalog.library_safety_summary().unwrap().stale, 1);
+
+    // Backing up again reconciles it — the carry is what clears the bucket, and it is
+    // idempotent, so nothing is re-copied for the image.
+    let plan_source = raw.clone();
+    let plan_dest = nas_dir.join("DSC1.ARW");
+    let carried = chairphoto_lib::catalog::carry_companions(&plan_source, &plan_dest).unwrap();
+    catalog
+        .record_companions_at(id, nas, LocationRole::Backup, &carried.carried)
+        .unwrap();
+
+    assert_eq!(
+        std::fs::read(nas_dir.join("DSC1.ARW.rrdata")).unwrap(),
+        b"masks",
+        "and the edit state actually reached home"
+    );
+    assert_eq!(catalog.photo_safety_status(id).unwrap(), SafetyStatus::Safe);
+}
+
+/// A companion carried and left alone is not stale — the sighting matches what was
+/// carried. Without this, every scan would push every photo into the bucket.
+#[test]
+fn a_carried_companion_seen_unchanged_stays_safe() {
+    let (catalog, root) = temp_catalog("carried-unchanged");
+    let nas_dir = root.parent().unwrap().join("nas");
+    std::fs::create_dir_all(&nas_dir).unwrap();
+    let nas = catalog.add_volume("NAS", &nas_dir, VolumeKind::Backup).unwrap();
+
+    let raw = root.join("DSC1.ARW");
+    std::fs::write(&raw, b"bytes").unwrap();
+    std::fs::write(root.join("DSC1.ARW.rrdata"), b"masks").unwrap();
+    let id = catalog.upsert_photo(&raw, None, 1, 5).unwrap().id;
+    catalog.backup_photo(id, nas).unwrap();
+
+    catalog.note_companion_freshness(id, &raw).unwrap();
+
+    assert_eq!(catalog.photo_safety_status(id).unwrap(), SafetyStatus::Safe);
+    assert_eq!(catalog.library_safety_summary().unwrap().stale, 0);
+}
+
+/// A file cannot be evidence that it has diverged from itself. Scanning the NAS copy must
+/// not refresh the note that describes the *local* copy — that would make every carried
+/// companion read as permanently current, which is the failure that hides #80 all over
+/// again.
+#[test]
+fn scanning_the_home_copy_does_not_vouch_for_the_local_one() {
+    let (catalog, root) = temp_catalog("freshness-self");
+    let nas_dir = root.parent().unwrap().join("nas");
+    std::fs::create_dir_all(&nas_dir).unwrap();
+    let nas = catalog.add_volume("NAS", &nas_dir, VolumeKind::Backup).unwrap();
+
+    let raw = root.join("DSC1.ARW");
+    std::fs::write(&raw, b"bytes").unwrap();
+    let sidecar = root.join("DSC1.ARW.rrdata");
+    std::fs::write(&sidecar, b"first-edit").unwrap();
+    let id = catalog.upsert_photo(&raw, None, 1, 5).unwrap().id;
+    catalog.backup_photo(id, nas).unwrap();
+
+    // Local companion moves on.
+    std::fs::write(&sidecar, b"second-edit").unwrap();
+    set_mtime_ahead(&sidecar, 120);
+
+    // A scan of the NAS copy notes nothing: its own row is skipped.
+    let refreshed = catalog.note_companion_freshness(id, &nas_dir.join("DSC1.ARW")).unwrap();
+    assert_eq!(refreshed, 0, "the home copy vouches for nothing");
+    assert_eq!(catalog.library_safety_summary().unwrap().stale, 0);
+
+    // The local scan is what reveals it.
+    catalog.note_companion_freshness(id, &raw).unwrap();
+    assert_eq!(catalog.library_safety_summary().unwrap().stale, 1);
+}
+
+/// Restore must bring back what an offload moved home — all three companion shapes, not
+/// just the appended one that happens to be most common. The shipping restore path used to
+/// record the image alone; both paths now go through one copy/record seam, so this covers
+/// the shape of the operation rather than one caller of it.
+#[test]
+fn restore_brings_back_every_companion_shape() {
+    let (catalog, root) = temp_catalog("restore-companions");
+    let nas_dir = root.parent().unwrap().join("nas");
+    std::fs::create_dir_all(&nas_dir).unwrap();
+    let nas = catalog.add_volume("NAS", &nas_dir, VolumeKind::Backup).unwrap();
+    let local_id = catalog
+        .list_volumes()
+        .unwrap()
+        .into_iter()
+        .find(|v| v.kind == VolumeKind::Local)
+        .unwrap()
+        .id;
+
+    let raw = root.join("DSC1.ARW");
+    std::fs::write(&raw, b"bytes").unwrap();
+    std::fs::write(root.join("DSC1.ARW.xmp"), b"appended-history").unwrap(); // darktable
+    std::fs::write(root.join("DSC1.xmp"), b"basename-history").unwrap(); // darktable, alt mode
+    std::fs::write(root.join("DSC1.ARW.rrdata"), b"masks").unwrap(); // RapidRAW
+    let id = catalog.upsert_photo(&raw, None, 1, 5).unwrap().id;
+
+    catalog.backup_photo(id, nas).unwrap();
+    catalog.offload_photo(id).unwrap();
+
+    // Local is empty; home holds everything.
+    assert!(!raw.exists());
+    assert!(!root.join("DSC1.ARW.rrdata").exists());
+    assert!(nas_dir.join("DSC1.xmp").is_file(), "the basename form reached home too");
+
+    catalog.restore_photo(id, local_id).unwrap();
+
+    assert_eq!(std::fs::read(&raw).unwrap(), b"bytes", "the image");
+    assert_eq!(
+        std::fs::read(root.join("DSC1.ARW.xmp")).unwrap(),
+        b"appended-history",
+        "appended xmp"
+    );
+    assert_eq!(
+        std::fs::read(root.join("DSC1.xmp")).unwrap(),
+        b"basename-history",
+        "basename xmp"
+    );
+    assert_eq!(std::fs::read(root.join("DSC1.ARW.rrdata")).unwrap(), b"masks", "rrdata");
+
+    // And the restored location knows what came with it, so freshness has a reference.
+    let recorded: Vec<String> = catalog
+        .companions_at(id, local_id, LocationRole::LocalCache)
+        .unwrap()
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect();
+    assert_eq!(recorded, vec!["DSC1.ARW.rrdata", "DSC1.ARW.xmp", "DSC1.xmp"]);
+}
+
+/// A companion that differs on the two sides is two unreconciled edits. Offload is not the
+/// place to choose between them, so it refuses — and nothing local is deleted.
+#[test]
+fn offload_refuses_when_a_companion_diverges() {
+    let (catalog, root) = temp_catalog("companions-offload-refuse");
+    let nas_dir = root.parent().unwrap().join("nas");
+    std::fs::create_dir_all(&nas_dir).unwrap();
+    let nas = catalog.add_volume("NAS", &nas_dir, VolumeKind::Backup).unwrap();
+
+    let raw = root.join("2026/DSC1.ARW");
+    std::fs::create_dir_all(raw.parent().unwrap()).unwrap();
+    std::fs::write(&raw, b"bytes").unwrap();
+    let id = catalog.upsert_photo(&raw, None, 1, 5).unwrap().id;
+    catalog.backup_photo(id, nas).unwrap();
+
+    std::fs::write(root.join("2026/DSC1.ARW.xmp"), b"local-edit").unwrap();
+    std::fs::write(nas_dir.join("2026/DSC1.ARW.xmp"), b"home-edit").unwrap();
+
+    let err = catalog.offload_photo(id).unwrap_err().to_string();
+
+    assert!(err.contains("refusing to offload"), "{err}");
+    assert!(raw.exists(), "the local image is untouched");
+    assert_eq!(std::fs::read(root.join("2026/DSC1.ARW.xmp")).unwrap(), b"local-edit");
+    assert_eq!(std::fs::read(nas_dir.join("2026/DSC1.ARW.xmp")).unwrap(), b"home-edit");
+}
+
 #[test]
 fn per_photo_storage_status_from_locations() {
     let (catalog, root) = temp_catalog("storage-status");
@@ -811,6 +1232,21 @@ fn per_photo_storage_status_from_locations() {
     let missing = catalog.upsert_photo(&root.join("e.arw"), None, 1, 1).unwrap().id;
     catalog.remove_locations_on_volume(missing, default_local).unwrap();
     assert_eq!(catalog.photo_storage_status(missing).unwrap(), StorageStatus::Missing);
+
+    // An EXPORT copy is a one-way hand-off, not a safety copy — even when the user pointed
+    // the export at a backup-kind disk. It must not make a photo read as backed up.
+    let exported = catalog.upsert_photo(&root.join("f.arw"), None, 1, 1).unwrap().id;
+    catalog.add_location(exported, nas, "f.arw", LocationRole::Export).unwrap();
+    assert_eq!(
+        catalog.photo_storage_status(exported).unwrap(),
+        StorageStatus::LocalOnly,
+        "an export copy on a backup volume is still only one real copy"
+    );
+
+    // And with no local copy either, an export copy leaves the photo Missing rather than
+    // Archived: there is nothing to browse from and nothing keeping it safe.
+    catalog.remove_locations_on_volume(exported, default_local).unwrap();
+    assert_eq!(catalog.photo_storage_status(exported).unwrap(), StorageStatus::Missing);
 
     // Batch returns one entry per requested id, matching the singles. The batch method
     // no longer stats — the caller supplies the reachability map (here from list_volumes,

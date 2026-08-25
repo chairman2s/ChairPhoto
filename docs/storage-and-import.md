@@ -196,6 +196,101 @@ derives this from the photo's locations' volume kinds and reachability. A backup
 chooses Archived vs Offline when there's no local copy). The grid shows two icons
 per tile — local (▣) and NAS (☁, dimmed when offline).
 
+### A copy is the image plus its declared companions
+
+A photo's edit state does not live in the image. darktable and Lightroom write develop
+history into `<raw>.xmp`, RawTherapee into `.pp3`, ART into `.arp`, and RapidRAW into
+`.rrdata` — all beside the original. Backup used to copy the image alone, so a photo could
+be reported **BACKED UP** while every edit decision made on it existed in exactly one
+place (issue #80).
+
+The set is **declared, never guessed** (`src-tauri/src/companions.rs`). An integration names
+its extension; the catalog does not sweep arbitrary neighbouring files, because backup must
+not behave differently depending on what happens to share a folder with the photo.
+
+Each kind also declares what its *presence* means, which is a separate question from whether
+it travels:
+
+| | carried | presence implies an edit |
+|---|---|---|
+| `.xmp` | yes | only by content — chairphoto writes this file too |
+| `.pp3`, `.arp` | yes | yes |
+| `.rrdata` | yes | **no** — RapidRAW writes it when it *opens* a photo |
+
+Both sidecar shapes are handled: appended (`DSC1.ARW.xmp`) and basename (`DSC1.xmp`,
+darktable's alternate mode). Destinations are derived from the destination *image*, so a
+copy whose `relative_path` differs between volumes still lands correctly rather than leaving
+an orphan.
+
+Three rules govern carrying:
+
+- **Backup and restore carry companions** through the same hash-verified atomic rename the
+  image uses, recording each in `photo_location_companions` against the exact
+  `photo_locations.id` — not (photo, volume), since one volume can hold several roles for
+  the same photo. What is recorded is the **source** mtime at carry time, which is the
+  reference point for answering "has the local file moved on since we copied it".
+- **Offload carries before it deletes.** Invariant 1 covers edit state too: freeing the
+  local image must not strand the history beside it. Companions go home first, then the
+  local ones are freed with the image, and `restore` brings them back.
+- **Divergence refuses; it never resolves.** A companion present on both sides with
+  different contents is two unreconciled edits. Backup leaves it untouched and does not
+  claim it as carried; offload refuses outright. Choosing a side would silently destroy
+  work.
+
+Carrying is idempotent — an identical file already at the destination is adopted rather
+than rewritten — so a companion placed there by any other means is absorbed on the next
+pass instead of being re-copied or causing a conflict.
+
+`verified_hash` deliberately stays a hash of the **image only**. The image is immutable, so
+a changed hash means bit rot; companions are mutable by design (darktable rewrites `.xmp` on
+every edit, and so does chairphoto on IPTC/GPS/face writes), so hashing them would report
+ordinary work as corruption.
+
+### Safety: a second axis
+
+`StorageStatus` answers *can I display this photo now* and drives the grid badge, so it is
+on the hot path and does not care whether anything was hash-verified. **`SafetyStatus`**
+answers *would I lose it*, is read by one panel, and is deliberately a separate enum rather
+than more variants on the first — overloading one would drag verification onto the grid's
+hot path.
+
+| bucket | meaning |
+|---|---|
+| `Missing` | no copy recorded anywhere |
+| `AtRisk` | no copy at home |
+| `Unverified` | a copy at home, never hash-verified |
+| `Stale` | verified at home, but a companion has moved on locally |
+| `Safe` | verified at home, companions carried and current |
+
+A photo lands in the first bucket it matches. `Stale` exists only because a copy is the
+image *plus* its companions: pixels safe at home with the develop history on one disk is
+not safe, and without the bucket the summary would call issue #80's exact situation `Safe`.
+
+**`AtRisk` is home-possession, not copy count** — see `CONTEXT.md`, which now says so in the
+vocabulary. An `export` copy never counts toward home: it is a one-way hand-off, even when
+the user pointed the export at a backup-kind disk.
+
+**Every query on this axis is pure SQL.** No volume is stat-ed, so an unmounted NAS cannot
+make the panel hang — the same reason `photo_statuses` moved its reachability check off the
+catalog lock. That constraint is what forces freshness to be *recorded* rather than
+measured on read: the scanner notes how each carried companion looks while it is already
+walking that file (`note_companion_freshness`), and the summary reads the note. Only *other*
+copies' rows are refreshed — a file cannot be evidence that it has not diverged from itself.
+
+Two consequences the UI must carry rather than hide:
+
+- **`Stale` is a floor, not a total**, while any carried companion has not been seen since
+  it was carried. The summary reports that count alongside it.
+- **The catalog speaks only for volumes it can see.** Redundancy inside a device, and any
+  off-site backup, are invisible; a photo reported safe is safe as far as this catalog
+  knows, and the panel says exactly that.
+
+The counting query is one grouped pass over `photo_locations`, measured at 0.24 s against a
+165,093-photo catalog versus 0.56 s for four correlated sub-selects per photo. The grid
+filter needs a per-row `EXISTS` instead, so the rule has two spellings; they share what they
+can and a test pins the rest, because a panel that reports one number and then lists a
+different set is worse than either number alone.
+
 ### The key performance principle
 
 **Cull / browse / tag run entirely off the local preview cache** (already built).
@@ -233,9 +328,49 @@ and the owner asked for silent background backup. Backup entry (owner decision):
 **both** — every imported photo is auto-enqueued, and a manual per-photo "Back up"
 (run-or-queue) sits in the inspector alongside Offload / Restore (shown by status).
 
+## Trash and delete
+
+**Trash** hides a photo everywhere, reversibly, without touching a byte. It is
+`photos.trashed_at` plus one predicate in `photos_visible` — which is the whole of "every
+query must learn about trash", because everything that lists or counts photos for the user
+already reads that view. The grid, album counts, library stats, tag counts and the safety
+summary all pick it up at once.
+
+It is **not** `pick_state = 'reject'`: reject is a verdict on a photo that stays in the
+library and keeps appearing, while trash hides it. Two-pass culling uses one, deletion
+flows use the other. It is **not** a sidecar field either — no user culling state reaches
+an in-library sidecar today, so trash would be the first, and would mark the file trashed
+for every foreign tool that reads that sidecar on the strength of a reversible local
+decision.
+
+**Trashing a stack takes the whole stack.** Frames are hidden from the grid by
+`stack_parent_id IS NULL`, so hiding a master alone would leave its frames hidden by one
+predicate and their master hidden by another: the trash would list one photo and the rest
+would be reachable from nowhere. The nullable timestamp already chosen for ordering doubles
+as the group key — a master stamps its untrashed frames with the same value, and restoring
+clears exactly that value, so a frame trashed separately keeps its own and stays put. Its
+one seam is whole-second resolution: a master and an unrelated frame of the same stack
+trashed inside one second would restore together.
+
+A trashed frame stops counting toward its master's stack badge; an *offline* one still
+counts. The difference is that one is a decision about the photo and the other is a fact
+about a disk.
+
+**Delete** is the only path in the app that destroys an original, and it is gated twice:
+an explicit confirmation the backend requires rather than assumes, and **every known copy
+reachable**. Reachability rather than role, because master-ness is an advisory claim and an
+advisory claim cannot guard a verb with no undo. Every copy rather than just home, because
+deleting what is in reach while a disconnected disk holds one leaves a survivor that
+nothing points at. A volume missing from the reachability map counts as unreachable —
+failing open would destroy originals on the strength of an absent map entry.
+
+Companions are deleted with the image. Leaving them would strand sidecars on the one path
+where nothing can be recovered afterwards.
+
 ## Safety invariants (non-negotiable)
 
-1. **Never delete the last verified copy** of a photo.
+1. **Never delete the last verified copy** of a photo — including the companions that
+   carry its edit state.
 2. **Never offload** anything not verified-backed-up.
 3. **Hash-verify** the NAS copy before marking safe or deleting anything local.
 4. On a NAS-less machine, offload of un-backed-up photos is **unavailable**; they

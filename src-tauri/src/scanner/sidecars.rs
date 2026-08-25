@@ -5,6 +5,7 @@
 //! key rule: chairphoto's own `.xmp` (it writes IPTC/keywords there) must NOT count
 //! as an external edit, or every photo we tag would look "edited".
 
+use crate::companions::EditSignal;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
@@ -14,23 +15,27 @@ use std::path::{Path, PathBuf};
 pub fn detect_external_editors(photo_path: &Path) -> Vec<String> {
     let mut found: BTreeSet<String> = BTreeSet::new();
 
-    // RawTherapee (.pp3) and ART (.arp) are identified by extension alone. Both
-    // append the sidecar extension to the full filename (e.g. `DSC1.ARW.pp3`).
-    if appended(photo_path, "pp3").is_some() {
-        found.insert("RawTherapee".into());
-    }
-    if appended(photo_path, "arp").is_some() {
-        found.insert("ART".into());
-    }
-
-    // XMP (`DSC1.ARW.xmp`, darktable's convention; also the basename form `DSC1.xmp`)
-    // may come from darktable, Lightroom/Camera Raw, or chairphoto itself. Attribute
-    // by inspecting the content.
-    for xmp in xmp_candidates(photo_path) {
-        if let Ok(text) = std::fs::read_to_string(&xmp) {
-            if let Some(editor) = attribute_xmp(&text) {
-                found.insert(editor);
+    // Which files can sit beside a photo is declared once, in `crate::companions`, so this
+    // and the backup carry-set cannot drift apart. Each kind says how its presence should
+    // be read:
+    //   ByExtension — RawTherapee's `.pp3`, ART's `.arp`: presence proves an edit.
+    //   ByContent   — `.xmp` comes from darktable, Lightroom *or* chairphoto itself, so
+    //                 only the contents can say (chairphoto's own never counts).
+    //   Never       — RapidRAW's `.rrdata` is written when it *opens* a photo, so its
+    //                 presence proves nothing and must not mark the RAW edited.
+    for companion in crate::companions::found_beside(photo_path) {
+        match crate::companions::lookup(companion.ext).map(|c| c.edit_signal) {
+            Some(EditSignal::ByExtension(editor)) => {
+                found.insert(editor.into());
             }
+            Some(EditSignal::ByContent) => {
+                if let Ok(text) = std::fs::read_to_string(&companion.path) {
+                    if let Some(editor) = attribute_xmp(&text) {
+                        found.insert(editor);
+                    }
+                }
+            }
+            Some(EditSignal::Never) | None => {}
         }
     }
 
@@ -75,28 +80,6 @@ fn attribute_xmp(text: &str) -> Option<String> {
         return Some("Lightroom".into());
     }
     None
-}
-
-/// `<photo_path>.<ext>` if it exists (extension appended to the full filename).
-fn appended(photo_path: &Path, ext: &str) -> Option<PathBuf> {
-    let mut s = photo_path.as_os_str().to_os_string();
-    s.push(".");
-    s.push(ext);
-    let p = PathBuf::from(s);
-    p.is_file().then_some(p)
-}
-
-/// `<photo_path>.xmp` (appended) and `<stem>.xmp` (basename, darktable's alt mode).
-fn xmp_candidates(photo_path: &Path) -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    if let Some(p) = appended(photo_path, "xmp") {
-        out.push(p);
-    }
-    let basename = photo_path.with_extension("xmp");
-    if basename.is_file() && !out.contains(&basename) {
-        out.push(basename);
-    }
-    out
 }
 
 #[cfg(test)]

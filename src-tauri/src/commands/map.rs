@@ -188,7 +188,8 @@ pub async fn reverse_geocode_photo(
         let row: Option<(f64, f64)> = c
             .conn()
             .query_row(
-                "SELECT gps_latitude, gps_longitude FROM photos
+                "-- includes-hidden: by id.
+                 SELECT gps_latitude, gps_longitude FROM photos
                  WHERE id = ?1 AND gps_latitude IS NOT NULL AND gps_longitude IS NOT NULL",
                 rusqlite::params![photo_id],
                 |r| Ok((r.get(0)?, r.get(1)?)),
@@ -284,7 +285,8 @@ pub async fn geocode_to_iptc(
         let row: Option<(f64, f64)> = c
             .conn()
             .query_row(
-                "SELECT gps_latitude, gps_longitude FROM photos
+                "-- includes-hidden: by id.
+                 SELECT gps_latitude, gps_longitude FROM photos
                  WHERE id = ?1 AND gps_latitude IS NOT NULL AND gps_longitude IS NOT NULL",
                 rusqlite::params![photo_id],
                 |r| Ok((r.get(0)?, r.get(1)?)),
@@ -448,9 +450,9 @@ pub async fn geocode_all_to_iptc(
         // Photos with GPS and at least one empty IPTC location column.
         let mut stmt = c.conn().prepare(
             "SELECT id, gps_latitude, gps_longitude
-             FROM photos
+             FROM photos_visible
              WHERE gps_latitude IS NOT NULL AND gps_longitude IS NOT NULL
-               AND missing = 0
+              
                AND (iptc_city IS NULL OR iptc_city = ''
                     OR iptc_state IS NULL OR iptc_state = ''
                     OR iptc_country IS NULL OR iptc_country = ''

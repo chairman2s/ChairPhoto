@@ -285,7 +285,7 @@ export const setLibraryRoot = (path: string) =>
 export const rescanLibrary = () => invoke<ScanResult>("rescan_library");
 
 /** Storage-tier filter for the library: all photos, on-disk only, or NAS-only. */
-export type StorageTier = "all" | "local" | "nas";
+export type StorageTier = "all" | "local" | "nas" | "atRisk" | "stale";
 
 /**
  * Photo sort order.
@@ -779,6 +779,16 @@ export interface DrainSummary {
 }
 export const listPendingOperations = () =>
   invoke<PendingOperation[]>("list_pending_operations");
+/**
+ * Queue an operation for many photos at once — the safety panel's batch action.
+ *
+ * Returns how many were *newly* queued; a photo already waiting is not counted. Nothing
+ * is copied here: the reconcile drain does the work when the NAS is reachable and reports
+ * its own progress, so queueing against an offline NAS is a promise kept later.
+ */
+export const enqueueOperations = (kind: string, photoIds: number[]) =>
+  invoke<number>("enqueue_operations", { kind, photoIds });
+
 export const enqueueOperation = (kind: string, photoId: number) =>
   invoke<number>("enqueue_operation", { kind, photoId });
 export const reconcileNow = () => invoke<DrainSummary>("reconcile_now");
@@ -1588,3 +1598,118 @@ export const proposeStacks = (photoIds: number[]) =>
  */
 export const applyStackProposal = (keeperId: number, memberIds: number[]) =>
   invoke<StackApplied>("apply_stack_proposal", { keeperId, memberIds });
+
+// ── Safety: would I lose this photo if a disk died? (cluster B, B1) ───────────
+
+/**
+ * Where a photo sits on the safety axis — a *second* axis, separate from
+ * `StorageStatus` ("can I display this now"). Ordered worst to best.
+ */
+export type SafetyStatus = "missing" | "atRisk" | "unverified" | "stale" | "safe";
+
+/** Library-wide safety counts. */
+export interface SafetySummary {
+  /** No copy recorded anywhere. */
+  missing: number;
+  /** No copy at home. */
+  atRisk: number;
+  /** A copy at home that has never been hash-verified. */
+  unverified: number;
+  /** Verified at home, but a companion has moved on locally since it was carried. */
+  stale: number;
+  /** Verified at home, companions carried and current. */
+  safe: number;
+  /** `created_at` of the oldest at-risk photo — how long, not just how many. */
+  oldestAtRisk: number | null;
+  /** Carried companions the scanner has looked at since. Freshness is known only for these. */
+  companionsChecked: number;
+  /** Not looked at since being carried: while this is non-zero, `stale` is a floor. */
+  companionsUnchecked: number;
+}
+
+/**
+ * Library-wide safety counts (cluster B, B1).
+ *
+ * Pure SQL on the backend — it never stats a volume, so an unmounted NAS cannot make this
+ * hang. The flip side is that `stale` is only ever true as of the last scan; see
+ * `companionsUnchecked`.
+ */
+export const librarySafetySummary = () => invoke<SafetySummary>("library_safety_summary");
+
+/** One photo's safety bucket. */
+export const photoSafetyStatus = (photoId: number) =>
+  invoke<SafetyStatus>("photo_safety_status", { photoId });
+
+// ── Trash (cluster B, B2) ─────────────────────────────────────────────────────
+
+/** What one trash call did. */
+export interface TrashSummary {
+  /** Photos you named that were not already in the trash. */
+  trashed: number;
+  /** Stack frames hidden along with a master you named. */
+  cascaded: number;
+  /** Photos you named that were already in the trash. */
+  already: number;
+}
+
+/** What emptying the trash did — and what it refused to do. */
+export interface EmptyTrashReport {
+  /** Photos destroyed: every copy deleted, then the catalog row. */
+  deleted: number;
+  /** Files removed — images and their declared companions. */
+  filesDeleted: number;
+  /**
+   * Photos left alone because a volume holding a copy could not be reached. Deleting them
+   * would have destroyed the copies we can see and left an unreferenced survivor.
+   */
+  skippedUnreachable: number[];
+  /**
+   * Photos whose deletion failed part-way, with the reason. Their catalog rows are kept —
+   * a row pointing at a file we could not remove is recoverable, a file with no row is an
+   * orphan nothing can find again.
+   */
+  failed: [number, string][];
+  /** Photos restored while this was running. Restore wins that race by design. */
+  restoredMeanwhile: number[];
+  /**
+   * The run stopped early because it stopped being the owner — a catalog switch, or a
+   * restore. What is reported happened; the rest did not.
+   */
+  aborted: boolean;
+}
+
+/**
+ * Move photos to the trash. Reversible, touches no bytes, and takes each photo's stack
+ * with it — otherwise trashing a master would leave its frames unreachable from every
+ * surface at once.
+ *
+ * Catalog-local, like rating and colour label: trashing here tells no other device
+ * anything.
+ */
+export const trashPhotos = (photoIds: number[]) =>
+  invoke<TrashSummary>("trash_photos", { photoIds });
+
+/** Bring photos back, along with whatever was trashed in the same act. */
+export const restorePhotos = (photoIds: number[]) =>
+  invoke<number>("restore_photos", { photoIds });
+
+/** Everything in the trash, most recently trashed first. */
+export const listTrash = () => invoke<Photo[]>("list_trash");
+
+/**
+ * Destroy trashed photos — the only path in the app that deletes an original.
+ *
+ * Refuses without `confirm`, and refuses per photo unless *every* known copy is reachable:
+ * deleting what we can see while a disconnected disk still holds a copy would leave an
+ * unreferenced survivor. Those photos come back in `skippedUnreachable`.
+ */
+export const emptyTrash = (opts: {
+  photoIds?: number[];
+  olderThanDays?: number;
+  confirm: boolean;
+}) =>
+  invoke<EmptyTrashReport>("empty_trash", {
+    photoIds: opts.photoIds ?? null,
+    olderThanDays: opts.olderThanDays ?? null,
+    confirm: opts.confirm,
+  });

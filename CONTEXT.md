@@ -18,9 +18,16 @@ Design docs live in `docs/`.
 - **Dead** — a device the user has permanently declared broken/unrecoverable. A human
   declaration, never inferred from unreachability. Only death of the master justifies
   promoting another device.
-- **At risk** — the state of a photo that exists on exactly one disk (typically a
-  satellite after card ingest, before home holds a verified copy). Priority one of
-  any sync design is shrinking the time a photo spends at risk.
+- **At risk** — the state of a photo with **no copy at home** (typically a satellite
+  after card ingest, before home holds it). Priority one of any sync design is shrinking
+  the time a photo spends at risk.
+
+  Deliberately *not* "exists on exactly one disk". The two are not the same: home holding
+  the only copy is one disk, and is not at risk — home may be redundant, and is backed up
+  by means the catalog cannot see. Counting disks would raise an alarm about photos in no
+  danger, and an alarm that is wrong the first time is one nobody reads again. The price is
+  that ChairPhoto can only ever speak for the volumes it can see, and any surface reporting
+  safety has to say so.
 - **Original** — the camera file (RAW/JPEG) as first ingested. Never modified,
   never leaves home outbound without an explicit user action per operation.
 
@@ -29,8 +36,13 @@ Design docs live in `docs/`.
 - **Photo identity** — the UUID a photo is given at first import and keeps forever.
   Unique across the catalog: no two photos share one. It is what catalog merge matches
   on, never the path.
-- **Copy** — one file of a photo at one location. A photo may have several. Each copy
-  carries its own sidecar, so identity is discharged per copy, not per photo.
+- **Copy** — a photo's image file at one location, together with its **companions**:
+  the declared sidecars that describe it (develop history, edit state). A photo may have
+  several copies. A copy is not safe until its companions are there too — the pixels
+  without the edit decisions is a different thing from the photo.
+- **Companion** — a file that belongs to a photo but is not the photo, and whose kind is
+  declared rather than inferred: `.xmp`, `.pp3`, `.arp`, `.rrdata`. Each copy carries its
+  own, so identity is discharged per copy, not per photo.
 - **Bound** — a copy whose sidecar carries the photo's identity. The settled state.
 - **Identity debt** — a copy whose sidecar does not yet carry it. Normal and transient:
   an unreachable volume owes just as much as a failed write. Debt is per copy.
@@ -52,9 +64,21 @@ Design docs live in `docs/`.
 - **Trash** — a per-photo metadata state ("in trash"). Hides the photo everywhere;
   reversible; touches no bytes anywhere. Catalog-local, like every other mutable
   per-photo state: trashing a photo on one device tells no other device anything.
-- **Delete** — destroy an original at home. Only possible on the master, only from
-  the trash, only by explicit manual confirmation. Never synchronized, never
-  triggered by another device. Satellites have no delete capability at all.
+
+  Trashing a stack takes the whole stack. Frames are already hidden from the grid by
+  their master, so hiding the master alone would leave them reachable from nowhere.
+  Restoring returns exactly the frames that were trashed in the same act — a frame
+  trashed separately, earlier, stays where it was put.
+- **Delete** — destroy an original. Only from the trash, only by explicit manual
+  confirmation, and only when **every known copy is reachable**. Never synchronized,
+  never triggered by another device.
+
+  Reachability, not role, is the gate. Master-ness is an advisory claim, and an advisory
+  claim cannot guard the one verb with no undo; a device that cannot reach a copy cannot
+  destroy it, which is stronger and needs nothing to be true about identity. "Satellites
+  have no delete capability" then follows from what a device can reach rather than from a
+  flag. And *every* copy, not just the one at home: destroying the copies in reach while a
+  disconnected disk still holds one leaves a survivor that nothing points at.
 
 ## Metadata
 

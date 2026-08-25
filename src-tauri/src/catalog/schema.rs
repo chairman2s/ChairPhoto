@@ -49,6 +49,11 @@ CREATE TABLE IF NOT EXISTS photos (
     -- applied ON TOP of the file's EXIF orientation when rendering. The original is never
     -- rewritten; survives rescans. See protocol.rs (render) and commands::rotate_photo.
     user_rotation          INTEGER NOT NULL DEFAULT 0,
+    -- Trash: when the user hid this photo, or NULL. A timestamp rather than a boolean so
+    -- the trash view can order by it, "empty trash older than N days" is expressible, and
+    -- restoring a stack can find the frames that were trashed *together* (cluster B, D8).
+    -- Catalog-local, like every other mutable per-photo state — see CONTEXT.md.
+    trashed_at             INTEGER,
     -- RAW+JPEG stacking: a derivative (e.g. the camera JPEG) points at its master photo
     -- (the RAW). Children are hidden from the main grid and grouped under the master.
     -- ON DELETE SET NULL so removing the master un-stacks the child (never deletes it).
@@ -299,6 +304,45 @@ CREATE TABLE IF NOT EXISTS photo_edits (
 -- Named, non-destructive versions of a photo (different crops/exposures). Each holds an
 -- opaque edit record (crop + tone), interpreted by the editing module, not core. The
 -- original photo is the implicit unedited base; these are derivatives. See docs/editing.md.
+-- Companion files carried alongside a photo's image at one location (cluster B, D2/D5).
+-- A copy is the image *plus* its declared companions; this records which ones were
+-- actually placed at that location and what the source looked like when they were, so a
+-- later pass can tell "carried and current" from "the local one has moved on since".
+-- `carried_mtime` is the SOURCE file's mtime at carry time, not the destination's: the
+-- question being answered is whether the local file has changed since we copied it.
+-- The photos a user should see. Everything that *lists* or *counts* photos for the user
+-- reads this instead of `photos`, so the visibility rule lives in one place rather than
+-- being re-spelled at every call site (it was spelled 36 times before this view existed).
+--
+-- Deliberately NOT used by: single-row lookups by id (the caller already has the row and
+-- wants it whatever its state), the background indexer queues, and maintenance/purge paths.
+-- Those must see hidden photos, and routing them here would silently change behaviour.
+--
+-- `SELECT *` on purpose: columns are added to `photos` by migration, and the view is
+-- re-resolved on use, so it keeps up without a second column list to maintain.
+DROP VIEW IF EXISTS photos_visible;
+CREATE VIEW photos_visible AS SELECT * FROM photos WHERE missing = 0 AND trashed_at IS NULL;
+
+CREATE TABLE IF NOT EXISTS photo_location_companions (
+    location_id   INTEGER NOT NULL REFERENCES photo_locations(id) ON DELETE CASCADE,
+    -- File name of the companion at that location (e.g. `DSC1.ARW.xmp`).
+    name          TEXT    NOT NULL,
+    -- The source companion's mtime, in whole seconds, when it was carried here.
+    -- **NULL means never carried**: the scanner found this companion beside a local copy
+    -- and there is no copy of it at this location. That is a distinct state from "carried
+    -- and possibly out of date", and collapsing the two is what would let a photo whose
+    -- edit state exists in exactly one place report as safe (cluster B, D5).
+    carried_mtime INTEGER,
+    -- The source file's mtime as the scanner last saw it. NULL = not looked at since the
+    -- carry. Newer than `carried_mtime` — or present when `carried_mtime` is NULL — means
+    -- home is missing an edit this machine has. Recorded rather than computed on read so
+    -- the safety summary stays pure SQL and an unreachable NAS cannot slow it down.
+    source_mtime_seen INTEGER,
+    -- When it was carried. NULL alongside a NULL `carried_mtime`.
+    carried_at    INTEGER,
+    PRIMARY KEY (location_id, name)
+);
+
 CREATE TABLE IF NOT EXISTS photo_versions (
     id         INTEGER PRIMARY KEY,
     photo_id   INTEGER NOT NULL REFERENCES photos(id) ON DELETE CASCADE,

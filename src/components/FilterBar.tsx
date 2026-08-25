@@ -171,6 +171,11 @@ export function FilterBar({
             ["all", "All"],
             ["local", "On disk"],
             ["nas", "On NAS"],
+            // The safety tiers are set from the Safety panel, not chosen here — they are a
+            // different axis and would make this bar a menu. But a filter you cannot see
+            // is a filter you cannot turn off, so the active one appears while it is on.
+            ...(storageTier === "atRisk" ? [["atRisk", "At risk"]] : []),
+            ...(storageTier === "stale" ? [["stale", "Edits not carried home"]] : []),
           ] as [StorageTier, string][]
         ).map(([t, label]) => (
           <button

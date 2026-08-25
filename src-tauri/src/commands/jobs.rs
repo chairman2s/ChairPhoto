@@ -383,6 +383,15 @@ pub struct JobRegistry {
     /// The Smart Tagging embedding index (H7b).
     #[cfg(feature = "smarttags")]
     pub smarttags: JobFamily<SmarttagsJobStatus>,
+    /// Emptying the trash (cluster B, B2) — the only job that destroys originals.
+    ///
+    /// It has a generation for two reasons the other families do not share. A catalog
+    /// switch trips every family, which is what makes an in-flight delete stop applying
+    /// one catalog's photo ids to another's rows. And **Restore trips it too**: a user who
+    /// pulls a photo back out of the trash while a delete is walking the filesystem must
+    /// win that race, because the alternative is destroying something they just asked to
+    /// keep. No status slot — the delete reports its own terminal result.
+    pub trash: AbortGeneration,
     /// The sidecar-identity repair pass (#34) — retries `pending_sidecar_identity`.
     ///
     /// Not feature-gated, and the first family here that isn't: identity debt is core, so
@@ -417,6 +426,7 @@ impl JobRegistry {
             faces_match,
             sharpness: _,
             phash: _,
+            trash: _,
             #[cfg(feature = "smarttags")]
             smarttags,
             identity,
@@ -449,6 +459,7 @@ impl JobRegistry {
             faces_match,
             sharpness,
             phash,
+            trash,
             #[cfg(feature = "smarttags")]
             smarttags,
             identity,
@@ -461,6 +472,7 @@ impl JobRegistry {
             faces_match: faces_match.abort.lock()?,
             sharpness: sharpness.lock()?,
             phash: phash.lock()?,
+            trash: trash.lock()?,
             #[cfg(feature = "smarttags")]
             smarttags: smarttags.abort.lock()?,
             identity: identity.abort.lock()?,
@@ -477,6 +489,7 @@ pub struct AbortGuards<'a> {
     faces_match: MutexGuard<'a, Arc<AtomicBool>>,
     sharpness: MutexGuard<'a, Arc<AtomicBool>>,
     phash: MutexGuard<'a, Arc<AtomicBool>>,
+    trash: MutexGuard<'a, Arc<AtomicBool>>,
     #[cfg(feature = "smarttags")]
     smarttags: MutexGuard<'a, Arc<AtomicBool>>,
     identity: MutexGuard<'a, Arc<AtomicBool>>,
@@ -493,6 +506,7 @@ impl AbortGuards<'_> {
             faces_match,
             sharpness,
             phash,
+            trash,
             #[cfg(feature = "smarttags")]
             smarttags,
             identity,
@@ -504,6 +518,7 @@ impl AbortGuards<'_> {
         faces_match.store(true, Ordering::Relaxed);
         sharpness.store(true, Ordering::Relaxed);
         phash.store(true, Ordering::Relaxed);
+        trash.store(true, Ordering::Relaxed);
         #[cfg(feature = "smarttags")]
         smarttags.store(true, Ordering::Relaxed);
         identity.store(true, Ordering::Relaxed);
@@ -537,6 +552,7 @@ impl AbortGuards<'_> {
                 ref mut faces_match,
             ref mut sharpness,
             ref mut phash,
+            ref mut trash,
             #[cfg(feature = "smarttags")]
                 ref mut smarttags,
             ref mut identity,
@@ -550,6 +566,7 @@ impl AbortGuards<'_> {
         }
         **sharpness = Arc::new(AtomicBool::new(false));
         **phash = Arc::new(AtomicBool::new(false));
+        **trash = Arc::new(AtomicBool::new(false));
         #[cfg(feature = "smarttags")]
         {
             **smarttags = Arc::new(AtomicBool::new(false));
@@ -648,6 +665,41 @@ mod tests {
 
     fn status(job: u64, done: usize) -> TestStatus {
         TestStatus { job, done }
+    }
+
+    /// A catalog switch must make every in-flight worker stop being an owner — including
+    /// the one that deletes originals. Without this, an `empty_trash` worker planned
+    /// against catalog A would carry on deleting A's files and then apply A's numeric photo
+    /// ids to catalog B's rows.
+    ///
+    /// The registry is destructured without `..` precisely so a new family cannot skip
+    /// this; the test is here so the *behaviour* is pinned as well as the compile error.
+    #[test]
+    fn a_switch_trips_the_trash_generation_along_with_every_other() {
+        let jobs = JobRegistry::default();
+        let held = jobs.trash.installed().unwrap();
+        let scan_held = jobs.scan.installed().unwrap();
+        assert!(!held.load(Ordering::Relaxed), "a fresh generation is not tripped");
+
+        jobs.lock_for_publish().unwrap().trip_and_replace_all();
+
+        assert!(held.load(Ordering::Relaxed), "the delete worker is no longer the owner");
+        assert!(scan_held.load(Ordering::Relaxed), "and so is everyone else");
+        assert!(
+            !jobs.trash.installed().unwrap().load(Ordering::Relaxed),
+            "while a fresh generation is installed for whatever starts next"
+        );
+    }
+
+    /// Cancelling is the same trip, which is what lets Restore stand a delete down.
+    #[test]
+    fn tripping_the_trash_family_stops_a_worker_holding_its_flag() {
+        let jobs = JobRegistry::default();
+        let worker_flag = jobs.trash.install_fresh().unwrap();
+
+        jobs.trash.trip().unwrap();
+
+        assert!(worker_flag.load(Ordering::Relaxed));
     }
 
     fn open_catalog(tag: &str) -> (Mutex<Option<Catalog>>, crate::test_support::TestSubPath) {

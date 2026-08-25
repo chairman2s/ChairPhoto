@@ -57,8 +57,8 @@ impl Catalog {
         let mut stmt = self.conn.prepare(
             "SELECT a.id, a.uuid, a.name, a.note,
                     (SELECT COUNT(*) FROM album_photos ap
-                     JOIN photos p ON p.id = ap.photo_id
-                     WHERE ap.album_id = a.id AND p.missing = 0) AS photo_count
+                     JOIN photos_visible p ON p.id = ap.photo_id
+                     WHERE ap.album_id = a.id) AS photo_count
              FROM albums a
              ORDER BY a.position, a.name",
         )?;

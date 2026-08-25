@@ -119,6 +119,11 @@ pub enum StorageTier {
     Local,
     /// Offloaded: no local copy, but a backup exists.
     Nas,
+    /// No copy at home — the panel's "show me" for the at-risk count.
+    AtRisk,
+    /// A companion has moved on locally since it was carried home, so home holds an
+    /// older edit than this machine does.
+    Stale,
 }
 
 /// Sort order for the library view.
@@ -142,7 +147,13 @@ pub(crate) fn photo_columns(alias: &str) -> String {
          {alias}.pick_state, {alias}.capture_time, {alias}.width, {alias}.height,
          {alias}.camera_model, {alias}.lens, {alias}.aperture, {alias}.shutter_speed,
          {alias}.iso, {alias}.external_editors, {alias}.thumbnail_path,
-         (SELECT COUNT(*) FROM photos c WHERE c.stack_parent_id = {alias}.id),
+         -- includes-hidden: the stack badge counts derivatives the grid would not list
+         -- on their own. Offline children still count — a stack of three showing as two
+         -- because a disk is unplugged is a worse lie than counting it — but trashed ones
+         -- do not, because that is a decision the user made about this photo rather than
+         -- a fact about a disk.
+         (SELECT COUNT(*) FROM photos c
+          WHERE c.stack_parent_id = {alias}.id AND c.trashed_at IS NULL),
          {alias}.stack_parent_id, {alias}.metadata_ready, {alias}.sharpness,
          {alias}.sharpness_method, {alias}.burst_flag,
          (SELECT COUNT(*) FROM photo_versions pv WHERE pv.photo_id = {alias}.id)"
@@ -248,13 +259,10 @@ impl Catalog {
     /// Every value reaching SQL is bound; the only interpolated text is from fixed
     /// allowlists (the enums above and `facet_predicate_owned`).
     fn build_query(&self, query: &PhotoQuery) -> Result<QuerySql> {
-        let mut from = String::from("photos p");
+        let mut from = String::from("photos_visible p");
         // Stacked derivatives (e.g. a camera JPEG under its RAW) are hidden from the
         // main grid; they're reached via the master's Stack section in the inspector.
-        let mut wheres = vec![
-            "p.missing = 0".to_string(),
-            "p.stack_parent_id IS NULL".to_string(),
-        ];
+        let mut wheres = vec!["p.stack_parent_id IS NULL".to_string()];
         let mut bind: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
 
         if let Some(tid) = query.tag_id {
@@ -333,6 +341,20 @@ impl Catalog {
                    WHERE l.photo_id = p.id AND v.kind = 'local') \
                  AND EXISTS (SELECT 1 FROM photo_locations l JOIN volumes v ON v.id = l.volume_id \
                    WHERE l.photo_id = p.id AND v.kind = 'backup')"
+                    .into(),
+            ),
+            // The safety axis, shared with `library_safety_summary` through the same
+            // fragments so the panel's count and the list it shows you cannot disagree.
+            StorageTier::AtRisk => wheres.push(format!(
+                "{any} AND NOT {home}",
+                any = super::safety::ANY_COPY_EXISTS,
+                home = super::safety::HOME_COPY_EXISTS,
+            )),
+            StorageTier::Stale => wheres.push(
+                "EXISTS (SELECT 1 FROM photo_location_companions c \
+                   JOIN photo_locations l ON l.id = c.location_id \
+                   WHERE l.photo_id = p.id AND c.source_mtime_seen IS NOT NULL \
+                     AND c.source_mtime_seen > c.carried_mtime)"
                     .into(),
             ),
         }

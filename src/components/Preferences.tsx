@@ -36,6 +36,7 @@ import {
 } from "../modules/host";
 import { ModuleSettings } from "../modules/ModuleContent";
 import { VolumesSection } from "./VolumesPanel";
+import { SafetySection } from "./SafetyPanel";
 import { ModulesSection } from "./ModulesPanel";
 
 // One preferences dialog. Fixed tabs: Storage (library root + volumes) and Modules
@@ -44,10 +45,13 @@ import { ModulesSection } from "./ModulesPanel";
 export function Preferences({
   onClose,
   onLibraryRootChanged,
+  onShowStorageTier,
 }: {
   onClose: () => void;
   /** Called after the library root is re-rooted, so the app can prompt a rescan. */
   onLibraryRootChanged: () => void;
+  /** Filter the grid to a safety bucket. Closing is the caller's business. */
+  onShowStorageTier?: (tier: import("../modules/api").StorageTier) => void;
 }) {
   // Re-render when modules enable/disable (moduleTabs filters by m.enabled) or contribute
   // settings panels (settingsPanelsForModule) — not on selection or other contribution types.
@@ -110,6 +114,7 @@ export function Preferences({
               <>
                 <LibrarySection onChanged={onLibraryRootChanged} />
                 <VolumesSection />
+                <SafetySection onShowTier={onShowStorageTier} />
                 <TieringSection onChanged={onLibraryRootChanged} />
                 <MaintenanceSection onChanged={onLibraryRootChanged} />
               </>

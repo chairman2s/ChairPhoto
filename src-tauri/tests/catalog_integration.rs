@@ -755,8 +755,10 @@ fn lifecycle_backup_offload_restore_with_verification() {
     assert_eq!(catalog.photo_storage_status(id).unwrap(), StorageStatus::LocalOnly);
 
     // Back up: copies to the NAS (mirroring the relative path), hash-verified.
-    let hash = catalog.backup_photo(id, nas).unwrap();
+    let report = catalog.backup_photo(id, nas).unwrap();
+    assert_eq!(report.backed_up, vec![id], "a photo with no stack backs up alone");
     let nas_copy = nas_dir.join("2015/06/01/DSC1.ARW");
+    let hash = chairphoto_lib::catalog::sha256_file(&nas_copy).unwrap();
     assert!(nas_copy.is_file());
     assert_eq!(std::fs::read(&nas_copy).unwrap(), b"original-bytes");
     assert_eq!(catalog.photo_storage_status(id).unwrap(), StorageStatus::BackedUp);
@@ -769,9 +771,14 @@ fn lifecycle_backup_offload_restore_with_verification() {
     assert_eq!(catalog.require_photo_path(id).unwrap(), nas_copy);
 
     // Restore: pulls the NAS copy back to local, hash-verified → BackedUp again.
-    let rhash = catalog.restore_photo(id, local_id).unwrap();
-    assert_eq!(rhash, hash);
+    let restored = catalog.restore_photo(id, local_id).unwrap();
+    assert_eq!(restored.restored, vec![id], "a photo with no stack comes back alone");
     assert!(raw.exists(), "restored local copy");
+    assert_eq!(
+        chairphoto_lib::catalog::sha256_file(&raw).unwrap(),
+        hash,
+        "the bytes that came back are the bytes that were verified at home"
+    );
     assert_eq!(catalog.photo_storage_status(id).unwrap(), StorageStatus::BackedUp);
 
     // Tampered backup: offload must refuse (invariant 3 — hash-verify before delete).
@@ -919,6 +926,200 @@ fn offload_carries_companions_home_first_and_restore_brings_them_back() {
         std::fs::read(&local_sidecar).unwrap(),
         b"masks",
         "and it comes back with the photo"
+    );
+}
+
+/// A local original in the catalog, at `path`. The stack tests need three or four of
+/// these each, and the setup is the noise around what they are actually asserting.
+fn local_photo(catalog: &Catalog, path: &std::path::Path, bytes: &[u8]) -> i64 {
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, bytes).unwrap();
+    catalog.upsert_photo(path, None, 1, bytes.len() as i64).unwrap().id
+}
+
+/// A reachable backup volume beside the catalog root.
+fn nas_volume(catalog: &Catalog, root: &std::path::Path) -> (i64, PathBuf) {
+    let dir = root.parent().unwrap().join("nas");
+    std::fs::create_dir_all(&dir).unwrap();
+    (catalog.add_volume("NAS", &dir, VolumeKind::Backup).unwrap(), dir)
+}
+
+/// A stack is how a burst is stored, so a tile is a *moment* rather than a file. Trash has
+/// taken the whole stack since cluster B; offload and backup took the master alone, which
+/// is #82 — offloading a stack expecting the burst back and getting only the keeper's
+/// bytes defeats the verb.
+#[test]
+fn offload_and_backup_take_the_stack_the_way_trash_does() {
+    let (catalog, root) = temp_catalog("stack-offload");
+    let (nas, nas_dir) = nas_volume(&catalog, &root);
+
+    let raw = root.join("2026/08/DSC1.ARW");
+    let jpg = root.join("2026/08/DSC1.JPG");
+    let master = local_photo(&catalog, &raw, b"raw-bytes");
+    let frame = local_photo(&catalog, &jpg, b"jpeg-bytes");
+    catalog.set_stack_parent(frame, master).unwrap();
+
+    // Only the master is ever named. Both are acted on.
+    let backed = catalog.backup_photo(master, nas).unwrap();
+    assert_eq!(backed.backed_up, vec![master, frame], "backup took the frame too");
+    assert!(backed.skipped.is_empty());
+    assert!(nas_dir.join("2026/08/DSC1.JPG").is_file(), "the frame reached home");
+
+    let freed = catalog.offload_photo(master).unwrap();
+    assert_eq!(freed.freed, vec![master, frame]);
+    assert!(freed.skipped.is_empty());
+    assert!(!raw.exists(), "master freed");
+    assert!(!jpg.exists(), "and the frame with it — the bytes that used to stay local");
+    assert_eq!(catalog.photo_storage_status(frame).unwrap(), StorageStatus::Archived);
+}
+
+/// Invariant 2 ("never offload without a verified backup") is decided **per frame**. A
+/// frame whose own backup is missing stays local on its own account, rather than being
+/// freed on the strength of the master's — and the report names it, the way `empty_trash`
+/// reports what it refused.
+#[test]
+fn a_frame_without_its_own_verified_backup_is_left_local_and_named() {
+    let (catalog, root) = temp_catalog("stack-offload-gate");
+    let (nas, _nas_dir) = nas_volume(&catalog, &root);
+
+    // The master is backed up *before* the frame exists, so the frame never gets one.
+    let raw = root.join("2026/08/DSC1.ARW");
+    let master = local_photo(&catalog, &raw, b"raw-bytes");
+    catalog.backup_photo(master, nas).unwrap();
+
+    let jpg = root.join("2026/08/DSC1.JPG");
+    let frame = local_photo(&catalog, &jpg, b"jpeg-bytes");
+    catalog.set_stack_parent(frame, master).unwrap();
+
+    let freed = catalog.offload_photo(master).unwrap();
+
+    assert_eq!(freed.freed, vec![master], "only what had a verified backup was freed");
+    assert_eq!(freed.skipped.len(), 1);
+    assert_eq!(freed.skipped[0].0, frame);
+    assert!(
+        freed.skipped[0].1.contains("no verified backup"),
+        "the reason travels with the id: {}",
+        freed.skipped[0].1
+    );
+    assert!(jpg.exists(), "the frame is still local, because its own backup is not there");
+    assert!(!raw.exists(), "the master, which does have one, was freed");
+}
+
+/// Backup gates each frame on its own local copy, and reports what it could not take —
+/// the mirror of the offload gate above.
+#[test]
+fn backup_gates_each_frame_on_its_own_local_copy() {
+    let (catalog, root) = temp_catalog("stack-backup-gate");
+    let (nas, nas_dir) = nas_volume(&catalog, &root);
+
+    let raw = root.join("2026/08/DSC1.ARW");
+    let jpg = root.join("2026/08/DSC1.JPG");
+    let master = local_photo(&catalog, &raw, b"raw-bytes");
+    let frame = local_photo(&catalog, &jpg, b"jpeg-bytes");
+    catalog.set_stack_parent(frame, master).unwrap();
+    // The frame's file is gone from disk (a removed card copy, a manual delete): there is
+    // nothing to send home for it.
+    std::fs::remove_file(&jpg).unwrap();
+
+    let backed = catalog.backup_photo(master, nas).unwrap();
+
+    assert_eq!(backed.backed_up, vec![master]);
+    assert_eq!(backed.skipped.len(), 1);
+    assert_eq!(backed.skipped[0].0, frame);
+    assert!(
+        backed.skipped[0].1.contains("no local copy"),
+        "and says why: {}",
+        backed.skipped[0].1
+    );
+    assert!(nas_dir.join("2026/08/DSC1.ARW").is_file(), "the master still went home");
+}
+
+/// A storage verb pressed on a frame acts on the frame. Stacks are one level deep, so a
+/// frame has nothing under it — the same asymmetry `restore_photos` has, where restoring a
+/// child does not restore its master.
+#[test]
+fn offloading_a_frame_leaves_its_master_alone() {
+    let (catalog, root) = temp_catalog("stack-offload-frame");
+    let (nas, _nas_dir) = nas_volume(&catalog, &root);
+
+    let raw = root.join("2026/08/DSC1.ARW");
+    let jpg = root.join("2026/08/DSC1.JPG");
+    let master = local_photo(&catalog, &raw, b"raw-bytes");
+    let frame = local_photo(&catalog, &jpg, b"jpeg-bytes");
+    catalog.set_stack_parent(frame, master).unwrap();
+    catalog.backup_photo(master, nas).unwrap();
+
+    let freed = catalog.offload_photo(frame).unwrap();
+
+    assert_eq!(freed.freed, vec![frame]);
+    assert!(!jpg.exists(), "the frame was freed");
+    assert!(raw.exists(), "its master was not — the user named the frame");
+}
+
+/// The round trip: offload frees the moment, restore brings the moment back. A stack that
+/// went to the NAS as two frames and came back as one would be #82's asymmetry pointing
+/// the other way.
+#[test]
+fn restore_brings_the_whole_stack_back() {
+    let (catalog, root) = temp_catalog("stack-restore");
+    let (nas, _nas_dir) = nas_volume(&catalog, &root);
+    let local_id = catalog
+        .list_volumes()
+        .unwrap()
+        .into_iter()
+        .find(|v| v.kind == VolumeKind::Local)
+        .unwrap()
+        .id;
+
+    let raw = root.join("2026/08/DSC1.ARW");
+    let jpg = root.join("2026/08/DSC1.JPG");
+    let master = local_photo(&catalog, &raw, b"raw-bytes");
+    let frame = local_photo(&catalog, &jpg, b"jpeg-bytes");
+    catalog.set_stack_parent(frame, master).unwrap();
+    catalog.backup_photo(master, nas).unwrap();
+    catalog.offload_photo(master).unwrap();
+    assert!(!raw.exists() && !jpg.exists(), "the whole stack is away");
+
+    let restored = catalog.restore_photo(master, local_id).unwrap();
+
+    assert_eq!(restored.restored, vec![master, frame]);
+    assert!(restored.skipped.is_empty());
+    assert_eq!(std::fs::read(&jpg).unwrap(), b"jpeg-bytes", "the frame came back too");
+    assert_eq!(catalog.photo_storage_status(frame).unwrap(), StorageStatus::BackedUp);
+
+    // Restoring again is a no-op for what is already here: the frame is not re-copied over.
+    let again = catalog.restore_photo(master, local_id).unwrap();
+    assert_eq!(again.restored, vec![master], "only the named photo, which restore always re-fetches");
+}
+
+/// `<sidecar>.chairphoto-backup` is the sidecar as it looked before ChairPhoto first wrote
+/// it, and it is **per copy**: carrying it home would routinely leave two different backups
+/// for one photo, which the divergence rule then refuses to offload over, and deleting it
+/// would destroy that record during a routine space-freeing operation. So offload leaves
+/// it — and reports it, so the one file left in an otherwise empty folder is something the
+/// verb said rather than something the user finds (#82).
+#[test]
+fn offload_leaves_a_sidecar_backup_in_place_and_reports_it() {
+    let (catalog, root) = temp_catalog("sidecar-backup-left");
+    let (nas, nas_dir) = nas_volume(&catalog, &root);
+
+    let raw = root.join("2026/08/DSC1.ARW");
+    let master = local_photo(&catalog, &raw, b"raw-bytes");
+    let sidecar = root.join("2026/08/DSC1.ARW.xmp");
+    let sidecar_backup = root.join("2026/08/DSC1.ARW.xmp.chairphoto-backup");
+    std::fs::write(&sidecar, b"<x>chairphoto wrote this</x>").unwrap();
+    std::fs::write(&sidecar_backup, b"<x>darktable, before chairphoto</x>").unwrap();
+    catalog.backup_photo(master, nas).unwrap();
+
+    let freed = catalog.offload_photo(master).unwrap();
+
+    assert_eq!(freed.sidecar_backups_left, 1, "counted, so the verb can say what it left");
+    assert!(sidecar_backup.is_file(), "and left: it is the only record of the earlier sidecar");
+    assert!(!sidecar.exists(), "while the sidecar itself went home and was freed");
+    assert!(!raw.exists());
+    assert!(
+        !nas_dir.join("2026/08/DSC1.ARW.xmp.chairphoto-backup").exists(),
+        "never carried either — home has its own copy's backup to keep"
     );
 }
 

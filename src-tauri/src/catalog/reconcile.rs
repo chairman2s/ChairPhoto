@@ -133,7 +133,7 @@ impl Catalog {
         for op in self.list_pending_operations()? {
             let result = match op.kind.as_str() {
                 "backup" => self.backup_photo(op.photo_id, backup_id).map(|_| ()),
-                "offload" => self.offload_photo(op.photo_id),
+                "offload" => self.offload_photo(op.photo_id).map(|_| ()),
                 "restore" => match local {
                     Some(l) => self.restore_photo(op.photo_id, l.id).map(|_| ()),
                     None => Err(CatalogError::Validation("no local volume".into())),

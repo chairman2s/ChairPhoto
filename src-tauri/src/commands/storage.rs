@@ -6,7 +6,7 @@
 
 use super::*;
 use std::sync::atomic::Ordering;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, State};
 
@@ -46,7 +46,15 @@ pub async fn enqueue_operations(
 // Each runs the E3 plan→IO→record split so the (possibly network) copy never holds
 // the catalog lock or blocks the UI thread.
 
-async fn do_backup(state: &State<'_, AppState>, photo_id: i64, backup_id: i64) -> Result<(), String> {
+/// Back up one photo — the named photo or one frame of its stack.
+///
+/// Split out so the stack cascade in [`do_backup`] applies exactly the same rules to a
+/// frame as to the master, including the idempotency below.
+async fn do_backup_one(
+    state: &State<'_, AppState>,
+    plan: crate::catalog::PhotoBackup,
+) -> Result<(), String> {
+    let crate::catalog::PhotoBackup { photo_id, source, dest, rel, volume_id } = plan;
     // Idempotent: if a verified backup file already exists, do NOT re-copy it. Re-copying
     // a good backup is pointless and — over a flaky mount — risks destroying it. A missing
     // backup returns false here, so it's still (re-)created below.
@@ -58,10 +66,6 @@ async fn do_backup(state: &State<'_, AppState>, photo_id: i64, backup_id: i64) -
     // companions are reconciled, which is idempotent and copies nothing when they are
     // already there.
     if with_catalog(state, |c| c.has_verified_backup(photo_id))? {
-        let (source, dest, rel, volume_id) = with_catalog(state, |c| {
-            let p = c.plan_backup(photo_id, backup_id)?;
-            Ok((p.source, p.dest, p.rel, p.volume_id))
-        })?;
         let carried = tauri::async_runtime::spawn_blocking(move || {
             crate::catalog::carry_companions(&source, &dest)
         })
@@ -79,10 +83,6 @@ async fn do_backup(state: &State<'_, AppState>, photo_id: i64, backup_id: i64) -
             Ok(())
         });
     }
-    let (source, dest, rel, volume_id) = with_catalog(state, |c| {
-        let p = c.plan_backup(photo_id, backup_id)?;
-        Ok((p.source, p.dest, p.rel, p.volume_id))
-    })?;
     // A copy is the image plus its declared companions, and `copy_with_companions` is the
     // one place that knows it — so this path cannot carry a different set from the sync
     // wrapper, or forget to carry at all. Missing that here is what #80 was.
@@ -97,29 +97,59 @@ async fn do_backup(state: &State<'_, AppState>, photo_id: i64, backup_id: i64) -
     })
 }
 
-async fn do_offload(state: &State<'_, AppState>, photo_id: i64) -> Result<(), String> {
+/// Back up a photo **and the frames stacked under it** (#82): the plan carries the whole
+/// stack, so every caller of this runner — the inspector button, the reconcile drain —
+/// inherits the cascade rather than each deciding for itself.
+///
+/// The named photo's failure is the call's failure; a frame that fails is reported and the
+/// rest continue, because the master is already at home by then.
+async fn do_backup(
+    state: &State<'_, AppState>,
+    photo_id: i64,
+    backup_id: i64,
+) -> Result<crate::catalog::BackupReport, String> {
+    let plan = with_catalog(state, |c| c.plan_backup(photo_id, backup_id))?;
+    let mut report =
+        crate::catalog::BackupReport { skipped: plan.skipped, ..Default::default() };
+    do_backup_one(state, plan.named).await?;
+    report.backed_up.push(photo_id);
+    for frame in plan.frames {
+        let frame_id = frame.photo_id;
+        match do_backup_one(state, frame).await {
+            Ok(()) => report.backed_up.push(frame_id),
+            Err(e) => report.skipped.push((frame_id, e)),
+        }
+    }
+    Ok(report)
+}
+
+/// Free a photo's local copies **and its stack frames'** (#82), then report what it did:
+/// which photos were freed, which frames were left local and why, and what it deliberately
+/// left on disk.
+async fn do_offload(
+    state: &State<'_, AppState>,
+    photo_id: i64,
+) -> Result<crate::catalog::OffloadReport, String> {
     let plan = with_catalog(state, |c| c.plan_offload(photo_id))?;
-    let volume_ids = plan.local_volume_ids.clone();
     // Persist an id-keyed thumbnail from a local copy BEFORE it's deleted, so the photo
-    // stays visible in the grid once only the (possibly offline) NAS copy remains.
-    if let Some(local) = plan.local_files.first().cloned() {
+    // stays visible in the grid once only the (possibly offline) NAS copy remains. Frames
+    // need it as much as the master: they are what the inspector's Stack section shows.
+    for member in std::iter::once(&plan.named).chain(plan.frames.iter()) {
+        let Some(local) = member.local_files.first().cloned() else { continue };
+        let id = member.photo_id;
         let _ = tauri::async_runtime::spawn_blocking(move || {
-            crate::thumbnails::ensure_persistent_thumb(photo_id, &local)
+            crate::thumbnails::ensure_persistent_thumb(id, &local)
         })
         .await;
     }
-    let backup_location_id = plan.backup_location_id;
-    let carried =
+    let carry =
         tauri::async_runtime::spawn_blocking(move || crate::catalog::verify_and_delete_locals(&plan))
             .await
             .map_err(|e| e.to_string())?
             .map_err(|e| e.to_string())?;
-    with_catalog(state, |c| {
-        // Before `commit_offload`: it drops the local location rows, and companion rows
-        // cascade with them.
-        c.record_companions(backup_location_id, &carried)?;
-        c.commit_offload(photo_id, &volume_ids)
-    })
+    // Companions are recorded before the local rows go away, per freed photo — see
+    // `commit_offload_carry`.
+    with_catalog(state, |c| c.commit_offload_carry(carry))
 }
 
 // ── Trash (cluster B, B2) ────────────────────────────────────────────────────
@@ -434,19 +464,29 @@ pub async fn apply_offload_policy(state: State<'_, AppState>) -> Result<usize, S
     }
     let candidates = with_catalog(&state, |c| c.photos_eligible_for_offload(age))?;
     let mut offloaded = 0usize;
+    // A stack's frames are eligible in their own right, and the master's offload already
+    // freed them (#82). Without this, the sweep would run a second no-op offload per frame
+    // and count each one twice.
+    let mut already_freed: HashSet<i64> = HashSet::new();
     for id in candidates {
-        if do_offload(&state, id).await.is_ok() {
-            offloaded += 1;
+        if already_freed.contains(&id) {
+            continue;
+        }
+        if let Ok(report) = do_offload(&state, id).await {
+            offloaded += report.freed.len();
+            already_freed.extend(report.freed);
         }
     }
     Ok(offloaded)
 }
 
-async fn do_restore(state: &State<'_, AppState>, photo_id: i64, local_id: i64) -> Result<(), String> {
-    let (source, dest, rel, volume_id, expected_hash) = with_catalog(state, |c| {
-        let p = c.plan_restore(photo_id, local_id)?;
-        Ok((p.source, p.dest, p.rel, p.volume_id, p.expected_hash))
-    })?;
+/// Bring one photo home — the named photo or one frame of its stack.
+async fn do_restore_one(
+    state: &State<'_, AppState>,
+    plan: crate::catalog::PhotoRestore,
+) -> Result<(), String> {
+    let crate::catalog::PhotoRestore { photo_id, source, dest, rel, volume_id, expected_hash } =
+        plan;
     // Companions come back with the image: a restored photo must arrive with the edit state
     // an offload moved home, not as bare pixels. This path had drifted from the sync
     // wrapper and did exactly that until the shared seam made it impossible.
@@ -461,18 +501,47 @@ async fn do_restore(state: &State<'_, AppState>, photo_id: i64, local_id: i64) -
     })
 }
 
-/// Back up a photo to the single backup volume. If the NAS is offline this errors;
-/// the UI queues a backup op instead (drained on reconcile).
+/// Restore a photo **and the frames stacked under it** that are not already home — the
+/// third verb of the same rule: offload frees the moment, so restore brings it back (#82).
+async fn do_restore(
+    state: &State<'_, AppState>,
+    photo_id: i64,
+    local_id: i64,
+) -> Result<crate::catalog::RestoreReport, String> {
+    let plan = with_catalog(state, |c| c.plan_restore(photo_id, local_id))?;
+    let mut report =
+        crate::catalog::RestoreReport { skipped: plan.skipped, ..Default::default() };
+    do_restore_one(state, plan.named).await?;
+    report.restored.push(photo_id);
+    for frame in plan.frames {
+        let frame_id = frame.photo_id;
+        match do_restore_one(state, frame).await {
+            Ok(()) => report.restored.push(frame_id),
+            Err(e) => report.skipped.push((frame_id, e)),
+        }
+    }
+    Ok(report)
+}
+
+/// Back up a photo — and its stack — to the single backup volume. If the NAS is offline
+/// this errors; the UI queues a backup op instead (drained on reconcile).
 #[tauri::command]
-pub async fn backup_photo(state: State<'_, AppState>, photo_id: i64) -> Result<(), String> {
+pub async fn backup_photo(
+    state: State<'_, AppState>,
+    photo_id: i64,
+) -> Result<crate::catalog::BackupReport, String> {
     let backup_id =
         with_catalog(&state, |c| single_volume_of_kind(c, crate::catalog::VolumeKind::Backup, "backup"))?;
     do_backup(&state, photo_id, backup_id).await
 }
 
-/// Free a photo's local copies (only after re-verifying its backup). Off the UI thread.
+/// Free a photo's local copies — and its stack frames' — after re-verifying each backup.
+/// Off the UI thread.
 #[tauri::command]
-pub async fn offload_photo(state: State<'_, AppState>, photo_id: i64) -> Result<(), String> {
+pub async fn offload_photo(
+    state: State<'_, AppState>,
+    photo_id: i64,
+) -> Result<crate::catalog::OffloadReport, String> {
     do_offload(&state, photo_id).await
 }
 
@@ -1134,9 +1203,13 @@ pub async fn purge_empty_photos(
         .collect())
 }
 
-/// Restore a photo's backup copy to the single local volume, hash-verified.
+/// Restore a photo's backup copy — and its stack's — to the single local volume,
+/// hash-verified.
 #[tauri::command]
-pub async fn restore_photo(state: State<'_, AppState>, photo_id: i64) -> Result<(), String> {
+pub async fn restore_photo(
+    state: State<'_, AppState>,
+    photo_id: i64,
+) -> Result<crate::catalog::RestoreReport, String> {
     let local_id =
         with_catalog(&state, |c| single_volume_of_kind(c, crate::catalog::VolumeKind::Local, "local"))?;
     do_restore(&state, photo_id, local_id).await
@@ -1177,10 +1250,12 @@ pub async fn reconcile_now(
     };
     for op in pending {
         let result = match op.kind.as_str() {
-            "backup" => do_backup(&state, op.photo_id, backup_id).await,
-            "offload" => do_offload(&state, op.photo_id).await,
+            // The reports are for the caller who pressed a button; the drain only needs
+            // to know whether the op can be cleared from the queue.
+            "backup" => do_backup(&state, op.photo_id, backup_id).await.map(|_| ()),
+            "offload" => do_offload(&state, op.photo_id).await.map(|_| ()),
             "restore" => match local_id {
-                Some(l) => do_restore(&state, op.photo_id, l).await,
+                Some(l) => do_restore(&state, op.photo_id, l).await.map(|_| ()),
                 None => Err("no local volume".into()),
             },
             other => Err(format!("unknown operation: {other}")),

@@ -864,10 +864,11 @@ fn new_root() -> Element {
     root
 }
 
+/// Where this sidecar's pre-chairphoto backup goes. Defined in `companions`, because
+/// offload has to recognise these files without deleting them (#82) and a second spelling
+/// of the suffix would let the two drift.
 fn sidecar_backup_path(sidecar: &Path) -> PathBuf {
-    let mut s = sidecar.as_os_str().to_os_string();
-    s.push(".chairphoto-backup");
-    PathBuf::from(s)
+    crate::companions::sidecar_backup(sidecar)
 }
 
 fn now() -> i64 {

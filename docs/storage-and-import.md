@@ -241,6 +241,15 @@ Carrying is idempotent — an identical file already at the destination is adopt
 than rewritten — so a companion placed there by any other means is absorbed on the next
 pass instead of being re-copied or causing a conflict.
 
+**A sidecar backup is not a companion.** `<sidecar>.chairphoto-backup` — the copy the XMP
+safety rule takes before ChairPhoto's first write — is **per copy** by construction: each
+copy's sidecar had its own pre-ChairPhoto state, and the NAS copy already has its own. So
+offload neither carries it (two backups for one photo is exactly what the divergence rule
+refuses to offload over) nor deletes it (that would destroy the only record of the earlier
+sidecar, during a routine space-freeing operation, for a few KB). It is left in place and
+**reported**, so the one file left in an otherwise emptied folder is something the verb
+said rather than something the user discovers (#82).
+
 `verified_hash` deliberately stays a hash of the **image only**. The image is immutable, so
 a changed hash means bit rot; companions are mutable by design (darktable rewrites `.xmp` on
 every edit, and so does chairphoto on IPTC/GPS/face writes), so hashing them would report
@@ -355,6 +364,35 @@ trashed inside one second would restore together.
 A trashed frame stops counting toward its master's stack badge; an *offline* one still
 counts. The difference is that one is a decision about the photo and the other is a fact
 about a disk.
+
+### A storage verb acts on the moment, not the file
+
+A stack is how a burst is stored, so a tile is a *moment*: trash, back up, and offload all
+take the master **and its frames**. They did not always — trash started cascading in
+cluster B while offload and backup still took one row, so the same tile behaved two ways
+and offloading a 7-frame burst freed the keeper alone (#82).
+
+The cascade lives in `plan_offload` / `plan_backup`, so every caller inherits it: the
+inspector button, the reconcile drain, and the age-based `apply_offload_policy` sweep. (The
+sweep also has to de-duplicate: a frame is eligible in its own right and its master's
+offload has already freed it, so without that it would count the same frame twice.)
+
+Two conditions keep the cascade honest:
+
+- **Every frame is gated on its own copies.** Invariant 2 is decided per frame: a frame
+  without its own verified backup stays local rather than being freed on the strength of
+  the master's. Backup likewise skips a frame with no local copy to send.
+- **What was skipped is reported**, with the reason, the way `empty_trash` reports what it
+  refused: *"Freed 4 of 7 — no verified backup yet"*.
+
+Restore is the same rule pointing the other way: a stack that leaves as seven frames comes
+back as seven. It brings home only the frames that are *away* — a frame already local is
+left alone, because copying the backup over it would replace a file the user may have
+edited since.
+
+Pressing a verb on a *frame* acts on that frame alone. Stacks are one level deep, so a
+frame has nothing under it — the same asymmetry restore has, where bringing a child back
+does not bring back its master.
 
 **Delete** is the only path in the app that destroys an original, and it is gated twice:
 an explicit confirmation the backend requires rather than assumes, and **every known copy

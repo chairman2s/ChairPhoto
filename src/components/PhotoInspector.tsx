@@ -139,6 +139,21 @@ const STORAGE_META: Record<StorageStatus, { label: string; color: string }> = {
   missing: { label: "Missing", color: "#F87171" },
 };
 
+/**
+ * How a storage verb reports acting on a stack: "Backed up 4 of 7 — no local copy to back
+ * up". A lone photo (nothing skipped, one photo touched) keeps the plain verb.
+ *
+ * Reasons are de-duplicated because a stack usually fails for one reason at a time, and
+ * seven copies of the same sentence would bury the count.
+ */
+function stackOutcome(verb: string, done: number[], skipped: [number, string][]): string {
+  if (skipped.length === 0) {
+    return done.length > 1 ? `${verb} ${done.length} in the stack` : verb;
+  }
+  const reasons = [...new Set(skipped.map(([, why]) => why))].join("; ");
+  return `${verb} ${done.length} of ${done.length + skipped.length} — ${reasons}`;
+}
+
 // A collapsible inspector section (the bottom accordion zone). The label acts as a
 // toggle; open/closed state is persisted per section in localStorage so it survives
 // photo navigation and restarts. Sections default to collapsed — `summary` is shown
@@ -576,11 +591,15 @@ export function PhotoInspector({
 
   // Storage actions. Back up runs now if the NAS is reachable, else queues (the "both"
   // entry-point: manual + the auto-enqueue on import). Offload/Restore act immediately.
+  //
+  // Each verb acts on the stack, so each reports what it took and what it left: a burst
+  // offloaded as "freed 90 MB of an expected 600" was #82's whole complaint, and a count
+  // the user can read is what makes the per-frame gate visible rather than mysterious.
   const onBackup = async () => {
     setStorageMsg("Backing up…");
     try {
-      await backupPhoto(photo.id);
-      setStorageMsg("Backed up");
+      const report = await backupPhoto(photo.id);
+      setStorageMsg(stackOutcome("Backed up", report.backedUp, report.skipped));
     } catch {
       await enqueueOperation("backup", photo.id).catch(() => {});
       setStorageMsg("Queued (NAS offline)");
@@ -590,8 +609,19 @@ export function PhotoInspector({
   const onOffload = async () => {
     setStorageMsg("Offloading…");
     try {
-      await offloadPhoto(photo.id);
-      setStorageMsg("Local copy freed");
+      const report = await offloadPhoto(photo.id);
+      const parts = [
+        report.freed.length === 1 && report.skipped.length === 0
+          ? "Local copy freed"
+          : stackOutcome("Freed", report.freed, report.skipped),
+      ];
+      if (report.sidecarBackupsLeft > 0) {
+        // Left on purpose, so say so: it is the only record of what this copy's sidecar
+        // looked like before ChairPhoto first wrote it.
+        const n = report.sidecarBackupsLeft;
+        parts.push(`left ${n} sidecar backup${n === 1 ? "" : "s"} in place`);
+      }
+      setStorageMsg(parts.join(" — "));
     } catch (e) {
       setStorageMsg(String(e));
     }
@@ -600,8 +630,12 @@ export function PhotoInspector({
   const onRestore = async () => {
     setStorageMsg("Restoring…");
     try {
-      await restorePhoto(photo.id);
-      setStorageMsg("Restored to local");
+      const report = await restorePhoto(photo.id);
+      setStorageMsg(
+        report.restored.length === 1 && report.skipped.length === 0
+          ? "Restored to local"
+          : stackOutcome("Restored", report.restored, report.skipped),
+      );
     } catch (e) {
       setStorageMsg(String(e));
     }

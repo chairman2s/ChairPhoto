@@ -724,9 +724,53 @@ export const deletePublication = (id: number) =>
 
 // --- storage lifecycle (backup / offload / restore + reconcile queue) ---
 
-export const backupPhoto = (photoId: number) => invoke<void>("backup_photo", { photoId });
-export const offloadPhoto = (photoId: number) => invoke<void>("offload_photo", { photoId });
-export const restorePhoto = (photoId: number) => invoke<void>("restore_photo", { photoId });
+/**
+ * What one backup call did. A tile is a moment, not a file: backing up a stack master
+ * backs up the frames under it too, each gated on its own local copy (#82).
+ */
+export interface BackupReport {
+  /** Photos now backed up: the one you named, then the frames that went with it. */
+  backedUp: number[];
+  /** Frames left behind, with why. */
+  skipped: [number, string][];
+}
+
+/** What one offload call did — the stack half of {@link BackupReport}. */
+export interface OffloadReport {
+  /** Photos whose local copies were freed: the one you named, then its frames. */
+  freed: number[];
+  /**
+   * Frames left local, with why. Invariant 2 ("never offload without a verified backup")
+   * is decided per frame, so a frame without one stays put instead of riding on the
+   * master's.
+   */
+  skipped: [number, string][];
+  /**
+   * `<sidecar>.chairphoto-backup` files left in place beside a freed image. They are this
+   * copy's only record of what its sidecar looked like before ChairPhoto first wrote it,
+   * so offload leaves them — and says so rather than leaving them silently.
+   */
+  sidecarBackupsLeft: number;
+}
+
+/**
+ * What one restore call did. Offload frees the moment, so restore brings it back: the
+ * frames that are away come home with the master, and the ones already local are left
+ * alone rather than overwritten.
+ */
+export interface RestoreReport {
+  /** Photos now local again: the one you named, then the frames that came with it. */
+  restored: number[];
+  /** Frames left on the backup volume, with why. */
+  skipped: [number, string][];
+}
+
+export const backupPhoto = (photoId: number) =>
+  invoke<BackupReport>("backup_photo", { photoId });
+export const offloadPhoto = (photoId: number) =>
+  invoke<OffloadReport>("offload_photo", { photoId });
+export const restorePhoto = (photoId: number) =>
+  invoke<RestoreReport>("restore_photo", { photoId });
 
 /** Forget a photo whose original is gone — deletes the catalog row only (never files). */
 export const removePhotoFromCatalog = (photoId: number) =>

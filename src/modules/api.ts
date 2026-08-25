@@ -732,7 +732,14 @@ export interface BackupReport {
   /** Photos now backed up: the one you named, then the frames that went with it. */
   backedUp: number[];
   /** Frames left behind, with why. */
-  skipped: [number, string][];
+  skipped: SkippedPhoto[];
+  /** Number of photos in the selected moment, including members already complete. */
+  total: number;
+}
+
+export interface SkippedPhoto {
+  photoId: number;
+  reason: string;
 }
 
 /** What one offload call did — the stack half of {@link BackupReport}. */
@@ -744,7 +751,8 @@ export interface OffloadReport {
    * is decided per frame, so a frame without one stays put instead of riding on the
    * master's.
    */
-  skipped: [number, string][];
+  skipped: SkippedPhoto[];
+  total: number;
   /**
    * `<sidecar>.chairphoto-backup` files left in place beside a freed image. They are this
    * copy's only record of what its sidecar looked like before ChairPhoto first wrote it,
@@ -762,7 +770,8 @@ export interface RestoreReport {
   /** Photos now local again: the one you named, then the frames that came with it. */
   restored: number[];
   /** Frames left on the backup volume, with why. */
-  skipped: [number, string][];
+  skipped: SkippedPhoto[];
+  total: number;
 }
 
 export const backupPhoto = (photoId: number) =>
@@ -819,6 +828,7 @@ export interface PendingOperation {
 export interface DrainSummary {
   ran: number;
   failed: number;
+  partial: number;
   skippedOffline: boolean;
 }
 export const listPendingOperations = () =>

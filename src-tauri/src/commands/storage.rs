@@ -10,6 +10,39 @@ use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, State};
 
+struct StorageClaim {
+    owner: AbortClaim,
+    _gate: tokio::sync::OwnedMutexGuard<()>,
+}
+
+async fn begin_storage(state: &AppState) -> Result<StorageClaim, String> {
+    let request = state.jobs.storage.request_claim()?;
+    let gate = state.storage_gate.clone().lock_owned().await;
+    let owner = state.jobs.storage.claim_requested(&state.catalog, request)?;
+    Ok(StorageClaim { owner, _gate: gate })
+}
+
+fn with_storage_catalog<T>(
+    state: &AppState,
+    claim: &StorageClaim,
+    f: impl FnOnce(&Catalog) -> crate::catalog::Result<T>,
+) -> Result<T, String> {
+    let guard = state.catalog.lock().map_err(|e| e.to_string())?;
+    let catalog = guard.as_ref().ok_or("No catalog is open")?;
+    if catalog.db_path() != claim.owner.db_path {
+        return Err("storage operation superseded or catalog switched".into());
+    }
+    f(catalog).map_err(|e| e.to_string())
+}
+
+fn ensure_storage_owner(claim: &StorageClaim) -> Result<(), String> {
+    if claim.owner.abort.load(Ordering::Relaxed) {
+        Err("storage operation superseded or catalog switched".into())
+    } else {
+        Ok(())
+    }
+}
+
 /// The reconcile queue — storage ops deferred until the NAS is reachable.
 #[tauri::command]
 pub fn list_pending_operations(
@@ -51,9 +84,11 @@ pub async fn enqueue_operations(
 /// Split out so the stack cascade in [`do_backup`] applies exactly the same rules to a
 /// frame as to the master, including the idempotency below.
 async fn do_backup_one(
-    state: &State<'_, AppState>,
+    state: &AppState,
+    claim: &StorageClaim,
     plan: crate::catalog::PhotoBackup,
 ) -> Result<(), String> {
+    ensure_storage_owner(claim)?;
     let crate::catalog::PhotoBackup { photo_id, source, dest, rel, volume_id } = plan;
     // Idempotent: if a verified backup file already exists, do NOT re-copy it. Re-copying
     // a good backup is pointless and — over a flaky mount — risks destroying it. A missing
@@ -65,14 +100,14 @@ async fn do_backup_one(
     // out meant pressing Back up on them did nothing at all. The image is left alone; the
     // companions are reconciled, which is idempotent and copies nothing when they are
     // already there.
-    if with_catalog(state, |c| c.has_verified_backup(photo_id))? {
+    if with_storage_catalog(state, claim, |c| c.has_verified_backup(photo_id))? {
         let carried = tauri::async_runtime::spawn_blocking(move || {
             crate::catalog::carry_companions(&source, &dest)
         })
         .await
         .map_err(|e| e.to_string())?
         .map_err(|e| e.to_string())?;
-        return with_catalog(state, |c| {
+        return with_storage_catalog(state, claim, |c| {
             c.record_companions_at(
                 photo_id,
                 volume_id,
@@ -92,7 +127,7 @@ async fn do_backup_one(
     .await
     .map_err(|e| e.to_string())?
     .map_err(|e| e.to_string())?;
-    with_catalog(state, |c| {
+    with_storage_catalog(state, claim, |c| {
         c.record_copy(photo_id, volume_id, &rel, crate::catalog::LocationRole::Backup, &outcome)
     })
 }
@@ -104,21 +139,25 @@ async fn do_backup_one(
 /// The named photo's failure is the call's failure; a frame that fails is reported and the
 /// rest continue, because the master is already at home by then.
 async fn do_backup(
-    state: &State<'_, AppState>,
+    state: &AppState,
+    claim: &StorageClaim,
     photo_id: i64,
     backup_id: i64,
 ) -> Result<crate::catalog::BackupReport, String> {
-    let plan = with_catalog(state, |c| c.plan_backup(photo_id, backup_id))?;
+    let plan = with_storage_catalog(state, claim, |c| c.plan_backup(photo_id, backup_id))?;
     let mut report =
-        crate::catalog::BackupReport { skipped: plan.skipped, ..Default::default() };
-    do_backup_one(state, plan.named).await?;
+        crate::catalog::BackupReport { skipped: plan.skipped, total: plan.total, ..Default::default() };
+    do_backup_one(state, claim, plan.named).await?;
     report.backed_up.push(photo_id);
     for frame in plan.frames {
         let frame_id = frame.photo_id;
-        match do_backup_one(state, frame).await {
+        match do_backup_one(state, claim, frame).await {
             Ok(()) => report.backed_up.push(frame_id),
-            Err(e) => report.skipped.push((frame_id, e)),
+            Err(e) => report.skipped.push(crate::catalog::SkippedPhoto { photo_id: frame_id, reason: e }),
         }
+    }
+    if claim.owner.abort.load(Ordering::Relaxed) {
+        return Err("storage operation superseded or catalog switched".into());
     }
     Ok(report)
 }
@@ -127,10 +166,11 @@ async fn do_backup(
 /// which photos were freed, which frames were left local and why, and what it deliberately
 /// left on disk.
 async fn do_offload(
-    state: &State<'_, AppState>,
+    state: &AppState,
+    claim: &StorageClaim,
     photo_id: i64,
 ) -> Result<crate::catalog::OffloadReport, String> {
-    let plan = with_catalog(state, |c| c.plan_offload(photo_id))?;
+    let plan = with_storage_catalog(state, claim, |c| c.plan_offload(photo_id))?;
     // Persist an id-keyed thumbnail from a local copy BEFORE it's deleted, so the photo
     // stays visible in the grid once only the (possibly offline) NAS copy remains. Frames
     // need it as much as the master: they are what the inspector's Stack section shows.
@@ -142,14 +182,17 @@ async fn do_offload(
         })
         .await;
     }
+    let abort = claim.owner.abort.clone();
     let carry =
-        tauri::async_runtime::spawn_blocking(move || crate::catalog::verify_and_delete_locals(&plan))
+        tauri::async_runtime::spawn_blocking(move || crate::catalog::verify_and_delete_locals_abortable(&plan, &abort))
             .await
             .map_err(|e| e.to_string())?
             .map_err(|e| e.to_string())?;
     // Companions are recorded before the local rows go away, per freed photo — see
     // `commit_offload_carry`.
-    with_catalog(state, |c| c.commit_offload_carry(carry))
+    let report = with_storage_catalog(state, claim, |c| c.commit_offload_carry(carry))?;
+    ensure_storage_owner(claim)?;
+    Ok(report)
 }
 
 // ── Trash (cluster B, B2) ────────────────────────────────────────────────────
@@ -456,13 +499,14 @@ const OFFLOAD_AGE_SETTING: &str = "offload_age_days";
 /// unreachable. Returns how many photos were offloaded.
 #[tauri::command]
 pub async fn apply_offload_policy(state: State<'_, AppState>) -> Result<usize, String> {
-    let age: i64 = with_catalog(&state, |c| c.get_setting(OFFLOAD_AGE_SETTING))?
+    let claim = begin_storage(state.inner()).await?;
+    let age: i64 = with_storage_catalog(state.inner(), &claim, |c| c.get_setting(OFFLOAD_AGE_SETTING))?
         .and_then(|v| v.trim().parse().ok())
         .unwrap_or(0);
     if age <= 0 {
         return Ok(0); // policy disabled
     }
-    let candidates = with_catalog(&state, |c| c.photos_eligible_for_offload(age))?;
+    let candidates = with_storage_catalog(state.inner(), &claim, |c| c.photos_eligible_for_offload(age))?;
     let mut offloaded = 0usize;
     // A stack's frames are eligible in their own right, and the master's offload already
     // freed them (#82). Without this, the sweep would run a second no-op offload per frame
@@ -472,9 +516,13 @@ pub async fn apply_offload_policy(state: State<'_, AppState>) -> Result<usize, S
         if already_freed.contains(&id) {
             continue;
         }
-        if let Ok(report) = do_offload(&state, id).await {
-            offloaded += report.freed.len();
-            already_freed.extend(report.freed);
+        match do_offload(state.inner(), &claim, id).await {
+            Ok(report) => {
+                offloaded += report.freed.len();
+                already_freed.extend(report.freed);
+            }
+            Err(e) if claim.owner.abort.load(Ordering::Relaxed) => return Err(e),
+            Err(_) => {}
         }
     }
     Ok(offloaded)
@@ -482,9 +530,11 @@ pub async fn apply_offload_policy(state: State<'_, AppState>) -> Result<usize, S
 
 /// Bring one photo home — the named photo or one frame of its stack.
 async fn do_restore_one(
-    state: &State<'_, AppState>,
+    state: &AppState,
+    claim: &StorageClaim,
     plan: crate::catalog::PhotoRestore,
 ) -> Result<(), String> {
+    ensure_storage_owner(claim)?;
     let crate::catalog::PhotoRestore { photo_id, source, dest, rel, volume_id, expected_hash } =
         plan;
     // Companions come back with the image: a restored photo must arrive with the edit state
@@ -496,7 +546,7 @@ async fn do_restore_one(
     .await
     .map_err(|e| e.to_string())?
     .map_err(|e| e.to_string())?;
-    with_catalog(state, |c| {
+    with_storage_catalog(state, claim, |c| {
         c.record_copy(photo_id, volume_id, &rel, crate::catalog::LocationRole::LocalCache, &outcome)
     })
 }
@@ -504,21 +554,25 @@ async fn do_restore_one(
 /// Restore a photo **and the frames stacked under it** that are not already home — the
 /// third verb of the same rule: offload frees the moment, so restore brings it back (#82).
 async fn do_restore(
-    state: &State<'_, AppState>,
+    state: &AppState,
+    claim: &StorageClaim,
     photo_id: i64,
     local_id: i64,
 ) -> Result<crate::catalog::RestoreReport, String> {
-    let plan = with_catalog(state, |c| c.plan_restore(photo_id, local_id))?;
+    let plan = with_storage_catalog(state, claim, |c| c.plan_restore(photo_id, local_id))?;
     let mut report =
-        crate::catalog::RestoreReport { skipped: plan.skipped, ..Default::default() };
-    do_restore_one(state, plan.named).await?;
+        crate::catalog::RestoreReport { skipped: plan.skipped, total: plan.total, ..Default::default() };
+    do_restore_one(state, claim, plan.named).await?;
     report.restored.push(photo_id);
     for frame in plan.frames {
         let frame_id = frame.photo_id;
-        match do_restore_one(state, frame).await {
+        match do_restore_one(state, claim, frame).await {
             Ok(()) => report.restored.push(frame_id),
-            Err(e) => report.skipped.push((frame_id, e)),
+            Err(e) => report.skipped.push(crate::catalog::SkippedPhoto { photo_id: frame_id, reason: e }),
         }
+    }
+    if claim.owner.abort.load(Ordering::Relaxed) {
+        return Err("storage operation superseded or catalog switched".into());
     }
     Ok(report)
 }
@@ -530,9 +584,10 @@ pub async fn backup_photo(
     state: State<'_, AppState>,
     photo_id: i64,
 ) -> Result<crate::catalog::BackupReport, String> {
+    let claim = begin_storage(state.inner()).await?;
     let backup_id =
-        with_catalog(&state, |c| single_volume_of_kind(c, crate::catalog::VolumeKind::Backup, "backup"))?;
-    do_backup(&state, photo_id, backup_id).await
+        with_storage_catalog(state.inner(), &claim, |c| single_volume_of_kind(c, crate::catalog::VolumeKind::Backup, "backup"))?;
+    do_backup(state.inner(), &claim, photo_id, backup_id).await
 }
 
 /// Free a photo's local copies — and its stack frames' — after re-verifying each backup.
@@ -542,7 +597,8 @@ pub async fn offload_photo(
     state: State<'_, AppState>,
     photo_id: i64,
 ) -> Result<crate::catalog::OffloadReport, String> {
-    do_offload(&state, photo_id).await
+    let claim = begin_storage(state.inner()).await?;
+    do_offload(state.inner(), &claim, photo_id).await
 }
 
 /// Forget a photo whose original is gone: delete its catalog row (and all dependent
@@ -849,6 +905,7 @@ async fn record_identity_on_catalog(
 mod tests {
     use super::*;
     use crate::catalog::{Catalog, LocationRole, VolumeKind};
+    use crate::commands::catalog::{detach_catalog_and_trip_jobs, publish_catalog_and_reset_jobs};
 
     fn temp_catalog(tag: &str) -> (Catalog, crate::test_support::TestSubPath) {
         let dir = crate::test_support::TestTmpDir::new(&format!("storage-command-{tag}"));
@@ -862,6 +919,48 @@ mod tests {
         let state = AppState::default();
         *state.catalog.lock().unwrap() = Some(catalog);
         state
+    }
+
+    #[tokio::test]
+    async fn a_storage_claim_cannot_record_into_the_catalog_switched_to() {
+        let (catalog_a, _root_a) = temp_catalog("claim-a");
+        let (catalog_b, _root_b) = temp_catalog("claim-b");
+        let state = state_with(catalog_a);
+        let claim = begin_storage(&state).await.unwrap();
+        detach_catalog_and_trip_jobs(&state).unwrap();
+        publish_catalog_and_reset_jobs(&state, catalog_b).unwrap();
+        let err = with_storage_catalog(&state, &claim, |c| c.set_setting("stale", "write"))
+            .unwrap_err();
+        assert!(err.contains("catalog switched"));
+        let guard = state.catalog.lock().unwrap();
+        assert_eq!(guard.as_ref().unwrap().get_setting("stale").unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn supersession_waits_for_the_current_filesystem_record_boundary() {
+        let (catalog, _root) = temp_catalog("claim-boundary");
+        let state = state_with(catalog);
+        let current = begin_storage(&state).await.unwrap();
+
+        let next_request = state.jobs.storage.request_claim().unwrap();
+        assert!(current.owner.abort.load(Ordering::Relaxed));
+        assert!(state.storage_gate.clone().try_lock_owned().is_err());
+
+        // A filesystem call already in progress is indivisible. Its matching catalog write
+        // remains owned until the gate is released, avoiding deleted/copied bytes with stale
+        // location rows; cancellation is observed before the next member instead.
+        with_storage_catalog(&state, &current, |c| c.set_setting("completed", "recorded"))
+            .unwrap();
+        drop(current);
+
+        let gate = state.storage_gate.clone().lock_owned().await;
+        let next = state
+            .jobs
+            .storage
+            .claim_requested(&state.catalog, next_request)
+            .unwrap();
+        assert!(!next.abort.load(Ordering::Relaxed));
+        drop(gate);
     }
 
     #[test]
@@ -1210,9 +1309,10 @@ pub async fn restore_photo(
     state: State<'_, AppState>,
     photo_id: i64,
 ) -> Result<crate::catalog::RestoreReport, String> {
+    let claim = begin_storage(state.inner()).await?;
     let local_id =
-        with_catalog(&state, |c| single_volume_of_kind(c, crate::catalog::VolumeKind::Local, "local"))?;
-    do_restore(&state, photo_id, local_id).await
+        with_storage_catalog(state.inner(), &claim, |c| single_volume_of_kind(c, crate::catalog::VolumeKind::Local, "local"))?;
+    do_restore(state.inner(), &claim, photo_id, local_id).await
 }
 
 /// Drain the reconcile queue (E4): run each pending op via the E3 lifecycle when a
@@ -1223,9 +1323,10 @@ pub async fn reconcile_now(
     state: State<'_, AppState>,
 ) -> Result<crate::catalog::DrainSummary, String> {
     use crate::catalog::{DrainSummary, VolumeKind};
+    let claim = begin_storage(state.inner()).await?;
     // Pure SQL under the lock; the reachability stat happens off-lock below so a hung
     // NAS mount can't stall every other catalog user for its duration.
-    let (vols, pending) = with_catalog(&state, |c| Ok((c.volume_rows()?, c.list_pending_operations()?)))?;
+    let (vols, pending) = with_storage_catalog(state.inner(), &claim, |c| Ok((c.volume_rows()?, c.list_pending_operations()?)))?;
     // Reconcile decides whether to run at all based on the backup volume being reachable —
     // it wants live truth, so drop any cached state and stat fresh (on a blocking worker).
     state.volume_health.invalidate();
@@ -1252,21 +1353,28 @@ pub async fn reconcile_now(
         let result = match op.kind.as_str() {
             // The reports are for the caller who pressed a button; the drain only needs
             // to know whether the op can be cleared from the queue.
-            "backup" => do_backup(&state, op.photo_id, backup_id).await.map(|_| ()),
-            "offload" => do_offload(&state, op.photo_id).await.map(|_| ()),
+            "backup" => do_backup(state.inner(), &claim, op.photo_id, backup_id).await.map(|r| r.skipped),
+            "offload" => do_offload(state.inner(), &claim, op.photo_id).await.map(|r| r.skipped),
             "restore" => match local_id {
-                Some(l) => do_restore(&state, op.photo_id, l).await.map(|_| ()),
+                Some(l) => do_restore(state.inner(), &claim, op.photo_id, l).await.map(|r| r.skipped),
                 None => Err("no local volume".into()),
             },
             other => Err(format!("unknown operation: {other}")),
         };
         match result {
-            Ok(()) => {
-                with_catalog(&state, |c| c.remove_operation(op.id))?;
-                summary.ran += 1;
+            Ok(skipped) => {
+                if skipped.is_empty() {
+                    with_storage_catalog(state.inner(), &claim, |c| c.remove_operation(op.id))?;
+                    summary.ran += 1;
+                } else {
+                    with_storage_catalog(state.inner(), &claim, |c| {
+                        c.replace_operation_with_skipped(op.id, &op.kind, &skipped)
+                    })?;
+                    summary.partial += 1;
+                }
             }
             Err(e) => {
-                with_catalog(&state, |c| c.set_operation_failed(op.id, &e))?;
+                with_storage_catalog(state.inner(), &claim, |c| c.set_operation_failed(op.id, &e))?;
                 summary.failed += 1;
             }
         }

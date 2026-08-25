@@ -59,6 +59,12 @@ pub async fn switch_catalog(
         ));
     }
 
+    // Stop the current storage owner, then wait until its in-flight filesystem operation
+    // and matching catalog record have reached one atomic boundary. Holding this gate
+    // through detach/open/publish prevents old plans from mutating either catalog.
+    state.jobs.storage.invalidate_claims()?;
+    let _storage_gate = state.storage_gate.clone().lock_owned().await;
+
     // 1 + 2. Detach the outgoing catalog: trip every switch-managed job generation and drop
     //        the catalog handle in ONE transition. See `detach_catalog_and_trip_jobs`.
     detach_catalog_and_trip_jobs(state.inner())?;
@@ -438,6 +444,9 @@ pub(super) async fn reroot_library(
     .await
     .map_err(|e| e.to_string())??;
 
+    state.jobs.storage.invalidate_claims()?;
+    let _storage_gate = state.storage_gate.clone().lock_owned().await;
+
     // Phase one: persist the new root through the outgoing handle, trip every job generation,
     // clear every status slot, drop the handle — one transition under the catalog lock. A
     // failed persist leaves the catalog open and nothing tripped.
@@ -677,4 +686,3 @@ mod catalog_registry_tests {
         assert!(list.is_empty(), "no registry file → empty list");
     }
 }
-

@@ -385,6 +385,17 @@ Two conditions keep the cascade honest:
 - **What was skipped is reported**, with the reason, the way `empty_trash` reports what it
   refused: *"Freed 4 of 7 — no verified backup yet"*.
 
+When reconcile completes only part of a stack, it replaces the completed master's queue
+row with one failed row per skipped frame. Each child row keeps the refusal reason and is
+retried independently, so the completed master is not destructively replayed.
+
+Async storage commands claim the current catalog through the storage job generation before
+planning. A newer command trips that generation, so stack work stops before its next member.
+The worker also holds the storage ownership gate through plan, filesystem work, and record:
+catalog switches trip the worker and acquire that gate before detaching, while a completed
+indivisible copy/delete is recorded before the old worker releases it. Record steps still
+require the claimed database to be active.
+
 Restore is the same rule pointing the other way: a stack that leaves as seven frames comes
 back as seven. It brings home only the frames that are *away* — a frame already local is
 left alone, because copying the backup over it would replace a file the user may have
@@ -653,8 +664,9 @@ A *fresh* abort generation is installed for each family after the new catalog is
 subsequent jobs start un-aborted while the old workers keep the flag they were given (and
 stay aborted). Steps 1–2 and the publish in step 3 are the two phases of one ownership
 transition; both, and every job start, live in `commands/jobs.rs`, which also carries the
-backend-wide lock order (catalog → abort generations → status slots). `set_library_root`
-runs the same transition — it replaces the catalog handle exactly as a switch does.
+backend-wide lock order (storage ownership gate → catalog → abort generations → status
+slots). The pre-gate cancellation step holds no other lock. `set_library_root` runs the same
+transition — it replaces the catalog handle exactly as a switch does.
 
 ### Invariants
 

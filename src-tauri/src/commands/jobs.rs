@@ -28,14 +28,17 @@
 //!
 //! # Lock order
 //!
-//! **catalog → abort generations → status slots**, and within each of the last two groups
-//! the declaration order of [`JobRegistry`]: scan, face indexing, face matching, sharpness,
-//! pHash, Smart Tagging, identity repair.
+//! **storage ownership gate → catalog → abort generations → status slots**, and within each
+//! of the last two groups the declaration order of [`JobRegistry`]: scan, face indexing,
+//! face matching, sharpness, pHash, trash, storage, Smart Tagging, identity repair. Storage
+//! cancellation/request announcement happens before the gate while holding no other lock.
 //!
 //! Every nested acquisition in the backend obeys it:
 //!
 //! | Site | Takes |
 //! |---|---|
+//! | storage start | request/abort alone → gate → catalog → storage abort |
+//! | catalog switch/root change | invalidate storage alone → gate → catalog → every abort → every slot |
 //! | [`JobFamily::begin`] | catalog → that family's abort → that family's slot |
 //! | [`JobRegistry::lock_for_detach`] (switch phase one) | every abort, then every slot |
 //! | [`JobRegistry::lock_for_publish`] (switch phase two) | every abort |
@@ -81,6 +84,11 @@ pub struct AbortGeneration {
     seq: AtomicU64,
 }
 
+pub struct AbortClaim {
+    pub db_path: PathBuf,
+    pub abort: Arc<AtomicBool>,
+}
+
 impl AbortGeneration {
     /// Lock the installed flag **without** touching it, so a caller can acquire it alongside
     /// the other locks of a transition before that transition's first mutation.
@@ -114,6 +122,45 @@ impl AbortGeneration {
     pub fn install_fresh(&self) -> Result<Arc<AtomicBool>, String> {
         let mut guard = self.lock()?;
         Ok(trip_and_replace(&mut guard))
+    }
+
+    pub fn claim(&self, catalog: &Mutex<Option<Catalog>>) -> Result<AbortClaim, String> {
+        let cat_guard = catalog.lock().map_err(|e| e.to_string())?;
+        let c = cat_guard.as_ref().ok_or("No catalog is open")?;
+        let db_path = c.db_path().to_path_buf();
+        let mut abort_guard = self.lock()?;
+        let abort = trip_and_replace(&mut abort_guard);
+        Ok(AbortClaim { db_path, abort })
+    }
+
+    /// Announce a storage-style start before it waits for exclusive filesystem ownership.
+    /// The sequence lets the eventual claimant detect that a still-newer waiter exists.
+    pub fn request_claim(&self) -> Result<u64, String> {
+        let request = self.next_job_id();
+        self.trip()?;
+        Ok(request)
+    }
+
+    /// Supersede both the installed owner and any request still waiting for its I/O gate.
+    pub fn invalidate_claims(&self) -> Result<(), String> {
+        self.next_job_id();
+        self.trip()
+    }
+
+    /// Install the requested generation while holding the catalog→abort lock order.
+    pub fn claim_requested(
+        &self,
+        catalog: &Mutex<Option<Catalog>>,
+        request: u64,
+    ) -> Result<AbortClaim, String> {
+        let cat_guard = catalog.lock().map_err(|e| e.to_string())?;
+        let c = cat_guard.as_ref().ok_or("No catalog is open")?;
+        let mut abort_guard = self.lock()?;
+        if self.job_ids_issued() != request {
+            return Err("storage operation superseded before it started".into());
+        }
+        let abort = trip_and_replace(&mut abort_guard);
+        Ok(AbortClaim { db_path: c.db_path().to_path_buf(), abort })
     }
 
     /// Trip the installed generation. Every Cancel command is exactly this; a no-op when
@@ -380,9 +427,6 @@ pub struct JobRegistry {
     pub sharpness: AbortGeneration,
     /// Perceptual-hash indexing (H15a). No status slot; its events carry the job id.
     pub phash: AbortGeneration,
-    /// The Smart Tagging embedding index (H7b).
-    #[cfg(feature = "smarttags")]
-    pub smarttags: JobFamily<SmarttagsJobStatus>,
     /// Emptying the trash (cluster B, B2) — the only job that destroys originals.
     ///
     /// It has a generation for two reasons the other families do not share. A catalog
@@ -392,6 +436,11 @@ pub struct JobRegistry {
     /// win that race, because the alternative is destroying something they just asked to
     /// keep. No status slot — the delete reports its own terminal result.
     pub trash: AbortGeneration,
+    /// Backup, offload, restore, policy sweeps and reconcile drains.
+    pub storage: AbortGeneration,
+    /// The Smart Tagging embedding index (H7b).
+    #[cfg(feature = "smarttags")]
+    pub smarttags: JobFamily<SmarttagsJobStatus>,
     /// The sidecar-identity repair pass (#34) — retries `pending_sidecar_identity`.
     ///
     /// Not feature-gated, and the first family here that isn't: identity debt is core, so
@@ -427,6 +476,7 @@ impl JobRegistry {
             sharpness: _,
             phash: _,
             trash: _,
+            storage: _,
             #[cfg(feature = "smarttags")]
             smarttags,
             identity,
@@ -460,6 +510,7 @@ impl JobRegistry {
             sharpness,
             phash,
             trash,
+            storage,
             #[cfg(feature = "smarttags")]
             smarttags,
             identity,
@@ -473,6 +524,7 @@ impl JobRegistry {
             sharpness: sharpness.lock()?,
             phash: phash.lock()?,
             trash: trash.lock()?,
+            storage: storage.lock()?,
             #[cfg(feature = "smarttags")]
             smarttags: smarttags.abort.lock()?,
             identity: identity.abort.lock()?,
@@ -490,6 +542,7 @@ pub struct AbortGuards<'a> {
     sharpness: MutexGuard<'a, Arc<AtomicBool>>,
     phash: MutexGuard<'a, Arc<AtomicBool>>,
     trash: MutexGuard<'a, Arc<AtomicBool>>,
+    storage: MutexGuard<'a, Arc<AtomicBool>>,
     #[cfg(feature = "smarttags")]
     smarttags: MutexGuard<'a, Arc<AtomicBool>>,
     identity: MutexGuard<'a, Arc<AtomicBool>>,
@@ -507,6 +560,7 @@ impl AbortGuards<'_> {
             sharpness,
             phash,
             trash,
+            storage,
             #[cfg(feature = "smarttags")]
             smarttags,
             identity,
@@ -519,6 +573,7 @@ impl AbortGuards<'_> {
         sharpness.store(true, Ordering::Relaxed);
         phash.store(true, Ordering::Relaxed);
         trash.store(true, Ordering::Relaxed);
+        storage.store(true, Ordering::Relaxed);
         #[cfg(feature = "smarttags")]
         smarttags.store(true, Ordering::Relaxed);
         identity.store(true, Ordering::Relaxed);
@@ -553,6 +608,7 @@ impl AbortGuards<'_> {
             ref mut sharpness,
             ref mut phash,
             ref mut trash,
+            ref mut storage,
             #[cfg(feature = "smarttags")]
                 ref mut smarttags,
             ref mut identity,
@@ -567,6 +623,7 @@ impl AbortGuards<'_> {
         **sharpness = Arc::new(AtomicBool::new(false));
         **phash = Arc::new(AtomicBool::new(false));
         **trash = Arc::new(AtomicBool::new(false));
+        **storage = Arc::new(AtomicBool::new(false));
         #[cfg(feature = "smarttags")]
         {
             **smarttags = Arc::new(AtomicBool::new(false));
@@ -675,20 +732,34 @@ mod tests {
     /// The registry is destructured without `..` precisely so a new family cannot skip
     /// this; the test is here so the *behaviour* is pinned as well as the compile error.
     #[test]
-    fn a_switch_trips_the_trash_generation_along_with_every_other() {
+    fn a_switch_trips_destructive_and_storage_generations_along_with_every_other() {
         let jobs = JobRegistry::default();
         let held = jobs.trash.installed().unwrap();
+        let storage_held = jobs.storage.installed().unwrap();
         let scan_held = jobs.scan.installed().unwrap();
         assert!(!held.load(Ordering::Relaxed), "a fresh generation is not tripped");
 
         jobs.lock_for_publish().unwrap().trip_and_replace_all();
 
         assert!(held.load(Ordering::Relaxed), "the delete worker is no longer the owner");
+        assert!(storage_held.load(Ordering::Relaxed), "the storage worker is no longer the owner");
         assert!(scan_held.load(Ordering::Relaxed), "and so is everyone else");
         assert!(
             !jobs.trash.installed().unwrap().load(Ordering::Relaxed),
             "while a fresh generation is installed for whatever starts next"
         );
+    }
+
+    #[test]
+    fn a_storage_claim_is_bound_to_the_catalog_and_tripped_by_a_switch() {
+        let (catalog, db) = open_catalog("storage-claim");
+        let jobs = JobRegistry::default();
+        let claim = jobs.storage.claim(&catalog).unwrap();
+        assert_eq!(claim.db_path, db.to_path_buf());
+        assert!(!claim.abort.load(Ordering::Relaxed));
+        jobs.lock_for_publish().unwrap().trip_and_replace_all();
+        assert!(claim.abort.load(Ordering::Relaxed));
+        assert!(!jobs.storage.installed().unwrap().load(Ordering::Relaxed));
     }
 
     /// Cancelling is the same trip, which is what lets Restore stand a delete down.

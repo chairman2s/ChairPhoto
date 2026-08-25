@@ -735,6 +735,30 @@ fn reconcile_queue_enqueues_and_drains_when_nas_reachable() {
 }
 
 #[test]
+fn reconcile_requeues_each_skipped_stack_frame_with_its_reason() {
+    let (catalog, root) = temp_catalog("reconcile-partial-stack");
+    let (nas, _nas_dir) = nas_volume(&catalog, &root);
+    let raw = root.join("2026/08/DSC1.ARW");
+    let master = local_photo(&catalog, &raw, b"raw-bytes");
+    catalog.backup_photo(master, nas).unwrap();
+    let jpg = root.join("2026/08/DSC1.JPG");
+    let frame = local_photo(&catalog, &jpg, b"jpeg-bytes");
+    catalog.set_stack_parent(frame, master).unwrap();
+    catalog.enqueue_operation("offload", master).unwrap();
+
+    let summary = catalog.drain_pending_operations().unwrap();
+
+    assert_eq!((summary.ran, summary.failed, summary.partial), (0, 0, 1));
+    let pending = catalog.list_pending_operations().unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!((pending[0].kind.as_str(), pending[0].photo_id), ("offload", frame));
+    assert_eq!(pending[0].status, "failed");
+    assert!(pending[0].error.contains("no verified backup"));
+    assert!(!raw.exists());
+    assert!(jpg.exists());
+}
+
+#[test]
 fn lifecycle_backup_offload_restore_with_verification() {
     let (catalog, root) = temp_catalog("lifecycle");
     // Local working volume = catalog root; a reachable NAS backup volume.
@@ -993,16 +1017,34 @@ fn a_frame_without_its_own_verified_backup_is_left_local_and_named() {
 
     let freed = catalog.offload_photo(master).unwrap();
 
+    assert_eq!(freed.total, 2);
     assert_eq!(freed.freed, vec![master], "only what had a verified backup was freed");
     assert_eq!(freed.skipped.len(), 1);
-    assert_eq!(freed.skipped[0].0, frame);
+    assert_eq!(freed.skipped[0].photo_id, frame);
     assert!(
-        freed.skipped[0].1.contains("no verified backup"),
+        freed.skipped[0].reason.contains("no verified backup"),
         "the reason travels with the id: {}",
-        freed.skipped[0].1
+        freed.skipped[0].reason
     );
     assert!(jpg.exists(), "the frame is still local, because its own backup is not there");
     assert!(!raw.exists(), "the master, which does have one, was freed");
+}
+
+#[test]
+fn a_tripped_storage_generation_deletes_no_local_copy() {
+    let (catalog, root) = temp_catalog("offload-aborted");
+    let (nas, _nas_dir) = nas_volume(&catalog, &root);
+    let raw = root.join("2026/08/DSC1.ARW");
+    let photo = local_photo(&catalog, &raw, b"raw-bytes");
+    catalog.backup_photo(photo, nas).unwrap();
+    let plan = catalog.plan_offload(photo).unwrap();
+    let abort = std::sync::atomic::AtomicBool::new(true);
+    let err = match chairphoto_lib::catalog::verify_and_delete_locals_abortable(&plan, &abort) {
+        Ok(_) => panic!("a tripped storage operation must stop before deletion"),
+        Err(err) => err.to_string(),
+    };
+    assert!(err.contains("catalog switched"));
+    assert!(raw.exists());
 }
 
 /// Backup gates each frame on its own local copy, and reports what it could not take —
@@ -1025,11 +1067,11 @@ fn backup_gates_each_frame_on_its_own_local_copy() {
 
     assert_eq!(backed.backed_up, vec![master]);
     assert_eq!(backed.skipped.len(), 1);
-    assert_eq!(backed.skipped[0].0, frame);
+    assert_eq!(backed.skipped[0].photo_id, frame);
     assert!(
-        backed.skipped[0].1.contains("no local copy"),
+        backed.skipped[0].reason.contains("no local copy"),
         "and says why: {}",
-        backed.skipped[0].1
+        backed.skipped[0].reason
     );
     assert!(nas_dir.join("2026/08/DSC1.ARW").is_file(), "the master still went home");
 }
@@ -1090,6 +1132,7 @@ fn restore_brings_the_whole_stack_back() {
     // Restoring again is a no-op for what is already here: the frame is not re-copied over.
     let again = catalog.restore_photo(master, local_id).unwrap();
     assert_eq!(again.restored, vec![master], "only the named photo, which restore always re-fetches");
+    assert_eq!(again.total, 2);
 }
 
 /// `<sidecar>.chairphoto-backup` is the sidecar as it looked before ChairPhoto first wrote

@@ -146,12 +146,17 @@ const STORAGE_META: Record<StorageStatus, { label: string; color: string }> = {
  * Reasons are de-duplicated because a stack usually fails for one reason at a time, and
  * seven copies of the same sentence would bury the count.
  */
-function stackOutcome(verb: string, done: number[], skipped: [number, string][]): string {
+export function stackOutcome(
+  verb: string,
+  done: number[],
+  skipped: { photoId: number; reason: string }[],
+  total: number,
+): string {
   if (skipped.length === 0) {
     return done.length > 1 ? `${verb} ${done.length} in the stack` : verb;
   }
-  const reasons = [...new Set(skipped.map(([, why]) => why))].join("; ");
-  return `${verb} ${done.length} of ${done.length + skipped.length} — ${reasons}`;
+  const reasons = [...new Set(skipped.map(({ reason }) => reason))].join("; ");
+  return `${verb} ${done.length} of ${total} — ${reasons}`;
 }
 
 // A collapsible inspector section (the bottom accordion zone). The label acts as a
@@ -599,7 +604,7 @@ export function PhotoInspector({
     setStorageMsg("Backing up…");
     try {
       const report = await backupPhoto(photo.id);
-      setStorageMsg(stackOutcome("Backed up", report.backedUp, report.skipped));
+      setStorageMsg(stackOutcome("Backed up", report.backedUp, report.skipped, report.total));
     } catch {
       await enqueueOperation("backup", photo.id).catch(() => {});
       setStorageMsg("Queued (NAS offline)");
@@ -613,7 +618,7 @@ export function PhotoInspector({
       const parts = [
         report.freed.length === 1 && report.skipped.length === 0
           ? "Local copy freed"
-          : stackOutcome("Freed", report.freed, report.skipped),
+          : stackOutcome("Freed", report.freed, report.skipped, report.total),
       ];
       if (report.sidecarBackupsLeft > 0) {
         // Left on purpose, so say so: it is the only record of what this copy's sidecar
@@ -634,7 +639,7 @@ export function PhotoInspector({
       setStorageMsg(
         report.restored.length === 1 && report.skipped.length === 0
           ? "Restored to local"
-          : stackOutcome("Restored", report.restored, report.skipped),
+          : stackOutcome("Restored", report.restored, report.skipped, report.total),
       );
     } catch (e) {
       setStorageMsg(String(e));

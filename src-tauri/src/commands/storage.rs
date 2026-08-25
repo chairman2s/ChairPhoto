@@ -235,6 +235,11 @@ pub struct EmptyTrashReport {
     pub deleted: usize,
     /// Files removed — images and their declared companions.
     pub files_deleted: usize,
+    /// `<sidecar>.chairphoto-backup` files removed. Counted apart from `files_deleted`
+    /// because a sidecar backup is deliberately **not** a companion
+    /// ([`crate::companions::sidecar_backups_beside`]), and folding it in would inflate
+    /// the count of destroyed originals with a file the user never knew about (#84).
+    pub sidecar_backups_deleted: usize,
     /// Photos left alone because a volume holding a copy could not be reached. Deleting
     /// them would have destroyed the copies we *can* see while leaving an unreferenced
     /// survivor on a disconnected disk.
@@ -259,6 +264,20 @@ pub(crate) enum DeleteOutcome {
     Unreachable,
     /// Something survived. The message names the first path still present.
     Failed(String),
+}
+
+/// What one photo's delete actually removed, split the way the report is.
+///
+/// Two numbers rather than one because the two kinds answer different questions: `files`
+/// is originals and the companions that are part of them, `sidecar_backups` is the
+/// pre-ChairPhoto record beside them, which no user ever asked for and which offload
+/// leaves in place (#82).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct DeleteTally {
+    /// Images and their declared companions.
+    pub files: usize,
+    /// `<sidecar>.chairphoto-backup` files.
+    pub sidecar_backups: usize,
 }
 
 /// Destroy trashed photos: the only path in the app that deletes an original.
@@ -357,13 +376,6 @@ pub async fn empty_trash(
     .map_err(|e| e.to_string())?
 }
 
-/// Delete every copy of each photo, or none of them.
-///
-/// Split out of the command because this is where the destructive decision is made, and a
-/// decision reachable only through a Tauri `State` is a decision nobody can test. Pure file
-/// IO — no catalog lock — so it runs on the blocking worker like the rest of the lifecycle.
-///
-/// Returns the report and the ids whose files are now gone, for the caller to forget.
 /// Walk the planned photos, destroying each one's copies — the part of emptying the trash
 /// where ownership actually matters.
 ///
@@ -375,6 +387,8 @@ pub async fn empty_trash(
 /// Stops at the first sign it is no longer the owner. `abort` is tripped by a catalog
 /// switch (so an old worker cannot apply one catalog's ids to another's rows) and by
 /// Restore (so pulling a photo out of the trash beats a delete already in flight).
+///
+/// Returns the report and the ids whose files are now gone, for the caller to forget.
 pub(crate) fn destroy_planned_photos(
     plans: &[(i64, Vec<crate::catalog::PathCandidate>)],
     reachable: &std::collections::HashMap<i64, bool>,
@@ -395,8 +409,9 @@ pub(crate) fn destroy_planned_photos(
             report.restored_meanwhile.push(*id);
             continue;
         }
-        let (outcome, files) = delete_one_photos_copies(locations, reachable);
-        report.files_deleted += files;
+        let (outcome, tally) = delete_one_photos_copies(locations, reachable);
+        report.files_deleted += tally.files;
+        report.sidecar_backups_deleted += tally.sidecar_backups;
         match outcome {
             DeleteOutcome::Destroyed => destroyed.push(*id),
             DeleteOutcome::Unreachable => report.skipped_unreachable.push(*id),
@@ -406,10 +421,32 @@ pub(crate) fn destroy_planned_photos(
     Ok((report, destroyed))
 }
 
+/// Delete every copy of each photo, or none of them.
+///
+/// Split out of the command because this is where the destructive decision is made, and a
+/// decision reachable only through a Tauri `State` is a decision nobody can test. Pure file
+/// IO — no catalog lock — so it runs on the blocking worker like the rest of the lifecycle.
+///
+/// Three passes, in this order and for a reason:
+///
+/// 1. **Companions, then the image**, per copy — a delete that fails part-way leaves the
+///    image there to say what the leftovers belonged to.
+/// 2. **Confirm every image and companion is absent.** Anything still present is a
+///    failure, and the caller keeps the catalog row.
+/// 3. **Only then, the sidecar backups.** `<sidecar>.chairphoto-backup` is not a
+///    companion and offload deliberately leaves it, because the photo it describes still
+///    exists. Delete removes the image, the sidecar, and the row, so nothing the backup
+///    is the earlier state *of* is left — and a file with no row and nothing beside it is
+///    exactly the orphan this path refuses to create (#84). Taking it only after pass 2
+///    succeeds means a delete that failed on the image has not also destroyed the record.
+///
+/// A backup that cannot be removed is a failure too. It is a few KB against every original
+/// already gone, but the row is what makes it findable and retryable; forgetting the row
+/// is what makes it unfindable forever.
 pub(crate) fn delete_one_photos_copies(
     locations: &[crate::catalog::PathCandidate],
     reachable: &std::collections::HashMap<i64, bool>,
-) -> (DeleteOutcome, usize) {
+) -> (DeleteOutcome, DeleteTally) {
     // Every known copy, not just the one at home: deleting what we can see while a
     // disconnected disk still holds one would leave an unreferenced survivor.
     let all_reachable = locations.iter().all(|cand| {
@@ -418,10 +455,10 @@ pub(crate) fn delete_one_photos_copies(
             .unwrap_or(true)
     });
     if !all_reachable {
-        return (DeleteOutcome::Unreachable, 0);
+        return (DeleteOutcome::Unreachable, DeleteTally::default());
     }
 
-    let mut files_deleted = 0usize;
+    let mut tally = DeleteTally::default();
     // Collect what we are responsible for *before* deleting, so the survivor check below
     // is against the full expected set rather than against whatever we happened to reach.
     let mut expected: Vec<std::path::PathBuf> = Vec::new();
@@ -439,11 +476,11 @@ pub(crate) fn delete_one_photos_copies(
         // what the leftovers belonged to.
         for found in crate::companions::carried_beside(&cand.path) {
             if std::fs::remove_file(&found.path).is_ok() {
-                files_deleted += 1;
+                tally.files += 1;
             }
         }
         if cand.path.exists() && std::fs::remove_file(&cand.path).is_ok() {
-            files_deleted += 1;
+            tally.files += 1;
         }
     }
 
@@ -452,12 +489,40 @@ pub(crate) fn delete_one_photos_copies(
     // file there — and reporting that photo deleted is how a catalog row disappears while
     // its original survives with nothing pointing at it.
     if let Some(survivor) = expected.iter().find(|p| p.exists()) {
+        // The sidecar backups are untouched on this path on purpose: the photo survived,
+        // so the record of what its sidecar looked like before ChairPhoto is still the
+        // record of something.
         return (
             DeleteOutcome::Failed(format!("{} could not be removed", survivor.display())),
-            files_deleted,
+            tally,
         );
     }
-    (DeleteOutcome::Destroyed, files_deleted)
+
+    // Every image and companion is gone. Now the backups: enumerated from the image path,
+    // which is why one stranded by an earlier offload — sitting where a local copy used to
+    // be, with no location row left pointing at it — is still in reach here.
+    // `photo_path_candidates` always appends the catalog-root path, so that folder is
+    // walked even when the local row is gone.
+    let mut backups: Vec<std::path::PathBuf> = Vec::new();
+    for cand in locations {
+        for backup in crate::companions::sidecar_backups_beside(&cand.path) {
+            if !backups.contains(&backup) {
+                backups.push(backup);
+            }
+        }
+    }
+    for backup in &backups {
+        if std::fs::remove_file(backup).is_ok() {
+            tally.sidecar_backups += 1;
+        }
+    }
+    if let Some(survivor) = backups.iter().find(|p| p.exists()) {
+        return (
+            DeleteOutcome::Failed(format!("{} could not be removed", survivor.display())),
+            tally,
+        );
+    }
+    (DeleteOutcome::Destroyed, tally)
 }
 
 fn now_secs() -> i64 {
@@ -1621,14 +1686,134 @@ mod trash_delete_tests {
         ];
         let reachable = HashMap::from([(1, true), (2, true)]);
 
-        let (outcome, files) = delete_one_photos_copies(&locations, &reachable);
+        let (outcome, tally) = delete_one_photos_copies(&locations, &reachable);
 
         assert_eq!(outcome, DeleteOutcome::Destroyed);
-        assert_eq!(files, 5, "2 images + 3 companions");
+        assert_eq!(tally.files, 5, "2 images + 3 companions");
         assert!(!local.join("DSC1.ARW").exists());
         assert!(!nas.join("DSC1.ARW").exists());
         assert!(!local.join("DSC1.ARW.rrdata").exists());
         assert!(local.join("DSC1.ARW.txt").exists(), "an undeclared neighbour is not ours");
+    }
+
+    /// A sidecar backup is not a companion, so nothing carried it and offload left it —
+    /// but delete removes the image, the sidecar and the row, so nothing it is the earlier
+    /// state *of* survives. Leaving it would produce a file with no row and nothing beside
+    /// it, which is the orphan this path exists to refuse (#84).
+    #[test]
+    fn deleting_a_photo_takes_the_sidecar_backup_offload_would_have_left() {
+        let dir = crate::test_support::TestTmpDir::new("empty-trash-sidecar-backup");
+        let local = dir.join("local");
+        std::fs::create_dir_all(&local).unwrap();
+        std::fs::write(local.join("DSC1.ARW"), b"bytes").unwrap();
+        std::fs::write(local.join("DSC1.ARW.xmp"), b"chairphoto wrote this").unwrap();
+        std::fs::write(local.join("DSC1.ARW.xmp.chairphoto-backup"), b"before").unwrap();
+        // The basename shape too — darktable's alternate mode leaves its own backup.
+        std::fs::write(local.join("DSC1.xmp.chairphoto-backup"), b"before").unwrap();
+
+        let (outcome, tally) = delete_one_photos_copies(
+            &[candidate(local.join("DSC1.ARW"), 1)],
+            &HashMap::from([(1, true)]),
+        );
+
+        assert_eq!(outcome, DeleteOutcome::Destroyed);
+        assert_eq!(tally.files, 2, "the image and its one declared companion");
+        assert_eq!(tally.sidecar_backups, 2, "counted apart, not folded into the originals");
+        assert!(!local.join("DSC1.ARW.xmp.chairphoto-backup").exists());
+        assert!(!local.join("DSC1.xmp.chairphoto-backup").exists());
+    }
+
+    /// The orphan an earlier offload stranded: the local image and its location row are
+    /// gone, and the backup sits where they used to be. `photo_path_candidates` always
+    /// appends the catalog-root path, so that folder is still walked — which is the only
+    /// reason this file is reachable at all.
+    #[test]
+    fn a_backup_stranded_by_an_earlier_offload_is_still_taken() {
+        let dir = crate::test_support::TestTmpDir::new("empty-trash-stranded-backup");
+        let local = dir.join("local");
+        let nas = dir.join("nas");
+        std::fs::create_dir_all(&local).unwrap();
+        std::fs::create_dir_all(&nas).unwrap();
+        // Offloaded: no local image, no local companion — only the backup it left.
+        std::fs::write(local.join("DSC1.ARW.xmp.chairphoto-backup"), b"before").unwrap();
+        std::fs::write(nas.join("DSC1.ARW"), b"bytes").unwrap();
+
+        let locations = vec![
+            crate::catalog::PathCandidate {
+                path: local.join("DSC1.ARW"),
+                role: LocationRole::Primary,
+                volume_id: None, // the catalog-root fallback, which survives the offload
+            },
+            candidate(nas.join("DSC1.ARW"), 2),
+        ];
+
+        let (outcome, tally) = delete_one_photos_copies(&locations, &HashMap::from([(2, true)]));
+
+        assert_eq!(outcome, DeleteOutcome::Destroyed);
+        assert_eq!(tally.files, 1, "only the copy at home was left to delete");
+        assert_eq!(tally.sidecar_backups, 1);
+        assert!(!local.join("DSC1.ARW.xmp.chairphoto-backup").exists());
+    }
+
+    /// Order matters: the backup is taken only once every image and companion is confirmed
+    /// gone. A delete that fails on the image leaves a photo that still exists, and the
+    /// record of what its sidecar looked like before ChairPhoto is still a record of
+    /// something.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_delete_leaves_the_sidecar_backup_alone() {
+        let dir = crate::test_support::TestTmpDir::new("empty-trash-backup-kept");
+        let ok = dir.join("ok");
+        let locked = dir.join("locked");
+        std::fs::create_dir_all(&ok).unwrap();
+        std::fs::create_dir_all(&locked).unwrap();
+        std::fs::write(ok.join("DSC1.ARW"), b"bytes").unwrap();
+        std::fs::write(ok.join("DSC1.ARW.xmp.chairphoto-backup"), b"before").unwrap();
+        std::fs::write(locked.join("DSC1.ARW"), b"bytes").unwrap();
+        set_readonly(&locked, true);
+
+        let (outcome, tally) = delete_one_photos_copies(
+            &[candidate(ok.join("DSC1.ARW"), 1), candidate(locked.join("DSC1.ARW"), 2)],
+            &HashMap::from([(1, true), (2, true)]),
+        );
+
+        set_readonly(&locked, false);
+        assert!(matches!(outcome, DeleteOutcome::Failed(_)), "got {outcome:?}");
+        assert_eq!(tally.sidecar_backups, 0, "not touched while a copy survives");
+        assert!(ok.join("DSC1.ARW.xmp.chairphoto-backup").exists());
+    }
+
+    /// And a backup that cannot be removed is itself a failure, so the row stays. A few KB
+    /// against every original already gone — but the row is what makes the leftover
+    /// findable and the delete retryable, and forgetting it is what makes the file an
+    /// orphan forever.
+    #[cfg(unix)]
+    #[test]
+    fn a_sidecar_backup_that_cannot_be_removed_keeps_the_catalog_row() {
+        let dir = crate::test_support::TestTmpDir::new("empty-trash-backup-readonly");
+        let ok = dir.join("ok");
+        let locked = dir.join("locked");
+        std::fs::create_dir_all(&ok).unwrap();
+        std::fs::create_dir_all(&locked).unwrap();
+        std::fs::write(ok.join("DSC1.ARW"), b"bytes").unwrap();
+        // The locked folder holds nothing but the leftover backup, so every image and
+        // companion is confirmed gone and only the third pass can fail.
+        std::fs::write(locked.join("DSC1.ARW.xmp.chairphoto-backup"), b"before").unwrap();
+        set_readonly(&locked, true);
+
+        let (outcome, tally) = delete_one_photos_copies(
+            &[candidate(ok.join("DSC1.ARW"), 1), candidate(locked.join("DSC1.ARW"), 2)],
+            &HashMap::from([(1, true), (2, true)]),
+        );
+
+        set_readonly(&locked, false);
+        assert!(
+            matches!(outcome, DeleteOutcome::Failed(ref why) if why.contains("chairphoto-backup")),
+            "expected the leftover to be named, got {outcome:?}"
+        );
+        assert_eq!(tally.files, 1);
+        assert_eq!(tally.sidecar_backups, 0);
+        assert!(locked.join("DSC1.ARW.xmp.chairphoto-backup").exists());
     }
 
     /// An unreachable copy means refuse, not "delete what we can". Deleting the reachable
@@ -1646,11 +1831,11 @@ mod trash_delete_tests {
             candidate(dir.join("gone/DSC1.ARW"), 2),
         ];
 
-        let (outcome, files) =
+        let (outcome, tally) =
             delete_one_photos_copies(&locations, &HashMap::from([(1, true), (2, false)]));
 
         assert_eq!(outcome, DeleteOutcome::Unreachable);
-        assert_eq!(files, 0);
+        assert_eq!(tally.files, 0);
         assert!(local.join("DSC1.ARW").exists(), "the reachable copy is untouched");
     }
 
@@ -1678,13 +1863,13 @@ mod trash_delete_tests {
         let dir = crate::test_support::TestTmpDir::new("empty-trash-absent");
         std::fs::create_dir_all(dir.join("local")).unwrap();
 
-        let (outcome, files) = delete_one_photos_copies(
+        let (outcome, tally) = delete_one_photos_copies(
             &[candidate(dir.join("local/DSC1.ARW"), 1)],
             &HashMap::from([(1, true)]),
         );
 
         assert_eq!(outcome, DeleteOutcome::Destroyed);
-        assert_eq!(files, 0);
+        assert_eq!(tally.files, 0);
     }
 
     /// The failure this contract exists for: `remove_file` returns an error, the file is
@@ -1749,14 +1934,14 @@ mod trash_delete_tests {
         std::fs::write(locked.join("DSC1.ARW"), b"bytes").unwrap();
         set_readonly(&locked, true);
 
-        let (outcome, files) = delete_one_photos_copies(
+        let (outcome, tally) = delete_one_photos_copies(
             &[candidate(ok.join("DSC1.ARW"), 1), candidate(locked.join("DSC1.ARW"), 2)],
             &HashMap::from([(1, true), (2, true)]),
         );
 
         set_readonly(&locked, false);
         assert!(matches!(outcome, DeleteOutcome::Failed(_)), "got {outcome:?}");
-        assert_eq!(files, 1, "the reachable copy really was removed — and is reported");
+        assert_eq!(tally.files, 1, "the reachable copy really was removed — and is reported");
         assert!(!ok.join("DSC1.ARW").exists());
         assert!(locked.join("DSC1.ARW").exists(), "the survivor keeps its catalog row");
     }

@@ -250,6 +250,25 @@ sidecar, during a routine space-freeing operation, for a few KB). It is left in 
 **reported**, so the one file left in an otherwise emptied folder is something the verb
 said rather than something the user discovers (#82).
 
+**Delete takes it, and reports it separately.** Emptying the trash removes the image, its
+companions and the catalog row, so nothing is left for the backup to be the earlier state
+*of* — and a file with no row and nothing beside it is the orphan the delete path already
+refuses to create everywhere else. It is counted in `sidecar_backups_deleted` rather than in
+`files_deleted`: a sidecar backup is not a companion, and folding it into the tally of
+destroyed originals would inflate that number with a file the user never knew about (#84).
+
+Order is part of the rule. The backups are taken **last**, only once every image and
+companion this delete is responsible for is confirmed absent — a delete that failed on the
+image leaves a photo that still exists, and the record of its earlier sidecar is then still
+a record of something. A backup that cannot be removed is itself a failure and the photo
+keeps its row: a few KB against every original already gone, but the row is what makes the
+leftover findable and the delete retryable.
+
+A backup **stranded by an earlier offload** — sitting where the local copy used to be, with
+its location row dropped — is still in reach, because `photo_path_candidates` always ends
+with the catalog-root path. That fallback, not the location rows, is what a later delete
+walks to find it.
+
 `verified_hash` deliberately stays a hash of the **image only**. The image is immutable, so
 a changed hash means bit rot; companions are mutable by design (darktable rewrites `.xmp` on
 every edit, and so does chairphoto on IPTC/GPS/face writes), so hashing them would report

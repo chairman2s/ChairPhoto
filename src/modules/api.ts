@@ -1713,6 +1713,14 @@ export interface EmptyTrashReport {
   /** Files removed — images and their declared companions. */
   filesDeleted: number;
   /**
+   * `<sidecar>.chairphoto-backup` files removed. Offload leaves these, because the photo
+   * they belong to still exists; delete takes the image, the sidecar and the row, so
+   * nothing is left for the backup to be the earlier state of. Counted apart from
+   * {@link filesDeleted} so the tally of destroyed originals is not inflated by a file the
+   * user never knew about.
+   */
+  sidecarBackupsDeleted: number;
+  /**
    * Photos left alone because a volume holding a copy could not be reached. Deleting them
    * would have destroyed the copies we can see and left an unreferenced survivor.
    */

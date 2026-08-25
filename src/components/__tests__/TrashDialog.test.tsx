@@ -156,6 +156,44 @@ describe("TrashDialog", () => {
     expect(text()).toMatch(/keep their place in the trash so you can retry/);
   });
 
+  it("names the sidecar backups it took, apart from the originals", async () => {
+    // Offload leaves these and says so; delete takes them and has to say so too. Folding
+    // them into the file count would inflate "originals destroyed" with a file the user
+    // never knew existed (#84).
+    emptyResult = () =>
+      Promise.resolve({
+        deleted: 1,
+        filesDeleted: 2,
+        sidecarBackupsDeleted: 2,
+        skippedUnreachable: [],
+        failed: [],
+        restoredMeanwhile: [],
+        aborted: false,
+      });
+    render(<TrashDialog onClose={() => {}} onChanged={vi.fn()} />);
+
+    await waitFor(() => expect(screen.getByText(/Delete all permanently/)).toBeTruthy());
+    fireEvent.click(screen.getByText(/Delete all permanently/));
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "delete" } });
+    fireEvent.click(screen.getByText("Delete"));
+
+    await waitFor(() => expect(text()).toMatch(/2 sidecar backups went with them/));
+    expect(text()).toMatch(/Deleted 1 photo and 2 files/);
+    expect(text()).toMatch(/nothing is left to describe/);
+  });
+
+  it("says nothing about sidecar backups when there were none", async () => {
+    render(<TrashDialog onClose={() => {}} onChanged={vi.fn()} />);
+
+    await waitFor(() => expect(screen.getByText(/Delete all permanently/)).toBeTruthy());
+    fireEvent.click(screen.getByText(/Delete all permanently/));
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "delete" } });
+    fireEvent.click(screen.getByText("Delete"));
+
+    await waitFor(() => expect(text()).toMatch(/Deleted 1 photo and 2 files/));
+    expect(text()).not.toMatch(/sidecar backup/);
+  });
+
   it("says when it stopped early rather than implying it finished", async () => {
     // A restore or a library switch stands the delete down mid-run. Reporting only the
     // count would let the user believe the rest of the trash was emptied.

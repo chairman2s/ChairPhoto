@@ -1166,6 +1166,45 @@ fn offload_leaves_a_sidecar_backup_in_place_and_reports_it() {
     );
 }
 
+/// The other half of #84: offload drops the local location row, so the backup it left sits
+/// at a path no `photo_locations` row names any more. It is not out of reach — the
+/// candidate list always ends with the catalog-root path — and that fallback is the only
+/// reason a later delete can find the file at all, so it is pinned here rather than left
+/// as an implementation detail of the resolver.
+#[test]
+fn the_backup_offload_leaves_stays_on_the_photos_candidate_list() {
+    let (catalog, root) = temp_catalog("sidecar-backup-still-reachable");
+    let (nas, _nas_dir) = nas_volume(&catalog, &root);
+
+    let raw = root.join("2026/08/DSC1.ARW");
+    let master = local_photo(&catalog, &raw, b"raw-bytes");
+    let sidecar_backup = root.join("2026/08/DSC1.ARW.xmp.chairphoto-backup");
+    std::fs::write(root.join("2026/08/DSC1.ARW.xmp"), b"<x/>").unwrap();
+    std::fs::write(&sidecar_backup, b"<x>before chairphoto</x>").unwrap();
+    catalog.backup_photo(master, nas).unwrap();
+    catalog.offload_photo(master).unwrap();
+
+    assert!(
+        catalog
+            .photo_locations(master)
+            .unwrap()
+            .iter()
+            .all(|l| l.role == LocationRole::Backup),
+        "no local row names that folder any more — which is what makes the file look stranded"
+    );
+
+    let candidates = catalog.photo_path_candidates(master).unwrap();
+    assert!(
+        candidates.iter().any(|c| c.path == *raw),
+        "but the catalog-root fallback still names it: {candidates:?}"
+    );
+    assert_eq!(
+        chairphoto_lib::companions::sidecar_backups_beside(&raw),
+        vec![sidecar_backup],
+        "and the backup is found from that image path, which is all delete has to go on"
+    );
+}
+
 /// The freshness half of the safety axis (cluster B, D5): home holds the companion that
 /// was carried, and the local one has since been edited again. Nothing stats home to work
 /// this out — the scanner notes what it sees locally, and the summary reads the note.

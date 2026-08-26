@@ -35,6 +35,39 @@ fn with_storage_catalog<T>(
     f(catalog).map_err(|e| e.to_string())
 }
 
+/// Like [`with_storage_catalog`], but on a blocking worker.
+///
+/// The offload and restore planners stat every candidate copy — `first_existing_copy` and
+/// `verified_backup` both end in `Path::exists` (`catalog/lifecycle.rs`) — and since the
+/// verbs took the whole stack (#82) that is once per frame, not once. Against an unreachable
+/// NAS a single `exists` can block for seconds, so on the async runtime's thread a seven-frame
+/// burst stalls every other command behind it. That is the "must not block the UI thread"
+/// half of AGENTS.md → Background work and ownership (#85).
+///
+/// This moves the stats off the runtime. It does **not** take them out from under the catalog
+/// mutex — other catalog readers still wait — which needs the planners split the way
+/// `photo_path_candidates` and `volume_health::pick_existing` already are.
+async fn with_storage_catalog_blocking<T: Send + 'static>(
+    state: &AppState,
+    claim: &StorageClaim,
+    f: impl FnOnce(&Catalog) -> crate::catalog::Result<T> + Send + 'static,
+) -> Result<T, String> {
+    let catalog = state.catalog.clone();
+    let db_path = claim.owner.db_path.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let guard = catalog.lock().map_err(|e| e.to_string())?;
+        let c = guard.as_ref().ok_or("No catalog is open")?;
+        // Same ownership check as the sync path: a catalog switch between the claim and the
+        // worker actually running must not let this write into the new catalog.
+        if c.db_path() != db_path {
+            return Err("storage operation superseded or catalog switched".into());
+        }
+        f(c).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 fn ensure_storage_owner(claim: &StorageClaim) -> Result<(), String> {
     if claim.owner.abort.load(Ordering::Relaxed) {
         Err("storage operation superseded or catalog switched".into())
@@ -100,7 +133,7 @@ async fn do_backup_one(
     // out meant pressing Back up on them did nothing at all. The image is left alone; the
     // companions are reconciled, which is idempotent and copies nothing when they are
     // already there.
-    if with_storage_catalog(state, claim, |c| c.has_verified_backup(photo_id))? {
+    if with_storage_catalog_blocking(state, claim, move |c| c.has_verified_backup(photo_id)).await? {
         let carried = tauri::async_runtime::spawn_blocking(move || {
             crate::catalog::carry_companions(&source, &dest)
         })
@@ -144,7 +177,9 @@ async fn do_backup(
     photo_id: i64,
     backup_id: i64,
 ) -> Result<crate::catalog::BackupReport, String> {
-    let plan = with_storage_catalog(state, claim, |c| c.plan_backup(photo_id, backup_id))?;
+    let plan =
+        with_storage_catalog_blocking(state, claim, move |c| c.plan_backup(photo_id, backup_id))
+            .await?;
     let mut report =
         crate::catalog::BackupReport { skipped: plan.skipped, total: plan.total, ..Default::default() };
     do_backup_one(state, claim, plan.named).await?;
@@ -170,7 +205,7 @@ async fn do_offload(
     claim: &StorageClaim,
     photo_id: i64,
 ) -> Result<crate::catalog::OffloadReport, String> {
-    let plan = with_storage_catalog(state, claim, |c| c.plan_offload(photo_id))?;
+    let plan = with_storage_catalog_blocking(state, claim, move |c| c.plan_offload(photo_id)).await?;
     // Persist an id-keyed thumbnail from a local copy BEFORE it's deleted, so the photo
     // stays visible in the grid once only the (possibly offline) NAS copy remains. Frames
     // need it as much as the master: they are what the inspector's Stack section shows.
@@ -571,7 +606,13 @@ pub async fn apply_offload_policy(state: State<'_, AppState>) -> Result<usize, S
     if age <= 0 {
         return Ok(0); // policy disabled
     }
-    let candidates = with_storage_catalog(state.inner(), &claim, |c| c.photos_eligible_for_offload(age))?;
+    // Stats once per candidate across the whole library, so it belongs off the runtime
+    // thread even more than the planners do (#85).
+    let candidates =
+        with_storage_catalog_blocking(state.inner(), &claim, move |c| {
+            c.photos_eligible_for_offload(age)
+        })
+        .await?;
     let mut offloaded = 0usize;
     // A stack's frames are eligible in their own right, and the master's offload already
     // freed them (#82). Without this, the sweep would run a second no-op offload per frame
@@ -624,7 +665,9 @@ async fn do_restore(
     photo_id: i64,
     local_id: i64,
 ) -> Result<crate::catalog::RestoreReport, String> {
-    let plan = with_storage_catalog(state, claim, |c| c.plan_restore(photo_id, local_id))?;
+    let plan =
+        with_storage_catalog_blocking(state, claim, move |c| c.plan_restore(photo_id, local_id))
+            .await?;
     let mut report =
         crate::catalog::RestoreReport { skipped: plan.skipped, total: plan.total, ..Default::default() };
     do_restore_one(state, claim, plan.named).await?;

@@ -629,6 +629,9 @@ Response: {response2}"
 }
 
 /// OpenAI vision via the Chat Completions API (the image rides as a base64 data URL).
+/// A decline or malformed body gets ONE retry — refusals of harmless photos are
+/// stochastic, and a second identical request often just answers. Transport errors are
+/// not retried.
 async fn call_openai(cfg: &Config, prompt: &str, image_b64: &str) -> Result<String, String> {
     if cfg.openai_key.is_empty() {
         return Err("No OpenAI API key configured".into());
@@ -646,23 +649,51 @@ async fn call_openai(cfg: &Config, prompt: &str, image_b64: &str) -> Result<Stri
             ],
         }],
     });
-    let resp = reqwest::Client::new()
-        .post("https://api.openai.com/v1/chat/completions")
-        .header("Authorization", format!("Bearer {}", cfg.openai_key))
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| format!("OpenAI request failed: {e}"))?;
-    let value: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
-    value
+    let do_request = |body: serde_json::Value| {
+        let key = cfg.openai_key.clone();
+        async move {
+            let resp = reqwest::Client::new()
+                .post("https://api.openai.com/v1/chat/completions")
+                .header("Authorization", format!("Bearer {key}"))
+                .json(&body)
+                .send()
+                .await
+                .map_err(|e| format!("OpenAI request failed: {e}"))?;
+            resp.json::<serde_json::Value>()
+                .await
+                .map_err(|e| e.to_string())
+        }
+    };
+    match extract_openai_text(&do_request(body.clone()).await?) {
+        Ok(text) => Ok(text),
+        Err(_) => extract_openai_text(&do_request(body).await?),
+    }
+}
+
+/// Pull the assistant text out of a Chat Completions response. A normal reply carries
+/// it in `message.content`; a decline carries `message.refusal` instead (content null),
+/// and an API failure a top-level `error` — both become readable errors, not a raw
+/// JSON dump.
+fn extract_openai_text(value: &serde_json::Value) -> Result<String, String> {
+    let message = value
         .get("choices")
         .and_then(|c| c.as_array())
         .and_then(|a| a.first())
-        .and_then(|m| m.get("message"))
-        .and_then(|m| m.get("content"))
-        .and_then(|t| t.as_str())
-        .map(str::to_string)
-        .ok_or_else(|| format!("OpenAI returned no text: {value}"))
+        .and_then(|m| m.get("message"));
+    if let Some(text) = message.and_then(|m| m.get("content")).and_then(|t| t.as_str()) {
+        return Ok(text.to_string());
+    }
+    if let Some(refusal) = message.and_then(|m| m.get("refusal")).and_then(|r| r.as_str()) {
+        return Err(format!("OpenAI declined this request: {refusal}"));
+    }
+    if let Some(msg) = value
+        .get("error")
+        .and_then(|e| e.get("message"))
+        .and_then(|m| m.as_str())
+    {
+        return Err(format!("OpenAI error: {msg}"));
+    }
+    Err(format!("OpenAI returned no text: {value}"))
 }
 
 /// Google Gemini vision via generateContent (the image rides as inline base64 data).
@@ -762,6 +793,58 @@ fn extract_json(content: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── OpenAI response extraction ───────────────────────────────────────────
+
+    #[test]
+    fn openai_content_is_returned_verbatim() {
+        let v = serde_json::json!({
+            "choices": [{ "message": { "content": "{\"tags\":[]}", "refusal": null } }]
+        });
+        assert_eq!(extract_openai_text(&v).unwrap(), "{\"tags\":[]}");
+    }
+
+    #[test]
+    fn openai_refusal_becomes_a_readable_error_not_a_json_dump() {
+        // Shape captured from a real gpt-4o refusal: content null, refusal set,
+        // finish_reason a normal "stop".
+        let v = serde_json::json!({
+            "choices": [{
+                "finish_reason": "stop",
+                "index": 0,
+                "message": {
+                    "annotations": [],
+                    "content": null,
+                    "refusal": "I'm sorry, but I can't help with identifying or \
+classifying real people or objects in images provided.",
+                    "role": "assistant"
+                }
+            }],
+            "model": "gpt-4o-2024-08-06"
+        });
+        let err = extract_openai_text(&v).unwrap_err();
+        assert!(err.starts_with("OpenAI declined this request:"), "{err}");
+        assert!(err.contains("identifying"), "{err}");
+        assert!(!err.contains("finish_reason"), "raw dump leaked into the error: {err}");
+    }
+
+    #[test]
+    fn openai_error_body_becomes_a_readable_error() {
+        let v = serde_json::json!({
+            "error": { "message": "Incorrect API key provided", "type": "invalid_request_error" }
+        });
+        assert_eq!(
+            extract_openai_text(&v).unwrap_err(),
+            "OpenAI error: Incorrect API key provided"
+        );
+    }
+
+    #[test]
+    fn openai_unrecognised_body_still_dumps_for_diagnosis() {
+        let v = serde_json::json!({ "unexpected": true });
+        let err = extract_openai_text(&v).unwrap_err();
+        assert!(err.starts_with("OpenAI returned no text:"), "{err}");
+    }
 
     // ── H15c — grouped dispatch + propagation ────────────────────────────────
 

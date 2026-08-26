@@ -1708,8 +1708,9 @@ mod trash_delete_tests {
         std::fs::write(local.join("DSC1.ARW"), b"bytes").unwrap();
         std::fs::write(local.join("DSC1.ARW.xmp"), b"chairphoto wrote this").unwrap();
         std::fs::write(local.join("DSC1.ARW.xmp.chairphoto-backup"), b"before").unwrap();
-        // The basename shape too — darktable's alternate mode leaves its own backup.
-        std::fs::write(local.join("DSC1.xmp.chairphoto-backup"), b"before").unwrap();
+        // A basename backup is left alone: nothing writes that shape, and the name belongs
+        // equally to a `DSC1.JPG` that may still be live beside this RAW (#86).
+        std::fs::write(local.join("DSC1.xmp.chairphoto-backup"), b"not ours").unwrap();
 
         let (outcome, tally) = delete_one_photos_copies(
             &[candidate(local.join("DSC1.ARW"), 1)],
@@ -1718,9 +1719,9 @@ mod trash_delete_tests {
 
         assert_eq!(outcome, DeleteOutcome::Destroyed);
         assert_eq!(tally.files, 2, "the image and its one declared companion");
-        assert_eq!(tally.sidecar_backups, 2, "counted apart, not folded into the originals");
+        assert_eq!(tally.sidecar_backups, 1, "counted apart, not folded into the originals");
         assert!(!local.join("DSC1.ARW.xmp.chairphoto-backup").exists());
-        assert!(!local.join("DSC1.xmp.chairphoto-backup").exists());
+        assert!(local.join("DSC1.xmp.chairphoto-backup").exists());
     }
 
     /// The orphan an earlier offload stranded: the local image and its location row are

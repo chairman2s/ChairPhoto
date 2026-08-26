@@ -106,6 +106,15 @@ export function TrashDialog({
             <div className="trash-report">
               Deleted {report.deleted} photo{report.deleted === 1 ? "" : "s"} and{" "}
               {report.filesDeleted} file{report.filesDeleted === 1 ? "" : "s"}.
+              {report.sidecarBackupsDeleted > 0 && (
+                <>
+                  {" "}
+                  {report.sidecarBackupsDeleted} sidecar backup
+                  {report.sidecarBackupsDeleted === 1 ? "" : "s"} went with them — the copy
+                  kept of each sidecar before ChairPhoto first wrote to it, which nothing is
+                  left to describe.
+                </>
+              )}
               {report.skippedUnreachable.length > 0 && (
                 <>
                   {" "}

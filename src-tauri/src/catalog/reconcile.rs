@@ -23,6 +23,7 @@ const KINDS: &[&str] = &["backup", "offload", "restore"];
 pub struct DrainSummary {
     pub ran: usize,
     pub failed: usize,
+    pub partial: usize,
     /// True when nothing was attempted because no backup volume is reachable.
     pub skipped_offline: bool,
 }
@@ -109,6 +110,27 @@ impl Catalog {
         Ok(())
     }
 
+    pub fn replace_operation_with_skipped(
+        &self,
+        operation_id: i64,
+        kind: &str,
+        skipped: &[super::SkippedPhoto],
+    ) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        for item in skipped {
+            tx.execute(
+                "INSERT INTO pending_operations(kind, photo_id, status, error, created_at)
+                 VALUES(?1, ?2, 'failed', ?3, ?4)
+                 ON CONFLICT(kind, photo_id) DO UPDATE
+                 SET status = 'failed', error = excluded.error",
+                params![kind, item.photo_id, item.reason, now()],
+            )?;
+        }
+        tx.execute("DELETE FROM pending_operations WHERE id = ?1", params![operation_id])?;
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Run every queued op through the E3 lifecycle, using the single backup + local
     /// volumes. Each op is cleared on success or marked `failed` (with the error) on
     /// failure. If no backup volume is reachable, nothing is attempted (the queue is
@@ -132,18 +154,23 @@ impl Catalog {
 
         for op in self.list_pending_operations()? {
             let result = match op.kind.as_str() {
-                "backup" => self.backup_photo(op.photo_id, backup_id).map(|_| ()),
-                "offload" => self.offload_photo(op.photo_id),
+                "backup" => self.backup_photo(op.photo_id, backup_id).map(|r| r.skipped),
+                "offload" => self.offload_photo(op.photo_id).map(|r| r.skipped),
                 "restore" => match local {
-                    Some(l) => self.restore_photo(op.photo_id, l.id).map(|_| ()),
+                    Some(l) => self.restore_photo(op.photo_id, l.id).map(|r| r.skipped),
                     None => Err(CatalogError::Validation("no local volume".into())),
                 },
                 other => Err(CatalogError::Validation(format!("unknown operation: {other}"))),
             };
             match result {
-                Ok(()) => {
-                    self.remove_operation(op.id)?;
-                    summary.ran += 1;
+                Ok(skipped) => {
+                    if skipped.is_empty() {
+                        self.remove_operation(op.id)?;
+                        summary.ran += 1;
+                    } else {
+                        self.replace_operation_with_skipped(op.id, &op.kind, &skipped)?;
+                        summary.partial += 1;
+                    }
                 }
                 Err(e) => {
                     self.set_operation_failed(op.id, &e.to_string())?;

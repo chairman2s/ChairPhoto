@@ -108,10 +108,7 @@ impl Found {
 
 /// `<image>.<ext>` — the extension appended to the whole filename.
 pub fn appended_path(image: &Path, ext: &str) -> PathBuf {
-    let mut s = image.as_os_str().to_os_string();
-    s.push(".");
-    s.push(ext);
-    PathBuf::from(s)
+    with_suffix(image, &format!(".{ext}"))
 }
 
 /// Every declared companion that currently exists beside `image`.
@@ -143,6 +140,60 @@ pub fn carried_beside(image: &Path) -> Vec<Found> {
             COMPANIONS.iter().any(|c| c.ext == f.ext && c.carry)
         })
         .collect()
+}
+
+/// The suffix `xmp::SidecarDocument` appends when it preserves a sidecar before its first
+/// chairphoto write (AGENTS.md "XMP safety").
+pub const SIDECAR_BACKUP_SUFFIX: &str = ".chairphoto-backup";
+
+/// The extension `xmp::sidecar_path` appends. Named here so the one place that looks for a
+/// sidecar *backup* cannot drift from the one place that writes a sidecar; pinned by
+/// `sidecar_backup_search_matches_what_the_writer_produces`.
+pub const SIDECAR_EXT: &str = "xmp";
+
+/// Where a sidecar's pre-chairphoto backup lives: `<sidecar>.chairphoto-backup`.
+///
+/// One definition, because two halves of the app care about these files — the writer that
+/// creates them (`xmp::SidecarDocument::open`) and the offload that must recognise them
+/// without deleting them (#82).
+pub fn sidecar_backup(sidecar: &Path) -> PathBuf {
+    with_suffix(sidecar, SIDECAR_BACKUP_SUFFIX)
+}
+
+/// Sidecar backups sitting beside `image`, in both sidecar shapes.
+///
+/// Deliberately **not** a companion: a backup records what *this copy's* sidecar looked
+/// like before chairphoto first touched it, so it is per-copy by construction. Carrying one
+/// home would routinely leave two different backups for one photo, which the divergence
+/// rule reads as unreconciled edits and refuses to offload over; deleting it would destroy
+/// the only record of the pre-chairphoto sidecar during a space-freeing operation. So
+/// offload leaves them alone and reports them, and this is how it finds them (#82).
+/// There is exactly one shape to look for. `xmp::SidecarDocument::open` is the only writer
+/// of these files, and it names them from `xmp::sidecar_path`, which appends `.xmp` to the
+/// whole file name — so `<image>.xmp.chairphoto-backup` is the only one that can exist.
+///
+/// Searching the basename form and the other companion extensions read as defensive and was
+/// not: it matched nothing the app can produce, and a *basename* backup is named identically
+/// by both members of a RAW+JPEG pair (`DSC1.ARW` and `DSC1.JPG` both yield
+/// `DSC1.xmp.chairphoto-backup`) — the shape `pair_raw_jpeg_stacks` creates after every scan.
+/// Deleting one member would have taken a file the other, still-live member also names (#86).
+///
+/// Looked up whether or not the sidecar itself still exists: a backup outlives the sidecar it
+/// was taken from, which is exactly the case offload leaves behind.
+pub fn sidecar_backups_beside(image: &Path) -> Vec<PathBuf> {
+    let backup = sidecar_backup(&appended_path(image, SIDECAR_EXT));
+    if backup.is_file() {
+        vec![backup]
+    } else {
+        Vec::new()
+    }
+}
+
+/// `<path><suffix>` — a suffix appended to the whole file name, extension included.
+fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut s = path.as_os_str().to_os_string();
+    s.push(suffix);
+    PathBuf::from(s)
 }
 
 /// The registry entry for an extension, if it is declared.
@@ -183,6 +234,39 @@ mod tests {
         touch(&dir.join("DSC1.ARW.txt"));
         touch(&dir.join("notes.md"));
 
+        assert!(found_beside(&img).is_empty());
+    }
+
+    #[test]
+    fn a_sidecar_backup_is_found_but_is_not_a_companion() {
+        // The two halves of #82's second finding: offload has to *recognise* these files
+        // to report them, and must never carry them (a backup is per copy, so carrying
+        // one produces two different backups for one photo).
+        let dir = TestTmpDir::new("companions-sidecar-backup");
+        let img = dir.join("DSC1.ARW");
+        touch(&img);
+        touch(&dir.join("DSC1.ARW.xmp"));
+        touch(&dir.join("DSC1.ARW.xmp.chairphoto-backup"));
+
+        assert_eq!(sidecar_backups_beside(&img).len(), 1);
+        assert!(
+            carried_beside(&img).iter().all(|f| f.ext == "xmp"),
+            "the backup is not carried — only the sidecar itself is"
+        );
+    }
+
+    #[test]
+    fn a_sidecar_backup_outlives_the_sidecar_it_was_taken_from() {
+        // Exactly what offload leaves behind: the sidecar went home and was freed, the
+        // backup did not. Deriving the path from the image rather than from what is on
+        // disk is what lets it still be counted.
+        let dir = TestTmpDir::new("companions-orphan-backup");
+        let img = dir.join("DSC1.ARW");
+        touch(&img);
+        // The backup, with no `DSC1.ARW.xmp` beside it any more.
+        touch(&dir.join("DSC1.ARW.xmp.chairphoto-backup"));
+
+        assert_eq!(sidecar_backups_beside(&img).len(), 1);
         assert!(found_beside(&img).is_empty());
     }
 
@@ -248,5 +332,42 @@ mod tests {
         // Nothing is declared purely for edit-detection today. If that changes, this test
         // is the place to notice, because `carried_beside` silently filters.
         assert!(COMPANIONS.iter().all(|c| c.carry));
+    }
+
+    /// The search and the writer have to agree on one name. If `xmp::sidecar_path` ever
+    /// stops appending `.xmp` to the whole file name, this fails here rather than by
+    /// silently finding no backups to delete (#86).
+    #[test]
+    fn sidecar_backup_search_matches_what_the_writer_produces() {
+        let image = Path::new("/library/DSC1.ARW");
+        assert_eq!(
+            sidecar_backup(&crate::xmp::sidecar_path(image)),
+            sidecar_backup(&appended_path(image, SIDECAR_EXT)),
+            "the shape looked for and the shape written must be the same path"
+        );
+    }
+
+    /// A basename backup is named identically by both members of a RAW+JPEG pair, which
+    /// `pair_raw_jpeg_stacks` creates after every scan. Deleting one member must not reach
+    /// a file the other still-live member also names (#86).
+    #[test]
+    fn a_basename_backup_is_not_claimed_by_either_member_of_a_pair() {
+        let dir = TestTmpDir::new("companions-pair-backup");
+        let raw = dir.join("DSC1.ARW");
+        let jpg = dir.join("DSC1.JPG");
+        std::fs::write(&raw, b"raw").unwrap();
+        std::fs::write(&jpg, b"jpg").unwrap();
+        std::fs::write(dir.join("DSC1.xmp.chairphoto-backup"), b"whose?").unwrap();
+
+        assert!(sidecar_backups_beside(&raw).is_empty());
+        assert!(sidecar_backups_beside(&jpg).is_empty());
+
+        // The shape the app does write is still found, for the RAW alone.
+        std::fs::write(dir.join("DSC1.ARW.xmp.chairphoto-backup"), b"mine").unwrap();
+        assert_eq!(
+            sidecar_backups_beside(&raw),
+            vec![dir.join("DSC1.ARW.xmp.chairphoto-backup")]
+        );
+        assert!(sidecar_backups_beside(&jpg).is_empty());
     }
 }

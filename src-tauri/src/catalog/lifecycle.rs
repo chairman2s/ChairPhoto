@@ -15,16 +15,67 @@ use super::{Catalog, CatalogError, LocationRole, Result, VolumeKind};
 use rusqlite::{params, OptionalExtension};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub struct BackupPlan {
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SkippedPhoto {
+    pub photo_id: i64,
+    pub reason: String,
+}
+
+impl SkippedPhoto {
+    fn new(photo_id: i64, reason: impl Into<String>) -> Self {
+        Self { photo_id, reason: reason.into() }
+    }
+}
+
+/// One photo's share of a backup: where its image is now and where the copy goes.
+pub struct PhotoBackup {
+    pub photo_id: i64,
     pub source: PathBuf,
     pub dest: PathBuf,
     pub rel: String,
     pub volume_id: i64,
 }
 
-pub struct OffloadPlan {
+/// What backing up one tile covers: the photo the caller named **and its stack frames**.
+///
+/// Since stacking became the normal way a burst is stored, a tile is a moment rather than
+/// a file — which is why trash has taken the whole stack since cluster B. Backup and
+/// offload took the master alone, so the same tile behaved two ways (#82). The cascade
+/// lives in the plan so that no caller — the inspector, the reconcile drain, the age-based
+/// sweep — can inherit half of it.
+///
+/// Each frame is gated on its **own** copies, never on the master's: a frame with nothing
+/// local to copy is skipped and named, not dragged along or silently dropped.
+pub struct BackupPlan {
+    /// The photo the caller named. Its refusal is the call's refusal.
+    pub named: PhotoBackup,
+    /// The frames that can travel with it.
+    pub frames: Vec<PhotoBackup>,
+    /// Frames left behind, with why.
+    pub skipped: Vec<SkippedPhoto>,
+    pub total: usize,
+}
+
+/// What one backup call achieved. Reported rather than counted, so the UI can say "4 of 7"
+/// and name the three it did not take.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BackupReport {
+    /// Photos now backed up: the named photo, then the frames that went with it.
+    pub backed_up: Vec<i64>,
+    /// Frames left local, with why.
+    pub skipped: Vec<SkippedPhoto>,
+    pub total: usize,
+}
+
+/// One photo's share of an offload: the verified backup that permits it and the local
+/// files it frees.
+pub struct PhotoOffload {
+    pub photo_id: i64,
     pub backup_abs: PathBuf,
     /// The `photo_locations.id` of the backup copy, so companions carried during the
     /// offload attach to the right row.
@@ -34,12 +85,89 @@ pub struct OffloadPlan {
     pub local_volume_ids: Vec<i64>,
 }
 
-pub struct RestorePlan {
+/// What offloading one tile covers — the stack half of [`BackupPlan`]'s reasoning.
+///
+/// Offloading a 7-frame burst expecting ~600 MB back and getting the keeper's 90 MB
+/// defeats the point of the verb. The per-frame gate matters more here than for backup:
+/// invariant 2 ("never offload without a verified backup") is decided **per frame**, so a
+/// frame whose own backup is missing stays local instead of being freed on the strength of
+/// the master's.
+pub struct OffloadPlan {
+    /// The photo the caller named. Its refusal is the call's refusal.
+    pub named: PhotoOffload,
+    /// The frames that can be freed with it.
+    pub frames: Vec<PhotoOffload>,
+    /// Frames left local, with why.
+    pub skipped: Vec<SkippedPhoto>,
+    pub total: usize,
+}
+
+/// One photo's local copies, freed and confirmed at home — the caller still has to record
+/// the companions and drop the location rows.
+pub struct FreedPhoto {
+    pub photo_id: i64,
+    pub backup_location_id: i64,
+    pub local_volume_ids: Vec<i64>,
+    pub carried: Vec<CarriedCompanion>,
+}
+
+/// What the file half of an offload achieved, for [`Catalog::commit_offload_carry`].
+pub struct OffloadCarry {
+    pub freed: Vec<FreedPhoto>,
+    /// Frames left local — planned-out, or refused by their own IO.
+    pub skipped: Vec<SkippedPhoto>,
+    pub total: usize,
+    /// `<sidecar>.chairphoto-backup` files left beside a freed image. See
+    /// [`crate::companions::sidecar_backups_beside`] for why they are left.
+    pub sidecar_backups_left: usize,
+}
+
+/// What one offload call achieved.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OffloadReport {
+    /// Photos whose local copies were freed: the named photo, then its frames.
+    pub freed: Vec<i64>,
+    /// Frames left local, with why (no verified backup yet, a diverged companion).
+    pub skipped: Vec<SkippedPhoto>,
+    pub total: usize,
+    /// Sidecar backups deliberately left in place, so offload says what it left rather
+    /// than leaving it silently (#82).
+    pub sidecar_backups_left: usize,
+}
+
+/// One photo's share of a restore.
+pub struct PhotoRestore {
+    pub photo_id: i64,
     pub source: PathBuf,
     pub dest: PathBuf,
     pub rel: String,
     pub volume_id: i64,
     pub expected_hash: Option<String>,
+}
+
+/// What restoring one tile covers. The third verb of the same rule: offload frees the
+/// moment, so restore has to bring the moment back — a stack that goes to the NAS as seven
+/// frames and returns as one would be the asymmetry #82 is about, pointing the other way.
+pub struct RestorePlan {
+    /// The photo the caller named. Its refusal is the call's refusal.
+    pub named: PhotoRestore,
+    /// Frames that are not at home and can be brought back.
+    pub frames: Vec<PhotoRestore>,
+    /// Frames left on the backup volume, with why.
+    pub skipped: Vec<SkippedPhoto>,
+    pub total: usize,
+}
+
+/// What one restore call achieved.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RestoreReport {
+    /// Photos now local again: the named photo, then the frames that came with it.
+    pub restored: Vec<i64>,
+    /// Frames left on the backup volume, with why.
+    pub skipped: Vec<SkippedPhoto>,
+    pub total: usize,
 }
 
 struct Copy {
@@ -55,19 +183,45 @@ struct Copy {
 impl Catalog {
     // --- backup ------------------------------------------------------------
 
-    /// Validate the target is a backup volume and a local source exists; compute paths.
+    /// Validate the target is a backup volume and a local source exists; compute paths —
+    /// for the named photo **and every frame stacked under it** (see [`BackupPlan`]).
     pub fn plan_backup(&self, photo_id: i64, backup_volume_id: i64) -> Result<BackupPlan> {
         let (base, kind) = self.volume_base_kind(backup_volume_id)?;
         if kind != VolumeKind::Backup {
             return Err(CatalogError::Validation("target is not a backup volume".into()));
         }
+        let named = self.plan_backup_one(photo_id, &base, backup_volume_id)?;
+        let mut frames = Vec::new();
+        let mut skipped = Vec::new();
+        let frame_ids = self.stack_frame_ids(photo_id)?;
+        let total = 1 + frame_ids.len();
+        for frame_id in frame_ids {
+            match self.plan_backup_one(frame_id, &base, backup_volume_id) {
+                Ok(plan) => frames.push(plan),
+                // A frame's own missing copy is a skip, not the master's failure. Anything
+                // else (a vanished row, a database error) is still an error.
+                Err(CatalogError::Validation(why)) => skipped.push(SkippedPhoto::new(frame_id, why)),
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(BackupPlan { named, frames, skipped, total })
+    }
+
+    /// One photo's paths, with no reference to the stack it may be part of.
+    fn plan_backup_one(
+        &self,
+        photo_id: i64,
+        base: &str,
+        backup_volume_id: i64,
+    ) -> Result<PhotoBackup> {
         let source = self
             .first_existing_copy(photo_id, VolumeKind::Local)?
             .ok_or_else(|| CatalogError::Validation("no local copy to back up".into()))?;
         let rel = self.get_photo(photo_id)?.path;
-        Ok(BackupPlan {
+        Ok(PhotoBackup {
+            photo_id,
             source: source.abs,
-            dest: Path::new(&base).join(&rel),
+            dest: Path::new(base).join(&rel),
             rel,
             volume_id: backup_volume_id,
         })
@@ -83,24 +237,79 @@ impl Catalog {
         self.set_location_verified_hash(photo_id, volume_id, LocationRole::Backup, hash)
     }
 
-    /// Sync convenience: back up a photo to a backup volume, returning the verified hash.
+    /// Sync convenience: back up a photo — and its stack — to a backup volume.
     ///
-    /// Carries the photo's declared companions too — a copy is the image *plus* what
+    /// Carries each photo's declared companions too: a copy is the image *plus* what
     /// describes it (cluster B, D2). A companion that differs at the destination is left
     /// alone rather than overwritten; it shows up as divergence for the freshness pass,
     /// because two edits exist and backup is not the place to pick one.
-    pub fn backup_photo(&self, photo_id: i64, backup_volume_id: i64) -> Result<String> {
+    ///
+    /// A frame that fails is reported, not fatal — the master is already at home by then,
+    /// and turning that into an error would report a copy that happened as one that did
+    /// not.
+    pub fn backup_photo(&self, photo_id: i64, backup_volume_id: i64) -> Result<BackupReport> {
         let plan = self.plan_backup(photo_id, backup_volume_id)?;
-        let outcome = copy_with_companions(&plan.source, &plan.dest, None)?;
-        self.record_copy(photo_id, plan.volume_id, &plan.rel, LocationRole::Backup, &outcome)?;
-        Ok(outcome.hash)
+        let mut report = BackupReport { skipped: plan.skipped, total: plan.total, ..Default::default() };
+        let outcome = copy_with_companions(&plan.named.source, &plan.named.dest, None)?;
+        self.record_copy(
+            plan.named.photo_id,
+            plan.named.volume_id,
+            &plan.named.rel,
+            LocationRole::Backup,
+            &outcome,
+        )?;
+        report.backed_up.push(plan.named.photo_id);
+        for frame in &plan.frames {
+            match copy_with_companions(&frame.source, &frame.dest, None) {
+                Ok(outcome) => {
+                    self.record_copy(
+                        frame.photo_id,
+                        frame.volume_id,
+                        &frame.rel,
+                        LocationRole::Backup,
+                        &outcome,
+                    )?;
+                    report.backed_up.push(frame.photo_id);
+                }
+                Err(e) => report.skipped.push(SkippedPhoto::new(frame.photo_id, e.to_string())),
+            }
+        }
+        Ok(report)
     }
 
     // --- offload -----------------------------------------------------------
 
-    /// Validate a verified backup exists and gather the local files to free. Errors
-    /// (refuses) if there is no verified backup — invariants 1 & 2.
+    /// Validate a verified backup exists and gather the local files to free — for the named
+    /// photo **and every frame stacked under it** (see [`OffloadPlan`]). Errors (refuses) if
+    /// the named photo has no verified backup — invariants 1 & 2.
     pub fn plan_offload(&self, photo_id: i64) -> Result<OffloadPlan> {
+        let named = self.plan_offload_one(photo_id)?;
+        let mut frames = Vec::new();
+        let mut skipped = Vec::new();
+        let frame_ids = self.stack_frame_ids(photo_id)?;
+        let total = 1 + frame_ids.len();
+        for frame_id in frame_ids {
+            // Nothing local to free is not a refusal: an already-archived frame is the
+            // state offload wants, and listing it as skipped would invite the user to act
+            // on it. Rows, not files — the rows are what `commit_offload` drops.
+            if self.copies_on_kind(frame_id, VolumeKind::Local)?.is_empty() {
+                continue;
+            }
+            match self.plan_offload_one(frame_id) {
+                Ok(plan) => frames.push(plan),
+                // Invariant 2 is decided per frame: a frame without its own verified
+                // backup stays local and is named, rather than being freed on the strength
+                // of the master's backup.
+                Err(CatalogError::Validation(why)) => skipped.push(SkippedPhoto::new(frame_id, why)),
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(OffloadPlan { named, frames, skipped, total })
+    }
+
+    /// One photo's backup gate and local files, with no reference to the stack it may be
+    /// part of.
+    fn plan_offload_one(&self, photo_id: i64) -> Result<PhotoOffload> {
         let backup = self
             .verified_backup(photo_id)?
             .ok_or_else(|| CatalogError::Validation("no verified backup — refusing to offload".into()))?;
@@ -108,13 +317,30 @@ impl Catalog {
         let mut local_volume_ids: Vec<i64> = locals.iter().map(|c| c.volume_id).collect();
         local_volume_ids.sort_unstable();
         local_volume_ids.dedup();
-        Ok(OffloadPlan {
+        Ok(PhotoOffload {
+            photo_id,
             backup_location_id: backup.location_id,
             backup_abs: backup.abs,
             expected_hash: backup.verified_hash.unwrap_or_default(),
             local_files: locals.into_iter().map(|c| c.abs).collect(),
             local_volume_ids,
         })
+    }
+
+    /// The frames stacked under `photo_id`, in a stable order.
+    ///
+    /// Empty for a frame: stacks are one level deep (`set_stack_parent` flattens), so a
+    /// storage verb pressed on a frame acts on that frame alone — the same asymmetry
+    /// `restore_photos` has, where restoring a child does not restore its master.
+    fn stack_frame_ids(&self, photo_id: i64) -> Result<Vec<i64>> {
+        let mut stmt = self.conn.prepare(
+            "-- includes-hidden: moving bytes is maintenance, not browsing. A frame the grid
+             -- hides (trashed, missing) still occupies the disk it is being freed from, and
+             -- still holds edit state that has to reach home before anything is deleted.
+             SELECT id FROM photos WHERE stack_parent_id = ?1 ORDER BY path COLLATE NOCASE",
+        )?;
+        let rows = stmt.query_map(params![photo_id], |r| r.get(0))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
     /// Drop the local location records after the files were deleted + backup verified.
@@ -125,19 +351,37 @@ impl Catalog {
         Ok(())
     }
 
-    /// Sync convenience: offload a photo's local copies (only after re-verifying backup).
+    /// Record what reached home and drop the local location rows, for every photo an
+    /// offload freed.
+    ///
+    /// Recording comes first per photo: `commit_offload` deletes the local location rows
+    /// and their companion rows cascade with them.
+    pub fn commit_offload_carry(&self, carry: OffloadCarry) -> Result<OffloadReport> {
+        let mut report = OffloadReport {
+            skipped: carry.skipped,
+            total: carry.total,
+            sidecar_backups_left: carry.sidecar_backups_left,
+            ..Default::default()
+        };
+        for freed in &carry.freed {
+            self.record_companions(freed.backup_location_id, &freed.carried)?;
+            self.commit_offload(freed.photo_id, &freed.local_volume_ids)?;
+            report.freed.push(freed.photo_id);
+        }
+        Ok(report)
+    }
+
+    /// Sync convenience: offload a photo's local copies — and its stack's — after
+    /// re-verifying each backup.
     ///
     /// Recovery note: files are deleted (IO) before the location records are dropped
     /// (`commit_offload`). A crash in between leaves stale local records pointing at
     /// now-missing files — **never data loss** (the verified backup is intact and the
     /// resolver falls back to it); a rescan/reconcile clears the stale records.
-    pub fn offload_photo(&self, photo_id: i64) -> Result<()> {
+    pub fn offload_photo(&self, photo_id: i64) -> Result<OffloadReport> {
         let plan = self.plan_offload(photo_id)?;
-        let carried = verify_and_delete_locals(&plan)?;
-        // Record before the local rows go away: `commit_offload` deletes the local
-        // location rows, and their companion rows cascade with them.
-        self.record_companions(plan.backup_location_id, &carried)?;
-        self.commit_offload(photo_id, &plan.local_volume_ids)
+        let carry = verify_and_delete_locals(&plan)?;
+        self.commit_offload_carry(carry)
     }
 
     /// Record companions confirmed present at one location.
@@ -302,19 +546,49 @@ impl Catalog {
 
     // --- restore -----------------------------------------------------------
 
-    /// Validate the target is a local volume and a backup copy exists; compute paths.
+    /// Validate the target is a local volume and a backup copy exists; compute paths — for
+    /// the named photo **and the frames stacked under it** that are not already home.
     pub fn plan_restore(&self, photo_id: i64, local_volume_id: i64) -> Result<RestorePlan> {
         let (base, kind) = self.volume_base_kind(local_volume_id)?;
         if kind != VolumeKind::Local {
             return Err(CatalogError::Validation("target is not a local volume".into()));
         }
+        let named = self.plan_restore_one(photo_id, &base, local_volume_id)?;
+        let mut frames = Vec::new();
+        let mut skipped = Vec::new();
+        let frame_ids = self.stack_frame_ids(photo_id)?;
+        let total = 1 + frame_ids.len();
+        for frame_id in frame_ids {
+            // A frame already at home needs nothing — and copying the backup over it would
+            // replace a local file the user may have edited since. Restore brings back what
+            // is away; it does not overwrite what is here.
+            if self.first_existing_copy(frame_id, VolumeKind::Local)?.is_some() {
+                continue;
+            }
+            match self.plan_restore_one(frame_id, &base, local_volume_id) {
+                Ok(plan) => frames.push(plan),
+                Err(CatalogError::Validation(why)) => skipped.push(SkippedPhoto::new(frame_id, why)),
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(RestorePlan { named, frames, skipped, total })
+    }
+
+    /// One photo's paths, with no reference to the stack it may be part of.
+    fn plan_restore_one(
+        &self,
+        photo_id: i64,
+        base: &str,
+        local_volume_id: i64,
+    ) -> Result<PhotoRestore> {
         let backup = self
             .first_existing_copy(photo_id, VolumeKind::Backup)?
             .ok_or_else(|| CatalogError::Validation("no reachable backup to restore".into()))?;
         let rel = self.get_photo(photo_id)?.path;
-        Ok(RestorePlan {
+        Ok(PhotoRestore {
+            photo_id,
             source: backup.abs,
-            dest: Path::new(&base).join(&rel),
+            dest: Path::new(base).join(&rel),
             rel,
             volume_id: local_volume_id,
             expected_hash: backup.verified_hash,
@@ -327,16 +601,43 @@ impl Catalog {
         self.set_location_verified_hash(photo_id, volume_id, LocationRole::LocalCache, hash)
     }
 
-    /// Sync convenience: restore a photo's backup copy to a local volume.
+    /// Sync convenience: restore a photo's backup copy — and its stack's — to a local
+    /// volume.
     ///
     /// Brings the companions back with it, so a restored photo arrives with the edit
     /// state an offload freed rather than as bare pixels.
-    pub fn restore_photo(&self, photo_id: i64, local_volume_id: i64) -> Result<String> {
+    pub fn restore_photo(&self, photo_id: i64, local_volume_id: i64) -> Result<RestoreReport> {
         let plan = self.plan_restore(photo_id, local_volume_id)?;
-        let outcome =
-            copy_with_companions(&plan.source, &plan.dest, plan.expected_hash.as_deref())?;
-        self.record_copy(photo_id, plan.volume_id, &plan.rel, LocationRole::LocalCache, &outcome)?;
-        Ok(outcome.hash)
+        let mut report = RestoreReport { skipped: plan.skipped, total: plan.total, ..Default::default() };
+        let outcome = copy_with_companions(
+            &plan.named.source,
+            &plan.named.dest,
+            plan.named.expected_hash.as_deref(),
+        )?;
+        self.record_copy(
+            plan.named.photo_id,
+            plan.named.volume_id,
+            &plan.named.rel,
+            LocationRole::LocalCache,
+            &outcome,
+        )?;
+        report.restored.push(plan.named.photo_id);
+        for frame in &plan.frames {
+            match copy_with_companions(&frame.source, &frame.dest, frame.expected_hash.as_deref()) {
+                Ok(outcome) => {
+                    self.record_copy(
+                        frame.photo_id,
+                        frame.volume_id,
+                        &frame.rel,
+                        LocationRole::LocalCache,
+                        &outcome,
+                    )?;
+                    report.restored.push(frame.photo_id);
+                }
+                Err(e) => report.skipped.push(SkippedPhoto::new(frame.photo_id, e.to_string())),
+            }
+        }
+        Ok(report)
     }
 
     // --- helpers -----------------------------------------------------------
@@ -617,16 +918,54 @@ pub fn copy_and_verify(src: &Path, dst: &Path, expected: Option<&str>) -> Result
     Ok(src_hash)
 }
 
-/// Re-verify the backup's hash, carry the local copy's companions home, then delete the
+/// Free the local copies of everything the plan covers: the named photo, then each frame.
+///
+/// The named photo's refusal is the call's refusal — the user pressed the button on that
+/// tile. A **frame** that refuses is recorded and left local instead: aborting would not
+/// un-free what is already gone, and it would hide which frame objected.
+pub fn verify_and_delete_locals(plan: &OffloadPlan) -> Result<OffloadCarry> {
+    verify_and_delete_locals_inner(plan, None)
+}
+
+pub fn verify_and_delete_locals_abortable(plan: &OffloadPlan, abort: &AtomicBool) -> Result<OffloadCarry> {
+    verify_and_delete_locals_inner(plan, Some(abort))
+}
+
+fn verify_and_delete_locals_inner(plan: &OffloadPlan, abort: Option<&AtomicBool>) -> Result<OffloadCarry> {
+    let mut out = OffloadCarry {
+        freed: Vec::new(),
+        skipped: plan.skipped.clone(),
+        total: plan.total,
+        sidecar_backups_left: 0,
+    };
+    let (freed, left_behind) = free_local_copies(&plan.named, abort)?;
+    out.freed.push(freed);
+    out.sidecar_backups_left += left_behind;
+    for frame in &plan.frames {
+        match free_local_copies(frame, abort) {
+            Ok((freed, left_behind)) => {
+                out.freed.push(freed);
+                out.sidecar_backups_left += left_behind;
+            }
+            Err(e) => out.skipped.push(SkippedPhoto::new(frame.photo_id, e.to_string())),
+        }
+    }
+    Ok(out)
+}
+
+/// Re-verify one photo's backup hash, carry its local companions home, then delete its
 /// local files. Invariant 3: never delete a local copy unless the backup is present and
 /// still hashes to the recorded value.
 ///
-/// Returns the companions now confirmed at home, for the caller to record — which it must
-/// do *before* `commit_offload`, since that drops the local location rows and the companion
-/// rows cascade with them.
-pub fn verify_and_delete_locals(plan: &OffloadPlan) -> Result<Vec<CarriedCompanion>> {
-    let current = sha256_file(&plan.backup_abs)?;
-    if current != plan.expected_hash {
+/// Returns what is now confirmed at home — for the caller to record *before*
+/// `commit_offload`, since that drops the local location rows and the companion rows
+/// cascade with them — and how many sidecar backups were left beside the freed files.
+fn free_local_copies(photo: &PhotoOffload, abort: Option<&AtomicBool>) -> Result<(FreedPhoto, usize)> {
+    if abort.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+        return Err(CatalogError::Validation("storage operation superseded or catalog switched".into()));
+    }
+    let current = sha256_file(&photo.backup_abs)?;
+    if current != photo.expected_hash {
         return Err(CatalogError::Validation(
             "backup hash changed — refusing to offload".into(),
         ));
@@ -638,8 +977,8 @@ pub fn verify_and_delete_locals(plan: &OffloadPlan) -> Result<Vec<CarriedCompani
     // the two sides — that is two unreconciled edits, and offload is not the place to
     // choose between them.
     let mut carried = Vec::new();
-    for file in &plan.local_files {
-        let carry = carry_companions(file, &plan.backup_abs)?;
+    for file in &photo.local_files {
+        let carry = carry_companions(file, &photo.backup_abs)?;
         if let Some(first) = carry.diverged.first() {
             return Err(CatalogError::Validation(format!(
                 "{} differs from the copy at home — refusing to offload",
@@ -649,18 +988,34 @@ pub fn verify_and_delete_locals(plan: &OffloadPlan) -> Result<Vec<CarriedCompani
         carried.extend(carry.carried);
     }
 
-    for file in &plan.local_files {
+    let mut sidecar_backups_left = 0usize;
+    for file in &photo.local_files {
+        if abort.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+            return Err(CatalogError::Validation("storage operation superseded or catalog switched".into()));
+        }
         // Companions first: if this fails part-way, the image is still local, so the
         // photo is never left with its edit state gone and its bytes freed.
         for found in crate::companions::carried_beside(file) {
             std::fs::remove_file(&found.path).map_err(io)?;
         }
+        // Counted, never carried and never deleted — see
+        // `companions::sidecar_backups_beside`. Counting is what turns "the one file
+        // offload left behind" from a bug report into something the verb says (#82).
+        sidecar_backups_left += crate::companions::sidecar_backups_beside(file).len();
         // Best-effort: an already-absent local file is fine (goal is "not local").
         if file.exists() {
             std::fs::remove_file(file).map_err(io)?;
         }
     }
-    Ok(carried)
+    Ok((
+        FreedPhoto {
+            photo_id: photo.photo_id,
+            backup_location_id: photo.backup_location_id,
+            local_volume_ids: photo.local_volume_ids.clone(),
+            carried,
+        },
+        sidecar_backups_left,
+    ))
 }
 
 fn io(e: std::io::Error) -> CatalogError {

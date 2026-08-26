@@ -42,8 +42,12 @@ pub use identity::{
 };
 pub use locations::{PathCandidate, ResolveMode};
 pub use lifecycle::{
-    carry_companions, copy_and_verify, copy_with_companions, verify_and_delete_locals, BackupPlan,
-    CarriedCompanion, CompanionCarry, CopyOutcome, OffloadPlan, RestorePlan,
+    carry_companions, copy_and_verify, copy_with_companions, sha256_file, verify_and_delete_locals,
+    verify_and_delete_locals_abortable,
+    BackupPlan,
+    BackupReport, CarriedCompanion, CompanionCarry, CopyOutcome, FreedPhoto, OffloadCarry,
+    OffloadPlan, OffloadReport, PhotoBackup, PhotoOffload, PhotoRestore, RestorePlan,
+    RestoreReport, SkippedPhoto,
 };
 pub use merge::MergeSummary;
 pub use models::{

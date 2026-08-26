@@ -241,6 +241,34 @@ Carrying is idempotent — an identical file already at the destination is adopt
 than rewritten — so a companion placed there by any other means is absorbed on the next
 pass instead of being re-copied or causing a conflict.
 
+**A sidecar backup is not a companion.** `<sidecar>.chairphoto-backup` — the copy the XMP
+safety rule takes before ChairPhoto's first write — is **per copy** by construction: each
+copy's sidecar had its own pre-ChairPhoto state, and the NAS copy already has its own. So
+offload neither carries it (two backups for one photo is exactly what the divergence rule
+refuses to offload over) nor deletes it (that would destroy the only record of the earlier
+sidecar, during a routine space-freeing operation, for a few KB). It is left in place and
+**reported**, so the one file left in an otherwise emptied folder is something the verb
+said rather than something the user discovers (#82).
+
+**Delete takes it, and reports it separately.** Emptying the trash removes the image, its
+companions and the catalog row, so nothing is left for the backup to be the earlier state
+*of* — and a file with no row and nothing beside it is the orphan the delete path already
+refuses to create everywhere else. It is counted in `sidecar_backups_deleted` rather than in
+`files_deleted`: a sidecar backup is not a companion, and folding it into the tally of
+destroyed originals would inflate that number with a file the user never knew about (#84).
+
+Order is part of the rule. The backups are taken **last**, only once every image and
+companion this delete is responsible for is confirmed absent — a delete that failed on the
+image leaves a photo that still exists, and the record of its earlier sidecar is then still
+a record of something. A backup that cannot be removed is itself a failure and the photo
+keeps its row: a few KB against every original already gone, but the row is what makes the
+leftover findable and the delete retryable.
+
+A backup **stranded by an earlier offload** — sitting where the local copy used to be, with
+its location row dropped — is still in reach, because `photo_path_candidates` always ends
+with the catalog-root path. That fallback, not the location rows, is what a later delete
+walks to find it.
+
 `verified_hash` deliberately stays a hash of the **image only**. The image is immutable, so
 a changed hash means bit rot; companions are mutable by design (darktable rewrites `.xmp` on
 every edit, and so does chairphoto on IPTC/GPS/face writes), so hashing them would report
@@ -355,6 +383,55 @@ trashed inside one second would restore together.
 A trashed frame stops counting toward its master's stack badge; an *offline* one still
 counts. The difference is that one is a decision about the photo and the other is a fact
 about a disk.
+
+### A storage verb acts on the moment, not the file
+
+A stack is how a burst is stored, so a tile is a *moment*: trash, back up, and offload all
+take the master **and its frames**. They did not always — trash started cascading in
+cluster B while offload and backup still took one row, so the same tile behaved two ways
+and offloading a 7-frame burst freed the keeper alone (#82).
+
+The cascade lives in `plan_offload` / `plan_backup`, so every caller inherits it: the
+inspector button, the reconcile drain, and the age-based `apply_offload_policy` sweep. (The
+sweep also has to de-duplicate: a frame is eligible in its own right and its master's
+offload has already freed it, so without that it would count the same frame twice.)
+
+Two conditions keep the cascade honest:
+
+- **Every frame is gated on its own copies.** Invariant 2 is decided per frame: a frame
+  without its own verified backup stays local rather than being freed on the strength of
+  the master's. Backup likewise skips a frame with no local copy to send.
+- **What was skipped is reported**, with the reason, the way `empty_trash` reports what it
+  refused: *"Freed 4 of 7 — no verified backup — refusing to offload"*.
+
+The sweep inherits one more thing, and it is worth stating plainly: **`offload_age_days`
+selects moments, not photos.** The cutoff picks which photos are candidates, but the cascade
+that follows applies no age test, so a frame imported inside the retention window is freed
+when its master falls outside it. A burst is one moment; splitting it across two disks to
+honour the cutoff exactly would be the worse answer. Nothing is at risk either way, because
+every frame is still gated on its own verified backup — but a user who set the policy to keep
+recent work on fast local storage can find yesterday's frame on the NAS, and that is the
+behaviour, not a bug (#87).
+
+When reconcile completes only part of a stack, it replaces the completed master's queue
+row with one failed row per skipped frame. Each child row keeps the refusal reason and is
+retried independently, so the completed master is not destructively replayed.
+
+Async storage commands claim the current catalog through the storage job generation before
+planning. A newer command trips that generation, so stack work stops before its next member.
+The worker also holds the storage ownership gate through plan, filesystem work, and record:
+catalog switches trip the worker and acquire that gate before detaching, while a completed
+indivisible copy/delete is recorded before the old worker releases it. Record steps still
+require the claimed database to be active.
+
+Restore is the same rule pointing the other way: a stack that leaves as seven frames comes
+back as seven. It brings home only the frames that are *away* — a frame already local is
+left alone, because copying the backup over it would replace a file the user may have
+edited since.
+
+Pressing a verb on a *frame* acts on that frame alone. Stacks are one level deep, so a
+frame has nothing under it — the same asymmetry restore has, where bringing a child back
+does not bring back its master.
 
 **Delete** is the only path in the app that destroys an original, and it is gated twice:
 an explicit confirmation the backend requires rather than assumes, and **every known copy
@@ -615,8 +692,9 @@ A *fresh* abort generation is installed for each family after the new catalog is
 subsequent jobs start un-aborted while the old workers keep the flag they were given (and
 stay aborted). Steps 1–2 and the publish in step 3 are the two phases of one ownership
 transition; both, and every job start, live in `commands/jobs.rs`, which also carries the
-backend-wide lock order (catalog → abort generations → status slots). `set_library_root`
-runs the same transition — it replaces the catalog handle exactly as a switch does.
+backend-wide lock order (storage ownership gate → catalog → abort generations → status
+slots). The pre-gate cancellation step holds no other lock. `set_library_root` runs the same
+transition — it replaces the catalog handle exactly as a switch does.
 
 ### Invariants
 

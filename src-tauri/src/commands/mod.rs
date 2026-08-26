@@ -94,7 +94,7 @@ pub use indexing::*;
 // Re-exported flat like the command modules so the domain submodules pick these up through
 // their `use super::*`. The rest of the ownership vocabulary (`AbortGeneration`, `JobFamily`,
 // `JobSlot`) is reached through the registry, so it stays namespaced under `jobs::`.
-pub use jobs::JobRegistry;
+pub use jobs::{AbortClaim, JobRegistry};
 // Every family with a queryable status slot needs these. Unconditional since #34: identity
 // repair publishes one and is not feature-gated — see the "Status slots" section of `jobs`.
 pub use jobs::{JobClaim, JobStatus};
@@ -123,6 +123,10 @@ pub use tags::*;
 #[derive(Default)]
 pub struct AppState {
     pub catalog: Arc<Mutex<Option<Catalog>>>,
+    /// Serializes storage filesystem ownership with catalog-root transitions. A storage
+    /// worker holds this across each plan/IO/record operation; a switch trips that worker
+    /// before waiting for the same gate.
+    pub storage_gate: Arc<tokio::sync::Mutex<()>>,
     /// Short-TTL cache of per-volume reachability, so NAS stats happen off the catalog
     /// lock (on a blocking worker). See `volume_health`.
     pub volume_health: Arc<crate::volume_health::VolumeHealth>,

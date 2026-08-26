@@ -3911,6 +3911,8 @@ body {
 }
 .cull-failure {
   color: var(--danger);
+}
+
 /* ── Safety panel (cluster B, B1) ─────────────────────────────────────────────
    A count you can act on: the number, what it means, and the way to see it. */
 .safety-row {

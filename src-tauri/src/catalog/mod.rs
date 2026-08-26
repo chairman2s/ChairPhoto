@@ -1459,10 +1459,15 @@ impl Catalog {
                 Some(id) => id,
                 None => {
                     let ts = now();
+                    // A tag born under a padlocked parent is padlocked from birth: the
+                    // recursive padlock (`set_tag_private`) is a one-time sweep, so
+                    // inheritance here is what keeps a person added later out of cloud
+                    // prompts.
+                    let private = inherited_private(&self.conn, parent_id)?;
                     self.conn.execute(
                         "INSERT INTO tags(uuid, name, name_norm, parent_id, full_path,
-                            full_path_norm, created_at, updated_at)
-                         VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)",
+                            full_path_norm, private, created_at, updated_at)
+                         VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)",
                         params![
                             uuid::Uuid::new_v4().to_string(),
                             component,
@@ -1470,6 +1475,7 @@ impl Catalog {
                             parent_id,
                             full_path,
                             full_path_norm,
+                            private as i64,
                             ts
                         ],
                     )?;
@@ -1626,6 +1632,23 @@ impl Catalog {
             )?;
         }
         Ok(changed)
+    }
+
+    /// Ids of every tag inside a private subtree: its own flag set, or any ancestor's.
+    /// This is the set a cloud prompt must withhold — privacy is a property of the
+    /// subtree, so a padlocked "People" covers a name under it even when the name's own
+    /// flag was never set (rows created before creation-time inheritance existed).
+    pub fn private_subtree_tag_ids(&self) -> Result<std::collections::HashSet<i64>> {
+        let mut stmt = self.conn.prepare(
+            "WITH RECURSIVE priv(id) AS (
+                 SELECT id FROM tags WHERE private = 1
+                 UNION
+                 SELECT tags.id FROM tags JOIN priv ON tags.parent_id = priv.id
+             )
+             SELECT id FROM priv",
+        )?;
+        let rows = stmt.query_map([], |r| r.get(0))?;
+        Ok(rows.collect::<rusqlite::Result<std::collections::HashSet<i64>>>()?)
     }
 
     /// All tags with a recursive photo count (counts include descendant tags).
@@ -2086,6 +2109,25 @@ fn row_to_photo(r: &Row) -> rusqlite::Result<Photo> {
 
 /// Build a `Tag` from a row selecting (id, name, full_path, parent_id, description,
 /// auto_rule, uuid, private) in that column order.
+/// The `private` flag a newly created tag starts with: its parent's. Every tag-creation
+/// site (`create_tag`, merge, tag maintenance) goes through this so no path can mint a
+/// cloud-visible tag inside a padlocked subtree.
+pub(crate) fn inherited_private(
+    conn: &rusqlite::Connection,
+    parent_id: Option<i64>,
+) -> rusqlite::Result<bool> {
+    match parent_id {
+        Some(pid) => Ok(conn
+            .query_row("SELECT private FROM tags WHERE id = ?1", params![pid], |r| {
+                r.get::<_, i64>(0)
+            })
+            .optional()?
+            .unwrap_or(0)
+            != 0),
+        None => Ok(false),
+    }
+}
+
 fn row_to_tag(r: &Row) -> rusqlite::Result<Tag> {
     Ok(Tag {
         id: r.get(0)?,

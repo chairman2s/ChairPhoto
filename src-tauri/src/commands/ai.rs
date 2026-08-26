@@ -84,19 +84,30 @@ pub async fn ai_suggest_tags(
     {
         use crate::plugins::ai;
         // Gather inputs under the lock, then release it for the network call.
-        let (config, image_path, taxonomy, rejected) = with_catalog(&state, |c| {
-            ai::ensure_schema(c.conn())?;
-            let config = ai::read_config(c)?;
-            // Private tags (people's names etc.) are withheld from cloud providers; the
-            // local model still gets the full taxonomy.
-            let taxonomy = ai::taxonomy_text(c, config.is_local())?;
-            Ok((
-                config,
-                c.require_photo_path(photo_id)?,
-                taxonomy,
-                ai::rejected_paths(c.conn(), photo_id)?,
-            ))
-        })?;
+        let (config, image_path, taxonomy, rejected, prompt_rejected) =
+            with_catalog(&state, |c| {
+                ai::ensure_schema(c.conn())?;
+                let config = ai::read_config(c)?;
+                // Private tags (people's names etc.) are withheld from cloud providers;
+                // the local model still gets the full taxonomy.
+                let taxonomy = ai::taxonomy_text(c, config.is_local())?;
+                let rejected = ai::rejected_paths(c.conn(), photo_id)?;
+                // The rejected list rides into the prompt as "don't suggest these
+                // again", so it gets the same privacy filter as the taxonomy. The
+                // unfiltered list still suppresses re-suggestion below.
+                let prompt_rejected = if config.is_local() {
+                    rejected.clone()
+                } else {
+                    ai::cloud_safe_paths(c, &rejected)?
+                };
+                Ok((
+                    config,
+                    c.require_photo_path(photo_id)?,
+                    taxonomy,
+                    rejected,
+                    prompt_rejected,
+                ))
+            })?;
 
         let image = tauri::async_runtime::spawn_blocking(move || -> Result<Vec<u8>, String> {
             let bytes = crate::thumbnails::preview_bytes(&image_path)?;
@@ -109,7 +120,9 @@ pub async fn ai_suggest_tags(
         .map_err(|e| e.to_string())??;
         let image_b64 = base64::engine::general_purpose::STANDARD.encode(&image);
 
-        let raw = ai::suggest(&config, &image_b64, &taxonomy, &rejected, question.as_deref()).await?;
+        let raw =
+            ai::suggest(&config, &image_b64, &taxonomy, &prompt_rejected, question.as_deref())
+                .await?;
 
         // Persist accepted-shaped results as pending, then return the photo's full
         // pending set (resolved against the live taxonomy).
@@ -408,11 +421,19 @@ pub async fn ai_suggest_tags_grouped(
 
             // Per-representative inputs: image path + this photo's rejections. If the
             // photo vanished (e.g. deleted mid-run), skip the whole cluster.
+            let is_local = config.is_local();
             let prep = with_catalog_blocking(&state, move |c| {
-                Ok((
-                    c.require_photo_path(rep_id)?,
-                    ai::rejected_paths(c.conn(), rep_id)?,
-                ))
+                // This list is prompt-only (`propagate_cluster` re-reads each member's
+                // rejections for suppression), so a cloud run gets the privacy-filtered
+                // form — a padlocked path must not leave the machine even as "don't
+                // suggest this again".
+                let rejected = ai::rejected_paths(c.conn(), rep_id)?;
+                let rejected = if is_local {
+                    rejected
+                } else {
+                    ai::cloud_safe_paths(c, &rejected)?
+                };
+                Ok((c.require_photo_path(rep_id)?, rejected))
             })
             .await;
             let (image_path, rejected) = match prep {

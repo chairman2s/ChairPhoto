@@ -163,6 +163,22 @@ pub fn rejected_paths(conn: &rusqlite::Connection, photo_id: i64) -> rusqlite::R
     rows.collect()
 }
 
+/// The subset of `paths` safe to put in a CLOUD prompt: only those resolving to an
+/// existing tag outside every private subtree. A path that no longer resolves is
+/// withheld too — a deleted person tag's name is still a name; when uncertain,
+/// preserve privacy. Local models get the unfiltered list.
+pub fn cloud_safe_paths(c: &Catalog, paths: &[String]) -> crate::catalog::Result<Vec<String>> {
+    let withheld = c.private_subtree_tag_ids()?;
+    let mut out = Vec::new();
+    for path in paths {
+        let id = c.find_tag_id_by_path(path).unwrap_or(None);
+        if matches!(id, Some(id) if !withheld.contains(&id)) {
+            out.push(path.clone());
+        }
+    }
+    Ok(out)
+}
+
 /// Insert a pending suggestion from a **direct** per-photo run, but never resurrect one
 /// already accepted/rejected. `source_photo_id` is `NULL` (this photo tagged itself).
 pub fn upsert_pending(
@@ -325,12 +341,18 @@ pub fn set_state(
 }
 
 /// Render the taxonomy as a compact list for the prompt: "- Full/Path: description".
-/// When `include_private` is false (a cloud provider), tags marked private (people's
-/// names etc.) are omitted so they never leave the machine. See `Catalog::tag_private`.
+/// When `include_private` is false (a cloud provider), tags in a private subtree — the
+/// tag's own padlock or any ancestor's — are omitted so sensitive labels (people's
+/// names etc.) never leave the machine. See `Catalog::private_subtree_tag_ids`.
 pub fn taxonomy_text(c: &Catalog, include_private: bool) -> crate::catalog::Result<String> {
+    let withheld = if include_private {
+        std::collections::HashSet::new()
+    } else {
+        c.private_subtree_tag_ids()?
+    };
     let mut s = String::new();
     for t in c.list_tags_with_counts()? {
-        if !include_private && t.tag.private {
+        if withheld.contains(&t.tag.id) {
             continue;
         }
         s.push_str("- ");

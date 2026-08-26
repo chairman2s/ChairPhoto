@@ -402,7 +402,16 @@ Two conditions keep the cascade honest:
   without its own verified backup stays local rather than being freed on the strength of
   the master's. Backup likewise skips a frame with no local copy to send.
 - **What was skipped is reported**, with the reason, the way `empty_trash` reports what it
-  refused: *"Freed 4 of 7 — no verified backup yet"*.
+  refused: *"Freed 4 of 7 — no verified backup — refusing to offload"*.
+
+The sweep inherits one more thing, and it is worth stating plainly: **`offload_age_days`
+selects moments, not photos.** The cutoff picks which photos are candidates, but the cascade
+that follows applies no age test, so a frame imported inside the retention window is freed
+when its master falls outside it. A burst is one moment; splitting it across two disks to
+honour the cutoff exactly would be the worse answer. Nothing is at risk either way, because
+every frame is still gated on its own verified backup — but a user who set the policy to keep
+recent work on fast local storage can find yesterday's frame on the NAS, and that is the
+behaviour, not a bug (#87).
 
 When reconcile completes only part of a stack, it replaces the completed master's queue
 row with one failed row per skipped frame. Each child row keeps the refusal reason and is

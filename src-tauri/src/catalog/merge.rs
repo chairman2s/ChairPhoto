@@ -209,10 +209,14 @@ impl MergeCtx<'_> {
                     } else {
                         (uuid::Uuid::new_v4().to_string(), 1)
                     };
+                    // Bundles don't carry the private flag, so a created tag inherits
+                    // the local parent's padlock — a name merged under a padlocked
+                    // "People" must not arrive cloud-visible.
+                    let private = super::inherited_private(&self.tx, parent_id)?;
                     self.tx.execute(
                         "INSERT INTO tags(uuid, name, name_norm, parent_id, full_path,
-                            full_path_norm, exportable, created_at, updated_at)
-                         VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)",
+                            full_path_norm, exportable, private, created_at, updated_at)
+                         VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)",
                         params![
                             uuid,
                             component,
@@ -221,6 +225,7 @@ impl MergeCtx<'_> {
                             full_path,
                             full_path_norm,
                             exportable,
+                            private as i64,
                             ts
                         ],
                     )?;

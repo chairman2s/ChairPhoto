@@ -584,10 +584,13 @@ fn ensure_tag_by_path(conn: &Connection, path: &str, now: i64) -> Result<(i64, b
         let id = match tag_id_by_norm(conn, &full_path_norm)? {
             Some(id) => id,
             None => {
+                // Inherit the parent's padlock (see `Catalog::create_tag`): a tag split
+                // or renamed into a private subtree must not surface cloud-visible.
+                let private = super::inherited_private(conn, parent_id)?;
                 conn.execute(
                     "INSERT INTO tags(uuid, name, name_norm, parent_id, full_path, full_path_norm,
-                                      created_at, updated_at)
-                     VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)",
+                                      private, created_at, updated_at)
+                     VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)",
                     params![
                         uuid::Uuid::new_v4().to_string(),
                         component,
@@ -595,6 +598,7 @@ fn ensure_tag_by_path(conn: &Connection, path: &str, now: i64) -> Result<(i64, b
                         parent_id,
                         full_path,
                         full_path_norm,
+                        private as i64,
                         now,
                     ],
                 )?;
@@ -801,6 +805,19 @@ mod tests {
 
     fn tag(conn: &Connection, path: &str) -> i64 {
         ensure_tag_by_path(conn, path, 0).unwrap().0
+    }
+
+    #[test]
+    fn ensure_tag_by_path_inherits_parent_privacy() {
+        let conn = conn();
+        let people = tag(&conn, "People");
+        conn.execute("UPDATE tags SET private = 1 WHERE id = ?1", [people])
+            .unwrap();
+        let late = tag(&conn, "People/Added Later");
+        let private: i64 = conn
+            .query_row("SELECT private FROM tags WHERE id = ?1", [late], |r| r.get(0))
+            .unwrap();
+        assert_eq!(private, 1, "a tag created inside a padlocked subtree must be born private");
     }
 
     fn photo(conn: &Connection, id: i64) {

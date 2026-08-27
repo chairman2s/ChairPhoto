@@ -697,6 +697,9 @@ fn extract_openai_text(value: &serde_json::Value) -> Result<String, String> {
 }
 
 /// Google Gemini vision via generateContent (the image rides as inline base64 data).
+/// A decline or malformed body gets ONE retry — declines of harmless photos are
+/// stochastic, and a second identical request often just answers. Transport errors and
+/// API failures (bad key, quota) fail fast: a retry would fail identically.
 async fn call_gemini(cfg: &Config, prompt: &str, image_b64: &str) -> Result<String, String> {
     if cfg.gemini_key.is_empty() {
         return Err("No Gemini API key configured".into());
@@ -714,26 +717,106 @@ async fn call_gemini(cfg: &Config, prompt: &str, image_b64: &str) -> Result<Stri
         }],
         "generationConfig": { "response_mime_type": "application/json" },
     });
-    let resp = reqwest::Client::new()
-        .post(&url)
-        .header("x-goog-api-key", &cfg.gemini_key)
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| format!("Gemini request failed: {e}"))?;
-    let value: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
-    value
+    let do_request = |body: serde_json::Value| {
+        let key = cfg.gemini_key.clone();
+        let url = url.clone();
+        async move {
+            let resp = reqwest::Client::new()
+                .post(&url)
+                .header("x-goog-api-key", &key)
+                .json(&body)
+                .send()
+                .await
+                .map_err(|e| format!("Gemini request failed: {e}"))?;
+            resp.json::<serde_json::Value>()
+                .await
+                .map_err(|e| e.to_string())
+        }
+    };
+    let first = do_request(body.clone()).await?;
+    match extract_gemini_text(&first) {
+        Ok(text) => Ok(text),
+        Err(e) if first.get("error").is_some() => Err(e),
+        Err(_) => extract_gemini_text(&do_request(body).await?),
+    }
+}
+
+/// Reasons generateContent reports when it refuses to answer, as opposed to reasons it
+/// merely stopped short (`MAX_TOKENS`, `OTHER`). Used for both `promptFeedback.blockReason`
+/// and `candidates[].finishReason`, which draw on the same vocabulary.
+const GEMINI_DECLINE_REASONS: [&str; 6] = [
+    "SAFETY",
+    "PROHIBITED_CONTENT",
+    "RECITATION",
+    "SPII",
+    "BLOCKLIST",
+    "IMAGE_SAFETY",
+];
+
+/// Pull the model text out of a generateContent response. A normal reply carries it in
+/// `candidates[0].content.parts[0].text`; a blocked prompt carries `promptFeedback.blockReason`
+/// with no candidate, a stopped generation a `finishReason` with no text part, and an API
+/// failure a top-level `error` — each becomes a readable error, not a raw JSON dump.
+fn extract_gemini_text(value: &serde_json::Value) -> Result<String, String> {
+    let candidate = value
         .get("candidates")
         .and_then(|c| c.as_array())
-        .and_then(|a| a.first())
+        .and_then(|a| a.first());
+    if let Some(text) = candidate
         .and_then(|c| c.get("content"))
         .and_then(|c| c.get("parts"))
         .and_then(|p| p.as_array())
         .and_then(|a| a.first())
         .and_then(|p| p.get("text"))
         .and_then(|t| t.as_str())
-        .map(str::to_string)
-        .ok_or_else(|| format!("Gemini returned no text: {value}"))
+    {
+        return Ok(text.to_string());
+    }
+    // The prompt itself was refused, so there is no candidate to inspect.
+    if let Some(feedback) = value.get("promptFeedback") {
+        if let Some(reason) = feedback.get("blockReason").and_then(|r| r.as_str()) {
+            return Err(gemini_stop_message(
+                reason,
+                feedback.get("blockReasonMessage").and_then(|m| m.as_str()),
+            ));
+        }
+    }
+    // Generation started but stopped before emitting text.
+    if let Some(reason) = candidate
+        .and_then(|c| c.get("finishReason"))
+        .and_then(|r| r.as_str())
+    {
+        return Err(gemini_stop_message(
+            reason,
+            candidate
+                .and_then(|c| c.get("finishMessage"))
+                .and_then(|m| m.as_str()),
+        ));
+    }
+    // A non-200 status still returns a parseable body, and this is what it holds.
+    if let Some(msg) = value
+        .get("error")
+        .and_then(|e| e.get("message"))
+        .and_then(|m| m.as_str())
+    {
+        return Err(format!("Gemini error: {msg}"));
+    }
+    Err(format!("Gemini returned no text: {value}"))
+}
+
+/// Phrase a block/finish reason as a decline or as a plain stop, appending whatever
+/// detail the API supplied alongside it.
+fn gemini_stop_message(reason: &str, detail: Option<&str>) -> String {
+    let mut msg = if GEMINI_DECLINE_REASONS.contains(&reason) {
+        format!("Gemini declined this request: {reason}")
+    } else {
+        format!("Gemini returned no text (finish reason: {reason})")
+    };
+    if let Some(detail) = detail.map(str::trim).filter(|d| !d.is_empty()) {
+        msg.push_str(" — ");
+        msg.push_str(detail);
+    }
+    msg
 }
 
 /// Parse the model's JSON (tolerant of surrounding prose) into raw suggestions.
@@ -844,6 +927,96 @@ classifying real people or objects in images provided.",
         let v = serde_json::json!({ "unexpected": true });
         let err = extract_openai_text(&v).unwrap_err();
         assert!(err.starts_with("OpenAI returned no text:"), "{err}");
+    }
+
+    // ── Gemini response extraction ───────────────────────────────────────────
+
+    #[test]
+    fn gemini_text_part_is_returned_verbatim() {
+        let v = serde_json::json!({
+            "candidates": [{
+                "content": { "parts": [{ "text": "{\"tags\":[]}" }], "role": "model" },
+                "finishReason": "STOP"
+            }]
+        });
+        assert_eq!(extract_gemini_text(&v).unwrap(), "{\"tags\":[]}");
+    }
+
+    #[test]
+    fn gemini_blocked_prompt_becomes_a_readable_error_not_a_json_dump() {
+        // A blocked prompt returns promptFeedback and no candidates at all.
+        let v = serde_json::json!({
+            "promptFeedback": {
+                "blockReason": "SAFETY",
+                "safetyRatings": [
+                    { "category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "probability": "HIGH" }
+                ]
+            }
+        });
+        let err = extract_gemini_text(&v).unwrap_err();
+        assert_eq!(err, "Gemini declined this request: SAFETY");
+        assert!(!err.contains("safetyRatings"), "raw dump leaked into the error: {err}");
+    }
+
+    #[test]
+    fn gemini_block_reason_message_is_appended_when_present() {
+        let v = serde_json::json!({
+            "promptFeedback": {
+                "blockReason": "PROHIBITED_CONTENT",
+                "blockReasonMessage": "Blocked by the prohibited content filter."
+            }
+        });
+        assert_eq!(
+            extract_gemini_text(&v).unwrap_err(),
+            "Gemini declined this request: PROHIBITED_CONTENT — \
+Blocked by the prohibited content filter."
+        );
+    }
+
+    #[test]
+    fn gemini_decline_finish_reason_becomes_a_readable_error() {
+        // Generation started, then stopped: a candidate with no content parts.
+        let v = serde_json::json!({
+            "candidates": [{
+                "finishReason": "RECITATION",
+                "index": 0,
+                "safetyRatings": []
+            }],
+            "modelVersion": "gemini-2.5-flash"
+        });
+        let err = extract_gemini_text(&v).unwrap_err();
+        assert_eq!(err, "Gemini declined this request: RECITATION");
+    }
+
+    #[test]
+    fn gemini_non_decline_finish_reason_is_not_reported_as_a_decline() {
+        let v = serde_json::json!({
+            "candidates": [{ "content": { "role": "model" }, "finishReason": "MAX_TOKENS" }]
+        });
+        let err = extract_gemini_text(&v).unwrap_err();
+        assert_eq!(err, "Gemini returned no text (finish reason: MAX_TOKENS)");
+    }
+
+    #[test]
+    fn gemini_error_body_becomes_a_readable_error() {
+        let v = serde_json::json!({
+            "error": {
+                "code": 400,
+                "message": "API key not valid. Please pass a valid API key.",
+                "status": "INVALID_ARGUMENT"
+            }
+        });
+        assert_eq!(
+            extract_gemini_text(&v).unwrap_err(),
+            "Gemini error: API key not valid. Please pass a valid API key."
+        );
+    }
+
+    #[test]
+    fn gemini_unrecognised_body_still_dumps_for_diagnosis() {
+        let v = serde_json::json!({ "unexpected": true });
+        let err = extract_gemini_text(&v).unwrap_err();
+        assert!(err.starts_with("Gemini returned no text:"), "{err}");
     }
 
     // ── H15c — grouped dispatch + propagation ────────────────────────────────

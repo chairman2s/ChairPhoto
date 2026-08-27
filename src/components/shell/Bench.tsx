@@ -189,7 +189,7 @@ export function Bench({
             disabled={!compareOn && !canCompare}
             title={
               compareOn || canCompare
-                ? `Compare the selected frames side by side, up to ${MAX_PANES} (C)`
+                ? `Compare the selection side by side, ${MAX_PANES} at a time (C)`
                 : "Select two or more photos to compare them"
             }
             onClick={onCompare}

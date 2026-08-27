@@ -186,4 +186,101 @@ describe("CompareView", () => {
   it("caps at four panes — beyond that each frame is too small to judge", () => {
     expect(MAX_PANES).toBe(4);
   });
+
+  // Batch paging: a selection larger than the visible panes is worked through in rounds,
+  // and the bar must say exactly which slice of the pool is on screen — the original sin
+  // this replaces was silently comparing "the first four of 27".
+  describe("batch paging over a large pool", () => {
+    const pool = { poolTotal: 27, poolOffset: 4 };
+
+    it("names the visible range within the pool", () => {
+      render(
+        <CompareView
+          photos={[photo(5), photo(6), photo(7), photo(8)]}
+          focusedId={5}
+          softThreshold={null}
+          {...pool}
+          onPage={() => {}}
+          onFocus={() => {}}
+          onKeep={() => {}}
+          onExit={() => {}}
+        />,
+      );
+      expect(screen.getByText("Comparing 5–8 of 27")).toBeTruthy();
+    });
+
+    it("the ‹ › controls page by one batch in each direction", () => {
+      const onPage = vi.fn();
+      render(
+        <CompareView
+          photos={[photo(5), photo(6), photo(7), photo(8)]}
+          focusedId={5}
+          softThreshold={null}
+          {...pool}
+          onPage={onPage}
+          onFocus={() => {}}
+          onKeep={() => {}}
+          onExit={() => {}}
+        />,
+      );
+      fireEvent.click(screen.getByRole("button", { name: "Next batch" }));
+      fireEvent.click(screen.getByRole("button", { name: "Previous batch" }));
+      expect(onPage.mock.calls).toEqual([[1], [-1]]);
+    });
+
+    it("disables ‹ on the first batch and › on the last", () => {
+      const { unmount } = render(
+        <CompareView
+          photos={[photo(1), photo(2), photo(3), photo(4)]}
+          focusedId={1}
+          softThreshold={null}
+          poolTotal={27}
+          poolOffset={0}
+          onPage={() => {}}
+          onFocus={() => {}}
+          onKeep={() => {}}
+          onExit={() => {}}
+        />,
+      );
+      expect(
+        (screen.getByRole("button", { name: "Previous batch" }) as HTMLButtonElement).disabled,
+      ).toBe(true);
+      expect(
+        (screen.getByRole("button", { name: "Next batch" }) as HTMLButtonElement).disabled,
+      ).toBe(false);
+      unmount();
+
+      render(
+        <CompareView
+          photos={[photo(25), photo(26), photo(27)]}
+          focusedId={25}
+          softThreshold={null}
+          poolTotal={27}
+          poolOffset={24}
+          onPage={() => {}}
+          onFocus={() => {}}
+          onKeep={() => {}}
+          onExit={() => {}}
+        />,
+      );
+      expect(
+        (screen.getByRole("button", { name: "Next batch" }) as HTMLButtonElement).disabled,
+      ).toBe(true);
+    });
+
+    it("a pool that fits on screen shows no paging chrome (default props)", () => {
+      render(
+        <CompareView
+          photos={[photo(1), photo(2)]}
+          focusedId={1}
+          softThreshold={null}
+          onFocus={() => {}}
+          onKeep={() => {}}
+          onExit={() => {}}
+        />,
+      );
+      expect(screen.queryByRole("button", { name: "Next batch" })).toBeNull();
+      expect(screen.getByText(/comparing 2 —/i)).toBeTruthy();
+    });
+  });
 });

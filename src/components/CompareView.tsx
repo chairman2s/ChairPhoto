@@ -25,18 +25,29 @@ export function CompareView({
   photos,
   focusedId,
   softThreshold,
+  poolTotal = photos.length,
+  poolOffset = 0,
+  onPage = () => {},
   onFocus,
   onKeep,
   onExit,
 }: {
-  /** The frames to compare, already capped to {@link MAX_PANES} by the caller. */
+  /** The frames on screen this round, already capped to {@link MAX_PANES} by the caller. */
   photos: Photo[];
   /** Which pane culling keys and the Keep action apply to. */
   focusedId: number | null;
   /** Sharpness below which a frame is flagged soft; `null` = nothing scored yet. */
   softThreshold: number | null;
+  /** Size of the whole compared selection. When it exceeds the visible panes, the bar
+   *  shows the batch range and ‹ › paging — a 27-frame selection is seven rounds of
+   *  four, never a silent "first four only". Defaults to the visible set (no paging). */
+  poolTotal?: number;
+  /** 0-based index of the first visible frame within the pool. */
+  poolOffset?: number;
+  /** Step to the previous (-1) or next (+1) batch; the caller clamps at the ends. */
+  onPage?: (dir: -1 | 1) => void;
   onFocus: (photoId: number) => void;
-  /** Promote the focused frame: pick it, reject the others. */
+  /** Promote the focused frame: pick it, reject its on-screen rivals. */
   onKeep: (keeperId: number) => void;
   onExit: () => void;
 }) {
@@ -75,9 +86,38 @@ export function CompareView({
         <button className="chip" onClick={onExit}>
           ‹ Back to grid (Esc)
         </button>
-        <span className="compare-count">
-          Comparing {photos.length} — ←/→ focus, 0–5 rate, P/X pick or reject, K keep
-        </span>
+        {poolTotal > photos.length ? (
+          <span className="compare-batch">
+            <button
+              className="chip"
+              onClick={() => onPage(-1)}
+              disabled={poolOffset === 0}
+              title="Previous four (PgUp)"
+              aria-label="Previous batch"
+            >
+              ‹
+            </button>
+            <span className="compare-count">
+              Comparing {poolOffset + 1}–{poolOffset + photos.length} of {poolTotal}
+            </span>
+            <button
+              className="chip"
+              onClick={() => onPage(1)}
+              disabled={poolOffset + photos.length >= poolTotal}
+              title="Next four (PgDn)"
+              aria-label="Next batch"
+            >
+              ›
+            </button>
+            <span className="compare-hint">
+              ←/→ focus · 0–5 rate · P/X pick or reject · K keep &amp; next batch
+            </span>
+          </span>
+        ) : (
+          <span className="compare-count">
+            Comparing {photos.length} — ←/→ focus, 0–5 rate, P/X pick or reject, K keep
+          </span>
+        )}
         {zoomed && (
           <button className="chip" onClick={() => setView(FIT_VIEW)} title="Fit all panes">
             Fit {Math.round(view.scale * 100)}%

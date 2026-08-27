@@ -3203,6 +3203,20 @@ body {
   font-size: 11px;
   color: var(--dim);
 }
+/* Batch paging (pool larger than the visible panes): ‹ range › plus the key hints. */
+.compare-batch {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+.compare-batch .chip:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+.compare-hint {
+  font-size: 11px;
+  color: var(--mute);
+}
 .compare-warn {
   margin-left: auto;
   font-size: 11px;

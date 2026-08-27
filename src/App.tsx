@@ -205,7 +205,11 @@ export default function App() {
   // frame can drop straight out of the current filter — so a live-derived pane list would
   // rearrange itself underneath the decision that caused it. The ids are held; their rows
   // are looked up fresh each render so badges stay current.
+  // The whole selection at the moment Compare opened; shown MAX_PANES at a time from
+  // `compareStart`, so a 27-frame selection is seven explicit rounds — never a silent
+  // "first four only" (the batch range in the compare bar says exactly where you are).
   const [compareIds, setCompareIds] = useState<number[] | null>(null);
+  const [compareStart, setCompareStart] = useState(0);
   const [compareFocusId, setCompareFocusId] = useState<number | null>(null);
   const [cachePreviews, setCachePreviews] = useState(true);
 
@@ -382,30 +386,44 @@ export default function App() {
   // looked up per render so a rating applied inside Compare shows up on its own pane; the
   // id list itself is frozen (see `compareIds`). A row that has vanished entirely — the
   // catalog switched, the photo was purged — is dropped rather than rendered blank.
-  const comparePhotos = compareIds
-    ? compareIds
-        .map((id) => photos.find((p) => p.id === id) ?? null)
-        .filter((p): p is Photo => p !== null)
-    : [];
+  const compareBatchIds = compareIds ? compareIds.slice(compareStart, compareStart + MAX_PANES) : [];
+  const comparePhotos = compareBatchIds
+    .map((id) => photos.find((p) => p.id === id) ?? null)
+    .filter((p): p is Photo => p !== null);
   const inCompare = compareIds !== null && comparePhotos.length > 0;
 
-  // Enter Compare on the current selection. Needs two frames to mean anything; more than
-  // MAX_PANES would make each pane too small to judge, so the rest are left behind.
+  // Enter Compare on the current selection. Needs two frames to mean anything; the whole
+  // selection becomes the pool, paged MAX_PANES at a time (more per screen would make each
+  // pane too small to judge). Opens on the batch holding the active photo, so the view
+  // starts on the frame the user was already looking at.
   const canCompare = selection.ids.length >= 2;
   const openCompare = useCallback(() => {
-    const ids = selection.ids.slice(0, MAX_PANES);
+    const ids = selection.ids;
     if (ids.length < 2) return;
+    const activeAt = selection.activeId != null ? ids.indexOf(selection.activeId) : -1;
+    const start = activeAt >= 0 ? Math.floor(activeAt / MAX_PANES) * MAX_PANES : 0;
     setCompareIds(ids);
-    setCompareFocusId(
-      // Start focused on the active photo when it is one of the panes, so the view opens
-      // on the frame the user was already looking at.
-      selection.activeId != null && ids.includes(selection.activeId) ? selection.activeId : ids[0],
-    );
+    setCompareStart(start);
+    setCompareFocusId(activeAt >= 0 ? ids[activeAt] : ids[start]);
     setLoupeInline(false);
   }, [selection.ids, selection.activeId]);
 
+  // Step one batch forward/back, clamped at the pool's ends; focus lands on the new
+  // batch's first frame so the culling keys always have a target.
+  const pageCompare = useCallback(
+    (dir: -1 | 1) => {
+      if (!compareIds) return;
+      const next = compareStart + dir * MAX_PANES;
+      if (next < 0 || next >= compareIds.length) return;
+      setCompareStart(next);
+      setCompareFocusId(compareIds[next]);
+    },
+    [compareIds, compareStart],
+  );
+
   const closeCompare = useCallback(() => {
     setCompareIds(null);
+    setCompareStart(0);
     setCompareFocusId(null);
   }, []);
 
@@ -1195,16 +1213,20 @@ export default function App() {
   // visible and can be undone in place rather than being an unseen side effect.
   const keepInCompare = useCallback(
     async (keeperId: number) => {
-      const ids = compareIds ?? [];
-      if (!ids.includes(keeperId)) return;
+      // Batch-scoped: the keeper's rivals are the frames on screen, not the whole pool —
+      // with a 27-frame pool, "keep" must never silently reject 26 photos. After the
+      // round, advance to the next batch so a big selection flows as K, K, K…
+      const batch = (compareIds ?? []).slice(compareStart, compareStart + MAX_PANES);
+      if (!batch.includes(keeperId)) return;
       await setPickState(keeperId, "pick");
-      for (const id of ids) {
+      for (const id of batch) {
         if (id !== keeperId) await setPickState(id, "reject");
       }
       setCompareFocusId(keeperId);
       await refresh();
+      pageCompare(1);
     },
-    [compareIds, refresh],
+    [compareIds, compareStart, refresh, pageCompare],
   );
 
   // The ONE write path for culling marks (rate / pick / label): apply the verb to every
@@ -1273,6 +1295,10 @@ export default function App() {
         const focused = at >= 0 ? ids[at] : ids[0];
         if (e.key === "Escape" || key === "c") {
           closeCompare();
+        } else if (e.key === "PageDown") {
+          pageCompare(1);
+        } else if (e.key === "PageUp") {
+          pageCompare(-1);
         } else if (e.key === "ArrowRight" || e.key === "ArrowDown") {
           setCompareFocusId(ids[(Math.max(at, 0) + 1) % ids.length]);
         } else if (e.key === "ArrowLeft" || e.key === "ArrowUp") {
@@ -1377,6 +1403,7 @@ export default function App() {
     openCompare,
     closeCompare,
     keepInCompare,
+    pageCompare,
   ]);
 
   // The bench's single progress readout, folded from the three title-bar renderers this
@@ -1678,6 +1705,9 @@ export default function App() {
                 photos={comparePhotos}
                 focusedId={compareFocusId}
                 softThreshold={softThreshold}
+                poolTotal={compareIds?.length ?? comparePhotos.length}
+                poolOffset={compareStart}
+                onPage={pageCompare}
                 onFocus={setCompareFocusId}
                 onKeep={keepInCompare}
                 onExit={closeCompare}

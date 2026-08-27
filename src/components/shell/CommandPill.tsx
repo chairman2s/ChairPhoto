@@ -1,5 +1,5 @@
 // The Darkroom redesign's floating command pill (see agent-notes mockup Main.dc.html
-// `.float-tb`): a small centered pill over the stage that replaces the old
+// `.dock-tb`): a toolbar row docked above the stage that replaces the old
 // `<div className="filter-bar">` row — one row of segmented controls, dots, dropdowns and
 // removable chips that used to sit between the title bar and `.body`. It absorbs every one
 // of FilterBar's internals verbatim (the culling seg, the colour-label dots, the scope
@@ -199,7 +199,7 @@ export function CommandPill({
   }, [activeBatchId]);
 
   return (
-    <div className="float-tb">
+    <div className="dock-tb">
       {filters.map((f) => (
         <button key={f} className={`ft ${filter === f ? "on" : ""}`} onClick={() => onFilter(f)}>
           {FILTER_LABELS[f]}

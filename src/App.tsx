@@ -1619,40 +1619,41 @@ export default function App() {
           )
         )}
         <main className={`grid-wrap ${inDevelop ? "develop-wrap" : ""}`}>
+          {/* Only the grid and the inline loupe have anything to filter/sort/size — hidden
+              in Develop, module views and Compare, which is exactly the rest of the stage
+              ternary's branches (mirrors it rather than tracking its own state). Docked as
+              its own row above the stage so it never obstructs the top row of tiles. */}
+          {!(inDevelop && selected) && !activeView && !inCompare && (
+          <CommandPill
+              filters={FILTERS}
+              filter={scope.filter}
+              onFilter={library.setFilter}
+              activeTagLabel={tags.find((t) => t.id === scope.tagId)?.name ?? null}
+              onClearTag={() => library.selectTag(null)}
+              activeAlbumId={scope.albumId}
+              onClearAlbum={() => library.selectAlbum(null)}
+              activeSmartAlbumId={scope.smartAlbumId}
+              onClearSmartAlbum={() => library.selectSmartAlbum(null)}
+              activeBatchId={scope.batchId}
+              onClearBatch={() => library.selectBatch(null)}
+              activeFacets={scope.facets}
+              onToggleFacet={library.toggleFacet}
+              storageTier={scope.storageTier}
+              onStorageTier={library.setStorageTier}
+              photoSort={scope.sort}
+              onPhotoSort={library.setSort}
+              activeCamera={scope.camera}
+              onCamera={library.setCamera}
+              activeLens={scope.lens}
+              onLens={library.setLens}
+              activeLabels={scope.labels}
+              onToggleLabel={library.toggleLabel}
+              reloadKey={groupsKey}
+              thumbSize={thumbSize}
+              onThumbSize={setThumbSize}
+            />
+          )}
           <div className="stage">
-            {/* Only the grid and the inline loupe have anything to filter/sort/size — hidden
-                in Develop, module views and Compare, which is exactly the rest of this
-                ternary's branches (mirrors it rather than tracking its own state). */}
-            {!(inDevelop && selected) && !activeView && !inCompare && (
-              <CommandPill
-                filters={FILTERS}
-                filter={scope.filter}
-                onFilter={library.setFilter}
-                activeTagLabel={tags.find((t) => t.id === scope.tagId)?.name ?? null}
-                onClearTag={() => library.selectTag(null)}
-                activeAlbumId={scope.albumId}
-                onClearAlbum={() => library.selectAlbum(null)}
-                activeSmartAlbumId={scope.smartAlbumId}
-                onClearSmartAlbum={() => library.selectSmartAlbum(null)}
-                activeBatchId={scope.batchId}
-                onClearBatch={() => library.selectBatch(null)}
-                activeFacets={scope.facets}
-                onToggleFacet={library.toggleFacet}
-                storageTier={scope.storageTier}
-                onStorageTier={library.setStorageTier}
-                photoSort={scope.sort}
-                onPhotoSort={library.setSort}
-                activeCamera={scope.camera}
-                onCamera={library.setCamera}
-                activeLens={scope.lens}
-                onLens={library.setLens}
-                activeLabels={scope.labels}
-                onToggleLabel={library.toggleLabel}
-                reloadKey={groupsKey}
-                thumbSize={thumbSize}
-                onThumbSize={setThumbSize}
-              />
-            )}
             {inDevelop && selected ? (
               <EditorView
                 photoId={selected.id}

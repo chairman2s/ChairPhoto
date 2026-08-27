@@ -4284,25 +4284,21 @@ body {
 }
 
 /* ── Shell: command pill ── */
-/* src/components/shell/CommandPill.tsx — the floating filter/sort/thumb-size pill over
-   `.stage` (see agent-notes mockup Main.dc.html `.float-tb`), replacing the old
-   `.filter-bar` row that used to sit between the title bar and `.body`. Absolutely
-   positioned inside `.stage` (which is `position: relative`), centered and floating over
-   the grid/loupe instead of pushing either down a row. */
-.float-tb {
-  position: absolute;
-  top: 14px;
-  left: 50%;
-  transform: translateX(-50%);
+/* src/components/shell/CommandPill.tsx — the filter/sort/thumb-size toolbar, replacing the
+   old `.filter-bar` row that used to sit between the title bar and `.body`. Docked as its
+   own row above `.stage` (a `.grid-wrap` sibling, so it never scrolls away or obstructs
+   the top row of tiles — it floated over the grid at first, and that covered the sheet). */
+.dock-tb {
+  flex: none;
   display: flex;
   align-items: center;
   gap: 4px;
-  padding: 4px;
-  background: var(--panel);
-  border: 1px solid var(--border);
-  border-radius: var(--r-pill);
-  box-shadow: var(--shadow-pop);
-  z-index: 5;
+  height: 44px;
+  padding: 0 12px;
+  background: var(--canvas);
+  border-bottom: 1px solid var(--line);
+  overflow-x: auto;
+  scrollbar-width: none;
 }
 /* Culling seg items and the +Filter trigger share this class — a flat, borderless pill
    button that gets an `--elev` fill only while active/open (mirrors `.seg-item`, but the

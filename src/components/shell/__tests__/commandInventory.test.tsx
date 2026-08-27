@@ -1224,6 +1224,15 @@ function between(src: string, start: string, end: string): string {
 }
 
 describe("one code path: bench marking = keyboard culling", () => {
+  it("the keyboard effect's dependency list names inCull, so the guard actually stands down", () => {
+    // The handler's first guard reads `inCull`, but a dep list without it leaves a stale
+    // closure (inCull captured false) attached while a cull session runs — wrong-target
+    // marks against the pre-session selection plus a full refresh per keystroke (review
+    // finding; the gap predates the redesign). Pin the dependency at source level.
+    const deps = between(APP_TSX, "return () => window.removeEventListener(\"keydown\", handler);", "]);");
+    expect(deps).toContain("inCull,");
+  });
+
   it("App defines exactly one applyToSelection, owning the target loop and the refresh", () => {
     const body = between(
       APP_TSX,

@@ -114,6 +114,32 @@ describe("MenuButton", () => {
     expect(windowSpy).not.toHaveBeenCalled();
   });
 
+  it("an open menu consumes every other key too — culling shortcuts never reach window", () => {
+    // A digit typed while a menu is open must not bubble to the app's window-level rating
+    // shortcut and mutate the selection behind the menu (review finding).
+    render(
+      <MenuButton label="Actions">
+        <MenuItem onSelect={() => {}}>One</MenuItem>
+      </MenuButton>,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Actions" }));
+    const item = screen.getByRole("menuitem", { name: "One" });
+    item.focus();
+
+    const windowSpy = vi.fn();
+    window.addEventListener("keydown", windowSpy);
+    try {
+      fireEvent.keyDown(item, { key: "3" });
+      fireEvent.keyDown(item, { key: "p" });
+    } finally {
+      window.removeEventListener("keydown", windowSpy);
+    }
+
+    expect(windowSpy).not.toHaveBeenCalled();
+    // The menu stays open — consuming a key is not selecting an item.
+    expect(screen.getByRole("menu")).toBeTruthy();
+  });
+
   it("arrow-key roving focus skips a disabled item", () => {
     render(
       <MenuButton label="Actions">

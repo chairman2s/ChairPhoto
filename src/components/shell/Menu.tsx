@@ -60,7 +60,14 @@ function handleMenuKeyDown(
     close();
     return;
   }
-  if (e.key !== "ArrowDown" && e.key !== "ArrowUp") return;
+  if (e.key !== "ArrowDown" && e.key !== "ArrowUp") {
+    // An open menu consumes the keyboard. Without this, a digit or letter typed while a
+    // menu is open bubbles on to the window-level culling shortcuts (rate/pick/label) and
+    // mutates the selection behind the menu. Enter/Space still activate the focused item —
+    // stopping propagation doesn't suppress the button's own activation.
+    e.stopPropagation();
+    return;
+  }
   const items = focusableItems(panelRef.current);
   if (items.length === 0) return;
   e.preventDefault();

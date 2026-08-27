@@ -1359,6 +1359,13 @@ export default function App() {
     refresh,
     activeView,
     inDevelop,
+    // Pre-existing gap surfaced in review: the first guard line reads `inCull`, but the
+    // dep list never named it — so opening a cull session left the stale closure (inCull
+    // captured false) attached, and the grid handler kept firing behind the session:
+    // wrong-target marks against the pre-session selection, a full refresh per keystroke,
+    // and a silent stepActive on the grid cursor. CullSession owns the keyboard while
+    // open; this dependency is what makes the guard actually stand down.
+    inCull,
     toggleLeftPanel,
     toggleRightPanel,
     // Compare's branch reads all of these; without them the listener would keep acting on

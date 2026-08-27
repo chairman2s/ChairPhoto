@@ -306,7 +306,7 @@ export function SendToDevicePanel({ api, onSent, preflight }: SendToDevicePanelP
       </div>
 
       {warning && (
-        <div className="modal-sub" role="status" style={{ color: "var(--warn, #c98a00)" }}>
+        <div className="modal-sub" role="status" style={{ color: "var(--rating)" }}>
           {warning}
         </div>
       )}

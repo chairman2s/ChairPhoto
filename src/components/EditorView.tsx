@@ -1166,7 +1166,7 @@ export function EditorView({
             </div>
 
             {error && <div className="modal-error">{error}</div>}
-            <div className="editor-hint" style={{ color: "var(--text-mute)" }}>
+            <div className="editor-hint" style={{ color: "var(--mute)" }}>
               Changes save to "{current.name}" automatically.
             </div>
           </div>

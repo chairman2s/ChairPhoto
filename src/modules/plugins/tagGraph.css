@@ -7,8 +7,8 @@
   height: 100%;
   width: 100%;
   min-height: 0;
-  color: var(--text);
-  background: var(--bg);
+  color: var(--txt);
+  background: var(--canvas);
   font-size: 13px;
 }
 
@@ -17,7 +17,7 @@
   width: 230px;
   flex: 0 0 230px;
   border-right: 1px solid var(--border);
-  background: var(--bg);
+  background: var(--canvas);
   padding: 12px 12px 16px;
   overflow-y: auto;
   display: flex;
@@ -30,7 +30,7 @@
   font-weight: 700;
   letter-spacing: 0.08em;
   text-transform: uppercase;
-  color: var(--text-mute);
+  color: var(--mute);
   margin: 10px 0 4px;
 }
 .tg-head:first-child {
@@ -53,20 +53,20 @@
   border: none;
   border-radius: var(--r-sm, 6px);
   background: transparent;
-  color: var(--text);
+  color: var(--txt);
   cursor: pointer;
   text-align: left;
   font-size: 13px;
 }
 .tg-type:hover,
 .tg-comm:hover {
-  background: var(--bg-panel);
+  background: var(--panel);
 }
 .tg-type.off {
   opacity: 0.4;
 }
 .tg-comm.on {
-  background: var(--bg-panel);
+  background: var(--panel);
 }
 
 .tg-dot {
@@ -91,7 +91,7 @@
 }
 .tg-type-count,
 .tg-comm-count {
-  color: var(--text-dim);
+  color: var(--dim);
   font-variant-numeric: tabular-nums;
   font-size: 12px;
 }
@@ -107,7 +107,7 @@
 .tg-slider-labels {
   display: flex;
   justify-content: space-between;
-  color: var(--text-mute);
+  color: var(--mute);
   font-size: 10px;
   padding: 0 4px;
 }
@@ -118,7 +118,7 @@
   align-items: center;
   justify-content: space-between;
   padding: 8px 4px 4px;
-  color: var(--text-dim);
+  color: var(--dim);
 }
 .tg-switch {
   position: relative;
@@ -126,7 +126,7 @@
   height: 18px;
   border-radius: 999px;
   border: 1px solid var(--border);
-  background: var(--bg-panel);
+  background: var(--panel);
   cursor: pointer;
   padding: 0;
   transition: background 0.15s;
@@ -142,7 +142,7 @@
   width: 14px;
   height: 14px;
   border-radius: 999px;
-  background: var(--text);
+  background: var(--txt);
   transition: transform 0.15s;
 }
 .tg-switch.on .tg-knob {
@@ -162,7 +162,7 @@
   font-weight: 700;
   letter-spacing: 0.08em;
   text-transform: uppercase;
-  color: var(--text-mute);
+  color: var(--mute);
 }
 .tg-seg {
   display: flex;
@@ -174,8 +174,8 @@
   flex: 1;
   padding: 6px 4px;
   border: none;
-  background: var(--bg-panel);
-  color: var(--text-dim);
+  background: var(--panel);
+  color: var(--dim);
   cursor: pointer;
   font-size: 12px;
 }
@@ -184,7 +184,7 @@
 }
 .tg-seg button.on {
   background: var(--accent);
-  color: #fff;
+  color: var(--onaccent);
 }
 
 /* ── Center canvas ───────────────────────────────────────────────── */
@@ -193,7 +193,7 @@
   flex: 1 1 auto;
   min-width: 0;
   overflow: hidden;
-  background: var(--bg);
+  background: var(--canvas);
 }
 .tg-svg {
   width: 100%;
@@ -215,9 +215,9 @@
   z-index: 5;
   padding: 8px 12px;
   border-radius: var(--r-sm, 6px);
-  background: rgba(239, 68, 68, 0.15);
-  border: 1px solid #ef4444;
-  color: #fecaca;
+  background: color-mix(in srgb, var(--danger) 15%, transparent);
+  border: 1px solid var(--danger);
+  color: var(--danger);
   font-size: 12px;
 }
 
@@ -268,11 +268,11 @@
   stroke-width: 1.5;
 }
 .tg-label {
-  fill: var(--text);
+  fill: var(--txt);
   font-size: 11px;
   font-weight: 500;
   paint-order: stroke;
-  stroke: var(--bg);
+  stroke: var(--canvas);
   stroke-width: 3px;
   pointer-events: none;
 }
@@ -287,11 +287,11 @@
   gap: 3px;
   padding: 8px 10px;
   border-radius: var(--r-sm, 6px);
-  background: rgba(30, 41, 59, 0.8);
+  background: color-mix(in srgb, var(--panel) 80%, transparent);
   border: 1px solid var(--border);
   backdrop-filter: blur(8px);
   font-size: 11px;
-  color: var(--text-dim);
+  color: var(--dim);
 }
 .tg-legend span {
   display: flex;
@@ -314,28 +314,28 @@
   align-items: center;
   gap: 4px;
   padding: 4px 8px;
-  background: rgba(30, 41, 59, 0.85);
+  background: color-mix(in srgb, var(--panel) 85%, transparent);
   backdrop-filter: blur(12px);
-  border: 1px solid #475569;
+  border: 1px solid var(--border);
   border-radius: 999px;
   box-shadow: var(--shadow-pop);
 }
 .tg-pill button {
   border: none;
   background: transparent;
-  color: var(--text);
+  color: var(--txt);
   cursor: pointer;
   padding: 4px 10px;
   border-radius: 999px;
   font-size: 13px;
 }
 .tg-pill button:hover {
-  background: rgba(255, 255, 255, 0.08);
+  background: color-mix(in srgb, var(--txt) 8%, transparent);
 }
 .tg-pill-sep {
   width: 1px;
   height: 16px;
-  background: #475569;
+  background: var(--border);
   margin: 0 2px;
 }
 
@@ -350,8 +350,8 @@
   align-items: center;
   padding: 0 12px;
   border-top: 1px solid var(--border);
-  background: var(--bg);
-  color: var(--text-mute);
+  background: var(--canvas);
+  color: var(--mute);
   font-size: 11px;
   font-variant-numeric: tabular-nums;
 }
@@ -361,14 +361,14 @@
   width: 280px;
   flex: 0 0 280px;
   border-left: 1px solid var(--border);
-  background: var(--bg);
+  background: var(--canvas);
   overflow: hidden;
   display: flex;
   flex-direction: column;
 }
 .tg-empty {
   margin: auto;
-  color: var(--text-mute);
+  color: var(--mute);
   font-size: 13px;
 }
 
@@ -407,13 +407,13 @@
 .tg-chip {
   padding: 3px 8px;
   border-radius: var(--r-pill, 999px);
-  background: var(--bg-panel);
+  background: var(--panel);
   border: 1px solid var(--border);
-  color: var(--text-dim);
+  color: var(--dim);
   font-size: 11px;
 }
 .tg-chip-comm {
-  color: var(--text);
+  color: var(--txt);
 }
 
 .tg-stats {
@@ -423,7 +423,7 @@
 }
 .tg-stat {
   flex: 1;
-  background: var(--bg-panel);
+  background: var(--panel);
   border-radius: 9px;
   padding: 10px 4px;
   text-align: center;
@@ -435,7 +435,7 @@
 }
 .tg-stat-l {
   font-size: 10px;
-  color: var(--text-mute);
+  color: var(--mute);
   text-transform: uppercase;
   letter-spacing: 0.05em;
   margin-top: 2px;
@@ -452,9 +452,9 @@
   gap: 6px;
   padding: 4px 8px;
   border-radius: var(--r-pill, 999px);
-  background: var(--bg-panel);
+  background: var(--panel);
   border: 1px solid var(--border);
-  color: var(--text);
+  color: var(--txt);
   cursor: pointer;
   font-size: 12px;
   max-width: 100%;
@@ -469,7 +469,7 @@
   max-width: 120px;
 }
 .tg-conn-w {
-  color: var(--text-mute);
+  color: var(--mute);
   font-variant-numeric: tabular-nums;
   font-size: 11px;
 }
@@ -483,7 +483,7 @@
   aspect-ratio: 1;
   border-radius: 6px;
   overflow: hidden;
-  background: var(--bg-tile, var(--bg-panel));
+  background: var(--elev);
 }
 .tg-thumb img {
   width: 100%;
@@ -513,8 +513,8 @@
   white-space: nowrap;
 }
 .tg-btn-primary {
-  background: var(--grad-primary);
-  color: #fff;
+  background: var(--accent);
+  color: var(--onaccent);
 }
 .tg-btn-primary:disabled {
   opacity: 0.4;
@@ -523,8 +523,8 @@
 .tg-btn-ghost {
   background: transparent;
   border-color: var(--border);
-  color: var(--text);
+  color: var(--txt);
 }
 .tg-btn-ghost:hover {
-  background: var(--bg-panel);
+  background: var(--panel);
 }

@@ -6,6 +6,7 @@ import { useState } from "react";
 import type { ChairPhotoAPI, ChairPhotoModule } from "../registry";
 import { thumbnailUrl } from "../api";
 import { OAuthSettings, PublishPanel, type PublishService } from "./publishing";
+import "./flickr.css";
 
 // ── Backend commands (owned by this module) ───────────────────────────────────
 // Per the module contract, a module's own commands go through `ChairPhotoAPI.invoke`
@@ -149,7 +150,7 @@ function CatalogThumb({
         objectFit: "cover",
         borderRadius: 4,
         flexShrink: 0,
-        background: "rgba(30,41,59,0.8)",
+        background: "color-mix(in srgb, var(--elev) 80%, transparent)",
       }}
       onError={(e) => {
         (e.currentTarget as HTMLImageElement).style.visibility = "hidden";
@@ -178,12 +179,12 @@ function FlickrThumb({
           height: size,
           borderRadius: 4,
           flexShrink: 0,
-          background: "rgba(30,41,59,0.8)",
+          background: "color-mix(in srgb, var(--elev) 80%, transparent)",
           display: "flex",
           alignItems: "center",
           justifyContent: "center",
           fontSize: 9,
-          color: "rgba(255,255,255,0.4)",
+          color: "color-mix(in srgb, var(--txt) 40%, transparent)",
           padding: 4,
           textAlign: "center",
           overflow: "hidden",
@@ -205,7 +206,7 @@ function FlickrThumb({
         objectFit: "cover",
         borderRadius: 4,
         flexShrink: 0,
-        background: "rgba(30,41,59,0.8)",
+        background: "color-mix(in srgb, var(--elev) 80%, transparent)",
       }}
       onError={(e) => {
         (e.currentTarget as HTMLImageElement).style.visibility = "hidden";
@@ -224,7 +225,7 @@ function SideTag({ children, color }: { children: string; color?: string }) {
         fontWeight: 600,
         textTransform: "uppercase",
         letterSpacing: 0.6,
-        color: color ?? "rgba(255,255,255,0.45)",
+        color: color ?? "color-mix(in srgb, var(--txt) 45%, transparent)",
         marginBottom: 3,
       }}
     >
@@ -375,7 +376,7 @@ function ImportPublishedPanel({ api }: { api: ChairPhotoAPI }) {
       {/* Manually resolved entries — pair view: Flickr thumb + chosen catalog thumb */}
       {resolved.size > 0 && (
         <div style={{ marginTop: 8 }}>
-          <div className="term-note" style={{ marginBottom: 4, color: "#50a050" }}>
+          <div className="term-note" style={{ marginBottom: 4, color: "var(--ok)" }}>
             Manually resolved ({resolved.size}) — Flickr photo → your catalog file:
           </div>
           <div style={{ fontSize: 11 }}>
@@ -408,7 +409,7 @@ function ImportPublishedPanel({ api }: { api: ChairPhotoAPI }) {
       {/* Ambiguous entries — visual resolution UI */}
       {plan && plan.ambiguous.length > 0 && (
         <div style={{ marginTop: 8 }}>
-          <div className="term-note" style={{ marginBottom: 4, color: "#c08030" }}>
+          <div className="term-note" style={{ marginBottom: 4, color: "var(--rating)" }}>
             Ambiguous — pick the right file or skip (up to 50 shown):
           </div>
           <div
@@ -425,12 +426,12 @@ function ImportPublishedPanel({ api }: { api: ChairPhotoAPI }) {
                   key={a.flickrId}
                   style={{
                     marginBottom: 12,
-                    borderLeft: "2px solid #c08030",
+                    borderLeft: "2px solid var(--rating)",
                     paddingLeft: 8,
                   }}
                 >
                   {/* Flickr side — thumbnail + title + date + link */}
-                  <SideTag color="#7ba8d8">On Flickr</SideTag>
+                  <SideTag color="var(--accent)">On Flickr</SideTag>
                   <div style={{ display: "flex", gap: 8, alignItems: "flex-start", marginBottom: 6 }}>
                     <a
                       href={a.flickrUrl}
@@ -486,10 +487,9 @@ function ImportPublishedPanel({ api }: { api: ChairPhotoAPI }) {
                         {a.candidates.map((c: FlickrImportCandidate) => (
                         <button
                           key={c.catalogId}
+                          className="flk-candidate-btn"
                           onClick={() => resolve(a, c)}
                           style={{
-                            background: "none",
-                            border: "1px solid rgba(255,255,255,0.15)",
                             borderRadius: 6,
                             padding: 4,
                             cursor: "pointer",
@@ -497,14 +497,6 @@ function ImportPublishedPanel({ api }: { api: ChairPhotoAPI }) {
                             width: THUMB_SIZE + 8,
                             flexShrink: 0,
                             transition: "border-color 0.15s, background 0.15s",
-                          }}
-                          onMouseEnter={(e) => {
-                            e.currentTarget.style.borderColor = "rgba(255,255,255,0.5)";
-                            e.currentTarget.style.background = "rgba(255,255,255,0.06)";
-                          }}
-                          onMouseLeave={(e) => {
-                            e.currentTarget.style.borderColor = "rgba(255,255,255,0.15)";
-                            e.currentTarget.style.background = "none";
                           }}
                         >
                           <CatalogThumb catalogId={c.catalogId} size={THUMB_SIZE} />

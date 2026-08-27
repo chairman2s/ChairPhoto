@@ -55,7 +55,7 @@ export function ModulesSection() {
           </div>
           {modulesDir && (
             <div className="module-install-path">
-              <span style={{ color: "var(--text-dim)" }}>Install path: </span>
+              <span style={{ color: "var(--dim)" }}>Install path: </span>
               <code className="module-install-path-code">{modulesDir}</code>
             </div>
           )}

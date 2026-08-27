@@ -601,11 +601,11 @@ const DEFAULT_THRESHOLD = "0.45";
 
 function chipColor(state: FaceRow["state"]): string {
   switch (state) {
-    case "confirmed": return "#10b981";
-    case "suggested": return "#f59e0b";
-    case "rejected":  return "#ef4444";
-    case "ignored":   return "#64748b";
-    default:          return "#3b82f6";
+    case "confirmed": return "var(--ok)";
+    case "suggested": return "var(--rating)";
+    case "rejected":  return "var(--danger)";
+    case "ignored":   return "var(--mute)";
+    default:          return "var(--accent)";
   }
 }
 
@@ -722,8 +722,8 @@ function PersonPicker({ tags, currentTagId, onPick, onCancel, onCreate }: Person
               textAlign: "left",
               padding: "4px 10px",
               fontSize: 12,
-              color: tag.id === currentTagId ? "#10b981" : "#f8fafc",
-              background: i === clamped ? "rgba(59,130,246,0.15)" : "none",
+              color: tag.id === currentTagId ? "var(--ok)" : "var(--txt)",
+              background: i === clamped ? "var(--sel)" : "none",
               border: "none",
               cursor: "pointer",
             }}
@@ -742,9 +742,9 @@ function PersonPicker({ tags, currentTagId, onPick, onCancel, onCreate }: Person
               textAlign: "left",
               padding: "4px 10px",
               fontSize: 12,
-              color: "#3b82f6",
+              color: "var(--accent)",
               background:
-                clamped === filtered.length ? "rgba(59,130,246,0.15)" : "none",
+                clamped === filtered.length ? "var(--sel)" : "none",
               border: "none",
               cursor: "pointer",
             }}
@@ -1120,7 +1120,9 @@ export function FaceOverlay({ photoId, api }: FaceOverlayProps) {
             style={{
               pointerEvents: "all",
               padding: "3px 8px",
-              background: drawMode ? "rgba(59,130,246,0.9)" : "rgba(15,23,42,0.85)",
+              background: drawMode
+                ? "color-mix(in srgb, var(--accent) 90%, transparent)"
+                : "color-mix(in srgb, var(--panel) 85%, transparent)",
               border: "1px solid var(--border)",
               borderRadius: 6,
             }}
@@ -1144,7 +1146,7 @@ export function FaceOverlay({ photoId, api }: FaceOverlayProps) {
               style={{
                 pointerEvents: "all",
                 padding: "3px 8px",
-                background: "rgba(15,23,42,0.85)",
+                background: "color-mix(in srgb, var(--panel) 85%, transparent)",
                 border: "1px solid var(--border)",
                 borderRadius: 6,
               }}
@@ -1169,8 +1171,8 @@ export function FaceOverlay({ photoId, api }: FaceOverlayProps) {
             top: Math.min(draft.y0, draft.y1),
             width: Math.abs(draft.x1 - draft.x0),
             height: Math.abs(draft.y1 - draft.y0),
-            border: "2px dashed #3b82f6",
-            background: "rgba(59,130,246,0.12)",
+            border: "2px dashed var(--accent)",
+            background: "var(--sel)",
             borderRadius: 4,
             pointerEvents: "none",
             zIndex: 24,
@@ -1215,12 +1217,12 @@ export function FaceOverlay({ photoId, api }: FaceOverlayProps) {
                 display: "flex",
                 alignItems: "center",
                 gap: 3,
-                background: "rgba(15, 23, 42, 0.88)",
+                background: "color-mix(in srgb, var(--panel) 88%, transparent)",
                 border: `1px solid ${color}`,
                 borderRadius: 4,
                 padding: "2px 5px",
                 fontSize: 11,
-                color: "#f8fafc",
+                color: "var(--txt)",
                 whiteSpace: "nowrap",
                 userSelect: "none",
                 zIndex: 20,
@@ -1303,7 +1305,7 @@ export function FaceOverlay({ photoId, api }: FaceOverlayProps) {
                   top: "100%",
                   left: 0,
                   zIndex: 30,
-                  background: "rgba(15, 23, 42, 0.97)",
+                  background: "color-mix(in srgb, var(--panel) 97%, transparent)",
                   border: "1px solid var(--border)",
                   borderRadius: 6,
                   padding: "4px 6px 6px",
@@ -1584,7 +1586,7 @@ function FacesInspectorPanel({ api }: { api: ChairPhotoAPI }) {
                   </button>
                 )}
                 {isConfirmed && (
-                  <span style={{ fontSize: 11, color: "#10b981", alignSelf: "center" }}>
+                  <span style={{ fontSize: 11, color: "var(--ok)", alignSelf: "center" }}>
                     confirmed
                   </span>
                 )}
@@ -2340,7 +2342,7 @@ function FacesSettings({ api }: { api: ChairPhotoAPI }) {
           ) : modelsStatus == null ? (
             <span className="term-note">Status unavailable</span>
           ) : modelsReady ? (
-            <span className="term-note" style={{ color: "#10b981" }}>
+            <span className="term-note" style={{ color: "var(--ok)" }}>
               YuNet + AuraFace ready
             </span>
           ) : (
@@ -2372,7 +2374,7 @@ function FacesSettings({ api }: { api: ChairPhotoAPI }) {
         >
           {modelsLoading ? "Downloading…" : modelsReady ? "Re-download models" : "Download models"}
         </button>
-        {modelsError && <span className="term-note" style={{ color: "#ef4444" }}>{modelsError}</span>}
+        {modelsError && <span className="term-note" style={{ color: "var(--danger)" }}>{modelsError}</span>}
       </div>
 
       {/* ── Inference: where face detection/embedding actually runs ── */}
@@ -2382,7 +2384,7 @@ function FacesSettings({ api }: { api: ChairPhotoAPI }) {
           {inference == null ? (
             <span className="term-note">Checking…</span>
           ) : inference.ep === "cuda" ? (
-            <span className="term-note" style={{ color: "#10b981" }}>GPU (CUDA)</span>
+            <span className="term-note" style={{ color: "var(--ok)" }}>GPU (CUDA)</span>
           ) : inference.ep === "cpu" ? (
             <span className="term-note">
               CPU
@@ -2448,7 +2450,7 @@ function FacesSettings({ api }: { api: ChairPhotoAPI }) {
                 left: 0,
                 right: 0,
                 zIndex: 20,
-                background: "var(--bg-panel)",
+                background: "var(--panel)",
                 border: "1px solid var(--border)",
                 borderRadius: 6,
                 overflow: "hidden",
@@ -2464,9 +2466,9 @@ function FacesSettings({ api }: { api: ChairPhotoAPI }) {
                     textAlign: "left",
                     padding: "5px 10px",
                     fontSize: 12,
-                    background: i === clampedRootHighlight ? "rgba(59,130,246,0.15)" : "none",
+                    background: i === clampedRootHighlight ? "var(--sel)" : "none",
                     border: "none",
-                    color: "var(--text)",
+                    color: "var(--txt)",
                     cursor: "pointer",
                   }}
                   onMouseEnter={() => setRootHighlight(i)}
@@ -2515,7 +2517,7 @@ function FacesSettings({ api }: { api: ChairPhotoAPI }) {
 
       {/* ── Index + match actions ────────────────────────────────── */}
       <div className="iptc-row" style={{ marginTop: 16, borderTop: "1px solid var(--border)", paddingTop: 12 }}>
-        <div className="iptc-label" style={{ fontWeight: 600, color: "var(--text)" }}>
+        <div className="iptc-label" style={{ fontWeight: 600, color: "var(--txt)" }}>
           Index & match
         </div>
       </div>
@@ -2567,11 +2569,11 @@ function FacesSettings({ api }: { api: ChairPhotoAPI }) {
                 {pct != null ? ` (${pct}%)` : ""}
               </div>
               {pct != null && (
-                <div style={{ height: 4, background: "rgba(255,255,255,0.12)", borderRadius: 2 }}>
+                <div style={{ height: 4, background: "color-mix(in srgb, var(--txt) 12%, transparent)", borderRadius: 2 }}>
                   <div
                     style={{
                       height: "100%",
-                      background: "#3b82f6",
+                      background: "var(--accent)",
                       borderRadius: 2,
                       width: `${pct}%`,
                       transition: "width 0.2s",
@@ -2674,7 +2676,7 @@ function FaceAvatar({ photoId, bbox, size = 72 }: FaceAvatarProps) {
         height: size,
         overflow: "hidden",
         borderRadius: "50%",
-        background: "rgba(30, 41, 59, 0.8)",
+        background: "color-mix(in srgb, var(--elev) 80%, transparent)",
         flexShrink: 0,
         position: "relative",
       }}
@@ -2710,7 +2712,7 @@ interface PersonCardProps {
 function PersonCard({ person, onFilter }: PersonCardProps) {
   return (
     <button
-      className="fa-pv-card"
+      className="fa-pv-card fa-person-card"
       onClick={onFilter}
       title={`Filter Library to ${person.fullPath}`}
       style={{
@@ -2719,7 +2721,6 @@ function PersonCard({ person, onFilter }: PersonCardProps) {
         alignItems: "center",
         gap: 8,
         padding: "12px 10px 10px",
-        background: "rgba(30, 41, 59, 0.5)",
         border: "1px solid var(--border)",
         borderRadius: 8,
         cursor: "pointer",
@@ -2727,11 +2728,9 @@ function PersonCard({ person, onFilter }: PersonCardProps) {
         width: 108,
         transition: "background 0.15s",
       }}
-      onMouseEnter={(e) => { (e.currentTarget as HTMLButtonElement).style.background = "rgba(59, 130, 246, 0.18)"; }}
-      onMouseLeave={(e) => { (e.currentTarget as HTMLButtonElement).style.background = "rgba(30, 41, 59, 0.5)"; }}
     >
       <FaceAvatar photoId={person.avatarPhotoId} bbox={person.avatarBbox} size={72} />
-      <div style={{ fontSize: 12, fontWeight: 600, color: "var(--text)", maxWidth: 90, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+      <div style={{ fontSize: 12, fontWeight: 600, color: "var(--txt)", maxWidth: 90, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
         {person.name}
       </div>
       <div style={{ fontSize: 11, opacity: 0.6, lineHeight: 1.3 }}>
@@ -2809,7 +2808,7 @@ function NameClusterModal({
         position: "fixed",
         inset: 0,
         zIndex: 1000,
-        background: "rgba(0,0,0,0.55)",
+        background: "var(--scrim)",
         display: "flex",
         alignItems: "center",
         justifyContent: "center",
@@ -2818,7 +2817,7 @@ function NameClusterModal({
     >
       <div
         style={{
-          background: "var(--bg-panel)",
+          background: "var(--panel)",
           border: "1px solid var(--border)",
           borderRadius: 10,
           padding: "20px 22px",
@@ -2827,7 +2826,7 @@ function NameClusterModal({
         }}
         onClick={(e) => e.stopPropagation()}
       >
-        <div style={{ fontWeight: 700, fontSize: 15, marginBottom: 10, color: "var(--text)" }}>
+        <div style={{ fontWeight: 700, fontSize: 15, marginBottom: 10, color: "var(--txt)" }}>
           Name this cluster
         </div>
         <div style={{ fontSize: 12, opacity: 0.7, marginBottom: 14 }}>
@@ -2862,6 +2861,7 @@ function NameClusterModal({
             {suggestions.map((tag) => (
               <button
                 key={tag.id}
+                className="fa-suggest-item"
                 style={{
                   display: "block",
                   width: "100%",
@@ -2870,11 +2870,9 @@ function NameClusterModal({
                   fontSize: 12,
                   background: "none",
                   border: "none",
-                  color: "var(--text)",
+                  color: "var(--txt)",
                   cursor: "pointer",
                 }}
-                onMouseEnter={(e) => { (e.currentTarget as HTMLButtonElement).style.background = "rgba(59,130,246,0.15)"; }}
-                onMouseLeave={(e) => { (e.currentTarget as HTMLButtonElement).style.background = "none"; }}
                 onClick={() => setTagPath(tag.fullPath)}
               >
                 {tag.fullPath}
@@ -2884,7 +2882,7 @@ function NameClusterModal({
         )}
 
         {error && (
-          <div style={{ color: "#ef4444", fontSize: 12, marginBottom: 8 }}>{error}</div>
+          <div style={{ color: "var(--danger)", fontSize: 12, marginBottom: 8 }}>{error}</div>
         )}
 
         <div style={{ display: "flex", gap: 8, marginTop: 10 }}>
@@ -2923,7 +2921,7 @@ function ClusterCard({ cluster, onName }: ClusterCardProps) {
         alignItems: "center",
         gap: 8,
         padding: "12px 10px 10px",
-        background: "rgba(30, 41, 59, 0.3)",
+        background: "color-mix(in srgb, var(--elev) 30%, transparent)",
         border: "1px dashed var(--border)",
         borderRadius: 8,
         cursor: "pointer",
@@ -2939,7 +2937,7 @@ function ClusterCard({ cluster, onName }: ClusterCardProps) {
       <div style={{ fontSize: 11, opacity: 0.6, lineHeight: 1.3 }}>
         {cluster.memberCount} face{cluster.memberCount !== 1 ? "s" : ""}
         <br />
-        <span style={{ fontSize: 10, color: "#f59e0b" }}>Tap to name</span>
+        <span style={{ fontSize: 10, color: "var(--rating)" }}>Tap to name</span>
       </div>
     </button>
   );
@@ -3074,13 +3072,13 @@ function SuggestionsQueue({ api, onDone }: SuggestionsQueueProps) {
               alignItems: "center",
               gap: 12,
               padding: "10px 20px",
-              borderBottom: "1px solid rgba(255,255,255,0.05)",
+              borderBottom: "1px solid color-mix(in srgb, var(--txt) 5%, transparent)",
               opacity: entry.confidence < confidenceThreshold ? 0.55 : 1,
             }}
           >
             <FaceAvatar photoId={entry.photoId} bbox={entry.bbox} size={52} />
             <div style={{ flex: 1, minWidth: 0 }}>
-              <div style={{ fontWeight: 600, fontSize: 13, color: "#10b981" }}>
+              <div style={{ fontWeight: 600, fontSize: 13, color: "var(--ok)" }}>
                 {entry.personFullPath}
               </div>
               <div style={{ fontSize: 11, opacity: 0.7 }}>
@@ -3090,7 +3088,7 @@ function SuggestionsQueue({ api, onDone }: SuggestionsQueueProps) {
             <div style={{ display: "flex", gap: 6, flexShrink: 0 }}>
               <button
                 className="chip"
-                style={{ fontSize: 12, padding: "3px 9px", color: "#10b981", borderColor: "#10b981" }}
+                style={{ fontSize: 12, padding: "3px 9px", color: "var(--ok)", borderColor: "var(--ok)" }}
                 onClick={() => void handleConfirm(entry)}
                 disabled={confirming.has(entry.faceId) || rejecting.has(entry.faceId)}
               >
@@ -3098,7 +3096,7 @@ function SuggestionsQueue({ api, onDone }: SuggestionsQueueProps) {
               </button>
               <button
                 className="chip"
-                style={{ fontSize: 12, padding: "3px 9px", color: "#ef4444", borderColor: "#ef4444" }}
+                style={{ fontSize: 12, padding: "3px 9px", color: "var(--danger)", borderColor: "var(--danger)" }}
                 onClick={() => void handleReject(entry)}
                 disabled={confirming.has(entry.faceId) || rejecting.has(entry.faceId)}
               >
@@ -3210,7 +3208,7 @@ function PeopleView({ api }: { api: ChairPhotoAPI }) {
         <div style={{ padding: 32, textAlign: "center", opacity: 0.6 }}>Loading…</div>
       )}
       {error && (
-        <div style={{ padding: 20, color: "#ef4444" }}>{error}</div>
+        <div style={{ padding: 20, color: "var(--danger)" }}>{error}</div>
       )}
 
       {!loading && !error && (

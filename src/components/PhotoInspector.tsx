@@ -132,11 +132,11 @@ const PICKS: { key: "pick" | "reject" | "none"; label: string }[] = [
 
 // Collapsed-row summary per storage status (dot colour + short label).
 const STORAGE_META: Record<StorageStatus, { label: string; color: string }> = {
-  localOnly: { label: "Local only", color: "#F59E0B" },
-  backedUp: { label: "Backed up", color: "#10B981" },
-  archived: { label: "On NAS", color: "#60A5FA" },
-  offline: { label: "NAS offline", color: "#F87171" },
-  missing: { label: "Missing", color: "#F87171" },
+  localOnly: { label: "Local only", color: "var(--rating)" },
+  backedUp: { label: "Backed up", color: "var(--ok)" },
+  archived: { label: "On NAS", color: "var(--accent)" },
+  offline: { label: "NAS offline", color: "var(--danger)" },
+  missing: { label: "Missing", color: "var(--danger)" },
 };
 
 // A collapsible inspector section (the bottom accordion zone). The label acts as a

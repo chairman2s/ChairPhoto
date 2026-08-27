@@ -7,8 +7,8 @@
   flex-direction: column;
   height: 100%;
   overflow: hidden;
-  background: var(--bg);
-  color: var(--text);
+  background: var(--canvas);
+  color: var(--txt);
 }
 
 /* ── Header bar ─────────────────────────────────────────────────────────────── */
@@ -58,27 +58,27 @@
 
 .fa-chip-btn {
   background: none;
-  border: 1px solid rgba(255, 255, 255, 0.35);
+  border: 1px solid color-mix(in srgb, var(--txt) 35%, transparent);
   border-radius: 3px;
   padding: 1px 5px;
   font-size: 11px;
-  color: #f8fafc;
+  color: var(--txt);
   cursor: pointer;
   line-height: 1.4;
   transition: background 0.1s;
 }
 
 .fa-chip-btn:hover {
-  background: rgba(255, 255, 255, 0.12);
+  background: color-mix(in srgb, var(--txt) 12%, transparent);
 }
 
 .fa-chip-btn-danger {
-  border-color: rgba(239, 68, 68, 0.6);
-  color: #fca5a5;
+  border-color: color-mix(in srgb, var(--danger) 60%, transparent);
+  color: var(--danger);
 }
 
 .fa-chip-btn-danger:hover {
-  background: rgba(239, 68, 68, 0.15);
+  background: color-mix(in srgb, var(--danger) 15%, transparent);
 }
 
 /* ── Face panel (inspector) ─────────────────────────────────────────────────── */
@@ -93,7 +93,7 @@
   display: flex;
   gap: 8px;
   padding: 6px 0;
-  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+  border-bottom: 1px solid color-mix(in srgb, var(--txt) 6%, transparent);
 }
 
 .fa-panel-num {
@@ -134,4 +134,21 @@
 
 .fa-drop-item {
   transition: background 0.1s;
+}
+
+/* ── People wall card (was an imperative onMouseEnter/onMouseLeave background
+   write — moved here so it's a plain CSS :hover rule instead). ──────────────── */
+
+.fa-person-card {
+  background: color-mix(in srgb, var(--elev) 50%, transparent);
+}
+.fa-person-card:hover {
+  background: var(--sel);
+}
+
+/* ── Cluster-naming type-ahead suggestion row (same: was an imperative
+   onMouseEnter/onMouseLeave background write). ──────────────────────────────── */
+
+.fa-suggest-item:hover {
+  background: var(--sel);
 }

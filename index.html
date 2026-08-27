@@ -6,11 +6,13 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>ChairPhoto</title>
     <!-- Dark from the very first paint, before the JS bundle loads — avoids the white
-         flash; the splash overlay then takes over seamlessly. -->
+         flash; the splash overlay then takes over seamlessly. This hex must match
+         --canvas in src/theme/standard.ts (ChairPhoto Standard) — it runs before any
+         CSS custom property is available, so it can't read the token itself. -->
     <style>
       html,
       body {
-        background: #0f172a;
+        background: #14120F;
       }
     </style>
   </head>

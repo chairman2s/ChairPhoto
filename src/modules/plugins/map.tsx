@@ -636,9 +636,9 @@ function MapView({ api }: { api: ChairPhotoAPI }) {
     if (drawPolyRef.current) map.removeLayer(drawPolyRef.current);
     if (verts.length < 2) { drawPolyRef.current = null; return; }
     const poly = L.polygon(verts as L.LatLngExpression[], {
-      color: "#3b82f6",
+      color: "var(--accent)",
       weight: 2,
-      fillColor: "#3b82f6",
+      fillColor: "var(--accent)",
       fillOpacity: 0.15,
       dashArray: "6 4",
     }).addTo(map);
@@ -709,7 +709,7 @@ function MapView({ api }: { api: ChairPhotoAPI }) {
       drawVerticesRef.current = newVerts;
 
       // Vertex marker.
-      const icon = makeVertexIcon("#3b82f6");
+      const icon = makeVertexIcon("var(--accent)");
       const m = L.marker([lat, lng], { icon, draggable: false }).addTo(map);
       drawMarkersRef.current.push(m);
       updateDrawPoly();
@@ -1237,11 +1237,11 @@ function MapSettings({ api }: { api: ChairPhotoAPI }) {
       )}
 
       {geocodeProgress && geocodeProgress.total > 0 && (
-        <div style={{ marginTop: 6, height: 4, background: "rgba(255,255,255,0.12)", borderRadius: 2 }}>
+        <div style={{ marginTop: 6, height: 4, background: "color-mix(in srgb, var(--txt) 12%, transparent)", borderRadius: 2 }}>
           <div
             style={{
               height: "100%",
-              background: "#3b82f6",
+              background: "var(--accent)",
               borderRadius: 2,
               width: `${pct ?? 0}%`,
               transition: "width 0.2s",

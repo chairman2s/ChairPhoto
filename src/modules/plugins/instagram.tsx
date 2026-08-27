@@ -188,7 +188,7 @@ function InstagramForm({ api }: { api: ChairPhotoAPI }) {
         <span className="iptc-status">{status}</span>
       </div>
       {pendingReview != null && (
-        <div className="field" style={{ marginTop: 8, padding: "8px 0", borderTop: "1px solid var(--border, #333)" }}>
+        <div className="field" style={{ marginTop: 8, padding: "8px 0", borderTop: "1px solid var(--border)" }}>
           <span className="term-note" style={{ display: "block", marginBottom: 6 }}>
             Did you click Share in the Instagram tab?
           </span>

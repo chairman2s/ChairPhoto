@@ -54,7 +54,12 @@ export function Inspector({ tab, onTab, onHide, photo, children, quickTags }: In
             title={`${label.name} label`}
           />
         )}
-        <button className="insp-hide" onClick={onHide} title="Hide the inspector">
+        <button
+          className="insp-hide"
+          onClick={onHide}
+          title="Hide the inspector"
+          aria-label="Hide the inspector"
+        >
           <svg
             width="14"
             height="14"

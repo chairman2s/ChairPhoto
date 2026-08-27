@@ -121,6 +121,7 @@ import {
   QuickTagGroups,
   INSPECTOR_TABS,
   railOrder,
+  useNarrow,
   type InspectorTab,
 } from "./components/shell";
 import { useAppearance } from "./theme/controller";
@@ -217,6 +218,31 @@ export default function App() {
   const [rightHidden, setRightHidden] = useState(
     () => localStorage.getItem("panel.rightHidden") === "1",
   );
+  // ≤1024px: the side columns stop fitting next to the grid, so App switches them from
+  // persistent grid tracks to transient overlays (see .body's inline style below and the
+  // "Shell: narrow overlays" block in App.css). Open/closed state is intentionally NOT
+  // persisted — narrow is a transient window shape, not a layout preference, so shrinking
+  // the window must never clobber leftHidden/rightHidden above, and every narrow session
+  // starts closed.
+  const narrow = useNarrow();
+  const [overlayLeft, setOverlayLeft] = useState(false);
+  const [overlayRight, setOverlayRight] = useState(false);
+  useEffect(() => {
+    if (!narrow) {
+      setOverlayLeft(false);
+      setOverlayRight(false);
+    }
+  }, [narrow]);
+  // The `[`/`]` shortcuts and the View menu's checkboxes both call these — narrow, they
+  // toggle the transient overlay instead of the persisted panel-hidden state.
+  const toggleLeftPanel = useCallback(() => {
+    if (narrow) setOverlayLeft((v) => !v);
+    else setLeftHidden((v) => !v);
+  }, [narrow]);
+  const toggleRightPanel = useCallback(() => {
+    if (narrow) setOverlayRight((v) => !v);
+    else setRightHidden((v) => !v);
+  }, [narrow]);
   // The docked inspector's active tab (details / tags / versions / publish), persisted
   // like the panel widths above. Validated against the tab whitelist so a stale or
   // hand-edited localStorage value can never select a tab that doesn't exist.
@@ -1224,14 +1250,15 @@ export default function App() {
 
       // Panel visibility: `[` the tags/collections panel, `]` the inspector. The same
       // toggles as More ⋯ → View, which stay; these work in Compare too — the panels
-      // frame every Library surface.
+      // frame every Library surface. Narrow, both remap to the transient overlay instead
+      // of the persisted hidden state (see toggleLeftPanel/toggleRightPanel above).
       if (key === "[") {
-        setLeftHidden((v) => !v);
+        toggleLeftPanel();
         e.preventDefault();
         return;
       }
       if (key === "]") {
-        setRightHidden((v) => !v);
+        toggleRightPanel();
         e.preventDefault();
         return;
       }
@@ -1332,6 +1359,8 @@ export default function App() {
     refresh,
     activeView,
     inDevelop,
+    toggleLeftPanel,
+    toggleRightPanel,
     // Compare's branch reads all of these; without them the listener would keep acting on
     // the pane list and focus it was created with — rating the wrong frame after a step.
     inCompare,
@@ -1376,6 +1405,118 @@ export default function App() {
           }
         : null;
 
+  // Hoisted so the narrow-overlay and desktop-column renders of .leftcol (below) can
+  // share one element instead of two copies of the same prop block.
+  const collectionBrowserPanel = (
+    <CollectionBrowser
+      isAllScope={
+        scope.tagId == null &&
+        scope.albumId == null &&
+        scope.batchId == null &&
+        scope.smartAlbumId == null
+      }
+      onSelectAll={library.clearScope}
+      trashCount={trashCount}
+      onOpenTrash={() => setShowTrash(true)}
+      tagPanel={{
+        tags,
+        activeTagId: scope.tagId,
+        onSelectTag: library.selectTag,
+        onEditTag: setEditingTag,
+        onMoveTag: (tagId, newParentId) =>
+          moveTag(tagId, newParentId)
+            .then(refresh)
+            .catch((e) => setStatus(`Move failed: ${e}`)),
+        onSetPrivate: (tagId, isPrivate, recursive) =>
+          setTagPrivate(tagId, isPrivate, recursive)
+            .then((n) => {
+              setStatus(
+                `${n} tag${n === 1 ? "" : "s"} marked ${isPrivate ? "private" : "public"}.`,
+              );
+              return refresh();
+            })
+            .catch((e) => setStatus(`Privacy change failed: ${e}`)),
+        onTagsChanged: refresh,
+        selectedPhotoIds: selection.ids,
+        onStatus: setStatus,
+      }}
+      albumsPanel={{
+        activeAlbumId: scope.albumId,
+        onSelectAlbum: library.selectAlbum,
+        selectionCount: selection.ids.length,
+        onAddSelection: addSelectionToAlbum,
+        reloadKey: albumsKey,
+      }}
+      smartAlbumsPanel={{
+        activeSmartAlbumId: scope.smartAlbumId,
+        onSelectSmartAlbum: library.selectSmartAlbum,
+        // The panel owns the SmartAlbumEditor modal; this just selects the album
+        // being edited so the grid previews its rule.
+        onEditRule: (album) => library.selectSmartAlbum(album.id),
+        reloadKey: smartAlbumsKey,
+      }}
+      batchesPanel={{
+        activeBatchId: scope.batchId,
+        onSelectBatch: library.selectBatch,
+        onExportBatch: setBundleExportBatch,
+        reloadKey: batchesKey,
+      }}
+    />
+  );
+
+  // Hoisted for the same reason as collectionBrowserPanel above — one element shared by
+  // .rightcol's narrow-overlay and desktop-column renders. `onHide` closes the transient
+  // overlay when narrow, rather than setting the persisted rightHidden a desktop session
+  // would otherwise lose.
+  const inspectorPanel = (
+    <Inspector
+      tab={inspectorTab}
+      onTab={setInspectorTab}
+      onHide={() => (narrow ? setOverlayRight(false) : setRightHidden(true))}
+      photo={shellPhoto}
+      quickTags={
+        <QuickTagGroups
+          reloadKey={groupsKey}
+          selectionCount={selection.ids.length}
+          onAssign={assignToSelection}
+          onManage={() => setShowGroups(true)}
+        />
+      }
+    >
+      <PhotoInspector
+        tab={inspectorTab}
+        photo={shellPhoto}
+        onChanged={() => {
+          refresh();
+          refreshPending();
+          setGroupsKey((k) => k + 1); // inspector tagging updates "Recently used"
+        }}
+        allTags={tags}
+        status={shellPhoto ? statuses.get(shellPhoto.id) ?? null : null}
+        // `activeVersion` belongs to the selected photo; while Compare is showing a
+        // different frame there is no active version to speak of, and passing one
+        // would attribute another photo's edit to this one.
+        activeVersionId={shellPhoto?.id === selection.activeId ? activeVersion?.id ?? null : null}
+        onSelectVersion={setActiveVersion}
+        canEditVersions={canEdit}
+        onEditVersion={(v) => {
+          setActiveVersion(v);
+          setDevelop(true);
+        }}
+        clipboardCount={tagClipboard.length}
+        selectionCount={selection.ids.length}
+        onCopyTags={copyTags}
+        onPasteTags={pasteTagsToSelection}
+        onAssignTag={assignToSelection}
+        onRemoveTag={removeFromSelection}
+        onRotate={rotateSelected}
+        onViewPhoto={viewPhotoInLoupe}
+        // Same gate the Bench's Publish button uses: an active grid selection.
+        onPublish={selection.activeId != null ? () => setShowPublish(true) : undefined}
+      />
+    </Inspector>
+  );
+
   return (
     <div className="app">
       <Splash stage={bootStage} />
@@ -1410,18 +1551,25 @@ export default function App() {
           isModalAction(action) ? setModalAction(action) : activateToolbarAction(action.id)
         }
         onOpenPrefs={() => setShowPrefs(true)}
-        leftHidden={leftHidden}
-        onToggleLeft={() => setLeftHidden((v) => !v)}
-        rightHidden={rightHidden}
-        onToggleRight={() => setRightHidden((v) => !v)}
+        // Narrow, the View menu's checkboxes track the transient overlay instead of the
+        // persisted hidden state — negated because TitleBar always renders `checked={!x}`.
+        leftHidden={narrow ? !overlayLeft : leftHidden}
+        onToggleLeft={toggleLeftPanel}
+        rightHidden={narrow ? !overlayRight : rightHidden}
+        onToggleRight={toggleRightPanel}
       />
 
       <div
         className="body"
         style={{
-          gridTemplateColumns: `52px ${leftHidden ? 0 : leftW}px 1fr ${
-            rightHidden ? 0 : rightW
-          }px`,
+          // Narrow: both side tracks collapse to 0 unconditionally — leftHidden/
+          // rightHidden stop driving the grid template at all, so the desktop prefs
+          // they hold survive a narrow session untouched (the panels themselves move to
+          // overlays below; see the leftcol/rightcol rendering and App.css's "Shell:
+          // narrow overlays" block).
+          gridTemplateColumns: narrow
+            ? `52px 0 1fr 0`
+            : `52px ${leftHidden ? 0 : leftW}px 1fr ${rightHidden ? 0 : rightW}px`,
         }}
       >
         <IconRail
@@ -1443,68 +1591,25 @@ export default function App() {
           }}
           onOpenPrefs={() => setShowPrefs(true)}
         />
-        {!leftHidden && (
-        <div className="leftcol">
-          <div
-            className="col-resizer col-resizer-right"
-            onMouseDown={startResize("left")}
-            title="Drag to resize"
-          />
-          <CollectionBrowser
-            isAllScope={
-              scope.tagId == null &&
-              scope.albumId == null &&
-              scope.batchId == null &&
-              scope.smartAlbumId == null
-            }
-            onSelectAll={library.clearScope}
-            trashCount={trashCount}
-            onOpenTrash={() => setShowTrash(true)}
-            tagPanel={{
-              tags,
-              activeTagId: scope.tagId,
-              onSelectTag: library.selectTag,
-              onEditTag: setEditingTag,
-              onMoveTag: (tagId, newParentId) =>
-                moveTag(tagId, newParentId)
-                  .then(refresh)
-                  .catch((e) => setStatus(`Move failed: ${e}`)),
-              onSetPrivate: (tagId, isPrivate, recursive) =>
-                setTagPrivate(tagId, isPrivate, recursive)
-                  .then((n) => {
-                    setStatus(
-                      `${n} tag${n === 1 ? "" : "s"} marked ${isPrivate ? "private" : "public"}.`,
-                    );
-                    return refresh();
-                  })
-                  .catch((e) => setStatus(`Privacy change failed: ${e}`)),
-              onTagsChanged: refresh,
-              selectedPhotoIds: selection.ids,
-              onStatus: setStatus,
-            }}
-            albumsPanel={{
-              activeAlbumId: scope.albumId,
-              onSelectAlbum: library.selectAlbum,
-              selectionCount: selection.ids.length,
-              onAddSelection: addSelectionToAlbum,
-              reloadKey: albumsKey,
-            }}
-            smartAlbumsPanel={{
-              activeSmartAlbumId: scope.smartAlbumId,
-              onSelectSmartAlbum: library.selectSmartAlbum,
-              // The panel owns the SmartAlbumEditor modal; this just selects the album
-              // being edited so the grid previews its rule.
-              onEditRule: (album) => library.selectSmartAlbum(album.id),
-              reloadKey: smartAlbumsKey,
-            }}
-            batchesPanel={{
-              activeBatchId: scope.batchId,
-              onSelectBatch: library.selectBatch,
-              onExportBatch: setBundleExportBatch,
-              reloadKey: batchesKey,
-            }}
-          />
-        </div>
+        {narrow ? (
+          overlayLeft && (
+            <div className="overlay-scrim" onClick={() => setOverlayLeft(false)}>
+              <div className="leftcol overlay" onClick={(e) => e.stopPropagation()}>
+                {collectionBrowserPanel}
+              </div>
+            </div>
+          )
+        ) : (
+          !leftHidden && (
+            <div className="leftcol">
+              <div
+                className="col-resizer col-resizer-right"
+                onMouseDown={startResize("left")}
+                title="Drag to resize"
+              />
+              {collectionBrowserPanel}
+            </div>
+          )
         )}
         <main className={`grid-wrap ${inDevelop ? "develop-wrap" : ""}`}>
           <div className="stage">
@@ -1755,63 +1860,27 @@ export default function App() {
             />
           )}
         </main>
-        {!inDevelop && !rightHidden && (
-        <div className="rightcol">
-          <div
-            className="col-resizer col-resizer-left"
-            onMouseDown={startResize("right")}
-            title="Drag to resize"
-          />
-          <Inspector
-            tab={inspectorTab}
-            onTab={setInspectorTab}
-            onHide={() => setRightHidden(true)}
-            photo={shellPhoto}
-            quickTags={
-              <QuickTagGroups
-                reloadKey={groupsKey}
-                selectionCount={selection.ids.length}
-                onAssign={assignToSelection}
-                onManage={() => setShowGroups(true)}
-              />
-            }
-          >
-            <PhotoInspector
-              tab={inspectorTab}
-              photo={shellPhoto}
-              onChanged={() => {
-                refresh();
-                refreshPending();
-                setGroupsKey((k) => k + 1); // inspector tagging updates "Recently used"
-              }}
-              allTags={tags}
-              status={shellPhoto ? statuses.get(shellPhoto.id) ?? null : null}
-              // `activeVersion` belongs to the selected photo; while Compare is showing a
-              // different frame there is no active version to speak of, and passing one
-              // would attribute another photo's edit to this one.
-              activeVersionId={
-                shellPhoto?.id === selection.activeId ? activeVersion?.id ?? null : null
-              }
-              onSelectVersion={setActiveVersion}
-              canEditVersions={canEdit}
-              onEditVersion={(v) => {
-                setActiveVersion(v);
-                setDevelop(true);
-              }}
-              clipboardCount={tagClipboard.length}
-              selectionCount={selection.ids.length}
-              onCopyTags={copyTags}
-              onPasteTags={pasteTagsToSelection}
-              onAssignTag={assignToSelection}
-              onRemoveTag={removeFromSelection}
-              onRotate={rotateSelected}
-              onViewPhoto={viewPhotoInLoupe}
-              // Same gate the Bench's Publish button uses: an active grid selection.
-              onPublish={selection.activeId != null ? () => setShowPublish(true) : undefined}
-            />
-          </Inspector>
-        </div>
-        )}
+        {!inDevelop &&
+          (narrow ? (
+            overlayRight && (
+              <div className="overlay-scrim" onClick={() => setOverlayRight(false)}>
+                <div className="rightcol overlay" onClick={(e) => e.stopPropagation()}>
+                  {inspectorPanel}
+                </div>
+              </div>
+            )
+          ) : (
+            !rightHidden && (
+              <div className="rightcol">
+                <div
+                  className="col-resizer col-resizer-left"
+                  onMouseDown={startResize("right")}
+                  title="Drag to resize"
+                />
+                {inspectorPanel}
+              </div>
+            )
+          ))}
       </div>
 
       {editingTag && (

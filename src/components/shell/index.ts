@@ -24,3 +24,4 @@ export {
   type QuickTagGroupsProps,
 } from "./Inspector";
 export { railOrder } from "./railOrder";
+export { useNarrow } from "./useNarrow";

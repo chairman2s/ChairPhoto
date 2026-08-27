@@ -85,17 +85,42 @@ describe(".body columns", () => {
   it("still declares four tracks, which the placements above index into", () => {
     expect(ruleBody(".body")).toMatch(/grid-template-columns:\s*52px\s+210px\s+1fr\s+316px;/);
     // The inline override that collapses a hidden panel's track — same four tracks, rail
-    // first and constant.
+    // first and constant. Narrow (≤1024px) branches to a separate literal (checked below)
+    // instead of computing leftW/rightW at all, so this only has to match the desktop
+    // (`narrow ? … : `) branch.
     expect(APP_TSX).toMatch(
-      /gridTemplateColumns:\s*`52px \$\{[^`]*\}px 1fr \$\{[\s\S]*?\}px`/,
+      /gridTemplateColumns:\s*narrow\s*\?\s*`52px 0 1fr 0`\s*:\s*`52px \$\{[^`]*\}px 1fr \$\{[\s\S]*?\}px`/,
     );
   });
 
-  it("still renders the side columns conditionally, which is what makes placement load-bearing", () => {
+  it("collapses both side tracks to a fixed literal when narrow, never computed from leftW/rightW", () => {
+    // ≤1024px: the side columns move to overlays (below) and the grid template stops
+    // reading leftW/rightW/leftHidden/rightHidden altogether — this exact literal is what
+    // proves it, since a computed narrow fallback could silently reintroduce a nonzero
+    // track and the horizontal scroll narrow exists to rule out.
+    expect(APP_TSX).toMatch(/`52px 0 1fr 0`/);
+  });
+
+  it("never persists the narrow overlay's open/closed state — it must reset every session", () => {
+    // overlayLeft/overlayRight are deliberately NOT in the localStorage.setItem effect
+    // that persists leftW/rightW/leftHidden/rightHidden/thumbSize/inspectorTab. Grep-level
+    // on purpose: a `localStorage.setItem("panel.overlayLeft", …)` slipped in anywhere
+    // would let a narrow session's open panel outlive the window it was opened in.
+    expect(APP_TSX).not.toMatch(/localStorage\.setItem\([^)]*overlay/i);
+  });
+
+  it("still renders the side columns conditionally in both layouts, which is what makes placement load-bearing", () => {
     // If these ever become unconditional, the bug's trigger is gone — but so is the reason
     // this test exists, and that should be a deliberate edit rather than a silent one.
-    expect(APP_TSX).toMatch(/\{!leftHidden && \(/);
-    expect(APP_TSX).toMatch(/\{!inDevelop && !rightHidden && \(/);
+    // Desktop: leftHidden/rightHidden gate rendering directly, as before narrow existed.
+    expect(APP_TSX).toMatch(/!leftHidden && \(/);
+    expect(APP_TSX).toMatch(/\{!inDevelop &&/);
+    expect(APP_TSX).toMatch(/!rightHidden && \(/);
+    // Narrow: the transient overlay state gates rendering the same way — narrow adds a
+    // second way to trigger #71's failure mode if either of these ever stops being
+    // conditional.
+    expect(APP_TSX).toMatch(/overlayLeft && \(/);
+    expect(APP_TSX).toMatch(/overlayRight && \(/);
   });
 
   it("renders the rail unconditionally, unlike the panels either side of it", () => {

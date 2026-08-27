@@ -4639,3 +4639,40 @@ body {
 .ins-publish {
   margin-top: 10px;
 }
+
+/* ── Shell: narrow overlays ── */
+/* ≤1024px (App.tsx's useNarrow): .body's inline gridTemplateColumns forces both side
+   tracks to 0 unconditionally, so the rail + grid never fight two docked columns for a
+   viewport too narrow to hold them (no page-level horizontal scroll, by construction).
+   .leftcol/.rightcol don't disappear — they render the same children, still (see
+   App.css's ".leftcol"/".rightcol" comments above) inside .brow/.insp's own panel
+   background and scroll — but as a fixed overlay over the rail + grid instead of a grid
+   track, toggled by App's own transient overlayLeft/overlayRight state rather than the
+   persisted leftHidden/rightHidden a desktop session left behind (so narrowing the
+   window can never show or hide a panel the user didn't just ask for, and widening back
+   out always starts closed). The scrim sits one below the shell's own menus
+   (.menu-backdrop is 1001) so an open More ⋯ menu still paints over an open panel. */
+.overlay-scrim {
+  position: fixed;
+  inset: 0;
+  z-index: 999;
+  background: var(--scrim);
+}
+.leftcol.overlay,
+.rightcol.overlay {
+  position: fixed;
+  top: 46px;
+  bottom: 0;
+  width: var(--overlay-w, 280px);
+  z-index: 1000;
+  background: var(--panel);
+  box-shadow: var(--shadow-pop);
+}
+.leftcol.overlay {
+  left: 52px;
+  border-right: 1px solid var(--border);
+}
+.rightcol.overlay {
+  right: 0;
+  border-left: 1px solid var(--border);
+}

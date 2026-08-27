@@ -21,6 +21,8 @@ import { IconRail, type IconRailProps } from "../IconRail";
 import { Bench, type BenchProps } from "../Bench";
 import { CommandPill, type CommandPillProps } from "../CommandPill";
 import { CollectionBrowser, type CollectionBrowserProps } from "../CollectionBrowser";
+import { Inspector, type InspectorProps } from "../Inspector";
+import { PhotoInspector } from "../../PhotoInspector";
 import { COLOR_LABELS } from "../../../modules/labels";
 import type { ImportBatch } from "../../../modules/api";
 import type { ToolbarAction, MainView, Photo } from "../../../modules/registry";
@@ -1069,6 +1071,119 @@ describe("Bench command inventory", () => {
     render(<Bench {...buildBenchProps()} />);
     // The path is 2026/08/_DSC8177.ARW — only the basename is shown.
     expect(screen.getByText("_DSC8177.ARW")).toBeTruthy();
+  });
+});
+
+// -- Inspector -------------------------------------------------------------------------
+// The docked inspector column (shell/Inspector.tsx) replaced the plain PhotoInspector +
+// bottom QuickTagBar stack in `.rightcol`: a header (filename + label swatch + hide
+// button) and a four-tab row now stand between the user and the tab content. Same
+// preservation intent, same table style, own inventory. The tab content's own commands
+// keep their coverage elsewhere (the Bench/keyboard own marking; the panels their
+// suites) — the new chrome here is the tab row and the hide button, plus the publish
+// tab's Publish… entry point pinned right after.
+
+function buildInspectorProps(): InspectorProps {
+  return {
+    tab: "details",
+    onTab: vi.fn(),
+    onHide: vi.fn(),
+    photo: benchPhoto(),
+    children: <div>inspector-children-stub</div>,
+    quickTags: null,
+  };
+}
+
+interface InspectorCase {
+  name: string;
+  run: () => void;
+  spy: (props: InspectorProps) => Mock;
+  expectCalledWith?: unknown[];
+}
+
+const inspectorCases: InspectorCase[] = [
+  ...(["details", "tags", "versions", "publish"] as const).map(
+    (t): InspectorCase => ({
+      name: `tab: ${t}`,
+      run: () => fireEvent.click(screen.getByRole("tab", { name: t })),
+      spy: (p) => p.onTab as unknown as Mock,
+      expectCalledWith: [t],
+    }),
+  ),
+  {
+    name: "hide the inspector",
+    run: () => fireEvent.click(screen.getByRole("button", { name: "Hide the inspector" })),
+    spy: (p) => p.onHide as unknown as Mock,
+  },
+];
+
+describe("Inspector command inventory", () => {
+  it.each(inspectorCases)(
+    "$name fires its callback exactly once",
+    ({ run, spy, expectCalledWith }) => {
+      const props = buildInspectorProps();
+      render(<Inspector {...props} />);
+
+      run();
+
+      const mock = spy(props);
+      expect(mock).toHaveBeenCalledTimes(1);
+      if (expectCalledWith) {
+        expect(mock).toHaveBeenCalledWith(...expectCalledWith);
+      }
+    },
+  );
+
+  it("covers every affordance the inspector shell renders", () => {
+    expect(inspectorCases.length).toBe(5);
+  });
+});
+
+// The publish tab's "Publish…" button lives in PhotoInspector (the tab content), wired
+// through the optional onPublish prop — App passes it exactly when the Bench's canPublish
+// gate (an active grid selection) is open, so an absent prop renders it disabled. The
+// file-wide invoke stub above lets the tab's PublishedPanel mount against an empty
+// catalog.
+
+function buildPhotoInspectorProps() {
+  return {
+    tab: "publish" as const,
+    photo: benchPhoto(),
+    onChanged: vi.fn(),
+    allTags: [],
+    status: null,
+    activeVersionId: null,
+    onSelectVersion: vi.fn(),
+    canEditVersions: false,
+    onEditVersion: vi.fn(),
+    clipboardCount: 0,
+    selectionCount: 1,
+    onCopyTags: vi.fn(),
+    onPasteTags: vi.fn(),
+    onAssignTag: vi.fn(),
+    onRemoveTag: vi.fn(),
+    onRotate: vi.fn(),
+    onViewPhoto: vi.fn(),
+  };
+}
+
+describe("PhotoInspector publish entry point", () => {
+  it("the publish tab's Publish… button fires onPublish exactly once", async () => {
+    const onPublish = vi.fn();
+    render(<PhotoInspector {...buildPhotoInspectorProps()} onPublish={onPublish} />);
+    // Let the panel's stubbed fetches settle (empty catalog → the empty state).
+    await screen.findByText("Not published yet");
+
+    fireEvent.click(screen.getByRole("button", { name: "Publish…" }));
+    expect(onPublish).toHaveBeenCalledTimes(1);
+  });
+
+  it("renders Publish… disabled when onPublish is absent (canPublish gate closed)", async () => {
+    render(<PhotoInspector {...buildPhotoInspectorProps()} />);
+    await screen.findByText("Not published yet");
+
+    const btn = screen.getByRole("button", { name: "Publish…" }) as HTMLButtonElement;
+    expect(btn.disabled).toBe(true);
   });
 });
 

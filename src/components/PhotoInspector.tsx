@@ -1,5 +1,5 @@
 import { type ReactNode, useEffect, useState, useSyncExternalStore } from "react";
-import type { Photo, Publication, Tag } from "../modules/registry";
+import type { Photo, Tag } from "../modules/registry";
 import {
   AvailableEditor,
   availableEditors,
@@ -13,11 +13,9 @@ import {
   getPhotoTags,
   getSetting,
   importDeveloped,
-  listPublications,
   onRapidrawProgress,
   rapidrawAvailable,
   listStackChildren,
-  listVersions,
   offloadPhoto,
   restorePhoto,
   setLabel,
@@ -29,6 +27,7 @@ import {
   TagWithCount,
   unstackPhoto,
 } from "../modules/api";
+import type { InspectorTab } from "./shell/Inspector";
 import { COLOR_LABELS } from "../modules/labels";
 import { convertFileSrc } from "@tauri-apps/api/core";
 
@@ -410,11 +409,23 @@ function DevelopSection({ photo, onChanged }: { photo: Photo; onChanged: () => v
   );
 }
 
-// Right sidebar: culling controls and tag assignment for the selected photo.
+// The docked inspector's tab content (the shell — header, tab row, hide button — is
+// components/shell/Inspector.tsx; App renders this inside it with the same `tab`).
 // Calls back to the parent after any catalog change so the grid can refresh.
-// Two zones: a primary zone (rating / pick / colour label / tags — always visible)
-// and a collapsed accordion of secondary sections beneath it.
+//
+//   details  — EXIF line, rating / pick / colour label, culling signals (open), the
+//              stack, and the secondary folds (Orientation / Edit in / Storage /
+//              IPTC / Metadata).
+//   tags     — assigned chips + autocomplete + copy/paste + nearby suggestions, plus
+//              the inspector-slot module panels (AI tags, faces, …).
+//   versions — the Versions panel, open.
+//   publish  — the Published-to panel, open, plus the Publish… entry point.
+//
+// HARD CONSTRAINT (React hook order): every hook below stays unconditional at the top
+// of the component — only the *returned JSX* branches by `tab`. Moving a hook into a
+// tab branch would change the hook count between renders and corrupt all state.
 export function PhotoInspector({
+  tab,
   photo,
   onChanged,
   allTags,
@@ -431,9 +442,15 @@ export function PhotoInspector({
   onRemoveTag,
   onRotate,
   onViewPhoto,
+  onPublish,
 }: {
+  /** Which tab's content to render (the shell Inspector shows the matching tab row). */
+  tab: InspectorTab;
   photo: Photo | null;
   onChanged: () => void;
+  /** Open the Publish dialog (publish tab). Absent = publishing unavailable right now
+   *  (no active selection) — the button renders disabled, same gate the Bench uses. */
+  onPublish?: () => void;
   /** Non-destructively rotate this photo by `delta` degrees (±90 / 180). */
   onRotate: (photoId: number, delta: number) => void;
   /** Open an off-grid photo (a stacked child) in the loupe. */
@@ -467,8 +484,6 @@ export function PhotoInspector({
   const [nearby, setNearby] = useState<TagWithCount[]>([]);
   const [windowSec, setWindowSec] = useState(120);
   const [storageMsg, setStorageMsg] = useState("");
-  const [versionCount, setVersionCount] = useState(0);
-  const [publications, setPublications] = useState<Publication[]>([]);
   useHostContributions(); // re-render when modules contribute/remove inspector panels
 
   // Load the persisted time window once.
@@ -493,25 +508,6 @@ export function PhotoInspector({
     suggestTagsByTime(photo.id, windowSec).then(setNearby).catch(() => setNearby([]));
   }, [photo, windowSec]);
 
-  // Version / publication counts for the collapsed accordion-row summaries.
-  useEffect(() => {
-    let alive = true;
-    if (!photo) {
-      setVersionCount(0);
-      setPublications([]);
-      return;
-    }
-    listVersions(photo.id)
-      .then((vs) => alive && setVersionCount(vs.length))
-      .catch(() => alive && setVersionCount(0));
-    listPublications(photo.id)
-      .then((ps) => alive && setPublications(ps))
-      .catch(() => alive && setPublications([]));
-    return () => {
-      alive = false;
-    };
-  }, [photo]);
-
   const changeWindow = (secs: number) => {
     setWindowSec(secs);
     setSetting("nearby_window_seconds", String(secs)).catch(() => {});
@@ -519,9 +515,9 @@ export function PhotoInspector({
 
   if (!photo) {
     return (
-      <aside className="panel inspector">
+      <div className="inspector">
         <div className="panel-empty">Select a photo</div>
-      </aside>
+      </div>
     );
   }
 
@@ -630,346 +626,360 @@ export function PhotoInspector({
     .join(" · ");
 
   const storageMeta = status ? STORAGE_META[status] : null;
-  const platforms = [...new Set(publications.map((p) => p.platform))]
-    .map((p) => p.charAt(0).toUpperCase() + p.slice(1))
-    .join(", ");
 
   return (
-    <aside className="panel inspector">
-      <div className="inspector-header">
-        <div className="inspector-filename" title={photo.path}>
-          {photo.path.split("/").pop()}
-        </div>
-        {exifLine && (
-          <div className="inspector-exif" title={exifLine}>
-            {exifLine}
-          </div>
-        )}
-      </div>
-
-      <div className="ins-primary">
-        <div className="ins-block">
-          <div className="ins-label">Rating</div>
-          <div className="stars">
-            {[1, 2, 3, 4, 5].map((n) => (
-              <button
-                key={n}
-                className={`star ${n <= photo.rating ? "star-on" : ""}`}
-                onClick={() => setRating(photo.id, n === photo.rating ? 0 : n).then(onChanged)}
-              >
-                ★
-              </button>
-            ))}
-          </div>
-        </div>
-
-        <div className="ins-block">
-          <div className="ins-label">Pick</div>
-          <div className="pick-seg">
-            {PICKS.map((p) => (
-              <button
-                key={p.key}
-                className={`pick-btn pick-${p.key} ${photo.pickState === p.key ? "pick-on" : ""}`}
-                onClick={() => setPickState(photo.id, p.key).then(onChanged)}
-              >
-                {p.label}
-              </button>
-            ))}
-          </div>
-        </div>
-
-        <div className="ins-block">
-          <div className="ins-label">Color label</div>
-          <div className="label-swatches">
-            {LABELS.map((l) => (
-              <button
-                key={l.name}
-                className={`swatch ${photo.label === l.name ? "swatch-on" : ""}`}
-                style={{ background: l.color }}
-                title={l.name}
-                onClick={() =>
-                  setLabel(photo.id, photo.label === l.name ? "" : l.name).then(onChanged)
-                }
-              />
-            ))}
-            <button
-              className="swatch swatch-none"
-              title="Clear label"
-              onClick={() => photo.label && setLabel(photo.id, "").then(onChanged)}
-            />
-          </div>
-        </div>
-
-        <div className="ins-block">
-          <div className="ins-label">Tags</div>
-          <div className="tag-list">
-            {tags.map((t) => (
-              <span key={t.id} className="assigned-tag" title={t.fullPath}>
-                {t.name}
-                <button
-                  className="tag-remove"
-                  onClick={() =>
-                    // Remove from the whole selection, not just the active photo, then
-                    // refresh this panel's list (shows the active photo's tags).
-                    Promise.resolve(onRemoveTag(t.id)).then(() => {
-                      refreshTags();
-                      onChanged();
-                    })
-                  }
-                >
-                  ×
-                </button>
-              </span>
-            ))}
-            {tags.length === 0 && <span className="panel-empty">none</span>}
-          </div>
-          <div className="row tag-copypaste">
-            <button
-              className="chip"
-              onClick={() => onCopyTags(tags.map((t) => t.id))}
-              disabled={tags.length === 0}
-              title="Copy this photo's tags"
-            >
-              Copy tags
-            </button>
-            <button
-              className="chip"
-              onClick={onPasteTags}
-              disabled={clipboardCount === 0}
-              title={
-                clipboardCount === 0
-                  ? "Copy tags from a photo first"
-                  : `Paste ${clipboardCount} tag(s) onto ${selectionCount > 1 ? `${selectionCount} selected` : "this photo"}`
-              }
-            >
-              Paste{clipboardCount > 0 ? ` ${clipboardCount}` : ""}
-              {selectionCount > 1 ? ` → ${selectionCount}` : ""}
-            </button>
-          </div>
-          <div className="tag-add">
-            <div className="row">
-              <input
-                className="tag-input"
-                placeholder="Add tag…"
-                value={newTag}
-                onChange={(e) => {
-                  setNewTag(e.target.value);
-                  setHighlight(0);
-                }}
-                onKeyDown={(e) => {
-                  if (e.key === "ArrowDown" && suggestions.length) {
-                    e.preventDefault();
-                    setHighlight((h) => Math.min(h + 1, suggestions.length - 1));
-                  } else if (e.key === "ArrowUp" && suggestions.length) {
-                    e.preventDefault();
-                    setHighlight((h) => Math.max(h - 1, 0));
-                  } else if (e.key === "Escape") {
-                    setNewTag("");
-                  } else if (e.key === "Enter") {
-                    // Enter picks the highlighted suggestion; with none, creates the
-                    // typed path (existing behaviour).
-                    if (suggestions.length) pickSuggestion(suggestions[clampedHighlight].id);
-                    else addTag();
-                  }
-                }}
-              />
-              <button
-                className="chip"
-                onClick={() =>
-                  suggestions.length
-                    ? pickSuggestion(suggestions[clampedHighlight].id)
-                    : addTag()
-                }
-              >
-                +
-              </button>
-            </div>
-            {suggestions.length > 0 && (
-              <ul className="tag-suggest">
-                {suggestions.map((s, i) => {
-                  const cut = s.fullPath.length - s.name.length;
-                  return (
-                    <li key={s.id}>
-                      <button
-                        className={`tag-suggest-item ${i === clampedHighlight ? "tag-suggest-on" : ""}`}
-                        // onMouseDown (not onClick) so it fires before the input blurs.
-                        onMouseDown={(e) => {
-                          e.preventDefault();
-                          pickSuggestion(s.id);
-                        }}
-                        onMouseEnter={() => setHighlight(i)}
-                      >
-                        <span className="tag-suggest-anc">{s.fullPath.slice(0, cut)}</span>
-                        <span className="tag-suggest-leaf">{s.name}</span>
-                      </button>
-                    </li>
-                  );
-                })}
-              </ul>
+    <div className="inspector">
+      {tab === "details" && (
+        <>
+          <div className="ins-primary">
+            {exifLine && (
+              <div className="ins-block">
+                <div className="inspector-exif" title={exifLine}>
+                  {exifLine}
+                </div>
+              </div>
             )}
-          </div>
 
-          <div className="nearby">
-            <div className="nearby-header">
-              <span className="nearby-label">From nearby photos</span>
-              <select
-                className="window-select"
-                value={windowSec}
-                onChange={(e) => changeWindow(parseInt(e.target.value, 10))}
-                title="Time window for nearby suggestions"
-              >
-                {WINDOW_OPTIONS.map((o) => (
-                  <option key={o.secs} value={o.secs}>
-                    ±{o.label}
-                  </option>
-                ))}
-              </select>
-            </div>
-            {nearby.length > 0 ? (
-              <div className="nearby-list">
-                {nearby.map((t) => (
+            <div className="ins-block">
+              <div className="ins-label">Rating</div>
+              <div className="stars">
+                {[1, 2, 3, 4, 5].map((n) => (
                   <button
-                    key={t.id}
-                    className="chip nearby-chip"
-                    title={`${t.fullPath} — on ${t.photoCount} nearby photo(s)`}
-                    onClick={() => addExisting(t.id)}
+                    key={n}
+                    className={`star ${n <= photo.rating ? "star-on" : ""}`}
+                    onClick={() => setRating(photo.id, n === photo.rating ? 0 : n).then(onChanged)}
                   >
-                    + {t.name} <span className="nearby-count">{t.photoCount}</span>
+                    ★
                   </button>
                 ))}
               </div>
-            ) : (
-              <span className="panel-empty">none in window</span>
-            )}
+            </div>
+
+            <div className="ins-block">
+              <div className="ins-label">Pick</div>
+              <div className="pick-seg">
+                {PICKS.map((p) => (
+                  <button
+                    key={p.key}
+                    className={`pick-btn pick-${p.key} ${photo.pickState === p.key ? "pick-on" : ""}`}
+                    onClick={() => setPickState(photo.id, p.key).then(onChanged)}
+                  >
+                    {p.label}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            <div className="ins-block">
+              <div className="ins-label">Color label</div>
+              <div className="label-swatches">
+                {LABELS.map((l) => (
+                  <button
+                    key={l.name}
+                    className={`swatch ${photo.label === l.name ? "swatch-on" : ""}`}
+                    style={{ background: l.color }}
+                    title={l.name}
+                    onClick={() =>
+                      setLabel(photo.id, photo.label === l.name ? "" : l.name).then(onChanged)
+                    }
+                  />
+                ))}
+                <button
+                  className="swatch swatch-none"
+                  title="Clear label"
+                  onClick={() => photo.label && setLabel(photo.id, "").then(onChanged)}
+                />
+              </div>
+            </div>
+
+            {/* C6 — the derivation behind the tile's badges, rendered open per the
+                Darkroom design (no fold). `explain_photo_signals` now fires whenever the
+                details tab shows a photo; the other tabs unmount this block, so it still
+                never fetches while off-screen. */}
+            <div className="ins-block">
+              <div className="ins-label">Culling signals</div>
+              <SignalsPanel key={photo.id} photoId={photo.id} />
+            </div>
+          </div>
+
+          <div className="ins-sections">
+            <StackSection photo={photo} onChanged={onChanged} onViewPhoto={onViewPhoto} />
+
+            <Section id="orientation" label="Orientation">
+              <div className="row">
+                <button
+                  className="chip"
+                  title="Rotate left 90° (non-destructive — the original file is never changed)"
+                  onClick={() => onRotate(photo.id, -90)}
+                >
+                  ↺ Left
+                </button>
+                <button
+                  className="chip"
+                  title="Rotate right 90° (non-destructive — the original file is never changed)"
+                  onClick={() => onRotate(photo.id, 90)}
+                >
+                  ↻ Right
+                </button>
+                <button
+                  className="chip"
+                  title="Rotate 180° (non-destructive)"
+                  onClick={() => onRotate(photo.id, 180)}
+                >
+                  180°
+                </button>
+              </div>
+            </Section>
+
+            <DevelopSection key={photo.id} photo={photo} onChanged={onChanged} />
+
+            <Section
+              id="storage"
+              label="Storage"
+              summary={
+                storageMeta && (
+                  <>
+                    <span className="sum-dot" style={{ background: storageMeta.color }} />
+                    {storageMeta.label}
+                  </>
+                )
+              }
+            >
+              <div className="row">
+                {status === "localOnly" && (
+                  <button className="chip" onClick={onBackup}>
+                    Back up
+                  </button>
+                )}
+                {status === "backedUp" && (
+                  <button className="chip" onClick={onOffload}>
+                    Offload local
+                  </button>
+                )}
+                {(status === "archived" || status === "offline") && (
+                  <button className="chip" onClick={onRestore}>
+                    Restore local
+                  </button>
+                )}
+                <span className="iptc-status">{storageMsg || status || ""}</span>
+              </div>
+            </Section>
+
+            <Section id="iptc" label="IPTC">
+              <IptcPanel photoId={photo.id} />
+            </Section>
+
+            <Section id="metadata" label="Metadata">
+              <MetadataPanel photoId={photo.id} />
+            </Section>
+          </div>
+        </>
+      )}
+
+      {tab === "tags" && (
+        <div className="ins-primary">
+          <div className="ins-block">
+            <div className="ins-label">Tags</div>
+            <div className="tag-list">
+              {tags.map((t) => (
+                <span key={t.id} className="assigned-tag" title={t.fullPath}>
+                  {t.name}
+                  <button
+                    className="tag-remove"
+                    onClick={() =>
+                      // Remove from the whole selection, not just the active photo, then
+                      // refresh this panel's list (shows the active photo's tags).
+                      Promise.resolve(onRemoveTag(t.id)).then(() => {
+                        refreshTags();
+                        onChanged();
+                      })
+                    }
+                  >
+                    ×
+                  </button>
+                </span>
+              ))}
+              {tags.length === 0 && <span className="panel-empty">none</span>}
+            </div>
+            <div className="row tag-copypaste">
+              <button
+                className="chip"
+                onClick={() => onCopyTags(tags.map((t) => t.id))}
+                disabled={tags.length === 0}
+                title="Copy this photo's tags"
+              >
+                Copy tags
+              </button>
+              <button
+                className="chip"
+                onClick={onPasteTags}
+                disabled={clipboardCount === 0}
+                title={
+                  clipboardCount === 0
+                    ? "Copy tags from a photo first"
+                    : `Paste ${clipboardCount} tag(s) onto ${selectionCount > 1 ? `${selectionCount} selected` : "this photo"}`
+                }
+              >
+                Paste{clipboardCount > 0 ? ` ${clipboardCount}` : ""}
+                {selectionCount > 1 ? ` → ${selectionCount}` : ""}
+              </button>
+            </div>
+            <div className="tag-add">
+              <div className="row">
+                <input
+                  className="tag-input"
+                  placeholder="Add tag…"
+                  value={newTag}
+                  onChange={(e) => {
+                    setNewTag(e.target.value);
+                    setHighlight(0);
+                  }}
+                  onKeyDown={(e) => {
+                    if (e.key === "ArrowDown" && suggestions.length) {
+                      e.preventDefault();
+                      setHighlight((h) => Math.min(h + 1, suggestions.length - 1));
+                    } else if (e.key === "ArrowUp" && suggestions.length) {
+                      e.preventDefault();
+                      setHighlight((h) => Math.max(h - 1, 0));
+                    } else if (e.key === "Escape") {
+                      setNewTag("");
+                    } else if (e.key === "Enter") {
+                      // Enter picks the highlighted suggestion; with none, creates the
+                      // typed path (existing behaviour).
+                      if (suggestions.length) pickSuggestion(suggestions[clampedHighlight].id);
+                      else addTag();
+                    }
+                  }}
+                />
+                <button
+                  className="chip"
+                  onClick={() =>
+                    suggestions.length
+                      ? pickSuggestion(suggestions[clampedHighlight].id)
+                      : addTag()
+                  }
+                >
+                  +
+                </button>
+              </div>
+              {suggestions.length > 0 && (
+                <ul className="tag-suggest">
+                  {suggestions.map((s, i) => {
+                    const cut = s.fullPath.length - s.name.length;
+                    return (
+                      <li key={s.id}>
+                        <button
+                          className={`tag-suggest-item ${i === clampedHighlight ? "tag-suggest-on" : ""}`}
+                          // onMouseDown (not onClick) so it fires before the input blurs.
+                          onMouseDown={(e) => {
+                            e.preventDefault();
+                            pickSuggestion(s.id);
+                          }}
+                          onMouseEnter={() => setHighlight(i)}
+                        >
+                          <span className="tag-suggest-anc">{s.fullPath.slice(0, cut)}</span>
+                          <span className="tag-suggest-leaf">{s.name}</span>
+                        </button>
+                      </li>
+                    );
+                  })}
+                </ul>
+              )}
+            </div>
+
+            <div className="nearby">
+              <div className="nearby-header">
+                <span className="nearby-label">From nearby photos</span>
+                <select
+                  className="window-select"
+                  value={windowSec}
+                  onChange={(e) => changeWindow(parseInt(e.target.value, 10))}
+                  title="Time window for nearby suggestions"
+                >
+                  {WINDOW_OPTIONS.map((o) => (
+                    <option key={o.secs} value={o.secs}>
+                      ±{o.label}
+                    </option>
+                  ))}
+                </select>
+              </div>
+              {nearby.length > 0 ? (
+                <div className="nearby-list">
+                  {nearby.map((t) => (
+                    <button
+                      key={t.id}
+                      className="chip nearby-chip"
+                      title={`${t.fullPath} — on ${t.photoCount} nearby photo(s)`}
+                      onClick={() => addExisting(t.id)}
+                    >
+                      + {t.name} <span className="nearby-count">{t.photoCount}</span>
+                    </button>
+                  ))}
+                </div>
+              ) : (
+                <span className="panel-empty">none in window</span>
+              )}
+            </div>
+          </div>
+
+          {/* Inspector panels contributed by enabled modules — tagging-flavoured (AI
+              tags, faces, geocode, …), so they live on the tags tab under TAGS, per the
+              redesign. */}
+          {panelsForSlot("inspector").map((panel) => (
+            <div className="ins-block" key={panel.id}>
+              <div className="ins-label">{panel.label}</div>
+              <ModuleContent view={panel} />
+            </div>
+          ))}
+        </div>
+      )}
+
+      {tab === "versions" && (
+        <div className="ins-primary">
+          <div className="ins-block">
+            <div className="ins-label">Versions</div>
+            <VersionsPanel
+              photoId={photo.id}
+              onChanged={onChanged}
+              activeVersionId={activeVersionId}
+              onSelectVersion={onSelectVersion}
+              canEdit={canEditVersions}
+              onEditVersion={onEditVersion}
+            />
           </div>
         </div>
+      )}
 
-        {/* Inspector panels contributed by enabled modules (e.g. AI tagging) — part of
-            the primary zone, per the redesign (AI TAGS sits under TAGS). */}
-        {panelsForSlot("inspector").map((panel) => (
-          <div className="ins-block" key={panel.id}>
-            <div className="ins-label">{panel.label}</div>
-            <ModuleContent view={panel} />
-          </div>
-        ))}
-      </div>
-
-      <div className="ins-sections">
-        <Section id="orientation" label="Orientation">
-          <div className="row">
-            <button
-              className="chip"
-              title="Rotate left 90° (non-destructive — the original file is never changed)"
-              onClick={() => onRotate(photo.id, -90)}
-            >
-              ↺ Left
-            </button>
-            <button
-              className="chip"
-              title="Rotate right 90° (non-destructive — the original file is never changed)"
-              onClick={() => onRotate(photo.id, 90)}
-            >
-              ↻ Right
-            </button>
-            <button
-              className="chip"
-              title="Rotate 180° (non-destructive)"
-              onClick={() => onRotate(photo.id, 180)}
-            >
-              180°
-            </button>
-          </div>
-        </Section>
-
-        <DevelopSection key={photo.id} photo={photo} onChanged={onChanged} />
-
-        {/* C6 — the derivation behind the tile's badges. The collapsed summary reads the
-            flag already on the photo row; the body's `explain_photo_signals` call only
-            fires once the section is expanded, since `Section` does not mount a closed
-            body. */}
-        <Section
-          id="signals"
-          label="Culling signals"
-          summary={
-            photo.burstFlag === "soft-in-burst"
-              ? "Soft in burst"
-              : photo.burstFlag === "sharpest-of-burst"
-                ? "Sharpest of burst"
-                : null
-          }
-        >
-          <SignalsPanel key={photo.id} photoId={photo.id} />
-        </Section>
-
-        <StackSection photo={photo} onChanged={onChanged} onViewPhoto={onViewPhoto} />
-
-        <Section
-          id="storage"
-          label="Storage"
-          summary={
-            storageMeta && (
-              <>
-                <span className="sum-dot" style={{ background: storageMeta.color }} />
-                {storageMeta.label}
-              </>
-            )
-          }
-        >
-          <div className="row">
-            {status === "localOnly" && (
-              <button className="chip" onClick={onBackup}>
-                Back up
+      {tab === "publish" && (
+        <div className="ins-primary">
+          <div className="ins-block">
+            <div className="ins-label">Published to</div>
+            <PublishedPanel
+              photoId={photo.id}
+              activeVersionId={activeVersionId}
+              onChanged={onChanged}
+            />
+            <div className="row ins-publish">
+              <button
+                className="chip"
+                disabled={!onPublish}
+                onClick={onPublish}
+                title={
+                  onPublish
+                    ? "Publish this photo to a connected platform"
+                    : "Select a photo in the grid to publish"
+                }
+              >
+                Publish…
               </button>
-            )}
-            {status === "backedUp" && (
-              <button className="chip" onClick={onOffload}>
-                Offload local
-              </button>
-            )}
-            {(status === "archived" || status === "offline") && (
-              <button className="chip" onClick={onRestore}>
-                Restore local
-              </button>
-            )}
-            <span className="iptc-status">{storageMsg || status || ""}</span>
+            </div>
           </div>
-        </Section>
-
-        <Section id="versions" label="Versions" summary={versionCount > 0 ? versionCount : null}>
-          <VersionsPanel
-            photoId={photo.id}
-            onChanged={() => {
-              listVersions(photo.id)
-                .then((vs) => setVersionCount(vs.length))
-                .catch(() => {});
-              onChanged();
-            }}
-            activeVersionId={activeVersionId}
-            onSelectVersion={onSelectVersion}
-            canEdit={canEditVersions}
-            onEditVersion={onEditVersion}
-          />
-        </Section>
-
-        <Section id="published" label="Published to" summary={platforms || null}>
-          <PublishedPanel
-            photoId={photo.id}
-            activeVersionId={activeVersionId}
-            onChanged={() => {
-              listPublications(photo.id).then(setPublications).catch(() => {});
-              onChanged();
-            }}
-          />
-        </Section>
-
-        <Section id="iptc" label="IPTC">
-          <IptcPanel photoId={photo.id} />
-        </Section>
-
-        <Section id="metadata" label="Metadata">
-          <MetadataPanel photoId={photo.id} />
-        </Section>
-      </div>
-    </aside>
+        </div>
+      )}
+    </div>
   );
 }
+
+// Exported for the collapsed-body-unmount invariant test (PhotoInspector.test.tsx). The
+// declaration above stays exactly as it was; only this named export is new.
+export { Section };

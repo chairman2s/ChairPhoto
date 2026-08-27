@@ -1332,7 +1332,8 @@ body {
   color: var(--onaccent);
 }
 
-/* Right column: inspector (scrolls) on top, quick-tag bar pinned beneath it.
+/* Right column: the docked inspector (components/shell/Inspector.tsx — header, tab row,
+   scrolling tab content; see the "Shell: inspector" block at the end of this file).
    Left side = organise/select; right side = act (rate, tag, AI, quick-tag). */
 .rightcol {
   grid-column: 4;
@@ -1386,37 +1387,6 @@ body {
 
 /* Tag Graph module styles live in src/modules/plugins/tagGraph.css (.tg-* classes). */
 
-/* Quick-tag bar */
-.quicktag {
-  border-top: 1px solid var(--border);
-  background: var(--panel);
-  padding: 6px 10px;
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-  max-height: 30vh;
-  overflow-y: auto;
-}
-.quicktag-groups {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 5px;
-  align-items: center;
-}
-.quicktag-manage {
-  margin-left: auto;
-  color: var(--dim);
-}
-.quicktag-tags {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-}
-.quicktag-tag {
-  font-size: 13px;
-  padding: 6px 12px;
-  border-radius: var(--r-pill);
-}
 /* Virtualized grid: an in-flow scroller that fills the main area; only on-screen rows are
    rendered (see CatalogGrid). The 12px gutter comes from .stage's padding. The columns
    and gap here must match the constants in that file. */
@@ -2508,20 +2478,10 @@ body {
   margin-top: 8px;
 }
 
-/* Inspector */
+/* Inspector tab content (PhotoInspector.tsx) — rendered inside the shell inspector's
+   scrolling .insp-body (see the "Shell: inspector" block at the end of this file). */
 .inspector {
-  flex: 1;
-  min-height: 0;
-}
-.inspector-header {
-  padding: 14px 14px 10px;
-}
-.inspector-filename {
-  font-size: 13px;
-  font-weight: 700;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
+  padding-top: 13px;
 }
 .inspector-exif {
   font-size: 10.5px;
@@ -4551,4 +4511,131 @@ body {
    relocate, so their own header stays visible instead (not targeted by this rule). */
 .brow-section-hide-header .panel-header {
   display: none;
+}
+
+/* ── Shell: inspector ── */
+/* src/components/shell/Inspector.tsx — the docked inspector column (see agent-notes
+   mockup Main.dc.html `.insp`): a serif filename header with the photo's colour-label
+   swatch and a hide button, a lowercase tab row (details / tags / versions / publish),
+   and a scrolling body hosting the PhotoInspector content for the active tab — plus the
+   quick-tag groups (.qtg, below) on the tags tab. */
+.insp {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  background: var(--panel);
+  overflow: hidden;
+}
+.insp-head {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 13px 14px 11px;
+}
+.insp-head h3 {
+  flex: 1;
+  min-width: 0;
+  margin: 0;
+  font-family: var(--font-display);
+  font-weight: 400;
+  font-size: 21px;
+  letter-spacing: 0.005em;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+/* The photo's colour-label dot beside the filename — stored meaning, never theme colour
+   (background set inline from COLOR_LABELS). */
+.insp-swatch {
+  flex: none;
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  box-shadow: 0 0 0 1.5px rgba(0, 0, 0, 0.5);
+}
+/* Minimal icon button (the mockup's .ib) — nothing app-wide exists to reuse yet. */
+.insp-hide {
+  flex: none;
+  width: 30px;
+  height: 30px;
+  border-radius: var(--r);
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--dim);
+  display: grid;
+  place-items: center;
+  cursor: pointer;
+}
+.insp-hide:hover {
+  background: var(--elev);
+  border-color: var(--border);
+  color: var(--txt);
+}
+.insp-tabs {
+  flex: none;
+  display: flex;
+  gap: 16px;
+  padding: 0 14px 9px;
+  border-bottom: 1px solid var(--line);
+}
+.insp-tab {
+  border: none;
+  background: none;
+  padding: 0 0 3px;
+  font-family: inherit;
+  font-size: 11px;
+  letter-spacing: 0.05em;
+  text-transform: lowercase;
+  color: var(--mute);
+  cursor: pointer;
+}
+.insp-tab:hover {
+  color: var(--dim);
+}
+.insp-tab.on {
+  color: var(--txt);
+  box-shadow: 0 2px 0 var(--accent);
+}
+/* The single scroll container: the tab's PhotoInspector content, then (tags tab) the
+   quick-tag groups. */
+.insp-body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+}
+
+/* Quick-tag groups (tags tab) — the old bottom quick-tag bar's group chips + tag
+   buttons, now under the tab content. */
+.qtg {
+  border-top: 1px solid var(--line);
+  padding: 12px 14px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.qtg-groups {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  align-items: center;
+}
+.qtg-manage {
+  margin-left: auto;
+  color: var(--dim);
+}
+.qtg-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.qtg-tag {
+  font-size: 13px;
+  padding: 6px 12px;
+  border-radius: var(--r-pill);
+}
+/* The button under the Published-to panel (publish tab). */
+.ins-publish {
+  margin-top: 10px;
 }

@@ -76,7 +76,6 @@ import { PhotoInspector } from "./components/PhotoInspector";
 import { ZoomableImage } from "./components/ZoomableImage";
 import { CompareView, MAX_PANES } from "./components/CompareView";
 import { shellTarget } from "./modules/shellTarget";
-import { QuickTagBar } from "./components/QuickTagBar";
 import { TagGroupsManager } from "./components/TagGroupsManager";
 import { broadcastPhoto, onLoupeReady, openLoupeWindow } from "./modules/loupe";
 import { prefetch, isVideoPath, videoUrl, setVideoPort } from "./modules/previewCache";
@@ -118,7 +117,11 @@ import {
   Bench,
   CommandPill,
   CollectionBrowser,
+  Inspector,
+  QuickTagGroups,
+  INSPECTOR_TABS,
   railOrder,
+  type InspectorTab,
 } from "./components/shell";
 import { useAppearance } from "./theme/controller";
 import "./App.css";
@@ -214,6 +217,13 @@ export default function App() {
   const [rightHidden, setRightHidden] = useState(
     () => localStorage.getItem("panel.rightHidden") === "1",
   );
+  // The docked inspector's active tab (details / tags / versions / publish), persisted
+  // like the panel widths above. Validated against the tab whitelist so a stale or
+  // hand-edited localStorage value can never select a tab that doesn't exist.
+  const [inspectorTab, setInspectorTab] = useState<InspectorTab>(() => {
+    const v = localStorage.getItem("panel.inspectorTab");
+    return INSPECTOR_TABS.includes(v as InspectorTab) ? (v as InspectorTab) : "details";
+  });
   // Grid tile size (px), driven by the command pill's thumbnail-size slider — same
   // persisted-to-localStorage treatment as the panel widths above. Clamped to the slider's
   // own [120, 320] range so a hand-edited or stale localStorage value can't hand CatalogGrid
@@ -228,7 +238,8 @@ export default function App() {
     localStorage.setItem("panel.leftHidden", leftHidden ? "1" : "0");
     localStorage.setItem("panel.rightHidden", rightHidden ? "1" : "0");
     localStorage.setItem("panel.thumbSize", String(thumbSize));
-  }, [leftW, rightW, leftHidden, rightHidden, thumbSize]);
+    localStorage.setItem("panel.inspectorTab", inspectorTab);
+  }, [leftW, rightW, leftHidden, rightHidden, thumbSize, inspectorTab]);
 
   // Drag a column edge to resize. `side` picks which width to adjust; the right
   // column grows when dragged left, so its delta is inverted.
@@ -1751,42 +1762,54 @@ export default function App() {
             onMouseDown={startResize("right")}
             title="Drag to resize"
           />
-          <PhotoInspector
+          <Inspector
+            tab={inspectorTab}
+            onTab={setInspectorTab}
+            onHide={() => setRightHidden(true)}
             photo={shellPhoto}
-            onChanged={() => {
-              refresh();
-              refreshPending();
-              setGroupsKey((k) => k + 1); // inspector tagging updates "Recently used"
-            }}
-            allTags={tags}
-            status={shellPhoto ? statuses.get(shellPhoto.id) ?? null : null}
-            // `activeVersion` belongs to the selected photo; while Compare is showing a
-            // different frame there is no active version to speak of, and passing one
-            // would attribute another photo's edit to this one.
-            activeVersionId={
-              shellPhoto?.id === selection.activeId ? activeVersion?.id ?? null : null
+            quickTags={
+              <QuickTagGroups
+                reloadKey={groupsKey}
+                selectionCount={selection.ids.length}
+                onAssign={assignToSelection}
+                onManage={() => setShowGroups(true)}
+              />
             }
-            onSelectVersion={setActiveVersion}
-            canEditVersions={canEdit}
-            onEditVersion={(v) => {
-              setActiveVersion(v);
-              setDevelop(true);
-            }}
-            clipboardCount={tagClipboard.length}
-            selectionCount={selection.ids.length}
-            onCopyTags={copyTags}
-            onPasteTags={pasteTagsToSelection}
-            onAssignTag={assignToSelection}
-            onRemoveTag={removeFromSelection}
-            onRotate={rotateSelected}
-            onViewPhoto={viewPhotoInLoupe}
-          />
-          <QuickTagBar
-            reloadKey={groupsKey}
-            selectionCount={selection.ids.length}
-            onAssign={assignToSelection}
-            onManage={() => setShowGroups(true)}
-          />
+          >
+            <PhotoInspector
+              tab={inspectorTab}
+              photo={shellPhoto}
+              onChanged={() => {
+                refresh();
+                refreshPending();
+                setGroupsKey((k) => k + 1); // inspector tagging updates "Recently used"
+              }}
+              allTags={tags}
+              status={shellPhoto ? statuses.get(shellPhoto.id) ?? null : null}
+              // `activeVersion` belongs to the selected photo; while Compare is showing a
+              // different frame there is no active version to speak of, and passing one
+              // would attribute another photo's edit to this one.
+              activeVersionId={
+                shellPhoto?.id === selection.activeId ? activeVersion?.id ?? null : null
+              }
+              onSelectVersion={setActiveVersion}
+              canEditVersions={canEdit}
+              onEditVersion={(v) => {
+                setActiveVersion(v);
+                setDevelop(true);
+              }}
+              clipboardCount={tagClipboard.length}
+              selectionCount={selection.ids.length}
+              onCopyTags={copyTags}
+              onPasteTags={pasteTagsToSelection}
+              onAssignTag={assignToSelection}
+              onRemoveTag={removeFromSelection}
+              onRotate={rotateSelected}
+              onViewPhoto={viewPhotoInLoupe}
+              // Same gate the Bench's Publish button uses: an active grid selection.
+              onPublish={selection.activeId != null ? () => setShowPublish(true) : undefined}
+            />
+          </Inspector>
         </div>
         )}
       </div>

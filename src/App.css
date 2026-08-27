@@ -3203,6 +3203,21 @@ body {
   font-size: 11px;
   color: var(--dim);
 }
+/* Duel: one pane per side, the champion marked; the winner state once the pool is done. */
+.compare-panes-1 { grid-template-columns: minmax(0, 1fr); }
+.compare-modes {
+  display: inline-flex;
+  gap: 4px;
+}
+.compare-pane-champion {
+  /* Green, not accent: the champion is the standing keeper, and the accent ring already
+     means "focused" one pane over. */
+  border-color: var(--ok);
+}
+.compare-champ {
+  background: color-mix(in srgb, var(--ok) 16%, transparent);
+  color: var(--ok);
+}
 /* Batch paging (pool larger than the visible panes): ‹ range › plus the key hints. */
 .compare-batch {
   display: inline-flex;

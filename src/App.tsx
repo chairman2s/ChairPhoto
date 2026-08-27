@@ -74,7 +74,8 @@ import { Splash, BOOT_STAGES } from "./components/Splash";
 import { TagEditor } from "./components/TagEditor";
 import { PhotoInspector } from "./components/PhotoInspector";
 import { ZoomableImage } from "./components/ZoomableImage";
-import { CompareView, MAX_PANES } from "./components/CompareView";
+import { CompareView, MAX_PANES, CompareMode } from "./components/CompareView";
+import { advanceDuel, DuelState, duelRound, duelTotalRounds, initialDuel } from "./modules/compareDuel";
 import { shellTarget } from "./modules/shellTarget";
 import { TagGroupsManager } from "./components/TagGroupsManager";
 import { broadcastPhoto, onLoupeReady, openLoupeWindow } from "./modules/loupe";
@@ -211,6 +212,17 @@ export default function App() {
   const [compareIds, setCompareIds] = useState<number[] | null>(null);
   const [compareStart, setCompareStart] = useState(0);
   const [compareFocusId, setCompareFocusId] = useState<number | null>(null);
+  // Duel vs grid presentation for pools larger than one screen. Persisted per machine
+  // like the other panel.* prefs; duel is the default — one ←/→ verdict per frame beats
+  // scanning batches when the pile is big.
+  const [compareMode, setCompareMode] = useState<CompareMode>(() => {
+    try {
+      return localStorage.getItem("panel.compareMode") === "grid" ? "grid" : "duel";
+    } catch {
+      return "duel";
+    }
+  });
+  const [duelState, setDuelState] = useState<DuelState>(initialDuel());
   const [cachePreviews, setCachePreviews] = useState(true);
 
   // Side-panel layout: widths (px) and hidden state, persisted to localStorage.
@@ -386,11 +398,19 @@ export default function App() {
   // looked up per render so a rating applied inside Compare shows up on its own pane; the
   // id list itself is frozen (see `compareIds`). A row that has vanished entirely — the
   // catalog switched, the photo was purged — is dropped rather than rendered blank.
-  const compareBatchIds = compareIds ? compareIds.slice(compareStart, compareStart + MAX_PANES) : [];
+  const compareBatchIds = !compareIds
+    ? []
+    : compareMode === "duel"
+      ? duelState.done
+        ? [compareIds[duelState.championIdx]]
+        : [compareIds[duelState.championIdx], compareIds[duelState.challengerIdx]]
+      : compareIds.slice(compareStart, compareStart + MAX_PANES);
   const comparePhotos = compareBatchIds
     .map((id) => photos.find((p) => p.id === id) ?? null)
     .filter((p): p is Photo => p !== null);
   const inCompare = compareIds !== null && comparePhotos.length > 0;
+  const duelChampionId =
+    compareIds && compareMode === "duel" ? compareIds[duelState.championIdx] ?? null : null;
 
   // Enter Compare on the current selection. Needs two frames to mean anything; the whole
   // selection becomes the pool, paged MAX_PANES at a time (more per screen would make each
@@ -404,9 +424,33 @@ export default function App() {
     const start = activeAt >= 0 ? Math.floor(activeAt / MAX_PANES) * MAX_PANES : 0;
     setCompareIds(ids);
     setCompareStart(start);
-    setCompareFocusId(activeAt >= 0 ? ids[activeAt] : ids[start]);
+    // A duel always starts at the top of the pool (round 1 of N-1); focus opens on the
+    // challenger — the frame being judged against the standing champion.
+    setDuelState(initialDuel());
+    setCompareFocusId(
+      compareMode === "duel" ? ids[1] : activeAt >= 0 ? ids[activeAt] : ids[start],
+    );
     setLoupeInline(false);
-  }, [selection.ids, selection.activeId]);
+  }, [selection.ids, selection.activeId, compareMode]);
+
+  // Swap presentation mid-compare: the duel restarts from the top of the pool (its
+  // judged/unjudged bookkeeping has no meaning across modes), the grid keeps its page.
+  const switchCompareMode = useCallback(
+    (m: CompareMode) => {
+      setCompareMode(m);
+      try {
+        localStorage.setItem("panel.compareMode", m);
+      } catch {
+        // Private-mode storage failures lose only the preference, never the feature.
+      }
+      if (compareIds) {
+        setDuelState(initialDuel());
+        setCompareFocusId(m === "duel" ? compareIds[1] ?? compareIds[0] : compareIds[compareStart]);
+      }
+    },
+    [compareIds, compareStart],
+  );
+
 
   // Step one batch forward/back, clamped at the pool's ends; focus lands on the new
   // batch's first frame so the culling keys always have a target.
@@ -424,6 +468,7 @@ export default function App() {
   const closeCompare = useCallback(() => {
     setCompareIds(null);
     setCompareStart(0);
+    setDuelState(initialDuel());
     setCompareFocusId(null);
   }, []);
 
@@ -1211,11 +1256,36 @@ export default function App() {
   // Reversible (U clears a pick state) and it touches no bytes — reject is a filterable
   // metadata state, not deletion. Compare stays open on the result so the outcome is
   // visible and can be undone in place rather than being an unseen side effect.
+  // One duel verdict: reject the loser, advance the challenger (a right-side win moves it
+  // to the champion slot), and on the final round pick the tournament's winner.
+  const duelVerdict = useCallback(
+    async (winner: "left" | "right") => {
+      if (!compareIds) return;
+      const result = advanceDuel(compareIds, duelState, winner);
+      if (!result) return;
+      await setPickState(result.loserId, "reject");
+      if (result.winnerId != null) await setPickState(result.winnerId, "pick");
+      setDuelState(result.next);
+      setCompareFocusId(
+        result.next.done
+          ? compareIds[result.next.championIdx] ?? null
+          : compareIds[result.next.challengerIdx] ?? null,
+      );
+      await refresh();
+    },
+    [compareIds, duelState, refresh],
+  );
+
   const keepInCompare = useCallback(
     async (keeperId: number) => {
       // Batch-scoped: the keeper's rivals are the frames on screen, not the whole pool —
       // with a 27-frame pool, "keep" must never silently reject 26 photos. After the
       // round, advance to the next batch so a big selection flows as K, K, K…
+      if (compareMode === "duel") {
+        // In a duel a "keep" is a verdict for that pane's side.
+        await duelVerdict(keeperId === duelChampionId ? "left" : "right");
+        return;
+      }
       const batch = (compareIds ?? []).slice(compareStart, compareStart + MAX_PANES);
       if (!batch.includes(keeperId)) return;
       await setPickState(keeperId, "pick");
@@ -1226,7 +1296,7 @@ export default function App() {
       await refresh();
       pageCompare(1);
     },
-    [compareIds, compareStart, refresh, pageCompare],
+    [compareIds, compareStart, refresh, pageCompare, compareMode, duelVerdict, duelChampionId],
   );
 
   // The ONE write path for culling marks (rate / pick / label): apply the verb to every
@@ -1295,10 +1365,15 @@ export default function App() {
         const focused = at >= 0 ? ids[at] : ids[0];
         if (e.key === "Escape" || key === "c") {
           closeCompare();
+        } else if (compareMode === "duel" && e.key === "ArrowRight") {
+          // Duel verdicts: the arrows name the winning side, not a focus move.
+          await duelVerdict("right");
+        } else if (compareMode === "duel" && e.key === "ArrowLeft") {
+          await duelVerdict("left");
         } else if (e.key === "PageDown") {
-          pageCompare(1);
+          if (compareMode === "grid") pageCompare(1);
         } else if (e.key === "PageUp") {
-          pageCompare(-1);
+          if (compareMode === "grid") pageCompare(-1);
         } else if (e.key === "ArrowRight" || e.key === "ArrowDown") {
           setCompareFocusId(ids[(Math.max(at, 0) + 1) % ids.length]);
         } else if (e.key === "ArrowLeft" || e.key === "ArrowUp") {
@@ -1404,6 +1479,8 @@ export default function App() {
     closeCompare,
     keepInCompare,
     pageCompare,
+    compareMode,
+    duelVerdict,
   ]);
 
   // The bench's single progress readout, folded from the three title-bar renderers this
@@ -1708,6 +1785,18 @@ export default function App() {
                 poolTotal={compareIds?.length ?? comparePhotos.length}
                 poolOffset={compareStart}
                 onPage={pageCompare}
+                mode={compareMode}
+                onMode={switchCompareMode}
+                duel={
+                  compareMode === "duel"
+                    ? {
+                        championId: duelChampionId,
+                        round: duelRound(duelState),
+                        totalRounds: duelTotalRounds(compareIds?.length ?? 0),
+                        done: duelState.done,
+                      }
+                    : undefined
+                }
                 onFocus={setCompareFocusId}
                 onKeep={keepInCompare}
                 onExit={closeCompare}

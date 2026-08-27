@@ -21,6 +21,10 @@ const LABEL_COLORS: Record<string, string> = Object.fromEntries(
 /** Most panes we will show at once. Beyond this each frame is too small to judge. */
 export const MAX_PANES = 4;
 
+/** How a larger-than-screen pool is worked through: grid batches, or a duel — the champion
+ *  holds the left pane while challengers arrive on the right, one verdict per frame. */
+export type CompareMode = "grid" | "duel";
+
 export function CompareView({
   photos,
   focusedId,
@@ -28,6 +32,9 @@ export function CompareView({
   poolTotal = photos.length,
   poolOffset = 0,
   onPage = () => {},
+  mode = "grid",
+  onMode,
+  duel,
   onFocus,
   onKeep,
   onExit,
@@ -46,6 +53,12 @@ export function CompareView({
   poolOffset?: number;
   /** Step to the previous (-1) or next (+1) batch; the caller clamps at the ends. */
   onPage?: (dir: -1 | 1) => void;
+  /** Grid shows a batch of panes at once; duel is champion-vs-challenger, two at a time. */
+  mode?: CompareMode;
+  /** Offered in the bar whenever the pool could use either presentation. */
+  onMode?: (m: CompareMode) => void;
+  /** Duel bookkeeping for the bar and the champion pane marking. */
+  duel?: { championId: number | null; round: number; totalRounds: number; done: boolean };
   onFocus: (photoId: number) => void;
   /** Promote the focused frame: pick it, reject its on-screen rivals. */
   onKeep: (keeperId: number) => void;
@@ -86,7 +99,41 @@ export function CompareView({
         <button className="chip" onClick={onExit}>
           ‹ Back to grid (Esc)
         </button>
-        {poolTotal > photos.length ? (
+        {onMode && poolTotal > 2 && (
+          <span className="compare-modes" role="group" aria-label="Compare mode">
+            <button
+              className={`chip ${mode === "duel" ? "chip-on" : ""}`}
+              onClick={() => onMode("duel")}
+              title="Champion vs challenger, two at a time"
+            >
+              Duel
+            </button>
+            <button
+              className={`chip ${mode === "grid" ? "chip-on" : ""}`}
+              onClick={() => onMode("grid")}
+              title={`Batches of up to ${MAX_PANES} side by side`}
+            >
+              Grid
+            </button>
+          </span>
+        )}
+        {mode === "duel" && duel ? (
+          duel.done ? (
+            <span className="compare-count">
+              Champion — {photos[0]?.path.split("/").pop() ?? ""} · picked, rivals rejected ·
+              Esc to finish
+            </span>
+          ) : (
+            <span className="compare-batch">
+              <span className="compare-count">
+                Duel {duel.round} of {duel.totalRounds}
+              </span>
+              <span className="compare-hint">
+                ← left wins · → right wins · loser is rejected · 0–5 rate the focused pane
+              </span>
+            </span>
+          )
+        ) : poolTotal > photos.length ? (
           <span className="compare-batch">
             <button
               className="chip"
@@ -136,6 +183,7 @@ export function CompareView({
       <div className={`compare-panes compare-panes-${photos.length}`}>
         {photos.map((photo) => {
           const isFocused = photo.id === focusedId;
+          const isChampion = mode === "duel" && duel != null && photo.id === duel.championId;
           const soft =
             softThreshold != null && photo.sharpness != null && photo.sharpness < softThreshold;
           return (
@@ -143,7 +191,7 @@ export function CompareView({
               key={photo.id}
               className={`compare-pane ${isFocused ? "compare-pane-focused" : ""} ${
                 photo.pickState === "reject" ? "compare-pane-rejected" : ""
-              }`}
+              } ${isChampion ? "compare-pane-champion" : ""}`}
               // Focus follows the pointer press rather than a click, so starting a pan
               // gesture in a pane also focuses it — otherwise the keys would keep acting
               // on whichever pane was clicked last, which is not the one being examined.
@@ -151,6 +199,14 @@ export function CompareView({
             >
               <div className="compare-pane-head">
                 <span className="compare-name">{photo.path.split("/").pop()}</span>
+                {isChampion && (
+                  <span
+                    className="compare-tag compare-champ"
+                    title={duel!.done ? "Won the duel" : "Reigning champion — ← keeps it"}
+                  >
+                    {duel!.done ? "♛ winner" : "champion"}
+                  </span>
+                )}
                 {photo.rating > 0 && (
                   <span className="compare-tag">{"★".repeat(photo.rating)}</span>
                 )}
@@ -186,13 +242,19 @@ export function CompareView({
               </div>
 
               <div className="compare-pane-foot">
+                {!(mode === "duel" && duel?.done) && (
                 <button
                   className={`chip ${isFocused ? "chip-on" : ""}`}
                   onClick={() => onKeep(photo.id)}
-                  title="Keep this frame: mark it a pick and reject the others (reversible with U)"
+                  title={
+                    mode === "duel"
+                      ? "This frame wins the round: its rival is rejected and the next challenger steps up (reversible with U)"
+                      : "Keep this frame: mark it a pick and reject the others (reversible with U)"
+                  }
                 >
-                  Keep this
+                  {mode === "duel" ? "This one wins" : "Keep this"}
                 </button>
+                )}
               </div>
             </div>
           );

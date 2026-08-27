@@ -268,6 +268,61 @@ describe("CompareView", () => {
       ).toBe(true);
     });
 
+    it("duel mode: names the round, marks the champion, and the pane button is a verdict", () => {
+      const onKeep = vi.fn();
+      const onMode = vi.fn();
+      render(
+        <CompareView
+          photos={[photo(10), photo(20)]}
+          focusedId={20}
+          softThreshold={null}
+          poolTotal={27}
+          poolOffset={0}
+          mode="duel"
+          onMode={onMode}
+          duel={{ championId: 10, round: 3, totalRounds: 26, done: false }}
+          onPage={() => {}}
+          onFocus={() => {}}
+          onKeep={onKeep}
+          onExit={() => {}}
+        />,
+      );
+      expect(screen.getByText("Duel 3 of 26")).toBeTruthy();
+      expect(screen.getByText("champion")).toBeTruthy();
+      // No grid batch chrome in duel mode.
+      expect(screen.queryByRole("button", { name: "Next batch" })).toBeNull();
+      // The per-pane button delivers a verdict for that pane's side.
+      const wins = screen.getAllByRole("button", { name: "This one wins" });
+      expect(wins.length).toBe(2);
+      fireEvent.click(wins[1]);
+      expect(onKeep).toHaveBeenCalledWith(20);
+      // Mode toggle offered and firing.
+      fireEvent.click(screen.getByRole("button", { name: "Grid" }));
+      expect(onMode).toHaveBeenCalledWith("grid");
+    });
+
+    it("duel mode: the finished state crowns the survivor and offers no further verdicts", () => {
+      render(
+        <CompareView
+          photos={[photo(20)]}
+          focusedId={20}
+          softThreshold={null}
+          poolTotal={27}
+          poolOffset={0}
+          mode="duel"
+          onMode={() => {}}
+          duel={{ championId: 20, round: 26, totalRounds: 26, done: true }}
+          onPage={() => {}}
+          onFocus={() => {}}
+          onKeep={() => {}}
+          onExit={() => {}}
+        />,
+      );
+      expect(screen.getByText(/Champion — DSC_20\.ARW/)).toBeTruthy();
+      expect(screen.getByText("♛ winner")).toBeTruthy();
+      expect(screen.queryByRole("button", { name: "This one wins" })).toBeNull();
+    });
+
     it("a pool that fits on screen shows no paging chrome (default props)", () => {
       render(
         <CompareView

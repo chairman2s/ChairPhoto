@@ -72,28 +72,6 @@ body {
   height: 100vh;
 }
 
-/* Top bar */
-.topbar {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 8px 16px;
-  background: var(--panel);
-  border-bottom: 1px solid var(--border);
-  min-height: 52px;
-}
-.brand {
-  font-weight: 700;
-  font-size: 14px;
-  letter-spacing: -0.02em;
-}
-/* Thin vertical divider between topbar regions */
-.topbar-sep {
-  width: 1px;
-  height: 18px;
-  background: var(--border);
-  flex-shrink: 0;
-}
 /* Secondary ghost button for topbar actions */
 .btn-ghost {
   background: transparent;
@@ -368,14 +346,6 @@ body {
 .store-offline {
   color: var(--mute);
 }
-.cache-opt {
-  display: flex;
-  align-items: center;
-  gap: 5px;
-  color: var(--dim);
-  font-size: 12px;
-  cursor: pointer;
-}
 .status {
   margin-left: auto;
   color: var(--dim);
@@ -468,9 +438,6 @@ body {
 .col-resizer:hover {
   background: var(--accent);
   opacity: 0.55;
-}
-.panel-toggle {
-  font-size: 11px;
 }
 .leftcol .tag-panel {
   flex: 1 1 auto;
@@ -1541,13 +1508,12 @@ body {
   align-self: stretch;
 }
 
-/* Module view switcher (topbar) — rendered as a .seg segmented control */
+/* Module view switcher (title bar) — rendered as a .seg segmented control. It used to rely
+   on `order: 1` to pin itself past the topbar's auto-margined .status; TitleBar.tsx now
+   places it explicitly (inside its `children` slot, between Export and More), so DOM
+   position alone controls where it sits. */
 .view-switcher {
   display: flex;
-  /* Pin the Library/Develop switch to the far right of the topbar. `order` moves it
-     past the order:0 items (including the auto-margined .status), so it sits flush
-     against the right edge without re-ordering the JSX. */
-  order: 1;
 }
 .module-view {
   width: 100%;
@@ -2594,10 +2560,6 @@ body {
 }
 
 /* Loupe (large view) */
-.loupe-controls {
-  display: flex;
-  gap: 4px;
-}
 .loupe-inline {
   display: flex;
   flex-direction: column;
@@ -3045,11 +3007,7 @@ body {
   font-size: 12px;
 }
 
-/* --- Module toolbar actions + Collage dialog (see docs/collage.md) --- */
-/* A topbar button contributed by a module's toolbar action (e.g. Make collage). */
-.module-action {
-  font-weight: 600;
-}
+/* --- Collage dialog (see docs/collage.md) --- */
 /* The collage dialog is taller than a standard modal (it has a tile grid + many controls). */
 .collage-modal {
   width: 600px;
@@ -4172,4 +4130,83 @@ body {
   height: 14px;
   flex: none;
   color: var(--accent);
+}
+
+/* ── Shell: title bar ── */
+/* src/components/shell/TitleBar.tsx — the Darkroom redesign's replacement for the old
+   .topbar row (one 52px row of ~21 ungrouped buttons): a fixed 46px strip with three
+   regions — a catalog pill (left), empty flex space (center, for rich search later), and
+   every command grouped behind the .menu-* primitive above plus a plain Export button
+   (right). */
+.titlebar {
+  display: flex;
+  align-items: center;
+  height: 46px;
+  padding: 0 16px;
+  background: var(--panel);
+  border-bottom: 1px solid var(--line);
+  gap: 12px;
+}
+.titlebar-left {
+  display: flex;
+  align-items: center;
+  flex: none;
+}
+/* Rich search lands here (deferred) — just absorbs the space between the catalog pill and
+   the right-hand command cluster for now. */
+.titlebar-center {
+  flex: 1 1 auto;
+}
+.titlebar-right {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: none;
+}
+/* Catalog pill: name + photo count + chevron, opens the catalog switcher. */
+.catpill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 26px;
+  padding: 0 10px;
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: var(--r-pill);
+  color: var(--txt);
+  font-size: 12px;
+  cursor: pointer;
+}
+.catpill:hover {
+  border-color: var(--dim);
+}
+.catpill-name {
+  font-weight: 700;
+  color: var(--txt);
+}
+.catpill-count {
+  color: var(--dim);
+}
+.catpill svg {
+  flex: none;
+  color: var(--dim);
+}
+/* Attention badge (waiting-for-NAS / identity-debt counts): pill style, shown only when
+   there's something to look at — a confirmed non-zero count, or (identity debt only) an
+   unknown one. */
+.attn {
+  display: inline-flex;
+  align-items: center;
+  height: 24px;
+  padding: 0 10px;
+  background: var(--sel);
+  border: 1px solid color-mix(in srgb, var(--accent) 45%, transparent);
+  border-radius: var(--r-pill);
+  color: var(--accent);
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.attn:hover {
+  filter: brightness(1.08);
 }

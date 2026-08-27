@@ -31,6 +31,7 @@ import {
   initHost,
   panelsForSlot,
   activateToolbarAction,
+  toolbarActionGroups,
   __channels,
   __legacy,
   __resetForTests,
@@ -678,6 +679,58 @@ describe("safe callback dispatch — activateToolbarAction (Finding 7)", () => {
     expect(() => activateToolbarAction("boom-action")).not.toThrow();
 
     disableModule("h16-toolbar-throws", false);
+  });
+});
+
+describe("toolbarActionGroups() — TitleBar's Modules submenu (redesign/darkroom-workspace)", () => {
+  it("groups enabled modules' actions by module, in registration order, using the module's name", () => {
+    register(makeModule("h-groups-a", { name: "Alpha Module", onLoad: (api) => {
+      api.registerAction({ id: "a1", label: "Action A1" });
+      api.registerAction({ id: "a2", label: "Action A2" });
+    } }));
+    register(makeModule("h-groups-b", { name: "Beta Module", onLoad: (api) => {
+      api.registerAction({ id: "b1", label: "Action B1" });
+    } }));
+    enableModule("h-groups-a", false);
+    enableModule("h-groups-b", false);
+
+    const groups = toolbarActionGroups();
+
+    expect(groups).toEqual([
+      {
+        moduleId: "h-groups-a",
+        moduleLabel: "Alpha Module",
+        actions: [
+          expect.objectContaining({ id: "a1", label: "Action A1" }),
+          expect.objectContaining({ id: "a2", label: "Action A2" }),
+        ],
+      },
+      {
+        moduleId: "h-groups-b",
+        moduleLabel: "Beta Module",
+        actions: [expect.objectContaining({ id: "b1", label: "Action B1" })],
+      },
+    ]);
+
+    disableModule("h-groups-a", false);
+    disableModule("h-groups-b", false);
+  });
+
+  it("omits a disabled module and a module with zero toolbar actions", () => {
+    register(makeModule("h-groups-disabled", { onLoad: (api) => {
+      api.registerAction({ id: "d1", label: "Should not appear" });
+    } }));
+    register(makeModule("h-groups-empty", { onLoad: () => {} }));
+    enableModule("h-groups-disabled", false);
+    enableModule("h-groups-empty", false);
+    disableModule("h-groups-disabled", false); // registered an action, then disabled
+
+    const groups = toolbarActionGroups();
+
+    expect(groups.find((g) => g.moduleId === "h-groups-disabled")).toBeUndefined();
+    expect(groups.find((g) => g.moduleId === "h-groups-empty")).toBeUndefined();
+
+    disableModule("h-groups-empty", false);
   });
 });
 

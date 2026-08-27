@@ -95,7 +95,7 @@ import {
   setFilterContext,
   setNavSink,
   setSelection,
-  toolbarActions,
+  toolbarActionGroups,
   activateToolbarAction,
   useHostContributions,
 } from "./modules/host";
@@ -115,7 +115,8 @@ import { TrashDialog } from "./components/TrashDialog";
 import { CatalogSwitcher } from "./components/CatalogSwitcher";
 import { EditorView } from "./components/EditorView";
 import { parseEdit } from "./modules/editing";
-import { ImportBatch } from "./modules/api";
+import { ImportBatch, listImportBatches, listRecentCatalogs } from "./modules/api";
+import { TitleBar } from "./components/shell";
 import { useAppearance } from "./theme/controller";
 import "./App.css";
 
@@ -242,6 +243,19 @@ export default function App() {
   };
   const [editingTag, setEditingTag] = useState<TagWithCount | null>(null);
   const [showCatalogSwitcher, setShowCatalogSwitcher] = useState(false);
+  // The open catalog's display name (basename of its .chairphoto path) — the title bar's
+  // catalog pill. Recorded catalogs are ordered most-recently-opened first, and both
+  // init_catalog and switch_catalog record the catalog they open before returning, so
+  // index 0 is always the one now open.
+  const [catalogName, setCatalogName] = useState("");
+  const refreshCatalogName = useCallback(() => {
+    listRecentCatalogs()
+      .then((catalogs) => {
+        const path = catalogs[0]?.catalogPath;
+        if (path) setCatalogName(path.split("/").pop() || path);
+      })
+      .catch(() => {});
+  }, []);
   const [showPrefs, setShowPrefs] = useState(false);
   const [showExport, setShowExport] = useState(false);
   const [showPublish, setShowPublish] = useState(false);
@@ -256,6 +270,14 @@ export default function App() {
   const [bundleExportBatch, setBundleExportBatch] = useState<ImportBatch | null>(null);
   // Bundle import dialog open/closed.
   const [showBundleImport, setShowBundleImport] = useState(false);
+  // Import batches, for the title bar's "Export a bundle" submenu (TitleBar owns none of
+  // this fetch — BatchesPanel/FilterBar/SmartAlbumEditor each keep their own copy the same
+  // way, reloaded on the same `batchesKey` bump).
+  const [importBatches, setImportBatches] = useState<ImportBatch[]>([]);
+  useEffect(() => {
+    if (!ready) return;
+    listImportBatches().then(setImportBatches).catch(() => {});
+  }, [ready, batchesKey]);
   const [importProgress, setImportProgress] = useState<{ done: number; total: number } | null>(
     null,
   );
@@ -496,6 +518,7 @@ export default function App() {
       .then(() => {
         setBootStage(BOOT_STAGES[2]); // Starting modules…
         setReady(true);
+        refreshCatalogName(); // now that init_catalog has recorded it as the most recent
         // The sidebar panels (albums / smart albums / batches) and the FilterBar fetch
         // their lists in mount effects, which fire BEFORE this initCatalog() chain has
         // opened the catalog — those first fetches fail ("No catalog is open") and are
@@ -1019,11 +1042,14 @@ export default function App() {
       // it's safe to call directly here rather than wait on an effect — nothing else
       // calls it on a catalog switch, since `ready` never flips back to false.
       refreshIdentityDebtCount();
+      // Same reasoning: switch_catalog has already recorded the new catalog as the most
+      // recent by the time this event fires, so re-reading the list gets the new name.
+      refreshCatalogName();
     });
     return () => {
       unlisten.then((f) => f());
     };
-  }, [library.reset, refreshIdentityDebtCount]);
+  }, [library.reset, refreshIdentityDebtCount, refreshCatalogName]);
 
   // Reset the active version to Original whenever the selected photo changes.
   useEffect(() => {
@@ -1223,33 +1249,54 @@ export default function App() {
   return (
     <div className="app">
       <Splash stage={bootStage} />
-      <header className="topbar">
-        <button
-          className={`chip panel-toggle ${leftHidden ? "" : "chip-on"}`}
-          onClick={() => setLeftHidden((v) => !v)}
-          title={leftHidden ? "Show left panel" : "Hide left panel"}
-        >
-          ⬛ Tags
-        </button>
-        <span className="brand">ChairPhoto</span>
-        <span className="topbar-sep" aria-hidden />
-        <button className="btn-primary" onClick={onScan} disabled={!ready} title="Re-index your library folder">
-          Rescan library
-        </button>
-        <button className="btn-ghost" onClick={() => setShowImport(true)} disabled={!ready} title="Copy from a card into your library">
-          Import card
-        </button>
-        <button className="btn-ghost" onClick={() => setShowBundleImport(true)} disabled={!ready} title="Import a .chairphoto bundle from another machine">
-          Import bundle
-        </button>
-        <label className="cache-opt" title="Pre-generate full previews on import (slower import, instant loupe)">
-          <input
-            type="checkbox"
-            checked={cachePreviews}
-            onChange={(e) => setCachePreviews(e.target.checked)}
-          />
-          Cache previews
-        </label>
+      <TitleBar
+        catalogName={catalogName}
+        photoCount={library.total}
+        onOpenCatalogs={() => setShowCatalogSwitcher(true)}
+        pendingCount={pendingCount}
+        onReconcile={runReconcile}
+        identityDebtCount={identityDebtCount}
+        onOpenIdentityDebt={() => setShowIdentityDebt(true)}
+        ready={ready}
+        onImportCard={() => setShowImport(true)}
+        onImportBundle={() => setShowBundleImport(true)}
+        onRescan={onScan}
+        cachePreviews={cachePreviews}
+        onCachePreviews={setCachePreviews}
+        exportableBatches={importBatches}
+        onExportBundle={setBundleExportBatch}
+        canExport={selection.targets.length > 0}
+        onExport={() => setShowExport(true)}
+        onPopOutLoupe={() => openLoupeWindow()}
+        loupeOn={loupeInline}
+        loupeEnabled={!!selected && activeView === null}
+        onToggleLoupe={() => setLoupeInline((v) => !v)}
+        compareOn={inCompare}
+        compareEnabled={canCompare && activeView === null}
+        onToggleCompare={() => (inCompare ? closeCompare() : openCompare())}
+        selectionCount={selection.ids.length}
+        onAnalyseBurst={runBurstAnalysis}
+        onProposeStacks={openStackProposals}
+        onCullSession={startCullSession}
+        canPublish={selection.activeId != null}
+        onPublish={() => setShowPublish(true)}
+        canBackUpSelection={ready && selection.ids.length > 0}
+        onBackUpSelection={backUpSelection}
+        onTrash={() => setShowTrash(true)}
+        moduleActionGroups={toolbarActionGroups()}
+        onModuleAction={(action) =>
+          isModalAction(action) ? setModalAction(action) : activateToolbarAction(action.id)
+        }
+        onOpenPrefs={() => setShowPrefs(true)}
+        leftHidden={leftHidden}
+        onToggleLeft={() => setLeftHidden((v) => !v)}
+        rightHidden={rightHidden}
+        onToggleRight={() => setRightHidden((v) => !v)}
+      >
+        {/* Retained unchanged, per the topbar extraction: the Library/Develop/module view
+            switcher and the three progress readouts + status line. They move to an icon
+            rail / bottom bench in a later commit — for now TitleBar just renders them
+            between Export and More. */}
         {(moduleViews.length > 0 || activeViewId !== null || canEdit) && (
           <div className="view-switcher">
             <div className="seg">
@@ -1308,156 +1355,6 @@ export default function App() {
             </div>
           </div>
         )}
-        <span className="topbar-sep" aria-hidden />
-        <div className="loupe-controls">
-          <button
-            className={`btn-ghost ${loupeInline ? "chip-on" : ""}`}
-            onClick={() => setLoupeInline((v) => !v)}
-            disabled={!selected || activeView !== null}
-            title="Toggle large view (Enter)"
-          >
-            Loupe
-          </button>
-          <button
-            className={`btn-ghost ${inCompare ? "chip-on" : ""}`}
-            onClick={() => (inCompare ? closeCompare() : openCompare())}
-            disabled={!inCompare && (!canCompare || activeView !== null)}
-            title={
-              canCompare || inCompare
-                ? `Compare the selected frames side by side, up to ${MAX_PANES} (C)`
-                : "Select two or more photos to compare them"
-            }
-          >
-            Compare
-          </button>
-          <button
-            className="btn-ghost"
-            onClick={() => openLoupeWindow()}
-            title="Open loupe in a separate window (move it to another screen)"
-          >
-            Pop out ⧉
-          </button>
-        </div>
-        {pendingCount > 0 && (
-          <button
-            className="chip chip-on"
-            onClick={runReconcile}
-            title="Back up photos waiting for the NAS"
-          >
-            ⤓ Back up ({pendingCount})
-          </button>
-        )}
-        {(identityDebtCount === null || identityDebtCount > 0) && (
-          <button
-            className="chip chip-on"
-            onClick={() => setShowIdentityDebt(true)}
-            title={
-              identityDebtCount === null
-                ? "Identity debt count could not be checked — open to see the current queue"
-                : "Photo copies whose sidecar doesn't carry their identity yet. Most of this " +
-                  "is normally Unreachable (an offline volume), not a failure."
-            }
-          >
-            Identity debt ({identityDebtCount === null ? "?" : identityDebtCount})
-          </button>
-        )}
-        <span className="topbar-sep" aria-hidden />
-        <button
-          className="btn-ghost"
-          onClick={() => setShowExport(true)}
-          disabled={selection.targets.length === 0}
-          title="Export the selected photo(s) to files (RAW + XMP, or JPEG)"
-        >
-          Export
-        </button>
-        <button
-          className="btn-ghost"
-          onClick={() => setShowPublish(true)}
-          disabled={selection.activeId == null}
-          title="Publish the selected photo to Instagram, Flickr, SmugMug…"
-        >
-          Publish
-        </button>
-        <button
-          className="btn-ghost"
-          onClick={backUpSelection}
-          disabled={!ready || selection.ids.length === 0}
-          title={
-            selection.ids.length
-              ? `Queue ${selection.ids.length} selected photo(s) to copy to the NAS`
-              : "Select photos first — this queues a copy of everything it names, so it never assumes the whole view"
-          }
-        >
-          Back up
-        </button>
-        <button
-          className="btn-ghost"
-          onClick={() => setShowTrash(true)}
-          disabled={!ready}
-          title="Photos you have hidden. Nothing there has been deleted — restoring is one click."
-        >
-          Trash
-        </button>
-        <button
-          className="btn-ghost"
-          onClick={runBurstAnalysis}
-          disabled={!ready}
-          title={
-            selection.ids.length
-              ? `Rank burst sharpness for ${selection.ids.length} selected photo(s)`
-              : "Rank burst sharpness for all visible photos (H16e)"
-          }
-        >
-          Analyse burst
-        </button>
-        <button
-          className="btn-ghost"
-          onClick={openStackProposals}
-          disabled={!ready}
-          title={
-            selection.ids.length
-              ? `Propose stacks for ${selection.ids.length} selected photo(s)`
-              : "Propose stacks for all visible photos — review each group before it collapses"
-          }
-        >
-          Stack bursts
-        </button>
-        <button
-          className="btn-ghost"
-          onClick={startCullSession}
-          disabled={!ready}
-          title={
-            selection.ids.length
-              ? `Cull ${selection.ids.length} selected photo(s) full screen, keyboard only`
-              : "Cull the whole view full screen, keyboard only — resumes where you left off"
-          }
-        >
-          Cull
-        </button>
-        {toolbarActions().map((action) => (
-          <button
-            key={action.id}
-            className="btn-ghost module-action"
-            onClick={() =>
-              isModalAction(action)
-                ? setModalAction(action)
-                : activateToolbarAction(action.id)
-            }
-            title={action.label}
-          >
-            {action.icon ? `${action.icon} ${action.label}` : action.label}
-          </button>
-        ))}
-        <button
-          className="btn-ghost"
-          onClick={() => setShowCatalogSwitcher(true)}
-          title="Open or create a catalog"
-        >
-          Catalogs
-        </button>
-        <button className="btn-ghost" onClick={() => setShowPrefs(true)} title="Preferences (storage, AI, modules)">
-          ⚙ Preferences
-        </button>
         {importProgress && (
           <div
             className="import-progress"
@@ -1484,14 +1381,6 @@ export default function App() {
             </div>
           </div>
         )}
-        <span className="topbar-sep" aria-hidden />
-        <button
-          className={`chip panel-toggle ${rightHidden ? "" : "chip-on"}`}
-          onClick={() => setRightHidden((v) => !v)}
-          title={rightHidden ? "Show inspector panel" : "Hide inspector panel"}
-        >
-          Inspector ⬛
-        </button>
         {scanProgress && (
           <div
             className="import-progress"
@@ -1533,7 +1422,7 @@ export default function App() {
           </div>
         )}
         <span className="status">{status}</span>
-      </header>
+      </TitleBar>
 
       <FilterBar
         filters={FILTERS}

@@ -1431,6 +1431,29 @@ export function toolbarActions(): ToolbarAction[] {
 }
 
 /**
+ * The same toolbar actions as {@link toolbarActions}, but grouped by owning module — for
+ * the title bar's "Modules" submenu (TitleBar.tsx), which renders one `MenuLabel` +
+ * `MenuItem`s per module instead of `toolbarActions()`'s flat list. Registration order
+ * (the `modules` map's iteration order); modules contributing no toolbar action are
+ * omitted rather than appearing as an empty group. `moduleLabel` is `reg.module.name`, the
+ * same field `listModules()` exposes as `ModuleInfo.name` and Preferences' module tabs
+ * render — so a module's title-bar group heading matches the name it's known by there.
+ */
+export function toolbarActionGroups(): {
+  moduleId: string;
+  moduleLabel: string;
+  actions: ToolbarAction[];
+}[] {
+  const out: { moduleId: string; moduleLabel: string; actions: ToolbarAction[] }[] = [];
+  for (const reg of modules.values()) {
+    if (reg.enabled && reg.actions.length > 0) {
+      out.push({ moduleId: reg.id, moduleLabel: reg.module.name, actions: reg.actions });
+    }
+  }
+  return out;
+}
+
+/**
  * Invoke a toolbar action's `onActivate` (the non-modal flavour), injecting the owning
  * module's host API — the same API it got at onLoad. The app uses this for actions without
  * a `render`; modal actions render `action.render(close)` directly. No-op if the action or

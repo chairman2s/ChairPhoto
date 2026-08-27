@@ -1,3 +1,4 @@
+pub mod appearance;
 pub mod bundle;
 pub mod burst;
 pub mod companions;
@@ -142,6 +143,13 @@ pub fn run() {
                 Err(e) => eprintln!("failed to start video server: {e}"),
             }
 
+            // "Follow Omarchy" appearance (docs/appearance.md): watch the Omarchy runtime
+            // theme and broadcast switches. Starts nothing when Omarchy is absent — a
+            // normal, non-degraded state that must cost zero polling — and never fatal.
+            if appearance::start_watcher(app.handle().clone()) {
+                eprintln!("appearance: following the Omarchy theme");
+            }
+
             // Build the bounded LIFO image pool and make it available to the URI scheme
             // handlers via Tauri's state system.
             let n_threads = image_pool::default_thread_count();
@@ -278,6 +286,7 @@ pub fn run() {
             commands::plugin_features,
             commands::get_setting,
             commands::set_setting,
+            commands::get_system_theme,
             commands::list_external_modules,
             commands::get_modules_dir,
             #[cfg(feature = "module-fetch")]

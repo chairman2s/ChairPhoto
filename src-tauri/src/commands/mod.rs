@@ -31,6 +31,7 @@ use tauri::State;
 
 mod ai;
 mod albums;
+mod appearance;
 mod burst;
 mod catalog;
 #[cfg(feature = "collage")]
@@ -77,6 +78,7 @@ mod tags;
 
 pub use ai::*;
 pub use albums::*;
+pub use appearance::*;
 pub use burst::*;
 pub use culling::*;
 pub use catalog::*;
@@ -258,20 +260,22 @@ async fn with_catalog_blocking<T: Send + 'static>(
 
 // ── Shared test helpers (env-var serialization) ───────────────────────────────
 //
-// Several test modules in this file mutate process-wide environment variables
-// (e.g. XDG_DATA_HOME) and therefore need a *single* process-wide Mutex so that
+// Several test modules in this crate (this file's submodules, and `appearance`)
+// mutate process-wide environment variables (e.g. XDG_DATA_HOME, XDG_STATE_HOME)
+// and therefore need a *single* process-wide Mutex so that
 // mutations from different test modules are serialized even when cargo runs them
 // concurrently on multiple threads.
 //
 // Rules:
 //   • Every test module that calls `std::env::set_var` / `remove_var` on any key
-//     that affects `app_data_dir()` MUST acquire `test_env_helpers::ENV_LOCK`
+//     that affects an env-derived path (`app_data_dir()`, the Omarchy state root, …)
+//     MUST acquire `test_env_helpers::ENV_LOCK`
 //     (via `EnvGuard::set`) before mutating and hold it until the test ends.
 //   • Use `test_env_helpers::EnvGuard::set(key, value)` — do NOT declare a
 //     separate `static ENV_LOCK` inside individual test modules; separate statics
 //     are independent instances and provide no cross-module exclusion.
 #[cfg(test)]
-mod test_env_helpers {
+pub(crate) mod test_env_helpers {
     use std::sync::Mutex;
 
     /// Process-wide lock for env-var mutations. **One static for the whole crate.**

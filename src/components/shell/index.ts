@@ -11,3 +11,5 @@ export {
   type MenuSubProps,
 } from "./Menu";
 export { TitleBar, type TitleBarProps, type ModuleActionGroup } from "./TitleBar";
+export { IconRail, type IconRailProps } from "./IconRail";
+export { railOrder } from "./railOrder";

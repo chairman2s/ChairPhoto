@@ -15,8 +15,9 @@ import { describe, expect, it, vi, type Mock } from "vitest";
 import { fireEvent, render, screen } from "@testing-library/react";
 
 import { TitleBar, type TitleBarProps, type ModuleActionGroup } from "../TitleBar";
+import { IconRail, type IconRailProps } from "../IconRail";
 import type { ImportBatch } from "../../../modules/api";
-import type { ToolbarAction } from "../../../modules/registry";
+import type { ToolbarAction, MainView } from "../../../modules/registry";
 
 function makeBatch(id: number, sourceLabel: string): ImportBatch {
   return { id, uuid: `uuid-${id}`, sourceLabel, note: "", createdAt: 0, photoCount: 10 };
@@ -335,5 +336,101 @@ describe("TitleBar command inventory (preservation)", () => {
     // raw onClick), but it pins the total command count so a command silently added to
     // TitleBar without a matching case here fails loudly instead of shipping unpinned.
     expect(cases.length).toBe(24);
+  });
+});
+
+// -- IconRail --------------------------------------------------------------------------
+// The Library/Develop/module-view switcher used to render inside TitleBar's children slot
+// (covered above via the CHILDREN_TEXT stub); it now lives in IconRail, a sibling of
+// TitleBar in App.tsx's `.body`. Same preservation intent, same table style, own inventory.
+
+function railView(id: string, label: string): MainView {
+  return { id, label };
+}
+
+const railModuleViews: MainView[] = [railView("map", "Map"), railView("people", "People")];
+
+/** Permissive rail props: Develop shown and enabled, two module views, fresh vi.fn()s. */
+function buildRailProps(): IconRailProps {
+  return {
+    active: "library",
+    canDevelop: true,
+    developEnabled: true,
+    moduleViews: railModuleViews,
+    onSelect: vi.fn(),
+    onOpenPrefs: vi.fn(),
+  };
+}
+
+function renderIconRail(props: IconRailProps) {
+  render(<IconRail {...props} />);
+}
+
+interface RailCase {
+  name: string;
+  run: () => void;
+  spy: (props: IconRailProps) => Mock;
+  expectCalledWith?: unknown[];
+}
+
+const railCases: RailCase[] = [
+  {
+    name: "library",
+    run: () => fireEvent.click(screen.getByRole("button", { name: "Library" })),
+    spy: (p) => p.onSelect as unknown as Mock,
+    expectCalledWith: ["library"],
+  },
+  {
+    name: "develop",
+    run: () => fireEvent.click(screen.getByRole("button", { name: "Develop" })),
+    spy: (p) => p.onSelect as unknown as Mock,
+    expectCalledWith: ["develop"],
+  },
+  {
+    name: "module view (map)",
+    run: () => fireEvent.click(screen.getByRole("button", { name: "Map" })),
+    spy: (p) => p.onSelect as unknown as Mock,
+    expectCalledWith: ["map"],
+  },
+  {
+    name: "module view (people)",
+    run: () => fireEvent.click(screen.getByRole("button", { name: "People" })),
+    spy: (p) => p.onSelect as unknown as Mock,
+    expectCalledWith: ["people"],
+  },
+  {
+    name: "preferences",
+    run: () => fireEvent.click(screen.getByRole("button", { name: "Preferences" })),
+    spy: (p) => p.onOpenPrefs as unknown as Mock,
+  },
+];
+
+describe("IconRail command inventory (preservation)", () => {
+  it.each(railCases)("$name fires its callback exactly once", ({ run, spy, expectCalledWith }) => {
+    const props = buildRailProps();
+    renderIconRail(props);
+
+    run();
+
+    const mock = spy(props);
+    expect(mock).toHaveBeenCalledTimes(1);
+    if (expectCalledWith) {
+      expect(mock).toHaveBeenCalledWith(...expectCalledWith);
+    }
+  });
+
+  it("hides Develop when canDevelop is false", () => {
+    renderIconRail({ ...buildRailProps(), canDevelop: false });
+    expect(screen.queryByRole("button", { name: "Develop" })).toBeNull();
+  });
+
+  it("disables Develop (without hiding it) when developEnabled is false", () => {
+    renderIconRail({ ...buildRailProps(), developEnabled: false });
+    const btn = screen.getByRole("button", { name: "Develop" }) as HTMLButtonElement;
+    expect(btn.disabled).toBe(true);
+  });
+
+  it("covers every rail affordance IconRail renders", () => {
+    expect(railCases.length).toBe(5);
   });
 });

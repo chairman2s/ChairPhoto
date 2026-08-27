@@ -10,10 +10,11 @@
 // and activation is a callback (`onModuleAction`), so this file's only coupling to the
 // module system is the `ToolbarAction` *type* used to describe a group's contents.
 //
-// `children` carries the JSX App.tsx still owns unchanged: the Library/Develop/module view
-// switcher and the three progress readouts + status line (issue: topbar extraction). They
-// render together, between the Export button and the "More" menu, so this component never
-// has to import their state either.
+// `children` carries the JSX App.tsx still owns unchanged: the three progress readouts +
+// status line (issue: topbar extraction). They render between the Export button and the
+// "More" menu, so this component never has to import their state either. The
+// Library/Develop/module view switcher that used to live here moved to IconRail.tsx — a
+// sibling of TitleBar in App.tsx's `.body`, not a child of it (see docs mockup "Darkroom").
 import type { ReactNode } from "react";
 import { MenuButton, MenuCheckItem, MenuItem, MenuLabel, MenuSeparator, MenuSub } from "./Menu";
 import type { ImportBatch } from "../../modules/api";
@@ -95,8 +96,8 @@ export interface TitleBarProps {
   rightHidden: boolean;
   onToggleRight: () => void;
 
-  /** The retained view switcher + progress readouts + status line — rendered between
-   *  Export and More. See file header. */
+  /** The retained progress readouts + status line — rendered between Export and More.
+   *  See file header. */
   children?: ReactNode;
 }
 

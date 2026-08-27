@@ -116,7 +116,7 @@ import { CatalogSwitcher } from "./components/CatalogSwitcher";
 import { EditorView } from "./components/EditorView";
 import { parseEdit } from "./modules/editing";
 import { ImportBatch, listImportBatches, listRecentCatalogs } from "./modules/api";
-import { TitleBar } from "./components/shell";
+import { TitleBar, IconRail, railOrder } from "./components/shell";
 import { useAppearance } from "./theme/controller";
 import "./App.css";
 
@@ -203,8 +203,8 @@ export default function App() {
   const [cachePreviews, setCachePreviews] = useState(true);
 
   // Side-panel layout: widths (px) and hidden state, persisted to localStorage.
-  const [leftW, setLeftW] = useState(() => +(localStorage.getItem("panel.leftW") || 250));
-  const [rightW, setRightW] = useState(() => +(localStorage.getItem("panel.rightW") || 300));
+  const [leftW, setLeftW] = useState(() => +(localStorage.getItem("panel.leftW") || 210));
+  const [rightW, setRightW] = useState(() => +(localStorage.getItem("panel.rightW") || 316));
   const [leftHidden, setLeftHidden] = useState(
     () => localStorage.getItem("panel.leftHidden") === "1",
   );
@@ -1293,68 +1293,10 @@ export default function App() {
         rightHidden={rightHidden}
         onToggleRight={() => setRightHidden((v) => !v)}
       >
-        {/* Retained unchanged, per the topbar extraction: the Library/Develop/module view
-            switcher and the three progress readouts + status line. They move to an icon
-            rail / bottom bench in a later commit — for now TitleBar just renders them
-            between Export and More. */}
-        {(moduleViews.length > 0 || activeViewId !== null || canEdit) && (
-          <div className="view-switcher">
-            <div className="seg">
-              <button
-                className={`seg-item ${activeView === null && !inDevelop ? "on" : ""}`}
-                onClick={() => {
-                  setActiveViewId(null);
-                  setDevelop(false);
-                }}
-              >
-                {/* Grid glyph — matches the app's 13px stroke icon language. */}
-                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
-                  <rect x="3" y="3" width="7" height="7" />
-                  <rect x="14" y="3" width="7" height="7" />
-                  <rect x="14" y="14" width="7" height="7" />
-                  <rect x="3" y="14" width="7" height="7" />
-                </svg>
-                Library
-              </button>
-              {canEdit && (
-                <button
-                  className={`seg-item ${inDevelop ? "on" : ""}`}
-                  onClick={() => {
-                    setActiveViewId(null);
-                    setDevelop(true);
-                  }}
-                  disabled={!selected}
-                  title="Develop the selected photo (crop & tone)"
-                >
-                  {/* Sliders glyph. */}
-                  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
-                    <line x1="21" y1="6" x2="14" y2="6" />
-                    <line x1="10" y1="6" x2="3" y2="6" />
-                    <line x1="21" y1="18" x2="12" y2="18" />
-                    <line x1="8" y1="18" x2="3" y2="18" />
-                    <line x1="14" y1="4" x2="14" y2="8" />
-                    <line x1="8" y1="16" x2="8" y2="20" />
-                  </svg>
-                  Develop
-                </button>
-              )}
-              {moduleViews.map((v) => (
-                <button
-                  key={v.id}
-                  className={`seg-item ${activeViewId === v.id ? "on" : ""}`}
-                  onClick={() => {
-                    setActiveViewId(v.id);
-                    setDevelop(false);
-                  }}
-                  title={v.label}
-                >
-                  {v.icon}
-                  {v.label}
-                </button>
-              ))}
-            </div>
-          </div>
-        )}
+        {/* Retained unchanged, per the topbar extraction: the three progress readouts +
+            status line. The Library/Develop/module view switcher that used to render here
+            moved to IconRail, a sibling of TitleBar in `.body` (see docs mockup
+            "Darkroom"). */}
         {importProgress && (
           <div
             className="import-progress"
@@ -1452,11 +1394,30 @@ export default function App() {
       <div
         className="body"
         style={{
-          gridTemplateColumns: `${leftHidden ? 0 : leftW}px 1fr ${
+          gridTemplateColumns: `52px ${leftHidden ? 0 : leftW}px 1fr ${
             rightHidden ? 0 : rightW
           }px`,
         }}
       >
+        <IconRail
+          active={activeView?.id ?? (inDevelop ? "develop" : "library")}
+          canDevelop={canEdit}
+          developEnabled={!!selected}
+          moduleViews={railOrder(moduleViews)}
+          onSelect={(id) => {
+            if (id === "library") {
+              setActiveViewId(null);
+              setDevelop(false);
+            } else if (id === "develop") {
+              setActiveViewId(null);
+              setDevelop(true);
+            } else {
+              setActiveViewId(id);
+              setDevelop(false);
+            }
+          }}
+          onOpenPrefs={() => setShowPrefs(true)}
+        />
         {!leftHidden && (
         <div className="leftcol">
           <div

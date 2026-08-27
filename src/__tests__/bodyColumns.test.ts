@@ -1,16 +1,19 @@
 /**
  * The `.body` grid's columns must be placed explicitly (issue #71).
  *
- * `.body` declares three tracks — left panel, grid, inspector — and App.tsx overrides their
- * widths inline, collapsing a hidden panel's track to `0px`. But it *removes* the hidden
- * panel's element rather than emptying it, so the track count stays three while the child
- * count drops. With no explicit placement, CSS grid auto-places what is left in DOM order:
- * hiding the left panel put `<main className="grid-wrap">` into track 1 — the `0px` one — and
- * the grid rendered nothing at all, at any scroll offset, on any selection.
+ * `.body` declares four tracks — icon rail, left panel, grid, inspector — and App.tsx
+ * overrides three of their widths inline, collapsing a hidden panel's track to `0px` (the
+ * rail's 52px is constant). But a hidden panel's element is *removed* rather than emptied,
+ * so the track count stays four while the child count drops. With no explicit placement,
+ * CSS grid auto-places what is left in DOM order: hiding the left panel put
+ * `<main className="grid-wrap">` into track 2 — the `0px` one — and the grid rendered
+ * nothing at all, at any scroll offset, on any selection.
  *
  * Measured in headless Chromium against the real `App.css` before the fix: with the left
  * panel hidden, `.grid-scroll`'s `clientWidth` was `0` (and its `clientHeight` a healthy 789,
- * which is what ruled out the height-collapse theory). Afterwards, 1276.
+ * which is what ruled out the height-collapse theory). Afterwards, 1276. (That measurement
+ * predates the icon rail; the invariant it proved — explicit placement or bust — is what
+ * this test still guards.)
  *
  * What this test can and cannot do: jsdom implements no layout, so nothing here measures a
  * pixel — `clientWidth` is always 0 and a rendering test would pass either way. It asserts
@@ -45,17 +48,20 @@ const APP_TSX = (
  * App.tsx.
  */
 const COLUMNS: { selector: string; gridColumn: string }[] = [
-  { selector: ".leftcol", gridColumn: "1" },
-  { selector: ".grid-wrap", gridColumn: "2" },
-  { selector: ".rightcol", gridColumn: "3" },
-  // Develop hides the inspector and spans both remaining tracks.
-  { selector: ".develop-wrap", gridColumn: "2 / 4" },
+  { selector: ".rail", gridColumn: "1" },
+  { selector: ".leftcol", gridColumn: "2" },
+  { selector: ".grid-wrap", gridColumn: "3" },
+  { selector: ".rightcol", gridColumn: "4" },
+  // Develop hides the inspector and spans both remaining tracks (rail and browser stay
+  // visible, so it starts at track 3, not track 1).
+  { selector: ".develop-wrap", gridColumn: "3 / 5" },
 ];
 
 /** The declaration block of a top-level rule, e.g. `.leftcol { … }`. */
 function ruleBody(selector: string): string {
   // Anchored at a line start so `.grid-wrap` cannot match `.develop-wrap`'s block or a
-  // descendant selector like `.leftcol .tag-panel`.
+  // descendant selector like `.leftcol .tag-panel`, and so `.rail` cannot match
+  // `.rail-item`'s block.
   const re = new RegExp(`^\\${selector}\\s*\\{([^}]*)\\}`, "m");
   const match = APP_CSS.match(re);
   if (!match) throw new Error(`App.css has no top-level rule for ${selector}`);
@@ -76,10 +82,13 @@ describe(".body columns", () => {
     expect(APP_CSS.indexOf("\n.develop-wrap {")).toBeGreaterThan(APP_CSS.indexOf("\n.grid-wrap {"));
   });
 
-  it("still declares three tracks, which the placements above index into", () => {
-    expect(ruleBody(".body")).toMatch(/grid-template-columns:\s*250px\s+1fr\s+300px;/);
-    // The inline override that collapses a hidden panel's track — same three tracks.
-    expect(APP_TSX).toMatch(/gridTemplateColumns:\s*`\$\{[^`]*\}px 1fr \$\{[\s\S]*?\}px`/);
+  it("still declares four tracks, which the placements above index into", () => {
+    expect(ruleBody(".body")).toMatch(/grid-template-columns:\s*52px\s+210px\s+1fr\s+316px;/);
+    // The inline override that collapses a hidden panel's track — same four tracks, rail
+    // first and constant.
+    expect(APP_TSX).toMatch(
+      /gridTemplateColumns:\s*`52px \$\{[^`]*\}px 1fr \$\{[\s\S]*?\}px`/,
+    );
   });
 
   it("still renders the side columns conditionally, which is what makes placement load-bearing", () => {
@@ -87,5 +96,14 @@ describe(".body columns", () => {
     // this test exists, and that should be a deliberate edit rather than a silent one.
     expect(APP_TSX).toMatch(/\{!leftHidden && \(/);
     expect(APP_TSX).toMatch(/\{!inDevelop && !rightHidden && \(/);
+  });
+
+  it("renders the rail unconditionally, unlike the panels either side of it", () => {
+    // The rail is track 1's only occupant and carries no visibility toggle (there is no
+    // "hide the rail" setting), so — unlike .leftcol/.rightcol above — nothing should
+    // stand between `.body`'s opening tag and <IconRail>.
+    const between = APP_TSX.match(/<div\s+className="body"[\s\S]*?>([\s\S]*?)<IconRail/);
+    expect(between, "<IconRail> must be a direct child of .body").not.toBeNull();
+    expect(between![1].trim()).toBe("");
   });
 });

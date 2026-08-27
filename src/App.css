@@ -4060,3 +4060,116 @@ body {
   color: var(--dim);
   line-height: 1.5;
 }
+
+/* ── Shell: menus ─────────── */
+/* src/components/shell/Menu.tsx — the new shell's composable dropdown/popover primitive
+   (title bar menus, icon-rail popovers). Same family as .ctx-item/.tag-menu-item (right-
+   click menus elsewhere in the app): a full-viewport backdrop that closes the menu on
+   click, and a `--panel`-surfaced popup of rows below/beside the trigger. Kept
+   self-contained (its own backdrop class) rather than reusing .ctx-backdrop, so this
+   primitive doesn't depend on the grid's context-menu styling. */
+.menu-wrap {
+  position: relative;
+  display: inline-flex;
+}
+.menu-backdrop {
+  position: fixed;
+  inset: 0;
+  /* Above the grid and any panel content; one above .ctx-backdrop's 1000 so a shell menu
+     always paints over a lingering grid ctx-menu rather than under it. */
+  z-index: 1001;
+}
+.menu-panel,
+.menu-sub-panel {
+  position: absolute;
+  min-width: 200px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: var(--r);
+  box-shadow: var(--shadow-pop);
+  padding: 5px;
+  z-index: 1002;
+}
+.menu-panel {
+  top: calc(100% + 4px);
+  left: 0;
+}
+.menu-panel-right {
+  left: auto;
+  right: 0;
+}
+.menu-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  height: 29px;
+  padding: 0 10px;
+  border: none;
+  border-radius: 6px;
+  background: none;
+  color: var(--txt);
+  font: inherit;
+  font-size: 12px;
+  text-align: left;
+  cursor: pointer;
+}
+.menu-item:hover:not(:disabled) {
+  background: var(--elev);
+}
+.menu-item:disabled {
+  color: var(--mute);
+  cursor: default;
+}
+.menu-item-label {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.menu-item-danger {
+  color: var(--danger);
+}
+.menu-item-danger:hover:not(:disabled) {
+  background: var(--danger);
+  color: #fff;
+}
+.menu-badge {
+  margin-left: auto;
+  flex: none;
+  color: var(--mute);
+  font-size: 10.5px;
+}
+.menu-sep {
+  height: 1px;
+  margin: 5px 8px;
+  background: var(--line);
+}
+.menu-label {
+  padding: 8px 10px 4px;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+  color: var(--mute);
+}
+.menu-sub-wrap {
+  position: relative;
+}
+.menu-sub-panel {
+  left: 100%;
+  top: -5px;
+}
+.menu-sub-panel.menu-panel-right {
+  left: auto;
+  right: 100%;
+}
+.menu-check {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 14px;
+  height: 14px;
+  flex: none;
+  color: var(--accent);
+}

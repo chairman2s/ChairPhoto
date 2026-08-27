@@ -11,9 +11,22 @@ const LABEL_COLORS: Record<string, string> = Object.fromEntries(
   COLOR_LABELS.map((l) => [l.name, l.color]),
 );
 
-// Grid layout constants (must match the .grid-scroll padding and .grid-row gap in CSS).
-const GAP = 10;
-const MIN_TILE = 160;
+// Grid layout constant (must match the .grid-row gap in CSS). The minimum tile width used
+// to be a constant too (MIN_TILE); it is now the `tileMin` prop, driven by the command
+// pill's thumbnail-size slider (see App.tsx's `thumbSize` state).
+const GAP = 3;
+
+/**
+ * How many columns fit `width` px of available space at `tileMin` px minimum tile width and
+ * `gap` px between tiles — the same `repeat(auto-fill, minmax(tileMin, 1fr))` arithmetic CSS
+ * grid would use, computed here so the ResizeObserver-driven column count and the estimated
+ * row height (both in `setScrollEl` below) agree with what actually renders. Exported for a
+ * direct unit test; `width <= 0` (nothing measured yet) floors to 1 rather than 0.
+ */
+export function computeCols(width: number, tileMin: number, gap: number): number {
+  if (width <= 0) return 1;
+  return Math.max(1, Math.floor((width + gap) / (tileMin + gap)));
+}
 
 // Whether a status implies a local and/or remote (NAS) copy, for the tile icons.
 function storageIcons(status: StorageStatus | undefined): {
@@ -179,6 +192,7 @@ export function CatalogGrid({
   onSelect,
   onOpen,
   onContextMenu,
+  tileMin = 160,
 }: {
   photos: Photo[];
   selectedId: number | null;
@@ -206,6 +220,9 @@ export function CatalogGrid({
   onOpen: (photo: Photo) => void;
   /** Right-click on a tile (for the context menu). */
   onContextMenu?: (photo: Photo, e: MouseEvent) => void;
+  /** Minimum tile width (px), bound to the command pill's thumbnail-size slider. A change
+   *  re-attaches the ResizeObserver and re-measures (see `setScrollEl`'s dep array). */
+  tileMin?: number;
 }) {
   const parentRef = useRef<HTMLDivElement | null>(null);
   const roRef = useRef<ResizeObserver | null>(null);
@@ -252,7 +269,7 @@ export function CatalogGrid({
       // is exactly the width available to tiles.
       const w = el.clientWidth;
       if (w <= 0) return;
-      const c = Math.max(1, Math.floor((w + GAP) / (MIN_TILE + GAP)));
+      const c = computeCols(w, tileMin, GAP);
       const colW = (w - GAP * (c - 1)) / c;
       const thumbH = (colW * 2) / 3; // .thumb aspect-ratio is 3/2
       setCols(c);
@@ -263,7 +280,11 @@ export function CatalogGrid({
     const ro = new ResizeObserver(recompute);
     ro.observe(el);
     roRef.current = ro;
-  }, []);
+    // tileMin changing (the thumb-size slider) must re-measure with the new minimum — a
+    // dependency change on a callback ref makes React call this with `null` (disconnecting
+    // the old observer via the guard above) and then with the element again, so this both
+    // re-attaches the ResizeObserver and recomputes cols/estRow synchronously.
+  }, [tileMin]);
 
   const idIndex = useMemo(() => {
     const m = new Map<number, number>();

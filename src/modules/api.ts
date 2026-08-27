@@ -368,7 +368,7 @@ export interface PhotoPage {
 export const listPhotos = (query: PhotoQuery = {}) =>
   invoke<PhotoPage>("list_photos", { query });
 
-/** Distinct camera models / lenses in the catalog, for the filter-bar dropdowns. */
+/** Distinct camera models / lenses in the catalog, for the command pill's picker. */
 export const distinctPhotoValues = (kind: "camera" | "lens") =>
   invoke<string[]>("distinct_photo_values", { kind });
 

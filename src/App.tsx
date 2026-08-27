@@ -74,7 +74,6 @@ import { TagPanel } from "./components/TagPanel";
 import { AlbumsPanel } from "./components/AlbumsPanel";
 import { SmartAlbumsPanel } from "./components/SmartAlbumsPanel";
 import { BatchesPanel } from "./components/BatchesPanel";
-import { FilterBar } from "./components/FilterBar";
 import { TagEditor } from "./components/TagEditor";
 import { PhotoInspector } from "./components/PhotoInspector";
 import { ZoomableImage } from "./components/ZoomableImage";
@@ -116,7 +115,7 @@ import { CatalogSwitcher } from "./components/CatalogSwitcher";
 import { EditorView } from "./components/EditorView";
 import { parseEdit } from "./modules/editing";
 import { ImportBatch, listImportBatches, listRecentCatalogs } from "./modules/api";
-import { TitleBar, IconRail, Bench, railOrder } from "./components/shell";
+import { TitleBar, IconRail, Bench, CommandPill, railOrder } from "./components/shell";
 import { useAppearance } from "./theme/controller";
 import "./App.css";
 
@@ -211,12 +210,21 @@ export default function App() {
   const [rightHidden, setRightHidden] = useState(
     () => localStorage.getItem("panel.rightHidden") === "1",
   );
+  // Grid tile size (px), driven by the command pill's thumbnail-size slider — same
+  // persisted-to-localStorage treatment as the panel widths above. Clamped to the slider's
+  // own [120, 320] range so a hand-edited or stale localStorage value can't hand CatalogGrid
+  // an out-of-range tileMin.
+  const [thumbSize, setThumbSize] = useState(() => {
+    const raw = +(localStorage.getItem("panel.thumbSize") || 160);
+    return Math.min(320, Math.max(120, Number.isFinite(raw) ? raw : 160));
+  });
   useEffect(() => {
     localStorage.setItem("panel.leftW", String(leftW));
     localStorage.setItem("panel.rightW", String(rightW));
     localStorage.setItem("panel.leftHidden", leftHidden ? "1" : "0");
     localStorage.setItem("panel.rightHidden", rightHidden ? "1" : "0");
-  }, [leftW, rightW, leftHidden, rightHidden]);
+    localStorage.setItem("panel.thumbSize", String(thumbSize));
+  }, [leftW, rightW, leftHidden, rightHidden, thumbSize]);
 
   // Drag a column edge to resize. `side` picks which width to adjust; the right
   // column grows when dragged left, so its delta is inverted.
@@ -271,7 +279,7 @@ export default function App() {
   // Bundle import dialog open/closed.
   const [showBundleImport, setShowBundleImport] = useState(false);
   // Import batches, for the title bar's "Export a bundle" submenu (TitleBar owns none of
-  // this fetch — BatchesPanel/FilterBar/SmartAlbumEditor each keep their own copy the same
+  // this fetch — BatchesPanel/CommandPill/SmartAlbumEditor each keep their own copy the same
   // way, reloaded on the same `batchesKey` bump).
   const [importBatches, setImportBatches] = useState<ImportBatch[]>([]);
   useEffect(() => {
@@ -519,7 +527,7 @@ export default function App() {
         setBootStage(BOOT_STAGES[2]); // Starting modules…
         setReady(true);
         refreshCatalogName(); // now that init_catalog has recorded it as the most recent
-        // The sidebar panels (albums / smart albums / batches) and the FilterBar fetch
+        // The sidebar panels (albums / smart albums / batches) and the command pill fetch
         // their lists in mount effects, which fire BEFORE this initCatalog() chain has
         // opened the catalog — those first fetches fail ("No catalog is open") and are
         // swallowed. Bump their reload keys now that the catalog is open, mirroring the
@@ -1368,31 +1376,6 @@ export default function App() {
         onToggleRight={() => setRightHidden((v) => !v)}
       />
 
-      <FilterBar
-        filters={FILTERS}
-        filter={scope.filter}
-        onFilter={library.setFilter}
-        activeTagLabel={tags.find((t) => t.id === scope.tagId)?.name ?? null}
-        onClearTag={() => library.selectTag(null)}
-        activeAlbumId={scope.albumId}
-        onClearAlbum={() => library.selectAlbum(null)}
-        activeBatchId={scope.batchId}
-        onClearBatch={() => library.selectBatch(null)}
-        activeFacets={scope.facets}
-        onToggleFacet={library.toggleFacet}
-        storageTier={scope.storageTier}
-        onStorageTier={library.setStorageTier}
-        photoSort={scope.sort}
-        onPhotoSort={library.setSort}
-        activeCamera={scope.camera}
-        onCamera={library.setCamera}
-        activeLens={scope.lens}
-        onLens={library.setLens}
-        activeLabels={scope.labels}
-        onToggleLabel={library.toggleLabel}
-        reloadKey={groupsKey}
-      />
-
       <div
         className="body"
         style={{
@@ -1476,6 +1459,39 @@ export default function App() {
         )}
         <main className={`grid-wrap ${inDevelop ? "develop-wrap" : ""}`}>
           <div className="stage">
+            {/* Only the grid and the inline loupe have anything to filter/sort/size — hidden
+                in Develop, module views and Compare, which is exactly the rest of this
+                ternary's branches (mirrors it rather than tracking its own state). */}
+            {!(inDevelop && selected) && !activeView && !inCompare && (
+              <CommandPill
+                filters={FILTERS}
+                filter={scope.filter}
+                onFilter={library.setFilter}
+                activeTagLabel={tags.find((t) => t.id === scope.tagId)?.name ?? null}
+                onClearTag={() => library.selectTag(null)}
+                activeAlbumId={scope.albumId}
+                onClearAlbum={() => library.selectAlbum(null)}
+                activeSmartAlbumId={scope.smartAlbumId}
+                onClearSmartAlbum={() => library.selectSmartAlbum(null)}
+                activeBatchId={scope.batchId}
+                onClearBatch={() => library.selectBatch(null)}
+                activeFacets={scope.facets}
+                onToggleFacet={library.toggleFacet}
+                storageTier={scope.storageTier}
+                onStorageTier={library.setStorageTier}
+                photoSort={scope.sort}
+                onPhotoSort={library.setSort}
+                activeCamera={scope.camera}
+                onCamera={library.setCamera}
+                activeLens={scope.lens}
+                onLens={library.setLens}
+                activeLabels={scope.labels}
+                onToggleLabel={library.toggleLabel}
+                reloadKey={groupsKey}
+                thumbSize={thumbSize}
+                onThumbSize={setThumbSize}
+              />
+            )}
             {inDevelop && selected ? (
               <EditorView
                 photoId={selected.id}
@@ -1634,6 +1650,7 @@ export default function App() {
                 onVisibleRange={library.setVisibleRange}
                 thumbBusts={thumbBusts}
                 softThreshold={softThreshold}
+                tileMin={thumbSize}
                 emptyMessage={
                   scope.storageTier === "nas"
                     ? "No NAS-only photos yet. Older photos move here when offloaded — set a day count in Preferences → Storage → Local / NAS tiering, or click “Offload older now”."

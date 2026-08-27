@@ -19,6 +19,7 @@ import { fireEvent, render, screen } from "@testing-library/react";
 import { TitleBar, type TitleBarProps, type ModuleActionGroup } from "../TitleBar";
 import { IconRail, type IconRailProps } from "../IconRail";
 import { Bench, type BenchProps } from "../Bench";
+import { CommandPill, type CommandPillProps } from "../CommandPill";
 import { COLOR_LABELS } from "../../../modules/labels";
 import type { ImportBatch } from "../../../modules/api";
 import type { ToolbarAction, MainView, Photo } from "../../../modules/registry";
@@ -406,6 +407,278 @@ describe("IconRail command inventory (preservation)", () => {
 
   it("covers every rail affordance IconRail renders", () => {
     expect(railCases.length).toBe(5);
+  });
+});
+
+// -- CommandPill -------------------------------------------------------------------------
+// The floating command pill (CommandPill.tsx) absorbed the old `<FilterBar>` row that used
+// to sit directly under TitleBar — culling seg, colour-label dots, removable scope chips,
+// and the facet/camera/lens/storage/sort pickers (now behind a "+Filter" menu) — plus the
+// smart-album chip and thumbnail-size slider FilterBar never had. Same preservation intent,
+// same table style, own inventory.
+//
+// Unlike TitleBar/IconRail/Bench, CommandPill resolves a few names (album/smart-album/batch)
+// and option lists (facets/cameras/lenses) via `invoke` on mount. Every case below asserts
+// through a chip/item's `title` or static label rather than an async-resolved display name,
+// so none of them need to wait on that fetch — the mock just needs to not reject.
+
+vi.mock("@tauri-apps/api/core", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@tauri-apps/api/core")>();
+  return {
+    ...actual,
+    invoke: () => Promise.resolve([]),
+  };
+});
+
+/** Permissive pill props: an empty scope (no chips) and fresh vi.fn()s. Individual cases
+ *  patch in whatever scope value their chip needs. */
+function buildPillProps(): CommandPillProps {
+  return {
+    filters: ["all", "unrated", "pick", "reject", "edited"],
+    filter: "all",
+    onFilter: vi.fn(),
+    activeTagLabel: null,
+    onClearTag: vi.fn(),
+    activeAlbumId: null,
+    onClearAlbum: vi.fn(),
+    activeSmartAlbumId: null,
+    onClearSmartAlbum: vi.fn(),
+    activeBatchId: null,
+    onClearBatch: vi.fn(),
+    activeFacets: [],
+    onToggleFacet: vi.fn(),
+    storageTier: "all",
+    onStorageTier: vi.fn(),
+    photoSort: "date",
+    onPhotoSort: vi.fn(),
+    activeCamera: null,
+    onCamera: vi.fn(),
+    activeLens: null,
+    onLens: vi.fn(),
+    activeLabels: [],
+    onToggleLabel: vi.fn(),
+    reloadKey: 0,
+    thumbSize: 160,
+    onThumbSize: vi.fn(),
+  };
+}
+
+const openFilterMenu = () => fireEvent.click(screen.getByRole("button", { name: "＋ Filter" }));
+
+interface PillCase {
+  name: string;
+  /** Overrides on the permissive base — e.g. an active tag, so its chip renders. */
+  props?: Partial<CommandPillProps>;
+  run: () => void;
+  spy: (props: CommandPillProps) => Mock;
+  expectCalledWith?: unknown[];
+}
+
+const pillCases: PillCase[] = [
+  {
+    name: "seg: All",
+    run: () => fireEvent.click(screen.getByRole("button", { name: "All" })),
+    spy: (p) => p.onFilter as unknown as Mock,
+    expectCalledWith: ["all"],
+  },
+  {
+    name: "seg: Unrated",
+    run: () => fireEvent.click(screen.getByRole("button", { name: "Unrated" })),
+    spy: (p) => p.onFilter as unknown as Mock,
+    expectCalledWith: ["unrated"],
+  },
+  {
+    name: "seg: Picks",
+    run: () => fireEvent.click(screen.getByRole("button", { name: "Picks" })),
+    spy: (p) => p.onFilter as unknown as Mock,
+    expectCalledWith: ["pick"],
+  },
+  {
+    name: "seg: Rejects",
+    run: () => fireEvent.click(screen.getByRole("button", { name: "Rejects" })),
+    spy: (p) => p.onFilter as unknown as Mock,
+    expectCalledWith: ["reject"],
+  },
+  {
+    name: "seg: Edited",
+    run: () => fireEvent.click(screen.getByRole("button", { name: "Edited" })),
+    spy: (p) => p.onFilter as unknown as Mock,
+    expectCalledWith: ["edited"],
+  },
+  // One case per canonical colour label, same pattern as the bench's dots below.
+  ...COLOR_LABELS.map(
+    (l): PillCase => ({
+      name: `label dot (${l.name})`,
+      run: () => fireEvent.click(screen.getByTitle(`${l.name} label`)),
+      spy: (p) => p.onToggleLabel as unknown as Mock,
+      expectCalledWith: [l.name],
+    }),
+  ),
+  {
+    name: "label dot (none)",
+    run: () => fireEvent.click(screen.getByTitle("No label")),
+    spy: (p) => p.onToggleLabel as unknown as Mock,
+    expectCalledWith: [""],
+  },
+  {
+    name: "chip: tag",
+    props: { activeTagLabel: "Portraits" },
+    run: () => fireEvent.click(screen.getByTitle("Clear tag filter")),
+    spy: (p) => p.onClearTag as unknown as Mock,
+  },
+  {
+    name: "chip: album",
+    props: { activeAlbumId: 3 },
+    run: () => fireEvent.click(screen.getByTitle("Clear album filter")),
+    spy: (p) => p.onClearAlbum as unknown as Mock,
+  },
+  {
+    name: "chip: smart album",
+    props: { activeSmartAlbumId: 4 },
+    run: () => fireEvent.click(screen.getByTitle("Clear smart album filter")),
+    spy: (p) => p.onClearSmartAlbum as unknown as Mock,
+  },
+  {
+    name: "chip: batch",
+    props: { activeBatchId: 5 },
+    run: () => fireEvent.click(screen.getByTitle("Clear batch filter")),
+    spy: (p) => p.onClearBatch as unknown as Mock,
+  },
+  {
+    name: "chip: facet",
+    props: { activeFacets: ["has-gps"] },
+    run: () => fireEvent.click(screen.getByTitle("Remove facet filter")),
+    spy: (p) => p.onToggleFacet as unknown as Mock,
+    expectCalledWith: ["has-gps"],
+  },
+  {
+    name: "chip: camera",
+    props: { activeCamera: "Canon EOS R5" },
+    run: () => fireEvent.click(screen.getByTitle("Clear camera filter")),
+    spy: (p) => p.onCamera as unknown as Mock,
+    expectCalledWith: [null],
+  },
+  {
+    name: "chip: lens",
+    props: { activeLens: "50mm" },
+    run: () => fireEvent.click(screen.getByTitle("Clear lens filter")),
+    spy: (p) => p.onLens as unknown as Mock,
+    expectCalledWith: [null],
+  },
+  {
+    name: "chip: storage tier",
+    props: { storageTier: "nas" },
+    run: () => fireEvent.click(screen.getByTitle("Clear storage filter")),
+    spy: (p) => p.onStorageTier as unknown as Mock,
+    expectCalledWith: ["all"],
+  },
+  {
+    name: "+Filter: Any camera",
+    run: () => {
+      openFilterMenu();
+      fireEvent.click(screen.getByRole("menuitem", { name: "Camera" }));
+      fireEvent.click(screen.getByRole("menuitem", { name: "Any camera" }));
+    },
+    spy: (p) => p.onCamera as unknown as Mock,
+    expectCalledWith: [null],
+  },
+  {
+    name: "+Filter: Any lens",
+    run: () => {
+      openFilterMenu();
+      fireEvent.click(screen.getByRole("menuitem", { name: "Lens" }));
+      fireEvent.click(screen.getByRole("menuitem", { name: "Any lens" }));
+    },
+    spy: (p) => p.onLens as unknown as Mock,
+    expectCalledWith: [null],
+  },
+  {
+    name: "+Filter: Storage All",
+    run: () => {
+      openFilterMenu();
+      fireEvent.click(screen.getByRole("menuitemcheckbox", { name: "All" }));
+    },
+    spy: (p) => p.onStorageTier as unknown as Mock,
+    expectCalledWith: ["all"],
+  },
+  {
+    name: "+Filter: Storage On disk",
+    run: () => {
+      openFilterMenu();
+      fireEvent.click(screen.getByRole("menuitemcheckbox", { name: "On disk" }));
+    },
+    spy: (p) => p.onStorageTier as unknown as Mock,
+    expectCalledWith: ["local"],
+  },
+  {
+    name: "+Filter: Storage NAS only",
+    run: () => {
+      openFilterMenu();
+      fireEvent.click(screen.getByRole("menuitemcheckbox", { name: "NAS only" }));
+    },
+    spy: (p) => p.onStorageTier as unknown as Mock,
+    expectCalledWith: ["nas"],
+  },
+  {
+    name: "+Filter: Sort Date",
+    run: () => {
+      openFilterMenu();
+      fireEvent.click(screen.getByRole("menuitemcheckbox", { name: "Date" }));
+    },
+    spy: (p) => p.onPhotoSort as unknown as Mock,
+    expectCalledWith: ["date"],
+  },
+  {
+    name: "+Filter: Sort Least sharp first",
+    run: () => {
+      openFilterMenu();
+      fireEvent.click(screen.getByRole("menuitemcheckbox", { name: "Least sharp first" }));
+    },
+    spy: (p) => p.onPhotoSort as unknown as Mock,
+    expectCalledWith: ["sharpness_asc"],
+  },
+  {
+    name: "+Filter: Sort Sharpest first",
+    run: () => {
+      openFilterMenu();
+      fireEvent.click(screen.getByRole("menuitemcheckbox", { name: "Sharpest first" }));
+    },
+    spy: (p) => p.onPhotoSort as unknown as Mock,
+    expectCalledWith: ["sharpness_desc"],
+  },
+  {
+    name: "thumbnail size slider",
+    run: () =>
+      fireEvent.change(screen.getByLabelText("Thumbnail size"), { target: { value: "240" } }),
+    spy: (p) => p.onThumbSize as unknown as Mock,
+    expectCalledWith: [240],
+  },
+];
+
+describe("CommandPill command inventory (preservation)", () => {
+  it.each(pillCases)(
+    "$name fires its callback exactly once",
+    ({ props: patch, run, spy, expectCalledWith }) => {
+      const props = { ...buildPillProps(), ...patch };
+      render(<CommandPill {...props} />);
+
+      run();
+
+      const mock = spy(props);
+      expect(mock).toHaveBeenCalledTimes(1);
+      if (expectCalledWith) {
+        expect(mock).toHaveBeenCalledWith(...expectCalledWith);
+      }
+    },
+  );
+
+  it("covers every affordance CommandPill renders", () => {
+    expect(pillCases.length).toBe(28);
+  });
+
+  it("renders no scope chips when the scope is empty", () => {
+    render(<CommandPill {...buildPillProps()} />);
+    expect(screen.queryByText("✕")).toBeNull();
   });
 });
 

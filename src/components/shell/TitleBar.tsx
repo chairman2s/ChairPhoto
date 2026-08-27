@@ -32,8 +32,8 @@ export interface ModuleActionGroup {
 }
 
 // Same "last path segment" label an import batch gets everywhere else it's shown
-// (BatchesPanel, FilterBar, App's bundleExportBatch dialog title) — kept local rather than
-// shared because each of those call sites already carries its own copy.
+// (BatchesPanel, CommandPill, App's bundleExportBatch dialog title) — kept local rather
+// than shared because each of those call sites already carries its own copy.
 function batchLabel(b: ImportBatch): string {
   return b.sourceLabel.replace(/\/+$/, "").split("/").pop() || b.sourceLabel || "(ingest)";
 }

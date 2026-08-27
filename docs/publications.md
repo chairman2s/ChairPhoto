@@ -81,7 +81,7 @@ wrapper in `src/modules/api.ts`, which takes an explicit platform.
   lists publications and lets the user mark a Flickr/SmugMug/other post by picking a
   platform and which version (defaults to the inspector's active version).
 - **Filtering:** dynamic facets keyed `published:<platform>` are appended by
-  `available_facets()` and reuse the existing FilterBar chips — no dedicated filter UI.
+  `available_facets()` and reuse the existing command pill chips — no dedicated filter UI.
 
 ## Progress and cancellation
 

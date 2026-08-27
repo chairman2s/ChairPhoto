@@ -121,124 +121,6 @@ body {
   cursor: default;
   box-shadow: none;
 }
-.filters {
-  display: flex;
-  gap: 4px;
-}
-
-/* Active-filters bar (below the topbar) */
-.filter-bar {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 6px 12px;
-  background: transparent;
-  border-bottom: 1px solid var(--panel);
-  min-height: 44px;
-}
-/* Pill variant of the segmented control (for culling/storage filter groups) */
-.seg-pill {
-  display: inline-flex;
-  gap: 2px;
-  background: var(--panel);
-  border-radius: var(--r-pill);
-  padding: 3px;
-}
-.seg-pill .seg-item {
-  border-radius: var(--r-pill);
-}
-.seg-pill .seg-item.on {
-  background: var(--border);
-  color: var(--txt);
-  font-weight: 600;
-}
-.filter-bar-sep {
-  width: 1px;
-  align-self: stretch;
-  background: var(--border);
-}
-.filter-chip {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  padding: 3px 9px;
-  background: var(--sel);
-  border: 1px solid color-mix(in srgb, var(--accent) 45%, transparent);
-  border-radius: var(--r-pill);
-  color: var(--accent);
-  cursor: pointer;
-  font-size: 12px;
-}
-.filter-chip:hover {
-  background: color-mix(in srgb, var(--accent) 22%, transparent);
-}
-.filter-chip-x {
-  color: var(--dim);
-}
-/* Colour-label filter dots (FilterBar): one per label + the crossed "none" dot.
-   Inactive dots are dimmed; active ones get full colour and a ring. */
-.label-dots {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-}
-.label-dot {
-  width: 14px;
-  height: 14px;
-  padding: 0;
-  border-radius: 50%;
-  border: 1px solid var(--border);
-  cursor: pointer;
-  opacity: 0.45;
-}
-.label-dot:hover {
-  opacity: 0.8;
-}
-.label-dot.on {
-  opacity: 1;
-  border-color: var(--txt);
-  box-shadow: 0 0 0 2px var(--panel), 0 0 0 3px var(--dim);
-}
-/* The "no label" dot: hollow with a diagonal slash. */
-.label-dot-none {
-  background:
-    linear-gradient(
-      135deg,
-      transparent 44%,
-      var(--dim) 44%,
-      var(--dim) 56%,
-      transparent 56%
-    );
-}
-
-.facet-add {
-  padding: 3px 9px;
-  background: transparent;
-  border: 1px dashed var(--border);
-  border-radius: var(--r-pill);
-  color: var(--dim);
-  cursor: pointer;
-  font-size: 12px;
-}
-.facet-add:hover {
-  color: var(--txt);
-  border-color: var(--dim);
-}
-.filter-select {
-  background: var(--elev);
-  color: inherit;
-  border: 1px solid var(--border);
-  border-radius: var(--r-pill);
-  padding: 0 12px;
-  height: 28px;
-  font-size: 12px;
-  max-width: 180px;
-  cursor: pointer;
-}
-.filter-select:hover {
-  border-color: var(--dim);
-}
-
 /* Preferences dialog — wide enough that visual panels (e.g. the Flickr import
    matcher's thumbnail comparison) are actually legible. */
 .modal.prefs {
@@ -1551,7 +1433,7 @@ body {
 }
 .grid-row {
   display: grid;
-  gap: 10px;
+  gap: 3px;
   align-content: start;
 }
 /* Video tiles: a play badge overlaid on the poster-frame thumbnail. */
@@ -1595,7 +1477,7 @@ body {
   padding: 0;
   background: var(--elev);
   border: 2px solid var(--border);
-  border-radius: var(--r);
+  border-radius: 3px;
   overflow: hidden;
   cursor: pointer;
   display: flex;
@@ -4445,4 +4327,119 @@ body {
 .bench-x:hover {
   color: var(--txt);
   background: var(--elev);
+}
+
+/* ── Shell: command pill ── */
+/* src/components/shell/CommandPill.tsx — the floating filter/sort/thumb-size pill over
+   `.stage` (see agent-notes mockup Main.dc.html `.float-tb`), replacing the old
+   `.filter-bar` row that used to sit between the title bar and `.body`. Absolutely
+   positioned inside `.stage` (which is `position: relative`), centered and floating over
+   the grid/loupe instead of pushing either down a row. */
+.float-tb {
+  position: absolute;
+  top: 14px;
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: var(--r-pill);
+  box-shadow: var(--shadow-pop);
+  z-index: 5;
+}
+/* Culling seg items and the +Filter trigger share this class — a flat, borderless pill
+   button that gets an `--elev` fill only while active/open (mirrors `.seg-item`, but the
+   pill's items sit flush against each other with no `.seg-pill` wrapper, per the mockup). */
+.ft {
+  height: 26px;
+  padding: 0 12px;
+  border-radius: var(--r-pill);
+  border: none;
+  background: transparent;
+  color: var(--dim);
+  font-size: 11.5px;
+  cursor: pointer;
+  font-family: inherit;
+  white-space: nowrap;
+}
+.ft:hover {
+  color: var(--txt);
+}
+.ft.on {
+  background: var(--elev);
+  color: var(--txt);
+  font-weight: 600;
+}
+.ftsep {
+  width: 1px;
+  height: 16px;
+  flex: none;
+  margin: 0 5px;
+  background: var(--border);
+}
+/* Colour-label dots: one per label + a crossed "none" dot, multi-select (OR). Identical to
+   the bench's `.bench-dot`/`.bench-dot.on`/`.bench-dot-x` (see the bench section above) —
+   the two are the same control shown in two places, so they stay visually identical. */
+.ftdots {
+  display: flex;
+  gap: 5px;
+  padding: 0 7px;
+  align-items: center;
+}
+.fd {
+  width: 10px;
+  height: 10px;
+  padding: 0;
+  border: none;
+  border-radius: 50%;
+  opacity: 0.42;
+  cursor: pointer;
+}
+.fd.on {
+  opacity: 1;
+  box-shadow: 0 0 0 2px var(--panel), 0 0 0 3.5px currentColor;
+}
+.fd-x {
+  background: transparent;
+  border: 1.4px solid var(--mute);
+  opacity: 0.6;
+}
+/* Removable scope chips (tag / album / smart album / batch / facet / camera / lens /
+   storage tier) — a small `--sel`-tinted pill with a trailing ✕, one click clears it. */
+.ftchip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 26px;
+  padding: 0 10px;
+  background: var(--sel);
+  border: 1px solid color-mix(in srgb, var(--accent) 45%, transparent);
+  border-radius: var(--r-pill);
+  color: var(--accent);
+  cursor: pointer;
+  font-size: 11.5px;
+  white-space: nowrap;
+}
+.ftchip:hover {
+  background: color-mix(in srgb, var(--accent) 22%, transparent);
+}
+.ftchip-x {
+  color: var(--dim);
+}
+/* Thumbnail-size slider: a small grid glyph + a thin range input. */
+.ftsize {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 0 10px 0 7px;
+  color: var(--mute);
+}
+.ftsize input[type="range"] {
+  width: 70px;
+  height: 3px;
+  cursor: pointer;
+  accent-color: var(--accent);
 }

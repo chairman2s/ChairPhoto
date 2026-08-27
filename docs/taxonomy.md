@@ -198,8 +198,8 @@ Design consequence — keep these on the *right* axis:
   - **Facets vs auto-tags**: want it shared/exported → **auto-tag**; purely-internal
     filtering you'd never share (has-GPS, shot-on-mobile, drone) → **facet**.
   - **Filter bar**: the catalog ANDs culling + tag + album in
-    `list_photos`; the `FilterBar` component surfaces the active scope as removable
-    chips.
+    `list_photos`; the `CommandPill` component (the floating pill over the stage) surfaces
+    the active scope as removable chips.
   - **Facets**: derived, internal-only filters computed from EXIF —
     `has-gps`, `mobile`, `drone` (`catalog/facets.rs`). They AND into `list_photos`
     and appear in the filter bar as add/remove chips, but are **never exported**

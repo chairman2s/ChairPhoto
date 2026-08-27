@@ -22,6 +22,8 @@ import {
   deleteTag,
   findSimilarTags,
   findOrphanTags,
+  getSystemTheme,
+  onThemeChanged,
   type OrphanTag,
   type SimilarTagPair,
   type TagWithCount,
@@ -38,9 +40,9 @@ import { ModuleSettings } from "../modules/ModuleContent";
 import { VolumesSection } from "./VolumesPanel";
 import { SafetySection } from "./SafetyPanel";
 import { ModulesSection } from "./ModulesPanel";
-import { applyStandard } from "../theme/apply";
-import { loadAppearanceMode, storeAppearanceMode } from "../theme/prefs";
-import type { AppearanceMode } from "../theme/tokens";
+import { getAppearanceMode, setAppearanceMode } from "../theme/controller";
+import { useOwnedSubscription } from "../modules/ownedEvents";
+import type { AppearanceMode, SystemThemeResult } from "../theme/tokens";
 
 // One preferences dialog. Fixed tabs: Storage (library root + volumes) and Modules
 // (enable/disable). Then one tab per enabled module that contributes settings (AI, Flickr,
@@ -662,20 +664,60 @@ function EditorsSection() {
   );
 }
 
-// Which palette source drives the app's theme. "Follow Omarchy" is the product default —
-// live detection of the user's system theme lands in a follow-up; until then it renders
-// ChairPhoto Standard, same as choosing Standard explicitly. This is a per-machine
-// preference (localStorage), not a catalog setting — it does not travel with the catalog.
+// Which palette source drives the app's theme. "Follow Omarchy" is the product default:
+// the palette is derived live from the user's Omarchy/system theme (theme/controller.ts)
+// and tracks theme switches while this dialog is open. This is a per-machine preference
+// (localStorage via theme/prefs.ts), not a catalog setting — it does not travel with the
+// catalog between computers.
+/** The Appearance tab's status line for a detection result — shared by the on-mount/
+ *  mode-change read and the live `appearance:theme_changed` subscription below, so both
+ *  paths render the identical wording. */
+function appearanceStatusLine(r: SystemThemeResult): string {
+  if (r.available) {
+    return `Following Omarchy · ${r.themeName ?? "unnamed theme"} · ${r.palette?.mode ?? ""}`;
+  }
+  return (
+    "Omarchy not detected — ChairPhoto Standard is in use. This is normal without Omarchy; " +
+    "nothing is missing."
+  );
+}
+
 function AppearanceSection() {
-  const [mode, setMode] = useState<AppearanceMode>(() => loadAppearanceMode());
+  const [mode, setMode] = useState<AppearanceMode>(() => getAppearanceMode());
+  const [status, setStatus] = useState<string | null>(null);
 
   const choose = (next: AppearanceMode) => {
     setMode(next);
-    storeAppearanceMode(next);
-    // Both options currently render ChairPhoto Standard — see the status line below for
-    // "follow-omarchy". Re-applying keeps this honest once live detection replaces it.
-    applyStandard();
+    setAppearanceMode(next);
   };
+
+  // Read the live status on mount, and again whenever the user switches back to Follow —
+  // mount already covers "already following" (the effect below fires on mount too), so
+  // this one condition is both cases the spec calls out. Standard mode never shows the
+  // line, so there is nothing to read for it.
+  useEffect(() => {
+    if (mode !== "follow-omarchy") return;
+    let cancelled = false;
+    getSystemTheme()
+      .then((r) => {
+        if (!cancelled) setStatus(appearanceStatusLine(r));
+      })
+      .catch(() => {
+        if (!cancelled) setStatus(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [mode]);
+
+  // Keep the line live while the dialog is open: a desktop theme switch updates it without
+  // waiting for the tab to be revisited. Subscribed unconditionally (not gated on `mode`) —
+  // it only ever drives `status`, which is rendered solely under the follow-omarchy branch
+  // below, so an event arriving while on Standard is harmless.
+  useOwnedSubscription(
+    () => onThemeChanged((r) => setStatus(appearanceStatusLine(r))),
+    [],
+  );
 
   return (
     <div className="prefs-section">
@@ -698,12 +740,7 @@ function AppearanceSection() {
           ChairPhoto Standard
         </button>
       </div>
-      {mode === "follow-omarchy" && (
-        <div className="modal-sub">
-          Omarchy theme detection is wired in a follow-up — ChairPhoto Standard is currently
-          being used.
-        </div>
-      )}
+      {mode === "follow-omarchy" && status && <div className="modal-sub">{status}</div>}
     </div>
   );
 }

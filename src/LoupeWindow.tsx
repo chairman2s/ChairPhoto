@@ -5,6 +5,7 @@ import { announceReady, onPhoto, type LoupePhoto } from "./modules/loupe";
 import { getSetting, listTags, pluginFeatures, renderEdit } from "./modules/api";
 import { parseEdit } from "./modules/editing";
 import { FaceOverlay, type FaceOverlayApi } from "./modules/plugins/faces";
+import { useAppearance } from "./theme/controller";
 import "./App.css";
 
 // Root component for the popped-out loupe window (rendered when the URL hash is
@@ -12,6 +13,7 @@ import "./App.css";
 // follows along as the selection changes there — so you can park it on a second
 // screen.
 export default function LoupeWindow() {
+  useAppearance();
   const [photo, setPhoto] = useState<LoupePhoto>({ photoId: null, editJson: null });
   // The rendered edit (data URL) when a version is active; "" = show the Original.
   const [editedSrc, setEditedSrc] = useState("");

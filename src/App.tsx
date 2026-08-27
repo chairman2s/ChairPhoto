@@ -116,6 +116,7 @@ import { CatalogSwitcher } from "./components/CatalogSwitcher";
 import { EditorView } from "./components/EditorView";
 import { parseEdit } from "./modules/editing";
 import { ImportBatch } from "./modules/api";
+import { useAppearance } from "./theme/controller";
 import "./App.css";
 
 const FILTERS: CullingFilter[] = ["all", "unrated", "pick", "reject", "edited"];
@@ -131,6 +132,7 @@ const COLOR_KEYS: Record<string, string> = {
 };
 
 export default function App() {
+  useAppearance();
   // App reads only contributions state (mainViews/activeEditRenderer/toolbarActions/
   // panelsForSlot("loupe")) — it *writes* selection/filterContext/editingTag via
   // setSelection/setHostActiveVersion/setFilterContext/setEditingTagContext but never

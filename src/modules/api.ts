@@ -13,6 +13,7 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { onOpenUrl } from "@tauri-apps/plugin-deep-link";
 import { openUrl, revealItemInDir } from "@tauri-apps/plugin-opener";
 import type { ModulePermissions, Photo, Publication, Tag } from "./registry";
+import type { SystemThemeResult } from "../theme/tokens";
 
 /**
  * Build the `thumb://` asset URL for a photo id. Wraps Tauri's `convertFileSrc`
@@ -200,6 +201,16 @@ export const getSetting = (key: string) =>
 
 export const setSetting = (key: string, value: string) =>
   invoke<void>("set_setting", { key, value });
+
+/** Current Omarchy theme detection (docs/appearance.md). Never rejects — every failure
+ *  shape (no Omarchy, missing/malformed files, an invalid color) settles to
+ *  `{available: false, themeName: null, palette: null}`. */
+export const getSystemTheme = () => invoke<SystemThemeResult>("get_system_theme");
+
+/** Subscribe to live Omarchy theme switches (`appearance:theme_changed`), same payload
+ *  shape as {@link getSystemTheme}. Returns an unlisten function. */
+export const onThemeChanged = (handler: (r: SystemThemeResult) => void): Promise<UnlistenFn> =>
+  listen<SystemThemeResult>("appearance:theme_changed", (e) => handler(e.payload));
 
 /**
  * Open a native folder picker, returning the chosen absolute path, or null if the

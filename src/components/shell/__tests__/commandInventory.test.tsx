@@ -20,9 +20,34 @@ import { TitleBar, type TitleBarProps, type ModuleActionGroup } from "../TitleBa
 import { IconRail, type IconRailProps } from "../IconRail";
 import { Bench, type BenchProps } from "../Bench";
 import { CommandPill, type CommandPillProps } from "../CommandPill";
+import { CollectionBrowser, type CollectionBrowserProps } from "../CollectionBrowser";
 import { COLOR_LABELS } from "../../../modules/labels";
 import type { ImportBatch } from "../../../modules/api";
 import type { ToolbarAction, MainView, Photo } from "../../../modules/registry";
+
+// CollectionBrowser's sections persist open/collapsed state to localStorage. Node ≥22's
+// experimental global `localStorage` can win the race against jsdom's own Storage under
+// vitest but throw "is not a function" on every call (no backing file configured) — see
+// src/theme/__tests__/theme.test.ts's comment on the same issue. Detect the broken
+// accessor once and substitute a real in-memory Storage.
+if (typeof (globalThis as { localStorage?: Storage }).localStorage?.clear !== "function") {
+  const backing = new Map<string, string>();
+  const memoryStorage: Storage = {
+    getItem: (key) => (backing.has(key) ? (backing.get(key) as string) : null),
+    setItem: (key, value) => void backing.set(key, String(value)),
+    removeItem: (key) => void backing.delete(key),
+    clear: () => backing.clear(),
+    key: (index) => Array.from(backing.keys())[index] ?? null,
+    get length() {
+      return backing.size;
+    },
+  };
+  Object.defineProperty(globalThis, "localStorage", {
+    value: memoryStorage,
+    configurable: true,
+    writable: true,
+  });
+}
 
 function makeBatch(id: number, sourceLabel: string): ImportBatch {
   return { id, uuid: `uuid-${id}`, sourceLabel, note: "", createdAt: 0, photoCount: 10 };
@@ -68,7 +93,6 @@ function buildProps(): TitleBarProps {
     onAnalyseBurst: vi.fn(),
     onProposeStacks: vi.fn(),
     onCullSession: vi.fn(),
-    onTrash: vi.fn(),
     moduleActionGroups: moduleGroups,
     onModuleAction: vi.fn(),
     onOpenPrefs: vi.fn(),
@@ -213,14 +237,6 @@ const cases: Case[] = [
     spy: (p) => p.onCullSession as unknown as Mock,
   },
   {
-    name: "trash",
-    run: () => {
-      openMoreMenu();
-      clickMenuItem("Trash…");
-    },
-    spy: (p) => p.onTrash as unknown as Mock,
-  },
-  {
     name: "module action (group 1)",
     run: () => {
       openMoreMenu();
@@ -310,7 +326,8 @@ describe("TitleBar command inventory (preservation)", () => {
     // raw onClick), but it pins the total command count so a command silently added to
     // TitleBar without a matching case here fails loudly instead of shipping unpinned.
     // Was 24; Compare, Publish and Back up selection moved to the Bench (see below).
-    expect(cases.length).toBe(21);
+    // Was 21; Trash moved to CollectionBrowser's Library section (see below).
+    expect(cases.length).toBe(20);
   });
 });
 
@@ -409,6 +426,104 @@ describe("IconRail command inventory (preservation)", () => {
     expect(railCases.length).toBe(5);
   });
 });
+
+// -- CollectionBrowser -------------------------------------------------------------------
+// CollectionBrowser.tsx merged the four leftcol panels (TagPanel, AlbumsPanel,
+// SmartAlbumsPanel, BatchesPanel) into one scrollable browser and added a Library
+// section on top (All photos / Trash) — Trash's case here replaces the "trash" case that
+// used to live in the TitleBar table above, since the entry point moved off the More ⋯
+// menu. AlbumsPanel/SmartAlbumsPanel/BatchesPanel fetch via `invoke` on mount; the
+// CommandPill block below already stubs `@tauri-apps/api/core`'s `invoke` file-wide (vi.mock
+// hoists), so rendering them here is safe without a per-block mock.
+
+/** Permissive browser props: an active "all photos" scope, a known trash count, empty
+ *  pass-through panels, fresh vi.fn()s everywhere. */
+function buildBrowserProps(): CollectionBrowserProps {
+  return {
+    isAllScope: true,
+    onSelectAll: vi.fn(),
+    trashCount: 5,
+    onOpenTrash: vi.fn(),
+    tagPanel: {
+      tags: [],
+      activeTagId: null,
+      onSelectTag: vi.fn(),
+      onEditTag: vi.fn(),
+      onMoveTag: vi.fn(),
+      onSetPrivate: vi.fn(),
+      onTagsChanged: vi.fn(),
+      selectedPhotoIds: [],
+      onStatus: vi.fn(),
+    },
+    albumsPanel: {
+      activeAlbumId: null,
+      onSelectAlbum: vi.fn(),
+      selectionCount: 0,
+      onAddSelection: vi.fn(async () => {}),
+      reloadKey: 0,
+    },
+    smartAlbumsPanel: {
+      activeSmartAlbumId: null,
+      onSelectSmartAlbum: vi.fn(),
+      onEditRule: vi.fn(),
+      reloadKey: 0,
+    },
+    batchesPanel: {
+      activeBatchId: null,
+      onSelectBatch: vi.fn(),
+      onExportBatch: vi.fn(),
+      reloadKey: 0,
+    },
+  };
+}
+
+interface BrowserCase {
+  name: string;
+  props?: Partial<CollectionBrowserProps>;
+  run: () => void;
+  spy: (props: CollectionBrowserProps) => Mock;
+}
+
+// TagPanel keeps its own "All photos" root row (clears just the tag scope — see
+// TagPanel.tsx's `tag-filterrow`), so `getByRole("button", { name: "All photos" })` would
+// find two matches once the (default-open) tags section renders it alongside the
+// browser's own Library row. `.brow-li` is unique to the Library section's two rows
+// (index 0 = All photos, 1 = Trash), so query by that instead of by accessible name.
+const browserRow = (index: 0 | 1) => document.querySelectorAll(".brow-li")[index];
+
+const browserCases: BrowserCase[] = [
+  {
+    name: "all photos",
+    run: () => fireEvent.click(browserRow(0)),
+    spy: (p) => p.onSelectAll as unknown as Mock,
+  },
+  {
+    name: "trash",
+    run: () => fireEvent.click(browserRow(1)),
+    spy: (p) => p.onOpenTrash as unknown as Mock,
+  },
+];
+
+describe("CollectionBrowser command inventory (preservation)", () => {
+  it.each(browserCases)("$name fires its callback exactly once", ({ props: patch, run, spy }) => {
+    const props = { ...buildBrowserProps(), ...patch };
+    render(<CollectionBrowser {...props} />);
+
+    run();
+
+    const mock = spy(props);
+    expect(mock).toHaveBeenCalledTimes(1);
+  });
+
+  it("covers every Library-section affordance CollectionBrowser renders", () => {
+    expect(browserCases.length).toBe(2);
+  });
+});
+
+// The full behavioral suite (active-state marking, trash-count display, section
+// collapse/expand + persistence, collapsed-body unmounting, pass-through panel props)
+// lives in CollectionBrowser.test.tsx alongside the component; this file only pins the
+// two Library-section commands' reachability, matching the other tables above.
 
 // -- CommandPill -------------------------------------------------------------------------
 // The floating command pill (CommandPill.tsx) absorbed the old `<FilterBar>` row that used

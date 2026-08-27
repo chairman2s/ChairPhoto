@@ -79,7 +79,6 @@ export interface TitleBarProps {
   onAnalyseBurst: () => void;
   onProposeStacks: () => void;
   onCullSession: () => void;
-  onTrash: () => void;
   moduleActionGroups: ModuleActionGroup[];
   onModuleAction: (action: ToolbarAction) => void;
   onOpenPrefs: () => void;
@@ -118,7 +117,6 @@ export function TitleBar({
   onAnalyseBurst,
   onProposeStacks,
   onCullSession,
-  onTrash,
   moduleActionGroups,
   onModuleAction,
   onOpenPrefs,
@@ -272,33 +270,23 @@ export function TitleBar({
             Start cull session
           </MenuItem>
           <MenuSeparator />
-          <MenuItem
-            disabled={!ready}
-            title="Photos you have hidden. Nothing there has been deleted — restoring is one click."
-            onSelect={onTrash}
-          >
-            Trash…
-          </MenuItem>
           {moduleActionGroups.length > 0 && (
-            <>
-              <MenuSeparator />
-              <MenuSub label="Modules">
-                {moduleActionGroups.map((group) => (
-                  <div key={group.moduleId}>
-                    <MenuLabel>{group.moduleLabel}</MenuLabel>
-                    {group.actions.map((action) => (
-                      <MenuItem
-                        key={action.id}
-                        title={action.label}
-                        onSelect={() => onModuleAction(action)}
-                      >
-                        {action.icon ? `${action.icon} ${action.label}` : action.label}
-                      </MenuItem>
-                    ))}
-                  </div>
-                ))}
-              </MenuSub>
-            </>
+            <MenuSub label="Modules">
+              {moduleActionGroups.map((group) => (
+                <div key={group.moduleId}>
+                  <MenuLabel>{group.moduleLabel}</MenuLabel>
+                  {group.actions.map((action) => (
+                    <MenuItem
+                      key={action.id}
+                      title={action.label}
+                      onSelect={() => onModuleAction(action)}
+                    >
+                      {action.icon ? `${action.icon} ${action.label}` : action.label}
+                    </MenuItem>
+                  ))}
+                </div>
+              ))}
+            </MenuSub>
           )}
           <MenuSeparator />
           <MenuItem

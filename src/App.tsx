@@ -62,6 +62,7 @@ import {
   applyOffloadPolicy,
   getSetting,
   listPendingOperations,
+  listTrash,
   listVolumes,
   reconcileNow,
   StorageStatus,
@@ -70,10 +71,6 @@ import {
 import { useLibrarySession } from "./modules/librarySession";
 import { CatalogGrid } from "./components/CatalogGrid";
 import { Splash, BOOT_STAGES } from "./components/Splash";
-import { TagPanel } from "./components/TagPanel";
-import { AlbumsPanel } from "./components/AlbumsPanel";
-import { SmartAlbumsPanel } from "./components/SmartAlbumsPanel";
-import { BatchesPanel } from "./components/BatchesPanel";
 import { TagEditor } from "./components/TagEditor";
 import { PhotoInspector } from "./components/PhotoInspector";
 import { ZoomableImage } from "./components/ZoomableImage";
@@ -115,7 +112,14 @@ import { CatalogSwitcher } from "./components/CatalogSwitcher";
 import { EditorView } from "./components/EditorView";
 import { parseEdit } from "./modules/editing";
 import { ImportBatch, listImportBatches, listRecentCatalogs } from "./modules/api";
-import { TitleBar, IconRail, Bench, CommandPill, railOrder } from "./components/shell";
+import {
+  TitleBar,
+  IconRail,
+  Bench,
+  CommandPill,
+  CollectionBrowser,
+  railOrder,
+} from "./components/shell";
 import { useAppearance } from "./theme/controller";
 import "./App.css";
 
@@ -274,6 +278,14 @@ export default function App() {
   // confirmed 0, so a transient IPC error can never masquerade as "no debt" and quietly
   // remove the panel's only entry point.
   const [identityDebtCount, setIdentityDebtCount] = useState<number | null>(null);
+  // Trash count for the collection browser's Library section (CollectionBrowser.tsx).
+  // `null` means "unknown" (not yet fetched, or the last fetch failed) — same reasoning
+  // as identityDebtCount above: hides the badge rather than showing a stale/wrong number.
+  // No dedicated backend count command exists (only `list_trash`, which returns full
+  // Photo rows), so this reuses `listTrash().length` — the same "fetch the list, count
+  // it" shape `checkReconcile` already uses for `listVolumes`/`listPendingOperations`
+  // below — refreshed on the same cycles as `pendingCount`.
+  const [trashCount, setTrashCount] = useState<number | null>(null);
   // Bundle export dialog state — set to the batch to export, null = closed.
   const [bundleExportBatch, setBundleExportBatch] = useState<ImportBatch | null>(null);
   // Bundle import dialog open/closed.
@@ -759,6 +771,16 @@ export default function App() {
     }
   }, []);
 
+  const refreshTrashCount = useCallback(async () => {
+    try {
+      const list = await listTrash();
+      setTrashCount(list.length);
+    } catch {
+      // Same reasoning as refreshIdentityDebtCount: leave it as it was rather than
+      // masquerading a transient IPC error as a confirmed 0.
+    }
+  }, []);
+
   // Drain the backup queue in the background (no blocking dialog). Guarded so
   // overlapping triggers (focus events) don't start parallel drains.
   const runReconcile = useCallback(async () => {
@@ -810,10 +832,14 @@ export default function App() {
     refreshPending();
     checkReconcile();
     refreshIdentityDebtCount();
-    const onFocus = () => checkReconcile();
+    refreshTrashCount();
+    const onFocus = () => {
+      checkReconcile();
+      refreshTrashCount();
+    };
     window.addEventListener("focus", onFocus);
     return () => window.removeEventListener("focus", onFocus);
-  }, [ready, checkReconcile, refreshPending, refreshIdentityDebtCount]);
+  }, [ready, checkReconcile, refreshPending, refreshIdentityDebtCount, refreshTrashCount]);
 
   const onScan = async () => {
     setStatus("Scanning library…");
@@ -1027,6 +1053,8 @@ export default function App() {
       // normally calls `refreshIdentityDebtCount` never re-fires on a catalog switch;
       // call it directly below instead of relying on that effect.
       setIdentityDebtCount(null);
+      // Trash is per-catalog too — same reasoning as identityDebtCount just above.
+      setTrashCount(null);
       // The tag tree is the shell's, not the session's — clear it here for the same
       // reason the session clears its rows.
       setTags([]);
@@ -1050,6 +1078,8 @@ export default function App() {
       // it's safe to call directly here rather than wait on an effect — nothing else
       // calls it on a catalog switch, since `ready` never flips back to false.
       refreshIdentityDebtCount();
+      // Same reasoning again: per-catalog, closes over no filter/tag state.
+      refreshTrashCount();
       // Same reasoning: switch_catalog has already recorded the new catalog as the most
       // recent by the time this event fires, so re-reading the list gets the new name.
       refreshCatalogName();
@@ -1057,7 +1087,7 @@ export default function App() {
     return () => {
       unlisten.then((f) => f());
     };
-  }, [library.reset, refreshIdentityDebtCount, refreshCatalogName]);
+  }, [library.reset, refreshIdentityDebtCount, refreshTrashCount, refreshCatalogName]);
 
   // Reset the active version to Original whenever the selected photo changes.
   useEffect(() => {
@@ -1364,7 +1394,6 @@ export default function App() {
         onAnalyseBurst={runBurstAnalysis}
         onProposeStacks={openStackProposals}
         onCullSession={startCullSession}
-        onTrash={() => setShowTrash(true)}
         moduleActionGroups={toolbarActionGroups()}
         onModuleAction={(action) =>
           isModalAction(action) ? setModalAction(action) : activateToolbarAction(action.id)
@@ -1410,50 +1439,59 @@ export default function App() {
             onMouseDown={startResize("left")}
             title="Drag to resize"
           />
-          <TagPanel
-            tags={tags}
-            activeTagId={scope.tagId}
-            onSelectTag={library.selectTag}
-            onEditTag={setEditingTag}
-            onMoveTag={(tagId, newParentId) =>
-              moveTag(tagId, newParentId)
-                .then(refresh)
-                .catch((e) => setStatus(`Move failed: ${e}`))
+          <CollectionBrowser
+            isAllScope={
+              scope.tagId == null &&
+              scope.albumId == null &&
+              scope.batchId == null &&
+              scope.smartAlbumId == null
             }
-            onSetPrivate={(tagId, isPrivate, recursive) =>
-              setTagPrivate(tagId, isPrivate, recursive)
-                .then((n) => {
-                  setStatus(
-                    `${n} tag${n === 1 ? "" : "s"} marked ${isPrivate ? "private" : "public"}.`,
-                  );
-                  return refresh();
-                })
-                .catch((e) => setStatus(`Privacy change failed: ${e}`))
-            }
-            onTagsChanged={refresh}
-            selectedPhotoIds={selection.ids}
-            onStatus={setStatus}
-          />
-          <AlbumsPanel
-            activeAlbumId={scope.albumId}
-            onSelectAlbum={library.selectAlbum}
-            selectionCount={selection.ids.length}
-            onAddSelection={addSelectionToAlbum}
-            reloadKey={albumsKey}
-          />
-          <SmartAlbumsPanel
-            activeSmartAlbumId={scope.smartAlbumId}
-            onSelectSmartAlbum={library.selectSmartAlbum}
-            // The panel owns the SmartAlbumEditor modal; this just selects the album being
-            // edited so the grid previews its rule.
-            onEditRule={(album) => library.selectSmartAlbum(album.id)}
-            reloadKey={smartAlbumsKey}
-          />
-          <BatchesPanel
-            activeBatchId={scope.batchId}
-            onSelectBatch={library.selectBatch}
-            onExportBatch={setBundleExportBatch}
-            reloadKey={batchesKey}
+            onSelectAll={library.clearScope}
+            trashCount={trashCount}
+            onOpenTrash={() => setShowTrash(true)}
+            tagPanel={{
+              tags,
+              activeTagId: scope.tagId,
+              onSelectTag: library.selectTag,
+              onEditTag: setEditingTag,
+              onMoveTag: (tagId, newParentId) =>
+                moveTag(tagId, newParentId)
+                  .then(refresh)
+                  .catch((e) => setStatus(`Move failed: ${e}`)),
+              onSetPrivate: (tagId, isPrivate, recursive) =>
+                setTagPrivate(tagId, isPrivate, recursive)
+                  .then((n) => {
+                    setStatus(
+                      `${n} tag${n === 1 ? "" : "s"} marked ${isPrivate ? "private" : "public"}.`,
+                    );
+                    return refresh();
+                  })
+                  .catch((e) => setStatus(`Privacy change failed: ${e}`)),
+              onTagsChanged: refresh,
+              selectedPhotoIds: selection.ids,
+              onStatus: setStatus,
+            }}
+            albumsPanel={{
+              activeAlbumId: scope.albumId,
+              onSelectAlbum: library.selectAlbum,
+              selectionCount: selection.ids.length,
+              onAddSelection: addSelectionToAlbum,
+              reloadKey: albumsKey,
+            }}
+            smartAlbumsPanel={{
+              activeSmartAlbumId: scope.smartAlbumId,
+              onSelectSmartAlbum: library.selectSmartAlbum,
+              // The panel owns the SmartAlbumEditor modal; this just selects the album
+              // being edited so the grid previews its rule.
+              onEditRule: (album) => library.selectSmartAlbum(album.id),
+              reloadKey: smartAlbumsKey,
+            }}
+            batchesPanel={{
+              activeBatchId: scope.batchId,
+              onSelectBatch: library.selectBatch,
+              onExportBatch: setBundleExportBatch,
+              reloadKey: batchesKey,
+            }}
           />
         </div>
         )}
@@ -1829,6 +1867,7 @@ export default function App() {
           onChanged={() => {
             refresh();
             refreshPending();
+            refreshTrashCount();
           }}
         />
       )}

@@ -275,7 +275,8 @@ body {
   color: var(--dim);
 }
 
-/* Left column: tags (top, grows) + albums (bottom, capped). */
+/* Left column: hosts the collection browser (CollectionBrowser.tsx — see the
+   "Shell: collection browser" block at the end of this file). */
 .leftcol {
   grid-column: 2;
   display: flex;
@@ -307,13 +308,6 @@ body {
 .leftcol .tag-panel {
   flex: 1 1 auto;
   border-right: none;
-}
-.leftcol .albums-panel,
-.leftcol .smart-albums-panel,
-.leftcol .batches-panel {
-  flex: 0 0 auto;
-  max-height: 30%;
-  border-top: 1px solid var(--border);
 }
 .panel-header {
   display: flex;
@@ -4442,4 +4436,119 @@ body {
   height: 3px;
   cursor: pointer;
   accent-color: var(--accent);
+}
+
+/* ── Shell: collection browser ── */
+/* CollectionBrowser.tsx (agent-notes mockup Main.dc.html `.brow`/`.gh`/`.li`): the four
+   panels that used to stack in `.leftcol` — each independently backed, independently
+   scrolling and capped at 30% height (see the deleted `.leftcol .albums-panel` etc. rule
+   above) — now render as sections in one scrollable list. `.brow` owns the background and
+   the only scrollbar now; the wrapped panels no longer supply either of their own (the
+   `.brow-section .panel` override below unsets the pairing `.panel` sets when used as a
+   standalone sidebar surface elsewhere). */
+.brow {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  background: var(--panel);
+}
+
+/* Section header: a lowercase, letterspaced label + hairline rule, doubling as the
+   disclosure toggle. A real <button> (unlike the mockup's plain <div class="gh">) for
+   keyboard/focus support. */
+.brow-gh {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  width: 100%;
+  height: 28px;
+  padding: 0 14px;
+  margin-top: 4px;
+  background: none;
+  border: none;
+  color: var(--mute);
+  font: inherit;
+  cursor: pointer;
+  text-align: left;
+}
+/* The Library section's header: not a disclosure control (two rows, always visible). */
+.brow-gh-fixed {
+  cursor: default;
+}
+.brow-gh-caret {
+  flex: none;
+  width: 9px;
+  font-size: 9px;
+  color: var(--mute);
+}
+.brow-gh-label {
+  flex: none;
+  font-size: 10px;
+  letter-spacing: 0.14em;
+  text-transform: lowercase;
+  color: var(--mute);
+}
+.brow-gh-rule {
+  flex: 1;
+  height: 1px;
+  background: var(--line);
+}
+
+/* Library rows: "All photos" and "Trash" — the browser's only custom rows. Everything
+   else under a section header is the rehosted panel's own row styling, untouched here. */
+.brow-li {
+  display: flex;
+  align-items: center;
+  width: 100%;
+  height: 25px;
+  padding: 0 14px;
+  background: none;
+  border: none;
+  color: var(--dim);
+  font: inherit;
+  cursor: pointer;
+  text-align: left;
+}
+.brow-li:hover {
+  color: var(--txt);
+  background: var(--elev);
+}
+.brow-li.on {
+  color: var(--txt);
+}
+.brow-li.on::before {
+  content: "";
+  width: 2px;
+  height: 13px;
+  background: var(--accent);
+  border-radius: 1px;
+  margin-left: -10px;
+  margin-right: 8px;
+}
+.brow-li .n {
+  margin-left: auto;
+  font-size: 10.5px;
+  color: var(--mute);
+  font-variant-numeric: tabular-nums;
+}
+
+/* The rehosted panels: `.brow` is the single scroll container and background owner now
+   (see the file comment above), so unset the pairing `.panel` normally sets on its own. */
+.brow-section .panel {
+  background: none;
+  overflow-y: visible;
+}
+/* `.panel-header`'s own `position: sticky` would compete with every other visible
+   section's header for the same `top: 0` while scrolling `.brow` — the section's own
+   `.brow-gh` is the sticking point now, so panel headers kept visible (see below) sit
+   static beneath it. */
+.brow-section .panel-header {
+  position: static;
+}
+/* Per-panel header decision (see CollectionBrowser.tsx's file header): BatchesPanel's
+   header carries no action, so its section header replaces it outright — hidden here.
+   TagPanel/AlbumsPanel/SmartAlbumsPanel each carry an add affordance with no prop hook to
+   relocate, so their own header stays visible instead (not targeted by this rule). */
+.brow-section-hide-header .panel-header {
+  display: none;
 }

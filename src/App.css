@@ -1,18 +1,43 @@
 :root {
-  --bg: #0F172A;
-  --bg-panel: #1E293B;
-  --bg-tile: #232e42;
-  --border: #334155;
-  --text: #F8FAFC;
-  --text-dim: #94A3B8;
-  --text-mute: #64748B;
-  --accent: #3B82F6;
-  --accent-2: #2563EB;
+  /* ChairPhoto Standard — the app's default warm dark palette. Semantic token contract:
+     src/theme/tokens.ts. src/theme/apply.ts re-stamps these same values on
+     document.documentElement before React mounts (so Preferences can swap palettes at
+     runtime); these :root values are the no-JS fallback and must stay in lockstep with
+     src/theme/standard.ts — src/theme/__tests__/theme.test.ts checks that mechanically. */
+  --canvas: #14120F;
+  --panel: #1B1815;
+  --elev: #23201C;
+  --well: #0D0C0A;
+  --border: #2E2A25;
+  --line: #241F1B;
+  --txt: #EFE9E0;
+  --dim: #A8A093;
+  --mute: #6F675C;
+  --accent: #E0A458;
+  --onaccent: #241C10;
+  --sel: rgba(224, 164, 88, 0.14);
   --ok: #10B981;
+  --onok: #04150F;
   --danger: #F87171;
-  --danger-2: #EF4444;
-  --star: #FFD700;
-  --grad-primary: linear-gradient(135deg, #2563EB, #3B82F6);
+  --rating: #FFD700;
+  --scrim: rgba(0, 0, 0, 0.66);
+  --font-sans: "Instrument Sans", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-display: "Instrument Serif", Georgia, serif;
+
+  /* Legacy aliases: pre-redesign code references these names ~400+ times. They resolve to
+     the new tokens above, so existing var() call sites pick up ChairPhoto Standard
+     immediately; migrating those call sites to the new names directly is a later task. */
+  --bg: var(--canvas);
+  --bg-panel: var(--panel);
+  --bg-tile: var(--elev);
+  --text: var(--txt);
+  --text-dim: var(--dim);
+  --text-mute: var(--mute);
+  --accent-2: var(--accent);
+  --danger-2: var(--danger);
+  --star: var(--rating);
+  --grad-primary: linear-gradient(135deg, var(--accent), var(--accent));
+
   --r: 8px;
   --r-sm: 6px;
   --r-pill: 999px;
@@ -48,7 +73,9 @@ body,
 body {
   background: var(--bg);
   color: var(--text);
-  font: 13px/1.45 Inter, system-ui, -apple-system, "Segoe UI", sans-serif;
+  font-family: var(--font-sans);
+  font-size: 13px;
+  line-height: 1.45;
   user-select: none;
   overflow: hidden;
 }

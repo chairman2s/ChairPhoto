@@ -38,6 +38,9 @@ import { ModuleSettings } from "../modules/ModuleContent";
 import { VolumesSection } from "./VolumesPanel";
 import { SafetySection } from "./SafetyPanel";
 import { ModulesSection } from "./ModulesPanel";
+import { applyStandard } from "../theme/apply";
+import { loadAppearanceMode, storeAppearanceMode } from "../theme/prefs";
+import type { AppearanceMode } from "../theme/tokens";
 
 // One preferences dialog. Fixed tabs: Storage (library root + volumes) and Modules
 // (enable/disable). Then one tab per enabled module that contributes settings (AI, Flickr,
@@ -61,7 +64,14 @@ export function Preferences({
     (m) => m.enabled && settingsPanelsForModule(m.id).length > 0,
   );
   const [tab, setTab] = useState<string>("storage");
-  const validIds = ["storage", "editors", "modules", ...moduleTabs.map((m) => m.id)];
+  const validIds = [
+    "storage",
+    "tags",
+    "editors",
+    "modules",
+    "appearance",
+    ...moduleTabs.map((m) => m.id),
+  ];
   const active = validIds.includes(tab) ? tab : "storage";
 
   return (
@@ -99,6 +109,12 @@ export function Preferences({
             >
               Modules
             </button>
+            <button
+              className={`prefs-tab ${active === "appearance" ? "prefs-tab-on" : ""}`}
+              onClick={() => setTab("appearance")}
+            >
+              Appearance
+            </button>
             {moduleTabs.map((m) => (
               <button
                 key={m.id}
@@ -122,6 +138,7 @@ export function Preferences({
             {active === "tags" && <TagMaintenanceSection onChanged={onLibraryRootChanged} />}
             {active === "editors" && <EditorsSection />}
             {active === "modules" && <ModulesSection />}
+            {active === "appearance" && <AppearanceSection />}
             {moduleTabs.some((m) => m.id === active) && <ModuleSettingsTab moduleId={active} />}
           </div>
         </div>
@@ -641,6 +658,52 @@ function EditorsSection() {
         </div>
       </div>
       {status && <div className="modal-sub">{status}</div>}
+    </div>
+  );
+}
+
+// Which palette source drives the app's theme. "Follow Omarchy" is the product default —
+// live detection of the user's system theme lands in a follow-up; until then it renders
+// ChairPhoto Standard, same as choosing Standard explicitly. This is a per-machine
+// preference (localStorage), not a catalog setting — it does not travel with the catalog.
+function AppearanceSection() {
+  const [mode, setMode] = useState<AppearanceMode>(() => loadAppearanceMode());
+
+  const choose = (next: AppearanceMode) => {
+    setMode(next);
+    storeAppearanceMode(next);
+    // Both options currently render ChairPhoto Standard — see the status line below for
+    // "follow-omarchy". Re-applying keeps this honest once live detection replaces it.
+    applyStandard();
+  };
+
+  return (
+    <div className="prefs-section">
+      <h3>Appearance</h3>
+      <div className="modal-sub">
+        Choose the palette ChairPhoto renders with. This is a per-machine preference — it
+        isn't saved to the catalog and doesn't travel with it between computers.
+      </div>
+      <div className="seg">
+        <button
+          className={`seg-item ${mode === "follow-omarchy" ? "on" : ""}`}
+          onClick={() => choose("follow-omarchy")}
+        >
+          Follow Omarchy
+        </button>
+        <button
+          className={`seg-item ${mode === "standard" ? "on" : ""}`}
+          onClick={() => choose("standard")}
+        >
+          ChairPhoto Standard
+        </button>
+      </div>
+      {mode === "follow-omarchy" && (
+        <div className="modal-sub">
+          Omarchy theme detection is wired in a follow-up — ChairPhoto Standard is currently
+          being used.
+        </div>
+      )}
     </div>
   );
 }

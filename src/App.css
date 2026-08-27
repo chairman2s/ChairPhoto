@@ -346,26 +346,8 @@ body {
 .store-offline {
   color: var(--mute);
 }
-.status {
-  margin-left: auto;
-  color: var(--dim);
-  font-size: 12px;
-}
-/* Background card-import progress, shown in the upper-right of the topbar. */
-.import-progress {
-  margin-left: auto;
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  font-size: 12px;
-  color: var(--dim);
-}
-.import-progress + .status {
-  margin-left: 12px; /* sit next to the progress, not pushed to the far edge */
-}
-.import-progress-label {
-  white-space: nowrap;
-}
+/* Job-progress bar — now rendered by the bench (Bench.tsx), which restyles the track
+   under .bench-prog. */
 .progress-track {
   width: 120px;
   height: 6px;
@@ -1486,12 +1468,16 @@ body {
 }
 
 /* Grid */
+/* A flex column of two children: `.stage` (the routed view — grid / loupe / Compare /
+   Develop / module view) and, outside Develop and module views, the `.bench` strip.
+   The 12px gutter, the scroll and the positioning context all live on `.stage` now —
+   see the bench section at the end of this file. */
 .grid-wrap {
   grid-column: 3;
-  flex: 1;
-  overflow-y: auto;
-  padding: 12px;
-  position: relative; /* positioning context for the virtualized .grid-scroll */
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  overflow: hidden;
 }
 /* Develop view spans the main + right-column tracks so its controls land in the
    right column (the inspector is hidden in develop; the rail and browser stay visible).
@@ -1556,39 +1542,12 @@ body {
   border-radius: var(--r-pill);
 }
 /* Virtualized grid: an in-flow scroller that fills the main area; only on-screen rows are
-   rendered (see CatalogGrid). The 12px gutter comes from .grid-wrap's padding. The columns
+   rendered (see CatalogGrid). The 12px gutter comes from .stage's padding. The columns
    and gap here must match the constants in that file. */
 .grid-scroll {
   height: 100%;
   overflow-y: auto;
   box-sizing: border-box;
-  /* Clear the floating status bar so the last row isn't hidden behind it. */
-  padding-bottom: 30px;
-}
-/* Selection/count status bar, pinned to the bottom of the grid area. .grid-wrap is
-   position:relative and the scroll happens inside .grid-scroll, so absolute here stays put. */
-.grid-statusbar {
-  position: absolute;
-  left: 0;
-  right: 0;
-  bottom: 0;
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  padding: 0 12px;
-  height: 28px;
-  font-size: 11px;
-  color: var(--mute);
-  background: var(--panel);
-  border-top: 1px solid var(--panel);
-}
-.grid-statusbar-count {
-  color: var(--dim);
-  font-weight: 600;
-}
-.grid-statusbar-sel {
-  color: var(--txt);
-  font-weight: 600;
 }
 .grid-row {
   display: grid;
@@ -4257,4 +4216,233 @@ body {
 }
 .rail-sp {
   flex: 1;
+}
+
+/* ── Shell: bench ── */
+/* The centre stage and the bench under it (see agent-notes mockup Main.dc.html `.bench`).
+   `.stage` is the inner box every routed view fills — it inherits what `.grid-wrap` used
+   to be before the bench: the 12px gutter, its own scroll, and the positioning context
+   for the virtualized `.grid-scroll` and the loupe-slot overlays. */
+.stage {
+  flex: 1;
+  min-height: 0;
+  position: relative;
+  overflow-y: auto;
+  padding: 12px;
+}
+/* Develop keeps its edge-to-edge canvas (the overrides `.develop-wrap` itself used to
+   carry when the views were its direct children). */
+.develop-wrap .stage {
+  padding: 0;
+  overflow: hidden;
+}
+.bench {
+  flex: 0 0 72px;
+  display: flex;
+  align-items: center;
+  gap: 18px;
+  padding: 0 14px;
+  background: var(--panel);
+  border-top: 1px solid var(--line);
+  min-width: 0;
+}
+/* Left block: one background job's progress, else the match/selection counts + status. */
+.bench-prog {
+  width: 214px;
+  flex: none;
+  min-width: 0;
+}
+.bench-prog-label {
+  font-size: 10.5px;
+  color: var(--mute);
+  letter-spacing: 0.02em;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.bench-prog .progress-track {
+  width: auto;
+  height: 3px;
+  border-radius: var(--r-pill);
+  background: var(--elev);
+  margin-top: 6px;
+}
+.bench-prog .progress-fill {
+  border-radius: var(--r-pill);
+}
+.bench-count {
+  font-size: 11px;
+  color: var(--dim);
+  font-variant-numeric: tabular-nums;
+}
+.bench-status {
+  margin-top: 3px;
+  font-size: 10.5px;
+  color: var(--mute);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.bench-sep {
+  width: 1px;
+  height: 38px;
+  background: var(--border);
+  flex: none;
+}
+/* Marking block: caption + stars / pick pills / label dots for the inspector's photo. */
+.bench-cap {
+  font-size: 9.5px;
+  letter-spacing: 0.14em;
+  color: var(--mute);
+  margin-bottom: 7px;
+}
+.bench-cap b {
+  color: var(--dim);
+  font-weight: 500;
+  letter-spacing: 0.02em;
+}
+.bench-markrow {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+}
+.bench-stars {
+  display: flex;
+  gap: 3px;
+}
+.bench-star {
+  border: none;
+  background: transparent;
+  padding: 0;
+  font-size: 18px;
+  line-height: 1;
+  color: var(--mute);
+  opacity: 0.5;
+  cursor: pointer;
+}
+.bench-star.on {
+  color: var(--rating);
+  opacity: 1;
+}
+.pkb {
+  height: 26px;
+  padding: 0 11px;
+  border-radius: var(--r-pill);
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--dim);
+  font-size: 11.5px;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-family: inherit;
+}
+.pkb:hover {
+  color: var(--txt);
+}
+.pkb.on {
+  background: var(--sel);
+  border-color: var(--ok);
+  color: var(--ok);
+}
+.bench-dots {
+  display: flex;
+  gap: 5px;
+  align-items: center;
+}
+.bench-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  border: none;
+  padding: 0;
+  opacity: 0.42;
+  cursor: pointer;
+}
+/* Active ring, like the mockup's `.fd.on` — the button's currentColor is its own dot
+   colour (colour labels are stored meaning, never theme colour). */
+.bench-dot.on {
+  opacity: 1;
+  box-shadow: 0 0 0 2px var(--panel), 0 0 0 3.5px currentColor;
+}
+.bench-dot-x {
+  background: transparent;
+  border: 1.4px solid var(--mute);
+  opacity: 0.6;
+}
+/* Right block: the selection pile — count, up to three thumbs, and the actions. */
+.bench-pile {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  min-width: 0;
+}
+.bench-selcount {
+  font-size: 11px;
+  color: var(--mute);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.bench-strip {
+  display: flex;
+  gap: 4px;
+}
+.bench-strip .thumbwrap {
+  width: 52px;
+  height: 35px;
+  border-radius: 3px;
+  overflow: hidden;
+  flex: none;
+}
+.bench-strip .thumbwrap.hl {
+  box-shadow: 0 0 0 2px var(--accent);
+}
+.bench-strip .thumbwrap .thumb {
+  width: 100%;
+  height: 100%;
+  aspect-ratio: auto;
+  object-fit: cover;
+}
+/* Text-pill action button (the mockup's `.txtb`). */
+.txtb {
+  height: 30px;
+  padding: 0 12px;
+  border-radius: var(--r-pill);
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--dim);
+  font-size: 11.5px;
+  cursor: pointer;
+  font-family: inherit;
+  white-space: nowrap;
+}
+.txtb:hover:not(:disabled) {
+  color: var(--txt);
+}
+.txtb:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+.txtb.on {
+  background: var(--sel);
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.bench-x {
+  width: 26px;
+  height: 26px;
+  border-radius: 50%;
+  border: none;
+  background: transparent;
+  color: var(--mute);
+  display: grid;
+  place-items: center;
+  cursor: pointer;
+  flex: none;
+}
+.bench-x:hover {
+  color: var(--txt);
+  background: var(--elev);
 }

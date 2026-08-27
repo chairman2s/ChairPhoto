@@ -247,6 +247,12 @@ export interface LibrarySession {
   viewPhoto: (photo: Photo) => void;
   /** Return from a stack-child view to the master it is stacked under. */
   backToOriginal: () => void;
+  /**
+   * Empty the selection: nothing active, nothing selected, no Shift anchor, and any
+   * off-grid stack-child view dropped. {@link reset}'s selection half, without touching
+   * the scope or the rows — the bench's "clear the table" ✕.
+   */
+  clearSelection: () => void;
 
   // --- lifecycle ------------------------------------------------------------
   /**
@@ -475,6 +481,16 @@ export function useLibrarySession(): LibrarySession {
     if (origin != null) select(origin);
   }, [stackOrigin, select]);
 
+  // Everything selection-scoped, and only that — `reset` is this plus the scope and the
+  // rows. Kept as one verb so the two can never disagree about what "selection state" is.
+  const clearSelection = useCallback(() => {
+    setActiveId(null);
+    setIds([]);
+    anchor.current = null;
+    setExtraPhoto(null);
+    setStackOrigin(null);
+  }, []);
+
   // --- derived selection ----------------------------------------------------
   const active = useMemo(
     () =>
@@ -516,15 +532,11 @@ export function useLibrarySession(): LibrarySession {
     // different question, so this must invalidate `query` and make the shell refetch even
     // when the previous catalog was being viewed unfiltered.
     setScope(defaultScope());
-    setActiveId(null);
-    setIds([]);
-    anchor.current = null;
-    setExtraPhoto(null);
-    setStackOrigin(null);
+    clearSelection();
     // Drops the rows immediately (the grid must not show the closed catalog's photos while
     // the new query resolves) and disowns whatever is still in flight against it.
     clearLibrary();
-  }, [clearLibrary]);
+  }, [clearSelection, clearLibrary]);
 
   return useMemo(
     () => ({
@@ -555,6 +567,7 @@ export function useLibrarySession(): LibrarySession {
       stepActive,
       viewPhoto,
       backToOriginal,
+      clearSelection,
       reset,
     }),
     [
@@ -585,6 +598,7 @@ export function useLibrarySession(): LibrarySession {
       stepActive,
       viewPhoto,
       backToOriginal,
+      clearSelection,
       reset,
     ],
   );

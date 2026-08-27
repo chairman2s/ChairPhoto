@@ -10,16 +10,16 @@
 // and activation is a callback (`onModuleAction`), so this file's only coupling to the
 // module system is the `ToolbarAction` *type* used to describe a group's contents.
 //
-// `children` carries the JSX App.tsx still owns unchanged: the three progress readouts +
-// status line (issue: topbar extraction). They render between the Export button and the
-// "More" menu, so this component never has to import their state either. The
-// Library/Develop/module view switcher that used to live here moved to IconRail.tsx — a
-// sibling of TitleBar in App.tsx's `.body`, not a child of it (see docs mockup "Darkroom").
+// `children` is an extension slot between the Export button and the "More" menu. It used
+// to carry the three progress readouts + status line, which moved to the bench (Bench.tsx)
+// along with the selection-flavoured More ⋯ entries (Publish, Back up selection, Compare);
+// App.tsx currently passes nothing. The Library/Develop/module view switcher that used to
+// live here moved to IconRail.tsx — a sibling of TitleBar in App.tsx's `.body`, not a
+// child of it (see docs mockup "Darkroom").
 import type { ReactNode } from "react";
 import { MenuButton, MenuCheckItem, MenuItem, MenuLabel, MenuSeparator, MenuSub } from "./Menu";
 import type { ImportBatch } from "../../modules/api";
 import type { ToolbarAction } from "../../modules/registry";
-import { MAX_PANES } from "../CompareView";
 
 /** One enabled module's toolbar actions, grouped for the "Modules" submenu. Structurally
  *  identical to `host.toolbarActionGroups()`'s return type — kept as a local type (rather
@@ -73,20 +73,12 @@ export interface TitleBarProps {
   loupeOn: boolean;
   loupeEnabled: boolean;
   onToggleLoupe: () => void;
-  compareOn: boolean;
-  compareEnabled: boolean;
-  onToggleCompare: () => void;
   /** Selected photo count — feeds the same "N selected photo(s)" vs. "the whole view"
-   *  tooltip wording the old flat buttons used for Analyse burst / Propose stacks / Cull /
-   *  Back up selection. */
+   *  tooltip wording the old flat buttons used for Analyse burst / Propose stacks / Cull. */
   selectionCount: number;
   onAnalyseBurst: () => void;
   onProposeStacks: () => void;
   onCullSession: () => void;
-  canPublish: boolean;
-  onPublish: () => void;
-  canBackUpSelection: boolean;
-  onBackUpSelection: () => void;
   onTrash: () => void;
   moduleActionGroups: ModuleActionGroup[];
   onModuleAction: (action: ToolbarAction) => void;
@@ -96,8 +88,7 @@ export interface TitleBarProps {
   rightHidden: boolean;
   onToggleRight: () => void;
 
-  /** The retained progress readouts + status line — rendered between Export and More.
-   *  See file header. */
+  /** Extension slot between Export and More — currently empty. See file header. */
   children?: ReactNode;
 }
 
@@ -123,17 +114,10 @@ export function TitleBar({
   loupeOn,
   loupeEnabled,
   onToggleLoupe,
-  compareOn,
-  compareEnabled,
-  onToggleCompare,
   selectionCount,
   onAnalyseBurst,
   onProposeStacks,
   onCullSession,
-  canPublish,
-  onPublish,
-  canBackUpSelection,
-  onBackUpSelection,
   onTrash,
   moduleActionGroups,
   onModuleAction,
@@ -252,18 +236,6 @@ export function TitleBar({
           >
             Loupe
           </MenuItem>
-          <MenuItem
-            disabled={!compareOn && !compareEnabled}
-            badge={compareOn ? "On" : undefined}
-            title={
-              compareOn || compareEnabled
-                ? `Compare the selected frames side by side, up to ${MAX_PANES} (C)`
-                : "Select two or more photos to compare them"
-            }
-            onSelect={onToggleCompare}
-          >
-            Compare
-          </MenuItem>
           <MenuSeparator />
           <MenuLabel>Whole view</MenuLabel>
           <MenuItem
@@ -300,26 +272,6 @@ export function TitleBar({
             Start cull session
           </MenuItem>
           <MenuSeparator />
-          <MenuLabel>Selection</MenuLabel>
-          <MenuItem
-            disabled={!canPublish}
-            title="Publish the selected photo to Instagram, Flickr, SmugMug…"
-            onSelect={onPublish}
-          >
-            Publish…
-          </MenuItem>
-          <MenuItem
-            disabled={!canBackUpSelection}
-            title={
-              selectionCount
-                ? `Queue ${selectionCount} selected photo(s) to copy to the NAS`
-                : "Select photos first — this queues a copy of everything it names, so it " +
-                  "never assumes the whole view"
-            }
-            onSelect={onBackUpSelection}
-          >
-            Back up selection
-          </MenuItem>
           <MenuItem
             disabled={!ready}
             title="Photos you have hidden. Nothing there has been deleted — restoring is one click."

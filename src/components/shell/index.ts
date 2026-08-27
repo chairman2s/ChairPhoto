@@ -12,4 +12,5 @@ export {
 } from "./Menu";
 export { TitleBar, type TitleBarProps, type ModuleActionGroup } from "./TitleBar";
 export { IconRail, type IconRailProps } from "./IconRail";
+export { Bench, type BenchProps } from "./Bench";
 export { railOrder } from "./railOrder";

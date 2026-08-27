@@ -116,7 +116,7 @@ import { CatalogSwitcher } from "./components/CatalogSwitcher";
 import { EditorView } from "./components/EditorView";
 import { parseEdit } from "./modules/editing";
 import { ImportBatch, listImportBatches, listRecentCatalogs } from "./modules/api";
-import { TitleBar, IconRail, railOrder } from "./components/shell";
+import { TitleBar, IconRail, Bench, railOrder } from "./components/shell";
 import { useAppearance } from "./theme/controller";
 import "./App.css";
 
@@ -1132,6 +1132,38 @@ export default function App() {
     [compareIds, refresh],
   );
 
+  // The ONE write path for culling marks (rate / pick / label): apply the verb to every
+  // targeted photo, then refresh. Shared by the keyboard culling shortcuts and the bench's
+  // marking controls, so the two surfaces cannot drift apart (pinned by the "one code
+  // path" block in components/shell/__tests__/commandInventory.test.tsx). Auto-advance is
+  // deliberately NOT in here: it is the keyboard branch's own behavior — pressing a number
+  // key steps to the next photo, clicking a bench star must not move the selection.
+  const applyToSelection = useCallback(
+    async (fn: (id: number) => Promise<unknown>) => {
+      for (const id of selection.targets) await fn(id);
+      await refresh();
+    },
+    [selection.targets, refresh],
+  );
+
+  // The bench's marking clicks. Outside Compare they are applyToSelection, verbatim.
+  // Inside Compare they drive the focused pane — the same photo whose marks the bench is
+  // showing (`shellPhoto`, via shellTarget) — mirroring Compare's keyboard branch: mark
+  // the one pane and refresh, never the whole selection at once.
+  const applyMark = useCallback(
+    async (fn: (id: number) => Promise<unknown>) => {
+      if (inCompare) {
+        if (shellPhoto) {
+          await fn(shellPhoto.id);
+          await refresh();
+        }
+        return;
+      }
+      await applyToSelection(fn);
+    },
+    [inCompare, shellPhoto, applyToSelection, refresh],
+  );
+
   // Keyboard culling. Active whenever a photo is selected and focus isn't in an input.
   useEffect(() => {
     const handler = async (e: KeyboardEvent) => {
@@ -1140,6 +1172,20 @@ export default function App() {
       if (target.tagName === "INPUT" || target.tagName === "TEXTAREA") return;
 
       const key = e.key.toLowerCase();
+
+      // Panel visibility: `[` the tags/collections panel, `]` the inspector. The same
+      // toggles as More ⋯ → View, which stay; these work in Compare too — the panels
+      // frame every Library surface.
+      if (key === "[") {
+        setLeftHidden((v) => !v);
+        e.preventDefault();
+        return;
+      }
+      if (key === "]") {
+        setRightHidden((v) => !v);
+        e.preventDefault();
+        return;
+      }
 
       // --- Compare owns the keyboard while it is open --------------------------
       // Deliberately ahead of every grid shortcut: culling keys must act on the FOCUSED
@@ -1188,14 +1234,15 @@ export default function App() {
       }
 
       if (!selected) return; // the shortcuts below act on the active photo
-      // Culling applies to the whole selection (batch) — advance only if culling one.
+      // Culling applies to the whole selection (batch) — through the same
+      // applyToSelection write path the bench's marking controls use — and advances only
+      // if culling one. The advance is the keyboard's own, over the rows this handler was
+      // created with: not the ones the refresh inside applyToSelection just produced,
+      // from which the photo that was just rated may have dropped out of the current
+      // filter (`stepActive` closes over this render's rows).
       const targets = selection.targets;
       const applyAll = async (fn: (id: number) => Promise<unknown>) => {
-        for (const id of targets) await fn(id);
-        await refresh();
-        // Auto-advance after a cull decision, over the rows this handler was created
-        // with — not the ones the refresh above just produced, from which the photo that
-        // was just rated may have dropped out of the current filter.
+        await applyToSelection(fn);
         if (targets.length === 1) library.stepActive(1);
       };
 
@@ -1230,6 +1277,7 @@ export default function App() {
   }, [
     selected,
     selection.targets,
+    applyToSelection,
     library.selectAll,
     library.stepActive,
     refresh,
@@ -1245,6 +1293,39 @@ export default function App() {
     closeCompare,
     keepInCompare,
   ]);
+
+  // The bench's single progress readout, folded from the three title-bar renderers this
+  // redesign removed — same labels, verbatim; priority import > scan > develop.
+  // `total: null` = indeterminate (the bar shows a fixed partial fill).
+  const benchProgress = importProgress
+    ? {
+        label: importProgress.total
+          ? `Importing ${importProgress.done}/${importProgress.total}`
+          : "Importing …",
+        done: importProgress.done,
+        total: importProgress.total || null,
+      }
+    : scanProgress
+      ? {
+          label:
+            scanProgress.phase === "metadata"
+              ? `Reading metadata ${scanProgress.done.toLocaleString()}/${scanProgress.total.toLocaleString()}`
+              : scanProgress.phase === "finalizing"
+                ? "Finalizing…"
+                : `Indexing ${scanProgress.done.toLocaleString()}…`,
+          done: scanProgress.done,
+          total: scanProgress.total > 0 ? scanProgress.total : null,
+        }
+      : developStatus
+        ? {
+            label:
+              developStatus.phase === "rendering"
+                ? `Rendering ${developStatus.editor}…`
+                : `Editing in ${developStatus.editor}…`,
+            done: 0,
+            total: null,
+          }
+        : null;
 
   return (
     <div className="app">
@@ -1271,17 +1352,10 @@ export default function App() {
         loupeOn={loupeInline}
         loupeEnabled={!!selected && activeView === null}
         onToggleLoupe={() => setLoupeInline((v) => !v)}
-        compareOn={inCompare}
-        compareEnabled={canCompare && activeView === null}
-        onToggleCompare={() => (inCompare ? closeCompare() : openCompare())}
         selectionCount={selection.ids.length}
         onAnalyseBurst={runBurstAnalysis}
         onProposeStacks={openStackProposals}
         onCullSession={startCullSession}
-        canPublish={selection.activeId != null}
-        onPublish={() => setShowPublish(true)}
-        canBackUpSelection={ready && selection.ids.length > 0}
-        onBackUpSelection={backUpSelection}
         onTrash={() => setShowTrash(true)}
         moduleActionGroups={toolbarActionGroups()}
         onModuleAction={(action) =>
@@ -1292,79 +1366,7 @@ export default function App() {
         onToggleLeft={() => setLeftHidden((v) => !v)}
         rightHidden={rightHidden}
         onToggleRight={() => setRightHidden((v) => !v)}
-      >
-        {/* Retained unchanged, per the topbar extraction: the three progress readouts +
-            status line. The Library/Develop/module view switcher that used to render here
-            moved to IconRail, a sibling of TitleBar in `.body` (see docs mockup
-            "Darkroom"). */}
-        {importProgress && (
-          <div
-            className="import-progress"
-            title="Importing from card"
-            role="progressbar"
-            aria-valuenow={importProgress.done}
-            aria-valuemax={importProgress.total || undefined}
-          >
-            <span className="import-progress-label">
-              Importing{" "}
-              {importProgress.total
-                ? `${importProgress.done}/${importProgress.total}`
-                : "…"}
-            </span>
-            <div className="progress-track">
-              <div
-                className="progress-fill"
-                style={{
-                  width: importProgress.total
-                    ? `${Math.round((importProgress.done / importProgress.total) * 100)}%`
-                    : "30%",
-                }}
-              />
-            </div>
-          </div>
-        )}
-        {scanProgress && (
-          <div
-            className="import-progress"
-            title="Scanning the library / NAS"
-            role="progressbar"
-            aria-valuenow={scanProgress.done}
-            aria-valuemax={scanProgress.total || undefined}
-          >
-            <span className="import-progress-label">
-              {scanProgress.phase === "metadata"
-                ? `Reading metadata ${scanProgress.done.toLocaleString()}/${scanProgress.total.toLocaleString()}`
-                : scanProgress.phase === "finalizing"
-                  ? "Finalizing…"
-                  : `Indexing ${scanProgress.done.toLocaleString()}…`}
-            </span>
-            <div className="progress-track">
-              <div
-                className="progress-fill"
-                style={{
-                  width:
-                    scanProgress.total > 0
-                      ? `${Math.round((scanProgress.done / scanProgress.total) * 100)}%`
-                      : "40%",
-                }}
-              />
-            </div>
-          </div>
-        )}
-        {developStatus && (
-          <div className="import-progress" title="External develop round-trip">
-            <span className="import-progress-label">
-              {developStatus.phase === "rendering"
-                ? `Rendering ${developStatus.editor}…`
-                : `Editing in ${developStatus.editor}…`}
-            </span>
-            <div className="progress-track">
-              <div className="progress-fill" style={{ width: "40%" }} />
-            </div>
-          </div>
-        )}
-        <span className="status">{status}</span>
-      </TitleBar>
+      />
 
       <FilterBar
         filters={FILTERS}
@@ -1473,201 +1475,218 @@ export default function App() {
         </div>
         )}
         <main className={`grid-wrap ${inDevelop ? "develop-wrap" : ""}`}>
-          {inDevelop && selected ? (
-            <EditorView
-              photoId={selected.id}
-              photoW={selected.width}
-              photoH={selected.height}
-              activeVersionId={activeVersion?.id ?? null}
-              onPickVersion={setActiveVersion}
-              onSavedActive={(editJson) =>
-                setActiveVersion((cur) => (cur ? { ...cur, editJson } : cur))
-              }
-              onChanged={() => {
-                refresh();
-              }}
-              onBack={() => setDevelop(false)}
-            />
-          ) : activeView ? (
-            <div className="module-view">
-              <ModuleContent view={activeView} />
-            </div>
-          ) : inCompare ? (
-            <CompareView
-              photos={comparePhotos}
-              focusedId={compareFocusId}
-              softThreshold={softThreshold}
-              onFocus={setCompareFocusId}
-              onKeep={keepInCompare}
-              onExit={closeCompare}
-            />
-          ) : loupeInline && selected ? (
-            <div className="loupe-inline">
-              <div className="loupe-bar">
-                <button className="chip" onClick={() => setLoupeInline(false)}>
-                  ‹ Back to grid (Esc)
-                </button>
-                {selection.extraPhoto && selection.stackOrigin != null && (
+          <div className="stage">
+            {inDevelop && selected ? (
+              <EditorView
+                photoId={selected.id}
+                photoW={selected.width}
+                photoH={selected.height}
+                activeVersionId={activeVersion?.id ?? null}
+                onPickVersion={setActiveVersion}
+                onSavedActive={(editJson) =>
+                  setActiveVersion((cur) => (cur ? { ...cur, editJson } : cur))
+                }
+                onChanged={() => {
+                  refresh();
+                }}
+                onBack={() => setDevelop(false)}
+              />
+            ) : activeView ? (
+              <div className="module-view">
+                <ModuleContent view={activeView} />
+              </div>
+            ) : inCompare ? (
+              <CompareView
+                photos={comparePhotos}
+                focusedId={compareFocusId}
+                softThreshold={softThreshold}
+                onFocus={setCompareFocusId}
+                onKeep={keepInCompare}
+                onExit={closeCompare}
+              />
+            ) : loupeInline && selected ? (
+              <div className="loupe-inline">
+                <div className="loupe-bar">
+                  <button className="chip" onClick={() => setLoupeInline(false)}>
+                    ‹ Back to grid (Esc)
+                  </button>
+                  {selection.extraPhoto && selection.stackOrigin != null && (
+                    <button
+                      className="chip"
+                      title="Return to the original this is stacked under"
+                      onClick={library.backToOriginal}
+                    >
+                      ‹ Back to original
+                    </button>
+                  )}
                   <button
                     className="chip"
-                    title="Return to the original this is stacked under"
-                    onClick={library.backToOriginal}
+                    title="Rotate left (non-destructive)"
+                    onClick={() => rotateSelected(selected.id, -90)}
                   >
-                    ‹ Back to original
+                    ↺
                   </button>
-                )}
-                <button
-                  className="chip"
-                  title="Rotate left (non-destructive)"
-                  onClick={() => rotateSelected(selected.id, -90)}
-                >
-                  ↺
-                </button>
-                <button
-                  className="chip"
-                  title="Rotate right (non-destructive)"
-                  onClick={() => rotateSelected(selected.id, 90)}
-                >
-                  ↻
-                </button>
-                <span className="loupe-filename">
-                  {selected.path.split("/").pop()}
-                  {selected.pickState === "reject" && (
-                    <span className="loupe-tag reject"> rejected</span>
-                  )}
-                  {selected.pickState === "pick" && (
-                    <span className="loupe-tag pick"> pick</span>
-                  )}
-                  {selected.rating > 0 && (
-                    <span className="loupe-tag"> {"★".repeat(selected.rating)}</span>
-                  )}
-                  {selected.sharpness != null && selected.sharpness < softThreshold && (
-                    <span
-                      className="loupe-tag loupe-soft"
-                      title={`Sharpness score ${selected.sharpness.toFixed(1)} is below threshold ${softThreshold} (method: ${selected.sharpnessMethod ?? "tile"})`}
-                    >
-                      soft
-                    </span>
-                  )}
-                  {selected.burstFlag === "soft-in-burst" && (
-                    <span
-                      className="loupe-tag loupe-soft"
-                      title="Soft in burst — dimmer than the rest of its cluster. The inspector's Culling signals section shows the cluster, the median and the exact cutoff."
-                    >
-                      soft-in-burst
-                    </span>
-                  )}
-                  {selected.burstFlag === "sharpest-of-burst" && (
-                    <span
-                      className="loupe-tag loupe-version"
-                      title="Sharpest of burst — the highest-scoring frame in its cluster. The inspector's Culling signals section shows the cluster and the scores."
-                    >
-                      ♛ sharpest of burst
-                    </span>
-                  )}
-                  {activeVersion && (
-                    <span className="loupe-tag loupe-version"> · {activeVersion.name}</span>
-                  )}
-                </span>
-                <span className="loupe-hint">
-                  scroll zoom · drag pan · dbl-click 100% · P pick · X reject · F faces · ← →
-                </span>
-              </div>
-              {isVideoPath(selected.path) ? (
-                <div className="loupe-video-wrap">
-                  {/* keyed by id so switching photos reloads the source */}
-                  <video
-                    key={selected.id}
-                    className="loupe-video"
-                    src={videoUrl(selected.id)}
-                    controls
-                    autoPlay
-                  />
+                  <button
+                    className="chip"
+                    title="Rotate right (non-destructive)"
+                    onClick={() => rotateSelected(selected.id, 90)}
+                  >
+                    ↻
+                  </button>
+                  <span className="loupe-filename">
+                    {selected.path.split("/").pop()}
+                    {selected.pickState === "reject" && (
+                      <span className="loupe-tag reject"> rejected</span>
+                    )}
+                    {selected.pickState === "pick" && (
+                      <span className="loupe-tag pick"> pick</span>
+                    )}
+                    {selected.rating > 0 && (
+                      <span className="loupe-tag"> {"★".repeat(selected.rating)}</span>
+                    )}
+                    {selected.sharpness != null && selected.sharpness < softThreshold && (
+                      <span
+                        className="loupe-tag loupe-soft"
+                        title={`Sharpness score ${selected.sharpness.toFixed(1)} is below threshold ${softThreshold} (method: ${selected.sharpnessMethod ?? "tile"})`}
+                      >
+                        soft
+                      </span>
+                    )}
+                    {selected.burstFlag === "soft-in-burst" && (
+                      <span
+                        className="loupe-tag loupe-soft"
+                        title="Soft in burst — dimmer than the rest of its cluster. The inspector's Culling signals section shows the cluster, the median and the exact cutoff."
+                      >
+                        soft-in-burst
+                      </span>
+                    )}
+                    {selected.burstFlag === "sharpest-of-burst" && (
+                      <span
+                        className="loupe-tag loupe-version"
+                        title="Sharpest of burst — the highest-scoring frame in its cluster. The inspector's Culling signals section shows the cluster and the scores."
+                      >
+                        ♛ sharpest of burst
+                      </span>
+                    )}
+                    {activeVersion && (
+                      <span className="loupe-tag loupe-version"> · {activeVersion.name}</span>
+                    )}
+                  </span>
+                  <span className="loupe-hint">
+                    scroll zoom · drag pan · dbl-click 100% · P pick · X reject · F faces · ← →
+                  </span>
                 </div>
-              ) : (
-                // Wrap the ZoomableImage in a relative-positioned container so that
-                // loupe-slot module panels (e.g. the face overlay) can position
-                // themselves absolutely over the image. The wrapper inherits the same
-                // flex-1 sizing that .zoom-container already has.
-                <div style={{ position: "relative", display: "flex", flexDirection: "column", flex: 1, minHeight: 0 }}>
-                  <ZoomableImage
-                    photoId={selected.id}
-                    bust={thumbBusts.get(selected.id)}
-                    srcOverride={editedSrc || undefined}
-                    hiSrcOverride={editedSrc ? renderHiVersion : undefined}
-                    unavailableActions={
-                      <div className="loupe-actions">
-                        <button className="chip" onClick={() => relocatePhotoAction(selected.id)}>
-                          Relocate…
-                        </button>
-                        <button className="chip" onClick={() => retrieveFromNasAction(selected.id)}>
-                          Retrieve from NAS
-                        </button>
-                        <button
-                          className="chip ctx-item-danger"
-                          onClick={() => removeFromCatalogAction(selected.id)}
-                        >
-                          Remove from catalog
-                        </button>
+                {isVideoPath(selected.path) ? (
+                  <div className="loupe-video-wrap">
+                    {/* keyed by id so switching photos reloads the source */}
+                    <video
+                      key={selected.id}
+                      className="loupe-video"
+                      src={videoUrl(selected.id)}
+                      controls
+                      autoPlay
+                    />
+                  </div>
+                ) : (
+                  // Wrap the ZoomableImage in a relative-positioned container so that
+                  // loupe-slot module panels (e.g. the face overlay) can position
+                  // themselves absolutely over the image. The wrapper inherits the same
+                  // flex-1 sizing that .zoom-container already has.
+                  <div style={{ position: "relative", display: "flex", flexDirection: "column", flex: 1, minHeight: 0 }}>
+                    <ZoomableImage
+                      photoId={selected.id}
+                      bust={thumbBusts.get(selected.id)}
+                      srcOverride={editedSrc || undefined}
+                      hiSrcOverride={editedSrc ? renderHiVersion : undefined}
+                      unavailableActions={
+                        <div className="loupe-actions">
+                          <button className="chip" onClick={() => relocatePhotoAction(selected.id)}>
+                            Relocate…
+                          </button>
+                          <button className="chip" onClick={() => retrieveFromNasAction(selected.id)}>
+                            Retrieve from NAS
+                          </button>
+                          <button
+                            className="chip ctx-item-danger"
+                            onClick={() => removeFromCatalogAction(selected.id)}
+                          >
+                            Remove from catalog
+                          </button>
+                        </div>
+                      }
+                    />
+                    {/* Loupe-slot panels from enabled modules (e.g. face overlay). Each
+                        panel is expected to render an absolute-positioned overlay. */}
+                    {panelsForSlot("loupe").map((panel) => (
+                      <div key={panel.id} style={{ position: "absolute", inset: 0, pointerEvents: "none" }}>
+                        <ModuleContent view={panel} />
                       </div>
-                    }
-                  />
-                  {/* Loupe-slot panels from enabled modules (e.g. face overlay). Each
-                      panel is expected to render an absolute-positioned overlay. */}
-                  {panelsForSlot("loupe").map((panel) => (
-                    <div key={panel.id} style={{ position: "absolute", inset: 0, pointerEvents: "none" }}>
-                      <ModuleContent view={panel} />
-                    </div>
-                  ))}
-                </div>
-              )}
-            </div>
-          ) : (
-            <CatalogGrid
-              photos={photos}
-              selectedId={selection.activeId}
-              selectedIds={selection.ids}
-              statuses={statuses}
-              onVisibleRange={library.setVisibleRange}
+                    ))}
+                  </div>
+                )}
+              </div>
+            ) : (
+              <CatalogGrid
+                photos={photos}
+                selectedId={selection.activeId}
+                selectedIds={selection.ids}
+                statuses={statuses}
+                onVisibleRange={library.setVisibleRange}
+                thumbBusts={thumbBusts}
+                softThreshold={softThreshold}
+                emptyMessage={
+                  scope.storageTier === "nas"
+                    ? "No NAS-only photos yet. Older photos move here when offloaded — set a day count in Preferences → Storage → Local / NAS tiering, or click “Offload older now”."
+                    : scope.storageTier === "local" ||
+                        scope.filter !== "all" ||
+                        scope.tagId != null ||
+                        scope.albumId != null ||
+                        scope.batchId != null ||
+                        scope.smartAlbumId != null ||
+                        scope.facets.length > 0 ||
+                        scope.labels.length > 0
+                      ? "No photos match the current filters."
+                      : undefined
+                }
+                onSelect={(p, mods) => library.select(p.id, mods)}
+                onOpen={(p) => {
+                  library.select(p.id);
+                  setLoupeInline(true);
+                }}
+                onContextMenu={(p, e) => {
+                  library.select(p.id);
+                  setCtxMenu({ x: e.clientX, y: e.clientY, photoId: p.id });
+                }}
+              />
+            )}
+          </div>
+          {!inDevelop && !activeView && (
+            <Bench
+              progress={benchProgress}
+              status={status}
+              total={library.total}
+              selectedCount={selection.ids.length}
+              active={shellPhoto}
+              onRate={(n) => void applyMark((id) => setRating(id, n))}
+              onPick={(s) => void applyMark((id) => setPickState(id, s))}
+              onLabel={(name) => void applyMark((id) => setLabel(id, name))}
+              selectionThumbs={selection.photos.slice(0, 3)}
               thumbBusts={thumbBusts}
-              softThreshold={softThreshold}
-              emptyMessage={
-                scope.storageTier === "nas"
-                  ? "No NAS-only photos yet. Older photos move here when offloaded — set a day count in Preferences → Storage → Local / NAS tiering, or click “Offload older now”."
-                  : scope.storageTier === "local" ||
-                      scope.filter !== "all" ||
-                      scope.tagId != null ||
-                      scope.albumId != null ||
-                      scope.batchId != null ||
-                      scope.smartAlbumId != null ||
-                      scope.facets.length > 0 ||
-                      scope.labels.length > 0
-                    ? "No photos match the current filters."
-                    : undefined
-              }
-              onSelect={(p, mods) => library.select(p.id, mods)}
-              onOpen={(p) => {
-                library.select(p.id);
-                setLoupeInline(true);
-              }}
-              onContextMenu={(p, e) => {
-                library.select(p.id);
-                setCtxMenu({ x: e.clientX, y: e.clientY, photoId: p.id });
-              }}
+              canCompare={canCompare}
+              compareOn={inCompare}
+              onCompare={() => (inCompare ? closeCompare() : openCompare())}
+              onStack={openStackProposals}
+              onCull={startCullSession}
+              canExport={selection.targets.length > 0}
+              onExport={() => setShowExport(true)}
+              canPublish={selection.activeId != null}
+              onPublish={() => setShowPublish(true)}
+              onBackUpSelection={backUpSelection}
+              canBackUpSelection={ready && selection.ids.length > 0}
+              onAnalyseBurst={runBurstAnalysis}
+              ready={ready}
+              onClearSelection={library.clearSelection}
             />
-          )}
-          {!inDevelop && !activeView && !inCompare && !(loupeInline && selected) && library.total > 0 && (
-            <div className="grid-statusbar">
-              {/* The MATCHING count, which a windowed fetch would no longer equal
-                  `photos.length` (issue #10). */}
-              <span className="grid-statusbar-count">{library.total.toLocaleString()}</span>
-              <span>photos</span>
-              {selection.ids.length > 1 && (
-                <span className="grid-statusbar-sel">
-                  {selection.ids.length.toLocaleString()} selected
-                </span>
-              )}
-            </div>
           )}
         </main>
         {!inDevelop && !rightHidden && (

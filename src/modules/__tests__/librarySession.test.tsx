@@ -460,4 +460,35 @@ describe("useLibrarySession — the selection", () => {
     });
     expect(mockPhotoStatuses).toHaveBeenCalledWith([99]);
   });
+
+  it("clears the selection without touching the scope or the rows", async () => {
+    // The bench's ✕ — reset()'s selection half. Everything selection-scoped goes
+    // (active, ids, the off-grid stack-child view, the Shift anchor); the scope, the
+    // derived query and the rows stay exactly as they were.
+    const { result } = await sessionWith([1, 2, 3]);
+    act(() => result.current.selectTag(7));
+    act(() => result.current.select(2));
+    act(() => result.current.select(3, { ctrl: true }));
+    act(() => result.current.viewPhoto(photo(99, { stackParentId: 2 })));
+    const scopeBefore = result.current.scope;
+    const queryBefore = result.current.query;
+
+    act(() => result.current.clearSelection());
+
+    expect(result.current.selection.activeId).toBeNull();
+    expect(result.current.selection.ids).toEqual([]);
+    expect(result.current.selection.active).toBeNull();
+    expect(result.current.selection.targets).toEqual([]);
+    expect(result.current.selection.extraPhoto).toBeNull();
+    expect(result.current.selection.stackOrigin).toBeNull();
+    // Unlike reset(): same scope object, same query identity (no refetch), rows kept.
+    expect(result.current.scope).toBe(scopeBefore);
+    expect(result.current.query).toBe(queryBefore);
+    expect(result.current.photos).toHaveLength(3);
+
+    // The Shift anchor went with the selection, so — with nothing active — a Shift
+    // click afterwards is an ordinary single selection, not a range from 2.
+    act(() => result.current.select(3, { shift: true }));
+    expect(result.current.selection.ids).toEqual([3]);
+  });
 });

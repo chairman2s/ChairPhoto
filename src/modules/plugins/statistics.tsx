@@ -2,8 +2,9 @@
 // shooting patterns, cameras, lenses, focal lengths, ratings and top tags. Frontend-only;
 // all figures come from the `catalog_stats` command. See docs/statistics.md.
 import { useEffect, useState, useRef, useId } from "react";
+import type { CSSProperties } from "react";
 import { useHostFilterContext } from "../host";
-import type { ChairPhotoAPI, ChairPhotoModule } from "../registry";
+import type { ChairPhotoAPI, ChairPhotoModule, Unsubscribe } from "../registry";
 import "./statistics.css";
 
 // ── Backend contract ──────────────────────────────────────────────────────────
@@ -41,6 +42,40 @@ interface CullCross<K> {
   picked: number;  // pick_state = 'pick'
   rated: number;   // rating > 0
   hits: number;    // rating >= 4
+}
+
+// ── Stats cache ───────────────────────────────────────────────────────────────
+
+/**
+ * Last fetched stats per scope, module-scoped so reopening the dashboard
+ * paints instantly with the previous figures while a fresh fetch runs
+ * (the view unmounts on every switch away, so component state can't do this).
+ * Cleared when the catalog switches via the optional `onEvent` capability;
+ * on a host without it the repaint is merely stale for the moment the
+ * always-running refetch takes. Entries are a few KB; FIFO-capped.
+ */
+const statsCache = new Map<string, CatalogStats>();
+const STATS_CACHE_CAP = 16;
+
+function statsCacheKey(ctx: {
+  tagId?: number | null;
+  albumId?: number | null;
+  batchId?: number | null;
+}): string {
+  return `${ctx.tagId ?? ""}|${ctx.albumId ?? ""}|${ctx.batchId ?? ""}`;
+}
+
+function statsCachePut(key: string, stats: CatalogStats) {
+  if (!statsCache.has(key) && statsCache.size >= STATS_CACHE_CAP) {
+    const oldest = statsCache.keys().next().value;
+    if (oldest !== undefined) statsCache.delete(oldest);
+  }
+  statsCache.set(key, stats);
+}
+
+/** Test hook: the cache outlives component unmounts by design. */
+export function __clearStatsCacheForTests() {
+  statsCache.clear();
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -317,8 +352,9 @@ function AreaChart({ points, tickEvery, fmtValue, height = 200 }: AreaProps) {
           </g>
         ))}
 
-        <path d={area} fill={`url(#area-${uid})`} />
-        <path d={line} className="st-area-line" fill="none" />
+        {/* pathLength=1 normalizes the dasharray so CSS can draw the line in. */}
+        <path d={area} fill={`url(#area-${uid})`} className="st-area-fill" />
+        <path d={line} className="st-area-line" fill="none" pathLength={1} />
 
         {/* Year tick labels */}
         {points.map((p, i) => {
@@ -483,8 +519,9 @@ function VBars({ values, labels, titles, height = 130, peakLabel = false, starLa
           const x = i * slot + pad;
           const yTop = topPad + plotH - h;
           const isPeak = i === peakIdx;
+          // --i staggers the grow-in animation, see statistics.css
           return (
-            <g key={i}>
+            <g key={i} style={{ "--i": i } as CSSProperties}>
               <rect
                 x={x}
                 y={yTop}
@@ -607,6 +644,7 @@ function RankList({
         <button
           key={i}
           className={`st-rank-row st-hue-${hue}${row.onClick ? " clickable" : ""}${i < 3 ? " top3" : ""}`}
+          style={{ "--i": i } as CSSProperties}
           onClick={row.onClick}
           title={row.title}
           disabled={!row.onClick}
@@ -660,6 +698,7 @@ function RateList({
           <button
             key={i}
             className={`st-rank-row st-rate st-hue-${hue}${lowN ? " st-low-n" : ""}`}
+            style={{ "--i": i } as CSSProperties}
             title={title}
             disabled
           >
@@ -676,13 +715,49 @@ function RateList({
   );
 }
 
+// ── Loading skeleton ────────────────────────────────────────────────────────────
+
+/**
+ * The dashboard's shape with pulsing placeholders — shown only on a true cold
+ * load (no cached figures for the scope yet), so the view composes itself
+ * instead of presenting a bare loading line.
+ */
+function StatsSkeleton() {
+  return (
+    <div role="status" aria-label="Loading statistics">
+      <div className="st-header">
+        {[0, 1, 2, 3].map((i) => (
+          <div key={i} className="st-stat-card">
+            <div className="st-skel" style={{ height: 26, width: "55%" }} />
+            <div className="st-skel" style={{ height: 11, width: "38%" }} />
+          </div>
+        ))}
+      </div>
+      <div className="st-card">
+        <div className="st-skel" style={{ height: 200 }} />
+      </div>
+      <div className="st-grid">
+        <div className="st-card">
+          <div className="st-skel" style={{ height: 170 }} />
+        </div>
+        <div className="st-card">
+          <div className="st-skel" style={{ height: 170 }} />
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // ── StatsView ─────────────────────────────────────────────────────────────────
 
 const WEEKDAY_LABELS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
 const WEEKDAY_ORDER = [1, 2, 3, 4, 5, 6, 0];
 
 function StatsView({ api }: { api: ChairPhotoAPI }) {
-  const [stats, setStats] = useState<CatalogStats | null>(null);
+  // Seeded from the module cache so a reopened dashboard paints immediately.
+  const [stats, setStats] = useState<CatalogStats | null>(
+    () => statsCache.get(statsCacheKey(api.getFilterContext())) ?? null,
+  );
   const [error, setError] = useState("");
   // Which rate the keeper-analysis crossings show: cull survival or ≥4★ hits.
   const [rateMetric, setRateMetric] = useState<"keep" | "hit">("keep");
@@ -710,8 +785,12 @@ function StatsView({ api }: { api: ChairPhotoAPI }) {
     setError("");
     // Deliberately NOT clearing `stats` here: on a scope change the previous
     // figures stay up until the new ones land, instead of flashing the loading
-    // state. Out-of-order responses are impossible — the cleanup below flips
+    // state — and a scope we've fetched before repaints from the cache right
+    // away. Out-of-order responses are impossible: the cleanup below flips
     // `alive` for the superseded fetch before this effect re-runs.
+    const key = statsCacheKey(ctx);
+    const cached = statsCache.get(key);
+    if (cached) setStats(cached);
     const args: Record<string, unknown> = {
       tagId: ctx.tagId ?? null,
       albumId: ctx.albumId ?? null,
@@ -719,7 +798,12 @@ function StatsView({ api }: { api: ChairPhotoAPI }) {
     };
     api
       .invoke<CatalogStats>("catalog_stats", args)
-      .then((s) => { if (alive) setStats(s); })
+      .then((s) => {
+        // Cache even when unmounted mid-flight — the data is valid either
+        // way, and it's exactly what makes the next open instant.
+        statsCachePut(key, s);
+        if (alive) setStats(s);
+      })
       .catch((e) => { if (alive) setError(String(e)); });
     return () => { alive = false; };
   // Re-fetch whenever the scope changes.
@@ -760,7 +844,7 @@ function StatsView({ api }: { api: ChairPhotoAPI }) {
       <div className="st-root">
         <div className="st-inner">
           {scopeChip}
-          <p className="st-loading">Loading statistics…</p>
+          <StatsSkeleton />
         </div>
       </div>
     );
@@ -1167,6 +1251,12 @@ export const statisticsModule: ChairPhotoModule = {
   // One aggregate query; everything else the dashboard shows comes from core wrappers (#48).
   permissions: { commands: ["catalog_stats"] },
   onLoad(api) {
+    // The stats cache is per-catalog: drop it when the catalog switches.
+    // `onEvent` is an optional host capability — without it the only cost is
+    // a briefly-stale repaint after a switch, corrected by the refetch that
+    // always runs (same degradation stance as the faces module's progress).
+    catalogSwitchUnsub =
+      api.onEvent?.("catalog:switched", () => statsCache.clear()) ?? Promise.resolve(null);
     api.registerMainView({
       id: "statistics",
       label: "Stats",
@@ -1181,4 +1271,12 @@ export const statisticsModule: ChairPhotoModule = {
       render: () => <StatsView api={api} />,
     });
   },
+  onUnload() {
+    statsCache.clear();
+    catalogSwitchUnsub?.then((u) => u?.());
+    catalogSwitchUnsub = null;
+  },
 };
+
+/** The catalog-switch listener owned by the current enable; released on unload. */
+let catalogSwitchUnsub: Promise<Unsubscribe | null> | null = null;

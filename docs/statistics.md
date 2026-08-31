@@ -81,10 +81,14 @@ The module id is `statistics`. It is **frontend-only** — it declares no `backe
 
 ## Limits
 
-- Everything is computed live from the catalog on each open — one pass over the photos table
-  plus a top-tags join, no cached snapshot. When the scope changes, the previous figures stay
-  on screen until the new ones arrive. The `catalog_stats` operation in the performance
-  harness (`docs/performance-harness.md`) guards this path against regressing to per-panel
-  queries.
+- Everything is computed live from the catalog — one pass over the photos table plus a
+  top-tags join, no persistent snapshot. Reopening the dashboard repaints instantly from the
+  last figures for that scope and refreshes in the background (the in-memory cache is dropped
+  on catalog switch); a scope change likewise keeps the previous figures up until the new
+  ones arrive. Only a true cold load shows the skeleton. The `catalog_stats` operation in the
+  performance harness (`docs/performance-harness.md`) guards the query path against
+  regressing to per-panel queries.
+- Charts animate in on mount (bars grow, the timeline draws itself, rate bars sweep). All
+  motion respects `prefers-reduced-motion`.
 - Photos marked missing are excluded, so counts describe what the catalog can currently see.
 - The panels are read-only. Clicking a bar does not filter the grid.

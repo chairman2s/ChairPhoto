@@ -21,7 +21,7 @@
   gap: 16px;
 }
 
-/* Entrance animation */
+/* Entrance animations — everything motion lives behind this media query. */
 @media (prefers-reduced-motion: no-preference) {
   .st-card,
   .st-stat-card,
@@ -32,6 +32,66 @@
     from { opacity: 0; transform: translateY(6px) scale(0.995); }
     to   { opacity: 1; transform: none; }
   }
+
+  /* Timeline draws itself in: the stroke unrolls (pathLength=1 normalizes the
+     dash math), the area fill fades up behind it. */
+  .st-area-line {
+    stroke-dasharray: 1;
+    animation: st-draw 0.9s ease-out both;
+  }
+  .st-area-fill {
+    animation: st-area-fade 0.9s ease-out both;
+  }
+  @keyframes st-draw {
+    from { stroke-dashoffset: 1; }
+    to   { stroke-dashoffset: 0; }
+  }
+  @keyframes st-area-fade {
+    from { opacity: 0; }
+  }
+
+  /* Bars grow from the baseline, left to right (--i set per bar in TSX). */
+  .st-vbars-svg g > rect {
+    transform-box: fill-box;
+    transform-origin: 50% 100%;
+    animation: st-grow 0.45s ease-out backwards;
+    animation-delay: calc(var(--i, 0) * 14ms);
+  }
+  @keyframes st-grow {
+    from { transform: scaleY(0.01); }
+  }
+
+  /* Donut and clock pop in as one piece. */
+  .st-donut-svg,
+  .st-clock-svg {
+    animation: st-pop 0.45s ease-out both;
+  }
+  @keyframes st-pop {
+    from { opacity: 0; transform: scale(0.92); }
+  }
+
+  /* Ranked/rate bars sweep to their width, top to bottom (--i per row). */
+  .st-rank-fill {
+    animation: st-fill-in 0.6s cubic-bezier(0.22, 0.61, 0.36, 1) backwards;
+    animation-delay: calc(var(--i, 0) * 30ms);
+  }
+  @keyframes st-fill-in {
+    from { width: 0; }
+  }
+
+  .st-skel {
+    animation: st-pulse 1.2s ease-in-out infinite;
+  }
+  @keyframes st-pulse {
+    0%, 100% { opacity: 0.5; }
+    50%      { opacity: 0.95; }
+  }
+}
+
+/* ── Loading skeleton ─────────────────────────────────────────── */
+.st-skel {
+  background: var(--well);
+  border-radius: 8px;
 }
 
 /* ── Scope chip ───────────────────────────────────────────────── */
@@ -62,11 +122,6 @@
 }
 
 /* ── Loading / error ──────────────────────────────────────────── */
-.st-loading {
-  color: var(--mute);
-  padding: 32px 16px;
-  font-size: 13px;
-}
 
 .st-error {
   padding: 8px 12px;

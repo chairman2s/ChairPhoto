@@ -26,7 +26,7 @@ import {
   setFilterContext,
 } from "../../host";
 import { ModuleContent } from "../../ModuleContent";
-import { statisticsModule } from "../statistics";
+import { __clearStatsCacheForTests, statisticsModule } from "../statistics";
 
 vi.mock("@tauri-apps/api/core", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@tauri-apps/api/core")>();
@@ -94,6 +94,7 @@ function statsFixture() {
 afterEach(() => {
   cleanup();
   __resetForTests();
+  __clearStatsCacheForTests();
   vi.restoreAllMocks();
 });
 
@@ -147,5 +148,32 @@ describe("Statistics panel — re-renders on a host filter-context notify (issue
     // All ratings are 0 in the fixture → quality hit rate has no denominator.
     expect(screen.getByText("Quality hit rate")).toBeTruthy();
     expect(screen.getByText("no rated photos yet")).toBeTruthy();
+  });
+
+  it("shows the skeleton on a cold load, then repaints instantly from cache on remount", async () => {
+    register(statisticsModule);
+    grantPermissions("statistics", false);
+    enableModule("statistics", false);
+
+    const view = mainViews().find((v) => v.id === "statistics");
+    if (!view) throw new Error("statistics module did not register a main view");
+
+    // Cold load: nothing cached, so the first synchronous paint is the
+    // skeleton, not data and not a bare loading line.
+    const first = render(<ModuleContent view={view} />);
+    expect(first.container.querySelector(".st-skel")).toBeTruthy();
+    expect(first.container.querySelector(".st-stat-num")).toBeNull();
+
+    await waitFor(() =>
+      expect(first.container.querySelector(".st-stat-num")?.textContent).toBe("5"),
+    );
+    first.unmount();
+
+    // Remount (the user switching back to the Stats view): the module cache
+    // seeds the initial state, so data is there on the FIRST paint — no
+    // skeleton, no waitFor.
+    const second = render(<ModuleContent view={view} />);
+    expect(second.container.querySelector(".st-skel")).toBeNull();
+    expect(second.container.querySelector(".st-stat-num")?.textContent).toBe("5");
   });
 });

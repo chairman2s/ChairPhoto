@@ -118,6 +118,12 @@ fn large_catalog_shape() {
         },
     );
 
+    let stats_total = required_operation(&mut operations, &config, Operation::CatalogStats, || {
+        let stats = catalog.catalog_stats(None, None, None)?;
+        Ok(Measured::unmetered(stats.total_photos))
+    });
+    assert_eq!(stats_total as usize, config.photo_count);
+
     let _volume_reachability = required_operation(
         &mut operations,
         &config,
@@ -441,6 +447,7 @@ enum Operation {
     ListPhotosCombinedFacetsAndFilters,
     ListPhotosOfflineNas,
     ListTagsWithCounts,
+    CatalogStats,
     VolumeReachability,
     GridStatusesWindow,
     GridBadgesWindow,
@@ -486,6 +493,11 @@ impl Operation {
             Operation::ListTagsWithCounts => {
                 OperationInfo::scaled("list_tags_with_counts", 20_000.0)
             }
+            // catalog_stats is one full-table pass plus the top-tags join. Calibrated
+            // for the harness's canonical debug build (~1.2 s at 100k, where the Rust
+            // fold is unoptimized); the per-panel-scan shape it replaced measured
+            // ~3.7 s at 100k, so the loose threshold still catches that regression.
+            Operation::CatalogStats => OperationInfo::scaled("catalog_stats", 2_500.0),
             Operation::VolumeReachability => OperationInfo::fixed("volume_reachability", 1_000.0),
             Operation::GridStatusesWindow => {
                 OperationInfo::fixed("grid_statuses_window", 5_000.0)

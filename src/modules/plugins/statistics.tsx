@@ -708,7 +708,10 @@ function StatsView({ api }: { api: ChairPhotoAPI }) {
   useEffect(() => {
     let alive = true;
     setError("");
-    setStats(null);
+    // Deliberately NOT clearing `stats` here: on a scope change the previous
+    // figures stay up until the new ones land, instead of flashing the loading
+    // state. Out-of-order responses are impossible — the cleanup below flips
+    // `alive` for the superseded fetch before this effect re-runs.
     const args: Record<string, unknown> = {
       tagId: ctx.tagId ?? null,
       albumId: ctx.albumId ?? null,

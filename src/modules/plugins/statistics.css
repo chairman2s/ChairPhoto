@@ -524,3 +524,61 @@
 .st-star {
   color: var(--rating);
 }
+
+/* ── Keeper analysis ──────────────────────────────────────────── */
+
+/* Rate rows show "num/den", wider than a plain count. */
+.st-rank-row.st-rate .st-rank-count {
+  flex: 0 0 72px;
+}
+
+/* Small-sample rows are dimmed, never dropped. */
+.st-rank-row.st-low-n {
+  opacity: 0.45;
+}
+
+/* Section header with the metric toggle. */
+.st-cull-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-top: 4px;
+}
+
+.st-cull-title {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--dim);
+}
+
+/* Pill segmented control. */
+.st-seg {
+  display: inline-flex;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--panel);
+  padding: 2px;
+  gap: 2px;
+}
+
+.st-seg button {
+  border: none;
+  background: transparent;
+  color: var(--dim);
+  font-size: 11px;
+  font-weight: 600;
+  padding: 4px 12px;
+  border-radius: 999px;
+  cursor: pointer;
+}
+
+.st-seg button:hover {
+  color: var(--txt);
+}
+
+.st-seg button.active {
+  background: var(--sel);
+  color: var(--txt);
+}

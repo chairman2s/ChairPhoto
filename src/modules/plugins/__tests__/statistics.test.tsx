@@ -76,6 +76,18 @@ function statsFixture() {
     ratings: new Array(6).fill(0),
     topDays: [],
     invalidDates: 0,
+    // Keeper analysis: 4 decided of 5 photos → 75% keep rate in the summary
+    // card AND in the lens rate row. Non-zero on purpose: a typo'd camelCase
+    // field would arrive as `undefined` and render nothing, failing the smoke
+    // assertions below.
+    picked: 3,
+    rejected: 1,
+    cullByLens: [{ key: "50mm", total: 4, decided: 4, picked: 3, rated: 4, hits: 2 }],
+    cullByCamera: [],
+    cullByFocal: [],
+    cullByIso: [],
+    cullByAperture: [],
+    cullByShutter: [],
   };
 }
 
@@ -114,5 +126,26 @@ describe("Statistics panel — re-renders on a host filter-context notify (issue
     setFilterContext({ tagId: 42, albumId: null, batchId: null });
 
     await waitFor(() => expect(screen.getByText(/scoped to tag/i)).toBeTruthy());
+  });
+
+  it("renders the keeper-analysis sections from the stats payload", async () => {
+    register(statisticsModule);
+    grantPermissions("statistics", false);
+    enableModule("statistics", false);
+
+    const view = mainViews().find((v) => v.id === "statistics");
+    if (!view) throw new Error("statistics module did not register a main view");
+
+    render(<ModuleContent view={view} />);
+
+    // Summary card: picked 3 / decided 4 = 75%. The lens rate row shows the
+    // same 75%, hence getAllByText.
+    await waitFor(() => expect(screen.getByText("Cull survival")).toBeTruthy());
+    expect(screen.getAllByText("75%").length).toBeGreaterThan(0);
+    // New exposure distribution card (renders even with an empty payload).
+    expect(screen.getByText("Shutter speed")).toBeTruthy();
+    // All ratings are 0 in the fixture → quality hit rate has no denominator.
+    expect(screen.getByText("Quality hit rate")).toBeTruthy();
+    expect(screen.getByText("no rated photos yet")).toBeTruthy();
   });
 });

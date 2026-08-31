@@ -3238,6 +3238,180 @@ fn catalog_stats_counts_and_buckets() {
     assert_eq!(dstats.cameras.len(), 0, "p3 has no camera");
 }
 
+#[test]
+fn catalog_stats_cull_survival_and_exposure_crossings() {
+    use chairphoto_lib::catalog::PromotedMetadata;
+
+    let (catalog, root) = temp_catalog("statscull");
+
+    let mk = |name: &str| -> i64 {
+        let p = root.join(name);
+        std::fs::write(&p, b"x").unwrap();
+        catalog.upsert_photo(&p, None, 1, 1).unwrap().id
+    };
+
+    // Five photos crossing lens/ISO/aperture/shutter with pick state and rating:
+    //   p1 — 50/1.8, ISO 100, f/2.8, 1/250  — Pick,   5★
+    //   p2 — 50/1.8, ISO 100, f/2.8, 1/250  — Reject, 2★
+    //   p3 — 24-70,  ISO 3200, f/1.8, "0.5" — Pick,   4★
+    //   p4 — no lens, ISO 3200, no aperture, "1/2" — undecided, unrated
+    //   p5 — no exposure metadata at all — undecided, unrated
+    let p1 = mk("p1.ARW");
+    let p2 = mk("p2.ARW");
+    let p3 = mk("p3.ARW");
+    let p4 = mk("p4.ARW");
+    let p5 = mk("p5.ARW");
+
+    let set_meta = |id: i64,
+                    lens: Option<&str>,
+                    iso: Option<i64>,
+                    aperture: Option<f64>,
+                    shutter: Option<&str>| {
+        let promoted = PromotedMetadata {
+            lens: lens.map(String::from),
+            iso,
+            aperture,
+            shutter_speed: shutter.map(String::from),
+            ..Default::default()
+        };
+        catalog.set_photo_metadata(id, &promoted, &[]).unwrap();
+    };
+
+    set_meta(p1, Some("50/1.8"), Some(100), Some(2.8), Some("1/250"));
+    set_meta(p2, Some("50/1.8"), Some(100), Some(2.8), Some("1/250"));
+    set_meta(p3, Some("24-70"), Some(3200), Some(1.8), Some("0.5"));
+    set_meta(p4, None, Some(3200), None, Some("1/2"));
+    set_meta(p5, None, None, None, None);
+
+    catalog.set_culling(p1, Some(5), None, Some(PickState::Pick)).unwrap();
+    catalog.set_culling(p2, Some(2), None, Some(PickState::Reject)).unwrap();
+    catalog.set_culling(p3, Some(4), None, Some(PickState::Pick)).unwrap();
+
+    // Compare a CullCross row against (total, decided, picked, rated, hits).
+    let tallies = |g: &chairphoto_lib::catalog::CullCross<i64>| -> (i64, i64, i64, i64, i64) {
+        (g.total, g.decided, g.picked, g.rated, g.hits)
+    };
+
+    // --- whole catalog ------------------------------------------------------
+    let stats = catalog.catalog_stats(None, None, None).unwrap();
+
+    assert_eq!(stats.picked, 2, "p1 and p3 are picked");
+    assert_eq!(stats.rejected, 1, "p2 is rejected");
+    // Undecided is derived downstream: total_photos - picked - rejected = 2.
+
+    // Lenses, total descending.
+    assert_eq!(stats.cull_by_lens.len(), 2);
+    assert_eq!(stats.cull_by_lens[0].key, "50/1.8");
+    assert_eq!(
+        (
+            stats.cull_by_lens[0].total,
+            stats.cull_by_lens[0].decided,
+            stats.cull_by_lens[0].picked,
+            stats.cull_by_lens[0].rated,
+            stats.cull_by_lens[0].hits,
+        ),
+        (2, 2, 1, 2, 1),
+        "50/1.8: p1+p2, both decided, one picked, both rated, one >=4"
+    );
+    assert_eq!(stats.cull_by_lens[1].key, "24-70");
+    assert_eq!(
+        (
+            stats.cull_by_lens[1].total,
+            stats.cull_by_lens[1].decided,
+            stats.cull_by_lens[1].picked,
+            stats.cull_by_lens[1].rated,
+            stats.cull_by_lens[1].hits,
+        ),
+        (1, 1, 1, 1, 1)
+    );
+
+    // No camera models were set.
+    assert!(stats.cull_by_camera.is_empty(), "no cameras in fixture");
+    // No focal lengths were set.
+    assert!(stats.cull_by_focal.is_empty(), "no focal lengths in fixture");
+
+    // ISO ascending.
+    assert_eq!(stats.cull_by_iso.len(), 2);
+    assert_eq!(stats.cull_by_iso[0].key, 100);
+    assert_eq!(tallies(&stats.cull_by_iso[0]), (2, 2, 1, 2, 1));
+    assert_eq!(stats.cull_by_iso[1].key, 3200);
+    assert_eq!(
+        tallies(&stats.cull_by_iso[1]),
+        (2, 1, 1, 1, 1),
+        "ISO 3200: p3+p4, only p3 decided/rated"
+    );
+
+    // Aperture ascending.
+    assert_eq!(stats.cull_by_aperture.len(), 2);
+    assert!((stats.cull_by_aperture[0].key - 1.8).abs() < 1e-9);
+    assert_eq!(
+        (stats.cull_by_aperture[0].total, stats.cull_by_aperture[0].picked),
+        (1, 1)
+    );
+    assert!((stats.cull_by_aperture[1].key - 2.8).abs() < 1e-9);
+    assert_eq!(
+        (
+            stats.cull_by_aperture[1].total,
+            stats.cull_by_aperture[1].decided,
+            stats.cull_by_aperture[1].picked,
+            stats.cull_by_aperture[1].rated,
+            stats.cull_by_aperture[1].hits,
+        ),
+        (2, 2, 1, 2, 1)
+    );
+
+    // Shutter: "0.5" and "1/2" must merge into one 0.5s group; ascending.
+    assert_eq!(stats.cull_by_shutter.len(), 2, "1/250 and 0.5s groups only");
+    assert!((stats.cull_by_shutter[0].key - 0.004).abs() < 1e-9);
+    assert_eq!(
+        (
+            stats.cull_by_shutter[0].total,
+            stats.cull_by_shutter[0].decided,
+            stats.cull_by_shutter[0].picked,
+            stats.cull_by_shutter[0].rated,
+            stats.cull_by_shutter[0].hits,
+        ),
+        (2, 2, 1, 2, 1)
+    );
+    assert!((stats.cull_by_shutter[1].key - 0.5).abs() < 1e-9);
+    assert_eq!(
+        (
+            stats.cull_by_shutter[1].total,
+            stats.cull_by_shutter[1].decided,
+            stats.cull_by_shutter[1].picked,
+            stats.cull_by_shutter[1].rated,
+            stats.cull_by_shutter[1].hits,
+        ),
+        (2, 1, 1, 1, 1),
+        "0.5s: p3 (\"0.5\") + p4 (\"1/2\") merged, only p3 decided"
+    );
+
+    // --- album scope --------------------------------------------------------
+    let album_id = catalog.create_album("CullSubset").unwrap();
+    catalog.add_photos_to_album(album_id, &[p1, p5]).unwrap();
+
+    let astats = catalog.catalog_stats(None, Some(album_id), None).unwrap();
+    assert_eq!(astats.picked, 1, "only p1 in album is picked");
+    assert_eq!(astats.rejected, 0);
+    assert_eq!(astats.cull_by_iso.len(), 1, "p5 has no ISO");
+    assert_eq!(astats.cull_by_iso[0].key, 100);
+    assert_eq!(tallies(&astats.cull_by_iso[0]), (1, 1, 1, 1, 1));
+    assert_eq!(astats.cull_by_shutter.len(), 1);
+    assert!((astats.cull_by_shutter[0].key - 0.004).abs() < 1e-9);
+    assert_eq!(astats.cull_by_shutter[0].total, 1);
+
+    // --- nonexistent tag scope: the empty_stats path ------------------------
+    let estats = catalog.catalog_stats(Some(999_999), None, None).unwrap();
+    assert_eq!(estats.picked, 0);
+    assert_eq!(estats.rejected, 0);
+    assert!(estats.cull_by_lens.is_empty());
+    assert!(estats.cull_by_camera.is_empty());
+    assert!(estats.cull_by_focal.is_empty());
+    assert!(estats.cull_by_iso.is_empty());
+    assert!(estats.cull_by_aperture.is_empty());
+    assert!(estats.cull_by_shutter.is_empty());
+}
+
 // ---------------------------------------------------------------------------
 // I4b — catalog-switch lifecycle: an in-flight scan cancels cleanly through
 // its Arc<AtomicBool> abort flag, so nothing writes into a stale catalog.

@@ -128,6 +128,40 @@ struct CatalogStats {
     top_days: Vec<(String, i64)>,
     /// Photos with an implausible capture date (pre-1950), excluded from time stats.
     invalid_dates: i64,
+    picked: i64,
+    rejected: i64,
+    cull_by_lens: Vec<CullCrossDto<String>>,
+    cull_by_camera: Vec<CullCrossDto<String>>,
+    cull_by_focal: Vec<CullCrossDto<f64>>,
+    cull_by_iso: Vec<CullCrossDto<i64>>,
+    cull_by_aperture: Vec<CullCrossDto<f64>>,
+    /// Keyed by exposure time in seconds.
+    cull_by_shutter: Vec<CullCrossDto<f64>>,
+}
+
+/// Wire shape of `catalog::CullCross` (keeper-analysis tallies per group).
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CullCrossDto<K> {
+    key: K,
+    total: i64,
+    decided: i64,
+    picked: i64,
+    rated: i64,
+    hits: i64,
+}
+
+fn cull_dto<K: serde::Serialize>(v: Vec<crate::catalog::CullCross<K>>) -> Vec<CullCrossDto<K>> {
+    v.into_iter()
+        .map(|g| CullCrossDto {
+            key: g.key,
+            total: g.total,
+            decided: g.decided,
+            picked: g.picked,
+            rated: g.rated,
+            hits: g.hits,
+        })
+        .collect()
 }
 
 /// Catalog-wide statistics: timeline, hours, weekdays, top tags, cameras, lenses,
@@ -164,6 +198,14 @@ pub async fn catalog_stats(
             ratings: raw.ratings,
             top_days: raw.top_days,
             invalid_dates: raw.invalid_dates,
+            picked: raw.picked,
+            rejected: raw.rejected,
+            cull_by_lens: cull_dto(raw.cull_by_lens),
+            cull_by_camera: cull_dto(raw.cull_by_camera),
+            cull_by_focal: cull_dto(raw.cull_by_focal),
+            cull_by_iso: cull_dto(raw.cull_by_iso),
+            cull_by_aperture: cull_dto(raw.cull_by_aperture),
+            cull_by_shutter: cull_dto(raw.cull_by_shutter),
         };
         Ok(serde_json::to_value(stats).unwrap_or_default())
     })

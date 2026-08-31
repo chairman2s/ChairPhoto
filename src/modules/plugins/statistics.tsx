@@ -23,6 +23,24 @@ interface CatalogStats {
   ratings: number[];              // 6 ints, index = rating 0-5
   topDays: [string, number][];    // 3 busiest single days ["YYYY-MM-DD", count] desc
   invalidDates: number;           // photos with bogus (pre-1950) dates, excluded above
+  picked: number;                 // pick_state = 'pick'
+  rejected: number;               // pick_state = 'reject'
+  cullByLens: CullCross<string>[];     // total desc
+  cullByCamera: CullCross<string>[];   // total desc
+  cullByFocal: CullCross<number>[];    // focal mm asc
+  cullByIso: CullCross<number>[];      // ISO asc
+  cullByAperture: CullCross<number>[]; // f-number asc
+  cullByShutter: CullCross<number>[];  // key = exposure time in SECONDS, asc
+}
+
+/** Per-group keeper-analysis tallies; `total` doubles as the plain distribution. */
+interface CullCross<K> {
+  key: K;
+  total: number;   // photos with this value
+  decided: number; // pick_state != 'none'
+  picked: number;  // pick_state = 'pick'
+  rated: number;   // rating > 0
+  hits: number;    // rating >= 4
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -117,6 +135,83 @@ function trimZeroBuckets(
     labels: labels.slice(start, end + 1),
     values: values.slice(start, end + 1),
   };
+}
+
+/** Generic edge-trim over parallel label/item arrays — sibling of trimZeroBuckets. */
+function trimZeroBy<T>(
+  labels: string[],
+  items: T[],
+  isZero: (t: T) => boolean,
+): { labels: string[]; items: T[] } {
+  let start = 0;
+  let end = items.length - 1;
+  while (start <= end && isZero(items[start])) start++;
+  while (end >= start && isZero(items[end])) end--;
+  if (start > end) return { labels: [], items: [] };
+  return { labels: labels.slice(start, end + 1), items: items.slice(start, end + 1) };
+}
+
+/** ISO bucket boundaries (upper exclusive), at geometric stop midpoints (×√2). */
+const ISO_BUCKETS: { label: string; max: number }[] = [
+  { label: "≤100",  max: 141 },
+  { label: "200",   max: 283 },
+  { label: "400",   max: 566 },
+  { label: "800",   max: 1131 },
+  { label: "1600",  max: 2263 },
+  { label: "3200",  max: 4526 },
+  { label: "6400",  max: 9051 },
+  { label: ">6400", max: Infinity },
+];
+
+/** Aperture buckets (upper exclusive), half-stop bounds (nominal × 2^¼) so third-stop values land right. */
+const APERTURE_BUCKETS: { label: string; max: number }[] = [
+  { label: "≤f/1.4", max: 1.7 },
+  { label: "f/2",    max: 2.4 },
+  { label: "f/2.8",  max: 3.4 },
+  { label: "f/4",    max: 4.8 },
+  { label: "f/5.6",  max: 6.8 },
+  { label: "f/8",    max: 9.6 },
+  { label: "f/11",   max: 13.5 },
+  { label: ">f/11",  max: Infinity },
+];
+
+/** Shutter buckets in seconds; first bucket whose min <= secs wins. Slow → fast. */
+const SHUTTER_BUCKETS: { label: string; min: number }[] = [
+  { label: "≥1s",         min: 1 },
+  { label: "1s–1/15",     min: 1 / 15 },
+  { label: "1/15–1/60",   min: 1 / 60 },
+  { label: "1/60–1/250",  min: 1 / 250 },
+  { label: "1/250–1/1000", min: 1 / 1000 },
+  { label: "<1/1000",     min: 0 },
+];
+
+interface CullTally {
+  total: number;
+  decided: number;
+  picked: number;
+  rated: number;
+  hits: number;
+}
+
+const EMPTY_TALLY: CullTally = { total: 0, decided: 0, picked: 0, rated: 0, hits: 0 };
+
+/** Sum CullCross rows into n buckets via bucketOf(key); a -1 bucket drops the row. */
+function aggregateCull(
+  rows: CullCross<number>[],
+  bucketOf: (v: number) => number,
+  n: number,
+): CullTally[] {
+  const out: CullTally[] = Array.from({ length: n }, () => ({ ...EMPTY_TALLY }));
+  for (const r of rows) {
+    const idx = bucketOf(r.key);
+    if (idx < 0 || idx >= n) continue;
+    out[idx].total += r.total;
+    out[idx].decided += r.decided;
+    out[idx].picked += r.picked;
+    out[idx].rated += r.rated;
+    out[idx].hits += r.hits;
+  }
+  return out;
 }
 
 /** Linear interpolate two hex colours. t ∈ [0,1]. */
@@ -530,6 +625,57 @@ function RankList({
   );
 }
 
+// ── Rate list (keeper analysis) ─────────────────────────────────────────────────
+
+interface RateRow {
+  label: string;
+  num: number;  // picked or hits
+  den: number;  // decided or rated
+  title?: string;
+}
+
+/**
+ * Ranked-list sibling that renders a RATE (num/den) instead of a share of a
+ * total. Rows with a denominator below `minDen` are dimmed as small samples,
+ * never dropped — dropping would make a scoped view look like data loss.
+ */
+function RateList({
+  rows,
+  hue,
+  minDen = 20,
+}: {
+  rows: RateRow[];
+  hue: "blue" | "violet" | "teal";
+  minDen?: number;
+}) {
+  if (rows.length === 0) return <p className="st-empty">No data</p>;
+
+  return (
+    <div className="st-rank-list">
+      {rows.map((row, i) => {
+        const lowN = row.den < minDen;
+        const pct = row.den > 0 ? Math.round((row.num / row.den) * 100) : 0;
+        const title = `${row.title ?? row.label} · ${row.num.toLocaleString()} of ${row.den.toLocaleString()}${lowN ? ` · small sample (n=${row.den})` : ""}`;
+        return (
+          <button
+            key={i}
+            className={`st-rank-row st-rate st-hue-${hue}${lowN ? " st-low-n" : ""}`}
+            title={title}
+            disabled
+          >
+            <span className="st-rank-name">{row.label}</span>
+            <span className="st-rank-track">
+              <span className="st-rank-fill" style={{ width: `${row.den > 0 ? (row.num / row.den) * 100 : 0}%` }} />
+            </span>
+            <span className="st-rank-count">{row.num.toLocaleString()}/{row.den.toLocaleString()}</span>
+            <span className="st-rank-pct">{pct}%</span>
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
 // ── StatsView ─────────────────────────────────────────────────────────────────
 
 const WEEKDAY_LABELS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
@@ -538,6 +684,8 @@ const WEEKDAY_ORDER = [1, 2, 3, 4, 5, 6, 0];
 function StatsView({ api }: { api: ChairPhotoAPI }) {
   const [stats, setStats] = useState<CatalogStats | null>(null);
   const [error, setError] = useState("");
+  // Which rate the keeper-analysis crossings show: cull survival or ≥4★ hits.
+  const [rateMetric, setRateMetric] = useState<"keep" | "hit">("keep");
   // Cache of all tags — fetched once and used to resolve tag names for the scope chip.
   const tagCacheRef = useRef<Map<number, string>>(new Map());
 
@@ -705,6 +853,59 @@ function StatsView({ api }: { api: ChairPhotoAPI }) {
     (count, i) => `${i === 0 ? "Unrated" : `${i}★`} · ${count.toLocaleString()} photos`,
   );
 
+  // ── Keeper analysis ─────────────────────────────────────────────────────────
+  // Two independent axes: pick/reject is the culling verdict, rating is the
+  // quality grade. Each rate uses its own honest denominator (decided / rated).
+
+  const decidedTotal = stats.picked + stats.rejected;
+  const undecided = stats.totalPhotos - decidedTotal;
+  const keepRate = decidedTotal > 0 ? Math.round((stats.picked / decidedTotal) * 100) : null;
+  const ratedTotal = stats.ratings.slice(1).reduce((a, b) => a + b, 0);
+  const hitsTotal = (stats.ratings[4] ?? 0) + (stats.ratings[5] ?? 0);
+  const unrated = stats.ratings[0] ?? 0;
+  const hitRate = ratedTotal > 0 ? Math.round((hitsTotal / ratedTotal) * 100) : null;
+
+  // Bucketed tallies (raw values from the backend, bucketed here like focalLengths).
+  const isoTallies = aggregateCull(
+    stats.cullByIso, (v) => ISO_BUCKETS.findIndex((b) => v < b.max), ISO_BUCKETS.length);
+  const apertureTallies = aggregateCull(
+    stats.cullByAperture, (v) => APERTURE_BUCKETS.findIndex((b) => v < b.max), APERTURE_BUCKETS.length);
+  const shutterTallies = aggregateCull(
+    stats.cullByShutter, (v) => SHUTTER_BUCKETS.findIndex((b) => v >= b.min), SHUTTER_BUCKETS.length);
+  const focalTallies = aggregateCull(
+    stats.cullByFocal, (v) => FL_BUCKETS.findIndex((b) => v < b.max), FL_BUCKETS.length);
+
+  // Exposure distributions (VBars): edge-trim on total, interior zeros kept.
+  const isoDist = trimZeroBy(ISO_BUCKETS.map((b) => b.label), isoTallies, (t) => t.total === 0);
+  const apertureDist = trimZeroBy(APERTURE_BUCKETS.map((b) => b.label), apertureTallies, (t) => t.total === 0);
+  const shutterDist = trimZeroBy(SHUTTER_BUCKETS.map((b) => b.label), shutterTallies, (t) => t.total === 0);
+  const distTitles = (labels: string[], items: CullTally[], prefix = "") =>
+    labels.map((lbl, i) => `${prefix}${lbl} · ${items[i].total.toLocaleString()} photos`);
+
+  // Rate rows for the crossings, per the active metric. Zero-denominator
+  // buckets/rows carry no information for a rate and are dropped entirely.
+  const rateNum = (t: CullTally) => (rateMetric === "keep" ? t.picked : t.hits);
+  const rateDen = (t: CullTally) => (rateMetric === "keep" ? t.decided : t.rated);
+  const bucketRateRows = (labels: string[], tallies: CullTally[]): RateRow[] =>
+    tallies
+      .map((t, i) => ({ label: labels[i], num: rateNum(t), den: rateDen(t) }))
+      .filter((r) => r.den > 0);
+  const gearRateRows = (rows: CullCross<string>[]): RateRow[] =>
+    rows
+      .map((r) => ({ label: r.key, num: rateNum(r), den: rateDen(r) }))
+      .filter((r) => r.den > 0)
+      .sort((a, b) => b.den - a.den)
+      .slice(0, 12);
+
+  const rateCards: { title: string; rows: RateRow[]; hue: "blue" | "violet" | "teal" }[] = [
+    { title: "By lens", rows: gearRateRows(stats.cullByLens), hue: "blue" },
+    { title: "By camera", rows: gearRateRows(stats.cullByCamera), hue: "violet" },
+    { title: "By focal length", rows: bucketRateRows(FL_BUCKETS.map((b) => `${b.label}mm`), focalTallies), hue: "teal" },
+    { title: "By ISO", rows: bucketRateRows(ISO_BUCKETS.map((b) => `ISO ${b.label}`), isoTallies), hue: "blue" },
+    { title: "By aperture", rows: bucketRateRows(APERTURE_BUCKETS.map((b) => b.label), apertureTallies), hue: "violet" },
+    { title: "By shutter speed", rows: bucketRateRows(SHUTTER_BUCKETS.map((b) => b.label), shutterTallies), hue: "teal" },
+  ];
+
   // ── Render ──────────────────────────────────────────────────────────────────
 
   return (
@@ -853,6 +1054,99 @@ function StatsView({ api }: { api: ChairPhotoAPI }) {
               starLabels
             />
           </div>
+
+          {/* ISO */}
+          <div className="st-card">
+            <div className="st-panel-head">ISO</div>
+            <VBars
+              values={isoDist.items.map((t) => t.total)}
+              labels={isoDist.labels}
+              titles={distTitles(isoDist.labels, isoDist.items, "ISO ")}
+              height={150}
+            />
+          </div>
+
+          {/* Aperture */}
+          <div className="st-card">
+            <div className="st-panel-head">Aperture</div>
+            <VBars
+              values={apertureDist.items.map((t) => t.total)}
+              labels={apertureDist.labels}
+              titles={distTitles(apertureDist.labels, apertureDist.items)}
+              height={150}
+            />
+          </div>
+
+          {/* Shutter speed */}
+          <div className="st-card">
+            <div className="st-panel-head">Shutter speed</div>
+            <VBars
+              values={shutterDist.items.map((t) => t.total)}
+              labels={shutterDist.labels}
+              titles={distTitles(shutterDist.labels, shutterDist.items)}
+              height={150}
+            />
+          </div>
+        </div>
+
+        {/* Keeper summary — cull survival and quality are independent axes */}
+        <div className="st-grid">
+          <div className="st-card">
+            <div className="st-panel-head">Cull survival</div>
+            <div className="st-stat-num">{keepRate != null ? `${keepRate}%` : "—"}</div>
+            <div className="st-stat-lbl">
+              {decidedTotal > 0
+                ? `picked ${stats.picked.toLocaleString()} · rejected ${stats.rejected.toLocaleString()}`
+                : "no pick/reject decisions yet"}
+            </div>
+            {undecided > 0 && (
+              <div className="st-footnote">
+                {undecided.toLocaleString()} undecided photos not counted
+              </div>
+            )}
+          </div>
+
+          <div className="st-card">
+            <div className="st-panel-head">Quality hit rate</div>
+            <div className="st-stat-num">{hitRate != null ? `${hitRate}%` : "—"}</div>
+            <div className="st-stat-lbl">
+              {ratedTotal > 0
+                ? `${hitsTotal.toLocaleString()} of ${ratedTotal.toLocaleString()} rated ≥4★`
+                : "no rated photos yet"}
+            </div>
+            {unrated > 0 && (
+              <div className="st-footnote">
+                {unrated.toLocaleString()} unrated photos not counted
+              </div>
+            )}
+          </div>
+        </div>
+
+        {/* Keeper analysis — both rates crossed with gear and exposure settings */}
+        <div className="st-cull-head">
+          <span className="st-cull-title">Keeper analysis</span>
+          <div className="st-seg" role="group" aria-label="Rate metric">
+            <button
+              className={rateMetric === "keep" ? "active" : ""}
+              onClick={() => setRateMetric("keep")}
+            >
+              Keep rate
+            </button>
+            <button
+              className={rateMetric === "hit" ? "active" : ""}
+              onClick={() => setRateMetric("hit")}
+            >
+              ≥4★ hit rate
+            </button>
+          </div>
+        </div>
+        <div className="st-grid">
+          {rateCards.map((card) => (
+            <div className="st-card" key={card.title}>
+              <div className="st-panel-head">{card.title}</div>
+              <RateList rows={card.rows} hue={card.hue} />
+            </div>
+          ))}
         </div>
       </div>
     </div>

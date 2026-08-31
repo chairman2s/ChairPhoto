@@ -54,6 +54,7 @@ pub use models::{
 };
 pub use query::{CullingFilter, PhotoPage, PhotoQuery, PhotoSort, PhotoWindow, StorageTier};
 pub use smart_albums::rule_to_sql;
+pub use stats::CullCross;
 pub use reconcile::DrainSummary;
 pub use trash::TrashSummary;
 pub use safety::{SafetyStatus, SafetySummary};

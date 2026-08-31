@@ -195,7 +195,7 @@
   overflow: hidden;
   background: var(--canvas);
 }
-.tg-svg {
+.tg-canvas {
   width: 100%;
   height: 100%;
   display: block;
@@ -203,7 +203,7 @@
   user-select: none;
   touch-action: none;
 }
-.tg-svg:active {
+.tg-canvas:active {
   cursor: grabbing;
 }
 
@@ -221,61 +221,8 @@
   font-size: 12px;
 }
 
-/* Links */
-.tg-link {
-  opacity: 0.25;
-  pointer-events: none;
-}
-.tg-link.active {
-  opacity: 0.8;
-}
-.tg-link-hierarchy {
-  stroke-dasharray: 3 3;
-  opacity: 0.12;
-}
-.tg-link-camera {
-  opacity: 0.2;
-}
-.tg-link-hierarchy.active,
-.tg-link-camera.active {
-  opacity: 0.7;
-}
-
-/* Nodes */
-.tg-node {
-  cursor: pointer;
-}
-.tg-node circle {
-  stroke: rgba(15, 23, 42, 0.6);
-  stroke-width: 1;
-  transition: opacity 0.15s;
-}
-.tg-node.dim {
-  opacity: 0.18;
-}
-.tg-node.sel circle {
-  stroke: #fff;
-  stroke-width: 1.5;
-}
-.tg-sel-ring {
-  fill: none;
-  stroke: #fff;
-  stroke-width: 2;
-  opacity: 0.9;
-}
-.tg-thumb-ring {
-  stroke: var(--border);
-  stroke-width: 1.5;
-}
-.tg-label {
-  fill: var(--txt);
-  font-size: 11px;
-  font-weight: 500;
-  paint-order: stroke;
-  stroke: var(--canvas);
-  stroke-width: 3px;
-  pointer-events: none;
-}
+/* Links, nodes, and labels are painted by the canvas renderer in tagGraph.tsx —
+   their visual constants (opacities, strokes, dashes) live there. */
 
 /* Top-right mini legend */
 .tg-legend {

@@ -1,7 +1,11 @@
 // Tag Graph module: a main-view force-directed graph of the tag vocabulary — nodes are tags
 // sized by photo count, edges are co-occurrence. Frontend-only; data comes from the
 // `library_graph` command. See docs/tag-graph.md.
-import { useEffect, useMemo, useReducer, useRef, useState } from "react";
+//
+// The scene is painted onto a single <canvas>: sim ticks, pan/zoom, and hover mutate refs
+// and set a dirty flag that one rAF loop repaints. React re-renders only on real state
+// changes (selection, panel toggles) — never per tick or per pointermove.
+import { useEffect, useMemo, useRef, useState } from "react";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import {
   forceCenter,
@@ -79,14 +83,20 @@ const tagRadius = (count: number) => 4 + Math.sqrt(count) * 2.2;
 // for collision so the layout reserves space whether thumbnails are shown or not.
 const PHOTO_R = 13;
 
+// Bipartite mode keeps only this many photos (the most-tagged ones). A six-figure library
+// would otherwise hand d3-force more nodes than any layout or renderer can animate.
+const BIPARTITE_PHOTO_CAP = 1500;
+
+const NODE_STROKE = "rgba(15, 23, 42, 0.6)";
+
 function GraphView({ api }: { api: ChairPhotoAPI }) {
   const [mode, setMode] = useState<Mode>("community");
   const [graph, setGraph] = useState<{ nodes: GNode[]; links: GLink[] } | null>(null);
   const [error, setError] = useState("");
-  const [hover, setHover] = useState<string | null>(null);
   const [selected, setSelected] = useState<string | null>(null);
   const [thumbs, setThumbs] = useState(false); // show photo thumbnails (bipartite)
-  const [view, setView] = useState({ k: 1, x: 0, y: 0 });
+  // Photos dropped by BIPARTITE_PHOTO_CAP — surfaced in the status strip.
+  const [photoOverflow, setPhotoOverflow] = useState(0);
 
   // Left-panel controls.
   const [visible, setVisible] = useState<Record<Kind, boolean>>({
@@ -99,9 +109,14 @@ function GraphView({ api }: { api: ChairPhotoAPI }) {
   const [frozen, setFrozen] = useState(false);
   const [isolate, setIsolate] = useState<string | null>(null); // selected node whose nbhd is isolated
 
-  const svgRef = useRef<SVGSVGElement>(null);
+  const canvasRef = useRef<HTMLCanvasElement>(null);
   const simRef = useRef<Simulation<GNode, GLink> | null>(null);
-  const [, tick] = useReducer((n: number) => n + 1, 0);
+  // Hot-path state lives in refs: mutate + set `dirty`, and the rAF loop repaints.
+  const viewRef = useRef({ k: 1, x: 0, y: 0 });
+  const hoverRef = useRef<string | null>(null);
+  const dirtyRef = useRef(true);
+  const drawRef = useRef<() => void>(() => {});
+  const thumbCache = useRef(new Map<number, HTMLImageElement>());
 
   // Community → colour map, computed from the loaded tags (stable by sorted name).
   const communityColor = useMemo(() => {
@@ -144,6 +159,7 @@ function GraphView({ api }: { api: ChairPhotoAPI }) {
     setGraph(null);
     setSelected(null);
     setIsolate(null);
+    setPhotoOverflow(0);
     const load = async () => {
       try {
         if (mode === "community") {
@@ -201,18 +217,29 @@ function GraphView({ api }: { api: ChairPhotoAPI }) {
             tags: RawNode[];
             edges: [number, number][];
           }>("photo_tag_graph");
+          // Keep only the most-tagged photos — a six-figure library would otherwise
+          // feed the force layout far more nodes than it can animate. The status
+          // strip reports the truncation.
+          const keptPhotos = [...g.photos]
+            .sort((a, b) => b.count - a.count)
+            .slice(0, BIPARTITE_PHOTO_CAP);
+          const keptIds = new Set(keptPhotos.map((p) => p.id));
+          const edges = g.edges.filter(([p]) => keptIds.has(p));
+          const keptTagIds = new Set(edges.map(([, t]) => t));
           const nodes: GNode[] = [
-            ...g.tags.map((n) => ({
-              id: `t${n.id}`,
-              kind: "tag" as const,
-              refId: n.id,
-              label: leaf(n.label),
-              fullPath: n.label,
-              count: n.count,
-              community: topLevel(n.label),
-              r: tagRadius(n.count),
-            })),
-            ...g.photos.map((n) => ({
+            ...g.tags
+              .filter((n) => keptTagIds.has(n.id))
+              .map((n) => ({
+                id: `t${n.id}`,
+                kind: "tag" as const,
+                refId: n.id,
+                label: leaf(n.label),
+                fullPath: n.label,
+                count: n.count,
+                community: topLevel(n.label),
+                r: tagRadius(n.count),
+              })),
+            ...keptPhotos.map((n) => ({
               id: `p${n.id}`,
               kind: "photo" as const,
               refId: n.id,
@@ -223,13 +250,16 @@ function GraphView({ api }: { api: ChairPhotoAPI }) {
               r: PHOTO_R,
             })),
           ];
-          const links: GLink[] = g.edges.map(([p, t]) => ({
+          const links: GLink[] = edges.map(([p, t]) => ({
             source: `p${p}`,
             target: `t${t}`,
             weight: 1,
             kind: "bipartite" as const,
           }));
-          if (alive) setGraph({ nodes, links });
+          if (alive) {
+            setPhotoOverflow(g.photos.length - keptPhotos.length);
+            setGraph({ nodes, links });
+          }
         }
       } catch (e) {
         if (alive) setError(String(e));
@@ -255,6 +285,9 @@ function GraphView({ api }: { api: ChairPhotoAPI }) {
     // error banner instead of letting the exception unmount the whole app.
     try {
       const sim = forceSimulation<GNode, GLink>(graph.nodes)
+        // Settle in roughly half d3's default tick count — the layout is visually
+        // stable long before alphaMin either way, and it halves time-to-readable.
+        .alphaDecay(0.04)
         .force(
           "link",
           forceLink<GNode, GLink>(simLinks)
@@ -267,7 +300,9 @@ function GraphView({ api }: { api: ChairPhotoAPI }) {
         .force("center", forceCenter(0, 0))
         .force("x", forceX(0).strength(0.04))
         .force("y", forceY(0).strength(0.04));
-      sim.on("tick", () => tick());
+      sim.on("tick", () => {
+        dirtyRef.current = true;
+      });
       simRef.current = sim;
       if (frozen) sim.stop();
     } catch (e) {
@@ -398,34 +433,147 @@ function GraphView({ api }: { api: ChairPhotoAPI }) {
     };
   }, [selNode, api]);
 
-  // Pan / zoom.
-  const onWheel = (e: React.WheelEvent) => {
-    e.preventDefault();
-    const rect = svgRef.current!.getBoundingClientRect();
-    const mx = e.clientX - rect.left;
-    const my = e.clientY - rect.top;
-    setView((v) => {
-      const k = Math.min(Math.max(v.k * (e.deltaY < 0 ? 1.15 : 1 / 1.15), 0.15), 6);
-      return { k, x: mx - (k / v.k) * (mx - v.x), y: my - (k / v.k) * (my - v.y) };
-    });
+  const markDirty = () => {
+    dirtyRef.current = true;
   };
-  const zoomBy = (factor: number) => {
-    const rect = svgRef.current?.getBoundingClientRect();
-    const mx = (rect?.width ?? 0) / 2;
-    const my = (rect?.height ?? 0) / 2;
-    setView((v) => {
-      const k = Math.min(Math.max(v.k * factor, 0.15), 6);
-      return { k, x: mx - (k / v.k) * (mx - v.x), y: my - (k / v.k) * (my - v.y) };
-    });
-  };
-  const resetView = () => setView({ k: 1, x: 0, y: 0 });
 
-  const onBgPointerDown = (e: React.PointerEvent) => {
-    // Clicking empty canvas deselects.
-    if (e.target === svgRef.current) setSelected(null);
-    const start = { mx: e.clientX, my: e.clientY, x: view.x, y: view.y };
-    const move = (ev: PointerEvent) =>
-      setView((v) => ({ ...v, x: start.x + (ev.clientX - start.mx), y: start.y + (ev.clientY - start.my) }));
+  // Screen → graph coordinates. The draw transform is translate(view) · scale(k) ·
+  // translate(cw/2, ch/2), so the inverse subtracts the recentre too.
+  const toGraph = (cx: number, cy: number) => {
+    const rect = canvasRef.current!.getBoundingClientRect();
+    const { k, x, y } = viewRef.current;
+    return {
+      x: (cx - rect.left - x) / k - rect.width / 2,
+      y: (cy - rect.top - y) / k - rect.height / 2,
+    };
+  };
+
+  // Topmost node under the cursor — nodes paint in array order, so scan from the end.
+  const hitTest = (cx: number, cy: number): GNode | null => {
+    if (!graph) return null;
+    const p = toGraph(cx, cy);
+    for (let i = graph.nodes.length - 1; i >= 0; i--) {
+      const n = graph.nodes[i];
+      if (!nodeShown(n)) continue;
+      const r = (n.kind === "photo" && !thumbs ? 5 : n.r) + 2;
+      const dx = (n.x ?? 0) - p.x;
+      const dy = (n.y ?? 0) - p.y;
+      if (dx * dx + dy * dy <= r * r) return n;
+    }
+    return null;
+  };
+
+  // Pan / zoom — refs only, no React render per gesture frame.
+  const zoomAt = (factor: number, cx?: number, cy?: number) => {
+    const rect = canvasRef.current?.getBoundingClientRect();
+    if (!rect) return;
+    const mx = cx ?? rect.width / 2;
+    const my = cy ?? rect.height / 2;
+    const v = viewRef.current;
+    const k = Math.min(Math.max(v.k * factor, 0.05), 6);
+    viewRef.current = { k, x: mx - (k / v.k) * (mx - v.x), y: my - (k / v.k) * (my - v.y) };
+    markDirty();
+  };
+
+  const fitView = () => {
+    const rect = canvasRef.current?.getBoundingClientRect();
+    if (!rect || !graph) return;
+    let minX = Infinity;
+    let minY = Infinity;
+    let maxX = -Infinity;
+    let maxY = -Infinity;
+    for (const n of graph.nodes) {
+      if (!nodeShown(n)) continue;
+      minX = Math.min(minX, (n.x ?? 0) - n.r);
+      maxX = Math.max(maxX, (n.x ?? 0) + n.r);
+      minY = Math.min(minY, (n.y ?? 0) - n.r);
+      maxY = Math.max(maxY, (n.y ?? 0) + n.r);
+    }
+    if (minX > maxX) return;
+    const pad = 48;
+    const k = Math.min(
+      Math.max(
+        Math.min((rect.width - pad) / (maxX - minX || 1), (rect.height - pad) / (maxY - minY || 1)),
+        0.05,
+      ),
+      6,
+    );
+    const cx = (minX + maxX) / 2;
+    const cy = (minY + maxY) / 2;
+    viewRef.current = {
+      k,
+      x: rect.width / 2 - (cx + rect.width / 2) * k,
+      y: rect.height / 2 - (cy + rect.height / 2) * k,
+    };
+    markDirty();
+  };
+
+  const resetView = () => {
+    viewRef.current = { k: 1, x: 0, y: 0 };
+    markDirty();
+  };
+
+  // Wheel zoom must preventDefault, and React registers wheel listeners passively —
+  // attach directly. Reads only refs, so the empty dep list is safe.
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const onWheel = (e: WheelEvent) => {
+      e.preventDefault();
+      const rect = canvas.getBoundingClientRect();
+      const v = viewRef.current;
+      const mx = e.clientX - rect.left;
+      const my = e.clientY - rect.top;
+      const k = Math.min(Math.max(v.k * (e.deltaY < 0 ? 1.15 : 1 / 1.15), 0.05), 6);
+      viewRef.current = { k, x: mx - (k / v.k) * (mx - v.x), y: my - (k / v.k) * (my - v.y) };
+      dirtyRef.current = true;
+    };
+    canvas.addEventListener("wheel", onWheel, { passive: false });
+    return () => canvas.removeEventListener("wheel", onWheel);
+  }, []);
+
+  // One pointerdown handler: a node starts a drag (a sub-4px drag = a click → select),
+  // empty canvas deselects and pans.
+  const onPointerDown = (e: React.PointerEvent) => {
+    const n = hitTest(e.clientX, e.clientY);
+    if (n) {
+      const sim = simRef.current;
+      if (!frozen) sim?.alphaTarget(0.3).restart();
+      const move = (ev: PointerEvent) => {
+        const p = toGraph(ev.clientX, ev.clientY);
+        n.fx = p.x;
+        n.fy = p.y;
+        if (frozen) {
+          // The sim is stopped, so fx/fy alone won't move the node — move it directly.
+          n.x = p.x;
+          n.y = p.y;
+          markDirty();
+        }
+      };
+      const up = (ev: PointerEvent) => {
+        window.removeEventListener("pointermove", move);
+        window.removeEventListener("pointerup", up);
+        sim?.alphaTarget(0);
+        n.fx = null;
+        n.fy = null;
+        if (Math.hypot(ev.clientX - e.clientX, ev.clientY - e.clientY) < 4) {
+          setSelected(n.id);
+        }
+      };
+      window.addEventListener("pointermove", move);
+      window.addEventListener("pointerup", up);
+      return;
+    }
+    setSelected(null);
+    const start = { mx: e.clientX, my: e.clientY, x: viewRef.current.x, y: viewRef.current.y };
+    const move = (ev: PointerEvent) => {
+      viewRef.current = {
+        ...viewRef.current,
+        x: start.x + (ev.clientX - start.mx),
+        y: start.y + (ev.clientY - start.my),
+      };
+      markDirty();
+    };
     const up = () => {
       window.removeEventListener("pointermove", move);
       window.removeEventListener("pointerup", up);
@@ -434,34 +582,21 @@ function GraphView({ api }: { api: ChairPhotoAPI }) {
     window.addEventListener("pointerup", up);
   };
 
-  // Drag a node (in graph coordinates). A tiny drag = a click → SELECT the node.
-  const onNodePointerDown = (e: React.PointerEvent, n: GNode) => {
-    e.stopPropagation();
-    const rect = svgRef.current!.getBoundingClientRect();
-    const toGraph = (cx: number, cy: number) => ({
-      x: (cx - rect.left - view.x) / view.k,
-      y: (cy - rect.top - view.y) / view.k,
-    });
-    const sim = simRef.current!;
-    if (!frozen) sim.alphaTarget(0.3).restart();
-    const move = (ev: PointerEvent) => {
-      const p = toGraph(ev.clientX, ev.clientY);
-      n.fx = p.x;
-      n.fy = p.y;
-      if (frozen) tick();
-    };
-    const up = (ev: PointerEvent) => {
-      window.removeEventListener("pointermove", move);
-      window.removeEventListener("pointerup", up);
-      sim.alphaTarget(0);
-      n.fx = null;
-      n.fy = null;
-      if (Math.hypot(ev.clientX - e.clientX, ev.clientY - e.clientY) < 4) {
-        setSelected(n.id);
-      }
-    };
-    window.addEventListener("pointermove", move);
-    window.addEventListener("pointerup", up);
+  const onPointerMove = (e: React.PointerEvent) => {
+    if (e.buttons) return; // mid-gesture — the window listeners own the pointer
+    const id = hitTest(e.clientX, e.clientY)?.id ?? null;
+    if (id !== hoverRef.current) {
+      hoverRef.current = id;
+      if (canvasRef.current) canvasRef.current.style.cursor = id ? "pointer" : "grab";
+      markDirty();
+    }
+  };
+
+  const onPointerLeave = () => {
+    if (hoverRef.current != null) {
+      hoverRef.current = null;
+      markDirty();
+    }
   };
 
   // Escape deselects.
@@ -472,11 +607,6 @@ function GraphView({ api }: { api: ChairPhotoAPI }) {
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, []);
-
-  const linkEnd = (e: GLink, which: "source" | "target") => {
-    const v = e[which];
-    return typeof v === "object" ? (v as GNode) : null;
-  };
 
   // Counts for the NODE TYPES panel.
   const kindCounts = useMemo(() => {
@@ -500,6 +630,216 @@ function GraphView({ api }: { api: ChairPhotoAPI }) {
 
   const communityDimmed = (n: GNode) =>
     activeCommunity != null && n.kind === "tag" && n.community !== activeCommunity;
+
+  // ── Canvas painter ──────────────────────────────────────────────
+  // Repaints the whole scene from current sim positions. Links batch into one Path2D
+  // per (colour, width, dash, alpha), so a frame is a few dozen stroke calls plus one
+  // arc per visible node — instead of reconciling 20k+ SVG elements through React.
+  drawRef.current = () => {
+    const canvas = canvasRef.current;
+    const ctx = canvas?.getContext("2d");
+    if (!canvas || !ctx) return;
+    const dpr = window.devicePixelRatio || 1;
+    const cw = canvas.clientWidth;
+    const ch = canvas.clientHeight;
+    if (canvas.width !== Math.round(cw * dpr) || canvas.height !== Math.round(ch * dpr)) {
+      canvas.width = Math.round(cw * dpr);
+      canvas.height = Math.round(ch * dpr);
+    }
+    const styles = getComputedStyle(canvas);
+    const txtColor = styles.getPropertyValue("--txt").trim() || "#e2e8f0";
+    const haloColor = styles.getPropertyValue("--canvas").trim() || "#0d1117";
+    const borderColor = styles.getPropertyValue("--border").trim() || "#3a4150";
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, cw, ch);
+    if (!graph) return;
+    const { k, x, y } = viewRef.current;
+    ctx.translate(x, y);
+    ctx.scale(k, k);
+    ctx.translate(cw / 2, ch / 2);
+
+    // Viewport in graph coordinates, for culling.
+    const vx0 = (0 - x) / k - cw / 2;
+    const vy0 = (0 - y) / k - ch / 2;
+    const vx1 = (cw - x) / k - cw / 2;
+    const vy1 = (ch - y) / k - ch / 2;
+
+    const hov = hoverRef.current;
+    const hovNbrs = hov ? neighbors.get(hov) : undefined;
+
+    type LinkBucket = { path: Path2D; color: string; width: number; dash: boolean; alpha: number };
+    const base = new Map<string, LinkBucket>();
+    const active = new Map<string, LinkBucket>();
+    for (const l of simLinks) {
+      const s = typeof l.source === "object" ? (l.source as GNode) : nodeById.get(l.source as string);
+      const t = typeof l.target === "object" ? (l.target as GNode) : nodeById.get(l.target as string);
+      if (!s || !t || !nodeShown(s) || !nodeShown(t)) continue;
+      const sx = s.x ?? 0;
+      const sy = s.y ?? 0;
+      const tx = t.x ?? 0;
+      const ty = t.y ?? 0;
+      if (
+        Math.max(sx, tx) < vx0 ||
+        Math.min(sx, tx) > vx1 ||
+        Math.max(sy, ty) < vy0 ||
+        Math.min(sy, ty) > vy1
+      )
+        continue;
+      const isActive =
+        (hov != null && (s.id === hov || t.id === hov)) ||
+        (selected != null && (s.id === selected || t.id === selected));
+      const color = l.kind === "camera" ? CAMERA_COLOR : nodeColor(s.kind === "camera" ? t : s);
+      const alpha = isActive
+        ? l.kind === "hierarchy" || l.kind === "camera"
+          ? 0.7
+          : 0.8
+        : l.kind === "hierarchy"
+          ? 0.12
+          : l.kind === "camera"
+            ? 0.2
+            : 0.25;
+      // Quantized to 0.5px so widths batch; visually indistinguishable from exact.
+      const width = Math.round(Math.min(1 + Math.log2(l.weight + 1) * 0.6, 4) * 2) / 2;
+      const dash = l.kind === "hierarchy";
+      const key = `${color}|${width}|${dash}|${alpha}`;
+      const map = isActive ? active : base;
+      let b = map.get(key);
+      if (!b) map.set(key, (b = { path: new Path2D(), color, width, dash, alpha }));
+      b.path.moveTo(sx, sy);
+      b.path.lineTo(tx, ty);
+    }
+    const strokeBuckets = (m: Map<string, LinkBucket>) => {
+      for (const b of m.values()) {
+        ctx.globalAlpha = b.alpha;
+        ctx.strokeStyle = b.color;
+        ctx.lineWidth = b.width;
+        ctx.setLineDash(b.dash ? [3, 3] : []);
+        ctx.stroke(b.path);
+      }
+    };
+    strokeBuckets(base);
+    strokeBuckets(active); // highlighted links paint on top
+    ctx.setLineDash([]);
+
+    // Labels are unreadable below ~6 screen px; skip them when zoomed far out.
+    const labelsLegible = k * 11 >= 6;
+    const TWO_PI = Math.PI * 2;
+    let hovered: GNode | null = null;
+
+    for (const n of graph.nodes) {
+      if (!nodeShown(n)) continue;
+      const nx = n.x ?? 0;
+      const ny = n.y ?? 0;
+      if (n.id === hov) hovered = n;
+      if (nx + n.r < vx0 || nx - n.r > vx1 || ny + n.r < vy0 || ny - n.r > vy1) continue;
+      const dim = (hov != null && hov !== n.id && !hovNbrs?.has(n.id)) || communityDimmed(n);
+      const isSel = selected === n.id;
+      ctx.globalAlpha = dim ? 0.18 : 1;
+      if (n.kind === "photo" && thumbs) {
+        let img = thumbCache.current.get(n.refId);
+        if (!img) {
+          img = new Image();
+          img.onload = () => {
+            dirtyRef.current = true;
+          };
+          img.src = convertFileSrc(String(n.refId), "thumb");
+          thumbCache.current.set(n.refId, img);
+        }
+        if (img.complete && img.naturalWidth > 0) {
+          ctx.save();
+          ctx.beginPath();
+          ctx.arc(nx, ny, n.r, 0, TWO_PI);
+          ctx.clip();
+          ctx.drawImage(img, nx - n.r, ny - n.r, n.r * 2, n.r * 2);
+          ctx.restore();
+        }
+        ctx.beginPath();
+        ctx.arc(nx, ny, n.r, 0, TWO_PI);
+        ctx.strokeStyle = borderColor;
+        ctx.lineWidth = 1.5;
+        ctx.stroke();
+      } else {
+        ctx.beginPath();
+        ctx.arc(nx, ny, n.kind === "photo" ? 5 : n.r, 0, TWO_PI);
+        ctx.fillStyle = nodeColor(n);
+        ctx.fill();
+        ctx.strokeStyle = isSel ? "#fff" : NODE_STROKE;
+        ctx.lineWidth = isSel ? 1.5 : 1;
+        ctx.stroke();
+      }
+      if (isSel) {
+        ctx.globalAlpha = 0.9;
+        ctx.beginPath();
+        ctx.arc(nx, ny, n.r + 3, 0, TWO_PI);
+        ctx.strokeStyle = "#fff";
+        ctx.lineWidth = 2;
+        ctx.stroke();
+        ctx.globalAlpha = dim ? 0.18 : 1;
+      }
+      if (n.kind !== "photo" && (isSel || n.id === hov || (labelsLegible && n.r > 7))) {
+        ctx.font = `500 11px ${styles.fontFamily}`;
+        ctx.textBaseline = "alphabetic";
+        ctx.lineWidth = 3;
+        ctx.strokeStyle = haloColor;
+        ctx.strokeText(n.label, nx + n.r + 3, ny + 3);
+        ctx.fillStyle = txtColor;
+        ctx.fillText(n.label, nx + n.r + 3, ny + 3);
+      }
+    }
+    ctx.globalAlpha = 1;
+
+    // Screen-fixed hover tooltip (replaces the old SVG <title>).
+    if (hovered) {
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      const sx = ((hovered.x ?? 0) + cw / 2) * k + x;
+      const sy = ((hovered.y ?? 0) + ch / 2) * k + y;
+      const what = hovered.kind === "photo" ? "tag(s)" : "photo(s)";
+      const text = `${hovered.fullPath} · ${hovered.count} ${what}`;
+      ctx.font = `500 12px ${styles.fontFamily}`;
+      ctx.textBaseline = "alphabetic";
+      const w = ctx.measureText(text).width;
+      const tx = Math.min(Math.max(sx + 10, 4), Math.max(cw - w - 12, 4));
+      const ty = Math.min(Math.max(sy - hovered.r * k - 10, 16), ch - 8);
+      ctx.globalAlpha = 0.92;
+      ctx.fillStyle = haloColor;
+      ctx.fillRect(tx - 6, ty - 13, w + 12, 19);
+      ctx.globalAlpha = 1;
+      ctx.strokeStyle = borderColor;
+      ctx.lineWidth = 1;
+      ctx.strokeRect(tx - 6, ty - 13, w + 12, 19);
+      ctx.fillStyle = txtColor;
+      ctx.fillText(text, tx, ty + 1);
+    }
+  };
+
+  // Any committed render may have changed the scene (selection, filters, new data).
+  useEffect(() => {
+    dirtyRef.current = true;
+  });
+
+  // The repaint loop: at most one paint per frame, and only when something changed.
+  useEffect(() => {
+    let raf = 0;
+    const loop = () => {
+      if (dirtyRef.current) {
+        dirtyRef.current = false;
+        drawRef.current();
+      }
+      raf = requestAnimationFrame(loop);
+    };
+    raf = requestAnimationFrame(loop);
+    return () => cancelAnimationFrame(raf);
+  }, []);
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ro = new ResizeObserver(() => {
+      dirtyRef.current = true;
+    });
+    ro.observe(canvas);
+    return () => ro.disconnect();
+  }, []);
 
   return (
     <div className="tg-root">
@@ -622,98 +962,13 @@ function GraphView({ api }: { api: ChairPhotoAPI }) {
       {/* ── Center canvas ──────────────────────────────────────────── */}
       <div className="tg-center">
         {error && <div className="tg-error">{error}</div>}
-        <svg
-          ref={svgRef}
-          className="tg-svg"
-          onWheel={onWheel}
-          onPointerDown={onBgPointerDown}
-        >
-          <g
-            transform={`translate(${view.x},${view.y}) scale(${view.k}) translate(${(svgRef.current?.clientWidth ?? 0) / 2},${(svgRef.current?.clientHeight ?? 0) / 2})`}
-          >
-            {graph?.links.map((l, i) => {
-              if (l.kind === "cooc" && l.weight < linkThreshold) return null;
-              const s = linkEnd(l, "source");
-              const t = linkEnd(l, "target");
-              if (!s || !t) return null;
-              if (!nodeShown(s) || !nodeShown(t)) return null;
-              const active = hover != null && (s.id === hover || t.id === hover);
-              const sel = selected != null && (s.id === selected || t.id === selected);
-              const stroke =
-                l.kind === "camera"
-                  ? CAMERA_COLOR
-                  : nodeColor(s.kind === "camera" ? t : s);
-              const cls = `tg-link tg-link-${l.kind}${active || sel ? " active" : ""}`;
-              return (
-                <line
-                  key={i}
-                  x1={s.x}
-                  y1={s.y}
-                  x2={t.x}
-                  y2={t.y}
-                  className={cls}
-                  stroke={stroke}
-                  strokeWidth={Math.min(1 + Math.log2(l.weight + 1) * 0.6, 4)}
-                />
-              );
-            })}
-            {graph?.nodes.map((n) => {
-              if (!nodeShown(n)) return null;
-              const dim =
-                (hover != null && hover !== n.id && !neighbors.get(hover)?.has(n.id)) ||
-                communityDimmed(n);
-              const isSel = selected === n.id;
-              const showLabel =
-                n.kind !== "photo" && (n.r > 7 || hover === n.id || isSel);
-              const fill = nodeColor(n);
-              return (
-                <g
-                  key={n.id}
-                  transform={`translate(${n.x ?? 0},${n.y ?? 0})`}
-                  className={`tg-node ${n.kind} ${dim ? "dim" : ""} ${isSel ? "sel" : ""}`}
-                  onPointerDown={(e) => onNodePointerDown(e, n)}
-                  onPointerEnter={() => setHover(n.id)}
-                  onPointerLeave={() => setHover((h) => (h === n.id ? null : h))}
-                >
-                  {isSel && <circle r={n.r + 3} className="tg-sel-ring" />}
-                  {n.kind === "photo" && thumbs ? (
-                    <>
-                      <clipPath id={`clip-${n.id}`}>
-                        <circle r={n.r} />
-                      </clipPath>
-                      <image
-                        href={convertFileSrc(String(n.refId), "thumb")}
-                        x={-n.r}
-                        y={-n.r}
-                        width={n.r * 2}
-                        height={n.r * 2}
-                        clipPath={`url(#clip-${n.id})`}
-                        preserveAspectRatio="xMidYMid slice"
-                      />
-                      <circle r={n.r} className="tg-thumb-ring" fill="none">
-                        <title>
-                          {n.label} · {n.count} tag(s)
-                        </title>
-                      </circle>
-                    </>
-                  ) : (
-                    <circle r={n.kind === "photo" ? 5 : n.r} fill={fill}>
-                      <title>
-                        {n.fullPath} · {n.count}{" "}
-                        {n.kind === "tag" ? "photo(s)" : n.kind === "camera" ? "photo(s)" : "tag(s)"}
-                      </title>
-                    </circle>
-                  )}
-                  {showLabel && (
-                    <text x={n.r + 3} y={3} className="tg-label">
-                      {n.label}
-                    </text>
-                  )}
-                </g>
-              );
-            })}
-          </g>
-        </svg>
+        <canvas
+          ref={canvasRef}
+          className="tg-canvas"
+          onPointerDown={onPointerDown}
+          onPointerMove={onPointerMove}
+          onPointerLeave={onPointerLeave}
+        />
 
         {/* Top-right mini legend */}
         <div className="tg-legend">
@@ -730,14 +985,14 @@ function GraphView({ api }: { api: ChairPhotoAPI }) {
 
         {/* Floating bottom-center glass pill */}
         <div className="tg-pill">
-          <button onClick={() => zoomBy(1 / 1.2)} title="Zoom out">
+          <button onClick={() => zoomAt(1 / 1.2)} title="Zoom out">
             −
           </button>
-          <button onClick={() => zoomBy(1.2)} title="Zoom in">
+          <button onClick={() => zoomAt(1.2)} title="Zoom in">
             ＋
           </button>
           <span className="tg-pill-sep" />
-          <button onClick={resetView} title="Fit / reset view">
+          <button onClick={fitView} title="Fit the whole graph in view">
             Fit
           </button>
           <button onClick={resetView} title="Re-center the graph">
@@ -748,7 +1003,7 @@ function GraphView({ api }: { api: ChairPhotoAPI }) {
         {/* Bottom status strip */}
         <div className="tg-status">
           {graph
-            ? `${shownStats.nodes} nodes · ${shownStats.links} links${mode === "community" ? ` · ${shownStats.communities} communities` : ""}`
+            ? `${shownStats.nodes} nodes · ${shownStats.links} links${mode === "community" ? ` · ${shownStats.communities} communities` : ""}${photoOverflow > 0 ? ` · top ${BIPARTITE_PHOTO_CAP} most-tagged photos (${photoOverflow.toLocaleString()} more hidden)` : ""}`
             : "Loading…"}
         </div>
       </div>

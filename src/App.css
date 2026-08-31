@@ -4559,14 +4559,16 @@ body {
   gap: 9px;
   padding: 13px 14px 11px;
 }
+/* Filenames are technical identifiers, not titles — the display serif made
+   "_DSC8229.ARW" read strangely, so this stays in the UI sans. */
 .insp-head h3 {
   flex: 1;
   min-width: 0;
   margin: 0;
-  font-family: var(--font-display);
-  font-weight: 400;
-  font-size: 21px;
-  letter-spacing: 0.005em;
+  font-family: var(--font-sans);
+  font-weight: 600;
+  font-size: 17px;
+  letter-spacing: 0.01em;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;

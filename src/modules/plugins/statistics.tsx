@@ -503,6 +503,16 @@ function VBars({ values, labels, titles, height = 130, peakLabel = false, starLa
 
   return (
     <div className="st-vbars">
+      {/* HTML, not SVG <text>: the svg below stretches non-uniformly
+          (preserveAspectRatio="none"), which would distort glyphs. */}
+      {peakLabel && values[peakIdx] > 0 && (
+        <span
+          className="st-vbar-peak"
+          style={{ left: `${((peakIdx * slot + pad + barW / 2) / W) * 100}%` }}
+        >
+          {values[peakIdx].toLocaleString()}
+        </span>
+      )}
       <svg viewBox={`0 0 ${W} ${height}`} preserveAspectRatio="none" className="st-vbars-svg" style={{ height: `${height}px` }}>
         <defs>
           <linearGradient id={`vb-${uid}`} x1="0" y1="0" x2="0" y2="1">
@@ -532,11 +542,6 @@ function VBars({ values, labels, titles, height = 130, peakLabel = false, starLa
               >
                 {titles?.[i] && <title>{titles[i]}</title>}
               </rect>
-              {peakLabel && isPeak && v > 0 && (
-                <text x={x + barW / 2} y={yTop - 3} textAnchor="middle" className="st-vbar-peaknum">
-                  {v.toLocaleString()}
-                </text>
-              )}
             </g>
           );
         })}

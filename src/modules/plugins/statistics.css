@@ -370,6 +370,7 @@
 
 /* ── Vertical gradient bars ───────────────────────────────────── */
 .st-vbars {
+  position: relative; /* anchors .st-vbar-peak */
   display: flex;
   flex-direction: column;
   gap: 6px;
@@ -379,11 +380,17 @@
   display: block;
   overflow: visible;
 }
-.st-vbar-peaknum {
-  fill: #93C5FD;
-  font-size: 7px;
+/* Peak count, overlaid in HTML so the stretched svg can't distort it. */
+.st-vbar-peak {
+  position: absolute;
+  top: 0;
+  transform: translateX(-50%);
+  color: #93C5FD;
+  font-size: 10px;
   font-weight: 700;
   font-variant-numeric: tabular-nums;
+  pointer-events: none;
+  white-space: nowrap;
 }
 .st-vbars-labels {
   display: flex;

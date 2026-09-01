@@ -1,17 +1,21 @@
-// Pop-out loupe window: open it, and sync the displayed photo across windows.
+// Pop-out loupe window: open it, and sync what it displays across windows.
 //
 // Both windows share the same backend process (and the same open catalog), so the
 // loupe window only needs to know *which* photo (and version) to show. The main
 // window emits `loupe:photo` whenever its selection or active version changes; the
-// loupe window listens. When the loupe window opens it emits `loupe:ready` so the
-// main window re-sends the current selection (handling the race where it opens
+// loupe window listens. A module can instead put a card up (`loupe:card`, via
+// `ChairPhotoAPI.showInLoupe`) — the loupe shows the card while one is set. When the
+// loupe window opens it emits `loupe:ready` so the main window re-sends the current
+// selection and the host replays the card (handling the race where it opens
 // mid-session).
 
 import { emit, listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
+import type { LoupeCard } from "./registry";
 
 const LOUPE_LABEL = "loupe";
 export const EVENT_PHOTO = "loupe:photo";
+export const EVENT_CARD = "loupe:card";
 export const EVENT_READY = "loupe:ready";
 
 /** Open the pop-out loupe window (or focus it if already open). */
@@ -44,6 +48,16 @@ export function broadcastPhoto(photoId: number | null, editJson: string | null =
 /** Loupe window: subscribe to photo/version changes. Returns an unlisten function. */
 export function onPhoto(handler: (photo: LoupePhoto) => void): Promise<UnlistenFn> {
   return listen<LoupePhoto>(EVENT_PHOTO, (e) => handler(e.payload));
+}
+
+/** Tell any open loupe window to show a module's card instead of the photo (null = photo). */
+export function broadcastCard(card: LoupeCard | null): void {
+  emit(EVENT_CARD, card);
+}
+
+/** Loupe window: subscribe to card changes. Returns an unlisten function. */
+export function onCard(handler: (card: LoupeCard | null) => void): Promise<UnlistenFn> {
+  return listen<LoupeCard | null>(EVENT_CARD, (e) => handler(e.payload));
 }
 
 /** Main window: respond to a loupe window announcing it is ready. */

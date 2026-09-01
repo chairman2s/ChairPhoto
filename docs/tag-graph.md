@@ -33,6 +33,10 @@ Radial hierarchical edge bundling (Holten 2006), drawn on a canvas:
   and/or Cameras to draw them.
 - **Hover a tag** to light up everything it appears with, coloured by the far end; **select**
   one for the inspector; **select a community** to light up all of its edges.
+- **Open loupe window** (in the inspector) mirrors the selected node to the pop-out loupe —
+  its numbers, what it connects to, and a wall of its photos, paged — so the inspector can
+  live on a second screen. It follows the selection from then on, and hands the loupe back
+  to the photo selection when you leave the graph.
 
 The layout is deterministic — no physics, no settling — so the same library always looks the
 same, and the picture is ready as soon as the data arrives.

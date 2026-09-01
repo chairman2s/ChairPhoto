@@ -19,7 +19,7 @@ import {
   type SimulationLinkDatum,
   type SimulationNodeDatum,
 } from "d3-force";
-import type { ChairPhotoAPI, ChairPhotoModule } from "../registry";
+import type { ChairPhotoAPI, ChairPhotoModule, LoupeCard } from "../registry";
 import {
   buildBundleLayout,
   bundlePath,
@@ -487,8 +487,42 @@ function GraphView({ api }: { api: ChairPhotoAPI }) {
     }
     return Array.from(best.values())
       .sort((a, b) => b.weight - a.weight)
-      .slice(0, 8);
+      .slice(0, 12);
   }, [selNode, graph, nodeById]);
+
+  // Mirror the inspector to the pop-out loupe window — a second screen — when the host
+  // can. The card carries the node's numbers and a photo scope; the loupe fetches the
+  // photos itself, so it can show a whole wall of them rather than the inspector's six.
+  const loupeCard = useMemo<LoupeCard | null>(() => {
+    if (!selNode) return null;
+    const isTag = selNode.kind === "tag";
+    const links = degree.get(selNode.id) ?? 0;
+    const stats: NonNullable<LoupeCard["stats"]> = [{ label: "Photos", value: selNode.count }];
+    if (isTag) stats.push({ label: "Children", value: childrenCount.get(selNode.id) ?? 0 });
+    stats.push({ label: "Links", value: links });
+    return {
+      title: selNode.label,
+      subtitle: isTag ? selNode.fullPath : "Camera",
+      color: nodeColor(selNode),
+      chips: isTag
+        ? [`Tag${links >= hubThreshold ? " · hub" : ""}`, `Community: ${selNode.community}`]
+        : ["Camera"],
+      stats,
+      related: connected.map((c) => ({
+        label: c.node.label,
+        detail: String(c.weight),
+        color: nodeColor(c.node),
+      })),
+      photos: isTag ? { tagId: selNode.refId } : { camera: selNode.fullPath },
+    };
+    // nodeColor is a plain closure over communityColor, which is the dep that matters.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selNode, degree, childrenCount, hubThreshold, connected, communityColor]);
+  useEffect(() => {
+    api.showInLoupe?.(loupeCard);
+  }, [api, loupeCard]);
+  // Leaving the view hands the loupe back to the photo selection.
+  useEffect(() => () => api.showInLoupe?.(null), [api]);
 
   // TOP PHOTOS thumbnails for the selected tag (via the core `list_photos` command).
   const [topPhotos, setTopPhotos] = useState<number[]>([]);
@@ -1424,6 +1458,9 @@ function GraphView({ api }: { api: ChairPhotoAPI }) {
             onIsolate={() =>
               setIsolate((cur) => (cur === selNode.id ? null : selNode.id))
             }
+            onOpenLoupe={
+              api.openLoupe ? () => void api.openLoupe!().catch(() => {}) : undefined
+            }
           />
         ) : (
           <div className="tg-empty">Select a node</div>
@@ -1469,6 +1506,7 @@ function Inspector({
   onSelect,
   onFilter,
   onIsolate,
+  onOpenLoupe,
 }: {
   node: GNode;
   color: string;
@@ -1483,6 +1521,8 @@ function Inspector({
   onSelect: (id: string) => void;
   onFilter: () => void;
   onIsolate: () => void;
+  /** Open the pop-out loupe window, which mirrors this inspector. Absent on older hosts. */
+  onOpenLoupe?: () => void;
 }) {
   const isTag = node.kind === "tag";
   return (
@@ -1522,7 +1562,7 @@ function Inspector({
           <>
             <div className="tg-head">Connected</div>
             <div className="tg-conn">
-              {connected.map((c) => (
+              {connected.slice(0, 8).map((c) => (
                 <button
                   key={c.node.id}
                   className="tg-conn-chip"
@@ -1564,6 +1604,15 @@ function Inspector({
         <button className="tg-btn tg-btn-ghost" onClick={onIsolate}>
           {isolated ? "Show all" : "Isolate neighbours"}
         </button>
+        {onOpenLoupe && (
+          <button
+            className="tg-btn tg-btn-ghost"
+            onClick={onOpenLoupe}
+            title="Show this node — and a wall of its photos — in the pop-out loupe window"
+          >
+            Open loupe window
+          </button>
+        )}
       </div>
     </div>
   );

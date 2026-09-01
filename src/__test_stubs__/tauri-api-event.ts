@@ -14,14 +14,25 @@
 export const __events = {
   calls: [] as { event: string; handler: (e: { payload: unknown }) => void }[],
   unlistenCount: 0,
+  /** Every `emit()` the code under test made, in order. */
+  emitted: [] as { event: string; payload: unknown }[],
   reset() {
     this.calls.length = 0;
     this.unlistenCount = 0;
+    this.emitted.length = 0;
   },
   /** Deliver a payload to every handler registered for `event`. */
   emit(event: string, payload: unknown) {
     for (const c of this.calls) if (c.event === event) c.handler({ payload });
   },
+};
+
+/** Record an emit. It is NOT delivered to local `listen` handlers — a test drives those
+ *  through `__events.emit()` explicitly, so what was sent and what was received stay
+ *  separately observable. */
+export const emit = (event: string, payload?: unknown): Promise<void> => {
+  __events.emitted.push({ event, payload });
+  return Promise.resolve();
 };
 
 export const listen = (event: string, handler: (e: { payload: unknown }) => void) => {

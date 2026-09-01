@@ -22,11 +22,13 @@ import {
   setEditRecord,
   setSetting,
 } from "./api";
+import { broadcastCard, onLoupeReady, openLoupeWindow } from "./loupe";
 import type {
   ChairPhotoAPI,
   ChairPhotoModule,
   EditRecord,
   EditRenderer,
+  LoupeCard,
   MainView,
   ModuleFetchInit,
   ModuleFetchResponse,
@@ -95,6 +97,23 @@ let navSink: {
   selectPhoto: () => {},
   selectPhotoSilent: () => {},
 };
+// The card a module last put in the pop-out loupe (see ChairPhotoAPI.showInLoupe), with
+// its owner: only the owner (or its disabling) takes it down, and it is replayed when a
+// loupe window announces itself — the same race App handles for the selected photo.
+let loupeCard: { moduleId: string; card: LoupeCard } | null = null;
+let loupeReplayArmed = false;
+function showLoupeCard(moduleId: string, card: LoupeCard | null) {
+  if (card) loupeCard = { moduleId, card };
+  else if (loupeCard?.moduleId === moduleId) loupeCard = null;
+  else return; // nothing of this module's is up — leave another module's card alone
+  if (!loupeReplayArmed) {
+    loupeReplayArmed = true;
+    onLoupeReady(() => {
+      if (loupeCard) broadcastCard(loupeCard.card);
+    }).catch(() => {});
+  }
+  broadcastCard(card);
+}
 let filterContext: { tagId: number | null; albumId: number | null; batchId: number | null } = {
   tagId: null,
   albumId: null,
@@ -978,6 +997,10 @@ function apiFor(reg: Registered): ChairPhotoAPI {
     selectPhoto: (photoId) => navSink.selectPhoto(photoId),
     selectPhotoSilent: (photoId) => navSink.selectPhotoSilent(photoId),
     getFilterContext: () => filterContext,
+    // Owner identity comes from the closure, like `invoke` above: a module can only ever
+    // put up or take down its own card.
+    showInLoupe: (card) => showLoupeCard(id, card),
+    openLoupe: () => openLoupeWindow(),
   };
 }
 
@@ -1277,6 +1300,8 @@ export function disableModule(id: string, persist = true) {
   reg.mainViews = [];
   reg.publishTargets = [];
   reg.renderer = null;
+  // Its loupe card goes with it: the pop-out must not keep showing a disabled module's data.
+  showLoupeCard(id, null);
   if (persist) persistEnabled();
   notifyModuleSetChanged();
 }

@@ -85,6 +85,26 @@ useEffect( => {
 
 Covered by the `ChairPhotoAPI.onEvent` tests in `src/modules/__tests__/host.test.ts`.
 
+### The pop-out loupe — `showInLoupe` / `openLoupe`
+
+A module with something worth a second screen — the Tag Graph's inspector, say — can put
+a **card** in the pop-out loupe window in place of the selected photo:
+
+```ts
+showInLoupe?(card: LoupeCard | null): void;   // null hands the loupe back to the selection
+openLoupe?(): Promise<void>;                   // open the pop-out window, or focus it
+```
+
+A `LoupeCard` is pure data — a title, chips, stats, related entries, and a photo *scope*
+(`{ tagId }` or `{ camera }`) that the loupe window pages through itself with `list_photos`,
+so a card stays small however many photos it covers. The host remembers the last card and
+replays it when a loupe window opens, lets only the owning module take it down, and takes
+it down itself when that module is disabled. Both members are optional (additive-stability
+rule): check before calling.
+
+Covered by the `ChairPhotoAPI.showInLoupe() / openLoupe()` tests in
+`src/modules/__tests__/host.test.ts`.
+
 ## Two layers, two kinds of "optional"
 
 - **Frontend (TS/React)** — a true runtime plugin. A module registers UI
@@ -136,6 +156,9 @@ interface ChairPhotoAPI {
   registerAction(action: ToolbarAction): void;
   registerSettingsPanel(panel: SettingsPanel): void; // React thunk or ModuleMount
   showToast(message): void;
+  // pop-out loupe (optional members): show a card there instead of the selected photo
+  showInLoupe?(card: LoupeCard | null): void;
+  openLoupe?(): Promise<void>;
 }
 ```
 

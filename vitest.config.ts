@@ -61,6 +61,10 @@ export default defineConfig({
         "src/__test_stubs__/tauri-plugin-deep-link.ts",
       ),
       "@tauri-apps/plugin-opener": resolve(__dirname, "src/__test_stubs__/tauri-plugin-opener.ts"),
+      "@tauri-apps/api/webviewWindow": resolve(
+        __dirname,
+        "src/__test_stubs__/tauri-api-webviewWindow.ts",
+      ),
       // React useSyncExternalStore is fine in Node; only import side-effects matter.
     },
   },

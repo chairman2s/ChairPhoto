@@ -317,6 +317,34 @@ export type SettingsPanel = (() => ReactNode) | ModuleMount;
 export type Unsubscribe = () => void;
 
 /** The only surface a module may use. The host injects an instance per module. */
+/**
+ * What a module can show in the pop-out loupe window in place of the selected photo —
+ * the Tag Graph's inspector on a second screen, say. Pure data: the loupe window fetches
+ * the photos itself from `photos`, so a card stays small however many photos it covers.
+ */
+export interface LoupeCard {
+  /** Headline — a tag's leaf name, a camera model. */
+  title: string;
+  /** Under the title — a tag's full path, say. */
+  subtitle?: string;
+  /** Accent colour for the title dot (any CSS colour). */
+  color?: string;
+  chips?: string[];
+  stats?: { label: string; value: string | number }[];
+  /** Related entries (e.g. co-occurring tags), strongest first. */
+  related?: { label: string; detail?: string; color?: string }[];
+  /** The photos to show as a wall: a library scope the loupe pages through itself. */
+  photos?: LoupeCardScope;
+}
+
+/** A library scope for a loupe card's photo wall — filters `list_photos` understands. */
+export interface LoupeCardScope {
+  /** A tag and its descendants. */
+  tagId?: number;
+  /** An exact camera model. */
+  camera?: string;
+}
+
 export interface ChairPhotoAPI {
   // selection & data
   getSelectedPhotos(): Photo[];
@@ -414,6 +442,15 @@ export interface ChairPhotoAPI {
   /** The Library's current sidebar scope (tag/album/batch filters), for modules that
    *  want to reflect it (e.g. Statistics). Values are null when not filtered. */
   getFilterContext(): { tagId: number | null; albumId: number | null; batchId: number | null };
+  /**
+   * Show a card in the pop-out loupe window — when one is open — in place of the selected
+   * photo; `null` hands the loupe back to the selection. The host remembers the last card
+   * and replays it when a loupe window opens, so a module calls this only when what it
+   * wants shown changes. Optional (additive-stability rule): undefined on older hosts.
+   */
+  showInLoupe?(card: LoupeCard | null): void;
+  /** Open the pop-out loupe window, or focus it if it is already open. Optional. */
+  openLoupe?(): Promise<void>;
 }
 
 /** A chairphoto module. Bundled and enabled/disabled at runtime. */

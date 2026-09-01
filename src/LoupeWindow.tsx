@@ -1,20 +1,24 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { LoupeCardView } from "./components/LoupeCardView";
 import { ZoomableImage } from "./components/ZoomableImage";
-import { announceReady, onPhoto, type LoupePhoto } from "./modules/loupe";
+import { announceReady, onCard, onPhoto, type LoupePhoto } from "./modules/loupe";
 import { getSetting, listTags, pluginFeatures, renderEdit } from "./modules/api";
 import { parseEdit } from "./modules/editing";
 import { FaceOverlay, type FaceOverlayApi } from "./modules/plugins/faces";
+import type { LoupeCard } from "./modules/registry";
 import { useAppearance } from "./theme/controller";
 import "./App.css";
 
 // Root component for the popped-out loupe window (rendered when the URL hash is
 // "#loupe"). It shows the photo (and version) the main window tells it to, and
 // follows along as the selection changes there — so you can park it on a second
-// screen.
+// screen. A module can put a card up instead (ChairPhotoAPI.showInLoupe); the card
+// takes over until it is taken down.
 export default function LoupeWindow() {
   useAppearance();
   const [photo, setPhoto] = useState<LoupePhoto>({ photoId: null, editJson: null });
+  const [card, setCard] = useState<LoupeCard | null>(null);
   // The rendered edit (data URL) when a version is active; "" = show the Original.
   const [editedSrc, setEditedSrc] = useState("");
   const photoId = photo.photoId;
@@ -45,10 +49,13 @@ export default function LoupeWindow() {
   }, []);
 
   useEffect(() => {
-    const unlisten = onPhoto(setPhoto);
-    announceReady();
+    const unlistenPhoto = onPhoto(setPhoto);
+    const unlistenCard = onCard(setCard);
+    // Both listeners are registered before the announce, so the replies can't be missed.
+    Promise.all([unlistenPhoto, unlistenCard]).then(() => announceReady());
     return () => {
-      unlisten.then((f) => f());
+      unlistenPhoto.then((f) => f());
+      unlistenCard.then((f) => f());
     };
   }, []);
 
@@ -84,7 +91,9 @@ export default function LoupeWindow() {
     // The .loupe-window class is used by FaceOverlay's DOM traversal to locate
     // the .zoom-container and its <img> for letterbox geometry computation.
     <div className="loupe-window">
-      {photoId == null ? (
+      {card ? (
+        <LoupeCardView card={card} />
+      ) : photoId == null ? (
         <div className="loupe-empty">No photo selected</div>
       ) : (
         // Wrap ZoomableImage in a relative-positioned container so the face

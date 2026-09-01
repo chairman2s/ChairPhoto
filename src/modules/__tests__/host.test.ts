@@ -36,8 +36,9 @@ import {
   __legacy,
   __resetForTests,
 } from "../host";
-import type { ChairPhotoAPI, ChairPhotoModule, Photo } from "../registry";
+import type { ChairPhotoAPI, ChairPhotoModule, LoupeCard, Photo } from "../registry";
 import { __events } from "../../__test_stubs__/tauri-api-event";
+import { __windows } from "../../__test_stubs__/tauri-api-webviewWindow";
 
 // initHost() (used only by the M17 regression test far below) discovers external modules
 // via listExternalModules(), which the shared Tauri stub resolves to `null` (its `invoke`
@@ -430,6 +431,95 @@ describe("ChairPhotoAPI.onEvent()", () => {
 
     expect(a).toEqual([1]);
     expect(b).toEqual([]);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ChairPhotoAPI.showInLoupe() / openLoupe() — pop-out loupe cards
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("ChairPhotoAPI.showInLoupe() / openLoupe()", () => {
+  const enabledHere: string[] = [];
+
+  function apiFromLoad(id: string): ChairPhotoAPI {
+    let received: ChairPhotoAPI | undefined;
+    register(makeModule(id, { onLoad: (api: ChairPhotoAPI) => void (received = api) }));
+    enableModule(id, false);
+    enabledHere.push(id);
+    if (!received) throw new Error("onLoad did not run");
+    return received;
+  }
+
+  const card = (title: string): LoupeCard => ({ title, photos: { tagId: 7 } });
+  /** The `loupe:card` payloads sent so far, in order. */
+  const sent = () =>
+    __events.emitted.filter((e) => e.event === "loupe:card").map((e) => e.payload);
+
+  beforeEach(() => {
+    // Not `__events.reset()`: the host arms its `loupe:ready` replay listener once, on the
+    // first card, and a reset would drop that registration for every later test here.
+    __events.emitted.length = 0;
+    __windows.reset();
+  });
+
+  afterEach(() => {
+    while (enabledHere.length) disableModule(enabledHere.pop()!, false);
+    __events.emitted.length = 0;
+  });
+
+  it("is present on the injected API", () => {
+    const api = apiFromLoad("loupe-present");
+    expect(typeof api.showInLoupe).toBe("function");
+    expect(typeof api.openLoupe).toBe("function");
+  });
+
+  it("broadcasts the card on loupe:card, and null to hand the loupe back", () => {
+    const api = apiFromLoad("loupe-show");
+    api.showInLoupe!(card("Dog"));
+    api.showInLoupe!(null);
+    expect(sent()).toEqual([card("Dog"), null]);
+  });
+
+  it("replays the last card when a loupe window announces it is ready", () => {
+    const api = apiFromLoad("loupe-replay");
+    api.showInLoupe!(card("Dog"));
+    __events.emit("loupe:ready", undefined);
+    expect(sent()).toEqual([card("Dog"), card("Dog")]);
+  });
+
+  it("does not replay a card that was taken down", () => {
+    const api = apiFromLoad("loupe-noreplay");
+    api.showInLoupe!(card("Dog"));
+    api.showInLoupe!(null);
+    __events.emit("loupe:ready", undefined);
+    expect(sent()).toEqual([card("Dog"), null]);
+  });
+
+  it("lets only the owning module take a card down", () => {
+    const a = apiFromLoad("loupe-owner-a");
+    const b = apiFromLoad("loupe-owner-b");
+    a.showInLoupe!(card("Dog"));
+    b.showInLoupe!(null); // b never put anything up — a's card stays
+    expect(sent()).toEqual([card("Dog")]);
+  });
+
+  it("takes the card down when its module is disabled", () => {
+    const api = apiFromLoad("loupe-disable");
+    api.showInLoupe!(card("Dog"));
+    disableModule("loupe-disable", false);
+    enabledHere.pop();
+    expect(sent()).toEqual([card("Dog"), null]);
+  });
+
+  it("openLoupe opens the loupe window, or focuses it when already open", async () => {
+    const api = apiFromLoad("loupe-open");
+    await api.openLoupe!();
+    expect(__windows.created.map((w) => w.label)).toEqual(["loupe"]);
+
+    __windows.open.add("loupe");
+    await api.openLoupe!();
+    expect(__windows.created).toHaveLength(1); // not opened twice
+    expect(__windows.focused).toEqual(["loupe"]);
   });
 });
 

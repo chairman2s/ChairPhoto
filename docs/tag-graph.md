@@ -33,6 +33,10 @@ Radial hierarchical edge bundling (Holten 2006), drawn on a canvas:
   and/or Cameras to draw them.
 - **Hover a tag** to light up everything it appears with, coloured by the far end; **select**
   one for the inspector; **select a community** to light up all of its edges.
+- **Focus on this branch** (in the inspector, for a tag with children) redraws the ring for
+  just that tag's subtree: its direct children become the arcs, and the tag itself keeps a
+  slot under its own name. Cameras stay, showing what shot that branch. A breadcrumb in the
+  left panel climbs back out; Esc with nothing selected goes up one level.
 - **Open loupe window** (in the inspector) mirrors the selected node to the pop-out loupe —
   its numbers, what it connects to, and a wall of its photos, paged — so the inspector can
   live on a second screen. It follows the selection from then on, and hands the loupe back

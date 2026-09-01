@@ -5,9 +5,32 @@ import {
   buildBundleLayout,
   bundlePath,
   CAMERA_GROUP,
+  parentPath,
+  relativeToBranch,
   type BundleNode,
   type PathSink,
 } from "../tagGraphBundle";
+
+describe("relativeToBranch / parentPath", () => {
+  it("is empty for the root itself and relative for descendants", () => {
+    expect(relativeToBranch("Animals", "Animals")).toBe("");
+    expect(relativeToBranch("Animals/Bird", "Animals")).toBe("Bird");
+    expect(relativeToBranch("Animals/Bird/Seagull", "Animals")).toBe("Bird/Seagull");
+    expect(relativeToBranch("Animals/Bird/Seagull", "Animals/Bird")).toBe("Seagull");
+  });
+
+  it("is null outside the branch, and segment-exact", () => {
+    expect(relativeToBranch("Places/Oslo", "Animals")).toBeNull();
+    expect(relativeToBranch("AnimalsX/Bird", "Animals")).toBeNull();
+    expect(relativeToBranch("Animal", "Animals")).toBeNull();
+  });
+
+  it("parentPath climbs one level and stops at the top", () => {
+    expect(parentPath("Animals/Bird/Seagull")).toBe("Animals/Bird");
+    expect(parentPath("Animals/Bird")).toBe("Animals");
+    expect(parentPath("Animals")).toBeNull();
+  });
+});
 
 const tag = (fullPath: string, count: number): BundleNode => ({
   id: `t:${fullPath}`,

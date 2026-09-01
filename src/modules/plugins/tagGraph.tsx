@@ -24,6 +24,8 @@ import {
   buildBundleLayout,
   bundlePath,
   CAMERA_GROUP,
+  parentPath,
+  relativeToBranch,
   type BundleLayout,
 } from "./tagGraphBundle";
 import "./tagGraph.css";
@@ -84,6 +86,14 @@ interface RawNode {
 
 const leaf = (path: string) => path.split("/").pop() || path;
 const topLevel = (path: string) => path.split("/")[0] || path;
+const endId = (e: GLink["source"]) => (typeof e === "object" ? (e as GNode).id : (e as string));
+
+// Inside a branch, the ring is laid out from paths relative to the branch root, so its
+// direct children become the arcs. The root tag itself takes a slot under its own name.
+const layoutPath = (path: string, label: string, branch: string): string => {
+  const rel = relativeToBranch(path, branch);
+  return rel == null ? path : rel === "" ? label : rel;
+};
 
 // Community colour palette (families), cycled in size order. Amber is reserved for cameras
 // so their arc is unmistakable.
@@ -129,7 +139,39 @@ const angleDiff = (a: number, b: number) => {
 
 function GraphView({ api }: { api: ChairPhotoAPI }) {
   const [mode, setMode] = useState<Mode>("community");
-  const [graph, setGraph] = useState<{ nodes: GNode[]; links: GLink[] } | null>(null);
+  const [loaded, setLoaded] = useState<{ nodes: GNode[]; links: GLink[] } | null>(null);
+  // The tag path the ring is scoped to (community mode), or null for the whole library.
+  const [branch, setBranch] = useState<string | null>(null);
+
+  // The graph on screen: the whole library, or one tag's branch — the tag and its
+  // descendants plus any cameras, with `community` re-rooted to the branch's direct
+  // children so the arcs, colours, and the Communities list are the branch's families.
+  // Node objects are shared with `loaded` (positions live on them); only `community`
+  // is rewritten, and restored when the scope lifts.
+  const graph = useMemo(() => {
+    if (!loaded) return null;
+    if (!branch || mode !== "community") {
+      for (const n of loaded.nodes) if (n.kind === "tag") n.community = topLevel(n.fullPath);
+      return loaded;
+    }
+    const keep = new Set<string>();
+    const nodes = loaded.nodes.filter((n) => {
+      if (n.kind === "camera") {
+        keep.add(n.id);
+        return true;
+      }
+      if (n.kind !== "tag") return false;
+      const rel = relativeToBranch(n.fullPath, branch);
+      if (rel == null) return false;
+      n.community = rel === "" ? n.label : topLevel(rel);
+      keep.add(n.id);
+      return true;
+    });
+    const links = loaded.links.filter(
+      (l) => keep.has(endId(l.source)) && keep.has(endId(l.target)),
+    );
+    return { nodes, links };
+  }, [loaded, branch, mode]);
   const [error, setError] = useState("");
   const [selected, setSelected] = useState<string | null>(null);
   const [thumbs, setThumbs] = useState(false); // show photo thumbnails (bipartite)
@@ -211,7 +253,8 @@ function GraphView({ api }: { api: ChairPhotoAPI }) {
   useEffect(() => {
     let alive = true;
     setError("");
-    setGraph(null);
+    setLoaded(null);
+    setBranch(null);
     setSelected(null);
     setIsolate(null);
     setPhotoOverflow(0);
@@ -265,7 +308,7 @@ function GraphView({ api }: { api: ChairPhotoAPI }) {
               kind: "camera" as const,
             })),
           ].filter((l) => ids.has(l.source as string) && ids.has(l.target as string));
-          if (alive) setGraph({ nodes, links });
+          if (alive) setLoaded({ nodes, links });
         } else {
           const g = await api.invoke<{
             photos: RawNode[];
@@ -313,7 +356,7 @@ function GraphView({ api }: { api: ChairPhotoAPI }) {
           }));
           if (alive) {
             setPhotoOverflow(g.photos.length - keptPhotos.length);
-            setGraph({ nodes, links });
+            setLoaded({ nodes, links });
           }
         }
       } catch (e) {
@@ -345,7 +388,15 @@ function GraphView({ api }: { api: ChairPhotoAPI }) {
   const bundle = useMemo(() => {
     if (!graph || mode !== "community") return null;
     const shown = graph.nodes.filter((n) => visible[n.kind]);
-    const layout = buildBundleLayout(shown, RING_R);
+    const layout = buildBundleLayout(
+      branch
+        ? shown.map((n) => ({
+            ...n,
+            fullPath: n.kind === "tag" ? layoutPath(n.fullPath, n.label, branch) : n.fullPath,
+          }))
+        : shown,
+      RING_R,
+    );
     for (const n of shown) {
       const p = layout.placement.get(n.id);
       if (p) {
@@ -354,7 +405,7 @@ function GraphView({ api }: { api: ChairPhotoAPI }) {
       }
     }
     return layout;
-  }, [graph, mode, visible]);
+  }, [graph, mode, visible, branch]);
 
   // Run / re-run the force simulation when the graph or the active link set changes
   // (bipartite mode only — the bundle layout is deterministic).
@@ -757,14 +808,28 @@ function GraphView({ api }: { api: ChairPhotoAPI }) {
     }
   };
 
-  // Escape deselects.
+  // Scope the ring to a tag's branch (community mode). Community focus and isolation are
+  // about the previous ring, so they lift; the selection stays — the tag is on the new ring.
+  const focusBranch = (path: string | null) => {
+    setBranch(path);
+    setActiveCommunity(null);
+    setIsolate(null);
+    // The new ring has the same radius, so fitting now (before it is laid out) is exact.
+    fitView();
+  };
+
+  // Escape deselects; with nothing selected it climbs one level out of a branch.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") setSelected(null);
+      if (e.key !== "Escape") return;
+      if (selected) setSelected(null);
+      else if (branch) focusBranch(parentPath(branch));
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, []);
+    // focusBranch only sets state.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selected, branch]);
 
   // Counts for the NODE TYPES panel.
   const kindCounts = useMemo(() => {
@@ -829,7 +894,6 @@ function GraphView({ api }: { api: ChairPhotoAPI }) {
     const Rs = layout.R * k;
     const hov = hoverRef.current;
     const hovNbrs = hov ? neighbors.get(hov) : undefined;
-    const endId = (e: GLink["source"]) => (typeof e === "object" ? (e as GNode).id : (e as string));
 
     // Focus: the node(s) whose edges light up. Hover beats selection beats community.
     let focus: Set<string> | null = null;
@@ -1271,6 +1335,28 @@ function GraphView({ api }: { api: ChairPhotoAPI }) {
     <div className="tg-root">
       {/* ── Left panel ─────────────────────────────────────────────── */}
       <div className="tg-left">
+        {mode === "community" && branch && (
+          <div className="tg-crumbs" aria-label="Branch">
+            <button className="tg-crumb" onClick={() => focusBranch(null)}>
+              All tags
+            </button>
+            {branch.split("/").map((seg, i, segs) => {
+              const path = segs.slice(0, i + 1).join("/");
+              return (
+                <span key={path} className="tg-crumb-step">
+                  <span className="tg-crumb-sep">›</span>
+                  {i === segs.length - 1 ? (
+                    <span className="tg-crumb tg-crumb-here">{seg}</span>
+                  ) : (
+                    <button className="tg-crumb" onClick={() => focusBranch(path)}>
+                      {seg}
+                    </button>
+                  )}
+                </span>
+              );
+            })}
+          </div>
+        )}
         <div className="tg-head">Node types</div>
         <div className="tg-types">
           <TypeRow
@@ -1302,7 +1388,7 @@ function GraphView({ api }: { api: ChairPhotoAPI }) {
 
         {mode === "community" && communities.length > 0 && (
           <>
-            <div className="tg-head">Communities</div>
+            <div className="tg-head">{branch ? `Under ${leaf(branch)}` : "Communities"}</div>
             <div className="tg-communities">
               {communities.map((c) => (
                 <button
@@ -1434,7 +1520,7 @@ function GraphView({ api }: { api: ChairPhotoAPI }) {
         {/* Bottom status strip */}
         <div className="tg-status">
           {graph
-            ? `${shownStats.nodes} nodes · ${shownStats.links} links${mode === "community" ? ` · ${shownStats.communities} communities` : ""}${photoOverflow > 0 ? ` · top ${BIPARTITE_PHOTO_CAP} most-tagged photos (${photoOverflow.toLocaleString()} more hidden)` : ""}`
+            ? `${branch && mode === "community" ? `${branch} · ` : ""}${shownStats.nodes} nodes · ${shownStats.links} links${mode === "community" ? ` · ${shownStats.communities} ${branch ? "branches" : "communities"}` : ""}${photoOverflow > 0 ? ` · top ${BIPARTITE_PHOTO_CAP} most-tagged photos (${photoOverflow.toLocaleString()} more hidden)` : ""}`
             : "Loading…"}
         </div>
       </div>
@@ -1460,6 +1546,14 @@ function GraphView({ api }: { api: ChairPhotoAPI }) {
             }
             onOpenLoupe={
               api.openLoupe ? () => void api.openLoupe!().catch(() => {}) : undefined
+            }
+            onFocusBranch={
+              mode === "community" &&
+              selNode.kind === "tag" &&
+              (childrenCount.get(selNode.id) ?? 0) > 0 &&
+              branch !== selNode.fullPath
+                ? () => focusBranch(selNode.fullPath)
+                : undefined
             }
           />
         ) : (
@@ -1507,6 +1601,7 @@ function Inspector({
   onFilter,
   onIsolate,
   onOpenLoupe,
+  onFocusBranch,
 }: {
   node: GNode;
   color: string;
@@ -1523,6 +1618,8 @@ function Inspector({
   onIsolate: () => void;
   /** Open the pop-out loupe window, which mirrors this inspector. Absent on older hosts. */
   onOpenLoupe?: () => void;
+  /** Redraw the ring for this tag's branch. Only for a tag with children, not already focused. */
+  onFocusBranch?: () => void;
 }) {
   const isTag = node.kind === "tag";
   return (
@@ -1593,8 +1690,17 @@ function Inspector({
       </div>
 
       <div className="tg-actions">
+        {onFocusBranch && (
+          <button
+            className="tg-btn tg-btn-primary"
+            onClick={onFocusBranch}
+            title={`Redraw the graph for just "${node.label}" and everything under it`}
+          >
+            Focus on this branch
+          </button>
+        )}
         <button
-          className="tg-btn tg-btn-primary"
+          className={`tg-btn ${onFocusBranch ? "tg-btn-ghost" : "tg-btn-primary"}`}
           onClick={onFilter}
           disabled={!isTag}
           title={isTag ? "" : "No camera filter is available"}

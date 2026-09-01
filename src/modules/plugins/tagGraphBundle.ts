@@ -56,6 +56,22 @@ export interface BundleLayout {
 /** The synthetic top-level group cameras hang under. */
 export const CAMERA_GROUP = "__camera";
 
+/**
+ * A tag path relative to a branch root: "" for the root itself, "Bird/Seagull" for a
+ * descendant, null when the path is outside the branch. Segment-exact — "Animals" does
+ * not contain "AnimalsX".
+ */
+export function relativeToBranch(path: string, rootPath: string): string | null {
+  if (path === rootPath) return "";
+  return path.startsWith(`${rootPath}/`) ? path.slice(rootPath.length + 1) : null;
+}
+
+/** The parent path of a tag path, or null at the top level. */
+export function parentPath(path: string): string | null {
+  const i = path.lastIndexOf("/");
+  return i === -1 ? null : path.slice(0, i);
+}
+
 // Slot gaps: between sibling subtrees and between top-level groups (in slot widths).
 const SIBLING_GAP = 0.35;
 const GROUP_GAP = 2.5;

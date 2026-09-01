@@ -25,6 +25,42 @@
   gap: 6px;
 }
 
+/* Branch breadcrumb — shown while the ring is scoped to one tag's subtree */
+.tg-crumbs {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 2px;
+  margin-bottom: 8px;
+  font-size: 12px;
+}
+.tg-crumb-step {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+}
+.tg-crumb {
+  padding: 3px 6px;
+  border: none;
+  border-radius: var(--r-sm, 6px);
+  background: transparent;
+  color: var(--dim);
+  cursor: pointer;
+  font-size: 12px;
+}
+button.tg-crumb:hover {
+  background: var(--panel);
+  color: var(--txt);
+}
+.tg-crumb-here {
+  color: var(--txt);
+  font-weight: 600;
+  cursor: default;
+}
+.tg-crumb-sep {
+  color: var(--mute);
+}
+
 .tg-head {
   font-size: 10px;
   font-weight: 700;

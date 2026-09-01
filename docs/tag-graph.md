@@ -32,7 +32,10 @@ Radial hierarchical edge bundling (Holten 2006), drawn on a canvas:
 - **Nothing is drawn until a node type is switched on.** The view opens empty; toggle Tags
   and/or Cameras to draw them.
 - **Hover a tag** to light up everything it appears with, coloured by the far end; **select**
-  one for the inspector; **select a community** to light up all of its edges.
+  one for the inspector; **select a community** on the left to light up all of its edges and
+  put the family itself in the inspector — photos, its top tags, and the same focus / filter /
+  loupe actions a tag gets. That works for a family whose top tag has no photos of its own
+  (such a tag is not on the ring, but the vocabulary still knows its id).
 - **Focus on this branch** (in the inspector, for a tag with children) redraws the ring for
   just that tag's subtree: its direct children become the arcs, and the tag itself keeps a
   slot under its own name. Cameras stay, showing what shot that branch. A breadcrumb in the

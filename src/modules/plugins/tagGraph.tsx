@@ -139,7 +139,12 @@ const angleDiff = (a: number, b: number) => {
 
 function GraphView({ api }: { api: ChairPhotoAPI }) {
   const [mode, setMode] = useState<Mode>("community");
-  const [loaded, setLoaded] = useState<{ nodes: GNode[]; links: GLink[] } | null>(null);
+  const [loaded, setLoaded] = useState<{
+    nodes: GNode[];
+    links: GLink[];
+    /** Every tag path → id, including parents with no direct photos (which are not nodes). */
+    tagIdByPath: Map<string, number>;
+  } | null>(null);
   // The tag path the ring is scoped to (community mode), or null for the whole library.
   const [branch, setBranch] = useState<string | null>(null);
 
@@ -308,7 +313,25 @@ function GraphView({ api }: { api: ChairPhotoAPI }) {
               kind: "camera" as const,
             })),
           ].filter((l) => ids.has(l.source as string) && ids.has(l.target as string));
-          if (alive) setLoaded({ nodes, links });
+          // Every tag path → id, parents without direct photos included: they are not
+          // nodes, but hierarchy edges name their ids, and a child's path names theirs.
+          // Walk the edges until no parent is left unnamed (one pass per missing level).
+          const pathById = new Map<number, string>(g.tags.map((n) => [n.id, n.label]));
+          for (let grew = true; grew; ) {
+            grew = false;
+            for (const [p, c] of g.hierarchyEdges) {
+              if (pathById.has(p)) continue;
+              const childPath = pathById.get(c);
+              const pp = childPath != null ? parentPath(childPath) : null;
+              if (pp != null) {
+                pathById.set(p, pp);
+                grew = true;
+              }
+            }
+          }
+          const tagIdByPath = new Map<string, number>();
+          pathById.forEach((path, id) => tagIdByPath.set(path, id));
+          if (alive) setLoaded({ nodes, links, tagIdByPath });
         } else {
           const g = await api.invoke<{
             photos: RawNode[];
@@ -356,7 +379,7 @@ function GraphView({ api }: { api: ChairPhotoAPI }) {
           }));
           if (alive) {
             setPhotoOverflow(g.photos.length - keptPhotos.length);
-            setLoaded({ nodes, links });
+            setLoaded({ nodes, links, tagIdByPath: new Map() });
           }
         }
       } catch (e) {
@@ -541,34 +564,96 @@ function GraphView({ api }: { api: ChairPhotoAPI }) {
       .slice(0, 12);
   }, [selNode, graph, nodeById]);
 
+  // The active community as a selectable thing of its own — the inspector's subject when
+  // no node is selected. A community is a tag branch: a top-level family, or a sub-family
+  // inside the focused branch. Its tag id is known even when that tag has no direct
+  // photos (and so is not on the ring), which is what makes Filter and the loupe work
+  // for "Animals" itself.
+  const community = useMemo(() => {
+    if (!activeCommunity || mode !== "community" || !graph) return null;
+    const members = Array.from(communityMembers.get(activeCommunity) ?? [])
+      .map((id) => nodeById.get(id))
+      .filter((n): n is GNode => !!n)
+      .sort((a, b) => b.count - a.count);
+    const first = members[0];
+    if (!first) return null;
+    let path: string;
+    if (!branch) path = topLevel(first.fullPath);
+    else {
+      const rel = relativeToBranch(first.fullPath, branch);
+      if (rel == null) return null;
+      path = rel === "" ? branch : `${branch}/${topLevel(rel)}`;
+    }
+    return {
+      name: activeCommunity,
+      path,
+      tagId: loaded?.tagIdByPath.get(path) ?? null,
+      color: communityColor.get(activeCommunity) ?? PALETTE[0],
+      photos: communities.find((c) => c.name === activeCommunity)?.count ?? 0,
+      members,
+      // A one-tag family is already as focused as it gets.
+      canFocus: path !== branch && members.length > 1,
+    };
+  }, [
+    activeCommunity,
+    mode,
+    graph,
+    communityMembers,
+    nodeById,
+    branch,
+    loaded,
+    communityColor,
+    communities,
+  ]);
+
   // Mirror the inspector to the pop-out loupe window — a second screen — when the host
-  // can. The card carries the node's numbers and a photo scope; the loupe fetches the
+  // can. The card carries the subject's numbers and a photo scope; the loupe fetches the
   // photos itself, so it can show a whole wall of them rather than the inspector's six.
   const loupeCard = useMemo<LoupeCard | null>(() => {
-    if (!selNode) return null;
-    const isTag = selNode.kind === "tag";
-    const links = degree.get(selNode.id) ?? 0;
-    const stats: NonNullable<LoupeCard["stats"]> = [{ label: "Photos", value: selNode.count }];
-    if (isTag) stats.push({ label: "Children", value: childrenCount.get(selNode.id) ?? 0 });
-    stats.push({ label: "Links", value: links });
-    return {
-      title: selNode.label,
-      subtitle: isTag ? selNode.fullPath : "Camera",
-      color: nodeColor(selNode),
-      chips: isTag
-        ? [`Tag${links >= hubThreshold ? " · hub" : ""}`, `Community: ${selNode.community}`]
-        : ["Camera"],
-      stats,
-      related: connected.map((c) => ({
-        label: c.node.label,
-        detail: String(c.weight),
-        color: nodeColor(c.node),
-      })),
-      photos: isTag ? { tagId: selNode.refId } : { camera: selNode.fullPath },
-    };
+    if (selNode) {
+      const isTag = selNode.kind === "tag";
+      const links = degree.get(selNode.id) ?? 0;
+      const stats: NonNullable<LoupeCard["stats"]> = [{ label: "Photos", value: selNode.count }];
+      if (isTag) stats.push({ label: "Children", value: childrenCount.get(selNode.id) ?? 0 });
+      stats.push({ label: "Links", value: links });
+      return {
+        title: selNode.label,
+        subtitle: isTag ? selNode.fullPath : "Camera",
+        color: nodeColor(selNode),
+        chips: isTag
+          ? [`Tag${links >= hubThreshold ? " · hub" : ""}`, `Community: ${selNode.community}`]
+          : ["Camera"],
+        stats,
+        related: connected.map((c) => ({
+          label: c.node.label,
+          detail: String(c.weight),
+          color: nodeColor(c.node),
+        })),
+        photos: isTag ? { tagId: selNode.refId } : { camera: selNode.fullPath },
+      };
+    }
+    if (community) {
+      return {
+        title: community.name,
+        subtitle: community.path,
+        color: community.color,
+        chips: [branch ? "Branch" : "Community"],
+        stats: [
+          { label: "Photos", value: community.photos },
+          { label: "Tags", value: community.members.length },
+        ],
+        related: community.members.slice(0, 12).map((n) => ({
+          label: n.label,
+          detail: String(n.count),
+          color: nodeColor(n),
+        })),
+        photos: community.tagId != null ? { tagId: community.tagId } : undefined,
+      };
+    }
+    return null;
     // nodeColor is a plain closure over communityColor, which is the dep that matters.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selNode, degree, childrenCount, hubThreshold, connected, communityColor]);
+  }, [selNode, degree, childrenCount, hubThreshold, connected, communityColor, community, branch]);
   useEffect(() => {
     api.showInLoupe?.(loupeCard);
   }, [api, loupeCard]);
@@ -1556,9 +1641,142 @@ function GraphView({ api }: { api: ChairPhotoAPI }) {
                 : undefined
             }
           />
+        ) : community ? (
+          <CommunityCard
+            name={community.name}
+            path={community.path}
+            color={community.color}
+            photos={community.photos}
+            tags={community.members.length}
+            top={community.members.slice(0, 8)}
+            nodeColorFor={nodeColor}
+            inBranch={branch != null}
+            onSelect={setSelected}
+            onFocus={community.canFocus ? () => focusBranch(community.path) : undefined}
+            onFilter={
+              community.tagId != null ? () => api.filterByTag(community.tagId!) : undefined
+            }
+            onOpenLoupe={
+              api.openLoupe ? () => void api.openLoupe!().catch(() => {}) : undefined
+            }
+            onClear={() => setActiveCommunity(null)}
+          />
         ) : (
-          <div className="tg-empty">Select a node</div>
+          <div className="tg-empty">Select a node, or a community on the left</div>
         )}
+      </div>
+    </div>
+  );
+}
+
+/** The right panel's subject when a community is active and no node is selected. */
+function CommunityCard({
+  name,
+  path,
+  color,
+  photos,
+  tags,
+  top,
+  nodeColorFor,
+  inBranch,
+  onSelect,
+  onFocus,
+  onFilter,
+  onOpenLoupe,
+  onClear,
+}: {
+  name: string;
+  path: string;
+  color: string;
+  photos: number;
+  /** How many tags the family has on the ring. */
+  tags: number;
+  /** The biggest of them, by count. */
+  top: GNode[];
+  nodeColorFor: (n: GNode) => string;
+  inBranch: boolean;
+  onSelect: (id: string) => void;
+  /** Redraw the ring for this family. Absent when it is a single tag, or already focused. */
+  onFocus?: () => void;
+  /** Filter the library to this family's tag. Absent when the vocabulary has no such tag. */
+  onFilter?: () => void;
+  onOpenLoupe?: () => void;
+  onClear: () => void;
+}) {
+  return (
+    <div className="tg-inspector">
+      <div className="tg-inspector-scroll">
+        <div className="tg-title">
+          <span className="tg-dot" style={{ background: color }} />
+          <span className="tg-title-text">{name}</span>
+        </div>
+        <div className="tg-chips">
+          <span className="tg-chip">{inBranch ? "Branch" : "Community"}</span>
+          {path !== name && <span className="tg-chip tg-chip-comm">{path}</span>}
+        </div>
+
+        <div className="tg-stats">
+          <div className="tg-stat">
+            <div className="tg-stat-n">{photos}</div>
+            <div className="tg-stat-l">Photos</div>
+          </div>
+          <div className="tg-stat">
+            <div className="tg-stat-n">{tags}</div>
+            <div className="tg-stat-l">Tags</div>
+          </div>
+        </div>
+
+        {top.length > 0 && (
+          <>
+            <div className="tg-head">Top tags</div>
+            <div className="tg-conn">
+              {top.map((n) => (
+                <button
+                  key={n.id}
+                  className="tg-conn-chip"
+                  onClick={() => onSelect(n.id)}
+                  title={`${n.fullPath} · ${n.count}`}
+                >
+                  <span className="tg-dot" style={{ background: nodeColorFor(n) }} />
+                  <span className="tg-conn-name">{n.label}</span>
+                  <span className="tg-conn-w">{n.count}</span>
+                </button>
+              ))}
+            </div>
+          </>
+        )}
+      </div>
+
+      <div className="tg-actions">
+        {onFocus && (
+          <button
+            className="tg-btn tg-btn-primary"
+            onClick={onFocus}
+            title={`Redraw the graph for just "${name}" and everything under it`}
+          >
+            Focus on this branch
+          </button>
+        )}
+        <button
+          className={`tg-btn ${onFocus ? "tg-btn-ghost" : "tg-btn-primary"}`}
+          onClick={onFilter}
+          disabled={!onFilter}
+          title={onFilter ? "" : "No tag in the vocabulary matches this family"}
+        >
+          Filter library to "{name}"
+        </button>
+        {onOpenLoupe && (
+          <button
+            className="tg-btn tg-btn-ghost"
+            onClick={onOpenLoupe}
+            title="Show this family — and a wall of its photos — in the pop-out loupe window"
+          >
+            Open loupe window
+          </button>
+        )}
+        <button className="tg-btn tg-btn-ghost" onClick={onClear}>
+          Clear
+        </button>
       </div>
     </div>
   );

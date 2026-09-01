@@ -2479,58 +2479,61 @@ body {
 }
 
 /* Pop-out loupe: a module's card (ChairPhotoAPI.showInLoupe) — see LoupeCardView.tsx. */
+/* Sized for a second screen read from a distance — everything here runs larger than the
+   docked inspector it mirrors. */
 .loupe-card {
   flex: 1;
   min-width: 0;
   min-height: 0;
   display: flex;
   flex-direction: column;
-  gap: 10px;
+  gap: 14px;
   overflow-y: auto;
-  padding: 8px 12px;
+  padding: 12px 16px;
   color: var(--txt);
 }
 .loupe-card-head {
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: 12px;
 }
 .loupe-card-title {
   display: flex;
   align-items: center;
-  gap: 10px;
-  font-size: 22px;
+  gap: 14px;
+  font-size: 34px;
   font-weight: 600;
+  line-height: 1.15;
 }
 .loupe-card-dot {
-  width: 12px;
-  height: 12px;
+  width: 18px;
+  height: 18px;
   border-radius: 999px;
-  flex: 0 0 12px;
+  flex: 0 0 18px;
 }
 .loupe-card-sub {
   color: var(--dim);
-  font-size: 13px;
+  font-size: 17px;
 }
 .loupe-card-chips,
 .loupe-card-related {
   display: flex;
   flex-wrap: wrap;
-  gap: 6px;
+  gap: 8px;
 }
 .loupe-card-chip {
   display: inline-flex;
   align-items: center;
-  gap: 6px;
-  padding: 3px 9px;
+  gap: 8px;
+  padding: 5px 13px;
   border-radius: 999px;
   background: var(--panel);
   border: 1px solid var(--border);
-  font-size: 12px;
+  font-size: 15px;
 }
 .loupe-card-chip i {
-  width: 8px;
-  height: 8px;
+  width: 10px;
+  height: 10px;
   border-radius: 999px;
 }
 .loupe-card-chip em {
@@ -2540,31 +2543,32 @@ body {
 }
 .loupe-card-stats {
   display: flex;
-  gap: 20px;
+  gap: 28px;
 }
 .loupe-card-stat-n {
-  font-size: 20px;
+  font-size: 30px;
   font-weight: 600;
   font-variant-numeric: tabular-nums;
+  line-height: 1.1;
 }
 .loupe-card-stat-l {
-  font-size: 11px;
+  font-size: 13px;
   color: var(--mute);
   text-transform: uppercase;
   letter-spacing: 0.06em;
 }
 .loupe-card-h {
-  font-size: 10px;
+  font-size: 13px;
   font-weight: 700;
   letter-spacing: 0.08em;
   text-transform: uppercase;
   color: var(--mute);
-  margin-top: 4px;
+  margin-top: 6px;
 }
 .loupe-card-wall {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
-  gap: 8px;
+  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+  gap: 12px;
 }
 .loupe-card-tile {
   aspect-ratio: 1;
@@ -2586,14 +2590,14 @@ body {
 }
 .loupe-card-more {
   align-self: center;
-  margin: 4px 0 12px;
-  padding: 6px 14px;
+  margin: 6px 0 16px;
+  padding: 9px 20px;
   border-radius: 999px;
   border: 1px solid var(--border);
   background: var(--panel);
   color: var(--txt);
   cursor: pointer;
-  font-size: 12px;
+  font-size: 15px;
 }
 .loupe-card-more:disabled {
   opacity: 0.5;
@@ -2606,18 +2610,18 @@ body {
 .loupe-card-bar {
   display: flex;
   align-items: center;
-  gap: 12px;
-  font-size: 13px;
+  gap: 14px;
+  font-size: 16px;
   color: var(--dim);
 }
 .loupe-card-back {
-  padding: 4px 10px;
+  padding: 6px 14px;
   border-radius: 999px;
   border: 1px solid var(--border);
   background: var(--panel);
   color: var(--txt);
   cursor: pointer;
-  font-size: 12px;
+  font-size: 15px;
 }
 .loupe-card-photo {
   flex: 1;

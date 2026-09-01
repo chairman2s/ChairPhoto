@@ -98,11 +98,13 @@ function GraphView({ api }: { api: ChairPhotoAPI }) {
   // Photos dropped by BIPARTITE_PHOTO_CAP — surfaced in the status strip.
   const [photoOverflow, setPhotoOverflow] = useState(0);
 
-  // Left-panel controls.
+  // Left-panel controls. Node types start OFF: the canvas begins empty and the user
+  // opts in per type — a 1,400-node hairball is a worse default than a blank slate,
+  // and the layout keeps settling in the background so nodes appear already placed.
   const [visible, setVisible] = useState<Record<Kind, boolean>>({
-    tag: true,
-    camera: true,
-    photo: true,
+    tag: false,
+    camera: false,
+    photo: false,
   });
   const [activeCommunity, setActiveCommunity] = useState<string | null>(null);
   const [linkThreshold, setLinkThreshold] = useState(0);
@@ -969,6 +971,9 @@ function GraphView({ api }: { api: ChairPhotoAPI }) {
           onPointerMove={onPointerMove}
           onPointerLeave={onPointerLeave}
         />
+        {graph && shownStats.nodes === 0 && (
+          <div className="tg-hint">Turn on a node type on the left to draw the graph</div>
+        )}
 
         {/* Top-right mini legend */}
         <div className="tg-legend">

@@ -224,6 +224,17 @@
 /* Links, nodes, and labels are painted by the canvas renderer in tagGraph.tsx —
    their visual constants (opacities, strokes, dashes) live there. */
 
+/* Empty state — no node type enabled yet */
+.tg-hint {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  color: var(--mute);
+  font-size: 13px;
+  pointer-events: none;
+}
+
 /* Top-right mini legend */
 .tg-legend {
   position: absolute;

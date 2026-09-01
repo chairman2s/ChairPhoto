@@ -1,6 +1,6 @@
 ---
 title: "Tag Graph"
-description: "The tag vocabulary drawn as a force-directed co-occurrence graph."
+description: "The tag vocabulary drawn as a radial edge-bundled co-occurrence graph."
 tags:
   - chairphoto/module
   - chairphoto/tagging
@@ -11,22 +11,35 @@ aliases:
 
 # Tag Graph
 
-A force-directed picture of your tag vocabulary — which tags you actually use, and which ones
-keep turning up together. It answers questions a tag tree cannot: where the vocabulary has
-clustered, which branches are dead, and which pairs are effectively synonyms in practice.
+A radial picture of your tag vocabulary — which tags you actually use, and which ones keep
+turning up together. It answers questions a tag tree cannot: which families lean on each other,
+which branches are dead, and which pairs are effectively synonyms in practice.
 
 Enable **Tag Graph** in Preferences → Modules and it appears as its own main view.
 
 ## What it draws
 
-- **Nodes are tags**, sized by how many photos carry them. Only tags with at least one
-  non-missing photo appear, so unused branches of the vocabulary stay out of the picture.
-- **Edges are co-occurrence** — two tags are linked when they appear on the same photos, and
-  the link strengthens with how often that happens.
+Radial hierarchical edge bundling (Holten 2006), drawn on a canvas:
 
-The useful reading is the clustering. Tags that sit tightly together describe the same kind of
-photo, which is a good signal that they belong on the same branch, or that one should be a
-synonym rather than its own tag. Isolated nodes are the opposite — vocabulary you created once
+- **Tags sit on a ring**, one slot each, ordered by a depth-first walk of the tag hierarchy so
+  children sit beside their parent and each top-level community is a contiguous arc, sized by
+  its photo count and marked with a coloured band. Cameras get an arc of their own. Only tags
+  with at least one non-missing photo appear, so unused branches stay out of the picture.
+- **Edges are co-occurrence** — two tags are linked when they appear on the same photos, with
+  opacity following how often. Each edge is routed through the hierarchy (up to the lowest
+  common ancestor and down again) and smoothed, so all the edges between two families share a
+  path and read as one bundle.
+- **Nothing is drawn until a node type is switched on.** The view opens empty; toggle Tags
+  and/or Cameras to draw them.
+- **Hover a tag** to light up everything it appears with, coloured by the far end; **select**
+  one for the inspector; **select a community** to light up all of its edges.
+
+The layout is deterministic — no physics, no settling — so the same library always looks the
+same, and the picture is ready as soon as the data arrives.
+
+The useful reading is the bundles. A thick bundle between two arcs is two families that describe
+the same photos, which is a good signal that they belong on one branch, or that one tag should be
+a synonym rather than its own. A slot with no edges is the opposite — vocabulary you created once
 and never reused.
 
 Selecting a tag pulls up its photos through the normal `list_photos` path, so the graph is a way
@@ -36,6 +49,7 @@ into the library rather than a dead end.
 
 ```
 src/modules/plugins/tagGraph.tsx      the view, registered via registerMainView
+src/modules/plugins/tagGraphBundle.ts  the radial layout — pure, unit-tested
 src/modules/plugins/tagGraph.css
 src-tauri/src/commands/graph.rs:66    library_graph — nodes and edges
 src-tauri/src/catalog/mod.rs:1841     the queries
@@ -50,8 +64,8 @@ want individual photos as nodes rather than the tag-level projection this module
 
 ## Limits
 
-- The graph is computed live on each open and is not cached; a large vocabulary takes a moment
-  to settle into its layout.
+- The graph is computed live on each open and is not cached. The bipartite Photo ↔ tag mode
+  keeps only the 1,500 most-tagged photos so its force layout stays animatable.
 - Photos marked missing are excluded, so the picture reflects what the catalog can currently
   reach.
 - It is a view of the vocabulary, not an editor — reparenting and merging tags happen in the tag

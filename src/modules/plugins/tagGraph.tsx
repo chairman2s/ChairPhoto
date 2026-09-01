@@ -1,10 +1,10 @@
-// Tag Graph module: a main-view force-directed graph of the tag vocabulary — nodes are tags
-// sized by photo count, edges are co-occurrence. Frontend-only; data comes from the
-// `library_graph` command. See docs/tag-graph.md.
+// Tag Graph module: the tag vocabulary as a radial edge-bundled graph — tags on a ring
+// grouped by community, co-occurrence edges bundled through the hierarchy. Frontend-only;
+// data comes from the `library_graph` command. See docs/tag-graph.md.
 //
-// The scene is painted onto a single <canvas>: sim ticks, pan/zoom, and hover mutate refs
+// The scene is painted onto a single <canvas>: layout, pan/zoom, and hover mutate refs
 // and set a dirty flag that one rAF loop repaints. React re-renders only on real state
-// changes (selection, panel toggles) — never per tick or per pointermove.
+// changes (selection, panel toggles) — never per frame or per pointermove.
 import { useEffect, useMemo, useRef, useState } from "react";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import {
@@ -20,13 +20,20 @@ import {
   type SimulationNodeDatum,
 } from "d3-force";
 import type { ChairPhotoAPI, ChairPhotoModule } from "../registry";
+import {
+  buildBundleLayout,
+  bundlePath,
+  CAMERA_GROUP,
+  type BundleLayout,
+} from "./tagGraphBundle";
 import "./tagGraph.css";
 
 // The Graph module: a full-surface view that visualizes the library as a graph.
-//  • Communities — nodes = tags (coloured by their top-level community) + cameras, edges =
-//    tag co-occurrence, tag hierarchy, and camera↔tag usage (from the `library_graph`
-//    command). Selecting a node opens an inspector; it does NOT navigate directly.
-//  • Photo ↔ tag — a bipartite graph of photos and the tags assigned to them (legacy view).
+//  • Communities — radial edge bundling: tags (and cameras) sit on a ring, grouped by
+//    their top-level community; co-occurrence and camera↔tag edges curve through the
+//    hierarchy in bundles (from the `library_graph` command). Deterministic — no physics.
+//    Selecting a node opens an inspector; it does NOT navigate directly.
+//  • Photo ↔ tag — a force-directed bipartite graph of photos and their tags (legacy view).
 // Pure frontend (reads core catalog commands), so it needs no Cargo feature.
 
 type Mode = "community" | "bipartite";
@@ -47,6 +54,20 @@ interface GLink extends SimulationLinkDatum<GNode> {
   kind: "cooc" | "hierarchy" | "camera" | "bipartite";
 }
 
+/** Per-frame paint context: the view transform, canvas size, and resolved theme colours. */
+interface PaintEnv {
+  k: number;
+  x: number;
+  y: number;
+  cw: number;
+  ch: number;
+  dpr: number;
+  font: string;
+  txtColor: string;
+  haloColor: string;
+  borderColor: string;
+}
+
 interface LibraryGraphData {
   tags: { id: number; label: string; count: number }[];
   cameras: { id: number; label: string; count: number }[];
@@ -64,12 +85,12 @@ interface RawNode {
 const leaf = (path: string) => path.split("/").pop() || path;
 const topLevel = (path: string) => path.split("/")[0] || path;
 
-// Community colour palette (families). Assigned stably by sorted community name.
+// Community colour palette (families), cycled in size order. Amber is reserved for cameras
+// so their arc is unmistakable.
 const PALETTE = [
   "#3B82F6",
   "#8B5CF6",
   "#10B981",
-  "#F59E0B",
   "#EC4899",
   "#14B8A6",
   "#F97316",
@@ -88,6 +109,23 @@ const PHOTO_R = 13;
 const BIPARTITE_PHOTO_CAP = 1500;
 
 const NODE_STROKE = "rgba(15, 23, 42, 0.6)";
+
+// Radial bundling geometry. The ring lives in graph units and the view scales it; every
+// piece of chrome (dots, labels, group arcs) is drawn in screen pixels so it stays
+// legible at any zoom.
+const RING_R = 400;
+const LABEL_EXTENT = 100; // px reserved outside the ring for tag labels
+const LABEL_MAX_CHARS = 16;
+const BUNDLE_BETA = 0.85; // 1 = follow the hierarchy exactly, 0 = straight chords
+
+const truncate = (s: string) =>
+  s.length > LABEL_MAX_CHARS ? `${s.slice(0, LABEL_MAX_CHARS - 1)}…` : s;
+
+/** Normalize an angle difference into (-π, π]. */
+const angleDiff = (a: number, b: number) => {
+  const d = (a - b) % (Math.PI * 2);
+  return d > Math.PI ? d - Math.PI * 2 : d <= -Math.PI ? d + Math.PI * 2 : d;
+};
 
 function GraphView({ api }: { api: ChairPhotoAPI }) {
   const [mode, setMode] = useState<Mode>("community");
@@ -119,19 +157,47 @@ function GraphView({ api }: { api: ChairPhotoAPI }) {
   const dirtyRef = useRef(true);
   const drawRef = useRef<() => void>(() => {});
   const thumbCache = useRef(new Map<number, HTMLImageElement>());
+  // Bundle mode: the un-highlighted edges as cached Path2D buckets (rebuilt only when the
+  // layout, link set, or isolation changes — hover repaints just restroke them), the ids
+  // labelled in the last paint (label-zone hit-testing), and which graph was auto-fitted.
+  const edgeCacheRef = useRef<{
+    bundle: BundleLayout;
+    links: GLink[];
+    isolate: Set<string> | null;
+    buckets: { path: Path2D; color: string; alpha: number }[];
+  } | null>(null);
+  const labelledRef = useRef<string[]>([]);
+  const fittedRef = useRef<object | null>(null);
 
-  // Community → colour map, computed from the loaded tags (stable by sorted name).
+  // Communities (tag families) by total photo count, descending — the left-panel list
+  // and the ring order share this ordering.
+  const communities = useMemo(() => {
+    if (!graph) return [] as { name: string; count: number }[];
+    const totals = new Map<string, number>();
+    for (const n of graph.nodes) {
+      if (n.kind !== "tag") continue;
+      totals.set(n.community, (totals.get(n.community) ?? 0) + n.count);
+    }
+    return Array.from(totals.entries())
+      .map(([name, count]) => ({ name, count }))
+      .sort((a, b) => b.count - a.count);
+  }, [graph]);
+
+  // Community → colour. The palette cycles down the size-ordered list, which is also the
+  // ring order, so neighbouring arcs differ.
   const communityColor = useMemo(() => {
     const m = new Map<string, string>();
-    if (!graph) return m;
-    const names = Array.from(
-      new Set(
-        graph.nodes
-          .filter((n) => n.kind === "tag")
-          .map((n) => n.community),
-      ),
-    ).sort();
-    names.forEach((name, i) => m.set(name, PALETTE[i % PALETTE.length]));
+    communities.forEach((c, i) => m.set(c.name, PALETTE[i % PALETTE.length]));
+    return m;
+  }, [communities]);
+
+  // Tag ids per community — the edge focus set when a community is active.
+  const communityMembers = useMemo(() => {
+    const m = new Map<string, Set<string>>();
+    graph?.nodes.forEach((n) => {
+      if (n.kind !== "tag") return;
+      (m.get(n.community) ?? m.set(n.community, new Set()).get(n.community)!).add(n.id);
+    });
     return m;
   }, [graph]);
 
@@ -140,19 +206,6 @@ function GraphView({ api }: { api: ChairPhotoAPI }) {
     if (n.kind === "photo") return PHOTO_COLOR;
     return communityColor.get(n.community) ?? PALETTE[0];
   };
-
-  // Communities list for the left panel (tag communities + total count).
-  const communities = useMemo(() => {
-    if (!graph) return [] as { name: string; count: number; color: string }[];
-    const totals = new Map<string, number>();
-    for (const n of graph.nodes) {
-      if (n.kind !== "tag") continue;
-      totals.set(n.community, (totals.get(n.community) ?? 0) + n.count);
-    }
-    return Array.from(totals.entries())
-      .map(([name, count]) => ({ name, count, color: communityColor.get(name) ?? PALETTE[0] }))
-      .sort((a, b) => b.count - a.count);
-  }, [graph, communityColor]);
 
   // Load + shape the data whenever the mode changes.
   useEffect(() => {
@@ -279,10 +332,35 @@ function GraphView({ api }: { api: ChairPhotoAPI }) {
     return graph.links.filter((l) => l.kind !== "cooc" || l.weight >= linkThreshold);
   }, [graph, linkThreshold]);
 
-  // Run / re-run the force simulation when the graph or the active link set changes.
+  // The links actually painted. The bundle draws hierarchy as ring adjacency, not edges.
+  const drawLinks = useMemo(
+    () => (mode === "community" ? simLinks.filter((l) => l.kind !== "hierarchy") : simLinks),
+    [mode, simLinks],
+  );
+
+  // Radial bundling layout (community mode). Only the visible kinds take ring slots, so
+  // toggling a type re-lays the ring. Ring placement is written onto the node objects:
+  // hit-testing, fit, and the inspector all read n.x / n.y — the same mutable-position
+  // convention d3-force uses in bipartite mode.
+  const bundle = useMemo(() => {
+    if (!graph || mode !== "community") return null;
+    const shown = graph.nodes.filter((n) => visible[n.kind]);
+    const layout = buildBundleLayout(shown, RING_R);
+    for (const n of shown) {
+      const p = layout.placement.get(n.id);
+      if (p) {
+        n.x = p.x;
+        n.y = p.y;
+      }
+    }
+    return layout;
+  }, [graph, mode, visible]);
+
+  // Run / re-run the force simulation when the graph or the active link set changes
+  // (bipartite mode only — the bundle layout is deterministic).
   useEffect(() => {
     simRef.current?.stop();
-    if (!graph) return;
+    if (!graph || mode !== "bipartite") return;
     // d3 throws (e.g. "node not found" on a dangling link) — surface it in the view's
     // error banner instead of letting the exception unmount the whole app.
     try {
@@ -294,10 +372,10 @@ function GraphView({ api }: { api: ChairPhotoAPI }) {
           "link",
           forceLink<GNode, GLink>(simLinks)
             .id((d) => d.id)
-            .distance((l) => (mode === "community" ? 40 + 30 / Math.sqrt(l.weight) : 28))
+            .distance(28)
             .strength(0.4),
         )
-        .force("charge", forceManyBody<GNode>().strength(mode === "community" ? -120 : -60))
+        .force("charge", forceManyBody<GNode>().strength(-60))
         .force("collide", forceCollide<GNode>().radius((d) => d.r + 2))
         .force("center", forceCenter(0, 0))
         .force("x", forceX(0).strength(0.04))
@@ -450,10 +528,34 @@ function GraphView({ api }: { api: ChairPhotoAPI }) {
     };
   };
 
-  // Topmost node under the cursor — nodes paint in array order, so scan from the end.
+  // Node under the cursor. Bundle mode: nearest ring slot by angle, on the ring itself or
+  // (further out) among the slots that currently carry a label. Force mode: topmost node
+  // — they paint in array order, so scan from the end.
   const hitTest = (cx: number, cy: number): GNode | null => {
     if (!graph) return null;
     const p = toGraph(cx, cy);
+    if (bundle) {
+      const { k } = viewRef.current;
+      const r = Math.hypot(p.x, p.y);
+      const ringTol = 8 / k;
+      if (r < bundle.R - ringTol || r > bundle.R + (LABEL_EXTENT + 12) / k) return null;
+      const a = Math.atan2(p.y, p.x);
+      const inLabelZone = r > bundle.R + ringTol;
+      const tol = inLabelZone ? 6 / (r * k) : Math.max(bundle.slot / 2, 5 / (bundle.R * k));
+      let best: GNode | null = null;
+      let bestD = Infinity;
+      for (const id of inLabelZone ? labelledRef.current : bundle.order) {
+        const n = nodeById.get(id);
+        const pl = bundle.placement.get(id);
+        if (!n || !pl || !nodeShown(n)) continue;
+        const d = Math.abs(angleDiff(a, pl.angle));
+        if (d < bestD) {
+          bestD = d;
+          best = n;
+        }
+      }
+      return bestD <= tol ? best : null;
+    }
     for (let i = graph.nodes.length - 1; i >= 0; i--) {
       const n = graph.nodes[i];
       if (!nodeShown(n)) continue;
@@ -480,6 +582,21 @@ function GraphView({ api }: { api: ChairPhotoAPI }) {
   const fitView = () => {
     const rect = canvasRef.current?.getBoundingClientRect();
     if (!rect || !graph) return;
+    if (bundle) {
+      // Ring plus the label band, centred.
+      const margin = LABEL_EXTENT + 28;
+      const k = Math.min(
+        Math.max((Math.min(rect.width, rect.height) / 2 - margin) / bundle.R, 0.05),
+        6,
+      );
+      viewRef.current = {
+        k,
+        x: (rect.width / 2) * (1 - k),
+        y: (rect.height / 2) * (1 - k),
+      };
+      markDirty();
+      return;
+    }
     let minX = Infinity;
     let minY = Infinity;
     let maxX = -Infinity;
@@ -538,6 +655,11 @@ function GraphView({ api }: { api: ChairPhotoAPI }) {
   // empty canvas deselects and pans.
   const onPointerDown = (e: React.PointerEvent) => {
     const n = hitTest(e.clientX, e.clientY);
+    if (n && bundle) {
+      // Ring slots are fixed — a press is a select, not a drag.
+      setSelected(n.id);
+      return;
+    }
     if (n) {
       const sim = simRef.current;
       if (!frozen) sim?.alphaTarget(0.3).restart();
@@ -621,22 +743,277 @@ function GraphView({ api }: { api: ChairPhotoAPI }) {
     if (!graph) return { nodes: 0, links: 0, communities: 0 };
     const shownNodes = graph.nodes.filter(nodeShown);
     const shownIds = new Set(shownNodes.map((n) => n.id));
-    const shownLinks = simLinks.filter((l) => {
+    const shownLinks = drawLinks.filter((l) => {
       const s = typeof l.source === "object" ? (l.source as GNode).id : (l.source as string);
       const t = typeof l.target === "object" ? (l.target as GNode).id : (l.target as string);
       return shownIds.has(s) && shownIds.has(t);
     });
     return { nodes: shownNodes.length, links: shownLinks.length, communities: communities.length };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [graph, simLinks, visible, isolateSet, communities.length]);
+  }, [graph, drawLinks, visible, isolateSet, communities.length]);
 
   const communityDimmed = (n: GNode) =>
     activeCommunity != null && n.kind === "tag" && n.community !== activeCommunity;
 
-  // ── Canvas painter ──────────────────────────────────────────────
-  // Repaints the whole scene from current sim positions. Links batch into one Path2D
-  // per (colour, width, dash, alpha), so a frame is a few dozen stroke calls plus one
-  // arc per visible node — instead of reconciling 20k+ SVG elements through React.
+  // Screen-fixed tooltip beside a node (what the SVG <title> used to say).
+  const drawTooltip = (
+    ctx: CanvasRenderingContext2D,
+    env: PaintEnv,
+    n: GNode,
+    sx: number,
+    sy: number,
+    rPx: number,
+  ) => {
+    const { dpr, cw, ch, font, txtColor, haloColor, borderColor } = env;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    const what = n.kind === "photo" ? "tag(s)" : "photo(s)";
+    const text = `${n.fullPath} · ${n.count} ${what}`;
+    ctx.font = `500 12px ${font}`;
+    ctx.textAlign = "left";
+    ctx.textBaseline = "alphabetic";
+    const w = ctx.measureText(text).width;
+    const tx = Math.min(Math.max(sx + 10, 4), Math.max(cw - w - 12, 4));
+    const ty = Math.min(Math.max(sy - rPx - 10, 16), ch - 8);
+    ctx.globalAlpha = 0.92;
+    ctx.fillStyle = haloColor;
+    ctx.fillRect(tx - 6, ty - 13, w + 12, 19);
+    ctx.globalAlpha = 1;
+    ctx.strokeStyle = borderColor;
+    ctx.lineWidth = 1;
+    ctx.strokeRect(tx - 6, ty - 13, w + 12, 19);
+    ctx.fillStyle = txtColor;
+    ctx.fillText(text, tx, ty + 1);
+  };
+
+  // ── Bundle painter (community mode) ─────────────────────────────
+  // Edges are stroked in graph space from cached Path2D buckets; everything else — group
+  // arcs, dots, labels — is drawn in screen pixels so it reads the same at any zoom.
+  const drawBundle = (ctx: CanvasRenderingContext2D, layout: BundleLayout, env: PaintEnv) => {
+    const { k, x, y, cw, ch, dpr, font, txtColor, haloColor } = env;
+    const cxs = (cw / 2) * k + x; // screen position of the ring centre
+    const cys = (ch / 2) * k + y;
+    const Rs = layout.R * k;
+    const hov = hoverRef.current;
+    const hovNbrs = hov ? neighbors.get(hov) : undefined;
+    const endId = (e: GLink["source"]) => (typeof e === "object" ? (e as GNode).id : (e as string));
+
+    // Focus: the node(s) whose edges light up. Hover beats selection beats community.
+    let focus: Set<string> | null = null;
+    if (hov) focus = new Set([hov]);
+    else if (selected) focus = new Set([selected]);
+    else if (activeCommunity) focus = communityMembers.get(activeCommunity) ?? null;
+
+    // ── Edges, in graph space ──
+    ctx.translate(x, y);
+    ctx.scale(k, k);
+    ctx.translate(cw / 2, ch / 2);
+    let cache = edgeCacheRef.current;
+    if (
+      !cache ||
+      cache.bundle !== layout ||
+      cache.links !== drawLinks ||
+      cache.isolate !== isolateSet
+    ) {
+      // One Path2D per (colour, alpha step). Alpha follows log weight so the strong
+      // pairs read and the long tail stays a haze; colour follows the heavier end so a
+      // bundle out of one family is one hue.
+      let maxW = 1;
+      for (const l of drawLinks) maxW = Math.max(maxW, l.weight);
+      const lnMax = Math.log1p(maxW);
+      const byKey = new Map<string, { path: Path2D; color: string; alpha: number }>();
+      for (const l of drawLinks) {
+        const s = nodeById.get(endId(l.source));
+        const t = nodeById.get(endId(l.target));
+        if (!s || !t || !nodeShown(s) || !nodeShown(t)) continue;
+        const pts = layout.path(s.id, t.id);
+        if (!pts) continue;
+        const heavy = s.count >= t.count ? s : t;
+        const color = l.kind === "camera" ? CAMERA_COLOR : nodeColor(heavy);
+        const alpha = Math.round((0.05 + 0.35 * (Math.log1p(l.weight) / lnMax)) * 50) / 50;
+        const key = `${color}|${alpha}`;
+        let b = byKey.get(key);
+        if (!b) byKey.set(key, (b = { path: new Path2D(), color, alpha }));
+        bundlePath(b.path, pts, BUNDLE_BETA);
+      }
+      cache = {
+        bundle: layout,
+        links: drawLinks,
+        isolate: isolateSet,
+        buckets: Array.from(byKey.values()),
+      };
+      edgeCacheRef.current = cache;
+    }
+    ctx.lineWidth = 1 / k;
+    ctx.lineCap = "round";
+    const baseMul = focus ? 0.2 : 1;
+    for (const b of cache.buckets) {
+      ctx.globalAlpha = b.alpha * baseMul;
+      ctx.strokeStyle = b.color;
+      ctx.stroke(b.path);
+    }
+    if (focus) {
+      // Lit edges, coloured by their far end so the picture says where a tag goes.
+      const byColor = new Map<string, Path2D>();
+      for (const l of drawLinks) {
+        const s = nodeById.get(endId(l.source));
+        const t = nodeById.get(endId(l.target));
+        if (!s || !t) continue;
+        const sIn = focus.has(s.id);
+        const tIn = focus.has(t.id);
+        if (!sIn && !tIn) continue;
+        if (!nodeShown(s) || !nodeShown(t)) continue;
+        const pts = layout.path(s.id, t.id);
+        if (!pts) continue;
+        const far = sIn ? t : s;
+        const color = far.kind === "camera" ? CAMERA_COLOR : nodeColor(far);
+        let p = byColor.get(color);
+        if (!p) byColor.set(color, (p = new Path2D()));
+        bundlePath(p, pts, BUNDLE_BETA);
+      }
+      ctx.lineWidth = 1.5 / k;
+      ctx.globalAlpha = 0.85;
+      for (const [color, p] of byColor) {
+        ctx.strokeStyle = color;
+        ctx.stroke(p);
+      }
+    }
+
+    // ── Chrome, in screen space ──
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.lineCap = "butt";
+    const groupColor = (name: string) =>
+      name === CAMERA_GROUP ? CAMERA_COLOR : (communityColor.get(name) ?? PALETTE[0]);
+    const groupDim = (name: string) =>
+      activeCommunity != null && name !== CAMERA_GROUP && name !== activeCommunity;
+
+    ctx.lineWidth = 3;
+    for (const g of layout.groups) {
+      ctx.globalAlpha = groupDim(g.name) ? 0.25 : 0.9;
+      ctx.strokeStyle = groupColor(g.name);
+      ctx.beginPath();
+      ctx.arc(cxs, cys, Rs + 6, g.a0, g.a1);
+      ctx.stroke();
+    }
+
+    const dimmed = (n: GNode) =>
+      (hov != null && hov !== n.id && !hovNbrs?.has(n.id)) || communityDimmed(n);
+    const TWO_PI = Math.PI * 2;
+    let hovered: GNode | null = null;
+    let hoveredR = 0;
+    for (const id of layout.order) {
+      const n = nodeById.get(id);
+      const p = layout.placement.get(id);
+      if (!n || !p || !nodeShown(n)) continue;
+      const r = 1.5 + 4.5 * Math.sqrt(n.count / layout.maxCount);
+      const sx = cxs + Rs * Math.cos(p.angle);
+      const sy = cys + Rs * Math.sin(p.angle);
+      if (id === hov) {
+        hovered = n;
+        hoveredR = r;
+      }
+      ctx.globalAlpha = dimmed(n) ? 0.18 : 1;
+      ctx.beginPath();
+      ctx.arc(sx, sy, r, 0, TWO_PI);
+      ctx.fillStyle = nodeColor(n);
+      ctx.fill();
+      if (id === selected || id === hov) {
+        ctx.strokeStyle = "#fff";
+        ctx.lineWidth = 1.5;
+        ctx.stroke();
+      }
+    }
+
+    // Labels: a stable base set by count, placed greedily with an angular gap so they
+    // never collide; then the hovered/selected node always, and its neighbours where
+    // they fit.
+    const minSep = 12 / Rs;
+    const placed: number[] = [];
+    const labelled: string[] = [];
+    const labelledSet = new Set<string>();
+    const tryLabel = (id: string, force: boolean) => {
+      if (labelledSet.has(id)) return;
+      const n = nodeById.get(id);
+      const p = layout.placement.get(id);
+      if (!n || !p || !nodeShown(n)) return;
+      if (!force) for (const a of placed) if (Math.abs(a - p.angle) < minSep) return;
+      placed.push(p.angle);
+      labelled.push(id);
+      labelledSet.add(id);
+    };
+    for (const id of layout.labelOrder) {
+      if (labelled.length >= 500) break;
+      tryLabel(id, false);
+    }
+    const emph = hov ?? selected;
+    if (emph) {
+      tryLabel(emph, true);
+      neighbors.get(emph)?.forEach((nb) => tryLabel(nb, false));
+    }
+    labelledRef.current = labelled;
+
+    ctx.textBaseline = "middle";
+    ctx.lineWidth = 3;
+    ctx.lineJoin = "round";
+    for (const id of labelled) {
+      const n = nodeById.get(id)!;
+      const p = layout.placement.get(id)!;
+      const isEmph = id === emph;
+      const flip = Math.cos(p.angle) < 0;
+      ctx.save();
+      ctx.translate(cxs + Rs * Math.cos(p.angle), cys + Rs * Math.sin(p.angle));
+      ctx.rotate(flip ? p.angle + Math.PI : p.angle);
+      ctx.textAlign = flip ? "right" : "left";
+      ctx.globalAlpha = dimmed(n) && !isEmph ? 0.3 : 1;
+      ctx.font = `${isEmph ? 700 : 500} 11px ${font}`;
+      const ox = flip ? -12 : 12;
+      const text = truncate(n.label);
+      ctx.strokeStyle = haloColor;
+      ctx.strokeText(text, ox, 0);
+      ctx.fillStyle = isEmph ? nodeColor(n) : txtColor;
+      ctx.fillText(text, ox, 0);
+      ctx.restore();
+    }
+
+    // Group names along the outside, only where the arc is long enough to carry them.
+    ctx.font = `700 11px ${font}`;
+    ctx.textAlign = "center";
+    for (const g of layout.groups) {
+      const name = g.name === CAMERA_GROUP ? "Cameras" : g.name;
+      const w = ctx.measureText(name).width;
+      if ((g.a1 - g.a0) * Rs < w + 10) continue;
+      const mid = (g.a0 + g.a1) / 2;
+      const rr = Rs + LABEL_EXTENT + 10;
+      let rot = mid + Math.PI / 2;
+      if (Math.cos(rot) < 0) rot += Math.PI;
+      ctx.save();
+      ctx.translate(cxs + rr * Math.cos(mid), cys + rr * Math.sin(mid));
+      ctx.rotate(rot);
+      ctx.globalAlpha = groupDim(g.name) ? 0.3 : 0.95;
+      ctx.strokeStyle = haloColor;
+      ctx.strokeText(name, 0, 0);
+      ctx.fillStyle = groupColor(g.name);
+      ctx.fillText(name, 0, 0);
+      ctx.restore();
+    }
+    ctx.globalAlpha = 1;
+
+    if (hovered) {
+      const p = layout.placement.get(hovered.id)!;
+      drawTooltip(
+        ctx,
+        env,
+        hovered,
+        cxs + Rs * Math.cos(p.angle),
+        cys + Rs * Math.sin(p.angle),
+        hoveredR,
+      );
+    }
+  };
+
+  // ── Frame painter ───────────────────────────────────────────────
+  // Repaints the whole scene. Bundle mode hands off to drawBundle; force mode (bipartite)
+  // batches links into one Path2D per (colour, width, dash, alpha) and draws one arc per
+  // visible node — a few dozen stroke calls instead of 20k+ reconciled SVG elements.
   drawRef.current = () => {
     const canvas = canvasRef.current;
     const ctx = canvas?.getContext("2d");
@@ -656,6 +1033,22 @@ function GraphView({ api }: { api: ChairPhotoAPI }) {
     ctx.clearRect(0, 0, cw, ch);
     if (!graph) return;
     const { k, x, y } = viewRef.current;
+    const env: PaintEnv = {
+      k,
+      x,
+      y,
+      cw,
+      ch,
+      dpr,
+      font: styles.fontFamily,
+      txtColor,
+      haloColor,
+      borderColor,
+    };
+    if (bundle) {
+      drawBundle(ctx, bundle, env);
+      return;
+    }
     ctx.translate(x, y);
     ctx.scale(k, k);
     ctx.translate(cw / 2, ch / 2);
@@ -672,7 +1065,7 @@ function GraphView({ api }: { api: ChairPhotoAPI }) {
     type LinkBucket = { path: Path2D; color: string; width: number; dash: boolean; alpha: number };
     const base = new Map<string, LinkBucket>();
     const active = new Map<string, LinkBucket>();
-    for (const l of simLinks) {
+    for (const l of drawLinks) {
       const s = typeof l.source === "object" ? (l.source as GNode) : nodeById.get(l.source as string);
       const t = typeof l.target === "object" ? (l.target as GNode) : nodeById.get(l.target as string);
       if (!s || !t || !nodeShown(s) || !nodeShown(t)) continue;
@@ -790,27 +1183,15 @@ function GraphView({ api }: { api: ChairPhotoAPI }) {
     }
     ctx.globalAlpha = 1;
 
-    // Screen-fixed hover tooltip (replaces the old SVG <title>).
     if (hovered) {
-      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-      const sx = ((hovered.x ?? 0) + cw / 2) * k + x;
-      const sy = ((hovered.y ?? 0) + ch / 2) * k + y;
-      const what = hovered.kind === "photo" ? "tag(s)" : "photo(s)";
-      const text = `${hovered.fullPath} · ${hovered.count} ${what}`;
-      ctx.font = `500 12px ${styles.fontFamily}`;
-      ctx.textBaseline = "alphabetic";
-      const w = ctx.measureText(text).width;
-      const tx = Math.min(Math.max(sx + 10, 4), Math.max(cw - w - 12, 4));
-      const ty = Math.min(Math.max(sy - hovered.r * k - 10, 16), ch - 8);
-      ctx.globalAlpha = 0.92;
-      ctx.fillStyle = haloColor;
-      ctx.fillRect(tx - 6, ty - 13, w + 12, 19);
-      ctx.globalAlpha = 1;
-      ctx.strokeStyle = borderColor;
-      ctx.lineWidth = 1;
-      ctx.strokeRect(tx - 6, ty - 13, w + 12, 19);
-      ctx.fillStyle = txtColor;
-      ctx.fillText(text, tx, ty + 1);
+      drawTooltip(
+        ctx,
+        env,
+        hovered,
+        ((hovered.x ?? 0) + cw / 2) * k + x,
+        ((hovered.y ?? 0) + ch / 2) * k + y,
+        hovered.r * k,
+      );
     }
   };
 
@@ -818,6 +1199,15 @@ function GraphView({ api }: { api: ChairPhotoAPI }) {
   useEffect(() => {
     dirtyRef.current = true;
   });
+
+  // Fit the ring the first time it has something on it for this graph.
+  useEffect(() => {
+    if (!bundle || !graph || bundle.order.length === 0 || fittedRef.current === graph) return;
+    fittedRef.current = graph;
+    fitView();
+    // fitView reads refs and `bundle`; nothing else it closes over should re-trigger it.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [bundle, graph]);
 
   // The repaint loop: at most one paint per frame, and only when something changed.
   useEffect(() => {
@@ -888,7 +1278,7 @@ function GraphView({ api }: { api: ChairPhotoAPI }) {
                     setActiveCommunity((a) => (a === c.name ? null : c.name))
                   }
                 >
-                  <span className="tg-sq" style={{ background: c.color }} />
+                  <span className="tg-sq" style={{ background: communityColor.get(c.name) }} />
                   <span className="tg-comm-name">{c.name}</span>
                   <span className="tg-comm-count">{c.count}</span>
                 </button>
@@ -918,16 +1308,18 @@ function GraphView({ api }: { api: ChairPhotoAPI }) {
           </>
         )}
 
-        <div className="tg-toggle-row">
-          <span>Freeze layout</span>
-          <button
-            className={`tg-switch ${frozen ? "on" : ""}`}
-            onClick={() => setFrozen((f) => !f)}
-            aria-pressed={frozen}
-          >
-            <span className="tg-knob" />
-          </button>
-        </div>
+        {mode === "bipartite" && (
+          <div className="tg-toggle-row">
+            <span>Freeze layout</span>
+            <button
+              className={`tg-switch ${frozen ? "on" : ""}`}
+              onClick={() => setFrozen((f) => !f)}
+              aria-pressed={frozen}
+            >
+              <span className="tg-knob" />
+            </button>
+          </div>
+        )}
 
         {mode === "bipartite" && (
           <div className="tg-toggle-row">

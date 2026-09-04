@@ -1,12 +1,19 @@
 # Status: Darkroom (the complete develop feature)
 
 - Gate 1 — Product: APPROVED 2026-09-04
-- Gate 2 — Architecture: in progress
-- Gate 3 — Program Design: pending
-- Gate 4 — Slice plan: pending
+- Gate 2 — Architecture: APPROVED 2026-09-04
+- Gate 3 — Program Design: APPROVED 2026-09-04
+- Gate 4 — Slice plan: in progress
 
 ## Slices
-(defined at Gate 4)
+- [ ] Slice 1 — tracer bullet: zones field end-to-end + bare DarkroomView behind `editor.darkroom` toggle
+- [ ] Slice 2 — zone curve + masses for real (engine + command + tests)
+- [ ] Slice 3 — live print on the pop-out loupe
+- [ ] Slice 4 — proof sheet (auto-tone + spread + adopt)
+- [ ] Slice 5 — duel refinement (+ keep-both forking)
+- [ ] Slice 6 — rail extraction from EditorView (no behaviour change)
+- [ ] Slice 7 — version shelf & save parity
+- [ ] Slice 8 — the swap: Darkroom becomes Develop
 
 ## Notes for a fresh session
 - Branch: `feature/darkroom` (cut from `feature/keeper-stats` at d935381 — the loupe-card

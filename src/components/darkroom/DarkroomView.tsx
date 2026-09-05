@@ -14,6 +14,8 @@ import {
   createVersion,
   editZoneMasses,
   getSetting,
+  listVersions,
+  PhotoVersion,
   renderEdit,
   setSetting,
   setVersionEdit,
@@ -64,20 +66,45 @@ export function DarkroomView({
   photoId,
   photoW,
   photoH,
+  activeVersionId,
   initialEditJson,
+  onPickVersion,
+  onChanged,
   onBack,
 }: {
   photoId: number;
   /** Original (sensor) pixel dimensions, for the crop-size readout and aspect math. */
   photoW: number | null;
   photoH: number | null;
+  activeVersionId: number | null;
   /** The active version's record — the working state starts from it (null = as shot). */
   initialEditJson: string | null;
+  /** Keep the shell's active version in step with the shelf and saves. */
+  onPickVersion: (v: PhotoVersion | null) => void;
+  onChanged: () => void;
   onBack: () => void;
 }) {
   const [working, setWorking] = useState<VersionEdit>(() =>
     parseEdit(initialEditJson ?? undefined),
   );
+  // The Darkroom is a sandbox (user decision, slice 7): it never auto-saves over the
+  // version it started from. `savedJson` is the last state banked to (or loaded from) a
+  // version — the unsaved marker and the loupe hand-back both compare against it.
+  const [versions, setVersions] = useState<PhotoVersion[]>([]);
+  const [baseVersionId, setBaseVersionId] = useState<number | null>(activeVersionId);
+  const [savedJson, setSavedJson] = useState<string>(() =>
+    JSON.stringify(parseEdit(initialEditJson ?? undefined)),
+  );
+  const savedJsonRef = useRef(savedJson);
+  savedJsonRef.current = savedJson;
+  // The proof label last adopted — the default name a save gets ("Portra", "Auto"…).
+  const adoptedLabelRef = useRef<string | null>(null);
+
+  useEffect(() => {
+    listVersions(photoId)
+      .then(setVersions)
+      .catch(() => setVersions([]));
+  }, [photoId]);
   const [backdrop, setBackdrop] = useState("");
   const [masses, setMasses] = useState<number[]>([]);
   const [rendering, setRendering] = useState(false);
@@ -223,12 +250,13 @@ export function DarkroomView({
     };
   }, [photoId]);
 
-  // Leaving the Darkroom hands the loupe back to the version the shell knows about.
+  // Leaving the Darkroom hands the loupe back to the last SAVED state — what the shell
+  // shows. (A ref, so this runs only on true unmount, not when a save updates props.)
   useEffect(
     () => () => {
-      if (printOnLoupeRef.current) broadcastPhoto(photoId, initialEditJson);
+      if (printOnLoupeRef.current) broadcastPhoto(photoId, loupeJson(savedJsonRef.current));
     },
-    [photoId, initialEditJson],
+    [photoId],
   );
 
   // The proof sheet: the auto-tone fragment is fetched once per photo, the preset
@@ -264,11 +292,65 @@ export function DarkroomView({
       const name = `What-if — ${DUEL_LABELS[dim].toLowerCase()}`;
       const id = await createVersion(photoId, name);
       await setVersionEdit(id, JSON.stringify(record));
+      setVersions(await listVersions(photoId));
+      onChanged();
       return name;
     } catch {
       return null;
     }
   };
+
+  // ── Saving: settings only, always to a NEW version ──
+  const dirty = JSON.stringify(working) !== savedJson;
+  const saveAsVersion = async () => {
+    const json = JSON.stringify(workingRef.current);
+    try {
+      const name = adoptedLabelRef.current ?? `Darkroom ${versions.length + 1}`;
+      const id = await createVersion(photoId, name);
+      await setVersionEdit(id, json);
+      const next = await listVersions(photoId);
+      setVersions(next);
+      setSavedJson(json);
+      setBaseVersionId(id);
+      adoptedLabelRef.current = null;
+      onChanged();
+      const created = next.find((v) => v.id === id);
+      if (created) onPickVersion(created);
+    } catch (e) {
+      setError(String(e));
+    }
+  };
+
+  // Shelf: load a version's settings into the working state (the shell follows).
+  const loadVersion = (v: PhotoVersion) => {
+    const record = parseEdit(v.editJson);
+    setWorking(record);
+    setSavedJson(JSON.stringify(record));
+    setBaseVersionId(v.id);
+    adoptedLabelRef.current = null;
+    onPickVersion(v);
+  };
+  const loadAsShot = () => {
+    setWorking({});
+    setSavedJson("{}");
+    setBaseVersionId(null);
+    adoptedLabelRef.current = null;
+    onPickVersion(null);
+  };
+
+  // Ctrl+S banks the settings as a new version.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "s") {
+        e.preventDefault();
+        if (JSON.stringify(workingRef.current) !== savedJsonRef.current) void saveAsVersion();
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+    // saveAsVersion reads refs; versions.length only names the default.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [photoId, versions.length]);
 
   const togglePrintOnLoupe = () => {
     const next = !printOnLoupe;
@@ -329,6 +411,27 @@ export function DarkroomView({
           ← Library
         </button>
         <span className="dk-title">Darkroom</span>
+        <span className="dk-shelf">
+          <button
+            className={`chip ${baseVersionId == null && !dirty ? "chip-on" : ""}`}
+            onClick={loadAsShot}
+            title="Start over from the unedited original"
+          >
+            As shot
+          </button>
+          {versions.map((v) => (
+            <button
+              key={v.id}
+              className={`chip ${baseVersionId === v.id ? "chip-on" : ""}`}
+              onClick={() => loadVersion(v)}
+              title={`Load "${v.name}" into the darkroom`}
+            >
+              {v.name}
+              {baseVersionId === v.id && dirty && <i className="dk-dirty" title="Unsaved changes" />}
+            </button>
+          ))}
+        </span>
+        <span className="dk-hint">{rendering ? "rendering…" : ""}</span>
         <button
           className={`dk-loupe-toggle ${printOnLoupe ? "on" : ""}`}
           onClick={togglePrintOnLoupe}
@@ -340,10 +443,14 @@ export function DarkroomView({
         >
           🖥 Loupe print
         </button>
-        <span className="dk-hint">
-          early preview — choose with proofs and duels, steer with the strip and rail
-          {rendering ? " · rendering…" : ""}
-        </span>
+        <button
+          className="dk-save"
+          onClick={() => void saveAsVersion()}
+          disabled={!dirty}
+          title="Bank these settings as a NEW version (Ctrl+S) — the version you started from is never overwritten, and only settings are stored, never pixels"
+        >
+          ✓ Save as version
+        </button>
       </header>
       {error && <div className="dk-error">{error}</div>}
       <div className="dk-body">
@@ -430,6 +537,10 @@ export function DarkroomView({
           candidates={proofs}
           onAdopt={(record) => {
             setWorking(record);
+            // Remember what was adopted — it becomes the default save name.
+            const picked = proofs.find((c) => c.record === record);
+            adoptedLabelRef.current =
+              picked && picked.group !== "asShot" ? picked.label : adoptedLabelRef.current;
             setProofs(null);
           }}
           onClose={() => setProofs(null)}

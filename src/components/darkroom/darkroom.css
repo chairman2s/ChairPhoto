@@ -30,6 +30,36 @@
 .dk-title {
   font-weight: 600;
 }
+.dk-shelf {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  min-width: 0;
+}
+.dk-dirty {
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  border-radius: 999px;
+  background: var(--accent);
+  margin-left: 6px;
+  vertical-align: middle;
+}
+.dk-save {
+  padding: 5px 14px;
+  border-radius: 999px;
+  border: 1px solid var(--accent);
+  background: var(--accent);
+  color: var(--onaccent, #fff);
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 600;
+}
+.dk-save:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
 .dk-loupe-toggle {
   padding: 5px 12px;
   border-radius: 999px;
@@ -48,6 +78,7 @@
   color: var(--dim);
   font-size: 12px;
   margin-left: auto;
+  white-space: nowrap;
 }
 .dk-error {
   margin: 10px 16px 0;

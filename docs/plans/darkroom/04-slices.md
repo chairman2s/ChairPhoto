@@ -18,6 +18,10 @@ Develop surface.
 5. **Duel** — `duelPair` + `DuelView` + round strip + keep-both forks a version.
 6. **Rail extraction** — EditorView's slider rail + crop stage extracted and embedded
    (no behaviour change to the old view); Darkroom reaches full slider/geometry parity.
-7. **Version shelf & save** — shelf chips + fork + auto-save parity with today's Develop.
+7. **Version shelf & save** — re-steered by the user after testing slice 6: the Darkroom
+   is a sandbox that NEVER auto-saves over the version it started from. A Save action
+   banks the working settings (the edit record only — never pixels) as a **new version**;
+   the shelf lists versions with an unsaved marker, loads one on click, and stays in
+   sync with the shell's active version.
 8. **The swap** — Darkroom becomes the Develop surface, toggle removed, EditorView shell
    retired, `docs/editing.md` + module description updated, full suites green.

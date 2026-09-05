@@ -37,7 +37,10 @@ export function DevelopSurface(props: {
         photoId={props.photoId}
         photoW={props.photoW}
         photoH={props.photoH}
+        activeVersionId={props.activeVersionId}
         initialEditJson={props.activeEditJson}
+        onPickVersion={props.onPickVersion}
+        onChanged={props.onChanged}
         onBack={props.onBack}
       />
     );

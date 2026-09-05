@@ -78,7 +78,9 @@ export interface ProofCandidate { label: string; group: "auto" | "film" | "bw" |
  *  base geometry (crop/straighten/perspective are copied through untouched). */
 export function proofSpread(base: EditRecord, auto: Partial<EditRecord>, presets: DevelopPreset[]): ProofCandidate[];
 
-export type DuelDim = "ev" | "warmth" | "contrast" | "shadows" | "look";
+export type DuelDim = "ev" | "warmth" | "contrast" | "shadows";
+// Narrowed at slice 5: a "look" round isn't symmetric-around-working in one dimension —
+// it needs preset semantics. Deferred with the learned auto-tone (00-status.md).
 /** A/B variants symmetric around `working` for the round's dimension; step size
  *  decays with `round` (coordinate descent by eye). Only that dimension differs. */
 export function duelPair(working: EditRecord, dim: DuelDim, round: number): [EditRecord, EditRecord];

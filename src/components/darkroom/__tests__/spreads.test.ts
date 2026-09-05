@@ -2,7 +2,7 @@
 import { describe, expect, it } from "vitest";
 import type { DevelopPreset } from "../../../modules/presets";
 import type { VersionEdit } from "../../../modules/editing";
-import { PROOF_CELLS, proofSpread } from "../spreads";
+import { DUEL_DIMS, duelPair, PROOF_CELLS, proofSpread } from "../spreads";
 
 const preset = (id: string, category: DevelopPreset["category"], edit: DevelopPreset["edit"]): DevelopPreset => ({
   id,
@@ -83,6 +83,46 @@ describe("proofSpread", () => {
     expect(warm.record.tone?.wb?.temp).toBeCloseTo(0.35);
     expect(cool.record.tone?.wb?.temp).toBeCloseTo(-0.35);
     expect(warm.record.tone?.ev).toBe(cool.record.tone?.ev);
+  });
+
+  it("duelPair differs only in its dimension, symmetrically", () => {
+    const working: VersionEdit = {
+      crop: { x: 0, y: 0, w: 1, h: 1 },
+      zones: [0, 0.3, 0, 0, 0, 0, 0, 0],
+      tone: { ev: 0.5, contrast: 0.1, wb: { temp: 0.1, tint: -0.05 } } as VersionEdit["tone"],
+    };
+    for (const dim of DUEL_DIMS) {
+      const [a, b] = duelPair(working, dim, 0);
+      // Framing, zones, and look travel through untouched on both sides.
+      expect(a.crop).toEqual(working.crop);
+      expect(b.zones).toEqual(working.zones);
+      // Exactly the duelled field differs between A and B.
+      const diffKeys = (["ev", "contrast", "shadows"] as const).filter(
+        (k) => a.tone?.[k] !== b.tone?.[k],
+      );
+      const tempDiffers = a.tone?.wb?.temp !== b.tone?.wb?.temp;
+      if (dim === "warmth") {
+        expect(diffKeys).toHaveLength(0);
+        expect(tempDiffers).toBe(true);
+        expect(a.tone?.wb?.tint).toBe(-0.05); // tint rides along unchanged
+      } else {
+        expect(diffKeys).toEqual([dim]);
+        expect(tempDiffers).toBe(false);
+      }
+    }
+    // Symmetry around the working value.
+    const [a, b] = duelPair(working, "ev", 0);
+    expect((a.tone!.ev + b.tone!.ev) / 2).toBeCloseTo(0.5);
+  });
+
+  it("duelPair's step decays with each revisit", () => {
+    const working: VersionEdit = {};
+    const spreadAt = (visit: number) => {
+      const [a, b] = duelPair(working, "ev", visit);
+      return Math.abs(b.tone!.ev - a.tone!.ev);
+    };
+    expect(spreadAt(1)).toBeCloseTo(spreadAt(0) / 2);
+    expect(spreadAt(3)).toBeCloseTo(spreadAt(0) / 8);
   });
 
   it("spreads looks across categories round-robin", () => {

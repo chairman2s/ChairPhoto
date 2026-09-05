@@ -4,17 +4,20 @@
 // in the engine — see src-tauri plugins/edit/zones.rs).
 import { useEffect, useRef, useState } from "react";
 import {
+  createVersion,
   editZoneMasses,
   getSetting,
   renderEdit,
   setSetting,
+  setVersionEdit,
   suggestAutoTone,
 } from "../../modules/api";
 import { parseEdit, type VersionEdit } from "../../modules/editing";
 import { broadcastPhoto, onLoupeReady, openLoupeWindow } from "../../modules/loupe";
 import { allPresets, BUILTIN_PRESETS, type DevelopPreset } from "../../modules/presets";
+import { DuelView } from "./DuelView";
 import { ProofSheet } from "./ProofSheet";
-import { proofSpread, type ProofCandidate } from "./spreads";
+import { DUEL_LABELS, proofSpread, type DuelDim, type ProofCandidate } from "./spreads";
 import { ToneStrip } from "./ToneStrip";
 import "./darkroom.css";
 
@@ -107,6 +110,20 @@ export function DarkroomView({
 
   const dealProofs = () => {
     setProofs(proofSpread(workingRef.current, autoFragment ?? {}, presets));
+  };
+
+  // The duel: picks stream into `working` (stage, strip, and loupe follow live), and
+  // either pane can be banked as a version mid-round.
+  const [duelOpen, setDuelOpen] = useState(false);
+  const forkVersion = async (record: VersionEdit, dim: DuelDim): Promise<string | null> => {
+    try {
+      const name = `What-if — ${DUEL_LABELS[dim].toLowerCase()}`;
+      const id = await createVersion(photoId, name);
+      await setVersionEdit(id, JSON.stringify(record));
+      return name;
+    } catch {
+      return null;
+    }
   };
 
   const togglePrintOnLoupe = () => {
@@ -202,6 +219,13 @@ export function DarkroomView({
         >
           ▦ Deal a proof sheet
         </button>
+        <button
+          className="dk-act"
+          onClick={() => setDuelOpen(true)}
+          title="Refine by choosing: two prints per round, pick the better one"
+        >
+          ⚖ Refine by duel
+        </button>
       </div>
       {proofs && (
         <ProofSheet
@@ -212,6 +236,15 @@ export function DarkroomView({
             setProofs(null);
           }}
           onClose={() => setProofs(null)}
+        />
+      )}
+      {duelOpen && (
+        <DuelView
+          photoId={photoId}
+          working={working}
+          onApply={setWorking}
+          onFork={forkVersion}
+          onClose={() => setDuelOpen(false)}
         />
       )}
     </div>

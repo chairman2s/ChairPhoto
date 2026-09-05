@@ -51,6 +51,70 @@ const pickLooks = (presets: DevelopPreset[], n: number): DevelopPreset[] => {
   return out;
 };
 
+// ── Duels ───────────────────────────────────────────────────────────────────
+// One round explores one dimension: A and B sit symmetrically around the working
+// state, the step halves on every revisit (coordinate descent by eye). v1 duels the
+// four numeric dims; a "look" round needs preset semantics and waits (00-status.md).
+
+export type DuelDim = "ev" | "warmth" | "contrast" | "shadows";
+export const DUEL_DIMS: DuelDim[] = ["ev", "warmth", "contrast", "shadows"];
+export const DUEL_LABELS: Record<DuelDim, string> = {
+  ev: "Exposure",
+  warmth: "Warmth",
+  contrast: "Contrast",
+  shadows: "Shadows",
+};
+/** First-visit step per dimension; halves per revisit. Tunable (Gate 3 §least-confident). */
+const DUEL_BASE_STEP: Record<DuelDim, number> = {
+  ev: 0.4,
+  warmth: 0.2,
+  contrast: 0.2,
+  shadows: 0.25,
+};
+
+const clamp1 = (v: number) => Math.min(1, Math.max(-1, v));
+const withTone = (r: VersionEdit, patch: Partial<Tone>): VersionEdit => ({
+  ...r,
+  tone: { ...(r.tone ?? {}), ...patch } as Tone,
+});
+
+/** A/B variants around `working` for `dim`; `visit` counts prior rounds on this dim. */
+export function duelPair(
+  working: VersionEdit,
+  dim: DuelDim,
+  visit: number,
+): [VersionEdit, VersionEdit] {
+  const step = DUEL_BASE_STEP[dim] * Math.pow(0.5, Math.max(0, visit));
+  const t = working.tone;
+  switch (dim) {
+    case "ev": {
+      const ev = t?.ev ?? 0;
+      return [withTone(working, { ev: ev - step }), withTone(working, { ev: ev + step })];
+    }
+    case "warmth": {
+      const wb = t?.wb ?? { temp: 0, tint: 0 };
+      return [
+        withTone(working, { wb: { temp: clamp1(wb.temp - step), tint: wb.tint } }),
+        withTone(working, { wb: { temp: clamp1(wb.temp + step), tint: wb.tint } }),
+      ];
+    }
+    case "contrast": {
+      const c = t?.contrast ?? 0;
+      return [
+        withTone(working, { contrast: clamp1(c - step) }),
+        withTone(working, { contrast: clamp1(c + step) }),
+      ];
+    }
+    case "shadows": {
+      const s = t?.shadows ?? 0;
+      return [
+        withTone(working, { shadows: clamp1(s - step) }),
+        withTone(working, { shadows: clamp1(s + step) }),
+      ];
+    }
+  }
+}
+
 /**
  * The spread: the current state (always first — declining is a click), three Auto
  * cells (fix, warm, cool), and looks over the preset library until the sheet is full.

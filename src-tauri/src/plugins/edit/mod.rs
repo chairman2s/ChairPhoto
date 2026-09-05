@@ -6,10 +6,12 @@
 //! (export). See docs/editing.md. The edit record shape is owned here but stays opaque
 //! to the catalog core.
 
+mod auto;
 pub mod cube;
 mod look;
 mod zones;
 
+pub use auto::auto_tone_for;
 pub use zones::zone_masses;
 
 use image::codecs::jpeg::JpegEncoder;

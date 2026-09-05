@@ -9,7 +9,7 @@
 - [x] Slice 1 — tracer bullet: zones field end-to-end + bare DarkroomView behind `editor.darkroom` toggle (2026-09-05)
 - [x] Slice 2 — zone curve + masses for real (engine + command + tests) (2026-09-05)
 - [x] Slice 3 — live print on the pop-out loupe (2026-09-05; on-screen check pending — needs the second monitor)
-- [ ] Slice 4 — proof sheet (auto-tone + spread + adopt)
+- [x] Slice 4 — proof sheet (auto-tone + spread + adopt) (2026-09-05)
 - [ ] Slice 5 — duel refinement (+ keep-both forking)
 - [ ] Slice 6 — rail extraction from EditorView (no behaviour change)
 - [ ] Slice 7 — version shelf & save parity

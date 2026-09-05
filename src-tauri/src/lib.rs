@@ -407,6 +407,7 @@ pub fn run() {
             commands::render_edit,
             commands::render_edit_batch,
             commands::edit_zone_masses,
+            commands::suggest_auto_tone,
             commands::list_luts,
             commands::import_lut,
             commands::delete_lut,

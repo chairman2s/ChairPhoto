@@ -3,9 +3,18 @@
 // dragging a zone sculpts that tonal band on the print (a feathered per-luma gain curve
 // in the engine — see src-tauri plugins/edit/zones.rs).
 import { useEffect, useRef, useState } from "react";
-import { editZoneMasses, getSetting, renderEdit, setSetting } from "../../modules/api";
+import {
+  editZoneMasses,
+  getSetting,
+  renderEdit,
+  setSetting,
+  suggestAutoTone,
+} from "../../modules/api";
 import { parseEdit, type VersionEdit } from "../../modules/editing";
 import { broadcastPhoto, onLoupeReady, openLoupeWindow } from "../../modules/loupe";
+import { allPresets, BUILTIN_PRESETS, type DevelopPreset } from "../../modules/presets";
+import { ProofSheet } from "./ProofSheet";
+import { proofSpread, type ProofCandidate } from "./spreads";
 import { ToneStrip } from "./ToneStrip";
 import "./darkroom.css";
 
@@ -74,6 +83,31 @@ export function DarkroomView({
     },
     [photoId, initialEditJson],
   );
+
+  // The proof sheet: the auto-tone fragment is fetched once per photo, the preset
+  // library once per mount; the spread itself is pure maths at deal time.
+  const [proofs, setProofs] = useState<ProofCandidate[] | null>(null);
+  const [autoFragment, setAutoFragment] = useState<VersionEdit | null>(null);
+  const [presets, setPresets] = useState<DevelopPreset[]>(BUILTIN_PRESETS);
+  useEffect(() => {
+    allPresets()
+      .then(setPresets)
+      .catch(() => setPresets(BUILTIN_PRESETS));
+  }, []);
+  useEffect(() => {
+    let alive = true;
+    setAutoFragment(null);
+    suggestAutoTone(photoId)
+      .then((j) => alive && setAutoFragment(parseEdit(j)))
+      .catch(() => alive && setAutoFragment({}));
+    return () => {
+      alive = false;
+    };
+  }, [photoId]);
+
+  const dealProofs = () => {
+    setProofs(proofSpread(workingRef.current, autoFragment ?? {}, presets));
+  };
 
   const togglePrintOnLoupe = () => {
     const next = !printOnLoupe;
@@ -159,6 +193,27 @@ export function DarkroomView({
           onZones={(zones) => setWorking((w) => ({ ...w, zones }))}
         />
       </div>
+      <div className="dk-actions">
+        <button
+          className="dk-act dk-act-primary"
+          onClick={dealProofs}
+          disabled={autoFragment === null}
+          title="Your photo developed a dozen ways — pick the one that's closest"
+        >
+          ▦ Deal a proof sheet
+        </button>
+      </div>
+      {proofs && (
+        <ProofSheet
+          photoId={photoId}
+          candidates={proofs}
+          onAdopt={(record) => {
+            setWorking(record);
+            setProofs(null);
+          }}
+          onClose={() => setProofs(null)}
+        />
+      )}
     </div>
   );
 }

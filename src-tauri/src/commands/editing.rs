@@ -188,6 +188,51 @@ pub async fn edit_zone_masses(
     }
 }
 
+/// Classical auto-tone suggestion for the Darkroom's proof sheet: a percentile analysis
+/// of the proxy's luma histogram → an edit-json *fragment* with only
+/// `tone.ev/contrast/highlights/shadows` (docs/plans/darkroom). A learned model can
+/// replace the internals later without this surface changing.
+#[tauri::command]
+pub async fn suggest_auto_tone(app: AppHandle, photo_id: i64) -> Result<String, String> {
+    #[cfg(not(feature = "edit"))]
+    {
+        let _ = (&app, photo_id);
+        Err("Editing backend not included in this build".into())
+    }
+    #[cfg(feature = "edit")]
+    {
+        let state = app.state::<AppState>();
+        let candidates = {
+            let guard = state.catalog.lock().map_err(|e| e.to_string())?;
+            let catalog = guard.as_ref().ok_or("No catalog is open")?;
+            catalog.photo_path_candidates(photo_id).map_err(|e| e.to_string())?
+        };
+        let health = state.volume_health.clone();
+        tauri::async_runtime::spawn_blocking(move || {
+            let path = crate::volume_health::pick_existing(
+                &candidates,
+                &health,
+                crate::catalog::ResolveMode::OriginalRequired,
+            )
+            .ok_or_else(|| format!("no reachable copy of photo {photo_id}"))?;
+            let jpeg = crate::thumbnails::preview_bytes(&path)?;
+            let img = image::load_from_memory(&jpeg).map_err(|e| e.to_string())?;
+            let a = crate::plugins::edit::auto_tone_for(&img.to_rgb8());
+            Ok(serde_json::json!({
+                "tone": {
+                    "ev": a.ev,
+                    "contrast": a.contrast,
+                    "highlights": a.highlights,
+                    "shadows": a.shadows,
+                }
+            })
+            .to_string())
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+}
+
 // --- LUTs (user-supplied .cube files for the editor, see docs/editing.md) --
 
 /// List the `.cube` LUT filenames available in the app's luts folder.

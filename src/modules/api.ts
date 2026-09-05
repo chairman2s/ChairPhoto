@@ -674,6 +674,11 @@ export const renderEditBatch = (photoId: number, editJsons: string[], maxEdge = 
 export const editZoneMasses = (photoId: number, editJson: string) =>
   invoke<number[]>("edit_zone_masses", { photoId, editJson });
 
+/** Classical auto-tone starting fragment for the Darkroom's proof sheet — an edit-json
+ *  string carrying only tone.ev/contrast/highlights/shadows. `edit` feature only. */
+export const suggestAutoTone = (photoId: number) =>
+  invoke<string>("suggest_auto_tone", { photoId });
+
 // --- LUTs (user-supplied .cube files, referenced by edit records by filename) ---
 
 /** Filenames of the .cube LUTs available in the app's luts folder. */

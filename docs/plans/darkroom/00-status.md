@@ -11,7 +11,7 @@
 - [x] Slice 3 — live print on the pop-out loupe (2026-09-05; on-screen check pending — needs the second monitor)
 - [x] Slice 4 — proof sheet (auto-tone + spread + adopt) (2026-09-05)
 - [x] Slice 5 — duel refinement (+ per-pane version forking) (2026-09-05; DuelDim narrowed to the four numeric dims — "look" rounds deferred with the learned auto-tone)
-- [ ] Slice 6 — rail extraction from EditorView (no behaviour change)
+- [x] Slice 6 — rail extraction from EditorView (no behaviour change) (2026-09-05; extracted into src/components/EditControls.tsx — EditStage/ToneRail/EffectsRail/GeometryRail; hands-on parity check of the classic Develop pending)
 - [ ] Slice 7 — version shelf & save parity
 - [ ] Slice 8 — the swap: Darkroom becomes Develop
 

@@ -35,6 +35,8 @@ export function DevelopSurface(props: {
     return (
       <DarkroomView
         photoId={props.photoId}
+        photoW={props.photoW}
+        photoH={props.photoH}
         initialEditJson={props.activeEditJson}
         onBack={props.onBack}
       />

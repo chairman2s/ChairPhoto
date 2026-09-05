@@ -57,23 +57,41 @@
   color: var(--danger);
   font-size: 12px;
 }
+/* Body: the stage column (print, strip, actions) beside the classic rail. */
+.dk-body {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+}
+.dk-center {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+.dk-rail {
+  width: 300px;
+  flex: 0 0 300px;
+  border-left: 1px solid var(--border);
+  background: var(--panel);
+  padding: 12px;
+  overflow-y: auto;
+}
 .dk-stage {
   flex: 1;
   min-height: 0;
   display: flex;
-  align-items: center;
-  justify-content: center;
-  padding: 16px;
+  padding: 12px 16px 0;
 }
-.dk-print {
-  max-width: 100%;
-  max-height: 100%;
-  object-fit: contain;
-  border-radius: 6px;
-  box-shadow: 0 18px 60px rgba(0, 0, 0, 0.5);
+.dk-stage .editor-stage {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
 }
 .dk-empty {
   color: var(--dim);
+  margin: auto;
 }
 
 /* ── Tone strip ─────────────────────────────────────────────────── */

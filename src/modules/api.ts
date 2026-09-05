@@ -669,6 +669,11 @@ export const renderEdit = (photoId: number, editJson: string, maxEdge = 0, hiRes
 export const renderEditBatch = (photoId: number, editJsons: string[], maxEdge = 320) =>
   invoke<(string | null)[]>("render_edit_batch", { photoId, editJsons, maxEdge });
 
+/** Share of pixels per Darkroom tone-strip zone (8 gamma-luma bands, blacks→whites) of
+ *  the photo's rendered working state — the strip's fill heights. `edit` feature only. */
+export const editZoneMasses = (photoId: number, editJson: string) =>
+  invoke<number[]>("edit_zone_masses", { photoId, editJson });
+
 // --- LUTs (user-supplied .cube files, referenced by edit records by filename) ---
 
 /** Filenames of the .cube LUTs available in the app's luts folder. */

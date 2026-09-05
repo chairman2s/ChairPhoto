@@ -406,6 +406,7 @@ pub fn run() {
             commands::set_edit_record,
             commands::render_edit,
             commands::render_edit_batch,
+            commands::edit_zone_masses,
             commands::list_luts,
             commands::import_lut,
             commands::delete_lut,

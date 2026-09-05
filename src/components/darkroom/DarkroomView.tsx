@@ -1,17 +1,14 @@
-// The Darkroom (docs/plans/darkroom): develop-by-choosing. Slice 1 — the tracer bullet:
-// the print renders the working record live, and dragging the tone strip writes real
-// `zones` into that record. The engine's zone curve is still the identity, so what this
-// slice proves is the wire: strip → record → render → print, on a real photo.
+// The Darkroom (docs/plans/darkroom): develop-by-choosing. As of slice 2 the tone strip
+// is live end-to-end: fills show the rendered working state's real zone masses, and
+// dragging a zone sculpts that tonal band on the print (a feathered per-luma gain curve
+// in the engine — see src-tauri plugins/edit/zones.rs).
 import { useEffect, useRef, useState } from "react";
-import { renderEdit } from "../../modules/api";
+import { editZoneMasses, renderEdit } from "../../modules/api";
 import { parseEdit, type VersionEdit } from "../../modules/editing";
 import { ToneStrip } from "./ToneStrip";
 import "./darkroom.css";
 
 const PREVIEW_MAX = 1400;
-// Slice 1: a plausible placeholder mountain — real masses arrive with the
-// `edit_zone_masses` command in slice 2.
-const PLACEHOLDER_MASSES = [0.04, 0.11, 0.2, 0.24, 0.19, 0.12, 0.07, 0.03];
 
 export function DarkroomView({
   photoId,
@@ -27,17 +24,19 @@ export function DarkroomView({
     parseEdit(initialEditJson ?? undefined),
   );
   const [backdrop, setBackdrop] = useState("");
+  const [masses, setMasses] = useState<number[]>([]);
   const [rendering, setRendering] = useState(false);
   const [error, setError] = useState("");
   const renderSeq = useRef(0);
 
-  // Debounced live render of the working record — the print. A stale response never
-  // paints over a newer one (sequence check).
+  // Debounced live render of the working record — the print — plus the strip's zone
+  // masses of that same state. A stale response never paints over a newer one.
   useEffect(() => {
     const seq = ++renderSeq.current;
     setRendering(true);
     const t = setTimeout(() => {
-      renderEdit(photoId, JSON.stringify(working), PREVIEW_MAX)
+      const json = JSON.stringify(working);
+      renderEdit(photoId, json, PREVIEW_MAX)
         .then((url) => {
           if (renderSeq.current !== seq) return;
           setBackdrop(url);
@@ -48,6 +47,13 @@ export function DarkroomView({
         })
         .finally(() => {
           if (renderSeq.current === seq) setRendering(false);
+        });
+      editZoneMasses(photoId, json)
+        .then((m) => {
+          if (renderSeq.current === seq) setMasses(m);
+        })
+        .catch(() => {
+          // Masses are a cosmetic overlay on the strip — a failure leaves the last fill.
         });
     }, 250);
     return () => clearTimeout(t);
@@ -61,7 +67,7 @@ export function DarkroomView({
         </button>
         <span className="dk-title">Darkroom</span>
         <span className="dk-hint">
-          early preview · slice 1 — the strip writes real zone records
+          early preview — drag the strip to sculpt; proof sheets and duels are coming
           {rendering ? " · rendering…" : ""}
         </span>
       </header>
@@ -75,7 +81,7 @@ export function DarkroomView({
       </div>
       <div className="dk-strip-row">
         <ToneStrip
-          masses={PLACEHOLDER_MASSES}
+          masses={masses}
           zones={working.zones}
           onZones={(zones) => setWorking((w) => ({ ...w, zones }))}
         />

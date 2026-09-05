@@ -921,6 +921,13 @@ mod tone_match_tests {
     }
 
     #[test]
+    fn zones_record_matches_across_paths() {
+        // The Darkroom's tone-strip curve must agree between preview and export like
+        // every other tone stage (docs/plans/darkroom, slice 2).
+        assert_paths_match(r#"{"zones":[0.6,0.4,0.2,0.0,-0.2,-0.4,-0.2,0.0]}"#, 2.0);
+    }
+
+    #[test]
     fn geometry_is_identical_across_paths() {
         // Beyond tone, the two paths must agree on output dimensions for a locked-aspect
         // crop (a per-pixel diff is only meaningful if geometry lines up).

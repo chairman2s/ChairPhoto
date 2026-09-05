@@ -10,6 +10,8 @@ pub mod cube;
 mod look;
 mod zones;
 
+pub use zones::zone_masses;
+
 use image::codecs::jpeg::JpegEncoder;
 use image::{DynamicImage, GenericImageView, Rgb, RgbImage};
 use look::{Bw, Grain, Split};

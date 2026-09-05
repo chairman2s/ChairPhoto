@@ -144,6 +144,50 @@ pub async fn render_edit_batch(
     }
 }
 
+/// Share of pixels per Darkroom tone-strip zone — 8 equal gamma-luma bands of the
+/// photo's **rendered working state**, so the strip always describes the print it sits
+/// under (docs/plans/darkroom). Same lock-then-worker shape as `render_edit`.
+#[tauri::command]
+pub async fn edit_zone_masses(
+    app: AppHandle,
+    photo_id: i64,
+    edit_json: String,
+) -> Result<[f32; 8], String> {
+    #[cfg(not(feature = "edit"))]
+    {
+        let _ = (&app, photo_id, &edit_json);
+        Err("Editing backend not included in this build".into())
+    }
+    #[cfg(feature = "edit")]
+    {
+        let state = app.state::<AppState>();
+        let candidates = {
+            let guard = state.catalog.lock().map_err(|e| e.to_string())?;
+            let catalog = guard.as_ref().ok_or("No catalog is open")?;
+            catalog.photo_path_candidates(photo_id).map_err(|e| e.to_string())?
+        };
+        let health = state.volume_health.clone();
+        tauri::async_runtime::spawn_blocking(move || {
+            // OriginalRequired: the masses describe an edit render of the real original,
+            // so a cached-unreachable flag must never stand in for a stat.
+            let path = crate::volume_health::pick_existing(
+                &candidates,
+                &health,
+                crate::catalog::ResolveMode::OriginalRequired,
+            )
+            .ok_or_else(|| format!("no reachable copy of photo {photo_id}"))?;
+            let jpeg = crate::thumbnails::preview_bytes(&path)?;
+            let img = image::load_from_memory(&jpeg).map_err(|e| e.to_string())?;
+            // 1024px is plenty of resolution for an 8-bin histogram, and keeps the
+            // render far cheaper than the preview tier's.
+            let out = crate::plugins::edit::render_image(img, &edit_json, 1024)?;
+            Ok(crate::plugins::edit::zone_masses(&out.to_rgb8()))
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+}
+
 // --- LUTs (user-supplied .cube files for the editor, see docs/editing.md) --
 
 /// List the `.cube` LUT filenames available in the app's luts folder.

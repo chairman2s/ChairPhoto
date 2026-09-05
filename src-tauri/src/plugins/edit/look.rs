@@ -77,8 +77,7 @@ pub(super) fn apply_look(img: &mut RgbImage, edit: &EditRecord, lut: Option<&Cub
     let grain = edit.grain.as_ref().filter(|g| g.amount > 0.0);
     let fade = edit.fade.clamp(0.0, 1.0);
     let vignette = edit.vignette.clamp(-1.0, 1.0);
-    // Tone-strip zone curve (docs/plans/darkroom): a per-luma gain LUT. Identity while
-    // slice 1 stands — see zones.rs.
+    // Tone-strip zone curve (docs/plans/darkroom): a per-luma gain LUT — see zones.rs.
     let zone_lut = edit.zones.as_ref().map(super::zones::zone_gain_lut);
 
     let tone_active = t.ev != 0.0

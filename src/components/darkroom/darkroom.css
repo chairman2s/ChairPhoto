@@ -1,0 +1,121 @@
+/* Darkroom (docs/plans/darkroom) — slice 1 surface. All classes prefixed .dk-. */
+.dk-root {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+  background: var(--well);
+}
+.dk-bar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border);
+  background: var(--panel);
+}
+.dk-back {
+  padding: 5px 12px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--txt);
+  cursor: pointer;
+  font-size: 12px;
+}
+.dk-back:hover {
+  background: var(--panel);
+}
+.dk-title {
+  font-weight: 600;
+}
+.dk-hint {
+  color: var(--dim);
+  font-size: 12px;
+  margin-left: auto;
+}
+.dk-error {
+  margin: 10px 16px 0;
+  padding: 8px 12px;
+  border: 1px solid var(--danger);
+  border-radius: 6px;
+  color: var(--danger);
+  font-size: 12px;
+}
+.dk-stage {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 16px;
+}
+.dk-print {
+  max-width: 100%;
+  max-height: 100%;
+  object-fit: contain;
+  border-radius: 6px;
+  box-shadow: 0 18px 60px rgba(0, 0, 0, 0.5);
+}
+.dk-empty {
+  color: var(--dim);
+}
+
+/* ── Tone strip ─────────────────────────────────────────────────── */
+.dk-strip-row {
+  padding: 0 16px 14px;
+  display: flex;
+  justify-content: center;
+}
+.dk-strip-wrap {
+  width: min(100%, 760px);
+}
+.dk-strip {
+  display: flex;
+  height: 64px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow: hidden;
+  background: var(--panel);
+}
+.dk-zone {
+  flex: 1;
+  position: relative;
+  cursor: ns-resize;
+  border-right: 1px solid rgba(255, 255, 255, 0.05);
+}
+.dk-zone:last-child {
+  border-right: 0;
+}
+.dk-zone:hover {
+  outline: 1px solid var(--accent);
+  outline-offset: -1px;
+}
+.dk-zone-mass {
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  display: block;
+}
+.dk-zone-delta {
+  position: absolute;
+  top: 3px;
+  left: 0;
+  right: 0;
+  text-align: center;
+  font-size: 11px;
+  color: var(--accent);
+  font-variant-numeric: tabular-nums;
+  z-index: 1;
+}
+.dk-strip-labels {
+  display: flex;
+  margin-top: 4px;
+  color: var(--dim);
+  font-size: 10px;
+}
+.dk-strip-labels span {
+  flex: 1;
+  text-align: center;
+}

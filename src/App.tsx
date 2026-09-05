@@ -109,7 +109,7 @@ import { StackProposalsDialog } from "./components/StackProposalsDialog";
 import { CullSession } from "./components/CullSession";
 import { TrashDialog } from "./components/TrashDialog";
 import { CatalogSwitcher } from "./components/CatalogSwitcher";
-import { EditorView } from "./components/EditorView";
+import { DevelopSurface } from "./components/darkroom/DevelopSurface";
 import { parseEdit } from "./modules/editing";
 import { ImportBatch, listImportBatches, listRecentCatalogs } from "./modules/api";
 import {
@@ -1759,11 +1759,12 @@ export default function App() {
           )}
           <div className="stage">
             {inDevelop && selected ? (
-              <EditorView
+              <DevelopSurface
                 photoId={selected.id}
                 photoW={selected.width}
                 photoH={selected.height}
                 activeVersionId={activeVersion?.id ?? null}
+                activeEditJson={activeVersion?.editJson ?? null}
                 onPickVersion={setActiveVersion}
                 onSavedActive={(editJson) =>
                   setActiveVersion((cur) => (cur ? { ...cur, editJson } : cur))

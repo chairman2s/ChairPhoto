@@ -77,6 +77,9 @@ pub(super) fn apply_look(img: &mut RgbImage, edit: &EditRecord, lut: Option<&Cub
     let grain = edit.grain.as_ref().filter(|g| g.amount > 0.0);
     let fade = edit.fade.clamp(0.0, 1.0);
     let vignette = edit.vignette.clamp(-1.0, 1.0);
+    // Tone-strip zone curve (docs/plans/darkroom): a per-luma gain LUT. Identity while
+    // slice 1 stands — see zones.rs.
+    let zone_lut = edit.zones.as_ref().map(super::zones::zone_gain_lut);
 
     let tone_active = t.ev != 0.0
         || t.contrast != 0.0
@@ -93,6 +96,7 @@ pub(super) fn apply_look(img: &mut RgbImage, edit: &EditRecord, lut: Option<&Cub
         && split.is_none()
         && grain.is_none()
         && lut.is_none()
+        && zone_lut.is_none()
         && fade == 0.0
         && vignette == 0.0
     {
@@ -147,6 +151,15 @@ pub(super) fn apply_look(img: &mut RgbImage, edit: &EditRecord, lut: Option<&Cub
         c[0] *= exposure * r_gain;
         c[1] *= exposure * g_gain;
         c[2] *= exposure * b_gain;
+        // Tone-strip zone curve: per-luma gain over the exposure/WB result, before the
+        // region sliders — the zones address the photo's own tonal bands.
+        if let Some(zlut) = &zone_lut {
+            let l = (luma601(&c).clamp(0.0, 1.0) * 255.0) as usize;
+            let g = zlut[l.min(255)];
+            c[0] *= g;
+            c[1] *= g;
+            c[2] *= g;
+        }
         // Tone-region adjustments use luminance as a soft mask.
         for v in c.iter_mut() {
             let mut x = v.clamp(0.0, 4.0);

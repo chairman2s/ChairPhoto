@@ -113,6 +113,8 @@ export interface VersionEdit {
   /** Corner shading, -1..1 (negative darkens). */
   vignette?: number;
   lut?: LutRef;
+  /** Darkroom tone-strip zone offsets in EV, blacks→whites (8 entries). Absent = none. */
+  zones?: number[];
 }
 
 /** The look-only slice of an edit — everything except framing (crop/straighten). */

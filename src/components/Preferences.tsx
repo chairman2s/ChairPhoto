@@ -138,7 +138,12 @@ export function Preferences({
               </>
             )}
             {active === "tags" && <TagMaintenanceSection onChanged={onLibraryRootChanged} />}
-            {active === "editors" && <EditorsSection />}
+            {active === "editors" && (
+              <>
+                <EditorsSection />
+                <DarkroomSection />
+              </>
+            )}
             {active === "modules" && <ModulesSection />}
             {active === "appearance" && <AppearanceSection />}
             {moduleTabs.some((m) => m.id === active) && <ModuleSettingsTab moduleId={active} />}
@@ -541,6 +546,46 @@ function TieringSection({ onChanged }: { onChanged: () => void }) {
 // still live on an offline volume (unmounted NAS) are never touched.
 // External develop editors (darktable / RawTherapee / ART). Paths are optional — blank uses
 // the auto-detected command on PATH. Availability (GUI/CLI found) is shown per editor.
+/** Darkroom early-preview toggle (docs/plans/darkroom): swaps the Develop surface for
+ *  the in-progress Darkroom. Read when Develop opens (DevelopSurface), so a change
+ *  applies on the next open. Removed at slice 8, when the Darkroom becomes Develop. */
+function DarkroomSection() {
+  const [on, setOn] = useState<boolean | null>(null);
+  useEffect(() => {
+    getSetting("editor.darkroom")
+      .then((v) => setOn(v === "1"))
+      .catch(() => setOn(false));
+  }, []);
+  const toggle = async () => {
+    const next = !(on ?? false);
+    setOn(next);
+    try {
+      await setSetting("editor.darkroom", next ? "1" : "0");
+    } catch {
+      setOn(!next); // write failed — reflect reality
+    }
+  };
+  return (
+    <div className="prefs-section">
+      <h3 style={{ marginTop: 18 }}>Darkroom (early preview)</h3>
+      <div className="modal-sub">
+        Replace the Develop view with the in-progress Darkroom (develop by choosing:
+        proof sheets, duels, and the tone strip). Under construction — expect a bare
+        surface for now. Takes effect the next time Develop opens.
+      </div>
+      <label style={{ display: "flex", gap: 8, alignItems: "center", cursor: "pointer" }}>
+        <input
+          type="checkbox"
+          checked={on ?? false}
+          disabled={on === null}
+          onChange={toggle}
+        />
+        Use the Darkroom as the Develop surface
+      </label>
+    </div>
+  );
+}
+
 function EditorsSection() {
   const [editors, setEditors] = useState<AvailableEditor[]>([]);
   const [paths, setPaths] = useState<Record<string, { gui: string; cli: string }>>({});

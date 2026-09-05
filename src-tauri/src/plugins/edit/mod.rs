@@ -8,6 +8,7 @@
 
 pub mod cube;
 mod look;
+mod zones;
 
 use image::codecs::jpeg::JpegEncoder;
 use image::{DynamicImage, GenericImageView, Rgb, RgbImage};
@@ -48,6 +49,10 @@ struct EditRecord {
     /// Optional user-supplied .cube LUT applied to the developed image.
     #[serde(default)]
     lut: Option<LutRef>,
+    /// Tone-strip zone offsets in EV, blacks→whites (docs/plans/darkroom). `None` = no
+    /// zone curve; a zeroed strip renders identically to none (locked by a test).
+    #[serde(default)]
+    zones: Option<[f32; 8]>,
 }
 
 /// Reference to a `.cube` LUT by bare filename, resolved against the app-data `luts/`

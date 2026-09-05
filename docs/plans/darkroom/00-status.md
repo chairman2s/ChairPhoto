@@ -3,10 +3,10 @@
 - Gate 1 — Product: APPROVED 2026-09-04
 - Gate 2 — Architecture: APPROVED 2026-09-04
 - Gate 3 — Program Design: APPROVED 2026-09-04
-- Gate 4 — Slice plan: in progress
+- Gate 4 — Slice plan: APPROVED 2026-09-05
 
 ## Slices
-- [ ] Slice 1 — tracer bullet: zones field end-to-end + bare DarkroomView behind `editor.darkroom` toggle
+- [x] Slice 1 — tracer bullet: zones field end-to-end + bare DarkroomView behind `editor.darkroom` toggle (2026-09-05)
 - [ ] Slice 2 — zone curve + masses for real (engine + command + tests)
 - [ ] Slice 3 — live print on the pop-out loupe
 - [ ] Slice 4 — proof sheet (auto-tone + spread + adopt)

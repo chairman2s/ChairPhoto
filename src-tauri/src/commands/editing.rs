@@ -65,12 +65,18 @@ pub async fn render_edit(
                 crate::catalog::ResolveMode::OriginalRequired,
             )
             .ok_or_else(|| format!("no reachable copy of photo {photo_id}"))?;
-            let jpeg = if hi_res.unwrap_or(false) {
-                crate::thumbnails::zoom_bytes(&path)?
+            if hi_res.unwrap_or(false) {
+                // Zoom tier: too large to keep resident — decode per render.
+                let jpeg = crate::thumbnails::zoom_bytes(&path)?;
+                crate::plugins::edit::render_jpeg(&jpeg, &edit_json, max_edge)
             } else {
-                crate::thumbnails::preview_bytes(&path)?
-            };
-            crate::plugins::edit::render_jpeg(&jpeg, &edit_json, max_edge)
+                // Proxy tier: live sliders render this many times a second — decode
+                // through the one-slot cache (same 90-quality encode as render_jpeg).
+                let jpeg = crate::thumbnails::preview_bytes(&path)?;
+                let img = crate::plugins::edit::decode_proxy_cached(&jpeg)?;
+                crate::plugins::edit::render_image(img, &edit_json, max_edge)
+                    .and_then(|out| crate::plugins::edit::encode_jpeg(&out, 90))
+            }
         })
         .await
         .map_err(|e| e.to_string())??;
@@ -116,7 +122,7 @@ pub async fn render_edit_batch(
             )
             .ok_or_else(|| format!("no reachable copy of photo {photo_id}"))?;
             let jpeg = crate::thumbnails::preview_bytes(&path)?;
-            let mut img = image::load_from_memory(&jpeg).map_err(|e| e.to_string())?;
+            let mut img = crate::plugins::edit::decode_proxy_cached(&jpeg)?;
             // Pre-scale once to ~2× the thumbnail edge; each per-record render then
             // only pushes a few hundred kilopixels through the look pipeline.
             if max_edge > 0 {
@@ -177,7 +183,7 @@ pub async fn edit_zone_masses(
             )
             .ok_or_else(|| format!("no reachable copy of photo {photo_id}"))?;
             let jpeg = crate::thumbnails::preview_bytes(&path)?;
-            let img = image::load_from_memory(&jpeg).map_err(|e| e.to_string())?;
+            let img = crate::plugins::edit::decode_proxy_cached(&jpeg)?;
             // 1024px is plenty of resolution for an 8-bin histogram, and keeps the
             // render far cheaper than the preview tier's.
             let out = crate::plugins::edit::render_image(img, &edit_json, 1024)?;
@@ -216,7 +222,7 @@ pub async fn suggest_auto_tone(app: AppHandle, photo_id: i64) -> Result<String, 
             )
             .ok_or_else(|| format!("no reachable copy of photo {photo_id}"))?;
             let jpeg = crate::thumbnails::preview_bytes(&path)?;
-            let img = image::load_from_memory(&jpeg).map_err(|e| e.to_string())?;
+            let img = crate::plugins::edit::decode_proxy_cached(&jpeg)?;
             let a = crate::plugins::edit::auto_tone_for(&img.to_rgb8());
             Ok(serde_json::json!({
                 "tone": {

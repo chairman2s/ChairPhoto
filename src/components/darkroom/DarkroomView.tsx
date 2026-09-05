@@ -55,6 +55,8 @@ import { ToneStrip } from "./ToneStrip";
 import "./darkroom.css";
 
 const PREVIEW_MAX = 1400;
+/** The live-drag tier: small enough to render ~11 fps through the cached proxy. */
+const PREVIEW_FAST = 720;
 /** Persisted "print on the loupe screen" preference (Gate 2's settings key). */
 const PRINT_ON_LOUPE_KEY = "basic-editor.printOnLoupe";
 
@@ -366,22 +368,41 @@ export function DarkroomView({
     }
   };
 
-  // Debounced live renders. The STAGE renders the record without its crop (the crop is
-  // an interactive overlay) and un-warped while the perspective handles are up; the
-  // loupe print and zone masses use the FULL record — they describe the final print.
+  // Live renders, two tiers. While the user drags, a small FAST render keeps the stage
+  // live (leading-edge throttle, ~11 fps against the backend's cached proxy decode);
+  // once input settles for 250ms, the full-quality render, the strip's masses, and the
+  // loupe print follow. The STAGE renders the record without its crop (the crop is an
+  // interactive overlay) and un-warped while the perspective handles are up; masses and
+  // the loupe use the FULL record — they describe the final print.
+  const lastFastRef = useRef(0);
   useEffect(() => {
     const seq = ++renderSeq.current;
     setRendering(true);
-    const t = setTimeout(() => {
-      const fullJson = JSON.stringify(working);
-      const stageJson = JSON.stringify({
-        ...working,
-        crop: undefined,
-        perspective: perspectiveMode ? undefined : working.perspective,
-      });
+    const fullJson = JSON.stringify(working);
+    const stageJson = JSON.stringify({
+      ...working,
+      crop: undefined,
+      perspective: perspectiveMode ? undefined : working.perspective,
+    });
+    let fullApplied = false;
+    const sinceFast = Date.now() - lastFastRef.current;
+    const fastTimer = setTimeout(
+      () => {
+        lastFastRef.current = Date.now();
+        renderEdit(photoId, stageJson, PREVIEW_FAST)
+          .then((url) => {
+            // Never paint the fast tier over a newer state or the settled render.
+            if (renderSeq.current === seq && !fullApplied) setBackdrop(url);
+          })
+          .catch(() => {});
+      },
+      sinceFast > 90 ? 0 : 90 - sinceFast,
+    );
+    const settleTimer = setTimeout(() => {
       renderEdit(photoId, stageJson, PREVIEW_MAX)
         .then((url) => {
           if (renderSeq.current !== seq) return;
+          fullApplied = true;
           setBackdrop(url);
           setError("");
         })
@@ -398,10 +419,13 @@ export function DarkroomView({
         .catch(() => {
           // Masses are a cosmetic overlay on the strip — a failure leaves the last fill.
         });
-      // The loupe print rides the same debounce: one settled state, one broadcast.
+      // The loupe print rides the settle: one settled state, one broadcast.
       if (printOnLoupeRef.current) broadcastPhoto(photoId, loupeJson(fullJson));
     }, 250);
-    return () => clearTimeout(t);
+    return () => {
+      clearTimeout(fastTimer);
+      clearTimeout(settleTimer);
+    };
   }, [photoId, working, perspectiveMode]);
 
   return (

@@ -16,6 +16,7 @@ pub use zones::zone_masses;
 
 use image::codecs::jpeg::JpegEncoder;
 use image::{DynamicImage, GenericImageView, Rgb, RgbImage};
+use std::sync::Mutex;
 use look::{Bw, Grain, Split};
 use serde::Deserialize;
 
@@ -178,6 +179,36 @@ pub fn render_jpeg(jpeg: &[u8], edit_json: &str, max_edge: u32) -> Result<Vec<u8
     let img = image::load_from_memory(jpeg).map_err(|e| e.to_string())?;
     let out = render_image(img, edit_json, max_edge)?;
     encode_jpeg(&out, 90)
+}
+
+/// One-slot cache of the last decoded proxy: live slider drags render the same proxy
+/// many times a second, and the JPEG decode is a large share of each render's cost.
+/// Keyed by a fingerprint of the bytes (length + head + tail), so a regenerated proxy
+/// (rotation, recovery) can never serve stale pixels. The clone hands the caller its
+/// own buffer — a memcpy, ~30× cheaper than a decode.
+static DECODE_CACHE: Mutex<Option<(u64, DynamicImage)>> = Mutex::new(None);
+
+fn jpeg_fingerprint(jpeg: &[u8]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    jpeg.len().hash(&mut h);
+    jpeg[..jpeg.len().min(4096)].hash(&mut h);
+    jpeg[jpeg.len().saturating_sub(1024)..].hash(&mut h);
+    h.finish()
+}
+
+/// Decode a proxy JPEG through the one-slot cache. Use for interactive proxy renders
+/// only — the hi-res zoom tier is too large to keep resident.
+pub fn decode_proxy_cached(jpeg: &[u8]) -> Result<DynamicImage, String> {
+    let fp = jpeg_fingerprint(jpeg);
+    if let Some((cached_fp, img)) = &*DECODE_CACHE.lock().unwrap() {
+        if *cached_fp == fp {
+            return Ok(img.clone());
+        }
+    }
+    let img = image::load_from_memory(jpeg).map_err(|e| e.to_string())?;
+    *DECODE_CACHE.lock().unwrap() = Some((fp, img.clone()));
+    Ok(img)
 }
 
 /// Encode an image to JPEG bytes at `quality` (1–100).

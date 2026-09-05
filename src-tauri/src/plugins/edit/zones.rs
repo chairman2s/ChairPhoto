@@ -133,4 +133,23 @@ mod tests {
         let v1 = r#"{"crop":{"x":0.1,"y":0.1,"w":0.5,"h":0.5},"tone":{"ev":0.5}}"#;
         assert!(crate::plugins::edit::render_jpeg(&jpeg, v1, 0).is_ok());
     }
+
+    #[test]
+    fn decode_proxy_cached_matches_a_plain_decode_and_never_crosses_photos() {
+        let a = synthetic_jpeg();
+        let b = {
+            let img = image::RgbImage::from_fn(32, 32, |x, y| image::Rgb([(x + y) as u8; 3]));
+            crate::plugins::edit::encode_jpeg(&image::DynamicImage::ImageRgb8(img), 95).unwrap()
+        };
+        let direct_a = image::load_from_memory(&a).unwrap().to_rgb8();
+        // Twice through the cache (miss, then hit) — both must equal the plain decode.
+        for _ in 0..2 {
+            let cached = crate::plugins::edit::decode_proxy_cached(&a).unwrap().to_rgb8();
+            assert_eq!(cached.as_raw(), direct_a.as_raw());
+        }
+        // A different JPEG must never be served the cached pixels.
+        let direct_b = image::load_from_memory(&b).unwrap().to_rgb8();
+        let cached_b = crate::plugins::edit::decode_proxy_cached(&b).unwrap().to_rgb8();
+        assert_eq!(cached_b.as_raw(), direct_b.as_raw());
+    }
 }

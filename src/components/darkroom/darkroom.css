@@ -29,6 +29,20 @@
 .dk-title {
   font-weight: 600;
 }
+.dk-loupe-toggle {
+  padding: 5px 12px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--dim);
+  cursor: pointer;
+  font-size: 12px;
+}
+.dk-loupe-toggle.on {
+  border-color: var(--accent);
+  color: var(--txt);
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+}
 .dk-hint {
   color: var(--dim);
   font-size: 12px;

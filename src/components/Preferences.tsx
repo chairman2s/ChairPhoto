@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { GlSpike } from "./darkroom/GlSpike";
 import { confirm } from "@tauri-apps/plugin-dialog";
 import {
   applyOffloadPolicy,
@@ -546,15 +547,30 @@ function TieringSection({ onChanged }: { onChanged: () => void }) {
 // still live on an offline volume (unmounted NAS) are never touched.
 // External develop editors (darktable / RawTherapee / ART). Paths are optional — blank uses
 // the auto-detected command on PATH. Availability (GUI/CLI found) is shown per editor.
+/** Settings keys shared with DarkroomView (read there once per mount). */
+export const RENDER_TIMING_KEY = "editor.renderTiming";
+const GL_SPIKE_REPORT_KEY = "editor.glSpike.lastReport";
+
 /** Darkroom early-preview toggle (docs/plans/darkroom): swaps the Develop surface for
  *  the in-progress Darkroom. Read when Develop opens (DevelopSurface), so a change
  *  applies on the next open. Removed at slice 8, when the Darkroom becomes Develop. */
 function DarkroomSection() {
   const [on, setOn] = useState<boolean | null>(null);
+  // Render-timing log (GPU-smoothness work, docs/plans/darkroom/00-status.md): stamps
+  // every stage render in the console and unlocks the WebGL probe below. Dev-only.
+  const [timing, setTiming] = useState<boolean | null>(null);
+  const [spike, setSpike] = useState(false);
+  const [lastSpike, setLastSpike] = useState("");
   useEffect(() => {
     getSetting("editor.darkroom")
       .then((v) => setOn(v === "1"))
       .catch(() => setOn(false));
+    getSetting(RENDER_TIMING_KEY)
+      .then((v) => setTiming(v === "1"))
+      .catch(() => setTiming(false));
+    getSetting(GL_SPIKE_REPORT_KEY)
+      .then((v) => setLastSpike(v ?? ""))
+      .catch(() => {});
   }, []);
   const toggle = async () => {
     const next = !(on ?? false);
@@ -563,6 +579,15 @@ function DarkroomSection() {
       await setSetting("editor.darkroom", next ? "1" : "0");
     } catch {
       setOn(!next); // write failed — reflect reality
+    }
+  };
+  const toggleTiming = async () => {
+    const next = !(timing ?? false);
+    setTiming(next);
+    try {
+      await setSetting(RENDER_TIMING_KEY, next ? "1" : "0");
+    } catch {
+      setTiming(!next);
     }
   };
   return (
@@ -582,6 +607,36 @@ function DarkroomSection() {
         />
         Use the Darkroom as the Develop surface
       </label>
+      <label
+        style={{ display: "flex", gap: 8, alignItems: "center", cursor: "pointer", marginTop: 6 }}
+      >
+        <input
+          type="checkbox"
+          checked={timing ?? false}
+          disabled={timing === null}
+          onChange={toggleTiming}
+        />
+        Log render timings to the console (dev)
+      </label>
+      {timing && (
+        <div style={{ marginTop: 8 }}>
+          <button onClick={() => setSpike(true)}>Run WebGL probe</button>
+          {lastSpike && (
+            <div className="modal-sub" style={{ marginTop: 4, wordBreak: "break-all" }}>
+              Last probe: {lastSpike}
+            </div>
+          )}
+        </div>
+      )}
+      {spike && (
+        <GlSpike
+          onClose={() => setSpike(false)}
+          onReport={(json) => {
+            setLastSpike(json);
+            setSetting(GL_SPIKE_REPORT_KEY, json).catch(() => {});
+          }}
+        />
+      )}
     </div>
   );
 }

@@ -53,6 +53,30 @@ survey and plan live in the session plan file; the increments are:
   with the toggle on — not taken in this session because the desktop was in use.
 - [x] Increment 2 — native `edit://` transport for the darkroom stage (`protocol::handle_edit_request`, `editRenderUrl`; base64 gone from the drag path).
 - [ ] Increment 3 — WebGL2 look shader as the drag tier (`editor.gpuPreview`, default off).
+  **Blocked on a decision (2026-09-06).** Two WebKitWebProcess segfaults during the
+  session (14:40 and 14:49) were symbolized with debuginfod and reproduced outside the
+  app with `scripts/webgl-teardown-repro.py`. Stack (WebKitGTK 2.52.6, NVIDIA 610.57):
+  `WebKit::AuxiliaryProcess::terminate` → `WebProcess::stopRunLoop` →
+  `PlatformDisplay::clearGLContexts` → `GLContext::~GLContext` (GLContext.cpp:335) →
+  SIGSEGV inside `libnvidia-eglcore`. That is, the web process was **already being
+  terminated** (a Vite full reload's process swap; the dev session ending; the test
+  windows closing) and died destroying its EGL contexts — not a crash of a running
+  page, but a core dump plus Omarchy's crash notification on every such teardown.
+  Conditions, from the reproduction: under `WEBKIT_DISABLE_DMABUF_RENDERER=1` (what
+  `lib.rs` sets on Linux) it happens every time a **visible** canvas still holds a live
+  WebGL2 context at teardown, even a single one; a hidden canvas, a context released
+  while the page lives (`drop`/`lose` modes), or the DMABUF renderer left on
+  (`WEBKIT_DISABLE_DMABUF_RENDERER=0 __NV_DISABLE_EXPLICIT_SYNC=1`) never crash; losing
+  contexts from `pagehide`/`beforeunload` is too late. Consequences: the probe now
+  loses its context on unmount (its cancel fn); a GL drag tier must do the same on
+  unmount and would still make "quit the app from the Darkroom" a web-process crash on
+  this driver path unless the app either loses contexts from the UI process before the
+  window closes (a CloseRequested hook that evals JS, then closes) or moves to the
+  DMABUF renderer with `__NV_DISABLE_EXPLICIT_SYNC=1` — allowed by AGENTS.md only as a
+  tested replacement (the standalone webview ran clean that way; the app has not been
+  run that way). Options: (a) accept the quit-time dump on the legacy path, (b) the
+  close hook, (c) validate and ship the env change, (d) drop the webview GL tier for
+  the Phase 2 native backend. Decide before building increment 3.
 - [ ] Phase 2 gate — `wgpu` backend: build only on the exit criteria in the plan.
 
 Follow-ups recorded here, not done: `LoupeWindow` / `basicEditor` and the

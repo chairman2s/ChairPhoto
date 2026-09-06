@@ -128,12 +128,20 @@ function identityLut(n: number): Float32Array {
   return data;
 }
 
-/** Run the probe on `canvas`; `done` receives the report once. Returns a cancel fn. */
+/** Run the probe on `canvas`; `done` receives the report once. Returns a cancel fn that
+ *  also **loses the context** — call it on unmount. With the DMABUF renderer disabled
+ *  (lib.rs, Linux) a page torn down while a visible canvas still holds a live WebGL
+ *  context segfaults the WebKitWebProcess inside the NVIDIA EGL driver; a context
+ *  released while the page lives is fine. Reproduced and recorded in
+ *  docs/plans/darkroom/00-status.md (scripts/webgl-teardown-repro.py). */
 export function runSpike(canvas: HTMLCanvasElement, done: (r: SpikeReport) => void): () => void {
   let cancelled = false;
   let lost = false;
+  let release: (() => void) | null = null;
   const cancel = () => {
     cancelled = true;
+    release?.();
+    release = null;
   };
   const base: SpikeReport = {
     context: false,
@@ -168,6 +176,8 @@ export function runSpike(canvas: HTMLCanvasElement, done: (r: SpikeReport) => vo
     e.preventDefault();
     lost = true;
   });
+  const loseExt = gl.getExtension("WEBGL_lose_context");
+  release = () => loseExt?.loseContext();
   const dbg = gl.getExtension("WEBGL_debug_renderer_info");
   const renderer = dbg
     ? String(gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL))

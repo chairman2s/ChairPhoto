@@ -40,8 +40,47 @@ use std::sync::{Arc, Condvar, Mutex};
 
 use crate::protocol::ImageKind;
 
-/// Key identifying a unique image job: `(photo_id, kind)`.
-pub type JobKey = (i64, ImageKind);
+/// Key identifying a unique image job. A photo tier is `(photo_id, kind)`; an edit render
+/// (the `edit://` protocol, `edit` feature) carries its whole request, so two identical
+/// URLs coalesce into one render and any difference is a different job. The pool never
+/// inspects a key — it only hashes and compares it.
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+pub enum JobKey {
+    Photo { id: i64, kind: ImageKind },
+    #[cfg(feature = "edit")]
+    Edit(EditJob),
+}
+
+impl JobKey {
+    pub fn photo(id: i64, kind: ImageKind) -> Self {
+        JobKey::Photo { id, kind }
+    }
+
+    /// The photo a job renders, whichever kind it is.
+    pub fn photo_id(&self) -> i64 {
+        match self {
+            JobKey::Photo { id, .. } => *id,
+            #[cfg(feature = "edit")]
+            JobKey::Edit(job) => job.photo_id,
+        }
+    }
+}
+
+/// One `edit://` render request, parsed by `protocol::edit_job_from_uri` and rendered by
+/// `commands::render_edit_bytes`.
+#[cfg(feature = "edit")]
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+pub struct EditJob {
+    pub photo_id: i64,
+    /// The edit record, verbatim — the URL carries it base64url-encoded.
+    pub edit_json: String,
+    /// Longest output edge; 0 = full size.
+    pub max_edge: u32,
+    /// Render from the native-size zoom tier instead of the 2048 px proxy.
+    pub hi_res: bool,
+    /// Geometry only, no look, as lossless PNG — the GL drag tier's base texture.
+    pub base_only: bool,
+}
 
 /// A one-shot callback that receives the rendered bytes (or an error string).
 pub type Respond = Box<dyn FnOnce(Result<Vec<u8>, String>) + Send>;
@@ -99,8 +138,8 @@ impl ImagePool {
             // Job already exists (queued or mid-render) — attach and return.
             responders.push(respond);
         } else {
+            guard.stack.push(key.clone()); // LIFO: newest at top
             guard.jobs.insert(key, vec![respond]);
-            guard.stack.push(key); // LIFO: newest at top
             self.cond.notify_one();
         }
     }
@@ -125,7 +164,7 @@ impl ImagePool {
 
             // Run the renderer outside the lock.  Catch panics so the thread lives.
             let result: Result<Vec<u8>, String> =
-                panic::catch_unwind(AssertUnwindSafe(|| runner(key)))
+                panic::catch_unwind(AssertUnwindSafe(|| runner(key.clone())))
                     .unwrap_or_else(|_| Err("render panicked".into()));
 
             // Collect all responders for this key, removing the job entry *after*
@@ -195,11 +234,11 @@ mod tests {
 
         let (result_tx, result_rx) = std::sync::mpsc::channel::<Result<Vec<u8>, String>>();
 
-        let key: JobKey = (42, ImageKind::Thumb);
+        let key: JobKey = JobKey::photo(42, ImageKind::Thumb);
         // First submit — enters the runner (which then blocks).
         {
             let tx = result_tx.clone();
-            pool2.submit(key, Box::new(move |r| { let _ = tx.send(r); }));
+            pool2.submit(key.clone(), Box::new(move |r| { let _ = tx.send(r); }));
         }
 
         // Wait until the runner is actually executing (entered the barrier wait).
@@ -208,7 +247,7 @@ mod tests {
         // Now submit 4 more identical keys — these should attach to the in-flight job.
         for _ in 0..4 {
             let tx = result_tx.clone();
-            pool2.submit(key, Box::new(move |r| { let _ = tx.send(r); }));
+            pool2.submit(key.clone(), Box::new(move |r| { let _ = tx.send(r); }));
         }
 
         // Release the runner.
@@ -236,16 +275,17 @@ mod tests {
         let gate = Arc::new(Barrier::new(2));
         let gate2 = Arc::clone(&gate);
 
-        let key_a: JobKey = (1, ImageKind::Thumb);
-        let key_b: JobKey = (2, ImageKind::Thumb);
-        let key_c: JobKey = (3, ImageKind::Thumb);
+        let key_a: JobKey = JobKey::photo(1, ImageKind::Thumb);
+        let key_b: JobKey = JobKey::photo(2, ImageKind::Thumb);
+        let key_c: JobKey = JobKey::photo(3, ImageKind::Thumb);
 
+        let key_a_in = key_a.clone();
         let runner: Runner = Arc::new(move |key| {
-            if key == key_a {
+            if key == key_a_in {
                 let _ = a_entered_tx.send(());
                 gate2.wait(); // block until released
             }
-            Ok(vec![key.0 as u8])
+            Ok(vec![key.photo_id() as u8])
         });
 
         let pool = ImagePool::start_with_runner(1, runner);
@@ -288,11 +328,12 @@ mod tests {
     // -----------------------------------------------------------------------
     #[test]
     fn test_panic_safety() {
-        let panic_key: JobKey = (999, ImageKind::Thumb);
-        let ok_key:    JobKey = (1,   ImageKind::Thumb);
+        let panic_key: JobKey = JobKey::photo(999, ImageKind::Thumb);
+        let ok_key:    JobKey = JobKey::photo(1, ImageKind::Thumb);
 
+        let panic_key_in = panic_key.clone();
         let runner: Runner = Arc::new(move |key| {
-            if key == panic_key {
+            if key == panic_key_in {
                 panic!("deliberate test panic");
             }
             Ok(b"ok".to_vec())
@@ -324,7 +365,7 @@ mod tests {
         let gate = Arc::new(Barrier::new(2));
         let gate2 = Arc::clone(&gate);
 
-        let key: JobKey = (77, ImageKind::Thumb);
+        let key: JobKey = JobKey::photo(77, ImageKind::Thumb);
 
         let runner: Runner = Arc::new(move |_key| {
             let _ = entered_tx.send(());
@@ -337,14 +378,14 @@ mod tests {
 
         // First submit.
         let tx1 = tx.clone();
-        pool.submit(key, Box::new(move |r| { let _ = tx1.send(r); }));
+        pool.submit(key.clone(), Box::new(move |r| { let _ = tx1.send(r); }));
 
         // Wait until runner has started (is inside the gate).
         entered_rx.recv().unwrap();
 
         // Late attach while runner is blocked.
         let tx2 = tx.clone();
-        pool.submit(key, Box::new(move |r| { let _ = tx2.send(r); }));
+        pool.submit(key.clone(), Box::new(move |r| { let _ = tx2.send(r); }));
 
         // Release the runner.
         gate.wait();

@@ -51,7 +51,7 @@ survey and plan live in the session plan file; the increments are:
   be run before the `wgpu` backend is built.
   Frontend cadence (IPC + paint, `editor.renderTiming.lastSummary`): pending a manual drag
   with the toggle on — not taken in this session because the desktop was in use.
-- [ ] Increment 2 — native `edit://` transport for the darkroom stage.
+- [x] Increment 2 — native `edit://` transport for the darkroom stage (`protocol::handle_edit_request`, `editRenderUrl`; base64 gone from the drag path).
 - [ ] Increment 3 — WebGL2 look shader as the drag tier (`editor.gpuPreview`, default off).
 - [ ] Phase 2 gate — `wgpu` backend: build only on the exit criteria in the plan.
 

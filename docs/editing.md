@@ -210,6 +210,19 @@ implemented — the crop fixes shape, resize would fix pixels.
 
 - **Live preview:** render the cached **preview proxy** (embedded JPEG, ~fast) as sliders/crop
   change (debounced). Proxy quality is fine for judging an edit.
+- **Transport — the Darkroom stage is a native URL.** The stage `<img>` loads
+  `edit://<photoId>?r=<base64url(record)>&m=<maxEdge>[&b=1][&hi=1][&v=bust]`
+  (`editRenderUrl` in `src/modules/api.ts`; `protocol::handle_edit_request` and
+  `commands::editing::render_edit_bytes` in Rust), served through the same bounded LIFO
+  image pool as `thumb://`/`preview://`/`zoom://`: the newest URL renders first and
+  identical URLs coalesce into one render, which is what makes slider spam safe. Responses
+  are `Cache-Control: no-store` — rendering, not fetching, is the cost, and a regenerated
+  proxy or re-imported LUT must never show stale pixels. `b=1` renders the geometry only
+  (perspective → straighten, no crop, no look) as lossless PNG: the base the GL drag tier
+  will shade. The `render_edit` / `render_edit_batch` commands still return base64 data
+  URLs for their remaining callers (the loupe window's renderer, the proof sheet, duels,
+  the preset browser, the legacy Develop view) — listed as follow-ups in
+  `docs/plans/darkroom/00-status.md`, not a transport the Darkroom stage uses.
 - **Loupe:** shows the active version's render when the module is enabled; otherwise the
   unedited preview (the core edit contract already falls back).
 - **Edited export — decided: render from a full RAW decode.** "Show off" (JPEG) renders each

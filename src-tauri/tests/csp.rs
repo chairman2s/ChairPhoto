@@ -120,19 +120,22 @@ fn the_fetch_proxy_did_not_widen_connect_src() {
 #[test]
 fn the_native_media_protocols_stay_loadable() {
     let img = sources("img-src");
-    // src-tauri/src/lib.rs registers these three; src/modules/previewCache.ts and
-    // src/components/Thumbnail.tsx build `<scheme>://localhost/<photo_id>` URLs from them.
-    for scheme in ["thumb:", "preview:", "zoom:"] {
+    // src-tauri/src/lib.rs registers these four; src/modules/previewCache.ts,
+    // src/components/Thumbnail.tsx and src/modules/api.ts (`editRenderUrl`, the Darkroom
+    // stage) build `<scheme>://localhost/<photo_id>` URLs from them.
+    for scheme in ["thumb:", "preview:", "zoom:", "edit:"] {
         assert!(
             img.iter().any(|s| s == scheme),
-            "img-src must allow `{scheme}` or grid thumbnails and loupe previews go blank: {img:?}"
+            "img-src must allow `{scheme}` or grid thumbnails, loupe previews and the Darkroom \
+             stage go blank: {img:?}"
         );
     }
-    // Windows/Android form of the same three protocols.
+    // Windows/Android form of the same four protocols.
     for host in [
         "http://thumb.localhost",
         "http://preview.localhost",
         "http://zoom.localhost",
+        "http://edit.localhost",
     ] {
         assert!(
             img.iter().any(|s| s == host),

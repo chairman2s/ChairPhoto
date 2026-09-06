@@ -12,11 +12,11 @@
 import { useEffect, useRef, useState } from "react";
 import {
   createVersion,
+  editRenderUrl,
   editZoneMasses,
   getSetting,
   listVersions,
   PhotoVersion,
-  renderEdit,
   setSetting,
   setVersionEdit,
   suggestAutoTone,
@@ -51,6 +51,7 @@ import {
 import { DuelView } from "./DuelView";
 import { ProofSheet } from "./ProofSheet";
 import { DUEL_LABELS, proofSpread, type DuelDim, type ProofCandidate } from "./spreads";
+import { stageJsonFor } from "./stageJson";
 import { ToneStrip } from "./ToneStrip";
 import {
   formatSample,
@@ -160,19 +161,26 @@ export function DarkroomView({
     unsummarizedRef.current++;
     console.debug(formatSample(s));
   };
-  // A frame's paint is attributed by URL when the stage <img> reports the load.
+  // A frame's paint is attributed by URL when the stage <img> reports the load. The
+  // element shows only its latest src, so every frame requested before the one that
+  // loaded was superseded — the browser dropped it, and so does the log.
   const awaitPaint = (s: FrameSample | null, url: string) => {
     if (!s) return;
     pendingPaintRef.current.set(url, s);
-    if (pendingPaintRef.current.size > 8) {
-      const oldest = pendingPaintRef.current.keys().next().value;
-      if (oldest !== undefined) pendingPaintRef.current.delete(oldest);
+  };
+  const settlePaints = (loaded: FrameSample | null) => {
+    for (const [url, p] of pendingPaintRef.current) {
+      if (loaded && p.requested >= loaded.requested) continue;
+      pendingPaintRef.current.delete(url);
+      p.superseded = true;
+      logSample(p);
     }
   };
-  const onBackdropLoad = (src: string) => {
+  const onPaintOf = (src: string) => {
     const s = pendingPaintRef.current.get(src);
     if (!s) return;
     pendingPaintRef.current.delete(src);
+    settlePaints(s);
     requestAnimationFrame((t) => {
       s.painted = t;
       logSample(s);
@@ -434,67 +442,37 @@ export function DarkroomView({
     }
   };
 
-  // Live renders, two tiers. While the user drags, a small FAST render keeps the stage
-  // live (leading-edge throttle, ~11 fps against the backend's cached proxy decode);
-  // once input settles for 250ms, the full-quality render, the strip's masses, and the
-  // loupe print follow. The STAGE renders the record without its crop (the crop is an
-  // interactive overlay) and un-warped while the perspective handles are up; masses and
-  // the loupe use the FULL record — they describe the final print.
+  // Live renders, two tiers, both native `edit://` URLs on the stage <img> (never base64
+  // over IPC): the backend's bounded LIFO pool renders the newest URL first and coalesces
+  // identical ones, and the element shows only its latest src, so a stale frame can never
+  // paint over a newer one. While the user drags, a small FAST URL keeps the stage live
+  // (leading-edge throttle against the cached proxy decode); once input settles for
+  // 250ms, the full-quality URL, the strip's masses, and the loupe print follow. The
+  // STAGE renders the record without its crop (an interactive overlay) and un-warped
+  // while the perspective handles are up; masses and the loupe use the FULL record —
+  // they describe the final print.
   const lastFastRef = useRef(0);
+  const settledUrlRef = useRef("");
   useEffect(() => {
     const seq = ++renderSeq.current;
     setRendering(true);
     const fullJson = JSON.stringify(working);
-    const stageJson = JSON.stringify({
-      ...working,
-      crop: undefined,
-      perspective: perspectiveMode ? undefined : working.perspective,
-    });
-    let fullApplied = false;
+    const stageJson = stageJsonFor(working, perspectiveMode);
     const sinceFast = Date.now() - lastFastRef.current;
     const fastTimer = setTimeout(
       () => {
         lastFastRef.current = Date.now();
-        const sample = startSample(seq, "fast");
-        renderEdit(photoId, stageJson, PREVIEW_FAST)
-          .then((url) => {
-            if (sample) sample.resolved = performance.now();
-            // Never paint the fast tier over a newer state or the settled render.
-            if (renderSeq.current === seq && !fullApplied) {
-              setBackdrop(url);
-              awaitPaint(sample, url);
-            } else if (sample) {
-              sample.superseded = true;
-              logSample(sample);
-            }
-          })
-          .catch(() => {});
+        const url = editRenderUrl(photoId, stageJson, { maxEdge: PREVIEW_FAST });
+        awaitPaint(startSample(seq, "fast"), url);
+        setBackdrop(url);
       },
       sinceFast > 90 ? 0 : 90 - sinceFast,
     );
     const settleTimer = setTimeout(() => {
-      const sample = startSample(seq, "settled");
-      renderEdit(photoId, stageJson, PREVIEW_MAX)
-        .then((url) => {
-          if (sample) sample.resolved = performance.now();
-          if (renderSeq.current !== seq) {
-            if (sample) {
-              sample.superseded = true;
-              logSample(sample);
-            }
-            return;
-          }
-          fullApplied = true;
-          setBackdrop(url);
-          awaitPaint(sample, url);
-          setError("");
-        })
-        .catch((e) => {
-          if (renderSeq.current === seq) setError(String(e));
-        })
-        .finally(() => {
-          if (renderSeq.current === seq) setRendering(false);
-        });
+      const url = editRenderUrl(photoId, stageJson, { maxEdge: PREVIEW_MAX });
+      settledUrlRef.current = url;
+      awaitPaint(startSample(seq, "settled"), url);
+      setBackdrop(url);
       editZoneMasses(photoId, fullJson)
         .then((m) => {
           if (renderSeq.current === seq) setMasses(m);
@@ -510,6 +488,21 @@ export function DarkroomView({
       clearTimeout(settleTimer);
     };
   }, [photoId, working, perspectiveMode]);
+  // The settled frame is on screen (or failed): the URL is unique per state, so equality
+  // with the one this effect set is the ownership check.
+  const onBackdropLoad = (src: string) => {
+    onPaintOf(src);
+    if (src === settledUrlRef.current) {
+      setRendering(false);
+      setError("");
+    }
+  };
+  const onBackdropError = (src: string) => {
+    if (src === settledUrlRef.current) {
+      setRendering(false);
+      setError("Render failed — see the app log");
+    }
+  };
 
   return (
     <div className="dk-root">
@@ -579,6 +572,7 @@ export function DarkroomView({
               onLevel={handleLevel}
               onImgDims={setImgDims}
               onBackdropLoad={onBackdropLoad}
+              onBackdropError={onBackdropError}
             />
           </div>
           <div className="dk-strip-row">

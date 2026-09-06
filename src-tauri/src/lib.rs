@@ -70,6 +70,13 @@ pub fn run() {
         }))
         .plugin(tauri_plugin_deep_link::init());
 
+    // The Darkroom stage renders through `edit://<photoId>?r=<record>&m=<edge>` — the same
+    // native path as the photo tiers below, never base64 over IPC (protocol.rs).
+    #[cfg(feature = "edit")]
+    let builder = builder.register_asynchronous_uri_scheme_protocol("edit", |ctx, req, responder| {
+        protocol::handle_edit_request(ctx, req, responder);
+    });
+
     builder
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())

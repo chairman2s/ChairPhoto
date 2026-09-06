@@ -44,9 +44,11 @@ export interface FrameSample {
 export interface TimingSummary {
   count: number;
   superseded: number;
-  /** invoke → resolve. */
+  /** request → on screen, every painted frame (the number a drag feels). */
+  latencyMs: { p50: number; p95: number };
+  /** invoke → resolve, for frames that came back over IPC (the data-URL path). */
   ipcMs: { p50: number; p95: number };
-  /** resolve → on screen (data-URL parse, JPEG decode, layout). */
+  /** resolve → on screen for those same frames (data-URL parse, JPEG decode, layout). */
   paintMs: { p50: number; p95: number };
   /** interval between consecutive painted frames of any tier. */
   cadenceMs: { p50: number; p95: number };
@@ -54,6 +56,7 @@ export interface TimingSummary {
 }
 
 export function summarize(samples: FrameSample[]): TimingSummary {
+  const latency: number[] = [];
   const ipc: number[] = [];
   const paint: number[] = [];
   const painted: number[] = [];
@@ -63,9 +66,10 @@ export function summarize(samples: FrameSample[]): TimingSummary {
     byTier[s.tier] = (byTier[s.tier] ?? 0) + 1;
     if (s.superseded) superseded++;
     if (s.resolved !== undefined) ipc.push(s.resolved - s.requested);
-    if (s.resolved !== undefined && s.painted !== undefined) {
-      paint.push(s.painted - s.resolved);
+    if (s.painted !== undefined) {
+      latency.push(s.painted - s.requested);
       painted.push(s.painted);
+      if (s.resolved !== undefined) paint.push(s.painted - s.resolved);
     }
   }
   painted.sort((a, b) => a - b);
@@ -73,6 +77,7 @@ export function summarize(samples: FrameSample[]): TimingSummary {
   return {
     count: samples.length,
     superseded,
+    latencyMs: p50p95(latency),
     ipcMs: p50p95(ipc),
     paintMs: p50p95(paint),
     cadenceMs: p50p95(cadence),
@@ -83,10 +88,11 @@ export function summarize(samples: FrameSample[]): TimingSummary {
 /** One console line per painted (or superseded) frame. */
 export function formatSample(s: FrameSample): string {
   const ms = (v: number | undefined) => (v === undefined ? "—" : `${v.toFixed(1)}ms`);
+  const total = s.painted === undefined ? undefined : s.painted - s.requested;
   const ipc = s.resolved === undefined ? undefined : s.resolved - s.requested;
   const paint =
     s.resolved === undefined || s.painted === undefined ? undefined : s.painted - s.resolved;
-  return `[edit-timing] seq=${s.seq} tier=${s.tier} ipc=${ms(ipc)} paint=${ms(paint)}${
-    s.superseded ? " superseded" : ""
-  }`;
+  return `[edit-timing] seq=${s.seq} tier=${s.tier} total=${ms(total)} ipc=${ms(ipc)} paint=${ms(
+    paint,
+  )}${s.superseded ? " superseded" : ""}`;
 }

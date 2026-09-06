@@ -51,18 +51,6 @@ fn timed<T>(f: impl FnOnce() -> T) -> (T, f64) {
     (out, t.elapsed().as_secs_f64() * 1000.0)
 }
 
-fn encode_png_fast(img: &DynamicImage) -> Vec<u8> {
-    use image::codecs::png::{CompressionType, FilterType, PngEncoder};
-    let mut out = std::io::Cursor::new(Vec::new());
-    img.write_with_encoder(PngEncoder::new_with_quality(
-        &mut out,
-        CompressionType::Fast,
-        FilterType::NoFilter,
-    ))
-    .unwrap();
-    out.into_inner()
-}
-
 #[test]
 #[ignore = "edit render stage bench; see docs/performance-harness.md"]
 fn render_stage_timings() {
@@ -121,7 +109,7 @@ fn render_stage_timings() {
             let (bytes, t) = timed(|| encode_jpeg(&out, 90).unwrap());
             jpeg_ms.push(t);
             jpeg_len = bytes.len();
-            let (_, t) = timed(|| encode_png_fast(&out));
+            let (_, t) = timed(|| encode_png_fast(&out).unwrap());
             png_ms.push(t);
             let (_, t) = timed(|| base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &bytes));
             b64_ms.push(t);

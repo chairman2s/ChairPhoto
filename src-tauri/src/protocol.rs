@@ -1,5 +1,5 @@
-//! Custom URI scheme protocols `thumb://` and `preview://` for serving images
-//! directly to the webview as native HTTP responses.
+//! Custom URI scheme protocols `thumb://`, `preview://`, `zoom://` and (with the `edit`
+//! feature) `edit://` for serving images directly to the webview as native HTTP responses.
 //!
 //! This is far faster than returning images as base64 over the IPC channel: there
 //! is no JSON serialization, the webview decodes a normal JPEG response, and it
@@ -12,6 +12,8 @@
 
 use crate::catalog::ResolveMode;
 use crate::commands::AppState;
+#[cfg(feature = "edit")]
+use crate::image_pool::EditJob;
 use crate::image_pool::{ImagePool, JobKey};
 use crate::thumbnails::{preview_bytes, thumbnail_bytes, zoom_bytes};
 use tauri::http::{Request, Response};
@@ -50,17 +52,89 @@ pub fn handle_image_request<R: Runtime>(
         }
     };
 
-    let key: JobKey = (id, kind);
+    // Previews are immutable for a given file version; let the webview cache them so
+    // re-viewing is instant.
+    let respond = respond_with(responder, "image/jpeg", "max-age=86400");
+    submit_or_fallback(app, JobKey::photo(id, kind), respond);
+}
 
-    // Build the one-shot HTTP-response callback.
-    let respond: crate::image_pool::Respond = Box::new(move |result| {
+/// Handle one `edit://<photoId>?r=<base64url(record)>&m=<edge>[&b=1][&hi=1]` request — the
+/// Darkroom stage's `<img src>` (`editRenderUrl` in `src/modules/api.ts`). Same pool as
+/// the photo tiers, so slider spam renders newest-first and identical URLs coalesce.
+#[cfg(feature = "edit")]
+pub fn handle_edit_request<R: Runtime>(
+    ctx: UriSchemeContext<'_, R>,
+    request: Request<Vec<u8>>,
+    responder: UriSchemeResponder,
+) {
+    let app = ctx.app_handle().clone();
+    let job = match edit_job_from_uri(&request) {
+        Ok(job) => job,
+        Err(msg) => {
+            responder.respond(
+                Response::builder()
+                    .status(404)
+                    .header("Content-Type", "text/plain")
+                    .body(msg.into_bytes())
+                    .unwrap(),
+            );
+            return;
+        }
+    };
+    let content_type = if job.base_only { "image/png" } else { "image/jpeg" };
+    // Rendering, not fetching, is the cost, and a record is one URL: `no-store` keeps the
+    // webview from ever showing pixels from a regenerated proxy or a re-imported LUT.
+    let respond = respond_with(responder, content_type, "no-store");
+    submit_or_fallback(app, JobKey::Edit(job), respond);
+}
+
+/// Parse an `edit://` request. `r` is the record (base64url, unpadded; absent = `{}`),
+/// `m` the longest edge (absent = 0, full), `b=1` base only, `hi=1` the zoom tier; `v`
+/// (a cache-buster) and anything unknown are ignored.
+#[cfg(feature = "edit")]
+pub(crate) fn edit_job_from_uri<T>(request: &Request<T>) -> Result<EditJob, String> {
+    use base64::Engine;
+    let photo_id = photo_id_from_uri(request)?;
+    let mut job = EditJob {
+        photo_id,
+        edit_json: "{}".to_string(),
+        max_edge: 0,
+        hi_res: false,
+        base_only: false,
+    };
+    let query = request.uri().query().unwrap_or("");
+    for pair in query.split('&').filter(|p| !p.is_empty()) {
+        let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+        match k {
+            "r" => {
+                let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .decode(v)
+                    .map_err(|e| format!("bad record encoding: {e}"))?;
+                job.edit_json =
+                    String::from_utf8(bytes).map_err(|e| format!("record is not UTF-8: {e}"))?;
+            }
+            "m" => job.max_edge = v.parse().map_err(|_| format!("bad max edge {v:?}"))?,
+            "b" => job.base_only = v == "1",
+            "hi" => job.hi_res = v == "1",
+            _ => {}
+        }
+    }
+    Ok(job)
+}
+
+/// The one-shot HTTP-response callback for a pool job: 200 with the bytes, 404 with the
+/// error text.
+fn respond_with(
+    responder: UriSchemeResponder,
+    content_type: &'static str,
+    cache_control: &'static str,
+) -> crate::image_pool::Respond {
+    Box::new(move |result| {
         let response = match result {
             Ok(bytes) => Response::builder()
                 .status(200)
-                .header("Content-Type", "image/jpeg")
-                // Previews are immutable for a given file version; let the webview
-                // cache them so re-viewing is instant.
-                .header("Cache-Control", "max-age=86400")
+                .header("Content-Type", content_type)
+                .header("Cache-Control", cache_control)
                 .body(bytes)
                 .unwrap(),
             Err(msg) => Response::builder()
@@ -70,10 +144,16 @@ pub fn handle_image_request<R: Runtime>(
                 .unwrap(),
         };
         responder.respond(response);
-    });
+    })
+}
 
-    // Use the managed pool when available (normal path), else fall back to a
-    // one-off thread (belt-and-braces: handles the narrow window during setup).
+/// Submit to the managed pool when available (normal path), else fall back to a one-off
+/// thread (belt-and-braces: handles the narrow window during setup).
+fn submit_or_fallback<R: Runtime>(
+    app: tauri::AppHandle<R>,
+    key: JobKey,
+    respond: crate::image_pool::Respond,
+) {
     if let Some(pool) = app.try_state::<std::sync::Arc<ImagePool>>() {
         pool.submit(key, respond);
     } else {
@@ -106,7 +186,11 @@ pub fn render_bytes<R: Runtime>(
     app: &tauri::AppHandle<R>,
     key: JobKey,
 ) -> Result<Vec<u8>, String> {
-    let (id, kind) = key;
+    let (id, kind) = match key {
+        JobKey::Photo { id, kind } => (id, kind),
+        #[cfg(feature = "edit")]
+        JobKey::Edit(job) => return crate::commands::render_edit_bytes(app, &job),
+    };
     let state = app.state::<AppState>();
     // Gather the path CANDIDATES (pure SQL) and the rotation under a brief lock, then
     // stat them OFF the lock via `pick_existing` so a slow/offline NAS can't serialize
@@ -329,4 +413,42 @@ fn photo_id_from_uri<T>(request: &Request<T>) -> Result<i64, String> {
         }
     }
     Err(format!("could not parse photo id from {uri}"))
+}
+
+#[cfg(all(test, feature = "edit"))]
+mod edit_uri_tests {
+    use super::*;
+
+    fn request(uri: &str) -> Request<()> {
+        Request::builder().uri(uri).body(()).unwrap()
+    }
+
+    #[test]
+    fn edit_job_from_uri_parses_all_fields() {
+        // "e30" is base64url("{}"); a full record round-trips the same way.
+        let job = edit_job_from_uri(&request("edit://localhost/123?r=e30&m=720&b=1&hi=1&v=9")).unwrap();
+        assert_eq!(job.photo_id, 123);
+        assert_eq!(job.edit_json, "{}");
+        assert_eq!(job.max_edge, 720);
+        assert!(job.base_only);
+        assert!(job.hi_res);
+
+        let record = r#"{"tone":{"ev":0.5},"lut":{"file":"Kodak ☺.cube"}}"#;
+        let encoded = {
+            use base64::Engine;
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(record)
+        };
+        let job = edit_job_from_uri(&request(&format!("edit://localhost/7?r={encoded}&m=1400"))).unwrap();
+        assert_eq!(job.edit_json, record);
+        assert_eq!((job.max_edge, job.base_only, job.hi_res), (1400, false, false));
+    }
+
+    #[test]
+    fn edit_job_from_uri_defaults_and_rejects_bad_input() {
+        let job = edit_job_from_uri(&request("edit://localhost/5")).unwrap();
+        assert_eq!((job.photo_id, job.edit_json.as_str(), job.max_edge), (5, "{}", 0));
+        assert!(edit_job_from_uri(&request("edit://localhost/5?r=%%%")).is_err());
+        assert!(edit_job_from_uri(&request("edit://localhost/5?m=wide")).is_err());
+        assert!(edit_job_from_uri(&request("edit://localhost/notaphoto?r=e30")).is_err());
+    }
 }

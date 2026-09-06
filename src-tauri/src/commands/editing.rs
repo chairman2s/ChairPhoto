@@ -25,13 +25,77 @@ pub fn set_edit_record(
     with_catalog(&state, |c| c.set_edit_record(photo_id, &edit_json))
 }
 
+/// The blocking body of an edit render — the `edit://` protocol
+/// (`protocol::handle_edit_request`, the Darkroom stage) and the [`render_edit`] command
+/// share it. Resolves the photo's path, decodes the source tier, renders, and encodes:
+/// JPEG q90, or lossless PNG for a base-only frame (the GL drag tier's texture — a JPEG
+/// base would spend the preview↔export parity budget before the shader ran). Operates on
+/// the embedded preview or zoom tier, never the original file.
+#[cfg(feature = "edit")]
+pub fn render_edit_bytes<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    job: &crate::image_pool::EditJob,
+) -> Result<Vec<u8>, String> {
+    use crate::plugins::edit::{self, timing::Stages, RenderOpts};
+    let mut t = Stages::start(format!(
+        "render_edit photo={} max_edge={} hi_res={} base_only={}",
+        job.photo_id, job.max_edge, job.hi_res, job.base_only
+    ));
+    // Gather path candidates under a brief lock (pure SQL), then stat + decode + render
+    // off the lock so a slow/offline NAS can't serialize the app.
+    let state = app.state::<AppState>();
+    let candidates = {
+        let guard = state.catalog.lock().map_err(|e| e.to_string())?;
+        let catalog = guard.as_ref().ok_or("No catalog is open")?;
+        catalog.photo_path_candidates(job.photo_id).map_err(|e| e.to_string())?
+    };
+    t.mark("candidates");
+    // OriginalRequired: an edit render needs the real original, so a cached-unreachable
+    // flag must never stand in for a stat.
+    let path = crate::volume_health::pick_existing(
+        &candidates,
+        &state.volume_health,
+        crate::catalog::ResolveMode::OriginalRequired,
+    )
+    .ok_or_else(|| format!("no reachable copy of photo {}", job.photo_id))?;
+    t.mark("pick_path");
+    let opts = RenderOpts { skip_look: job.base_only };
+    let out = if job.hi_res {
+        // Zoom tier: too large to keep resident — decode per render.
+        let jpeg = crate::thumbnails::zoom_bytes(&path)?;
+        t.mark("zoom_bytes");
+        let img = image::load_from_memory(&jpeg).map_err(|e| e.to_string())?;
+        t.mark("decode");
+        edit::render_image_opts(img, &job.edit_json, job.max_edge, opts)?
+    } else {
+        // Proxy tier: live sliders render this many times a second — decode through
+        // the one-slot cache.
+        let jpeg = crate::thumbnails::preview_bytes(&path)?;
+        t.mark("preview_bytes");
+        let img = edit::decode_proxy_cached(&jpeg)?;
+        t.mark("decode_cache");
+        edit::render_image_opts(img, &job.edit_json, job.max_edge, opts)?
+    };
+    t.mark("render");
+    let bytes = if job.base_only {
+        edit::encode_png_fast(&out)?
+    } else {
+        edit::encode_jpeg(&out, 90)?
+    };
+    t.mark(if job.base_only { "encode_png" } else { "encode_jpeg" });
+    t.report(&format!("bytes={}", bytes.len()));
+    Ok(bytes)
+}
+
 /// Render a photo's preview proxy with an edit record applied (crop + tone), returning
-/// a base64 data URL (`data:image/jpeg;base64,…`) for the loupe/editor. Operates on the
+/// a base64 data URL (`data:image/jpeg;base64,…`) — the loupe window's renderer and the
+/// legacy Develop view. The Darkroom stage does not use this: it loads the same render
+/// through the native `edit://` protocol (see [`render_edit_bytes`]). Operates on the
 /// embedded preview — never the original file. Errors if the `edit` feature is compiled
 /// out. `maxEdge` (0 = full) caps the result size for fast live preview. `hiRes` renders
-/// from the native-size preview tier instead of the fast 2048 one — the loupe requests
-/// it when zooming into a version (a cropped render of the 2048 proxy can be smaller
-/// than the window, leaving nothing to zoom into).
+/// from the native-size preview tier instead of the fast 2048 one — the loupe requests it
+/// when zooming into a version (a cropped render of the 2048 proxy can be smaller than
+/// the window, leaving nothing to zoom into).
 #[tauri::command]
 pub async fn render_edit(
     app: AppHandle,
@@ -47,54 +111,18 @@ pub async fn render_edit(
     }
     #[cfg(feature = "edit")]
     {
-        use crate::plugins::edit::timing::Stages;
-        let hi = hi_res.unwrap_or(false);
-        let mut t = Stages::start(format!("render_edit photo={photo_id} max_edge={max_edge} hi_res={hi}"));
-        // Gather path candidates under a brief lock (pure SQL), then stat + decode +
-        // render off the lock so a slow/offline NAS can't serialize the app.
-        let state = app.state::<AppState>();
-        let candidates = {
-            let guard = state.catalog.lock().map_err(|e| e.to_string())?;
-            let catalog = guard.as_ref().ok_or("No catalog is open")?;
-            catalog.photo_path_candidates(photo_id).map_err(|e| e.to_string())?
+        let job = crate::image_pool::EditJob {
+            photo_id,
+            edit_json,
+            max_edge,
+            hi_res: hi_res.unwrap_or(false),
+            base_only: false,
         };
-        t.mark("candidates");
-        let health = state.volume_health.clone();
-        // The base64 wrap rides the same blocking worker: it is CPU work on a
-        // half-megabyte string, not something for the async thread.
+        // Render and base64-wrap on a blocking worker: both are CPU work, neither belongs
+        // on the async thread.
         tauri::async_runtime::spawn_blocking(move || {
-            // OriginalRequired: an edit render needs the real original, so a
-            // cached-unreachable flag must never stand in for a stat.
-            let path = crate::volume_health::pick_existing(
-                &candidates,
-                &health,
-                crate::catalog::ResolveMode::OriginalRequired,
-            )
-            .ok_or_else(|| format!("no reachable copy of photo {photo_id}"))?;
-            t.mark("pick_path");
-            let bytes = if hi {
-                // Zoom tier: too large to keep resident — decode per render.
-                let jpeg = crate::thumbnails::zoom_bytes(&path)?;
-                t.mark("zoom_bytes");
-                let out = crate::plugins::edit::render_jpeg(&jpeg, &edit_json, max_edge)?;
-                t.mark("decode_render_encode");
-                out
-            } else {
-                // Proxy tier: live sliders render this many times a second — decode
-                // through the one-slot cache (same 90-quality encode as render_jpeg).
-                let jpeg = crate::thumbnails::preview_bytes(&path)?;
-                t.mark("preview_bytes");
-                let img = crate::plugins::edit::decode_proxy_cached(&jpeg)?;
-                t.mark("decode_cache");
-                let out = crate::plugins::edit::render_image(img, &edit_json, max_edge)?;
-                t.mark("render");
-                let bytes = crate::plugins::edit::encode_jpeg(&out, 90)?;
-                t.mark("encode_jpeg");
-                bytes
-            };
+            let bytes = render_edit_bytes(&app, &job)?;
             let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
-            t.mark("base64");
-            t.report(&format!("bytes={}", bytes.len()));
             Ok(format!("data:image/jpeg;base64,{b64}"))
         })
         .await

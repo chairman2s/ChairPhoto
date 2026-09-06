@@ -661,6 +661,47 @@ export const setEditRecord = (photoId: number, editJson: string) =>
 export const renderEdit = (photoId: number, editJson: string, maxEdge = 0, hiRes = false) =>
   invoke<string>("render_edit", { photoId, editJson, maxEdge, hiRes });
 
+/** Options for {@link editRenderUrl}. */
+export interface EditRenderOpts {
+  /** Longest output edge in px; 0 (default) = full size. */
+  maxEdge?: number;
+  /** Render from the native-size zoom tier instead of the 2048 px proxy. */
+  hiRes?: boolean;
+  /** Geometry only — perspective and straighten, no crop, no look — served as lossless
+   *  PNG: the GL drag tier's texture (docs/plans/darkroom/00-status.md). */
+  baseOnly?: boolean;
+  /** Cache-buster, the `thumb://…?v=` convention. */
+  bust?: number;
+}
+
+/** base64url (RFC 4648 §5, unpadded) of a UTF-8 string — URL-safe by construction. */
+export function base64url(s: string): string {
+  let bin = "";
+  for (const b of new TextEncoder().encode(s)) bin += String.fromCharCode(b);
+  return btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+/**
+ * The native `edit://` URL of a photo rendered with an edit record — the Darkroom stage's
+ * `<img src>`. Same inputs ⇒ same URL ⇒ same pixels. The backend serves it through the
+ * bounded LIFO image pool (newest first, identical requests coalesced) and never as base64
+ * over IPC; `Cache-Control: no-store`, so a regenerated proxy or re-imported LUT can never
+ * show stale pixels. 404 when the `edit` backend feature is compiled out.
+ */
+export const editRenderUrl = (
+  photoId: number,
+  editJson: string,
+  opts: EditRenderOpts = {},
+): string => {
+  const q = new URLSearchParams();
+  q.set("r", base64url(editJson));
+  q.set("m", String(opts.maxEdge ?? 0));
+  if (opts.baseOnly) q.set("b", "1");
+  if (opts.hiRes) q.set("hi", "1");
+  if (opts.bust) q.set("v", String(opts.bust));
+  return `${convertFileSrc(String(photoId), "edit")}?${q.toString()}`;
+};
+
 /**
  * Render several edit records against one photo's proxy in a single call (the preset
  * browser's thumbnails). The proxy is decoded once backend-side; per-record failures

@@ -222,15 +222,50 @@ pub fn encode_jpeg(img: &DynamicImage, quality: u8) -> Result<Vec<u8>, String> {
     Ok(out.into_inner())
 }
 
+/// Encode an image as PNG, fastest compression, no filtering — lossless where that is
+/// the point (the GL drag tier's base texture) and cheap enough for a per-geometry render.
+pub fn encode_png_fast(img: &DynamicImage) -> Result<Vec<u8>, String> {
+    use image::codecs::png::{CompressionType, FilterType, PngEncoder};
+    let mut out = std::io::Cursor::new(Vec::new());
+    img.write_with_encoder(PngEncoder::new_with_quality(
+        &mut out,
+        CompressionType::Fast,
+        FilterType::NoFilter,
+    ))
+    .map_err(|e| e.to_string())?;
+    Ok(out.into_inner())
+}
+
+/// Per-render switches that are not part of the record.
+#[derive(Clone, Copy, Default, Debug)]
+pub struct RenderOpts {
+    /// Geometry as the record says (perspective, straighten, crop, downscale) and no look:
+    /// the base the GL drag tier shades in the webview (docs/plans/darkroom/00-status.md).
+    pub skip_look: bool,
+}
+
 /// Apply the edits in `edit_json` (normalized geometry + tone) to an already-decoded image.
 /// `max_edge` (when > 0) downscales the result's longest edge. Used for both the JPEG
 /// proxy path ([`render_jpeg`]) and full-resolution edited export (RAW decode → here).
 pub fn render_image(
-    mut img: DynamicImage,
+    img: DynamicImage,
     edit_json: &str,
     max_edge: u32,
 ) -> Result<DynamicImage, String> {
-    let mut t = timing::Stages::start(format!("render_image max_edge={max_edge}"));
+    render_image_opts(img, edit_json, max_edge, RenderOpts::default())
+}
+
+/// [`render_image`] with [`RenderOpts`].
+pub fn render_image_opts(
+    mut img: DynamicImage,
+    edit_json: &str,
+    max_edge: u32,
+    opts: RenderOpts,
+) -> Result<DynamicImage, String> {
+    let mut t = timing::Stages::start(format!(
+        "render_image max_edge={max_edge} skip_look={}",
+        opts.skip_look
+    ));
     let trimmed = edit_json.trim();
     let edit: EditRecord = serde_json::from_str(if trimmed.is_empty() { "{}" } else { trimmed })
         .map_err(|e| format!("invalid edit record: {e}"))?;
@@ -288,15 +323,21 @@ pub fn render_image(
     // 4) The look — tone, B&W mix, LUT, toning, fade, vignette — in the RGB domain.
     // The LUT (if referenced) is resolved once per render through cube's mtime cache;
     // a missing/corrupt file is non-fatal and the render proceeds without it.
-    let lut = edit.lut.as_ref().and_then(|l| {
-        crate::commands::luts_dir()
-            .ok()
-            .and_then(|dir| cube::load(&dir, &l.file))
-    });
+    let lut = if opts.skip_look {
+        None
+    } else {
+        edit.lut.as_ref().and_then(|l| {
+            crate::commands::luts_dir()
+                .ok()
+                .and_then(|dir| cube::load(&dir, &l.file))
+        })
+    };
     t.mark("lut_load");
     let mut rgb = img.to_rgb8();
     t.mark("to_rgb8");
-    look::apply_look(&mut rgb, &edit, lut.as_deref());
+    if !opts.skip_look {
+        look::apply_look(&mut rgb, &edit, lut.as_deref());
+    }
     t.mark("look");
     t.report(&format!("out={}x{}", rgb.width(), rgb.height()));
 
@@ -465,6 +506,38 @@ fn sample_bilinear(img: &RgbImage, x: f32, y: f32) -> Rgb<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn base_only_skips_look_but_keeps_geometry() {
+        let img = DynamicImage::ImageRgb8(RgbImage::from_fn(64, 48, |x, y| {
+            Rgb([(x * 4) as u8, (y * 5) as u8, ((x + y) * 2) as u8])
+        }));
+        let geometry = r#"{"straighten": 15}"#;
+        let with_look = r#"{"straighten": 15, "tone": {"ev": 1.0}, "vignette": -0.5}"#;
+        let base = render_image_opts(img.clone(), with_look, 0, RenderOpts { skip_look: true }).unwrap();
+        let plain = render_image(img.clone(), geometry, 0).unwrap();
+        assert_eq!(
+            base.to_rgb8().as_raw(),
+            plain.to_rgb8().as_raw(),
+            "a base-only render must equal the geometry-only render, byte for byte"
+        );
+        let looked = render_image(img, with_look, 0).unwrap();
+        assert_ne!(
+            base.to_rgb8().as_raw(),
+            looked.to_rgb8().as_raw(),
+            "the look is what was skipped"
+        );
+    }
+
+    #[test]
+    fn png_base_roundtrips_losslessly() {
+        let img = DynamicImage::ImageRgb8(RgbImage::from_fn(40, 30, |x, y| {
+            Rgb([(x * 6) as u8, (y * 8) as u8, ((x ^ y) * 3) as u8])
+        }));
+        let png = encode_png_fast(&img).unwrap();
+        let back = image::load_from_memory(&png).unwrap().to_rgb8();
+        assert_eq!(back.as_raw(), img.to_rgb8().as_raw());
+    }
 
     fn solid_jpeg(r: u8, g: u8, b: u8) -> Vec<u8> {
         let img = RgbImage::from_pixel(16, 16, image::Rgb([r, g, b]));

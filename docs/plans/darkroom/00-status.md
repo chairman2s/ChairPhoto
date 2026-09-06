@@ -15,6 +15,50 @@
 - [x] Slice 7 — version shelf & save-as-new-version (2026-09-05; user re-steer: the Darkroom is a sandbox — never overwrites its starting version; Save banks the settings as a NEW version)
 - [ ] Slice 8 — the swap: Darkroom becomes Develop
 
+## Follow-on: GPU smoothness (branch `feature/darkroom-gpu`, plan 2026-09-06)
+
+Direction (user, 2026-09-06): phased — a WebGL2 look shader as the drag tier now (the
+settled Rust render stays the oracle), a native `wgpu` backend later, evidence-gated. The
+survey and plan live in the session plan file; the increments are:
+
+- [x] Gate 0 — WebGL probe (`GlSpike.tsx`, Preferences → Darkroom, behind the timing toggle).
+  Result on the RTX 3080 / WebKitGTK 2.52.6 / DMABUF renderer disabled (the shipped
+  default), two runs, identical: `{"context":true,"renderer":"Apple GPU" (masked),
+  "maxTexture":32768,"max3d":16384,"frames":266,"cadence":{"p50":20,"p95":22},
+  "finish":{"p50":0,"p95":1},"lost":false}` — a 1400 px look frame with eight 3D-LUT
+  fetches and the grain hash completes in under a millisecond, at a 50 fps rAF cadence on
+  a 120 Hz monitor. **Gate passed** (bar: finish p50 ≤ 16 ms). The alternative
+  `WEBKIT_DISABLE_DMABUF_RENDERER=0 __NV_DISABLE_EXPLICIT_SYNC=1` row was not measured.
+- [x] Increment 1 — instrumentation (`plugins/edit/timing.rs`, `bench.rs`, the frontend
+  frame log). Baseline, `render_stage_timings`, synthetic 2048×1365 proxy, no LUT, N=10,
+  medians in ms:
+
+  | profile | edge | cache clone | downscale | look | encode jpeg q90 | encode png fast | base64 | render_image total | masses pass (1024) |
+  |---|---|---|---|---|---|---|---|---|---|
+  | debug (`tauri dev`) | 720 | 1.4 | 28.5 | 159.9 | 57.6 | 54.7 | 0.5 | 191.5 | 371.9 |
+  | debug (`tauri dev`) | 1400 | 0.9 | 44.2 | 601.8 | 230.2 | 202.0 | 2.6 | 646.2 | |
+  | release | 720 | 1.3 | 19.4 | 34.6 | 8.4 | 1.8 | 0.04 | 55.2 | 100.5 |
+  | release | 1400 | 1.0 | 44.5 | 129.8 | 34.6 | 6.9 | 0.4 | 176.2 | |
+
+  Reading: in the debug profile the look loop dominates everything (opt-level 0 — only the
+  decoders are optimized in dev, `Cargo.toml` `[profile.dev.package.*]`), so the ~11 fps
+  drag of 2fe085c was a debug-profile figure. In release the look loop still dominates —
+  130 ms of the 176 ms settled frame, 35 of the 55 ms drag frame — with the `image`-crate
+  downscale (19–44 ms) and the JPEG encode (8–35 ms) next; base64 is noise on the Rust side.
+  Two consequences: the Phase 2 gate's criterion (1) (release look ≥ 25 ms at 1400 px) is
+  met before any transport work, and the cheapest lever of all is not GPU at all — the loop
+  is scalar and single-threaded on a 24-thread machine (survey row F); that comparison must
+  be run before the `wgpu` backend is built.
+  Frontend cadence (IPC + paint, `editor.renderTiming.lastSummary`): pending a manual drag
+  with the toggle on — not taken in this session because the desktop was in use.
+- [ ] Increment 2 — native `edit://` transport for the darkroom stage.
+- [ ] Increment 3 — WebGL2 look shader as the drag tier (`editor.gpuPreview`, default off).
+- [ ] Phase 2 gate — `wgpu` backend: build only on the exit criteria in the plan.
+
+Follow-ups recorded here, not done: `LoupeWindow` / `basicEditor` and the
+`render_edit_batch` consumers (`ProofSheet`, `DuelView`, `PresetBrowser`) still receive
+base64 data URLs; `EditorView` retires at slice 8.
+
 ## Notes for a fresh session
 - Branch: `feature/darkroom` (cut from `feature/keeper-stats` at d935381 — the loupe-card
   work lives there and the Darkroom intends to drive the pop-out loupe as the "print").

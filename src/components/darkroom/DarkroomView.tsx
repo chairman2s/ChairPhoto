@@ -52,6 +52,13 @@ import { DuelView } from "./DuelView";
 import { ProofSheet } from "./ProofSheet";
 import { DUEL_LABELS, proofSpread, type DuelDim, type ProofCandidate } from "./spreads";
 import { ToneStrip } from "./ToneStrip";
+import {
+  formatSample,
+  RENDER_TIMING_KEY,
+  RENDER_TIMING_SUMMARY_KEY,
+  summarize,
+  type FrameSample,
+} from "./renderTiming";
 import "./darkroom.css";
 
 const PREVIEW_MAX = 1400;
@@ -112,6 +119,65 @@ export function DarkroomView({
   const [rendering, setRendering] = useState(false);
   const [error, setError] = useState("");
   const renderSeq = useRef(0);
+
+  // ── Frame timing (dev, `editor.renderTiming`) ──
+  // Stamps each tier's request, IPC resolve and on-screen paint; one console line per
+  // frame, a summary every 2 s while frames arrive, and the last summary persisted so a
+  // run can be read back without the inspector. Off, none of this allocates.
+  const timingRef = useRef(false);
+  const samplesRef = useRef<FrameSample[]>([]);
+  const pendingPaintRef = useRef(new Map<string, FrameSample>());
+  const unsummarizedRef = useRef(0);
+  useEffect(() => {
+    let alive = true;
+    getSetting(RENDER_TIMING_KEY)
+      .then((v) => {
+        if (alive) timingRef.current = v === "1";
+      })
+      .catch(() => {});
+    const flush = () => {
+      if (unsummarizedRef.current === 0) return;
+      unsummarizedRef.current = 0;
+      const summary = JSON.stringify(summarize(samplesRef.current));
+      console.debug(`[edit-timing] summary ${summary}`);
+      setSetting(RENDER_TIMING_SUMMARY_KEY, summary).catch(() => {});
+    };
+    const timer = setInterval(flush, 2000);
+    return () => {
+      alive = false;
+      clearInterval(timer);
+      flush();
+    };
+  }, []);
+  const startSample = (seq: number, tier: FrameSample["tier"]): FrameSample | null => {
+    if (!timingRef.current) return null;
+    const s: FrameSample = { seq, tier, requested: performance.now() };
+    samplesRef.current.push(s);
+    if (samplesRef.current.length > 400) samplesRef.current.splice(0, 200);
+    return s;
+  };
+  const logSample = (s: FrameSample) => {
+    unsummarizedRef.current++;
+    console.debug(formatSample(s));
+  };
+  // A frame's paint is attributed by URL when the stage <img> reports the load.
+  const awaitPaint = (s: FrameSample | null, url: string) => {
+    if (!s) return;
+    pendingPaintRef.current.set(url, s);
+    if (pendingPaintRef.current.size > 8) {
+      const oldest = pendingPaintRef.current.keys().next().value;
+      if (oldest !== undefined) pendingPaintRef.current.delete(oldest);
+    }
+  };
+  const onBackdropLoad = (src: string) => {
+    const s = pendingPaintRef.current.get(src);
+    if (!s) return;
+    pendingPaintRef.current.delete(src);
+    requestAnimationFrame((t) => {
+      s.painted = t;
+      logSample(s);
+    });
+  };
 
   // ── Bridge: the record, spoken in the rail/stage's decomposed dialect ──
   const tone: Tone = {
@@ -389,21 +455,38 @@ export function DarkroomView({
     const fastTimer = setTimeout(
       () => {
         lastFastRef.current = Date.now();
+        const sample = startSample(seq, "fast");
         renderEdit(photoId, stageJson, PREVIEW_FAST)
           .then((url) => {
+            if (sample) sample.resolved = performance.now();
             // Never paint the fast tier over a newer state or the settled render.
-            if (renderSeq.current === seq && !fullApplied) setBackdrop(url);
+            if (renderSeq.current === seq && !fullApplied) {
+              setBackdrop(url);
+              awaitPaint(sample, url);
+            } else if (sample) {
+              sample.superseded = true;
+              logSample(sample);
+            }
           })
           .catch(() => {});
       },
       sinceFast > 90 ? 0 : 90 - sinceFast,
     );
     const settleTimer = setTimeout(() => {
+      const sample = startSample(seq, "settled");
       renderEdit(photoId, stageJson, PREVIEW_MAX)
         .then((url) => {
-          if (renderSeq.current !== seq) return;
+          if (sample) sample.resolved = performance.now();
+          if (renderSeq.current !== seq) {
+            if (sample) {
+              sample.superseded = true;
+              logSample(sample);
+            }
+            return;
+          }
           fullApplied = true;
           setBackdrop(url);
+          awaitPaint(sample, url);
           setError("");
         })
         .catch((e) => {
@@ -495,6 +578,7 @@ export function DarkroomView({
               straightenMode={straightenMode}
               onLevel={handleLevel}
               onImgDims={setImgDims}
+              onBackdropLoad={onBackdropLoad}
             />
           </div>
           <div className="dk-strip-row">

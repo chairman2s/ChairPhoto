@@ -47,6 +47,9 @@ pub async fn render_edit(
     }
     #[cfg(feature = "edit")]
     {
+        use crate::plugins::edit::timing::Stages;
+        let hi = hi_res.unwrap_or(false);
+        let mut t = Stages::start(format!("render_edit photo={photo_id} max_edge={max_edge} hi_res={hi}"));
         // Gather path candidates under a brief lock (pure SQL), then stat + decode +
         // render off the lock so a slow/offline NAS can't serialize the app.
         let state = app.state::<AppState>();
@@ -55,8 +58,11 @@ pub async fn render_edit(
             let catalog = guard.as_ref().ok_or("No catalog is open")?;
             catalog.photo_path_candidates(photo_id).map_err(|e| e.to_string())?
         };
+        t.mark("candidates");
         let health = state.volume_health.clone();
-        let bytes = tauri::async_runtime::spawn_blocking(move || {
+        // The base64 wrap rides the same blocking worker: it is CPU work on a
+        // half-megabyte string, not something for the async thread.
+        tauri::async_runtime::spawn_blocking(move || {
             // OriginalRequired: an edit render needs the real original, so a
             // cached-unreachable flag must never stand in for a stat.
             let path = crate::volume_health::pick_existing(
@@ -65,23 +71,34 @@ pub async fn render_edit(
                 crate::catalog::ResolveMode::OriginalRequired,
             )
             .ok_or_else(|| format!("no reachable copy of photo {photo_id}"))?;
-            if hi_res.unwrap_or(false) {
+            t.mark("pick_path");
+            let bytes = if hi {
                 // Zoom tier: too large to keep resident — decode per render.
                 let jpeg = crate::thumbnails::zoom_bytes(&path)?;
-                crate::plugins::edit::render_jpeg(&jpeg, &edit_json, max_edge)
+                t.mark("zoom_bytes");
+                let out = crate::plugins::edit::render_jpeg(&jpeg, &edit_json, max_edge)?;
+                t.mark("decode_render_encode");
+                out
             } else {
                 // Proxy tier: live sliders render this many times a second — decode
                 // through the one-slot cache (same 90-quality encode as render_jpeg).
                 let jpeg = crate::thumbnails::preview_bytes(&path)?;
+                t.mark("preview_bytes");
                 let img = crate::plugins::edit::decode_proxy_cached(&jpeg)?;
-                crate::plugins::edit::render_image(img, &edit_json, max_edge)
-                    .and_then(|out| crate::plugins::edit::encode_jpeg(&out, 90))
-            }
+                t.mark("decode_cache");
+                let out = crate::plugins::edit::render_image(img, &edit_json, max_edge)?;
+                t.mark("render");
+                let bytes = crate::plugins::edit::encode_jpeg(&out, 90)?;
+                t.mark("encode_jpeg");
+                bytes
+            };
+            let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+            t.mark("base64");
+            t.report(&format!("bytes={}", bytes.len()));
+            Ok(format!("data:image/jpeg;base64,{b64}"))
         })
         .await
-        .map_err(|e| e.to_string())??;
-        let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
-        Ok(format!("data:image/jpeg;base64,{b64}"))
+        .map_err(|e| e.to_string())?
     }
 }
 

@@ -7,8 +7,11 @@
 //! to the catalog core.
 
 mod auto;
+#[cfg(test)]
+mod bench;
 pub mod cube;
 mod look;
+pub mod timing;
 mod zones;
 
 pub use auto::auto_tone_for;
@@ -227,9 +230,11 @@ pub fn render_image(
     edit_json: &str,
     max_edge: u32,
 ) -> Result<DynamicImage, String> {
+    let mut t = timing::Stages::start(format!("render_image max_edge={max_edge}"));
     let trimmed = edit_json.trim();
     let edit: EditRecord = serde_json::from_str(if trimmed.is_empty() { "{}" } else { trimmed })
         .map_err(|e| format!("invalid edit record: {e}"))?;
+    t.mark("parse");
 
     // 0) Perspective: map the named quad back onto a rectangle. First, because it
     //    redefines the frame the later stages work within — straighten's centre and
@@ -240,12 +245,14 @@ pub fn render_image(
             img = warped;
         }
     }
+    t.mark("perspective");
 
     // 1) Straighten: rotate about the centre. Corners exposed by the rotation are left
     //    black; the UI's inscribed crop keeps them out of the final frame.
     if edit.straighten.abs() > 0.01 {
         img = rotate_about_center(&img, edit.straighten);
     }
+    t.mark("straighten");
 
     // 2) Crop (normalized → pixels), clamped to the image bounds.
     if let Some(c) = &edit.crop {
@@ -267,6 +274,7 @@ pub fn render_image(
         }
         img = img.crop_imm(x, y, cw, ch);
     }
+    t.mark("crop");
 
     // 3) Optional downscale (preview speed).
     if max_edge > 0 {
@@ -275,6 +283,7 @@ pub fn render_image(
             img = img.thumbnail(max_edge, max_edge);
         }
     }
+    t.mark("downscale");
 
     // 4) The look — tone, B&W mix, LUT, toning, fade, vignette — in the RGB domain.
     // The LUT (if referenced) is resolved once per render through cube's mtime cache;
@@ -284,8 +293,12 @@ pub fn render_image(
             .ok()
             .and_then(|dir| cube::load(&dir, &l.file))
     });
+    t.mark("lut_load");
     let mut rgb = img.to_rgb8();
+    t.mark("to_rgb8");
     look::apply_look(&mut rgb, &edit, lut.as_deref());
+    t.mark("look");
+    t.report(&format!("out={}x{}", rgb.width(), rgb.height()));
 
     Ok(DynamicImage::ImageRgb8(rgb))
 }

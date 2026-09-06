@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { GlSpike } from "./darkroom/GlSpike";
+import { RENDER_TIMING_KEY, RENDER_TIMING_SUMMARY_KEY } from "./darkroom/renderTiming";
 import { confirm } from "@tauri-apps/plugin-dialog";
 import {
   applyOffloadPolicy,
@@ -547,8 +548,7 @@ function TieringSection({ onChanged }: { onChanged: () => void }) {
 // still live on an offline volume (unmounted NAS) are never touched.
 // External develop editors (darktable / RawTherapee / ART). Paths are optional — blank uses
 // the auto-detected command on PATH. Availability (GUI/CLI found) is shown per editor.
-/** Settings keys shared with DarkroomView (read there once per mount). */
-export const RENDER_TIMING_KEY = "editor.renderTiming";
+/** The probe's last report, persisted so it can be read without the inspector. */
 const GL_SPIKE_REPORT_KEY = "editor.glSpike.lastReport";
 
 /** Darkroom early-preview toggle (docs/plans/darkroom): swaps the Develop surface for
@@ -561,6 +561,7 @@ function DarkroomSection() {
   const [timing, setTiming] = useState<boolean | null>(null);
   const [spike, setSpike] = useState(false);
   const [lastSpike, setLastSpike] = useState("");
+  const [lastSummary, setLastSummary] = useState("");
   useEffect(() => {
     getSetting("editor.darkroom")
       .then((v) => setOn(v === "1"))
@@ -570,6 +571,9 @@ function DarkroomSection() {
       .catch(() => setTiming(false));
     getSetting(GL_SPIKE_REPORT_KEY)
       .then((v) => setLastSpike(v ?? ""))
+      .catch(() => {});
+    getSetting(RENDER_TIMING_SUMMARY_KEY)
+      .then((v) => setLastSummary(v ?? ""))
       .catch(() => {});
   }, []);
   const toggle = async () => {
@@ -624,6 +628,11 @@ function DarkroomSection() {
           {lastSpike && (
             <div className="modal-sub" style={{ marginTop: 4, wordBreak: "break-all" }}>
               Last probe: {lastSpike}
+            </div>
+          )}
+          {lastSummary && (
+            <div className="modal-sub" style={{ marginTop: 4, wordBreak: "break-all" }}>
+              Last drag summary: {lastSummary}
             </div>
           )}
         </div>

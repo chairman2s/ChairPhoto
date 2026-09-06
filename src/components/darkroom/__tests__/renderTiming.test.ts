@@ -1,6 +1,6 @@
 // Pure timing math shared by the WebGL probe and the darkroom's frame log.
 import { describe, expect, it } from "vitest";
-import { p50p95, percentile } from "../renderTiming";
+import { formatSample, p50p95, percentile, summarize, type FrameSample } from "../renderTiming";
 
 describe("percentile", () => {
   it("is NaN for an empty list", () => {
@@ -29,5 +29,43 @@ describe("percentile", () => {
 describe("p50p95", () => {
   it("rounds to a tenth of a millisecond", () => {
     expect(p50p95([1.04, 1.06, 1.08])).toEqual({ p50: 1.1, p95: 1.1 });
+  });
+});
+
+describe("summarize", () => {
+  const frames: FrameSample[] = [
+    { seq: 1, tier: "fast", requested: 0, resolved: 40, painted: 50 },
+    { seq: 2, tier: "fast", requested: 90, resolved: 130, superseded: true },
+    { seq: 3, tier: "fast", requested: 180, resolved: 220, painted: 230 },
+    { seq: 3, tier: "settled", requested: 430, resolved: 530, painted: 550 },
+  ];
+
+  it("splits ipc, paint and cadence and counts superseded frames", () => {
+    const s = summarize(frames);
+    expect(s.count).toBe(4);
+    expect(s.superseded).toBe(1);
+    expect(s.ipcMs).toEqual({ p50: 40, p95: 100 });
+    expect(s.paintMs).toEqual({ p50: 10, p95: 20 });
+    // painted at 50, 230, 550 → intervals 180 and 320
+    expect(s.cadenceMs).toEqual({ p50: 180, p95: 320 });
+    expect(s.byTier).toEqual({ fast: 3, settled: 1 });
+  });
+
+  it("is all-NaN but well-formed for no samples", () => {
+    const s = summarize([]);
+    expect(s.count).toBe(0);
+    expect(s.ipcMs.p50).toBeNaN();
+    expect(s.cadenceMs.p95).toBeNaN();
+  });
+});
+
+describe("formatSample", () => {
+  it("prints the round trip and paint, and marks superseded frames", () => {
+    expect(formatSample({ seq: 7, tier: "settled", requested: 0, resolved: 12.34, painted: 20 })).toBe(
+      "[edit-timing] seq=7 tier=settled ipc=12.3ms paint=7.7ms",
+    );
+    expect(formatSample({ seq: 8, tier: "fast", requested: 0, resolved: 5, superseded: true })).toBe(
+      "[edit-timing] seq=8 tier=fast ipc=5.0ms paint=— superseded",
+    );
   });
 });

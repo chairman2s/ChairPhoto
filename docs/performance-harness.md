@@ -81,3 +81,39 @@ and compare:
 
 By default the harness reports thresholds without enforcing them. Set
 `CHAIRPHOTO_PERF_ENFORCE_THRESHOLDS=1` when you want a local run to fail on a clear regression.
+
+## Edit render bench
+
+`src-tauri/src/plugins/edit/bench.rs` is a second ignored test, added for the Darkroom's
+GPU-smoothness work (`docs/plans/darkroom/00-status.md`, "Follow-on: GPU smoothness"). It
+times every stage a slider-drag frame pays — the cached-proxy clone, the downscale, the
+RGB copy, the look loop, JPEG and PNG encode, base64 — plus the end-to-end
+`render_image`, at the 720 px drag tier and the 1400 px settled tier, and the 1024 px
+masses pass the settle also pays. Medians of N runs, one JSON line per edge.
+
+Run it in **both** profiles: `tauri dev` ships the debug profile, where this crate is
+unoptimized (only the decoders are, `Cargo.toml` `[profile.dev.package.*]`), and the
+release profile is what users install. The numbers differ by an order of magnitude.
+
+```bash
+cargo test plugins::edit::bench::render_stage_timings -- --ignored --nocapture
+cargo test --release plugins::edit::bench::render_stage_timings -- --ignored --nocapture
+```
+
+Environment variables:
+
+- `CHAIRPHOTO_EDIT_BENCH_JPEG`: a real 2048 px preview proxy to render; default a synthetic
+  2048×1365 gradient-plus-noise JPEG.
+- `CHAIRPHOTO_EDIT_BENCH_LUT`: a `.cube` file to add a 3D LUT to the look; default none.
+- `CHAIRPHOTO_EDIT_BENCH_N`: runs per stage, default `10`.
+
+### Live render timings
+
+The same stages can be read from a running app: start it with `CHAIRPHOTO_EDIT_TIMING=1`
+and every `render_edit` / `render_image` prints one `[edit-timing] … profile=debug|release`
+line to stderr (`src-tauri/src/plugins/edit/timing.rs`). The frontend half lives behind
+Preferences → Darkroom → "Log render timings to the console": the Darkroom logs one
+`[edit-timing]` line per painted frame (IPC round trip and resolve-to-paint), a summary every
+2 s while frames arrive, and persists the last summary under `editor.renderTiming.lastSummary`
+so a run can be read back without the web inspector. The same toggle exposes the WebGL
+probe (`GlSpike.tsx`), whose last report is kept under `editor.glSpike.lastReport`.

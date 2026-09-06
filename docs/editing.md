@@ -220,3 +220,14 @@ implemented — the crop fixes shape, resize would fix pixels.
 - **Hand-off export (RAW + XMP) stays unedited** — you're giving the RAW to another editor;
   crop/exposure are not written into the sidecar (merge-safe invariant).
 
+### Measuring the render path
+
+Every stage of a render can be timed without a profiler: `CHAIRPHOTO_EDIT_TIMING=1` makes
+the backend print one `[edit-timing]` line per render (stages, total, and the build profile —
+`tauri dev` runs the engine unoptimized, so its numbers are not release numbers), and the
+Darkroom's Preferences toggle "Log render timings to the console" adds the frontend half:
+IPC round trip, resolve-to-paint, and drag cadence per frame, summarized every 2 s and
+persisted under `editor.renderTiming.lastSummary`. The ignored bench
+`plugins::edit::bench::render_stage_timings` gives the same stages in isolation; see
+`docs/performance-harness.md` § Edit render bench.
+

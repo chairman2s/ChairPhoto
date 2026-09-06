@@ -68,6 +68,8 @@ export function EditStage({
   showBefore = false,
   topLeft,
   onImgDims,
+  onBackdropLoad,
+  onBackdropError,
 }: {
   /** The rendered preview (data URL); empty shows `loading`. */
   backdrop: string;
@@ -95,6 +97,10 @@ export function EditStage({
   topLeft?: ReactNode;
   /** The displayed preview's natural dimensions, for the parent's orientation math. */
   onImgDims?: (d: { w: number; h: number }) => void;
+  /** The backdrop <img> finished loading `src` — the frame is on screen next paint. */
+  onBackdropLoad?: (src: string) => void;
+  /** The backdrop <img> failed to load `src`. */
+  onBackdropError?: (src: string) => void;
 }) {
   const stageRef = useRef<HTMLDivElement>(null);
   const frameRef = useRef<HTMLDivElement>(null);
@@ -355,7 +361,9 @@ export function EditStage({
                 const d = { w: e.currentTarget.naturalWidth, h: e.currentTarget.naturalHeight };
                 setImgDims(d);
                 onImgDims?.(d);
+                onBackdropLoad?.(e.currentTarget.src);
               }}
+              onError={(e) => onBackdropError?.(e.currentTarget.src)}
             />
             {crop && !showBefore && (
               <div

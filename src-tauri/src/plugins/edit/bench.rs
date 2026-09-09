@@ -93,6 +93,7 @@ fn render_stage_timings() {
         let mut png_ms = Vec::new();
         let mut b64_ms = Vec::new();
         let mut total_ms = Vec::new();
+        let mut proxy_hit_ms = Vec::new();
         let mut out_dims = (0u32, 0u32);
         let mut jpeg_len = 0usize;
         for _ in 0..n {
@@ -115,6 +116,9 @@ fn render_stage_timings() {
             b64_ms.push(t);
             let (_, t) = timed(|| render_image(decode_proxy_cached(&jpeg).unwrap(), FULL_RECORD, edge).unwrap());
             total_ms.push(t);
+            // The drag path: same geometry as the previous frame → framed-base cache hit.
+            let (_, t) = timed(|| render_proxy(&jpeg, FULL_RECORD, edge, RenderOpts::default()).unwrap());
+            proxy_hit_ms.push(t);
         }
         col("decode_cache_clone", clone_ms);
         col("downscale", down_ms);
@@ -124,6 +128,12 @@ fn render_stage_timings() {
         col("encode_png_fast", png_ms);
         col("base64", b64_ms);
         col("render_image_total", total_ms);
+        // The first render_proxy of an edge is the miss that fills the cache; hits only.
+        proxy_hit_ms.remove(0);
+        if proxy_hit_ms.is_empty() {
+            proxy_hit_ms.push(f64::NAN);
+        }
+        col("render_proxy_cached", proxy_hit_ms);
         let mut line = format!(
             "{{\"edge\":{edge},\"out\":\"{}x{}\",\"jpeg_bytes\":{jpeg_len}",
             out_dims.0, out_dims.1
@@ -139,7 +149,7 @@ fn render_stage_timings() {
     let mut masses_ms = Vec::new();
     for _ in 0..n {
         let (_, t) = timed(|| {
-            let out = render_image(decode_proxy_cached(&jpeg).unwrap(), FULL_RECORD, 1024).unwrap();
+            let out = render_proxy(&jpeg, FULL_RECORD, 1024, RenderOpts::default()).unwrap();
             zones::zone_masses(&out.to_rgb8())
         });
         masses_ms.push(t);

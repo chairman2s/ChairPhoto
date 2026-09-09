@@ -68,13 +68,11 @@ pub fn render_edit_bytes<R: tauri::Runtime>(
         t.mark("decode");
         edit::render_image_opts(img, &job.edit_json, job.max_edge, opts)?
     } else {
-        // Proxy tier: live sliders render this many times a second — decode through
-        // the one-slot cache.
+        // Proxy tier: live sliders render this many times a second — through the decode
+        // cache and the framed-base cache, so a look-only frame pays look + encode.
         let jpeg = crate::thumbnails::preview_bytes(&path)?;
         t.mark("preview_bytes");
-        let img = edit::decode_proxy_cached(&jpeg)?;
-        t.mark("decode_cache");
-        edit::render_image_opts(img, &job.edit_json, job.max_edge, opts)?
+        edit::render_proxy(&jpeg, &job.edit_json, job.max_edge, opts)?
     };
     t.mark("render");
     let bytes = if job.base_only {
@@ -228,10 +226,15 @@ pub async fn edit_zone_masses(
             )
             .ok_or_else(|| format!("no reachable copy of photo {photo_id}"))?;
             let jpeg = crate::thumbnails::preview_bytes(&path)?;
-            let img = crate::plugins::edit::decode_proxy_cached(&jpeg)?;
             // 1024px is plenty of resolution for an 8-bin histogram, and keeps the
-            // render far cheaper than the preview tier's.
-            let out = crate::plugins::edit::render_image(img, &edit_json, 1024)?;
+            // render far cheaper than the preview tier's. Through the framed-base cache:
+            // the settle that asks for masses has the same geometry as the drag before it.
+            let out = crate::plugins::edit::render_proxy(
+                &jpeg,
+                &edit_json,
+                1024,
+                crate::plugins::edit::RenderOpts::default(),
+            )?;
             Ok(crate::plugins::edit::zone_masses(&out.to_rgb8()))
         })
         .await

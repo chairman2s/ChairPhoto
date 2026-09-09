@@ -64,6 +64,25 @@ survey and plan live in the session plan file; the increments are:
   **not** met (release look at 1400 px is 10 ms, under the 25 ms bar): a native GPU
   backend would not buy the drag anything the CPU cannot already do; the next levers are
   the downscale and the encode, or the GL tier, which skips both.
+
+  The first on-screen drag after the rayon change (dev build, Exposure only, persisted
+  summary) barely moved: request→paint p50 118 → 112 ms, 69% of frames superseded. An
+  exposure-only record never had much look to parallelize; that frame was downscale +
+  encode. **Done 2026-09-09, the framed-base cache:** `render_proxy` keeps the proxy after
+  geometry + downscale, before the look, keyed by (proxy fingerprint, geometry, edge), 4
+  entries LRU. A look-only frame now skips perspective/straighten/crop/`thumbnail()`.
+  Bench, the cached drag path (`render_proxy_cached`, look + nothing else) vs the uncached
+  render, ms:
+
+  | profile | edge | render_image total | render_proxy (cache hit) | masses pass |
+  |---|---|---|---|---|
+  | debug | 720 | 42.1 | **12.4** | 76 → 43 |
+  | debug | 1400 | 88.8 | **44.2** | |
+  | release | 720 | 24.2 | **3.1** | 37 → 7 |
+  | release | 1400 | 56.7 | **10.3** | |
+
+  Per frame in release the Rust side is now ~3 ms + 8 ms JPEG encode at 720 px; the
+  encode is the last CPU stage worth touching before the webview's own decode dominates.
   Frontend cadence (IPC + paint, `editor.renderTiming.lastSummary`): pending a manual drag
   with the toggle on — not taken in this session because the desktop was in use.
 - [x] Increment 2 — native `edit://` transport for the darkroom stage (`protocol::handle_edit_request`, `editRenderUrl`; base64 gone from the drag path).

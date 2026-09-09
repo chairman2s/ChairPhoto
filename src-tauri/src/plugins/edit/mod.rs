@@ -203,7 +203,10 @@ fn jpeg_fingerprint(jpeg: &[u8]) -> u64 {
 /// Decode a proxy JPEG through the one-slot cache. Use for interactive proxy renders
 /// only — the hi-res zoom tier is too large to keep resident.
 pub fn decode_proxy_cached(jpeg: &[u8]) -> Result<DynamicImage, String> {
-    let fp = jpeg_fingerprint(jpeg);
+    decode_proxy_cached_fp(jpeg_fingerprint(jpeg), jpeg)
+}
+
+fn decode_proxy_cached_fp(fp: u64, jpeg: &[u8]) -> Result<DynamicImage, String> {
     if let Some((cached_fp, img)) = &*DECODE_CACHE.lock().unwrap() {
         if *cached_fp == fp {
             return Ok(img.clone());
@@ -257,7 +260,7 @@ pub fn render_image(
 
 /// [`render_image`] with [`RenderOpts`].
 pub fn render_image_opts(
-    mut img: DynamicImage,
+    img: DynamicImage,
     edit_json: &str,
     max_edge: u32,
     opts: RenderOpts,
@@ -266,11 +269,72 @@ pub fn render_image_opts(
         "render_image max_edge={max_edge} skip_look={}",
         opts.skip_look
     ));
-    let trimmed = edit_json.trim();
-    let edit: EditRecord = serde_json::from_str(if trimmed.is_empty() { "{}" } else { trimmed })
-        .map_err(|e| format!("invalid edit record: {e}"))?;
+    let edit = parse_record(edit_json)?;
     t.mark("parse");
+    let framed = frame_image(img, &edit, max_edge, &mut t);
+    let rgb = finish_look(framed.to_rgb8(), &edit, opts, &mut t);
+    t.report(&format!("out={}x{}", rgb.width(), rgb.height()));
+    Ok(DynamicImage::ImageRgb8(rgb))
+}
 
+/// Render the interactive proxy tier through both caches: the decoded proxy (one slot)
+/// and the **framed base** — the proxy after geometry and downscale, before the look.
+/// A slider drag changes only the look, so every frame after the first skips the
+/// perspective/straighten/crop/`thumbnail()` stages entirely and pays the look plus the
+/// encode. Keyed by the proxy bytes' fingerprint, the record's geometry, and the edge,
+/// so a regenerated proxy, a different framing, or a different tier is a different
+/// entry; output is byte-identical to [`render_image_opts`] on the decoded proxy
+/// (locked by `framed_base_cache_renders_identically_on_miss_and_hit`).
+pub fn render_proxy(
+    jpeg: &[u8],
+    edit_json: &str,
+    max_edge: u32,
+    opts: RenderOpts,
+) -> Result<DynamicImage, String> {
+    let mut t = timing::Stages::start(format!(
+        "render_proxy max_edge={max_edge} skip_look={}",
+        opts.skip_look
+    ));
+    let edit = parse_record(edit_json)?;
+    t.mark("parse");
+    let fp = jpeg_fingerprint(jpeg);
+    let key = FramedKey {
+        proxy: fp,
+        geometry: geometry_fingerprint(&edit),
+        max_edge,
+    };
+    let base = match framed_cache_get(&key) {
+        Some(base) => {
+            t.mark("framed_cache_hit");
+            base
+        }
+        None => {
+            let img = decode_proxy_cached_fp(fp, jpeg)?;
+            t.mark("decode_cache");
+            let base = frame_image(img, &edit, max_edge, &mut t).to_rgb8();
+            framed_cache_put(key, base.clone());
+            t.mark("framed_cache_put");
+            base
+        }
+    };
+    let rgb = finish_look(base, &edit, opts, &mut t);
+    t.report(&format!("out={}x{}", rgb.width(), rgb.height()));
+    Ok(DynamicImage::ImageRgb8(rgb))
+}
+
+fn parse_record(edit_json: &str) -> Result<EditRecord, String> {
+    let trimmed = edit_json.trim();
+    serde_json::from_str(if trimmed.is_empty() { "{}" } else { trimmed })
+        .map_err(|e| format!("invalid edit record: {e}"))
+}
+
+/// Stages 0–3: geometry and the optional downscale. Everything before the look.
+fn frame_image(
+    mut img: DynamicImage,
+    edit: &EditRecord,
+    max_edge: u32,
+    t: &mut timing::Stages,
+) -> DynamicImage {
     // 0) Perspective: map the named quad back onto a rectangle. First, because it
     //    redefines the frame the later stages work within — straighten's centre and
     //    crop's fractions both refer to the rectified image, not the original.
@@ -319,29 +383,106 @@ pub fn render_image_opts(
         }
     }
     t.mark("downscale");
+    img
+}
 
-    // 4) The look — tone, B&W mix, LUT, toning, fade, vignette — in the RGB domain.
-    // The LUT (if referenced) is resolved once per render through cube's mtime cache;
-    // a missing/corrupt file is non-fatal and the render proceeds without it.
-    let lut = if opts.skip_look {
-        None
-    } else {
-        edit.lut.as_ref().and_then(|l| {
-            crate::commands::luts_dir()
-                .ok()
-                .and_then(|dir| cube::load(&dir, &l.file))
-        })
-    };
-    t.mark("lut_load");
-    let mut rgb = img.to_rgb8();
-    t.mark("to_rgb8");
-    if !opts.skip_look {
-        look::apply_look(&mut rgb, &edit, lut.as_deref());
+/// Stage 4: the look — tone, B&W mix, LUT, toning, fade, vignette — in the RGB domain.
+/// The LUT (if referenced) is resolved once per render through cube's mtime cache; a
+/// missing/corrupt file is non-fatal and the render proceeds without it.
+fn finish_look(
+    mut rgb: RgbImage,
+    edit: &EditRecord,
+    opts: RenderOpts,
+    t: &mut timing::Stages,
+) -> RgbImage {
+    if opts.skip_look {
+        t.mark("look_skipped");
+        return rgb;
     }
+    let lut = edit.lut.as_ref().and_then(|l| {
+        crate::commands::luts_dir()
+            .ok()
+            .and_then(|dir| cube::load(&dir, &l.file))
+    });
+    t.mark("lut_load");
+    look::apply_look(&mut rgb, edit, lut.as_deref());
     t.mark("look");
-    t.report(&format!("out={}x{}", rgb.width(), rgb.height()));
+    rgb
+}
 
-    Ok(DynamicImage::ImageRgb8(rgb))
+// ── The framed-base cache ─────────────────────────────────────────────────────────
+
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+struct FramedKey {
+    /// [`jpeg_fingerprint`] of the proxy bytes.
+    proxy: u64,
+    /// [`geometry_fingerprint`] of the record.
+    geometry: u64,
+    max_edge: u32,
+}
+
+/// Entries kept: the current photo's drag (720) and settled (1400) tiers, the masses
+/// pass (1024), and the loupe's full-size render (0) — one photo's working set. A 2048 px
+/// RGB base is ~12 MB, so the cap is memory, not hit rate. Evicts least recently used.
+const FRAMED_CACHE_CAP: usize = 4;
+static FRAMED_CACHE: Mutex<Vec<(FramedKey, RgbImage)>> = Mutex::new(Vec::new());
+/// Hits since process start — for the tests and the bench, never for behaviour.
+static FRAMED_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn framed_cache_get(key: &FramedKey) -> Option<RgbImage> {
+    let mut cache = FRAMED_CACHE.lock().unwrap();
+    let pos = cache.iter().position(|(k, _)| k == key)?;
+    // Most recently used at the back.
+    let entry = cache.remove(pos);
+    let base = entry.1.clone();
+    cache.push(entry);
+    FRAMED_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    Some(base)
+}
+
+fn framed_cache_put(key: FramedKey, base: RgbImage) {
+    let mut cache = FRAMED_CACHE.lock().unwrap();
+    cache.retain(|(k, _)| *k != key);
+    if cache.len() >= FRAMED_CACHE_CAP {
+        cache.remove(0);
+    }
+    cache.push((key, base));
+}
+
+/// Hits so far (tests and the bench).
+pub fn framed_cache_hits() -> u64 {
+    FRAMED_HITS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Everything [`frame_image`] reads from the record, hashed bit-exactly: two records
+/// with the same geometry share a framed base whatever their look says.
+fn geometry_fingerprint(edit: &EditRecord) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    edit.straighten.to_bits().hash(&mut h);
+    match &edit.crop {
+        Some(c) => {
+            1u8.hash(&mut h);
+            c.x.to_bits().hash(&mut h);
+            c.y.to_bits().hash(&mut h);
+            c.w.to_bits().hash(&mut h);
+            c.h.to_bits().hash(&mut h);
+            c.aspect.hash(&mut h);
+        }
+        None => 0u8.hash(&mut h),
+    }
+    match &edit.perspective {
+        Some(p) => {
+            1u8.hash(&mut h);
+            for corner in [p.tl, p.tr, p.br, p.bl] {
+                corner[0].to_bits().hash(&mut h);
+                corner[1].to_bits().hash(&mut h);
+            }
+            p.aspect.map(f32::to_bits).hash(&mut h);
+        }
+        None => 0u8.hash(&mut h),
+    }
+    h.finish()
 }
 
 /// Warp the quadrilateral named by `p` onto a rectangle, undoing the keystone of an
@@ -506,6 +647,75 @@ fn sample_bilinear(img: &RgbImage, x: f32, y: f32) -> Rgb<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn proxy_jpeg(seed: u32) -> Vec<u8> {
+        let img = RgbImage::from_fn(96, 64, |x, y| {
+            Rgb([
+                ((x * 3 + seed) % 256) as u8,
+                ((y * 5 + seed * 7) % 256) as u8,
+                (((x + y) * 2 + seed * 13) % 256) as u8,
+            ])
+        });
+        encode_jpeg(&DynamicImage::ImageRgb8(img), 95).unwrap()
+    }
+
+    #[test]
+    fn framed_base_cache_renders_identically_on_miss_and_hit() {
+        let jpeg = proxy_jpeg(1);
+        let record = r#"{"straighten": 6, "crop": {"x": 0.1, "y": 0.1, "w": 0.8, "h": 0.8},
+                         "tone": {"ev": 0.7, "contrast": 0.2}, "vignette": -0.4}"#;
+        let plain = render_image(image::load_from_memory(&jpeg).unwrap(), record, 48).unwrap();
+        let hits0 = framed_cache_hits();
+        let miss = render_proxy(&jpeg, record, 48, RenderOpts::default()).unwrap();
+        let hit = render_proxy(&jpeg, record, 48, RenderOpts::default()).unwrap();
+        assert!(framed_cache_hits() > hits0, "the second render must hit the framed cache");
+        assert_eq!(miss.to_rgb8().as_raw(), plain.to_rgb8().as_raw(), "miss ≠ uncached path");
+        assert_eq!(hit.to_rgb8().as_raw(), plain.to_rgb8().as_raw(), "hit ≠ uncached path");
+
+        // A look-only change reuses the base; the output still follows the record.
+        let hits1 = framed_cache_hits();
+        let brighter = r#"{"straighten": 6, "crop": {"x": 0.1, "y": 0.1, "w": 0.8, "h": 0.8},
+                           "tone": {"ev": 1.5}}"#;
+        let out = render_proxy(&jpeg, brighter, 48, RenderOpts::default()).unwrap();
+        assert!(framed_cache_hits() > hits1, "a look-only change must reuse the framed base");
+        let expect = render_image(image::load_from_memory(&jpeg).unwrap(), brighter, 48).unwrap();
+        assert_eq!(out.to_rgb8().as_raw(), expect.to_rgb8().as_raw());
+    }
+
+    #[test]
+    fn framed_base_cache_keys_on_geometry_edge_and_photo() {
+        let a = proxy_jpeg(2);
+        let b = proxy_jpeg(3);
+        let rec = r#"{"tone": {"ev": 0.3}}"#;
+        let tilted = r#"{"tone": {"ev": 0.3}, "straighten": 4}"#;
+        let base = render_proxy(&a, rec, 48, RenderOpts::default()).unwrap();
+        // Same photo, same look, different geometry → different pixels, never a stale base.
+        let geo = render_proxy(&a, tilted, 48, RenderOpts::default()).unwrap();
+        assert_ne!(base.to_rgb8().as_raw(), geo.to_rgb8().as_raw());
+        assert_eq!(
+            geo.to_rgb8().as_raw(),
+            render_image(image::load_from_memory(&a).unwrap(), tilted, 48).unwrap().to_rgb8().as_raw()
+        );
+        // Different edge → the right size, not the cached one.
+        let big = render_proxy(&a, rec, 64, RenderOpts::default()).unwrap();
+        assert_ne!(big.dimensions(), base.dimensions());
+        // Another photo with the same dimensions and record → its own pixels.
+        let other = render_proxy(&b, rec, 48, RenderOpts::default()).unwrap();
+        assert_ne!(other.to_rgb8().as_raw(), base.to_rgb8().as_raw());
+        assert_eq!(
+            other.to_rgb8().as_raw(),
+            render_image(image::load_from_memory(&b).unwrap(), rec, 48).unwrap().to_rgb8().as_raw()
+        );
+    }
+
+    #[test]
+    fn framed_base_cache_is_bounded() {
+        let jpeg = proxy_jpeg(4);
+        for edge in [8u32, 9, 10, 11, 12, 13, 14] {
+            render_proxy(&jpeg, "{}", edge, RenderOpts::default()).unwrap();
+        }
+        assert!(FRAMED_CACHE.lock().unwrap().len() <= FRAMED_CACHE_CAP);
+    }
 
     #[test]
     fn base_only_skips_look_but_keeps_geometry() {

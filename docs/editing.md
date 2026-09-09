@@ -210,6 +210,13 @@ implemented — the crop fixes shape, resize would fix pixels.
 
 - **Live preview:** render the cached **preview proxy** (embedded JPEG, ~fast) as sliders/crop
   change (debounced). Proxy quality is fine for judging an edit.
+- **Two caches make the drag cheap.** The proxy JPEG is decoded once (a one-slot cache
+  keyed by the bytes' fingerprint), and `render_proxy` keeps the **framed base** — the
+  proxy after perspective → straighten → crop → downscale, before the look — keyed by
+  (proxy fingerprint, geometry, edge), four entries, least recently used out. A look-only
+  slider frame therefore pays the look and the encode and nothing else; a geometry change
+  is a miss and re-frames. Both caches are byte-identical to the uncached path (locked by
+  tests in `plugins/edit`).
 - **Transport — the Darkroom stage is a native URL.** The stage `<img>` loads
   `edit://<photoId>?r=<base64url(record)>&m=<maxEdge>[&b=1][&hi=1][&v=bust]`
   (`editRenderUrl` in `src/modules/api.ts`; `protocol::handle_edit_request` and

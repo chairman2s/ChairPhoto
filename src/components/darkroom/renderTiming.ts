@@ -50,10 +50,14 @@ export interface TimingSummary {
   ipcMs: { p50: number; p95: number };
   /** resolve → on screen for those same frames (data-URL parse, JPEG decode, layout). */
   paintMs: { p50: number; p95: number };
-  /** interval between consecutive painted frames of any tier. */
+  /** interval between consecutive painted frames of any tier, within a drag — a gap
+   *  longer than IDLE_GAP_MS is the user pausing, not a slow frame, and is not counted. */
   cadenceMs: { p50: number; p95: number };
   byTier: Partial<Record<Tier, number>>;
 }
+
+/** A pause between painted frames longer than this is idle time, not cadence. */
+export const IDLE_GAP_MS = 1000;
 
 export function summarize(samples: FrameSample[]): TimingSummary {
   const latency: number[] = [];
@@ -73,7 +77,10 @@ export function summarize(samples: FrameSample[]): TimingSummary {
     }
   }
   painted.sort((a, b) => a - b);
-  const cadence = painted.slice(1).map((t, i) => t - painted[i]);
+  const cadence = painted
+    .slice(1)
+    .map((t, i) => t - painted[i])
+    .filter((gap) => gap <= IDLE_GAP_MS);
   return {
     count: samples.length,
     superseded,

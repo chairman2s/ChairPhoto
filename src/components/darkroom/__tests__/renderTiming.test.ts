@@ -63,6 +63,17 @@ describe("summarize", () => {
     expect(s.cadenceMs).toEqual({ p50: 340, p95: 340 });
   });
 
+  it("does not count a pause between drags as cadence", () => {
+    const s = summarize([
+      { seq: 1, tier: "fast", requested: 0, painted: 40 },
+      { seq: 2, tier: "fast", requested: 90, painted: 130 },
+      // …the user lets go, thinks, and drags again 5 s later
+      { seq: 3, tier: "fast", requested: 5000, painted: 5040 },
+      { seq: 4, tier: "fast", requested: 5090, painted: 5130 },
+    ]);
+    expect(s.cadenceMs).toEqual({ p50: 90, p95: 90 });
+  });
+
   it("is all-NaN but well-formed for no samples", () => {
     const s = summarize([]);
     expect(s.count).toBe(0);

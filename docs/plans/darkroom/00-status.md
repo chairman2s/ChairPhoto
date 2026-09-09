@@ -47,8 +47,23 @@ survey and plan live in the session plan file; the increments are:
   downscale (19–44 ms) and the JPEG encode (8–35 ms) next; base64 is noise on the Rust side.
   Two consequences: the Phase 2 gate's criterion (1) (release look ≥ 25 ms at 1400 px) is
   met before any transport work, and the cheapest lever of all is not GPU at all — the loop
-  is scalar and single-threaded on a 24-thread machine (survey row F); that comparison must
-  be run before the `wgpu` backend is built.
+  was scalar and single-threaded on a 24-thread machine (survey row F). **Done 2026-09-09:**
+  `apply_look` now runs over row chunks on rayon, byte-identical to the scalar loop (locked
+  by `parallel_look_matches_the_sequential_loop`). Same bench, after:
+
+  | profile | edge | look before → after | render_image total before → after | encode jpeg q90 | masses pass |
+  |---|---|---|---|---|---|
+  | debug | 720 | 159.9 → 12.5 | 191.5 → 42.6 | 58.0 | 371.9 → 76.1 |
+  | debug | 1400 | 601.8 → 44.2 | 646.2 → 89.4 | 231.1 | |
+  | release | 720 | 34.6 → 3.1 | 55.2 → 23.6 | 8.5 | 100.5 → 36.8 |
+  | release | 1400 | 129.8 → 9.8 | 176.2 → 56.1 | 34.8 | |
+
+  The look is no longer the bottleneck in either profile. What remains per frame is the
+  `image`-crate downscale (20–45 ms, `thumbnail()` is single-threaded) and the JPEG
+  encode (8–35 ms release, 58–231 ms debug). So the Phase 2 gate's criterion (1) is now
+  **not** met (release look at 1400 px is 10 ms, under the 25 ms bar): a native GPU
+  backend would not buy the drag anything the CPU cannot already do; the next levers are
+  the downscale and the encode, or the GL tier, which skips both.
   Frontend cadence (IPC + paint, `editor.renderTiming.lastSummary`): pending a manual drag
   with the toggle on — not taken in this session because the desktop was in use.
 - [x] Increment 2 — native `edit://` transport for the darkroom stage (`protocol::handle_edit_request`, `editRenderUrl`; base64 gone from the drag path).

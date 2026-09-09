@@ -5,6 +5,7 @@
 //! default, so old edit records render unchanged.
 
 use image::RgbImage;
+use rayon::prelude::*;
 use serde::Deserialize;
 
 use super::cube::CubeLut;
@@ -140,7 +141,13 @@ pub(super) fn apply_look(img: &mut RgbImage, edit: &EditRecord, lut: Option<&Cub
     let long_edge = w.max(h) as f32;
     let grain_freq = grain.map(|g| 1200.0 / g.size.clamp(0.5, 3.0));
 
-    for (x, y, px) in img.enumerate_pixels_mut() {
+    // Every pixel is a pure function of (x, y, its own bytes) and the constants above, so
+    // rows are independent: rayon splits the buffer into row chunks across the thread
+    // pool. Same per-pixel arithmetic in the same order as the scalar loop this replaced
+    // — locked byte-for-byte by `parallel_look_matches_the_sequential_loop` below — so
+    // preview↔export parity and the grain/zone/LUT identity tests are untouched.
+    let row_bytes = w as usize * 3;
+    let per_pixel = |x: u32, y: u32, px: &mut [u8]| {
         let mut c = [
             px[0] as f32 / 255.0,
             px[1] as f32 / 255.0,
@@ -277,7 +284,19 @@ pub(super) fn apply_look(img: &mut RgbImage, edit: &EditRecord, lut: Option<&Cub
         px[0] = (c[0] * 255.0).round().clamp(0.0, 255.0) as u8;
         px[1] = (c[1] * 255.0).round().clamp(0.0, 255.0) as u8;
         px[2] = (c[2] * 255.0).round().clamp(0.0, 255.0) as u8;
+    };
+
+    if row_bytes == 0 {
+        return;
     }
+    img.as_mut()
+        .par_chunks_mut(row_bytes)
+        .enumerate()
+        .for_each(|(y, row)| {
+            for (x, px) in row.chunks_exact_mut(3).enumerate() {
+                per_pixel(x as u32, y as u32, px);
+            }
+        });
 }
 
 /// Value noise in [-1, 1]: bilinear interpolation of a hash at the four surrounding
@@ -328,5 +347,49 @@ fn hue_rgb(h_deg: f32) -> [f32; 3] {
         3 => [0.0, x, 1.0],
         4 => [x, 0.0, 1.0],
         _ => [1.0, 0.0, x],
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The parallel loop must be indistinguishable from running the same work on one
+    /// thread: same bytes, whatever the chunking. A full record so every branch runs.
+    #[test]
+    fn parallel_look_matches_the_sequential_loop() {
+        let edit: EditRecord = serde_json::from_str(
+            r#"{"tone":{"ev":0.4,"contrast":0.2,"highlights":-0.3,"shadows":0.25,"whites":0.1,
+                 "blacks":-0.1,"vibrance":0.3,"saturation":0.1,"wb":{"temp":0.3,"tint":-0.2}},
+                "zones":[0.2,0,0.1,0,-0.1,0,0.1,0],
+                "split":{"shadow_hue":35,"shadow_sat":0.3,"highlight_hue":275,"highlight_sat":0.2,"balance":0.1},
+                "fade":0.3,"vignette":-0.6,"grain":{"amount":0.7,"size":1.4,"seed":3}}"#,
+        )
+        .unwrap();
+        let src = RgbImage::from_fn(301, 173, |x, y| {
+            image::Rgb([(x % 256) as u8, (y * 3 % 256) as u8, ((x ^ y) % 256) as u8])
+        });
+
+        let mut parallel = src.clone();
+        apply_look(&mut parallel, &edit, None);
+
+        // The single-threaded reference: the same function, forced onto one thread.
+        let mut sequential = src.clone();
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap()
+            .install(|| apply_look(&mut sequential, &edit, None));
+
+        assert_ne!(parallel.as_raw(), src.as_raw(), "the record must actually change pixels");
+        assert_eq!(parallel.as_raw(), sequential.as_raw(), "thread count must not change a byte");
+    }
+
+    #[test]
+    fn empty_image_is_a_no_op() {
+        let mut img = RgbImage::new(0, 0);
+        let edit: EditRecord = serde_json::from_str(r#"{"tone":{"ev":1}}"#).unwrap();
+        apply_look(&mut img, &edit, None);
+        assert_eq!(img.dimensions(), (0, 0));
     }
 }

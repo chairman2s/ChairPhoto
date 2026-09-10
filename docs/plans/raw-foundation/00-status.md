@@ -6,7 +6,7 @@
 - Gate 4 — Slice plan: APPROVED 2026-09-10
 
 ## Slices
-- [ ] Slice 1 — tracer bullet: vendored LibRaw builds with the app; `raw_probe`; the source badge
+- [x] Slice 1 — tracer bullet: vendored LibRaw builds with the app; `raw_probe`; the source badge (2026-09-10; on-screen check of the badge on the A7R VI pending the next dev restart)
 - [ ] Slice 2 — the working image renders (engine 2 behind `develop.rawEngine`); corpus measurements
 - [ ] Slice 3 — ownership and cleanup, forced
 - [ ] Slice 4 — the `.rawf` decode cache + neighbour preload

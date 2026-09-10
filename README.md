@@ -50,7 +50,7 @@ degrade one feature; they never crash the app** — but you'll want them.
 | **ffmpeg** | Video poster frames, slideshow `.mp4` render | No video thumbs, no slideshow |
 | **ImageMagick** *(with the libheif delegate)* | HEIF/HEIC (iPhone) decode | HEIC tiles show "no preview" |
 | **ONNX Runtime** *(1.24 or newer)* | Face tagging and Smart Tagging inference | Those two modules report the runtime is missing; everything else is unaffected |
-| **LibRaw** | Full-resolution RAW decode (build-time link) | Build fails unless you disable the `raw` feature |
+| **LibRaw** (vendored) | Full-resolution RAW decode — a pinned git submodule compiled into the binary (`git submodule update --init`) | Build fails unless you disable the `raw` feature |
 
 Building additionally needs a Rust toolchain, Node.js, and the usual Tauri Linux
 dependencies (`webkit2gtk-4.1`, `gtk3`, `librsvg`), plus `clang`/`libclang` for the LibRaw
@@ -60,7 +60,7 @@ bindings.
 
 ```bash
 sudo pacman -S --needed \
-  perl-image-exiftool exiv2 ffmpeg imagemagick libheif libraw \
+  perl-image-exiftool exiv2 ffmpeg imagemagick libheif \
   clang pkgconf webkit2gtk-4.1 gtk3 librsvg \
   rust nodejs npm
 
@@ -73,7 +73,7 @@ sudo pacman -S --needed onnxruntime-cpu
 
 ```bash
 sudo apt install \
-  libimage-exiftool-perl exiv2 ffmpeg imagemagick libheif1 libraw-dev \
+  libimage-exiftool-perl exiv2 ffmpeg imagemagick libheif1 zlib1g-dev \
   clang pkg-config libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev \
   nodejs npm
 # Rust via https://rustup.rs
@@ -118,7 +118,7 @@ cargo build --no-default-features --features edit,collage,slideshow
 
 | Feature | What it adds | Extra cost |
 |---|---|---|
-| `raw` | Full-res RAW decode | LibRaw + libclang at build time |
+| `raw` | Full-res RAW decode | the vendored LibRaw submodule, a C++ compiler, zlib and libclang at build time |
 | `edit` | Crop/tone render engine | none |
 | `faces` | Local face detect + recognise | ONNX Runtime at runtime + model download |
 | `smarttags` | Local CLIP tag suggestions | ONNX Runtime at runtime + ~350 MB model |

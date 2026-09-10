@@ -702,6 +702,7 @@ version = "2026.8.0"
 dependencies = [
  "base64 0.22.1",
  "bindgen",
+ "cc",
  "chromiumoxide",
  "chrono",
  "futures-util",
@@ -711,7 +712,6 @@ dependencies = [
  "libloading 0.8.9",
  "lru",
  "ort",
- "pkg-config",
  "quick-xml 0.37.5",
  "rayon",
  "rcgen",

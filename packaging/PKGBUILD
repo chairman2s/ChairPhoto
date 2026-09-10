@@ -13,7 +13,8 @@ license=('GPL-3.0-only')
 # the moment that intermediate package drops it. Regenerate after changing linked libraries:
 #   readelf -d usr/bin/chairphoto | grep NEEDED   ->   pacman -Qoq /usr/lib/<soname>
 #
-#   libraw          full-resolution RAW decode, linked at build time by the `raw` feature
+#   (LibRaw is vendored — src-tauri/vendor/LibRaw, compiled into the binary by build.rs — so it
+#   is a second source tarball below, not a depends entry.)
 #   hicolor-icon-theme  owns the /usr/share/icons/hicolor directories this package installs into.
 #
 # librsvg is deliberately absent. Tauri's Linux prerequisites name it, but this package ships
@@ -28,13 +29,12 @@ depends=(
   'gtk3'
   'hicolor-icon-theme'
   'libgcc'
-  'libraw'
   'libsoup3'
   'webkit2gtk-4.1'
 )
 
-# clang/pkgconf are for the LibRaw bindgen step in src-tauri/build.rs, which reads the
-# installed header so the struct ABI matches the linked library exactly.
+# clang is for the LibRaw bindgen step in src-tauri/build.rs, which reads the vendored header
+# so the struct ABI matches the compiled library exactly; the C++ compiler builds LibRaw itself.
 makedepends=(
   'cargo'
   'clang'
@@ -64,14 +64,24 @@ optdepends=(
 # are unaffected, which is why only these two show up.
 options=(!lto)
 
+# The vendored LibRaw is a git submodule, which a release tarball does not contain; fetch
+# the pinned snapshot as its own tarball and place it in prepare(). Keep `_libraw_commit` in
+# step with `git -C src-tauri/vendor/LibRaw rev-parse HEAD` at the tagged release.
+_libraw_commit=dde798dd
 source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz"
+        "libraw-$_libraw_commit.tar.gz::https://github.com/LibRaw/LibRaw/archive/$_libraw_commit.tar.gz"
         "$pkgname.desktop")
 # Regenerate with `updpkgsums` after every pkgver bump; see README.md in this directory.
 sha256sums=('9243bce8e428bf534228c598f0b5e78cb932684adf4fa91965d583bd1ebb2ebf'
+            'SKIP'
             'f886deeefb89b0ac96497bf02e6307539175fbb99a498ba3f40ed8ff14e10f00')
 
 prepare() {
   cd "ChairPhoto-$pkgver"
+
+  # Drop the (empty) submodule directory from the tarball and put the pinned snapshot there.
+  rm -rf src-tauri/vendor/LibRaw
+  cp -r "$srcdir/LibRaw-$_libraw_commit"* src-tauri/vendor/LibRaw
 
   # Both fetches need network, and are kept here so build() can run entirely offline.
   # --locked pins the Cargo.lock versions; --target limits the fetch to this host.

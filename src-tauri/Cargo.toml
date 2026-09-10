@@ -85,10 +85,13 @@ smarttags-cuda = ["smarttags", "ort/cuda"]
 # Rust deps — it shells out to the external `ffmpeg` binary (detected on PATH at runtime,
 # like exiftool/Chrome) — so this is purely a compile gate. See docs/slideshow.md.
 slideshow = []
-# Full RAW decode via the system LibRaw (FFI), used for full-resolution edited export
-# (docs/editing.md, Phase 3). Needs LibRaw + a working clang/libclang at build time
-# (bindgen reads the installed header so the ABI matches exactly). Build without it on
-# machines that lack LibRaw: `--no-default-features --features ai,edit`.
+# Full RAW decode via LibRaw (FFI): full-resolution edited export today, and the Develop
+# working image (docs/plans/raw-foundation). LibRaw is **vendored** — a pinned git submodule
+# at src-tauri/vendor/LibRaw, compiled by build.rs with the `cc` crate and linked statically
+# under its CDDL-1.0 option — because the packaged releases lag new cameras (0.22.2 cannot
+# open a Sony ILCE-7RM6; the pinned snapshot can). Needs a C++ compiler, zlib and a working
+# clang/libclang (bindgen) at build time; no system LibRaw. `git submodule update --init`
+# after cloning. Build without it: `--no-default-features --features ai,edit`.
 raw = []
 
 # Test-only. `hooks` gives rusqlite's authorizer callback, which one identity test uses to
@@ -102,9 +105,11 @@ rusqlite = { version = "0.31", features = ["hooks"] }
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 # Only used when the `raw` feature is on (gated inside build.rs by CARGO_FEATURE_RAW);
-# they compile regardless but do no work unless invoked.
+# they compile regardless but do no work unless invoked. `cc` compiles the vendored LibRaw
+# (src-tauri/vendor/LibRaw, a pinned git submodule) into the binary; `bindgen` reads that
+# same tree's header, so the FFI struct layout matches the compiled library by construction.
 bindgen = "0.70"
-pkg-config = "0.3"
+cc = { version = "1", features = ["parallel"] }
 
 [dependencies]
 tauri = { version = "2", features = ["protocol-asset"] }

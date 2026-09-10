@@ -720,6 +720,18 @@ export const editZoneMasses = (photoId: number, editJson: string) =>
 export const suggestAutoTone = (photoId: number) =>
   invoke<string>("suggest_auto_tone", { photoId });
 
+// --- Develop source (docs/plans/raw-foundation) ---
+
+/** What the decoder makes of a photo's file — the Darkroom's source badge. */
+export type DevelopSource =
+  | { source: "raw"; camera: string; megapixels: number; bits: number; decoder: string }
+  | { source: "unsupported"; camera: string | null; reason: string }
+  | { source: "jpeg" }
+  | { source: "nodecoder" };
+
+/** Identify a photo's file with the vendored RAW decoder (no pixels are read). */
+export const rawProbe = (photoId: number) => invoke<DevelopSource>("raw_probe", { photoId });
+
 // --- LUTs (user-supplied .cube files, referenced by edit records by filename) ---
 
 /** Filenames of the .cube LUTs available in the app's luts folder. */

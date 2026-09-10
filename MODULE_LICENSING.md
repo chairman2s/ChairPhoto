@@ -46,3 +46,11 @@ third-party services (the Flickr API, the Claude API) that nobody expects to be 
    (see the host-API stability contract in the plugin system docs).
 4. Never bundle credentials. Take API keys from the user at runtime, the way the
    built-in publishing modules do.
+
+## Bundled third-party code
+
+ChairPhoto vendors **LibRaw** (`src-tauri/vendor/LibRaw`, a pinned git submodule) and
+compiles it into the binary for RAW decoding. LibRaw is dual-licensed; ChairPhoto takes it
+under the **CDDL-1.0** option (`LICENSE.CDDL` in that tree), whose file-scope copyleft is
+compatible with static linking into a GPL-3.0 program without a relinking obligation.
+LibRaw's own sources are unmodified; a decoder bump is a submodule pointer change.

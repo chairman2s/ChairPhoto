@@ -411,6 +411,7 @@ pub fn run() {
             commands::remove_tag_from_group,
             commands::get_edit_record,
             commands::set_edit_record,
+            commands::raw_probe,
             commands::render_edit,
             commands::render_edit_batch,
             commands::edit_zone_masses,

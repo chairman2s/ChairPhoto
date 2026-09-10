@@ -17,6 +17,8 @@ import {
   getSetting,
   listVersions,
   PhotoVersion,
+  rawProbe,
+  type DevelopSource,
   setSetting,
   setVersionEdit,
   suggestAutoTone,
@@ -51,6 +53,7 @@ import {
 import { DuelView } from "./DuelView";
 import { ProofSheet } from "./ProofSheet";
 import { DUEL_LABELS, proofSpread, type DuelDim, type ProofCandidate } from "./spreads";
+import { badgeFor } from "./developSource";
 import { stageJsonFor } from "./stageJson";
 import { ToneStrip } from "./ToneStrip";
 import {
@@ -116,6 +119,19 @@ export function DarkroomView({
       .catch(() => setVersions([]));
   }, [photoId]);
   const [backdrop, setBackdrop] = useState("");
+  // The source badge (docs/plans/raw-foundation, slice 1): what the decoder makes of this
+  // photo's file. Probe only — the stage still renders the camera preview until slice 2.
+  const [source, setSource] = useState<DevelopSource | null>(null);
+  useEffect(() => {
+    let alive = true;
+    setSource(null);
+    rawProbe(photoId)
+      .then((s) => alive && setSource(s))
+      .catch(() => alive && setSource(null));
+    return () => {
+      alive = false;
+    };
+  }, [photoId]);
   const [masses, setMasses] = useState<number[]>([]);
   const [rendering, setRendering] = useState(false);
   const [error, setError] = useState("");
@@ -532,6 +548,11 @@ export function DarkroomView({
           ))}
         </span>
         <span className="dk-hint">{rendering ? "rendering…" : ""}</span>
+        {source && (
+          <span className={`dk-source dk-source-${badgeFor(source).tone}`} title={badgeFor(source).title}>
+            {badgeFor(source).label}
+          </span>
+        )}
         <button
           className={`dk-loupe-toggle ${printOnLoupe ? "on" : ""}`}
           onClick={togglePrintOnLoupe}

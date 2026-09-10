@@ -1,0 +1,3 @@
+[submodule "src-tauri/vendor/LibRaw"]
+	path = src-tauri/vendor/LibRaw
+	url = https://github.com/LibRaw/LibRaw.git

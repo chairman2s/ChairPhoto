@@ -80,6 +80,24 @@
   margin-left: auto;
   white-space: nowrap;
 }
+/* The source badge: what the stage renders from (docs/plans/raw-foundation). */
+.dk-source {
+  padding: 3px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  color: var(--dim);
+  font-size: 12px;
+  white-space: nowrap;
+}
+.dk-source-raw {
+  border-color: var(--accent);
+  color: var(--txt);
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+}
+.dk-source-warn {
+  border-color: #c9922a;
+  color: var(--txt);
+}
 .dk-error {
   margin: 10px 16px 0;
   padding: 8px 12px;

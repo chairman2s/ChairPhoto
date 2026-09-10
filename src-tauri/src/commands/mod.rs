@@ -37,6 +37,7 @@ mod catalog;
 #[cfg(feature = "collage")]
 mod collage;
 mod culling;
+mod develop;
 mod editing;
 mod export;
 #[cfg(feature = "faces")]
@@ -84,6 +85,7 @@ pub use culling::*;
 pub use catalog::*;
 #[cfg(feature = "collage")]
 pub use collage::*;
+pub use develop::*;
 pub use editing::*;
 pub use export::*;
 #[cfg(feature = "faces")]

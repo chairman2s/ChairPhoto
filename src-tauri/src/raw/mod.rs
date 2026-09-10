@@ -16,8 +16,83 @@ mod ffi {
 }
 
 use image::{DynamicImage, RgbImage};
-use std::ffi::CString;
+use std::ffi::{CStr, CString};
 use std::path::Path;
+
+/// What the decoder makes of a file, from `libraw_open_file` alone — the identify step,
+/// tens of milliseconds, no unpack. `Unsupported` is the honest state the Develop badge
+/// shows for a camera newer than the pinned snapshot (docs/plans/raw-foundation).
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+#[serde(tag = "support", rename_all = "lowercase")]
+pub enum RawSupport {
+    Supported(RawIdentity),
+    Unsupported {
+        /// The camera as far as the file's own metadata names it, when LibRaw got that far.
+        camera: Option<String>,
+        reason: String,
+    },
+}
+
+/// The identity LibRaw reports for a supported file.
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+pub struct RawIdentity {
+    pub make: String,
+    pub model: String,
+    /// Sensor-oriented dimensions of the developed image (after LibRaw's own cropping).
+    pub width: u32,
+    pub height: u32,
+}
+
+/// Open and identify `path` without unpacking pixels. Never panics on a bad file: LibRaw's
+/// error text becomes the `reason`.
+pub fn probe(path: &Path) -> RawSupport {
+    let Ok(c_path) = CString::new(path.to_string_lossy().as_bytes()) else {
+        return RawSupport::Unsupported { camera: None, reason: "path contains a NUL byte".into() };
+    };
+    // SAFETY: the handle is created, used and closed in this block; every pointer read is
+    // on the live handle; strings are NUL-terminated fixed arrays on the LibRaw struct.
+    unsafe {
+        let lr = ffi::libraw_init(0);
+        if lr.is_null() {
+            return RawSupport::Unsupported { camera: None, reason: "libraw_init returned null".into() };
+        }
+        let rc = ffi::libraw_open_file(lr, c_path.as_ptr());
+        let result = if rc == 0 {
+            RawSupport::Supported(RawIdentity {
+                make: c_field(&(*lr).idata.make),
+                model: c_field(&(*lr).idata.model),
+                width: (*lr).sizes.iwidth as u32,
+                height: (*lr).sizes.iheight as u32,
+            })
+        } else {
+            let reason = CStr::from_ptr(ffi::libraw_strerror(rc)).to_string_lossy().into_owned();
+            let model = c_field(&(*lr).idata.model);
+            RawSupport::Unsupported {
+                camera: (!model.is_empty()).then_some(model),
+                reason,
+            }
+        };
+        ffi::libraw_recycle(lr);
+        ffi::libraw_close(lr);
+        result
+    }
+}
+
+/// The compiled-in LibRaw's version string (e.g. `0.22.0-Devel202609`) — part of every
+/// decode-cache key, so a decoder bump can never serve an older snapshot's pixels.
+pub fn decoder_version() -> &'static str {
+    static VERSION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    VERSION.get_or_init(|| {
+        // SAFETY: libraw_version returns a pointer to a static NUL-terminated string.
+        unsafe { CStr::from_ptr(ffi::libraw_version()).to_string_lossy().into_owned() }
+    })
+}
+
+/// A LibRaw fixed-size char field as a String (trimmed at the first NUL).
+fn c_field(field: &[std::os::raw::c_char]) -> String {
+    let bytes: Vec<u8> = field.iter().take_while(|&&c| c != 0).map(|&c| c as u8).collect();
+    String::from_utf8_lossy(&bytes).trim().to_string()
+}
 
 /// Decode a RAW file to a full-resolution 8-bit sRGB image, with the camera (as-shot)
 /// white balance. Errors (unsupported camera, corrupt file, …) are returned so the
@@ -149,4 +224,46 @@ unsafe fn copy_processed_image(
     let rgb = RgbImage::from_raw(w, h, bytes)
         .ok_or_else(|| format!("RGB buffer size mismatch ({len} bytes for {w}x{h})"))?;
     Ok(DynamicImage::ImageRgb8(rgb))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decoder_version_names_the_vendored_snapshot() {
+        let v = decoder_version();
+        assert!(v.starts_with("0."), "unexpected LibRaw version string {v:?}");
+    }
+
+    #[test]
+    fn probe_reports_unsupported_without_panicking() {
+        let dir = std::env::temp_dir().join(format!("chairphoto-raw-probe-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let not_raw = dir.join("plain.txt");
+        std::fs::write(&not_raw, b"this is not a raw file at all").unwrap();
+        match probe(&not_raw) {
+            RawSupport::Unsupported { reason, .. } => assert!(!reason.is_empty()),
+            other => panic!("a text file must not probe as supported: {other:?}"),
+        }
+        let missing = dir.join("missing.ARW");
+        assert!(matches!(probe(&missing), RawSupport::Unsupported { .. }));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Runs only with a real RAW at `CHAIRPHOTO_RAW_FIXTURE`; announces itself otherwise.
+    #[test]
+    fn probe_identifies_a_real_raw_fixture() {
+        let Ok(fixture) = std::env::var("CHAIRPHOTO_RAW_FIXTURE") else {
+            println!("SKIPPED: probe_identifies_a_real_raw_fixture — set CHAIRPHOTO_RAW_FIXTURE to a RAW file");
+            return;
+        };
+        match probe(Path::new(&fixture)) {
+            RawSupport::Supported(id) => {
+                assert!(!id.model.is_empty());
+                assert!(id.width > 0 && id.height > 0);
+            }
+            RawSupport::Unsupported { reason, .. } => panic!("fixture not supported: {reason}"),
+        }
+    }
 }

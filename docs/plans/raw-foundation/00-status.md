@@ -6,7 +6,7 @@
 - Gate 4 — Slice plan: APPROVED 2026-09-10
 
 ## Slices
-- [x] Slice 1 — tracer bullet: vendored LibRaw builds with the app; `raw_probe`; the source badge (2026-09-10; on-screen check of the badge on the A7R VI pending the next dev restart)
+- [x] Slice 1 — tracer bullet: vendored LibRaw builds with the app; `raw_probe`; the source badge (2026-09-10; seen on screen on the A7R VI). Finding: Sony *Lossless* Compressed RAW 2 files store a 10240×7168 raster (73.4 MP) padded around the 9984×6656 picture; the badge and any size the engine reports must use the camera's visible rectangle (`raw_inset_crops[0]`), which is also what `crop_to_inset` trims the export to.
 - [ ] Slice 2 — the working image renders (engine 2 behind `develop.rawEngine`); corpus measurements
 - [ ] Slice 3 — ownership and cleanup, forced
 - [ ] Slice 4 — the `.rawf` decode cache + neighbour preload

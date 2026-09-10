@@ -36,7 +36,8 @@ export function badgeFor(s: DevelopSource): SourceBadge {
   }
 }
 
-/** 66.83 → "67", 9.6 → "9.6": whole numbers above ten, one decimal below. */
+/** One decimal, trailing zero dropped: 66.45 → "66.5", 33.0 → "33", 9.62 → "9.6". The
+ *  picture's real pixel count, not a brochure figure — a Sony A7R VI delivers 66.5 MP. */
 export function formatMegapixels(mp: number): string {
-  return mp >= 10 ? String(Math.round(mp)) : (Math.round(mp * 10) / 10).toString();
+  return (Math.round(mp * 10) / 10).toString();
 }

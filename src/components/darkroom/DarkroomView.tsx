@@ -126,7 +126,12 @@ export function DarkroomView({
     let alive = true;
     setSource(null);
     rawProbe(photoId)
-      .then((s) => alive && setSource(s))
+      .then((s) => {
+        if (!alive) return;
+        // Dev evidence for the badge (docs/plans/raw-foundation slice 1): the exact payload.
+        console.debug(`[develop] source photo=${photoId} ${JSON.stringify(s)}`);
+        setSource(s);
+      })
       .catch(() => alive && setSource(null));
     return () => {
       alive = false;

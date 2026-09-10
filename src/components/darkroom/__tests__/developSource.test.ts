@@ -3,8 +3,8 @@ import { badgeFor, formatMegapixels } from "../developSource";
 
 describe("badgeFor", () => {
   it("names a supported RAW by depth and size", () => {
-    const b = badgeFor({ source: "raw", camera: "Sony ILCE-7RM6", megapixels: 66.83, bits: 16, decoder: "0.22.0-Devel" });
-    expect(b.label).toBe("RAW · 16-bit · 67 MP");
+    const b = badgeFor({ source: "raw", camera: "Sony ILCE-7RM6", megapixels: 66.45, bits: 16, decoder: "0.22.0-Devel" });
+    expect(b.label).toBe("RAW · 16-bit · 66.5 MP");
     expect(b.title).toContain("Sony ILCE-7RM6");
     expect(b.tone).toBe("raw");
   });
@@ -26,8 +26,8 @@ describe("badgeFor", () => {
 });
 
 describe("formatMegapixels", () => {
-  it("rounds large counts and keeps one decimal for small ones", () => {
-    expect(formatMegapixels(66.83)).toBe("67");
+  it("keeps one decimal and drops a trailing zero", () => {
+    expect(formatMegapixels(66.45)).toBe("66.5");
     expect(formatMegapixels(33.0)).toBe("33");
     expect(formatMegapixels(9.62)).toBe("9.6");
   });

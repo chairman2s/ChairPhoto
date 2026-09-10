@@ -38,7 +38,10 @@ pub enum RawSupport {
 pub struct RawIdentity {
     pub make: String,
     pub model: String,
-    /// Sensor-oriented dimensions of the developed image (after LibRaw's own cropping).
+    /// Sensor-oriented dimensions of the *picture* — the camera's visible rectangle
+    /// (`raw_inset_crops[0]`, the same trim the export applies), not the sensor's full
+    /// readout with its masked borders. For a Sony ILCE-7RM6 that is 10016×6672 (67 MP)
+    /// inside a ~73 MP readout.
     pub width: u32,
     pub height: u32,
 }
@@ -58,11 +61,12 @@ pub fn probe(path: &Path) -> RawSupport {
         }
         let rc = ffi::libraw_open_file(lr, c_path.as_ptr());
         let result = if rc == 0 {
+            let (width, height) = visible_size(&(*lr).sizes);
             RawSupport::Supported(RawIdentity {
                 make: c_field(&(*lr).idata.make),
                 model: c_field(&(*lr).idata.model),
-                width: (*lr).sizes.iwidth as u32,
-                height: (*lr).sizes.iheight as u32,
+                width,
+                height,
             })
         } else {
             let reason = CStr::from_ptr(ffi::libraw_strerror(rc)).to_string_lossy().into_owned();
@@ -86,6 +90,19 @@ pub fn decoder_version() -> &'static str {
         // SAFETY: libraw_version returns a pointer to a static NUL-terminated string.
         unsafe { CStr::from_ptr(ffi::libraw_version()).to_string_lossy().into_owned() }
     })
+}
+
+/// The picture's size in sensor orientation: the camera's default visible rectangle when
+/// the file declares one (`crop_to_inset` applies the same rule to the decode), else
+/// LibRaw's own image size. Available from `libraw_open_file` alone.
+fn visible_size(sizes: &ffi::libraw_image_sizes_t) -> (u32, u32) {
+    let inset = sizes.raw_inset_crops[0];
+    let (cw, ch) = (inset.cwidth as u32, inset.cheight as u32);
+    if cw == 0 || ch == 0 || inset.cwidth == u16::MAX {
+        (sizes.width as u32, sizes.height as u32)
+    } else {
+        (cw, ch)
+    }
 }
 
 /// A LibRaw fixed-size char field as a String (trimmed at the first NUL).
@@ -260,8 +277,14 @@ mod tests {
         };
         match probe(Path::new(&fixture)) {
             RawSupport::Supported(id) => {
+                println!("probe: {} {} {}x{} ({:.2} MP)", id.make, id.model, id.width, id.height,
+                    id.width as f64 * id.height as f64 / 1e6);
                 assert!(!id.model.is_empty());
                 assert!(id.width > 0 && id.height > 0);
+                // The picture, not the readout: for a known fixture, pin the exact size.
+                if let Ok(expect) = std::env::var("CHAIRPHOTO_RAW_FIXTURE_SIZE") {
+                    assert_eq!(format!("{}x{}", id.width, id.height), expect, "visible size");
+                }
             }
             RawSupport::Unsupported { reason, .. } => panic!("fixture not supported: {reason}"),
         }

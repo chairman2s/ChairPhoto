@@ -1,0 +1,71 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Mockup — Develop prepares the real file</title>
+<style>
+  :root { --bg:#0d1117; --panel:#161b22; --border:#2d333b; --txt:#e6edf3; --dim:#9da7b3; --accent:#4c8dff; }
+  * { box-sizing: border-box; margin: 0; }
+  body { background: var(--bg); color: var(--txt); font: 13px/1.4 system-ui, sans-serif; padding: 24px; }
+  h1 { font-size: 15px; margin-bottom: 4px; }
+  .sub { color: var(--dim); margin-bottom: 20px; }
+  .row { display: grid; grid-template-columns: 1fr 1fr; gap: 24px; }
+  .state { border: 1px solid var(--border); border-radius: 10px; background: var(--panel); padding: 14px; }
+  .state h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .1em; color: var(--dim); margin-bottom: 10px; }
+  header { display: flex; align-items: center; gap: 12px; padding: 6px 10px; border: 1px solid var(--border); border-radius: 8px; margin-bottom: 10px; }
+  header .name { font-weight: 600; }
+  .badge { margin-left: auto; padding: 3px 10px; border-radius: 999px; border: 1px solid var(--border); color: var(--dim); font-size: 12px; }
+  .badge.raw { border-color: var(--accent); color: var(--txt); background: rgba(76,141,255,.12); }
+  .badge b { color: var(--txt); }
+  .stage { position: relative; }
+  .print { width: 100%; aspect-ratio: 3/2; border-radius: 8px; box-shadow: 0 16px 50px rgba(0,0,0,.6); }
+  .jpeg { background: radial-gradient(120% 90% at 70% 20%, #ffffff 0%, #f5e6d0 18%, #e8a06a 38%, #a1476d 62%, #452a63 82%, #1b1b3a 100%); filter: contrast(1.15) saturate(1.1); }
+  .rawp { background: radial-gradient(120% 90% at 70% 20%, #f3ecdf 0%, #efc79a 14%, #e29a66 34%, #9d4b70 60%, #4a2e66 80%, #1c1d3c 100%); }
+  .pill { position: absolute; left: 12px; bottom: 12px; padding: 6px 12px; border-radius: 999px; background: rgba(13,17,23,.85); border: 1px solid var(--border); color: var(--dim); display: flex; gap: 8px; align-items: center; }
+  .pill i { width: 9px; height: 9px; border-radius: 999px; background: var(--accent); animation: pulse 1.2s infinite; }
+  @keyframes pulse { 50% { opacity: .3; } }
+  .note { color: var(--dim); margin-top: 10px; font-size: 12px; }
+  .note b { color: var(--txt); }
+  .jpegonly { margin-top: 24px; border: 1px dashed var(--border); border-radius: 10px; padding: 12px 14px; color: var(--dim); }
+</style>
+
+<h1>Develop always shows the real file</h1>
+<div class="sub">Two moments after opening a keeper. There is no quality setting to choose; the only variable is time.</div>
+
+<div class="row">
+  <div class="state">
+    <h2>Instantly — the camera's preview, honestly labelled</h2>
+    <header><span class="name">_DSC8286.ARW</span><span class="badge">camera preview · preparing</span></header>
+    <div class="stage">
+      <div class="print jpeg"></div>
+      <div class="pill"><i></i> Preparing full quality — 14-bit RAW, 67 MP</div>
+    </div>
+    <div class="note">Sliders work at once on the preview; the moment the RAW is ready the
+    stage swaps to it, same framing, same zoom, and your adjustments re-render on the real
+    pixels. The swap is visible — the RAW does not look like the camera's JPEG, which is
+    the point — so stepping through a set prepares the next photos in the background, and a
+    photo prepared once opens prepared the next time.</div>
+  </div>
+
+  <div class="state">
+    <h2>A moment later — the photograph itself</h2>
+    <header><span class="name">_DSC8286.ARW</span><span class="badge raw"><b>RAW</b> · 14-bit linear · 67 MP</span></header>
+    <div class="stage">
+      <div class="print rawp"></div>
+    </div>
+    <div class="note">Everything renders from this: the stage, the tone strip's masses, the
+    proof sheet, duels, the loupe at Fit and at 100%, and the export. <b>What you see is
+    what you export</b> — the same picture, rendered the same way, at two sizes.</div>
+  </div>
+</div>
+
+<div class="jpegonly">
+  <b style="color:var(--txt)">JPEG-only photo?</b> The badge reads <i>JPEG · 8-bit</i> and that is the
+  file's full quality — Develop shows it as it is. Nothing to prepare, nothing to choose.
+</div>
+
+<div class="jpegonly" style="margin-top:12px">
+  <header style="margin:0 0 8px"><span class="name">_DSC8286.ARW</span><span class="badge" style="border-color:#c9922a;color:var(--txt)">camera preview · <b>RAW not supported yet</b> — Sony ILCE-7RM6</span></header>
+  <b style="color:var(--txt)">Camera newer than the decoder?</b> Develop says so on the photo and works on the
+  camera's preview, the same way it did before this feature. Nothing is guessed and nothing
+  falls back silently; when the decoder catches up, the badge changes and the photo's
+  versions render from the RAW without being re-edited.
+</div>

@@ -2,8 +2,8 @@
 
 - Gate 1 — Product: APPROVED 2026-09-10 (drafted 2026-09-09, revised after the assumptions review)
 - Gate 2 — Architecture: APPROVED 2026-09-10
-- Gate 3 — Program Design: in progress
-- Gate 4 — Slice plan: pending
+- Gate 3 — Program Design: APPROVED 2026-09-10
+- Gate 4 — Slice plan: in progress
 
 ## Slices
 (planned at Gate 4)
@@ -58,6 +58,13 @@
      constraint, not a quality one. Cleanup on switch/exit is necessary, not sufficient.
   6. Known limit, out of scope: WebKitGTK is not colour-managed, so preview = export holds
      for the file, not for a wide-gamut screen.
+- Gate 3 decisions with the user (2026-09-10): white balance mode lives on the record
+  (`relative` ships now, `kelvin` parsed now and rendered in a later slice; a preference may
+  only choose which slider new edits show — never how a saved version renders; presets carry
+  the mode their author meant, and Kelvin is preferred for scene-light presets because
+  relative is a look that changes meaning from scene to scene). Highlights: honest clipping
+  at sensor white first, measured on the user's clipped-sky keepers in slice 2; unclip modes
+  are the fallback and would regenerate the decode cache.
 - Research notes with the engine options and their licences: `agent-notes/darkroom-research/02-raw-engine-research.md` (untracked).
 - Branch: `feature/raw-foundation` off `feature/darkroom-gpu` (decided at Gate 2 draft);
   the transport/cache/timing work carries over unchanged.

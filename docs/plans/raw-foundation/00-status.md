@@ -1,8 +1,8 @@
 # Status: RAW foundation (Develop renders the real file)
 
 - Gate 1 — Product: APPROVED 2026-09-10 (drafted 2026-09-09, revised after the assumptions review)
-- Gate 2 — Architecture: in progress
-- Gate 3 — Program Design: pending
+- Gate 2 — Architecture: APPROVED 2026-09-10
+- Gate 3 — Program Design: in progress
 - Gate 4 — Slice plan: pending
 
 ## Slices
@@ -59,5 +59,11 @@
   6. Known limit, out of scope: WebKitGTK is not colour-managed, so preview = export holds
      for the file, not for a wide-gamut screen.
 - Research notes with the engine options and their licences: `agent-notes/darkroom-research/02-raw-engine-research.md` (untracked).
-- Branch: to be decided at Gate 2 (probably a new `feature/raw-foundation` off
-  `feature/darkroom-gpu`, whose transport/cache/timing work carries over unchanged).
+- Branch: `feature/raw-foundation` off `feature/darkroom-gpu` (decided at Gate 2 draft);
+  the transport/cache/timing work carries over unchanged.
+- Gate 2 draft findings (2026-09-10): LibRaw's `Makefile.dist` builds with `USE_ZLIB` only
+  and no OpenMP by default, so the 5.6 s decode was single-threaded; the vendored build
+  turns OpenMP on. `libraw_version()` exists in the bindings for the cache key. The job
+  registry's `JobFamily::begin` (catalog → abort → slot) is the ownership primitive the
+  `develop` family reuses. `parseEdit` round-trips unknown fields, so an engine id survives
+  the frontend. The preview cache already keys on path+mtime+size (`cache_path_for`).

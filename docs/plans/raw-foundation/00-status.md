@@ -3,10 +3,18 @@
 - Gate 1 — Product: APPROVED 2026-09-10 (drafted 2026-09-09, revised after the assumptions review)
 - Gate 2 — Architecture: APPROVED 2026-09-10
 - Gate 3 — Program Design: APPROVED 2026-09-10
-- Gate 4 — Slice plan: in progress
+- Gate 4 — Slice plan: APPROVED 2026-09-10
 
 ## Slices
-(planned at Gate 4)
+- [ ] Slice 1 — tracer bullet: vendored LibRaw builds with the app; `raw_probe`; the source badge
+- [ ] Slice 2 — the working image renders (engine 2 behind `develop.rawEngine`); corpus measurements
+- [ ] Slice 3 — ownership and cleanup, forced
+- [ ] Slice 4 — the `.rawf` decode cache + neighbour preload
+- [ ] Slice 5 — proof sheet, duels, masses, loupe, clipping overlay on the working image
+- [ ] Slice 6 — export is the view (tone match gone for engine 2; exact parity)
+- [ ] Slice 7 — engine-1 versions kept honest; fork into the new engine
+- [ ] Slice 8 — the swap: `develop.rawEngine` default on, docs, licensing
+- [ ] Slice 9 — Kelvin white balance (first follow-on)
 
 ## Notes for a fresh session
 - Origin: the GPU-smoothness work on `feature/darkroom-gpu` (see

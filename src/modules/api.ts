@@ -9,9 +9,75 @@
 import { invoke as tauriInvoke, convertFileSrc } from "@tauri-apps/api/core";
 import { noteInvokeRows, timedInvoke } from "./shellTiming";
 
-// Every core command goes through here; during a shell transition (dev timing toggle)
-// slow round trips are attributed by name, otherwise this is a direct call.
-const invoke = <T>(cmd: string, args?: Record<string, unknown>): Promise<T> =>
+// ── The core invoke, with a cache for the catalog-wide lists ─────────────────────
+//
+// Every core command goes through here. Two things happen on the way:
+//
+// 1. **Catalog-wide lists are cached.** `list_tags` (with counts: ~225 ms of SQL on a
+//    144k-photo catalog), `list_facets`, `distinct_photo_values`, `list_tag_groups` and
+//    `recently_used_tags` were re-queried by every panel that mounted them — the Library
+//    remount alone asked for the tag tree twice — and each one queued on the catalog lock.
+//    They change only when something in the catalog changes, so they are served from a
+//    cache keyed by command + args and stamped with a *generation*. In-flight requests are
+//    shared too, which is what folds React's dev-mode double mount into one call.
+// 2. **Any command that is not a known read bumps the generation** — when it starts and
+//    again when it settles, so a read issued mid-mutation cannot be cached as current —
+//    and so do `invalidateListCache()` callers: the shell's `refresh()`, the module change
+//    sink, and a catalog switch. Unknown commands count as mutations: the safe error is an
+//    extra fetch, never a stale list.
+//
+// During a shell transition (dev timing toggle) slow round trips are attributed by name.
+
+const LIST_CACHE_COMMANDS = new Set([
+  "list_tags",
+  "list_facets",
+  "distinct_photo_values",
+  "list_tag_groups",
+  "recently_used_tags",
+]);
+
+/** Commands that never change catalog state. Anything else bumps the list generation. */
+const READ_ONLY_COMMANDS = new Set([
+  "ai_default_prompt", "ai_get_suggestions", "ai_grouped_estimate", "ai_ollama_models",
+  "assemble_hashtag_bundle", "build_instagram_caption", "card_thumbnail", "catalog_stats",
+  "collage_auto_arrange", "collage_preview", "distinct_photo_values", "edit_zone_masses",
+  "explain_photo_signals", "faces_cluster_summary", "faces_for_photo", "faces_index_status",
+  "faces_inference_info", "faces_match_status", "faces_models_status", "faces_people_summary",
+  "faces_suggestion_list", "find_empty_photos", "find_orphan_tags", "find_similar_tags",
+  "find_unavailable_photos", "flickr_connected", "get_edit_record", "get_group_members",
+  "get_iptc", "get_library_root", "get_modules_dir", "get_photo", "get_photo_by_uuid",
+  "get_photo_locations", "get_photo_metadata", "get_photo_tags", "get_preview",
+  "get_setting", "get_system_theme", "get_tag_exportable", "get_tag_private",
+  "get_thumbnail", "identity_repair_status", "library_graph", "library_safety_summary",
+  "list_albums", "list_card_photos_cmd", "list_external_modules", "list_facets",
+  "list_fences", "list_import_batches", "list_languages", "list_luts",
+  "list_pending_identity", "list_pending_operations", "list_photos", "list_publications",
+  "list_recent_catalogs", "list_smart_albums", "list_stack_children", "list_tag_groups",
+  "list_tag_terms", "list_tags", "list_trash", "list_versions", "list_volumes",
+  "localsend_discover", "map_photo_points", "module_fetch", "photo_path",
+  "photo_safety_status", "photo_statuses", "photo_tag_graph", "plugin_features",
+  "preview_bundle", "raw_probe", "recently_used_tags", "render_edit", "render_edit_batch",
+  "smart_album_count", "smarttags_index_status", "smarttags_load_suggestions",
+  "smarttags_model_status", "smugmug_connected", "smugmug_list_albums", "suggest_auto_tone",
+  "suggest_tags_by_time", "summarize_pending_identity", "tag_export_preview",
+  "version_counts", "video_server_port",
+]);
+
+let listGeneration = 0;
+const listCache = new Map<string, { generation: number; promise: Promise<unknown> }>();
+
+/** Drop every cached catalog-wide list; the next read refetches. */
+export function invalidateListCache(): void {
+  listGeneration++;
+  listCache.clear();
+}
+
+/** The current list generation — for tests. */
+export function listCacheGeneration(): number {
+  return listGeneration;
+}
+
+const rawInvoke = <T>(cmd: string, args?: Record<string, unknown>): Promise<T> =>
   timedInvoke(cmd, () => tauriInvoke<T>(cmd, args)).then((r) => {
     if (r && typeof r === "object") {
       const arr = Array.isArray(r) ? r : Object.values(r as Record<string, unknown>).find(Array.isArray);
@@ -19,6 +85,27 @@ const invoke = <T>(cmd: string, args?: Record<string, unknown>): Promise<T> =>
     }
     return r;
   });
+
+const invoke = <T>(cmd: string, args?: Record<string, unknown>): Promise<T> => {
+  if (LIST_CACHE_COMMANDS.has(cmd)) {
+    const key = `${cmd}:${JSON.stringify(args ?? {})}`;
+    const hit = listCache.get(key);
+    if (hit && hit.generation === listGeneration) return hit.promise as Promise<T>;
+    const generation = listGeneration;
+    const promise = rawInvoke<T>(cmd, args).catch((e) => {
+      // Errors are not worth remembering.
+      if (listCache.get(key)?.promise === promise) listCache.delete(key);
+      throw e;
+    });
+    listCache.set(key, { generation, promise });
+    return promise;
+  }
+  if (!READ_ONLY_COMMANDS.has(cmd)) {
+    invalidateListCache();
+    return rawInvoke<T>(cmd, args).finally(invalidateListCache);
+  }
+  return rawInvoke<T>(cmd, args);
+};
 import { getVersion } from "@tauri-apps/api/app";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";

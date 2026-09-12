@@ -233,6 +233,16 @@ fn begin_scan_generation(state: &AppState) -> Result<Arc<AtomicBool>, String> {
 }
 
 /// Run a closure against the open catalog, or return an error if none is open.
+/// Run `f` against the open catalog, holding the catalog lock for its duration.
+///
+/// **Never on the main thread.** A command that calls this must be `async fn` or carry
+/// `#[tauri::command(async)]`, so its body runs on the async runtime instead of the GTK
+/// main thread. The lock is shared with every blocking worker; a plain sync command that
+/// waits for it here parks the UI thread, and with it every repaint and every IPC
+/// response, for as long as the workers keep the lock busy. That was a 2.2 s freeze on
+/// every Develop → Library switch (the Library mounts ~25 commands at once, and the
+/// `get_setting`s among them blocked the window while the tag counts ran). The rule is
+/// enforced by `commands_that_take_the_catalog_lock_never_run_on_the_main_thread`.
 fn with_catalog<T>(
     state: &State<'_, AppState>,
     f: impl FnOnce(&Catalog) -> crate::catalog::Result<T>,
@@ -356,4 +366,54 @@ fn expand_home(path: &str) -> PathBuf {
         }
     }
     PathBuf::from(path)
+}
+
+#[cfg(test)]
+mod thread_rules {
+    /// Source scan: every `#[tauri::command]` in `commands/` whose body takes the catalog
+    /// lock (`with_catalog(`, `with_catalog_blocking(`, `state.catalog.lock()`) must not run on
+    /// the main thread — it is either an `async fn` or marked `#[tauri::command(async)]`.
+    /// See `with_catalog`'s doc for the freeze this prevents. The scan is deliberately
+    /// syntactic: a bare `#[tauri::command]` directly above a `pub fn` whose body (up to
+    /// the next line that is exactly `}`) mentions the lock is a failure.
+    #[test]
+    fn commands_that_take_the_catalog_lock_never_run_on_the_main_thread() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/commands");
+        let mut offenders = Vec::new();
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().is_none_or(|e| e != "rs") {
+                continue;
+            }
+            let src = std::fs::read_to_string(&path).unwrap();
+            let lines: Vec<&str> = src.lines().collect();
+            for (i, line) in lines.iter().enumerate() {
+                if line.trim() != "#[tauri::command]" {
+                    continue;
+                }
+                // Skip attribute/doc lines to the signature.
+                let mut j = i + 1;
+                while j < lines.len() && (lines[j].starts_with("#[") || lines[j].starts_with("///")) {
+                    j += 1;
+                }
+                let Some(sig) = lines.get(j) else { continue };
+                if !sig.starts_with("pub fn ") {
+                    continue; // async fn: fine
+                }
+                let name = sig["pub fn ".len()..].split('(').next().unwrap_or("?");
+                // Body: up to the first line that is exactly "}".
+                let end = lines[j..].iter().position(|l| *l == "}").map(|k| j + k).unwrap_or(lines.len());
+                let body = lines[j..end].join("\n");
+                if body.contains("with_catalog(") || body.contains("with_catalog_blocking(") || body.contains(".catalog.lock()") {
+                    offenders.push(format!("{}:{} {name}", path.file_name().unwrap().to_string_lossy(), i + 1));
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "sync commands taking the catalog lock on the main thread — mark them \
+             #[tauri::command(async)] or make them async fn:\n{}",
+            offenders.join("\n")
+        );
+    }
 }

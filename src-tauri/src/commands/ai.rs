@@ -163,7 +163,7 @@ pub fn ai_default_prompt() -> String {
 }
 
 /// Load a photo's persisted pending suggestions (no model call). Empty if AI is off.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn ai_get_suggestions(
     state: State<'_, AppState>,
     photo_id: i64,
@@ -183,7 +183,7 @@ pub fn ai_get_suggestions(
 }
 
 /// Accept a suggestion: assign the tag (creating it if new) and mark it accepted.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn ai_accept_suggestion(
     state: State<'_, AppState>,
     photo_id: i64,
@@ -223,7 +223,7 @@ pub fn ai_accept_suggestion(
 }
 
 /// Reject a suggestion: it won't be shown or re-suggested for this photo.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn ai_reject_suggestion(
     state: State<'_, AppState>,
     photo_id: i64,

@@ -391,7 +391,7 @@ pub async fn init_catalog(app: AppHandle, state: State<'_, AppState>) -> Result<
 }
 
 /// The current library root (the catalog root = local volume base).
-#[tauri::command]
+#[tauri::command(async)]
 pub fn get_library_root(state: State<'_, AppState>) -> Result<String, String> {
     with_catalog(&state, |c| Ok(c.root().to_string_lossy().to_string()))
 }

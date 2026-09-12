@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, State};
 
 /// The reconcile queue — storage ops deferred until the NAS is reachable.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn list_pending_operations(
     state: State<'_, AppState>,
 ) -> Result<Vec<crate::catalog::PendingOperation>, String> {
@@ -19,7 +19,7 @@ pub fn list_pending_operations(
 }
 
 /// Queue a deferred storage op (kind: "backup" | "offload" | "restore").
-#[tauri::command]
+#[tauri::command(async)]
 pub fn enqueue_operation(
     state: State<'_, AppState>,
     kind: String,
@@ -479,7 +479,7 @@ pub async fn offload_photo(state: State<'_, AppState>, photo_id: i64) -> Result<
 /// Forget a photo whose original is gone: delete its catalog row (and all dependent
 /// records). Never deletes files on disk or on the NAS — only the catalog entry. For the
 /// "Remove from catalog" option on a missing/black placeholder tile.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn remove_photo_from_catalog(state: State<'_, AppState>, photo_id: i64) -> Result<(), String> {
     with_catalog(&state, |c| c.remove_photo(photo_id))
 }
@@ -1226,14 +1226,14 @@ fn single_volume_of_kind(
 }
 
 /// List storage volumes, each flagged with whether it's currently reachable.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn list_volumes(state: State<'_, AppState>) -> Result<Vec<Volume>, String> {
     with_catalog(&state, |c| c.list_volumes())
 }
 
 /// Register a named storage volume (e.g. a NAS mount). `basePath` is this machine's
 /// mount point; a leading "~" is expanded to $HOME. `kind` is "local" or "backup".
-#[tauri::command]
+#[tauri::command(async)]
 pub fn add_volume(
     state: State<'_, AppState>,
     name: String,
@@ -1294,7 +1294,7 @@ pub(crate) fn grid_photo_statuses_with_reachability(
 
 /// Remove a storage volume registration (not the default catalog-root volume). This
 /// forgets the catalog's location pointers on that volume; it never deletes files.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn remove_volume(state: State<'_, AppState>, volume_id: i64) -> Result<(), String> {
     with_catalog(&state, |c| c.remove_volume(volume_id))?;
     // A removed volume no longer belongs in the reachability cache.
@@ -1303,7 +1303,7 @@ pub fn remove_volume(state: State<'_, AppState>, volume_id: i64) -> Result<(), S
 }
 
 /// The physical locations recorded for a photo (where its bytes live).
-#[tauri::command]
+#[tauri::command(async)]
 pub fn get_photo_locations(
     state: State<'_, AppState>,
     photo_id: i64,

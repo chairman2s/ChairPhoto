@@ -88,7 +88,7 @@ pub async fn post_to_flickr(
 /// and the Instagram caption) in Flickr's `tags` format — space-separated, multi-word
 /// tags quoted. Prefills the publish panel's Tags field; the user edits before upload.
 #[cfg(feature = "flickr")]
-#[tauri::command]
+#[tauri::command(async)]
 pub fn flickr_suggest_tags(state: State<'_, AppState>, photo_id: i64) -> Result<String, String> {
     with_catalog(&state, |c| {
         let keywords = c

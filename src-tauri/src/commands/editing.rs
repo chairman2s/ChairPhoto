@@ -9,14 +9,14 @@ use std::path::PathBuf;
 use tauri::{AppHandle, Manager, State};
 
 /// Read a photo's edit record (opaque JSON), or null if it has none.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn get_edit_record(state: State<'_, AppState>, photo_id: i64) -> Result<Option<String>, String> {
     with_catalog(&state, |c| c.get_edit_record(photo_id))
 }
 
 /// Replace a photo's edit record. An empty value clears it. Core validates only that
 /// the value is well-formed JSON; editing modules own its contents.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn set_edit_record(
     state: State<'_, AppState>,
     photo_id: i64,
@@ -357,12 +357,12 @@ pub async fn delete_lut(file: String) -> Result<(), String> {
 
 // --- photo versions (crop/exposure variants, see docs/editing.md) ---------
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn list_versions(state: State<'_, AppState>, photo_id: i64) -> Result<Vec<PhotoVersion>, String> {
     with_catalog(&state, |c| c.list_versions(photo_id))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn create_version(
     state: State<'_, AppState>,
     photo_id: i64,
@@ -371,7 +371,7 @@ pub fn create_version(
     with_catalog(&state, |c| c.create_version(photo_id, &name))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn rename_version(
     state: State<'_, AppState>,
     version_id: i64,
@@ -470,17 +470,17 @@ async fn set_version_edit_in_state(
     Ok(())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn delete_version(state: State<'_, AppState>, version_id: i64) -> Result<(), String> {
     with_catalog(&state, |c| c.delete_version(version_id))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn duplicate_version(state: State<'_, AppState>, version_id: i64) -> Result<i64, String> {
     with_catalog(&state, |c| c.duplicate_version(version_id))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn reorder_versions(
     state: State<'_, AppState>,
     photo_id: i64,

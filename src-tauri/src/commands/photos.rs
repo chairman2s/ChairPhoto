@@ -21,7 +21,7 @@ pub async fn list_photos(
 
 /// Distinct camera models / lenses present in the catalog, for the filter-bar dropdowns.
 /// `kind` is "camera" or "lens".
-#[tauri::command]
+#[tauri::command(async)]
 pub fn distinct_photo_values(
     state: State<'_, AppState>,
     kind: String,
@@ -31,7 +31,7 @@ pub fn distinct_photo_values(
 
 /// Assemble a reach-hashtag bundle from a tag group (for the export dialog's preview
 /// and copy button). Core export-to-disk; platform destinations are module-based.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn assemble_hashtag_bundle(
     state: State<'_, AppState>,
     group_id: i64,
@@ -41,7 +41,7 @@ pub fn assemble_hashtag_bundle(
 }
 
 /// All import batches, newest first, each with a photo count.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn list_import_batches(
     state: State<'_, AppState>,
 ) -> Result<Vec<crate::catalog::ImportBatch>, String> {
@@ -54,13 +54,13 @@ pub async fn list_facets(state: State<'_, AppState>) -> Result<Vec<crate::catalo
     with_catalog_blocking(&state, move |c| Ok(c.available_facets())).await
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn get_photo(state: State<'_, AppState>, photo_id: i64) -> Result<Photo, String> {
     with_catalog(&state, |c| c.get_photo(photo_id))
 }
 
 /// One photo by its stable uuid — resolves a chairphoto://<uuid> deep link.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn get_photo_by_uuid(state: State<'_, AppState>, uuid: String) -> Result<Photo, String> {
     with_catalog(&state, |c| c.get_photo_by_uuid(&uuid))
 }
@@ -75,7 +75,7 @@ pub async fn photo_path(state: State<'_, AppState>, photo_id: i64) -> Result<Str
     Ok(path.to_string_lossy().into_owned())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn set_rating(
     state: State<'_, AppState>,
     photo_id: i64,
@@ -84,7 +84,7 @@ pub fn set_rating(
     with_catalog(&state, |c| c.set_culling(photo_id, Some(rating), None, None))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn set_label(
     state: State<'_, AppState>,
     photo_id: i64,
@@ -93,7 +93,7 @@ pub fn set_label(
     with_catalog(&state, |c| c.set_culling(photo_id, None, Some(&label), None))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn set_pick_state(
     state: State<'_, AppState>,
     photo_id: i64,
@@ -105,7 +105,7 @@ pub fn set_pick_state(
 }
 
 /// Read a photo's authored IPTC fields.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn get_iptc(state: State<'_, AppState>, photo_id: i64) -> Result<IptcFields, String> {
     with_catalog(&state, |c| c.get_iptc(photo_id))
 }
@@ -138,7 +138,7 @@ pub async fn set_iptc(
 /// stored in the catalog and composed on top of the file's EXIF orientation at render time
 /// (see protocol.rs) — the original file is never modified. Returns the new absolute
 /// rotation (0/90/180/270).
-#[tauri::command]
+#[tauri::command(async)]
 pub fn rotate_photo(
     state: State<'_, AppState>,
     photo_id: i64,
@@ -151,7 +151,7 @@ pub fn rotate_photo(
 }
 
 /// The photos stacked under `photo_id` (e.g. a camera JPEG under its RAW).
-#[tauri::command]
+#[tauri::command(async)]
 pub fn list_stack_children(
     state: State<'_, AppState>,
     photo_id: i64,
@@ -161,7 +161,7 @@ pub fn list_stack_children(
 
 /// Stack `childId` under `parentId` (the child is hidden from the grid, grouped under
 /// the master). Used to manually pair a derivative (e.g. JPEG) with its master (RAW).
-#[tauri::command]
+#[tauri::command(async)]
 pub fn stack_photo(
     state: State<'_, AppState>,
     child_id: i64,
@@ -171,7 +171,7 @@ pub fn stack_photo(
 }
 
 /// Remove a photo from its stack — it returns to the main grid as a top-level photo.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn unstack_photo(state: State<'_, AppState>, child_id: i64) -> Result<(), String> {
     with_catalog(&state, |c| c.unstack(child_id))
 }
@@ -179,13 +179,13 @@ pub fn unstack_photo(state: State<'_, AppState>, child_id: i64) -> Result<(), St
 /// Stack every derivative JPEG under its sibling RAW (same folder + filename stem).
 /// Idempotent; returns the number newly stacked. Runs automatically on the v18 migration
 /// and after each scan — this command lets the user re-run it on demand.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn pair_raw_jpeg_stacks(state: State<'_, AppState>) -> Result<usize, String> {
     with_catalog(&state, |c| c.pair_raw_jpeg_stacks())
 }
 
 /// All stored EXIF/IPTC/XMP metadata for a photo (grouped), for the metadata panel.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn get_photo_metadata(
     state: State<'_, AppState>,
     photo_id: i64,

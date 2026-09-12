@@ -16,7 +16,16 @@ vi.mock("@tauri-apps/api/core", () => ({
   convertFileSrc: (p: string) => `asset:///${p}`,
 }));
 
-import { assignTag, distinctPhotoValues, getSetting, invalidateListCache, listCacheGeneration, listTags } from "../api";
+import {
+  assignTag,
+  distinctPhotoValues,
+  getSetting,
+  invalidateListCache,
+  listCacheGeneration,
+  listTags,
+  setRating,
+  setSetting,
+} from "../api";
 
 beforeEach(() => {
   calls.length = 0;
@@ -47,6 +56,14 @@ describe("list cache", () => {
     expect(listCacheGeneration()).toBeGreaterThan(before);
     await listTags();
     expect(calls.filter((c) => c === "list_tags")).toHaveLength(2);
+  });
+
+  it("keeps the lists across writes they do not derive from", async () => {
+    await listTags();
+    await setSetting("editor.renderTiming.lastShell", "{}");
+    await setRating(1, 3);
+    await listTags();
+    expect(calls.filter((c) => c === "list_tags")).toHaveLength(1);
   });
 
   it("refetches after explicit invalidation", async () => {

@@ -20,7 +20,7 @@ import { noteInvokeRows, timedInvoke } from "./shellTiming";
 //    They change only when something in the catalog changes, so they are served from a
 //    cache keyed by command + args and stamped with a *generation*. In-flight requests are
 //    shared too, which is what folds React's dev-mode double mount into one call.
-// 2. **Any command that is not a known read bumps the generation** — when it starts and
+// 2. **Any command not known to leave the lists alone bumps the generation** — when it starts and
 //    again when it settles, so a read issued mid-mutation cannot be cached as current —
 //    and so do `invalidateListCache()` callers: the shell's `refresh()`, the module change
 //    sink, and a catalog switch. Unknown commands count as mutations: the safe error is an
@@ -36,8 +36,18 @@ const LIST_CACHE_COMMANDS = new Set([
   "recently_used_tags",
 ]);
 
-/** Commands that never change catalog state. Anything else bumps the list generation. */
-const READ_ONLY_COMMANDS = new Set([
+/** Commands that cannot change any cached list. Reads, plus writes to things the lists do
+ *  not derive from: the tag tree's counts come from tag assignments and photo presence,
+ *  the facets from whether sharpness is indexed, cameras/lenses from the photo rows — so
+ *  settings, ratings, labels, picks, versions, edit records, rotation, GPS and IPTC edits
+ *  and publication records leave them untouched. Anything else bumps the generation. */
+const LIST_NEUTRAL_COMMANDS = new Set([
+  // writes the lists do not depend on
+  "create_version", "delete_version", "duplicate_version", "record_publication",
+  "rename_version", "reorder_versions", "rotate_photo", "set_edit_record", "set_iptc",
+  "set_label", "set_photo_gps", "set_pick_state", "set_rating", "set_setting",
+  "set_version_edit",
+  // reads
   "ai_default_prompt", "ai_get_suggestions", "ai_grouped_estimate", "ai_ollama_models",
   "assemble_hashtag_bundle", "build_instagram_caption", "card_thumbnail", "catalog_stats",
   "collage_auto_arrange", "collage_preview", "distinct_photo_values", "edit_zone_masses",
@@ -100,7 +110,7 @@ const invoke = <T>(cmd: string, args?: Record<string, unknown>): Promise<T> => {
     listCache.set(key, { generation, promise });
     return promise;
   }
-  if (!READ_ONLY_COMMANDS.has(cmd)) {
+  if (!LIST_NEUTRAL_COMMANDS.has(cmd)) {
     invalidateListCache();
     return rawInvoke<T>(cmd, args).finally(invalidateListCache);
   }

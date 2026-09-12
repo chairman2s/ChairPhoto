@@ -10,12 +10,12 @@ pub async fn list_tags(state: State<'_, AppState>) -> Result<Vec<TagWithCount>, 
     with_catalog_blocking(&state, move |c| c.list_tags_with_counts()).await
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn create_tag(state: State<'_, AppState>, path: String) -> Result<i64, String> {
     with_catalog(&state, |c| c.create_tag(&path))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn assign_tag(
     state: State<'_, AppState>,
     photo_id: i64,
@@ -24,7 +24,7 @@ pub fn assign_tag(
     with_catalog(&state, |c| c.assign_tag(photo_id, tag_id))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn remove_tag(
     state: State<'_, AppState>,
     photo_id: i64,
@@ -42,7 +42,7 @@ pub async fn get_photo_tags(
 }
 
 /// Rename a tag's canonical name (rewrites its path and all descendants' paths).
-#[tauri::command]
+#[tauri::command(async)]
 pub fn rename_tag(
     state: State<'_, AppState>,
     tag_id: i64,
@@ -52,31 +52,31 @@ pub fn rename_tag(
 }
 
 /// Delete a tag and its whole subtree (assignments and terms cascade).
-#[tauri::command]
+#[tauri::command(async)]
 pub fn delete_tag(state: State<'_, AppState>, tag_id: i64) -> Result<(), String> {
     with_catalog(&state, |c| c.delete_tag(tag_id))
 }
 
 /// Re-apply all auto-tags (e.g. monochrome) across the catalog. Useful to populate
 /// auto-tags for photos imported before the rule existed, without a rescan.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn apply_auto_tags(state: State<'_, AppState>) -> Result<(), String> {
     with_catalog(&state, |c| c.apply_auto_tags())
 }
 
 // --- tag groups (fast tagging) -------------------------------------------
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn list_tag_groups(state: State<'_, AppState>) -> Result<Vec<TagGroup>, String> {
     with_catalog(&state, |c| c.list_tag_groups())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn create_tag_group(state: State<'_, AppState>, name: String) -> Result<i64, String> {
     with_catalog(&state, |c| c.create_tag_group(&name))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn rename_tag_group(
     state: State<'_, AppState>,
     group_id: i64,
@@ -85,25 +85,25 @@ pub fn rename_tag_group(
     with_catalog(&state, |c| c.rename_tag_group(group_id, &name))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn delete_tag_group(state: State<'_, AppState>, group_id: i64) -> Result<(), String> {
     with_catalog(&state, |c| c.delete_tag_group(group_id))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn get_group_members(state: State<'_, AppState>, group_id: i64) -> Result<Vec<Tag>, String> {
     with_catalog(&state, |c| c.group_members(group_id))
 }
 
 /// The tags most recently applied by hand, newest first. Backs the virtual
 /// "Recently used" quick-tag group.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn recently_used_tags(state: State<'_, AppState>, limit: usize) -> Result<Vec<Tag>, String> {
     with_catalog(&state, |c| c.recently_used_tags(limit))
 }
 
 /// Add a tag (by path, created if new) to a group. Returns the tag id.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn add_tag_to_group(
     state: State<'_, AppState>,
     group_id: i64,
@@ -119,7 +119,7 @@ pub fn add_tag_to_group(
     })
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn remove_tag_from_group(
     state: State<'_, AppState>,
     group_id: i64,
@@ -132,7 +132,7 @@ pub fn remove_tag_from_group(
 
 /// Suggest existing tags from photos taken near this one in time (default ±120s).
 /// Non-AI heuristic; session tags (Events/Places) rank highest by frequency.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn suggest_tags_by_time(
     state: State<'_, AppState>,
     photo_id: i64,
@@ -143,7 +143,7 @@ pub fn suggest_tags_by_time(
 }
 
 /// Reparent a tag (drag-and-drop). `newParentId = null` moves it to the top level.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn move_tag(
     state: State<'_, AppState>,
     tag_id: i64,
@@ -153,7 +153,7 @@ pub fn move_tag(
 }
 
 /// Set a tag's description (internal metadata; not exported to image sidecars).
-#[tauri::command]
+#[tauri::command(async)]
 pub fn set_tag_description(
     state: State<'_, AppState>,
     tag_id: i64,
@@ -163,20 +163,20 @@ pub fn set_tag_description(
 }
 
 /// Whether a tag is emitted on export (false = organizational; descendants still export).
-#[tauri::command]
+#[tauri::command(async)]
 pub fn get_tag_exportable(state: State<'_, AppState>, tag_id: i64) -> Result<bool, String> {
     with_catalog(&state, |c| c.tag_exportable(tag_id))
 }
 
 /// Library-wide tidy: remove redundant ancestor tags (a parent a child already implies)
 /// from every photo. Returns how many assignments were removed.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn tidy_redundant_tags(state: State<'_, AppState>) -> Result<usize, String> {
     with_catalog(&state, |c| c.tidy_redundant_tags())
 }
 
 /// Mark a tag as exported or organizational (not written as a keyword on export).
-#[tauri::command]
+#[tauri::command(async)]
 pub fn set_tag_exportable(
     state: State<'_, AppState>,
     tag_id: i64,
@@ -186,14 +186,14 @@ pub fn set_tag_exportable(
 }
 
 /// Whether a tag is private (withheld from external/cloud AI; local AI still sees it).
-#[tauri::command]
+#[tauri::command(async)]
 pub fn get_tag_private(state: State<'_, AppState>, tag_id: i64) -> Result<bool, String> {
     with_catalog(&state, |c| c.tag_private(tag_id))
 }
 
 /// Mark a tag private or not (see [`get_tag_private`]). With `recursive`, applies to the
 /// tag and every descendant. Returns the number of tags changed.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn set_tag_private(
     state: State<'_, AppState>,
     tag_id: i64,
@@ -206,14 +206,14 @@ pub fn set_tag_private(
 // --- taxonomy: tag terms (translations & synonyms) ------------------------
 
 /// All terms (translations + synonyms) for a tag.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn list_tag_terms(state: State<'_, AppState>, tag_id: i64) -> Result<Vec<TagTerm>, String> {
     with_catalog(&state, |c| c.list_terms(tag_id))
 }
 
 /// Add a term to a tag. `isPrimary` makes it the canonical name for its language
 /// (a translation); otherwise it's a synonym. `language` may be empty for neutral.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn add_tag_term(
     state: State<'_, AppState>,
     tag_id: i64,
@@ -227,7 +227,7 @@ pub fn add_tag_term(
     })
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn update_tag_term(
     state: State<'_, AppState>,
     term_id: i64,
@@ -241,7 +241,7 @@ pub fn update_tag_term(
     })
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn set_term_export(
     state: State<'_, AppState>,
     term_id: i64,
@@ -250,20 +250,20 @@ pub fn set_term_export(
     with_catalog(&state, |c| c.set_term_export(term_id, export))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn remove_tag_term(state: State<'_, AppState>, term_id: i64) -> Result<(), String> {
     with_catalog(&state, |c| c.remove_term(term_id))
 }
 
 /// Distinct languages used across the taxonomy (for UI pickers).
-#[tauri::command]
+#[tauri::command(async)]
 pub fn list_languages(state: State<'_, AppState>) -> Result<Vec<String>, String> {
     with_catalog(&state, |c| c.list_languages())
 }
 
 /// Preview the labels that would be exported for a tag given selected languages —
 /// the transition-layer building block, surfaced for the UI.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn tag_export_preview(
     state: State<'_, AppState>,
     tag_id: i64,

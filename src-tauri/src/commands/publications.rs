@@ -5,7 +5,7 @@
 use super::*;
 use tauri::State;
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn list_publications(
     state: State<'_, AppState>,
     photo_id: i64,
@@ -16,7 +16,7 @@ pub fn list_publications(
 /// Record (or update) that a photo's `version_id` (None = Original) was published to
 /// `platform`. The `platform` marker is supplied by the caller (a publishing module, or
 /// the user marking a manual post); core rejects an empty one.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn record_publication(
     state: State<'_, AppState>,
     photo_id: i64,
@@ -29,7 +29,7 @@ pub fn record_publication(
     })
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn delete_publication(state: State<'_, AppState>, id: i64) -> Result<(), String> {
     with_catalog(&state, |c| c.delete_publication(id))
 }

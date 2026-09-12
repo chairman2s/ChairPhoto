@@ -43,7 +43,7 @@ pub struct FacesInferenceInfo {
 }
 
 #[cfg(feature = "faces")]
-#[tauri::command]
+#[tauri::command(async)]
 pub fn faces_inference_info(state: State<'_, AppState>) -> Result<FacesInferenceInfo, String> {
     use crate::plugins::faces::engine::ActiveEp;
     let ep = match crate::plugins::faces::engine::active_ep() {
@@ -74,7 +74,7 @@ pub fn faces_inference_info(state: State<'_, AppState>) -> Result<FacesInference
 /// than being ignored until restart. A run already in progress keeps the pool it started
 /// with — see `engine::configure`'s doc comment for the cross-job edge case.
 #[cfg(feature = "faces")]
-#[tauri::command]
+#[tauri::command(async)]
 pub fn faces_set_indexing_speed(state: State<'_, AppState>, speed: String) -> Result<(), String> {
     let v = speed.trim().to_ascii_lowercase();
     if v != "background" && v != "full" {
@@ -780,7 +780,7 @@ pub async fn faces_name_cluster(
 /// matching/centroid query requires an embedding, so a drawn box only ever becomes a
 /// person through explicit assignment (`faces_assign`). Returns the new face id.
 #[cfg(feature = "faces")]
-#[tauri::command]
+#[tauri::command(async)]
 pub fn faces_add_manual(
     state: State<'_, AppState>,
     photo_id: i64,
@@ -819,7 +819,7 @@ pub fn faces_add_manual(
 /// (Once a drawn box is assigned, `faces_assign` flips its source to 'manual' and it is
 /// treated like any other confirmed face.)
 #[cfg(feature = "faces")]
-#[tauri::command]
+#[tauri::command(async)]
 pub fn faces_delete_drawn(state: State<'_, AppState>, face_id: i64) -> Result<(), String> {
     let n = with_catalog(&state, |c| {
         c.conn()

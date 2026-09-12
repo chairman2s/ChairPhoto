@@ -9,7 +9,7 @@ use tauri::{AppHandle, Emitter, State};
 
 /// Return every stored geofence.
 #[cfg(feature = "map")]
-#[tauri::command]
+#[tauri::command(async)]
 pub fn list_fences(
     state: State<'_, AppState>,
 ) -> Result<Vec<crate::plugins::map::Fence>, String> {
@@ -21,7 +21,7 @@ pub fn list_fences(
 
 /// Create a geofence and return the stored row (with its id and created_at).
 #[cfg(feature = "map")]
-#[tauri::command]
+#[tauri::command(async)]
 pub fn create_fence(
     state: State<'_, AppState>,
     name: String,
@@ -38,7 +38,7 @@ pub fn create_fence(
 /// Update a fence's name, tag path and polygon in place. Returns the number of rows
 /// changed (0 means no such fence).
 #[cfg(feature = "map")]
-#[tauri::command]
+#[tauri::command(async)]
 pub fn update_fence(
     state: State<'_, AppState>,
     fence_id: i64,
@@ -56,7 +56,7 @@ pub fn update_fence(
 /// Delete a geofence by id. Existing tag assignments on photos are left untouched
 /// (they are owned by the user once seeded). Returns the number of rows removed.
 #[cfg(feature = "map")]
-#[tauri::command]
+#[tauri::command(async)]
 pub fn delete_fence(
     state: State<'_, AppState>,
     fence_id: i64,

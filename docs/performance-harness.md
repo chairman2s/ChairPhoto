@@ -117,3 +117,19 @@ Preferences → Darkroom → "Log render timings to the console": the Darkroom l
 2 s while frames arrive, and persists the last summary under `editor.renderTiming.lastSummary`
 so a run can be read back without the web inspector. The same toggle exposes the WebGL
 probe (`GlSpike.tsx`), whose last report is kept under `editor.glSpike.lastReport`.
+
+### Shell transition timing
+
+With the same Darkroom toggle on, leaving Develop records one transition under
+`editor.renderTiming.lastShell` (`src/modules/shellTiming.ts`): time from Back to the grid's
+React commit, first and last thumbnail loaded, the grid's scroll to the selection, the
+longest gap between animation frames (a main-thread or UI-process stall), and every backend
+command that took ≥ 50 ms during the transition, by name with a row-count hint. Read it with
+
+```bash
+sqlite3 -readonly ~/.local/share/chairphoto/default.chairphoto \
+  "select value from settings where key='editor.renderTiming.lastShell'"
+```
+
+This is what found the 2.2 s Develop → Library freeze (sync commands waiting for the
+catalog lock on the main thread; see `with_catalog` in `src-tauri/src/commands/mod.rs`).

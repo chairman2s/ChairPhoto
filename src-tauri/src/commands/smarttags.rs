@@ -365,7 +365,7 @@ pub async fn smarttags_suggest_tags(
 
 /// Load the pending Smart Tagging kNN suggestions for a photo (H7c).
 #[cfg(feature = "smarttags")]
-#[tauri::command]
+#[tauri::command(async)]
 pub fn smarttags_load_suggestions(
     state: State<'_, AppState>,
     photo_id: i64,
@@ -388,7 +388,7 @@ pub fn smarttags_load_suggestions(
 /// Accept a Smart Tagging kNN suggestion: assign the tag (creating it if new) and
 /// mark it `accepted` so it is not shown again (H7c).
 #[cfg(feature = "smarttags")]
-#[tauri::command]
+#[tauri::command(async)]
 pub fn smarttags_accept_suggestion(
     state: State<'_, AppState>,
     photo_id: i64,
@@ -417,7 +417,7 @@ pub fn smarttags_accept_suggestion(
 /// Reject a Smart Tagging kNN suggestion: marks it `rejected` so it is not
 /// re-proposed for this photo on future suggest runs (H7c).
 #[cfg(feature = "smarttags")]
-#[tauri::command]
+#[tauri::command(async)]
 pub fn smarttags_reject_suggestion(
     state: State<'_, AppState>,
     photo_id: i64,
@@ -442,7 +442,7 @@ pub fn smarttags_reject_suggestion(
 /// retraining with a different model. A fresh `smarttags_index_photos` run
 /// rebuilds from scratch.
 #[cfg(feature = "smarttags")]
-#[tauri::command]
+#[tauri::command(async)]
 pub fn smarttags_delete_index(state: State<'_, AppState>) -> Result<(), String> {
     with_catalog(&state, |c| {
         crate::plugins::smarttags::delete_index(c.conn())

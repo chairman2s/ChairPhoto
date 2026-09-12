@@ -85,7 +85,7 @@ pub async fn post_to_instagram(
 /// Build a suggested Instagram caption for a photo: its title/description followed by its
 /// keywords as `#hashtags` (de-duped, capped at 30). Used to prefill the caption box.
 #[cfg(feature = "instagram")]
-#[tauri::command]
+#[tauri::command(async)]
 pub fn build_instagram_caption(
     state: State<'_, AppState>,
     photo_id: i64,

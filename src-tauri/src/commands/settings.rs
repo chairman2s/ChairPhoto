@@ -46,13 +46,13 @@ pub fn plugin_features() -> Vec<String> {
 }
 
 /// Read a settings value (used for module-scoped, namespaced settings).
-#[tauri::command]
+#[tauri::command(async)]
 pub fn get_setting(state: State<'_, AppState>, key: String) -> Result<Option<String>, String> {
     with_catalog(&state, |c| c.get_setting(&key))
 }
 
 /// Write a settings value (used for module-scoped, namespaced settings).
-#[tauri::command]
+#[tauri::command(async)]
 pub fn set_setting(state: State<'_, AppState>, key: String, value: String) -> Result<(), String> {
     with_catalog(&state, |c| c.set_setting(&key, &value))
 }

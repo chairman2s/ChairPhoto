@@ -1,4 +1,5 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { noteGridCommit } from "./modules/shellTiming";
+import { Profiler, useCallback, useEffect, useRef, useState } from "react";
 import { confirm } from "@tauri-apps/plugin-dialog";
 import {
   analyzeBurstSharpness,
@@ -16,6 +17,7 @@ import {
   onDeepLinkPhoto,
   onDeepLinkTag,
   PhotoVersion,
+  invalidateListCache,
   listTags,
   moveTag,
   setTagPrivate,
@@ -702,6 +704,10 @@ export default function App() {
   // stale-response guard live in `useLibrarySession`; the tag tree is the shell's own.
   const refreshLibrary = library.refresh;
   const refresh = useCallback(async () => {
+    // A refresh means "something changed": drop the cached lists before re-reading them.
+    // Module mutations arrive here through the change sink and do not pass through the
+    // core invoke, so this is their invalidation.
+    invalidateListCache();
     const [, nextTags] = await Promise.all([refreshLibrary(), listTags()]);
     setTags(nextTags);
   }, [refreshLibrary]);
@@ -1128,6 +1134,7 @@ export default function App() {
   // then refresh the photo list and tags against the new catalog.
   useEffect(() => {
     const unlisten = onCatalogSwitched(() => {
+      invalidateListCache(); // the lists belong to the catalog that just closed
       // The library session: scope, selection, Shift anchor, and the rows themselves.
       // Every id in there names something in the catalog that just closed. Dropping the
       // rows immediately also stops the previous catalog's photos being on screen (with
@@ -1924,6 +1931,7 @@ export default function App() {
                 )}
               </div>
             ) : (
+              <Profiler id="grid" onRender={(_id, phase, actual) => noteGridCommit(phase, actual)}>
               <CatalogGrid
                 photos={photos}
                 selectedId={selection.activeId}
@@ -1957,6 +1965,7 @@ export default function App() {
                   setCtxMenu({ x: e.clientX, y: e.clientY, photoId: p.id });
                 }}
               />
+              </Profiler>
             )}
           </div>
           {!inDevelop && !activeView && (

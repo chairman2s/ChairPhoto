@@ -6,7 +6,19 @@
 // `ChairPhotoAPI.invoke<T>(name, args)` (see registry.ts) and its command names stay in
 // the module. Do not add a module-owned command here.
 
-import { invoke, convertFileSrc } from "@tauri-apps/api/core";
+import { invoke as tauriInvoke, convertFileSrc } from "@tauri-apps/api/core";
+import { noteInvokeRows, timedInvoke } from "./shellTiming";
+
+// Every core command goes through here; during a shell transition (dev timing toggle)
+// slow round trips are attributed by name, otherwise this is a direct call.
+const invoke = <T>(cmd: string, args?: Record<string, unknown>): Promise<T> =>
+  timedInvoke(cmd, () => tauriInvoke<T>(cmd, args)).then((r) => {
+    if (r && typeof r === "object") {
+      const arr = Array.isArray(r) ? r : Object.values(r as Record<string, unknown>).find(Array.isArray);
+      if (Array.isArray(arr)) noteInvokeRows(cmd, arr.length);
+    }
+    return r;
+  });
 import { getVersion } from "@tauri-apps/api/app";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";

@@ -51,6 +51,7 @@ import {
 import { DuelView } from "./DuelView";
 import { ProofSheet } from "./ProofSheet";
 import { DUEL_LABELS, proofSpread, type DuelDim, type ProofCandidate } from "./spreads";
+import { markShellLeave, setShellTimingEnabled } from "../../modules/shellTiming";
 import { stageJsonFor } from "./stageJson";
 import { ToneStrip } from "./ToneStrip";
 import {
@@ -133,7 +134,9 @@ export function DarkroomView({
     let alive = true;
     getSetting(RENDER_TIMING_KEY)
       .then((v) => {
-        if (alive) timingRef.current = v === "1";
+        if (!alive) return;
+        timingRef.current = v === "1";
+        setShellTimingEnabled(v === "1");
       })
       .catch(() => {});
     const flush = () => {
@@ -507,7 +510,13 @@ export function DarkroomView({
   return (
     <div className="dk-root">
       <header className="dk-bar">
-        <button className="dk-back" onClick={onBack}>
+        <button
+          className="dk-back"
+          onClick={() => {
+            markShellLeave("develop");
+            onBack();
+          }}
+        >
           ← Library
         </button>
         <span className="dk-title">Darkroom</span>

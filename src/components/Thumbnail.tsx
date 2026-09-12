@@ -1,3 +1,4 @@
+import { noteTileLoaded, noteTileMounted } from "../modules/shellTiming";
 import { useEffect, useState } from "react";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import type { StorageStatus } from "../modules/api";
@@ -29,6 +30,11 @@ export function Thumbnail({
    */
   metadataReady?: boolean;
 }) {
+  // Shell-timing evidence (dev toggle): one mounted tile per Thumbnail instance.
+  useEffect(() => {
+    noteTileMounted();
+  }, []);
+
   const [failed, setFailed] = useState(false);
 
   // A new bust value means "the underlying file may have changed" — try again.
@@ -62,6 +68,7 @@ export function Thumbnail({
       src={url}
       loading="lazy"
       alt=""
+      onLoad={noteTileLoaded}
       onError={() => setFailed(true)}
     />
   );

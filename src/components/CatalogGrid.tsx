@@ -1,3 +1,4 @@
+import { noteGridScroll, noteMark } from "../modules/shellTiming";
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { MouseEvent } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
@@ -336,10 +337,15 @@ export function CatalogGrid({
     if (selectedId == null) return;
     const idx = idIndex.get(selectedId);
     if (idx == null) return;
+    noteGridScroll();
     rowVirtualizer.scrollToIndex(Math.floor(idx / cols), { align: "auto" });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedId, cols]);
 
+  // Shell-timing sentinel (dev toggle): when this subtree's effects have run.
+  useEffect(() => {
+    noteMark("grid-effects");
+  });
   if (photos.length === 0) {
     return (
       <div className="grid-empty">

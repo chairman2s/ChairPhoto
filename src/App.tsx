@@ -1,4 +1,5 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { noteGridCommit } from "./modules/shellTiming";
+import { Profiler, useCallback, useEffect, useRef, useState } from "react";
 import { confirm } from "@tauri-apps/plugin-dialog";
 import {
   analyzeBurstSharpness,
@@ -1924,6 +1925,7 @@ export default function App() {
                 )}
               </div>
             ) : (
+              <Profiler id="grid" onRender={(_id, phase, actual) => noteGridCommit(phase, actual)}>
               <CatalogGrid
                 photos={photos}
                 selectedId={selection.activeId}
@@ -1957,6 +1959,7 @@ export default function App() {
                   setCtxMenu({ x: e.clientX, y: e.clientY, photoId: p.id });
                 }}
               />
+              </Profiler>
             )}
           </div>
           {!inDevelop && !activeView && (

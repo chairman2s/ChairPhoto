@@ -399,6 +399,10 @@ pub struct JobRegistry {
     /// publishes a slot because the debt panel is a modal that remounts, and a pass over a
     /// 74k-row queue on a NAS long outlives one open/close of it.
     pub identity: JobFamily<IdentityRepairJobStatus>,
+    /// The Develop session's working image (docs/plans/raw-foundation): one claim per
+    /// opened photo; a switch, exit or catalog change trips it and the image is released.
+    #[cfg(all(feature = "raw", feature = "edit"))]
+    pub develop: JobFamily<super::DevelopStatus>,
 }
 
 impl JobRegistry {
@@ -430,6 +434,8 @@ impl JobRegistry {
             #[cfg(feature = "smarttags")]
             smarttags,
             identity,
+            #[cfg(all(feature = "raw", feature = "edit"))]
+            develop,
         } = self;
         let slots = SlotGuards {
             #[cfg(feature = "faces")]
@@ -439,6 +445,8 @@ impl JobRegistry {
             #[cfg(feature = "smarttags")]
             smarttags: smarttags.slot.lock().map_err(|e| e.to_string())?,
             identity: identity.slot.lock().map_err(|e| e.to_string())?,
+            #[cfg(all(feature = "raw", feature = "edit"))]
+            develop: develop.slot.lock().map_err(|e| e.to_string())?,
         };
         Ok(DetachGuards { aborts, slots })
     }
@@ -463,6 +471,8 @@ impl JobRegistry {
             #[cfg(feature = "smarttags")]
             smarttags,
             identity,
+            #[cfg(all(feature = "raw", feature = "edit"))]
+            develop,
         } = self;
         Ok(AbortGuards {
             scan: scan.lock()?,
@@ -476,6 +486,8 @@ impl JobRegistry {
             #[cfg(feature = "smarttags")]
             smarttags: smarttags.abort.lock()?,
             identity: identity.abort.lock()?,
+            #[cfg(all(feature = "raw", feature = "edit"))]
+            develop: develop.abort.lock()?,
         })
     }
 }
@@ -493,6 +505,8 @@ pub struct AbortGuards<'a> {
     #[cfg(feature = "smarttags")]
     smarttags: MutexGuard<'a, Arc<AtomicBool>>,
     identity: MutexGuard<'a, Arc<AtomicBool>>,
+    #[cfg(all(feature = "raw", feature = "edit"))]
+    develop: MutexGuard<'a, Arc<AtomicBool>>,
 }
 
 impl AbortGuards<'_> {
@@ -510,6 +524,8 @@ impl AbortGuards<'_> {
             #[cfg(feature = "smarttags")]
             smarttags,
             identity,
+            #[cfg(all(feature = "raw", feature = "edit"))]
+            develop,
         } = self;
         scan.store(true, Ordering::Relaxed);
         #[cfg(feature = "faces")]
@@ -522,6 +538,8 @@ impl AbortGuards<'_> {
         #[cfg(feature = "smarttags")]
         smarttags.store(true, Ordering::Relaxed);
         identity.store(true, Ordering::Relaxed);
+        #[cfg(all(feature = "raw", feature = "edit"))]
+        develop.store(true, Ordering::Relaxed);
     }
 
     /// Trip every installed generation and replace each with a fresh, un-tripped one,
@@ -556,6 +574,8 @@ impl AbortGuards<'_> {
             #[cfg(feature = "smarttags")]
                 ref mut smarttags,
             ref mut identity,
+            #[cfg(all(feature = "raw", feature = "edit"))]
+                ref mut develop,
         } = self;
         let fresh_scan = Arc::new(AtomicBool::new(false));
         **scan = fresh_scan.clone();
@@ -572,6 +592,10 @@ impl AbortGuards<'_> {
             **smarttags = Arc::new(AtomicBool::new(false));
         }
         **identity = Arc::new(AtomicBool::new(false));
+        #[cfg(all(feature = "raw", feature = "edit"))]
+        {
+            **develop = Arc::new(AtomicBool::new(false));
+        }
         fresh_scan
     }
 }
@@ -588,6 +612,8 @@ pub struct SlotGuards<'a> {
     /// to keep the lifetime used under `--no-default-features`, where every other slot here
     /// is compiled out.
     identity: MutexGuard<'a, Option<IdentityRepairJobStatus>>,
+    #[cfg(all(feature = "raw", feature = "edit"))]
+    develop: MutexGuard<'a, Option<super::DevelopStatus>>,
 }
 
 impl SlotGuards<'_> {
@@ -602,6 +628,8 @@ impl SlotGuards<'_> {
             #[cfg(feature = "smarttags")]
             mut smarttags,
             mut identity,
+            #[cfg(all(feature = "raw", feature = "edit"))]
+            mut develop,
         } = self;
         #[cfg(feature = "faces")]
         {
@@ -613,6 +641,10 @@ impl SlotGuards<'_> {
             *smarttags = None;
         }
         *identity = None;
+        #[cfg(all(feature = "raw", feature = "edit"))]
+        {
+            *develop = None;
+        }
     }
 }
 

@@ -7,7 +7,27 @@
 
 ## Slices
 - [x] Slice 1 — tracer bullet: vendored LibRaw builds with the app; `raw_probe`; the source badge (2026-09-10; seen on screen on the A7R VI). Finding: Sony *Lossless* Compressed RAW 2 files store a 10240×7168 raster (73.4 MP) padded around the 9984×6656 picture; the badge and any size the engine reports must use the camera's visible rectangle (`raw_inset_crops[0]`), which is also what `crop_to_inset` trims the export to.
-- [ ] Slice 2 — the working image renders (engine 2 behind `develop.rawEngine`); corpus measurements
+- [x] Slice 2 — the working image renders (engine 2 behind `develop.rawEngine`) (2026-09-19;
+  on-screen check on the A7R VI pending the next dev restart). Landed: `raw::decode_linear`
+  (16-bit linear, honest clipping, abortable), `develop::{ResidentSet, session}` with the
+  `develop` job family, `RenderSource`/`SourceToken` and the `s=` token on `edit://`,
+  `render_edit_batch`/`edit_zone_masses` with a `source`, the engine id on the record
+  (engine 1 byte-identical with the field present), `apply_look_with` (engine 2 shares the
+  display-domain look), `linear.rs` (exposure/WB in light, sRGB or soft-shoulder transform,
+  `BASELINE_EV = 0.5` provisional, clip mask), geometry on f32 images, export dispatch for
+  engine-2 records, the Preferences toggle, and the Darkroom wiring (open/close, event,
+  token in every render URL, engine-2 stamp on saves).
+  **Measurements on the A7R VI (`_DSC8120.ARW`, 9984×6656):** full linear decode 2.59 s in
+  release (OpenMP, 24 threads; 5.6 s single-threaded before), **14.5 s in the debug
+  profile `tauri dev` runs** — the on-screen swap will look slow in dev and normal in a
+  release build; mean linear sample 17847/65535 (27 % of sensor white — no auto-bright).
+  Headroom: locked by `engine2_renders_the_working_image_and_recovers_headroom` on a
+  synthetic image (a patch 1.4× above white returns at −1.5 EV; engine 1 on the 8-bit
+  rendering cannot). Distance from the camera JPEG and the `Soft` default: **not yet
+  measured on the corpus** — needs the on-screen comparison; `BASELINE_EV` stays provisional.
+  Known, deliberate gaps for later slices: the loupe print and the proof sheet/duels still
+  render engine 1 from the preview (an engine-2 broadcast makes the loupe fall back to the
+  unedited preview); neighbours are accepted by `develop_open` but not preloaded (slice 4).
 - [ ] Slice 3 — ownership and cleanup, forced
 - [ ] Slice 4 — the `.rawf` decode cache + neighbour preload
 - [ ] Slice 5 — proof sheet, duels, masses, loupe, clipping overlay on the working image

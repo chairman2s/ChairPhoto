@@ -69,6 +69,19 @@ impl Default for Grain {
 /// image, fade lifts last so the matte black isn't re-crushed, the vignette shades
 /// the post-crop frame, and grain sits on top like grain on a print.
 pub(super) fn apply_look(img: &mut RgbImage, edit: &EditRecord, lut: Option<&CubeLut>) {
+    apply_look_with(img, edit, lut, true)
+}
+
+/// [`apply_look`] with the exposure/white-balance stage optional: engine 2 has already
+/// multiplied those into the linear image and hands over a display-encoded base, so the
+/// rest of the look — zones, regions, contrast, saturation, and the finish — runs the same
+/// code on both engines and a preset means the same thing on both.
+pub(super) fn apply_look_with(
+    img: &mut RgbImage,
+    edit: &EditRecord,
+    lut: Option<&CubeLut>,
+    exposure_in_look: bool,
+) {
     let t = &edit.tone;
     let bw = edit.bw.as_ref().filter(|b| b.enabled);
     let split = edit
@@ -81,16 +94,15 @@ pub(super) fn apply_look(img: &mut RgbImage, edit: &EditRecord, lut: Option<&Cub
     // Tone-strip zone curve (docs/plans/darkroom): a per-luma gain LUT — see zones.rs.
     let zone_lut = edit.zones.as_ref().map(super::zones::zone_gain_lut);
 
-    let tone_active = t.ev != 0.0
+    let exposure_active = exposure_in_look && (t.ev != 0.0 || t.wb.temp != 0.0 || t.wb.tint != 0.0);
+    let tone_active = exposure_active
         || t.contrast != 0.0
         || t.highlights != 0.0
         || t.shadows != 0.0
         || t.whites != 0.0
         || t.blacks != 0.0
         || t.vibrance != 0.0
-        || t.saturation != 0.0
-        || t.wb.temp != 0.0
-        || t.wb.tint != 0.0;
+        || t.saturation != 0.0;
     if !tone_active
         && bw.is_none()
         && split.is_none()
@@ -109,11 +121,13 @@ pub(super) fn apply_look(img: &mut RgbImage, edit: &EditRecord, lut: Option<&Cub
         .map(|l| l.amount.clamp(0.0, 1.0))
         .unwrap_or(1.0);
 
-    let exposure = 2f32.powf(t.ev); // EV stops → linear gain
-    // White balance as channel gains (gentle): warm raises R / lowers B, tint shifts G.
-    let r_gain = 1.0 + 0.3 * t.wb.temp;
-    let b_gain = 1.0 - 0.3 * t.wb.temp;
-    let g_gain = 1.0 + 0.15 * t.wb.tint;
+    // Exposure + white balance as channel gains (gentle): warm raises R / lowers B, tint
+    // shifts G. Engine 2 did these in linear light already, so they are unity there.
+    let (exposure, r_gain, g_gain, b_gain) = if exposure_in_look {
+        (2f32.powf(t.ev), 1.0 + 0.3 * t.wb.temp, 1.0 + 0.15 * t.wb.tint, 1.0 - 0.3 * t.wb.temp)
+    } else {
+        (1.0, 1.0, 1.0, 1.0)
+    };
     let contrast = 1.0 + t.contrast; // pivot at mid-grey
 
     // B&W mixer weights, normalized so a recipe's overall brightness stays sane even

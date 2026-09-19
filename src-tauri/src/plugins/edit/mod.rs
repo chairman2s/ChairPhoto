@@ -10,15 +10,18 @@ mod auto;
 #[cfg(test)]
 mod bench;
 pub mod cube;
+pub mod linear;
 mod look;
+pub mod source;
 pub mod timing;
 mod zones;
 
 pub use auto::auto_tone_for;
+pub use source::{RenderSource, SourceToken, WorkingImage};
 pub use zones::zone_masses;
 
 use image::codecs::jpeg::JpegEncoder;
-use image::{DynamicImage, GenericImageView, Rgb, RgbImage};
+use image::{DynamicImage, GenericImageView, ImageBuffer, Pixel, Rgb, Rgb32FImage, RgbImage};
 use std::sync::Mutex;
 use look::{Bw, Grain, Split};
 use serde::Deserialize;
@@ -61,6 +64,23 @@ struct EditRecord {
     /// zone curve; a zeroed strip renders identically to none (locked by a test).
     #[serde(default)]
     zones: Option<[f32; 8]>,
+    /// Which engine this record was made for (docs/plans/raw-foundation). Absent = 1: the
+    /// gamma-domain pipeline on the camera preview, rendered exactly as it always was.
+    /// 2: the scene-linear pipeline on the RAW working image. Never reinterpreted.
+    #[serde(default = "engine_v1")]
+    engine: u32,
+    /// Engine 2's rendering transform slot (`linear::DisplayTransform::from_record`).
+    #[serde(default)]
+    display: Option<String>,
+}
+
+fn engine_v1() -> u32 {
+    1
+}
+
+/// The engine a record asks for, without rendering anything (export dispatch).
+pub fn record_engine(edit_json: &str) -> u32 {
+    parse_record(edit_json).map(|e| e.engine).unwrap_or(1)
 }
 
 /// Reference to a `.cube` LUT by bare filename, resolved against the app-data `luts/`
@@ -158,6 +178,10 @@ struct Tone {
 struct Wb {
     temp: f32, // -1..1 relative (warm/cool)
     tint: f32, // -1..1 relative (green/magenta)
+    /// Engine 2 only: `"relative"` (default) or `"kelvin"` — see `linear::WbSpec`.
+    mode: Option<String>,
+    /// Engine 2, `mode: "kelvin"`: the scene light in Kelvin.
+    kelvin: Option<f32>,
 }
 
 /// Whether an edit record renders black & white — an enabled B&W mixer or full
@@ -247,20 +271,23 @@ pub struct RenderOpts {
     pub skip_look: bool,
 }
 
-/// Apply the edits in `edit_json` (normalized geometry + tone) to an already-decoded image.
-/// `max_edge` (when > 0) downscales the result's longest edge. Used for both the JPEG
-/// proxy path ([`render_jpeg`]) and full-resolution edited export (RAW decode → here).
+/// Apply the edits in `edit_json` (normalized geometry + tone) to an already-decoded
+/// 8-bit image — the export path's full-res source and the tests. Engine 1 only: an
+/// engine-2 record needs the RAW working image ([`render_image_opts`] with
+/// [`RenderSource::Working`]) and is refused here rather than rendered from the wrong pixels.
 pub fn render_image(
     img: DynamicImage,
     edit_json: &str,
     max_edge: u32,
 ) -> Result<DynamicImage, String> {
-    render_image_opts(img, edit_json, max_edge, RenderOpts::default())
+    render_image_opts(RenderSource::Decoded(img), edit_json, max_edge, RenderOpts::default())
 }
 
-/// [`render_image`] with [`RenderOpts`].
+/// Render `src` with the record, dispatching on the record's engine. Engine 1 takes a
+/// preview JPEG or a decoded 8-bit image; engine 2 takes the working image. A mismatch is
+/// an error, never a silent substitution (docs/plans/raw-foundation).
 pub fn render_image_opts(
-    img: DynamicImage,
+    src: RenderSource<'_>,
     edit_json: &str,
     max_edge: u32,
     opts: RenderOpts,
@@ -271,22 +298,40 @@ pub fn render_image_opts(
     ));
     let edit = parse_record(edit_json)?;
     t.mark("parse");
-    let framed = frame_image(img, &edit, max_edge, &mut t);
-    let rgb = finish_look(framed.to_rgb8(), &edit, opts, &mut t);
+    let rgb = match (edit.engine, src) {
+        (1, RenderSource::PreviewJpeg(jpeg)) => {
+            let img = image::load_from_memory(jpeg).map_err(|e| e.to_string())?;
+            t.mark("decode");
+            let framed = frame_image(img, &edit, max_edge, &mut t);
+            finish_look(framed.to_rgb8(), &edit, opts, &mut t)
+        }
+        (1, RenderSource::Decoded(img)) => {
+            let framed = frame_image(img, &edit, max_edge, &mut t);
+            finish_look(framed.to_rgb8(), &edit, opts, &mut t)
+        }
+        (2, RenderSource::Working { image, .. }) => {
+            let framed = frame_image(DynamicImage::ImageRgb32F(image.linear.clone()), &edit, max_edge, &mut t);
+            finish_linear(framed.into_rgb32f(), &edit, &image, opts, &mut t)?
+        }
+        (1, RenderSource::Working { .. }) => {
+            return Err("an engine-1 record renders from the camera preview, not the working image".into())
+        }
+        (2, _) => return Err("an engine-2 record needs the RAW working image; none is resident".into()),
+        (n, _) => return Err(format!("unknown edit engine {n}")),
+    };
     t.report(&format!("out={}x{}", rgb.width(), rgb.height()));
     Ok(DynamicImage::ImageRgb8(rgb))
 }
 
-/// Render the interactive proxy tier through both caches: the decoded proxy (one slot)
-/// and the **framed base** — the proxy after geometry and downscale, before the look.
+/// Render the interactive tier through both caches: the decoded proxy (one slot, engine 1)
+/// and the **framed base** — the source after geometry and downscale, before the look.
 /// A slider drag changes only the look, so every frame after the first skips the
 /// perspective/straighten/crop/`thumbnail()` stages entirely and pays the look plus the
-/// encode. Keyed by the proxy bytes' fingerprint, the record's geometry, and the edge,
-/// so a regenerated proxy, a different framing, or a different tier is a different
-/// entry; output is byte-identical to [`render_image_opts`] on the decoded proxy
-/// (locked by `framed_base_cache_renders_identically_on_miss_and_hit`).
+/// encode. Keyed by the source (proxy bytes' fingerprint, or the working image's token),
+/// the record's geometry, and the edge; output is byte-identical to [`render_image_opts`]
+/// on the same source (locked by `framed_base_cache_renders_identically_on_miss_and_hit`).
 pub fn render_proxy(
-    jpeg: &[u8],
+    src: RenderSource<'_>,
     edit_json: &str,
     max_edge: u32,
     opts: RenderOpts,
@@ -297,29 +342,87 @@ pub fn render_proxy(
     ));
     let edit = parse_record(edit_json)?;
     t.mark("parse");
-    let fp = jpeg_fingerprint(jpeg);
-    let key = FramedKey {
-        proxy: fp,
-        geometry: geometry_fingerprint(&edit),
-        max_edge,
-    };
-    let base = match framed_cache_get(&key) {
-        Some(base) => {
-            t.mark("framed_cache_hit");
-            base
+    let geometry = geometry_fingerprint(&edit);
+    let rgb = match (edit.engine, src) {
+        (1, RenderSource::PreviewJpeg(jpeg)) => {
+            let fp = jpeg_fingerprint(jpeg);
+            let key = FramedKey { source: fp, geometry, max_edge };
+            let base = match framed_cache_get(&key) {
+                Some(FramedBase::Rgb8(base)) => {
+                    t.mark("framed_cache_hit");
+                    base
+                }
+                _ => {
+                    let img = decode_proxy_cached_fp(fp, jpeg)?;
+                    t.mark("decode_cache");
+                    let base = frame_image(img, &edit, max_edge, &mut t).to_rgb8();
+                    framed_cache_put(key, FramedBase::Rgb8(base.clone()));
+                    t.mark("framed_cache_put");
+                    base
+                }
+            };
+            finish_look(base, &edit, opts, &mut t)
         }
-        None => {
-            let img = decode_proxy_cached_fp(fp, jpeg)?;
-            t.mark("decode_cache");
-            let base = frame_image(img, &edit, max_edge, &mut t).to_rgb8();
-            framed_cache_put(key, base.clone());
-            t.mark("framed_cache_put");
-            base
+        (2, RenderSource::Working { token, image }) => {
+            let key = FramedKey { source: token_fingerprint(&token), geometry, max_edge };
+            let base = match framed_cache_get(&key) {
+                Some(FramedBase::Linear(base)) => {
+                    t.mark("framed_cache_hit");
+                    base
+                }
+                _ => {
+                    let framed = frame_image(DynamicImage::ImageRgb32F(image.linear.clone()), &edit, max_edge, &mut t);
+                    let base = framed.into_rgb32f();
+                    framed_cache_put(key, FramedBase::Linear(base.clone()));
+                    t.mark("framed_cache_put");
+                    base
+                }
+            };
+            finish_linear(base, &edit, &image, opts, &mut t)?
         }
+        (1, _) => return Err("engine 1 renders from the camera preview".into()),
+        (2, _) => return Err("an engine-2 record needs the RAW working image; none is resident".into()),
+        (n, _) => return Err(format!("unknown edit engine {n}")),
     };
-    let rgb = finish_look(base, &edit, opts, &mut t);
     t.report(&format!("out={}x{}", rgb.width(), rgb.height()));
     Ok(DynamicImage::ImageRgb8(rgb))
+}
+
+/// Engine 2's stage 4: exposure and white balance in linear light, the display transform,
+/// then the shared display-domain look (zones, regions, contrast, saturation, and the
+/// finish) with exposure already done.
+fn finish_linear(
+    mut lin: Rgb32FImage,
+    edit: &EditRecord,
+    image: &WorkingImage,
+    opts: RenderOpts,
+    t: &mut timing::Stages,
+) -> Result<RgbImage, String> {
+    if opts.skip_look {
+        t.mark("look_skipped");
+        return Ok(linear::to_display(&lin, linear::DisplayTransform::Srgb, linear::BASELINE_EV));
+    }
+    let wb = linear::WbSpec::from_record(
+        edit.tone.wb.mode.as_deref(),
+        edit.tone.wb.temp,
+        edit.tone.wb.tint,
+        edit.tone.wb.kelvin,
+    );
+    let gains = linear::wb_multipliers(&wb, &image.cam_mul, &image.rgb_cam)?;
+    linear::apply_exposure_linear(&mut lin, edit.tone.ev, gains);
+    t.mark("linear_exposure");
+    let transform = linear::DisplayTransform::from_record(edit.display.as_deref());
+    let mut rgb = linear::to_display(&lin, transform, linear::BASELINE_EV);
+    t.mark("display");
+    let lut = edit.lut.as_ref().and_then(|l| {
+        crate::commands::luts_dir()
+            .ok()
+            .and_then(|dir| cube::load(&dir, &l.file))
+    });
+    t.mark("lut_load");
+    look::apply_look_with(&mut rgb, edit, lut.as_deref(), false);
+    t.mark("look");
+    Ok(rgb)
 }
 
 fn parse_record(edit_json: &str) -> Result<EditRecord, String> {
@@ -414,22 +517,37 @@ fn finish_look(
 
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 struct FramedKey {
-    /// [`jpeg_fingerprint`] of the proxy bytes.
-    proxy: u64,
+    /// [`jpeg_fingerprint`] of the proxy bytes, or [`token_fingerprint`] of a working image.
+    source: u64,
     /// [`geometry_fingerprint`] of the record.
     geometry: u64,
     max_edge: u32,
+}
+
+/// A framed base of either engine.
+#[derive(Clone)]
+enum FramedBase {
+    Rgb8(RgbImage),
+    Linear(Rgb32FImage),
+}
+
+fn token_fingerprint(token: &SourceToken) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    "working".hash(&mut h);
+    token.hash(&mut h);
+    h.finish()
 }
 
 /// Entries kept: the current photo's drag (720) and settled (1400) tiers, the masses
 /// pass (1024), and the loupe's full-size render (0) — one photo's working set. A 2048 px
 /// RGB base is ~12 MB, so the cap is memory, not hit rate. Evicts least recently used.
 const FRAMED_CACHE_CAP: usize = 4;
-static FRAMED_CACHE: Mutex<Vec<(FramedKey, RgbImage)>> = Mutex::new(Vec::new());
+static FRAMED_CACHE: Mutex<Vec<(FramedKey, FramedBase)>> = Mutex::new(Vec::new());
 /// Hits since process start — for the tests and the bench, never for behaviour.
 static FRAMED_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-fn framed_cache_get(key: &FramedKey) -> Option<RgbImage> {
+fn framed_cache_get(key: &FramedKey) -> Option<FramedBase> {
     let mut cache = FRAMED_CACHE.lock().unwrap();
     let pos = cache.iter().position(|(k, _)| k == key)?;
     // Most recently used at the back.
@@ -440,7 +558,7 @@ fn framed_cache_get(key: &FramedKey) -> Option<RgbImage> {
     Some(base)
 }
 
-fn framed_cache_put(key: FramedKey, base: RgbImage) {
+fn framed_cache_put(key: FramedKey, base: FramedBase) {
     let mut cache = FRAMED_CACHE.lock().unwrap();
     cache.retain(|(k, _)| *k != key);
     if cache.len() >= FRAMED_CACHE_CAP {
@@ -494,7 +612,16 @@ fn geometry_fingerprint(edit: &EditRecord) -> u64 {
 /// rectification — which the caller treats as "leave the geometry alone", the same
 /// non-fatal degradation a missing LUT gets.
 fn perspective_warp(img: &DynamicImage, p: &Perspective) -> Option<DynamicImage> {
-    let src = img.to_rgb8();
+    match img {
+        DynamicImage::ImageRgb32F(src) => warp_buffer(src, p).map(DynamicImage::ImageRgb32F),
+        other => warp_buffer(&other.to_rgb8(), p).map(DynamicImage::ImageRgb8),
+    }
+}
+
+fn warp_buffer<T: Sample>(src: &ImageBuffer<Rgb<T>, Vec<T>>, p: &Perspective) -> Option<ImageBuffer<Rgb<T>, Vec<T>>>
+where
+    Rgb<T>: Pixel<Subpixel = T>,
+{
     let (w, h) = src.dimensions();
     let (fw, fh) = (w as f32, h as f32);
     let corner = |c: [f32; 2]| (c[0] * fw, c[1] * fh);
@@ -527,7 +654,7 @@ fn perspective_warp(img: &DynamicImage, p: &Perspective) -> Option<DynamicImage>
         [tl, tr, br, bl],
     )?;
 
-    let mut out = RgbImage::new(out_w, out_h);
+    let mut out = ImageBuffer::new(out_w, out_h);
     for y in 0..out_h {
         for x in 0..out_w {
             let (u, v) = (x as f32 + 0.5, y as f32 + 0.5);
@@ -542,10 +669,10 @@ fn perspective_warp(img: &DynamicImage, p: &Perspective) -> Option<DynamicImage>
             if !sx.is_finite() || !sy.is_finite() {
                 continue;
             }
-            out.put_pixel(x, y, sample_bilinear(&src, sx - 0.5, sy - 0.5));
+            out.put_pixel(x, y, sample_bilinear(src, sx - 0.5, sy - 0.5));
         }
     }
-    Some(DynamicImage::ImageRgb8(out))
+    Some(out)
 }
 
 /// Solve the eight coefficients of the projective map taking each `from[i]` to `to[i]`:
@@ -602,11 +729,20 @@ fn solve_homography(from: [(f32, f32); 4], to: [(f32, f32); 4]) -> Option<[f32; 
 /// pulled from outside the source (the exposed corners) are black; bilinear sampling
 /// keeps edges smooth. `degrees` follows screen space (y-down), matching the UI's tilt.
 fn rotate_about_center(img: &DynamicImage, degrees: f32) -> DynamicImage {
-    let src = img.to_rgb8();
+    match img {
+        DynamicImage::ImageRgb32F(src) => DynamicImage::ImageRgb32F(rotate_buffer(src, degrees)),
+        other => DynamicImage::ImageRgb8(rotate_buffer(&other.to_rgb8(), degrees)),
+    }
+}
+
+fn rotate_buffer<T: Sample>(src: &ImageBuffer<Rgb<T>, Vec<T>>, degrees: f32) -> ImageBuffer<Rgb<T>, Vec<T>>
+where
+    Rgb<T>: Pixel<Subpixel = T>,
+{
     let (w, h) = src.dimensions();
     let (sin, cos) = degrees.to_radians().sin_cos();
     let (cx, cy) = (w as f32 / 2.0, h as f32 / 2.0);
-    let mut out = RgbImage::new(w, h);
+    let mut out = ImageBuffer::new(w, h);
     for y in 0..h {
         for x in 0..w {
             let dx = x as f32 + 0.5 - cx;
@@ -614,19 +750,45 @@ fn rotate_about_center(img: &DynamicImage, degrees: f32) -> DynamicImage {
             // Inverse rotation (output → source): rotate the offset by -degrees.
             let sx = cos * dx + sin * dy + cx - 0.5;
             let sy = -sin * dx + cos * dy + cy - 0.5;
-            out.put_pixel(x, y, sample_bilinear(&src, sx, sy));
+            out.put_pixel(x, y, sample_bilinear(src, sx, sy));
         }
     }
-    DynamicImage::ImageRgb8(out)
+    out
+}
+
+/// A channel type the geometry stages can resample: 8-bit (engine 1, the exact rounding
+/// the byte-identity tests lock) or f32 (engine 2's linear working image, no rounding).
+trait Sample: image::Primitive + 'static {
+    fn to_f32(self) -> f32;
+    fn from_f32(v: f32) -> Self;
+}
+impl Sample for u8 {
+    fn to_f32(self) -> f32 {
+        self as f32
+    }
+    fn from_f32(v: f32) -> Self {
+        v.round().clamp(0.0, 255.0) as u8
+    }
+}
+impl Sample for f32 {
+    fn to_f32(self) -> f32 {
+        self
+    }
+    fn from_f32(v: f32) -> Self {
+        v
+    }
 }
 
 /// Bilinearly sample `img` at fractional `(x, y)`; black for the rotation's exposed
 /// corners. Coordinates within half a pixel of the image are clamped to the edge (rather
 /// than blackened), so a straightened image has no 1px black sliver at the binding edge.
-fn sample_bilinear(img: &RgbImage, x: f32, y: f32) -> Rgb<u8> {
+fn sample_bilinear<T: Sample>(img: &ImageBuffer<Rgb<T>, Vec<T>>, x: f32, y: f32) -> Rgb<T>
+where
+    Rgb<T>: Pixel<Subpixel = T>,
+{
     let (w, h) = img.dimensions();
     if x < -0.5 || y < -0.5 || x > w as f32 - 0.5 || y > h as f32 - 0.5 {
-        return Rgb([0, 0, 0]);
+        return Rgb([T::from_f32(0.0), T::from_f32(0.0), T::from_f32(0.0)]);
     }
     let x = x.clamp(0.0, (w - 1) as f32);
     let y = y.clamp(0.0, (h - 1) as f32);
@@ -635,11 +797,11 @@ fn sample_bilinear(img: &RgbImage, x: f32, y: f32) -> Rgb<u8> {
     let (fx, fy) = (x - x0 as f32, y - y0 as f32);
     let p = |xx, yy| img.get_pixel(xx, yy).0;
     let (p00, p10, p01, p11) = (p(x0, y0), p(x1, y0), p(x0, y1), p(x1, y1));
-    let mut out = [0u8; 3];
+    let mut out = [T::from_f32(0.0); 3];
     for c in 0..3 {
-        let top = p00[c] as f32 * (1.0 - fx) + p10[c] as f32 * fx;
-        let bot = p01[c] as f32 * (1.0 - fx) + p11[c] as f32 * fx;
-        out[c] = (top * (1.0 - fy) + bot * fy).round().clamp(0.0, 255.0) as u8;
+        let top = p00[c].to_f32() * (1.0 - fx) + p10[c].to_f32() * fx;
+        let bot = p01[c].to_f32() * (1.0 - fx) + p11[c].to_f32() * fx;
+        out[c] = T::from_f32(top * (1.0 - fy) + bot * fy);
     }
     Rgb(out)
 }
@@ -666,8 +828,8 @@ mod tests {
                          "tone": {"ev": 0.7, "contrast": 0.2}, "vignette": -0.4}"#;
         let plain = render_image(image::load_from_memory(&jpeg).unwrap(), record, 48).unwrap();
         let hits0 = framed_cache_hits();
-        let miss = render_proxy(&jpeg, record, 48, RenderOpts::default()).unwrap();
-        let hit = render_proxy(&jpeg, record, 48, RenderOpts::default()).unwrap();
+        let miss = render_proxy(RenderSource::PreviewJpeg(&jpeg), record, 48, RenderOpts::default()).unwrap();
+        let hit = render_proxy(RenderSource::PreviewJpeg(&jpeg), record, 48, RenderOpts::default()).unwrap();
         assert!(framed_cache_hits() > hits0, "the second render must hit the framed cache");
         assert_eq!(miss.to_rgb8().as_raw(), plain.to_rgb8().as_raw(), "miss ≠ uncached path");
         assert_eq!(hit.to_rgb8().as_raw(), plain.to_rgb8().as_raw(), "hit ≠ uncached path");
@@ -676,7 +838,7 @@ mod tests {
         let hits1 = framed_cache_hits();
         let brighter = r#"{"straighten": 6, "crop": {"x": 0.1, "y": 0.1, "w": 0.8, "h": 0.8},
                            "tone": {"ev": 1.5}}"#;
-        let out = render_proxy(&jpeg, brighter, 48, RenderOpts::default()).unwrap();
+        let out = render_proxy(RenderSource::PreviewJpeg(&jpeg), brighter, 48, RenderOpts::default()).unwrap();
         assert!(framed_cache_hits() > hits1, "a look-only change must reuse the framed base");
         let expect = render_image(image::load_from_memory(&jpeg).unwrap(), brighter, 48).unwrap();
         assert_eq!(out.to_rgb8().as_raw(), expect.to_rgb8().as_raw());
@@ -688,19 +850,19 @@ mod tests {
         let b = proxy_jpeg(3);
         let rec = r#"{"tone": {"ev": 0.3}}"#;
         let tilted = r#"{"tone": {"ev": 0.3}, "straighten": 4}"#;
-        let base = render_proxy(&a, rec, 48, RenderOpts::default()).unwrap();
+        let base = render_proxy(RenderSource::PreviewJpeg(&a), rec, 48, RenderOpts::default()).unwrap();
         // Same photo, same look, different geometry → different pixels, never a stale base.
-        let geo = render_proxy(&a, tilted, 48, RenderOpts::default()).unwrap();
+        let geo = render_proxy(RenderSource::PreviewJpeg(&a), tilted, 48, RenderOpts::default()).unwrap();
         assert_ne!(base.to_rgb8().as_raw(), geo.to_rgb8().as_raw());
         assert_eq!(
             geo.to_rgb8().as_raw(),
             render_image(image::load_from_memory(&a).unwrap(), tilted, 48).unwrap().to_rgb8().as_raw()
         );
         // Different edge → the right size, not the cached one.
-        let big = render_proxy(&a, rec, 64, RenderOpts::default()).unwrap();
+        let big = render_proxy(RenderSource::PreviewJpeg(&a), rec, 64, RenderOpts::default()).unwrap();
         assert_ne!(big.dimensions(), base.dimensions());
         // Another photo with the same dimensions and record → its own pixels.
-        let other = render_proxy(&b, rec, 48, RenderOpts::default()).unwrap();
+        let other = render_proxy(RenderSource::PreviewJpeg(&b), rec, 48, RenderOpts::default()).unwrap();
         assert_ne!(other.to_rgb8().as_raw(), base.to_rgb8().as_raw());
         assert_eq!(
             other.to_rgb8().as_raw(),
@@ -712,7 +874,7 @@ mod tests {
     fn framed_base_cache_is_bounded() {
         let jpeg = proxy_jpeg(4);
         for edge in [8u32, 9, 10, 11, 12, 13, 14] {
-            render_proxy(&jpeg, "{}", edge, RenderOpts::default()).unwrap();
+            render_proxy(RenderSource::PreviewJpeg(&jpeg), "{}", edge, RenderOpts::default()).unwrap();
         }
         assert!(FRAMED_CACHE.lock().unwrap().len() <= FRAMED_CACHE_CAP);
     }
@@ -724,7 +886,7 @@ mod tests {
         }));
         let geometry = r#"{"straighten": 15}"#;
         let with_look = r#"{"straighten": 15, "tone": {"ev": 1.0}, "vignette": -0.5}"#;
-        let base = render_image_opts(img.clone(), with_look, 0, RenderOpts { skip_look: true }).unwrap();
+        let base = render_image_opts(RenderSource::Decoded(img.clone()), with_look, 0, RenderOpts { skip_look: true }).unwrap();
         let plain = render_image(img.clone(), geometry, 0).unwrap();
         assert_eq!(
             base.to_rgb8().as_raw(),
@@ -737,6 +899,74 @@ mod tests {
             looked.to_rgb8().as_raw(),
             "the look is what was skipped"
         );
+    }
+
+    fn synthetic_working(bright: f32) -> std::sync::Arc<WorkingImage> {
+        // A tinted ramp with a neutral patch above display white on the left.
+        let linear = Rgb32FImage::from_fn(64, 48, |x, y| {
+            if x < 16 {
+                return image::Rgb([bright; 3]);
+            }
+            let v = (x as f32 / 63.0) * 0.6;
+            image::Rgb([v, v * (0.5 + y as f32 / 96.0), v * 0.4])
+        });
+        std::sync::Arc::new(WorkingImage {
+            width: 64,
+            height: 48,
+            linear,
+            cam_mul: [1.0; 4],
+            rgb_cam: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            decoder: "test",
+        })
+    }
+
+    #[test]
+    fn engine2_refuses_a_preview_source_and_engine1_refuses_the_working_image() {
+        let jpeg = proxy_jpeg(9);
+        let e2 = r#"{"engine": 2, "tone": {"ev": 0.5}}"#;
+        assert!(render_proxy(RenderSource::PreviewJpeg(&jpeg), e2, 48, RenderOpts::default()).is_err());
+        assert!(render_image(image::load_from_memory(&jpeg).unwrap(), e2, 48).is_err());
+        let token = SourceToken::Working { photo_id: 1, generation: 1 };
+        let e1 = r#"{"tone": {"ev": 0.5}}"#;
+        assert!(render_proxy(RenderSource::Working { token, image: synthetic_working(0.5) }, e1, 48, RenderOpts::default()).is_err());
+    }
+
+    #[test]
+    fn engine2_renders_the_working_image_and_recovers_headroom() {
+        let token = SourceToken::Working { photo_id: 2, generation: 7 };
+        let img = synthetic_working(1.4);
+        let at0 = render_proxy(RenderSource::Working { token: token.clone(), image: img.clone() }, r#"{"engine": 2}"#, 0, RenderOpts::default()).unwrap().to_rgb8();
+        let down = render_proxy(RenderSource::Working { token: token.clone(), image: img.clone() }, r#"{"engine": 2, "tone": {"ev": -1.5}}"#, 0, RenderOpts::default()).unwrap().to_rgb8();
+        // At 0 EV the bright patch is display white; at −1.5 EV it is not, and the ramp
+        // beside it is darker still — the patch kept its light.
+        assert_eq!(at0.get_pixel(2, 10).0, [255, 255, 255]);
+        assert!(down.get_pixel(2, 10).0[0] < 255);
+        assert!(down.get_pixel(2, 10).0[0] > down.get_pixel(40, 10).0[0]);
+        // Engine 1 on an 8-bit rendering of the same scene cannot: white stays white.
+        let eight = DynamicImage::ImageRgb8(at0.clone());
+        let e1down = render_image(eight, r#"{"tone": {"ev": -1.5}}"#, 0).unwrap().to_rgb8();
+        assert_eq!(e1down.get_pixel(2, 10).0, e1down.get_pixel(0, 10).0, "no detail to recover");
+        // Geometry runs on the linear image: a straighten + crop record renders the same
+        // size as the framed base would, and the cache serves the second render.
+        let geo = r#"{"engine": 2, "straighten": 3, "crop": {"x": 0.1, "y": 0.1, "w": 0.8, "h": 0.8}}"#;
+        let hits0 = framed_cache_hits();
+        let a = render_proxy(RenderSource::Working { token: token.clone(), image: img.clone() }, geo, 32, RenderOpts::default()).unwrap();
+        let b = render_proxy(RenderSource::Working { token, image: img }, geo, 32, RenderOpts::default()).unwrap();
+        assert!(framed_cache_hits() > hits0);
+        assert_eq!(a.to_rgb8().as_raw(), b.to_rgb8().as_raw());
+    }
+
+    #[test]
+    fn engine_field_defaults_to_1_and_engine1_renders_byte_identically() {
+        let jpeg = proxy_jpeg(5);
+        let img = image::load_from_memory(&jpeg).unwrap();
+        let plain = r#"{"tone": {"ev": 0.4, "contrast": 0.2}, "vignette": -0.3, "zones": [0.1, 0, 0, 0, 0, 0, 0, 0]}"#;
+        let tagged = r#"{"engine": 1, "tone": {"ev": 0.4, "contrast": 0.2}, "vignette": -0.3, "zones": [0.1, 0, 0, 0, 0, 0, 0, 0]}"#;
+        assert_eq!(record_engine(plain), 1);
+        assert_eq!(record_engine(tagged), 1);
+        let a = render_image(img.clone(), plain, 48).unwrap();
+        let b = render_image(img, tagged, 48).unwrap();
+        assert_eq!(a.to_rgb8().as_raw(), b.to_rgb8().as_raw());
     }
 
     #[test]

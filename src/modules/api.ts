@@ -781,6 +781,11 @@ export interface EditRenderOpts {
   baseOnly?: boolean;
   /** Cache-buster, the `thumb://…?v=` convention. */
   bust?: number;
+  /** Which pixels to render from: absent or `"p"` = the camera preview (today's path);
+   *  `"w:<photo>:<generation>"` = the RAW working image the `develop:source` event named.
+   *  A working-image token that is no longer resident renders nothing (404) rather than
+   *  silently falling back — the frontend only builds one after the event said so. */
+  source?: string;
 }
 
 /** base64url (RFC 4648 §5, unpadded) of a UTF-8 string — URL-safe by construction. */
@@ -807,6 +812,7 @@ export const editRenderUrl = (
   q.set("m", String(opts.maxEdge ?? 0));
   if (opts.baseOnly) q.set("b", "1");
   if (opts.hiRes) q.set("hi", "1");
+  if (opts.source && opts.source !== "p") q.set("s", opts.source);
   if (opts.bust) q.set("v", String(opts.bust));
   return `${convertFileSrc(String(photoId), "edit")}?${q.toString()}`;
 };
@@ -816,13 +822,13 @@ export const editRenderUrl = (
  * browser's thumbnails). The proxy is decoded once backend-side; per-record failures
  * come back as null. Returns data URLs in input order.
  */
-export const renderEditBatch = (photoId: number, editJsons: string[], maxEdge = 320) =>
-  invoke<(string | null)[]>("render_edit_batch", { photoId, editJsons, maxEdge });
+export const renderEditBatch = (photoId: number, editJsons: string[], maxEdge = 320, source?: string) =>
+  invoke<(string | null)[]>("render_edit_batch", { photoId, editJsons, maxEdge, source: source ?? null });
 
 /** Share of pixels per Darkroom tone-strip zone (8 gamma-luma bands, blacks→whites) of
  *  the photo's rendered working state — the strip's fill heights. `edit` feature only. */
-export const editZoneMasses = (photoId: number, editJson: string) =>
-  invoke<number[]>("edit_zone_masses", { photoId, editJson });
+export const editZoneMasses = (photoId: number, editJson: string, source?: string) =>
+  invoke<number[]>("edit_zone_masses", { photoId, editJson, source: source ?? null });
 
 /** Classical auto-tone starting fragment for the Darkroom's proof sheet — an edit-json
  *  string carrying only tone.ev/contrast/highlights/shadows. `edit` feature only. */
@@ -833,13 +839,35 @@ export const suggestAutoTone = (photoId: number) =>
 
 /** What the decoder makes of a photo's file — the Darkroom's source badge. */
 export type DevelopSource =
-  | { source: "raw"; camera: string; megapixels: number; bits: number; decoder: string }
+  /** The camera's embedded preview — while a RAW is being prepared, or when the RAW
+   *  engine is off. `preparing` says whether a working image is on its way. */
+  | { source: "preview"; preparing: boolean }
+  /** The RAW working image is resident; `token` goes into every render URL for it. */
+  | { source: "raw"; camera: string; megapixels: number; bits: number; decoder: string; token?: string }
   | { source: "unsupported"; camera: string | null; reason: string }
   | { source: "jpeg" }
   | { source: "nodecoder" };
 
 /** Identify a photo's file with the vendored RAW decoder (no pixels are read). */
 export const rawProbe = (photoId: number) => invoke<DevelopSource>("raw_probe", { photoId });
+
+/** The Darkroom opened `photoId`: claim the develop session, start preparing its working
+ *  image (a cached or fresh linear decode) and, at lower priority, its `neighbours`. Returns
+ *  the state right now; changes arrive as `develop:source` events. */
+export const developOpen = (photoId: number, neighbours: number[] = []) =>
+  invoke<DevelopSource>("develop_open", { photoId, neighbours });
+
+/** The Darkroom closed: release the working images. Idempotent. */
+export const developClose = () => invoke<void>("develop_close");
+
+/** The develop source state right now (a remounted view re-attaching). */
+export const developSource = (photoId: number) =>
+  invoke<DevelopSource>("develop_source", { photoId });
+
+/** A develop-source change; `job` is the claim that emitted it, `photoId` the photo. */
+export type DevelopSourceEvent = DevelopSource & { photoId: number; job: number };
+export const onDevelopSource = (handler: (e: DevelopSourceEvent) => void): Promise<UnlistenFn> =>
+  listen<DevelopSourceEvent>("develop:source", (e) => handler(e.payload));
 
 // --- LUTs (user-supplied .cube files, referenced by edit records by filename) ---
 

@@ -101,6 +101,7 @@ pub(crate) fn edit_job_from_uri<T>(request: &Request<T>) -> Result<EditJob, Stri
         max_edge: 0,
         hi_res: false,
         base_only: false,
+        source: crate::plugins::edit::SourceToken::Preview,
     };
     let query = request.uri().query().unwrap_or("");
     for pair in query.split('&').filter(|p| !p.is_empty()) {
@@ -116,6 +117,12 @@ pub(crate) fn edit_job_from_uri<T>(request: &Request<T>) -> Result<EditJob, Stri
             "m" => job.max_edge = v.parse().map_err(|_| format!("bad max edge {v:?}"))?,
             "b" => job.base_only = v == "1",
             "hi" => job.hi_res = v == "1",
+            "s" => {
+                // The frontend percent-encodes ':' in the token.
+                let raw = v.replace("%3A", ":").replace("%3a", ":");
+                job.source = crate::plugins::edit::SourceToken::parse(&raw)
+                    .ok_or_else(|| format!("bad source token {v:?}"))?;
+            }
             _ => {}
         }
     }
@@ -447,6 +454,10 @@ mod edit_uri_tests {
     fn edit_job_from_uri_defaults_and_rejects_bad_input() {
         let job = edit_job_from_uri(&request("edit://localhost/5")).unwrap();
         assert_eq!((job.photo_id, job.edit_json.as_str(), job.max_edge), (5, "{}", 0));
+        assert_eq!(job.source, crate::plugins::edit::SourceToken::Preview);
+        let job = edit_job_from_uri(&request("edit://localhost/5?r=e30&s=w%3A5%3A3")).unwrap();
+        assert_eq!(job.source, crate::plugins::edit::SourceToken::Working { photo_id: 5, generation: 3 });
+        assert!(edit_job_from_uri(&request("edit://localhost/5?s=nonsense")).is_err());
         assert!(edit_job_from_uri(&request("edit://localhost/5?r=%%%")).is_err());
         assert!(edit_job_from_uri(&request("edit://localhost/5?m=wide")).is_err());
         assert!(edit_job_from_uri(&request("edit://localhost/notaphoto?r=e30")).is_err());

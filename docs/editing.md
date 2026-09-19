@@ -240,6 +240,41 @@ implemented — the crop fixes shape, resize would fix pixels.
 - **Hand-off export (RAW + XMP) stays unedited** — you're giving the RAW to another editor;
   crop/exposure are not written into the sidecar (merge-safe invariant).
 
+### Two engines, one record shape (docs/plans/raw-foundation)
+
+Every record carries an **engine id** — absent or `1`: the pipeline above, on the camera's
+embedded preview, rendered exactly as it always was; `2`: the scene-linear pipeline on the
+RAW **working image**. A version means one thing forever: the Darkroom never reinterprets
+an engine-1 record as engine 2 (an EV of +1 on gamma pixels is not the same picture as +1
+in linear light). Engine 2 is behind the `develop.rawEngine` setting (Preferences →
+Darkroom) until the swap slice makes it the default.
+
+- **Working image.** Opening a photo in the Darkroom claims the `develop` job family and
+  decodes the RAW on its own thread (`raw::decode_linear`: 16-bit, gamma 1.0, sRGB/Rec.709
+  primaries, as-shot white balance, no auto-brightening, highlights clipped at sensor white,
+  the camera's visible rectangle) into an f32 image held by `develop::ResidentSet`. A photo
+  switch, leaving Develop, or a catalog switch trips the claim and releases it. The event
+  `develop:source` carries the state — `preview` (preparing), `raw` with the **token**
+  `w:<photo>:<generation>`, `unsupported` with the camera, `jpeg`, `nodecoder`.
+- **Source on every render.** `edit://…&s=<token>`, `render_edit_batch` and
+  `edit_zone_masses` name the pixels they render from. A token that is no longer resident is
+  a 404, never a fallback to the preview; engine 2 refuses a preview source and engine 1
+  refuses the working image (`plugins/edit/source.rs`, `RenderSource`).
+- **Engine 2's pipeline** (`plugins/edit/linear.rs`): exposure and white balance as
+  multiplications of linear light (values above white survive), then one display
+  transform (`display`: absent/`"srgb"`, or `"soft"` with a highlight shoulder) with a
+  provisional `BASELINE_EV` lift so as-shot lands near the camera JPEG, then the *same*
+  display-domain look as engine 1 — zones, region sliders, contrast, saturation, and the
+  finish (B&W, LUT, split, fade, vignette, grain) — so presets mean the same on both.
+  Geometry (perspective → straighten → crop → downscale) runs on the f32 image; the
+  framed-base cache keys on the token instead of the JPEG fingerprint.
+- **White balance on engine 2** is a tagged meaning on `tone.wb`: `mode` absent or
+  `"relative"` (warmer/cooler than as-shot, the same gentle gains as engine 1) or
+  `"kelvin"` (a scene light; parsed now, rendered in the Kelvin slice — refused with a clear
+  error until then, never silently treated as relative).
+- **Export of an engine-2 version** decodes the same working image and renders it through
+  the same pipeline at full size; the tone-matching step belongs to engine 1 only.
+
 ### Measuring the render path
 
 Every stage of a render can be timed without a profiler: `CHAIRPHOTO_EDIT_TIMING=1` makes

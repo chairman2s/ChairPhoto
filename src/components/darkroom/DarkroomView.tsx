@@ -12,12 +12,14 @@
 import { useEffect, useRef, useState } from "react";
 import {
   createVersion,
+  developClose,
+  developOpen,
   editRenderUrl,
   editZoneMasses,
   getSetting,
   listVersions,
+  onDevelopSource,
   PhotoVersion,
-  rawProbe,
   type DevelopSource,
   setSetting,
   setVersionEdit,
@@ -53,8 +55,9 @@ import {
 import { DuelView } from "./DuelView";
 import { ProofSheet } from "./ProofSheet";
 import { DUEL_LABELS, proofSpread, type DuelDim, type ProofCandidate } from "./spreads";
+import { useOwnedSubscription } from "../../modules/ownedEvents";
 import { markShellLeave, setShellTimingEnabled } from "../../modules/shellTiming";
-import { badgeFor } from "./developSource";
+import { badgeFor, INITIAL_SOURCE, reduceSource, type SourceState } from "./developSource";
 import { stageJsonFor } from "./stageJson";
 import { ToneStrip } from "./ToneStrip";
 import {
@@ -120,24 +123,52 @@ export function DarkroomView({
       .catch(() => setVersions([]));
   }, [photoId]);
   const [backdrop, setBackdrop] = useState("");
-  // The source badge (docs/plans/raw-foundation, slice 1): what the decoder makes of this
-  // photo's file. Probe only — the stage still renders the camera preview until slice 2.
-  const [source, setSource] = useState<DevelopSource | null>(null);
+  // The source (docs/plans/raw-foundation): opening a photo claims the develop session
+  // and starts preparing its RAW working image; `develop:source` events move the stage
+  // from the camera preview to the RAW, and leaving releases it. The reduced state names
+  // the token every render URL carries and the engine a saved record is stamped with.
+  const [sourceState, setSourceState] = useState<SourceState>(INITIAL_SOURCE);
+  const source: DevelopSource | null = sourceState.source;
   useEffect(() => {
     let alive = true;
-    setSource(null);
-    rawProbe(photoId)
+    setSourceState(INITIAL_SOURCE);
+    developOpen(photoId, [])
       .then((s) => {
         if (!alive) return;
-        // Dev evidence for the badge (docs/plans/raw-foundation slice 1): the exact payload.
-        console.debug(`[develop] source photo=${photoId} ${JSON.stringify(s)}`);
-        setSource(s);
+        // Dev evidence for the badge (docs/plans/raw-foundation): the exact payload.
+        console.debug(`[develop] open photo=${photoId} ${JSON.stringify(s)}`);
+        setSourceState((prev) => reduceSource(prev, s, photoId));
       })
-      .catch(() => alive && setSource(null));
+      .catch((e) => {
+        if (alive) console.debug(`[develop] open failed photo=${photoId}: ${String(e)}`);
+      });
     return () => {
       alive = false;
     };
   }, [photoId]);
+  useOwnedSubscription(
+    () =>
+      onDevelopSource((e) => {
+        console.debug(`[develop] event ${JSON.stringify(e)}`);
+        setSourceState((prev) => reduceSource(prev, e, photoId));
+      }),
+    [photoId],
+  );
+  // Leaving the Darkroom releases the working image (a ref: true unmount only).
+  useEffect(
+    () => () => {
+      developClose().catch(() => {});
+    },
+    [],
+  );
+  const sourceToken = sourceState.token;
+  const sourceTokenRef = useRef(sourceToken);
+  sourceTokenRef.current = sourceToken;
+  const engineRef = useRef(sourceState.engine);
+  engineRef.current = sourceState.engine;
+  /** The record as saved: stamped with the engine that rendered it (engine 1 = absent). */
+  const stamped = (record: VersionEdit): VersionEdit =>
+    engineRef.current === 2 ? { ...record, engine: 2 } : record;
   const [masses, setMasses] = useState<number[]>([]);
   const [rendering, setRendering] = useState(false);
   const [error, setError] = useState("");
@@ -391,7 +422,7 @@ export function DarkroomView({
     try {
       const name = `What-if — ${DUEL_LABELS[dim].toLowerCase()}`;
       const id = await createVersion(photoId, name);
-      await setVersionEdit(id, JSON.stringify(record));
+      await setVersionEdit(id, JSON.stringify(stamped(record)));
       setVersions(await listVersions(photoId));
       onChanged();
       return name;
@@ -401,9 +432,10 @@ export function DarkroomView({
   };
 
   // ── Saving: settings only, always to a NEW version ──
-  const dirty = JSON.stringify(working) !== savedJson;
+  // Compared as saved — engine-stamped — so a save on the RAW engine reads clean.
+  const dirty = JSON.stringify(stamped(working)) !== savedJson;
   const saveAsVersion = async () => {
-    const json = JSON.stringify(workingRef.current);
+    const json = JSON.stringify(stamped(workingRef.current));
     try {
       const name = adoptedLabelRef.current ?? `Darkroom ${versions.length + 1}`;
       const id = await createVersion(photoId, name);
@@ -443,7 +475,7 @@ export function DarkroomView({
     const onKey = (e: KeyboardEvent) => {
       if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "s") {
         e.preventDefault();
-        if (JSON.stringify(workingRef.current) !== savedJsonRef.current) void saveAsVersion();
+        if (JSON.stringify(stamped(workingRef.current)) !== savedJsonRef.current) void saveAsVersion();
       }
     };
     window.addEventListener("keydown", onKey);
@@ -480,24 +512,25 @@ export function DarkroomView({
   useEffect(() => {
     const seq = ++renderSeq.current;
     setRendering(true);
-    const fullJson = JSON.stringify(working);
-    const stageJson = stageJsonFor(working, perspectiveMode);
+    const engineWorking = stamped(working);
+    const fullJson = JSON.stringify(engineWorking);
+    const stageJson = stageJsonFor(engineWorking, perspectiveMode);
     const sinceFast = Date.now() - lastFastRef.current;
     const fastTimer = setTimeout(
       () => {
         lastFastRef.current = Date.now();
-        const url = editRenderUrl(photoId, stageJson, { maxEdge: PREVIEW_FAST });
+        const url = editRenderUrl(photoId, stageJson, { maxEdge: PREVIEW_FAST, source: sourceToken });
         awaitPaint(startSample(seq, "fast"), url);
         setBackdrop(url);
       },
       sinceFast > 90 ? 0 : 90 - sinceFast,
     );
     const settleTimer = setTimeout(() => {
-      const url = editRenderUrl(photoId, stageJson, { maxEdge: PREVIEW_MAX });
+      const url = editRenderUrl(photoId, stageJson, { maxEdge: PREVIEW_MAX, source: sourceToken });
       settledUrlRef.current = url;
       awaitPaint(startSample(seq, "settled"), url);
       setBackdrop(url);
-      editZoneMasses(photoId, fullJson)
+      editZoneMasses(photoId, fullJson, sourceToken)
         .then((m) => {
           if (renderSeq.current === seq) setMasses(m);
         })
@@ -511,7 +544,8 @@ export function DarkroomView({
       clearTimeout(fastTimer);
       clearTimeout(settleTimer);
     };
-  }, [photoId, working, perspectiveMode]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [photoId, working, perspectiveMode, sourceToken]);
   // The settled frame is on screen (or failed): the URL is unique per state, so equality
   // with the one this effect set is the ownership check.
   const onBackdropLoad = (src: string) => {

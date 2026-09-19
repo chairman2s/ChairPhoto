@@ -13,6 +13,10 @@ export interface SourceBadge {
 
 export function badgeFor(s: DevelopSource): SourceBadge {
   switch (s.source) {
+    case "preview":
+      return s.preparing
+        ? { label: "camera preview · preparing full quality", title: "The RAW is being decoded; the stage swaps to it when ready.", tone: "warn" }
+        : { label: "camera preview", title: "The RAW engine is off (Preferences → Darkroom).", tone: "plain" };
     case "raw":
       return {
         label: `RAW · ${s.bits}-bit · ${formatMegapixels(s.megapixels)} MP`,
@@ -40,4 +44,24 @@ export function badgeFor(s: DevelopSource): SourceBadge {
  *  picture's real pixel count, not a brochure figure — a Sony A7R VI delivers 66.5 MP. */
 export function formatMegapixels(mp: number): string {
   return (Math.round(mp * 10) / 10).toString();
+}
+
+/** What the stage renders from, reduced from the source events for one photo. */
+export interface SourceState {
+  /** The token to put in render URLs — undefined = the camera preview. */
+  token: string | undefined;
+  /** The engine the working record should be written for: 2 once the RAW is resident. */
+  engine: 1 | 2;
+  /** The latest source, for the badge. */
+  source: DevelopSource | null;
+}
+
+export const INITIAL_SOURCE: SourceState = { token: undefined, engine: 1, source: null };
+
+/** Fold a source event in. Events for another photo are ignored; a resident RAW yields its
+ *  token and engine 2; anything else drops back to the preview path. Pure. */
+export function reduceSource(prev: SourceState, e: DevelopSource & { photoId?: number }, photoId: number): SourceState {
+  if (e.photoId !== undefined && e.photoId !== photoId) return prev;
+  if (e.source === "raw" && e.token) return { token: e.token, engine: 2, source: e };
+  return { token: undefined, engine: 1, source: e };
 }

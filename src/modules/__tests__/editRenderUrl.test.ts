@@ -27,6 +27,11 @@ describe("editRenderUrl", () => {
     expect(editRenderUrl(7, "{}", { hiRes: true, bust: 42 })).toBe("asset:///7?r=e30&m=0&hi=1&v=42");
   });
 
+  it("carries the working-image token, and omits the preview token", () => {
+    expect(editRenderUrl(5, "{}", { maxEdge: 720, source: "w:5:3" })).toBe("asset:///5?r=e30&m=720&s=w%3A5%3A3");
+    expect(editRenderUrl(5, "{}", { maxEdge: 720, source: "p" })).toBe("asset:///5?r=e30&m=720");
+  });
+
   it("is deterministic: same record, same URL", () => {
     const json = JSON.stringify({ tone: { ev: 0.5 }, zones: [0, 0.1, 0, 0, 0, 0, 0, 0] });
     expect(editRenderUrl(1, json, { maxEdge: 720 })).toBe(editRenderUrl(1, json, { maxEdge: 720 }));

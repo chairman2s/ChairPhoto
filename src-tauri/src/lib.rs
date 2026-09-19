@@ -24,6 +24,8 @@ pub mod plugins;
 mod protocol;
 #[cfg(feature = "raw")]
 pub mod raw;
+#[cfg(all(feature = "raw", feature = "edit"))]
+pub mod develop;
 #[cfg(feature = "smugmug")]
 pub mod smugmug;
 pub mod rapidraw;
@@ -412,6 +414,9 @@ pub fn run() {
             commands::get_edit_record,
             commands::set_edit_record,
             commands::raw_probe,
+            commands::develop_open,
+            commands::develop_close,
+            commands::develop_source,
             commands::render_edit,
             commands::render_edit_batch,
             commands::edit_zone_masses,

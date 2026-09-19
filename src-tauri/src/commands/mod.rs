@@ -137,6 +137,11 @@ pub struct AppState {
     pub jobs: JobRegistry,
 }
 
+/// The develop session's status slot lives with its worker (`develop::session`); it is
+/// re-exported here so `JobRegistry` names every family's status in one place.
+#[cfg(all(feature = "raw", feature = "edit"))]
+pub use crate::develop::session::DevelopStatus;
+
 /// Snapshot of the running face-indexing job (`faces_index_status`).
 #[cfg(feature = "faces")]
 #[derive(Debug, Clone, Copy, serde::Serialize)]

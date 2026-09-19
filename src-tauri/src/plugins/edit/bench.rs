@@ -117,7 +117,7 @@ fn render_stage_timings() {
             let (_, t) = timed(|| render_image(decode_proxy_cached(&jpeg).unwrap(), FULL_RECORD, edge).unwrap());
             total_ms.push(t);
             // The drag path: same geometry as the previous frame → framed-base cache hit.
-            let (_, t) = timed(|| render_proxy(&jpeg, FULL_RECORD, edge, RenderOpts::default()).unwrap());
+            let (_, t) = timed(|| render_proxy(RenderSource::PreviewJpeg(&jpeg), FULL_RECORD, edge, RenderOpts::default()).unwrap());
             proxy_hit_ms.push(t);
         }
         col("decode_cache_clone", clone_ms);
@@ -149,7 +149,7 @@ fn render_stage_timings() {
     let mut masses_ms = Vec::new();
     for _ in 0..n {
         let (_, t) = timed(|| {
-            let out = render_proxy(&jpeg, FULL_RECORD, 1024, RenderOpts::default()).unwrap();
+            let out = render_proxy(RenderSource::PreviewJpeg(&jpeg), FULL_RECORD, 1024, RenderOpts::default()).unwrap();
             zones::zone_masses(&out.to_rgb8())
         });
         masses_ms.push(t);

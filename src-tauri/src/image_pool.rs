@@ -80,6 +80,9 @@ pub struct EditJob {
     pub hi_res: bool,
     /// Geometry only, no look, as lossless PNG — the GL drag tier's base texture.
     pub base_only: bool,
+    /// Which pixels to render from (`s=` in the URL): the camera preview, or a resident
+    /// RAW working image by token.
+    pub source: crate::plugins::edit::SourceToken,
 }
 
 /// A one-shot callback that receives the rendered bytes (or an error string).

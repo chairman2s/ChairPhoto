@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { badgeFor, formatMegapixels } from "../developSource";
+import { badgeFor, formatMegapixels, INITIAL_SOURCE, reduceSource } from "../developSource";
 
 describe("badgeFor", () => {
   it("names a supported RAW by depth and size", () => {
@@ -30,5 +30,35 @@ describe("formatMegapixels", () => {
     expect(formatMegapixels(66.45)).toBe("66.5");
     expect(formatMegapixels(33.0)).toBe("33");
     expect(formatMegapixels(9.62)).toBe("9.6");
+  });
+});
+
+describe("reduceSource", () => {
+  const raw = { source: "raw" as const, camera: "Sony", megapixels: 66.5, bits: 16, decoder: "x", token: "w:5:3", photoId: 5 };
+
+  it("starts on the preview and moves to the RAW token when it becomes resident", () => {
+    const preparing = reduceSource(INITIAL_SOURCE, { source: "preview", preparing: true, photoId: 5 }, 5);
+    expect(preparing.token).toBeUndefined();
+    expect(preparing.engine).toBe(1);
+    const resident = reduceSource(preparing, raw, 5);
+    expect(resident.token).toBe("w:5:3");
+    expect(resident.engine).toBe(2);
+  });
+
+  it("ignores events for another photo", () => {
+    const s = reduceSource(INITIAL_SOURCE, { ...raw, photoId: 6 }, 5);
+    expect(s).toBe(INITIAL_SOURCE);
+  });
+
+  it("drops back to the preview when the source is not a resident RAW", () => {
+    const resident = reduceSource(INITIAL_SOURCE, raw, 5);
+    const gone = reduceSource(resident, { source: "unsupported", camera: null, reason: "x", photoId: 5 }, 5);
+    expect(gone.token).toBeUndefined();
+    expect(gone.engine).toBe(1);
+  });
+
+  it("badges the preparing state honestly", () => {
+    expect(badgeFor({ source: "preview", preparing: true }).label).toContain("preparing");
+    expect(badgeFor({ source: "preview", preparing: false }).tone).toBe("plain");
   });
 });

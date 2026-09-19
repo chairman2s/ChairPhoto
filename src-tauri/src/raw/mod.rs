@@ -105,6 +105,141 @@ fn visible_size(sizes: &ffi::libraw_image_sizes_t) -> (u32, u32) {
     }
 }
 
+/// The engine's working-image decode: 16-bit **linear** (gamma 1.0), sRGB/Rec.709
+/// primaries, as-shot white balance, no auto-brightening, highlights clipped at sensor
+/// white (docs/plans/raw-foundation, decision 3), inset-cropped to the camera's visible
+/// rectangle, in sensor orientation with the display orientation alongside.
+#[derive(Debug)]
+pub struct LinearDecode {
+    pub width: u32,
+    pub height: u32,
+    /// Interleaved RGB, row-major, 0..=65535 with 65535 = sensor white.
+    pub rgb16: Vec<u16>,
+    pub orientation: image::metadata::Orientation,
+    pub cam_mul: [f32; 4],
+    pub rgb_cam: [[f32; 3]; 3],
+}
+
+/// Decode `path` for the working image. `abort` is polled between the expensive steps —
+/// open, unpack, process, copy-out — so a superseded Develop session stops within one step.
+pub fn decode_linear(path: &Path, abort: &std::sync::atomic::AtomicBool) -> Result<LinearDecode, String> {
+    use std::sync::atomic::Ordering;
+    let c_path = CString::new(path.to_string_lossy().as_bytes())
+        .map_err(|_| "path contains a NUL byte".to_string())?;
+    let check = |stage: &str| -> Result<(), String> {
+        if abort.load(Ordering::Relaxed) {
+            Err(format!("decode aborted before {stage}"))
+        } else {
+            Ok(())
+        }
+    };
+    // SAFETY: as in `decode_to_image` — pointers checked before use, the handle recycled
+    // and closed on every exit path.
+    let decoded = unsafe {
+        let lr = ffi::libraw_init(0);
+        if lr.is_null() {
+            return Err("libraw_init returned null".into());
+        }
+        let result = (|| {
+            check("open")?;
+            let rc = ffi::libraw_open_file(lr, c_path.as_ptr());
+            if rc != 0 {
+                return Err(format!("libraw_open_file failed ({})", CStr::from_ptr(ffi::libraw_strerror(rc)).to_string_lossy()));
+            }
+            check("unpack")?;
+            let rc = ffi::libraw_unpack(lr);
+            if rc != 0 {
+                return Err(format!("libraw_unpack failed ({rc})"));
+            }
+            (*lr).params.use_camera_wb = 1;
+            (*lr).params.output_bps = 16;
+            (*lr).params.output_color = 1; // sRGB / Rec.709 primaries
+            (*lr).params.gamm[0] = 1.0; // linear: no transfer curve
+            (*lr).params.gamm[1] = 1.0;
+            (*lr).params.no_auto_bright = 1;
+            (*lr).params.highlight = 0; // clip at sensor white — decision 3
+            (*lr).params.user_flip = 0; // sensor orientation; oriented by the caller
+            check("process")?;
+            let rc = ffi::libraw_dcraw_process(lr);
+            if rc != 0 {
+                return Err(format!("libraw_dcraw_process failed ({rc})"));
+            }
+            check("copy")?;
+            let inset = (*lr).sizes.raw_inset_crops[0];
+            let cam_mul = (*lr).color.cam_mul;
+            let rc = &(*lr).color.rgb_cam;
+            let rgb_cam = [
+                [rc[0][0], rc[0][1], rc[0][2]],
+                [rc[1][0], rc[1][1], rc[1][2]],
+                [rc[2][0], rc[2][1], rc[2][2]],
+            ];
+            let mut errc: i32 = 0;
+            let img = ffi::libraw_dcraw_make_mem_image(lr, &mut errc);
+            if img.is_null() || errc != 0 {
+                return Err(format!("libraw_dcraw_make_mem_image failed ({errc})"));
+            }
+            let copied = copy_processed_image16(img);
+            ffi::libraw_dcraw_clear_mem(img);
+            let (w, h, rgb16) = copied?;
+            let (w, h, rgb16) = crop_rgb16_to_inset(w, h, rgb16, inset);
+            Ok(LinearDecode {
+                width: w,
+                height: h,
+                rgb16,
+                orientation: image::metadata::Orientation::NoTransforms,
+                cam_mul,
+                rgb_cam,
+            })
+        })();
+        ffi::libraw_recycle(lr);
+        ffi::libraw_close(lr);
+        result
+    }?;
+    Ok(LinearDecode {
+        orientation: crate::thumbnails::exif_orientation(path),
+        ..decoded
+    })
+}
+
+/// Copy LibRaw's 16-bit, 3-channel processed buffer out as native-endian `u16`s.
+unsafe fn copy_processed_image16(
+    img: *mut ffi::libraw_processed_image_t,
+) -> Result<(u32, u32, Vec<u16>), String> {
+    let i = &*img;
+    if i.colors != 3 || i.bits != 16 {
+        return Err(format!("unexpected LibRaw output (colors={}, bits={})", i.colors, i.bits));
+    }
+    let (w, h) = (i.width as u32, i.height as u32);
+    let len = i.data_size as usize;
+    let n = w as usize * h as usize * 3;
+    if len != n * 2 {
+        return Err(format!("RGB16 buffer size mismatch ({len} bytes for {w}x{h})"));
+    }
+    // `data` is a flexible array member; LibRaw writes 16-bit samples in host order.
+    let bytes = std::slice::from_raw_parts(i.data.as_ptr(), len);
+    let mut out = Vec::with_capacity(n);
+    for px in bytes.chunks_exact(2) {
+        out.push(u16::from_ne_bytes([px[0], px[1]]));
+    }
+    Ok((w, h, out))
+}
+
+/// [`crop_to_inset`] for the 16-bit buffer.
+fn crop_rgb16_to_inset(w: u32, h: u32, rgb16: Vec<u16>, inset: ffi::libraw_raw_inset_crop_t) -> (u32, u32, Vec<u16>) {
+    let (cl, ct, cw, ch) = (inset.cleft as u32, inset.ctop as u32, inset.cwidth as u32, inset.cheight as u32);
+    if cw == 0 || ch == 0 || inset.cwidth == u16::MAX || cl >= w || ct >= h {
+        return (w, h, rgb16);
+    }
+    let cw = cw.min(w - cl);
+    let ch = ch.min(h - ct);
+    let mut out = Vec::with_capacity(cw as usize * ch as usize * 3);
+    for y in ct..ct + ch {
+        let row = y as usize * w as usize * 3;
+        out.extend_from_slice(&rgb16[row + cl as usize * 3..row + (cl + cw) as usize * 3]);
+    }
+    (cw, ch, out)
+}
+
 /// A LibRaw fixed-size char field as a String (trimmed at the first NUL).
 fn c_field(field: &[std::os::raw::c_char]) -> String {
     let bytes: Vec<u8> = field.iter().take_while(|&&c| c != 0).map(|&c| c as u8).collect();
@@ -266,6 +401,40 @@ mod tests {
         let missing = dir.join("missing.ARW");
         assert!(matches!(probe(&missing), RawSupport::Unsupported { .. }));
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn decode_linear_honours_abort() {
+        let dir = std::env::temp_dir().join(format!("chairphoto-raw-abort-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("x.ARW");
+        std::fs::write(&f, b"not a raw").unwrap();
+        let tripped = std::sync::atomic::AtomicBool::new(true);
+        let err = decode_linear(&f, &tripped).unwrap_err();
+        assert!(err.contains("aborted"), "{err}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Runs only with a real RAW at `CHAIRPHOTO_RAW_FIXTURE`: the linear decode is 16-bit,
+    /// the picture size, never brighter than sensor white, and orientation-tagged.
+    #[test]
+    fn decode_linear_is_16bit_linear_and_never_brightens() {
+        let Ok(fixture) = std::env::var("CHAIRPHOTO_RAW_FIXTURE") else {
+            println!("SKIPPED: decode_linear_is_16bit_linear_and_never_brightens — set CHAIRPHOTO_RAW_FIXTURE");
+            return;
+        };
+        let t = std::time::Instant::now();
+        let d = decode_linear(Path::new(&fixture), &std::sync::atomic::AtomicBool::new(false)).unwrap();
+        println!("decode_linear: {}x{} in {:.2?}, cam_mul {:?}", d.width, d.height, t.elapsed(), d.cam_mul);
+        assert_eq!(d.rgb16.len(), d.width as usize * d.height as usize * 3);
+        // Linear + no auto-bright: a mid-grey scene sits well below the top — the mean of
+        // the whole frame must not be pushed up toward white by a histogram stretch.
+        let mean = d.rgb16.iter().map(|&v| v as u64).sum::<u64>() / d.rgb16.len() as u64;
+        println!("mean sample {mean} / 65535");
+        assert!(mean < 40000, "a linear decode without auto-bright is not this bright");
+        if let Ok(expect) = std::env::var("CHAIRPHOTO_RAW_FIXTURE_SIZE") {
+            assert_eq!(format!("{}x{}", d.width, d.height), expect);
+        }
     }
 
     /// Runs only with a real RAW at `CHAIRPHOTO_RAW_FIXTURE`; announces itself otherwise.

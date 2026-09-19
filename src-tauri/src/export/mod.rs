@@ -473,6 +473,27 @@ fn decode_export_source(
 ) -> Result<image::DynamicImage, String> {
     #[cfg(feature = "edit")]
     if has_edit {
+        // Engine 2 (docs/plans/raw-foundation): the same linear working image Develop
+        // showed, through the same pipeline at full size — no tone matching.
+        if crate::plugins::edit::record_engine(edit_json) == 2 {
+            #[cfg(feature = "raw")]
+            {
+                let flag = std::sync::atomic::AtomicBool::new(false);
+                let decoded = crate::raw::decode_linear(original, &flag)?;
+                let image = std::sync::Arc::new(crate::develop::working_image_from(decoded));
+                let token = crate::plugins::edit::SourceToken::Working { photo_id: 0, generation: 0 };
+                return crate::plugins::edit::render_image_opts(
+                    crate::plugins::edit::RenderSource::Working { token, image },
+                    edit_json,
+                    0,
+                    crate::plugins::edit::RenderOpts::default(),
+                );
+            }
+            #[cfg(not(feature = "raw"))]
+            {
+                return Err("this version was developed on the RAW engine, which this build lacks".into());
+            }
+        }
         // The full-res source is already cropped to the camera's visible area and rotated
         // to display orientation (see `full_res_source` → `raw::decode_to_image`), so it
         // matches the frame the crop fractions were drawn on.

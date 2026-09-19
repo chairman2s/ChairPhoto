@@ -115,6 +115,28 @@ export interface VersionEdit {
   lut?: LutRef;
   /** Darkroom tone-strip zone offsets in EV, blacks→whites (8 entries). Absent = none. */
   zones?: number[];
+  /** Which render engine this record was made for (docs/plans/raw-foundation). Absent or
+   *  1: the gamma-domain pipeline on the camera preview, rendered exactly as it always
+   *  was. 2: the scene-linear pipeline on the RAW working image. A version means one
+   *  thing forever; the Darkroom never reinterprets an engine-1 record as engine 2. */
+  engine?: number;
+}
+
+/** The scene-linear engine that renders from the RAW working image. */
+export const ENGINE_LINEAR = 2;
+
+/** Whether a record belongs to the linear engine. */
+export const isLinear = (e: VersionEdit): boolean => e.engine === ENGINE_LINEAR;
+
+/** A fresh engine-2 record from an engine-1 one: geometry copied, look and tone reset
+ *  (an old EV is not a new EV — the pipelines mean different things by it). */
+export function forLinearEngine(e: VersionEdit): VersionEdit {
+  return {
+    crop: e.crop,
+    perspective: e.perspective,
+    straighten: e.straighten,
+    engine: ENGINE_LINEAR,
+  };
 }
 
 /** The look-only slice of an edit — everything except framing (crop/straighten). */

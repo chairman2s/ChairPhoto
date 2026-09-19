@@ -36,11 +36,28 @@ pub fn render_edit_bytes<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
     job: &crate::image_pool::EditJob,
 ) -> Result<Vec<u8>, String> {
-    use crate::plugins::edit::{self, timing::Stages, RenderOpts};
+    use crate::plugins::edit::{self, timing::Stages, RenderOpts, RenderSource, SourceToken};
     let mut t = Stages::start(format!(
-        "render_edit photo={} max_edge={} hi_res={} base_only={}",
-        job.photo_id, job.max_edge, job.hi_res, job.base_only
+        "render_edit photo={} max_edge={} hi_res={} base_only={} source={}",
+        job.photo_id, job.max_edge, job.hi_res, job.base_only, job.source.to_query()
     ));
+    // A working-image token renders from the resident RAW decode, or nothing: a stale
+    // token (photo switched, session closed) is a 404, never a fallback to other pixels.
+    if let SourceToken::Working { .. } = &job.source {
+        let opts = RenderOpts { skip_look: job.base_only };
+        let image = working_image(&job.source)?;
+        let out = edit::render_proxy(
+            RenderSource::Working { token: job.source.clone(), image },
+            &job.edit_json,
+            job.max_edge,
+            opts,
+        )?;
+        t.mark("render");
+        let bytes = if job.base_only { edit::encode_png_fast(&out)? } else { edit::encode_jpeg(&out, 90)? };
+        t.mark(if job.base_only { "encode_png" } else { "encode_jpeg" });
+        t.report(&format!("bytes={}", bytes.len()));
+        return Ok(bytes);
+    }
     // Gather path candidates under a brief lock (pure SQL), then stat + decode + render
     // off the lock so a slow/offline NAS can't serialize the app.
     let state = app.state::<AppState>();
@@ -66,13 +83,13 @@ pub fn render_edit_bytes<R: tauri::Runtime>(
         t.mark("zoom_bytes");
         let img = image::load_from_memory(&jpeg).map_err(|e| e.to_string())?;
         t.mark("decode");
-        edit::render_image_opts(img, &job.edit_json, job.max_edge, opts)?
+        edit::render_image_opts(RenderSource::Decoded(img), &job.edit_json, job.max_edge, opts)?
     } else {
         // Proxy tier: live sliders render this many times a second — through the decode
         // cache and the framed-base cache, so a look-only frame pays look + encode.
         let jpeg = crate::thumbnails::preview_bytes(&path)?;
         t.mark("preview_bytes");
-        edit::render_proxy(&jpeg, &job.edit_json, job.max_edge, opts)?
+        edit::render_proxy(RenderSource::PreviewJpeg(&jpeg), &job.edit_json, job.max_edge, opts)?
     };
     t.mark("render");
     let bytes = if job.base_only {
@@ -115,6 +132,7 @@ pub async fn render_edit(
             max_edge,
             hi_res: hi_res.unwrap_or(false),
             base_only: false,
+            source: crate::plugins::edit::SourceToken::Preview,
         };
         // Render and base64-wrap on a blocking worker: both are CPU work, neither belongs
         // on the async thread.
@@ -125,6 +143,35 @@ pub async fn render_edit(
         })
         .await
         .map_err(|e| e.to_string())?
+    }
+}
+
+/// A `source` argument as a working-image token, or `None` for the preview path.
+#[cfg(feature = "edit")]
+fn parse_working_token(source: Option<&str>) -> Result<Option<crate::plugins::edit::SourceToken>, String> {
+    use crate::plugins::edit::SourceToken;
+    match source {
+        None | Some("") | Some("p") => Ok(None),
+        Some(s) => match SourceToken::parse(s) {
+            Some(SourceToken::Preview) => Ok(None),
+            Some(t) => Ok(Some(t)),
+            None => Err(format!("bad source token {s:?}")),
+        },
+    }
+}
+
+/// The resident working image a token names — or a clear error, never other pixels.
+#[cfg(feature = "edit")]
+fn working_image(token: &crate::plugins::edit::SourceToken) -> Result<std::sync::Arc<crate::plugins::edit::WorkingImage>, String> {
+    #[cfg(feature = "raw")]
+    {
+        return crate::develop::resident(token)
+            .ok_or_else(|| format!("working image {} is not resident", token.to_query()));
+    }
+    #[cfg(not(feature = "raw"))]
+    {
+        let _ = token;
+        Err("this build has no RAW decoder; no working image can be resident".into())
     }
 }
 
@@ -139,10 +186,11 @@ pub async fn render_edit_batch(
     photo_id: i64,
     edit_jsons: Vec<String>,
     max_edge: u32,
+    source: Option<String>,
 ) -> Result<Vec<Option<String>>, String> {
     #[cfg(not(feature = "edit"))]
     {
-        let _ = (&app, photo_id, &edit_jsons, max_edge);
+        let _ = (&app, photo_id, &edit_jsons, max_edge, &source);
         Err("Editing backend not included in this build".into())
     }
     #[cfg(feature = "edit")]
@@ -164,6 +212,28 @@ pub async fn render_edit_batch(
                 crate::catalog::ResolveMode::OriginalRequired,
             )
             .ok_or_else(|| format!("no reachable copy of photo {photo_id}"))?;
+            if let Some(token) = parse_working_token(source.as_deref())? {
+                // Working image: every record renders through the framed-base cache (one
+                // geometry per batch, so one downscale) — no shared pre-scale needed.
+                let image = working_image(&token)?;
+                return Ok(edit_jsons
+                    .iter()
+                    .map(|ej| {
+                        crate::plugins::edit::render_proxy(
+                            crate::plugins::edit::RenderSource::Working { token: token.clone(), image: image.clone() },
+                            ej,
+                            max_edge,
+                            crate::plugins::edit::RenderOpts::default(),
+                        )
+                        .and_then(|out| crate::plugins::edit::encode_jpeg(&out, 82))
+                        .ok()
+                        .map(|bytes| {
+                            let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                            format!("data:image/jpeg;base64,{b64}")
+                        })
+                    })
+                    .collect());
+            }
             let jpeg = crate::thumbnails::preview_bytes(&path)?;
             let mut img = crate::plugins::edit::decode_proxy_cached(&jpeg)?;
             // Pre-scale once to ~2× the thumbnail edge; each per-record render then
@@ -201,10 +271,11 @@ pub async fn edit_zone_masses(
     app: AppHandle,
     photo_id: i64,
     edit_json: String,
+    source: Option<String>,
 ) -> Result<[f32; 8], String> {
     #[cfg(not(feature = "edit"))]
     {
-        let _ = (&app, photo_id, &edit_json);
+        let _ = (&app, photo_id, &edit_json, &source);
         Err("Editing backend not included in this build".into())
     }
     #[cfg(feature = "edit")]
@@ -225,16 +296,26 @@ pub async fn edit_zone_masses(
                 crate::catalog::ResolveMode::OriginalRequired,
             )
             .ok_or_else(|| format!("no reachable copy of photo {photo_id}"))?;
-            let jpeg = crate::thumbnails::preview_bytes(&path)?;
             // 1024px is plenty of resolution for an 8-bin histogram, and keeps the
             // render far cheaper than the preview tier's. Through the framed-base cache:
             // the settle that asks for masses has the same geometry as the drag before it.
-            let out = crate::plugins::edit::render_proxy(
-                &jpeg,
-                &edit_json,
-                1024,
-                crate::plugins::edit::RenderOpts::default(),
-            )?;
+            let out = if let Some(token) = parse_working_token(source.as_deref())? {
+                let image = working_image(&token)?;
+                crate::plugins::edit::render_proxy(
+                    crate::plugins::edit::RenderSource::Working { token, image },
+                    &edit_json,
+                    1024,
+                    crate::plugins::edit::RenderOpts::default(),
+                )?
+            } else {
+                let jpeg = crate::thumbnails::preview_bytes(&path)?;
+                crate::plugins::edit::render_proxy(
+                    crate::plugins::edit::RenderSource::PreviewJpeg(&jpeg),
+                    &edit_json,
+                    1024,
+                    crate::plugins::edit::RenderOpts::default(),
+                )?
+            };
             Ok(crate::plugins::edit::zone_masses(&out.to_rgb8()))
         })
         .await

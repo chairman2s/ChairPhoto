@@ -38,9 +38,11 @@
   **Still to judge by eye:** the user's first side-by-side reads the RAW as slightly lighter
   and less saturated in the oranges and a touch flatter overall (the camera's tone curve and
   picture style, which a plain decode does not carry) — whether to match the camera by
-  default or keep the honest decode is the user's call and stays open. Headroom has not yet
-  been seen on a *clipped* frame: the poster test shot had nothing blown, so the preview at
-  −1 EV would have looked the same; try a blown sky or daylight behind a subject.
+  default or keep the honest decode is the user's call and stays open. **Headroom seen on
+  a clipped frame (2026-09-19):** a sunlit portrait against sky whose camera preview had
+  pixels in the whites bin and a featureless cloud bank; the RAW at −1 EV shows the clouds'
+  shape and shading, keeps the sky blue instead of grey, and empties the whites bin —
+  the preview at −1 EV can only turn that cloud into a flat grey patch.
   Known, deliberate gaps for later slices: the loupe print and the proof sheet/duels still
   render engine 1 from the preview (an engine-2 broadcast makes the loupe fall back to the
   unedited preview); neighbours are accepted by `develop_open` but not preloaded (slice 4).

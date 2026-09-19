@@ -253,7 +253,11 @@ Darkroom) until the swap slice makes it the default.
   decodes the RAW on its own thread (`raw::decode_linear`: 16-bit, gamma 1.0, sRGB/Rec.709
   primaries, as-shot white balance, no auto-brightening, highlights clipped at sensor white,
   the camera's visible rectangle) into an f32 image held by `develop::ResidentSet`. A photo
-  switch, leaving Develop, or a catalog switch trips the claim and releases it. The event
+  switch, leaving Develop, a catalog switch, or an open with the engine switched off trips
+  the claim and releases it (the switch releases in its detach phase, with the slot); a
+  decode that finishes after a newer claim removes only its own image. The resident set's
+  lock is a leaf in the `commands::jobs` lock order. Each of those transitions is forced in
+  `develop::session::tests` and `commands::jobs::tests`. The event
   `develop:source` carries the state — `preview` (preparing), `raw` with the **token**
   `w:<photo>:<generation>`, `unsupported` with the camera, `jpeg`, `nodecoder`.
 - **Source on every render.** `edit://…&s=<token>`, `render_edit_batch` and

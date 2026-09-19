@@ -46,7 +46,24 @@
   Known, deliberate gaps for later slices: the loupe print and the proof sheet/duels still
   render engine 1 from the preview (an engine-2 broadcast makes the loupe fall back to the
   unedited preview); neighbours are accepted by `develop_open` but not preloaded (slice 4).
-- [ ] Slice 3 — ownership and cleanup, forced
+- [x] Slice 3 — ownership and cleanup, forced (2026-09-19). The open is now a `claim` step
+  and the worker's tail a `publish` step, both plain functions the tests drive by hand.
+  Fixed on the way: a catalog switch tripped the claim and cleared the slot but **left the
+  working image resident** (800 MB nothing owned, reachable by a token whose photo id means
+  another photo in the next catalog) — `DetachGuards::trip_and_clear_all` now releases it;
+  a superseded decode cleared *every* image, so a slow decode finishing after a fast one
+  would have dropped the newer photo's image — it removes only its own token; an open with
+  the engine switched off released nothing — it trips and releases like any other open.
+  Forced tests: `open_for_another_photo_trips_the_previous_claim`,
+  `a_superseded_decode_releases_only_its_own_image`,
+  `close_releases_the_image_and_the_stale_token_names_nothing`,
+  `reopening_the_resident_photo_answers_without_a_new_claim`,
+  `an_open_that_prepares_nothing_still_releases_the_previous_image`,
+  `jobs::a_switch_releases_the_develop_working_image`,
+  `editing::a_stale_working_token_is_an_error_not_other_pixels`; the first two and the
+  switch test were checked to fail against the mutated code. The resident set's lock is
+  documented as a leaf of the `commands::jobs` lock order. RSS before/after a quit from the
+  Darkroom: pending the measurement below.
 - [ ] Slice 4 — the `.rawf` decode cache + neighbour preload
 - [ ] Slice 5 — proof sheet, duels, masses, loupe, clipping overlay on the working image
 - [ ] Slice 6 — export is the view (tone match gone for engine 2; exact parity)

@@ -42,6 +42,7 @@
 //! | [`AbortGeneration::install_fresh`] (scan / sharpness / pHash starts) | one abort, released before the catalog is read |
 //! | [`AbortGeneration::trip`] (every Cancel command) | one abort |
 //! | [`JobSlot`] writes (workers) | one slot |
+//! | `develop`'s resident set (`develop::with_resident`) | a leaf: after any of the above, never across another lock |
 //!
 //! The scan, sharpness and pHash starts never hold two of these at once, so they cannot
 //! invert against the order; phase two covers them instead by tripping whatever it finds
@@ -669,10 +670,19 @@ impl DetachGuards<'_> {
     /// catalog lock, so no start can be inside its catalog → abort → slot claim; the slot's
     /// owner is necessarily the job being tripped. Between the phases the catalog is `None`,
     /// so every start fails before claiming.
+    ///
+    /// The develop family's working images go with its slot: an image is only ever
+    /// reachable through a token minted by a claim, and phase one trips every claim, so a
+    /// resident image would be 800 MB nothing can name — or worse, named by a token whose
+    /// photo id now means a different photo in the next catalog. The resident set's lock is
+    /// a leaf (see `develop`), taken here after every registry lock is released by
+    /// `clear_all`.
     pub fn trip_and_clear_all(self) {
         let Self { aborts, slots } = self;
         aborts.trip_all();
         slots.clear_all();
+        #[cfg(all(feature = "raw", feature = "edit"))]
+        crate::develop::release_all();
     }
 }
 
@@ -996,6 +1006,36 @@ mod tests {
         );
         #[cfg(feature = "smarttags")]
         assert!(registry.smarttags.status().unwrap().is_none());
+    }
+
+    /// **Forced.** A catalog switch trips the develop claim, clears its slot, **and releases
+    /// its working image** — the token it minted would otherwise still answer, naming a
+    /// photo id that means something else in the next catalog.
+    #[cfg(all(feature = "raw", feature = "edit"))]
+    #[test]
+    fn a_switch_releases_the_develop_working_image() {
+        use crate::develop::{resident, resident_bytes, serial, session, test_image};
+        use crate::plugins::edit::SourceToken;
+        let _serial = serial();
+        let (catalog, _db) = open_catalog("develop");
+        let registry = JobRegistry::default();
+        let claim = registry
+            .develop
+            .begin(&catalog, |job| super::super::DevelopStatus { job, photo_id: 7, generation: job, resident: false })
+            .unwrap();
+        let token = SourceToken::Working { photo_id: 7, generation: claim.job };
+        assert_eq!(session::publish(&claim, 7, &token, test_image(8, 8)), session::Published::Resident);
+        assert!(resident(&token).is_some());
+
+        registry.lock_for_detach().unwrap().trip_and_clear_all();
+
+        assert!(claim.abort.load(Ordering::Relaxed), "the decode is told to stop");
+        assert!(registry.develop.status().unwrap().is_none(), "the slot is cleared");
+        assert!(resident(&token).is_none(), "the image is released with the slot");
+        assert_eq!(resident_bytes(), 0);
+        // A straggler that decoded across the switch cannot make itself resident either.
+        assert_eq!(session::publish(&claim, 7, &token, test_image(8, 8)), session::Published::Superseded);
+        assert!(resident(&token).is_none());
     }
 
     /// **Forced race.** A superseded worker's straggler, arriving after a switch has cleared

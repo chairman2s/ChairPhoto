@@ -3,6 +3,16 @@
 //! owned by the `develop` job family — a photo switch, a Develop exit, or a catalog switch
 //! trips the claim and the images are released. Only compiled with both the decoder
 //! (`raw`) and the engine (`edit`); without either, Develop keeps rendering the preview.
+//!
+//! # Ownership
+//!
+//! The set is a process-global behind its own mutex, and that mutex is a **leaf** in the
+//! lock order documented in `commands::jobs`: it is taken after any registry lock and never
+//! held while taking another. Membership follows the `develop` claim: `session::open` and
+//! `session::close` release on every ownership change, a catalog switch releases in its
+//! detach phase (`DetachGuards::trip_and_clear_all`), and a superseded worker removes only
+//! its own token. A stale token — one whose claim was tripped — therefore names nothing,
+//! and `edit://` answers it with a 404 rather than other pixels.
 
 pub mod session;
 
@@ -48,6 +58,14 @@ impl ResidentSet {
         self.images.clear();
     }
 
+    /// Drop one token's image, if resident. A superseded worker's cleanup: it must not
+    /// touch the image a newer claim has meanwhile published.
+    pub fn remove(&mut self, token: &SourceToken) -> bool {
+        let before = self.images.len();
+        self.images.retain(|(t, _)| t != token);
+        self.images.len() != before
+    }
+
     pub fn len(&self) -> usize {
         self.images.len()
     }
@@ -69,10 +87,43 @@ pub(crate) fn with_resident<T>(f: impl FnOnce(&mut ResidentSet) -> T) -> T {
     f(&mut guard)
 }
 
+/// Release every working image. The cleanup half of every ownership transition — the
+/// catalog switch calls it from its detach phase, so a switch cannot leave a replaced
+/// catalog's decode resident and reachable by a token that names the new catalog's ids.
+pub(crate) fn release_all() {
+    with_resident(|r| r.clear());
+}
+
+/// How many bytes the resident images hold right now — the number a "did it clean up"
+/// check reads.
+pub fn resident_bytes() -> usize {
+    with_resident(|r| r.images.iter().map(|(_, i)| i.bytes()).sum())
+}
+
+/// The resident set is process-global, so tests that assert on it must not interleave:
+/// each takes this lock for its whole body.
+#[cfg(test)]
+pub(crate) fn serial() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: Mutex<()> = Mutex::new(());
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// A small synthetic working image for ownership tests (`w`×`h`, all black).
+#[cfg(test)]
+pub(crate) fn test_image(w: u32, h: u32) -> Arc<WorkingImage> {
+    Arc::new(WorkingImage {
+        width: w,
+        height: h,
+        linear: image::Rgb32FImage::new(w, h),
+        cam_mul: [1.0; 4],
+        rgb_cam: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+        decoder: "test",
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use image::Rgb32FImage;
 
     /// Runs only with a real RAW at `CHAIRPHOTO_RAW_FIXTURE`: the distance between the
     /// engine-2 as-shot render and the camera's own preview, as mean sRGB values — the
@@ -118,14 +169,20 @@ mod tests {
     }
 
     fn img(w: u32, h: u32) -> Arc<WorkingImage> {
-        Arc::new(WorkingImage {
-            width: w,
-            height: h,
-            linear: Rgb32FImage::new(w, h),
-            cam_mul: [1.0; 4],
-            rgb_cam: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
-            decoder: "test",
-        })
+        test_image(w, h)
+    }
+
+    #[test]
+    fn remove_drops_only_the_named_token() {
+        let mut set = ResidentSet::new(usize::MAX);
+        let a = SourceToken::Working { photo_id: 1, generation: 1 };
+        let b = SourceToken::Working { photo_id: 2, generation: 2 };
+        assert!(set.insert(a.clone(), img(4, 4)));
+        assert!(set.insert(b.clone(), img(4, 4)));
+        assert!(set.remove(&a));
+        assert!(!set.remove(&a), "already gone");
+        assert!(set.get(&a).is_none());
+        assert!(set.get(&b).is_some(), "the other image is untouched");
     }
 
     #[test]

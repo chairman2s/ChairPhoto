@@ -602,6 +602,19 @@ mod tests {
         (catalog, dir, root)
     }
 
+    /// A working-image token nothing resident answers to is an error — the `edit://`
+    /// responder turns it into a 404 — never a fall-through to the preview pixels.
+    #[cfg(feature = "raw")]
+    #[test]
+    fn a_stale_working_token_is_an_error_not_other_pixels() {
+        let token = crate::plugins::edit::SourceToken::Working { photo_id: 999_999, generation: 1 };
+        let err = match working_image(&token) {
+            Err(e) => e,
+            Ok(_) => panic!("a token nothing minted found an image"),
+        };
+        assert!(err.contains("w:999999:1") && err.contains("not resident"), "{err}");
+    }
+
     fn state_with(catalog: Catalog, health: VolumeHealth) -> AppState {
         let state = AppState::default();
         *state.catalog.lock().unwrap() = Some(catalog);

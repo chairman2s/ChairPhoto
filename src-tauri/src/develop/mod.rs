@@ -74,6 +74,49 @@ mod tests {
     use super::*;
     use image::Rgb32FImage;
 
+    /// Runs only with a real RAW at `CHAIRPHOTO_RAW_FIXTURE`: the distance between the
+    /// engine-2 as-shot render and the camera's own preview, as mean sRGB values — the
+    /// number that sets `BASELINE_EV` and the display default (docs/plans/raw-foundation,
+    /// slice 2). Prints every stage's mean so a brightness bug is localizable.
+    #[test]
+    fn fixture_working_image_renders_near_the_camera_preview() {
+        let Ok(fixture) = std::env::var("CHAIRPHOTO_RAW_FIXTURE") else {
+            println!("SKIPPED: fixture_working_image_renders_near_the_camera_preview — set CHAIRPHOTO_RAW_FIXTURE");
+            return;
+        };
+        use crate::plugins::edit::{render_proxy, RenderOpts, RenderSource, SourceToken};
+        let path = std::path::Path::new(&fixture);
+        let d = crate::raw::decode_linear(path, &std::sync::atomic::AtomicBool::new(false)).unwrap();
+        let mean16 = d.rgb16.iter().map(|&v| v as f64).sum::<f64>() / d.rgb16.len() as f64 / 65535.0;
+        let image = Arc::new(working_image_from(d));
+        let src = &image.linear;
+        let mean_lin = src.as_raw().iter().map(|&v| v as f64).sum::<f64>() / src.as_raw().len() as f64;
+        let max_lin = src.as_raw().iter().cloned().fold(0.0f32, f32::max);
+        println!("linear: mean16={mean16:.4} mean_f32={mean_lin:.4} max_f32={max_lin:.3} {}x{}", image.width, image.height);
+        // Stage by stage: the downscale, the display transform, and both together.
+        {
+            use crate::plugins::edit::linear::{to_display, DisplayTransform, BASELINE_EV};
+            let small = crate::plugins::edit::linear::downscale_linear(src, 720);
+            let m = |v: &[f32]| v.iter().map(|&x| x as f64).sum::<f64>() / v.len() as f64;
+            println!("stage: downscale_linear(720) mean_f32={:.4} max={:.3}", m(small.as_raw()), small.as_raw().iter().cloned().fold(0.0f32, f32::max));
+            let mu = |v: &[u8]| v.iter().map(|&x| x as f64).sum::<f64>() / v.len() as f64;
+            for ev in [0.0f32, 0.5, 1.0, 1.5] {
+                let d = to_display(&small, DisplayTransform::Srgb, ev);
+                let soft = to_display(&small, DisplayTransform::Soft { shoulder: 0.8 }, ev);
+                println!("stage: baseline {ev:+.1} EV → srgb mean={:.1}  soft mean={:.1}", mu(d.as_raw()), mu(soft.as_raw()));
+            }
+            let _ = BASELINE_EV;
+        }
+        let token = SourceToken::Working { photo_id: 1, generation: 1 };
+        let out = render_proxy(RenderSource::Working { token, image: image.clone() }, r#"{"engine": 2}"#, 720, RenderOpts::default()).unwrap().to_rgb8();
+        let mean_out = out.as_raw().iter().map(|&v| v as f64).sum::<f64>() / out.as_raw().len() as f64;
+        let preview = crate::thumbnails::preview_bytes(path).unwrap();
+        let pv = image::load_from_memory(&preview).unwrap().to_rgb8();
+        let mean_pv = pv.as_raw().iter().map(|&v| v as f64).sum::<f64>() / pv.as_raw().len() as f64;
+        println!("display: engine2 mean={mean_out:.1}/255  camera preview mean={mean_pv:.1}/255  ({}x{} vs {}x{})", out.width(), out.height(), pv.width(), pv.height());
+        assert!(mean_lin < 0.9, "the linear working image is not nearly white");
+    }
+
     fn img(w: u32, h: u32) -> Arc<WorkingImage> {
         Arc::new(WorkingImage {
             width: w,

@@ -478,11 +478,15 @@ fn frame_image(
     }
     t.mark("crop");
 
-    // 3) Optional downscale (preview speed).
+    // 3) Optional downscale (preview speed). The linear image never goes through the
+    //    `image` crate's resampler — it is wrong on f32 buffers (see `linear::downscale_linear`).
     if max_edge > 0 {
         let (w, h) = img.dimensions();
         if w.max(h) > max_edge {
-            img = img.thumbnail(max_edge, max_edge);
+            img = match img {
+                DynamicImage::ImageRgb32F(lin) => DynamicImage::ImageRgb32F(linear::downscale_linear(&lin, max_edge)),
+                other => other.thumbnail(max_edge, max_edge),
+            };
         }
     }
     t.mark("downscale");
@@ -936,8 +940,10 @@ mod tests {
         let token = SourceToken::Working { photo_id: 2, generation: 7 };
         let img = synthetic_working(1.4);
         let at0 = render_proxy(RenderSource::Working { token: token.clone(), image: img.clone() }, r#"{"engine": 2}"#, 0, RenderOpts::default()).unwrap().to_rgb8();
-        let down = render_proxy(RenderSource::Working { token: token.clone(), image: img.clone() }, r#"{"engine": 2, "tone": {"ev": -1.5}}"#, 0, RenderOpts::default()).unwrap().to_rgb8();
-        // At 0 EV the bright patch is display white; at −1.5 EV it is not, and the ramp
+        // The baseline lift (BASELINE_EV) sits on top of the record's EV, so the pull has
+        // to exceed it: at −3 EV a patch at 1.4× sensor white lands at 1.4·2^(1.4−3) ≈ 0.46.
+        let down = render_proxy(RenderSource::Working { token: token.clone(), image: img.clone() }, r#"{"engine": 2, "tone": {"ev": -3.0}}"#, 0, RenderOpts::default()).unwrap().to_rgb8();
+        // At 0 EV the bright patch is display white; at −3 EV it is not, and the ramp
         // beside it is darker still — the patch kept its light.
         assert_eq!(at0.get_pixel(2, 10).0, [255, 255, 255]);
         assert!(down.get_pixel(2, 10).0[0] < 255);

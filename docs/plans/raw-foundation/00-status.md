@@ -23,8 +23,16 @@
   release build; mean linear sample 17847/65535 (27 % of sensor white — no auto-bright).
   Headroom: locked by `engine2_renders_the_working_image_and_recovers_headroom` on a
   synthetic image (a patch 1.4× above white returns at −1.5 EV; engine 1 on the 8-bit
-  rendering cannot). Distance from the camera JPEG and the `Soft` default: **not yet
-  measured on the corpus** — needs the on-screen comparison; `BASELINE_EV` stays provisional.
+  rendering cannot).
+  **On-screen finding (first open, `_DSC8291.ARW`):** the RAW rendered nearly white. Cause,
+  found by `develop::tests::fixture_working_image_renders_near_the_camera_preview` printing
+  every stage's mean: the `image` crate's `thumbnail`/`resize` are **wrong on f32 buffers**
+  (mean 0.08 → 0.58, values up to 1.5 from a source capped at 1.0). Fixed with
+  `linear::downscale_linear`, an exact area average; the linear path never calls the
+  crate's resampler now. **Distance from the camera JPEG (same photo):** preview mean sRGB
+  105.6; the linear decode at baseline 0 EV → 66.8, +0.5 → 79.4, +1.0 → 93.8, +1.5 → 109.9,
+  so `BASELINE_EV` is set to **1.4** (from 0.5). The `Soft` shoulder changes nothing at
+  these means (it acts only near white); its default stays open until judged by eye.
   Known, deliberate gaps for later slices: the loupe print and the proof sheet/duels still
   render engine 1 from the preview (an engine-2 broadcast makes the loupe fall back to the
   unedited preview); neighbours are accepted by `develop_open` but not preloaded (slice 4).

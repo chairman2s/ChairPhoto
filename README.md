@@ -38,6 +38,14 @@ Most of this lives in **modules** you can turn off. See [Modules](#modules).
 Developed and tested on **Linux**. Tauri itself is cross-platform, but ChairPhoto's system
 dependencies and packaging have not been exercised on macOS or Windows — reports welcome.
 
+**Hyprland / Omarchy.** Omarchy makes every window slightly translucent by default, which
+mixes the wallpaper into the tones you are judging in Develop. Keep ChairPhoto opaque by
+adding this to `~/.config/hypr/hyprland.lua` (the same rule is in `packaging/omarchy/`):
+
+```lua
+o.window("^chairphoto$", { tag = "-default-opacity", opacity = "1 1" })
+```
+
 ## Requirements
 
 ChairPhoto shells out to a few system tools rather than bundling them. **Missing tools

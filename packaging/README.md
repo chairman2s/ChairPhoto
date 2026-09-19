@@ -10,6 +10,19 @@ separate source of truth.
 |---|---|
 | `PKGBUILD` | The package recipe. |
 | `chairphoto.desktop` | Launcher entry, plus the `chairphoto://` scheme registration. |
+| `omarchy/chairphoto.lua` | Hyprland window rule for Omarchy, keeping the app opaque (see below). |
+
+## Why `omarchy/chairphoto.lua` exists
+
+Omarchy 4 tags every window `default-opacity` and applies `opacity = "0.985 0.96"` to the
+tag, so the wallpaper shows faintly through every app. For a photo editor that is a defect:
+every tone judged in Develop is mixed with whatever is behind the window. No Wayland
+protocol lets an app ask the compositor to make it opaque, and the app should not run
+`hyprctl` to change a user's compositor behind their back, so the fix is a window rule.
+Omarchy keeps such rules per app under `default/hypr/apps/` (DaVinci Resolve and RetroArch
+opt out for the same reason); `omarchy/chairphoto.lua` is that file, ready to submit
+upstream. Until it lands there, users add the same line to their own `hyprland.lua` — the
+top-level README shows it.
 
 ## Why `onnxruntime-cpu` is an *optional* dependency
 

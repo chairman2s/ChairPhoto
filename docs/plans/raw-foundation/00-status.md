@@ -8,7 +8,9 @@
 ## Slices
 - [x] Slice 1 — tracer bullet: vendored LibRaw builds with the app; `raw_probe`; the source badge (2026-09-10; seen on screen on the A7R VI). Finding: Sony *Lossless* Compressed RAW 2 files store a 10240×7168 raster (73.4 MP) padded around the 9984×6656 picture; the badge and any size the engine reports must use the camera's visible rectangle (`raw_inset_crops[0]`), which is also what `crop_to_inset` trims the export to.
 - [x] Slice 2 — the working image renders (engine 2 behind `develop.rawEngine`) (2026-09-19;
-  on-screen check on the A7R VI pending the next dev restart). Landed: `raw::decode_linear`
+  seen on screen on the A7R VI: badge `RAW · 16-bit · 66.5 MP`, brightness matching the
+  preview at the 1.4 EV baseline, and Exposure −1 pulling the whites to a clean grey with
+  no banding in the dark reds). Landed: `raw::decode_linear`
   (16-bit linear, honest clipping, abortable), `develop::{ResidentSet, session}` with the
   `develop` job family, `RenderSource`/`SourceToken` and the `s=` token on `edit://`,
   `render_edit_batch`/`edit_zone_masses` with a `source`, the engine id on the record
@@ -33,6 +35,12 @@
   105.6; the linear decode at baseline 0 EV → 66.8, +0.5 → 79.4, +1.0 → 93.8, +1.5 → 109.9,
   so `BASELINE_EV` is set to **1.4** (from 0.5). The `Soft` shoulder changes nothing at
   these means (it acts only near white); its default stays open until judged by eye.
+  **Still to judge by eye:** the user's first side-by-side reads the RAW as slightly lighter
+  and less saturated in the oranges and a touch flatter overall (the camera's tone curve and
+  picture style, which a plain decode does not carry) — whether to match the camera by
+  default or keep the honest decode is the user's call and stays open. Headroom has not yet
+  been seen on a *clipped* frame: the poster test shot had nothing blown, so the preview at
+  −1 EV would have looked the same; try a blown sky or daylight behind a subject.
   Known, deliberate gaps for later slices: the loupe print and the proof sheet/duels still
   render engine 1 from the preview (an engine-2 broadcast makes the loupe fall back to the
   unedited preview); neighbours are accepted by `develop_open` but not preloaded (slice 4).

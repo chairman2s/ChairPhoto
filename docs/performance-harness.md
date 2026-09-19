@@ -133,3 +133,17 @@ sqlite3 -readonly ~/.local/share/chairphoto/default.chairphoto \
 
 This is what found the 2.2 s Develop → Library freeze (sync commands waiting for the
 catalog lock on the main thread; see `with_catalog` in `src-tauri/src/commands/mod.rs`).
+
+## Tag-count bench
+
+`catalog::tests::tag_count_bench` times `list_tags_with_counts` against a **copy** of a real
+catalog (never the live file), both the current implementation and the recursive-closure
+query it replaced, and asserts they agree:
+
+```bash
+CHAIRPHOTO_TAG_BENCH_DB=~/.local/share/chairphoto/default.chairphoto \
+  cargo test --release tag_count_bench -- --ignored --nocapture
+```
+
+On a 144k-photo / 1.6k-tag catalog (2026-09-19): closure 240 ms → two queries + walk 106 ms
+in release; 1028 → 630 ms in the debug profile `tauri dev` runs.

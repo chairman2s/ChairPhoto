@@ -1630,7 +1630,70 @@ impl Catalog {
     }
 
     /// All tags with a recursive photo count (counts include descendant tags).
+    /// Every tag, in path order, with the number of *distinct* visible photos in its
+    /// subtree — a photo tagged both `Birds` and `Birds/Owls` counts once for `Birds`.
+    ///
+    /// Two cheap queries and a walk, instead of one recursive join: the tag closure joined
+    /// against every assignment cost ~225 ms on a 144k-photo / 1.6k-tag catalog, and this is
+    /// the query the Library asks for on every boot and every cold return from Develop. The
+    /// per-subtree distinct count is computed here — each visible assignment is credited to
+    /// the tag and every ancestor, deduplicated per (tag, photo) — which is the same set
+    /// `COUNT(DISTINCT p.id)` over the closure produced; `tags_with_counts_match_the_sql_closure`
+    /// keeps the two in step.
     pub fn list_tags_with_counts(&self) -> Result<Vec<TagWithCount>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, name, full_path, parent_id, description, auto_rule, uuid, private
+             FROM tags ORDER BY full_path_norm",
+        )?;
+        let tags = stmt
+            .query_map([], row_to_tag)?
+            .collect::<rusqlite::Result<Vec<Tag>>>()?;
+        let parent_of: std::collections::HashMap<i64, Option<i64>> =
+            tags.iter().map(|t| (t.id, t.parent_id)).collect();
+
+        // Visible assignments only: the grid hides missing/trashed photos, so a tag's count
+        // must match what selecting it shows.
+        let mut stmt = self.conn.prepare(
+            "SELECT pt.tag_id, pt.photo_id
+             FROM photo_tags pt
+             JOIN photos_visible p ON p.id = pt.photo_id",
+        )?;
+        let assignments = stmt
+            .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))?
+            .collect::<rusqlite::Result<Vec<(i64, i64)>>>()?;
+
+        let mut counts: std::collections::HashMap<i64, i64> = std::collections::HashMap::new();
+        let mut credited: std::collections::HashSet<(i64, i64)> = std::collections::HashSet::new();
+        let depth_limit = tags.len() + 1; // a corrupt parent cycle terminates rather than spins
+        for (tag_id, photo_id) in assignments {
+            let mut cur = Some(tag_id);
+            let mut hops = 0;
+            while let Some(id) = cur {
+                if hops > depth_limit {
+                    break;
+                }
+                hops += 1;
+                if credited.insert((id, photo_id)) {
+                    *counts.entry(id).or_insert(0) += 1;
+                }
+                cur = parent_of.get(&id).copied().flatten();
+            }
+        }
+
+        Ok(tags
+            .into_iter()
+            .map(|tag| {
+                let photo_count = counts.get(&tag.id).copied().unwrap_or(0);
+                TagWithCount { tag, photo_count }
+            })
+            .collect())
+    }
+
+    /// The previous, single-query form of [`Self::list_tags_with_counts`]: the tag closure
+    /// joined against every visible assignment with `COUNT(DISTINCT p.id)`. Kept as the
+    /// oracle the fast path is tested against.
+    #[cfg(test)]
+    pub(crate) fn list_tags_with_counts_via_closure(&self) -> Result<Vec<TagWithCount>> {
         let mut stmt = self.conn.prepare(
             "WITH RECURSIVE tag_tree(root_id, tag_id) AS (
                  SELECT id, id FROM tags
@@ -1643,9 +1706,6 @@ impl Catalog {
              FROM tags t
              LEFT JOIN tag_tree ON tag_tree.root_id = t.id
              LEFT JOIN photo_tags pt ON pt.tag_id = tag_tree.tag_id
-             -- Count only photos that are actually present (the grid hides missing/removed
-             -- ones), so a tag's count matches what selecting it shows. Counting NULL p.id
-             -- (a missing photo) is skipped by COUNT(DISTINCT …).
              LEFT JOIN photos_visible p ON p.id = pt.photo_id
              GROUP BY t.id
              ORDER BY t.full_path_norm",
@@ -2304,5 +2364,97 @@ mod tests {
             drop(catalog);
             let _ = std::fs::remove_dir_all(&dir);
         }
+    }
+
+    /// Timing on a real catalog: `CHAIRPHOTO_TAG_BENCH_DB=/path/to/x.chairphoto cargo test
+    /// --release tag_count_bench -- --ignored --nocapture`. Opens a *copy*, never the live file.
+    #[test]
+    #[ignore = "tag-count bench on a real catalog; needs CHAIRPHOTO_TAG_BENCH_DB"]
+    fn tag_count_bench() {
+        let Ok(src) = std::env::var("CHAIRPHOTO_TAG_BENCH_DB") else {
+            println!("SKIPPED: tag_count_bench — set CHAIRPHOTO_TAG_BENCH_DB");
+            return;
+        };
+        let dir = crate::test_support::TestTmpDir::new("tag-bench");
+        let db = dir.join("copy.chairphoto");
+        std::fs::copy(&src, &db).unwrap();
+        if let Ok(wal) = std::fs::read(format!("{src}-wal")) {
+            std::fs::write(dir.join("copy.chairphoto-wal"), wal).unwrap();
+        }
+        let root = dir.join("photos");
+        std::fs::create_dir_all(&root).unwrap();
+        let cat = Catalog::open(&db, &root).unwrap();
+        for (label, f) in [
+            ("closure (old)", Box::new(|| cat.list_tags_with_counts_via_closure().unwrap()) as Box<dyn Fn() -> Vec<TagWithCount>>),
+            ("fast (new)", Box::new(|| cat.list_tags_with_counts().unwrap())),
+        ] {
+            let mut ms = Vec::new();
+            let mut n = 0;
+            for _ in 0..5 {
+                let t = std::time::Instant::now();
+                n = f().len();
+                ms.push(t.elapsed().as_secs_f64() * 1000.0);
+            }
+            ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            println!("{label}: {n} tags, median {:.1} ms, min {:.1} ms", ms[2], ms[0]);
+        }
+        let a = cat.list_tags_with_counts_via_closure().unwrap();
+        let b = cat.list_tags_with_counts().unwrap();
+        let pairs = |v: &[TagWithCount]| v.iter().map(|t| (t.tag.id, t.photo_count)).collect::<Vec<_>>();
+        assert_eq!(pairs(&a), pairs(&b), "fast and closure disagree on the real catalog");
+        println!("counts identical on the real catalog");
+    }
+
+    /// The fast tag-count path (two queries + a walk) must agree with the recursive
+    /// closure query it replaced, on the shapes that make them differ if either is wrong:
+    /// a photo tagged with both a tag and its ancestor (counted once), a three-level chain,
+    /// a photo under two sibling subtrees, and missing / trashed photos (excluded).
+    #[test]
+    fn tags_with_counts_match_the_sql_closure() {
+        let dir = crate::test_support::TestTmpDir::new("tag-counts");
+        let root = dir.join("photos");
+        std::fs::create_dir_all(&root).unwrap();
+        let cat = Catalog::open(&dir.join("test.chairphoto"), &root).unwrap();
+        let c = cat.conn();
+        for id in 1..=6 {
+            c.execute(
+                "INSERT INTO photos(id, uuid, path, mtime_ns, size, extension, created_at, updated_at)
+                 VALUES(?1, ?2, ?3, 0, 0, 'jpg', 0, 0)",
+                params![id, format!("u{id}"), format!("p{id}.jpg")],
+            )
+            .unwrap();
+        }
+        let animals = cat.create_tag("Animals").unwrap();
+        let birds = cat.create_tag("Animals/Birds").unwrap();
+        let owls = cat.create_tag("Animals/Birds/Owls").unwrap();
+        let dogs = cat.create_tag("Animals/Dogs").unwrap();
+        let places = cat.create_tag("Places").unwrap();
+        // 1: owl only → Owls, Birds, Animals each get it once.
+        cat.assign_tag(1, owls).unwrap();
+        // 2: owl AND its ancestor Birds → Birds must not count it twice.
+        cat.assign_tag(2, owls).unwrap();
+        cat.assign_tag(2, birds).unwrap();
+        // 3: under two sibling subtrees → Animals counts it once, Birds and Dogs once each.
+        cat.assign_tag(3, birds).unwrap();
+        cat.assign_tag(3, dogs).unwrap();
+        // 4: missing, 5: trashed → excluded everywhere.
+        cat.assign_tag(4, owls).unwrap();
+        c.execute("UPDATE photos SET missing = 1 WHERE id = 4", []).unwrap();
+        cat.assign_tag(5, dogs).unwrap();
+        cat.trash_photos(&[5]).unwrap();
+        // 6: untagged; Places has no photos at all.
+        let _ = places;
+
+        let fast = cat.list_tags_with_counts().unwrap();
+        let oracle = cat.list_tags_with_counts_via_closure().unwrap();
+        let pairs = |v: &[TagWithCount]| v.iter().map(|t| (t.tag.full_path.clone(), t.photo_count)).collect::<Vec<_>>();
+        assert_eq!(pairs(&fast), pairs(&oracle));
+        let by_path: std::collections::HashMap<_, _> = pairs(&fast).into_iter().collect();
+        assert_eq!(by_path["Animals"], 3, "photos 1, 2, 3 — each once");
+        assert_eq!(by_path["Animals/Birds"], 3, "1 via Owls, 2 once despite both tags, 3 direct");
+        assert_eq!(by_path["Animals/Birds/Owls"], 2, "1 and 2; 4 is missing");
+        assert_eq!(by_path["Animals/Dogs"], 1, "3; 5 is trashed");
+        assert_eq!(by_path["Places"], 0);
+        assert_eq!(animals, fast[0].tag.id, "path order: Animals first");
     }
 }

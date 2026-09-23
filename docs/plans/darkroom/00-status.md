@@ -86,32 +86,38 @@ survey and plan live in the session plan file; the increments are:
   Frontend cadence (IPC + paint, `editor.renderTiming.lastSummary`): pending a manual drag
   with the toggle on — not taken in this session because the desktop was in use.
 - [x] Increment 2 — native `edit://` transport for the darkroom stage (`protocol::handle_edit_request`, `editRenderUrl`; base64 gone from the drag path).
-- [ ] Increment 3 — WebGL2 look shader as the drag tier (`editor.gpuPreview`, default off).
-  **Blocked on a decision (2026-09-06).** Two WebKitWebProcess segfaults during the
-  session (14:40 and 14:49) were symbolized with debuginfod and reproduced outside the
-  app with `scripts/webgl-teardown-repro.py`. Stack (WebKitGTK 2.52.6, NVIDIA 610.57):
-  `WebKit::AuxiliaryProcess::terminate` → `WebProcess::stopRunLoop` →
-  `PlatformDisplay::clearGLContexts` → `GLContext::~GLContext` (GLContext.cpp:335) →
-  SIGSEGV inside `libnvidia-eglcore`. That is, the web process was **already being
-  terminated** (a Vite full reload's process swap; the dev session ending; the test
-  windows closing) and died destroying its EGL contexts — not a crash of a running
-  page, but a core dump plus Omarchy's crash notification on every such teardown.
-  Conditions, from the reproduction: under `WEBKIT_DISABLE_DMABUF_RENDERER=1` (what
-  `lib.rs` sets on Linux) it happens every time a **visible** canvas still holds a live
-  WebGL2 context at teardown, even a single one; a hidden canvas, a context released
-  while the page lives (`drop`/`lose` modes), or the DMABUF renderer left on
-  (`WEBKIT_DISABLE_DMABUF_RENDERER=0 __NV_DISABLE_EXPLICIT_SYNC=1`) never crash; losing
-  contexts from `pagehide`/`beforeunload` is too late. Consequences: the probe now
-  loses its context on unmount (its cancel fn); a GL drag tier must do the same on
-  unmount and would still make "quit the app from the Darkroom" a web-process crash on
-  this driver path unless the app either loses contexts from the UI process before the
-  window closes (a CloseRequested hook that evals JS, then closes) or moves to the
-  DMABUF renderer with `__NV_DISABLE_EXPLICIT_SYNC=1` — allowed by AGENTS.md only as a
-  tested replacement (the standalone webview ran clean that way; the app has not been
-  run that way). Options: (a) accept the quit-time dump on the legacy path, (b) the
-  close hook, (c) validate and ship the env change, (d) drop the webview GL tier for
-  the Phase 2 native backend. Decide before building increment 3.
-- [ ] Phase 2 gate — `wgpu` backend: build only on the exit criteria in the plan.
+- [x] Increment 3 — WebGL2 look shader as the drag tier. **Decided against, 2026-09-23,
+  not built.** Two problems, independent of each other, either one enough on its own:
+
+  1. **Wrong layer for this app.** ChairPhoto is a native Tauri process with a webview
+     for UI, not a website; the trusted render engine lives in Rust and preview/export
+     must stay bit-identical to it (docs/editing.md). The original GPU research note
+     said this before any code existed: "The browser/WebView GPU is only a display
+     surface. The trusted renderer belongs in the native Rust process"
+     (agent-notes/darkroom-research/05-gpu-rendering.md). A WebGL shader in the webview
+     would have made the display layer do real rendering work — the thing that note
+     ruled out.
+  2. **It demonstrated real fragility.** The Gate 0 spike reproduced a genuine
+     WebKitGTK/NVIDIA driver bug: a live WebGL2 context in the webview at app teardown
+     segfaults the web process. Symbolized with debuginfod and reproduced standalone
+     with `scripts/webgl-teardown-repro.py` — stack `WebKit::AuxiliaryProcess::terminate`
+     → `WebProcess::stopRunLoop` → `PlatformDisplay::clearGLContexts` →
+     `GLContext::~GLContext` (GLContext.cpp:335) → SIGSEGV in `libnvidia-eglcore`, under
+     `WEBKIT_DISABLE_DMABUF_RENDERER=1` (what `lib.rs` sets on Linux) whenever a visible
+     canvas holds a live context at teardown. That is exactly the kind of risk that
+     comes from routing native work through browser rendering machinery instead of the
+     engine process — evidence for (1), not just a bug to work around.
+
+  `GlSpike.tsx` (the probe) and `scripts/webgl-teardown-repro.py` stay in the tree as
+  the record of both findings; the probe is dead code behind a setting nothing turns on.
+  Not deleted since nothing depends on it and it documents the decision better in place.
+- [ ] Phase 2 gate — `wgpu` backend (native, Rust-side; the only GPU path this app's own
+  architecture supports): build only on the exit criteria in the plan. Not currently
+  met — after the rayon look loop and the framed-base cache the release-profile look is
+  ~3 ms, far under the 25 ms bar, so the CPU path already clears what was being asked of
+  a GPU. A stray, unmerged `wgpu` feasibility probe exists on `feature/darkroom-develop`
+  (commit 65c7fe9, `src-tauri/src/bin/gpu_probe.rs`) from a parallel exploration; it was
+  never integrated and this decision does not depend on it.
 
 Follow-ups recorded here, not done: `LoupeWindow` / `basicEditor` and the
 `render_edit_batch` consumers (`ProofSheet`, `DuelView`, `PresetBrowser`) still receive

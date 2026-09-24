@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { asLinearRecord, ENGINE_LINEAR, forLinearEngine, isLinear, parseEdit } from "../editing";
+import { asLinearRecord, ENGINE_LINEAR, forLinearEngine, isEngine1Version, isLinear, parseEdit } from "../editing";
 
 describe("engine id on the record", () => {
   it("is absent (engine 1) on every existing record, and survives a round trip", () => {
@@ -36,5 +36,30 @@ describe("engine id on the record", () => {
     expect(asLinearRecord(saved, -1.6)).toBe(saved);
     // The match belongs to the camera transform; a record asking for another gets none.
     expect(asLinearRecord({ display: "srgb" }, -1.6)).not.toHaveProperty("cameraEv");
+  });
+});
+
+describe("old versions, honestly (slice 7)", () => {
+  it("a saved record without the engine-2 stamp that holds anything is engine 1", () => {
+    expect(isEngine1Version(parseEdit('{"tone":{"ev":0.5}}'))).toBe(true);
+    expect(isEngine1Version(parseEdit('{"engine":1,"fade":0.2}'))).toBe(true);
+    expect(isEngine1Version(parseEdit('{"engine":2,"display":"camera.2"}'))).toBe(false);
+    // A blank version holds nothing whose meaning could change.
+    expect(isEngine1Version(parseEdit("{}"))).toBe(false);
+  });
+
+  it("the fork keeps the framing, resets tone and look, and takes this frame's match", () => {
+    const old = parseEdit(
+      '{"crop":{"x":0.1,"y":0,"w":0.8,"h":1,"aspect":"4:5"},"straighten":1.2,"tone":{"ev":0.8},"fade":0.3,"lut":{"file":"a.cube","amount":1}}',
+    );
+    expect(forLinearEngine(old, -1.6)).toEqual({
+      crop: { x: 0.1, y: 0, w: 0.8, h: 1, aspect: "4:5" },
+      perspective: undefined,
+      straighten: 1.2,
+      engine: 2,
+      display: "camera.2",
+      cameraEv: -1.6,
+    });
+    expect(forLinearEngine(old)).not.toHaveProperty("cameraEv");
   });
 });

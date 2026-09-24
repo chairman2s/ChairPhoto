@@ -154,7 +154,19 @@
   100 % test's job. On a real A7R VI frame the export came out 6656×9984 and the tally
   read 1 checked, 0 differing. Not seen on screen: the Export dialog run (monitor
   unavailable).
-- [ ] Slice 7 — engine-1 versions kept honest; fork into the new engine
+- [x] Slice 7 — engine-1 versions kept honest (2026-09-24). A saved version without the
+  engine-2 stamp that holds anything (`isEngine1Version`) now stays on engine 1 in the
+  Darkroom even with the RAW resident: no token in its URLs, no engine-2 stamp on its saves
+  (before this, the stamp rewrote it as engine 2 on the next autosave). The bar says
+  *camera preview · this version's engine* and offers **Develop with the new engine**,
+  which forks "<name> (RAW)" with the framing copied, tone and look reset, `camera.2` and
+  this frame's camera match (`forLinearEngine`), and switches to it; the engine-1 version
+  is untouched. A blank `{}` version may start on either engine. Presets are look-only and
+  render on engine 2 through the shared finish (fade, vignette, grain, B&W, zones are in
+  the full-size parity test). Known gap: a change made while the RAW is still preparing
+  saves an engine-1 record, and once the RAW is resident the next save stamps it engine 2
+  — the lock is taken when a version is loaded, not mid-session. Not seen on screen
+  (monitor unavailable); covered by tests.
 - [ ] Slice 8 — the swap: `develop.rawEngine` default on, docs, licensing
 - [ ] Slice 9 — Kelvin white balance (first follow-on)
 

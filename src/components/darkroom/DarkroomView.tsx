@@ -32,6 +32,8 @@ import {
 import {
   asLinearRecord,
   ASPECTS,
+  forLinearEngine,
+  isEngine1Version,
   clampStraighten,
   Crop,
   CropOverlay,
@@ -137,6 +139,11 @@ export function DarkroomView({
   // no version gets one on its first change. `committed*` is what the version holds (last
   // saved or loaded); the view is keyed per photo, so none of this crosses photos.
   const [versions, setVersions] = useState<PhotoVersion[]>([]);
+  // The version on the stage was made on engine 1 (the camera preview): it keeps rendering
+  // there, whatever the source, until "Develop with the new engine" forks it (slice 7).
+  const [engine1Version, setEngine1Version] = useState<boolean>(
+    () => activeVersionId != null && isEngine1Version(parseEdit(initialEditJson ?? undefined)),
+  );
   const versionsRef = useRef(versions);
   versionsRef.current = versions;
   const [versionId, setVersionId] = useState<number | null>(activeVersionId);
@@ -186,6 +193,7 @@ export function DarkroomView({
           setWorking(record);
           onPickVersionRef.current(v);
         }
+        setEngine1Version(v != null && isEngine1Version(parseEdit(v.editJson)));
         setVersionId(v?.id ?? null);
         if (v) {
           versionHistory(v.id)
@@ -239,11 +247,13 @@ export function DarkroomView({
   );
   // Leaving Develop releases the working images — DevelopSurface owns that, so stepping
   // to the next photo (a remount of this view) keeps the preloaded neighbours.
-  const sourceToken = sourceState.token;
+  // An engine-1 version renders from the preview even with the RAW resident: no token in
+  // its URLs, no engine-2 stamp on its saves.
+  const sourceToken = engine1Version ? undefined : sourceState.token;
   const sourceTokenRef = useRef(sourceToken);
   sourceTokenRef.current = sourceToken;
-  const engineRef = useRef(sourceState.engine);
-  engineRef.current = sourceState.engine;
+  const engineRef = useRef<1 | 2>(engine1Version ? 1 : sourceState.engine);
+  engineRef.current = engine1Version ? 1 : sourceState.engine;
   const cameraEvRef = useRef(sourceState.cameraEv);
   cameraEvRef.current = sourceState.cameraEv;
   /** The record as saved: stamped with the engine that rendered it (engine 1 = absent).
@@ -691,6 +701,35 @@ export function DarkroomView({
     }
   };
 
+  /** "Develop with the new engine": an engine-1 version's framing as a fresh engine-2
+   *  version (tone and look reset — an old EV is not a new EV), which the stage switches
+   *  to. The engine-1 version stays as it was. */
+  const developOnNewEngine = async () => {
+    await flush();
+    try {
+      const from = versionsRef.current.find((v) => v.id === versionIdRef.current);
+      const record = forLinearEngine(workingRef.current, cameraEvRef.current);
+      const json = JSON.stringify(record);
+      const id = await createVersion(photoId, `${from?.name ?? "Version"} (RAW)`);
+      await setVersionEdit(id, json);
+      const vs = await listVersions(photoId);
+      setVersions(vs);
+      setEngine1Version(false);
+      setVersionId(id);
+      versionIdRef.current = id;
+      historyRef.current = null;
+      setHistory(null);
+      adoptCommitted(record);
+      setWorking(record);
+      adoptedLabelRef.current = null;
+      onChanged();
+      const created = vs.find((v) => v.id === id);
+      if (created) onPickVersion({ ...created, editJson: json });
+    } catch (e) {
+      setError(String(e));
+    }
+  };
+
   /** Shelf: switch to a version (or the original, `null`) — pending changes saved first. */
   const switchVersion = async (target: PhotoVersion | null) => {
     await flush();
@@ -700,6 +739,7 @@ export function DarkroomView({
     const record = parseEdit(v?.editJson ?? undefined);
     adoptCommitted(record);
     setWorking(record);
+    setEngine1Version(v != null && isEngine1Version(record));
     setVersionId(v?.id ?? null);
     versionIdRef.current = v?.id ?? null;
     historyRef.current = null;
@@ -856,10 +896,28 @@ export function DarkroomView({
           ))}
         </span>
         <span className="dk-hint">{saving ? "saving…" : rendering ? "rendering…" : ""}</span>
-        {source && (
-          <span className={`dk-source dk-source-${badgeFor(source).tone}`} title={badgeFor(source).title}>
-            {badgeFor(source).label}
-          </span>
+        {source && engine1Version && sourceState.token ? (
+          <>
+            <span
+              className="dk-source dk-source-warn"
+              title="This version was developed on the camera preview. It keeps rendering exactly as it was saved; the RAW is ready for a new version."
+            >
+              camera preview · this version's engine
+            </span>
+            <button
+              className="dk-loupe-toggle"
+              onClick={() => void developOnNewEngine()}
+              title="Start a new version on the RAW with this version's framing (tone and look start fresh — the engines read sliders differently)"
+            >
+              Develop with the new engine
+            </button>
+          </>
+        ) : (
+          source && (
+            <span className={`dk-source dk-source-${badgeFor(source).tone}`} title={badgeFor(source).title}>
+              {badgeFor(source).label}
+            </span>
+          )
         )}
         {sourceToken && (
           <button

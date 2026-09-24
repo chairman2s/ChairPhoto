@@ -153,15 +153,27 @@ export function asLinearRecord(record: VersionEdit, cameraEv = 0): VersionEdit {
 export const isLinear = (e: VersionEdit): boolean => e.engine === ENGINE_LINEAR;
 
 /** A fresh engine-2 record from an engine-1 one: geometry copied, look and tone reset
- *  (an old EV is not a new EV — the pipelines mean different things by it). */
-export function forLinearEngine(e: VersionEdit): VersionEdit {
-  return {
+ *  (an old EV is not a new EV — the pipelines mean different things by it), the default
+ *  display transform and this frame's camera match (`cameraEv`, 0 left off). */
+export function forLinearEngine(e: VersionEdit, cameraEv = 0): VersionEdit {
+  const out: VersionEdit = {
     crop: e.crop,
     perspective: e.perspective,
     straighten: e.straighten,
     engine: ENGINE_LINEAR,
     display: DEFAULT_LINEAR_DISPLAY,
   };
+  if (cameraEv !== 0) out.cameraEv = cameraEv;
+  return out;
+}
+
+/** Whether a saved version belongs to engine 1 (docs/plans/raw-foundation, slice 7): it
+ *  was saved without the engine-2 stamp and holds something. Such a version keeps
+ *  rendering from the camera preview — it is never reinterpreted on the RAW — until the
+ *  user forks it with {@link forLinearEngine}. An empty record (`{}`) holds no edit that
+ *  could change meaning, so it may start on either engine. */
+export function isEngine1Version(record: VersionEdit): boolean {
+  return record.engine !== ENGINE_LINEAR && JSON.stringify(record) !== "{}";
 }
 
 /** The look-only slice of an edit — everything except framing (crop/straighten). */

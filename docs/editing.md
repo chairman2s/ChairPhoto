@@ -27,8 +27,9 @@ exposures — each independently editable and exportable.
 
 **Packaging.** The render engine is gated behind the `edit` Cargo feature, while the loupe's
 render hook belongs to the bundled Basic Editor module. Disable the module and the loupe falls
-back to the original image with the Develop and Edit entry points hidden. Full-resolution RAW
-decode for export sits behind the `raw` feature via LibRaw.
+back to the original image with the Develop and Edit entry points hidden. The RAW decode —
+Develop's working image and every engine-2 render and export — sits behind the `raw`
+feature via the vendored LibRaw; without it Develop works on the camera preview.
 
 ## Goal & requirements
 
@@ -251,8 +252,12 @@ implemented — the crop fixes shape, resize would fix pixels.
 
 ## Rendering & export
 
-- **Live preview:** render the cached **preview proxy** (embedded JPEG, ~fast) as sliders/crop
-  change (debounced). Proxy quality is fine for judging an edit.
+- **What Develop renders from.** A RAW the bundled decoder supports is developed from the
+  RAW itself (engine 2, below) — the default since the swap (docs/plans/raw-foundation,
+  slice 8; the `develop.rawEngine` setting is gone). The camera's embedded **preview proxy**
+  is what the stage shows for the moment the RAW is being prepared, and what engine 1
+  renders from: JPEG-only photos, RAWs the decoder does not support yet (the bar says so and
+  names the camera), and versions saved on engine 1.
 - **Two caches make the drag cheap.** The proxy JPEG is decoded once (a one-slot cache
   keyed by the bytes' fingerprint), and `render_proxy` keeps the **framed base** — the
   proxy after perspective → straighten → crop → downscale, before the look — keyed by
@@ -267,19 +272,22 @@ implemented — the crop fixes shape, resize would fix pixels.
   image pool as `thumb://`/`preview://`/`zoom://`: the newest URL renders first and
   identical URLs coalesce into one render, which is what makes slider spam safe. Responses
   are `Cache-Control: no-store` — rendering, not fetching, is the cost, and a regenerated
-  proxy or re-imported LUT must never show stale pixels. `b=1` renders the geometry only
-  (perspective → straighten, no crop, no look) as lossless PNG: the base the GL drag tier
-  will shade. The `render_edit` / `render_edit_batch` commands still return base64 data
-  URLs for their remaining callers (the loupe window's renderer, the proof sheet, duels,
-  the preset browser, the legacy Develop view) — listed as follow-ups in
-  `docs/plans/darkroom/00-status.md`, not a transport the Darkroom stage uses.
-- **Loupe:** shows the active version's render when the module is enabled; otherwise the
-  unedited preview (the core edit contract already falls back).
-- **Edited export — decided: render from a full RAW decode.** "Show off" (JPEG) renders each
-  chosen version from the **full-resolution source**: a decoded RAW for RAW originals, or the
-  original JPEG for JPEG-only photos. This gates *edited RAW export* on a RAW decoder that
-  doesn't exist yet (see Phase 3) — JPEG-only originals can export edited immediately.
-  Per-version filenames (`<stem> - <version>.jpg`), collision-safe.
+  proxy or re-imported LUT must never show stale pixels. `s=<token>` names the working
+  image, `k=1` asks for the sensor-clipping overlay instead of the render, and `b=1`
+  renders the geometry only (perspective → straighten, no crop, no look) as lossless PNG.
+  The proof sheet, the duels and every engine-2 loupe render use these URLs too. The
+  `render_edit` / `render_edit_batch` commands still return base64 data URLs for their
+  remaining callers — an engine-1 version on the loupe, the preset browser and the legacy
+  Develop view — never for an engine-2 render.
+- **Loupe:** shows the active version's render when the module is enabled (`renderForLoupe`):
+  an engine-2 version is the RAW through its pipeline at 2560 px, full size to zoom — from
+  the Darkroom's own working image while it prints there, else from an offline load — and
+  an engine-1 version renders as it always has; otherwise the unedited preview.
+- **Edited export.** "Show off" (JPEG) renders each chosen version at full resolution: an
+  engine-2 version from its working image (below — it *is* the view); an engine-1 version
+  from a LibRaw decode tone-matched to the camera preview it was judged on, or from the
+  original for JPEG-only photos. Per-version filenames (`<stem> - <version>.jpg`),
+  collision-safe.
 - **Hand-off export (RAW + XMP) stays unedited** — you're giving the RAW to another editor;
   crop/exposure are not written into the sidecar (merge-safe invariant).
 
@@ -289,20 +297,38 @@ Every record carries an **engine id** — absent or `1`: the pipeline above, on 
 embedded preview, rendered exactly as it always was; `2`: the scene-linear pipeline on the
 RAW **working image**. A version means one thing forever: the Darkroom never reinterprets
 an engine-1 record as engine 2 (an EV of +1 on gamma pixels is not the same picture as +1
-in linear light). Engine 2 is behind the `develop.rawEngine` setting (Preferences →
-Darkroom) until the swap slice makes it the default.
+in linear light). New edits of a supported RAW are engine 2. A saved engine-1 version keeps
+rendering on engine 1 even with the RAW open, and the bar offers **Develop with the new
+engine**, which forks "<name> (RAW)" with the framing copied and tone and look reset.
 
 - **Working image.** Opening a photo in the Darkroom claims the `develop` job family and
   decodes the RAW on its own thread (`raw::decode_linear`: 16-bit, gamma 1.0, sRGB/Rec.709
   primaries, as-shot white balance, no auto-brightening, highlights clipped at sensor white,
   the camera's visible rectangle) into an f32 image held by `develop::ResidentSet`. A photo
-  switch, leaving Develop, a catalog switch, or an open with the engine switched off trips
-  the claim and releases it (the switch releases in its detach phase, with the slot); a
+  switch, leaving Develop, or a catalog switch trips the claim and releases it (the switch releases in its detach phase, with the slot); a
   decode that finishes after a newer claim removes only its own image. The resident set's
   lock is a leaf in the `commands::jobs` lock order. Each of those transitions is forced in
   `develop::session::tests` and `commands::jobs::tests`. The event
   `develop:source` carries the state — `preview` (preparing), `raw` with the **token**
   `w:<photo>:<generation>`, `unsupported` with the camera, `jpeg`, `nodecoder`.
+- **Decoder.** LibRaw, vendored as a pinned submodule and compiled in (`raw` feature; LGPL-2.1,
+  see `MODULE_LICENSING.md`). Every call runs under the crash marker: a file that took the
+  process down twice is skipped and Develop stays on its preview, saying so. A camera
+  newer than the decoder is *RAW not supported yet* on the bar, never a silent fallback.
+- **Caches, each bounded.** The `.rawf` **decode cache** keeps each decoded RAW on disk
+  (uncompressed, keyed by file size, mtime and decoder version; Preferences › Darkroom sets
+  its size, default 20 GB, oldest first out), so a second open is a read. The **resident
+  set** holds the open photo and its preloaded neighbours in memory (4 GB budget; the open
+  photo is never evicted for a neighbour). One **offline** image (`develop::offline`) serves
+  engine-2 renders outside Develop — the Library loupe, cover thumbnails, exports — loaded
+  one at a time and kept 60 s. The **framed-base cache** keeps four geometry-applied bases,
+  linear ones only up to 2560 px. **Cover** thumbnails cache on disk per file and look.
+- **Camera match.** When a working image is prepared it is measured against its own camera
+  JPEG (`linear::camera_match_ev`), and a new engine-2 record stores that offset as
+  `cameraEv`: the extended-low-ISO pull, a body's metering bias, and a global share of DRO
+  that one fixed curve cannot carry.
+- **Sensor clipping.** *◩ Clipping* on the bar overlays, in magenta, where the RAW itself
+  is clipped (`edit://…&k=1`) — the only white no slider can bring back.
 - **Source on every render.** `edit://…&s=<token>`, `render_edit_batch` and
   `edit_zone_masses` name the pixels they render from. A token that is no longer resident is
   a 404, never a fallback to the preview; engine 2 refuses a preview source and engine 1

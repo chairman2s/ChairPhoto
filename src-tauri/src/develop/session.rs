@@ -20,10 +20,6 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter, Manager, Runtime};
 
-/// Settings key: `"1"` renders Develop from the RAW working image (engine 2). Off by
-/// default until slice 8 — until then the Darkroom behaves exactly as before.
-pub const RAW_ENGINE_KEY: &str = "develop.rawEngine";
-
 /// Settings key: `"0"` turns neighbour preload off. On by default.
 pub const PRELOAD_KEY: &str = "develop.preloadNeighbours";
 
@@ -82,15 +78,6 @@ pub struct DevelopSourceEvent {
     pub source: DevelopSource,
 }
 
-/// Whether the RAW engine is switched on in this catalog's settings.
-fn raw_engine_enabled(state: &AppState) -> bool {
-    let Ok(guard) = state.catalog.lock() else { return false };
-    guard
-        .as_ref()
-        .and_then(|c| c.get_setting(RAW_ENGINE_KEY).ok().flatten())
-        .is_some_and(|v| v == "1")
-}
-
 /// What claiming the family for a photo decided: the answer is already known; or the photo
 /// was already resident (a preloaded neighbour) and is adopted under the new claim, whose
 /// worker only prepares the neighbours; or a load must run under this claim.
@@ -111,13 +98,6 @@ pub(crate) fn claim(
     probe: DevelopSource,
     neighbours: &[i64],
 ) -> Result<Claimed, String> {
-    if !raw_engine_enabled(state) {
-        // Switched off: nothing to prepare, but a photo opened while it was on may still be
-        // resident, and this open is the ownership change that releases it.
-        let _ = state.jobs.develop.cancel();
-        release_all();
-        return Ok(Claimed::Ready(DevelopSource::Preview { preparing: false }));
-    }
     let DevelopSource::Raw { .. } = &probe else {
         // Not a supported RAW: nothing to prepare. The claim is not taken, so a previous
         // photo's image is released by the trip here all the same.
@@ -193,9 +173,6 @@ pub fn close(state: &AppState) -> Result<(), String> {
 
 /// The source state right now for `photo_id`, from the slot and the resident set.
 pub fn current(state: &AppState, photo_id: i64, probe: DevelopSource) -> DevelopSource {
-    if !raw_engine_enabled(state) {
-        return DevelopSource::Preview { preparing: false };
-    }
     match state.jobs.develop.status() {
         Ok(Some(s)) if s.photo_id == photo_id => {
             let token = SourceToken::Working { photo_id, generation: s.generation };
@@ -453,7 +430,7 @@ mod tests {
     use crate::catalog::Catalog;
     use crate::develop::{resident, resident_bytes, serial, test_image};
 
-    fn state(engine_on: bool) -> (AppState, crate::test_support::TestTmpDir) {
+    fn state() -> (AppState, crate::test_support::TestTmpDir) {
         // The resident set is process-global and now survives a claim for the photos it
         // keeps: every test starts from an empty one (callers hold `serial()`).
         release_all();
@@ -461,7 +438,6 @@ mod tests {
         let root = dir.join("photos");
         std::fs::create_dir_all(&root).unwrap();
         let catalog = Catalog::open(&dir.join("t.chairphoto"), &root).unwrap();
-        catalog.set_setting(RAW_ENGINE_KEY, if engine_on { "1" } else { "0" }).unwrap();
         let state = AppState::default();
         *state.catalog.lock().unwrap() = Some(catalog);
         (state, dir)
@@ -492,7 +468,7 @@ mod tests {
     #[test]
     fn open_for_another_photo_trips_the_previous_claim() {
         let _serial = serial();
-        let (state, _dir) = state(true);
+        let (state, _dir) = state();
         let a = decode_claim(&state, 1);
         let ta = token_of(&a, 1);
         assert_eq!(publish(&a, 1, &ta, test_image(8, 8)), Published::Resident);
@@ -518,7 +494,7 @@ mod tests {
     #[test]
     fn a_superseded_decode_releases_only_its_own_image() {
         let _serial = serial();
-        let (state, _dir) = state(true);
+        let (state, _dir) = state();
         let a = decode_claim(&state, 1);
         let b = decode_claim(&state, 2);
         let (ta, tb) = (token_of(&a, 1), token_of(&b, 2));
@@ -541,7 +517,7 @@ mod tests {
     #[test]
     fn the_raw_answer_carries_the_images_camera_match() {
         let _serial = serial();
-        let (state, _dir) = state(true);
+        let (state, _dir) = state();
         let a = decode_claim(&state, 1);
         let ta = token_of(&a, 1);
         let mut img = WorkingImage::clone_for_test(&test_image(8, 8));
@@ -562,7 +538,7 @@ mod tests {
     #[test]
     fn close_releases_the_image_and_the_stale_token_names_nothing() {
         let _serial = serial();
-        let (state, _dir) = state(true);
+        let (state, _dir) = state();
         let a = decode_claim(&state, 1);
         let ta = token_of(&a, 1);
         assert_eq!(publish(&a, 1, &ta, test_image(8, 8)), Published::Resident);
@@ -584,7 +560,7 @@ mod tests {
     #[test]
     fn reopening_the_resident_photo_answers_without_a_new_claim() {
         let _serial = serial();
-        let (state, _dir) = state(true);
+        let (state, _dir) = state();
         let a = decode_claim(&state, 1);
         let ta = token_of(&a, 1);
         assert_eq!(publish(&a, 1, &ta, test_image(8, 8)), Published::Resident);
@@ -597,12 +573,12 @@ mod tests {
         assert!(resident(&ta).is_some());
     }
 
-    /// Opening a non-RAW, or opening with the engine switched off, takes no claim but still
-    /// releases whatever the previous open left resident.
+    /// Opening a non-RAW takes no claim but still releases whatever the previous open left
+    /// resident. (Slice 8 removed the engine switch; a RAW always prepares.)
     #[test]
     fn an_open_that_prepares_nothing_still_releases_the_previous_image() {
         let _serial = serial();
-        let (state, _dir) = state(true);
+        let (state, _dir) = state();
         let a = decode_claim(&state, 1);
         let ta = token_of(&a, 1);
         assert_eq!(publish(&a, 1, &ta, test_image(8, 8)), Published::Resident);
@@ -610,18 +586,6 @@ mod tests {
         assert!(matches!(claim(&state, 2, DevelopSource::Jpeg, &[]).unwrap(), Claimed::Ready(DevelopSource::Jpeg)));
         assert!(a.abort.load(Ordering::Relaxed));
         assert!(resident(&ta).is_none());
-
-        let b = decode_claim(&state, 3);
-        let tb = token_of(&b, 3);
-        assert_eq!(publish(&b, 3, &tb, test_image(8, 8)), Published::Resident);
-        state.catalog.lock().unwrap().as_ref().unwrap().set_setting(RAW_ENGINE_KEY, "0").unwrap();
-        assert!(matches!(
-            claim(&state, 3, raw_probe(), &[]).unwrap(),
-            Claimed::Ready(DevelopSource::Preview { preparing: false })
-        ));
-        assert!(b.abort.load(Ordering::Relaxed), "switching the engine off stands the decode down");
-        assert!(resident(&tb).is_none());
-        assert!(matches!(current(&state, 3, raw_probe()), DevelopSource::Preview { preparing: false }));
     }
 
     /// **Forced.** Stepping to a photo the previous claim preloaded as a neighbour adopts
@@ -631,7 +595,7 @@ mod tests {
     #[test]
     fn stepping_to_a_preloaded_neighbour_adopts_it_and_keeps_only_the_new_neighbours() {
         let _serial = serial();
-        let (state, _dir) = state(true);
+        let (state, _dir) = state();
         let a = decode_claim_with(&state, 1, &[2, 3]);
         let (t1, t2, t3) = (token_of(&a, 1), token_of(&a, 2), token_of(&a, 3));
         assert_eq!(publish(&a, 1, &t1, test_image(8, 8)), Published::Resident);
@@ -661,7 +625,7 @@ mod tests {
     #[test]
     fn a_superseded_preload_takes_itself_back_out() {
         let _serial = serial();
-        let (state, _dir) = state(true);
+        let (state, _dir) = state();
         let a = decode_claim_with(&state, 1, &[2]);
         let _b = decode_claim(&state, 5);
         let late = token_of(&a, 2);
@@ -676,7 +640,7 @@ mod tests {
     #[test]
     fn the_session_outlives_its_worker_but_not_its_image() {
         let _serial = serial();
-        let (state, _dir) = state(true);
+        let (state, _dir) = state();
         let a = decode_claim(&state, 1);
         let t = token_of(&a, 1);
         assert_eq!(publish(&a, 1, &t, test_image(8, 8)), Published::Resident);

@@ -167,7 +167,18 @@
   saves an engine-1 record, and once the RAW is resident the next save stamps it engine 2
   — the lock is taken when a version is loaded, not mid-session. Not seen on screen
   (monitor unavailable); covered by tests.
-- [ ] Slice 8 — the swap: `develop.rawEngine` default on, docs, licensing
+- [x] Slice 8 — the swap (2026-09-24). The RAW engine is no longer a setting: every
+  supported RAW opened in the Darkroom prepares its working image (`raw_engine_enabled`
+  and the "switched off" branch are gone, with their test half), the Preferences checkbox
+  is replaced by a line saying what Develop renders from, and the decode-cache settings
+  and the export-parity count show unconditionally. `docs/editing.md` describes the
+  sources, both engines, the decoder and its crash marker, every cache and its bound, the
+  camera match and the clipping overlay as they are. **Licensing corrected:**
+  `MODULE_LICENSING.md` had ChairPhoto taking LibRaw under CDDL-1.0, which the FSF lists
+  as GPL-incompatible; it now names LibRaw's LGPL-2.1 option (section 3 permits GPL v2 or
+  later, so GPL-3.0-only fits), and the package installs LibRaw's `COPYRIGHT` and
+  `LICENSE.LGPL` (commit 7012115). The Darkroom itself is still behind its own
+  early-preview switch (`editor.darkroom`, docs/plans/darkroom — that plan's slice 8).
 - [ ] Slice 9 — Kelvin white balance (first follow-on)
 
 ## Notes for a fresh session

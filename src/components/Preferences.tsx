@@ -552,9 +552,6 @@ function TieringSection({ onChanged }: { onChanged: () => void }) {
 // the auto-detected command on PATH. Availability (GUI/CLI found) is shown per editor.
 /** The probe's last report, persisted so it can be read without the inspector. */
 const GL_SPIKE_REPORT_KEY = "editor.glSpike.lastReport";
-/** `"1"` renders Develop from the RAW working image (docs/plans/raw-foundation); read by the
- *  backend's `develop_open`. Off by default until slice 8. */
-const RAW_ENGINE_KEY = "develop.rawEngine";
 /** The `.rawf` decode cache's size limit in GB (backend default 20) and neighbour preload
  *  (default on) — docs/plans/raw-foundation, slice 4. Read by `develop_open`. */
 const DECODE_CACHE_GB_KEY = "develop.decodeCacheGb";
@@ -698,7 +695,6 @@ function DarkroomSection() {
   // Render-timing log (GPU-smoothness work, docs/plans/darkroom/00-status.md): stamps
   // every stage render in the console and unlocks the WebGL probe below. Dev-only.
   const [timing, setTiming] = useState<boolean | null>(null);
-  const [rawEngine, setRawEngine] = useState<boolean | null>(null);
   const [spike, setSpike] = useState(false);
   const [lastSpike, setLastSpike] = useState("");
   const [lastSummary, setLastSummary] = useState("");
@@ -706,9 +702,6 @@ function DarkroomSection() {
     getSetting("editor.darkroom")
       .then((v) => setOn(v === "1"))
       .catch(() => setOn(false));
-    getSetting(RAW_ENGINE_KEY)
-      .then((v) => setRawEngine(v === "1"))
-      .catch(() => setRawEngine(false));
     getSetting(RENDER_TIMING_KEY)
       .then((v) => setTiming(v === "1"))
       .catch(() => setTiming(false));
@@ -754,27 +747,11 @@ function DarkroomSection() {
         />
         Use the Darkroom as the Develop surface
       </label>
-      <label
-        style={{ display: "flex", gap: 8, alignItems: "center", cursor: "pointer", marginTop: 6 }}
-        title="Develop decodes the RAW itself — all 14 bits, in linear light — and every slider renders from that instead of the camera's preview JPEG. Takes effect the next time a photo is opened in the Darkroom."
-      >
-        <input
-          type="checkbox"
-          checked={rawEngine ?? false}
-          disabled={rawEngine === null}
-          onChange={async () => {
-            const next = !(rawEngine ?? false);
-            setRawEngine(next);
-            try {
-              await setSetting(RAW_ENGINE_KEY, next ? "1" : "0");
-            } catch {
-              setRawEngine(!next);
-            }
-          }}
-        />
-        Render from the RAW (engine 2, in progress)
-      </label>
-      {rawEngine && <RawCacheSettings />}
+      <div className="modal-sub" style={{ marginTop: 6 }}>
+        The Darkroom develops the RAW itself — all the bits the sensor recorded, in linear
+        light — and every slider, proof and print renders from that.
+      </div>
+      <RawCacheSettings />
       <label
         style={{ display: "flex", gap: 8, alignItems: "center", cursor: "pointer", marginTop: 6 }}
       >

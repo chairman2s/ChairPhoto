@@ -16,7 +16,7 @@ export function badgeFor(s: DevelopSource): SourceBadge {
     case "preview":
       return s.preparing
         ? { label: "camera preview · preparing full quality", title: "The RAW is being decoded; the stage swaps to it when ready.", tone: "warn" }
-        : { label: "camera preview", title: "The RAW engine is off (Preferences → Darkroom).", tone: "plain" };
+        : { label: "camera preview", title: "The camera's embedded preview: the RAW is not prepared for this photo.", tone: "plain" };
     case "raw":
       return {
         label: `RAW · ${s.bits}-bit · ${formatMegapixels(s.megapixels)} MP`,

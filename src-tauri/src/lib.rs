@@ -434,6 +434,8 @@ pub fn run() {
             commands::raw_probe,
             commands::develop_open,
             commands::develop_close,
+            commands::develop_cache_usage,
+            commands::develop_cache_clear,
             commands::develop_source,
             commands::render_edit,
             commands::render_edit_batch,

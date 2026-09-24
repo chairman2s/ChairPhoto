@@ -14,6 +14,7 @@
 //! its own token. A stale token — one whose claim was tripped — therefore names nothing,
 //! and `edit://` answers it with a 404 rather than other pixels.
 
+pub mod cache;
 pub mod session;
 
 pub use session::working_image_from;
@@ -21,8 +22,8 @@ pub use session::working_image_from;
 use crate::plugins::edit::{SourceToken, WorkingImage};
 use std::sync::{Arc, Mutex};
 
-/// Resident working images: the current photo (and, in a later slice, its neighbours),
-/// bounded by bytes. Inserting beyond the budget is refused rather than evicting the
+/// Resident working images: the current photo and its preloaded neighbours, bounded by
+/// bytes. Inserting beyond the budget is refused rather than evicting the
 /// current photo; a `clear` on every ownership change is the cleanup the product demands.
 pub struct ResidentSet {
     budget_bytes: usize,
@@ -64,6 +65,23 @@ impl ResidentSet {
         let before = self.images.len();
         self.images.retain(|(t, _)| t != token);
         self.images.len() != before
+    }
+
+    /// The ownership change of a new claim: keep the images of `keep` (the newly opened
+    /// photo and its neighbours) under the new `generation`, and drop everything else. The
+    /// old tokens name nothing afterwards — a URL minted under the previous claim 404s,
+    /// exactly as if the image had been released — while the pixels survive the step, which
+    /// is what makes stepping to a preloaded neighbour instant. Returns the photo ids kept.
+    pub fn retain_rekey(&mut self, keep: &[i64], generation: u64) -> Vec<i64> {
+        self.images.retain(|(t, _)| matches!(t, SourceToken::Working { photo_id, .. } if keep.contains(photo_id)));
+        let mut kept = Vec::new();
+        for (t, _) in self.images.iter_mut() {
+            if let SourceToken::Working { photo_id, .. } = *t {
+                *t = SourceToken::Working { photo_id, generation };
+                kept.push(photo_id);
+            }
+        }
+        kept
     }
 
     pub fn len(&self) -> usize {
@@ -183,6 +201,25 @@ mod tests {
         assert!(!set.remove(&a), "already gone");
         assert!(set.get(&a).is_none());
         assert!(set.get(&b).is_some(), "the other image is untouched");
+    }
+
+    #[test]
+    fn retain_rekey_keeps_only_the_named_photos_under_the_new_generation() {
+        let mut set = ResidentSet::new(usize::MAX);
+        for id in [1, 2, 3] {
+            assert!(set.insert(SourceToken::Working { photo_id: id, generation: 7 }, img(4, 4)));
+        }
+        let mut kept = set.retain_rekey(&[2, 3, 9], 8);
+        kept.sort();
+        assert_eq!(kept, vec![2, 3]);
+        assert_eq!(set.len(), 2);
+        for id in [2, 3] {
+            assert!(set.get(&SourceToken::Working { photo_id: id, generation: 8 }).is_some());
+            assert!(set.get(&SourceToken::Working { photo_id: id, generation: 7 }).is_none(), "old tokens name nothing");
+        }
+        assert!(set.get(&SourceToken::Working { photo_id: 1, generation: 7 }).is_none());
+        assert!(set.retain_rekey(&[], 9).is_empty());
+        assert!(set.is_empty());
     }
 
     #[test]

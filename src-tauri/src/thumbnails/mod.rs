@@ -688,7 +688,7 @@ fn unique_tmp_dir(path: &Path) -> PathBuf {
 }
 
 /// Resolve the user cache dir (XDG_CACHE_HOME or ~/.cache), with a temp fallback.
-fn cache_dir() -> PathBuf {
+pub(crate) fn cache_dir() -> PathBuf {
     if let Some(xdg) = std::env::var_os("XDG_CACHE_HOME") {
         return PathBuf::from(xdg);
     }

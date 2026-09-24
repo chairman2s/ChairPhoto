@@ -64,7 +64,37 @@
   switch test were checked to fail against the mutated code. The resident set's lock is
   documented as a leaf of the `commands::jobs` lock order. RSS before/after a quit from the
   Darkroom: pending the measurement below.
-- [ ] Slice 4 — the `.rawf` decode cache + neighbour preload
+- [x] Slice 4 — the `.rawf` decode cache + neighbour preload (2026-09-24; seen on screen on
+  the isolated catalog's Sony files). Landed: `develop/cache.rs` (16-bit linear, fixed header
+  carrying the full key so a hash collision is a miss, temp-then-rename writes, a hit touches
+  mtime so trimming is LRU, directories keyed by decoder version with old ones deleted by the
+  trim); the worker loads cache → else LibRaw (under its crash marker) → writes and trims;
+  after publishing the current photo it preloads N+1 then N−1 into the same claim's memory
+  budget without announcing them; a new claim keeps only the new photo and its neighbours,
+  re-keyed to itself (old tokens 404), so a step to a preloaded neighbour is adopted at once;
+  Preferences → Darkroom gains the cache size (`develop.decodeCacheGb`, default 20), its
+  current use with a Clear button, and `develop.preloadNeighbours` (default on).
+  **Measured.** Bench `develop::cache::tests::bench_cache_hit` (6656×9984, the A7R VI
+  picture): write 0.19 s, read 0.09 s, to working image 0.39 s release / 0.59 s debug. On
+  screen (debug, 32.7 MP Sony): first open 12.2 s decode; the same photo from the cache
+  0.31 s; neighbours from the cache 0.46–0.67 s. The first cut read pixels with a per-value
+  loop — 11.6 s at opt-level 0, slower than the decode it replaced in every `tauri dev`
+  session — fixed by reading and writing the buffer's own bytes on little-endian hosts
+  (`pixels_are_stored_little_endian` pins the file format), and the u16→f32 conversion now
+  runs across cores.
+  **Fixed on the way (slice 3):** the worker cleared the session's status slot after a
+  *successful* publish, so reopening a still-resident photo found no record, released it and
+  decoded again. The slot now describes the open session and is cleared only on failure;
+  readers still check the resident set, so after a close it reads "not resident", never
+  "preparing" (`the_session_outlives_its_worker_but_not_its_image`). The old tests never ran
+  the worker's final step, which is why they passed.
+  **Open, for the user:** the Darkroom has no way to step to the next photo — the shell ignores
+  arrow keys in Develop on purpose and there is no filmstrip — and leaving Develop releases
+  memory. So today neighbour preload pays off through the disk cache (opening the next photo
+  from the Library is a cache hit), while the in-memory adoption waits for stepping. Stepping
+  needs a product decision first: what happens to unsaved sandbox changes when you move on.
+  Not measured: whether a background neighbour decode (OpenMP, all cores) makes slider drags
+  stutter; the plan's fallback is a lower thread priority or the setting.
 - [ ] Slice 5 — proof sheet, duels, masses, loupe, clipping overlay on the working image
 - [ ] Slice 6 — export is the view (tone match gone for engine 2; exact parity)
 - [ ] Slice 7 — engine-1 versions kept honest; fork into the new engine

@@ -1,10 +1,17 @@
 //! The `develop` job family: one claim per opened photo. `open` claims, probes, and starts
-//! the decode on its own thread (never the image pool — a two-second decode must not
-//! block tile serving); the worker publishes the working image and emits
-//! `develop:source`; `close` trips the claim. Every step after a `?` is preceded by an
-//! abort check, so a switch mid-decode stops at the next one and clears only its own slot.
+//! the worker on its own thread (never the image pool — a two-second decode must not
+//! block tile serving); the worker loads the working image — from the `.rawf` decode cache
+//! when it can, else LibRaw, writing the cache — publishes it, emits `develop:source`, and
+//! then prepares the neighbours (N+1, then N−1) into the same claim's memory budget without
+//! announcing them. `close` trips the claim. Every step is preceded by an abort check, so a
+//! switch mid-decode stops at the next one and clears only its own slot.
+//!
+//! The slot describes the open session, not the worker: it stays set (`resident: true`)
+//! after the worker ends, until the next claim or a failure clears it. Readers check the
+//! resident set too, so a slot that outlives its image (a `close` after the worker ended)
+//! reads as "not resident", never as other pixels.
 
-use super::{release_all, with_resident, DEFAULT_BUDGET_BYTES};
+use super::{release_all, with_resident};
 use crate::commands::jobs::{JobClaim, JobStatus};
 use crate::commands::{AppState, DevelopSource};
 use crate::plugins::edit::{SourceToken, WorkingImage};
@@ -16,6 +23,32 @@ use tauri::{AppHandle, Emitter, Manager, Runtime};
 /// Settings key: `"1"` renders Develop from the RAW working image (engine 2). Off by
 /// default until slice 8 — until then the Darkroom behaves exactly as before.
 pub const RAW_ENGINE_KEY: &str = "develop.rawEngine";
+
+/// Settings key: `"0"` turns neighbour preload off. On by default.
+pub const PRELOAD_KEY: &str = "develop.preloadNeighbours";
+
+/// What the worker reads from the catalog's settings, once, at the claim.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Prep {
+    /// The decode cache's size limit.
+    pub cache_budget_bytes: u64,
+    pub preload: bool,
+}
+
+fn prep_settings(state: &AppState) -> Prep {
+    let get = |k: &str| -> Option<String> {
+        let guard = state.catalog.lock().ok()?;
+        guard.as_ref()?.get_setting(k).ok().flatten()
+    };
+    let gb = get(super::cache::BUDGET_KEY)
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .filter(|g| g.is_finite() && *g >= 0.0)
+        .unwrap_or(super::cache::DEFAULT_BUDGET_GB as f64);
+    Prep {
+        cache_budget_bytes: (gb * 1024.0 * 1024.0 * 1024.0) as u64,
+        preload: get(PRELOAD_KEY).as_deref() != Some("0"),
+    }
+}
 
 /// The develop family's status slot: which photo the claim is for and whether its
 /// working image is resident. `generation` is the job id — the token's second half.
@@ -53,18 +86,26 @@ fn raw_engine_enabled(state: &AppState) -> bool {
         .is_some_and(|v| v == "1")
 }
 
-/// What claiming the family for a photo decided: the answer is already known, or a decode
-/// must run under this claim.
+/// What claiming the family for a photo decided: the answer is already known; or the photo
+/// was already resident (a preloaded neighbour) and is adopted under the new claim, whose
+/// worker only prepares the neighbours; or a load must run under this claim.
 pub(crate) enum Claimed {
     Ready(DevelopSource),
+    Adopted(JobClaim<DevelopStatus>, SourceToken),
     Decode(JobClaim<DevelopStatus>),
 }
 
 /// The ownership transition of an open, with no thread and no decode: trip whatever the
-/// family was doing, release its images, and claim it for `photo_id` — or answer from the
+/// family was doing and claim it for `photo_id`, keeping only the images of `photo_id` and
+/// its `neighbours` (re-keyed to the new claim) and releasing the rest — or answer from the
 /// current claim when it is already for this photo and resident. Every path that returns
 /// without a claim has still released the previous photo's image.
-pub(crate) fn claim(state: &AppState, photo_id: i64, probe: DevelopSource) -> Result<Claimed, String> {
+pub(crate) fn claim(
+    state: &AppState,
+    photo_id: i64,
+    probe: DevelopSource,
+    neighbours: &[i64],
+) -> Result<Claimed, String> {
     if !raw_engine_enabled(state) {
         // Switched off: nothing to prepare, but a photo opened while it was on may still be
         // resident, and this open is the ownership change that releases it.
@@ -94,33 +135,48 @@ pub(crate) fn claim(state: &AppState, photo_id: i64, probe: DevelopSource) -> Re
         generation: job,
         resident: false,
     })?;
-    // The previous photo's image is unreachable from now on: drop it before the decode
-    // starts, so two 67 MP images are never resident at once for one open. Its worker, if
-    // still running, was tripped by `begin` and removes only its own token on the way out.
-    release_all();
+    // Everything not about this photo or its neighbours is unreachable from now on: drop it
+    // before any load starts, so memory never holds a stale photo alongside a new decode.
+    // What stays is re-keyed to this claim — the previous claim's tokens name nothing. Its
+    // worker, if still running, was tripped by `begin`; a late insert it makes is removed by
+    // its own owner check.
+    let mut keep = vec![photo_id];
+    keep.extend(neighbours.iter().copied().filter(|&n| n != photo_id));
+    let kept = with_resident(|r| r.retain_rekey(&keep, claim.job));
+    if kept.contains(&photo_id) {
+        let token = SourceToken::Working { photo_id, generation: claim.job };
+        claim.slot.publish(|job| DevelopStatus { job, photo_id, generation: job, resident: true });
+        return Ok(Claimed::Adopted(claim, token));
+    }
     Ok(Claimed::Decode(claim))
 }
 
-/// Claim the family for `photo_id` and start preparing its working image. Returns the
-/// state right now: `Preview{preparing:true}` while the decode runs, `Raw{token}` when the
-/// image is already resident, or the honest exceptions.
+/// Claim the family for `photo_id` and start preparing its working image and then its
+/// `neighbours` (resolved paths, N+1 first). Returns the state right now:
+/// `Preview{preparing:true}` while the load runs, `Raw{token}` when the image is already
+/// resident (the same photo, or a preloaded neighbour), or the honest exceptions.
 pub fn open<R: Runtime>(
     app: &AppHandle<R>,
     photo_id: i64,
     path: PathBuf,
     probe: DevelopSource,
+    neighbours: Vec<(i64, PathBuf)>,
 ) -> Result<DevelopSource, String> {
     let state = app.state::<AppState>();
-    let claim = match claim(&state, photo_id, probe.clone())? {
+    let prep = prep_settings(&state);
+    let ids: Vec<i64> = if prep.preload { neighbours.iter().map(|(id, _)| *id).collect() } else { Vec::new() };
+    let (claim, answer, current_ready) = match claim(&state, photo_id, probe.clone(), &ids)? {
         Claimed::Ready(source) => return Ok(source),
-        Claimed::Decode(claim) => claim,
+        Claimed::Adopted(claim, token) => (claim, with_token(probe.clone(), &token), true),
+        Claimed::Decode(claim) => (claim, DevelopSource::Preview { preparing: true }, false),
     };
+    let neighbours = if prep.preload { neighbours } else { Vec::new() };
     let app2 = app.clone();
     std::thread::Builder::new()
         .name(format!("develop-decode-{photo_id}"))
-        .spawn(move || prepare(claim, app2, photo_id, path, probe))
+        .spawn(move || prepare(claim, app2, photo_id, path, probe, current_ready, neighbours, prep))
         .map_err(|e| format!("could not start the decode thread: {e}"))?;
-    Ok(DevelopSource::Preview { preparing: true })
+    Ok(answer)
 }
 
 /// Trip the claim and release every working image. Idempotent.
@@ -138,10 +194,14 @@ pub fn current(state: &AppState, photo_id: i64, probe: DevelopSource) -> Develop
     match state.jobs.develop.status() {
         Ok(Some(s)) if s.photo_id == photo_id => {
             let token = SourceToken::Working { photo_id, generation: s.generation };
-            if s.resident && super::resident(&token).is_some() {
+            if !s.resident {
+                DevelopSource::Preview { preparing: true }
+            } else if super::resident(&token).is_some() {
                 with_token(probe, &token)
             } else {
-                DevelopSource::Preview { preparing: true }
+                // The session outlived its image (Develop was closed after the worker
+                // ended): nothing is resident and nothing is being prepared.
+                probe
             }
         }
         _ => probe,
@@ -161,52 +221,146 @@ fn with_token(probe: DevelopSource, token: &SourceToken) -> DevelopSource {
     }
 }
 
-/// The worker: decode, publish, announce. Runs on its own thread with the claim.
+/// Load `path`'s linear decode: the `.rawf` cache when it holds this file for this decoder,
+/// else LibRaw (under its crash marker), writing the cache and trimming it to the budget.
+/// A cache that cannot be written costs the next open a decode, nothing more.
+pub(crate) fn load_linear(
+    path: &std::path::Path,
+    abort: &std::sync::atomic::AtomicBool,
+    cache_budget_bytes: u64,
+) -> Result<(crate::raw::LinearDecode, &'static str), String> {
+    load_linear_in(&super::cache::root(), path, abort, cache_budget_bytes)
+}
+
+fn load_linear_in(
+    root: &std::path::Path,
+    path: &std::path::Path,
+    abort: &std::sync::atomic::AtomicBool,
+    cache_budget_bytes: u64,
+) -> Result<(crate::raw::LinearDecode, &'static str), String> {
+    use super::cache;
+    let key = cache::CacheKey::for_file(path);
+    if let Some(d) = key.as_ref().and_then(|k| cache::read_in(root, k)) {
+        return Ok((d, "cache"));
+    }
+    let d = crate::raw::decode_linear(path, abort)?;
+    if let Some(key) = key {
+        if !abort.load(Ordering::Relaxed) && cache_budget_bytes > 0 {
+            if let Err(e) = cache::write_in(root, &key, &d) {
+                eprintln!("develop: {e}");
+            }
+            cache::trim_in(root, crate::raw::decoder_version(), cache_budget_bytes);
+        }
+    }
+    Ok((d, "decode"))
+}
+
+/// The worker: load, publish, announce; then preload the neighbours. Runs on its own thread
+/// with the claim.
+#[allow(clippy::too_many_arguments)]
 fn prepare<R: Runtime>(
     claim: JobClaim<DevelopStatus>,
     app: AppHandle<R>,
     photo_id: i64,
     path: PathBuf,
     probe: DevelopSource,
+    current_ready: bool,
+    neighbours: Vec<(i64, PathBuf)>,
+    prep: Prep,
 ) {
     let generation = claim.job;
     let abort = claim.abort.clone();
+    let aborted = || abort.load(Ordering::Relaxed);
     let emit = |source: DevelopSource| {
         let _ = app.emit("develop:source", DevelopSourceEvent { photo_id, job: generation, source });
     };
-    let done = || {
-        // Only this job may clear its slot (a newer claim already owns it otherwise).
-        claim.slot.clear();
-    };
-    if abort.load(Ordering::Relaxed) {
-        return done();
-    }
-    let decoded = match crate::raw::decode_linear(&path, &abort) {
-        Ok(d) => d,
-        Err(e) => {
-            if !abort.load(Ordering::Relaxed) {
-                eprintln!("develop: decode of photo {photo_id} failed: {e}");
-                emit(DevelopSource::Unsupported { camera: None, reason: e });
+    // Terminal for a failure: the slot goes (only if still ours), then the event.
+    let fail = || claim.slot.clear();
+    if !current_ready {
+        if aborted() {
+            return fail();
+        }
+        let t = std::time::Instant::now();
+        let (decoded, from) = match load_linear(&path, &abort, prep.cache_budget_bytes) {
+            Ok(d) => d,
+            Err(e) => {
+                if !aborted() {
+                    eprintln!("develop: decode of photo {photo_id} failed: {e}");
+                    fail();
+                    emit(DevelopSource::Unsupported { camera: None, reason: e });
+                }
+                return fail();
             }
-            return done();
+        };
+        if aborted() {
+            return fail();
         }
-    };
-    if abort.load(Ordering::Relaxed) {
-        return done();
-    }
-    let image = Arc::new(working_image_from(decoded));
-    if abort.load(Ordering::Relaxed) {
-        return done();
-    }
-    let token = SourceToken::Working { photo_id, generation };
-    match publish(&claim, photo_id, &token, image) {
-        Published::Resident => emit(with_token(probe, &token)),
-        Published::OverBudget => {
-            emit(DevelopSource::Unsupported { camera: None, reason: "working image exceeds the memory budget".into() });
+        let image = Arc::new(working_image_from(decoded));
+        if aborted() {
+            return fail();
         }
-        Published::Superseded => {}
+        eprintln!("develop: photo {photo_id} ready from {from} in {:.2?}", t.elapsed());
+        let token = SourceToken::Working { photo_id, generation };
+        match publish(&claim, photo_id, &token, image) {
+            Published::Resident => emit(with_token(probe, &token)),
+            Published::OverBudget => {
+                fail();
+                emit(DevelopSource::Unsupported { camera: None, reason: "working image exceeds the memory budget".into() });
+                return;
+            }
+            Published::Superseded => return,
+        }
     }
-    done()
+    preload_neighbours(&claim, &neighbours, prep.cache_budget_bytes);
+}
+
+/// Prepare each neighbour into the claim's budget, silently: nothing is emitted, the slot is
+/// not touched, and a neighbour that fails is simply not preloaded. Stops at the first
+/// neighbour the budget refuses — the current photo is never evicted for one — and at any
+/// trip. The same insert-then-check as [`publish`]: an insert that lands after a newer claim
+/// has released everything takes itself back out.
+pub(crate) fn preload_neighbours(
+    claim: &JobClaim<DevelopStatus>,
+    neighbours: &[(i64, PathBuf)],
+    cache_budget_bytes: u64,
+) {
+    let generation = claim.job;
+    let abort = claim.abort.clone();
+    for (nid, npath) in neighbours {
+        if abort.load(Ordering::Relaxed) {
+            return;
+        }
+        let token = SourceToken::Working { photo_id: *nid, generation };
+        if super::resident(&token).is_some() {
+            continue; // kept from the previous claim
+        }
+        if !matches!(crate::raw::probe(npath), crate::raw::RawSupport::Supported(_)) {
+            continue;
+        }
+        let t = std::time::Instant::now();
+        let Ok((decoded, from)) = load_linear(npath, &abort, cache_budget_bytes) else { continue };
+        if abort.load(Ordering::Relaxed) {
+            return;
+        }
+        let image = Arc::new(working_image_from(decoded));
+        if !preload_insert(claim, &token, image) {
+            return;
+        }
+        eprintln!("develop: neighbour {nid} preloaded from {from} in {:.2?}", t.elapsed());
+    }
+}
+
+/// Insert a neighbour's image under this claim; `false` when refused (budget) or taken back
+/// out because the claim was superseded meanwhile — either way, stop preloading.
+pub(crate) fn preload_insert(claim: &JobClaim<DevelopStatus>, token: &SourceToken, image: Arc<WorkingImage>) -> bool {
+    if !with_resident(|r| r.insert(token.clone(), image)) {
+        return false;
+    }
+    if claim.abort.load(Ordering::Relaxed) || !claim.slot.owns() {
+        with_resident(|r| r.remove(token));
+        return false;
+    }
+    true
 }
 
 /// The outcome of a worker's publish step.
@@ -233,11 +387,7 @@ pub(crate) fn publish(
     image: Arc<WorkingImage>,
 ) -> Published {
     let generation = claim.job;
-    let inserted = with_resident(|r| {
-        // A default budget; the setting arrives with the decode cache slice.
-        let _ = DEFAULT_BUDGET_BYTES;
-        r.insert(token.clone(), image)
-    });
+    let inserted = with_resident(|r| r.insert(token.clone(), image));
     if !inserted {
         return Published::OverBudget;
     }
@@ -254,9 +404,9 @@ pub(crate) fn publish(
 /// sensor white, oriented for display.
 pub fn working_image_from(d: crate::raw::LinearDecode) -> WorkingImage {
     use image::{DynamicImage, Rgb32FImage};
-    let n = d.rgb16.len();
-    let mut f = Vec::with_capacity(n);
-    f.extend(d.rgb16.iter().map(|&v| v as f32 / 65535.0));
+    use rayon::prelude::*;
+    // 200 million values for a 67 MP decode: across cores, it is part of every cache hit.
+    let f: Vec<f32> = d.rgb16.par_iter().map(|&v| v as f32 / 65535.0).collect();
     let img = Rgb32FImage::from_raw(d.width, d.height, f).expect("rgb16 length matches its dimensions");
     let mut dynimg = DynamicImage::ImageRgb32F(img);
     dynimg.apply_orientation(d.orientation);
@@ -278,6 +428,9 @@ mod tests {
     use crate::develop::{resident, resident_bytes, serial, test_image};
 
     fn state(engine_on: bool) -> (AppState, crate::test_support::TestTmpDir) {
+        // The resident set is process-global and now survives a claim for the photos it
+        // keeps: every test starts from an empty one (callers hold `serial()`).
+        release_all();
         let dir = crate::test_support::TestTmpDir::new("develop-session");
         let root = dir.join("photos");
         std::fs::create_dir_all(&root).unwrap();
@@ -293,8 +446,13 @@ mod tests {
     }
 
     fn decode_claim(state: &AppState, photo_id: i64) -> JobClaim<DevelopStatus> {
-        match claim(state, photo_id, raw_probe()).unwrap() {
+        decode_claim_with(state, photo_id, &[])
+    }
+
+    fn decode_claim_with(state: &AppState, photo_id: i64, neighbours: &[i64]) -> JobClaim<DevelopStatus> {
+        match claim(state, photo_id, raw_probe(), neighbours).unwrap() {
             Claimed::Decode(c) => c,
+            Claimed::Adopted(_, t) => panic!("expected a decode claim, got an adoption of {t:?}"),
             Claimed::Ready(s) => panic!("expected a decode claim, got {s:?}"),
         }
     }
@@ -384,7 +542,7 @@ mod tests {
         let ta = token_of(&a, 1);
         assert_eq!(publish(&a, 1, &ta, test_image(8, 8)), Published::Resident);
 
-        match claim(&state, 1, raw_probe()).unwrap() {
+        match claim(&state, 1, raw_probe(), &[]).unwrap() {
             Claimed::Ready(DevelopSource::Raw { token: Some(t), .. }) => assert_eq!(t, ta.to_query()),
             other => panic!("expected the resident token, got {:?}", matches!(other, Claimed::Decode(_))),
         }
@@ -402,7 +560,7 @@ mod tests {
         let ta = token_of(&a, 1);
         assert_eq!(publish(&a, 1, &ta, test_image(8, 8)), Published::Resident);
 
-        assert!(matches!(claim(&state, 2, DevelopSource::Jpeg).unwrap(), Claimed::Ready(DevelopSource::Jpeg)));
+        assert!(matches!(claim(&state, 2, DevelopSource::Jpeg, &[]).unwrap(), Claimed::Ready(DevelopSource::Jpeg)));
         assert!(a.abort.load(Ordering::Relaxed));
         assert!(resident(&ta).is_none());
 
@@ -411,11 +569,105 @@ mod tests {
         assert_eq!(publish(&b, 3, &tb, test_image(8, 8)), Published::Resident);
         state.catalog.lock().unwrap().as_ref().unwrap().set_setting(RAW_ENGINE_KEY, "0").unwrap();
         assert!(matches!(
-            claim(&state, 3, raw_probe()).unwrap(),
+            claim(&state, 3, raw_probe(), &[]).unwrap(),
             Claimed::Ready(DevelopSource::Preview { preparing: false })
         ));
         assert!(b.abort.load(Ordering::Relaxed), "switching the engine off stands the decode down");
         assert!(resident(&tb).is_none());
         assert!(matches!(current(&state, 3, raw_probe()), DevelopSource::Preview { preparing: false }));
+    }
+
+    /// **Forced.** Stepping to a photo the previous claim preloaded as a neighbour adopts
+    /// its image at once — no load, no preview state — under the new claim's generation.
+    /// The previous claim's tokens name nothing afterwards, and the previous current photo
+    /// stays only because it is a neighbour of the new one.
+    #[test]
+    fn stepping_to_a_preloaded_neighbour_adopts_it_and_keeps_only_the_new_neighbours() {
+        let _serial = serial();
+        let (state, _dir) = state(true);
+        let a = decode_claim_with(&state, 1, &[2, 3]);
+        let (t1, t2, t3) = (token_of(&a, 1), token_of(&a, 2), token_of(&a, 3));
+        assert_eq!(publish(&a, 1, &t1, test_image(8, 8)), Published::Resident);
+        assert!(preload_insert(&a, &t2, test_image(8, 8)));
+        assert!(preload_insert(&a, &t3, test_image(8, 8)));
+
+        // The user steps to photo 2, whose neighbours are 1 and 4 (3 is no longer adjacent).
+        let (b, token) = match claim(&state, 2, raw_probe(), &[1, 4]).unwrap() {
+            Claimed::Adopted(b, token) => (b, token),
+            _ => panic!("a preloaded neighbour must be adopted, not decoded again"),
+        };
+        assert_eq!(token, token_of(&b, 2));
+        assert!(a.abort.load(Ordering::Relaxed), "the previous worker is told to stop");
+        assert!(resident(&token).is_some(), "photo 2's pixels survived the step");
+        assert!(resident(&token_of(&b, 1)).is_some(), "photo 1 stays: it is a neighbour now");
+        for old in [&t1, &t2, &t3] {
+            assert!(resident(old).is_none(), "the previous claim's tokens name nothing: {old:?}");
+        }
+        assert!(resident(&token_of(&b, 3)).is_none(), "photo 3 is no longer adjacent: released");
+        let status = state.jobs.develop.status().unwrap().unwrap();
+        assert_eq!((status.photo_id, status.resident), (2, true));
+        assert!(matches!(current(&state, 2, raw_probe()), DevelopSource::Raw { token: Some(_), .. }));
+    }
+
+    /// **Forced.** A tripped worker that finishes a neighbour after a newer claim took the
+    /// family takes its insert back out, and stops preloading.
+    #[test]
+    fn a_superseded_preload_takes_itself_back_out() {
+        let _serial = serial();
+        let (state, _dir) = state(true);
+        let a = decode_claim_with(&state, 1, &[2]);
+        let _b = decode_claim(&state, 5);
+        let late = token_of(&a, 2);
+        assert!(!preload_insert(&a, &late, test_image(8, 8)), "refused: the claim is gone");
+        assert!(resident(&late).is_none());
+        assert_eq!(resident_bytes(), 0);
+    }
+
+    /// The session status stays after the worker's success (it describes the open photo,
+    /// not the worker), so a remount re-attaches to the resident image; after Develop is
+    /// closed the same status reads as "not resident", never as preparing forever.
+    #[test]
+    fn the_session_outlives_its_worker_but_not_its_image() {
+        let _serial = serial();
+        let (state, _dir) = state(true);
+        let a = decode_claim(&state, 1);
+        let t = token_of(&a, 1);
+        assert_eq!(publish(&a, 1, &t, test_image(8, 8)), Published::Resident);
+        // The worker ends here on success — it does not clear the slot.
+        assert!(matches!(current(&state, 1, raw_probe()), DevelopSource::Raw { token: Some(_), .. }));
+        match claim(&state, 1, raw_probe(), &[]).unwrap() {
+            Claimed::Ready(DevelopSource::Raw { token: Some(q), .. }) => assert_eq!(q, t.to_query()),
+            _ => panic!("reopening the resident photo must answer at once"),
+        }
+        close(&state).unwrap();
+        assert!(matches!(current(&state, 1, raw_probe()), DevelopSource::Raw { token: None, .. }));
+    }
+
+    /// A photo the decode cache holds loads from it without calling LibRaw: the "file" here
+    /// is not a RAW at all, so a decode would fail — the cache hit is the only way through.
+    #[test]
+    fn a_cached_decode_loads_without_the_decoder() {
+        let dir = crate::test_support::TestTmpDir::new("develop-cache-hit");
+        let root = dir.join("cache");
+        let file = dir.join("a.ARW");
+        std::fs::write(&file, b"not a raw file").unwrap();
+        let key = super::super::cache::CacheKey::for_file(&file).unwrap();
+        let d = crate::raw::LinearDecode {
+            width: 4,
+            height: 2,
+            rgb16: (0..24).collect(),
+            orientation: image::metadata::Orientation::NoTransforms,
+            cam_mul: [1.0; 4],
+            rgb_cam: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+        };
+        super::super::cache::write_in(&root, &key, &d).unwrap();
+        let abort = std::sync::atomic::AtomicBool::new(false);
+        let (got, from) = load_linear_in(&root, &file, &abort, u64::MAX).unwrap();
+        assert_eq!(from, "cache");
+        assert_eq!(got.rgb16, d.rgb16);
+        // Change the file: the key changes, it is a miss, and the decoder is asked (and
+        // refuses a text file) — never the stale decode.
+        std::fs::write(&file, b"not a raw file, now longer").unwrap();
+        assert!(load_linear_in(&root, &file, &abort, u64::MAX).is_err());
     }
 }

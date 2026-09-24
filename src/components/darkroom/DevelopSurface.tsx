@@ -19,6 +19,9 @@ export function DevelopSurface(props: {
   onSavedActive: (editJson: string) => void;
   onChanged: () => void;
   onBack: () => void;
+  /** The photos either side in the Library's current order, next first — the Darkroom
+   *  preloads their RAW working images (docs/plans/raw-foundation, slice 4). */
+  neighbours: number[];
 }) {
   const [darkroom, setDarkroom] = useState<boolean | null>(null);
   useEffect(() => {
@@ -42,9 +45,10 @@ export function DevelopSurface(props: {
         onPickVersion={props.onPickVersion}
         onChanged={props.onChanged}
         onBack={props.onBack}
+        neighbours={props.neighbours}
       />
     );
   }
-  const { activeEditJson: _activeEditJson, ...editorProps } = props;
+  const { activeEditJson: _activeEditJson, neighbours: _neighbours, ...editorProps } = props;
   return <EditorView {...editorProps} />;
 }

@@ -88,6 +88,7 @@ export function DarkroomView({
   onPickVersion,
   onChanged,
   onBack,
+  neighbours = [],
 }: {
   photoId: number;
   /** Original (sensor) pixel dimensions, for the crop-size readout and aspect math. */
@@ -100,7 +101,11 @@ export function DarkroomView({
   onPickVersion: (v: PhotoVersion | null) => void;
   onChanged: () => void;
   onBack: () => void;
+  /** The photos either side, next first: preloaded after this one is ready. */
+  neighbours?: number[];
 }) {
+  const neighboursRef = useRef(neighbours);
+  neighboursRef.current = neighbours;
   const [working, setWorking] = useState<VersionEdit>(() =>
     parseEdit(initialEditJson ?? undefined),
   );
@@ -132,7 +137,9 @@ export function DarkroomView({
   useEffect(() => {
     let alive = true;
     setSourceState(INITIAL_SOURCE);
-    developOpen(photoId, [])
+    // Neighbours are read at open time: they preload in the background, and a change in
+    // them alone (the list re-sorted around this photo) is not a reason to reopen it.
+    developOpen(photoId, neighboursRef.current)
       .then((s) => {
         if (!alive) return;
         // Dev evidence for the badge (docs/plans/raw-foundation): the exact payload.

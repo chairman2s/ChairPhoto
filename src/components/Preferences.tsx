@@ -10,6 +10,8 @@ import {
   findUnavailablePhotos,
   getLibraryRoot,
   purgeEmptyPhotos,
+  developCacheClear,
+  developCacheUsage,
   getSetting,
   listVolumes,
   OFFLOAD_AGE_SETTING,
@@ -553,6 +555,110 @@ const GL_SPIKE_REPORT_KEY = "editor.glSpike.lastReport";
 /** `"1"` renders Develop from the RAW working image (docs/plans/raw-foundation); read by the
  *  backend's `develop_open`. Off by default until slice 8. */
 const RAW_ENGINE_KEY = "develop.rawEngine";
+/** The `.rawf` decode cache's size limit in GB (backend default 20) and neighbour preload
+ *  (default on) — docs/plans/raw-foundation, slice 4. Read by `develop_open`. */
+const DECODE_CACHE_GB_KEY = "develop.decodeCacheGb";
+const PRELOAD_KEY = "develop.preloadNeighbours";
+const DEFAULT_DECODE_CACHE_GB = 20;
+
+/** Bytes as "3.4 GB" / "512 MB". */
+export function formatCacheBytes(bytes: number): string {
+  const gb = bytes / 1024 ** 3;
+  if (gb >= 1) return `${gb.toFixed(1)} GB`;
+  return `${Math.round(bytes / 1024 ** 2)} MB`;
+}
+
+/** The decode-cache size a settings value means: a non-negative number of GB, else the
+ *  default. */
+export function parseCacheGb(v: string | null | undefined): number {
+  const n = v == null || v.trim() === "" ? NaN : Number(v);
+  return Number.isFinite(n) && n >= 0 ? n : DEFAULT_DECODE_CACHE_GB;
+}
+
+/** RAW engine settings: the decode cache's size, its current use, and neighbour preload. */
+function RawCacheSettings() {
+  const [gb, setGb] = useState<string>("");
+  const [preload, setPreload] = useState<boolean | null>(null);
+  const [usage, setUsage] = useState<number | null>(null);
+  const [busy, setBusy] = useState(false);
+  const refreshUsage = () => {
+    developCacheUsage()
+      .then(setUsage)
+      .catch(() => setUsage(null));
+  };
+  useEffect(() => {
+    getSetting(DECODE_CACHE_GB_KEY)
+      .then((v) => setGb(String(parseCacheGb(v))))
+      .catch(() => setGb(String(DEFAULT_DECODE_CACHE_GB)));
+    getSetting(PRELOAD_KEY)
+      .then((v) => setPreload(v !== "0"))
+      .catch(() => setPreload(true));
+    refreshUsage();
+  }, []);
+  const saveGb = async () => {
+    const n = parseCacheGb(gb);
+    setGb(String(n));
+    await setSetting(DECODE_CACHE_GB_KEY, String(n)).catch(() => {});
+  };
+  return (
+    <div style={{ marginLeft: 24, marginTop: 4 }}>
+      <label style={{ display: "flex", gap: 8, alignItems: "center" }}>
+        RAW decode cache
+        <input
+          type="number"
+          min={0}
+          step={1}
+          value={gb}
+          style={{ width: 70 }}
+          onChange={(e) => setGb(e.target.value)}
+          onBlur={saveGb}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") void saveGb();
+          }}
+          aria-label="RAW decode cache size in GB"
+        />
+        GB
+        <span className="modal-sub">
+          {usage == null ? "" : `· ${formatCacheBytes(usage)} used`}
+        </span>
+        <button
+          disabled={busy || !usage}
+          onClick={async () => {
+            setBusy(true);
+            await developCacheClear().catch(() => 0);
+            setBusy(false);
+            refreshUsage();
+          }}
+          title="Delete every cached RAW decode. The next first open of each photo decodes it again."
+        >
+          Clear
+        </button>
+      </label>
+      <div className="modal-sub" style={{ marginTop: 2 }}>
+        Each RAW decoded in the Darkroom is kept on disk so opening it again is near-instant
+        (about 200–400 MB per photo). Oldest entries go first when the limit is reached; 0
+        keeps nothing.
+      </div>
+      <label style={{ display: "flex", gap: 8, alignItems: "center", cursor: "pointer", marginTop: 6 }}>
+        <input
+          type="checkbox"
+          checked={preload ?? true}
+          disabled={preload === null}
+          onChange={async () => {
+            const next = !(preload ?? true);
+            setPreload(next);
+            try {
+              await setSetting(PRELOAD_KEY, next ? "1" : "0");
+            } catch {
+              setPreload(!next);
+            }
+          }}
+        />
+        Prepare the next and previous photo in the background
+      </label>
+    </div>
+  );
+}
 
 /** Darkroom early-preview toggle (docs/plans/darkroom): swaps the Develop surface for
  *  the in-progress Darkroom. Read when Develop opens (DevelopSurface), so a change
@@ -638,6 +744,7 @@ function DarkroomSection() {
         />
         Render from the RAW (engine 2, in progress)
       </label>
+      {rawEngine && <RawCacheSettings />}
       <label
         style={{ display: "flex", gap: 8, alignItems: "center", cursor: "pointer", marginTop: 6 }}
       >

@@ -860,6 +860,12 @@ export const developOpen = (photoId: number, neighbours: number[] = []) =>
 /** The Darkroom closed: release the working images. Idempotent. */
 export const developClose = () => invoke<void>("develop_close");
 
+/** Bytes the RAW decode cache (`.rawf`) holds on disk. */
+export const developCacheUsage = () => invoke<number>("develop_cache_usage");
+
+/** Empty the RAW decode cache; returns the bytes freed. */
+export const developCacheClear = () => invoke<number>("develop_cache_clear");
+
 /** The develop source state right now (a remounted view re-attaching). */
 export const developSource = (photoId: number) =>
   invoke<DevelopSource>("develop_source", { photoId });

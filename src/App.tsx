@@ -1,5 +1,5 @@
 import { noteGridCommit } from "./modules/shellTiming";
-import { Profiler, useCallback, useEffect, useRef, useState } from "react";
+import { Profiler, useCallback, useEffect, useRef, useState, useMemo } from "react";
 import { confirm } from "@tauri-apps/plugin-dialog";
 import {
   analyzeBurstSharpness,
@@ -516,6 +516,16 @@ export default function App() {
   // invariant). We prefetch further ahead than behind, since culling moves forward:
   // the next 5 photos and the previous 2. Preloading stays keyed on the *selection*: it
   // exists for stepping through the grid, and the compared frames are already on screen.
+  // The Darkroom's RAW preload targets (docs/plans/raw-foundation, slice 4): the photos
+  // either side in the current order, next first. Kept referentially stable while the
+  // selection and the list are unchanged.
+  const developNeighbours = useMemo(() => {
+    if (selection.activeId == null) return [];
+    const idx = photos.findIndex((p) => p.id === selection.activeId);
+    if (idx === -1) return [];
+    return [photos[idx + 1]?.id, photos[idx - 1]?.id].filter((id): id is number => id != null);
+  }, [selection.activeId, photos]);
+
   useEffect(() => {
     broadcastPhoto(loupeBroadcastId, loupeBroadcastEdit);
     if (selection.activeId == null) return;
@@ -1768,6 +1778,7 @@ export default function App() {
             {inDevelop && selected ? (
               <DevelopSurface
                 photoId={selected.id}
+                neighbours={developNeighbours}
                 photoW={selected.width}
                 photoH={selected.height}
                 activeVersionId={activeVersion?.id ?? null}

@@ -107,6 +107,19 @@ Environment variables:
 - `CHAIRPHOTO_EDIT_BENCH_LUT`: a `.cube` file to add a 3D LUT to the look; default none.
 - `CHAIRPHOTO_EDIT_BENCH_N`: runs per stage, default `10`.
 
+### RAW decode-cache bench
+
+`develop::cache::tests::bench_cache_hit` (ignored) times a cache hit on a 67 MP-sized decode
+— write, read, and conversion to the working image — in whichever profile it is built for:
+
+```bash
+cargo test develop::cache::tests::bench_cache_hit -- --ignored --nocapture
+cargo test --release develop::cache::tests::bench_cache_hit -- --ignored --nocapture
+```
+
+The running app logs `develop: photo N ready from cache|decode in …` and
+`develop: neighbour N preloaded from …` for every load.
+
 ### Live render timings
 
 The same stages can be read from a running app: start it with `CHAIRPHOTO_EDIT_TIMING=1`

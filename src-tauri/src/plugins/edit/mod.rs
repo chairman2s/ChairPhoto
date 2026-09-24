@@ -379,8 +379,12 @@ pub fn render_proxy(
                 _ => {
                     let framed = frame_image(DynamicImage::ImageRgb32F(image.linear.clone()), &edit, max_edge, &mut t);
                     let base = framed.into_rgb32f();
-                    framed_cache_put(key, FramedBase::Linear(base.clone()));
-                    t.mark("framed_cache_put");
+                    // A full-size linear base is ~800 MB for a 67 MP frame and the cache
+                    // copies on every hit: only screen-sized bases are kept.
+                    if base.width().max(base.height()) <= FRAMED_CACHE_MAX_LINEAR_EDGE {
+                        framed_cache_put(key, FramedBase::Linear(base.clone()));
+                        t.mark("framed_cache_put");
+                    }
                     base
                 }
             };
@@ -553,6 +557,8 @@ fn token_fingerprint(token: &SourceToken) -> u64 {
 /// pass (1024), and the loupe's full-size render (0) — one photo's working set. A 2048 px
 /// RGB base is ~12 MB, so the cap is memory, not hit rate. Evicts least recently used.
 const FRAMED_CACHE_CAP: usize = 4;
+/// The largest linear framed base the cache keeps (long edge, px): the loupe's fit render.
+pub const FRAMED_CACHE_MAX_LINEAR_EDGE: u32 = 2560;
 static FRAMED_CACHE: Mutex<Vec<(FramedKey, FramedBase)>> = Mutex::new(Vec::new());
 /// Hits since process start — for the tests and the bench, never for behaviour.
 static FRAMED_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);

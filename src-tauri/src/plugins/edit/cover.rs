@@ -80,13 +80,10 @@ fn render(path: &Path, photo_id: i64, edit_json: &str) -> Result<Vec<u8>, String
 
 #[cfg(feature = "raw")]
 fn render_engine2(path: &Path, photo_id: i64, edit_json: &str) -> Result<Vec<u8>, String> {
-    use super::{render_image_opts, RenderOpts, RenderSource, SourceToken};
-    let abort = std::sync::atomic::AtomicBool::new(false);
+    use super::{render_image_opts, RenderOpts, RenderSource};
     let budget = crate::develop::cache::DEFAULT_BUDGET_GB * 1024 * 1024 * 1024;
-    let (decoded, _) = crate::develop::session::load_linear(path, &abort, budget)?;
-    let image = std::sync::Arc::new(crate::develop::working_image_from(decoded));
-    // A private token: this render is not the Develop session's and is never cached as one.
-    let token = SourceToken::Working { photo_id, generation: 0 };
+    // The session's image when it holds this photo, else one bounded offline load.
+    let (token, image) = crate::develop::offline::working_image_for(photo_id, path, budget)?;
     let out = render_image_opts(RenderSource::Working { token, image }, edit_json, COVER_EDGE, RenderOpts::default())?;
     super::encode_jpeg(&out, 85)
 }

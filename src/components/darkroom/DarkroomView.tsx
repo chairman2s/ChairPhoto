@@ -251,6 +251,10 @@ export function DarkroomView({
    *  this frame's camera match. */
   const stamped = (record: VersionEdit): VersionEdit =>
     engineRef.current === 2 ? asLinearRecord(record, cameraEvRef.current) : record;
+  /** Put the working state on the loupe as the print: the stamped record and, on the RAW
+   *  engine, the session token, so the loupe renders the stage's own pixels. */
+  const broadcastPrint = () =>
+    broadcastPhoto(photoId, loupeJson(JSON.stringify(stamped(workingRef.current))), sourceTokenRef.current ?? null);
   /** A variant's render (proof sheet, duel) from the stage's own source and engine. */
   const variantUrl = (record: VersionEdit, maxEdge: number): string =>
     editRenderUrl(photoId, JSON.stringify(stamped(record)), { maxEdge, source: sourceToken });
@@ -458,7 +462,7 @@ export function DarkroomView({
   useEffect(() => {
     const unlisten = onLoupeReady(() => {
       if (printOnLoupeRef.current) {
-        broadcastPhoto(photoId, loupeJson(JSON.stringify(workingRef.current)));
+        broadcastPrint();
       }
     });
     return () => {
@@ -470,7 +474,9 @@ export function DarkroomView({
   // shows. (Pending changes are flushed on the same unmount, below.)
   useEffect(
     () => () => {
-      if (printOnLoupeRef.current) broadcastPhoto(photoId, loupeJson(JSON.stringify(workingRef.current)));
+      // No token: leaving re-keys (a step) or releases (Develop closed) this session's
+      // image, so the loupe renders the record from an offline load instead of a 404.
+      if (printOnLoupeRef.current) broadcastPhoto(photoId, loupeJson(JSON.stringify(stamped(workingRef.current))), null);
     },
     [photoId],
   );
@@ -738,7 +744,7 @@ export function DarkroomView({
     if (next) {
       // Opening (or focusing) the window is part of turning the print on.
       void openLoupeWindow().catch(() => {});
-      broadcastPhoto(photoId, loupeJson(JSON.stringify(workingRef.current)));
+      broadcastPrint();
     } else {
       broadcastPhoto(photoId, initialEditJson);
     }
@@ -784,7 +790,7 @@ export function DarkroomView({
           // Masses are a cosmetic overlay on the strip — a failure leaves the last fill.
         });
       // The loupe print rides the settle: one settled state, one broadcast.
-      if (printOnLoupeRef.current) broadcastPhoto(photoId, loupeJson(fullJson));
+      if (printOnLoupeRef.current) broadcastPhoto(photoId, loupeJson(fullJson), sourceToken ?? null);
     }, 250);
     return () => {
       clearTimeout(fastTimer);

@@ -15,6 +15,7 @@
 //! and `edit://` answers it with a 404 rather than other pixels.
 
 pub mod cache;
+pub mod offline;
 pub mod session;
 #[cfg(test)]
 mod camera_fit;
@@ -43,6 +44,15 @@ impl ResidentSet {
 
     pub fn get(&self, token: &SourceToken) -> Option<Arc<WorkingImage>> {
         self.images.iter().find(|(t, _)| t == token).map(|(_, i)| i.clone())
+    }
+
+    /// Any resident image of `photo_id`, with its token (a render outside the session
+    /// reuses the session's decode rather than loading its own).
+    pub fn find_photo(&self, photo_id: i64) -> Option<(SourceToken, Arc<WorkingImage>)> {
+        self.images
+            .iter()
+            .find(|(t, _)| matches!(t, SourceToken::Working { photo_id: p, .. } if *p == photo_id))
+            .map(|(t, i)| (t.clone(), i.clone()))
     }
 
     /// `false` when the image would exceed the budget (unless the set is empty: the current
@@ -112,6 +122,7 @@ pub(crate) fn with_resident<T>(f: impl FnOnce(&mut ResidentSet) -> T) -> T {
 /// catalog's decode resident and reachable by a token that names the new catalog's ids.
 pub(crate) fn release_all() {
     with_resident(|r| r.clear());
+    offline::clear();
 }
 
 /// How many bytes the resident images hold right now — the number a "did it clean up"

@@ -38,11 +38,14 @@ export interface LoupePhoto {
   photoId: number | null;
   /** The active version's edit record (JSON string), or null for the Original. */
   editJson: string | null;
+  /** The Develop session's working-image token when the record is on the RAW engine and
+   *  the Darkroom has it resident — the print renders from the same pixels as the stage. */
+  source?: string | null;
 }
 
 /** Tell any open loupe window which photo (and version) to display. */
-export function broadcastPhoto(photoId: number | null, editJson: string | null = null): void {
-  emit(EVENT_PHOTO, { photoId, editJson } satisfies LoupePhoto);
+export function broadcastPhoto(photoId: number | null, editJson: string | null = null, source: string | null = null): void {
+  emit(EVENT_PHOTO, { photoId, editJson, source } satisfies LoupePhoto);
 }
 
 /** Loupe window: subscribe to photo/version changes. Returns an unlisten function. */

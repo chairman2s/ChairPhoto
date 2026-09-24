@@ -770,6 +770,36 @@ export const setEditRecord = (photoId: number, editJson: string) =>
 export const renderEdit = (photoId: number, editJson: string, maxEdge = 0, hiRes = false) =>
   invoke<string>("render_edit", { photoId, editJson, maxEdge, hiRes });
 
+/** The long edge of a loupe's fit render on the RAW engine (the loupe window's size on a
+ *  large screen); zoom asks for the full picture. */
+export const LOUPE_FIT_EDGE = 2560;
+
+/**
+ * A version's render for a loupe (the pop-out window, the main window's loupe). An
+ * engine-2 record is a native `edit://` URL — from the Develop session's working image
+ * when `source` names it, else from a bounded offline load of the RAW — at
+ * {@link LOUPE_FIT_EDGE}, or full size for `hi`; never the camera preview, and never a
+ * 67 MP image as base64. An engine-1 record renders as it always has.
+ */
+export const renderForLoupe = (
+  photoId: number,
+  editJson: string,
+  opts: { hi?: boolean; source?: string | null } = {},
+): Promise<string> => {
+  let engine = 1;
+  try {
+    engine = (JSON.parse(editJson) as { engine?: number }).engine ?? 1;
+  } catch {
+    // An unreadable record renders (and fails) the old way.
+  }
+  if (engine === 2) {
+    return Promise.resolve(
+      editRenderUrl(photoId, editJson, { maxEdge: opts.hi ? 0 : LOUPE_FIT_EDGE, source: opts.source ?? undefined }),
+    );
+  }
+  return renderEdit(photoId, editJson, 0, opts.hi ?? false);
+};
+
 /** Options for {@link editRenderUrl}. */
 export interface EditRenderOpts {
   /** Longest output edge in px; 0 (default) = full size. */

@@ -77,6 +77,20 @@ pub fn render_edit_bytes<R: tauri::Runtime>(
     .ok_or_else(|| format!("no reachable copy of photo {}", job.photo_id))?;
     t.mark("pick_path");
     let opts = RenderOpts { skip_look: job.base_only };
+    // An engine-2 record with no session token (the Library loupe, a version outside
+    // Develop): the RAW through its pipeline from a bounded offline load, never the
+    // camera preview. `hi_res` needs nothing more — engine 2 is always the full decode.
+    #[cfg(feature = "raw")]
+    if edit::record_engine(&job.edit_json) == 2 {
+        let budget = crate::develop::session::cache_budget_bytes(&state);
+        let (token, image) = crate::develop::offline::working_image_for(job.photo_id, &path, budget)?;
+        t.mark("working_image");
+        let out = edit::render_proxy(RenderSource::Working { token, image }, &job.edit_json, job.max_edge, opts)?;
+        t.mark("render");
+        let bytes = if job.base_only { edit::encode_png_fast(&out)? } else { edit::encode_jpeg(&out, 90)? };
+        t.report(&format!("bytes={}", bytes.len()));
+        return Ok(bytes);
+    }
     let out = if job.hi_res {
         // Zoom tier: too large to keep resident — decode per render.
         let jpeg = crate::thumbnails::zoom_bytes(&path)?;

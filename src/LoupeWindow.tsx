@@ -3,7 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { LoupeCardView } from "./components/LoupeCardView";
 import { ZoomableImage } from "./components/ZoomableImage";
 import { announceReady, onCard, onPhoto, type LoupePhoto } from "./modules/loupe";
-import { getSetting, listTags, pluginFeatures, renderEdit } from "./modules/api";
+import { getSetting, listTags, pluginFeatures, renderForLoupe } from "./modules/api";
 import { parseEdit } from "./modules/editing";
 import { FaceOverlay, type FaceOverlayApi } from "./modules/plugins/faces";
 import type { LoupeCard } from "./modules/registry";
@@ -17,7 +17,7 @@ import "./App.css";
 // takes over until it is taken down.
 export default function LoupeWindow() {
   useAppearance();
-  const [photo, setPhoto] = useState<LoupePhoto>({ photoId: null, editJson: null });
+  const [photo, setPhoto] = useState<LoupePhoto>({ photoId: null, editJson: null, source: null });
   const [card, setCard] = useState<LoupeCard | null>(null);
   // The rendered edit (data URL) when a version is active; "" = show the Original.
   const [editedSrc, setEditedSrc] = useState("");
@@ -64,13 +64,13 @@ export default function LoupeWindow() {
   // the unedited preview when there's no version or the render fails (e.g. the
   // edit engine is compiled out).
   useEffect(() => {
-    const { photoId, editJson } = photo;
+    const { photoId, editJson, source } = photo;
     if (photoId == null || editJson == null) {
       setEditedSrc("");
       return;
     }
     let cancelled = false;
-    renderEdit(photoId, JSON.stringify(parseEdit(editJson)), 0)
+    renderForLoupe(photoId, JSON.stringify(parseEdit(editJson)), { source })
       .then((url) => !cancelled && setEditedSrc(url))
       .catch(() => !cancelled && setEditedSrc(""));
     return () => {
@@ -81,11 +81,11 @@ export default function LoupeWindow() {
   // Zoom-in render for the active version: the same edit over the native-size preview
   // tier, so zooming a (cropped) version magnifies real pixels — the fast render can
   // be smaller than the window. Fetched lazily by ZoomableImage on first zoom.
-  const { photoId: hiPhotoId, editJson: hiEditJson } = photo;
+  const { photoId: hiPhotoId, editJson: hiEditJson, source: hiSource } = photo;
   const hiSrcOverride = useCallback(() => {
     if (hiPhotoId == null || hiEditJson == null) return Promise.resolve("");
-    return renderEdit(hiPhotoId, JSON.stringify(parseEdit(hiEditJson)), 0, true);
-  }, [hiPhotoId, hiEditJson]);
+    return renderForLoupe(hiPhotoId, JSON.stringify(parseEdit(hiEditJson)), { hi: true, source: hiSource });
+  }, [hiPhotoId, hiEditJson, hiSource]);
 
   return (
     // The .loupe-window class is used by FaceOverlay's DOM traversal to locate

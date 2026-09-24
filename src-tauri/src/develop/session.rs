@@ -35,6 +35,11 @@ pub(crate) struct Prep {
     pub preload: bool,
 }
 
+/// The `.rawf` cache budget this catalog's settings ask for, in bytes.
+pub(crate) fn cache_budget_bytes(state: &AppState) -> u64 {
+    prep_settings(state).cache_budget_bytes
+}
+
 fn prep_settings(state: &AppState) -> Prep {
     let get = |k: &str| -> Option<String> {
         let guard = state.catalog.lock().ok()?;

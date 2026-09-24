@@ -1,5 +1,5 @@
 import type { ChairPhotoModule } from "../registry";
-import { renderEdit } from "../api";
+import { renderForLoupe } from "../api";
 
 // The Basic Editor module (H5b): non-destructive crop + exposure/tone over photo
 // versions. Its backend render engine is the `edit` Cargo feature; if compiled out, the
@@ -14,17 +14,18 @@ export const basicEditorModule: ChairPhotoModule = {
     "Non-destructive crop (with social aspect presets) and exposure/tone, saved as photo versions. Originals are never modified.",
   backendFeature: "edit",
   // No `permissions` on purpose, not by omission (#48): this module never calls
-  // `api.invoke`. It renders through `renderEdit`, a core wrapper in `modules/api.ts`,
+  // `api.invoke`. It renders through `renderForLoupe`, a core wrapper in `modules/api.ts`,
   // which is part of the host API rather than the module-owned command surface.
   onLoad(api) {
     api.registerEditRenderer({
       id: "basic-editor",
-      // Render a version's edit record to a full-size data URL for the loupe.
-      render: (photoId, record) => renderEdit(photoId, JSON.stringify(record), 0),
-      // Zoom-in render: same record over the native-size preview tier, so the loupe
-      // has real pixels to magnify (a cropped render of the fast 2048 proxy can be
-      // smaller than the window).
-      renderHi: (photoId, record) => renderEdit(photoId, JSON.stringify(record), 0, true),
+      // Render a version's edit record for the loupe (a RAW-engine record renders the RAW,
+      // see renderForLoupe).
+      render: (photoId, record) => renderForLoupe(photoId, JSON.stringify(record)),
+      // Zoom-in render: same record over the native-size preview tier (or the full RAW),
+      // so the loupe has real pixels to magnify (a cropped render of the fast 2048 proxy
+      // can be smaller than the window).
+      renderHi: (photoId, record) => renderForLoupe(photoId, JSON.stringify(record), { hi: true }),
     });
   },
 };

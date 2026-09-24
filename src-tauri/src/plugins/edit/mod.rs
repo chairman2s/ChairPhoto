@@ -12,6 +12,7 @@ pub mod cover;
 mod bench;
 pub mod cube;
 pub mod linear;
+pub mod parity;
 mod look;
 pub mod source;
 pub mod timing;
@@ -1047,6 +1048,28 @@ mod tests {
         assert_eq!(mask.get_pixel(2, 10).0, [255, 0, 255, 190], "clipped at the sensor: marked, whatever the sliders say");
         assert_eq!(mask.get_pixel(28, 10).0[3], 0, "below sensor white: transparent");
         assert!(clip_overlay_png(token, img, r#"{"tone": {"ev": 0}}"#, 32).is_err(), "engine 1 has no sensor data");
+    }
+
+    /// The success metric at 100 %: an engine-2 export (`render_image_opts`, full size) is
+    /// byte-for-byte the view's full-size render (`render_proxy`, through the framed-base
+    /// cache) — for geometry, tone, a film look and grain alike.
+    #[test]
+    fn export_at_full_size_is_the_view_at_full_size() {
+        let img = synthetic_working(1.3);
+        for (gen, json) in [
+            r#"{"engine": 2, "display": "camera.2"}"#,
+            r#"{"engine": 2, "display": "camera.2", "cameraEv": -0.6, "tone": {"ev": 0.4, "contrast": 0.3, "highlights": -0.5}}"#,
+            r#"{"engine": 2, "display": "camera.2", "straighten": 2.5, "crop": {"x": 0.1, "y": 0.05, "w": 0.8, "h": 0.9}, "fade": 0.2, "vignette": -0.3, "grain": {"amount": 0.4, "size": 1.5}}"#,
+            r#"{"engine": 2, "bw": {"enabled": true, "r": 0.5, "g": 0.3, "b": 0.2}, "zones": [0, 0.1, 0.2, 0, -0.1, 0, 0.2, 0]}"#,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let token = SourceToken::Working { photo_id: 6, generation: 100 + gen as u64 };
+            let export = render_image_opts(RenderSource::Working { token: token.clone(), image: img.clone() }, json, 0, RenderOpts::default()).unwrap();
+            let view = render_proxy(RenderSource::Working { token, image: img.clone() }, json, 0, RenderOpts::default()).unwrap();
+            assert_eq!(export.to_rgb8().as_raw(), view.to_rgb8().as_raw(), "{json}");
+        }
     }
 
     #[test]

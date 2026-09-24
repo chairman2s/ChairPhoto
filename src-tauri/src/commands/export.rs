@@ -37,11 +37,48 @@ pub async fn export_photos(
         };
         (resolved, hashtags)
     };
-    tauri::async_runtime::spawn_blocking(move || {
+    let result = tauri::async_runtime::spawn_blocking(move || {
         crate::export::write_exports(&resolved, preset, &dest, &hashtags)
     })
     .await
-    .map_err(|e| e.to_string())?
+    .map_err(|e| e.to_string())?;
+    record_export_parity(&state);
+    result
+}
+
+/// The settings key holding this catalog's "export equals view" total
+/// (`plugins::edit::parity::ParityTally` as JSON): exports checked, exports that differed.
+#[cfg(feature = "edit")]
+pub const EXPORT_PARITY_KEY: &str = "metrics.exportParity";
+
+/// Add the engine-2 exports checked since the last call to this catalog's total. Called
+/// after every command that writes an export (the Export dialog, publishing, Instagram,
+/// LocalSend); best-effort — a failed write loses a count, never an export.
+pub(crate) fn record_export_parity(state: &AppState) {
+    #[cfg(feature = "edit")]
+    {
+        use crate::plugins::edit::parity::{take, ParityTally};
+        let tally = take();
+        if tally.checked == 0 {
+            return;
+        }
+        let Ok(guard) = state.catalog.lock() else { return };
+        let Some(catalog) = guard.as_ref() else { return };
+        let total: ParityTally = catalog
+            .get_setting(EXPORT_PARITY_KEY)
+            .ok()
+            .flatten()
+            .and_then(|v| serde_json::from_str(&v).ok())
+            .unwrap_or_default();
+        let next = tally.plus(total);
+        if let Ok(json) = serde_json::to_string(&next) {
+            if let Err(e) = catalog.set_setting(EXPORT_PARITY_KEY, &json) {
+                eprintln!("export: could not record the export-parity tally: {e}");
+            }
+        }
+    }
+    #[cfg(not(feature = "edit"))]
+    let _ = state;
 }
 
 /// Export one import batch as a `.chairphoto` bundle zip to `dest_path`.

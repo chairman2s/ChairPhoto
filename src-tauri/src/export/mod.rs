@@ -56,6 +56,8 @@ pub struct ExportResult {
 /// a Show-off export it also carries the selected version's edit (crop + tone) and name,
 /// so the JPEG is rendered from the full-resolution source and filed per-version.
 pub struct ResolvedItem {
+    /// The catalog photo (the develop session and the offline loader key on it).
+    pub photo_id: i64,
     pub original: PathBuf,
     pub keywords: ExportKeywords,
     /// The selected version's edit record (`None` = export the unedited original).
@@ -118,6 +120,7 @@ pub fn resolve_originals(
                     .unwrap_or((0, String::new()));
                 let iptc = catalog.get_iptc(id).unwrap_or_default();
                 out.items.push(ResolvedItem {
+                    photo_id: id,
                     original,
                     keywords,
                     edit_json,
@@ -249,7 +252,7 @@ fn export_jpeg(item: &ResolvedItem, dest_dir: &Path, max_width: Option<u32>) -> 
         let t = edit_json.trim();
         !t.is_empty() && t != "{}"
     };
-    let jpeg = render_export_jpeg(original, edit_json, has_edit, max_width)?;
+    let jpeg = render_export_jpeg(original, item.photo_id, edit_json, has_edit, max_width)?;
 
     let stem = original
         .file_stem()
@@ -286,7 +289,7 @@ pub fn write_item_jpeg(
         let t = edit_json.trim();
         !t.is_empty() && t != "{}"
     };
-    let jpeg = render_export_jpeg(&item.original, edit_json, has_edit, max_width)?;
+    let jpeg = render_export_jpeg(&item.original, item.photo_id, edit_json, has_edit, max_width)?;
     if let Some(parent) = out_path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
@@ -318,7 +321,7 @@ pub fn write_item_jpeg_with_long_edge(
     let jpeg = if !has_edit && limit == 0 {
         crate::thumbnails::zoom_bytes(&item.original)?
     } else {
-        let mut img = decode_export_source(&item.original, edit_json, has_edit)?;
+        let mut img = decode_export_source(&item.original, item.photo_id, edit_json, has_edit)?;
         if limit > 0 {
             img = downscale_to_long_edge(img, limit);
         }
@@ -445,6 +448,7 @@ fn run_exiftool(mut cmd: Command) -> Result<(), String> {
 /// apply the crop + tone, optionally downscale to `max_width`, and encode.
 fn render_export_jpeg(
     original: &Path,
+    photo_id: i64,
     edit_json: &str,
     has_edit: bool,
     max_width: Option<u32>,
@@ -456,7 +460,7 @@ fn render_export_jpeg(
     }
 
     // Otherwise we need pixels in hand (to crop and/or resize).
-    let mut img = decode_export_source(original, edit_json, has_edit)?;
+    let mut img = decode_export_source(original, photo_id, edit_json, has_edit)?;
     if let Some(w) = max_width {
         img = downscale_to_width(img, w);
     }
@@ -468,6 +472,7 @@ fn render_export_jpeg(
 /// engine is compiled out.
 fn decode_export_source(
     original: &Path,
+    photo_id: i64,
     edit_json: &str,
     has_edit: bool,
 ) -> Result<image::DynamicImage, String> {
@@ -478,16 +483,7 @@ fn decode_export_source(
         if crate::plugins::edit::record_engine(edit_json) == 2 {
             #[cfg(feature = "raw")]
             {
-                let flag = std::sync::atomic::AtomicBool::new(false);
-                let decoded = crate::raw::decode_linear(original, &flag)?;
-                let image = std::sync::Arc::new(crate::develop::working_image_from(decoded));
-                let token = crate::plugins::edit::SourceToken::Working { photo_id: 0, generation: 0 };
-                return crate::plugins::edit::render_image_opts(
-                    crate::plugins::edit::RenderSource::Working { token, image },
-                    edit_json,
-                    0,
-                    crate::plugins::edit::RenderOpts::default(),
-                );
+                return export_engine2(original, photo_id, edit_json);
             }
             #[cfg(not(feature = "raw"))]
             {
@@ -500,9 +496,31 @@ fn decode_export_source(
         let source = full_res_source(original)?;
         return crate::plugins::edit::render_image(source, edit_json, 0);
     }
-    let _ = (edit_json, has_edit);
+    let _ = (edit_json, has_edit, photo_id);
     let jpeg = crate::thumbnails::zoom_bytes(original)?;
     image::load_from_memory(&jpeg).map_err(|e| e.to_string())
+}
+
+/// An engine-2 export: the same working image the view renders (the Develop session's, or
+/// one bounded offline load from the `.rawf` cache or the decoder) through the same
+/// pipeline at full size — no tone matching — then checked against the view at Fit and
+/// tallied (`plugins::edit::parity`). A failed check is logged, never a failed export.
+#[cfg(all(feature = "edit", feature = "raw"))]
+fn export_engine2(original: &Path, photo_id: i64, edit_json: &str) -> Result<image::DynamicImage, String> {
+    use crate::plugins::edit::{parity, render_image_opts, RenderOpts, RenderSource};
+    let budget = crate::develop::cache::DEFAULT_BUDGET_GB * 1024 * 1024 * 1024;
+    let (token, image) = crate::develop::offline::working_image_for(photo_id, original, budget)?;
+    let out = render_image_opts(
+        RenderSource::Working { token: token.clone(), image: image.clone() },
+        edit_json,
+        0,
+        RenderOpts::default(),
+    )?;
+    match parity::fit_difference(&token, &image, edit_json, &out) {
+        Ok(d) => parity::record(d),
+        Err(e) => eprintln!("export: parity check skipped for photo {photo_id}: {e}"),
+    }
+    Ok(out)
 }
 
 /// Downscale `img` to `target_width`, preserving aspect; never upscales.
@@ -897,7 +915,7 @@ mod tone_match_tests {
         // decodes the JPEG we just wrote, then the same `render_image` runs, so any tonal
         // divergence between the two callers would show up here.
         let source = write_temp_jpeg("tone-match", &jpeg);
-        let export = render_export_jpeg(source.path(), edit_json, true, None).unwrap();
+        let export = render_export_jpeg(source.path(), 0, edit_json, true, None).unwrap();
 
         let diff = mean_abs_diff(&preview, &export);
         assert!(
@@ -957,7 +975,7 @@ mod tone_match_tests {
         let edit = r#"{"crop":{"x":0.0,"y":0.0,"w":0.5,"h":0.6,"aspect":"1:1"}}"#;
         let preview = crate::plugins::edit::render_jpeg(&jpeg, edit, 0).unwrap();
         let source = write_temp_jpeg("geometry-match", &jpeg);
-        let export = render_export_jpeg(source.path(), edit, true, None).unwrap();
+        let export = render_export_jpeg(source.path(), 0, edit, true, None).unwrap();
         let dp = image::load_from_memory(&preview).unwrap().dimensions();
         let de = image::load_from_memory(&export).unwrap().dimensions();
         assert_eq!(dp, de, "preview {dp:?} and export {de:?} geometry must match");
@@ -1068,5 +1086,30 @@ mod preview_tone_match_tests {
             (md - mp).abs() / mp < 0.05,
             "decode mean {md:.4} deviates >5% from preview mean {mp:.4}"
         );
+    }
+}
+
+/// An engine-2 export on a real RAW (`CHAIRPHOTO_RAW_FIXTURE`): the full working image
+/// through the view's pipeline — full size, no tone matching — checked against the view
+/// and tallied as not differing.
+#[cfg(all(test, feature = "edit", feature = "raw"))]
+mod engine2_export_tests {
+    #[test]
+    fn a_raw_engine_export_is_full_size_and_equals_the_view() {
+        let Ok(fixture) = std::env::var("CHAIRPHOTO_RAW_FIXTURE") else {
+            println!("SKIPPED: a_raw_engine_export_is_full_size_and_equals_the_view — set CHAIRPHOTO_RAW_FIXTURE");
+            return;
+        };
+        let path = std::path::Path::new(&fixture);
+        let json = r#"{"engine":2,"display":"camera.2","cameraEv":-0.3,"tone":{"contrast":0.2}}"#;
+        let _ = crate::plugins::edit::parity::take();
+        let img = super::decode_export_source(path, 424242, json, true).unwrap();
+        let (token, image) = crate::develop::offline::working_image_for(424242, path, 0).unwrap();
+        let _ = token;
+        assert_eq!((img.width(), img.height()), (image.width, image.height), "full size");
+        let tally = crate::plugins::edit::parity::take();
+        println!("export {}x{}; parity tally {tally:?}", img.width(), img.height());
+        assert_eq!(tally, crate::plugins::edit::parity::ParityTally { checked: 1, differing: 0 });
+        crate::develop::offline::clear();
     }
 }

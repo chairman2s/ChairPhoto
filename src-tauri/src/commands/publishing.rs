@@ -281,6 +281,7 @@ pub(super) async fn render_export_jpeg(
     })
     .await
     .map_err(|e| e.to_string())??;
+    super::export::record_export_parity(&app.state::<AppState>());
     Ok(RenderedUpload { _dir: dir, path: out })
 }
 

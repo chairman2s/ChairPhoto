@@ -141,7 +141,19 @@
   screen: proofs and duel on the RAW. Not seen on screen: the pop-out loupe and the
   clipping layer (the agent's monitor was switched away when the loupe opened) — covered by
   tests only.
-- [ ] Slice 6 — export is the view (tone match gone for engine 2; exact parity)
+- [x] Slice 6 — export is the view (2026-09-24). An engine-2 export loads the working image
+  through `develop::offline` (the session's, the `.rawf` cache, or the decoder — it had
+  decoded afresh each time) and renders it with `render_image_opts` at full size; no tone
+  match on that path. Exact equality at 100 % is locked on four records (tone, camera
+  match, geometry + grain + vignette, B&W + zones). The in-app check at Fit
+  (`plugins::edit::parity`) tallies every engine-2 export into `metrics.exportParity`,
+  shown in Preferences. Its tolerance was measured, not assumed: resampling order alone
+  gives 0.07–1.32 levels on the seven ARWs, 1.79–2.67 with grain, 3.60–5.28 on the
+  detailed DNG (linear-light averaging only moved it), so the bar is 6 — it catches an
+  export from another source or pipeline (8–60 levels), not subtle drift; exactness is the
+  100 % test's job. On a real A7R VI frame the export came out 6656×9984 and the tally
+  read 1 checked, 0 differing. Not seen on screen: the Export dialog run (monitor
+  unavailable).
 - [ ] Slice 7 — engine-1 versions kept honest; fork into the new engine
 - [ ] Slice 8 — the swap: `develop.rawEngine` default on, docs, licensing
 - [ ] Slice 9 — Kelvin white balance (first follow-on)

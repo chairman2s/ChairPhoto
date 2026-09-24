@@ -575,8 +575,30 @@ export function parseCacheGb(v: string | null | undefined): number {
   return Number.isFinite(n) && n >= 0 ? n : DEFAULT_DECODE_CACHE_GB;
 }
 
+/** The backend's "export equals view" total (docs/plans/raw-foundation, the success
+ *  metric): every RAW-engine export is checked against the Develop view and counted. */
+const EXPORT_PARITY_KEY = "metrics.exportParity";
+
+/** The metric in words, or null before any RAW-engine export was checked. */
+export function formatExportParity(v: string | null | undefined): string | null {
+  let t: { checked?: number; differing?: number };
+  try {
+    t = JSON.parse(v ?? "") as { checked?: number; differing?: number };
+  } catch {
+    return null;
+  }
+  const checked = t.checked ?? 0;
+  if (!(checked > 0)) return null;
+  const differing = t.differing ?? 0;
+  const noun = checked === 1 ? "export" : "exports";
+  return differing === 0
+    ? `What you see is what you export: ${checked} RAW ${noun} checked, none differed from the view.`
+    : `What you see is what you export: ${checked} RAW ${noun} checked, ${differing} differed from the view.`;
+}
+
 /** RAW engine settings: the decode cache's size, its current use, and neighbour preload. */
 function RawCacheSettings() {
+  const [parity, setParity] = useState<string | null>(null);
   const [gb, setGb] = useState<string>("");
   const [preload, setPreload] = useState<boolean | null>(null);
   const [usage, setUsage] = useState<number | null>(null);
@@ -593,6 +615,9 @@ function RawCacheSettings() {
     getSetting(PRELOAD_KEY)
       .then((v) => setPreload(v !== "0"))
       .catch(() => setPreload(true));
+    getSetting(EXPORT_PARITY_KEY)
+      .then((v) => setParity(formatExportParity(v)))
+      .catch(() => setParity(null));
     refreshUsage();
   }, []);
   const saveGb = async () => {
@@ -656,6 +681,11 @@ function RawCacheSettings() {
         />
         Prepare the next and previous photo in the background
       </label>
+      {parity && (
+        <div className="modal-sub" style={{ marginTop: 6 }}>
+          {parity}
+        </div>
+      )}
     </div>
   );
 }

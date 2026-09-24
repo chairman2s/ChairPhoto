@@ -228,6 +228,34 @@ mod tests {
         assert_eq!(a, b, "no slider moves the sensor's clipping");
     }
 
+    /// With a real RAW (`CHAIRPHOTO_RAW_FIXTURE`): how far an engine-2 export sits from the
+    /// view at Fit — resampling order alone — for several records. Sets
+    /// `parity::PARITY_TOLERANCE`.
+    #[test]
+    fn fixture_export_matches_the_view_at_fit() {
+        let Ok(fixture) = std::env::var("CHAIRPHOTO_RAW_FIXTURE") else {
+            println!("SKIPPED: fixture_export_matches_the_view_at_fit — set CHAIRPHOTO_RAW_FIXTURE");
+            return;
+        };
+        use crate::plugins::edit::{parity, render_image_opts, RenderOpts, RenderSource, SourceToken};
+        let d = crate::raw::decode_linear(std::path::Path::new(&fixture), &std::sync::atomic::AtomicBool::new(false)).unwrap();
+        let image = Arc::new(working_image_from(d));
+        for (i, json) in [
+            r#"{"engine":2,"display":"camera.2"}"#,
+            r#"{"engine":2,"display":"camera.2","tone":{"ev":0.7,"contrast":0.4,"shadows":0.3}}"#,
+            r#"{"engine":2,"display":"camera.2","straighten":2,"crop":{"x":0.1,"y":0.1,"w":0.7,"h":0.8},"grain":{"amount":0.5,"size":1.2},"vignette":-0.4}"#,
+        ]
+        .iter()
+        .enumerate()
+        {
+            let token = SourceToken::Working { photo_id: 1, generation: 500 + i as u64 };
+            let out = render_image_opts(RenderSource::Working { token: token.clone(), image: image.clone() }, json, 0, RenderOpts::default()).unwrap();
+            let d = parity::fit_difference(&token, &image, json, &out).unwrap();
+            println!("parity: record {i} mean |Δ| at Fit {d:.2} (tolerance {})", parity::PARITY_TOLERANCE);
+            assert!(d <= parity::PARITY_TOLERANCE, "resampling alone should stay inside the tolerance");
+        }
+    }
+
     fn img(w: u32, h: u32) -> Arc<WorkingImage> {
         test_image(w, h)
     }

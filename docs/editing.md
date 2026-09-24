@@ -324,8 +324,16 @@ Darkroom) until the swap slice makes it the default.
   `"relative"` (warmer/cooler than as-shot, the same gentle gains as engine 1) or
   `"kelvin"` (a scene light; parsed now, rendered in the Kelvin slice — refused with a clear
   error until then, never silently treated as relative).
-- **Export of an engine-2 version** decodes the same working image and renders it through
-  the same pipeline at full size; the tone-matching step belongs to engine 1 only.
+- **Export of an engine-2 version** renders the same working image the view does — the
+  Develop session's, or one bounded load from the `.rawf` cache or the decoder
+  (`develop::offline`) — through the same pipeline at full size; the tone-matching step
+  belongs to engine 1 only. At 100 % the export equals the view byte for byte
+  (`export_at_full_size_is_the_view_at_full_size`). Every engine-2 export is also checked
+  against the view at Fit (`plugins::edit::parity`: the view's 512 px render against the
+  export scaled to it, mean |Δ| ≤ 6 levels — above what resampling order alone produces on
+  a detailed frame, below any other-source or other-pipeline mismatch) and tallied per
+  catalog in `metrics.exportParity`; Preferences › Darkroom shows the count — the product's
+  success metric, "0 exports that differ from the view".
 
 ### Measuring the render path
 

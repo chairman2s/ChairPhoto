@@ -492,13 +492,23 @@ async fn set_version_edit_in_state(
     version_id: i64,
     edit_json: &str,
 ) -> Result<(), String> {
+    write_version_then_refresh_monochrome(state, version_id, |c| c.set_version_edit(version_id, edit_json)).await
+}
+
+/// Any write that changes a version's settings, followed by the monochrome refresh every
+/// such write owes (H6): a plain save, a history commit, a step back or forward. Returns
+/// what `write` returned.
+#[cfg(feature = "edit")]
+async fn write_version_then_refresh_monochrome<T>(
+    state: &AppState,
+    version_id: i64,
+    write: impl FnOnce(&crate::catalog::Catalog) -> crate::catalog::Result<T>,
+) -> Result<T, String> {
     // Save + gather everything the monochrome refresh needs under one brief lock.
-    let (photo_id, any_bw, stored_gray, candidates) = {
+    let (written, photo_id, any_bw, stored_gray, candidates) = {
         let guard = state.catalog.lock().map_err(|e| e.to_string())?;
         let catalog = guard.as_ref().ok_or("No catalog is open")?;
-        catalog
-            .set_version_edit(version_id, edit_json)
-            .map_err(|e| e.to_string())?;
+        let written = write(catalog).map_err(|e| e.to_string())?;
         let photo_id = catalog.version_photo_id(version_id).map_err(|e| e.to_string())?;
         let any_bw = catalog
             .list_versions(photo_id)
@@ -507,13 +517,13 @@ async fn set_version_edit_in_state(
             .any(|v| crate::plugins::edit::is_bw(&v.edit_json));
         let stored = catalog.is_grayscale(photo_id).map_err(|e| e.to_string())?;
         let cands = catalog.photo_path_candidates(photo_id).map_err(|e| e.to_string())?;
-        (photo_id, any_bw, stored, cands)
+        (written, photo_id, any_bw, stored, cands)
     };
     let gray = if any_bw {
         true
     } else if !stored_gray {
         // Not B&W by edit and already not flagged — nothing can change.
-        return Ok(());
+        return Ok(written);
     } else {
         // The flag was set but no version is B&W anymore: fall back to the
         // pixel-derived signal (the photo itself may still be monochrome).
@@ -539,7 +549,7 @@ async fn set_version_edit_in_state(
         .map_err(|e| e.to_string())?;
         match outcome {
             Some(g) => g,
-            None => return Ok(()),
+            None => return Ok(written),
         }
     };
     if gray != stored_gray {
@@ -548,7 +558,56 @@ async fn set_version_edit_in_state(
         catalog.set_grayscale(photo_id, gray).map_err(|e| e.to_string())?;
         catalog.apply_auto_tags().map_err(|e| e.to_string())?;
     }
-    Ok(())
+    Ok(written)
+}
+
+/// A version's edit history (the Darkroom's History panel).
+#[tauri::command(async)]
+pub fn version_history(state: State<'_, AppState>, version_id: i64) -> Result<crate::catalog::VersionHistory, String> {
+    with_catalog(&state, |c| c.version_history(version_id))
+}
+
+/// Save a version's settings as a history step (the Darkroom's autosave). `amend`
+/// replaces the current step — the same control still moving. Settings only.
+#[tauri::command]
+pub async fn commit_version_edit(
+    app: AppHandle,
+    version_id: i64,
+    edit_json: String,
+    label: String,
+    amend: bool,
+) -> Result<crate::catalog::VersionHistory, String> {
+    let state = app.state::<AppState>();
+    #[cfg(not(feature = "edit"))]
+    {
+        with_catalog(&state, |c| c.commit_version_edit(version_id, &edit_json, &label, amend))
+    }
+    #[cfg(feature = "edit")]
+    {
+        write_version_then_refresh_monochrome(&state, version_id, |c| {
+            c.commit_version_edit(version_id, &edit_json, &label, amend)
+        })
+        .await
+    }
+}
+
+/// Step the version to history step `seq` (undo, redo, or a click in the History panel).
+/// Returns the step's settings and the history.
+#[tauri::command]
+pub async fn goto_version_step(
+    app: AppHandle,
+    version_id: i64,
+    seq: i64,
+) -> Result<(String, crate::catalog::VersionHistory), String> {
+    let state = app.state::<AppState>();
+    #[cfg(not(feature = "edit"))]
+    {
+        with_catalog(&state, |c| c.goto_version_step(version_id, seq))
+    }
+    #[cfg(feature = "edit")]
+    {
+        write_version_then_refresh_monochrome(&state, version_id, |c| c.goto_version_step(version_id, seq)).await
+    }
 }
 
 #[tauri::command(async)]
@@ -664,6 +723,39 @@ mod tests {
             ))
             .unwrap();
         std::fs::write(path, bytes.into_inner()).unwrap();
+    }
+
+    /// A history commit is a settings write like any other: committing a B&W develop marks
+    /// the photo monochrome and tags it, and stepping back to colour — the original still
+    /// reachable and decoding as colour — clears both. Through the same refresh as a save.
+    #[test]
+    fn history_commits_and_steps_refresh_the_monochrome_flag() {
+        let (catalog, _dir, root) = temp_catalog("history-bw");
+        let file = root.join("c.jpg");
+        write_colour_jpeg(&file);
+        let id = catalog.upsert_photo(&file, None, 1, 1).unwrap().id;
+        let v = catalog.create_version(id, "V1").unwrap();
+        let state = state_with(catalog, VolumeHealth::with_ttl(Duration::MAX));
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let tagged = |state: &AppState| {
+            let guard = state.catalog.lock().unwrap();
+            let c = guard.as_ref().unwrap();
+            (
+                c.is_grayscale(id).unwrap(),
+                c.get_photo_tags(id).unwrap().iter().any(|t| t.full_path == "Treatment/Black & White"),
+            )
+        };
+
+        let bw = r#"{"bw":{"enabled":true,"r":0.3,"g":0.6,"b":0.1}}"#;
+        let h = rt
+            .block_on(write_version_then_refresh_monochrome(&state, v, |c| c.commit_version_edit(v, bw, "B&W Neutral", false)))
+            .unwrap();
+        assert_eq!(h.head, Some(1));
+        assert_eq!(tagged(&state), (true, true), "a B&W commit marks and tags the photo");
+
+        rt.block_on(write_version_then_refresh_monochrome(&state, v, |c| c.goto_version_step(v, 0)))
+            .unwrap();
+        assert_eq!(tagged(&state), (false, false), "stepping back to colour clears both");
     }
 
     /// **Offline original.** The photo's only copy sits on a volume renamed away (a

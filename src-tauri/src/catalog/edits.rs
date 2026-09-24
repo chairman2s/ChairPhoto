@@ -12,8 +12,24 @@
 //! edits can ride along later with the (currently deferred) scan-time sidecar writes.
 
 use super::{
-    sqlite_param_placeholders, Catalog, CatalogError, PhotoVersion, Result, SQLITE_PARAM_CHUNK,
+    sqlite_param_placeholders, Catalog, CatalogError, HistoryStep, PhotoVersion, Result,
+    VersionHistory, SQLITE_PARAM_CHUNK,
 };
+
+/// Steps kept per version; the oldest go first. Settings are small (a few hundred bytes),
+/// so this bounds rows, not space.
+pub const HISTORY_CAP: i64 = 200;
+
+/// The label of step 0: the settings the version had when its history began.
+pub const HISTORY_BASELINE_LABEL: &str = "Before";
+
+fn validated_edit_json(edit_json: &str) -> Result<&str> {
+    let trimmed = edit_json.trim();
+    let value = if trimmed.is_empty() { "{}" } else { trimmed };
+    serde_json::from_str::<serde_json::Value>(value)
+        .map_err(|e| CatalogError::Validation(format!("edit record is not valid JSON: {e}")))?;
+    Ok(value)
+}
 use rusqlite::{params, OptionalExtension};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -161,6 +177,150 @@ impl Catalog {
             params![value, now(), version_id],
         )?;
         Ok(())
+    }
+
+    /// A version's edit history: steps oldest first, and the current one.
+    pub fn version_history(&self, version_id: i64) -> Result<VersionHistory> {
+        let mut stmt = self.conn.prepare(
+            "SELECT seq, label, created_at FROM photo_version_history
+             WHERE version_id = ?1 ORDER BY seq",
+        )?;
+        let steps = stmt
+            .query_map(params![version_id], |r| {
+                Ok(HistoryStep { seq: r.get(0)?, label: r.get(1)?, created_at: r.get(2)? })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let head = self
+            .conn
+            .query_row(
+                "SELECT seq FROM photo_version_history_head WHERE version_id = ?1",
+                params![version_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(VersionHistory { version_id, steps, head })
+    }
+
+    /// Save `edit_json` as the version's settings and record it as a history step labelled
+    /// `label`, in one transaction. The first change seeds step 0 ("Before") with the
+    /// settings the version had, so it can be undone. Steps after the current one are
+    /// dropped first (a change after stepping back replaces them). `amend` replaces the
+    /// current step instead of adding one — the same control still moving — but never the
+    /// baseline, and only at the tip. Identical settings are not a step. Keeps at most
+    /// [`HISTORY_CAP`] steps. Returns the history as it now stands.
+    pub fn commit_version_edit(
+        &self,
+        version_id: i64,
+        edit_json: &str,
+        label: &str,
+        amend: bool,
+    ) -> Result<VersionHistory> {
+        let value = validated_edit_json(edit_json)?;
+        let label = label.trim();
+        let label = if label.is_empty() { "Edit" } else { label };
+        let now = now();
+        let tx = self.conn.unchecked_transaction()?;
+        let current: String = tx
+            .query_row(
+                "SELECT edit_json FROM photo_versions WHERE id = ?1",
+                params![version_id],
+                |r| r.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| CatalogError::Validation("version not found".into()))?;
+        let head: Option<i64> = tx
+            .query_row(
+                "SELECT seq FROM photo_version_history_head WHERE version_id = ?1",
+                params![version_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let head = match head {
+            Some(h) => h,
+            None => {
+                tx.execute(
+                    "INSERT INTO photo_version_history(version_id, seq, label, edit_json, created_at)
+                     VALUES(?1, 0, ?2, ?3, ?4)",
+                    params![version_id, HISTORY_BASELINE_LABEL, current, now],
+                )?;
+                0
+            }
+        };
+        let head_json: String = tx.query_row(
+            "SELECT edit_json FROM photo_version_history WHERE version_id = ?1 AND seq = ?2",
+            params![version_id, head],
+            |r| r.get(0),
+        )?;
+        let new_head = if head_json == value {
+            head // no change: not a step
+        } else {
+            let tip: i64 = tx.query_row(
+                "SELECT MAX(seq) FROM photo_version_history WHERE version_id = ?1",
+                params![version_id],
+                |r| r.get(0),
+            )?;
+            if amend && head > 0 && head == tip {
+                tx.execute(
+                    "UPDATE photo_version_history SET label = ?1, edit_json = ?2, created_at = ?3
+                     WHERE version_id = ?4 AND seq = ?5",
+                    params![label, value, now, version_id, head],
+                )?;
+                head
+            } else {
+                tx.execute(
+                    "DELETE FROM photo_version_history WHERE version_id = ?1 AND seq > ?2",
+                    params![version_id, head],
+                )?;
+                tx.execute(
+                    "INSERT INTO photo_version_history(version_id, seq, label, edit_json, created_at)
+                     VALUES(?1, ?2, ?3, ?4, ?5)",
+                    params![version_id, head + 1, label, value, now],
+                )?;
+                tx.execute(
+                    "DELETE FROM photo_version_history WHERE version_id = ?1 AND seq <= ?2",
+                    params![version_id, head + 1 - HISTORY_CAP],
+                )?;
+                head + 1
+            }
+        };
+        tx.execute(
+            "INSERT INTO photo_version_history_head(version_id, seq) VALUES(?1, ?2)
+             ON CONFLICT(version_id) DO UPDATE SET seq = excluded.seq",
+            params![version_id, new_head],
+        )?;
+        if current != value {
+            tx.execute(
+                "UPDATE photo_versions SET edit_json = ?1, updated_at = ?2 WHERE id = ?3",
+                params![value, now, version_id],
+            )?;
+        }
+        tx.commit()?;
+        self.version_history(version_id)
+    }
+
+    /// Make step `seq` current: the version's settings become that step's. Nothing is
+    /// deleted — the steps after it stay until the next change replaces them. Returns the
+    /// step's settings and the history.
+    pub fn goto_version_step(&self, version_id: i64, seq: i64) -> Result<(String, VersionHistory)> {
+        let tx = self.conn.unchecked_transaction()?;
+        let json: String = tx
+            .query_row(
+                "SELECT edit_json FROM photo_version_history WHERE version_id = ?1 AND seq = ?2",
+                params![version_id, seq],
+                |r| r.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| CatalogError::Validation("no such history step".into()))?;
+        tx.execute(
+            "UPDATE photo_version_history_head SET seq = ?1 WHERE version_id = ?2",
+            params![seq, version_id],
+        )?;
+        tx.execute(
+            "UPDATE photo_versions SET edit_json = ?1, updated_at = ?2 WHERE id = ?3",
+            params![json, now(), version_id],
+        )?;
+        tx.commit()?;
+        Ok((json, self.version_history(version_id)?))
     }
 
     pub fn delete_version(&self, version_id: i64) -> Result<()> {

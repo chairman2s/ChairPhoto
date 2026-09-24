@@ -354,6 +354,29 @@ CREATE TABLE IF NOT EXISTS photo_versions (
 );
 CREATE INDEX IF NOT EXISTS idx_photo_versions_photo ON photo_versions(photo_id);
 
+-- Edit history per version (the Darkroom autosaves every change; docs/editing.md). One row
+-- per step: a snapshot of the version's settings after that change, with a short label
+-- ("Exposure +0.50"). `seq` counts up from 0 — step 0 is "Before", the settings the
+-- version had when its history began, so the first change can always be undone. The head
+-- table says which step is current: stepping back moves the head without deleting
+-- anything, and the next change drops the steps after it (a list, not a tree). Settings
+-- only, never pixels. Local to this catalog: catalog merge and bundle export do not carry
+-- it (a version arriving from elsewhere starts its history fresh). Additive and
+-- idempotent, so no SCHEMA_VERSION bump: SCHEMA_SQL runs on every open.
+CREATE TABLE IF NOT EXISTS photo_version_history (
+    id         INTEGER PRIMARY KEY,
+    version_id INTEGER NOT NULL REFERENCES photo_versions(id) ON DELETE CASCADE,
+    seq        INTEGER NOT NULL,
+    label      TEXT NOT NULL,
+    edit_json  TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    UNIQUE(version_id, seq)
+);
+CREATE TABLE IF NOT EXISTS photo_version_history_head (
+    version_id INTEGER PRIMARY KEY REFERENCES photo_versions(id) ON DELETE CASCADE,
+    seq        INTEGER NOT NULL
+);
+
 -- Where a photo has been published (Instagram, Flickr, SmugMug, …) and WHICH version
 -- went out. version_id NULL = the Original (unedited base); version_name is a snapshot
 -- so the record still reads correctly after a version is deleted (ON DELETE SET NULL).

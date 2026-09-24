@@ -11,6 +11,7 @@ mod autotags;
 mod batches;
 pub mod culling;
 mod edits;
+pub use edits::{HISTORY_BASELINE_LABEL, HISTORY_CAP};
 mod facets;
 mod groups;
 mod identity;
@@ -47,10 +48,10 @@ pub use lifecycle::{
 };
 pub use merge::MergeSummary;
 pub use models::{
-    Album, BurstInput, ExportKeywords, ImportBatch, IptcFields, LocationRole, MetadataEntry,
+    Album, BurstInput, ExportKeywords, HistoryStep, ImportBatch, IptcFields, LocationRole, MetadataEntry,
     PendingOperation, Photo, PhotoLocation, PhotoVersion, PickState, PromotedMetadata,
-    Publication, StorageStatus, SmartAlbum, Tag, TagGroup, TagTerm, TagWithCount, Volume,
-    VolumeKind,
+    Publication, StorageStatus, SmartAlbum, Tag, TagGroup, TagTerm, TagWithCount, VersionHistory,
+    Volume, VolumeKind,
 };
 pub use query::{CullingFilter, PhotoPage, PhotoQuery, PhotoSort, PhotoWindow, StorageTier};
 pub use smart_albums::rule_to_sql;

@@ -189,6 +189,26 @@ pub struct PhotoVersion {
     pub position: i64,
 }
 
+/// One step of a version's edit history (see `photo_version_history`).
+#[derive(Debug, Clone, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct HistoryStep {
+    pub seq: i64,
+    pub label: String,
+    /// Seconds since the epoch.
+    pub created_at: i64,
+}
+
+/// A version's history: its steps, oldest first, and which one is current (`None` while
+/// the version has no history yet).
+#[derive(Debug, Clone, Serialize, PartialEq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct VersionHistory {
+    pub version_id: i64,
+    pub steps: Vec<HistoryStep>,
+    pub head: Option<i64>,
+}
+
 /// A record that a photo (in a specific version) was published to a platform. `platform`
 /// is the marker declared by the publishing module (e.g. "instagram"); `version_id` is
 /// `None` for the Original, and `version_name` is a snapshot kept so the record survives

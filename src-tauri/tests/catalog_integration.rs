@@ -1706,6 +1706,90 @@ fn photo_versions_crud_and_counts() {
     assert!(catalog.version_counts(&[photo]).unwrap() == vec![(photo, 2)]);
 }
 
+/// The Darkroom's edit history (docs/editing.md): every committed change is a step; the
+/// first change seeds a "Before" step with the settings the version had; stepping back
+/// moves the head and restores those settings; a change after stepping back replaces the
+/// later steps; the same control still moving amends the tip.
+#[test]
+fn version_history_records_steps_and_steps_back() {
+    let (catalog, root) = temp_catalog("version-history");
+    let path = root.join("h.arw");
+    std::fs::write(&path, b"x").unwrap();
+    let photo = catalog.upsert_photo(&path, None, 1, 1).unwrap().id;
+    let v = catalog.create_version(photo, "Version 1").unwrap();
+    catalog.set_version_edit(v, r#"{"tone":{"ev":0.1}}"#).unwrap();
+    let edit = |v: i64| catalog.get_version(v).unwrap().unwrap().edit_json;
+    let labels = |h: &chairphoto_lib::catalog::VersionHistory| h.steps.iter().map(|s| s.label.clone()).collect::<Vec<_>>();
+
+    // No history until the first commit.
+    let h = catalog.version_history(v).unwrap();
+    assert!(h.steps.is_empty() && h.head.is_none());
+
+    // First change: "Before" (what the version had) + the change, head on the change.
+    let h = catalog.commit_version_edit(v, r#"{"tone":{"ev":0.5}}"#, "Exposure +0.50", false).unwrap();
+    assert_eq!(labels(&h), vec!["Before", "Exposure +0.50"]);
+    assert_eq!(h.head, Some(1));
+    assert_eq!(edit(v), r#"{"tone":{"ev":0.5}}"#, "the version holds the latest settings");
+
+    // Same settings again: not a step. Same control still moving: amends the tip.
+    let h = catalog.commit_version_edit(v, r#"{"tone":{"ev":0.5}}"#, "Exposure +0.50", false).unwrap();
+    assert_eq!(h.steps.len(), 2);
+    let h = catalog.commit_version_edit(v, r#"{"tone":{"ev":0.7}}"#, "Exposure +0.70", true).unwrap();
+    assert_eq!(labels(&h), vec!["Before", "Exposure +0.70"]);
+
+    // Another control: a new step.
+    let h = catalog.commit_version_edit(v, r#"{"tone":{"ev":0.7,"contrast":0.2}}"#, "Contrast +0.20", false).unwrap();
+    assert_eq!(h.head, Some(2));
+
+    // Step back to before the contrast change: settings restored, nothing deleted yet.
+    let (json, h) = catalog.goto_version_step(v, 1).unwrap();
+    assert_eq!(json, r#"{"tone":{"ev":0.7}}"#);
+    assert_eq!(edit(v), json);
+    assert_eq!((h.head, h.steps.len()), (Some(1), 3), "redo is still possible");
+    // …and all the way back to how it was before the Darkroom touched it.
+    let (json, _) = catalog.goto_version_step(v, 0).unwrap();
+    assert_eq!(json, r#"{"tone":{"ev":0.1}}"#);
+    catalog.goto_version_step(v, 1).unwrap();
+
+    // Amend never rewrites a step that is not the tip: this becomes a new step and the
+    // later one ("Contrast") is replaced.
+    let h = catalog.commit_version_edit(v, r#"{"tone":{"ev":0.7},"vignette":-0.3}"#, "Vignette", true).unwrap();
+    assert_eq!(labels(&h), vec!["Before", "Exposure +0.70", "Vignette"]);
+    assert_eq!(h.head, Some(2));
+
+    // Amend never rewrites the baseline either.
+    catalog.goto_version_step(v, 0).unwrap();
+    let h = catalog.commit_version_edit(v, r#"{"fade":0.2}"#, "Fade", true).unwrap();
+    assert_eq!(labels(&h), vec!["Before", "Fade"]);
+
+    // Unknown step and invalid JSON are refused; a missing version too.
+    assert!(catalog.goto_version_step(v, 99).is_err());
+    assert!(catalog.commit_version_edit(v, "not json", "x", false).is_err());
+    assert!(catalog.commit_version_edit(987_654, "{}", "x", false).is_err());
+
+    // Deleting the version takes its history with it.
+    catalog.delete_version(v).unwrap();
+    assert!(catalog.version_history(v).unwrap().steps.is_empty());
+}
+
+/// History is bounded: the oldest steps go first, the head stays on the newest.
+#[test]
+fn version_history_keeps_at_most_the_cap() {
+    let (catalog, root) = temp_catalog("version-history-cap");
+    let path = root.join("c.arw");
+    std::fs::write(&path, b"x").unwrap();
+    let photo = catalog.upsert_photo(&path, None, 1, 1).unwrap().id;
+    let v = catalog.create_version(photo, "V").unwrap();
+    let cap = chairphoto_lib::catalog::HISTORY_CAP;
+    for i in 0..(cap + 25) {
+        catalog.commit_version_edit(v, &format!(r#"{{"fade":{}}}"#, i as f64 / 1000.0 + 0.001), &format!("step {i}"), false).unwrap();
+    }
+    let h = catalog.version_history(v).unwrap();
+    assert_eq!(h.steps.len() as i64, cap);
+    assert_eq!(h.head, h.steps.last().map(|s| s.seq));
+    assert_eq!(h.steps.last().unwrap().label, format!("step {}", cap + 24));
+}
+
 /// The grid's version badge rides the photo row (issue #10) — a listing needs no per-id
 /// side query to draw it. Every query that builds a `Photo` must carry the same number.
 #[test]

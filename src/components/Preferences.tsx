@@ -716,11 +716,9 @@ function RawCacheSettings() {
   );
 }
 
-/** Darkroom early-preview toggle (docs/plans/darkroom): swaps the Develop surface for
- *  the in-progress Darkroom. Read when Develop opens (DevelopSurface), so a change
- *  applies on the next open. Removed at slice 8, when the Darkroom becomes Develop. */
+/** The Darkroom — the Develop surface (docs/plans/darkroom): what it renders from, the
+ *  RAW decode cache, white balance for new edits, and the dev timing tools. */
 function DarkroomSection() {
-  const [on, setOn] = useState<boolean | null>(null);
   // Render-timing log (GPU-smoothness work, docs/plans/darkroom/00-status.md): stamps
   // every stage render in the console and unlocks the WebGL probe below. Dev-only.
   const [timing, setTiming] = useState<boolean | null>(null);
@@ -728,9 +726,6 @@ function DarkroomSection() {
   const [lastSpike, setLastSpike] = useState("");
   const [lastSummary, setLastSummary] = useState("");
   useEffect(() => {
-    getSetting("editor.darkroom")
-      .then((v) => setOn(v === "1"))
-      .catch(() => setOn(false));
     getSetting(RENDER_TIMING_KEY)
       .then((v) => setTiming(v === "1"))
       .catch(() => setTiming(false));
@@ -741,15 +736,6 @@ function DarkroomSection() {
       .then((v) => setLastSummary(v ?? ""))
       .catch(() => {});
   }, []);
-  const toggle = async () => {
-    const next = !(on ?? false);
-    setOn(next);
-    try {
-      await setSetting("editor.darkroom", next ? "1" : "0");
-    } catch {
-      setOn(!next); // write failed — reflect reality
-    }
-  };
   const toggleTiming = async () => {
     const next = !(timing ?? false);
     setTiming(next);
@@ -761,21 +747,7 @@ function DarkroomSection() {
   };
   return (
     <div className="prefs-section">
-      <h3 style={{ marginTop: 18 }}>Darkroom (early preview)</h3>
-      <div className="modal-sub">
-        Replace the Develop view with the in-progress Darkroom (develop by choosing:
-        proof sheets, duels, and the tone strip). Under construction — expect a bare
-        surface for now. Takes effect the next time Develop opens.
-      </div>
-      <label style={{ display: "flex", gap: 8, alignItems: "center", cursor: "pointer" }}>
-        <input
-          type="checkbox"
-          checked={on ?? false}
-          disabled={on === null}
-          onChange={toggle}
-        />
-        Use the Darkroom as the Develop surface
-      </label>
+      <h3 style={{ marginTop: 18 }}>Darkroom</h3>
       <div className="modal-sub" style={{ marginTop: 6 }}>
         The Darkroom develops the RAW itself — all the bits the sensor recorded, in linear
         light — and every slider, proof and print renders from that.

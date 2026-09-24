@@ -13,7 +13,15 @@
 - [x] Slice 5 — duel refinement (+ per-pane version forking) (2026-09-05; DuelDim narrowed to the four numeric dims — "look" rounds deferred with the learned auto-tone)
 - [x] Slice 6 — rail extraction from EditorView (no behaviour change) (2026-09-05; extracted into src/components/EditControls.tsx — EditStage/ToneRail/EffectsRail/GeometryRail; hands-on parity check of the classic Develop pending)
 - [x] Slice 7 — version shelf & save-as-new-version (2026-09-05; user re-steer: the Darkroom is a sandbox — never overwrites its starting version; Save banks the settings as a NEW version). **Reversed 2026-09-24 by the user:** the Darkroom autosaves every change into the active version with a per-version history (undo/redo, a History panel) — see docs/editing.md § History and autosave; "Save as version" became "+ New version" (fork).
-- [ ] Slice 8 — the swap: Darkroom becomes Develop
+- [x] Slice 8 — the swap: Darkroom becomes Develop (2026-09-24). `DevelopSurface` always
+  mounts the Darkroom; the `editor.darkroom` switch and its Preferences checkbox are gone,
+  and `EditorView.tsx` is deleted. Its histogram is replaced by the tone strip (user
+  decision 2026-09-04); its preset browser moved into the Darkroom rail and now renders
+  each card as an `edit://` URL from the Darkroom's source and engine (so on the RAW the
+  thumbnails are the RAW), applying a preset replaces tone and look and flattens the tone
+  strip, and saving is the bar's "☆ Save as preset" (look-only) — the browser keeps rename
+  and delete. `render_edit_batch` has no caller in the app now. `docs/editing.md` and the
+  basic editor's module description describe the Darkroom as Develop.
 
 ## Follow-on: GPU smoothness (branch `feature/darkroom-gpu`, plan 2026-09-06)
 
@@ -127,8 +135,8 @@ survey and plan live in the session plan file; the increments are:
   does not reopen the gate.
 
 Follow-ups recorded here, not done: `LoupeWindow` / `basicEditor` and the
-`render_edit_batch` consumers (`ProofSheet`, `DuelView`, `PresetBrowser`) still receive
-base64 data URLs; `EditorView` retires at slice 8.
+`render_edit_batch` consumers (`ProofSheet`, `DuelView`, `PresetBrowser`) received base64
+data URLs; all three load `edit://` URLs now, and `EditorView` retired at slice 8.
 
 ## Notes for a fresh session
 - Branch: `feature/darkroom` (cut from `feature/keeper-stats` at d935381 — the loupe-card

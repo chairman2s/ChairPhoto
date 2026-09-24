@@ -15,12 +15,14 @@ aliases:
 A non-destructive editor for crop, tone and film looks. Your original RAW or JPEG is never
 modified — that is a binding architecture invariant, not a policy this module chose.
 
-Editing arrives as a full-window **Develop** tab rather than a modal, following the darkroom
-metaphor: a version bar, crop with social aspect presets and Free (drag to move, resize from the
-corners, live pixel-size readout), composition overlays (none, thirds, phi grid, golden spiral —
-remembered in `editor.crop_overlay`), tone sliders for EV, contrast, highlights, shadows and
-white balance (double-click any slider to reset), a live proxy preview, and auto-save to the
-active version.
+Editing arrives as a full-window **Develop** tab rather than a modal: the **Darkroom**
+(docs/plans/darkroom — since its slice 8 the only Develop surface; the classic editor view
+is retired). A version bar, the tone strip (the histogram as a control), the proof sheet and
+duels, the preset browser, crop with social aspect presets and Free (drag to move, resize
+from the corners, live pixel-size readout), composition overlays (none, thirds, phi grid,
+golden spiral — remembered in `editor.crop_overlay`), tone sliders for EV, contrast,
+highlights, shadows and white balance in Kelvin or relative (double-click any slider to
+reset), a filmstrip, the pop-out loupe print, and autosave with history.
 
 A photo can carry **multiple versions** — several crops, or the same frame at different
 exposures — each independently editable and exportable.
@@ -218,9 +220,11 @@ parser + mtime cache in `plugins/edit/cube.rs`; LUT files managed via
 **Develop presets** (`src/modules/presets.ts`): built-in library of parameter recipes
 (monochrome filter styles, sepia/selenium, film stocks like Tri-X/Kodak Gold/Portra/
 Ektachrome/Kodachrome/Velvia) + user presets saved under the settings key
-`basic-editor.presets`. Presets are look-only — never crop/straighten. The preset browser
-(`src/components/PresetBrowser.tsx`) shows the current photo rendered per preset via one
-`render_edit_batch` call (proxy decoded once).
+`basic-editor.presets`. Presets are look-only — never crop/straighten. The Darkroom's preset
+browser (`src/components/PresetBrowser.tsx`) shows the current photo rendered per preset, each
+card an `edit://` render from the Darkroom's own source and engine; "☆ Save as preset" on
+the bar saves the current look (`lookOnly`), and the browser renames and deletes user
+presets.
 
 ## Aspect-ratio presets (social), as data
 
@@ -275,10 +279,10 @@ implemented — the crop fixes shape, resize would fix pixels.
   proxy or re-imported LUT must never show stale pixels. `s=<token>` names the working
   image, `k=1` asks for the sensor-clipping overlay instead of the render, and `b=1`
   renders the geometry only (perspective → straighten, no crop, no look) as lossless PNG.
-  The proof sheet, the duels and every engine-2 loupe render use these URLs too. The
-  `render_edit` / `render_edit_batch` commands still return base64 data URLs for their
-  remaining callers — an engine-1 version on the loupe, the preset browser and the legacy
-  Develop view — never for an engine-2 render.
+  The proof sheet, the duels, the preset browser and every engine-2 loupe render use these
+  URLs too. The `render_edit` command still returns a base64 data URL for its one remaining
+  caller — an engine-1 version on the loupe — and `render_edit_batch` has no caller in the
+  app (it stays a core command for modules); neither serves an engine-2 render.
 - **Loupe:** shows the active version's render when the module is enabled (`renderForLoupe`):
   an engine-2 version is the RAW through its pipeline at 2560 px, full size to zoom — from
   the Darkroom's own working image while it prints there, else from an offline load — and

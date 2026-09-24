@@ -4,8 +4,9 @@ import { renderForLoupe } from "../api";
 // The Basic Editor module (H5b): non-destructive crop + exposure/tone over photo
 // versions. Its backend render engine is the `edit` Cargo feature; if compiled out, the
 // host won't let the module enable. It registers the loupe **edit renderer** so a
-// selected version shows its edited result; the editor UI itself (the "Develop" main-window
-// view) opens from the view switcher or the Versions panel's Edit button. See docs/editing.md.
+// selected version shows its edited result; the editor UI itself (the Darkroom, the
+// "Develop" main-window view) opens from the view switcher or the Versions panel's Edit
+// button. See docs/editing.md.
 export const basicEditorModule: ChairPhotoModule = {
   id: "basic-editor",
   name: "Basic Editor",

@@ -60,6 +60,7 @@ import {
   ToneRail,
 } from "../EditControls";
 import { type KelvinContext, WB_SLIDER_KEY } from "./kelvin";
+import { PresetBrowser } from "../PresetBrowser";
 import { DuelView } from "./DuelView";
 import { ProofSheet } from "./ProofSheet";
 import { DUEL_LABELS, proofSpread, type DuelDim, type ProofCandidate } from "./spreads";
@@ -384,6 +385,25 @@ export function DarkroomView({
   const perspective = working.perspective ?? null;
 
   const onTone = (t: Tone) => setWorking((w) => ({ ...w, tone: t }));
+  // The preset browser: a preset replaces tone and look (a flat tone strip too — a fresh
+  // look deserves one, as on the proof sheet) and keeps the framing and engine fields.
+  const [presetsRev, setPresetsRev] = useState(0);
+  const applyPreset = (p: DevelopPreset) => {
+    const e = p.edit;
+    nextLabelRef.current = `Preset: ${p.name}`;
+    setWorking((w) => ({
+      ...w,
+      tone: { ...ZERO_TONE, ...e.tone, wb: { ...ZERO_TONE.wb, ...e.tone?.wb } },
+      ...ZERO_LOOK,
+      bw: e.bw,
+      split: e.split,
+      grain: e.grain,
+      fade: e.fade ?? 0,
+      vignette: e.vignette ?? 0,
+      lut: e.lut,
+      zones: undefined,
+    }));
+  };
   const onLook = (l: Look) =>
     setWorking((w) => ({
       ...w,
@@ -549,6 +569,7 @@ export function DarkroomView({
     try {
       await addUserPreset(name, workingRef.current);
       setPresets(await allPresets());
+      setPresetsRev((n) => n + 1);
       setPresetName(null);
       setNotice(`Saved preset “${name}”`);
       setTimeout(() => setNotice(""), 3000);
@@ -1087,6 +1108,13 @@ export function DarkroomView({
         <aside className="dk-rail">
           <HistoryPanel history={history} onGoto={(seq) => void gotoStep(seq)} />
           <ToneRail tone={tone} onTone={onTone} kelvin={kelvinCtx} />
+          <PresetBrowser
+            currentTone={tone}
+            currentLook={look}
+            renderUrl={(edit, maxEdge) => variantUrl(edit as VersionEdit, maxEdge)}
+            refreshKey={presetsRev}
+            onApply={applyPreset}
+          />
           <EffectsRail look={look} onLook={onLook} onError={setError} />
           <GeometryRail
             aspect={aspect}

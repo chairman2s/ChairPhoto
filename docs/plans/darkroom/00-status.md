@@ -118,6 +118,13 @@ survey and plan live in the session plan file; the increments are:
   a GPU. A stray, unmerged `wgpu` feasibility probe exists on `feature/darkroom-develop`
   (commit 65c7fe9, `src-tauri/src/bin/gpu_probe.rs`) from a parallel exploration; it was
   never integrated and this decision does not depend on it.
+  **Research (2026-09-24):** what such a backend needs — verified, cited, and checked
+  against the local spikes — is in `agent-notes/darkroom-research/15-gpu-backend-research.md`.
+  Headlines: bit-exact GPU/CPU parity is not obtainable through wgpu/WGSL (export stays
+  CPU; parity is a tolerance test); a preview-only backend needs no tiling; darktable's
+  VRAM formula gives ≈6.4 GB usable of 10 GB; readback, not kernel time, is the frame;
+  the fallback must be a real CPU path, not a software rasterizer (RapidRAW's gap). It
+  does not reopen the gate.
 
 Follow-ups recorded here, not done: `LoupeWindow` / `basicEditor` and the
 `render_edit_batch` consumers (`ProofSheet`, `DuelView`, `PresetBrowser`) still receive

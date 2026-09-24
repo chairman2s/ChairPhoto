@@ -6,7 +6,7 @@ pkgrel=2
 pkgdesc="Catalog-first photo organizer for large RAW collections"
 arch=('x86_64')
 url="https://github.com/chairman2s/ChairPhoto"
-license=('GPL-3.0-only')
+license=('GPL-3.0-only' 'LGPL-2.1-only')
 
 # Every direct library dependency is listed, per the packaging guidelines: several of these
 # would also arrive through gtk3 or webkit2gtk-4.1, but relying on a transitive edge breaks
@@ -171,6 +171,9 @@ package() {
   install -Dm755 "src-tauri/target/release/$pkgname" "$pkgdir/usr/bin/$pkgname"
   install -Dm644 "$srcdir/$pkgname.desktop" "$pkgdir/usr/share/applications/$pkgname.desktop"
   install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+  # The vendored LibRaw is compiled in under its LGPL-2.1 option (MODULE_LICENSING.md).
+  install -Dm644 src-tauri/vendor/LibRaw/COPYRIGHT "$pkgdir/usr/share/licenses/$pkgname/LibRaw-COPYRIGHT"
+  install -Dm644 src-tauri/vendor/LibRaw/LICENSE.LGPL "$pkgdir/usr/share/licenses/$pkgname/LibRaw-LICENSE.LGPL"
 
   install -Dm644 "src-tauri/icons/32x32.png" \
     "$pkgdir/usr/share/icons/hicolor/32x32/apps/$pkgname.png"

@@ -50,7 +50,14 @@ third-party services (the Flickr API, the Claude API) that nobody expects to be 
 ## Bundled third-party code
 
 ChairPhoto vendors **LibRaw** (`src-tauri/vendor/LibRaw`, a pinned git submodule) and
-compiles it into the binary for RAW decoding. LibRaw is dual-licensed; ChairPhoto takes it
-under the **CDDL-1.0** option (`LICENSE.CDDL` in that tree), whose file-scope copyleft is
-compatible with static linking into a GPL-3.0 program without a relinking obligation.
-LibRaw's own sources are unmodified; a decoder bump is a submodule pointer change.
+compiles it into the binary for RAW decoding. LibRaw is dual-licensed, LGPL-2.1 or CDDL-1.0
+(`COPYRIGHT` in that tree). ChairPhoto takes it under the **LGPL-2.1** option
+(`LICENSE.LGPL`): section 3 of that license lets a copy be distributed under the GNU GPL,
+version 2 or any later version, which is how it sits inside a GPL-3.0-only program. The
+CDDL option is not used — the FSF lists CDDL as incompatible with the GPL. (Corrected
+2026-09-24; this note had named the CDDL option. A reading of the licenses, not legal
+advice.) LibRaw's own sources are unmodified; a decoder bump is a submodule pointer
+change. Its notices travel with every binary: the package installs LibRaw's `COPYRIGHT`
+and `LICENSE.LGPL` next to ChairPhoto's own license (`packaging/PKGBUILD`), and LibRaw's
+bundled parts (dcraw, DCB/FBDD, X3F, Adobe DNG SDK pieces) are covered by that
+`COPYRIGHT` file.

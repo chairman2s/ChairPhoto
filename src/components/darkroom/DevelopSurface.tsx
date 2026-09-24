@@ -22,6 +22,8 @@ export function DevelopSurface(props: {
   /** The photos either side in the Library's current order, next first — the Darkroom
    *  preloads their RAW working images (docs/plans/raw-foundation, slice 4). */
   neighbours: number[];
+  /** The filmstrip: the Library's order, names for tooltips, and how to move to a photo. */
+  strip: { ids: number[]; names: Map<number, string>; onSelect: (id: number) => void };
 }) {
   const [darkroom, setDarkroom] = useState<boolean | null>(null);
   useEffect(() => {
@@ -60,9 +62,10 @@ export function DevelopSurface(props: {
         onBack={props.onBack}
         onSavedActive={props.onSavedActive}
         neighbours={props.neighbours}
+        strip={props.strip}
       />
     );
   }
-  const { activeEditJson: _activeEditJson, neighbours: _neighbours, ...editorProps } = props;
+  const { activeEditJson: _activeEditJson, neighbours: _neighbours, strip: _strip, ...editorProps } = props;
   return <EditorView {...editorProps} />;
 }

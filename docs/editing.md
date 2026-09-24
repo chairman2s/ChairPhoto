@@ -103,6 +103,12 @@ steps after it stay until the next change, which **replaces** them (a list, not 
 most 200 steps per version are kept. Pending changes are saved before a step, a version
 switch, or leaving the photo.
 
+**Filmstrip.** The Darkroom's bottom strip shows the Library's photos in their current
+order and filter, the one being developed centred. Click a frame, or ← / →, to move on
+(the arrows are left alone while a slider, field or the proof sheet/duel has them). Moving
+on saves first. With the RAW engine on, the next and previous photos are already decoded
+in memory (docs/plans/raw-foundation, slice 4), so a step shows the RAW at once.
+
 Storage: core tables `photo_version_history` and `photo_version_history_head`
 (`catalog/schema.rs`), both cascading with their version. They are local to the catalog:
 catalog merge and bundle export carry versions but not their history. Every write that

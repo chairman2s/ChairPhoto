@@ -516,6 +516,15 @@ export default function App() {
   // invariant). We prefetch further ahead than behind, since culling moves forward:
   // the next 5 photos and the previous 2. Preloading stays keyed on the *selection*: it
   // exists for stepping through the grid, and the compared frames are already on screen.
+  // The Darkroom's filmstrip: the Library's current order, and file names for tooltips.
+  const developStrip = useMemo(
+    () => ({
+      ids: photos.map((p) => p.id),
+      names: new Map(photos.map((p) => [p.id, p.path.split(/[\\/]/).pop() ?? p.path])),
+    }),
+    [photos],
+  );
+
   // The Darkroom's RAW preload targets (docs/plans/raw-foundation, slice 4): the photos
   // either side in the current order, next first. Kept referentially stable while the
   // selection and the list are unchanged.
@@ -1779,6 +1788,7 @@ export default function App() {
               <DevelopSurface
                 photoId={selected.id}
                 neighbours={developNeighbours}
+                strip={{ ...developStrip, onSelect: (id: number) => library.select(id) }}
                 photoW={selected.width}
                 photoH={selected.height}
                 // The shell clears the active version one render after the selection

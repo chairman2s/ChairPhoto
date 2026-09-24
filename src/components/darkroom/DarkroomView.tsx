@@ -64,6 +64,7 @@ import { badgeFor, INITIAL_SOURCE, reduceSource, type SourceState } from "./deve
 import { stageJsonFor } from "./stageJson";
 import { describeChange, shouldAmend } from "./history";
 import { HistoryPanel } from "./HistoryPanel";
+import { Filmstrip } from "./Filmstrip";
 import { ToneStrip } from "./ToneStrip";
 import {
   formatSample,
@@ -95,6 +96,7 @@ export function DarkroomView({
   onBack,
   onSavedActive,
   neighbours = [],
+  strip,
 }: {
   photoId: number;
   /** Original (sensor) pixel dimensions, for the crop-size readout and aspect math. */
@@ -112,6 +114,8 @@ export function DarkroomView({
   onSavedActive?: (editJson: string) => void;
   /** The photos either side, next first: preloaded after this one is ready. */
   neighbours?: number[];
+  /** The filmstrip (absent: none shown). Stepping saves first — the view unmounts. */
+  strip?: { ids: number[]; names: Map<number, string>; onSelect: (id: number) => void };
 }) {
   const neighboursRef = useRef(neighbours);
   neighboursRef.current = neighbours;
@@ -861,6 +865,15 @@ export function DarkroomView({
               Reset
             </button>
           </div>
+          {strip && strip.ids.length > 1 && (
+            <Filmstrip
+              ids={strip.ids}
+              names={strip.names}
+              currentId={photoId}
+              onSelect={strip.onSelect}
+              keysDisabled={duelOpen || proofs != null}
+            />
+          )}
         </div>
         <aside className="dk-rail">
           <HistoryPanel history={history} onGoto={(seq) => void gotoStep(seq)} />

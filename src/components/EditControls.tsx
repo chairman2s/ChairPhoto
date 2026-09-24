@@ -27,6 +27,15 @@ import {
   STRAIGHTEN_MAX,
   Tone,
 } from "../modules/editing";
+import {
+  KELVIN_TINT_RANGE,
+  kelvinToSlider,
+  kelvinWb,
+  SLIDER_STEPS,
+  sliderToKelvin,
+  wbShown,
+  type KelvinContext,
+} from "./darkroom/kelvin";
 
 /** The persisted crop-overlay preference, shared by every Develop surface. */
 export const OVERLAY_KEY = "editor.crop_overlay";
@@ -455,14 +464,98 @@ export function EditStage({
 
 // ── ToneRail ────────────────────────────────────────────────────────────────
 
-export function ToneRail({ tone, onTone }: { tone: Tone; onTone: (t: Tone) => void }) {
+export function ToneRail({
+  tone,
+  onTone,
+  kelvin,
+}: {
+  tone: Tone;
+  onTone: (t: Tone) => void;
+  /** Engine 2 with an as-shot light: white balance can be stated in Kelvin
+   *  (docs/plans/raw-foundation, slice 9). Absent: the relative sliders only. */
+  kelvin?: KelvinContext | null;
+}) {
   const setToneKey = (key: keyof Omit<Tone, "wb">, v: number) => onTone({ ...tone, [key]: v });
   const setWb = (key: "temp" | "tint", v: number) =>
-    onTone({ ...tone, wb: { ...tone.wb, [key]: v } });
+    onTone({
+      ...tone,
+      // A relative move keeps an explicit "relative" choice, so the rail does not flip back
+      // to Kelvin when the slider returns to zero.
+      wb: { temp: tone.wb.temp, tint: tone.wb.tint, ...(tone.wb.mode === "relative" ? { mode: "relative" as const } : {}), [key]: v },
+    });
+  const shown = wbShown(tone.wb, kelvin);
+  // Back to as-shot: a blank white balance renders exactly as the camera's light.
+  const asShot = () => onTone({ ...tone, wb: { temp: 0, tint: 0 } });
   return (
     <>
       <div className="develop-section">
-        <div className="panel-head develop-group-label">White Balance</div>
+        <div className="panel-head develop-group-label">
+          White Balance
+          {kelvin && (
+            <button
+              className="develop-wb-mode"
+              title={
+                shown.mode === "kelvin"
+                  ? "Adjust white balance as warmer/cooler than as-shot instead"
+                  : "State the scene's light in Kelvin"
+              }
+              onClick={() =>
+                onTone({
+                  ...tone,
+                  wb:
+                    shown.mode === "kelvin"
+                      ? { temp: 0, tint: 0, mode: "relative" }
+                      : kelvinWb(kelvin.asShot.kelvin, kelvin.asShot.tint),
+                })
+              }
+            >
+              {shown.mode === "kelvin" ? "K" : "±"}
+            </button>
+          )}
+        </div>
+        {shown.mode === "kelvin" ? (
+          <>
+            <div className="develop-slider-row">
+              <div className="develop-slider-header">
+                <span className="develop-slider-label">Temperature</span>
+                <span className="develop-slider-value">{Math.round(shown.kelvin)} K</span>
+              </div>
+              <input
+                type="range"
+                className="develop-range develop-range-temp"
+                min={0}
+                max={SLIDER_STEPS}
+                step={1}
+                value={kelvinToSlider(shown.kelvin)}
+                onChange={(e) =>
+                  onTone({ ...tone, wb: kelvinWb(sliderToKelvin(parseFloat(e.target.value)), shown.tint) })
+                }
+                onDoubleClick={asShot}
+                title={kelvin ? `As shot: ${Math.round(kelvin.asShot.kelvin)} K` : undefined}
+              />
+            </div>
+            <div className="develop-slider-row">
+              <div className="develop-slider-header">
+                <span className="develop-slider-label">Tint</span>
+                <span className="develop-slider-value">
+                  {shown.tint >= 0 ? "+" : "−"}
+                  {Math.abs(shown.tint).toFixed(0)}
+                </span>
+              </div>
+              <input
+                type="range"
+                className="develop-range develop-range-tint"
+                min={-KELVIN_TINT_RANGE}
+                max={KELVIN_TINT_RANGE}
+                step={1}
+                value={shown.tint}
+                onChange={(e) => onTone({ ...tone, wb: kelvinWb(shown.kelvin, parseFloat(e.target.value)) })}
+                onDoubleClick={asShot}
+              />
+            </div>
+          </>
+        ) : (
+          <>
         <div className="develop-slider-row">
           <div className="develop-slider-header">
             <span className="develop-slider-label">Temperature</span>
@@ -495,6 +588,8 @@ export function ToneRail({ tone, onTone }: { tone: Tone; onTone: (t: Tone) => vo
             onDoubleClick={() => setWb("tint", 0)}
           />
         </div>
+          </>
+        )}
       </div>
 
       <div className="develop-section">

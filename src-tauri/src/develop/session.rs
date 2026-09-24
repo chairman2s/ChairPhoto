@@ -191,6 +191,7 @@ pub fn current(state: &AppState, photo_id: i64, probe: DevelopSource) -> Develop
 }
 
 fn with_token(probe: DevelopSource, token: &SourceToken) -> DevelopSource {
+    let resident_image = super::resident(token);
     match probe {
         DevelopSource::Raw { camera, megapixels, bits, decoder, .. } => DevelopSource::Raw {
             camera,
@@ -198,7 +199,10 @@ fn with_token(probe: DevelopSource, token: &SourceToken) -> DevelopSource {
             bits,
             decoder,
             token: Some(token.to_query()),
-            camera_ev: super::resident(token).and_then(|i| i.camera_ev),
+            camera_ev: resident_image.as_ref().and_then(|i| i.camera_ev),
+            as_shot_wb: resident_image.as_ref().and_then(|i| {
+                crate::plugins::edit::linear::as_shot_kelvin(&i.cam_mul, &i.pre_mul, &i.rgb_cam, &i.wbct).map(|(k, t)| [k, t])
+            }),
         },
         other => other,
     }
@@ -418,7 +422,9 @@ pub fn working_image_from(d: crate::raw::LinearDecode) -> WorkingImage {
         height: linear.height(),
         linear,
         cam_mul: d.cam_mul,
+        pre_mul: d.pre_mul,
         rgb_cam: d.rgb_cam,
+        wbct: d.wbct,
         decoder: crate::raw::decoder_version(),
         camera_ev: None,
     }
@@ -444,7 +450,7 @@ mod tests {
     }
 
     fn raw_probe() -> DevelopSource {
-        DevelopSource::Raw { camera: "Test".into(), megapixels: 1.0, bits: 16, decoder: "test".into(), token: None, camera_ev: None }
+        DevelopSource::Raw { camera: "Test".into(), megapixels: 1.0, bits: 16, decoder: "test".into(), token: None, camera_ev: None, as_shot_wb: None }
     }
 
     fn decode_claim(state: &AppState, photo_id: i64) -> JobClaim<DevelopStatus> {
@@ -669,7 +675,9 @@ mod tests {
             rgb16: (0..24).collect(),
             orientation: image::metadata::Orientation::NoTransforms,
             cam_mul: [1.0; 4],
+            pre_mul: [1.0; 4],
             rgb_cam: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            wbct: Vec::new(),
         };
         super::super::cache::write_in(&root, &key, &d).unwrap();
         let abort = std::sync::atomic::AtomicBool::new(false);

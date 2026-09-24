@@ -51,7 +51,11 @@ pub struct WorkingImage {
     pub height: u32,
     pub linear: Rgb32FImage,
     pub cam_mul: [f32; 4],
+    /// The daylight multipliers `rgb_cam` is normalized to (`raw::LinearDecode::pre_mul`).
+    pub pre_mul: [f32; 4],
     pub rgb_cam: [[f32; 3]; 3],
+    /// The camera's white-balance table (`raw::LinearDecode::wbct`).
+    pub wbct: Vec<[f32; 4]>,
     pub decoder: &'static str,
     /// The exposure offset that matched the camera's own JPEG of this frame
     /// (`linear::camera_match_ev`), measured when the image was prepared. New engine-2
@@ -68,7 +72,9 @@ impl WorkingImage {
             height: self.height,
             linear: self.linear.clone(),
             cam_mul: self.cam_mul,
+            pre_mul: self.pre_mul,
             rgb_cam: self.rgb_cam,
+            wbct: self.wbct.clone(),
             decoder: self.decoder,
             camera_ev: self.camera_ev,
         }

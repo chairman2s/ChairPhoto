@@ -58,6 +58,12 @@ describe("reduceSource", () => {
     expect(gone.cameraEv).toBe(0);
   });
 
+  it("carries the as-shot light for Kelvin, and none off the RAW", () => {
+    expect(reduceSource(INITIAL_SOURCE, { ...raw, asShotWb: [5313, 2.4] }, 5).asShotWb).toEqual({ kelvin: 5313, tint: 2.4 });
+    expect(reduceSource(INITIAL_SOURCE, raw, 5).asShotWb).toBeNull();
+    expect(reduceSource(INITIAL_SOURCE, { source: "jpeg", photoId: 5 }, 5).asShotWb).toBeNull();
+  });
+
   it("carries the resident RAW's camera match, and 0 when it was not measured", () => {
     expect(reduceSource(INITIAL_SOURCE, { ...raw, cameraEv: -1.6 }, 5).cameraEv).toBe(-1.6);
     expect(reduceSource(INITIAL_SOURCE, raw, 5).cameraEv).toBe(0);

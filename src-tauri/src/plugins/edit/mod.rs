@@ -471,8 +471,8 @@ fn finish_linear(
         edit.tone.wb.tint,
         edit.tone.wb.kelvin,
     );
-    let gains = linear::wb_multipliers(&wb, &image.cam_mul, &image.rgb_cam)?;
-    linear::apply_exposure_linear(&mut lin, edit.tone.ev, gains);
+    let wb = linear::wb_matrix(&wb, &image.cam_mul, &image.pre_mul, &image.rgb_cam, &image.wbct)?;
+    linear::apply_exposure_linear(&mut lin, edit.tone.ev, wb);
     t.mark("linear_exposure");
     let transform = linear::DisplayTransform::from_record(edit.display.as_deref());
     let mut rgb = linear::to_display(&lin, transform, linear::BASELINE_EV + edit.camera_ev);
@@ -984,7 +984,9 @@ mod tests {
             height: 48,
             linear,
             cam_mul: [1.0; 4],
+            pre_mul: [1.0; 4],
             rgb_cam: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            wbct: Vec::new(),
             decoder: "test",
             camera_ev: None,
         })
@@ -1070,6 +1072,25 @@ mod tests {
             let view = render_proxy(RenderSource::Working { token, image: img.clone() }, json, 0, RenderOpts::default()).unwrap();
             assert_eq!(export.to_rgb8().as_raw(), view.to_rgb8().as_raw(), "{json}");
         }
+    }
+
+    /// Kelvin through the whole engine-2 render: the as-shot light is the picture as shot,
+    /// and a warmer stated light warms it.
+    #[test]
+    fn engine2_kelvin_at_as_shot_is_as_shot_and_a_higher_kelvin_warms() {
+        let img = synthetic_working(0.4);
+        let (k, t) = linear::as_shot_kelvin(&img.cam_mul, &img.pre_mul, &img.rgb_cam, &img.wbct).unwrap();
+        let render = |json: String, gen: u64| {
+            let token = SourceToken::Working { photo_id: 8, generation: gen };
+            render_proxy(RenderSource::Working { token, image: img.clone() }, &json, 0, RenderOpts::default()).unwrap().to_rgb8()
+        };
+        let plain = render(r#"{"engine":2,"display":"camera.2"}"#.to_string(), 1);
+        let at = render(format!(r#"{{"engine":2,"display":"camera.2","tone":{{"wb":{{"mode":"kelvin","kelvin":{k},"tint":{t}}}}}}}"#), 2);
+        let worst = plain.as_raw().iter().zip(at.as_raw()).map(|(a, b)| (*a as i32 - *b as i32).abs()).max().unwrap();
+        assert!(worst <= 1, "as-shot Kelvin is the picture as shot (max |Δ| {worst})");
+        let warm = render(format!(r#"{{"engine":2,"display":"camera.2","tone":{{"wb":{{"mode":"kelvin","kelvin":{},"tint":{t}}}}}}}"#, k * 1.4), 3);
+        let (p, w) = (plain.get_pixel(2, 10).0, warm.get_pixel(2, 10).0); // the neutral patch
+        assert!(w[0] as i32 - w[2] as i32 > p[0] as i32 - p[2] as i32, "warmer: {w:?} vs {p:?}");
     }
 
     #[test]

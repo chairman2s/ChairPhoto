@@ -96,7 +96,9 @@ mod tests {
             height: 64,
             linear,
             cam_mul: [1.0; 4],
+            pre_mul: [1.0; 4],
             rgb_cam: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            wbct: Vec::new(),
             decoder: "test",
             camera_ev: None,
         })

@@ -39,8 +39,19 @@ function changedControls(prev: VersionEdit, next: VersionEdit): [string, string]
   }
   const pwb = prev.tone?.wb ?? { temp: 0, tint: 0 };
   const nwb = next.tone?.wb ?? { temp: 0, tint: 0 };
-  if ((pwb.temp ?? 0) !== (nwb.temp ?? 0)) out.push(["tone.wb.temp", `Temperature ${signed(nwb.temp ?? 0)}`]);
-  if ((pwb.tint ?? 0) !== (nwb.tint ?? 0)) out.push(["tone.wb.tint", `Tint ${signed(nwb.tint ?? 0)}`]);
+  const pk = pwb.mode === "kelvin" ? pwb.kelvin : undefined;
+  const nk = nwb.mode === "kelvin" ? nwb.kelvin : undefined;
+  if (pk !== nk) {
+    // Kelvin (slice 9): the stated light, or back to as-shot.
+    out.push(["tone.wb.kelvin", nk != null ? `White balance ${Math.round(nk)} K` : "White balance as shot"]);
+  } else if (nk != null) {
+    const t = nwb.tint ?? 0;
+    if ((pwb.tint ?? 0) !== t) out.push(["tone.wb.tint", `Tint ${t >= 0 ? "+" : "−"}${Math.abs(Math.round(t))}`]);
+  }
+  if (nk == null && pk == null) {
+    if ((pwb.temp ?? 0) !== (nwb.temp ?? 0)) out.push(["tone.wb.temp", `Temperature ${signed(nwb.temp ?? 0)}`]);
+    if ((pwb.tint ?? 0) !== (nwb.tint ?? 0)) out.push(["tone.wb.tint", `Tint ${signed(nwb.tint ?? 0)}`]);
+  }
   if (!same(prev.zones, next.zones)) out.push(["zones", "Tone strip"]);
   if (!same(prev.crop, next.crop)) {
     out.push(["crop", next.crop ? `Crop${next.crop.aspect && next.crop.aspect !== "Free" ? ` ${next.crop.aspect}` : ""}` : "Crop removed"]);

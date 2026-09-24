@@ -13,9 +13,10 @@
 //! # File format (little-endian)
 //!
 //! ```text
-//! magic    8  b"CPRAWF01"
+//! magic    8  b"CPRAWF02"
 //! width    u32 · height u32 · orientation u8 (EXIF 1–8)
-//! cam_mul  4×f32 · rgb_cam 9×f32
+//! cam_mul  4×f32 · pre_mul 4×f32 · rgb_cam 9×f32
+//! wbct     u8 rows + rows×4 f32 (K, R, G, B)
 //! decoder  u16 len + UTF-8 · key u32 len + UTF-8 (the full key, so an fnv collision reads
 //!          as a miss, never as another photo's pixels)
 //! pixels   width×height×3 u16, interleaved RGB, row-major
@@ -35,8 +36,10 @@ use std::path::{Path, PathBuf};
 
 /// Bumped when the file format or the decode contract changes (the decode contract lives in
 /// `raw::decode_linear`: bit depth, white balance, clipping, inset crop).
-const FORMAT: u32 = 1;
-const MAGIC: &[u8; 8] = b"CPRAWF01";
+/// 2: `pre_mul` and the camera's white-balance table joined the header (Kelvin white
+/// balance); format-1 directories are unreachable and trimmed.
+const FORMAT: u32 = 2;
+const MAGIC: &[u8; 8] = b"CPRAWF02";
 const EXT: &str = "rawf";
 
 /// Settings key: the cache's size limit in GB. Default [`DEFAULT_BUDGET_GB`].
@@ -139,11 +142,21 @@ fn read_body(r: &mut impl Read, key: &CacheKey, file_len: u64) -> Option<LinearD
     for v in &mut cam_mul {
         *v = read_f32(r)?;
     }
+    let mut pre_mul = [0f32; 4];
+    for v in &mut pre_mul {
+        *v = read_f32(r)?;
+    }
     let mut rgb_cam = [[0f32; 3]; 3];
     for row in &mut rgb_cam {
         for v in row.iter_mut() {
             *v = read_f32(r)?;
         }
+    }
+    let mut n_wbct = [0u8; 1];
+    r.read_exact(&mut n_wbct).ok()?;
+    let mut wbct = Vec::with_capacity(n_wbct[0] as usize);
+    for _ in 0..n_wbct[0] {
+        wbct.push([read_f32(r)?, read_f32(r)?, read_f32(r)?, read_f32(r)?]);
     }
     let decoder_len = read_u16(r)? as usize;
     let decoder = read_string(r, decoder_len)?;
@@ -153,12 +166,12 @@ fn read_body(r: &mut impl Read, key: &CacheKey, file_len: u64) -> Option<LinearD
         return None; // another decoder, or an fnv collision: a miss, never other pixels
     }
     let n = (width as u64).checked_mul(height as u64)?.checked_mul(3)?;
-    let header = 8 + 4 + 4 + 1 + 16 + 36 + 2 + decoder.len() as u64 + 4 + stored_key.len() as u64;
+    let header = 8 + 4 + 4 + 1 + 16 + 16 + 36 + 1 + 16 * wbct.len() as u64 + 2 + decoder.len() as u64 + 4 + stored_key.len() as u64;
     if header + n * 2 != file_len {
         return None; // truncated or padded: not a file this writer produced
     }
     let rgb16 = read_u16s(r, n as usize)?;
-    Some(LinearDecode { width, height, rgb16, orientation, cam_mul, rgb_cam })
+    Some(LinearDecode { width, height, rgb16, orientation, cam_mul, pre_mul, rgb_cam, wbct })
 }
 
 /// Read `n` little-endian `u16`s. On a little-endian machine the file's bytes already are
@@ -243,7 +256,17 @@ pub(crate) fn write_in(root: &Path, key: &CacheKey, d: &LinearDecode) -> Result<
         for v in d.cam_mul {
             w.write_all(&v.to_bits().to_le_bytes())?;
         }
+        for v in d.pre_mul {
+            w.write_all(&v.to_bits().to_le_bytes())?;
+        }
         for row in d.rgb_cam {
+            for v in row {
+                w.write_all(&v.to_bits().to_le_bytes())?;
+            }
+        }
+        let rows = &d.wbct[..d.wbct.len().min(u8::MAX as usize)];
+        w.write_all(&[rows.len() as u8])?;
+        for row in rows {
             for v in row {
                 w.write_all(&v.to_bits().to_le_bytes())?;
             }
@@ -372,7 +395,9 @@ mod tests {
             rgb16: (0..w * h * 3).map(|i| (i as u16).wrapping_mul(31).wrapping_add(seed)).collect(),
             orientation: Orientation::Rotate90,
             cam_mul: [2.1, 1.0, 1.6, 1.0],
+            pre_mul: [2.4, 1.0, 1.3, 0.0],
             rgb_cam: [[1.7, -0.6, -0.1], [-0.2, 1.5, -0.3], [0.0, -0.4, 1.4]],
+            wbct: vec![[2500.0, 1395.0, 1024.0, 3366.0], [6000.0, 2561.0, 1024.0, 1518.0]],
         }
     }
 
@@ -422,6 +447,8 @@ mod tests {
         assert_eq!(back.rgb16, d.rgb16);
         assert_eq!(back.orientation, d.orientation);
         assert_eq!(back.cam_mul, d.cam_mul);
+        assert_eq!(back.pre_mul, d.pre_mul);
+        assert_eq!(back.wbct, d.wbct);
         assert_eq!(back.rgb_cam, d.rgb_cam);
         // No temp file is left behind.
         let dir = dir_for(&r, "0.22.0-test");

@@ -179,7 +179,25 @@
   later, so GPL-3.0-only fits), and the package installs LibRaw's `COPYRIGHT` and
   `LICENSE.LGPL` (commit 7012115). The Darkroom itself is still behind its own
   early-preview switch (`editor.darkroom`, docs/plans/darkroom — that plan's slice 8).
-- [ ] Slice 9 — Kelvin white balance (first follow-on)
+- [x] Slice 9 — Kelvin white balance (2026-09-24). `WbSpec::Kelvin` renders through
+  `linear::wb_matrix`: exposure and white balance are now one matrix per pixel (diagonal
+  fast path for relative). The decode keeps LibRaw's daylight multipliers — read *before*
+  processing, since dcraw's scale step overwrites `pre_mul` with the multipliers it used
+  (found when every frame read ~6500 K) — and the camera's own white-balance table
+  (`WBCT_Coeffs`); `.rawf` is format 2 (old entries are a miss, then rewritten). **The
+  table, not the matrix, is the reference where it exists:** the matrix model maps the
+  A7 IV's labelled 2500/3200/4500/6000/8500 K presets to 2639/3332/4526/5829/8036 K, but
+  the A7 R VI's to 2213/2670/3452/4260/5535 K — LibRaw's colour data for the newer body is
+  off. Calibrated to each camera's table, the presets read Daylight 5260/5313 K, Cloudy
+  6149/6172, Shade 7824/7658, Tungsten 2719/2766 (A7 IV/A7 R VI), and every corpus frame
+  renders its as-shot Kelvin as the identity (fixture test); the DNG has no table and uses
+  the model (5404 K). The source event carries `asShotWb`; the rail shows Kelvin + tint
+  with a *K/±* switch; `develop.wbSlider` picks what fresh edits show (Kelvin by default);
+  the proof sheet's warm/cool cells step ±30 mireds and the duel's warmth round 25 mireds,
+  halving. History names "White balance 5300 K", "Tint +6", "White balance as shot". The
+  A7 R VI finding suggests the same LibRaw colour data sits under that body's hue gap that
+  `camera.2`'s matrix partly corrects. Not seen on screen (monitor unavailable); covered by
+  unit, render and fixture tests.
 
 ## Notes for a fresh session
 - Origin: the GPU-smoothness work on `feature/darkroom-gpu` (see

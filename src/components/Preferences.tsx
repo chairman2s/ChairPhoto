@@ -593,9 +593,14 @@ export function formatExportParity(v: string | null | undefined): string | null 
     : `What you see is what you export: ${checked} RAW ${noun} checked, ${differing} differed from the view.`;
 }
 
+/** Which white-balance slider a fresh RAW edit shows (docs/plans/raw-foundation, slice 9):
+ *  the scene's light in Kelvin, or warmer/cooler than as-shot. Read when a photo opens. */
+const WB_SLIDER_KEY = "develop.wbSlider";
+
 /** RAW engine settings: the decode cache's size, its current use, and neighbour preload. */
 function RawCacheSettings() {
   const [parity, setParity] = useState<string | null>(null);
+  const [wbSlider, setWbSlider] = useState<"kelvin" | "relative" | null>(null);
   const [gb, setGb] = useState<string>("");
   const [preload, setPreload] = useState<boolean | null>(null);
   const [usage, setUsage] = useState<number | null>(null);
@@ -615,6 +620,9 @@ function RawCacheSettings() {
     getSetting(EXPORT_PARITY_KEY)
       .then((v) => setParity(formatExportParity(v)))
       .catch(() => setParity(null));
+    getSetting(WB_SLIDER_KEY)
+      .then((v) => setWbSlider(v === "relative" ? "relative" : "kelvin"))
+      .catch(() => setWbSlider("kelvin"));
     refreshUsage();
   }, []);
   const saveGb = async () => {
@@ -677,6 +685,27 @@ function RawCacheSettings() {
           }}
         />
         Prepare the next and previous photo in the background
+      </label>
+      <label style={{ display: "flex", gap: 8, alignItems: "center", marginTop: 6 }}>
+        White balance for new edits
+        <select
+          value={wbSlider ?? "kelvin"}
+          disabled={wbSlider === null}
+          onChange={async (e) => {
+            const next = e.target.value === "relative" ? "relative" : "kelvin";
+            const before = wbSlider;
+            setWbSlider(next);
+            try {
+              await setSetting(WB_SLIDER_KEY, next);
+            } catch {
+              setWbSlider(before);
+            }
+          }}
+          aria-label="White balance slider for new edits"
+        >
+          <option value="kelvin">Kelvin — the scene's light (5200 K)</option>
+          <option value="relative">Warmer / cooler than as shot</option>
+        </select>
       </label>
       {parity && (
         <div className="modal-sub" style={{ marginTop: 6 }}>

@@ -5,12 +5,14 @@
 // Either pane can be banked as a version (⑂) without ending the round.
 import { useEffect, useMemo, useState } from "react";
 import type { VersionEdit } from "../../modules/editing";
+import type { KelvinContext } from "./kelvin";
 import { RenderedImage } from "./RenderedImage";
 import { DUEL_DIMS, DUEL_LABELS, duelPair, type DuelDim } from "./spreads";
 
 export function DuelView({
   working,
   renderUrl,
+  kelvin,
   onApply,
   onFork,
   onClose,
@@ -18,6 +20,8 @@ export function DuelView({
   working: VersionEdit;
   /** The render URL for a record at a given long edge — the Darkroom's engine and source. */
   renderUrl: (record: VersionEdit, maxEdge: number) => string;
+  /** On the RAW with an as-shot light: the warmth round steps stated light (Kelvin). */
+  kelvin?: KelvinContext | null;
   /** The picked variant becomes the working state. */
   onApply: (record: VersionEdit) => void;
   /** Bank a variant as a version without ending the round. Resolves to its name. */
@@ -28,7 +32,7 @@ export function DuelView({
   const [note, setNote] = useState("");
   const dim = DUEL_DIMS[dimIdx];
 
-  const pair = useMemo(() => duelPair(working, dim, 0), [working, dim]);
+  const pair = useMemo(() => duelPair(working, dim, 0, kelvin), [working, dim, kelvin]);
 
   const advance = () => {
     setNote("");

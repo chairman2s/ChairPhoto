@@ -30,6 +30,10 @@ pub enum DevelopSource {
         token: Option<String>,
         #[serde(rename = "cameraEv", skip_serializing_if = "Option::is_none")]
         camera_ev: Option<f32>,
+        /// The as-shot light as Kelvin and tint (`linear::as_shot_kelvin`), when the
+        /// camera gives what Kelvin white balance needs — the Kelvin slider's home.
+        #[serde(rename = "asShotWb", skip_serializing_if = "Option::is_none")]
+        as_shot_wb: Option<[f32; 2]>,
     },
     /// A RAW the decoder does not support (yet): the Darkroom keeps working on the camera
     /// preview and says so.
@@ -78,6 +82,7 @@ fn probe_source(path: &std::path::Path) -> DevelopSource {
             decoder: crate::raw::decoder_version().to_string(),
             token: None,
             camera_ev: None,
+            as_shot_wb: None,
         },
         RawSupport::Unsupported { camera, reason } => DevelopSource::Unsupported { camera, reason },
     }

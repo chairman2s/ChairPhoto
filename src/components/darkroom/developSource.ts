@@ -54,16 +54,21 @@ export interface SourceState {
   engine: 1 | 2;
   /** The resident RAW's camera match, in EV (0 when unmeasured or not on the RAW). */
   cameraEv: number;
+  /** The resident RAW's as-shot light, for Kelvin white balance (null when unknown). */
+  asShotWb: { kelvin: number; tint: number } | null;
   /** The latest source, for the badge. */
   source: DevelopSource | null;
 }
 
-export const INITIAL_SOURCE: SourceState = { token: undefined, engine: 1, cameraEv: 0, source: null };
+export const INITIAL_SOURCE: SourceState = { token: undefined, engine: 1, cameraEv: 0, asShotWb: null, source: null };
 
 /** Fold a source event in. Events for another photo are ignored; a resident RAW yields its
  *  token and engine 2; anything else drops back to the preview path. Pure. */
 export function reduceSource(prev: SourceState, e: DevelopSource & { photoId?: number }, photoId: number): SourceState {
   if (e.photoId !== undefined && e.photoId !== photoId) return prev;
-  if (e.source === "raw" && e.token) return { token: e.token, engine: 2, cameraEv: e.cameraEv ?? 0, source: e };
-  return { token: undefined, engine: 1, cameraEv: 0, source: e };
+  if (e.source === "raw" && e.token) {
+    const asShotWb = e.asShotWb ? { kelvin: e.asShotWb[0], tint: e.asShotWb[1] } : null;
+    return { token: e.token, engine: 2, cameraEv: e.cameraEv ?? 0, asShotWb, source: e };
+  }
+  return { token: undefined, engine: 1, cameraEv: 0, asShotWb: null, source: e };
 }

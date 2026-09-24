@@ -61,7 +61,10 @@ export interface Tone {
   blacks: number; // -1..1
   vibrance: number; // -1..1
   saturation: number; // -1..1
-  wb: { temp: number; tint: number }; // -1..1 each
+  /** Relative (the default): `temp`/`tint` −1..1, warmer/cooler than as-shot. Kelvin
+   *  (engine 2, docs/plans/raw-foundation slice 9): `mode: "kelvin"`, the scene's light in
+   *  `kelvin`, and `tint` in Kelvin units (+100 = one stop less green). */
+  wb: { temp: number; tint: number; mode?: "relative" | "kelvin"; kelvin?: number };
 }
 
 /**

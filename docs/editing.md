@@ -348,8 +348,18 @@ engine**, which forks "<name> (RAW)" with the framing copied and tone and look r
   framed-base cache keys on the token instead of the JPEG fingerprint.
 - **White balance on engine 2** is a tagged meaning on `tone.wb`: `mode` absent or
   `"relative"` (warmer/cooler than as-shot, the same gentle gains as engine 1) or
-  `"kelvin"` (a scene light; parsed now, rendered in the Kelvin slice — refused with a clear
-  error until then, never silently treated as relative).
+  `"kelvin"` — the scene's light, `kelvin` plus `tint` (+100 = one stop less green),
+  rendered as a change of balance in the camera's own space
+  (`rgb_cam · diag(b / as-shot) · rgb_cam⁻¹`, green held). The balance for a stated light
+  comes from the **camera's own white-balance table** where the file has one (LibRaw's
+  `WBCT_Coeffs`, interpolated in mireds), else from the decoder's daylight multipliers and
+  matrix. The as-shot light is solved the same way, so rendering it is exactly the picture
+  as shot, and a blank white balance and "as shot" are the same record. The Darkroom's
+  rail shows Kelvin (slider 2000–12000 K, log; double-click = as shot) or the relative
+  pair, switched by *K/±*; which one a fresh RAW edit shows is Preferences › Darkroom
+  (`develop.wbSlider`, Kelvin by default). The proof sheet's warm/cool cells and the
+  duel's warmth round step stated light in mireds on the RAW. A camera with neither table
+  nor daylight white refuses Kelvin with a clear error, never a silent relative.
 - **Export of an engine-2 version** renders the same working image the view does — the
   Develop session's, or one bounded load from the `.rawf` cache or the decoder
   (`develop::offline`) — through the same pipeline at full size; the tone-matching step

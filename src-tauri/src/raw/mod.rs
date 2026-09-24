@@ -168,7 +168,14 @@ pub struct LinearDecode {
     pub rgb16: Vec<u16>,
     pub orientation: image::metadata::Orientation,
     pub cam_mul: [f32; 4],
+    /// LibRaw's daylight (D65) multipliers — the white `rgb_cam` is normalized to. With
+    /// `cam_mul` they place the as-shot light, which Kelvin white balance renders around.
+    pub pre_mul: [f32; 4],
     pub rgb_cam: [[f32; 3]; 3],
+    /// The camera's own white-balance table where the file has one (LibRaw's
+    /// `WBCT_Coeffs`): (colour temperature K, R, G, B multipliers) per row. Kelvin white
+    /// balance calibrates to it, which is independent of how good the decoder's matrix is.
+    pub wbct: Vec<[f32; 4]>,
 }
 
 /// Decode `path` for the working image. `abort` is polled between the expensive steps —
@@ -207,6 +214,16 @@ pub fn decode_linear(path: &Path, abort: &std::sync::atomic::AtomicBool) -> Resu
             if rc != 0 {
                 return Err(format!("libraw_unpack failed ({rc})"));
             }
+            // The daylight multipliers, read before processing: dcraw's scale step writes
+            // the multipliers it used (here the camera's) back into `pre_mul`.
+            let pre_mul = (*lr).color.pre_mul;
+            let wbct: Vec<[f32; 4]> = (*lr)
+                .color
+                .WBCT_Coeffs
+                .iter()
+                .filter(|r| r[0] > 0.0 && r[1] > 0.0 && r[2] > 0.0 && r[3] > 0.0)
+                .map(|r| [r[0], r[1], r[2], r[3]])
+                .collect();
             (*lr).params.use_camera_wb = 1;
             (*lr).params.output_bps = 16;
             (*lr).params.output_color = 1; // sRGB / Rec.709 primaries
@@ -244,7 +261,9 @@ pub fn decode_linear(path: &Path, abort: &std::sync::atomic::AtomicBool) -> Resu
                 rgb16,
                 orientation: image::metadata::Orientation::NoTransforms,
                 cam_mul,
+                pre_mul,
                 rgb_cam,
+                wbct,
             })
         })();
         ffi::libraw_recycle(lr);

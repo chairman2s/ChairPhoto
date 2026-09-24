@@ -59,6 +59,7 @@ import {
   persistOverlay,
   ToneRail,
 } from "../EditControls";
+import { type KelvinContext, WB_SLIDER_KEY } from "./kelvin";
 import { DuelView } from "./DuelView";
 import { ProofSheet } from "./ProofSheet";
 import { DUEL_LABELS, proofSpread, type DuelDim, type ProofCandidate } from "./spreads";
@@ -274,6 +275,18 @@ export function DarkroomView({
       source: sourceToken,
       clip: true,
     });
+  // Kelvin white balance (slice 9): on the RAW with an as-shot light. Which slider a fresh
+  // edit shows is the user's preference (Preferences › Darkroom; Kelvin by default).
+  const [wbPrefer, setWbPrefer] = useState<"kelvin" | "relative">("kelvin");
+  useEffect(() => {
+    getSetting(WB_SLIDER_KEY)
+      .then((v) => setWbPrefer(v === "relative" ? "relative" : "kelvin"))
+      .catch(() => {});
+  }, []);
+  const kelvinCtx: KelvinContext | null =
+    sourceToken && sourceState.asShotWb ? { asShot: sourceState.asShotWb, prefer: wbPrefer } : null;
+  const kelvinCtxRef = useRef(kelvinCtx);
+  kelvinCtxRef.current = kelvinCtx;
   /** A variant's render (proof sheet, duel) from the stage's own source and engine. */
   const variantUrl = (record: VersionEdit, maxEdge: number): string =>
     editRenderUrl(photoId, JSON.stringify(stamped(record)), { maxEdge, source: sourceToken });
@@ -545,7 +558,7 @@ export function DarkroomView({
   };
 
   const dealProofs = () => {
-    setProofs(proofSpread(workingRef.current, autoFragment ?? {}, presets));
+    setProofs(proofSpread(workingRef.current, autoFragment ?? {}, presets, kelvinCtxRef.current));
   };
 
   // The duel: picks stream into `working` (stage, strip, and loupe follow live), and
@@ -1073,7 +1086,7 @@ export function DarkroomView({
         </div>
         <aside className="dk-rail">
           <HistoryPanel history={history} onGoto={(seq) => void gotoStep(seq)} />
-          <ToneRail tone={tone} onTone={onTone} />
+          <ToneRail tone={tone} onTone={onTone} kelvin={kelvinCtx} />
           <EffectsRail look={look} onLook={onLook} onError={setError} />
           <GeometryRail
             aspect={aspect}
@@ -1120,6 +1133,7 @@ export function DarkroomView({
         <DuelView
           working={working}
           renderUrl={variantUrl}
+          kelvin={kelvinCtx}
           onApply={(record) => {
             nextLabelRef.current = "Duel pick";
             setWorking(record);

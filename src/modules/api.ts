@@ -882,7 +882,17 @@ export type DevelopSource =
   /** The RAW working image is resident; `token` goes into every render URL for it.
    *  `cameraEv` is the offset that matched the camera's JPEG of this frame, stamped on new
    *  engine-2 records (absent when it could not be measured). */
-  | { source: "raw"; camera: string; megapixels: number; bits: number; decoder: string; token?: string; cameraEv?: number }
+  | {
+      source: "raw";
+      camera: string;
+      megapixels: number;
+      bits: number;
+      decoder: string;
+      token?: string;
+      cameraEv?: number;
+      /** The as-shot light, [kelvin, tint], when the camera gives what Kelvin needs. */
+      asShotWb?: [number, number];
+    }
   | { source: "unsupported"; camera: string | null; reason: string }
   | { source: "jpeg" }
   | { source: "nodecoder" };

@@ -147,7 +147,9 @@ pub(crate) fn test_image(w: u32, h: u32) -> Arc<WorkingImage> {
         height: h,
         linear: image::Rgb32FImage::new(w, h),
         cam_mul: [1.0; 4],
+        pre_mul: [1.0; 4],
         rgb_cam: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+        wbct: Vec::new(),
         decoder: "test",
         camera_ev: None,
     })
@@ -253,6 +255,43 @@ mod tests {
             let d = parity::fit_difference(&token, &image, json, &out).unwrap();
             println!("parity: record {i} mean |Δ| at Fit {d:.2} (tolerance {})", parity::PARITY_TOLERANCE);
             assert!(d <= parity::PARITY_TOLERANCE, "resampling alone should stay inside the tolerance");
+        }
+    }
+
+    /// With a real RAW (`CHAIRPHOTO_RAW_FIXTURE`): the as-shot Kelvin and tint the camera's
+    /// multipliers place, and that rendering them changes nothing.
+    #[test]
+    fn fixture_as_shot_kelvin_is_plausible_and_renders_as_shot() {
+        let Ok(fixture) = std::env::var("CHAIRPHOTO_RAW_FIXTURE") else {
+            println!("SKIPPED: fixture_as_shot_kelvin_is_plausible_and_renders_as_shot — set CHAIRPHOTO_RAW_FIXTURE");
+            return;
+        };
+        use crate::plugins::edit::linear;
+        let d = crate::raw::decode_linear(std::path::Path::new(&fixture), &std::sync::atomic::AtomicBool::new(false)).unwrap();
+        println!("kelvin: cam_mul {:?} pre_mul {:?}", d.cam_mul, d.pre_mul);
+        let (k, t) = linear::as_shot_kelvin(&d.cam_mul, &d.pre_mul, &d.rgb_cam, &d.wbct).expect("an as-shot light");
+        println!("kelvin: as shot {k:.0} K, tint {t:+.1}");
+        // The camera's own labelled presets (Sony stores WB_RGBLevels<N>K), when exiftool
+        // can read them: what the model makes of each.
+        if let Ok(out) = std::process::Command::new("exiftool").args(["-s", "-WB_RGBLevels*"]).arg(&fixture).output() {
+            for line in String::from_utf8_lossy(&out.stdout).lines() {
+                let Some((name, vals)) = line.split_once(':') else { continue };
+                let v: Vec<f32> = vals.split_whitespace().filter_map(|x| x.parse().ok()).collect();
+                if v.len() != 3 {
+                    continue;
+                }
+                let cm = [v[0], v[1], v[2], v[1]];
+                if let Some((pk, pt)) = linear::as_shot_kelvin(&cm, &d.pre_mul, &d.rgb_cam, &d.wbct) {
+                    println!("kelvin: preset {:<28} → {pk:6.0} K, tint {pt:+.1}", name.trim());
+                }
+            }
+        }
+        assert!((1667.0..25000.0).contains(&k));
+        let m = linear::wb_matrix(&linear::WbSpec::Kelvin { kelvin: k, tint: t }, &d.cam_mul, &d.pre_mul, &d.rgb_cam, &d.wbct).unwrap();
+        for (i, row) in m.iter().enumerate() {
+            for (j, v) in row.iter().enumerate() {
+                assert!((v - if i == j { 1.0 } else { 0.0 }).abs() < 1e-3, "{m:?}");
+            }
         }
     }
 

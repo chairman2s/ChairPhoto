@@ -5,6 +5,7 @@
 // base's look and only fix its tone.
 import type { Tone, VersionEdit } from "../../modules/editing";
 import type { DevelopPreset } from "../../modules/presets";
+import { DUEL_WARMTH_MIREDS, PROOF_WARMTH_MIREDS, withKelvinShift, type KelvinContext } from "./kelvin";
 
 export interface ProofCandidate {
   label: string;
@@ -83,9 +84,15 @@ export function duelPair(
   working: VersionEdit,
   dim: DuelDim,
   visit: number,
+  kelvin?: KelvinContext | null,
 ): [VersionEdit, VersionEdit] {
   const step = DUEL_BASE_STEP[dim] * Math.pow(0.5, Math.max(0, visit));
   const t = working.tone;
+  // On the RAW with an as-shot light, warmth is a step of stated light in mireds.
+  if (dim === "warmth" && kelvin) {
+    const m = DUEL_WARMTH_MIREDS * Math.pow(0.5, Math.max(0, visit));
+    return [withKelvinShift(working, kelvin, m), withKelvinShift(working, kelvin, -m)];
+  }
   switch (dim) {
     case "ev": {
       const ev = t?.ev ?? 0;
@@ -124,6 +131,7 @@ export function proofSpread(
   base: VersionEdit,
   auto: VersionEdit,
   presets: DevelopPreset[],
+  kelvin?: KelvinContext | null,
 ): ProofCandidate[] {
   const geo = geometryOf(base);
   const autoTone = mergeTone(base.tone, auto.tone);
@@ -134,8 +142,14 @@ export function proofSpread(
       record: base,
     },
     { label: "Auto", group: "auto", record: { ...base, tone: autoTone } },
-    { label: "Auto · Warm", group: "auto", record: { ...base, tone: warmed(autoTone, 0.35) } },
-    { label: "Auto · Cool", group: "auto", record: { ...base, tone: warmed(autoTone, -0.35) } },
+    // On the RAW with an as-shot light, warm and cool are stated light, 30 mireds either
+    // side of what the photo shows now; otherwise the relative warmth nudge.
+    kelvin
+      ? { label: "Auto · Warm", group: "auto", record: withKelvinShift({ ...base, tone: autoTone }, kelvin, -PROOF_WARMTH_MIREDS) }
+      : { label: "Auto · Warm", group: "auto", record: { ...base, tone: warmed(autoTone, 0.35) } },
+    kelvin
+      ? { label: "Auto · Cool", group: "auto", record: withKelvinShift({ ...base, tone: autoTone }, kelvin, PROOF_WARMTH_MIREDS) }
+      : { label: "Auto · Cool", group: "auto", record: { ...base, tone: warmed(autoTone, -0.35) } },
   ];
   for (const p of pickLooks(presets, PROOF_CELLS - out.length)) {
     out.push({

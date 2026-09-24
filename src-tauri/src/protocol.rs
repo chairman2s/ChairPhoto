@@ -203,12 +203,17 @@ pub fn render_bytes<R: Runtime>(
     // stat them OFF the lock via `pick_existing` so a slow/offline NAS can't serialize
     // the whole app. `pick_existing` still returns the best available copy (local cache
     // > primary > backup); the reachability cache only reorders the stats.
-    let (candidates, rotation) = {
+    let (candidates, rotation, cover) = {
         let guard = state.catalog.lock().map_err(|e| e.to_string())?;
         let catalog = guard.as_ref().ok_or("no catalog open")?;
         let candidates = catalog.photo_path_candidates(id).map_err(|e| e.to_string())?;
         let rotation = catalog.photo_rotation(id).unwrap_or(0);
-        (candidates, rotation)
+        // The cover version's settings, when the grid should show a version's look.
+        let cover = match kind {
+            ImageKind::Thumb => catalog.cover_of(id).ok().flatten().map(|(_, _, json)| json),
+            _ => None,
+        };
+        (candidates, rotation, cover)
     };
     // A thumbnail has a persistent fallback below, so it resolves in FastDisplay: a
     // cached-unreachable volume is never statted and the grid falls back at once. Preview
@@ -221,6 +226,18 @@ pub fn render_bytes<R: Runtime>(
     match resolved {
         Some(absolute) => match kind {
             ImageKind::Thumb => {
+                // A cover shows the version's look; if it cannot be rendered (no edit
+                // engine in this build, an engine-2 cover without the decoder, a failure)
+                // the plain thumbnail below is served instead.
+                if let Some(json) = &cover {
+                    #[cfg(feature = "edit")]
+                    match crate::plugins::edit::cover::cover_thumb(&absolute, id, json) {
+                        Ok(bytes) => return crate::thumbnails::rotate_jpeg(bytes, rotation),
+                        Err(e) => eprintln!("cover thumbnail for photo {id}: {e}"),
+                    }
+                    #[cfg(not(feature = "edit"))]
+                    let _ = json;
+                }
                 // Apply the user rotation on top of the file's baked EXIF orientation, then
                 // keep the rotated id-keyed copy so the photo stays browsable (correctly
                 // oriented) after it's offloaded and the NAS goes offline.

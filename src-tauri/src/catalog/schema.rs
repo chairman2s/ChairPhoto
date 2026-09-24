@@ -372,6 +372,18 @@ CREATE TABLE IF NOT EXISTS photo_version_history (
     created_at INTEGER NOT NULL,
     UNIQUE(version_id, seq)
 );
+-- A photo's cover: the version whose look the Library shows for it (grid thumbnail). One
+-- per photo; gone with the photo or the version. `rev` counts changes to the cover
+-- version's settings (save, history step, undo), so the grid's thumbnail URL — which
+-- carries "version:rev" — changes whenever the cover's look does, and the webview's cache
+-- can never show a stale one. Local to this catalog, like the history.
+CREATE TABLE IF NOT EXISTS photo_cover (
+    photo_id   INTEGER PRIMARY KEY REFERENCES photos(id) ON DELETE CASCADE,
+    -- NULL = no cover. The row outlives a cleared or deleted cover so `rev` keeps
+    -- counting and a later cover never reuses a token the webview has cached.
+    version_id INTEGER REFERENCES photo_versions(id) ON DELETE SET NULL,
+    rev        INTEGER NOT NULL DEFAULT 0
+);
 CREATE TABLE IF NOT EXISTS photo_version_history_head (
     version_id INTEGER PRIMARY KEY REFERENCES photo_versions(id) ON DELETE CASCADE,
     seq        INTEGER NOT NULL

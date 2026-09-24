@@ -2143,6 +2143,7 @@ fn row_to_photo(r: &Row) -> rusqlite::Result<Photo> {
         sharpness_method: r.get(20)?,
         burst_flag: r.get(21)?,
         version_count: r.get(22)?,
+        cover_token: r.get(23)?,
     })
 }
 

@@ -521,6 +521,7 @@ export default function App() {
     () => ({
       ids: photos.map((p) => p.id),
       names: new Map(photos.map((p) => [p.id, p.path.split(/[\\/]/).pop() ?? p.path])),
+      covers: new Map(photos.map((p) => [p.id, p.coverToken ?? null])),
     }),
     [photos],
   );
@@ -1789,6 +1790,7 @@ export default function App() {
                 photoId={selected.id}
                 neighbours={developNeighbours}
                 strip={{ ...developStrip, onSelect: (id: number) => library.select(id) }}
+                coverVersionId={selected.coverToken ? Number(selected.coverToken.split(":")[0]) : null}
                 photoW={selected.width}
                 photoH={selected.height}
                 // The shell clears the active version one render after the selection

@@ -3,7 +3,7 @@
 // docs/plans/darkroom/04-slices.md removes this chooser and the Darkroom becomes the
 // only surface. The setting is read when Develop opens, so a toggle applies on the
 // next open rather than mid-edit.
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { EditorView } from "../EditorView";
 import { developClose, getSetting, type PhotoVersion } from "../../modules/api";
 import { DarkroomView } from "./DarkroomView";
@@ -23,7 +23,14 @@ export function DevelopSurface(props: {
    *  preloads their RAW working images (docs/plans/raw-foundation, slice 4). */
   neighbours: number[];
   /** The filmstrip: the Library's order, names for tooltips, and how to move to a photo. */
-  strip: { ids: number[]; names: Map<number, string>; onSelect: (id: number) => void };
+  strip: {
+    ids: number[];
+    names: Map<number, string>;
+    covers: Map<number, string | null>;
+    onSelect: (id: number) => void;
+  };
+  /** The version this photo's Library thumbnail shows, if one is its cover. */
+  coverVersionId: number | null;
 }) {
   const [darkroom, setDarkroom] = useState<boolean | null>(null);
   useEffect(() => {
@@ -39,9 +46,14 @@ export function DevelopSurface(props: {
   // stepping to the next photo remounts the Darkroom (keyed per photo) but keeps the
   // session, so a preloaded neighbour is adopted instead of released. Leaving Develop
   // releases the working images.
+  // Leaving also refreshes the Library: edits made here may have changed a cover's look,
+  // and the grid's thumbnail URLs carry the cover token from the photo rows.
+  const onChangedRef = useRef(props.onChanged);
+  onChangedRef.current = props.onChanged;
   useEffect(
     () => () => {
       developClose().catch(() => {});
+      onChangedRef.current();
     },
     [],
   );
@@ -63,9 +75,16 @@ export function DevelopSurface(props: {
         onSavedActive={props.onSavedActive}
         neighbours={props.neighbours}
         strip={props.strip}
+        coverVersionId={props.coverVersionId}
       />
     );
   }
-  const { activeEditJson: _activeEditJson, neighbours: _neighbours, strip: _strip, ...editorProps } = props;
+  const {
+    activeEditJson: _activeEditJson,
+    neighbours: _neighbours,
+    strip: _strip,
+    coverVersionId: _coverVersionId,
+    ...editorProps
+  } = props;
   return <EditorView {...editorProps} />;
 }

@@ -451,6 +451,7 @@ pub fn run() {
             commands::version_history,
             commands::commit_version_edit,
             commands::goto_version_step,
+            commands::set_cover_version,
             commands::delete_version,
             commands::duplicate_version,
             commands::reorder_versions,

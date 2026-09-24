@@ -180,7 +180,7 @@ export function Bench({
                 key={p.id}
                 className={`thumbwrap ${p.id === active?.id ? "hl" : ""}`}
               >
-                <Thumbnail photoId={p.id} bust={thumbBusts?.get(p.id)} />
+                <Thumbnail photoId={p.id} bust={thumbBusts?.get(p.id)} cover={p.coverToken} />
               </div>
             ))}
           </div>

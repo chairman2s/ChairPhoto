@@ -109,6 +109,17 @@ order and filter, the one being developed centred. Click a frame, or ← / →, 
 on saves first. With the RAW engine on, the next and previous photos are already decoded
 in memory (docs/plans/raw-foundation, slice 4), so a step shows the RAW at once.
 
+**Cover.** "☆ Use as cover" on the Darkroom bar makes the current version the photo's
+face in the Library grid, the Bench and the filmstrip; "★ Cover" clears it. The original is
+untouched: the grid thumbnail is rendered from the version's settings at 512 px on a worker
+(`plugins/edit/cover.rs`, with the RAW engine when the version uses it) and cached under
+`<cache>/chairphoto/cover512v1/`, keyed by file and settings. If that render fails the plain
+thumbnail is shown. The photo row carries a cover token, `"<version>:<rev>"`, which the grid
+puts in the `thumb://` URL; `rev` rises on every change to the cover's look and on every
+new, cleared or deleted cover, so the webview never shows a cached stale face. Stored in
+the core table `photo_cover` (one row per photo, kept when the cover is cleared so `rev`
+keeps counting); local to this catalog like the history.
+
 Storage: core tables `photo_version_history` and `photo_version_history_head`
 (`catalog/schema.rs`), both cascading with their version. They are local to the catalog:
 catalog merge and bundle export carry versions but not their history. Every write that

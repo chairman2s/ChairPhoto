@@ -13,6 +13,7 @@ import { useEffect, useRef, useState } from "react";
 import {
   commitVersionEdit,
   createVersion,
+  setCoverVersion,
   developOpen,
   editRenderUrl,
   editZoneMasses,
@@ -97,6 +98,7 @@ export function DarkroomView({
   onSavedActive,
   neighbours = [],
   strip,
+  coverVersionId = null,
 }: {
   photoId: number;
   /** Original (sensor) pixel dimensions, for the crop-size readout and aspect math. */
@@ -115,7 +117,14 @@ export function DarkroomView({
   /** The photos either side, next first: preloaded after this one is ready. */
   neighbours?: number[];
   /** The filmstrip (absent: none shown). Stepping saves first — the view unmounts. */
-  strip?: { ids: number[]; names: Map<number, string>; onSelect: (id: number) => void };
+  strip?: {
+    ids: number[];
+    names: Map<number, string>;
+    covers?: Map<number, string | null>;
+    onSelect: (id: number) => void;
+  };
+  /** The version this photo's Library thumbnail shows (its cover), if any. */
+  coverVersionId?: number | null;
 }) {
   const neighboursRef = useRef(neighbours);
   neighboursRef.current = neighbours;
@@ -613,6 +622,23 @@ export function DarkroomView({
     if (target) void gotoStep(target.seq);
   };
 
+  // The cover: which version the Library shows for this photo. Toggled for the version
+  // being edited; the grid follows on its next refresh (now, and on leaving Develop).
+  const [cover, setCover] = useState<number | null>(coverVersionId);
+  const toggleCover = async () => {
+    const vid = versionIdRef.current;
+    if (vid == null) return;
+    await flush();
+    try {
+      const next = cover === vid ? null : vid;
+      await setCoverVersion(photoId, next);
+      setCover(next);
+      onChanged();
+    } catch (e) {
+      setError(String(e));
+    }
+  };
+
   /** Fork the current settings into a new version and continue there. */
   const newVersion = async () => {
     await flush();
@@ -818,6 +844,19 @@ export function DarkroomView({
         >
           🖥 Loupe print
         </button>
+        {versionId != null && (
+          <button
+            className={`dk-loupe-toggle ${cover === versionId ? "on" : ""}`}
+            onClick={() => void toggleCover()}
+            title={
+              cover === versionId
+                ? "The Library shows this version for the photo — click to show the original again"
+                : "Show this version's look as the photo's thumbnail in the Library"
+            }
+          >
+            {cover === versionId ? "★ Cover" : "☆ Use as cover"}
+          </button>
+        )}
         <button
           className="dk-save"
           onClick={() => void newVersion()}
@@ -917,6 +956,7 @@ export function DarkroomView({
             <Filmstrip
               ids={strip.ids}
               names={strip.names}
+              covers={strip.covers}
               currentId={photoId}
               onSelect={strip.onSelect}
               keysDisabled={duelOpen || proofs != null}

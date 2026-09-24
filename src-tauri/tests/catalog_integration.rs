@@ -1772,6 +1772,64 @@ fn version_history_records_steps_and_steps_back() {
     assert!(catalog.version_history(v).unwrap().steps.is_empty());
 }
 
+/// A version as the photo's cover: the photo row carries a token the grid puts in the
+/// thumbnail URL; the token changes on every change to the cover's look (a save, a history
+/// step, an undo) and on a new cover; a version of another photo is refused; deleting the
+/// cover version clears it.
+#[test]
+fn a_version_can_be_the_photo_cover_and_its_token_follows_the_look() {
+    let (catalog, root) = temp_catalog("cover");
+    let path = root.join("c.arw");
+    std::fs::write(&path, b"x").unwrap();
+    let photo = catalog.upsert_photo(&path, None, 1, 1).unwrap().id;
+    let other_path = root.join("o.arw");
+    std::fs::write(&other_path, b"y").unwrap();
+    let other = catalog.upsert_photo(&other_path, None, 1, 1).unwrap().id;
+    let a = catalog.create_version(photo, "A").unwrap();
+    let b = catalog.create_version(photo, "B").unwrap();
+    let foreign = catalog.create_version(other, "X").unwrap();
+    let token = |id: i64| catalog.get_photo(id).unwrap().cover_token;
+
+    assert_eq!(token(photo), None);
+    let t0 = catalog.set_cover_version(photo, Some(a)).unwrap().unwrap();
+    assert!(t0.starts_with(&format!("{a}:")));
+    assert_eq!(token(photo), Some(t0.clone()));
+    assert_eq!(catalog.cover_of(photo).unwrap().unwrap().0, a);
+
+    // Every change to the cover's look changes the token.
+    catalog.set_version_edit(a, r#"{"fade":0.1}"#).unwrap();
+    let t1 = token(photo).unwrap();
+    assert_ne!(t1, t0);
+    catalog.commit_version_edit(a, r#"{"fade":0.2}"#, "Fade 0.20", false).unwrap();
+    let t2 = token(photo).unwrap();
+    assert_ne!(t2, t1);
+    catalog.goto_version_step(a, 0).unwrap();
+    let t3 = token(photo).unwrap();
+    assert_ne!(t3, t2);
+    // …while edits to a version that is not the cover leave it alone.
+    catalog.set_version_edit(b, r#"{"fade":0.3}"#).unwrap();
+    assert_eq!(token(photo).unwrap(), t3);
+
+    // A new cover is a new token, never one seen before.
+    let tb = catalog.set_cover_version(photo, Some(b)).unwrap().unwrap();
+    assert!(tb.starts_with(&format!("{b}:")));
+    assert!(![&t0, &t1, &t2, &t3].contains(&&tb));
+
+    // Another photo's version is refused; clearing works; deleting the cover version clears.
+    assert!(catalog.set_cover_version(photo, Some(foreign)).is_err());
+    assert_eq!(catalog.set_cover_version(photo, None).unwrap(), None);
+    assert_eq!(token(photo), None);
+    // Clearing and choosing the same version again must not bring back a cached token.
+    let tb2 = catalog.set_cover_version(photo, Some(b)).unwrap().unwrap();
+    assert_ne!(tb2, tb);
+    catalog.delete_version(b).unwrap();
+    assert_eq!(token(photo), None);
+    assert!(catalog.cover_of(photo).unwrap().is_none());
+    // …nor after the cover version was deleted.
+    let ta = catalog.set_cover_version(photo, Some(a)).unwrap().unwrap();
+    assert!(![&t0, &t1, &t2, &t3].contains(&&ta));
+}
+
 /// History is bounded: the oldest steps go first, the head stays on the newest.
 #[test]
 fn version_history_keeps_at_most_the_cap() {

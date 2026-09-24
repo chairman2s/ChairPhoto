@@ -918,6 +918,11 @@ export interface VersionHistory {
   head: number | null;
 }
 
+/** Make a version the photo's cover (its Library thumbnail shows that look), or clear it
+ *  with null. Returns the new cover token. Only a reference is stored. */
+export const setCoverVersion = (photoId: number, versionId: number | null) =>
+  invoke<string | null>("set_cover_version", { photoId, versionId });
+
 /** A version's edit history. */
 export const versionHistory = (versionId: number) =>
   invoke<VersionHistory>("version_history", { versionId });

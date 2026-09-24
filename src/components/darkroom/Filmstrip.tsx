@@ -3,12 +3,13 @@
 // goes, so nothing is lost by stepping. Thumbnails come through the native `thumb://`
 // protocol; only a window around the current photo is rendered.
 import { useEffect, useRef } from "react";
-import { thumbnailUrl } from "../../modules/api";
+import { thumbUrl } from "../Thumbnail";
 import { arrowsBelongToTarget, stepTarget, windowAround } from "./filmstrip";
 
 export function Filmstrip({
   ids,
   names,
+  covers,
   currentId,
   onSelect,
   keysDisabled,
@@ -16,6 +17,8 @@ export function Filmstrip({
   ids: number[];
   /** File names for tooltips, by photo id. */
   names: Map<number, string>;
+  /** Cover tokens by photo id: frames show the same look as the Library grid. */
+  covers?: Map<number, string | null>;
   currentId: number;
   onSelect: (id: number) => void;
   /** A modal (proof sheet, duel) owns the arrow keys right now. */
@@ -57,7 +60,7 @@ export function Filmstrip({
           title={`${names.get(id) ?? ""} (${start + k + 1} of ${ids.length})`}
           aria-current={id === currentId ? "true" : undefined}
         >
-          <img src={thumbnailUrl(id)} alt="" loading="lazy" draggable={false} />
+          <img src={thumbUrl(id, undefined, covers?.get(id))} alt="" loading="lazy" draggable={false} />
         </button>
       ))}
     </nav>

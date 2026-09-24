@@ -7,6 +7,7 @@
 //! to the catalog core.
 
 mod auto;
+pub mod cover;
 #[cfg(test)]
 mod bench;
 pub mod cube;

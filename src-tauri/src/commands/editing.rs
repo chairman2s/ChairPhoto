@@ -561,6 +561,18 @@ async fn write_version_then_refresh_monochrome<T>(
     Ok(written)
 }
 
+/// Make a version the photo's cover — the look its Library thumbnail shows — or clear it
+/// with `null`. Returns the new cover token (`"version:rev"`), which the grid puts in the
+/// thumbnail URL. Only a reference is stored; the thumbnail is rendered from the settings.
+#[tauri::command(async)]
+pub fn set_cover_version(
+    state: State<'_, AppState>,
+    photo_id: i64,
+    version_id: Option<i64>,
+) -> Result<Option<String>, String> {
+    with_catalog(&state, |c| c.set_cover_version(photo_id, version_id))
+}
+
 /// A version's edit history (the Darkroom's History panel).
 #[tauri::command(async)]
 pub fn version_history(state: State<'_, AppState>, version_id: i64) -> Result<crate::catalog::VersionHistory, String> {

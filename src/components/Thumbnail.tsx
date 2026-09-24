@@ -15,11 +15,15 @@ import type { StorageStatus } from "../modules/api";
 export function Thumbnail({
   photoId,
   bust,
+  cover,
   status,
   metadataReady = true,
 }: {
   photoId: number;
   bust?: number;
+  /** The photo's cover token (`Photo.coverToken`): part of the URL, so a new cover — or
+   *  an edit to it — fetches a new thumbnail instead of the webview's cached one. */
+  cover?: string | null;
   /** Storage state, used to label the placeholder when the thumbnail can't load. */
   status?: StorageStatus;
   /**
@@ -60,8 +64,7 @@ export function Thumbnail({
       </div>
     );
   }
-  const url =
-    convertFileSrc(String(photoId), "thumb") + (bust ? `?v=${bust}` : "");
+  const url = thumbUrl(photoId, bust, cover);
   return (
     <img
       className="thumb"
@@ -72,4 +75,13 @@ export function Thumbnail({
       onError={() => setFailed(true)}
     />
   );
+}
+
+/** The `thumb://` URL for a photo: `v` busts after a file recovery, `c` follows the cover. */
+export function thumbUrl(photoId: number, bust?: number, cover?: string | null): string {
+  const q = new URLSearchParams();
+  if (bust) q.set("v", String(bust));
+  if (cover) q.set("c", cover);
+  const qs = q.toString();
+  return convertFileSrc(String(photoId), "thumb") + (qs ? `?${qs}` : "");
 }

@@ -97,6 +97,7 @@ const Tile = React.memo(function Tile({
       <Thumbnail
         photoId={photo.id}
         bust={bust}
+        cover={photo.coverToken}
         status={status}
         metadataReady={photo.metadataReady !== 0}
       />

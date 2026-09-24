@@ -52,6 +52,10 @@ export interface Photo {
    * value as 0.
    */
   versionCount?: number;
+  /** `"<version id>:<rev>"` when a version is this photo's cover (its Library thumbnail
+   *  shows that version's look); changes whenever the cover's look does. Absent/null:
+   *  the plain camera preview. */
+  coverToken?: string | null;
 }
 
 export interface Tag {

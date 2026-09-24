@@ -156,7 +156,8 @@ pub(crate) fn photo_columns(alias: &str) -> String {
           WHERE c.stack_parent_id = {alias}.id AND c.trashed_at IS NULL),
          {alias}.stack_parent_id, {alias}.metadata_ready, {alias}.sharpness,
          {alias}.sharpness_method, {alias}.burst_flag,
-         (SELECT COUNT(*) FROM photo_versions pv WHERE pv.photo_id = {alias}.id)"
+         (SELECT COUNT(*) FROM photo_versions pv WHERE pv.photo_id = {alias}.id),
+         (SELECT pc.version_id || ':' || pc.rev FROM photo_cover pc WHERE pc.photo_id = {alias}.id)"
     )
 }
 

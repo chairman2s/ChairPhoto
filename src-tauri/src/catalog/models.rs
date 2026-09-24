@@ -73,6 +73,10 @@ pub struct Photo {
     /// correlated `COUNT` over `idx_photo_versions_photo`, alongside the stack count that
     /// was already computed this way. 0 = never edited.
     pub version_count: i64,
+    /// `"<version id>:<rev>"` when a version is this photo's cover (`photo_cover`), else
+    /// `None`. The grid puts it in the thumbnail URL, so a new cover — or a change to the
+    /// cover's settings — is a new URL.
+    pub cover_token: Option<String>,
 }
 
 /// Lightweight row used by the burst analysis engine to avoid fetching full Photo rows.

@@ -176,6 +176,7 @@ impl Catalog {
             "UPDATE photo_versions SET edit_json = ?1, updated_at = ?2 WHERE id = ?3",
             params![value, now(), version_id],
         )?;
+        self.bump_cover_rev(version_id)?;
         Ok(())
     }
 
@@ -293,6 +294,10 @@ impl Catalog {
                 "UPDATE photo_versions SET edit_json = ?1, updated_at = ?2 WHERE id = ?3",
                 params![value, now, version_id],
             )?;
+            tx.execute(
+                "UPDATE photo_cover SET rev = rev + 1 WHERE version_id = ?1",
+                params![version_id],
+            )?;
         }
         tx.commit()?;
         self.version_history(version_id)
@@ -319,8 +324,61 @@ impl Catalog {
             "UPDATE photo_versions SET edit_json = ?1, updated_at = ?2 WHERE id = ?3",
             params![json, now(), version_id],
         )?;
+        tx.execute(
+            "UPDATE photo_cover SET rev = rev + 1 WHERE version_id = ?1",
+            params![version_id],
+        )?;
         tx.commit()?;
         Ok((json, self.version_history(version_id)?))
+    }
+
+    /// The cover version's settings changed: bump its rev so the thumbnail URL changes.
+    fn bump_cover_rev(&self, version_id: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE photo_cover SET rev = rev + 1 WHERE version_id = ?1",
+            params![version_id],
+        )?;
+        Ok(())
+    }
+
+    /// Make `version_id` the photo's cover, or clear it with `None`. The version must be
+    /// this photo's. Returns the new cover token (`"version:rev"`), or `None` when cleared.
+    pub fn set_cover_version(&self, photo_id: i64, version_id: Option<i64>) -> Result<Option<String>> {
+        let Some(vid) = version_id else {
+            self.conn.execute(
+                "UPDATE photo_cover SET version_id = NULL, rev = rev + 1 WHERE photo_id = ?1",
+                params![photo_id],
+            )?;
+            return Ok(None);
+        };
+        let owner: Option<i64> = self
+            .conn
+            .query_row("SELECT photo_id FROM photo_versions WHERE id = ?1", params![vid], |r| r.get(0))
+            .optional()?;
+        if owner != Some(photo_id) {
+            return Err(CatalogError::Validation("that version does not belong to this photo".into()));
+        }
+        // A new cover starts one past any previous rev for this photo (clearing keeps the
+        // row), so its token never equals one the webview may have cached earlier.
+        self.conn.execute(
+            "INSERT INTO photo_cover(photo_id, version_id, rev) VALUES(?1, ?2, 0)
+             ON CONFLICT(photo_id) DO UPDATE SET version_id = excluded.version_id, rev = photo_cover.rev + 1",
+            params![photo_id, vid],
+        )?;
+        Ok(self.cover_of(photo_id)?.map(|(v, rev, _)| format!("{v}:{rev}")))
+    }
+
+    /// The photo's cover: (version id, rev, the version's settings), if it has one.
+    pub fn cover_of(&self, photo_id: i64) -> Result<Option<(i64, i64, String)>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT pc.version_id, pc.rev, pv.edit_json FROM photo_cover pc
+                 JOIN photo_versions pv ON pv.id = pc.version_id WHERE pc.photo_id = ?1",
+                params![photo_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?)
     }
 
     pub fn delete_version(&self, version_id: i64) -> Result<()> {

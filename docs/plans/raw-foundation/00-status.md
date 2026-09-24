@@ -44,13 +44,24 @@
   |Δ| to the camera JPEG, centre 80 %, levels of 255: plain sRGB 10.1 → camera 3.6
   (per photo 2.5–4.3). The curve alone brings the colour up to the camera's (median chroma
   on the Vivid frame 58 → 75, camera 75), so there is no saturation step. Records without
-  the field, saved before, stay sRGB. Left out of the fit and still off by about a stop:
-  two frames at **extended low ISO** (50 on the A7 IV, 80 on the A7R VI, below base 100),
-  which the camera exposes brighter and pulls down in its own processing — a per-photo
-  exposure the decode should read from the file (follow-on, with decision 4's per-camera
-  baseline); and `_DSC7602.dng`, whose camera preview sits ~0.3 stop darker for a reason
-  not found (its `BaselineExposure` is +0.35, the wrong sign to explain it). DRO is local
-  tone mapping; a global curve approximates it. Not yet seen on screen. **Headroom seen on
+  the field, saved before, stay sRGB. Left out of the fit: two frames at **extended low
+  ISO** (50 on the A7 IV, 80 on the A7R VI, below base 100), which the camera exposes
+  brighter and pulls down in its own processing, and `_DSC7602.dng`, whose camera preview
+  sits darker for a reason not found (its `BaselineExposure` is +0.35, the wrong sign).
+  **Per-photo camera match (2026-09-24):** those are brightness the global curve cannot
+  carry, so each working image is now also measured against its own camera JPEG when it
+  is prepared (`linear::camera_match_ev`: the EV offset minimizing mean |Δ| of luma, centre
+  80 %), and a new engine-2 record stores it as `cameraEv`, added to the baseline lift —
+  decision 4's per-camera baseline, made per photo. It is not an ISO rule: the ISO 50 and
+  ISO 80 frames both need about −1.6 EV. Offsets on the corpus: the five fitted frames
+  −0.10..+0.04, the low-ISO frames −1.60 and −1.57, the DNG −0.64. Mean |Δ| over all
+  eight: camera curve alone 18.4 → with the match 3.7 (worst 6.2, the DNG). Cost per
+  prepared image in the debug build ~120–200 ms (the linear downscale most of it), on
+  the decode thread before the image is announced. Seen on screen: the ISO 50 frame's
+  stage mean RGB (93, 89, 85) against the camera JPEG's (93, 89, 84), 60 levels brighter
+  before; a Contrast nudge saved `"cameraEv":-1.6`. DRO is local tone mapping; a global
+  curve and offset approximate it. **Not matched: hue** — the camera renders blues more
+  violet than the decode's matrix (the Vivid frame). **Headroom seen on
   a clipped frame (2026-09-19):** a sunlit portrait against sky whose camera preview had
   pixels in the whites bin and a featureless cloud bank; the RAW at −1 EV shows the clouds'
   shape and shading, keeps the sky blue instead of grey, and empties the whites bin —

@@ -223,14 +223,16 @@ export async function saveUserPresets(list: DevelopPreset[]): Promise<void> {
 }
 
 /** A record's look, as a preset stores it: everything but the framing (crop, straighten,
- *  perspective), the engine stamp and the engine's display transform. A preset is applied
+ *  perspective), the engine stamp, and the engine's display transform and camera match
+ *  (both belong to the photo, not the look). A preset is applied
  *  over another photo's framing, and which engine a preset means is decided where it is
  *  applied (docs/plans/raw-foundation, slice 7). Never mutates `record`. */
 export function lookOnly(record: VersionEdit): DevelopPreset["edit"] {
   const { crop: _c, straighten: _s, perspective: _p, ...rest } = record;
-  const out = { ...rest } as DevelopPreset["edit"] & { engine?: unknown; display?: unknown };
+  const out = { ...rest } as DevelopPreset["edit"] & { engine?: unknown; display?: unknown; cameraEv?: unknown };
   delete out.engine;
   delete out.display;
+  delete out.cameraEv;
   return out;
 }
 

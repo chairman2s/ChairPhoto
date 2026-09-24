@@ -138,6 +138,7 @@ pub(crate) fn test_image(w: u32, h: u32) -> Arc<WorkingImage> {
         cam_mul: [1.0; 4],
         rgb_cam: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
         decoder: "test",
+        camera_ev: None,
     })
 }
 

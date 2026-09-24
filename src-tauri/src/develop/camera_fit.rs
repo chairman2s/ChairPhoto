@@ -220,12 +220,17 @@ fn fit_camera_transform() {
     let sat = ratios[ratios.len() / 2];
     println!("\nsaturation factor after the curve (median over photos) = {sat:.3}  per photo {ratios:.2?}");
     println!("\nper photo: mean |Δ| vs camera JPEG (0..255), mean luma, median chroma");
-    let (mut t0, mut t1, mut t2, mut t3) = (0.0, 0.0, 0.0, 0.0);
+    let (mut t0, mut t1, mut t2, mut t3, mut tm) = (0.0, 0.0, 0.0, 0.0, 0.0);
     for (f, small, pv) in &pairs {
         let plain = linear::to_display(small, DisplayTransform::Srgb, BASELINE_EV);
         let c = apply(small, 1.0);
         let cs = apply(small, sat);
         let shipped = linear::to_display(small, DisplayTransform::Camera, BASELINE_EV);
+        let match_ev = linear::camera_match_ev(small, pv).unwrap_or(0.0);
+        let matched = linear::to_display(small, DisplayTransform::Camera, BASELINE_EV + match_ev);
+        let em = mean_abs(&matched, pv);
+        tm += em;
+        println!("  {:<16} matched ev {match_ev:+.2} → {em:5.1}", f.file_name().unwrap().to_string_lossy());
         if let Ok(dir) = std::env::var("CHAIRPHOTO_FIT_DUMP") {
             // Plain sRGB | shipped camera transform | camera JPEG, side by side.
             let (w, h) = shipped.dimensions();
@@ -266,4 +271,5 @@ fn fit_camera_transform() {
     }
     let n = pairs.len() as f64;
     println!("  mean             srgb {:5.1}  curve {:5.1}  curve+sat {:5.1}  shipped {:5.1}", t0 / n, t1 / n, t2 / n, t3 / n);
+    println!("  mean matched {:5.1}", tm / n);
 }

@@ -244,10 +244,13 @@ export function DarkroomView({
   sourceTokenRef.current = sourceToken;
   const engineRef = useRef(sourceState.engine);
   engineRef.current = sourceState.engine;
+  const cameraEvRef = useRef(sourceState.cameraEv);
+  cameraEvRef.current = sourceState.cameraEv;
   /** The record as saved: stamped with the engine that rendered it (engine 1 = absent).
-   *  A record becoming engine 2 here also gets engine 2's default display transform. */
+   *  A record becoming engine 2 here also gets engine 2's default display transform and
+   *  this frame's camera match. */
   const stamped = (record: VersionEdit): VersionEdit =>
-    engineRef.current === 2 ? asLinearRecord(record) : record;
+    engineRef.current === 2 ? asLinearRecord(record, cameraEvRef.current) : record;
   const [masses, setMasses] = useState<number[]>([]);
   const [rendering, setRendering] = useState(false);
   const [error, setError] = useState("");

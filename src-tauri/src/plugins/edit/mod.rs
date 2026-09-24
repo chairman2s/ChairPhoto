@@ -73,6 +73,11 @@ struct EditRecord {
     /// Engine 2's rendering transform slot (`linear::DisplayTransform::from_record`).
     #[serde(default)]
     display: Option<String>,
+    /// Engine 2: the exposure offset, in EV, that matched this photo's camera JPEG when
+    /// the record was made (`linear::camera_match_ev`) — added to the baseline lift, not
+    /// shown on the Exposure slider. Absent = 0, so older records render as they did.
+    #[serde(default, rename = "cameraEv")]
+    camera_ev: f32,
 }
 
 fn engine_v1() -> u32 {
@@ -401,7 +406,7 @@ fn finish_linear(
 ) -> Result<RgbImage, String> {
     if opts.skip_look {
         t.mark("look_skipped");
-        return Ok(linear::to_display(&lin, linear::DisplayTransform::Srgb, linear::BASELINE_EV));
+        return Ok(linear::to_display(&lin, linear::DisplayTransform::Srgb, linear::BASELINE_EV + edit.camera_ev));
     }
     let wb = linear::WbSpec::from_record(
         edit.tone.wb.mode.as_deref(),
@@ -413,7 +418,7 @@ fn finish_linear(
     linear::apply_exposure_linear(&mut lin, edit.tone.ev, gains);
     t.mark("linear_exposure");
     let transform = linear::DisplayTransform::from_record(edit.display.as_deref());
-    let mut rgb = linear::to_display(&lin, transform, linear::BASELINE_EV);
+    let mut rgb = linear::to_display(&lin, transform, linear::BASELINE_EV + edit.camera_ev);
     t.mark("display");
     let lut = edit.lut.as_ref().and_then(|l| {
         crate::commands::luts_dir()
@@ -922,6 +927,7 @@ mod tests {
             cam_mul: [1.0; 4],
             rgb_cam: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
             decoder: "test",
+            camera_ev: None,
         })
     }
 
@@ -952,6 +958,23 @@ mod tests {
         // and changes the ramp beside it.
         assert_eq!(camera.get_pixel(2, 10).0, [255, 255, 255]);
         assert_ne!(camera.get_pixel(40, 10).0, plain.get_pixel(40, 10).0);
+    }
+
+    #[test]
+    fn engine2_camera_ev_on_the_record_is_an_exposure_below_the_slider() {
+        let img = synthetic_working(0.3);
+        let render = |json: &str, gen: u64| {
+            let token = SourceToken::Working { photo_id: 4, generation: gen };
+            render_proxy(RenderSource::Working { token, image: img.clone() }, json, 0, RenderOpts::default()).unwrap().to_rgb8()
+        };
+        let matched = render(r#"{"engine": 2, "display": "camera", "cameraEv": -1.0}"#, 1);
+        let by_slider = render(r#"{"engine": 2, "display": "camera", "tone": {"ev": -1.0}}"#, 2);
+        let none = render(r#"{"engine": 2, "display": "camera"}"#, 3);
+        let zero = render(r#"{"engine": 2, "display": "camera", "cameraEv": 0}"#, 4);
+        assert_eq!(none.as_raw(), zero.as_raw(), "absent means no offset");
+        assert_ne!(matched.as_raw(), none.as_raw());
+        let worst = matched.as_raw().iter().zip(by_slider.as_raw()).map(|(a, b)| (*a as i32 - *b as i32).abs()).max().unwrap();
+        assert!(worst <= 1, "the same light either way (max |Δ| {worst})");
     }
 
     #[test]

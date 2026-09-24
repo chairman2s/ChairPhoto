@@ -55,6 +55,12 @@ describe("reduceSource", () => {
     const gone = reduceSource(resident, { source: "unsupported", camera: null, reason: "x", photoId: 5 }, 5);
     expect(gone.token).toBeUndefined();
     expect(gone.engine).toBe(1);
+    expect(gone.cameraEv).toBe(0);
+  });
+
+  it("carries the resident RAW's camera match, and 0 when it was not measured", () => {
+    expect(reduceSource(INITIAL_SOURCE, { ...raw, cameraEv: -1.6 }, 5).cameraEv).toBe(-1.6);
+    expect(reduceSource(INITIAL_SOURCE, raw, 5).cameraEv).toBe(0);
   });
 
   it("badges the preparing state honestly", () => {

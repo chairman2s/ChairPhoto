@@ -9,6 +9,7 @@ describe("lookOnly", () => {
       JSON.stringify({
         engine: 2,
         display: "camera",
+        cameraEv: -1.6,
         crop: { x: 0.1, y: 0.1, w: 0.8, h: 0.8, aspect: "4:5" },
         straighten: 1.5,
         perspective: { tl: [0, 0], tr: [1, 0], br: [1, 1], bl: [0, 1] },
@@ -19,7 +20,7 @@ describe("lookOnly", () => {
       }),
     );
     const look = lookOnly(record) as Record<string, unknown>;
-    for (const k of ["crop", "straighten", "perspective", "engine", "display"]) expect(look[k]).toBeUndefined();
+    for (const k of ["crop", "straighten", "perspective", "engine", "display", "cameraEv"]) expect(look[k]).toBeUndefined();
     expect((look.tone as { ev: number }).ev).toBe(0.5);
     expect(look.zones).toEqual([0, 0.1, 0, 0, 0, 0, 0, 0]);
     expect(look.fade).toBe(0.2);

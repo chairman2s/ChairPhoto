@@ -19,7 +19,18 @@ pub enum DevelopSource {
     /// A RAW the vendored decoder identifies. `bits` is the working depth this engine will
     /// use (the decode is 16-bit linear); `megapixels` from the decoder's own dimensions.
     /// `token` is set once the working image is resident — it goes into every render URL.
-    Raw { camera: String, megapixels: f32, bits: u8, decoder: String, #[serde(skip_serializing_if = "Option::is_none")] token: Option<String> },
+    /// `camera_ev` rides with the token: the offset that matched the camera's JPEG of this
+    /// frame, which the Darkroom stamps on new engine-2 records.
+    Raw {
+        camera: String,
+        megapixels: f32,
+        bits: u8,
+        decoder: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        token: Option<String>,
+        #[serde(rename = "cameraEv", skip_serializing_if = "Option::is_none")]
+        camera_ev: Option<f32>,
+    },
     /// A RAW the decoder does not support (yet): the Darkroom keeps working on the camera
     /// preview and says so.
     Unsupported { camera: Option<String>, reason: String },
@@ -66,6 +77,7 @@ fn probe_source(path: &std::path::Path) -> DevelopSource {
             bits: 16,
             decoder: crate::raw::decoder_version().to_string(),
             token: None,
+            camera_ev: None,
         },
         RawSupport::Unsupported { camera, reason } => DevelopSource::Unsupported { camera, reason },
     }

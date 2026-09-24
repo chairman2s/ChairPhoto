@@ -254,6 +254,76 @@ pub fn to_display(img: &Rgb32FImage, t: DisplayTransform, baseline_ev: f32) -> R
     out
 }
 
+/// The exposure offset, in EV, at which `lin` (a small linear image, as-shot) rendered
+/// through the camera transform best matches the camera's own JPEG of the same frame in
+/// brightness: mean |Δ| of luma over the centre 80 % (every other pixel), searched over
+/// −3..+2 EV coarse to fine, to 0.01. It carries what a global curve cannot — the pull an
+/// extended low ISO gets in the camera, a body's metering bias, a global part of DRO.
+/// `None` when the two frames do not have the same shape (a crop in the camera JPEG, a
+/// failed turn).
+pub fn camera_match_ev(lin: &Rgb32FImage, camera: &RgbImage) -> Option<f32> {
+    let (w, h) = lin.dimensions();
+    let (cw, ch) = camera.dimensions();
+    if w < 10 || h < 10 || cw == 0 || ch == 0 {
+        return None;
+    }
+    let (a, b) = (w as f32 / h as f32, cw as f32 / ch as f32);
+    if (a / b - 1.0).abs() > 0.03 {
+        return None;
+    }
+    let (x0, y0, x1, y1) = (w / 10, h / 10, w - w / 10, h - h / 10);
+    let mut px: Vec<([f32; 3], f32)> = Vec::with_capacity(((x1 - x0) * (y1 - y0)) as usize);
+    // Every other pixel each way: a quarter of the work, and the match is a mean anyway.
+    // The camera's luma for a pixel is the mean over the block of the JPEG it covers — a
+    // box average by hand, because the `image` crate's generic resize runs unoptimized in
+    // a debug build and cost most of a second here.
+    // The JPEG's rows (or columns) under output row `i` of `n`: never empty, never past `cn`.
+    let block = |i: u32, n: u32, cn: u32| {
+        let (i, n, cn) = (i as u64, n as u64, cn as u64);
+        let a = (i * cn / n).min(cn - 1);
+        let b = ((i + 1) * cn).div_ceil(n).clamp(a + 1, cn);
+        (a as u32, b as u32)
+    };
+    for y in (y0..y1).step_by(2) {
+        let (cy0, cy1) = block(y, h, ch);
+        for x in (x0..x1).step_by(2) {
+            let (cx0, cx1) = block(x, w, cw);
+            let (mut sum, mut n) = (0f32, 0f32);
+            for cy in cy0..cy1 {
+                for cx in cx0..cx1 {
+                    let c = camera.get_pixel(cx, cy).0;
+                    sum += 0.2126 * c[0] as f32 + 0.7152 * c[1] as f32 + 0.0722 * c[2] as f32;
+                    n += 1.0;
+                }
+            }
+            px.push((lin.get_pixel(x, y).0, sum / n / 255.0));
+        }
+    }
+    let lut = camera_lut();
+    let err = |ev: f32| -> f32 {
+        let lift = 2f32.powf(BASELINE_EV + ev);
+        let mut e = 0.0;
+        for (s, l) in &px {
+            let v = [camera_lookup(lut, (s[0] * lift).max(0.0)), camera_lookup(lut, (s[1] * lift).max(0.0)), camera_lookup(lut, (s[2] * lift).max(0.0))];
+            e += (0.2126 * v[0] + 0.7152 * v[1] + 0.0722 * v[2] - l).abs();
+        }
+        e / px.len() as f32
+    };
+    let search = |from: f32, to: f32, step: f32| -> f32 {
+        let n = ((to - from) / step).round() as i32;
+        (0..=n)
+            .map(|i| from + i as f32 * step)
+            .min_by(|a, b| err(*a).partial_cmp(&err(*b)).unwrap())
+            .unwrap()
+    };
+    // Coarse to fine (21 + 10 + 10 evaluations instead of 121): the error is a smooth
+    // valley in EV, so each pass only has to bracket the previous one's minimum.
+    let coarse = search(-3.0, 2.0, 0.25);
+    let mid = search(coarse - 0.25, coarse + 0.25, 0.05);
+    let fine = search(mid - 0.05, mid + 0.05, 0.01);
+    Some((fine * 100.0).round() / 100.0)
+}
+
 /// Downscale a linear image so its long edge is `max_edge`, by exact area averaging
 /// (every source pixel contributes its covered fraction to exactly one or two output
 /// pixels per axis). Written here because the `image` crate's `thumbnail`/`resize` are
@@ -414,6 +484,25 @@ mod tests {
         let (c, s) = (c.get_pixel(0, 0).0, s.get_pixel(0, 0).0);
         assert!(c[0] > c[1] && c[1] > c[2]);
         assert!(c[0] as i32 - c[2] as i32 > s[0] as i32 - s[2] as i32);
+    }
+
+    #[test]
+    fn camera_match_ev_recovers_a_known_offset_and_refuses_another_shape() {
+        // A scene with shadows, midtones and a highlight; the "camera" rendered it a
+        // stop and a quarter darker than the transform's as-shot render.
+        let lin = Rgb32FImage::from_fn(96, 64, |x, y| {
+            let v = 0.002 * 1.07f32.powi(x as i32) * (1.0 + y as f32 / 64.0);
+            image::Rgb([v * 1.1, v, v * 0.8])
+        });
+        let camera = to_display(&lin, DisplayTransform::Camera, BASELINE_EV - 1.25);
+        let ev = camera_match_ev(&lin, &camera).unwrap();
+        assert!((ev + 1.25).abs() <= 0.02, "matched {ev}");
+        // At the camera's own size too (the preview is larger than the 256 px copy).
+        let big = image::imageops::resize(&camera, 192, 128, image::imageops::FilterType::Triangle);
+        assert!((camera_match_ev(&lin, &big).unwrap() + 1.25).abs() <= 0.05);
+        // A turned or cropped JPEG is not this frame.
+        let turned = image::imageops::rotate90(&camera);
+        assert_eq!(camera_match_ev(&lin, &turned), None);
     }
 
     #[test]

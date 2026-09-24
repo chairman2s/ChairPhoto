@@ -125,6 +125,9 @@ export interface VersionEdit {
    *  the curve fitted to the camera's own JPEGs. New engine-2 records get "camera"
    *  ({@link asLinearRecord}); a saved record keeps what it has. */
   display?: string;
+  /** Engine 2: the exposure offset, in EV, that matched this photo's camera JPEG when the
+   *  record was made — part of the baseline, not the Exposure slider. Absent = 0. */
+  cameraEv?: number;
 }
 
 /** The scene-linear engine that renders from the RAW working image. */
@@ -135,11 +138,14 @@ export const ENGINE_LINEAR = 2;
 export const DEFAULT_LINEAR_DISPLAY = "camera";
 
 /** `record` as an engine-2 record. One already made for engine 2 is returned as is — its
- *  display transform included, so a saved version renders the same forever; one becoming
- *  engine 2 now gets the default display transform. */
-export function asLinearRecord(record: VersionEdit): VersionEdit {
+ *  display transform and camera match included, so a saved version renders the same
+ *  forever; one becoming engine 2 now gets the default display transform and this frame's
+ *  camera match (`cameraEv`, measured when the RAW was prepared; 0 is left off). */
+export function asLinearRecord(record: VersionEdit, cameraEv = 0): VersionEdit {
   if (record.engine === ENGINE_LINEAR) return record;
-  return { ...record, engine: ENGINE_LINEAR, display: record.display ?? DEFAULT_LINEAR_DISPLAY };
+  const out: VersionEdit = { ...record, engine: ENGINE_LINEAR, display: record.display ?? DEFAULT_LINEAR_DISPLAY };
+  if (cameraEv !== 0 && out.display === DEFAULT_LINEAR_DISPLAY) out.cameraEv = cameraEv;
+  return out;
 }
 
 /** Whether a record belongs to the linear engine. */

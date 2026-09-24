@@ -27,4 +27,14 @@ describe("engine id on the record", () => {
     expect(asLinearRecord(old)).toBe(old);
     expect(asLinearRecord(parseEdit('{"engine":2,"display":"soft"}')).display).toBe("soft");
   });
+
+  it("stamps this frame's camera match on a new record only, and leaves 0 off", () => {
+    expect(asLinearRecord({ fade: 0.1 }, -1.6)).toEqual({ fade: 0.1, engine: 2, display: "camera", cameraEv: -1.6 });
+    expect(asLinearRecord({ fade: 0.1 }, 0)).not.toHaveProperty("cameraEv");
+    // A saved engine-2 record keeps its own match (or none), whatever this open measured.
+    const saved = parseEdit('{"engine":2,"display":"camera","cameraEv":-0.5}');
+    expect(asLinearRecord(saved, -1.6)).toBe(saved);
+    // The match belongs to the camera transform; a record asking for another gets none.
+    expect(asLinearRecord({ display: "srgb" }, -1.6)).not.toHaveProperty("cameraEv");
+  });
 });

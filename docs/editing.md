@@ -312,7 +312,9 @@ Darkroom) until the swap slice makes it the default.
   transform (`display`: absent/`"srgb"`, `"soft"` with a highlight shoulder, or
   `"camera"`, the per-channel curve fitted to the camera's own JPEGs, which new engine-2
   records get by default; a record keeps the transform it was saved with) with a
-  provisional `BASELINE_EV` lift so as-shot lands near the camera JPEG, then the *same*
+  `BASELINE_EV` lift plus the record's `cameraEv` — the offset that matched this photo's
+  camera JPEG, measured when the RAW was prepared and stamped on a new engine-2 record —
+  so as-shot lands at the camera JPEG's brightness, then the *same*
   display-domain look as engine 1 — zones, region sliders, contrast, saturation, and the
   finish (B&W, LUT, split, fade, vignette, grain) — so presets mean the same on both.
   Geometry (perspective → straighten → crop → downscale) runs on the f32 image; the

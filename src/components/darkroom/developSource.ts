@@ -52,16 +52,18 @@ export interface SourceState {
   token: string | undefined;
   /** The engine the working record should be written for: 2 once the RAW is resident. */
   engine: 1 | 2;
+  /** The resident RAW's camera match, in EV (0 when unmeasured or not on the RAW). */
+  cameraEv: number;
   /** The latest source, for the badge. */
   source: DevelopSource | null;
 }
 
-export const INITIAL_SOURCE: SourceState = { token: undefined, engine: 1, source: null };
+export const INITIAL_SOURCE: SourceState = { token: undefined, engine: 1, cameraEv: 0, source: null };
 
 /** Fold a source event in. Events for another photo are ignored; a resident RAW yields its
  *  token and engine 2; anything else drops back to the preview path. Pure. */
 export function reduceSource(prev: SourceState, e: DevelopSource & { photoId?: number }, photoId: number): SourceState {
   if (e.photoId !== undefined && e.photoId !== photoId) return prev;
-  if (e.source === "raw" && e.token) return { token: e.token, engine: 2, source: e };
-  return { token: undefined, engine: 1, source: e };
+  if (e.source === "raw" && e.token) return { token: e.token, engine: 2, cameraEv: e.cameraEv ?? 0, source: e };
+  return { token: undefined, engine: 1, cameraEv: 0, source: e };
 }

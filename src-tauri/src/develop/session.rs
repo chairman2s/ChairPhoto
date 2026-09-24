@@ -216,6 +216,7 @@ fn with_token(probe: DevelopSource, token: &SourceToken) -> DevelopSource {
             bits,
             decoder,
             token: Some(token.to_query()),
+            camera_ev: super::resident(token).and_then(|i| i.camera_ev),
         },
         other => other,
     }
@@ -295,7 +296,9 @@ fn prepare<R: Runtime>(
         if aborted() {
             return fail();
         }
-        let image = Arc::new(working_image_from(decoded));
+        let mut image = working_image_from(decoded);
+        image.camera_ev = measure_camera_ev(&path, &image);
+        let image = Arc::new(image);
         if aborted() {
             return fail();
         }
@@ -342,8 +345,9 @@ pub(crate) fn preload_neighbours(
         if abort.load(Ordering::Relaxed) {
             return;
         }
-        let image = Arc::new(working_image_from(decoded));
-        if !preload_insert(claim, &token, image) {
+        let mut image = working_image_from(decoded);
+        image.camera_ev = measure_camera_ev(npath, &image);
+        if !preload_insert(claim, &token, Arc::new(image)) {
             return;
         }
         eprintln!("develop: neighbour {nid} preloaded from {from} in {:.2?}", t.elapsed());
@@ -400,6 +404,22 @@ pub(crate) fn publish(
     }
 }
 
+/// How far this frame's camera JPEG sits from the camera transform's as-shot render, in EV
+/// (`linear::camera_match_ev` on a 256 px copy against the app's own preview, which is
+/// oriented and already converted to sRGB). `None` when there is no preview or the frames
+/// differ in shape; the caller's records then carry no offset.
+fn measure_camera_ev(path: &std::path::Path, image: &WorkingImage) -> Option<f32> {
+    let t = std::time::Instant::now();
+    let preview = crate::thumbnails::preview_bytes(path).ok()?;
+    let camera = image::load_from_memory(&preview).ok()?.to_rgb8();
+    let t_prev = t.elapsed();
+    let small = crate::plugins::edit::linear::downscale_linear(&image.linear, 256);
+    let t_down = t.elapsed();
+    let ev = crate::plugins::edit::linear::camera_match_ev(&small, &camera);
+    eprintln!("develop: camera match {ev:?} EV in {:.2?} (preview {t_prev:.2?}, downscale {:.2?}, match {:.2?})", t.elapsed(), t_down - t_prev, t.elapsed() - t_down);
+    ev
+}
+
 /// The decoder's 16-bit linear output as the engine's f32 working image: normalized to
 /// sensor white, oriented for display.
 pub fn working_image_from(d: crate::raw::LinearDecode) -> WorkingImage {
@@ -418,6 +438,7 @@ pub fn working_image_from(d: crate::raw::LinearDecode) -> WorkingImage {
         cam_mul: d.cam_mul,
         rgb_cam: d.rgb_cam,
         decoder: crate::raw::decoder_version(),
+        camera_ev: None,
     }
 }
 
@@ -442,7 +463,7 @@ mod tests {
     }
 
     fn raw_probe() -> DevelopSource {
-        DevelopSource::Raw { camera: "Test".into(), megapixels: 1.0, bits: 16, decoder: "test".into(), token: None }
+        DevelopSource::Raw { camera: "Test".into(), megapixels: 1.0, bits: 16, decoder: "test".into(), token: None, camera_ev: None }
     }
 
     fn decode_claim(state: &AppState, photo_id: i64) -> JobClaim<DevelopStatus> {
@@ -508,6 +529,27 @@ mod tests {
         // And A's terminal clear is a no-op on B's slot.
         a.slot.clear();
         assert!(state.jobs.develop.status().unwrap().is_some());
+    }
+
+    /// The source answer for a resident photo carries the camera match its image was
+    /// prepared with, so the Darkroom can stamp it on a new record.
+    #[test]
+    fn the_raw_answer_carries_the_images_camera_match() {
+        let _serial = serial();
+        let (state, _dir) = state(true);
+        let a = decode_claim(&state, 1);
+        let ta = token_of(&a, 1);
+        let mut img = WorkingImage::clone_for_test(&test_image(8, 8));
+        img.camera_ev = Some(-1.5);
+        assert_eq!(publish(&a, 1, &ta, Arc::new(img)), Published::Resident);
+        match current(&state, 1, raw_probe()) {
+            DevelopSource::Raw { token: Some(_), camera_ev, .. } => assert_eq!(camera_ev, Some(-1.5)),
+            other => panic!("{other:?}"),
+        }
+        let json = serde_json::to_value(current(&state, 1, raw_probe())).unwrap();
+        assert_eq!(json["cameraEv"], -1.5);
+        close(&state).unwrap();
+        a.slot.clear();
     }
 
     /// Leaving Develop trips the claim and releases the image; the token it minted is then

@@ -53,9 +53,27 @@ pub struct WorkingImage {
     pub cam_mul: [f32; 4],
     pub rgb_cam: [[f32; 3]; 3],
     pub decoder: &'static str,
+    /// The exposure offset that matched the camera's own JPEG of this frame
+    /// (`linear::camera_match_ev`), measured when the image was prepared. New engine-2
+    /// records carry it as `cameraEv`; the image never applies it by itself.
+    pub camera_ev: Option<f32>,
 }
 
 impl WorkingImage {
+    /// A field-for-field copy, for tests that vary one field of a shared image.
+    #[cfg(test)]
+    pub fn clone_for_test(&self) -> WorkingImage {
+        WorkingImage {
+            width: self.width,
+            height: self.height,
+            linear: self.linear.clone(),
+            cam_mul: self.cam_mul,
+            rgb_cam: self.rgb_cam,
+            decoder: self.decoder,
+            camera_ev: self.camera_ev,
+        }
+    }
+
     pub fn bytes(&self) -> usize {
         self.linear.as_raw().len() * std::mem::size_of::<f32>()
     }

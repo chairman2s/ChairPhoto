@@ -2,6 +2,7 @@ pub mod appearance;
 pub mod bundle;
 pub mod burst;
 pub mod companions;
+pub mod crash_marker;
 pub mod catalog;
 #[cfg(feature = "collage")]
 pub mod collage;
@@ -96,6 +97,23 @@ pub fn run() {
         // <video> on WebKitGTK uses GStreamer, which can't read custom URI schemes — so we
         // serve videos over a loopback HTTP server (range-capable) it can fetch instead.
         .setup(|app| {
+            // Before anything can call into LibRaw (or, one day, a GPU driver): turn the
+            // previous run's leftover crash markers into strikes (src/crash_marker.rs).
+            match commands::app_data_dir() {
+                Ok(dir) => {
+                    for s in crash_marker::init(&dir.join("crash-markers")) {
+                        eprintln!(
+                            "crash marker: the previous run died inside {} on {} ({} strike{}{})",
+                            s.kind,
+                            s.label,
+                            s.strikes,
+                            if s.strikes == 1 { "" } else { "s" },
+                            if s.is_blocked() { " — skipped from now on" } else { "" },
+                        );
+                    }
+                }
+                Err(e) => eprintln!("crash marker: disabled, no app data dir ({e})"),
+            }
             // Reclaim upload renders left behind by a previous run. Kept directories — a
             // supervised Instagram post, or any publish that errored — were otherwise
             // reclaimed only when someone happened to publish again, so a user who
@@ -596,6 +614,12 @@ pub fn run() {
             #[cfg(feature = "smarttags")]
             commands::smarttags_train_classifiers,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|_app, event| {
+            // A deliberate quit cuts in-flight decodes short; that is not a crash.
+            if let tauri::RunEvent::Exit = event {
+                crash_marker::clean_exit();
+            }
+        });
 }

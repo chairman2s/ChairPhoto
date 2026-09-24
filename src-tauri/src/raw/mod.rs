@@ -19,6 +19,48 @@ use image::{DynamicImage, RgbImage};
 use std::ffi::{CStr, CString};
 use std::path::Path;
 
+// ── Crash protection ──────────────────────────────────────────────────────────────────
+// LibRaw is C: a malformed or unusual file can segfault inside it, which kills the whole
+// process and cannot be caught. Every call into it runs under a crash marker
+// (`crate::crash_marker`); a file that has taken the process down twice is skipped, and
+// the caller falls back to the embedded preview. The subject key carries the decoder
+// version and the file's size and mtime, so a decoder upgrade or a replaced file gets a
+// fresh chance without any user action. Probe and decode are separate kinds: a file whose
+// unpack crashes still opens, and a probe surviving it must not reset the decode's count.
+
+/// Crash-marker kind for the identify step (`libraw_open_file` only).
+pub const KIND_PROBE: &str = "libraw-probe";
+/// Crash-marker kind for a full decode (unpack + process), either bit depth.
+pub const KIND_DECODE: &str = "libraw-decode";
+
+/// The crash-marker subject for `path`: decoder version, path, size and mtime.
+pub fn crash_subject(path: &Path) -> String {
+    let (len, mtime) = std::fs::metadata(path)
+        .map(|m| {
+            let mtime = m
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            (m.len(), mtime)
+        })
+        .unwrap_or((0, 0));
+    format!("{}|{}|{len}|{mtime}", decoder_version(), path.display())
+}
+
+/// Why `path` is skipped, if it crashed the decoder too often under `kind`.
+fn crash_block_reason(kind: &str, subject: &str) -> Option<String> {
+    crate::crash_marker::blocked(kind, subject).map(|s| crash_reason_text(s.strikes))
+}
+
+fn crash_reason_text(strikes: u32) -> String {
+    format!(
+        "the RAW decoder crashed the app on this file {strikes} times, so it is skipped and \
+         the camera preview is used instead; replacing the file or updating the app retries it"
+    )
+}
+
 /// What the decoder makes of a file, from `libraw_open_file` alone — the identify step,
 /// tens of milliseconds, no unpack. `Unsupported` is the honest state the Develop badge
 /// shows for a camera newer than the pinned snapshot (docs/plans/raw-foundation).
@@ -52,6 +94,15 @@ pub fn probe(path: &Path) -> RawSupport {
     let Ok(c_path) = CString::new(path.to_string_lossy().as_bytes()) else {
         return RawSupport::Unsupported { camera: None, reason: "path contains a NUL byte".into() };
     };
+    let subject = crash_subject(path);
+    // A file the full decode crashes on is reported here too, so Develop never starts a
+    // session it knows will end the process.
+    if let Some(reason) =
+        crash_block_reason(KIND_PROBE, &subject).or_else(|| crash_block_reason(KIND_DECODE, &subject))
+    {
+        return RawSupport::Unsupported { camera: None, reason };
+    }
+    let _crash_guard = crate::crash_marker::enter(KIND_PROBE, &subject, &path.to_string_lossy());
     // SAFETY: the handle is created, used and closed in this block; every pointer read is
     // on the live handle; strings are NUL-terminated fixed arrays on the LibRaw struct.
     unsafe {
@@ -126,6 +177,11 @@ pub fn decode_linear(path: &Path, abort: &std::sync::atomic::AtomicBool) -> Resu
     use std::sync::atomic::Ordering;
     let c_path = CString::new(path.to_string_lossy().as_bytes())
         .map_err(|_| "path contains a NUL byte".to_string())?;
+    let subject = crash_subject(path);
+    if let Some(reason) = crash_block_reason(KIND_DECODE, &subject) {
+        return Err(reason);
+    }
+    let _crash_guard = crate::crash_marker::enter(KIND_DECODE, &subject, &path.to_string_lossy());
     let check = |stage: &str| -> Result<(), String> {
         if abort.load(Ordering::Relaxed) {
             Err(format!("decode aborted before {stage}"))
@@ -252,6 +308,11 @@ fn c_field(field: &[std::os::raw::c_char]) -> String {
 pub fn decode_to_image(path: &Path) -> Result<DynamicImage, String> {
     let c_path = CString::new(path.to_string_lossy().as_bytes())
         .map_err(|_| "path contains a NUL byte".to_string())?;
+    let subject = crash_subject(path);
+    if let Some(reason) = crash_block_reason(KIND_DECODE, &subject) {
+        return Err(reason);
+    }
+    let _crash_guard = crate::crash_marker::enter(KIND_DECODE, &subject, &path.to_string_lossy());
 
     // SAFETY: every pointer is checked before use, and the LibRaw handle is always
     // recycled + closed on every exit path (the inner closure isolates the fallible
@@ -401,6 +462,27 @@ mod tests {
         let missing = dir.join("missing.ARW");
         assert!(matches!(probe(&missing), RawSupport::Unsupported { .. }));
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_crash_subject_changes_with_the_file_and_names_the_decoder() {
+        let dir = std::env::temp_dir().join(format!("chairphoto-raw-subject-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("a.ARW");
+        std::fs::write(&f, b"one").unwrap();
+        let first = crash_subject(&f);
+        assert!(first.starts_with(decoder_version()), "{first}");
+        assert!(first.contains("a.ARW"));
+        assert_eq!(first, crash_subject(&f), "stable while the file is unchanged");
+        std::fs::write(&f, b"replaced, longer").unwrap();
+        assert_ne!(first, crash_subject(&f), "a replaced file gets a fresh chance");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_crash_reason_says_what_happens_instead() {
+        let r = crash_reason_text(2);
+        assert!(r.contains("2 times") && r.contains("camera preview"), "{r}");
     }
 
     #[test]

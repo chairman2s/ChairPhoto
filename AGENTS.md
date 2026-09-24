@@ -236,6 +236,12 @@ Missing runtime tools degrade only their feature; they must not crash the app:
 LibRaw is a link-time dependency for full-resolution decode under the `raw` feature, not a
 runtime fallback.
 
+Native code that can kill the process — LibRaw today, a GPU driver if a GPU backend lands —
+runs under a crash marker (`src-tauri/src/crash_marker.rs`): `enter(kind, subject, label)`
+before the call, `blocked(kind, subject)` checked first. A subject that took the process down
+twice is skipped and the caller takes its fallback; a clean quit is not a crash. Choose the
+subject so a change (decoder version, file size/mtime, driver) earns a fresh chance.
+
 On NVIDIA/Wayland, WebKitGTK may crash without
 `WEBKIT_DISABLE_DMABUF_RENDERER=1`. `src-tauri/src/lib.rs::run` sets it on Linux while
 respecting an existing value. Do not remove it without a tested replacement.

@@ -603,3 +603,18 @@
   width: auto;
   border-radius: 2px;
 }
+
+/* ── Save as preset ─────────────────────────────────────────────── */
+.dk-preset-name {
+  display: inline-flex;
+  gap: 6px;
+  align-items: center;
+}
+.dk-preset-name input {
+  width: 160px;
+}
+.dk-notice {
+  color: var(--dim);
+  font-size: 12px;
+  align-self: center;
+}

@@ -222,6 +222,30 @@ export async function saveUserPresets(list: DevelopPreset[]): Promise<void> {
   await setSetting(USER_PRESETS_KEY, JSON.stringify(list));
 }
 
+/** A record's look, as a preset stores it: everything but the framing (crop, straighten,
+ *  perspective) and the engine stamp. A preset is applied over another photo's framing, and
+ *  which engine a preset means is decided where it is applied (docs/plans/raw-foundation,
+ *  slice 7). Never mutates `record`. */
+export function lookOnly(record: VersionEdit): DevelopPreset["edit"] {
+  const { crop: _c, straighten: _s, perspective: _p, ...rest } = record;
+  const out = { ...rest } as DevelopPreset["edit"] & { engine?: unknown };
+  delete out.engine;
+  return out;
+}
+
+/** Append a user preset named `name` holding `record`'s look; returns the saved list. */
+export async function addUserPreset(name: string, record: VersionEdit): Promise<DevelopPreset[]> {
+  const preset: DevelopPreset = {
+    id: crypto.randomUUID(),
+    name: name.trim(),
+    category: "User",
+    edit: lookOnly(record),
+  };
+  const list = [...(await loadUserPresets()), preset];
+  await saveUserPresets(list);
+  return list;
+}
+
 /** All presets in display order: built-in groups first, then the user's. */
 export async function allPresets(): Promise<DevelopPreset[]> {
   return [...BUILTIN_PRESETS, ...(await loadUserPresets())];

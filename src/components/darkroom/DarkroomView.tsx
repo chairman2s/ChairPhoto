@@ -46,7 +46,7 @@ import {
   type VersionEdit,
 } from "../../modules/editing";
 import { broadcastPhoto, onLoupeReady, openLoupeWindow } from "../../modules/loupe";
-import { allPresets, BUILTIN_PRESETS, type DevelopPreset } from "../../modules/presets";
+import { addUserPreset, allPresets, BUILTIN_PRESETS, type DevelopPreset } from "../../modules/presets";
 import {
   EditStage,
   EffectsRail,
@@ -479,6 +479,24 @@ export function DarkroomView({
     };
   }, [photoId]);
 
+  // "Save as preset": the current look (never the framing) under a name, into the user
+  // presets the proof sheet and the preset browser deal from.
+  const [presetName, setPresetName] = useState<string | null>(null);
+  const [notice, setNotice] = useState("");
+  const savePreset = async () => {
+    const name = (presetName ?? "").trim();
+    if (!name) return;
+    try {
+      await addUserPreset(name, workingRef.current);
+      setPresets(await allPresets());
+      setPresetName(null);
+      setNotice(`Saved preset “${name}”`);
+      setTimeout(() => setNotice(""), 3000);
+    } catch (e) {
+      setError(String(e));
+    }
+  };
+
   const dealProofs = () => {
     setProofs(proofSpread(workingRef.current, autoFragment ?? {}, presets));
   };
@@ -854,6 +872,36 @@ export function DarkroomView({
             >
               ⚖ Refine by duel
             </button>
+            {presetName == null ? (
+              <button
+                className="dk-act"
+                onClick={() => setPresetName("")}
+                title="Save this look — tone and effects, not the crop or straighten — as a preset"
+              >
+                ☆ Save as preset
+              </button>
+            ) : (
+              <span className="dk-preset-name">
+                <input
+                  autoFocus
+                  value={presetName}
+                  placeholder="Preset name"
+                  aria-label="Preset name"
+                  onChange={(e) => setPresetName(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") void savePreset();
+                    if (e.key === "Escape") setPresetName(null);
+                  }}
+                />
+                <button className="dk-act dk-act-primary" disabled={!presetName.trim()} onClick={() => void savePreset()}>
+                  Save
+                </button>
+                <button className="dk-act" onClick={() => setPresetName(null)}>
+                  Cancel
+                </button>
+              </span>
+            )}
+            {notice && <span className="dk-notice">{notice}</span>}
             <button
               className="dk-act"
               onClick={() => {

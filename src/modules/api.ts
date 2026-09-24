@@ -902,6 +902,35 @@ export const renameVersion = (versionId: number, name: string) =>
   invoke<void>("rename_version", { versionId, name });
 export const setVersionEdit = (versionId: number, editJson: string) =>
   invoke<void>("set_version_edit", { versionId, editJson });
+
+/** One step of a version's edit history (the Darkroom's History panel). */
+export interface HistoryStep {
+  seq: number;
+  label: string;
+  /** Seconds since the epoch. */
+  createdAt: number;
+}
+
+/** A version's history: steps oldest first, and the current one (null: no history yet). */
+export interface VersionHistory {
+  versionId: number;
+  steps: HistoryStep[];
+  head: number | null;
+}
+
+/** A version's edit history. */
+export const versionHistory = (versionId: number) =>
+  invoke<VersionHistory>("version_history", { versionId });
+
+/** Save a version's settings as a history step (the Darkroom's autosave). `amend` replaces
+ *  the current step — the same control still moving. Settings only, never pixels. */
+export const commitVersionEdit = (versionId: number, editJson: string, label: string, amend: boolean) =>
+  invoke<VersionHistory>("commit_version_edit", { versionId, editJson, label, amend });
+
+/** Make history step `seq` current (undo, redo, a click in History). Returns that step's
+ *  settings and the history. */
+export const gotoVersionStep = (versionId: number, seq: number) =>
+  invoke<[string, VersionHistory]>("goto_version_step", { versionId, seq });
 export const deleteVersion = (versionId: number) =>
   invoke<void>("delete_version", { versionId });
 export const duplicateVersion = (versionId: number) =>

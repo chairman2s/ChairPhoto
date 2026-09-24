@@ -83,6 +83,32 @@ CREATE TABLE photo_versions (
 - The **grid** shows the master thumbnail with a small **"N versions" badge** — no extra
   tiles, no stacks. Versions are chosen at export time.
 
+### History and autosave (the Darkroom)
+
+The Darkroom saves every change to the **active version** as it goes — settings only, never
+pixels, never the original or its sidecar (user decision 2026-09-24, replacing the slice-7
+sandbox). A photo with no version gets "Version N" on its first change; "Original" on the
+shelf shows the unedited file, and changing anything there starts a new version. "+ New
+version" copies the current settings into a new version and continues there.
+
+Each settled change (0.6 s of quiet) is a **history step** on that version, named after what
+changed ("Exposure +0.50", "Crop 4:5", "Proof: Portra", "Reset"). The same control still
+moving within four seconds amends its step rather than adding one, so a keyboard nudge or a
+second drag is one step. Step 0, "Before", holds what the version had when its history
+began, so the first change is always undoable.
+
+The History panel (top of the rail) lists the steps newest first; clicking one — or Ctrl+Z /
+Ctrl+Shift+Z / Ctrl+Y — makes it current and saves its settings back into the version. The
+steps after it stay until the next change, which **replaces** them (a list, not a tree). At
+most 200 steps per version are kept. Pending changes are saved before a step, a version
+switch, or leaving the photo.
+
+Storage: core tables `photo_version_history` and `photo_version_history_head`
+(`catalog/schema.rs`), both cascading with their version. They are local to the catalog:
+catalog merge and bundle export carry versions but not their history. Every write that
+changes a version's settings — a save, a commit, a step — refreshes the photo's monochrome
+flag and auto-tag the same way (`commands::editing::write_version_then_refresh_monochrome`).
+
 ## Edit record shape (resolution-independent)
 
 ```jsonc

@@ -12,7 +12,7 @@
 - [x] Slice 4 — proof sheet (auto-tone + spread + adopt) (2026-09-05)
 - [x] Slice 5 — duel refinement (+ per-pane version forking) (2026-09-05; DuelDim narrowed to the four numeric dims — "look" rounds deferred with the learned auto-tone)
 - [x] Slice 6 — rail extraction from EditorView (no behaviour change) (2026-09-05; extracted into src/components/EditControls.tsx — EditStage/ToneRail/EffectsRail/GeometryRail; hands-on parity check of the classic Develop pending)
-- [x] Slice 7 — version shelf & save-as-new-version (2026-09-05; user re-steer: the Darkroom is a sandbox — never overwrites its starting version; Save banks the settings as a NEW version)
+- [x] Slice 7 — version shelf & save-as-new-version (2026-09-05; user re-steer: the Darkroom is a sandbox — never overwrites its starting version; Save banks the settings as a NEW version). **Reversed 2026-09-24 by the user:** the Darkroom autosaves every change into the active version with a per-version history (undo/redo, a History panel) — see docs/editing.md § History and autosave; "Save as version" became "+ New version" (fork).
 - [ ] Slice 8 — the swap: Darkroom becomes Develop
 
 ## Follow-on: GPU smoothness (branch `feature/darkroom-gpu`, plan 2026-09-06)

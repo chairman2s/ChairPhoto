@@ -5,7 +5,7 @@
 // next open rather than mid-edit.
 import { useEffect, useState } from "react";
 import { EditorView } from "../EditorView";
-import { getSetting, type PhotoVersion } from "../../modules/api";
+import { developClose, getSetting, type PhotoVersion } from "../../modules/api";
 import { DarkroomView } from "./DarkroomView";
 
 export function DevelopSurface(props: {
@@ -33,10 +33,23 @@ export function DevelopSurface(props: {
       alive = false;
     };
   }, []);
+  // The Develop session lives as long as Develop does, not as long as one photo's view:
+  // stepping to the next photo remounts the Darkroom (keyed per photo) but keeps the
+  // session, so a preloaded neighbour is adopted instead of released. Leaving Develop
+  // releases the working images.
+  useEffect(
+    () => () => {
+      developClose().catch(() => {});
+    },
+    [],
+  );
   if (darkroom === null) return null; // one frame while the setting loads
   if (darkroom) {
     return (
       <DarkroomView
+        // One view per photo: nothing — working state, history, pending autosave — can
+        // cross from one photo to the next.
+        key={props.photoId}
         photoId={props.photoId}
         photoW={props.photoW}
         photoH={props.photoH}
@@ -45,6 +58,7 @@ export function DevelopSurface(props: {
         onPickVersion={props.onPickVersion}
         onChanged={props.onChanged}
         onBack={props.onBack}
+        onSavedActive={props.onSavedActive}
         neighbours={props.neighbours}
       />
     );

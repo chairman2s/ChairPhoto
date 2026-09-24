@@ -11,8 +11,8 @@
 // masses always use the full record — they describe the finished print.
 import { useEffect, useRef, useState } from "react";
 import {
+  commitVersionEdit,
   createVersion,
-  developClose,
   developOpen,
   editRenderUrl,
   editZoneMasses,
@@ -23,6 +23,9 @@ import {
   type DevelopSource,
   setSetting,
   setVersionEdit,
+  gotoVersionStep,
+  versionHistory,
+  type VersionHistory,
   suggestAutoTone,
 } from "../../modules/api";
 import {
@@ -59,6 +62,8 @@ import { useOwnedSubscription } from "../../modules/ownedEvents";
 import { markShellLeave, setShellTimingEnabled } from "../../modules/shellTiming";
 import { badgeFor, INITIAL_SOURCE, reduceSource, type SourceState } from "./developSource";
 import { stageJsonFor } from "./stageJson";
+import { describeChange, shouldAmend } from "./history";
+import { HistoryPanel } from "./HistoryPanel";
 import { ToneStrip } from "./ToneStrip";
 import {
   formatSample,
@@ -88,6 +93,7 @@ export function DarkroomView({
   onPickVersion,
   onChanged,
   onBack,
+  onSavedActive,
   neighbours = [],
 }: {
   photoId: number;
@@ -101,6 +107,9 @@ export function DarkroomView({
   onPickVersion: (v: PhotoVersion | null) => void;
   onChanged: () => void;
   onBack: () => void;
+  /** The active version's settings were saved (autosave, a history step): the shell's copy
+   *  follows, so the loupe and the grid show what is saved. */
+  onSavedActive?: (editJson: string) => void;
   /** The photos either side, next first: preloaded after this one is ready. */
   neighbours?: number[];
 }) {
@@ -109,23 +118,76 @@ export function DarkroomView({
   const [working, setWorking] = useState<VersionEdit>(() =>
     parseEdit(initialEditJson ?? undefined),
   );
-  // The Darkroom is a sandbox (user decision, slice 7): it never auto-saves over the
-  // version it started from. `savedJson` is the last state banked to (or loaded from) a
-  // version — the unsaved marker and the loupe hand-back both compare against it.
+  // Autosave (user decision 2026-09-24, replacing slice 7's sandbox): every change is saved
+  // to the active version as a history step — settings only, never pixels. A photo with
+  // no version gets one on its first change. `committed*` is what the version holds (last
+  // saved or loaded); the view is keyed per photo, so none of this crosses photos.
   const [versions, setVersions] = useState<PhotoVersion[]>([]);
-  const [baseVersionId, setBaseVersionId] = useState<number | null>(activeVersionId);
-  const [savedJson, setSavedJson] = useState<string>(() =>
-    JSON.stringify(parseEdit(initialEditJson ?? undefined)),
-  );
-  const savedJsonRef = useRef(savedJson);
-  savedJsonRef.current = savedJson;
-  // The proof label last adopted — the default name a save gets ("Portra", "Auto"…).
+  const versionsRef = useRef(versions);
+  versionsRef.current = versions;
+  const [versionId, setVersionId] = useState<number | null>(activeVersionId);
+  const versionIdRef = useRef(versionId);
+  versionIdRef.current = versionId;
+  const [history, setHistory] = useState<VersionHistory | null>(null);
+  const historyRef = useRef(history);
+  historyRef.current = history;
+  const committedJsonRef = useRef<string>(JSON.stringify(working));
+  const committedRecordRef = useRef<VersionEdit>(working);
+  /** The last committed step's control and time — the amend window's memory. */
+  const lastStepRef = useRef<{ key: string; at: number } | null>(null);
+  /** A caller-named change ("Proof: Portra", "Reset") for the next commit. */
+  const nextLabelRef = useRef<string | null>(null);
+  /** Autosave stays off until the photo's version is resolved. */
+  const loadedRef = useRef(false);
+  const aliveRef = useRef(true);
+  const [saving, setSaving] = useState(false);
+  // The proof label last adopted — the default name "New version" gives ("Portra", …).
   const adoptedLabelRef = useRef<string | null>(null);
+  const onSavedActiveRef = useRef(onSavedActive);
+  onSavedActiveRef.current = onSavedActive;
+  const onPickVersionRef = useRef(onPickVersion);
+  onPickVersionRef.current = onPickVersion;
+  const onChangedRef = useRef(onChanged);
+  onChangedRef.current = onChanged;
 
+  /** Take `record` as what the version holds right now (a load, a step): no commit. */
+  const adoptCommitted = (record: VersionEdit) => {
+    committedJsonRef.current = JSON.stringify(record);
+    committedRecordRef.current = record;
+    lastStepRef.current = null;
+  };
+
+  // Resolve the version on open: the shell's active version when it is this photo's, else
+  // the first one (what the classic Develop does), else none until the first change.
   useEffect(() => {
+    aliveRef.current = true;
     listVersions(photoId)
-      .then(setVersions)
-      .catch(() => setVersions([]));
+      .then((vs) => {
+        if (!aliveRef.current) return;
+        setVersions(vs);
+        const v = vs.find((x) => x.id === activeVersionId) ?? vs[0] ?? null;
+        if (v && v.id !== activeVersionId) {
+          const record = parseEdit(v.editJson);
+          adoptCommitted(record);
+          setWorking(record);
+          onPickVersionRef.current(v);
+        }
+        setVersionId(v?.id ?? null);
+        if (v) {
+          versionHistory(v.id)
+            .then((h) => aliveRef.current && setHistory(h))
+            .catch(() => {});
+        }
+      })
+      .catch(() => setVersions([]))
+      .finally(() => {
+        loadedRef.current = true;
+      });
+    return () => {
+      aliveRef.current = false;
+    };
+    // Once per photo: the view is keyed by photoId.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [photoId]);
   const [backdrop, setBackdrop] = useState("");
   // The source (docs/plans/raw-foundation): opening a photo claims the develop session
@@ -161,13 +223,8 @@ export function DarkroomView({
       }),
     [photoId],
   );
-  // Leaving the Darkroom releases the working image (a ref: true unmount only).
-  useEffect(
-    () => () => {
-      developClose().catch(() => {});
-    },
-    [],
-  );
+  // Leaving Develop releases the working images — DevelopSurface owns that, so stepping
+  // to the next photo (a remount of this view) keeps the preloaded neighbours.
   const sourceToken = sourceState.token;
   const sourceTokenRef = useRef(sourceToken);
   sourceTokenRef.current = sourceToken;
@@ -388,11 +445,11 @@ export function DarkroomView({
     };
   }, [photoId]);
 
-  // Leaving the Darkroom hands the loupe back to the last SAVED state — what the shell
-  // shows. (A ref, so this runs only on true unmount, not when a save updates props.)
+  // Leaving the photo hands the loupe back to what the version holds — what the shell
+  // shows. (Pending changes are flushed on the same unmount, below.)
   useEffect(
     () => () => {
-      if (printOnLoupeRef.current) broadcastPhoto(photoId, loupeJson(savedJsonRef.current));
+      if (printOnLoupeRef.current) broadcastPhoto(photoId, loupeJson(JSON.stringify(workingRef.current)));
     },
     [photoId],
   );
@@ -438,58 +495,179 @@ export function DarkroomView({
     }
   };
 
-  // ── Saving: settings only, always to a NEW version ──
-  // Compared as saved — engine-stamped — so a save on the RAW engine reads clean.
-  const dirty = JSON.stringify(stamped(working)) !== savedJson;
-  const saveAsVersion = async () => {
-    const json = JSON.stringify(stamped(workingRef.current));
+  // ── Autosave: every settled change is a history step on the active version ──
+  /** Commit the working state if it differs from what the version holds. Serialized by
+   *  `flush` — one commit at a time, in order. */
+  const commitNow = async (): Promise<void> => {
+    const record = workingRef.current;
+    const json = JSON.stringify(record);
+    if (!loadedRef.current || json === committedJsonRef.current) return;
+    const change = describeChange(committedRecordRef.current, record, nextLabelRef.current ?? undefined);
+    nextLabelRef.current = null;
+    const before = { json: committedJsonRef.current, record: committedRecordRef.current };
+    committedJsonRef.current = json;
+    committedRecordRef.current = record;
+    if (aliveRef.current) setSaving(true);
     try {
-      const name = adoptedLabelRef.current ?? `Darkroom ${versions.length + 1}`;
+      let vid = versionIdRef.current;
+      let created: number | null = null;
+      if (vid == null) {
+        vid = await createVersion(photoId, `Version ${versionsRef.current.length + 1}`);
+        created = vid;
+        versionIdRef.current = vid;
+        if (aliveRef.current) setVersionId(vid);
+      }
+      const h = created == null ? historyRef.current : null;
+      const tip = h?.steps[h.steps.length - 1]?.seq;
+      const atTip = h?.head != null && h.head === tip;
+      const now = Date.now();
+      const saved = JSON.stringify(stamped(record));
+      const next = await commitVersionEdit(vid, saved, change.label, shouldAmend(lastStepRef.current, change, now, atTip));
+      lastStepRef.current = { key: change.key, at: now };
+      historyRef.current = next;
+      if (aliveRef.current) setHistory(next);
+      onSavedActiveRef.current?.(saved);
+      if (created != null) {
+        const vs = await listVersions(photoId);
+        if (aliveRef.current) setVersions(vs);
+        const v = vs.find((x) => x.id === created);
+        if (v) onPickVersionRef.current({ ...v, editJson: saved });
+        onChangedRef.current();
+      }
+    } catch (e) {
+      committedJsonRef.current = before.json;
+      committedRecordRef.current = before.record;
+      if (aliveRef.current) setError(`Autosave failed: ${String(e)}`);
+    } finally {
+      if (aliveRef.current) setSaving(false);
+    }
+  };
+  const commitRef = useRef(commitNow);
+  commitRef.current = commitNow;
+  const chainRef = useRef<Promise<void>>(Promise.resolve());
+  /** Commit now (after any commit already running). Returns when it is saved. */
+  const flush = () => {
+    chainRef.current = chainRef.current.then(() => commitRef.current()).catch(() => {});
+    return chainRef.current;
+  };
+  // A change settles after a short quiet: one step per adjustment, not per drag frame.
+  useEffect(() => {
+    if (!loadedRef.current || JSON.stringify(working) === committedJsonRef.current) return;
+    const t = setTimeout(() => void flush(), 600);
+    return () => clearTimeout(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [working]);
+  // Leaving the photo (the filmstrip, Library, a catalog switch) saves what is pending.
+  useEffect(
+    () => () => {
+      void flush();
+    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [],
+  );
+
+  /** Go to history step `seq`: pending changes are saved first, so nothing is lost. */
+  const gotoStep = async (seq: number) => {
+    await flush();
+    const vid = versionIdRef.current;
+    if (vid == null) return;
+    try {
+      const [json, h] = await gotoVersionStep(vid, seq);
+      const record = parseEdit(json);
+      adoptCommitted(record);
+      historyRef.current = h;
+      setHistory(h);
+      setWorking(record);
+      onSavedActiveRef.current?.(json);
+    } catch (e) {
+      setError(String(e));
+    }
+  };
+  const stepBy = (delta: -1 | 1) => {
+    const h = historyRef.current;
+    if (!h || h.head == null) return;
+    const i = h.steps.findIndex((st) => st.seq === h.head);
+    const target = h.steps[i + delta];
+    if (target) void gotoStep(target.seq);
+  };
+
+  /** Fork the current settings into a new version and continue there. */
+  const newVersion = async () => {
+    await flush();
+    try {
+      const name = adoptedLabelRef.current ?? `Version ${versionsRef.current.length + 1}`;
+      const json = JSON.stringify(stamped(workingRef.current));
       const id = await createVersion(photoId, name);
       await setVersionEdit(id, json);
-      const next = await listVersions(photoId);
-      setVersions(next);
-      setSavedJson(json);
-      setBaseVersionId(id);
+      const vs = await listVersions(photoId);
+      setVersions(vs);
+      setVersionId(id);
+      versionIdRef.current = id;
+      historyRef.current = null;
+      setHistory(null);
+      adoptCommitted(workingRef.current);
       adoptedLabelRef.current = null;
       onChanged();
-      const created = next.find((v) => v.id === id);
-      if (created) onPickVersion(created);
+      const created = vs.find((v) => v.id === id);
+      if (created) onPickVersion({ ...created, editJson: json });
     } catch (e) {
       setError(String(e));
     }
   };
 
-  // Shelf: load a version's settings into the working state (the shell follows).
-  const loadVersion = (v: PhotoVersion) => {
-    const record = parseEdit(v.editJson);
+  /** Shelf: switch to a version (or the original, `null`) — pending changes saved first. */
+  const switchVersion = async (target: PhotoVersion | null) => {
+    await flush();
+    const vs = await listVersions(photoId).catch(() => versionsRef.current);
+    setVersions(vs);
+    const v = target ? vs.find((x) => x.id === target.id) ?? target : null;
+    const record = parseEdit(v?.editJson ?? undefined);
+    adoptCommitted(record);
     setWorking(record);
-    setSavedJson(JSON.stringify(record));
-    setBaseVersionId(v.id);
+    setVersionId(v?.id ?? null);
+    versionIdRef.current = v?.id ?? null;
+    historyRef.current = null;
+    setHistory(null);
+    if (v) {
+      versionHistory(v.id)
+        .then((h) => {
+          if (versionIdRef.current === v.id && aliveRef.current) {
+            historyRef.current = h;
+            setHistory(h);
+          }
+        })
+        .catch(() => {});
+    }
     adoptedLabelRef.current = null;
     onPickVersion(v);
   };
-  const loadAsShot = () => {
-    setWorking({});
-    setSavedJson("{}");
-    setBaseVersionId(null);
-    adoptedLabelRef.current = null;
-    onPickVersion(null);
-  };
 
-  // Ctrl+S banks the settings as a new version.
+  // Ctrl+Z / Ctrl+Shift+Z (and Ctrl+Y) walk the history; Ctrl+S saves what is pending now.
+  // Text fields keep their own undo.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "s") {
+      if (!(e.ctrlKey || e.metaKey)) return;
+      const t = e.target as HTMLElement | null;
+      const typing =
+        t?.tagName === "TEXTAREA" ||
+        (t?.tagName === "INPUT" && !["range", "checkbox", "radio", "button"].includes((t as HTMLInputElement).type));
+      const k = e.key.toLowerCase();
+      if (k === "s") {
         e.preventDefault();
-        if (JSON.stringify(stamped(workingRef.current)) !== savedJsonRef.current) void saveAsVersion();
+        void flush();
+      } else if (!typing && k === "z") {
+        e.preventDefault();
+        stepBy(e.shiftKey ? 1 : -1);
+      } else if (!typing && k === "y") {
+        e.preventDefault();
+        stepBy(1);
       }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-    // saveAsVersion reads refs; versions.length only names the default.
+    // Reads refs only.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [photoId, versions.length]);
+  }, []);
 
   const togglePrintOnLoupe = () => {
     const next = !printOnLoupe;
@@ -584,25 +762,24 @@ export function DarkroomView({
         <span className="dk-title">Darkroom</span>
         <span className="dk-shelf">
           <button
-            className={`chip ${baseVersionId == null && !dirty ? "chip-on" : ""}`}
-            onClick={loadAsShot}
-            title="Start over from the unedited original"
+            className={`chip ${versionId == null ? "chip-on" : ""}`}
+            onClick={() => void switchVersion(null)}
+            title="The unedited original. Changing anything here starts a new version."
           >
-            As shot
+            Original
           </button>
           {versions.map((v) => (
             <button
               key={v.id}
-              className={`chip ${baseVersionId === v.id ? "chip-on" : ""}`}
-              onClick={() => loadVersion(v)}
-              title={`Load "${v.name}" into the darkroom`}
+              className={`chip ${versionId === v.id ? "chip-on" : ""}`}
+              onClick={() => void switchVersion(v)}
+              title={`Edit "${v.name}" — every change is saved to it, with history`}
             >
               {v.name}
-              {baseVersionId === v.id && dirty && <i className="dk-dirty" title="Unsaved changes" />}
             </button>
           ))}
         </span>
-        <span className="dk-hint">{rendering ? "rendering…" : ""}</span>
+        <span className="dk-hint">{saving ? "saving…" : rendering ? "rendering…" : ""}</span>
         {source && (
           <span className={`dk-source dk-source-${badgeFor(source).tone}`} title={badgeFor(source).title}>
             {badgeFor(source).label}
@@ -621,11 +798,10 @@ export function DarkroomView({
         </button>
         <button
           className="dk-save"
-          onClick={() => void saveAsVersion()}
-          disabled={!dirty}
-          title="Bank these settings as a NEW version (Ctrl+S) — the version you started from is never overwritten, and only settings are stored, never pixels"
+          onClick={() => void newVersion()}
+          title="Copy these settings into a new version and keep editing there. Changes are saved automatically; only settings are stored, never pixels."
         >
-          ✓ Save as version
+          + New version
         </button>
       </header>
       {error && <div className="dk-error">{error}</div>}
@@ -676,7 +852,10 @@ export function DarkroomView({
             </button>
             <button
               className="dk-act"
-              onClick={() => setWorking({})}
+              onClick={() => {
+                nextLabelRef.current = "Reset";
+                setWorking({});
+              }}
               title="Back to as shot — clears every adjustment, framing included"
             >
               Reset
@@ -684,6 +863,7 @@ export function DarkroomView({
           </div>
         </div>
         <aside className="dk-rail">
+          <HistoryPanel history={history} onGoto={(seq) => void gotoStep(seq)} />
           <ToneRail tone={tone} onTone={onTone} />
           <EffectsRail look={look} onLook={onLook} onError={setError} />
           <GeometryRail
@@ -714,11 +894,14 @@ export function DarkroomView({
           photoId={photoId}
           candidates={proofs}
           onAdopt={(record) => {
-            setWorking(record);
-            // Remember what was adopted — it becomes the default save name.
+            // Remember what was adopted — the history step's name, and the default name a
+            // "New version" gets.
             const picked = proofs.find((c) => c.record === record);
-            adoptedLabelRef.current =
-              picked && picked.group !== "asShot" ? picked.label : adoptedLabelRef.current;
+            if (picked && picked.group !== "asShot") {
+              adoptedLabelRef.current = picked.label;
+              nextLabelRef.current = `Proof: ${picked.label}`;
+            }
+            setWorking(record);
             setProofs(null);
           }}
           onClose={() => setProofs(null)}
@@ -728,7 +911,10 @@ export function DarkroomView({
         <DuelView
           photoId={photoId}
           working={working}
-          onApply={setWorking}
+          onApply={(record) => {
+            nextLabelRef.current = "Duel pick";
+            setWorking(record);
+          }}
           onFork={forkVersion}
           onClose={() => setDuelOpen(false)}
         />

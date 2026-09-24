@@ -1781,8 +1781,11 @@ export default function App() {
                 neighbours={developNeighbours}
                 photoW={selected.width}
                 photoH={selected.height}
-                activeVersionId={activeVersion?.id ?? null}
-                activeEditJson={activeVersion?.editJson ?? null}
+                // The shell clears the active version one render after the selection
+                // changes; until then it may still be the previous photo's. Only hand
+                // Develop a version that belongs to the photo it opens.
+                activeVersionId={activeVersion?.photoId === selected.id ? activeVersion.id : null}
+                activeEditJson={activeVersion?.photoId === selected.id ? activeVersion.editJson : null}
                 onPickVersion={setActiveVersion}
                 onSavedActive={(editJson) =>
                   setActiveVersion((cur) => (cur ? { ...cur, editJson } : cur))

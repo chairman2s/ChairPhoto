@@ -35,10 +35,22 @@
   105.6; the linear decode at baseline 0 EV → 66.8, +0.5 → 79.4, +1.0 → 93.8, +1.5 → 109.9,
   so `BASELINE_EV` is set to **1.4** (from 0.5). The `Soft` shoulder changes nothing at
   these means (it acts only near white); its default stays open until judged by eye.
-  **Still to judge by eye:** the user's first side-by-side reads the RAW as slightly lighter
-  and less saturated in the oranges and a touch flatter overall (the camera's tone curve and
-  picture style, which a plain decode does not carry) — whether to match the camera by
-  default or keep the honest decode is the user's call and stays open. **Headroom seen on
+  **Camera look — DECIDED with the user (2026-09-24): the default is closer to the camera's
+  picture style.** The user's first side-by-side read the RAW as slightly lighter and less
+  saturated in the oranges and a touch flatter overall. New engine-2 records now carry
+  `display: "camera"`, a per-channel tone curve (`linear::CAMERA_CURVE`) fitted by the
+  ignored `develop::camera_fit::fit_camera_transform` against the embedded camera JPEGs of
+  the five Sony ARWs in the agent library (A7 IV Standard, A7R VI Vivid, DRO Auto). Mean
+  |Δ| to the camera JPEG, centre 80 %, levels of 255: plain sRGB 10.1 → camera 3.6
+  (per photo 2.5–4.3). The curve alone brings the colour up to the camera's (median chroma
+  on the Vivid frame 58 → 75, camera 75), so there is no saturation step. Records without
+  the field, saved before, stay sRGB. Left out of the fit and still off by about a stop:
+  two frames at **extended low ISO** (50 on the A7 IV, 80 on the A7R VI, below base 100),
+  which the camera exposes brighter and pulls down in its own processing — a per-photo
+  exposure the decode should read from the file (follow-on, with decision 4's per-camera
+  baseline); and `_DSC7602.dng`, whose camera preview sits ~0.3 stop darker for a reason
+  not found (its `BaselineExposure` is +0.35, the wrong sign to explain it). DRO is local
+  tone mapping; a global curve approximates it. Not yet seen on screen. **Headroom seen on
   a clipped frame (2026-09-19):** a sunlit portrait against sky whose camera preview had
   pixels in the whites bin and a featureless cloud bank; the RAW at −1 EV shows the clouds'
   shape and shading, keeps the sky blue instead of grey, and empties the whites bin —
@@ -88,11 +100,9 @@
   readers still check the resident set, so after a close it reads "not resident", never
   "preparing" (`the_session_outlives_its_worker_but_not_its_image`). The old tests never ran
   the worker's final step, which is why they passed.
-  **Open, for the user:** the Darkroom has no way to step to the next photo — the shell ignores
-  arrow keys in Develop on purpose and there is no filmstrip — and leaving Develop releases
-  memory. So today neighbour preload pays off through the disk cache (opening the next photo
-  from the Library is a cache hit), while the in-memory adoption waits for stepping. Stepping
-  needs a product decision first: what happens to unsaved sandbox changes when you move on.
+  **Stepping — settled (2026-09-24):** the Darkroom autosaves into the active version and
+  has a filmstrip (docs/editing.md § History and autosave), so moving to the next photo
+  saves first and adopts the preloaded neighbour from memory.
   Not measured: whether a background neighbour decode (OpenMP, all cores) makes slider drags
   stutter; the plan's fallback is a lower thread priority or the setting.
 - [ ] Slice 5 — proof sheet, duels, masses, loupe, clipping overlay on the working image

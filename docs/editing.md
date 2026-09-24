@@ -309,7 +309,9 @@ Darkroom) until the swap slice makes it the default.
   refuses the working image (`plugins/edit/source.rs`, `RenderSource`).
 - **Engine 2's pipeline** (`plugins/edit/linear.rs`): exposure and white balance as
   multiplications of linear light (values above white survive), then one display
-  transform (`display`: absent/`"srgb"`, or `"soft"` with a highlight shoulder) with a
+  transform (`display`: absent/`"srgb"`, `"soft"` with a highlight shoulder, or
+  `"camera"`, the per-channel curve fitted to the camera's own JPEGs, which new engine-2
+  records get by default; a record keeps the transform it was saved with) with a
   provisional `BASELINE_EV` lift so as-shot lands near the camera JPEG, then the *same*
   display-domain look as engine 1 — zones, region sliders, contrast, saturation, and the
   finish (B&W, LUT, split, fade, vignette, grain) — so presets mean the same on both.

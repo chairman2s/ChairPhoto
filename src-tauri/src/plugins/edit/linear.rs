@@ -61,23 +61,143 @@ pub fn apply_exposure_linear(img: &mut Rgb32FImage, ev: f32, wb: [f32; 3]) {
     });
 }
 
-/// The rendering transform slot (decision 5): plain sRGB, or sRGB with a soft shoulder
-/// that rolls highlights off instead of clipping them. The default is chosen on the
-/// user's own photos in slice 2, not here.
+/// The rendering transform slot (decision 5): plain sRGB, sRGB with a soft shoulder that
+/// rolls highlights off instead of clipping them, or the camera-style curve
+/// ([`CAMERA_CURVE`]). New engine-2 edits get `camera` (user decision 2026-09-24: the
+/// default should be closer to the camera's picture style); a record without the field
+/// stays plain sRGB, so a saved version renders the same forever.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum DisplayTransform {
     Srgb,
     Soft { shoulder: f32 },
+    Camera,
 }
 
 impl DisplayTransform {
-    /// From the record's `display` field: absent or `"srgb"` = sRGB; `"soft"` = the shoulder.
+    /// From the record's `display` field: absent or `"srgb"` = sRGB; `"soft"` = the
+    /// shoulder; `"camera"` = the camera-style curve.
     pub fn from_record(name: Option<&str>) -> Self {
         match name {
             Some("soft") => DisplayTransform::Soft { shoulder: 0.8 },
+            Some("camera") => DisplayTransform::Camera,
             _ => DisplayTransform::Srgb,
         }
     }
+}
+
+/// The camera-style tone curve: (linear value after the [`BASELINE_EV`] lift, encoded
+/// display value), applied to each channel. Fitted by `develop::camera_fit` on 2026-09-24
+/// against the embedded camera JPEGs of five Sony ARWs (A7 IV "Standard", A7R VI "Vivid",
+/// DRO Auto): per-bin medians of every channel of the centre 80 %, smoothed over five
+/// bins and made monotone. Mean |Δ| to the camera JPEG fell from 10.1 (plain sRGB) to 3.6
+/// levels of 255, and the per-channel curve alone brought the colour up to the camera's
+/// (median chroma 58 → 75 against the camera's 75 on the Vivid frame), so there is no
+/// separate saturation step. Left out of the fit, with the reason: two frames at extended
+/// low ISO (50 and 80, below the bodies' base 100), which the camera exposes brighter and
+/// pulls down about a stop in its own processing — a per-photo exposure, not the style —
+/// and one DNG whose camera preview sits ~0.3 stop darker for a reason not yet found.
+/// Compared with sRGB it holds shadows lower (0.016 vs 0.033 at the first knot), lifts the
+/// midtones a little, and keeps about a stop and a half above display white in a shoulder
+/// instead of clipping it. Beyond the last measured knot it reaches white at 3.0.
+pub const CAMERA_CURVE: &[(f32, f32)] = &[
+    (0.002533, 0.0157),
+    (0.003012, 0.0167),
+    (0.003582, 0.0180),
+    (0.004260, 0.0220),
+    (0.005066, 0.0259),
+    (0.006024, 0.0298),
+    (0.007164, 0.0353),
+    (0.008520, 0.0424),
+    (0.010132, 0.0502),
+    (0.012049, 0.0596),
+    (0.014328, 0.0714),
+    (0.017039, 0.0855),
+    (0.020263, 0.1012),
+    (0.024097, 0.1192),
+    (0.028656, 0.1396),
+    (0.034078, 0.1624),
+    (0.040526, 0.1875),
+    (0.048194, 0.2165),
+    (0.057313, 0.2478),
+    (0.068157, 0.2816),
+    (0.081052, 0.3192),
+    (0.096388, 0.3592),
+    (0.114626, 0.4000),
+    (0.136313, 0.4424),
+    (0.162105, 0.4855),
+    (0.192776, 0.5271),
+    (0.229251, 0.5694),
+    (0.272627, 0.6141),
+    (0.324210, 0.6612),
+    (0.385553, 0.7075),
+    (0.458502, 0.7529),
+    (0.545254, 0.7953),
+    (0.648420, 0.8408),
+    (0.771105, 0.8776),
+    (0.917004, 0.9129),
+    (1.090508, 0.9459),
+    (1.296840, 0.9725),
+    (1.834008, 0.9814),
+    (2.181015, 0.9922),
+    (3.0, 1.0),
+];
+
+/// The camera curve at `x`: monotone cubic (Fritsch–Carlson) through [`CAMERA_CURVE`] in
+/// log2(x), so the curve is smooth between knots and never overshoots; a straight line
+/// to zero below the first knot; white from the last.
+pub fn camera_curve(x: f32) -> f32 {
+    let k = CAMERA_CURVE;
+    if x <= 0.0 {
+        return 0.0;
+    }
+    if x <= k[0].0 {
+        return k[0].1 * x / k[0].0;
+    }
+    if x >= k[k.len() - 1].0 {
+        return 1.0;
+    }
+    let lx: Vec<f32> = k.iter().map(|p| p.0.log2()).collect();
+    let n = k.len();
+    let d: Vec<f32> = (0..n - 1).map(|i| (k[i + 1].1 - k[i].1) / (lx[i + 1] - lx[i])).collect();
+    let tangent = |i: usize| -> f32 {
+        if i == 0 {
+            return d[0];
+        }
+        if i == n - 1 {
+            return d[n - 2];
+        }
+        if d[i - 1] * d[i] <= 0.0 {
+            return 0.0;
+        }
+        // Harmonic mean keeps the interpolant monotone where the data is.
+        2.0 / (1.0 / d[i - 1] + 1.0 / d[i])
+    };
+    let t = x.log2();
+    let i = lx.windows(2).position(|w| t <= w[1]).unwrap_or(n - 2);
+    let h = lx[i + 1] - lx[i];
+    let s = (t - lx[i]) / h;
+    let (m0, m1) = (tangent(i) * h, tangent(i + 1) * h);
+    let (s2, s3) = (s * s, s * s * s);
+    (2.0 * s3 - 3.0 * s2 + 1.0) * k[i].1 + (s3 - 2.0 * s2 + s) * m0 + (-2.0 * s3 + 3.0 * s2) * k[i + 1].1 + (s3 - s2) * m1
+}
+
+/// [`camera_curve`] tabulated for the per-pixel path: `CAMERA_LUT_SIZE` samples over
+/// 0..=3.0, linear between them. Built once.
+const CAMERA_LUT_SIZE: usize = 8192;
+fn camera_lut() -> &'static [f32] {
+    static LUT: std::sync::OnceLock<Vec<f32>> = std::sync::OnceLock::new();
+    LUT.get_or_init(|| {
+        (0..CAMERA_LUT_SIZE)
+            .map(|i| camera_curve(i as f32 * 3.0 / (CAMERA_LUT_SIZE - 1) as f32))
+            .collect()
+    })
+}
+
+fn camera_lookup(lut: &[f32], v: f32) -> f32 {
+    let p = (v * (CAMERA_LUT_SIZE - 1) as f32 / 3.0).clamp(0.0, (CAMERA_LUT_SIZE - 1) as f32);
+    let i = (p as usize).min(CAMERA_LUT_SIZE - 2);
+    let f = p - i as f32;
+    lut[i] + (lut[i + 1] - lut[i]) * f
 }
 
 /// A fixed lift applied before the transform so an as-shot render lands near the camera
@@ -98,7 +218,8 @@ pub fn srgb_oetf(x: f32) -> f32 {
 }
 
 /// Fit the linear image onto the display: baseline lift, the transform, the sRGB curve,
-/// 8-bit. Values above display white clip here (Srgb) or roll off (Soft) — nowhere earlier.
+/// 8-bit. Values above display white clip here (Srgb) or roll off (Soft, Camera) —
+/// nowhere earlier. `Camera` replaces the sRGB curve with [`CAMERA_CURVE`].
 pub fn to_display(img: &Rgb32FImage, t: DisplayTransform, baseline_ev: f32) -> RgbImage {
     let (w, h) = img.dimensions();
     let lift = 2f32.powf(baseline_ev);
@@ -107,10 +228,18 @@ pub fn to_display(img: &Rgb32FImage, t: DisplayTransform, baseline_ev: f32) -> R
         return out;
     }
     let row_w = w as usize;
+    let lut = (t == DisplayTransform::Camera).then(camera_lut);
     out.as_mut()
         .par_chunks_mut(row_w * 3)
         .zip(img.as_raw().par_chunks(row_w * 3))
         .for_each(|(dst, src)| {
+            if let Some(lut) = lut {
+                // The camera curve is fitted to encoded output: no sRGB curve after it.
+                for (d, s) in dst.iter_mut().zip(src.iter()) {
+                    *d = (camera_lookup(lut, (s * lift).max(0.0)) * 255.0).round().clamp(0.0, 255.0) as u8;
+                }
+                return;
+            }
             for (d, s) in dst.iter_mut().zip(src.iter()) {
                 let mut v = (s * lift).max(0.0);
                 if let DisplayTransform::Soft { shoulder } = t {
@@ -237,6 +366,54 @@ mod tests {
             assert!((a - 2.0 * b).abs() < 1e-6);
         }
         assert!(img.as_raw().iter().any(|&v| v > 1.0), "values above white are kept");
+    }
+
+    #[test]
+    fn display_transform_names() {
+        assert_eq!(DisplayTransform::from_record(None), DisplayTransform::Srgb);
+        assert_eq!(DisplayTransform::from_record(Some("srgb")), DisplayTransform::Srgb);
+        assert_eq!(DisplayTransform::from_record(Some("camera")), DisplayTransform::Camera);
+        assert_eq!(DisplayTransform::from_record(Some("unknown")), DisplayTransform::Srgb);
+    }
+
+    #[test]
+    fn camera_curve_passes_its_knots_and_is_monotone() {
+        for &(x, y) in CAMERA_CURVE {
+            assert!((camera_curve(x) - y).abs() < 1e-4 || x >= 3.0, "knot {x}");
+        }
+        assert_eq!(camera_curve(0.0), 0.0);
+        assert_eq!(camera_curve(3.0), 1.0);
+        assert_eq!(camera_curve(10.0), 1.0);
+        let mut prev = -1.0f32;
+        for i in 0..=30_000 {
+            let y = camera_curve(i as f32 * 1e-4);
+            assert!(y >= prev - 1e-6, "monotone at {}", i as f32 * 1e-4);
+            assert!((0.0..=1.0).contains(&y));
+            prev = y;
+        }
+    }
+
+    #[test]
+    fn camera_transform_is_the_camera_s_curve_with_a_shoulder() {
+        let at = |v: f32| {
+            let img = Rgb32FImage::from_pixel(1, 1, image::Rgb([v; 3]));
+            to_display(&img, DisplayTransform::Camera, 0.0).get_pixel(0, 0).0[0]
+        };
+        let srgb = |v: f32| {
+            let img = Rgb32FImage::from_pixel(1, 1, image::Rgb([v; 3]));
+            to_display(&img, DisplayTransform::Srgb, 0.0).get_pixel(0, 0).0[0]
+        };
+        assert!(at(0.005) < srgb(0.005), "deeper shadows");
+        assert!(at(0.16) > srgb(0.16), "brighter midtones");
+        assert_eq!(srgb(1.3), 255);
+        assert!(at(1.3) < 255 && at(1.3) > at(1.0), "detail kept above display white");
+        assert_eq!(at(3.5), 255);
+        // Per channel: a coloured pixel keeps its hue order and gains chroma in the mids.
+        let img = Rgb32FImage::from_pixel(1, 1, image::Rgb([0.2, 0.1, 0.05]));
+        let (c, s) = (to_display(&img, DisplayTransform::Camera, 0.0), to_display(&img, DisplayTransform::Srgb, 0.0));
+        let (c, s) = (c.get_pixel(0, 0).0, s.get_pixel(0, 0).0);
+        assert!(c[0] > c[1] && c[1] > c[2]);
+        assert!(c[0] as i32 - c[2] as i32 > s[0] as i32 - s[2] as i32);
     }
 
     #[test]

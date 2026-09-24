@@ -937,6 +937,24 @@ mod tests {
     }
 
     #[test]
+    fn engine2_display_field_selects_the_transform_and_absent_stays_srgb() {
+        let img = synthetic_working(1.4);
+        let render = |json: &str, gen: u64| {
+            let token = SourceToken::Working { photo_id: 3, generation: gen };
+            render_proxy(RenderSource::Working { token, image: img.clone() }, json, 0, RenderOpts::default()).unwrap().to_rgb8()
+        };
+        let plain = render(r#"{"engine": 2}"#, 1);
+        let srgb = render(r#"{"engine": 2, "display": "srgb"}"#, 2);
+        let camera = render(r#"{"engine": 2, "display": "camera"}"#, 3);
+        assert_eq!(plain.as_raw(), srgb.as_raw(), "a record saved without the field renders as it always did");
+        assert_ne!(plain.as_raw(), camera.as_raw());
+        // The camera curve keeps the 1.4× patch (1.4·2^1.4 ≈ 3.7 lifted) at white either way,
+        // and changes the ramp beside it.
+        assert_eq!(camera.get_pixel(2, 10).0, [255, 255, 255]);
+        assert_ne!(camera.get_pixel(40, 10).0, plain.get_pixel(40, 10).0);
+    }
+
+    #[test]
     fn engine2_renders_the_working_image_and_recovers_headroom() {
         let token = SourceToken::Working { photo_id: 2, generation: 7 };
         let img = synthetic_working(1.4);

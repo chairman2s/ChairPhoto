@@ -16,6 +16,8 @@
 
 pub mod cache;
 pub mod session;
+#[cfg(test)]
+mod camera_fit;
 
 pub use session::working_image_from;
 

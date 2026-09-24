@@ -120,10 +120,27 @@ export interface VersionEdit {
    *  was. 2: the scene-linear pipeline on the RAW working image. A version means one
    *  thing forever; the Darkroom never reinterprets an engine-1 record as engine 2. */
   engine?: number;
+  /** Engine 2's display transform (docs/plans/raw-foundation, decision 5): absent or
+   *  "srgb" = the plain sRGB curve, "soft" = sRGB with a highlight shoulder, "camera" =
+   *  the curve fitted to the camera's own JPEGs. New engine-2 records get "camera"
+   *  ({@link asLinearRecord}); a saved record keeps what it has. */
+  display?: string;
 }
 
 /** The scene-linear engine that renders from the RAW working image. */
 export const ENGINE_LINEAR = 2;
+
+/** The display transform new engine-2 records start with (user decision 2026-09-24:
+ *  closer to the camera's picture style). */
+export const DEFAULT_LINEAR_DISPLAY = "camera";
+
+/** `record` as an engine-2 record. One already made for engine 2 is returned as is — its
+ *  display transform included, so a saved version renders the same forever; one becoming
+ *  engine 2 now gets the default display transform. */
+export function asLinearRecord(record: VersionEdit): VersionEdit {
+  if (record.engine === ENGINE_LINEAR) return record;
+  return { ...record, engine: ENGINE_LINEAR, display: record.display ?? DEFAULT_LINEAR_DISPLAY };
+}
 
 /** Whether a record belongs to the linear engine. */
 export const isLinear = (e: VersionEdit): boolean => e.engine === ENGINE_LINEAR;
@@ -136,6 +153,7 @@ export function forLinearEngine(e: VersionEdit): VersionEdit {
     perspective: e.perspective,
     straighten: e.straighten,
     engine: ENGINE_LINEAR,
+    display: DEFAULT_LINEAR_DISPLAY,
   };
 }
 

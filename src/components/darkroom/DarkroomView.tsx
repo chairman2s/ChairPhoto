@@ -30,6 +30,7 @@ import {
   suggestAutoTone,
 } from "../../modules/api";
 import {
+  asLinearRecord,
   ASPECTS,
   clampStraighten,
   Crop,
@@ -243,9 +244,10 @@ export function DarkroomView({
   sourceTokenRef.current = sourceToken;
   const engineRef = useRef(sourceState.engine);
   engineRef.current = sourceState.engine;
-  /** The record as saved: stamped with the engine that rendered it (engine 1 = absent). */
+  /** The record as saved: stamped with the engine that rendered it (engine 1 = absent).
+   *  A record becoming engine 2 here also gets engine 2's default display transform. */
   const stamped = (record: VersionEdit): VersionEdit =>
-    engineRef.current === 2 ? { ...record, engine: 2 } : record;
+    engineRef.current === 2 ? asLinearRecord(record) : record;
   const [masses, setMasses] = useState<number[]>([]);
   const [rendering, setRendering] = useState(false);
   const [error, setError] = useState("");

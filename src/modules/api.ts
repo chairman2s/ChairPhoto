@@ -832,8 +832,11 @@ export const editZoneMasses = (photoId: number, editJson: string, source?: strin
 
 /** Classical auto-tone starting fragment for the Darkroom's proof sheet — an edit-json
  *  string carrying only tone.ev/contrast/highlights/shadows. `edit` feature only. */
-export const suggestAutoTone = (photoId: number) =>
-  invoke<string>("suggest_auto_tone", { photoId });
+/** The proof sheet's auto-tone fragment. On the RAW engine pass the working-image
+ *  `source` token and the as-shot `baseJson` (engine, display transform, camera match) so
+ *  the analysis reads the picture being developed. */
+export const suggestAutoTone = (photoId: number, source?: string, baseJson?: string) =>
+  invoke<string>("suggest_auto_tone", { photoId, source: source ?? null, baseJson: baseJson ?? null });
 
 // --- Develop source (docs/plans/raw-foundation) ---
 

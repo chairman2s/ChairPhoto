@@ -251,6 +251,9 @@ export function DarkroomView({
    *  this frame's camera match. */
   const stamped = (record: VersionEdit): VersionEdit =>
     engineRef.current === 2 ? asLinearRecord(record, cameraEvRef.current) : record;
+  /** A variant's render (proof sheet, duel) from the stage's own source and engine. */
+  const variantUrl = (record: VersionEdit, maxEdge: number): string =>
+    editRenderUrl(photoId, JSON.stringify(stamped(record)), { maxEdge, source: sourceToken });
   const [masses, setMasses] = useState<number[]>([]);
   const [rendering, setRendering] = useState(false);
   const [error, setError] = useState("");
@@ -485,13 +488,18 @@ export function DarkroomView({
   useEffect(() => {
     let alive = true;
     setAutoFragment(null);
-    suggestAutoTone(photoId)
+    // On the RAW engine the fragment is measured on the working image as-shot, so it waits
+    // for the token; until then (and on engine 1) it reads the camera preview.
+    const base = sourceToken ? JSON.stringify(stamped({})) : undefined;
+    suggestAutoTone(photoId, sourceToken, base)
       .then((j) => alive && setAutoFragment(parseEdit(j)))
       .catch(() => alive && setAutoFragment({}));
     return () => {
       alive = false;
     };
-  }, [photoId]);
+    // `stamped` reads refs; the token names the source and changes with it.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [photoId, sourceToken]);
 
   // "Save as preset": the current look (never the framing) under a name, into the user
   // presets the proof sheet and the preset browser deal from.
@@ -997,8 +1005,8 @@ export function DarkroomView({
       </div>
       {proofs && (
         <ProofSheet
-          photoId={photoId}
           candidates={proofs}
+          renderUrl={variantUrl}
           onAdopt={(record) => {
             // Remember what was adopted — the history step's name, and the default name a
             // "New version" gets.
@@ -1015,8 +1023,8 @@ export function DarkroomView({
       )}
       {duelOpen && (
         <DuelView
-          photoId={photoId}
           working={working}
+          renderUrl={variantUrl}
           onApply={(record) => {
             nextLabelRef.current = "Duel pick";
             setWorking(record);

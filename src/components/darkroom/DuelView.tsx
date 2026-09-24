@@ -4,19 +4,20 @@
 // says "same" and skips the dimension, Esc keeps the standing winner and leaves.
 // Either pane can be banked as a version (⑂) without ending the round.
 import { useEffect, useMemo, useState } from "react";
-import { renderEditBatch } from "../../modules/api";
 import type { VersionEdit } from "../../modules/editing";
+import { RenderedImage } from "./RenderedImage";
 import { DUEL_DIMS, DUEL_LABELS, duelPair, type DuelDim } from "./spreads";
 
 export function DuelView({
-  photoId,
   working,
+  renderUrl,
   onApply,
   onFork,
   onClose,
 }: {
-  photoId: number;
   working: VersionEdit;
+  /** The render URL for a record at a given long edge — the Darkroom's engine and source. */
+  renderUrl: (record: VersionEdit, maxEdge: number) => string;
   /** The picked variant becomes the working state. */
   onApply: (record: VersionEdit) => void;
   /** Bank a variant as a version without ending the round. Resolves to its name. */
@@ -24,30 +25,10 @@ export function DuelView({
   onClose: () => void;
 }) {
   const [dimIdx, setDimIdx] = useState(0);
-  const [renders, setRenders] = useState<(string | null)[]>([]);
   const [note, setNote] = useState("");
   const dim = DUEL_DIMS[dimIdx];
 
   const pair = useMemo(() => duelPair(working, dim, 0), [working, dim]);
-
-  useEffect(() => {
-    let alive = true;
-    setRenders([]);
-    renderEditBatch(
-      photoId,
-      pair.map((r) => JSON.stringify(r)),
-      1024,
-    )
-      .then((r) => {
-        if (alive) setRenders(r);
-      })
-      .catch(() => {
-        if (alive) setRenders([null, null]);
-      });
-    return () => {
-      alive = false;
-    };
-  }, [photoId, pair]);
 
   const advance = () => {
     setNote("");
@@ -100,11 +81,7 @@ export function DuelView({
       <main className="dk-duel-panes">
         {([0, 1] as const).map((i) => (
           <div key={i} className="dk-duel-pane" onClick={() => pick(i)}>
-            {renders[i] ? (
-              <img src={renders[i]!} alt="" />
-            ) : (
-              <div className="dk-duel-loading">Rendering…</div>
-            )}
+            <RenderedImage src={renderUrl(pair[i], 1024)} loadingClass="dk-duel-loading" loadingText="Rendering…" />
             <div className="dk-duel-pane-bar">
               <button
                 className="dk-duel-pick"

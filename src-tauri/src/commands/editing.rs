@@ -328,10 +328,15 @@ pub async fn edit_zone_masses(
 /// `tone.ev/contrast/highlights/shadows` (docs/plans/darkroom). A learned model can
 /// replace the internals later without this surface changing.
 #[tauri::command]
-pub async fn suggest_auto_tone(app: AppHandle, photo_id: i64) -> Result<String, String> {
+pub async fn suggest_auto_tone(
+    app: AppHandle,
+    photo_id: i64,
+    source: Option<String>,
+    base_json: Option<String>,
+) -> Result<String, String> {
     #[cfg(not(feature = "edit"))]
     {
-        let _ = (&app, photo_id);
+        let _ = (&app, photo_id, &source, &base_json);
         Err("Editing backend not included in this build".into())
     }
     #[cfg(feature = "edit")]
@@ -350,9 +355,24 @@ pub async fn suggest_auto_tone(app: AppHandle, photo_id: i64) -> Result<String, 
                 crate::catalog::ResolveMode::OriginalRequired,
             )
             .ok_or_else(|| format!("no reachable copy of photo {photo_id}"))?;
-            let jpeg = crate::thumbnails::preview_bytes(&path)?;
-            let img = crate::plugins::edit::decode_proxy_cached(&jpeg)?;
-            let a = crate::plugins::edit::auto_tone_for(&img.to_rgb8());
+            // On the RAW engine the analysis reads what the stage shows as-shot: the working
+            // image through the record's base (`base_json`: engine, display transform and
+            // camera match, no adjustments) — the fragment's EV then means linear stops on
+            // the picture being developed, not on the camera's JPEG.
+            let rgb = if let Some(token) = parse_working_token(source.as_deref())? {
+                let image = working_image(&token)?;
+                crate::plugins::edit::render_proxy(
+                    crate::plugins::edit::RenderSource::Working { token, image },
+                    base_json.as_deref().unwrap_or(r#"{"engine":2}"#),
+                    1024,
+                    crate::plugins::edit::RenderOpts::default(),
+                )?
+                .to_rgb8()
+            } else {
+                let jpeg = crate::thumbnails::preview_bytes(&path)?;
+                crate::plugins::edit::decode_proxy_cached(&jpeg)?.to_rgb8()
+            };
+            let a = crate::plugins::edit::auto_tone_for(&rgb);
             Ok(serde_json::json!({
                 "tone": {
                     "ev": a.ev,

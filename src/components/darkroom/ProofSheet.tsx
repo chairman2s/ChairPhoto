@@ -1,42 +1,25 @@
 // The proof sheet (docs/plans/darkroom/mockups/02-proof-sheet.html): the photo
-// developed a dozen ways — real renders from one render_edit_batch call (proxy decoded
-// once backend-side). Click a proof to adopt its record; Esc or the backdrop declines.
-import { useEffect, useState } from "react";
-import { renderEditBatch } from "../../modules/api";
+// developed a dozen ways — real renders, each a native `edit://` URL from the same source
+// as the stage (the RAW working image when it is resident; the framed-base cache makes
+// the dozen share one geometry pass). Click a proof to adopt its record; Esc or the
+// backdrop declines.
+import { useEffect } from "react";
 import type { VersionEdit } from "../../modules/editing";
+import { RenderedImage } from "./RenderedImage";
 import type { ProofCandidate } from "./spreads";
 
 export function ProofSheet({
-  photoId,
   candidates,
+  renderUrl,
   onAdopt,
   onClose,
 }: {
-  photoId: number;
   candidates: ProofCandidate[];
+  /** The render URL for a record at a given long edge — the Darkroom's engine and source. */
+  renderUrl: (record: VersionEdit, maxEdge: number) => string;
   onAdopt: (record: VersionEdit) => void;
   onClose: () => void;
 }) {
-  const [renders, setRenders] = useState<(string | null)[]>([]);
-
-  useEffect(() => {
-    let alive = true;
-    renderEditBatch(
-      photoId,
-      candidates.map((c) => JSON.stringify(c.record)),
-      320,
-    )
-      .then((r) => {
-        if (alive) setRenders(r);
-      })
-      .catch(() => {
-        if (alive) setRenders(candidates.map(() => null));
-      });
-    return () => {
-      alive = false;
-    };
-  }, [photoId, candidates]);
-
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") {
@@ -68,11 +51,7 @@ export function ProofSheet({
               onClick={() => onAdopt(c.record)}
               title={`Adopt "${c.label}" as the working state`}
             >
-              {renders[i] ? (
-                <img src={renders[i]!} alt="" />
-              ) : (
-                <span className="dk-proof-loading">…</span>
-              )}
+              <RenderedImage src={renderUrl(c.record, 320)} loadingClass="dk-proof-loading" loadingText="…" />
               <span className="dk-proof-tag">
                 <b>{c.label}</b>
                 {c.group !== "asShot" && c.group !== "auto" && <em>{c.group}</em>}

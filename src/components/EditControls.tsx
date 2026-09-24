@@ -70,6 +70,7 @@ export function EditStage({
   onImgDims,
   onBackdropLoad,
   onBackdropError,
+  stageLayer,
 }: {
   /** The rendered preview (data URL); empty shows `loading`. */
   backdrop: string;
@@ -102,6 +103,9 @@ export function EditStage({
   onBackdropLoad?: (src: string) => void;
   /** The backdrop <img> failed to load that `backdrop` value. */
   onBackdropError?: (src: string) => void;
+  /** Drawn over the picture inside the frame (so it pans, zooms and sizes with it) and
+   *  under the crop and quad overlays — the Darkroom's sensor-clipping layer. */
+  stageLayer?: ReactNode;
 }) {
   const stageRef = useRef<HTMLDivElement>(null);
   const frameRef = useRef<HTMLDivElement>(null);
@@ -366,6 +370,7 @@ export function EditStage({
               }}
               onError={() => onBackdropError?.(backdrop)}
             />
+            {stageLayer}
             {crop && !showBefore && (
               <div
                 className="crop-rect"

@@ -200,6 +200,34 @@ mod tests {
         assert!(mean_lin < 0.9, "the linear working image is not nearly white");
     }
 
+    /// With a real RAW (`CHAIRPHOTO_RAW_FIXTURE`): the clip overlay marks the sensor's
+    /// clipped share at the stage size, and a −3 EV pull changes nothing about it.
+    #[test]
+    fn fixture_clip_overlay_marks_what_the_sensor_clipped() {
+        let Ok(fixture) = std::env::var("CHAIRPHOTO_RAW_FIXTURE") else {
+            println!("SKIPPED: fixture_clip_overlay_marks_what_the_sensor_clipped — set CHAIRPHOTO_RAW_FIXTURE");
+            return;
+        };
+        use crate::plugins::edit::{clip_overlay_png, SourceToken};
+        let d = crate::raw::decode_linear(std::path::Path::new(&fixture), &std::sync::atomic::AtomicBool::new(false)).unwrap();
+        let image = Arc::new(working_image_from(d));
+        let full = image.linear.as_raw().chunks_exact(3).filter(|p| p.iter().any(|&c| c >= 1.0)).count();
+        let token = SourceToken::Working { photo_id: 1, generation: 77 };
+        let marked = |json: &str| {
+            let png = clip_overlay_png(token.clone(), image.clone(), json, 1400).unwrap();
+            let m = image::load_from_memory(&png).unwrap().to_rgba8();
+            (m.pixels().filter(|p| p.0[3] > 0).count(), m.width() * m.height())
+        };
+        let (a, n) = marked(r#"{"engine":2,"display":"camera.2"}"#);
+        let (b, _) = marked(r#"{"engine":2,"display":"camera.2","tone":{"ev":-3}}"#);
+        println!(
+            "clip: full-res clipped {:.3}% ; overlay at 1400 marks {:.3}% ({a} of {n})",
+            100.0 * full as f64 / (image.width as f64 * image.height as f64),
+            100.0 * a as f64 / n as f64
+        );
+        assert_eq!(a, b, "no slider moves the sensor's clipping");
+    }
+
     fn img(w: u32, h: u32) -> Arc<WorkingImage> {
         test_image(w, h)
     }

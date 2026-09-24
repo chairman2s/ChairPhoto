@@ -806,6 +806,9 @@ export interface EditRenderOpts {
   maxEdge?: number;
   /** Render from the native-size zoom tier instead of the 2048 px proxy. */
   hiRes?: boolean;
+  /** The sensor-clipping overlay for this geometry and size instead of the render
+   *  (a transparent PNG; needs the working-image `source`). */
+  clip?: boolean;
   /** Geometry only — perspective and straighten, no crop, no look — served as lossless
    *  PNG: the GL drag tier's texture (docs/plans/darkroom/00-status.md). */
   baseOnly?: boolean;
@@ -842,6 +845,7 @@ export const editRenderUrl = (
   q.set("m", String(opts.maxEdge ?? 0));
   if (opts.baseOnly) q.set("b", "1");
   if (opts.hiRes) q.set("hi", "1");
+  if (opts.clip) q.set("k", "1");
   if (opts.source && opts.source !== "p") q.set("s", opts.source);
   if (opts.bust) q.set("v", String(opts.bust));
   return `${convertFileSrc(String(photoId), "edit")}?${q.toString()}`;

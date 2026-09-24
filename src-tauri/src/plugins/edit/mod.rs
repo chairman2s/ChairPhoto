@@ -370,24 +370,7 @@ pub fn render_proxy(
             finish_look(base, &edit, opts, &mut t)
         }
         (2, RenderSource::Working { token, image }) => {
-            let key = FramedKey { source: token_fingerprint(&token), geometry, max_edge };
-            let base = match framed_cache_get(&key) {
-                Some(FramedBase::Linear(base)) => {
-                    t.mark("framed_cache_hit");
-                    base
-                }
-                _ => {
-                    let framed = frame_image(DynamicImage::ImageRgb32F(image.linear.clone()), &edit, max_edge, &mut t);
-                    let base = framed.into_rgb32f();
-                    // A full-size linear base is ~800 MB for a 67 MP frame and the cache
-                    // copies on every hit: only screen-sized bases are kept.
-                    if base.width().max(base.height()) <= FRAMED_CACHE_MAX_LINEAR_EDGE {
-                        framed_cache_put(key, FramedBase::Linear(base.clone()));
-                        t.mark("framed_cache_put");
-                    }
-                    base
-                }
-            };
+            let base = framed_linear(&token, &image, &edit, geometry, max_edge, &mut t);
             finish_linear(base, &edit, &image, opts, &mut t)?
         }
         (1, _) => return Err("engine 1 renders from the camera preview".into()),
@@ -396,6 +379,75 @@ pub fn render_proxy(
     };
     t.report(&format!("out={}x{}", rgb.width(), rgb.height()));
     Ok(DynamicImage::ImageRgb8(rgb))
+}
+
+/// The working image after the record's geometry and the downscale, through the
+/// framed-base cache.
+fn framed_linear(
+    token: &SourceToken,
+    image: &WorkingImage,
+    edit: &EditRecord,
+    geometry: u64,
+    max_edge: u32,
+    t: &mut timing::Stages,
+) -> Rgb32FImage {
+    let key = FramedKey { source: token_fingerprint(token), geometry, max_edge };
+    if let Some(FramedBase::Linear(base)) = framed_cache_get(&key) {
+        t.mark("framed_cache_hit");
+        return base;
+    }
+    let framed = frame_image(DynamicImage::ImageRgb32F(image.linear.clone()), edit, max_edge, t);
+    let base = framed.into_rgb32f();
+    // A full-size linear base is ~800 MB for a 67 MP frame and the cache copies on every
+    // hit: only screen-sized bases are kept.
+    if base.width().max(base.height()) <= FRAMED_CACHE_MAX_LINEAR_EDGE {
+        framed_cache_put(key, FramedBase::Linear(base.clone()));
+        t.mark("framed_cache_put");
+    }
+    base
+}
+
+/// A pixel of the framed working image counts as sensor-clipped when any channel is at
+/// sensor white. Just under 1.0, because the area-average downscale of a fully clipped
+/// block can land a rounding step below it; a block only partly clipped averages lower
+/// and is not marked.
+pub const CLIP_AT: f32 = 0.999;
+
+/// The stage's sensor-clipping overlay (docs/plans/raw-foundation, mockup 02): for the
+/// same record geometry and `max_edge` as the stage render, a transparent PNG marked
+/// magenta wherever the RAW itself is clipped — the only white that is gone for good, and
+/// unmoved by any slider. Engine 2 only.
+pub fn clip_overlay_png(
+    token: SourceToken,
+    image: std::sync::Arc<WorkingImage>,
+    edit_json: &str,
+    max_edge: u32,
+) -> Result<Vec<u8>, String> {
+    let edit = parse_record(edit_json)?;
+    if edit.engine != 2 {
+        return Err("the sensor-clipping overlay is for engine-2 records".into());
+    }
+    let mut t = timing::Stages::start(format!("clip_overlay max_edge={max_edge}"));
+    let base = framed_linear(&token, &image, &edit, geometry_fingerprint(&edit), max_edge, &mut t);
+    let mask = image::RgbaImage::from_fn(base.width(), base.height(), |x, y| {
+        if base.get_pixel(x, y).0.iter().any(|&c| c >= CLIP_AT) {
+            image::Rgba([255, 0, 255, 190])
+        } else {
+            image::Rgba([0, 0, 0, 0])
+        }
+    });
+    t.mark("mask");
+    let mut out = std::io::Cursor::new(Vec::new());
+    DynamicImage::ImageRgba8(mask)
+        .write_with_encoder(image::codecs::png::PngEncoder::new_with_quality(
+            &mut out,
+            image::codecs::png::CompressionType::Fast,
+            image::codecs::png::FilterType::NoFilter,
+        ))
+        .map_err(|e| e.to_string())?;
+    let out = out.into_inner();
+    t.report(&format!("bytes={}", out.len()));
+    Ok(out)
 }
 
 /// Engine 2's stage 4: exposure and white balance in linear light, the display transform,
@@ -981,6 +1033,20 @@ mod tests {
         assert_ne!(matched.as_raw(), none.as_raw());
         let worst = matched.as_raw().iter().zip(by_slider.as_raw()).map(|(a, b)| (*a as i32 - *b as i32).abs()).max().unwrap();
         assert!(worst <= 1, "the same light either way (max |Δ| {worst})");
+    }
+
+    #[test]
+    fn the_clip_overlay_marks_sensor_white_only_and_matches_the_stage_size() {
+        let img = synthetic_working(1.0); // the left patch sits exactly at sensor white
+        let token = SourceToken::Working { photo_id: 5, generation: 1 };
+        let json = r#"{"engine": 2, "display": "camera.2", "tone": {"ev": -2.0}}"#;
+        let png = clip_overlay_png(token.clone(), img.clone(), json, 32).unwrap();
+        let mask = image::load_from_memory(&png).unwrap().to_rgba8();
+        let stage = render_proxy(RenderSource::Working { token: token.clone(), image: img.clone() }, json, 32, RenderOpts::default()).unwrap();
+        assert_eq!(mask.dimensions(), (stage.width(), stage.height()), "the overlay lies exactly on the stage render");
+        assert_eq!(mask.get_pixel(2, 10).0, [255, 0, 255, 190], "clipped at the sensor: marked, whatever the sliders say");
+        assert_eq!(mask.get_pixel(28, 10).0[3], 0, "below sensor white: transparent");
+        assert!(clip_overlay_png(token, img, r#"{"tone": {"ev": 0}}"#, 32).is_err(), "engine 1 has no sensor data");
     }
 
     #[test]

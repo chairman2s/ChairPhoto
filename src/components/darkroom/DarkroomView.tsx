@@ -255,6 +255,15 @@ export function DarkroomView({
    *  engine, the session token, so the loupe renders the stage's own pixels. */
   const broadcastPrint = () =>
     broadcastPhoto(photoId, loupeJson(JSON.stringify(stamped(workingRef.current))), sourceTokenRef.current ?? null);
+  /** The sensor-clipping layer: the stage's geometry at the settled size (tone does not
+   *  move it, so slider drags do not refetch it). */
+  const [showClipping, setShowClipping] = useState(false);
+  const clipUrl = (geometry: VersionEdit, perspectiveOff: boolean) =>
+    editRenderUrl(photoId, stageJsonFor(stamped(geometry), perspectiveOff), {
+      maxEdge: PREVIEW_MAX,
+      source: sourceToken,
+      clip: true,
+    });
   /** A variant's render (proof sheet, duel) from the stage's own source and engine. */
   const variantUrl = (record: VersionEdit, maxEdge: number): string =>
     editRenderUrl(photoId, JSON.stringify(stamped(record)), { maxEdge, source: sourceToken });
@@ -852,6 +861,15 @@ export function DarkroomView({
             {badgeFor(source).label}
           </span>
         )}
+        {sourceToken && (
+          <button
+            className={`dk-loupe-toggle ${showClipping ? "on" : ""}`}
+            onClick={() => setShowClipping((v) => !v)}
+            title="Mark where the sensor itself clipped — the only white no slider can bring back"
+          >
+            ◩ Clipping
+          </button>
+        )}
         <button
           className={`dk-loupe-toggle ${printOnLoupe ? "on" : ""}`}
           onClick={togglePrintOnLoupe}
@@ -905,6 +923,19 @@ export function DarkroomView({
               onImgDims={setImgDims}
               onBackdropLoad={onBackdropLoad}
               onBackdropError={onBackdropError}
+              stageLayer={
+                showClipping && sourceToken ? (
+                  <img
+                    className="dk-clip-layer"
+                    src={clipUrl(
+                      { crop: working.crop, straighten: working.straighten, perspective: working.perspective },
+                      perspectiveMode,
+                    )}
+                    alt=""
+                    draggable={false}
+                  />
+                ) : null
+              }
             />
           </div>
           <div className="dk-strip-row">

@@ -27,6 +27,12 @@ describe("editRenderUrl", () => {
     expect(editRenderUrl(7, "{}", { hiRes: true, bust: 42 })).toBe("asset:///7?r=e30&m=0&hi=1&v=42");
   });
 
+  it("asks for the sensor-clipping overlay with k=1", () => {
+    expect(editRenderUrl(3, "{}", { maxEdge: 1400, source: "w:3:1", clip: true })).toBe(
+      "asset:///3?r=e30&m=1400&k=1&s=w%3A3%3A1",
+    );
+  });
+
   it("carries the working-image token, and omits the preview token", () => {
     expect(editRenderUrl(5, "{}", { maxEdge: 720, source: "w:5:3" })).toBe("asset:///5?r=e30&m=720&s=w%3A5%3A3");
     expect(editRenderUrl(5, "{}", { maxEdge: 720, source: "p" })).toBe("asset:///5?r=e30&m=720");

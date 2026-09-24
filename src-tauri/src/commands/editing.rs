@@ -46,6 +46,11 @@ pub fn render_edit_bytes<R: tauri::Runtime>(
     if let SourceToken::Working { .. } = &job.source {
         let opts = RenderOpts { skip_look: job.base_only };
         let image = working_image(&job.source)?;
+        if job.clip {
+            let bytes = edit::clip_overlay_png(job.source.clone(), image, &job.edit_json, job.max_edge)?;
+            t.report(&format!("clip bytes={}", bytes.len()));
+            return Ok(bytes);
+        }
         let out = edit::render_proxy(
             RenderSource::Working { token: job.source.clone(), image },
             &job.edit_json,
@@ -76,6 +81,9 @@ pub fn render_edit_bytes<R: tauri::Runtime>(
     )
     .ok_or_else(|| format!("no reachable copy of photo {}", job.photo_id))?;
     t.mark("pick_path");
+    if job.clip {
+        return Err("the sensor-clipping overlay needs the RAW working image".into());
+    }
     let opts = RenderOpts { skip_look: job.base_only };
     // An engine-2 record with no session token (the Library loupe, a version outside
     // Develop): the RAW through its pipeline from a bounded offline load, never the
@@ -147,6 +155,7 @@ pub async fn render_edit(
             hi_res: hi_res.unwrap_or(false),
             base_only: false,
             source: crate::plugins::edit::SourceToken::Preview,
+            clip: false,
         };
         // Render and base64-wrap on a blocking worker: both are CPU work, neither belongs
         // on the async thread.

@@ -83,6 +83,9 @@ pub struct EditJob {
     /// Which pixels to render from (`s=` in the URL): the camera preview, or a resident
     /// RAW working image by token.
     pub source: crate::plugins::edit::SourceToken,
+    /// The sensor-clipping overlay (`k=1`) instead of the render: a transparent PNG with
+    /// the same geometry and size, marked where the RAW itself clipped. Engine 2 only.
+    pub clip: bool,
 }
 
 /// A one-shot callback that receives the rendered bytes (or an error string).

@@ -124,7 +124,23 @@
   saves first and adopts the preloaded neighbour from memory.
   Not measured: whether a background neighbour decode (OpenMP, all cores) makes slider drags
   stutter; the plan's fallback is a lower thread priority or the setting.
-- [ ] Slice 5 — proof sheet, duels, masses, loupe, clipping overlay on the working image
+- [x] Slice 5 — every surface on the same source (2026-09-24). The proof sheet and duels
+  load `edit://` URLs with the stamped record and the session token (they had been engine-1
+  base64 renders of the preview), and the Auto proof's analysis reads the working image
+  (`suggest_auto_tone` with `source`/`base_json`); the masses already did. The loupe print
+  carries the token (`broadcastPrint`), and `renderForLoupe` renders any engine-2 record as
+  `edit://` at 2560 px (full size to zoom) in both loupes. Outside Develop an engine-2
+  record renders from `develop::offline::working_image_for` — the session's image when it
+  holds the photo, else one serialized load kept 60 s — which the cover renderer shares.
+  The framed-base cache keeps linear bases only up to 2560 px. The **sensor-clipping
+  overlay**: `edit://…&k=1` answers a transparent PNG of the stage's geometry and size,
+  magenta where any channel is at sensor white (`CLIP_AT` 0.999 after the area downscale),
+  shown by the *◩ Clipping* toggle on the RAW. On the corpus: `DSC07441` (the sky through
+  the hole, white in the camera JPEG) 0 % clipped; `_DSC7742` (sunset) 0.81 % at full
+  resolution, 0.57 % marked at 1400 px; a −3 EV pull marks the same pixels. Seen on
+  screen: proofs and duel on the RAW. Not seen on screen: the pop-out loupe and the
+  clipping layer (the agent's monitor was switched away when the loupe opened) — covered by
+  tests only.
 - [ ] Slice 6 — export is the view (tone match gone for engine 2; exact parity)
 - [ ] Slice 7 — engine-1 versions kept honest; fork into the new engine
 - [ ] Slice 8 — the swap: `develop.rawEngine` default on, docs, licensing

@@ -81,7 +81,7 @@ pub fn handle_edit_request<R: Runtime>(
             return;
         }
     };
-    let content_type = if job.base_only { "image/png" } else { "image/jpeg" };
+    let content_type = if job.base_only || job.clip { "image/png" } else { "image/jpeg" };
     // Rendering, not fetching, is the cost, and a record is one URL: `no-store` keeps the
     // webview from ever showing pixels from a regenerated proxy or a re-imported LUT.
     let respond = respond_with(responder, content_type, "no-store");
@@ -102,6 +102,7 @@ pub(crate) fn edit_job_from_uri<T>(request: &Request<T>) -> Result<EditJob, Stri
         hi_res: false,
         base_only: false,
         source: crate::plugins::edit::SourceToken::Preview,
+        clip: false,
     };
     let query = request.uri().query().unwrap_or("");
     for pair in query.split('&').filter(|p| !p.is_empty()) {
@@ -117,6 +118,7 @@ pub(crate) fn edit_job_from_uri<T>(request: &Request<T>) -> Result<EditJob, Stri
             "m" => job.max_edge = v.parse().map_err(|_| format!("bad max edge {v:?}"))?,
             "b" => job.base_only = v == "1",
             "hi" => job.hi_res = v == "1",
+            "k" => job.clip = v == "1",
             "s" => {
                 // The frontend percent-encodes ':' in the token.
                 let raw = v.replace("%3A", ":").replace("%3a", ":");
@@ -451,6 +453,8 @@ mod edit_uri_tests {
     fn edit_job_from_uri_parses_all_fields() {
         // "e30" is base64url("{}"); a full record round-trips the same way.
         let job = edit_job_from_uri(&request("edit://localhost/123?r=e30&m=720&b=1&hi=1&v=9")).unwrap();
+        assert!(!job.clip);
+        assert!(edit_job_from_uri(&request("edit://localhost/123?r=e30&k=1")).unwrap().clip);
         assert_eq!(job.photo_id, 123);
         assert_eq!(job.edit_json, "{}");
         assert_eq!(job.max_edge, 720);

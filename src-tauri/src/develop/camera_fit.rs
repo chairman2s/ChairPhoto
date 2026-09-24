@@ -227,7 +227,7 @@ fn fit_camera_transform() {
         let cs = apply(small, sat);
         let shipped = linear::to_display(small, DisplayTransform::Camera, BASELINE_EV);
         let match_ev = linear::camera_match_ev(small, pv).unwrap_or(0.0);
-        let matched = linear::to_display(small, DisplayTransform::Camera, BASELINE_EV + match_ev);
+        let matched = linear::to_display(small, DisplayTransform::CameraColour, BASELINE_EV + match_ev);
         let em = mean_abs(&matched, pv);
         tm += em;
         println!("  {:<16} matched ev {match_ev:+.2} → {em:5.1}", f.file_name().unwrap().to_string_lossy());
@@ -269,7 +269,91 @@ fn fit_camera_transform() {
             chroma(&cs),
         );
     }
+    fit_colour_matrix(&pairs, lift);
     let n = pairs.len() as f64;
     println!("  mean             srgb {:5.1}  curve {:5.1}  curve+sat {:5.1}  shipped {:5.1}", t0 / n, t1 / n, t2 / n, t3 / n);
     println!("  mean matched {:5.1}", tm / n);
+}
+
+
+/// A 3×3 matrix in linear light, rows summing to 1 so neutrals stay neutral, fitted so the
+/// camera transform after it matches the camera JPEG's colour — each photo first brought to
+/// its own camera match, so the matrix explains hue and colourfulness, not brightness.
+/// Coordinate descent on the six off-diagonal entries; printed for the whole corpus and for
+/// each picture style (the A7 IV frames are "Standard", the A7R VI frames "Vivid").
+fn fit_colour_matrix(pairs: &[(std::path::PathBuf, Rgb32FImage, RgbImage)], lift: f64) {
+    let lut: Vec<f32> = (0..8192).map(|i| linear::camera_curve(i as f32 * 3.0 / 8191.0)).collect();
+    let curve = |v: f32| -> f32 {
+        let p = (v * 8191.0 / 3.0).clamp(0.0, 8191.0);
+        let i = (p as usize).min(8190);
+        lut[i] + (lut[i + 1] - lut[i]) * (p - i as f32)
+    };
+    // Samples per photo: (lifted, matched linear RGB, camera RGB 0..1), every 3rd pixel.
+    let mut per_photo: Vec<(String, Vec<([f32; 3], [f32; 3])>)> = vec![];
+    for (f, small, pv) in pairs {
+        let ev = linear::camera_match_ev(small, pv).unwrap_or(0.0);
+        let k = (lift as f32) * 2f32.powf(ev);
+        let (w, h) = small.dimensions();
+        let mut v = vec![];
+        for y in (h / 10..h - h / 10).step_by(3) {
+            for x in (w / 10..w - w / 10).step_by(3) {
+                let s = small.get_pixel(x, y).0;
+                let c = pv.get_pixel(x, y).0;
+                v.push(([s[0] * k, s[1] * k, s[2] * k], [c[0] as f32 / 255.0, c[1] as f32 / 255.0, c[2] as f32 / 255.0]));
+            }
+        }
+        per_photo.push((f.file_name().unwrap().to_string_lossy().into_owned(), v));
+    }
+    let matrix = |o: &[f32; 6]| -> [[f32; 3]; 3] {
+        [[1.0 - o[0] - o[1], o[0], o[1]], [o[2], 1.0 - o[2] - o[3], o[3]], [o[4], o[5], 1.0 - o[4] - o[5]]]
+    };
+    let err = |m: &[[f32; 3]; 3], samples: &[([f32; 3], [f32; 3])]| -> f32 {
+        let mut e = 0.0;
+        for (s, c) in samples {
+            for r in 0..3 {
+                let v = m[r][0] * s[0] + m[r][1] * s[1] + m[r][2] * s[2];
+                e += (curve(v.max(0.0)) - c[r]).abs();
+            }
+        }
+        e / (samples.len() * 3) as f32 * 255.0
+    };
+    let fit = |set: &[usize]| -> [f32; 6] {
+        let samples: Vec<([f32; 3], [f32; 3])> = set.iter().flat_map(|&i| per_photo[i].1.iter().copied()).collect();
+        let mut o = [0f32; 6];
+        let mut best = err(&matrix(&o), &samples);
+        let mut step = 0.1f32;
+        while step > 0.0005 {
+            let mut improved = false;
+            for i in 0..6 {
+                for d in [step, -step] {
+                    let mut t = o;
+                    t[i] += d;
+                    let e = err(&matrix(&t), &samples);
+                    if e < best {
+                        best = e;
+                        o = t;
+                        improved = true;
+                    }
+                }
+            }
+            if !improved {
+                step /= 2.0;
+            }
+        }
+        o
+    };
+    let vivid: Vec<usize> = (0..per_photo.len()).filter(|&i| per_photo[i].0.starts_with("_DSC")).collect();
+    let standard: Vec<usize> = (0..per_photo.len()).filter(|&i| !per_photo[i].0.starts_with("_DSC")).collect();
+    let all: Vec<usize> = (0..per_photo.len()).collect();
+    let fits = [("all", fit(&all)), ("standard", fit(&standard)), ("vivid", fit(&vivid))];
+    println!("\ncolour matrix (per photo matched first); mean |Δ| per photo:");
+    for (name, o) in &fits {
+        let m = matrix(o);
+        println!("  {name:<9} {:.3?}", m);
+    }
+    let ident = matrix(&[0.0; 6]);
+    for (name, samples) in &per_photo {
+        let row: Vec<String> = fits.iter().map(|(n, o)| format!("{n} {:5.1}", err(&matrix(o), samples))).collect();
+        println!("  {name:<16} none {:5.1}  {}", err(&ident, samples), row.join("  "));
+    }
 }

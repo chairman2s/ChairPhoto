@@ -16,12 +16,12 @@ describe("engine id on the record", () => {
       bw: { enabled: true, r: 1, g: 0, b: 0 } as never,
       zones: [0, 1, 0, 0, 0, 0, 0, 0],
     });
-    expect(out).toEqual({ crop: { x: 0.1, y: 0.1, w: 0.8, h: 0.8, aspect: "1:1" }, perspective: undefined, straighten: 2, engine: 2, display: "camera" });
+    expect(out).toEqual({ crop: { x: 0.1, y: 0.1, w: 0.8, h: 0.8, aspect: "1:1" }, perspective: undefined, straighten: 2, engine: 2, display: "camera.2" });
   });
 
   it("a record becoming engine 2 gets the camera look; an engine-2 record keeps its own", () => {
-    expect(asLinearRecord({ tone: { ev: 0.5 } as never })).toEqual({ tone: { ev: 0.5 }, engine: 2, display: "camera" });
-    expect(asLinearRecord({ engine: 1, fade: 0.1 })).toEqual({ engine: 2, fade: 0.1, display: "camera" });
+    expect(asLinearRecord({ tone: { ev: 0.5 } as never })).toEqual({ tone: { ev: 0.5 }, engine: 2, display: "camera.2" });
+    expect(asLinearRecord({ engine: 1, fade: 0.1 })).toEqual({ engine: 2, fade: 0.1, display: "camera.2" });
     // Saved before the default changed: no display means plain sRGB, forever.
     const old = parseEdit('{"engine":2,"fade":0.1}');
     expect(asLinearRecord(old)).toBe(old);
@@ -29,7 +29,7 @@ describe("engine id on the record", () => {
   });
 
   it("stamps this frame's camera match on a new record only, and leaves 0 off", () => {
-    expect(asLinearRecord({ fade: 0.1 }, -1.6)).toEqual({ fade: 0.1, engine: 2, display: "camera", cameraEv: -1.6 });
+    expect(asLinearRecord({ fade: 0.1 }, -1.6)).toEqual({ fade: 0.1, engine: 2, display: "camera.2", cameraEv: -1.6 });
     expect(asLinearRecord({ fade: 0.1 }, 0)).not.toHaveProperty("cameraEv");
     // A saved engine-2 record keeps its own match (or none), whatever this open measured.
     const saved = parseEdit('{"engine":2,"display":"camera","cameraEv":-0.5}');

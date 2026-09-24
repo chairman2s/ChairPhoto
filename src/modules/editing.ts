@@ -122,7 +122,8 @@ export interface VersionEdit {
   engine?: number;
   /** Engine 2's display transform (docs/plans/raw-foundation, decision 5): absent or
    *  "srgb" = the plain sRGB curve, "soft" = sRGB with a highlight shoulder, "camera" =
-   *  the curve fitted to the camera's own JPEGs. New engine-2 records get "camera"
+   *  the curve fitted to the camera's own JPEGs, "camera.2" = that curve after the camera
+   *  colour matrix. New engine-2 records get "camera.2"
    *  ({@link asLinearRecord}); a saved record keeps what it has. */
   display?: string;
   /** Engine 2: the exposure offset, in EV, that matched this photo's camera JPEG when the
@@ -135,7 +136,7 @@ export const ENGINE_LINEAR = 2;
 
 /** The display transform new engine-2 records start with (user decision 2026-09-24:
  *  closer to the camera's picture style). */
-export const DEFAULT_LINEAR_DISPLAY = "camera";
+export const DEFAULT_LINEAR_DISPLAY = "camera.2";
 
 /** `record` as an engine-2 record. One already made for engine 2 is returned as is — its
  *  display transform and camera match included, so a saved version renders the same

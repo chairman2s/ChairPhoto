@@ -62,27 +62,59 @@ pub fn apply_exposure_linear(img: &mut Rgb32FImage, ev: f32, wb: [f32; 3]) {
 }
 
 /// The rendering transform slot (decision 5): plain sRGB, sRGB with a soft shoulder that
-/// rolls highlights off instead of clipping them, or the camera-style curve
-/// ([`CAMERA_CURVE`]). New engine-2 edits get `camera` (user decision 2026-09-24: the
-/// default should be closer to the camera's picture style); a record without the field
-/// stays plain sRGB, so a saved version renders the same forever.
+/// rolls highlights off instead of clipping them, the camera-style curve
+/// ([`CAMERA_CURVE`]), or that curve after the camera colour matrix ([`CAMERA_MATRIX`]).
+/// New engine-2 edits get `camera.2` (user decision 2026-09-24: the default should be
+/// closer to the camera's picture style). Every name keeps its meaning once shipped — a
+/// record without the field stays plain sRGB and a `camera` record never gains the matrix
+/// — so a saved version renders the same forever.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum DisplayTransform {
     Srgb,
     Soft { shoulder: f32 },
+    /// `"camera"`: the curve alone.
     Camera,
+    /// `"camera.2"`: [`CAMERA_MATRIX`] in linear light, then the curve.
+    CameraColour,
 }
 
 impl DisplayTransform {
     /// From the record's `display` field: absent or `"srgb"` = sRGB; `"soft"` = the
-    /// shoulder; `"camera"` = the camera-style curve.
+    /// shoulder; `"camera"` = the camera-style curve; `"camera.2"` = matrix and curve.
     pub fn from_record(name: Option<&str>) -> Self {
         match name {
             Some("soft") => DisplayTransform::Soft { shoulder: 0.8 },
             Some("camera") => DisplayTransform::Camera,
+            Some("camera.2") => DisplayTransform::CameraColour,
             _ => DisplayTransform::Srgb,
         }
     }
+}
+
+/// The camera colour matrix of `camera.2`, applied to linear RGB before the curve. Rows
+/// sum to 1, so neutrals stay neutral. Fitted by `develop::camera_fit` on 2026-09-24 over
+/// all eight corpus frames, each first brought to its own camera match, by coordinate
+/// descent on the off-diagonals minimizing mean |Δ| to the camera JPEG. It turns the
+/// decode's cyan-leaning blues toward the camera's violet and deepens blue: on the A7R VI
+/// "Vivid" blue frame the error fell 4.7 → 2.1 levels; the others moved by −0.4..+0.5
+/// (the DNG, 6.1 → 6.6, most); mean over eight 3.7 → 3.35. One blue scene carries most of
+/// that evidence, and the Standard (A7 IV) and Vivid frames alone fit different matrices;
+/// this is the compromise over both.
+pub const CAMERA_MATRIX: [[f32; 3]; 3] = [
+    [0.936, 0.055, 0.009],
+    [-0.035, 1.073, -0.038],
+    [0.047, -0.319, 1.272],
+];
+
+/// `px` through [`CAMERA_MATRIX`].
+#[inline]
+pub fn camera_matrix(px: [f32; 3]) -> [f32; 3] {
+    let m = &CAMERA_MATRIX;
+    [
+        m[0][0] * px[0] + m[0][1] * px[1] + m[0][2] * px[2],
+        m[1][0] * px[0] + m[1][1] * px[1] + m[1][2] * px[2],
+        m[2][0] * px[0] + m[2][1] * px[1] + m[2][2] * px[2],
+    ]
 }
 
 /// The camera-style tone curve: (linear value after the [`BASELINE_EV`] lift, encoded
@@ -218,8 +250,9 @@ pub fn srgb_oetf(x: f32) -> f32 {
 }
 
 /// Fit the linear image onto the display: baseline lift, the transform, the sRGB curve,
-/// 8-bit. Values above display white clip here (Srgb) or roll off (Soft, Camera) —
-/// nowhere earlier. `Camera` replaces the sRGB curve with [`CAMERA_CURVE`].
+/// 8-bit. Values above display white clip here (Srgb) or roll off (Soft, the camera
+/// transforms) — nowhere earlier. The camera transforms replace the sRGB curve with
+/// [`CAMERA_CURVE`]; `CameraColour` applies [`CAMERA_MATRIX`] first.
 pub fn to_display(img: &Rgb32FImage, t: DisplayTransform, baseline_ev: f32) -> RgbImage {
     let (w, h) = img.dimensions();
     let lift = 2f32.powf(baseline_ev);
@@ -228,11 +261,20 @@ pub fn to_display(img: &Rgb32FImage, t: DisplayTransform, baseline_ev: f32) -> R
         return out;
     }
     let row_w = w as usize;
-    let lut = (t == DisplayTransform::Camera).then(camera_lut);
+    let lut = matches!(t, DisplayTransform::Camera | DisplayTransform::CameraColour).then(camera_lut);
     out.as_mut()
         .par_chunks_mut(row_w * 3)
         .zip(img.as_raw().par_chunks(row_w * 3))
         .for_each(|(dst, src)| {
+            if let (Some(lut), DisplayTransform::CameraColour) = (lut, t) {
+                for (d, s) in dst.chunks_exact_mut(3).zip(src.chunks_exact(3)) {
+                    let v = camera_matrix([s[0] * lift, s[1] * lift, s[2] * lift]);
+                    for c in 0..3 {
+                        d[c] = (camera_lookup(lut, v[c].max(0.0)) * 255.0).round().clamp(0.0, 255.0) as u8;
+                    }
+                }
+                return;
+            }
             if let Some(lut) = lut {
                 // The camera curve is fitted to encoded output: no sRGB curve after it.
                 for (d, s) in dst.iter_mut().zip(src.iter()) {
@@ -255,7 +297,7 @@ pub fn to_display(img: &Rgb32FImage, t: DisplayTransform, baseline_ev: f32) -> R
 }
 
 /// The exposure offset, in EV, at which `lin` (a small linear image, as-shot) rendered
-/// through the camera transform best matches the camera's own JPEG of the same frame in
+/// through the `camera.2` transform best matches the camera's own JPEG of the same frame in
 /// brightness: mean |Δ| of luma over the centre 80 % (every other pixel), searched over
 /// −3..+2 EV coarse to fine, to 0.01. It carries what a global curve cannot — the pull an
 /// extended low ISO gets in the camera, a body's metering bias, a global part of DRO.
@@ -299,12 +341,15 @@ pub fn camera_match_ev(lin: &Rgb32FImage, camera: &RgbImage) -> Option<f32> {
             px.push((lin.get_pixel(x, y).0, sum / n / 255.0));
         }
     }
+    // Measured through the transform new records get (`camera.2`); the matrix keeps
+    // neutrals, so a `camera` record's match would differ only by its colour.
     let lut = camera_lut();
     let err = |ev: f32| -> f32 {
         let lift = 2f32.powf(BASELINE_EV + ev);
         let mut e = 0.0;
         for (s, l) in &px {
-            let v = [camera_lookup(lut, (s[0] * lift).max(0.0)), camera_lookup(lut, (s[1] * lift).max(0.0)), camera_lookup(lut, (s[2] * lift).max(0.0))];
+            let m = camera_matrix([s[0] * lift, s[1] * lift, s[2] * lift]);
+            let v = [camera_lookup(lut, m[0].max(0.0)), camera_lookup(lut, m[1].max(0.0)), camera_lookup(lut, m[2].max(0.0))];
             e += (0.2126 * v[0] + 0.7152 * v[1] + 0.0722 * v[2] - l).abs();
         }
         e / px.len() as f32
@@ -443,6 +488,7 @@ mod tests {
         assert_eq!(DisplayTransform::from_record(None), DisplayTransform::Srgb);
         assert_eq!(DisplayTransform::from_record(Some("srgb")), DisplayTransform::Srgb);
         assert_eq!(DisplayTransform::from_record(Some("camera")), DisplayTransform::Camera);
+        assert_eq!(DisplayTransform::from_record(Some("camera.2")), DisplayTransform::CameraColour);
         assert_eq!(DisplayTransform::from_record(Some("unknown")), DisplayTransform::Srgb);
     }
 
@@ -487,6 +533,22 @@ mod tests {
     }
 
     #[test]
+    fn camera_matrix_keeps_neutrals_and_moves_blue_toward_violet() {
+        for row in CAMERA_MATRIX {
+            assert!((row.iter().sum::<f32>() - 1.0).abs() < 1e-6);
+        }
+        let grey = Rgb32FImage::from_pixel(1, 1, image::Rgb([0.1; 3]));
+        let (a, b) = (to_display(&grey, DisplayTransform::CameraColour, 0.0), to_display(&grey, DisplayTransform::Camera, 0.0));
+        assert_eq!(a.get_pixel(0, 0), b.get_pixel(0, 0), "a neutral is untouched by the matrix");
+        let sky = Rgb32FImage::from_pixel(1, 1, image::Rgb([0.02, 0.06, 0.12]));
+        let (c2, c1) = (to_display(&sky, DisplayTransform::CameraColour, 0.0), to_display(&sky, DisplayTransform::Camera, 0.0));
+        let (c2, c1) = (c2.get_pixel(0, 0).0, c1.get_pixel(0, 0).0);
+        // Violet leans: red up relative to green, blue deeper.
+        assert!((c2[0] as i32 - c2[1] as i32) > (c1[0] as i32 - c1[1] as i32), "{c2:?} vs {c1:?}");
+        assert!(c2[2] >= c1[2]);
+    }
+
+    #[test]
     fn camera_match_ev_recovers_a_known_offset_and_refuses_another_shape() {
         // A scene with shadows, midtones and a highlight; the "camera" rendered it a
         // stop and a quarter darker than the transform's as-shot render.
@@ -494,7 +556,7 @@ mod tests {
             let v = 0.002 * 1.07f32.powi(x as i32) * (1.0 + y as f32 / 64.0);
             image::Rgb([v * 1.1, v, v * 0.8])
         });
-        let camera = to_display(&lin, DisplayTransform::Camera, BASELINE_EV - 1.25);
+        let camera = to_display(&lin, DisplayTransform::CameraColour, BASELINE_EV - 1.25);
         let ev = camera_match_ev(&lin, &camera).unwrap();
         assert!((ev + 1.25).abs() <= 0.02, "matched {ev}");
         // At the camera's own size too (the preview is larger than the 256 px copy).

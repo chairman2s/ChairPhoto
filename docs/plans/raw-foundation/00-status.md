@@ -37,9 +37,10 @@
   these means (it acts only near white); its default stays open until judged by eye.
   **Camera look — DECIDED with the user (2026-09-24): the default is closer to the camera's
   picture style.** The user's first side-by-side read the RAW as slightly lighter and less
-  saturated in the oranges and a touch flatter overall. New engine-2 records now carry
-  `display: "camera"`, a per-channel tone curve (`linear::CAMERA_CURVE`) fitted by the
-  ignored `develop::camera_fit::fit_camera_transform` against the embedded camera JPEGs of
+  saturated in the oranges and a touch flatter overall. New engine-2 records carried
+  `display: "camera"` (now `camera.2`, below), a per-channel tone curve
+  (`linear::CAMERA_CURVE`) fitted by the ignored
+  `develop::camera_fit::fit_camera_transform` against the embedded camera JPEGs of
   the five Sony ARWs in the agent library (A7 IV Standard, A7R VI Vivid, DRO Auto). Mean
   |Δ| to the camera JPEG, centre 80 %, levels of 255: plain sRGB 10.1 → camera 3.6
   (per photo 2.5–4.3). The curve alone brings the colour up to the camera's (median chroma
@@ -60,8 +61,15 @@
   the decode thread before the image is announced. Seen on screen: the ISO 50 frame's
   stage mean RGB (93, 89, 85) against the camera JPEG's (93, 89, 84), 60 levels brighter
   before; a Contrast nudge saved `"cameraEv":-1.6`. DRO is local tone mapping; a global
-  curve and offset approximate it. **Not matched: hue** — the camera renders blues more
-  violet than the decode's matrix (the Vivid frame). **Headroom seen on
+  curve and offset approximate it. **Hue (2026-09-24):** the camera rendered blues more
+  violet than the decode's matrix (the Vivid frame). New records now get `camera.2`: a
+  3×3 matrix in linear light (`linear::CAMERA_MATRIX`, rows summing to 1) before the same
+  curve, fitted on all eight frames after each one's camera match. Shipped path (matrix +
+  curve + match), mean |Δ| per frame: 2.3, 3.2, 2.0, 3.8, 3.9, **2.2** (the blue Vivid
+  frame, 4.6 before), 3.1, 6.7 (the DNG, 6.1 before); mean 3.7 → 3.4. One blue scene
+  carries most of that evidence, and the Standard and Vivid frames alone fit different
+  matrices — `camera.2` is the compromise; a per-style or per-photo colour match is the
+  lever if it is not enough. `camera` records keep the curve alone. **Headroom seen on
   a clipped frame (2026-09-19):** a sunlit portrait against sky whose camera preview had
   pixels in the whites bin and a featureless cloud bank; the RAW at −1 EV shows the clouds'
   shape and shading, keeps the sky blue instead of grey, and empties the whites bin —

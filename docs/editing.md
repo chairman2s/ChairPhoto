@@ -310,8 +310,9 @@ Darkroom) until the swap slice makes it the default.
 - **Engine 2's pipeline** (`plugins/edit/linear.rs`): exposure and white balance as
   multiplications of linear light (values above white survive), then one display
   transform (`display`: absent/`"srgb"`, `"soft"` with a highlight shoulder, or
-  `"camera"`, the per-channel curve fitted to the camera's own JPEGs, which new engine-2
-  records get by default; a record keeps the transform it was saved with) with a
+  `"camera"`, the per-channel curve fitted to the camera's own JPEGs, or `"camera.2"`,
+  that curve after a fitted camera colour matrix, which new engine-2 records get by
+  default; a record keeps the transform it was saved with) with a
   `BASELINE_EV` lift plus the record's `cameraEv` — the offset that matched this photo's
   camera JPEG, measured when the RAW was prepared and stamped on a new engine-2 record —
   so as-shot lands at the camera JPEG's brightness, then the *same*

@@ -46,6 +46,12 @@ export function formatMegapixels(mp: number): string {
   return (Math.round(mp * 10) / 10).toString();
 }
 
+/** Whether the RAW is still being prepared — the engine a save would be stamped with is not
+ *  decided yet, so the Darkroom's autosave waits (explicit saves do not). */
+export function isPreparing(s: DevelopSource | null): boolean {
+  return s?.source === "preview" && s.preparing;
+}
+
 /** What the stage renders from, reduced from the source events for one photo. */
 export interface SourceState {
   /** The token to put in render URLs — undefined = the camera preview. */

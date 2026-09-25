@@ -134,9 +134,10 @@ survey and plan live in the session plan file; the increments are:
   the fallback must be a real CPU path, not a software rasterizer (RapidRAW's gap). It
   does not reopen the gate.
 
-Follow-ups recorded here, not done: `LoupeWindow` / `basicEditor` and the
-`render_edit_batch` consumers (`ProofSheet`, `DuelView`, `PresetBrowser`) received base64
-data URLs; all three load `edit://` URLs now, and `EditorView` retired at slice 8.
+Follow-ups recorded here, since done: `LoupeWindow` / `basicEditor` render engine-2
+versions as `edit://` URLs (`renderForLoupe`), the `render_edit_batch` consumers
+(`ProofSheet`, `DuelView`, `PresetBrowser`) all load `edit://` URLs, and `EditorView`
+retired at slice 8. The one base64 path left is an engine-1 version on the loupe.
 
 ## Notes for a fresh session
 - Branch: `feature/darkroom` (cut from `feature/keeper-stats` at d935381 — the loupe-card

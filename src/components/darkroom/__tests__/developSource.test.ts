@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { badgeFor, formatMegapixels, INITIAL_SOURCE, reduceSource } from "../developSource";
+import { badgeFor, formatMegapixels, INITIAL_SOURCE, isPreparing, reduceSource } from "../developSource";
 
 describe("badgeFor", () => {
   it("names a supported RAW by depth and size", () => {
@@ -67,6 +67,14 @@ describe("reduceSource", () => {
   it("carries the resident RAW's camera match, and 0 when it was not measured", () => {
     expect(reduceSource(INITIAL_SOURCE, { ...raw, cameraEv: -1.6 }, 5).cameraEv).toBe(-1.6);
     expect(reduceSource(INITIAL_SOURCE, raw, 5).cameraEv).toBe(0);
+  });
+
+  it("autosave waits only while the RAW is being prepared", () => {
+    expect(isPreparing({ source: "preview", preparing: true })).toBe(true);
+    expect(isPreparing({ source: "preview", preparing: false })).toBe(false);
+    expect(isPreparing(null)).toBe(false);
+    expect(isPreparing({ source: "jpeg" })).toBe(false);
+    expect(isPreparing({ source: "unsupported", camera: null, reason: "x" })).toBe(false);
   });
 
   it("badges the preparing state honestly", () => {

@@ -163,9 +163,11 @@
   this frame's camera match (`forLinearEngine`), and switches to it; the engine-1 version
   is untouched. A blank `{}` version may start on either engine. Presets are look-only and
   render on engine 2 through the shared finish (fade, vignette, grain, B&W, zones are in
-  the full-size parity test). Known gap: a change made while the RAW is still preparing
-  saves an engine-1 record, and once the RAW is resident the next save stamps it engine 2
-  — the lock is taken when a version is loaded, not mid-session. Not seen on screen
+  the full-size parity test). Gap closed 2026-09-25: a change made while the RAW was still
+  preparing saved an engine-1 record that the next save after the swap stamped engine 2.
+  Now the autosave waits while the source is preparing (`isPreparing`) and saves once it
+  is known, stamped for that engine; a save forced meanwhile (a step, a switch, leaving) is
+  engine 1 and locks the version to engine 1 for the session, as a reload would. Not seen on screen
   (monitor unavailable); covered by tests.
 - [x] Slice 8 — the swap (2026-09-24). The RAW engine is no longer a setting: every
   supported RAW opened in the Darkroom prepares its working image (`raw_engine_enabled`

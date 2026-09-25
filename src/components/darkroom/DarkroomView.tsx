@@ -66,7 +66,7 @@ import { ProofSheet } from "./ProofSheet";
 import { DUEL_LABELS, proofSpread, type DuelDim, type ProofCandidate } from "./spreads";
 import { useOwnedSubscription } from "../../modules/ownedEvents";
 import { markShellLeave, setShellTimingEnabled } from "../../modules/shellTiming";
-import { badgeFor, INITIAL_SOURCE, reduceSource, type SourceState } from "./developSource";
+import { badgeFor, INITIAL_SOURCE, isPreparing, reduceSource, type SourceState } from "./developSource";
 import { stageJsonFor } from "./stageJson";
 import { describeChange, shouldAmend } from "./history";
 import { HistoryPanel } from "./HistoryPanel";
@@ -256,6 +256,11 @@ export function DarkroomView({
   sourceTokenRef.current = sourceToken;
   const engineRef = useRef<1 | 2>(engine1Version ? 1 : sourceState.engine);
   engineRef.current = engine1Version ? 1 : sourceState.engine;
+  // The RAW is still being prepared: the engine a save would be stamped with is not
+  // decided yet (docs/plans/raw-foundation, slice 7's gap).
+  const preparing = isPreparing(source);
+  const preparingRef = useRef(preparing);
+  preparingRef.current = preparing;
   const cameraEvRef = useRef(sourceState.cameraEv);
   cameraEvRef.current = sourceState.cameraEv;
   /** The record as saved: stamped with the engine that rendered it (engine 1 = absent).
@@ -625,7 +630,12 @@ export function DarkroomView({
       const atTip = h?.head != null && h.head === tip;
       const now = Date.now();
       const saved = JSON.stringify(stamped(record));
+      // A save forced while the RAW is preparing (a step, a switch, leaving) is an engine-1
+      // record; keep this version on engine 1 from here, as a reload would, so the next
+      // save cannot reinterpret it once the RAW arrives.
+      const savedOnEngine1WhilePreparing = preparingRef.current && engineRef.current === 1;
       const next = await commitVersionEdit(vid, saved, change.label, shouldAmend(lastStepRef.current, change, now, atTip));
+      if (savedOnEngine1WhilePreparing && aliveRef.current && isEngine1Version(record)) setEngine1Version(true);
       lastStepRef.current = { key: change.key, at: now };
       historyRef.current = next;
       if (aliveRef.current) setHistory(next);
@@ -654,12 +664,14 @@ export function DarkroomView({
     return chainRef.current;
   };
   // A change settles after a short quiet: one step per adjustment, not per drag frame.
+  // While the RAW is preparing the settle waits: the change is saved when the source is
+  // known, stamped for the engine that will render it (explicit saves still happen).
   useEffect(() => {
-    if (!loadedRef.current || JSON.stringify(working) === committedJsonRef.current) return;
+    if (preparing || !loadedRef.current || JSON.stringify(working) === committedJsonRef.current) return;
     const t = setTimeout(() => void flush(), 600);
     return () => clearTimeout(t);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [working]);
+  }, [working, preparing]);
   // Leaving the photo (the filmstrip, Library, a catalog switch) saves what is pending.
   useEffect(
     () => () => {

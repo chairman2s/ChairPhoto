@@ -295,6 +295,129 @@ mod tests {
         }
     }
 
+    fn rss_mb() -> f64 {
+        let s = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+        s.lines()
+            .find(|l| l.starts_with("VmRSS:"))
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|kb| kb.parse::<f64>().ok())
+            .map(|kb| kb / 1024.0)
+            .unwrap_or(f64::NAN)
+    }
+
+    /// With a real RAW (`CHAIRPHOTO_RAW_FIXTURE`): the process's resident memory before a
+    /// decode, with the working image resident (and its offline twin), and after the
+    /// release a Develop exit performs — the plan's "RSS before/after a quit from the
+    /// Darkroom", measured without a window.
+    #[test]
+    fn fixture_memory_is_returned_when_develop_releases() {
+        let Ok(fixture) = std::env::var("CHAIRPHOTO_RAW_FIXTURE") else {
+            println!("SKIPPED: fixture_memory_is_returned_when_develop_releases — set CHAIRPHOTO_RAW_FIXTURE");
+            return;
+        };
+        let _serial = serial();
+        release_all();
+        let path = std::path::Path::new(&fixture);
+        let before = rss_mb();
+        let d = crate::raw::decode_linear(path, &std::sync::atomic::AtomicBool::new(false)).unwrap();
+        let image = Arc::new(working_image_from(d));
+        let bytes = image.bytes();
+        let token = SourceToken::Working { photo_id: 1, generation: 1 };
+        assert!(with_resident(|r| r.insert(token.clone(), image)));
+        // A render at the stage size, so the framed-base cache holds its share too.
+        let img = resident(&token).unwrap();
+        let _ = crate::plugins::edit::render_proxy(
+            crate::plugins::edit::RenderSource::Working { token: token.clone(), image: img.clone() },
+            r#"{"engine":2,"display":"camera.2"}"#,
+            1400,
+            crate::plugins::edit::RenderOpts::default(),
+        )
+        .unwrap();
+        drop(img);
+        let resident_mb = rss_mb();
+        release_all();
+        let after = rss_mb();
+        println!(
+            "memory: before {before:.0} MB · working image {:.0} MB resident → RSS {resident_mb:.0} MB · after release {after:.0} MB ({:+.0} MB vs before)",
+            bytes as f64 / 1048576.0,
+            after - before
+        );
+        assert_eq!(resident_bytes(), 0);
+        assert!(after - before < bytes as f64 / 1048576.0 / 4.0, "most of the working image went back to the OS");
+    }
+
+    /// With two real RAWs (`CHAIRPHOTO_RAW_FIXTURE`, `CHAIRPHOTO_RAW_FIXTURE_2`): slider
+    /// frames at the drag tier (720 px, look-only, framed base warm) alone, then while the
+    /// second photo is prepared on another thread — from the decoder, then from the
+    /// `.rawf` cache — the way neighbour preload runs during a drag. Prints p50/p95.
+    #[test]
+    fn fixture_neighbour_preparation_and_drag_frames() {
+        let (Ok(a), Ok(b)) = (std::env::var("CHAIRPHOTO_RAW_FIXTURE"), std::env::var("CHAIRPHOTO_RAW_FIXTURE_2")) else {
+            println!("SKIPPED: fixture_neighbour_preparation_and_drag_frames — set CHAIRPHOTO_RAW_FIXTURE and _2");
+            return;
+        };
+        use crate::plugins::edit::{render_proxy, RenderOpts, RenderSource};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let d = crate::raw::decode_linear(std::path::Path::new(&a), &AtomicBool::new(false)).unwrap();
+        let image = Arc::new(working_image_from(d));
+        let token = SourceToken::Working { photo_id: 1, generation: 900 };
+        let frame = |i: usize| {
+            let ev = (i % 20) as f32 * 0.05 - 0.5;
+            let json = format!(r#"{{"engine":2,"display":"camera.2","tone":{{"ev":{ev}}}}}"#);
+            let t = std::time::Instant::now();
+            render_proxy(RenderSource::Working { token: token.clone(), image: image.clone() }, &json, 720, RenderOpts::default()).unwrap();
+            t.elapsed().as_secs_f64() * 1000.0
+        };
+        frame(0); // warm the framed base
+        let stats = |mut v: Vec<f64>| {
+            v.sort_by(|x, y| x.partial_cmp(y).unwrap());
+            (v[v.len() / 2], v[(v.len() * 95) / 100], v.len())
+        };
+        let alone: Vec<f64> = (0..60).map(frame).collect();
+        let (p50, p95, _) = stats(alone);
+        println!("drag: alone               p50 {p50:6.1} ms  p95 {p95:6.1} ms");
+        for (label, from_cache) in [("decoding a neighbour", false), ("neighbour from .rawf", true)] {
+            let b = b.clone();
+            let root = std::env::temp_dir().join(format!("chairphoto-drag-bench-{}", std::process::id()));
+            if from_cache {
+                // Prime the cache so the timed load is a read.
+                let path = std::path::Path::new(&b);
+                let key = super::cache::CacheKey::for_file(path).unwrap();
+                let d = crate::raw::decode_linear(path, &AtomicBool::new(false)).unwrap();
+                super::cache::write_in(&root, &key, &d).unwrap();
+            }
+            let done = Arc::new(AtomicBool::new(false));
+            let done2 = done.clone();
+            let root2 = root.clone();
+            let worker = std::thread::spawn(move || {
+                let t = std::time::Instant::now();
+                let path = std::path::Path::new(&b);
+                let d = if from_cache {
+                    super::cache::read_in(&root2, &super::cache::CacheKey::for_file(path).unwrap()).unwrap()
+                } else {
+                    crate::raw::decode_linear(path, &AtomicBool::new(false)).unwrap()
+                };
+                let _img = working_image_from(d);
+                done2.store(true, Ordering::Relaxed);
+                t.elapsed().as_secs_f64() * 1000.0
+            });
+            let mut during = Vec::new();
+            let mut i = 0;
+            while !done.load(Ordering::Relaxed) {
+                during.push(frame(i));
+                i += 1;
+            }
+            let took = worker.join().unwrap();
+            let _ = std::fs::remove_dir_all(&root);
+            if during.is_empty() {
+                println!("drag: {label:<22} (finished in {took:.0} ms before a frame)");
+                continue;
+            }
+            let (p50, p95, n) = stats(during);
+            println!("drag: {label:<22} p50 {p50:6.1} ms  p95 {p95:6.1} ms  ({n} frames over {took:.0} ms)");
+        }
+    }
+
     fn img(w: u32, h: u32) -> Arc<WorkingImage> {
         test_image(w, h)
     }

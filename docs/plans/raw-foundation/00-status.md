@@ -94,7 +94,9 @@
   `editing::a_stale_working_token_is_an_error_not_other_pixels`; the first two and the
   switch test were checked to fail against the mutated code. The resident set's lock is
   documented as a leaf of the `commands::jobs` lock order. RSS before/after a quit from the
-  Darkroom: pending the measurement below.
+  Darkroom, measured headless 2026-09-25 (`fixture_memory_is_returned_when_develop_releases`,
+  release): a 33 MP A7 IV frame 8 → 406 → 32 MB, a 67 MP A7 R VI frame 8 → 792 → 32 MB —
+  the working image goes back to the OS; the 24 MB left is the screen-sized framed base.
 - [x] Slice 4 — the `.rawf` decode cache + neighbour preload (2026-09-24; seen on screen on
   the isolated catalog's Sony files). Landed: `develop/cache.rs` (16-bit linear, fixed header
   carrying the full key so a hash collision is a miss, temp-then-rename writes, a hit touches
@@ -122,8 +124,12 @@
   **Stepping — settled (2026-09-24):** the Darkroom autosaves into the active version and
   has a filmstrip (docs/editing.md § History and autosave), so moving to the next photo
   saves first and adopts the preloaded neighbour from memory.
-  Not measured: whether a background neighbour decode (OpenMP, all cores) makes slider drags
-  stutter; the plan's fallback is a lower thread priority or the setting.
+  Measured 2026-09-25 (`fixture_neighbour_preparation_and_drag_frames`, release, a 67 MP
+  A7 R VI frame on the stage, another prepared meanwhile): drag-tier renders (720 px,
+  look-only) p50/p95 1.5/1.9 ms alone, 1.5/2.6 ms while the neighbour decodes (4.5 s, all
+  cores), 1.6/2.5 ms while it loads from `.rawf` (1.3 s). The render side does not stutter,
+  so no priority change is needed. Not covered: the JPEG encode, IPC and the webview's
+  decode, which a manual drag with the timing toggle measures.
 - [x] Slice 5 — every surface on the same source (2026-09-24). The proof sheet and duels
   load `edit://` URLs with the stamped record and the session token (they had been engine-1
   base64 renders of the preview), and the Auto proof's analysis reads the working image

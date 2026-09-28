@@ -174,6 +174,8 @@ package() {
   # The vendored LibRaw is compiled in under its LGPL-2.1 option (MODULE_LICENSING.md).
   install -Dm644 src-tauri/vendor/LibRaw/COPYRIGHT "$pkgdir/usr/share/licenses/$pkgname/LibRaw-COPYRIGHT"
   install -Dm644 src-tauri/vendor/LibRaw/LICENSE.LGPL "$pkgdir/usr/share/licenses/$pkgname/LibRaw-LICENSE.LGPL"
+  # The lens-correction reader is ported from RAWmakase, MIT (MODULE_LICENSING.md).
+  install -Dm644 src-tauri/src/lens/LICENSE-RAWmakase "$pkgdir/usr/share/licenses/$pkgname/RAWmakase-LICENSE"
 
   install -Dm644 "src-tauri/icons/32x32.png" \
     "$pkgdir/usr/share/icons/hicolor/32x32/apps/$pkgname.png"

@@ -61,3 +61,27 @@ change. Its notices travel with every binary: the package installs LibRaw's `COP
 and `LICENSE.LGPL` next to ChairPhoto's own license (`packaging/PKGBUILD`), and LibRaw's
 bundled parts (dcraw, DCB/FBDD, X3F, Adobe DNG SDK pieces) are covered by that
 `COPYRIGHT` file.
+
+The lens-correction reader (`src-tauri/src/lens/`) is ported from **RAWmakase**
+(<https://github.com/pch/rawmakase>, commit `80b6433`), Copyright (c) 2026 RAWmakase
+contributors, under the MIT License, which permits use in a GPL-3.0 program provided the
+notice is kept: it is in `src-tauri/src/lens/LICENSE-RAWmakase`, which the package
+installs next to ChairPhoto's own license (`packaging/PKGBUILD`), and quoted below. Only RAWmakase's own MIT code is taken — none of its files under the
+Adobe DNG SDK license, and none of its tables measured from Adobe Camera Raw.
+
+> Permission is hereby granted, free of charge, to any person obtaining a copy of this
+> software and associated documentation files (the "Software"), to deal in the Software
+> without restriction, including without limitation the rights to use, copy, modify,
+> merge, publish, distribute, sublicense, and/or sell copies of the Software, and to
+> permit persons to whom the Software is furnished to do so, subject to the following
+> conditions:
+>
+> The above copyright notice and this permission notice shall be included in all copies
+> or substantial portions of the Software.
+>
+> THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED,
+> INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+> PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
+> HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF
+> CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR
+> THE USE OR OTHER DEALINGS IN THE SOFTWARE.

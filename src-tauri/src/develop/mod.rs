@@ -152,6 +152,7 @@ pub(crate) fn test_image(w: u32, h: u32) -> Arc<WorkingImage> {
         wbct: Vec::new(),
         decoder: "test",
         camera_ev: None,
+        lens: None,
     })
 }
 

@@ -24,6 +24,8 @@ pub mod phash_indexer;
 pub mod plugins;
 mod protocol;
 #[cfg(feature = "raw")]
+pub mod lens;
+#[cfg(feature = "raw")]
 pub mod raw;
 #[cfg(all(feature = "raw", feature = "edit"))]
 pub mod develop;

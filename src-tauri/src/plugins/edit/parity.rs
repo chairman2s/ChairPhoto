@@ -101,6 +101,8 @@ mod tests {
             wbct: Vec::new(),
             decoder: "test",
             camera_ev: None,
+            #[cfg(feature = "raw")]
+            lens: None,
         })
     }
 

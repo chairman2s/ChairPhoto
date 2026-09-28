@@ -176,6 +176,10 @@ pub struct LinearDecode {
     /// `WBCT_Coeffs`): (colour temperature K, R, G, B multipliers) per row. Kelvin white
     /// balance calibrates to it, which is independent of how good the decoder's matrix is.
     pub wbct: Vec<[f32; 4]>,
+    /// The camera's own lens-correction tables (`lens::embedded`), read from the original
+    /// alongside the decode. Their radius runs over this image — the visible rectangle,
+    /// which is the picture the camera measured them on (docs/plans/lens-corrections).
+    pub lens: Option<crate::lens::LensCorrection>,
 }
 
 /// Decode `path` for the working image. `abort` is polled between the expensive steps —
@@ -264,6 +268,7 @@ pub fn decode_linear(path: &Path, abort: &std::sync::atomic::AtomicBool) -> Resu
                 pre_mul,
                 rgb_cam,
                 wbct,
+                lens: None,
             })
         })();
         ffi::libraw_recycle(lr);
@@ -272,6 +277,7 @@ pub fn decode_linear(path: &Path, abort: &std::sync::atomic::AtomicBool) -> Resu
     }?;
     Ok(LinearDecode {
         orientation: crate::thumbnails::exif_orientation(path),
+        lens: crate::lens::embedded::read(path),
         ..decoded
     })
 }

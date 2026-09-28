@@ -61,6 +61,10 @@ pub struct WorkingImage {
     /// (`linear::camera_match_ev`), measured when the image was prepared. New engine-2
     /// records carry it as `cameraEv`; the image never applies it by itself.
     pub camera_ev: Option<f32>,
+    /// The camera's lens-correction tables (`raw::LinearDecode::lens`). Radial about this
+    /// image's centre, so orientation does not move them.
+    #[cfg(feature = "raw")]
+    pub lens: Option<crate::lens::LensCorrection>,
 }
 
 impl WorkingImage {
@@ -77,6 +81,8 @@ impl WorkingImage {
             wbct: self.wbct.clone(),
             decoder: self.decoder,
             camera_ev: self.camera_ev,
+            #[cfg(feature = "raw")]
+            lens: self.lens.clone(),
         }
     }
 

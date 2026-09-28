@@ -13,10 +13,11 @@
 //! # File format (little-endian)
 //!
 //! ```text
-//! magic    8  b"CPRAWF02"
+//! magic    8  b"CPRAWF03"
 //! width    u32 · height u32 · orientation u8 (EXIF 1–8)
 //! cam_mul  4×f32 · pre_mul 4×f32 · rgb_cam 9×f32
 //! wbct     u8 rows + rows×4 f32 (K, R, G, B)
+//! lens     u32 len + JSON of `lens::LensCorrection` (len 0 = none)
 //! decoder  u16 len + UTF-8 · key u32 len + UTF-8 (the full key, so an fnv collision reads
 //!          as a miss, never as another photo's pixels)
 //! pixels   width×height×3 u16, interleaved RGB, row-major
@@ -38,8 +39,12 @@ use std::path::{Path, PathBuf};
 /// `raw::decode_linear`: bit depth, white balance, clipping, inset crop).
 /// 2: `pre_mul` and the camera's white-balance table joined the header (Kelvin white
 /// balance); format-1 directories are unreachable and trimmed.
-const FORMAT: u32 = 2;
-const MAGIC: &[u8; 8] = b"CPRAWF02";
+/// 3: the camera's lens-correction tables joined the header, so a cache hit with the
+/// original unmounted still corrects (docs/plans/lens-corrections).
+const FORMAT: u32 = 3;
+const MAGIC: &[u8; 8] = b"CPRAWF03";
+/// Far above any real table set (a few KB of JSON); a larger length is a damaged file.
+const MAX_LENS_JSON: usize = 256 * 1024;
 const EXT: &str = "rawf";
 
 /// Settings key: the cache's size limit in GB. Default [`DEFAULT_BUDGET_GB`].
@@ -158,6 +163,23 @@ fn read_body(r: &mut impl Read, key: &CacheKey, file_len: u64) -> Option<LinearD
     for _ in 0..n_wbct[0] {
         wbct.push([read_f32(r)?, read_f32(r)?, read_f32(r)?, read_f32(r)?]);
     }
+    let lens_len = read_u32(r)? as usize;
+    if lens_len > MAX_LENS_JSON {
+        return None;
+    }
+    let lens = if lens_len == 0 {
+        None
+    } else {
+        let mut b = vec![0u8; lens_len];
+        r.read_exact(&mut b).ok()?;
+        let lens: crate::lens::LensCorrection = serde_json::from_slice(&b).ok()?;
+        // Damaged tables are a miss (a fresh decode reads them again), never a hit that
+        // silently renders uncorrected.
+        if !lens.validate() {
+            return None;
+        }
+        Some(lens)
+    };
     let decoder_len = read_u16(r)? as usize;
     let decoder = read_string(r, decoder_len)?;
     let key_len = read_u32(r)? as usize;
@@ -166,12 +188,12 @@ fn read_body(r: &mut impl Read, key: &CacheKey, file_len: u64) -> Option<LinearD
         return None; // another decoder, or an fnv collision: a miss, never other pixels
     }
     let n = (width as u64).checked_mul(height as u64)?.checked_mul(3)?;
-    let header = 8 + 4 + 4 + 1 + 16 + 16 + 36 + 1 + 16 * wbct.len() as u64 + 2 + decoder.len() as u64 + 4 + stored_key.len() as u64;
+    let header = 8 + 4 + 4 + 1 + 16 + 16 + 36 + 1 + 16 * wbct.len() as u64 + 4 + lens_len as u64 + 2 + decoder.len() as u64 + 4 + stored_key.len() as u64;
     if header + n * 2 != file_len {
         return None; // truncated or padded: not a file this writer produced
     }
     let rgb16 = read_u16s(r, n as usize)?;
-    Some(LinearDecode { width, height, rgb16, orientation, cam_mul, pre_mul, rgb_cam, wbct })
+    Some(LinearDecode { width, height, rgb16, orientation, cam_mul, pre_mul, rgb_cam, wbct, lens })
 }
 
 /// Read `n` little-endian `u16`s. On a little-endian machine the file's bytes already are
@@ -240,6 +262,13 @@ pub fn write(key: &CacheKey, d: &LinearDecode) -> Result<(), String> {
 }
 
 pub(crate) fn write_in(root: &Path, key: &CacheKey, d: &LinearDecode) -> Result<(), String> {
+    let lens_json = match &d.lens {
+        Some(l) => serde_json::to_vec(l).map_err(|e| format!("could not encode the lens tables: {e}"))?,
+        None => Vec::new(),
+    };
+    if lens_json.len() > MAX_LENS_JSON {
+        return Err("lens tables too large for the decode cache".into());
+    }
     let path = path_in(root, key);
     let dir = path.parent().ok_or("cache path has no directory")?;
     std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
@@ -271,6 +300,8 @@ pub(crate) fn write_in(root: &Path, key: &CacheKey, d: &LinearDecode) -> Result<
                 w.write_all(&v.to_bits().to_le_bytes())?;
             }
         }
+        w.write_all(&(lens_json.len() as u32).to_le_bytes())?;
+        w.write_all(&lens_json)?;
         w.write_all(&(key.decoder.len() as u16).to_le_bytes())?;
         w.write_all(key.decoder.as_bytes())?;
         w.write_all(&(key.key.len() as u32).to_le_bytes())?;
@@ -398,6 +429,19 @@ mod tests {
             pre_mul: [2.4, 1.0, 1.3, 0.0],
             rgb_cam: [[1.7, -0.6, -0.1], [-0.2, 1.5, -0.3], [0.0, -0.4, 1.4]],
             wbct: vec![[2500.0, 1395.0, 1024.0, 3366.0], [6000.0, 2561.0, 1024.0, 1518.0]],
+            lens: None,
+        }
+    }
+
+    /// Tables shaped like an A7 IV + FE 85mm F1.8 frame's (vignetting and CA, no distortion).
+    fn lens() -> crate::lens::LensCorrection {
+        let knots: Vec<f32> = (0..16).map(|i| i as f32 / 15.0).collect();
+        let radial = |values: Vec<f32>| crate::lens::Radial { knots: knots.clone(), values };
+        crate::lens::LensCorrection {
+            source: "Sony built-in".into(),
+            vignetting: Some(radial((0..16).map(|i| 1.0 + i as f32 * 0.05).collect())),
+            distortion: None,
+            chromatic: Some([radial(vec![0.9998; 16]), radial(vec![1.0003; 16])]),
         }
     }
 
@@ -450,9 +494,23 @@ mod tests {
         assert_eq!(back.pre_mul, d.pre_mul);
         assert_eq!(back.wbct, d.wbct);
         assert_eq!(back.rgb_cam, d.rgb_cam);
+        assert_eq!(back.lens, None);
         // No temp file is left behind.
         let dir = dir_for(&r, "0.22.0-test");
         assert!(std::fs::read_dir(&dir).unwrap().flatten().all(|e| !e.file_name().to_string_lossy().ends_with(".tmp")));
+        std::fs::remove_dir_all(&r).ok();
+    }
+
+    /// The lens tables ride in the header: a hit with the original unmounted still has them.
+    #[test]
+    fn cache_roundtrip_keeps_the_lens_tables() {
+        let r = root("lens");
+        let d = LinearDecode { lens: Some(lens()), ..decode(9, 5, 2) };
+        let k = key("/photos/b.ARW|1|2", "dec");
+        write_in(&r, &k, &d).unwrap();
+        let back = read_in(&r, &k).expect("a hit");
+        assert_eq!(back.lens, d.lens);
+        assert_eq!(back.rgb16, d.rgb16);
         std::fs::remove_dir_all(&r).ok();
     }
 

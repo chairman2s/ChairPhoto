@@ -427,6 +427,7 @@ pub fn working_image_from(d: crate::raw::LinearDecode) -> WorkingImage {
         wbct: d.wbct,
         decoder: crate::raw::decoder_version(),
         camera_ev: None,
+        lens: d.lens,
     }
 }
 
@@ -678,6 +679,7 @@ mod tests {
             pre_mul: [1.0; 4],
             rgb_cam: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
             wbct: Vec::new(),
+            lens: None,
         };
         super::super::cache::write_in(&root, &key, &d).unwrap();
         let abort = std::sync::atomic::AtomicBool::new(false);

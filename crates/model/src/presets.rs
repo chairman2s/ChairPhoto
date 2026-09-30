@@ -12,7 +12,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-use crate::editing::{edit_from_value, Bw, Grain, Split, Tone, VersionEdit, Wb};
+use crate::editing::{edit_from_value, Bw, Field, Grain, Split, Tone, VersionEdit, Wb};
 use crate::js_compat;
 
 /// The settings key the user presets live under.
@@ -49,16 +49,16 @@ pub struct DevelopPreset {
 }
 
 
-fn split(shadow_hue: f64, shadow_sat: f64, highlight_hue: f64, highlight_sat: f64) -> Option<Split> {
-    Some(Split { shadow_hue, shadow_sat, highlight_hue, highlight_sat, balance: 0.0, extra: Map::new() })
+fn split(shadow_hue: f64, shadow_sat: f64, highlight_hue: f64, highlight_sat: f64) -> Field<Split> {
+    Field::Set(Split { shadow_hue, shadow_sat, highlight_hue, highlight_sat, balance: 0.0, extra: Map::new() })
 }
 
-fn grain(amount: f64, size: f64) -> Option<Grain> {
-    Some(Grain { amount, size, seed: 0.0, extra: Map::new() })
+fn grain(amount: f64, size: f64) -> Field<Grain> {
+    Field::Set(Grain { amount, size, seed: 0.0, extra: Map::new() })
 }
 
-fn wb(temp: f64) -> Option<Wb> {
-    Some(Wb::relative(temp, 0.0))
+fn wb(temp: f64) -> Field<Wb> {
+    Field::Set(Wb::relative(temp, 0.0))
 }
 
 fn builtin(id: &str, name: &str, category: PresetCategory, edit: VersionEdit) -> DevelopPreset {
@@ -73,30 +73,30 @@ pub fn builtin_presets() -> Vec<DevelopPreset> {
     let t = Tone::default;
     vec![
         // --- Monochrome styles ---
-        builtin("bw-neutral", "B&W Neutral", Monochrome, VersionEdit { bw: Some(Bw::mix(0.299, 0.587, 0.114)), tone: Some(Tone { contrast: Some(0.1), ..t() }), ..e() }),
+        builtin("bw-neutral", "B&W Neutral", Monochrome, VersionEdit { bw: Field::Set(Bw::mix(0.299, 0.587, 0.114)), tone: Field::Set(Tone { contrast: Field::Set(0.1), ..t() }), ..e() }),
         // Dramatic skies: reds/skin bright, blues near-black.
-        builtin("bw-red", "B&W Red Filter", Monochrome, VersionEdit { bw: Some(Bw::mix(0.9, 0.15, -0.05)), tone: Some(Tone { contrast: Some(0.2), ..t() }), ..e() }),
-        builtin("bw-yellow", "B&W Yellow Filter", Monochrome, VersionEdit { bw: Some(Bw::mix(0.55, 0.4, 0.05)), tone: Some(Tone { contrast: Some(0.12), ..t() }), ..e() }),
+        builtin("bw-red", "B&W Red Filter", Monochrome, VersionEdit { bw: Field::Set(Bw::mix(0.9, 0.15, -0.05)), tone: Field::Set(Tone { contrast: Field::Set(0.2), ..t() }), ..e() }),
+        builtin("bw-yellow", "B&W Yellow Filter", Monochrome, VersionEdit { bw: Field::Set(Bw::mix(0.55, 0.4, 0.05)), tone: Field::Set(Tone { contrast: Field::Set(0.12), ..t() }), ..e() }),
         // Classic for foliage and natural skin rendering.
-        builtin("bw-green", "B&W Green Filter", Monochrome, VersionEdit { bw: Some(Bw::mix(0.2, 0.7, 0.1)), tone: Some(Tone { contrast: Some(0.1), ..t() }), ..e() }),
+        builtin("bw-green", "B&W Green Filter", Monochrome, VersionEdit { bw: Field::Set(Bw::mix(0.2, 0.7, 0.1)), tone: Field::Set(Tone { contrast: Field::Set(0.1), ..t() }), ..e() }),
         builtin(
             "bw-high-contrast",
             "B&W High Contrast",
             Monochrome,
-            VersionEdit { bw: Some(Bw::mix(0.299, 0.587, 0.114)), tone: Some(Tone { contrast: Some(0.45), blacks: Some(-0.15), whites: Some(0.15), ..t() }), ..e() },
+            VersionEdit { bw: Field::Set(Bw::mix(0.299, 0.587, 0.114)), tone: Field::Set(Tone { contrast: Field::Set(0.45), blacks: Field::Set(-0.15), whites: Field::Set(0.15), ..t() }), ..e() },
         ),
         builtin(
             "sepia",
             "Sepia",
             Monochrome,
-            VersionEdit { bw: Some(Bw::mix(0.299, 0.587, 0.114)), split: split(35.0, 0.25, 45.0, 0.12), tone: Some(Tone { contrast: Some(0.05), ..t() }), ..e() },
+            VersionEdit { bw: Field::Set(Bw::mix(0.299, 0.587, 0.114)), split: split(35.0, 0.25, 45.0, 0.12), tone: Field::Set(Tone { contrast: Field::Set(0.05), ..t() }), ..e() },
         ),
         // Cool purple-blue toning in the shadows, like a selenium-toned print.
         builtin(
             "selenium",
             "Selenium",
             Monochrome,
-            VersionEdit { bw: Some(Bw::mix(0.299, 0.587, 0.114)), split: split(275.0, 0.15, 250.0, 0.06), tone: Some(Tone { contrast: Some(0.15), ..t() }), ..e() },
+            VersionEdit { bw: Field::Set(Bw::mix(0.299, 0.587, 0.114)), split: split(275.0, 0.15, 250.0, 0.06), tone: Field::Set(Tone { contrast: Field::Set(0.15), ..t() }), ..e() },
         ),
         // --- Film stocks ---
         // Gritty photojournalism B&W: contrasty, crushed blacks, visible grain.
@@ -105,8 +105,8 @@ pub fn builtin_presets() -> Vec<DevelopPreset> {
             "Tri-X 400",
             Film,
             VersionEdit {
-                bw: Some(Bw::mix(0.35, 0.45, 0.2)),
-                tone: Some(Tone { contrast: Some(0.3), blacks: Some(-0.1), ..t() }),
+                bw: Field::Set(Bw::mix(0.35, 0.45, 0.2)),
+                tone: Field::Set(Tone { contrast: Field::Set(0.3), blacks: Field::Set(-0.1), ..t() }),
                 grain: grain(0.5, 1.2),
                 ..e()
             },
@@ -117,9 +117,9 @@ pub fn builtin_presets() -> Vec<DevelopPreset> {
             "Kodak Gold 200",
             Film,
             VersionEdit {
-                tone: Some(Tone { vibrance: Some(0.15), wb: wb(0.15), ..t() }),
+                tone: Field::Set(Tone { vibrance: Field::Set(0.15), wb: wb(0.15), ..t() }),
                 split: split(40.0, 0.0, 45.0, 0.08),
-                fade: Some(0.1),
+                fade: Field::Set(0.1),
                 grain: grain(0.2, 1.0),
                 ..e()
             },
@@ -130,7 +130,7 @@ pub fn builtin_presets() -> Vec<DevelopPreset> {
             "Portra 400",
             Film,
             VersionEdit {
-                tone: Some(Tone { contrast: Some(-0.05), saturation: Some(-0.1), shadows: Some(0.1), wb: wb(0.08), ..t() }),
+                tone: Field::Set(Tone { contrast: Field::Set(-0.05), saturation: Field::Set(-0.1), shadows: Field::Set(0.1), wb: wb(0.08), ..t() }),
                 split: split(20.0, 0.06, 40.0, 0.0),
                 grain: grain(0.15, 1.0),
                 ..e()
@@ -142,7 +142,7 @@ pub fn builtin_presets() -> Vec<DevelopPreset> {
             "Ektachrome E100",
             Film,
             VersionEdit {
-                tone: Some(Tone { saturation: Some(0.15), contrast: Some(0.15), wb: wb(-0.05), ..t() }),
+                tone: Field::Set(Tone { saturation: Field::Set(0.15), contrast: Field::Set(0.15), wb: wb(-0.05), ..t() }),
                 split: split(220.0, 0.05, 200.0, 0.0),
                 ..e()
             },
@@ -153,7 +153,7 @@ pub fn builtin_presets() -> Vec<DevelopPreset> {
             "Kodachrome 64",
             Film,
             VersionEdit {
-                tone: Some(Tone { contrast: Some(0.25), saturation: Some(0.1), blacks: Some(-0.1), wb: wb(0.05), ..t() }),
+                tone: Field::Set(Tone { contrast: Field::Set(0.25), saturation: Field::Set(0.1), blacks: Field::Set(-0.1), wb: wb(0.05), ..t() }),
                 split: split(40.0, 0.0, 50.0, 0.05),
                 ..e()
             },
@@ -163,34 +163,34 @@ pub fn builtin_presets() -> Vec<DevelopPreset> {
             "velvia",
             "Velvia 50",
             Film,
-            VersionEdit { tone: Some(Tone { saturation: Some(0.35), vibrance: Some(0.2), contrast: Some(0.2), ..t() }), ..e() },
+            VersionEdit { tone: Field::Set(Tone { saturation: Field::Set(0.35), vibrance: Field::Set(0.2), contrast: Field::Set(0.2), ..t() }), ..e() },
         ),
         // --- Color looks ---
         builtin(
             "auto",
             "Auto",
             Color,
-            VersionEdit { tone: Some(Tone { ev: Some(0.15), contrast: Some(0.1), highlights: Some(-0.2), shadows: Some(0.15), ..t() }), ..e() },
+            VersionEdit { tone: Field::Set(Tone { ev: Field::Set(0.15), contrast: Field::Set(0.1), highlights: Field::Set(-0.2), shadows: Field::Set(0.15), ..t() }), ..e() },
         ),
         builtin(
             "landscape",
             "Landscape",
             Color,
-            VersionEdit { tone: Some(Tone { vibrance: Some(0.35), contrast: Some(0.1), highlights: Some(-0.25), shadows: Some(0.1), ..t() }), ..e() },
+            VersionEdit { tone: Field::Set(Tone { vibrance: Field::Set(0.35), contrast: Field::Set(0.1), highlights: Field::Set(-0.25), shadows: Field::Set(0.1), ..t() }), ..e() },
         ),
         builtin(
             "punch",
             "Punch",
             Color,
-            VersionEdit { tone: Some(Tone { contrast: Some(0.3), vibrance: Some(0.25), blacks: Some(-0.15), ..t() }), ..e() },
+            VersionEdit { tone: Field::Set(Tone { contrast: Field::Set(0.3), vibrance: Field::Set(0.25), blacks: Field::Set(-0.15), ..t() }), ..e() },
         ),
         builtin(
             "faded-matte",
             "Faded Matte",
             Color,
             VersionEdit {
-                tone: Some(Tone { contrast: Some(-0.1), saturation: Some(-0.15), ..t() }),
-                fade: Some(0.5),
+                tone: Field::Set(Tone { contrast: Field::Set(-0.1), saturation: Field::Set(-0.15), ..t() }),
+                fade: Field::Set(0.5),
                 grain: grain(0.2, 1.0),
                 ..e()
             },
@@ -229,13 +229,13 @@ pub fn serialize_user_presets(list: &[DevelopPreset]) -> String {
 /// lens corrections — all of which belong to the photo, not the look. Unknown keys stay.
 pub fn look_only(record: &VersionEdit) -> VersionEdit {
     VersionEdit {
-        crop: None,
-        straighten: None,
-        perspective: None,
-        engine: None,
-        display: None,
-        camera_ev: None,
-        lens: None,
+        crop: Field::Absent,
+        straighten: Field::Absent,
+        perspective: Field::Absent,
+        engine: Field::Absent,
+        display: Field::Absent,
+        camera_ev: Field::Absent,
+        lens: Field::Absent,
         ..record.clone()
     }
 }
@@ -295,31 +295,31 @@ mod tests {
             .to_string(),
         ));
         let look = look_only(&record);
-        assert_eq!((look.crop.as_ref(), look.straighten, look.perspective.as_ref()), (None, None, None));
-        assert_eq!((look.engine, look.display.as_ref(), look.camera_ev, look.lens.as_ref()), (None, None, None, None));
-        assert_eq!(look.tone.as_ref().and_then(|t| t.ev), Some(0.5));
-        assert_eq!(look.zones, Some(vec![0.0, 0.1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]));
-        assert_eq!(look.fade, Some(0.2));
-        assert_eq!(look.lut, Some(LutRef { file: "portra.cube".into(), amount: 0.8, extra: Map::new() }));
-        assert!(record.crop.is_some(), "the input is not mutated");
+        assert!([look.crop.is_absent(), look.straighten.is_absent(), look.perspective.is_absent()].iter().all(|a| *a));
+        assert!([look.engine.is_absent(), look.display.is_absent(), look.camera_ev.is_absent(), look.lens.is_absent()].iter().all(|a| *a));
+        assert_eq!(look.tone.value().and_then(|t| t.ev.get()), Some(0.5));
+        assert_eq!(look.zones, Field::Set(vec![0.0, 0.1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]));
+        assert_eq!(look.fade, Field::Set(0.2));
+        assert_eq!(look.lut, Field::Set(LutRef { file: "portra.cube".into(), amount: 0.8, extra: Map::new() }));
+        assert!(record.crop.is_set(), "the input is not mutated");
     }
 
     // --- user-preset storage (new; the TS functions did IO and had no tests) ---
 
     #[test]
     fn user_presets_round_trip_through_the_setting_text() {
-        let record = VersionEdit { crop: Some(Crop::rect(0.0, 0.0, 0.5, 0.5)), fade: Some(0.3), ..Default::default() };
+        let record = VersionEdit { crop: Field::Set(Crop::rect(0.0, 0.0, 0.5, 0.5)), fade: Field::Set(0.3), ..Default::default() };
         let list = add_user_preset(None, "u-1".into(), "  Mine \u{feff}", &record);
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].name, "Mine");
-        assert_eq!(list[0].edit.crop, None);
+        assert_eq!(list[0].edit.crop, Field::Absent);
         let text = serialize_user_presets(&list);
         let v: Value = serde_json::from_str(&text).unwrap();
         // A new preset has no `builtin` key (TS omitted it); `edit` holds only the look.
         assert_eq!(v, json!([{"id": "u-1", "name": "Mine", "category": "User", "edit": {"fade": 0.3}}]));
         let back = parse_user_presets(Some(&text));
         assert_eq!(back[0].builtin, Some(false));
-        assert_eq!(back[0].edit.fade, Some(0.3));
+        assert_eq!(back[0].edit.fade, Field::Set(0.3));
         let two = add_user_preset(Some(&text), "u-2".into(), "Two", &VersionEdit::default());
         assert_eq!(two.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(), ["u-1", "u-2"]);
     }

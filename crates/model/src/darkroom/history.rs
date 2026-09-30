@@ -8,7 +8,7 @@
 
 use serde::Serialize;
 
-use crate::editing::{Tone, VersionEdit, Wb};
+use crate::editing::{Field, Tone, VersionEdit, Wb};
 use crate::js_compat::{self, number_to_string, to_fixed};
 
 /// How long the same control may keep moving and still amend the step it started.
@@ -25,14 +25,14 @@ pub struct Change {
 type ToneGet = fn(&Tone) -> Option<f64>;
 
 const TONE_NAMES: [(&str, &str, ToneGet); 8] = [
-    ("ev", "Exposure", |t| t.ev),
-    ("contrast", "Contrast", |t| t.contrast),
-    ("highlights", "Highlights", |t| t.highlights),
-    ("shadows", "Shadows", |t| t.shadows),
-    ("whites", "Whites", |t| t.whites),
-    ("blacks", "Blacks", |t| t.blacks),
-    ("vibrance", "Vibrance", |t| t.vibrance),
-    ("saturation", "Saturation", |t| t.saturation),
+    ("ev", "Exposure", |t| t.ev.get()),
+    ("contrast", "Contrast", |t| t.contrast.get()),
+    ("highlights", "Highlights", |t| t.highlights.get()),
+    ("shadows", "Shadows", |t| t.shadows.get()),
+    ("whites", "Whites", |t| t.whites.get()),
+    ("blacks", "Blacks", |t| t.blacks.get()),
+    ("vibrance", "Vibrance", |t| t.vibrance.get()),
+    ("saturation", "Saturation", |t| t.saturation.get()),
 ];
 
 /// `+0.50` / `−0.25` (U+2212), two decimals.
@@ -40,11 +40,11 @@ fn signed(v: f64) -> String {
     format!("{}{}", if v >= 0.0 { "+" } else { "−" }, to_fixed(v.abs(), 2))
 }
 
-/// TS `same`: `JSON.stringify(a ?? null) === JSON.stringify(b ?? null)`. Compared as JSON
-/// values, so NaN equals NaN (both `null`) as in TS; unlike TS the comparison ignores key
+/// TS `same`: `JSON.stringify(a ?? null) === JSON.stringify(b ?? null)` — so `null` and
+/// absent are the same here. Compared as JSON values, so NaN equals NaN (both `null`) as in TS; unlike TS the comparison ignores key
 /// order, which in TS followed how each object was built — never meaningfully different.
-fn same<T: Serialize>(a: &Option<T>, b: &Option<T>) -> bool {
-    serde_json::to_value(a).ok() == serde_json::to_value(b).ok()
+fn same<T: Serialize>(a: &Field<T>, b: &Field<T>) -> bool {
+    serde_json::to_value(a.value()).ok() == serde_json::to_value(b.value()).ok()
 }
 
 /// Strip one trailing `.cube`, any case (`/\.cube$/i`).
@@ -62,8 +62,8 @@ fn strip_cube(file: &str) -> &str {
 fn changed_controls(prev: &VersionEdit, next: &VersionEdit) -> Vec<(String, String)> {
     let mut out: Vec<(String, String)> = Vec::new();
     let mut push = |k: &str, l: String| out.push((k.to_string(), l));
-    let pt = prev.tone.clone().unwrap_or_default();
-    let nt = next.tone.clone().unwrap_or_default();
+    let pt = prev.tone.value().cloned().unwrap_or_default();
+    let nt = next.tone.value().cloned().unwrap_or_default();
     for (k, name, get) in TONE_NAMES {
         let a = get(&pt).unwrap_or(0.0);
         let b = get(&nt).unwrap_or(0.0);
@@ -71,10 +71,10 @@ fn changed_controls(prev: &VersionEdit, next: &VersionEdit) -> Vec<(String, Stri
             push(&format!("tone.{k}"), format!("{name} {}", signed(b)));
         }
     }
-    let pwb = pt.wb.clone().unwrap_or_else(|| Wb::relative(0.0, 0.0));
-    let nwb = nt.wb.clone().unwrap_or_else(|| Wb::relative(0.0, 0.0));
-    let pk = if pwb.is_kelvin() { pwb.kelvin } else { None };
-    let nk = if nwb.is_kelvin() { nwb.kelvin } else { None };
+    let pwb = pt.wb.value().cloned().unwrap_or_else(|| Wb::relative(0.0, 0.0));
+    let nwb = nt.wb.value().cloned().unwrap_or_else(|| Wb::relative(0.0, 0.0));
+    let pk = if pwb.is_kelvin() { pwb.kelvin.get() } else { None };
+    let nk = if nwb.is_kelvin() { nwb.kelvin.get() } else { None };
     if pk != nk {
         // Kelvin (slice 9): the stated light, or back to as-shot.
         let label = match nk {
@@ -83,25 +83,25 @@ fn changed_controls(prev: &VersionEdit, next: &VersionEdit) -> Vec<(String, Stri
         };
         push("tone.wb.kelvin", label);
     } else if nk.is_some() {
-        let t = nwb.tint.unwrap_or(0.0);
-        if pwb.tint.unwrap_or(0.0) != t {
+        let t = nwb.tint.get().unwrap_or(0.0);
+        if pwb.tint.get().unwrap_or(0.0) != t {
             let sign = if t >= 0.0 { "+" } else { "−" };
             push("tone.wb.tint", format!("Tint {sign}{}", number_to_string(js_compat::round(t).abs())));
         }
     }
     if nk.is_none() && pk.is_none() {
-        if pwb.temp.unwrap_or(0.0) != nwb.temp.unwrap_or(0.0) {
-            push("tone.wb.temp", format!("Temperature {}", signed(nwb.temp.unwrap_or(0.0))));
+        if pwb.temp.get().unwrap_or(0.0) != nwb.temp.get().unwrap_or(0.0) {
+            push("tone.wb.temp", format!("Temperature {}", signed(nwb.temp.get().unwrap_or(0.0))));
         }
-        if pwb.tint.unwrap_or(0.0) != nwb.tint.unwrap_or(0.0) {
-            push("tone.wb.tint", format!("Tint {}", signed(nwb.tint.unwrap_or(0.0))));
+        if pwb.tint.get().unwrap_or(0.0) != nwb.tint.get().unwrap_or(0.0) {
+            push("tone.wb.tint", format!("Tint {}", signed(nwb.tint.get().unwrap_or(0.0))));
         }
     }
     if !same(&prev.zones, &next.zones) {
         push("zones", "Tone strip".into());
     }
     if !same(&prev.crop, &next.crop) {
-        let label = match &next.crop {
+        let label = match next.crop.value() {
             Some(c) => match c.aspect.as_deref() {
                 Some(a) if !a.is_empty() && a != "Free" => format!("Crop {a}"),
                 _ => "Crop".into(),
@@ -110,18 +110,18 @@ fn changed_controls(prev: &VersionEdit, next: &VersionEdit) -> Vec<(String, Stri
         };
         push("crop", label);
     }
-    if prev.straighten.unwrap_or(0.0) != next.straighten.unwrap_or(0.0) {
-        push("straighten", format!("Straighten {}°", to_fixed(next.straighten.unwrap_or(0.0), 1)));
+    if prev.straighten.get().unwrap_or(0.0) != next.straighten.get().unwrap_or(0.0) {
+        push("straighten", format!("Straighten {}°", to_fixed(next.straighten.get().unwrap_or(0.0), 1)));
     }
     if !same(&prev.perspective, &next.perspective) {
-        push("perspective", if next.perspective.is_some() { "Perspective" } else { "Perspective removed" }.into());
+        push("perspective", if next.perspective.is_set() { "Perspective" } else { "Perspective removed" }.into());
     }
-    let lens_on = |e: &VersionEdit| e.lens.as_ref().is_some_and(|l| l.builtin);
+    let lens_on = |e: &VersionEdit| e.lens.value().is_some_and(|l| l.builtin);
     if lens_on(prev) != lens_on(next) {
         push("lens", if lens_on(next) { "Lens correction on" } else { "Lens correction off" }.into());
     }
     if !same(&prev.bw, &next.bw) {
-        push("bw", if next.bw.as_ref().is_some_and(|b| b.enabled) { "Black & white" } else { "Colour" }.into());
+        push("bw", if next.bw.value().is_some_and(|b| b.enabled) { "Black & white" } else { "Colour" }.into());
     }
     if !same(&prev.split, &next.split) {
         push("split", "Split toning".into());
@@ -129,14 +129,14 @@ fn changed_controls(prev: &VersionEdit, next: &VersionEdit) -> Vec<(String, Stri
     if !same(&prev.grain, &next.grain) {
         push("grain", "Grain".into());
     }
-    if prev.fade.unwrap_or(0.0) != next.fade.unwrap_or(0.0) {
-        push("fade", format!("Fade {}", to_fixed(next.fade.unwrap_or(0.0), 2)));
+    if prev.fade.get().unwrap_or(0.0) != next.fade.get().unwrap_or(0.0) {
+        push("fade", format!("Fade {}", to_fixed(next.fade.get().unwrap_or(0.0), 2)));
     }
-    if prev.vignette.unwrap_or(0.0) != next.vignette.unwrap_or(0.0) {
-        push("vignette", format!("Vignette {}", signed(next.vignette.unwrap_or(0.0))));
+    if prev.vignette.get().unwrap_or(0.0) != next.vignette.get().unwrap_or(0.0) {
+        push("vignette", format!("Vignette {}", signed(next.vignette.get().unwrap_or(0.0))));
     }
     if !same(&prev.lut, &next.lut) {
-        let label = match &next.lut {
+        let label = match next.lut.value() {
             Some(l) => format!("LUT {}", strip_cube(&l.file)),
             None => "LUT removed".into(),
         };

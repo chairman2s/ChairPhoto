@@ -1,6 +1,6 @@
 //! The record the Darkroom stage renders — a port of `src/components/darkroom/stageJson.ts`.
 
-use crate::editing::VersionEdit;
+use crate::editing::{Field, VersionEdit};
 
 /// The stage shows the working record WITHOUT its crop — the crop is an interactive
 /// overlay — and un-warped while the perspective handles are up, because the handles aim
@@ -9,8 +9,9 @@ use crate::editing::VersionEdit;
 /// Returns the `edit_json` text for the render request ([`VersionEdit::to_json`]).
 pub fn stage_json_for(working: &VersionEdit, perspective_mode: bool) -> String {
     VersionEdit {
-        crop: None,
-        perspective: if perspective_mode { None } else { working.perspective.clone() },
+        // `crop: undefined` drops the key, even a `null` one.
+        crop: Field::Absent,
+        perspective: if perspective_mode { Field::Absent } else { working.perspective.clone() },
         ..working.clone()
     }
     .to_json()
@@ -45,7 +46,7 @@ mod tests {
         let r = parsed(&stage_json_for(&w, false));
         assert!(r.get("crop").is_none());
         assert_eq!(r["straighten"], json!(2));
-        assert_eq!(serde_json::from_value::<Option<Perspective>>(r["perspective"].clone()).unwrap(), w.perspective);
+        assert_eq!(serde_json::from_value::<Perspective>(r["perspective"].clone()).unwrap(), w.perspective.into_value().unwrap());
         assert_eq!(r["tone"]["ev"], json!(0.5));
     }
 
@@ -55,10 +56,19 @@ mod tests {
         assert!(parsed(&stage_json_for(&working(), false)).get("perspective").is_some());
     }
 
+    /// `crop: undefined` drops even a `null` crop; a `null` perspective is carried when the
+    /// handles are down (review finding, #103).
+    #[test]
+    fn explicit_null_crop_is_dropped_and_a_null_perspective_carried() {
+        let w = parse_edit(Some(r#"{"crop":null,"perspective":null,"fade":null}"#));
+        assert_eq!(parsed(&stage_json_for(&w, false)), json!({"fade": null, "perspective": null}));
+        assert_eq!(parsed(&stage_json_for(&w, true)), json!({"fade": null}));
+    }
+
     #[test]
     fn is_a_pure_function_of_its_inputs() {
         let w = working();
         assert_eq!(stage_json_for(&w, false), stage_json_for(&w.clone(), false));
-        assert!(w.crop.is_some());
+        assert!(w.crop.is_set());
     }
 }

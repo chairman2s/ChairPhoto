@@ -4,7 +4,7 @@
 //! as-shot light. Rendering the as-shot Kelvin and tint is the identity, so "as shot" and a
 //! blank white balance are the same picture.
 
-use crate::editing::{Tone, VersionEdit, Wb};
+use crate::editing::{Field, Tone, VersionEdit, Wb};
 use crate::js_compat;
 use serde_json::Map;
 
@@ -80,7 +80,13 @@ pub fn mired_shift(kelvin: f64, mireds: f64) -> f64 {
 
 /// A Kelvin white balance for the record: `{ temp: 0, tint, mode: "kelvin", kelvin }`.
 pub fn kelvin_wb(kelvin: f64, tint: f64) -> Wb {
-    Wb { temp: Some(0.0), tint: Some(tint), mode: Some("kelvin".into()), kelvin: Some(kelvin), extra: Map::new() }
+    Wb {
+        temp: Field::Set(0.0),
+        tint: Field::Set(tint),
+        mode: Field::Set("kelvin".into()),
+        kelvin: Field::Set(kelvin),
+        extra: Map::new(),
+    }
 }
 
 /// What the white-balance rail shows.
@@ -92,17 +98,18 @@ pub enum WbShown {
 
 /// What the rail shows for `wb`: the record's Kelvin pair; as-shot Kelvin when the record
 /// leaves white balance alone and Kelvin is preferred; otherwise the relative sliders.
-/// Kelvin needs a context — engine 2 with an as-shot light.
+/// Kelvin needs a context — engine 2 with an as-shot light. Pass `None` for a `null` white
+/// balance: TS's `!wb` treated it as untouched.
 pub fn wb_shown(wb: Option<&Wb>, ctx: Option<&KelvinContext>) -> WbShown {
     if let Some(w) = wb {
-        if let (true, Some(kelvin)) = (w.is_kelvin(), w.kelvin) {
-            return WbShown::Kelvin { kelvin, tint: w.tint.unwrap_or(0.0) };
+        if let (true, Some(kelvin)) = (w.is_kelvin(), w.kelvin.get()) {
+            return WbShown::Kelvin { kelvin, tint: w.tint.get().unwrap_or(0.0) };
         }
     }
     let Some(ctx) = ctx else { return WbShown::Relative };
     let untouched = match wb {
         None => true,
-        Some(w) => w.mode.as_deref() != Some("relative") && w.temp.unwrap_or(0.0) == 0.0 && w.tint.unwrap_or(0.0) == 0.0,
+        Some(w) => w.mode.as_deref() != Some("relative") && w.temp.get().unwrap_or(0.0) == 0.0 && w.tint.get().unwrap_or(0.0) == 0.0,
     };
     if ctx.prefer == WbPrefer::Kelvin && untouched {
         return WbShown::Kelvin { kelvin: ctx.as_shot.kelvin, tint: ctx.as_shot.tint };
@@ -114,12 +121,12 @@ pub fn wb_shown(wb: Option<&Wb>, ctx: Option<&KelvinContext>) -> WbShown {
 /// around what it shows now — the proof sheet's warm/cool cells and the duel's warmth.
 pub fn with_kelvin_shift(record: &VersionEdit, ctx: &KelvinContext, mireds: f64) -> VersionEdit {
     let prefer_kelvin = KelvinContext { prefer: WbPrefer::Kelvin, ..*ctx };
-    let (kelvin, tint) = match wb_shown(record.tone.as_ref().and_then(|t| t.wb.as_ref()), Some(&prefer_kelvin)) {
+    let (kelvin, tint) = match wb_shown(record.tone.value().and_then(|t| t.wb.value()), Some(&prefer_kelvin)) {
         WbShown::Kelvin { kelvin, tint } => (kelvin, tint),
         WbShown::Relative => (ctx.as_shot.kelvin, ctx.as_shot.tint),
     };
-    let tone = Tone { wb: Some(kelvin_wb(mired_shift(kelvin, mireds), tint)), ..record.tone.clone().unwrap_or_default() };
-    VersionEdit { tone: Some(tone), ..record.clone() }
+    let tone = Tone { wb: Field::Set(kelvin_wb(mired_shift(kelvin, mireds), tint)), ..record.tone.value().cloned().unwrap_or_default() };
+    VersionEdit { tone: Field::Set(tone), ..record.clone() }
 }
 
 #[cfg(test)]
@@ -134,7 +141,7 @@ mod tests {
     const CTX: KelvinContext = KelvinContext { as_shot: AsShotWb { kelvin: 5313.0, tint: 2.4 }, prefer: WbPrefer::Kelvin };
 
     fn wb_of(r: &VersionEdit) -> Wb {
-        r.tone.as_ref().and_then(|t| t.wb.clone()).expect("a white balance")
+        r.tone.value().and_then(|t| t.wb.value().cloned()).expect("a white balance")
     }
 
     #[test]
@@ -174,7 +181,7 @@ mod tests {
     #[test]
     fn a_relative_edit_or_an_explicit_relative_choice_stays_relative() {
         assert_eq!(wb_shown(Some(&Wb::relative(0.3, 0.0)), Some(&CTX)), WbShown::Relative);
-        let explicit = Wb { mode: Some("relative".into()), ..Wb::relative(0.0, 0.0) };
+        let explicit = Wb { mode: Field::Set("relative".into()), ..Wb::relative(0.0, 0.0) };
         assert_eq!(wb_shown(Some(&explicit), Some(&CTX)), WbShown::Relative);
     }
 
@@ -184,32 +191,32 @@ mod tests {
         let warm = wb_of(&cells.iter().find(|c| c.label == "Auto · Warm").unwrap().record);
         let cool = wb_of(&cells.iter().find(|c| c.label == "Auto · Cool").unwrap().record);
         assert_eq!(warm.mode.as_deref(), Some("kelvin"));
-        assert!(warm.kelvin.unwrap() > 5313.0);
-        assert!(cool.kelvin.unwrap() < 5313.0);
-        assert!((warm.tint.unwrap() - 2.4).abs() < 0.005);
+        assert!(warm.kelvin.get().unwrap() > 5313.0);
+        assert!(cool.kelvin.get().unwrap() < 5313.0);
+        assert!((warm.tint.get().unwrap() - 2.4).abs() < 0.005);
         // Without the context (engine 1, or no as-shot light) it stays the relative nudge.
         let rel = proof_spread(&VersionEdit::default(), &VersionEdit::default(), &[], None);
         let rel = wb_of(&rel.iter().find(|c| c.label == "Auto · Warm").unwrap().record);
-        assert_eq!(rel.mode, None);
-        assert!(rel.temp.unwrap() > 0.0);
+        assert_eq!(rel.mode, Field::Absent);
+        assert!(rel.temp.get().unwrap() > 0.0);
     }
 
     #[test]
     fn the_duels_warmth_round_steps_stated_light_around_what_the_photo_shows() {
-        let working = VersionEdit { tone: Some(Tone { wb: Some(kelvin_wb(6000.0, 0.0)), ..Tone::default() }), ..VersionEdit::default() };
+        let working = VersionEdit { tone: Field::Set(Tone { wb: Field::Set(kelvin_wb(6000.0, 0.0)), ..Tone::default() }), ..VersionEdit::default() };
         let [cooler, warmer] = duel_pair(&working, DuelDim::Warmth, 0, Some(&CTX));
-        assert!(wb_of(&cooler).kelvin.unwrap() < 6000.0);
-        assert!(wb_of(&warmer).kelvin.unwrap() > 6000.0);
+        assert!(wb_of(&cooler).kelvin.get().unwrap() < 6000.0);
+        assert!(wb_of(&warmer).kelvin.get().unwrap() > 6000.0);
         let [c2, _] = duel_pair(&working, DuelDim::Warmth, 1, Some(&CTX));
-        assert!(6000.0 - wb_of(&c2).kelvin.unwrap() < 6000.0 - wb_of(&cooler).kelvin.unwrap());
+        assert!(6000.0 - wb_of(&c2).kelvin.get().unwrap() < 6000.0 - wb_of(&cooler).kelvin.get().unwrap());
     }
 
     #[test]
     fn a_shift_keeps_the_rest_of_the_record() {
         let r = with_kelvin_shift(&parse_edit(Some(r#"{"engine":2,"fade":0.2,"tone":{"ev":0.5}}"#)), &CTX, -30.0);
-        assert_eq!(r.engine, Some(2.0));
-        assert_eq!(r.fade, Some(0.2));
-        assert_eq!(r.tone.unwrap().ev, Some(0.5));
+        assert_eq!(r.engine, Field::Set(2.0));
+        assert_eq!(r.fade, Field::Set(0.2));
+        assert_eq!(r.tone.into_value().unwrap().ev, Field::Set(0.5));
     }
 
     #[test]

@@ -500,7 +500,15 @@ impl LibrarySession {
 
     /// [`Self::select`] over an id snapshot instead of the current rows.
     pub fn select_over(&mut self, rows: &[i64], id: i64, mods: SelectMods) {
-        let from = self.anchor.or(self.active_id);
+        let active = self.active_id;
+        self.select_over_from(rows, id, mods, active);
+    }
+
+    /// [`Self::select_over`] whose Shift origin falls back to `active` rather than the live
+    /// active photo. The TS `select` read the anchor from a ref (live) but `activeId` from
+    /// its render (captured), so a snapshot step supplies the snapshot's active photo here.
+    fn select_over_from(&mut self, rows: &[i64], id: i64, mods: SelectMods, active: Option<i64>) {
+        let from = self.anchor.or(active);
         let range = match from {
             Some(from) if mods.shift => Some(range_between(rows, |&r| r, from, id)),
             _ => None,
@@ -583,7 +591,7 @@ impl LibrarySession {
         }
         let next = rows[to as usize];
         if extend {
-            self.select_over(rows, next, SelectMods::SHIFT);
+            self.select_over_from(rows, next, SelectMods::SHIFT, snapshot.active_id);
         } else {
             self.select_single(next);
         }
@@ -1113,5 +1121,18 @@ mod tests {
         assert_eq!(s.selection().active_id, Some(2));
         s.step_active_over(&second, 1, false);
         assert_eq!(s.selection().active_id, Some(2), "must not skip to 3");
+    }
+
+    // New (Codex review of 891b85a): a Shift step from a snapshot ranges from the snapshot's
+    // active photo when there is no live anchor, as the TS closure's captured `activeId` did.
+    #[test]
+    fn an_extended_snapshot_step_ranges_from_the_snapshots_active_photo() {
+        let mut s = session_with(&[1, 2, 3]);
+        s.select(1, SelectMods::default());
+        let snapshot = s.step_snapshot();
+        s.clear_selection(); // no live anchor, nothing active
+        s.step_active_over(&snapshot, 1, true);
+        assert_eq!(s.selection().ids, &[1, 2]);
+        assert_eq!(s.selection().active_id, Some(2));
     }
 }

@@ -45,7 +45,7 @@
 //! A resolution is therefore always the winner, and deliberately does **not** trip the
 //! pass: killing a 74k-row pass because one row got a decision would be a far worse trade
 //! than dropping that row's result. The pass's own ownership — job id, abort flag, status
-//! slot, catalog switch — is the `commands::jobs` protocol, one layer up.
+//! slot, catalog switch — is the `app::jobs` protocol, one layer up.
 
 use super::{Catalog, CatalogError, Result};
 use rusqlite::{params, OptionalExtension};

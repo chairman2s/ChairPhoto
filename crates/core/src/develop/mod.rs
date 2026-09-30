@@ -7,7 +7,7 @@
 //! # Ownership
 //!
 //! The set is a process-global behind its own mutex, and that mutex is a **leaf** in the
-//! lock order documented in `commands::jobs`: it is taken after any registry lock and never
+//! lock order documented in `app::jobs`: it is taken after any registry lock and never
 //! held while taking another. Membership follows the `develop` claim: `session::open` and
 //! `session::close` release on every ownership change, a catalog switch releases in its
 //! detach phase (`DetachGuards::trip_and_clear_all`), and a superseded worker removes only

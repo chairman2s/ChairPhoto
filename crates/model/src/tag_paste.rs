@@ -2,7 +2,7 @@
 //! "create tags" dialog (`TagCreateModal`).
 //!
 //! Semantic choices against the TypeScript:
-//! - Whitespace is JavaScript's `String.prototype.trim` set ([`is_js_whitespace`]), not
+//! - Whitespace is JavaScript's `String.prototype.trim` set ([`crate::js_compat::is_js_whitespace`]), not
 //!   Rust's `char::is_whitespace`: the two differ on U+FEFF (JS trims a BOM, Rust does not)
 //!   and U+0085 (Rust trims NEL, JS does not). A BOM at the head of pasted text is the case
 //!   that matters.
@@ -13,27 +13,7 @@
 
 use std::collections::HashSet;
 
-/// JavaScript's `trim()` whitespace: ECMAScript WhiteSpace plus LineTerminator.
-fn is_js_whitespace(c: char) -> bool {
-    matches!(
-        c,
-        '\u{0009}'..='\u{000D}'
-            | ' '
-            | '\u{00A0}'
-            | '\u{1680}'
-            | '\u{2000}'..='\u{200A}'
-            | '\u{2028}'
-            | '\u{2029}'
-            | '\u{202F}'
-            | '\u{205F}'
-            | '\u{3000}'
-            | '\u{FEFF}'
-    )
-}
-
-fn js_trim(s: &str) -> &str {
-    s.trim_matches(is_js_whitespace)
-}
+use crate::js_compat::js_trim;
 
 /// Indentation width of a line: tabs count as 4, spaces count as 1.
 fn indent_width(line: &str) -> usize {

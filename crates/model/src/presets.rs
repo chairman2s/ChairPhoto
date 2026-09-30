@@ -9,6 +9,7 @@
 //! `allPresets`) become pure functions over the setting's text: the caller reads and writes
 //! the setting, and supplies the new preset's id (TS used `crypto.randomUUID()`).
 
+use crate::js_compat::js_trim;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
@@ -238,11 +239,6 @@ pub fn look_only(record: &VersionEdit) -> VersionEdit {
         lens: Field::Absent,
         ..record.clone()
     }
-}
-
-/// `String.prototype.trim`: Unicode white space plus the BOM (Rust's `trim` keeps U+FEFF).
-fn js_trim(s: &str) -> &str {
-    s.trim_matches(|c: char| c.is_whitespace() || c == '\u{feff}')
 }
 
 /// The stored user presets (`stored`, the setting's text) with a new preset `id` named

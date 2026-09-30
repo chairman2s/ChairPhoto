@@ -151,8 +151,33 @@ pub fn to_number(v: &Value) -> f64 {
     }
 }
 
+/// JavaScript's whitespace for `trim()` and `ToNumber`: ECMAScript WhiteSpace plus
+/// LineTerminator. Not Rust's `char::is_whitespace`, which also takes U+0085 (NEL) and misses
+/// the BOM (U+FEFF).
+pub fn is_js_whitespace(c: char) -> bool {
+    matches!(
+        c,
+        '\u{0009}'..='\u{000D}'
+            | ' '
+            | '\u{00A0}'
+            | '\u{1680}'
+            | '\u{2000}'..='\u{200A}'
+            | '\u{2028}'
+            | '\u{2029}'
+            | '\u{202F}'
+            | '\u{205F}'
+            | '\u{3000}'
+            | '\u{FEFF}'
+    )
+}
+
+/// `String.prototype.trim` (see [`is_js_whitespace`]).
+pub fn js_trim(s: &str) -> &str {
+    s.trim_matches(is_js_whitespace)
+}
+
 fn string_to_number(s: &str) -> f64 {
-    let t = s.trim_matches(|c: char| c.is_whitespace() || c == '\u{feff}');
+    let t = js_trim(s);
     if t.is_empty() {
         return 0.0;
     }
@@ -163,7 +188,16 @@ fn string_to_number(s: &str) -> f64 {
     }
     for (prefix, radix) in [("0x", 16), ("0X", 16), ("0o", 8), ("0O", 8), ("0b", 2), ("0B", 2)] {
         if let Some(digits) = t.strip_prefix(prefix) {
-            return u64::from_str_radix(digits, radix).map_or(f64::NAN, |n| n as f64);
+            // Accumulated in f64, as JS does: no u64 overflow to NaN for long hex strings.
+            if digits.is_empty() {
+                return f64::NAN;
+            }
+            let mut n = 0.0_f64;
+            for c in digits.chars() {
+                let Some(d) = c.to_digit(radix) else { return f64::NAN };
+                n = n * f64::from(radix) + f64::from(d);
+            }
+            return n;
         }
     }
     // JS decimal literal: optional sign, digits with an optional point, optional exponent.
@@ -335,6 +369,17 @@ mod tests {
         assert_eq!(number_to_string(1.5e22), "1.5e+22");
         assert_eq!(number_to_string(123456789012345680000.0), "123456789012345680000");
         assert_eq!(number_to_string(-4800.0), "-4800");
+    }
+
+    #[test]
+    fn to_number_matches_js_on_nel_and_long_hex() {
+        // From the Claude review of c718349, checked against node v25's Number().
+        assert!(to_number(&Value::String("\u{85} 5".into())).is_nan());
+        assert_eq!(to_number(&Value::String("\u{feff} 5 \u{3000}".into())), 5.0);
+        assert_eq!(to_number(&Value::String("0xFFFFFFFFFFFFFFFFFF".into())), 4.722366482869645e21);
+        assert!(to_number(&Value::String("0x".into())).is_nan());
+        assert_eq!(to_number(&Value::String("0b101".into())), 5.0);
+        assert_eq!(js_trim("\u{85}a\u{85}"), "\u{85}a\u{85}");
     }
 
     #[test]

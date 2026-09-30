@@ -10,6 +10,7 @@ separate source of truth.
 |---|---|
 | `PKGBUILD` | The package recipe. |
 | `chairphoto.desktop` | Launcher entry, plus the `chairphoto://` scheme registration. |
+| `chairphoto-gpui.desktop` | The GPUI front end's entry and scheme registration (`chairphoto-gpui %u`). Not installed yet: the Tauri entry owns the scheme until the GPUI cutover. |
 | `omarchy/chairphoto.lua` | Hyprland window rule for Omarchy, keeping the app opaque (see below). |
 
 ## Why `omarchy/chairphoto.lua` exists

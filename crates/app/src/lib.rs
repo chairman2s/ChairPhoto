@@ -5,7 +5,8 @@
 //!
 //! 0. the single-instance claim ([`single_instance`]): a second launch for the same app data
 //!    dir forwards its `chairphoto://` URLs (or just a focus request) to the running instance
-//!    and exits 0, before anything below runs;
+//!    and exits 0, before anything below runs; then, in a debug build, the dev
+//!    scheme-handler entry ([`desktop`]);
 //! 1. an [`AppState`] with the [`events::GpuiSink`] installed — first, so nothing the core
 //!    starts can send into the void;
 //! 2. `app::boot` — crash markers, upload sweep, Omarchy watcher, decode analyzers, image
@@ -23,6 +24,7 @@
 //! process exit cannot leave one either.
 
 pub mod assets;
+pub mod desktop;
 pub mod events;
 pub mod keymap;
 pub mod launch;
@@ -112,6 +114,16 @@ pub fn run() {
     let (instance_tx, instance_rx) = unbounded::<Request>();
     // Held for the process's lifetime: the lock, and the socket file it removes on the way out.
     let _instance = claim_single_instance(&launch, instance_tx);
+
+    // A dev build is not installed, so nothing else registers the scheme for it.
+    #[cfg(debug_assertions)]
+    std::thread::spawn(|| {
+        let (Some(home), Ok(exe)) = (desktop::data_home(), std::env::current_exe()) else { return };
+        let claim = std::env::var(desktop::CLAIM_ENV).is_ok_and(|v| v == "1");
+        if let Err(e) = desktop::register_dev_handler(&home, &exe, claim) {
+            eprintln!("deep-link dev registration failed: {e}");
+        }
+    });
 
     let state = AppState::default();
     let (sink, events_rx) = events::channel();

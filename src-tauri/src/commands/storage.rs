@@ -6,7 +6,6 @@
 
 use super::*;
 use std::sync::atomic::Ordering;
-use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, State};
 
@@ -242,7 +241,7 @@ pub async fn empty_trash(
                 }
                 plans.push((id, c.photo_path_candidates(id).map_err(|e| e.to_string())?));
             }
-            let pairs = grid_status_volume_pairs(c).map_err(|e| e.to_string())?;
+            let pairs = c.volume_base_paths().map_err(|e| e.to_string())?;
             (candidates.len(), plans, pairs)
         };
         let _ = candidates;
@@ -1234,32 +1233,17 @@ pub async fn photo_statuses(
         let pairs: Vec<(i64, String)> = {
             let guard = catalog.lock().map_err(|e| e.to_string())?;
             let c = guard.as_ref().ok_or("No catalog is open")?;
-            grid_status_volume_pairs(c).map_err(|e| e.to_string())?
+            c.volume_base_paths().map_err(|e| e.to_string())?
         };
         // 2. Off the lock, on this worker: stat (or reuse cached) reachability.
         let reachable = health.refresh(&pairs);
         // 3. Back under the lock: derive statuses using the off-lock reachability.
         let guard = catalog.lock().map_err(|e| e.to_string())?;
         let c = guard.as_ref().ok_or("No catalog is open")?;
-        grid_photo_statuses_with_reachability(c, &photo_ids, &reachable).map_err(|e| e.to_string())
+        c.photo_storage_statuses(&photo_ids, &reachable).map_err(|e| e.to_string())
     })
     .await
     .map_err(|e| e.to_string())?
-}
-
-pub(crate) fn grid_status_volume_pairs(c: &Catalog) -> crate::catalog::Result<Vec<(i64, String)>> {
-    Ok(c.volume_rows()?
-        .into_iter()
-        .map(|v| (v.id, v.base_path))
-        .collect())
-}
-
-pub(crate) fn grid_photo_statuses_with_reachability(
-    c: &Catalog,
-    photo_ids: &[i64],
-    reachable: &HashMap<i64, bool>,
-) -> crate::catalog::Result<Vec<(i64, crate::catalog::StorageStatus)>> {
-    c.photo_storage_statuses(photo_ids, reachable)
 }
 
 /// Remove a storage volume registration (not the default catalog-root volume). This

@@ -120,6 +120,17 @@ impl Catalog {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
+    /// Every volume's `(id, base_path)` — the input the reachability cache
+    /// ([`crate::volume_health::VolumeHealth::refresh`]) stats off the catalog lock. PURE
+    /// SQL, like [`Catalog::volume_rows`], which it projects.
+    pub fn volume_base_paths(&self) -> Result<Vec<(i64, String)>> {
+        Ok(self
+            .volume_rows()?
+            .into_iter()
+            .map(|v| (v.id, v.base_path))
+            .collect())
+    }
+
     /// All volumes, each flagged with whether its base path currently exists. This
     /// STATS each volume, so it must not be called while holding a lock that a hung NAS
     /// stat could serialize; it's kept for the Volumes preferences UI and cold callers.

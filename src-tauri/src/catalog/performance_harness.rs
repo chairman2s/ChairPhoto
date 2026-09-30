@@ -1182,7 +1182,7 @@ fn measure_grid_statuses(
 ) -> Result<BadgeMeasurement> {
     let reachable = load_volume_reachability(catalog, volume_health)?;
     let statuses =
-        crate::commands::grid_photo_statuses_with_reachability(catalog, photo_ids, &reachable)?;
+        catalog.photo_storage_statuses(photo_ids, &reachable)?;
     let payload_bytes = command_payload(
         "photo_statuses",
         json!({ "photoIds": photo_ids }),
@@ -1209,8 +1209,8 @@ fn measure_grid_badges(
 ) -> Result<BadgeMeasurement> {
     let reachable = load_volume_reachability(catalog, volume_health)?;
     let statuses =
-        crate::commands::grid_photo_statuses_with_reachability(catalog, photo_ids, &reachable)?;
-    let versions = crate::commands::grid_version_counts(catalog, photo_ids)?;
+        catalog.photo_storage_statuses(photo_ids, &reachable)?;
+    let versions = catalog.version_counts(photo_ids)?;
     let status_payload = command_payload(
         "photo_statuses",
         json!({ "photoIds": photo_ids }),
@@ -1237,7 +1237,7 @@ fn load_volume_reachability(
     catalog: &Catalog,
     volume_health: &crate::volume_health::VolumeHealth,
 ) -> Result<HashMap<i64, bool>> {
-    let volume_pairs = crate::commands::grid_status_volume_pairs(catalog)?;
+    let volume_pairs = catalog.volume_base_paths()?;
     Ok(volume_health.refresh(&volume_pairs))
 }
 

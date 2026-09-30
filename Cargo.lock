@@ -1164,6 +1164,7 @@ dependencies = [
  "futures",
  "gpui-kit",
  "image",
+ "libc",
  "serde",
  "serde_json",
 ]

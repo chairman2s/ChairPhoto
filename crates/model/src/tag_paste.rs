@@ -11,9 +11,8 @@
 //! - Indentation is counted per `char` (a Unicode scalar), which equals JS's per-code-point
 //!   `for…of` for the only characters it counts (tab and space).
 
-use std::collections::HashSet;
-
 use crate::js_compat::js_trim;
+use std::collections::HashSet;
 
 /// Indentation width of a line: tabs count as 4, spaces count as 1.
 fn indent_width(line: &str) -> usize {

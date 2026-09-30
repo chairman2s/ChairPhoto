@@ -10,6 +10,8 @@
 //!   `f64::min`/`max` return the non-NaN operand).
 //! - [`f32_as_js`] is what a Rust `f32` becomes after serde_json → `JSON.parse`.
 //! - [`to_json_string`] writes JSON the way `JSON.stringify` writes numbers where it matters.
+//! - [`js_trim`]/[`is_js_whitespace`] are `String.prototype.trim`'s set, which includes U+FEFF
+//!   (a BOM) and excludes U+0085 (NEL), unlike `str::trim`.
 
 use serde::Serialize;
 use serde_json::Value;

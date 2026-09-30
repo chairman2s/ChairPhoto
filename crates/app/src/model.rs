@@ -29,8 +29,9 @@
 
 use chairphoto_core::app::{with_catalog, AppState, CoreEvent, EventVisitor};
 use crate::image_store::Loaded;
-use chairphoto_core::catalog::{PhotoQuery, PhotoWindow};
+use chairphoto_core::catalog::{CatalogError, PhotoQuery, PhotoWindow};
 use chairphoto_core::image_pool::ImagePool;
+use chairphoto_model::deep_link::{self, DeepLink, DeepLinkView};
 use gpui_kit::{Context, EventEmitter, SharedString};
 use std::sync::Arc;
 
@@ -60,6 +61,21 @@ pub struct CatalogSummary {
 
 /// How many photos [`CatalogSummary::first_photos`] holds.
 pub const FIRST_PHOTOS: usize = 24;
+/// A `chairphoto://` link, resolved against the open catalog: what the Library view, the
+/// loupe and the Darkroom apply once they are ported. Until then the model holds the newest
+/// one and says so on the status line.
+///
+/// | Link | Applied by (not ported yet) |
+/// |---|---|
+/// | photo, view `grid` | the Library view selects it, scope widened (#106) |
+/// | photo, view `loupe` | … then opens the inline loupe (#109) |
+/// | photo, view `develop` | … then opens the Darkroom (#111) |
+/// | tag | the Library filters to the tag (#106) |
+#[derive(Debug, Clone, PartialEq)]
+pub enum DeepLinkTarget {
+    Photo { id: i64, uuid: String, path: String, view: DeepLinkView },
+    Tag { id: i64, uuid: String, full_path: String },
+}
 
 /// App-wide state for the shell.
 pub struct AppModel {
@@ -79,6 +95,12 @@ pub struct AppModel {
     /// Bumped by every `catalog:switched`: photo ids from before it mean other photos now,
     /// so whatever is keyed by them (the image cache) must be dropped.
     pub catalog_epoch: u64,
+    /// The newest resolved `chairphoto://` link (see [`DeepLinkTarget`]).
+    pub deep_link: Option<DeepLinkTarget>,
+    /// Links that arrived before the catalog was open, applied once it is (React's `ready`).
+    pending_links: Vec<DeepLink>,
+    /// Bumped by every link resolution; only the newest link's result lands.
+    link_generation: u64,
 }
 
 impl EventEmitter<AppModelEvent> for AppModel {}
@@ -94,6 +116,9 @@ impl AppModel {
             events_seen: 0,
             generation: 0,
             catalog_epoch: 0,
+            deep_link: None,
+            pending_links: Vec::new(),
+            link_generation: 0,
         }
     }
 
@@ -161,12 +186,63 @@ impl AppModel {
                         eprintln!("catalog: {} · {} photos", summary.name, summary.photo_count);
                         m.catalog = Some(summary);
                         cx.emit(AppModelEvent::CatalogRead);
+                        for link in std::mem::take(&mut m.pending_links) {
+                            m.open_deep_link(link, cx);
+                        }
                     }
                     Err(e) => {
                         m.catalog = None;
                         m.status = format!("Catalog unavailable: {e}").into();
                     }
                 }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// A `chairphoto://` URL from the command line or a second launch. Anything that is not a
+    /// ChairPhoto link is reported on the status line and dropped.
+    pub fn open_url(&mut self, url: &str, cx: &mut Context<Self>) {
+        match deep_link::parse(url) {
+            Some(link) => self.open_deep_link(link, cx),
+            None => {
+                eprintln!("deep link: ignored {url:?}");
+                self.status = format!("Deep link: not a ChairPhoto link: {url}").into();
+                cx.notify();
+            }
+        }
+    }
+
+    /// Resolve a parsed link against the open catalog, off the UI thread, and record it in
+    /// [`deep_link`](Self::deep_link). Before the catalog is open the link waits; a newer link
+    /// supersedes an older one still resolving.
+    pub fn open_deep_link(&mut self, link: DeepLink, cx: &mut Context<Self>) {
+        if self.catalog.is_none() {
+            self.pending_links.push(link);
+            self.status = "Deep link: waiting for the catalog…".into();
+            cx.notify();
+            return;
+        }
+        self.link_generation += 1;
+        let generation = self.link_generation;
+        let state = self.state.clone();
+        let read = cx.background_executor().spawn(async move { resolve_link(&state, &link) });
+        cx.spawn(async move |this, cx| {
+            let resolved = read.await;
+            this.update(cx, |m, cx| {
+                if m.link_generation != generation {
+                    return; // superseded
+                }
+                match resolved {
+                    Ok(target) => {
+                        m.status = link_status(&target).into();
+                        m.deep_link = Some(target);
+                    }
+                    Err(message) => m.status = message.into(),
+                }
+                eprintln!("deep link: {}", m.status);
                 cx.notify();
             })
             .ok();
@@ -225,6 +301,51 @@ fn read_summary(state: &AppState) -> Result<CatalogSummary, String> {
             .unwrap_or_else(|| path.to_string_lossy().to_string());
         Ok(CatalogSummary { name, photo_count, first_photos })
     })
+}
+
+/// Look a link's uuid up in the open catalog. `Err` is the status line to show, worded as
+/// App.tsx worded it ("Deep link: no photo <uuid> in this catalog"). Blocking: background only.
+fn resolve_link(state: &AppState, link: &DeepLink) -> Result<DeepLinkTarget, String> {
+    match link {
+        DeepLink::Photo { uuid, view } => {
+            let photo = with_catalog(state, |c| match c.get_photo_by_uuid(uuid) {
+                Ok(p) => Ok(Some(p)),
+                Err(CatalogError::NotFound(_)) => Ok(None),
+                Err(e) => Err(e),
+            })
+            .map_err(|e| format!("Deep link: {e}"))?;
+            let photo = photo.ok_or_else(|| format!("Deep link: no photo {uuid} in this catalog"))?;
+            Ok(DeepLinkTarget::Photo { id: photo.id, uuid: photo.uuid, path: photo.path, view: *view })
+        }
+        DeepLink::Tag { uuid } => {
+            // App.tsx matched against the loaded tag tree (`tags.find(t => t.uuid === uuid)`).
+            let tags = with_catalog(state, |c| c.list_tags_with_counts()).map_err(|e| format!("Deep link: {e}"))?;
+            let tag = tags
+                .into_iter()
+                .map(|t| t.tag)
+                .find(|t| t.uuid == *uuid)
+                .ok_or_else(|| format!("Deep link: no tag {uuid} in this catalog"))?;
+            Ok(DeepLinkTarget::Tag { id: tag.id, uuid: tag.uuid, full_path: tag.full_path })
+        }
+    }
+}
+
+/// The status line for a resolved link: what it asks for, and that the view that applies it
+/// is not ported yet.
+fn link_status(target: &DeepLinkTarget) -> String {
+    match target {
+        DeepLinkTarget::Photo { path, view, .. } => {
+            let surface = match view {
+                DeepLinkView::Grid => "Library",
+                DeepLinkView::Loupe => "loupe",
+                DeepLinkView::Develop => "Darkroom",
+            };
+            format!("Deep link: {path} → {surface} (view not ported yet)")
+        }
+        DeepLinkTarget::Tag { full_path, .. } => {
+            format!("Deep link: filter by tag {full_path} (view not ported yet)")
+        }
+    }
 }
 
 /// The event's payload as compact JSON, cut to one readable line.

@@ -61,6 +61,9 @@ serde_json = "1"
 # `RenderImage` frames are `image::Frame`s; the image layer converts the core's decoded
 # `DynamicImage` to BGRA (`image_store::to_bgra`). The core's and gpui's version (0.25).
 image = { version = "0.25", default-features = false }
+# The quit-signal handlers (`signals.rs`: sigaction, a self-pipe, `_exit`). Already in the
+# lockfile through the core and gpui.
+libc = "0.2"
 
 [dev-dependencies]
 # The headless test platform: `#[gpui_kit::test]`, `TestAppContext`, `VisualTestContext`.

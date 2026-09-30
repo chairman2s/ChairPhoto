@@ -3,6 +3,10 @@
 //!
 //! [`run`] is the whole startup, in this order:
 //!
+//! 0. the single-instance claim ([`single_instance`]): a second launch for the same app data
+//!    dir forwards its `chairphoto://` URLs (or just a focus request) to the running instance
+//!    and exits 0, before anything below runs; then the quit-signal handlers ([`signals`])
+//!    and, in a debug build, the dev scheme-handler entry ([`desktop`]);
 //! 1. an [`AppState`] with the [`events::GpuiSink`] installed — first, so nothing the core
 //!    starts can send into the void ([`start_core`]);
 //! 2. `app::boot_with` — crash markers, upload sweep, Omarchy watcher, decode analyzers, image
@@ -14,23 +18,31 @@
 //! 4. the [`model::AppModel`] entity and the event router, the [`shell::ShellState`], and the
 //!    [`image_store::ImageStore`] (cleared on every catalog switch);
 //! 5. `app::open_default_catalog`, off the UI thread;
-//! 6. the main window, 1400×900, `app_id` `chairphoto`.
+//! 6. the main window, 1400×900, `app_id` `chairphoto`; then the routers for second launches
+//!    and quit signals ([`launch`]), and this launch's own `chairphoto://` URLs.
 //!
-//! Quitting — Ctrl+Q, or closing the main window — goes through [`quit_app`], and the quit
-//! runs `crash_marker::clean_exit()`, as the Tauri shell does at `RunEvent::Exit`: decodes a
-//! deliberate quit cuts short are not crashes.
+//! Quitting — Ctrl+Q, closing the main window, or `SIGTERM`/`SIGINT`/`SIGHUP` (dispatched as
+//! the same `Quit` action) — goes through [`quit_app`], and the quit runs
+//! `crash_marker::clean_exit()`, as the Tauri shell does at `RunEvent::Exit`: decodes a
+//! deliberate quit cuts short are not crashes. `clean_exit` also disarms the markers, so a
+//! decode that starts between the quit and the process exit cannot leave one either.
 //!
 //! [`start_core`] and [`wire`] are the startup itself, not a copy of it: `run` is those two
 //! calls around the event loop, and the tests call the same two functions with a test boot,
 //! no default catalog and a counter for `clean_exit`.
 
 pub mod assets;
+#[cfg(feature = "edit")]
 pub mod darkroom;
+pub mod desktop;
 pub mod events;
 pub mod image_store;
 pub mod keymap;
+pub mod launch;
 pub mod model;
 pub mod shell;
+pub mod signals;
+pub mod single_instance;
 pub mod theme;
 pub mod view;
 
@@ -43,7 +55,8 @@ use chairphoto_core::app::{AppState, CoreEvent};
 use chairphoto_core::appearance::SystemThemeResult;
 use chairphoto_core::image_pool::ImagePool;
 use image_store::{ImageStore, Loaded};
-use futures::channel::mpsc::UnboundedReceiver;
+use futures::channel::mpsc::{unbounded, UnboundedReceiver, UnboundedSender};
+use single_instance::{Claim, ClaimError, Primary, Request};
 use model::AppModel;
 use gpui_kit::{
     px, size, AnyWindowHandle, App, AppContext as _, Bounds, Entity, Global, QuitMode, TitlebarOptions,
@@ -198,8 +211,74 @@ pub fn wire(
     Wired { model, images, shell, main_window }
 }
 
+/// Become this app data dir's primary instance, serving second launches into `tx`; or hand
+/// `launch` to the instance that already is, and exit. `None`: single-instance could not be
+/// set up (the reason is logged) and the app runs without it.
+fn claim_single_instance(launch: &Request, tx: UnboundedSender<Request>) -> Option<Primary> {
+    let endpoint = chairphoto_core::app::app_data_dir()
+        .map_err(std::io::Error::other)
+        .and_then(|dir| {
+            // The key hashes the canonical path, which needs the directory to exist.
+            std::fs::create_dir_all(&dir)?;
+            single_instance::Endpoint::for_app_data_dir(&dir)
+        });
+    let endpoint = match endpoint {
+        Ok(endpoint) => endpoint,
+        Err(e) => {
+            eprintln!("single instance: disabled: {e}");
+            return None;
+        }
+    };
+    match single_instance::claim(&endpoint, launch, single_instance::CONNECT_PATIENCE) {
+        Ok(Claim::Primary(primary)) => {
+            let served = primary.serve(move |request| {
+                // Fails only once the app is shutting down.
+                let _ = tx.unbounded_send(request);
+            });
+            served.map_err(|e| eprintln!("single instance: disabled: {e}")).ok()
+        }
+        Ok(Claim::Forwarded) => {
+            eprintln!(
+                "ChairPhoto is already running; handed it {} link(s) and asked it to come forward.",
+                launch.urls.len()
+            );
+            std::process::exit(0);
+        }
+        Err(e @ ClaimError::NoAnswer(_)) => {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
+        Err(e @ ClaimError::Endpoint(_)) => {
+            eprintln!("single instance: disabled: {e}");
+            None
+        }
+    }
+}
+
 /// Start the app and run until it quits.
 pub fn run() {
+    let launch = Request::from_args(std::env::args().skip(1));
+    let (instance_tx, instance_rx) = unbounded::<Request>();
+    // Held for the process's lifetime: the lock, and the socket file it removes on the way out.
+    let _instance = claim_single_instance(&launch, instance_tx);
+
+    let (quit_tx, quit_rx) = unbounded::<i32>();
+    if let Err(e) = signals::install(move |signal| {
+        let _ = quit_tx.unbounded_send(signal);
+    }) {
+        eprintln!("signals: {e}; SIGTERM/SIGINT will not quit cleanly");
+    }
+
+    // A dev build is not installed, so nothing else registers the scheme for it.
+    #[cfg(debug_assertions)]
+    std::thread::spawn(|| {
+        let (Some(home), Ok(exe)) = (desktop::data_home(), std::env::current_exe()) else { return };
+        let claim = std::env::var(desktop::CLAIM_ENV).is_ok_and(|v| v == "1");
+        if let Err(e) = desktop::register_dev_handler(&home, &exe, claim) {
+            eprintln!("deep-link dev registration failed: {e}");
+        }
+    });
+
     // The pool's runner decodes straight to BGRA textures (`image_store::runner`), not JPEG.
     let (state, events_rx, boot) =
         start_core(|state| chairphoto_core::app::boot_with(state, image_store::runner(state.clone())));
@@ -213,7 +292,13 @@ pub fn run() {
         // a pop-out loupe left open would keep the app alive after the main window closed.
         .with_quit_mode(QuitMode::Explicit)
         .run(move |cx| {
-            wire(cx, state, events_rx, Some(boot.pool.clone()), &initial_theme, WireOptions::production());
+            let wired =
+                wire(cx, state, events_rx, Some(boot.pool.clone()), &initial_theme, WireOptions::production());
+            launch::spawn_quit_on_signal(quit_rx, cx).detach();
+            launch::spawn_request_router(instance_rx, wired.model.clone(), wired.main_window.clone().ok(), cx)
+                .detach();
+            // This launch's own links (the React app got them from onOpenUrl's getCurrent()).
+            launch::apply_request(launch, &wired.model, None, cx);
         });
     // Also on the way out of the event loop, for a platform that returns without running
     // the quit observers. Idempotent.

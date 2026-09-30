@@ -19,6 +19,13 @@
 //! 4. Surviving the call once clears the subject's strikes. A clean quit ([`clean_exit`])
 //!    clears this process's in-flight markers, so closing the app during a 3-second RAW
 //!    decode is not mistaken for a crash.
+//! 5. [`clean_exit`] also **disarms** the store for the rest of the process: every later
+//!    [`enter`] writes nothing. Worker threads keep running between the quit and the process
+//!    exit — an image-pool decode can reach LibRaw after the sweep — and a marker written
+//!    then would be cut off by the exit and struck as a crash on the next launch. The sweep
+//!    and the disarm are one step under a lock that every `enter` holds while it writes, so
+//!    no marker can land between them. The cost: a genuine crash during those last moments
+//!    of a deliberate quit is not recorded.
 //!
 //! Callers choose the subject key so that a *change* earns a fresh chance: the LibRaw
 //! keys include the decoder version and the file's size and mtime, so upgrading the
@@ -41,7 +48,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock, RwLock};
 
 /// Strikes after which a subject is skipped.
 pub const BLOCK_AFTER: u32 = 2;
@@ -84,6 +91,10 @@ pub struct Markers {
     seq: AtomicU64,
     /// `strikes.json`, loaded once and written through.
     strikes: Mutex<BTreeMap<String, Strikes>>,
+    /// Set by [`Markers::clean_exit`]: the process is quitting, write no more markers.
+    /// [`Markers::enter`] holds the read side while it checks and writes; `clean_exit` holds
+    /// the write side while it sets the flag and sweeps, so the two never interleave.
+    disarmed: RwLock<bool>,
 }
 
 fn key(kind: &str, subject: &str) -> String {
@@ -115,6 +126,7 @@ impl Markers {
             pid: std::process::id(),
             seq: AtomicU64::new(0),
             strikes: Mutex::new(strikes),
+            disarmed: RwLock::new(false),
         }
     }
 
@@ -132,8 +144,14 @@ impl Markers {
         }
     }
 
-    /// Mark `kind`/`subject` in flight until the returned guard drops.
+    /// Mark `kind`/`subject` in flight until the returned guard drops. After
+    /// [`clean_exit`](Self::clean_exit) the guard is inert: nothing is written.
     pub fn enter(&self, kind: &str, subject: &str, label: &str) -> Guard<'_> {
+        // Held until the marker is on disk, so `clean_exit` either sweeps it or ran first.
+        let disarmed = self.disarmed.read().unwrap_or_else(|e| e.into_inner());
+        if *disarmed {
+            return Guard::inert();
+        }
         let n = self.seq.fetch_add(1, Ordering::Relaxed);
         let path = self.inflight_dir().join(format!("{}-{n}.json", self.pid));
         let marker = Marker {
@@ -217,8 +235,12 @@ impl Markers {
     }
 
     /// The app is quitting on purpose: whatever is still in flight was cut short, not
-    /// crashed. Remove this process's markers.
+    /// crashed. Remove this process's markers, and disarm the store so that no later
+    /// [`enter`](Self::enter) writes one (module docs, step 5). Idempotent; call it only on
+    /// the way out of the process.
     pub fn clean_exit(&self) {
+        let mut disarmed = self.disarmed.write().unwrap_or_else(|e| e.into_inner());
+        *disarmed = true;
         let prefix = format!("{}-", self.pid);
         let Ok(entries) = std::fs::read_dir(self.inflight_dir()) else { return };
         for entry in entries.flatten() {
@@ -226,6 +248,7 @@ impl Markers {
                 let _ = std::fs::remove_file(entry.path());
             }
         }
+        drop(disarmed);
     }
 }
 
@@ -238,7 +261,7 @@ pub struct Guard<'a> {
 }
 
 impl Guard<'_> {
-    /// A guard that protects nothing (no store initialised).
+    /// A guard that protects nothing (no store initialised, or the store is disarmed).
     fn inert() -> Guard<'static> {
         Guard { markers: None, path: None, key: String::new() }
     }
@@ -300,7 +323,7 @@ pub fn blocked(kind: &str, subject: &str) -> Option<Strikes> {
     GLOBAL.get()?.blocked(kind, subject)
 }
 
-/// [`Markers::clean_exit`] on the app's store.
+/// [`Markers::clean_exit`] on the app's store: sweep this process's markers and disarm it.
 pub fn clean_exit() {
     if let Some(m) = GLOBAL.get() {
         m.clean_exit();
@@ -399,6 +422,59 @@ mod tests {
         crash_inside(&m, "libraw-decode", "slow.ARW"); // still decoding when the user quits
         m.clean_exit();
         assert_eq!(inflight_count(&dir), 0);
+        assert!(m.recover().is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_decode_that_starts_after_the_quit_leaves_no_marker() {
+        let (dir, m) = store("after-quit");
+        m.clean_exit();
+        // An image-pool worker reaches LibRaw after the quit and the process exits inside it.
+        crash_inside(&m, "libraw-decode", "late.ARW");
+        assert_eq!(inflight_count(&dir), 0, "a disarmed store writes no marker");
+        assert!(m.recover().is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Workers entering in a tight loop while the quit sweeps: whatever the interleaving, no
+    /// marker of this process survives the quit, because every `enter` either wrote before
+    /// the sweep (and was swept) or saw the disarm (and wrote nothing).
+    #[test]
+    fn no_marker_lands_between_the_sweep_and_the_exit() {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::{Arc, Barrier};
+        let (dir, m) = store("race");
+        let m = Arc::new(m);
+        let stop = Arc::new(AtomicBool::new(false));
+        const WORKERS: usize = 8;
+        let start = Arc::new(Barrier::new(WORKERS + 1));
+        let workers: Vec<_> = (0..WORKERS)
+            .map(|w| {
+                let (m, stop, start) = (m.clone(), stop.clone(), start.clone());
+                std::thread::spawn(move || {
+                    start.wait();
+                    let mut entered = 0u32;
+                    while !stop.load(Ordering::Relaxed) {
+                        crash_inside(&m, "libraw-decode", &format!("w{w}-{entered}.ARW"));
+                        entered += 1;
+                    }
+                    entered
+                })
+            })
+            .collect();
+        start.wait();
+        // Let every worker get markers onto disk before the quit, so the sweep has work.
+        while inflight_count(&dir) < WORKERS {
+            std::thread::yield_now();
+        }
+        m.clean_exit();
+        // Keep the workers entering after the quit for a while, then stop them.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        stop.store(true, Ordering::Relaxed);
+        let entered: u32 = workers.into_iter().map(|w| w.join().unwrap()).sum();
+        assert!(entered as usize > WORKERS, "the workers did enter ({entered})");
+        assert_eq!(inflight_count(&dir), 0, "a marker landed after the quit's sweep");
         assert!(m.recover().is_empty());
         std::fs::remove_dir_all(&dir).ok();
     }

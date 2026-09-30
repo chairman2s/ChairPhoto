@@ -7,6 +7,7 @@
 
 pub mod compare_duel;
 pub mod darkroom;
+pub mod deep_link;
 pub mod editing;
 pub mod js_compat;
 pub mod library;

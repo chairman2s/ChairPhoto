@@ -9,17 +9,22 @@
 //! (`TestAppContext::quit` runs the app's quit observers); the platform's own quit →
 //! event-loop exit is GPUI's. `QuitMode::Explicit` is set on the `Application` in `run` and
 //! has no test-platform counterpart.
+//!
+//! Also: deep link → model, second launch → model, quit signal → `Quit` (gpui #100).
 
-use crate::keymap::{self, contexts};
-use crate::model::{not_yet_ported_line, CatalogSummary};
+use crate::keymap::{self, contexts, Quit};
+use crate::model::{not_yet_ported_line, AppModel, CatalogSummary, DeepLinkTarget};
 use crate::shell::actions::{self as shell_actions, ToggleLeftPanel};
 use crate::shell::state::Side;
 use crate::{start_core, wire, QuitReason, QuitRequested, WireOptions, Wired};
+use crate::launch;
+use crate::single_instance::Request;
+use chairphoto_model::deep_link::DeepLinkView;
 use chairphoto_core::app::{AppState, CoreEvent, EventSink as _};
 use chairphoto_core::appearance::SystemThemeResult;
 use chairphoto_core::catalog::{Catalog, CullingFilter};
 use gpui_kit::test::TestWindowExt as _;
-use gpui_kit::{div, AnyWindowHandle, AppContext as _, Context, FocusHandle, InteractiveElement as _, IntoElement, ParentElement as _, Render, Styled as _, TestAppContext, Window};
+use gpui_kit::{div, AnyWindowHandle, Entity, AppContext as _, Context, FocusHandle, InteractiveElement as _, IntoElement, ParentElement as _, Render, Styled as _, TestAppContext, Window};
 use std::cell::Cell;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -380,4 +385,141 @@ fn the_command_pill_and_browser_edit_the_scope(cx: &mut TestAppContext) {
     assert!(app.wired.shell.read_with(cx, |s, _| s.section_open(Section::Albums)));
     click(&app, "section-albums", cx);
     assert!(!app.wired.shell.read_with(cx, |s, _| s.section_open(Section::Albums)));
+}
+
+/// A catalog with one photo and one tag, opened into `state`; returns the photo's and the
+/// tag's uuids.
+fn catalog_with_a_photo_and_a_tag(dir: &TempDir, state: &AppState) -> (String, String) {
+    let root = dir.0.join("photos");
+    let catalog = Catalog::open(&dir.0.join("links.chairphoto"), &root).unwrap();
+    let photo = catalog.upsert_photo(&root.join("2026/a.ARW"), None, 0, 1).unwrap();
+    let tag_id = catalog.create_tag("Places/Oslo").unwrap();
+    let tag_uuid = catalog.get_tag(tag_id).unwrap().uuid;
+    *state.catalog.lock().unwrap() = Some(catalog);
+    (photo.uuid, tag_uuid)
+}
+
+/// The deep-link tests' view of `start`: the real wiring's state and model (gpui #100's tests
+/// predate `start_core`/`wire` and read the model directly).
+fn wired(cx: &mut TestAppContext) -> (AppState, Entity<AppModel>) {
+    let app = start(cx);
+    (app.state.clone(), app.wired.model.clone())
+}
+
+fn model_status(model: &Entity<AppModel>, cx: &mut TestAppContext) -> String {
+    model.read_with(cx, |m, _| m.status.to_string())
+}
+
+/// A link that arrives before the catalog is open waits for it (React's `ready` gate), then
+/// resolves to the photo and the requested view, and says so on the status line.
+#[gpui_kit::test]
+fn a_photo_link_waits_for_the_catalog_then_resolves(cx: &mut TestAppContext) {
+    let dir = TempDir::new("link-wait");
+    let (state, model) = wired(cx);
+    let (photo_uuid, _) = catalog_with_a_photo_and_a_tag(&dir, &state);
+
+    let url = format!("chairphoto:///{}/LOUPE", photo_uuid.to_uppercase());
+    model.update(cx, |m, cx| m.open_url(&url, cx));
+    cx.run_until_parked();
+    assert_eq!(model_status(&model, cx), "Deep link: waiting for the catalog…");
+    model.read_with(cx, |m, _| assert_eq!(m.deep_link, None));
+
+    model.update(cx, |m, cx| m.refresh(cx));
+    cx.run_until_parked();
+    model.read_with(cx, |m, _| match &m.deep_link {
+        Some(DeepLinkTarget::Photo { uuid, path, view, .. }) => {
+            assert_eq!(uuid, &photo_uuid);
+            assert_eq!(path, "2026/a.ARW");
+            assert_eq!(*view, DeepLinkView::Loupe);
+        }
+        other => panic!("expected the photo, got {other:?}"),
+    });
+    assert_eq!(model_status(&model, cx), "Deep link: 2026/a.ARW → loupe (view not ported yet)");
+}
+
+/// Tag links resolve by uuid; unknown uuids and non-links are reported, as App.tsx did.
+#[gpui_kit::test]
+fn tag_links_resolve_and_misses_are_reported(cx: &mut TestAppContext) {
+    let dir = TempDir::new("link-tag");
+    let (state, model) = wired(cx);
+    let (_, tag_uuid) = catalog_with_a_photo_and_a_tag(&dir, &state);
+    model.update(cx, |m, cx| m.refresh(cx));
+    cx.run_until_parked();
+
+    model.update(cx, |m, cx| m.open_url(&format!("chairphoto://tag/{tag_uuid}"), cx));
+    cx.run_until_parked();
+    model.read_with(cx, |m, _| match &m.deep_link {
+        Some(DeepLinkTarget::Tag { uuid, full_path, .. }) => {
+            assert_eq!(uuid, &tag_uuid);
+            assert_eq!(full_path, "Places/Oslo");
+        }
+        other => panic!("expected the tag, got {other:?}"),
+    });
+    assert_eq!(model_status(&model, cx), "Deep link: filter by tag Places/Oslo (view not ported yet)");
+
+    let missing = "0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d";
+    model.update(cx, |m, cx| m.open_url(&format!("chairphoto://{missing}/develop"), cx));
+    cx.run_until_parked();
+    assert_eq!(model_status(&model, cx), format!("Deep link: no photo {missing} in this catalog"));
+    model.update(cx, |m, cx| m.open_url(&format!("chairphoto://tag/{missing}"), cx));
+    cx.run_until_parked();
+    assert_eq!(model_status(&model, cx), format!("Deep link: no tag {missing} in this catalog"));
+
+    model.update(cx, |m, cx| m.open_url("chairphoto://album/x", cx));
+    assert_eq!(model_status(&model, cx), "Deep link: not a ChairPhoto link: chairphoto://album/x");
+    // A miss does not clear the last link that did resolve.
+    model.read_with(cx, |m, _| assert!(matches!(m.deep_link, Some(DeepLinkTarget::Tag { .. }))));
+}
+
+/// A second launch's request, sent from the single-instance thread, reaches the model on the
+/// main thread; of several links the last one wins, as each supersedes the one before.
+#[gpui_kit::test]
+fn a_second_launch_request_from_a_worker_thread_opens_its_links(cx: &mut TestAppContext) {
+    let dir = TempDir::new("link-forward");
+    let (state, model) = wired(cx);
+    let (photo_uuid, tag_uuid) = catalog_with_a_photo_and_a_tag(&dir, &state);
+    model.update(cx, |m, cx| m.refresh(cx));
+    cx.run_until_parked();
+
+    let (tx, rx) = futures::channel::mpsc::unbounded::<Request>();
+    cx.update(|cx| launch::spawn_request_router(rx, model.clone(), None, cx).detach());
+    let request = Request {
+        urls: vec![format!("chairphoto://tag/{tag_uuid}"), format!("chairphoto://{photo_uuid}")],
+    };
+    std::thread::spawn(move || tx.unbounded_send(request).unwrap()).join().unwrap();
+    cx.run_until_parked();
+
+    model.read_with(cx, |m, _| match &m.deep_link {
+        Some(DeepLinkTarget::Photo { uuid, view, .. }) => {
+            assert_eq!(uuid, &photo_uuid);
+            assert_eq!(*view, DeepLinkView::Grid);
+        }
+        other => panic!("expected the photo (the last link), got {other:?}"),
+    });
+    assert_eq!(model_status(&model, cx), "Deep link: 2026/a.ARW → Library (view not ported yet)");
+}
+
+/// A quit signal, delivered by the signal thread, dispatches `Quit` once — the Ctrl+Q path,
+/// whose handler in `run` calls `cx.quit()` and so the quit observers and `clean_exit`.
+#[gpui_kit::test]
+fn a_quit_signal_dispatches_quit(cx: &mut TestAppContext) {
+    let quits = Rc::new(Cell::new(0));
+    cx.update(|cx| {
+        let quits = quits.clone();
+        cx.on_action(move |_: &Quit, _| quits.set(quits.get() + 1));
+    });
+    let (tx, rx) = futures::channel::mpsc::unbounded::<i32>();
+    cx.update(|cx| launch::spawn_quit_on_signal(rx, cx).detach());
+    // Sent before the router is first polled: GPUI's deterministic scheduler rejects a wakeup
+    // from a foreign thread, so the channel must already hold the signals when it runs.
+    assert_eq!(quits.get(), 0);
+    std::thread::spawn(move || {
+        tx.unbounded_send(libc::SIGTERM).unwrap();
+        // A second signal is the handler's business (it forces the exit); the router quits once.
+        tx.unbounded_send(libc::SIGINT).unwrap();
+    })
+    .join()
+    .unwrap();
+    cx.run_until_parked();
+    assert_eq!(quits.get(), 1);
 }

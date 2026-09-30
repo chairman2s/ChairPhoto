@@ -10,7 +10,7 @@ import {
 /**
  * The perspective quad crosses two boundaries: it is serialized into the opaque
  * `edit_json` a version stores, and it is read back by the Rust render engine
- * (`src-tauri/src/plugins/edit/mod.rs`). Both sides agree on *fractions of the source*
+ * (`crates/core/src/plugins/edit/mod.rs`). Both sides agree on *fractions of the source*
  * and on the corner names, so these tests pin the shape rather than any rendering.
  */
 describe("perspective edit record", () => {

@@ -47,11 +47,11 @@ remembered as `smugmug.last_album` and pre-selected next time.
 
 ## Implementation
 
-All network I/O is in Rust. OAuth 1.0a signing lives in `src-tauri/src/oauth1.rs` — RFC 5849
+All network I/O is in Rust. OAuth 1.0a signing lives in `crates/core/src/oauth1.rs` — RFC 5849
 HMAC-SHA1, pure and unit-tested against a reference vector, and shared with the Flickr
 module.
 
-`src-tauri/src/smugmug/mod.rs` handles the request/access token exchange, listing the user's
+`crates/core/src/smugmug/mod.rs` handles the request/access token exchange, listing the user's
 albums against `api.smugmug.com` (API v2), and the raw-binary upload to
 `upload.smugmug.com`.
 

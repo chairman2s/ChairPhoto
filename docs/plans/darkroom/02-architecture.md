@@ -9,7 +9,7 @@ same versions. It is a new *surface* over the existing engine, not a new pipelin
 - `src/components/EditorView.tsx` (the current Develop tab, 1.3k lines) is **succeeded** by
   a Darkroom view composed of: stage (print + tone strip + actions), proof sheet, duel,
   and the classic slider rail (which reuses the existing slider/crop/perspective controls).
-- `src-tauri/src/plugins/edit/` (render engine) gains one pipeline stage (zone curve) and
+- `crates/core/src/plugins/edit/` (render engine) gains one pipeline stage (zone curve) and
   two small helpers (zone masses, auto-tone suggestion). Order and record stay canonical.
 - The pop-out loupe is the print with **zero new protocol**: `loupe:photo` already carries
   `{photoId, editJson}` — the Darkroom broadcasts its working edit (throttled) and the

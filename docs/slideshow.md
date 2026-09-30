@@ -55,7 +55,7 @@ order is the current grid order.
 
 ## Implementation
 
-- `src-tauri/src/slideshow/mod.rs` — ffmpeg detection, filtergraph construction, and the
+- `crates/core/src/slideshow/mod.rs` — ffmpeg detection, filtergraph construction, and the
   run with progress parsing.
 - The `make_slideshow` async command renders the frames into a temp dir, calls the engine
   off the UI thread, and streams progress.

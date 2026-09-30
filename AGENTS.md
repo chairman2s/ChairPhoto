@@ -102,14 +102,22 @@ Read only the documents triggered by the task:
 
 ```
 src/                    React/TypeScript UI and host/module contracts
-src-tauri/src/          Rust I/O, catalog, image processing, and Tauri commands
+crates/core/src/        Rust I/O, catalog, image processing, jobs (`chairphoto-core`, no Tauri)
+src-tauri/src/          Tauri shell: `run()`, commands, media protocols (`chairphoto`)
 ```
+
+The Rust side is a Cargo workspace rooted at the repository root. The core crate must build
+with no `tauri` dependency; the shell re-exports it at its crate root and forwards every
+feature under the same name.
 
 Frontend/backend communication is asynchronous Tauri IPC. Rust owns file access,
 catalog queries, image decoding, XMP, and external processes. TypeScript invokes typed
 commands and renders their results; it never reads photo files directly.
 
 ### Backend map
+
+Paths are under `crates/core/src/`, except `commands/` and `protocol.rs`, which are the
+shell's (`src-tauri/src/`).
 
 | Path | Responsibility |
 |---|---|
@@ -156,19 +164,19 @@ npx tsc --noEmit
 npm test
 npm run build
 
-# backend, from src-tauri/
-cargo test
-cargo check --all-features --all-targets
-cargo check --no-default-features
+# backend, from repository root (the Cargo workspace: crates/core + src-tauri)
+cargo test --workspace
+cargo check --workspace --all-features --all-targets
+cargo check --workspace --no-default-features
 ```
 
-`cargo check --all-features --all-targets` includes `#[cfg(test)]` code; plain
+`cargo check --workspace --all-features --all-targets` includes `#[cfg(test)]` code; plain
 `cargo check` does not. Keep every feature combination warning-clean.
 
 Tests that cannot run on a given machine — no ONNX Runtime, no `ffmpeg`, no model behind
 `SMARTTAGS_TEST_MODEL`, no loopback multicast — skip rather than fail, and announce it as
 `SKIPPED: <test_name> — <why>`. `cargo test` captures that line for a *passing* test, so run
-`cargo test -- --nocapture` when you need to know what actually executed. A plain green run
+`cargo test --workspace -- --nocapture` when you need to know what actually executed. A plain green run
 does not distinguish "passed" from "never ran".
 
 ### Verify, then report
@@ -237,7 +245,7 @@ LibRaw is a link-time dependency for full-resolution decode under the `raw` feat
 runtime fallback.
 
 Native code that can kill the process — LibRaw today, a GPU driver if a GPU backend lands —
-runs under a crash marker (`src-tauri/src/crash_marker.rs`): `enter(kind, subject, label)`
+runs under a crash marker (`crates/core/src/crash_marker.rs`): `enter(kind, subject, label)`
 before the call, `blocked(kind, subject)` checked first. A subject that took the process down
 twice is skipped and the caller takes its fallback; a clean quit is not a crash. Choose the
 subject so a change (decoder version, file size/mtime, driver) earns a fresh chance.

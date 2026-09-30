@@ -209,7 +209,7 @@ set, and the collected contributions; exposes `enable(id)`, `disable(id)`,
 ## Backend host
 
 - Each backend-bearing module gets a **Cargo feature** (e.g. `ai`). Its Rust lives in
-  its own module (`src-tauri/src/plugins/<name>/`), and its commands are registered
+  its own module (`crates/core/src/plugins/<name>/`), and its commands are registered
   conditionally: `#[cfg(feature = "ai")] commands::ai_suggest, …`.
 - Default feature set decides what ships; a build can omit a feature to exclude it.
 - The frontend asks the backend which features are compiled in (a `plugin_features`
@@ -258,7 +258,7 @@ whether its backend feature is compiled in, and an enable toggle. Toggling persi
 AI tagging becomes the first module: `id: "ai-tagging"`, `backendFeature: "ai"`.
 - `onLoad`: registers an inspector panel ("Suggest tags") and a settings panel
   (provider/model/key), reads config via the namespaced `getSetting`.
-- Backend: `src-tauri/src/plugins/ai/` behind the `ai` Cargo feature — the provider
+- Backend: `crates/core/src/plugins/ai/` behind the `ai` Cargo feature — the provider
   abstraction + `ai_suggest_tags` / accept / reject commands + the `ai__suggestions` table.
 - Fully optional: omit the `ai` feature to compile it out; or leave it off in Modules.
 

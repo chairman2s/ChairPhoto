@@ -106,11 +106,15 @@ Checks:
 ```bash
 npm test                                    # frontend tests (vitest)
 npx tsc --noEmit                            # frontend typecheck
-cd src-tauri
-cargo test                                  # backend tests
-cargo check --all-features --all-targets
-cargo check --no-default-features           # verifies feature gating still holds
+cargo test --workspace                      # backend tests (crates/core + src-tauri)
+cargo check --workspace --all-features --all-targets
+cargo check --workspace --no-default-features   # verifies feature gating still holds
 ```
+
+The backend is a Cargo workspace at the repository root: `crates/core` (`chairphoto-core`)
+holds the catalog, import, decode and module backends with no Tauri dependency, and
+`src-tauri` (`chairphoto`) is the Tauri shell — commands, media protocols and plugins —
+forwarding the same feature names. Build output is in `target/` at the root.
 
 The tree is warning-clean under every feature combination. Please keep it that way.
 
@@ -121,7 +125,7 @@ can build only what you want:
 
 ```bash
 # a lean build with no RAW, no local AI, no browser automation
-cargo build --no-default-features --features edit,collage,slideshow
+cargo build -p chairphoto --no-default-features --features edit,collage,slideshow
 ```
 
 | Feature | What it adds | Extra cost |

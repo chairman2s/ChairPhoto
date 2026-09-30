@@ -3,8 +3,8 @@
 ## Files
 
 **Vendored decoder and build**
-- `src-tauri/vendor/LibRaw` — NEW git submodule, pinned at/after `dde798d`. `.gitmodules` NEW.
-- `src-tauri/build.rs` — CHANGED. With `raw`: compile the submodule's `src/**/*.cpp` with the
+- `crates/core/vendor/LibRaw` — NEW git submodule, pinned at/after `dde798d`. `.gitmodules` NEW.
+- `crates/core/build.rs` — CHANGED. With `raw`: compile the submodule's `src/**/*.cpp` with the
   `cc` crate (C++17, `-DUSE_ZLIB -DUSE_OPENMP -fopenmp`, links `z` and `gomp`), emit
   `cargo:rustc-link-lib=static=raw_r`, and run bindgen on the *vendored* header. The
   pkg-config probe goes; the ABI-match argument now holds by construction.
@@ -14,35 +14,35 @@
   CHANGED: a "Bundled third-party code" section recording LibRaw under CDDL-1.0.
 
 **Backend (all inside `raw` + `edit` unless noted)**
-- `src-tauri/src/raw/mod.rs` — CHANGED. Keeps `decode_to_image` (engine 1's export path,
+- `crates/core/src/raw/mod.rs` — CHANGED. Keeps `decode_to_image` (engine 1's export path,
   untouched). Adds `probe`, `decode_linear`, `decoder_version`, and the 16-bit copy-out.
-- `src-tauri/src/develop/mod.rs` — NEW, core (not a plugin: the working image is a host
+- `crates/core/src/develop/mod.rs` — NEW, core (not a plugin: the working image is a host
   service the edit engine consumes). `WorkingImage`, `SourceToken`, `DevelopSource`, the
   resident set with its byte budget.
-- `src-tauri/src/develop/cache.rs` — NEW, pure I/O. The `.rawf` file format, read/write,
+- `crates/core/src/develop/cache.rs` — NEW, pure I/O. The `.rawf` file format, read/write,
   LRU trimming by the size setting.
-- `src-tauri/src/develop/session.rs` — NEW. The `develop` job worker: claim → probe →
+- `crates/core/src/develop/session.rs` — NEW. The `develop` job worker: claim → probe →
   cache → decode → publish → neighbours; every step a cancellation point.
 - `src-tauri/src/commands/develop.rs` — NEW. `develop_open`, `develop_close`,
   `develop_source`, `raw_probe`. Registered in `lib.rs`.
 - `src-tauri/src/commands/jobs.rs` — CHANGED. `JobRegistry.develop: JobFamily<DevelopStatus>`
   (the exhaustive destructurings in `lock_for_detach`/`lock_for_publish` make omission a
   compile error, as designed).
-- `src-tauri/src/plugins/edit/source.rs` — NEW. `RenderSource`: what a render reads from.
-- `src-tauri/src/plugins/edit/linear.rs` — NEW, pure. Engine 2's scene-linear tone stage
+- `crates/core/src/plugins/edit/source.rs` — NEW. `RenderSource`: what a render reads from.
+- `crates/core/src/plugins/edit/linear.rs` — NEW, pure. Engine 2's scene-linear tone stage
   and the display transform slot. Reuses `look.rs` for everything after tone.
-- `src-tauri/src/plugins/edit/mod.rs` — CHANGED. `EditRecord.engine` (serde default 1);
+- `crates/core/src/plugins/edit/mod.rs` — CHANGED. `EditRecord.engine` (serde default 1);
   `render_proxy` / `render_image_opts` take a `RenderSource`; the framed-base cache keys on
   the source token; `RenderOpts.clip_mask`.
-- `src-tauri/src/plugins/edit/look.rs` — CHANGED. `apply_look` splits into
+- `crates/core/src/plugins/edit/look.rs` — CHANGED. `apply_look` splits into
   `apply_tone` (engine 1 only) and `apply_finish` (B&W → LUT → split → fade → vignette →
   grain, shared by both engines). Byte identity for engine 1 locked by the existing tests.
-- `src-tauri/src/protocol.rs`, `src-tauri/src/image_pool.rs` — CHANGED. `EditJob.source`
+- `src-tauri/src/protocol.rs`, `crates/core/src/image_pool.rs` — CHANGED. `EditJob.source`
   parsed from `s=`; `render_edit_bytes` resolves it or 404s.
-- `src-tauri/src/export/mod.rs` — CHANGED. `decode_export_source` dispatches on engine:
+- `crates/core/src/export/mod.rs` — CHANGED. `decode_export_source` dispatches on engine:
   2 → `WorkingImage` (resident, cached, or decoded) through `render_image_opts`; 1 → today's
   path. `tone_match_to_preview` stays for engine 1 only.
-- `src-tauri/src/thumbnails/mod.rs` — CHANGED (visibility only): `exif_orientation`,
+- `crates/core/src/thumbnails/mod.rs` — CHANGED (visibility only): `exif_orientation`,
   `cache_dir` become `pub(crate)`.
 
 **Frontend**

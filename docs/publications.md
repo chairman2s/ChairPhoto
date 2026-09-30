@@ -43,7 +43,7 @@ publications(
   Tracking *repeats of the identical version over time* is a non-goal.
 
 Catalog API: `record_publication`, `list_publications`, `delete_publication`,
-`published_platforms` (`src-tauri/src/catalog/publications.rs`). `record_publication`
+`published_platforms` (`crates/core/src/catalog/publications.rs`). `record_publication`
 rejects an empty `platform`.
 
 ## Markers are declared by the publishing module

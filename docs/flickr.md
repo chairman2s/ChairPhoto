@@ -70,11 +70,11 @@ publications.
 
 ## Implementation
 
-All network I/O is in Rust. OAuth 1.0a signing lives in `src-tauri/src/oauth1.rs` — RFC 5849
+All network I/O is in Rust. OAuth 1.0a signing lives in `crates/core/src/oauth1.rs` — RFC 5849
 HMAC-SHA1, pure and unit-tested against a reference vector, and shared with the SmugMug
 module.
 
-`src-tauri/src/flickr/mod.rs` handles the request/access token exchange, the photostream
+`crates/core/src/flickr/mod.rs` handles the request/access token exchange, the photostream
 fetch and matching, and the `up.flickr.com` upload. The multipart body is built by hand to
 avoid an extra dependency.
 

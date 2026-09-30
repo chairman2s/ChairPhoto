@@ -22,11 +22,11 @@
   the registered edit renderer is untouched.
 
 **Backend (all inside the `edit` feature)**
-- `src-tauri/src/plugins/edit/zones.rs` — NEW, pure. Zone gain curve + zone masses.
-- `src-tauri/src/plugins/edit/auto.rs` — NEW, pure. Classical auto-tone suggestion.
-- `src-tauri/src/plugins/edit/mod.rs` — CHANGED. `EditRecord.zones`; `render_image`
+- `crates/core/src/plugins/edit/zones.rs` — NEW, pure. Zone gain curve + zone masses.
+- `crates/core/src/plugins/edit/auto.rs` — NEW, pure. Classical auto-tone suggestion.
+- `crates/core/src/plugins/edit/mod.rs` — CHANGED. `EditRecord.zones`; `render_image`
   hands zones to the look stage.
-- `src-tauri/src/plugins/edit/look.rs` — CHANGED. Applies the zone gain LUT inside the
+- `crates/core/src/plugins/edit/look.rs` — CHANGED. Applies the zone gain LUT inside the
   tone step (after EV/WB, before contrast).
 - `src-tauri/src/commands/editing.rs` — CHANGED. Commands `edit_zone_masses`,
   `suggest_auto_tone` (same lock-then-spawn_blocking shape as `render_edit`).

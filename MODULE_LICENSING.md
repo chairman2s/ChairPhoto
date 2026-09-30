@@ -49,7 +49,7 @@ third-party services (the Flickr API, the Claude API) that nobody expects to be 
 
 ## Bundled third-party code
 
-ChairPhoto vendors **LibRaw** (`src-tauri/vendor/LibRaw`, a pinned git submodule) and
+ChairPhoto vendors **LibRaw** (`crates/core/vendor/LibRaw`, a pinned git submodule) and
 compiles it into the binary for RAW decoding. LibRaw is dual-licensed, LGPL-2.1 or CDDL-1.0
 (`COPYRIGHT` in that tree). ChairPhoto takes it under the **LGPL-2.1** option
 (`LICENSE.LGPL`): section 3 of that license lets a copy be distributed under the GNU GPL,
@@ -62,10 +62,10 @@ and `LICENSE.LGPL` next to ChairPhoto's own license (`packaging/PKGBUILD`), and 
 bundled parts (dcraw, DCB/FBDD, X3F, Adobe DNG SDK pieces) are covered by that
 `COPYRIGHT` file.
 
-The lens-correction reader (`src-tauri/src/lens/`) is ported from **RAWmakase**
+The lens-correction reader (`crates/core/src/lens/`) is ported from **RAWmakase**
 (<https://github.com/pch/rawmakase>, commit `80b6433`), Copyright (c) 2026 RAWmakase
 contributors, under the MIT License, which permits use in a GPL-3.0 program provided the
-notice is kept: it is in `src-tauri/src/lens/LICENSE-RAWmakase`, which the package
+notice is kept: it is in `crates/core/src/lens/LICENSE-RAWmakase`, which the package
 installs next to ChairPhoto's own license (`packaging/PKGBUILD`), and quoted below. Only RAWmakase's own MIT code is taken — none of its files under the
 Adobe DNG SDK license, and none of its tables measured from Adobe Camera Raw.
 

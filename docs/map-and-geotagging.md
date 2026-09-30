@@ -27,7 +27,7 @@ live in the taxonomy like any other, per [taxonomy.md](taxonomy.md).
 ## Geofences
 
 **Shape.** A freeform polygon, tested with `point_in_polygon` (ray casting, even-odd rule)
-in `src-tauri/src/plugins/map/mod.rs`, covered by tests for vertices, edges, concave
+in `crates/core/src/plugins/map/mod.rs`, covered by tests for vertices, edges, concave
 polygons, and degenerate cases. Pure Rust, no extra dependencies.
 
 **Storage.** The plugin-owned table `map__fences(id, name, tag_path, polygon, created_at)`,
@@ -75,7 +75,7 @@ Geofences handle the fine personal spots a geocoder will never know. Reverse-geo
 handles the broad administrative areas: a GPS coordinate becomes coarse country / state /
 city via OSM Nominatim, filling **empty** IPTC location fields.
 
-`src-tauri/src/plugins/map/geocode.rs` performs the lookup at coarse zoom and caches it in
+`crates/core/src/plugins/map/geocode.rs` performs the lookup at coarse zoom and caches it in
 `map__geocode_cache`, keyed on lat/lng rounded to ~1 km (0.01° ≈ 1.1 km at the equator), so
 nearby photos share a single network call. The cache stores city, state, country, and
 country code with a timestamp; a cache hit makes no HTTP request. Tests run against a

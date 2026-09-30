@@ -22,7 +22,7 @@ ChairPhoto's UI is painted from one set of semantic color tokens. Two modes fill
   theme switches live.
 
 Only the Omarchy half has a Rust side, and that is what this document describes: parser
-and watcher in `src-tauri/src/appearance/`, the command surface in
+and watcher in `crates/core/src/appearance/`, the command surface in
 `src-tauri/src/commands/appearance.rs`.
 
 ## The Omarchy 4 contract

@@ -30,7 +30,7 @@ Face tagging and Smart Tagging run inference through `ort`. Left alone, `ort` do
 own ONNX Runtime during the build — fine for development, wrong for a distro package, which
 must build from declared dependencies rather than an unpinned network fetch.
 
-`src-tauri/Cargo.toml` turns `download-binaries` off and enables ort's `load-dynamic`
+`crates/core/Cargo.toml` turns `download-binaries` off and enables ort's `load-dynamic`
 instead, so the binary carries no `libonnxruntime` in its `NEEDED` entries and `dlopen`s the
 library on first use. That is what lets this recipe list it under `optdepends`: a user who
 never opens face tagging or Smart Tagging does not install a ~25 MB inference runtime to run
@@ -39,7 +39,7 @@ missing one degrades its feature and nothing else.
 
 The catch is that ort does not degrade politely. Its loader **hangs indefinitely with no
 error** when the library is absent, which is worse than crashing: no message, no recovery,
-and a wedged worker. So `src-tauri/src/plugins/onnx.rs` loads the library itself first,
+and a wedged worker. So `crates/core/src/plugins/onnx.rs` loads the library itself first,
 caches the verdict, and returns an error before anything reaches ort. It mirrors ort's own
 resolution (`ORT_DYLIB_PATH`, then next to the executable, then the loader's search path) and
 asks the same three questions ort asks — symbol present, version at or above the floor, and

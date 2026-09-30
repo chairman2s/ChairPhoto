@@ -116,7 +116,7 @@ buttons. `mode` maps to `ThemeMode::{Light,Dark}`. `color-scheme` and `data-appe
 because there are no native web controls.
 
 **Live Omarchy refresh.** `appearance::start_watcher(events: impl EventSink)` stays unchanged
-(src-tauri/src/appearance/mod.rs:347). The GPUI `EventSink` sends the settled `SystemThemeResult` into an async
+(crates/core/src/appearance/mod.rs:347). The GPUI `EventSink` sends the settled `SystemThemeResult` into an async
 channel. A task on the main thread applies it: port `mapPalette` (src/theme/omarchy.ts) to Rust, then
 `apply(..)`, or `apply(STANDARD)` when `available: false`. `Theme::update` re-renders every window, so the
 pop-out loupe follows too. Store the app-owned tokens in the same `cx.update` call so both are current in the

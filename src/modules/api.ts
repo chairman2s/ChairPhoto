@@ -418,7 +418,7 @@ export type PhotoSort = "date" | "sharpness_asc" | "sharpness_desc";
 /**
  * Which photos the library view wants, in what order, and (optionally) which slice.
  *
- * The same object as `PhotoQuery` in `src-tauri/src/catalog/query.rs`, field for field
+ * The same object as `PhotoQuery` in `crates/core/src/catalog/query.rs`, field for field
  * (issue #10) — it used to be eleven positional arguments that TypeScript, the Tauri
  * command and the SQL builder each had to spell identically. Two things keep the sides
  * honest rather than merely parallel: the string unions below are Rust enums, and the Rust

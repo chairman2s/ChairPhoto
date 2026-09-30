@@ -69,7 +69,7 @@ is never overwritten.
 
 ## Where it lives
 
-- `src-tauri/src/instagram/mod.rs` — the Chrome automation.
+- `crates/core/src/instagram/mod.rs` — the Chrome automation.
 - `src-tauri/src/commands/instagram.rs` — `post_to_instagram` and
   `build_instagram_caption`, both gated on the `instagram` feature. The render goes to a
   temp JPEG in a directory belonging to that post alone (`publishing::JobTempDir`), whose

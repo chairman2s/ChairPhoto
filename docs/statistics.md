@@ -72,7 +72,7 @@ re-filtering the grid.
 ```
 src/modules/plugins/statistics.tsx    the view, registered via registerMainView
 src-tauri/src/commands/graph.rs:174   catalog_stats command
-src-tauri/src/catalog/stats.rs:95     the queries
+crates/core/src/catalog/stats.rs:95     the queries
 ```
 
 The module id is `statistics`. It is **frontend-only** — it declares no `backendFeature`, and

@@ -63,7 +63,7 @@ src/modules/plugins/tagGraph.tsx      the view, registered via registerMainView
 src/modules/plugins/tagGraphBundle.ts  the radial layout — pure, unit-tested
 src/modules/plugins/tagGraph.css
 src-tauri/src/commands/graph.rs:66    library_graph — nodes and edges
-src-tauri/src/catalog/mod.rs:1841     the queries
+crates/core/src/catalog/mod.rs:1841     the queries
 ```
 
 The module id is `tag-graph`. It is **frontend-only** — no `backendFeature`, and `library_graph`

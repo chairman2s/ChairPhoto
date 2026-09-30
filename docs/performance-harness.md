@@ -3,7 +3,8 @@
 Issue #20 added an ignored Rust test that builds a synthetic catalog and reports timings
 for optimization-sensitive paths. It does not run in normal `cargo test`.
 
-Run it from `src-tauri`:
+Run it from `crates/core` (every bench on this page is in the core crate; from the repository
+root, add `-p chairphoto-core`):
 
 ```bash
 CHAIRPHOTO_PERF_PHOTOS=100000 cargo test catalog::performance_harness::large_catalog_shape -- --ignored --nocapture --test-threads=1
@@ -84,7 +85,7 @@ By default the harness reports thresholds without enforcing them. Set
 
 ## Edit render bench
 
-`src-tauri/src/plugins/edit/bench.rs` is a second ignored test, added for the Darkroom's
+`crates/core/src/plugins/edit/bench.rs` is a second ignored test, added for the Darkroom's
 GPU-smoothness work (`docs/plans/darkroom/00-status.md`, "Follow-on: GPU smoothness"). It
 times every stage a slider-drag frame pays — the cached-proxy clone, the downscale, the
 RGB copy, the look loop, JPEG and PNG encode, base64 — plus the end-to-end
@@ -92,7 +93,7 @@ RGB copy, the look loop, JPEG and PNG encode, base64 — plus the end-to-end
 masses pass the settle also pays. Medians of N runs, one JSON line per edge.
 
 Run it in **both** profiles: `tauri dev` ships the debug profile, where this crate is
-unoptimized (only the decoders are, `Cargo.toml` `[profile.dev.package.*]`), and the
+unoptimized (only the decoders are, the root `Cargo.toml`'s `[profile.dev.package.*]`), and the
 release profile is what users install. The numbers differ by an order of magnitude.
 
 ```bash
@@ -124,7 +125,7 @@ The running app logs `develop: photo N ready from cache|decode in …` and
 
 The same stages can be read from a running app: start it with `CHAIRPHOTO_EDIT_TIMING=1`
 and every `render_edit` / `render_image` prints one `[edit-timing] … profile=debug|release`
-line to stderr (`src-tauri/src/plugins/edit/timing.rs`). The frontend half lives behind
+line to stderr (`crates/core/src/plugins/edit/timing.rs`). The frontend half lives behind
 Preferences → Darkroom → "Log render timings to the console": the Darkroom logs one
 `[edit-timing]` line per painted frame (IPC round trip and resolve-to-paint), a summary every
 2 s while frames arrive, and persists the last summary under `editor.renderTiming.lastSummary`

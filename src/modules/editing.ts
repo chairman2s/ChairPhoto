@@ -1,6 +1,6 @@
 // Shared types + presets for the basic editor (H5b). The edit record is stored as the
 // opaque `edit_json` on a photo version and interpreted by the render engine
-// (src-tauri/src/plugins/edit). See docs/editing.md.
+// (crates/core/src/plugins/edit). See docs/editing.md.
 
 /** Crop rectangle as fractions (0–1) of the source — resolution-independent. */
 export interface Crop {

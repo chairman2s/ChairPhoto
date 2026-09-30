@@ -204,7 +204,7 @@ history into `<raw>.xmp`, RawTherapee into `.pp3`, ART into `.arp`, and RapidRAW
 be reported **BACKED UP** while every edit decision made on it existed in exactly one
 place (issue #80).
 
-The set is **declared, never guessed** (`src-tauri/src/companions.rs`). An integration names
+The set is **declared, never guessed** (`crates/core/src/companions.rs`). An integration names
 its extension; the catalog does not sweep arbitrary neighbouring files, because backup must
 not behave differently depending on what happens to share a folder with the photo.
 

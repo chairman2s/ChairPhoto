@@ -8,12 +8,12 @@ session — and points every Develop surface at it. It changes *where pixels com
 not how the surfaces work: the Darkroom, the loupe print, the proof sheet, duels, the
 tone strip, and export all keep their commands, records and versions.
 
-- `src-tauri/src/raw/` — today a one-shot `decode_to_image` (8-bit sRGB, camera WB, used
+- `crates/core/src/raw/` — today a one-shot `decode_to_image` (8-bit sRGB, camera WB, used
   only by export). Becomes the **decoder**: same LibRaw FFI, new output contract (16-bit
   linear, no auto-bright, camera WB as metadata not baked), plus a supported/unsupported
   probe. LibRaw itself moves from the distro package to a **vendored, pinned snapshot**
   built with the app (§External) — the packaged 0.22.2 cannot open the user's newest camera.
-- `src-tauri/src/plugins/edit/` — the render engine gains a **source abstraction**: the
+- `crates/core/src/plugins/edit/` — the render engine gains a **source abstraction**: the
   pipeline's input is a `WorkingImage` (linear f32 RGB, sensor orientation applied, with its
   colour metadata) instead of a decoded JPEG. The framed-base cache, the decode cache, the
   look and the transport built on `feature/darkroom-gpu` carry over; only the *first* input
@@ -25,10 +25,10 @@ tone strip, and export all keep their commands, records and versions.
   existing ownership protocol rather than as a new one.
 - `src-tauri/src/protocol.rs` / `image_pool.rs` — the `edit://` URL learns which source it
   renders from (§Endpoints). Same pool, same LIFO, same dedup.
-- `src-tauri/src/export/` — `full_res_source` + `tone_match_to_preview` are **deleted** for
+- `crates/core/src/export/` — `full_res_source` + `tone_match_to_preview` are **deleted** for
   engine-v2 records: export renders the same `WorkingImage` through the same pipeline at
   full size. The parity test becomes exact at 100%. Engine-v1 records keep the old path.
-- `src-tauri/src/thumbnails/` — the Library tiers are untouched. The new **decode cache**
+- `crates/core/src/thumbnails/` — the Library tiers are untouched. The new **decode cache**
   lives beside them on disk (§Data) so a photo prepared once opens prepared.
 - Frontend: `DarkroomView` gains the preparing/developed/unsupported states from the Gate 1
   mockup, driven by one event; `LoupeWindow` and `basicEditor` render the same source via
@@ -138,7 +138,7 @@ frame at reduced opacity (no extra render: the mask is a per-geometry cached PNG
 
 ## External
 
-- **LibRaw, vendored.** A git submodule at `src-tauri/vendor/LibRaw` pinned to a master
+- **LibRaw, vendored.** A git submodule at `crates/core/vendor/LibRaw` pinned to a master
   commit at or after `dde798d` (2026-09-09, decodes the ILCE-7RM6 "Compressed RAW 2").
   Built by `build.rs` with the `cc` crate from the snapshot's `src/**` (the Makefile.dist
   object list), `USE_ZLIB` + `USE_OPENMP`, statically linked; bindgen reads the vendored

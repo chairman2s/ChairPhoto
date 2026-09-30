@@ -102,7 +102,7 @@ on success — mirroring how `publishing.tsx` is shared by Flickr and SmugMug.
 
 ## Implementation
 
-All I/O is in Rust. `src-tauri/src/localsend/mod.rs`, behind a `localsend` Cargo feature,
+All I/O is in Rust. `crates/core/src/localsend/mod.rs`, behind a `localsend` Cargo feature,
 reuses `reqwest` and does UDP through tokio:
 
 - `discover(timeout_ms) -> Vec<Device>` — multicast listen and announce, plus a concurrent
@@ -129,7 +129,7 @@ Unit tests cover the discovery-JSON parse, the prepare-upload body and response 
 device-info builder, the host's `satisfies` semver helper, and the Snapchat aspect helper.
 The discovery-socket tests (issue #39) are the exception: they bind the real well-known UDP
 port, join the real multicast group, and send/receive real datagrams over loopback — see the
-`#[cfg(test)] mod tests` doc comments in `src-tauri/src/localsend/mod.rs` for what that costs
+`#[cfg(test)] mod tests` doc comments in `crates/core/src/localsend/mod.rs` for what that costs
 (serialized against each other and against a co-resident LocalSend desktop app) and how it's
 kept hermetic (loopback only, never the LAN).
 

@@ -13,7 +13,7 @@ URL. Statements marked **(inference)** are reasoned, not observed.
 
 **Write our own map widget; use no map crate.** Split it in two:
 
-1. **Headless core in the backend** (`src-tauri/src/plugins/map/`, `map` feature, no
+1. **Headless core in the backend** (`crates/core/src/plugins/map/`, `map` feature, no
    GPUI dependency, unit-testable): Web Mercator tile math with fractional zoom, a
    policy-compliant tile fetcher (existing `reqwest`, fixed User-Agent, conditional
    revalidation), a disk tile cache, and grid clustering in world-pixel space.
@@ -52,7 +52,7 @@ Key reasons:
 | Modules start disabled; enabled set persisted in setting `modules.enabled` | `src/modules/host.ts:1027`, `:1059-1062`, `:1312` |
 | Module settings are namespaced by module id (`tileUrl` → `map.tileUrl`) | `src/modules/host.ts:962`; `docs/module-capabilities.md:196` |
 | `map` cargo feature is on by default and pulls in `reqwest` | `src-tauri/Cargo.toml:22`, `:49-52`, `:141` |
-| Points: `map_photo_points` → `(id, lat, lng)` from `photos_visible` where both GPS columns are non-null | `src-tauri/src/plugins/map/mod.rs:162-189`; command `src-tauri/src/commands/map.rs:103-117` |
+| Points: `map_photo_points` → `(id, lat, lng)` from `photos_visible` where both GPS columns are non-null | `crates/core/src/plugins/map/mod.rs:162-189`; command `src-tauri/src/commands/map.rs:103-117` |
 | Empty state when no photo has GPS; loading/error overlays; status strip with count | `map.tsx:973-1016` |
 
 ### Tiles
@@ -91,15 +91,15 @@ Key reasons:
 | Fence editor dialog: name + tag path required, Enter/Esc | `map.tsx:152-217`, `:833-863` |
 | Existing fences: polygon (weight 2, fill 0.15), click selects in list, draggable vertex handles with live preview, drag end → `update_fence` | `map.tsx:736-813`, `:1043-1088` |
 | Delete via `window.confirm`; Apply / Apply all → count toast + `notifyChange` | `map.tsx:873-928` |
-| Backend CRUD + `apply_fence` / `apply_all_fences`, table `map__fences`, polygon JSON `[[lat,lng],…]` | `src-tauri/src/plugins/map/mod.rs:40-160`, `:199-260`; `src-tauri/src/commands/map.rs:13-102` |
-| `point_in_polygon`: planar ray casting, boundary counts as inside | `src-tauri/src/plugins/map/mod.rs:400-445` |
+| Backend CRUD + `apply_fence` / `apply_all_fences`, table `map__fences`, polygon JSON `[[lat,lng],…]` | `crates/core/src/plugins/map/mod.rs:40-160`, `:199-260`; `src-tauri/src/commands/map.rs:13-102` |
+| `point_in_polygon`: planar ray casting, boundary counts as inside | `crates/core/src/plugins/map/mod.rs:400-445` |
 | `set_photo_gps` command exists (catalog + XMP + re-apply fences) but has **no** caller in `map.tsx`; only listed in core `api.ts` | `src-tauri/src/commands/map.rs:118-157`; `src/modules/api.ts:48` |
 
 ### Reverse geocoding (not map UI, but same module)
 
 | Feature | Where |
 |---|---|
-| Nominatim `/reverse`, endpoint setting `geocode.endpoint`, app User-Agent, global ≤1 req/s limiter, ~1 km cache table | `src-tauri/src/plugins/map/geocode.rs:24-74`, `:242-340` |
+| Nominatim `/reverse`, endpoint setting `geocode.endpoint`, app User-Agent, global ≤1 req/s limiter, ~1 km cache table | `crates/core/src/plugins/map/geocode.rs:24-74`, `:242-340` |
 | User-initiated only: inspector "Geocode location" and settings "Geocode all with GPS" with progress | `map.tsx:1125-1160`, `:1263-1311` |
 
 This is already Rust; the GPUI port only rewrites its two small UIs.

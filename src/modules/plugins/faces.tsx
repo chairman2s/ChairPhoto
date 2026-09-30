@@ -549,7 +549,7 @@ interface DraftBox {
 // and FacesInspectorPanel can reference them without a forward-declaration issue.
 
 // Host-namespaced to "faces.people_root" / "faces.match_threshold" — must match
-// PEOPLE_ROOT_SETTING / THRESHOLD_SETTING in src-tauri/src/plugins/faces/matcher.rs,
+// PEOPLE_ROOT_SETTING / THRESHOLD_SETTING in crates/core/src/plugins/faces/matcher.rs,
 // which the Rust matching engine reads.
 /**
  * Shown when the indexing terminal event cannot be subscribed to. `ChairPhotoAPI.onEvent`

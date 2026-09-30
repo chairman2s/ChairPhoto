@@ -38,15 +38,34 @@ extern "C" fn on_signal(signal: libc::c_int) {
     let fd = PIPE_WRITE.load(Ordering::SeqCst);
     if fd >= 0 {
         let byte = signal as u8;
-        // SAFETY: `write` is async-signal-safe; the buffer is one live byte. A full pipe
-        // (impossible: one byte per process lifetime reaches it) would just drop it.
-        unsafe { libc::write(fd, (&byte as *const u8).cast(), 1) };
+        // The handler interrupts arbitrary code, which may be about to read `errno`; a failed
+        // `write` here must not change it under that code's feet.
+        // SAFETY: `__errno_location` returns this thread's errno slot; reading and writing it
+        // and calling `write` (with one live byte) are async-signal-safe. A full pipe
+        // (impossible: one byte per process lifetime reaches it) would just drop the byte.
+        unsafe {
+            let errno = libc::__errno_location();
+            let saved = *errno;
+            libc::write(fd, (&byte as *const u8).cast(), 1);
+            *errno = saved;
+        }
     }
+}
+
+/// Point the handler's pipe at `fd`. For the errno test only: a closed descriptor makes the
+/// handler's `write` fail, which must leave the interrupted code's `errno` alone.
+#[doc(hidden)]
+pub fn point_pipe_at_for_test(fd: i32) {
+    PIPE_WRITE.store(fd, Ordering::SeqCst);
 }
 
 /// Install the handlers and start the watcher thread, which calls `on_quit_signal` with the
 /// signal number the first time one arrives. Once per process; a second call is an error.
-pub fn install(on_quit_signal: impl Fn(i32) + Send + 'static) -> io::Result<()> {
+///
+/// A signal this process inherited as **ignored** stays ignored: `nohup` ignores `SIGHUP`,
+/// and a shell starts background jobs with `SIGINT` ignored, both so that the program
+/// survives what that signal means there. Returns the signals actually handled.
+pub fn install(on_quit_signal: impl Fn(i32) + Send + 'static) -> io::Result<Vec<i32>> {
     if INSTALLED.swap(true, Ordering::SeqCst) {
         return Err(io::Error::other("signal handlers are already installed"));
     }
@@ -71,11 +90,21 @@ pub fn install(on_quit_signal: impl Fn(i32) + Send + 'static) -> io::Result<()> 
         }
     })?;
 
+    let mut handled = Vec::new();
     for signal in QUIT_SIGNALS {
-        // SAFETY: a zeroed sigaction is a valid starting point; the handler is an
-        // `extern "C" fn(c_int)`, as `sa_sigaction` expects without SA_SIGINFO. SA_RESTART
-        // keeps other threads' interrupted syscalls from failing with EINTR.
+        // SAFETY: a zeroed sigaction is a valid starting point and a valid out-parameter; the
+        // handler is an `extern "C" fn(c_int)`, as `sa_sigaction` expects without
+        // SA_SIGINFO. SA_RESTART keeps other threads' interrupted syscalls from failing with
+        // EINTR.
         unsafe {
+            let mut old: libc::sigaction = std::mem::zeroed();
+            if libc::sigaction(signal, std::ptr::null(), &mut old) != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if old.sa_sigaction == libc::SIG_IGN {
+                eprintln!("signals: signal {signal} was ignored when we started; leaving it ignored");
+                continue;
+            }
             let mut action: libc::sigaction = std::mem::zeroed();
             action.sa_sigaction = on_signal as extern "C" fn(libc::c_int) as libc::sighandler_t;
             action.sa_flags = libc::SA_RESTART;
@@ -84,6 +113,7 @@ pub fn install(on_quit_signal: impl Fn(i32) + Send + 'static) -> io::Result<()> 
                 return Err(io::Error::last_os_error());
             }
         }
+        handled.push(signal);
     }
-    Ok(())
+    Ok(handled)
 }

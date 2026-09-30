@@ -49,6 +49,29 @@ fn child() {
             std::thread::sleep(Duration::from_secs(5));
             println!("CHILD-SURVIVED");
         }
+        "hup-ignored" => {
+            // Started with SIGHUP ignored (the parent's pre_exec, as nohup does).
+            // SAFETY: signalling our own process.
+            assert_eq!(unsafe { libc::kill(pid, libc::SIGHUP) }, 0);
+            assert!(rx.recv_timeout(Duration::from_millis(300)).is_err(), "an ignored SIGHUP reached the callback");
+            // SIGTERM, not ignored, is still handled.
+            assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);
+            assert_eq!(rx.recv_timeout(Duration::from_secs(5)).expect("SIGTERM reached the callback"), libc::SIGTERM);
+            println!("CHILD-OK hup stayed ignored");
+        }
+        "errno" => {
+            // A closed descriptor: the handler's write fails with EBADF.
+            chairphoto_app::signals::point_pipe_at_for_test(1_000_000);
+            // SAFETY: this thread's errno slot; `raise` runs the handler on this thread
+            // before it returns.
+            unsafe {
+                *libc::__errno_location() = 4242;
+                assert_eq!(libc::raise(libc::SIGTERM), 0);
+                let after = *libc::__errno_location();
+                assert_eq!(after, 4242, "the handler changed errno to {after}");
+            }
+            println!("CHILD-OK errno preserved");
+        }
         other => panic!("unknown scenario {other}"),
     }
 }
@@ -73,4 +96,34 @@ fn a_second_signal_forces_the_exit() {
     assert!(stdout.contains("CHILD-FIRST"), "{stdout}");
     assert!(!stdout.contains("CHILD-SURVIVED"), "{stdout}");
     assert_eq!(out.status.code(), Some(128 + libc::SIGINT), "{:?}", out.status);
+}
+
+fn assert_child_ok(scenario: &str, out: std::process::Output) {
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{scenario}: {:?}\n{stdout}\n{}", out.status, String::from_utf8_lossy(&out.stderr));
+    assert!(stdout.contains("CHILD-OK"), "{scenario}: {stdout}");
+}
+
+/// A process started with SIGHUP ignored (`nohup`) keeps it ignored; the other quit signals
+/// are still handled.
+#[test]
+fn an_inherited_ignored_signal_stays_ignored() {
+    use std::os::unix::process::CommandExt as _;
+    let mut command = Command::new(std::env::current_exe().unwrap());
+    command.args(["--exact", "child", "--nocapture", "--test-threads=1"]).env(CHILD, "hup-ignored");
+    // SAFETY: `signal` is async-signal-safe, as `pre_exec` requires; SIG_IGN survives exec.
+    unsafe {
+        command.pre_exec(|| {
+            libc::signal(libc::SIGHUP, libc::SIG_IGN);
+            Ok(())
+        });
+    }
+    assert_child_ok("hup-ignored", command.output().unwrap());
+}
+
+/// The handler leaves the interrupted thread's errno as it found it, even when its own
+/// `write` fails.
+#[test]
+fn the_handler_preserves_errno() {
+    assert_child_ok("errno", run_child("errno"));
 }

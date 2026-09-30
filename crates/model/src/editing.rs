@@ -793,7 +793,15 @@ mod tests {
 
     /// The render engine parses what this crate writes. `record_engine` falls back to 1
     /// when the whole record fails to parse, so reading back 2 proves core accepted every
-    /// field — including the integer-typed `engine` and `grain.seed`.
+    /// field — including the integer-typed `engine` and `grain.seed`. Needs core's render
+    /// engine: `--features edit-parity` (see Cargo.toml for why it is opt-in).
+    #[cfg(not(feature = "edit-parity"))]
+    #[test]
+    fn core_parses_every_record_this_crate_writes() {
+        println!("SKIPPED: core_parses_every_record_this_crate_writes — needs `--features edit-parity`");
+    }
+
+    #[cfg(feature = "edit-parity")]
     #[test]
     fn core_parses_every_record_this_crate_writes() {
         use chairphoto_core::plugins::edit::{is_bw, record_engine};

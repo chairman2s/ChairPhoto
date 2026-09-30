@@ -23,7 +23,10 @@ chairphoto-core = { path = "../core", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
-[dev-dependencies]
-# The render engine's own parser (`plugins::edit::record_engine`), so the tests prove core
-# reads every record this crate writes.
-chairphoto-core = { path = "../core", default-features = false, features = ["edit"] }
+[features]
+# Test-only: builds core's render engine so a test can feed it the records this crate writes
+# (`plugins::edit::record_engine`). Opt-in, not a dev-dependency feature, because a
+# workspace build with `--no-default-features --all-targets` would then switch core's `edit`
+# on under a shell built without it, and the shell's `match` over core's `JobKey` assumes
+# the two agree. `cargo test -p chairphoto-model --features edit-parity` runs it.
+edit-parity = ["chairphoto-core/edit"]

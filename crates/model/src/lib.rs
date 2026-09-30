@@ -6,3 +6,4 @@
 //! port had to choose between JavaScript and Rust semantics.
 
 pub mod compare_duel;
+pub mod tag_paste;

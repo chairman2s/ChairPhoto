@@ -13,6 +13,8 @@ pub mod export;
 #[cfg(feature = "flickr")]
 pub mod flickr;
 pub mod image_pool;
+#[cfg(feature = "edit")]
+pub mod media;
 #[cfg(feature = "instagram")]
 pub mod instagram;
 #[cfg(feature = "localsend")]

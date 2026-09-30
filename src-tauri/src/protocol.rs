@@ -195,7 +195,7 @@ pub fn render_bytes(state: &AppState, key: JobKey) -> Result<Vec<u8>, String> {
     let (id, kind) = match key {
         JobKey::Photo { id, kind } => (id, kind),
         #[cfg(feature = "edit")]
-        JobKey::Edit(job) => return crate::commands::render_edit_bytes(state, &job),
+        JobKey::Edit(job) => return crate::media::render_edit_bytes(state, &job),
     };
     // Gather the path CANDIDATES (pure SQL) and the rotation under a brief lock, then
     // stat them OFF the lock via `pick_existing` so a slow/offline NAS can't serialize

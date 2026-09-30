@@ -67,7 +67,7 @@ impl JobKey {
 }
 
 /// One `edit://` render request, parsed by `protocol::edit_job_from_uri` and rendered by
-/// `commands::render_edit_bytes`.
+/// `media::render_edit_bytes`.
 #[cfg(feature = "edit")]
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub struct EditJob {

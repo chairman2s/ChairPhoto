@@ -318,6 +318,88 @@ fn invalidate_waits_for_a_running_render_before_requesting_again(cx: &mut TestAp
     images.update(cx, |s, _| assert_eq!(s.key(5, ImageKind::Thumb).version, 1));
 }
 
+/// Review finding 1: a render released while running (navigation moved on) and then made
+/// stale by an invalidate must still hold back the new version's request — otherwise the pool
+/// merges it into the old render and the pre-change pixels are cached under the new version.
+#[gpui_kit::test]
+fn a_released_running_render_still_blocks_the_next_version(cx: &mut TestAppContext) {
+    let (pool, images) = store(cx, 1 << 20);
+    images.update(cx, |s, _| s.request(5, ImageKind::Thumb));
+    pool.start(thumb(5));
+    images.update(cx, |s, cx| {
+        s.release_pending(|_| false); // running: cannot be cancelled
+        s.invalidate(5, cx);
+        s.request(5, ImageKind::Thumb);
+    });
+    assert_eq!(pool.submitted(), 1, "the v1 request must not merge into the running v0 render");
+
+    let old = pixels(4, 4);
+    pool.finish(&thumb(5), Ok(old.clone()));
+    cx.run_until_parked();
+    if let Some(shown) = ready(&images, 5, ImageKind::Thumb, cx) {
+        assert!(!Arc::ptr_eq(&shown.image, &old.image), "v0 pixels cached under v1");
+    }
+    assert_eq!(pool.submitted(), 2, "the v1 request goes out once the v0 render is back");
+    let new = pixels(4, 4);
+    pool.finish(&thumb(5), Ok(new.clone()));
+    cx.run_until_parked();
+    let shown = ready(&images, 5, ImageKind::Thumb, cx).expect("v1 landed");
+    assert!(Arc::ptr_eq(&shown.image, &new.image));
+}
+
+/// The same after a catalog switch: an id means another photo now, so a render started for the
+/// old catalog must never answer the new catalog's request.
+#[gpui_kit::test]
+fn a_released_running_render_still_blocks_after_a_catalog_switch(cx: &mut TestAppContext) {
+    let (pool, images) = store(cx, 1 << 20);
+    images.update(cx, |s, _| s.request(5, ImageKind::Thumb));
+    pool.start(thumb(5));
+    images.update(cx, |s, cx| {
+        s.release_pending(|_| false);
+        s.clear(cx);
+        s.request(5, ImageKind::Thumb);
+    });
+    assert_eq!(pool.submitted(), 1, "the new catalog's request must wait");
+    let old = pixels(4, 4);
+    pool.finish(&thumb(5), Ok(old.clone()));
+    cx.run_until_parked();
+    if let Some(shown) = ready(&images, 5, ImageKind::Thumb, cx) {
+        assert!(!Arc::ptr_eq(&shown.image, &old.image), "the old catalog's photo was cached");
+    }
+    assert_eq!(pool.submitted(), 2);
+}
+
+/// Review finding 2: the wait for a running old-version render ends only when *that* render
+/// answers — not on an earlier stale answer (a cancelled request's CANCELLED) still in the
+/// channel.
+#[gpui_kit::test]
+fn only_the_old_renders_own_answer_ends_the_wait(cx: &mut TestAppContext) {
+    let (pool, images) = store(cx, 1 << 20);
+    images.update(cx, |s, cx| {
+        s.request(5, ImageKind::Thumb); // g1
+        s.release_pending(|_| false); // g1 queued: cancelled, its CANCELLED answer queued
+        s.request(5, ImageKind::Thumb); // g2
+        pool.start(thumb(5)); // a worker takes g2
+        s.invalidate(5, cx); // g2 is running: v1 must wait for it
+        s.request(5, ImageKind::Thumb); // v1: deferred
+    });
+    cx.run_until_parked(); // delivers g1's CANCELLED
+    assert_eq!(pool.submitted(), 2, "g1's CANCELLED must not release the v1 request");
+
+    let old = pixels(4, 4);
+    pool.finish(&thumb(5), Ok(old.clone())); // g2, v0 pixels
+    cx.run_until_parked();
+    if let Some(shown) = ready(&images, 5, ImageKind::Thumb, cx) {
+        assert!(!Arc::ptr_eq(&shown.image, &old.image), "v0 pixels cached under v1");
+    }
+    assert_eq!(pool.submitted(), 3, "now the v1 request goes out");
+    let new = pixels(4, 4);
+    pool.finish(&thumb(5), Ok(new.clone()));
+    cx.run_until_parked();
+    let shown = ready(&images, 5, ImageKind::Thumb, cx).expect("v1 landed");
+    assert!(Arc::ptr_eq(&shown.image, &new.image));
+}
+
 #[gpui_kit::test]
 fn clear_forgets_cache_pending_and_failures(cx: &mut TestAppContext) {
     let (pool, images) = store(cx, 1 << 20);

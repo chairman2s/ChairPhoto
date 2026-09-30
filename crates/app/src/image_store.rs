@@ -24,8 +24,11 @@
 //!   cancelled there; one already rendering cannot be interrupted and is dropped on arrival.
 //! - **A render already running when its photo changes** (an invalidate, a catalog switch)
 //!   cannot be cancelled, and the pool would merge a new request for the same tier into it —
-//!   handing the old pixels to the new version. So such a tier is *draining*: new requests
-//!   for it wait until the old render has come back (and been dropped), then go out.
+//!   handing the old pixels to the new version. So the store remembers every submission it
+//!   has not heard back from (`unanswered`: generation, version, catalog epoch), whether or
+//!   not anyone still wants it. A request for a tier with an unanswered submission from an
+//!   older version or epoch waits (`deferred`), and goes out when the last such submission's
+//!   own answer arrives — not on any other answer for the tier.
 //! - **Navigation** asks for the current photo first, then N+1, then N−1 as one pool batch,
 //!   so the current photo is on top of the LIFO stack before any worker can pop
 //!   (AGENTS.md § Performance).
@@ -254,6 +257,14 @@ pub struct StoreStats {
     pub released: u64,
 }
 
+/// One submission to the pool, remembered until it answers.
+#[derive(Clone, Copy, Debug)]
+struct Submission {
+    generation: u64,
+    version: u64,
+    epoch: u64,
+}
+
 struct Done {
     key: ImageKey,
     generation: u64,
@@ -269,10 +280,13 @@ pub struct ImageStore {
     pending: HashMap<ImageKey, u64>,
     failed: HashMap<ImageKey, SharedString>,
     versions: HashMap<i64, u64>,
-    /// Tiers whose render was running when the photo changed; see the module docs.
-    draining: HashSet<(i64, ImageKind)>,
-    /// Requests that arrived while their tier was draining, sent once it has drained.
+    /// Every submission not yet answered, per tier: (generation, version, epoch). Released
+    /// or abandoned ones stay until their answer arrives; see the module docs.
+    unanswered: HashMap<(i64, ImageKind), Vec<Submission>>,
+    /// Requests held back by an outdated unanswered submission, sent once none is left.
     deferred: HashSet<(i64, ImageKind)>,
+    /// Bumped by [`clear`](Self::clear): photo ids from an older epoch are other photos.
+    epoch: u64,
     generation: u64,
     done: UnboundedSender<Done>,
     stats: StoreStats,
@@ -297,8 +311,9 @@ impl ImageStore {
             pending: HashMap::new(),
             failed: HashMap::new(),
             versions: HashMap::new(),
-            draining: HashSet::new(),
+            unanswered: HashMap::new(),
             deferred: HashSet::new(),
+            epoch: 0,
             generation: 0,
             done,
             stats: StoreStats::default(),
@@ -367,7 +382,7 @@ impl ImageStore {
             if !seen.insert(key) || self.lru.peek(&key).is_some() || self.failed.contains_key(&key) {
                 continue;
             }
-            if self.draining.contains(&(photo, kind)) {
+            if self.outdated_in_flight((photo, kind), key.version) {
                 self.deferred.insert((photo, kind));
                 continue;
             }
@@ -379,6 +394,11 @@ impl ImageStore {
             self.generation += 1;
             let generation = self.generation;
             self.pending.insert(key, generation);
+            self.unanswered.entry((photo, kind)).or_default().push(Submission {
+                generation,
+                version: key.version,
+                epoch: self.epoch,
+            });
             self.stats.submitted += 1;
             let done = self.done.clone();
             batch.push((
@@ -427,6 +447,8 @@ impl ImageStore {
 
     /// Forget everything — the catalog changed, so every photo id means something else.
     pub fn clear(&mut self, cx: &mut Context<Self>) {
+        self.epoch += 1;
+        self.deferred.clear();
         let gone = self.lru.remove_where(|_| true);
         self.release(gone, cx);
         self.abandon(|_| true);
@@ -435,26 +457,37 @@ impl ImageStore {
         cx.notify();
     }
 
-    /// Drop the pending requests `matches` selects because what they would render changed:
-    /// cancel the queued ones; a running one makes its tier drain.
+    /// Drop the pending requests `matches` selects because what they would render changed,
+    /// cancelling the queued ones. A running one stays in `unanswered` under its old version
+    /// or epoch, which holds back the next request for its tier.
     fn abandon(&mut self, mut matches: impl FnMut(&ImageKey) -> bool) {
-        let keys: Vec<ImageKey> = self.pending.keys().filter(|k| matches(k)).copied().collect();
-        for key in keys {
-            self.pending.remove(&key);
-            if !self.pool.cancel(&JobKey::photo(key.photo, key.kind)) {
-                self.draining.insert((key.photo, key.kind));
-            }
-        }
+        self.release_pending(|k| !matches(k));
+    }
+
+    /// Whether `tier` has a submission not yet answered that rendered for another version of
+    /// the photo or another catalog — one a new request must not merge into.
+    fn outdated_in_flight(&self, tier: (i64, ImageKind), version: u64) -> bool {
+        self.unanswered
+            .get(&tier)
+            .is_some_and(|subs| subs.iter().any(|s| s.version != version || s.epoch != self.epoch))
     }
 
     fn complete(&mut self, done: Done, cx: &mut Context<Self>) {
         let tier = (done.key.photo, done.key.kind);
+        // This submission is answered, whatever becomes of its result.
+        if let Some(subs) = self.unanswered.get_mut(&tier) {
+            subs.retain(|s| s.generation != done.generation);
+            if subs.is_empty() {
+                self.unanswered.remove(&tier);
+            }
+        }
+        // Retry a held-back request: `request_batch` sends it only if no outdated submission
+        // for the tier is left unanswered, and holds it back again otherwise.
+        if self.deferred.remove(&tier) {
+            self.request_batch(&[tier]);
+        }
         if self.pending.get(&done.key) != Some(&done.generation) {
             self.stats.stale_dropped += 1;
-            // The render a changed photo was waiting for is back: send what waited on it.
-            if self.draining.remove(&tier) && self.deferred.remove(&tier) {
-                self.request_batch(&[tier]);
-            }
             return;
         }
         self.pending.remove(&done.key);

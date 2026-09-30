@@ -9,6 +9,8 @@ lerna-debug.log*
 
 node_modules
 dist
+# Cargo's build output for the workspace (crates/core + src-tauri)
+/target/
 dist-ssr
 *.local
 

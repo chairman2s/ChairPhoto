@@ -5,9 +5,9 @@
 //! Skips gracefully (passes) when the sample folder isn't present, so it's safe
 //! in CI or on another machine.
 
-use chairphoto_lib::catalog::{Catalog, PhotoQuery};
-use chairphoto_lib::scanner::scan_folder;
-use chairphoto_lib::thumbnails::{preview_bytes, thumbnail_bytes};
+use chairphoto_core::catalog::{Catalog, PhotoQuery};
+use chairphoto_core::scanner::scan_folder;
+use chairphoto_core::thumbnails::{preview_bytes, thumbnail_bytes};
 use std::path::{Path, PathBuf};
 
 mod common;
@@ -27,7 +27,7 @@ fn scan_populates_metadata() {
     }
     let tmp = common::TestTmpDir::new("metadata-test");
     let catalog = Catalog::open(&tmp.join("t.chairphoto"), &root).unwrap();
-    scan_folder(&catalog, &sample, &chairphoto_lib::scanner::never_abort(), &|_| {}).unwrap();
+    scan_folder(&catalog, &sample, &chairphoto_core::scanner::never_abort(), &|_| {}).unwrap();
 
     let photos = catalog.list_photos(&PhotoQuery::default()).unwrap();
     // Find an ARW (Sony) and check its promoted + generic metadata.
@@ -114,7 +114,7 @@ fn scans_real_folder_and_extracts_raw_thumbnail() {
     let tmp = common::TestTmpDir::new("pipeline-test");
     let catalog = Catalog::open(&tmp.join("t.chairphoto"), &root).unwrap();
 
-    let result = scan_folder(&catalog, &sample, &chairphoto_lib::scanner::never_abort(), &|_| {}).unwrap();
+    let result = scan_folder(&catalog, &sample, &chairphoto_core::scanner::never_abort(), &|_| {}).unwrap();
     eprintln!(
         "scanned={} imported={} created={} errors={}",
         result.scanned, result.imported, result.created, result.errors

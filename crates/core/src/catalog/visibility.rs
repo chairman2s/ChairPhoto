@@ -46,6 +46,15 @@ mod tests {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("src")
     }
 
+    /// Every source tree whose SQL this rule governs: this crate's, and the Tauri shell's,
+    /// whose commands still carry queries of their own (split out in #95). Asserted to
+    /// exist, so moving or deleting the shell narrows the rule on purpose, not silently.
+    fn scanned_dirs() -> Vec<PathBuf> {
+        let shell = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../src-tauri/src");
+        assert!(shell.is_dir(), "the Tauri shell's source is not at {}", shell.display());
+        vec![src_dir(), shell]
+    }
+
     fn rust_files() -> Vec<PathBuf> {
         fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
             let Ok(entries) = std::fs::read_dir(dir) else { return };
@@ -59,7 +68,9 @@ mod tests {
             }
         }
         let mut out = Vec::new();
-        walk(&src_dir(), &mut out);
+        for dir in scanned_dirs() {
+            walk(&dir, &mut out);
+        }
         out.sort();
         out
     }

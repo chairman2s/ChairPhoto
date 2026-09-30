@@ -36,7 +36,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          # LibRaw is a vendored submodule (src-tauri/vendor/LibRaw), built by build.rs.
+          # LibRaw is a vendored submodule (crates/core/vendor/LibRaw), built by build.rs.
           submodules: true
 
       # ChairPhoto compiles its vendored LibRaw at build time (a C++ compiler, zlib and
@@ -51,45 +51,43 @@ jobs:
             libimage-exiftool-perl exiv2 ffmpeg imagemagick
 
       - uses: dtolnay/rust-toolchain@stable
+      # The Cargo workspace is the repository root (crates/core + src-tauri), so the default
+      # `. -> target` is the right cache key.
       - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: src-tauri
 
       # The model-dependent tests (faces) auto-skip when the ONNX models are absent,
       # so this stays offline-safe on a clean runner.
       - name: Tests
-        working-directory: src-tauri
-        run: cargo test
+        run: cargo test --workspace
 
       - name: Check (incl. test-only code)
-        working-directory: src-tauri
-        run: cargo check --all-targets
+        run: cargo check --workspace --all-targets
 
       # AI must stay optional — this is the invariant that keeps the feature gating honest.
       - name: Check without default features
-        working-directory: src-tauri
-        run: cargo check --no-default-features
+        run: cargo check --workspace --no-default-features
 
       # Single-feature checks catch hidden coupling between optional backends. Cargo's default
-      # and all-feature builds can both pass while `--features smarttags` alone fails.
+      # and all-feature builds can both pass while `--features smarttags` alone fails. Both
+      # packages: the shell's check builds the core only as a library, not its test targets.
       - name: Check individual backend features
-        working-directory: src-tauri
         env:
           RUSTFLAGS: "-D warnings"
         run: |
           for feature in ai edit raw instagram collage slideshow localsend map faces smarttags flickr smugmug; do
-            echo "::group::cargo check --no-default-features --features ${feature} --all-targets"
-            cargo check --no-default-features --features "${feature}" --all-targets
-            echo "::endgroup::"
+            for pkg in chairphoto-core chairphoto; do
+              echo "::group::cargo check -p ${pkg} --no-default-features --features ${feature} --all-targets"
+              cargo check -p "${pkg}" --no-default-features --features "${feature}" --all-targets
+              echo "::endgroup::"
+            done
           done
 
       # The tree is rustc-warning-clean and should stay that way.
       - name: Deny rustc warnings
-        working-directory: src-tauri
         env:
           RUSTFLAGS: "-D warnings"
-        run: cargo check --all-targets
+        run: cargo check --workspace --all-targets
 
 # Note: the `faces-cuda` / `smarttags-cuda` features are deliberately not built here —
 # they require an NVIDIA toolchain no standard runner has. Verify those locally with
-# `cargo check --all-features --all-targets`.
+# `cargo check --workspace --all-features --all-targets`.

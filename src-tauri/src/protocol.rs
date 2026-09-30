@@ -14,17 +14,10 @@ use crate::catalog::ResolveMode;
 use crate::app::AppState;
 #[cfg(feature = "edit")]
 use crate::image_pool::EditJob;
-use crate::image_pool::{ImagePool, JobKey};
+use crate::image_pool::{ImageKind, ImagePool, JobKey};
 use crate::thumbnails::{preview_bytes, thumbnail_bytes, zoom_bytes};
 use tauri::http::{Request, Response};
 use tauri::{Manager, Runtime, UriSchemeContext, UriSchemeResponder};
-
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub enum ImageKind {
-    Thumb,
-    Preview,
-    Zoom,
-}
 
 /// Handle one `thumb://`/`preview://` request.
 ///

@@ -121,7 +121,25 @@ pub use tags::*;
 /// The Tauri shell's [`EventSink`]: each [`CoreEvent`] becomes the webview event of the
 /// same name, with its payload serialized as its own type (so the wire format is exactly
 /// what the frontend's listeners were written against).
-impl<R: tauri::Runtime> EventSink for tauri::AppHandle<R> {
+///
+/// A newtype rather than an impl on `AppHandle` itself: `EventSink` is the core crate's
+/// trait and `AppHandle` is Tauri's type, so the orphan rule needs a local type between them.
+pub struct WebviewEvents<R: tauri::Runtime>(pub tauri::AppHandle<R>);
+
+impl<R: tauri::Runtime> EventSink for WebviewEvents<R> {
+    fn send(&self, event: CoreEvent) {
+        SendCoreEvent::send(&self.0, event);
+    }
+}
+
+/// `app.send(CoreEvent::…)` for the commands that hold an `AppHandle` — the same emission as
+/// [`WebviewEvents`], as a shell-local trait because the core's `EventSink` cannot be
+/// implemented on Tauri's type from this crate (the orphan rule).
+pub trait SendCoreEvent {
+    fn send(&self, event: CoreEvent);
+}
+
+impl<R: tauri::Runtime> SendCoreEvent for tauri::AppHandle<R> {
     fn send(&self, event: CoreEvent) {
         struct Emit<'a, R: tauri::Runtime>(&'a tauri::AppHandle<R>);
         impl<R: tauri::Runtime> crate::app::events::EventVisitor for Emit<'_, R> {
@@ -132,6 +150,13 @@ impl<R: tauri::Runtime> EventSink for tauri::AppHandle<R> {
         event.visit(&Emit(self));
     }
 }
+
+// The env-var lock the command tests share (`use super::test_env_helpers::EnvGuard`). It is
+// the core's file, compiled once more into this crate's test binary: `#[cfg(test)]` items do
+// not cross crates, and this binary is its own process, so it needs its own lock anyway.
+#[cfg(test)]
+#[path = "../../../crates/core/src/app/test_env_helpers.rs"]
+pub(crate) mod test_env_helpers;
 
 #[cfg(test)]
 mod thread_rules {

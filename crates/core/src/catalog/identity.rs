@@ -1442,13 +1442,13 @@ mod tests {
     use super::*;
 
     /// A test's own temp directory, keyed by pid + tag and removed on drop — mirrors
-    /// `thumbnails::tests::TestTmpDir` (see `src-tauri/src/thumbnails/mod.rs`).
+    /// `thumbnails::tests::TestTmpDir` (see `crates/core/src/thumbnails/mod.rs`).
     ///
     /// This file previously keyed on `tag` alone (`chairphoto-identity-test-{tag}`),
     /// which every `cargo test` process on the machine shares; `remove_dir_all` on entry
     /// then deletes a directory another process is still writing into, and nothing
     /// cleans up after a panicking test either. That is the same bug #45 / commit
-    /// 9cd6d83 fixed for the thumbnail tests. `src-tauri/src/test_support.rs` on the
+    /// 9cd6d83 fixed for the thumbnail tests. `crates/core/src/test_support.rs` on the
     /// #45 branch adds a shared
     /// `TestTmpDir` with this same shape but is not merged yet; this is a local copy in
     /// the same shape so the two converge trivially once it lands — collapse this into

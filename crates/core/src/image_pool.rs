@@ -38,7 +38,15 @@ use std::collections::HashMap;
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::{Arc, Condvar, Mutex};
 
-use crate::protocol::ImageKind;
+/// Which cached tier of a photo a job renders — the `thumb://`, `preview://` and `zoom://`
+/// protocols in the Tauri shell each map to one. Lives here, beside the key that carries it,
+/// so the pool needs nothing from a front end.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum ImageKind {
+    Thumb,
+    Preview,
+    Zoom,
+}
 
 /// Key identifying a unique image job. A photo tier is `(photo_id, kind)`; an edit render
 /// (the `edit://` protocol, `edit` feature) carries its whole request, so two identical

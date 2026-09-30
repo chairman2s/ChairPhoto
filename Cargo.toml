@@ -1,0 +1,27 @@
+# The Rust half of ChairPhoto is two crates (issue #95):
+#
+# - `crates/core` (`chairphoto-core`) — catalog, import, XMP, decode, jobs, plugins' backends:
+#   everything the app *does*. It has no Tauri dependency, so a second front end (the GPUI
+#   app, docs/plans/gpui) can link it directly.
+# - `src-tauri` (`chairphoto`) — the Tauri shell: `run()`, the command surface in
+#   `commands/`, the `thumb://`/`preview://`/`zoom://`/`edit://` protocols and the Tauri
+#   plugins. It forwards every feature to the core crate under the same name.
+#
+# The workspace root is the repository root rather than `src-tauri/` so the core crate is not
+# anchored under the directory the GPUI cutover deletes. Build output is therefore `target/`
+# here, not `src-tauri/target/`.
+[workspace]
+members = ["crates/core", "src-tauri"]
+resolver = "2"
+
+# Optimize image-decoding crates even in dev builds. Our own code stays in debug
+# (fast incremental builds), but decoding a 66 MP embedded RAW preview is ~20x
+# slower unoptimized — this brings debug-mode decode close to release speed.
+# These dependencies compile once, so the hit to iteration time is negligible.
+# (Profiles are read from the workspace root only.)
+[profile.dev.package.image]
+opt-level = 3
+[profile.dev.package.zune-jpeg]
+opt-level = 3
+[profile.dev.package.zune-core]
+opt-level = 3

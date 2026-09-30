@@ -349,9 +349,15 @@ mod tests {
     fn ort_sessions_are_only_built_through_this_module() {
         let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let facade = src.join("plugins").join("onnx.rs");
+        // The Tauri shell (a separate crate since #95) links ort through this crate too, so
+        // its source is held to the same rule. Asserted to exist so that moving or deleting
+        // it narrows the scan on purpose, not silently.
+        let shell = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../src-tauri/src");
+        assert!(shell.is_dir(), "the Tauri shell's source is not at {}", shell.display());
 
-        let offenders: Vec<String> = walkdir::WalkDir::new(&src)
-            .into_iter()
+        let offenders: Vec<String> = [src.clone(), shell]
+            .iter()
+            .flat_map(walkdir::WalkDir::new)
             .filter_map(Result::ok)
             .filter(|e| e.file_type().is_file())
             .filter(|e| e.path().extension().is_some_and(|x| x == "rs"))

@@ -476,7 +476,10 @@ impl Catalog {
 
     /// Raw connection for in-crate plugins that own their own prefix-named tables
     /// (e.g. `ai__suggestions`). Core defines no plugin tables; see docs/plugin-system.md.
-    pub(crate) fn conn(&self) -> &rusqlite::Connection {
+    ///
+    /// `pub` because the Tauri shell's commands, a separate crate since #95, query through it
+    /// as they did when both were one crate; it is not an invitation for new front-end SQL.
+    pub fn conn(&self) -> &rusqlite::Connection {
         &self.conn
     }
 

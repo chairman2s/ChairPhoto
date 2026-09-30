@@ -13,7 +13,7 @@ license=('GPL-3.0-only' 'LGPL-2.1-only')
 # the moment that intermediate package drops it. Regenerate after changing linked libraries:
 #   readelf -d usr/bin/chairphoto | grep NEEDED   ->   pacman -Qoq /usr/lib/<soname>
 #
-#   (LibRaw is vendored — src-tauri/vendor/LibRaw, compiled into the binary by build.rs — so it
+#   (LibRaw is vendored — crates/core/vendor/LibRaw, compiled into the binary by build.rs — so it
 #   is a second source tarball below, not a depends entry.)
 #   hicolor-icon-theme  owns the /usr/share/icons/hicolor directories this package installs into.
 #
@@ -33,7 +33,7 @@ depends=(
   'webkit2gtk-4.1'
 )
 
-# clang is for the LibRaw bindgen step in src-tauri/build.rs, which reads the vendored header
+# clang is for the LibRaw bindgen step in crates/core/build.rs, which reads the vendored header
 # so the struct ABI matches the compiled library exactly; the C++ compiler builds LibRaw itself.
 makedepends=(
   'cargo'
@@ -66,7 +66,7 @@ options=(!lto)
 
 # The vendored LibRaw is a git submodule, which a release tarball does not contain; fetch
 # the pinned snapshot as its own tarball and place it in prepare(). Keep `_libraw_commit` in
-# step with `git -C src-tauri/vendor/LibRaw rev-parse HEAD` at the tagged release.
+# step with `git -C crates/core/vendor/LibRaw rev-parse HEAD` at the tagged release.
 _libraw_commit=dde798dd
 source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz"
         "libraw-$_libraw_commit.tar.gz::https://github.com/LibRaw/LibRaw/archive/$_libraw_commit.tar.gz"
@@ -80,14 +80,14 @@ prepare() {
   cd "ChairPhoto-$pkgver"
 
   # Drop the (empty) submodule directory from the tarball and put the pinned snapshot there.
-  rm -rf src-tauri/vendor/LibRaw
-  cp -r "$srcdir/LibRaw-$_libraw_commit"* src-tauri/vendor/LibRaw
+  rm -rf crates/core/vendor/LibRaw
+  cp -r "$srcdir/LibRaw-$_libraw_commit"* crates/core/vendor/LibRaw
 
   # Both fetches need network, and are kept here so build() can run entirely offline.
   # --locked pins the Cargo.lock versions; --target limits the fetch to this host.
   export RUSTUP_TOOLCHAIN=stable
   npm ci
-  cargo fetch --locked --manifest-path src-tauri/Cargo.toml \
+  cargo fetch --locked --manifest-path Cargo.toml \
     --target "$(rustc -vV | sed -n 's/host: //p')"
 }
 
@@ -95,7 +95,9 @@ build() {
   cd "ChairPhoto-$pkgver"
 
   export RUSTUP_TOOLCHAIN=stable
-  export CARGO_TARGET_DIR=target
+  # Absolute, so the output is the workspace root's target/ (which check() and package() read)
+  # whichever directory the Tauri CLI runs cargo from; a relative path resolves against that.
+  export CARGO_TARGET_DIR="$PWD/target"
   # Equivalent to cargo's --frozen, which cannot be passed through the Tauri CLI: the build
   # may only use what prepare() already fetched, so dependency resolution cannot drift.
   export CARGO_NET_OFFLINE=true
@@ -125,9 +127,9 @@ check() {
   # readelf, not ldd: ldd prints the whole resolved closure, so it would also fire on a
   # dependency that pulled ONNX Runtime in transitively — a binary this recipe has no quarrel
   # with. NEEDED is the invariant, so read NEEDED.
-  if readelf -d "src-tauri/target/release/$pkgname" | grep NEEDED | grep -q 'libonnxruntime'; then
+  if readelf -d "target/release/$pkgname" | grep NEEDED | grep -q 'libonnxruntime'; then
     echo "==> ERROR: the binary links libonnxruntime; it must dlopen it instead." >&2
-    echo "    Check that the ort dependency in src-tauri/Cargo.toml still sets" >&2
+    echo "    Check that the ort dependency in crates/core/Cargo.toml still sets" >&2
     echo "    default-features = false with the \`load-dynamic\` feature." >&2
     return 1
   fi
@@ -158,7 +160,7 @@ check() {
   # what prepare() already fetched.
   echo "==> Checking the dynamic ONNX Runtime path (present and absent)..."
   export RUSTUP_TOOLCHAIN=stable
-  cargo test --locked --offline --manifest-path src-tauri/Cargo.toml \
+  cargo test --locked --offline -p chairphoto-core \
     --features flickr,smugmug --lib -- --nocapture \
     plugins::onnx::tests::missing_runtime_reports_an_error \
     plugins::onnx::tests::probe_accepts_an_installed_runtime \
@@ -168,14 +170,14 @@ check() {
 package() {
   cd "ChairPhoto-$pkgver"
 
-  install -Dm755 "src-tauri/target/release/$pkgname" "$pkgdir/usr/bin/$pkgname"
+  install -Dm755 "target/release/$pkgname" "$pkgdir/usr/bin/$pkgname"
   install -Dm644 "$srcdir/$pkgname.desktop" "$pkgdir/usr/share/applications/$pkgname.desktop"
   install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
   # The vendored LibRaw is compiled in under its LGPL-2.1 option (MODULE_LICENSING.md).
-  install -Dm644 src-tauri/vendor/LibRaw/COPYRIGHT "$pkgdir/usr/share/licenses/$pkgname/LibRaw-COPYRIGHT"
-  install -Dm644 src-tauri/vendor/LibRaw/LICENSE.LGPL "$pkgdir/usr/share/licenses/$pkgname/LibRaw-LICENSE.LGPL"
+  install -Dm644 crates/core/vendor/LibRaw/COPYRIGHT "$pkgdir/usr/share/licenses/$pkgname/LibRaw-COPYRIGHT"
+  install -Dm644 crates/core/vendor/LibRaw/LICENSE.LGPL "$pkgdir/usr/share/licenses/$pkgname/LibRaw-LICENSE.LGPL"
   # The lens-correction reader is ported from RAWmakase, MIT (MODULE_LICENSING.md).
-  install -Dm644 src-tauri/src/lens/LICENSE-RAWmakase "$pkgdir/usr/share/licenses/$pkgname/RAWmakase-LICENSE"
+  install -Dm644 crates/core/src/lens/LICENSE-RAWmakase "$pkgdir/usr/share/licenses/$pkgname/RAWmakase-LICENSE"
 
   install -Dm644 "src-tauri/icons/32x32.png" \
     "$pkgdir/usr/share/icons/hicolor/32x32/apps/$pkgname.png"

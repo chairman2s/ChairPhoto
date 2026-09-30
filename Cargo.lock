@@ -701,6 +701,28 @@ name = "chairphoto"
 version = "2026.8.0"
 dependencies = [
  "base64 0.22.1",
+ "chairphoto-core",
+ "chrono",
+ "image",
+ "reqwest 0.12.28",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tauri",
+ "tauri-build",
+ "tauri-plugin-deep-link",
+ "tauri-plugin-dialog",
+ "tauri-plugin-opener",
+ "tauri-plugin-single-instance",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
+name = "chairphoto-core"
+version = "0.0.0"
+dependencies = [
+ "base64 0.22.1",
  "bindgen",
  "cc",
  "chromiumoxide",
@@ -722,12 +744,6 @@ dependencies = [
  "sha1",
  "sha2",
  "socket2",
- "tauri",
- "tauri-build",
- "tauri-plugin-deep-link",
- "tauri-plugin-dialog",
- "tauri-plugin-opener",
- "tauri-plugin-single-instance",
  "thiserror 2.0.18",
  "tokio",
  "toml 1.1.2+spec-1.1.0",

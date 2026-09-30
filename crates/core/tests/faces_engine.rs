@@ -13,7 +13,7 @@
 
 #![cfg(feature = "faces")]
 
-use chairphoto_lib::plugins::faces::{self, engine};
+use chairphoto_core::plugins::faces::{self, engine};
 
 /// Ensure the models *and* the ONNX Runtime are available, or return `false` (with a skip
 /// message) when they are not and downloading was not opted into.
@@ -23,7 +23,7 @@ use chairphoto_lib::plugins::faces::{self, engine};
 /// same way absent models already do — the runtime's own failure path is covered by the unit
 /// tests in `plugins::onnx`, which need no runtime to assert against.
 fn models_ready_or_skip(what: &str) -> bool {
-    if let Err(e) = chairphoto_lib::plugins::onnx::ensure_available() {
+    if let Err(e) = chairphoto_core::plugins::onnx::ensure_available() {
         eprintln!("SKIPPED: {what} — no usable ONNX Runtime ({e})");
         return false;
     }

@@ -5,8 +5,8 @@
 //! store is initialised here and nowhere else.
 #![cfg(feature = "raw")]
 
-use chairphoto_lib::crash_marker::{self, Markers, BLOCK_AFTER};
-use chairphoto_lib::raw;
+use chairphoto_core::crash_marker::{self, Markers, BLOCK_AFTER};
+use chairphoto_core::raw;
 use std::sync::atomic::AtomicBool;
 
 #[test]

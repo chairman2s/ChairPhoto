@@ -240,37 +240,12 @@ pub async fn with_catalog_blocking<T: Send + 'static>(
 //   • Use `test_env_helpers::EnvGuard::set(key, value)` — do NOT declare a
 //     separate `static ENV_LOCK` inside individual test modules; separate statics
 //     are independent instances and provide no cross-module exclusion.
+//
+// The module lives in its own file so the Tauri shell's command tests can compile the same
+// helper into their own test binary (`#[cfg(test)]` items are invisible across crates, and a
+// separate process needs its own lock anyway).
 #[cfg(test)]
-pub(crate) mod test_env_helpers {
-    use std::sync::Mutex;
-
-    /// Process-wide lock for env-var mutations. **One static for the whole crate.**
-    pub static ENV_LOCK: Mutex<()> = Mutex::new(());
-
-    pub struct EnvGuard {
-        pub key: &'static str,
-        pub original: Option<std::ffi::OsString>,
-        pub _lock: std::sync::MutexGuard<'static, ()>,
-    }
-
-    impl EnvGuard {
-        pub fn set(key: &'static str, value: &str) -> Self {
-            let lock = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-            let original = std::env::var_os(key);
-            std::env::set_var(key, value);
-            EnvGuard { key, original, _lock: lock }
-        }
-    }
-
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            match &self.original {
-                Some(v) => std::env::set_var(self.key, v),
-                None => std::env::remove_var(self.key),
-            }
-        }
-    }
-}
+pub(crate) mod test_env_helpers;
 
 /// The app's data dir (`$XDG_DATA_HOME/chairphoto` or `~/.local/share/chairphoto`) —
 /// home of the default catalog DB and the user's LUT folder.

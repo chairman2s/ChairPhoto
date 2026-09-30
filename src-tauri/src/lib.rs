@@ -1,56 +1,26 @@
-pub mod appearance;
-pub mod bundle;
-pub mod burst;
-pub mod companions;
-pub mod crash_marker;
-pub mod catalog;
-#[cfg(feature = "collage")]
-pub mod collage;
-pub mod app;
+//! The Tauri shell: [`run`] builds the app, registers the command surface (`commands/`), the
+//! native media protocols (`protocol.rs`) and the Tauri plugins, and wires the core's services
+//! to the webview.
+//!
+//! Everything else lives in `chairphoto-core` (`crates/core`), re-exported here at the crate
+//! root so `crate::catalog`, `crate::app` and the rest resolve in the shell exactly as they did
+//! when both halves were one crate (issue #95). The core has no Tauri dependency; the shell
+//! adds only what the webview needs.
+
+pub use chairphoto_core::*;
+
 mod commands;
-mod external_edit;
-pub mod export;
-#[cfg(feature = "flickr")]
-pub mod flickr;
-pub mod image_pool;
-#[cfg(feature = "edit")]
-pub mod media;
-#[cfg(feature = "instagram")]
-pub mod instagram;
-#[cfg(feature = "localsend")]
-pub mod localsend;
-pub mod metadata;
-#[cfg(any(feature = "flickr", feature = "smugmug"))]
-pub mod oauth1;
-pub mod phash;
-pub mod phash_indexer;
-pub mod plugins;
 mod protocol;
-#[cfg(feature = "raw")]
-pub mod lens;
-#[cfg(feature = "raw")]
-pub mod raw;
-#[cfg(all(feature = "raw", feature = "edit"))]
-pub mod develop;
-pub mod develop_source;
-#[cfg(feature = "smugmug")]
-pub mod smugmug;
-pub mod rapidraw;
-pub mod scanner;
-pub mod sharpness;
-pub mod sharpness_indexer;
-pub mod sharpness_regions;
-#[cfg(feature = "slideshow")]
-pub mod slideshow;
+// The commands' unit tests use the same temp-dir fixture as the core's. `#[cfg(test)]` items
+// are invisible across crates, so the shell compiles the core's file into itself rather than
+// keeping a third copy (see that file's module docs for the other one, `tests/common`).
 #[cfg(test)]
+#[path = "../../crates/core/src/test_support.rs"]
 mod test_support;
-pub mod thumbnails;
-pub mod volume_health;
-pub mod xmp;
 
 use commands::AppState;
-use image_pool::ImagePool;
-use protocol::{handle_image_request, ImageKind};
+use image_pool::{ImageKind, ImagePool};
+use protocol::handle_image_request;
 use tauri::Manager;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -109,7 +79,7 @@ pub fn run() {
             // Every event the backend sends goes to the webview (commands' `EventSink`).
             // First, so nothing started below can send into the void.
             let state = app.state::<AppState>().inner().clone();
-            state.set_events(std::sync::Arc::new(app.handle().clone()));
+            state.set_events(std::sync::Arc::new(commands::WebviewEvents(app.handle().clone())));
             // Before anything can call into LibRaw (or, one day, a GPU driver): turn the
             // previous run's leftover crash markers into strikes (src/crash_marker.rs).
             match commands::app_data_dir() {

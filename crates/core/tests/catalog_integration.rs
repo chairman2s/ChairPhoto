@@ -2,7 +2,7 @@
 //! invariants from AGENTS.md: UUID assignment, relative-path storage,
 //! hierarchical tags, and culling.
 
-use chairphoto_lib::catalog::{
+use chairphoto_core::catalog::{
     Catalog, CullingFilter, LocationRole, PhotoQuery, PhotoSort, PhotoWindow, PickState,
     SafetyStatus, StorageStatus, StorageTier, VolumeKind,
 };
@@ -14,7 +14,7 @@ fn set_mtime_ahead(path: &std::path::Path, secs: u64) {
     f.set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(secs))
         .unwrap();
 }
-use chairphoto_lib::catalog::PathCandidate;
+use chairphoto_core::catalog::PathCandidate;
 use std::path::PathBuf;
 
 mod common;
@@ -96,7 +96,7 @@ fn remove_photo_forgets_row_and_cascades_but_keeps_no_file_logic() {
 
 #[test]
 fn offload_policy_selects_old_backed_up_photos_only() {
-    use chairphoto_lib::catalog::PromotedMetadata;
+    use chairphoto_core::catalog::PromotedMetadata;
     let (catalog, root) = temp_catalog("offload-policy");
     let nas_dir = root.parent().unwrap().join("nas-policy");
     std::fs::create_dir_all(&nas_dir).unwrap();
@@ -146,7 +146,7 @@ fn scan_external_indexes_nas_photos_in_place() {
     let photo = nas_dir.join("1998/old.jpg");
     std::fs::write(&photo, b"oldphoto").unwrap();
 
-    let res = chairphoto_lib::scanner::scan_external_folder(&catalog, &nas_dir, &chairphoto_lib::scanner::never_abort(), &|_| {}).unwrap();
+    let res = chairphoto_core::scanner::scan_external_folder(&catalog, &nas_dir, &chairphoto_core::scanner::never_abort(), &|_| {}).unwrap();
     assert_eq!(res.created, 1, "the NAS photo is indexed");
 
     // It's catalogued as NAS-only: shows under the "nas" tier, resolves to the NAS file,
@@ -167,7 +167,7 @@ fn scan_external_indexes_nas_photos_in_place() {
     );
 
     // Re-scan is idempotent — matched by location, no duplicate row.
-    chairphoto_lib::scanner::scan_external_folder(&catalog, &nas_dir, &chairphoto_lib::scanner::never_abort(), &|_| {}).unwrap();
+    chairphoto_core::scanner::scan_external_folder(&catalog, &nas_dir, &chairphoto_core::scanner::never_abort(), &|_| {}).unwrap();
     assert_eq!(
         catalog.list_photos(&PhotoQuery::default()).unwrap().len(),
         1
@@ -260,7 +260,7 @@ fn list_photos_filters_by_storage_tier() {
 
 #[test]
 fn backup_is_idempotent_and_copy_never_clobbers_existing() {
-    use chairphoto_lib::catalog::copy_and_verify;
+    use chairphoto_core::catalog::copy_and_verify;
     let (catalog, root) = temp_catalog("backup-safety");
     let nas_dir = root.parent().unwrap().join("nas-safety");
     std::fs::create_dir_all(&nas_dir).unwrap();
@@ -559,7 +559,7 @@ fn non_exportable_tag_is_dropped_but_descendants_export() {
 
 #[test]
 fn export_handoff_copies_original_and_sidecar_and_skips_offline() {
-    use chairphoto_lib::export::{resolve_originals, write_exports, ExportPreset};
+    use chairphoto_core::export::{resolve_originals, write_exports, ExportPreset};
     let (catalog, root) = temp_catalog("export");
 
     // A photo with a real file on disk + an existing (well-formed) XMP sidecar that
@@ -657,7 +657,7 @@ fn import_batches_assign_and_filter() {
 
 #[test]
 fn ingest_from_card_copies_into_date_tree_and_indexes() {
-    use chairphoto_lib::scanner::ingest_from_card;
+    use chairphoto_core::scanner::ingest_from_card;
     let (catalog, root) = temp_catalog("ingest");
 
     // A "card" outside the catalog root with two raster images (no EXIF date → mtime).
@@ -1043,7 +1043,7 @@ fn an_uncarried_local_companion_is_stale_not_safe() {
     // idempotent, so nothing is re-copied for the image.
     let plan_source = raw.clone();
     let plan_dest = nas_dir.join("DSC1.ARW");
-    let carried = chairphoto_lib::catalog::carry_companions(&plan_source, &plan_dest).unwrap();
+    let carried = chairphoto_core::catalog::carry_companions(&plan_source, &plan_dest).unwrap();
     catalog
         .record_companions_at(id, nas, LocationRole::Backup, &carried.carried)
         .unwrap();
@@ -1535,7 +1535,7 @@ fn reconcile_missing_hides_orphans_but_spares_offline_backups() {
 #[test]
 fn scan_reconciles_the_scanned_folder_and_leaves_the_rest_of_the_catalog_alone() {
     let (catalog, root) = temp_catalog("scan-scope-reconcile");
-    let abort = chairphoto_lib::scanner::never_abort();
+    let abort = chairphoto_core::scanner::never_abort();
     let trip = root.join("trip");
     let other = root.join("other");
     std::fs::create_dir_all(&trip).unwrap();
@@ -1545,7 +1545,7 @@ fn scan_reconciles_the_scanned_folder_and_leaves_the_rest_of_the_catalog_alone()
     std::fs::write(&in_scope, b"x").unwrap();
     std::fs::write(&out_of_scope, b"x").unwrap();
 
-    chairphoto_lib::scanner::scan_folder(&catalog, &root, &abort, &|_| {}).unwrap();
+    chairphoto_core::scanner::scan_folder(&catalog, &root, &abort, &|_| {}).unwrap();
     let visible = |catalog: &Catalog| -> Vec<String> {
         catalog
             .list_photos(&PhotoQuery::default())
@@ -1559,7 +1559,7 @@ fn scan_reconciles_the_scanned_folder_and_leaves_the_rest_of_the_catalog_alone()
     // Both files disappear, but only `trip` is re-scanned.
     std::fs::remove_file(&in_scope).unwrap();
     std::fs::remove_file(&out_of_scope).unwrap();
-    chairphoto_lib::scanner::scan_folder(&catalog, &trip, &abort, &|_| {}).unwrap();
+    chairphoto_core::scanner::scan_folder(&catalog, &trip, &abort, &|_| {}).unwrap();
 
     let after = visible(&catalog);
     assert!(
@@ -1572,7 +1572,7 @@ fn scan_reconciles_the_scanned_folder_and_leaves_the_rest_of_the_catalog_alone()
     );
 
     // Scanning the parent covers both, so nothing is permanently stranded.
-    chairphoto_lib::scanner::scan_folder(&catalog, &root, &abort, &|_| {}).unwrap();
+    chairphoto_core::scanner::scan_folder(&catalog, &root, &abort, &|_| {}).unwrap();
     assert!(visible(&catalog).is_empty());
 }
 
@@ -1582,7 +1582,7 @@ fn scan_reconciles_the_scanned_folder_and_leaves_the_rest_of_the_catalog_alone()
 #[test]
 fn scan_reconciliation_spares_an_offline_nas_photo_in_scope() {
     let (catalog, root) = temp_catalog("scan-scope-offline-nas");
-    let abort = chairphoto_lib::scanner::never_abort();
+    let abort = chairphoto_core::scanner::never_abort();
     let archived = root.join("trip/archived.jpg");
     std::fs::create_dir_all(archived.parent().unwrap()).unwrap();
     std::fs::write(&archived, b"x").unwrap();
@@ -1601,7 +1601,7 @@ fn scan_reconciliation_spares_an_offline_nas_photo_in_scope() {
         .add_location(id, nas, "trip/archived.jpg", LocationRole::Backup)
         .unwrap();
 
-    chairphoto_lib::scanner::scan_folder(&catalog, &root.join("trip"), &abort, &|_| {}).unwrap();
+    chairphoto_core::scanner::scan_folder(&catalog, &root.join("trip"), &abort, &|_| {}).unwrap();
 
     let visible: Vec<i64> = catalog
         .list_photos(&PhotoQuery::default())
@@ -1719,7 +1719,7 @@ fn version_history_records_steps_and_steps_back() {
     let v = catalog.create_version(photo, "Version 1").unwrap();
     catalog.set_version_edit(v, r#"{"tone":{"ev":0.1}}"#).unwrap();
     let edit = |v: i64| catalog.get_version(v).unwrap().unwrap().edit_json;
-    let labels = |h: &chairphoto_lib::catalog::VersionHistory| h.steps.iter().map(|s| s.label.clone()).collect::<Vec<_>>();
+    let labels = |h: &chairphoto_core::catalog::VersionHistory| h.steps.iter().map(|s| s.label.clone()).collect::<Vec<_>>();
 
     // No history until the first commit.
     let h = catalog.version_history(v).unwrap();
@@ -1838,7 +1838,7 @@ fn version_history_keeps_at_most_the_cap() {
     std::fs::write(&path, b"x").unwrap();
     let photo = catalog.upsert_photo(&path, None, 1, 1).unwrap().id;
     let v = catalog.create_version(photo, "V").unwrap();
-    let cap = chairphoto_lib::catalog::HISTORY_CAP;
+    let cap = chairphoto_core::catalog::HISTORY_CAP;
     for i in 0..(cap + 25) {
         catalog.commit_version_edit(v, &format!(r#"{{"fade":{}}}"#, i as f64 / 1000.0 + 0.001), &format!("step {i}"), false).unwrap();
     }
@@ -1975,7 +1975,7 @@ fn delete_tag_removes_subtree_and_assignments() {
 
 #[test]
 fn iptc_round_trips() {
-    use chairphoto_lib::catalog::IptcFields;
+    use chairphoto_core::catalog::IptcFields;
     let (catalog, root) = temp_catalog("iptc");
     let id = catalog
         .upsert_photo(&root.join("a.jpg"), None, 1, 1)
@@ -2215,7 +2215,7 @@ fn albums_membership_and_composition_with_culling() {
 
 #[test]
 fn facets_filter_by_derived_exif() {
-    use chairphoto_lib::catalog::PromotedMetadata;
+    use chairphoto_core::catalog::PromotedMetadata;
     let (catalog, root) = temp_catalog("facets");
 
     let set = |id: i64, make: Option<&str>, model: Option<&str>, gps: bool| {
@@ -2279,7 +2279,7 @@ fn soft_facet_and_sharpness_sort() {
     // H16d: the `soft` facet fires when sharpness IS NOT NULL AND sharpness < threshold;
     // sort-by-sharpness_asc puts least-sharp first (unscored last); sharpness is surfaced
     // on the Photo struct.
-    use chairphoto_lib::catalog::SOFT_THRESHOLD_DEFAULT;
+    use chairphoto_core::catalog::SOFT_THRESHOLD_DEFAULT;
 
     let (catalog, root) = temp_catalog("soft-facet");
 
@@ -2345,7 +2345,7 @@ fn soft_facet_and_sharpness_sort() {
 /// capture time, and one pair of names that differ only in case (so they also tie under
 /// `path COLLATE NOCASE`). Returns the catalog and the ids in creation order.
 fn catalog_of_tied_photos(tag: &str, count: usize) -> (Catalog, common::TestSubPath, Vec<i64>) {
-    use chairphoto_lib::catalog::PromotedMetadata;
+    use chairphoto_core::catalog::PromotedMetadata;
     let (catalog, root) = temp_catalog(tag);
     let mut ids = Vec::new();
     for i in 0..count {
@@ -2601,7 +2601,7 @@ fn external_editors_drive_the_edited_filter() {
 
 #[test]
 fn long_exposure_auto_tag_applies_from_shutter() {
-    use chairphoto_lib::catalog::PromotedMetadata;
+    use chairphoto_core::catalog::PromotedMetadata;
     let (catalog, root) = temp_catalog("autotag-longexp");
 
     let set_shutter = |id: i64, shutter: &str| {
@@ -2651,7 +2651,7 @@ fn long_exposure_auto_tag_applies_from_shutter() {
 
 #[test]
 fn panorama_auto_tag_applies_from_aspect_ratio() {
-    use chairphoto_lib::catalog::PromotedMetadata;
+    use chairphoto_core::catalog::PromotedMetadata;
     let (catalog, root) = temp_catalog("autotag-pano");
 
     let set_dims = |id: i64, w: i64, h: i64| {
@@ -2866,7 +2866,7 @@ fn smart_album_color_label_matches_stored_casing() {
 
 #[test]
 fn smart_album_combines_conditions_from_many_groups() {
-    use chairphoto_lib::catalog::PromotedMetadata;
+    use chairphoto_core::catalog::PromotedMetadata;
     let (catalog, root) = temp_catalog("smart-albums-multi");
 
     // Build a small library where each photo differs on exactly one group's axis,
@@ -2976,8 +2976,8 @@ fn smart_album_combines_conditions_from_many_groups() {
 /// Returns (catalog_a, root_a, photo1_uuid, photo2_uuid, batch_id).
 fn setup_catalog_a(
     tag: &str,
-) -> (chairphoto_lib::catalog::Catalog, common::TestSubPath, String, String, i64) {
-    use chairphoto_lib::catalog::{IptcFields, PickState};
+) -> (chairphoto_core::catalog::Catalog, common::TestSubPath, String, String, i64) {
+    use chairphoto_core::catalog::{IptcFields, PickState};
 
     let (cat, root) = temp_catalog(tag);
 
@@ -3022,9 +3022,9 @@ fn setup_catalog_a(
 
 #[test]
 fn bundle_round_trip_export_import_and_idempotent_reimport() {
-    use chairphoto_lib::bundle::importer::{extract_originals, index_bundle, open_bundle};
-    use chairphoto_lib::bundle::writer::{gather_bundle, write_bundle};
-    use chairphoto_lib::catalog::PickState;
+    use chairphoto_core::bundle::importer::{extract_originals, index_bundle, open_bundle};
+    use chairphoto_core::bundle::writer::{gather_bundle, write_bundle};
+    use chairphoto_core::catalog::PickState;
 
     // ── Catalog A: source of the export ──────────────────────────────────────
     let (cat_a, root_a, uuid1, uuid2, batch_id_a) =
@@ -3190,8 +3190,8 @@ fn bundle_import_merges_with_pre_existing_local_taxonomy() {
     // Verifies the path-match branch: catalog B independently grew "Birds/Owls" with its
     // own uuid *and* a local extra term before the bundle arrives. The merge must union
     // the bundle's term without clobbering the local uuid or the local term.
-    use chairphoto_lib::bundle::importer::{extract_originals, index_bundle, open_bundle};
-    use chairphoto_lib::bundle::writer::{gather_bundle, write_bundle};
+    use chairphoto_core::bundle::importer::{extract_originals, index_bundle, open_bundle};
+    use chairphoto_core::bundle::writer::{gather_bundle, write_bundle};
 
     let (cat_a, _root_a, uuid1, _uuid2, batch_id_a) =
         setup_catalog_a("bundle-tax-a");
@@ -3245,7 +3245,7 @@ fn bundle_import_merges_with_pre_existing_local_taxonomy() {
 
 #[test]
 fn catalog_stats_counts_and_buckets() {
-    use chairphoto_lib::catalog::PromotedMetadata;
+    use chairphoto_core::catalog::PromotedMetadata;
 
     let (catalog, root) = temp_catalog("stats");
 
@@ -3382,7 +3382,7 @@ fn catalog_stats_counts_and_buckets() {
 
 #[test]
 fn catalog_stats_cull_survival_and_exposure_crossings() {
-    use chairphoto_lib::catalog::PromotedMetadata;
+    use chairphoto_core::catalog::PromotedMetadata;
 
     let (catalog, root) = temp_catalog("statscull");
 
@@ -3430,7 +3430,7 @@ fn catalog_stats_cull_survival_and_exposure_crossings() {
     catalog.set_culling(p3, Some(4), None, Some(PickState::Pick)).unwrap();
 
     // Compare a CullCross row against (total, decided, picked, rated, hits).
-    let tallies = |g: &chairphoto_lib::catalog::CullCross<i64>| -> (i64, i64, i64, i64, i64) {
+    let tallies = |g: &chairphoto_core::catalog::CullCross<i64>| -> (i64, i64, i64, i64, i64) {
         (g.total, g.decided, g.picked, g.rated, g.hits)
     };
 
@@ -3577,9 +3577,9 @@ fn scan_folder_aborts_before_writing_anything() {
     // The abort flag is already set when the scan begins: it must bail at the first
     // cancellation point and never import a row.
     let abort = AtomicBool::new(true);
-    let err = chairphoto_lib::scanner::scan_folder(&catalog, &root, &abort, &|_| {})
+    let err = chairphoto_core::scanner::scan_folder(&catalog, &root, &abort, &|_| {})
         .expect_err("a pre-aborted scan returns an error, not Ok");
-    assert_eq!(err, chairphoto_lib::scanner::SCAN_ABORTED);
+    assert_eq!(err, chairphoto_core::scanner::SCAN_ABORTED);
 
     // Nothing landed in the catalog — the switch can safely tear it down.
     let photos = catalog
@@ -3596,9 +3596,9 @@ fn scan_external_aborts_before_writing_anything() {
     catalog.add_volume("NAS", &nas_dir, VolumeKind::Backup).unwrap();
 
     let abort = AtomicBool::new(true);
-    let err = chairphoto_lib::scanner::scan_external_folder(&catalog, &nas_dir, &abort, &|_| {})
+    let err = chairphoto_core::scanner::scan_external_folder(&catalog, &nas_dir, &abort, &|_| {})
         .expect_err("a pre-aborted external scan returns an error");
-    assert_eq!(err, chairphoto_lib::scanner::SCAN_ABORTED);
+    assert_eq!(err, chairphoto_core::scanner::SCAN_ABORTED);
     assert!(
         catalog
             .list_photos(&PhotoQuery::default())
@@ -3618,15 +3618,15 @@ fn scan_folder_aborts_mid_run_and_stops_early() {
 
     let abort = std::sync::Arc::new(AtomicBool::new(false));
     let abort_for_cb = abort.clone();
-    let on_progress = move |p: chairphoto_lib::scanner::ScanProgress| {
+    let on_progress = move |p: chairphoto_core::scanner::ScanProgress| {
         // Trip the flag as soon as the first indexing batch commits.
         if p.phase == "indexing" {
             abort_for_cb.store(true, Ordering::Relaxed);
         }
     };
-    let err = chairphoto_lib::scanner::scan_folder(&catalog, &root, &abort, &on_progress)
+    let err = chairphoto_core::scanner::scan_folder(&catalog, &root, &abort, &on_progress)
         .expect_err("a mid-run abort returns SCAN_ABORTED");
-    assert_eq!(err, chairphoto_lib::scanner::SCAN_ABORTED);
+    assert_eq!(err, chairphoto_core::scanner::SCAN_ABORTED);
 
     // Rows committed before the abort are durable (the first batch), but the scan stopped
     // early — it did not import all 1200 files.
@@ -3846,11 +3846,11 @@ fn switch_catalog_with_aborted_scan_leaves_new_catalog_clean() {
         Catalog::open_secondary(cat_a.db_path(), cat_a.root()).unwrap();
     let abort = AtomicBool::new(true);
     let err =
-        chairphoto_lib::scanner::scan_folder(&scan_cat_a, &root_a, &abort, &|_| {})
+        chairphoto_core::scanner::scan_folder(&scan_cat_a, &root_a, &abort, &|_| {})
             .expect_err("abort must cause an error");
     assert_eq!(
         err,
-        chairphoto_lib::scanner::SCAN_ABORTED,
+        chairphoto_core::scanner::SCAN_ABORTED,
         "scan must return SCAN_ABORTED"
     );
 
@@ -3883,7 +3883,7 @@ fn phase_a_imports_unready_rows_then_phase_b_marks_ready() {
     // Phase A: rows appear immediately, all awaiting metadata (metadata_ready = 0).
     let abort = AtomicBool::new(false);
     let (result, pending) =
-        chairphoto_lib::scanner::scan_folder_phase_a(&catalog, &root, &abort, &|_| {}).unwrap();
+        chairphoto_core::scanner::scan_folder_phase_a(&catalog, &root, &abort, &|_| {}).unwrap();
     assert_eq!(result.created, 4, "Phase A creates all 4 rows");
     let after_a = catalog
         .list_photos(&PhotoQuery::default())
@@ -3895,7 +3895,7 @@ fn phase_a_imports_unready_rows_then_phase_b_marks_ready() {
     );
 
     // Phase B: enrich the pending rows; every one flips to ready.
-    chairphoto_lib::scanner::phase_b_enrich(&catalog, pending, &abort, &|_| {}).unwrap();
+    chairphoto_core::scanner::phase_b_enrich(&catalog, pending, &abort, &|_| {}).unwrap();
     let after_b = catalog
         .list_photos(&PhotoQuery::default())
         .unwrap();
@@ -3913,14 +3913,14 @@ fn phase_b_aborts_and_leaves_rows_unready() {
     // Phase A imports the rows (metadata_ready = 0).
     let abort = AtomicBool::new(false);
     let (_result, pending) =
-        chairphoto_lib::scanner::scan_folder_phase_a(&catalog, &root, &abort, &|_| {}).unwrap();
+        chairphoto_core::scanner::scan_folder_phase_a(&catalog, &root, &abort, &|_| {}).unwrap();
 
     // A catalog switch / second scan trips the flag before Phase B runs: it must bail at
     // the first cancellation point with SCAN_ABORTED and leave the rows not-yet-ready.
     abort.store(true, Ordering::Relaxed);
-    let err = chairphoto_lib::scanner::phase_b_enrich(&catalog, pending, &abort, &|_| {})
+    let err = chairphoto_core::scanner::phase_b_enrich(&catalog, pending, &abort, &|_| {})
         .expect_err("a pre-aborted Phase B returns SCAN_ABORTED");
-    assert_eq!(err, chairphoto_lib::scanner::SCAN_ABORTED);
+    assert_eq!(err, chairphoto_core::scanner::SCAN_ABORTED);
     let rows = catalog
         .list_photos(&PhotoQuery::default())
         .unwrap();
@@ -3945,7 +3945,7 @@ fn i6d_pending_queue_persists_after_phase_a_and_drains_on_phase_b_completion() {
     //     persisted in the pending_enrichment table.
     let abort = AtomicBool::new(false);
     let (_result, pending) =
-        chairphoto_lib::scanner::scan_folder_phase_a(&catalog, &root, &abort, &|_| {}).unwrap();
+        chairphoto_core::scanner::scan_folder_phase_a(&catalog, &root, &abort, &|_| {}).unwrap();
     assert_eq!(pending.imported.len(), 4, "Phase A produced 4 pending entries");
 
     // (b) pending_enrichment table must have exactly 4 rows.
@@ -3957,9 +3957,9 @@ fn i6d_pending_queue_persists_after_phase_a_and_drains_on_phase_b_completion() {
 
     // (c) Abort Phase B immediately — simulates an app crash / quit mid-scan.
     abort.store(true, Ordering::Relaxed);
-    let err = chairphoto_lib::scanner::phase_b_enrich(&catalog, pending, &abort, &|_| {})
+    let err = chairphoto_core::scanner::phase_b_enrich(&catalog, pending, &abort, &|_| {})
         .expect_err("pre-aborted Phase B returns SCAN_ABORTED");
-    assert_eq!(err, chairphoto_lib::scanner::SCAN_ABORTED);
+    assert_eq!(err, chairphoto_core::scanner::SCAN_ABORTED);
 
     // After the abort the rows are still not-ready.
     let after_abort = catalog
@@ -3979,7 +3979,7 @@ fn i6d_pending_queue_persists_after_phase_a_and_drains_on_phase_b_completion() {
 
     // (d) resume_pending_enrichment rebuilds the PendingEnrich hand-off from the
     //     persisted table — this is what startup auto-resume calls.
-    let resumed = chairphoto_lib::scanner::resume_pending_enrichment(&catalog)
+    let resumed = chairphoto_core::scanner::resume_pending_enrichment(&catalog)
         .unwrap()
         .expect("resume_pending_enrichment must return Some when rows remain");
     assert_eq!(
@@ -3992,7 +3992,7 @@ fn i6d_pending_queue_persists_after_phase_a_and_drains_on_phase_b_completion() {
 
     // (e) Run Phase B to completion using the resumed PendingEnrich.
     let abort2 = AtomicBool::new(false);
-    chairphoto_lib::scanner::phase_b_enrich(&catalog, resumed, &abort2, &|_| {}).unwrap();
+    chairphoto_core::scanner::phase_b_enrich(&catalog, resumed, &abort2, &|_| {}).unwrap();
 
     // (f) All rows must be metadata_ready=1 and the queue must be empty.
     let after_resume = catalog
@@ -4013,7 +4013,7 @@ fn i6d_pending_queue_persists_after_phase_a_and_drains_on_phase_b_completion() {
 fn i6d_resume_returns_none_when_queue_is_empty() {
     let (catalog, _root) = temp_catalog("i6d-empty-resume");
     // No Phase A was run — the queue is empty.
-    let result = chairphoto_lib::scanner::resume_pending_enrichment(&catalog).unwrap();
+    let result = chairphoto_core::scanner::resume_pending_enrichment(&catalog).unwrap();
     assert!(
         result.is_none(),
         "resume_pending_enrichment returns None when no rows are pending"
@@ -4071,7 +4071,7 @@ fn i6d_stale_drain_via_rescan_handles_deleted_unchanged_and_changed_files() {
     // ── Scan 1: Phase A enqueues all three ───────────────────────────────────
     let abort1 = AtomicBool::new(false);
     let (_result1, pending1) =
-        chairphoto_lib::scanner::scan_folder_phase_a(&catalog, &root, &abort1, &|_| {}).unwrap();
+        chairphoto_core::scanner::scan_folder_phase_a(&catalog, &root, &abort1, &|_| {}).unwrap();
     assert_eq!(pending1.imported.len(), 3, "Phase A created 3 rows");
 
     // Collect photo_ids for A, B, C so we can assert on them later.
@@ -4099,9 +4099,9 @@ fn i6d_stale_drain_via_rescan_handles_deleted_unchanged_and_changed_files() {
 
     // ── Abort Phase B immediately — simulates a crash / quit mid-scan ────────
     abort1.store(true, Ordering::Relaxed);
-    let err = chairphoto_lib::scanner::phase_b_enrich(&catalog, pending1, &abort1, &|_| {})
+    let err = chairphoto_core::scanner::phase_b_enrich(&catalog, pending1, &abort1, &|_| {})
         .expect_err("pre-aborted Phase B must return SCAN_ABORTED");
-    assert_eq!(err, chairphoto_lib::scanner::SCAN_ABORTED);
+    assert_eq!(err, chairphoto_core::scanner::SCAN_ABORTED);
 
     // All three rows are still not-ready and still in pending_enrichment.
     let rows_after_abort = catalog
@@ -4129,7 +4129,7 @@ fn i6d_stale_drain_via_rescan_handles_deleted_unchanged_and_changed_files() {
     // runs at end of Phase B, which we'll do here). The walk only sees B and C.
     let abort2 = AtomicBool::new(false);
     let (_result2, pending2) =
-        chairphoto_lib::scanner::scan_folder_phase_a(&catalog, &root, &abort2, &|_| {}).unwrap();
+        chairphoto_core::scanner::scan_folder_phase_a(&catalog, &root, &abort2, &|_| {}).unwrap();
 
     // Phase A finds B (unchanged → needs_extract=false, NOT re-enqueued) and
     // C (changed → needs_extract=true, re-enqueued). A is not in the walk.
@@ -4181,7 +4181,7 @@ fn i6d_stale_drain_via_rescan_handles_deleted_unchanged_and_changed_files() {
     // Merge via the same function used by run_blocking_two_phase_scan.
     let mut merged_pending = pending2;
     merged_pending.imported =
-        chairphoto_lib::scanner::merge_stale_pending(merged_pending.imported, stale);
+        chairphoto_core::scanner::merge_stale_pending(merged_pending.imported, stale);
 
     // C was already covered (needs_extract=true); B was not and was merged in.
     // A was silently dropped by load_pending_enrichment.
@@ -4196,7 +4196,7 @@ fn i6d_stale_drain_via_rescan_handles_deleted_unchanged_and_changed_files() {
     assert_eq!(c_count, 1, "C must appear exactly once (already_covered prevents duplication)");
 
     // ── Run Phase B with the merged pending ──────────────────────────────────
-    chairphoto_lib::scanner::phase_b_enrich(&catalog, merged_pending, &abort2, &|_| {}).unwrap();
+    chairphoto_core::scanner::phase_b_enrich(&catalog, merged_pending, &abort2, &|_| {}).unwrap();
 
     // B and C must now be metadata_ready=1 (enriched).
     let photos_after = catalog
@@ -4257,7 +4257,7 @@ fn i6e_unready_rows_survive_list_photos_and_done_clears_placeholders() {
     // Phase A: insert rows with metadata_ready=0.
     let abort = AtomicBool::new(false);
     let (_result, pending) =
-        chairphoto_lib::scanner::scan_folder_phase_a(&catalog, &root, &abort, &|_| {}).unwrap();
+        chairphoto_core::scanner::scan_folder_phase_a(&catalog, &root, &abort, &|_| {}).unwrap();
     assert_eq!(pending.imported.len(), 3, "Phase A produced 3 pending entries");
 
     // Invariant 1: list_photos must include unready rows so the grid can render
@@ -4275,7 +4275,7 @@ fn i6e_unready_rows_survive_list_photos_and_done_clears_placeholders() {
     // refresh is triggered. After set_metadata_ready(true) for every photo,
     // list_photos returns the same rows with metadata_ready=1, meaning the
     // placeholder state is cleared and all tiles are fully ready.
-    chairphoto_lib::scanner::phase_b_enrich(&catalog, pending, &abort, &|_| {}).unwrap();
+    chairphoto_core::scanner::phase_b_enrich(&catalog, pending, &abort, &|_| {}).unwrap();
     let after_done = catalog
         .list_photos(&PhotoQuery::default())
         .unwrap();
@@ -4314,7 +4314,7 @@ fn insert_photo_with_gps(
     lat: f64,
     lng: f64,
 ) -> i64 {
-    use chairphoto_lib::catalog::PromotedMetadata;
+    use chairphoto_core::catalog::PromotedMetadata;
     let path = root.join(name);
     std::fs::write(&path, b"\xff\xd8test").unwrap();
     let photo_id = catalog.upsert_photo(&path, None, 1, 4).unwrap().id;
@@ -4333,7 +4333,7 @@ fn unit_square_fence(
     catalog: &Catalog,
     tag_path: &str,
 ) -> i64 {
-    use chairphoto_lib::plugins::map;
+    use chairphoto_core::plugins::map;
     map::ensure_schema_for(catalog).unwrap();
     let poly = vec![(0.0_f64, 0.0_f64), (0.0, 1.0), (1.0, 1.0), (1.0, 0.0)];
     map::create_fence_for(catalog, "Unit square", tag_path, &poly)
@@ -4345,7 +4345,7 @@ fn unit_square_fence(
 #[cfg(feature = "map")]
 #[test]
 fn map_apply_fence_tags_inside_photos_only() {
-    use chairphoto_lib::plugins::map;
+    use chairphoto_core::plugins::map;
 
     let (catalog, root) = temp_catalog("map_apply_fence");
     map::ensure_schema_for(&catalog).unwrap();
@@ -4377,7 +4377,7 @@ fn map_apply_fence_tags_inside_photos_only() {
 #[cfg(feature = "map")]
 #[test]
 fn map_apply_fence_is_idempotent() {
-    use chairphoto_lib::plugins::map;
+    use chairphoto_core::plugins::map;
 
     let (catalog, root) = temp_catalog("map_idempotent");
     map::ensure_schema_for(&catalog).unwrap();
@@ -4401,7 +4401,7 @@ fn map_apply_fence_is_idempotent() {
 #[cfg(feature = "map")]
 #[test]
 fn map_apply_all_fences_covers_every_fence() {
-    use chairphoto_lib::plugins::map;
+    use chairphoto_core::plugins::map;
 
     let (catalog, root) = temp_catalog("map_apply_all");
     map::ensure_schema_for(&catalog).unwrap();
@@ -4426,8 +4426,8 @@ fn map_apply_all_fences_covers_every_fence() {
 #[cfg(feature = "map")]
 #[test]
 fn map_photo_points_returns_gps_photos_only() {
-    use chairphoto_lib::plugins::map;
-    use chairphoto_lib::catalog::PromotedMetadata;
+    use chairphoto_core::plugins::map;
+    use chairphoto_core::catalog::PromotedMetadata;
 
     let (catalog, root) = temp_catalog("map_points");
     map::ensure_schema_for(&catalog).unwrap();
@@ -4453,7 +4453,7 @@ fn map_photo_points_returns_gps_photos_only() {
 #[cfg(feature = "map")]
 #[test]
 fn map_apply_fence_creates_full_tag_hierarchy() {
-    use chairphoto_lib::plugins::map;
+    use chairphoto_core::plugins::map;
 
     let (catalog, root) = temp_catalog("map_hierarchy");
     map::ensure_schema_for(&catalog).unwrap();
@@ -4478,7 +4478,7 @@ fn map_apply_fence_creates_full_tag_hierarchy() {
 #[cfg(feature = "map")]
 #[test]
 fn map_apply_fences_to_photo_import_hook() {
-    use chairphoto_lib::plugins::map;
+    use chairphoto_core::plugins::map;
 
     let (catalog, root) = temp_catalog("map_import_hook");
     map::ensure_schema_for(&catalog).unwrap();
@@ -4503,8 +4503,8 @@ fn map_apply_fences_to_photo_import_hook() {
 #[cfg(feature = "map")]
 #[test]
 fn map_apply_fences_to_photo_no_gps_is_noop() {
-    use chairphoto_lib::plugins::map;
-    use chairphoto_lib::catalog::PromotedMetadata;
+    use chairphoto_core::plugins::map;
+    use chairphoto_core::catalog::PromotedMetadata;
 
     let (catalog, root) = temp_catalog("map_noop");
     map::ensure_schema_for(&catalog).unwrap();
@@ -4525,8 +4525,8 @@ fn map_apply_fences_to_photo_no_gps_is_noop() {
 #[cfg(feature = "map")]
 #[test]
 fn map_ingest_applies_fences_to_new_photos() {
-    use chairphoto_lib::plugins::map;
-    use chairphoto_lib::scanner::ingest_from_card;
+    use chairphoto_core::plugins::map;
+    use chairphoto_core::scanner::ingest_from_card;
 
     let (catalog, root) = temp_catalog("map_ingest");
     map::ensure_schema_for(&catalog).unwrap();
@@ -4555,7 +4555,7 @@ fn map_ingest_applies_fences_to_new_photos() {
     assert_eq!(photos.len(), 1);
     let photo_id = photos[0].id;
 
-    use chairphoto_lib::catalog::PromotedMetadata;
+    use chairphoto_core::catalog::PromotedMetadata;
     catalog
         .set_photo_metadata(
             photo_id,
@@ -4591,7 +4591,7 @@ fn reverse_geocode_iptc_fill_integration() {
     std::fs::write(&photo_path, b"\xff\xd8test").unwrap();
     let photo_id = catalog.upsert_photo(&photo_path, None, 1, 4).unwrap().id;
 
-    use chairphoto_lib::catalog::PromotedMetadata;
+    use chairphoto_core::catalog::PromotedMetadata;
     catalog
         .set_photo_metadata(
             photo_id,
@@ -4613,7 +4613,7 @@ fn reverse_geocode_iptc_fill_integration() {
 
     // Simulate a geocoder response (GeocodeResult as returned by the actual geocoder).
     // Note: GeocodeResult uses Option<String>, so we wrap the values in Some().
-    use chairphoto_lib::plugins::map::geocode::GeocodeResult;
+    use chairphoto_core::plugins::map::geocode::GeocodeResult;
     let geocode_result = GeocodeResult {
         city: Some("Oslo".to_string()),
         state: Some("Oslo".to_string()),
@@ -4625,7 +4625,7 @@ fn reverse_geocode_iptc_fill_integration() {
     // This is the critical path: fill only empty fields, never overwrite user-entered values.
     let current_iptc = catalog.get_iptc(photo_id).unwrap();
     let (updated_iptc, changed) =
-        chairphoto_lib::plugins::map::geocode::fill_empty_iptc(&current_iptc, &geocode_result);
+        chairphoto_core::plugins::map::geocode::fill_empty_iptc(&current_iptc, &geocode_result);
 
     assert!(changed, "at least one field should have been filled");
 
@@ -4633,7 +4633,7 @@ fn reverse_geocode_iptc_fill_integration() {
     catalog.set_iptc(photo_id, &updated_iptc).unwrap();
 
     // Write to XMP sidecar (merge-safe path).
-    chairphoto_lib::xmp::write_iptc(&photo_path, &updated_iptc).unwrap();
+    chairphoto_core::xmp::write_iptc(&photo_path, &updated_iptc).unwrap();
 
     // Verify IPTC fields were updated in the catalog.
     let final_iptc = catalog.get_iptc(photo_id).unwrap();
@@ -4663,7 +4663,7 @@ fn reverse_geocode_preserves_existing_iptc_values() {
     std::fs::write(&photo_path, b"\xff\xd8test").unwrap();
     let photo_id = catalog.upsert_photo(&photo_path, None, 1, 4).unwrap().id;
 
-    use chairphoto_lib::catalog::PromotedMetadata;
+    use chairphoto_core::catalog::PromotedMetadata;
     catalog
         .set_photo_metadata(
             photo_id,
@@ -4684,7 +4684,7 @@ fn reverse_geocode_preserves_existing_iptc_values() {
     catalog.set_iptc(photo_id, &pre_iptc).unwrap();
 
     // Simulate a geocoder response (GeocodeResult as returned by the actual geocoder).
-    use chairphoto_lib::plugins::map::geocode::GeocodeResult;
+    use chairphoto_core::plugins::map::geocode::GeocodeResult;
     let geocode_result = GeocodeResult {
         city: Some("Oslo".to_string()),
         state: Some("Vestfold".to_string()),
@@ -4696,7 +4696,7 @@ fn reverse_geocode_preserves_existing_iptc_values() {
     // This is the critical test: verify that pre-filled fields are NEVER overwritten.
     let current_iptc = catalog.get_iptc(photo_id).unwrap();
     let (updated_iptc, changed) =
-        chairphoto_lib::plugins::map::geocode::fill_empty_iptc(&current_iptc, &geocode_result);
+        chairphoto_core::plugins::map::geocode::fill_empty_iptc(&current_iptc, &geocode_result);
 
     assert!(changed, "at least state or country_code should have been filled");
 
@@ -4710,7 +4710,7 @@ fn reverse_geocode_preserves_existing_iptc_values() {
 
     // Write to catalog and XMP sidecar (demonstrating the full write path).
     catalog.set_iptc(photo_id, &updated_iptc).unwrap();
-    chairphoto_lib::xmp::write_iptc(&photo_path, &updated_iptc).unwrap();
+    chairphoto_core::xmp::write_iptc(&photo_path, &updated_iptc).unwrap();
 
     // Verify the sidecar was written correctly.
     let sidecar_path = photo_path.with_extension("jpg.xmp");
@@ -4733,7 +4733,7 @@ fn reverse_geocode_preserves_existing_iptc_values() {
 #[cfg(feature = "map")]
 #[test]
 fn set_photo_gps_updates_catalog_columns_for_multiple_photos() {
-    use chairphoto_lib::plugins::map;
+    use chairphoto_core::plugins::map;
 
     let (catalog, root) = temp_catalog("set_gps_columns");
     map::ensure_schema_for(&catalog).unwrap();
@@ -4768,8 +4768,8 @@ fn set_photo_gps_updates_catalog_columns_for_multiple_photos() {
 #[cfg(feature = "map")]
 #[test]
 fn set_photo_gps_sidecar_round_trips_and_preserves_foreign_content() {
-    use chairphoto_lib::plugins::map;
-    use chairphoto_lib::xmp;
+    use chairphoto_core::plugins::map;
+    use chairphoto_core::xmp;
 
     let (catalog, root) = temp_catalog("set_gps_sidecar");
     map::ensure_schema_for(&catalog).unwrap();
@@ -4814,7 +4814,7 @@ fn set_photo_gps_sidecar_round_trips_and_preserves_foreign_content() {
 #[cfg(feature = "map")]
 #[test]
 fn set_photo_gps_reapplies_fences_after_move() {
-    use chairphoto_lib::plugins::map;
+    use chairphoto_core::plugins::map;
 
     let (catalog, root) = temp_catalog("set_gps_fences");
     map::ensure_schema_for(&catalog).unwrap();
@@ -4848,7 +4848,7 @@ fn set_photo_gps_reapplies_fences_after_move() {
 #[cfg(feature = "map")]
 #[test]
 fn set_photo_gps_outside_all_fences_returns_zero() {
-    use chairphoto_lib::plugins::map;
+    use chairphoto_core::plugins::map;
 
     let (catalog, root) = temp_catalog("set_gps_outside");
     map::ensure_schema_for(&catalog).unwrap();
@@ -4976,7 +4976,7 @@ fn read_only_dir(what: &str, dir: &std::path::Path) -> Option<ReadOnlyDir> {
 }
 
 fn pending_sidecar_field_count(
-    pending: &[chairphoto_lib::catalog::PendingIdentityRow],
+    pending: &[chairphoto_core::catalog::PendingIdentityRow],
     field: &str,
 ) -> usize {
     pending.iter().filter(|p| p.field == field).count()
@@ -4985,7 +4985,7 @@ fn pending_sidecar_field_count(
 #[cfg(unix)]
 #[test]
 fn unwritable_sidecar_queues_a_repair_that_later_succeeds() {
-    use chairphoto_lib::catalog::SidecarIdentity;
+    use chairphoto_core::catalog::SidecarIdentity;
 
     let (catalog, root) = temp_catalog("identity-unwritable");
     let dir = root.join("2026/06/28");
@@ -5006,7 +5006,7 @@ fn unwritable_sidecar_queues_a_repair_that_later_succeeds() {
         "an unwritable folder must report the failure, got {outcome:?}"
     );
     assert!(
-        chairphoto_lib::xmp::read_identifier(&photo).is_none(),
+        chairphoto_core::xmp::read_identifier(&photo).is_none(),
         "no sidecar could be written, so nothing is on disk yet"
     );
 
@@ -5039,7 +5039,7 @@ fn unwritable_sidecar_queues_a_repair_that_later_succeeds() {
     let summary = catalog.repair_pending_identity().unwrap();
     assert_eq!((summary.bound, summary.failed, summary.unreachable), (1, 0, 0));
     assert_eq!(
-        chairphoto_lib::xmp::read_identifier(&photo).as_deref(),
+        chairphoto_core::xmp::read_identifier(&photo).as_deref(),
         Some(up.uuid.as_str()),
         "the catalog UUID is now on disk"
     );
@@ -5056,7 +5056,7 @@ fn scan_read_only_storage_queues_import_batch_sidecar_debt() {
     };
 
     let abort = AtomicBool::new(false);
-    let result = chairphoto_lib::scanner::scan_folder(&catalog, &root, &abort, &|_| {}).unwrap();
+    let result = chairphoto_core::scanner::scan_folder(&catalog, &root, &abort, &|_| {}).unwrap();
     assert_eq!(
         result.created, 2,
         "read-only sidecars must not abort the scan"
@@ -5088,7 +5088,7 @@ fn scan_read_only_storage_queues_import_batch_sidecar_debt() {
     {
         let path = root.join(&photo.path);
         assert_eq!(
-            chairphoto_lib::xmp::read_import_batch(&path).as_deref(),
+            chairphoto_core::xmp::read_import_batch(&path).as_deref(),
             Some(batch_uuid.as_str()),
             "{} carries its import batch after repair",
             photo.path
@@ -5100,7 +5100,7 @@ fn scan_read_only_storage_queues_import_batch_sidecar_debt() {
 #[cfg(unix)]
 #[test]
 fn card_ingest_queues_identity_and_import_batch_sidecar_debt() {
-    use chairphoto_lib::scanner::{copy_from_card, index_ingested};
+    use chairphoto_core::scanner::{copy_from_card, index_ingested};
 
     let (catalog, root) = temp_catalog("batch-sidecar-ingest-readonly");
     let card = root.parent().unwrap().join("card-readonly-sidecar");
@@ -5135,7 +5135,7 @@ fn card_ingest_queues_identity_and_import_batch_sidecar_debt() {
         "the ingest-side ImportBatch write failure is retryable catalog debt"
     );
     assert!(
-        chairphoto_lib::xmp::read_import_batch(&dest).is_none(),
+        chairphoto_core::xmp::read_import_batch(&dest).is_none(),
         "the read-only destination could not be updated yet"
     );
 
@@ -5152,11 +5152,11 @@ fn card_ingest_queues_identity_and_import_batch_sidecar_debt() {
         .next()
         .unwrap();
     assert_eq!(
-        chairphoto_lib::xmp::read_identifier(&dest).as_deref(),
+        chairphoto_core::xmp::read_identifier(&dest).as_deref(),
         Some(photo.uuid.as_str())
     );
     assert_eq!(
-        chairphoto_lib::xmp::read_import_batch(&dest).as_deref(),
+        chairphoto_core::xmp::read_import_batch(&dest).as_deref(),
         Some(batch_uuid.as_str())
     );
     assert!(catalog.list_pending_identity().unwrap().is_empty());
@@ -5165,8 +5165,8 @@ fn card_ingest_queues_identity_and_import_batch_sidecar_debt() {
 #[cfg(unix)]
 #[test]
 fn bundle_import_queues_identity_sidecar_debt_for_unwritable_extracted_copy() {
-    use chairphoto_lib::bundle::importer::{extract_originals, index_bundle, open_bundle};
-    use chairphoto_lib::bundle::writer::{gather_bundle, write_bundle};
+    use chairphoto_core::bundle::importer::{extract_originals, index_bundle, open_bundle};
+    use chairphoto_core::bundle::writer::{gather_bundle, write_bundle};
 
     let (cat_a, _root_a, _uuid1, _uuid2, batch_id_a) = setup_catalog_a("identity-bundle-a");
     let bundle_zip = std::env::temp_dir().join(format!(
@@ -5195,7 +5195,7 @@ fn bundle_import_queues_identity_sidecar_debt_for_unwritable_extracted_copy() {
 
     let target = extracted[0].dest.clone();
     let target_uuid = extracted[0].photo_uuid.clone();
-    let sidecar = chairphoto_lib::xmp::sidecar_path(&target);
+    let sidecar = chairphoto_core::xmp::sidecar_path(&target);
     assert!(
         sidecar.exists(),
         "extract_originals normally writes the bundle UUID before indexing"
@@ -5222,7 +5222,7 @@ fn bundle_import_queues_identity_sidecar_debt_for_unwritable_extracted_copy() {
     assert_eq!(identifier.photo_id, imported.id);
     assert_eq!(PathBuf::from(&identifier.target_path), target);
     assert!(
-        chairphoto_lib::xmp::read_identifier(&target).is_none(),
+        chairphoto_core::xmp::read_identifier(&target).is_none(),
         "the read-only destination could not be updated yet"
     );
 
@@ -5238,7 +5238,7 @@ fn bundle_import_queues_identity_sidecar_debt_for_unwritable_extracted_copy() {
         "at least the queued UUID field should be repaired"
     );
     assert_eq!(
-        chairphoto_lib::xmp::read_identifier(&target).as_deref(),
+        chairphoto_core::xmp::read_identifier(&target).as_deref(),
         Some(imported.uuid.as_str())
     );
     assert!(cat_b.list_pending_identity().unwrap().is_empty());
@@ -5246,7 +5246,7 @@ fn bundle_import_queues_identity_sidecar_debt_for_unwritable_extracted_copy() {
 
 #[test]
 fn malformed_sidecar_is_preserved_and_queued() {
-    use chairphoto_lib::catalog::SidecarIdentity;
+    use chairphoto_core::catalog::SidecarIdentity;
 
     let (catalog, root) = temp_catalog("identity-malformed");
     let photo = root.join("DSC0002.ARW");
@@ -5258,7 +5258,7 @@ fn malformed_sidecar_is_preserved_and_queued() {
 
     let up = catalog.upsert_photo(&photo, None, 1, 9).unwrap();
     assert!(
-        chairphoto_lib::xmp::read_identifier(&photo).is_none(),
+        chairphoto_core::xmp::read_identifier(&photo).is_none(),
         "a sidecar that does not parse yields no identifier"
     );
 
@@ -5286,7 +5286,7 @@ fn malformed_sidecar_is_preserved_and_queued() {
     let summary = catalog.repair_pending_identity().unwrap();
     assert_eq!((summary.bound, summary.failed), (1, 0));
     assert_eq!(
-        chairphoto_lib::xmp::read_identifier(&photo).as_deref(),
+        chairphoto_core::xmp::read_identifier(&photo).as_deref(),
         Some(up.uuid.as_str())
     );
     assert_eq!(catalog.count_pending_identity().unwrap(), 0);
@@ -5294,7 +5294,7 @@ fn malformed_sidecar_is_preserved_and_queued() {
 
 #[test]
 fn a_foreign_identity_in_the_sidecar_is_never_overwritten() {
-    use chairphoto_lib::catalog::SidecarIdentity;
+    use chairphoto_core::catalog::SidecarIdentity;
 
     let (catalog, root) = temp_catalog("identity-conflict");
     let photo = root.join("DSC0003.ARW");
@@ -5304,15 +5304,15 @@ fn a_foreign_identity_in_the_sidecar_is_never_overwritten() {
     // The file already carries somebody else's identity (a copied sidecar, another
     // catalog's photo). Binding must not resolve that by destroying it.
     const FOREIGN: &str = "11111111-2222-3333-4444-555555555555";
-    chairphoto_lib::xmp::write_identifier(&photo, FOREIGN).unwrap();
-    let found = chairphoto_lib::xmp::read_identifier(&photo);
+    chairphoto_core::xmp::write_identifier(&photo, FOREIGN).unwrap();
+    let found = chairphoto_core::xmp::read_identifier(&photo);
 
     let outcome = catalog
         .ensure_sidecar_identity(up.id, &photo, &up.uuid, found.as_deref())
         .unwrap();
     assert_eq!(outcome, SidecarIdentity::Conflict(FOREIGN.to_string()));
     assert_eq!(
-        chairphoto_lib::xmp::read_identifier(&photo).as_deref(),
+        chairphoto_core::xmp::read_identifier(&photo).as_deref(),
         Some(FOREIGN),
         "the foreign identity stays on disk"
     );
@@ -5332,7 +5332,7 @@ fn a_foreign_identity_in_the_sidecar_is_never_overwritten() {
     let summary = catalog.repair_pending_identity().unwrap();
     assert_eq!((summary.bound, summary.failed, summary.conflicts), (0, 0, 1));
     assert_eq!(
-        chairphoto_lib::xmp::read_identifier(&photo).as_deref(),
+        chairphoto_core::xmp::read_identifier(&photo).as_deref(),
         Some(FOREIGN)
     );
 }
@@ -5366,7 +5366,7 @@ fn an_unreachable_original_leaves_the_repair_queued() {
 
 #[test]
 fn identity_repair_keeps_copy_debt_when_another_copy_is_reachable() {
-    use chairphoto_lib::catalog::SidecarIdentity;
+    use chairphoto_core::catalog::SidecarIdentity;
 
     let (catalog, root) = temp_catalog("identity-copy-target");
     let primary = root.join("DSC0005.ARW");
@@ -5411,7 +5411,7 @@ fn identity_repair_keeps_copy_debt_when_another_copy_is_reachable() {
     );
     assert_eq!(catalog.count_pending_identity().unwrap(), 1);
     assert!(
-        chairphoto_lib::xmp::read_identifier(&backup).is_none(),
+        chairphoto_core::xmp::read_identifier(&backup).is_none(),
         "repair is scoped to the queued primary copy"
     );
 
@@ -5420,7 +5420,7 @@ fn identity_repair_keeps_copy_debt_when_another_copy_is_reachable() {
         .unwrap();
     assert_eq!(backup_outcome, SidecarIdentity::Bound);
     assert_eq!(
-        chairphoto_lib::xmp::read_identifier(&backup).as_deref(),
+        chairphoto_core::xmp::read_identifier(&backup).as_deref(),
         Some(up.uuid.as_str())
     );
     let pending = catalog.list_pending_identity().unwrap();
@@ -5439,7 +5439,7 @@ fn identity_repair_keeps_copy_debt_when_another_copy_is_reachable() {
         (1, 0, 0)
     );
     assert_eq!(
-        chairphoto_lib::xmp::read_identifier(&primary).as_deref(),
+        chairphoto_core::xmp::read_identifier(&primary).as_deref(),
         Some(up.uuid.as_str())
     );
     assert_eq!(catalog.count_pending_identity().unwrap(), 0);
@@ -5454,7 +5454,7 @@ fn a_scan_onto_read_only_storage_keeps_every_identity_recoverable() {
 
     // The scan still imports — one unwritable folder must not cost the user the rows.
     let abort = AtomicBool::new(false);
-    let result = chairphoto_lib::scanner::scan_folder(&catalog, &root, &abort, &|_| {}).unwrap();
+    let result = chairphoto_core::scanner::scan_folder(&catalog, &root, &abort, &|_| {}).unwrap();
     assert_eq!(result.created, 3, "the scan indexes every file");
     assert_eq!(
         catalog.count_pending_identity().unwrap(),
@@ -5476,7 +5476,7 @@ fn a_scan_onto_read_only_storage_keeps_every_identity_recoverable() {
     assert_eq!(photos.len(), 3);
     for photo in &photos {
         assert_eq!(
-            chairphoto_lib::xmp::read_identifier(&root.join(&photo.path)).as_deref(),
+            chairphoto_core::xmp::read_identifier(&root.join(&photo.path)).as_deref(),
             Some(photo.uuid.as_str()),
             "{} carries its catalog identity after the repair",
             photo.path
@@ -5591,7 +5591,7 @@ fn opening_an_old_catalog_drops_the_index_but_keeps_the_column() {
 /// is the state every existing library is in until it is compacted.
 #[test]
 fn metadata_round_trips_while_the_retired_column_is_still_present() {
-    use chairphoto_lib::catalog::{MetadataEntry, PromotedMetadata};
+    use chairphoto_core::catalog::{MetadataEntry, PromotedMetadata};
     let (catalog, root, _db) = legacy_metadata_catalog("a7-legacy-write");
     let id = catalog.upsert_photo(&root.join("a.jpg"), None, 1, 1).unwrap().id;
 
@@ -5616,7 +5616,7 @@ fn metadata_round_trips_while_the_retired_column_is_still_present() {
 /// the table, so it runs only when the user asks — and afterwards writes take the new path.
 #[test]
 fn compacting_sheds_the_retired_column_and_keeps_the_metadata() {
-    use chairphoto_lib::catalog::{MetadataEntry, PromotedMetadata};
+    use chairphoto_core::catalog::{MetadataEntry, PromotedMetadata};
     let (mut catalog, root, db) = legacy_metadata_catalog("a7-compact");
     let id = catalog.upsert_photo(&root.join("a.jpg"), None, 1, 1).unwrap().id;
     let entry = |key: &str, value: &str| MetadataEntry {
@@ -5656,7 +5656,7 @@ fn compacting_sheds_the_retired_column_and_keeps_the_metadata() {
 /// the table shape it observed when it opened.
 #[test]
 fn secondary_opened_before_compaction_writes_the_new_metadata_shape() {
-    use chairphoto_lib::catalog::{MetadataEntry, PromotedMetadata};
+    use chairphoto_core::catalog::{MetadataEntry, PromotedMetadata};
     let (mut catalog, root, db) = legacy_metadata_catalog("a7-secondary-after-compact");
     let id = catalog
         .upsert_photo(&root.join("a.jpg"), None, 1, 1)

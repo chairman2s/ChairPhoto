@@ -45,6 +45,8 @@ raw = ["chairphoto-core/raw"]
 [dependencies]
 # Features are forwarded one by one above, so `--no-default-features` here builds no backend.
 chairphoto-core = { path = "../core", default-features = false }
+# The UI logic without a toolkit: here, the theme tokens and the Omarchy mapping (#102).
+chairphoto-model = { path = "../model" }
 # One dependency for GPUI (`gpui-pre =0.3.7`, which this version pins), gpui-base, the
 # gpui-component widgets and the default icon assets. Exact pin: the Phase 0 spike (3e13e1b)
 # and docs/plans/gpui/shell-apis.md were verified against this version.

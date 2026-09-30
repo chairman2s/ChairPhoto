@@ -1160,6 +1160,7 @@ name = "chairphoto-app"
 version = "0.0.0"
 dependencies = [
  "chairphoto-core",
+ "chairphoto-model",
  "futures",
  "gpui-kit",
  "serde",

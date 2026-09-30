@@ -1,6 +1,7 @@
-//! ChairPhoto's look in GPUI: the token contract (`src/theme/tokens.ts`), the ChairPhoto
-//! Standard palette (`src/theme/standard.ts`), the Omarchy mapping (`src/theme/omarchy.ts`, in
-//! [`omarchy`]) and how a palette reaches the widgets.
+//! ChairPhoto's look in GPUI: how a palette reaches the widgets. The token contract, the
+//! ChairPhoto Standard palette and the Omarchy mapping are `chairphoto_model::theme` (the
+//! reviewed ports of `src/theme/{tokens,standard,omarchy}.ts`); this module only turns their
+//! CSS colour strings into the hex gpui parses.
 //!
 //! A palette becomes a `gpui_component::ThemeConfig` ([`theme_config`]) applied with
 //! `Theme::update(.. apply_config ..)`, which derives the hover/active/button colours, rebuilds
@@ -14,9 +15,8 @@
 //! (Preferences, #113). Until then it always follows Omarchy — the product default — and
 //! falls back to Standard when no usable Omarchy theme exists, exactly as follow mode does.
 
-pub mod omarchy;
-
-use chairphoto_core::appearance::SystemThemeResult;
+use chairphoto_core::appearance::{OmarchyMode, SystemThemeResult};
+use chairphoto_model::theme::{omarchy, standard as model_standard, tokens::ThemeTokens};
 use gpui_kit::component::{Theme, ThemeConfig, ThemeConfigColors, ThemeMode};
 use gpui_kit::{App, Global, SharedString};
 use std::rc::Rc;
@@ -53,34 +53,64 @@ pub struct Tokens {
 /// Dark or light — `ThemeMode` for gpui-component.
 pub type Mode = ThemeMode;
 
-/// ChairPhoto Standard, the app-owned warm dark palette (`src/theme/standard.ts`). `sel` is
-/// `rgba(224, 164, 88, 0.14)` and `scrim` `rgba(0, 0, 0, 0.66)` there; as hex alpha they are
-/// `0x24` (0.14 × 255 = 35.7) and `0xA8` (0.66 × 255 = 168.3).
-pub fn standard() -> Tokens {
-    let s = |v: &str| v.to_string();
-    Tokens {
-        canvas: s("#14120F"),
-        panel: s("#1B1815"),
-        elev: s("#23201C"),
-        well: s("#0D0C0A"),
-        border: s("#2E2A25"),
-        line: s("#241F1B"),
-        txt: s("#EFE9E0"),
-        dim: s("#A8A093"),
-        mute: s("#6F675C"),
-        accent: s("#E0A458"),
-        onaccent: s("#241C10"),
-        sel: s("#E0A45824"),
-        ok: s("#10B981"),
-        onok: s("#04150F"),
-        danger: s("#F87171"),
-        rating: s("#FFD700"),
-        scrim: s("#000000A8"),
+impl Tokens {
+    /// The model's tokens with every colour as hex gpui can parse (see [`css_hex`]).
+    pub fn from_model(t: &ThemeTokens) -> Tokens {
+        Tokens {
+            canvas: css_hex(&t.canvas),
+            panel: css_hex(&t.panel),
+            elev: css_hex(&t.elev),
+            well: css_hex(&t.well),
+            border: css_hex(&t.border),
+            line: css_hex(&t.line),
+            txt: css_hex(&t.txt),
+            dim: css_hex(&t.dim),
+            mute: css_hex(&t.mute),
+            accent: css_hex(&t.accent),
+            onaccent: css_hex(&t.onaccent),
+            sel: css_hex(&t.sel),
+            ok: css_hex(&t.ok),
+            onok: css_hex(&t.onok),
+            danger: css_hex(&t.danger),
+            rating: css_hex(&t.rating),
+            scrim: css_hex(&t.scrim),
+        }
     }
+}
+
+/// A token's CSS colour as hex: `#rgb`/`#rrggbb`/`#rrggbbaa` pass through, and
+/// `rgba(r, g, b, a)` becomes `#RRGGBBAA` with the alpha rounded to the nearest of 255 steps
+/// (Standard's `sel` alpha 0.14 → `0x24`, its `scrim` alpha 0.66 → `0xA8`). Anything else is
+/// returned unchanged, and gpui's parser rejects it visibly rather than guessing.
+pub fn css_hex(v: &str) -> String {
+    let v = v.trim();
+    let Some(inner) = v.strip_prefix("rgba(").and_then(|r| r.strip_suffix(')')) else {
+        return v.to_string();
+    };
+    let parts: Vec<&str> = inner.split(',').map(str::trim).collect();
+    let [r, g, b, a] = parts.as_slice() else { return v.to_string() };
+    let (Ok(r), Ok(g), Ok(b), Ok(a)) = (r.parse::<u8>(), g.parse::<u8>(), b.parse::<u8>(), a.parse::<f32>()) else {
+        return v.to_string();
+    };
+    let a = (a.clamp(0.0, 1.0) * 255.0).round() as u8;
+    format!("#{r:02X}{g:02X}{b:02X}{a:02X}")
+}
+
+/// ChairPhoto Standard, the app-owned warm dark palette (`chairphoto_model::theme::standard`).
+pub fn standard() -> Tokens {
+    Tokens::from_model(&model_standard::standard())
 }
 
 /// ChairPhoto Standard is dark.
 pub const STANDARD_MODE: Mode = ThemeMode::Dark;
+
+/// gpui-component's mode for a palette's mode.
+fn gpui_mode(mode: &OmarchyMode) -> Mode {
+    match mode {
+        OmarchyMode::Dark => ThemeMode::Dark,
+        OmarchyMode::Light => ThemeMode::Light,
+    }
+}
 
 /// The active palette in full — including the tokens gpui's `Theme` has no field for — plus
 /// where it came from. Read it with `cx.global::<Palette>()`.
@@ -149,8 +179,8 @@ pub fn apply(tokens: Tokens, mode: Mode, omarchy_theme: Option<String>, cx: &mut
 pub fn palette_for(result: &SystemThemeResult) -> (Tokens, Mode, Option<String>) {
     match (&result.palette, result.available) {
         (Some(palette), true) => {
-            let (tokens, mode) = omarchy::map_palette(palette);
-            (tokens, mode, result.theme_name.clone())
+            let mapped = omarchy::map_palette(palette);
+            (Tokens::from_model(&mapped.tokens), gpui_mode(&mapped.mode), result.theme_name.clone())
         }
         _ => (standard(), STANDARD_MODE, None),
     }
@@ -206,6 +236,16 @@ mod tests {
         assert_eq!(tokens, standard());
         assert_eq!(mode, STANDARD_MODE);
         assert_eq!(name, None);
+    }
+
+    /// Standard's two `rgba()` tokens become the hex alpha gpui parses, and hex passes through.
+    #[test]
+    fn css_hex_converts_rgba_and_passes_hex_through() {
+        assert_eq!(css_hex("rgba(224, 164, 88, 0.14)"), "#E0A45824");
+        assert_eq!(css_hex("rgba(0, 0, 0, 0.66)"), "#000000A8");
+        assert_eq!(css_hex("#14120F"), "#14120F");
+        assert_eq!(standard().sel, "#E0A45824");
+        assert_eq!(standard().scrim, "#000000A8");
     }
 
     /// Every token parses as the colour gpui-component will read (hex only, no `rgba()`).

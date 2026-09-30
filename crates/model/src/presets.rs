@@ -48,17 +48,13 @@ pub struct DevelopPreset {
     pub extra: Map<String, Value>,
 }
 
-const BW_NEUTRAL: Bw = Bw { enabled: true, r: 0.299, g: 0.587, b: 0.114 };
-const BW_RED: Bw = Bw { enabled: true, r: 0.9, g: 0.15, b: -0.05 };
-const BW_YELLOW: Bw = Bw { enabled: true, r: 0.55, g: 0.4, b: 0.05 };
-const BW_GREEN: Bw = Bw { enabled: true, r: 0.2, g: 0.7, b: 0.1 };
 
 fn split(shadow_hue: f64, shadow_sat: f64, highlight_hue: f64, highlight_sat: f64) -> Option<Split> {
-    Some(Split { shadow_hue, shadow_sat, highlight_hue, highlight_sat, balance: 0.0 })
+    Some(Split { shadow_hue, shadow_sat, highlight_hue, highlight_sat, balance: 0.0, extra: Map::new() })
 }
 
 fn grain(amount: f64, size: f64) -> Option<Grain> {
-    Some(Grain { amount, size, seed: 0.0 })
+    Some(Grain { amount, size, seed: 0.0, extra: Map::new() })
 }
 
 fn wb(temp: f64) -> Option<Wb> {
@@ -77,30 +73,30 @@ pub fn builtin_presets() -> Vec<DevelopPreset> {
     let t = Tone::default;
     vec![
         // --- Monochrome styles ---
-        builtin("bw-neutral", "B&W Neutral", Monochrome, VersionEdit { bw: Some(BW_NEUTRAL), tone: Some(Tone { contrast: Some(0.1), ..t() }), ..e() }),
+        builtin("bw-neutral", "B&W Neutral", Monochrome, VersionEdit { bw: Some(Bw::mix(0.299, 0.587, 0.114)), tone: Some(Tone { contrast: Some(0.1), ..t() }), ..e() }),
         // Dramatic skies: reds/skin bright, blues near-black.
-        builtin("bw-red", "B&W Red Filter", Monochrome, VersionEdit { bw: Some(BW_RED), tone: Some(Tone { contrast: Some(0.2), ..t() }), ..e() }),
-        builtin("bw-yellow", "B&W Yellow Filter", Monochrome, VersionEdit { bw: Some(BW_YELLOW), tone: Some(Tone { contrast: Some(0.12), ..t() }), ..e() }),
+        builtin("bw-red", "B&W Red Filter", Monochrome, VersionEdit { bw: Some(Bw::mix(0.9, 0.15, -0.05)), tone: Some(Tone { contrast: Some(0.2), ..t() }), ..e() }),
+        builtin("bw-yellow", "B&W Yellow Filter", Monochrome, VersionEdit { bw: Some(Bw::mix(0.55, 0.4, 0.05)), tone: Some(Tone { contrast: Some(0.12), ..t() }), ..e() }),
         // Classic for foliage and natural skin rendering.
-        builtin("bw-green", "B&W Green Filter", Monochrome, VersionEdit { bw: Some(BW_GREEN), tone: Some(Tone { contrast: Some(0.1), ..t() }), ..e() }),
+        builtin("bw-green", "B&W Green Filter", Monochrome, VersionEdit { bw: Some(Bw::mix(0.2, 0.7, 0.1)), tone: Some(Tone { contrast: Some(0.1), ..t() }), ..e() }),
         builtin(
             "bw-high-contrast",
             "B&W High Contrast",
             Monochrome,
-            VersionEdit { bw: Some(BW_NEUTRAL), tone: Some(Tone { contrast: Some(0.45), blacks: Some(-0.15), whites: Some(0.15), ..t() }), ..e() },
+            VersionEdit { bw: Some(Bw::mix(0.299, 0.587, 0.114)), tone: Some(Tone { contrast: Some(0.45), blacks: Some(-0.15), whites: Some(0.15), ..t() }), ..e() },
         ),
         builtin(
             "sepia",
             "Sepia",
             Monochrome,
-            VersionEdit { bw: Some(BW_NEUTRAL), split: split(35.0, 0.25, 45.0, 0.12), tone: Some(Tone { contrast: Some(0.05), ..t() }), ..e() },
+            VersionEdit { bw: Some(Bw::mix(0.299, 0.587, 0.114)), split: split(35.0, 0.25, 45.0, 0.12), tone: Some(Tone { contrast: Some(0.05), ..t() }), ..e() },
         ),
         // Cool purple-blue toning in the shadows, like a selenium-toned print.
         builtin(
             "selenium",
             "Selenium",
             Monochrome,
-            VersionEdit { bw: Some(BW_NEUTRAL), split: split(275.0, 0.15, 250.0, 0.06), tone: Some(Tone { contrast: Some(0.15), ..t() }), ..e() },
+            VersionEdit { bw: Some(Bw::mix(0.299, 0.587, 0.114)), split: split(275.0, 0.15, 250.0, 0.06), tone: Some(Tone { contrast: Some(0.15), ..t() }), ..e() },
         ),
         // --- Film stocks ---
         // Gritty photojournalism B&W: contrasty, crushed blacks, visible grain.
@@ -109,7 +105,7 @@ pub fn builtin_presets() -> Vec<DevelopPreset> {
             "Tri-X 400",
             Film,
             VersionEdit {
-                bw: Some(Bw { enabled: true, r: 0.35, g: 0.45, b: 0.2 }),
+                bw: Some(Bw::mix(0.35, 0.45, 0.2)),
                 tone: Some(Tone { contrast: Some(0.3), blacks: Some(-0.1), ..t() }),
                 grain: grain(0.5, 1.2),
                 ..e()
@@ -304,7 +300,7 @@ mod tests {
         assert_eq!(look.tone.as_ref().and_then(|t| t.ev), Some(0.5));
         assert_eq!(look.zones, Some(vec![0.0, 0.1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]));
         assert_eq!(look.fade, Some(0.2));
-        assert_eq!(look.lut, Some(LutRef { file: "portra.cube".into(), amount: 0.8 }));
+        assert_eq!(look.lut, Some(LutRef { file: "portra.cube".into(), amount: 0.8, extra: Map::new() }));
         assert!(record.crop.is_some(), "the input is not mutated");
     }
 

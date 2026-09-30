@@ -9,7 +9,8 @@
 //! (a sparse tone merges key by key; `isEngine1Version` asks whether the record holds
 //! anything at all) and write back exactly what it read. So [`VersionEdit`] mirrors the
 //! TypeScript `VersionEdit` deliberately: every field optional, `f64` for every TS
-//! `number`, and unknown top-level keys kept in [`VersionEdit::extra`] and written back.
+//! `number`, and unknown keys kept in an `extra` map at every level (the record and each
+//! nested object) and written back, as the TS object spreads carried them.
 //!
 //! # JSON compatibility
 //!
@@ -43,12 +44,14 @@ pub struct Crop {
     /// The chosen aspect preset label (UI bookkeeping; the engine locks "A:B" ratios).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub aspect: Option<String>,
+    /// Keys this build does not know, kept and written back as the TS spreads did.
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
-
 impl Crop {
     /// A crop without an aspect label.
     pub fn rect(x: f64, y: f64, w: f64, h: f64) -> Self {
-        Crop { x, y, w, h, aspect: None }
+        Crop { x, y, w, h, aspect: None, extra: Map::new() }
     }
 }
 
@@ -67,8 +70,10 @@ pub struct Perspective {
     /// Output aspect (width / height). Absent = the engine derives it from the quad.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub aspect: Option<f64>,
+    /// Keys this build does not know, kept and written back as the TS spreads did.
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
-
 /// A corner of the perspective quad.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum QuadCorner {
@@ -113,15 +118,18 @@ impl Perspective {
     }
 }
 
-/// The quad a fresh perspective edit starts from — the whole frame, inset far enough that
+/// `DEFAULT_QUAD`: the quad a fresh perspective edit starts from — the whole frame, inset far enough that
 /// all four handles are visible and grabbable.
-pub const DEFAULT_QUAD: Perspective = Perspective {
-    tl: [0.06, 0.06],
-    tr: [0.94, 0.06],
-    br: [0.94, 0.94],
-    bl: [0.06, 0.94],
-    aspect: None,
-};
+pub fn default_quad() -> Perspective {
+    Perspective {
+        tl: [0.06, 0.06],
+        tr: [0.94, 0.06],
+        br: [0.94, 0.94],
+        bl: [0.06, 0.94],
+        aspect: None,
+        extra: Map::new(),
+    }
+}
 
 /// White balance. Relative (the default): `temp`/`tint` −1..1 around as-shot. Kelvin
 /// (engine 2): `mode: "kelvin"`, the scene's light in `kelvin`, `tint` in Kelvin units.
@@ -137,12 +145,14 @@ pub struct Wb {
     pub mode: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kelvin: Option<f64>,
+    /// Keys this build does not know, kept and written back as the TS spreads did.
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
-
 impl Wb {
     /// A relative white balance `{ temp, tint }`.
     pub fn relative(temp: f64, tint: f64) -> Self {
-        Wb { temp: Some(temp), tint: Some(tint), mode: None, kelvin: None }
+        Wb { temp: Some(temp), tint: Some(tint), mode: None, kelvin: None, extra: Map::new() }
     }
 
     pub fn is_kelvin(&self) -> bool {
@@ -172,8 +182,10 @@ pub struct Tone {
     pub saturation: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wb: Option<Wb>,
+    /// Keys this build does not know, kept and written back as the TS spreads did.
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
-
 impl Tone {
     /// `ZERO_TONE`: every slider at 0, white balance `{ temp: 0, tint: 0 }`.
     pub fn zero() -> Self {
@@ -187,6 +199,7 @@ impl Tone {
             vibrance: Some(0.0),
             saturation: Some(0.0),
             wb: Some(Wb::relative(0.0, 0.0)),
+            extra: Map::new(),
         }
     }
 
@@ -202,6 +215,7 @@ impl Tone {
             vibrance: over.vibrance.or(self.vibrance),
             saturation: over.saturation.or(self.saturation),
             wb: over.wb.clone().or_else(|| self.wb.clone()),
+            extra: merged_extra(&self.extra, &over.extra),
         }
     }
 }
@@ -215,11 +229,13 @@ pub struct Bw {
     pub r: f64,
     pub g: f64,
     pub b: f64,
+    /// Keys this build does not know, kept and written back as the TS spreads did.
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
-
 impl Default for Bw {
     fn default() -> Self {
-        Bw { enabled: true, r: 0.299, g: 0.587, b: 0.114 }
+        Bw::mix(0.299, 0.587, 0.114)
     }
 }
 
@@ -232,8 +248,10 @@ pub struct Split {
     pub highlight_hue: f64,
     pub highlight_sat: f64,
     pub balance: f64,
+    /// Keys this build does not know, kept and written back as the TS spreads did.
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
-
 /// Deterministic film grain — the seed is part of the record so exports reproduce. Core
 /// reads `seed` as `u32`; it is written as a JSON integer (see the module docs).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -242,11 +260,13 @@ pub struct Grain {
     pub amount: f64,
     pub size: f64,
     pub seed: f64,
+    /// Keys this build does not know, kept and written back as the TS spreads did.
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
-
 impl Default for Grain {
     fn default() -> Self {
-        Grain { amount: 0.0, size: 1.0, seed: 0.0 }
+        Grain { amount: 0.0, size: 1.0, seed: 0.0, extra: Map::new() }
     }
 }
 
@@ -256,13 +276,31 @@ pub struct LutRef {
     pub file: String,
     #[serde(default = "one")]
     pub amount: f64,
+    /// Keys this build does not know, kept and written back as the TS spreads did.
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
-
 /// Engine 2's lens corrections from the camera's own tables.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Lens {
     pub builtin: bool,
+    /// Keys this build does not know, kept and written back as the TS spreads did.
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
+}
+impl Bw {
+    /// An enabled mixer with these weights.
+    pub fn mix(r: f64, g: f64, b: f64) -> Self {
+        Bw { enabled: true, r, g, b, extra: Map::new() }
+    }
+}
+
+/// `{ ...a, ...b }` over the unknown keys: `b`'s win.
+fn merged_extra(a: &Map<String, Value>, b: &Map<String, Value>) -> Map<String, Value> {
+    let mut out = a.clone();
+    out.extend(b.iter().map(|(k, v)| (k.clone(), v.clone())));
+    out
 }
 
 fn one() -> f64 {
@@ -473,13 +511,16 @@ pub struct BwFilter {
     pub bw: Bw,
 }
 
-/// B&W contrast-filter chips for the Effects section — channel-mixer weight recipes.
-pub const BW_FILTERS: [BwFilter; 4] = [
-    BwFilter { label: "Neutral", bw: Bw { enabled: true, r: 0.299, g: 0.587, b: 0.114 } },
-    BwFilter { label: "Red", bw: Bw { enabled: true, r: 0.9, g: 0.15, b: -0.05 } },
-    BwFilter { label: "Yellow", bw: Bw { enabled: true, r: 0.55, g: 0.4, b: 0.05 } },
-    BwFilter { label: "Green", bw: Bw { enabled: true, r: 0.2, g: 0.7, b: 0.1 } },
-];
+/// `BW_FILTERS`: B&W contrast-filter chips for the Effects section — channel-mixer weight
+/// recipes.
+pub fn bw_filters() -> [BwFilter; 4] {
+    [
+        BwFilter { label: "Neutral", bw: Bw::mix(0.299, 0.587, 0.114) },
+        BwFilter { label: "Red", bw: Bw::mix(0.9, 0.15, -0.05) },
+        BwFilter { label: "Yellow", bw: Bw::mix(0.55, 0.4, 0.05) },
+        BwFilter { label: "Green", bw: Bw::mix(0.2, 0.7, 0.1) },
+    ]
+}
 
 /// The supported straighten range, ± degrees.
 pub const STRAIGHTEN_MAX: f64 = 45.0;
@@ -516,12 +557,12 @@ pub fn level_from_line(x1: f64, y1: f64, x2: f64, y2: f64) -> f64 {
 pub fn inscribed_crop(img_w: f64, img_h: f64, degrees: f64) -> Crop {
     let a = degrees.abs() * std::f64::consts::PI / 180.0;
     if a < 1e-4 || img_w <= 0.0 || img_h <= 0.0 {
-        return Crop { x: 0.0, y: 0.0, w: 1.0, h: 1.0, aspect: Some("Original".into()) };
+        return Crop { aspect: Some("Original".into()), ..Crop::rect(0.0, 0.0, 1.0, 1.0) };
     }
     let (sin, cos) = a.sin_cos();
     let s = js_compat::min(img_w / (img_w * cos + img_h * sin), img_h / (img_w * sin + img_h * cos));
     let sc = js_compat::clamp(s * 0.997, 0.05, 1.0);
-    Crop { x: (1.0 - sc) / 2.0, y: (1.0 - sc) / 2.0, w: sc, h: sc, aspect: Some("Original".into()) }
+    Crop { aspect: Some("Original".into()), ..Crop::rect((1.0 - sc) / 2.0, (1.0 - sc) / 2.0, sc, sc) }
 }
 
 /// A crop preset. `ratio` = width/height; `None`: "Original" = no crop, "Free" = no lock.
@@ -654,7 +695,7 @@ mod tests {
 
     #[test]
     fn perspective_round_trips_through_the_stored_edit_json() {
-        let perspective = Perspective { tl: [0.098, 0.171], tr: [0.853, 0.106], br: [0.878, 0.9], bl: [0.083, 0.921], aspect: None };
+        let perspective = Perspective { tl: [0.098, 0.171], tr: [0.853, 0.106], br: [0.878, 0.9], bl: [0.083, 0.921], aspect: None, extra: Map::new() };
         let saved = VersionEdit { perspective: Some(perspective.clone()), straighten: Some(0.0), ..Default::default() }.to_json();
         assert_eq!(parse_edit(Some(&saved)).perspective, Some(perspective));
     }
@@ -681,8 +722,8 @@ mod tests {
 
     #[test]
     fn default_quad_is_an_inset_full_frame_with_every_corner_grabbable() {
-        let xs: Vec<f64> = QUAD_CORNERS.iter().map(|c| DEFAULT_QUAD.corner(*c)[0]).collect();
-        let ys: Vec<f64> = QUAD_CORNERS.iter().map(|c| DEFAULT_QUAD.corner(*c)[1]).collect();
+        let xs: Vec<f64> = QUAD_CORNERS.iter().map(|c| default_quad().corner(*c)[0]).collect();
+        let ys: Vec<f64> = QUAD_CORNERS.iter().map(|c| default_quad().corner(*c)[1]).collect();
         for v in xs.iter().chain(&ys) {
             assert!(*v > 0.0 && *v < 1.0);
         }
@@ -783,6 +824,37 @@ mod tests {
             let b: Value = serde_json::from_str(&written).unwrap();
             assert_eq!(a, b, "{json} → {written}");
         }
+    }
+
+    /// Review finding (Codex, #103): unknown keys inside nested objects were dropped, so
+    /// saving an unrelated adjustment destroyed extension data the TS spreads carried.
+    #[test]
+    fn unknown_keys_survive_in_every_nested_object() {
+        let json = r#"{
+            "crop": {"x": 0, "y": 0, "w": 1, "h": 1, "f": 1},
+            "tone": {"ev": 1, "future": 0.2, "wb": {"temp": 0.1, "tint": 0, "f": "w"}},
+            "perspective": {"tl": [0, 0], "tr": [1, 0], "br": [1, 1], "bl": [0, 1], "f": [1]},
+            "bw": {"enabled": true, "r": 1, "g": 0, "b": 0, "f": true},
+            "split": {"shadow_hue": 1, "shadow_sat": 0, "highlight_hue": 2, "highlight_sat": 0, "balance": 0, "f": 2},
+            "grain": {"amount": 0.2, "size": 1, "seed": 0, "f": {"x": 1}},
+            "lut": {"file": "a.cube", "amount": 1, "f": "l"},
+            "lens": {"builtin": true, "f": 3}
+        }"#;
+        let e = parse_edit(Some(json));
+        let back: Value = serde_json::from_str(&e.to_json()).unwrap();
+        assert_eq!(back, serde_json::from_str::<Value>(json).unwrap());
+        // Saving an unrelated adjustment keeps them.
+        let adjusted = e.with_look(&Look { fade: Some(0.3), ..e.look() });
+        let back: Value = serde_json::from_str(&adjusted.to_json()).unwrap();
+        assert_eq!(back["tone"]["future"], json!(0.2));
+        assert_eq!(back["tone"]["wb"]["f"], json!("w"));
+        assert_eq!(back["crop"]["f"], json!(1));
+        assert_eq!(back["fade"], json!(0.3));
+        // A sparse tone merge keeps both sides' unknown keys, the patch's winning.
+        let a = rec(json!({"tone": {"ev": 1, "p": 1, "q": 1}})).tone.unwrap();
+        let b = rec(json!({"tone": {"contrast": 0.2, "q": 2}})).tone.unwrap();
+        let m = serde_json::to_value(a.merged(&b)).unwrap();
+        assert_eq!((m["p"].clone(), m["q"].clone()), (json!(1), json!(2)));
     }
 
     #[test]

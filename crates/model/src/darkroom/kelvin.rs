@@ -6,6 +6,7 @@
 
 use crate::editing::{Tone, VersionEdit, Wb};
 use crate::js_compat;
+use serde_json::Map;
 
 /// Settings key: which white-balance slider a fresh engine-2 edit shows — `"kelvin"`
 /// (default) or `"relative"`.
@@ -79,7 +80,7 @@ pub fn mired_shift(kelvin: f64, mireds: f64) -> f64 {
 
 /// A Kelvin white balance for the record: `{ temp: 0, tint, mode: "kelvin", kelvin }`.
 pub fn kelvin_wb(kelvin: f64, tint: f64) -> Wb {
-    Wb { temp: Some(0.0), tint: Some(tint), mode: Some("kelvin".into()), kelvin: Some(kelvin) }
+    Wb { temp: Some(0.0), tint: Some(tint), mode: Some("kelvin".into()), kelvin: Some(kelvin), extra: Map::new() }
 }
 
 /// What the white-balance rail shows.

@@ -10,6 +10,7 @@ use crate::darkroom::kelvin::{with_kelvin_shift, KelvinContext, DUEL_WARMTH_MIRE
 use crate::editing::{Tone, VersionEdit, Wb};
 use crate::js_compat;
 use crate::presets::{DevelopPreset, PresetCategory};
+use serde_json::Map;
 
 /// Which family a proof cell belongs to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -160,7 +161,7 @@ pub fn duel_pair(working: &VersionEdit, dim: DuelDim, visit: i32, kelvin: Option
         DuelDim::Warmth => {
             let wb = t.wb.clone().unwrap_or_else(|| Wb::relative(0.0, 0.0));
             let temp = wb.temp.unwrap_or(0.0);
-            patch(&|d| Tone { wb: Some(Wb { temp: Some(clamp1(temp + d)), tint: wb.tint, mode: None, kelvin: None }), ..Tone::default() })
+            patch(&|d| Tone { wb: Some(Wb { temp: Some(clamp1(temp + d)), tint: wb.tint, mode: None, kelvin: None, extra: Map::new() }), ..Tone::default() })
         }
         DuelDim::Contrast => {
             let c = t.contrast.unwrap_or(0.0);
@@ -222,7 +223,6 @@ mod tests {
     // --- src/components/darkroom/__tests__/spreads.test.ts (9 cases) ---
     use super::*;
     use crate::editing::{Bw, Crop, Lens, Perspective, Split};
-    use serde_json::Map;
 
     fn preset(id: &str, category: PresetCategory, edit: VersionEdit) -> DevelopPreset {
         DevelopPreset { id: id.into(), name: id.into(), category, edit, builtin: Some(true), extra: Map::new() }
@@ -244,13 +244,13 @@ mod tests {
             preset(
                 "teal",
                 Color,
-                VersionEdit { split: Some(Split { shadow_hue: 180.0, shadow_sat: 0.2, highlight_hue: 40.0, highlight_sat: 0.1, balance: 0.0 }), ..e() },
+                VersionEdit { split: Some(Split { shadow_hue: 180.0, shadow_sat: 0.2, highlight_hue: 40.0, highlight_sat: 0.1, balance: 0.0, extra: Map::new() }), ..e() },
             ),
             preset("sunset", Color, e()),
             preset(
                 "bw-red",
                 Monochrome,
-                VersionEdit { bw: Some(Bw { enabled: true, r: 0.9, g: 0.15, b: -0.05 }), tone: tone(|t| t.contrast = Some(0.2)), ..e() },
+                VersionEdit { bw: Some(Bw::mix(0.9, 0.15, -0.05)), tone: tone(|t| t.contrast = Some(0.2)), ..e() },
             ),
             preset("bw-soft", Monochrome, e()),
             preset("sepia", Monochrome, e()),
@@ -291,17 +291,17 @@ mod tests {
     #[test]
     fn copies_the_bases_framing_into_every_candidate_untouched() {
         let base = VersionEdit {
-            crop: Some(Crop { x: 0.1, y: 0.2, w: 0.5, h: 0.5, aspect: Some("1:1".into()) }),
+            crop: Some(Crop { aspect: Some("1:1".into()), ..Crop::rect(0.1, 0.2, 0.5, 0.5) }),
             straighten: Some(1.5),
-            perspective: Some(Perspective { tl: [0.0, 0.0], tr: [1.0, 0.0], br: [1.0, 1.0], bl: [0.0, 1.0], aspect: None }),
-            lens: Some(Lens { builtin: true }),
+            perspective: Some(Perspective { tl: [0.0, 0.0], tr: [1.0, 0.0], br: [1.0, 1.0], bl: [0.0, 1.0], aspect: None, extra: Map::new() }),
+            lens: Some(Lens { builtin: true, extra: Map::new() }),
             ..VersionEdit::default()
         };
         for c in proof_spread(&base, &auto(), &many_presets(), None) {
             assert_eq!(c.record.crop, base.crop);
             assert_eq!(c.record.straighten, Some(1.5));
             assert_eq!(c.record.perspective, base.perspective);
-            assert_eq!(c.record.lens, Some(Lens { builtin: true }), "adopting a proof keeps the lens correction");
+            assert_eq!(c.record.lens, Some(Lens { builtin: true, extra: Map::new() }), "adopting a proof keeps the lens correction");
         }
     }
 

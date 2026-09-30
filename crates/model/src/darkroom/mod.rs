@@ -3,7 +3,9 @@
 //! source badge and the lens hint. View code (the rails, stage, strip) ports with the GPUI
 //! views that draw it.
 
+pub mod develop_source;
 pub mod history;
 pub mod kelvin;
+pub mod lens_rail;
 pub mod spreads;
 pub mod stage_json;

@@ -517,10 +517,14 @@ mod tests {
     fn a_stale_socket_from_a_crashed_primary_is_replaced() {
         let dir = TempDir::new("stale");
         let endpoint = Endpoint::new(&dir.0, "k");
-        // What a crash leaves: a socket file nobody listens on, and no lock holder.
+        // What a crash leaves: a socket file whose listener is gone, and no lock holder.
         drop(UnixListener::bind(&endpoint.socket).unwrap());
-        assert!(endpoint.socket.exists());
-        assert!(UnixStream::connect(&endpoint.socket).is_err(), "nobody listens on a stale socket");
+        // Checked by file type, not by a connect that should fail: another test thread's
+        // process spawn can hold a copy of the dropped listener's fd between its fork and
+        // exec (CLOEXEC closes it only at exec), and for that moment a connect succeeds. With
+        // a thread spawning /bin/true alongside, 11 and 19 of 2000 such connects succeeded.
+        use std::os::unix::fs::FileTypeExt as _;
+        assert!(std::fs::symlink_metadata(&endpoint.socket).unwrap().file_type().is_socket());
 
         let (tx, rx) = mpsc::channel();
         let _primary = primary(claim(&endpoint, &Request::default(), CONNECT_PATIENCE))

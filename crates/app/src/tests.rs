@@ -562,6 +562,20 @@ fn a_link_in_flight_at_a_switch_resolves_against_the_new_catalog(cx: &mut TestAp
     });
 }
 
+/// Asking to quit closes the single-instance endpoint at once (before the event loop ends),
+/// so a second launch from then on is told `closing` rather than `ok`.
+#[gpui_kit::test]
+fn a_quit_request_closes_the_single_instance_endpoint(cx: &mut TestAppContext) {
+    let _app = start(cx);
+    let closer = crate::single_instance::Closer::default();
+    cx.update(|cx| launch::close_instance_on_quit(closer.clone(), cx));
+    cx.run_until_parked();
+    assert!(!closer.is_closed());
+    cx.update(|cx| crate::quit_app(QuitReason::Requested, cx));
+    cx.run_until_parked();
+    assert!(closer.is_closed(), "the endpoint stayed open after the quit was requested");
+}
+
 /// A quit signal, delivered by the signal thread, dispatches `Quit` once — the Ctrl+Q path,
 /// whose handler in `run` calls `cx.quit()` and so the quit observers and `clean_exit`.
 #[gpui_kit::test]

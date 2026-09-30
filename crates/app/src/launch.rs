@@ -4,7 +4,8 @@
 
 use crate::keymap::Quit;
 use crate::model::AppModel;
-use crate::single_instance::Request;
+use crate::single_instance::{Closer, Request};
+use crate::QuitRequested;
 use futures::channel::mpsc::UnboundedReceiver;
 use futures::StreamExt as _;
 use gpui_kit::{AnyWindowHandle, App, Entity, Task};
@@ -36,6 +37,21 @@ pub fn spawn_request_router(
             cx.update(|cx| apply_request(request, &model, main_window, cx));
         }
     })
+}
+
+/// Close the single-instance endpoint as soon as a quit is asked for (the [`QuitRequested`]
+/// global, set by every quit path: Ctrl+Q, the main window closing, a quit signal), and again
+/// as the app quits, for a platform-initiated quit. From then on a second launch is told
+/// `closing` and starts fresh once this process has let go of the lock, rather than being
+/// told `ok` for a link an exiting app would drop.
+pub fn close_instance_on_quit(closer: Closer, cx: &mut App) {
+    let on_request = closer.clone();
+    cx.observe_global::<QuitRequested>(move |_| on_request.close()).detach();
+    cx.on_app_quit(move |_| {
+        closer.close();
+        async {}
+    })
+    .detach();
 }
 
 /// Turn a quit signal into the [`Quit`] action — the same path as Ctrl+Q, so the quit

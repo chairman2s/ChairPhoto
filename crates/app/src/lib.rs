@@ -231,10 +231,8 @@ fn claim_single_instance(launch: &Request, tx: UnboundedSender<Request>) -> Opti
     };
     match single_instance::claim(&endpoint, launch, single_instance::CONNECT_PATIENCE) {
         Ok(Claim::Primary(primary)) => {
-            let served = primary.serve(move |request| {
-                // Fails only once the app is shutting down.
-                let _ = tx.unbounded_send(request);
-            });
+            // Taken only if the router still listens: the second launch hears `ok` only then.
+            let served = primary.serve(move |request| tx.unbounded_send(request).is_ok());
             served.map_err(|e| eprintln!("single instance: disabled: {e}")).ok()
         }
         Ok(Claim::Forwarded) => {
@@ -260,7 +258,8 @@ pub fn run() {
     let launch = Request::from_args(std::env::args().skip(1));
     let (instance_tx, instance_rx) = unbounded::<Request>();
     // Held for the process's lifetime: the lock, and the socket file it removes on the way out.
-    let _instance = claim_single_instance(&launch, instance_tx);
+    let instance = claim_single_instance(&launch, instance_tx);
+    let instance_closer = instance.as_ref().map(|primary| primary.closer());
 
     let (quit_tx, quit_rx) = unbounded::<i32>();
     if let Err(e) = signals::install(move |signal| {
@@ -295,6 +294,9 @@ pub fn run() {
             let wired =
                 wire(cx, state, events_rx, Some(boot.pool.clone()), &initial_theme, WireOptions::production());
             launch::spawn_quit_on_signal(quit_rx, cx).detach();
+            if let Some(closer) = instance_closer {
+                launch::close_instance_on_quit(closer, cx);
+            }
             launch::spawn_request_router(instance_rx, wired.model.clone(), wired.main_window.clone().ok(), cx)
                 .detach();
             // This launch's own links (the React app got them from onOpenUrl's getCurrent()).

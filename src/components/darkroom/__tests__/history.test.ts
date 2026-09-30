@@ -19,6 +19,8 @@ describe("describeChange", () => {
     expect(describeChange(rec({}), rec({ bw: { enabled: true, r: 1, g: 0, b: 0 } })).label).toBe("Black & white");
     expect(describeChange(rec({}), rec({ lut: { file: "portra.cube", amount: 1 } })).label).toBe("LUT portra");
     expect(describeChange(rec({}), rec({ zones: [0, 0.2, 0, 0, 0, 0, 0, 0] })).label).toBe("Tone strip");
+    expect(describeChange(rec({}), rec({ lens: { builtin: true } }))).toEqual({ label: "Lens correction on", key: "lens" });
+    expect(describeChange(rec({ lens: { builtin: true } }), rec({})).label).toBe("Lens correction off");
   });
 
   it("names several changes at once by the caller's label, or generically", () => {

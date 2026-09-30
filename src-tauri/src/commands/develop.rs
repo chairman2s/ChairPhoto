@@ -34,6 +34,10 @@ pub enum DevelopSource {
         /// camera gives what Kelvin white balance needs — the Kelvin slider's home.
         #[serde(rename = "asShotWb", skip_serializing_if = "Option::is_none")]
         as_shot_wb: Option<[f32; 2]>,
+        /// Which lens corrections the camera wrote into this file, once the working image
+        /// is resident (docs/plans/lens-corrections) — what the Darkroom's Lens switch offers.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        lens: Option<LensInfo>,
     },
     /// A RAW the decoder does not support (yet): the Darkroom keeps working on the camera
     /// preview and says so.
@@ -71,6 +75,16 @@ pub async fn raw_probe(app: AppHandle, photo_id: i64) -> Result<DevelopSource, S
     .map_err(|e| e.to_string())?
 }
 
+/// The camera's lens tables for one photo, as the Darkroom shows them.
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+pub struct LensInfo {
+    /// Where the tables came from, e.g. "Sony built-in".
+    pub source: String,
+    pub vignetting: bool,
+    pub distortion: bool,
+    pub chromatic: bool,
+}
+
 #[cfg(feature = "raw")]
 fn probe_source(path: &std::path::Path) -> DevelopSource {
     use crate::raw::{probe, RawSupport};
@@ -83,6 +97,7 @@ fn probe_source(path: &std::path::Path) -> DevelopSource {
             token: None,
             camera_ev: None,
             as_shot_wb: None,
+            lens: None,
         },
         RawSupport::Unsupported { camera, reason } => DevelopSource::Unsupported { camera, reason },
     }

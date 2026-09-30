@@ -75,10 +75,36 @@ Not taken, deliberately:
 2. **Vignetting.** Record field, gain in the framed base, Darkroom toggle, overlay test
    before the gain, export = view. Proof: corner/centre EV change on the corpus; old
    versions byte-identical; parity check still passes.
+   **Built, not committed — blocked on a finding (2026-09-29).** The mechanism works
+   (record field, gain before geometry in `working_base`, overlay ignores the gain, export
+   = view, Lens switch in the rail), but `develop::tests::corpus_lens_correction_brings_corners_to_the_cameras`
+   (7 ARWs, `--release`) shows the *uncorrected* render already matches the camera JPEG's
+   corner-to-centre falloff (mean gap 0.06 EV) and applying Sony's table overshoots
+   (0.39 EV, corners brighter than the camera's). Hypotheses, not yet told apart: (1) with
+   Shading Compensation on Auto (every file here) Sony applies it to the raw data, so the
+   table would double-correct; (2) the embedded preview is uncorrected too and is the wrong
+   reference. Deciding test, asked of the user: an evenly lit plain surface, FE 85mm at
+   f/1.8, one ARW with Shading Compensation Auto and one Off.
 3. **Distortion + lateral CA.** Per-channel radial resample with the fill scale (trim the
    undefined border). Measure with the edit bench first: a full-resolution warp on every
    geometry miss of a 67 MP image may break the 50 ms preloaded target; if so, fuse it with
    the perspective warp or run it at output resolution.
+   **Built, not committed (2026-09-29).** `radial_pass` in `plugins/edit`: one pass over
+   the output reading the decode directly — each output pixel reads each channel at
+   `r·fill·s_c(r·fill)`, bilinear, times the vignetting gain at green's source radius;
+   scales and gain tabulated in r². The fill keeps every sample inside the picture and
+   the output keeps the working image's size. The clipping overlay uses the same warp
+   without the gain (`BaseFor::SensorClip`, part of the framed-base key). Tests: identity
+   for flat tables, each channel read at the radius the table names, no read outside the
+   frame, export = view, overlay follows the warp. **Cost** (`plugins::edit::bench`,
+   release, 9984×6656): the full pass 219 ms against a 147 ms plain copy; vignetting alone
+   costs the same as the copy. A photo's first render per size 146 → 235 ms with the
+   correction on (552 ms before the one-pass rewrite); a straighten miss 1433 → 1521 ms —
+   the full-resolution rotation, not the lens, dominates that. Follow-on: a
+   RAWmakase-style single inverse map from a resolution pyramid would make all preview
+   geometry output-sized (RAWmakase `src/develop/pyramid.rs`, `Geometry::source`,
+   `docs/preview-performance.md`); correcting at 2× the tier measured 43 ms at 720 px,
+   mean 0.6–0.9 levels from the exact order on _DSC7742.
 4. **Default for new edits.** Decided with the user on their own photos.
 
 ## Out of scope / follow-ons

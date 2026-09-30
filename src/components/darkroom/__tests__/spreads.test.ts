@@ -48,11 +48,13 @@ describe("proofSpread", () => {
       crop: { x: 0.1, y: 0.2, w: 0.5, h: 0.5, aspect: "1:1" },
       straighten: 1.5,
       perspective: { tl: [0, 0], tr: [1, 0], br: [1, 1], bl: [0, 1] },
+      lens: { builtin: true },
     };
     for (const c of proofSpread(base, AUTO, MANY_PRESETS)) {
       expect(c.record.crop).toEqual(base.crop);
       expect(c.record.straighten).toBe(1.5);
       expect(c.record.perspective).toEqual(base.perspective);
+      expect(c.record.lens, "adopting a proof keeps the lens correction").toEqual({ builtin: true });
     }
   });
 

@@ -62,6 +62,9 @@ function changedControls(prev: VersionEdit, next: VersionEdit): [string, string]
   if (!same(prev.perspective, next.perspective)) {
     out.push(["perspective", next.perspective ? "Perspective" : "Perspective removed"]);
   }
+  if (!!prev.lens?.builtin !== !!next.lens?.builtin) {
+    out.push(["lens", next.lens?.builtin ? "Lens correction on" : "Lens correction off"]);
+  }
   if (!same(prev.bw, next.bw)) out.push(["bw", next.bw?.enabled ? "Black & white" : "Colour"]);
   if (!same(prev.split, next.split)) out.push(["split", "Split toning"]);
   if (!same(prev.grain, next.grain)) out.push(["grain", "Grain"]);

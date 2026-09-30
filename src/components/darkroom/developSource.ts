@@ -1,6 +1,6 @@
 // The Darkroom's source badge (docs/plans/raw-foundation, mockup 01-preparing): what the
 // stage is rendering from, in words. Pure — DarkroomView feeds it the probe result.
-import type { DevelopSource } from "../../modules/api";
+import type { DevelopSource, LensInfo } from "../../modules/api";
 
 export interface SourceBadge {
   /** Short text for the bar. */
@@ -62,11 +62,13 @@ export interface SourceState {
   cameraEv: number;
   /** The resident RAW's as-shot light, for Kelvin white balance (null when unknown). */
   asShotWb: { kelvin: number; tint: number } | null;
+  /** The resident RAW's lens tables (null off the RAW or when the camera wrote none). */
+  lens: LensInfo | null;
   /** The latest source, for the badge. */
   source: DevelopSource | null;
 }
 
-export const INITIAL_SOURCE: SourceState = { token: undefined, engine: 1, cameraEv: 0, asShotWb: null, source: null };
+export const INITIAL_SOURCE: SourceState = { token: undefined, engine: 1, cameraEv: 0, asShotWb: null, lens: null, source: null };
 
 /** Fold a source event in. Events for another photo are ignored; a resident RAW yields its
  *  token and engine 2; anything else drops back to the preview path. Pure. */
@@ -74,7 +76,7 @@ export function reduceSource(prev: SourceState, e: DevelopSource & { photoId?: n
   if (e.photoId !== undefined && e.photoId !== photoId) return prev;
   if (e.source === "raw" && e.token) {
     const asShotWb = e.asShotWb ? { kelvin: e.asShotWb[0], tint: e.asShotWb[1] } : null;
-    return { token: e.token, engine: 2, cameraEv: e.cameraEv ?? 0, asShotWb, source: e };
+    return { token: e.token, engine: 2, cameraEv: e.cameraEv ?? 0, asShotWb, lens: e.lens ?? null, source: e };
   }
-  return { token: undefined, engine: 1, cameraEv: 0, asShotWb: null, source: e };
+  return { token: undefined, engine: 1, cameraEv: 0, asShotWb: null, lens: null, source: e };
 }

@@ -1,6 +1,6 @@
 // Proof-spread candidates for the Darkroom (docs/plans/darkroom): pure record maths,
 // no IO — unit-tested. A candidate never touches the base's framing: crop, straighten,
-// and perspective travel through untouched. Look cells replace the look wholesale —
+// perspective and the lens corrections travel through untouched. Look cells replace the look wholesale —
 // zones included, since a fresh look deserves a flat strip — while Auto cells keep the
 // base's look and only fix its tone.
 import type { Tone, VersionEdit } from "../../modules/editing";
@@ -17,10 +17,11 @@ export const PROOF_CELLS = 12;
 
 const geometryOf = (
   base: VersionEdit,
-): Pick<VersionEdit, "crop" | "straighten" | "perspective"> => ({
+): Pick<VersionEdit, "crop" | "straighten" | "perspective" | "lens"> => ({
   ...(base.crop ? { crop: base.crop } : {}),
   ...(base.straighten !== undefined ? { straighten: base.straighten } : {}),
   ...(base.perspective ? { perspective: base.perspective } : {}),
+  ...(base.lens ? { lens: base.lens } : {}),
 });
 
 /** Sparse-over-sparse tone merge (`b`'s keys win); undefined when both are absent. */

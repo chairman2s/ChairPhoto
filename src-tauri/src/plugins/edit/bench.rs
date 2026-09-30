@@ -156,3 +156,96 @@ fn render_stage_timings() {
     }
     println!("{{\"edge\":1024,\"masses_pass_ms\":{:.2}}}", median(masses_ms));
 }
+
+/// Ignored bench (docs/plans/lens-corrections, slice 3): what the camera's lens corrections
+/// cost a framed-base miss on an A7R VI-sized working image (9984×6656) — against the
+/// plain copy a miss pays without them: the vignetting-only pass and the full pass
+/// (vignetting, distortion, lateral CA). Medians of `CHAIRPHOTO_EDIT_BENCH_N` runs
+/// (default 5), one JSON line:
+/// `cargo test [--release] --lib plugins::edit::bench::lens_stage_timings -- --ignored --nocapture`.
+#[cfg(feature = "raw")]
+#[test]
+#[ignore = "lens-correction stage bench; prints timings"]
+fn lens_stage_timings() {
+    let n: usize = std::env::var("CHAIRPHOTO_EDIT_BENCH_N").ok().and_then(|v| v.parse().ok()).unwrap_or(5);
+    let (w, h) = (9984u32, 6656u32);
+    let src = Rgb32FImage::from_fn(w, h, |x, y| image::Rgb([x as f32 / w as f32, y as f32 / h as f32, 0.3]));
+    let radial = |values: Vec<f32>| crate::lens::Radial { knots: (0..16).map(|i| i as f32 / 15.0).collect(), values };
+    // Shaped like _DSC7742's tables (Sigma 24-70 at 25 mm): barrel to −4.75 %, CA ±0.02 %.
+    let lens = crate::lens::LensCorrection {
+        source: "bench".into(),
+        vignetting: Some(radial((0..16).map(|i| 1.0 + i as f32 * 0.023).collect())),
+        distortion: Some(radial((0..16).map(|i| 1.0 - i as f32 * 0.0032).collect())),
+        chromatic: Some([radial(vec![1.0002; 16]), radial(vec![0.9999; 16])]),
+    };
+    let median = |mut v: Vec<f64>| {
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        v[v.len() / 2]
+    };
+    let time = |f: &dyn Fn() -> Rgb32FImage| {
+        median(
+            (0..n)
+                .map(|_| {
+                    let t = Instant::now();
+                    std::hint::black_box(f());
+                    t.elapsed().as_secs_f64() * 1e3
+                })
+                .collect(),
+        )
+    };
+    let copy = time(&|| src.clone());
+    let vignetting = time(&|| radial_pass(&src, &lens, false, lens.vignetting.as_ref()));
+    let full = time(&|| radial_pass(&src, &lens, true, lens.vignetting.as_ref()));
+    println!(
+        "{{\"bench\":\"lens_stages\",\"profile\":\"{}\",\"px\":\"{w}x{h}\",\"n\":{n},\"copy_ms\":{copy:.0},\"vignetting_ms\":{vignetting:.0},\"full_ms\":{full:.0}}}",
+        timing::PROFILE
+    );
+}
+
+/// Ignored bench: a whole framed-base miss (stage render at 720 px after a straighten
+/// change) on an A7R VI-sized working image, with the lens correction off and on — the
+/// cost a straighten drag frame or a photo's first render pays.
+#[cfg(feature = "raw")]
+#[test]
+#[ignore = "lens-correction render bench; prints timings"]
+fn lens_framed_miss_timings() {
+    let n: usize = std::env::var("CHAIRPHOTO_EDIT_BENCH_N").ok().and_then(|v| v.parse().ok()).unwrap_or(5);
+    let (w, h) = (9984u32, 6656u32);
+    let radial = |values: Vec<f32>| crate::lens::Radial { knots: (0..16).map(|i| i as f32 / 15.0).collect(), values };
+    let mut img = super::tests_support_working(w, h);
+    img.lens = Some(crate::lens::LensCorrection {
+        source: "bench".into(),
+        vignetting: Some(radial((0..16).map(|i| 1.0 + i as f32 * 0.023).collect())),
+        distortion: Some(radial((0..16).map(|i| 1.0 - i as f32 * 0.0032).collect())),
+        chromatic: Some([radial(vec![1.0002; 16]), radial(vec![0.9999; 16])]),
+    });
+    let img = std::sync::Arc::new(img);
+    let median = |mut v: Vec<f64>| {
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        v[v.len() / 2]
+    };
+    let mut line = format!("{{\"bench\":\"lens_framed_miss\",\"profile\":\"{}\",\"px\":\"{w}x{h}\",\"n\":{n}", timing::PROFILE);
+    for (name, lens) in [("off", ""), ("on", r#","lens":{"builtin":true}"#)] {
+        let mut v = vec![];
+        for i in 0..n {
+            // A new straighten angle every run: always a miss, as during a drag.
+            let json = format!(r#"{{"engine":2,"display":"camera.2","straighten":{}{lens}}}"#, 0.5 + i as f32 * 0.1);
+            let token = SourceToken::Working { photo_id: 77, generation: 1 };
+            let t = Instant::now();
+            std::hint::black_box(render_proxy(RenderSource::Working { token, image: img.clone() }, &json, 720, RenderOpts::default()).unwrap());
+            v.push(t.elapsed().as_secs_f64() * 1e3);
+        }
+        line.push_str(&format!(",\"straighten_{name}_ms\":{:.0}", median(v)));
+        let mut v = vec![];
+        for i in 0..n {
+            // No geometry, a new photo token every run: the first render of an opened photo.
+            let json = format!(r#"{{"engine":2,"display":"camera.2"{lens}}}"#);
+            let token = SourceToken::Working { photo_id: 78, generation: 10 + i as u64 };
+            let t = Instant::now();
+            std::hint::black_box(render_proxy(RenderSource::Working { token, image: img.clone() }, &json, 720, RenderOpts::default()).unwrap());
+            v.push(t.elapsed().as_secs_f64() * 1e3);
+        }
+        line.push_str(&format!(",\"open_{name}_ms\":{:.0}", median(v)));
+    }
+    println!("{line}}}");
+}

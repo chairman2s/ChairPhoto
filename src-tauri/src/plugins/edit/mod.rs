@@ -27,6 +27,8 @@ use image::{DynamicImage, GenericImageView, ImageBuffer, Pixel, Rgb, Rgb32FImage
 use std::sync::Mutex;
 use look::{Bw, Grain, Split};
 use serde::Deserialize;
+#[cfg(feature = "raw")]
+use crate::lens::Radial;
 
 /// A version's edit record. All fields optional/defaulted so a partial/empty record
 /// renders as a no-op (an unedited copy).
@@ -79,6 +81,18 @@ struct EditRecord {
     /// shown on the Exposure slider. Absent = 0, so older records render as they did.
     #[serde(default, rename = "cameraEv")]
     camera_ev: f32,
+    /// Engine 2: lens corrections from the camera's own tables (docs/plans/lens-corrections).
+    /// Absent = none, so every version saved before renders as it did.
+    #[serde(default)]
+    lens: Option<LensRec>,
+}
+
+/// Which of the camera's lens corrections a record applies.
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct LensRec {
+    /// The camera's built-in tables (`WorkingImage::lens`). Slice 2 applies vignetting.
+    builtin: bool,
 }
 
 fn engine_v1() -> u32 {
@@ -317,7 +331,7 @@ pub fn render_image_opts(
             finish_look(framed.to_rgb8(), &edit, opts, &mut t)
         }
         (2, RenderSource::Working { image, .. }) => {
-            let framed = frame_image(DynamicImage::ImageRgb32F(image.linear.clone()), &edit, max_edge, &mut t);
+            let framed = frame_image(working_base(&image, &edit, BaseFor::Render, &mut t), &edit, max_edge, &mut t);
             finish_linear(framed.into_rgb32f(), &edit, &image, opts, &mut t)?
         }
         (1, RenderSource::Working { .. }) => {
@@ -353,7 +367,7 @@ pub fn render_proxy(
     let rgb = match (edit.engine, src) {
         (1, RenderSource::PreviewJpeg(jpeg)) => {
             let fp = jpeg_fingerprint(jpeg);
-            let key = FramedKey { source: fp, geometry, max_edge };
+            let key = FramedKey { source: fp, geometry, max_edge, purpose: BaseFor::Render };
             let base = match framed_cache_get(&key) {
                 Some(FramedBase::Rgb8(base)) => {
                     t.mark("framed_cache_hit");
@@ -371,7 +385,7 @@ pub fn render_proxy(
             finish_look(base, &edit, opts, &mut t)
         }
         (2, RenderSource::Working { token, image }) => {
-            let base = framed_linear(&token, &image, &edit, geometry, max_edge, &mut t);
+            let base = framed_linear(&token, &image, &edit, geometry, max_edge, BaseFor::Render, &mut t);
             finish_linear(base, &edit, &image, opts, &mut t)?
         }
         (1, _) => return Err("engine 1 renders from the camera preview".into()),
@@ -390,14 +404,15 @@ fn framed_linear(
     edit: &EditRecord,
     geometry: u64,
     max_edge: u32,
+    purpose: BaseFor,
     t: &mut timing::Stages,
 ) -> Rgb32FImage {
-    let key = FramedKey { source: token_fingerprint(token), geometry, max_edge };
+    let key = FramedKey { source: token_fingerprint(token), geometry, max_edge, purpose };
     if let Some(FramedBase::Linear(base)) = framed_cache_get(&key) {
         t.mark("framed_cache_hit");
         return base;
     }
-    let framed = frame_image(DynamicImage::ImageRgb32F(image.linear.clone()), edit, max_edge, t);
+    let framed = frame_image(working_base(image, edit, purpose, t), edit, max_edge, t);
     let base = framed.into_rgb32f();
     // A full-size linear base is ~800 MB for a 67 MP frame and the cache copies on every
     // hit: only screen-sized bases are kept.
@@ -406,6 +421,119 @@ fn framed_linear(
         t.mark("framed_cache_put");
     }
     base
+}
+
+/// What a working base is for: the rendered picture, or the sensor-clipping overlay —
+/// the same geometry, lens distortion included, but without the vignetting gain, which
+/// lifts corners past white without anything having clipped.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+enum BaseFor {
+    Render,
+    SensorClip,
+}
+
+/// The working image as the record's geometry starts from it: the decode, with the
+/// camera's lens corrections when the record asks for them and the file has tables. The
+/// one place both the stage (through the framed-base cache) and the export build their
+/// base, so the two cannot disagree.
+fn working_base(image: &WorkingImage, edit: &EditRecord, purpose: BaseFor, t: &mut timing::Stages) -> DynamicImage {
+    #[cfg(feature = "raw")]
+    if let Some(corrected) = lens_corrected(image, edit, purpose) {
+        t.mark("lens");
+        return DynamicImage::ImageRgb32F(corrected);
+    }
+    #[cfg(not(feature = "raw"))]
+    let _ = (edit, purpose);
+    let linear = image.linear.clone();
+    t.mark("working_clone");
+    DynamicImage::ImageRgb32F(linear)
+}
+
+/// The working image with the record's lens corrections, or `None` when there is nothing
+/// to correct (the caller then copies the decode as it is).
+#[cfg(feature = "raw")]
+fn lens_corrected(image: &WorkingImage, edit: &EditRecord, purpose: BaseFor) -> Option<Rgb32FImage> {
+    if !edit.lens.as_ref().is_some_and(|l| l.builtin) {
+        return None;
+    }
+    let lens = image.lens.as_ref()?;
+    let gain = lens.vignetting.as_ref().filter(|_| purpose == BaseFor::Render);
+    let warp = lens.distortion.is_some() || lens.chromatic.is_some();
+    if !warp && gain.is_none() {
+        return None;
+    }
+    Some(radial_pass(&image.linear, lens, warp, gain))
+}
+
+/// Entries of [`radial_pass`]'s tables over r² ∈ [0, 1].
+#[cfg(feature = "raw")]
+const RADIAL_LUT: usize = 4096;
+
+/// The camera's lens corrections in one pass over the output, reading the decode directly
+/// (docs/plans/lens-corrections; one pass instead of copy, gain pass and warp measured
+/// 522 → 193 ms on 67 MP, agent-notes research 2026-09-29).
+///
+/// - `warp`: distortion and lateral chromatic aberration. Each output pixel reads each
+///   channel from the source at its own radius (`LensCorrection::radial_scale`),
+///   bilinearly. Output radii are first scaled by `fill_scale`, so every sample lands
+///   inside the picture — the undefined border a correction opens is cropped away — and
+///   the output keeps the working image's size, so crop fractions keep meaning the frame.
+/// - `gain`: vignetting, the table's gain at the source radius (green's, when warping:
+///   the channels' radii differ by lateral CA, a few pixels at most).
+///
+/// Radius 0 is the image centre, 1 the corner (half the diagonal): the working image is
+/// the camera's picture in display orientation and the model is radial. The scales and
+/// the gain are tabulated in r², so a pixel pays no square root and no knot search.
+#[cfg(feature = "raw")]
+fn radial_pass(src: &Rgb32FImage, lens: &crate::lens::LensCorrection, warp: bool, gain: Option<&Radial>) -> Rgb32FImage {
+    use rayon::prelude::*;
+    let (w, h) = (src.width() as usize, src.height() as usize);
+    let (cx, cy) = (w as f32 * 0.5, h as f32 * 0.5);
+    let half = ((w * w + h * h) as f32).sqrt() * 0.5;
+    let fill = if warp { lens.fill_scale() } else { 1.0 };
+    let lut: Vec<[f32; 4]> = (0..=RADIAL_LUT)
+        .map(|i| {
+            let r = (i as f32 / RADIAL_LUT as f32).sqrt();
+            let s = if warp { lens.radial_scale(r) } else { [1.0; 3] };
+            [s[0], s[1], s[2], gain.map_or(1.0, |g| g.eval(r * s[1]))]
+        })
+        .collect();
+    let lut_per_r2 = RADIAL_LUT as f32 / (half * half);
+    let data = src.as_raw();
+    let mut out = Rgb32FImage::new(w as u32, h as u32);
+    out.as_mut().par_chunks_mut(w * 3).enumerate().for_each(|(y, row)| {
+        let dy = (y as f32 + 0.5 - cy) * fill;
+        for (x, px) in row.chunks_exact_mut(3).enumerate() {
+            let dx = (x as f32 + 0.5 - cx) * fill;
+            let t = ((dx * dx + dy * dy) * lut_per_r2).min(RADIAL_LUT as f32 - 1.0);
+            let i = t as usize;
+            let f = t - i as f32;
+            let (a, b) = (lut[i], lut[i + 1]);
+            let g = a[3] + (b[3] - a[3]) * f;
+            if !warp {
+                let at = (y * w + x) * 3;
+                for c in 0..3 {
+                    px[c] = data[at + c] * g;
+                }
+                continue;
+            }
+            for c in 0..3 {
+                let s = a[c] + (b[c] - a[c]) * f;
+                // Bilinear, clamped to the picture (the fill keeps samples inside; the
+                // clamp only guards rounding at the very edge).
+                let sx = (cx + dx * s - 0.5).clamp(0.0, (w - 1) as f32);
+                let sy = (cy + dy * s - 0.5).clamp(0.0, (h - 1) as f32);
+                let (x0, y0) = (sx as usize, sy as usize);
+                let (x1, y1) = ((x0 + 1).min(w - 1), (y0 + 1).min(h - 1));
+                let (fx, fy) = (sx - x0 as f32, sy - y0 as f32);
+                let p = |xx: usize, yy: usize| data[(yy * w + xx) * 3 + c];
+                let top = p(x0, y0) + (p(x1, y0) - p(x0, y0)) * fx;
+                let bot = p(x0, y1) + (p(x1, y1) - p(x0, y1)) * fx;
+                px[c] = (top + (bot - top) * fy) * g;
+            }
+        }
+    });
+    out
 }
 
 /// A pixel of the framed working image counts as sensor-clipped when any channel is at
@@ -429,7 +557,8 @@ pub fn clip_overlay_png(
         return Err("the sensor-clipping overlay is for engine-2 records".into());
     }
     let mut t = timing::Stages::start(format!("clip_overlay max_edge={max_edge}"));
-    let base = framed_linear(&token, &image, &edit, geometry_fingerprint(&edit), max_edge, &mut t);
+    // The stage's geometry, lens distortion included, without the vignetting gain.
+    let base = framed_linear(&token, &image, &edit, geometry_fingerprint(&edit), max_edge, BaseFor::SensorClip, &mut t);
     let mask = image::RgbaImage::from_fn(base.width(), base.height(), |x, y| {
         if base.get_pixel(x, y).0.iter().any(|&c| c >= CLIP_AT) {
             image::Rgba([255, 0, 255, 190])
@@ -589,6 +718,8 @@ struct FramedKey {
     /// [`geometry_fingerprint`] of the record.
     geometry: u64,
     max_edge: u32,
+    /// The picture or the clipping overlay's base (engine 1 is always `Render`).
+    purpose: BaseFor,
 }
 
 /// A framed base of either engine.
@@ -669,6 +800,8 @@ fn geometry_fingerprint(edit: &EditRecord) -> u64 {
         }
         None => 0u8.hash(&mut h),
     }
+    // The lens corrections are applied to the base before the geometry (`working_base`).
+    edit.lens.as_ref().is_some_and(|l| l.builtin).hash(&mut h);
     h.finish()
 }
 
@@ -875,6 +1008,23 @@ where
     Rgb(out)
 }
 
+/// A plain full-size working image for the lens benches.
+#[cfg(all(test, feature = "raw"))]
+fn tests_support_working(w: u32, h: u32) -> WorkingImage {
+    WorkingImage {
+        width: w,
+        height: h,
+        linear: Rgb32FImage::from_fn(w, h, |x, y| image::Rgb([x as f32 / w as f32, y as f32 / h as f32, 0.3])),
+        cam_mul: [1.0; 4],
+        pre_mul: [1.0; 4],
+        rgb_cam: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+        wbct: Vec::new(),
+        decoder: "bench",
+        camera_ev: None,
+        lens: None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1074,6 +1224,243 @@ mod tests {
             let view = render_proxy(RenderSource::Working { token, image: img.clone() }, json, 0, RenderOpts::default()).unwrap();
             assert_eq!(export.to_rgb8().as_raw(), view.to_rgb8().as_raw(), "{json}");
         }
+    }
+
+    /// A uniform grey working image whose camera table doubles the light at the corner
+    /// (knots at radius 0 and 1, gain 1 → 2), for the lens tests.
+    #[cfg(feature = "raw")]
+    fn vignetted_working(level: f32) -> std::sync::Arc<WorkingImage> {
+        let mut img = synthetic_working(0.4).clone_for_test();
+        img.linear = Rgb32FImage::from_pixel(64, 48, image::Rgb([level; 3]));
+        img.lens = Some(crate::lens::LensCorrection {
+            source: "test".into(),
+            vignetting: Some(crate::lens::Radial { knots: vec![0.0, 1.0], values: vec![1.0, 2.0] }),
+            distortion: None,
+            chromatic: None,
+        });
+        std::sync::Arc::new(img)
+    }
+
+    #[cfg(feature = "raw")]
+    const LENS_ON: &str = r#"{"engine": 2, "display": "camera.2", "lens": {"builtin": true}}"#;
+
+    /// The gain is the table's at each pixel's radius: centre ×~1, corner ×~2 (the corner
+    /// pixel's centre sits just inside radius 1).
+    #[cfg(feature = "raw")]
+    #[test]
+    fn vignetting_multiplies_each_pixel_by_the_table_at_its_radius() {
+        let img = vignetted_working(0.25);
+        let edit = parse_record(LENS_ON).unwrap();
+        let mut t = timing::Stages::start("test");
+        let base = working_base(&img, &edit, BaseFor::Render, &mut t).into_rgb32f();
+        let centre = base.get_pixel(32, 24).0[1];
+        let corner = base.get_pixel(0, 0).0[1];
+        assert!((centre / 0.25 - 1.0).abs() < 0.02, "centre gain {}", centre / 0.25);
+        assert!((corner / 0.25 - 2.0).abs() < 0.03, "corner gain {}", corner / 0.25);
+        // Symmetric about the centre: the four corners agree.
+        for (x, y) in [(63, 0), (0, 47), (63, 47)] {
+            assert!((base.get_pixel(x, y).0[1] - corner).abs() < 1e-6, "corner ({x},{y})");
+        }
+        // Values above white survive: the gain works in linear light, not on a clipped image.
+        assert!(working_base(&vignetted_working(0.8), &edit, BaseFor::Render, &mut t).into_rgb32f().get_pixel(0, 0).0[0] > 1.5);
+    }
+
+    /// Every record saved before this feature has no `lens`: it renders byte-identically
+    /// whether or not the working image carries tables, and so does `builtin: false`.
+    #[cfg(feature = "raw")]
+    #[test]
+    fn a_record_without_lens_renders_as_before_even_when_the_file_has_tables() {
+        let with_tables = vignetted_working(0.3);
+        let mut bare = with_tables.clone_for_test();
+        bare.lens = None;
+        let bare = std::sync::Arc::new(bare);
+        let render = |image: &std::sync::Arc<WorkingImage>, json: &str, gen: u64| {
+            let token = SourceToken::Working { photo_id: 21, generation: gen };
+            render_proxy(RenderSource::Working { token, image: image.clone() }, json, 0, RenderOpts::default()).unwrap().to_rgb8()
+        };
+        let old = r#"{"engine": 2, "display": "camera.2"}"#;
+        let off = r#"{"engine": 2, "display": "camera.2", "lens": {"builtin": false}}"#;
+        let reference = render(&bare, old, 1);
+        assert_eq!(render(&with_tables, old, 2).as_raw(), reference.as_raw());
+        assert_eq!(render(&with_tables, off, 3).as_raw(), reference.as_raw());
+        // A file without tables ignores the switch rather than failing.
+        assert_eq!(render(&bare, LENS_ON, 4).as_raw(), render(&bare, r#"{"engine": 2, "display": "camera.2"}"#, 5).as_raw());
+    }
+
+    /// The stage toggling the correction on the same working image gets the corrected
+    /// pixels, never the uncorrected base from the framed-base cache — and back.
+    #[cfg(feature = "raw")]
+    #[test]
+    fn toggling_the_lens_correction_is_never_a_stale_framed_base() {
+        let img = vignetted_working(0.2);
+        let token = SourceToken::Working { photo_id: 22, generation: 1 };
+        let render = |json: &str| {
+            render_proxy(RenderSource::Working { token: token.clone(), image: img.clone() }, json, 48, RenderOpts::default()).unwrap().to_rgb8()
+        };
+        let off = render(r#"{"engine": 2, "display": "camera.2"}"#);
+        let on = render(LENS_ON);
+        assert!(on.get_pixel(0, 0).0[1] > off.get_pixel(0, 0).0[1], "the corner brightens");
+        assert!(
+            (on.get_pixel(24, 18).0[1] as i32 - off.get_pixel(24, 18).0[1] as i32).abs() <= 2,
+            "the centre barely moves"
+        );
+        assert_eq!(render(r#"{"engine": 2, "display": "camera.2"}"#).as_raw(), off.as_raw());
+    }
+
+    /// Export = view with the correction on, straightened and cropped alike.
+    #[cfg(feature = "raw")]
+    #[test]
+    fn export_with_lens_correction_is_the_view() {
+        let img = vignetted_working(0.3);
+        for (gen, json) in [
+            LENS_ON,
+            r#"{"engine": 2, "display": "camera.2", "lens": {"builtin": true}, "straighten": 3, "crop": {"x": 0.1, "y": 0.1, "w": 0.7, "h": 0.8}, "tone": {"ev": 0.3}}"#,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let token = SourceToken::Working { photo_id: 23, generation: 200 + gen as u64 };
+            let export = render_image_opts(RenderSource::Working { token: token.clone(), image: img.clone() }, json, 0, RenderOpts::default()).unwrap();
+            let view = render_proxy(RenderSource::Working { token, image: img.clone() }, json, 0, RenderOpts::default()).unwrap();
+            assert_eq!(export.to_rgb8().as_raw(), view.to_rgb8().as_raw(), "{json}");
+        }
+    }
+
+    /// The overlay marks what the sensor clipped. Corners lifted past white by the
+    /// vignetting gain did not clip: the overlay is the same with the correction on or off.
+    #[cfg(feature = "raw")]
+    #[test]
+    fn the_clipping_overlay_ignores_the_vignetting_gain() {
+        // 0.7 is far from white; the corner gain takes it to ~1.4.
+        let img = vignetted_working(0.7);
+        let token = SourceToken::Working { photo_id: 24, generation: 1 };
+        let on = clip_overlay_png(token.clone(), img.clone(), LENS_ON, 32).unwrap();
+        let off = clip_overlay_png(token, img, r#"{"engine": 2, "display": "camera.2"}"#, 32).unwrap();
+        let marked = |png: &[u8]| image::load_from_memory(png).unwrap().to_rgba8().pixels().filter(|p| p.0[3] > 0).count();
+        assert_eq!(marked(&on), 0, "nothing clipped on the sensor");
+        assert_eq!(on, off);
+    }
+
+    /// A lens with only distortion/CA tables, knots at radius 0 and 1.
+    #[cfg(feature = "raw")]
+    fn warp_lens(distortion: [f32; 2], red: [f32; 2], blue: [f32; 2]) -> crate::lens::LensCorrection {
+        let radial = |v: [f32; 2]| crate::lens::Radial { knots: vec![0.0, 1.0], values: v.to_vec() };
+        crate::lens::LensCorrection {
+            source: "test".into(),
+            vignetting: None,
+            distortion: Some(radial(distortion)),
+            chromatic: Some([radial(red), radial(blue)]),
+        }
+    }
+
+    /// Each channel holds the normalized source radius of its pixel: after the remap, a
+    /// channel's value says which source radius it was read from.
+    #[cfg(feature = "raw")]
+    fn radius_image(w: u32, h: u32) -> Rgb32FImage {
+        let half = ((w * w + h * h) as f32).sqrt() * 0.5;
+        Rgb32FImage::from_fn(w, h, |x, y| {
+            let (dx, dy) = (x as f32 + 0.5 - w as f32 * 0.5, y as f32 + 0.5 - h as f32 * 0.5);
+            image::Rgb([(dx * dx + dy * dy).sqrt() / half; 3])
+        })
+    }
+
+    /// No distortion is no change, byte for byte; and a constant radial scale is a zoom
+    /// the fill scale takes back out, so it is no change either.
+    #[cfg(feature = "raw")]
+    #[test]
+    fn remap_is_the_identity_for_flat_tables() {
+        let src = Rgb32FImage::from_fn(40, 30, |x, y| image::Rgb([x as f32 * 0.01, y as f32 * 0.02, (x + y) as f32 * 0.005]));
+        let same = radial_pass(&src, &warp_lens([1.0, 1.0], [1.0, 1.0], [1.0, 1.0]), true, None);
+        assert_eq!(same.as_raw(), src.as_raw());
+        let zoom = radial_pass(&src, &warp_lens([1.02, 1.02], [1.0, 1.0], [1.0, 1.0]), true, None);
+        let worst = zoom.as_raw().iter().zip(src.as_raw()).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        assert!(worst < 1e-4, "a constant scale is cancelled by the fill (max |Δ| {worst})");
+    }
+
+    /// Each output pixel reads the source radius the table names: r_src = r·fill·s(r·fill),
+    /// for green; red and blue add their own CA scale. Checked on a radius-valued image.
+    #[cfg(feature = "raw")]
+    #[test]
+    fn remap_reads_each_channel_from_the_radius_the_table_names() {
+        let (w, h) = (300u32, 200u32);
+        let src = radius_image(w, h);
+        // Barrel correction (source radius shrinks to 0.95 at the corner), red fringe
+        // 1% outward, blue 0.5% inward.
+        let lens = warp_lens([1.0, 0.95], [1.01, 1.01], [0.995, 0.995]);
+        let fill = lens.fill_scale();
+        let out = radial_pass(&src, &lens, true, None);
+        let half = ((w * w + h * h) as f32).sqrt() * 0.5;
+        for (x, y) in [(150, 100), (250, 150), (10, 10), (299, 0), (60, 180)] {
+            let (dx, dy) = (x as f32 + 0.5 - w as f32 * 0.5, y as f32 + 0.5 - h as f32 * 0.5);
+            let r = (dx * dx + dy * dy).sqrt() / half * fill;
+            let s = lens.radial_scale(r);
+            let got = out.get_pixel(x, y).0;
+            for c in 0..3 {
+                // Bilinear interpolation of a radial ramp is within a pixel's worth of radius.
+                assert!((got[c] - r * s[c]).abs() < 1.5 / half, "({x},{y}) channel {c}: {} vs {}", got[c], r * s[c]);
+            }
+        }
+        // Red is read from farther out than green, blue from nearer — at the corner.
+        let corner = out.get_pixel(299, 199).0;
+        assert!(corner[0] > corner[1] && corner[1] > corner[2], "{corner:?}");
+    }
+
+    /// Pincushion correction (source radius grows) would read past the frame: the fill
+    /// scale pulls the output in so every corner sample is inside the picture.
+    #[cfg(feature = "raw")]
+    #[test]
+    fn remap_never_reads_outside_the_picture() {
+        let (w, h) = (120u32, 80u32);
+        let lens = warp_lens([1.0, 1.06], [1.0, 1.0], [1.0, 1.0]);
+        let out = radial_pass(&radius_image(w, h), &lens, true, None);
+        for (x, y) in [(0, 0), (w - 1, 0), (0, h - 1), (w - 1, h - 1)] {
+            let v = out.get_pixel(x, y).0[1];
+            assert!(v <= 1.0 + 1e-3, "corner ({x},{y}) read radius {v}, outside the picture");
+            assert!(v > 0.97, "and it still reaches the corner, not a shrunken frame ({v})");
+        }
+    }
+
+    /// The whole engine: a record with the correction on renders the remapped picture, the
+    /// export is the view, and the clipping overlay follows the warp (a clipped patch at
+    /// the corner moves with it) without the vignetting gain.
+    #[cfg(feature = "raw")]
+    #[test]
+    fn distortion_through_the_engine_is_the_view_and_the_overlay_follows_it() {
+        let mut img = synthetic_working(0.4).clone_for_test();
+        let (w, h) = (96u32, 64u32);
+        // Sensor white in a block near the top-left corner, a ramp elsewhere.
+        img.linear = Rgb32FImage::from_fn(w, h, |x, y| {
+            if (6..14).contains(&x) && (6..12).contains(&y) {
+                image::Rgb([1.0; 3])
+            } else {
+                image::Rgb([0.2 + x as f32 * 0.003; 3])
+            }
+        });
+        img.width = w;
+        img.height = h;
+        img.lens = Some(warp_lens([1.0, 0.9], [1.0, 1.0], [1.0, 1.0]));
+        let img = std::sync::Arc::new(img);
+        let token = SourceToken::Working { photo_id: 31, generation: 1 };
+        let export = render_image_opts(RenderSource::Working { token: token.clone(), image: img.clone() }, LENS_ON, 0, RenderOpts::default()).unwrap();
+        let view = render_proxy(RenderSource::Working { token: token.clone(), image: img.clone() }, LENS_ON, 0, RenderOpts::default()).unwrap();
+        assert_eq!(export.to_rgb8().as_raw(), view.to_rgb8().as_raw());
+        let marked = |json: &str| {
+            let png = clip_overlay_png(token.clone(), img.clone(), json, 0).unwrap();
+            let m = image::load_from_memory(&png).unwrap().to_rgba8();
+            let pts: Vec<(u32, u32)> = m.enumerate_pixels().filter(|(_, _, p)| p.0[3] > 0).map(|(x, y, _)| (x, y)).collect();
+            pts
+        };
+        let off = marked(r#"{"engine": 2, "display": "camera.2"}"#);
+        let on = marked(LENS_ON);
+        assert!(!off.is_empty() && !on.is_empty());
+        // Barrel correction pushes the corner block outward: its marked centre moves toward
+        // the corner (smaller x and y).
+        let centre = |p: &[(u32, u32)]| {
+            let n = p.len() as f32;
+            (p.iter().map(|q| q.0 as f32).sum::<f32>() / n, p.iter().map(|q| q.1 as f32).sum::<f32>() / n)
+        };
+        let (a, b) = (centre(&off), centre(&on));
+        assert!(b.0 < a.0 && b.1 < a.1, "overlay follows the warp: {a:?} → {b:?}");
     }
 
     /// Kelvin through the whole engine-2 render: the as-shot light is the picture as shot,

@@ -67,6 +67,7 @@ import { DUEL_LABELS, proofSpread, type DuelDim, type ProofCandidate } from "./s
 import { useOwnedSubscription } from "../../modules/ownedEvents";
 import { markShellLeave, setShellTimingEnabled } from "../../modules/shellTiming";
 import { badgeFor, INITIAL_SOURCE, isPreparing, reduceSource, type SourceState } from "./developSource";
+import { LensRail } from "./LensRail";
 import { stageJsonFor } from "./stageJson";
 import { describeChange, shouldAmend } from "./history";
 import { HistoryPanel } from "./HistoryPanel";
@@ -1128,6 +1129,13 @@ export function DarkroomView({
             onApply={applyPreset}
           />
           <EffectsRail look={look} onLook={onLook} onError={setError} />
+          {sourceToken && sourceState.lens && (sourceState.lens.vignetting || sourceState.lens.distortion || sourceState.lens.chromatic) && (
+            <LensRail
+              info={sourceState.lens}
+              on={!!working.lens?.builtin}
+              onToggle={(on) => setWorking((w) => ({ ...w, lens: on ? { builtin: true } : undefined }))}
+            />
+          )}
           <GeometryRail
             aspect={aspect}
             onAspect={applyAspect}

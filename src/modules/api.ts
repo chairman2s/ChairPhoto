@@ -874,6 +874,15 @@ export const suggestAutoTone = (photoId: number, source?: string, baseJson?: str
 
 // --- Develop source (docs/plans/raw-foundation) ---
 
+/** The camera's lens-correction tables in one file, e.g. `{ source: "Sony built-in",
+ *  vignetting: true, … }`. */
+export interface LensInfo {
+  source: string;
+  vignetting: boolean;
+  distortion: boolean;
+  chromatic: boolean;
+}
+
 /** What the decoder makes of a photo's file — the Darkroom's source badge. */
 export type DevelopSource =
   /** The camera's embedded preview — while a RAW is being prepared, or when the RAW
@@ -892,6 +901,8 @@ export type DevelopSource =
       cameraEv?: number;
       /** The as-shot light, [kelvin, tint], when the camera gives what Kelvin needs. */
       asShotWb?: [number, number];
+      /** Which lens corrections the camera wrote into the file (docs/plans/lens-corrections). */
+      lens?: LensInfo;
     }
   | { source: "unsupported"; camera: string | null; reason: string }
   | { source: "jpeg" }

@@ -64,6 +64,14 @@ describe("reduceSource", () => {
     expect(reduceSource(INITIAL_SOURCE, { source: "jpeg", photoId: 5 }, 5).asShotWb).toBeNull();
   });
 
+  it("carries the resident RAW's lens tables, and none off the RAW", () => {
+    const lens = { source: "Sony built-in", vignetting: true, distortion: true, chromatic: true };
+    expect(reduceSource(INITIAL_SOURCE, { ...raw, lens }, 5).lens).toEqual(lens);
+    expect(reduceSource(INITIAL_SOURCE, raw, 5).lens).toBeNull();
+    const resident = reduceSource(INITIAL_SOURCE, { ...raw, lens }, 5);
+    expect(reduceSource(resident, { source: "preview", preparing: true, photoId: 5 }, 5).lens).toBeNull();
+  });
+
   it("carries the resident RAW's camera match, and 0 when it was not measured", () => {
     expect(reduceSource(INITIAL_SOURCE, { ...raw, cameraEv: -1.6 }, 5).cameraEv).toBe(-1.6);
     expect(reduceSource(INITIAL_SOURCE, raw, 5).cameraEv).toBe(0);

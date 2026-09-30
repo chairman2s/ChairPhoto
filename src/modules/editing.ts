@@ -132,6 +132,10 @@ export interface VersionEdit {
   /** Engine 2: the exposure offset, in EV, that matched this photo's camera JPEG when the
    *  record was made — part of the baseline, not the Exposure slider. Absent = 0. */
   cameraEv?: number;
+  /** Engine 2: lens corrections from the camera's own tables (docs/plans/lens-corrections).
+   *  `builtin: true` applies what the file carries — vignetting today. Absent = none, so
+   *  every version saved before renders as it did. Belongs to the photo, not the look. */
+  lens?: { builtin: boolean };
 }
 
 /** The scene-linear engine that renders from the RAW working image. */

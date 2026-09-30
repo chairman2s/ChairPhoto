@@ -203,6 +203,84 @@ mod tests {
         assert!(mean_lin < 0.9, "the linear working image is not nearly white");
     }
 
+    /// Every file under `dir`, recursively.
+    fn walk(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let mut out = vec![];
+        let mut stack = vec![dir.to_path_buf()];
+        while let Some(d) = stack.pop() {
+            for e in std::fs::read_dir(&d).into_iter().flatten().flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    stack.push(p);
+                } else {
+                    out.push(p);
+                }
+            }
+        }
+        out
+    }
+
+    /// With a folder of RAWs (`CHAIRPHOTO_RAW_CORPUS`; run with `--release`): how far each
+    /// engine-2 render's corners fall below its centre, with the camera's lens correction
+    /// off and on, against the camera's own JPEG — which the camera corrects in-body
+    /// (docs/plans/lens-corrections, slice 2). The scene is the same in all three, so the
+    /// gap between a render's falloff and the camera's is the lens's share of it.
+    #[test]
+    fn corpus_lens_correction_brings_corners_to_the_cameras() {
+        let Ok(dir) = std::env::var("CHAIRPHOTO_RAW_CORPUS") else {
+            println!("SKIPPED: corpus_lens_correction_brings_corners_to_the_cameras — set CHAIRPHOTO_RAW_CORPUS");
+            return;
+        };
+        use crate::plugins::edit::{linear, render_proxy, RenderOpts, RenderSource, SourceToken};
+        let mut files: Vec<_> = walk(std::path::Path::new(&dir)).into_iter().filter(|p| p.extension().is_some_and(|x| x.eq_ignore_ascii_case("arw"))).collect();
+        files.sort();
+        // Mean linear luma of the four corner boxes over the centre box, in EV.
+        let falloff = |img: &image::RgbImage| -> f64 {
+            let (w, h) = (img.width(), img.height());
+            let luma = |x0: u32, y0: u32, bw: u32, bh: u32| {
+                let mut sum = 0.0f64;
+                for y in y0..y0 + bh {
+                    for x in x0..x0 + bw {
+                        let p = img.get_pixel(x, y).0;
+                        let lin = |v: u8| (v as f64 / 255.0).powf(2.2);
+                        sum += 0.2126 * lin(p[0]) + 0.7152 * lin(p[1]) + 0.0722 * lin(p[2]);
+                    }
+                }
+                sum / (bw * bh) as f64
+            };
+            let (cw, ch) = (w / 12, h / 12);
+            let corners = (luma(0, 0, cw, ch) + luma(w - cw, 0, cw, ch) + luma(0, h - ch, cw, ch) + luma(w - cw, h - ch, cw, ch)) / 4.0;
+            let centre = luma(w * 2 / 5, h * 2 / 5, w / 5, h / 5);
+            (corners / centre).log2()
+        };
+        let (mut gap_off, mut gap_on) = (0.0, 0.0);
+        for (i, path) in files.iter().enumerate() {
+            let d = crate::raw::decode_linear(path, &std::sync::atomic::AtomicBool::new(false)).unwrap();
+            assert!(d.lens.as_ref().is_some_and(|l| l.vignetting.is_some()), "{}: no vignetting table", path.display());
+            let image = Arc::new(working_image_from(d));
+            let preview = crate::thumbnails::preview_bytes(path).unwrap();
+            let camera = image::load_from_memory(&preview).unwrap().to_rgb8();
+            let ev = linear::camera_match_ev(&linear::downscale_linear(&image.linear, 256), &camera).unwrap_or(0.0);
+            let render = |lens: bool| {
+                let json = format!(r#"{{"engine":2,"display":"camera.2","cameraEv":{ev}{}}}"#, if lens { r#","lens":{"builtin":true}"# } else { "" });
+                let token = SourceToken::Working { photo_id: 900 + i as i64, generation: lens as u64 };
+                render_proxy(RenderSource::Working { token, image: image.clone() }, &json, 720, RenderOpts::default()).unwrap().to_rgb8()
+            };
+            let (off, on) = (render(false), render(true));
+            let camera = image::imageops::resize(&camera, off.width(), off.height(), image::imageops::FilterType::Triangle);
+            let (fc, f0, f1) = (falloff(&camera), falloff(&off), falloff(&on));
+            gap_off += (f0 - fc).abs();
+            gap_on += (f1 - fc).abs();
+            println!(
+                "{}: corners vs centre — camera JPEG {fc:+.2} EV, RAW uncorrected {f0:+.2} EV, corrected {f1:+.2} EV",
+                path.file_name().unwrap().to_string_lossy()
+            );
+        }
+        let n = files.len().max(1) as f64;
+        println!("mean |gap to the camera|: uncorrected {:.2} EV, corrected {:.2} EV", gap_off / n, gap_on / n);
+        assert!(gap_on < gap_off, "the correction brings the corners closer to the camera's");
+    }
+
     /// With a real RAW (`CHAIRPHOTO_RAW_FIXTURE`): the clip overlay marks the sensor's
     /// clipped share at the stage size, and a −3 EV pull changes nothing about it.
     #[test]

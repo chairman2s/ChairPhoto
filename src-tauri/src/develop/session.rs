@@ -203,6 +203,12 @@ fn with_token(probe: DevelopSource, token: &SourceToken) -> DevelopSource {
             as_shot_wb: resident_image.as_ref().and_then(|i| {
                 crate::plugins::edit::linear::as_shot_kelvin(&i.cam_mul, &i.pre_mul, &i.rgb_cam, &i.wbct).map(|(k, t)| [k, t])
             }),
+            lens: resident_image.as_ref().and_then(|i| i.lens.as_ref()).map(|l| crate::commands::LensInfo {
+                source: l.source.clone(),
+                vignetting: l.vignetting.is_some(),
+                distortion: l.distortion.is_some(),
+                chromatic: l.chromatic.is_some(),
+            }),
         },
         other => other,
     }
@@ -451,7 +457,7 @@ mod tests {
     }
 
     fn raw_probe() -> DevelopSource {
-        DevelopSource::Raw { camera: "Test".into(), megapixels: 1.0, bits: 16, decoder: "test".into(), token: None, camera_ev: None, as_shot_wb: None }
+        DevelopSource::Raw { camera: "Test".into(), megapixels: 1.0, bits: 16, decoder: "test".into(), token: None, camera_ev: None, as_shot_wb: None, lens: None }
     }
 
     fn decode_claim(state: &AppState, photo_id: i64) -> JobClaim<DevelopStatus> {
@@ -517,6 +523,31 @@ mod tests {
         // And A's terminal clear is a no-op on B's slot.
         a.slot.clear();
         assert!(state.jobs.develop.status().unwrap().is_some());
+    }
+
+    /// The source answer for a resident photo says which lens tables its image carries —
+    /// what the Darkroom's Lens switch offers.
+    #[test]
+    fn the_raw_answer_carries_the_images_lens_tables() {
+        let _serial = serial();
+        let (state, _dir) = state();
+        let a = decode_claim(&state, 1);
+        let ta = token_of(&a, 1);
+        let mut img = WorkingImage::clone_for_test(&test_image(8, 8));
+        img.lens = Some(crate::lens::LensCorrection {
+            source: "Sony built-in".into(),
+            vignetting: Some(crate::lens::Radial { knots: vec![0.0, 1.0], values: vec![1.0, 1.5] }),
+            distortion: None,
+            chromatic: None,
+        });
+        assert_eq!(publish(&a, 1, &ta, Arc::new(img)), Published::Resident);
+        match current(&state, 1, raw_probe()) {
+            DevelopSource::Raw { token: Some(_), lens, .. } => assert_eq!(
+                lens,
+                Some(crate::commands::LensInfo { source: "Sony built-in".into(), vignetting: true, distortion: false, chromatic: false })
+            ),
+            other => panic!("{other:?}"),
+        }
     }
 
     /// The source answer for a resident photo carries the camera match its image was

@@ -118,6 +118,12 @@ impl AppModel {
         self.generation += 1;
         let generation = self.generation;
         let state = self.state.clone();
+        // Short catalog reads run on GPUI's background executor, not the core runtime's
+        // blocking pool: GPUI's deterministic test scheduler rejects wakeups from foreign
+        // threads, so only this path is testable headless. The cost (reviewed, gpui #99): while
+        // a worker holds the catalog lock, each pending read parks one executor thread;
+        // refreshes are event-driven and superseded ones are dropped, so few are in flight.
+        // Long lock-holding jobs (scans, indexing) already run on the core runtime.
         let read = cx.background_executor().spawn(async move { read_summary(&state) });
         cx.spawn(async move |this, cx| {
             let summary = read.await;

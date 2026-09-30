@@ -418,7 +418,7 @@ impl ShellState {
 
     // --- events and reads ---------------------------------------------------------------
 
-    fn on_core_event(&mut self, event: &CoreEvent, cx: &mut Context<Self>) {
+    pub(crate) fn on_core_event(&mut self, event: &CoreEvent, cx: &mut Context<Self>) {
         let jobs_changed = self.jobs.on_core_event(event);
         match event {
             CoreEvent::CatalogSwitched(_) => {

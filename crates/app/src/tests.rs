@@ -584,3 +584,33 @@ fn window_focus_rereads_the_pending_and_trash_counts(cx: &mut TestAppContext) {
         assert_eq!((s.counts.pending, s.counts.trash), (1, Some(1)), "focus re-read the counts")
     });
 }
+
+/// A catalog switch disowns every read the old catalog started: reads issued just before
+/// the switch, which then run against the old catalog and land after it, are dropped
+/// (AGENTS.md: a catalog switch makes older workers unreachable as owners). The switch is
+/// fed to the shell directly so no fresh read follows it and nothing can mask a stale one.
+#[gpui_kit::test]
+fn reads_started_before_a_catalog_switch_are_dropped(cx: &mut TestAppContext) {
+    let dir = TempDir::new("switch");
+    let app = start(cx);
+    open_catalog_with_photos(&app, &dir, 2, cx);
+    app.wired.shell.read_with(cx, |s, _| {
+        assert_eq!(s.scope_info.total, Some(2));
+        assert_eq!(s.counts.trash, Some(0));
+        assert!(!s.lists.facets.is_empty());
+    });
+
+    // Issue every kind of read, then switch — before any of them has run.
+    app.wired.shell.update(cx, |s, cx| {
+        s.refresh_catalog_data(cx); // lists + counts, and the scope count
+        s.refresh_on_focus(cx); // pending + trash
+        s.on_core_event(&CoreEvent::CatalogSwitched("another.chairphoto".into()), cx);
+    });
+    cx.run_until_parked(); // the reads run now, still against the old catalog
+
+    app.wired.shell.read_with(cx, |s, _| {
+        assert_eq!(s.scope_info.total, None, "the old catalog's scope count landed after the switch");
+        assert_eq!(s.counts.trash, None, "the old catalog's trash count landed after the switch");
+        assert!(s.lists.facets.is_empty(), "the old catalog's lists landed after the switch");
+    });
+}

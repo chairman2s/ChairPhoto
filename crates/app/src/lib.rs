@@ -5,12 +5,14 @@
 //!
 //! 1. an [`AppState`] with the [`events::GpuiSink`] installed — first, so nothing the core
 //!    starts can send into the void ([`start_core`]);
-//! 2. `app::boot` — crash markers, upload sweep, Omarchy watcher, decode analyzers, image
-//!    pool (the same startup the Tauri shell runs);
+//! 2. `app::boot_with` — crash markers, upload sweep, Omarchy watcher, decode analyzers, image
+//!    pool (the same startup the Tauri shell runs; this pool's runner decodes to BGRA
+//!    textures, [`image_store::runner`]);
 //! 3. the GPUI application ([`wire`]): embedded fonts, gpui-kit's init, the theme from the
 //!    current system theme (before the first window: `theme::init` switches to Light), the
 //!    keymap and the quit wiring;
-//! 4. the [`model::AppModel`] entity and the event router, and the [`shell::ShellState`];
+//! 4. the [`model::AppModel`] entity and the event router, the [`shell::ShellState`], and the
+//!    [`image_store::ImageStore`] (cleared on every catalog switch);
 //! 5. `app::open_default_catalog`, off the UI thread;
 //! 6. the main window, 1400×900, `app_id` `chairphoto`.
 //!
@@ -23,7 +25,9 @@
 //! no default catalog and a counter for `clean_exit`.
 
 pub mod assets;
+pub mod darkroom;
 pub mod events;
+pub mod image_store;
 pub mod keymap;
 pub mod model;
 pub mod shell;
@@ -32,15 +36,18 @@ pub mod view;
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod image_tests;
 
 use chairphoto_core::app::{AppState, CoreEvent};
 use chairphoto_core::appearance::SystemThemeResult;
 use chairphoto_core::image_pool::ImagePool;
+use image_store::{ImageStore, Loaded};
 use futures::channel::mpsc::UnboundedReceiver;
 use model::AppModel;
 use gpui_kit::{
     px, size, AnyWindowHandle, App, AppContext as _, Bounds, Entity, Global, QuitMode, TitlebarOptions,
-    WindowBackgroundAppearance, WindowBounds, WindowDecorations, WindowOptions,
+    Subscription, WindowBackgroundAppearance, WindowBounds, WindowDecorations, WindowOptions,
 };
 use std::rc::Rc;
 use std::sync::Arc;
@@ -121,6 +128,8 @@ impl WireOptions {
 /// What [`wire`] built.
 pub struct Wired {
     pub model: Entity<AppModel>,
+    /// The image layer's cache and request queue (#101), cleared on every catalog switch.
+    pub images: Entity<ImageStore>,
     pub shell: Entity<shell::ShellState>,
     /// The main window, or why it could not open (the app has then been asked to quit).
     pub main_window: Result<AnyWindowHandle, String>,
@@ -132,7 +141,7 @@ pub fn wire(
     cx: &mut App,
     state: AppState,
     events_rx: UnboundedReceiver<CoreEvent>,
-    pool: Option<Arc<ImagePool>>,
+    pool: Option<Arc<ImagePool<Loaded>>>,
     initial_theme: &SystemThemeResult,
     options: WireOptions,
 ) -> Wired {
@@ -150,17 +159,24 @@ pub fn wire(
     })
     .detach();
 
-    let model = cx.new(|_| AppModel::new(state, pool));
+    let model = cx.new(|_| AppModel::new(state, pool.clone()));
     events::spawn_router(events_rx, model.clone(), cx).detach();
     let shell = cx.new(|cx| shell::ShellState::new(&model, cx));
+    // Without a pool (tests), every image request fails at once instead of waiting forever.
+    let submit: Arc<dyn image_store::Submit> = match &pool {
+        Some(pool) => pool.clone(),
+        None => Arc::new(NoPool),
+    };
+    let images = cx.new(|cx| ImageStore::new(submit, image_store::DEFAULT_BUDGET_BYTES, cx));
+    clear_images_on_catalog_switch(&model, &images, cx).detach();
     if options.open_default_catalog {
         model.update(cx, |m, cx| m.open_default_catalog(cx));
     }
 
     let window_options = main_window_options(cx);
     let opened = gpui_kit::open_window(window_options, cx, {
-        let (model, shell) = (model.clone(), shell.clone());
-        move |window, cx| cx.new(|cx| view::RootView::new(model, shell, window, cx))
+        let (model, shell, images) = (model.clone(), shell.clone(), images.clone());
+        move |window, cx| cx.new(|cx| view::RootView::new(model, shell, images, window, cx))
     });
     let main_window = match opened {
         Ok((handle, _)) => {
@@ -179,12 +195,14 @@ pub fn wire(
             Err(e.to_string())
         }
     };
-    Wired { model, shell, main_window }
+    Wired { model, images, shell, main_window }
 }
 
 /// Start the app and run until it quits.
 pub fn run() {
-    let (state, events_rx, boot) = start_core(chairphoto_core::app::boot);
+    // The pool's runner decodes straight to BGRA textures (`image_store::runner`), not JPEG.
+    let (state, events_rx, boot) =
+        start_core(|state| chairphoto_core::app::boot_with(state, image_store::runner(state.clone())));
     // Two small files under ~/.local/state/omarchy, read before the event loop starts so the
     // first frame is already in the right palette.
     let initial_theme = chairphoto_core::appearance::read_current_theme();
@@ -200,4 +218,38 @@ pub fn run() {
     // Also on the way out of the event loop, for a platform that returns without running
     // the quit observers. Idempotent.
     chairphoto_core::crash_marker::clean_exit();
+}
+
+/// Photo ids mean other photos after a catalog switch, so the image cache is dropped whenever
+/// [`AppModel::catalog_epoch`] moves.
+pub fn clear_images_on_catalog_switch(
+    model: &Entity<AppModel>,
+    images: &Entity<ImageStore>,
+    cx: &mut App,
+) -> Subscription {
+    let images = images.clone();
+    let mut seen = model.read(cx).catalog_epoch;
+    cx.observe(model, move |model, cx| {
+        let epoch = model.read(cx).catalog_epoch;
+        if epoch != seen {
+            seen = epoch;
+            images.update(cx, |store, cx| store.clear(cx));
+        }
+    })
+}
+
+/// [`wire`]'s image source when there is no decode pool (tests that pass `None`): every
+/// request is answered at once with an error, so no cell waits forever.
+struct NoPool;
+
+impl image_store::Submit for NoPool {
+    fn submit_batch(&self, batch: Vec<(chairphoto_core::image_pool::JobKey, chairphoto_core::image_pool::Respond<Loaded>)>) {
+        for (_, respond) in batch {
+            respond(Err("no image pool".into()));
+        }
+    }
+
+    fn cancel(&self, _key: &chairphoto_core::image_pool::JobKey) -> bool {
+        false
+    }
 }

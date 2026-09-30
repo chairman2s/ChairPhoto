@@ -18,15 +18,17 @@
 //! [`AppModel::not_yet_ported`].
 
 use crate::keymap::{contexts, ReloadTheme};
+use crate::image_store::{ImageState, ImageStore};
 use crate::model::AppModel;
+use chairphoto_core::image_pool::ImageKind;
 use crate::shell::actions::*;
 use crate::shell::state::{ShellState, Side, Surface, NARROW_MAX_W};
 use crate::shell::style::Colors;
 use gpui_kit::component::slider::SliderState;
 use gpui_kit::prelude::*;
 use gpui_kit::{
-    div, px, AnyElement, Context, CursorStyle, Entity, FocusHandle, MouseButton, MouseMoveEvent, Pixels,
-    Subscription, TestSupportExt as _, Window,
+    div, img, px, AnyElement, Context, CursorStyle, Entity, FocusHandle, MouseButton, MouseMoveEvent, ObjectFit,
+    Pixels, Subscription, TestSupportExt as _, Window,
 };
 
 /// A column-edge drag in progress: which column, where the pointer started, the width then.
@@ -40,21 +42,36 @@ struct Resize {
 pub struct RootView {
     pub(crate) model: Entity<AppModel>,
     pub(crate) shell: Entity<ShellState>,
+    pub(crate) images: Entity<ImageStore>,
     pub(crate) focus: FocusHandle,
     pub(crate) thumb_slider: Entity<SliderState>,
     resize: Option<Resize>,
-    _observers: [Subscription; 2],
+    _observers: [Subscription; 3],
 }
+
+/// One cell of the stage's thumbnail strip — the image layer's on-screen proof (#101) until
+/// the Library view (#106) replaces the stage.
+const STRIP_CELL: (f32, f32) = (132., 96.);
 
 impl RootView {
     /// The root owns focus from the start, so the app-wide bindings in [`contexts::ROOT`]
     /// work before anything else takes it.
-    pub fn new(model: Entity<AppModel>, shell: Entity<ShellState>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        model: Entity<AppModel>,
+        shell: Entity<ShellState>,
+        images: Entity<ImageStore>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let focus = cx.focus_handle();
         focus.focus(window, cx);
         let thumb_slider = crate::shell::command_pill::thumb_slider(&shell, window, cx);
-        let _observers = [cx.observe(&model, |_, _, cx| cx.notify()), cx.observe(&shell, |_, _, cx| cx.notify())];
-        Self { model, shell, focus, thumb_slider, resize: None, _observers }
+        let _observers = [
+            cx.observe(&model, |_, _, cx| cx.notify()),
+            cx.observe(&shell, |_, _, cx| cx.notify()),
+            cx.observe(&images, |_, _, cx| cx.notify()),
+        ];
+        Self { model, shell, images, focus, thumb_slider, resize: None, _observers }
     }
 
     pub fn focus_handle(&self) -> &FocusHandle {
@@ -112,7 +129,47 @@ impl RootView {
             )
     }
 
-    fn render_stage(&self, shell: &ShellState, model: &AppModel, colors: Colors) -> AnyElement {
+    /// The first thumbnails of the open catalog through the [`ImageStore`]: requested in display
+    /// order (the pool is LIFO, so the batch keeps the first cell first), then read back —
+    /// cached, loading or failed.
+    fn strip_cells(&self, cx: &mut Context<Self>) -> Vec<(i64, ImageState)> {
+        let ids: Vec<i64> = self.model.read(cx).catalog.as_ref().map(|c| c.first_photos.clone()).unwrap_or_default();
+        self.images.update(cx, |store, _| {
+            let wanted: Vec<_> = ids.iter().map(|&id| (id, ImageKind::Thumb)).collect();
+            store.request_batch(&wanted);
+            ids.iter().map(|&id| (id, store.get(id, ImageKind::Thumb))).collect()
+        })
+    }
+
+    fn render_strip(cells: Vec<(i64, ImageState)>, colors: Colors) -> AnyElement {
+        div()
+            .id("thumb-strip")
+            .flex()
+            .flex_row()
+            .flex_wrap()
+            .justify_center()
+            .gap_2()
+            .max_w(px(8. * (STRIP_CELL.0 + 8.)))
+            .children(cells.into_iter().map(|(id, state)| {
+                let cell = div()
+                    .id(("thumb", id as u64))
+                    .w(px(STRIP_CELL.0))
+                    .h(px(STRIP_CELL.1))
+                    .rounded_sm()
+                    .overflow_hidden()
+                    .bg(colors.panel);
+                match state {
+                    ImageState::Ready(loaded) => {
+                        cell.child(img(loaded.image).size_full().object_fit(ObjectFit::Contain)).into_any_element()
+                    }
+                    ImageState::Failed(_) => cell.border_1().border_color(colors.danger).into_any_element(),
+                    ImageState::Loading | ImageState::Absent => cell.border_1().border_color(colors.border).into_any_element(),
+                }
+            }))
+            .into_any_element()
+    }
+
+    fn render_stage(&self, shell: &ShellState, model: &AppModel, colors: Colors, strip: Vec<(i64, ImageState)>) -> AnyElement {
         let surface = match &shell.surface {
             Surface::Library => "The library grid comes with the Library view (#106).".to_string(),
             Surface::Develop => "The Darkroom comes with #111.".to_string(),
@@ -131,6 +188,7 @@ impl RootView {
             .gap_2()
             .p(px(12.))
             .child(div().text_size(px(12.)).text_color(colors.dim).child(surface))
+            .when(shell.surface == Surface::Library && !strip.is_empty(), |d| d.child(Self::render_strip(strip, colors)))
             .child(
                 div()
                     .id("last-event")
@@ -147,6 +205,7 @@ impl Render for RootView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let narrow = window.viewport_size().width <= px(NARROW_MAX_W);
         self.shell.update(cx, |s, _| s.set_narrow(narrow));
+        let strip = self.strip_cells(cx);
         let colors = Colors::get(cx);
         let shell_entity = self.shell.clone();
         let model_entity = self.model.clone();
@@ -157,7 +216,7 @@ impl Render for RootView {
         let rail = self.render_rail(shell, colors, cx);
         let library = shell.surface == Surface::Library;
         let pill = library.then(|| self.render_command_pill(shell, colors, cx));
-        let stage = self.render_stage(shell, model, colors);
+        let stage = self.render_stage(shell, model, colors, strip);
         let bench = library.then(|| self.render_bench(shell, model, colors, cx));
         let (left_w, right_w) = (shell.layout.left_w, shell.layout.right_w);
         let show_left = !narrow && !shell.layout.left_hidden;

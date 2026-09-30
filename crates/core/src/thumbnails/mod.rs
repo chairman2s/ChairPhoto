@@ -127,15 +127,26 @@ pub fn rotate_jpeg(bytes: Vec<u8>, degrees: i64) -> Result<Vec<u8>, String> {
         return Ok(bytes);
     }
     let img = image::load_from_memory(&bytes).map_err(|e| e.to_string())?;
-    let rotated = match d {
+    encode_rotated_jpeg(&rotate_image(img, d))
+}
+
+/// [`rotate_jpeg`]'s rotation on decoded pixels: clockwise by `degrees`; anything but
+/// 90/180/270 (after normalising) leaves the image as it is. The GPUI app's decode path
+/// (`media::render_image`) rotates here instead of re-encoding.
+pub fn rotate_image(img: DynamicImage, degrees: i64) -> DynamicImage {
+    match ((degrees % 360) + 360) % 360 {
         90 => img.rotate90(),
         180 => img.rotate180(),
         270 => img.rotate270(),
         _ => img,
-    };
+    }
+}
+
+/// The JPEG [`rotate_jpeg`] writes for a rotated image (quality 90). Shared so the decode
+/// path keeps the same persistent thumbnail the byte path would have written.
+pub(crate) fn encode_rotated_jpeg(img: &DynamicImage) -> Result<Vec<u8>, String> {
     let mut out = Cursor::new(Vec::new());
-    rotated
-        .write_with_encoder(JpegEncoder::new_with_quality(&mut out, 90))
+    img.write_with_encoder(JpegEncoder::new_with_quality(&mut out, 90))
         .map_err(|e| e.to_string())?;
     Ok(out.into_inner())
 }

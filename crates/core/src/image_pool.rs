@@ -33,6 +33,22 @@
 //!
 //! * A panicking runner maps to `Err("render panicked")` via `catch_unwind`; the
 //!   worker thread itself is never killed.
+//!
+//! # What a job returns
+//!
+//! The pool is generic over its result `T` (default `Vec<u8>`): the Tauri shell's pool renders
+//! encoded bytes for its URI protocols (`media::render_bytes`), the GPUI app's renders decoded
+//! pixels (`media::render_image`, #101). The pool never looks at `T`; it only clones it for a
+//! job's extra responders, so a cheap-to-clone `T` (an `Arc`) is what a multi-responder job
+//! wants.
+//!
+//! # Priority batches and cancellation (the GPUI app, #101)
+//!
+//! [`ImagePool::submit_batch`] submits several keys under one lock, most urgent first, so no
+//! worker can pop between them: the first key ends on top of the stack. A key that is still
+//! queued moves to the top instead of staying where it was — the batch is the newest request.
+//! [`ImagePool::cancel`] takes a queued (not yet started) job off the stack and answers every
+//! responder with [`CANCELLED`]; a job already rendering runs to completion.
 
 use std::collections::HashMap;
 use std::panic::{self, AssertUnwindSafe};
@@ -96,30 +112,33 @@ pub struct EditJob {
     pub clip: bool,
 }
 
-/// A one-shot callback that receives the rendered bytes (or an error string).
-pub type Respond = Box<dyn FnOnce(Result<Vec<u8>, String>) + Send>;
+/// A one-shot callback that receives the rendered result (or an error string).
+pub type Respond<T = Vec<u8>> = Box<dyn FnOnce(Result<T, String>) + Send>;
 
 /// The render function. Must be `Send + Sync` so it can be shared across workers.
-pub type Runner = Arc<dyn Fn(JobKey) -> Result<Vec<u8>, String> + Send + Sync>;
+pub type Runner<T = Vec<u8>> = Arc<dyn Fn(JobKey) -> Result<T, String> + Send + Sync>;
 
-struct PoolInner {
+/// The error every responder of a [cancelled](ImagePool::cancel) job receives.
+pub const CANCELLED: &str = "cancelled";
+
+struct PoolInner<T> {
     /// LIFO stack of keys waiting to be picked up by a worker.
     stack: Vec<JobKey>,
     /// All pending or in-flight jobs, keyed by `JobKey`.
     /// A key is present here from first submit until *after* the runner finishes.
-    jobs: HashMap<JobKey, Vec<Respond>>,
+    jobs: HashMap<JobKey, Vec<Respond<T>>>,
 }
 
 /// Bounded image-render pool. Create with [`ImagePool::start_with_runner`] and
 /// submit work with [`ImagePool::submit`].
-pub struct ImagePool {
-    inner: Mutex<PoolInner>,
+pub struct ImagePool<T = Vec<u8>> {
+    inner: Mutex<PoolInner<T>>,
     cond: Condvar,
 }
 
-impl ImagePool {
+impl<T: Clone + Send + 'static> ImagePool<T> {
     /// Spawn `n_threads` worker threads backed by `runner` and return the pool.
-    pub fn start_with_runner(n_threads: usize, runner: Runner) -> Arc<Self> {
+    pub fn start_with_runner(n_threads: usize, runner: Runner<T>) -> Arc<Self> {
         let pool = Arc::new(ImagePool {
             inner: Mutex::new(PoolInner {
                 stack: Vec::new(),
@@ -146,7 +165,7 @@ impl ImagePool {
     ///   it and will be called when the ongoing render completes (dedup).
     /// * Otherwise a new job is created, pushed to the top of the LIFO stack, and a
     ///   worker is woken.
-    pub fn submit(&self, key: JobKey, respond: Respond) {
+    pub fn submit(&self, key: JobKey, respond: Respond<T>) {
         let mut guard = self.inner.lock().expect("image pool lock poisoned");
         if let Some(responders) = guard.jobs.get_mut(&key) {
             // Job already exists (queued or mid-render) — attach and return.
@@ -158,9 +177,65 @@ impl ImagePool {
         }
     }
 
+    /// Submit several requests at once, **most urgent first**, under one lock: when the call
+    /// returns, `batch[0]` is on top of the stack, then `batch[1]`, and so on — no worker can
+    /// pop one before the rest are in place. What the loupe needs: the current photo, then
+    /// N+1, then N−1.
+    ///
+    /// Per key, as [`submit`](Self::submit) — an in-flight or queued job gets the responder
+    /// attached — except that a key still **queued** moves to the top in batch order rather
+    /// than keeping its old, lower place: a preload queued earlier becomes the current photo.
+    pub fn submit_batch(&self, batch: Vec<(JobKey, Respond<T>)>) {
+        let mut guard = self.inner.lock().expect("image pool lock poisoned");
+        let mut new_jobs = 0;
+        // Least urgent first, so the most urgent ends on top.
+        for (key, respond) in batch.into_iter().rev() {
+            if let Some(responders) = guard.jobs.get_mut(&key) {
+                responders.push(respond);
+                if let Some(at) = guard.stack.iter().position(|k| *k == key) {
+                    let k = guard.stack.remove(at);
+                    guard.stack.push(k);
+                }
+            } else {
+                guard.stack.push(key.clone());
+                guard.jobs.insert(key, vec![respond]);
+                new_jobs += 1;
+            }
+        }
+        drop(guard);
+        for _ in 0..new_jobs {
+            self.cond.notify_one();
+        }
+    }
+
+    /// Take `key` off the stack if no worker has started it, and answer every responder
+    /// attached to it with `Err(CANCELLED)`. Returns whether it did. A job already rendering
+    /// is left alone (it cannot be interrupted); its result reaches its responders as usual,
+    /// and a caller that no longer wants it drops it.
+    pub fn cancel(&self, key: &JobKey) -> bool {
+        let responders = {
+            let mut guard = self.inner.lock().expect("image pool lock poisoned");
+            let Some(at) = guard.stack.iter().position(|k| k == key) else {
+                return false;
+            };
+            guard.stack.remove(at);
+            guard.jobs.remove(key).unwrap_or_default()
+        };
+        // Outside the lock, like the worker's answers: a responder may submit again.
+        for respond in responders {
+            respond(Err(CANCELLED.into()));
+        }
+        true
+    }
+
+    /// How many jobs are waiting for a worker (not counting those rendering).
+    pub fn queued(&self) -> usize {
+        self.inner.lock().expect("image pool lock poisoned").stack.len()
+    }
+
     // --- internals -----------------------------------------------------------
 
-    fn worker_loop(&self, runner: Runner) {
+    fn worker_loop(&self, runner: Runner<T>) {
         loop {
             // Acquire a key from the top of the stack.
             let key = {
@@ -177,13 +252,13 @@ impl ImagePool {
             }; // lock released here
 
             // Run the renderer outside the lock.  Catch panics so the thread lives.
-            let result: Result<Vec<u8>, String> =
+            let result: Result<T, String> =
                 panic::catch_unwind(AssertUnwindSafe(|| runner(key.clone())))
                     .unwrap_or_else(|_| Err("render panicked".into()));
 
             // Collect all responders for this key, removing the job entry *after*
             // render so that any attach arriving mid-render still sees the key.
-            let responders: Vec<Respond> = {
+            let responders: Vec<Respond<T>> = {
                 let mut guard = self.inner.lock().expect("image pool lock poisoned");
                 guard.jobs.remove(&key).unwrap_or_default()
             };
@@ -193,13 +268,10 @@ impl ImagePool {
             for (i, respond) in responders.into_iter().enumerate() {
                 if i + 1 < n {
                     // Clone the result for every responder except the last.
-                    let r = match &result {
-                        Ok(bytes) => Ok(bytes.clone()),
-                        Err(e) => Err(e.clone()),
-                    };
-                    respond(r);
+                    respond(result.clone());
                 } else {
-                    respond(result.clone().map_err(|e| e));
+                    respond(result);
+                    break;
                 }
             }
         }
@@ -411,5 +483,128 @@ mod tests {
         assert!(r2.is_ok());
         assert_eq!(r1.unwrap(), b"shared-bytes");
         assert_eq!(r2.unwrap(), b"shared-bytes");
+    }
+
+    /// A 1-thread pool whose runner blocks on `gate` for photo 0 and records every photo it
+    /// renders, in order.
+    fn gated_pool() -> (Arc<ImagePool>, Arc<Barrier>, std::sync::mpsc::Receiver<i64>, std::sync::mpsc::Receiver<()>) {
+        let gate = Arc::new(Barrier::new(2));
+        let (ran_tx, ran_rx) = std::sync::mpsc::channel::<i64>();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
+        let g = Arc::clone(&gate);
+        let ran_tx = std::sync::Mutex::new(ran_tx);
+        let entered_tx = std::sync::Mutex::new(entered_tx);
+        let runner: Runner = Arc::new(move |key| {
+            if key.photo_id() == 0 {
+                let _ = entered_tx.lock().unwrap().send(());
+                g.wait();
+            }
+            let _ = ran_tx.lock().unwrap().send(key.photo_id());
+            Ok(vec![key.photo_id() as u8])
+        });
+        (ImagePool::start_with_runner(1, runner), gate, ran_rx, entered_rx)
+    }
+
+    fn noop() -> Respond {
+        Box::new(|_| {})
+    }
+
+    // -----------------------------------------------------------------------
+    // 5. Batch order: the first key of a batch renders first, then the rest in order —
+    //    even with older jobs queued underneath.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn a_batch_renders_most_urgent_first_above_older_queued_jobs() {
+        let (pool, gate, ran, entered) = gated_pool();
+        pool.submit(JobKey::photo(0, ImageKind::Thumb), noop());
+        entered.recv().unwrap(); // the only worker is now busy with photo 0
+        pool.submit(JobKey::photo(9, ImageKind::Thumb), noop()); // an older grid request
+        pool.submit_batch(vec![
+            (JobKey::photo(5, ImageKind::Preview), noop()), // current
+            (JobKey::photo(6, ImageKind::Preview), noop()), // N+1
+            (JobKey::photo(4, ImageKind::Preview), noop()), // N-1
+        ]);
+        assert_eq!(pool.queued(), 4);
+        gate.wait();
+        let order: Vec<i64> = (0..5).map(|_| ran.recv().unwrap()).collect();
+        assert_eq!(order, vec![0, 5, 6, 4, 9]);
+    }
+
+    // -----------------------------------------------------------------------
+    // 6. A key a batch names that is already queued moves to the top and keeps one job:
+    //    both responders get the one render.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn a_batch_promotes_a_queued_key_and_merges_its_responders() {
+        let (pool, gate, ran, entered) = gated_pool();
+        pool.submit(JobKey::photo(0, ImageKind::Thumb), noop());
+        entered.recv().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel::<Result<Vec<u8>, String>>();
+        let tx1 = tx.clone();
+        pool.submit(JobKey::photo(6, ImageKind::Preview), Box::new(move |r| { let _ = tx1.send(r); }));
+        pool.submit(JobKey::photo(7, ImageKind::Preview), noop());
+        pool.submit(JobKey::photo(8, ImageKind::Preview), noop());
+        // 6 was queued at the bottom; the batch makes it the most urgent.
+        pool.submit_batch(vec![(JobKey::photo(6, ImageKind::Preview), Box::new(move |r| { let _ = tx.send(r); }))]);
+        assert_eq!(pool.queued(), 3, "a merged key is still one job");
+        gate.wait();
+        let order: Vec<i64> = (0..4).map(|_| ran.recv().unwrap()).collect();
+        assert_eq!(order, vec![0, 6, 8, 7]);
+        assert_eq!(rx.recv().unwrap().unwrap(), vec![6]);
+        assert_eq!(rx.recv().unwrap().unwrap(), vec![6]);
+    }
+
+    // -----------------------------------------------------------------------
+    // 7. Cancel: a queued job never renders and every responder hears CANCELLED; a job
+    //    already rendering cannot be cancelled and still answers.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn cancel_answers_a_queued_job_and_leaves_a_rendering_one() {
+        let (pool, gate, ran, entered) = gated_pool();
+        let (tx, rx) = std::sync::mpsc::channel::<(i64, Result<Vec<u8>, String>)>();
+        let respond = |id: i64| -> Respond {
+            let tx = tx.clone();
+            Box::new(move |r| { let _ = tx.send((id, r)); })
+        };
+        pool.submit(JobKey::photo(0, ImageKind::Thumb), respond(0));
+        entered.recv().unwrap();
+        pool.submit(JobKey::photo(3, ImageKind::Thumb), respond(3));
+        pool.submit(JobKey::photo(3, ImageKind::Thumb), respond(3));
+        pool.submit(JobKey::photo(4, ImageKind::Thumb), respond(4));
+
+        assert!(!pool.cancel(&JobKey::photo(0, ImageKind::Thumb)), "photo 0 is rendering");
+        assert!(pool.cancel(&JobKey::photo(3, ImageKind::Thumb)));
+        assert!(!pool.cancel(&JobKey::photo(3, ImageKind::Thumb)), "already gone");
+        for _ in 0..2 {
+            assert_eq!(rx.recv().unwrap(), (3, Err(CANCELLED.to_string())));
+        }
+        gate.wait();
+        let order: Vec<i64> = (0..2).map(|_| ran.recv().unwrap()).collect();
+        assert_eq!(order, vec![0, 4], "the cancelled job never reached the runner");
+        let mut answered: Vec<i64> = (0..2).map(|_| rx.recv().unwrap().0).collect();
+        answered.sort();
+        assert_eq!(answered, vec![0, 4]);
+    }
+
+    // -----------------------------------------------------------------------
+    // 8. Generic result: a pool of `Arc`s hands every merged responder the same `Arc`.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn a_pool_of_arcs_shares_one_result_between_merged_responders() {
+        let gate = Arc::new(Barrier::new(2));
+        let g = Arc::clone(&gate);
+        let runner: Runner<Arc<String>> = Arc::new(move |_| {
+            g.wait();
+            Ok(Arc::new("pixels".to_string()))
+        });
+        let pool = ImagePool::start_with_runner(1, runner);
+        let (tx, rx) = std::sync::mpsc::channel::<Arc<String>>();
+        for _ in 0..2 {
+            let tx = tx.clone();
+            pool.submit(JobKey::photo(1, ImageKind::Zoom), Box::new(move |r| { let _ = tx.send(r.unwrap()); }));
+        }
+        gate.wait();
+        let (a, b) = (rx.recv().unwrap(), rx.recv().unwrap());
+        assert!(Arc::ptr_eq(&a, &b));
     }
 }

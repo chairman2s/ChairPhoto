@@ -202,7 +202,7 @@ fn a_core_event_from_a_worker_thread_reaches_the_model(cx: &mut TestAppContext) 
         assert!(line.contains("bridge.chairphoto"), "{line}");
         assert_eq!(
             m.catalog,
-            Some(CatalogSummary { name: "bridge.chairphoto".into(), photo_count: 0 }),
+            Some(CatalogSummary { name: "bridge.chairphoto".into(), photo_count: 0, first_photos: vec![] }),
             "catalog:switched must refresh the catalog summary"
         );
     });

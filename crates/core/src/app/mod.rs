@@ -21,7 +21,7 @@ mod catalogs;
 pub mod events;
 pub mod jobs;
 
-pub use boot::{boot, Boot};
+pub use boot::{boot, boot_with, Boot};
 pub use catalogs::{
     default_catalog_path, load_recent_catalogs, open_default_catalog, record_recent_catalog,
     spawn_detached_phase_b, RecentCatalog,

@@ -3,6 +3,9 @@
 //!
 //! [`run`] is the whole startup, in this order:
 //!
+//! 0. the single-instance claim ([`single_instance`]): a second launch for the same app data
+//!    dir forwards its `chairphoto://` URLs (or just a focus request) to the running instance
+//!    and exits 0, before anything below runs;
 //! 1. an [`AppState`] with the [`events::GpuiSink`] installed — first, so nothing the core
 //!    starts can send into the void;
 //! 2. `app::boot` — crash markers, upload sweep, Omarchy watcher, decode analyzers, image
@@ -11,15 +14,20 @@
 //!    theme (before the first window: `theme::init` switches to Light), the keymap;
 //! 4. the [`model::AppModel`] entity and the event router;
 //! 5. `app::open_default_catalog`, off the UI thread;
-//! 6. the main window, 1400×900, `app_id` `chairphoto`.
+//! 6. the main window, 1400×900, `app_id` `chairphoto`; then the router for second launches
+//!    ([`launch`]), and this launch's own `chairphoto://` URLs.
 //!
 //! Quitting — Ctrl+Q, or closing the main window — runs `crash_marker::clean_exit()`, as the
 //! Tauri shell does at `RunEvent::Exit`: decodes a deliberate quit cuts short are not crashes.
+//! `clean_exit` also disarms the markers, so a decode that starts between the quit and the
+//! process exit cannot leave one either.
 
 pub mod assets;
 pub mod events;
 pub mod keymap;
+pub mod launch;
 pub mod model;
+pub mod single_instance;
 pub mod theme;
 pub mod view;
 
@@ -27,6 +35,8 @@ pub mod view;
 mod tests;
 
 use chairphoto_core::app::AppState;
+use futures::channel::mpsc::{unbounded, UnboundedSender};
+use single_instance::{Claim, ClaimError, Primary, Request};
 use gpui_kit::{
     px, size, AppContext as _, Bounds, QuitMode, TitlebarOptions, WindowBackgroundAppearance,
     WindowBounds, WindowOptions,
@@ -52,8 +62,57 @@ pub fn main_window_options(cx: &gpui_kit::App) -> WindowOptions {
     }
 }
 
+/// Become this app data dir's primary instance, serving second launches into `tx`; or hand
+/// `launch` to the instance that already is, and exit. `None`: single-instance could not be
+/// set up (the reason is logged) and the app runs without it.
+fn claim_single_instance(launch: &Request, tx: UnboundedSender<Request>) -> Option<Primary> {
+    let endpoint = chairphoto_core::app::app_data_dir()
+        .map_err(std::io::Error::other)
+        .and_then(|dir| {
+            // The key hashes the canonical path, which needs the directory to exist.
+            std::fs::create_dir_all(&dir)?;
+            single_instance::Endpoint::for_app_data_dir(&dir)
+        });
+    let endpoint = match endpoint {
+        Ok(endpoint) => endpoint,
+        Err(e) => {
+            eprintln!("single instance: disabled: {e}");
+            return None;
+        }
+    };
+    match single_instance::claim(&endpoint, launch, single_instance::CONNECT_PATIENCE) {
+        Ok(Claim::Primary(primary)) => {
+            let served = primary.serve(move |request| {
+                // Fails only once the app is shutting down.
+                let _ = tx.unbounded_send(request);
+            });
+            served.map_err(|e| eprintln!("single instance: disabled: {e}")).ok()
+        }
+        Ok(Claim::Forwarded) => {
+            eprintln!(
+                "ChairPhoto is already running; handed it {} link(s) and asked it to come forward.",
+                launch.urls.len()
+            );
+            std::process::exit(0);
+        }
+        Err(e @ ClaimError::NoAnswer(_)) => {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
+        Err(e @ ClaimError::Endpoint(_)) => {
+            eprintln!("single instance: disabled: {e}");
+            None
+        }
+    }
+}
+
 /// Start the app and run until it quits.
 pub fn run() {
+    let launch = Request::from_args(std::env::args().skip(1));
+    let (instance_tx, instance_rx) = unbounded::<Request>();
+    // Held for the process's lifetime: the lock, and the socket file it removes on the way out.
+    let _instance = claim_single_instance(&launch, instance_tx);
+
     let state = AppState::default();
     let (sink, events_rx) = events::channel();
     state.set_events(Arc::new(sink));
@@ -87,7 +146,7 @@ pub fn run() {
                 let model = model.clone();
                 move |window, cx| cx.new(|cx| view::RootView::new(model, window, cx))
             });
-            match opened {
+            let main_window = match opened {
                 Ok((handle, _)) => {
                     let main = handle.window_id();
                     cx.on_window_closed(move |cx, closed| {
@@ -96,12 +155,18 @@ pub fn run() {
                         }
                     })
                     .detach();
+                    Some(handle)
                 }
                 Err(e) => {
                     eprintln!("could not open the main window: {e}");
                     cx.quit();
+                    None
                 }
-            }
+            };
+
+            launch::spawn_request_router(instance_rx, model.clone(), main_window, cx).detach();
+            // This launch's own links (the React app got them from onOpenUrl's getCurrent()).
+            launch::apply_request(launch, &model, None, cx);
         });
     // Also on the way out of the event loop, for a platform that returns without running
     // the quit observers. Idempotent.

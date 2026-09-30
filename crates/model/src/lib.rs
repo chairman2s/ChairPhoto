@@ -9,3 +9,4 @@ pub mod compare_duel;
 pub mod js_compat;
 pub mod shell_timing;
 pub mod tag_paste;
+pub mod theme;

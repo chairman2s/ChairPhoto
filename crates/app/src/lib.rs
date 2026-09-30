@@ -273,8 +273,7 @@ pub fn run() {
     #[cfg(debug_assertions)]
     std::thread::spawn(|| {
         let (Some(home), Ok(exe)) = (desktop::data_home(), std::env::current_exe()) else { return };
-        let claim = std::env::var(desktop::CLAIM_ENV).is_ok_and(|v| v == "1");
-        if let Err(e) = desktop::register_dev_handler(&home, &exe, claim) {
+        if let Err(e) = desktop::register_dev_handler(&home, &exe, desktop::opted_in(), desktop::claim_default) {
             eprintln!("deep-link dev registration failed: {e}");
         }
     });

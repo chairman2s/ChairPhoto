@@ -30,8 +30,20 @@
 use chairphoto_core::app::{with_catalog, AppState, CoreEvent, EventVisitor};
 use chairphoto_core::catalog::PhotoQuery;
 use chairphoto_core::image_pool::ImagePool;
-use gpui_kit::{Context, SharedString};
+use gpui_kit::{Context, EventEmitter, SharedString};
 use std::sync::Arc;
+
+/// What the [`AppModel`] tells the entities that derive state from it (the shell today).
+#[derive(Clone)]
+pub enum AppModelEvent {
+    /// A core event, after the model has noted it — so a subscriber applies the same
+    /// invalidation rules without a second route in `events.rs`.
+    Core(CoreEvent),
+    /// A refresh read the open catalog: catalog-derived lists are worth (re)reading now.
+    /// Startup's `open_default_catalog` sends no `catalog:switched`, so this is how the
+    /// first catalog reaches the other entities.
+    CatalogRead,
+}
 
 /// What the shell shows about the open catalog.
 #[derive(Debug, Clone, PartialEq)]
@@ -58,6 +70,8 @@ pub struct AppModel {
     /// Bumped by every refresh; a result from an older one is dropped.
     generation: u64,
 }
+
+impl EventEmitter<AppModelEvent> for AppModel {}
 
 impl AppModel {
     pub fn new(state: AppState, pool: Option<Arc<ImagePool>>) -> Self {
@@ -135,6 +149,7 @@ impl AppModel {
                     Ok(summary) => {
                         eprintln!("catalog: {} · {} photos", summary.name, summary.photo_count);
                         m.catalog = Some(summary);
+                        cx.emit(AppModelEvent::CatalogRead);
                     }
                     Err(e) => {
                         m.catalog = None;
@@ -159,6 +174,15 @@ impl AppModel {
         if invalidates {
             self.refresh(cx);
         }
+        cx.emit(AppModelEvent::Core(event.clone()));
+    }
+
+    /// A shell action whose feature a later ticket ports: say so in the status line rather
+    /// than fake it (`shell::actions::NOT_YET_PORTED`).
+    pub fn not_yet_ported(&mut self, what: &str, ticket: u32, cx: &mut Context<Self>) {
+        eprintln!("shell: {what}: not yet ported (#{ticket})");
+        self.status = not_yet_ported_line(what, ticket).into();
+        cx.notify();
     }
 
     /// Record `name payload` as the last event.
@@ -167,6 +191,11 @@ impl AppModel {
         self.last_event = Some(format!("{name} {payload}").trim_end().to_string().into());
         cx.notify();
     }
+}
+
+/// The status line for a feature that is not ported yet.
+pub fn not_yet_ported_line(what: &str, ticket: u32) -> String {
+    format!("{what}: not yet ported to the GPUI app (#{ticket})")
 }
 
 /// The open catalog's name and photo count. Blocking (catalog lock + SQLite): background only.

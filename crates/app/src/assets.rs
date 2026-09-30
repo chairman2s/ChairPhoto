@@ -25,7 +25,8 @@ const FONTS: &[(&str, &[u8])] = &[
     ("fonts/InstrumentSerif-Italic.ttf", include_bytes!("../assets/fonts/InstrumentSerif-Italic.ttf")),
 ];
 
-/// The app's `AssetSource`: [`FONTS`] under `fonts/`, gpui-kit's icon bundle for the rest
+/// The app's `AssetSource`: [`FONTS`] under `fonts/`, the shell's extra icons
+/// ([`crate::shell::sidebar::RailIcons`]), and gpui-kit's default icon bundle for the rest
 /// (the gpui-component widgets load their icons through it).
 pub struct Assets;
 
@@ -34,6 +35,9 @@ impl AssetSource for Assets {
         if let Some((_, bytes)) = FONTS.iter().find(|(p, _)| *p == path) {
             return Ok(Some(Cow::Borrowed(bytes)));
         }
+        if let Some(bytes) = crate::shell::sidebar::RailIcons.load(path)? {
+            return Ok(Some(bytes));
+        }
         gpui_kit::assets::Assets.load(path)
     }
 
@@ -41,7 +45,11 @@ impl AssetSource for Assets {
         if path.trim_end_matches('/') == "fonts" {
             return Ok(FONTS.iter().map(|(p, _)| SharedString::from(*p)).collect());
         }
-        gpui_kit::assets::Assets.list(path)
+        let mut paths = gpui_kit::assets::Assets.list(path)?;
+        paths.extend(crate::shell::sidebar::RailIcons.list(path)?);
+        paths.sort();
+        paths.dedup();
+        Ok(paths)
     }
 }
 

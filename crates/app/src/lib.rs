@@ -10,7 +10,7 @@
 //! 3. the GPUI application ([`wire`]): embedded fonts, gpui-kit's init, the theme from the
 //!    current system theme (before the first window: `theme::init` switches to Light), the
 //!    keymap and the quit wiring;
-//! 4. the [`model::AppModel`] entity and the event router;
+//! 4. the [`model::AppModel`] entity and the event router, and the [`shell::ShellState`];
 //! 5. `app::open_default_catalog`, off the UI thread;
 //! 6. the main window, 1400×900, `app_id` `chairphoto`.
 //!
@@ -26,6 +26,7 @@ pub mod assets;
 pub mod events;
 pub mod keymap;
 pub mod model;
+pub mod shell;
 pub mod theme;
 pub mod view;
 
@@ -47,7 +48,8 @@ use std::sync::Arc;
 /// Wayland `app_id` / X11 class: the `.desktop` file and the Hyprland rules match on it.
 pub const APP_ID: &str = "chairphoto";
 
-/// The main window's options: 1400×900 centred, server-side decorations (shell-apis.md § 7).
+/// The main window's options: 1400×900 centred, server-side decorations (shell-apis.md § 7;
+/// the title bar is the app's own header, see `shell::title_bar`).
 pub fn main_window_options(cx: &App) -> WindowOptions {
     WindowOptions {
         app_id: Some(APP_ID.into()),
@@ -119,6 +121,7 @@ impl WireOptions {
 /// What [`wire`] built.
 pub struct Wired {
     pub model: Entity<AppModel>,
+    pub shell: Entity<shell::ShellState>,
     /// The main window, or why it could not open (the app has then been asked to quit).
     pub main_window: Result<AnyWindowHandle, String>,
 }
@@ -149,14 +152,15 @@ pub fn wire(
 
     let model = cx.new(|_| AppModel::new(state, pool));
     events::spawn_router(events_rx, model.clone(), cx).detach();
+    let shell = cx.new(|cx| shell::ShellState::new(&model, cx));
     if options.open_default_catalog {
         model.update(cx, |m, cx| m.open_default_catalog(cx));
     }
 
     let window_options = main_window_options(cx);
     let opened = gpui_kit::open_window(window_options, cx, {
-        let model = model.clone();
-        move |window, cx| cx.new(|cx| view::RootView::new(model, window, cx))
+        let (model, shell) = (model.clone(), shell.clone());
+        move |window, cx| cx.new(|cx| view::RootView::new(model, shell, window, cx))
     });
     let main_window = match opened {
         Ok((handle, _)) => {
@@ -175,7 +179,7 @@ pub fn wire(
             Err(e.to_string())
         }
     };
-    Wired { model, main_window }
+    Wired { model, shell, main_window }
 }
 
 /// Start the app and run until it quits.

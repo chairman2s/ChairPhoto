@@ -11,7 +11,8 @@
 //! add one row to [`bindings`] with its context, and handle it with `.on_action` on the view
 //! that sets that context (or `cx.on_action` for app-global ones such as [`Quit`]).
 
-use gpui_kit::{actions, KeyBinding};
+use crate::shell::actions::{ToggleLeftPanel, ToggleRightPanel};
+use gpui_kit::{actions, KeyBinding, NoAction};
 
 /// Key-context names, one per surface that owns keys. Ported surfaces use these names so
 /// bindings and views agree; the React key handlers they replace are listed per row in
@@ -33,9 +34,18 @@ pub mod contexts {
     pub const DUEL: &str = "Duel";
     /// The Darkroom's Proof sheet overlay.
     pub const PROOF_SHEET: &str = "ProofSheet";
-    /// An open dropdown menu (swallows the culling keys while open).
-    pub const MENU: &str = "Menu";
+    /// An open dropdown menu: gpui-component's `PopupMenu` context (its own bindings: Escape,
+    /// ↑/↓/←/→, Enter). The keymap mutes the shell's keys in it, as React's open menu
+    /// swallowed every key but its own.
+    pub const MENU: &str = "PopupMenu";
+    /// A focused text input (gpui-base's `Input` context): typed characters are text, not
+    /// shortcuts (React's `INPUT`/`TEXTAREA` guard).
+    pub const INPUT: &str = "Input";
 }
+
+/// Single-key shell shortcuts that must not fire while a menu or a text input has focus.
+/// Culling keys (Library view, #106) join this list when they are bound.
+const MUTED_IN_MENUS_AND_INPUTS: &[&str] = &["[", "]"];
 
 actions!(
     chairphoto,
@@ -48,9 +58,22 @@ actions!(
 );
 
 /// The keymap. One row per binding: keystroke, action, context.
+///
+/// The shell's own keys are App.tsx's panel toggles (`[`, `]`; they also work in Compare,
+/// and a Darkroom/module/cull context mutes them with `NoAction` when those land) and
+/// Menu.tsx's menu keys, which gpui-component's `PopupMenu` binds itself. The rest of
+/// App.tsx's window handler — culling, Compare, loupe — binds with its views (#106, #109).
 pub fn bindings() -> Vec<KeyBinding> {
-    vec![
+    let mut bindings = vec![
         KeyBinding::new("ctrl-q", Quit, Some(contexts::ROOT)),
         KeyBinding::new("ctrl-shift-r", ReloadTheme, Some(contexts::ROOT)),
-    ]
+        KeyBinding::new("[", ToggleLeftPanel, Some(contexts::ROOT)),
+        KeyBinding::new("]", ToggleRightPanel, Some(contexts::ROOT)),
+    ];
+    // A deeper `NoAction` outranks the root binding for the same keystroke.
+    for key in MUTED_IN_MENUS_AND_INPUTS {
+        bindings.push(KeyBinding::new(key, NoAction, Some(contexts::MENU)));
+        bindings.push(KeyBinding::new(key, NoAction, Some(contexts::INPUT)));
+    }
+    bindings
 }

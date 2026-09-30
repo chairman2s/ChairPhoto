@@ -1,0 +1,29 @@
+[package]
+name = "chairphoto-model"
+# Internal crate, never published on its own: the app's version is the shell's
+# (`src-tauri/Cargo.toml`, see AGENTS.md § Versioning), so this one carries none.
+version = "0.0.0"
+publish = false
+description = "ChairPhoto's UI-free model: the pure logic the GPUI app ports from the React front end"
+authors = ["Andreas Henden <chairman2s.ah+github@gmail.com>"]
+license = "GPL-3.0-only"
+readme = "../../README.md"
+edition = "2021"
+
+# Plain Rust with no GPUI and no Tauri dependency (issue #92): state, record maths and labels
+# the GPUI app crate renders, testable without a window.
+[lib]
+name = "chairphoto_model"
+
+[dependencies]
+# Only for types that genuinely come from core: the Darkroom's source badge reads core's
+# `DevelopSource`/`LensInfo` (crates/core/src/develop_source.rs). No features — the model
+# needs none of core's optional backends (a workspace build unifies features anyway).
+chairphoto-core = { path = "../core", default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+# The render engine's own parser (`plugins::edit::record_engine`), so the tests prove core
+# reads every record this crate writes.
+chairphoto-core = { path = "../core", default-features = false, features = ["edit"] }

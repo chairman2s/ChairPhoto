@@ -754,6 +754,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "chairphoto-model"
+version = "0.0.0"
+dependencies = [
+ "chairphoto-core",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "chromiumoxide"
 version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

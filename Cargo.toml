@@ -11,7 +11,7 @@
 # anchored under the directory the GPUI cutover deletes. Build output is therefore `target/`
 # here, not `src-tauri/target/`.
 [workspace]
-members = ["crates/core", "src-tauri"]
+members = ["crates/core", "crates/model", "src-tauri"]
 resolver = "2"
 
 # Optimize image-decoding crates even in dev builds. Our own code stays in debug

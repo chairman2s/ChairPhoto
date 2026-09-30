@@ -74,7 +74,11 @@ fn a_core_event_from_a_worker_thread_reaches_the_model(cx: &mut TestAppContext) 
         assert!(line.contains("bridge.chairphoto"), "{line}");
         assert_eq!(
             m.catalog,
-            Some(CatalogSummary { name: "bridge.chairphoto".into(), photo_count: 0 }),
+            Some(CatalogSummary {
+                name: "bridge.chairphoto".into(),
+                photo_count: 0,
+                first_photos: vec![],
+            }),
             "catalog:switched must refresh the catalog summary"
         );
     });
@@ -126,7 +130,10 @@ fn ctrl_q_in_the_root_view_dispatches_quit(cx: &mut TestAppContext) {
         // Stands in for `run`'s handler, which calls `cx.quit()`.
         cx.on_action(move |_: &Quit, _| quits.set(quits.get() + 1));
     });
-    let (_view, cx) = cx.add_window_view(|window, cx| RootView::new(model, window, cx));
+    let images = cx.update(|cx| {
+        cx.new(|cx| crate::image_store::ImageStore::new(Arc::new(crate::image_tests::FakePool::default()), 1 << 20, cx))
+    });
+    let (_view, cx) = cx.add_window_view(|window, cx| RootView::new(model, images, window, cx));
     cx.run_until_parked();
 
     cx.simulate_keystrokes("ctrl-q");

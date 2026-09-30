@@ -28,7 +28,8 @@
 //! entity rather than guess. A stale list is a correctness bug; an extra refetch is only work.
 
 use chairphoto_core::app::{with_catalog, AppState, CoreEvent, EventVisitor};
-use chairphoto_core::catalog::PhotoQuery;
+use crate::image_store::Loaded;
+use chairphoto_core::catalog::{PhotoQuery, PhotoWindow};
 use chairphoto_core::image_pool::ImagePool;
 use gpui_kit::{Context, SharedString};
 use std::sync::Arc;
@@ -40,13 +41,19 @@ pub struct CatalogSummary {
     pub name: String,
     /// Every photo in the library view with no filter (`PhotoQuery::default()`).
     pub photo_count: usize,
+    /// The first [`FIRST_PHOTOS`] photo ids in that view's order — the root view's thumbnail
+    /// strip, the image layer's on-screen proof (#101) until the Library view replaces it.
+    pub first_photos: Vec<i64>,
 }
+
+/// How many photos [`CatalogSummary::first_photos`] holds.
+pub const FIRST_PHOTOS: usize = 24;
 
 /// App-wide state for the shell.
 pub struct AppModel {
     state: AppState,
-    /// Held for the app's lifetime; the image layer (#101) submits to it.
-    pool: Option<Arc<ImagePool>>,
+    /// Held for the app's lifetime; the image layer ([`crate::image_store`]) submits to it.
+    pool: Option<Arc<ImagePool<Loaded>>>,
     /// The open catalog, once [`AppModel::refresh`] has read it.
     pub catalog: Option<CatalogSummary>,
     /// One line on what the app is doing ("Opening catalog…", an error).
@@ -57,10 +64,13 @@ pub struct AppModel {
     pub events_seen: u64,
     /// Bumped by every refresh; a result from an older one is dropped.
     generation: u64,
+    /// Bumped by every `catalog:switched`: photo ids from before it mean other photos now,
+    /// so whatever is keyed by them (the image cache) must be dropped.
+    pub catalog_epoch: u64,
 }
 
 impl AppModel {
-    pub fn new(state: AppState, pool: Option<Arc<ImagePool>>) -> Self {
+    pub fn new(state: AppState, pool: Option<Arc<ImagePool<Loaded>>>) -> Self {
         Self {
             state,
             pool,
@@ -69,6 +79,7 @@ impl AppModel {
             last_event: None,
             events_seen: 0,
             generation: 0,
+            catalog_epoch: 0,
         }
     }
 
@@ -76,7 +87,7 @@ impl AppModel {
         &self.state
     }
 
-    pub fn pool(&self) -> Option<&Arc<ImagePool>> {
+    pub fn pool(&self) -> Option<&Arc<ImagePool<Loaded>>> {
         self.pool.as_ref()
     }
 
@@ -150,6 +161,9 @@ impl AppModel {
 
     /// A core event for this entity: note it, and refresh what it invalidates.
     pub fn on_core_event(&mut self, event: &CoreEvent, cx: &mut Context<Self>) {
+        if let CoreEvent::CatalogSwitched(_) = event {
+            self.catalog_epoch += 1;
+        }
         let invalidates = match event {
             CoreEvent::CatalogSwitched(_) => true,
             CoreEvent::ScanProgress(p) => p.phase == "done",
@@ -173,12 +187,14 @@ impl AppModel {
 fn read_summary(state: &AppState) -> Result<CatalogSummary, String> {
     with_catalog(state, |c| {
         let photo_count = c.count_photos(&PhotoQuery::default())?;
+        let window = PhotoQuery { window: Some(PhotoWindow::new(0, FIRST_PHOTOS)), ..Default::default() };
+        let first_photos = c.list_photos(&window)?.into_iter().map(|p| p.id).collect();
         let path = c.db_path();
         let name = path
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| path.to_string_lossy().to_string());
-        Ok(CatalogSummary { name, photo_count })
+        Ok(CatalogSummary { name, photo_count, first_photos })
     })
 }
 

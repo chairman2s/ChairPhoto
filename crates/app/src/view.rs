@@ -1,28 +1,43 @@
-//! The root view: for now the open catalog's name and photo count, what the app is doing, and
-//! a live line fed by core events — the proof that the window, the core and the event bridge
-//! are wired. The shell chrome (#105) replaces the body; the root context and focus stay.
+//! The root view: for now the open catalog's name and photo count, what the app is doing, a
+//! live line fed by core events, and a strip of the catalog's first thumbnails through the
+//! [`ImageStore`] — the proof that the window, the core, the event bridge and the image layer
+//! are wired. The shell chrome (#105) and the Library view replace the body; the root context
+//! and focus stay.
 
+use crate::image_store::{ImageState, ImageStore};
 use crate::keymap::{contexts, ReloadTheme};
 use crate::model::AppModel;
 use crate::theme::{Palette, FONT_DISPLAY};
+use chairphoto_core::image_pool::ImageKind;
 use gpui_kit::component::{ActiveTheme as _, Colorize as _};
 use gpui_kit::prelude::*;
-use gpui_kit::{div, px, Context, Entity, FocusHandle, Hsla, Subscription, Window};
+use gpui_kit::{div, img, px, AnyElement, Context, Entity, FocusHandle, Hsla, ObjectFit, Subscription, Window};
+
+/// One cell of the thumbnail strip.
+const STRIP_CELL: (f32, f32) = (132., 96.);
 
 pub struct RootView {
     model: Entity<AppModel>,
+    images: Entity<ImageStore>,
     focus: FocusHandle,
     _model_changed: Subscription,
+    _images_changed: Subscription,
 }
 
 impl RootView {
     /// The root owns focus from the start, so the app-wide bindings in [`contexts::ROOT`]
     /// work before anything else takes it.
-    pub fn new(model: Entity<AppModel>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        model: Entity<AppModel>,
+        images: Entity<ImageStore>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let focus = cx.focus_handle();
         focus.focus(window, cx);
         let _model_changed = cx.observe(&model, |_, _, cx| cx.notify());
-        Self { model, focus, _model_changed }
+        let _images_changed = cx.observe(&images, |_, _, cx| cx.notify());
+        Self { model, images, focus, _model_changed, _images_changed }
     }
 
     pub fn focus_handle(&self) -> &FocusHandle {
@@ -52,7 +67,44 @@ impl Render for RootView {
             .try_global::<Palette>()
             .and_then(|p| Hsla::parse_hex(&p.tokens.mute).ok())
             .unwrap_or(dim);
+        // The strip's thumbnails: requested in display order (the pool is LIFO, so the batch
+        // keeps the first cell first), then read back — cached, loading or failed.
+        let strip: Vec<i64> = self
+            .model
+            .read(cx)
+            .catalog
+            .as_ref()
+            .map(|c| c.first_photos.clone())
+            .unwrap_or_default();
+        let cells: Vec<ImageState> = self.images.update(cx, |store, _| {
+            let wanted: Vec<_> = strip.iter().map(|&id| (id, ImageKind::Thumb)).collect();
+            store.request_batch(&wanted);
+            strip.iter().map(|&id| store.get(id, ImageKind::Thumb)).collect()
+        });
+        let theme = cx.theme();
         let model = self.model.read(cx);
+        let strip_cells: Vec<AnyElement> = strip
+            .iter()
+            .zip(cells)
+            .map(|(&id, state)| {
+                let cell = div()
+                    .id(("thumb", id as u64))
+                    .w(px(STRIP_CELL.0))
+                    .h(px(STRIP_CELL.1))
+                    .rounded_sm()
+                    .overflow_hidden()
+                    .bg(panel);
+                match state {
+                    ImageState::Ready(loaded) => cell
+                        .child(img(loaded.image).size_full().object_fit(ObjectFit::Contain))
+                        .into_any_element(),
+                    ImageState::Failed(_) => cell.border_1().border_color(theme.danger).into_any_element(),
+                    ImageState::Loading | ImageState::Absent => {
+                        cell.border_1().border_color(border).into_any_element()
+                    }
+                }
+            })
+            .collect();
 
         let catalog_line = match &model.catalog {
             Some(c) => format!("{} · {} photos", c.name, c.photo_count),
@@ -117,6 +169,18 @@ impl Render for RootView {
                             .text_xs()
                             .text_color(mute)
                             .child(format!("{} core events · Ctrl+Q quits", model.events_seen)),
+                    )
+                    .child(
+                        div()
+                            .id("thumb-strip")
+                            .mt_4()
+                            .max_w(px(8. * (STRIP_CELL.0 + 8.)))
+                            .flex()
+                            .flex_row()
+                            .flex_wrap()
+                            .justify_center()
+                            .gap_2()
+                            .children(strip_cells),
                     ),
             )
     }

@@ -9,7 +9,7 @@
 //! - The palette is the backend's own [`OmarchyPalette`] (`chairphoto_core::appearance`),
 //!   which the TS interface mirrored field for field; `?: string | null` is `Option<String>`.
 //! - Channels are `f64` between parse and [`to_hex`], as JS numbers were; [`to_hex`] rounds
-//!   with JavaScript's `Math.round` ([`crate::js_compat::math_round`]), so every token is
+//!   with JavaScript's `Math.round` ([`crate::js_compat::round`]), so every token is
 //!   byte-identical to the TS output.
 //! - Hex digits parse like `parseInt(pair, 16)`: the leading hex digits of the pair count
 //!   (`"1g"` → 1). Where JS got `NaN` (no leading digit) and would have printed
@@ -21,7 +21,7 @@
 
 use super::standard;
 use super::tokens::{ThemeMode, ThemeTokens};
-use crate::js_compat::math_round;
+use crate::js_compat::round;
 pub use chairphoto_core::appearance::OmarchyPalette;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -73,7 +73,7 @@ fn parse_hex(input: &str) -> Rgb {
 }
 
 fn to_hex(c: Rgb) -> String {
-    let h = |n: f64| math_round(clamp(n, 0.0, 255.0)) as u8;
+    let h = |n: f64| round(clamp(n, 0.0, 255.0)) as u8;
     format!("#{:02x}{:02x}{:02x}", h(c.r), h(c.g), h(c.b))
 }
 

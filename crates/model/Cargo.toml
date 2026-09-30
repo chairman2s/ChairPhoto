@@ -18,10 +18,18 @@ edition = "2021"
 name = "chairphoto_model"
 
 [dependencies]
-# Only for the backend DTOs the TypeScript mirrored (Photo, PhotoQuery, ImportBatch,
-# StorageStatus, OmarchyPalette, …). Default features off: none of those types is
-# feature-gated, and it keeps LibRaw, ONNX Runtime and the publishers out of
-# `cargo test -p chairphoto-model`.
+# Only for types that genuinely come from core: the backend DTOs the TypeScript mirrored
+# (Photo, PhotoQuery, ImportBatch, StorageStatus, OmarchyPalette, …) and the Darkroom's
+# DevelopSource/LensInfo. Default features off: none of those types is feature-gated, and it
+# keeps LibRaw, ONNX Runtime and the publishers out of `cargo test -p chairphoto-model`.
 chairphoto-core = { path = "../core", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+[features]
+# Test-only: builds core's render engine so a test can feed it the records this crate writes
+# (`plugins::edit::record_engine`). `cargo test -p chairphoto-model --features edit-parity`
+# runs it. (It was made opt-in while the shell assumed core's features equal its own; since
+# gpui #99's db7facf the shell survives a core with more features, but opt-in still keeps
+# the plain model test run free of core's render engine.)
+edit-parity = ["chairphoto-core/edit"]

@@ -33,7 +33,7 @@
 //!   counted but not bucketed; the TS wrote it to a `-1` property of the array, which
 //!   `JSON.stringify` dropped.
 
-use crate::js_compat::{math_round, round_tenth};
+use crate::js_compat::{round, round_tenth};
 use serde::ser::SerializeMap;
 use serde::{Serialize, Serializer};
 
@@ -154,7 +154,7 @@ pub fn summarize_transition(t: &Transition) -> ShellSummary {
         tiles_loaded: t.tiles_loaded,
         load_buckets: t.load_buckets.clone(),
         to_scroll_ms: r(t.scroll_at),
-        max_frame_gap_ms: math_round(t.max_frame_gap_ms),
+        max_frame_gap_ms: round(t.max_frame_gap_ms),
         max_frame_gap_end_ms: r(t.max_frame_gap_at),
         marks: t.marks.clone(),
         slow_invokes: t.slow_invokes.clone(),

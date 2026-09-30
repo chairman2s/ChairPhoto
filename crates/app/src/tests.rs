@@ -312,38 +312,63 @@ fn an_open_menu_swallows_the_shell_keys(cx: &mut TestAppContext) {
     assert!(!left_visible(&app, cx), "the root has focus back");
 }
 
-/// A focused text input types `[` rather than toggling a column.
+/// A focused gpui-component `Input` gets `[` and `]` as text rather than toggling a column,
+/// and the same key toggles once focus is back on the root: the `Input` context is what
+/// mutes it (React's `INPUT`/`TEXTAREA` guard).
 #[gpui_kit::test]
 fn brackets_are_text_in_a_focused_input(cx: &mut TestAppContext) {
+    use gpui_kit::component::input::{Input, InputState};
     struct Field {
         root: FocusHandle,
-        input: FocusHandle,
+        input: Entity<InputState>,
         toggles: Rc<Cell<u32>>,
     }
     impl Render for Field {
         fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
             let toggles = self.toggles.clone();
             div()
+                .id("field-root")
                 .key_context(contexts::ROOT)
                 .track_focus(&self.root)
                 .on_action(move |_: &ToggleLeftPanel, _, _| toggles.set(toggles.get() + 1))
                 .size_full()
-                .child(div().key_context(contexts::INPUT).track_focus(&self.input).size_full())
+                .child(Input::new(&self.input).id("field").w(gpui_kit::px(240.)))
         }
     }
-    cx.update(|cx| cx.bind_keys(keymap::bindings()));
-    let toggles = Rc::new(Cell::new(0));
-    let (view, cx) = cx.add_window_view({
-        let toggles = toggles.clone();
-        move |_, cx| Field { root: cx.focus_handle(), input: cx.focus_handle(), toggles }
+    cx.update(|cx| {
+        gpui_kit::init(cx);
+        cx.bind_keys(keymap::bindings());
     });
-    cx.update(|window, cx| view.read(cx).input.clone().focus(window, cx));
-    cx.simulate_keystrokes("[");
+    let toggles = Rc::new(Cell::new(0));
+    let (handle, view) = cx.update(|cx| {
+        gpui_kit::open_window(Default::default(), cx, {
+            let toggles = toggles.clone();
+            move |window, cx| {
+                let input = cx.new(|cx| InputState::new(window, cx));
+                cx.new(|cx| Field { root: cx.focus_handle(), input, toggles })
+            }
+        })
+        .unwrap()
+    });
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.click("field", cx);
+        window.press("[", cx);
+        window.press("]", cx);
+        window.input("x", cx);
+        assert_eq!(window.find("field").value(), Some("[]x"), "the brackets were typed");
+    })
+    .unwrap();
     assert_eq!(toggles.get(), 0, "[ toggled a column from inside an input");
-    // The same key with the root focused does toggle: the input's context is what mutes it.
-    cx.update(|window, cx| view.read(cx).root.clone().focus(window, cx));
-    cx.simulate_keystrokes("[");
-    assert_eq!(toggles.get(), 1);
+    assert_eq!(view.read_with(cx, |f, cx| f.input.read(cx).value().to_string()), "[]x");
+
+    cx.update_window(handle, |_, window, cx| {
+        view.read(cx).root.clone().focus(window, cx);
+        window.render_frame(cx);
+        window.press("[", cx);
+    })
+    .unwrap();
+    assert_eq!(toggles.get(), 1, "with the root focused, [ toggles");
 }
 
 // --- menus and controls ------------------------------------------------------------------

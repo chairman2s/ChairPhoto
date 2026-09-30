@@ -98,6 +98,32 @@ fn open_catalog(app: &App, dir: &TempDir, cx: &mut TestAppContext) {
     cx.run_until_parked();
 }
 
+/// Like [`open_catalog`], with `n` photos in it (unrated, unpicked); returns their ids.
+fn open_catalog_with_photos(app: &App, dir: &TempDir, n: usize, cx: &mut TestAppContext) -> Vec<i64> {
+    let db = dir.0.join("photos.chairphoto");
+    let root = dir.0.join("photos");
+    let catalog = Catalog::open(&db, &root).unwrap();
+    let ids = (0..n)
+        .map(|i| catalog.upsert_photo(&root.join(format!("2026/p{i}.ARW")), None, 0, 1).unwrap().id)
+        .collect();
+    *app.state.catalog.lock().unwrap() = Some(catalog);
+    app.state.send(CoreEvent::CatalogSwitched(db.to_string_lossy().to_string()));
+    cx.run_until_parked();
+    ids
+}
+
+/// Take focus away from the main window (to a second window) and give it back: the
+/// platform's activation change, as a window manager would send it.
+fn refocus_main_window(app: &App, cx: &mut TestAppContext) {
+    let other = cx.update(|cx| {
+        cx.open_window(Default::default(), |_, cx| cx.new(|_| gpui_kit::Empty)).unwrap()
+    });
+    other.update(cx, |_, window, _| window.activate_window()).unwrap();
+    cx.run_until_parked();
+    cx.update_window(app.window(), |_, window, _| window.activate_window()).unwrap();
+    cx.run_until_parked();
+}
+
 fn press(app: &App, key: &str, cx: &mut TestAppContext) {
     cx.update_window(app.window(), |_, window, cx| {
         window.render_frame(cx);
@@ -522,4 +548,29 @@ fn a_quit_signal_dispatches_quit(cx: &mut TestAppContext) {
     .unwrap();
     cx.run_until_parked();
     assert_eq!(quits.get(), 1);
+}
+
+/// React re-read the back-up queue and the trash count on window focus: a change made
+/// elsewhere (another tool, a finished backup) shows when the user comes back.
+#[gpui_kit::test]
+fn window_focus_rereads_the_pending_and_trash_counts(cx: &mut TestAppContext) {
+    let dir = TempDir::new("focus");
+    let app = start(cx);
+    let ids = open_catalog_with_photos(&app, &dir, 2, cx);
+    app.wired.shell.read_with(cx, |s, _| assert_eq!((s.counts.pending, s.counts.trash), (0, Some(0))));
+
+    // Changed behind the shell's back: nothing announces these.
+    {
+        let guard = app.state.catalog.lock().unwrap();
+        let c = guard.as_ref().unwrap();
+        c.enqueue_operation("backup", ids[0]).unwrap();
+        c.trash_photos(&[ids[1]]).unwrap();
+    }
+    cx.run_until_parked();
+    app.wired.shell.read_with(cx, |s, _| assert_eq!((s.counts.pending, s.counts.trash), (0, Some(0))));
+
+    refocus_main_window(&app, cx);
+    app.wired.shell.read_with(cx, |s, _| {
+        assert_eq!((s.counts.pending, s.counts.trash), (1, Some(1)), "focus re-read the counts")
+    });
 }

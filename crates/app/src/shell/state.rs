@@ -260,6 +260,7 @@ pub struct ShellState {
     pub scope_info: ScopeInfo,
     lists_generation: u64,
     scope_generation: u64,
+    focus_generation: u64,
     _model_events: Subscription,
 }
 
@@ -293,6 +294,7 @@ impl ShellState {
             scope_info: ScopeInfo::default(),
             lists_generation: 0,
             scope_generation: 0,
+            focus_generation: 0,
             _model_events,
         }
     }
@@ -434,6 +436,7 @@ impl ShellState {
                 // the model's `CatalogRead`.
                 self.lists_generation += 1;
                 self.scope_generation += 1;
+                self.focus_generation += 1;
                 cx.notify();
             }
             _ if jobs_changed => cx.notify(),
@@ -470,6 +473,41 @@ impl ShellState {
         })
         .detach();
         self.refresh_scope(cx);
+    }
+
+    /// The main window regained focus: re-read the back-up queue and the trash count, as
+    /// React's `onFocus` did (`checkReconcile` + `refreshTrashCount`; the reconcile it could
+    /// start is Storage and import, #114). Off the UI thread; a read that a newer focus or a
+    /// catalog switch superseded is dropped. No-op with no catalog open.
+    pub fn refresh_on_focus(&mut self, cx: &mut Context<Self>) {
+        self.focus_generation += 1;
+        let generation = self.focus_generation;
+        let state = self.app.clone();
+        let read = cx.background_executor().spawn(async move {
+            let pending = with_catalog(&state, |c| c.list_pending_operations())
+                .map(|ops| ops.iter().filter(|o| o.status == "pending").count());
+            let trash = with_catalog(&state, |c| c.list_trash()).map(|t| t.len());
+            (pending, trash)
+        });
+        cx.spawn(async move |this, cx| {
+            let (pending, trash) = read.await;
+            this.update(cx, |s, cx| {
+                if s.focus_generation != generation {
+                    return;
+                }
+                // A failed read (e.g. no catalog yet) leaves the counts as they were: unknown
+                // is not zero.
+                if let Ok(pending) = pending {
+                    s.counts.pending = pending;
+                }
+                if let Ok(trash) = trash {
+                    s.counts.trash = Some(trash);
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// Re-read what the current scope resolves to.

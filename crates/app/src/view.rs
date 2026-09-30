@@ -46,7 +46,7 @@ pub struct RootView {
     pub(crate) focus: FocusHandle,
     pub(crate) thumb_slider: Entity<SliderState>,
     resize: Option<Resize>,
-    _observers: [Subscription; 3],
+    _observers: [Subscription; 4],
 }
 
 /// One cell of the stage's thumbnail strip — the image layer's on-screen proof (#101) until
@@ -70,6 +70,13 @@ impl RootView {
             cx.observe(&model, |_, _, cx| cx.notify()),
             cx.observe(&shell, |_, _, cx| cx.notify()),
             cx.observe(&images, |_, _, cx| cx.notify()),
+            // React re-read the back-up queue and the trash count on window focus
+            // (App.tsx `onFocus`): an external change or a finished backup shows on return.
+            cx.observe_window_activation(window, |this, window, cx| {
+                if window.is_window_active() {
+                    this.shell.update(cx, |s, cx| s.refresh_on_focus(cx));
+                }
+            }),
         ];
         Self { model, shell, images, focus, thumb_slider, resize: None, _observers }
     }

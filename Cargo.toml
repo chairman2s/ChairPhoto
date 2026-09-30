@@ -1,8 +1,13 @@
-# The Rust half of ChairPhoto is two crates (issue #95):
+# The Rust half of ChairPhoto is a workspace of four crates (issue #95):
 #
 # - `crates/core` (`chairphoto-core`) — catalog, import, XMP, decode, jobs, plugins' backends:
 #   everything the app *does*. It has no Tauri dependency, so a second front end (the GPUI
 #   app, docs/plans/gpui) can link it directly.
+# - `crates/app` (`chairphoto-app`, binary `chairphoto-gpui`) — the native GPUI front end that
+#   replaces the Tauri shell (docs/plans/gpui, issue #99). Links the core directly.
+# - `crates/model` (`chairphoto-model`) — the UI's logic without any UI toolkit: library
+#   session/query, Darkroom editing rules, theme mapping (issues #102, #103). Sans-IO, so it is
+#   unit-tested without GPUI.
 # - `src-tauri` (`chairphoto`) — the Tauri shell: `run()`, the command surface in
 #   `commands/`, the `thumb://`/`preview://`/`zoom://`/`edit://` protocols and the Tauri
 #   plugins. It forwards every feature to the core crate under the same name.
@@ -11,7 +16,7 @@
 # anchored under the directory the GPUI cutover deletes. Build output is therefore `target/`
 # here, not `src-tauri/target/`.
 [workspace]
-members = ["crates/core", "crates/model", "src-tauri"]
+members = ["crates/core", "crates/model", "crates/app", "src-tauri"]
 resolver = "2"
 
 # Optimize image-decoding crates even in dev builds. Our own code stays in debug

@@ -104,6 +104,7 @@ Read only the documents triggered by the task:
 src/                    React/TypeScript UI and host/module contracts
 crates/core/src/        Rust I/O, catalog, image processing, jobs (`chairphoto-core`, no Tauri)
 src-tauri/src/          Tauri shell: `run()`, commands, media protocols (`chairphoto`)
+crates/app/src/         GPUI front end replacing the Tauri shell (`chairphoto-app`, bin `chairphoto-gpui`)
 ```
 
 The Rust side is a Cargo workspace rooted at the repository root. The core crate must build

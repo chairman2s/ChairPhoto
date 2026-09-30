@@ -332,7 +332,9 @@ mod tests {
     use super::*;
     use std::sync::mpsc;
 
-    /// A private directory under the system temp dir, removed on drop.
+    /// A private directory, removed on drop. Under `$XDG_RUNTIME_DIR` (else `/tmp`), not
+    /// `std::env::temp_dir()`: a socket path must fit in `sun_path` (108 bytes), and a long
+    /// `TMPDIR` (the suite runs with one on disk) overflows it.
     struct TempDir(PathBuf);
 
     impl TempDir {
@@ -341,7 +343,11 @@ mod tests {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_nanos();
-            let dir = std::env::temp_dir().join(format!("cp-si-{tag}-{}-{nanos}", std::process::id()));
+            let base = std::env::var_os("XDG_RUNTIME_DIR")
+                .filter(|v| !v.is_empty())
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("/tmp"));
+            let dir = base.join(format!("cp-si-{tag}-{}-{nanos}", std::process::id()));
             std::fs::DirBuilder::new().mode(0o700).recursive(true).create(&dir).unwrap();
             TempDir(dir)
         }

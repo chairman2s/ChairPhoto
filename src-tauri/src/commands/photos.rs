@@ -128,7 +128,7 @@ pub async fn set_iptc(
         c.require_photo_path(photo_id)
     })
     .await?;
-    tauri::async_runtime::spawn_blocking(move || crate::xmp::write_iptc(&original, &fields))
+    crate::app::spawn_blocking(move || crate::xmp::write_iptc(&original, &fields))
         .await
         .map_err(|e| e.to_string())?
 }

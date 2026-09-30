@@ -48,7 +48,7 @@ pub async fn cache_images(
         Ok(lists)
     })?;
     let health = state.volume_health.clone();
-    let items: Vec<(i64, PathBuf)> = tauri::async_runtime::spawn_blocking(move || {
+    let items: Vec<(i64, PathBuf)> = crate::app::spawn_blocking(move || {
         candidate_lists
             .into_iter()
             .filter_map(|(id, cands)| {
@@ -75,7 +75,7 @@ pub async fn cache_images(
     // (photo_id, is_grayscale) computed from each thumbnail, applied to the catalog
     // after the parallel pass (workers don't hold the lock).
     let grayscale = std::sync::Mutex::new(Vec::<(i64, bool)>::with_capacity(total));
-    let grayscale = tauri::async_runtime::spawn_blocking(move || {
+    let grayscale = crate::app::spawn_blocking(move || {
         let done = AtomicUsize::new(0);
         let workers = std::thread::available_parallelism()
             .map(|n| n.get())
@@ -162,7 +162,7 @@ async fn image_data_uri(
     // OriginalRequired: this is the base64 fallback for the `thumb://`/`preview://`
     // protocols, so it is the last thing standing between the caller and an error — it
     // must not report "unreachable" on the strength of a cached flag alone.
-    let bytes = tauri::async_runtime::spawn_blocking(move || {
+    let bytes = crate::app::spawn_blocking(move || {
         let absolute = crate::volume_health::pick_existing(
             &candidates,
             &health,

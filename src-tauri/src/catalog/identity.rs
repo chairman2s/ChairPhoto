@@ -1332,7 +1332,7 @@ impl Catalog {
     ///
     /// The whole pass, minus the ownership that surrounds it: `commands::storage`'s
     /// `repair_pending_identity` claims the identity job family
-    /// (`commands::jobs::JobRegistry::identity`) and hands its abort generation in here, so
+    /// (`app::jobs::JobRegistry::identity`) and hands its abort generation in here, so
     /// a newer pass, a Cancel, or a catalog switch stops this one. `progress` is called
     /// after each row with the running summary; the command turns that into the
     /// `identity:repair_progress` event.

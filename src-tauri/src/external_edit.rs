@@ -299,7 +299,7 @@ pub async fn develop_in_editor(
     let app2 = app.clone();
     let key = editor_key.clone();
     let (raw, db_path, root, cli) = (r.raw, r.db_path, r.root, r.cli);
-    let result = tauri::async_runtime::spawn_blocking(move || -> Result<Option<i64>, String> {
+    let result = crate::app::spawn_blocking(move || -> Result<Option<i64>, String> {
         emit(&app2, "waiting", &key);
         // Wait for the interactive session to finish. Editors may exit non-zero; we key off
         // the sidecar changing, not the exit code. For darktable, additionally watch the
@@ -374,7 +374,7 @@ pub async fn import_developed(
     };
     let (raw, db_path, root, key) = (r.raw, r.db_path, r.root, editor_key.clone());
     let app2 = app.clone();
-    let result = tauri::async_runtime::spawn_blocking(move || -> Result<i64, String> {
+    let result = crate::app::spawn_blocking(move || -> Result<i64, String> {
         emit(&app2, "rendering", &key);
         let catalog = Catalog::open_secondary(&db_path, &root).map_err(|e| e.to_string())?;
         // Adopt any AI-restore outputs first (idempotent for already-indexed ones), so

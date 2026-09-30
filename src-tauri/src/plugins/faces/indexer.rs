@@ -128,7 +128,7 @@ pub struct IndexedFace {
 ///
 /// Returns an [`IndexOutcome`] — processed/skipped counts and whether the run aborted.
 ///
-/// The function is not `async` because it runs inside `tauri::async_runtime::spawn_blocking`.
+/// The function is not `async` because it runs inside `crate::app::spawn_blocking`.
 ///
 /// ## Parallelism
 ///

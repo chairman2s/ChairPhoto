@@ -59,7 +59,7 @@ pub async fn raw_probe(app: AppHandle, photo_id: i64) -> Result<DevelopSource, S
         catalog.photo_path_candidates(photo_id).map_err(|e| e.to_string())?
     };
     let health = state.volume_health.clone();
-    tauri::async_runtime::spawn_blocking(move || {
+    crate::app::spawn_blocking(move || {
         let path = crate::volume_health::pick_existing(
             &candidates,
             &health,
@@ -131,7 +131,7 @@ fn resolve_original(app: &AppHandle, photo_id: i64) -> Result<std::path::PathBuf
 /// a RAW or whose original is unreachable is simply not preloaded.
 #[tauri::command]
 pub async fn develop_open(app: AppHandle, photo_id: i64, neighbours: Vec<i64>) -> Result<DevelopSource, String> {
-    tauri::async_runtime::spawn_blocking(move || {
+    crate::app::spawn_blocking(move || {
         let path = resolve_original(&app, photo_id)?;
         if !crate::scanner::is_raw(&path) {
             // Nothing to prepare for a JPEG; `session::open` is not reached, so a previous
@@ -179,7 +179,7 @@ pub async fn develop_close(app: AppHandle) -> Result<(), String> {
 pub async fn develop_cache_usage() -> Result<u64, String> {
     #[cfg(all(feature = "raw", feature = "edit"))]
     {
-        return tauri::async_runtime::spawn_blocking(crate::develop::cache::usage_bytes)
+        return crate::app::spawn_blocking(crate::develop::cache::usage_bytes)
             .await
             .map_err(|e| e.to_string());
     }
@@ -193,7 +193,7 @@ pub async fn develop_cache_usage() -> Result<u64, String> {
 pub async fn develop_cache_clear() -> Result<u64, String> {
     #[cfg(all(feature = "raw", feature = "edit"))]
     {
-        return tauri::async_runtime::spawn_blocking(|| crate::develop::cache::trim_to(0))
+        return crate::app::spawn_blocking(|| crate::develop::cache::trim_to(0))
             .await
             .map_err(|e| e.to_string());
     }
@@ -204,7 +204,7 @@ pub async fn develop_cache_clear() -> Result<u64, String> {
 /// The develop source state right now (a remounted view re-attaching).
 #[tauri::command]
 pub async fn develop_source(app: AppHandle, photo_id: i64) -> Result<DevelopSource, String> {
-    tauri::async_runtime::spawn_blocking(move || {
+    crate::app::spawn_blocking(move || {
         let path = resolve_original(&app, photo_id)?;
         if !crate::scanner::is_raw(&path) {
             return Ok(DevelopSource::Jpeg);

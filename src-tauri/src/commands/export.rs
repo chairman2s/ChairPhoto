@@ -37,7 +37,7 @@ pub async fn export_photos(
         };
         (resolved, hashtags)
     };
-    let result = tauri::async_runtime::spawn_blocking(move || {
+    let result = crate::app::spawn_blocking(move || {
         crate::export::write_exports(&resolved, preset, &dest, &hashtags)
     })
     .await
@@ -128,7 +128,7 @@ pub async fn export_bundle(
 
     // Phase 2 — write the zip off the catalog lock (file IO can be slow for large RAW sets).
     // Progress events mirror the `import:progress` shape used by E5 (ingest_from_card).
-    tauri::async_runtime::spawn_blocking(move || {
+    crate::app::spawn_blocking(move || {
         crate::bundle::writer::write_bundle(&bundle, &dest, |done, total| {
             let _ = app.emit("import:progress", ImportProgress { done, total });
         })
@@ -165,7 +165,7 @@ pub async fn import_bundle_cmd(
     // This is the slow part (potentially gigabytes of RAW files).
     let (manifest, extracted, partial) = {
         let app = app.clone();
-        tauri::async_runtime::spawn_blocking(move || {
+        crate::app::spawn_blocking(move || {
             let (manifest, mut archive) =
                 crate::bundle::importer::open_bundle(&bundle_path)?;
             let (extracted, partial) = crate::bundle::importer::extract_originals(
@@ -193,7 +193,7 @@ pub async fn import_bundle_cmd(
         let catalog = guard.as_ref().ok_or("No catalog is open")?;
         (catalog.db_path().to_path_buf(), catalog.root().to_path_buf())
     };
-    let result = tauri::async_runtime::spawn_blocking(move || {
+    let result = crate::app::spawn_blocking(move || {
         let sec = crate::catalog::Catalog::open_secondary(&db_path, &root)
             .map_err(|e| e.to_string())?;
         crate::bundle::importer::index_bundle(&sec, &manifest, &extracted, &root, partial)
@@ -220,7 +220,7 @@ pub async fn preview_bundle(
     let bundle_path = expand_home(&bundle_path);
 
     // Phase 1 — open and parse the manifest (pure filesystem; no catalog lock).
-    let manifest = tauri::async_runtime::spawn_blocking(move || {
+    let manifest = crate::app::spawn_blocking(move || {
         let (manifest, _archive) = crate::bundle::importer::open_bundle(&bundle_path)?;
         Ok::<_, String>(manifest)
     })

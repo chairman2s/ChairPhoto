@@ -64,7 +64,7 @@ pub async fn switch_catalog(
     detach_catalog_and_trip_jobs(state.inner())?;
 
     // 3. Open (creating first if requested) the new catalog off the async executor.
-    let catalog = tauri::async_runtime::spawn_blocking({
+    let catalog = crate::app::spawn_blocking({
         let path = catalog_path_buf.clone();
         let root = root_buf.clone();
         move || {
@@ -98,7 +98,7 @@ pub async fn switch_catalog(
     state.volume_health.invalidate();
 
     // Record in recent catalogs (non-fatal if it fails). Off the async executor.
-    let _ = tauri::async_runtime::spawn_blocking({
+    let _ = crate::app::spawn_blocking({
         let name = catalog_name.clone();
         let path = catalog_path_buf.clone();
         let root = actual_root.clone();
@@ -151,7 +151,7 @@ pub async fn switch_catalog(
 /// Nested acquisition is always catalog -> abort -> slot, here and in every job start that
 /// takes more than one, so this cannot invert. Both switch phases are also the only places
 /// that hold two abort locks at once, and they take them in the same order — the field order
-/// of `commands::jobs::JobRegistry` (scan, face indexing, face matching, sharpness, pHash,
+/// of `app::jobs::JobRegistry` (scan, face indexing, face matching, sharpness, pHash,
 /// Smart Tagging), which is where that order is now defined rather than copied.
 ///
 /// Extracted from `switch_catalog` so the ownership transition can be driven directly by
@@ -251,7 +251,7 @@ pub(super) fn publish_catalog_and_reset_jobs(
 /// List recently-accessed catalogs, ordered by last-opened (most recent first).
 #[tauri::command]
 pub async fn list_recent_catalogs() -> Result<Vec<RecentCatalog>, String> {
-    tauri::async_runtime::spawn_blocking(|| load_recent_catalogs())
+    crate::app::spawn_blocking(|| load_recent_catalogs())
         .await
         .map_err(|e| e.to_string())?
 }
@@ -342,13 +342,13 @@ pub async fn init_catalog(app: AppHandle, state: State<'_, AppState>) -> Result<
     let default_root = expand_home("~/Pictures/Raw");
 
     // Create the default root directory off the UI thread.
-    let _ = tauri::async_runtime::spawn_blocking({
+    let _ = crate::app::spawn_blocking({
         let root = default_root.clone();
         move || std::fs::create_dir_all(&root).ok()
     })
     .await;
 
-    let catalog = tauri::async_runtime::spawn_blocking({
+    let catalog = crate::app::spawn_blocking({
         let path = catalog_path.clone();
         let root = default_root.clone();
         move || Catalog::open(&path, &root)
@@ -365,7 +365,7 @@ pub async fn init_catalog(app: AppHandle, state: State<'_, AppState>) -> Result<
 
     // Record in recent catalogs (non-fatal if it fails). Wrap in spawn_blocking to avoid
     // blocking the async executor on file I/O.
-    let _ = tauri::async_runtime::spawn_blocking({
+    let _ = crate::app::spawn_blocking({
         let path = catalog_path.clone();
         let root = actual_root.clone();
         move || record_recent_catalog("default", &path, &root)
@@ -431,7 +431,7 @@ pub(super) async fn reroot_library(
 ) -> Result<(), String> {
     // Creating the directory is disk work; keep it off the async executor, and do it before
     // anything is tripped so a bad path fails with every job still running.
-    tauri::async_runtime::spawn_blocking({
+    crate::app::spawn_blocking({
         let root = new_root.clone();
         move || std::fs::create_dir_all(&root).map_err(|e| e.to_string())
     })
@@ -449,7 +449,7 @@ pub(super) async fn reroot_library(
     })?;
 
     // Reopen off the async executor — this runs migrations.
-    let reopened = tauri::async_runtime::spawn_blocking({
+    let reopened = crate::app::spawn_blocking({
         let path = catalog_path.clone();
         let root = new_root.clone();
         move || Catalog::open(&path, &root).map_err(|e| e.to_string())
@@ -519,7 +519,7 @@ pub struct VacuumResult {
 /// the window stays responsive). Returns the size before and after.
 #[tauri::command]
 pub async fn vacuum_catalog(app: AppHandle) -> Result<VacuumResult, String> {
-    tauri::async_runtime::spawn_blocking(move || {
+    crate::app::spawn_blocking(move || {
         let state = app.state::<AppState>();
         // `&mut`: compaction also sheds retired columns, which changes the connection's own
         // view of the table shape (see `Catalog::vacuum`).

@@ -152,7 +152,7 @@ pub async fn make_slideshow(
     let frame_max_width = (engine_opts.width.max(engine_opts.height) * 2).min(4096);
 
     let dest_for_write = dest.clone();
-    tauri::async_runtime::spawn_blocking(move || -> Result<(), String> {
+    crate::app::spawn_blocking(move || -> Result<(), String> {
         // Temp working dir for the per-photo frame JPEGs (cleaned up after the encode).
         let work = std::env::temp_dir().join(format!(
             "chairphoto_slideshow_{}",

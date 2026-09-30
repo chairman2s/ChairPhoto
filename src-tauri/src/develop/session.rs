@@ -12,7 +12,7 @@
 //! reads as "not resident", never as other pixels.
 
 use super::{release_all, with_resident};
-use crate::commands::jobs::{JobClaim, JobStatus};
+use crate::app::jobs::{JobClaim, JobStatus};
 use crate::commands::{AppState, DevelopSource};
 use crate::plugins::edit::{SourceToken, WorkingImage};
 use std::path::PathBuf;

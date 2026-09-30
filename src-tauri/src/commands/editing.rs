@@ -159,7 +159,7 @@ pub async fn render_edit(
         };
         // Render and base64-wrap on a blocking worker: both are CPU work, neither belongs
         // on the async thread.
-        tauri::async_runtime::spawn_blocking(move || {
+        crate::app::spawn_blocking(move || {
             let bytes = render_edit_bytes(&app, &job)?;
             let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
             Ok(format!("data:image/jpeg;base64,{b64}"))
@@ -226,7 +226,7 @@ pub async fn render_edit_batch(
             catalog.photo_path_candidates(photo_id).map_err(|e| e.to_string())?
         };
         let health = state.volume_health.clone();
-        tauri::async_runtime::spawn_blocking(move || {
+        crate::app::spawn_blocking(move || {
             // OriginalRequired: an edit render needs the real original, so a
             // cached-unreachable flag must never stand in for a stat.
             let path = crate::volume_health::pick_existing(
@@ -310,7 +310,7 @@ pub async fn edit_zone_masses(
             catalog.photo_path_candidates(photo_id).map_err(|e| e.to_string())?
         };
         let health = state.volume_health.clone();
-        tauri::async_runtime::spawn_blocking(move || {
+        crate::app::spawn_blocking(move || {
             // OriginalRequired: the masses describe an edit render of the real original,
             // so a cached-unreachable flag must never stand in for a stat.
             let path = crate::volume_health::pick_existing(
@@ -371,7 +371,7 @@ pub async fn suggest_auto_tone(
             catalog.photo_path_candidates(photo_id).map_err(|e| e.to_string())?
         };
         let health = state.volume_health.clone();
-        tauri::async_runtime::spawn_blocking(move || {
+        crate::app::spawn_blocking(move || {
             let path = crate::volume_health::pick_existing(
                 &candidates,
                 &health,
@@ -416,7 +416,7 @@ pub async fn suggest_auto_tone(
 /// List the `.cube` LUT filenames available in the app's luts folder.
 #[tauri::command]
 pub async fn list_luts() -> Result<Vec<String>, String> {
-    tauri::async_runtime::spawn_blocking(|| {
+    crate::app::spawn_blocking(|| {
         let dir = luts_dir()?;
         let mut out = Vec::new();
         for entry in std::fs::read_dir(&dir).map_err(|e| e.to_string())? {
@@ -444,7 +444,7 @@ pub async fn import_lut(path: String) -> Result<String, String> {
     }
     #[cfg(feature = "edit")]
     {
-        tauri::async_runtime::spawn_blocking(move || {
+        crate::app::spawn_blocking(move || {
             let src = PathBuf::from(&path);
             let name = src
                 .file_name()
@@ -472,7 +472,7 @@ pub async fn delete_lut(file: String) -> Result<(), String> {
     if file.contains('/') || file.contains('\\') || file.is_empty() {
         return Err("bad LUT filename".into());
     }
-    tauri::async_runtime::spawn_blocking(move || {
+    crate::app::spawn_blocking(move || {
         std::fs::remove_file(luts_dir()?.join(&file)).map_err(|e| e.to_string())
     })
     .await
@@ -579,7 +579,7 @@ async fn write_version_then_refresh_monochrome<T>(
         // both skip the write below and leave the stored flag alone (AGENTS.md:
         // missing/unmounted storage is normal, never evidence the row is wrong). Only an
         // actual decoded verdict is ever persisted.
-        let outcome = tauri::async_runtime::spawn_blocking(move || {
+        let outcome = crate::app::spawn_blocking(move || {
             crate::volume_health::pick_existing(
                 &candidates,
                 &health,

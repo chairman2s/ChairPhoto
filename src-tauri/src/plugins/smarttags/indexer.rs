@@ -80,7 +80,7 @@ pub struct IndexOutcome {
 /// - `abort`           — shared abort flag; checked after each photo.
 /// - `emit_progress`   — callback receiving [`SmarttagsProgress`] after each embedded photo.
 ///
-/// The function is not `async` — it runs inside `tauri::async_runtime::spawn_blocking`.
+/// The function is not `async` — it runs inside `crate::app::spawn_blocking`.
 #[allow(clippy::too_many_arguments)]
 pub fn run_index<ResolveFn, PreviewFn, EmbedFn, EmitFn>(
     conn: &Connection,

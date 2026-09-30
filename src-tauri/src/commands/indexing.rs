@@ -59,7 +59,7 @@ pub async fn index_sharpness(
         (c.db_path().to_path_buf(), c.root().to_path_buf())
     };
 
-    tauri::async_runtime::spawn_blocking(move || {
+    crate::app::spawn_blocking(move || {
         use crate::catalog::Catalog;
         use crate::sharpness_indexer;
 
@@ -220,7 +220,7 @@ pub async fn index_phashes(app: AppHandle, state: State<'_, AppState>) -> Result
         (c.db_path().to_path_buf(), c.root().to_path_buf())
     };
 
-    tauri::async_runtime::spawn_blocking(move || {
+    crate::app::spawn_blocking(move || {
         use crate::catalog::Catalog;
         use crate::phash_indexer;
 

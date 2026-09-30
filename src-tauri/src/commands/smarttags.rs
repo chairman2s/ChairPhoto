@@ -5,6 +5,7 @@
 
 use super::*;
 use serde::Serialize;
+use std::sync::Mutex;
 use tauri::{AppHandle, Emitter, State};
 
 /// Read the `smarttags.model_path` setting under a brief catalog lock, treating "no catalog
@@ -101,7 +102,7 @@ pub struct SmarttagsIndexDone {
 /// id, trip the previous job, install this job's abort flag and claim the status slot as
 /// ONE transition, holding catalog → abort → slot throughout.
 ///
-/// The transition itself lives in [`crate::commands::jobs::JobFamily::begin`] — one
+/// The transition itself lives in [`crate::app::jobs::JobFamily::begin`] — one
 /// implementation shared with both face-job families and fenced by the same locks as the two
 /// `switch_catalog` phases. Read that function for why each of the three locks is held
 /// across the whole claim; this wrapper only supplies the initial status snapshot (`total`
@@ -169,7 +170,7 @@ pub async fn smarttags_index_photos(
     let JobClaim { db_path, root, abort, job, slot: job_slot } =
         begin_smarttags_job(state.inner())?;
 
-    tauri::async_runtime::spawn_blocking(move || {
+    crate::app::spawn_blocking(move || {
         use crate::catalog::Catalog;
         use crate::plugins::smarttags::{embed, indexer, models};
         use crate::plugins::indexing as shared_indexing;
@@ -524,7 +525,7 @@ pub async fn smarttags_train_classifiers(
     state: State<'_, AppState>,
 ) -> Result<SmarttagsTrainResult, String> {
     let catalog = state.catalog.clone();
-    tauri::async_runtime::spawn_blocking(move || train_classifiers_phased(&catalog, || {}))
+    crate::app::spawn_blocking(move || train_classifiers_phased(&catalog, || {}))
         .await
         .map_err(|e| e.to_string())?
 }

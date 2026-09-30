@@ -6,6 +6,7 @@ pub mod crash_marker;
 pub mod catalog;
 #[cfg(feature = "collage")]
 pub mod collage;
+pub mod app;
 mod commands;
 mod external_edit;
 pub mod export;
@@ -41,7 +42,7 @@ pub mod slideshow;
 #[cfg(test)]
 mod test_support;
 pub mod thumbnails;
-mod volume_health;
+pub mod volume_health;
 pub mod xmp;
 
 use commands::AppState;
@@ -51,6 +52,9 @@ use tauri::Manager;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // One tokio runtime for the process: Tauri's commands and `app::spawn_blocking` callers
+    // outside a command (worker threads, the setup hook) share `app::runtime()`.
+    tauri::async_runtime::set(app::runtime());
     // WebKitGTK's DMABUF renderer crashes on NVIDIA + Wayland with
     // "Error 71 (Protocol error) dispatching to Wayland display". Disabling it
     // before the webview is created fixes startup. Linux-only; harmless elsewhere.

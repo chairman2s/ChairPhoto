@@ -65,7 +65,7 @@ where
         (catalog.db_path().to_path_buf(), catalog.root().to_path_buf(), abort)
     };
     let emit_app = app.clone();
-    let res = tauri::async_runtime::spawn_blocking(move || {
+    let res = crate::app::spawn_blocking(move || {
         let scan_catalog = Catalog::open_secondary(&path, &root).map_err(|e| e.to_string())?;
         // Stream progress to the UI as `scan:progress` events (throttled per commit batch).
         let emit = move |p: crate::scanner::ScanProgress| {
@@ -98,7 +98,7 @@ pub(super) fn spawn_detached_phase_b(
     root: PathBuf,
     abort: Arc<AtomicBool>,
 ) {
-    tauri::async_runtime::spawn_blocking(move || {
+    crate::app::spawn_blocking(move || {
         let enrich_catalog = match Catalog::open_secondary(&path, &root) {
             Ok(c) => c,
             Err(e) => {
@@ -181,7 +181,7 @@ where
     let phase_a_out = {
         let (path, root, abort) = (path.clone(), root.clone(), abort.clone());
         let emit_app = app.clone();
-        tauri::async_runtime::spawn_blocking(move || {
+        crate::app::spawn_blocking(move || {
             let scan_catalog = Catalog::open_secondary(&path, &root).map_err(|e| e.to_string())?;
             let emit = move |p: crate::scanner::ScanProgress| {
                 let _ = emit_app.emit("scan:progress", p);
@@ -222,7 +222,7 @@ where
         // proceed with what Phase A produced — Phase B still enriches the new/changed files.
         let stale = {
             let app = app.clone();
-            tauri::async_runtime::spawn_blocking(move || {
+            crate::app::spawn_blocking(move || {
                 let app_state = app.state::<AppState>();
                 let Ok(guard) = app_state.catalog.lock() else {
                     return Vec::new();
@@ -243,7 +243,7 @@ where
     // the background. It emits the terminal `scan:progress {phase:"done"}` itself when it
     // finishes (or aborts), so the UI's progress indicator clears at the right time.
     let emit_app = app.clone();
-    tauri::async_runtime::spawn_blocking(move || {
+    crate::app::spawn_blocking(move || {
         let enrich_catalog = match Catalog::open_secondary(&path, &root) {
             Ok(c) => c,
             Err(e) => {
@@ -311,7 +311,7 @@ pub async fn ingest_from_card_cmd(
     let (result, copied) = {
         let (source, dest) = (source.clone(), dest.clone());
         let app = app.clone();
-        tauri::async_runtime::spawn_blocking(move || {
+        crate::app::spawn_blocking(move || {
             crate::scanner::copy_from_card(&source, &dest, selected.as_ref(), |done, total| {
                 let _ = app.emit("import:progress", ImportProgress { done, total });
             })
@@ -342,7 +342,7 @@ pub async fn list_card_photos_cmd(
         let catalog = guard.as_ref().ok_or("No catalog is open")?;
         catalog.root().to_path_buf()
     };
-    tauri::async_runtime::spawn_blocking(move || crate::scanner::list_card_photos(&source, &dest))
+    crate::app::spawn_blocking(move || crate::scanner::list_card_photos(&source, &dest))
         .await
         .map_err(|e| e.to_string())?
 }
@@ -352,7 +352,7 @@ pub async fn list_card_photos_cmd(
 #[tauri::command]
 pub async fn card_thumbnail(path: String) -> Result<String, String> {
     let path = expand_home(&path);
-    let bytes = tauri::async_runtime::spawn_blocking(move || crate::thumbnails::thumbnail_bytes(&path))
+    let bytes = crate::app::spawn_blocking(move || crate::thumbnails::thumbnail_bytes(&path))
         .await
         .map_err(|e| e.to_string())??;
     let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);

@@ -77,7 +77,7 @@ pub async fn localsend_send(
     // The handshake + uploads are network IO (tokio); run them on the async runtime, emitting
     // `localsend:progress` after each file completes.
     let send_paths = paths.clone();
-    let result = tauri::async_runtime::spawn(async move {
+    let result = crate::app::runtime().spawn(async move {
         crate::localsend::send_files(&device, &send_paths, pin.as_deref(), |done, total| {
             let _ = app_for_progress.emit("localsend:progress", LocalSendProgress { done, total });
         })
@@ -134,7 +134,7 @@ async fn render_localsend_jpegs(
         // Full resolution (no downscale): the device decides what to do with it (Snapchat
         // downscales to 9:16 on the phone). Skip a photo whose render fails rather than
         // aborting the whole send.
-        match tauri::async_runtime::spawn_blocking(move || {
+        match crate::app::spawn_blocking(move || {
             crate::export::write_item_jpeg(&item, None, &t)
         })
         .await

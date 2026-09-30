@@ -13,7 +13,7 @@ use crate::appearance::SystemThemeResult;
 pub async fn get_system_theme() -> Result<SystemThemeResult, String> {
     // Two small reads, but they still touch disk — off the UI thread like every other
     // disk-touching command (the `with_catalog_blocking` rule).
-    tauri::async_runtime::spawn_blocking(crate::appearance::read_current_theme)
+    crate::app::spawn_blocking(crate::appearance::read_current_theme)
         .await
         .map_err(|e| e.to_string())
 }

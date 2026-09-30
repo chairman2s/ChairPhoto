@@ -62,7 +62,7 @@ async fn do_backup(state: &State<'_, AppState>, photo_id: i64, backup_id: i64) -
             let p = c.plan_backup(photo_id, backup_id)?;
             Ok((p.source, p.dest, p.rel, p.volume_id))
         })?;
-        let carried = tauri::async_runtime::spawn_blocking(move || {
+        let carried = crate::app::spawn_blocking(move || {
             crate::catalog::carry_companions(&source, &dest)
         })
         .await
@@ -86,7 +86,7 @@ async fn do_backup(state: &State<'_, AppState>, photo_id: i64, backup_id: i64) -
     // A copy is the image plus its declared companions, and `copy_with_companions` is the
     // one place that knows it — so this path cannot carry a different set from the sync
     // wrapper, or forget to carry at all. Missing that here is what #80 was.
-    let outcome = tauri::async_runtime::spawn_blocking(move || {
+    let outcome = crate::app::spawn_blocking(move || {
         crate::catalog::copy_with_companions(&source, &dest, None)
     })
     .await
@@ -103,14 +103,14 @@ async fn do_offload(state: &State<'_, AppState>, photo_id: i64) -> Result<(), St
     // Persist an id-keyed thumbnail from a local copy BEFORE it's deleted, so the photo
     // stays visible in the grid once only the (possibly offline) NAS copy remains.
     if let Some(local) = plan.local_files.first().cloned() {
-        let _ = tauri::async_runtime::spawn_blocking(move || {
+        let _ = crate::app::spawn_blocking(move || {
             crate::thumbnails::ensure_persistent_thumb(photo_id, &local)
         })
         .await;
     }
     let backup_location_id = plan.backup_location_id;
     let carried =
-        tauri::async_runtime::spawn_blocking(move || crate::catalog::verify_and_delete_locals(&plan))
+        crate::app::spawn_blocking(move || crate::catalog::verify_and_delete_locals(&plan))
             .await
             .map_err(|e| e.to_string())?
             .map_err(|e| e.to_string())?;
@@ -220,7 +220,7 @@ pub async fn empty_trash(
     let abort = state.jobs.trash.install_fresh()?;
     let catalog = state.catalog.clone();
     let health = state.volume_health.clone();
-    tauri::async_runtime::spawn_blocking(move || {
+    crate::app::spawn_blocking(move || {
         // 1. Under the lock: which photos, and where every copy of each one lives.
         let (candidates, plans, pairs) = {
             let guard = catalog.lock().map_err(|e| e.to_string())?;
@@ -450,7 +450,7 @@ async fn do_restore(state: &State<'_, AppState>, photo_id: i64, local_id: i64) -
     // Companions come back with the image: a restored photo must arrive with the edit state
     // an offload moved home, not as bare pixels. This path had drifted from the sync
     // wrapper and did exactly that until the shared seam made it impossible.
-    let outcome = tauri::async_runtime::spawn_blocking(move || {
+    let outcome = crate::app::spawn_blocking(move || {
         crate::catalog::copy_with_companions(&source, &dest, expected_hash.as_deref())
     })
     .await
@@ -518,7 +518,7 @@ async fn relocate_photo_in_state(
     .await?;
     // The file usually already carries the UUID (its sidecar moved with it); a sidecar
     // holding somebody else's identity is left alone and recorded as a conflict.
-    let outcome = tauri::async_runtime::spawn_blocking(move || {
+    let outcome = crate::app::spawn_blocking(move || {
         let found = crate::xmp::read_identifier(&bind_path);
         crate::catalog::bind_sidecar_identity(&bind_path, &uuid, found.as_deref())
     })
@@ -607,7 +607,7 @@ const REPAIR_PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
 /// trip the previous pass, install this one's abort flag and claim the status slot as ONE
 /// transition, holding catalog → abort → slot throughout.
 ///
-/// The transition itself is [`crate::commands::jobs::JobFamily::begin`], shared with both
+/// The transition itself is [`crate::app::jobs::JobFamily::begin`], shared with both
 /// face-job families and Smart Tagging and fenced by the same locks as the two
 /// `switch_catalog` phases; read that function for why each lock is held across the whole
 /// claim. This wrapper only supplies the initial status snapshot — `total` is not known
@@ -656,7 +656,7 @@ pub async fn repair_pending_identity(
     // precedes it, so it cannot leave a previous pass aborted with no successor.
     let JobClaim { db_path, root, abort, job, slot } = begin_identity_repair_job(state.inner())?;
 
-    tauri::async_runtime::spawn_blocking(move || {
+    crate::app::spawn_blocking(move || {
         // Release the status slot — but only if a newer pass hasn't already claimed it.
         // Always BEFORE the terminal event: see `JobSlot::clear`.
         let finish = |summary: crate::catalog::IdentityRepairSummary, error: Option<String>| {
@@ -749,7 +749,7 @@ pub async fn resolve_identity_conflict(
 ) -> Result<crate::catalog::IdentityConflictOutcome, String> {
     let (db_path, root) =
         with_catalog(&state, |c| Ok((c.db_path().to_path_buf(), c.root().to_path_buf())))?;
-    tauri::async_runtime::spawn_blocking(move || {
+    crate::app::spawn_blocking(move || {
         let catalog = Catalog::open_secondary(&db_path, &root).map_err(|e| e.to_string())?;
         catalog
             .resolve_identity_conflict(photo_id, volume_id, &relative_path, action)
@@ -766,7 +766,7 @@ async fn record_identity_on_catalog(
     target_path: PathBuf,
     outcome: crate::catalog::SidecarIdentity,
 ) -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || {
+    crate::app::spawn_blocking(move || {
         let catalog = Catalog::open_secondary(&db_path, &root).map_err(|e| e.to_string())?;
         catalog
             .record_sidecar_identity(photo_id, &target_path, &outcome)
@@ -859,6 +859,7 @@ mod tests {
 #[cfg(test)]
 mod identity_repair_ownership_tests {
     use super::*;
+    use std::sync::Mutex;
     use crate::commands::catalog::{detach_catalog_and_trip_jobs, publish_catalog_and_reset_jobs};
     use crate::catalog::SidecarIdentity;
     use std::path::Path;
@@ -1158,7 +1159,7 @@ pub async fn reconcile_now(
     state.volume_health.invalidate();
     let pairs: Vec<(i64, String)> = vols.iter().map(|v| (v.id, v.base_path.clone())).collect();
     let health = state.volume_health.clone();
-    let reachable = tauri::async_runtime::spawn_blocking(move || health.refresh(&pairs))
+    let reachable = crate::app::spawn_blocking(move || health.refresh(&pairs))
         .await
         .map_err(|e| e.to_string())?;
     let backup_id = vols
@@ -1259,7 +1260,7 @@ pub async fn photo_statuses(
     // a slow/offline NAS can't serialize the whole app.
     let catalog = state.catalog.clone();
     let health = state.volume_health.clone();
-    tauri::async_runtime::spawn_blocking(move || {
+    crate::app::spawn_blocking(move || {
         // 1. Under the lock: pull the (id, base_path) pairs (pure SQL, no stats).
         let pairs: Vec<(i64, String)> = {
             let guard = catalog.lock().map_err(|e| e.to_string())?;

@@ -42,7 +42,7 @@ pub async fn post_to_instagram(
     let dir = JobTempDir::new("instagram")?;
     let img_path = dir.join("chairphoto-instagram.jpg");
     let out = img_path.clone();
-    tauri::async_runtime::spawn_blocking(move || {
+    crate::app::spawn_blocking(move || {
         crate::export::write_item_jpeg(&item, Some(1080), &out)
     })
     .await

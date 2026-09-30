@@ -276,7 +276,7 @@ pub(super) async fn render_export_jpeg(
     let o = out.clone();
     // Render the JPEG, applying the per-module long-edge limit when set (0/None = full
     // resolution, the default for portfolio/archival services like Flickr/SmugMug).
-    tauri::async_runtime::spawn_blocking(move || {
+    crate::app::spawn_blocking(move || {
         crate::export::write_item_jpeg_with_long_edge(&item, max_long_edge, &o)
     })
     .await

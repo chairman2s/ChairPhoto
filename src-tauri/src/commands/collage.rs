@@ -191,7 +191,7 @@ pub async fn make_collage(
     // Decode each preview and run the compositor entirely off the UI thread — both the
     // JPEG decodes and the per-tile Lanczos3 resize are CPU-bound.
     let dest_for_write = dest.clone();
-    tauri::async_runtime::spawn_blocking(move || -> Result<(), String> {
+    crate::app::spawn_blocking(move || -> Result<(), String> {
         let mut images = Vec::with_capacity(paths.len());
         for path in &paths {
             let bytes = crate::thumbnails::zoom_bytes(path)?;
@@ -292,7 +292,7 @@ pub async fn collage_preview(
         corner_radius: sc(opts.corner_radius),
     };
 
-    tauri::async_runtime::spawn_blocking(move || -> Result<String, String> {
+    crate::app::spawn_blocking(move || -> Result<String, String> {
         let mut images = Vec::with_capacity(paths.len());
         for path in &paths {
             let bytes = crate::thumbnails::zoom_bytes(path)?;
@@ -445,7 +445,7 @@ pub async fn collage_auto_arrange(
         corner_radius: 0,
     };
 
-    tauri::async_runtime::spawn_blocking(move || -> Result<Vec<PlacementDto>, String> {
+    crate::app::spawn_blocking(move || -> Result<Vec<PlacementDto>, String> {
         let mut aspects = Vec::with_capacity(paths.len());
         for path in &paths {
             let bytes = crate::thumbnails::zoom_bytes(path)?;
@@ -556,7 +556,7 @@ async fn render_freeform_to_file(
     bg: [u8; 4],
     dest: PathBuf,
 ) -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || -> Result<(), String> {
+    crate::app::spawn_blocking(move || -> Result<(), String> {
         let mut items = Vec::with_capacity(paths.len());
         for (path, rect) in paths.iter().zip(rects.into_iter()) {
             let bytes = crate::thumbnails::zoom_bytes(path)?;

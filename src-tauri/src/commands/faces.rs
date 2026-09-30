@@ -122,7 +122,7 @@ pub struct FacesProgressEvent {
 /// trip the previous job, install this job's abort flag and claim the status slot as ONE
 /// transition, holding catalog -> abort -> slot throughout.
 ///
-/// The transition itself lives in [`crate::commands::jobs::JobFamily::begin`] — one
+/// The transition itself lives in [`crate::app::jobs::JobFamily::begin`] — one
 /// implementation shared with face matching and Smart Tagging, fenced by the same locks as
 /// the two `switch_catalog` phases. Read that function for why each lock is held across the
 /// whole claim; this wrapper only supplies the initial status snapshot (`total` is unknown
@@ -173,7 +173,7 @@ pub async fn faces_index_photos(
     let JobClaim { db_path, root, abort, job, slot: job_slot } =
         begin_faces_index_job(state.inner())?;
 
-    tauri::async_runtime::spawn_blocking(move || {
+    crate::app::spawn_blocking(move || {
         use crate::catalog::Catalog;
         use crate::plugins::faces::indexer;
         use crate::plugins::indexing as shared_indexing;
@@ -480,7 +480,7 @@ pub struct FacesMatchDone {
 /// trip the previous match, install this job's abort flag and claim the status slot as ONE
 /// transition, holding catalog -> abort -> slot throughout.
 ///
-/// The transition itself is [`crate::commands::jobs::JobFamily::begin`], shared with face
+/// The transition itself is [`crate::app::jobs::JobFamily::begin`], shared with face
 /// indexing and Smart Tagging; see it for why releasing any of the three locks early leaves
 /// either a dead job owning the status slot or a worker no cancel can reach. Matching is its
 /// own family, so cancelling a match does not stop an index and the two never collide on an
@@ -521,7 +521,7 @@ pub async fn faces_run_matching(app: AppHandle, state: State<'_, AppState>) -> R
 
     let JobClaim { db_path, root, abort, job, slot: job_slot } = begin_faces_match_job(&state)?;
 
-    tauri::async_runtime::spawn_blocking(move || {
+    crate::app::spawn_blocking(move || {
         use crate::catalog::Catalog;
 
         // Release the status slot — but only if a newer job hasn't already claimed it.

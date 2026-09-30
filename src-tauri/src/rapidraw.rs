@@ -378,7 +378,7 @@ pub async fn edit_in_rapidraw(app: AppHandle, photo_id: i64) -> Result<Option<i6
         .ok_or("This photo is already being edited in RapidRAW — finish or cancel that edit first")?;
     let app2 = app.clone();
 
-    let joined = tauri::async_runtime::spawn_blocking(move || {
+    let joined = crate::app::spawn_blocking(move || {
         run_roundtrip(&r, &cancel, &|phase, message| emit(&app2, photo_id, phase, message))
     })
     .await;

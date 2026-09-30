@@ -98,7 +98,7 @@ pub async fn ai_suggest_tags(
             ))
         })?;
 
-        let image = tauri::async_runtime::spawn_blocking(move || -> Result<Vec<u8>, String> {
+        let image = crate::app::spawn_blocking(move || -> Result<Vec<u8>, String> {
             let bytes = crate::thumbnails::preview_bytes(&image_path)?;
             match region {
                 Some(r) => crop_region_jpeg(&bytes, &r),
@@ -421,7 +421,7 @@ pub async fn ai_suggest_tags_grouped(
             };
 
             // Decode the representative's preview off the async thread.
-            let image = tauri::async_runtime::spawn_blocking(move || {
+            let image = crate::app::spawn_blocking(move || {
                 crate::thumbnails::preview_bytes(&image_path)
             })
             .await

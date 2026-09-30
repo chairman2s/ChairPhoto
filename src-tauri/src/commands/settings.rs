@@ -348,7 +348,7 @@ fn list_external_modules_blocking() -> Result<Vec<ExternalModuleManifest>, Strin
 /// executor is never blocked (AGENTS.md invariant: all disk-touching commands must be async).
 #[tauri::command]
 pub async fn list_external_modules() -> Result<Vec<ExternalModuleManifest>, String> {
-    tauri::async_runtime::spawn_blocking(list_external_modules_blocking)
+    crate::app::spawn_blocking(list_external_modules_blocking)
         .await
         .map_err(|e| e.to_string())?
 }

@@ -24,7 +24,7 @@
 //! adopting the result as a **stacked child** of the original via `upsert_external_one` +
 //! `set_stack_parent` — the same association mechanism the develop round-trip uses.
 
-use crate::app::{CoreEvent, EventSink};
+use crate::app::{AppState, CoreEvent, EventSink};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -33,8 +33,6 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use crate::catalog::Catalog;
-use crate::commands::AppState;
-use tauri::{AppHandle, Manager, Runtime, State};
 
 /// Settings key namespace, mirroring `editor.<key>.<which>` from `external_edit.rs`.
 const BIN_SETTING: &str = "editor.rapidraw.bin";
@@ -128,8 +126,7 @@ pub struct RapidRawStatus {
 }
 
 /// Whether RapidRAW is configured/available, for the inspector "Edit in…" action + Preferences.
-#[tauri::command]
-pub fn rapidraw_available(state: State<'_, AppState>) -> Result<RapidRawStatus, String> {
+pub fn rapidraw_available(state: &AppState) -> Result<RapidRawStatus, String> {
     let guard = state.catalog.lock().map_err(|e| e.to_string())?;
     let catalog = guard.as_ref().ok_or("No catalog is open")?;
     Ok(RapidRawStatus {
@@ -149,8 +146,8 @@ pub struct RapidRawProgress {
     pub message: String,
 }
 
-fn emit<R: Runtime>(app: &AppHandle<R>, photo_id: i64, phase: &str, message: &str) {
-    let _ = app.send(CoreEvent::RapidRawProgress(RapidRawProgress { photo_id, phase: phase.into(), message: message.into() }));
+fn emit(state: &AppState, photo_id: i64, phase: &str, message: &str) {
+    state.send(CoreEvent::RapidRawProgress(RapidRawProgress { photo_id, phase: phase.into(), message: message.into() }));
 }
 
 /// Everything needed to run a round-trip, resolved under a brief catalog lock so the long
@@ -180,8 +177,7 @@ impl Resolved {
     }
 }
 
-fn resolve(app: &AppHandle, photo_id: i64) -> Result<Resolved, String> {
-    let state = app.state::<AppState>();
+fn resolve(state: &AppState, photo_id: i64) -> Result<Resolved, String> {
     let guard = state.catalog.lock().map_err(|e| e.to_string())?;
     let catalog = guard.as_ref().ok_or("No catalog is open")?;
     let source = catalog.require_photo_path(photo_id).map_err(|e| e.to_string())?;
@@ -369,15 +365,14 @@ pub fn run_roundtrip(
 /// left "editing" — every path clears the state and emits a terminal `rapidraw:progress`.
 ///
 /// Returns the new stacked child's id on success, or `None` if the wait was cancelled.
-#[tauri::command]
-pub async fn edit_in_rapidraw(app: AppHandle, photo_id: i64) -> Result<Option<i64>, String> {
-    let r = resolve(&app, photo_id)?;
+pub async fn edit_in_rapidraw(state: AppState, photo_id: i64) -> Result<Option<i64>, String> {
+    let r = resolve(&state, photo_id)?;
     let cancel = register_cancel(photo_id)
         .ok_or("This photo is already being edited in RapidRAW — finish or cancel that edit first")?;
-    let app2 = app.clone();
+    let state2 = state.clone();
 
     let joined = crate::app::spawn_blocking(move || {
-        run_roundtrip(&r, &cancel, &|phase, message| emit(&app2, photo_id, phase, message))
+        run_roundtrip(&r, &cancel, &|phase, message| emit(&state2, photo_id, phase, message))
     })
     .await;
 
@@ -387,9 +382,9 @@ pub async fn edit_in_rapidraw(app: AppHandle, photo_id: i64) -> Result<Option<i6
     clear_cancel(photo_id);
     let result = joined.map_err(|e| e.to_string())?;
     match &result {
-        Ok(None) => emit(&app, photo_id, "cancelled", ""),
+        Ok(None) => emit(&state, photo_id, "cancelled", ""),
         Ok(Some(_)) => {} // "done" already emitted from the worker
-        Err(e) => emit(&app, photo_id, "error", e),
+        Err(e) => emit(&state, photo_id, "error", e),
     }
     result
 }
@@ -397,7 +392,6 @@ pub async fn edit_in_rapidraw(app: AppHandle, photo_id: i64) -> Result<Option<i6
 /// Cancel an in-flight RapidRAW wait for `photo_id`. Trips the watcher's cancel flag so it
 /// abandons the wait (used both to give up on a forwarded session and to resolve the
 /// "closed without Done" case, which the app can't distinguish from forwarding).
-#[tauri::command]
 pub fn cancel_rapidraw(photo_id: i64) -> Result<(), String> {
     if let Some(flag) = cancels().lock().map_err(|e| e.to_string())?.get(&photo_id) {
         flag.store(true, Ordering::Relaxed);

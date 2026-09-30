@@ -15,15 +15,13 @@
 //! Runs on a dedicated catalog connection (like scans) so the shared connection keeps
 //! serving reads while an interactive edit session is open. See the approved plan.
 
-use crate::app::{CoreEvent, EventSink};
+use crate::app::{AppState, CoreEvent, EventSink};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
 use crate::catalog::Catalog;
-use crate::commands::AppState;
-use tauri::{AppHandle, Manager, Runtime, State};
 
 /// A supported external develop editor and its default binaries.
 struct Editor {
@@ -146,8 +144,8 @@ fn dt_ai_outputs(raw: &Path) -> Vec<PathBuf> {
 /// across two polls (darktable writes the file progressively). Keeps watching briefly
 /// after the GUI exits so a job finishing right at quit isn't missed. Returns the ids of
 /// the adopted children (may be empty).
-fn run_gui_watching_ai_outputs<R: Runtime>(
-    app: &AppHandle<R>,
+fn run_gui_watching_ai_outputs(
+    state: &AppState,
     gui: &str,
     raw: &Path,
     photo_id: i64,
@@ -184,7 +182,7 @@ fn run_gui_watching_ai_outputs<R: Runtime>(
                     match adopt_stacked_child(catalog.as_ref().unwrap(), &path, photo_id) {
                         Ok(id) => {
                             adopted.push(id);
-                            emit(app, "stacked", "darktable");
+                            emit(state, "stacked", "darktable");
                         }
                         Err(e) => eprintln!(
                             "external-edit: couldn't import AI output {}: {e}",
@@ -220,8 +218,8 @@ pub struct DevelopProgress {
     pub editor: String,
 }
 
-fn emit<R: Runtime>(app: &AppHandle<R>, phase: &str, editor: &str) {
-    let _ = app.send(CoreEvent::DevelopProgress(DevelopProgress { phase: phase.into(), editor: editor.into() }));
+fn emit(state: &AppState, phase: &str, editor: &str) {
+    state.send(CoreEvent::DevelopProgress(DevelopProgress { phase: phase.into(), editor: editor.into() }));
 }
 
 #[derive(serde::Serialize)]
@@ -237,8 +235,7 @@ pub struct AvailableEditor {
 }
 
 /// Which editors are configured/available, for the inspector "Edit in…" menu + Preferences.
-#[tauri::command]
-pub fn available_editors(state: State<'_, AppState>) -> Result<Vec<AvailableEditor>, String> {
+pub fn available_editors(state: &AppState) -> Result<Vec<AvailableEditor>, String> {
     let guard = state.catalog.lock().map_err(|e| e.to_string())?;
     let catalog = guard.as_ref().ok_or("No catalog is open")?;
     Ok(EDITORS
@@ -263,8 +260,7 @@ struct Resolved {
     cli: Option<String>,
 }
 
-fn resolve(app: &AppHandle, photo_id: i64, ed: &Editor) -> Result<Resolved, String> {
-    let state = app.state::<AppState>();
+fn resolve(state: &AppState, photo_id: i64, ed: &Editor) -> Result<Resolved, String> {
     let guard = state.catalog.lock().map_err(|e| e.to_string())?;
     let catalog = guard.as_ref().ok_or("No catalog is open")?;
     let raw = catalog.require_photo_path(photo_id).map_err(|e| e.to_string())?;
@@ -281,30 +277,29 @@ fn resolve(app: &AppHandle, photo_id: i64, ed: &Editor) -> Result<Resolved, Stri
 /// sidecar was created/updated, render the developed JPEG via the editor CLI and adopt it as
 /// a stacked child (returns its new photo id). Returns `None` if nothing changed (e.g. the
 /// editor was already open and handed off, or no edit was made) — use `import_developed` then.
-#[tauri::command]
 pub async fn develop_in_editor(
-    app: AppHandle,
+    state: AppState,
     photo_id: i64,
     editor_key: String,
 ) -> Result<Option<i64>, String> {
     let ed = editor(&editor_key).ok_or("unknown editor")?;
-    let r = resolve(&app, photo_id, ed)?;
+    let r = resolve(&state, photo_id, ed)?;
     let gui = r
         .gui
         .ok_or_else(|| format!("{} is not configured — set its path in Preferences", ed.label))?;
     let before = latest_sidecar_mtime(&r.raw, ed.key);
 
-    let app2 = app.clone();
+    let state2 = state.clone();
     let key = editor_key.clone();
     let (raw, db_path, root, cli) = (r.raw, r.db_path, r.root, r.cli);
     let result = crate::app::spawn_blocking(move || -> Result<Option<i64>, String> {
-        emit(&app2, "waiting", &key);
+        emit(&state2, "waiting", &key);
         // Wait for the interactive session to finish. Editors may exit non-zero; we key off
         // the sidecar changing, not the exit code. For darktable, additionally watch the
         // folder during the session: its AI restore tools (5.6+) write a new DNG/TIFF next
         // to the original, which we adopt into the stack as it appears.
         let ai_imported = if key == "darktable" {
-            run_gui_watching_ai_outputs(&app2, &gui, &raw, photo_id, &db_path, &root)?
+            run_gui_watching_ai_outputs(&state2, &gui, &raw, photo_id, &db_path, &root)?
         } else {
             Command::new(&gui)
                 .arg(&raw)
@@ -321,26 +316,26 @@ pub async fn develop_in_editor(
         if !changed {
             // No develop edit — but AI outputs may still have been produced and stacked.
             if let Some(&first) = ai_imported.first() {
-                emit(&app2, "done", &key);
+                emit(&state2, "done", &key);
                 return Ok(Some(first));
             }
-            emit(&app2, "nochange", &key);
+            emit(&state2, "nochange", &key);
             return Ok(None);
         }
         let cli = cli.ok_or_else(|| {
             format!("edited, but no CLI is configured to render {}'s result", key)
         })?;
-        emit(&app2, "rendering", &key);
+        emit(&state2, "rendering", &key);
         let catalog = Catalog::open_secondary(&db_path, &root).map_err(|e| e.to_string())?;
         let id = render_and_stack(&catalog, &cli, &key, &raw, photo_id)?;
-        emit(&app2, "done", &key);
+        emit(&state2, "done", &key);
         Ok(Some(id))
     })
     .await
     .map_err(|e| e.to_string())?;
 
     if result.is_err() {
-        emit(&app, "error", &editor_key);
+        emit(&state, "error", &editor_key);
     }
     result
 }
@@ -348,14 +343,13 @@ pub async fn develop_in_editor(
 /// Render the developed result from the CURRENT sidecar (without relaunching the GUI) and
 /// adopt it as a stacked child. The manual fallback for when the editor was already open, or
 /// to re-render after further edits. Errors if no develop sidecar exists.
-#[tauri::command]
 pub async fn import_developed(
-    app: AppHandle,
+    state: AppState,
     photo_id: i64,
     editor_key: String,
 ) -> Result<i64, String> {
     let ed = editor(&editor_key).ok_or("unknown editor")?;
-    let r = resolve(&app, photo_id, ed)?;
+    let r = resolve(&state, photo_id, ed)?;
     let has_sidecar = existing_sidecar(&r.raw, ed.key).is_some();
     // darktable may have produced AI-restore outputs without a develop edit (see the
     // watcher above) — those count as an importable result too.
@@ -371,9 +365,9 @@ pub async fn import_developed(
         None
     };
     let (raw, db_path, root, key) = (r.raw, r.db_path, r.root, editor_key.clone());
-    let app2 = app.clone();
+    let state2 = state.clone();
     let result = crate::app::spawn_blocking(move || -> Result<i64, String> {
-        emit(&app2, "rendering", &key);
+        emit(&state2, "rendering", &key);
         let catalog = Catalog::open_secondary(&db_path, &root).map_err(|e| e.to_string())?;
         // Adopt any AI-restore outputs first (idempotent for already-indexed ones), so
         // "Import result" works after a handoff to an already-open darktable instance.
@@ -383,7 +377,7 @@ pub async fn import_developed(
                 match adopt_stacked_child(&catalog, &path, photo_id) {
                     Ok(id) => {
                         ai_first.get_or_insert(id);
-                        emit(&app2, "stacked", &key);
+                        emit(&state2, "stacked", &key);
                     }
                     Err(e) => eprintln!(
                         "external-edit: couldn't import AI output {}: {e}",
@@ -396,13 +390,13 @@ pub async fn import_developed(
             Some(cli) => render_and_stack(&catalog, &cli, &key, &raw, photo_id)?,
             None => ai_first.ok_or("no importable result found")?,
         };
-        emit(&app2, "done", &key);
+        emit(&state2, "done", &key);
         Ok(id)
     })
     .await
     .map_err(|e| e.to_string())?;
     if result.is_err() {
-        emit(&app, "error", &editor_key);
+        emit(&state, "error", &editor_key);
     }
     result
 }

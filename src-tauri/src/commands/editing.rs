@@ -32,10 +32,7 @@ pub fn set_edit_record(
 /// base would spend the preview↔export parity budget before the shader ran). Operates on
 /// the embedded preview or zoom tier, never the original file.
 #[cfg(feature = "edit")]
-pub fn render_edit_bytes<R: tauri::Runtime>(
-    app: &tauri::AppHandle<R>,
-    job: &crate::image_pool::EditJob,
-) -> Result<Vec<u8>, String> {
+pub fn render_edit_bytes(state: &AppState, job: &crate::image_pool::EditJob) -> Result<Vec<u8>, String> {
     use crate::plugins::edit::{self, timing::Stages, RenderOpts, RenderSource, SourceToken};
     let mut t = Stages::start(format!(
         "render_edit photo={} max_edge={} hi_res={} base_only={} source={}",
@@ -65,7 +62,6 @@ pub fn render_edit_bytes<R: tauri::Runtime>(
     }
     // Gather path candidates under a brief lock (pure SQL), then stat + decode + render
     // off the lock so a slow/offline NAS can't serialize the app.
-    let state = app.state::<AppState>();
     let candidates = {
         let guard = state.catalog.lock().map_err(|e| e.to_string())?;
         let catalog = guard.as_ref().ok_or("No catalog is open")?;
@@ -160,7 +156,7 @@ pub async fn render_edit(
         // Render and base64-wrap on a blocking worker: both are CPU work, neither belongs
         // on the async thread.
         crate::app::spawn_blocking(move || {
-            let bytes = render_edit_bytes(&app, &job)?;
+            let bytes = render_edit_bytes(&app.state::<AppState>(), &job)?;
             let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
             Ok(format!("data:image/jpeg;base64,{b64}"))
         })
@@ -730,12 +726,10 @@ mod tests {
     }
 
     fn state_with(catalog: Catalog, health: VolumeHealth) -> AppState {
-        let state = AppState::default();
+        let mut state = AppState::default();
         *state.catalog.lock().unwrap() = Some(catalog);
-        AppState {
-            volume_health: std::sync::Arc::new(health),
-            ..state
-        }
+        state.volume_health = std::sync::Arc::new(health);
+        state
     }
 
     /// A photo whose only copy lives on a separate "NAS" volume, with a version that has

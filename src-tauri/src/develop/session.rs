@@ -14,12 +14,12 @@
 use crate::app::{CoreEvent, EventSink};
 use super::{release_all, with_resident};
 use crate::app::jobs::{JobClaim, JobStatus};
-use crate::commands::{AppState, DevelopSource};
+use crate::app::AppState;
+use crate::develop_source::{DevelopSource, LensInfo};
 use crate::plugins::edit::{SourceToken, WorkingImage};
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use tauri::{AppHandle, Manager, Runtime};
 
 /// Settings key: `"0"` turns neighbour preload off. On by default.
 pub const PRELOAD_KEY: &str = "develop.preloadNeighbours";
@@ -141,26 +141,25 @@ pub(crate) fn claim(
 /// `neighbours` (resolved paths, N+1 first). Returns the state right now:
 /// `Preview{preparing:true}` while the load runs, `Raw{token}` when the image is already
 /// resident (the same photo, or a preloaded neighbour), or the honest exceptions.
-pub fn open<R: Runtime>(
-    app: &AppHandle<R>,
+pub fn open(
+    state: &AppState,
     photo_id: i64,
     path: PathBuf,
     probe: DevelopSource,
     neighbours: Vec<(i64, PathBuf)>,
 ) -> Result<DevelopSource, String> {
-    let state = app.state::<AppState>();
-    let prep = prep_settings(&state);
+    let prep = prep_settings(state);
     let ids: Vec<i64> = if prep.preload { neighbours.iter().map(|(id, _)| *id).collect() } else { Vec::new() };
-    let (claim, answer, current_ready) = match claim(&state, photo_id, probe.clone(), &ids)? {
+    let (claim, answer, current_ready) = match claim(state, photo_id, probe.clone(), &ids)? {
         Claimed::Ready(source) => return Ok(source),
         Claimed::Adopted(claim, token) => (claim, with_token(probe.clone(), &token), true),
         Claimed::Decode(claim) => (claim, DevelopSource::Preview { preparing: true }, false),
     };
     let neighbours = if prep.preload { neighbours } else { Vec::new() };
-    let app2 = app.clone();
+    let state = state.clone();
     std::thread::Builder::new()
         .name(format!("develop-decode-{photo_id}"))
-        .spawn(move || prepare(claim, app2, photo_id, path, probe, current_ready, neighbours, prep))
+        .spawn(move || prepare(claim, state, photo_id, path, probe, current_ready, neighbours, prep))
         .map_err(|e| format!("could not start the decode thread: {e}"))?;
     Ok(answer)
 }
@@ -204,7 +203,7 @@ fn with_token(probe: DevelopSource, token: &SourceToken) -> DevelopSource {
             as_shot_wb: resident_image.as_ref().and_then(|i| {
                 crate::plugins::edit::linear::as_shot_kelvin(&i.cam_mul, &i.pre_mul, &i.rgb_cam, &i.wbct).map(|(k, t)| [k, t])
             }),
-            lens: resident_image.as_ref().and_then(|i| i.lens.as_ref()).map(|l| crate::commands::LensInfo {
+            lens: resident_image.as_ref().and_then(|i| i.lens.as_ref()).map(|l| LensInfo {
                 source: l.source.clone(),
                 vignetting: l.vignetting.is_some(),
                 distortion: l.distortion.is_some(),
@@ -252,9 +251,9 @@ fn load_linear_in(
 /// The worker: load, publish, announce; then preload the neighbours. Runs on its own thread
 /// with the claim.
 #[allow(clippy::too_many_arguments)]
-fn prepare<R: Runtime>(
+fn prepare(
     claim: JobClaim<DevelopStatus>,
-    app: AppHandle<R>,
+    state: AppState,
     photo_id: i64,
     path: PathBuf,
     probe: DevelopSource,
@@ -266,7 +265,7 @@ fn prepare<R: Runtime>(
     let abort = claim.abort.clone();
     let aborted = || abort.load(Ordering::Relaxed);
     let emit = |source: DevelopSource| {
-        let _ = app.send(CoreEvent::DevelopSource(DevelopSourceEvent { photo_id, job: generation, source }));
+        state.send(CoreEvent::DevelopSource(DevelopSourceEvent { photo_id, job: generation, source }));
     };
     // Terminal for a failure: the slot goes (only if still ours), then the event.
     let fail = || claim.slot.clear();
@@ -545,7 +544,7 @@ mod tests {
         match current(&state, 1, raw_probe()) {
             DevelopSource::Raw { token: Some(_), lens, .. } => assert_eq!(
                 lens,
-                Some(crate::commands::LensInfo { source: "Sony built-in".into(), vignetting: true, distortion: false, chromatic: false })
+                Some(LensInfo { source: "Sony built-in".into(), vignetting: true, distortion: false, chromatic: false })
             ),
             other => panic!("{other:?}"),
         }

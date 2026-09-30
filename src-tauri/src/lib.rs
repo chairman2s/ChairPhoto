@@ -30,6 +30,7 @@ pub mod lens;
 pub mod raw;
 #[cfg(all(feature = "raw", feature = "edit"))]
 pub mod develop;
+pub mod develop_source;
 #[cfg(feature = "smugmug")]
 pub mod smugmug;
 pub mod rapidraw;
@@ -103,6 +104,10 @@ pub fn run() {
         // <video> on WebKitGTK uses GStreamer, which can't read custom URI schemes — so we
         // serve videos over a loopback HTTP server (range-capable) it can fetch instead.
         .setup(|app| {
+            // Every event the backend sends goes to the webview (commands' `EventSink`).
+            // First, so nothing started below can send into the void.
+            let state = app.state::<AppState>().inner().clone();
+            state.set_events(std::sync::Arc::new(app.handle().clone()));
             // Before anything can call into LibRaw (or, one day, a GPU driver): turn the
             // previous run's leftover crash markers into strikes (src/crash_marker.rs).
             match commands::app_data_dir() {
@@ -171,7 +176,7 @@ pub fn run() {
                 }
             }
 
-            match protocol::start_video_server(app.handle().clone()) {
+            match protocol::start_video_server(state.clone()) {
                 Ok(port) => eprintln!("video server on http://127.0.0.1:{port}"),
                 Err(e) => eprintln!("failed to start video server: {e}"),
             }
@@ -179,7 +184,7 @@ pub fn run() {
             // "Follow Omarchy" appearance (docs/appearance.md): watch the Omarchy runtime
             // theme and broadcast switches. Starts nothing when Omarchy is absent — a
             // normal, non-degraded state that must cost zero polling — and never fatal.
-            if appearance::start_watcher(app.handle().clone()) {
+            if appearance::start_watcher(state.clone()) {
                 eprintln!("appearance: following the Omarchy theme");
             }
 
@@ -187,9 +192,9 @@ pub fn run() {
             // handlers via Tauri's state system.
             let n_threads = image_pool::default_thread_count();
             eprintln!("image pool: {n_threads} worker threads");
-            let handle = app.handle().clone();
+            let pool_state = state.clone();
             let runner: image_pool::Runner = std::sync::Arc::new(move |key| {
-                protocol::render_bytes(&handle, key)
+                protocol::render_bytes(&pool_state, key)
             });
             // `manage` holds the Arc for the app's lifetime — that alone keeps the pool
             // (and its worker threads) alive.
@@ -511,12 +516,12 @@ pub fn run() {
             commands::stack_photo,
             commands::unstack_photo,
             commands::pair_raw_jpeg_stacks,
-            external_edit::available_editors,
-            external_edit::develop_in_editor,
-            external_edit::import_developed,
-            rapidraw::rapidraw_available,
-            rapidraw::edit_in_rapidraw,
-            rapidraw::cancel_rapidraw,
+            commands::available_editors,
+            commands::develop_in_editor,
+            commands::import_developed,
+            commands::rapidraw_available,
+            commands::edit_in_rapidraw,
+            commands::cancel_rapidraw,
             #[cfg(feature = "collage")]
             commands::make_collage,
             #[cfg(feature = "collage")]

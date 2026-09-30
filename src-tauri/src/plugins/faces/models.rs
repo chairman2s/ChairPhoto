@@ -100,7 +100,7 @@ pub struct ModelStatus {
 
 /// The directory holding the face models (`<app_data_dir>/models/faces`). Created lazily.
 pub fn models_dir() -> Result<PathBuf, ModelError> {
-    let base = crate::commands::app_data_dir().map_err(ModelError::Dir)?;
+    let base = crate::app::app_data_dir().map_err(ModelError::Dir)?;
     let dir = base.join("models").join("faces");
     std::fs::create_dir_all(&dir).map_err(|e| ModelError::Dir(e.to_string()))?;
     Ok(dir)

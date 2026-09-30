@@ -46,7 +46,7 @@ const IDENTITY_FILE: &str = "localsend-client-identity.pem";
 static IDENTITY: OnceLock<Option<reqwest::Identity>> = OnceLock::new();
 
 fn identity_path() -> Result<PathBuf, String> {
-    Ok(crate::commands::app_data_dir()?.join(IDENTITY_FILE))
+    Ok(crate::app::app_data_dir()?.join(IDENTITY_FILE))
 }
 
 /// The client identity, generating and persisting it on first use.

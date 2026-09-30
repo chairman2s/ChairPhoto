@@ -344,7 +344,7 @@ static WATCHER_STARTED: AtomicBool = AtomicBool::new(false);
 /// outcome changes. Returns whether it started. It does not start when Omarchy's state
 /// root is absent — the supported no-Omarchy state, which must cost zero polling — or when
 /// a watcher is already running.
-pub fn start_watcher(app: tauri::AppHandle) -> bool {
+pub fn start_watcher(events: impl EventSink + 'static) -> bool {
     let Some(root) = omarchy_state_root() else {
         return false;
     };
@@ -359,7 +359,7 @@ pub fn start_watcher(app: tauri::AppHandle) -> bool {
         loop {
             std::thread::sleep(WATCH_INTERVAL);
             if let Some(result) = poll_tick(&root, &mut state) {
-                let _ = app.send(CoreEvent::ThemeChanged(result.clone()));
+                events.send(CoreEvent::ThemeChanged(result));
             }
         }
     });
@@ -369,7 +369,7 @@ pub fn start_watcher(app: tauri::AppHandle) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::commands::test_env_helpers::EnvGuard;
+    use crate::app::test_env_helpers::EnvGuard;
     use crate::test_support::TestTmpDir;
 
     /// A complete dark palette: every required and optional field, mixed-case hex.

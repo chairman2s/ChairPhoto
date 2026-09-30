@@ -11,7 +11,7 @@
 //! networking thread is never blocked.
 
 use crate::catalog::ResolveMode;
-use crate::commands::AppState;
+use crate::app::AppState;
 #[cfg(feature = "edit")]
 use crate::image_pool::EditJob;
 use crate::image_pool::{ImagePool, JobKey};
@@ -174,7 +174,7 @@ fn submit_or_fallback<R: Runtime>(
         let spawned = std::thread::Builder::new()
             .name("image-fallback".into())
             .spawn(move || {
-                let result = render_bytes(&app, key);
+                let result = render_bytes(&app.state::<AppState>(), key);
                 if let Some(r) = respond2.lock().ok().and_then(|mut g| g.take()) {
                     r(result);
                 }
@@ -191,16 +191,12 @@ fn submit_or_fallback<R: Runtime>(
 ///
 /// This is the runner function injected into [`ImagePool`].  It is `pub` so
 /// that `lib.rs` can reference it when building the pool runner closure.
-pub fn render_bytes<R: Runtime>(
-    app: &tauri::AppHandle<R>,
-    key: JobKey,
-) -> Result<Vec<u8>, String> {
+pub fn render_bytes(state: &AppState, key: JobKey) -> Result<Vec<u8>, String> {
     let (id, kind) = match key {
         JobKey::Photo { id, kind } => (id, kind),
         #[cfg(feature = "edit")]
-        JobKey::Edit(job) => return crate::commands::render_edit_bytes(app, &job),
+        JobKey::Edit(job) => return crate::commands::render_edit_bytes(state, &job),
     };
-    let state = app.state::<AppState>();
     // Gather the path CANDIDATES (pure SQL) and the rotation under a brief lock, then
     // stat them OFF the lock via `pick_existing` so a slow/offline NAS can't serialize
     // the whole app. `pick_existing` still returns the best available copy (local cache
@@ -280,15 +276,15 @@ pub fn video_server_port() -> u16 {
 
 /// Start the loopback video server and return its port. Binds an ephemeral port on
 /// 127.0.0.1 and serves each connection on its own thread.
-pub fn start_video_server<R: Runtime>(app: tauri::AppHandle<R>) -> std::io::Result<u16> {
+pub fn start_video_server(state: AppState) -> std::io::Result<u16> {
     let listener = TcpListener::bind(("127.0.0.1", 0))?;
     let port = listener.local_addr()?.port();
     let _ = VIDEO_PORT.set(port);
     std::thread::spawn(move || {
         for stream in listener.incoming().flatten() {
-            let app = app.clone();
+            let state = state.clone();
             std::thread::spawn(move || {
-                let _ = serve_video(stream, app);
+                let _ = serve_video(stream, state);
             });
         }
     });
@@ -303,7 +299,7 @@ fn write_simple(stream: &mut TcpStream, status: &str, extra: &str) -> std::io::R
     )
 }
 
-fn serve_video<R: Runtime>(mut stream: TcpStream, app: tauri::AppHandle<R>) -> std::io::Result<()> {
+fn serve_video(mut stream: TcpStream, state: AppState) -> std::io::Result<()> {
     use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 
     let mut reader = BufReader::new(stream.try_clone()?);
@@ -335,7 +331,6 @@ fn serve_video<R: Runtime>(mut stream: TcpStream, app: tauri::AppHandle<R>) -> s
 
     // Resolve the photo's file: gather candidates under a brief lock (pure SQL), then
     // stat them OFF the lock so a slow/offline NAS can't serialize the app.
-    let state = app.state::<AppState>();
     let candidates = {
         let guard = match state.catalog.lock() {
             Ok(g) => g,

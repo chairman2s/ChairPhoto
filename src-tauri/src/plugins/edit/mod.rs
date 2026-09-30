@@ -607,7 +607,7 @@ fn finish_linear(
     let mut rgb = linear::to_display(&lin, transform, linear::BASELINE_EV + edit.camera_ev);
     t.mark("display");
     let lut = edit.lut.as_ref().and_then(|l| {
-        crate::commands::luts_dir()
+        crate::app::luts_dir()
             .ok()
             .and_then(|dir| cube::load(&dir, &l.file))
     });
@@ -699,7 +699,7 @@ fn finish_look(
         return rgb;
     }
     let lut = edit.lut.as_ref().and_then(|l| {
-        crate::commands::luts_dir()
+        crate::app::luts_dir()
             .ok()
             .and_then(|dir| cube::load(&dir, &l.file))
     });

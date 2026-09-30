@@ -51,8 +51,12 @@ where
     runtime().spawn_blocking(f)
 }
 
-/// Shared application state: the currently open catalog, if any.
-#[derive(Default)]
+/// Shared application state: the open catalog, volume health, every job's ownership
+/// state, and where events go.
+///
+/// Cloning is cheap and **shares** everything (each field is an `Arc`), so a worker thread
+/// holds a clone rather than reaching back through a UI toolkit for "the" state.
+#[derive(Clone, Default)]
 pub struct AppState {
     pub catalog: Arc<Mutex<Option<Catalog>>>,
     /// Short-TTL cache of per-volume reachability, so NAS stats happen off the catalog
@@ -62,7 +66,27 @@ pub struct AppState {
     /// queryable status slots — behind the one protocol they all run. Grouped rather than
     /// left as loose fields so a catalog switch cannot reach some families and miss others.
     /// **Declare new job families in [`JobRegistry`], never directly here.**
-    pub jobs: JobRegistry,
+    pub jobs: Arc<JobRegistry>,
+    /// The frontend's event sink, installed once at startup ([`AppState::set_events`]).
+    /// Until then — and in tests that install none — events are dropped.
+    events: Arc<OnceLock<Arc<dyn EventSink>>>,
+}
+
+impl AppState {
+    /// Install the frontend's sink. Only the first call takes effect; returns whether this
+    /// one did.
+    pub fn set_events(&self, sink: Arc<dyn EventSink>) -> bool {
+        self.events.set(sink).is_ok()
+    }
+}
+
+/// Background work sends through the state it already holds.
+impl EventSink for AppState {
+    fn send(&self, event: CoreEvent) {
+        if let Some(sink) = self.events.get() {
+            sink.send(event);
+        }
+    }
 }
 
 /// The develop session's status slot lives with its worker (`develop::session`); it is
@@ -298,3 +322,46 @@ pub fn expand_home(path: &str) -> PathBuf {
     PathBuf::from(path)
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Count(std::sync::atomic::AtomicUsize);
+
+    impl EventSink for Count {
+        fn send(&self, _event: CoreEvent) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    fn ev() -> CoreEvent {
+        CoreEvent::CatalogSwitched("x".into())
+    }
+
+    /// A worker holds a clone taken before the sink was installed; its events must still
+    /// reach the frontend, because a clone shares the state rather than copying it.
+    #[test]
+    fn a_clone_shares_the_sink_installed_after_it_was_taken() {
+        let state = AppState::default();
+        let worker = state.clone();
+        worker.send(ev()); // before install: dropped, not an error
+        let sink = Arc::new(Count(Default::default()));
+        assert!(state.set_events(sink.clone()));
+        worker.send(ev());
+        state.send(ev());
+        assert_eq!(sink.0.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn only_the_first_sink_is_installed() {
+        let state = AppState::default();
+        let first = Arc::new(Count(Default::default()));
+        let second = Arc::new(Count(Default::default()));
+        assert!(state.set_events(first.clone()));
+        assert!(!state.set_events(second.clone()));
+        state.send(ev());
+        assert_eq!(first.0.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(second.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+}

@@ -3,50 +3,8 @@
 //! and the decode cache follow in later slices.
 
 use super::AppState;
+pub use crate::develop_source::{probe_source, DevelopSource};
 use tauri::{AppHandle, Manager};
-
-/// What the Develop badge shows for a photo. Serialized with a `source` tag so the frontend
-/// switches on one field. Which variants a build constructs depends on the `raw` feature
-/// (`NoDecoder` only without it, `Raw`/`Unsupported` only with it) — the enum is the
-/// contract, so the per-configuration dead-variant lint is silenced rather than split.
-#[allow(dead_code)]
-#[derive(Clone, Debug, PartialEq, serde::Serialize)]
-#[serde(tag = "source", rename_all = "lowercase")]
-pub enum DevelopSource {
-    /// The camera's embedded preview: while a RAW is being prepared (`preparing`), or when
-    /// the RAW engine is switched off.
-    Preview { preparing: bool },
-    /// A RAW the vendored decoder identifies. `bits` is the working depth this engine will
-    /// use (the decode is 16-bit linear); `megapixels` from the decoder's own dimensions.
-    /// `token` is set once the working image is resident — it goes into every render URL.
-    /// `camera_ev` rides with the token: the offset that matched the camera's JPEG of this
-    /// frame, which the Darkroom stamps on new engine-2 records.
-    Raw {
-        camera: String,
-        megapixels: f32,
-        bits: u8,
-        decoder: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        token: Option<String>,
-        #[serde(rename = "cameraEv", skip_serializing_if = "Option::is_none")]
-        camera_ev: Option<f32>,
-        /// The as-shot light as Kelvin and tint (`linear::as_shot_kelvin`), when the
-        /// camera gives what Kelvin white balance needs — the Kelvin slider's home.
-        #[serde(rename = "asShotWb", skip_serializing_if = "Option::is_none")]
-        as_shot_wb: Option<[f32; 2]>,
-        /// Which lens corrections the camera wrote into this file, once the working image
-        /// is resident (docs/plans/lens-corrections) — what the Darkroom's Lens switch offers.
-        #[serde(skip_serializing_if = "Option::is_none")]
-        lens: Option<LensInfo>,
-    },
-    /// A RAW the decoder does not support (yet): the Darkroom keeps working on the camera
-    /// preview and says so.
-    Unsupported { camera: Option<String>, reason: String },
-    /// Not a RAW: the file's own pixels are its full quality.
-    Jpeg,
-    /// The `raw` feature is compiled out of this build.
-    NoDecoder,
-}
 
 /// Identify a photo's file with the decoder (no pixels are read). Path resolution is a
 /// brief catalog lock; the probe itself runs on a blocking worker.
@@ -73,39 +31,6 @@ pub async fn raw_probe(app: AppHandle, photo_id: i64) -> Result<DevelopSource, S
     })
     .await
     .map_err(|e| e.to_string())?
-}
-
-/// The camera's lens tables for one photo, as the Darkroom shows them.
-#[derive(Clone, Debug, PartialEq, serde::Serialize)]
-pub struct LensInfo {
-    /// Where the tables came from, e.g. "Sony built-in".
-    pub source: String,
-    pub vignetting: bool,
-    pub distortion: bool,
-    pub chromatic: bool,
-}
-
-#[cfg(feature = "raw")]
-fn probe_source(path: &std::path::Path) -> DevelopSource {
-    use crate::raw::{probe, RawSupport};
-    match probe(path) {
-        RawSupport::Supported(id) => DevelopSource::Raw {
-            camera: format!("{} {}", id.make, id.model).trim().to_string(),
-            megapixels: (id.width as f32 * id.height as f32) / 1_000_000.0,
-            bits: 16,
-            decoder: crate::raw::decoder_version().to_string(),
-            token: None,
-            camera_ev: None,
-            as_shot_wb: None,
-            lens: None,
-        },
-        RawSupport::Unsupported { camera, reason } => DevelopSource::Unsupported { camera, reason },
-    }
-}
-
-#[cfg(not(feature = "raw"))]
-fn probe_source(_path: &std::path::Path) -> DevelopSource {
-    DevelopSource::NoDecoder
 }
 
 /// Resolve a photo's original path off the catalog lock (the same brief-lock-then-stat
@@ -147,7 +72,7 @@ pub async fn develop_open(app: AppHandle, photo_id: i64, neighbours: Vec<i64>) -
                 .filter_map(|n| resolve_original(&app, n).ok().map(|p| (n, p)))
                 .filter(|(_, p)| crate::scanner::is_raw(p))
                 .collect();
-            return crate::develop::session::open(&app, photo_id, path, probe, neighbours);
+            return crate::develop::session::open(&app.state::<AppState>(), photo_id, path, probe, neighbours);
         }
         #[cfg(not(all(feature = "raw", feature = "edit")))]
         {

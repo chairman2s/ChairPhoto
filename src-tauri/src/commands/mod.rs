@@ -39,6 +39,7 @@ mod culling;
 mod develop;
 mod editing;
 mod export;
+mod external;
 #[cfg(feature = "faces")]
 mod faces;
 #[cfg(feature = "flickr")]
@@ -84,6 +85,7 @@ pub use collage::*;
 pub use develop::*;
 pub use editing::*;
 pub use export::*;
+pub use external::*;
 #[cfg(feature = "faces")]
 pub use faces::*;
 #[cfg(feature = "flickr")]

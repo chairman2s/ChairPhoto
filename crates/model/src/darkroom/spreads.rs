@@ -34,34 +34,35 @@ pub struct ProofCandidate {
 pub const PROOF_CELLS: usize = 12;
 
 /// The base's framing, as TS picked it: crop, perspective and lens when truthy (so a
-/// `null` one is left out), straighten whenever the key is there (`!== undefined`, so a
-/// `null` one is copied).
+/// `null` one is left out, a raw one kept), straighten whenever the key is there
+/// (`!== undefined`, so a `null` one is copied).
 fn geometry_of(base: &VersionEdit) -> VersionEdit {
-    let truthy = |f: &Field<_>| if f.is_set() { f.clone() } else { Field::Absent };
     VersionEdit {
-        crop: truthy(&base.crop),
+        crop: if base.crop.is_truthy() { base.crop.clone() } else { Field::Absent },
         straighten: base.straighten.clone(),
-        perspective: if base.perspective.is_set() { base.perspective.clone() } else { Field::Absent },
-        lens: if base.lens.is_set() { base.lens.clone() } else { Field::Absent },
+        perspective: if base.perspective.is_truthy() { base.perspective.clone() } else { Field::Absent },
+        lens: if base.lens.is_truthy() { base.lens.clone() } else { Field::Absent },
         ..VersionEdit::default()
     }
 }
 
-/// Sparse-over-sparse tone merge (`b`'s keys win); absent when neither is set (`a || b`,
-/// so `null` counts as unset).
+/// Sparse-over-sparse tone merge (`b`'s keys win); absent when neither is truthy
+/// (`a || b`). A raw (non-object) tone spreads nothing.
 fn merge_tone(a: &Field<Tone>, b: &Field<Tone>) -> Field<Tone> {
-    match (a.value(), b.value()) {
-        (None, None) => Field::Absent,
-        (a, b) => Field::Set(a.cloned().unwrap_or_default().merged(&b.cloned().unwrap_or_default())),
+    if a.is_truthy() || b.is_truthy() {
+        Field::Set(a.value_or_default().merged(&b.value_or_default()))
+    } else {
+        Field::Absent
     }
 }
 
 /// `t` with a relative white balance `{ temp, tint }` — the tint kept, any Kelvin mode
 /// dropped (as in TS).
 fn warmed(t: &Field<Tone>, temp: f64) -> Tone {
-    let t = t.value();
-    let tint = t.and_then(|t| t.wb.value()).and_then(|w| w.tint.get()).unwrap_or(0.0);
-    Tone { wb: Field::Set(Wb::relative(temp, tint)), ..t.cloned().unwrap_or_default() }
+    // `t?.wb?.tint ?? 0`: a raw tint is carried as it is.
+    let tint = t.value().and_then(|t| t.wb.value()).map_or(Field::Set(0.0), |w| w.tint.or_set(0.0));
+    let wb = Wb { tint, ..Wb::relative(temp, 0.0) };
+    Tone { wb: Field::Set(wb), ..t.value_or_default() }
 }
 
 fn group_of(p: &DevelopPreset) -> ProofGroup {
@@ -140,7 +141,7 @@ fn clamp1(v: f64) -> f64 {
 }
 
 fn with_tone(r: &VersionEdit, patch: Tone) -> VersionEdit {
-    VersionEdit { tone: Field::Set(r.tone.value().cloned().unwrap_or_default().merged(&patch)), ..r.clone() }
+    VersionEdit { tone: Field::Set(r.tone.value_or_default().merged(&patch)), ..r.clone() }
 }
 
 /// A/B variants around `working` for `dim`; `visit` counts prior rounds on this dim.
@@ -153,7 +154,7 @@ fn with_tone(r: &VersionEdit, patch: Tone) -> VersionEdit {
 pub fn duel_pair(working: &VersionEdit, dim: DuelDim, visit: i32, kelvin: Option<&KelvinContext>) -> [VersionEdit; 2] {
     let decay = 0.5f64.powi(visit.max(0));
     let step = dim.base_step() * decay;
-    let t = working.tone.value().cloned().unwrap_or_default();
+    let t = working.tone.value_or_default();
     if let (DuelDim::Warmth, Some(ctx)) = (dim, kelvin) {
         let m = DUEL_WARMTH_MIREDS * decay;
         return [with_kelvin_shift(working, ctx, m), with_kelvin_shift(working, ctx, -m)];
@@ -161,22 +162,27 @@ pub fn duel_pair(working: &VersionEdit, dim: DuelDim, visit: i32, kelvin: Option
     let patch = |f: &dyn Fn(f64) -> Tone| [with_tone(working, f(-step)), with_tone(working, f(step))];
     match dim {
         DuelDim::Ev => {
-            let ev = t.ev.get().unwrap_or(0.0);
+            let ev = t.ev.num_or(0.0);
             patch(&|d| Tone { ev: Field::Set(ev + d), ..Tone::default() })
         }
         DuelDim::Warmth => {
-            let wb = t.wb.value().cloned().unwrap_or_else(|| Wb::relative(0.0, 0.0));
-            let temp = wb.temp.get().unwrap_or(0.0);
+            // `t?.wb ?? { temp: 0, tint: 0 }`; a raw (non-object) one has no members.
+            let wb = match &t.wb {
+                Field::Set(w) => w.clone(),
+                Field::Raw(_) => Wb::default(),
+                Field::Absent | Field::Null => Wb::relative(0.0, 0.0),
+            };
+            let temp = wb.temp.num_or(0.0);
             // `{ temp, tint: wb.tint }`: the tint as it was, `null` included.
             let relative = |temp| Wb { temp: Field::Set(temp), tint: wb.tint.clone(), mode: Field::Absent, kelvin: Field::Absent, extra: Map::new() };
             patch(&|d| Tone { wb: Field::Set(relative(clamp1(temp + d))), ..Tone::default() })
         }
         DuelDim::Contrast => {
-            let c = t.contrast.get().unwrap_or(0.0);
+            let c = t.contrast.num_or(0.0);
             patch(&|d| Tone { contrast: Field::Set(clamp1(c + d)), ..Tone::default() })
         }
         DuelDim::Shadows => {
-            let s = t.shadows.get().unwrap_or(0.0);
+            let s = t.shadows.num_or(0.0);
             patch(&|d| Tone { shadows: Field::Set(clamp1(s + d)), ..Tone::default() })
         }
     }

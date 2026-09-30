@@ -130,6 +130,124 @@ pub fn number_to_string(x: f64) -> String {
     }
 }
 
+/// `ToNumber` of a JSON value, for the rare record value that is not the number the TS
+/// code expected (a hand-edited or foreign record): `null` → 0, booleans → 0/1, strings
+/// parsed as JS does (trimmed, `""` → 0, `0x`/`0o`/`0b`, `Infinity`), arrays through their
+/// string form, objects → NaN.
+pub fn to_number(v: &Value) -> f64 {
+    match v {
+        Value::Null => 0.0,
+        Value::Bool(b) => f64::from(u8::from(*b)),
+        Value::Number(n) => n.as_f64().unwrap_or(f64::NAN),
+        Value::String(s) => string_to_number(s),
+        Value::Array(_) => string_to_number(&to_js_string(v)),
+        Value::Object(_) => f64::NAN,
+    }
+}
+
+fn string_to_number(s: &str) -> f64 {
+    let t = s.trim_matches(|c: char| c.is_whitespace() || c == '\u{feff}');
+    if t.is_empty() {
+        return 0.0;
+    }
+    match t {
+        "Infinity" | "+Infinity" => return f64::INFINITY,
+        "-Infinity" => return f64::NEG_INFINITY,
+        _ => {}
+    }
+    for (prefix, radix) in [("0x", 16), ("0X", 16), ("0o", 8), ("0O", 8), ("0b", 2), ("0B", 2)] {
+        if let Some(digits) = t.strip_prefix(prefix) {
+            return u64::from_str_radix(digits, radix).map_or(f64::NAN, |n| n as f64);
+        }
+    }
+    // JS decimal literal: optional sign, digits with an optional point, optional exponent.
+    // (Rust's parser would also take "inf" and "nan", which JS reads as NaN.)
+    let body = t.strip_prefix(['+', '-']).unwrap_or(t);
+    let (mantissa, exp) = match body.find(['e', 'E']) {
+        Some(i) => (&body[..i], Some(&body[i + 1..])),
+        None => (body, None),
+    };
+    let digits_ok = {
+        let (int, frac) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+        (!int.is_empty() || !frac.is_empty())
+            && int.bytes().all(|b| b.is_ascii_digit())
+            && frac.bytes().all(|b| b.is_ascii_digit())
+    };
+    let exp_ok = exp.is_none_or(|e| {
+        let e = e.strip_prefix(['+', '-']).unwrap_or(e);
+        !e.is_empty() && e.bytes().all(|b| b.is_ascii_digit())
+    });
+    if digits_ok && exp_ok {
+        t.parse().unwrap_or(f64::NAN)
+    } else {
+        f64::NAN
+    }
+}
+
+/// `String(v)` of a JSON value (`Array#join` for arrays, `[object Object]` for objects).
+pub fn to_js_string(v: &Value) -> String {
+    match v {
+        Value::Null => "null".into(),
+        Value::Bool(b) => b.to_string(),
+        Value::Number(n) => number_to_string(n.as_f64().unwrap_or(f64::NAN)),
+        Value::String(s) => s.clone(),
+        Value::Array(a) => a
+            .iter()
+            .map(|e| if e.is_null() { String::new() } else { to_js_string(e) })
+            .collect::<Vec<_>>()
+            .join(","),
+        Value::Object(_) => "[object Object]".into(),
+    }
+}
+
+/// JS truthiness of a value; `None` is `undefined`.
+pub fn truthy(v: Option<&Value>) -> bool {
+    match v {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(b)) => *b,
+        Some(Value::Number(n)) => n.as_f64().is_some_and(|f| f != 0.0 && !f.is_nan()),
+        Some(Value::String(s)) => !s.is_empty(),
+        Some(Value::Array(_) | Value::Object(_)) => true,
+    }
+}
+
+/// `a === b` for JSON values; `None` is `undefined`. Numbers compare as doubles (`1` and
+/// `1.0` are one number in JS); arrays and objects compare by content, which for the
+/// record values this is used on (fresh parses, never shared references) is what the TS
+/// `JSON.stringify` comparisons meant.
+pub fn strict_eq(a: Option<&Value>, b: Option<&Value>) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(a), Some(b)) => json_eq(a, b),
+        _ => false,
+    }
+}
+
+/// JSON equality with numbers compared as doubles.
+pub fn json_eq(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Number(x), Value::Number(y)) => x.as_f64() == y.as_f64(),
+        (Value::Array(x), Value::Array(y)) => x.len() == y.len() && x.iter().zip(y).all(|(a, b)| json_eq(a, b)),
+        (Value::Object(x), Value::Object(y)) => {
+            x.len() == y.len() && x.iter().all(|(k, v)| y.get(k).is_some_and(|w| json_eq(v, w)))
+        }
+        _ => a == b,
+    }
+}
+
+/// `v?.[key]`: a member of an object; `undefined` for anything else.
+pub fn member<'a>(v: Option<&'a Value>, key: &str) -> Option<&'a Value> {
+    v.and_then(Value::as_object).and_then(|o| o.get(key))
+}
+
+/// `v ?? d`.
+pub fn or<'a>(v: Option<&'a Value>, d: &'a Value) -> &'a Value {
+    match v {
+        None | Some(Value::Null) => d,
+        Some(v) => v,
+    }
+}
+
 /// A Rust `f32` as the TypeScript side saw it: serde_json writes the f32's shortest
 /// decimal (`66.45f32` → `66.45`) and `JSON.parse` reads that as a double. Widening with
 /// `as f64` instead gives `66.44999694824219`, which rounds differently.
@@ -205,6 +323,33 @@ mod tests {
         assert_eq!(number_to_string(1.5e22), "1.5e+22");
         assert_eq!(number_to_string(123456789012345680000.0), "123456789012345680000");
         assert_eq!(number_to_string(-4800.0), "-4800");
+    }
+
+    #[test]
+    fn to_number_and_truthiness_match_js() {
+        use serde_json::json;
+        for (v, n) in [
+            (json!(null), 0.0),
+            (json!(true), 1.0),
+            (json!(" 12.5 "), 12.5),
+            (json!(""), 0.0),
+            (json!("0x1f"), 31.0),
+            (json!("1e3"), 1000.0),
+            (json!(".5"), 0.5),
+            (json!("-Infinity"), f64::NEG_INFINITY),
+            (json!([7]), 7.0),
+            (json!([]), 0.0),
+        ] {
+            assert_eq!(to_number(&v), n, "{v}");
+        }
+        for v in [json!("inf"), json!("nan"), json!("1,5"), json!({}), json!([1, 2])] {
+            assert!(to_number(&v).is_nan(), "{v}");
+        }
+        assert!(!truthy(None) && !truthy(Some(&json!(0))) && !truthy(Some(&json!(""))));
+        assert!(truthy(Some(&json!({}))) && truthy(Some(&json!("0"))));
+        assert!(strict_eq(Some(&json!(1)), Some(&json!(1.0))));
+        assert!(!strict_eq(None, Some(&json!(null))));
+        assert!(!strict_eq(Some(&json!("1")), Some(&json!(1))));
     }
 
     #[test]

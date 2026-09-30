@@ -99,17 +99,19 @@ pub enum WbShown {
 /// What the rail shows for `wb`: the record's Kelvin pair; as-shot Kelvin when the record
 /// leaves white balance alone and Kelvin is preferred; otherwise the relative sliders.
 /// Kelvin needs a context — engine 2 with an as-shot light. Pass `None` for a `null` white
-/// balance: TS's `!wb` treated it as untouched.
+/// balance, and for a raw (non-object) one: TS's `!wb` or its missing members made it
+/// untouched.
 pub fn wb_shown(wb: Option<&Wb>, ctx: Option<&KelvinContext>) -> WbShown {
     if let Some(w) = wb {
-        if let (true, Some(kelvin)) = (w.is_kelvin(), w.kelvin.get()) {
-            return WbShown::Kelvin { kelvin, tint: w.tint.get().unwrap_or(0.0) };
+        // `wb.kelvin != null`: a raw one counts, read as a number.
+        if w.is_kelvin() && !w.kelvin.is_nullish() {
+            return WbShown::Kelvin { kelvin: w.kelvin.num_or(0.0), tint: w.tint.num_or(0.0) };
         }
     }
     let Some(ctx) = ctx else { return WbShown::Relative };
     let untouched = match wb {
         None => true,
-        Some(w) => w.mode.as_deref() != Some("relative") && w.temp.get().unwrap_or(0.0) == 0.0 && w.tint.get().unwrap_or(0.0) == 0.0,
+        Some(w) => w.mode.as_deref() != Some("relative") && w.temp.strictly_equals_or(0.0, 0.0) && w.tint.strictly_equals_or(0.0, 0.0),
     };
     if ctx.prefer == WbPrefer::Kelvin && untouched {
         return WbShown::Kelvin { kelvin: ctx.as_shot.kelvin, tint: ctx.as_shot.tint };
@@ -125,7 +127,7 @@ pub fn with_kelvin_shift(record: &VersionEdit, ctx: &KelvinContext, mireds: f64)
         WbShown::Kelvin { kelvin, tint } => (kelvin, tint),
         WbShown::Relative => (ctx.as_shot.kelvin, ctx.as_shot.tint),
     };
-    let tone = Tone { wb: Field::Set(kelvin_wb(mired_shift(kelvin, mireds), tint)), ..record.tone.value().cloned().unwrap_or_default() };
+    let tone = Tone { wb: Field::Set(kelvin_wb(mired_shift(kelvin, mireds), tint)), ..record.tone.value_or_default() };
     VersionEdit { tone: Field::Set(tone), ..record.clone() }
 }
 

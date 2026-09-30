@@ -7,6 +7,7 @@
 //! halves toward +∞ ([`crate::js_compat`]), and the minus sign is U+2212 "−".
 
 use serde::Serialize;
+use serde_json::Value;
 
 use crate::editing::{Field, Tone, VersionEdit, Wb};
 use crate::js_compat::{self, number_to_string, to_fixed};
@@ -22,17 +23,17 @@ pub struct Change {
     pub key: String,
 }
 
-type ToneGet = fn(&Tone) -> Option<f64>;
+type ToneGet = fn(&Tone) -> &Field<f64>;
 
 const TONE_NAMES: [(&str, &str, ToneGet); 8] = [
-    ("ev", "Exposure", |t| t.ev.get()),
-    ("contrast", "Contrast", |t| t.contrast.get()),
-    ("highlights", "Highlights", |t| t.highlights.get()),
-    ("shadows", "Shadows", |t| t.shadows.get()),
-    ("whites", "Whites", |t| t.whites.get()),
-    ("blacks", "Blacks", |t| t.blacks.get()),
-    ("vibrance", "Vibrance", |t| t.vibrance.get()),
-    ("saturation", "Saturation", |t| t.saturation.get()),
+    ("ev", "Exposure", |t| &t.ev),
+    ("contrast", "Contrast", |t| &t.contrast),
+    ("highlights", "Highlights", |t| &t.highlights),
+    ("shadows", "Shadows", |t| &t.shadows),
+    ("whites", "Whites", |t| &t.whites),
+    ("blacks", "Blacks", |t| &t.blacks),
+    ("vibrance", "Vibrance", |t| &t.vibrance),
+    ("saturation", "Saturation", |t| &t.saturation),
 ];
 
 /// `+0.50` / `−0.25` (U+2212), two decimals.
@@ -40,11 +41,34 @@ fn signed(v: f64) -> String {
     format!("{}{}", if v >= 0.0 { "+" } else { "−" }, to_fixed(v.abs(), 2))
 }
 
+/// `(a ?? 0) !== (b ?? 0)` for numeric keys, a raw (non-number) value included.
+fn differs(a: &Field<f64>, b: &Field<f64>) -> bool {
+    let zero = Value::from(0.0);
+    let (a, b) = (a.js(), b.js());
+    !js_compat::strict_eq(Some(js_compat::or(a.as_ref(), &zero)), Some(js_compat::or(b.as_ref(), &zero)))
+}
+
 /// TS `same`: `JSON.stringify(a ?? null) === JSON.stringify(b ?? null)` — so `null` and
-/// absent are the same here. Compared as JSON values, so NaN equals NaN (both `null`) as in TS; unlike TS the comparison ignores key
-/// order, which in TS followed how each object was built — never meaningfully different.
+/// absent are the same here, and a raw value compares as the JSON it is. Unlike TS the
+/// comparison ignores key order, which in TS followed how each object was built — never
+/// meaningfully different.
 fn same<T: Serialize>(a: &Field<T>, b: &Field<T>) -> bool {
-    serde_json::to_value(a.value()).ok() == serde_json::to_value(b.value()).ok()
+    let (a, b) = (a.js(), b.js());
+    js_compat::json_eq(js_compat::or(a.as_ref(), &Value::Null), js_compat::or(b.as_ref(), &Value::Null))
+}
+
+/// `x?.[key]` on a record field's JS value.
+fn member<T: Serialize>(f: &Field<T>, key: &str) -> Option<Value> {
+    js_compat::member(f.js().as_ref(), key).cloned()
+}
+
+/// `tone?.wb ?? { temp: 0, tint: 0 }`: a raw (non-object) white balance has no members.
+fn wb_of(t: &Tone) -> Wb {
+    match &t.wb {
+        Field::Set(w) => w.clone(),
+        Field::Raw(_) => Wb::default(),
+        Field::Absent | Field::Null => Wb::relative(0.0, 0.0),
+    }
 }
 
 /// Strip one trailing `.cube`, any case (`/\.cube$/i`).
@@ -58,21 +82,22 @@ fn strip_cube(file: &str) -> &str {
 }
 
 /// Every control that differs between `prev` and `next`, as (key, label) pairs, in panel
-/// order.
+/// order. A raw (mistyped) value is compared as the JSON it is and coerced with `ToNumber`
+/// for a numeric label; where TS would have thrown (`.replace` on a non-string LUT file),
+/// the label uses the value's string form.
 fn changed_controls(prev: &VersionEdit, next: &VersionEdit) -> Vec<(String, String)> {
     let mut out: Vec<(String, String)> = Vec::new();
     let mut push = |k: &str, l: String| out.push((k.to_string(), l));
-    let pt = prev.tone.value().cloned().unwrap_or_default();
-    let nt = next.tone.value().cloned().unwrap_or_default();
+    // `prev.tone ?? {}`: a raw (non-object) tone has no members.
+    let pt = prev.tone.value_or_default();
+    let nt = next.tone.value_or_default();
     for (k, name, get) in TONE_NAMES {
-        let a = get(&pt).unwrap_or(0.0);
-        let b = get(&nt).unwrap_or(0.0);
-        if a != b {
-            push(&format!("tone.{k}"), format!("{name} {}", signed(b)));
+        if differs(get(&pt), get(&nt)) {
+            push(&format!("tone.{k}"), format!("{name} {}", signed(get(&nt).num_or(0.0))));
         }
     }
-    let pwb = pt.wb.value().cloned().unwrap_or_else(|| Wb::relative(0.0, 0.0));
-    let nwb = nt.wb.value().cloned().unwrap_or_else(|| Wb::relative(0.0, 0.0));
+    let pwb = wb_of(&pt);
+    let nwb = wb_of(&nt);
     let pk = if pwb.is_kelvin() { pwb.kelvin.get() } else { None };
     let nk = if nwb.is_kelvin() { nwb.kelvin.get() } else { None };
     if pk != nk {
@@ -83,45 +108,49 @@ fn changed_controls(prev: &VersionEdit, next: &VersionEdit) -> Vec<(String, Stri
         };
         push("tone.wb.kelvin", label);
     } else if nk.is_some() {
-        let t = nwb.tint.get().unwrap_or(0.0);
-        if pwb.tint.get().unwrap_or(0.0) != t {
+        if differs(&pwb.tint, &nwb.tint) {
+            let t = nwb.tint.num_or(0.0);
             let sign = if t >= 0.0 { "+" } else { "−" };
             push("tone.wb.tint", format!("Tint {sign}{}", number_to_string(js_compat::round(t).abs())));
         }
     }
     if nk.is_none() && pk.is_none() {
-        if pwb.temp.get().unwrap_or(0.0) != nwb.temp.get().unwrap_or(0.0) {
-            push("tone.wb.temp", format!("Temperature {}", signed(nwb.temp.get().unwrap_or(0.0))));
+        if differs(&pwb.temp, &nwb.temp) {
+            push("tone.wb.temp", format!("Temperature {}", signed(nwb.temp.num_or(0.0))));
         }
-        if pwb.tint.get().unwrap_or(0.0) != nwb.tint.get().unwrap_or(0.0) {
-            push("tone.wb.tint", format!("Tint {}", signed(nwb.tint.get().unwrap_or(0.0))));
+        if differs(&pwb.tint, &nwb.tint) {
+            push("tone.wb.tint", format!("Tint {}", signed(nwb.tint.num_or(0.0))));
         }
     }
     if !same(&prev.zones, &next.zones) {
         push("zones", "Tone strip".into());
     }
     if !same(&prev.crop, &next.crop) {
-        let label = match next.crop.value() {
-            Some(c) => match c.aspect.as_deref() {
-                Some(a) if !a.is_empty() && a != "Free" => format!("Crop {a}"),
+        let label = if next.crop.is_truthy() {
+            // `aspect && aspect !== "Free"`
+            match member(&next.crop, "aspect") {
+                Some(Value::String(a)) if a == "Free" => "Crop".into(),
+                a if js_compat::truthy(a.as_ref()) => format!("Crop {}", js_compat::to_js_string(&a.unwrap_or_default())),
                 _ => "Crop".into(),
-            },
-            None => "Crop removed".into(),
+            }
+        } else {
+            "Crop removed".into()
         };
         push("crop", label);
     }
-    if prev.straighten.get().unwrap_or(0.0) != next.straighten.get().unwrap_or(0.0) {
-        push("straighten", format!("Straighten {}°", to_fixed(next.straighten.get().unwrap_or(0.0), 1)));
+    if differs(&prev.straighten, &next.straighten) {
+        push("straighten", format!("Straighten {}°", to_fixed(next.straighten.num_or(0.0), 1)));
     }
     if !same(&prev.perspective, &next.perspective) {
-        push("perspective", if next.perspective.is_set() { "Perspective" } else { "Perspective removed" }.into());
+        push("perspective", if next.perspective.is_truthy() { "Perspective" } else { "Perspective removed" }.into());
     }
-    let lens_on = |e: &VersionEdit| e.lens.value().is_some_and(|l| l.builtin);
+    let lens_on = |e: &VersionEdit| js_compat::truthy(member(&e.lens, "builtin").as_ref());
     if lens_on(prev) != lens_on(next) {
         push("lens", if lens_on(next) { "Lens correction on" } else { "Lens correction off" }.into());
     }
     if !same(&prev.bw, &next.bw) {
-        push("bw", if next.bw.value().is_some_and(|b| b.enabled) { "Black & white" } else { "Colour" }.into());
+        let bw_on = js_compat::truthy(member(&next.bw, "enabled").as_ref());
+        push("bw", if bw_on { "Black & white" } else { "Colour" }.into());
     }
     if !same(&prev.split, &next.split) {
         push("split", "Split toning".into());
@@ -129,16 +158,20 @@ fn changed_controls(prev: &VersionEdit, next: &VersionEdit) -> Vec<(String, Stri
     if !same(&prev.grain, &next.grain) {
         push("grain", "Grain".into());
     }
-    if prev.fade.get().unwrap_or(0.0) != next.fade.get().unwrap_or(0.0) {
-        push("fade", format!("Fade {}", to_fixed(next.fade.get().unwrap_or(0.0), 2)));
+    if differs(&prev.fade, &next.fade) {
+        push("fade", format!("Fade {}", to_fixed(next.fade.num_or(0.0), 2)));
     }
-    if prev.vignette.get().unwrap_or(0.0) != next.vignette.get().unwrap_or(0.0) {
-        push("vignette", format!("Vignette {}", signed(next.vignette.get().unwrap_or(0.0))));
+    if differs(&prev.vignette, &next.vignette) {
+        push("vignette", format!("Vignette {}", signed(next.vignette.num_or(0.0))));
     }
     if !same(&prev.lut, &next.lut) {
-        let label = match next.lut.value() {
-            Some(l) => format!("LUT {}", strip_cube(&l.file)),
-            None => "LUT removed".into(),
+        let label = if next.lut.is_truthy() {
+            match member(&next.lut, "file") {
+                Some(Value::String(f)) => format!("LUT {}", strip_cube(&f)),
+                f => format!("LUT {}", f.map_or("undefined".into(), |f| js_compat::to_js_string(&f))),
+            }
+        } else {
+            "LUT removed".into()
         };
         push("lut", label);
     }
@@ -322,6 +355,17 @@ mod tests {
         assert_eq!(when_label(at(3.0 * 86400.0), NOW), WhenLabel::Date(NOW / 1000.0 - 3.0 * 86400.0));
         assert_eq!(when_label(at(3.0 * 86400.0), NOW).text(|s| format!("day {s}")), format!("day {}", NOW / 1000.0 - 3.0 * 86400.0));
         assert_eq!(when_label(at(-60.0), NOW), WhenLabel::JustNow);
+    }
+
+    /// A raw (mistyped) value is compared as the JSON it is and read like JS (second review,
+    /// #103): a crop with a `null` coordinate is still a truthy object with its aspect.
+    #[test]
+    fn raw_values_are_named_as_ts_named_them() {
+        let bad_crop = json!({"crop": {"x": null, "y": 0.1, "w": 0.5, "h": 0.5, "aspect": "1:1"}});
+        assert_eq!(label(json!({}), bad_crop.clone()), "Crop 1:1");
+        assert_eq!(describe_change(&rec(bad_crop.clone()), &rec(bad_crop), None).key, "none");
+        assert_eq!(label(json!({}), json!({"fade": "0.5"})), "Fade 0.50");
+        assert_eq!(label(json!({"tone": {"wb": {"temp": 0.1, "mode": 5}}}), json!({"tone": {"wb": {"temp": 0.2, "mode": 5}}})), "Temperature +0.20");
     }
 
     // --- JS-formatting edge cases (new) ---

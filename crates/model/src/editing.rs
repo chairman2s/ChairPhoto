@@ -14,18 +14,23 @@
 //!
 //! # JSON compatibility
 //!
-//! - **Reading.** Every record the TS app wrote parses. Inside a present object, a field
-//!   core defaults is defaulted here with core's value (`crop.w` → 1, `grain.size` → 1,
-//!   `bw` → enabled Rec.601 weights, …) and a field core requires is required here
-//!   (`perspective` corners, `lut.file`), so the model reads what the renderer renders.
-//!   A key whose value has the wrong type is dropped rather than failing the whole record
-//!   ([`parse_edit`]); TS kept such a value verbatim, but core could not render it either.
-//!   An explicit `null` is kept as [`Field::Null`], distinct from a missing key, and
-//!   written back: TS kept it, and `{"bw":null}` is not `{}` to `isEngine1Version`. Every
-//!   optional key (the record's, the tone's, the white balance's, `crop.aspect`,
-//!   `perspective.aspect`) is a [`Field`]. Not matched: a `null` inside a fixed-shape
-//!   object's number or flag (`crop.x`, `bw.r`, a `zones` entry) fails that key like any
-//!   wrong type, so the key is dropped — core cannot render such a record either.
+//! - **Reading.** Every record the TS app wrote parses, and nothing it would keep is lost.
+//!   Every optional key (the record's, the tone's, the white balance's, `crop.aspect`,
+//!   `perspective.aspect`) is a [`Field`]: absent, `null`, a typed value, or — when the
+//!   value does not fit its type — the raw JSON ([`Field::Raw`]), kept and written back
+//!   unchanged. So `{"crop":{"x":null,…}}` (JS writes NaN as `null`) or a `zones` array
+//!   with a `null` in it survives whole, and one bad `wb.mode` cannot take the rest of the
+//!   tone with it. Inside a present object that does fit, a field core defaults is
+//!   defaulted here with core's value (`crop.w` → 1, `grain.size` → 1, `bw` → enabled
+//!   Rec.601 weights) and a field core requires is required (`perspective` corners,
+//!   `lut.file`) — a fixed-shape object missing one is kept raw. An explicit `null` is
+//!   [`Field::Null`], distinct from a missing key: TS kept it, and `{"bw":null}` is not
+//!   `{}` to `isEngine1Version`.
+//! - **Using a raw value.** Operations read it the way the TS expressions did where that
+//!   is cheap to state: truthiness and `?? x` see it as present; arithmetic and labels
+//!   coerce it with JS `ToNumber` ([`Field::num_or`]); spreading a non-object tone or
+//!   white balance spreads nothing. Where TS would have thrown or concatenated strings
+//!   (`"5" + 0.4`), the port coerces to a number instead.
 //! - **Writing.** [`VersionEdit::to_json`] omits absent fields (as `JSON.stringify` omits
 //!   `undefined`) and spells integral numbers as integers — core reads `engine` and
 //!   `grain.seed` as integers and rejects `2.0`. See [`crate::js_compat::to_json_string`].
@@ -35,19 +40,21 @@ use serde_json::{Map, Value};
 
 use crate::js_compat;
 
-/// A record key in one of its three JSON states. TS kept an explicit `null` as a value
-/// distinct from a missing key: `JSON.stringify({ bw: null })` is `{"bw":null}`, not `{}`,
-/// and `isEngine1Version` reads that difference. Every optional record field is a `Field`,
-/// so `null` round-trips and counts as holding something, while every `?? x` read treats
-/// it like absence ([`Field::get`], [`Field::value`]).
+/// A record key in one of its JSON states. TS kept an explicit `null` as a value distinct
+/// from a missing key (`JSON.stringify({ bw: null })` is `{"bw":null}`, not `{}`), and kept
+/// any value verbatim whatever its type. Every optional record field is a `Field`, so both
+/// round-trip; `?? x` reads see `null` as missing ([`Field::value`], [`Field::num_or`]).
 #[derive(Clone, Debug, PartialEq)]
 pub enum Field<T> {
     /// The key is not there (TS `undefined`); omitted when written.
     Absent,
     /// The key is there with `null`.
     Null,
-    /// The key has a value.
+    /// The key has a value of its type.
     Set(T),
+    /// The key has a value that does not fit its type (a string where a number belongs, a
+    /// crop with a `null` coordinate). Kept verbatim and written back unchanged.
+    Raw(Value),
 }
 
 impl<T> Default for Field<T> {
@@ -57,23 +64,28 @@ impl<T> Default for Field<T> {
 }
 
 impl<T> Field<T> {
-    /// The value, if set — `null` and absent both read as none (`?? x`).
+    /// The typed value, if there is one (`null`, absent and raw give none).
     pub fn value(&self) -> Option<&T> {
         match self {
             Field::Set(v) => Some(v),
-            Field::Absent | Field::Null => None,
+            _ => None,
         }
     }
 
     pub fn into_value(self) -> Option<T> {
         match self {
             Field::Set(v) => Some(v),
-            Field::Absent | Field::Null => None,
+            _ => None,
         }
     }
 
     pub fn is_absent(&self) -> bool {
         matches!(self, Field::Absent)
+    }
+
+    /// `x == null`: absent or `null`.
+    pub fn is_nullish(&self) -> bool {
+        matches!(self, Field::Absent | Field::Null)
     }
 
     pub fn is_set(&self) -> bool {
@@ -91,12 +103,75 @@ impl<T> Field<T> {
             over.clone()
         }
     }
+
+    /// `x ?? d` as a field: a nullish one becomes `d`, anything else stays.
+    pub fn or_set(&self, d: T) -> Field<T>
+    where
+        T: Clone,
+    {
+        if self.is_nullish() {
+            Field::Set(d)
+        } else {
+            self.clone()
+        }
+    }
+
+    /// For an object-typed field read by spreading (`{ ...(x ?? {}) }`): the value, or an
+    /// empty one for absent, `null` and a raw value (a non-object spreads nothing).
+    pub fn value_or_default(&self) -> T
+    where
+        T: Clone + Default,
+    {
+        self.value().cloned().unwrap_or_default()
+    }
+
+    /// The JS value of the key: `None` for absent (`undefined`), else its JSON.
+    pub fn js(&self) -> Option<Value>
+    where
+        T: Serialize,
+    {
+        match self {
+            Field::Absent => None,
+            Field::Null => Some(Value::Null),
+            Field::Set(v) => Some(serde_json::to_value(v).unwrap_or(Value::Null)),
+            Field::Raw(v) => Some(v.clone()),
+        }
+    }
+
+    /// JS truthiness of the key's value.
+    pub fn is_truthy(&self) -> bool
+    where
+        T: Serialize,
+    {
+        js_compat::truthy(self.js().as_ref())
+    }
 }
 
 impl<T: Copy> Field<T> {
-    /// The value, if set (`?? x` reads `null` as missing).
+    /// The typed value, if there is one.
     pub fn get(&self) -> Option<T> {
         self.value().copied()
+    }
+}
+
+impl Field<f64> {
+    /// `(x ?? d)` used as a number: the value, `d` when nullish, and a raw value through JS
+    /// `ToNumber` (garbage in, NaN out — `JSON.stringify` writes that NaN as `null`).
+    pub fn num_or(&self, d: f64) -> f64 {
+        match self {
+            Field::Set(v) => *v,
+            Field::Absent | Field::Null => d,
+            Field::Raw(v) => js_compat::to_number(v),
+        }
+    }
+
+    /// `(x ?? d) === n`: a raw value is never a number, so never equal.
+    pub fn strictly_equals_or(&self, d: f64, n: f64) -> bool {
+        match self {
+            Field::Set(v) => *v == n,
+            Field::Absent | Field::Null => d == n,
+            Field::Raw(_) => false,
+        }
     }
 }
 
@@ -117,6 +192,7 @@ impl<T: Serialize> Serialize for Field<T> {
     fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         match self {
             Field::Set(v) => v.serialize(s),
+            Field::Raw(v) => v.serialize(s),
             // Absent fields are skipped by `skip_serializing_if`; were one written anyway,
             // `null` is the only JSON for it.
             Field::Absent | Field::Null => s.serialize_none(),
@@ -124,10 +200,18 @@ impl<T: Serialize> Serialize for Field<T> {
     }
 }
 
-impl<'de, T: Deserialize<'de>> Deserialize<'de> for Field<T> {
+impl<'de, T: serde::de::DeserializeOwned> Deserialize<'de> for Field<T> {
     /// Called only for a key that is there (a missing key takes `#[serde(default)]`).
+    /// Never fails: a value that does not fit `T` is kept as [`Field::Raw`].
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        Ok(Option::<T>::deserialize(d)?.map_or(Field::Null, Field::Set))
+        let v = Value::deserialize(d)?;
+        if v.is_null() {
+            return Ok(Field::Null);
+        }
+        Ok(match serde_json::from_value::<T>(v.clone()) {
+            Ok(t) => Field::Set(t),
+            Err(_) => Field::Raw(v),
+        })
     }
 }
 
@@ -537,7 +621,7 @@ pub fn as_linear_record(record: &VersionEdit, camera_ev: f64) -> VersionEdit {
     let mut out = VersionEdit {
         engine: Field::Set(ENGINE_LINEAR),
         // `record.display ?? DEFAULT`: a `null` display takes the default too.
-        display: Field::Set(record.display.value().cloned().unwrap_or_else(|| DEFAULT_LINEAR_DISPLAY.into())),
+        display: record.display.or_set(DEFAULT_LINEAR_DISPLAY.into()),
         ..record.clone()
     };
     if camera_ev != 0.0 && out.display.as_deref() == Some(DEFAULT_LINEAR_DISPLAY) {
@@ -548,7 +632,7 @@ pub fn as_linear_record(record: &VersionEdit, camera_ev: f64) -> VersionEdit {
 
 /// Whether a record belongs to the linear engine.
 pub fn is_linear(e: &VersionEdit) -> bool {
-    e.engine.get() == Some(ENGINE_LINEAR)
+    e.engine.value() == Some(&ENGINE_LINEAR)
 }
 
 /// A fresh engine-2 record from an engine-1 one: geometry (crop, perspective, straighten)
@@ -608,11 +692,13 @@ impl Look {
 /// and NaN are dropped, and so is `null`). `bw`, `split` and `lut` pass through as they are,
 /// `null` included.
 pub fn look_fields(l: &Look) -> Look {
-    let truthy = |v: &Field<f64>| v.get().filter(|x| *x != 0.0 && !x.is_nan()).into();
+    let truthy = |v: &Field<f64>| if v.is_truthy() { v.clone() } else { Field::Absent };
+    // `l.grain && l.grain.amount > 0`, read off a raw grain too.
+    let amount = js_compat::member(l.grain.js().as_ref(), "amount").map_or(f64::NAN, js_compat::to_number);
     Look {
         bw: l.bw.clone(),
         split: l.split.clone(),
-        grain: l.grain.value().filter(|g| g.amount > 0.0).cloned().into(),
+        grain: if l.grain.is_truthy() && amount > 0.0 { l.grain.clone() } else { Field::Absent },
         fade: truthy(&l.fade),
         vignette: truthy(&l.vignette),
         lut: l.lut.clone(),
@@ -756,8 +842,8 @@ pub const GOLDEN_SPIRAL_PATH: &str = concat!(
 
 /// Parse a version's stored `edit_json` (tolerant of empty/partial). Absent or empty
 /// input, invalid JSON and a non-object (TS would return `null`/an array cast as a
-/// record) give the empty record. A key whose value does not fit its type is dropped and
-/// the rest kept (see the module docs).
+/// record) give the empty record. A key whose value does not fit its type is kept raw
+/// (see the module docs).
 pub fn parse_edit(edit_json: Option<&str>) -> VersionEdit {
     match edit_json {
         Some(s) if !s.is_empty() => serde_json::from_str::<Value>(s).map(edit_from_value).unwrap_or_default(),
@@ -765,22 +851,13 @@ pub fn parse_edit(edit_json: Option<&str>) -> VersionEdit {
     }
 }
 
-/// A record from an already-parsed JSON value; see [`parse_edit`].
+/// A record from an already-parsed JSON value; see [`parse_edit`]. Any object parses: every
+/// field is a [`Field`], which keeps a value it cannot type as [`Field::Raw`].
 pub fn edit_from_value(v: Value) -> VersionEdit {
-    let Value::Object(obj) = v else { return VersionEdit::default() };
-    if let Ok(e) = serde_json::from_value::<VersionEdit>(Value::Object(obj.clone())) {
-        return e;
+    match v {
+        Value::Object(_) => serde_json::from_value(v).unwrap_or_default(),
+        _ => VersionEdit::default(),
     }
-    // Salvage key by key: a bad `fade` must not cost the photo its crop.
-    let mut out = VersionEdit::default();
-    for (k, v) in obj {
-        let mut one = Map::new();
-        one.insert(k, v);
-        if let Ok(e) = serde_json::from_value::<VersionEdit>(Value::Object(one)) {
-            out = out.overlaid(&e);
-        }
-    }
-    out
 }
 
 /// The largest crop of pixel aspect `ratio` (width/height) inside a W×H image, scaled by
@@ -1015,6 +1092,52 @@ mod tests {
         assert_eq!(rec(json!({"tone": null})).tone.value(), None);
     }
 
+    /// Review finding (second review, #103): a `null` or mistyped value inside a fixed-shape
+    /// object dropped the whole top-level key, and a bad nested field took its siblings with
+    /// it. The reviewer's probes, verbatim: each record now saves back exactly.
+    #[test]
+    fn mistyped_values_inside_objects_are_kept_whole() {
+        for json in [
+            r#"{"crop":{"x":null,"y":0.1,"w":0.5,"h":0.5,"aspect":"1:1"},"fade":0.2}"#,
+            r#"{"zones":[0,null,0,0,0,0,0,0]}"#,
+            r#"{"tone":{"ev":1,"contrast":0.3,"wb":{"temp":0.1,"mode":5}}}"#,
+            r#"{"bw":{"enabled":"yes","r":1,"g":0,"b":0},"perspective":{"tl":[0,0]},"lut":{"amount":1},"engine":"2"}"#,
+        ] {
+            let e = parse_edit(Some(json));
+            let (a, b): (Value, Value) = (serde_json::from_str(json).unwrap(), serde_json::from_str(&e.to_json()).unwrap());
+            assert_eq!(a, b, "{json}");
+        }
+        let crop = parse_edit(Some(r#"{"crop":{"x":null,"y":0.1,"w":0.5,"h":0.5,"aspect":"1:1"},"fade":0.2}"#));
+        assert!(matches!(crop.crop, Field::Raw(_)));
+        assert_eq!(crop.fade, Field::Set(0.2));
+        // `{"zones":[0,null,…]}` holds something: engine 1, as in TS.
+        assert!(is_engine1_version(&parse_edit(Some(r#"{"zones":[0,null,0,0,0,0,0,0]}"#))));
+        // One bad `wb.mode` keeps its siblings typed.
+        let tone = parse_edit(Some(r#"{"tone":{"ev":1,"contrast":0.3,"wb":{"temp":0.1,"mode":5}}}"#)).tone.into_value().unwrap();
+        assert_eq!((tone.ev.get(), tone.contrast.get()), (Some(1.0), Some(0.3)));
+        let wb = tone.wb.into_value().unwrap();
+        assert_eq!((wb.temp.get(), wb.mode), (Some(0.1), Field::Raw(json!(5))));
+        // `engine: "2"` is not `=== 2`.
+        assert!(!is_linear(&parse_edit(Some(r#"{"engine":"2"}"#))));
+    }
+
+    /// Operations carry a raw value the way the TS spreads did and read it like JS.
+    #[test]
+    fn raw_values_travel_through_operations() {
+        let e = parse_edit(Some(r#"{"crop":{"x":null,"y":0.1,"w":0.5,"h":0.5,"aspect":"1:1"},"fade":"0.3","grain":{"amount":0.4,"seed":"s"}}"#));
+        // `...record` and `crop: e.crop` keep the raw crop.
+        assert_eq!(as_linear_record(&e, 0.0).crop, e.crop);
+        assert_eq!(for_linear_engine(&e, 0.0).crop, e.crop);
+        // lookFields: a truthy raw fade stays; a raw grain whose `amount > 0` stays.
+        let adjusted = e.with_look(&e.look());
+        assert_eq!(adjusted.fade, Field::Raw(json!("0.3")));
+        assert!(matches!(adjusted.grain, Field::Raw(_)));
+        let (a, b): (Value, Value) = (serde_json::from_str(&e.to_json()).unwrap(), serde_json::from_str(&adjusted.to_json()).unwrap());
+        assert_eq!(a, b);
+        // `(x ?? 0)` used as a number is JS ToNumber.
+        assert_eq!(e.fade.num_or(0.0), 0.3);
+    }
+
     #[test]
     fn integers_stay_integers_for_core() {
         let written = rec(json!({"engine": 2, "grain": {"amount": 0.2, "size": 1, "seed": 7}, "straighten": 2})).to_json();
@@ -1057,12 +1180,13 @@ mod tests {
     }
 
     #[test]
-    fn unknown_keys_survive_and_bad_values_cost_only_their_key() {
+    fn unknown_keys_and_mistyped_values_survive() {
         let e = parse_edit(Some(r#"{"future":{"a":[1,2]},"fade":"oops","crop":{"x":0,"y":0,"w":0.5,"h":0.5}}"#));
         assert_eq!(e.crop, Field::Set(Crop::rect(0.0, 0.0, 0.5, 0.5)));
-        assert_eq!(e.fade, Field::Absent);
+        assert_eq!(e.fade, Field::Raw(json!("oops")));
         let back: Value = serde_json::from_str(&e.to_json()).unwrap();
         assert_eq!(back["future"], json!({"a": [1, 2]}));
+        assert_eq!(back["fade"], json!("oops"));
         assert_eq!(parse_edit(Some("not json")), VersionEdit::default());
         assert_eq!(parse_edit(Some("null")), VersionEdit::default());
         assert_eq!(parse_edit(Some("")), VersionEdit::default());

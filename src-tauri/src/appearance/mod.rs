@@ -13,11 +13,11 @@
 //! half-swapped theme that never settles — gets the same answer, because the frontend's
 //! fallback (ChairPhoto Standard) must engage immediately rather than keep a stale palette.
 
+use crate::app::{CoreEvent, EventSink};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime};
-use tauri::Emitter;
 
 /// Broadcast whenever the settled Omarchy state changes. Payload: a [`SystemThemeResult`] —
 /// the switched-to theme, or `available: false` when the theme vanished or broke and the
@@ -359,7 +359,7 @@ pub fn start_watcher(app: tauri::AppHandle) -> bool {
         loop {
             std::thread::sleep(WATCH_INTERVAL);
             if let Some(result) = poll_tick(&root, &mut state) {
-                let _ = app.emit(THEME_CHANGED_EVENT, &result);
+                let _ = app.send(CoreEvent::ThemeChanged(result.clone()));
             }
         }
     });

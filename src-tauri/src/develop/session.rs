@@ -11,6 +11,7 @@
 //! resident set too, so a slot that outlives its image (a `close` after the worker ended)
 //! reads as "not resident", never as other pixels.
 
+use crate::app::{CoreEvent, EventSink};
 use super::{release_all, with_resident};
 use crate::app::jobs::{JobClaim, JobStatus};
 use crate::commands::{AppState, DevelopSource};
@@ -18,7 +19,7 @@ use crate::plugins::edit::{SourceToken, WorkingImage};
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use tauri::{AppHandle, Emitter, Manager, Runtime};
+use tauri::{AppHandle, Manager, Runtime};
 
 /// Settings key: `"0"` turns neighbour preload off. On by default.
 pub const PRELOAD_KEY: &str = "develop.preloadNeighbours";
@@ -265,7 +266,7 @@ fn prepare<R: Runtime>(
     let abort = claim.abort.clone();
     let aborted = || abort.load(Ordering::Relaxed);
     let emit = |source: DevelopSource| {
-        let _ = app.emit("develop:source", DevelopSourceEvent { photo_id, job: generation, source });
+        let _ = app.send(CoreEvent::DevelopSource(DevelopSourceEvent { photo_id, job: generation, source }));
     };
     // Terminal for a failure: the slot goes (only if still ours), then the event.
     let fail = || claim.slot.clear();

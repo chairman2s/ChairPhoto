@@ -5,7 +5,7 @@
 //! keywords, rating/label and IPTC are written into the *destination* sidecar.
 
 use super::*;
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, State};
 
 /// Export photos to a destination folder using a preset (Hand-off RAW+XMP, or
 /// Show-off JPEG). `destDir`'s leading "~" is expanded. Unreachable originals are
@@ -130,7 +130,7 @@ pub async fn export_bundle(
     // Progress events mirror the `import:progress` shape used by E5 (ingest_from_card).
     crate::app::spawn_blocking(move || {
         crate::bundle::writer::write_bundle(&bundle, &dest, |done, total| {
-            let _ = app.emit("import:progress", ImportProgress { done, total });
+            let _ = app.send(CoreEvent::ImportProgress(ImportProgress { done, total }));
         })
     })
     .await
@@ -173,7 +173,7 @@ pub async fn import_bundle_cmd(
                 &mut archive,
                 &dest,
                 |done, total| {
-                    let _ = app.emit("import:progress", ImportProgress { done, total });
+                    let _ = app.send(CoreEvent::ImportProgress(ImportProgress { done, total }));
                 },
             )?;
             Ok::<_, String>((manifest, extracted, partial))

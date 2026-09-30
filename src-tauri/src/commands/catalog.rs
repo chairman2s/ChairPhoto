@@ -8,7 +8,7 @@
 
 use super::*;
 use std::path::{Path, PathBuf};
-use tauri::{AppHandle, Emitter, Manager, State};
+use tauri::{AppHandle, Manager, State};
 
 /// Switch the active catalog with a safe teardown → reinit lifecycle (I4b).
 ///
@@ -107,7 +107,7 @@ pub async fn switch_catalog(
     .await;
 
     // 5. Tell the frontend to reset and refresh against the new catalog.
-    let _ = app.emit("catalog:switched", &catalog_path);
+    let _ = app.send(CoreEvent::CatalogSwitched(catalog_path.clone()));
 
     // 6. Auto-resume Phase B (I6d) if the new catalog has pending enrichment rows
     //    (crash/quit mid-scan in a prior session). Only start the detached worker (and burn

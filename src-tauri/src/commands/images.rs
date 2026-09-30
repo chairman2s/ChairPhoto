@@ -7,21 +7,13 @@
 
 use super::*;
 use std::path::{Path, PathBuf};
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, State};
 
 /// The loopback port serving catalog videos (`http://127.0.0.1:<port>/<photo_id>`), for the
 /// frontend `<video>` player. 0 if the server failed to start.
 #[tauri::command]
 pub fn video_server_port() -> u16 {
     crate::protocol::video_server_port()
-}
-
-/// Progress event payload for batch caching, emitted as `cache:progress`.
-#[derive(Clone, serde::Serialize)]
-#[serde(rename_all = "camelCase")]
-struct CacheProgress {
-    done: usize,
-    total: usize,
 }
 
 /// Pre-generate cached images for every photo in the catalog, in parallel across
@@ -105,7 +97,7 @@ pub async fn cache_images(
                             .unwrap_or(false);
                         grayscale.lock().unwrap().push((*photo_id, gray));
                         let n = done.fetch_add(1, Ordering::Relaxed) + 1;
-                        let _ = app.emit("cache:progress", CacheProgress { done: n, total });
+                        let _ = app.send(CoreEvent::CacheProgress(CacheProgress { done: n, total }));
                     }
                 });
             }

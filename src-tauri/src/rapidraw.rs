@@ -24,6 +24,7 @@
 //! adopting the result as a **stacked child** of the original via `upsert_external_one` +
 //! `set_stack_parent` — the same association mechanism the develop round-trip uses.
 
+use crate::app::{CoreEvent, EventSink};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -33,7 +34,7 @@ use std::time::Duration;
 
 use crate::catalog::Catalog;
 use crate::commands::AppState;
-use tauri::{AppHandle, Emitter, Manager, Runtime, State};
+use tauri::{AppHandle, Manager, Runtime, State};
 
 /// Settings key namespace, mirroring `editor.<key>.<which>` from `external_edit.rs`.
 const BIN_SETTING: &str = "editor.rapidraw.bin";
@@ -140,19 +141,16 @@ pub fn rapidraw_available(state: State<'_, AppState>) -> Result<RapidRawStatus, 
 /// Per-photo progress of a RapidRAW round-trip, streamed on `rapidraw:progress`.
 #[derive(Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
-struct RapidRawProgress {
-    photo_id: i64,
+pub struct RapidRawProgress {
+    pub photo_id: i64,
     /// editing | waiting | importing | done | error | cancelled
-    phase: String,
+    pub phase: String,
     /// Human-readable detail (error text, or the output path being watched).
-    message: String,
+    pub message: String,
 }
 
 fn emit<R: Runtime>(app: &AppHandle<R>, photo_id: i64, phase: &str, message: &str) {
-    let _ = app.emit(
-        "rapidraw:progress",
-        RapidRawProgress { photo_id, phase: phase.into(), message: message.into() },
-    );
+    let _ = app.send(CoreEvent::RapidRawProgress(RapidRawProgress { photo_id, phase: phase.into(), message: message.into() }));
 }
 
 /// Everything needed to run a round-trip, resolved under a brief catalog lock so the long

@@ -7,7 +7,7 @@
 
 use super::*;
 use std::path::PathBuf;
-use tauri::{AppHandle, Emitter, Manager};
+use tauri::{AppHandle, Manager};
 
 /// Scan a folder (recursively) into the open catalog. Read-only on photo files.
 /// A leading "~" is expanded to $HOME.
@@ -69,7 +69,7 @@ where
         let scan_catalog = Catalog::open_secondary(&path, &root).map_err(|e| e.to_string())?;
         // Stream progress to the UI as `scan:progress` events (throttled per commit batch).
         let emit = move |p: crate::scanner::ScanProgress| {
-            let _ = emit_app.emit("scan:progress", p);
+            let _ = emit_app.send(CoreEvent::ScanProgress(p));
         };
         op(&scan_catalog, &abort, &emit)
     })
@@ -77,10 +77,7 @@ where
     .map_err(|e| e.to_string())?;
     // Terminal event so the UI clears its progress indicator (whether the scan succeeded,
     // failed, or was aborted by a catalog switch).
-    let _ = app.emit(
-        "scan:progress",
-        crate::scanner::ScanProgress { phase: "done".into(), done: 0, total: 0 },
-    );
+    let _ = app.send(CoreEvent::ScanProgress(crate::scanner::ScanProgress { phase: "done".into(), done: 0, total: 0 }));
     res
 }
 
@@ -103,10 +100,7 @@ pub(super) fn spawn_detached_phase_b(
             Ok(c) => c,
             Err(e) => {
                 eprintln!("resume phase B: couldn't open enrichment connection: {e}");
-                let _ = app.emit(
-                    "scan:progress",
-                    crate::scanner::ScanProgress { phase: "done".into(), done: 0, total: 0 },
-                );
+                let _ = app.send(CoreEvent::ScanProgress(crate::scanner::ScanProgress { phase: "done".into(), done: 0, total: 0 }));
                 return;
             }
         };
@@ -115,17 +109,14 @@ pub(super) fn spawn_detached_phase_b(
             Ok(None) => return, // queue is empty — nothing to do, no events emitted
             Err(e) => {
                 eprintln!("resume phase B: couldn't load enrichment queue: {e}");
-                let _ = app.emit(
-                    "scan:progress",
-                    crate::scanner::ScanProgress { phase: "done".into(), done: 0, total: 0 },
-                );
+                let _ = app.send(CoreEvent::ScanProgress(crate::scanner::ScanProgress { phase: "done".into(), done: 0, total: 0 }));
                 return;
             }
         };
         let emit = {
             let emit_app = app.clone();
             move |p: crate::scanner::ScanProgress| {
-                let _ = emit_app.emit("scan:progress", p);
+                let _ = emit_app.send(CoreEvent::ScanProgress(p));
             }
         };
         if let Err(e) = crate::scanner::phase_b_enrich(&enrich_catalog, pending, &abort, &emit) {
@@ -133,10 +124,7 @@ pub(super) fn spawn_detached_phase_b(
                 eprintln!("resume phase B: enrichment failed: {e}");
             }
         }
-        let _ = app.emit(
-            "scan:progress",
-            crate::scanner::ScanProgress { phase: "done".into(), done: 0, total: 0 },
-        );
+        let _ = app.send(CoreEvent::ScanProgress(crate::scanner::ScanProgress { phase: "done".into(), done: 0, total: 0 }));
     });
 }
 
@@ -184,7 +172,7 @@ where
         crate::app::spawn_blocking(move || {
             let scan_catalog = Catalog::open_secondary(&path, &root).map_err(|e| e.to_string())?;
             let emit = move |p: crate::scanner::ScanProgress| {
-                let _ = emit_app.emit("scan:progress", p);
+                let _ = emit_app.send(CoreEvent::ScanProgress(p));
             };
             phase_a(&scan_catalog, &abort, &emit)
         })
@@ -199,10 +187,7 @@ where
             // `scan:progress {phase:"done"}` so the UI's topbar progress indicator always
             // clears (matching the old single-phase run_blocking_scan, which emitted "done"
             // whether the op succeeded, failed, or aborted), then propagate the error.
-            let _ = app.emit(
-                "scan:progress",
-                crate::scanner::ScanProgress { phase: "done".into(), done: 0, total: 0 },
-            );
+            let _ = app.send(CoreEvent::ScanProgress(crate::scanner::ScanProgress { phase: "done".into(), done: 0, total: 0 }));
             return Err(e);
         }
     };
@@ -248,17 +233,14 @@ where
             Ok(c) => c,
             Err(e) => {
                 eprintln!("phase B: couldn't open enrichment connection: {e}");
-                let _ = emit_app.emit(
-                    "scan:progress",
-                    crate::scanner::ScanProgress { phase: "done".into(), done: 0, total: 0 },
-                );
+                let _ = emit_app.send(CoreEvent::ScanProgress(crate::scanner::ScanProgress { phase: "done".into(), done: 0, total: 0 }));
                 return;
             }
         };
         let emit = {
             let emit_app = emit_app.clone();
             move |p: crate::scanner::ScanProgress| {
-                let _ = emit_app.emit("scan:progress", p);
+                let _ = emit_app.send(CoreEvent::ScanProgress(p));
             }
         };
         if let Err(e) = crate::scanner::phase_b_enrich(&enrich_catalog, pending, &abort, &emit) {
@@ -268,10 +250,7 @@ where
                 eprintln!("phase B: enrichment failed: {e}");
             }
         }
-        let _ = emit_app.emit(
-            "scan:progress",
-            crate::scanner::ScanProgress { phase: "done".into(), done: 0, total: 0 },
-        );
+        let _ = emit_app.send(CoreEvent::ScanProgress(crate::scanner::ScanProgress { phase: "done".into(), done: 0, total: 0 }));
     });
 
     Ok(result)
@@ -313,7 +292,7 @@ pub async fn ingest_from_card_cmd(
         let app = app.clone();
         crate::app::spawn_blocking(move || {
             crate::scanner::copy_from_card(&source, &dest, selected.as_ref(), |done, total| {
-                let _ = app.emit("import:progress", ImportProgress { done, total });
+                let _ = app.send(CoreEvent::ImportProgress(ImportProgress { done, total }));
             })
         })
         .await
@@ -357,13 +336,5 @@ pub async fn card_thumbnail(path: String) -> Result<String, String> {
         .map_err(|e| e.to_string())??;
     let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
     Ok(format!("data:image/jpeg;base64,{b64}"))
-}
-
-/// Progress event payload for card import, emitted as `import:progress` during the copy.
-#[derive(Clone, serde::Serialize)]
-#[serde(rename_all = "camelCase")]
-pub(super) struct ImportProgress {
-    pub(super) done: usize,
-    pub(super) total: usize,
 }
 

@@ -6,7 +6,7 @@
 
 use super::*;
 use serde::Serialize;
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, State};
 
 /// Report which face models are present, so the UI can offer a download and keep the module
 /// inert until they are. Never fails — a missing model is a clean state. `async` so it runs
@@ -89,35 +89,6 @@ pub fn faces_set_indexing_speed(state: State<'_, AppState>, speed: String) -> Re
 
 // ── Face-indexing commands (H13b) ────────────────────────────────────────────
 
-/// Terminal event payload for `faces_index_photos` (`faces:index_done`). Progress events
-/// alone can't signal completion unambiguously (a run with nothing to index emits only
-/// `{0, 0}`, which is indistinguishable from a failure), so completion gets its own event.
-/// `job` identifies which run finished — starting a new run aborts the previous one, and
-/// the UI must not mistake the superseded run's done-event for its own job completing.
-/// `offline`/`failed`/`aborted` say *why* `done < total` instead of leaving the UI to guess.
-#[cfg(feature = "faces")]
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct FacesIndexDone {
-    pub ok: bool,
-    pub done: usize,
-    pub total: usize,
-    pub offline: usize,
-    pub failed: usize,
-    pub aborted: bool,
-    pub job: u64,
-    pub error: Option<String>,
-}
-
-/// Progress event payload (`faces:progress`) for the indexing job — the indexer's
-/// `{done, total}` plus the job id, so a superseded job's stragglers can be ignored.
-#[cfg(feature = "faces")]
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct FacesProgressEvent {
-    pub done: usize,
-    pub total: usize,
-    pub job: u64,
-}
-
 /// Claim ownership of the face-**indexing** job: snapshot the catalog, allocate the job id,
 /// trip the previous job, install this job's abort flag and claim the status slot as ONE
 /// transition, holding catalog -> abort -> slot throughout.
@@ -189,9 +160,7 @@ pub async fn faces_index_photos(
             Err(e) => {
                 eprintln!("faces_index: couldn't open secondary connection: {e}");
                 clear_job_slot();
-                let _ = app.emit(
-                    "faces:index_done",
-                    FacesIndexDone {
+                let _ = app.send(CoreEvent::FacesIndexDone(FacesIndexDone {
                         ok: false,
                         done: 0,
                         total: 0,
@@ -200,8 +169,7 @@ pub async fn faces_index_photos(
                         aborted: false,
                         job,
                         error: Some(format!("couldn't open catalog connection: {e}")),
-                    },
-                );
+                    }));
                 return;
             }
         };
@@ -247,10 +215,7 @@ pub async fn faces_index_photos(
             // but its in-flight chunk may still emit a few stragglers). `JobSlot::publish`
             // is the shared guard that rejects those.
             progress_slot.publish(|job| FacesJobStatus { job, done: p.done, total: p.total });
-            let _ = emit_app.emit(
-                "faces:progress",
-                FacesProgressEvent { done: p.done, total: p.total, job },
-            );
+            let _ = emit_app.send(CoreEvent::FacesProgress(FacesProgressEvent { done: p.done, total: p.total, job }));
         };
 
         // People-root branch (setting, with default) for the MWG-region import: an imported
@@ -304,9 +269,7 @@ pub async fn faces_index_photos(
         clear_job_slot();
         match result {
             Ok(o) => {
-                let _ = app.emit(
-                    "faces:index_done",
-                    FacesIndexDone {
+                let _ = app.send(CoreEvent::FacesIndexDone(FacesIndexDone {
                         ok: true,
                         done: o.done,
                         total: o.total,
@@ -315,14 +278,11 @@ pub async fn faces_index_photos(
                         aborted: o.aborted,
                         job,
                         error: None,
-                    },
-                );
+                    }));
             }
             Err(e) => {
                 eprintln!("faces_index: job failed: {e}");
-                let _ = app.emit(
-                    "faces:index_done",
-                    FacesIndexDone {
+                let _ = app.send(CoreEvent::FacesIndexDone(FacesIndexDone {
                         ok: false,
                         done: 0,
                         total: 0,
@@ -331,8 +291,7 @@ pub async fn faces_index_photos(
                         aborted: false,
                         job,
                         error: Some(e.to_string()),
-                    },
-                );
+                    }));
             }
         }
     });
@@ -445,37 +404,6 @@ fn faces_write_regions(c: &crate::catalog::Catalog, photo_id: i64) {
 // commands only wire it to the open catalog. Confirming a face also assigns the person tag
 // to the *photo* through the catalog's `assign_tag` (XMP export + cross-catalog merge).
 
-/// Progress payload for `faces:match_progress`: the pipeline step label plus counts, and
-/// the job id so the UI can drop stragglers from a superseded run.
-///
-/// Matching used to share `faces:progress` with indexing and be told apart by the *absence*
-/// of a `job` field. Now that matching is a real job it has a job id of its own, so it also
-/// has an event of its own — discriminating two job families by a missing field does not
-/// survive both of them having one.
-#[cfg(feature = "faces")]
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct FacesMatchProgressEvent {
-    pub done: usize,
-    pub total: usize,
-    pub phase: &'static str,
-    pub job: u64,
-}
-
-/// Terminal event payload for `faces:match_done`.
-///
-/// The pipeline counters live here rather than in the command's return value: the command
-/// returns as soon as the job has *started*, so this event is the run's actual result, not
-/// a progress notification. `aborted` says why `outcome` may be short.
-#[cfg(feature = "faces")]
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct FacesMatchDone {
-    pub ok: bool,
-    pub outcome: Option<crate::plugins::faces::MatchOutcome>,
-    pub aborted: bool,
-    pub job: u64,
-    pub error: Option<String>,
-}
-
 /// Claim ownership of the face-matching job: snapshot the catalog, allocate the job id,
 /// trip the previous match, install this job's abort flag and claim the status slot as ONE
 /// transition, holding catalog -> abort -> slot throughout.
@@ -529,10 +457,7 @@ pub async fn faces_run_matching(app: AppHandle, state: State<'_, AppState>) -> R
         let clear_job_slot = || job_slot.clear();
 
         let fail = |app: &AppHandle, error: String| {
-            let _ = app.emit(
-                "faces:match_done",
-                FacesMatchDone { ok: false, outcome: None, aborted: false, job, error: Some(error) },
-            );
+            let _ = app.send(CoreEvent::FacesMatchDone(FacesMatchDone { ok: false, outcome: None, aborted: false, job, error: Some(error) }));
         };
 
         // Secondary connection — never contends with the primary's UI reads.
@@ -578,10 +503,7 @@ pub async fn faces_run_matching(app: AppHandle, state: State<'_, AppState>) -> R
                     total,
                     phase: phase.label(),
                 });
-                let _ = app.emit(
-                    "faces:match_progress",
-                    FacesMatchProgressEvent { done, total, phase: phase.label(), job },
-                );
+                let _ = app.send(CoreEvent::FacesMatchProgress(FacesMatchProgressEvent { done, total, phase: phase.label(), job }));
             }
             true
         };
@@ -592,9 +514,7 @@ pub async fn faces_run_matching(app: AppHandle, state: State<'_, AppState>) -> R
 
         // Clear the slot before the terminal event, and only if this job still owns it.
         clear_job_slot();
-        let _ = app.emit(
-            "faces:match_done",
-            match result {
+        let _ = app.send(CoreEvent::FacesMatchDone(match result {
                 Ok(outcome) => {
                     FacesMatchDone { ok: !aborted, outcome: Some(outcome), aborted, job, error: None }
                 }
@@ -605,8 +525,7 @@ pub async fn faces_run_matching(app: AppHandle, state: State<'_, AppState>) -> R
                     job,
                     error: Some(e.to_string()),
                 },
-            },
-        );
+            }));
     });
 
     Ok(job)

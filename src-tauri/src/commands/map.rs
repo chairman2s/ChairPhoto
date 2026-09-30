@@ -5,7 +5,7 @@
 
 use super::*;
 use serde::Serialize;
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, State};
 
 /// Return every stored geofence.
 #[cfg(feature = "map")]
@@ -391,16 +391,6 @@ pub struct GeocodeAllSummary {
     pub skipped: usize,
 }
 
-/// Progress event payload for `geocode_all_to_iptc`, emitted as `geocode:progress`.
-#[cfg(feature = "map")]
-#[derive(Debug, Serialize, Clone)]
-#[serde(rename_all = "camelCase")]
-pub struct GeocodeProgress {
-    pub done: usize,
-    pub total: usize,
-    pub filled: usize,
-}
-
 /// Reverse-geocode **all** photos that have GPS coordinates and at least one empty
 /// IPTC location field (city / state / country / country_code).
 ///
@@ -550,10 +540,7 @@ pub async fn geocode_all_to_iptc(
         }
 
         done += 1;
-        let _ = app.emit(
-            "geocode:progress",
-            GeocodeProgress { done, total, filled: filled_count },
-        );
+        let _ = app.send(CoreEvent::GeocodeProgress(GeocodeProgress { done, total, filled: filled_count }));
     }
 
     Ok(GeocodeAllSummary {

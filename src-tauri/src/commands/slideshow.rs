@@ -4,7 +4,7 @@
 
 use super::*;
 use std::path::{Path, PathBuf};
-use tauri::{AppHandle, Emitter, Manager};
+use tauri::{AppHandle, Manager};
 
 /// Slideshow render options as sent by the frontend (serde camelCase). Mirrors the engine's
 /// [`crate::slideshow::SlideshowOptions`] and the dialog (docs/slideshow.md → Options):
@@ -29,16 +29,6 @@ pub struct SlideshowOptionsDto {
     pub width: u32,
     /// Output height in pixels (from the aspect/resolution preset).
     pub height: u32,
-}
-
-/// Progress event payload for slideshow encoding, emitted as `slideshow:progress`. `done`/
-/// `total` are raw ffmpeg output-frame counts (mirrors `import:progress`'s shape).
-#[cfg(feature = "slideshow")]
-#[derive(Clone, serde::Serialize)]
-#[serde(rename_all = "camelCase")]
-struct SlideshowProgress {
-    done: u32,
-    total: u32,
 }
 
 /// A destination path that doesn't already exist (`slideshow.mp4`, then `slideshow (2).mp4`,
@@ -179,7 +169,7 @@ pub async fn make_slideshow(
             &engine_opts,
             &dest_for_write,
             |done, total| {
-                let _ = app.emit("slideshow:progress", SlideshowProgress { done, total });
+                let _ = app.send(CoreEvent::SlideshowProgress(SlideshowProgress { done, total }));
             },
         );
 

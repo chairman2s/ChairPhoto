@@ -15,6 +15,7 @@
 //! Runs on a dedicated catalog connection (like scans) so the shared connection keeps
 //! serving reads while an interactive edit session is open. See the approved plan.
 
+use crate::app::{CoreEvent, EventSink};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -22,7 +23,7 @@ use std::time::{Duration, Instant};
 
 use crate::catalog::Catalog;
 use crate::commands::AppState;
-use tauri::{AppHandle, Emitter, Manager, Runtime, State};
+use tauri::{AppHandle, Manager, Runtime, State};
 
 /// A supported external develop editor and its default binaries.
 struct Editor {
@@ -214,16 +215,13 @@ fn run_gui_watching_ai_outputs<R: Runtime>(
 
 #[derive(Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
-struct DevelopProgress {
-    phase: String, // waiting | rendering | stacked | done | nochange | error
-    editor: String,
+pub struct DevelopProgress {
+    pub phase: String, // waiting | rendering | stacked | done | nochange | error
+    pub editor: String,
 }
 
 fn emit<R: Runtime>(app: &AppHandle<R>, phase: &str, editor: &str) {
-    let _ = app.emit(
-        "develop:progress",
-        DevelopProgress { phase: phase.into(), editor: editor.into() },
-    );
+    let _ = app.send(CoreEvent::DevelopProgress(DevelopProgress { phase: phase.into(), editor: editor.into() }));
 }
 
 #[derive(serde::Serialize)]

@@ -8,7 +8,7 @@ use super::*;
 use std::sync::atomic::Ordering;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, State};
 
 /// The reconcile queue — storage ops deferred until the NAS is reachable.
 #[tauri::command(async)]
@@ -570,31 +570,6 @@ pub async fn summarize_pending_identity(
 
 // ── The identity repair job (#34) ────────────────────────────────────────────
 
-/// Progress event for `identity:repair_progress`. Carries the job id so the UI can drop a
-/// superseded pass's stragglers.
-#[derive(Debug, Clone, serde::Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct IdentityRepairProgress {
-    pub done: usize,
-    pub total: usize,
-    pub job: u64,
-}
-
-/// Terminal event for `identity:repair_done`.
-///
-/// The summary carries `aborted` and `total` itself, so a pass stopped by a Cancel or a
-/// catalog switch reports partial counters that say they are partial rather than reading as
-/// a finished result. `ok: false` with an `error` is the other terminal shape — a pass that
-/// could not run at all.
-#[derive(Debug, Clone, serde::Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct IdentityRepairDone {
-    pub ok: bool,
-    pub job: u64,
-    pub summary: crate::catalog::IdentityRepairSummary,
-    pub error: Option<String>,
-}
-
 /// How often the pass emits `identity:repair_progress`.
 ///
 /// Time-based, not every-Nth-row: rows differ by four orders of magnitude in cost (a local
@@ -661,10 +636,7 @@ pub async fn repair_pending_identity(
         // Always BEFORE the terminal event: see `JobSlot::clear`.
         let finish = |summary: crate::catalog::IdentityRepairSummary, error: Option<String>| {
             slot.clear();
-            let _ = app.emit(
-                "identity:repair_done",
-                IdentityRepairDone { ok: error.is_none(), job, summary, error },
-            );
+            let _ = app.send(CoreEvent::IdentityRepairDone(IdentityRepairDone { ok: error.is_none(), job, summary, error }));
         };
 
         // Secondary connection — never contends with the primary's UI reads.
@@ -691,10 +663,7 @@ pub async fn repair_pending_identity(
             }
             last_emit = Some(Instant::now());
             let (done, total) = (s.done(), s.total);
-            let _ = emit_app.emit(
-                "identity:repair_progress",
-                IdentityRepairProgress { done, total, job },
-            );
+            let _ = emit_app.send(CoreEvent::IdentityRepairProgress(IdentityRepairProgress { done, total, job }));
             // A superseded pass reaches here routinely — a newer start trips its flag, but
             // the row it is already on finishes first. `JobSlot::publish` is the shared
             // guard that stops it overwriting the newer pass's slot.

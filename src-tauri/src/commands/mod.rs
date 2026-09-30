@@ -116,6 +116,21 @@ pub use smugmug::*;
 pub use storage::*;
 pub use tags::*;
 
+/// The Tauri shell's [`EventSink`]: each [`CoreEvent`] becomes the webview event of the
+/// same name, with its payload serialized as its own type (so the wire format is exactly
+/// what the frontend's listeners were written against).
+impl<R: tauri::Runtime> EventSink for tauri::AppHandle<R> {
+    fn send(&self, event: CoreEvent) {
+        struct Emit<'a, R: tauri::Runtime>(&'a tauri::AppHandle<R>);
+        impl<R: tauri::Runtime> crate::app::events::EventVisitor for Emit<'_, R> {
+            fn visit<T: serde::Serialize + Clone>(&self, name: &'static str, payload: &T) {
+                let _ = tauri::Emitter::emit(self.0, name, payload);
+            }
+        }
+        event.visit(&Emit(self));
+    }
+}
+
 #[cfg(test)]
 mod thread_rules {
     /// Source scan: every `#[tauri::command]` in `commands/` whose body takes the catalog

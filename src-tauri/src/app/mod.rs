@@ -13,7 +13,10 @@ use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, OnceLock};
 
+pub mod events;
 pub mod jobs;
+
+pub use events::*;
 
 pub use jobs::JobRegistry;
 // Every family with a queryable status slot needs these. Unconditional since #34: identity

@@ -6,7 +6,7 @@
 use super::*;
 use serde::Serialize;
 use std::sync::Mutex;
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, State};
 
 /// Read the `smarttags.model_path` setting under a brief catalog lock, treating "no catalog
 /// open" the same as "setting unset" (→ the pinned default path applies). Shared by the two
@@ -31,17 +31,6 @@ pub async fn smarttags_model_status(
     Ok(crate::plugins::smarttags::models::status(setting.as_deref()))
 }
 
-/// Download progress event payload for `smarttags:download_progress`. Sent approximately
-/// every 1 MiB (or 1% of total) so the UI can render a live progress bar without event
-/// spam. `total` is `None` when the server omitted `Content-Length`.
-#[cfg(feature = "smarttags")]
-#[derive(Debug, Clone, serde::Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SmarttagsDownloadProgressEvent {
-    pub done: u64,
-    pub total: Option<u64>,
-}
-
 /// Download the pinned default CLIP model (once) with checksum verification, returning the
 /// post-download status. Safe to re-invoke — an already-present verified model is a no-op.
 /// A **custom** `smarttags.model_path` is never fetched; the command errors so the user
@@ -60,10 +49,7 @@ pub async fn smarttags_download_model(
     // Clone app handle so the closure can outlive this stack frame inside `ensure`.
     let app2 = app.clone();
     let progress_cb: Box<dyn Fn(u64, Option<u64>) + Send + Sync> = Box::new(move |done, total| {
-        let _ = app2.emit(
-            "smarttags:download_progress",
-            SmarttagsDownloadProgressEvent { done, total },
-        );
+        let _ = app2.send(CoreEvent::SmarttagsDownloadProgress(SmarttagsDownloadProgressEvent { done, total }));
     });
     models::ensure(setting.as_deref(), Some(progress_cb.as_ref()))
         .await
@@ -72,31 +58,6 @@ pub async fn smarttags_download_model(
 }
 
 // ── H7b: Smart Tagging embedding-index job ───────────────────────────────────
-
-/// Progress event payload for `smarttags:progress`. Carries the job id so the UI can
-/// ignore stragglers from a superseded run.
-#[cfg(feature = "smarttags")]
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct SmarttagsProgressEvent {
-    pub done: usize,
-    pub total: usize,
-    pub job: u64,
-}
-
-/// Terminal event payload for `smarttags:index_done`. Honest breakdown: `offline` /
-/// `failed` / `aborted` say why `done < total` instead of leaving the UI to guess.
-#[cfg(feature = "smarttags")]
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct SmarttagsIndexDone {
-    pub ok: bool,
-    pub done: usize,
-    pub total: usize,
-    pub offline: usize,
-    pub failed: usize,
-    pub aborted: bool,
-    pub job: u64,
-    pub error: Option<String>,
-}
 
 /// Claim ownership of the Smart Tagging index job: snapshot the catalog, allocate the job
 /// id, trip the previous job, install this job's abort flag and claim the status slot as
@@ -186,9 +147,7 @@ pub async fn smarttags_index_photos(
             Err(e) => {
                 eprintln!("smarttags_index: couldn't open secondary connection: {e}");
                 clear_job_slot();
-                let _ = app.emit(
-                    "smarttags:index_done",
-                    SmarttagsIndexDone {
+                let _ = app.send(CoreEvent::SmarttagsIndexDone(SmarttagsIndexDone {
                         ok: false,
                         done: 0,
                         total: 0,
@@ -197,8 +156,7 @@ pub async fn smarttags_index_photos(
                         aborted: false,
                         job,
                         error: Some(format!("couldn't open catalog connection: {e}")),
-                    },
-                );
+                    }));
                 return;
             }
         };
@@ -233,10 +191,7 @@ pub async fn smarttags_index_photos(
         let emit_app_clone = emit_app.clone();
         let job_slot_clone = job_slot.clone();
         let emit_fn = move |p: indexer::SmarttagsProgress| {
-            let _ = emit_app_clone.emit(
-                "smarttags:progress",
-                SmarttagsProgressEvent { done: p.done, total: p.total, job },
-            );
+            let _ = emit_app_clone.send(CoreEvent::SmarttagsProgress(SmarttagsProgressEvent { done: p.done, total: p.total, job }));
             // Update the job status so UI can query it on remount — but never overwrite a
             // newer job's slot. Starting a new run trips this one's abort flag, and the
             // indexer emits progress for the current photo before it checks that flag
@@ -267,9 +222,7 @@ pub async fn smarttags_index_photos(
         clear_job_slot();
         match result {
             Ok(o) => {
-                let _ = emit_app.emit(
-                    "smarttags:index_done",
-                    SmarttagsIndexDone {
+                let _ = emit_app.send(CoreEvent::SmarttagsIndexDone(SmarttagsIndexDone {
                         ok: true,
                         done: o.done,
                         total: o.total,
@@ -278,14 +231,11 @@ pub async fn smarttags_index_photos(
                         aborted: o.aborted,
                         job,
                         error: None,
-                    },
-                );
+                    }));
             }
             Err(e) => {
                 eprintln!("smarttags_index: job failed: {e}");
-                let _ = emit_app.emit(
-                    "smarttags:index_done",
-                    SmarttagsIndexDone {
+                let _ = emit_app.send(CoreEvent::SmarttagsIndexDone(SmarttagsIndexDone {
                         ok: false,
                         done: 0,
                         total: 0,
@@ -294,8 +244,7 @@ pub async fn smarttags_index_photos(
                         aborted: false,
                         job,
                         error: Some(e.to_string()),
-                    },
-                );
+                    }));
             }
         }
     });

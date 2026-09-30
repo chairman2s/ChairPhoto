@@ -5,29 +5,7 @@
 //! commands are the cancellable backfill for photos imported before that hook existed.
 
 use super::*;
-use tauri::{AppHandle, Emitter, State};
-
-/// Progress event payload for `sharpness:progress`. Carries the job id so the UI can
-/// ignore stragglers from a superseded run.
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct SharpnessProgressEvent {
-    pub done: usize,
-    pub total: usize,
-    pub job: u64,
-}
-
-/// Terminal event for the sharpness-indexing job.
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct SharpnessIndexDone {
-    pub ok: bool,
-    pub done: usize,
-    pub total: usize,
-    pub failed: usize,
-    pub offline: usize,
-    pub aborted: bool,
-    pub job: u64,
-    pub error: Option<String>,
-}
+use tauri::{AppHandle, State};
 
 /// Begin (or resume) the background sharpness-indexing job. Opens its own secondary
 /// catalog connection so the UI thread is never blocked. Scoring runs on the ~1024–2048px
@@ -68,9 +46,7 @@ pub async fn index_sharpness(
             Ok(c) => c,
             Err(e) => {
                 eprintln!("sharpness_index: couldn't open secondary connection: {e}");
-                let _ = app.emit(
-                    "sharpness:index_done",
-                    SharpnessIndexDone {
+                let _ = app.send(CoreEvent::SharpnessIndexDone(SharpnessIndexDone {
                         ok: false,
                         done: 0,
                         total: 0,
@@ -79,8 +55,7 @@ pub async fn index_sharpness(
                         aborted: false,
                         job,
                         error: Some(format!("couldn't open catalog connection: {e}")),
-                    },
-                );
+                    }));
                 return;
             }
         };
@@ -94,10 +69,7 @@ pub async fn index_sharpness(
         // Progress callback: emit a Tauri event after each scored photo.
         let emit_app = app.clone();
         let emit_fn = move |p: sharpness_indexer::SharpnessProgress| {
-            let _ = emit_app.emit(
-                "sharpness:progress",
-                SharpnessProgressEvent { done: p.done, total: p.total, job },
-            );
+            let _ = emit_app.send(CoreEvent::SharpnessProgress(SharpnessProgressEvent { done: p.done, total: p.total, job }));
         };
 
         let resolve_fn = |photo_id: i64| {
@@ -130,9 +102,7 @@ pub async fn index_sharpness(
 
         match result {
             Ok(o) => {
-                let _ = app.emit(
-                    "sharpness:index_done",
-                    SharpnessIndexDone {
+                let _ = app.send(CoreEvent::SharpnessIndexDone(SharpnessIndexDone {
                         ok: true,
                         done: o.done,
                         total: o.total,
@@ -141,14 +111,11 @@ pub async fn index_sharpness(
                         aborted: o.aborted,
                         job,
                         error: None,
-                    },
-                );
+                    }));
             }
             Err(e) => {
                 eprintln!("sharpness_index: job failed: {e}");
-                let _ = app.emit(
-                    "sharpness:index_done",
-                    SharpnessIndexDone {
+                let _ = app.send(CoreEvent::SharpnessIndexDone(SharpnessIndexDone {
                         ok: false,
                         done: 0,
                         total: 0,
@@ -157,8 +124,7 @@ pub async fn index_sharpness(
                         aborted: false,
                         job,
                         error: Some(e.to_string()),
-                    },
-                );
+                    }));
             }
         }
     });
@@ -175,28 +141,6 @@ pub async fn sharpness_index_cancel(state: State<'_, AppState>) -> Result<(), St
 }
 
 // ── H15a: Perceptual-hash index job ──────────────────────────────────────────
-
-/// Progress event payload for `phash:progress`. Carries the job id so the UI can ignore
-/// stragglers from a superseded run.
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct PhashProgressEvent {
-    pub done: usize,
-    pub total: usize,
-    pub job: u64,
-}
-
-/// Terminal event for the perceptual-hash indexing job.
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct PhashIndexDone {
-    pub ok: bool,
-    pub done: usize,
-    pub total: usize,
-    pub failed: usize,
-    pub offline: usize,
-    pub aborted: bool,
-    pub job: u64,
-    pub error: Option<String>,
-}
 
 /// Begin (or resume) the background perceptual-hash indexing job (H15a). Opens its own
 /// secondary catalog connection so the UI thread is never blocked. Hashing runs on the
@@ -228,9 +172,7 @@ pub async fn index_phashes(app: AppHandle, state: State<'_, AppState>) -> Result
             Ok(c) => c,
             Err(e) => {
                 eprintln!("phash_index: couldn't open secondary connection: {e}");
-                let _ = app.emit(
-                    "phash:index_done",
-                    PhashIndexDone {
+                let _ = app.send(CoreEvent::PhashIndexDone(PhashIndexDone {
                         ok: false,
                         done: 0,
                         total: 0,
@@ -239,8 +181,7 @@ pub async fn index_phashes(app: AppHandle, state: State<'_, AppState>) -> Result
                         aborted: false,
                         job,
                         error: Some(format!("couldn't open catalog connection: {e}")),
-                    },
-                );
+                    }));
                 return;
             }
         };
@@ -249,10 +190,7 @@ pub async fn index_phashes(app: AppHandle, state: State<'_, AppState>) -> Result
 
         let emit_app = app.clone();
         let emit_fn = move |p: phash_indexer::PhashProgress| {
-            let _ = emit_app.emit(
-                "phash:progress",
-                PhashProgressEvent { done: p.done, total: p.total, job },
-            );
+            let _ = emit_app.send(CoreEvent::PhashProgress(PhashProgressEvent { done: p.done, total: p.total, job }));
         };
 
         let resolve_fn =
@@ -270,9 +208,7 @@ pub async fn index_phashes(app: AppHandle, state: State<'_, AppState>) -> Result
 
         match result {
             Ok(o) => {
-                let _ = app.emit(
-                    "phash:index_done",
-                    PhashIndexDone {
+                let _ = app.send(CoreEvent::PhashIndexDone(PhashIndexDone {
                         ok: true,
                         done: o.done,
                         total: o.total,
@@ -281,14 +217,11 @@ pub async fn index_phashes(app: AppHandle, state: State<'_, AppState>) -> Result
                         aborted: o.aborted,
                         job,
                         error: None,
-                    },
-                );
+                    }));
             }
             Err(e) => {
                 eprintln!("phash_index: job failed: {e}");
-                let _ = app.emit(
-                    "phash:index_done",
-                    PhashIndexDone {
+                let _ = app.send(CoreEvent::PhashIndexDone(PhashIndexDone {
                         ok: false,
                         done: 0,
                         total: 0,
@@ -297,8 +230,7 @@ pub async fn index_phashes(app: AppHandle, state: State<'_, AppState>) -> Result
                         aborted: false,
                         job,
                         error: Some(e.to_string()),
-                    },
-                );
+                    }));
             }
         }
     });

@@ -6,7 +6,7 @@
 use super::publishing::{upload_file_name, JobTempDir};
 use super::*;
 use std::path::{Path, PathBuf};
-use tauri::{AppHandle, Emitter, Manager};
+use tauri::{AppHandle, Manager};
 
 /// Discover LocalSend devices on the LAN. `timeout_ms` (default 2500ms) is the reply window
 /// `crate::localsend::discover` keeps open *after* the last of its burst of 3 announcements,
@@ -31,15 +31,6 @@ pub async fn localsend_discover(
 pub struct SendResult {
     pub sent: usize,
     pub failed: usize,
-}
-
-/// Progress event payload for a LocalSend transfer, emitted as `localsend:progress`.
-#[cfg(feature = "localsend")]
-#[derive(Clone, serde::Serialize)]
-#[serde(rename_all = "camelCase")]
-struct LocalSendProgress {
-    done: usize,
-    total: usize,
 }
 
 /// Send the selected photos (the chosen version) to a LocalSend `device`. Renders each photo
@@ -79,7 +70,7 @@ pub async fn localsend_send(
     let send_paths = paths.clone();
     let result = crate::app::runtime().spawn(async move {
         crate::localsend::send_files(&device, &send_paths, pin.as_deref(), |done, total| {
-            let _ = app_for_progress.emit("localsend:progress", LocalSendProgress { done, total });
+            let _ = app_for_progress.send(CoreEvent::LocalSendProgress(LocalSendProgress { done, total }));
         })
         .await
     })

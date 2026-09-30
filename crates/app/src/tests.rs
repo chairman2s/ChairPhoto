@@ -389,16 +389,26 @@ fn every_unported_action_reports_its_ticket(cx: &mut TestAppContext) {
 fn the_command_pill_and_browser_edit_the_scope(cx: &mut TestAppContext) {
     let dir = TempDir::new("pill");
     let app = start(cx);
-    open_catalog(&app, &dir, cx);
+    // Two unrated, unpicked photos: the whole library counts 2, and Picks counts 0, so a
+    // count that was not re-read after the click stays visibly at 2.
+    open_catalog_with_photos(&app, &dir, 2, cx);
     let revision = app.wired.shell.read_with(cx, |s, _| s.library.query_revision());
+    assert_eq!(app.wired.shell.read_with(cx, |s, _| s.scope_info.total), Some(2));
 
+    click(&app, "filter-Unrated", cx);
+    assert_eq!(app.wired.shell.read_with(cx, |s, _| s.scope_info.total), Some(2), "both are unrated");
     click(&app, "filter-Picks", cx);
-    click(&app, "label-Red", cx);
     app.wired.shell.read_with(cx, |s, _| {
         assert_eq!(s.library.scope().filter, CullingFilter::Pick);
-        assert_eq!(s.library.scope().labels, vec!["Red".to_string()]);
         assert!(s.library.query_revision() > revision);
         assert_eq!(s.scope_info.total, Some(0), "the filtered count was re-read");
+    });
+    click(&app, "filter-All", cx);
+    assert_eq!(app.wired.shell.read_with(cx, |s, _| s.scope_info.total), Some(2), "and back");
+    click(&app, "label-Red", cx);
+    app.wired.shell.read_with(cx, |s, _| {
+        assert_eq!(s.library.scope().labels, vec!["Red".to_string()]);
+        assert_eq!(s.scope_info.total, Some(0), "no photo carries the Red label");
     });
 
     app.wired.shell.update(cx, |s, cx| s.update_scope(cx, |l| l.select_album(Some(7))));

@@ -53,8 +53,11 @@
 //! the culling shortcut relied on it: rate, let the refresh land, *then* step — over the rows
 //! it started from, not the refreshed ones the rated photo may have been filtered out of.
 //! Here [`LibrarySession::step_active`] steps over the current rows, and
-//! [`LibrarySession::step_active_over`] over an id snapshot the caller took
-//! ([`LibrarySession::photo_ids`]) before the refresh.
+//! [`LibrarySession::step_active_over`] over a [`StepSnapshot`] the caller took
+//! ([`LibrarySession::step_snapshot`]) before the refresh. The snapshot holds the active
+//! photo as well as the rows, because the TS closure captured both: two culling actions
+//! started on the same photo must both step from *that* photo, not from wherever the first
+//! one's step left the selection.
 //!
 //! ### Other semantic choices
 //!
@@ -249,6 +252,14 @@ impl Default for LibrarySession {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// What [`LibrarySession::step_active_over`] steps over: the rows and the active photo at
+/// the moment a culling action started (see the module docs).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StepSnapshot {
+    pub rows: Vec<i64>,
+    pub active_id: Option<i64>,
 }
 
 impl LibrarySession {
@@ -548,13 +559,21 @@ impl LibrarySession {
     /// Move the active photo `delta` rows through the result, stopping at either end.
     /// `extend` grows the Shift range instead of replacing the selection.
     pub fn step_active(&mut self, delta: isize, extend: bool) {
-        let rows = self.photo_ids();
-        self.step_active_over(&rows, delta, extend);
+        let snapshot = self.step_snapshot();
+        self.step_active_over(&snapshot, delta, extend);
     }
 
-    /// [`Self::step_active`] over an id snapshot taken before a refresh (see module docs).
-    pub fn step_active_over(&mut self, rows: &[i64], delta: isize, extend: bool) {
-        let Some(active_id) = self.active_id else { return };
+    /// The rows and the active photo as they are now — what a culling action captures before
+    /// it lets a refresh land, then steps over with [`Self::step_active_over`].
+    pub fn step_snapshot(&self) -> StepSnapshot {
+        StepSnapshot { rows: self.photo_ids(), active_id: self.active_id }
+    }
+
+    /// [`Self::step_active`] from a [`StepSnapshot`] taken before a refresh (see module
+    /// docs): both the rows and the photo to step from are the snapshot's.
+    pub fn step_active_over(&mut self, snapshot: &StepSnapshot, delta: isize, extend: bool) {
+        let rows = snapshot.rows.as_slice();
+        let Some(active_id) = snapshot.active_id else { return };
         // An off-grid stack child is in no row, so `from` is -1 and a forward step lands on
         // the first row.
         let from = rows.iter().position(|&r| r == active_id).map_or(-1, |i| i as isize);
@@ -1070,7 +1089,7 @@ mod tests {
     fn steps_over_the_rows_it_started_from_after_a_refresh_drops_the_active_photo() {
         let mut s = session_with(&[1, 2, 3]);
         s.select(2, SelectMods::default());
-        let before = s.photo_ids();
+        let before = s.step_snapshot();
         // Rating 2 as a reject under a "pick" filter drops it from the refreshed rows.
         refresh_with(&mut s, &[1, 3]);
         s.step_active_over(&before, 1, false);
@@ -1079,5 +1098,20 @@ mod tests {
         s.select_quiet(2);
         s.step_active(1, false);
         assert_eq!(s.selection().active_id, Some(1));
+    }
+
+    // New (Codex review of gpui #102): two culling actions started on the same photo both
+    // step from it, as the TS closures did — the second must not advance past an unjudged
+    // photo because the first already moved the selection.
+    #[test]
+    fn overlapping_culls_started_on_one_photo_both_step_from_it() {
+        let mut s = session_with(&[1, 2, 3]);
+        s.select(1, SelectMods::default());
+        let first = s.step_snapshot();
+        let second = s.step_snapshot();
+        s.step_active_over(&first, 1, false);
+        assert_eq!(s.selection().active_id, Some(2));
+        s.step_active_over(&second, 1, false);
+        assert_eq!(s.selection().active_id, Some(2), "must not skip to 3");
     }
 }

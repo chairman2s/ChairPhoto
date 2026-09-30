@@ -124,6 +124,73 @@ fn a_rotated_photo_rotates_pixels_and_keeps_the_same_persistent_thumb() {
     assert_eq!((decoded.width(), decoded.height()), image::load_from_memory(&bytes).unwrap().to_rgb8().dimensions());
 }
 
+/// Every rotation on the preview and zoom tiers: `render_image` is the cached tier's JPEG,
+/// decoded and rotated as pixels, with the protocol's dimensions.
+#[test]
+fn rotated_preview_and_zoom_rotate_the_cached_pixels() {
+    let dir = Fixture::new("media-rot-tiers");
+    let (state, ids) = catalog_with(&dir, &["t.jpg"], |root, n| {
+        write_jpeg(root, n, 2600, 1300);
+    });
+    let id = ids[0];
+    let abs = dir.join("photos").join("t.jpg");
+    for degrees in [90, 180, 270] {
+        state.catalog.lock().unwrap().as_ref().unwrap().set_photo_rotation(id, degrees).unwrap();
+        for kind in [ImageKind::Preview, ImageKind::Zoom] {
+            let cached = match kind {
+                ImageKind::Preview => chairphoto_core::thumbnails::preview_bytes(&abs).unwrap(),
+                _ => chairphoto_core::thumbnails::zoom_bytes(&abs).unwrap(),
+            };
+            let plain = image::load_from_memory(&cached).unwrap();
+            let expected = match degrees {
+                90 => plain.rotate90(),
+                180 => plain.rotate180(),
+                _ => plain.rotate270(),
+            }
+            .to_rgb8();
+            let decoded = render_image(&state, JobKey::photo(id, kind)).unwrap().image.to_rgb8();
+            assert_eq!(decoded, expected, "{kind:?} at {degrees}°");
+            let served = decode(&render_bytes(&state, JobKey::photo(id, kind)).unwrap());
+            assert_eq!(decoded.dimensions(), served.dimensions(), "{kind:?} at {degrees}°");
+        }
+    }
+}
+
+/// A rotated photo with a cover version: the thumbnail is the cover render, rotated — not
+/// the plain thumbnail — with the protocol's dimensions.
+#[cfg(feature = "edit")]
+#[test]
+fn a_rotated_cover_thumbnail_is_the_cover_render_rotated() {
+    let dir = Fixture::new("media-rot-cover");
+    let (state, ids) = catalog_with(&dir, &["c.jpg"], |root, n| {
+        write_jpeg(root, n, 1600, 1000);
+    });
+    let id = ids[0];
+    let record = r#"{"tone": {"ev": 1.0, "contrast": 0.3}, "vignette": -0.5}"#;
+    {
+        let guard = state.catalog.lock().unwrap();
+        let catalog = guard.as_ref().unwrap();
+        let version = catalog.create_version(id, "Cover").unwrap();
+        catalog.set_version_edit(version, record).unwrap();
+        catalog.set_cover_version(id, Some(version)).unwrap();
+        catalog.set_photo_rotation(id, 270).unwrap();
+    }
+    let abs = dir.join("photos").join("c.jpg");
+    let json = state.catalog.lock().unwrap().as_ref().unwrap().cover_of(id).unwrap().unwrap().2;
+    let cover = chairphoto_core::plugins::edit::cover::cover_thumb(&abs, id, &json).unwrap();
+    let expected = image::load_from_memory(&cover).unwrap().rotate270().to_rgb8();
+
+    let decoded = render_image(&state, JobKey::photo(id, ImageKind::Thumb)).unwrap().image.to_rgb8();
+    assert_eq!(decoded, expected);
+    let plain = image::load_from_memory(&chairphoto_core::thumbnails::thumbnail_bytes(&abs).unwrap())
+        .unwrap()
+        .rotate270()
+        .to_rgb8();
+    assert_ne!(decoded, plain, "the cover's look, not the plain thumbnail");
+    let served = decode(&render_bytes(&state, JobKey::photo(id, ImageKind::Thumb)).unwrap());
+    assert_eq!(decoded.dimensions(), served.dimensions());
+}
+
 /// Original gone: the thumbnail tier falls back to the persistent copy, as the protocol does;
 /// preview has no fallback and errors.
 #[test]

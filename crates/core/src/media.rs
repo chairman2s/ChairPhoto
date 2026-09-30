@@ -16,6 +16,12 @@ use crate::thumbnails::{preview_bytes, thumbnail_bytes, zoom_bytes};
 /// The runner [`app::boot`](crate::app::boot) injects into the
 /// [`ImagePool`](crate::image_pool::ImagePool); the Tauri protocol's no-pool fallback calls it
 /// directly.
+///
+/// It matches on [`JobKey`], whose `Edit` variant exists only with this crate's `edit` feature,
+/// so the match must live in this crate under that same gate. In a front end it would be gated
+/// by the front end's `edit` instead, and Cargo's feature unification can turn the core's on
+/// while the front end's is off (another workspace member asked for it) — a non-exhaustive
+/// match that fails to compile.
 pub fn render_bytes(state: &AppState, key: JobKey) -> Result<Vec<u8>, String> {
     let (id, kind) = match key {
         JobKey::Photo { id, kind } => (id, kind),

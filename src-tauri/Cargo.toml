@@ -25,6 +25,17 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 # core crate's feature of the same name, where the backend and its dependencies live — see
 # `crates/core/Cargo.toml` for what each pulls in. The shell's own code only registers (or not)
 # the matching commands.
+#
+# The core can have MORE features on than the shell. Cargo unifies a dependency's features
+# across everything in one build, so building the shell together with the GPUI app
+# (`crates/app`, which forwards the same names) enables on the core whatever either asked for.
+# So a shell `#[cfg(feature = "…")]` must never assume the core's feature is off when the
+# shell's is: in particular, never match exhaustively on a core enum whose variants the core
+# gates (`image_pool::JobKey::Edit`, `CoreEvent`'s plugin events) under the shell's own cfg —
+# such matches belong in the core, next to the gate (the pool runner, `media::render_bytes`,
+# lives there for this reason). Check with the core's features all on and the shell's off:
+#   cargo check -p chairphoto --all-targets --no-default-features \
+#     --features chairphoto-core/ai,chairphoto-core/edit,chairphoto-core/raw,…
 [features]
 default = ["ai", "edit", "raw", "instagram", "collage", "slideshow", "localsend", "map", "faces", "smarttags", "module-fetch"]
 ai = ["chairphoto-core/ai"]

@@ -9,8 +9,9 @@
 // compiles for those features too — with a narrower set of imports.
 #[cfg(any(feature = "flickr", feature = "smugmug"))]
 use super::*;
-// `Path` is used by the upload-name helpers and by the sweep, so it follows the wider set.
-#[cfg(any(feature = "flickr", feature = "smugmug", feature = "instagram", feature = "localsend"))]
+// `Path` is used by the upload-name helpers (the sweep that also took one moved to the core's
+// `upload_sweep`), so it follows their set — Instagram renders a fixed name.
+#[cfg(any(feature = "flickr", feature = "smugmug", feature = "localsend"))]
 use std::path::Path;
 use std::path::PathBuf;
 // The sweep that reclaims stranded job directories lives in the core, which runs it at every

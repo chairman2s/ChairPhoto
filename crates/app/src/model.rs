@@ -99,7 +99,10 @@ pub struct AppModel {
     pub deep_link: Option<DeepLinkTarget>,
     /// Links that arrived before the catalog was open, applied once it is (React's `ready`).
     pending_links: Vec<DeepLink>,
-    /// Bumped by every link resolution; only the newest link's result lands.
+    /// The link [`AppModel::open_deep_link`] is resolving now, if any.
+    in_flight_link: Option<DeepLink>,
+    /// Bumped by every link resolution and by every catalog switch; only the newest
+    /// resolution's result lands, and never one started against a catalog since switched away.
     link_generation: u64,
 }
 
@@ -118,6 +121,7 @@ impl AppModel {
             catalog_epoch: 0,
             deep_link: None,
             pending_links: Vec::new(),
+            in_flight_link: None,
             link_generation: 0,
         }
     }
@@ -228,13 +232,15 @@ impl AppModel {
         self.link_generation += 1;
         let generation = self.link_generation;
         let state = self.state.clone();
+        self.in_flight_link = Some(link.clone());
         let read = cx.background_executor().spawn(async move { resolve_link(&state, &link) });
         cx.spawn(async move |this, cx| {
             let resolved = read.await;
             this.update(cx, |m, cx| {
                 if m.link_generation != generation {
-                    return; // superseded
+                    return; // superseded, or the catalog was switched
                 }
+                m.in_flight_link = None;
                 match resolved {
                     Ok(target) => {
                         m.status = link_status(&target).into();
@@ -250,10 +256,32 @@ impl AppModel {
         .detach();
     }
 
+    /// A catalog switch: every photo and tag id from before it names something else now.
+    ///
+    /// - The resolved [`deep_link`](Self::deep_link) is dropped: its ids are the old catalog's.
+    /// - A resolution still in flight can no longer land (`link_generation` moves on); it
+    ///   may have read either catalog.
+    /// - **Unresolved links carry over**: the in-flight one goes back to `pending_links`
+    ///   with those already waiting, and all resolve against the new catalog once its
+    ///   refresh lands. A `chairphoto://` URL names a photo or tag by uuid, not a catalog;
+    ///   the user asked the app to show it, and the catalog the app has open when it can
+    ///   answer is the one to ask. Dropping them would lose a click without a word.
+    fn on_catalog_switched(&mut self) {
+        self.catalog_epoch += 1;
+        self.link_generation += 1;
+        self.deep_link = None;
+        if let Some(link) = self.in_flight_link.take() {
+            self.pending_links.insert(0, link);
+        }
+        if !self.pending_links.is_empty() {
+            self.status = "Deep link: waiting for the catalog…".into();
+        }
+    }
+
     /// A core event for this entity: note it, and refresh what it invalidates.
     pub fn on_core_event(&mut self, event: &CoreEvent, cx: &mut Context<Self>) {
         if let CoreEvent::CatalogSwitched(_) = event {
-            self.catalog_epoch += 1;
+            self.on_catalog_switched();
         }
         let invalidates = match event {
             CoreEvent::CatalogSwitched(_) => true,

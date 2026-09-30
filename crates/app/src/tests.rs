@@ -499,6 +499,69 @@ fn a_second_launch_request_from_a_worker_thread_opens_its_links(cx: &mut TestApp
     assert_eq!(model_status(&model, cx), "Deep link: 2026/a.ARW → Library (view not ported yet)");
 }
 
+/// A second catalog (its own directory) holding a photo with the same relative path; returns
+/// the photo's uuid.
+fn second_catalog(dir: &TempDir) -> (Catalog, String) {
+    let root = dir.0.join("photos-b");
+    let catalog = Catalog::open(&dir.0.join("other.chairphoto"), &root).unwrap();
+    let photo = catalog.upsert_photo(&root.join("2026/b.ARW"), None, 0, 1).unwrap();
+    (catalog, photo.uuid)
+}
+
+/// A catalog switch drops the resolved link: its photo id is the old catalog's.
+#[gpui_kit::test]
+fn a_catalog_switch_drops_the_resolved_link(cx: &mut TestAppContext) {
+    let dir = TempDir::new("link-switch");
+    let (state, model) = wired(cx);
+    let (photo_uuid, _) = catalog_with_a_photo_and_a_tag(&dir, &state);
+    model.update(cx, |m, cx| m.refresh(cx));
+    cx.run_until_parked();
+    model.update(cx, |m, cx| m.open_url(&format!("chairphoto://{photo_uuid}"), cx));
+    cx.run_until_parked();
+    model.read_with(cx, |m, _| assert!(matches!(m.deep_link, Some(DeepLinkTarget::Photo { .. }))));
+
+    let (other, _) = second_catalog(&dir);
+    *state.catalog.lock().unwrap() = Some(other);
+    model.update(cx, |m, cx| m.on_core_event(&CoreEvent::CatalogSwitched("other".into()), cx));
+    cx.run_until_parked();
+    model.read_with(cx, |m, _| assert_eq!(m.deep_link, None, "the old catalog's photo id survived the switch"));
+}
+
+/// A link still resolving when the catalog switches is neither lost nor landed from the old
+/// resolution: it waits for the new catalog and resolves there. Here the new catalog is not
+/// readable at first (state holds none while it opens), so the old resolution fails; that
+/// failure must not land, and the link must resolve once the new catalog is in.
+#[gpui_kit::test]
+fn a_link_in_flight_at_a_switch_resolves_against_the_new_catalog(cx: &mut TestAppContext) {
+    let dir = TempDir::new("link-inflight");
+    let (state, model) = wired(cx);
+    catalog_with_a_photo_and_a_tag(&dir, &state);
+    model.update(cx, |m, cx| m.refresh(cx));
+    cx.run_until_parked();
+    let (other, other_uuid) = second_catalog(&dir);
+
+    // Started against the first catalog, not yet run; then the switch begins.
+    model.update(cx, |m, cx| m.open_url(&format!("chairphoto://{other_uuid}/develop"), cx));
+    *state.catalog.lock().unwrap() = None;
+    model.update(cx, |m, cx| m.on_core_event(&CoreEvent::CatalogSwitched("other".into()), cx));
+    cx.run_until_parked();
+    // The switch's refresh found no catalog; the old resolution's error did not land.
+    assert_eq!(model_status(&model, cx), "Catalog unavailable: No catalog is open");
+    model.read_with(cx, |m, _| assert_eq!(m.deep_link, None));
+
+    *state.catalog.lock().unwrap() = Some(other);
+    model.update(cx, |m, cx| m.refresh(cx));
+    cx.run_until_parked();
+    model.read_with(cx, |m, _| match &m.deep_link {
+        Some(DeepLinkTarget::Photo { uuid, path, view, .. }) => {
+            assert_eq!(uuid, &other_uuid);
+            assert_eq!(path, "2026/b.ARW");
+            assert_eq!(*view, DeepLinkView::Develop);
+        }
+        other => panic!("the link was lost across the switch: {other:?}"),
+    });
+}
+
 /// A quit signal, delivered by the signal thread, dispatches `Quit` once — the Ctrl+Q path,
 /// whose handler in `run` calls `cx.quit()` and so the quit observers and `clean_exit`.
 #[gpui_kit::test]

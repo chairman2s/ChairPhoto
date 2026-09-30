@@ -58,6 +58,9 @@ futures = "0.3"
 # the core's dependencies.
 serde = "1"
 serde_json = "1"
+# The quit-signal handlers (`signals.rs`: sigaction, a self-pipe, `_exit`). Already in the
+# lockfile through the core and gpui.
+libc = "0.2"
 
 [dev-dependencies]
 # The headless test platform: `#[gpui_kit::test]`, `TestAppContext`, `VisualTestContext`.

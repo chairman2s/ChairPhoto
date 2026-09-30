@@ -1163,6 +1163,7 @@ dependencies = [
  "chairphoto-model",
  "futures",
  "gpui-kit",
+ "libc",
  "serde",
  "serde_json",
 ]

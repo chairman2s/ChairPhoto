@@ -5,8 +5,8 @@
 //!
 //! 0. the single-instance claim ([`single_instance`]): a second launch for the same app data
 //!    dir forwards its `chairphoto://` URLs (or just a focus request) to the running instance
-//!    and exits 0, before anything below runs; then, in a debug build, the dev
-//!    scheme-handler entry ([`desktop`]);
+//!    and exits 0, before anything below runs; then the quit-signal handlers ([`signals`])
+//!    and, in a debug build, the dev scheme-handler entry ([`desktop`]);
 //! 1. an [`AppState`] with the [`events::GpuiSink`] installed — first, so nothing the core
 //!    starts can send into the void;
 //! 2. `app::boot` — crash markers, upload sweep, Omarchy watcher, decode analyzers, image
@@ -15,13 +15,13 @@
 //!    theme (before the first window: `theme::init` switches to Light), the keymap;
 //! 4. the [`model::AppModel`] entity and the event router;
 //! 5. `app::open_default_catalog`, off the UI thread;
-//! 6. the main window, 1400×900, `app_id` `chairphoto`; then the router for second launches
-//!    ([`launch`]), and this launch's own `chairphoto://` URLs.
+//! 6. the main window, 1400×900, `app_id` `chairphoto`; then the routers for second launches
+//!    and quit signals ([`launch`]), and this launch's own `chairphoto://` URLs.
 //!
-//! Quitting — Ctrl+Q, or closing the main window — runs `crash_marker::clean_exit()`, as the
-//! Tauri shell does at `RunEvent::Exit`: decodes a deliberate quit cuts short are not crashes.
-//! `clean_exit` also disarms the markers, so a decode that starts between the quit and the
-//! process exit cannot leave one either.
+//! Quitting — Ctrl+Q, closing the main window, or `SIGTERM`/`SIGINT`/`SIGHUP` — runs
+//! `crash_marker::clean_exit()`, as the Tauri shell does at `RunEvent::Exit`: decodes a
+//! deliberate quit cuts short are not crashes. `clean_exit` also disarms the markers, so a
+//! decode that starts between the quit and the process exit cannot leave one either.
 
 pub mod assets;
 pub mod desktop;
@@ -29,6 +29,7 @@ pub mod events;
 pub mod keymap;
 pub mod launch;
 pub mod model;
+pub mod signals;
 pub mod single_instance;
 pub mod theme;
 pub mod view;
@@ -115,6 +116,13 @@ pub fn run() {
     // Held for the process's lifetime: the lock, and the socket file it removes on the way out.
     let _instance = claim_single_instance(&launch, instance_tx);
 
+    let (quit_tx, quit_rx) = unbounded::<i32>();
+    if let Err(e) = signals::install(move |signal| {
+        let _ = quit_tx.unbounded_send(signal);
+    }) {
+        eprintln!("signals: {e}; SIGTERM/SIGINT will not quit cleanly");
+    }
+
     // A dev build is not installed, so nothing else registers the scheme for it.
     #[cfg(debug_assertions)]
     std::thread::spawn(|| {
@@ -176,6 +184,7 @@ pub fn run() {
                 }
             };
 
+            launch::spawn_quit_on_signal(quit_rx, cx).detach();
             launch::spawn_request_router(instance_rx, model.clone(), main_window, cx).detach();
             // This launch's own links (the React app got them from onOpenUrl's getCurrent()).
             launch::apply_request(launch, &model, None, cx);

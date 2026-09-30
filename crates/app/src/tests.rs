@@ -1,5 +1,5 @@
 //! Headless tests of the wiring: event bridge → entity, keymap → action, theme event → theme,
-//! deep link → model, second launch → model.
+//! deep link → model, second launch → model, quit signal → `Quit`.
 //! `#[gpui_kit::test]` runs on GPUI's test platform (no window server, deterministic executor).
 
 use crate::events;
@@ -243,4 +243,29 @@ fn a_second_launch_request_from_a_worker_thread_opens_its_links(cx: &mut TestApp
         other => panic!("expected the photo (the last link), got {other:?}"),
     });
     assert_eq!(status(&model, cx), "Deep link: 2026/a.ARW → Library (view not ported yet)");
+}
+
+/// A quit signal, delivered by the signal thread, dispatches `Quit` once — the Ctrl+Q path,
+/// whose handler in `run` calls `cx.quit()` and so the quit observers and `clean_exit`.
+#[gpui_kit::test]
+fn a_quit_signal_dispatches_quit(cx: &mut TestAppContext) {
+    let quits = Rc::new(Cell::new(0));
+    cx.update(|cx| {
+        let quits = quits.clone();
+        cx.on_action(move |_: &Quit, _| quits.set(quits.get() + 1));
+    });
+    let (tx, rx) = futures::channel::mpsc::unbounded::<i32>();
+    cx.update(|cx| launch::spawn_quit_on_signal(rx, cx).detach());
+    // Sent before the router is first polled: GPUI's deterministic scheduler rejects a wakeup
+    // from a foreign thread, so the channel must already hold the signals when it runs.
+    assert_eq!(quits.get(), 0);
+    std::thread::spawn(move || {
+        tx.unbounded_send(libc::SIGTERM).unwrap();
+        // A second signal is the handler's business (it forces the exit); the router quits once.
+        tx.unbounded_send(libc::SIGINT).unwrap();
+    })
+    .join()
+    .unwrap();
+    cx.run_until_parked();
+    assert_eq!(quits.get(), 1);
 }

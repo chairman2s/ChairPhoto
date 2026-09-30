@@ -1,7 +1,8 @@
 //! What reaches the running app from outside its window, on the main thread: second launches
-//! ([`crate::single_instance`]). They arrive on a worker thread and cross to GPUI over a
-//! channel, as core events do ([`crate::events`]).
+//! ([`crate::single_instance`]) and quit signals ([`crate::signals`]). Both arrive on worker
+//! threads and cross to GPUI over a channel, as core events do ([`crate::events`]).
 
+use crate::keymap::Quit;
 use crate::model::AppModel;
 use crate::single_instance::Request;
 use futures::channel::mpsc::UnboundedReceiver;
@@ -33,6 +34,17 @@ pub fn spawn_request_router(
     cx.spawn(async move |cx| {
         while let Some(request) = rx.next().await {
             cx.update(|cx| apply_request(request, &model, main_window, cx));
+        }
+    })
+}
+
+/// Turn a quit signal into the [`Quit`] action — the same path as Ctrl+Q, so the quit
+/// observers (and `crash_marker::clean_exit`) run. Detach it.
+pub fn spawn_quit_on_signal(mut rx: UnboundedReceiver<i32>, cx: &mut App) -> Task<()> {
+    cx.spawn(async move |cx| {
+        if let Some(signal) = rx.next().await {
+            eprintln!("signal {signal}: quitting");
+            cx.update(|cx| cx.dispatch_action(&Quit));
         }
     })
 }

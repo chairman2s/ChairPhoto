@@ -7,6 +7,7 @@
 //! DTOs mirrored field for field.
 
 pub mod query;
+pub mod session;
 
 #[cfg(test)]
 pub(crate) mod test_support {

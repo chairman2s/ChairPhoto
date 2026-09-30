@@ -3,3 +3,4 @@
 
 pub mod editing;
 pub mod js_compat;
+pub mod presets;

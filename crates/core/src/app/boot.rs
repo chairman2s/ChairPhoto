@@ -11,10 +11,10 @@ use crate::image_pool::{self, ImagePool};
 use std::sync::{Arc, Once};
 
 /// What [`boot`] started, for the front end to hold and report.
-pub struct Boot {
-    /// The bounded LIFO decode pool with [`crate::media::render_bytes`] as its runner. Hold
-    /// it for the app's lifetime: the `Arc` keeps its worker threads alive.
-    pub pool: Arc<ImagePool>,
+pub struct Boot<T = Vec<u8>> {
+    /// The bounded LIFO decode pool with the front end's runner — [`crate::media::render_bytes`]
+    /// for [`boot`]. Hold it for the app's lifetime: the `Arc` keeps its worker threads alive.
+    pub pool: Arc<ImagePool<T>>,
     /// The previous run's crash strikes (already printed to stderr), for a front end that
     /// wants to show them.
     pub strikes: Vec<crate::crash_marker::Strikes>,
@@ -40,6 +40,15 @@ pub struct Boot {
 /// process-global; a second call re-uses them (it starts no second watcher and registers no
 /// second pair of analyzers) but builds a second pool.
 pub fn boot(state: &AppState) -> Boot {
+    let pool_state = state.clone();
+    boot_with(state, Arc::new(move |key| crate::media::render_bytes(&pool_state, key)))
+}
+
+/// [`boot`] with the image pool's runner chosen by the front end: the Tauri shell's pool
+/// renders encoded bytes (`media::render_bytes`, through [`boot`]); the GPUI app's renders
+/// decoded pixels (`media::render_image`, converted to its texture format on the worker).
+/// Everything else is the same startup, in the same order.
+pub fn boot_with<T: Clone + Send + 'static>(state: &AppState, runner: image_pool::Runner<T>) -> Boot<T> {
     // Before anything can call into LibRaw (or, one day, a GPU driver): turn the previous
     // run's leftover crash markers into strikes (crash_marker.rs).
     let strikes = match app_data_dir() {
@@ -90,9 +99,6 @@ pub fn boot(state: &AppState) -> Boot {
     // The bounded LIFO image pool every media request goes through.
     let n_threads = image_pool::default_thread_count();
     eprintln!("image pool: {n_threads} worker threads");
-    let pool_state = state.clone();
-    let runner: image_pool::Runner =
-        Arc::new(move |key| crate::media::render_bytes(&pool_state, key));
     let pool = ImagePool::start_with_runner(n_threads, runner);
 
     Boot { pool, strikes, following_omarchy }

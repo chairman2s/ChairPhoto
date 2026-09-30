@@ -41,8 +41,10 @@
 //! did not apply before the event loop ended. The endpoint closes when the quit is asked for,
 //! not when the loop ends, which leaves only requests accepted in the same instant.
 //!
-//! The primary serves one connection at a time with a read timeout, and caps line length and URL count, so a stuck
-//! or hostile peer (the socket is private to this user anyway) costs at most a timeout.
+//! The primary serves one connection at a time, gives each peer one deadline for its whole
+//! request (not a timeout per read, which a trickling peer could renew forever), and caps
+//! line length and URL count, so a stuck or hostile peer (the socket is private to this user
+//! anyway) costs at most that deadline.
 
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, ErrorKind, Read, Write};
@@ -58,8 +60,10 @@ const HELLO: &str = "chairphoto-instance 1";
 const MAX_LINE: usize = 8 * 1024;
 /// Most URLs in one request.
 const MAX_URLS: usize = 64;
-/// How long the primary waits on one peer, and a peer on the primary's answer.
+/// How long a peer waits on the primary's answer, and either side on a write.
 const IO_TIMEOUT: Duration = Duration::from_secs(2);
+/// How long the primary gives one peer to send its whole request, however it trickles in.
+const REQUEST_DEADLINE: Duration = Duration::from_secs(2);
 /// How long a second launch keeps trying to connect while the primary (which already holds
 /// the lock) is still starting up and has not bound the socket yet.
 pub const CONNECT_PATIENCE: Duration = Duration::from_secs(5);
@@ -336,10 +340,10 @@ fn forward(mut stream: UnixStream, request: &Request) -> io::Result<Answer> {
 /// that `ok` is never a promise the app cannot keep. Errors are the peer's fault; the caller
 /// logs them and moves on.
 fn serve_one(stream: UnixStream, accept: impl FnOnce(Request) -> bool) -> io::Result<()> {
-    stream.set_read_timeout(Some(IO_TIMEOUT))?;
     stream.set_write_timeout(Some(IO_TIMEOUT))?;
     let mut writer = stream.try_clone()?;
-    let (answer, result) = match parse_request(&mut BufReader::new(stream)) {
+    let reader = Deadline { stream, until: Instant::now() + REQUEST_DEADLINE };
+    let (answer, result) = match parse_request(&mut BufReader::new(reader)) {
         Ok(request) => {
             let answer = if accept(request) { "ok\n" } else { "closing\n" };
             (answer.to_string(), Ok(()))
@@ -348,6 +352,25 @@ fn serve_one(stream: UnixStream, accept: impl FnOnce(Request) -> bool) -> io::Re
     };
     let _ = writer.write_all(answer.as_bytes());
     result
+}
+
+/// A stream whose reads share one deadline: each read may wait only for what is left of it.
+/// A per-read timeout alone would let a peer that sends a byte now and then hold the
+/// one-at-a-time server indefinitely.
+struct Deadline {
+    stream: UnixStream,
+    until: Instant,
+}
+
+impl Read for Deadline {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let left = self.until.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(io::Error::new(ErrorKind::TimedOut, "request took too long"));
+        }
+        self.stream.set_read_timeout(Some(left))?;
+        self.stream.read(buf)
+    }
 }
 
 fn parse_request(reader: &mut impl BufRead) -> io::Result<Request> {
@@ -569,6 +592,42 @@ mod tests {
         let _primary = primary(claim(&endpoint, &Request::default(), CONNECT_PATIENCE)).serve(|_| false).unwrap();
         let result = claim(&endpoint, &Request { urls: vec![PHOTO.into()] }, Duration::from_millis(200));
         assert!(matches!(result, Err(ClaimError::NoAnswer(_))), "expected NoAnswer");
+    }
+
+    /// A peer that trickles its request a byte at a time (each byte well inside a per-read
+    /// timeout) is cut off at the whole-request deadline, not served for as long as it keeps
+    /// trickling.
+    #[test]
+    fn a_trickling_peer_is_cut_off_at_the_request_deadline() {
+        let dir = TempDir::new("trickle");
+        let endpoint = Endpoint::new(&dir.0, "k");
+        let _primary = primary(claim(&endpoint, &Request::default(), CONNECT_PATIENCE)).serve(|_| true).unwrap();
+        let stream = UnixStream::connect(&endpoint.socket).unwrap();
+        let mut reader = stream.try_clone().unwrap();
+        let started = Instant::now();
+        let stop = Arc::new(AtomicBool::new(false));
+        let trickle = {
+            let (mut stream, stop) = (stream, stop.clone());
+            std::thread::spawn(move || {
+                // One byte of a line that never ends, every 200 ms, for up to 8 s.
+                while !stop.load(Ordering::SeqCst) && started.elapsed() < Duration::from_secs(8) {
+                    if stream.write_all(b"x").is_err() {
+                        return; // the server hung up
+                    }
+                    std::thread::sleep(Duration::from_millis(200));
+                }
+            })
+        };
+        let mut answer = String::new();
+        let _ = reader.read_to_string(&mut answer);
+        let cut_off_after = started.elapsed();
+        stop.store(true, Ordering::SeqCst);
+        trickle.join().unwrap();
+        assert!(answer.starts_with("error "), "{answer:?}");
+        assert!(
+            cut_off_after < REQUEST_DEADLINE + Duration::from_secs(1),
+            "the trickling peer held the server for {cut_off_after:?}"
+        );
     }
 
     /// A peer that speaks something else gets an error line and its request is dropped; the

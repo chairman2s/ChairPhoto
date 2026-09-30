@@ -6,6 +6,7 @@
 //! port had to choose between JavaScript and Rust semantics.
 
 pub mod compare_duel;
+pub mod deep_link;
 pub mod js_compat;
 pub mod library;
 pub mod shell_timing;

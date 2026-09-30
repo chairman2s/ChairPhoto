@@ -372,9 +372,16 @@ impl ImageStore {
     }
 
     /// Request several images, most urgent first, as one pool batch: the first ends on top of
-    /// the pool's LIFO stack. Cached and failed keys are skipped; a pending key is re-sent
-    /// with a no-op responder so the pool moves it up to its place in this batch.
+    /// the pool's LIFO stack. Cached, failed and already pending keys are skipped, so a view
+    /// may call this on every render: once everything it wants is pending, nothing is sent.
     pub fn request_batch(&mut self, wanted: &[(i64, ImageKind)]) {
+        self.submit(wanted, false);
+    }
+
+    /// [`request_batch`](Self::request_batch), and with `promote` a pending key is re-sent
+    /// with a no-op responder so the pool moves it up to its place in this batch — what
+    /// navigation needs when a preload becomes the current photo.
+    fn submit(&mut self, wanted: &[(i64, ImageKind)], promote: bool) {
         let mut batch: Vec<(JobKey, Respond<Loaded>)> = Vec::with_capacity(wanted.len());
         let mut seen = HashSet::new();
         for &(photo, kind) in wanted {
@@ -388,7 +395,9 @@ impl ImageStore {
             }
             let job = JobKey::photo(photo, kind);
             if self.pending.contains_key(&key) {
-                batch.push((job, Box::new(|_| {})));
+                if promote {
+                    batch.push((job, Box::new(|_| {})));
+                }
                 continue;
             }
             self.generation += 1;
@@ -431,7 +440,7 @@ impl ImageStore {
             neighbours(photos.len(), index).into_iter().map(|i| (photos[i], kind)).collect();
         let keep: HashSet<i64> = wanted.iter().map(|&(p, _)| p).collect();
         self.release_pending(|k| k.kind != kind || keep.contains(&k.photo));
-        self.request_batch(&wanted);
+        self.submit(&wanted, true);
     }
 
     /// A photo's pixels changed (rotation, cover version): drop what is cached for it, and

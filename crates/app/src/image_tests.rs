@@ -249,6 +249,20 @@ fn navigation_requests_current_then_next_then_previous(cx: &mut TestAppContext) 
     });
 }
 
+/// Review finding 3: a view asks for its images on every render. Asking again for keys that
+/// are already pending must not reach the pool — each re-send added a no-op responder and an
+/// O(stack) move. (Navigation still re-sends on purpose, to promote; see the test above.)
+#[gpui_kit::test]
+fn asking_again_for_pending_images_sends_nothing(cx: &mut TestAppContext) {
+    let (pool, images) = store(cx, 1 << 20);
+    let wanted: Vec<(i64, ImageKind)> = (1..=8).map(|id| (id, ImageKind::Thumb)).collect();
+    for _ in 0..100 {
+        images.update(cx, |s, _| s.request_batch(&wanted));
+    }
+    assert_eq!(pool.submitted(), 8, "one responder per job");
+    assert_eq!(pool.batches.lock().unwrap().len(), 1, "one batch");
+}
+
 /// A preload that was already rendering when the user moved away cannot be cancelled; its
 /// pixels arrive later and must be dropped, not cached or shown.
 #[gpui_kit::test]

@@ -73,11 +73,18 @@ impl FakePool {
         }
     }
 
+    /// Answer the `n`th responder ever submitted (submission order).
+    #[cfg_attr(not(feature = "edit"), allow(dead_code))]
+    pub fn finish_nth(&self, n: usize, result: Result<Loaded, String>) {
+        let (_, respond) = self.responders.lock().unwrap()[n].take().expect("already answered");
+        respond(result);
+    }
+
     pub fn submitted(&self) -> usize {
         self.responders.lock().unwrap().len()
     }
 
-    fn last_batch(&self) -> Vec<JobKey> {
+    pub fn last_batch(&self) -> Vec<JobKey> {
         self.batches.lock().unwrap().last().cloned().unwrap_or_default()
     }
 }

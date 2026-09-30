@@ -19,6 +19,8 @@
 //! Tauri shell does at `RunEvent::Exit`: decodes a deliberate quit cuts short are not crashes.
 
 pub mod assets;
+#[cfg(feature = "edit")]
+pub mod darkroom;
 pub mod events;
 pub mod image_store;
 pub mod keymap;

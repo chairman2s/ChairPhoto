@@ -1,11 +1,89 @@
-//! Blocking render bodies behind the native media protocols: the bytes an `edit://`
-//! request serves, rendered from a photo's resolved preview/zoom tier or a resident RAW
-//! working image. Core code — the Tauri protocol handler (`protocol.rs`) and the edit
-//! commands call in here; nothing here depends on the command layer. Compiled only with
-//! the `edit` feature.
+//! Blocking render bodies behind the native media protocols: the bytes a `thumb://`,
+//! `preview://`, `zoom://` or (with the `edit` feature) `edit://` request serves.
+//! [`render_bytes`] is the [`ImagePool`](crate::image_pool::ImagePool) runner every front end
+//! installs (`app::boot`); [`render_edit_bytes`] renders from a photo's resolved preview/zoom
+//! tier or a resident RAW working image. Core code — the Tauri protocol handler
+//! (`protocol.rs`), the edit commands and the GPUI app call in here; nothing here depends on
+//! a command layer.
 
 use crate::app::AppState;
+use crate::catalog::ResolveMode;
+use crate::image_pool::{ImageKind, JobKey};
+use crate::thumbnails::{preview_bytes, thumbnail_bytes, zoom_bytes};
 
+/// Render one image and return its JPEG bytes, or an error string.
+///
+/// The runner [`app::boot`](crate::app::boot) injects into the
+/// [`ImagePool`](crate::image_pool::ImagePool); the Tauri protocol's no-pool fallback calls it
+/// directly.
+pub fn render_bytes(state: &AppState, key: JobKey) -> Result<Vec<u8>, String> {
+    let (id, kind) = match key {
+        JobKey::Photo { id, kind } => (id, kind),
+        #[cfg(feature = "edit")]
+        JobKey::Edit(job) => return render_edit_bytes(state, &job),
+    };
+    // Gather the path CANDIDATES (pure SQL) and the rotation under a brief lock, then
+    // stat them OFF the lock via `pick_existing` so a slow/offline NAS can't serialize
+    // the whole app. `pick_existing` still returns the best available copy (local cache
+    // > primary > backup); the reachability cache only reorders the stats.
+    let (candidates, rotation, cover) = {
+        let guard = state.catalog.lock().map_err(|e| e.to_string())?;
+        let catalog = guard.as_ref().ok_or("no catalog open")?;
+        let candidates = catalog.photo_path_candidates(id).map_err(|e| e.to_string())?;
+        let rotation = catalog.photo_rotation(id).unwrap_or(0);
+        // The cover version's settings, when the grid should show a version's look.
+        let cover = match kind {
+            ImageKind::Thumb => catalog.cover_of(id).ok().flatten().map(|(_, _, json)| json),
+            _ => None,
+        };
+        (candidates, rotation, cover)
+    };
+    // A thumbnail has a persistent fallback below, so it resolves in FastDisplay: a
+    // cached-unreachable volume is never statted and the grid falls back at once. Preview
+    // and zoom have no fallback — they need the original, so they keep strict checking.
+    let mode = match kind {
+        ImageKind::Thumb => ResolveMode::FastDisplay,
+        ImageKind::Preview | ImageKind::Zoom => ResolveMode::OriginalRequired,
+    };
+    let resolved = crate::volume_health::pick_existing(&candidates, &state.volume_health, mode);
+    match resolved {
+        Some(absolute) => match kind {
+            ImageKind::Thumb => {
+                // A cover shows the version's look; if it cannot be rendered (no edit
+                // engine in this build, an engine-2 cover without the decoder, a failure)
+                // the plain thumbnail below is served instead.
+                if let Some(json) = &cover {
+                    #[cfg(feature = "edit")]
+                    match crate::plugins::edit::cover::cover_thumb(&absolute, id, json) {
+                        Ok(bytes) => return crate::thumbnails::rotate_jpeg(bytes, rotation),
+                        Err(e) => eprintln!("cover thumbnail for photo {id}: {e}"),
+                    }
+                    #[cfg(not(feature = "edit"))]
+                    let _ = json;
+                }
+                // Apply the user rotation on top of the file's baked EXIF orientation, then
+                // keep the rotated id-keyed copy so the photo stays browsable (correctly
+                // oriented) after it's offloaded and the NAS goes offline.
+                let bytes = crate::thumbnails::rotate_jpeg(thumbnail_bytes(&absolute)?, rotation)?;
+                crate::thumbnails::save_persistent_thumb(id, &bytes);
+                Ok(bytes)
+            }
+            ImageKind::Preview => crate::thumbnails::rotate_jpeg(preview_bytes(&absolute)?, rotation),
+            ImageKind::Zoom => crate::thumbnails::rotate_jpeg(zoom_bytes(&absolute)?, rotation),
+        },
+        // Original unreachable (e.g. offloaded + NAS unmounted): fall back to the kept
+        // thumbnail so the grid still shows the photo. Preview/zoom need the original.
+        None => {
+            let e = format!("no reachable copy of photo {id}");
+            match kind {
+                ImageKind::Thumb => crate::thumbnails::read_persistent_thumb(id).ok_or(e),
+                _ => Err(e),
+            }
+        }
+    }
+}
+
+#[cfg(feature = "edit")]
 /// The blocking body of an edit render — the `edit://` protocol
 /// (`protocol::handle_edit_request`, the Darkroom stage) and the `render_edit` command
 /// share it. Resolves the photo's path, decodes the source tier, renders, and encodes:
@@ -100,6 +178,7 @@ pub fn render_edit_bytes(state: &AppState, job: &crate::image_pool::EditJob) -> 
     Ok(bytes)
 }
 
+#[cfg(feature = "edit")]
 /// The resident working image a token names — or a clear error, never other pixels.
 pub fn working_image(token: &crate::plugins::edit::SourceToken) -> Result<std::sync::Arc<crate::plugins::edit::WorkingImage>, String> {
     #[cfg(feature = "raw")]
@@ -114,7 +193,7 @@ pub fn working_image(token: &crate::plugins::edit::SourceToken) -> Result<std::s
     }
 }
 
-#[cfg(all(test, feature = "raw"))]
+#[cfg(all(test, feature = "edit", feature = "raw"))]
 mod tests {
     use super::*;
 

@@ -6,7 +6,6 @@
 //! previous one before it can write to a torn-down catalog.
 
 use super::*;
-use std::path::PathBuf;
 use tauri::{AppHandle, Manager};
 
 /// Scan a folder (recursively) into the open catalog. Read-only on photo files.
@@ -79,53 +78,6 @@ where
     // failed, or was aborted by a catalog switch).
     let _ = app.send(CoreEvent::ScanProgress(crate::scanner::ScanProgress { phase: "done".into(), done: 0, total: 0 }));
     res
-}
-
-/// Detach a Phase B enrichment worker for the given catalog `path`/`root`, using the
-/// supplied `abort` flag. The worker opens its own secondary connection, loads the
-/// pending-enrichment queue, and calls `phase_b_enrich` — streaming
-/// `scan:progress {phase:"metadata"|"finalizing"}` events and the terminal
-/// `scan:progress {phase:"done"}` event when it finishes (or is aborted).
-///
-/// Used by the auto-resume path on startup (I6d) and `drain_enrichment_queue`.
-/// Does nothing (and emits no events) if the queue is empty.
-pub(super) fn spawn_detached_phase_b(
-    app: AppHandle,
-    path: PathBuf,
-    root: PathBuf,
-    abort: Arc<AtomicBool>,
-) {
-    crate::app::spawn_blocking(move || {
-        let enrich_catalog = match Catalog::open_secondary(&path, &root) {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!("resume phase B: couldn't open enrichment connection: {e}");
-                let _ = app.send(CoreEvent::ScanProgress(crate::scanner::ScanProgress { phase: "done".into(), done: 0, total: 0 }));
-                return;
-            }
-        };
-        let pending = match crate::scanner::resume_pending_enrichment(&enrich_catalog) {
-            Ok(Some(p)) => p,
-            Ok(None) => return, // queue is empty — nothing to do, no events emitted
-            Err(e) => {
-                eprintln!("resume phase B: couldn't load enrichment queue: {e}");
-                let _ = app.send(CoreEvent::ScanProgress(crate::scanner::ScanProgress { phase: "done".into(), done: 0, total: 0 }));
-                return;
-            }
-        };
-        let emit = {
-            let emit_app = app.clone();
-            move |p: crate::scanner::ScanProgress| {
-                let _ = emit_app.send(CoreEvent::ScanProgress(p));
-            }
-        };
-        if let Err(e) = crate::scanner::phase_b_enrich(&enrich_catalog, pending, &abort, &emit) {
-            if e != crate::scanner::SCAN_ABORTED {
-                eprintln!("resume phase B: enrichment failed: {e}");
-            }
-        }
-        let _ = app.send(CoreEvent::ScanProgress(crate::scanner::ScanProgress { phase: "done".into(), done: 0, total: 0 }));
-    });
 }
 
 /// Run a **two-phase** live scan (I6): Phase A (the fast walk) runs on a blocking worker

@@ -33,7 +33,7 @@
 //! a mismatch. That is not circular — it catches a URL that the two parsers read differently,
 //! which is otherwise a way to be granted one origin and reach another.
 
-use super::*;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;

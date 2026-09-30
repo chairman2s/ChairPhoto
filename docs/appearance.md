@@ -69,7 +69,7 @@ them; keys are camelCase on the wire (`darkBackground`), snake_case only in the 
 
 ## Watching for switches
 
-At startup (`lib.rs` setup, beside the video server) the backend starts a singleton
+At startup (`app::boot`, which every front end runs) the backend starts a singleton
 watcher thread — **only if the Omarchy state root exists**. It polls every 2 seconds with
 a cheap fingerprint (mtime + length of both files, absence included as a value). On a
 fingerprint change it settle-reads: both files re-read every 100 ms until two consecutive

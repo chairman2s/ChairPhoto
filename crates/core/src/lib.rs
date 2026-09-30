@@ -29,7 +29,6 @@ pub mod instagram;
 pub mod lens;
 #[cfg(feature = "localsend")]
 pub mod localsend;
-#[cfg(feature = "edit")]
 pub mod media;
 pub mod metadata;
 #[cfg(any(feature = "flickr", feature = "smugmug"))]
@@ -51,5 +50,7 @@ pub mod smugmug;
 #[cfg(test)]
 mod test_support;
 pub mod thumbnails;
+#[cfg(any(feature = "flickr", feature = "smugmug", feature = "instagram", feature = "localsend"))]
+pub mod upload_sweep;
 pub mod volume_health;
 pub mod xmp;

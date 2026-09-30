@@ -16,7 +16,6 @@ use crate::catalog::{
 use crate::scanner::ScanResult;
 use crate::thumbnails::{preview_bytes, thumbnail_bytes};
 use base64::Engine;
-use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;

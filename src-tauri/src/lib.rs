@@ -19,7 +19,7 @@ mod protocol;
 mod test_support;
 
 use commands::AppState;
-use image_pool::{ImageKind, ImagePool};
+use image_pool::ImageKind;
 use protocol::handle_image_request;
 use tauri::Manager;
 
@@ -80,34 +80,13 @@ pub fn run() {
             // First, so nothing started below can send into the void.
             let state = app.state::<AppState>().inner().clone();
             state.set_events(std::sync::Arc::new(commands::WebviewEvents(app.handle().clone())));
-            // Before anything can call into LibRaw (or, one day, a GPU driver): turn the
-            // previous run's leftover crash markers into strikes (src/crash_marker.rs).
-            match commands::app_data_dir() {
-                Ok(dir) => {
-                    for s in crash_marker::init(&dir.join("crash-markers")) {
-                        eprintln!(
-                            "crash marker: the previous run died inside {} on {} ({} strike{}{})",
-                            s.kind,
-                            s.label,
-                            s.strikes,
-                            if s.strikes == 1 { "" } else { "s" },
-                            if s.is_blocked() { " — skipped from now on" } else { "" },
-                        );
-                    }
-                }
-                Err(e) => eprintln!("crash marker: disabled, no app data dir ({e})"),
-            }
-            // Reclaim upload renders left behind by a previous run. Kept directories — a
-            // supervised Instagram post, or any publish that errored — were otherwise
-            // reclaimed only when someone happened to publish again, so a user who
-            // publishes once and hits an error kept a full-resolution JPEG forever.
-            #[cfg(any(
-                feature = "flickr",
-                feature = "smugmug",
-                feature = "instagram",
-                feature = "localsend"
-            ))]
-            crate::commands::publishing::sweep_abandoned_uploads_at_startup();
+            // The core's process startup — crash markers, upload sweep, Omarchy watcher,
+            // decode analyzers and the image pool — shared with the GPUI app (app::boot).
+            // `manage` holds the pool's Arc for the app's lifetime, which keeps its worker
+            // threads alive; the URI scheme handlers find it there.
+            let boot = crate::app::boot(&state);
+            app.manage(boot.pool);
+
             // Dev builds aren't installed, so no .desktop/registry entry registers the
             // chairphoto:// scheme — register it at runtime (writes a handler .desktop
             // pointing at this binary on Linux). Bundles register via tauri.conf.json.
@@ -151,136 +130,6 @@ pub fn run() {
             match protocol::start_video_server(state.clone()) {
                 Ok(port) => eprintln!("video server on http://127.0.0.1:{port}"),
                 Err(e) => eprintln!("failed to start video server: {e}"),
-            }
-
-            // "Follow Omarchy" appearance (docs/appearance.md): watch the Omarchy runtime
-            // theme and broadcast switches. Starts nothing when Omarchy is absent — a
-            // normal, non-degraded state that must cost zero polling — and never fatal.
-            if appearance::start_watcher(state.clone()) {
-                eprintln!("appearance: following the Omarchy theme");
-            }
-
-            // Build the bounded LIFO image pool and make it available to the URI scheme
-            // handlers via Tauri's state system.
-            let n_threads = image_pool::default_thread_count();
-            eprintln!("image pool: {n_threads} worker threads");
-            let pool_state = state.clone();
-            let runner: image_pool::Runner = std::sync::Arc::new(move |key| {
-                protocol::render_bytes(&pool_state, key)
-            });
-            // `manage` holds the Arc for the app's lifetime — that alone keeps the pool
-            // (and its worker threads) alive.
-            app.manage(ImagePool::start_with_runner(n_threads, runner));
-
-            // H16b: Register the sharpness analyzer so newly decoded previews are scored
-            // on the fly — scoring rides the decode that was already paid for (I7b hook)
-            // instead of re-reading the file. Score-on-index handles the backfill.
-            //
-            // The closure captures a clone of the catalog Arc. When a decode fires (inside
-            // the thumbnail pool's worker threads), the closure:
-            //   1. Computes the sharpness score from the already-decoded image (pure math).
-            //   2. Briefly locks the catalog to resolve the absolute path → photo_id.
-            //   3. Writes the score if the photo is not yet scored (sharpness IS NULL guard).
-            //
-            // The lock scope is narrow (one SELECT + one UPDATE) so it does not meaningfully
-            // contend with UI reads. The run_analyzers fix (snapshot before invoke) ensures
-            // the registry lock is NOT held during this work.
-            {
-                let catalog_arc = app.state::<AppState>().catalog.clone();
-                thumbnails::register_analyzer(std::sync::Arc::new(move |img, path| {
-                    use crate::sharpness_indexer::{
-                        photo_af_point, score_image_regions, write_sharpness, RegionInputs,
-                    };
-                    use rusqlite::OptionalExtension as _;
-
-                    let guard = match catalog_arc.lock() {
-                        Ok(g) => g,
-                        Err(_) => return,
-                    };
-                    let catalog = match guard.as_ref() {
-                        Some(c) => c,
-                        None => return,
-                    };
-                    // Convert the absolute path to a catalog-root-relative path — the same
-                    // key used in photos.path. If the file is outside the catalog root
-                    // (e.g. a card import source path), skip silently.
-                    let root = catalog.root();
-                    let rel = match path.strip_prefix(root) {
-                        Ok(r) => r.to_string_lossy().to_string(),
-                        Err(_) => return,
-                    };
-                    // Look up the photo only if it is not yet scored; don't overwrite an
-                    // existing score (e.g. from the batch indexer) and don't write 0 for
-                    // photos that have no catalog row yet (not imported).
-                    let photo_id: Option<i64> = catalog
-                        .conn()
-                        .query_row(
-                            "SELECT id FROM photos WHERE path = ?1 AND sharpness IS NULL",
-                            rusqlite::params![rel],
-                            |r| r.get(0),
-                        )
-                        .optional()
-                        .ok()
-                        .flatten();
-                    if let Some(id) = photo_id {
-                        // Region-aware scoring (H16c): faces → AF point → tiles. Regions are
-                        // read under the same lock we already hold. Faces are only available
-                        // with the `faces` feature; without it the chain falls through to
-                        // AF/tile. Scoring rides the decode the pool already paid for.
-                        let af_point = photo_af_point(catalog.conn(), id);
-                        #[cfg(feature = "faces")]
-                        let face_boxes =
-                            crate::plugins::faces::store::face_boxes_for_photo(catalog.conn(), id)
-                                .unwrap_or_default();
-                        #[cfg(not(feature = "faces"))]
-                        let face_boxes = Vec::new();
-                        let regions = RegionInputs { face_boxes, af_point };
-                        let (score, method) = score_image_regions(img, &regions);
-                        let _ = write_sharpness(catalog.conn(), id, score, method);
-                    }
-                }));
-            }
-
-            // H15a: Register the perceptual-hash analyzer so newly decoded previews are
-            // hashed on the fly (I7b hook — one decode, many analyzers). Unlike sharpness,
-            // the dHash is resolution-invariant, so any decode that reaches the analyzers
-            // (gated at PREVIEW_MAX) is fine. `hash_and_store` writes only when the photo
-            // is not yet hashed (phash IS NULL), so it never fights the batch indexer and
-            // never inserts for a file with no catalog row. The batch `index_phashes`
-            // command backfills photos imported before this hook existed.
-            {
-                let catalog_arc = app.state::<AppState>().catalog.clone();
-                thumbnails::register_analyzer(std::sync::Arc::new(move |img, path| {
-                    use rusqlite::OptionalExtension as _;
-
-                    let guard = match catalog_arc.lock() {
-                        Ok(g) => g,
-                        Err(_) => return,
-                    };
-                    let catalog = match guard.as_ref() {
-                        Some(c) => c,
-                        None => return,
-                    };
-                    let root = catalog.root();
-                    let rel = match path.strip_prefix(root) {
-                        Ok(r) => r.to_string_lossy().to_string(),
-                        Err(_) => return,
-                    };
-                    // Only look up unhashed photos so we don't decode-and-store redundantly.
-                    let photo_id: Option<i64> = catalog
-                        .conn()
-                        .query_row(
-                            "SELECT id FROM photos WHERE path = ?1 AND phash IS NULL",
-                            rusqlite::params![rel],
-                            |r| r.get(0),
-                        )
-                        .optional()
-                        .ok()
-                        .flatten();
-                    if let Some(id) = photo_id {
-                        crate::phash_indexer::hash_and_store(catalog.conn(), id, img);
-                    }
-                }));
             }
 
             Ok(())

@@ -4,6 +4,9 @@
 //! state in [`jobs::JobRegistry`]) plus the helpers more than one domain needs. The Tauri
 //! command layer (`commands/`) re-exports all of it; a native frontend links it directly.
 //!
+//! Startup is [`boot`] (crash markers, upload sweep, theme watcher, decode analyzers, the
+//! image pool) and then [`open_default_catalog`]; every front end runs the same two.
+//!
 //! Blocking work goes through [`spawn_blocking`] on the runtime from [`runtime`], which the
 //! Tauri shell also installs as its own async runtime, so there is one tokio runtime
 //! whichever frontend is running.
@@ -13,9 +16,16 @@ use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, OnceLock};
 
+mod boot;
+mod catalogs;
 pub mod events;
 pub mod jobs;
 
+pub use boot::{boot, Boot};
+pub use catalogs::{
+    default_catalog_path, load_recent_catalogs, open_default_catalog, record_recent_catalog,
+    spawn_detached_phase_b, RecentCatalog,
+};
 pub use events::*;
 
 pub use jobs::JobRegistry;

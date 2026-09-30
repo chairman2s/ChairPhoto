@@ -10,12 +10,11 @@
 //! photo id to its file and renders. Work happens on a worker thread so the webview
 //! networking thread is never blocked.
 
-use crate::catalog::ResolveMode;
 use crate::app::AppState;
+use crate::catalog::ResolveMode;
 #[cfg(feature = "edit")]
 use crate::image_pool::EditJob;
 use crate::image_pool::{ImageKind, ImagePool, JobKey};
-use crate::thumbnails::{preview_bytes, thumbnail_bytes, zoom_bytes};
 use tauri::http::{Request, Response};
 use tauri::{Manager, Runtime, UriSchemeContext, UriSchemeResponder};
 
@@ -167,7 +166,7 @@ fn submit_or_fallback<R: Runtime>(
         let spawned = std::thread::Builder::new()
             .name("image-fallback".into())
             .spawn(move || {
-                let result = render_bytes(&app.state::<AppState>(), key);
+                let result = crate::media::render_bytes(&app.state::<AppState>(), key);
                 if let Some(r) = respond2.lock().ok().and_then(|mut g| g.take()) {
                     r(result);
                 }
@@ -175,77 +174,6 @@ fn submit_or_fallback<R: Runtime>(
         if spawned.is_err() {
             if let Some(r) = respond.lock().ok().and_then(|mut g| g.take()) {
                 r(Err("failed to spawn image render thread".into()));
-            }
-        }
-    }
-}
-
-/// Render one image and return its JPEG bytes, or an error string.
-///
-/// This is the runner function injected into [`ImagePool`].  It is `pub` so
-/// that `lib.rs` can reference it when building the pool runner closure.
-pub fn render_bytes(state: &AppState, key: JobKey) -> Result<Vec<u8>, String> {
-    let (id, kind) = match key {
-        JobKey::Photo { id, kind } => (id, kind),
-        #[cfg(feature = "edit")]
-        JobKey::Edit(job) => return crate::media::render_edit_bytes(state, &job),
-    };
-    // Gather the path CANDIDATES (pure SQL) and the rotation under a brief lock, then
-    // stat them OFF the lock via `pick_existing` so a slow/offline NAS can't serialize
-    // the whole app. `pick_existing` still returns the best available copy (local cache
-    // > primary > backup); the reachability cache only reorders the stats.
-    let (candidates, rotation, cover) = {
-        let guard = state.catalog.lock().map_err(|e| e.to_string())?;
-        let catalog = guard.as_ref().ok_or("no catalog open")?;
-        let candidates = catalog.photo_path_candidates(id).map_err(|e| e.to_string())?;
-        let rotation = catalog.photo_rotation(id).unwrap_or(0);
-        // The cover version's settings, when the grid should show a version's look.
-        let cover = match kind {
-            ImageKind::Thumb => catalog.cover_of(id).ok().flatten().map(|(_, _, json)| json),
-            _ => None,
-        };
-        (candidates, rotation, cover)
-    };
-    // A thumbnail has a persistent fallback below, so it resolves in FastDisplay: a
-    // cached-unreachable volume is never statted and the grid falls back at once. Preview
-    // and zoom have no fallback — they need the original, so they keep strict checking.
-    let mode = match kind {
-        ImageKind::Thumb => ResolveMode::FastDisplay,
-        ImageKind::Preview | ImageKind::Zoom => ResolveMode::OriginalRequired,
-    };
-    let resolved = crate::volume_health::pick_existing(&candidates, &state.volume_health, mode);
-    match resolved {
-        Some(absolute) => match kind {
-            ImageKind::Thumb => {
-                // A cover shows the version's look; if it cannot be rendered (no edit
-                // engine in this build, an engine-2 cover without the decoder, a failure)
-                // the plain thumbnail below is served instead.
-                if let Some(json) = &cover {
-                    #[cfg(feature = "edit")]
-                    match crate::plugins::edit::cover::cover_thumb(&absolute, id, json) {
-                        Ok(bytes) => return crate::thumbnails::rotate_jpeg(bytes, rotation),
-                        Err(e) => eprintln!("cover thumbnail for photo {id}: {e}"),
-                    }
-                    #[cfg(not(feature = "edit"))]
-                    let _ = json;
-                }
-                // Apply the user rotation on top of the file's baked EXIF orientation, then
-                // keep the rotated id-keyed copy so the photo stays browsable (correctly
-                // oriented) after it's offloaded and the NAS goes offline.
-                let bytes = crate::thumbnails::rotate_jpeg(thumbnail_bytes(&absolute)?, rotation)?;
-                crate::thumbnails::save_persistent_thumb(id, &bytes);
-                Ok(bytes)
-            }
-            ImageKind::Preview => crate::thumbnails::rotate_jpeg(preview_bytes(&absolute)?, rotation),
-            ImageKind::Zoom => crate::thumbnails::rotate_jpeg(zoom_bytes(&absolute)?, rotation),
-        },
-        // Original unreachable (e.g. offloaded + NAS unmounted): fall back to the kept
-        // thumbnail so the grid still shows the photo. Preview/zoom need the original.
-        None => {
-            let e = format!("no reachable copy of photo {id}");
-            match kind {
-                ImageKind::Thumb => crate::thumbnails::read_persistent_thumb(id).ok_or(e),
-                _ => Err(e),
             }
         }
     }

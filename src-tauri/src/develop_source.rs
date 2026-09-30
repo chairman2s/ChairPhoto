@@ -78,4 +78,3 @@ pub fn probe_source(path: &std::path::Path) -> DevelopSource {
 pub fn probe_source(_path: &std::path::Path) -> DevelopSource {
     DevelopSource::NoDecoder
 }
-

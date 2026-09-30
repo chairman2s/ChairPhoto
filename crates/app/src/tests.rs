@@ -481,12 +481,12 @@ fn a_second_launch_request_from_a_worker_thread_opens_its_links(cx: &mut TestApp
     model.update(cx, |m, cx| m.refresh(cx));
     cx.run_until_parked();
 
-    let (tx, rx) = futures::channel::mpsc::unbounded::<Request>();
+    let (tx, rx) = launch::request_queue();
     cx.update(|cx| launch::spawn_request_router(rx, model.clone(), None, cx).detach());
     let request = Request {
         urls: vec![format!("chairphoto://tag/{tag_uuid}"), format!("chairphoto://{photo_uuid}")],
     };
-    std::thread::spawn(move || tx.unbounded_send(request).unwrap()).join().unwrap();
+    std::thread::spawn(move || tx.send(request).unwrap()).join().unwrap();
     cx.run_until_parked();
 
     model.read_with(cx, |m, _| match &m.deep_link {
@@ -506,6 +506,42 @@ fn second_catalog(dir: &TempDir) -> (Catalog, String) {
     let catalog = Catalog::open(&dir.0.join("other.chairphoto"), &root).unwrap();
     let photo = catalog.upsert_photo(&root.join("2026/b.ARW"), None, 0, 1).unwrap();
     (catalog, photo.uuid)
+}
+
+/// Links that arrive before the catalog opens do not pile up: only the newest can land (each
+/// resolution supersedes the one before), so only the newest waits, and it is the one
+/// applied once the catalog is in.
+#[gpui_kit::test]
+fn links_waiting_for_the_catalog_are_coalesced_to_the_newest(cx: &mut TestAppContext) {
+    let dir = TempDir::new("link-flood");
+    let (state, model) = wired(cx);
+    let (photo_uuid, tag_uuid) = catalog_with_a_photo_and_a_tag(&dir, &state);
+    for _ in 0..100 {
+        model.update(cx, |m, cx| m.open_url(&format!("chairphoto://{photo_uuid}"), cx));
+    }
+    model.update(cx, |m, cx| m.open_url(&format!("chairphoto://tag/{tag_uuid}"), cx));
+    assert_eq!(model.read_with(cx, |m, _| m.pending_link_count()), 1);
+
+    model.update(cx, |m, cx| m.refresh(cx));
+    cx.run_until_parked();
+    model.read_with(cx, |m, _| assert!(matches!(m.deep_link, Some(DeepLinkTarget::Tag { .. }))));
+    assert_eq!(model.read_with(cx, |m, _| m.pending_link_count()), 0);
+}
+
+/// The queue between the single-instance thread and the main thread is bounded: past
+/// `MAX_QUEUED_REQUESTS` a request is refused `Busy` (the second launch hears `busy`), and
+/// draining makes room again.
+#[gpui_kit::test]
+fn the_second_launch_queue_is_bounded(cx: &mut TestAppContext) {
+    let (_state, model) = wired(cx);
+    let (tx, rx) = launch::request_queue();
+    for _ in 0..launch::MAX_QUEUED_REQUESTS {
+        assert_eq!(tx.send(Request::default()), Ok(()));
+    }
+    assert_eq!(tx.send(Request::default()), Err(crate::single_instance::Refused::Busy));
+    cx.update(|cx| launch::spawn_request_router(rx, model.clone(), None, cx).detach());
+    cx.run_until_parked();
+    assert_eq!(tx.send(Request::default()), Ok(()), "draining did not make room");
 }
 
 /// A catalog switch drops the resolved link: its photo id is the old catalog's.

@@ -55,7 +55,7 @@ use chairphoto_core::app::{AppState, CoreEvent};
 use chairphoto_core::appearance::SystemThemeResult;
 use chairphoto_core::image_pool::ImagePool;
 use image_store::{ImageStore, Loaded};
-use futures::channel::mpsc::{unbounded, UnboundedReceiver, UnboundedSender};
+use futures::channel::mpsc::{unbounded, UnboundedReceiver};
 use single_instance::{Claim, ClaimError, Primary, Request};
 use model::AppModel;
 use gpui_kit::{
@@ -214,7 +214,7 @@ pub fn wire(
 /// Become this app data dir's primary instance, serving second launches into `tx`; or hand
 /// `launch` to the instance that already is, and exit. `None`: single-instance could not be
 /// set up (the reason is logged) and the app runs without it.
-fn claim_single_instance(launch: &Request, tx: UnboundedSender<Request>) -> Option<Primary> {
+fn claim_single_instance(launch: &Request, tx: launch::RequestSender) -> Option<Primary> {
     let endpoint = chairphoto_core::app::app_data_dir()
         .map_err(std::io::Error::other)
         .and_then(|dir| {
@@ -231,8 +231,9 @@ fn claim_single_instance(launch: &Request, tx: UnboundedSender<Request>) -> Opti
     };
     match single_instance::claim(&endpoint, launch, single_instance::CONNECT_PATIENCE) {
         Ok(Claim::Primary(primary)) => {
-            // Taken only if the router still listens: the second launch hears `ok` only then.
-            let served = primary.serve(move |request| tx.unbounded_send(request).is_ok());
+            // Taken only if the queue has room and the router still listens: the second
+            // launch hears `ok` only then.
+            let served = primary.serve(move |request| tx.send(request));
             served.map_err(|e| eprintln!("single instance: disabled: {e}")).ok()
         }
         Ok(Claim::Forwarded) => {
@@ -256,7 +257,7 @@ fn claim_single_instance(launch: &Request, tx: UnboundedSender<Request>) -> Opti
 /// Start the app and run until it quits.
 pub fn run() {
     let launch = Request::from_args(std::env::args().skip(1));
-    let (instance_tx, instance_rx) = unbounded::<Request>();
+    let (instance_tx, instance_rx) = launch::request_queue();
     // Held for the process's lifetime: the lock, and the socket file it removes on the way out.
     let instance = claim_single_instance(&launch, instance_tx);
     let instance_closer = instance.as_ref().map(|primary| primary.closer());

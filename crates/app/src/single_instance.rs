@@ -34,8 +34,11 @@
 //! The primary hands the [`Request`] to the app (which focuses the main window and opens each
 //! URL; a request with no URL only focuses, a second launch from the app launcher) and only
 //! then answers: `ok` if the app took it, `closing` if the app is quitting ([`Closer`]) or
-//! could not take it. On `closing` the second launch waits for the lock to come free and
-//! becomes the primary itself, link in hand. A malformed request gets `error <reason>`.
+//! its router is gone, `busy` if too many requests already wait for the main thread
+//! ([`Refused`]). On `closing` or `busy` the second launch keeps trying for its patience:
+//! after `closing` the lock comes free and it becomes the primary itself, link in hand; a
+//! primary that stays busy that long is stuck, and the second launch exits 1 saying so. A
+//! malformed request gets `error <reason>`.
 //!
 //! What a quitting primary still loses: a request the router already took (`ok` sent) but
 //! did not apply before the event loop ended. The endpoint closes when the quit is asked for,
@@ -193,6 +196,24 @@ pub struct Primary {
     _lock: File,
 }
 
+/// Why the app did not take a request; the second launch hears it as its answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Refused {
+    /// The app is quitting, or its router is gone.
+    Closing,
+    /// Too many requests already wait for the main thread.
+    Busy,
+}
+
+impl Refused {
+    fn answer(self) -> &'static str {
+        match self {
+            Refused::Closing => "closing\n",
+            Refused::Busy => "busy\n",
+        }
+    }
+}
+
 /// Tells a serving [`Primary`] that the app is quitting. From then on it answers every second
 /// launch `closing` without handing the request on, and the second launch waits for the lock
 /// to come free and starts fresh instead of sending its link into an app that is going away.
@@ -220,17 +241,27 @@ impl Primary {
     /// lives, handing each accepted [`Request`] to `on_request` (on that thread). Returns
     /// `self` back so the caller keeps the lock and the socket file alive.
     ///
-    /// `on_request` returns whether the app took the request. The peer is answered only
-    /// after that: `ok` if it did, `closing` if it did not or [`Primary::closer`] has closed
-    /// the endpoint, so a second launch is never told `ok` for a link the app will not see.
-    pub fn serve(mut self, on_request: impl Fn(Request) -> bool + Send + 'static) -> io::Result<Self> {
+    /// `on_request` says whether the app took the request. The peer is answered only after
+    /// that: `ok` if it did, the [`Refused`] reason if not (`closing` also once
+    /// [`Primary::closer`] has closed the endpoint), so a second launch is never told `ok`
+    /// for a link the app will not see.
+    pub fn serve(
+        mut self,
+        on_request: impl Fn(Request) -> Result<(), Refused> + Send + 'static,
+    ) -> io::Result<Self> {
         let listener = self.listener.take().expect("serve is called once");
         let closing = self.closing.clone();
         std::thread::Builder::new().name("chairphoto-instance".into()).spawn(move || {
             for stream in listener.incoming() {
                 match stream {
                     Ok(stream) => {
-                        let accept = |request: Request| !closing.is_closed() && on_request(request);
+                        let accept = |request: Request| {
+                            if closing.is_closed() {
+                                Err(Refused::Closing)
+                            } else {
+                                on_request(request)
+                            }
+                        };
                         if let Err(e) = serve_one(stream, accept) {
                             eprintln!("single instance: dropped a request: {e}");
                         }
@@ -279,7 +310,8 @@ pub fn claim(endpoint: &Endpoint, request: &Request, patience: Duration) -> Resu
         let not_now = match UnixStream::connect(&endpoint.socket) {
             Ok(stream) => match forward(stream, request).map_err(ClaimError::NoAnswer)? {
                 Answer::Accepted => return Ok(Claim::Forwarded),
-                Answer::Closing => io::Error::other("the running instance is quitting"),
+                Answer::Refused(Refused::Closing) => io::Error::other("the running instance is quitting"),
+                Answer::Refused(Refused::Busy) => io::Error::other("the running instance is busy"),
             },
             Err(e) if matches!(e.kind(), ErrorKind::NotFound | ErrorKind::ConnectionRefused) => e,
             Err(e) => return Err(ClaimError::NoAnswer(e)),
@@ -311,8 +343,8 @@ fn become_primary(endpoint: &Endpoint, lock: File) -> Result<Claim, ClaimError> 
 enum Answer {
     /// `ok`: the app took the request.
     Accepted,
-    /// `closing`: the app is quitting and did not take it.
-    Closing,
+    /// `closing` or `busy`: the app did not take it.
+    Refused(Refused),
 }
 
 /// Send `request` over a connection to the primary and wait for its answer.
@@ -329,23 +361,27 @@ fn forward(mut stream: UnixStream, request: &Request) -> io::Result<Answer> {
     BufReader::new(stream).take(MAX_LINE as u64).read_line(&mut answer)?;
     match answer.trim_end() {
         "ok" => Ok(Answer::Accepted),
-        "closing" => Ok(Answer::Closing),
+        "closing" => Ok(Answer::Refused(Refused::Closing)),
+        "busy" => Ok(Answer::Refused(Refused::Busy)),
         "" => Err(io::Error::new(ErrorKind::UnexpectedEof, "the running instance closed the connection")),
         other => Err(io::Error::other(format!("the running instance answered {other:?}"))),
     }
 }
 
 /// Read one request from a peer, offer it to `accept`, then answer: `ok` if it was taken,
-/// `closing` if not, `error <why>` if it was malformed. The answer comes after the handoff so
+/// the [`Refused`] reason if not, `error <why>` if it was malformed. The answer comes after the handoff so
 /// that `ok` is never a promise the app cannot keep. Errors are the peer's fault; the caller
 /// logs them and moves on.
-fn serve_one(stream: UnixStream, accept: impl FnOnce(Request) -> bool) -> io::Result<()> {
+fn serve_one(stream: UnixStream, accept: impl FnOnce(Request) -> Result<(), Refused>) -> io::Result<()> {
     stream.set_write_timeout(Some(IO_TIMEOUT))?;
     let mut writer = stream.try_clone()?;
     let reader = Deadline { stream, until: Instant::now() + REQUEST_DEADLINE };
     let (answer, result) = match parse_request(&mut BufReader::new(reader)) {
         Ok(request) => {
-            let answer = if accept(request) { "ok\n" } else { "closing\n" };
+            let answer = match accept(request) {
+                Ok(()) => "ok\n",
+                Err(refused) => refused.answer(),
+            };
             (answer.to_string(), Ok(()))
         }
         Err(e) => (format!("error {}\n", e.to_string().replace('\n', " ")), Err(e)),
@@ -456,7 +492,7 @@ mod tests {
         let endpoint = Endpoint::new(&dir.0, "k");
         let (tx, rx) = mpsc::channel();
         let _primary = primary(claim(&endpoint, &Request::default(), CONNECT_PATIENCE))
-            .serve(move |r| tx.send(r).is_ok())
+            .serve(move |r| tx.send(r).map_err(|_| Refused::Closing))
             .unwrap();
 
         let second = Request { urls: vec![PHOTO.into(), "chairphoto://tag/x".into()] };
@@ -488,7 +524,7 @@ mod tests {
 
         let (tx, rx) = mpsc::channel();
         let _primary = primary(claim(&endpoint, &Request::default(), CONNECT_PATIENCE))
-            .serve(move |r| tx.send(r).is_ok())
+            .serve(move |r| tx.send(r).map_err(|_| Refused::Closing))
             .unwrap();
         let second = Request { urls: vec![PHOTO.into()] };
         assert!(matches!(claim(&endpoint, &second, CONNECT_PATIENCE).unwrap(), Claim::Forwarded));
@@ -501,7 +537,7 @@ mod tests {
     fn a_primary_that_quits_hands_over_to_the_next_launch() {
         let dir = TempDir::new("handover");
         let endpoint = Endpoint::new(&dir.0, "k");
-        let first = primary(claim(&endpoint, &Request::default(), CONNECT_PATIENCE)).serve(|_| true).unwrap();
+        let first = primary(claim(&endpoint, &Request::default(), CONNECT_PATIENCE)).serve(|_| Ok(())).unwrap();
         drop(first);
         assert!(!endpoint.socket.exists(), "a clean exit removes the socket");
         let _next = primary(claim(&endpoint, &Request::default(), CONNECT_PATIENCE));
@@ -536,7 +572,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(150));
             let listener = UnixListener::bind(&socket).unwrap();
             let (stream, _) = listener.accept().unwrap();
-            serve_one(stream, |r| tx.send(r).is_ok()).unwrap();
+            serve_one(stream, |r| tx.send(r).map_err(|_| Refused::Closing)).unwrap();
         });
         let second = Request { urls: vec![PHOTO.into()] };
         assert!(matches!(claim(&endpoint, &second, CONNECT_PATIENCE).unwrap(), Claim::Forwarded));
@@ -571,7 +607,7 @@ mod tests {
         let endpoint = Endpoint::new(&dir.0, "k");
         let (tx, rx) = mpsc::channel();
         let quitting = primary(claim(&endpoint, &Request::default(), CONNECT_PATIENCE))
-            .serve(move |r| tx.send(r).is_ok())
+            .serve(move |r| tx.send(r).map_err(|_| Refused::Closing))
             .unwrap();
         quitting.closer().close();
         let departing = std::thread::spawn(move || {
@@ -589,7 +625,7 @@ mod tests {
     fn a_request_the_app_does_not_take_is_not_acknowledged() {
         let dir = TempDir::new("refused");
         let endpoint = Endpoint::new(&dir.0, "k");
-        let _primary = primary(claim(&endpoint, &Request::default(), CONNECT_PATIENCE)).serve(|_| false).unwrap();
+        let _primary = primary(claim(&endpoint, &Request::default(), CONNECT_PATIENCE)).serve(|_| Err(Refused::Closing)).unwrap();
         let result = claim(&endpoint, &Request { urls: vec![PHOTO.into()] }, Duration::from_millis(200));
         assert!(matches!(result, Err(ClaimError::NoAnswer(_))), "expected NoAnswer");
     }
@@ -601,7 +637,7 @@ mod tests {
     fn a_trickling_peer_is_cut_off_at_the_request_deadline() {
         let dir = TempDir::new("trickle");
         let endpoint = Endpoint::new(&dir.0, "k");
-        let _primary = primary(claim(&endpoint, &Request::default(), CONNECT_PATIENCE)).serve(|_| true).unwrap();
+        let _primary = primary(claim(&endpoint, &Request::default(), CONNECT_PATIENCE)).serve(|_| Ok(())).unwrap();
         let stream = UnixStream::connect(&endpoint.socket).unwrap();
         let mut reader = stream.try_clone().unwrap();
         let started = Instant::now();
@@ -630,6 +666,21 @@ mod tests {
         );
     }
 
+    /// A primary whose app refuses as busy is not acknowledged either: the second launch
+    /// keeps trying for its patience, then gives up saying the instance is busy.
+    #[test]
+    fn a_busy_primary_is_reported_as_busy() {
+        let dir = TempDir::new("busy");
+        let endpoint = Endpoint::new(&dir.0, "k");
+        let _primary = primary(claim(&endpoint, &Request::default(), CONNECT_PATIENCE))
+            .serve(|_| Err(Refused::Busy))
+            .unwrap();
+        match claim(&endpoint, &Request { urls: vec![PHOTO.into()] }, Duration::from_millis(200)) {
+            Err(ClaimError::NoAnswer(e)) => assert_eq!(e.to_string(), "the running instance is busy"),
+            _ => panic!("expected NoAnswer"),
+        }
+    }
+
     /// A peer that speaks something else gets an error line and its request is dropped; the
     /// primary keeps serving.
     #[test]
@@ -638,7 +689,7 @@ mod tests {
         let endpoint = Endpoint::new(&dir.0, "k");
         let (tx, rx) = mpsc::channel();
         let _primary = primary(claim(&endpoint, &Request::default(), CONNECT_PATIENCE))
-            .serve(move |r| tx.send(r).is_ok())
+            .serve(move |r| tx.send(r).map_err(|_| Refused::Closing))
             .unwrap();
 
         for bad in ["hello\nend\n", "chairphoto-instance 1\nopen x\nend\n", "chairphoto-instance 1\nurl x\n"] {

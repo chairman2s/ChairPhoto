@@ -4,11 +4,55 @@
 
 use crate::keymap::Quit;
 use crate::model::AppModel;
-use crate::single_instance::{Closer, Request};
+use crate::single_instance::{Closer, Refused, Request};
 use crate::QuitRequested;
-use futures::channel::mpsc::UnboundedReceiver;
+use futures::channel::mpsc::{unbounded, UnboundedReceiver, UnboundedSender};
 use futures::StreamExt as _;
 use gpui_kit::{AnyWindowHandle, App, Entity, Task};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+
+/// Most second-launch requests that may wait for the main thread at once. More only pile up
+/// behind a main thread that is not draining them (a hung app); those are refused `busy`.
+pub const MAX_QUEUED_REQUESTS: usize = 16;
+
+/// The single-instance thread's end of the request queue.
+pub struct RequestSender {
+    tx: UnboundedSender<Request>,
+    queued: Arc<AtomicUsize>,
+}
+
+/// The main thread's end, drained by [`spawn_request_router`].
+pub struct RequestReceiver {
+    rx: UnboundedReceiver<Request>,
+    queued: Arc<AtomicUsize>,
+}
+
+/// A queue of at most [`MAX_QUEUED_REQUESTS`] requests between the single-instance thread
+/// and the main thread.
+pub fn request_queue() -> (RequestSender, RequestReceiver) {
+    let (tx, rx) = unbounded();
+    let queued = Arc::new(AtomicUsize::new(0));
+    (RequestSender { tx, queued: queued.clone() }, RequestReceiver { rx, queued })
+}
+
+impl RequestSender {
+    /// Queue `request` for the main thread: `Busy` when the queue is full, `Closing` when the
+    /// main thread's end is gone.
+    pub fn send(&self, request: Request) -> Result<(), Refused> {
+        let reserved = self
+            .queued
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| (n < MAX_QUEUED_REQUESTS).then_some(n + 1));
+        if reserved.is_err() {
+            eprintln!("single instance: {MAX_QUEUED_REQUESTS} requests already wait for the main thread; refusing one");
+            return Err(Refused::Busy);
+        }
+        self.tx.unbounded_send(request).map_err(|_| {
+            self.queued.fetch_sub(1, Ordering::SeqCst);
+            Refused::Closing
+        })
+    }
+}
 
 /// Apply one second-launch request: bring the main window forward, then open each URL in
 /// order (the last one wins, as in the React app).
@@ -27,13 +71,15 @@ pub fn apply_request(request: Request, model: &Entity<AppModel>, main_window: Op
 
 /// Drain second-launch requests on the main thread for the app's lifetime; detach it.
 pub fn spawn_request_router(
-    mut rx: UnboundedReceiver<Request>,
+    requests: RequestReceiver,
     model: Entity<AppModel>,
     main_window: Option<AnyWindowHandle>,
     cx: &mut App,
 ) -> Task<()> {
     cx.spawn(async move |cx| {
+        let RequestReceiver { mut rx, queued } = requests;
         while let Some(request) = rx.next().await {
+            queued.fetch_sub(1, Ordering::SeqCst);
             cx.update(|cx| apply_request(request, &model, main_window, cx));
         }
     })

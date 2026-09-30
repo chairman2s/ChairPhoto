@@ -98,23 +98,26 @@ fn changed_controls(prev: &VersionEdit, next: &VersionEdit) -> Vec<(String, Stri
     }
     let pwb = wb_of(&pt);
     let nwb = wb_of(&nt);
-    let pk = if pwb.is_kelvin() { pwb.kelvin.get() } else { None };
-    let nk = if nwb.is_kelvin() { nwb.kelvin.get() } else { None };
-    if pk != nk {
+    // `wb.mode === "kelvin" ? wb.kelvin : undefined` — as JS values, so a `null` Kelvin is
+    // not `undefined` (`null !== undefined` is a change), while `!= null` covers both.
+    let pk = if pwb.is_kelvin() { pwb.kelvin.js() } else { None };
+    let nk = if nwb.is_kelvin() { nwb.kelvin.js() } else { None };
+    let nullish = |k: &Option<Value>| k.as_ref().is_none_or(Value::is_null);
+    if !js_compat::strict_eq(pk.as_ref(), nk.as_ref()) {
         // Kelvin (slice 9): the stated light, or back to as-shot.
-        let label = match nk {
-            Some(k) => format!("White balance {} K", number_to_string(js_compat::round(k))),
+        let label = match nk.as_ref().filter(|k| !k.is_null()) {
+            Some(k) => format!("White balance {} K", number_to_string(js_compat::round(js_compat::to_number(k)))),
             None => "White balance as shot".to_string(),
         };
         push("tone.wb.kelvin", label);
-    } else if nk.is_some() {
+    } else if !nullish(&nk) {
         if differs(&pwb.tint, &nwb.tint) {
             let t = nwb.tint.num_or(0.0);
             let sign = if t >= 0.0 { "+" } else { "−" };
             push("tone.wb.tint", format!("Tint {sign}{}", number_to_string(js_compat::round(t).abs())));
         }
     }
-    if nk.is_none() && pk.is_none() {
+    if nullish(&nk) && nullish(&pk) {
         if differs(&pwb.temp, &nwb.temp) {
             push("tone.wb.temp", format!("Temperature {}", signed(nwb.temp.num_or(0.0))));
         }
@@ -366,6 +369,22 @@ mod tests {
         assert_eq!(describe_change(&rec(bad_crop.clone()), &rec(bad_crop), None).key, "none");
         assert_eq!(label(json!({}), json!({"fade": "0.5"})), "Fade 0.50");
         assert_eq!(label(json!({"tone": {"wb": {"temp": 0.1, "mode": 5}}}), json!({"tone": {"wb": {"temp": 0.2, "mode": 5}}})), "Temperature +0.20");
+    }
+
+    /// Second review, finding 3: prev's Kelvin is `null`, next has none — TS has
+    /// `pk = null`, `nk = undefined`, and `null !== undefined` names the change.
+    #[test]
+    fn a_null_kelvin_is_not_an_absent_one() {
+        let prev = json!({"tone": {"wb": {"mode": "kelvin", "kelvin": null}}});
+        assert_eq!(
+            describe_change(&rec(prev.clone()), &rec(json!({})), None),
+            Change { label: "White balance as shot".into(), key: "tone.wb.kelvin".into() }
+        );
+        // Both null: no Kelvin change, and neither side states a light.
+        assert_eq!(describe_change(&rec(prev.clone()), &rec(prev), None).key, "none");
+        // null → a light names the light.
+        let next = json!({"tone": {"wb": {"mode": "kelvin", "kelvin": 5200}}});
+        assert_eq!(label(json!({"tone": {"wb": {"mode": "kelvin", "kelvin": null}}}), next), "White balance 5200 K");
     }
 
     // --- JS-formatting edge cases (new) ---

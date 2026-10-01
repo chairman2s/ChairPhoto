@@ -390,19 +390,25 @@ impl MapState {
     /// ([`HostConsent::merge_legacy`]: only allowed/denied entries; denied wins), then empty
     /// the catalog's copy — in the catalog it was read from — so it is merged once, and a
     /// later change in Preferences is not undone by the next read.
+    ///
+    /// The catalog's copy is emptied only **after** the machine's copy is on disk
+    /// ([`MachinePrefs::set_then`], off the UI thread): if that write fails (or the
+    /// preferences live in memory only), the catalog keeps its answers and the next read
+    /// merges them again, so a remembered decision is never lost (gate #119).
     fn migrate_consent(&mut self, from: CatalogIdentity, legacy: Option<&str>, cx: &mut Context<Self>) {
         let legacy = HostConsent::parse(legacy);
         if legacy.is_empty() {
             return;
         }
-        if self.consent.merge_legacy(&legacy) {
-            MachinePrefs::set(cx, MACHINE_TILE_HOSTS, &self.consent.to_json());
-        }
-        let key = self.settings.key(TILE_HOSTS_KEY);
-        self.run(cx, move |app, _| with_catalog_as(app, from, |c| c.set_setting(&key, "{}")), |_, r, _| {
-            if let Err(e) = r {
-                eprintln!("map: could not empty the catalog's old tile answers: {e}");
+        self.consent.merge_legacy(&legacy);
+        let (app, key) = (self.app.clone(), self.settings.key(TILE_HOSTS_KEY));
+        MachinePrefs::set_then(cx, MACHINE_TILE_HOSTS, &self.consent.to_json(), move |saved| match saved {
+            Ok(()) => {
+                if let Err(e) = with_catalog_as(&app, from, |c| c.set_setting(&key, "{}")) {
+                    eprintln!("map: could not empty the catalog's old tile answers: {e}");
+                }
             }
+            Err(e) => eprintln!("map: kept the catalog's old tile answers; this machine's copy is not saved: {e}"),
         });
     }
 

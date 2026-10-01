@@ -23,6 +23,9 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+/// Told whether a write reached the disk ([`MachinePrefs::set_then`]).
+type Saved = Box<dyn FnOnce(Result<(), String>) + Send>;
+
 /// The file in the app data dir.
 pub const FILE_NAME: &str = "machine-prefs.json";
 
@@ -88,28 +91,60 @@ impl MachinePrefs {
 
     /// Set `key` and persist the whole store off the UI thread. No store installed: nothing.
     pub fn set(cx: &mut App, key: &str, value: &str) {
-        if !cx.has_global::<MachinePrefs>() {
+        if cx.try_global::<MachinePrefs>().is_none_or(|p| p.get(key) == Some(value)) {
             return;
         }
+        Self::persist(cx, key, value, None);
+    }
+
+    /// [`set`](Self::set), then `then(saved)` off the UI thread once the write is over:
+    /// `Ok` when the file holds this value (this snapshot, or a newer one, was written);
+    /// `Err` when the write failed, or nothing persists (no store installed, or memory
+    /// only). For a caller that may discard another copy only once this one is durable
+    /// (the Map module's consent migration). Writes even an unchanged value: an earlier
+    /// write of it may have failed.
+    pub fn set_then(cx: &mut App, key: &str, value: &str, then: impl FnOnce(Result<(), String>) + Send + 'static) {
+        Self::persist(cx, key, value, Some(Box::new(then)));
+    }
+
+    fn persist(cx: &mut App, key: &str, value: &str, then: Option<Saved>) {
         let runner = Runner::get(cx);
-        let prefs = cx.global_mut::<MachinePrefs>();
-        if prefs.get(key) == Some(value) {
-            return;
+        let fail = |runner: &Runner, then: Option<Saved>, why: &'static str| {
+            if let Some(then) = then {
+                runner.spawn(move || then(Err(why.into())));
+            }
+        };
+        if !cx.has_global::<MachinePrefs>() {
+            return fail(&runner, then, "no preference store is installed");
         }
+        let prefs = cx.global_mut::<MachinePrefs>();
         prefs.values.insert(key.to_string(), value.to_string());
-        let Some(path) = prefs.path.clone() else { return };
+        let Some(path) = prefs.path.clone() else {
+            return fail(&runner, then, "this machine's preferences are kept in memory only");
+        };
         prefs.seq += 1;
         let (seq, snapshot, written) = (prefs.seq, prefs.values.clone(), prefs.written.clone());
         runner.spawn(move || {
             // Held across the write, so two snapshots never write at once and an older one
             // that arrives late is skipped rather than undoing a newer one.
             let mut last = written.lock().unwrap_or_else(|e| e.into_inner());
-            if seq <= *last {
-                return;
-            }
-            match write_atomically(&path, &snapshot) {
-                Ok(()) => *last = seq,
-                Err(e) => eprintln!("machine prefs: cannot write {}: {e}", path.display()),
+            let saved = if seq <= *last {
+                Ok(()) // a newer snapshot is on disk: this value, or what replaced it
+            } else {
+                match write_atomically(&path, &snapshot) {
+                    Ok(()) => {
+                        *last = seq;
+                        Ok(())
+                    }
+                    Err(e) => {
+                        eprintln!("machine prefs: cannot write {}: {e}", path.display());
+                        Err(format!("cannot write {}: {e}", path.display()))
+                    }
+                }
+            };
+            drop(last);
+            if let Some(then) = then {
+                then(saved);
             }
         });
     }

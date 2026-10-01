@@ -12,6 +12,8 @@
 //!
 //! A fresh cached tile makes no request at all. A stale one whose revalidation fails (offline,
 //! a server error) is still shown — re-viewing what was already fetched, not an offline mode.
+//! Whatever is served is decoded first ([`TileFetcher::load_decoded`]): a cached body that is
+//! not a tile is evicted and fetched again, never served or revalidated.
 //!
 //! **Consent is the caller's.** The fetcher does not know whether the user allowed the host
 //! (decision #118, per host, asked on first open); the app's map never calls it for a host
@@ -19,7 +21,7 @@
 //! the source's own host or one of those ([`ReqwestHttp`] follows redirects itself). The
 //! HTTP client is behind [`TileHttp`] so tests count requests without a network.
 
-use super::cache::{CachedTile, TileCache, TileMeta, DEFAULT_CAP_BYTES};
+use super::cache::{TileCache, TileMeta, DEFAULT_CAP_BYTES};
 use super::math::TileKey;
 use super::source::{authority, TileSource};
 use std::future::Future;
@@ -46,9 +48,62 @@ pub struct HttpRequest {
     pub if_none_match: Option<String>,
     pub if_modified_since: Option<String>,
     /// Hosts (as [`authority`] names them) a redirect may lead to besides the request's
-    /// own: the other hosts the user allowed. A redirect anywhere else fails the tile
-    /// without contacting that host.
-    pub redirect_hosts: Vec<String>,
+    /// own: the other hosts the user allowed, read **when the redirect arrives**. A redirect
+    /// anywhere else fails the tile without contacting that host.
+    pub redirect_hosts: AllowedHosts,
+}
+
+/// The other hosts the user allowed, shared between the map and every load it started:
+/// [`set`](Self::set) changes the list every pending request consults at its next redirect,
+/// so revoking a host cuts off requests already in flight, not only later ones (gate #119).
+/// `Clone` shares the list; equality compares the hosts.
+#[derive(Clone, Default)]
+pub struct AllowedHosts(Arc<std::sync::RwLock<Arc<[String]>>>);
+
+impl AllowedHosts {
+    pub fn new(hosts: Vec<String>) -> Self {
+        AllowedHosts(Arc::new(std::sync::RwLock::new(Arc::from(hosts))))
+    }
+
+    /// Replace the hosts for every holder of this list. Returns whether they changed.
+    pub fn set(&self, hosts: Vec<String>) -> bool {
+        let mut current = self.0.write().unwrap_or_else(|e| e.into_inner());
+        if **current == *hosts {
+            return false;
+        }
+        *current = Arc::from(hosts);
+        true
+    }
+
+    /// The hosts now.
+    pub fn snapshot(&self) -> Vec<String> {
+        self.0.read().unwrap_or_else(|e| e.into_inner()).to_vec()
+    }
+
+    /// Whether `host` is allowed now.
+    pub fn allows(&self, host: &str) -> bool {
+        self.0.read().unwrap_or_else(|e| e.into_inner()).iter().any(|a| a.eq_ignore_ascii_case(host))
+    }
+}
+
+impl From<Vec<String>> for AllowedHosts {
+    fn from(hosts: Vec<String>) -> Self {
+        AllowedHosts::new(hosts)
+    }
+}
+
+impl PartialEq for AllowedHosts {
+    fn eq(&self, other: &Self) -> bool {
+        self.snapshot() == other.snapshot()
+    }
+}
+
+impl Eq for AllowedHosts {}
+
+impl std::fmt::Debug for AllowedHosts {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list().entries(self.snapshot()).finish()
+    }
 }
 
 /// What came back.
@@ -73,8 +128,8 @@ pub trait TileHttp: Send + Sync + 'static {
 /// **Redirects are followed by hand**, never by reqwest: consent is per host (decision
 /// #118), and reqwest's default policy would follow a tile server's redirect to any host.
 /// Each `Location` is checked before it is requested — the request's own host or one of
-/// [`HttpRequest::redirect_hosts`], `http`/`https` only, at most [`MAX_REDIRECTS`] —
-/// and anything else fails the tile.
+/// [`HttpRequest::redirect_hosts`] as they are at that moment, `http`/`https` only, at most
+/// [`MAX_REDIRECTS`] — and anything else fails the tile.
 pub struct ReqwestHttp {
     client: reqwest::Client,
 }
@@ -92,13 +147,13 @@ impl ReqwestHttp {
 }
 
 /// Where a redirect from `from` to `location` may go, or why not.
-fn redirect_target(from: &reqwest::Url, location: &str, origin: &str, allowed: &[String]) -> Result<reqwest::Url, String> {
+fn redirect_target(from: &reqwest::Url, location: &str, origin: &str, allowed: &AllowedHosts) -> Result<reqwest::Url, String> {
     let next = from.join(location).map_err(|e| format!("the tile server redirected to an invalid URL: {e}"))?;
     if !matches!(next.scheme(), "http" | "https") {
         return Err(format!("the tile server redirected to a {} URL", next.scheme()));
     }
     let host = authority(&next);
-    if host == origin || allowed.iter().any(|a| a.eq_ignore_ascii_case(&host)) {
+    if host == origin || allowed.allows(&host) {
         Ok(next)
     } else {
         Err(format!("the tile server redirected to {host}, which you have not allowed"))
@@ -190,11 +245,39 @@ pub struct LoadedTile {
     pub origin: Origin,
 }
 
-/// Whether `bytes` decode as an image, on a blocking worker (a full decode: a truncated
-/// PNG has a valid header).
-async fn decodes(bytes: &[u8]) -> bool {
-    let bytes = bytes.to_vec();
-    tokio::task::spawn_blocking(move || image::load_from_memory(&bytes).is_ok()).await.unwrap_or(false)
+/// A tile as the caller's decoder made it, and where its bytes came from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Decoded<T> {
+    pub tile: T,
+    pub origin: Origin,
+}
+
+/// Turns a tile's bytes into what the caller shows (the app: a texture). Runs on a
+/// blocking worker. `Err` means the bytes are not a tile.
+pub type TileDecoder<T> = Arc<dyn Fn(&[u8]) -> Result<T, String> + Send + Sync>;
+
+/// The bytes back once they decode as an image (a full decode: a truncated PNG has a valid
+/// header). [`TileFetcher::load`]'s decoder.
+pub fn checked_bytes(bytes: &[u8]) -> Result<Vec<u8>, String> {
+    image::load_from_memory(bytes).map(|_| bytes.to_vec()).map_err(|e| format!("not an image: {e}"))
+}
+
+/// `decode(bytes)` on a blocking worker; the bytes come back for the cache.
+async fn decode_off_thread<T: Send + 'static>(decode: &TileDecoder<T>, bytes: Vec<u8>) -> (Vec<u8>, Result<T, String>) {
+    let decode = decode.clone();
+    tokio::task::spawn_blocking(move || {
+        let result = decode(&bytes);
+        (bytes, result)
+    })
+    .await
+    .unwrap_or_else(|e| (Vec::new(), Err(e.to_string())))
+}
+
+/// What the network said, decoded.
+enum Fetched<T> {
+    Body { tile: T, body: Vec<u8>, meta: TileMeta },
+    NotModified(HttpResponse),
+    Failed(String),
 }
 
 fn unix_now() -> i64 {
@@ -231,68 +314,105 @@ impl TileFetcher {
         &self.cache
     }
 
-    /// One tile: a fresh cache entry, else the network (conditionally when a stale entry
-    /// exists), else the stale entry. Dropping the future before it reaches the network
-    /// (while it waits for a permit) sends nothing.
+    /// One tile's bytes, checked to decode as an image ([`checked_bytes`]):
+    /// [`load_decoded`](Self::load_decoded) with no other allowed host.
     pub async fn load(&self, source: &TileSource, key: TileKey) -> Result<LoadedTile, String> {
-        self.load_allowing(source, key, &[]).await
+        let decoded = self.load_decoded(source, key, &AllowedHosts::default(), Arc::new(checked_bytes)).await?;
+        Ok(LoadedTile { bytes: decoded.tile, origin: decoded.origin })
     }
 
-    /// [`load`](Self::load), where a redirect may also lead to `redirect_hosts` (the other
-    /// hosts the user allowed); with none, only to the source's own host.
-    pub async fn load_allowing(&self, source: &TileSource, key: TileKey, redirect_hosts: &[String]) -> Result<LoadedTile, String> {
+    /// One tile, made by `decode` on a blocking worker: a fresh cache entry, else the
+    /// network (conditionally when a stale entry exists), else the stale entry. A redirect
+    /// may lead to the source's own host or to `redirect_hosts` (the other hosts the user
+    /// allowed, consulted when the redirect arrives). Dropping the future before it reaches
+    /// the network (while it waits for a permit) sends nothing.
+    ///
+    /// **Every byte served is decoded first, once** (gate #119). A cached body that does not
+    /// decode — cached before 2xx bodies were checked, or damaged on disk since — is
+    /// evicted and fetched again *unconditionally*: it never reaches the caller, is never a
+    /// stale fallback, and its validators are never sent, so a `304` cannot renew it. A
+    /// downloaded 2xx body that does not decode (a captive portal's page, an error served as
+    /// 200) is a failure: never cached, and the map retries it later, with a valid stale
+    /// copy still shown meanwhile.
+    pub async fn load_decoded<T: Send + 'static>(
+        &self,
+        source: &TileSource,
+        key: TileKey,
+        redirect_hosts: &AllowedHosts,
+        decode: TileDecoder<T>,
+    ) -> Result<Decoded<T>, String> {
         let cached = {
             let (cache, source) = (self.cache.clone(), source.clone());
             tokio::task::spawn_blocking(move || cache.get(&source, key)).await.map_err(|e| e.to_string())?
         };
         let now = (self.clock)();
-        if let Some(c) = &cached {
-            if c.is_fresh(now) {
-                return Ok(LoadedTile { bytes: c.bytes.clone(), origin: Origin::Cache });
+        // The cached copy that decodes: served now when fresh, else revalidated.
+        let mut stale: Option<(T, TileMeta)> = None;
+        if let Some(c) = cached {
+            let fresh = c.is_fresh(now);
+            match decode_off_thread(&decode, c.bytes).await {
+                (_, Ok(tile)) if fresh => return Ok(Decoded { tile, origin: Origin::Cache }),
+                (_, Ok(tile)) => stale = Some((tile, c.meta)),
+                (_, Err(e)) => {
+                    eprintln!("tiles: cached tile {key:?} does not decode ({e}); fetching it again");
+                    self.evict(source, key).await;
+                }
             }
         }
         let response = {
             let _permit = self.permits.acquire().await.map_err(|e| e.to_string())?;
+            let validators = stale.as_ref().map(|(_, meta)| meta);
             let request = HttpRequest {
                 url: source.url(key),
-                if_none_match: cached.as_ref().and_then(|c| c.meta.etag.clone()),
-                if_modified_since: cached.as_ref().and_then(|c| c.meta.last_modified.clone()),
-                redirect_hosts: redirect_hosts.to_vec(),
+                if_none_match: validators.and_then(|m| m.etag.clone()),
+                if_modified_since: validators.and_then(|m| m.last_modified.clone()),
+                redirect_hosts: redirect_hosts.clone(),
             };
             self.http.get(request).await
         };
-        // A 2xx body is cached for a week, so it must be a tile: one that does not decode
-        // (a captive portal's page, an error served as 200) is a failure — never cached,
-        // and the map retries it later — with a stale copy still shown meanwhile.
-        let response = match response {
-            Ok(r) if (200..300).contains(&r.status) && !r.body.is_empty() && !decodes(&r.body).await => {
-                Err(format!("the tile server's answer (HTTP {}) is not an image", r.status))
-            }
-            other => other,
-        };
         let now = (self.clock)();
-        match (response, cached) {
-            (Ok(r), Some(c)) if r.status == 304 => {
+        let fetched = match response {
+            Ok(HttpResponse { status, body, etag, last_modified, cache_control })
+                if (200..300).contains(&status) && !body.is_empty() =>
+            {
+                match decode_off_thread(&decode, body).await {
+                    (body, Ok(tile)) => {
+                        let meta = TileMeta { etag, last_modified, expires: expiry(now, cache_control.as_deref()) };
+                        Fetched::Body { tile, body, meta }
+                    }
+                    (_, Err(_)) => Fetched::Failed(format!("the tile server's answer (HTTP {status}) is not an image")),
+                }
+            }
+            Ok(r) if r.status == 304 && stale.is_some() => Fetched::NotModified(r),
+            Ok(r) => Fetched::Failed(format!("the tile server answered HTTP {}", r.status)),
+            Err(e) => Fetched::Failed(e),
+        };
+        match (fetched, stale) {
+            (Fetched::Body { tile, body, meta }, _) => {
+                self.store(source, key, Some(body), meta).await;
+                Ok(Decoded { tile, origin: Origin::Network })
+            }
+            (Fetched::NotModified(r), Some((tile, old))) => {
                 let meta = TileMeta {
-                    etag: r.etag.or(c.meta.etag),
-                    last_modified: r.last_modified.or(c.meta.last_modified),
+                    etag: r.etag.or(old.etag),
+                    last_modified: r.last_modified.or(old.last_modified),
                     expires: expiry(now, r.cache_control.as_deref()),
                 };
                 self.store(source, key, None, meta).await;
-                Ok(LoadedTile { bytes: c.bytes, origin: Origin::Revalidated })
+                Ok(Decoded { tile, origin: Origin::Revalidated })
             }
-            (Ok(r), _) if (200..300).contains(&r.status) && !r.body.is_empty() => {
-                let meta = TileMeta {
-                    etag: r.etag,
-                    last_modified: r.last_modified,
-                    expires: expiry(now, r.cache_control.as_deref()),
-                };
-                self.store(source, key, Some(r.body.clone()), meta).await;
-                Ok(LoadedTile { bytes: r.body, origin: Origin::Network })
-            }
-            (Ok(_) | Err(_), Some(CachedTile { bytes, .. })) => Ok(LoadedTile { bytes, origin: Origin::Stale }),
-            (Ok(r), None) => Err(format!("the tile server answered HTTP {}", r.status)),
-            (Err(e), None) => Err(e),
+            (Fetched::Failed(_), Some((tile, _))) => Ok(Decoded { tile, origin: Origin::Stale }),
+            (Fetched::Failed(e), None) => Err(e),
+            (Fetched::NotModified(r), None) => Err(format!("the tile server answered HTTP {}", r.status)),
+        }
+    }
+
+    /// Drop a cached tile that does not decode; a failed removal is logged (the next load
+    /// finds it again and retries the removal).
+    async fn evict(&self, source: &TileSource, key: TileKey) {
+        let (cache, source) = (self.cache.clone(), source.clone());
+        if let Ok(Err(e)) = tokio::task::spawn_blocking(move || cache.remove(&source, key)).await {
+            eprintln!("tiles: could not evict cached tile {key:?}: {e}");
         }
     }
 
@@ -448,9 +568,9 @@ mod tests {
         let f = fetcher(http.clone(), &dir);
         let src = TileSource::default();
         let meta = TileMeta { etag: Some("\"e1\"".into()), last_modified: Some("Mon, 31 Aug 2026 00:00:00 GMT".into()), expires: NOW - 1 };
-        f.cache().put(&src, K, b"old", &meta).unwrap();
+        f.cache().put(&src, K, &png(9), &meta).unwrap();
         let got = f.load(&src, K).await.unwrap();
-        assert_eq!(got, LoadedTile { bytes: b"old".to_vec(), origin: Origin::Revalidated });
+        assert_eq!(got, LoadedTile { bytes: png(9), origin: Origin::Revalidated });
         let req = &http.requests()[0];
         assert_eq!(req.if_none_match.as_deref(), Some("\"e1\""));
         assert_eq!(req.if_modified_since.as_deref(), Some("Mon, 31 Aug 2026 00:00:00 GMT"));
@@ -464,10 +584,42 @@ mod tests {
         let http = Fake::answering(vec![ok(&png(2), Some("\"e2\""), Some("max-age=999999999"))]);
         let f = fetcher(http, &dir);
         let src = TileSource::default();
-        f.cache().put(&src, K, b"old", &TileMeta { etag: Some("\"e1\"".into()), expires: NOW - 1, ..Default::default() }).unwrap();
+        f.cache().put(&src, K, &png(9), &TileMeta { etag: Some("\"e1\"".into()), expires: NOW - 1, ..Default::default() }).unwrap();
         assert_eq!(f.load(&src, K).await.unwrap(), LoadedTile { bytes: png(2), origin: Origin::Network });
         let c = f.cache().get(&src, K).unwrap();
         assert_eq!((c.bytes, c.meta.expires), (png(2), NOW + 999_999_999));
+    }
+
+    /// Gate #119: a fresh cache hit was served without a decode check, so a body that is
+    /// not a tile (cached before 2xx bodies were checked, or damaged on disk) failed on
+    /// every retry until it expired, and a `304` renewed it for another week. Pre-seeded
+    /// cache files that do not decode: a fresh one is evicted and fetched again; a stale one
+    /// is evicted and fetched **without its validators**, so a `304` cannot renew it (the
+    /// server's 304 to an unconditional GET is a failure, and nothing is cached).
+    #[tokio::test]
+    async fn a_cached_tile_that_does_not_decode_is_evicted_and_fetched_again() {
+        let dir = TempDir::new("invalid");
+        let src = TileSource::default();
+        let portal = b"<html>Log in to the hotel wifi</html>";
+        let validators = |expires| TileMeta { etag: Some("\"e0\"".into()), last_modified: Some("Mon, 31 Aug 2026 00:00:00 GMT".into()), expires };
+
+        let http = Fake::answering(vec![ok(&png(5), Some("\"e5\""), None)]);
+        let f = fetcher(http.clone(), &dir);
+        f.cache().put(&src, K, portal, &validators(NOW + 1000)).unwrap();
+        assert_eq!(f.load(&src, K).await.unwrap(), LoadedTile { bytes: png(5), origin: Origin::Network });
+        let sent = http.requests();
+        assert_eq!(sent.len(), 1, "the fresh but broken entry was served from the cache");
+        assert_eq!((sent[0].if_none_match.as_deref(), sent[0].if_modified_since.as_deref()), (None, None));
+        assert_eq!(f.cache().get(&src, K).unwrap().bytes, png(5), "the refetched tile replaced it");
+
+        let other = TileKey { z: 4, x: 9, y: 5 };
+        let http = Fake::answering(vec![Ok(HttpResponse { status: 304, ..Default::default() })]);
+        let f = fetcher(http.clone(), &dir);
+        f.cache().put(&src, other, portal, &validators(NOW - 1)).unwrap();
+        assert_eq!(f.load(&src, other).await.unwrap_err(), "the tile server answered HTTP 304");
+        let sent = http.requests();
+        assert_eq!((sent[0].if_none_match.as_deref(), sent[0].if_modified_since.as_deref()), (None, None), "validators of a broken entry were sent");
+        assert_eq!(f.cache().get(&src, other), None, "the broken entry is gone, not renewed");
     }
 
     /// Offline or refused: a stale copy is still shown; with none, the error.
@@ -482,7 +634,7 @@ mod tests {
         ]);
         let f = fetcher(http, &dir);
         let src = TileSource::default();
-        f.cache().put(&src, K, b"old", &TileMeta { expires: NOW - 1, ..Default::default() }).unwrap();
+        f.cache().put(&src, K, &png(9), &TileMeta { expires: NOW - 1, ..Default::default() }).unwrap();
         assert_eq!(f.load(&src, K).await.unwrap().origin, Origin::Stale);
         assert_eq!(f.load(&src, K).await.unwrap().origin, Origin::Stale);
         let other = TileKey { z: 4, x: 9, y: 5 };
@@ -612,7 +764,7 @@ mod tests {
         .await;
         let http = ReqwestHttp::new().unwrap();
         let get = |path: &str, allowed: Vec<String>| {
-            http.get(HttpRequest { url: format!("http://{origin}{path}"), redirect_hosts: allowed, ..Default::default() })
+            http.get(HttpRequest { url: format!("http://{origin}{path}"), redirect_hosts: allowed.into(), ..Default::default() })
         };
 
         let err = get("/away", Vec::new()).await.unwrap_err();
@@ -626,7 +778,7 @@ mod tests {
         assert_eq!((allowed.status, allowed.body.as_slice()), (200, &b"else"[..]));
         assert_eq!(elsewhere_hits.load(Ordering::SeqCst), 1);
 
-        let to_file = redirect_target(&reqwest::Url::parse("http://h.org/a").unwrap(), "file:///etc/passwd", "h.org", &[]);
+        let to_file = redirect_target(&reqwest::Url::parse("http://h.org/a").unwrap(), "file:///etc/passwd", "h.org", &AllowedHosts::default());
         assert!(to_file.unwrap_err().contains("file URL"));
         s1.abort();
         s2.abort();
@@ -660,7 +812,7 @@ mod tests {
                 url: src.url(K),
                 if_none_match: Some("\"e1\"".into()),
                 if_modified_since: Some("Mon, 31 Aug 2026 00:00:00 GMT".into()),
-                redirect_hosts: Vec::new(),
+                redirect_hosts: AllowedHosts::default(),
             })
             .await
             .unwrap();

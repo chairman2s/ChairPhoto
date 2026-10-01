@@ -26,6 +26,7 @@
 
 use crate::keymap::{contexts, ReloadTheme};
 use crate::image_store::ImageStore;
+use crate::inspector::PhotoInspector;
 use crate::library::grid::LibraryView;
 use crate::library::stacks::{Closed, StackDialog};
 use crate::model::AppModel;
@@ -62,6 +63,8 @@ pub struct RootView {
     pub(crate) focus: FocusHandle,
     pub(crate) thumb_slider: Entity<SliderState>,
     pub(crate) library: Entity<LibraryView>,
+    /// The Photo inspector's tab bodies (#108), drawn inside the inspector column.
+    pub(crate) inspector: Entity<PhotoInspector>,
     /// The "Stack bursts" dialog while it is open, and its close subscription.
     pub(crate) stacks: Option<(Entity<StackDialog>, Subscription)>,
     /// The catalog the dialog was opened on: a switch closes it.
@@ -88,6 +91,7 @@ impl RootView {
         // in [`contexts::ROOT`] still reach the root, the grid's ancestor.
         library.read(cx).focus_handle().clone().focus(window, cx);
         let thumb_slider = crate::shell::command_pill::thumb_slider(&shell, window, cx);
+        let inspector = cx.new(|cx| PhotoInspector::new(model.clone(), shell.clone(), images.clone(), window, cx));
         let catalog_epoch = model.read(cx).catalog_epoch;
         let _observers = [
             cx.observe(&model, |this, model, cx| {
@@ -136,6 +140,7 @@ impl RootView {
             focus,
             thumb_slider,
             library,
+            inspector,
             stacks: None,
             catalog_epoch,
             resize: None,

@@ -1,10 +1,12 @@
 //! The inspector column's chrome (`src/components/shell/Inspector.tsx`): a filename
 //! header (the UI sans, not the display serif — App.css: filenames are identifiers, not
 //! titles) with the photo's colour-label swatch and a hide button, the lowercase tab row
-//! (details / tags / versions / publish), and the body the Photo inspector (#108) fills.
-//! QuickTagGroups, the tags tab's extra zone, comes with the Tag panel (#107). The enabled
-//! modules' inspector panels ([`crate::modules::PanelSlot::Inspector`]) render on the tags tab
-//! under its built-in blocks, as `PhotoInspector.tsx` did, while a photo is active.
+//! (details / tags / versions / publish), and the scrolling body. The details, versions and
+//! publish bodies are the Photo inspector ([`crate::inspector::PhotoInspector`], #108). The
+//! tags tab is the Tag panel's slot ([`crate::inspector::tags::tags_tab`]; its content and
+//! QuickTagGroups are #107), then the enabled modules' inspector panels
+//! ([`crate::modules::PanelSlot::Inspector`]), as `PhotoInspector.tsx` did, while a photo is
+//! active.
 
 use crate::shell::state::{InspectorTab, ShellState, Side};
 use crate::shell::style::{Colors, COLOR_LABELS};
@@ -92,16 +94,19 @@ impl RootView {
             .child(tabs)
             .child(
                 div()
+                    .id("inspector-body")
                     .flex_1()
-                    .p(px(16.))
-                    .text_size(px(11.))
-                    .text_color(colors.mute)
-                    .child(match active {
-                        Some(_) => "Photo inspector — not yet ported (#108)",
-                        None => "Select a photo",
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .flex()
+                    .flex_col()
+                    .map(|body| match (shell.inspector_tab, active) {
+                        (InspectorTab::Tags, Some(photo)) => body.child(crate::inspector::tags::tags_tab(photo, colors)).children(
+                            module_panels.map(|panels| div().id("module-slot-inspector").flex().flex_col().child(panels)),
+                        ),
+                        _ => body.child(self.inspector.clone()),
                     }),
             )
-            .children(module_panels.map(|panels| div().id("module-slot-inspector").flex().flex_col().child(panels)))
             .into_any_element()
     }
 }

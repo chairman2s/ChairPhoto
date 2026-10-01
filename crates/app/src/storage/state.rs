@@ -196,7 +196,14 @@ impl StorageState {
         let state = self.app.clone();
         let name = (!name.trim().is_empty()).then(|| name.trim().to_string());
         let selected: HashSet<String> = selected.into_iter().collect();
-        let rx = Runner::get(cx).run(move || scans::ingest_from_card(&state, &source, name.as_deref(), Some(selected)));
+        // Claimed here, not on the worker: a Cancel or a catalog switch before the worker
+        // starts must still stop it. One abort-flag lock, never the catalog's.
+        let abort = match scans::claim_import(&self.app) {
+            Ok(a) => a,
+            Err(e) => return self.finish_import(&job, Err(e), cx),
+        };
+        let rx = Runner::get(cx)
+            .run(move || scans::ingest_from_card_claimed(&state, &abort, &source, name.as_deref(), Some(selected)));
         cx.spawn(async move |this, cx| {
             let Ok(result) = rx.await else { return };
             this.update(cx, |s, cx| s.finish_import(&job, result.map(ImportOutcome::Card), cx)).ok();
@@ -212,7 +219,12 @@ impl StorageState {
         self.set_bench_import(Some((0, 0)), cx);
         self.status("Importing bundle…".into(), cx);
         let state = self.app.clone();
-        let rx = Runner::get(cx).run(move || chairphoto_core::app::bundles::import_bundle(&state, &path));
+        let abort = match scans::claim_import(&self.app) {
+            Ok(a) => a,
+            Err(e) => return self.finish_import(&job, Err(e), cx),
+        };
+        let rx =
+            Runner::get(cx).run(move || chairphoto_core::app::bundles::import_bundle_claimed(&state, &abort, &path));
         cx.spawn(async move |this, cx| {
             let Ok(result) = rx.await else { return };
             this.update(cx, |s, cx| s.finish_import(&job, result.map(ImportOutcome::Bundle), cx)).ok();
@@ -237,7 +249,9 @@ impl StorageState {
                 cx.emit(StorageEvent::BundleImported(Ok(r)));
             }
             (ImportKind::Card, Err(e)) => {
-                self.status(format!("Import failed: {e}"), cx);
+                // A cancelled import's report is its own line, not a failure.
+                let line = if e.starts_with(scans::IMPORT_CANCELLED) { e } else { format!("Import failed: {e}") };
+                self.status(line, cx);
                 cx.emit(StorageEvent::ImportEnded(ImportKind::Card));
             }
             (ImportKind::Bundle, Err(e)) => {

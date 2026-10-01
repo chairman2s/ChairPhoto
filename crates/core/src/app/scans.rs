@@ -118,7 +118,30 @@ pub fn ingest_from_card(
     name: Option<&str>,
     selected: Option<std::collections::HashSet<String>>,
 ) -> Result<ScanResult, String> {
-    let abort = state.jobs.import.install_fresh()?;
+    let abort = claim_import(state)?;
+    ingest_from_card_claimed(state, &abort, source, name, selected)
+}
+
+/// Claim the import generation: trip the running import and install a fresh flag. One abort
+/// lock, never the catalog's — cheap enough for a UI thread, which is the point: a front end
+/// that claims when the user presses Import can cancel (or a switch can trip) the import
+/// before its worker has even started.
+pub fn claim_import(state: &AppState) -> Result<std::sync::Arc<AtomicBool>, String> {
+    state.jobs.import.install_fresh()
+}
+
+/// [`ingest_from_card`] under an import generation the caller already claimed
+/// ([`claim_import`]). Already tripped: it copies nothing.
+pub fn ingest_from_card_claimed(
+    state: &AppState,
+    abort: &AtomicBool,
+    source: &Path,
+    name: Option<&str>,
+    selected: Option<std::collections::HashSet<String>>,
+) -> Result<ScanResult, String> {
+    if abort.load(Ordering::Relaxed) {
+        return Err(cancelled_message(0));
+    }
     let (db_path, dest) = {
         let guard = state.catalog.lock().map_err(|e| e.to_string())?;
         let catalog = guard.as_ref().ok_or("No catalog is open")?;
@@ -126,7 +149,7 @@ pub fn ingest_from_card(
     };
     let (result, copied, aborted) = {
         let events = state.clone();
-        crate::scanner::copy_from_card_abortable(source, &dest, selected.as_ref(), &abort, move |done, total| {
+        crate::scanner::copy_from_card_abortable(source, &dest, selected.as_ref(), abort, move |done, total| {
             events.send(CoreEvent::ImportProgress(ImportProgress { done, total }))
         })?
     };

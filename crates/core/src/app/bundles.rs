@@ -51,7 +51,20 @@ pub fn preview_bundle(state: &AppState, bundle_path: &Path) -> Result<BundlePrev
 /// `import:progress` per photo), then index and merge additively on a secondary connection
 /// to the catalog the import started against (UUID-aware, so nothing is duplicated).
 pub fn import_bundle(state: &AppState, bundle_path: &Path) -> Result<BundleImportResult, String> {
-    let abort = state.jobs.import.install_fresh()?;
+    let abort = super::scans::claim_import(state)?;
+    import_bundle_claimed(state, &abort, bundle_path)
+}
+
+/// [`import_bundle`] under an import generation the caller already claimed
+/// (`scans::claim_import`). Already tripped: it unpacks nothing.
+pub fn import_bundle_claimed(
+    state: &AppState,
+    abort: &std::sync::atomic::AtomicBool,
+    bundle_path: &Path,
+) -> Result<BundleImportResult, String> {
+    if abort.load(Ordering::Relaxed) {
+        return Err(format!("{IMPORT_CANCELLED} before the bundle was opened."));
+    }
     let dest = library_root(state)?;
     let db_path = {
         let guard = state.catalog.lock().map_err(|e| e.to_string())?;

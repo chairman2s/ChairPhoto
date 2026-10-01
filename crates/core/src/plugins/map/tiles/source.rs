@@ -27,6 +27,16 @@ pub const MAX_TILE_ZOOM: u8 = 19;
 
 const OSM_HOST: &str = "tile.openstreetmap.org";
 
+/// The host (with an explicit, non-default port) a request to `url` goes to: what tile
+/// consent names, and what a redirect is checked against. Lowercase; no credentials.
+pub fn authority(url: &reqwest::Url) -> String {
+    let host = url.host_str().unwrap_or_default().to_ascii_lowercase();
+    match url.port() {
+        Some(port) => format!("{host}:{port}"),
+        None => host,
+    }
+}
+
 /// A checked tile URL template.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct TileSource {
@@ -74,12 +84,21 @@ impl TileSource {
             let name: String = leftover[start..].chars().take_while(|c| *c != '}').chain(['}']).collect();
             return Err(format!("unsupported placeholder {name} in the tile URL"));
         }
-        let host_of = |t: &str| {
-            let rest = t.split_once("://").map(|(_, r)| r).unwrap_or(t);
-            let authority = rest.split('/').next().unwrap_or_default();
-            authority.rsplit('@').next().unwrap_or_default().to_ascii_lowercase()
+        // The consent host is where requests actually go: the host of a filled-in URL, as
+        // the HTTP client parses it. A placeholder in the host would send each tile to
+        // another host than the one consented to, so it is refused: two fillings must agree.
+        let filled = |n: &str| template.replace("{z}", n).replace("{x}", n).replace("{y}", n);
+        let parse_host = |u: &str| {
+            reqwest::Url::parse(u)
+                .ok()
+                .filter(|u| u.host_str().is_some_and(|h| !h.is_empty()))
+                .map(|u| self::authority(&u))
+                .ok_or_else(|| "a tile URL needs a host and a path".to_string())
         };
-        let host = host_of(&template);
+        let host = parse_host(&filled("0"))?;
+        if parse_host(&filled("1"))? != host {
+            return Err("a tile URL's host cannot contain the {z}, {x} or {y} placeholders".into());
+        }
         Ok(TileSource { template, host })
     }
 
@@ -156,6 +175,28 @@ mod tests {
         assert!(err("https://x.org/{z}/{x}.png").contains("missing {y}"));
         assert!(err("https://x.org/{z}/{x}/{y}{r}.png").contains("{r}"));
         assert!(err("https://{z}{x}{y}").contains("host and a path"));
+    }
+
+    /// Review #119: the consent host was taken from the template itself, so a placeholder in
+    /// the host made consent name `{z}.tiles.example.org` while requests went to
+    /// `3.tiles.example.org`. The host is now that of a filled-in URL, and a template whose
+    /// host would vary per tile is refused.
+    #[test]
+    fn the_consent_host_is_where_requests_go_and_never_varies_per_tile() {
+        let err = |u: &str| TileSource::parse(u).unwrap_err();
+        for t in [
+            "https://{z}.tiles.example.org/{x}/{y}.png",
+            "https://tiles-{x}.example.org/{z}/{y}.png",
+            "https://tiles.example.org:80{y}/{z}/{x}.png",
+        ] {
+            assert!(err(t).contains("host cannot contain"), "{t}: {}", err(t));
+        }
+        let s = TileSource::parse("https://Tiles.Example.org:443/{z}/{x}/{y}.png?key=a").unwrap();
+        assert_eq!(s.host(), "tiles.example.org", "the default port is the same host");
+        for key in [TileKey { z: 0, x: 0, y: 0 }, TileKey { z: 12, x: 2048, y: 1300 }] {
+            let url = reqwest::Url::parse(&s.url(key)).unwrap();
+            assert_eq!(authority(&url), s.host(), "every request goes to the consented host");
+        }
     }
 
     #[test]

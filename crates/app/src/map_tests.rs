@@ -6,7 +6,10 @@
 //! ([`work`]).
 
 use super::*;
-use crate::modules::map::state::Load;
+use crate::modules::map::state::fake::FakeGeocode;
+use crate::modules::map::state::{Load, MapGeocode};
+use chairphoto_core::app::GeocodeProgress;
+use chairphoto_core::plugins::map::geocode::GeocodeAllSummary;
 use crate::modules::map::tiles::fake::{tiny, FakeTiles};
 use crate::modules::map::tiles::MapTiles;
 use crate::modules::map::view::MapView;
@@ -25,6 +28,9 @@ const OSM: &str = "tile.openstreetmap.org";
 const OSLO: LatLng = (59.91, 10.75);
 const OSLO2: LatLng = (59.912, 10.752);
 const SYDNEY: LatLng = (-33.87, 151.21);
+/// The Map module's old per-catalog consent setting (`map.tileHosts`), as the first port
+/// stored it through `ModuleSettings`.
+const LEGACY_HOSTS: &str = "map.tileHosts";
 
 /// Run queued catalog work and repaint until nothing more happens.
 fn work(app: &App, cx: &mut TestAppContext) {
@@ -197,7 +203,7 @@ impl Map {
 /// Decision #118: opening the map asks before the first tile request to a host; until the
 /// user allows it nothing is fetched — not while the card is up, not after "Not now", not
 /// while panning and zooming — and markers still show. The answer is remembered per host in
-/// `map.tileHosts`; allowing (here from the status bar's chip) starts fetching, and only from
+/// this machine's preferences (`map.tileHosts`), not the catalog; allowing (here from the status bar's chip) starts fetching, and only from
 /// that host.
 #[gpui_kit::test]
 fn no_tile_is_fetched_before_the_user_allows_the_host(cx: &mut TestAppContext) {
@@ -213,7 +219,8 @@ fn no_tile_is_fetched_before_the_user_allows_the_host(cx: &mut TestAppContext) {
 
     m.click("map-consent-deny", cx);
     assert!(!m.has("map-consent", cx));
-    assert_eq!(m.setting("map.tileHosts").as_deref(), Some(r#"{"tile.openstreetmap.org":false}"#));
+    assert_eq!(machine_hosts(cx).as_deref(), Some(r#"{"tile.openstreetmap.org":false}"#));
+    assert_eq!(m.setting(LEGACY_HOSTS), None, "not a catalog setting");
     view.update(cx, |v, cx| {
         v.zoom_by(3.0, cx);
         v.viewport.pan_by(120.0, -40.0);
@@ -231,7 +238,7 @@ fn no_tile_is_fetched_before_the_user_allows_the_host(cx: &mut TestAppContext) {
     assert_eq!(m.fake.count(), 0);
 
     m.click("map-tiles-off", cx);
-    assert_eq!(m.setting("map.tileHosts").as_deref(), Some(r#"{"tile.openstreetmap.org":true}"#));
+    assert_eq!(machine_hosts(cx).as_deref(), Some(r#"{"tile.openstreetmap.org":true}"#));
     let n = m.loads_to(OSM);
     let visible = view.read_with(cx, |v, _| v.viewport.visible_tiles().len());
     assert!(n > 0 && n <= visible, "only the visible tiles load: {n} of {visible}");
@@ -262,11 +269,14 @@ fn another_tile_host_asks_again_and_fetches_nothing_meanwhile(cx: &mut TestAppCo
     m.allow(cx);
     let loads = m.fake.loads.lock().unwrap();
     assert!(loads[before..].iter().all(|l| l.host == "a.tiles.example.org") && loads.len() > before);
+    // A redirect may lead only to the source's own host or another allowed one.
+    assert!(loads[..before].iter().all(|l| l.redirect_hosts.is_empty()), "nothing else was allowed then");
+    assert!(loads[before..].iter().all(|l| l.redirect_hosts == [OSM]), "OSM is the other allowed host");
 }
 
-/// A catalog switch makes the old catalog's answer and every pending load unreachable: the
-/// loads are cancelled, a result that arrives anyway is dropped, and the new catalog's map
-/// asks again before fetching.
+/// A catalog switch makes every pending load unreachable: the loads are cancelled and a
+/// result that arrives anyway is dropped. The answer is this machine's, so the new
+/// catalog's map does not ask again; it fetches its own view once its settings are read.
 #[gpui_kit::test]
 fn a_catalog_switch_cancels_tile_loads_and_drops_late_results(cx: &mut TestAppContext) {
     let dir = TempDir::new("map-switch");
@@ -295,8 +305,95 @@ fn a_catalog_switch_cancels_tile_loads_and_drops_late_results(cx: &mut TestAppCo
         assert!(v.tiles.stats.stale_dropped >= pending as u64);
     });
     show_map(&m.app, cx);
-    assert!(m.has("map-consent", cx), "the new catalog has not been asked");
-    assert_eq!(m.fake.count(), pending);
+    assert!(!m.has("map-consent", cx), "the answer is per machine, not per catalog");
+    assert!(m.fake.count() > pending, "the new catalog's view loads from the allowed host");
+    m.loads_to(OSM);
+}
+
+/// The tile URL stays a catalog setting, written to the catalog its settings were read from:
+/// a save that lands after the core switched (event not delivered yet) fails closed instead
+/// of setting the new catalog's URL.
+#[gpui_kit::test]
+fn a_tile_url_saved_across_a_switch_does_not_reach_the_new_catalog(cx: &mut TestAppContext) {
+    let dir = TempDir::new("map-url-switch");
+    let m = open_map(&dir, &[OSLO], cx);
+    m.click("map-consent-deny", cx);
+    let state = map_state(&m, cx);
+    let other = dir.0.join("other");
+    let b = chairphoto_core::catalog::Catalog::open(&other.join("b.chairphoto"), &other).unwrap();
+    chairphoto_core::app::detach_catalog_and_trip_jobs(&m.app.state).unwrap();
+    chairphoto_core::app::publish_catalog_and_reset_jobs(&m.app.state, b).unwrap();
+    state.update(cx, |s, cx| s.set_tile_url("https://tiles.example.org/{z}/{x}/{y}.png", cx)).unwrap();
+    work(&m.app, cx);
+    let url_key = format!("{MAP_MODULE_ID}.tileUrl");
+    assert_eq!(m.setting(&url_key), None, "the old catalog's URL landed in the new catalog");
+}
+
+fn machine_hosts(cx: &mut TestAppContext) -> Option<String> {
+    cx.update(|cx| crate::machine_prefs::MachinePrefs::read(cx, crate::modules::map::logic::MACHINE_TILE_HOSTS))
+}
+
+/// Answers stored per catalog by the first port move to this machine on each catalog's
+/// first read: only allowed/denied entries; where catalogs (or the machine) disagree,
+/// denied wins. The catalog's copy is emptied so it merges once — a later Allow in
+/// Preferences is not undone by reopening that catalog. Preferences' Map tab lists the
+/// machine's answers and edits them.
+#[gpui_kit::test]
+fn per_catalog_answers_migrate_to_this_machine_and_show_in_preferences(cx: &mut TestAppContext) {
+    let dir = TempDir::new("map-migrate");
+    let fake = Arc::new(FakeTiles::default());
+    cx.update(|cx| cx.set_global(MapTiles(fake.clone())));
+    let app = start(cx);
+    open_catalog_with_photos(&app, &dir, 1, cx);
+    {
+        let guard = app.state.catalog.lock().unwrap();
+        guard.as_ref().unwrap().set_setting(
+            LEGACY_HOSTS,
+            r#"{"tile.openstreetmap.org":true,"b.example":true,"odd.example":"yes"}"#,
+        ).unwrap();
+    }
+    work(&app, cx);
+    cx.update(|cx| ModuleRegistry::enable(&app.wired.modules, MAP_MODULE_ID, cx));
+    work(&app, cx);
+    assert_eq!(machine_hosts(cx).as_deref(), Some(r#"{"b.example":true,"tile.openstreetmap.org":true}"#));
+    let setting = |app: &App| app.state.catalog.lock().unwrap().as_ref().unwrap().get_setting(LEGACY_HOSTS).unwrap();
+    assert_eq!(setting(&app).as_deref(), Some("{}"), "the catalog's copy was emptied");
+    show_map(&app, cx);
+    assert!(fake.count() > 0, "allowed by the migrated answer: no question");
+
+    // A second catalog blocked OSM: denied wins.
+    let other = TempDir::new("map-migrate-b");
+    let db = other.0.join("photos.chairphoto");
+    {
+        let c = chairphoto_core::catalog::Catalog::open(&db, &other.0.join("photos")).unwrap();
+        c.set_setting(LEGACY_HOSTS, r#"{"tile.openstreetmap.org":false}"#).unwrap();
+    }
+    open_catalog_with_photos(&app, &other, 1, cx);
+    work(&app, cx);
+    assert_eq!(machine_hosts(cx).as_deref(), Some(r#"{"b.example":true,"tile.openstreetmap.org":false}"#));
+
+    // Preferences → Map lists the machine's answers; Allow there sticks across catalogs.
+    click(&app, "rail-preferences", cx);
+    work(&app, cx);
+    click(&app, "prefs-tab-module-map", cx);
+    work(&app, cx);
+    let listed = cx
+        .update_window(app.window(), |_, window, cx| {
+            window.render_frame(cx);
+            window.try_find("map-host-b.example").is_some()
+        })
+        .unwrap();
+    assert!(listed, "the host list is in Preferences");
+    click(&app, "map-host-toggle-tile.openstreetmap.org", cx);
+    work(&app, cx);
+    assert_eq!(machine_hosts(cx).as_deref(), Some(r#"{"b.example":true,"tile.openstreetmap.org":true}"#));
+    // Away and back to the catalog that blocked OSM: already merged, so the Allow stands.
+    open_catalog_with_photos(&app, &dir, 1, cx);
+    work(&app, cx);
+    open_catalog_with_photos(&app, &other, 1, cx);
+    work(&app, cx);
+    assert_eq!(setting(&app).as_deref(), Some("{}"));
+    assert_eq!(machine_hosts(cx).as_deref(), Some(r#"{"b.example":true,"tile.openstreetmap.org":true}"#));
 }
 
 /// Tiles follow the view: panning far away cancels the loads that left it; a tile already
@@ -475,6 +572,160 @@ fn dragging_a_vertex_saves_the_new_shape(cx: &mut TestAppContext) {
     // Within a hundredth of a pixel (positions travel as f32 pixels).
     assert!((saved[2].0 - target.0).abs() < 1e-6 && (saved[2].1 - target.1).abs() < 1e-6, "{saved:?} vs {target:?}");
     assert_eq!(saved[0], square[0], "the other vertices stay");
+}
+
+/// **Forced interleaving** (review #119, catalog identity): the core switches to a catalog
+/// whose fence and photo ids collide, and `catalog:switched` has not reached the module
+/// yet. Every fence write the user can still click — save a drawn fence, edit, delete,
+/// apply (one and all share the guard) — is bound to the catalog the fences were read from and fails
+/// closed; the new catalog's fence and tags are untouched.
+#[gpui_kit::test]
+fn old_fence_ids_never_reach_the_new_catalog(cx: &mut TestAppContext) {
+    let dir = TempDir::new("map-ident");
+    let m = open_map(&dir, &[OSLO], cx);
+    m.click("map-consent-deny", cx);
+    let square = vec![(59.90, 10.74), (59.90, 10.76), (59.92, 10.76), (59.92, 10.74)];
+    {
+        let guard = m.app.state.catalog.lock().unwrap();
+        backend::create_fence_for(guard.as_ref().unwrap(), "Old", "Places/Old", &square).unwrap();
+    }
+    let state = m.view(cx).read_with(cx, |v, _| v.state.clone());
+    state.update(cx, |s, cx| s.reload_fences(cx));
+    work(&m.app, cx);
+    let old = state.read_with(cx, |s, _| s.fences[0].clone());
+
+    // The core switch, with the event not delivered.
+    let other = dir.0.join("other");
+    let b = chairphoto_core::catalog::Catalog::open(&other.join("b.chairphoto"), &other).unwrap();
+    let photo = b.upsert_photo(&other.join("2026/q0.ARW"), None, 0, 1).unwrap().id;
+    assert_eq!(photo, m.ids[0], "the photo ids collide");
+    backend::ensure_schema_for(&b).unwrap();
+    backend::set_photo_gps(&b, &[photo], OSLO.0, OSLO.1).unwrap();
+    let theirs = backend::create_fence_for(&b, "Theirs", "Places/Theirs", &square).unwrap();
+    assert_eq!(theirs.id, old.id, "the fence ids collide");
+    chairphoto_core::app::detach_catalog_and_trip_jobs(&m.app.state).unwrap();
+    chairphoto_core::app::publish_catalog_and_reset_jobs(&m.app.state, b).unwrap();
+
+    // All queued before any lands (a failed edit re-reads the fences, which are then the
+    // new catalog's, read with its identity: consistent, so later writes may go there).
+    state.update(cx, |s, cx| {
+        s.apply(None, cx);
+        let mut edited = old.clone();
+        edited.name = "Renamed".into();
+        s.update_fence(edited, cx);
+        s.create_fence("Drawn".into(), "Places/Drawn".into(), square.clone(), cx);
+        s.delete_fence(old.id, cx);
+    });
+    work(&m.app, cx);
+
+    let status = m.app.wired.model.read_with(cx, |m, _| m.status.to_string());
+    assert!(status.contains(chairphoto_core::app::CATALOG_CHANGED), "the write failed closed: {status}");
+    let guard = m.app.state.catalog.lock().unwrap();
+    let c = guard.as_ref().unwrap();
+    let fences = backend::list_fences_for(c).unwrap();
+    assert_eq!(fences.len(), 1, "nothing created or deleted in the new catalog: {fences:?}");
+    assert_eq!((fences[0].name.as_str(), fences[0].tag_path.as_str()), ("Theirs", "Places/Theirs"), "not renamed");
+    assert_eq!(backend::apply_fence(c, theirs.id).unwrap(), 1, "the new catalog's photo had not been tagged");
+}
+
+// --- Geocode all -------------------------------------------------------------------------
+
+/// The map with a recording Geocode all backend installed (no network; the real backend's
+/// cancel is `state.rs`'s `cancelling_a_net_run_drops_its_pending_request`).
+fn with_fake_geocode(cx: &mut TestAppContext) -> Arc<FakeGeocode> {
+    let fake = Arc::new(FakeGeocode::default());
+    cx.update(|cx| cx.set_global(MapGeocode(fake.clone())));
+    fake
+}
+
+fn map_state(m: &Map, cx: &mut TestAppContext) -> Entity<crate::modules::map::state::MapState> {
+    m.view(cx).read_with(cx, |v, _| v.state.clone())
+}
+
+/// Review #119: Geocode all ran on the core runtime with no owner. Disabling the module now
+/// stops it (its abort flag and its task), and a result that arrives anyway lands nowhere.
+#[gpui_kit::test]
+fn disabling_the_module_stops_geocode_all(cx: &mut TestAppContext) {
+    let dir = TempDir::new("map-geo-off");
+    let fake = with_fake_geocode(cx);
+    let m = open_map(&dir, &[OSLO], cx);
+    m.click("map-consent-deny", cx);
+    let state = map_state(&m, cx);
+    state.update(cx, |s, cx| s.geocode_all(cx));
+    work(&m.app, cx);
+    assert!(state.read_with(cx, |s, _| s.geocode_running().is_some() && s.geocode.busy));
+    let now = chairphoto_core::app::catalog_identity(&m.app.state).unwrap();
+    assert_eq!(fake.runs.lock().unwrap()[0].from, now, "bound to the shown catalog");
+
+    cx.update(|cx| ModuleRegistry::disable(&m.app.wired.modules, MAP_MODULE_ID, cx));
+    work(&m.app, cx);
+    assert!(fake.runs.lock().unwrap()[0].stopped(), "the run outlived the module");
+    let status = m.app.wired.model.read_with(cx, |m, _| m.status.to_string());
+    let done = fake.runs.lock().unwrap()[0].done.take().unwrap();
+    let _ = done.send(Ok(GeocodeAllSummary { total: 1, filled: 1, skipped: 0 }));
+    work(&m.app, cx);
+    assert_eq!(m.app.wired.model.read_with(cx, |m, _| m.status.to_string()), status, "a late result reported");
+}
+
+/// A catalog switch stops the run (its photo ids are the old catalog's); a new run on the
+/// new catalog starts, and the old run's stragglers — progress and result, sent by its
+/// backend after the switch — never touch it. At most one run: a second start while one
+/// runs does nothing. Cancel stops the run and says so; the current run's own progress and
+/// result land.
+#[gpui_kit::test]
+fn a_switch_stops_geocode_all_and_its_stragglers_never_reach_the_next_run(cx: &mut TestAppContext) {
+    let dir = TempDir::new("map-geo-switch");
+    let fake = with_fake_geocode(cx);
+    let m = open_map(&dir, &[OSLO], cx);
+    m.click("map-consent-deny", cx);
+    let state = map_state(&m, cx);
+    state.update(cx, |s, cx| s.geocode_all(cx));
+    work(&m.app, cx);
+
+    let other = TempDir::new("map-geo-switch-b");
+    open_catalog_with_photos(&m.app, &other, 1, cx);
+    work(&m.app, cx);
+    assert!(fake.runs.lock().unwrap()[0].stopped(), "the switch stopped the old run");
+    assert!(state.read_with(cx, |s, _| s.geocode_running().is_none() && !s.geocode.busy));
+
+    state.update(cx, |s, cx| s.geocode_all(cx));
+    work(&m.app, cx);
+    state.update(cx, |s, cx| s.geocode_all(cx));
+    assert_eq!(fake.runs.lock().unwrap().len(), 2, "one run at a time");
+    let now = chairphoto_core::app::catalog_identity(&m.app.state).unwrap();
+    assert_eq!(fake.runs.lock().unwrap()[1].from, now, "the new run is bound to the new catalog");
+
+    // The old run's stragglers, through its own channels.
+    {
+        let mut runs = fake.runs.lock().unwrap();
+        runs[0].progress.unbounded_send(GeocodeProgress { done: 1, total: 1, filled: 1 }).ok();
+        let _ = runs[0].done.take().unwrap().send(Ok(GeocodeAllSummary { total: 1, filled: 1, skipped: 0 }));
+    }
+    work(&m.app, cx);
+    state.read_with(cx, |s, _| {
+        assert!(s.geocode_running().is_some(), "a stale result ended the new run");
+        assert_eq!((s.geocode.busy, s.geocode.done, s.geocode.status.as_str()), (true, 0, "Starting…"), "stale progress shown");
+    });
+    // The current run's own progress lands.
+    fake.runs.lock().unwrap()[1].progress.unbounded_send(GeocodeProgress { done: 1, total: 3, filled: 1 }).ok();
+    work(&m.app, cx);
+    assert_eq!(state.read_with(cx, |s, _| (s.geocode.done, s.geocode.total)), (1, 3));
+
+    state.update(cx, |s, cx| s.cancel_geocode(cx));
+    work(&m.app, cx);
+    assert!(fake.runs.lock().unwrap()[1].stopped(), "Cancel stopped the run");
+    let status = state.read_with(cx, |s, _| s.geocode.status.clone());
+    assert_eq!(status, "Geocoding cancelled after 1 photos; 1 had location fields filled.");
+
+    // A third run's result lands.
+    state.update(cx, |s, cx| s.geocode_all(cx));
+    work(&m.app, cx);
+    let _ = fake.runs.lock().unwrap()[2].done.take().unwrap().send(Ok(GeocodeAllSummary { total: 2, filled: 1, skipped: 1 }));
+    work(&m.app, cx);
+    state.read_with(cx, |s, _| {
+        assert!(s.geocode_running().is_none() && !s.geocode.busy);
+        assert_eq!(s.geocode.status, "Done: 1 of 2 photos had location fields filled. 1 already set or no result.");
+    });
 }
 
 /// Escape closes the editor first, then cancels drawing, then closes the filmstrip.

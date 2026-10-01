@@ -200,8 +200,18 @@ impl MapView {
     }
 
     fn tile_done(&mut self, done: TileDone, cx: &mut Context<Self>) {
+        let key = done.key;
         let gone = self.tiles.complete(done);
         release(gone, cx);
+        // A failed tile is retried once its backoff ends: repaint then (`want` asks again if
+        // it is still visible).
+        if let Some(wait) = self.tiles.retry_in(&key) {
+            cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(wait).await;
+                this.update(cx, |_, cx| cx.notify()).ok();
+            })
+            .detach();
+        }
         cx.notify();
     }
 
@@ -225,6 +235,9 @@ impl MapView {
     fn sync_source(&mut self, cx: &mut Context<Self>) {
         let s = self.state.read(cx);
         let source = (s.consent() == Consent::Allowed).then(|| s.source.clone());
+        let others: Vec<String> =
+            s.host_consent().hosts().filter(|&(h, allowed)| allowed && h != s.source.host()).map(|(h, _)| h.to_string()).collect();
+        self.tiles.set_redirect_hosts(others);
         let gone = self.tiles.set_source(source);
         release(gone, cx);
     }

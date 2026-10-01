@@ -81,11 +81,20 @@ as overlays, and contributes the same settings and inspector "Geocode" panels as
 **Tiles need the user's yes, per host** (decision #118). The first time the map opens with a
 tile host it has no answer for, a card asks whether to load tiles from that host and says
 what a tile request reveals (the IP address and roughly where the photos are). The answer is
-the catalog setting `map.tileHosts` (`{"tile.openstreetmap.org": true}`), changeable in the
-Map module's settings ("Block", "Ask again") or from the status bar's "Map tiles off" chip.
-Until a host is allowed nothing is fetched; markers and fences show on a plain background
-with a graticule. A new tile URL on another host asks again. Being a catalog setting, the
-answer is per catalog. Reverse geocoding stays user-initiated per click, as before.
+a per-machine preference, `map.tileHosts` in `machine-prefs.json` (`{"tile.openstreetmap.org":
+true}`): a tile request reveals this computer's address whichever catalog is open, so another
+catalog does not ask again. It is changeable in Preferences → Map ("Block", "Ask again") or
+from the status bar's "Map tiles off" chip. Until a host is allowed nothing is fetched;
+markers and fences show on a plain background with a graticule. A new tile URL on another
+host asks again. The consent host is the host a filled-in tile URL goes to, and a
+template with a placeholder in its host is refused. A tile server's redirect is followed
+only to its own host or another allowed one; anywhere else fails the tile without
+contacting that host. The tile URL itself stays the catalog setting `map.tileUrl`: consent is
+keyed by the host it names, so it need not move. Answers the first port stored per catalog
+(the module setting `map.tileHosts`) move to the machine on that catalog's first read —
+only allowed/denied entries; where they disagree with the machine's or another catalog's,
+denied wins — and the catalog's copy is then emptied, so a later Allow is not undone.
+Reverse geocoding stays user-initiated per click, as before.
 
 **OSM tile policy.** The default URL is the policy's exact
 `https://tile.openstreetmap.org/{z}/{x}/{y}.png`; React's stored `{s}.` default reads as it,
@@ -93,9 +102,14 @@ and `{s}` is never used (dropped on OSM's host, `a` elsewhere). Every request ca
 `plugins::map::USER_AGENT`. Tiles are cached on disk under
 `$XDG_CACHE_HOME/chairphoto/tiles/` (512 MiB cap, least recently used evicted), fresh for
 `max(max-age, 7 days)`, then revalidated with `If-None-Match`/`If-Modified-Since`; a stale
-tile is shown when revalidation fails. Only the tiles intersecting the view load, at most
+tile is shown when revalidation fails. A 2xx answer is cached only if it decodes as an
+image, and a body over 2 MiB fails the tile; a failed tile is asked for again after a
+backoff that doubles from 2 s up to 2 minutes while it stays in view. Only the tiles intersecting the view load, at most
 four requests at a time, and a load that leaves the view before its request starts is
-cancelled. The attribution is always on the status bar while tiles show.
+cancelled. Decoded tiles are GPU textures in a least-recently-used set of 256; a tile on
+screen is never evicted, so a 4K canvas showing ~300 tiles holds them all rather than
+reloading its own tiles in a loop. The attribution is always on the status bar while tiles
+show.
 
 **Measuring.** `CHAIRPHOTO_MAP_TIMING=1` logs the map's render and paint CPU time per frame
 (p50/p95/max every 120 frames); `cargo run --release -p chairphoto-app --example map_bench`
@@ -123,7 +137,15 @@ Three commands:
 
 Fields that already hold a value are **never overwritten** — this fills blanks, it does not
 replace. The write path is `set_iptc` + `xmp::write_iptc`, identical to a manual IPTC save,
-so XMP sidecars stay merge-safe. The single-photo path uses a TOCTOU-safe three-step
+so XMP sidecars stay merge-safe. Both fills are bound to the catalog they read the photo
+from (`CatalogIdentity`): the cache, the row, the sidecar path and the IPTC written into it
+all come from that catalog, and a catalog switch during the Nominatim call makes the next
+step fail closed with `CATALOG_CHANGED` instead of writing the new catalog's row (whose ids
+collide) or the old catalog's sidecar. The GPUI module binds its fence writes the same way,
+to the catalog the fences were read from. In the GPUI module, Geocode all is an owned job
+(`geocode_all_to_iptc_with`): at most one run; Cancel, a catalog switch or disabling the
+module sets its abort flag and aborts its task (dropping a pending Nominatim request), and
+its progress and result land only while it is still the current run. The single-photo path uses a TOCTOU-safe three-step
 pattern (read GPS and check cache, async HTTP, store result) so it never blocks the UI
 thread. The inspector exposes "Geocode location" for one photo and "Geocode all with GPS"
 for the batch, with a progress bar and a summary.
@@ -140,6 +162,8 @@ no configuration needed:
 - A global rate limiter holds a mutex across the sleep, so concurrent callers cannot race
   past the ≤1 req/s limit. The limiter is a global static, so the single-photo and batch
   commands share one budget.
+- Each request gives up after 20 s (`NOMINATIM_TIMEOUT`), so a server that never answers
+  cannot hold a geocode forever.
 
 ### Self-hosting
 

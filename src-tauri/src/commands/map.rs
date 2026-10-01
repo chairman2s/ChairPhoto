@@ -249,7 +249,7 @@ pub async fn geocode_to_iptc(
     state: State<'_, AppState>,
     photo_id: i64,
 ) -> Result<bool, String> {
-    crate::plugins::map::geocode::geocode_photo_to_iptc(&state, photo_id).await
+    crate::plugins::map::geocode::geocode_photo_to_iptc(&state, None, photo_id).await
 }
 
 /// Summary returned by `geocode_all_to_iptc`.
@@ -265,7 +265,7 @@ pub use crate::plugins::map::geocode::GeocodeAllSummary;
 pub async fn geocode_all_to_iptc(
     state: State<'_, AppState>,
 ) -> Result<GeocodeAllSummary, String> {
-    crate::plugins::map::geocode::geocode_all_to_iptc(&state).await
+    crate::plugins::map::geocode::geocode_all_to_iptc(&state, None).await
 }
 
 // ── Face-tagging model commands (feature = "faces") ───────────────────────────

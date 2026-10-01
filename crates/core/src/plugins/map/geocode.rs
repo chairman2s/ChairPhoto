@@ -14,8 +14,10 @@
 //! - **No live network calls in tests** — tests use the `mock_endpoint` parameter in
 //!   [`reverse_geocode_ll`] so the real Nominatim is never hit during CI.
 
+use crate::app::CatalogIdentity;
 use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 
@@ -253,6 +255,15 @@ pub async fn nominatim_reverse(
     lat: f64,
     lng: f64,
 ) -> Result<GeocodeResult, String> {
+    nominatim_reverse_within(endpoint, lat, lng, NOMINATIM_TIMEOUT).await
+}
+
+/// How long one Nominatim request may take, connect to body. Without it a server that
+/// accepts and never answers held a single-photo geocode, or a whole Geocode all run,
+/// forever.
+pub const NOMINATIM_TIMEOUT: Duration = Duration::from_secs(20);
+
+async fn nominatim_reverse_within(endpoint: &str, lat: f64, lng: f64, timeout: Duration) -> Result<GeocodeResult, String> {
     throttle().await;
 
     let url = format!(
@@ -264,6 +275,7 @@ pub async fn nominatim_reverse(
 
     let resp = reqwest::Client::builder()
         .user_agent(USER_AGENT)
+        .timeout(timeout)
         .build()
         .map_err(|e| format!("geocode: failed to build HTTP client: {e}"))?
         .get(&url)
@@ -343,6 +355,61 @@ pub async fn reverse_geocode_ll(
 
 // ── Filling IPTC location fields (the Tauri commands and the GPUI Map module) ────────
 
+/// Run `f` against the open catalog and return its identity: only while that catalog is
+/// still `expected` (failing closed with `CATALOG_CHANGED` otherwise), or — with no
+/// expectation — against whatever catalog is open now.
+fn with_bound<T>(
+    state: &crate::app::AppState,
+    expected: Option<CatalogIdentity>,
+    f: impl FnOnce(&crate::catalog::Catalog) -> crate::catalog::Result<T>,
+) -> Result<(CatalogIdentity, T), String> {
+    match expected {
+        Some(identity) => crate::app::with_catalog_as(state, identity, f).map(|t| (identity, t)),
+        None => crate::app::with_catalog_identified(state, f),
+    }
+}
+
+/// Step 3 of a fill, in the catalog the photo was read from: re-read the IPTC (a value the
+/// user typed meanwhile wins), resolve the original's path and write the filled fields —
+/// all under one lock hold of that catalog. Returns the sidecar write still to do (off the
+/// lock), or `None` when nothing was filled. The path is resolved before the row is
+/// written, so an unreachable original leaves the catalog and the sidecar in step.
+fn fill_in(
+    state: &crate::app::AppState,
+    identity: CatalogIdentity,
+    photo_id: i64,
+    geo: &GeocodeResult,
+) -> Result<Option<(std::path::PathBuf, crate::catalog::IptcFields)>, String> {
+    crate::app::with_catalog_as(state, identity, |c| {
+        let current = c.get_iptc(photo_id)?;
+        let (updated, changed) = fill_empty_iptc(&current, geo);
+        if !changed {
+            return Ok(None);
+        }
+        let original = c.require_photo_path(photo_id)?;
+        c.set_iptc(photo_id, &updated)?;
+        Ok(Some((original, updated)))
+    })
+}
+
+/// The cached answer for `(lat, lng)` in the identified catalog, or Nominatim's (then
+/// cached there). The HTTP call holds no lock.
+async fn lookup_or_ask(
+    state: &crate::app::AppState,
+    identity: CatalogIdentity,
+    endpoint: &str,
+    lat: f64,
+    lng: f64,
+) -> Result<GeocodeResult, String> {
+    let (lat_cell, lng_cell) = (round_cell(lat), round_cell(lng));
+    if let Some(hit) = crate::app::with_catalog_as(state, identity, |c| Ok(lookup_cache(c.conn(), lat_cell, lng_cell)?))? {
+        return Ok(hit);
+    }
+    let result = nominatim_reverse(endpoint, lat, lng).await?;
+    crate::app::with_catalog_as(state, identity, |c| Ok(store_cache(c.conn(), lat_cell, lng_cell, &result)?))?;
+    Ok(result)
+}
+
 /// Reverse-geocode one photo and fill its **empty** IPTC location fields (city, state,
 /// country, country_code). Fields that already hold a value are **never overwritten**.
 ///
@@ -353,19 +420,26 @@ pub async fn reverse_geocode_ll(
 /// cache under the lock; (2) ask Nominatim with no lock held; (3) re-read the IPTC under the
 /// lock and fill only what is still empty (a value the user typed meanwhile wins), then
 /// write the sidecar off the lock through `xmp::write_iptc`, as a manual IPTC save does.
-pub async fn geocode_photo_to_iptc(state: &crate::app::AppState, photo_id: i64) -> Result<bool, String> {
+///
+/// **Catalog identity.** `photo_id` means a photo of one catalog. Every step runs in the
+/// catalog step 1 read — `expected` when the caller read the id with an identity, else the
+/// one open at step 1 — and fails closed with `CATALOG_CHANGED` once another is open. The
+/// sidecar path and the IPTC written to it come from that same catalog, in one lock hold:
+/// a switch during the HTTP call can no longer write one catalog's fields into the other's
+/// row or sidecar.
+pub async fn geocode_photo_to_iptc(
+    state: &crate::app::AppState,
+    expected: Option<CatalogIdentity>,
+    photo_id: i64,
+) -> Result<bool, String> {
     struct Step1 {
         lat: f64,
         lng: f64,
         endpoint: String,
-        cached: Option<GeocodeResult>,
-        original_path: std::path::PathBuf,
     }
 
-    let step1: Step1 = {
-        let guard = state.catalog.lock().map_err(|e| e.to_string())?;
-        let c = guard.as_ref().ok_or("No catalog is open")?;
-        ensure_cache_schema(c.conn()).map_err(|e| e.to_string())?;
+    let (identity, step1) = with_bound(state, expected, |c| {
+        ensure_cache_schema(c.conn())?;
         let row: Option<(f64, f64)> = c
             .conn()
             .query_row(
@@ -375,48 +449,27 @@ pub async fn geocode_photo_to_iptc(state: &crate::app::AppState, photo_id: i64) 
                 params![photo_id],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
-            .optional()
-            .map_err(|e| e.to_string())?;
+            .optional()?;
         let Some((lat, lng)) = row else {
-            return Ok(false); // no GPS — nothing to do
+            return Ok(None); // no GPS — nothing to do
         };
         // Every location field already set: no need to ask the geocoder. Step 3 re-reads.
-        let iptc = c.get_iptc(photo_id).map_err(|e| e.to_string())?;
+        let iptc = c.get_iptc(photo_id)?;
         if !iptc.city.is_empty() && !iptc.state.is_empty() && !iptc.country.is_empty() && !iptc.country_code.is_empty() {
-            return Ok(false);
+            return Ok(None);
         }
-        let endpoint =
-            c.get_setting(SETTING_ENDPOINT).map_err(|e| e.to_string())?.unwrap_or_else(|| DEFAULT_ENDPOINT.to_string());
-        let cached = lookup_cache(c.conn(), round_cell(lat), round_cell(lng)).map_err(|e| e.to_string())?;
-        let original_path = c.require_photo_path(photo_id).map_err(|e| e.to_string())?;
-        Step1 { lat, lng, endpoint, cached, original_path }
-    };
+        // An unreachable original fails here, before any request (step 3 resolves it again).
+        c.require_photo_path(photo_id)?;
+        let endpoint = c.get_setting(SETTING_ENDPOINT)?.unwrap_or_else(|| DEFAULT_ENDPOINT.to_string());
+        Ok(Some(Step1 { lat, lng, endpoint }))
+    })?;
+    let Some(step1) = step1 else { return Ok(false) };
 
-    let geo = match step1.cached {
-        Some(hit) => hit,
-        None => {
-            let result = nominatim_reverse(&step1.endpoint, step1.lat, step1.lng).await?;
-            let guard = state.catalog.lock().map_err(|e| e.to_string())?;
-            let c = guard.as_ref().ok_or("No catalog is open")?;
-            store_cache(c.conn(), round_cell(step1.lat), round_cell(step1.lng), &result).map_err(|e| e.to_string())?;
-            result
-        }
-    };
-
-    let (updated, changed) = {
-        let guard = state.catalog.lock().map_err(|e| e.to_string())?;
-        let c = guard.as_ref().ok_or("No catalog is open")?;
-        let current = c.get_iptc(photo_id).map_err(|e| e.to_string())?;
-        let (updated, changed) = fill_empty_iptc(&current, &geo);
-        if changed {
-            c.set_iptc(photo_id, &updated).map_err(|e| e.to_string())?;
-        }
-        (updated, changed)
-    };
-    if !changed {
+    let geo = lookup_or_ask(state, identity, &step1.endpoint, step1.lat, step1.lng).await?;
+    let Some((original, updated)) = fill_in(state, identity, photo_id, &geo)? else {
         return Ok(false);
-    }
-    crate::xmp::write_iptc(&step1.original_path, &updated)?;
+    };
+    crate::xmp::write_iptc(&original, &updated)?;
     Ok(true)
 }
 
@@ -436,86 +489,95 @@ pub struct GeocodeAllSummary {
 /// one empty IPTC location field, sending `geocode:progress { done, total, filled }` through
 /// the state's event sink after each photo. The Nominatim throttle is global, so this and
 /// the single-photo path share one ≤ 1 req/s budget.
-pub async fn geocode_all_to_iptc(state: &crate::app::AppState) -> Result<GeocodeAllSummary, String> {
-    use crate::app::{CoreEvent, EventSink as _, GeocodeProgress};
+///
+/// The whole run is bound to one catalog (`expected`, or the one open when it starts), as
+/// [`geocode_photo_to_iptc`] is: once another catalog is open, the next step fails closed
+/// with `CATALOG_CHANGED` and the run stops, having written nothing to the new catalog.
+///
+/// The Tauri command's entry point: it cannot be cancelled. The GPUI module runs
+/// [`geocode_all_to_iptc_with`], which can.
+pub async fn geocode_all_to_iptc(
+    state: &crate::app::AppState,
+    expected: Option<CatalogIdentity>,
+) -> Result<GeocodeAllSummary, String> {
+    use crate::app::{CoreEvent, EventSink as _};
+    let never = AtomicBool::new(false);
+    geocode_all_to_iptc_with(state, expected, &never, |p| state.send(CoreEvent::GeocodeProgress(p))).await
+}
+
+/// What [`geocode_all_to_iptc_with`] answers once its abort flag is set.
+pub const GEOCODE_CANCELLED: &str = "Geocoding was cancelled";
+
+/// [`geocode_all_to_iptc`] for an owner that can stop it: `abort` is checked before each
+/// photo and again after its Nominatim answer, before anything is written, and a set flag
+/// ends the run with [`GEOCODE_CANCELLED`]. A photo whose write began is finished first
+/// (the row and its sidecar stay in step). Progress goes to `on_progress` — the owner
+/// scopes it to its own run — instead of the state's event sink. The owner may also drop
+/// the future (a task abort): every `await` here is before a photo's writes, never between
+/// them.
+pub async fn geocode_all_to_iptc_with(
+    state: &crate::app::AppState,
+    expected: Option<CatalogIdentity>,
+    abort: &AtomicBool,
+    mut on_progress: impl FnMut(crate::app::GeocodeProgress),
+) -> Result<GeocodeAllSummary, String> {
+    use crate::app::GeocodeProgress;
 
     struct Candidate {
         photo_id: i64,
         lat: f64,
         lng: f64,
-        original_path: std::path::PathBuf,
     }
 
-    let (candidates, endpoint) = {
-        let guard = state.catalog.lock().map_err(|e| e.to_string())?;
-        let c = guard.as_ref().ok_or("No catalog is open")?;
-        ensure_cache_schema(c.conn()).map_err(|e| e.to_string())?;
-        let endpoint =
-            c.get_setting(SETTING_ENDPOINT).map_err(|e| e.to_string())?.unwrap_or_else(|| DEFAULT_ENDPOINT.to_string());
-        let mut stmt = c
-            .conn()
-            .prepare(
-                "SELECT id, gps_latitude, gps_longitude
-                 FROM photos_visible
-                 WHERE gps_latitude IS NOT NULL AND gps_longitude IS NOT NULL
-                   AND (iptc_city IS NULL OR iptc_city = ''
-                        OR iptc_state IS NULL OR iptc_state = ''
-                        OR iptc_country IS NULL OR iptc_country = ''
-                        OR iptc_country_code IS NULL OR iptc_country_code = '')",
-            )
-            .map_err(|e| e.to_string())?;
+    let (identity, (candidates, endpoint)) = with_bound(state, expected, |c| {
+        ensure_cache_schema(c.conn())?;
+        let endpoint = c.get_setting(SETTING_ENDPOINT)?.unwrap_or_else(|| DEFAULT_ENDPOINT.to_string());
+        let mut stmt = c.conn().prepare(
+            "SELECT id, gps_latitude, gps_longitude
+             FROM photos_visible
+             WHERE gps_latitude IS NOT NULL AND gps_longitude IS NOT NULL
+               AND (iptc_city IS NULL OR iptc_city = ''
+                    OR iptc_state IS NULL OR iptc_state = ''
+                    OR iptc_country IS NULL OR iptc_country = ''
+                    OR iptc_country_code IS NULL OR iptc_country_code = '')",
+        )?;
         let rows: Vec<(i64, f64, f64)> = stmt
-            .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, f64>(1)?, r.get::<_, f64>(2)?)))
-            .map_err(|e| e.to_string())?
-            .collect::<rusqlite::Result<_>>()
-            .map_err(|e| e.to_string())?;
-        let mut candidates = Vec::new();
-        for (photo_id, lat, lng) in rows {
-            // Missing or offline: skipped, not an error.
-            if let Ok(path) = c.require_photo_path(photo_id) {
-                candidates.push(Candidate { photo_id, lat, lng, original_path: path });
-            }
-        }
-        (candidates, endpoint)
-    };
+            .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, f64>(1)?, r.get::<_, f64>(2)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        // Missing or offline originals are skipped, not an error.
+        let candidates = rows
+            .into_iter()
+            .filter(|(id, _, _)| c.require_photo_path(*id).is_ok())
+            .map(|(photo_id, lat, lng)| Candidate { photo_id, lat, lng })
+            .collect::<Vec<_>>();
+        Ok((candidates, endpoint))
+    })?;
 
     let total = candidates.len();
     let (mut filled, mut done) = (0usize, 0usize);
     for candidate in candidates {
-        let (lat_cell, lng_cell) = (round_cell(candidate.lat), round_cell(candidate.lng));
-        let cached = {
-            let guard = state.catalog.lock().map_err(|e| e.to_string())?;
-            let c = guard.as_ref().ok_or("No catalog is open")?;
-            lookup_cache(c.conn(), lat_cell, lng_cell).map_err(|e| e.to_string())?
-        };
-        let geo = match cached {
-            Some(hit) => hit,
-            None => {
-                let result = nominatim_reverse(&endpoint, candidate.lat, candidate.lng).await?;
-                let guard = state.catalog.lock().map_err(|e| e.to_string())?;
-                let c = guard.as_ref().ok_or("No catalog is open")?;
-                store_cache(c.conn(), lat_cell, lng_cell, &result).map_err(|e| e.to_string())?;
-                result
-            }
-        };
-        // Re-read under the lock that writes: a value the user typed meanwhile wins.
-        let (updated, changed) = {
-            let guard = state.catalog.lock().map_err(|e| e.to_string())?;
-            let c = guard.as_ref().ok_or("No catalog is open")?;
-            let current = c.get_iptc(candidate.photo_id).map_err(|e| e.to_string())?;
-            let (updated, changed) = fill_empty_iptc(&current, &geo);
-            if changed {
-                c.set_iptc(candidate.photo_id, &updated).map_err(|e| e.to_string())?;
-            }
-            (updated, changed)
+        if abort.load(Ordering::Relaxed) {
+            return Err(GEOCODE_CANCELLED.into());
+        }
+        let geo = lookup_or_ask(state, identity, &endpoint, candidate.lat, candidate.lng).await?;
+        if abort.load(Ordering::Relaxed) {
+            return Err(GEOCODE_CANCELLED.into()); // stopped while Nominatim answered
+        }
+        // An original that went offline since the read is skipped; a switch stops the run.
+        let write = match fill_in(state, identity, candidate.photo_id, &geo) {
+            Err(e) if e == crate::app::CATALOG_CHANGED => return Err(e),
+            Err(_) => None,
+            Ok(write) => write,
         };
         // Counted as filled only when the sidecar write also succeeded, so the summary does
         // not claim a photo whose sidecar diverged.
-        if changed && crate::xmp::write_iptc(&candidate.original_path, &updated).is_ok() {
-            filled += 1;
+        if let Some((original, updated)) = write {
+            if crate::xmp::write_iptc(&original, &updated).is_ok() {
+                filled += 1;
+            }
         }
         done += 1;
-        state.send(CoreEvent::GeocodeProgress(GeocodeProgress { done, total, filled }));
+        on_progress(GeocodeProgress { done, total, filled });
     }
     Ok(GeocodeAllSummary { total, filled, skipped: total - filled })
 }
@@ -896,13 +958,153 @@ mod tests {
             iptc.country = "Noreg".into(); // the user's value
             c.set_iptc(id, &iptc).unwrap();
         }
-        let summary = geocode_all_to_iptc(&state).await.unwrap();
+        let summary = geocode_all_to_iptc(&state, None).await.unwrap();
         assert_eq!(summary, GeocodeAllSummary { total: 1, filled: 1, skipped: 0 });
         assert_eq!(*progress.0.lock().unwrap(), vec![(1, 1, 1)]);
         let iptc = state.catalog.lock().unwrap().as_ref().unwrap().get_iptc(id).unwrap();
         assert_eq!((iptc.city.as_str(), iptc.country.as_str(), iptc.country_code.as_str()), ("Oslo", "Noreg", "NO"));
         // Every field set now: the single-photo path has nothing to do.
-        assert!(!geocode_photo_to_iptc(&state, id).await.unwrap());
+        assert!(!geocode_photo_to_iptc(&state, None, id).await.unwrap());
+        server.abort();
+    }
+
+    /// A loopback "Nominatim" that, on its first request, switches the state to `next` (a
+    /// catalog switch landing during the HTTP call), then answers Oslo.
+    async fn serve_and_switch(
+        state: crate::app::AppState,
+        next: crate::catalog::Catalog,
+    ) -> (tokio::task::JoinHandle<()>, String) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        let handle = tokio::spawn(async move {
+            let mut next = Some(next);
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf).await;
+                if let Some(b) = next.take() {
+                    *state.catalog.lock().unwrap() = Some(b);
+                }
+                let body = r#"{"address":{"city":"Oslo","state":"Oslo","country":"Norway","country_code":"no"}}"#;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            }
+        });
+        (handle, endpoint)
+    }
+
+    /// A second catalog whose one photo has the same id as `geo_catalog`'s (ids collide
+    /// across real catalogs) at the same place, with empty location fields.
+    fn colliding_catalog(dir: &crate::test_support::TestTmpDir, id: i64) -> (crate::catalog::Catalog, std::path::PathBuf) {
+        let root = dir.join("other");
+        std::fs::create_dir_all(&root).unwrap();
+        let file = root.join("IMG_B.jpg");
+        std::fs::write(&file, b"another catalog's photo").unwrap();
+        let b = crate::catalog::Catalog::open(&dir.join("b.chairphoto"), &root).unwrap();
+        assert_eq!(b.upsert_photo(&file, None, 0, 1).unwrap().id, id, "the ids collide");
+        b.conn().execute("UPDATE photos SET gps_latitude = 59.91, gps_longitude = 10.75 WHERE id = ?1", [id]).unwrap();
+        ensure_cache_schema(b.conn()).unwrap(); // it has used the Map module too
+        (b, file)
+    }
+
+    /// **Forced interleaving** (review #119): a catalog switch lands while Nominatim is
+    /// asked. The fill must not write the new catalog's row (same id), nor any sidecar —
+    /// before, it wrote the new catalog's IPTC and then the old catalog's sidecar with it.
+    /// Both entry points fail closed with `CATALOG_CHANGED`; an identity read before the
+    /// switch is refused up front.
+    #[tokio::test]
+    async fn a_switch_during_the_request_writes_neither_catalog_nor_sidecar() {
+        for all in [false, true] {
+            let (dir, state, id, progress) = geo_catalog(if all { "geo-sw-all" } else { "geo-sw-one" }, "http://unused");
+            let before = crate::app::catalog_identity(&state).unwrap();
+            let (b, b_file) = colliding_catalog(&dir, id);
+            let (server, endpoint) = serve_and_switch(state.clone(), b).await;
+            state.catalog.lock().unwrap().as_ref().unwrap().set_setting(SETTING_ENDPOINT, &endpoint).unwrap();
+            let a_file = dir.join("library").join("IMG_1.jpg");
+
+            let err = if all {
+                geocode_all_to_iptc(&state, None).await.unwrap_err()
+            } else {
+                geocode_photo_to_iptc(&state, None, id).await.unwrap_err()
+            };
+            assert_eq!(err, crate::app::CATALOG_CHANGED, "all = {all}");
+            let iptc = state.catalog.lock().unwrap().as_ref().unwrap().get_iptc(id).unwrap();
+            assert!(iptc.city.is_empty() && iptc.country.is_empty(), "the new catalog's row was written: {iptc:?}");
+            assert!(!crate::xmp::sidecar_path(&a_file).exists(), "the old catalog's sidecar was written");
+            assert!(!crate::xmp::sidecar_path(&b_file).exists(), "the new catalog's sidecar was written");
+            assert!(progress.0.lock().unwrap().is_empty(), "no photo counted as done");
+
+            // A caller holding the old identity is refused before any request.
+            assert_eq!(geocode_photo_to_iptc(&state, Some(before), id).await.unwrap_err(), crate::app::CATALOG_CHANGED);
+            assert_eq!(geocode_all_to_iptc(&state, Some(before)).await.unwrap_err(), crate::app::CATALOG_CHANGED);
+            server.abort();
+        }
+    }
+
+    /// **Forced interleaving:** the owner cancels while Nominatim is answering. The run ends
+    /// with `GEOCODE_CANCELLED` before writing the answer anywhere; a flag already set stops
+    /// it before any request.
+    #[tokio::test]
+    async fn a_cancelled_run_stops_before_writing() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let abort = std::sync::Arc::new(AtomicBool::new(false));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        let requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let server = {
+            let (abort, requests) = (abort.clone(), requests.clone());
+            tokio::spawn(async move {
+                while let Ok((mut stream, _)) = listener.accept().await {
+                    let mut buf = [0u8; 4096];
+                    let _ = stream.read(&mut buf).await;
+                    requests.fetch_add(1, Ordering::SeqCst);
+                    abort.store(true, Ordering::SeqCst); // the user clicks Cancel now
+                    let body = r#"{"address":{"city":"Oslo","country":"Norway","country_code":"no"}}"#;
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                }
+            })
+        };
+        let (dir, state, id, _) = geo_catalog("geo-cancel", &endpoint);
+        let mut seen = Vec::new();
+        let err = geocode_all_to_iptc_with(&state, None, &abort, |p| seen.push(p.done)).await.unwrap_err();
+        assert_eq!(err, GEOCODE_CANCELLED);
+        assert!(seen.is_empty(), "no photo counted as done");
+        let iptc = state.catalog.lock().unwrap().as_ref().unwrap().get_iptc(id).unwrap();
+        assert!(iptc.city.is_empty(), "the answer was written after the cancel: {iptc:?}");
+        assert!(!crate::xmp::sidecar_path(&dir.join("library").join("IMG_1.jpg")).exists());
+        // Already cancelled: not even a request.
+        let err = geocode_all_to_iptc_with(&state, None, &abort, |_| {}).await.unwrap_err();
+        assert_eq!((err.as_str(), requests.load(Ordering::SeqCst)), (GEOCODE_CANCELLED, 1));
+        server.abort();
+    }
+
+    /// Review #119: the Nominatim client had no timeout, so a server that accepts and never
+    /// answers held the geocode forever. A request now fails after its timeout.
+    #[tokio::test]
+    async fn a_silent_nominatim_times_out() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        let server = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                held.push(stream); // accepted, never answered
+            }
+        });
+        assert!(NOMINATIM_TIMEOUT <= Duration::from_secs(30), "{NOMINATIM_TIMEOUT:?}");
+        let started = Instant::now();
+        let outcome =
+            tokio::time::timeout(Duration::from_secs(10), nominatim_reverse_within(&endpoint, 1.0, 2.0, Duration::from_millis(300)))
+                .await;
+        let err = outcome.expect("the request never gave up").unwrap_err();
+        assert!(err.contains("HTTP request failed"), "{err}");
+        assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
         server.abort();
     }
 

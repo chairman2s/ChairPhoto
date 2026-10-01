@@ -10,8 +10,8 @@ that tree unless they name a crate in `~/.cargo/registry/src/index.crates.io-*/`
 URL. Statements marked **(inference)** are reasoned, not observed.
 
 **Built** (ticket #119, branch `wf/map-module`): as recommended below, with the owner's
-privacy decision from #118 (ask per host on first open, remembered as the catalog setting
-`map.tileHosts`) instead of the `map.tiles.enabled` switch proposed under "Opt-in and privacy
+privacy decision from #118 (ask per host on first open, remembered — first as the catalog
+setting `map.tileHosts`, since the #119 review in this machine's preferences) instead of the `map.tiles.enabled` switch proposed under "Opt-in and privacy
 in the port". What was built, and how to measure it: `docs/map-and-geotagging.md` § "The
 GPUI map".
 

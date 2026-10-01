@@ -2,9 +2,10 @@
 //! "Geocode" panel (`GeocodePanelContent`).
 //!
 //! **Settings:** the tile URL (Save / Reset to default; an unusable template is refused with
-//! the reason), the attribution note, the per-host tile answers (allow, block, forget — the
-//! "change it in Preferences" half of decision #118), and "Geocode all with GPS" with its
-//! progress. **Geocode panel:** fills the active photo's empty IPTC location fields.
+//! the reason), the attribution note, this machine's per-host tile answers (allow, block,
+//! forget — the "change it in Preferences" half of decision #118; the panel is the Map tab
+//! of Preferences), and "Geocode all with GPS" with its
+//! progress and Cancel. **Geocode panel:** fills the active photo's empty IPTC location fields.
 //!
 //! Both reverse-geocoding actions are user-initiated, as in React; that click is their
 //! network opt-in (#118 left Nominatim's prompt undecided).
@@ -61,8 +62,7 @@ impl Render for MapSettings {
         let s = self.state.read(cx);
         let template = s.source.template().to_string();
         let known = s.settings_known();
-        let hosts: Vec<(String, bool)> =
-            s.stored.as_ref().map(|d| d.consent.hosts().map(|(h, a)| (h.to_string(), a)).collect()).unwrap_or_default();
+        let hosts: Vec<(String, bool)> = s.host_consent().hosts().map(|(h, a)| (h.to_string(), a)).collect();
         let geocode = s.geocode.clone();
         if known && self.shown.as_deref() != Some(template.as_str()) {
             self.shown = Some(template.clone());
@@ -101,7 +101,8 @@ impl Render for MapSettings {
                 ),
                 colors,
             ))
-            .child(ui::label("Tile servers", colors));
+            .child(ui::label("Tile servers", colors))
+            .child(ui::sub("Answers are remembered on this computer, for every catalog.", colors));
         if hosts.is_empty() {
             body = body.child(ui::sub("No tile server has been allowed or blocked yet.", colors));
         }
@@ -147,6 +148,13 @@ impl Render for MapSettings {
                         !geocode.busy,
                         cx.listener(|this, _, _, cx| this.state.update(cx, |s, cx| s.geocode_all(cx))),
                     ))
+                    .when(geocode.busy, |d| {
+                        d.child(ui::clickable(
+                            ui::chip("map-geocode-cancel", "Cancel", true, colors),
+                            true,
+                            cx.listener(|this, _, _, cx| this.state.update(cx, |s, cx| s.cancel_geocode(cx))),
+                        ))
+                    })
                     .when_some(pct, |d, p| d.child(div().text_color(colors.dim).child(format!("{p}%")))),
             )
             .when(!geocode.status.is_empty(), |d| {
@@ -175,6 +183,13 @@ impl GeocodePanel {
         if self.busy {
             return;
         }
+        // The photo id is the shown catalog's: the fill is bound to it (fails closed after a
+        // switch, writing neither the new catalog's row nor any sidecar).
+        let Some(from) = self.state.read(cx).catalog() else {
+            self.status = "The catalog is still loading; try again.".into();
+            cx.notify();
+            return;
+        };
         self.busy = true;
         self.status = "Geocoding…".into();
         cx.notify();
@@ -182,7 +197,7 @@ impl GeocodePanel {
         let app = self.state.read(cx).app().clone();
         // Network (Nominatim): the core runtime, never the UI thread.
         let task = chairphoto_core::app::runtime()
-            .spawn(async move { chairphoto_core::plugins::map::geocode::geocode_photo_to_iptc(&app, photo).await });
+            .spawn(async move { chairphoto_core::plugins::map::geocode::geocode_photo_to_iptc(&app, Some(from), photo).await });
         cx.spawn(async move |this, cx| {
             let result = task.await.unwrap_or_else(|e| Err(e.to_string()));
             this.update(cx, |p, cx| {

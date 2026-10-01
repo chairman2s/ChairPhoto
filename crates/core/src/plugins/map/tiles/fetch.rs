@@ -15,12 +15,13 @@
 //!
 //! **Consent is the caller's.** The fetcher does not know whether the user allowed the host
 //! (decision #118, per host, asked on first open); the app's map never calls it for a host
-//! that is not allowed. The HTTP client is behind [`TileHttp`] so tests count requests
-//! without a network.
+//! that is not allowed, and passes the other allowed hosts so that a redirect reaches only
+//! the source's own host or one of those ([`ReqwestHttp`] follows redirects itself). The
+//! HTTP client is behind [`TileHttp`] so tests count requests without a network.
 
 use super::cache::{CachedTile, TileCache, TileMeta, DEFAULT_CAP_BYTES};
 use super::math::TileKey;
-use super::source::TileSource;
+use super::source::{authority, TileSource};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -32,12 +33,22 @@ pub const MAX_CONCURRENT: usize = 4;
 /// How long one request may take.
 pub const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
+/// Redirects one tile request may follow.
+pub const MAX_REDIRECTS: usize = 5;
+/// The largest tile body accepted (a 256 px raster tile is tens of KiB): a server that
+/// sends more fails the tile instead of filling memory and the disk cache.
+pub const MAX_TILE_BYTES: usize = 2 * 1024 * 1024;
+
 /// One GET, with the validators of a stale cached copy.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct HttpRequest {
     pub url: String,
     pub if_none_match: Option<String>,
     pub if_modified_since: Option<String>,
+    /// Hosts (as [`authority`] names them) a redirect may lead to besides the request's
+    /// own: the other hosts the user allowed. A redirect anywhere else fails the tile
+    /// without contacting that host.
+    pub redirect_hosts: Vec<String>,
 }
 
 /// What came back.
@@ -58,6 +69,12 @@ pub trait TileHttp: Send + Sync + 'static {
 }
 
 /// The real client: one `reqwest::Client` (connection reuse) with ChairPhoto's User-Agent.
+///
+/// **Redirects are followed by hand**, never by reqwest: consent is per host (decision
+/// #118), and reqwest's default policy would follow a tile server's redirect to any host.
+/// Each `Location` is checked before it is requested — the request's own host or one of
+/// [`HttpRequest::redirect_hosts`], `http`/`https` only, at most [`MAX_REDIRECTS`] —
+/// and anything else fails the tile.
 pub struct ReqwestHttp {
     client: reqwest::Client,
 }
@@ -67,9 +84,24 @@ impl ReqwestHttp {
         let client = reqwest::Client::builder()
             .user_agent(super::super::USER_AGENT)
             .timeout(REQUEST_TIMEOUT)
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|e| format!("tiles: could not build the HTTP client: {e}"))?;
         Ok(ReqwestHttp { client })
+    }
+}
+
+/// Where a redirect from `from` to `location` may go, or why not.
+fn redirect_target(from: &reqwest::Url, location: &str, origin: &str, allowed: &[String]) -> Result<reqwest::Url, String> {
+    let next = from.join(location).map_err(|e| format!("the tile server redirected to an invalid URL: {e}"))?;
+    if !matches!(next.scheme(), "http" | "https") {
+        return Err(format!("the tile server redirected to a {} URL", next.scheme()));
+    }
+    let host = authority(&next);
+    if host == origin || allowed.iter().any(|a| a.eq_ignore_ascii_case(&host)) {
+        Ok(next)
+    } else {
+        Err(format!("the tile server redirected to {host}, which you have not allowed"))
     }
 }
 
@@ -78,21 +110,50 @@ impl TileHttp for ReqwestHttp {
         let client = self.client.clone();
         Box::pin(async move {
             use reqwest::header;
-            let mut builder = client.get(&request.url);
-            if let Some(etag) = &request.if_none_match {
-                builder = builder.header(header::IF_NONE_MATCH, etag);
-            }
-            if let Some(date) = &request.if_modified_since {
-                builder = builder.header(header::IF_MODIFIED_SINCE, date);
-            }
-            let response = builder.send().await.map_err(|e| format!("tile request failed: {e}"))?;
+            let mut url = reqwest::Url::parse(&request.url).map_err(|e| format!("bad tile URL: {e}"))?;
+            let origin = authority(&url);
+            let mut redirects = 0;
+            let response = loop {
+                let mut builder = client.get(url.clone());
+                if let Some(etag) = &request.if_none_match {
+                    builder = builder.header(header::IF_NONE_MATCH, etag);
+                }
+                if let Some(date) = &request.if_modified_since {
+                    builder = builder.header(header::IF_MODIFIED_SINCE, date);
+                }
+                let response = builder.send().await.map_err(|e| format!("tile request failed: {e}"))?;
+                let location = response.headers().get(header::LOCATION).and_then(|v| v.to_str().ok());
+                let redirect = matches!(response.status().as_u16(), 301 | 302 | 303 | 307 | 308);
+                match (redirect, location) {
+                    (true, Some(location)) => {
+                        redirects += 1;
+                        if redirects > MAX_REDIRECTS {
+                            return Err("the tile server redirected too many times".into());
+                        }
+                        url = redirect_target(&url, location, &origin, &request.redirect_hosts)?;
+                    }
+                    _ => break response,
+                }
+            };
             let text = |name: header::HeaderName| {
                 response.headers().get(name).and_then(|v| v.to_str().ok()).map(str::to_string)
             };
             let (etag, last_modified, cache_control) =
                 (text(header::ETAG), text(header::LAST_MODIFIED), text(header::CACHE_CONTROL));
             let status = response.status().as_u16();
-            let body = response.bytes().await.map_err(|e| format!("tile download failed: {e}"))?.to_vec();
+            let too_big = || format!("the tile is larger than {} MiB", MAX_TILE_BYTES / (1024 * 1024));
+            if response.content_length().is_some_and(|n| n > MAX_TILE_BYTES as u64) {
+                return Err(too_big());
+            }
+            // Read in chunks, so a body without (or with a lying) Content-Length stops at the cap.
+            let mut response = response;
+            let mut body = Vec::new();
+            while let Some(chunk) = response.chunk().await.map_err(|e| format!("tile download failed: {e}"))? {
+                if body.len() + chunk.len() > MAX_TILE_BYTES {
+                    return Err(too_big());
+                }
+                body.extend_from_slice(&chunk);
+            }
             Ok(HttpResponse { status, body, etag, last_modified, cache_control })
         })
     }
@@ -127,6 +188,13 @@ pub enum Origin {
 pub struct LoadedTile {
     pub bytes: Vec<u8>,
     pub origin: Origin,
+}
+
+/// Whether `bytes` decode as an image, on a blocking worker (a full decode: a truncated
+/// PNG has a valid header).
+async fn decodes(bytes: &[u8]) -> bool {
+    let bytes = bytes.to_vec();
+    tokio::task::spawn_blocking(move || image::load_from_memory(&bytes).is_ok()).await.unwrap_or(false)
 }
 
 fn unix_now() -> i64 {
@@ -167,6 +235,12 @@ impl TileFetcher {
     /// exists), else the stale entry. Dropping the future before it reaches the network
     /// (while it waits for a permit) sends nothing.
     pub async fn load(&self, source: &TileSource, key: TileKey) -> Result<LoadedTile, String> {
+        self.load_allowing(source, key, &[]).await
+    }
+
+    /// [`load`](Self::load), where a redirect may also lead to `redirect_hosts` (the other
+    /// hosts the user allowed); with none, only to the source's own host.
+    pub async fn load_allowing(&self, source: &TileSource, key: TileKey, redirect_hosts: &[String]) -> Result<LoadedTile, String> {
         let cached = {
             let (cache, source) = (self.cache.clone(), source.clone());
             tokio::task::spawn_blocking(move || cache.get(&source, key)).await.map_err(|e| e.to_string())?
@@ -183,8 +257,18 @@ impl TileFetcher {
                 url: source.url(key),
                 if_none_match: cached.as_ref().and_then(|c| c.meta.etag.clone()),
                 if_modified_since: cached.as_ref().and_then(|c| c.meta.last_modified.clone()),
+                redirect_hosts: redirect_hosts.to_vec(),
             };
             self.http.get(request).await
+        };
+        // A 2xx body is cached for a week, so it must be a tile: one that does not decode
+        // (a captive portal's page, an error served as 200) is a failure — never cached,
+        // and the map retries it later — with a stale copy still shown meanwhile.
+        let response = match response {
+            Ok(r) if (200..300).contains(&r.status) && !r.body.is_empty() && !decodes(&r.body).await => {
+                Err(format!("the tile server's answer (HTTP {}) is not an image", r.status))
+            }
+            other => other,
         };
         let now = (self.clock)();
         match (response, cached) {
@@ -262,6 +346,62 @@ mod tests {
         }
     }
 
+    /// A real (tiny) PNG, distinct per `shade`.
+    pub(crate) fn png(shade: u8) -> Vec<u8> {
+        let mut out = Vec::new();
+        let img = image::RgbaImage::from_pixel(2, 2, image::Rgba([shade, 0, 0, 255]));
+        image::DynamicImage::ImageRgba8(img).write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png).unwrap();
+        out
+    }
+
+    /// Review #119: a 2xx answer that is not an image (a captive portal's page, an error
+    /// served as 200) was cached for a week and shown as a failed tile until then. It is now
+    /// a failure: not cached, so the next load asks again; a stale copy is shown meanwhile.
+    #[tokio::test]
+    async fn a_2xx_body_that_is_not_an_image_is_never_cached() {
+        let dir = TempDir::new("notimage");
+        let portal = ok(b"<html>Log in to the hotel wifi</html>", None, None);
+        let http = Fake::answering(vec![portal.clone(), ok(&png(3), None, None)]);
+        let f = fetcher(http.clone(), &dir);
+        let src = TileSource::default();
+        let err = f.load(&src, K).await.unwrap_err();
+        assert!(err.contains("not an image"), "{err}");
+        assert!(f.cache().get(&src, K).is_none(), "the portal page was cached");
+        assert_eq!(f.load(&src, K).await.unwrap(), LoadedTile { bytes: png(3), origin: Origin::Network }, "asked again");
+        assert_eq!(http.requests().len(), 2);
+
+        // With a stale copy, it is shown and kept.
+        let other = TileKey { z: 4, x: 9, y: 5 };
+        f.cache().put(&src, other, &png(4), &TileMeta { expires: NOW - 1, ..Default::default() }).unwrap();
+        let http = Fake::answering(vec![portal]);
+        let f = fetcher(http, &dir);
+        assert_eq!(f.load(&src, other).await.unwrap(), LoadedTile { bytes: png(4), origin: Origin::Stale });
+        assert_eq!(f.cache().get(&src, other).unwrap().bytes, png(4));
+    }
+
+    /// Review #119: the body was read whole, however large. Over `MAX_TILE_BYTES` the tile
+    /// fails — by its Content-Length up front, or while reading when there is none.
+    #[tokio::test]
+    async fn an_oversized_body_fails_the_tile() {
+        let big = MAX_TILE_BYTES + 1;
+        let (declared, _, s1) = loopback(move |_| {
+            format!("HTTP/1.1 200 OK\r\nContent-Length: {big}\r\nConnection: close\r\n\r\n{}", "x".repeat(big))
+        })
+        .await;
+        let (undeclared, _, s2) = loopback(move |_| {
+            format!("HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n{}", "x".repeat(big))
+        })
+        .await;
+        let http = ReqwestHttp::new().unwrap();
+        for host in [declared, undeclared] {
+            let got = http.get(HttpRequest { url: format!("http://{host}/1/2/3.png"), ..Default::default() }).await;
+            let err = got.map(|r| r.body.len()).expect_err("an oversized body was accepted (its length above)");
+            assert!(err.contains("larger than 2 MiB"), "{host}: {err}");
+        }
+        s1.abort();
+        s2.abort();
+    }
+
     fn ok(body: &[u8], etag: Option<&str>, cache_control: Option<&str>) -> Result<HttpResponse, String> {
         Ok(HttpResponse {
             status: 200,
@@ -288,11 +428,11 @@ mod tests {
     #[tokio::test]
     async fn a_fresh_cached_tile_makes_no_request() {
         let dir = TempDir::new("fresh");
-        let http = Fake::answering(vec![ok(b"tile", Some("\"e1\""), None)]);
+        let http = Fake::answering(vec![ok(&png(1), Some("\"e1\""), None)]);
         let f = fetcher(http.clone(), &dir);
         let src = TileSource::default();
         let first = f.load(&src, K).await.unwrap();
-        assert_eq!(first, LoadedTile { bytes: b"tile".to_vec(), origin: Origin::Network });
+        assert_eq!(first, LoadedTile { bytes: png(1), origin: Origin::Network });
         assert_eq!(http.requests(), vec![HttpRequest { url: "https://tile.openstreetmap.org/4/8/5.png".into(), ..Default::default() }]);
         let again = f.load(&src, K).await.unwrap();
         assert_eq!(again.origin, Origin::Cache);
@@ -321,13 +461,13 @@ mod tests {
     #[tokio::test]
     async fn a_changed_tile_replaces_the_stale_one() {
         let dir = TempDir::new("changed");
-        let http = Fake::answering(vec![ok(b"new", Some("\"e2\""), Some("max-age=999999999"))]);
+        let http = Fake::answering(vec![ok(&png(2), Some("\"e2\""), Some("max-age=999999999"))]);
         let f = fetcher(http, &dir);
         let src = TileSource::default();
         f.cache().put(&src, K, b"old", &TileMeta { etag: Some("\"e1\"".into()), expires: NOW - 1, ..Default::default() }).unwrap();
-        assert_eq!(f.load(&src, K).await.unwrap(), LoadedTile { bytes: b"new".to_vec(), origin: Origin::Network });
+        assert_eq!(f.load(&src, K).await.unwrap(), LoadedTile { bytes: png(2), origin: Origin::Network });
         let c = f.cache().get(&src, K).unwrap();
-        assert_eq!((c.bytes.as_slice(), c.meta.expires), (&b"new"[..], NOW + 999_999_999));
+        assert_eq!((c.bytes, c.meta.expires), (png(2), NOW + 999_999_999));
     }
 
     /// Offline or refused: a stale copy is still shown; with none, the error.
@@ -371,7 +511,7 @@ mod tests {
                 s.max.fetch_max(n, Ordering::SeqCst);
                 let _open = s.open.acquire().await.unwrap();
                 s.now.fetch_sub(1, Ordering::SeqCst);
-                Ok(HttpResponse { status: 200, body: b"t".to_vec(), ..Default::default() })
+                Ok(HttpResponse { status: 200, body: png(1), ..Default::default() })
             })
         }
     }
@@ -421,6 +561,77 @@ mod tests {
         assert_eq!(gate.max.load(Ordering::SeqCst), MAX_CONCURRENT);
     }
 
+    /// A loopback HTTP server answering each request with `answer(path)`; counts requests.
+    async fn loopback(
+        answer: impl Fn(&str) -> String + Send + Sync + 'static,
+    ) -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let host = format!("127.0.0.1:{}", listener.local_addr().unwrap().port());
+        let hits = Arc::new(AtomicUsize::new(0));
+        let (answer, count) = (Arc::new(answer), hits.clone());
+        let server = tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                count.fetch_add(1, Ordering::SeqCst);
+                let mut request = Vec::new();
+                let mut buf = [0u8; 1024];
+                while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match stream.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => request.extend_from_slice(&buf[..n]),
+                    }
+                }
+                let text = String::from_utf8_lossy(&request).to_string();
+                let path = text.split_whitespace().nth(1).unwrap_or("/").to_string();
+                let _ = stream.write_all(answer(&path).as_bytes()).await;
+            }
+        });
+        (host, hits, server)
+    }
+
+    fn redirect_to(location: String) -> String {
+        format!("HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+    }
+
+    /// Review #119: reqwest's default policy followed a tile server's redirect to any host,
+    /// though consent is per host. A redirect to a host the user has not allowed now fails
+    /// the tile **without contacting that host**; one to the same host, or to another host
+    /// the user allowed, is followed.
+    #[tokio::test]
+    async fn redirects_reach_only_the_same_or_an_allowed_host() {
+        let (elsewhere, elsewhere_hits, s1) = loopback(|_| {
+            "HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\nelse".to_string()
+        })
+        .await;
+        let target = elsewhere.clone();
+        let (origin, _, s2) = loopback(move |path| match path {
+            "/same" => redirect_to("/tile".into()),
+            "/tile" => "HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\nsame".to_string(),
+            _ => redirect_to(format!("http://{target}/tile")),
+        })
+        .await;
+        let http = ReqwestHttp::new().unwrap();
+        let get = |path: &str, allowed: Vec<String>| {
+            http.get(HttpRequest { url: format!("http://{origin}{path}"), redirect_hosts: allowed, ..Default::default() })
+        };
+
+        let err = get("/away", Vec::new()).await.unwrap_err();
+        assert!(err.contains(&format!("redirected to {elsewhere}, which you have not allowed")), "{err}");
+        assert_eq!(elsewhere_hits.load(Ordering::SeqCst), 0, "the unconsented host was contacted");
+
+        let same = get("/same", Vec::new()).await.unwrap();
+        assert_eq!((same.status, same.body.as_slice()), (200, &b"same"[..]));
+
+        let allowed = get("/away", vec![elsewhere.clone()]).await.unwrap();
+        assert_eq!((allowed.status, allowed.body.as_slice()), (200, &b"else"[..]));
+        assert_eq!(elsewhere_hits.load(Ordering::SeqCst), 1);
+
+        let to_file = redirect_target(&reqwest::Url::parse("http://h.org/a").unwrap(), "file:///etc/passwd", "h.org", &[]);
+        assert!(to_file.unwrap_err().contains("file URL"));
+        s1.abort();
+        s2.abort();
+    }
+
     /// The real client against a loopback server: the ChairPhoto UA, the validators, and no
     /// `no-cache` request header.
     #[tokio::test]
@@ -449,6 +660,7 @@ mod tests {
                 url: src.url(K),
                 if_none_match: Some("\"e1\"".into()),
                 if_modified_since: Some("Mon, 31 Aug 2026 00:00:00 GMT".into()),
+                redirect_hosts: Vec::new(),
             })
             .await
             .unwrap();

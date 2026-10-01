@@ -7,8 +7,15 @@ use std::collections::BTreeMap;
 
 // --- consent ------------------------------------------------------------------------------
 
-/// The module setting holding the per-host answers (`map.tileHosts`): a JSON object
-/// `{"tile.openstreetmap.org": true, "tiles.example.org": false}`.
+/// The per-machine preference ([`crate::machine_prefs::MachinePrefs`]) holding the per-host
+/// answers: a JSON object `{"tile.openstreetmap.org": true, "tiles.example.org": false}`.
+/// Decision #118 says "per host, remembered, changeable in Preferences"; what a tile request
+/// reveals (this computer's IP address) is about the machine, not the catalog, so another
+/// catalog on this computer does not ask again.
+pub const MACHINE_TILE_HOSTS: &str = "map.tileHosts";
+/// The module setting where the answers used to live, per catalog (`map.tileHosts`, the
+/// first GPUI port). Read once per catalog, merged into [`MACHINE_TILE_HOSTS`]
+/// ([`HostConsent::merge_legacy`]) and then emptied.
 pub const TILE_HOSTS_KEY: &str = "tileHosts";
 /// The module setting holding the tile URL template (`map.tileUrl`, React's key).
 pub const TILE_URL_KEY: &str = "tileUrl";
@@ -28,10 +35,40 @@ pub enum Consent {
 pub struct HostConsent(BTreeMap<String, bool>);
 
 impl HostConsent {
-    /// Parse the stored setting. Anything unreadable is "never asked" for every host: the
-    /// safe direction, since it asks again rather than fetching.
+    /// Parse the stored value. Only `true` (allowed) and `false` (denied) entries count;
+    /// anything else — an unreadable value, a non-boolean entry — is "never asked" for that
+    /// host: the safe direction, since it asks again rather than fetching.
     pub fn parse(stored: Option<&str>) -> Self {
-        HostConsent(stored.and_then(|s| serde_json::from_str(s).ok()).unwrap_or_default())
+        let map: BTreeMap<String, serde_json::Value> =
+            stored.and_then(|s| serde_json::from_str(s).ok()).unwrap_or_default();
+        HostConsent(map.into_iter().filter_map(|(h, v)| v.as_bool().map(|a| (h, a))).collect())
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Fold a catalog's old per-catalog answers into these (the machine's). A host this
+    /// machine has no answer for takes the catalog's; where they disagree, **denied wins**
+    /// (two catalogs that disagree, or a catalog that blocked what another allowed, end up
+    /// blocked — the privacy-safe direction; the user can allow it again in Preferences).
+    /// Returns whether anything changed.
+    pub fn merge_legacy(&mut self, legacy: &HostConsent) -> bool {
+        let mut changed = false;
+        for (host, &allowed) in &legacy.0 {
+            match self.0.get(host) {
+                None => {
+                    self.0.insert(host.clone(), allowed);
+                    changed = true;
+                }
+                Some(true) if !allowed => {
+                    self.0.insert(host.clone(), false);
+                    changed = true;
+                }
+                Some(_) => {}
+            }
+        }
+        changed
     }
 
     pub fn to_json(&self) -> String {
@@ -197,6 +234,24 @@ mod tests {
         let mut f = back;
         f.forget("tiles.example.org");
         assert_eq!(f.get("tiles.example.org"), Consent::Unknown);
+    }
+
+    /// Migration from the per-catalog store: only boolean entries count; a host the machine
+    /// never answered takes the catalog's answer; on disagreement denied wins, whichever
+    /// side denied; agreement changes nothing.
+    #[test]
+    fn legacy_answers_merge_only_booleans_and_denied_wins() {
+        let mut machine = HostConsent::parse(Some(r#"{"both.example":true,"kept.example":false}"#));
+        let legacy = HostConsent::parse(Some(
+            r#"{"new.example":true,"both.example":false,"kept.example":true,"odd.example":"allowed","n.example":1}"#,
+        ));
+        assert_eq!(legacy.hosts().count(), 3, "non-boolean entries are not answers");
+        assert!(machine.merge_legacy(&legacy));
+        assert_eq!(machine.get("new.example"), Consent::Allowed);
+        assert_eq!(machine.get("both.example"), Consent::Denied, "a catalog's block wins over an allow");
+        assert_eq!(machine.get("kept.example"), Consent::Denied, "a catalog's allow never lifts a block");
+        assert_eq!(machine.get("odd.example"), Consent::Unknown);
+        assert!(!machine.merge_legacy(&legacy), "merging again changes nothing");
     }
 
     #[test]

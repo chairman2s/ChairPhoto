@@ -137,131 +137,36 @@ pub async fn export_bundle(
     .map_err(|e| e.to_string())?
 }
 
-/// Import a `.chairphoto` bundle (F1d): unpack originals into `<root>/YYYY/MM/DD/`,
-/// index via the UUID-aware upsert (prevents duplicates), run the F1c additive merge
-/// (metadata/taxonomy/ratings/tags/import batch), and auto-enqueue backup. The copy
-/// phase runs off the catalog lock to keep the UI responsive; the index phase holds
-/// the lock only briefly (fast DB work).
-///
-/// Progress is streamed as `import:progress` events (`{done, total}`) during the copy
-/// phase — the same shape as E5/ingest so the frontend reuses its progress bar.
+/// Import a `.chairphoto` bundle (F1d): unpack originals into `<root>/YYYY/MM/DD/`, index
+/// via the UUID-aware upsert, run the additive merge and auto-enqueue backup — the core's
+/// `app::bundles::import_bundle` on a blocking worker (the copy runs off the catalog lock,
+/// the index on a secondary connection). Progress streams as `import:progress`. The import
+/// owns the import generation, so a catalog switch or a newer import stops it before the
+/// merge.
 #[tauri::command]
 pub async fn import_bundle_cmd(
-    app: AppHandle,
     state: State<'_, AppState>,
     bundle_path: String,
 ) -> Result<crate::bundle::importer::BundleImportResult, String> {
     let bundle_path = expand_home(&bundle_path);
-
-    // The destination is always the library root (catalog root = local volume base).
-    // Read it under a brief lock before releasing for the long copy phase.
-    let dest = {
-        let guard = state.catalog.lock().map_err(|e| e.to_string())?;
-        let catalog = guard.as_ref().ok_or("No catalog is open")?;
-        catalog.root().to_path_buf()
-    };
-
-    // Phase 1+2 — open + extract originals. File IO only; no catalog lock.
-    // This is the slow part (potentially gigabytes of RAW files).
-    let (manifest, extracted, partial) = {
-        let app = app.clone();
-        crate::app::spawn_blocking(move || {
-            let (manifest, mut archive) =
-                crate::bundle::importer::open_bundle(&bundle_path)?;
-            let (extracted, partial) = crate::bundle::importer::extract_originals(
-                &manifest,
-                &mut archive,
-                &dest,
-                |done, total| {
-                    let _ = app.send(CoreEvent::ImportProgress(ImportProgress { done, total }));
-                },
-            )?;
-            Ok::<_, String>((manifest, extracted, partial))
-        })
+    let state = state.inner().clone();
+    crate::app::spawn_blocking(move || crate::app::bundles::import_bundle(&state, &bundle_path))
         .await
-        .map_err(|e| e.to_string())??
-    };
-
-    // Phase 3 — index + merge. Read catalog path+root under a brief lock, then release
-    // it. The actual indexing (DB writes, XMP sidecar writes, reconcile_missing) runs on
-    // a secondary catalog connection inside spawn_blocking — the main mutex is never held
-    // across file I/O. This matches the run_blocking_scan / ingest_from_card pattern and
-    // satisfies AGENTS.md "UI thread is never blocked" + the spec's "copy phase off the
-    // catalog lock" requirement.
-    let (db_path, root) = {
-        let guard = state.catalog.lock().map_err(|e| e.to_string())?;
-        let catalog = guard.as_ref().ok_or("No catalog is open")?;
-        (catalog.db_path().to_path_buf(), catalog.root().to_path_buf())
-    };
-    let result = crate::app::spawn_blocking(move || {
-        let sec = crate::catalog::Catalog::open_secondary(&db_path, &root)
-            .map_err(|e| e.to_string())?;
-        crate::bundle::importer::index_bundle(&sec, &manifest, &extracted, &root, partial)
-            .map_err(|e| e.to_string())
-    })
-    .await
-    .map_err(|e| e.to_string())??;
-
-    Ok(result)
+        .map_err(|e| e.to_string())?
 }
 
-/// Peek at a `.chairphoto` bundle and return a lightweight pre-import summary so the
-/// frontend can show the user "N new / M already present" before committing to the full
-/// import. Opens the bundle zip, reads `manifest.json`, and counts photos by UUID against
-/// the open catalog. No files are written and no catalog data is changed.
-///
-/// Returns a [`BundlePreview`] with the batch label, total photo count, and the number
-/// that are already present in the catalog (so `new = total - existing`).
+/// Peek at a `.chairphoto` bundle and return a lightweight pre-import summary ("N new / M
+/// already present") so the user can confirm before the full import. Writes nothing.
 #[tauri::command]
 pub async fn preview_bundle(
     state: State<'_, AppState>,
     bundle_path: String,
 ) -> Result<BundlePreview, String> {
     let bundle_path = expand_home(&bundle_path);
-
-    // Phase 1 — open and parse the manifest (pure filesystem; no catalog lock).
-    let manifest = crate::app::spawn_blocking(move || {
-        let (manifest, _archive) = crate::bundle::importer::open_bundle(&bundle_path)?;
-        Ok::<_, String>(manifest)
-    })
-    .await
-    .map_err(|e| e.to_string())??;
-
-    // Phase 2 — count new vs existing with a single IN-clause query under a brief
-    // catalog lock.  Collecting all UUIDs first avoids holding the lock for N
-    // individual round-trips (one per photo), which stalls thumbnails and grid
-    // refreshes on large bundles.
-    let uuids: Vec<String> = manifest.photos.iter().map(|bp| bp.uuid.clone()).collect();
-    let (existing, new_count) = {
-        let guard = state.catalog.lock().map_err(|e| e.to_string())?;
-        let catalog = guard.as_ref().ok_or("No catalog is open")?;
-        let existing = catalog.count_existing_uuids(&uuids).map_err(|e| e.to_string())?;
-        let new_count = uuids.len().saturating_sub(existing);
-        (existing, new_count)
-    };
-
-    Ok(BundlePreview {
-        batch_label: manifest.batch.source_label.clone(),
-        batch_uuid: manifest.batch.uuid.clone(),
-        total: manifest.photos.len(),
-        new_count,
-        existing,
-    })
+    let state = state.inner().clone();
+    crate::app::spawn_blocking(move || crate::app::bundles::preview_bundle(&state, &bundle_path))
+        .await
+        .map_err(|e| e.to_string())?
 }
 
-/// Lightweight summary returned by [`preview_bundle`] for the pre-import dialog.
-#[derive(Debug, serde::Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct BundlePreview {
-    /// Human label for the import batch (e.g. source folder name).
-    pub batch_label: String,
-    /// Stable UUID of the import batch.
-    pub batch_uuid: String,
-    /// Total photos in the bundle.
-    pub total: usize,
-    /// Photos not yet in the catalog (will be added on import).
-    pub new_count: usize,
-    /// Photos already present in the catalog (merge is a no-op for them).
-    pub existing: usize,
-}
-
+pub use crate::app::bundles::BundlePreview;

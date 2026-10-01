@@ -18,6 +18,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 mod boot;
 pub mod catalogs;
+pub mod bundles;
 pub mod events;
 pub mod identity;
 pub mod jobs;

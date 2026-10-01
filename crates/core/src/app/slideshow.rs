@@ -85,9 +85,7 @@ pub fn claim_slideshow(
         return Err("No photos selected for the slideshow".into());
     }
     let ffmpeg = ffmpeg.ok_or_else(|| FFMPEG_MISSING.to_string())?;
-    if dest_dir.trim().is_empty() {
-        return Err("Choose an output folder.".into());
-    }
+    let dest_dir = output_folder(dest_dir)?;
     let guard = state.catalog.lock().map_err(|e| e.to_string())?;
     let catalog = guard.as_ref().ok_or("No catalog is open")?;
     if expected.is_some_and(|e| !e.is(catalog)) {
@@ -104,11 +102,31 @@ pub fn claim_slideshow(
         state: state.clone(),
         items: resolved.items,
         opts,
-        dest_dir: super::expand_home(dest_dir.trim()),
+        dest_dir,
         ffmpeg,
         abort,
         job,
     })
+}
+
+/// What a render answers when the output folder is not an absolute local path.
+pub const OUTPUT_FOLDER_NOT_LOCAL: &str =
+    "The output folder must be a full local folder path (like ~/Videos), not a URL or a relative path.";
+
+/// The output folder as an absolute local path (`~` expanded). Anything else — a relative
+/// path, a URL such as `ftp://…`, a name starting with `-` — is refused: the movie path is
+/// handed to ffmpeg, which would read a URL as a network output and a leading `-` as an
+/// option.
+fn output_folder(dest_dir: &str) -> Result<PathBuf, String> {
+    let dest_dir = dest_dir.trim();
+    if dest_dir.is_empty() {
+        return Err("Choose an output folder.".into());
+    }
+    let path = super::expand_home(dest_dir);
+    if !path.is_absolute() {
+        return Err(OUTPUT_FOLDER_NOT_LOCAL.into());
+    }
+    Ok(path)
 }
 
 impl SlideshowJob {
@@ -206,7 +224,7 @@ mod tests {
             "#!/bin/sh\nexec sleep 30\n".to_string()
         } else {
             "#!/bin/sh\nfor last; do :; done\necho frame=10\necho progress=continue\necho frame=40\n\
-             echo progress=end\nprintf movie > \"$last\"\n"
+             echo progress=end\nprintf movie > \"${last#file:}\"\n"
                 .to_string()
         };
         std::fs::write(&path, body).unwrap();
@@ -271,6 +289,18 @@ mod tests {
         let err = claim_slideshow(&state, None, &ids, opts(), "~/Videos", None).err().unwrap();
         assert_eq!(err, FFMPEG_MISSING);
         assert_eq!(state.jobs.slideshow.job_ids_issued(), before, "no job claimed");
+    }
+
+    #[test]
+    fn an_output_folder_that_is_not_an_absolute_local_path_is_refused_before_the_claim() {
+        let (dir, state, _p, ids) = setup("folder", 2);
+        let before = state.jobs.slideshow.job_ids_issued();
+        for folder in ["-x", "ftp://example.com/movies", "relative/out", "file:out"] {
+            let err = claim_slideshow(&state, None, &ids, opts(), folder, Some(fake_ffmpeg(&dir, false))).err();
+            assert_eq!(err.as_deref(), Some(OUTPUT_FOLDER_NOT_LOCAL), "{folder}");
+        }
+        assert_eq!(state.jobs.slideshow.job_ids_issued(), before, "no job claimed");
+        assert!(!dir.join("-x").exists() && !std::path::Path::new("-x").exists(), "nothing created");
     }
 
     #[test]

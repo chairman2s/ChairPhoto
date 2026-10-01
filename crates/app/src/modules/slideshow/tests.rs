@@ -69,7 +69,7 @@ fn fake_ffmpeg(dir: &Path) -> PathBuf {
     let path = dir.join("ffmpeg");
     std::fs::write(
         &path,
-        "#!/bin/sh\nfor last; do :; done\necho frame=10\necho progress=end\nprintf movie > \"$last\"\n",
+        "#!/bin/sh\nfor last; do :; done\necho frame=10\necho progress=end\nprintf movie > \"${last#file:}\"\n",
     )
     .unwrap();
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();

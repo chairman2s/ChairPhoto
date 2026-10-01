@@ -96,8 +96,12 @@ pub struct AppModel {
     pub catalog_epoch: u64,
     /// The newest resolved `chairphoto://` link (see [`DeepLinkTarget`]).
     pub deep_link: Option<DeepLinkTarget>,
-    /// The newest link that arrived before the catalog was open, applied once it is (React's
-    /// `ready`). One, not a queue: each resolution supersedes the one before, so of several
+    /// Whether [`catalog`](Self::catalog) was read since the last catalog switch, so that a
+    /// link resolved now asks the catalog the user sees. Kept apart from `catalog`, which the
+    /// title bar goes on showing (the old name) until the switch's refresh lands.
+    catalog_current: bool,
+    /// The newest link that arrived before the catalog was read (at startup, or since a
+    /// switch), applied once it is (React's `ready`). One, not a queue: each resolution supersedes the one before, so of several
     /// waiting links only the newest could land; older ones are dropped as they are replaced.
     pending_link: Option<DeepLink>,
     /// The link [`AppModel::open_deep_link`] is resolving now, if any.
@@ -121,6 +125,7 @@ impl AppModel {
             generation: 0,
             catalog_epoch: 0,
             deep_link: None,
+            catalog_current: false,
             pending_link: None,
             in_flight_link: None,
             link_generation: 0,
@@ -190,6 +195,7 @@ impl AppModel {
                     Ok(summary) => {
                         eprintln!("catalog: {} · {} photos", summary.name, summary.photo_count);
                         m.catalog = Some(summary);
+                        m.catalog_current = true;
                         cx.emit(AppModelEvent::CatalogRead);
                         if let Some(link) = m.pending_link.take() {
                             m.open_deep_link(link, cx);
@@ -197,6 +203,7 @@ impl AppModel {
                     }
                     Err(e) => {
                         m.catalog = None;
+                        m.catalog_current = false;
                         m.status = format!("Catalog unavailable: {e}").into();
                     }
                 }
@@ -221,10 +228,11 @@ impl AppModel {
     }
 
     /// Resolve a parsed link against the open catalog, off the UI thread, and record it in
-    /// [`deep_link`](Self::deep_link). Before the catalog is open the link waits; a newer link
-    /// supersedes an older one still resolving.
+    /// [`deep_link`](Self::deep_link). Before the catalog is open — or after a switch, before
+    /// the new catalog has been read — the link waits; a newer link supersedes an older one
+    /// still resolving or waiting.
     pub fn open_deep_link(&mut self, link: DeepLink, cx: &mut Context<Self>) {
-        if self.catalog.is_none() {
+        if !self.catalog_current {
             if let Some(older) = self.pending_link.replace(link) {
                 eprintln!("deep link: {older:?} superseded by a newer link before the catalog opened");
             }
@@ -276,8 +284,12 @@ impl AppModel {
     ///   its refresh lands. A `chairphoto://` URL names a photo or tag by uuid, not a catalog;
     ///   the user asked the app to show it, and the catalog the app has open when it can
     ///   answer is the one to ask. Dropping them would lose a click without a word.
+    /// - **Until the new catalog is read, links wait** (`catalog_current`): a link arriving
+    ///   now replaces the carried-over one in `pending_link`, so the refresh replays the
+    ///   newest link, never an older one over a newer.
     fn on_catalog_switched(&mut self) {
         self.catalog_epoch += 1;
+        self.catalog_current = false;
         self.link_generation += 1;
         self.deep_link = None;
         if let Some(link) = self.in_flight_link.take() {

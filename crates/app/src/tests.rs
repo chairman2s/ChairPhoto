@@ -665,6 +665,40 @@ fn a_link_in_flight_at_a_switch_resolves_against_the_new_catalog(cx: &mut TestAp
     });
 }
 
+/// A newer link always wins across a switch (Codex gate, #100): link A is in flight when the
+/// catalog switches, so it is carried over to wait for the new catalog's read; link B
+/// arrives after the switch but before that read lands. B must be the one applied — the
+/// refresh must not replay the older A over it.
+#[gpui_kit::test]
+fn a_link_after_a_switch_supersedes_the_carried_over_one(cx: &mut TestAppContext) {
+    let dir = TempDir::new("link-newer");
+    let (state, model) = wired(cx);
+    catalog_with_a_photo_and_a_tag(&dir, &state);
+    model.update(cx, |m, cx| m.refresh(cx));
+    cx.run_until_parked();
+    let (other, other_uuid) = second_catalog(&dir);
+    let tag_id = other.create_tag("Places/Bergen").unwrap();
+    let tag_uuid = other.get_tag(tag_id).unwrap().uuid;
+
+    // A starts against the first catalog; the switch lands (the new catalog already in
+    // state, as `switch_catalog` leaves it) before A or the switch's refresh has run.
+    model.update(cx, |m, cx| m.open_url(&format!("chairphoto://{other_uuid}"), cx));
+    *state.catalog.lock().unwrap() = Some(other);
+    model.update(cx, |m, cx| m.on_core_event(&CoreEvent::CatalogSwitched("other".into()), cx));
+    // B, newer, before the refresh lands.
+    model.update(cx, |m, cx| m.open_url(&format!("chairphoto://tag/{tag_uuid}"), cx));
+    cx.run_until_parked();
+
+    model.read_with(cx, |m, _| match &m.deep_link {
+        Some(DeepLinkTarget::Tag { uuid, full_path, .. }) => {
+            assert_eq!(uuid, &tag_uuid);
+            assert_eq!(full_path, "Places/Bergen");
+        }
+        other => panic!("the older link landed over the newer one: {other:?}"),
+    });
+    assert_eq!(model_status(&model, cx), "Deep link: filter by tag Places/Bergen");
+}
+
 /// Asking to quit closes the single-instance endpoint at once (before the event loop ends),
 /// so a second launch from then on is told `closing` rather than `ok`.
 #[gpui_kit::test]

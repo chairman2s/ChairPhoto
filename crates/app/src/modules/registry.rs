@@ -14,7 +14,12 @@
 //! **Persistence.** The enabled set lives in the open catalog's `settings` table under
 //! `modules.enabled`, comma-separated in dependency order, written off the UI thread after
 //! every user toggle (a write a newer one overtook is skipped). It is restored on the first
-//! catalog read after startup ([`AppModelEvent::CatalogRead`]), as `initHost` did.
+//! catalog read after startup ([`AppModelEvent::CatalogRead`]), as `initHost` did, and again
+//! after every `catalog:switched`, from the new catalog: the modules it lists are enabled and
+//! those it does not list disabled, without writing (React kept the old set and the next
+//! toggle overwrote the new catalog's). A catalog that has never saved a set keeps the
+//! modules that are on. A write is tied to the catalog it was made for: one that would land
+//! in a catalog opened since is dropped.
 //!
 //! **Toggles wait for the restore.** React awaited `initHost` before anything could toggle.
 //! Here the restore's read is asynchronous, so an enable or disable asked for before it has
@@ -172,6 +177,10 @@ pub struct ModuleRegistry {
     restore: Restore,
     /// Enables (`true`) and disables asked for while the restore had not landed, in order.
     queued: Vec<(String, bool)>,
+    /// Bumped by every catalog switch: a restore read from before it is dropped.
+    restore_generation: u64,
+    /// The catalog the enabled set was restored from; writes go only to it.
+    catalog_path: Option<std::path::PathBuf>,
     views: HashMap<ViewKey, AnyView>,
     persist_generation: u64,
     /// The generation of the newest `modules.enabled` write that ran.
@@ -219,6 +228,8 @@ impl ModuleRegistry {
             shell: shell.clone(),
             restore: Restore::Waiting,
             queued: Vec::new(),
+            restore_generation: 0,
+            catalog_path: None,
             views: HashMap::new(),
             persist_generation: 0,
             persisted: Arc::new(Mutex::new(0)),
@@ -236,7 +247,12 @@ impl ModuleRegistry {
             let Some(registry) = weak.upgrade() else { return };
             match event {
                 AppModelEvent::CatalogRead => Self::restore(&registry, cx),
-                AppModelEvent::Core(event) => Self::deliver(&registry, event, cx),
+                AppModelEvent::Core(event) => {
+                    if let CoreEvent::CatalogSwitched(_) = event {
+                        Self::catalog_switched(&registry, cx);
+                    }
+                    Self::deliver(&registry, event, cx)
+                }
             }
         })
         .detach();
@@ -564,6 +580,7 @@ impl ModuleRegistry {
         let csv = self.enabled_ids_in_dep_order().iter().map(|id| id.as_ref()).collect::<Vec<_>>().join(",");
         let app = self.app.clone();
         let persisted = self.persisted.clone();
+        let catalog = self.catalog_path.clone();
         cx.background_executor()
             .spawn(async move {
                 let mut newest = persisted.lock().unwrap_or_else(|e| e.into_inner());
@@ -571,7 +588,15 @@ impl ModuleRegistry {
                     return;
                 }
                 *newest = generation;
-                if let Err(e) = with_catalog(&app, |c| c.set_setting(ENABLED_KEY, &csv)) {
+                let written = with_catalog(&app, |c| match &catalog {
+                    // Under the catalog lock, so no switch can come between check and write.
+                    Some(path) if c.db_path() != path.as_path() => Ok(false),
+                    _ => c.set_setting(ENABLED_KEY, &csv).map(|()| true),
+                });
+                if let Ok(false) = written {
+                    eprintln!("modules: not saving the enabled modules: the catalog was switched");
+                }
+                if let Err(e) = written {
                     eprintln!("modules: could not save the enabled modules: {e}");
                 }
             })
@@ -585,18 +610,36 @@ impl ModuleRegistry {
         if this.read(cx).restore != Restore::Waiting {
             return;
         }
-        this.update(cx, |r, _| r.restore = Restore::Reading);
+        let generation = this.update(cx, |r, _| {
+            r.restore = Restore::Reading;
+            r.restore_generation
+        });
         let app = this.read(cx).app.clone();
-        let read = cx.background_executor().spawn(async move { with_catalog(&app, |c| c.get_setting(ENABLED_KEY)) });
+        let read = cx.background_executor().spawn(async move {
+            with_catalog(&app, |c| Ok((c.get_setting(ENABLED_KEY)?, c.db_path().to_path_buf())))
+        });
         let weak = this.downgrade();
         cx.spawn(async move |cx| {
-            let csv = read.await;
+            let read = read.await;
             cx.update(|cx| {
                 let Some(this) = weak.upgrade() else { return };
-                match csv {
-                    Ok(csv) => {
-                        for id in csv.unwrap_or_default().split(',').filter(|id| !id.is_empty()) {
-                            Self::enable_inner(&this, id, false, &mut HashSet::new(), cx);
+                if this.read(cx).restore_generation != generation {
+                    return; // the catalog was switched while reading: the new one's read follows
+                }
+                match read {
+                    Ok((csv, path)) => {
+                        this.update(cx, |r, _| r.catalog_path = Some(path));
+                        if let Some(csv) = csv {
+                            let listed: Vec<&str> = csv.split(',').filter(|id| !id.is_empty()).collect();
+                            // Dependents first, so a cascade finds nothing left to do.
+                            let mut off = this.read(cx).enabled_ids_in_dep_order();
+                            off.reverse();
+                            for id in off.iter().filter(|id| !listed.contains(&id.as_ref())) {
+                                Self::disable_inner(&this, id, false, cx);
+                            }
+                            for id in listed {
+                                Self::enable_inner(&this, id, false, &mut HashSet::new(), cx);
+                            }
                         }
                     }
                     Err(e) => eprintln!("modules: could not read the enabled modules: {e}"),
@@ -621,6 +664,16 @@ impl ModuleRegistry {
             });
         })
         .detach();
+    }
+
+    /// A catalog switch: the saved set is the new catalog's, read on the model's next catalog
+    /// read; until then toggles queue, and a read still running for the old one is dropped.
+    fn catalog_switched(this: &Entity<Self>, cx: &mut App) {
+        this.update(cx, |r, _| {
+            r.restore = Restore::Waiting;
+            r.restore_generation += 1;
+            r.catalog_path = None;
+        });
     }
 
     /// Hand `event` to every enabled module, in registration order. A module disabled by an

@@ -465,6 +465,78 @@ fn a_toggle_during_startup_composes_with_the_saved_set(cx: &mut TestAppContext) 
     }
 }
 
+/// After a catalog switch the new catalog's saved set applies — what it lists on, the rest
+/// off — without writing the old set into it; a catalog with no saved set keeps what is on.
+/// A write made for the old catalog never lands in the new one.
+#[gpui_kit::test]
+fn a_catalog_switch_restores_the_new_catalogs_modules(cx: &mut TestAppContext) {
+    let dir = TempDir::new("switch");
+    let log = Log::default();
+    let b = bench(
+        vec![probe(ModuleMeta::new("a", "A"), &log), probe(ModuleMeta::new("b", "B"), &log), probe(ModuleMeta::new("c", "C"), &log)],
+        &[],
+        &dir,
+        cx,
+    );
+    b.enable("a", cx);
+    b.enable("c", cx);
+    let open = |name: &str, saved: Option<&str>| {
+        let db = dir.0.join(name);
+        let c = Catalog::open(&db, &dir.0.join("photos")).unwrap();
+        if let Some(saved) = saved {
+            c.set_setting(ENABLED_KEY, saved).unwrap();
+        }
+        (c, db)
+    };
+    let switch_to = |catalog: Catalog, db: &std::path::Path, cx: &mut TestAppContext| {
+        let old = b.state.catalog.lock().unwrap().replace(catalog);
+        b.event(CoreEvent::CatalogSwitched(db.to_string_lossy().to_string()), cx);
+        old.unwrap()
+    };
+
+    let (cat_b, db_b) = open("b.chairphoto", Some("b"));
+    let cat_a = switch_to(cat_b, &db_b, cx);
+    assert_eq!(b.enabled(cx), ["b"], "B's saved set, not A's carried over");
+    assert_eq!(b.setting(ENABLED_KEY).as_deref(), Some("b"), "nothing was written into B");
+    assert_eq!(cat_a.get_setting(ENABLED_KEY).unwrap().as_deref(), Some("a,c"), "A keeps its own");
+    b.enable("c", cx);
+    assert_eq!(b.setting(ENABLED_KEY).as_deref(), Some("b,c"));
+
+    let (cat_c, db_c) = open("c.chairphoto", None);
+    switch_to(cat_c, &db_c, cx);
+    assert_eq!(b.enabled(cx), ["b", "c"], "a catalog with no saved set keeps what is on");
+    assert_eq!(b.setting(ENABLED_KEY), None);
+
+    // A toggle's write, then a catalog swap before the write runs: it must not land.
+    cx.update(|cx| ModuleRegistry::enable(&b.registry, "a", cx));
+    let (cat_d, _) = open("d.chairphoto", Some("b"));
+    b.state.catalog.lock().unwrap().replace(cat_d);
+    cx.run_until_parked();
+    assert_eq!(b.setting(ENABLED_KEY).as_deref(), Some("b"), "the write for C did not land in D");
+}
+
+/// A restore read that a catalog switch overtook is dropped: the old catalog's set is not
+/// applied, and the new catalog's restore still runs.
+#[gpui_kit::test]
+fn a_restore_read_overtaken_by_a_switch_is_dropped(cx: &mut TestAppContext) {
+    let dir = TempDir::new("overtaken");
+    let log = Log::default();
+    let b = bench_unrestored(vec![probe(ModuleMeta::new("a", "A"), &log), probe(ModuleMeta::new("b", "B"), &log)], &[], &dir, cx);
+    b.state.catalog.lock().unwrap().as_ref().unwrap().set_setting(ENABLED_KEY, "a").unwrap();
+    b.model.update(cx, |m, cx| m.refresh(cx));
+    while !b.registry.read_with(cx, |r, _| r.restore_reading()) {
+        cx.executor().tick();
+    }
+    cx.executor().tick(); // the read runs against A; its result is not applied yet
+    let db = dir.0.join("b.chairphoto");
+    let catalog = Catalog::open(&db, &dir.0.join("photos")).unwrap();
+    catalog.set_setting(ENABLED_KEY, "b").unwrap();
+    *b.state.catalog.lock().unwrap() = Some(catalog);
+    b.event(CoreEvent::CatalogSwitched(db.to_string_lossy().to_string()), cx);
+    assert_eq!(b.enabled(cx), ["b"]);
+    assert_eq!(*log.borrow(), ["load:b"], "A's set was never applied");
+}
+
 /// With no catalog open, a toggle waits (it has nowhere to be saved) and lands once one is.
 #[gpui_kit::test]
 fn a_toggle_with_no_catalog_waits_for_one(cx: &mut TestAppContext) {

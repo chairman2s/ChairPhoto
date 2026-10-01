@@ -14,4 +14,5 @@ pub mod library;
 pub mod presets;
 pub mod shell_timing;
 pub mod tag_paste;
+pub mod tag_tree;
 pub mod theme;

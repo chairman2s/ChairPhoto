@@ -39,6 +39,7 @@
 
 pub mod panel;
 pub mod registry;
+pub mod statistics;
 
 #[cfg(any(test, feature = "dev-module"))]
 pub mod dev_module;
@@ -320,6 +321,7 @@ pub fn bundled() -> Vec<Rc<dyn Module>> {
     let mut modules: Vec<Rc<dyn Module>> = Vec::new();
     #[cfg(any(test, feature = "dev-module"))]
     modules.push(Rc::new(dev_module::DevModule));
+    modules.push(Rc::new(statistics::StatisticsModule));
     modules
 }
 

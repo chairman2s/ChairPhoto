@@ -359,6 +359,71 @@ fn a_raster_is_painted_only_under_its_own_scene(cx: &mut TestAppContext) {
     assert_eq!(painted(cx), Some(new), "the new scene's raster is painted");
 }
 
+/// A resize alone (same selection, same view) moves the ring's centre, so the lit edges are
+/// rebuilt at the new canvas size: they shift with the ring by half the size change × k.
+#[gpui_kit::test]
+fn a_resize_rebuilds_the_lit_edges(cx: &mut TestAppContext) {
+    let f = fixture(small(), cx);
+    f.click("tg-type-tags", cx);
+    let id = f.view.read_with(cx, |v, _| v.session().scene().unwrap().layout.label_order[0]);
+    f.view.update(cx, |v, cx| v.update_session(cx, |s| s.select(Some(id))));
+    f.settle(cx);
+    let lit = |cx: &mut TestAppContext| {
+        f.view.read_with(cx, |v, _| {
+            let c = v.paint_cache();
+            let c = c.borrow();
+            (c.lit_bounds().expect("lit edges painted"), c.canvas_size().unwrap(), c.origin())
+        })
+    };
+    let (before, size0, origin0) = lit(cx);
+    let view = f.view_state(cx);
+
+    let window = cx.update_window(f.any(), |_, window, _| window.bounds().size).unwrap();
+    cx.simulate_window_resize(f.any(), gpui_kit::size(window.width + px(200.), window.height + px(100.)));
+    f.settle(cx);
+    let (after, size1, origin1) = lit(cx);
+    assert_eq!(f.view_state(cx), view, "the view itself is unchanged");
+    assert_eq!(f.view.read_with(cx, |v, _| v.session().selected()), Some(id));
+    assert!(size1.w > size0.w && size1.h > size0.h, "the canvas grew: {size0:?} → {size1:?}");
+
+    let dx = (size1.w - size0.w) / 2. * view.k + f64::from(origin1.x - origin0.x);
+    let dy = (size1.h - size0.h) / 2. * view.k + f64::from(origin1.y - origin0.y);
+    let moved = (f64::from(after.origin.x - before.origin.x), f64::from(after.origin.y - before.origin.y));
+    assert!(
+        (moved.0 - dx).abs() < 0.5 && (moved.1 - dy).abs() < 0.5,
+        "the lit edges follow the ring: moved {moved:?}, expected ({dx}, {dy})"
+    );
+    assert!(f64::from(after.size.width - before.size.width).abs() < 0.5, "same edges, same extent");
+}
+
+/// A display-scale change alone (same logical size, 2× → 1×) re-rasters at the new scale, so
+/// the old raster is not left stretched.
+#[gpui_kit::test]
+fn a_scale_change_alone_rasters_at_the_new_scale(cx: &mut TestAppContext) {
+    let f = fixture(small(), cx);
+    f.click("tg-type-tags", cx);
+    let width = |cx: &mut TestAppContext| {
+        f.view.read_with(cx, |v, _| {
+            let r = v.raster().expect("a raster");
+            (r.image.size(0).width.0, r.region.w)
+        })
+    };
+    let (w0, region0) = width(cx);
+    assert_eq!(w0, (region0 * 2.).ceil() as i32, "the test window starts at 2×");
+    let size0 = f.view.read_with(cx, |v, _| v.session().size());
+    let before = f.stats(cx);
+
+    cx.simulate_window_scale_factor_change(f.any(), 1.);
+    f.settle(cx);
+    cx.executor().advance_clock(super::raster::SETTLE);
+    cx.run_until_parked();
+    assert_eq!(f.view.read_with(cx, |v, _| v.session().size()), size0, "the logical size is unchanged");
+    let after = f.stats(cx);
+    assert_eq!(after.rasters_applied - before.rasters_applied, 1, "one raster for the new scale");
+    let (w1, region1) = width(cx);
+    assert_eq!(w1, (region1 * 1.).ceil() as i32, "made at 1×");
+}
+
 /// A burst of raster requests (a slider sweep, a zoom while one runs): one raster runs at a
 /// time, the burst coalesces into one more made from the latest state, and that one lands.
 #[gpui_kit::test]

@@ -449,10 +449,13 @@ impl TagGraphView {
         self.zoom((1. + e.delta as f64).max(0.1), e.position, cx);
     }
 
-    /// The canvas was laid out (size or scale changed): fit if waiting, re-raster.
-    fn canvas_resized(&mut self, cx: &mut Context<Self>) {
+    /// The canvas was laid out (size or scale changed): fit if waiting, re-raster. A scale
+    /// change alone (a move to a display of another density) re-rasters too: the shown raster
+    /// was made at the old device scale.
+    fn canvas_resized(&mut self, scale_changed: bool, cx: &mut Context<Self>) {
         let Some(size) = self.paint.borrow().canvas_size() else { return };
-        if self.session.set_size(size) {
+        let size_changed = self.session.set_size(size);
+        if size_changed || scale_changed {
             self.request_raster(self.raster.is_some(), cx);
             cx.notify();
         }
@@ -518,7 +521,7 @@ impl TagGraphView {
                 if changed || scale_changed {
                     let this = this.clone();
                     cx.defer(move |cx| {
-                        this.update(cx, |v, cx| v.canvas_resized(cx)).ok();
+                        this.update(cx, |v, cx| v.canvas_resized(scale_changed, cx)).ok();
                     });
                 }
             },

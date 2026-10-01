@@ -222,16 +222,16 @@ fn emit(state: &AppState, phase: &str, editor: &str) {
     state.send(CoreEvent::DevelopProgress(DevelopProgress { phase: phase.into(), editor: editor.into() }));
 }
 
-#[derive(serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AvailableEditor {
-    key: String,
-    label: String,
+    pub key: String,
+    pub label: String,
     /// The GUI command is runnable (so we can offer "Edit in …").
-    gui: bool,
+    pub gui: bool,
     /// The CLI command is runnable (so we can auto-render the result).
-    cli: bool,
-    sidecar: String,
+    pub cli: bool,
+    pub sidecar: String,
 }
 
 /// Which editors are configured/available, for the inspector "Edit in…" menu + Preferences.

@@ -13,7 +13,10 @@
 //!
 //! The directory is `$XDG_RUNTIME_DIR/chairphoto`, or `<tmp>/chairphoto-<uid>` when
 //! `XDG_RUNTIME_DIR` is unset; either way created `0700` and refused unless it is owned by
-//! this user and not writable by anyone else.
+//! this user and not writable by anyone else. A socket path must fit `sun_path`
+//! ([`MAX_SOCKET_PATH`] bytes): when `$TMPDIR` is too deep for that, the fallback is
+//! `/tmp/chairphoto-<uid>`, and a path that still does not fit is refused by [`claim`] with an
+//! error that says so (the app then runs without single-instance).
 //!
 //! **The key** ([`instance_key`]) is a hash of the app data directory — the directory that
 //! holds `default.chairphoto` (`app::app_data_dir`, `$XDG_DATA_HOME/chairphoto`). One app
@@ -123,16 +126,33 @@ pub fn instance_key(app_data_dir: &Path) -> String {
     format!("{hash:016x}")
 }
 
-/// `$XDG_RUNTIME_DIR/chairphoto`, else `<tmp>/chairphoto-<uid>`, created `0700` and checked
-/// to be this user's and private.
+/// The longest Unix socket path Linux accepts: `sun_path` is 108 bytes with the NUL.
+pub const MAX_SOCKET_PATH: usize = 107;
+/// `<16 hex digits>.sock`, the socket's file name.
+const SOCKET_NAME_LEN: usize = 16 + ".sock".len();
+
+/// `$XDG_RUNTIME_DIR/chairphoto`, else [`fallback_dir`], created `0700` and checked to be
+/// this user's and private.
 pub fn runtime_dir() -> io::Result<PathBuf> {
     let uid = current_uid()?;
     let dir = match std::env::var_os("XDG_RUNTIME_DIR").filter(|v| !v.is_empty()) {
         Some(base) => PathBuf::from(base).join("chairphoto"),
-        None => std::env::temp_dir().join(format!("chairphoto-{uid}")),
+        None => fallback_dir(&std::env::temp_dir(), uid),
     };
     ensure_private_dir(&dir, uid)?;
     Ok(dir)
+}
+
+/// Without `XDG_RUNTIME_DIR`: `<tmp>/chairphoto-<uid>`, unless a socket in it would be too
+/// long for `sun_path` (a deep `$TMPDIR`); then `/tmp/chairphoto-<uid>`.
+fn fallback_dir(tmp: &Path, uid: u32) -> PathBuf {
+    let name = format!("chairphoto-{uid}");
+    let dir = tmp.join(&name);
+    if dir.as_os_str().len() + 1 + SOCKET_NAME_LEN <= MAX_SOCKET_PATH {
+        dir
+    } else {
+        Path::new("/tmp").join(name)
+    }
 }
 
 /// This process's uid, read from `/proc/self` (no libc call needed on Linux).
@@ -294,6 +314,16 @@ impl Primary {
 ///   the lock a moment longer). Wait a little and look again: either the socket answers or
 ///   the lock comes free and this launch starts fresh with its link.
 pub fn claim(endpoint: &Endpoint, request: &Request, patience: Duration) -> Result<Claim, ClaimError> {
+    let socket_len = endpoint.socket.as_os_str().len();
+    if socket_len > MAX_SOCKET_PATH {
+        return Err(ClaimError::Endpoint(io::Error::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "socket path {} is {socket_len} bytes; a Unix socket path holds at most {MAX_SOCKET_PATH}",
+                endpoint.socket.display()
+            ),
+        )));
+    }
     let lock = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -747,6 +777,32 @@ mod tests {
         // FNV-1a 64 of the empty string is its offset basis: the hash is the fixed algorithm,
         // not std's randomly seeded one.
         assert_eq!(instance_key(Path::new("")), "cbf29ce484222325");
+    }
+
+    /// A deep `$TMPDIR` does not push the fallback socket past `sun_path`.
+    #[test]
+    fn the_fallback_dir_stays_short_enough_for_a_socket() {
+        assert_eq!(fallback_dir(Path::new("/tmp"), 1000), Path::new("/tmp/chairphoto-1000"));
+        let deep = Path::new("/home/someone/.local/share/chairphoto-agent/tmp/imgfix-a9c59/and/deeper/still");
+        let dir = fallback_dir(deep, 1000);
+        assert_eq!(dir, Path::new("/tmp/chairphoto-1000"));
+        let endpoint = Endpoint::new(&dir, &instance_key(Path::new("/x")));
+        assert!(endpoint.socket.as_os_str().len() <= MAX_SOCKET_PATH);
+    }
+
+    /// A socket path too long for `sun_path` is refused up front, saying why, as an
+    /// `Endpoint` error (the app runs without single-instance), not as a bind failure.
+    #[test]
+    fn a_socket_path_too_long_is_refused_clearly() {
+        let dir = TempDir::new("long");
+        let deep = dir.0.join("d".repeat(100));
+        std::fs::create_dir_all(&deep).unwrap();
+        match claim(&Endpoint::new(&deep, "k"), &Request::default(), CONNECT_PATIENCE) {
+            Err(ClaimError::Endpoint(e)) => {
+                assert!(e.to_string().contains("a Unix socket path holds at most 107"), "{e}")
+            }
+            _ => panic!("expected an Endpoint error"),
+        }
     }
 
     #[test]

@@ -20,7 +20,8 @@ use chairphoto_core::catalog::PickState;
 use chairphoto_core::image_pool::{ImageKind, JobKey};
 use gpui_kit::test::TestWindowExt as _;
 use gpui_kit::{
-    point, AppContext as _, Entity, InputEvent as _, Modifiers, ScrollDelta, ScrollWheelEvent, TestAppContext, TouchPhase,
+    point, AppContext as _, Entity, InputEvent as _, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, ScrollDelta, ScrollWheelEvent, TestAppContext, TouchPhase,
 };
 use std::cell::RefCell;
 use std::path::PathBuf;
@@ -463,6 +464,54 @@ fn a_cull_session_resumes_decides_saves_and_summarises(cx: &mut TestAppContext) 
         })
         .unwrap();
     assert!(grid_focused, "the grid has the keys again");
+}
+
+/// The session occludes the shell: a click on the cull photo, over a grid tile, neither focuses
+/// the grid nor changes its selection, and the culling keys still mark the cull photo.
+#[gpui_kit::test]
+fn a_click_on_the_cull_session_does_not_reach_the_grid(cx: &mut TestAppContext) {
+    let (app, _pool, _dir, ids) = app_with(4, "cull-occlude", cx);
+    select_all(&app, cx);
+    render(&app, cx);
+    start_cull(&app, cx);
+    let view = cull(&app, cx).unwrap();
+    assert_eq!(view.read_with(cx, |v, _| v.state.at()), Some(0));
+    let selection = |cx: &mut TestAppContext| app.wired.shell.read_with(cx, |s, _| s.library.selection().ids.to_vec());
+    let before = selection(cx);
+    cx.update_window(app.window(), |_, window, cx| {
+        window.render_frame(cx);
+        // A tile under the session, which a click there would select alone.
+        let position = window.find(("tile", ids[3] as u64)).bounds().center();
+        let hover = MouseMoveEvent { position, pressed_button: None, modifiers: Modifiers::default() };
+        window.dispatch_event(hover.to_platform_input(), cx);
+        let down = MouseDownEvent {
+            button: MouseButton::Left,
+            position,
+            modifiers: Modifiers::default(),
+            click_count: 1,
+            first_mouse: false,
+        };
+        window.dispatch_event(down.to_platform_input(), cx);
+        let up = MouseUpEvent { button: MouseButton::Left, position, modifiers: Modifiers::default(), click_count: 1 };
+        window.dispatch_event(up.to_platform_input(), cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    let (cull_focused, grid_focused) = cx
+        .update_window(app.window(), |_, window, cx| {
+            (
+                view.read(cx).focus_handle().is_focused(window),
+                root(&app).read(cx).library().read(cx).focus_handle().is_focused(window),
+            )
+        })
+        .unwrap();
+    assert!(cull_focused && !grid_focused, "the session keeps the keys");
+    assert_eq!(selection(cx), before, "the grid's selection is untouched");
+    press(&app, "p", cx);
+    assert_eq!(culling(&app, ids[0]).1, PickState::Pick, "the cull photo is marked");
+    assert_eq!(culling(&app, ids[3]).1, PickState::None, "the tile under the click is not");
+    assert_eq!(view.read_with(cx, |v, _| v.state.at()), Some(1));
 }
 
 /// A decision the catalog did not take (the core switched under the session) is rolled back

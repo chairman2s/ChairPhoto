@@ -280,6 +280,88 @@ fn leaving_saves_what_is_pending(cx: &mut TestAppContext) {
     assert_eq!(serde_json::from_str::<Value>(&versions[0].edit_json).unwrap()["tone"]["contrast"], json!(0.3));
 }
 
+/// **Forced interleaving.** A change made while an autosave commit is on the worker, then
+/// the photo is left — by a step (→) or ← Library — with that commit still held running: the
+/// newer record is committed after it, into the version it created, for the photo it was
+/// made on; the next photo's version is untouched.
+fn a_change_during_a_running_commit_survives(leave: bool, cx: &mut TestAppContext) {
+    let rig = rig(if leave { "dk-chain-leave" } else { "dk-chain-step" }, 2, cx);
+    let order = rig.app.wired.shell.read_with(cx, |s, _| s.library.photo_ids());
+    let photo = order[0];
+    assert_eq!(rig.open_photo(cx), Some(photo));
+    rig.slide(Control::Tone(ToneKey::Ev), 0.5, cx);
+    advance(cx, AUTOSAVE_QUIET);
+    // The quiet started the commit; the worker has not run it (Runner::manual holds it).
+    assert!(rig.darkroom(cx).read_with(cx, |d, _| d.open.as_ref().unwrap().saving), "the commit is running");
+    assert!(rig.catalog(|c| c.list_versions(photo).unwrap()).is_empty());
+    rig.slide(Control::Tone(ToneKey::Contrast), 0.3, cx);
+    if leave {
+        rig.app.wired.shell.update(cx, |s, cx| s.show_library(cx));
+        cx.run_until_parked();
+        assert_eq!(rig.surface(cx), Surface::Library);
+    } else {
+        assert!(rig.view(cx).update(cx, |v, cx| v.step(1, None, cx)));
+        cx.run_until_parked();
+        assert_eq!(rig.open_photo(cx), Some(order[1]));
+    }
+    work(cx);
+    let versions = rig.catalog(|c| c.list_versions(photo).unwrap());
+    assert_eq!(versions.len(), 1, "one version: the follow-up commit wrote the one the first created");
+    assert_eq!(versions[0].name, "Version 1");
+    let saved: Value = serde_json::from_str(&versions[0].edit_json).unwrap();
+    assert_eq!(
+        (saved["tone"]["ev"].clone(), saved["tone"]["contrast"].clone()),
+        (json!(0.5), json!(0.3)),
+        "the latest record wins"
+    );
+    let steps = rig.catalog(|c| c.version_history(versions[0].id).unwrap()).steps;
+    let labels: Vec<&str> = steps.iter().map(|s| s.label.as_str()).collect();
+    assert_eq!(labels[labels.len() - 2..], ["Exposure +0.50", "Contrast +0.30"], "{labels:?}");
+    assert!(rig.catalog(|c| c.list_versions(order[1]).unwrap()).is_empty(), "nothing written to the next photo");
+    if !leave {
+        assert_eq!(rig.working(cx), json!({}), "the next photo keeps its own record");
+    }
+    assert_eq!(rig.darkroom(cx).read_with(cx, |d, _| d.error.clone()), None);
+}
+
+#[gpui_kit::test]
+fn a_step_during_a_running_commit_saves_the_newer_change_after_it(cx: &mut TestAppContext) {
+    a_change_during_a_running_commit_survives(false, cx);
+}
+
+#[gpui_kit::test]
+fn leaving_during_a_running_commit_saves_the_newer_change_after_it(cx: &mut TestAppContext) {
+    a_change_during_a_running_commit_survives(true, cx);
+}
+
+/// Make every history write fail (a full disk, say) (the trigger lives in the test catalog).
+fn fail_history_writes(rig: &Rig) {
+    rig.catalog(|c| {
+        c.conn()
+            .execute_batch(
+                "CREATE TRIGGER test_fail_history BEFORE INSERT ON photo_version_history
+                 BEGIN SELECT RAISE(ABORT, 'disk full'); END;",
+            )
+            .unwrap()
+    });
+}
+
+/// A left photo's commit that fails after the view moved on is reported on the status line
+/// (the Library shows no Darkroom banner), naming the photo — not dropped with the view.
+#[gpui_kit::test]
+fn a_left_photos_failed_commit_is_reported_on_the_status_line(cx: &mut TestAppContext) {
+    let rig = rig("dk-chain-fail", 1, cx);
+    rig.slide(Control::Tone(ToneKey::Ev), 0.5, cx);
+    advance(cx, AUTOSAVE_QUIET);
+    assert!(rig.darkroom(cx).read_with(cx, |d, _| d.open.as_ref().unwrap().saving), "the commit is running");
+    fail_history_writes(&rig);
+    rig.app.wired.shell.update(cx, |s, cx| s.show_library(cx));
+    cx.run_until_parked();
+    work(cx);
+    let line = crate::tests::status(&rig.app, cx);
+    assert!(line.starts_with("Autosave failed for ") && line.contains("disk full"), "{line}");
+}
+
 /// The filmstrip: → steps to the next photo in the Library's order (saving first), arrows
 /// that belong to a slider are left alone, and the ends do not wrap.
 #[gpui_kit::test]

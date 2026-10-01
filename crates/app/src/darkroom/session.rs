@@ -188,6 +188,11 @@ pub struct Darkroom {
     pool: Arc<dyn Submit>,
     luts_dir: LutsDir,
     pub open: Option<OpenPhoto>,
+    /// Photos left (a step, ← Library) while a commit of theirs was on the worker. Each is
+    /// kept until that commit answers, so a change made meanwhile is committed after it —
+    /// to the version it created or wrote, as React's `chainRef` did — and a failure is
+    /// reported (the banner and the status line) instead of dropped with the view.
+    leaving: Vec<OpenPhoto>,
     seq: u64,
     /// The `.cube` files in the LUT folder (read when the Darkroom opens).
     pub luts: Vec<String>,
@@ -227,6 +232,7 @@ impl Darkroom {
             pool,
             luts_dir: Arc::new(chairphoto_core::app::luts_dir),
             open: None,
+            leaving: Vec::new(),
             seq: 0,
             luts: Vec::new(),
             error: None,
@@ -659,7 +665,22 @@ impl Darkroom {
     /// Save the working record now, if it differs from what the version holds (Ctrl+S, a
     /// step, a switch, leaving). One commit at a time: a flush while one runs follows it.
     pub fn flush(&mut self, cx: &mut Context<Self>) {
-        let Some(open) = self.open.as_mut() else { return };
+        if let Some(seq) = self.open.as_ref().map(|o| o.seq) {
+            self.commit(seq, cx);
+        }
+    }
+
+    /// The open photo, or one being left whose commit is still on the worker, by its `seq`.
+    fn photo_mut(&mut self, seq: u64) -> Option<&mut OpenPhoto> {
+        match self.open.as_mut() {
+            Some(o) if o.seq == seq => Some(o),
+            _ => self.leaving.iter_mut().find(|o| o.seq == seq),
+        }
+    }
+
+    /// [`flush`](Self::flush) for photo `seq`: the open one, or one being left.
+    fn commit(&mut self, seq: u64, cx: &mut Context<Self>) {
+        let Some(open) = self.photo_mut(seq) else { return };
         open.autosave_timer = None;
         if !open.loaded || !open.dirty() {
             return;
@@ -717,8 +738,10 @@ impl Darkroom {
         cx: &mut Context<Self>,
     ) {
         // The write has happened (or failed) whatever is open now; only the open photo's own
-        // commit updates the view.
-        let Some(open) = self.open.as_mut().filter(|o| o.seq == seq) else { return };
+        // commit updates the view. A photo being left takes its answer too: a change made
+        // while this commit ran is committed after it, and a failure is reported.
+        let is_open = self.open.as_ref().is_some_and(|o| o.seq == seq);
+        let Some(open) = self.photo_mut(seq) else { return };
         open.committing = false;
         open.saving = false;
         let mut failed = false;
@@ -734,7 +757,8 @@ impl Darkroom {
                 let active = match c.version {
                     Some(v) => {
                         open.versions_len += 1;
-                        Some(PhotoVersion { edit_json: c.saved.clone(), ..v })
+                        // The shell's active version is the open photo's only.
+                        is_open.then(|| PhotoVersion { edit_json: c.saved.clone(), ..v })
                     }
                     None => {
                         let active = self.shell.read(cx).active_version().cloned();
@@ -748,16 +772,31 @@ impl Darkroom {
             Err(e) => {
                 open.committed_json = before.0;
                 open.committed = before.1;
-                self.error = Some(format!("Autosave failed: {e}"));
                 failed = true;
+                if is_open {
+                    self.error = Some(format!("Autosave failed: {e}"));
+                } else {
+                    // The view has moved on: say which photo, on the banner and the status
+                    // line (the Library shows no banner).
+                    let name = std::path::Path::new(&open.photo.path)
+                        .file_name()
+                        .map_or_else(|| open.photo.path.clone(), |n| n.to_string_lossy().into_owned());
+                    let line = format!("Autosave failed for {name}: {e}");
+                    self.error = Some(line.clone());
+                    self.model.update(cx, |m, cx| m.set_status(line, cx));
+                }
             }
         }
-        let again = self.open.as_mut().map(|o| std::mem::take(&mut o.commit_again)).unwrap_or(false);
+        let again = self.photo_mut(seq).map(|o| std::mem::take(&mut o.commit_again)).unwrap_or(false);
         if again {
-            // A change came in while this commit ran: it is the user's, so it is tried.
-            self.flush(cx);
-        } else if !failed {
+            // A change came in while this commit ran (or was pending when the photo was
+            // left): it is the user's, so it is tried.
+            self.commit(seq, cx);
+        } else if is_open && !failed {
             self.schedule_autosave(cx);
+        }
+        if !is_open {
+            self.finish_leaving(seq, cx);
         }
         // A refused or failed save is not retried on a timer (a switched-away catalog would
         // refuse it forever): the next change, Ctrl+S or leaving tries again.
@@ -770,9 +809,13 @@ impl Darkroom {
     /// belongs to is gone), close its stages.
     fn leave_photo(&mut self, save: bool, cx: &mut Context<Self>) {
         if save {
+            // Starts a commit, or — one running — marks the change to follow it.
             self.flush(cx);
         }
-        let Some(open) = self.open.take() else { return };
+        let Some(mut open) = self.open.take() else { return };
+        if !save {
+            open.commit_again = false;
+        }
         if self.timing_log {
             let summary = open.stage.read(cx).timing_summary().to_json();
             eprintln!("[edit-timing] summary {summary}");
@@ -788,7 +831,25 @@ impl Darkroom {
         if let Some(clip) = &open.clip_stage {
             clip.update(cx, |s, cx| s.close(cx));
         }
+        if open.committing {
+            // Its commit's answer, and the change that may follow it, still belong to it.
+            open.autosave_timer = None;
+            open.masses_timer = None;
+            self.leaving.push(open);
+        }
         cx.notify();
+    }
+
+    /// A left photo's commit answered: once nothing more is on the worker for it, it is
+    /// dropped — and, saved into the catalog the Library shows, the rows are re-read (the
+    /// re-read at leaving ran before this save landed).
+    fn finish_leaving(&mut self, seq: u64, cx: &mut Context<Self>) {
+        let Some(i) = self.leaving.iter().position(|o| o.seq == seq && !o.committing) else { return };
+        let left = self.leaving.remove(i);
+        let shell = self.shell.read(cx);
+        if !left.dirty() && shell.surface != Surface::Develop && shell.rows_from() == Some(left.from) {
+            self.shell.update(cx, |s, cx| s.refresh_rows(cx));
+        }
     }
 
     /// Leave Develop: the photo (saving unless `save` is false), the develop session, and a

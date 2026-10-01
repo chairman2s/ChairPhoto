@@ -5,6 +5,8 @@
 //! Sub-modules:
 //!
 //! - [`geocode`] — Nominatim reverse-geocode client + `map__geocode_cache` table.
+//! - [`tiles`] — the slippy map's headless half: Web Mercator maths with fractional zoom,
+//!   the tile source, a disk tile cache and an OSM-policy-compliant fetcher.
 //!
 //! This module owns:
 //!
@@ -24,6 +26,7 @@
 //!   involuntarily).
 
 pub mod geocode;
+pub mod tiles;
 
 /// The User-Agent of every request the map plugin makes (Nominatim reverse geocoding, map
 /// tiles). Both OSM services require "a clear, unique User-Agent string that names your app"

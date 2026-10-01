@@ -28,6 +28,19 @@
 //! (`ShellState::apply_mark_to`), on the photo shown — as `PhotoInspector.tsx` wrote
 //! `photo.id`, not the selection.
 //!
+//! **Catalog identity.** The photo shown comes from the Library's rows, so the inspector is
+//! bound to the catalog they were read from (`ShellState::rows_from`, held as `from`). Every
+//! read of the photo's data and every write keyed by its id or by ids read with it (rotate,
+//! unstack, back up / queue, offload, restore, IPTC, versions, publications, marks) goes
+//! through `with_catalog_as` or a core `_as` function, so after a switch it fails closed
+//! (`CATALOG_CHANGED`) — also in the window before `catalog:switched` arrives — instead of
+//! landing on the new catalog's photo with the same id. The storage actions run on a
+//! connection of their own to that catalog (`storage::backup_photo_as` and its siblings).
+//!
+//! **IPTC saves** are serialized per photo: Save is disabled while the photo's fields are
+//! still loading, and a Save while that photo's previous save is in flight runs after it,
+//! with the form's values then (so a catalog row and its sidecar never interleave).
+//!
 //! **External editors** (darktable / RawTherapee / ART) and **RapidRAW** run on the storage
 //! [`Runner`] (the core runtime's blocking pool). A sidecar-editor run is owned by a sequence
 //! number per photo; its result lands only if no newer run for that photo started and the
@@ -51,7 +64,7 @@ use crate::image_store::ImageStore;
 use crate::model::{AppModel, AppModelEvent};
 use crate::shell::state::{InspectorTab, Mark, ShellState};
 use crate::storage::Runner;
-use chairphoto_core::app::{with_catalog, AppState, CoreEvent};
+use chairphoto_core::app::{with_catalog_as, AppState, CatalogIdentity, CoreEvent};
 use chairphoto_core::catalog::{IptcFields, MetadataEntry, Photo, PhotoVersion, PickState, Publication};
 use chairphoto_core::external_edit::AvailableEditor;
 use chairphoto_core::photo_signals::PhotoSignals;
@@ -280,6 +293,9 @@ pub struct PhotoInspector {
     /// The photo shown, and its stack shape (master id, child count) — a change of the
     /// latter re-reads the Stack section.
     pub photo_id: Option<i64>,
+    /// The catalog the photo shown (and everything read about it) came from: every read and
+    /// write is bound to it.
+    pub from: Option<CatalogIdentity>,
     stack_key: Option<(Option<i64>, i64)>,
     /// Bumped by every change of the photo shown and every catalog switch.
     generation: u64,
@@ -310,6 +326,9 @@ pub struct PhotoInspector {
     pub rapid: HashMap<i64, RapidRun>,
     pub notes: HashMap<i64, String>,
     seq: u64,
+    /// Photos with an IPTC save in flight, and those whose next Save waits for it.
+    pub iptc_saving: HashSet<i64>,
+    iptc_queued: HashSet<i64>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -354,6 +373,7 @@ impl PhotoInspector {
             shell,
             images,
             photo_id: None,
+            from: None,
             stack_key: None,
             generation: 0,
             epoch: 0,
@@ -374,6 +394,8 @@ impl PhotoInspector {
             rapid: HashMap::new(),
             notes: HashMap::new(),
             seq: 0,
+            iptc_saving: HashSet::new(),
+            iptc_queued: HashSet::new(),
             _subscriptions: subscriptions,
         };
         this.sync(cx);
@@ -409,14 +431,15 @@ impl PhotoInspector {
     /// The shell changed: a new active photo resets everything per-photo; a new tab, or a
     /// new stack shape, reads what it shows.
     fn sync(&mut self, cx: &mut Context<Self>) {
-        let (photo, tab, active_version) = {
+        let (photo, tab, active_version, from) = {
             let shell = self.shell.read(cx);
             let photo = shell.library.selection().active.map(|p| (p.id, p.stack_parent_id, p.stack_count));
-            (photo, shell.inspector_tab, shell.active_version().map(|v| v.id))
+            (photo, shell.inspector_tab, shell.active_version().map(|v| v.id), shell.rows_from())
         };
         let id = photo.map(|p| p.0);
-        if id != self.photo_id {
+        if id != self.photo_id || from != self.from {
             self.photo_id = id;
+            self.from = from;
             self.generation += 1;
             self.data = PhotoData::default();
             self.stack_key = photo.map(|p| (p.1, p.2));
@@ -488,6 +511,7 @@ impl PhotoInspector {
         read: impl FnOnce(&chairphoto_core::catalog::Catalog) -> chairphoto_core::catalog::Result<T> + Send + 'static,
         cx: &mut Context<Self>,
     ) {
+        let Some(from) = self.from else { return };
         let generation = self.generation;
         let s = slot(self);
         s.seq += 1;
@@ -496,7 +520,7 @@ impl PhotoInspector {
             s.load = Load::Loading;
         }
         let state = self.app.clone();
-        let task = cx.background_executor().spawn(async move { with_catalog(&state, read) });
+        let task = cx.background_executor().spawn(async move { with_catalog_as(&state, from, read) });
         cx.spawn(async move |this, cx| {
             let result = task.await;
             this.update(cx, |this, cx| {
@@ -519,12 +543,13 @@ impl PhotoInspector {
     }
 
     fn read_iptc(&mut self, id: i64, cx: &mut Context<Self>) {
+        let Some(from) = self.from else { return };
         let generation = self.generation;
         self.data.iptc.seq += 1;
         let seq = self.data.iptc.seq;
         self.data.iptc.load = Load::Loading;
         let state = self.app.clone();
-        let task = cx.background_executor().spawn(async move { with_catalog(&state, |c| c.get_iptc(id)) });
+        let task = cx.background_executor().spawn(async move { with_catalog_as(&state, from, |c| c.get_iptc(id)) });
         cx.spawn(async move |this, cx| {
             let result = task.await;
             this.update(cx, |this, cx| {
@@ -563,6 +588,9 @@ impl PhotoInspector {
                 self.epoch += 1;
                 self.generation += 1;
                 self.photo_id = None;
+                self.from = None;
+                self.iptc_saving.clear();
+                self.iptc_queued.clear();
                 self.data = PhotoData::default();
                 self.editors = None;
                 self.editors_reading = false;
@@ -580,17 +608,19 @@ impl PhotoInspector {
 
     // --- mutations ---------------------------------------------------------------------
 
-    /// Run a short catalog write off the UI thread; `done` runs only if no catalog switch
-    /// overtook it.
+    /// Run a short catalog write off the UI thread, bound to the catalog the photo came from
+    /// (`with_catalog_as`: after a switch it fails closed); `done` runs only if no catalog
+    /// switch overtook it.
     fn write<T: Send + 'static>(
         &mut self,
         work: impl FnOnce(&chairphoto_core::catalog::Catalog) -> chairphoto_core::catalog::Result<T> + Send + 'static,
         done: impl FnOnce(&mut Self, Result<T, String>, &mut Context<Self>) + 'static,
         cx: &mut Context<Self>,
     ) {
+        let Some(from) = self.from else { return };
         let epoch = self.epoch;
         let state = self.app.clone();
-        let task = cx.background_executor().spawn(async move { with_catalog(&state, work) });
+        let task = cx.background_executor().spawn(async move { with_catalog_as(&state, from, work) });
         cx.spawn(async move |this, cx| {
             let result = task.await;
             this.update(cx, |this, cx| {
@@ -599,6 +629,23 @@ impl PhotoInspector {
                 }
             })
             .ok();
+        })
+        .detach();
+    }
+
+    /// [`run_blocking`](Self::run_blocking), but `done` runs whatever the epoch (it checks
+    /// itself): the IPTC save's bookkeeping must end even after a switch.
+    fn run_blocking_always<T: Send + 'static>(
+        &mut self,
+        work: impl FnOnce(&AppState) -> Result<T, String> + Send + 'static,
+        done: impl FnOnce(&mut Self, Result<T, String>, &mut Context<Self>) + 'static,
+        cx: &mut Context<Self>,
+    ) {
+        let state = self.app.clone();
+        let rx = Runner::get(cx).run(move || work(&state));
+        cx.spawn(async move |this, cx| {
+            let result = rx.await.unwrap_or_else(|_| Err("the worker stopped".into()));
+            this.update(cx, |this, cx| done(this, result, cx)).ok();
         })
         .detach();
     }
@@ -638,14 +685,14 @@ impl PhotoInspector {
     /// The stars: a click on the current rating clears it.
     pub fn rate(&mut self, stars: i64, cx: &mut Context<Self>) {
         let Some(p) = self.photo(cx) else { return };
-        let Some(from) = self.shell.read(cx).rows_from() else { return };
+        let Some(from) = self.from else { return };
         let rating = next_rating(p.rating, stars);
         self.shell.update(cx, |s, cx| s.apply_mark_to(Mark::Rating(rating), vec![p.id], from, cx));
     }
 
     pub fn pick(&mut self, pick: PickState, cx: &mut Context<Self>) {
         let Some(p) = self.photo(cx) else { return };
-        let Some(from) = self.shell.read(cx).rows_from() else { return };
+        let Some(from) = self.from else { return };
         self.shell.update(cx, |s, cx| s.apply_mark_to(Mark::Pick(pick), vec![p.id], from, cx));
     }
 
@@ -654,7 +701,7 @@ impl PhotoInspector {
     pub fn label(&mut self, name: &str, cx: &mut Context<Self>) {
         let Some(p) = self.photo(cx) else { return };
         let Some(label) = next_label(&p.label, name) else { return };
-        let Some(from) = self.shell.read(cx).rows_from() else { return };
+        let Some(from) = self.from else { return };
         self.shell.update(cx, |s, cx| s.apply_mark_to(Mark::Label(label), vec![p.id], from, cx));
     }
 
@@ -700,15 +747,16 @@ impl PhotoInspector {
 
     /// Back up now if the NAS is reachable, else queue a backup (React's `onBackup`).
     pub fn back_up(&mut self, cx: &mut Context<Self>) {
-        let Some(id) = self.photo_id else { return };
+        let (Some(id), Some(from)) = (self.photo_id, self.from) else { return };
         self.storage_msg = Some("Backing up…".into());
         cx.notify();
         self.storage_action(
             id,
-            move |state| match chairphoto_core::app::storage::backup_photo(state, id) {
+            move |state| match chairphoto_core::app::storage::backup_photo_as(state, from, id) {
                 Ok(()) => Ok("Backed up".to_string()),
+                Err(e) if e == chairphoto_core::app::CATALOG_CHANGED => Err(e),
                 Err(_) => {
-                    let _ = with_catalog(state, |c| c.enqueue_operation("backup", id));
+                    chairphoto_core::app::storage::enqueue_backup_as(state, from, id)?;
                     Ok("Queued (NAS offline)".to_string())
                 }
             },
@@ -717,23 +765,27 @@ impl PhotoInspector {
     }
 
     pub fn offload(&mut self, cx: &mut Context<Self>) {
-        let Some(id) = self.photo_id else { return };
+        let (Some(id), Some(from)) = (self.photo_id, self.from) else { return };
         self.storage_msg = Some("Offloading…".into());
         cx.notify();
         self.storage_action(
             id,
-            move |state| chairphoto_core::app::storage::offload_photo(state, id).map(|()| "Local copy freed".to_string()),
+            move |state| {
+                chairphoto_core::app::storage::offload_photo_as(state, from, id).map(|()| "Local copy freed".to_string())
+            },
             cx,
         );
     }
 
     pub fn restore(&mut self, cx: &mut Context<Self>) {
-        let Some(id) = self.photo_id else { return };
+        let (Some(id), Some(from)) = (self.photo_id, self.from) else { return };
         self.storage_msg = Some("Restoring…".into());
         cx.notify();
         self.storage_action(
             id,
-            move |state| chairphoto_core::app::storage::restore_photo(state, id).map(|()| "Restored to local".to_string()),
+            move |state| {
+                chairphoto_core::app::storage::restore_photo_as(state, from, id).map(|()| "Restored to local".to_string())
+            },
             cx,
         );
     }
@@ -760,18 +812,42 @@ impl PhotoInspector {
 
     // --- IPTC --------------------------------------------------------------------------
 
-    /// "Save IPTC": the catalog, then the sidecar (`app::iptc::save_iptc`), on a worker.
+    /// Whether "Save IPTC" can run: the photo's fields have loaded (a save before that would
+    /// store the empty form over them).
+    pub fn iptc_loaded(&self) -> bool {
+        matches!(self.data.iptc.load, Load::Ready(_) | Load::Failed(_))
+    }
+
+    /// "Save IPTC": the catalog, then the sidecar (`app::iptc::save_iptc_as`, bound to the
+    /// photo's catalog), on a worker. One save per photo at a time: a Save while one is in
+    /// flight runs when it ends, with the form's values then.
     pub fn save_iptc(&mut self, cx: &mut Context<Self>) {
-        let Some(id) = self.photo_id else { return };
+        let (Some(id), Some(from)) = (self.photo_id, self.from) else { return };
+        if !self.iptc_loaded() {
+            return;
+        }
+        if self.iptc_saving.contains(&id) {
+            self.iptc_queued.insert(id);
+            return;
+        }
+        self.iptc_saving.insert(id);
         let fields = self.iptc.values(cx);
         self.iptc.status = "Saving…".into();
         self.iptc.save_seq += 1;
-        let (seq, generation) = (self.iptc.save_seq, self.generation);
+        let (seq, generation, epoch) = (self.iptc.save_seq, self.generation, self.epoch);
         cx.notify();
         let saved = fields.clone();
-        self.run_blocking(
-            move |state| chairphoto_core::app::iptc::save_iptc(state, id, &fields),
+        self.run_blocking_always(
+            move |state| chairphoto_core::app::iptc::save_iptc_as(state, from, id, &fields),
             move |this, result, cx| {
+                if this.epoch != epoch {
+                    return;
+                }
+                this.iptc_saving.remove(&id);
+                if this.iptc_queued.remove(&id) && this.photo_id == Some(id) && this.generation == generation {
+                    this.save_iptc(cx);
+                    return;
+                }
                 if this.generation != generation || this.iptc.save_seq != seq {
                     return;
                 }

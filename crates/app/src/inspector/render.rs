@@ -420,7 +420,8 @@ impl PhotoInspector {
         for ((key, text), input) in IPTC_FIELDS.iter().zip(&self.iptc.fields) {
             body = body.child(field_label(text)).child(Input::new(input).small().id(SharedString::from(format!("iptc-{key}"))));
         }
-        let dirty = self.iptc.dirty(cx);
+        // Not while the photo's fields load: the form is still empty.
+        let dirty = self.iptc_loaded() && self.iptc.dirty(cx);
         let status = self.iptc.status.clone();
         body.child(
             row()

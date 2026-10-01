@@ -100,12 +100,23 @@ pub struct AppModel {
     /// link resolved now asks the catalog the user sees. Kept apart from `catalog`, which the
     /// title bar goes on showing (the old name) until the switch's refresh lands.
     catalog_current: bool,
-    /// The newest link that arrived before the catalog was read (at startup, or since a
-    /// switch), applied once it is (React's `ready`). One, not a queue: each resolution supersedes the one before, so of several
-    /// waiting links only the newest could land; older ones are dropped as they are replaced.
+    /// The newest link not yet being resolved: one that arrived before the catalog was read
+    /// (at startup, or since a switch), applied once it is (React's `ready`), or one that
+    /// arrived while another resolution ran, started when that one finishes. One, not a
+    /// queue: each link supersedes the one before, so of several waiting links only the newest
+    /// could land; older ones are dropped as they are replaced.
     pending_link: Option<DeepLink>,
-    /// The link [`AppModel::open_deep_link`] is resolving now, if any.
+    /// The link whose resolution is running and still wanted, if any (a switch takes it back
+    /// into `pending_link`).
     in_flight_link: Option<DeepLink>,
+    /// Whether a resolution task is running. **At most one runs at a time**, so a flood of
+    /// links from the single-instance socket costs one catalog lookup plus one waiting slot,
+    /// not a lookup per link: the bounded request queue frees its slot as soon as a link is
+    /// handed here, so the bound on the work has to be here.
+    resolving: bool,
+    /// How many resolutions have started (tests: the work is bounded).
+    #[cfg(test)]
+    resolutions_started: u64,
     /// Bumped by every link resolution and by every catalog switch; only the newest
     /// resolution's result lands, and never one started against a catalog since switched away.
     link_generation: u64,
@@ -128,6 +139,9 @@ impl AppModel {
             catalog_current: false,
             pending_link: None,
             in_flight_link: None,
+            resolving: false,
+            #[cfg(test)]
+            resolutions_started: 0,
             link_generation: 0,
         }
     }
@@ -197,9 +211,7 @@ impl AppModel {
                         m.catalog = Some(summary);
                         m.catalog_current = true;
                         cx.emit(AppModelEvent::CatalogRead);
-                        if let Some(link) = m.pending_link.take() {
-                            m.open_deep_link(link, cx);
-                        }
+                        m.start_pending_link(cx);
                     }
                     Err(e) => {
                         m.catalog = None;
@@ -229,16 +241,30 @@ impl AppModel {
 
     /// Resolve a parsed link against the open catalog, off the UI thread, and record it in
     /// [`deep_link`](Self::deep_link). Before the catalog is open — or after a switch, before
-    /// the new catalog has been read — the link waits; a newer link supersedes an older one
-    /// still resolving or waiting.
+    /// the new catalog has been read — the link waits; so it does while another link resolves.
+    /// A newer link supersedes an older one still resolving or waiting.
     pub fn open_deep_link(&mut self, link: DeepLink, cx: &mut Context<Self>) {
+        if let Some(older) = self.pending_link.replace(link) {
+            eprintln!("deep link: {older:?} superseded by a newer link before it was resolved");
+        }
         if !self.catalog_current {
-            if let Some(older) = self.pending_link.replace(link) {
-                eprintln!("deep link: {older:?} superseded by a newer link before the catalog opened");
-            }
             self.status = "Deep link: waiting for the catalog…".into();
             cx.notify();
+        }
+        self.start_pending_link(cx);
+    }
+
+    /// Start resolving the waiting link, if there is one, the catalog has been read, and no
+    /// other resolution runs (that one's completion calls this again).
+    fn start_pending_link(&mut self, cx: &mut Context<Self>) {
+        if !self.catalog_current || self.resolving {
             return;
+        }
+        let Some(link) = self.pending_link.take() else { return };
+        self.resolving = true;
+        #[cfg(test)]
+        {
+            self.resolutions_started += 1;
         }
         self.link_generation += 1;
         let generation = self.link_generation;
@@ -248,20 +274,25 @@ impl AppModel {
         cx.spawn(async move |this, cx| {
             let resolved = read.await;
             this.update(cx, |m, cx| {
+                m.resolving = false;
                 if m.link_generation != generation {
-                    return; // superseded, or the catalog was switched
-                }
-                m.in_flight_link = None;
-                match resolved {
-                    Ok(target) => {
-                        m.status = link_status(&target).into();
-                        m.deep_link = Some(target.clone());
-                        cx.emit(AppModelEvent::DeepLink(target));
+                    // The catalog was switched: the link went back to `pending_link`.
+                } else if m.pending_link.is_some() {
+                    m.in_flight_link = None; // superseded by the newer link that waits
+                } else {
+                    m.in_flight_link = None;
+                    match resolved {
+                        Ok(target) => {
+                            m.status = link_status(&target).into();
+                            m.deep_link = Some(target.clone());
+                            cx.emit(AppModelEvent::DeepLink(target));
+                        }
+                        Err(message) => m.status = message.into(),
                     }
-                    Err(message) => m.status = message.into(),
+                    eprintln!("deep link: {}", m.status);
+                    cx.notify();
                 }
-                eprintln!("deep link: {}", m.status);
-                cx.notify();
+                m.start_pending_link(cx);
             })
             .ok();
         })
@@ -274,11 +305,18 @@ impl AppModel {
         usize::from(self.pending_link.is_some())
     }
 
+    /// How many link resolutions have started (tests: the work is bounded).
+    #[cfg(test)]
+    pub(crate) fn resolutions_started(&self) -> u64 {
+        self.resolutions_started
+    }
+
     /// A catalog switch: every photo and tag id from before it names something else now.
     ///
     /// - The resolved [`deep_link`](Self::deep_link) is dropped: its ids are the old catalog's.
     /// - A resolution still in flight can no longer land (`link_generation` moves on); it
-    ///   may have read either catalog.
+    ///   may have read either catalog. It still counts as running (`resolving`) until it
+    ///   finishes, so the next one starts only then: never two at once.
     /// - **Unresolved links carry over**: the in-flight one goes back to `pending_link`
     ///   (unless a newer one already waits there) and resolves against the new catalog once
     ///   its refresh lands. A `chairphoto://` URL names a photo or tag by uuid, not a catalog;

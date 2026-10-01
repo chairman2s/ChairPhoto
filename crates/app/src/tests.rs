@@ -595,6 +595,37 @@ fn links_waiting_for_the_catalog_are_coalesced_to_the_newest(cx: &mut TestAppCon
     assert_eq!(model.read_with(cx, |m, _| m.pending_link_count()), 0);
 }
 
+/// Link resolution is bounded once the catalog is open, too (Codex gate, #100): a flood of
+/// links while a catalog operation holds the lock starts one lookup, and the rest coalesce
+/// into one waiting slot, rather than a parked lookup per link. The newest is the one that
+/// lands once the lock is free.
+#[gpui_kit::test]
+fn a_flood_of_links_runs_one_resolution_at_a_time(cx: &mut TestAppContext) {
+    let dir = TempDir::new("link-bound");
+    let (state, model) = wired(cx);
+    let (photo_uuid, tag_uuid) = catalog_with_a_photo_and_a_tag(&dir, &state);
+    model.update(cx, |m, cx| m.refresh(cx));
+    cx.run_until_parked();
+    assert_eq!(model.read_with(cx, |m, _| m.resolutions_started()), 0);
+
+    {
+        // A long catalog operation (a scan, a backup) holds the lock throughout the flood.
+        let _held = state.catalog.lock().unwrap();
+        for _ in 0..100 {
+            model.update(cx, |m, cx| m.open_url(&format!("chairphoto://{photo_uuid}"), cx));
+        }
+        model.update(cx, |m, cx| m.open_url(&format!("chairphoto://tag/{tag_uuid}"), cx));
+        assert_eq!(model.read_with(cx, |m, _| m.resolutions_started()), 1, "one lookup, not one per link");
+        assert_eq!(model.read_with(cx, |m, _| m.pending_link_count()), 1);
+    }
+    cx.run_until_parked();
+    // The first lookup ran and was superseded; the newest link's ran next and landed.
+    assert_eq!(model.read_with(cx, |m, _| m.resolutions_started()), 2);
+    assert_eq!(model.read_with(cx, |m, _| m.pending_link_count()), 0);
+    model.read_with(cx, |m, _| assert!(matches!(m.deep_link, Some(DeepLinkTarget::Tag { .. }))));
+    assert_eq!(model_status(&model, cx), "Deep link: filter by tag Places/Oslo");
+}
+
 /// The queue between the single-instance thread and the main thread is bounded: past
 /// `MAX_QUEUED_REQUESTS` a request is refused `Busy` (the second launch hears `busy`), and
 /// draining makes room again.

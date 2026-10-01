@@ -131,20 +131,25 @@ fn export_photos_claimed_with(
     };
     let job = claim.job;
     let events = state.clone();
-    let run = crate::export::write_exports_with(
-        &resolved,
-        request.preset,
-        &request.dest_dir,
-        &hashtags,
-        &claim.abort,
-        &|done, total| {
-            events.send(CoreEvent::ExportProgress(ExportProgress { kind: ExportKind::Photos, job, done, total }));
-            if done > 0 {
-                after_photo(done);
-            }
-        },
-    )?;
-    record_export_parity_as(state, Some(read_from));
+    // This job's own parity tally: collected while its copies are written, so no other
+    // export's checks are counted into it, nor its checks into another's.
+    let (run, tally) = collect_parity(|| {
+        crate::export::write_exports_with(
+            &resolved,
+            request.preset,
+            &request.dest_dir,
+            &hashtags,
+            &claim.abort,
+            &|done, total| {
+                events.send(CoreEvent::ExportProgress(ExportProgress { kind: ExportKind::Photos, job, done, total }));
+                if done > 0 {
+                    after_photo(done);
+                }
+            },
+        )
+    });
+    let run = run?;
+    record_parity_tally(state, Some(read_from), tally);
     if run.stopped {
         return Err(format!(
             "{EXPORT_CANCELLED}: {} of {} exported to {}.",
@@ -183,6 +188,21 @@ pub fn export_bundle_claimed_with(
     dest_path: &Path,
     on_progress: &dyn Fn(usize, usize),
 ) -> Result<BundleWriteResult, String> {
+    export_bundle_claimed_hooked(state, claim, from, batch_id, dest_path, on_progress, &|| {})
+}
+
+/// [`export_bundle_claimed_with`], calling `before_publish` after the writer's own last
+/// abort check and before the publish lock is taken — where a test lets a newer export of
+/// the same destination run to completion.
+fn export_bundle_claimed_hooked(
+    state: &AppState,
+    claim: &ExportClaim,
+    from: Option<CatalogIdentity>,
+    batch_id: i64,
+    dest_path: &Path,
+    on_progress: &dyn Fn(usize, usize),
+    before_publish: &dyn Fn(),
+) -> Result<BundleWriteResult, String> {
     use crate::bundle::writer::BUNDLE_EXPORT_CANCELLED;
     if claim.aborted() {
         return Err(format!("{BUNDLE_EXPORT_CANCELLED} — nothing was written to the destination."));
@@ -202,8 +222,21 @@ pub fn export_bundle_claimed_with(
     if offline > 0 {
         eprintln!("export_bundle: {offline} original(s) are offline — their metadata is included, no bytes copied");
     }
-    // Phase 2 — write the zip off the catalog lock.
-    crate::bundle::writer::write_bundle_abortable(&bundle, dest_path, &claim.abort, on_progress)
+    // Phase 2 — write the zip off the catalog lock, publishing it atomically with this job's
+    // ownership: the bundle-export abort lock — the one a newer claim, a Cancel and both
+    // catalog-switch phases take to trip this generation — is held across the last abort
+    // check and the rename. A superseded export either sees its trip there and publishes
+    // nothing, or renamed before the newer claim could trip it, so the newer one's rename
+    // lands last. Only that one lock is held, never the catalog: see `app::jobs`' lock order.
+    let publish = |rename: &dyn Fn() -> Result<(), String>| {
+        before_publish();
+        let _owner = state.jobs.bundle_export.lock()?;
+        if claim.aborted() {
+            return Err(crate::bundle::writer::cancelled());
+        }
+        rename()
+    };
+    crate::bundle::writer::write_bundle_published(&bundle, dest_path, &claim.abort, on_progress, &publish)
 }
 
 /// The settings key holding this catalog's "export equals view" total
@@ -211,21 +244,40 @@ pub fn export_bundle_claimed_with(
 #[cfg(feature = "edit")]
 pub const EXPORT_PARITY_KEY: &str = "metrics.exportParity";
 
-/// Add the engine-2 exports checked since the last call to this catalog's total. Called
-/// after every command that writes an export (the Export dialog, publishing, Instagram,
-/// LocalSend); best-effort — a failed write loses a count, never an export.
-pub fn record_export_parity(state: &AppState) {
-    record_export_parity_as(state, None);
+/// One export job's parity tally (`plugins::edit::parity::ParityTally`); nothing without
+/// the `edit` feature, which is what checks exports.
+#[cfg(feature = "edit")]
+type JobParity = crate::plugins::edit::parity::ParityTally;
+#[cfg(not(feature = "edit"))]
+type JobParity = ();
+
+/// Run one export job's writes, `f`, collecting the parity checks they record into the
+/// job's own tally (`plugins::edit::parity::collect`) rather than the process-wide one.
+fn collect_parity<R>(f: impl FnOnce() -> R) -> (R, JobParity) {
+    #[cfg(feature = "edit")]
+    return crate::plugins::edit::parity::collect(f);
+    #[cfg(not(feature = "edit"))]
+    (f(), ())
 }
 
-/// [`record_export_parity`] bound to `from`, the catalog the export read: once another
-/// catalog is open the tally is dropped (it counts the old catalog's exports), never added
-/// to the new catalog's total.
-pub fn record_export_parity_as(state: &AppState, from: Option<CatalogIdentity>) {
+/// Add the engine-2 exports checked outside any export job's own tally (the process-wide
+/// `parity::take`) to the open catalog's total. Called after the commands that write an
+/// export without collecting their own (publishing, Instagram, LocalSend); best-effort — a
+/// failed write loses a count, never an export.
+pub fn record_export_parity(state: &AppState) {
+    #[cfg(feature = "edit")]
+    record_parity_tally(state, None, crate::plugins::edit::parity::take());
+    #[cfg(not(feature = "edit"))]
+    record_parity_tally(state, None, ());
+}
+
+/// Add `tally` — one export job's own — to the total of `from`, the catalog the export read:
+/// once another catalog is open the tally is dropped (it counts the old catalog's exports),
+/// never added to the new catalog's total. `None`: whichever catalog is open.
+fn record_parity_tally(state: &AppState, from: Option<CatalogIdentity>, tally: JobParity) {
     #[cfg(feature = "edit")]
     {
-        use crate::plugins::edit::parity::{take, ParityTally};
-        let tally = take();
+        use crate::plugins::edit::parity::ParityTally;
         if tally.checked == 0 {
             return;
         }
@@ -249,7 +301,7 @@ pub fn record_export_parity_as(state: &AppState, from: Option<CatalogIdentity>) 
         }
     }
     #[cfg(not(feature = "edit"))]
-    let _ = (state, from);
+    let _ = (state, from, tally);
 }
 
 #[cfg(test)]
@@ -450,6 +502,55 @@ mod tests {
         assert_eq!(now.get_setting(EXPORT_PARITY_KEY).unwrap(), None, "the switched-to catalog's total is untouched");
     }
 
+    /// Each export's parity tally is its own. Export A (catalog A) records one check after
+    /// its first photo and is held there; the app switches to catalog B, where export B
+    /// records two checks and finishes; the app switches back to A and export A resumes (it
+    /// stops — B tripped it — and records). B's total must be B's two checks only, and A's
+    /// total A's one: neither drains nor carries the other's counts.
+    #[cfg(feature = "edit")]
+    #[test]
+    fn interleaved_exports_across_a_switch_record_each_tally_only_into_its_own_catalog() {
+        use crate::plugins::edit::parity::{record, ParityTally};
+        use std::sync::mpsc::channel;
+        let f = fixture("parity-own", 2);
+        let other = fixture("parity-own-other", 2);
+        let parked = Mutex::new(other.state.catalog.lock().unwrap().take());
+        let swap = || std::mem::swap(&mut *f.state.catalog.lock().unwrap(), &mut *parked.lock().unwrap());
+        let total = |c: &Catalog| -> Option<ParityTally> {
+            c.get_setting(EXPORT_PARITY_KEY).unwrap().map(|v| serde_json::from_str(&v).unwrap())
+        };
+        let (mid_tx, mid_rx) = channel::<()>();
+        let (resume_tx, resume_rx) = channel::<()>();
+        let claim_a = claim_export(&f.state).unwrap();
+        std::thread::scope(|s| {
+            let (f, claim_a) = (&f, &claim_a);
+            let a = s.spawn(move || {
+                export_photos_claimed_with(&f.state, claim_a, None, &request(f, &f.dir.join("out-a")), &|done| {
+                    if done == 1 {
+                        record(0.0);
+                        mid_tx.send(()).unwrap();
+                        wait(&resume_rx);
+                    }
+                })
+            });
+            wait(&mid_rx);
+            swap(); // → catalog B
+            let claim_b = claim_export(&f.state).unwrap();
+            export_photos_claimed_with(&f.state, &claim_b, None, &request(&other, &other.dir.join("out-b")), &|_| {
+                record(0.0)
+            })
+            .unwrap();
+            swap(); // → catalog A
+            resume_tx.send(()).unwrap();
+            let err = a.join().unwrap().unwrap_err();
+            assert!(err.starts_with(EXPORT_CANCELLED), "{err}");
+        });
+        let guard = f.state.catalog.lock().unwrap();
+        assert_eq!(total(guard.as_ref().unwrap()), Some(ParityTally { checked: 1, differing: 0 }), "A's own check");
+        let parked = parked.lock().unwrap();
+        assert_eq!(total(parked.as_ref().unwrap()), Some(ParityTally { checked: 2, differing: 0 }), "B's own checks");
+    }
+
     /// A Cancel during the last photo (its preview step, the final progress call) — after
     /// the loop's last per-photo check — still stops the bundle: no bundle at the
     /// destination, no temp file, and the result says cancelled.
@@ -525,6 +626,52 @@ mod tests {
         let entries = bundle_entries(&dest);
         let originals: Vec<_> = entries.iter().filter(|e| e.starts_with("originals/") && !e.ends_with(".xmp")).collect();
         assert_eq!(originals.len(), 3, "{entries:?}");
+        assert_eq!(files(&f.dir.join("out")), ["trip.chairphoto"], "no temp file is left behind");
+    }
+
+    /// The bundle-export publish is atomic with ownership. The older export passes its last
+    /// abort check before the rename and is held there (the `before_publish` hook); a newer
+    /// export of the same destination — with one more photo in the batch, so the two bundles
+    /// differ — claims (tripping the older), writes and publishes. The older then resumes:
+    /// it must not rename its bundle over the newer one.
+    #[test]
+    fn a_superseded_bundle_export_held_after_its_last_check_never_publishes_over_the_newer_one() {
+        use std::sync::mpsc::channel;
+        let f = fixture("bundle-publish", 3);
+        let dest = f.dir.join("out/trip.chairphoto");
+        let older = claim_bundle_export(&f.state).unwrap();
+        let (go_tx, go_rx) = channel::<()>();
+        let (done_tx, done_rx) = channel::<()>();
+        let (newer, older_res) = std::thread::scope(|s| {
+            let (f, dest) = (&f, &dest);
+            let newer = s.spawn(move || {
+                wait(&go_rx);
+                {
+                    let guard = f.state.catalog.lock().unwrap();
+                    let catalog = guard.as_ref().unwrap();
+                    let path = f.dir.join("photos/IMG_9999.CR3");
+                    std::fs::write(&path, "raw bytes newer").unwrap();
+                    let id = catalog.upsert_photo(&path, None, 0, 15).unwrap().id;
+                    catalog.assign_photos_to_batch(f.batch, &[id]).unwrap();
+                }
+                let claim = claim_bundle_export(&f.state).unwrap();
+                let r = export_bundle_claimed(&f.state, &claim, None, f.batch, dest);
+                done_tx.send(()).unwrap();
+                r
+            });
+            let older_res = export_bundle_claimed_hooked(&f.state, &older, None, f.batch, dest, &|_, _| {}, &|| {
+                go_tx.send(()).unwrap();
+                wait(&done_rx);
+            });
+            (newer.join().unwrap(), older_res)
+        });
+        let r = newer.expect("the newer bundle export completes");
+        assert_eq!(r.exported, 4);
+        let err = older_res.expect_err("the superseded export must not publish");
+        assert!(err.starts_with(crate::bundle::writer::BUNDLE_EXPORT_CANCELLED), "{err}");
+        let entries = bundle_entries(&dest);
+        let originals: Vec<_> = entries.iter().filter(|e| e.starts_with("originals/") && !e.ends_with(".xmp")).collect();
+        assert_eq!(originals.len(), 4, "the newer bundle stays at the destination: {entries:?}");
         assert_eq!(files(&f.dir.join("out")), ["trip.chairphoto"], "no temp file is left behind");
     }
 }

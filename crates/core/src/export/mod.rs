@@ -171,6 +171,21 @@ pub fn write_exports_with(
     abort: &std::sync::atomic::AtomicBool,
     on_progress: &dyn Fn(usize, usize),
 ) -> Result<ExportRun, String> {
+    write_exports_hooked(resolved, preset, dest_dir, hashtags, abort, on_progress, &|_| {})
+}
+
+/// [`write_exports_with`], calling `before_write(target)` once each photo's destination name
+/// is reserved and before its bytes are written — where a test lets an overlapping export of
+/// the same folder run.
+fn write_exports_hooked(
+    resolved: &ResolvedExport,
+    preset: ExportPreset,
+    dest_dir: &Path,
+    hashtags: &[String],
+    abort: &std::sync::atomic::AtomicBool,
+    on_progress: &dyn Fn(usize, usize),
+    before_write: &dyn Fn(&Path),
+) -> Result<ExportRun, String> {
     use std::sync::atomic::Ordering;
     if abort.load(Ordering::Relaxed) {
         return Ok(ExportRun {
@@ -191,9 +206,9 @@ pub fn write_exports_with(
             return Ok(ExportRun { result, stopped: true });
         }
         let outcome = match preset {
-            ExportPreset::HandOff => export_handoff(item, dest_dir),
-            ExportPreset::ShowOff => export_jpeg(item, dest_dir, None),
-            ExportPreset::Instagram => export_jpeg(item, dest_dir, Some(INSTAGRAM_WIDTH)),
+            ExportPreset::HandOff => export_handoff(item, dest_dir, before_write),
+            ExportPreset::ShowOff => export_jpeg(item, dest_dir, None, before_write),
+            ExportPreset::Instagram => export_jpeg(item, dest_dir, Some(INSTAGRAM_WIDTH), before_write),
         };
         match outcome {
             Ok(()) => result.exported += 1,
@@ -204,7 +219,7 @@ pub fn write_exports_with(
     if !hashtags.is_empty() {
         // Best-effort, like the keyword write: photos are already exported, so a failed
         // hashtags.txt write must not discard the whole ExportResult.
-        if let Err(e) = std::fs::write(dest_dir.join("hashtags.txt"), hashtags.join(" ")) {
+        if let Err(e) = replace_file(&dest_dir.join("hashtags.txt"), hashtags.join(" ").as_bytes()) {
             eprintln!("export: hashtags.txt write failed: {e}");
             result.errors += 1;
         }
@@ -215,20 +230,39 @@ pub fn write_exports_with(
 /// Copy the original next to its XMP sidecar (if one exists), never overwriting an
 /// existing file in the destination (duplicate names — possible across volumes — get a
 /// " (n)" suffix; the sidecar is renamed to stay paired with its original). Then emit
-/// the assembled keywords into the destination sidecar (merge-safe, G2).
-fn export_handoff(item: &ResolvedItem, dest_dir: &Path) -> Result<(), String> {
+/// the assembled keywords into the destination sidecar (merge-safe, G2). The names are
+/// reserved before anything is written ([`reserve_destination`]), so an overlapping export
+/// of the same folder never writes into this one's files.
+fn export_handoff(item: &ResolvedItem, dest_dir: &Path, before_write: &dyn Fn(&Path)) -> Result<(), String> {
     let original = &item.original;
     let name = original
         .file_name()
         .ok_or_else(|| "original has no file name".to_string())?;
-    let target = unique_path(&dest_dir.join(name));
-    std::fs::copy(original, &target).map_err(|e| e.to_string())?;
+    let (target, mut out) = reserve_destination(&dest_dir.join(name))?;
+    let target_sidecar = crate::xmp::sidecar_path(&target);
+    before_write(&target);
+    let copied = std::fs::File::open(original)
+        .and_then(|mut src| std::io::copy(&mut src, &mut out))
+        ;
+    drop(out);
+    if let Err(e) = copied {
+        // Both names are this export's own: a half-copied original must not look exported.
+        let _ = std::fs::remove_file(&target);
+        let _ = std::fs::remove_file(&target_sidecar);
+        return Err(e.to_string());
+    }
 
     let sidecar = crate::xmp::sidecar_path(original);
     if sidecar.is_file() {
         // Pair the sidecar with the (possibly disambiguated) target via the same
-        // convention the keyword writer uses.
-        std::fs::copy(&sidecar, crate::xmp::sidecar_path(&target)).map_err(|e| e.to_string())?;
+        // convention the keyword writer uses. The destination is this export's own
+        // reserved (empty) file.
+        std::fs::copy(&sidecar, &target_sidecar).map_err(|e| e.to_string())?;
+    } else {
+        // No sidecar to copy: release the empty reservation so the keyword writer creates
+        // a fresh one. Nothing else writes `<target>.xmp` — that would need `target`, which
+        // this export holds.
+        let _ = std::fs::remove_file(&target_sidecar);
     }
     // Emit keywords into the destination sidecar (merges into the copied one, or
     // creates it). Best-effort: the RAW + sidecar are already exported, so a malformed
@@ -281,7 +315,12 @@ fn embed_sidecar_metadata(sidecar: &Path, item: &ResolvedItem) -> Result<(), Str
 /// the full-resolution source (a true RAW decode when available) so the crop is exact;
 /// an unedited export uses the cached embedded full-size preview (fast, near-native).
 /// `max_width`, when set, downscales to that width (Instagram preset) — never upscales.
-fn export_jpeg(item: &ResolvedItem, dest_dir: &Path, max_width: Option<u32>) -> Result<(), String> {
+fn export_jpeg(
+    item: &ResolvedItem,
+    dest_dir: &Path,
+    max_width: Option<u32>,
+    before_write: &dyn Fn(&Path),
+) -> Result<(), String> {
     let original = &item.original;
     // A version whose record is empty / `{}` has no crop or tone — treat as unedited.
     let edit_json = item.edit_json.as_deref().unwrap_or("");
@@ -301,8 +340,18 @@ fn export_jpeg(item: &ResolvedItem, dest_dir: &Path, max_width: Option<u32>) -> 
     }
     let mut base = PathBuf::from(dest_dir).join(name);
     base.set_extension("jpg");
-    let target = unique_path(&base);
-    std::fs::write(&target, jpeg).map_err(|e| e.to_string())?;
+    let (target, mut out) = reserve_destination(&base)?;
+    // The paired sidecar is written (with `exiftool -o`, which refuses an existing file)
+    // only once there is authored metadata: release the empty reservation now. Nothing
+    // else writes `<target>.xmp` — that would need `target`, which this export holds.
+    let _ = std::fs::remove_file(crate::xmp::sidecar_path(&target));
+    before_write(&target);
+    let written = std::io::Write::write_all(&mut out, &jpeg);
+    drop(out);
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(&target);
+        return Err(e.to_string());
+    }
 
     // Stamp the keywords + rating/label + IPTC into the JPEG and a paired sidecar.
     // Best-effort: the pixels are already written, so a metadata failure (e.g. exiftool
@@ -444,7 +493,8 @@ fn embed_export_metadata(jpeg: &Path, item: &ResolvedItem, has_edit: bool) -> Re
     run_exiftool(embed)?;
 
     // 2) Mirror authored metadata into a paired sidecar (skip for an untagged photo). The
-    // `-o` form refuses to overwrite, so clear any existing sidecar first.
+    // `-o` form refuses to overwrite, so clear any existing sidecar first — only ever this
+    // export's own: `export_jpeg` reserved the name together with the JPEG's.
     if authored {
         let sidecar = crate::xmp::sidecar_path(jpeg);
         let _ = std::fs::remove_file(&sidecar);
@@ -746,28 +796,65 @@ fn tone_match_lut(src: &[u64; 256], dst: &[u64; 256]) -> [u8; 256] {
     lut
 }
 
-/// A destination path that doesn't already exist: returns `path` if free, else
-/// `stem (2).ext`, `stem (3).ext`, … This prevents a re-export or a duplicate source
-/// filename from silently clobbering an already-written file.
-fn unique_path(path: &Path) -> PathBuf {
-    if !path.exists() {
-        return path.to_path_buf();
-    }
+/// Reserve a destination this export owns: the first of `path`, `stem (2).ext`,
+/// `stem (3).ext`, … that is free **and** whose `<name>.xmp` sidecar is free, both created
+/// with an exclusive create (`O_EXCL`), so a re-export, a duplicate source filename or an
+/// overlapping export of the same folder never gets — and never truncates — a name another
+/// writer holds. Returns the reserved path and its open, empty file; the sidecar is left
+/// reserved (empty) for the caller to fill or remove. On `AlreadyExists` for either name the
+/// next candidate is tried (a primary reserved here is released first).
+fn reserve_destination(path: &Path) -> Result<(PathBuf, std::fs::File), String> {
+    use std::io::ErrorKind::AlreadyExists;
+    let create = |p: &Path| std::fs::OpenOptions::new().write(true).create_new(true).open(p);
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("file");
     let ext = path.extension().and_then(|s| s.to_str());
-    for n in 2..10_000 {
+    let candidates = std::iter::once(path.to_path_buf()).chain((2..10_000).map(|n| {
         let mut name = format!("{stem} ({n})");
         if let Some(ext) = ext {
             name.push('.');
             name.push_str(ext);
         }
-        let candidate = dir.join(name);
-        if !candidate.exists() {
-            return candidate;
+        dir.join(name)
+    }));
+    for candidate in candidates {
+        let file = match create(&candidate) {
+            Ok(f) => f,
+            Err(e) if e.kind() == AlreadyExists => continue,
+            Err(e) => return Err(format!("{}: {e}", candidate.display())),
+        };
+        match create(&crate::xmp::sidecar_path(&candidate)) {
+            Ok(_) => return Ok((candidate, file)),
+            Err(e) => {
+                drop(file);
+                let _ = std::fs::remove_file(&candidate);
+                if e.kind() != AlreadyExists {
+                    return Err(format!("{}: {e}", candidate.display()));
+                }
+            }
         }
     }
-    path.to_path_buf() // pathological fallback (10k collisions)
+    Err(format!("{}: no free name", path.display()))
+}
+
+/// Replace `path` whole with `bytes`: written to a temp file of this call's own (exclusive
+/// create, beside `path`), then renamed over it. Two exports writing the same `path`
+/// (`hashtags.txt`) each leave a complete file — the last rename wins, as React's overwrite
+/// did — and neither ever truncates the file the other just wrote.
+fn replace_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("file");
+    let tmp = dir.join(format!(".{name}-{}-{}.tmp", std::process::id(), uuid::Uuid::new_v4().simple()));
+    let result = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)
+        .and_then(|mut f| std::io::Write::write_all(&mut f, bytes))
+        .and_then(|_| std::fs::rename(&tmp, path));
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
 }
 
 #[cfg(test)]
@@ -1150,5 +1237,111 @@ mod engine2_export_tests {
         println!("export {}x{}; parity tally {tally:?}", img.width(), img.height());
         assert_eq!(tally, crate::plugins::edit::parity::ParityTally { checked: 1, differing: 0 });
         crate::develop::offline::clear();
+    }
+}
+
+/// Overlapping photo exports into one folder (#115, Codex gate).
+#[cfg(test)]
+mod overlap_tests {
+    use super::*;
+    use crate::test_support::TestTmpDir;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::mpsc::{channel, Receiver};
+
+    fn item(original: PathBuf) -> ResolvedItem {
+        ResolvedItem {
+            photo_id: 1,
+            original,
+            keywords: ExportKeywords::default(),
+            edit_json: None,
+            version_name: None,
+            rating: 0,
+            label: String::new(),
+            iptc: IptcFields::default(),
+        }
+    }
+
+    /// An original `IMG.CR3` with `bytes` and a sidecar carrying `marker`, under `dir`.
+    fn original(dir: &Path, bytes: &str, marker: &str) -> ResolvedExport {
+        std::fs::create_dir_all(dir).unwrap();
+        let path = dir.join("IMG.CR3");
+        std::fs::write(&path, bytes).unwrap();
+        std::fs::write(
+            crate::xmp::sidecar_path(&path),
+            format!("<x:xmpmeta xmlns:x='adobe:ns:meta/'><rdf:RDF xmlns:rdf='http://www.w3.org/1999/02/22-rdf-syntax-ns#'><rdf:Description rdf:about='' xmlns:t='urn:test'><t:m>{marker}</t:m></rdf:Description></rdf:RDF></x:xmpmeta>"),
+        )
+        .unwrap();
+        ResolvedExport { items: vec![item(path)], skipped_offline: 0, resolve_errors: 0 }
+    }
+
+    fn wait(rx: &Receiver<()>) {
+        rx.recv_timeout(std::time::Duration::from_secs(60)).expect("the other export's step");
+    }
+
+    /// Two hand-off exports of two different originals both named `IMG.CR3` into one folder.
+    /// The first is held after choosing its destination name and before writing a byte
+    /// (`before_write`); the second runs whole in that window, with its own `hashtags.txt`;
+    /// then the first resumes. Each must end in its own complete pair — `IMG.CR3` and
+    /// `IMG (2).CR3`, each with the sidecar of its own original — and `hashtags.txt` is one
+    /// export's complete text, with no temp file left.
+    #[test]
+    fn two_overlapping_exports_to_one_folder_end_with_distinct_complete_files() {
+        let dir = TestTmpDir::new("export-overlap");
+        let dest = dir.join("out");
+        let a = original(&dir.join("a"), "AAAA original bytes", "from-a");
+        let b = original(&dir.join("b"), "BBBB original bytes", "from-b");
+        let never = AtomicBool::new(false);
+        let (go_tx, go_rx) = channel::<()>();
+        let (done_tx, done_rx) = channel::<()>();
+        let tags_a = vec!["#alpha".to_string(), "#aaa".to_string()];
+        let tags_b = vec!["#bravo".to_string(), "#bbb".to_string()];
+        let (ra, rb) = std::thread::scope(|s| {
+            let (b, dest, never, tags_b) = (&b, &dest, &never, &tags_b);
+            let second = s.spawn(move || {
+                wait(&go_rx);
+                let r = write_exports_hooked(b, ExportPreset::HandOff, dest, tags_b, never, &|_, _| {}, &|_| {});
+                done_tx.send(()).unwrap();
+                r
+            });
+            let ra = write_exports_hooked(&a, ExportPreset::HandOff, &dest, &tags_a, &never, &|_, _| {}, &|_| {
+                go_tx.send(()).unwrap();
+                wait(&done_rx);
+            });
+            (ra, second.join().unwrap())
+        });
+        assert_eq!(ra.unwrap().result.exported, 1);
+        assert_eq!(rb.unwrap().result.exported, 1);
+
+        let mut names: Vec<String> =
+            std::fs::read_dir(&dest).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        names.sort();
+        assert_eq!(names, ["IMG (2).CR3", "IMG (2).CR3.xmp", "IMG.CR3", "IMG.CR3.xmp", "hashtags.txt"], "{names:?}");
+        let mut seen = Vec::new();
+        for name in ["IMG.CR3", "IMG (2).CR3"] {
+            let bytes = std::fs::read_to_string(dest.join(name)).unwrap();
+            let sidecar = std::fs::read_to_string(dest.join(format!("{name}.xmp"))).unwrap();
+            let which = match bytes.as_str() {
+                "AAAA original bytes" => "a",
+                "BBBB original bytes" => "b",
+                other => panic!("{name} is not one export's complete original: {other:?}"),
+            };
+            assert!(sidecar.contains(&format!("from-{which}")), "{name}'s sidecar pairs with its own original: {sidecar}");
+            seen.push(which);
+        }
+        seen.sort();
+        assert_eq!(seen, ["a", "b"], "both originals survive");
+        let tags = std::fs::read_to_string(dest.join("hashtags.txt")).unwrap();
+        assert!(tags == "#alpha #aaa" || tags == "#bravo #bbb", "{tags:?}");
+    }
+
+    /// A free name whose sidecar name is taken (a stale `.xmp`) is skipped, never merged into.
+    #[test]
+    fn a_name_whose_sidecar_exists_is_not_reserved() {
+        let dir = TestTmpDir::new("export-reserve");
+        std::fs::write(dir.join("IMG.CR3.xmp"), "stale").unwrap();
+        let (path, _file) = reserve_destination(&dir.join("IMG.CR3")).unwrap();
+        assert_eq!(path, dir.join("IMG (2).CR3"));
+        assert!(!dir.join("IMG.CR3").exists(), "the released primary is removed");
+        assert_eq!(std::fs::read_to_string(dir.join("IMG.CR3.xmp")).unwrap(), "stale");
     }
 }

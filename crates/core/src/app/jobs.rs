@@ -47,6 +47,7 @@
 //! | [`AbortGeneration::install_fresh_if_owner`] (a card import committing to index) | the scan abort → the import abort |
 //! | [`AbortGeneration::install_fresh_if_newer`] (a burst-analysis worker's claim) | one abort, released before the catalog is read |
 //! | `exports::claim_export`, `exports::claim_bundle_export` | one abort, released before the catalog is read |
+//! | `exports::export_bundle_claimed_with`'s publish (its last abort check and the bundle's rename into place) | the bundle-export abort alone, after the catalog was released |
 //! | [`AbortGeneration::trip`] (every Cancel command) | one abort |
 //! | [`JobSlot`] writes (workers) | one slot |
 //! | `develop`'s resident set (`develop::with_resident`) | a leaf: after any of the above, never across another lock |

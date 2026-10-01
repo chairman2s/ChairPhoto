@@ -407,6 +407,20 @@ Two modes over the same core location model:
   optional **Import name** that labels the batch (defaults to the source folder); the batch
   keeps its stable UUID underneath. (Cross-volume "import once" by UUID is handled by bundle merge.)
 
+**Stopping an import.** Cancel, a newer import and a catalog switch all trip the import's
+abort flag, which is checked between files in every phase. During the copy (or a bundle's
+unpack) the import stops before the next file and indexes nothing; the copies stay in the
+library folder for the next rescan (a bundle: import it again). During indexing
+(`scanner::index_ingested_abortable`, `bundle::importer::index_bundle_abortable`) it stops
+before the next copy, and what it indexed so far is committed whole, as if the import had
+held only those files: rows and identity sidecars, the import batch (and its UUID in their
+sidecars), queued backups, auto-tags and geofence tags; for a bundle, the merge runs over
+the manifest narrowed to those photos, so the originals not yet indexed are not inserted as
+metadata-only rows. Indexing always writes the catalog the import started against (its own
+connection to that file), never one opened since. The report says how many were indexed;
+the rest wait for a rescan (card) or a second import of the bundle, which matches what is
+already there by UUID.
+
 ### Import batches ("negative film roll")
 
 Every ingest creates an **import batch** with a permanent unique ID — think of it as

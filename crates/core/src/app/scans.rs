@@ -181,11 +181,12 @@ pub fn ingest_from_card_claimed(
     name: Option<&str>,
     selected: Option<std::collections::HashSet<String>>,
 ) -> Result<ScanResult, String> {
-    ingest_claimed_with(state, claim, source, name, selected, &|| {})
+    ingest_claimed_with(state, claim, source, name, selected, &|| {}, &|_| {})
 }
 
 /// [`ingest_from_card_claimed`], calling `after_copy` once the copy finished un-cancelled and
-/// before the import commits to indexing — where a test puts a Cancel.
+/// before the import commits to indexing, and `after_indexed(n)` after each copy indexed —
+/// where a test puts a Cancel.
 fn ingest_claimed_with(
     state: &AppState,
     claim: &ImportClaim,
@@ -193,6 +194,7 @@ fn ingest_claimed_with(
     name: Option<&str>,
     selected: Option<std::collections::HashSet<String>>,
     after_copy: &dyn Fn(),
+    after_indexed: &dyn Fn(usize),
 ) -> Result<ScanResult, String> {
     let (abort, job) = (&*claim.abort, claim.job);
     if abort.load(Ordering::Relaxed) {
@@ -220,7 +222,10 @@ fn ingest_claimed_with(
     // (`install_fresh_if_owner`), so an import cancelled after its copy never stops a
     // rescan's enrichment. The import flag is checked once more after that: a switch or
     // Cancel landing after the commit must not see these rows indexed. A tripped scan stays
-    // tripped; its queued enrichment rows are drained by the next scan (I6d).
+    // tripped; its queued enrichment rows are drained by the next scan (I6d). The indexing
+    // itself stops before its next copy once the flag trips (Cancel, a newer import, a
+    // switch): what it indexed so far is committed whole, and the rest wait for a rescan
+    // (`scanner::index_ingested_abortable`).
     let Some(_scan) = state.jobs.scan.install_fresh_if_owner(&state.jobs.import, abort)? else {
         return Err(cancelled_message(copied.len()));
     };
@@ -229,7 +234,12 @@ fn ingest_claimed_with(
             return Err(cancelled_message(copied.len()));
         }
         let catalog = Catalog::open_secondary(&db_path, &dest).map_err(|e| e.to_string())?;
-        crate::scanner::index_ingested(&catalog, &dest, source, copied, name, result)
+        let total = copied.len();
+        let indexed = crate::scanner::index_ingested_with(&catalog, &dest, source, copied, name, result, abort, after_indexed)?;
+        if indexed.aborted() {
+            return Err(cancelled_while_indexing(indexed.indexed, total));
+        }
+        Ok(indexed.result)
     })();
     send_scan_done(state);
     indexed
@@ -247,6 +257,18 @@ fn cancelled_message(copied: usize) -> String {
             if copied == 1 { "it" } else { "them" },
         )
     }
+}
+
+/// What an import stopped during indexing reports: the copies indexed so far are in the
+/// catalog, whole; the rest are in the library folder for the next rescan.
+fn cancelled_while_indexing(indexed: usize, total: usize) -> String {
+    let rest = total - indexed;
+    format!(
+        "{IMPORT_CANCELLED}: {indexed} of {total} copied files indexed; the other {rest} {} in the library folder, \
+         not indexed yet — Rescan library picks {} up.",
+        if rest == 1 { "is" } else { "are" },
+        if rest == 1 { "it" } else { "them" },
+    )
 }
 
 /// Stop the running card or bundle import before its next file. A no-op when none runs.
@@ -343,15 +365,70 @@ mod tests {
         let enrichment = state.jobs.scan.install_fresh().unwrap();
         let claim = claim_import(&state).unwrap();
         let cancel = || cancel_import(&state).unwrap();
-        let err = ingest_claimed_with(&state, &claim, &card, None, None, &cancel).unwrap_err();
+        let err = ingest_claimed_with(&state, &claim, &card, None, None, &cancel, &|_| {}).unwrap_err();
         assert!(err.contains("1 file already copied"), "{err}");
         assert!(!enrichment.load(Ordering::Relaxed), "the cancelled import stopped the rescan's enrichment");
         assert_eq!(photos(&state), 0);
 
         let claim = claim_import(&state).unwrap();
         std::fs::write(card.join("IMG_new.jpg"), b"another").unwrap();
-        ingest_claimed_with(&state, &claim, &card, None, None, &|| {}).unwrap();
+        ingest_claimed_with(&state, &claim, &card, None, None, &|| {}, &|_| {}).unwrap();
         assert!(enrichment.load(Ordering::Relaxed), "an import that indexes supersedes the scan");
+    }
+
+    /// **Forced interleaving** (#114 Codex, finding D). Cancel, a newer import and a catalog
+    /// switch each land after the first of three copies is indexed: indexing stops before the
+    /// second. The first is committed whole — its row, identity sidecar, import batch and
+    /// queued backup — in the catalog the import started against; the other two stay in the
+    /// library folder, unindexed, and the report says so.
+    #[test]
+    fn cancel_switch_or_a_newer_import_stops_indexing_between_photos() {
+        for how in ["cancel", "newer", "switch"] {
+            let (dir, state, _names, card) = setup(&format!("index-abort-{how}"), 3);
+            let a = state.catalog.clone();
+            let claim = claim_import(&state).unwrap();
+            let trip = |n: usize| {
+                if n != 1 {
+                    return;
+                }
+                match how {
+                    "cancel" => cancel_import(&state).unwrap(),
+                    "newer" => drop(claim_import(&state).unwrap()),
+                    _ => {
+                        crate::app::catalogs::detach_catalog_and_trip_jobs(&state).unwrap();
+                        let b = Catalog::open(&dir.join("b.chairphoto"), &dir.join("b")).unwrap();
+                        crate::app::catalogs::publish_catalog_and_reset_jobs(&state, b).unwrap();
+                    }
+                }
+            };
+            let err = ingest_claimed_with(&state, &claim, &card, Some("Trip"), None, &|| {}, &trip).unwrap_err();
+            assert_eq!(
+                err,
+                "Import cancelled: 1 of 3 copied files indexed; the other 2 are in the library folder, not indexed yet — \
+                 Rescan library picks them up.",
+                "{how}"
+            );
+            // The catalog the import started against (a secondary connection to it, after a switch).
+            let started = Catalog::open_secondary(&dir.join("c.chairphoto"), &dir.join("library")).unwrap();
+            let rows = started.list_photos(&Default::default()).unwrap();
+            assert_eq!(rows.len(), 1, "{how}: one photo indexed, not three");
+            let photo = &rows[0];
+            let path = started.require_photo_path(photo.id).unwrap();
+            assert_eq!(crate::xmp::read_identifier(&path).as_deref(), Some(photo.uuid.as_str()), "{how}: its identity sidecar");
+            assert!(started.import_batch_uuid_for_photo(photo.id).unwrap().is_some(), "{how}: its import batch");
+            let backups: Vec<i64> = started.list_pending_operations().unwrap().iter().map(|o| o.photo_id).collect();
+            assert_eq!(backups, [photo.id], "{how}: its queued backup");
+            let files = walkdir::WalkDir::new(dir.join("library"))
+                .into_iter()
+                .filter_map(|e| e.ok())
+                .filter(|e| e.file_type().is_file() && e.path().extension().is_some_and(|x| x == "jpg"))
+                .count();
+            assert_eq!(files, 3, "{how}: every copy stays in the library folder");
+            if how == "switch" {
+                assert_eq!(crate::app::with_catalog(&state, |c| c.count_photos(&Default::default())).unwrap(), 0, "B untouched");
+            }
+            drop(a);
+        }
     }
 
     #[test]

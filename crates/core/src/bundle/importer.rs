@@ -28,6 +28,8 @@ use zip::ZipArchive;
 
 use crate::bundle::{BundleManifest, BUNDLE_FORMAT_VERSION, MANIFEST_FILENAME, ORIGINALS_DIR};
 use crate::catalog::{Catalog, MergeSummary};
+use crate::scanner::Indexed;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 // ---------------------------------------------------------------------------
 // Result type
@@ -366,10 +368,48 @@ pub fn index_bundle(
     manifest: &BundleManifest,
     extracted: &[ExtractedItem],
     dest_base: &Path,
-    mut partial_result: BundleImportResult,
+    partial_result: BundleImportResult,
 ) -> Result<BundleImportResult, String> {
+    index_bundle_abortable(catalog, manifest, extracted, dest_base, partial_result, &AtomicBool::new(false))
+        .map(|i| i.result)
+}
+
+/// [`index_bundle`], stopping before the next original once `abort` is set (Cancel, a newer
+/// import, a catalog switch). A stop leaves a consistent catalog, as if the bundle had held
+/// only the originals indexed so far: Step A is committed for each (its row with the
+/// bundle's identity, its identity sidecar or queued repair, the bundle's culling, IPTC,
+/// edit and versions for a new photo, its queued backup), and Steps B and C run over the
+/// manifest narrowed to those photos — the batch and their tags merged, the batch assigned
+/// and written into their sidecars, auto-tags, stacks, reconcile. The narrowing matters: the
+/// full merge would insert the originals not yet indexed as metadata-only rows. Importing
+/// the bundle again finishes it; the upsert is UUID-aware, so the photos indexed here are
+/// matched, not duplicated. [`Indexed`] says how many originals were indexed.
+pub fn index_bundle_abortable(
+    catalog: &Catalog,
+    manifest: &BundleManifest,
+    extracted: &[ExtractedItem],
+    dest_base: &Path,
+    partial_result: BundleImportResult,
+    abort: &AtomicBool,
+) -> Result<Indexed<BundleImportResult>, String> {
+    index_bundle_with(catalog, manifest, extracted, dest_base, partial_result, abort, &|_| {})
+}
+
+/// [`index_bundle_abortable`], calling `after_each(indexed)` after each original — where a
+/// test trips the abort mid-pass.
+pub(crate) fn index_bundle_with(
+    catalog: &Catalog,
+    manifest: &BundleManifest,
+    extracted: &[ExtractedItem],
+    dest_base: &Path,
+    mut partial_result: BundleImportResult,
+    abort: &AtomicBool,
+    after_each: &dyn Fn(usize),
+) -> Result<Indexed<BundleImportResult>, String> {
     use crate::catalog::PickState;
 
+    let total = extracted.len();
+    let mut indexed = 0;
     let folder_id = catalog.add_folder(dest_base).map_err(|e| e.to_string())?;
 
     // Build a lookup table uuid → BundlePhoto for fast access during the upsert loop.
@@ -384,6 +424,10 @@ pub fn index_bundle(
 
     let tx = catalog.begin().map_err(|e| e.to_string())?;
     for item in extracted {
+        if abort.load(Ordering::Relaxed) {
+            break; // Step A is committed for what is indexed so far; see the docs
+        }
+        indexed += 1;
         let path = &item.dest;
         let meta = std::fs::metadata(path).map_err(|e| e.to_string())?;
         let mtime_ns = meta
@@ -418,6 +462,7 @@ pub fn index_bundle(
             Err(e) => {
                 eprintln!("bundle import: upsert failed for {}: {e}", path.display());
                 partial_result.errors += 1;
+                after_each(indexed);
                 continue;
             }
         };
@@ -492,6 +537,7 @@ pub fn index_bundle(
                 }
             }
         }
+        after_each(indexed);
     }
 
     // Auto-enqueue backup for newly-created photos (E4). Failures are best-effort.
@@ -500,6 +546,19 @@ pub fn index_bundle(
     }
 
     tx.commit().map_err(|e| e.to_string())?;
+
+    // Stopped early: Steps B and C cover only the photos indexed (see the docs).
+    let narrowed;
+    let manifest = if indexed < total {
+        let done: std::collections::HashSet<&str> = extracted[..indexed].iter().map(|i| i.photo_uuid.as_str()).collect();
+        narrowed = BundleManifest {
+            photos: manifest.photos.iter().filter(|p| done.contains(p.uuid.as_str())).cloned().collect(),
+            ..manifest.clone()
+        };
+        &narrowed
+    } else {
+        manifest
+    };
 
     // Step B — F1c merge: apply taxonomy, import batch, tag assignments — additive.
     // Photos with originals in the bundle are already "existing" after the upsert above;
@@ -553,7 +612,7 @@ pub fn index_bundle(
     merge_summary.photos_added += newly_created.len();
     merge_summary.photos_existing = merge_summary.photos_existing.saturating_sub(newly_created.len());
     partial_result.merge = merge_summary;
-    Ok(partial_result)
+    Ok(Indexed { result: partial_result, indexed, total })
 }
 
 // ---------------------------------------------------------------------------

@@ -711,6 +711,23 @@ pub fn copy_from_card_abortable(
     Ok((result, copied, false))
 }
 
+/// What an abortable indexing pass ([`index_ingested_abortable`],
+/// `bundle::importer::index_bundle_abortable`) did: its result over the photos it indexed,
+/// and how many of the `total` copies those were. `indexed < total` means it was stopped.
+#[derive(Debug, Clone)]
+pub struct Indexed<R> {
+    pub result: R,
+    pub indexed: usize,
+    pub total: usize,
+}
+
+impl<R> Indexed<R> {
+    /// Stopped before the last copy.
+    pub fn aborted(&self) -> bool {
+        self.indexed < self.total
+    }
+}
+
 /// Phase 2 of import: index the already-copied files into the catalog, batch them, and
 /// auto-enqueue backups. This is the only phase that touches the catalog, and it's all
 /// fast DB writes, so the lock is held only briefly. `result` carries the counts from
@@ -721,8 +738,45 @@ pub fn index_ingested(
     source: &Path,
     copied: Vec<CopiedItem>,
     batch_label: Option<&str>,
-    mut result: ScanResult,
+    result: ScanResult,
 ) -> Result<ScanResult, String> {
+    index_ingested_abortable(catalog, dest_base, source, copied, batch_label, result, &AtomicBool::new(false))
+        .map(|i| i.result)
+}
+
+/// [`index_ingested`], stopping before the next copy once `abort` is set (Cancel, a newer
+/// import, a catalog switch). A stop leaves a consistent catalog: every copy indexed so far
+/// is committed whole — its row and identity sidecar, its import batch (and the batch UUID
+/// in its sidecar), its queued backup, auto-tags and geofence tags — exactly as if the
+/// import had been of those copies only. The copies after it stay in the library folder,
+/// unindexed, for the next rescan. [`Indexed`] says how many were indexed.
+pub fn index_ingested_abortable(
+    catalog: &Catalog,
+    dest_base: &Path,
+    source: &Path,
+    copied: Vec<CopiedItem>,
+    batch_label: Option<&str>,
+    result: ScanResult,
+    abort: &AtomicBool,
+) -> Result<Indexed<ScanResult>, String> {
+    index_ingested_with(catalog, dest_base, source, copied, batch_label, result, abort, &|_| {})
+}
+
+/// [`index_ingested_abortable`], calling `after_each(indexed)` after each copy — where a test
+/// trips the abort mid-pass.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn index_ingested_with(
+    catalog: &Catalog,
+    dest_base: &Path,
+    source: &Path,
+    copied: Vec<CopiedItem>,
+    batch_label: Option<&str>,
+    mut result: ScanResult,
+    abort: &AtomicBool,
+    after_each: &dyn Fn(usize),
+) -> Result<Indexed<ScanResult>, String> {
+    let total = copied.len();
+    let mut indexed = 0;
     let folder_id = catalog.add_folder(dest_base).map_err(|e| e.to_string())?;
 
     let mut newly_created: Vec<i64> = Vec::new();
@@ -731,6 +785,10 @@ pub fn index_ingested(
     let mut newly_created_copies: Vec<(i64, PathBuf)> = Vec::new();
     let tx = catalog.begin().map_err(|e| e.to_string())?;
     for item in &copied {
+        if abort.load(Ordering::Relaxed) {
+            break; // what is indexed so far is finished below, as a smaller import
+        }
+        indexed += 1;
         match upsert_one(catalog, &item.dest, folder_id) {
             Ok((photo_id, created, _)) => {
                 result.imported += 1;
@@ -746,6 +804,7 @@ pub fn index_ingested(
             }
             Err(_) => result.errors += 1,
         }
+        after_each(indexed);
     }
 
     // K3: resolve the batch UUID before committing the transaction so the row exists
@@ -800,7 +859,7 @@ pub fn index_ingested(
         }
     }
 
-    Ok(result)
+    Ok(Indexed { result, indexed, total })
 }
 
 /// Index a single newly-created file (e.g. a collage saved into the library) into the

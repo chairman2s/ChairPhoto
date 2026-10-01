@@ -134,7 +134,8 @@ struct Entry {
 }
 
 /// A contributed view, per window: a panel's view in the main window is not the same entity
-/// as the same panel's view in a pop-out loupe window.
+/// as the same panel's view in a pop-out loupe window. A window's views are dropped when it
+/// closes, and every view of a module when it is disabled.
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct ViewKey {
     window: WindowId,
@@ -205,6 +206,13 @@ impl ModuleRegistry {
             persisted: Arc::new(Mutex::new(0)),
             in_callback: 0,
         });
+        let weak = registry.downgrade();
+        cx.on_window_closed(move |cx, closed| {
+            if let Some(registry) = weak.upgrade() {
+                registry.update(cx, |r, _| r.views.retain(|key, _| key.window != closed));
+            }
+        })
+        .detach();
         let weak = registry.downgrade();
         cx.subscribe(model, move |_, event: &AppModelEvent, cx| {
             let Some(registry) = weak.upgrade() else { return };
@@ -579,6 +587,12 @@ impl ModuleRegistry {
     }
 
     // --- views -----------------------------------------------------------------------
+
+    /// How many contributed views are cached, over all windows.
+    #[cfg(test)]
+    pub(crate) fn cached_view_count(&self) -> usize {
+        self.views.len()
+    }
 
     /// The view for one contribution in `window`, built on first use and kept until its
     /// module is disabled.

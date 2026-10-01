@@ -575,6 +575,34 @@ fn a_disabled_module_gets_no_events(cx: &mut TestAppContext) {
     assert_eq!(*log.borrow(), ["load:a", "event:a:scan:progress", "unload:a"]);
 }
 
+/// Each window gets its own views of a module's panels; closing a window drops its views (and
+/// their subscriptions) while the other window's stay cached.
+#[gpui_kit::test]
+fn closing_a_window_drops_its_module_views(cx: &mut TestAppContext) {
+    let dir = TempDir::new("windows");
+    let log = Log::default();
+    let b = bench(vec![probe(ModuleMeta::new("a", "A"), &log)], &[], &dir, cx);
+    b.enable("a", cx);
+    let open = |cx: &mut TestAppContext| -> gpui_kit::AnyWindowHandle {
+        cx.update(|cx| cx.open_window(Default::default(), |_, cx| cx.new(|_| Empty)).unwrap()).into()
+    };
+    let (first, second) = (open(cx), open(cx));
+    let views = |w: gpui_kit::AnyWindowHandle, cx: &mut TestAppContext| {
+        let registry = b.registry.clone();
+        cx.update_window(w, |_, window, cx| ModuleRegistry::panel_views(&registry, PanelSlot::Inspector, window, cx))
+            .unwrap()
+    };
+    let in_first = views(first, cx)[0].view.entity_id();
+    let in_second = views(second, cx)[0].view.entity_id();
+    assert_ne!(in_first, in_second, "one view per window");
+    assert_eq!(b.registry.read_with(cx, |r, _| r.cached_view_count()), 2);
+
+    cx.update_window(second, |_, window, _| window.remove_window()).unwrap();
+    cx.run_until_parked();
+    assert_eq!(b.registry.read_with(cx, |r, _| r.cached_view_count()), 1, "the closed window's view is gone");
+    assert_eq!(views(first, cx)[0].view.entity_id(), in_first, "the open window's view is still cached");
+}
+
 // --- the shell's slots, with the dev module -------------------------------------------------
 
 struct Shell {

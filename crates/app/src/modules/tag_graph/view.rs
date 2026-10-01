@@ -352,6 +352,8 @@ impl TagGraphView {
         Some(RasterJob { scene, view, size, region, scale, strips })
     }
 
+    /// (Re)read the selected tag's first photos: on a new selection, and after every applied
+    /// load — a catalog read can change a tag's photos while the same tag stays selected.
     fn load_top_photos(&mut self, cx: &mut Context<Self>) {
         self.top_generation += 1;
         let generation = self.top_generation;
@@ -362,10 +364,10 @@ impl TagGraphView {
                 return;
             }
         };
-        if self.top_photos.as_ref().is_some_and(|(t, _)| *t == tag) {
-            return;
+        // The same tag's photos stay up while they are re-read; another tag's go at once.
+        if self.top_photos.as_ref().is_some_and(|(t, _)| *t != tag) {
+            self.top_photos = None;
         }
-        self.top_photos = None;
         let app = self.app.clone();
         let read = cx.background_executor().spawn(async move {
             let query = PhotoQuery { tag_id: Some(tag), window: Some(PhotoWindow::new(0, 6)), ..Default::default() };

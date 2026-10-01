@@ -9,7 +9,7 @@ use crate::modules::ModuleRegistry;
 use crate::shell::state::Surface;
 use crate::shell::ShellState;
 use crate::{start_core, wire, WireOptions};
-use chairphoto_core::app::{AppState, CoreEvent, EventSink as _};
+use chairphoto_core::app::{with_catalog, AppState, CoreEvent, EventSink as _};
 use chairphoto_core::appearance::SystemThemeResult;
 use chairphoto_core::catalog::Catalog;
 use chairphoto_model::tag_graph::graph::{LibraryGraph, NodeId};
@@ -51,19 +51,28 @@ impl Render for Host {
 
 /// A window holding only the Tag graph view over `graph` (counting its loads).
 fn fixture(graph: LibraryGraph, cx: &mut TestAppContext) -> Fixture {
+    fixture_with(AppState::default(), move || Ok(graph.clone()), cx)
+}
+
+/// The same over `app` (its catalog, for the inspector's photo reads) and a graph source.
+fn fixture_with(
+    app: AppState,
+    graph: impl Fn() -> Result<LibraryGraph, String> + Send + Sync + 'static,
+    cx: &mut TestAppContext,
+) -> Fixture {
     cx.update(|cx| {
         gpui_kit::init(cx);
         crate::theme::apply_system_theme(&SystemThemeResult::unavailable(), cx);
         cx.bind_keys(crate::keymap::bindings());
     });
-    let model = cx.new(|_| AppModel::new(AppState::default(), None));
+    let model = cx.new(|_| AppModel::new(app, None));
     let shell = cx.new(|cx| ShellState::new(&model, cx));
     let loads = Arc::new(AtomicUsize::new(0));
     let source: GraphSource = {
         let loads = loads.clone();
         Arc::new(move || {
             loads.fetch_add(1, Ordering::SeqCst);
-            Ok(graph.clone())
+            graph()
         })
     };
     let (m, s) = (model.clone(), shell.clone());
@@ -458,6 +467,43 @@ impl Drop for TempDir {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
     }
+}
+
+/// A catalog read re-reads the inspector's top photos even when the same tag stays selected.
+#[gpui_kit::test]
+fn a_catalog_read_refreshes_the_selected_tags_photos(cx: &mut TestAppContext) {
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+    let dir = TempDir(std::env::temp_dir().join(format!("cp-tg-top-{}-{nanos}", std::process::id())));
+    std::fs::create_dir_all(&dir.0).unwrap();
+    let root = dir.0.join("photos");
+    let catalog = Catalog::open(&dir.0.join("t.chairphoto"), &root).unwrap();
+    let bird = catalog.create_tag("Animals/Bird").unwrap();
+    let dog = catalog.create_tag("Animals/Dog").unwrap();
+    let p: Vec<i64> = (0..3).map(|i| catalog.upsert_photo(&root.join(format!("p{i}.ARW")), None, 0, 1).unwrap().id).collect();
+    for &id in &p[..2] {
+        catalog.assign_tag(id, bird).unwrap();
+        catalog.assign_tag(id, dog).unwrap();
+    }
+    let app = AppState::default();
+    *app.catalog.lock().unwrap() = Some(catalog);
+    let source = super::catalog_source(app.clone());
+    let f = fixture_with(app.clone(), move || source(), cx);
+    f.click("tg-type-tags", cx);
+    f.view.update(cx, |v, cx| v.update_session(cx, |s| s.select(Some(NodeId::Tag(bird)))));
+    f.settle(cx);
+    let top = |cx: &mut TestAppContext| {
+        f.view.read_with(cx, |v, _| v.top_photos().cloned()).map(|(t, mut ids)| {
+            ids.sort();
+            (t, ids)
+        })
+    };
+    assert_eq!(top(cx), Some((bird, p[..2].to_vec())));
+
+    with_catalog(&app, |c| c.assign_tag(p[2], bird)).unwrap();
+    f.model.update(cx, |_, cx| cx.emit(crate::model::AppModelEvent::CatalogRead));
+    f.settle(cx);
+    assert_eq!(f.view.read_with(cx, |v, _| v.session().selected()), Some(NodeId::Tag(bird)), "still selected");
+    assert_eq!(top(cx), Some((bird, p.clone())), "the new photo shows");
 }
 
 /// The module in the real wiring: enabled from the registry, its rail item shows the view,

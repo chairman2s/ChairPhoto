@@ -13,5 +13,6 @@ pub mod js_compat;
 pub mod library;
 pub mod presets;
 pub mod shell_timing;
+pub mod tag_graph;
 pub mod tag_paste;
 pub mod theme;

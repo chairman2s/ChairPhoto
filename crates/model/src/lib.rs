@@ -5,6 +5,7 @@
 //! module from the React front end; its doc comment names the source and states where the
 //! port had to choose between JavaScript and Rust semantics ([`js_compat`] holds those rules).
 
+pub mod collage;
 pub mod compare_duel;
 pub mod darkroom;
 pub mod deep_link;
@@ -13,6 +14,7 @@ pub mod js_compat;
 pub mod library;
 pub mod presets;
 pub mod shell_timing;
+pub mod slideshow;
 pub mod statistics;
 pub mod tag_graph;
 pub mod tag_paste;

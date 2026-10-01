@@ -164,11 +164,68 @@ fn scan_done() -> CoreEvent {
 fn module_ids_are_settings_namespaces() {
     assert!(validate_id("faces").is_ok());
     assert!(validate_id("tag-graph").is_ok());
-    for bad in ["", "a.b", "a,b", "a b", "modules"] {
+    for bad in ["", "a.b", "a,b", "a b", "modules", "indexing", "sharpness", "editor", "develop", "basic-editor"] {
         assert!(validate_id(bad).is_err(), "{bad:?}");
+    }
+    for shared in super::registry::BACKEND_NAMESPACES {
+        assert!(validate_id(shared).is_ok(), "{shared} is its module's, shared with its backend");
     }
     for m in bundled() {
         assert_eq!(validate_id(&m.meta().id), Ok(()), "a bundled module's id");
+    }
+}
+
+/// Every `"<prefix>.<key>"` settings key the host uses — constants and literal keys passed to
+/// `get_setting`/`set_setting` in the core, the model, the Tauri shell and this crate — is in a
+/// reserved namespace or a module's backend namespace, so no module id can reach it.
+#[test]
+fn every_host_settings_prefix_is_reserved() {
+    use super::registry::{BACKEND_NAMESPACES, RESERVED_NAMESPACES};
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let mut files = Vec::new();
+    fn walk(dir: &std::path::Path, files: &mut Vec<PathBuf>) {
+        for entry in std::fs::read_dir(dir).unwrap().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if !path.ends_with("vendor") {
+                    walk(&path, files);
+                }
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                files.push(path);
+            }
+        }
+    }
+    for dir in ["crates/core/src", "crates/model/src", "crates/app/src", "src-tauri/src"] {
+        walk(&root.join(dir), &mut files);
+    }
+    // `const X_KEY: &str = "p.k"` / `X_SETTING` / `SETTING_X`, and `get_setting("p.k"`.
+    let mut prefixes = std::collections::BTreeSet::new();
+    for file in &files {
+        if file.ends_with("modules/tests.rs") {
+            continue;
+        }
+        let text = std::fs::read_to_string(file).unwrap();
+        for line in text.lines() {
+            let line = line.trim();
+            let named = line.starts_with("pub const ") || line.starts_with("const ");
+            let is_setting_const = named && (line.contains("KEY") || line.contains("SETTING")) && line.contains(": &str = \"");
+            let literal = ["get_setting(\"", "set_setting(\"", "get_setting(&format!(\""]
+                .iter()
+                .find_map(|pat| line.find(pat).map(|i| i + pat.len()));
+            let start = if is_setting_const { line.find(": &str = \"").map(|i| i + ": &str = \"".len()) } else { literal };
+            let Some(start) = start else { continue };
+            let key: String = line[start..].chars().take_while(|c| *c != '"').collect();
+            if let Some((prefix, _)) = key.split_once('.') {
+                prefixes.insert((prefix.to_string(), key.clone(), file.display().to_string()));
+            }
+        }
+    }
+    assert!(prefixes.iter().any(|(p, ..)| p == "indexing"), "the scan finds indexing.speed: {prefixes:?}");
+    for (prefix, key, file) in &prefixes {
+        assert!(
+            RESERVED_NAMESPACES.contains(&prefix.as_str()) || BACKEND_NAMESPACES.contains(&prefix.as_str()),
+            "{key} ({file}): namespace {prefix:?} is neither reserved nor a backend's"
+        );
     }
 }
 
@@ -182,6 +239,7 @@ fn invalid_and_duplicate_ids_are_not_registered(cx: &mut TestAppContext) {
             probe(ModuleMeta::new("a", "Second A"), &log),
             probe(ModuleMeta::new("x.y", "Dotted"), &log),
             probe(ModuleMeta::new("modules", "Host"), &log),
+            probe(ModuleMeta::new("indexing", "Indexing"), &log),
         ],
         &[],
         &dir,

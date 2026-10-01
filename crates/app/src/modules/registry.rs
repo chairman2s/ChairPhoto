@@ -40,9 +40,33 @@ use std::sync::{Arc, Mutex};
 /// The catalog setting holding the enabled set (host.ts `modules.enabled`).
 pub const ENABLED_KEY: &str = "modules.enabled";
 
+/// Settings namespaces the host owns: no module may take one of these as its id, or its
+/// `ModuleSettings` would read and write the host's keys. Every `<prefix>.` key the core, the
+/// model and the app use outside a module's own namespace is here (the source scan in
+/// `modules::tests` keeps this list complete):
+///
+/// - `modules` — `modules.enabled`;
+/// - `indexing` — `indexing.speed` (core `plugins/indexing.rs`);
+/// - `sharpness` — `sharpness.soft_threshold`, `sharpness.burst_soft_threshold`;
+/// - `editor` — external editors and RapidRaw (`editor.<key>.*`, `editor.rapidraw.*`),
+///   `editor.renderTiming.lastShell`;
+/// - `develop` — the Darkroom (`develop.decodeCacheGb`, `develop.preloadNeighbours`,
+///   `develop.wbSlider`);
+/// - `basic-editor` — the Darkroom's presets (`basic-editor.presets`; the Basic Editor
+///   folded into the Darkroom, #104);
+/// - `metrics` — `metrics.exportParity`;
+/// - `geocode` — the map backend's `geocode.endpoint` (the Map module's id is `map`).
+pub const RESERVED_NAMESPACES: &[&str] =
+    &["modules", "indexing", "sharpness", "editor", "develop", "basic-editor", "metrics", "geocode"];
+
+/// Namespaces a module shares with its own backend, deliberately, as in React: the module
+/// whose id this is reads and writes the keys its core backend reads (`ai.*` burst settings,
+/// `faces.*`, `smarttags.*`). Only that module may take the id.
+pub const BACKEND_NAMESPACES: &[&str] = &["ai", "faces", "smarttags"];
+
 /// Why `id` cannot be a module id, or `Ok`. Ids are settings namespaces (`<id>.<key>`) and
 /// entries in a comma-separated list: a `.` would let `a` + `b.c` and `a.b` + `c` name the
-/// same key, a `,` would split the list, and `modules` would own the host's `modules.enabled`.
+/// same key, a `,` would split the list, and a [`RESERVED_NAMESPACES`] id would own host keys.
 pub fn validate_id(id: &str) -> Result<(), String> {
     if id.is_empty() {
         return Err("a module id must not be empty".into());
@@ -50,8 +74,8 @@ pub fn validate_id(id: &str) -> Result<(), String> {
     if id.contains(['.', ',']) || id.chars().any(char::is_whitespace) {
         return Err(format!("module id {id:?} contains '.', ',' or whitespace"));
     }
-    if id == "modules" {
-        return Err("module id \"modules\" is the host's own settings namespace".into());
+    if RESERVED_NAMESPACES.contains(&id) {
+        return Err(format!("module id {id:?} is a settings namespace the host owns"));
     }
     Ok(())
 }

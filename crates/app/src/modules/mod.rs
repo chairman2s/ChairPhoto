@@ -86,7 +86,10 @@ pub trait ModuleInstance: 'static {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ModuleMeta {
     /// Stable id: the settings namespace (`<id>.<key>`) and the key in `modules.enabled`.
-    /// Non-empty, no `.` or `,`, and not `modules` (see [`registry::validate_id`]).
+    /// Non-empty, no `.` or `,`, and not a host-owned namespace
+    /// ([`registry::RESERVED_NAMESPACES`], checked by [`registry::validate_id`]). The `ai`,
+    /// `faces` and `smarttags` ids share their namespace with their own backend
+    /// ([`registry::BACKEND_NAMESPACES`]).
     pub id: SharedString,
     pub name: SharedString,
     pub description: SharedString,
@@ -277,7 +280,8 @@ impl ModuleHost {
 
 /// A module's settings: the catalog's key/value `settings` table, every key prefixed with
 /// `<module id>.` (`getSetting`/`setSetting` in host.ts), so a module cannot read or write
-/// another module's keys or the host's own (`modules.enabled`).
+/// another module's keys or the host's own ([`registry::RESERVED_NAMESPACES`]). A module whose
+/// id is one of [`registry::BACKEND_NAMESPACES`] shares the namespace with its own backend.
 ///
 /// **Blocking** (the catalog lock and SQLite): call [`get`](Self::get) and [`set`](Self::set)
 /// from a background task, e.g. `cx.background_executor().spawn(..)`, never in a render or

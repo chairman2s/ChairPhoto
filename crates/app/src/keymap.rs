@@ -22,6 +22,8 @@ pub mod contexts {
     pub const ROOT: &str = "ChairPhoto";
     /// The library grid (culling keys, selection).
     pub const LIBRARY: &str = "Library";
+    /// The "Stack bursts" dialog over the Library.
+    pub const STACK_DIALOG: &str = "StackProposals";
     /// The inline loupe over the grid, and the pop-out loupe window.
     pub const LOUPE: &str = "Loupe";
     /// Compare (duel/grid modes).
@@ -44,7 +46,8 @@ pub mod contexts {
 }
 
 /// Single-key shell shortcuts that must not fire while a menu or a text input has focus.
-/// Culling keys (Library view, #106) join this list when they are bound.
+/// The Library's culling keys need no entry: they bind in [`contexts::LIBRARY`], which no
+/// menu or input sits inside.
 const MUTED_IN_MENUS_AND_INPUTS: &[&str] = &["[", "]"];
 
 actions!(
@@ -75,5 +78,6 @@ pub fn bindings() -> Vec<KeyBinding> {
         bindings.push(KeyBinding::new(key, NoAction, Some(contexts::MENU)));
         bindings.push(KeyBinding::new(key, NoAction, Some(contexts::INPUT)));
     }
+    bindings.extend(crate::library::bindings());
     bindings
 }

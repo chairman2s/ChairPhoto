@@ -39,6 +39,7 @@ pub mod events;
 pub mod image_store;
 pub mod keymap;
 pub mod launch;
+pub mod library;
 pub mod model;
 pub mod shell;
 pub mod signals;
@@ -146,6 +147,8 @@ pub struct Wired {
     pub shell: Entity<shell::ShellState>,
     /// The main window, or why it could not open (the app has then been asked to quit).
     pub main_window: Result<AnyWindowHandle, String>,
+    /// The main window's root view (the shell and the Library grid), when it opened.
+    pub root: Option<Entity<view::RootView>>,
 }
 
 /// Steps 3–6, inside the GPUI application: fonts, components, theme, keymap, quit wiring,
@@ -191,6 +194,7 @@ pub fn wire(
         let (model, shell, images) = (model.clone(), shell.clone(), images.clone());
         move |window, cx| cx.new(|cx| view::RootView::new(model, shell, images, window, cx))
     });
+    let root = opened.as_ref().ok().map(|(_, root)| root.clone());
     let main_window = match opened {
         Ok((handle, _)) => {
             let main = handle.window_id();
@@ -208,7 +212,7 @@ pub fn wire(
             Err(e.to_string())
         }
     };
-    Wired { model, images, shell, main_window }
+    Wired { model, images, shell, main_window, root }
 }
 
 /// Become this app data dir's primary instance, serving second launches into `tx`; or hand

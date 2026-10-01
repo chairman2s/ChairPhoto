@@ -8,27 +8,29 @@
 //! └──────┴────────────────────┴─────────────────────────┴─────────────┘
 //! ```
 //!
-//! The stage is the slot the Library view (#106), the loupe (#109) and the Darkroom (#111)
-//! fill; until they land it shows which surface is active and the last core event (the
-//! event bridge's live proof). The side columns drag-resize from 140 to 640 px; at or below
-//! 1024 px window width they become overlays behind a scrim (`useNarrow.ts`).
+//! The stage is the slot the Library grid ([`LibraryView`]), the loupe (#109) and the
+//! Darkroom (#111) fill; a surface not ported yet says so. The side columns drag-resize from
+//! 140 to 640 px; at or below 1024 px window width they become overlays behind a scrim
+//! (`useNarrow.ts`). The "Stack bursts" dialog ([`StackDialog`]) opens over everything.
 //!
-//! The root owns focus and the [`contexts::ROOT`] key context: the app-wide bindings and every
-//! shell action (`shell::actions`) are handled here — ported ones by [`ShellState`], the rest by
-//! [`AppModel::not_yet_ported`].
+//! The root sets the [`contexts::ROOT`] key context: the app-wide bindings and every shell
+//! action (`shell::actions`) are handled here — ported ones by [`ShellState`], the rest by
+//! [`AppModel::not_yet_ported`]. The grid takes focus at startup; root keys still reach
+//! the root, an ancestor of the grid in the dispatch path.
 
 use crate::keymap::{contexts, ReloadTheme};
-use crate::image_store::{ImageState, ImageStore};
+use crate::image_store::ImageStore;
+use crate::library::grid::LibraryView;
+use crate::library::stacks::{Closed, StackDialog};
 use crate::model::AppModel;
-use chairphoto_core::image_pool::ImageKind;
 use crate::shell::actions::*;
 use crate::shell::state::{ShellState, Side, Surface, NARROW_MAX_W};
 use crate::shell::style::Colors;
 use gpui_kit::component::slider::SliderState;
 use gpui_kit::prelude::*;
 use gpui_kit::{
-    div, img, px, AnyElement, Context, CursorStyle, Entity, FocusHandle, MouseButton, MouseMoveEvent, ObjectFit,
-    Pixels, Subscription, TestSupportExt as _, Window,
+    div, px, AnyElement, Context, CursorStyle, Entity, FocusHandle, MouseButton, MouseMoveEvent, Pixels,
+    Subscription, TestSupportExt as _, Window,
 };
 
 /// A column-edge drag in progress: which column, where the pointer started, the width then.
@@ -45,13 +47,14 @@ pub struct RootView {
     pub(crate) images: Entity<ImageStore>,
     pub(crate) focus: FocusHandle,
     pub(crate) thumb_slider: Entity<SliderState>,
+    pub(crate) library: Entity<LibraryView>,
+    /// The "Stack bursts" dialog while it is open, and its close subscription.
+    pub(crate) stacks: Option<(Entity<StackDialog>, Subscription)>,
+    /// The catalog the dialog was opened on: a switch closes it.
+    catalog_epoch: u64,
     resize: Option<Resize>,
     _observers: [Subscription; 4],
 }
-
-/// One cell of the stage's thumbnail strip — the image layer's on-screen proof (#101) until
-/// the Library view (#106) replaces the stage.
-const STRIP_CELL: (f32, f32) = (132., 96.);
 
 impl RootView {
     /// The root owns focus from the start, so the app-wide bindings in [`contexts::ROOT`]
@@ -64,10 +67,22 @@ impl RootView {
         cx: &mut Context<Self>,
     ) -> Self {
         let focus = cx.focus_handle();
-        focus.focus(window, cx);
+        let library = cx.new(|cx| LibraryView::new(shell.clone(), images.clone(), cx));
+        // The grid has focus from the start: its keys work at once, and the root's bindings
+        // in [`contexts::ROOT`] still reach the root, the grid's ancestor.
+        library.read(cx).focus_handle().clone().focus(window, cx);
         let thumb_slider = crate::shell::command_pill::thumb_slider(&shell, window, cx);
+        let catalog_epoch = model.read(cx).catalog_epoch;
         let _observers = [
-            cx.observe(&model, |_, _, cx| cx.notify()),
+            cx.observe(&model, |this, model, cx| {
+                // A catalog switch closes the dialog: its groups name the old catalog's photos.
+                let epoch = model.read(cx).catalog_epoch;
+                if epoch != this.catalog_epoch {
+                    this.catalog_epoch = epoch;
+                    this.stacks = None;
+                }
+                cx.notify()
+            }),
             cx.observe(&shell, |_, _, cx| cx.notify()),
             cx.observe(&images, |_, _, cx| cx.notify()),
             // React re-read the back-up queue and the trash count on window focus
@@ -78,7 +93,7 @@ impl RootView {
                 }
             }),
         ];
-        Self { model, shell, images, focus, thumb_slider, resize: None, _observers }
+        Self { model, shell, images, focus, thumb_slider, library, stacks: None, catalog_epoch, resize: None, _observers }
     }
 
     pub fn focus_handle(&self) -> &FocusHandle {
@@ -136,75 +151,41 @@ impl RootView {
             )
     }
 
-    /// The first thumbnails of the open catalog through the [`ImageStore`]: requested in display
-    /// order (the pool is LIFO, so the batch keeps the first cell first), then read back —
-    /// cached, loading or failed.
-    fn strip_cells(&self, cx: &mut Context<Self>) -> Vec<(i64, ImageState)> {
-        let ids: Vec<i64> = self.model.read(cx).catalog.as_ref().map(|c| c.first_photos.clone()).unwrap_or_default();
-        self.images.update(cx, |store, _| {
-            let wanted: Vec<_> = ids.iter().map(|&id| (id, ImageKind::Thumb)).collect();
-            store.request_batch(&wanted);
-            ids.iter().map(|&id| (id, store.get(id, ImageKind::Thumb))).collect()
-        })
+    /// Open the "Stack bursts" dialog over the selection, else the whole view (App.tsx's
+    /// `openStackProposals`).
+    fn open_stack_proposals(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let targets = self.shell.read(cx).whole_view_targets();
+        if targets.is_empty() {
+            self.model.update(cx, |m, cx| m.set_status("No photos to group — scan or select some first.", cx));
+            return;
+        }
+        let (model, shell, images) = (self.model.clone(), self.shell.clone(), self.images.clone());
+        let dialog = cx.new(|cx| StackDialog::new(&model, shell, images, targets, window, cx));
+        let closed = cx.subscribe_in(&dialog, window, |this, _, _: &Closed, window, cx| {
+            this.stacks = None;
+            this.library.read(cx).focus_handle().clone().focus(window, cx);
+            cx.notify();
+        });
+        self.stacks = Some((dialog, closed));
+        cx.notify();
     }
 
-    fn render_strip(cells: Vec<(i64, ImageState)>, colors: Colors) -> AnyElement {
-        div()
-            .id("thumb-strip")
-            .flex()
-            .flex_row()
-            .flex_wrap()
-            .justify_center()
-            .gap_2()
-            .max_w(px(8. * (STRIP_CELL.0 + 8.)))
-            .children(cells.into_iter().map(|(id, state)| {
-                let cell = div()
-                    .id(("thumb", id as u64))
-                    .w(px(STRIP_CELL.0))
-                    .h(px(STRIP_CELL.1))
-                    .rounded_sm()
-                    .overflow_hidden()
-                    .bg(colors.panel);
-                match state {
-                    ImageState::Ready(loaded) => {
-                        cell.child(img(loaded.image).size_full().object_fit(ObjectFit::Contain)).into_any_element()
-                    }
-                    ImageState::Failed(_) => cell.border_1().border_color(colors.danger).into_any_element(),
-                    ImageState::Loading | ImageState::Absent => cell.border_1().border_color(colors.border).into_any_element(),
-                }
-            }))
-            .into_any_element()
-    }
-
-    fn render_stage(&self, shell: &ShellState, model: &AppModel, colors: Colors, strip: Vec<(i64, ImageState)>) -> AnyElement {
-        let surface = match &shell.surface {
-            Surface::Library => "The library grid comes with the Library view (#106).".to_string(),
-            Surface::Develop => "The Darkroom comes with #111.".to_string(),
-            Surface::Module(id) => format!("Module view {id}: Module registry (#104)."),
-        };
-        let last_event = model.last_event.clone().unwrap_or_else(|| "Waiting for core events…".into());
-        div()
-            .id("stage")
-            .relative()
-            .flex_1()
-            .min_h_0()
-            .flex()
-            .flex_col()
-            .justify_center()
-            .items_center()
-            .gap_2()
-            .p(px(12.))
-            .child(div().text_size(px(12.)).text_color(colors.dim).child(surface))
-            .when(shell.surface == Surface::Library && !strip.is_empty(), |d| d.child(Self::render_strip(strip, colors)))
-            .child(
-                div()
-                    .id("last-event")
-                    .text_size(px(11.))
-                    .text_color(colors.mute)
-                    .child(format!("{} core events · last: {last_event}", model.events_seen))
-                    .test_support(),
-            )
-            .into_any_element()
+    fn render_stage(&self, shell: &ShellState, colors: Colors) -> AnyElement {
+        let stage = div().id("stage").relative().flex_1().min_h_0().flex().flex_col();
+        match &shell.surface {
+            Surface::Library => stage.child(self.library.clone()).into_any_element(),
+            other => {
+                let text = match other {
+                    Surface::Module(id) => format!("Module view {id}: Module registry (#104)."),
+                    _ => "The Darkroom comes with #111.".to_string(),
+                };
+                stage
+                    .items_center()
+                    .justify_center()
+                    .child(div().text_size(px(12.)).text_color(colors.dim).child(text))
+                    .into_any_element()
+            }
+        }
     }
 }
 
@@ -212,7 +193,6 @@ impl Render for RootView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let narrow = window.viewport_size().width <= px(NARROW_MAX_W);
         self.shell.update(cx, |s, _| s.set_narrow(narrow));
-        let strip = self.strip_cells(cx);
         let colors = Colors::get(cx);
         let shell_entity = self.shell.clone();
         let model_entity = self.model.clone();
@@ -223,7 +203,7 @@ impl Render for RootView {
         let rail = self.render_rail(shell, colors, cx);
         let library = shell.surface == Surface::Library;
         let pill = library.then(|| self.render_command_pill(shell, colors, cx));
-        let stage = self.render_stage(shell, model, colors, strip);
+        let stage = self.render_stage(shell, colors);
         let bench = library.then(|| self.render_bench(shell, model, colors, cx));
         let (left_w, right_w) = (shell.layout.left_w, shell.layout.right_w);
         let show_left = !narrow && !shell.layout.left_hidden;
@@ -340,6 +320,8 @@ impl Render for RootView {
             }))
             .on_action(cx.listener(|this, _: &ShowLibrary, _, cx| this.shell.update(cx, |s, cx| s.show_library(cx))))
             .on_action(cx.listener(|this, _: &ClearSelection, _, cx| this.shell.update(cx, |s, cx| s.clear_selection(cx))))
+            .on_action(cx.listener(|this, _: &AnalyseBurst, _, cx| this.shell.update(cx, |s, cx| s.analyse_burst(cx))))
+            .on_action(cx.listener(|this, _: &ProposeStacks, window, cx| this.open_stack_proposals(window, cx)))
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| this.on_mouse_move(event, cx)))
             .on_mouse_up(MouseButton::Left, cx.listener(|this, _, _, _| this.resize = None))
             .size_full()
@@ -348,7 +330,8 @@ impl Render for RootView {
             .bg(colors.canvas)
             .text_color(colors.txt)
             .child(title_bar)
-            .child(body);
+            .child(body)
+            .children(self.stacks.as_ref().map(|(dialog, _)| dialog.clone()));
         let model = self.model.clone();
         on_not_yet_ported(root, move |what, ticket, _, cx| {
             model.update(cx, |m, cx| m.not_yet_ported(what, ticket, cx))

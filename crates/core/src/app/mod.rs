@@ -19,8 +19,10 @@ use std::sync::{Arc, Mutex, OnceLock};
 mod boot;
 pub mod catalogs;
 pub mod events;
+pub mod identity;
 pub mod jobs;
 pub mod scans;
+pub mod storage;
 
 pub use boot::{boot, boot_with, Boot};
 // `catalogs::switch_catalog` is deliberately not re-exported here: the Tauri shell re-exports

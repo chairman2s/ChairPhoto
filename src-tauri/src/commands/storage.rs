@@ -5,9 +5,11 @@
 //! "Nothing ever leaves home" is binding here — see `docs/storage-and-import.md`.
 
 use super::*;
-use std::sync::atomic::Ordering;
-use std::time::{Duration, Instant};
-use tauri::{AppHandle, State};
+use crate::app::storage;
+use crate::app::storage::EmptyTrashReport;
+#[cfg(test)]
+use crate::app::storage::{delete_one_photos_copies, destroy_planned_photos, DeleteOutcome};
+use tauri::State;
 
 /// The reconcile queue — storage ops deferred until the NAS is reachable.
 #[tauri::command(async)]
@@ -41,86 +43,16 @@ pub async fn enqueue_operations(
     with_catalog_blocking(&state, move |c| c.enqueue_operations(&kind, &photo_ids)).await
 }
 
-// --- shared async op runners (used by the per-photo commands AND the drain) ---
-// Each runs the E3 plan→IO→record split so the (possibly network) copy never holds
-// the catalog lock or blocks the UI thread.
+// --- the storage jobs (`app::storage`, shared with the GPUI app) ---
 
-async fn do_backup(state: &State<'_, AppState>, photo_id: i64, backup_id: i64) -> Result<(), String> {
-    // Idempotent: if a verified backup file already exists, do NOT re-copy it. Re-copying
-    // a good backup is pointless and — over a flaky mount — risks destroying it. A missing
-    // backup returns false here, so it's still (re-)created below.
-    //
-    // But returning here entirely is what made #80 unfixable for the photos it was about.
-    // Every backup made before companions existed has a verified image and no carried
-    // sidecars, so this branch is *exactly* the affected population — and skipping straight
-    // out meant pressing Back up on them did nothing at all. The image is left alone; the
-    // companions are reconciled, which is idempotent and copies nothing when they are
-    // already there.
-    if with_catalog(state, |c| c.has_verified_backup(photo_id))? {
-        let (source, dest, rel, volume_id) = with_catalog(state, |c| {
-            let p = c.plan_backup(photo_id, backup_id)?;
-            Ok((p.source, p.dest, p.rel, p.volume_id))
-        })?;
-        let carried = crate::app::spawn_blocking(move || {
-            crate::catalog::carry_companions(&source, &dest)
-        })
-        .await
-        .map_err(|e| e.to_string())?
-        .map_err(|e| e.to_string())?;
-        return with_catalog(state, |c| {
-            c.record_companions_at(
-                photo_id,
-                volume_id,
-                crate::catalog::LocationRole::Backup,
-                &carried.carried,
-            )?;
-            let _ = rel;
-            Ok(())
-        });
-    }
-    let (source, dest, rel, volume_id) = with_catalog(state, |c| {
-        let p = c.plan_backup(photo_id, backup_id)?;
-        Ok((p.source, p.dest, p.rel, p.volume_id))
-    })?;
-    // A copy is the image plus its declared companions, and `copy_with_companions` is the
-    // one place that knows it — so this path cannot carry a different set from the sync
-    // wrapper, or forget to carry at all. Missing that here is what #80 was.
-    let outcome = crate::app::spawn_blocking(move || {
-        crate::catalog::copy_with_companions(&source, &dest, None)
-    })
-    .await
-    .map_err(|e| e.to_string())?
-    .map_err(|e| e.to_string())?;
-    with_catalog(state, |c| {
-        c.record_copy(photo_id, volume_id, &rel, crate::catalog::LocationRole::Backup, &outcome)
-    })
+/// Run one of `app::storage`'s blocking jobs on the blocking pool.
+async fn run_storage<T: Send + 'static>(
+    state: &State<'_, AppState>,
+    job: impl FnOnce(&AppState) -> Result<T, String> + Send + 'static,
+) -> Result<T, String> {
+    let state = state.inner().clone();
+    crate::app::spawn_blocking(move || job(&state)).await.map_err(|e| e.to_string())?
 }
-
-async fn do_offload(state: &State<'_, AppState>, photo_id: i64) -> Result<(), String> {
-    let plan = with_catalog(state, |c| c.plan_offload(photo_id))?;
-    let volume_ids = plan.local_volume_ids.clone();
-    // Persist an id-keyed thumbnail from a local copy BEFORE it's deleted, so the photo
-    // stays visible in the grid once only the (possibly offline) NAS copy remains.
-    if let Some(local) = plan.local_files.first().cloned() {
-        let _ = crate::app::spawn_blocking(move || {
-            crate::thumbnails::ensure_persistent_thumb(photo_id, &local)
-        })
-        .await;
-    }
-    let backup_location_id = plan.backup_location_id;
-    let carried =
-        crate::app::spawn_blocking(move || crate::catalog::verify_and_delete_locals(&plan))
-            .await
-            .map_err(|e| e.to_string())?
-            .map_err(|e| e.to_string())?;
-    with_catalog(state, |c| {
-        // Before `commit_offload`: it drops the local location rows, and companion rows
-        // cascade with them.
-        c.record_companions(backup_location_id, &carried)?;
-        c.commit_offload(photo_id, &volume_ids)
-    })
-}
-
 // ── Trash (cluster B, B2) ────────────────────────────────────────────────────
 
 /// Move photos to the trash, taking each one's stack with it. Touches no bytes.
@@ -132,19 +64,15 @@ pub async fn trash_photos(
     with_catalog_blocking(&state, move |c| c.trash_photos(&photo_ids)).await
 }
 
-/// Bring photos back, along with whatever was trashed in the same act.
-///
-/// Trips the trash job generation first. An `empty_trash` worker can be part-way through
-/// the filesystem with a plan minutes old; restoring is the user saying "keep this", and
-/// the only safe way to resolve that race is for the delete to stand down. Tripping before
-/// the restore, not after, means the worker cannot slip a deletion in between.
+/// Bring photos back, along with whatever was trashed in the same act. Trips the trash job
+/// generation first, so an `empty_trash` already walking the filesystem stands down
+/// (`app::storage::restore_trashed`).
 #[tauri::command]
 pub async fn restore_photos(
     state: State<'_, AppState>,
     photo_ids: Vec<i64>,
 ) -> Result<usize, String> {
-    state.jobs.trash.trip()?;
-    with_catalog_blocking(&state, move |c| c.restore_photos(&photo_ids)).await
+    run_storage(&state, move |s| storage::restore_trashed(s, &photo_ids)).await
 }
 
 /// Everything in the trash, most recently trashed first.
@@ -153,54 +81,9 @@ pub async fn list_trash(state: State<'_, AppState>) -> Result<Vec<Photo>, String
     with_catalog_blocking(&state, |c| c.list_trash()).await
 }
 
-/// What emptying the trash did — and, as importantly, what it did not.
-#[derive(Debug, Clone, Default, serde::Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct EmptyTrashReport {
-    /// Photos destroyed: every expected file confirmed gone, then the catalog row.
-    pub deleted: usize,
-    /// Files removed — images and their declared companions.
-    pub files_deleted: usize,
-    /// Photos left alone because a volume holding a copy could not be reached. Deleting
-    /// them would have destroyed the copies we *can* see while leaving an unreferenced
-    /// survivor on a disconnected disk.
-    pub skipped_unreachable: Vec<i64>,
-    /// Photos whose deletion failed part-way, with the reason. Their catalog rows are
-    /// **kept**: a row pointing at a file we could not remove is recoverable, whereas a
-    /// file with no row is an orphan nothing in the app can ever find again.
-    pub failed: Vec<(i64, String)>,
-    /// Photos restored while this was running. Restore wins that race by design.
-    pub restored_meanwhile: Vec<i64>,
-    /// The run stopped early because it stopped being the owner — a catalog switch, or a
-    /// restore. Whatever is reported here happened; the rest did not.
-    pub aborted: bool,
-}
-
-/// What became of one photo's copies.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum DeleteOutcome {
-    /// Every expected file is confirmed absent. Safe to forget the row.
-    Destroyed,
-    /// A volume holding a copy could not be reached; nothing was touched.
-    Unreachable,
-    /// Something survived. The message names the first path still present.
-    Failed(String),
-}
-
-/// Destroy trashed photos: the only path in the app that deletes an original.
-///
-/// Two gates, both deliberate:
-///
-/// - **`confirm` must be true.** The backend fails closed rather than trusting that a
-///   caller meant it; this is the one verb with no undo.
-/// - **Every known copy must be reachable.** Not just home — deleting the copies we can
-///   see while a disconnected disk still holds one would leave an unreferenced survivor
-///   and a deleted catalog row, which is worse than refusing. This is what replaces
-///   "only on the master": a device that cannot reach a copy cannot destroy it, which is
-///   a stronger guarantee than a role flag and needs nothing to be true about identity.
-///
-/// Companions go with the image (cluster B, D2). Leaving them behind would strand sidecars
-/// at home — the mirror of #80, on the one path where nothing can be recovered afterwards.
+/// Destroy trashed photos: the only path in the app that deletes an original. Gated twice —
+/// `confirm` must be true, and every known copy must be reachable; the body and its
+/// reasoning are `app::storage::empty_trash`.
 #[tauri::command]
 pub async fn empty_trash(
     state: State<'_, AppState>,
@@ -208,191 +91,8 @@ pub async fn empty_trash(
     older_than_days: Option<i64>,
     confirm: bool,
 ) -> Result<EmptyTrashReport, String> {
-    if !confirm {
-        return Err("emptying the trash needs an explicit confirmation".into());
-    }
-    // Own this run through the job protocol before touching anything. A catalog switch
-    // trips every family, so an in-flight delete stops being an owner the moment the
-    // catalog under it is replaced — which is what stops one catalog's photo ids being
-    // applied to another's rows. `restore_photos` trips it too, so a user pulling a photo
-    // back out of the trash wins that race.
-    let abort = state.jobs.trash.install_fresh()?;
-    let catalog = state.catalog.clone();
-    let health = state.volume_health.clone();
-    crate::app::spawn_blocking(move || {
-        // 1. Under the lock: which photos, and where every copy of each one lives.
-        let (candidates, plans, pairs) = {
-            let guard = catalog.lock().map_err(|e| e.to_string())?;
-            let c = guard.as_ref().ok_or("No catalog is open")?;
-            let candidates: Vec<i64> = match (photo_ids, older_than_days) {
-                (Some(ids), _) => ids,
-                (None, Some(days)) => {
-                    let cutoff = now_secs() - days.max(0) * 86_400;
-                    c.trashed_before(cutoff).map_err(|e| e.to_string())?
-                }
-                (None, None) => c.trashed_before(i64::MAX).map_err(|e| e.to_string())?,
-            };
-            let mut plans = Vec::new();
-            for &id in &candidates {
-                // Only ever destroys something already in the trash: emptying the trash
-                // must not be a way to delete a photo that was never put there.
-                if !c.is_trashed(id).map_err(|e| e.to_string())? {
-                    continue;
-                }
-                plans.push((id, c.photo_path_candidates(id).map_err(|e| e.to_string())?));
-            }
-            let pairs = c.volume_base_paths().map_err(|e| e.to_string())?;
-            (candidates.len(), plans, pairs)
-        };
-        let _ = candidates;
-
-        // 2. Off the lock: reachability, then the deletes themselves. Both can block on a
-        //    slow mount and neither may hold the catalog.
-        let reachable = health.refresh(&pairs);
-        let (mut report, destroyed) = destroy_planned_photos(
-            &plans,
-            &reachable,
-            &abort,
-            &mut |id| {
-                let guard = catalog.lock().map_err(|e| e.to_string())?;
-                let c = guard.as_ref().ok_or("No catalog is open")?;
-                c.is_trashed(id).map_err(|e| e.to_string())
-            },
-        )?;
-
-        // 3. Back under the lock: forget only the rows whose files are confirmed gone. A
-        //    photo that failed keeps its row, so the trash can still find it and the user
-        //    can retry — the alternative is a file on disk that nothing points at.
-        let guard = catalog.lock().map_err(|e| e.to_string())?;
-        let c = guard.as_ref().ok_or("No catalog is open")?;
-        for id in destroyed {
-            // Ownership is re-checked here too, not just before the IO: the rows belong to
-            // whichever catalog is installed *now*, and applying an old catalog's ids to a
-            // new one is the failure this whole protocol exists to prevent. The files are
-            // already gone; a rescan reconciles the rows, which is recoverable.
-            if abort.load(Ordering::Relaxed) {
-                report.aborted = true;
-                break;
-            }
-            c.remove_photo(id).map_err(|e| e.to_string())?;
-            report.deleted += 1;
-        }
-        Ok(report)
-    })
-    .await
-    .map_err(|e| e.to_string())?
+    run_storage(&state, move |s| storage::empty_trash(s, photo_ids, older_than_days, confirm)).await
 }
-
-/// Delete every copy of each photo, or none of them.
-///
-/// Split out of the command because this is where the destructive decision is made, and a
-/// decision reachable only through a Tauri `State` is a decision nobody can test. Pure file
-/// IO — no catalog lock — so it runs on the blocking worker like the rest of the lifecycle.
-///
-/// Returns the report and the ids whose files are now gone, for the caller to forget.
-/// Walk the planned photos, destroying each one's copies — the part of emptying the trash
-/// where ownership actually matters.
-///
-/// Split out because the two interleavings that make this dangerous are otherwise
-/// reachable only through a Tauri `State`, and a race nobody can test is a race nobody has
-/// checked. `still_trashed` is a callback so a test can make a photo come back mid-run the
-/// way Restore does.
-///
-/// Stops at the first sign it is no longer the owner. `abort` is tripped by a catalog
-/// switch (so an old worker cannot apply one catalog's ids to another's rows) and by
-/// Restore (so pulling a photo out of the trash beats a delete already in flight).
-pub(crate) fn destroy_planned_photos(
-    plans: &[(i64, Vec<crate::catalog::PathCandidate>)],
-    reachable: &std::collections::HashMap<i64, bool>,
-    abort: &std::sync::atomic::AtomicBool,
-    still_trashed: &mut dyn FnMut(i64) -> Result<bool, String>,
-) -> Result<(EmptyTrashReport, Vec<i64>), String> {
-    let mut report = EmptyTrashReport::default();
-    let mut destroyed: Vec<i64> = Vec::new();
-    for (id, locations) in plans {
-        if abort.load(Ordering::Relaxed) {
-            report.aborted = true;
-            break;
-        }
-        // Re-read trash membership immediately before deleting *this* photo, not once for
-        // the batch at plan time: the plan can be minutes old over a slow mount, and
-        // Restore clears `trashed_at` underneath it.
-        if !still_trashed(*id)? {
-            report.restored_meanwhile.push(*id);
-            continue;
-        }
-        let (outcome, files) = delete_one_photos_copies(locations, reachable);
-        report.files_deleted += files;
-        match outcome {
-            DeleteOutcome::Destroyed => destroyed.push(*id),
-            DeleteOutcome::Unreachable => report.skipped_unreachable.push(*id),
-            DeleteOutcome::Failed(why) => report.failed.push((*id, why)),
-        }
-    }
-    Ok((report, destroyed))
-}
-
-pub(crate) fn delete_one_photos_copies(
-    locations: &[crate::catalog::PathCandidate],
-    reachable: &std::collections::HashMap<i64, bool>,
-) -> (DeleteOutcome, usize) {
-    // Every known copy, not just the one at home: deleting what we can see while a
-    // disconnected disk still holds one would leave an unreferenced survivor.
-    let all_reachable = locations.iter().all(|cand| {
-        cand.volume_id
-            .map(|v| reachable.get(&v).copied().unwrap_or(false))
-            .unwrap_or(true)
-    });
-    if !all_reachable {
-        return (DeleteOutcome::Unreachable, 0);
-    }
-
-    let mut files_deleted = 0usize;
-    // Collect what we are responsible for *before* deleting, so the survivor check below
-    // is against the full expected set rather than against whatever we happened to reach.
-    let mut expected: Vec<std::path::PathBuf> = Vec::new();
-    for cand in locations {
-        for found in crate::companions::carried_beside(&cand.path) {
-            expected.push(found.path.clone());
-        }
-        if cand.path.exists() {
-            expected.push(cand.path.clone());
-        }
-    }
-
-    for cand in locations {
-        // Companions first: if a delete fails part-way, the image is still there to say
-        // what the leftovers belonged to.
-        for found in crate::companions::carried_beside(&cand.path) {
-            if std::fs::remove_file(&found.path).is_ok() {
-                files_deleted += 1;
-            }
-        }
-        if cand.path.exists() && std::fs::remove_file(&cand.path).is_ok() {
-            files_deleted += 1;
-        }
-    }
-
-    // Success is *confirmed absence*, not "no error was returned". A permission error, a
-    // read-only mount, or a volume that dropped after the reachability probe all leave the
-    // file there — and reporting that photo deleted is how a catalog row disappears while
-    // its original survives with nothing pointing at it.
-    if let Some(survivor) = expected.iter().find(|p| p.exists()) {
-        return (
-            DeleteOutcome::Failed(format!("{} could not be removed", survivor.display())),
-            files_deleted,
-        );
-    }
-    (DeleteOutcome::Destroyed, files_deleted)
-}
-
-fn now_secs() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
-}
-
 /// Library-wide safety counts for the at-risk panel (cluster B, B1).
 ///
 /// Pure SQL — deliberately never stats a volume, so an unmounted NAS cannot make this hang
@@ -415,64 +115,25 @@ pub async fn photo_safety_status(
     with_catalog_blocking(&state, move |c| c.photo_safety_status(photo_id)).await
 }
 
-/// Setting key for the age-based offload policy ("keep last N days on local disk").
-/// Empty / "0" = disabled (no automatic offload).
-const OFFLOAD_AGE_SETTING: &str = "offload_age_days";
-
-/// Apply the "keep last N days local" policy: offload every photo older than the
-/// configured age that has a verified NAS backup, freeing local space while keeping it
-/// visible (via the persistent thumbnail). No-op when the policy is unset or the NAS is
-/// unreachable. Returns how many photos were offloaded.
+/// Apply the "keep last N days local" policy (`app::storage::apply_offload_policy`): offload
+/// every photo older than the configured age that has a verified NAS backup. No-op when the
+/// policy is unset or the NAS is unreachable. Returns how many photos were offloaded.
 #[tauri::command]
 pub async fn apply_offload_policy(state: State<'_, AppState>) -> Result<usize, String> {
-    let age: i64 = with_catalog(&state, |c| c.get_setting(OFFLOAD_AGE_SETTING))?
-        .and_then(|v| v.trim().parse().ok())
-        .unwrap_or(0);
-    if age <= 0 {
-        return Ok(0); // policy disabled
-    }
-    let candidates = with_catalog(&state, |c| c.photos_eligible_for_offload(age))?;
-    let mut offloaded = 0usize;
-    for id in candidates {
-        if do_offload(&state, id).await.is_ok() {
-            offloaded += 1;
-        }
-    }
-    Ok(offloaded)
-}
-
-async fn do_restore(state: &State<'_, AppState>, photo_id: i64, local_id: i64) -> Result<(), String> {
-    let (source, dest, rel, volume_id, expected_hash) = with_catalog(state, |c| {
-        let p = c.plan_restore(photo_id, local_id)?;
-        Ok((p.source, p.dest, p.rel, p.volume_id, p.expected_hash))
-    })?;
-    // Companions come back with the image: a restored photo must arrive with the edit state
-    // an offload moved home, not as bare pixels. This path had drifted from the sync
-    // wrapper and did exactly that until the shared seam made it impossible.
-    let outcome = crate::app::spawn_blocking(move || {
-        crate::catalog::copy_with_companions(&source, &dest, expected_hash.as_deref())
-    })
-    .await
-    .map_err(|e| e.to_string())?
-    .map_err(|e| e.to_string())?;
-    with_catalog(state, |c| {
-        c.record_copy(photo_id, volume_id, &rel, crate::catalog::LocationRole::LocalCache, &outcome)
-    })
+    run_storage(&state, storage::apply_offload_policy).await
 }
 
 /// Back up a photo to the single backup volume. If the NAS is offline this errors;
 /// the UI queues a backup op instead (drained on reconcile).
 #[tauri::command]
 pub async fn backup_photo(state: State<'_, AppState>, photo_id: i64) -> Result<(), String> {
-    let backup_id =
-        with_catalog(&state, |c| single_volume_of_kind(c, crate::catalog::VolumeKind::Backup, "backup"))?;
-    do_backup(&state, photo_id, backup_id).await
+    run_storage(&state, move |s| storage::backup_photo(s, photo_id)).await
 }
 
 /// Free a photo's local copies (only after re-verifying its backup). Off the UI thread.
 #[tauri::command]
 pub async fn offload_photo(state: State<'_, AppState>, photo_id: i64) -> Result<(), String> {
-    do_offload(&state, photo_id).await
+    run_storage(&state, move |s| storage::offload_photo(s, photo_id)).await
 }
 
 /// Forget a photo whose original is gone: delete its catalog row (and all dependent
@@ -568,113 +229,28 @@ pub async fn summarize_pending_identity(
 }
 
 // ── The identity repair job (#34) ────────────────────────────────────────────
+//
+// The bodies are the core's `app::identity` (the GPUI identity-debt panel runs the same).
 
-/// How often the pass emits `identity:repair_progress`.
-///
-/// Time-based, not every-Nth-row: rows differ by four orders of magnitude in cost (a local
-/// sidecar already carrying its identity versus a file on an unmounted NAS at its timeout),
-/// so any row count is either tens of thousands of events on a fast local queue or a frozen
-/// bar on a slow remote one. The final row always emits regardless.
-const REPAIR_PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
-
-/// Claim ownership of the identity repair pass: snapshot the catalog, allocate the job id,
-/// trip the previous pass, install this one's abort flag and claim the status slot as ONE
-/// transition, holding catalog → abort → slot throughout.
-///
-/// The transition itself is [`crate::app::jobs::JobFamily::begin`], shared with both
-/// face-job families and Smart Tagging and fenced by the same locks as the two
-/// `switch_catalog` phases; read that function for why each lock is held across the whole
-/// claim. This wrapper only supplies the initial status snapshot — `total` is not known
-/// until the worker has counted the queue, and claiming with `0` anyway is what lets a
-/// status query between "command returned" and "first progress event" already see the pass
-/// running.
-///
-/// Named rather than inlined so the interleaving tests below can drive the start exactly as
-/// the command does; they have no Tauri `AppHandle`.
-fn begin_identity_repair_job(
-    state: &AppState,
-) -> Result<JobClaim<IdentityRepairJobStatus>, String> {
-    state
-        .jobs
-        .identity
-        .begin(&state.catalog, |job| IdentityRepairJobStatus { job, done: 0, total: 0 })
-}
+/// The claim, by its old path: the ownership tests below drive the start exactly as the
+/// command does.
+#[cfg(test)]
+use crate::app::identity::begin_identity_repair_job;
 
 /// Start a pass over the queued sidecar identity repairs, clearing the copies that now
 /// succeed. Returns the new pass's **job id**; the result arrives as `identity:repair_done`.
 ///
 /// Copies whose file is unreachable stay queued; so do sidecars that still can't be written
-/// or that carry a conflicting photo identity — those need a human (#33), and the queue
-/// remembers them.
-///
-/// The work runs on a secondary connection on a blocking worker, so the sidecar parsing and
-/// writing — a network round trip per copy on a NAS, over a queue that reached 74,488 rows
-/// on the 100k harness shape in #20 — never holds the app's catalog lock. That part was
-/// always right and is unchanged; what #34 added is the ownership around it:
-///
-/// * a job id, on every `identity:repair_progress` and the `identity:repair_done` event;
-/// * an abort flag the pass polls before each row, tripped by `identity_repair_cancel`;
-/// * a status slot, so the debt panel can re-attach after a remount, cleared before the
-///   terminal event and only while this pass still owns it;
-/// * and a catalog switch that trips it, so a pass cannot outlive the catalog it was
-///   started against — the AGENTS.md invariant this command was the last one to violate.
-///
-/// Starting a second pass supersedes the first rather than running both at the queue.
+/// or that carry a conflicting photo identity — those need a human (#33). The claim
+/// (`app::identity::claim_identity_repair`) snapshots the catalog, trips any previous pass
+/// and claims the status slot as one transition; the pass itself runs on a blocking worker
+/// on a secondary connection. A newer pass, `identity_repair_cancel` or a catalog switch
+/// stops it; its events carry the job id.
 #[tauri::command]
-pub async fn repair_pending_identity(
-    app: AppHandle,
-    state: State<'_, AppState>,
-) -> Result<u64, String> {
-    // Snapshot the catalog, allocate the job id, trip the previous pass, install this
-    // pass's abort flag and claim the status slot as ONE transition. Nothing fallible
-    // precedes it, so it cannot leave a previous pass aborted with no successor.
-    let JobClaim { db_path, root, abort, job, slot } = begin_identity_repair_job(state.inner())?;
-
-    crate::app::spawn_blocking(move || {
-        // Release the status slot — but only if a newer pass hasn't already claimed it.
-        // Always BEFORE the terminal event: see `JobSlot::clear`.
-        let finish = |summary: crate::catalog::IdentityRepairSummary, error: Option<String>| {
-            slot.clear();
-            let _ = app.send(CoreEvent::IdentityRepairDone(IdentityRepairDone { ok: error.is_none(), job, summary, error }));
-        };
-
-        // Secondary connection — never contends with the primary's UI reads.
-        let catalog = match Catalog::open_secondary(&db_path, &root) {
-            Ok(c) => c,
-            Err(e) => {
-                finish(
-                    Default::default(),
-                    Some(format!("couldn't open catalog connection: {e}")),
-                );
-                return;
-            }
-        };
-
-        let emit_app = app.clone();
-        let progress_slot = slot.clone();
-        let mut last_emit: Option<Instant> = None;
-        let result = catalog.run_identity_repair(&abort, |s| {
-            // Throttled, but never at the cost of the last update: a pass that ends inside
-            // the interval must still leave the panel showing the count it finished on.
-            let due = last_emit.is_none_or(|t| t.elapsed() >= REPAIR_PROGRESS_INTERVAL);
-            if !due && s.done() < s.total {
-                return;
-            }
-            last_emit = Some(Instant::now());
-            let (done, total) = (s.done(), s.total);
-            let _ = emit_app.send(CoreEvent::IdentityRepairProgress(IdentityRepairProgress { done, total, job }));
-            // A superseded pass reaches here routinely — a newer start trips its flag, but
-            // the row it is already on finishes first. `JobSlot::publish` is the shared
-            // guard that stops it overwriting the newer pass's slot.
-            progress_slot.publish(|job| IdentityRepairJobStatus { job, done, total });
-        });
-
-        match result {
-            Ok(summary) => finish(summary, None),
-            Err(e) => finish(Default::default(), Some(e.to_string())),
-        }
-    });
-
+pub async fn repair_pending_identity(state: State<'_, AppState>) -> Result<u64, String> {
+    let pass = crate::app::identity::claim_identity_repair(state.inner())?;
+    let job = pass.job;
+    crate::app::spawn_blocking(move || pass.run());
     Ok(job)
 }
 
@@ -683,7 +259,7 @@ pub async fn repair_pending_identity(
 /// rest of the queue's. No-op when nothing is running.
 #[tauri::command]
 pub async fn identity_repair_cancel(state: State<'_, AppState>) -> Result<(), String> {
-    state.jobs.identity.cancel()
+    crate::app::identity::cancel_identity_repair(state.inner())
 }
 
 /// The live status of the running identity repair pass, or `None` when idle — so the debt
@@ -692,21 +268,14 @@ pub async fn identity_repair_cancel(state: State<'_, AppState>) -> Result<(), St
 pub async fn identity_repair_status(
     state: State<'_, AppState>,
 ) -> Result<Option<IdentityRepairJobStatus>, String> {
-    state.jobs.identity.status()
+    crate::app::identity::identity_repair_status(state.inner())
 }
 
 /// Resolve one conflicted copy the way the user decided (#33): `adopt` the identifier the
 /// file already carries, `overwrite` the file with the catalog's, `dismiss` the copy, or
 /// `restore` a dismissed one. There is no default — the action is required, and an
 /// unrecognised one fails to deserialize rather than falling back to the destructive path.
-///
-/// Runs on a secondary connection on a blocking worker, exactly like
-/// `repair_pending_identity`: `adopt` reads the sidecar and `overwrite` rewrites it, and
-/// neither may hold the app's catalog lock across a (possibly network) sidecar IO.
-///
-/// Refusals come back as plain messages naming what was refused — most importantly
-/// "another photo already holds that identity", which is checked before the write rather
-/// than left to surface as a UNIQUE-constraint error.
+/// Runs on a blocking worker on a secondary connection (`app::identity`).
 #[tauri::command]
 pub async fn resolve_identity_conflict(
     state: State<'_, AppState>,
@@ -715,18 +284,13 @@ pub async fn resolve_identity_conflict(
     relative_path: String,
     action: crate::catalog::IdentityConflictAction,
 ) -> Result<crate::catalog::IdentityConflictOutcome, String> {
-    let (db_path, root) =
-        with_catalog(&state, |c| Ok((c.db_path().to_path_buf(), c.root().to_path_buf())))?;
+    let state = state.inner().clone();
     crate::app::spawn_blocking(move || {
-        let catalog = Catalog::open_secondary(&db_path, &root).map_err(|e| e.to_string())?;
-        catalog
-            .resolve_identity_conflict(photo_id, volume_id, &relative_path, action)
-            .map_err(|e| e.to_string())
+        crate::app::identity::resolve_identity_conflict(&state, photo_id, volume_id, &relative_path, action)
     })
     .await
     .map_err(|e| e.to_string())?
 }
-
 async fn record_identity_on_catalog(
     db_path: PathBuf,
     root: PathBuf,
@@ -1107,92 +671,16 @@ pub async fn purge_empty_photos(
 /// Restore a photo's backup copy to the single local volume, hash-verified.
 #[tauri::command]
 pub async fn restore_photo(state: State<'_, AppState>, photo_id: i64) -> Result<(), String> {
-    let local_id =
-        with_catalog(&state, |c| single_volume_of_kind(c, crate::catalog::VolumeKind::Local, "local"))?;
-    do_restore(&state, photo_id, local_id).await
+    run_storage(&state, move |s| storage::restore_photo(s, photo_id)).await
 }
 
-/// Drain the reconcile queue (E4): run each pending op via the E3 lifecycle when a
-/// backup volume is reachable, off the UI thread. Clears each op on success, marks it
-/// failed (kept) otherwise. With no reachable backup it does nothing (skippedOffline).
+/// Drain the reconcile queue (E4): run each pending op via the E3 lifecycle when a backup
+/// volume is reachable, off the UI thread (`app::storage::reconcile_now`). Clears each op on
+/// success, marks it failed (kept) otherwise. With no reachable backup it does nothing
+/// (skippedOffline).
 #[tauri::command]
-pub async fn reconcile_now(
-    state: State<'_, AppState>,
-) -> Result<crate::catalog::DrainSummary, String> {
-    use crate::catalog::{DrainSummary, VolumeKind};
-    // Pure SQL under the lock; the reachability stat happens off-lock below so a hung
-    // NAS mount can't stall every other catalog user for its duration.
-    let (vols, pending) = with_catalog(&state, |c| Ok((c.volume_rows()?, c.list_pending_operations()?)))?;
-    // Reconcile decides whether to run at all based on the backup volume being reachable —
-    // it wants live truth, so drop any cached state and stat fresh (on a blocking worker).
-    state.volume_health.invalidate();
-    let pairs: Vec<(i64, String)> = vols.iter().map(|v| (v.id, v.base_path.clone())).collect();
-    let health = state.volume_health.clone();
-    let reachable = crate::app::spawn_blocking(move || health.refresh(&pairs))
-        .await
-        .map_err(|e| e.to_string())?;
-    let backup_id = vols
-        .iter()
-        .find(|v| v.kind == VolumeKind::Backup && reachable.get(&v.id).copied().unwrap_or(false))
-        .map(|v| v.id);
-    let local_id = vols.iter().find(|v| v.kind == VolumeKind::Local).map(|v| v.id);
-
-    let mut summary = DrainSummary::default();
-    let backup_id = match backup_id {
-        Some(id) => id,
-        None => {
-            summary.skipped_offline = true;
-            return Ok(summary);
-        }
-    };
-    for op in pending {
-        let result = match op.kind.as_str() {
-            "backup" => do_backup(&state, op.photo_id, backup_id).await,
-            "offload" => do_offload(&state, op.photo_id).await,
-            "restore" => match local_id {
-                Some(l) => do_restore(&state, op.photo_id, l).await,
-                None => Err("no local volume".into()),
-            },
-            other => Err(format!("unknown operation: {other}")),
-        };
-        match result {
-            Ok(()) => {
-                with_catalog(&state, |c| c.remove_operation(op.id))?;
-                summary.ran += 1;
-            }
-            Err(e) => {
-                with_catalog(&state, |c| c.set_operation_failed(op.id, &e))?;
-                summary.failed += 1;
-            }
-        }
-    }
-    // Reconciliation moves files between volumes (backup/offload/restore), so the cached
-    // reachability could be stale — drop it.
-    state.volume_health.invalidate();
-    Ok(summary)
-}
-
-/// The id of the single volume of a kind, or an error if there are zero or many.
-fn single_volume_of_kind(
-    c: &Catalog,
-    kind: crate::catalog::VolumeKind,
-    label: &str,
-) -> crate::catalog::Result<i64> {
-    let ids: Vec<i64> = c
-        .list_volumes()?
-        .into_iter()
-        .filter(|v| v.kind == kind)
-        .map(|v| v.id)
-        .collect();
-    match ids.as_slice() {
-        [one] => Ok(*one),
-        [] => Err(crate::catalog::CatalogError::Validation(format!(
-            "no {label} volume configured"
-        ))),
-        _ => Err(crate::catalog::CatalogError::Validation(format!(
-            "multiple {label} volumes — choosing one isn't supported yet"
-        ))),
-    }
+pub async fn reconcile_now(state: State<'_, AppState>) -> Result<crate::catalog::DrainSummary, String> {
+    run_storage(&state, storage::reconcile_now).await
 }
 
 /// List storage volumes, each flagged with whether it's currently reachable.

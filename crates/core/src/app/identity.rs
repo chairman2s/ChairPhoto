@@ -123,7 +123,39 @@ pub fn resolve_identity_conflict(
         let c = guard.as_ref().ok_or("No catalog is open")?;
         (c.db_path().to_path_buf(), c.root().to_path_buf())
     };
-    let catalog = Catalog::open_secondary(&db_path, &root).map_err(|e| e.to_string())?;
+    resolve_in(&db_path, &root, photo_id, volume_id, relative_path, action)
+}
+
+/// [`resolve_identity_conflict`] of a copy read from the catalog `expected` names — what a
+/// front end calls with the identity its debt rows were read with. Photo and volume ids and
+/// relative paths are per catalog: once another catalog opening is open it fails closed with
+/// [`CATALOG_CHANGED`](super::CATALOG_CHANGED) and touches nothing. The check and the capture
+/// of the catalog's file run under one catalog lock, and the resolution then runs on a
+/// secondary connection to *that* file, so the rows it changes and the sidecar it reads or
+/// writes (resolved from that catalog's volumes) are the ones the user was shown, even if a
+/// switch lands while it runs.
+pub fn resolve_identity_conflict_as(
+    state: &AppState,
+    expected: super::CatalogIdentity,
+    photo_id: i64,
+    volume_id: i64,
+    relative_path: &str,
+    action: crate::catalog::IdentityConflictAction,
+) -> Result<crate::catalog::IdentityConflictOutcome, String> {
+    let (db_path, root) =
+        super::with_catalog_as(state, expected, |c| Ok((c.db_path().to_path_buf(), c.root().to_path_buf())))?;
+    resolve_in(&db_path, &root, photo_id, volume_id, relative_path, action)
+}
+
+fn resolve_in(
+    db_path: &std::path::Path,
+    root: &std::path::Path,
+    photo_id: i64,
+    volume_id: i64,
+    relative_path: &str,
+    action: crate::catalog::IdentityConflictAction,
+) -> Result<crate::catalog::IdentityConflictOutcome, String> {
+    let catalog = Catalog::open_secondary(db_path, root).map_err(|e| e.to_string())?;
     catalog
         .resolve_identity_conflict(photo_id, volume_id, relative_path, action)
         .map_err(|e| e.to_string())

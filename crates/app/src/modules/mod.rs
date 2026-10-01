@@ -45,6 +45,8 @@ pub mod statistics;
 pub mod dev_module;
 #[cfg(feature = "map")]
 pub mod map;
+#[cfg(feature = "tag-graph")]
+pub mod tag_graph;
 
 #[cfg(test)]
 mod tests;
@@ -249,7 +251,8 @@ pub struct Contributions {
 }
 
 /// What the registry hands a module when it loads: its settings, and the app entities that
-/// hold what `ChairPhotoAPI` used to expose (selection, active photo, Library scope, status).
+/// hold what `ChairPhotoAPI` used to expose (selection, active photo, Library scope, status),
+/// and the image layer for thumbnails (`thumb://` in the React app).
 #[derive(Clone)]
 pub struct ModuleHost {
     meta: ModuleMeta,
@@ -339,6 +342,8 @@ pub fn bundled() -> Vec<Rc<dyn Module>> {
     modules.push(Rc::new(statistics::StatisticsModule));
     #[cfg(feature = "map")]
     modules.push(Rc::new(map::MapModule));
+    #[cfg(feature = "tag-graph")]
+    modules.push(Rc::new(tag_graph::TagGraphModule));
     modules
 }
 

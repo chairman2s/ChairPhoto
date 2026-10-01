@@ -225,10 +225,10 @@ pub fn wire(
         None => Arc::new(NoPool),
     };
     let images = cx.new(|cx| ImageStore::new(submit, image_store::DEFAULT_BUDGET_BYTES, cx));
+    clear_images_on_catalog_switch(&model, &images, cx).detach();
     let modules = modules::ModuleRegistry::install(&model, &shell, &images, cx);
     let storage = cx.new(|cx| storage::StorageState::new(&model, &shell, cx));
     let tags = cx.new(|cx| tags::TagsState::new(&model, cx));
-    clear_images_on_catalog_switch(&model, &images, cx).detach();
     if options.open_default_catalog {
         model.update(cx, |m, cx| m.open_default_catalog(cx));
     }

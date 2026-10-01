@@ -175,7 +175,8 @@ pub struct ModuleRegistry {
     app: AppState,
     model: Entity<AppModel>,
     shell: Entity<ShellState>,
-    /// The app's image layer, handed to modules that show photos (the map's filmstrip).
+    /// The image layer, handed to modules for thumbnails; `None` in registries built without
+    /// one (tests).
     images: Option<Entity<ImageStore>>,
     restore: Restore,
     /// Enables (`true`) and disables asked for while the restore had not landed, in order.
@@ -194,7 +195,8 @@ pub struct ModuleRegistry {
 }
 
 impl ModuleRegistry {
-    /// The production registry: [`super::bundled`] against [`super::compiled_features`].
+    /// The production registry: [`super::bundled`] against [`super::compiled_features`], with
+    /// the app's image layer for the modules' thumbnails ([`ModuleHost::images`]).
     pub fn install(
         model: &Entity<AppModel>,
         shell: &Entity<ShellState>,

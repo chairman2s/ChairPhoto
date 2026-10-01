@@ -40,6 +40,8 @@ pub mod contexts {
     /// ↑/↓/←/→, Enter). The keymap mutes the shell's keys in it, as React's open menu
     /// swallowed every key but its own.
     pub const MENU: &str = "PopupMenu";
+    /// The Tag graph's main view (`modules::tag_graph`).
+    pub const TAG_GRAPH: &str = "TagGraph";
     /// A focused text input (gpui-base's `Input` context): typed characters are text, not
     /// shortcuts (React's `INPUT`/`TEXTAREA` guard).
     pub const INPUT: &str = "Input";
@@ -73,6 +75,9 @@ pub fn bindings() -> Vec<KeyBinding> {
         KeyBinding::new("[", ToggleLeftPanel, Some(contexts::ROOT)),
         KeyBinding::new("]", ToggleRightPanel, Some(contexts::ROOT)),
     ];
+    // The Tag graph's window keydown handler (Escape) moves to its focused view.
+    #[cfg(feature = "tag-graph")]
+    bindings.push(KeyBinding::new("escape", crate::modules::tag_graph::Back, Some(contexts::TAG_GRAPH)));
     // A deeper `NoAction` outranks the root binding for the same keystroke.
     for key in MUTED_IN_MENUS_AND_INPUTS {
         bindings.push(KeyBinding::new(key, NoAction, Some(contexts::MENU)));

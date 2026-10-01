@@ -1167,6 +1167,7 @@ dependencies = [
  "libc",
  "serde",
  "serde_json",
+ "tiny-skia",
  "tokio",
 ]
 

@@ -27,11 +27,16 @@ path = "src/main.rs"
 name = "map_bench"
 required-features = ["map"]
 
+# The Tag graph's measurement path (#121); it needs the module.
+[[example]]
+name = "tag_graph_bench"
+required-features = ["tag-graph"]
+
 [features]
 # The same names as the core's features, forwarded one by one (the Tauri shell does the same),
 # and the same default set as the Tauri shell's minus `module-fetch`, which gates a Tauri
 # command and nothing in the core.
-default = ["ai", "edit", "raw", "instagram", "collage", "slideshow", "localsend", "map", "faces", "smarttags"]
+default = ["ai", "edit", "raw", "instagram", "collage", "slideshow", "localsend", "map", "faces", "smarttags", "tag-graph"]
 ai = ["chairphoto-core/ai"]
 localsend = ["chairphoto-core/localsend"]
 flickr = ["chairphoto-core/flickr"]
@@ -49,6 +54,9 @@ raw = ["chairphoto-core/raw"]
 # The module registry's dev module (`modules::dev_module`), which contributes to every slot:
 # for looking at the slots in the running app. Never in `default`; tests get it anyway.
 dev-module = []
+# The Tag graph module (`modules::tag_graph`, #121). App-only: its data (`library_graph`) is in
+# every core build, so it forwards no core feature; it brings tiny-skia for the edge raster.
+tag-graph = ["dep:tiny-skia"]
 
 [dependencies]
 # Features are forwarded one by one above, so `--no-default-features` here builds no backend.
@@ -75,6 +83,9 @@ tokio = { version = "1", default-features = false, features = ["rt"] }
 # The quit-signal handlers (`signals.rs`: sigaction, a self-pipe, `_exit`). Already in the
 # lockfile through the core and gpui.
 libc = "0.2"
+# The Tag graph's base edge raster (`modules::tag_graph::raster`). Already in the lockfile
+# through gpui's resvg, at this version and with its default features.
+tiny-skia = { version = "0.11.4", optional = true }
 
 [dev-dependencies]
 # The headless test platform: `#[gpui_kit::test]`, `TestAppContext`, `VisualTestContext`.

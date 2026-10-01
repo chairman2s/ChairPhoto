@@ -13,7 +13,7 @@ use crate::js_compat::js_trim;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-use crate::editing::{edit_from_value, Bw, Field, Grain, Split, Tone, VersionEdit, Wb};
+use crate::editing::{Bw, Field, Grain, Split, Tone, VersionEdit, Wb};
 use crate::js_compat;
 
 /// The settings key the user presets live under.
@@ -39,9 +39,11 @@ pub struct DevelopPreset {
     pub id: String,
     pub name: String,
     pub category: PresetCategory,
-    /// Look-only fields — never crop or straighten ([`look_only`]).
-    #[serde(default)]
-    pub edit: VersionEdit,
+    /// Look-only fields — never crop or straighten ([`look_only`]). A [`Field`] so a stored
+    /// payload this build cannot read (or a missing or `null` one) is written back as it
+    /// was, as TS's `{ ...p }` kept it; [`Field::spread`] is what applying it spreads.
+    #[serde(default, skip_serializing_if = "Field::is_absent")]
+    pub edit: Field<VersionEdit>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub builtin: Option<bool>,
     /// Keys a stored preset carries that this build does not know, written back as read.
@@ -63,7 +65,7 @@ fn wb(temp: f64) -> Field<Wb> {
 }
 
 fn builtin(id: &str, name: &str, category: PresetCategory, edit: VersionEdit) -> DevelopPreset {
-    DevelopPreset { id: id.into(), name: name.into(), category, edit, builtin: Some(true), extra: Map::new() }
+    DevelopPreset { id: id.into(), name: name.into(), category, edit: Field::Set(edit), builtin: Some(true), extra: Map::new() }
 }
 
 /// The built-in library, in display order. Recipes are starting points tuned by eye.
@@ -202,7 +204,8 @@ pub fn builtin_presets() -> Vec<DevelopPreset> {
 /// The user presets stored in the setting's text (`loadUserPresets`). Missing, empty,
 /// invalid or non-array text gives none. Entries without a string `id` and `name` are
 /// skipped; every entry is forced to category `User`, `builtin: false`. An entry's `edit`
-/// is read like any record ([`edit_from_value`]); a missing one reads as empty.
+/// is kept as a [`Field`]: a record when it is one (read like any record), otherwise —
+/// missing, `null`, an array, a string — as it was, so a save writes it back unchanged.
 pub fn parse_user_presets(raw: Option<&str>) -> Vec<DevelopPreset> {
     let Some(raw) = raw.filter(|s| !s.is_empty()) else { return Vec::new() };
     let Ok(Value::Array(list)) = serde_json::from_str::<Value>(raw) else { return Vec::new() };
@@ -211,7 +214,8 @@ pub fn parse_user_presets(raw: Option<&str>) -> Vec<DevelopPreset> {
             let Value::Object(mut obj) = p else { return None };
             let id = obj.get("id")?.as_str()?.to_string();
             let name = obj.get("name")?.as_str()?.to_string();
-            let edit = obj.remove("edit").map(edit_from_value).unwrap_or_default();
+            // Field's reading never fails: a non-object payload is kept raw.
+            let edit = obj.remove("edit").map_or(Field::Absent, |v| serde_json::from_value(v).unwrap_or(Field::Absent));
             for k in ["id", "name", "category", "builtin"] {
                 obj.remove(k);
             }
@@ -250,7 +254,7 @@ pub fn add_user_preset(stored: Option<&str>, id: String, name: &str, record: &Ve
         id,
         name: js_trim(name).to_string(),
         category: PresetCategory::User,
-        edit: look_only(record),
+        edit: Field::Set(look_only(record)),
         builtin: None,
         extra: Map::new(),
     });
@@ -308,14 +312,14 @@ mod tests {
         let list = add_user_preset(None, "u-1".into(), "  Mine \u{feff}", &record);
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].name, "Mine");
-        assert_eq!(list[0].edit.crop, Field::Absent);
+        assert_eq!(list[0].edit.value().unwrap().crop, Field::Absent);
         let text = serialize_user_presets(&list);
         let v: Value = serde_json::from_str(&text).unwrap();
         // A new preset has no `builtin` key (TS omitted it); `edit` holds only the look.
         assert_eq!(v, json!([{"id": "u-1", "name": "Mine", "category": "User", "edit": {"fade": 0.3}}]));
         let back = parse_user_presets(Some(&text));
         assert_eq!(back[0].builtin, Some(false));
-        assert_eq!(back[0].edit.fade, Field::Set(0.3));
+        assert_eq!(back[0].edit.value().unwrap().fade, Field::Set(0.3));
         let two = add_user_preset(Some(&text), "u-2".into(), "Two", &VersionEdit::default());
         assert_eq!(two.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(), ["u-1", "u-2"]);
     }
@@ -332,7 +336,26 @@ mod tests {
         assert_eq!(list.len(), 2);
         assert_eq!((list[0].category, list[0].builtin), (PresetCategory::User, Some(false)));
         assert_eq!(list[0].extra.get("note"), Some(&json!("kept")));
-        assert_eq!(list[1].edit, VersionEdit::default());
+        assert_eq!(list[1].edit, Field::Absent);
+    }
+
+    /// Codex review of c718349: loading read an unparseable `edit` as `{}`, so saving an
+    /// unrelated preset persisted the loss. TS's `{ ...p, category, builtin }` keeps the
+    /// payload as it was — and keeps a missing or `null` one missing or `null`.
+    #[test]
+    fn a_stored_preset_payload_survives_saving_another_preset() {
+        let stored = r#"[{"id":"old","name":"Old","edit":[{"future":42}]}]"#;
+        let list = add_user_preset(Some(stored), "new".into(), "New", &VersionEdit::default());
+        let saved: Value = serde_json::from_str(&serialize_user_presets(&list)).unwrap();
+        assert_eq!(saved[0]["edit"], json!([{"future": 42}]));
+        for (stored, edit) in [
+            (r#"[{"id":"a","name":"A","edit":null}]"#, Some(json!(null))),
+            (r#"[{"id":"a","name":"A","edit":"x"}]"#, Some(json!("x"))),
+            (r#"[{"id":"a","name":"A"}]"#, None),
+        ] {
+            let saved: Value = serde_json::from_str(&serialize_user_presets(&parse_user_presets(Some(stored)))).unwrap();
+            assert_eq!(saved[0].get("edit"), edit.as_ref(), "{stored}");
+        }
     }
 
     #[test]
@@ -343,7 +366,8 @@ mod tests {
         assert_eq!(all.last().unwrap().id, "u");
         // Builtins never carry framing or an engine stamp.
         for p in builtin_presets() {
-            assert_eq!(p.edit, look_only(&p.edit), "{}", p.id);
+            let edit = p.edit.value().unwrap();
+            assert_eq!(*edit, look_only(edit), "{}", p.id);
             assert_eq!(p.builtin, Some(true));
         }
     }

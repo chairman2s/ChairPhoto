@@ -227,7 +227,11 @@ pub fn proof_spread(
     for p in pick_looks(presets, PROOF_CELLS - out.len()) {
         // Framing + Auto's exposure + the preset's whole look; the preset's own tone keys
         // win over Auto's (a B&W recipe's contrast is part of the recipe).
-        let record = VersionEdit { tone: merge_tone(&auto_tone, &p.edit.tone), ..geo.overlaid(&p.edit) };
+        // `{ ...geo, ...p.edit, tone: … p.edit.tone }`: a raw payload spreads its index keys
+        // and has no `tone`.
+        let edit = p.edit.spread();
+        let tone = p.edit.value().map_or(Field::Absent, |e| e.tone.clone());
+        let record = VersionEdit { tone: merge_tone(&auto_tone, &tone), ..geo.overlaid(&edit) };
         out.push(cell(&p.name, group_of(p), record));
     }
     out
@@ -240,7 +244,7 @@ mod tests {
     use crate::editing::{Bw, Crop, Lens, Perspective, Split};
 
     fn preset(id: &str, category: PresetCategory, edit: VersionEdit) -> DevelopPreset {
-        DevelopPreset { id: id.into(), name: id.into(), category, edit, builtin: Some(true), extra: Map::new() }
+        DevelopPreset { id: id.into(), name: id.into(), category, edit: Field::Set(edit), builtin: Some(true), extra: Map::new() }
     }
 
     fn tone(f: impl FnOnce(&mut Tone)) -> Field<Tone> {

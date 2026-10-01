@@ -537,6 +537,39 @@ fn a_restore_read_overtaken_by_a_switch_is_dropped(cx: &mut TestAppContext) {
     assert_eq!(*log.borrow(), ["load:b"], "A's set was never applied");
 }
 
+/// **Forced interleaving, A→B→A.** A toggle's write for catalog A is still queued when the app
+/// switches to B and back to A — a new opening of the same file. The write is refused: the
+/// reopened A's saved set is what its own restore read, not the old opening's toggle. Without
+/// the event (the core switch alone) and with it (the reopened A's restore running too).
+#[gpui_kit::test]
+fn a_write_for_a_catalog_never_lands_in_a_later_opening_of_it(cx: &mut TestAppContext) {
+    for deliver in [false, true] {
+        let dir = TempDir::new("reopen");
+        let log = Log::default();
+        let b = bench(vec![probe(ModuleMeta::new("a", "A"), &log), probe(ModuleMeta::new("c", "C"), &log)], &[], &dir, cx);
+        b.enable("a", cx);
+        assert_eq!(b.setting(ENABLED_KEY).as_deref(), Some("a"));
+
+        cx.update(|cx| ModuleRegistry::enable(&b.registry, "c", cx)); // its write is queued, not run
+        let other = Catalog::open(&dir.0.join("b.chairphoto"), &dir.0.join("photos")).unwrap();
+        b.state.catalog.lock().unwrap().replace(other);
+        let switched = |cx: &mut TestAppContext| {
+            if deliver {
+                b.model.update(cx, |m, cx| m.on_core_event(&CoreEvent::CatalogSwitched("x".into()), cx));
+            }
+        };
+        switched(cx);
+        let reopened = Catalog::open(&dir.0.join("m.chairphoto"), &dir.0.join("photos")).unwrap();
+        b.state.catalog.lock().unwrap().replace(reopened);
+        switched(cx);
+        cx.run_until_parked();
+        assert_eq!(b.setting(ENABLED_KEY).as_deref(), Some("a"), "deliver={deliver}: the old opening's write did not land");
+        if deliver {
+            assert_eq!(b.enabled(cx), ["a"], "the reopened catalog's saved set applies");
+        }
+    }
+}
+
 /// With no catalog open, a toggle waits (it has nowhere to be saved) and lands once one is.
 #[gpui_kit::test]
 fn a_toggle_with_no_catalog_waits_for_one(cx: &mut TestAppContext) {

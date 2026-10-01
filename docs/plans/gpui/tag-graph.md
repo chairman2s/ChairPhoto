@@ -1,6 +1,12 @@
 # Tag graph on GPUI: layout and drawing
 
-Status: research for wayfinder ticket #117 (map #92). Nothing here is implemented yet.
+Status: research for wayfinder ticket #117 (map #92). Implemented, Communities only, by
+#121 on `wf/tag-graph`: `crates/model/src/tag_graph/` (layout, scene, labels, session) and
+`crates/app/src/modules/tag_graph/` (view, tiny-skia raster, canvas). The owner's decisions
+in #120 apply: Photo ↔ tag dropped, horizontal labels, base edges soft while zooming. One
+detail differs from the plan below: the raster strips stroke 8 overlap rows each, because
+tiny-skia anti-aliases a pixmap's first rows differently (seams otherwise).
+Measurements: `cargo run --release -p chairphoto-app --example tag_graph_bench`.
 Base: `feature/gpui` at `ebe3259`. Toolchain: gpui-pre 0.3.7 (with gpui-pre-wgpu 0.3.7) and
 rustc 1.98.1, measured 2026-09-30.
 

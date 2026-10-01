@@ -315,13 +315,16 @@ impl TieringSection {
 
     pub fn save(&mut self, cx: &mut Context<Self>) {
         let n = parse_days(&self.days.read(cx).value());
-        self.ctx.run(
+        let ctx = self.ctx.clone();
+        ctx.write_setting(
             cx,
-            move |scope| scope.catalog(|c| c.set_setting(OFFLOAD_AGE_SETTING, &n.to_string())),
+            OFFLOAD_AGE_SETTING,
+            n.to_string(),
+            |_| Ok(()),
             move |s: &mut Self, result, _| {
                 s.status = Some(match result {
-                    Ok(()) if n > 0 => format!("Saved — photos older than {n} day(s) will be offloaded to the NAS."),
-                    Ok(()) => "Saved — automatic offload is off (photos stay on local disk).".into(),
+                    Ok(_) if n > 0 => format!("Saved — photos older than {n} day(s) will be offloaded to the NAS."),
+                    Ok(_) => "Saved — automatic offload is off (photos stay on local disk).".into(),
                     Err(e) => e,
                 })
             },

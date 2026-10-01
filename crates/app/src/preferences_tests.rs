@@ -8,6 +8,7 @@ use crate::preferences::editors::{DarkroomSection, EditorsSection};
 use crate::preferences::storage::{MaintenanceSection, Removal, SafetySection, TieringSection};
 use crate::preferences::tags::TagMaintenance;
 use crate::preferences::{Content, LastPreferences, Preferences, Tab};
+use crate::storage::Runner;
 use chairphoto_core::catalog::{StorageTier, VolumeKind};
 use chairphoto_model::darkroom::kelvin::WbPrefer;
 
@@ -477,6 +478,87 @@ fn editors_and_darkroom_save_reacts_keys(cx: &mut TestAppContext) {
     work(cx);
     assert_eq!(setting(&app, "editor.renderTiming").as_deref(), Some("0"));
     assert_eq!(d.read_with(cx, |d, _| d.timing), Some(false));
+}
+
+/// **Forced reversal** (#113 Codex gate, finding 3). Every setting is changed twice; the
+/// Runner then runs the queued writes newest first. Each setting persists the newer value,
+/// and each control shows it.
+#[gpui_kit::test]
+fn setting_writes_persist_in_the_order_made(cx: &mut TestAppContext) {
+    let dir = TempDir::new("prefs-write-order");
+    let app = start(cx);
+    open_catalog(&app, &dir, cx);
+    let p = open(&app, cx);
+    let tier = tiering(&p, cx);
+    let days = tier.read_with(cx, |t, _| t.days.clone());
+    for n in ["7", "30"] {
+        set_input(&app, &days, n, cx);
+        tier.update(cx, |t, cx| t.save(cx));
+    }
+    in_window(&app, cx, |w, cx| p.update(cx, |p, cx| p.select(Tab::Editors, w, cx)));
+    work(cx);
+    let (e, d) = editors(&p, cx);
+    let gb = d.read_with(cx, |d, _| d.gb.clone());
+    for n in ["5", "9"] {
+        set_input(&app, &gb, n, cx);
+        in_window(&app, cx, |w, cx| d.update(cx, |d, cx| d.save_gb(w, cx)));
+    }
+    d.update(cx, |d, cx| {
+        d.set_preload(false, cx);
+        d.set_preload(true, cx);
+        d.set_timing(true, cx);
+        d.set_timing(false, cx);
+        d.set_wb(WbPrefer::Relative, cx);
+        d.set_wb(WbPrefer::Kelvin, cx);
+    });
+    e.update(cx, |e, cx| {
+        e.set_rapidraw_format("png", cx);
+        e.set_rapidraw_format("jpg", cx);
+        e.save("darktable", "gui", "/old/darktable".into(), cx);
+        e.save("darktable", "gui", "/new/darktable".into(), cx);
+    });
+    let ran = cx.update(|cx| Runner::get(cx).run_pending_reversed());
+    assert!(ran >= 12, "every write was queued: {ran}");
+    work(cx);
+    for (key, want) in [
+        ("offload_age_days", "30"),
+        ("develop.decodeCacheGb", "9"),
+        ("develop.preloadNeighbours", "1"),
+        ("editor.renderTiming", "0"),
+        ("develop.wbSlider", "kelvin"),
+        ("editor.rapidraw.format", "jpg"),
+        ("editor.darktable.gui", "/new/darktable"),
+    ] {
+        assert_eq!(setting(&app, key).as_deref(), Some(want), "{key}: an older write overwrote a newer one");
+    }
+    d.read_with(cx, |d, _| {
+        assert_eq!(d.preload, Some(true));
+        assert_eq!(d.timing, Some(false));
+        assert_eq!(d.wb, Some(WbPrefer::Kelvin));
+    });
+    assert_eq!(e.read_with(cx, |e, _| e.rapidraw_format.clone()), "jpg");
+}
+
+/// An older write's completion, arriving after a newer change was made but before its write
+/// ran, does not put the control back to the older value.
+#[gpui_kit::test]
+fn a_stale_write_completion_does_not_undo_a_newer_change(cx: &mut TestAppContext) {
+    let dir = TempDir::new("prefs-write-stale");
+    let app = start(cx);
+    open_catalog(&app, &dir, cx);
+    let p = open(&app, cx);
+    in_window(&app, cx, |w, cx| p.update(cx, |p, cx| p.select(Tab::Editors, w, cx)));
+    work(cx);
+    let (_, d) = editors(&p, cx);
+    d.update(cx, |d, cx| d.set_preload(false, cx));
+    // The off write runs; its completion is not delivered yet.
+    assert_eq!(cx.update(|cx| Runner::get(cx).run_pending()), 1);
+    d.update(cx, |d, cx| d.set_preload(true, cx));
+    cx.run_until_parked();
+    assert_eq!(d.read_with(cx, |d, _| d.preload), Some(true), "the off write's completion undid the on");
+    work(cx);
+    assert_eq!(setting(&app, "develop.preloadNeighbours").as_deref(), Some("1"));
+    assert_eq!(d.read_with(cx, |d, _| d.preload), Some(true));
 }
 
 // --- appearance -------------------------------------------------------------------------------

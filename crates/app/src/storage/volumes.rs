@@ -4,14 +4,19 @@
 //! expands) and kind, Enter in the path adds.
 //!
 //! A view entity Preferences mounts in its Storage tab ([`crate::preferences`], #113), the
-//! one way in, as in React. Reachability is stated off the catalog
-//! lock through the volume-health cache, which add and remove invalidate, as the Tauri
-//! commands do.
+//! one way in (the rail's gear and More ⋯ → Preferences… both open it), as in React.
+//! Reachability is stated off the catalog lock through the volume-health cache, which add
+//! and remove invalidate, as the Tauri commands do.
+//!
+//! The panel is bound to the catalog the tab was built for (its [`Scope`]): the list, Add
+//! and Remove all go through `with_catalog_as`, so one queued before a switch and run after
+//! it fails closed with `CATALOG_CHANGED` rather than landing in the catalog open by then.
 
 use super::ui;
 use super::{CloseDialog, Runner};
+use crate::preferences::Scope;
 use crate::shell::style::Colors;
-use chairphoto_core::app::{expand_home, with_catalog, with_catalog_as, with_catalog_identified, AppState, CatalogIdentity};
+use chairphoto_core::app::expand_home;
 use chairphoto_core::catalog::{Volume, VolumeKind};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::prelude::*;
@@ -22,10 +27,9 @@ use gpui_kit::{div, px, Context, Entity, EventEmitter, SharedString, Subscriptio
 pub const LIBRARY_VOLUME: &str = "catalog-root";
 
 pub struct VolumesPanel {
-    app: AppState,
+    /// The catalog this panel lists and writes: every access is bound to it.
+    scope: Scope,
     pub volumes: Vec<Volume>,
-    /// The catalog `volumes` were read from: a Remove of one of them is bound to it.
-    pub volumes_from: Option<CatalogIdentity>,
     pub name: Entity<InputState>,
     pub path: Entity<InputState>,
     pub kind: VolumeKind,
@@ -36,7 +40,7 @@ pub struct VolumesPanel {
 impl EventEmitter<CloseDialog> for VolumesPanel {}
 
 impl VolumesPanel {
-    pub fn new(app: AppState, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(scope: Scope, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let name = cx.new(|cx| InputState::new(window, cx).placeholder("Name (e.g. NAS)"));
         let path = cx.new(|cx| InputState::new(window, cx).placeholder("Base path (e.g. ~/ZimaCube/Gallery)"));
         let enter = cx.subscribe_in(&path, window, |this: &mut Self, _, event: &InputEvent, window, cx| {
@@ -45,9 +49,8 @@ impl VolumesPanel {
             }
         });
         let mut this = VolumesPanel {
-            app,
+            scope,
             volumes: Vec::new(),
-            volumes_from: None,
             name,
             path,
             kind: VolumeKind::Backup,
@@ -59,24 +62,21 @@ impl VolumesPanel {
     }
 
     pub fn reload(&mut self, cx: &mut Context<Self>) {
-        let state = self.app.clone();
+        let scope = self.scope.clone();
         let rx = Runner::get(cx).run(move || {
-            let (from, mut vols) = with_catalog_identified(&state, |c| c.volume_rows())?;
+            let mut vols = scope.catalog(|c| c.volume_rows())?;
             let pairs: Vec<(i64, String)> = vols.iter().map(|v| (v.id, v.base_path.clone())).collect();
-            let reachable = state.volume_health.refresh(&pairs);
+            let reachable = scope.state().volume_health.refresh(&pairs);
             for v in &mut vols {
                 v.reachable = reachable.get(&v.id).copied().unwrap_or(false);
             }
-            Ok::<_, String>((from, vols))
+            Ok::<_, String>(vols)
         });
         cx.spawn(async move |this, cx| {
             let Ok(result) = rx.await else { return };
             this.update(cx, |s, cx| {
                 match result {
-                    Ok((from, v)) => {
-                        s.volumes = v;
-                        s.volumes_from = Some(from);
-                    }
+                    Ok(v) => s.volumes = v,
                     Err(e) => s.error = Some(e),
                 }
                 cx.notify();
@@ -103,10 +103,10 @@ impl VolumesPanel {
             cx.notify();
             return;
         }
-        let (state, kind) = (self.app.clone(), self.kind);
+        let (scope, kind) = (self.scope.clone(), self.kind);
         let rx = Runner::get(cx).run(move || {
-            let id = with_catalog(&state, |c| c.add_volume(&name, &expand_home(&path), kind))?;
-            state.volume_health.invalidate();
+            let id = scope.catalog(|c| c.add_volume(&name, &expand_home(&path), kind))?;
+            scope.state().volume_health.invalidate();
             Ok::<_, String>(id)
         });
         cx.spawn_in(window, async move |this, cx| {
@@ -128,11 +128,11 @@ impl VolumesPanel {
     }
 
     /// Remove, after the confirm React showed with `window.confirm` — from the catalog the
-    /// list was read from: volume ids are per catalog, so once another catalog is open (the
-    /// confirm is asynchronous) it fails closed with `CATALOG_CHANGED` and removes nothing.
+    /// list was read from (the panel's): volume ids are per catalog, so once another catalog
+    /// is open (the confirm is asynchronous) it fails closed with `CATALOG_CHANGED` and
+    /// removes nothing.
     pub fn remove(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
         let Some(v) = self.volumes.get(index).cloned() else { return };
-        let Some(from) = self.volumes_from else { return };
         if v.name == LIBRARY_VOLUME {
             return;
         }
@@ -146,15 +146,15 @@ impl VolumesPanel {
                 .into(),
             "Remove",
         );
-        let state = self.app.clone();
+        let scope = self.scope.clone();
         let runner = Runner::get(cx);
         cx.spawn(async move |this, cx| {
             if answer.await != Ok(true) {
                 return;
             }
             let rx = runner.run(move || {
-                with_catalog_as(&state, from, |c| c.remove_volume(v.id))?;
-                state.volume_health.invalidate();
+                scope.catalog(|c| c.remove_volume(v.id))?;
+                scope.state().volume_health.invalidate();
                 Ok::<_, String>(())
             });
             let Ok(result) = rx.await else { return };

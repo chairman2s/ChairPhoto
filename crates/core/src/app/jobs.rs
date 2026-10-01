@@ -40,7 +40,8 @@
 //! | [`JobFamily::begin`] | catalog → that family's abort → that family's slot |
 //! | [`JobRegistry::lock_for_detach`] (switch phase one) | every abort, then every slot |
 //! | [`JobRegistry::lock_for_publish`] (switch phase two) | every abort |
-//! | [`AbortGeneration::install_fresh`] (scan / sharpness / pHash starts), `scans::claim_import` | one abort, released before the catalog is read |
+//! | [`AbortGeneration::install_fresh`] (sharpness / pHash starts), `scans::claim_import` | one abort, released before the catalog is read |
+//! | a scan start (`scans::scan_two_phase`), `storage::empty_trash_as`, `storage::restore_trashed_as` | catalog → that family's abort (the catalog identity checked before the abort is touched) |
 //! | `storage::claim_reconcile` (a back-up drain or offload-policy start) | catalog → the reconcile abort |
 //! | `slideshow::claim_slideshow` (a slideshow render start) | catalog → the slideshow abort |
 //! | [`AbortGeneration::install_fresh_if_owner`] (a card import committing to index) | the scan abort → the import abort |
@@ -50,7 +51,7 @@
 //! | [`JobSlot`] writes (workers) | one slot |
 //! | `develop`'s resident set (`develop::with_resident`) | a leaf: after any of the above, never across another lock |
 //!
-//! The scan, sharpness and pHash starts never hold two of these at once, so they cannot
+//! The sharpness and pHash starts never hold two of these at once, so they cannot
 //! invert against the order; phase two covers them instead by tripping whatever it finds
 //! installed before replacing it. See [`JobRegistry::lock_for_publish`].
 //!

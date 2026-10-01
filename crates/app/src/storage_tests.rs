@@ -967,6 +967,55 @@ fn removing_a_volume_never_reaches_the_new_catalog_after_the_switch_event(cx: &m
     remove_volume_across_a_switch(true, cx);
 }
 
+/// **Forced interleaving** (#113 Codex gate, finding 2). Preferences → Storage is open on
+/// catalog A; Add is pressed and the core switches to B — the Add pressed after the switch
+/// with the event undelivered, or pressed before it with the event delivered before the
+/// worker runs. Either way the volume never lands in B.
+fn add_volume_across_a_switch(delivered: bool, cx: &mut TestAppContext) {
+    let dir = TempDir::new("volumes-add-switch");
+    let app = start(cx);
+    open_catalog(&app, &dir, cx);
+    std::fs::create_dir_all(dir.0.join("nas")).unwrap();
+    dispatch(&app, crate::shell::actions::OpenPreferences, cx);
+    settle(&app, cx);
+    let prefs = cx.update(|cx| cx.global::<crate::preferences::LastPreferences>().0.upgrade()).expect("Preferences opened");
+    let panel = prefs.read_with(cx, |p, _| match &p.content {
+        crate::preferences::Content::Storage(s) => s.volumes.clone(),
+        _ => panic!("Preferences opens on Storage"),
+    });
+    work(cx);
+    let (name, path) = panel.read_with(cx, |p, _| (p.name.clone(), p.path.clone()));
+    set_input(&app, &name, "NAS", cx);
+    set_input(&app, &path, &dir.0.join("nas").to_string_lossy(), cx);
+
+    let other = dir.0.join("other");
+    let b = Catalog::open(&other.join("b.chairphoto"), &other).unwrap();
+    if delivered {
+        click(&app, "volume-add", cx);
+        core_switch(&app, b);
+        deliver_switch(&app, cx);
+    } else {
+        core_switch(&app, b);
+        click(&app, "volume-add", cx);
+    }
+    work(cx);
+    let vols = chairphoto_core::app::with_catalog(&app.state, |c| c.volume_rows()).unwrap();
+    assert!(!vols.iter().any(|v| v.name == "NAS"), "delivered={delivered}: A's Add landed in B: {vols:?}");
+    if !delivered {
+        panel.read_with(cx, |p, _| assert_eq!(p.error.as_deref(), Some(chairphoto_core::app::CATALOG_CHANGED)));
+    }
+}
+
+#[gpui_kit::test]
+fn adding_a_volume_never_reaches_the_new_catalog_before_the_switch_event(cx: &mut TestAppContext) {
+    add_volume_across_a_switch(false, cx);
+}
+
+#[gpui_kit::test]
+fn adding_a_volume_never_reaches_the_new_catalog_after_the_switch_event(cx: &mut TestAppContext) {
+    add_volume_across_a_switch(true, cx);
+}
+
 #[gpui_kit::test]
 fn volumes_add_and_remove_behind_a_confirm(cx: &mut TestAppContext) {
     let dir = TempDir::new("volumes");

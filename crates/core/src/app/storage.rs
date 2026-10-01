@@ -370,8 +370,15 @@ pub fn restore_trashed_as(
     expected: super::CatalogIdentity,
     photo_ids: &[i64],
 ) -> Result<usize, String> {
+    // Checked before the trip, under the same catalog lock hold (catalog → trash abort): a
+    // stale restore must not stop the open catalog's delete.
+    let guard = state.catalog.lock().map_err(|e| e.to_string())?;
+    let c = guard.as_ref().ok_or("No catalog is open")?;
+    if !expected.is(c) {
+        return Err(super::CATALOG_CHANGED.into());
+    }
     state.jobs.trash.trip()?;
-    super::with_catalog_as(state, expected, |c| c.restore_photos(photo_ids))
+    c.restore_photos(photo_ids).map_err(|e| e.to_string())
 }
 
 /// What emptying the trash did — and, as importantly, what it did not.
@@ -453,7 +460,18 @@ pub fn empty_trash_as(
     // catalog under it is replaced — which is what stops one catalog's photo ids being
     // applied to another's rows. `restore_photos` trips it too, so a user pulling a photo
     // back out of the trash wins that race.
-    let abort = state.jobs.trash.install_fresh()?;
+    //
+    // The identity is checked before the generation is installed, under one catalog lock
+    // hold (catalog → trash abort): a delete bound to a catalog that is no longer open must
+    // fail closed without tripping the open catalog's delete.
+    let abort = {
+        let guard = state.catalog.lock().map_err(|e| e.to_string())?;
+        let c = guard.as_ref().ok_or("No catalog is open")?;
+        if expected.is_some_and(|id| !id.is(c)) {
+            return Err(super::CATALOG_CHANGED.to_string());
+        }
+        state.jobs.trash.install_fresh()?
+    };
     let catalog = state.catalog.clone();
     let health = state.volume_health.clone();
     (move || {

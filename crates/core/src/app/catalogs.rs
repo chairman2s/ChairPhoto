@@ -315,8 +315,8 @@ pub fn detach_catalog_and_trip_jobs_with(
 /// ONE transition, holding the catalog lock across both. Returns the new scan generation
 /// (the caller hands it to an auto-resumed Phase B).
 ///
-/// Whatever is installed at this point is tripped before being replaced: the scan,
-/// sharpness, pHash and import starts install their generation *before* reading the catalog,
+/// Whatever is installed at this point is tripped before being replaced: the sharpness,
+/// pHash and import starts install their generation *before* reading the catalog,
 /// so one of those can hold a live generation right now, blocked on the catalog read.
 /// Replacing it silently would leave its worker running with a handle nothing can reach.
 /// The status slots are left alone — each aborted worker clears its own on the way out, and
@@ -850,6 +850,37 @@ mod switch_tests {
         assert_eq!(scanned.unwrap_err(), CATALOG_CHANGED);
         let b = super::super::catalog_identity(&state).unwrap();
         assert!(vacuum_catalog_as(&state, b).is_ok(), "bound to the open catalog, it runs");
+    }
+
+    /// **Forced interleaving** (#113 Codex gate, finding 1). Catalog A's NAS index, delete
+    /// and restore are queued; a switch to B lands and B's scan and trash delete start; then
+    /// A's requests run. Each fails closed **without** tripping B's running job.
+    #[test]
+    fn a_stale_request_does_not_trip_the_open_catalogs_job() {
+        // A switch's phase one releases develop's process-global resident set: not while a
+        // develop test holds it.
+        #[cfg(all(feature = "raw", feature = "edit"))]
+        let _serial = crate::develop::serial();
+        let dir = crate::test_support::TestTmpDir::new("stale-trip");
+        let state = AppState::default();
+        *state.catalog.lock().unwrap() = Some(Catalog::open(&dir.join("a.chairphoto"), &dir.join("a")).unwrap());
+        let a = super::super::catalog_identity(&state).unwrap();
+        detach_catalog_and_trip_jobs(&state).unwrap();
+        publish_catalog_and_reset_jobs(&state, Catalog::open(&dir.join("b.chairphoto"), &dir.join("b")).unwrap()).unwrap();
+        // B's scan and B's trash delete are running.
+        let b_scan = begin_scan_generation(&state).unwrap();
+        let b_trash = state.jobs.trash.install_fresh().unwrap();
+
+        let scanned = crate::app::scans::scan_nas_folder_as(&state, a, dir.join("nas")).map(drop);
+        assert_eq!(scanned.unwrap_err(), CATALOG_CHANGED);
+        assert!(!b_scan.load(Ordering::Relaxed), "A's stale index tripped B's scan");
+
+        let emptied = crate::app::storage::empty_trash_as(&state, Some(a), Some(vec![1]), None, true).map(drop);
+        assert_eq!(emptied.unwrap_err(), CATALOG_CHANGED);
+        assert!(!b_trash.load(Ordering::Relaxed), "A's stale delete tripped B's delete");
+
+        assert_eq!(crate::app::storage::restore_trashed_as(&state, a, &[1]).unwrap_err(), CATALOG_CHANGED);
+        assert!(!b_trash.load(Ordering::Relaxed), "A's stale restore tripped B's delete");
     }
 
     /// VACUUM reports the file's size before and after, and needs an open catalog.

@@ -173,15 +173,14 @@ impl EditorsSection {
 
     /// Save one path (blank = the auto-detected command on PATH), then re-check availability.
     pub fn save(&mut self, key: &str, which: &str, value: String, cx: &mut Context<Self>) {
-        let setting = format!("editor.{key}.{which}");
-        self.ctx.run(
+        let ctx = self.ctx.clone();
+        ctx.write_setting(
             cx,
-            move |scope| {
-                scope.catalog(|c| c.set_setting(&setting, value.trim()))?;
-                available_editors(scope.state())
-            },
+            format!("editor.{key}.{which}"),
+            value.trim().to_string(),
+            |scope| available_editors(scope.state()),
             |s: &mut Self, result, _| match result {
-                Ok(editors) => {
+                Ok((_, editors)) => {
                     s.editors = editors;
                     s.status = Some("Saved.".into());
                 }
@@ -190,18 +189,22 @@ impl EditorsSection {
         );
     }
 
-    /// Save RapidRAW's binary or format, then re-check it.
+    /// Save RapidRAW's binary or format, then re-check it. The format chip follows what was
+    /// stored only on a format write: a binary write's re-check may run before a newer format
+    /// write has persisted.
     pub fn save_rapidraw(&mut self, key: &'static str, value: String, cx: &mut Context<Self>) {
-        self.ctx.run(
+        let ctx = self.ctx.clone();
+        ctx.write_setting(
             cx,
-            move |scope| {
-                scope.catalog(|c| c.set_setting(key, value.trim()))?;
-                rapidraw_available(scope.state())
-            },
-            |s: &mut Self, result, _| match result {
-                Ok(st) => {
+            key,
+            value.trim().to_string(),
+            |scope| rapidraw_available(scope.state()),
+            move |s: &mut Self, result, _| match result {
+                Ok((_, st)) => {
                     s.rapidraw_found = st.available;
-                    s.rapidraw_format = st.format;
+                    if key == RAPIDRAW_FORMAT_KEY {
+                        s.rapidraw_format = st.format;
+                    }
                     s.status = Some("Saved.".into());
                 }
                 Err(e) => s.status = Some(e),
@@ -366,7 +369,8 @@ impl DarkroomSection {
         if self.gb.read(cx).value() != text.as_str() {
             self.gb.update(cx, |i, cx| i.set_value(text.clone(), window, cx));
         }
-        self.ctx.run(cx, move |scope| scope.catalog(|c| c.set_setting(DECODE_CACHE_GB_KEY, &text)), |_: &mut Self, _, _| {});
+        let ctx = self.ctx.clone();
+        ctx.write_setting(cx, DECODE_CACHE_GB_KEY, text, |_| Ok(()), |_: &mut Self, _, _| {});
     }
 
     pub fn clear_cache(&mut self, cx: &mut Context<Self>) {
@@ -381,30 +385,35 @@ impl DarkroomSection {
         });
     }
 
-    /// A boolean setting shown at once and put back if the write fails.
+    /// A boolean setting shown at once; once the newest write of it completes, the control
+    /// shows what is stored (`read` turns the stored value into the flag), and is put back if
+    /// that write failed.
     fn store_flag(
         &mut self,
         key: &'static str,
         next: bool,
         field: fn(&mut Self) -> &mut Option<bool>,
+        read: fn(Option<&str>) -> bool,
         cx: &mut Context<Self>,
     ) {
         *field(self) = Some(next);
         cx.notify();
         let value = if next { "1" } else { "0" };
-        self.ctx.run(cx, move |scope| scope.catalog(|c| c.set_setting(key, value)), move |s: &mut Self, result, _| {
-            if result.is_err() {
-                *field(s) = Some(!next);
-            }
+        let ctx = self.ctx.clone();
+        ctx.write_setting(cx, key, value.into(), |_| Ok(()), move |s: &mut Self, result, _| {
+            *field(s) = Some(match result {
+                Ok((stored, ())) => read(stored.as_deref()),
+                Err(_) => !next,
+            });
         });
     }
 
     pub fn set_preload(&mut self, on: bool, cx: &mut Context<Self>) {
-        self.store_flag(PRELOAD_KEY, on, |s| &mut s.preload, cx);
+        self.store_flag(PRELOAD_KEY, on, |s| &mut s.preload, |v| v != Some("0"), cx);
     }
 
     pub fn set_timing(&mut self, on: bool, cx: &mut Context<Self>) {
-        self.store_flag(RENDER_TIMING_KEY, on, |s| &mut s.timing, cx);
+        self.store_flag(RENDER_TIMING_KEY, on, |s| &mut s.timing, |v| v == Some("1"), cx);
     }
 
     pub fn set_wb(&mut self, next: WbPrefer, cx: &mut Context<Self>) {
@@ -415,10 +424,12 @@ impl DarkroomSection {
             WbPrefer::Kelvin => "kelvin",
             WbPrefer::Relative => "relative",
         };
-        self.ctx.run(cx, move |scope| scope.catalog(|c| c.set_setting(WB_SLIDER_KEY, value)), move |s: &mut Self, result, _| {
-            if result.is_err() {
-                s.wb = before;
-            }
+        let ctx = self.ctx.clone();
+        ctx.write_setting(cx, WB_SLIDER_KEY, value.into(), |_| Ok(()), move |s: &mut Self, result, _| {
+            s.wb = match result {
+                Ok((stored, ())) => Some(WbPrefer::from_setting(stored.as_deref())),
+                Err(_) => before,
+            };
         });
     }
 }

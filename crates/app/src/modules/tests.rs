@@ -115,6 +115,14 @@ struct Bench {
 }
 
 fn bench(modules: Vec<Rc<dyn Module>>, features: &[&str], dir: &TempDir, cx: &mut TestAppContext) -> Bench {
+    let b = bench_unrestored(modules, features, dir, cx);
+    b.model.update(cx, |m, cx| m.refresh(cx));
+    cx.run_until_parked();
+    b
+}
+
+/// [`bench`] before the model's first catalog read: the saved set is not restored yet.
+fn bench_unrestored(modules: Vec<Rc<dyn Module>>, features: &[&str], dir: &TempDir, cx: &mut TestAppContext) -> Bench {
     let state = AppState::default();
     let catalog = Catalog::open(&dir.0.join("m.chairphoto"), &dir.0.join("photos")).unwrap();
     *state.catalog.lock().unwrap() = Some(catalog);
@@ -164,11 +172,68 @@ fn scan_done() -> CoreEvent {
 fn module_ids_are_settings_namespaces() {
     assert!(validate_id("faces").is_ok());
     assert!(validate_id("tag-graph").is_ok());
-    for bad in ["", "a.b", "a,b", "a b", "modules"] {
+    for bad in ["", "a.b", "a,b", "a b", "modules", "indexing", "sharpness", "editor", "develop", "basic-editor"] {
         assert!(validate_id(bad).is_err(), "{bad:?}");
+    }
+    for shared in super::registry::BACKEND_NAMESPACES {
+        assert!(validate_id(shared).is_ok(), "{shared} is its module's, shared with its backend");
     }
     for m in bundled() {
         assert_eq!(validate_id(&m.meta().id), Ok(()), "a bundled module's id");
+    }
+}
+
+/// Every `"<prefix>.<key>"` settings key the host uses — constants and literal keys passed to
+/// `get_setting`/`set_setting` in the core, the model, the Tauri shell and this crate — is in a
+/// reserved namespace or a module's backend namespace, so no module id can reach it.
+#[test]
+fn every_host_settings_prefix_is_reserved() {
+    use super::registry::{BACKEND_NAMESPACES, RESERVED_NAMESPACES};
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let mut files = Vec::new();
+    fn walk(dir: &std::path::Path, files: &mut Vec<PathBuf>) {
+        for entry in std::fs::read_dir(dir).unwrap().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if !path.ends_with("vendor") {
+                    walk(&path, files);
+                }
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                files.push(path);
+            }
+        }
+    }
+    for dir in ["crates/core/src", "crates/model/src", "crates/app/src", "src-tauri/src"] {
+        walk(&root.join(dir), &mut files);
+    }
+    // `const X_KEY: &str = "p.k"` / `X_SETTING` / `SETTING_X`, and `get_setting("p.k"`.
+    let mut prefixes = std::collections::BTreeSet::new();
+    for file in &files {
+        if file.ends_with("modules/tests.rs") {
+            continue;
+        }
+        let text = std::fs::read_to_string(file).unwrap();
+        for line in text.lines() {
+            let line = line.trim();
+            let named = line.starts_with("pub const ") || line.starts_with("const ");
+            let is_setting_const = named && (line.contains("KEY") || line.contains("SETTING")) && line.contains(": &str = \"");
+            let literal = ["get_setting(\"", "set_setting(\"", "get_setting(&format!(\""]
+                .iter()
+                .find_map(|pat| line.find(pat).map(|i| i + pat.len()));
+            let start = if is_setting_const { line.find(": &str = \"").map(|i| i + ": &str = \"".len()) } else { literal };
+            let Some(start) = start else { continue };
+            let key: String = line[start..].chars().take_while(|c| *c != '"').collect();
+            if let Some((prefix, _)) = key.split_once('.') {
+                prefixes.insert((prefix.to_string(), key.clone(), file.display().to_string()));
+            }
+        }
+    }
+    assert!(prefixes.iter().any(|(p, ..)| p == "indexing"), "the scan finds indexing.speed: {prefixes:?}");
+    for (prefix, key, file) in &prefixes {
+        assert!(
+            RESERVED_NAMESPACES.contains(&prefix.as_str()) || BACKEND_NAMESPACES.contains(&prefix.as_str()),
+            "{key} ({file}): namespace {prefix:?} is neither reserved nor a backend's"
+        );
     }
 }
 
@@ -182,6 +247,7 @@ fn invalid_and_duplicate_ids_are_not_registered(cx: &mut TestAppContext) {
             probe(ModuleMeta::new("a", "Second A"), &log),
             probe(ModuleMeta::new("x.y", "Dotted"), &log),
             probe(ModuleMeta::new("modules", "Host"), &log),
+            probe(ModuleMeta::new("indexing", "Indexing"), &log),
         ],
         &[],
         &dir,
@@ -338,7 +404,7 @@ fn disabling_cascades_to_dependents_and_unloads(cx: &mut TestAppContext) {
 fn the_first_catalog_read_restores_the_enabled_set_once(cx: &mut TestAppContext) {
     let dir = TempDir::new("restore");
     let log = Log::default();
-    let b = bench(
+    let b = bench_unrestored(
         vec![
             probe(ModuleMeta::new("b", "B").requires("a"), &log),
             probe(ModuleMeta::new("a", "A"), &log),
@@ -361,6 +427,133 @@ fn the_first_catalog_read_restores_the_enabled_set_once(cx: &mut TestAppContext)
     b.model.update(cx, |m, cx| m.refresh(cx));
     cx.run_until_parked();
     assert_eq!(b.enabled(cx), ["a"], "a second catalog read does not restore again");
+}
+
+/// A toggle made before the saved set is restored — before the first catalog read, or while
+/// the restore's read runs — waits for it and lands on top of it: the saved set survives.
+#[gpui_kit::test]
+fn a_toggle_during_startup_composes_with_the_saved_set(cx: &mut TestAppContext) {
+    for when in ["before the catalog read", "during the restore's read"] {
+        let dir = TempDir::new("startup");
+        let log = Log::default();
+        let b = bench_unrestored(
+            vec![probe(ModuleMeta::new("a", "A"), &log), probe(ModuleMeta::new("c", "C"), &log)],
+            &[],
+            &dir,
+            cx,
+        );
+        b.state.catalog.lock().unwrap().as_ref().unwrap().set_setting(ENABLED_KEY, "a").unwrap();
+        if when == "before the catalog read" {
+            cx.update(|cx| ModuleRegistry::enable(&b.registry, "c", cx));
+            assert_eq!(b.enabled(cx), Vec::<String>::new(), "{when}: queued");
+            assert!(b.status(cx).contains("C will be enabled"), "{when}: said so: {}", b.status(cx));
+            b.model.update(cx, |m, cx| m.refresh(cx));
+        } else {
+            // The model's read lands and starts the restore's read; enable before that runs.
+            b.model.update(cx, |m, cx| m.refresh(cx));
+            let restore_started = |cx: &mut TestAppContext| b.model.read_with(cx, |m, _| m.catalog.is_some());
+            while !restore_started(cx) {
+                cx.executor().tick();
+            }
+            assert!(b.registry.read_with(cx, |r, _| r.restore_reading()), "{when}: the read is running");
+            cx.update(|cx| ModuleRegistry::enable(&b.registry, "c", cx));
+            assert_eq!(b.enabled(cx), Vec::<String>::new(), "{when}: queued");
+        }
+        cx.run_until_parked();
+        assert_eq!(b.enabled(cx), ["a", "c"], "{when}");
+        assert_eq!(b.setting(ENABLED_KEY).as_deref(), Some("a,c"), "{when}: the saved set survived");
+    }
+}
+
+/// After a catalog switch the new catalog's saved set applies — what it lists on, the rest
+/// off — without writing the old set into it; a catalog with no saved set keeps what is on.
+/// A write made for the old catalog never lands in the new one.
+#[gpui_kit::test]
+fn a_catalog_switch_restores_the_new_catalogs_modules(cx: &mut TestAppContext) {
+    let dir = TempDir::new("switch");
+    let log = Log::default();
+    let b = bench(
+        vec![probe(ModuleMeta::new("a", "A"), &log), probe(ModuleMeta::new("b", "B"), &log), probe(ModuleMeta::new("c", "C"), &log)],
+        &[],
+        &dir,
+        cx,
+    );
+    b.enable("a", cx);
+    b.enable("c", cx);
+    let open = |name: &str, saved: Option<&str>| {
+        let db = dir.0.join(name);
+        let c = Catalog::open(&db, &dir.0.join("photos")).unwrap();
+        if let Some(saved) = saved {
+            c.set_setting(ENABLED_KEY, saved).unwrap();
+        }
+        (c, db)
+    };
+    let switch_to = |catalog: Catalog, db: &std::path::Path, cx: &mut TestAppContext| {
+        let old = b.state.catalog.lock().unwrap().replace(catalog);
+        b.event(CoreEvent::CatalogSwitched(db.to_string_lossy().to_string()), cx);
+        old.unwrap()
+    };
+
+    let (cat_b, db_b) = open("b.chairphoto", Some("b"));
+    let cat_a = switch_to(cat_b, &db_b, cx);
+    assert_eq!(b.enabled(cx), ["b"], "B's saved set, not A's carried over");
+    assert_eq!(b.setting(ENABLED_KEY).as_deref(), Some("b"), "nothing was written into B");
+    assert_eq!(cat_a.get_setting(ENABLED_KEY).unwrap().as_deref(), Some("a,c"), "A keeps its own");
+    b.enable("c", cx);
+    assert_eq!(b.setting(ENABLED_KEY).as_deref(), Some("b,c"));
+
+    let (cat_c, db_c) = open("c.chairphoto", None);
+    switch_to(cat_c, &db_c, cx);
+    assert_eq!(b.enabled(cx), ["b", "c"], "a catalog with no saved set keeps what is on");
+    assert_eq!(b.setting(ENABLED_KEY), None);
+
+    // A toggle's write, then a catalog swap before the write runs: it must not land.
+    cx.update(|cx| ModuleRegistry::enable(&b.registry, "a", cx));
+    let (cat_d, _) = open("d.chairphoto", Some("b"));
+    b.state.catalog.lock().unwrap().replace(cat_d);
+    cx.run_until_parked();
+    assert_eq!(b.setting(ENABLED_KEY).as_deref(), Some("b"), "the write for C did not land in D");
+}
+
+/// A restore read that a catalog switch overtook is dropped: the old catalog's set is not
+/// applied, and the new catalog's restore still runs.
+#[gpui_kit::test]
+fn a_restore_read_overtaken_by_a_switch_is_dropped(cx: &mut TestAppContext) {
+    let dir = TempDir::new("overtaken");
+    let log = Log::default();
+    let b = bench_unrestored(vec![probe(ModuleMeta::new("a", "A"), &log), probe(ModuleMeta::new("b", "B"), &log)], &[], &dir, cx);
+    b.state.catalog.lock().unwrap().as_ref().unwrap().set_setting(ENABLED_KEY, "a").unwrap();
+    b.model.update(cx, |m, cx| m.refresh(cx));
+    while !b.registry.read_with(cx, |r, _| r.restore_reading()) {
+        cx.executor().tick();
+    }
+    cx.executor().tick(); // the read runs against A; its result is not applied yet
+    let db = dir.0.join("b.chairphoto");
+    let catalog = Catalog::open(&db, &dir.0.join("photos")).unwrap();
+    catalog.set_setting(ENABLED_KEY, "b").unwrap();
+    *b.state.catalog.lock().unwrap() = Some(catalog);
+    b.event(CoreEvent::CatalogSwitched(db.to_string_lossy().to_string()), cx);
+    assert_eq!(b.enabled(cx), ["b"]);
+    assert_eq!(*log.borrow(), ["load:b"], "A's set was never applied");
+}
+
+/// With no catalog open, a toggle waits (it has nowhere to be saved) and lands once one is.
+#[gpui_kit::test]
+fn a_toggle_with_no_catalog_waits_for_one(cx: &mut TestAppContext) {
+    let dir = TempDir::new("nocat");
+    let log = Log::default();
+    let b = bench_unrestored(vec![probe(ModuleMeta::new("c", "C"), &log)], &[], &dir, cx);
+    let catalog = b.state.catalog.lock().unwrap().take();
+    b.model.update(cx, |m, cx| m.refresh(cx)); // fails: no catalog, no CatalogRead
+    cx.run_until_parked();
+    b.enable("c", cx);
+    assert!(log.borrow().is_empty(), "nothing loads with nowhere to save it");
+    assert_eq!(b.status(cx), "Modules: no catalog is open yet; C will be enabled once it is done");
+    *b.state.catalog.lock().unwrap() = catalog;
+    b.model.update(cx, |m, cx| m.refresh(cx));
+    cx.run_until_parked();
+    assert_eq!(b.enabled(cx), ["c"]);
+    assert_eq!(b.setting(ENABLED_KEY).as_deref(), Some("c"));
 }
 
 /// Toggles in quick succession land in the order they were made.
@@ -397,6 +590,72 @@ fn module_settings_are_namespaced_by_id(cx: &mut TestAppContext) {
 
 // --- events ------------------------------------------------------------------------------
 
+/// Disables `target` from its `on_event`, through a registry handle set after install.
+struct Disabler {
+    meta: ModuleMeta,
+    target: &'static str,
+    registry: Rc<RefCell<Option<Entity<ModuleRegistry>>>>,
+    log: Log,
+}
+
+struct DisablerInstance {
+    target: &'static str,
+    registry: Rc<RefCell<Option<Entity<ModuleRegistry>>>>,
+    log: Log,
+}
+
+impl Module for Disabler {
+    fn meta(&self) -> ModuleMeta {
+        self.meta.clone()
+    }
+
+    fn load(&self, _: ModuleHost, _: &mut App) -> Result<Box<dyn ModuleInstance>, String> {
+        Ok(Box::new(DisablerInstance { target: self.target, registry: self.registry.clone(), log: self.log.clone() }))
+    }
+}
+
+impl ModuleInstance for DisablerInstance {
+    fn contributions(&self) -> Contributions {
+        Contributions::default()
+    }
+
+    fn on_event(&mut self, _: &CoreEvent, cx: &mut App) {
+        let registry = self.registry.borrow().clone().unwrap();
+        ModuleRegistry::disable(&registry, self.target, cx);
+    }
+
+    fn on_unload(&mut self, _: &mut App) {
+        self.log.borrow_mut().push("unload:self".into());
+    }
+}
+
+/// A module that disables itself, or a module it requires, from `on_event` does not crash
+/// the dispatch ("already borrowed"): the disable runs after the callback returns.
+#[gpui_kit::test]
+fn a_module_disabling_itself_from_on_event_is_deferred_not_a_crash(cx: &mut TestAppContext) {
+    for target in ["self", "base"] {
+        let dir = TempDir::new("reentry");
+        let log = Log::default();
+        let slot: Rc<RefCell<Option<Entity<ModuleRegistry>>>> = Rc::default();
+        let b = bench(
+            vec![
+                probe(ModuleMeta::new("base", "Base"), &log),
+                Rc::new(Disabler { meta: ModuleMeta::new("self", "Self").requires("base"), target, registry: slot.clone(), log: log.clone() }),
+            ],
+            &[],
+            &dir,
+            cx,
+        );
+        *slot.borrow_mut() = Some(b.registry.clone());
+        b.enable("self", cx);
+        b.event(scan_done(), cx);
+        assert!(!b.registry.read_with(cx, |r, _| r.is_enabled("self")), "{target}: the module ended up disabled");
+        assert!(log.borrow().contains(&"unload:self".to_string()), "{target}: and unloaded: {:?}", log.borrow());
+        let base_on = b.registry.read_with(cx, |r, _| r.is_enabled("base"));
+        assert_eq!(base_on, target == "self", "{target}: only what was asked for went");
+    }
+}
+
 /// Core events reach enabled modules only, in registration order, through the real event
 /// router (a worker thread's `send` → the model → the registry).
 #[gpui_kit::test]
@@ -409,7 +668,6 @@ fn core_events_reach_only_enabled_modules(cx: &mut TestAppContext) {
     let model = cx.new(|_| AppModel::new(state.clone(), None));
     let shell = cx.new(|cx| ShellState::new(&model, cx));
     let registry = cx.update(|cx| {
-        crate::events::spawn_router(rx, model.clone(), cx).detach();
         ModuleRegistry::install_with(
             vec![probe(ModuleMeta::new("b", "B"), &log), probe(ModuleMeta::new("a", "A"), &log), probe(ModuleMeta::new("off", "Off"), &log)],
             Vec::new(),
@@ -418,7 +676,13 @@ fn core_events_reach_only_enabled_modules(cx: &mut TestAppContext) {
             cx,
         )
     });
+    model.update(cx, |m, cx| m.refresh(cx));
+    cx.run_until_parked(); // the (empty) saved set is restored
+    // The router starts only now and is not polled before the worker's send: a send to a
+    // router already parked would wake it from a foreign thread, which the test scheduler
+    // rejects (as in `tests::a_core_event_from_a_worker_thread_reaches_the_model`).
     cx.update(|cx| {
+        crate::events::spawn_router(rx, model.clone(), cx).detach();
         ModuleRegistry::enable(&registry, "a", cx);
         ModuleRegistry::enable(&registry, "b", cx);
     });
@@ -449,6 +713,34 @@ fn a_disabled_module_gets_no_events(cx: &mut TestAppContext) {
     b.disable("a", cx);
     b.event(scan_done(), cx);
     assert_eq!(*log.borrow(), ["load:a", "event:a:scan:progress", "unload:a"]);
+}
+
+/// Each window gets its own views of a module's panels; closing a window drops its views (and
+/// their subscriptions) while the other window's stay cached.
+#[gpui_kit::test]
+fn closing_a_window_drops_its_module_views(cx: &mut TestAppContext) {
+    let dir = TempDir::new("windows");
+    let log = Log::default();
+    let b = bench(vec![probe(ModuleMeta::new("a", "A"), &log)], &[], &dir, cx);
+    b.enable("a", cx);
+    let open = |cx: &mut TestAppContext| -> gpui_kit::AnyWindowHandle {
+        cx.update(|cx| cx.open_window(Default::default(), |_, cx| cx.new(|_| Empty)).unwrap()).into()
+    };
+    let (first, second) = (open(cx), open(cx));
+    let views = |w: gpui_kit::AnyWindowHandle, cx: &mut TestAppContext| {
+        let registry = b.registry.clone();
+        cx.update_window(w, |_, window, cx| ModuleRegistry::panel_views(&registry, PanelSlot::Inspector, window, cx))
+            .unwrap()
+    };
+    let in_first = views(first, cx)[0].view.entity_id();
+    let in_second = views(second, cx)[0].view.entity_id();
+    assert_ne!(in_first, in_second, "one view per window");
+    assert_eq!(b.registry.read_with(cx, |r, _| r.cached_view_count()), 2);
+
+    cx.update_window(second, |_, window, _| window.remove_window()).unwrap();
+    cx.run_until_parked();
+    assert_eq!(b.registry.read_with(cx, |r, _| r.cached_view_count()), 1, "the closed window's view is gone");
+    assert_eq!(views(first, cx)[0].view.entity_id(), in_first, "the open window's view is still cached");
 }
 
 // --- the shell's slots, with the dev module -------------------------------------------------

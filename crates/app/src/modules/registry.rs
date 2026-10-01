@@ -13,10 +13,19 @@
 //!
 //! **Persistence.** The enabled set lives in the open catalog's `settings` table under
 //! `modules.enabled`, comma-separated in dependency order, written off the UI thread after
-//! every user toggle (a write a newer one overtook is skipped). It is read once, on the first
-//! catalog read after startup ([`AppModelEvent::CatalogRead`]), as `initHost` did; a catalog
-//! switch keeps the modules that are enabled (React did not re-read either), and the next
-//! toggle writes the set into the catalog that is open then.
+//! every user toggle (a write a newer one overtook is skipped). It is restored on the first
+//! catalog read after startup ([`AppModelEvent::CatalogRead`]), as `initHost` did, and again
+//! after every `catalog:switched`, from the new catalog: the modules it lists are enabled and
+//! those it does not list disabled, without writing (React kept the old set and the next
+//! toggle overwrote the new catalog's). A catalog that has never saved a set keeps the
+//! modules that are on. A write is tied to the catalog it was made for: one that would land
+//! in a catalog opened since is dropped.
+//!
+//! **Toggles wait for the restore.** React awaited `initHost` before anything could toggle.
+//! Here the restore's read is asynchronous, so an enable or disable asked for before it has
+//! landed — no catalog open yet, or the read still running — is queued, said on the status
+//! line, and applied on top of the restored set once it lands; then the result is written.
+//! A toggle can therefore never overwrite the saved set with a partial one.
 //!
 //! **Events.** Every [`CoreEvent`] the app model routes ([`AppModelEvent::Core`]) reaches each
 //! enabled module's `on_event`, in registration order. `appearance:theme_changed` is applied
@@ -40,9 +49,33 @@ use std::sync::{Arc, Mutex};
 /// The catalog setting holding the enabled set (host.ts `modules.enabled`).
 pub const ENABLED_KEY: &str = "modules.enabled";
 
+/// Settings namespaces the host owns: no module may take one of these as its id, or its
+/// `ModuleSettings` would read and write the host's keys. Every `<prefix>.` key the core, the
+/// model and the app use outside a module's own namespace is here (the source scan in
+/// `modules::tests` keeps this list complete):
+///
+/// - `modules` — `modules.enabled`;
+/// - `indexing` — `indexing.speed` (core `plugins/indexing.rs`);
+/// - `sharpness` — `sharpness.soft_threshold`, `sharpness.burst_soft_threshold`;
+/// - `editor` — external editors and RapidRaw (`editor.<key>.*`, `editor.rapidraw.*`),
+///   `editor.renderTiming.lastShell`;
+/// - `develop` — the Darkroom (`develop.decodeCacheGb`, `develop.preloadNeighbours`,
+///   `develop.wbSlider`);
+/// - `basic-editor` — the Darkroom's presets (`basic-editor.presets`; the Basic Editor
+///   folded into the Darkroom, #104);
+/// - `metrics` — `metrics.exportParity`;
+/// - `geocode` — the map backend's `geocode.endpoint` (the Map module's id is `map`).
+pub const RESERVED_NAMESPACES: &[&str] =
+    &["modules", "indexing", "sharpness", "editor", "develop", "basic-editor", "metrics", "geocode"];
+
+/// Namespaces a module shares with its own backend, deliberately, as in React: the module
+/// whose id this is reads and writes the keys its core backend reads (`ai.*` burst settings,
+/// `faces.*`, `smarttags.*`). Only that module may take the id.
+pub const BACKEND_NAMESPACES: &[&str] = &["ai", "faces", "smarttags"];
+
 /// Why `id` cannot be a module id, or `Ok`. Ids are settings namespaces (`<id>.<key>`) and
 /// entries in a comma-separated list: a `.` would let `a` + `b.c` and `a.b` + `c` name the
-/// same key, a `,` would split the list, and `modules` would own the host's `modules.enabled`.
+/// same key, a `,` would split the list, and a [`RESERVED_NAMESPACES`] id would own host keys.
 pub fn validate_id(id: &str) -> Result<(), String> {
     if id.is_empty() {
         return Err("a module id must not be empty".into());
@@ -50,8 +83,8 @@ pub fn validate_id(id: &str) -> Result<(), String> {
     if id.contains(['.', ',']) || id.chars().any(char::is_whitespace) {
         return Err(format!("module id {id:?} contains '.', ',' or whitespace"));
     }
-    if id == "modules" {
-        return Err("module id \"modules\" is the host's own settings namespace".into());
+    if RESERVED_NAMESPACES.contains(&id) {
+        return Err(format!("module id {id:?} is a settings namespace the host owns"));
     }
     Ok(())
 }
@@ -109,8 +142,20 @@ struct Entry {
     live: Option<Live>,
 }
 
+/// Where the restore of `modules.enabled` stands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Restore {
+    /// No catalog read yet: toggles are queued.
+    Waiting,
+    /// The read is running: toggles are queued.
+    Reading,
+    /// Restored: toggles apply and persist at once.
+    Done,
+}
+
 /// A contributed view, per window: a panel's view in the main window is not the same entity
-/// as the same panel's view in a pop-out loupe window.
+/// as the same panel's view in a pop-out loupe window. A window's views are dropped when it
+/// closes, and every view of a module when it is disabled.
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct ViewKey {
     window: WindowId,
@@ -129,11 +174,20 @@ pub struct ModuleRegistry {
     app: AppState,
     model: Entity<AppModel>,
     shell: Entity<ShellState>,
-    restored: bool,
+    restore: Restore,
+    /// Enables (`true`) and disables asked for while the restore had not landed, in order.
+    queued: Vec<(String, bool)>,
+    /// Bumped by every catalog switch: a restore read from before it is dropped.
+    restore_generation: u64,
+    /// The catalog the enabled set was restored from; writes go only to it.
+    catalog_path: Option<std::path::PathBuf>,
     views: HashMap<ViewKey, AnyView>,
     persist_generation: u64,
     /// The generation of the newest `modules.enabled` write that ran.
     persisted: Arc<Mutex<u64>>,
+    /// How many module callbacks (`load`, `on_event`, `on_unload`) are running now. An enable
+    /// or disable asked for from inside one is deferred until it returns ([`Self::enable`]).
+    in_callback: u32,
 }
 
 impl ModuleRegistry {
@@ -172,17 +226,33 @@ impl ModuleRegistry {
             app,
             model: model.clone(),
             shell: shell.clone(),
-            restored: false,
+            restore: Restore::Waiting,
+            queued: Vec::new(),
+            restore_generation: 0,
+            catalog_path: None,
             views: HashMap::new(),
             persist_generation: 0,
             persisted: Arc::new(Mutex::new(0)),
+            in_callback: 0,
         });
+        let weak = registry.downgrade();
+        cx.on_window_closed(move |cx, closed| {
+            if let Some(registry) = weak.upgrade() {
+                registry.update(cx, |r, _| r.views.retain(|key, _| key.window != closed));
+            }
+        })
+        .detach();
         let weak = registry.downgrade();
         cx.subscribe(model, move |_, event: &AppModelEvent, cx| {
             let Some(registry) = weak.upgrade() else { return };
             match event {
                 AppModelEvent::CatalogRead => Self::restore(&registry, cx),
-                AppModelEvent::Core(event) => Self::deliver(&registry, event, cx),
+                AppModelEvent::Core(event) => {
+                    if let CoreEvent::CatalogSwitched(_) = event {
+                        Self::catalog_switched(&registry, cx);
+                    }
+                    Self::deliver(&registry, event, cx)
+                }
             }
         })
         .detach();
@@ -346,7 +416,16 @@ impl ModuleRegistry {
 
     /// Enable module `id` (and its requirements) and persist the enabled set. A no-op when
     /// it is unknown or already enabled; a refusal says why on the status line.
+    ///
+    /// Asked for from inside a module callback (a module disabling itself from `on_event`, say)
+    /// it is not run there, where the module's instance is borrowed: it is logged and deferred
+    /// until the callback has returned.
+    ///
+    /// Before the saved set has been restored it is queued instead (see the module docs).
     pub fn enable(this: &Entity<Self>, id: &str, cx: &mut App) {
+        if Self::defer_if_in_callback(this, id, true, cx) || Self::queue_until_restored(this, id, true, cx) {
+            return;
+        }
         Self::enable_inner(this, id, true, &mut HashSet::new(), cx);
     }
 
@@ -380,7 +459,7 @@ impl ModuleRegistry {
             let r = this.read(cx);
             ModuleHost::new(meta.clone(), r.app.clone(), r.model.clone(), r.shell.clone())
         };
-        match module.load(host, cx) {
+        match Self::in_module(this, cx, |cx| module.load(host, cx)) {
             Ok(instance) => {
                 let contributions = instance.contributions();
                 let live = Live { instance: Rc::new(RefCell::new(instance)), contributions };
@@ -404,8 +483,59 @@ impl ModuleRegistry {
 
     /// Disable module `id`, cascading to every enabled module that requires it, and persist
     /// the enabled set. A no-op when it is unknown or not enabled.
+    /// Deferred like [`enable`](Self::enable) when asked for from inside a module callback.
     pub fn disable(this: &Entity<Self>, id: &str, cx: &mut App) {
+        if Self::defer_if_in_callback(this, id, false, cx) || Self::queue_until_restored(this, id, false, cx) {
+            return;
+        }
         Self::disable_inner(this, id, true, cx);
+    }
+
+    /// Before the restore has landed: queue the toggle and say so. Returns whether it queued.
+    fn queue_until_restored(this: &Entity<Self>, id: &str, enable: bool, cx: &mut App) -> bool {
+        let (restore, name) = {
+            let r = this.read(cx);
+            (r.restore, r.entry(id).map(|e| e.meta.name.clone()))
+        };
+        if restore == Restore::Done {
+            return false;
+        }
+        let Some(name) = name else { return true };
+        this.update(cx, |r, cx| {
+            r.queued.push((id.to_string(), enable));
+            cx.notify();
+        });
+        let verb = if enable { "enabled" } else { "disabled" };
+        let wait = if restore == Restore::Waiting { "no catalog is open yet" } else { "reading the saved modules" };
+        Self::report(this, format!("Modules: {wait}; {name} will be {verb} once it is done"), cx);
+        true
+    }
+
+    /// Run `f`, a call into a module, counted in `in_callback`.
+    fn in_module<R>(this: &Entity<Self>, cx: &mut App, f: impl FnOnce(&mut App) -> R) -> R {
+        this.update(cx, |r, _| r.in_callback += 1);
+        let out = f(cx);
+        this.update(cx, |r, _| r.in_callback -= 1);
+        out
+    }
+
+    /// Inside a module callback: log, and run the enable/disable once the callback (and the
+    /// effect cycle it is part of) has returned. Returns whether it deferred.
+    fn defer_if_in_callback(this: &Entity<Self>, id: &str, enable: bool, cx: &mut App) -> bool {
+        if this.read(cx).in_callback == 0 {
+            return false;
+        }
+        let verb = if enable { "enable" } else { "disable" };
+        eprintln!("modules: {verb} {id:?} asked for from inside a module callback; deferred until it returns");
+        let (this, id) = (this.clone(), id.to_string());
+        cx.defer(move |cx| {
+            if enable {
+                Self::enable(&this, &id, cx)
+            } else {
+                Self::disable(&this, &id, cx)
+            }
+        });
+        true
     }
 
     fn disable_inner(this: &Entity<Self>, id: &str, persist: bool, cx: &mut App) {
@@ -432,7 +562,7 @@ impl ModuleRegistry {
             r.entry_mut(id).and_then(|e| e.live.take())
         });
         if let Some(live) = live {
-            live.instance.borrow_mut().on_unload(cx);
+            Self::in_module(this, cx, |cx| live.instance.borrow_mut().on_unload(cx));
         }
         this.update(cx, |r, cx| {
             if persist {
@@ -450,6 +580,7 @@ impl ModuleRegistry {
         let csv = self.enabled_ids_in_dep_order().iter().map(|id| id.as_ref()).collect::<Vec<_>>().join(",");
         let app = self.app.clone();
         let persisted = self.persisted.clone();
+        let catalog = self.catalog_path.clone();
         cx.background_executor()
             .spawn(async move {
                 let mut newest = persisted.lock().unwrap_or_else(|e| e.into_inner());
@@ -457,39 +588,92 @@ impl ModuleRegistry {
                     return;
                 }
                 *newest = generation;
-                if let Err(e) = with_catalog(&app, |c| c.set_setting(ENABLED_KEY, &csv)) {
+                let written = with_catalog(&app, |c| match &catalog {
+                    // Under the catalog lock, so no switch can come between check and write.
+                    Some(path) if c.db_path() != path.as_path() => Ok(false),
+                    _ => c.set_setting(ENABLED_KEY, &csv).map(|()| true),
+                });
+                if let Ok(false) = written {
+                    eprintln!("modules: not saving the enabled modules: the catalog was switched");
+                }
+                if let Err(e) = written {
                     eprintln!("modules: could not save the enabled modules: {e}");
                 }
             })
             .detach();
     }
 
-    /// Enable what `modules.enabled` lists, once per app run (host.ts `initHost`). Off the UI
-    /// thread for the read; the enables themselves do not re-persist.
+    /// Enable what `modules.enabled` lists, once per app run (host.ts `initHost`), then apply
+    /// the toggles queued meanwhile and, if there were any, write the result. Off the UI
+    /// thread for the read; the restored enables themselves do not re-persist.
     fn restore(this: &Entity<Self>, cx: &mut App) {
-        if this.read(cx).restored {
+        if this.read(cx).restore != Restore::Waiting {
             return;
         }
-        this.update(cx, |r, _| r.restored = true);
+        let generation = this.update(cx, |r, _| {
+            r.restore = Restore::Reading;
+            r.restore_generation
+        });
         let app = this.read(cx).app.clone();
-        let read = cx.background_executor().spawn(async move { with_catalog(&app, |c| c.get_setting(ENABLED_KEY)) });
+        let read = cx.background_executor().spawn(async move {
+            with_catalog(&app, |c| Ok((c.get_setting(ENABLED_KEY)?, c.db_path().to_path_buf())))
+        });
         let weak = this.downgrade();
         cx.spawn(async move |cx| {
-            let csv = read.await;
+            let read = read.await;
             cx.update(|cx| {
                 let Some(this) = weak.upgrade() else { return };
-                match csv {
-                    Ok(csv) => {
-                        for id in csv.unwrap_or_default().split(',').filter(|id| !id.is_empty()) {
-                            Self::enable_inner(&this, id, false, &mut HashSet::new(), cx);
+                if this.read(cx).restore_generation != generation {
+                    return; // the catalog was switched while reading: the new one's read follows
+                }
+                match read {
+                    Ok((csv, path)) => {
+                        this.update(cx, |r, _| r.catalog_path = Some(path));
+                        if let Some(csv) = csv {
+                            let listed: Vec<&str> = csv.split(',').filter(|id| !id.is_empty()).collect();
+                            // Dependents first, so a cascade finds nothing left to do.
+                            let mut off = this.read(cx).enabled_ids_in_dep_order();
+                            off.reverse();
+                            for id in off.iter().filter(|id| !listed.contains(&id.as_ref())) {
+                                Self::disable_inner(&this, id, false, cx);
+                            }
+                            for id in listed {
+                                Self::enable_inner(&this, id, false, &mut HashSet::new(), cx);
+                            }
                         }
                     }
                     Err(e) => eprintln!("modules: could not read the enabled modules: {e}"),
                 }
-                this.update(cx, |_, cx| cx.notify());
+                let queued = this.update(cx, |r, _| {
+                    r.restore = Restore::Done;
+                    std::mem::take(&mut r.queued)
+                });
+                for (id, enable) in &queued {
+                    if *enable {
+                        Self::enable_inner(&this, id, false, &mut HashSet::new(), cx);
+                    } else {
+                        Self::disable_inner(&this, id, false, cx);
+                    }
+                }
+                this.update(cx, |r, cx| {
+                    if !queued.is_empty() {
+                        r.persist(cx);
+                    }
+                    cx.notify();
+                });
             });
         })
         .detach();
+    }
+
+    /// A catalog switch: the saved set is the new catalog's, read on the model's next catalog
+    /// read; until then toggles queue, and a read still running for the old one is dropped.
+    fn catalog_switched(this: &Entity<Self>, cx: &mut App) {
+        this.update(cx, |r, _| {
+            r.restore = Restore::Waiting;
+            r.restore_generation += 1;
+            r.catalog_path = None;
+        });
     }
 
     /// Hand `event` to every enabled module, in registration order. A module disabled by an
@@ -498,7 +682,7 @@ impl ModuleRegistry {
         for id in this.read(cx).enabled_ids() {
             let instance = this.read(cx).entry(&id).and_then(|e| e.live.as_ref()).map(|l| l.instance.clone());
             if let Some(instance) = instance {
-                instance.borrow_mut().on_event(event, cx);
+                Self::in_module(this, cx, |cx| instance.borrow_mut().on_event(event, cx));
             }
         }
     }
@@ -513,6 +697,18 @@ impl ModuleRegistry {
     }
 
     // --- views -----------------------------------------------------------------------
+
+    /// Whether the restore's read is running (tests force a toggle into that window).
+    #[cfg(test)]
+    pub(crate) fn restore_reading(&self) -> bool {
+        self.restore == Restore::Reading
+    }
+
+    /// How many contributed views are cached, over all windows.
+    #[cfg(test)]
+    pub(crate) fn cached_view_count(&self) -> usize {
+        self.views.len()
+    }
 
     /// The view for one contribution in `window`, built on first use and kept until its
     /// module is disabled.

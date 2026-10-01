@@ -201,6 +201,32 @@ fn batch_marks_and_bench_marks_do_not_advance(cx: &mut TestAppContext) {
     assert_eq!(rating_of(&app, ids[3]).2, "Green");
 }
 
+/// A culling key whose write fails does not advance: the selection stays on the photo the
+/// user tried to mark, and the status line says why (React advanced only after
+/// `applyToSelection` resolved). The failure is injected with a temporary trigger on the
+/// catalog's own connection that aborts every update of `photos`.
+#[gpui_kit::test]
+fn a_failed_culling_write_does_not_advance(cx: &mut TestAppContext) {
+    let dir = TempDir::new("grid-cull-fail");
+    let app = start(cx);
+    let ids = open_catalog_with_photos(&app, &dir, 3, cx);
+    click_tile(&app, ids[1], Modifiers::default(), cx);
+    app.state
+        .catalog
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .conn()
+        .execute_batch("CREATE TEMP TRIGGER refuse_marks BEFORE UPDATE ON photos BEGIN SELECT RAISE(ABORT, 'injected'); END;")
+        .unwrap();
+
+    press(&app, "3", cx);
+    assert_eq!(rating_of(&app, ids[1]).0, 0, "the injected failure refused the write");
+    assert!(status(&app, cx).starts_with("Could not mark:"), "status: {}", status(&app, cx));
+    assert_eq!(selection(&app, cx), (Some(ids[1]), vec![ids[1]]), "a failed mark advanced the selection");
+}
+
 /// A mark queued when the catalog switches is not written: its ids name the closed
 /// catalog's photos (AGENTS.md: a catalog switch makes older work unreachable).
 #[gpui_kit::test]
@@ -304,6 +330,53 @@ fn make_burst(c: &chairphoto_core::catalog::Catalog, ids: &[i64]) {
         let time = if i < 3 { format!("2026-01-01T10:00:0{i}") } else { format!("2026-01-01T{}:00:00", 11 + i) };
         c.conn().execute("UPDATE photos SET capture_time = ?1, phash = 7 WHERE id = ?2", (time.as_str(), *id)).unwrap();
     }
+}
+
+/// Two burst analyses (gpui #106 gate): A over the whole view (a four-frame burst with a
+/// soft third frame), then B over that soft frame alone, which clears its flag. Whichever
+/// worker runs first, B's verdict stands and B's result is the status line; A's late result
+/// — delivered after B's — is dropped (the core's own half, an older run never writing after
+/// a newer one, is forced in `burst_analysis::ownership_tests`).
+#[gpui_kit::test]
+fn a_superseded_burst_analysis_is_neither_persisted_nor_shown(cx: &mut TestAppContext) {
+    let dir = TempDir::new("grid-burst-runs");
+    let app = start(cx);
+    let ids = open_catalog_with_photos(&app, &dir, 4, cx);
+    {
+        let guard = app.state.catalog.lock().unwrap();
+        let c = guard.as_ref().unwrap();
+        make_burst(c, &ids);
+        for (&id, sharpness) in ids.iter().zip([100.0, 100.0, 10.0, 90.0]) {
+            c.conn().execute("UPDATE photos SET sharpness = ?1 WHERE id = ?2", (sharpness, id)).unwrap();
+        }
+    }
+    let analyse = |cx: &mut TestAppContext| {
+        cx.update_window(app.window(), |_, window, cx| {
+            window.dispatch_action(Box::new(crate::shell::actions::AnalyseBurst), cx)
+        })
+        .unwrap();
+    };
+    analyse(cx); // A: nothing selected, so the whole view
+    let (job_a, generation) = app.wired.shell.read_with(cx, |s, _| s.burst_owner());
+    app.wired.shell.update(cx, |s, _| s.library.select(ids[2], Default::default()));
+    analyse(cx); // B: the soft frame alone
+    cx.run_until_parked();
+    let b_line = "Burst analysis done — 1 cluster(s), 0 best frame(s), 0 soft-in-burst.";
+    assert_eq!(status(&app, cx), b_line);
+    let soft_flag = app.state.catalog.lock().unwrap().as_ref().unwrap().get_photo(ids[2]).unwrap().burst_flag;
+    assert_eq!(soft_flag, None, "A's soft-in-burst flag overwrote B's verdict");
+
+    // A's result arriving after B's, as a slower run's would.
+    let late = chairphoto_core::burst_analysis::BurstAnalysisResult {
+        total: 4,
+        clusters: 1,
+        flagged_soft: 1,
+        flagged_best: 1,
+        cleared: 0,
+    };
+    app.wired.shell.update(cx, |s, cx| s.finish_burst(job_a, generation, Ok(late), cx));
+    cx.run_until_parked();
+    assert_eq!(status(&app, cx), b_line, "the superseded run's result was shown");
 }
 
 fn stack_dialog(app: &App, cx: &mut TestAppContext) -> Entity<crate::library::stacks::StackDialog> {
@@ -593,6 +666,48 @@ fn thumbnails_are_requested_per_window(cx: &mut TestAppContext) {
     let after = app.wired.images.read_with(cx, |s, _| s.stats().submitted);
     assert!(after > first, "scrolling requested the revealed rows ({first} → {after})");
     assert!(after < 1200, "{after} requests after scrolling past a fraction of {n}");
+}
+
+/// Codex gate (Low): a filter that empties the grid releases the thumbnails the last window
+/// asked for — an empty grid draws no list, so the per-frame window hook never runs. The
+/// grid here is a second `LibraryView` over the app's shell with a pool that answers
+/// nothing, so each request stays pending until it is released (cancelled in the pool).
+#[gpui_kit::test]
+fn a_filter_that_empties_the_grid_releases_its_thumbnails(cx: &mut TestAppContext) {
+    use crate::image_tests::FakePool;
+    use chairphoto_core::image_pool::{ImageKind, JobKey};
+    let dir = TempDir::new("grid-empty-release");
+    let app = start(cx);
+    let ids = open_catalog_with_photos(&app, &dir, 12, cx);
+    let pool = std::sync::Arc::new(FakePool::default());
+    let images = cx.update(|cx| {
+        let submit: std::sync::Arc<dyn crate::image_store::Submit> = pool.clone();
+        cx.new(|cx| crate::image_store::ImageStore::new(submit, crate::image_store::DEFAULT_BUDGET_BYTES, cx))
+    });
+    let shell = app.wired.shell.clone();
+    let grid_window = cx.update(|cx| {
+        let images = images.clone();
+        cx.open_window(Default::default(), |_, cx| cx.new(|cx| LibraryView::new(shell, images, cx))).unwrap()
+    });
+    let window: gpui_kit::AnyWindowHandle = grid_window.into();
+    let frame = |cx: &mut TestAppContext| {
+        cx.update_window(window, |_, window, cx| window.render_frame(cx)).unwrap();
+        cx.run_until_parked();
+    };
+    frame(cx);
+    frame(cx);
+    let pending: Vec<i64> =
+        images.read_with(cx, |s, _| ids.iter().copied().filter(|&id| s.is_pending(id, ImageKind::Thumb)).collect());
+    assert!(!pending.is_empty(), "the grid asked for its tiles' thumbnails");
+
+    click(&app, "filter-Picks", cx);
+    assert!(rows(&app, cx).is_empty());
+    frame(cx);
+    let cancelled: Vec<JobKey> = pool.cancelled.lock().unwrap().clone();
+    for id in &pending {
+        assert!(cancelled.contains(&JobKey::photo(*id, ImageKind::Thumb)), "thumbnail {id} still queued for an empty grid");
+    }
+    images.read_with(cx, |s, _| assert!(pending.iter().all(|&id| !s.is_pending(id, ImageKind::Thumb))));
 }
 
 /// The "Stack bursts" dialog proposes the burst, and accepting stacks it under the keeper:

@@ -30,7 +30,7 @@
 //!
 //! **catalog → abort generations → status slots**, and within each of the last two groups
 //! the declaration order of [`JobRegistry`]: scan, face indexing, face matching, sharpness,
-//! pHash, trash, import, reconcile, Smart Tagging, identity repair.
+//! pHash, trash, import, reconcile, Smart Tagging, identity repair, burst analysis.
 //!
 //! Every nested acquisition in the backend obeys it:
 //!
@@ -42,6 +42,7 @@
 //! | [`AbortGeneration::install_fresh`] (scan / sharpness / pHash starts), `scans::claim_import` | one abort, released before the catalog is read |
 //! | `storage::claim_reconcile` (a back-up drain or offload-policy start) | catalog → the reconcile abort |
 //! | [`AbortGeneration::install_fresh_if_owner`] (a card import committing to index) | the scan abort → the import abort |
+//! | [`AbortGeneration::install_fresh_if_newer`] (a burst-analysis worker's claim) | one abort, released before the catalog is read |
 //! | [`AbortGeneration::trip`] (every Cancel command) | one abort |
 //! | [`JobSlot`] writes (workers) | one slot |
 //! | `develop`'s resident set (`develop::with_resident`) | a leaf: after any of the above, never across another lock |
@@ -93,6 +94,9 @@ use super::SmarttagsJobStatus;
 pub struct AbortGeneration {
     flag: Mutex<Arc<AtomicBool>>,
     seq: AtomicU64,
+    /// The newest job id that claimed this generation through
+    /// [`Self::install_fresh_if_newer`]; written only under `flag`'s lock. `0`: none yet.
+    newest_claim: AtomicU64,
 }
 
 impl AbortGeneration {
@@ -158,6 +162,25 @@ impl AbortGeneration {
         if owner_flag.load(Ordering::Relaxed) {
             return Ok(None);
         }
+        Ok(Some(trip_and_replace(&mut guard)))
+    }
+
+    /// Claim the generation for `job` — an id from [`Self::next_job_id`] — **only if** no
+    /// newer job has claimed it already: trip the installed flag and install a fresh one for
+    /// `job`. `None` when a newer job got here first; then nothing is tripped, and `job` must
+    /// not start.
+    ///
+    /// For a start whose id is allocated where the user acted (the UI thread, lock-free) but
+    /// whose claim runs on a worker: two workers may reach their claims in either order, and
+    /// comparing ids makes the later *start* the owner whichever worker arrives first (burst
+    /// analysis). A catalog switch replaces the flag without touching the claim record, so a
+    /// claim older than one already made stays refused across it.
+    pub fn install_fresh_if_newer(&self, job: u64) -> Result<Option<Arc<AtomicBool>>, String> {
+        let mut guard = self.lock()?;
+        if self.newest_claim.load(Ordering::Relaxed) >= job {
+            return Ok(None);
+        }
+        self.newest_claim.store(job, Ordering::Relaxed);
         Ok(Some(trip_and_replace(&mut guard)))
     }
 
@@ -456,6 +479,12 @@ pub struct JobRegistry {
     /// publishes a slot because the debt panel is a modal that remounts, and a pass over a
     /// 74k-row queue on a NAS long outlives one open/close of it.
     pub identity: JobFamily<IdentityRepairJobStatus>,
+    /// Burst-relative sharpness analysis (H16e, `burst_analysis`). A newer run trips an
+    /// older one — whichever worker claims first ([`AbortGeneration::install_fresh_if_newer`])
+    /// — so a slower, superseded run over an overlapping set never writes its flags over the
+    /// newer run's. No status slot: each run reports its own terminal result, tagged with its
+    /// job id so a front end drops a superseded run's.
+    pub burst: AbortGeneration,
     /// The Develop session's working image (docs/plans/raw-foundation): one claim per
     /// opened photo; a switch, exit or catalog change trips it and the image is released.
     #[cfg(all(feature = "raw", feature = "edit"))]
@@ -493,6 +522,7 @@ impl JobRegistry {
             #[cfg(feature = "smarttags")]
             smarttags,
             identity,
+            burst: _,
             #[cfg(all(feature = "raw", feature = "edit"))]
             develop,
         } = self;
@@ -532,6 +562,7 @@ impl JobRegistry {
             #[cfg(feature = "smarttags")]
             smarttags,
             identity,
+            burst,
             #[cfg(all(feature = "raw", feature = "edit"))]
             develop,
         } = self;
@@ -549,6 +580,7 @@ impl JobRegistry {
             #[cfg(feature = "smarttags")]
             smarttags: smarttags.abort.lock()?,
             identity: identity.abort.lock()?,
+            burst: burst.lock()?,
             #[cfg(all(feature = "raw", feature = "edit"))]
             develop: develop.abort.lock()?,
         })
@@ -570,6 +602,7 @@ pub struct AbortGuards<'a> {
     #[cfg(feature = "smarttags")]
     smarttags: MutexGuard<'a, Arc<AtomicBool>>,
     identity: MutexGuard<'a, Arc<AtomicBool>>,
+    burst: MutexGuard<'a, Arc<AtomicBool>>,
     #[cfg(all(feature = "raw", feature = "edit"))]
     develop: MutexGuard<'a, Arc<AtomicBool>>,
 }
@@ -591,6 +624,7 @@ impl AbortGuards<'_> {
             #[cfg(feature = "smarttags")]
             smarttags,
             identity,
+            burst,
             #[cfg(all(feature = "raw", feature = "edit"))]
             develop,
         } = self;
@@ -607,6 +641,7 @@ impl AbortGuards<'_> {
         #[cfg(feature = "smarttags")]
         smarttags.store(true, Ordering::Relaxed);
         identity.store(true, Ordering::Relaxed);
+        burst.store(true, Ordering::Relaxed);
         #[cfg(all(feature = "raw", feature = "edit"))]
         develop.store(true, Ordering::Relaxed);
     }
@@ -645,6 +680,7 @@ impl AbortGuards<'_> {
             #[cfg(feature = "smarttags")]
                 ref mut smarttags,
             ref mut identity,
+            ref mut burst,
             #[cfg(all(feature = "raw", feature = "edit"))]
                 ref mut develop,
         } = self;
@@ -665,6 +701,7 @@ impl AbortGuards<'_> {
             **smarttags = Arc::new(AtomicBool::new(false));
         }
         **identity = Arc::new(AtomicBool::new(false));
+        **burst = Arc::new(AtomicBool::new(false));
         #[cfg(all(feature = "raw", feature = "edit"))]
         {
             **develop = Arc::new(AtomicBool::new(false));
@@ -1061,6 +1098,7 @@ mod tests {
         let registry = JobRegistry::default();
         let scan = registry.scan.install_fresh().unwrap();
         let sharpness = registry.sharpness.install_fresh().unwrap();
+        let burst = registry.burst.install_fresh_if_newer(registry.burst.next_job_id()).unwrap().unwrap();
 
         let identity = begin_identity(&registry, &catalog).unwrap();
         #[cfg(feature = "smarttags")]
@@ -1073,6 +1111,7 @@ mod tests {
 
         assert!(scan.load(Ordering::Relaxed), "phase one must trip the scan generation");
         assert!(sharpness.load(Ordering::Relaxed), "phase one must trip sharpness too");
+        assert!(burst.load(Ordering::Relaxed), "and a burst analysis");
         assert!(identity.abort.load(Ordering::Relaxed), "and the identity repair pass");
         assert!(
             registry.identity.status().unwrap().is_none(),

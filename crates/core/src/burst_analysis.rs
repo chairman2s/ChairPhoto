@@ -10,6 +10,7 @@
 use crate::app::{with_catalog_as, with_catalog_identified, AppState, CatalogIdentity};
 use crate::burst::{group_into_clusters, BurstConfig, BurstPhoto, BurstVerdict};
 use serde::Serialize;
+use std::sync::atomic::Ordering;
 
 /// Summary of one [`analyze_burst_sharpness`] run.
 #[derive(Debug, Clone, Serialize)]
@@ -34,8 +35,22 @@ pub struct BurstAnalysisResult {
 pub const BURST_SOFT_THRESHOLD_KEY: &str = "sharpness.burst_soft_threshold";
 pub const BURST_SOFT_THRESHOLD_DEFAULT: f64 = 0.60;
 
+/// What a burst analysis answers when a newer one replaced it before it wrote its flags.
+/// Nothing was written; a front end that tracks the newest run's job id drops this result.
+pub const BURST_SUPERSEDED: &str = "A newer burst analysis replaced this one; its flags were not saved";
+
+/// Allocate the next burst-analysis job id. Lock-free: a front end calls it where the user
+/// started the run (the UI thread), so the id order is the order of the starts, and hands it
+/// to [`analyze_burst_sharpness_as`].
+pub fn next_burst_job(state: &AppState) -> u64 {
+    state.jobs.burst.next_job_id()
+}
+
 /// Analyse burst-relative sharpness for a set of photos. Blocking: call it on a worker.
 ///
+/// 0. Claim the burst generation for this run's job id (`JobRegistry::burst`,
+///    `install_fresh_if_newer`), tripping any older run; a run whose newer sibling already
+///    claimed it stops here with [`BURST_SUPERSEDED`].
 /// 1. Read the threshold and the clustering settings (`ai.burst_time_gap_secs`,
 ///    `ai.burst_hamming_threshold`), and `(capture_time, phash, rating, sharpness)` for
 ///    each id — under the catalog lock.
@@ -43,7 +58,11 @@ pub const BURST_SOFT_THRESHOLD_DEFAULT: f64 = 0.60;
 /// 3. For clusters with >1 sharpness-scored member: flag members below
 ///    `threshold × median` as `"soft-in-burst"` and crown the sharpest
 ///    `"sharpest-of-burst"`. Single-photo clusters: clear any stale flag.
-/// 4. Write all flags in a single transaction via `Catalog::set_burst_flags`.
+/// 4. Write all flags in a single transaction via `Catalog::set_burst_flags` — unless a newer
+///    run tripped this one's generation, checked under the same catalog lock hold as the
+///    write. Then nothing is written and the run answers [`BURST_SUPERSEDED`]. A newer run
+///    trips the older one when it claims, before its own read, so the older run can never
+///    write after the newer one did.
 ///
 /// `photo_ids` is typically the current selection or view. Unscored photos (sharpness IS
 /// NULL) are clustered but flagged neither way (they have no score to compare).
@@ -54,21 +73,35 @@ pub const BURST_SOFT_THRESHOLD_DEFAULT: f64 = 0.60;
 /// Tauri command calls this; a front end that read `photo_ids` itself passes the identity it
 /// read them with ([`analyze_burst_sharpness_as`]).
 pub fn analyze_burst_sharpness(state: &AppState, photo_ids: &[i64]) -> Result<BurstAnalysisResult, String> {
-    analyze(state, None, photo_ids)
+    analyze(state, None, photo_ids, next_burst_job(state), || {})
 }
 
 /// [`analyze_burst_sharpness`] over ids read from the catalog `expected` names: both the
 /// read (step 1) and the write (step 4) fail closed with `CATALOG_CHANGED` once another
-/// catalog is open, so the ids never reach another catalog's rows.
+/// catalog is open, so the ids never reach another catalog's rows. `job` is the run's id from
+/// [`next_burst_job`], allocated when the user started it.
 pub fn analyze_burst_sharpness_as(
     state: &AppState,
     expected: CatalogIdentity,
     photo_ids: &[i64],
+    job: u64,
 ) -> Result<BurstAnalysisResult, String> {
-    analyze(state, Some(expected), photo_ids)
+    analyze(state, Some(expected), photo_ids, job, || {})
 }
 
-fn analyze(state: &AppState, expected: Option<CatalogIdentity>, photo_ids: &[i64]) -> Result<BurstAnalysisResult, String> {
+/// The analysis. `before_write` runs after the flags are computed and before they are
+/// persisted, outside every lock — a seam for tests that force another run in between.
+fn analyze(
+    state: &AppState,
+    expected: Option<CatalogIdentity>,
+    photo_ids: &[i64],
+    job: u64,
+    before_write: impl FnOnce(),
+) -> Result<BurstAnalysisResult, String> {
+    // ── Step 0: claim this run's generation, before reading anything ──────────
+    let Some(abort) = state.jobs.burst.install_fresh_if_newer(job)? else {
+        return Err(BURST_SUPERSEDED.into());
+    };
     if photo_ids.is_empty() {
         return Ok(BurstAnalysisResult { total: 0, clusters: 0, flagged_soft: 0, flagged_best: 0, cleared: 0 });
     }
@@ -141,8 +174,20 @@ fn analyze(state: &AppState, expected: Option<CatalogIdentity>, photo_ids: &[i64
         }
     }
 
-    // ── Step 4: persist ───────────────────────────────────────────────────────
-    with_catalog_as(state, read_from, |c| c.set_burst_flags(flags))?;
+    // ── Step 4: persist, unless superseded ────────────────────────────────────
+    before_write();
+    // The abort check shares the write's catalog lock hold: a newer run trips this one when
+    // it claims, before taking the lock for its own read, so this run either writes before
+    // the newer run reads or sees the trip and writes nothing.
+    let written = with_catalog_as(state, read_from, |c| {
+        if abort.load(Ordering::Relaxed) {
+            return Ok(false);
+        }
+        c.set_burst_flags(flags).map(|()| true)
+    })?;
+    if !written {
+        return Err(BURST_SUPERSEDED.into());
+    }
 
     Ok(BurstAnalysisResult { total, clusters: num_clusters, flagged_soft, flagged_best, cleared })
 }
@@ -285,5 +330,81 @@ mod burst_flag_tests {
         let f = flag_cluster(&members, 0.60);
         assert_eq!(verdict_of(&f, 1), BurstVerdict::Unscored);
         assert_eq!(f.best, None);
+    }
+}
+
+#[cfg(test)]
+mod ownership_tests {
+    //! Job ownership between two runs (gpui #106 gate): a newer analysis makes an older one
+    //! unreachable, whichever finishes first.
+    use super::*;
+    use crate::catalog::Catalog;
+
+    /// A state with one catalog holding a four-frame burst (a second apart, one pHash),
+    /// sharpness 100, 100, 10, 90 — so a run over all four flags the third `soft-in-burst`.
+    fn burst_state(tag: &str) -> (AppState, Vec<i64>, crate::test_support::TestTmpDir) {
+        let dir = crate::test_support::TestTmpDir::new(tag);
+        let root = dir.join("photos");
+        let catalog = Catalog::open(&dir.join("c.chairphoto"), &root).unwrap();
+        let ids: Vec<i64> = [100.0, 100.0, 10.0, 90.0]
+            .iter()
+            .enumerate()
+            .map(|(i, sharpness)| {
+                let id = catalog.upsert_photo(&root.join(format!("2026/b{i}.ARW")), None, 0, 1).unwrap().id;
+                catalog
+                    .conn()
+                    .execute(
+                        "UPDATE photos SET capture_time = ?1, phash = 7, sharpness = ?2 WHERE id = ?3",
+                        (format!("2026-01-01T10:00:0{i}"), sharpness, id),
+                    )
+                    .unwrap();
+                id
+            })
+            .collect();
+        let state = AppState::default();
+        *state.catalog.lock().unwrap() = Some(catalog);
+        (state, ids, dir)
+    }
+
+    fn flags(state: &AppState, ids: &[i64]) -> Vec<Option<String>> {
+        let guard = state.catalog.lock().unwrap();
+        ids.iter().map(|&id| guard.as_ref().unwrap().get_photo(id).unwrap().burst_flag).collect()
+    }
+
+    /// **Forced interleaving.** A (over the whole burst) starts and has computed its flags;
+    /// then B (over the soft frame alone, which clears its flag) starts, runs and writes; then
+    /// A reaches its write. A writes nothing and answers `BURST_SUPERSEDED`; B's result stands.
+    #[test]
+    fn an_older_run_finishing_after_a_newer_one_writes_nothing() {
+        let (state, ids, _dir) = burst_state("burst-own-late");
+        let (a, b) = (next_burst_job(&state), next_burst_job(&state));
+        let soft = ids[2];
+        let a_result = analyze(&state, None, &ids, a, || {
+            let r = analyze(&state, None, &[soft], b, || {}).expect("the newer run completes");
+            assert_eq!(r.cleared, 1, "B: a lone frame is cleared");
+        });
+        assert_eq!(a_result.unwrap_err(), BURST_SUPERSEDED);
+        assert_eq!(flags(&state, &ids), vec![None; 4], "the superseded run's flags were persisted");
+    }
+
+    /// The claims themselves, reversed: B's worker claims, runs and writes before A's worker
+    /// claims at all. A — the older start — is refused at its claim and writes nothing.
+    #[test]
+    fn an_older_run_claiming_after_a_newer_one_is_refused() {
+        let (state, ids, _dir) = burst_state("burst-own-claim");
+        let (a, b) = (next_burst_job(&state), next_burst_job(&state));
+        analyze(&state, None, &[ids[2]], b, || {}).expect("the newer run completes");
+        assert_eq!(analyze(&state, None, &ids, a, || {}).unwrap_err(), BURST_SUPERSEDED);
+        assert_eq!(flags(&state, &ids), vec![None; 4], "the older run wrote after the newer one");
+    }
+
+    /// Without a rival, a run writes its flags (the fixture really is a burst with a soft
+    /// frame, so the two tests above would see A's write if it happened).
+    #[test]
+    fn a_lone_run_writes_its_flags() {
+        let (state, ids, _dir) = burst_state("burst-own-lone");
+        let r = analyze_burst_sharpness(&state, &ids).unwrap();
+        assert_eq!((r.clusters, r.flagged_soft, r.flagged_best), (1, 1, 1));
+        assert_eq!(flags(&state, &ids)[2].as_deref(), Some("soft-in-burst"));
     }
 }

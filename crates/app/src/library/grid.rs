@@ -203,6 +203,18 @@ impl LibraryView {
         self.requested = keep;
     }
 
+    /// Release every thumbnail the grid still has asked for — the window is gone (an empty
+    /// grid draws no list). A no-op once released, so it is cheap on every empty frame.
+    fn release_requested(&mut self, cx: &mut Context<Self>) {
+        if self.requested.is_empty() {
+            return;
+        }
+        let dropped = std::mem::take(&mut self.requested);
+        self.images.update(cx, |store, _| {
+            store.release_pending(|k| k.kind != ImageKind::Thumb || !dropped.contains(&k.photo));
+        });
+    }
+
     /// The rows `range` of the grid, as `uniform_list` asks for them (during its layout and
     /// prepaint). Builds elements from what the session and the image store hold; loads
     /// nothing (see [`Self::on_visible`]).
@@ -592,6 +604,9 @@ impl Render for LibraryView {
             // A fresh set of rows opens at the bottom again (React remounted the grid).
             self.opened_at_bottom = false;
             self.scrolled_for = None;
+            // No list is drawn, so `on_visible` never runs to release the last window: the
+            // thumbnails it asked for would stay queued for tiles that are gone.
+            self.release_requested(cx);
             return root
                 .items_center()
                 .justify_center()

@@ -555,3 +555,31 @@ fn luts_are_chosen_and_imported(cx: &mut TestAppContext) {
     assert_eq!(rig.working(cx)["lut"], json!({"file": "Portra.cube", "amount": 1}));
     assert_eq!(rig.darkroom(cx).read_with(cx, |d, _| d.luts.clone()), ["Portra.cube", "film.cube"]);
 }
+
+/// **Forced interleaving.** A LUT import on one photo is overtaken by a step: the next
+/// photo's open (and its listing of the LUT folder) runs first, then the copy lands. The list
+/// — the folder's, not the photo's — still gains the import; the selection is applied to
+/// neither the next photo nor anything else.
+#[gpui_kit::test]
+fn a_lut_import_overtaken_by_a_step_refreshes_the_list_only(cx: &mut TestAppContext) {
+    let rig = rig("dk-lut-step", 2, cx);
+    let order = rig.app.wired.shell.read_with(cx, |s, _| s.library.photo_ids());
+    let src = rig.dir.0.join("Portra.cube");
+    std::fs::write(&src, "LUT_3D_SIZE 2\n0 0 0\n1 0 0\n0 1 0\n1 1 0\n0 0 1\n1 0 1\n0 1 1\n1 1 1\n").unwrap();
+    rig.darkroom(cx).update(cx, |d, cx| d.import_lut(src, cx));
+    let held = cx.update(|cx| Runner::get(cx).hold_pending());
+    assert!(!held.is_empty(), "the import is on the worker");
+    assert!(rig.view(cx).update(cx, |v, cx| v.step(1, None, cx)));
+    cx.run_until_parked();
+    work(cx); // the next photo opens and lists the folder before the copy
+    assert_eq!(rig.open_photo(cx), Some(order[1]));
+    assert_eq!(rig.darkroom(cx).read_with(cx, |d, _| d.luts.clone()), ["film.cube"]);
+    cx.update(|cx| Runner::get(cx).release(held));
+    work(cx);
+    assert!(rig.dir.0.join("luts/Portra.cube").exists());
+    assert_eq!(rig.darkroom(cx).read_with(cx, |d, _| d.luts.clone()), ["Portra.cube", "film.cube"], "the list is refreshed");
+    assert_eq!(rig.working(cx), json!({}), "not selected for the photo it was not imported on");
+    advance(cx, AUTOSAVE_QUIET);
+    work(cx);
+    assert!(rig.catalog(|c| c.list_versions(order[1]).unwrap()).is_empty());
+}

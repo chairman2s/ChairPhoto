@@ -900,32 +900,43 @@ impl Darkroom {
     }
 
     /// "Import…": validate a `.cube` file, copy it into the LUT folder (the file itself is
-    /// only read), and select it.
+    /// only read), and select it for the photo it was imported on.
+    ///
+    /// Not [`run`](Self::run): the folder is the Darkroom's, not the photo's, so the list is
+    /// refreshed whatever is open when the copy lands; only the selection is the photo's,
+    /// and it is applied only while that photo is still the open one (a step in between
+    /// leaves the next photo's record alone).
     pub fn import_lut(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         let Some(seq) = self.open.as_ref().map(|o| o.seq) else { return };
         let luts_dir = self.luts_dir.clone();
-        self.run(
-            seq,
-            move |_| {
-                let dir = luts_dir()?;
-                let name = editing::import_lut_into(&dir, &path)?;
-                Ok((name, editing::list_luts_in(&dir)?))
-            },
-            |this, result, cx| match result {
+        let rx = Runner::get(cx).run(move || -> Result<(String, Vec<String>), String> {
+            let dir = luts_dir()?;
+            let name = editing::import_lut_into(&dir, &path)?;
+            Ok((name, editing::list_luts_in(&dir)?))
+        });
+        cx.spawn(async move |this, cx| {
+            let result = rx.await.unwrap_or_else(|_| Err("the worker stopped".into()));
+            this.update(cx, |this, cx| match result {
                 Ok((name, luts)) => {
                     this.luts = luts;
-                    let next = this.open.as_ref().map(|o| chairphoto_model::darkroom::controls::set_lut(&o.working, Some(&name)));
+                    let next = this
+                        .open
+                        .as_ref()
+                        .filter(|o| o.seq == seq)
+                        .map(|o| chairphoto_model::darkroom::controls::set_lut(&o.working, Some(&name)));
                     if let Some(next) = next {
                         this.apply(next, None, cx);
                     }
+                    cx.notify();
                 }
                 Err(e) => {
                     this.error = Some(e);
                     cx.notify();
                 }
-            },
-            cx,
-        );
+            })
+            .ok();
+        })
+        .detach();
     }
 
     // --- the filmstrip --------------------------------------------------------------------

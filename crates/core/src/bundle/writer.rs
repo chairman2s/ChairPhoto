@@ -320,9 +320,18 @@ pub fn write_bundle(
 /// What a bundle write stopped by its abort flag reports (`write_bundle_abortable`).
 pub const BUNDLE_EXPORT_CANCELLED: &str = "Bundle export cancelled";
 
-/// [`write_bundle`], checking `abort` before each photo. A tripped flag stops the write
-/// there with [`BUNDLE_EXPORT_CANCELLED`]: the temporary file is removed and nothing is
-/// placed at `dest_path`, so a half-written bundle never looks like a finished one.
+fn aborted(abort: &std::sync::atomic::AtomicBool) -> bool {
+    abort.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+fn cancelled() -> String {
+    format!("{BUNDLE_EXPORT_CANCELLED} — nothing was written to the destination.")
+}
+
+/// [`write_bundle`], checking `abort` before each photo, before the zip's finish and before
+/// the rename. A tripped flag stops the write there with [`BUNDLE_EXPORT_CANCELLED`]: the
+/// temporary file is removed and nothing is placed at `dest_path`, so a half-written bundle
+/// never looks like a finished one.
 pub fn write_bundle_abortable(
     bundle: &GatheredBundle,
     dest_path: &Path,
@@ -344,7 +353,14 @@ pub fn write_bundle_abortable(
     // older, tripped one is still mid-photo) never share a temp file, so neither truncates,
     // deletes nor renames the other's.
     let (tmp_path, file) = create_unique_temp(dir)?;
-    let result = write_bundle_to_file(bundle, file, total_steps, abort, &on_progress);
+    let result = write_bundle_to_file(bundle, file, total_steps, abort, &on_progress).and_then(|r| {
+        // A trip during the last photo or the zip's finish still stops it: checked again
+        // right before the rename, the last point where nothing has reached `dest_path`.
+        if aborted(abort) {
+            return Err(cancelled());
+        }
+        Ok(r)
+    });
 
     match result {
         Ok(r) => {
@@ -410,8 +426,8 @@ fn write_bundle_to_file(
     let mut done = 0usize;
 
     for bp in &bundle.manifest.photos {
-        if abort.load(std::sync::atomic::Ordering::Relaxed) {
-            return Err(format!("{BUNDLE_EXPORT_CANCELLED} — nothing was written to the destination."));
+        if aborted(abort) {
+            return Err(cancelled());
         }
         let original_path = bundle.originals.get(&bp.uuid).and_then(|o| o.as_ref());
 
@@ -478,6 +494,10 @@ fn write_bundle_to_file(
         }
     }
 
+    // A trip during the last photo stops it before the central directory is written.
+    if aborted(abort) {
+        return Err(cancelled());
+    }
     zip.finish().map_err(|e| format!("zip finish: {e}"))?;
     Ok(result)
 }

@@ -412,6 +412,26 @@ mod tests {
         assert_eq!(files(&f.dir.join("out")), ["trip.chairphoto"], "no temp file is left behind");
     }
 
+    /// A Cancel during the last photo (its preview step, the final progress call) — after
+    /// the loop's last per-photo check — still stops the bundle: no bundle at the
+    /// destination, no temp file, and the result says cancelled.
+    #[test]
+    fn a_cancel_during_the_last_photo_leaves_no_bundle_and_reports_cancelled() {
+        let f = fixture("bundle-last", 2);
+        let dest = f.dir.join("out/last.chairphoto");
+        let claim = claim_bundle_export(&f.state).unwrap();
+        let state = f.state.clone();
+        let err = export_bundle_claimed_with(&f.state, &claim, None, f.batch, &dest, &move |done, total| {
+            if done == total {
+                cancel_bundle_export(&state).unwrap();
+            }
+        })
+        .unwrap_err();
+        assert!(err.starts_with(crate::bundle::writer::BUNDLE_EXPORT_CANCELLED), "{err}");
+        assert!(!dest.exists(), "nothing at the destination");
+        assert!(files(&f.dir.join("out")).is_empty(), "no temp file is left behind");
+    }
+
     /// The archive's entry names, sorted (panics on an unreadable zip).
     fn bundle_entries(path: &Path) -> Vec<String> {
         let mut zip = zip::ZipArchive::new(std::fs::File::open(path).unwrap()).unwrap();

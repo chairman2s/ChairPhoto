@@ -218,6 +218,48 @@ fn zooming_in_swaps_to_the_zoom_tier_and_stepping_releases_it(cx: &mut TestAppCo
     assert!(pool.cancelled.lock().unwrap().contains(&zoom_key(ids[1])), "the old zoom tier is released");
 }
 
+fn cached(app: &App, id: i64, kind: ImageKind, cx: &mut TestAppContext) -> bool {
+    app.wired.images.read_with(cx, |s, _| s.lru().peek(&s.key(id, kind)).is_some())
+}
+
+/// Stepping away releases the loaded full-resolution tier of the photo left, not just a
+/// pending one; its preview stays cached, and the new photo's own zoom tier is kept.
+#[gpui_kit::test]
+fn stepping_away_evicts_the_loaded_zoom_tier_of_the_photo_left(cx: &mut TestAppContext) {
+    let (app, pool, _dir, ids) = app_with(3, "loupe-evict", cx);
+    select(&app, ids[0], cx);
+    press(&app, "enter", cx);
+    pool.finish(&preview(ids[0]), Ok(pixels(300, 200)));
+    cx.run_until_parked();
+    wheel(&app, "loupe-image", true, cx);
+    pool.finish(&zoom_key(ids[0]), Ok(pixels(3000, 2000)));
+    cx.run_until_parked();
+    assert!(cached(&app, ids[0], ImageKind::Zoom, cx), "the zoom tier is in");
+
+    press(&app, "right", cx);
+    assert!(!cached(&app, ids[0], ImageKind::Zoom, cx), "released with the step");
+    assert!(cached(&app, ids[0], ImageKind::Preview, cx), "the preview stays for a step back");
+
+    pool.finish(&preview(ids[1]), Ok(pixels(300, 200)));
+    cx.run_until_parked();
+    wheel(&app, "loupe-image", true, cx);
+    pool.finish(&zoom_key(ids[1]), Ok(pixels(3000, 2000)));
+    cx.run_until_parked();
+    // A re-sync that is no step (a render, a shell change) keeps the target's tier.
+    app.wired.shell.update(cx, |_, cx| cx.notify());
+    render(&app, cx);
+    assert!(cached(&app, ids[1], ImageKind::Zoom, cx), "the target keeps its own");
+    // Stepping onto a photo whose zoom tier is already in (another view loaded it) keeps it.
+    app.wired.images.update(cx, |s, _| s.request(ids[2], ImageKind::Zoom));
+    pool.finish(&zoom_key(ids[2]), Ok(pixels(3000, 2000)));
+    cx.run_until_parked();
+    press(&app, "right", cx);
+    assert!(!cached(&app, ids[1], ImageKind::Zoom, cx));
+    assert!(cached(&app, ids[2], ImageKind::Zoom, cx), "the target's tier is kept");
+    press(&app, "escape", cx);
+    assert!(!cached(&app, ids[2], ImageKind::Zoom, cx), "closing the loupe leaves the photo too");
+}
+
 /// A double-click at fit waits for the full-resolution image, then shows it at 100 %.
 #[gpui_kit::test]
 fn a_double_click_waits_for_the_zoom_tier_then_shows_100_percent(cx: &mut TestAppContext) {

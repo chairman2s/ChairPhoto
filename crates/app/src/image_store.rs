@@ -223,16 +223,26 @@ pub fn runner(state: chairphoto_core::app::AppState) -> chairphoto_core::image_p
 /// The indices navigation loads, in load order: `index`, then `index + 1`, then `index − 1`
 /// (the ones that exist). AGENTS.md: the requested photo first, then its neighbours.
 pub fn neighbours(len: usize, index: usize) -> Vec<usize> {
+    neighbour_window(len, index, 1, 1)
+}
+
+/// [`neighbours`] with a wider preload: `index`, then N+1 and N−1 (the AGENTS.md order),
+/// then the rest of the window ahead (N+2 … N+`ahead`), then the rest behind
+/// (N−2 … N−`behind`). Culling moves forward, so the loupe and the cull session preload
+/// further ahead than behind (React prefetched +1..+5, −1, −2 and +1..+5, −1).
+pub fn neighbour_window(len: usize, index: usize, ahead: usize, behind: usize) -> Vec<usize> {
     if index >= len {
         return Vec::new();
     }
     let mut out = vec![index];
-    if index + 1 < len {
+    if ahead >= 1 && index + 1 < len {
         out.push(index + 1);
     }
-    if index > 0 {
+    if behind >= 1 && index >= 1 {
         out.push(index - 1);
     }
+    out.extend((2..=ahead).map(|d| index + d).take_while(|&i| i < len));
+    out.extend((2..=behind).map_while(|d| index.checked_sub(d)));
     out
 }
 
@@ -328,6 +338,12 @@ impl ImageStore {
 
     pub fn stats(&self) -> StoreStats {
         self.stats
+    }
+
+    /// The decode pool this store submits to: edit renders (the loupe's version render, the
+    /// Duel's and the Proof sheet's variants) go to the same workers.
+    pub fn pool(&self) -> Arc<dyn Submit> {
+        self.pool.clone()
     }
 
     pub fn lru(&self) -> &ImageLru {
@@ -453,8 +469,18 @@ impl ImageStore {
     /// The loupe moved to `photos[index]`: supersede this tier's other pending requests, then
     /// request the current photo, N+1 and N−1, in that order, as one batch.
     pub fn navigate(&mut self, photos: &[i64], index: usize, kind: ImageKind) {
-        let wanted: Vec<(i64, ImageKind)> =
-            neighbours(photos.len(), index).into_iter().map(|i| (photos[i], kind)).collect();
+        self.navigate_window(photos, index, kind, 1, 1);
+    }
+
+    /// [`navigate`](Self::navigate) over a wider window ([`neighbour_window`]): the current
+    /// photo first, then N+1, N−1, then the rest ahead and behind — one batch, so the current
+    /// photo is on top of the pool's stack. This tier's pending requests outside the window
+    /// are superseded.
+    pub fn navigate_window(&mut self, photos: &[i64], index: usize, kind: ImageKind, ahead: usize, behind: usize) {
+        let wanted: Vec<(i64, ImageKind)> = neighbour_window(photos.len(), index, ahead, behind)
+            .into_iter()
+            .map(|i| (photos[i], kind))
+            .collect();
         let keep: HashSet<i64> = wanted.iter().map(|&(p, _)| p).collect();
         self.release_pending(|k| k.kind != kind || keep.contains(&k.photo));
         self.submit(&wanted, true);

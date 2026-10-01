@@ -60,6 +60,16 @@ actions!(
         /// More ⋯ → Propose stacks…, and the bench's Stack: the "Stack bursts" dialog over
         /// the selection, else the whole view (`library::stacks`).
         ProposeStacks,
+        // The loupe (#109, `crate::loupe`):
+        /// More ⋯ → Loupe, Enter with an active photo, a double-click on a tile: the inline
+        /// loupe on or off.
+        ToggleLoupe,
+        /// More ⋯ → Start cull session, and the bench's Cull: over the selection, else the
+        /// whole view.
+        StartCullSession,
+        /// The bench's Compare (C in the grid): Compare over the selection (two or more); in
+        /// Compare it closes it again.
+        OpenCompare,
     ]
 );
 
@@ -100,14 +110,15 @@ not_yet_ported! {
     ExportSelection => ("Export", 115),
     /// More ⋯ → Open loupe in a new window.
     PopOutLoupe => ("Open loupe in a new window", 110),
-    /// More ⋯ → Loupe (Enter in the grid).
-    ToggleLoupe => ("Loupe", 109),
-    /// More ⋯ → Start cull session, and the bench's Cull.
-    StartCullSession => ("Start cull session", 109),
-    /// The bench's Compare (C in the grid).
-    OpenCompare => ("Compare", 109),
     /// The icon rail's Develop.
     OpenDevelop => ("Develop", 111),
+    /// The loupe's "unavailable" state: Relocate… (a file picker; the grid context menu's
+    /// commands are Storage and import's).
+    RelocatePhoto => ("Relocate…", 114),
+    /// The loupe's "unavailable" state: Retrieve from NAS.
+    RetrieveFromNas => ("Retrieve from NAS", 114),
+    /// The loupe's "unavailable" state: Remove from catalog.
+    RemoveFromCatalog => ("Remove from catalog", 114),
 }
 
 #[cfg(test)]

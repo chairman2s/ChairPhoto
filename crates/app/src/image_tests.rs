@@ -4,7 +4,7 @@
 //! forced, not hoped for.
 
 use crate::image_store::{
-    image_bytes, neighbours, to_bgra, ImageKey, ImageLru, ImageState, ImageStore, Loaded, Submit,
+    image_bytes, neighbour_window, neighbours, to_bgra, ImageKey, ImageLru, ImageState, ImageStore, Loaded, Submit,
 };
 use chairphoto_core::image_pool::{ImageKind, JobKey, Respond, CANCELLED};
 use gpui_kit::{
@@ -188,6 +188,18 @@ fn neighbours_are_current_then_next_then_previous() {
     assert_eq!(neighbours(1, 0), vec![0]);
     assert!(neighbours(0, 0).is_empty());
     assert!(neighbours(3, 3).is_empty());
+}
+
+/// The loupe's and the cull session's wider preload: still current, N+1, N−1 first.
+#[test]
+fn a_neighbour_window_loads_current_next_previous_then_the_rest() {
+    assert_eq!(neighbour_window(20, 10, 5, 2), vec![10, 11, 9, 12, 13, 14, 15, 8]);
+    assert_eq!(neighbour_window(20, 10, 5, 1), vec![10, 11, 9, 12, 13, 14, 15]);
+    assert_eq!(neighbour_window(12, 10, 5, 2), vec![10, 11, 9, 8], "clipped at the end");
+    assert_eq!(neighbour_window(20, 0, 5, 2), vec![0, 1, 2, 3, 4, 5], "clipped at the start");
+    assert_eq!(neighbour_window(20, 1, 1, 3), vec![1, 2, 0]);
+    assert_eq!(neighbour_window(5, 2, 1, 1), neighbours(5, 2));
+    assert!(neighbour_window(3, 3, 5, 2).is_empty());
 }
 
 // --- the store -------------------------------------------------------------------------------

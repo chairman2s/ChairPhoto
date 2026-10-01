@@ -115,7 +115,7 @@ impl LibraryView {
         self.focus.focus(window, cx);
         let m = event.modifiers();
         if event.click_count() >= 2 {
-            // Double-click opens (React `onOpen`: select, then the inline loupe, #109).
+            // Double-click opens (React `onOpen`: select, then the inline loupe).
             self.shell.update(cx, |s, cx| s.select_with(cx, |l| l.select(id, SelectMods::default())));
             window.dispatch_action(Box::new(ToggleLoupe), cx);
             return;

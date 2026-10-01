@@ -8,7 +8,8 @@
 //! └──────┴────────────────────┴─────────────────────────┴─────────────┘
 //! ```
 //!
-//! The stage is the slot the Library grid ([`LibraryView`]), the loupe (#109) and the
+//! The stage is the slot the Library grid ([`LibraryView`]), the loupe and Compare
+//! ([`crate::loupe`], `ShellState::stage_view`) and the
 //! Darkroom (#111) fill; a surface not ported yet says so. The side columns drag-resize from
 //! 140 to 640 px; at or below 1024 px window width they become overlays behind a scrim
 //! (`useNarrow.ts`). The "Stack bursts" dialog ([`StackDialog`]) opens over everything.
@@ -29,6 +30,11 @@ use crate::image_store::ImageStore;
 use crate::inspector::PhotoInspector;
 use crate::library::grid::LibraryView;
 use crate::library::stacks::{Closed, StackDialog};
+use crate::loupe::compare::{CompareMode, MODE_PREF};
+use crate::loupe::compare_view::CompareView;
+use crate::loupe::cull::{CullEnded, CullView};
+use crate::loupe::view::{Follow, LoupeView};
+use crate::machine_prefs::MachinePrefs;
 use crate::model::AppModel;
 use crate::modules::registry::SlotView;
 use crate::modules::{panel as module_panel, ModuleRegistry, PanelSlot};
@@ -37,7 +43,7 @@ use crate::tags::panel::TagPanel;
 use crate::tags::photo_tags::{PhotoTags, TagTarget};
 use crate::tags::TagsState;
 use crate::shell::actions::*;
-use crate::shell::state::{ShellState, Side, Surface, NARROW_MAX_W};
+use crate::shell::state::{ShellState, Side, StageView, Surface, NARROW_MAX_W};
 use crate::shell::style::Colors;
 use gpui_kit::component::slider::SliderState;
 use gpui_kit::prelude::*;
@@ -74,10 +80,18 @@ pub struct RootView {
     pub(crate) inspector: Entity<PhotoInspector>,
     /// The "Stack bursts" dialog while it is open, and its close subscription.
     pub(crate) stacks: Option<(Entity<StackDialog>, Subscription)>,
+    /// The inline loupe and Compare (#109), on the Library stage instead of the grid while
+    /// the shell says so (`ShellState::stage_view`).
+    pub(crate) loupe: Entity<LoupeView>,
+    pub(crate) compare: Entity<CompareView>,
+    /// The cull session while it runs (full screen, over everything), and its end.
+    pub(crate) cull: Option<(Entity<CullView>, Subscription)>,
+    /// What the stage showed at the last shell change: a change hands focus to the new view.
+    stage_seen: StageView,
     /// The catalog the dialog was opened on: a switch closes it.
     catalog_epoch: u64,
     resize: Option<Resize>,
-    _observers: [Subscription; 7],
+    _observers: [Subscription; 8],
 }
 
 impl RootView {
@@ -103,6 +117,12 @@ impl RootView {
         let tag_panel = cx.new(|cx| TagPanel::new(tags.clone(), shell.clone(), modules.clone(), window, cx));
         let target = tag_target(shell.read(cx));
         let photo_tags = cx.new(|cx| PhotoTags::new(tags.clone(), target, window, cx));
+        let compare_mode = CompareMode::from_pref(MachinePrefs::read(cx, MODE_PREF).as_deref());
+        shell.update(cx, |s, _| s.compare_mode = compare_mode);
+        let loupe = cx.new(|cx| {
+            LoupeView::new(model.clone(), shell.clone(), images.clone(), modules.clone(), Follow::Inline, cx)
+        });
+        let compare = cx.new(|cx| CompareView::new(shell.clone(), images.clone(), cx));
         let catalog_epoch = model.read(cx).catalog_epoch;
         let _observers = [
             cx.observe_in(&model, window, |this, model, window, cx| {
@@ -111,8 +131,10 @@ impl RootView {
                 let epoch = model.read(cx).catalog_epoch;
                 if epoch != this.catalog_epoch {
                     this.catalog_epoch = epoch;
-                    if this.stacks.take().is_some() {
-                        this.library.read(cx).focus_handle().clone().focus(window, cx);
+                    // The cull session's list is the old catalog's photos too.
+                    let cull = this.cull.take().is_some();
+                    if this.stacks.take().is_some() || cull {
+                        this.focus_stage(window, cx);
                     }
                 }
                 cx.notify()
@@ -123,8 +145,19 @@ impl RootView {
             // chrome: hand it to the grid, so its keys work again. Only on the Library
             // surface and with no Stack dialog open, where the grid is what takes keys.
             cx.on_focus(&focus, window, |this, window, cx| {
-                if this.stacks.is_none() && this.shell.read(cx).surface == Surface::Library {
-                    this.library.read(cx).focus_handle().clone().focus(window, cx);
+                if this.stacks.is_none() && this.cull.is_none() && this.shell.read(cx).surface == Surface::Library {
+                    this.focus_stage(window, cx);
+                }
+            }),
+            // The stage changed (the loupe or Compare opened or closed — by a key, a click, a
+            // catalog switch): its view takes the keys.
+            cx.observe_in(&shell, window, |this, shell, window, cx| {
+                let stage = shell.read(cx).stage_view();
+                if stage != this.stage_seen {
+                    this.stage_seen = stage;
+                    if this.stacks.is_none() && this.cull.is_none() && shell.read(cx).surface == Surface::Library {
+                        this.focus_stage(window, cx);
+                    }
                 }
             }),
             cx.observe(&shell, |this, shell, cx| {
@@ -173,6 +206,10 @@ impl RootView {
             library,
             inspector,
             stacks: None,
+            loupe,
+            compare,
+            cull: None,
+            stage_seen: StageView::Grid,
             catalog_epoch,
             resize: None,
             _observers,
@@ -190,6 +227,80 @@ impl RootView {
     /// The Library grid.
     pub fn library(&self) -> &Entity<LibraryView> {
         &self.library
+    }
+
+    /// The inline loupe.
+    pub fn loupe(&self) -> &Entity<LoupeView> {
+        &self.loupe
+    }
+
+    pub fn compare(&self) -> &Entity<CompareView> {
+        &self.compare
+    }
+
+    pub fn cull(&self) -> Option<&Entity<CullView>> {
+        self.cull.as_ref().map(|(v, _)| v)
+    }
+
+    /// Focus whichever view the Library stage shows: the grid, the loupe or Compare.
+    pub(crate) fn focus_stage(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let handle = match self.shell.read(cx).stage_view() {
+            StageView::Grid => self.library.read(cx).focus_handle().clone(),
+            StageView::Loupe => self.loupe.read(cx).focus_handle().clone(),
+            StageView::Compare => self.compare.read(cx).focus_handle().clone(),
+        };
+        handle.focus(window, cx);
+    }
+
+    /// Enter / More ⋯ → Loupe / a double-click: the inline loupe on or off.
+    fn toggle_loupe(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.shell.update(cx, |s, cx| s.toggle_loupe(cx));
+        self.focus_stage(window, cx);
+    }
+
+    /// C / the bench's Compare: open Compare on two or more selected, or close it.
+    fn toggle_compare(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.shell.update(cx, |s, cx| {
+            if s.compare().is_some() {
+                s.close_compare(cx);
+            } else {
+                s.open_compare(cx);
+            }
+        });
+        self.focus_stage(window, cx);
+    }
+
+    /// More ⋯ → Start cull session / the bench's Cull: over the selection (in grid order),
+    /// else the whole view, frozen now (App.tsx's `startCullSession`).
+    fn start_cull(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let shell = self.shell.read(cx);
+        let selected: std::collections::HashSet<i64> = shell.library.selection().ids.iter().copied().collect();
+        let rows: Vec<chairphoto_core::catalog::Photo> = shell
+            .library
+            .photos()
+            .iter()
+            .filter(|p| selected.is_empty() || selected.contains(&p.id))
+            .cloned()
+            .collect();
+        let Some(from) = shell.rows_from().filter(|_| !rows.is_empty()) else {
+            self.model.update(cx, |m, cx| m.set_status("Nothing to cull — scan or select some photos first.", cx));
+            return;
+        };
+        let app = self.model.read(cx).state().clone();
+        let (shell, images) = (self.shell.clone(), self.images.clone());
+        let view = cx.new(|cx| CullView::new(app, shell, images, rows, from, cx));
+        let ended = cx.subscribe_in(&view, window, |this, _, ended: &CullEnded, window, cx| {
+            this.cull = None;
+            let line = ended.0.status_line();
+            this.model.update(cx, |m, cx| m.set_status(line, cx));
+            // The session wrote without re-reading; the grid catches up once.
+            this.shell.update(cx, |s, cx| s.refresh_rows(cx));
+            this.focus_stage(window, cx);
+            cx.notify();
+        });
+        view.read(cx).focus_handle().clone().focus(window, cx);
+        self.cull = Some((view, ended));
+        cx.notify();
     }
 
     /// Re-read the system theme off the UI thread; it paints when following.
@@ -266,7 +377,11 @@ impl RootView {
                 .into_any_element();
         }
         match &shell.surface {
-            Surface::Library => stage.child(self.library.clone()).into_any_element(),
+            Surface::Library => match shell.stage_view() {
+                StageView::Grid => stage.child(self.library.clone()).into_any_element(),
+                StageView::Loupe => stage.child(self.loupe.clone()).into_any_element(),
+                StageView::Compare => stage.child(self.compare.clone()).into_any_element(),
+            },
             other => {
                 let text = match other {
                     Surface::Module(id) => format!("Module view {id} is not available."),
@@ -312,7 +427,9 @@ impl Render for RootView {
         let title_bar = self.render_title_bar(shell, model, colors, window);
         let rail = self.render_rail(shell, colors, rail_views, cx);
         let library = shell.surface == Surface::Library;
-        let pill = library.then(|| self.render_command_pill(shell, colors, cx));
+        // React hid the command pill in Compare: there is nothing there for it to filter.
+        let pill = (library && shell.stage_view() != StageView::Compare)
+            .then(|| self.render_command_pill(shell, colors, cx));
         let stage = self.render_stage(shell, colors, module_view);
         let bench = library.then(|| self.render_bench(shell, model, colors, cx));
         let (left_w, right_w) = (shell.layout.left_w, shell.layout.right_w);
@@ -450,6 +567,9 @@ impl Render for RootView {
             .on_action(cx.listener(|this, _: &BackUpSelection, _, cx| this.back_up_selection(cx)))
             .on_action(cx.listener(|this, _: &AnalyseBurst, _, cx| this.shell.update(cx, |s, cx| s.analyse_burst(cx))))
             .on_action(cx.listener(|this, _: &ProposeStacks, window, cx| this.open_stack_proposals(window, cx)))
+            .on_action(cx.listener(|this, _: &ToggleLoupe, window, cx| this.toggle_loupe(window, cx)))
+            .on_action(cx.listener(|this, _: &OpenCompare, window, cx| this.toggle_compare(window, cx)))
+            .on_action(cx.listener(|this, _: &StartCullSession, window, cx| this.start_cull(window, cx)))
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| this.on_mouse_move(event, cx)))
             .on_mouse_up(MouseButton::Left, cx.listener(|this, _, _, _| this.resize = None))
             .size_full()
@@ -459,7 +579,8 @@ impl Render for RootView {
             .text_color(colors.txt)
             .child(title_bar)
             .child(body)
-            .children(self.stacks.as_ref().map(|(dialog, _)| dialog.clone()));
+            .children(self.stacks.as_ref().map(|(dialog, _)| dialog.clone()))
+            .children(self.cull.as_ref().map(|(cull, _)| cull.clone()));
         let model = self.model.clone();
         on_not_yet_ported(root, move |what, ticket, _, cx| {
             model.update(cx, |m, cx| m.not_yet_ported(what, ticket, cx))

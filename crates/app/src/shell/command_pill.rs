@@ -5,7 +5,7 @@
 //! It edits the Library session's scope directly ([`ShellState::update_scope`]); the match
 //! count and chip names follow through `ShellState`'s scope read, and the Library view
 //! (#106) re-runs its query on `ScopeChanged`. Shown only on the Library surface, the only
-//! one with a grid or loupe to filter (React also hid it in Compare; Compare is #109).
+//! one with a grid or loupe to filter, and hidden in Compare, as React hid it.
 
 use crate::shell::state::{snap_thumb, ShellState, THUMB_MAX, THUMB_MIN, THUMB_STEP};
 use crate::shell::style::{dot_ring, Colors, COLOR_LABELS};

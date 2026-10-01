@@ -206,9 +206,10 @@ impl RootView {
     fn more_menu(&self, shell: &ShellState, ready: bool, colors: Colors) -> impl IntoElement {
         let root = self.focus.clone();
         let selection = shell.library.selection();
-        // React: `loupeEnabled = !!selected && activeView === null`; the loupe is not ported
-        // (#109), so it is never "On".
+        // React: `loupeEnabled = !!selected && activeView === null`, with an "On" badge while
+        // the inline loupe shows.
         let loupe_enabled = selection.active.is_some();
+        let loupe_on = shell.stage_view() == crate::shell::state::StageView::Loupe;
         let debt = shell.counts.identity_debt.map_or("?".to_string(), |n| n.to_string());
         let pending = shell.counts.pending.to_string();
         let left_on = shell.panel_visible(Side::Left);
@@ -221,7 +222,7 @@ impl RootView {
             .text_color(colors.dim)
             .tooltip("More")
             .dropdown_menu_with_anchor(Anchor::TopRight, move |menu: PopupMenu, window, cx| {
-                let menu = more_menu_head(menu, root.clone(), ready, loupe_enabled);
+                let menu = more_menu_head(menu, root.clone(), ready, loupe_enabled, loupe_on);
                 let menu = module_actions_submenu(menu, &modules, window, cx);
                 more_menu_tail(menu, &debt, &pending, left_on, right_on, colors)
             })
@@ -230,11 +231,11 @@ impl RootView {
 
 /// More ⋯, in React's order: [`more_menu_head`], the "Modules" submenu
 /// ([`module_actions_submenu`]), [`more_menu_tail`].
-fn more_menu_head(menu: PopupMenu, root: FocusHandle, ready: bool, loupe_enabled: bool) -> PopupMenu {
+fn more_menu_head(menu: PopupMenu, root: FocusHandle, ready: bool, loupe_enabled: bool, loupe_on: bool) -> PopupMenu {
     menu.action_context(root)
         .min_w(px(200.))
         .menu("Open loupe in a new window", Box::new(PopOutLoupe))
-        .menu_with_disabled("Loupe", Box::new(ToggleLoupe), !loupe_enabled)
+        .menu_with_check_and_disabled("Loupe", loupe_on, Box::new(ToggleLoupe), !loupe_enabled)
         .separator()
         .label("WHOLE VIEW")
         .menu_with_disabled("Analyse burst sharpness", Box::new(AnalyseBurst), !ready)

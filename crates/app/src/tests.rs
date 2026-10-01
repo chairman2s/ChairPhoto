@@ -67,6 +67,9 @@ impl App {
 }
 
 fn start(cx: &mut TestAppContext) -> App {
+    // Storage jobs queue until a test runs them (`Runner::manual`): the core runtime's
+    // threads could not wake GPUI's deterministic test scheduler.
+    cx.update(|cx| cx.set_global(crate::storage::Runner::manual()));
     let (state, events_rx, ()) = start_core(|_| ());
     let exits = Rc::new(Cell::new(0));
     let on_exit = {
@@ -383,7 +386,7 @@ fn menu_items_dispatch_their_actions(cx: &mut TestAppContext) {
     let app = start(cx);
     open_catalog(&app, &dir, cx);
 
-    click_menu_row(&app, "more-menu", 12, "Tags & collections panel", cx);
+    click_menu_row(&app, "more-menu", 13, "Tags & collections panel", cx);
     assert!(!left_visible(&app, cx), "More ⋯ → View → Tags & collections panel");
 
     click_menu_row(&app, "more-menu", 0, "Open loupe in a new window", cx);
@@ -395,7 +398,7 @@ fn menu_items_dispatch_their_actions(cx: &mut TestAppContext) {
 
     // Enabled once a catalog is open.
     click_menu_row(&app, "import-menu", 3, "Rescan library", cx);
-    assert_eq!(status(&app, cx), not_yet_ported_line("Rescan library", 114));
+    assert_eq!(status(&app, cx), "Scanning library…");
 }
 
 /// Every not-yet-ported action is handled, with a status line naming its ticket.
@@ -754,3 +757,7 @@ fn reads_started_before_a_catalog_switch_are_dropped(cx: &mut TestAppContext) {
         assert!(s.lists.facets.is_empty(), "the old catalog's lists landed after the switch");
     });
 }
+
+// Storage and import (#114).
+#[path = "storage_tests.rs"]
+mod storage_tests;

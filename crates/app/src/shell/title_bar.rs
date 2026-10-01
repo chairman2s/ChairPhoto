@@ -274,6 +274,9 @@ fn module_actions_submenu(
 fn more_menu_tail(menu: PopupMenu, debt: &str, pending: &str, left_on: bool, right_on: bool, colors: Colors) -> PopupMenu {
     menu.item(badge_item("Identity debt", debt.to_string(), Box::new(OpenIdentityDebt), colors))
         .item(badge_item("Back-up queue", pending.to_string(), Box::new(Reconcile), colors))
+        // Not in React's menu: React reached volumes only through Preferences → Storage,
+        // which is #113. Until that lands this is the panel's way in.
+        .menu("Storage volumes…", Box::new(OpenVolumes))
         .separator()
         .label("VIEW")
         .menu_with_check("Tags & collections panel", left_on, Box::new(ToggleLeftPanel))

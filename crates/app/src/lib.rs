@@ -45,6 +45,7 @@ pub mod modules;
 pub mod shell;
 pub mod signals;
 pub mod single_instance;
+pub mod storage;
 pub mod theme;
 pub mod view;
 
@@ -148,6 +149,8 @@ pub struct Wired {
     pub shell: Entity<shell::ShellState>,
     /// The first-party modules and what the enabled ones contribute (#122).
     pub modules: Entity<modules::ModuleRegistry>,
+    /// Storage and import's jobs (#114).
+    pub storage: Entity<storage::StorageState>,
     /// The main window, or why it could not open (the app has then been asked to quit).
     pub main_window: Result<AnyWindowHandle, String>,
 }
@@ -180,6 +183,7 @@ pub fn wire(
     events::spawn_router(events_rx, model.clone(), cx).detach();
     let shell = cx.new(|cx| shell::ShellState::new(&model, cx));
     let modules = modules::ModuleRegistry::install(&model, &shell, cx);
+    let storage = cx.new(|cx| storage::StorageState::new(&model, &shell, cx));
     // Without a pool (tests), every image request fails at once instead of waiting forever.
     let submit: Arc<dyn image_store::Submit> = match &pool {
         Some(pool) => pool.clone(),
@@ -193,8 +197,9 @@ pub fn wire(
 
     let window_options = main_window_options(cx);
     let opened = gpui_kit::open_window(window_options, cx, {
-        let (model, shell, images, modules) = (model.clone(), shell.clone(), images.clone(), modules.clone());
-        move |window, cx| cx.new(|cx| view::RootView::new(model, shell, images, modules, window, cx))
+        let (model, shell, images, modules, storage) =
+            (model.clone(), shell.clone(), images.clone(), modules.clone(), storage.clone());
+        move |window, cx| cx.new(|cx| view::RootView::new(model, shell, images, modules, storage, window, cx))
     });
     let main_window = match opened {
         Ok((handle, _)) => {
@@ -213,7 +218,7 @@ pub fn wire(
             Err(e.to_string())
         }
     };
-    Wired { model, images, shell, modules, main_window }
+    Wired { model, images, shell, modules, storage, main_window }
 }
 
 /// Become this app data dir's primary instance, serving second launches into `tx`; or hand

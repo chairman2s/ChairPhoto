@@ -1016,6 +1016,7 @@ pub async fn faces_suggestion_list(
 #[cfg(all(test, feature = "faces"))]
 mod faces_job_ownership_tests {
     use super::*;
+    use std::sync::Arc;
     use crate::commands::catalog::{detach_catalog_and_trip_jobs, publish_catalog_and_reset_jobs};
 
     fn temp_catalog(tag: &str) -> (Catalog, crate::test_support::TestSubPath) {

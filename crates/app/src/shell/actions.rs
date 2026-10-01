@@ -6,6 +6,7 @@
 //! - **Ported** — the shell does them itself ([`crate::shell::ShellState`]): panel
 //!   toggles, the cache-previews toggle, widening to all photos, clearing the selection; and
 //!   the module registry's dialogs (the Modules panel, the Publish dialog, [`crate::modules`]).
+//!   Storage and import's (#114), which the root view hands to `crate::storage`.
 //! - **Not yet ported** — the feature's surface belongs to a later ticket. Its menu item or
 //!   button still dispatches a real action, and [`crate::model::AppModel::not_yet_ported`]
 //!   answers with a visible status line naming the ticket, rather than faking the feature.
@@ -35,6 +36,27 @@ actions!(
         OpenModules,
         /// The bench's Publish: the Publish dialog over the enabled modules' publish targets.
         PublishSelection,
+        // Storage and import (#114, `crate::storage`):
+        /// The catalog pill: the catalog switcher.
+        OpenCatalogs,
+        /// "⤓ N waiting for the NAS" and More ⋯ → Back-up queue: run the reconcile now.
+        Reconcile,
+        /// "N identity debt" and More ⋯ → Identity debt.
+        OpenIdentityDebt,
+        /// Import ▾ → Import from card….
+        ImportFromCard,
+        /// Import ▾ → Import a .chairphoto bundle….
+        ImportBundle,
+        /// Import ▾ → Rescan library.
+        RescanLibrary,
+        /// The bench's Cancel while an import runs.
+        CancelImport,
+        /// The collection browser's Trash.
+        OpenTrash,
+        /// The bench's Back up.
+        BackUpSelection,
+        /// More ⋯ → Storage volumes… (Preferences → Storage mounts the same panel, #113).
+        OpenVolumes,
     ]
 );
 
@@ -71,18 +93,6 @@ macro_rules! not_yet_ported {
 }
 
 not_yet_ported! {
-    /// The catalog pill: the catalog switcher.
-    OpenCatalogs => ("Open or create a catalog", 114),
-    /// "⤓ N waiting for the NAS" and More ⋯ → Back-up queue: run the reconcile now.
-    Reconcile => ("Back up photos waiting for the NAS", 114),
-    /// "N identity debt" and More ⋯ → Identity debt.
-    OpenIdentityDebt => ("Identity debt", 114),
-    /// Import ▾ → Import from card….
-    ImportFromCard => ("Import from card", 114),
-    /// Import ▾ → Import a .chairphoto bundle….
-    ImportBundle => ("Import a .chairphoto bundle", 114),
-    /// Import ▾ → Rescan library.
-    RescanLibrary => ("Rescan library", 114),
     /// The title bar's and the bench's Export.
     ExportSelection => ("Export", 115),
     /// More ⋯ → Open loupe in a new window.
@@ -98,12 +108,8 @@ not_yet_ported! {
     StartCullSession => ("Start cull session", 109),
     /// More ⋯ → Preferences…, and the rail's gear.
     OpenPreferences => ("Preferences", 113),
-    /// The collection browser's Trash.
-    OpenTrash => ("Trash", 114),
     /// The bench's Compare (C in the grid).
     OpenCompare => ("Compare", 109),
-    /// The bench's Back up.
-    BackUpSelection => ("Back up the selection", 114),
     /// The icon rail's Develop.
     OpenDevelop => ("Develop", 111),
 }

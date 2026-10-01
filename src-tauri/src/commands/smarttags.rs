@@ -4,6 +4,7 @@
 //! `docs/ai-tagging.md` (Smart Tagging section) and `plugins/smarttags/`.
 
 use super::*;
+use std::sync::Arc;
 use serde::Serialize;
 use std::sync::Mutex;
 use tauri::{AppHandle, State};
@@ -821,6 +822,7 @@ mod smarttags_training_lock_tests {
 #[cfg(test)]
 mod smarttags_ownership_tests {
     use super::*;
+    use std::sync::atomic::AtomicBool;
     use crate::commands::catalog::{
         detach_catalog_and_trip_jobs, publish_catalog_and_reset_jobs,
     };

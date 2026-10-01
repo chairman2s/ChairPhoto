@@ -46,7 +46,7 @@ fn section_placeholder(section: Section) -> &'static str {
         Section::Tags => "Tag panel — not yet ported (#107)",
         Section::SmartAlbums => "Smart albums — not yet ported (#115)",
         Section::Albums => "Albums — not yet ported (#115)",
-        Section::Batches => "Import batches — not yet ported (#114)",
+        Section::Batches => "", // `crate::storage::batches`
     }
 }
 
@@ -238,7 +238,9 @@ impl RootView {
                     .on_click(cx.listener(move |this, _, _, cx| this.shell.update(cx, |s, cx| s.toggle_section(section, cx))))
                     .test_support(),
             );
-            if open {
+            if open && section == Section::Batches {
+                browser = browser.child(self.render_batches(shell, colors, cx));
+            } else if open {
                 browser = browser.child(
                     div()
                         .px(px(14.))

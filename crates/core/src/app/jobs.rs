@@ -30,7 +30,7 @@
 //!
 //! **catalog → abort generations → status slots**, and within each of the last two groups
 //! the declaration order of [`JobRegistry`]: scan, face indexing, face matching, sharpness,
-//! pHash, Smart Tagging, identity repair.
+//! pHash, trash, import, Smart Tagging, identity repair.
 //!
 //! Every nested acquisition in the backend obeys it:
 //!
@@ -39,7 +39,7 @@
 //! | [`JobFamily::begin`] | catalog → that family's abort → that family's slot |
 //! | [`JobRegistry::lock_for_detach`] (switch phase one) | every abort, then every slot |
 //! | [`JobRegistry::lock_for_publish`] (switch phase two) | every abort |
-//! | [`AbortGeneration::install_fresh`] (scan / sharpness / pHash starts) | one abort, released before the catalog is read |
+//! | [`AbortGeneration::install_fresh`] (scan / sharpness / pHash / import starts) | one abort, released before the catalog is read |
 //! | [`AbortGeneration::trip`] (every Cancel command) | one abort |
 //! | [`JobSlot`] writes (workers) | one slot |
 //! | `develop`'s resident set (`develop::with_resident`) | a leaf: after any of the above, never across another lock |
@@ -393,6 +393,12 @@ pub struct JobRegistry {
     /// win that race, because the alternative is destroying something they just asked to
     /// keep. No status slot — the delete reports its own terminal result.
     pub trash: AbortGeneration,
+    /// Importing a card or a `.chairphoto` bundle: the copy into the library root, then the
+    /// indexing of the copies. A newer import start trips the older one, Cancel trips it, and
+    /// a catalog switch trips it, so an import never indexes into a catalog the user has
+    /// left. No status slot — progress is `import:progress`, and the start reports its own
+    /// terminal result.
+    pub import: AbortGeneration,
     /// The sidecar-identity repair pass (#34) — retries `pending_sidecar_identity`.
     ///
     /// Not feature-gated, and the first family here that isn't: identity debt is core, so
@@ -432,6 +438,7 @@ impl JobRegistry {
             sharpness: _,
             phash: _,
             trash: _,
+            import: _,
             #[cfg(feature = "smarttags")]
             smarttags,
             identity,
@@ -469,6 +476,7 @@ impl JobRegistry {
             sharpness,
             phash,
             trash,
+            import,
             #[cfg(feature = "smarttags")]
             smarttags,
             identity,
@@ -484,6 +492,7 @@ impl JobRegistry {
             sharpness: sharpness.lock()?,
             phash: phash.lock()?,
             trash: trash.lock()?,
+            import: import.lock()?,
             #[cfg(feature = "smarttags")]
             smarttags: smarttags.abort.lock()?,
             identity: identity.abort.lock()?,
@@ -503,6 +512,7 @@ pub struct AbortGuards<'a> {
     sharpness: MutexGuard<'a, Arc<AtomicBool>>,
     phash: MutexGuard<'a, Arc<AtomicBool>>,
     trash: MutexGuard<'a, Arc<AtomicBool>>,
+    import: MutexGuard<'a, Arc<AtomicBool>>,
     #[cfg(feature = "smarttags")]
     smarttags: MutexGuard<'a, Arc<AtomicBool>>,
     identity: MutexGuard<'a, Arc<AtomicBool>>,
@@ -522,6 +532,7 @@ impl AbortGuards<'_> {
             sharpness,
             phash,
             trash,
+            import,
             #[cfg(feature = "smarttags")]
             smarttags,
             identity,
@@ -536,6 +547,7 @@ impl AbortGuards<'_> {
         sharpness.store(true, Ordering::Relaxed);
         phash.store(true, Ordering::Relaxed);
         trash.store(true, Ordering::Relaxed);
+        import.store(true, Ordering::Relaxed);
         #[cfg(feature = "smarttags")]
         smarttags.store(true, Ordering::Relaxed);
         identity.store(true, Ordering::Relaxed);
@@ -572,6 +584,7 @@ impl AbortGuards<'_> {
             ref mut sharpness,
             ref mut phash,
             ref mut trash,
+            ref mut import,
             #[cfg(feature = "smarttags")]
                 ref mut smarttags,
             ref mut identity,
@@ -588,6 +601,7 @@ impl AbortGuards<'_> {
         **sharpness = Arc::new(AtomicBool::new(false));
         **phash = Arc::new(AtomicBool::new(false));
         **trash = Arc::new(AtomicBool::new(false));
+        **import = Arc::new(AtomicBool::new(false));
         #[cfg(feature = "smarttags")]
         {
             **smarttags = Arc::new(AtomicBool::new(false));
@@ -731,6 +745,24 @@ mod tests {
             !jobs.trash.installed().unwrap().load(Ordering::Relaxed),
             "while a fresh generation is installed for whatever starts next"
         );
+    }
+
+    /// An import in flight when the user switches catalogs must not index its copies into
+    /// either catalog: both switch phases trip the import generation, and phase two leaves a
+    /// fresh one for the next import.
+    #[test]
+    fn both_switch_phases_trip_the_import_generation() {
+        let jobs = JobRegistry::default();
+        let copying = jobs.import.install_fresh().unwrap();
+        // Phase one's abort half (`trip_and_clear_all` minus the slot clear and the Develop
+        // release, which reach process-wide state other tests share).
+        jobs.lock_for_detach().unwrap().aborts.trip_all();
+        assert!(copying.load(Ordering::Relaxed), "phase one stops the import");
+
+        let racing = jobs.import.install_fresh().unwrap();
+        jobs.lock_for_publish().unwrap().trip_and_replace_all();
+        assert!(racing.load(Ordering::Relaxed), "phase two stops an import started between the phases");
+        assert!(!jobs.import.installed().unwrap().load(Ordering::Relaxed));
     }
 
     /// Cancelling is the same trip, which is what lets Restore stand a delete down.

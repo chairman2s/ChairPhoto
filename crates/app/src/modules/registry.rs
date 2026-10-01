@@ -145,6 +145,9 @@ pub struct SlotView {
 struct Live {
     instance: Rc<RefCell<Box<dyn ModuleInstance>>>,
     contributions: Contributions,
+    /// Which load this is (unique per registry): a view built for one instance is never
+    /// cached for another ([`ModuleRegistry::cached_view`]).
+    generation: u64,
 }
 
 struct Entry {
@@ -211,6 +214,8 @@ pub struct ModuleRegistry {
     persist_generation: u64,
     /// The generation of the newest `modules.enabled` write that ran.
     persisted: Arc<Mutex<u64>>,
+    /// The last [`Live::generation`] handed out.
+    live_generation: u64,
     /// How many module callbacks (`load`, `on_event`, `on_unload`) are running now. An enable
     /// or disable asked for from inside one is deferred until it returns ([`Self::enable`]).
     in_callback: u32,
@@ -268,6 +273,7 @@ impl ModuleRegistry {
             views: HashMap::new(),
             persist_generation: 0,
             persisted: Arc::new(Mutex::new(0)),
+            live_generation: 0,
             in_callback: 0,
         });
         let weak = registry.downgrade();
@@ -499,8 +505,9 @@ impl ModuleRegistry {
         match Self::in_module(this, cx, |cx| module.load(host, cx)) {
             Ok(instance) => {
                 let contributions = instance.contributions();
-                let live = Live { instance: Rc::new(RefCell::new(instance)), contributions };
                 this.update(cx, |r, cx| {
+                    r.live_generation += 1;
+                    let live = Live { instance: Rc::new(RefCell::new(instance)), contributions, generation: r.live_generation };
                     if let Some(entry) = r.entry_mut(id) {
                         entry.live = Some(live);
                     }
@@ -769,8 +776,18 @@ impl ModuleRegistry {
         self.views.len()
     }
 
+    /// Which load of module `id` is live, if it is enabled.
+    fn live_generation(&self, id: &str) -> Option<u64> {
+        self.entry(id).and_then(|e| e.live.as_ref()).map(|l| l.generation)
+    }
+
     /// The view for one contribution in `window`, built on first use and kept until its
     /// module is disabled.
+    ///
+    /// The factory is module code run with no lease on the registry, so it may disable — or
+    /// disable and re-enable — its own module. A view whose module instance is no longer the
+    /// one it was built for is neither cached nor returned (`None`): it would outlive the
+    /// unload, and a re-enabled module would get the old instance's view back.
     fn cached_view(
         this: &Entity<Self>,
         module: &SharedString,
@@ -779,14 +796,23 @@ impl ModuleRegistry {
         factory: &ViewFactory,
         window: &mut Window,
         cx: &mut App,
-    ) -> AnyView {
+    ) -> Option<AnyView> {
         let key = ViewKey { window: window.window_handle().window_id(), module: module.clone(), kind, id: id.clone() };
-        if let Some(view) = this.read(cx).views.get(&key) {
-            return view.clone();
-        }
+        let built_for = {
+            let r = this.read(cx);
+            if let Some(view) = r.views.get(&key) {
+                return Some(view.clone());
+            }
+            r.live_generation(module)?
+        };
         let view = factory(window, cx);
-        this.update(cx, |r, _| r.views.insert(key, view.clone()));
-        view
+        this.update(cx, |r, _| {
+            if r.live_generation(module) != Some(built_for) {
+                return None; // disabled or reloaded while the factory ran
+            }
+            r.views.insert(key, view.clone());
+            Some(view)
+        })
     }
 
     /// The views of the enabled modules' panels at `slot`, in registration order.
@@ -794,9 +820,9 @@ impl ModuleRegistry {
         let panels = this.read(cx).panels(slot);
         panels
             .into_iter()
-            .map(|(module_id, p)| {
-                let view = Self::cached_view(this, &module_id, slot.name(), &p.id, &p.view, window, cx);
-                SlotView { module_id, id: p.id, label: p.label, view }
+            .filter_map(|(module_id, p)| {
+                let view = Self::cached_view(this, &module_id, slot.name(), &p.id, &p.view, window, cx)?;
+                Some(SlotView { module_id, id: p.id, label: p.label, view })
             })
             .collect()
     }
@@ -804,14 +830,14 @@ impl ModuleRegistry {
     /// The view of main view `view_id`, if an enabled module contributes it.
     pub fn main_view(this: &Entity<Self>, view_id: &str, window: &mut Window, cx: &mut App) -> Option<SlotView> {
         let (module_id, v) = this.read(cx).main_views().into_iter().find(|(_, v)| v.id.as_ref() == view_id)?;
-        let view = Self::cached_view(this, &module_id, "main-view", &v.id, &v.view, window, cx);
+        let view = Self::cached_view(this, &module_id, "main-view", &v.id, &v.view, window, cx)?;
         Some(SlotView { module_id, id: v.id, label: v.label, view })
     }
 
     /// The views of one enabled module's settings panels.
     pub fn settings_views(this: &Entity<Self>, module_id: &SharedString, window: &mut Window, cx: &mut App) -> Vec<AnyView> {
         let panels = this.read(cx).settings_panels(module_id);
-        panels.iter().map(|p| Self::cached_view(this, module_id, "settings", &p.id, &p.view, window, cx)).collect()
+        panels.iter().filter_map(|p| Self::cached_view(this, module_id, "settings", &p.id, &p.view, window, cx)).collect()
     }
 
     /// Fresh views of every enabled publish target, for a Publish dialog that is opening.

@@ -881,6 +881,88 @@ fn closing_a_window_drops_its_module_views(cx: &mut TestAppContext) {
     assert_eq!(views(first, cx)[0].view.entity_id(), in_first, "the open window's view is still cached");
 }
 
+/// A module whose inspector panel's factory, the first time it runs, disables its own module
+/// (`reload`: and enables it again) through the registry — module code the registry runs with
+/// no lease on itself. Counts the views it builds.
+struct FactoryToggler {
+    reload: bool,
+    registry: Rc<RefCell<Option<Entity<ModuleRegistry>>>>,
+    built: Rc<RefCell<usize>>,
+}
+
+struct FactoryTogglerInstance {
+    reload: bool,
+    registry: Rc<RefCell<Option<Entity<ModuleRegistry>>>>,
+    built: Rc<RefCell<usize>>,
+}
+
+impl Module for FactoryToggler {
+    fn meta(&self) -> ModuleMeta {
+        ModuleMeta::new("toggler", "Toggler")
+    }
+
+    fn load(&self, _: ModuleHost, _: &mut App) -> Result<Box<dyn ModuleInstance>, String> {
+        Ok(Box::new(FactoryTogglerInstance { reload: self.reload, registry: self.registry.clone(), built: self.built.clone() }))
+    }
+}
+
+impl ModuleInstance for FactoryTogglerInstance {
+    fn contributions(&self) -> Contributions {
+        let (reload, registry, built) = (self.reload, self.registry.clone(), self.built.clone());
+        Contributions {
+            panels: vec![Panel {
+                id: "toggler-panel".into(),
+                label: "Toggler".into(),
+                slot: PanelSlot::Inspector,
+                view: Rc::new(move |_, cx| {
+                    *built.borrow_mut() += 1;
+                    if *built.borrow() == 1 {
+                        let registry = registry.borrow().clone().unwrap();
+                        ModuleRegistry::disable(&registry, "toggler", cx);
+                        if reload {
+                            ModuleRegistry::enable(&registry, "toggler", cx);
+                        }
+                    }
+                    cx.new(|_| Empty).into()
+                }),
+            }],
+            ..Default::default()
+        }
+    }
+}
+
+/// A view factory that disables its own module leaves no view cached for the unloaded
+/// instance; one that disables and re-enables it does not hand the old instance's view to the
+/// new one — the next build is fresh.
+#[gpui_kit::test]
+fn a_view_built_while_its_module_went_away_is_not_cached(cx: &mut TestAppContext) {
+    for reload in [false, true] {
+        let dir = TempDir::new("factory");
+        let slot: Rc<RefCell<Option<Entity<ModuleRegistry>>>> = Rc::default();
+        let built = Rc::new(RefCell::new(0));
+        let b = bench(vec![Rc::new(FactoryToggler { reload, registry: slot.clone(), built: built.clone() })], &[], &dir, cx);
+        *slot.borrow_mut() = Some(b.registry.clone());
+        b.enable("toggler", cx);
+        let window: AnyWindowHandle = cx.update(|cx| cx.open_window(Default::default(), |_, cx| cx.new(|_| Empty)).unwrap()).into();
+        let views = |cx: &mut TestAppContext| {
+            let registry = b.registry.clone();
+            cx.update_window(window, |_, window, cx| ModuleRegistry::panel_views(&registry, PanelSlot::Inspector, window, cx))
+                .unwrap()
+        };
+        let first = views(cx);
+        cx.run_until_parked();
+        assert!(first.is_empty(), "reload={reload}: the view of the instance that went away is not shown");
+        assert_eq!(b.registry.read_with(cx, |r, _| r.cached_view_count()), 0, "reload={reload}: nor cached");
+        assert_eq!(b.enabled(cx).is_empty(), !reload, "reload={reload}");
+        if reload {
+            let again = views(cx);
+            assert_eq!(again.len(), 1);
+            assert_eq!(*built.borrow(), 2, "the re-enabled instance got a freshly built view");
+            assert_eq!(views(cx)[0].view.entity_id(), again[0].view.entity_id(), "which is cached");
+        }
+    }
+}
+
 // --- the shell's slots, with the dev module -------------------------------------------------
 
 struct Shell {

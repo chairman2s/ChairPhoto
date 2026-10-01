@@ -525,6 +525,68 @@ fn a_trash_report_that_lands_after_a_switch_is_dropped(cx: &mut TestAppContext) 
     trash.read_with(cx, |t, _| assert!(t.report.is_none(), "the left catalog's report landed"));
 }
 
+/// **Forced interleaving.** The core has switched to a catalog whose trashed photos carry the
+/// same ids, but `catalog:switched` has not reached the open Trash dialog yet, and Delete is
+/// confirmed on the old list. The core refuses the old ids (the new catalog's files and rows
+/// survive). When the event arrives, the dialog drops the old list and reads the new
+/// catalog's trash.
+#[gpui_kit::test]
+fn old_trash_ids_never_reach_the_new_catalogs_delete(cx: &mut TestAppContext) {
+    let dir = TempDir::new("trash-switch-ids");
+    let app = start(cx);
+    let old_ids = catalog_with_trash(&app, &dir, cx);
+    dispatch(&app, crate::shell::actions::OpenTrash, cx);
+    let StorageDialog::Trash(trash) = dialog(&app, cx) else { panic!() };
+    work(cx);
+    trash.read_with(cx, |t, _| assert_eq!(t.photos.as_ref().map(Vec::len), Some(2)));
+
+    // The core switch, with the event not delivered.
+    let other = dir.0.join("other");
+    let b = Catalog::open(&other.join("b.chairphoto"), &other).unwrap();
+    let files: Vec<PathBuf> = (0..2).map(|i| other.join(format!("2026/q{i}.ARW"))).collect();
+    let new_ids: Vec<i64> = files
+        .iter()
+        .map(|f| {
+            std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+            std::fs::write(f, b"another catalog's raw").unwrap();
+            b.upsert_photo(f, None, 0, 1).unwrap().id
+        })
+        .collect();
+    assert_eq!(new_ids, old_ids, "the ids collide, as real catalogs' do");
+    b.trash_photos(&new_ids).unwrap();
+    chairphoto_core::app::detach_catalog_and_trip_jobs(&app.state).unwrap();
+    chairphoto_core::app::publish_catalog_and_reset_jobs(&app.state, b).unwrap();
+    app.state.volume_health.invalidate();
+
+    click(&app, "trash-delete", cx);
+    cx.update_window(app.window(), |_, window, cx| {
+        window.render_frame(cx);
+        window.input("delete", cx);
+    })
+    .unwrap();
+    trash.update(cx, |t, cx| t.destroy(cx));
+    assert_eq!(work_once(cx), 1);
+    cx.run_until_parked();
+    assert!(files.iter().all(|f| f.exists()), "the new catalog's originals were deleted");
+    let trashed = chairphoto_core::app::with_catalog(&app.state, |c| c.list_trash()).unwrap();
+    assert_eq!(trashed.len(), 2, "the new catalog's rows were removed");
+    trash.read_with(cx, |t, _| {
+        assert_eq!(t.error.as_deref(), Some(chairphoto_core::app::CATALOG_CHANGED));
+        assert!(t.report.is_none());
+    });
+
+    storage_sees_switch(&app, cx);
+    trash.read_with(cx, |t, _| {
+        assert!(t.photos.is_none() && t.selected.is_empty() && !t.confirming, "the old list was dropped");
+    });
+    work(cx);
+    let now = chairphoto_core::app::catalog_identity(&app.state).unwrap();
+    trash.read_with(cx, |t, _| {
+        assert_eq!(t.photos.as_ref().map(Vec::len), Some(2));
+        assert_eq!(t.loaded_from, Some(now), "the new catalog's trash was read");
+    });
+}
+
 // --- identity debt ------------------------------------------------------------------------
 
 /// A catalog whose `n` photos each owe their identity, with the files reachable.

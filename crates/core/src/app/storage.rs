@@ -314,6 +314,18 @@ pub fn restore_trashed(state: &AppState, photo_ids: &[i64]) -> Result<usize, Str
     with_catalog(state, |c| c.restore_photos(photo_ids))
 }
 
+/// [`restore_trashed`] for ids read from the catalog `expected` names: fails closed with
+/// `CATALOG_CHANGED` (restoring nothing) once another catalog is open, because the same ids
+/// there are other photos.
+pub fn restore_trashed_as(
+    state: &AppState,
+    expected: super::CatalogIdentity,
+    photo_ids: &[i64],
+) -> Result<usize, String> {
+    state.jobs.trash.trip()?;
+    super::with_catalog_as(state, expected, |c| c.restore_photos(photo_ids))
+}
+
 /// What emptying the trash did — and, as importantly, what it did not.
 #[derive(Debug, Clone, Default, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -369,6 +381,22 @@ pub fn empty_trash(
     older_than_days: Option<i64>,
     confirm: bool,
 ) -> Result<EmptyTrashReport, String> {
+    empty_trash_as(state, None, photo_ids, older_than_days, confirm)
+}
+
+/// [`empty_trash`] bound to the catalog `expected` names — what a front end that listed the
+/// trash passes along with the ids it read. The plan and the record phases each check it
+/// under the catalog lock: if another catalog is open by then, the plan fails closed with
+/// `CATALOG_CHANGED` before any file is touched, and the record phase stops (`aborted`).
+/// This holds even when the delete's worker starts after a switch that the front end has
+/// not seen yet, where a fresh trash generation alone would not stop it.
+pub fn empty_trash_as(
+    state: &AppState,
+    expected: Option<super::CatalogIdentity>,
+    photo_ids: Option<Vec<i64>>,
+    older_than_days: Option<i64>,
+    confirm: bool,
+) -> Result<EmptyTrashReport, String> {
     if !confirm {
         return Err("emptying the trash needs an explicit confirmation".into());
     }
@@ -385,6 +413,9 @@ pub fn empty_trash(
         let (candidates, plans, pairs) = {
             let guard = catalog.lock().map_err(|e| e.to_string())?;
             let c = guard.as_ref().ok_or("No catalog is open")?;
+            if expected.is_some_and(|id| !id.is(c)) {
+                return Err(super::CATALOG_CHANGED.to_string());
+            }
             let candidates: Vec<i64> = match (photo_ids, older_than_days) {
                 (Some(ids), _) => ids,
                 (None, Some(days)) => {
@@ -417,6 +448,9 @@ pub fn empty_trash(
             &mut |id| {
                 let guard = catalog.lock().map_err(|e| e.to_string())?;
                 let c = guard.as_ref().ok_or("No catalog is open")?;
+                if expected.is_some_and(|e| !e.is(c)) {
+                    return Err(super::CATALOG_CHANGED.to_string());
+                }
                 c.is_trashed(id).map_err(|e| e.to_string())
             },
         )?;
@@ -431,7 +465,7 @@ pub fn empty_trash(
             // whichever catalog is installed *now*, and applying an old catalog's ids to a
             // new one is the failure this whole protocol exists to prevent. The files are
             // already gone; a rescan reconciles the rows, which is recoverable.
-            if abort.load(Ordering::Relaxed) {
+            if abort.load(Ordering::Relaxed) || expected.is_some_and(|e| !e.is(c)) {
                 report.aborted = true;
                 break;
             }

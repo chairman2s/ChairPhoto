@@ -68,6 +68,9 @@ pub enum StorageEvent {
     BundleImported(Result<BundleImportResult, String>),
     /// The identity repair pass this entity followed ended: the queue changed.
     RepairEnded,
+    /// `catalog:switched` arrived and [`StorageState::epoch`] has moved on: whatever a dialog
+    /// read from the old catalog names other photos now.
+    CatalogSwitched,
 }
 
 pub struct StorageState {
@@ -172,6 +175,7 @@ impl StorageState {
                 self.import = None;
                 self.scan = None;
                 self.repair = RepairState::default();
+                cx.emit(StorageEvent::CatalogSwitched);
                 cx.notify();
             }
             CoreEvent::IdentityRepairProgress(p) => {

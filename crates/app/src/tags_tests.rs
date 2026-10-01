@@ -681,3 +681,79 @@ fn the_nearby_window_is_not_written_into_the_new_catalog(cx: &mut TestAppContext
     cx.run_until_parked();
     assert_eq!(with_catalog(&app, |c| c.get_setting(crate::tags::photo_tags::WINDOW_SETTING).unwrap()), None);
 }
+
+// --- a drag across a catalog switch (#107 gate) -------------------------------------------
+
+/// Native pointer input at `position` (window-local), then a frame.
+fn pointer(app: &App, position: gpui_kit::Point<gpui_kit::Pixels>, phase: &str, cx: &mut TestAppContext) {
+    use gpui_kit::{InputEvent as _, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent};
+    let modifiers = Modifiers::default();
+    cx.update_window(app.window(), |_, window, cx| {
+        let event = match phase {
+            "down" => {
+                MouseDownEvent { button: MouseButton::Left, position, modifiers, click_count: 1, first_mouse: false }
+                    .to_platform_input()
+            }
+            "move" => MouseMoveEvent { position, pressed_button: Some(MouseButton::Left), modifiers }.to_platform_input(),
+            _ => MouseUpEvent { button: MouseButton::Left, position, modifiers, click_count: 1 }.to_platform_input(),
+        };
+        window.dispatch_event(event, cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+}
+
+fn center(app: &App, id: String, cx: &mut TestAppContext) -> gpui_kit::Point<gpui_kit::Pixels> {
+    cx.update_window(app.window(), |_, window, cx| {
+        window.render_frame(cx);
+        window.find(SharedString::from(id)).bounds().center()
+    })
+    .unwrap()
+}
+
+/// **Forced interleaving** (#107 gate). Bergen's row is picked up and dragged towards People;
+/// mid-drag the core switches to the twin catalog (every tag id collides), with
+/// `catalog:switched` withheld or delivered (and the twin's tree read and drawn); then the tag
+/// is dropped on People's row. The twin's Bergen is not reparented: a drag from the old tree
+/// is refused (delivered), or its move fails closed under the drag's catalog (withheld).
+/// (Mutation-checked: dropping with the panel's current guard and no refusal — the code
+/// before this fix — reparents the twin's Bergen under People and the delivered case fails;
+/// without only the refusal, the drag's guard keeps the twin untouched but the drop fails
+/// silently, and the delivered case fails on the missing status line.)
+fn drag_across_a_switch(delivered: bool, cx: &mut TestAppContext) {
+    let dir = TempDir::new("tags-drag-switch");
+    let app = start(cx);
+    let s = open_tagged(&app, &dir, "a", cx);
+    let from = center(&app, format!("tag-row-{}", s.bergen), cx);
+    let to = center(&app, format!("tag-row-{}", s.people), cx);
+    pointer(&app, from, "down", cx);
+    for step in 1..=4 {
+        let f = step as f32 / 8.;
+        pointer(&app, gpui_kit::point(from.x + (to.x - from.x) * f, from.y + (to.y - from.y) * f), "move", cx);
+    }
+    assert!(cx.update(|cx| cx.has_active_drag()), "a drag is in progress");
+
+    let b = switch_to_twin(&app, &dir, delivered, cx);
+    assert_eq!((b.bergen, b.people), (s.bergen, s.people), "the ids collide");
+    if delivered {
+        assert!(app.wired.tags.read_with(cx, |t, _| t.loaded), "the twin's tree is drawn");
+    }
+    let to = center(&app, format!("tag-row-{}", b.people), cx);
+    pointer(&app, to, "move", cx);
+    pointer(&app, to, "up", cx);
+
+    assert_eq!(parent_of(&app, b.bergen), Some(b.norway), "the old catalog's drag moved the new catalog's tag");
+    let line = status(&app, cx);
+    assert!(line.starts_with("Move failed: "), "{line}");
+}
+
+#[gpui_kit::test]
+fn a_drag_never_moves_a_tag_of_the_new_catalog_before_the_switch_event(cx: &mut TestAppContext) {
+    drag_across_a_switch(false, cx);
+}
+
+#[gpui_kit::test]
+fn a_drag_never_moves_a_tag_of_the_new_catalog_after_the_switch_event(cx: &mut TestAppContext) {
+    drag_across_a_switch(true, cx);
+}

@@ -842,7 +842,14 @@ impl DetachGuards<'_> {
         aborts.trip_all();
         slots.clear_all();
         #[cfg(all(feature = "raw", feature = "edit"))]
-        crate::develop::release_all();
+        {
+            // Tests only: the resident set is process-global, so a switch in one test would
+            // release the images a develop test running in parallel just made resident
+            // (#133). Wait for that test instead; see `develop::serial`.
+            #[cfg(test)]
+            let _serial = crate::develop::serial();
+            crate::develop::release_all();
+        }
     }
 }
 
@@ -1220,6 +1227,40 @@ mod tests {
         // A straggler that decoded across the switch cannot make itself resident either.
         assert_eq!(session::publish(&claim, 7, &token, test_image(8, 8)), session::Published::Superseded);
         assert!(resident(&token).is_none());
+    }
+
+    /// **Forced interleaving** (#133). Another test's switch — its own `AppState`, its own
+    /// thread — runs phase one while a develop test holds images resident. The resident set
+    /// is process-global, so before phase one took `develop::serial()` this released the
+    /// develop test's image (shown with a throwaway test that joined the switch thread
+    /// between `publish` and the check: it failed 3 runs of 3). Now the switch waits for the
+    /// develop test, and releases only after it.
+    #[cfg(all(feature = "raw", feature = "edit"))]
+    #[test]
+    fn another_tests_switch_waits_for_a_develop_test() {
+        use crate::develop::{resident, serial, session, test_image};
+        use crate::plugins::edit::SourceToken;
+        let serial = serial();
+        let (catalog, _db) = open_catalog("develop-parallel-switch");
+        let registry = JobRegistry::default();
+        let claim = registry
+            .develop
+            .begin(&catalog, |job| super::super::DevelopStatus { job, photo_id: 7, generation: job, resident: false })
+            .unwrap();
+        let token = SourceToken::Working { photo_id: 7, generation: claim.job };
+        assert_eq!(session::publish(&claim, 7, &token, test_image(8, 8)), session::Published::Resident);
+        let switch = std::thread::spawn(|| {
+            let state = crate::app::AppState::default();
+            crate::app::catalogs::detach_catalog_and_trip_jobs(&state).unwrap();
+        });
+        // Long enough for an unblocked switch to finish many times over. Under extreme load
+        // this can only pass falsely (switch thread not yet scheduled), never fail falsely.
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(!switch.is_finished(), "the switch did not wait for the develop test");
+        assert!(resident(&token).is_some(), "another test's switch released this test's image");
+        drop(serial);
+        switch.join().unwrap();
+        assert!(resident(&token).is_none(), "once the develop test is done, the switch releases");
     }
 
     /// **Forced race.** A superseded worker's straggler, arriving after a switch has cleared

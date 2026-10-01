@@ -748,18 +748,40 @@ static FRAMED_CACHE: Mutex<Vec<(FramedKey, FramedBase)>> = Mutex::new(Vec::new()
 static FRAMED_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn framed_cache_get(key: &FramedKey) -> Option<FramedBase> {
-    let mut cache = FRAMED_CACHE.lock().unwrap();
-    let pos = cache.iter().position(|(k, _)| k == key)?;
-    // Most recently used at the back.
-    let entry = cache.remove(pos);
-    let base = entry.1.clone();
-    cache.push(entry);
-    FRAMED_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    Some(base)
+    #[cfg(test)]
+    if let Some(got) = ScopedFramedCache::with(|cache, hits| {
+        let got = lru_get(cache, key);
+        *hits += got.is_some() as u64;
+        got
+    }) {
+        return got;
+    }
+    let got = lru_get(&mut FRAMED_CACHE.lock().unwrap(), key);
+    if got.is_some() {
+        FRAMED_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    got
 }
 
 fn framed_cache_put(key: FramedKey, base: FramedBase) {
-    let mut cache = FRAMED_CACHE.lock().unwrap();
+    #[cfg(test)]
+    if ScopedFramedCache::active() {
+        ScopedFramedCache::with(|cache, _| lru_put(cache, key, base));
+        return;
+    }
+    lru_put(&mut FRAMED_CACHE.lock().unwrap(), key, base);
+}
+
+/// The framed cache's LRU lookup: most recently used at the back.
+fn lru_get(cache: &mut Vec<(FramedKey, FramedBase)>, key: &FramedKey) -> Option<FramedBase> {
+    let pos = cache.iter().position(|(k, _)| k == key)?;
+    let entry = cache.remove(pos);
+    let base = entry.1.clone();
+    cache.push(entry);
+    Some(base)
+}
+
+fn lru_put(cache: &mut Vec<(FramedKey, FramedBase)>, key: FramedKey, base: FramedBase) {
     cache.retain(|(k, _)| *k != key);
     if cache.len() >= FRAMED_CACHE_CAP {
         cache.remove(0);
@@ -770,6 +792,60 @@ fn framed_cache_put(key: FramedKey, base: FramedBase) {
 /// Hits so far (tests and the bench).
 pub fn framed_cache_hits() -> u64 {
     FRAMED_HITS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Tests only: a private framed cache, with its own hit count, for the calling thread while
+/// the guard lives.
+///
+/// The real cache is process-global and holds [`FRAMED_CACHE_CAP`] entries, and the test
+/// binary renders through it from dozens of threads at once. An assertion that a second
+/// render *hits* therefore depends on no other test putting `FRAMED_CACHE_CAP` entries in
+/// between (which evicts the first render's base), and a global hit counter cannot tell this
+/// test's hit from another's (issue #131). Inside a scope, `framed_cache_get`/`put` run the
+/// same LRU on the scope's vector instead, so what the test asserts is only its own traffic.
+/// Renders on other threads still use the global cache.
+#[cfg(test)]
+pub(crate) struct ScopedFramedCache(std::marker::PhantomData<*const ()>);
+
+#[cfg(test)]
+type ScopedState = Option<(Vec<(FramedKey, FramedBase)>, u64)>;
+
+#[cfg(test)]
+thread_local! {
+    static SCOPED_FRAMED: std::cell::RefCell<ScopedState> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+impl ScopedFramedCache {
+    pub(crate) fn new() -> Self {
+        SCOPED_FRAMED.with(|s| {
+            let mut s = s.borrow_mut();
+            assert!(s.is_none(), "framed-cache scopes do not nest");
+            *s = Some((Vec::new(), 0));
+        });
+        ScopedFramedCache(std::marker::PhantomData)
+    }
+
+    /// Hits on this scope's cache so far.
+    pub(crate) fn hits(&self) -> u64 {
+        Self::with(|_, hits| *hits).expect("scope is live")
+    }
+
+    fn active() -> bool {
+        SCOPED_FRAMED.with(|s| s.borrow().is_some())
+    }
+
+    /// `None` when the calling thread has no scope.
+    fn with<R>(f: impl FnOnce(&mut Vec<(FramedKey, FramedBase)>, &mut u64) -> R) -> Option<R> {
+        SCOPED_FRAMED.with(|s| s.borrow_mut().as_mut().map(|(cache, hits)| f(cache, hits)))
+    }
+}
+
+#[cfg(test)]
+impl Drop for ScopedFramedCache {
+    fn drop(&mut self) {
+        SCOPED_FRAMED.with(|s| *s.borrow_mut() = None);
+    }
 }
 
 /// Everything [`frame_image`] reads from the record, hashed bit-exactly: two records
@@ -1046,19 +1122,21 @@ mod tests {
         let record = r#"{"straighten": 6, "crop": {"x": 0.1, "y": 0.1, "w": 0.8, "h": 0.8},
                          "tone": {"ev": 0.7, "contrast": 0.2}, "vignette": -0.4}"#;
         let plain = render_image(image::load_from_memory(&jpeg).unwrap(), record, 48).unwrap();
-        let hits0 = framed_cache_hits();
+        // This thread's own cache: other tests' renders can neither evict the base between
+        // the two renders nor bump the count (#131).
+        let scope = ScopedFramedCache::new();
         let miss = render_proxy(RenderSource::PreviewJpeg(&jpeg), record, 48, RenderOpts::default()).unwrap();
+        assert_eq!(scope.hits(), 0, "the first render misses");
         let hit = render_proxy(RenderSource::PreviewJpeg(&jpeg), record, 48, RenderOpts::default()).unwrap();
-        assert!(framed_cache_hits() > hits0, "the second render must hit the framed cache");
+        assert_eq!(scope.hits(), 1, "the second render must hit the framed cache");
         assert_eq!(miss.to_rgb8().as_raw(), plain.to_rgb8().as_raw(), "miss ≠ uncached path");
         assert_eq!(hit.to_rgb8().as_raw(), plain.to_rgb8().as_raw(), "hit ≠ uncached path");
 
         // A look-only change reuses the base; the output still follows the record.
-        let hits1 = framed_cache_hits();
         let brighter = r#"{"straighten": 6, "crop": {"x": 0.1, "y": 0.1, "w": 0.8, "h": 0.8},
                            "tone": {"ev": 1.5}}"#;
         let out = render_proxy(RenderSource::PreviewJpeg(&jpeg), brighter, 48, RenderOpts::default()).unwrap();
-        assert!(framed_cache_hits() > hits1, "a look-only change must reuse the framed base");
+        assert_eq!(scope.hits(), 2, "a look-only change must reuse the framed base");
         let expect = render_image(image::load_from_memory(&jpeg).unwrap(), brighter, 48).unwrap();
         assert_eq!(out.to_rgb8().as_raw(), expect.to_rgb8().as_raw());
     }
@@ -1502,11 +1580,41 @@ mod tests {
         // Geometry runs on the linear image: a straighten + crop record renders the same
         // size as the framed base would, and the cache serves the second render.
         let geo = r#"{"engine": 2, "straighten": 3, "crop": {"x": 0.1, "y": 0.1, "w": 0.8, "h": 0.8}}"#;
-        let hits0 = framed_cache_hits();
+        let scope = ScopedFramedCache::new(); // see `framed_base_cache_renders_identically_on_miss_and_hit`
         let a = render_proxy(RenderSource::Working { token: token.clone(), image: img.clone() }, geo, 32, RenderOpts::default()).unwrap();
         let b = render_proxy(RenderSource::Working { token, image: img }, geo, 32, RenderOpts::default()).unwrap();
-        assert!(framed_cache_hits() > hits0);
+        assert_eq!(scope.hits(), 1);
         assert_eq!(a.to_rgb8().as_raw(), b.to_rgb8().as_raw());
+    }
+
+    /// **Forced interleaving** (#131). Between two renders of the same framed base, another
+    /// thread renders [`FRAMED_CACHE_CAP`] other bases — what the rest of the suite does at
+    /// random. Through the global cache that evicts the first base and the second render
+    /// misses (shown before the scope existed: the hit assertion failed 3 runs of 3); in a
+    /// scope it hits, and the global count is untouched by this thread.
+    #[test]
+    fn a_scoped_framed_cache_ignores_other_threads_renders() {
+        let token = SourceToken::Working { photo_id: 2, generation: 131 };
+        let img = synthetic_working(1.4);
+        let geo = r#"{"engine": 2, "straighten": 3, "crop": {"x": 0.1, "y": 0.1, "w": 0.8, "h": 0.8}}"#;
+        let render = || render_proxy(RenderSource::Working { token: token.clone(), image: img.clone() }, geo, 32, RenderOpts::default()).unwrap();
+        let scope = ScopedFramedCache::new();
+        let a = render();
+        std::thread::spawn(|| {
+            let jpeg = proxy_jpeg(131);
+            for edge in 40..40 + FRAMED_CACHE_CAP as u32 {
+                render_proxy(RenderSource::PreviewJpeg(&jpeg), "{}", edge, RenderOpts::default()).unwrap();
+            }
+        })
+        .join()
+        .unwrap();
+        let b = render();
+        assert_eq!(scope.hits(), 1, "the other thread's renders evicted this test's base");
+        assert_eq!(a.to_rgb8().as_raw(), b.to_rgb8().as_raw());
+        assert!(
+            !FRAMED_CACHE.lock().unwrap().iter().any(|(k, _)| k.source == token_fingerprint(&token)),
+            "a scoped render leaked into the global cache"
+        );
     }
 
     #[test]

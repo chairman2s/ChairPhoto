@@ -333,13 +333,18 @@ pub fn write_bundle_abortable(
     // 2 steps per photo: original + preview
     let total_steps = total_photos * 2;
 
-    if let Some(parent) = dest_path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("create dest dir: {e}"))?;
-    }
+    let dir = match dest_path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    std::fs::create_dir_all(dir).map_err(|e| format!("create dest dir: {e}"))?;
 
-    // Write to a temp file first; rename to dest on success (atomic-ish).
-    let tmp_path = dest_path.with_extension("chairphoto.tmp");
-    let result = write_bundle_to_file(bundle, &tmp_path, total_steps, abort, &on_progress);
+    // Write to a temp file of this write's own, beside the destination (same filesystem),
+    // then rename it into place. Two writes to one destination (a newer export while an
+    // older, tripped one is still mid-photo) never share a temp file, so neither truncates,
+    // deletes nor renames the other's.
+    let (tmp_path, file) = create_unique_temp(dir)?;
+    let result = write_bundle_to_file(bundle, file, total_steps, abort, &on_progress);
 
     match result {
         Ok(r) => {
@@ -354,16 +359,30 @@ pub fn write_bundle_abortable(
     }
 }
 
+/// Create a fresh temp file in `dir` for one bundle write: a name no other write uses
+/// (process id + random UUID), created exclusively (`O_EXCL`), so it is never another
+/// write's file. Hidden, and named so a leftover is recognisable.
+fn create_unique_temp(dir: &Path) -> Result<(PathBuf, std::fs::File), String> {
+    let mut last = None;
+    for _ in 0..8 {
+        let name = format!(".chairphoto-bundle-{}-{}.tmp", std::process::id(), uuid::Uuid::new_v4().simple());
+        let path = dir.join(name);
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(file) => return Ok((path, file)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => last = Some(e),
+            Err(e) => return Err(format!("create bundle file: {e}")),
+        }
+    }
+    Err(format!("create bundle file: {}", last.map(|e| e.to_string()).unwrap_or_default()))
+}
+
 fn write_bundle_to_file(
     bundle: &GatheredBundle,
-    tmp_path: &Path,
+    file: std::fs::File,
     total_steps: usize,
     abort: &std::sync::atomic::AtomicBool,
     on_progress: &impl Fn(usize, usize),
 ) -> Result<BundleWriteResult, String> {
-    let file = std::fs::File::create(tmp_path)
-        .map_err(|e| format!("create bundle file: {e}"))?;
-
     let mut zip = ZipWriter::new(file);
 
     // Stored (no compression) for originals — they're already compressed (RAW/JPEG).

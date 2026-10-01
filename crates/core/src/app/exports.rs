@@ -409,6 +409,64 @@ mod tests {
         .unwrap_err();
         assert!(err.starts_with(crate::bundle::writer::BUNDLE_EXPORT_CANCELLED), "{err}");
         assert!(!dest2.exists());
-        assert!(!dest2.with_extension("chairphoto.tmp").exists());
+        assert_eq!(files(&f.dir.join("out")), ["trip.chairphoto"], "no temp file is left behind");
+    }
+
+    /// The archive's entry names, sorted (panics on an unreadable zip).
+    fn bundle_entries(path: &Path) -> Vec<String> {
+        let mut zip = zip::ZipArchive::new(std::fs::File::open(path).unwrap()).unwrap();
+        let mut v: Vec<String> = (0..zip.len()).map(|i| zip.by_index(i).unwrap().name().to_string()).collect();
+        v.sort();
+        v
+    }
+
+    /// Wait for the other thread's step, failing rather than hanging.
+    fn wait(rx: &std::sync::mpsc::Receiver<()>) {
+        rx.recv_timeout(std::time::Duration::from_secs(60)).expect("the other export's step");
+    }
+
+    /// Two bundle exports to one destination, interleaved: the newer starts (tripping the
+    /// older) while the older is mid-write after its first photo; the older then stops at its
+    /// next check while the newer is itself mid-write; the newer then finishes. The older
+    /// never truncates, deletes nor renames the newer's temp file: the newer's bundle lands
+    /// whole, and no temp file is left behind.
+    #[test]
+    fn a_newer_bundle_export_to_the_same_destination_never_shares_the_older_ones_temp_file() {
+        use std::sync::mpsc::channel;
+        let f = fixture("bundle-newer", 3);
+        let dest = f.dir.join("out/trip.chairphoto");
+        let older = claim_bundle_export(&f.state).unwrap();
+        let (go_tx, go_rx) = channel::<()>();
+        let (mid_tx, mid_rx) = channel::<()>();
+        let (done_tx, done_rx) = channel::<()>();
+        let (newer, older_err) = std::thread::scope(|s| {
+            let (f, dest) = (&f, &dest);
+            let newer = s.spawn(move || {
+                wait(&go_rx);
+                let claim = claim_bundle_export(&f.state).unwrap();
+                export_bundle_claimed_with(&f.state, &claim, None, f.batch, dest, &|done, _| {
+                    if done == 1 {
+                        mid_tx.send(()).unwrap();
+                        wait(&done_rx);
+                    }
+                })
+            });
+            let older_err = export_bundle_claimed_with(&f.state, &older, None, f.batch, dest, &|done, _| {
+                if done == 1 {
+                    go_tx.send(()).unwrap();
+                    wait(&mid_rx);
+                }
+            });
+            done_tx.send(()).unwrap();
+            (newer.join().unwrap(), older_err)
+        });
+        let err = older_err.unwrap_err();
+        assert!(err.starts_with(crate::bundle::writer::BUNDLE_EXPORT_CANCELLED), "{err}");
+        let r = newer.expect("the newer bundle export completes");
+        assert_eq!((r.exported, r.skipped_offline, r.errors), (3, 0, 0));
+        let entries = bundle_entries(&dest);
+        let originals: Vec<_> = entries.iter().filter(|e| e.starts_with("originals/") && !e.ends_with(".xmp")).collect();
+        assert_eq!(originals.len(), 3, "{entries:?}");
+        assert_eq!(files(&f.dir.join("out")), ["trip.chairphoto"], "no temp file is left behind");
     }
 }

@@ -455,6 +455,34 @@ fn a_promotion_that_restarts_a_finished_job_still_blocks_the_next_version(cx: &m
     assert!(Arc::ptr_eq(&shown.image, &new.image));
 }
 
+/// Codex gate finding 4: a request held back behind an outdated render is a request too.
+/// Navigating away must forget it like a pending one — not send it when that render answers.
+#[gpui_kit::test]
+fn navigating_away_forgets_a_held_back_request(cx: &mut TestAppContext) {
+    let (pool, images) = store(cx, 1 << 30);
+    let photos = [10, 11, 12, 13, 14, 15];
+    images.update(cx, |s, _| s.navigate(&photos, 2, ImageKind::Preview)); // 12, 13, 11
+    pool.start(preview(13));
+    images.update(cx, |s, cx| {
+        s.invalidate(13, cx); // 13 v0 is running: a v1 request must wait for it
+        s.navigate(&photos, 2, ImageKind::Preview); // 13 v1: held back
+    });
+    let sent = pool.submitted();
+    images.update(cx, |s, _| s.navigate(&photos, 5, ImageKind::Preview)); // 15, 14
+    let after_move = pool.submitted();
+    assert_eq!(pool.last_batch(), vec![preview(15), preview(14)]);
+
+    pool.finish(&preview(13), Ok(pixels(4, 4))); // the v0 render answers
+    cx.run_until_parked();
+    assert!(after_move > sent);
+    assert_eq!(pool.submitted(), after_move, "13 is no longer wanted: nothing more is sent");
+    assert!(pool.last_batch() != vec![preview(13)]);
+    images.update(cx, |s, _| {
+        assert!(!s.is_pending(13, ImageKind::Preview));
+        assert!(matches!(s.get(13, ImageKind::Preview), ImageState::Absent));
+    });
+}
+
 #[gpui_kit::test]
 fn clear_forgets_cache_pending_and_failures(cx: &mut TestAppContext) {
     let (pool, images) = store(cx, 1 << 20);

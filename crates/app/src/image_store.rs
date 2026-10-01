@@ -434,13 +434,20 @@ impl ImageStore {
     }
 
     /// Stop wanting every pending request `keep` rejects: each is cancelled in the pool if it
-    /// is still queued, and whatever it produces later is dropped by generation.
+    /// is still queued, and whatever it produces later is dropped by generation. A request
+    /// held back in `deferred` that `keep` rejects (judged under the photo's current version,
+    /// which is what it would be sent as) is forgotten, so it is not sent when the render it
+    /// waits for answers.
     pub fn release_pending(&mut self, mut keep: impl FnMut(&ImageKey) -> bool) {
         let released: Vec<ImageKey> = self.pending.keys().filter(|k| !keep(k)).copied().collect();
         for key in released {
             self.pending.remove(&key);
             self.pool.cancel(&JobKey::photo(key.photo, key.kind));
         }
+        let versions = &self.versions;
+        self.deferred.retain(|&(photo, kind)| {
+            keep(&ImageKey { photo, kind, version: versions.get(&photo).copied().unwrap_or(0) })
+        });
     }
 
     /// The loupe moved to `photos[index]`: supersede this tier's other pending requests, then

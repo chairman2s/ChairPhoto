@@ -130,7 +130,7 @@ pub async fn export_bundle(
     // Progress events mirror the `import:progress` shape used by E5 (ingest_from_card).
     crate::app::spawn_blocking(move || {
         crate::bundle::writer::write_bundle(&bundle, &dest, |done, total| {
-            let _ = app.send(CoreEvent::ImportProgress(ImportProgress { done, total }));
+            let _ = app.send(CoreEvent::ImportProgress(ImportProgress { job: 0, done, total }));
         })
     })
     .await

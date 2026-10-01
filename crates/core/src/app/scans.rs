@@ -118,27 +118,38 @@ pub fn ingest_from_card(
     name: Option<&str>,
     selected: Option<std::collections::HashSet<String>>,
 ) -> Result<ScanResult, String> {
-    let abort = claim_import(state)?;
-    ingest_from_card_claimed(state, &abort, source, name, selected)
+    let claim = claim_import(state)?;
+    ingest_from_card_claimed(state, &claim, source, name, selected)
 }
 
-/// Claim the import generation: trip the running import and install a fresh flag. One abort
-/// lock, never the catalog's — cheap enough for a UI thread, which is the point: a front end
-/// that claims when the user presses Import can cancel (or a switch can trip) the import
-/// before its worker has even started.
-pub fn claim_import(state: &AppState) -> Result<std::sync::Arc<AtomicBool>, String> {
-    state.jobs.import.install_fresh()
+/// An import's ownership: its generation of the import abort flag, and the job id its
+/// `import:progress` events carry.
+#[derive(Clone)]
+pub struct ImportClaim {
+    pub abort: std::sync::Arc<AtomicBool>,
+    pub job: u64,
+}
+
+/// Claim the import generation: trip the running import, install a fresh flag and number the
+/// job. One abort lock, never the catalog's — cheap enough for a UI thread, which is the
+/// point: a front end that claims when the user presses Import can cancel (or a switch can
+/// trip) the import before its worker has even started, and knows the job id its progress
+/// will carry before any arrives.
+pub fn claim_import(state: &AppState) -> Result<ImportClaim, String> {
+    let (abort, job) = state.jobs.import.install_fresh_numbered()?;
+    Ok(ImportClaim { abort, job })
 }
 
 /// [`ingest_from_card`] under an import generation the caller already claimed
 /// ([`claim_import`]). Already tripped: it copies nothing.
 pub fn ingest_from_card_claimed(
     state: &AppState,
-    abort: &AtomicBool,
+    claim: &ImportClaim,
     source: &Path,
     name: Option<&str>,
     selected: Option<std::collections::HashSet<String>>,
 ) -> Result<ScanResult, String> {
+    let (abort, job) = (&*claim.abort, claim.job);
     if abort.load(Ordering::Relaxed) {
         return Err(cancelled_message(0));
     }
@@ -150,7 +161,7 @@ pub fn ingest_from_card_claimed(
     let (result, copied, aborted) = {
         let events = state.clone();
         crate::scanner::copy_from_card_abortable(source, &dest, selected.as_ref(), abort, move |done, total| {
-            events.send(CoreEvent::ImportProgress(ImportProgress { done, total }))
+            events.send(CoreEvent::ImportProgress(ImportProgress { job, done, total }))
         })?
     };
     if aborted || abort.load(Ordering::Relaxed) {

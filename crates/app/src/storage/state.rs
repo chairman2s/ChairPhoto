@@ -152,8 +152,10 @@ impl StorageState {
         self.model.update(cx, |m, cx| m.refresh(cx));
     }
 
-    fn set_bench_import(&self, progress: Option<(usize, usize)>, cx: &mut Context<Self>) {
+    /// Put the bench on import job `job` (its `import:progress` events move it), or clear it.
+    fn set_bench_import(&self, job: Option<u64>, progress: Option<(usize, usize)>, cx: &mut Context<Self>) {
         self.shell.update(cx, |s, cx| {
+            s.jobs.import_job = job;
             s.jobs.import = progress;
             cx.notify();
         });
@@ -194,19 +196,19 @@ impl StorageState {
     pub fn start_card_import(&mut self, source: PathBuf, name: String, selected: Vec<String>, cx: &mut Context<Self>) {
         let job = ImportJob { seq: self.next_seq(), epoch: self.epoch, kind: ImportKind::Card };
         self.import = Some(job.clone());
-        self.set_bench_import(Some((0, 0)), cx);
         self.status("Importing from card…".into(), cx);
         let state = self.app.clone();
         let name = (!name.trim().is_empty()).then(|| name.trim().to_string());
         let selected: HashSet<String> = selected.into_iter().collect();
         // Claimed here, not on the worker: a Cancel or a catalog switch before the worker
         // starts must still stop it. One abort-flag lock, never the catalog's.
-        let abort = match scans::claim_import(&self.app) {
-            Ok(a) => a,
+        let claim = match scans::claim_import(&self.app) {
+            Ok(c) => c,
             Err(e) => return self.finish_import(&job, Err(e), cx),
         };
+        self.set_bench_import(Some(claim.job), Some((0, 0)), cx);
         let rx = Runner::get(cx)
-            .run(move || scans::ingest_from_card_claimed(&state, &abort, &source, name.as_deref(), Some(selected)));
+            .run(move || scans::ingest_from_card_claimed(&state, &claim, &source, name.as_deref(), Some(selected)));
         cx.spawn(async move |this, cx| {
             let Ok(result) = rx.await else { return };
             this.update(cx, |s, cx| s.finish_import(&job, result.map(ImportOutcome::Card), cx)).ok();
@@ -219,15 +221,15 @@ impl StorageState {
     pub fn start_bundle_import(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         let job = ImportJob { seq: self.next_seq(), epoch: self.epoch, kind: ImportKind::Bundle };
         self.import = Some(job.clone());
-        self.set_bench_import(Some((0, 0)), cx);
         self.status("Importing bundle…".into(), cx);
         let state = self.app.clone();
-        let abort = match scans::claim_import(&self.app) {
-            Ok(a) => a,
+        let claim = match scans::claim_import(&self.app) {
+            Ok(c) => c,
             Err(e) => return self.finish_import(&job, Err(e), cx),
         };
+        self.set_bench_import(Some(claim.job), Some((0, 0)), cx);
         let rx =
-            Runner::get(cx).run(move || chairphoto_core::app::bundles::import_bundle_claimed(&state, &abort, &path));
+            Runner::get(cx).run(move || chairphoto_core::app::bundles::import_bundle_claimed(&state, &claim, &path));
         cx.spawn(async move |this, cx| {
             let Ok(result) = rx.await else { return };
             this.update(cx, |s, cx| s.finish_import(&job, result.map(ImportOutcome::Bundle), cx)).ok();
@@ -241,7 +243,7 @@ impl StorageState {
             return; // superseded by a newer import, or by a catalog switch
         }
         self.import = None;
-        self.set_bench_import(None, cx);
+        self.set_bench_import(None, None, cx);
         match (job.kind, result) {
             (_, Ok(ImportOutcome::Card(r))) => {
                 self.status(card_import_line(&r), cx);

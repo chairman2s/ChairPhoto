@@ -213,6 +213,64 @@ fn a_catalog_switch_stops_a_queued_import(cx: &mut TestAppContext) {
     app.wired.shell.read_with(cx, |s, _| assert_eq!(s.jobs.import, None, "the switch cleared the bench"));
 }
 
+/// The bench's import readout and the job it follows.
+fn bench_import(app: &App, cx: &mut TestAppContext) -> (Option<(usize, usize)>, Option<u64>) {
+    app.wired.shell.read_with(cx, |s, _| (s.jobs.import, s.jobs.import_job))
+}
+
+/// A straggling `import:progress` from `job`, as a worker sends it after passing its last
+/// abort check: it arrives after whatever the UI thread has already seen.
+fn straggler(app: &App, job: u64, cx: &mut TestAppContext) {
+    use chairphoto_core::app::{EventSink as _, ImportProgress};
+    app.state.send(CoreEvent::ImportProgress(ImportProgress { job, done: 1, total: 2 }));
+    cx.run_until_parked();
+}
+
+/// **Forced interleaving.** An import's progress arrives after the catalog switch reset the
+/// bench: it is a straggler from the left catalog's import and must not put the bench back on
+/// an import nothing will ever finish (whose Cancel would be dead).
+#[gpui_kit::test]
+fn a_straggler_from_before_a_switch_leaves_the_bench_clear(cx: &mut TestAppContext) {
+    let dir = TempDir::new("import-bench-switch");
+    let app = start(cx);
+    open_catalog(&app, &dir, cx);
+    let source = card(&dir, 2);
+    let all: Vec<String> = (0..2).map(|i| source.join(format!("IMG_{i:04}.jpg")).to_string_lossy().to_string()).collect();
+    app.wired.storage.update(cx, |s, cx| s.start_card_import(source, String::new(), all, cx));
+    let (shown, job) = bench_import(&app, cx);
+    assert_eq!(shown, Some((0, 0)));
+    let job = job.expect("the bench follows the claimed job");
+    switch_catalog_now(&app, &dir, cx);
+    assert_eq!(bench_import(&app, cx), (None, None), "the switch cleared the bench");
+    straggler(&app, job, cx);
+    assert_eq!(bench_import(&app, cx).0, None, "a straggler put the bench back on a dead import");
+    work(cx);
+    assert_eq!(bench_import(&app, cx).0, None);
+}
+
+/// **Forced interleaving.** A newer import supersedes an older one; the older one's progress
+/// arrives while the newer runs, and again after it finished. Neither moves the bench.
+#[gpui_kit::test]
+fn a_superseded_imports_stragglers_never_move_the_bench(cx: &mut TestAppContext) {
+    let dir = TempDir::new("import-bench-newer");
+    let app = start(cx);
+    open_catalog(&app, &dir, cx);
+    let source = card(&dir, 1);
+    let all = vec![source.join("IMG_0000.jpg").to_string_lossy().to_string()];
+    app.wired.storage.update(cx, |s, cx| s.start_card_import(source.clone(), String::new(), all.clone(), cx));
+    let older = bench_import(&app, cx).1.unwrap();
+    app.wired.storage.update(cx, |s, cx| s.start_card_import(source, String::new(), all, cx));
+    let newer = bench_import(&app, cx).1.unwrap();
+    assert_ne!(older, newer);
+    straggler(&app, older, cx);
+    assert_eq!(bench_import(&app, cx), (Some((0, 0)), Some(newer)), "the older import's progress moved the bench");
+    work(cx);
+    assert_eq!(status(&app, cx), "Imported 1 new of 1 on card");
+    assert_eq!(bench_import(&app, cx).0, None, "the newer import cleared the bench");
+    straggler(&app, older, cx);
+    assert_eq!(bench_import(&app, cx).0, None, "the older import's straggler revived the bench");
+}
+
 // --- rescan -------------------------------------------------------------------------------
 
 /// Rescan library: Phase A's result sets the status line; a result that lands after a

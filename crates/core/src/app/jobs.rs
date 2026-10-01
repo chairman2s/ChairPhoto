@@ -39,7 +39,7 @@
 //! | [`JobFamily::begin`] | catalog → that family's abort → that family's slot |
 //! | [`JobRegistry::lock_for_detach`] (switch phase one) | every abort, then every slot |
 //! | [`JobRegistry::lock_for_publish`] (switch phase two) | every abort |
-//! | [`AbortGeneration::install_fresh`] (scan / sharpness / pHash / import starts) | one abort, released before the catalog is read |
+//! | [`AbortGeneration::install_fresh`] (scan / sharpness / pHash starts), `scans::claim_import` | one abort, released before the catalog is read |
 //! | `storage::claim_reconcile` (a back-up drain or offload-policy start) | catalog → the reconcile abort |
 //! | [`AbortGeneration::trip`] (every Cancel command) | one abort |
 //! | [`JobSlot`] writes (workers) | one slot |
@@ -127,6 +127,14 @@ impl AbortGeneration {
     pub fn install_fresh(&self) -> Result<Arc<AtomicBool>, String> {
         let mut guard = self.lock()?;
         Ok(trip_and_replace(&mut guard))
+    }
+
+    /// [`Self::install_fresh`], also allocating the new job's id under the same lock, so the
+    /// id order matches the generation order (the import start: its progress carries the id).
+    pub fn install_fresh_numbered(&self) -> Result<(Arc<AtomicBool>, u64), String> {
+        let mut guard = self.lock()?;
+        let job = self.next_job_id();
+        Ok((trip_and_replace(&mut guard), job))
     }
 
     /// Trip the installed generation. Every Cancel command is exactly this; a no-op when

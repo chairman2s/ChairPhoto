@@ -53,17 +53,18 @@ pub fn preview_bundle(state: &AppState, bundle_path: &Path) -> Result<BundlePrev
 /// `import:progress` per photo), then index and merge additively on a secondary connection
 /// to the catalog the import started against (UUID-aware, so nothing is duplicated).
 pub fn import_bundle(state: &AppState, bundle_path: &Path) -> Result<BundleImportResult, String> {
-    let abort = super::scans::claim_import(state)?;
-    import_bundle_claimed(state, &abort, bundle_path)
+    let claim = super::scans::claim_import(state)?;
+    import_bundle_claimed(state, &claim, bundle_path)
 }
 
 /// [`import_bundle`] under an import generation the caller already claimed
 /// (`scans::claim_import`). Already tripped: it unpacks nothing.
 pub fn import_bundle_claimed(
     state: &AppState,
-    abort: &std::sync::atomic::AtomicBool,
+    claim: &super::scans::ImportClaim,
     bundle_path: &Path,
 ) -> Result<BundleImportResult, String> {
+    let (abort, job) = (&*claim.abort, claim.job);
     if abort.load(Ordering::Relaxed) {
         return Err(format!("{IMPORT_CANCELLED} before the bundle was opened."));
     }
@@ -76,7 +77,7 @@ pub fn import_bundle_claimed(
     let (extracted, partial, aborted) = {
         let events = state.clone();
         crate::bundle::importer::extract_originals_abortable(&manifest, &mut archive, &dest, abort, move |done, total| {
-            events.send(CoreEvent::ImportProgress(ImportProgress { done, total }))
+            events.send(CoreEvent::ImportProgress(ImportProgress { job, done, total }))
         })?
     };
     if aborted || abort.load(Ordering::Relaxed) {

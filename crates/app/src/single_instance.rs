@@ -28,6 +28,13 @@
 //!    creates files.
 //! 3. The primary reads each peer's uid (`SO_PEERCRED`, [`peer_uid`]) and drops a connection
 //!    from any other uid unanswered.
+//! 4. A second launch reads the *server's* uid the same way and forwards only to this user
+//!    ([`claim`]): a lock and socket planted by someone else are never told our links.
+//!
+//! An existing directory of ours that others could only read or search is tightened to
+//! `0700`; one they could **write** is refused, because they may already have planted a lock
+//! file (and hold it) and a socket there, and tightening the mode later revokes neither
+//! (Codex re-check of b6a788c).
 //!
 //! A socket path must fit `sun_path`
 //! ([`MAX_SOCKET_PATH`] bytes): when `$TMPDIR` is too deep for that, the fallback is
@@ -179,7 +186,8 @@ fn current_uid() -> io::Result<u32> {
 }
 
 /// Create `dir` (mode 0700) if missing. Refuse it unless it is a real directory (not a
-/// symlink) owned by `uid`; if it has any group/other permission bits, tighten it to `0700`.
+/// symlink) owned by `uid` that no one else could write; if others could read or search it,
+/// tighten it to `0700`.
 /// A shared temp dir makes this matter: another user could otherwise pre-create the
 /// directory and receive our URLs, or reach a socket in a `0755` directory of ours.
 ///
@@ -218,6 +226,9 @@ fn ensure_private_dir(dir: &Path, uid: u32) -> io::Result<()> {
         return Err(refuse(&format!("owned by uid {}", meta.uid())));
     }
     let mode = meta.permissions().mode() & 0o7777;
+    if mode & 0o022 != 0 {
+        return Err(refuse(&format!("mode {mode:o} lets others write in it, so its contents may not be ours")));
+    }
     if mode & 0o077 != 0 {
         eprintln!("single instance: {} had mode {mode:o}; tightening it to 700", dir.display());
         handle.set_permissions(std::fs::Permissions::from_mode(0o700))?;
@@ -403,6 +414,18 @@ impl Primary {
 ///   the lock a moment longer). Wait a little and look again: either the socket answers or
 ///   the lock comes free and this launch starts fresh with its link.
 pub fn claim(endpoint: &Endpoint, request: &Request, patience: Duration) -> Result<Claim, ClaimError> {
+    let uid = current_uid().map_err(ClaimError::Endpoint)?;
+    claim_trusting(endpoint, request, patience, uid)
+}
+
+/// [`claim`], forwarding only to a primary running as `server_uid` (tests pass another uid to
+/// play a stranger's server).
+fn claim_trusting(
+    endpoint: &Endpoint,
+    request: &Request,
+    patience: Duration,
+    server_uid: u32,
+) -> Result<Claim, ClaimError> {
     let socket_len = endpoint.socket.as_os_str().len();
     if socket_len > MAX_SOCKET_PATH {
         return Err(ClaimError::Endpoint(io::Error::new(
@@ -427,11 +450,27 @@ pub fn claim(endpoint: &Endpoint, request: &Request, patience: Duration) -> Resu
             Err(std::fs::TryLockError::Error(e)) => return Err(ClaimError::Endpoint(e)),
         }
         let not_now = match UnixStream::connect(&endpoint.socket) {
-            Ok(stream) => match forward(stream, request).map_err(ClaimError::NoAnswer)? {
-                Answer::Accepted => return Ok(Claim::Forwarded),
-                Answer::Refused(Refused::Closing) => io::Error::other("the running instance is quitting"),
-                Answer::Refused(Refused::Busy) => io::Error::other("the running instance is busy"),
-            },
+            Ok(stream) => {
+                // Only to this user's primary: a stranger may hold a lock and serve a socket
+                // planted before the directory was ours alone (see the module docs).
+                match peer_uid(&stream).map_err(ClaimError::NoAnswer)? {
+                    uid if uid == server_uid => {}
+                    uid => {
+                        return Err(ClaimError::NoAnswer(io::Error::new(
+                            ErrorKind::PermissionDenied,
+                            format!(
+                                "the instance socket {} is served by uid {uid}, not this user",
+                                endpoint.socket.display()
+                            ),
+                        )))
+                    }
+                }
+                match forward(stream, request).map_err(ClaimError::NoAnswer)? {
+                    Answer::Accepted => return Ok(Claim::Forwarded),
+                    Answer::Refused(Refused::Closing) => io::Error::other("the running instance is quitting"),
+                    Answer::Refused(Refused::Busy) => io::Error::other("the running instance is busy"),
+                }
+            }
             Err(e) if matches!(e.kind(), ErrorKind::NotFound | ErrorKind::ConnectionRefused) => e,
             Err(e) => return Err(ClaimError::NoAnswer(e)),
         };
@@ -911,12 +950,20 @@ mod tests {
         ensure_private_dir(&private, uid).unwrap();
         assert_eq!(mode(&private), 0o700);
 
-        for loose in [0o755, 0o777, 0o710] {
+        for loose in [0o755, 0o750, 0o710, 0o701] {
             let existing = dir.0.join(format!("loose-{loose:o}"));
             std::fs::create_dir(&existing).unwrap();
             std::fs::set_permissions(&existing, std::fs::Permissions::from_mode(loose)).unwrap();
             ensure_private_dir(&existing, uid).unwrap();
             assert_eq!(mode(&existing), 0o700, "a {loose:o} dir of ours was not tightened");
+        }
+        // Writable by others: something may already be planted inside, so refuse, unchanged.
+        for writable in [0o777, 0o775, 0o730, 0o703] {
+            let existing = dir.0.join(format!("writable-{writable:o}"));
+            std::fs::create_dir(&existing).unwrap();
+            std::fs::set_permissions(&existing, std::fs::Permissions::from_mode(writable)).unwrap();
+            assert!(ensure_private_dir(&existing, uid).is_err(), "a {writable:o} dir was accepted");
+            assert_eq!(mode(&existing), writable, "a refused {writable:o} dir was changed");
         }
 
         let link = dir.0.join("link");
@@ -977,5 +1024,26 @@ mod tests {
         let _ = stream.read_to_string(&mut answer);
         assert_eq!(answer, "", "a stranger was answered");
         assert!(rx.recv_timeout(Duration::from_millis(200)).is_err(), "a stranger's link reached the app");
+    }
+
+    /// A second launch forwards only to a primary running as this user: facing someone
+    /// else's server (played by expecting uid+1 from ours), it sends nothing and fails
+    /// instead of exiting as if the link had been taken (Codex re-check of b6a788c).
+    #[test]
+    fn a_second_launch_never_forwards_to_another_users_server() {
+        let dir = TempDir::new("srvcred");
+        let endpoint = Endpoint::new(&dir.0, "k");
+        let (tx, rx) = mpsc::channel();
+        let _primary = primary(claim(&endpoint, &Request::default(), CONNECT_PATIENCE))
+            .serve(move |r| tx.send(r).map_err(|_| Refused::Closing))
+            .unwrap();
+        let request = Request { urls: vec![PHOTO.into()], ..Request::default() };
+        let stranger = current_uid().unwrap() + 1;
+        match claim_trusting(&endpoint, &request, CONNECT_PATIENCE, stranger) {
+            Err(ClaimError::NoAnswer(e)) => assert_eq!(e.kind(), ErrorKind::PermissionDenied, "{e}"),
+            Ok(Claim::Forwarded) => panic!("forwarded to another user's server"),
+            other => panic!("unexpected: {:?}", other.map(|_| ())),
+        }
+        assert!(rx.recv_timeout(Duration::from_millis(200)).is_err(), "the link reached that server");
     }
 }

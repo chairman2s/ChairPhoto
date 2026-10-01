@@ -83,7 +83,7 @@ fn start(cx: &mut TestAppContext) -> App {
             events_rx,
             None,
             &SystemThemeResult::unavailable(),
-            WireOptions { on_exit, open_default_catalog: false },
+            WireOptions::headless(on_exit),
         )
     });
     // Not parked here: the event router has not been polled yet, which the worker-thread

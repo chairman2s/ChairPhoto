@@ -122,16 +122,9 @@ impl RootView {
         &self.shell
     }
 
-    /// Re-read the system theme off the UI thread and apply it.
+    /// Re-read the system theme off the UI thread; it paints when following.
     fn reload_theme(&mut self, cx: &mut Context<Self>) {
-        let read = cx
-            .background_executor()
-            .spawn(async { chairphoto_core::appearance::read_current_theme() });
-        cx.spawn(async move |_, cx| {
-            let result = read.await;
-            cx.update(|cx| crate::theme::apply_system_theme(&result, cx));
-        })
-        .detach();
+        crate::theme::reread_system_theme(cx);
     }
 
     fn on_mouse_move(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {

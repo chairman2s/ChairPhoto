@@ -9,7 +9,7 @@
 //!
 //! | Event | Owner |
 //! |---|---|
-//! | `appearance:theme_changed` | the theme ([`crate::theme::apply_system_theme`]) |
+//! | `appearance:theme_changed` | the theme ([`crate::theme::on_system_theme`]: painted when following) |
 //! | everything else | [`AppModel`], which refreshes what the event invalidates |
 //!
 //! As views are ported they take their events here (the grid its `scan:progress`, the faces
@@ -43,7 +43,7 @@ pub fn channel() -> (GpuiSink, UnboundedReceiver<CoreEvent>) {
 pub fn route(event: CoreEvent, model: &Entity<AppModel>, cx: &mut App) {
     match event {
         CoreEvent::ThemeChanged(result) => {
-            crate::theme::apply_system_theme(&result, cx);
+            crate::theme::on_system_theme(&result, cx);
             model.update(cx, |m, cx| m.note_event("appearance:theme_changed", theme_line(&result), cx));
         }
         other => model.update(cx, |m, cx| m.on_core_event(&other, cx)),

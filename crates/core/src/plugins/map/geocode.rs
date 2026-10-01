@@ -17,6 +17,7 @@
 use crate::app::CatalogIdentity;
 use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 
@@ -482,11 +483,35 @@ pub struct GeocodeAllSummary {
 /// The whole run is bound to one catalog (`expected`, or the one open when it starts), as
 /// [`geocode_photo_to_iptc`] is: once another catalog is open, the next step fails closed
 /// with `CATALOG_CHANGED` and the run stops, having written nothing to the new catalog.
+///
+/// The Tauri command's entry point: it cannot be cancelled. The GPUI module runs
+/// [`geocode_all_to_iptc_with`], which can.
 pub async fn geocode_all_to_iptc(
     state: &crate::app::AppState,
     expected: Option<CatalogIdentity>,
 ) -> Result<GeocodeAllSummary, String> {
-    use crate::app::{CoreEvent, EventSink as _, GeocodeProgress};
+    use crate::app::{CoreEvent, EventSink as _};
+    let never = AtomicBool::new(false);
+    geocode_all_to_iptc_with(state, expected, &never, |p| state.send(CoreEvent::GeocodeProgress(p))).await
+}
+
+/// What [`geocode_all_to_iptc_with`] answers once its abort flag is set.
+pub const GEOCODE_CANCELLED: &str = "Geocoding was cancelled";
+
+/// [`geocode_all_to_iptc`] for an owner that can stop it: `abort` is checked before each
+/// photo and again after its Nominatim answer, before anything is written, and a set flag
+/// ends the run with [`GEOCODE_CANCELLED`]. A photo whose write began is finished first
+/// (the row and its sidecar stay in step). Progress goes to `on_progress` — the owner
+/// scopes it to its own run — instead of the state's event sink. The owner may also drop
+/// the future (a task abort): every `await` here is before a photo's writes, never between
+/// them.
+pub async fn geocode_all_to_iptc_with(
+    state: &crate::app::AppState,
+    expected: Option<CatalogIdentity>,
+    abort: &AtomicBool,
+    mut on_progress: impl FnMut(crate::app::GeocodeProgress),
+) -> Result<GeocodeAllSummary, String> {
+    use crate::app::GeocodeProgress;
 
     struct Candidate {
         photo_id: i64,
@@ -521,7 +546,13 @@ pub async fn geocode_all_to_iptc(
     let total = candidates.len();
     let (mut filled, mut done) = (0usize, 0usize);
     for candidate in candidates {
+        if abort.load(Ordering::Relaxed) {
+            return Err(GEOCODE_CANCELLED.into());
+        }
         let geo = lookup_or_ask(state, identity, &endpoint, candidate.lat, candidate.lng).await?;
+        if abort.load(Ordering::Relaxed) {
+            return Err(GEOCODE_CANCELLED.into()); // stopped while Nominatim answered
+        }
         // An original that went offline since the read is skipped; a switch stops the run.
         let write = match fill_in(state, identity, candidate.photo_id, &geo) {
             Err(e) if e == crate::app::CATALOG_CHANGED => return Err(e),
@@ -536,7 +567,7 @@ pub async fn geocode_all_to_iptc(
             }
         }
         done += 1;
-        state.send(CoreEvent::GeocodeProgress(GeocodeProgress { done, total, filled }));
+        on_progress(GeocodeProgress { done, total, filled });
     }
     Ok(GeocodeAllSummary { total, filled, skipped: total - filled })
 }
@@ -1001,6 +1032,47 @@ mod tests {
             assert_eq!(geocode_all_to_iptc(&state, Some(before)).await.unwrap_err(), crate::app::CATALOG_CHANGED);
             server.abort();
         }
+    }
+
+    /// **Forced interleaving:** the owner cancels while Nominatim is answering. The run ends
+    /// with `GEOCODE_CANCELLED` before writing the answer anywhere; a flag already set stops
+    /// it before any request.
+    #[tokio::test]
+    async fn a_cancelled_run_stops_before_writing() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let abort = std::sync::Arc::new(AtomicBool::new(false));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        let requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let server = {
+            let (abort, requests) = (abort.clone(), requests.clone());
+            tokio::spawn(async move {
+                while let Ok((mut stream, _)) = listener.accept().await {
+                    let mut buf = [0u8; 4096];
+                    let _ = stream.read(&mut buf).await;
+                    requests.fetch_add(1, Ordering::SeqCst);
+                    abort.store(true, Ordering::SeqCst); // the user clicks Cancel now
+                    let body = r#"{"address":{"city":"Oslo","country":"Norway","country_code":"no"}}"#;
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                }
+            })
+        };
+        let (dir, state, id, _) = geo_catalog("geo-cancel", &endpoint);
+        let mut seen = Vec::new();
+        let err = geocode_all_to_iptc_with(&state, None, &abort, |p| seen.push(p.done)).await.unwrap_err();
+        assert_eq!(err, GEOCODE_CANCELLED);
+        assert!(seen.is_empty(), "no photo counted as done");
+        let iptc = state.catalog.lock().unwrap().as_ref().unwrap().get_iptc(id).unwrap();
+        assert!(iptc.city.is_empty(), "the answer was written after the cancel: {iptc:?}");
+        assert!(!crate::xmp::sidecar_path(&dir.join("library").join("IMG_1.jpg")).exists());
+        // Already cancelled: not even a request.
+        let err = geocode_all_to_iptc_with(&state, None, &abort, |_| {}).await.unwrap_err();
+        assert_eq!((err.as_str(), requests.load(Ordering::SeqCst)), (GEOCODE_CANCELLED, 1));
+        server.abort();
     }
 
     /// Nominatim blocks generic or misleading clients: every request names ChairPhoto and

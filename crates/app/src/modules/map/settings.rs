@@ -4,7 +4,7 @@
 //! **Settings:** the tile URL (Save / Reset to default; an unusable template is refused with
 //! the reason), the attribution note, the per-host tile answers (allow, block, forget — the
 //! "change it in Preferences" half of decision #118), and "Geocode all with GPS" with its
-//! progress. **Geocode panel:** fills the active photo's empty IPTC location fields.
+//! progress and Cancel. **Geocode panel:** fills the active photo's empty IPTC location fields.
 //!
 //! Both reverse-geocoding actions are user-initiated, as in React; that click is their
 //! network opt-in (#118 left Nominatim's prompt undecided).
@@ -147,6 +147,13 @@ impl Render for MapSettings {
                         !geocode.busy,
                         cx.listener(|this, _, _, cx| this.state.update(cx, |s, cx| s.geocode_all(cx))),
                     ))
+                    .when(geocode.busy, |d| {
+                        d.child(ui::clickable(
+                            ui::chip("map-geocode-cancel", "Cancel", true, colors),
+                            true,
+                            cx.listener(|this, _, _, cx| this.state.update(cx, |s, cx| s.cancel_geocode(cx))),
+                        ))
+                    })
                     .when_some(pct, |d, p| d.child(div().text_color(colors.dim).child(format!("{p}%")))),
             )
             .when(!geocode.status.is_empty(), |d| {

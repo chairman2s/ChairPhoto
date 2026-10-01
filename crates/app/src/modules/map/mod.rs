@@ -73,4 +73,10 @@ impl ModuleInstance for MapInstance {
             ..Default::default()
         }
     }
+
+    /// Disabled: stop the Geocode all run, if any (its task lives on the core runtime and
+    /// would otherwise outlive the module).
+    fn on_unload(&mut self, cx: &mut App) {
+        self.state.update(cx, |s, cx| s.unload(cx));
+    }
 }

@@ -6,7 +6,10 @@
 //! ([`work`]).
 
 use super::*;
-use crate::modules::map::state::Load;
+use crate::modules::map::state::fake::FakeGeocode;
+use crate::modules::map::state::{Load, MapGeocode};
+use chairphoto_core::app::GeocodeProgress;
+use chairphoto_core::plugins::map::geocode::GeocodeAllSummary;
 use crate::modules::map::tiles::fake::{tiny, FakeTiles};
 use crate::modules::map::tiles::MapTiles;
 use crate::modules::map::view::MapView;
@@ -529,6 +532,106 @@ fn old_fence_ids_never_reach_the_new_catalog(cx: &mut TestAppContext) {
     assert_eq!(fences.len(), 1, "nothing created or deleted in the new catalog: {fences:?}");
     assert_eq!((fences[0].name.as_str(), fences[0].tag_path.as_str()), ("Theirs", "Places/Theirs"), "not renamed");
     assert_eq!(backend::apply_fence(c, theirs.id).unwrap(), 1, "the new catalog's photo had not been tagged");
+}
+
+// --- Geocode all -------------------------------------------------------------------------
+
+/// The map with a recording Geocode all backend installed (no network; the real backend's
+/// cancel is `state.rs`'s `cancelling_a_net_run_drops_its_pending_request`).
+fn with_fake_geocode(cx: &mut TestAppContext) -> Arc<FakeGeocode> {
+    let fake = Arc::new(FakeGeocode::default());
+    cx.update(|cx| cx.set_global(MapGeocode(fake.clone())));
+    fake
+}
+
+fn map_state(m: &Map, cx: &mut TestAppContext) -> Entity<crate::modules::map::state::MapState> {
+    m.view(cx).read_with(cx, |v, _| v.state.clone())
+}
+
+/// Review #119: Geocode all ran on the core runtime with no owner. Disabling the module now
+/// stops it (its abort flag and its task), and a result that arrives anyway lands nowhere.
+#[gpui_kit::test]
+fn disabling_the_module_stops_geocode_all(cx: &mut TestAppContext) {
+    let dir = TempDir::new("map-geo-off");
+    let fake = with_fake_geocode(cx);
+    let m = open_map(&dir, &[OSLO], cx);
+    m.click("map-consent-deny", cx);
+    let state = map_state(&m, cx);
+    state.update(cx, |s, cx| s.geocode_all(cx));
+    work(&m.app, cx);
+    assert!(state.read_with(cx, |s, _| s.geocode_running().is_some() && s.geocode.busy));
+    let now = chairphoto_core::app::catalog_identity(&m.app.state).unwrap();
+    assert_eq!(fake.runs.lock().unwrap()[0].from, now, "bound to the shown catalog");
+
+    cx.update(|cx| ModuleRegistry::disable(&m.app.wired.modules, MAP_MODULE_ID, cx));
+    work(&m.app, cx);
+    assert!(fake.runs.lock().unwrap()[0].stopped(), "the run outlived the module");
+    let status = m.app.wired.model.read_with(cx, |m, _| m.status.to_string());
+    let done = fake.runs.lock().unwrap()[0].done.take().unwrap();
+    let _ = done.send(Ok(GeocodeAllSummary { total: 1, filled: 1, skipped: 0 }));
+    work(&m.app, cx);
+    assert_eq!(m.app.wired.model.read_with(cx, |m, _| m.status.to_string()), status, "a late result reported");
+}
+
+/// A catalog switch stops the run (its photo ids are the old catalog's); a new run on the
+/// new catalog starts, and the old run's stragglers — progress and result, sent by its
+/// backend after the switch — never touch it. At most one run: a second start while one
+/// runs does nothing. Cancel stops the run and says so; the current run's own progress and
+/// result land.
+#[gpui_kit::test]
+fn a_switch_stops_geocode_all_and_its_stragglers_never_reach_the_next_run(cx: &mut TestAppContext) {
+    let dir = TempDir::new("map-geo-switch");
+    let fake = with_fake_geocode(cx);
+    let m = open_map(&dir, &[OSLO], cx);
+    m.click("map-consent-deny", cx);
+    let state = map_state(&m, cx);
+    state.update(cx, |s, cx| s.geocode_all(cx));
+    work(&m.app, cx);
+
+    let other = TempDir::new("map-geo-switch-b");
+    open_catalog_with_photos(&m.app, &other, 1, cx);
+    work(&m.app, cx);
+    assert!(fake.runs.lock().unwrap()[0].stopped(), "the switch stopped the old run");
+    assert!(state.read_with(cx, |s, _| s.geocode_running().is_none() && !s.geocode.busy));
+
+    state.update(cx, |s, cx| s.geocode_all(cx));
+    work(&m.app, cx);
+    state.update(cx, |s, cx| s.geocode_all(cx));
+    assert_eq!(fake.runs.lock().unwrap().len(), 2, "one run at a time");
+    let now = chairphoto_core::app::catalog_identity(&m.app.state).unwrap();
+    assert_eq!(fake.runs.lock().unwrap()[1].from, now, "the new run is bound to the new catalog");
+
+    // The old run's stragglers, through its own channels.
+    {
+        let mut runs = fake.runs.lock().unwrap();
+        runs[0].progress.unbounded_send(GeocodeProgress { done: 1, total: 1, filled: 1 }).ok();
+        let _ = runs[0].done.take().unwrap().send(Ok(GeocodeAllSummary { total: 1, filled: 1, skipped: 0 }));
+    }
+    work(&m.app, cx);
+    state.read_with(cx, |s, _| {
+        assert!(s.geocode_running().is_some(), "a stale result ended the new run");
+        assert_eq!((s.geocode.busy, s.geocode.done, s.geocode.status.as_str()), (true, 0, "Starting…"), "stale progress shown");
+    });
+    // The current run's own progress lands.
+    fake.runs.lock().unwrap()[1].progress.unbounded_send(GeocodeProgress { done: 1, total: 3, filled: 1 }).ok();
+    work(&m.app, cx);
+    assert_eq!(state.read_with(cx, |s, _| (s.geocode.done, s.geocode.total)), (1, 3));
+
+    state.update(cx, |s, cx| s.cancel_geocode(cx));
+    work(&m.app, cx);
+    assert!(fake.runs.lock().unwrap()[1].stopped(), "Cancel stopped the run");
+    let status = state.read_with(cx, |s, _| s.geocode.status.clone());
+    assert_eq!(status, "Geocoding cancelled after 1 photos; 1 had location fields filled.");
+
+    // A third run's result lands.
+    state.update(cx, |s, cx| s.geocode_all(cx));
+    work(&m.app, cx);
+    let _ = fake.runs.lock().unwrap()[2].done.take().unwrap().send(Ok(GeocodeAllSummary { total: 2, filled: 1, skipped: 1 }));
+    work(&m.app, cx);
+    state.read_with(cx, |s, _| {
+        assert!(s.geocode_running().is_none() && !s.geocode.busy);
+        assert_eq!(s.geocode.status, "Done: 1 of 2 photos had location fields filled. 1 already set or no result.");
+    });
 }
 
 /// Escape closes the editor first, then cancels drawing, then closes the filmstrip.

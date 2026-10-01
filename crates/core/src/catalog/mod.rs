@@ -140,9 +140,24 @@ pub struct Catalog {
     /// Per connection, not per catalog: `open_secondary` skips migration, and scans write
     /// metadata through exactly that connection.
     legacy_value_norm: Cell<bool>,
+    /// Process-unique id of this handle — what `app::CatalogIdentity` compares. Every
+    /// `open`/`open_secondary` gets a new one, so a reopened catalog is a different instance.
+    instance: u64,
+}
+
+/// The next process-unique catalog handle id (never 0).
+fn next_instance() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 impl Catalog {
+    /// This handle's process-unique id. Two handles to the same file have different ids; a
+    /// handle keeps its id for life. See `app::CatalogIdentity`.
+    pub fn instance_id(&self) -> u64 {
+        self.instance
+    }
+
     /// Open (or create) a catalog file. `root` is the folder photo paths are
     /// stored relative to; it is persisted so a reopened catalog keeps the same
     /// root, and can be overridden on import to remap a catalog from another machine.
@@ -162,6 +177,7 @@ impl Catalog {
             root: root.to_path_buf(),
             path: catalog_path.to_path_buf(),
             legacy_value_norm: Cell::new(false),
+            instance: next_instance(),
         };
         catalog.migrate()?;
         // After migration: the table shape is settled by this point.
@@ -186,6 +202,7 @@ impl Catalog {
             root: root.to_path_buf(),
             path: catalog_path.to_path_buf(),
             legacy_value_norm: Cell::new(legacy_value_norm),
+            instance: next_instance(),
         })
     }
 

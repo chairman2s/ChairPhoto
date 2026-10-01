@@ -51,6 +51,17 @@
 //!
 //! Every transition here acquires **all** of its guards before its first mutation, so a
 //! poisoned mutex fails the whole transition rather than leaving a prefix of it applied.
+//!
+//! # Writes keyed by ids read earlier
+//!
+//! Abort generations stop *workers*. A front end's own write keyed by row ids, such as a
+//! culling mark, a burst or stack accept, or a trash delete, needs one more guard. The
+//! switch publishes the new catalog before `catalog:switched` reaches the UI, so such a write
+//! can land on the new catalog's rows. For these, capture [`super::CatalogIdentity`] with the
+//! snapshot (`with_catalog_identified`) and write through `with_catalog_as`. That fails closed
+//! (`CATALOG_CHANGED`) when the open catalog is no longer the one read. It takes no lock of
+//! its own: the identity is checked under the catalog lock the write already holds, so it
+//! adds nothing to the order above.
 
 use crate::catalog::Catalog;
 use std::path::PathBuf;

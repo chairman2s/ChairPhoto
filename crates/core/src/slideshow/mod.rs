@@ -16,6 +16,9 @@
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
+use std::time::Duration;
 
 /// All knobs for one slideshow render. The output path + the resolved still paths are passed
 /// separately to [`build_args`] / [`render`]; this is the user-facing option set mirrored by
@@ -263,14 +266,47 @@ pub fn render(
     if frame_paths.is_empty() {
         return Err("slideshow: no photos to render".to_string());
     }
-    let bin = ffmpeg_path()
-        .ok_or_else(|| "ffmpeg not found on PATH — install ffmpeg to render slideshows".to_string())?;
+    let bin = ffmpeg_path().ok_or_else(|| FFMPEG_MISSING.to_string())?;
+    render_with(Path::new(&bin), frame_paths, opts, out, &AtomicBool::new(false), on_progress)
+}
 
+/// What a render answers when ffmpeg is not installed.
+pub const FFMPEG_MISSING: &str = "ffmpeg not found on PATH — install ffmpeg to render slideshows";
+
+/// What a render answers when its abort flag was tripped (Cancel, a newer render, or a
+/// catalog switch).
+pub const SLIDESHOW_CANCELLED: &str = "Slideshow cancelled";
+
+/// How often the encode loop looks at the abort flag while ffmpeg runs.
+const ABORT_POLL: Duration = Duration::from_millis(50);
+
+/// [`render`] with an explicit ffmpeg binary and an abort flag. Tripping `abort` kills the
+/// ffmpeg process within [`ABORT_POLL`] and answers [`SLIDESHOW_CANCELLED`]; the partial
+/// output is the caller's to remove. Blocking.
+///
+/// ffmpeg's stdout is read on a helper thread and its `frame=` counts sent back here, so this
+/// thread can watch `abort` while ffmpeg is quiet (a long zoompan clip writes nothing for a
+/// while) and `on_progress` runs on the caller's thread.
+pub fn render_with(
+    bin: &Path,
+    frame_paths: &[PathBuf],
+    opts: &SlideshowOptions,
+    out: &Path,
+    abort: &AtomicBool,
+    on_progress: impl Fn(u32, u32),
+) -> Result<(), String> {
+    if frame_paths.is_empty() {
+        return Err("slideshow: no photos to render".to_string());
+    }
+    if abort.load(Ordering::Relaxed) {
+        return Err(SLIDESHOW_CANCELLED.to_string());
+    }
     let total = total_frames(frame_paths.len(), opts);
     let args = build_args(frame_paths, opts, out);
 
-    let mut child = Command::new(&bin)
+    let mut child = Command::new(bin)
         .args(&args)
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -289,25 +325,51 @@ pub fn render(
 
     // Parse `-progress pipe:1` from stdout. ffmpeg writes blocks of `key=value` lines; we
     // care about `frame=` (current output frame) and the terminal `progress=end`.
-    if let Some(stdout) = child.stdout.take() {
-        let reader = BufReader::new(stdout);
-        for line in reader.lines().map_while(Result::ok) {
-            if let Some(v) = line.strip_prefix("frame=") {
-                if let Ok(f) = v.trim().parse::<u32>() {
-                    on_progress(f.min(total), total);
+    let (tx, rx) = mpsc::channel::<u32>();
+    let stdout_handle = child.stdout.take().map(|stdout| {
+        std::thread::spawn(move || {
+            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                let frame = if let Some(v) = line.strip_prefix("frame=") {
+                    v.trim().parse::<u32>().ok()
+                } else if line == "progress=end" {
+                    Some(u32::MAX)
+                } else {
+                    None
+                };
+                if let Some(f) = frame {
+                    if tx.send(f).is_err() {
+                        break;
+                    }
                 }
-            } else if line == "progress=end" {
-                on_progress(total, total);
+            }
+        })
+    });
+
+    let mut aborted = false;
+    if stdout_handle.is_some() {
+        loop {
+            if abort.load(Ordering::Relaxed) {
+                aborted = true;
+                let _ = child.kill();
+                break;
+            }
+            match rx.recv_timeout(ABORT_POLL) {
+                Ok(f) => on_progress(f.min(total), total),
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => break, // ffmpeg closed stdout
             }
         }
     }
 
+    let status = child.wait().map_err(|e| format!("ffmpeg wait failed: {e}"))?;
+    if let Some(h) = stdout_handle {
+        let _ = h.join();
+    }
     let stderr_buf = stderr_handle.and_then(|h| h.join().ok()).unwrap_or_default();
 
-    let status = child
-        .wait()
-        .map_err(|e| format!("ffmpeg wait failed: {e}"))?;
-
+    if aborted {
+        return Err(SLIDESHOW_CANCELLED.to_string());
+    }
     if !status.success() {
         let tail: String = stderr_buf
             .lines()

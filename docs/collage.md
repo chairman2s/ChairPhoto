@@ -113,7 +113,13 @@ because it has no alpha, and the dialog nudges you toward PNG when that matters.
 
 Backend `collage::{compose_freeform, resize_cover_offset}` with commands
 `collage_auto_arrange` (async, upright-aspect layout), `make_collage_freeform`, and
-`save_collage_to_catalog`. Frontend `CollageDialog` plus `collageTemplates.ts`.
+`save_collage_to_catalog`, whose bodies live in core `app::collage` (shared with the GPUI
+Collage module, which binds them to the `CatalogIdentity` its dialog opened with). A library
+save indexes only into the catalog its photos were resolved in: if another catalog opened
+while the collage rendered, it fails closed and removes the rendered file. Frontend
+`CollageDialog` plus `collageTemplates.ts`; in the GPUI app,
+`crates/app/src/modules/collage/` plus `chairphoto_model::collage` (templates and canvas
+gestures).
 
 `CollageDialog.tsx` owns the module's backend surface: private
 `CollageFormat`/`CollageOptions`/`Placement`/`FreeformOptions` DTOs and wrappers over

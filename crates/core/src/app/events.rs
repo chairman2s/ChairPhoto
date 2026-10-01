@@ -112,13 +112,15 @@ pub struct CacheProgress {
 }
 
 /// Progress event payload for slideshow encoding, emitted as `slideshow:progress`. `done`/
-/// `total` are raw ffmpeg output-frame counts (mirrors `import:progress`'s shape).
+/// `total` are raw ffmpeg output-frame counts (mirrors `import:progress`'s shape); `job` is
+/// the render's job id (`app::slideshow`), so a front end drops a superseded render's.
 #[cfg(feature = "slideshow")]
 #[derive(Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SlideshowProgress {
     pub done: u32,
     pub total: u32,
+    pub job: u64,
 }
 
 /// Progress event payload for a LocalSend transfer, emitted as `localsend:progress`.

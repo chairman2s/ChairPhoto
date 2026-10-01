@@ -804,6 +804,10 @@ mod switch_tests {
     /// published; the new root is persisted in the re-rooted catalog file.
     #[test]
     fn a_reroot_overtaken_by_a_switch_does_not_publish_over_it() {
+        // A switch's phase one releases develop's process-global resident set: not while a
+        // develop test holds it.
+        #[cfg(all(feature = "raw", feature = "edit"))]
+        let _serial = crate::develop::serial();
         let dir = crate::test_support::TestTmpDir::new("reroot-race");
         let state = AppState::default();
         let db = dir.join("a.chairphoto");
@@ -826,6 +830,10 @@ mod switch_tests {
     /// or trips anything; the open catalog keeps its root.
     #[test]
     fn a_reroot_bound_to_a_closed_catalog_fails_closed() {
+        // A switch's phase one releases develop's process-global resident set: not while a
+        // develop test holds it.
+        #[cfg(all(feature = "raw", feature = "edit"))]
+        let _serial = crate::develop::serial();
         let dir = crate::test_support::TestTmpDir::new("reroot-as");
         let state = AppState::default();
         *state.catalog.lock().unwrap() = Some(Catalog::open(&dir.join("a.chairphoto"), &dir.join("a")).unwrap());

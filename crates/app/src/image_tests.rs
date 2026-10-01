@@ -414,6 +414,47 @@ fn only_the_old_renders_own_answer_ends_the_wait(cx: &mut TestAppContext) {
     assert!(Arc::ptr_eq(&shown.image, &new.image));
 }
 
+/// Codex gate finding 1: navigation promotes a pending preload by re-sending it. If the pool
+/// already finished that job (its answer is still in the channel, not drained), the re-send
+/// starts a fresh render. That render must be tracked like any submission: after the drain an
+/// invalidate's request for the new version must wait for it, not merge into it and cache the
+/// old pixels under the new version.
+#[gpui_kit::test]
+fn a_promotion_that_restarts_a_finished_job_still_blocks_the_next_version(cx: &mut TestAppContext) {
+    let (pool, images) = store(cx, 1 << 30);
+    let photos = [10, 11, 12];
+    images.update(cx, |s, _| s.navigate(&photos, 0, ImageKind::Preview)); // 10, then 11
+    // The preload of 11 finishes; its answer is sent but not drained (nothing has run yet).
+    pool.finish(&preview(11), Ok(pixels(4, 4)));
+    // 11 is still pending, so moving to it promotes it: the real pool no longer holds the
+    // job and starts a fresh render of the v0 photo.
+    images.update(cx, |s, _| s.navigate(&photos, 1, ImageKind::Preview));
+    assert_eq!(pool.last_batch()[0], preview(11), "11 is re-sent first");
+    pool.start(preview(11));
+    cx.run_until_parked(); // the first answer lands: 11 v0 is cached
+    assert!(ready(&images, 11, ImageKind::Preview, cx).is_some());
+
+    let sent = pool.submitted();
+    images.update(cx, |s, cx| {
+        s.invalidate(11, cx);
+        s.request(11, ImageKind::Preview);
+    });
+    assert_eq!(pool.submitted(), sent, "the v1 request must not merge into the running v0 render");
+
+    let old = pixels(4, 4);
+    pool.finish(&preview(11), Ok(old.clone())); // the promotion's render: v0 pixels
+    cx.run_until_parked();
+    if let Some(shown) = ready(&images, 11, ImageKind::Preview, cx) {
+        assert!(!Arc::ptr_eq(&shown.image, &old.image), "v0 pixels cached under v1");
+    }
+    assert_eq!(pool.submitted(), sent + 1, "the v1 request goes out once the v0 render is back");
+    let new = pixels(4, 4);
+    pool.finish(&preview(11), Ok(new.clone()));
+    cx.run_until_parked();
+    let shown = ready(&images, 11, ImageKind::Preview, cx).expect("v1 landed");
+    assert!(Arc::ptr_eq(&shown.image, &new.image));
+}
+
 #[gpui_kit::test]
 fn clear_forgets_cache_pending_and_failures(cx: &mut TestAppContext) {
     let (pool, images) = store(cx, 1 << 20);

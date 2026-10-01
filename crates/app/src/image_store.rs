@@ -31,7 +31,9 @@
 //!   own answer arrives — not on any other answer for the tier.
 //! - **Navigation** asks for the current photo first, then N+1, then N−1 as one pool batch,
 //!   so the current photo is on top of the LIFO stack before any worker can pop
-//!   (AGENTS.md § Performance).
+//!   (AGENTS.md § Performance). A preload that became the current photo is re-sent to move
+//!   it up; the re-send is an `unanswered` submission like any other, because the pool may
+//!   already have finished that job and start a fresh render for it.
 //!
 //! The pool is behind [`Submit`] so tests can hold responders and deliver them in any order.
 
@@ -268,6 +270,9 @@ struct Submission {
 struct Done {
     key: ImageKey,
     generation: u64,
+    /// The answer to a navigation promotion: never the one a pending key waits for, so
+    /// dropping it is not counted as stale.
+    promotion: bool,
     result: Result<Loaded, String>,
 }
 
@@ -378,9 +383,10 @@ impl ImageStore {
         self.submit(wanted, false);
     }
 
-    /// [`request_batch`](Self::request_batch), and with `promote` a pending key is re-sent
-    /// with a no-op responder so the pool moves it up to its place in this batch — what
-    /// navigation needs when a preload becomes the current photo.
+    /// [`request_batch`](Self::request_batch), and with `promote` a pending key is re-sent so
+    /// the pool moves it up to its place in this batch — what navigation needs when a preload
+    /// becomes the current photo. The re-send is tracked in `unanswered` under its own
+    /// generation; its answer only ends that record (the pending key's own answer lands).
     fn submit(&mut self, wanted: &[(i64, ImageKind)], promote: bool) {
         let mut batch: Vec<(JobKey, Respond<Loaded>)> = Vec::with_capacity(wanted.len());
         let mut seen = HashSet::new();
@@ -394,27 +400,31 @@ impl ImageStore {
                 continue;
             }
             let job = JobKey::photo(photo, kind);
-            if self.pending.contains_key(&key) {
-                if promote {
-                    batch.push((job, Box::new(|_| {})));
-                }
+            let promotion = self.pending.contains_key(&key);
+            if promotion && !promote {
                 continue;
             }
+            // A promotion is a submission like any other. The pool merges it into the
+            // pending job if it still holds that job; if the job already finished (its answer
+            // not yet drained), the pool starts a fresh render, which `unanswered` must know
+            // about so that a later version or catalog does not merge into it.
             self.generation += 1;
             let generation = self.generation;
-            self.pending.insert(key, generation);
+            if !promotion {
+                self.pending.insert(key, generation);
+                self.stats.submitted += 1;
+            }
             self.unanswered.entry((photo, kind)).or_default().push(Submission {
                 generation,
                 version: key.version,
                 epoch: self.epoch,
             });
-            self.stats.submitted += 1;
             let done = self.done.clone();
             batch.push((
                 job,
                 Box::new(move |result| {
                     // Fails only when the store is gone; the result is then unwanted.
-                    let _ = done.unbounded_send(Done { key, generation, result });
+                    let _ = done.unbounded_send(Done { key, generation, promotion, result });
                 }),
             ));
         }
@@ -494,6 +504,9 @@ impl ImageStore {
         // for the tier is left unanswered, and holds it back again otherwise.
         if self.deferred.remove(&tier) {
             self.request_batch(&[tier]);
+        }
+        if done.promotion {
+            return;
         }
         if self.pending.get(&done.key) != Some(&done.generation) {
             self.stats.stale_dropped += 1;

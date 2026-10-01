@@ -110,6 +110,12 @@ pub struct EditJob {
     /// The sensor-clipping overlay (`k=1`) instead of the render: a transparent PNG with
     /// the same geometry and size, marked where the RAW itself clipped. Engine 2 only.
     pub clip: bool,
+    /// Which catalog the caller had open when it asked (the GPUI app's
+    /// `AppModel::catalog_epoch`). Photo ids from different catalogs are different photos, so
+    /// two otherwise identical requests across a catalog switch are different jobs and must
+    /// never merge into one render. Neither the pool nor the renderer reads it. The Tauri
+    /// shell does not track one and passes 0.
+    pub catalog_epoch: u64,
 }
 
 /// A one-shot callback that receives the rendered result (or an error string).

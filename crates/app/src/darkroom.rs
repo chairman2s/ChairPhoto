@@ -23,6 +23,11 @@
 //! only ever be stale — unless the pool merged the new request into one of them (the same
 //! record and size again).
 //!
+//! Every job carries the catalog epoch the stage was opened under (`EditJob::catalog_epoch`).
+//! A render cannot be interrupted, and the pool merges identical keys; without the epoch a
+//! stage opened after a catalog switch for the same photo id, record and source would adopt a
+//! render still running for the other catalog's photo.
+//!
 //! The Darkroom view itself is a later ticket; this is its frame source.
 
 use crate::image_store::{Loaded, Submit};
@@ -94,6 +99,8 @@ struct FrameDone {
 pub struct DarkroomStage {
     pool: Arc<dyn Submit>,
     photo_id: i64,
+    /// The catalog this stage renders for (`AppModel::catalog_epoch` when it was opened).
+    catalog_epoch: u64,
     source: SourceToken,
     edit_json: String,
     generation: u64,
@@ -113,11 +120,14 @@ pub struct DarkroomStage {
 }
 
 impl DarkroomStage {
-    /// A stage for `photo_id` rendering from `source` (the camera preview, or a resident
-    /// RAW working image by token) with the record `edit_json`. Renders nothing until asked.
+    /// A stage for `photo_id` of the catalog open under `catalog_epoch`
+    /// (`AppModel::catalog_epoch`), rendering from `source` (the camera preview, or a
+    /// resident RAW working image by token) with the record `edit_json`. Renders nothing
+    /// until asked. A catalog switch needs a new stage: this one's frames are its catalog's.
     pub fn new(
         pool: Arc<dyn Submit>,
         photo_id: i64,
+        catalog_epoch: u64,
         source: SourceToken,
         edit_json: String,
         cx: &mut Context<Self>,
@@ -133,6 +143,7 @@ impl DarkroomStage {
         Self {
             pool,
             photo_id,
+            catalog_epoch,
             source,
             edit_json,
             generation: 0,
@@ -210,6 +221,7 @@ impl DarkroomStage {
             base_only: false,
             source: self.source.clone(),
             clip: false,
+            catalog_epoch: self.catalog_epoch,
         });
         self.cancel_older(generation, Some(&job));
         self.outstanding.push((generation, job.clone()));
@@ -324,7 +336,7 @@ mod tests {
         let pool = Arc::new(FakePool::default());
         let stage = cx.update(|cx| {
             let pool: Arc<dyn Submit> = pool.clone();
-            cx.new(|cx| DarkroomStage::new(pool, 42, SourceToken::Preview, "{}".into(), cx))
+            cx.new(|cx| DarkroomStage::new(pool, 42, 0, SourceToken::Preview, "{}".into(), cx))
         });
         (pool, stage)
     }
@@ -530,6 +542,46 @@ mod tests {
             assert_eq!(s.frame().map(|f| f.generation), Some(g4));
             assert!(s.failure().is_none(), "a newer frame clears the failure");
             assert_eq!(s.stats().failed, 2);
+        });
+    }
+
+    /// Codex gate finding 3: a stage opened after a catalog switch, for the same photo id,
+    /// record and source, must not adopt a render still running for the old catalog. The pool
+    /// merges equal keys (the fake answers every responder of a key at once), so the keys must
+    /// differ.
+    #[gpui_kit::test]
+    fn a_new_catalogs_stage_never_adopts_the_old_catalogs_render(cx: &mut TestAppContext) {
+        let pool = Arc::new(FakePool::default());
+        let open = |epoch: u64, cx: &mut TestAppContext| {
+            let pool: Arc<dyn Submit> = pool.clone();
+            cx.update(|cx| {
+                cx.new(|cx| DarkroomStage::new(pool, 42, epoch, SourceToken::Preview, "{}".into(), cx))
+            })
+        };
+        let old_stage = open(0, cx);
+        old_stage.update(cx, |s, cx| s.request(FrameTier::Full, cx));
+        let old_job = pool.last_batch()[0].clone();
+        pool.start(old_job.clone()); // a worker renders the old catalog's photo 42
+        old_stage.update(cx, |s, cx| s.close(cx)); // the catalog switches away
+
+        let new_stage = open(1, cx);
+        new_stage.update(cx, |s, cx| s.request(FrameTier::Full, cx));
+        let new_job = pool.last_batch()[0].clone();
+        assert_ne!(old_job, new_job, "the new catalog's request would merge into the old render");
+
+        let old_pixels = pixels(8, 8);
+        pool.finish(&old_job, Ok(old_pixels.clone()));
+        cx.run_until_parked();
+        new_stage.update(cx, |s, _| {
+            if let Some(f) = s.frame() {
+                assert!(!Arc::ptr_eq(&f.image, &old_pixels.image), "the old catalog's photo was shown");
+            }
+        });
+        let new_pixels = pixels(8, 8);
+        pool.finish(&new_job, Ok(new_pixels.clone()));
+        cx.run_until_parked();
+        new_stage.update(cx, |s, _| {
+            assert!(Arc::ptr_eq(&s.frame().expect("its own frame").image, &new_pixels.image));
         });
     }
 

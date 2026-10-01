@@ -20,7 +20,7 @@
 //! ([`TagsState::revision`]); a read for a superseded target is dropped.
 
 use super::groups::TagGroupsManager;
-use super::state::{run, TagDialog, TagsState};
+use super::state::{run, run_as, TagDialog, TagsState};
 use crate::shell::style::Colors;
 use crate::storage::ui;
 use chairphoto_core::catalog::{Tag, TagGroup, TagWithCount};
@@ -274,10 +274,15 @@ impl PhotoTags {
         self.tags.update(cx, |s, cx| s.paste(targets, cx));
     }
 
-    /// Change the nearby window, remember it, and re-read.
+    /// Change the nearby window, remember it, and re-read. Remembered in the catalog the tag
+    /// tree was read from (`run_as` under its guard: refused once another catalog is open);
+    /// with no tree read yet — between a switch and its re-read — it is not remembered.
     pub fn set_window(&mut self, secs: i64, cx: &mut Context<Self>) {
         self.window_secs = secs;
-        run(&self.tags, cx, false, move |c| c.set_setting(WINDOW_SETTING, &secs.to_string()), |_: &mut Self, _, _| {});
+        let guard = self.tags.read(cx).guard();
+        if guard.identity.is_some() {
+            run_as(&self.tags, &guard, cx, false, move |c| c.set_setting(WINDOW_SETTING, &secs.to_string()), |_: &mut Self, _, _| {});
+        }
         self.reload(cx);
         cx.notify();
     }

@@ -5,7 +5,7 @@
 //! when it loses focus. Every write bumps the tag state's revision, so the quick-tag block
 //! re-reads (React refetched on close).
 
-use super::state::{run, TagsState};
+use super::state::{bind_dialog, run_as, CatalogGuard, TagsState};
 use crate::shell::style::Colors;
 use crate::storage::{ui, CloseDialog};
 use chairphoto_core::catalog::{Tag, TagGroup};
@@ -15,6 +15,8 @@ use gpui_kit::{div, px, Context, Entity, EventEmitter, FontWeight, Subscription,
 
 pub struct TagGroupsManager {
     tags: Entity<TagsState>,
+    /// The tree this dialog opened over ([`bind_dialog`]): its jobs run under it.
+    guard: CatalogGuard,
     pub groups: Vec<TagGroup>,
     pub active: Option<i64>,
     pub members: Vec<Tag>,
@@ -34,7 +36,9 @@ impl TagGroupsManager {
         let new_group = cx.new(|cx| InputState::new(window, cx).placeholder("New group name (e.g. Street photo)"));
         let new_member = cx.new(|cx| InputState::new(window, cx).placeholder("Add tag (path, created if new — e.g. Street/Candid)"));
         let rename = cx.new(|cx| InputState::new(window, cx));
+        let (guard, bound) = bind_dialog(&tags, cx);
         let subscriptions = vec![
+            bound,
             cx.subscribe_in(&new_group, window, |s: &mut Self, _, e: &InputEvent, window, cx| {
                 if matches!(e, InputEvent::PressEnter { .. }) {
                     s.add_group(window, cx);
@@ -53,6 +57,7 @@ impl TagGroupsManager {
         ];
         let mut this = TagGroupsManager {
             tags,
+            guard,
             groups: Vec::new(),
             active: None,
             members: Vec::new(),
@@ -70,7 +75,7 @@ impl TagGroupsManager {
     /// Re-read the groups; keep `keep` (or the current group) active if it still exists, else
     /// the first.
     pub fn reload_groups(&mut self, keep: Option<Option<i64>>, cx: &mut Context<Self>) {
-        run(&self.tags, cx, false, |c| c.list_tag_groups(), move |s: &mut Self, r, cx| {
+        run_as(&self.tags, &self.guard, cx, false, |c| c.list_tag_groups(), move |s: &mut Self, r, cx| {
             match r {
                 Ok(groups) => {
                     let want = keep.unwrap_or(s.active);
@@ -89,7 +94,7 @@ impl TagGroupsManager {
             self.members.clear();
             return;
         };
-        run(&self.tags, cx, false, move |c| c.group_members(group), move |s: &mut Self, r, cx| {
+        run_as(&self.tags, &self.guard, cx, false, move |c| c.group_members(group), move |s: &mut Self, r, cx| {
             if s.active == Some(group) {
                 s.members = r.unwrap_or_default();
                 cx.notify();
@@ -110,7 +115,7 @@ impl TagGroupsManager {
             return;
         }
         self.new_group.update(cx, |i, cx| i.set_value("", window, cx));
-        run(&self.tags, cx, true, move |c| c.create_tag_group(&name), |s: &mut Self, r, cx| match r {
+        run_as(&self.tags, &self.guard, cx, true, move |c| c.create_tag_group(&name), |s: &mut Self, r, cx| match r {
             Ok(id) => s.reload_groups(Some(Some(id)), cx),
             Err(e) => {
                 s.error = Some(e);
@@ -126,7 +131,7 @@ impl TagGroupsManager {
             return;
         }
         self.new_member.update(cx, |i, cx| i.set_value("", window, cx));
-        run(&self.tags, cx, true, move |c| chairphoto_core::app::tags::add_tag_to_group(c, group, &path), |s: &mut Self, r, cx| {
+        run_as(&self.tags, &self.guard, cx, true, move |c| chairphoto_core::app::tags::add_tag_to_group(c, group, &path), |s: &mut Self, r, cx| {
             if let Err(e) = r {
                 s.error = Some(e);
             }
@@ -137,7 +142,7 @@ impl TagGroupsManager {
 
     pub fn remove_member(&mut self, tag_id: i64, cx: &mut Context<Self>) {
         let Some(group) = self.active else { return };
-        run(&self.tags, cx, true, move |c| c.remove_tag_from_group(group, tag_id), |s: &mut Self, r, cx| {
+        run_as(&self.tags, &self.guard, cx, true, move |c| c.remove_tag_from_group(group, tag_id), |s: &mut Self, r, cx| {
             if let Err(e) = r {
                 s.error = Some(e);
             }
@@ -147,7 +152,7 @@ impl TagGroupsManager {
 
     pub fn delete_active(&mut self, cx: &mut Context<Self>) {
         let Some(group) = self.active else { return };
-        run(&self.tags, cx, true, move |c| c.delete_tag_group(group), |s: &mut Self, r, cx| {
+        run_as(&self.tags, &self.guard, cx, true, move |c| c.delete_tag_group(group), |s: &mut Self, r, cx| {
             if let Err(e) = r {
                 s.error = Some(e);
             }
@@ -162,7 +167,7 @@ impl TagGroupsManager {
         if name.is_empty() || current.as_deref() == Some(name.as_str()) {
             return;
         }
-        run(&self.tags, cx, true, move |c| c.rename_tag_group(group, &name), |s: &mut Self, r, cx| {
+        run_as(&self.tags, &self.guard, cx, true, move |c| c.rename_tag_group(group, &name), |s: &mut Self, r, cx| {
             if let Err(e) = r {
                 s.error = Some(e);
             }

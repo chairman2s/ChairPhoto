@@ -10,6 +10,7 @@ pub mod app;
 pub mod appearance;
 pub mod bundle;
 pub mod burst;
+pub mod burst_analysis;
 pub mod catalog;
 #[cfg(feature = "collage")]
 pub mod collage;

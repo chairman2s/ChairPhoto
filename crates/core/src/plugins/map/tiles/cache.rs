@@ -102,6 +102,19 @@ impl TileCache {
         write_atomic(&meta_path, &serde_json::to_vec(meta).map_err(std::io::Error::other)?)
     }
 
+    /// Forget a tile (its body and validators): a cached body that is not a tile. Validators
+    /// go first, so a half-done removal never leaves validators for a missing body.
+    pub fn remove(&self, source: &TileSource, key: TileKey) -> std::io::Result<()> {
+        let (data, meta_path) = self.paths(source, key);
+        for path in [meta_path, data] {
+            match std::fs::remove_file(&path) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
     /// Bytes of tile bodies held.
     pub fn size(&self) -> u64 {
         self.entries().iter().map(|e| e.1).sum()

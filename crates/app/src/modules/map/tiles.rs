@@ -3,7 +3,7 @@
 //!
 //! ```text
 //! MapView ──want(visible keys)──▶ TileLayer ──load──▶ TileBackend (core runtime:
-//!                                    ▲                  TileFetcher::load → PNG/JPEG decode
+//!                                    ▲                  TileFetcher::load_decoded: PNG/JPEG
 //!                                    │                  → BGRA RenderImage, on a blocking worker)
 //!                                    └── TileDone {key, generation} ◀── unbounded channel
 //! ```
@@ -22,7 +22,7 @@
 //!   its own tiles in a loop. An evicted or cleared tile is released from every window's
 //!   sprite atlas with `drop_image` (deferred: it may be evicted inside a render).
 
-use chairphoto_core::plugins::map::tiles::fetch::{AllowedHosts, TileFetcher};
+use chairphoto_core::plugins::map::tiles::fetch::{AllowedHosts, TileDecoder, TileFetcher};
 use chairphoto_core::plugins::map::tiles::{TileKey, TileSource};
 use futures::channel::mpsc::{unbounded, UnboundedReceiver, UnboundedSender};
 use gpui_kit::{App, Global, RenderImage};
@@ -101,12 +101,10 @@ impl TileBackend for NetTiles {
     fn load(&self, source: &TileSource, redirect_hosts: &AllowedHosts, key: TileKey, respond: TileRespond) -> Box<dyn TileTicket> {
         let (fetcher, source, redirect_hosts) = (self.fetcher.clone(), source.clone(), redirect_hosts.clone());
         let task = chairphoto_core::app::runtime().spawn(async move {
-            let result = match fetcher.load_allowing(&source, key, &redirect_hosts).await {
-                Ok(tile) => tokio::task::spawn_blocking(move || decode(&tile.bytes))
-                    .await
-                    .unwrap_or_else(|e| Err(e.to_string())),
-                Err(e) => Err(e),
-            };
+            // Decoded inside the fetcher, on a blocking worker: a cached body that does not
+            // decode is evicted and fetched again there, never handed back to fail forever.
+            let decoder: TileDecoder<Arc<RenderImage>> = Arc::new(decode);
+            let result = fetcher.load_decoded(&source, key, &redirect_hosts, decoder).await.map(|d| d.tile);
             respond(result);
         });
         Box::new(Abort(task.abort_handle()))

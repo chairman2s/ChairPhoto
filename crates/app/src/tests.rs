@@ -542,12 +542,12 @@ fn a_second_launch_request_from_a_worker_thread_opens_its_links(cx: &mut TestApp
     model.update(cx, |m, cx| m.refresh(cx));
     cx.run_until_parked();
 
-    let (tx, rx) = futures::channel::mpsc::unbounded::<Request>();
+    let (tx, rx) = launch::request_queue();
     cx.update(|cx| launch::spawn_request_router(rx, model.clone(), None, cx).detach());
     let request = Request {
         urls: vec![format!("chairphoto://tag/{tag_uuid}"), format!("chairphoto://{photo_uuid}")],
     };
-    std::thread::spawn(move || tx.unbounded_send(request).unwrap()).join().unwrap();
+    std::thread::spawn(move || tx.send(request).unwrap()).join().unwrap();
     cx.run_until_parked();
 
     model.read_with(cx, |m, _| match &m.deep_link {
@@ -558,6 +558,119 @@ fn a_second_launch_request_from_a_worker_thread_opens_its_links(cx: &mut TestApp
         other => panic!("expected the photo (the last link), got {other:?}"),
     });
     assert_eq!(model_status(&model, cx), "Deep link: 2026/a.ARW → Library (view not ported yet)");
+}
+
+/// A second catalog (its own directory) holding a photo with the same relative path; returns
+/// the photo's uuid.
+fn second_catalog(dir: &TempDir) -> (Catalog, String) {
+    let root = dir.0.join("photos-b");
+    let catalog = Catalog::open(&dir.0.join("other.chairphoto"), &root).unwrap();
+    let photo = catalog.upsert_photo(&root.join("2026/b.ARW"), None, 0, 1).unwrap();
+    (catalog, photo.uuid)
+}
+
+/// Links that arrive before the catalog opens do not pile up: only the newest can land (each
+/// resolution supersedes the one before), so only the newest waits, and it is the one
+/// applied once the catalog is in.
+#[gpui_kit::test]
+fn links_waiting_for_the_catalog_are_coalesced_to_the_newest(cx: &mut TestAppContext) {
+    let dir = TempDir::new("link-flood");
+    let (state, model) = wired(cx);
+    let (photo_uuid, tag_uuid) = catalog_with_a_photo_and_a_tag(&dir, &state);
+    for _ in 0..100 {
+        model.update(cx, |m, cx| m.open_url(&format!("chairphoto://{photo_uuid}"), cx));
+    }
+    model.update(cx, |m, cx| m.open_url(&format!("chairphoto://tag/{tag_uuid}"), cx));
+    assert_eq!(model.read_with(cx, |m, _| m.pending_link_count()), 1);
+
+    model.update(cx, |m, cx| m.refresh(cx));
+    cx.run_until_parked();
+    model.read_with(cx, |m, _| assert!(matches!(m.deep_link, Some(DeepLinkTarget::Tag { .. }))));
+    assert_eq!(model.read_with(cx, |m, _| m.pending_link_count()), 0);
+}
+
+/// The queue between the single-instance thread and the main thread is bounded: past
+/// `MAX_QUEUED_REQUESTS` a request is refused `Busy` (the second launch hears `busy`), and
+/// draining makes room again.
+#[gpui_kit::test]
+fn the_second_launch_queue_is_bounded(cx: &mut TestAppContext) {
+    let (_state, model) = wired(cx);
+    let (tx, rx) = launch::request_queue();
+    for _ in 0..launch::MAX_QUEUED_REQUESTS {
+        assert_eq!(tx.send(Request::default()), Ok(()));
+    }
+    assert_eq!(tx.send(Request::default()), Err(crate::single_instance::Refused::Busy));
+    cx.update(|cx| launch::spawn_request_router(rx, model.clone(), None, cx).detach());
+    cx.run_until_parked();
+    assert_eq!(tx.send(Request::default()), Ok(()), "draining did not make room");
+}
+
+/// A catalog switch drops the resolved link: its photo id is the old catalog's.
+#[gpui_kit::test]
+fn a_catalog_switch_drops_the_resolved_link(cx: &mut TestAppContext) {
+    let dir = TempDir::new("link-switch");
+    let (state, model) = wired(cx);
+    let (photo_uuid, _) = catalog_with_a_photo_and_a_tag(&dir, &state);
+    model.update(cx, |m, cx| m.refresh(cx));
+    cx.run_until_parked();
+    model.update(cx, |m, cx| m.open_url(&format!("chairphoto://{photo_uuid}"), cx));
+    cx.run_until_parked();
+    model.read_with(cx, |m, _| assert!(matches!(m.deep_link, Some(DeepLinkTarget::Photo { .. }))));
+
+    let (other, _) = second_catalog(&dir);
+    *state.catalog.lock().unwrap() = Some(other);
+    model.update(cx, |m, cx| m.on_core_event(&CoreEvent::CatalogSwitched("other".into()), cx));
+    cx.run_until_parked();
+    model.read_with(cx, |m, _| assert_eq!(m.deep_link, None, "the old catalog's photo id survived the switch"));
+}
+
+/// A link still resolving when the catalog switches is neither lost nor landed from the old
+/// resolution: it waits for the new catalog and resolves there. Here the new catalog is not
+/// readable at first (state holds none while it opens), so the old resolution fails; that
+/// failure must not land, and the link must resolve once the new catalog is in.
+#[gpui_kit::test]
+fn a_link_in_flight_at_a_switch_resolves_against_the_new_catalog(cx: &mut TestAppContext) {
+    let dir = TempDir::new("link-inflight");
+    let (state, model) = wired(cx);
+    catalog_with_a_photo_and_a_tag(&dir, &state);
+    model.update(cx, |m, cx| m.refresh(cx));
+    cx.run_until_parked();
+    let (other, other_uuid) = second_catalog(&dir);
+
+    // Started against the first catalog, not yet run; then the switch begins.
+    model.update(cx, |m, cx| m.open_url(&format!("chairphoto://{other_uuid}/develop"), cx));
+    *state.catalog.lock().unwrap() = None;
+    model.update(cx, |m, cx| m.on_core_event(&CoreEvent::CatalogSwitched("other".into()), cx));
+    cx.run_until_parked();
+    // The switch's refresh found no catalog; the old resolution's error did not land.
+    assert_eq!(model_status(&model, cx), "Catalog unavailable: No catalog is open");
+    model.read_with(cx, |m, _| assert_eq!(m.deep_link, None));
+
+    *state.catalog.lock().unwrap() = Some(other);
+    model.update(cx, |m, cx| m.refresh(cx));
+    cx.run_until_parked();
+    model.read_with(cx, |m, _| match &m.deep_link {
+        Some(DeepLinkTarget::Photo { uuid, path, view, .. }) => {
+            assert_eq!(uuid, &other_uuid);
+            assert_eq!(path, "2026/b.ARW");
+            assert_eq!(*view, DeepLinkView::Develop);
+        }
+        other => panic!("the link was lost across the switch: {other:?}"),
+    });
+}
+
+/// Asking to quit closes the single-instance endpoint at once (before the event loop ends),
+/// so a second launch from then on is told `closing` rather than `ok`.
+#[gpui_kit::test]
+fn a_quit_request_closes_the_single_instance_endpoint(cx: &mut TestAppContext) {
+    let _app = start(cx);
+    let closer = crate::single_instance::Closer::default();
+    cx.update(|cx| launch::close_instance_on_quit(closer.clone(), cx));
+    cx.run_until_parked();
+    assert!(!closer.is_closed());
+    cx.update(|cx| crate::quit_app(QuitReason::Requested, cx));
+    cx.run_until_parked();
+    assert!(closer.is_closed(), "the endpoint stayed open after the quit was requested");
 }
 
 /// A quit signal, delivered by the signal thread, dispatches `Quit` once — the Ctrl+Q path,

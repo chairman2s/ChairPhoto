@@ -13,7 +13,10 @@
 //!
 //! The directory is `$XDG_RUNTIME_DIR/chairphoto`, or `<tmp>/chairphoto-<uid>` when
 //! `XDG_RUNTIME_DIR` is unset; either way created `0700` and refused unless it is owned by
-//! this user and not writable by anyone else.
+//! this user and not writable by anyone else. A socket path must fit `sun_path`
+//! ([`MAX_SOCKET_PATH`] bytes): when `$TMPDIR` is too deep for that, the fallback is
+//! `/tmp/chairphoto-<uid>`, and a path that still does not fit is refused by [`claim`] with an
+//! error that says so (the app then runs without single-instance).
 //!
 //! **The key** ([`instance_key`]) is a hash of the app data directory — the directory that
 //! holds `default.chairphoto` (`app::app_data_dir`, `$XDG_DATA_HOME/chairphoto`). One app
@@ -31,17 +34,31 @@
 //! end
 //! ```
 //!
-//! The primary answers `ok` and hands the [`Request`] to the app: it focuses the main window
-//! and opens each URL. A request with no URL only focuses — a second launch from the app
-//! launcher. Anything else gets `error <reason>` and is dropped. The primary serves one
-//! connection at a time with a read timeout, and caps line length and URL count, so a stuck
-//! or hostile peer (the socket is private to this user anyway) costs at most a timeout.
+//! The primary hands the [`Request`] to the app (which focuses the main window and opens each
+//! URL; a request with no URL only focuses, a second launch from the app launcher) and only
+//! then answers: `ok` if the app took it, `closing` if the app is quitting ([`Closer`]) or
+//! its router is gone, `busy` if too many requests already wait for the main thread
+//! ([`Refused`]). On `closing` or `busy` the second launch keeps trying for its patience:
+//! after `closing` the lock comes free and it becomes the primary itself, link in hand; a
+//! primary that stays busy that long is stuck, and the second launch exits 1 saying so. A
+//! malformed request gets `error <reason>`.
+//!
+//! What a quitting primary still loses: a request the router already took (`ok` sent) but
+//! did not apply before the event loop ended. The endpoint closes when the quit is asked for,
+//! not when the loop ends, which leaves only requests accepted in the same instant.
+//!
+//! The primary serves one connection at a time, gives each peer one deadline for its whole
+//! request (not a timeout per read, which a trickling peer could renew forever), and caps
+//! line length and URL count, so a stuck or hostile peer (the socket is private to this user
+//! anyway) costs at most that deadline.
 
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, ErrorKind, Read, Write};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const HELLO: &str = "chairphoto-instance 1";
@@ -49,8 +66,10 @@ const HELLO: &str = "chairphoto-instance 1";
 const MAX_LINE: usize = 8 * 1024;
 /// Most URLs in one request.
 const MAX_URLS: usize = 64;
-/// How long the primary waits on one peer, and a peer on the primary's answer.
+/// How long a peer waits on the primary's answer, and either side on a write.
 const IO_TIMEOUT: Duration = Duration::from_secs(2);
+/// How long the primary gives one peer to send its whole request, however it trickles in.
+const REQUEST_DEADLINE: Duration = Duration::from_secs(2);
 /// How long a second launch keeps trying to connect while the primary (which already holds
 /// the lock) is still starting up and has not bound the socket yet.
 pub const CONNECT_PATIENCE: Duration = Duration::from_secs(5);
@@ -107,16 +126,33 @@ pub fn instance_key(app_data_dir: &Path) -> String {
     format!("{hash:016x}")
 }
 
-/// `$XDG_RUNTIME_DIR/chairphoto`, else `<tmp>/chairphoto-<uid>`, created `0700` and checked
-/// to be this user's and private.
+/// The longest Unix socket path Linux accepts: `sun_path` is 108 bytes with the NUL.
+pub const MAX_SOCKET_PATH: usize = 107;
+/// `<16 hex digits>.sock`, the socket's file name.
+const SOCKET_NAME_LEN: usize = 16 + ".sock".len();
+
+/// `$XDG_RUNTIME_DIR/chairphoto`, else [`fallback_dir`], created `0700` and checked to be
+/// this user's and private.
 pub fn runtime_dir() -> io::Result<PathBuf> {
     let uid = current_uid()?;
     let dir = match std::env::var_os("XDG_RUNTIME_DIR").filter(|v| !v.is_empty()) {
         Some(base) => PathBuf::from(base).join("chairphoto"),
-        None => std::env::temp_dir().join(format!("chairphoto-{uid}")),
+        None => fallback_dir(&std::env::temp_dir(), uid),
     };
     ensure_private_dir(&dir, uid)?;
     Ok(dir)
+}
+
+/// Without `XDG_RUNTIME_DIR`: `<tmp>/chairphoto-<uid>`, unless a socket in it would be too
+/// long for `sun_path` (a deep `$TMPDIR`); then `/tmp/chairphoto-<uid>`.
+fn fallback_dir(tmp: &Path, uid: u32) -> PathBuf {
+    let name = format!("chairphoto-{uid}");
+    let dir = tmp.join(&name);
+    if dir.as_os_str().len() + 1 + SOCKET_NAME_LEN <= MAX_SOCKET_PATH {
+        dir
+    } else {
+        Path::new("/tmp").join(name)
+    }
 }
 
 /// This process's uid, read from `/proc/self` (no libc call needed on Linux).
@@ -176,7 +212,42 @@ pub enum Claim {
 pub struct Primary {
     listener: Option<UnixListener>,
     socket: PathBuf,
+    closing: Closer,
     _lock: File,
+}
+
+/// Why the app did not take a request; the second launch hears it as its answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Refused {
+    /// The app is quitting, or its router is gone.
+    Closing,
+    /// Too many requests already wait for the main thread.
+    Busy,
+}
+
+impl Refused {
+    fn answer(self) -> &'static str {
+        match self {
+            Refused::Closing => "closing\n",
+            Refused::Busy => "busy\n",
+        }
+    }
+}
+
+/// Tells a serving [`Primary`] that the app is quitting. From then on it answers every second
+/// launch `closing` without handing the request on, and the second launch waits for the lock
+/// to come free and starts fresh instead of sending its link into an app that is going away.
+#[derive(Clone, Default)]
+pub struct Closer(Arc<AtomicBool>);
+
+impl Closer {
+    pub fn close(&self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+
+    pub fn is_closed(&self) -> bool {
+        self.0.load(Ordering::SeqCst)
+    }
 }
 
 impl Drop for Primary {
@@ -189,20 +260,42 @@ impl Primary {
     /// Serve second launches on a thread of its own for as long as the returned `Primary`
     /// lives, handing each accepted [`Request`] to `on_request` (on that thread). Returns
     /// `self` back so the caller keeps the lock and the socket file alive.
-    pub fn serve(mut self, on_request: impl Fn(Request) + Send + 'static) -> io::Result<Self> {
+    ///
+    /// `on_request` says whether the app took the request. The peer is answered only after
+    /// that: `ok` if it did, the [`Refused`] reason if not (`closing` also once
+    /// [`Primary::closer`] has closed the endpoint), so a second launch is never told `ok`
+    /// for a link the app will not see.
+    pub fn serve(
+        mut self,
+        on_request: impl Fn(Request) -> Result<(), Refused> + Send + 'static,
+    ) -> io::Result<Self> {
         let listener = self.listener.take().expect("serve is called once");
+        let closing = self.closing.clone();
         std::thread::Builder::new().name("chairphoto-instance".into()).spawn(move || {
             for stream in listener.incoming() {
                 match stream {
-                    Ok(stream) => match read_request(stream) {
-                        Ok(request) => on_request(request),
-                        Err(e) => eprintln!("single instance: dropped a request: {e}"),
-                    },
+                    Ok(stream) => {
+                        let accept = |request: Request| {
+                            if closing.is_closed() {
+                                Err(Refused::Closing)
+                            } else {
+                                on_request(request)
+                            }
+                        };
+                        if let Err(e) = serve_one(stream, accept) {
+                            eprintln!("single instance: dropped a request: {e}");
+                        }
+                    }
                     Err(e) => eprintln!("single instance: accept failed: {e}"),
                 }
             }
         })?;
         Ok(self)
+    }
+
+    /// The handle that closes this endpoint at quit.
+    pub fn closer(&self) -> Closer {
+        self.closing.clone()
     }
 }
 
@@ -214,12 +307,23 @@ impl Primary {
 ///   return [`Claim::Primary`].
 /// - The lock is held and the socket answers: send `request` and return
 ///   [`Claim::Forwarded`] once the primary says `ok` ([`ClaimError::NoAnswer`] if it says
-///   anything else).
-/// - The lock is held but nothing listens: the primary is still starting (it locks before
-///   it binds) or on its way out (it unlinks the socket before its lock goes, and a child
-///   process between `fork` and `exec` can hold the lock a moment longer). Wait a little and
-///   look again: either the socket appears or the lock comes free.
+///   anything but `ok` or `closing`).
+/// - The lock is held but nothing listens, or the primary answers `closing`: it is still
+///   starting (it locks before it binds) or on its way out (it is quitting, or it unlinks
+///   the socket before its lock goes, and a child process between `fork` and `exec` can hold
+///   the lock a moment longer). Wait a little and look again: either the socket answers or
+///   the lock comes free and this launch starts fresh with its link.
 pub fn claim(endpoint: &Endpoint, request: &Request, patience: Duration) -> Result<Claim, ClaimError> {
+    let socket_len = endpoint.socket.as_os_str().len();
+    if socket_len > MAX_SOCKET_PATH {
+        return Err(ClaimError::Endpoint(io::Error::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "socket path {} is {socket_len} bytes; a Unix socket path holds at most {MAX_SOCKET_PATH}",
+                endpoint.socket.display()
+            ),
+        )));
+    }
     let lock = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -233,19 +337,19 @@ pub fn claim(endpoint: &Endpoint, request: &Request, patience: Duration) -> Resu
             Err(std::fs::TryLockError::WouldBlock) => {}
             Err(std::fs::TryLockError::Error(e)) => return Err(ClaimError::Endpoint(e)),
         }
-        match UnixStream::connect(&endpoint.socket) {
-            Ok(stream) => {
-                forward(stream, request).map_err(ClaimError::NoAnswer)?;
-                return Ok(Claim::Forwarded);
-            }
-            Err(e) if matches!(e.kind(), ErrorKind::NotFound | ErrorKind::ConnectionRefused) => {
-                if Instant::now() >= deadline {
-                    return Err(ClaimError::NoAnswer(e));
-                }
-                std::thread::sleep(Duration::from_millis(25));
-            }
+        let not_now = match UnixStream::connect(&endpoint.socket) {
+            Ok(stream) => match forward(stream, request).map_err(ClaimError::NoAnswer)? {
+                Answer::Accepted => return Ok(Claim::Forwarded),
+                Answer::Refused(Refused::Closing) => io::Error::other("the running instance is quitting"),
+                Answer::Refused(Refused::Busy) => io::Error::other("the running instance is busy"),
+            },
+            Err(e) if matches!(e.kind(), ErrorKind::NotFound | ErrorKind::ConnectionRefused) => e,
             Err(e) => return Err(ClaimError::NoAnswer(e)),
+        };
+        if Instant::now() >= deadline {
+            return Err(ClaimError::NoAnswer(not_now));
         }
+        std::thread::sleep(Duration::from_millis(25));
     }
 }
 
@@ -256,11 +360,25 @@ fn become_primary(endpoint: &Endpoint, lock: File) -> Result<Claim, ClaimError> 
         Err(e) => return Err(ClaimError::Endpoint(e)),
     }
     let listener = UnixListener::bind(&endpoint.socket).map_err(ClaimError::Endpoint)?;
-    Ok(Claim::Primary(Primary { listener: Some(listener), socket: endpoint.socket.clone(), _lock: lock }))
+    Ok(Claim::Primary(Primary {
+        listener: Some(listener),
+        socket: endpoint.socket.clone(),
+        closing: Closer::default(),
+        _lock: lock,
+    }))
 }
 
-/// Send `request` over a connection to the primary and wait for its `ok`.
-fn forward(mut stream: UnixStream, request: &Request) -> io::Result<()> {
+/// What the primary answered.
+#[derive(Debug, PartialEq, Eq)]
+enum Answer {
+    /// `ok`: the app took the request.
+    Accepted,
+    /// `closing` or `busy`: the app did not take it.
+    Refused(Refused),
+}
+
+/// Send `request` over a connection to the primary and wait for its answer.
+fn forward(mut stream: UnixStream, request: &Request) -> io::Result<Answer> {
     stream.set_read_timeout(Some(IO_TIMEOUT))?;
     stream.set_write_timeout(Some(IO_TIMEOUT))?;
     let mut message = format!("{HELLO}\n");
@@ -272,25 +390,53 @@ fn forward(mut stream: UnixStream, request: &Request) -> io::Result<()> {
     let mut answer = String::new();
     BufReader::new(stream).take(MAX_LINE as u64).read_line(&mut answer)?;
     match answer.trim_end() {
-        "ok" => Ok(()),
+        "ok" => Ok(Answer::Accepted),
+        "closing" => Ok(Answer::Refused(Refused::Closing)),
+        "busy" => Ok(Answer::Refused(Refused::Busy)),
         "" => Err(io::Error::new(ErrorKind::UnexpectedEof, "the running instance closed the connection")),
         other => Err(io::Error::other(format!("the running instance answered {other:?}"))),
     }
 }
 
-/// Read one request from a peer and answer it. Errors are the peer's fault; the caller logs
-/// them and moves on.
-fn read_request(stream: UnixStream) -> io::Result<Request> {
-    stream.set_read_timeout(Some(IO_TIMEOUT))?;
+/// Read one request from a peer, offer it to `accept`, then answer: `ok` if it was taken,
+/// the [`Refused`] reason if not, `error <why>` if it was malformed. The answer comes after the handoff so
+/// that `ok` is never a promise the app cannot keep. Errors are the peer's fault; the caller
+/// logs them and moves on.
+fn serve_one(stream: UnixStream, accept: impl FnOnce(Request) -> Result<(), Refused>) -> io::Result<()> {
     stream.set_write_timeout(Some(IO_TIMEOUT))?;
     let mut writer = stream.try_clone()?;
-    let result = parse_request(&mut BufReader::new(stream));
-    let answer = match &result {
-        Ok(_) => "ok\n".to_string(),
-        Err(e) => format!("error {}\n", e.to_string().replace('\n', " ")),
+    let reader = Deadline { stream, until: Instant::now() + REQUEST_DEADLINE };
+    let (answer, result) = match parse_request(&mut BufReader::new(reader)) {
+        Ok(request) => {
+            let answer = match accept(request) {
+                Ok(()) => "ok\n",
+                Err(refused) => refused.answer(),
+            };
+            (answer.to_string(), Ok(()))
+        }
+        Err(e) => (format!("error {}\n", e.to_string().replace('\n', " ")), Err(e)),
     };
     let _ = writer.write_all(answer.as_bytes());
     result
+}
+
+/// A stream whose reads share one deadline: each read may wait only for what is left of it.
+/// A per-read timeout alone would let a peer that sends a byte now and then hold the
+/// one-at-a-time server indefinitely.
+struct Deadline {
+    stream: UnixStream,
+    until: Instant,
+}
+
+impl Read for Deadline {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let left = self.until.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(io::Error::new(ErrorKind::TimedOut, "request took too long"));
+        }
+        self.stream.set_read_timeout(Some(left))?;
+        self.stream.read(buf)
+    }
 }
 
 fn parse_request(reader: &mut impl BufRead) -> io::Result<Request> {
@@ -332,7 +478,9 @@ mod tests {
     use super::*;
     use std::sync::mpsc;
 
-    /// A private directory under the system temp dir, removed on drop.
+    /// A private directory, removed on drop. Under `$XDG_RUNTIME_DIR` (else `/tmp`), not
+    /// `std::env::temp_dir()`: a socket path must fit in `sun_path` (108 bytes), and a long
+    /// `TMPDIR` (the suite runs with one on disk) overflows it.
     struct TempDir(PathBuf);
 
     impl TempDir {
@@ -341,7 +489,11 @@ mod tests {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_nanos();
-            let dir = std::env::temp_dir().join(format!("cp-si-{tag}-{}-{nanos}", std::process::id()));
+            let base = std::env::var_os("XDG_RUNTIME_DIR")
+                .filter(|v| !v.is_empty())
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("/tmp"));
+            let dir = base.join(format!("cp-si-{tag}-{}-{nanos}", std::process::id()));
             std::fs::DirBuilder::new().mode(0o700).recursive(true).create(&dir).unwrap();
             TempDir(dir)
         }
@@ -370,7 +522,7 @@ mod tests {
         let endpoint = Endpoint::new(&dir.0, "k");
         let (tx, rx) = mpsc::channel();
         let _primary = primary(claim(&endpoint, &Request::default(), CONNECT_PATIENCE))
-            .serve(move |r| tx.send(r).unwrap())
+            .serve(move |r| tx.send(r).map_err(|_| Refused::Closing))
             .unwrap();
 
         let second = Request { urls: vec![PHOTO.into(), "chairphoto://tag/x".into()] };
@@ -395,14 +547,18 @@ mod tests {
     fn a_stale_socket_from_a_crashed_primary_is_replaced() {
         let dir = TempDir::new("stale");
         let endpoint = Endpoint::new(&dir.0, "k");
-        // What a crash leaves: a socket file nobody listens on, and no lock holder.
+        // What a crash leaves: a socket file whose listener is gone, and no lock holder.
         drop(UnixListener::bind(&endpoint.socket).unwrap());
-        assert!(endpoint.socket.exists());
-        assert!(UnixStream::connect(&endpoint.socket).is_err(), "nobody listens on a stale socket");
+        // Checked by file type, not by a connect that should fail: another test thread's
+        // process spawn can hold a copy of the dropped listener's fd between its fork and
+        // exec (CLOEXEC closes it only at exec), and for that moment a connect succeeds. With
+        // a thread spawning /bin/true alongside, 11 and 19 of 2000 such connects succeeded.
+        use std::os::unix::fs::FileTypeExt as _;
+        assert!(std::fs::symlink_metadata(&endpoint.socket).unwrap().file_type().is_socket());
 
         let (tx, rx) = mpsc::channel();
         let _primary = primary(claim(&endpoint, &Request::default(), CONNECT_PATIENCE))
-            .serve(move |r| tx.send(r).unwrap())
+            .serve(move |r| tx.send(r).map_err(|_| Refused::Closing))
             .unwrap();
         let second = Request { urls: vec![PHOTO.into()] };
         assert!(matches!(claim(&endpoint, &second, CONNECT_PATIENCE).unwrap(), Claim::Forwarded));
@@ -415,7 +571,7 @@ mod tests {
     fn a_primary_that_quits_hands_over_to_the_next_launch() {
         let dir = TempDir::new("handover");
         let endpoint = Endpoint::new(&dir.0, "k");
-        let first = primary(claim(&endpoint, &Request::default(), CONNECT_PATIENCE)).serve(|_| {}).unwrap();
+        let first = primary(claim(&endpoint, &Request::default(), CONNECT_PATIENCE)).serve(|_| Ok(())).unwrap();
         drop(first);
         assert!(!endpoint.socket.exists(), "a clean exit removes the socket");
         let _next = primary(claim(&endpoint, &Request::default(), CONNECT_PATIENCE));
@@ -450,7 +606,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(150));
             let listener = UnixListener::bind(&socket).unwrap();
             let (stream, _) = listener.accept().unwrap();
-            tx.send(read_request(stream).unwrap()).unwrap();
+            serve_one(stream, |r| tx.send(r).map_err(|_| Refused::Closing)).unwrap();
         });
         let second = Request { urls: vec![PHOTO.into()] };
         assert!(matches!(claim(&endpoint, &second, CONNECT_PATIENCE).unwrap(), Claim::Forwarded));
@@ -476,6 +632,89 @@ mod tests {
         departing.join().unwrap();
     }
 
+    /// A second launch that arrives while the primary is quitting is told `closing`, not
+    /// `ok`: its link is not handed to an app that is going away. It waits for the lock and
+    /// becomes the next primary with its link.
+    #[test]
+    fn a_second_launch_during_the_primarys_quit_starts_fresh() {
+        let dir = TempDir::new("quitting");
+        let endpoint = Endpoint::new(&dir.0, "k");
+        let (tx, rx) = mpsc::channel();
+        let quitting = primary(claim(&endpoint, &Request::default(), CONNECT_PATIENCE))
+            .serve(move |r| tx.send(r).map_err(|_| Refused::Closing))
+            .unwrap();
+        quitting.closer().close();
+        let departing = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(150));
+            drop(quitting);
+        });
+        let _next = primary(claim(&endpoint, &Request { urls: vec![PHOTO.into()] }, CONNECT_PATIENCE));
+        departing.join().unwrap();
+        assert!(rx.try_recv().is_err(), "the quitting primary must not take the link");
+    }
+
+    /// A request the app does not take (its receiver is gone) is not acknowledged: the second
+    /// launch never hears `ok`, and gives up after its patience instead of exiting 0.
+    #[test]
+    fn a_request_the_app_does_not_take_is_not_acknowledged() {
+        let dir = TempDir::new("refused");
+        let endpoint = Endpoint::new(&dir.0, "k");
+        let _primary = primary(claim(&endpoint, &Request::default(), CONNECT_PATIENCE)).serve(|_| Err(Refused::Closing)).unwrap();
+        let result = claim(&endpoint, &Request { urls: vec![PHOTO.into()] }, Duration::from_millis(200));
+        assert!(matches!(result, Err(ClaimError::NoAnswer(_))), "expected NoAnswer");
+    }
+
+    /// A peer that trickles its request a byte at a time (each byte well inside a per-read
+    /// timeout) is cut off at the whole-request deadline, not served for as long as it keeps
+    /// trickling.
+    #[test]
+    fn a_trickling_peer_is_cut_off_at_the_request_deadline() {
+        let dir = TempDir::new("trickle");
+        let endpoint = Endpoint::new(&dir.0, "k");
+        let _primary = primary(claim(&endpoint, &Request::default(), CONNECT_PATIENCE)).serve(|_| Ok(())).unwrap();
+        let stream = UnixStream::connect(&endpoint.socket).unwrap();
+        let mut reader = stream.try_clone().unwrap();
+        let started = Instant::now();
+        let stop = Arc::new(AtomicBool::new(false));
+        let trickle = {
+            let (mut stream, stop) = (stream, stop.clone());
+            std::thread::spawn(move || {
+                // One byte of a line that never ends, every 200 ms, for up to 8 s.
+                while !stop.load(Ordering::SeqCst) && started.elapsed() < Duration::from_secs(8) {
+                    if stream.write_all(b"x").is_err() {
+                        return; // the server hung up
+                    }
+                    std::thread::sleep(Duration::from_millis(200));
+                }
+            })
+        };
+        let mut answer = String::new();
+        let _ = reader.read_to_string(&mut answer);
+        let cut_off_after = started.elapsed();
+        stop.store(true, Ordering::SeqCst);
+        trickle.join().unwrap();
+        assert!(answer.starts_with("error "), "{answer:?}");
+        assert!(
+            cut_off_after < REQUEST_DEADLINE + Duration::from_secs(1),
+            "the trickling peer held the server for {cut_off_after:?}"
+        );
+    }
+
+    /// A primary whose app refuses as busy is not acknowledged either: the second launch
+    /// keeps trying for its patience, then gives up saying the instance is busy.
+    #[test]
+    fn a_busy_primary_is_reported_as_busy() {
+        let dir = TempDir::new("busy");
+        let endpoint = Endpoint::new(&dir.0, "k");
+        let _primary = primary(claim(&endpoint, &Request::default(), CONNECT_PATIENCE))
+            .serve(|_| Err(Refused::Busy))
+            .unwrap();
+        match claim(&endpoint, &Request { urls: vec![PHOTO.into()] }, Duration::from_millis(200)) {
+            Err(ClaimError::NoAnswer(e)) => assert_eq!(e.to_string(), "the running instance is busy"),
+            _ => panic!("expected NoAnswer"),
+        }
+    }
+
     /// A peer that speaks something else gets an error line and its request is dropped; the
     /// primary keeps serving.
     #[test]
@@ -484,7 +723,7 @@ mod tests {
         let endpoint = Endpoint::new(&dir.0, "k");
         let (tx, rx) = mpsc::channel();
         let _primary = primary(claim(&endpoint, &Request::default(), CONNECT_PATIENCE))
-            .serve(move |r| tx.send(r).unwrap())
+            .serve(move |r| tx.send(r).map_err(|_| Refused::Closing))
             .unwrap();
 
         for bad in ["hello\nend\n", "chairphoto-instance 1\nopen x\nend\n", "chairphoto-instance 1\nurl x\n"] {
@@ -538,6 +777,32 @@ mod tests {
         // FNV-1a 64 of the empty string is its offset basis: the hash is the fixed algorithm,
         // not std's randomly seeded one.
         assert_eq!(instance_key(Path::new("")), "cbf29ce484222325");
+    }
+
+    /// A deep `$TMPDIR` does not push the fallback socket past `sun_path`.
+    #[test]
+    fn the_fallback_dir_stays_short_enough_for_a_socket() {
+        assert_eq!(fallback_dir(Path::new("/tmp"), 1000), Path::new("/tmp/chairphoto-1000"));
+        let deep = Path::new("/home/someone/.local/share/chairphoto-agent/tmp/imgfix-a9c59/and/deeper/still");
+        let dir = fallback_dir(deep, 1000);
+        assert_eq!(dir, Path::new("/tmp/chairphoto-1000"));
+        let endpoint = Endpoint::new(&dir, &instance_key(Path::new("/x")));
+        assert!(endpoint.socket.as_os_str().len() <= MAX_SOCKET_PATH);
+    }
+
+    /// A socket path too long for `sun_path` is refused up front, saying why, as an
+    /// `Endpoint` error (the app runs without single-instance), not as a bind failure.
+    #[test]
+    fn a_socket_path_too_long_is_refused_clearly() {
+        let dir = TempDir::new("long");
+        let deep = dir.0.join("d".repeat(100));
+        std::fs::create_dir_all(&deep).unwrap();
+        match claim(&Endpoint::new(&deep, "k"), &Request::default(), CONNECT_PATIENCE) {
+            Err(ClaimError::Endpoint(e)) => {
+                assert!(e.to_string().contains("a Unix socket path holds at most 107"), "{e}")
+            }
+            _ => panic!("expected an Endpoint error"),
+        }
     }
 
     #[test]

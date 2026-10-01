@@ -55,7 +55,7 @@ use chairphoto_core::app::{AppState, CoreEvent};
 use chairphoto_core::appearance::SystemThemeResult;
 use chairphoto_core::image_pool::ImagePool;
 use image_store::{ImageStore, Loaded};
-use futures::channel::mpsc::{unbounded, UnboundedReceiver, UnboundedSender};
+use futures::channel::mpsc::{unbounded, UnboundedReceiver};
 use single_instance::{Claim, ClaimError, Primary, Request};
 use model::AppModel;
 use gpui_kit::{
@@ -214,7 +214,7 @@ pub fn wire(
 /// Become this app data dir's primary instance, serving second launches into `tx`; or hand
 /// `launch` to the instance that already is, and exit. `None`: single-instance could not be
 /// set up (the reason is logged) and the app runs without it.
-fn claim_single_instance(launch: &Request, tx: UnboundedSender<Request>) -> Option<Primary> {
+fn claim_single_instance(launch: &Request, tx: launch::RequestSender) -> Option<Primary> {
     let endpoint = chairphoto_core::app::app_data_dir()
         .map_err(std::io::Error::other)
         .and_then(|dir| {
@@ -231,10 +231,9 @@ fn claim_single_instance(launch: &Request, tx: UnboundedSender<Request>) -> Opti
     };
     match single_instance::claim(&endpoint, launch, single_instance::CONNECT_PATIENCE) {
         Ok(Claim::Primary(primary)) => {
-            let served = primary.serve(move |request| {
-                // Fails only once the app is shutting down.
-                let _ = tx.unbounded_send(request);
-            });
+            // Taken only if the queue has room and the router still listens: the second
+            // launch hears `ok` only then.
+            let served = primary.serve(move |request| tx.send(request));
             served.map_err(|e| eprintln!("single instance: disabled: {e}")).ok()
         }
         Ok(Claim::Forwarded) => {
@@ -258,9 +257,10 @@ fn claim_single_instance(launch: &Request, tx: UnboundedSender<Request>) -> Opti
 /// Start the app and run until it quits.
 pub fn run() {
     let launch = Request::from_args(std::env::args().skip(1));
-    let (instance_tx, instance_rx) = unbounded::<Request>();
+    let (instance_tx, instance_rx) = launch::request_queue();
     // Held for the process's lifetime: the lock, and the socket file it removes on the way out.
-    let _instance = claim_single_instance(&launch, instance_tx);
+    let instance = claim_single_instance(&launch, instance_tx);
+    let instance_closer = instance.as_ref().map(|primary| primary.closer());
 
     let (quit_tx, quit_rx) = unbounded::<i32>();
     if let Err(e) = signals::install(move |signal| {
@@ -273,8 +273,7 @@ pub fn run() {
     #[cfg(debug_assertions)]
     std::thread::spawn(|| {
         let (Some(home), Ok(exe)) = (desktop::data_home(), std::env::current_exe()) else { return };
-        let claim = std::env::var(desktop::CLAIM_ENV).is_ok_and(|v| v == "1");
-        if let Err(e) = desktop::register_dev_handler(&home, &exe, claim) {
+        if let Err(e) = desktop::register_dev_handler(&home, &exe, desktop::opted_in(), desktop::claim_default) {
             eprintln!("deep-link dev registration failed: {e}");
         }
     });
@@ -295,6 +294,9 @@ pub fn run() {
             let wired =
                 wire(cx, state, events_rx, Some(boot.pool.clone()), &initial_theme, WireOptions::production());
             launch::spawn_quit_on_signal(quit_rx, cx).detach();
+            if let Some(closer) = instance_closer {
+                launch::close_instance_on_quit(closer, cx);
+            }
             launch::spawn_request_router(instance_rx, wired.model.clone(), wired.main_window.clone().ok(), cx)
                 .detach();
             // This launch's own links (the React app got them from onOpenUrl's getCurrent()).

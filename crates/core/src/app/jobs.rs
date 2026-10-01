@@ -41,6 +41,7 @@
 //! | [`JobRegistry::lock_for_publish`] (switch phase two) | every abort |
 //! | [`AbortGeneration::install_fresh`] (scan / sharpness / pHash starts), `scans::claim_import` | one abort, released before the catalog is read |
 //! | `storage::claim_reconcile` (a back-up drain or offload-policy start) | catalog → the reconcile abort |
+//! | [`AbortGeneration::install_fresh_if_owner`] (a card import committing to index) | the scan abort → the import abort |
 //! | [`AbortGeneration::trip`] (every Cancel command) | one abort |
 //! | [`JobSlot`] writes (workers) | one slot |
 //! | `develop`'s resident set (`develop::with_resident`) | a leaf: after any of the above, never across another lock |
@@ -135,6 +136,29 @@ impl AbortGeneration {
         let mut guard = self.lock()?;
         let job = self.next_job_id();
         Ok((trip_and_replace(&mut guard), job))
+    }
+
+    /// Replace this generation (trip the running job, install a fresh flag) **only if**
+    /// `owner_flag` — a job of the `owner` family — is still un-tripped, checked while holding
+    /// both locks. `None` when the owner was already stopped; then nothing is tripped.
+    ///
+    /// For one job superseding another family's job only once it commits: a card import
+    /// replaces a running scan when it starts indexing. Checking and replacing under both
+    /// locks means a Cancel of the import (which trips under `owner`'s lock) lands either
+    /// before (nothing is tripped here) or after (the import stops at its next check).
+    /// `self` must precede `owner` in the [`JobRegistry`] declaration order (scan before
+    /// import), which is the order these locks are taken in.
+    pub fn install_fresh_if_owner(
+        &self,
+        owner: &AbortGeneration,
+        owner_flag: &AtomicBool,
+    ) -> Result<Option<Arc<AtomicBool>>, String> {
+        let mut guard = self.lock()?;
+        let _owner = owner.lock()?;
+        if owner_flag.load(Ordering::Relaxed) {
+            return Ok(None);
+        }
+        Ok(Some(trip_and_replace(&mut guard)))
     }
 
     /// Trip the installed generation. Every Cancel command is exactly this; a no-op when

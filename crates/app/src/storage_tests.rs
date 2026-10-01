@@ -337,6 +337,31 @@ fn window_focus_leaves_the_queue_while_the_nas_is_away(cx: &mut TestAppContext) 
     assert_eq!(pending.len(), 1);
 }
 
+/// **Forced interleaving.** A drain is in flight (queued, its result not landed) when the
+/// catalog switches: the new catalog's drain is not skipped because of it.
+#[gpui_kit::test]
+fn a_drain_from_before_a_switch_does_not_block_the_new_catalogs_drain(cx: &mut TestAppContext) {
+    let dir = TempDir::new("reconcile-switch");
+    let app = start(cx);
+    let id = catalog_with_backup(&app, &dir, cx);
+    work(cx); // the launch check: nothing waits
+    app.state.catalog.lock().unwrap().as_ref().unwrap().enqueue_operation("backup", id).unwrap();
+    dispatch(&app, crate::shell::actions::Reconcile, cx);
+    let runner = cx.update(|cx| Runner::get(cx));
+    assert_eq!(runner.pending(), 1, "the old catalog's drain is in flight");
+
+    switch_catalog_now(&app, &dir, cx);
+    // The new catalog's drain (its launch check, the chip or the menu all end here).
+    let before = runner.pending();
+    app.wired.storage.update(cx, |s, cx| s.run_reconcile(cx));
+    assert_eq!(runner.pending(), before + 1, "the new catalog's drain was skipped for the old one");
+    let epoch = app.wired.storage.read_with(cx, |s, _| s.epoch());
+    assert_eq!(app.wired.storage.read_with(cx, |s, _| s.reconciling), Some(epoch));
+
+    work(cx);
+    app.wired.storage.read_with(cx, |s, _| assert_eq!(s.reconciling, None, "both drains ended"));
+}
+
 // --- trash --------------------------------------------------------------------------------
 
 /// Two trashed photos whose files exist; returns their ids.

@@ -25,6 +25,10 @@ pub struct DrainSummary {
     pub failed: usize,
     /// True when nothing was attempted because no backup volume is reachable.
     pub skipped_offline: bool,
+    /// True when the drain stopped before its last op because it stopped being the owner —
+    /// a catalog switch, or a newer drain (`app::storage::ReconcileClaim`). The ops it did
+    /// not reach stay queued.
+    pub aborted: bool,
 }
 
 impl Catalog {

@@ -5,9 +5,9 @@
 //! **Ownership.** Every job start takes a sequence number, and every start also records the
 //! catalog epoch (bumped by `catalog:switched`). A result lands only when both are still
 //! current: a newer start of the same job or a catalog switch makes an older worker's result
-//! unreachable, as AGENTS.md requires. The core does the other half — the import and identity
-//! generations are tripped by a newer start, by Cancel and by the switch itself, so the old
-//! worker stops at its next file or copy rather than running on.
+//! unreachable, as AGENTS.md requires. The core does the other half — the import, reconcile
+//! and identity generations are tripped by a newer start, by Cancel and by the switch itself,
+//! so the old worker stops at its next file, op or copy rather than running on.
 //!
 //! **Identity repair.** The pass's events carry its job id; this entity follows exactly one
 //! job. `identity:repair_done` is the required terminal signal. The job id reaches the UI
@@ -80,9 +80,11 @@ pub struct StorageState {
     pub import: Option<ImportJob>,
     /// The running rescan's `(seq, epoch)`.
     scan: Option<(u64, u64)>,
-    /// A back-up drain is running (overlapping triggers start no second one, as React's
-    /// `reconciling` ref).
-    pub reconciling: bool,
+    /// The epoch of the back-up drain running now: overlapping triggers in one catalog start
+    /// no second one (React's `reconciling` ref). A drain from before a catalog switch does
+    /// not count — the switch tripped it in the core (`storage::ReconcileClaim`), so the new
+    /// catalog's launch drain must not wait for it.
+    pub reconciling: Option<u64>,
     pub repair: RepairState,
     /// The storage dialog opened last (tests drive it through this).
     pub last_dialog: Option<super::open::StorageDialog>,
@@ -115,7 +117,7 @@ impl StorageState {
             seq: 0,
             import: None,
             scan: None,
-            reconciling: false,
+            reconciling: None,
             repair: RepairState::default(),
             last_dialog: None,
             launch_checked: None,
@@ -344,26 +346,32 @@ impl StorageState {
     /// The "⤓ N waiting for the NAS" chip and More ⋯ → Back-up queue (App.tsx
     /// `runReconcile`): back up, then apply the offload policy.
     pub fn run_reconcile(&mut self, cx: &mut Context<Self>) {
-        if self.reconciling {
+        if self.reconciling == Some(self.epoch) {
             return;
         }
-        self.reconciling = true;
         let epoch = self.epoch;
+        self.reconciling = Some(epoch);
         let pending = self.shell.read(cx).counts.pending;
         if pending > 0 {
             self.status(format!("Backing up {pending} to NAS…"), cx);
         }
         let state = self.app.clone();
         let rx = Runner::get(cx).run(move || {
-            let summary = storage::reconcile_now(&state)?;
+            // One claim for both steps: a switch between the drain and the policy stops the
+            // policy too, and neither ever touches a catalog other than the one claimed.
+            let claim = storage::claim_reconcile(&state)?;
+            let summary = claim.drain(&state)?;
             // Best-effort: never blocks the result.
-            let offloaded = if summary.skipped_offline { 0 } else { storage::apply_offload_policy(&state).unwrap_or(0) };
+            let offloaded = if summary.skipped_offline { 0 } else { claim.apply_offload_policy().unwrap_or(0) };
             Ok::<_, String>((summary, offloaded))
         });
         cx.spawn(async move |this, cx| {
             let result = rx.await;
             this.update(cx, |s, cx| {
-                s.reconciling = false;
+                // Only this drain's own mark: a newer catalog's drain may own it by now.
+                if s.reconciling == Some(epoch) {
+                    s.reconciling = None;
+                }
                 if epoch != s.epoch {
                     return;
                 }

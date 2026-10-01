@@ -912,6 +912,61 @@ fn a_bundle_previews_and_imports(cx: &mut TestAppContext) {
 
 /// Add a volume (Enter in the path adds); the library folder cannot be removed; removing
 /// another asks first, and Cancel keeps it.
+/// **Forced interleaving** (#114 Codex, finding B). Preferences → Storage lists catalog A's
+/// volumes; the core switches to B, whose NAS volume has the same id. Removing A's NAS —
+/// confirmed after the switch with the event undelivered, or confirmed before it with the
+/// event delivered before the worker runs — never removes B's volume.
+fn remove_volume_across_a_switch(delivered: bool, cx: &mut TestAppContext) {
+    let dir = TempDir::new("volumes-switch");
+    let app = start(cx);
+    open_catalog(&app, &dir, cx);
+    std::fs::create_dir_all(dir.0.join("nas")).unwrap();
+    let nas_id = app.state.catalog.lock().unwrap().as_ref().unwrap().add_volume("NAS", &dir.0.join("nas"), VolumeKind::Backup).unwrap();
+    dispatch(&app, crate::shell::actions::OpenPreferences, cx);
+    settle(&app, cx);
+    let prefs = cx.update(|cx| cx.global::<crate::preferences::LastPreferences>().0.upgrade()).expect("Preferences opened");
+    let panel = prefs.read_with(cx, |p, _| match &p.content {
+        crate::preferences::Content::Storage(s) => s.volumes.clone(),
+        _ => panic!("Preferences opens on Storage"),
+    });
+    work(cx);
+    let nas = panel.read_with(cx, |p, _| p.volumes.iter().position(|v| v.id == nas_id).expect("listed"));
+    let remove: &'static str = Box::leak(format!("volume-remove-{nas}").into_boxed_str());
+
+    let other = dir.0.join("other");
+    let b = Catalog::open(&other.join("b.chairphoto"), &other).unwrap();
+    let b_nas = b.add_volume("NAS", &dir.0.join("nas"), VolumeKind::Backup).unwrap();
+    assert_eq!(b_nas, nas_id, "the volume ids collide, as real catalogs' do");
+    if delivered {
+        click(&app, remove, cx);
+        settle(&app, cx);
+        click(&app, "ok", cx);
+        core_switch(&app, b);
+        deliver_switch(&app, cx);
+    } else {
+        core_switch(&app, b);
+        click(&app, remove, cx);
+        settle(&app, cx);
+        click(&app, "ok", cx);
+    }
+    work(cx);
+    let vols = chairphoto_core::app::with_catalog(&app.state, |c| c.volume_rows()).unwrap();
+    assert!(vols.iter().any(|v| v.id == b_nas), "delivered={delivered}: B's volume was removed: {vols:?}");
+    if !delivered {
+        panel.read_with(cx, |p, _| assert_eq!(p.error.as_deref(), Some(chairphoto_core::app::CATALOG_CHANGED)));
+    }
+}
+
+#[gpui_kit::test]
+fn removing_a_volume_never_reaches_the_new_catalog_before_the_switch_event(cx: &mut TestAppContext) {
+    remove_volume_across_a_switch(false, cx);
+}
+
+#[gpui_kit::test]
+fn removing_a_volume_never_reaches_the_new_catalog_after_the_switch_event(cx: &mut TestAppContext) {
+    remove_volume_across_a_switch(true, cx);
+}
+
 #[gpui_kit::test]
 fn volumes_add_and_remove_behind_a_confirm(cx: &mut TestAppContext) {
     let dir = TempDir::new("volumes");

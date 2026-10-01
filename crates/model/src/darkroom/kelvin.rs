@@ -123,11 +123,18 @@ pub fn wb_shown(wb: Option<&Wb>, ctx: Option<&KelvinContext>) -> WbShown {
 /// around what it shows now — the proof sheet's warm/cool cells and the duel's warmth.
 pub fn with_kelvin_shift(record: &VersionEdit, ctx: &KelvinContext, mireds: f64) -> VersionEdit {
     let prefer_kelvin = KelvinContext { prefer: WbPrefer::Kelvin, ..*ctx };
-    let (kelvin, tint) = match wb_shown(record.tone.value().and_then(|t| t.wb.value()), Some(&prefer_kelvin)) {
-        WbShown::Kelvin { kelvin, tint } => (kelvin, tint),
-        WbShown::Relative => (ctx.as_shot.kelvin, ctx.as_shot.tint),
+    let wb = record.tone.value().and_then(|t| t.wb.value());
+    let (kelvin, tint) = match wb_shown(wb, Some(&prefer_kelvin)) {
+        WbShown::Kelvin { kelvin, tint } => {
+            // `shown.tint` is `wb.tint ?? 0` copied, not computed with: a record's own raw
+            // tint goes into the new white balance as it was (only the Kelvin is arithmetic).
+            let own = wb.filter(|w| w.is_kelvin() && !w.kelvin.is_nullish());
+            (kelvin, own.map_or(Field::Set(tint), |w| w.tint.or_set(0.0)))
+        }
+        WbShown::Relative => (ctx.as_shot.kelvin, Field::Set(ctx.as_shot.tint)),
     };
-    let tone = Tone { wb: Field::Set(kelvin_wb(mired_shift(kelvin, mireds), tint)), ..record.tone.spread() };
+    let wb = Wb { tint, ..kelvin_wb(mired_shift(kelvin, mireds), 0.0) };
+    let tone = Tone { wb: Field::Set(wb), ..record.tone.spread() };
     VersionEdit { tone: Field::Set(tone), ..record.clone() }
 }
 
@@ -211,6 +218,22 @@ mod tests {
         assert!(wb_of(&warmer).kelvin.get().unwrap() > 6000.0);
         let [c2, _] = duel_pair(&working, DuelDim::Warmth, 1, Some(&CTX));
         assert!(6000.0 - wb_of(&c2).kelvin.get().unwrap() < 6000.0 - wb_of(&cooler).kelvin.get().unwrap());
+    }
+
+    /// Codex review of c718349: a warmth change overwrote an untouched raw tint with null
+    /// (num_or made it NaN). TS copies `wb.tint ?? 0` into `kelvinWb` unchanged and does
+    /// arithmetic on the Kelvin only.
+    #[test]
+    fn a_shift_leaves_a_raw_tint_as_it_was() {
+        let record = parse_edit(Some(r#"{"tone":{"wb":{"mode":"kelvin","kelvin":5000,"tint":{"future":42}}}}"#));
+        let shifted = with_kelvin_shift(&record, &CTX, -30.0);
+        let back: serde_json::Value = serde_json::from_str(&shifted.to_json()).unwrap();
+        assert_eq!(back["tone"]["wb"]["tint"], json!({"future": 42}));
+        assert_eq!(back["tone"]["wb"]["kelvin"].as_f64(), Some(mired_shift(5000.0, -30.0)));
+        // The duel's warmth round goes through the same shift.
+        let [cooler, _] = duel_pair(&record, DuelDim::Warmth, 0, Some(&CTX));
+        let back: serde_json::Value = serde_json::from_str(&cooler.to_json()).unwrap();
+        assert_eq!(back["tone"]["wb"]["tint"], json!({"future": 42}));
     }
 
     #[test]

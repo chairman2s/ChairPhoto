@@ -15,7 +15,7 @@
 //! Runs on a dedicated catalog connection (like scans) so the shared connection keeps
 //! serving reads while an interactive edit session is open. See the approved plan.
 
-use crate::app::{AppState, CoreEvent, EventSink};
+use crate::app::{AppState, CatalogIdentity, CoreEvent, EventSink, CATALOG_CHANGED};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -261,9 +261,16 @@ struct Resolved {
     cli: Option<String>,
 }
 
-fn resolve(state: &AppState, photo_id: i64, ed: &Editor) -> Result<Resolved, String> {
+/// `expected`: the catalog the photo id was read from (`None` = whichever is open, the
+/// Tauri commands' unbound form). Checked under the same lock hold as the path lookup, so
+/// once another catalog is open this fails closed with [`CATALOG_CHANGED`] before anything
+/// is launched or imported — photo ids are per catalog.
+fn resolve(state: &AppState, expected: Option<CatalogIdentity>, photo_id: i64, ed: &Editor) -> Result<Resolved, String> {
     let guard = state.catalog.lock().map_err(|e| e.to_string())?;
     let catalog = guard.as_ref().ok_or("No catalog is open")?;
+    if expected.is_some_and(|e| !e.is(catalog)) {
+        return Err(CATALOG_CHANGED.into());
+    }
     let raw = catalog.require_photo_path(photo_id).map_err(|e| e.to_string())?;
     Ok(Resolved {
         db_path: catalog.db_path().to_path_buf(),
@@ -283,8 +290,29 @@ pub async fn develop_in_editor(
     photo_id: i64,
     editor_key: String,
 ) -> Result<Option<i64>, String> {
+    develop(state, None, photo_id, editor_key).await
+}
+
+/// [`develop_in_editor`] of a photo read from the catalog `expected` names: once another
+/// catalog is open it fails closed with [`CATALOG_CHANGED`] and launches nothing. The result
+/// imports into the catalog the photo came from (its file, captured with the photo's path).
+pub async fn develop_in_editor_as(
+    state: AppState,
+    expected: CatalogIdentity,
+    photo_id: i64,
+    editor_key: String,
+) -> Result<Option<i64>, String> {
+    develop(state, Some(expected), photo_id, editor_key).await
+}
+
+async fn develop(
+    state: AppState,
+    expected: Option<CatalogIdentity>,
+    photo_id: i64,
+    editor_key: String,
+) -> Result<Option<i64>, String> {
     let ed = editor(&editor_key).ok_or("unknown editor")?;
-    let r = resolve(&state, photo_id, ed)?;
+    let r = resolve(&state, expected, photo_id, ed)?;
     let gui = r
         .gui
         .ok_or_else(|| format!("{} is not configured — set its path in Preferences", ed.label))?;
@@ -349,8 +377,28 @@ pub async fn import_developed(
     photo_id: i64,
     editor_key: String,
 ) -> Result<i64, String> {
+    import(state, None, photo_id, editor_key).await
+}
+
+/// [`import_developed`] of a photo read from the catalog `expected` names: once another
+/// catalog is open it fails closed with [`CATALOG_CHANGED`] and renders and imports nothing.
+pub async fn import_developed_as(
+    state: AppState,
+    expected: CatalogIdentity,
+    photo_id: i64,
+    editor_key: String,
+) -> Result<i64, String> {
+    import(state, Some(expected), photo_id, editor_key).await
+}
+
+async fn import(
+    state: AppState,
+    expected: Option<CatalogIdentity>,
+    photo_id: i64,
+    editor_key: String,
+) -> Result<i64, String> {
     let ed = editor(&editor_key).ok_or("unknown editor")?;
-    let r = resolve(&state, photo_id, ed)?;
+    let r = resolve(&state, expected, photo_id, ed)?;
     let has_sidecar = existing_sidecar(&r.raw, ed.key).is_some();
     // darktable may have produced AI-restore outputs without a develop edit (see the
     // watcher above) — those count as an importable result too.
@@ -478,6 +526,60 @@ mod tests {
         assert!(!hit("DSC01234_something.dng")); // unknown suffix
         assert!(!hit("DSC01234_raw-denoise_x.dng")); // non-numeric counter
         assert!(!hit("DSC012345_raw-denoise.dng")); // stem is a prefix, not equal
+    }
+
+    /// The identity-bound runs (#108 gate): bound to the open catalog, Develop, Import result
+    /// and RapidRAW reach the editor binary (a fake script that logs its arguments — never a
+    /// real editor); after a switch to a catalog whose photo has the same id, its own original
+    /// and the same editors configured, all three fail closed with `CATALOG_CHANGED` and
+    /// launch nothing. (Mutation-checked: without the identity check in either `resolve`,
+    /// the fake is launched on the new catalog's photo and this fails.)
+    #[test]
+    fn bound_runs_launch_and_switched_runs_fail_closed() {
+        use crate::app::{catalog_identity, CATALOG_CHANGED};
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = crate::test_support::TestTmpDir::new("external-edit-bound");
+        let (script, log) = (dir.join("fake-editor.sh"), dir.join("fake-editor.log"));
+        std::fs::write(&script, format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nexit 1\n", log.display())).unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let open = |name: &str| {
+            let root = dir.join(name);
+            let c = Catalog::open(&root.join(format!("{name}.chairphoto")), &root).unwrap();
+            for key in ["editor.rawtherapee.gui", "editor.rawtherapee.cli", "editor.rapidraw.bin"] {
+                c.set_setting(key, script.to_str().unwrap()).unwrap();
+            }
+            let original = root.join(format!("{name}0.ARW"));
+            std::fs::write(&original, b"raw").unwrap();
+            std::fs::write(root.join(format!("{name}0.ARW.pp3")), b"[Version]").unwrap();
+            let id = c.upsert_photo(&original, None, 0, 1).unwrap().id;
+            (c, id, original)
+        };
+        let ((a, a_id, a_original), (b, b_id, _)) = (open("a"), open("b"));
+        assert_eq!(a_id, b_id, "the ids collide, as real catalogs' do");
+        let state = AppState::default();
+        *state.catalog.lock().unwrap() = Some(a);
+        let from = catalog_identity(&state).unwrap();
+        let rt = crate::app::runtime();
+        let key = || "rawtherapee".to_string();
+
+        let develop = rt.block_on(develop_in_editor_as(state.clone(), from, a_id, key()));
+        assert_eq!(develop, Ok(None), "the fake GUI changed no sidecar");
+        assert!(rt.block_on(import_developed_as(state.clone(), from, a_id, key())).is_err(), "the fake CLI renders nothing");
+        let job = crate::rapidraw::next_job_id();
+        assert!(rt.block_on(crate::rapidraw::edit_in_rapidraw_as(state.clone(), from, a_id, job)).is_err());
+        let ran = std::fs::read_to_string(&log).expect("the bound runs launched the fake");
+        assert_eq!(ran.lines().count(), 3, "{ran}");
+        assert!(ran.lines().all(|l| l.contains(a_original.to_str().unwrap())), "{ran}");
+        std::fs::remove_file(&log).unwrap();
+
+        crate::app::detach_catalog_and_trip_jobs(&state).unwrap();
+        crate::app::publish_catalog_and_reset_jobs(&state, b).unwrap();
+        let changed = Err(CATALOG_CHANGED.to_string());
+        assert_eq!(rt.block_on(develop_in_editor_as(state.clone(), from, b_id, key())), changed);
+        assert_eq!(rt.block_on(import_developed_as(state.clone(), from, b_id, key())).map(Some), changed);
+        let job = crate::rapidraw::next_job_id();
+        assert_eq!(rt.block_on(crate::rapidraw::edit_in_rapidraw_as(state.clone(), from, b_id, job)), changed);
+        assert!(!log.exists(), "launched on the new catalog's photo: {:?}", std::fs::read_to_string(&log));
     }
 }
 

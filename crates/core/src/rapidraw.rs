@@ -24,7 +24,7 @@
 //! adopting the result as a **stacked child** of the original via `upsert_external_one` +
 //! `set_stack_parent` — the same association mechanism the develop round-trip uses.
 
-use crate::app::{AppState, CoreEvent, EventSink};
+use crate::app::{AppState, CatalogIdentity, CoreEvent, EventSink, CATALOG_CHANGED};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -199,9 +199,15 @@ impl Resolved {
     }
 }
 
-fn resolve(state: &AppState, photo_id: i64) -> Result<Resolved, String> {
+/// `expected`: the catalog the photo id was read from (`None` = whichever is open, the Tauri
+/// command's unbound form), checked under the same lock hold as the path lookup — once
+/// another catalog is open this fails closed with [`CATALOG_CHANGED`] and nothing launches.
+fn resolve(state: &AppState, expected: Option<CatalogIdentity>, photo_id: i64) -> Result<Resolved, String> {
     let guard = state.catalog.lock().map_err(|e| e.to_string())?;
     let catalog = guard.as_ref().ok_or("No catalog is open")?;
+    if expected.is_some_and(|e| !e.is(catalog)) {
+        return Err(CATALOG_CHANGED.into());
+    }
     let source = catalog.require_photo_path(photo_id).map_err(|e| e.to_string())?;
     let bin = resolved_bin(catalog)
         .ok_or("RapidRAW is not configured — set its path in Preferences → Editors")?;
@@ -388,14 +394,30 @@ pub fn run_roundtrip(
 ///
 /// Returns the new stacked child's id on success, or `None` if the wait was cancelled.
 pub async fn edit_in_rapidraw(state: AppState, photo_id: i64) -> Result<Option<i64>, String> {
-    edit_in_rapidraw_as(state, photo_id, next_job_id()).await
+    edit(state, None, photo_id, next_job_id()).await
 }
 
-/// [`edit_in_rapidraw`] under a job id the caller chose ([`next_job_id`]), so it can follow
-/// the job's `rapidraw:progress` events from the first one and cancel exactly this job
-/// ([`cancel_rapidraw_job`]).
-pub async fn edit_in_rapidraw_as(state: AppState, photo_id: i64, job_id: u64) -> Result<Option<i64>, String> {
-    let r = resolve(&state, photo_id)?;
+/// [`edit_in_rapidraw`] of a photo read from the catalog `expected` names, under a job id the
+/// caller chose ([`next_job_id`]), so it can follow the job's `rapidraw:progress` events from
+/// the first one and cancel exactly this job ([`cancel_rapidraw_job`]). Once another catalog
+/// is open it fails closed with [`CATALOG_CHANGED`]: RapidRAW is not launched on, and nothing
+/// is imported into, the new catalog's photo with the same id.
+pub async fn edit_in_rapidraw_as(
+    state: AppState,
+    expected: CatalogIdentity,
+    photo_id: i64,
+    job_id: u64,
+) -> Result<Option<i64>, String> {
+    edit(state, Some(expected), photo_id, job_id).await
+}
+
+async fn edit(
+    state: AppState,
+    expected: Option<CatalogIdentity>,
+    photo_id: i64,
+    job_id: u64,
+) -> Result<Option<i64>, String> {
+    let r = resolve(&state, expected, photo_id)?;
     let cancel = register_cancel(photo_id, job_id)
         .ok_or("This photo is already being edited in RapidRAW — finish or cancel that edit first")?;
     let state2 = state.clone();

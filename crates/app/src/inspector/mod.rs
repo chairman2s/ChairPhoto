@@ -43,14 +43,18 @@
 //! with the form's values then (so a catalog row and its sidecar never interleave).
 //!
 //! **External editors** (darktable / RawTherapee / ART) and **RapidRAW** run on the storage
-//! [`Runner`] (the core runtime's blocking pool). A sidecar-editor run is owned by a sequence
+//! [`Runner`] (the core runtime's blocking pool), bound to the photo's catalog like every
+//! write (`external_edit::develop_in_editor_as` / `import_developed_as`,
+//! `rapidraw::edit_in_rapidraw_as`): a run whose worker starts after a switch fails closed
+//! under the catalog lock, before anything is launched or imported. A sidecar-editor run is owned by a sequence
 //! number per photo; its result lands only if no newer run for that photo started and the
 //! catalog did not switch. A RapidRAW round-trip gets a core job id
 //! (`rapidraw::next_job_id`) before it starts: its `rapidraw:progress` events (routed here
 //! through `AppModel`) and its result update the photo's entry only while that job still owns
 //! it, and Cancel cancels exactly that job (`cancel_rapidraw_job`). A catalog switch drops
-//! every entry; the round-trips themselves keep running and import into the catalog they
-//! started on (the core captured its path), but this inspector no longer follows them.
+//! every entry; round-trips already running keep running and import into the catalog they
+//! started on (the core captured its file under the identity check), but this inspector no
+//! longer follows them.
 //!
 //! **Not persisted yet.** React kept each section's open state in localStorage
 //! (`inspector.section.<id>`, default collapsed); with no per-machine settings store yet
@@ -1031,14 +1035,14 @@ impl PhotoInspector {
     /// "Edit in <editor>": launch it on the original; when it closes, the core renders the
     /// sidecar's result and stacks it (`develop_in_editor`).
     pub fn develop(&mut self, editor: &str, label: &str, cx: &mut Context<Self>) {
-        let Some(id) = self.photo_id else { return };
+        let (Some(id), Some(from)) = (self.photo_id, self.from) else { return };
         let note = format!("Editing in {label}… the result imports when you close it.");
         let label = label.to_string();
         let key = editor.to_string();
         let seq = self.begin_sidecar(id, editor, note, cx);
         self.run_blocking(
             move |state| {
-                futures::executor::block_on(chairphoto_core::external_edit::develop_in_editor(state.clone(), id, key))
+                futures::executor::block_on(chairphoto_core::external_edit::develop_in_editor_as(state.clone(), from, id, key))
             },
             move |this, result, cx| {
                 let note = match result {
@@ -1056,12 +1060,14 @@ impl PhotoInspector {
 
     /// "Import result": render the current sidecar and stack it, without relaunching.
     pub fn import_result(&mut self, editor: &str, cx: &mut Context<Self>) {
-        let Some(id) = self.photo_id else { return };
+        let (Some(id), Some(from)) = (self.photo_id, self.from) else { return };
         let key = editor.to_string();
         let note = self.notes.get(&id).cloned().unwrap_or_default();
         let seq = self.begin_sidecar(id, editor, note, cx);
         self.run_blocking(
-            move |state| futures::executor::block_on(chairphoto_core::external_edit::import_developed(state.clone(), id, key)),
+            move |state| {
+                futures::executor::block_on(chairphoto_core::external_edit::import_developed_as(state.clone(), from, id, key))
+            },
             move |this, result, cx| this.end_sidecar(id, seq, result.err(), cx),
             cx,
         );
@@ -1097,7 +1103,7 @@ impl PhotoInspector {
     /// match from the first one. The entry shows "editing" at once (React's optimistic
     /// entry); the events then drive it, and the result writes the terminal note.
     pub fn edit_in_rapidraw(&mut self, cx: &mut Context<Self>) {
-        let Some(id) = self.photo_id else { return };
+        let (Some(id), Some(from)) = (self.photo_id, self.from) else { return };
         if self.rapid.contains_key(&id) {
             return;
         }
@@ -1106,7 +1112,9 @@ impl PhotoInspector {
         self.notes.remove(&id);
         cx.notify();
         self.run_blocking(
-            move |state| futures::executor::block_on(chairphoto_core::rapidraw::edit_in_rapidraw_as(state.clone(), id, job)),
+            move |state| {
+                futures::executor::block_on(chairphoto_core::rapidraw::edit_in_rapidraw_as(state.clone(), from, id, job))
+            },
             move |this, result, cx| this.on_rapidraw_result(id, job, result, cx),
             cx,
         );

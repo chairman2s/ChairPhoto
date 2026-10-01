@@ -1,8 +1,9 @@
 //! Headless tests of the Photo inspector (#108) through the real wiring (`start` → `wire`
 //! → the main window): what each tab shows, its writes, and who owns each result. Blocking
 //! work (IPTC save, storage, editors) runs on `Runner::manual`, so a test decides when it
-//! runs; editor jobs are never run here (that would launch a real editor) — their ownership
-//! is driven through the same entry points the worker's result and the routed events use.
+//! runs. Editor jobs run only against a fake editor script configured as every editor's
+//! binary ([`fake_editor`]) — never a real editor; their ownership is otherwise driven through
+//! the same entry points the worker's result and the routed events use.
 
 use super::*;
 use crate::shell::state::InspectorTab;
@@ -758,6 +759,83 @@ fn a_superseded_sidecar_run_does_not_write_its_note(cx: &mut TestAppContext) {
         assert!(!i.editing(id));
         assert_eq!(i.notes[&id], "no rawtherapee sidecar");
     });
+}
+
+/// A stand-in for every external editor binary (never a real editor): it appends its
+/// arguments to `log` and exits 1, so a sidecar editor reports "no changes", its CLI and
+/// RapidRAW report an error — and the log says what it was launched on.
+fn fake_editor(dir: &TempDir) -> (std::path::PathBuf, std::path::PathBuf) {
+    use std::os::unix::fs::PermissionsExt as _;
+    let (script, log) = (dir.0.join("fake-editor.sh"), dir.0.join("fake-editor.log"));
+    std::fs::write(&script, format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nexit 1\n", log.display())).unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    (script, log)
+}
+
+/// Point RawTherapee (GUI and CLI) and RapidRAW at `script`, and give `original` a file and a
+/// RawTherapee sidecar, so every editor action has something to launch on.
+fn editors_on(c: &chairphoto_core::catalog::Catalog, script: &std::path::Path, original: &std::path::Path) {
+    let script = script.to_str().unwrap();
+    for key in ["editor.rawtherapee.gui", "editor.rawtherapee.cli", "editor.rapidraw.bin"] {
+        c.set_setting(key, script).unwrap();
+    }
+    std::fs::create_dir_all(original.parent().unwrap()).unwrap();
+    std::fs::write(original, b"raw").unwrap();
+    let mut pp3 = original.as_os_str().to_os_string();
+    pp3.push(".pp3");
+    std::fs::write(pp3, b"[Version]").unwrap();
+}
+
+/// **Forced interleaving** (#108 gate). Develop, Import result and RapidRAW are queued for
+/// photo 1 of catalog A; the core then switches to B, whose photo 1 has its own original,
+/// sidecar and the same (fake) editors configured — with `catalog:switched` withheld or
+/// delivered — and only then do the workers run. Nothing is launched on B's photo and
+/// nothing is imported into B. (A run bound to the open catalog does reach this fake: the
+/// core's `bound_runs_launch_and_switched_runs_fail_closed` tests — run here, the editor's
+/// worker thread would trip GPUI's deterministic scheduler.) (Mutation-checked: without the
+/// identity check in `external_edit::resolve` and `rapidraw::resolve`, the fake is launched
+/// on B's photo and this fails.)
+fn editors_across_a_switch(delivered: bool, cx: &mut TestAppContext) {
+    let dir = TempDir::new("insp-editors-switch");
+    let (script, log) = fake_editor(&dir);
+    let app = start(cx);
+    let ids = open_catalog_with_photos(&app, &dir, 1, cx);
+    let a_original = dir.0.join("photos/2026/p0.ARW");
+    catalog(&app, |c| editors_on(c, &script, &a_original));
+    select(&app, ids[0], SelectMods::default(), cx);
+    let insp = inspector(&app, cx);
+
+    let (b, b_ids) = colliding_catalog(&dir, "b", 1);
+    assert_eq!(b_ids, ids, "the ids collide, as real catalogs' do");
+    let b_original = dir.0.join("b/2026/b0.ARW");
+    editors_on(&b, &script, &b_original);
+    insp.update(cx, |i, cx| {
+        i.develop("rawtherapee", "RawTherapee", cx);
+        i.import_result("rawtherapee", cx);
+        i.edit_in_rapidraw(cx);
+    });
+    core_switch(&app, b);
+    if delivered {
+        deliver_switch(&app, cx);
+    }
+    work(cx);
+
+    assert!(!log.exists(), "an editor was launched on the new catalog's photo: {:?}", std::fs::read_to_string(&log));
+    let photos = catalog(&app, |c| c.count_photos(&Default::default()).unwrap());
+    assert_eq!(photos, 1, "nothing was imported into the new catalog");
+    if !delivered {
+        insp.read_with(cx, |i, _| assert!(!i.editing(ids[0]), "the refused runs ended their entries"));
+    }
+}
+
+#[gpui_kit::test]
+fn editor_actions_never_reach_the_new_catalog_before_the_switch_event(cx: &mut TestAppContext) {
+    editors_across_a_switch(false, cx);
+}
+
+#[gpui_kit::test]
+fn editor_actions_never_reach_the_new_catalog_after_the_switch_event(cx: &mut TestAppContext) {
+    editors_across_a_switch(true, cx);
 }
 
 trait UpdateInWindow {

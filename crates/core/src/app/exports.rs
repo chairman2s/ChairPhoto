@@ -183,6 +183,21 @@ pub fn export_bundle_claimed_with(
     dest_path: &Path,
     on_progress: &dyn Fn(usize, usize),
 ) -> Result<BundleWriteResult, String> {
+    export_bundle_claimed_hooked(state, claim, from, batch_id, dest_path, on_progress, &|| {})
+}
+
+/// [`export_bundle_claimed_with`], calling `before_publish` after the writer's own last
+/// abort check and before the publish lock is taken — where a test lets a newer export of
+/// the same destination run to completion.
+fn export_bundle_claimed_hooked(
+    state: &AppState,
+    claim: &ExportClaim,
+    from: Option<CatalogIdentity>,
+    batch_id: i64,
+    dest_path: &Path,
+    on_progress: &dyn Fn(usize, usize),
+    before_publish: &dyn Fn(),
+) -> Result<BundleWriteResult, String> {
     use crate::bundle::writer::BUNDLE_EXPORT_CANCELLED;
     if claim.aborted() {
         return Err(format!("{BUNDLE_EXPORT_CANCELLED} — nothing was written to the destination."));
@@ -202,8 +217,21 @@ pub fn export_bundle_claimed_with(
     if offline > 0 {
         eprintln!("export_bundle: {offline} original(s) are offline — their metadata is included, no bytes copied");
     }
-    // Phase 2 — write the zip off the catalog lock.
-    crate::bundle::writer::write_bundle_abortable(&bundle, dest_path, &claim.abort, on_progress)
+    // Phase 2 — write the zip off the catalog lock, publishing it atomically with this job's
+    // ownership: the bundle-export abort lock — the one a newer claim, a Cancel and both
+    // catalog-switch phases take to trip this generation — is held across the last abort
+    // check and the rename. A superseded export either sees its trip there and publishes
+    // nothing, or renamed before the newer claim could trip it, so the newer one's rename
+    // lands last. Only that one lock is held, never the catalog: see `app::jobs`' lock order.
+    let publish = |rename: &dyn Fn() -> Result<(), String>| {
+        before_publish();
+        let _owner = state.jobs.bundle_export.lock()?;
+        if claim.aborted() {
+            return Err(crate::bundle::writer::cancelled());
+        }
+        rename()
+    };
+    crate::bundle::writer::write_bundle_published(&bundle, dest_path, &claim.abort, on_progress, &publish)
 }
 
 /// The settings key holding this catalog's "export equals view" total
@@ -525,6 +553,52 @@ mod tests {
         let entries = bundle_entries(&dest);
         let originals: Vec<_> = entries.iter().filter(|e| e.starts_with("originals/") && !e.ends_with(".xmp")).collect();
         assert_eq!(originals.len(), 3, "{entries:?}");
+        assert_eq!(files(&f.dir.join("out")), ["trip.chairphoto"], "no temp file is left behind");
+    }
+
+    /// The bundle-export publish is atomic with ownership. The older export passes its last
+    /// abort check before the rename and is held there (the `before_publish` hook); a newer
+    /// export of the same destination — with one more photo in the batch, so the two bundles
+    /// differ — claims (tripping the older), writes and publishes. The older then resumes:
+    /// it must not rename its bundle over the newer one.
+    #[test]
+    fn a_superseded_bundle_export_held_after_its_last_check_never_publishes_over_the_newer_one() {
+        use std::sync::mpsc::channel;
+        let f = fixture("bundle-publish", 3);
+        let dest = f.dir.join("out/trip.chairphoto");
+        let older = claim_bundle_export(&f.state).unwrap();
+        let (go_tx, go_rx) = channel::<()>();
+        let (done_tx, done_rx) = channel::<()>();
+        let (newer, older_res) = std::thread::scope(|s| {
+            let (f, dest) = (&f, &dest);
+            let newer = s.spawn(move || {
+                wait(&go_rx);
+                {
+                    let guard = f.state.catalog.lock().unwrap();
+                    let catalog = guard.as_ref().unwrap();
+                    let path = f.dir.join("photos/IMG_9999.CR3");
+                    std::fs::write(&path, "raw bytes newer").unwrap();
+                    let id = catalog.upsert_photo(&path, None, 0, 15).unwrap().id;
+                    catalog.assign_photos_to_batch(f.batch, &[id]).unwrap();
+                }
+                let claim = claim_bundle_export(&f.state).unwrap();
+                let r = export_bundle_claimed(&f.state, &claim, None, f.batch, dest);
+                done_tx.send(()).unwrap();
+                r
+            });
+            let older_res = export_bundle_claimed_hooked(&f.state, &older, None, f.batch, dest, &|_, _| {}, &|| {
+                go_tx.send(()).unwrap();
+                wait(&done_rx);
+            });
+            (newer.join().unwrap(), older_res)
+        });
+        let r = newer.expect("the newer bundle export completes");
+        assert_eq!(r.exported, 4);
+        let err = older_res.expect_err("the superseded export must not publish");
+        assert!(err.starts_with(crate::bundle::writer::BUNDLE_EXPORT_CANCELLED), "{err}");
+        let entries = bundle_entries(&dest);
+        let originals: Vec<_> = entries.iter().filter(|e| e.starts_with("originals/") && !e.ends_with(".xmp")).collect();
+        assert_eq!(originals.len(), 4, "the newer bundle stays at the destination: {entries:?}");
         assert_eq!(files(&f.dir.join("out")), ["trip.chairphoto"], "no temp file is left behind");
     }
 }

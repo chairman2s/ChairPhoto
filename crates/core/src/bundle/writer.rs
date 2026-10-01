@@ -324,7 +324,7 @@ fn aborted(abort: &std::sync::atomic::AtomicBool) -> bool {
     abort.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-fn cancelled() -> String {
+pub(crate) fn cancelled() -> String {
     format!("{BUNDLE_EXPORT_CANCELLED} — nothing was written to the destination.")
 }
 
@@ -337,6 +337,31 @@ pub fn write_bundle_abortable(
     dest_path: &Path,
     abort: &std::sync::atomic::AtomicBool,
     on_progress: impl Fn(usize, usize),
+) -> Result<BundleWriteResult, String> {
+    write_bundle_published(bundle, dest_path, abort, on_progress, &|rename| {
+        if aborted(abort) {
+            return Err(cancelled());
+        }
+        rename()
+    })
+}
+
+/// How a bundle write places its finished temp file at the destination: `publish` is handed
+/// the rename and must run it at most once. A caller whose ownership can change under it
+/// (a newer export of the same destination, a Cancel, a catalog switch) holds the lock that
+/// guards that ownership across its own abort check *and* the rename, so a superseded write
+/// can never publish after a newer one did. Returning `Err` without running the rename
+/// leaves nothing at the destination; the temp file is removed either way.
+pub type PublishGate<'a> = dyn Fn(&dyn Fn() -> Result<(), String>) -> Result<(), String> + 'a;
+
+/// [`write_bundle_abortable`], with the final check-and-rename run through `publish`
+/// ([`PublishGate`]) — `app::exports` makes it atomic with the bundle-export job's ownership.
+pub fn write_bundle_published(
+    bundle: &GatheredBundle,
+    dest_path: &Path,
+    abort: &std::sync::atomic::AtomicBool,
+    on_progress: impl Fn(usize, usize),
+    publish: &PublishGate<'_>,
 ) -> Result<BundleWriteResult, String> {
     let total_photos = bundle.manifest.photos.len();
     // 2 steps per photo: original + preview
@@ -360,8 +385,9 @@ pub fn write_bundle_abortable(
             return Err(cancelled());
         }
         // The temp file was fsynced before this: a crash after the rename leaves either the
-        // previous bundle or this whole one at `dest_path`, never a truncated one.
-        std::fs::rename(&tmp_path, dest_path).map_err(|e| format!("rename bundle into place: {e}"))?;
+        // previous bundle or this whole one at `dest_path`, never a truncated one. The gate
+        // re-checks ownership under its lock and renames while still holding it.
+        publish(&|| std::fs::rename(&tmp_path, dest_path).map_err(|e| format!("rename bundle into place: {e}")))?;
         Ok(r)
     });
 

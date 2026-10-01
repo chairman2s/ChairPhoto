@@ -205,47 +205,14 @@ pub async fn suggest_auto_tone(
     }
     #[cfg(feature = "edit")]
     {
-        let state = app.state::<AppState>();
-        let candidates = {
-            let guard = state.catalog.lock().map_err(|e| e.to_string())?;
-            let catalog = guard.as_ref().ok_or("No catalog is open")?;
-            catalog.photo_path_candidates(photo_id).map_err(|e| e.to_string())?
-        };
-        let health = state.volume_health.clone();
         crate::app::spawn_blocking(move || {
-            let path = crate::volume_health::pick_existing(
-                &candidates,
-                &health,
-                crate::catalog::ResolveMode::OriginalRequired,
+            crate::app::editing::suggest_auto_tone(
+                &app.state::<AppState>(),
+                None,
+                photo_id,
+                source.as_deref(),
+                base_json.as_deref(),
             )
-            .ok_or_else(|| format!("no reachable copy of photo {photo_id}"))?;
-            // On the RAW engine the analysis reads what the stage shows as-shot: the working
-            // image through the record's base (`base_json`: engine, display transform and
-            // camera match, no adjustments) — the fragment's EV then means linear stops on
-            // the picture being developed, not on the camera's JPEG.
-            let rgb = if let Some(token) = parse_working_token(source.as_deref())? {
-                let image = working_image(&token)?;
-                crate::plugins::edit::render_proxy(
-                    crate::plugins::edit::RenderSource::Working { token, image },
-                    base_json.as_deref().unwrap_or(r#"{"engine":2}"#),
-                    1024,
-                    crate::plugins::edit::RenderOpts::default(),
-                )?
-                .to_rgb8()
-            } else {
-                let jpeg = crate::thumbnails::preview_bytes(&path)?;
-                crate::plugins::edit::decode_proxy_cached(&jpeg)?.to_rgb8()
-            };
-            let a = crate::plugins::edit::auto_tone_for(&rgb);
-            Ok(serde_json::json!({
-                "tone": {
-                    "ev": a.ev,
-                    "contrast": a.contrast,
-                    "highlights": a.highlights,
-                    "shadows": a.shadows,
-                }
-            })
-            .to_string())
         })
         .await
         .map_err(|e| e.to_string())?

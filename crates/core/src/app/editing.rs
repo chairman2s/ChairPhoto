@@ -1,7 +1,8 @@
 //! The Darkroom's backend bodies, shared by the Tauri commands (`commands::develop`,
 //! `commands::editing`) and the GPUI Darkroom (`crates/app/src/darkroom`): opening a photo
-//! for development, the tone strip's zone masses, the `.cube` LUT folder, and writing a
-//! version's settings with the monochrome refresh every such write owes.
+//! for development, the tone strip's zone masses, the proof sheet's auto-tone fragment, the
+//! `.cube` LUT folder, and writing a version's settings with the monochrome refresh every such
+//! write owes.
 //!
 //! **Blocking.** Every function here takes the catalog lock, stats files or renders; call
 //! it on a worker (`spawn_blocking`, the app's storage runner), never on a UI thread.
@@ -140,6 +141,48 @@ pub fn zone_masses(
     Ok(crate::plugins::edit::zone_masses(&out.to_rgb8()))
 }
 
+/// Classical auto-tone suggestion for the Darkroom's proof sheet: a percentile analysis of
+/// the proxy's luma histogram → an edit-json *fragment* with only
+/// `tone.ev/contrast/highlights/shadows` (docs/plans/darkroom).
+///
+/// On the RAW engine (`source` names a resident working image) the analysis reads what the
+/// stage shows as shot: the working image through `base_json` (engine, display transform and
+/// camera match, no adjustments), so the fragment's EV means linear stops on the picture
+/// being developed; otherwise the camera preview.
+#[cfg(feature = "edit")]
+pub fn suggest_auto_tone(
+    state: &AppState,
+    from: Option<CatalogIdentity>,
+    photo_id: i64,
+    source: Option<&str>,
+    base_json: Option<&str>,
+) -> Result<String, String> {
+    let path = original_path(state, from, photo_id)?;
+    let rgb = if let Some(token) = parse_working_token(source)? {
+        let image = crate::media::working_image(&token)?;
+        crate::plugins::edit::render_proxy(
+            crate::plugins::edit::RenderSource::Working { token, image },
+            base_json.unwrap_or(r#"{"engine":2}"#),
+            1024,
+            crate::plugins::edit::RenderOpts::default(),
+        )?
+        .to_rgb8()
+    } else {
+        let jpeg = crate::thumbnails::preview_bytes(&path)?;
+        crate::plugins::edit::decode_proxy_cached(&jpeg)?.to_rgb8()
+    };
+    let a = crate::plugins::edit::auto_tone_for(&rgb);
+    Ok(serde_json::json!({
+        "tone": {
+            "ev": a.ev,
+            "contrast": a.contrast,
+            "highlights": a.highlights,
+            "shadows": a.shadows,
+        }
+    })
+    .to_string())
+}
+
 /// The `.cube` LUT filenames in `dir` (the app's [`luts_dir`](super::luts_dir)), sorted.
 pub fn list_luts_in(dir: &Path) -> Result<Vec<String>, String> {
     let mut out = Vec::new();
@@ -254,6 +297,7 @@ mod tests {
         #[cfg(feature = "edit")]
         {
             assert_eq!(zone_masses(&state, Some(from), photo, "{}", None).unwrap_err(), CATALOG_CHANGED);
+            assert_eq!(suggest_auto_tone(&state, Some(from), photo, None, None).unwrap_err(), CATALOG_CHANGED);
             let err = write_version_then_refresh_monochrome(&state, Some(from), version, |c| {
                 c.commit_version_edit(version, r#"{"tone":{"ev":1}}"#, "Exposure +1.00", false)
             })

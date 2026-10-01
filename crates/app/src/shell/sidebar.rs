@@ -7,9 +7,10 @@
 //! foot.
 //!
 //! **Collection browser.** The fixed "library" header with All photos and Trash, then the
-//! collapsible sections — tags, smart albums, albums, import batches — whose panels are later
-//! tickets (Tag panel #107, Albums and export #115, Storage and import #114). Each section
-//! body says which ticket fills it. Below them, `module-slot-sidebar` holds the enabled
+//! collapsible sections — tags ([`crate::tags::panel::TagPanel`]), smart albums, albums,
+//! import batches ([`crate::storage::batches`]); a section whose panel is a later ticket
+//! (Albums and export #115) says so. The browser scrolls as one column; the tag panel holds
+//! its scroll handle, so a tag search can scroll its row into view. Below them, `module-slot-sidebar` holds the enabled
 //! modules' sidebar panels ([`crate::modules::PanelSlot::Sidebar`]); it is empty while no
 //! module contributes one.
 
@@ -43,7 +44,7 @@ pub fn rail_order<'a, V>(views: &'a [V], id: impl Fn(&V) -> &str) -> Vec<&'a V> 
 /// What each section's panel is waiting for.
 fn section_placeholder(section: Section) -> &'static str {
     match section {
-        Section::Tags => "Tag panel — not yet ported (#107)",
+        Section::Tags => "", // `crate::tags::panel`
         Section::SmartAlbums => "Smart albums — not yet ported (#115)",
         Section::Albums => "Albums — not yet ported (#115)",
         Section::Batches => "", // `crate::storage::batches`
@@ -194,6 +195,7 @@ impl RootView {
             .flex_1()
             .min_h_0()
             .overflow_y_scroll()
+            .track_scroll(&self.tag_panel.read(cx).scroll)
             .bg(colors.panel)
             .text_size(px(12.5))
             .child(header("library"))
@@ -240,6 +242,8 @@ impl RootView {
             );
             if open && section == Section::Batches {
                 browser = browser.child(self.render_batches(shell, colors, cx));
+            } else if open && section == Section::Tags {
+                browser = browser.child(self.tag_panel.clone());
             } else if open {
                 browser = browser.child(
                     div()

@@ -32,6 +32,8 @@ use crate::model::AppModel;
 use crate::modules::registry::SlotView;
 use crate::modules::{panel as module_panel, ModuleRegistry, PanelSlot};
 use crate::storage::StorageState;
+use crate::tags::panel::TagPanel;
+use crate::tags::TagsState;
 use crate::shell::actions::*;
 use crate::shell::state::{ShellState, Side, Surface, NARROW_MAX_W};
 use crate::shell::style::Colors;
@@ -57,6 +59,8 @@ pub struct RootView {
     pub(crate) modules: Entity<ModuleRegistry>,
     /// Storage and import (#114): its jobs and dialogs.
     pub(crate) storage: Entity<StorageState>,
+    /// Tags (#107): the collection browser's tag panel.
+    pub(crate) tag_panel: Entity<TagPanel>,
     /// The open storage dialog's close request (`crate::storage::open`).
     pub(crate) dialog_close: Option<Subscription>,
     pub(crate) focus: FocusHandle,
@@ -79,6 +83,7 @@ impl RootView {
         images: Entity<ImageStore>,
         modules: Entity<ModuleRegistry>,
         storage: Entity<StorageState>,
+        tags: Entity<TagsState>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -88,6 +93,7 @@ impl RootView {
         // in [`contexts::ROOT`] still reach the root, the grid's ancestor.
         library.read(cx).focus_handle().clone().focus(window, cx);
         let thumb_slider = crate::shell::command_pill::thumb_slider(&shell, window, cx);
+        let tag_panel = cx.new(|cx| TagPanel::new(tags.clone(), shell.clone(), modules.clone(), window, cx));
         let catalog_epoch = model.read(cx).catalog_epoch;
         let _observers = [
             cx.observe(&model, |this, model, cx| {
@@ -132,6 +138,7 @@ impl RootView {
             images,
             modules,
             storage,
+            tag_panel,
             dialog_close: None,
             focus,
             thumb_slider,

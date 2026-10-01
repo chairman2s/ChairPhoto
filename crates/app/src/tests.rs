@@ -762,3 +762,7 @@ fn reads_started_before_a_catalog_switch_are_dropped(cx: &mut TestAppContext) {
 // Storage and import (#114).
 #[path = "storage_tests.rs"]
 mod storage_tests;
+
+// Tags (#107).
+#[path = "tags_tests.rs"]
+mod tags_tests;

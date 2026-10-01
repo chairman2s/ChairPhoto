@@ -304,6 +304,9 @@ pub struct ShellState {
     rows_pending: Option<u64>,
     /// A photo link waiting for the grid to list its photo.
     pub pending_link: Option<PendingPhotoLink>,
+    /// The tag the tag editor is showing, if one is open: what `tag-editor`-slot module
+    /// panels edit (host.ts's `getEditingTag`). Set and cleared by `tags::editor::TagEditor`.
+    pub editing_tag: Option<i64>,
     /// The newest culling write: each write waits for the one before, so marks land in the
     /// order they were made.
     last_mark: Option<Task<()>>,
@@ -353,6 +356,7 @@ impl ShellState {
             rows_loaded: false,
             rows_pending: None,
             pending_link: None,
+            editing_tag: None,
             last_mark: None,
             catalog_generation: 0,
             model: model.clone(),
@@ -442,6 +446,14 @@ impl ShellState {
     pub fn set_inspector_tab(&mut self, tab: InspectorTab, cx: &mut Context<Self>) {
         self.inspector_tab = tab;
         cx.notify();
+    }
+
+    /// The tag editor opened on `tag` (`Some`) or closed (`None`).
+    pub fn set_editing_tag(&mut self, tag: Option<i64>, cx: &mut Context<Self>) {
+        if self.editing_tag != tag {
+            self.editing_tag = tag;
+            cx.notify();
+        }
     }
 
     pub fn toggle_cache_previews(&mut self, cx: &mut Context<Self>) {
@@ -726,6 +738,7 @@ impl ShellState {
                 self.rows_loaded = false;
                 self.rows_pending = None;
                 self.pending_link = None;
+                self.editing_tag = None;
                 self.catalog_generation += 1;
                 self.surface = Surface::Library;
                 self.counts = Counts::default();

@@ -22,7 +22,7 @@ use chairphoto_core::image_pool::ImageKind;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::prelude::*;
 use gpui_kit::TestSupportExt as _;
-use gpui_kit::{div, img, px, Context, Entity, EventEmitter, KeyDownEvent, ObjectFit, SharedString, Subscription, Window};
+use gpui_kit::{div, img, px, Context, Entity, EventEmitter, ObjectFit, SharedString, Subscription, Window};
 
 /// What must be typed to confirm.
 pub const CONFIRM_WORD: &str = "delete";
@@ -161,6 +161,17 @@ impl TrashDialog {
         let focus = gpui_kit::Focusable::focus_handle(self.typed.read(cx), cx);
         window.focus(&focus, cx);
         cx.notify();
+    }
+
+    /// The dialog's Cancel (Escape, the close button): while the typed confirmation is open
+    /// it cancels only that, as React's input keydown did, and keeps the dialog. Returns
+    /// whether the dialog may close.
+    pub fn on_dialog_cancel(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if self.confirming {
+            self.cancel_confirm(window, cx);
+            return false;
+        }
+        true
     }
 
     pub fn cancel_confirm(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -352,13 +363,6 @@ impl Render for TrashDialog {
                     .flex_wrap()
                     .items_center()
                     .gap(px(6.))
-                    // Escape cancels the confirmation, not the dialog (React's input keydown).
-                    .capture_key_down(cx.listener(|s, e: &KeyDownEvent, window, cx| {
-                        if e.keystroke.key == "escape" {
-                            s.cancel_confirm(window, cx);
-                            cx.stop_propagation();
-                        }
-                    }))
                     .child(ui::sub(
                         format!(
                             "This destroys {} and every copy of {}. Type {CONFIRM_WORD} to confirm:",

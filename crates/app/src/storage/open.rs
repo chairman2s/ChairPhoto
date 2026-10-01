@@ -13,7 +13,8 @@ use super::CloseDialog;
 use crate::view::RootView;
 use gpui_kit::component::WindowExt as _;
 use gpui_kit::prelude::*;
-use gpui_kit::{px, Context, Entity, EventEmitter, Window};
+use gpui_kit::{px, App, Context, Entity, EventEmitter, Window};
+use std::rc::Rc;
 
 /// The storage dialog opened last — what a test drives. Replaced by the next one.
 #[derive(Clone)]
@@ -36,11 +37,34 @@ impl RootView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.show_dialog_with(title, width, view, handle, None, window, cx)
+    }
+
+    /// `on_cancel`: the dialog's Cancel (Escape, the close button); `false` keeps it open.
+    #[allow(clippy::too_many_arguments)]
+    fn show_dialog_with<V: Render + EventEmitter<CloseDialog>>(
+        &mut self,
+        title: &'static str,
+        width: f32,
+        view: Entity<V>,
+        handle: StorageDialog,
+        on_cancel: Option<Rc<dyn Fn(&mut Window, &mut App) -> bool>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.dialog_close = Some(cx.subscribe_in(&view, window, |_, _, _: &CloseDialog, window, cx| {
             window.close_dialog(cx);
         }));
         self.storage.update(cx, |s, _| s.last_dialog = Some(handle));
-        window.open_dialog(cx, move |dialog, _, _| dialog.title(title).w(px(width)).child(view.clone()));
+        window.open_dialog(cx, move |dialog, _, _| {
+            // No storage dialog has an OK button; Enter in one of its fields (Scan, Check,
+            // the trash's typed confirmation) must not reach the Dialog's Confirm and close it.
+            let dialog = dialog.title(title).w(px(width)).child(view.clone()).on_ok(|_, _, _| false);
+            match on_cancel.clone() {
+                Some(f) => dialog.on_cancel(move |_, window, cx| f(window, cx)),
+                None => dialog,
+            }
+        });
     }
 
     pub(crate) fn open_catalogs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -70,7 +94,11 @@ impl RootView {
     pub(crate) fn open_trash(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let (storage, model, images) = (self.storage.clone(), self.model.clone(), self.images.clone());
         let view = cx.new(|cx| TrashDialog::new(storage, model, images, window, cx));
-        self.show_dialog("Trash", 760., view.clone(), StorageDialog::Trash(view), window, cx);
+        let cancel = {
+            let view = view.clone();
+            Rc::new(move |window: &mut Window, cx: &mut App| view.update(cx, |t, cx| t.on_dialog_cancel(window, cx)))
+        };
+        self.show_dialog_with("Trash", 760., view.clone(), StorageDialog::Trash(view), Some(cancel), window, cx);
     }
 
     pub(crate) fn open_volumes(&mut self, window: &mut Window, cx: &mut Context<Self>) {

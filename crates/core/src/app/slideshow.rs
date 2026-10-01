@@ -333,7 +333,8 @@ mod tests {
     }
 
     /// **Forced interleaving.** Cancel, a newer render and a catalog switch each land while
-    /// ffmpeg is running (a fake that sleeps): ffmpeg is killed, the render answers
+    /// ffmpeg is running: the fake writes a partial movie, reports one progress line — the
+    /// "started" signal the test waits for — and sleeps. ffmpeg is killed, the render answers
     /// cancelled and its partial movie is gone.
     #[test]
     fn cancel_a_newer_render_or_a_switch_kills_a_running_encode() {
@@ -341,14 +342,21 @@ mod tests {
         // this must not interleave with the develop tests that assert on it (#133).
         let _serial = crate::develop::serial();
         for how in ["cancel", "newer", "switch"] {
-            let (dir, state, _p, ids) = setup(&format!("abort-{how}"), 2);
+            let (dir, state, progress, ids) = setup(&format!("abort-{how}"), 2);
             let out = dir.join("out");
             let job = claim_slideshow(&state, None, &ids, opts(), out.to_str().unwrap(), Some(fake_ffmpeg(true))).unwrap();
-            let handle = job.abort_handle();
+            let (handle, id) = (job.abort_handle(), job.job);
             let started = std::time::Instant::now();
             let runner = std::thread::spawn(move || job.run_with(&copy_frames()));
-            // The frames are copied quickly; give the encode a moment to be running.
-            std::thread::sleep(std::time::Duration::from_millis(200));
+            // Wait for ffmpeg's own "started" line (its first progress, this job's id), so the
+            // trip below lands while it runs, not before it was spawned.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !progress.0.lock().unwrap().iter().any(|p| p.2 == id) {
+                assert!(std::time::Instant::now() < deadline, "{how}: ffmpeg never started");
+                assert!(!runner.is_finished(), "{how}: the render ended before ffmpeg started");
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            assert!(!runner.is_finished(), "{how}: ffmpeg is running at the trip");
             match how {
                 "cancel" => handle.store(true, Ordering::Relaxed),
                 "newer" => drop(claim_slideshow(&state, None, &ids, opts(), out.to_str().unwrap(), Some(fake_ffmpeg(false))).unwrap()),

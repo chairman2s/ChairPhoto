@@ -276,6 +276,12 @@ fn claim_single_instance(launch: &Request, tx: launch::RequestSender) -> Option<
         });
     let endpoint = match endpoint {
         Ok(endpoint) => endpoint,
+        // Someone else's (or a writable) runtime dir: running without single-instance would
+        // let every launch open the same catalog, so stop and say what to remove.
+        Err(e) if single_instance::is_unsafe_dir(&e) => {
+            eprintln!("ChairPhoto will not start: {e}");
+            std::process::exit(1);
+        }
         Err(e) => {
             eprintln!("single instance: disabled: {e}");
             return None;

@@ -1,0 +1,6 @@
+#!/bin/sh
+# A fake ffmpeg that reports one progress line and then sleeps until killed, never creating
+# its output (the window in which another render could pick the same name). Checked in,
+# never written by a test (see ffmpeg-ok).
+echo frame=1
+exec sleep 30

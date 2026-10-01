@@ -423,24 +423,36 @@ pub fn expand_home(path: &str) -> PathBuf {
 /// A destination that doesn't already exist: `path` if free, else `stem (2).ext`,
 /// `stem (3).ext`, … so a repeat render (collage, slideshow) never clobbers an earlier file.
 pub fn unique_path(path: &std::path::Path) -> PathBuf {
-    if !path.exists() {
-        return path.to_path_buf();
+    unique_candidates(path).find(|c| !c.exists()).unwrap_or_else(|| path.to_path_buf()) // 10k collisions: pathological
+}
+
+/// [`unique_path`], but the name is taken: the first free candidate is created empty with an
+/// exclusive create (`O_EXCL`), so a concurrent writer choosing names the same way never gets
+/// the same one, and the caller owns — and may remove — exactly the file it was handed.
+pub fn reserve_unique_path(path: &std::path::Path) -> Result<PathBuf, String> {
+    for candidate in unique_candidates(path) {
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(&candidate) {
+            Ok(_) => return Ok(candidate),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(format!("{}: {e}", candidate.display())),
+        }
     }
+    Err(format!("{}: no free name", path.display()))
+}
+
+/// `path`, then `stem (2).ext` … `stem (9999).ext`.
+fn unique_candidates(path: &std::path::Path) -> impl Iterator<Item = PathBuf> + '_ {
     let dir = path.parent().unwrap_or_else(|| std::path::Path::new("."));
     let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("output");
     let ext = path.extension().and_then(|s| s.to_str());
-    for n in 2..10_000 {
+    std::iter::once(path.to_path_buf()).chain((2..10_000).map(move |n| {
         let mut name = format!("{stem} ({n})");
         if let Some(ext) = ext {
             name.push('.');
             name.push_str(ext);
         }
-        let candidate = dir.join(name);
-        if !candidate.exists() {
-            return candidate;
-        }
-    }
-    path.to_path_buf() // pathological fallback (10k collisions)
+        dir.join(name)
+    }))
 }
 
 

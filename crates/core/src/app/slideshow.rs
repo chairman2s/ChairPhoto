@@ -150,8 +150,9 @@ impl SlideshowJob {
     ///
     /// The frames go to a temp dir private to this job (process id and job id), so a
     /// superseded render's cleanup never removes a newer render's frames. The movie goes to a
-    /// fresh `slideshow.mp4` / `slideshow (N).mp4` in the destination; nothing else there is
-    /// touched, and a cancelled or failed encode removes its own partial movie.
+    /// fresh `slideshow.mp4` / `slideshow (N).mp4` in the destination, reserved by an exclusive
+    /// create before ffmpeg starts; nothing else there is touched, and a cancelled or failed
+    /// encode removes its own reservation / partial movie.
     pub fn run_with(self, write_frame: &FrameWriter) -> Result<PathBuf, String> {
         let SlideshowJob { state, items, opts, dest_dir, ffmpeg, abort, job } = self;
         let cancelled = || abort.load(Ordering::Relaxed);
@@ -175,14 +176,17 @@ impl SlideshowJob {
                 return Err(SLIDESHOW_CANCELLED.to_string());
             }
             std::fs::create_dir_all(&dest_dir).map_err(|e| e.to_string())?;
-            let dest = super::unique_path(&dest_dir.join("slideshow.mp4"));
+            // The name is reserved (an exclusive create), so no other render — in this
+            // process or another — can choose it, and the cleanup below removes only ours.
+            // ffmpeg then overwrites that empty reservation (`-y`).
+            let dest = super::reserve_unique_path(&dest_dir.join("slideshow.mp4"))?;
             let encoded = crate::slideshow::render_with(&ffmpeg, &frames, &opts, &dest, &abort, |done, total| {
                 state.send(CoreEvent::SlideshowProgress(SlideshowProgress { done, total, job }));
             });
             match encoded {
                 Ok(()) => Ok(dest),
                 Err(e) => {
-                    // Our own partial output: the unique path did not exist before this job.
+                    // Our own reservation / partial output, never another render's.
                     let _ = std::fs::remove_file(&dest);
                     Err(e)
                 }
@@ -221,9 +225,13 @@ mod tests {
     /// killed. Never written at run time: a script written and then executed while other test
     /// threads fork can fail with ETXTBSY (a forked child holding the write descriptor).
     fn fake_ffmpeg(hang: bool) -> PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/ffmpeg")
-            .join(if hang { "ffmpeg-hang" } else { "ffmpeg-ok" })
+        fixture(if hang { "ffmpeg-hang" } else { "ffmpeg-ok" })
+    }
+
+    /// A checked-in fake ffmpeg by name; `ffmpeg-stall` reports one progress line and sleeps
+    /// without ever creating its output.
+    fn fixture(name: &str) -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/ffmpeg").join(name)
     }
 
     /// A frame writer that copies the original (no thumbnail cache, no exiftool).
@@ -372,6 +380,44 @@ mod tests {
             let left: Vec<_> = std::fs::read_dir(&out).map(|d| d.flatten().map(|e| e.path()).collect()).unwrap_or_default();
             assert!(left.is_empty(), "{how}: the partial movie is removed: {left:?}");
         }
+    }
+
+    /// **Forced interleaving.** Two renders into one folder that do not trip each other (two
+    /// app instances): A's ffmpeg is running but has not created its output yet when B
+    /// renders. B must not get A's name, and A's cancel must not remove B's movie.
+    #[test]
+    fn a_render_never_takes_or_removes_a_name_another_render_chose() {
+        let (dir, a_state, a_progress, a_ids) = setup("race-a", 2);
+        let (_b_dir, b_state, _bp, b_ids) = setup("race-b", 2);
+        let out = dir.join("out");
+        let a = claim_slideshow(&a_state, None, &a_ids, opts(), out.to_str().unwrap(), Some(fixture("ffmpeg-stall"))).unwrap();
+        let (a_abort, a_job) = (a.abort_handle(), a.job);
+        let a_run = std::thread::spawn(move || a.run_with(&copy_frames()));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !a_progress.0.lock().unwrap().iter().any(|p| p.2 == a_job) {
+            assert!(std::time::Instant::now() < deadline && !a_run.is_finished(), "A's ffmpeg never started");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let b = claim_slideshow(&b_state, None, &b_ids, opts(), out.to_str().unwrap(), Some(fake_ffmpeg(false))).unwrap();
+        let b_movie = b.run_with(&copy_frames()).unwrap();
+        a_abort.store(true, Ordering::Relaxed);
+        assert_eq!(a_run.join().unwrap().unwrap_err(), SLIDESHOW_CANCELLED);
+        assert_eq!(std::fs::read(&b_movie).ok().as_deref(), Some(&b"movie"[..]), "A's cleanup left B's movie alone");
+        assert_eq!(b_movie, out.join("slideshow (2).mp4"), "A had reserved slideshow.mp4");
+        assert!(!out.join("slideshow.mp4").exists(), "A removed its own reservation");
+    }
+
+    #[test]
+    fn reserve_unique_path_takes_each_name_once() {
+        let dir = TestTmpDir::new("reserve");
+        let want = dir.join("slideshow.mp4");
+        std::fs::write(&want, b"earlier").unwrap();
+        let first = crate::app::reserve_unique_path(&want).unwrap();
+        let second = crate::app::reserve_unique_path(&want).unwrap();
+        assert_eq!((first.clone(), second.clone()), (dir.join("slideshow (2).mp4"), dir.join("slideshow (3).mp4")));
+        assert_eq!(std::fs::read(&want).unwrap(), b"earlier");
+        assert!(first.exists() && second.exists(), "each name is taken on disk");
+        assert!(crate::app::reserve_unique_path(&dir.join("missing/x.mp4")).is_err());
     }
 
     #[test]

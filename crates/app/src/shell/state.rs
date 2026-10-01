@@ -20,7 +20,7 @@
 use crate::model::{AppModel, AppModelEvent, DeepLinkTarget};
 use chairphoto_core::app::{with_catalog, AppState, CoreEvent};
 use chairphoto_core::catalog::{
-    Album, Catalog, Facet, ImportBatch, Photo, PhotoPage, PhotoQuery, PickState, SmartAlbum,
+    Album, Catalog, Facet, ImportBatch, Photo, PhotoPage, PhotoQuery, PhotoVersion, PickState, SmartAlbum,
     SOFT_THRESHOLD_DEFAULT, SOFT_THRESHOLD_KEY,
 };
 use chairphoto_model::deep_link::DeepLinkView;
@@ -304,6 +304,10 @@ pub struct ShellState {
     rows_pending: Option<u64>,
     /// A photo link waiting for the grid to list its photo.
     pub pending_link: Option<PendingPhotoLink>,
+    /// The version of the active photo the loupe shows (`None` = Original): picked in the
+    /// inspector's Versions tab (App.tsx's `activeVersion`). It belongs to one photo, and is
+    /// dropped when the active photo changes or the catalog switches.
+    active_version: Option<PhotoVersion>,
     /// The newest culling write: each write waits for the one before, so marks land in the
     /// order they were made.
     last_mark: Option<Task<()>>,
@@ -353,6 +357,7 @@ impl ShellState {
             rows_loaded: false,
             rows_pending: None,
             pending_link: None,
+            active_version: None,
             last_mark: None,
             catalog_generation: 0,
             model: model.clone(),
@@ -484,7 +489,30 @@ impl ShellState {
 
     pub fn clear_selection(&mut self, cx: &mut Context<Self>) {
         self.library.clear_selection();
+        self.drop_foreign_version();
         cx.notify();
+    }
+
+    /// The active photo's chosen version, if one is chosen (`None` = Original).
+    pub fn active_version(&self) -> Option<&PhotoVersion> {
+        let active = self.library.selection().active_id;
+        self.active_version.as_ref().filter(|v| Some(v.photo_id) == active)
+    }
+
+    /// Choose the version the loupe shows; one of another photo than the active one is
+    /// refused (it would draw that photo's edit on this one).
+    pub fn set_active_version(&mut self, version: Option<PhotoVersion>, cx: &mut Context<Self>) {
+        let active = self.library.selection().active_id;
+        self.active_version = version.filter(|v| Some(v.photo_id) == active);
+        cx.notify();
+    }
+
+    /// App.tsx reset the active version to Original whenever the active photo changed.
+    fn drop_foreign_version(&mut self) {
+        let active = self.library.selection().active_id;
+        if self.active_version.as_ref().is_some_and(|v| Some(v.photo_id) != active) {
+            self.active_version = None;
+        }
     }
 
     /// Run a selection verb (a click, a key), then ask for the active photo's storage badge
@@ -495,6 +523,7 @@ impl ShellState {
     }
 
     fn after_input(&mut self, cx: &mut Context<Self>) {
+        self.drop_foreign_version();
         if let Some(request) = self.library.take_active_status_request() {
             self.fetch_statuses(request, cx);
         }
@@ -588,6 +617,26 @@ impl ShellState {
             return;
         }
         let snapshot = (advance && targets.len() == 1).then(|| self.library.step_snapshot());
+        self.queue_mark(mark, targets, snapshot, cx);
+    }
+
+    /// [`apply_mark`](Self::apply_mark) on named photos rather than the selection, never
+    /// advancing: the inspector's stars, pick and label controls mark the photo it shows
+    /// (`PhotoInspector.tsx` wrote `photo.id` only, not the selection). The same queue, so
+    /// these marks and the keys' land in the order they were made.
+    pub fn apply_mark_to(&mut self, mark: Mark, targets: Vec<i64>, cx: &mut Context<Self>) {
+        if !targets.is_empty() {
+            self.queue_mark(mark, targets, None, cx);
+        }
+    }
+
+    fn queue_mark(
+        &mut self,
+        mark: Mark,
+        targets: Vec<i64>,
+        snapshot: Option<chairphoto_model::library::session::StepSnapshot>,
+        cx: &mut Context<Self>,
+    ) {
         let previous = self.last_mark.take();
         let generation = self.catalog_generation;
         let state = self.app.clone();
@@ -726,6 +775,7 @@ impl ShellState {
                 self.rows_loaded = false;
                 self.rows_pending = None;
                 self.pending_link = None;
+                self.active_version = None;
                 self.catalog_generation += 1;
                 self.surface = Surface::Library;
                 self.counts = Counts::default();

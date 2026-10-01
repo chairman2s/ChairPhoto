@@ -347,3 +347,25 @@ fn whole_view_tools_need_photos(cx: &mut TestAppContext) {
         assert_eq!(status(&app, cx), line);
     }
 }
+
+/// Two culling keys pressed on one photo before either write has run both step from that
+/// photo, over the rows they started from — not from wherever the first one's step and
+/// refresh left the grid (the session's `step_active_over`, React's closures).
+#[gpui_kit::test]
+fn overlapping_culls_both_step_from_the_photo_they_started_on(cx: &mut TestAppContext) {
+    let dir = TempDir::new("grid-overlap");
+    let app = start(cx);
+    let ids = open_catalog_with_photos(&app, &dir, 4, cx);
+    click(&app, "filter-Unrated", cx);
+    click_tile(&app, ids[1], Modifiers::default(), cx);
+    cx.update_window(app.window(), |_, window, cx| {
+        window.dispatch_action(Box::new(crate::library::Rate3), cx);
+        window.dispatch_action(Box::new(crate::library::Rate2), cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    assert_eq!(rating_of(&app, ids[1]).0, 2, "both marked the photo they were pressed on, in order");
+    assert_eq!(rating_of(&app, ids[2]).0, 0);
+    assert_eq!(rows(&app, cx), vec![ids[0], ids[2], ids[3]]);
+    assert_eq!(selection(&app, cx).0, Some(ids[2]), "not skipped past the unjudged ids[2]");
+}

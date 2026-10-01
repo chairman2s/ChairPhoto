@@ -46,7 +46,9 @@ pub trait TileTicket {
 
 /// Where tiles come from. [`NetTiles`] in the app; a recording fake in tests.
 pub trait TileBackend: Send + Sync {
-    fn load(&self, source: &TileSource, key: TileKey, respond: TileRespond) -> Box<dyn TileTicket>;
+    /// Load `key` from `source`. A redirect may lead only to the source's own host or to
+    /// one of `redirect_hosts` (the other hosts the user allowed).
+    fn load(&self, source: &TileSource, redirect_hosts: &Arc<[String]>, key: TileKey, respond: TileRespond) -> Box<dyn TileTicket>;
 }
 
 /// The installed backend, a GPUI global; absent means [`NetTiles`] (made on first use).
@@ -83,10 +85,10 @@ impl TileTicket for Abort {
 }
 
 impl TileBackend for NetTiles {
-    fn load(&self, source: &TileSource, key: TileKey, respond: TileRespond) -> Box<dyn TileTicket> {
-        let (fetcher, source) = (self.fetcher.clone(), source.clone());
+    fn load(&self, source: &TileSource, redirect_hosts: &Arc<[String]>, key: TileKey, respond: TileRespond) -> Box<dyn TileTicket> {
+        let (fetcher, source, redirect_hosts) = (self.fetcher.clone(), source.clone(), redirect_hosts.clone());
         let task = chairphoto_core::app::runtime().spawn(async move {
-            let result = match fetcher.load(&source, key).await {
+            let result = match fetcher.load_allowing(&source, key, &redirect_hosts).await {
                 Ok(tile) => tokio::task::spawn_blocking(move || decode(&tile.bytes))
                     .await
                     .unwrap_or_else(|e| Err(e.to_string())),
@@ -108,7 +110,7 @@ impl TileTicket for NoTicket {
 }
 
 impl TileBackend for Unavailable {
-    fn load(&self, _: &TileSource, _: TileKey, respond: TileRespond) -> Box<dyn TileTicket> {
+    fn load(&self, _: &TileSource, _: &Arc<[String]>, _: TileKey, respond: TileRespond) -> Box<dyn TileTicket> {
         respond(Err(self.0.clone()));
         Box::new(NoTicket)
     }
@@ -145,6 +147,8 @@ pub struct TileStats {
 pub struct TileLayer {
     backend: Arc<dyn TileBackend>,
     source: Option<TileSource>,
+    /// The other hosts the user allowed: where a redirect may also lead.
+    redirect_hosts: Arc<[String]>,
     held: HashMap<TileKey, (Arc<RenderImage>, u64)>,
     order: BTreeMap<u64, TileKey>,
     tick: u64,
@@ -166,6 +170,7 @@ impl TileLayer {
         let layer = TileLayer {
             backend,
             source: None,
+            redirect_hosts: Arc::from(Vec::new()),
             held: HashMap::new(),
             order: BTreeMap::new(),
             tick: 0,
@@ -204,6 +209,14 @@ impl TileLayer {
 
     /// Show tiles of `source` from now on; a different source drops everything held and
     /// pending (returned, to be released). `None` = no tiles (no consent).
+    /// The other hosts the user allowed (a tile server's redirect may lead there, and
+    /// nowhere else but its own host). Applies to loads started from now on.
+    pub fn set_redirect_hosts(&mut self, hosts: Vec<String>) {
+        if *self.redirect_hosts != *hosts {
+            self.redirect_hosts = Arc::from(hosts);
+        }
+    }
+
     pub fn set_source(&mut self, source: Option<TileSource>) -> Vec<Arc<RenderImage>> {
         if self.source == source {
             return Vec::new();
@@ -257,7 +270,7 @@ impl TileLayer {
                 // Fails only when the view is gone: the tile is then unwanted.
                 let _ = done.unbounded_send(TileDone { key, generation, result });
             });
-            let ticket = self.backend.load(&source, key, respond);
+            let ticket = self.backend.load(&source, &self.redirect_hosts, key, respond);
             self.pending.insert(key, (generation, ticket));
         }
     }
@@ -356,6 +369,7 @@ pub(crate) mod fake {
 
     pub struct Load {
         pub host: String,
+        pub redirect_hosts: Vec<String>,
         pub key: TileKey,
         pub respond: Option<TileRespond>,
         pub cancelled: Arc<std::sync::atomic::AtomicBool>,
@@ -375,10 +389,11 @@ pub(crate) mod fake {
     }
 
     impl TileBackend for FakeTiles {
-        fn load(&self, source: &TileSource, key: TileKey, respond: TileRespond) -> Box<dyn TileTicket> {
+        fn load(&self, source: &TileSource, redirect_hosts: &Arc<[String]>, key: TileKey, respond: TileRespond) -> Box<dyn TileTicket> {
             let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
             self.loads.lock().unwrap().push(Load {
                 host: source.host().to_string(),
+                redirect_hosts: redirect_hosts.to_vec(),
                 key,
                 respond: Some(respond),
                 cancelled: cancelled.clone(),

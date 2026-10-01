@@ -269,6 +269,9 @@ fn another_tile_host_asks_again_and_fetches_nothing_meanwhile(cx: &mut TestAppCo
     m.allow(cx);
     let loads = m.fake.loads.lock().unwrap();
     assert!(loads[before..].iter().all(|l| l.host == "a.tiles.example.org") && loads.len() > before);
+    // A redirect may lead only to the source's own host or another allowed one.
+    assert!(loads[..before].iter().all(|l| l.redirect_hosts.is_empty()), "nothing else was allowed then");
+    assert!(loads[before..].iter().all(|l| l.redirect_hosts == [OSM]), "OSM is the other allowed host");
 }
 
 /// A catalog switch makes every pending load unreachable: the loads are cancelled and a

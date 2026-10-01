@@ -225,6 +225,9 @@ impl MapView {
     fn sync_source(&mut self, cx: &mut Context<Self>) {
         let s = self.state.read(cx);
         let source = (s.consent() == Consent::Allowed).then(|| s.source.clone());
+        let others: Vec<String> =
+            s.host_consent().hosts().filter(|&(h, allowed)| allowed && h != s.source.host()).map(|(h, _)| h.to_string()).collect();
+        self.tiles.set_redirect_hosts(others);
         let gone = self.tiles.set_source(source);
         release(gone, cx);
     }

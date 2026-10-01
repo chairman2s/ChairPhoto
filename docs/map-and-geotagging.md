@@ -86,7 +86,10 @@ true}`): a tile request reveals this computer's address whichever catalog is ope
 catalog does not ask again. It is changeable in Preferences → Map ("Block", "Ask again") or
 from the status bar's "Map tiles off" chip. Until a host is allowed nothing is fetched;
 markers and fences show on a plain background with a graticule. A new tile URL on another
-host asks again. The tile URL itself stays the catalog setting `map.tileUrl`: consent is
+host asks again. The consent host is the host a filled-in tile URL goes to, and a
+template with a placeholder in its host is refused. A tile server's redirect is followed
+only to its own host or another allowed one; anywhere else fails the tile without
+contacting that host. The tile URL itself stays the catalog setting `map.tileUrl`: consent is
 keyed by the host it names, so it need not move. Answers the first port stored per catalog
 (the module setting `map.tileHosts`) move to the machine on that catalog's first read —
 only allowed/denied entries; where they disagree with the machine's or another catalog's,

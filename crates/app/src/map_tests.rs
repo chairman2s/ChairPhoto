@@ -28,6 +28,9 @@ const OSM: &str = "tile.openstreetmap.org";
 const OSLO: LatLng = (59.91, 10.75);
 const OSLO2: LatLng = (59.912, 10.752);
 const SYDNEY: LatLng = (-33.87, 151.21);
+/// The Map module's old per-catalog consent setting (`map.tileHosts`), as the first port
+/// stored it through `ModuleSettings`.
+const LEGACY_HOSTS: &str = "map.tileHosts";
 
 /// Run queued catalog work and repaint until nothing more happens.
 fn work(app: &App, cx: &mut TestAppContext) {
@@ -200,7 +203,7 @@ impl Map {
 /// Decision #118: opening the map asks before the first tile request to a host; until the
 /// user allows it nothing is fetched — not while the card is up, not after "Not now", not
 /// while panning and zooming — and markers still show. The answer is remembered per host in
-/// `map.tileHosts`; allowing (here from the status bar's chip) starts fetching, and only from
+/// this machine's preferences (`map.tileHosts`), not the catalog; allowing (here from the status bar's chip) starts fetching, and only from
 /// that host.
 #[gpui_kit::test]
 fn no_tile_is_fetched_before_the_user_allows_the_host(cx: &mut TestAppContext) {
@@ -216,7 +219,8 @@ fn no_tile_is_fetched_before_the_user_allows_the_host(cx: &mut TestAppContext) {
 
     m.click("map-consent-deny", cx);
     assert!(!m.has("map-consent", cx));
-    assert_eq!(m.setting("map.tileHosts").as_deref(), Some(r#"{"tile.openstreetmap.org":false}"#));
+    assert_eq!(machine_hosts(cx).as_deref(), Some(r#"{"tile.openstreetmap.org":false}"#));
+    assert_eq!(m.setting(LEGACY_HOSTS), None, "not a catalog setting");
     view.update(cx, |v, cx| {
         v.zoom_by(3.0, cx);
         v.viewport.pan_by(120.0, -40.0);
@@ -234,7 +238,7 @@ fn no_tile_is_fetched_before_the_user_allows_the_host(cx: &mut TestAppContext) {
     assert_eq!(m.fake.count(), 0);
 
     m.click("map-tiles-off", cx);
-    assert_eq!(m.setting("map.tileHosts").as_deref(), Some(r#"{"tile.openstreetmap.org":true}"#));
+    assert_eq!(machine_hosts(cx).as_deref(), Some(r#"{"tile.openstreetmap.org":true}"#));
     let n = m.loads_to(OSM);
     let visible = view.read_with(cx, |v, _| v.viewport.visible_tiles().len());
     assert!(n > 0 && n <= visible, "only the visible tiles load: {n} of {visible}");
@@ -267,9 +271,9 @@ fn another_tile_host_asks_again_and_fetches_nothing_meanwhile(cx: &mut TestAppCo
     assert!(loads[before..].iter().all(|l| l.host == "a.tiles.example.org") && loads.len() > before);
 }
 
-/// A catalog switch makes the old catalog's answer and every pending load unreachable: the
-/// loads are cancelled, a result that arrives anyway is dropped, and the new catalog's map
-/// asks again before fetching.
+/// A catalog switch makes every pending load unreachable: the loads are cancelled and a
+/// result that arrives anyway is dropped. The answer is this machine's, so the new
+/// catalog's map does not ask again; it fetches its own view once its settings are read.
 #[gpui_kit::test]
 fn a_catalog_switch_cancels_tile_loads_and_drops_late_results(cx: &mut TestAppContext) {
     let dir = TempDir::new("map-switch");
@@ -298,8 +302,95 @@ fn a_catalog_switch_cancels_tile_loads_and_drops_late_results(cx: &mut TestAppCo
         assert!(v.tiles.stats.stale_dropped >= pending as u64);
     });
     show_map(&m.app, cx);
-    assert!(m.has("map-consent", cx), "the new catalog has not been asked");
-    assert_eq!(m.fake.count(), pending);
+    assert!(!m.has("map-consent", cx), "the answer is per machine, not per catalog");
+    assert!(m.fake.count() > pending, "the new catalog's view loads from the allowed host");
+    m.loads_to(OSM);
+}
+
+/// The tile URL stays a catalog setting, written to the catalog its settings were read from:
+/// a save that lands after the core switched (event not delivered yet) fails closed instead
+/// of setting the new catalog's URL.
+#[gpui_kit::test]
+fn a_tile_url_saved_across_a_switch_does_not_reach_the_new_catalog(cx: &mut TestAppContext) {
+    let dir = TempDir::new("map-url-switch");
+    let m = open_map(&dir, &[OSLO], cx);
+    m.click("map-consent-deny", cx);
+    let state = map_state(&m, cx);
+    let other = dir.0.join("other");
+    let b = chairphoto_core::catalog::Catalog::open(&other.join("b.chairphoto"), &other).unwrap();
+    chairphoto_core::app::detach_catalog_and_trip_jobs(&m.app.state).unwrap();
+    chairphoto_core::app::publish_catalog_and_reset_jobs(&m.app.state, b).unwrap();
+    state.update(cx, |s, cx| s.set_tile_url("https://tiles.example.org/{z}/{x}/{y}.png", cx)).unwrap();
+    work(&m.app, cx);
+    let url_key = format!("{MAP_MODULE_ID}.tileUrl");
+    assert_eq!(m.setting(&url_key), None, "the old catalog's URL landed in the new catalog");
+}
+
+fn machine_hosts(cx: &mut TestAppContext) -> Option<String> {
+    cx.update(|cx| crate::machine_prefs::MachinePrefs::read(cx, crate::modules::map::logic::MACHINE_TILE_HOSTS))
+}
+
+/// Answers stored per catalog by the first port move to this machine on each catalog's
+/// first read: only allowed/denied entries; where catalogs (or the machine) disagree,
+/// denied wins. The catalog's copy is emptied so it merges once — a later Allow in
+/// Preferences is not undone by reopening that catalog. Preferences' Map tab lists the
+/// machine's answers and edits them.
+#[gpui_kit::test]
+fn per_catalog_answers_migrate_to_this_machine_and_show_in_preferences(cx: &mut TestAppContext) {
+    let dir = TempDir::new("map-migrate");
+    let fake = Arc::new(FakeTiles::default());
+    cx.update(|cx| cx.set_global(MapTiles(fake.clone())));
+    let app = start(cx);
+    open_catalog_with_photos(&app, &dir, 1, cx);
+    {
+        let guard = app.state.catalog.lock().unwrap();
+        guard.as_ref().unwrap().set_setting(
+            LEGACY_HOSTS,
+            r#"{"tile.openstreetmap.org":true,"b.example":true,"odd.example":"yes"}"#,
+        ).unwrap();
+    }
+    work(&app, cx);
+    cx.update(|cx| ModuleRegistry::enable(&app.wired.modules, MAP_MODULE_ID, cx));
+    work(&app, cx);
+    assert_eq!(machine_hosts(cx).as_deref(), Some(r#"{"b.example":true,"tile.openstreetmap.org":true}"#));
+    let setting = |app: &App| app.state.catalog.lock().unwrap().as_ref().unwrap().get_setting(LEGACY_HOSTS).unwrap();
+    assert_eq!(setting(&app).as_deref(), Some("{}"), "the catalog's copy was emptied");
+    show_map(&app, cx);
+    assert!(fake.count() > 0, "allowed by the migrated answer: no question");
+
+    // A second catalog blocked OSM: denied wins.
+    let other = TempDir::new("map-migrate-b");
+    let db = other.0.join("photos.chairphoto");
+    {
+        let c = chairphoto_core::catalog::Catalog::open(&db, &other.0.join("photos")).unwrap();
+        c.set_setting(LEGACY_HOSTS, r#"{"tile.openstreetmap.org":false}"#).unwrap();
+    }
+    open_catalog_with_photos(&app, &other, 1, cx);
+    work(&app, cx);
+    assert_eq!(machine_hosts(cx).as_deref(), Some(r#"{"b.example":true,"tile.openstreetmap.org":false}"#));
+
+    // Preferences → Map lists the machine's answers; Allow there sticks across catalogs.
+    click(&app, "rail-preferences", cx);
+    work(&app, cx);
+    click(&app, "prefs-tab-module-map", cx);
+    work(&app, cx);
+    let listed = cx
+        .update_window(app.window(), |_, window, cx| {
+            window.render_frame(cx);
+            window.try_find("map-host-b.example").is_some()
+        })
+        .unwrap();
+    assert!(listed, "the host list is in Preferences");
+    click(&app, "map-host-toggle-tile.openstreetmap.org", cx);
+    work(&app, cx);
+    assert_eq!(machine_hosts(cx).as_deref(), Some(r#"{"b.example":true,"tile.openstreetmap.org":true}"#));
+    // Away and back to the catalog that blocked OSM: already merged, so the Allow stands.
+    open_catalog_with_photos(&app, &dir, 1, cx);
+    work(&app, cx);
+    open_catalog_with_photos(&app, &other, 1, cx);
+    work(&app, cx);
+    assert_eq!(setting(&app).as_deref(), Some("{}"));
+    assert_eq!(machine_hosts(cx).as_deref(), Some(r#"{"b.example":true,"tile.openstreetmap.org":true}"#));
 }
 
 /// Tiles follow the view: panning far away cancels the loads that left it; a tile already

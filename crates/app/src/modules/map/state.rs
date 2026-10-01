@@ -17,11 +17,16 @@
 //! another catalog is open. Before the first read lands (or after a switch) there is no
 //! identity and a write is refused with a status line.
 //!
-//! **Consent** (decision #118) is a catalog setting, `map.tileHosts`, so it is remembered
-//! per catalog: another catalog asks again. Until it has been read, the host counts as
-//! "never asked" and nothing is fetched.
+//! **Consent** (decision #118: per host, remembered, changeable in Preferences) is a
+//! per-machine preference ([`MachinePrefs`] key `map.tileHosts`): a tile request reveals
+//! this computer's address, whichever catalog is open, so a catalog switch does not ask
+//! again. A catalog's old per-catalog answers are merged in on its first read
+//! ([`MapState::reload_settings`]). The tile URL stays a catalog setting (`map.tileUrl`, as
+//! in React): consent is keyed by the host the URL names, so it need not move with it.
+//! Until a catalog's settings are read the host is not known and nothing is fetched.
 
-use super::logic::{Consent, HostConsent, TILE_HOSTS_KEY, TILE_URL_KEY};
+use super::logic::{Consent, HostConsent, MACHINE_TILE_HOSTS, TILE_HOSTS_KEY, TILE_URL_KEY};
+use crate::machine_prefs::MachinePrefs;
 use crate::model::{AppModel, AppModelEvent};
 use crate::modules::ModuleSettings;
 use crate::storage::Runner;
@@ -49,7 +54,6 @@ pub enum Load<T> {
 pub struct MapSettingsData {
     /// The stored `map.tileUrl` (raw), if any.
     pub tile_url: Option<String>,
-    pub consent: HostConsent,
 }
 
 /// Where "Geocode all" stands.
@@ -78,6 +82,10 @@ pub struct MapState {
     pub fence_error: Option<String>,
     /// `None` until the settings have been read.
     pub stored: Option<MapSettingsData>,
+    /// The catalog `stored` was read from (the tile URL is saved there).
+    settings_from: Option<CatalogIdentity>,
+    /// This machine's per-host answers.
+    consent: HostConsent,
     pub source: TileSource,
     /// Why the stored tile URL was refused (the default is used meanwhile).
     pub source_error: Option<String>,
@@ -195,6 +203,8 @@ impl MapState {
             fences_from: None,
             fence_error: None,
             stored: None,
+            settings_from: None,
+            consent: HostConsent::parse(MachinePrefs::read(cx, MACHINE_TILE_HOSTS).as_deref()),
             source: TileSource::default(),
             source_error: None,
             applying: None,
@@ -228,7 +238,10 @@ impl MapState {
 
     /// The consent for the current tile host. `Unknown` until the settings are read.
     pub fn consent(&self) -> Consent {
-        self.stored.as_ref().map_or(Consent::Unknown, |s| s.consent.get(self.source.host()))
+        if self.stored.is_none() {
+            return Consent::Unknown; // the host is not known yet
+        }
+        self.consent.get(self.source.host())
     }
 
     /// Whether the settings have been read (the consent question can be asked).
@@ -245,6 +258,7 @@ impl MapState {
         self.fences_from = None;
         self.fence_error = None;
         self.stored = None;
+        self.settings_from = None;
         self.source = TileSource::default();
         self.source_error = None;
         self.applying = None;
@@ -336,16 +350,18 @@ impl MapState {
     }
 
     pub fn reload_settings(&mut self, cx: &mut Context<Self>) {
+        let (url_key, hosts_key) = (self.settings.key(TILE_URL_KEY), self.settings.key(TILE_HOSTS_KEY));
         self.run(
             cx,
-            |_, settings| -> Result<MapSettingsData, String> {
-                Ok(MapSettingsData {
-                    tile_url: settings.get(TILE_URL_KEY)?,
-                    consent: HostConsent::parse(settings.get(TILE_HOSTS_KEY)?.as_deref()),
-                })
+            move |app, _| {
+                with_catalog_identified(app, |c| Ok((c.get_setting(&url_key)?, c.get_setting(&hosts_key)?)))
             },
-            |s, result, _| match result {
-                Ok(data) => s.apply_settings(data),
+            |s, result, cx| match result {
+                Ok((from, (tile_url, legacy))) => {
+                    s.settings_from = Some(from);
+                    s.apply_settings(MapSettingsData { tile_url });
+                    s.migrate_consent(from, legacy.as_deref(), cx);
+                }
                 Err(e) => eprintln!("map: settings unavailable: {e}"),
             },
         );
@@ -365,25 +381,47 @@ impl MapState {
         self.stored = Some(data);
     }
 
-    /// Remember the answer for `host` (the consent prompt, or Preferences).
-    pub fn set_consent(&mut self, host: &str, allowed: Option<bool>, cx: &mut Context<Self>) {
-        let Some(stored) = self.stored.as_mut() else { return };
-        match allowed {
-            Some(a) => stored.consent.set(host, a),
-            None => stored.consent.forget(host),
+    /// The first read of a catalog that still holds per-catalog answers (`map.tileHosts`,
+    /// from before they moved to this machine's preferences): fold them into the machine's
+    /// ([`HostConsent::merge_legacy`]: only allowed/denied entries; denied wins), then empty
+    /// the catalog's copy — in the catalog it was read from — so it is merged once, and a
+    /// later change in Preferences is not undone by the next read.
+    fn migrate_consent(&mut self, from: CatalogIdentity, legacy: Option<&str>, cx: &mut Context<Self>) {
+        let legacy = HostConsent::parse(legacy);
+        if legacy.is_empty() {
+            return;
         }
-        let json = stored.consent.to_json();
-        cx.notify();
-        self.run(cx, move |_, settings| settings.set(TILE_HOSTS_KEY, &json), |_, r, _| {
+        if self.consent.merge_legacy(&legacy) {
+            MachinePrefs::set(cx, MACHINE_TILE_HOSTS, &self.consent.to_json());
+        }
+        let key = self.settings.key(TILE_HOSTS_KEY);
+        self.run(cx, move |app, _| with_catalog_as(app, from, |c| c.set_setting(&key, "{}")), |_, r, _| {
             if let Err(e) = r {
-                eprintln!("map: could not save the tile consent: {e}");
+                eprintln!("map: could not empty the catalog's old tile answers: {e}");
             }
         });
     }
 
-    /// Save a tile URL (empty = the default). Refused with the reason when unusable.
+    /// Every host's answer on this machine (Preferences shows and edits them).
+    pub fn host_consent(&self) -> &HostConsent {
+        &self.consent
+    }
+
+    /// Remember the answer for `host` on this machine (the consent prompt, or Preferences).
+    pub fn set_consent(&mut self, host: &str, allowed: Option<bool>, cx: &mut Context<Self>) {
+        match allowed {
+            Some(a) => self.consent.set(host, a),
+            None => self.consent.forget(host),
+        }
+        MachinePrefs::set(cx, MACHINE_TILE_HOSTS, &self.consent.to_json());
+        cx.notify();
+    }
+
+    /// Save a tile URL (empty = the default) in the catalog the settings were read from.
+    /// Refused with the reason when unusable, or while that catalog's settings are unread.
     pub fn set_tile_url(&mut self, url: &str, cx: &mut Context<Self>) -> Result<(), String> {
         let source = TileSource::parse(url)?;
+        let from = self.settings_from.ok_or("The catalog's map settings are still loading; try again.")?;
         let stored = source.template().to_string();
         self.source = source;
         self.source_error = None;
@@ -391,7 +429,8 @@ impl MapState {
             s.tile_url = Some(stored.clone());
         }
         cx.notify();
-        self.run(cx, move |_, settings| settings.set(TILE_URL_KEY, &stored), |_, r, _| {
+        let key = self.settings.key(TILE_URL_KEY);
+        self.run(cx, move |app, _| with_catalog_as(app, from, |c| c.set_setting(&key, &stored)), |_, r, _| {
             if let Err(e) = r {
                 eprintln!("map: could not save the tile URL: {e}");
             }

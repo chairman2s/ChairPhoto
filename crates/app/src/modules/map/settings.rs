@@ -2,8 +2,9 @@
 //! "Geocode" panel (`GeocodePanelContent`).
 //!
 //! **Settings:** the tile URL (Save / Reset to default; an unusable template is refused with
-//! the reason), the attribution note, the per-host tile answers (allow, block, forget — the
-//! "change it in Preferences" half of decision #118), and "Geocode all with GPS" with its
+//! the reason), the attribution note, this machine's per-host tile answers (allow, block,
+//! forget — the "change it in Preferences" half of decision #118; the panel is the Map tab
+//! of Preferences), and "Geocode all with GPS" with its
 //! progress and Cancel. **Geocode panel:** fills the active photo's empty IPTC location fields.
 //!
 //! Both reverse-geocoding actions are user-initiated, as in React; that click is their
@@ -61,8 +62,7 @@ impl Render for MapSettings {
         let s = self.state.read(cx);
         let template = s.source.template().to_string();
         let known = s.settings_known();
-        let hosts: Vec<(String, bool)> =
-            s.stored.as_ref().map(|d| d.consent.hosts().map(|(h, a)| (h.to_string(), a)).collect()).unwrap_or_default();
+        let hosts: Vec<(String, bool)> = s.host_consent().hosts().map(|(h, a)| (h.to_string(), a)).collect();
         let geocode = s.geocode.clone();
         if known && self.shown.as_deref() != Some(template.as_str()) {
             self.shown = Some(template.clone());
@@ -101,7 +101,8 @@ impl Render for MapSettings {
                 ),
                 colors,
             ))
-            .child(ui::label("Tile servers", colors));
+            .child(ui::label("Tile servers", colors))
+            .child(ui::sub("Answers are remembered on this computer, for every catalog.", colors));
         if hosts.is_empty() {
             body = body.child(ui::sub("No tile server has been allowed or blocked yet.", colors));
         }

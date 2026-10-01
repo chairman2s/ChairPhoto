@@ -642,3 +642,7 @@ fn reads_started_before_a_catalog_switch_are_dropped(cx: &mut TestAppContext) {
         assert!(s.lists.facets.is_empty(), "the old catalog's lists landed after the switch");
     });
 }
+
+// Storage and import (#114).
+#[path = "storage_tests.rs"]
+mod storage_tests;

@@ -74,6 +74,19 @@ impl Runner {
         }
     }
 
+    /// Manual runner: run what is queued right now **newest first** — the order a pool of
+    /// workers may pick tasks up in — and nothing those queue. Returns how many ran.
+    #[cfg(test)]
+    pub fn run_pending_reversed(&self) -> usize {
+        let Some(queue) = &self.manual else { return 0 };
+        let batch: Vec<Work> = queue.lock().unwrap().drain(..).collect();
+        let ran = batch.len();
+        for work in batch.into_iter().rev() {
+            work();
+        }
+        ran
+    }
+
     /// Manual runner: how many items wait.
     pub fn pending(&self) -> usize {
         self.manual.as_ref().map_or(0, |q| q.lock().unwrap().len())

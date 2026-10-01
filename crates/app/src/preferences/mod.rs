@@ -24,7 +24,9 @@
 //! reaches the section through a weak handle, only while the catalog it was started against
 //! is still open: a `catalog:switched` (or a re-root, which reopens the catalog) rebuilds the
 //! open tab's sections, so a result from before it finds its section gone and is dropped
-//! ([`Ctx::live`] checks the epoch and the identity too).
+//! ([`Ctx::live`] checks the epoch and the identity too). Catalog-setting writes persist in
+//! the order they were made, whatever order the Runner runs them in, and only the newest
+//! write of a key reports back to the section ([`Ctx::write_setting`]).
 //!
 //! **Catalog identity.** A tab is built bound to the catalog the model last read
 //! ([`AppModel::catalog_identity`]); its work gets a [`Scope`] whose catalog access goes
@@ -51,6 +53,8 @@ use crate::storage::volumes::VolumesPanel;
 use crate::storage::{CloseDialog, Runner};
 use crate::view::RootView;
 use chairphoto_core::app::{with_catalog_as, AppState, CatalogIdentity};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use gpui_kit::component::WindowExt as _;
 use gpui_kit::prelude::*;
 use gpui_kit::TestSupportExt as _;
@@ -135,6 +139,20 @@ impl Scope {
     }
 }
 
+/// The order of the catalog-setting writes Preferences makes ([`Ctx::write_setting`]). A GPUI
+/// global, so the order holds across a tab's rebuild and the dialog's reopening.
+#[derive(Default)]
+pub struct SettingWrites {
+    /// The last write number handed out. UI thread only.
+    seq: u64,
+    /// Per key, the newest write made. UI thread only.
+    issued: HashMap<String, u64>,
+    /// Per key, the newest write persisted. Workers only, under the catalog lock.
+    persisted: Arc<Mutex<HashMap<String, u64>>>,
+}
+
+impl Global for SettingWrites {}
+
 impl Ctx {
     /// Still the catalog the section was built for.
     pub fn live(&self, cx: &App) -> bool {
@@ -194,6 +212,56 @@ impl Ctx {
             .ok();
         })
         .detach();
+    }
+
+    /// Persist the catalog setting `key = value` on the [`Runner`], **in the order the writes
+    /// were made**, then run `after` on the same worker, and hand `apply` the outcome with the
+    /// value stored for `key` once the write ran — so the section shows what persisted.
+    ///
+    /// Each write is an independent Runner task, and those run in any order, so two quick
+    /// changes of one setting (off → on) could otherwise persist as on → off while the UI shows
+    /// on. Every write takes a number from [`SettingWrites`] as it is made; the worker writes
+    /// only if no later write of `key` has been persisted yet (checked and recorded under the
+    /// catalog lock the write holds, so two writers cannot interleave), else it leaves the
+    /// newer value in place. `apply` runs only for the newest write made of `key`: an older
+    /// one's completion would show a value the user has already changed.
+    pub fn write_setting<V: 'static, R: Send + 'static>(
+        &self,
+        cx: &mut Context<V>,
+        key: impl Into<String>,
+        value: String,
+        after: impl FnOnce(&Scope) -> Result<R, String> + Send + 'static,
+        apply: impl FnOnce(&mut V, Result<(Option<String>, R), String>, &mut Context<V>) + 'static,
+    ) {
+        let key: String = key.into();
+        let writes = cx.default_global::<SettingWrites>();
+        writes.seq += 1;
+        let seq = writes.seq;
+        writes.issued.insert(key.clone(), seq);
+        let persisted = writes.persisted.clone();
+        let k = key.clone();
+        self.run(
+            cx,
+            move |scope| {
+                let stored = scope.catalog(|c| {
+                    // A leaf under the catalog lock: nothing else is taken while it is held.
+                    let mut persisted = persisted.lock().unwrap_or_else(|e| e.into_inner());
+                    let last = persisted.entry(k.clone()).or_default();
+                    if seq > *last {
+                        c.set_setting(&k, &value)?;
+                        *last = seq;
+                    }
+                    c.get_setting(&k)
+                })?;
+                Ok((stored, after(scope)?))
+            },
+            move |view, result, cx| {
+                let newest = cx.try_global::<SettingWrites>().and_then(|w| w.issued.get(&key).copied());
+                if newest == Some(seq) {
+                    apply(view, result, cx);
+                }
+            },
+        );
     }
 
     /// Something catalog-derived changed (React's `onLibraryRootChanged` → `refresh()`): the

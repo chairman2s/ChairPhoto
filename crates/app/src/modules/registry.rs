@@ -789,9 +789,16 @@ impl ModuleRegistry {
     /// disable and re-enable — its own module. A view whose module instance is no longer the
     /// one it was built for is neither cached nor returned (`None`): it would outlive the
     /// unload, and a re-enabled module would get the old instance's view back.
+    ///
+    /// `built_for` is the module's generation read **with** the factory (in the same snapshot):
+    /// a caller that snapshots several factories and runs them in turn may find an earlier one
+    /// reloaded the module, and the later factories then belong to the old instance — they are
+    /// not run at all (Codex re-check of 0331450).
+    #[allow(clippy::too_many_arguments)]
     fn cached_view(
         this: &Entity<Self>,
         module: &SharedString,
+        built_for: u64,
         kind: &'static str,
         id: &SharedString,
         factory: &ViewFactory,
@@ -799,13 +806,15 @@ impl ModuleRegistry {
         cx: &mut App,
     ) -> Option<AnyView> {
         let key = ViewKey { window: window.window_handle().window_id(), module: module.clone(), kind, id: id.clone() };
-        let built_for = {
+        {
             let r = this.read(cx);
+            if r.live_generation(module) != Some(built_for) {
+                return None; // this factory's instance is gone
+            }
             if let Some(view) = r.views.get(&key) {
                 return Some(view.clone());
             }
-            r.live_generation(module)?
-        };
+        }
         let view = factory(window, cx);
         this.update(cx, |r, _| {
             if r.live_generation(module) != Some(built_for) {
@@ -818,11 +827,15 @@ impl ModuleRegistry {
 
     /// The views of the enabled modules' panels at `slot`, in registration order.
     pub fn panel_views(this: &Entity<Self>, slot: PanelSlot, window: &mut Window, cx: &mut App) -> Vec<SlotView> {
-        let panels = this.read(cx).panels(slot);
+        let panels: Vec<_> = {
+            let r = this.read(cx);
+            r.panels(slot).into_iter().filter_map(|(m, p)| r.live_generation(&m).map(|g| (m, g, p))).collect()
+        };
         panels
             .into_iter()
-            .filter_map(|(module_id, p)| {
-                let view = Self::cached_view(this, &module_id, slot.name(), &p.id, &p.view, window, cx)?;
+            .filter_map(|(module_id, generation, p)| {
+                let view =
+                    Self::cached_view(this, &module_id, generation, slot.name(), &p.id, &p.view, window, cx)?;
                 Some(SlotView { module_id, id: p.id, label: p.label, view })
             })
             .collect()
@@ -830,15 +843,27 @@ impl ModuleRegistry {
 
     /// The view of main view `view_id`, if an enabled module contributes it.
     pub fn main_view(this: &Entity<Self>, view_id: &str, window: &mut Window, cx: &mut App) -> Option<SlotView> {
-        let (module_id, v) = this.read(cx).main_views().into_iter().find(|(_, v)| v.id.as_ref() == view_id)?;
-        let view = Self::cached_view(this, &module_id, "main-view", &v.id, &v.view, window, cx)?;
+        let (module_id, generation, v) = {
+            let r = this.read(cx);
+            let (m, v) = r.main_views().into_iter().find(|(_, v)| v.id.as_ref() == view_id)?;
+            let g = r.live_generation(&m)?;
+            (m, g, v)
+        };
+        let view = Self::cached_view(this, &module_id, generation, "main-view", &v.id, &v.view, window, cx)?;
         Some(SlotView { module_id, id: v.id, label: v.label, view })
     }
 
     /// The views of one enabled module's settings panels.
     pub fn settings_views(this: &Entity<Self>, module_id: &SharedString, window: &mut Window, cx: &mut App) -> Vec<AnyView> {
-        let panels = this.read(cx).settings_panels(module_id);
-        panels.iter().filter_map(|p| Self::cached_view(this, module_id, "settings", &p.id, &p.view, window, cx)).collect()
+        let (generation, panels) = {
+            let r = this.read(cx);
+            let Some(g) = r.live_generation(module_id) else { return Vec::new() };
+            (g, r.settings_panels(module_id))
+        };
+        panels
+            .iter()
+            .filter_map(|p| Self::cached_view(this, module_id, generation, "settings", &p.id, &p.view, window, cx))
+            .collect()
     }
 
     /// Fresh views of every enabled publish target, for a Publish dialog that is opening.

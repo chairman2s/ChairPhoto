@@ -888,12 +888,15 @@ struct FactoryToggler {
     reload: bool,
     registry: Rc<RefCell<Option<Entity<ModuleRegistry>>>>,
     built: Rc<RefCell<usize>>,
+    /// A second inspector panel, after the toggling one; counts the views it builds.
+    second: Option<Rc<RefCell<usize>>>,
 }
 
 struct FactoryTogglerInstance {
     reload: bool,
     registry: Rc<RefCell<Option<Entity<ModuleRegistry>>>>,
     built: Rc<RefCell<usize>>,
+    second: Option<Rc<RefCell<usize>>>,
 }
 
 impl Module for FactoryToggler {
@@ -902,15 +905,29 @@ impl Module for FactoryToggler {
     }
 
     fn load(&self, _: ModuleHost, _: &mut App) -> Result<Box<dyn ModuleInstance>, String> {
-        Ok(Box::new(FactoryTogglerInstance { reload: self.reload, registry: self.registry.clone(), built: self.built.clone() }))
+        Ok(Box::new(FactoryTogglerInstance {
+            reload: self.reload,
+            registry: self.registry.clone(),
+            built: self.built.clone(),
+            second: self.second.clone(),
+        }))
     }
 }
 
 impl ModuleInstance for FactoryTogglerInstance {
     fn contributions(&self) -> Contributions {
         let (reload, registry, built) = (self.reload, self.registry.clone(), self.built.clone());
+        let second = self.second.clone().map(|count| Panel {
+            id: "toggler-panel-2".into(),
+            label: "Toggler 2".into(),
+            slot: PanelSlot::Inspector,
+            view: Rc::new(move |_, cx| {
+                *count.borrow_mut() += 1;
+                cx.new(|_| Empty).into()
+            }),
+        });
         Contributions {
-            panels: vec![Panel {
+            panels: [Panel {
                 id: "toggler-panel".into(),
                 label: "Toggler".into(),
                 slot: PanelSlot::Inspector,
@@ -925,7 +942,10 @@ impl ModuleInstance for FactoryTogglerInstance {
                     }
                     cx.new(|_| Empty).into()
                 }),
-            }],
+            }]
+            .into_iter()
+            .chain(second)
+            .collect(),
             ..Default::default()
         }
     }
@@ -940,7 +960,12 @@ fn a_view_built_while_its_module_went_away_is_not_cached(cx: &mut TestAppContext
         let dir = TempDir::new("factory");
         let slot: Rc<RefCell<Option<Entity<ModuleRegistry>>>> = Rc::default();
         let built = Rc::new(RefCell::new(0));
-        let b = bench(vec![Rc::new(FactoryToggler { reload, registry: slot.clone(), built: built.clone() })], &[], &dir, cx);
+        let b = bench(
+            vec![Rc::new(FactoryToggler { reload, registry: slot.clone(), built: built.clone(), second: None })],
+            &[],
+            &dir,
+            cx,
+        );
         *slot.borrow_mut() = Some(b.registry.clone());
         b.enable("toggler", cx);
         let window: AnyWindowHandle = cx.update(|cx| cx.open_window(Default::default(), |_, cx| cx.new(|_| Empty)).unwrap()).into();
@@ -961,6 +986,36 @@ fn a_view_built_while_its_module_went_away_is_not_cached(cx: &mut TestAppContext
             assert_eq!(views(cx)[0].view.entity_id(), again[0].view.entity_id(), "which is cached");
         }
     }
+}
+
+
+/// Codex's re-check of 0331450: with two panels, the first factory reloads the module while
+/// `panel_views` still holds the old instance's second factory. That factory is not run, and
+/// no view of the old instance is cached or shown; the next pass builds both afresh.
+#[gpui_kit::test]
+fn a_later_factory_of_a_reloaded_module_is_not_run_for_the_new_instance(cx: &mut TestAppContext) {
+    let dir = TempDir::new("factory2");
+    let slot: Rc<RefCell<Option<Entity<ModuleRegistry>>>> = Rc::default();
+    let (built, built2) = (Rc::new(RefCell::new(0)), Rc::new(RefCell::new(0)));
+    let toggler =
+        FactoryToggler { reload: true, registry: slot.clone(), built: built.clone(), second: Some(built2.clone()) };
+    let b = bench(vec![Rc::new(toggler)], &[], &dir, cx);
+    *slot.borrow_mut() = Some(b.registry.clone());
+    b.enable("toggler", cx);
+    let window: AnyWindowHandle = cx.update(|cx| cx.open_window(Default::default(), |_, cx| cx.new(|_| Empty)).unwrap()).into();
+    let views = |cx: &mut TestAppContext| {
+        let registry = b.registry.clone();
+        cx.update_window(window, |_, window, cx| ModuleRegistry::panel_views(&registry, PanelSlot::Inspector, window, cx))
+            .unwrap()
+    };
+    let first = views(cx);
+    cx.run_until_parked();
+    assert!(first.is_empty(), "an old instance's view was shown: {} views", first.len());
+    assert_eq!(*built2.borrow(), 0, "the old instance's second factory ran after the reload");
+    assert_eq!(b.registry.read_with(cx, |r, _| r.cached_view_count()), 0, "an old instance's view was cached");
+    let again = views(cx);
+    assert_eq!(again.len(), 2);
+    assert_eq!((*built.borrow(), *built2.borrow()), (2, 1), "both views of the new instance are fresh");
 }
 
 // --- the shell's slots, with the dev module -------------------------------------------------

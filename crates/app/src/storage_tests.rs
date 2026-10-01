@@ -420,6 +420,71 @@ fn a_drain_from_before_a_switch_does_not_block_the_new_catalogs_drain(cx: &mut T
     app.wired.storage.read_with(cx, |s, _| assert_eq!(s.reconciling, None, "both drains ended"));
 }
 
+/// **Forced interleaving.** The bench's Back up on catalog A's selection, with the core
+/// switched to B whose photos carry the same ids: before `catalog:switched` arrives (the UI
+/// still shows A's selection when Back up is pressed) and with the job queued before the
+/// switch and the event delivered before it runs. B's photos are never queued for backup.
+fn back_up_across_a_switch(delivered: bool, cx: &mut TestAppContext) {
+    let dir = TempDir::new("backup-switch");
+    let app = start(cx);
+    let ids = open_catalog_with_photos(&app, &dir, 2, cx);
+    work(cx);
+    app.wired.shell.update(cx, |s, cx| {
+        s.library.select_all();
+        cx.notify();
+    });
+    let targets = app.wired.shell.read_with(cx, |s, _| s.library.selection().targets.clone());
+    assert_eq!(targets, ids, "A's photos are selected");
+    let (b, b_ids) = colliding_catalog(&dir, "b", 2);
+    assert_eq!(b_ids, ids, "the ids collide, as real catalogs' do");
+    if delivered {
+        dispatch(&app, crate::shell::actions::BackUpSelection, cx);
+        core_switch(&app, b);
+        deliver_switch(&app, cx);
+    } else {
+        core_switch(&app, b);
+        dispatch(&app, crate::shell::actions::BackUpSelection, cx);
+    }
+    work(cx);
+    let pending = chairphoto_core::app::with_catalog(&app.state, |c| c.list_pending_operations()).unwrap();
+    assert!(pending.is_empty(), "delivered={delivered}: B's photos were queued for backup: {pending:?}");
+    if !delivered {
+        assert_eq!(status(&app, cx), format!("Back up failed: {}", chairphoto_core::app::CATALOG_CHANGED));
+    }
+}
+
+#[gpui_kit::test]
+fn back_up_never_queues_the_new_catalogs_photos_before_the_switch_event(cx: &mut TestAppContext) {
+    back_up_across_a_switch(false, cx);
+}
+
+#[gpui_kit::test]
+fn back_up_never_queues_the_new_catalogs_photos_after_the_switch_event(cx: &mut TestAppContext) {
+    back_up_across_a_switch(true, cx);
+}
+
+/// The bench's Back up on A's selection queues A's photos (the binding does not refuse the
+/// catalog the ids came from).
+#[gpui_kit::test]
+fn back_up_queues_the_selection(cx: &mut TestAppContext) {
+    let dir = TempDir::new("backup");
+    let app = start(cx);
+    let ids = open_catalog_with_photos(&app, &dir, 2, cx);
+    work(cx);
+    app.wired.shell.update(cx, |s, cx| {
+        s.library.select_all();
+        cx.notify();
+    });
+    dispatch(&app, crate::shell::actions::BackUpSelection, cx);
+    assert_eq!(work_once(cx), 1, "the queueing ran");
+    cx.run_until_parked();
+    let pending = chairphoto_core::app::with_catalog(&app.state, |c| c.list_pending_operations()).unwrap();
+    let mut queued: Vec<i64> = pending.iter().map(|op| op.photo_id).collect();
+    queued.sort();
+    assert_eq!(queued, ids);
+    assert_eq!(status(&app, cx), "Queued 2 for backup");
+}
+
 // --- trash --------------------------------------------------------------------------------
 
 /// Two trashed photos whose files exist; returns their ids.

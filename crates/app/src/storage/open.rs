@@ -99,9 +99,13 @@ impl RootView {
         self.show_dialog_with("Trash", 760., view.clone(), StorageDialog::Trash(view), Some(cancel), window, cx);
     }
 
-    /// The bench's Back up: the selection's targets.
+    /// The bench's Back up: the selection's targets, bound to the catalog the rows (and so
+    /// the selection's ids) were read from.
     pub(crate) fn back_up_selection(&mut self, cx: &mut Context<Self>) {
-        let targets = self.shell.read(cx).library.selection().targets.clone();
-        self.storage.update(cx, |s, cx| s.back_up(targets, cx));
+        let (targets, from) = {
+            let shell = self.shell.read(cx);
+            (shell.library.selection().targets.clone(), shell.rows_from())
+        };
+        self.storage.update(cx, |s, cx| s.back_up(targets, from, cx));
     }
 }

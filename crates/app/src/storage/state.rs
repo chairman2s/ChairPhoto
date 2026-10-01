@@ -19,7 +19,7 @@
 use super::runner::Runner;
 use crate::model::{AppModel, AppModelEvent};
 use crate::shell::ShellState;
-use chairphoto_core::app::{scans, storage, AppState, CoreEvent, IdentityRepairDone};
+use chairphoto_core::app::{scans, storage, AppState, CatalogIdentity, CoreEvent, IdentityRepairDone};
 use chairphoto_core::bundle::importer::BundleImportResult;
 use chairphoto_core::catalog::IdentityRepairSummary;
 use chairphoto_core::scanner::ScanResult;
@@ -406,16 +406,22 @@ impl StorageState {
 
     /// The bench's Back up: queue a backup for each target and drain now (React's
     /// `enqueueOperations` + reconcile). Queued, not copied here: an offline NAS keeps them
-    /// for the next drain.
-    pub fn back_up(&mut self, photo_ids: Vec<i64>, cx: &mut Context<Self>) {
+    /// for the next drain. `from` is the catalog the ids were read from (the Library's
+    /// `rows_from`): the queueing fails closed with `CATALOG_CHANGED` once another catalog is
+    /// open, so the old ids never queue the new catalog's same-numbered photos.
+    pub fn back_up(&mut self, photo_ids: Vec<i64>, from: Option<CatalogIdentity>, cx: &mut Context<Self>) {
         if photo_ids.is_empty() {
             self.status("Select photos to back up.".into(), cx);
             return;
         }
+        let Some(from) = from else {
+            self.status("The photos are still loading; try again.".into(), cx);
+            return;
+        };
         let state = self.app.clone();
         let epoch = self.epoch;
         let rx = Runner::get(cx).run(move || {
-            chairphoto_core::app::with_catalog(&state, |c| c.enqueue_operations("backup", &photo_ids))
+            chairphoto_core::app::with_catalog_as(&state, from, |c| c.enqueue_operations("backup", &photo_ids))
         });
         cx.spawn(async move |this, cx| {
             let Ok(result) = rx.await else { return };

@@ -95,7 +95,10 @@ and `{s}` is never used (dropped on OSM's host, `a` elsewhere). Every request ca
 `max(max-age, 7 days)`, then revalidated with `If-None-Match`/`If-Modified-Since`; a stale
 tile is shown when revalidation fails. Only the tiles intersecting the view load, at most
 four requests at a time, and a load that leaves the view before its request starts is
-cancelled. The attribution is always on the status bar while tiles show.
+cancelled. Decoded tiles are GPU textures in a least-recently-used set of 256; a tile on
+screen is never evicted, so a 4K canvas showing ~300 tiles holds them all rather than
+reloading its own tiles in a loop. The attribution is always on the status bar while tiles
+show.
 
 **Measuring.** `CHAIRPHOTO_MAP_TIMING=1` logs the map's render and paint CPU time per frame
 (p50/p95/max every 120 frames); `cargo run --release -p chairphoto-app --example map_bench`

@@ -16,9 +16,11 @@
 //!   pending under the generation it was asked with. A source change, a consent change, a
 //!   catalog switch ([`TileLayer::clear`]) or the view closing (the channel is gone) makes
 //!   every outstanding result stale.
-//! - **Bounded GPU memory.** At most [`TILE_BUDGET`] decoded tiles are held (LRU); an evicted
-//!   or cleared tile is released from every window's sprite atlas with `drop_image`
-//!   (deferred: it may be evicted inside a render).
+//! - **Bounded GPU memory.** At most [`TILE_BUDGET`] decoded tiles are held (LRU) — or the
+//!   visible set, when that is larger: a tile the view shows now is **pinned** and never
+//!   evicted, so a 4K canvas near a half zoom (≈ 300 visible tiles) does not evict and reload
+//!   its own tiles in a loop. An evicted or cleared tile is released from every window's
+//!   sprite atlas with `drop_image` (deferred: it may be evicted inside a render).
 
 use chairphoto_core::plugins::map::tiles::fetch::TileFetcher;
 use chairphoto_core::plugins::map::tiles::{TileKey, TileSource};
@@ -27,8 +29,10 @@ use gpui_kit::{App, Global, RenderImage};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
-/// Decoded tiles held: 256 × 256 × 4 bytes each, so about 64 MiB of textures — a 4K
-/// viewport at the smallest tile scale shows about 250.
+/// Decoded tiles held beyond the visible set: 256 × 256 × 4 bytes each, so about 64 MiB of
+/// textures. A 4K viewport just above a half zoom (the next zoom's tiles drawn at ≈ 0.7×) shows about 300,
+/// more than this: visible tiles are pinned ([`TileLayer::want`]), so the layer then holds
+/// exactly the visible set until the view shrinks or zooms.
 pub const TILE_BUDGET: usize = 256;
 
 /// Answers one tile load: the texture, or why not.
@@ -145,6 +149,8 @@ pub struct TileLayer {
     order: BTreeMap<u64, TileKey>,
     tick: u64,
     pending: HashMap<TileKey, (u64, Box<dyn TileTicket>)>,
+    /// The keys of the last [`want`](Self::want): pinned, never evicted.
+    visible: HashSet<TileKey>,
     failed: HashSet<TileKey>,
     last_error: Option<String>,
     generation: u64,
@@ -164,6 +170,7 @@ impl TileLayer {
             order: BTreeMap::new(),
             tick: 0,
             pending: HashMap::new(),
+            visible: HashSet::new(),
             failed: HashSet::new(),
             last_error: None,
             generation: 0,
@@ -215,6 +222,7 @@ impl TileLayer {
         }
         self.failed.clear();
         self.last_error = None;
+        self.visible.clear();
         self.order.clear();
         let gone: Vec<Arc<RenderImage>> = self.held.drain().map(|(_, (img, _))| img).collect();
         self.stats.released += gone.len() as u64;
@@ -222,10 +230,12 @@ impl TileLayer {
     }
 
     /// The tiles the view shows now, most urgent first: cancel pending loads not among
-    /// them, then load the missing ones. Nothing without a source.
+    /// them, then load the missing ones. Nothing without a source. These keys stay pinned
+    /// (never evicted) until the next call.
     pub fn want(&mut self, keys: &[TileKey]) {
         let Some(source) = self.source.clone() else { return };
         let wanted: HashSet<TileKey> = keys.iter().copied().collect();
+        self.visible = wanted.clone();
         let gone: Vec<TileKey> = self.pending.keys().filter(|k| !wanted.contains(k)).copied().collect();
         for key in gone {
             if let Some((_, ticket)) = self.pending.remove(&key) {
@@ -280,7 +290,11 @@ impl TileLayer {
         }
         self.order.insert(self.tick, key);
         while self.held.len() > self.budget {
-            let Some((_, oldest)) = self.order.pop_first() else { break };
+            // The least recently used tile that is not on screen. None: everything held is
+            // visible, so the layer holds the visible set (bounded by the viewport) for now.
+            let victim = self.order.iter().find(|(_, k)| !self.visible.contains(k)).map(|(t, k)| (*t, *k));
+            let Some((used, oldest)) = victim else { break };
+            self.order.remove(&used);
             if let Some((img, _)) = self.held.remove(&oldest) {
                 gone.push(img);
             }
@@ -475,6 +489,38 @@ mod tests {
         assert!(l.get(&key(1)).is_none() && l.get(&key(0)).is_some());
         assert_eq!(l.clear().len(), 2);
         assert_eq!(l.stats.released, 3);
+    }
+
+    /// A 3840×2160 canvas just above a half zoom (tiles of the next zoom drawn at ≈ 0.7×) shows more tiles than [`TILE_BUDGET`]. Every
+    /// one of them stays held after loading, and asking for the same view again loads
+    /// nothing: no visible tile is evicted and re-requested (the review's reload loop).
+    #[test]
+    fn visible_tiles_beyond_the_budget_are_pinned_not_reloaded() {
+        use chairphoto_core::plugins::map::tiles::Viewport;
+        let vp = Viewport::new((48.85, 2.35), 10.51, 3840.0, 2160.0);
+        let keys: Vec<TileKey> = vp.visible_tiles().iter().map(|t| t.key).collect();
+        let unique: HashSet<TileKey> = keys.iter().copied().collect();
+        assert!(unique.len() > TILE_BUDGET, "{} visible tiles: the case needs more than the budget", unique.len());
+        let (mut l, fake, mut rx) = layer(TILE_BUDGET);
+        l.want(&keys);
+        fake.answer_all();
+        assert!(drain(&mut l, &mut rx).is_empty(), "nothing visible was released");
+        assert_eq!(l.held(), unique.len());
+        for _ in 0..3 {
+            l.want(&keys); // the view repaints
+            fake.answer_all();
+            drain(&mut l, &mut rx);
+        }
+        assert_eq!(fake.count(), unique.len(), "a visible tile was evicted and loaded again");
+        // Panning away: the old tiles are no longer pinned and the LRU trims back to budget.
+        let moved = Viewport::new((40.0, -74.0), 10.51, 3840.0, 2160.0);
+        let next: Vec<TileKey> = moved.visible_tiles().iter().map(|t| t.key).collect();
+        l.want(&next);
+        fake.answer_all();
+        let released = drain(&mut l, &mut rx);
+        let next_unique: HashSet<TileKey> = next.iter().copied().collect();
+        assert_eq!(l.held(), next_unique.len().max(TILE_BUDGET));
+        assert_eq!(released.len(), unique.len() + next_unique.len() - l.held());
     }
 
     #[test]

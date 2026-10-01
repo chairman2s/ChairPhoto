@@ -71,8 +71,10 @@ pub struct PaintCache {
     widths_scene: u64,
     lit: Option<(LitKey, Vec<(Path<Pixels>, Hsla)>)>,
     prepaint_took: Duration,
-    /// Prepaint + paint time of recent frames (the bench reads it).
+    /// Prepaint + paint time of recent frames, and when each was painted (the bench reads
+    /// both).
     pub timings: Vec<Duration>,
+    pub painted_at: Vec<Instant>,
 }
 
 impl PaintCache {
@@ -87,8 +89,10 @@ impl PaintCache {
     fn record(&mut self, d: Duration) {
         if self.timings.len() >= 4096 {
             self.timings.drain(..2048);
+            self.painted_at.drain(..2048);
         }
         self.timings.push(d);
+        self.painted_at.push(Instant::now());
     }
 }
 

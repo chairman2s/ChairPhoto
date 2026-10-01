@@ -34,6 +34,13 @@
 //!   (AGENTS.md § Performance). A preload that became the current photo is re-sent to move
 //!   it up; the re-send is an `unanswered` submission like any other, because the pool may
 //!   already have finished that job and start a fresh render for it.
+//! - **Claims** say who still wants a tier, so one view's release cannot take another's
+//!   images (#110: the inline loupe and the pop-out loupe navigate over the same store). A
+//!   view that navigates holds a [`ClaimId`] and replaces its claimed set on every step
+//!   ([`ImageStore::set_claim`]): what it held and holds no longer is released — unless
+//!   another claim holds it. [`ImageStore::release_pending`] and [`ImageStore::evict`] never
+//!   touch a claimed tier. Only a change of what the pixels are (an invalidate, a catalog
+//!   switch) drops claimed requests, and a switch empties every claim.
 //!
 //! The pool is behind [`Submit`] so tests can hold responders and deliver them in any order.
 
@@ -246,6 +253,11 @@ pub fn neighbour_window(len: usize, index: usize, ahead: usize, behind: usize) -
     out
 }
 
+/// `photos`' preload window around `index`, as `kind` requests, most urgent first.
+fn window_of(photos: &[i64], index: usize, kind: ImageKind, ahead: usize, behind: usize) -> Vec<(i64, ImageKind)> {
+    neighbour_window(photos.len(), index, ahead, behind).into_iter().map(|i| (photos[i], kind)).collect()
+}
+
 // --- the store ---------------------------------------------------------------------------
 
 /// What a view gets for one image.
@@ -286,6 +298,10 @@ struct Done {
     result: Result<Loaded, String>,
 }
 
+/// A view's hold on the tiers it wants ([`ImageStore::new_claim`]); see the module docs.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct ClaimId(u64);
+
 /// The app's image cache and request broker. One per app; views read it and request
 /// through it.
 pub struct ImageStore {
@@ -303,6 +319,9 @@ pub struct ImageStore {
     /// Bumped by [`clear`](Self::clear): photo ids from an older epoch are other photos.
     epoch: u64,
     generation: u64,
+    /// What each claim holds (see the module docs).
+    claims: HashMap<ClaimId, HashSet<(i64, ImageKind)>>,
+    next_claim: u64,
     done: UnboundedSender<Done>,
     stats: StoreStats,
     _drain: Task<()>,
@@ -330,6 +349,8 @@ impl ImageStore {
             deferred: HashSet::new(),
             epoch: 0,
             generation: 0,
+            claims: HashMap::new(),
+            next_claim: 0,
             done,
             stats: StoreStats::default(),
             _drain,
@@ -449,12 +470,65 @@ impl ImageStore {
         }
     }
 
-    /// Stop wanting every pending request `keep` rejects: each is cancelled in the pool if it
-    /// is still queued, and whatever it produces later is dropped by generation. A request
-    /// held back in `deferred` that `keep` rejects (judged under the photo's current version,
-    /// which is what it would be sent as) is forgotten, so it is not sent when the render it
-    /// waits for answers.
+    /// Stop wanting every pending request `keep` rejects and no claim holds: each is cancelled
+    /// in the pool if it is still queued, and whatever it produces later is dropped by
+    /// generation. A request held back in `deferred` that is released (judged under the
+    /// photo's current version, which is what it would be sent as) is forgotten, so it is not
+    /// sent when the render it waits for answers.
     pub fn release_pending(&mut self, mut keep: impl FnMut(&ImageKey) -> bool) {
+        let claimed = self.claimed_tiers(None);
+        self.drop_pending(|k| keep(k) || claimed.contains(&(k.photo, k.kind)));
+    }
+
+    /// A new, empty claim, for a view that navigates (see the module docs).
+    pub fn new_claim(&mut self) -> ClaimId {
+        self.next_claim += 1;
+        let id = ClaimId(self.next_claim);
+        self.claims.insert(id, HashSet::new());
+        id
+    }
+
+    /// What `owner` holds now.
+    pub fn claim(&self, owner: ClaimId) -> HashSet<(i64, ImageKind)> {
+        self.claims.get(&owner).cloned().unwrap_or_default()
+    }
+
+    /// Whether any claim holds `photo`'s `kind`.
+    pub fn is_claimed(&self, photo: i64, kind: ImageKind) -> bool {
+        self.claims.values().any(|held| held.contains(&(photo, kind)))
+    }
+
+    /// Every tier a claim other than `except` holds.
+    fn claimed_tiers(&self, except: Option<ClaimId>) -> HashSet<(i64, ImageKind)> {
+        self.claims
+            .iter()
+            .filter(|(id, _)| Some(**id) != except)
+            .flat_map(|(_, held)| held.iter().copied())
+            .collect()
+    }
+
+    /// Make `owner` hold exactly `wanted`. What it held and holds no longer is released if
+    /// pending — unless another claim holds it. Sends nothing.
+    pub fn set_claim(&mut self, owner: ClaimId, wanted: impl IntoIterator<Item = (i64, ImageKind)>) {
+        let wanted: HashSet<(i64, ImageKind)> = wanted.into_iter().collect();
+        let before = self.claims.insert(owner, wanted.clone()).unwrap_or_default();
+        let others = self.claimed_tiers(Some(owner));
+        let gone: HashSet<(i64, ImageKind)> =
+            before.into_iter().filter(|t| !wanted.contains(t) && !others.contains(t)).collect();
+        if !gone.is_empty() {
+            self.drop_pending(|k| !gone.contains(&(k.photo, k.kind)));
+        }
+    }
+
+    /// Give up `owner`'s claim for good, releasing what only it held.
+    pub fn drop_claim(&mut self, owner: ClaimId) {
+        self.set_claim(owner, []);
+        self.claims.remove(&owner);
+    }
+
+    /// [`release_pending`](Self::release_pending) whatever the claims hold: for what no claim
+    /// survives (a change of what the pixels are, a superseded claim).
+    fn drop_pending(&mut self, mut keep: impl FnMut(&ImageKey) -> bool) {
         let released: Vec<ImageKey> = self.pending.keys().filter(|k| !keep(k)).copied().collect();
         for key in released {
             self.pending.remove(&key);
@@ -475,22 +549,41 @@ impl ImageStore {
     /// [`navigate`](Self::navigate) over a wider window ([`neighbour_window`]): the current
     /// photo first, then N+1, N−1, then the rest ahead and behind — one batch, so the current
     /// photo is on top of the pool's stack. This tier's pending requests outside the window
-    /// are superseded.
+    /// are superseded, except those a claim holds.
     pub fn navigate_window(&mut self, photos: &[i64], index: usize, kind: ImageKind, ahead: usize, behind: usize) {
-        let wanted: Vec<(i64, ImageKind)> = neighbour_window(photos.len(), index, ahead, behind)
-            .into_iter()
-            .map(|i| (photos[i], kind))
-            .collect();
+        let wanted = window_of(photos, index, kind, ahead, behind);
         let keep: HashSet<i64> = wanted.iter().map(|&(p, _)| p).collect();
         self.release_pending(|k| k.kind != kind || keep.contains(&k.photo));
         self.submit(&wanted, true);
     }
 
-    /// Drop the cached images `matches` selects and release their textures. For what a view
-    /// is done with and the LRU would otherwise keep: a full-resolution tier (180–245 MB for a
-    /// typical RAW) costs hundreds of thumbnails while it waits for eviction.
-    pub fn evict(&mut self, matches: impl FnMut(&ImageKey) -> bool, cx: &mut Context<Self>) {
-        let gone = self.lru.remove_where(matches);
+    /// [`navigate_window`](Self::navigate_window) for the view holding `owner`: its claim
+    /// becomes the window plus `also` (tiers it may ask for later, such as the current
+    /// photo's full-resolution one). What it superseded is released only if no other claim
+    /// holds it, and what it wants is safe from other views' releases.
+    #[allow(clippy::too_many_arguments)]
+    pub fn navigate_window_as(
+        &mut self,
+        owner: ClaimId,
+        photos: &[i64],
+        index: usize,
+        kind: ImageKind,
+        ahead: usize,
+        behind: usize,
+        also: &[(i64, ImageKind)],
+    ) {
+        let wanted = window_of(photos, index, kind, ahead, behind);
+        self.set_claim(owner, wanted.iter().chain(also).copied());
+        self.submit(&wanted, true);
+    }
+
+    /// Drop the cached images `matches` selects and no claim holds, and release their
+    /// textures. For what a view is done with and the LRU would otherwise keep: a
+    /// full-resolution tier (180–245 MB for a typical RAW) costs hundreds of thumbnails while
+    /// it waits for eviction.
+    pub fn evict(&mut self, mut matches: impl FnMut(&ImageKey) -> bool, cx: &mut Context<Self>) {
+        let claimed = self.claimed_tiers(None);
+        let gone = self.lru.remove_where(|k| matches(k) && !claimed.contains(&(k.photo, k.kind)));
         if !gone.is_empty() {
             self.release(gone, cx);
             cx.notify();
@@ -512,6 +605,9 @@ impl ImageStore {
     pub fn clear(&mut self, cx: &mut Context<Self>) {
         self.epoch += 1;
         self.deferred.clear();
+        for held in self.claims.values_mut() {
+            held.clear();
+        }
         let gone = self.lru.remove_where(|_| true);
         self.release(gone, cx);
         self.abandon(|_| true);
@@ -524,7 +620,7 @@ impl ImageStore {
     /// cancelling the queued ones. A running one stays in `unanswered` under its old version
     /// or epoch, which holds back the next request for its tier.
     fn abandon(&mut self, mut matches: impl FnMut(&ImageKey) -> bool) {
-        self.release_pending(|k| !matches(k));
+        self.drop_pending(|k| !matches(k));
     }
 
     /// Whether `tier` has a submission not yet answered that rendered for another version of

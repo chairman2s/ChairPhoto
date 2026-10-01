@@ -7,8 +7,10 @@
 //!   camera preview (`edit` feature), with its hi-res render fetched on the first zoom-in.
 //! - **Navigation order.** When the target changes the image layer is asked for the target's
 //!   preview first, then N+1 and N−1, then N+2…N+5 and N−2 — one pool batch
-//!   (`ImageStore::navigate_window`), superseding the old window's queued requests. A zoom
-//!   tier wanted for the previous photo is released.
+//!   (`ImageStore::navigate_window_as`), superseding the old window's queued requests. A zoom
+//!   tier wanted for the previous photo is released. Each loupe holds its own claim on what
+//!   it navigated to, so it releases only what no other loupe still wants: the inline loupe
+//!   closing leaves the pop-out's preloads alone, and the other way round (#110).
 //! - **Stale frames.** The image shows only tiers keyed by the target's id (the image layer
 //!   drops answers for released keys, and clears on a catalog switch); while the target's
 //!   preview is on its way its own thumbnail stands in, never the previous photo.
@@ -19,7 +21,7 @@
 //! Keys ([`contexts::LOUPE`]): ←/→/↑/↓ step (Shift extends), Enter/Esc back to the grid, C
 //! Compare, and the culling keys, which mark the targets and advance as in the grid.
 
-use crate::image_store::ImageStore;
+use crate::image_store::{ClaimId, ImageStore};
 use crate::keymap::contexts;
 use crate::library::*;
 use crate::loupe::zoom::ZoomImage;
@@ -79,6 +81,9 @@ pub struct LoupeView {
     follow: Follow,
     /// The target the last navigation was for.
     navigated: Option<i64>,
+    /// This view's hold on the images it navigated to (`ImageStore::set_claim`): another
+    /// loupe over the same store — the inline one and the pop-out — keeps its own.
+    claim: ClaimId,
     #[cfg(feature = "edit")]
     renders: Entity<crate::loupe::edit_renders::EditRenders>,
     _observers: Vec<Subscription>,
@@ -114,6 +119,7 @@ impl LoupeView {
             observers.push(cx.observe(&zoom, |this, _, cx| this.sync_version(cx)));
             renders
         };
+        let claim = images.update(cx, |s, _| s.new_claim());
         let mut view = LoupeView {
             model,
             shell,
@@ -123,6 +129,7 @@ impl LoupeView {
             focus: cx.focus_handle(),
             follow,
             navigated: None,
+            claim,
             #[cfg(feature = "edit")]
             renders,
             _observers: observers,
@@ -156,27 +163,32 @@ impl LoupeView {
         if target != self.navigated {
             let left = std::mem::replace(&mut self.navigated, target);
             let rows = self.shell.read(cx).library.photo_ids();
+            let claim = self.claim;
             self.images.update(cx, |store, cx| {
-                if let Some(left) = left {
-                    store.evict(|k| k.kind == ImageKind::Zoom && k.photo == left, cx);
-                }
                 match target {
+                    // This view's claim becomes the new window and the target's zoom tier:
+                    // what it held before is released unless another view holds it too.
                     Some(id) => {
+                        let zoom = [(id, ImageKind::Zoom)];
                         match rows.iter().position(|&r| r == id) {
-                            Some(index) => store.navigate_window(
+                            Some(index) => store.navigate_window_as(
+                                claim,
                                 &rows,
                                 index,
                                 ImageKind::Preview,
                                 PRELOAD_AHEAD,
                                 PRELOAD_BEHIND,
+                                &zoom,
                             ),
                             // Off-grid (a stacked child): just this one.
-                            None => store.navigate_window(&[id], 0, ImageKind::Preview, 0, 0),
+                            None => store.navigate_window_as(claim, &[id], 0, ImageKind::Preview, 0, 0, &zoom),
                         }
-                        store.release_pending(|k| k.kind != ImageKind::Zoom || k.photo == id);
                     }
-                    // Closed: the grid's thumbnails come first again.
-                    None => store.release_pending(|k| k.kind == ImageKind::Thumb),
+                    // Closed: nothing of this view's is wanted any more.
+                    None => store.set_claim(claim, []),
+                }
+                if let Some(left) = left {
+                    store.evict(|k| k.kind == ImageKind::Zoom && k.photo == left, cx);
                 }
             });
         }

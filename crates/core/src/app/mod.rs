@@ -30,8 +30,8 @@ pub use boot::{boot, boot_with, Boot};
 // this module flat beside a command of the same name.
 pub use catalogs::{
     default_catalog_path, detach_catalog_and_trip_jobs, detach_catalog_and_trip_jobs_with,
-    load_recent_catalogs, open_default_catalog, publish_catalog_and_reset_jobs,
-    record_recent_catalog, spawn_detached_phase_b, EnrichJob, RecentCatalog,
+    load_recent_catalogs, load_recent_catalogs_in, open_default_catalog,
+    publish_catalog_and_reset_jobs, record_recent_catalog, record_recent_catalog_in, spawn_detached_phase_b, EnrichJob, RecentCatalog,
 };
 pub use events::*;
 

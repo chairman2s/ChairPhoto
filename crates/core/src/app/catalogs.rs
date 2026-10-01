@@ -196,6 +196,19 @@ pub fn switch_catalog(
     create: bool,
     name: Option<String>,
 ) -> Result<Option<EnrichJob>, String> {
+    switch_catalog_in(state, None, catalog_path, root, create, name)
+}
+
+/// [`switch_catalog`], recording into the recent-catalogs registry in `registry_dir`
+/// (`None`: the app data dir).
+pub fn switch_catalog_in(
+    state: &AppState,
+    registry_dir: Option<&Path>,
+    catalog_path: &Path,
+    root: &Path,
+    create: bool,
+    name: Option<String>,
+) -> Result<Option<EnrichJob>, String> {
     if create {
         if catalog_path.exists() {
             return Err(format!("Catalog file already exists: {}", catalog_path.display()));
@@ -224,7 +237,10 @@ pub fn switch_catalog(
     // A different catalog may have entirely different volumes — drop stale reachability.
     state.volume_health.invalidate();
     // Non-fatal if it fails.
-    let _ = record_recent_catalog(&catalog_name, catalog_path, &actual_root);
+    let _ = match registry_dir {
+        Some(dir) => record_recent_catalog_in(dir, &catalog_name, catalog_path, &actual_root),
+        None => record_recent_catalog(&catalog_name, catalog_path, &actual_root),
+    };
 
     state.send(CoreEvent::CatalogSwitched(catalog_path.to_string_lossy().to_string()));
 
@@ -334,9 +350,14 @@ pub struct RecentCatalog {
 
 /// Load the recent catalogs list from `app_data_dir()/recent_catalogs.json`.
 pub fn load_recent_catalogs() -> Result<Vec<RecentCatalog>, String> {
-    let app_data = app_data_dir()?;
-    std::fs::create_dir_all(&app_data).map_err(|e| e.to_string())?;
-    let path = app_data.join("recent_catalogs.json");
+    load_recent_catalogs_in(&app_data_dir()?)
+}
+
+/// [`load_recent_catalogs`] from the registry in `dir` — a front end's tests point this at a
+/// scratch directory rather than the user's app data.
+pub fn load_recent_catalogs_in(dir: &Path) -> Result<Vec<RecentCatalog>, String> {
+    std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    let path = dir.join("recent_catalogs.json");
 
     if !path.exists() {
         return Ok(Vec::new());
@@ -347,11 +368,10 @@ pub fn load_recent_catalogs() -> Result<Vec<RecentCatalog>, String> {
     Ok(catalogs)
 }
 
-/// Save the recent catalogs list to `app_data_dir()/recent_catalogs.json`.
-fn save_recent_catalogs(catalogs: &[RecentCatalog]) -> Result<(), String> {
-    let app_data = app_data_dir()?;
-    std::fs::create_dir_all(&app_data).map_err(|e| e.to_string())?;
-    let path = app_data.join("recent_catalogs.json");
+/// Save the recent catalogs list to `dir/recent_catalogs.json`.
+fn save_recent_catalogs_in(dir: &Path, catalogs: &[RecentCatalog]) -> Result<(), String> {
+    std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    let path = dir.join("recent_catalogs.json");
 
     let json = serde_json::to_string_pretty(catalogs).map_err(|e| e.to_string())?;
     std::fs::write(&path, json).map_err(|e| e.to_string())?;
@@ -361,12 +381,17 @@ fn save_recent_catalogs(catalogs: &[RecentCatalog]) -> Result<(), String> {
 /// Add a catalog to the recent catalogs list (or update its timestamp if already present).
 /// Keeps only the 20 most recent.
 pub fn record_recent_catalog(name: &str, catalog_path: &Path, root: &Path) -> Result<(), String> {
+    record_recent_catalog_in(&app_data_dir()?, name, catalog_path, root)
+}
+
+/// [`record_recent_catalog`] into the registry in `dir`.
+pub fn record_recent_catalog_in(dir: &Path, name: &str, catalog_path: &Path, root: &Path) -> Result<(), String> {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_err(|e| e.to_string())?
         .as_secs() as i64;
 
-    let mut catalogs = load_recent_catalogs()?;
+    let mut catalogs = load_recent_catalogs_in(dir)?;
     let catalog_path_str = catalog_path.to_string_lossy().to_string();
     let root_str = root.to_string_lossy().to_string();
 
@@ -384,7 +409,7 @@ pub fn record_recent_catalog(name: &str, catalog_path: &Path, root: &Path) -> Re
     // Keep only the 20 most recent.
     catalogs.truncate(20);
 
-    save_recent_catalogs(&catalogs)?;
+    save_recent_catalogs_in(dir, &catalogs)?;
     Ok(())
 }
 
@@ -528,5 +553,56 @@ mod catalog_registry_tests {
         // No file written — fresh install simulation.
         let list = load_recent_catalogs().unwrap();
         assert!(list.is_empty(), "no registry file → empty list");
+    }
+}
+
+#[cfg(test)]
+mod switch_tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+    use std::sync::Mutex;
+
+    #[derive(Default)]
+    struct Names(Mutex<Vec<String>>);
+    impl EventSink for Names {
+        fn send(&self, event: CoreEvent) {
+            self.0.lock().unwrap().push(event.name().to_string());
+        }
+    }
+
+    /// A rejected switch mutates nothing: the job generations stay live and the catalog open.
+    #[test]
+    fn a_switch_to_a_missing_catalog_leaves_everything_running() {
+        let dir = crate::test_support::TestTmpDir::new("switch-missing");
+        let state = AppState::default();
+        *state.catalog.lock().unwrap() = Some(Catalog::open(&dir.join("a.chairphoto"), &dir.join("a")).unwrap());
+        let import = state.jobs.import.install_fresh().unwrap();
+        let err = switch_catalog_in(&state, Some(&dir.join("reg")), &dir.join("nope.chairphoto"), &dir, false, None)
+            .err()
+            .unwrap();
+        assert!(err.starts_with("Catalog file does not exist"), "{err}");
+        assert!(!import.load(Ordering::Relaxed));
+        assert!(state.catalog.lock().unwrap().is_some());
+    }
+
+    /// Create: the new catalog is open, the old jobs are tripped, the registry in the given
+    /// directory records it, and `catalog:switched` goes out.
+    #[test]
+    fn a_switch_that_creates_records_and_announces_it() {
+        let dir = crate::test_support::TestTmpDir::new("switch-create");
+        let state = AppState::default();
+        let names = Arc::new(Names::default());
+        state.set_events(names.clone());
+        *state.catalog.lock().unwrap() = Some(Catalog::open(&dir.join("a.chairphoto"), &dir.join("a")).unwrap());
+        let import = state.jobs.import.install_fresh().unwrap();
+        let new_path = dir.join("b/B.chairphoto");
+        let resume =
+            switch_catalog_in(&state, Some(&dir.join("reg")), &new_path, &dir.join("b"), true, Some("B".into())).unwrap();
+        assert!(resume.is_none(), "a fresh catalog has nothing to enrich");
+        assert!(import.load(Ordering::Relaxed), "the old import was tripped");
+        assert_eq!(state.catalog.lock().unwrap().as_ref().unwrap().db_path(), new_path.as_path());
+        let recent = load_recent_catalogs_in(&dir.join("reg")).unwrap();
+        assert_eq!((recent.len(), recent[0].name.as_str()), (1, "B"));
+        assert_eq!(names.0.lock().unwrap().as_slice(), ["catalog:switched"]);
     }
 }

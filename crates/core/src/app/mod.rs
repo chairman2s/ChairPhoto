@@ -18,6 +18,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 mod boot;
 pub mod catalogs;
+pub mod editing;
 pub mod bundles;
 #[cfg(feature = "collage")]
 pub mod collage;

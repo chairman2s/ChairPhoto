@@ -32,6 +32,11 @@ required-features = ["map"]
 name = "tag_graph_bench"
 required-features = ["tag-graph"]
 
+# The Darkroom's drag-frame measurement path (#111); it needs the edit engine.
+[[example]]
+name = "darkroom_bench"
+required-features = ["edit"]
+
 [features]
 # The same names as the core's features, forwarded one by one (the Tauri shell does the same),
 # and the same default set as the Tauri shell's minus `module-fetch`, which gates a Tauri

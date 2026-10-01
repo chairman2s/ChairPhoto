@@ -30,6 +30,8 @@ actions!(
         ShowAllPhotos,
         /// The icon rail's Library item.
         ShowLibrary,
+        /// The icon rail's Develop: the Darkroom on the active photo (#111).
+        OpenDevelop,
         /// The bench's ✕: clear the selection.
         ClearSelection,
         /// More ⋯ → Preferences…, and the rail's gear: Preferences (#113), on its Storage tab.
@@ -114,8 +116,6 @@ macro_rules! not_yet_ported {
 not_yet_ported! {
     /// More ⋯ → Open loupe in a new window.
     PopOutLoupe => ("Open loupe in a new window", 110),
-    /// The icon rail's Develop.
-    OpenDevelop => ("Develop", 111),
     /// The loupe's "unavailable" state: Relocate… (a file picker; the grid context menu's
     /// commands are Storage and import's).
     RelocatePhoto => ("Relocate…", 114),

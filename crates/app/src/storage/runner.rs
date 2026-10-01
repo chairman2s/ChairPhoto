@@ -74,6 +74,23 @@ impl Runner {
         }
     }
 
+    /// Manual runner, tests: take everything queued so far out of the queue, to be put back
+    /// with [`release`](Self::release) — so work queued later runs first (a slow job that a
+    /// newer one overtakes). No-op for the core runtime.
+    #[cfg(test)]
+    pub fn hold_pending(&self) -> Vec<Work> {
+        self.manual.as_ref().map_or_else(Vec::new, |q| q.lock().unwrap().drain(..).collect())
+    }
+
+    /// Manual runner, tests: queue `held` work (from [`hold_pending`](Self::hold_pending))
+    /// again, after what is queued now.
+    #[cfg(test)]
+    pub fn release(&self, held: Vec<Work>) {
+        if let Some(q) = &self.manual {
+            q.lock().unwrap().extend(held);
+        }
+    }
+
     /// Manual runner: how many items wait.
     pub fn pending(&self) -> usize {
         self.manual.as_ref().map_or(0, |q| q.lock().unwrap().len())

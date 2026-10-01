@@ -108,6 +108,13 @@ pub struct RootView {
     catalog_epoch: u64,
     resize: Option<Resize>,
     _observers: [Subscription; 9],
+    /// Develop takes the keys when it opens (its arrows step the filmstrip) and hands them
+    /// back to the grid when the Library returns.
+    #[cfg(feature = "edit")]
+    _develop_focus: Subscription,
+    /// The Darkroom (#111): the stage on `Surface::Develop`.
+    #[cfg(feature = "edit")]
+    pub(crate) darkroom: Entity<crate::darkroom::DarkroomView>,
 }
 
 impl RootView {
@@ -141,6 +148,27 @@ impl RootView {
         });
         let compare = cx.new(|cx| CompareView::new(shell.clone(), images.clone(), cx));
         let catalog_epoch = model.read(cx).catalog_epoch;
+        #[cfg(feature = "edit")]
+        let darkroom = {
+            let pool: std::sync::Arc<dyn crate::image_store::Submit> = match model.read(cx).pool() {
+                Some(pool) => pool.clone(),
+                None => std::sync::Arc::new(crate::NoPool),
+            };
+            let state = cx.new(|cx| crate::darkroom::Darkroom::new(&model, shell.clone(), images.clone(), pool, cx));
+            cx.new(|cx| crate::darkroom::DarkroomView::new(state, window, cx))
+        };
+        #[cfg(feature = "edit")]
+        let _develop_focus = cx.observe_in(&shell, window, |this, shell, window, cx| {
+            let focus = this.darkroom.read(cx).focus_handle().clone();
+            match shell.read(cx).surface {
+                Surface::Develop if !focus.contains_focused(window, cx) => focus.focus(window, cx),
+                // Back in the Library: the grid takes the keys again.
+                Surface::Library if focus.contains_focused(window, cx) => {
+                    this.library.read(cx).focus_handle().clone().focus(window, cx)
+                }
+                _ => {}
+            }
+        });
         let _observers = [
             cx.observe_in(&model, window, |this, model, window, cx| {
                 // A catalog switch closes the dialog: its groups name the old catalog's photos.
@@ -233,9 +261,13 @@ impl RootView {
             compare,
             cull: None,
             stage_seen: StageView::Grid,
+            #[cfg(feature = "edit")]
+            darkroom,
             catalog_epoch,
             resize: None,
             _observers,
+            #[cfg(feature = "edit")]
+            _develop_focus,
         }
     }
 
@@ -405,10 +437,12 @@ impl RootView {
                 StageView::Loupe => stage.child(self.loupe.clone()).into_any_element(),
                 StageView::Compare => stage.child(self.compare.clone()).into_any_element(),
             },
+            #[cfg(feature = "edit")]
+            Surface::Develop => stage.child(self.darkroom.clone()).into_any_element(),
             other => {
                 let text = match other {
                     Surface::Module(id) => format!("Module view {id} is not available."),
-                    _ => "The Darkroom comes with #111.".to_string(),
+                    _ => "This build has no Darkroom (the `edit` feature is off).".to_string(),
                 };
                 stage
                     .items_center()
@@ -571,6 +605,7 @@ impl Render for RootView {
                 this.shell.update(cx, |s, cx| s.update_scope(cx, |l| l.clear_scope()))
             }))
             .on_action(cx.listener(|this, _: &ShowLibrary, _, cx| this.shell.update(cx, |s, cx| s.show_library(cx))))
+            .on_action(cx.listener(|this, _: &OpenDevelop, _, cx| this.shell.update(cx, |s, cx| s.open_develop(cx))))
             .on_action(cx.listener(|this, _: &ClearSelection, _, cx| this.shell.update(cx, |s, cx| s.clear_selection(cx))))
             .on_action(cx.listener(|this, _: &OpenPreferences, window, cx| {
                 this.open_preferences(crate::preferences::Tab::Storage, window, cx)

@@ -97,7 +97,7 @@ pub fn snap_thumb(v: f32) -> f32 {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Surface {
     Library,
-    /// Reserved for the Darkroom (#111); the rail's Develop is not ported yet.
+    /// The Darkroom (#111, `crate::darkroom`): it develops the active photo.
     Develop,
     /// A module's main view (`modules::MainView`), by view id.
     Module(String),
@@ -565,6 +565,18 @@ impl ShellState {
         cx.notify();
     }
 
+    /// The rail's Develop, an inspector version's ✎, a `develop` link: the Darkroom develops
+    /// the active photo (`crate::darkroom::Darkroom` follows the surface). Without an active
+    /// photo there is nothing to develop: the status line says so.
+    pub fn open_develop(&mut self, cx: &mut Context<Self>) {
+        if self.library.selection().active.is_none() {
+            self.model.update(cx, |m, cx| m.set_status("Select a photo to develop.", cx));
+            return;
+        }
+        self.surface = Surface::Develop;
+        cx.notify();
+    }
+
     /// A module main view's rail item: the stage shows that view.
     pub fn show_module_view(&mut self, view_id: &str, cx: &mut Context<Self>) {
         self.surface = Surface::Module(view_id.to_string());
@@ -782,6 +794,12 @@ impl ShellState {
     /// The catalog the lists shown were read from ([`Self::lists_from`]'s field docs).
     pub fn lists_from(&self) -> Option<CatalogIdentity> {
         self.lists_from
+    }
+
+    /// Tests: the generation of the row read in flight, if any.
+    #[cfg(all(test, feature = "edit"))]
+    pub(crate) fn rows_pending(&self) -> Option<u64> {
+        self.rows_pending
     }
 
     /// Re-run the current query off the UI thread (`list_photos`), with the identity of the
@@ -1139,9 +1157,7 @@ impl ShellState {
                 self.compare = None;
                 self.loupe_open = true;
             }
-            DeepLinkView::Develop => {
-                self.model.update(cx, |m, cx| m.not_yet_ported("Deep link into the Darkroom", 111, cx))
-            }
+            DeepLinkView::Develop => self.open_develop(cx),
         }
     }
 

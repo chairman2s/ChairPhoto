@@ -407,7 +407,7 @@ pub fn clear_images_on_catalog_switch(
 
 /// [`wire`]'s image source when there is no decode pool (tests that pass `None`): every
 /// request is answered at once with an error, so no cell waits forever.
-struct NoPool;
+pub(crate) struct NoPool;
 
 impl image_store::Submit for NoPool {
     fn submit_batch(&self, batch: Vec<(chairphoto_core::image_pool::JobKey, chairphoto_core::image_pool::Respond<Loaded>)>) {

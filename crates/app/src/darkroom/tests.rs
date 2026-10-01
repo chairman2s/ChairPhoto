@@ -334,7 +334,7 @@ fn leaving_during_a_running_commit_saves_the_newer_change_after_it(cx: &mut Test
     a_change_during_a_running_commit_survives(true, cx);
 }
 
-/// Make every history write fail (a full disk, say) (the trigger lives in the test catalog).
+/// Make every history write fail (a full disk, say) until the test drops the trigger.
 fn fail_history_writes(rig: &Rig) {
     rig.catalog(|c| {
         c.conn()
@@ -360,6 +360,35 @@ fn a_left_photos_failed_commit_is_reported_on_the_status_line(cx: &mut TestAppCo
     work(cx);
     let line = crate::tests::status(&rig.app, cx);
     assert!(line.starts_with("Autosave failed for ") && line.contains("disk full"), "{line}");
+}
+
+/// "Version N" is created at most once: the first commit creates the version and its write
+/// fails; the retry writes into that version — no second, empty "Version 2" — and the shell
+/// is given it.
+#[gpui_kit::test]
+fn a_failed_first_write_keeps_the_created_version_for_the_retry(cx: &mut TestAppContext) {
+    let rig = rig("dk-create-once", 1, cx);
+    let photo = rig.ids[0];
+    fail_history_writes(&rig);
+    rig.slide(Control::Tone(ToneKey::Ev), 0.5, cx);
+    advance(cx, AUTOSAVE_QUIET);
+    work(cx);
+    let error = rig.darkroom(cx).read_with(cx, |d, _| d.error.clone()).unwrap_or_default();
+    assert!(error.starts_with("Autosave failed: ") && error.contains("disk full"), "{error}");
+    let created = rig.catalog(|c| c.list_versions(photo).unwrap());
+    assert_eq!(created.iter().map(|v| v.name.as_str()).collect::<Vec<_>>(), ["Version 1"], "created, not written");
+
+    rig.catalog(|c| c.conn().execute_batch("DROP TRIGGER test_fail_history;").unwrap());
+    rig.darkroom(cx).update(cx, |d, cx| d.flush(cx)); // Ctrl+S, a step or leaving
+    work(cx);
+    let versions = rig.catalog(|c| c.list_versions(photo).unwrap());
+    assert_eq!(versions.len(), 1, "the retry wrote the version the first commit created");
+    assert_eq!(versions[0].id, created[0].id);
+    assert_eq!(serde_json::from_str::<Value>(&versions[0].edit_json).unwrap()["tone"]["ev"], json!(0.5));
+    let active = rig.app.wired.shell.read_with(cx, |s, _| s.active_version().cloned());
+    assert_eq!(active.map(|v| (v.id, v.name)), Some((created[0].id, "Version 1".to_string())));
+    // The next version made here would be "Version 2", counting the one created.
+    assert_eq!(rig.darkroom(cx).read_with(cx, |d, _| d.open.as_ref().unwrap().versions_len), 1);
 }
 
 /// The filmstrip: → steps to the next photo in the Library's order (saving first), arrows

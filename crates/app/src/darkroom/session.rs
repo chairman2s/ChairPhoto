@@ -78,6 +78,9 @@ pub struct OpenPhoto {
     pub epoch: u64,
     /// The version edited (`None`: the Original — the first change creates one).
     pub version_id: Option<i64>,
+    /// A commit created `version_id` but its first write failed: the shell has not been
+    /// given the version yet, so the next commit reads its row back.
+    version_unlisted: bool,
     /// How many versions the photo had, for the "Version N" a first change creates.
     pub versions_len: usize,
     /// The working record: what the controls show.
@@ -170,8 +173,16 @@ impl OpenPhoto {
     }
 }
 
-/// What a commit's worker answers: the version written, whether it was created, the
-/// history after the step, and the saved JSON.
+/// What a commit's worker answers: the version id it created, if it did — known even when
+/// the write after it failed, so "Version N" is created at most once — and the write's
+/// result.
+struct Commit {
+    created: Option<i64>,
+    result: Result<Committed, String>,
+}
+
+/// A commit's write: the version's row (read back when it was just created or is not yet
+/// the shell's), the version written, the history after the step, and the saved JSON.
 struct Committed {
     version: Option<PhotoVersion>,
     version_id: i64,
@@ -310,6 +321,7 @@ impl Darkroom {
             from,
             epoch,
             version_id: version.as_ref().map(|v| v.id),
+            version_unlisted: false,
             versions_len: 0,
             committed: working.clone(),
             committed_json,
@@ -698,28 +710,35 @@ impl Darkroom {
         let saved = open.stamped(&record).to_json();
         let (seq, from, photo_id, vid) = (open.seq, open.from, open.photo.id, open.version_id);
         let name = format!("Version {}", open.versions_len + 1);
+        let read_row = vid.is_none() || open.version_unlisted;
         let saved_on_engine1_while_preparing = open.preparing() && open.engine() == 1;
         open.committing = true;
         open.saving = true;
         let label = change.label.clone();
         let state = self.app.clone();
-        let rx = Runner::get(cx).run(move || -> Result<Committed, String> {
+        let rx = Runner::get(cx).run(move || -> Commit {
             let (version_id, created) = match vid {
-                Some(v) => (v, false),
-                None => (with_catalog_as(&state, from, |c| c.create_version(photo_id, &name))?, true),
+                Some(v) => (v, None),
+                None => match with_catalog_as(&state, from, |c| c.create_version(photo_id, &name)) {
+                    Ok(v) => (v, Some(v)),
+                    Err(e) => return Commit { created: None, result: Err(e) },
+                },
             };
-            let history = editing::write_version_then_refresh_monochrome(&state, Some(from), version_id, |c| {
-                c.commit_version_edit(version_id, &saved, &label, amend)
-            })?;
-            let version = if created {
-                with_catalog_as(&state, from, |c| c.list_versions(photo_id))?.into_iter().find(|v| v.id == version_id)
-            } else {
-                None
-            };
-            Ok(Committed { version, version_id, history, saved })
+            let result = (|| {
+                let history = editing::write_version_then_refresh_monochrome(&state, Some(from), version_id, |c| {
+                    c.commit_version_edit(version_id, &saved, &label, amend)
+                })?;
+                let version = if read_row {
+                    with_catalog_as(&state, from, |c| c.list_versions(photo_id))?.into_iter().find(|v| v.id == version_id)
+                } else {
+                    None
+                };
+                Ok(Committed { version, version_id, history, saved })
+            })();
+            Commit { created, result }
         });
         cx.spawn(async move |this, cx| {
-            let result = rx.await.unwrap_or_else(|_| Err("the worker stopped".into()));
+            let result = rx.await.unwrap_or_else(|_| Commit { created: None, result: Err("the worker stopped".into()) });
             this.update(cx, |this, cx| this.committed(seq, change, before, saved_on_engine1_while_preparing, result, now, cx)).ok();
         })
         .detach();
@@ -733,7 +752,7 @@ impl Darkroom {
         change: chairphoto_model::darkroom::history::Change,
         before: (String, VersionEdit),
         engine1_while_preparing: bool,
-        result: Result<Committed, String>,
+        commit: Commit,
         now: i64,
         cx: &mut Context<Self>,
     ) {
@@ -744,8 +763,15 @@ impl Darkroom {
         let Some(open) = self.photo_mut(seq) else { return };
         open.committing = false;
         open.saving = false;
+        if let Some(created) = commit.created {
+            // Recorded whatever the write did: a failed first write is retried into this
+            // version (React set `versionIdRef` right after `createVersion`).
+            open.version_id = Some(created);
+            open.versions_len += 1;
+            open.version_unlisted = true;
+        }
         let mut failed = false;
-        match result {
+        match commit.result {
             Ok(c) => {
                 if engine1_while_preparing && is_engine1_version(&parse_edit(Some(&c.saved))) {
                     open.engine1_version = true;
@@ -756,7 +782,7 @@ impl Darkroom {
                 let photo_id = open.photo.id;
                 let active = match c.version {
                     Some(v) => {
-                        open.versions_len += 1;
+                        open.version_unlisted = false;
                         // The shell's active version is the open photo's only.
                         is_open.then(|| PhotoVersion { edit_json: c.saved.clone(), ..v })
                     }

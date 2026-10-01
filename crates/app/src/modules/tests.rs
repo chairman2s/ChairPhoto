@@ -115,6 +115,14 @@ struct Bench {
 }
 
 fn bench(modules: Vec<Rc<dyn Module>>, features: &[&str], dir: &TempDir, cx: &mut TestAppContext) -> Bench {
+    let b = bench_unrestored(modules, features, dir, cx);
+    b.model.update(cx, |m, cx| m.refresh(cx));
+    cx.run_until_parked();
+    b
+}
+
+/// [`bench`] before the model's first catalog read: the saved set is not restored yet.
+fn bench_unrestored(modules: Vec<Rc<dyn Module>>, features: &[&str], dir: &TempDir, cx: &mut TestAppContext) -> Bench {
     let state = AppState::default();
     let catalog = Catalog::open(&dir.0.join("m.chairphoto"), &dir.0.join("photos")).unwrap();
     *state.catalog.lock().unwrap() = Some(catalog);
@@ -396,7 +404,7 @@ fn disabling_cascades_to_dependents_and_unloads(cx: &mut TestAppContext) {
 fn the_first_catalog_read_restores_the_enabled_set_once(cx: &mut TestAppContext) {
     let dir = TempDir::new("restore");
     let log = Log::default();
-    let b = bench(
+    let b = bench_unrestored(
         vec![
             probe(ModuleMeta::new("b", "B").requires("a"), &log),
             probe(ModuleMeta::new("a", "A"), &log),
@@ -419,6 +427,61 @@ fn the_first_catalog_read_restores_the_enabled_set_once(cx: &mut TestAppContext)
     b.model.update(cx, |m, cx| m.refresh(cx));
     cx.run_until_parked();
     assert_eq!(b.enabled(cx), ["a"], "a second catalog read does not restore again");
+}
+
+/// A toggle made before the saved set is restored — before the first catalog read, or while
+/// the restore's read runs — waits for it and lands on top of it: the saved set survives.
+#[gpui_kit::test]
+fn a_toggle_during_startup_composes_with_the_saved_set(cx: &mut TestAppContext) {
+    for when in ["before the catalog read", "during the restore's read"] {
+        let dir = TempDir::new("startup");
+        let log = Log::default();
+        let b = bench_unrestored(
+            vec![probe(ModuleMeta::new("a", "A"), &log), probe(ModuleMeta::new("c", "C"), &log)],
+            &[],
+            &dir,
+            cx,
+        );
+        b.state.catalog.lock().unwrap().as_ref().unwrap().set_setting(ENABLED_KEY, "a").unwrap();
+        if when == "before the catalog read" {
+            cx.update(|cx| ModuleRegistry::enable(&b.registry, "c", cx));
+            assert_eq!(b.enabled(cx), Vec::<String>::new(), "{when}: queued");
+            assert!(b.status(cx).contains("C will be enabled"), "{when}: said so: {}", b.status(cx));
+            b.model.update(cx, |m, cx| m.refresh(cx));
+        } else {
+            // The model's read lands and starts the restore's read; enable before that runs.
+            b.model.update(cx, |m, cx| m.refresh(cx));
+            let restore_started = |cx: &mut TestAppContext| b.model.read_with(cx, |m, _| m.catalog.is_some());
+            while !restore_started(cx) {
+                cx.executor().tick();
+            }
+            assert!(b.registry.read_with(cx, |r, _| r.restore_reading()), "{when}: the read is running");
+            cx.update(|cx| ModuleRegistry::enable(&b.registry, "c", cx));
+            assert_eq!(b.enabled(cx), Vec::<String>::new(), "{when}: queued");
+        }
+        cx.run_until_parked();
+        assert_eq!(b.enabled(cx), ["a", "c"], "{when}");
+        assert_eq!(b.setting(ENABLED_KEY).as_deref(), Some("a,c"), "{when}: the saved set survived");
+    }
+}
+
+/// With no catalog open, a toggle waits (it has nowhere to be saved) and lands once one is.
+#[gpui_kit::test]
+fn a_toggle_with_no_catalog_waits_for_one(cx: &mut TestAppContext) {
+    let dir = TempDir::new("nocat");
+    let log = Log::default();
+    let b = bench_unrestored(vec![probe(ModuleMeta::new("c", "C"), &log)], &[], &dir, cx);
+    let catalog = b.state.catalog.lock().unwrap().take();
+    b.model.update(cx, |m, cx| m.refresh(cx)); // fails: no catalog, no CatalogRead
+    cx.run_until_parked();
+    b.enable("c", cx);
+    assert!(log.borrow().is_empty(), "nothing loads with nowhere to save it");
+    assert_eq!(b.status(cx), "Modules: no catalog is open yet; C will be enabled once it is done");
+    *b.state.catalog.lock().unwrap() = catalog;
+    b.model.update(cx, |m, cx| m.refresh(cx));
+    cx.run_until_parked();
+    assert_eq!(b.enabled(cx), ["c"]);
+    assert_eq!(b.setting(ENABLED_KEY).as_deref(), Some("c"));
 }
 
 /// Toggles in quick succession land in the order they were made.
@@ -533,7 +596,6 @@ fn core_events_reach_only_enabled_modules(cx: &mut TestAppContext) {
     let model = cx.new(|_| AppModel::new(state.clone(), None));
     let shell = cx.new(|cx| ShellState::new(&model, cx));
     let registry = cx.update(|cx| {
-        crate::events::spawn_router(rx, model.clone(), cx).detach();
         ModuleRegistry::install_with(
             vec![probe(ModuleMeta::new("b", "B"), &log), probe(ModuleMeta::new("a", "A"), &log), probe(ModuleMeta::new("off", "Off"), &log)],
             Vec::new(),
@@ -542,7 +604,13 @@ fn core_events_reach_only_enabled_modules(cx: &mut TestAppContext) {
             cx,
         )
     });
+    model.update(cx, |m, cx| m.refresh(cx));
+    cx.run_until_parked(); // the (empty) saved set is restored
+    // The router starts only now and is not polled before the worker's send: a send to a
+    // router already parked would wake it from a foreign thread, which the test scheduler
+    // rejects (as in `tests::a_core_event_from_a_worker_thread_reaches_the_model`).
     cx.update(|cx| {
+        crate::events::spawn_router(rx, model.clone(), cx).detach();
         ModuleRegistry::enable(&registry, "a", cx);
         ModuleRegistry::enable(&registry, "b", cx);
     });

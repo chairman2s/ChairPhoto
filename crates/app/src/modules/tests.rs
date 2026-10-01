@@ -604,21 +604,88 @@ fn the_newest_toggle_is_what_is_persisted(cx: &mut TestAppContext) {
     assert_eq!(b.setting(ENABLED_KEY).as_deref(), Some("c"));
 }
 
+/// Keeps the host it was loaded with, for the settings tests.
+struct HostGrab {
+    meta: ModuleMeta,
+    host: Rc<RefCell<Option<ModuleHost>>>,
+}
+
+impl Module for HostGrab {
+    fn meta(&self) -> ModuleMeta {
+        self.meta.clone()
+    }
+
+    fn load(&self, host: ModuleHost, _: &mut App) -> Result<Box<dyn ModuleInstance>, String> {
+        *self.host.borrow_mut() = Some(host);
+        Ok(Box::new(GrabInstance))
+    }
+}
+
+struct GrabInstance;
+
+impl ModuleInstance for GrabInstance {
+    fn contributions(&self) -> Contributions {
+        Contributions::default()
+    }
+}
+
+/// A bench with one [`HostGrab`] module `id`, enabled; returns the host it was loaded with.
+fn grab_bench(id: &'static str, dir: &TempDir, cx: &mut TestAppContext) -> (Bench, ModuleHost) {
+    let slot: Rc<RefCell<Option<ModuleHost>>> = Rc::default();
+    let b = bench(vec![Rc::new(HostGrab { meta: ModuleMeta::new(id, id), host: slot.clone() })], &[], dir, cx);
+    b.enable(id, cx);
+    let host = slot.borrow().clone().expect("loaded");
+    (b, host)
+}
+
 /// A module's settings are `<id>.<key>` in the catalog.
 #[gpui_kit::test]
 fn module_settings_are_namespaced_by_id(cx: &mut TestAppContext) {
     let dir = TempDir::new("settings");
-    let b = bench(Vec::new(), &[], &dir, cx);
-    let host = cx.update(|cx| {
-        let shell = cx.new(|cx| ShellState::new(&b.model, cx));
-        ModuleHost::new(ModuleMeta::new("ai", "AI"), b.state.clone(), b.model.clone(), shell)
-    });
+    let (b, host) = grab_bench("ai", &dir, cx);
     host.settings().set("provider", "ollama").unwrap();
     assert_eq!(b.setting("ai.provider").as_deref(), Some("ollama"));
     assert_eq!(host.settings().get("provider").unwrap().as_deref(), Some("ollama"));
     assert_eq!(host.settings().get(&ENABLED_KEY["modules.".len()..]).unwrap(), None, "the host's own keys are out of reach");
     assert_eq!(ModuleMeta::new("ai", "AI").marker(), "ai");
     assert_eq!(ModuleMeta::new("snap", "Snap").publication_marker("snapchat").marker(), "snapchat");
+}
+
+/// **Forced interleaving.** A settings handle a module took while catalog A was open — say for
+/// a background write — is bound to A: once B (holding the same key) is open it neither reads
+/// nor writes B, whether or not `catalog:switched` has reached the UI. A handle taken between
+/// the event and B's restore is bound to nothing; one taken after B's restore reads and
+/// writes B.
+#[gpui_kit::test]
+fn a_settings_handle_never_reaches_a_catalog_opened_after_it(cx: &mut TestAppContext) {
+    use chairphoto_core::app::CATALOG_CHANGED;
+    for deliver in [false, true] {
+        let dir = TempDir::new("settings-switch");
+        let (b, host) = grab_bench("probe", &dir, cx);
+        let on_a = host.settings();
+        on_a.set("level", "a").unwrap();
+
+        let other = Catalog::open(&dir.0.join("b.chairphoto"), &dir.0.join("photos")).unwrap();
+        other.set_setting("probe.level", "b").unwrap();
+        b.state.catalog.lock().unwrap().replace(other);
+        if deliver {
+            // The event, with B's restore not landed yet.
+            b.model.update(cx, |m, cx| m.on_core_event(&CoreEvent::CatalogSwitched("b".into()), cx));
+            let fresh = host.settings();
+            assert_eq!(fresh.set("level", "x"), Err(super::SETTINGS_NOT_READY.to_string()), "unbound until B is restored");
+        }
+        assert_eq!(on_a.set("level", "stale"), Err(CATALOG_CHANGED.to_string()), "deliver={deliver}: the write failed closed");
+        assert_eq!(on_a.get("level"), Err(CATALOG_CHANGED.to_string()), "deliver={deliver}: and the read");
+        assert_eq!(b.setting("probe.level").as_deref(), Some("b"), "deliver={deliver}: B's value is untouched");
+
+        if deliver {
+            cx.run_until_parked(); // B's restore
+            let on_b = host.settings();
+            assert_eq!(on_b.get("level").unwrap().as_deref(), Some("b"), "a fresh handle reads B");
+            on_b.set("level", "b2").unwrap();
+            assert_eq!(b.setting("probe.level").as_deref(), Some("b2"), "and writes B");
+        }
+    }
 }
 
 // --- events ------------------------------------------------------------------------------

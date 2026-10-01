@@ -68,6 +68,10 @@ pub struct GeocodeRun {
 
 pub struct MapState {
     app: AppState,
+    /// For its key names (`map.<key>`). This state outlives catalog switches, so its reads
+    /// and writes do not go through the handle (bound to the catalog open when the module
+    /// loaded): they capture the identity with each read (`settings_from`) and write through
+    /// `with_catalog_as`, which is what `ModuleSettings` itself does for one catalog opening.
     settings: ModuleSettings,
     model: Entity<AppModel>,
     /// GPS points, projected once (the clusterer's input).

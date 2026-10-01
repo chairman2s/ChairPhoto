@@ -35,12 +35,12 @@
 
 use super::{
     ActionKind, Contributions, MainView, Module, ModuleAction, ModuleHost, ModuleInstance, ModuleMeta, Panel,
-    PanelSlot, PublishTarget, SettingsPanel, ViewFactory,
+    PanelSlot, PublishTarget, RestoredCatalog, SettingsPanel, ViewFactory,
 };
 use crate::image_store::ImageStore;
 use crate::model::{AppModel, AppModelEvent};
 use crate::shell::ShellState;
-use chairphoto_core::app::{with_catalog_as, with_catalog_identified, AppState, CatalogIdentity, CoreEvent, CATALOG_CHANGED};
+use chairphoto_core::app::{with_catalog_as, with_catalog_identified, AppState, CoreEvent, CATALOG_CHANGED};
 use gpui_kit::component::WindowExt as _;
 use gpui_kit::prelude::*;
 use gpui_kit::{AnyView, App, Context, Entity, SharedString, Window, WindowId};
@@ -188,7 +188,8 @@ pub struct ModuleRegistry {
     /// The catalog the enabled set was restored from; writes go only to it. Its identity,
     /// not its path: after a switch away and back the reopened catalog is another opening,
     /// whose restore may already have read the set an old write would overwrite.
-    restored_from: Option<CatalogIdentity>,
+    /// Shared with every module's host: their settings handles are bound to it.
+    restored_from: RestoredCatalog,
     views: HashMap<ViewKey, AnyView>,
     persist_generation: u64,
     /// The generation of the newest `modules.enabled` write that ran.
@@ -246,7 +247,7 @@ impl ModuleRegistry {
             restore: Restore::Waiting,
             queued: Vec::new(),
             restore_generation: 0,
-            restored_from: None,
+            restored_from: RestoredCatalog::default(),
             views: HashMap::new(),
             persist_generation: 0,
             persisted: Arc::new(Mutex::new(0)),
@@ -475,7 +476,8 @@ impl ModuleRegistry {
         }
         let host = {
             let r = this.read(cx);
-            ModuleHost::new(meta.clone(), r.app.clone(), r.model.clone(), r.shell.clone()).with_images(r.images.clone())
+            ModuleHost::new(meta.clone(), r.app.clone(), r.restored_from.clone(), r.model.clone(), r.shell.clone())
+                .with_images(r.images.clone())
         };
         match Self::in_module(this, cx, |cx| module.load(host, cx)) {
             Ok(instance) => {
@@ -598,7 +600,7 @@ impl ModuleRegistry {
         let csv = self.enabled_ids_in_dep_order().iter().map(|id| id.as_ref()).collect::<Vec<_>>().join(",");
         let app = self.app.clone();
         let persisted = self.persisted.clone();
-        let from = self.restored_from;
+        let from = self.restored_from.get();
         cx.background_executor()
             .spawn(async move {
                 let mut newest = persisted.lock().unwrap_or_else(|e| e.into_inner());
@@ -647,7 +649,7 @@ impl ModuleRegistry {
                 }
                 match read {
                     Ok((from, csv)) => {
-                        this.update(cx, |r, _| r.restored_from = Some(from));
+                        this.read(cx).restored_from.set(Some(from));
                         if let Some(csv) = csv {
                             let listed: Vec<&str> = csv.split(',').filter(|id| !id.is_empty()).collect();
                             // Dependents first, so a cascade finds nothing left to do.
@@ -691,7 +693,7 @@ impl ModuleRegistry {
         this.update(cx, |r, _| {
             r.restore = Restore::Waiting;
             r.restore_generation += 1;
-            r.restored_from = None;
+            r.restored_from.set(None);
         });
     }
 

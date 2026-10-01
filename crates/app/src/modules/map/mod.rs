@@ -50,7 +50,7 @@ impl Module for MapModule {
 
     fn load(&self, host: ModuleHost, cx: &mut App) -> Result<Box<dyn ModuleInstance>, String> {
         let app = host.model().read(cx).state().clone();
-        let (settings, model) = (host.settings().clone(), host.model().clone());
+        let (settings, model) = (host.settings(), host.model().clone());
         let state = cx.new(|cx| state::MapState::new(app, settings, model, cx));
         Ok(Box::new(MapInstance { state, host }))
     }

@@ -56,10 +56,11 @@ pub use registry::{ModuleInfo, ModuleRegistry, RequirementInfo};
 use crate::image_store::ImageStore;
 use crate::model::AppModel;
 use crate::shell::ShellState;
-use chairphoto_core::app::{with_catalog, AppState, CoreEvent};
+use chairphoto_core::app::{with_catalog_as, AppState, CatalogIdentity, CoreEvent};
 use gpui_kit::component::Icon;
 use gpui_kit::{AnyView, App, AppContext as _, Context, Entity, Render, SharedString, Window};
 use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 
 /// A first-party module. Object-safe: the registry holds `Rc<dyn Module>`.
 pub trait Module: 'static {
@@ -256,16 +257,22 @@ pub struct Contributions {
 #[derive(Clone)]
 pub struct ModuleHost {
     meta: ModuleMeta,
-    settings: ModuleSettings,
+    app: AppState,
+    restored: RestoredCatalog,
     model: Entity<AppModel>,
     shell: Entity<ShellState>,
     images: Option<Entity<ImageStore>>,
 }
 
 impl ModuleHost {
-    pub(crate) fn new(meta: ModuleMeta, app: AppState, model: Entity<AppModel>, shell: Entity<ShellState>) -> Self {
-        let settings = ModuleSettings { app, prefix: format!("{}.", meta.id) };
-        ModuleHost { meta, settings, model, shell, images: None }
+    pub(crate) fn new(
+        meta: ModuleMeta,
+        app: AppState,
+        restored: RestoredCatalog,
+        model: Entity<AppModel>,
+        shell: Entity<ShellState>,
+    ) -> Self {
+        ModuleHost { meta, app, restored, model, shell, images: None }
     }
 
     pub(crate) fn with_images(mut self, images: Option<Entity<ImageStore>>) -> Self {
@@ -277,9 +284,13 @@ impl ModuleHost {
         &self.meta
     }
 
-    /// This module's settings, namespaced by its id.
-    pub fn settings(&self) -> &ModuleSettings {
-        &self.settings
+    /// A handle on this module's settings, namespaced by its id and bound to the catalog the
+    /// registry restored the enabled set from — the one open now, as far as the UI knows. Take
+    /// a fresh handle after `catalog:switched`: the old one fails closed (see
+    /// [`ModuleSettings`]), and a fresh one reads and writes the new catalog once the registry
+    /// has restored from it.
+    pub fn settings(&self) -> ModuleSettings {
+        ModuleSettings { app: self.app.clone(), prefix: format!("{}.", self.meta.id), catalog: self.restored.get() }
     }
 
     /// The app model: the core [`AppState`], the status line, the open catalog.
@@ -304,6 +315,15 @@ impl ModuleHost {
 /// another module's keys or the host's own ([`registry::RESERVED_NAMESPACES`]). A module whose
 /// id is one of [`registry::BACKEND_NAMESPACES`] shares the namespace with its own backend.
 ///
+/// **Bound to one catalog opening.** Settings are per catalog, and a module's instance outlives
+/// a catalog switch, so a handle carries the [`CatalogIdentity`] the registry restored from when
+/// it was taken ([`ModuleHost::settings`]). [`get`](Self::get) and [`set`](Self::set) run
+/// through `with_catalog_as`: once another catalog is open — even before `catalog:switched`
+/// reaches the UI — they fail closed with [`CATALOG_CHANGED`](chairphoto_core::app::CATALOG_CHANGED)
+/// rather than read or write the new catalog's keys. A handle taken while no catalog's set has
+/// been restored (between a switch and the new catalog's restore) fails with
+/// [`SETTINGS_NOT_READY`].
+///
 /// **Blocking** (the catalog lock and SQLite): call [`get`](Self::get) and [`set`](Self::set)
 /// from a background task, e.g. `cx.background_executor().spawn(..)`, never in a render or
 /// an event handler.
@@ -311,6 +331,27 @@ impl ModuleHost {
 pub struct ModuleSettings {
     app: AppState,
     prefix: String,
+    catalog: Option<CatalogIdentity>,
+}
+
+/// What a [`ModuleSettings`] handle taken before the open catalog's modules were restored
+/// answers: it is bound to no catalog, so it touches none.
+pub const SETTINGS_NOT_READY: &str = "The catalog's module settings are not read yet";
+
+/// The catalog opening the registry last restored the enabled set from, shared by the
+/// registry and every [`ModuleHost`] it hands out: what a settings handle is bound to. `None`
+/// from a catalog switch until the new catalog's restore has read.
+#[derive(Clone, Default)]
+pub(crate) struct RestoredCatalog(Arc<Mutex<Option<CatalogIdentity>>>);
+
+impl RestoredCatalog {
+    pub(crate) fn get(&self) -> Option<CatalogIdentity> {
+        *self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    pub(crate) fn set(&self, catalog: Option<CatalogIdentity>) {
+        *self.0.lock().unwrap_or_else(|e| e.into_inner()) = catalog;
+    }
 }
 
 impl ModuleSettings {
@@ -319,14 +360,23 @@ impl ModuleSettings {
         format!("{}{key}", self.prefix)
     }
 
+    /// The catalog opening this handle reads and writes; `None` = none (it fails closed).
+    pub fn catalog(&self) -> Option<CatalogIdentity> {
+        self.catalog
+    }
+
     pub fn get(&self, key: &str) -> Result<Option<String>, String> {
         let key = self.key(key);
-        with_catalog(&self.app, |c| c.get_setting(&key))
+        with_catalog_as(&self.app, self.bound()?, |c| c.get_setting(&key))
     }
 
     pub fn set(&self, key: &str, value: &str) -> Result<(), String> {
         let key = self.key(key);
-        with_catalog(&self.app, |c| c.set_setting(&key, value))
+        with_catalog_as(&self.app, self.bound()?, |c| c.set_setting(&key, value))
+    }
+
+    fn bound(&self) -> Result<CatalogIdentity, String> {
+        self.catalog.ok_or_else(|| SETTINGS_NOT_READY.to_string())
     }
 }
 

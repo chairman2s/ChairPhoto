@@ -53,6 +53,7 @@ pub enum TagDialog {
     Move(WeakEntity<super::move_tag::TagMove>),
     Merge(WeakEntity<super::merge::TagMerge>),
     Split(WeakEntity<super::split::TagSplit>),
+    Groups(WeakEntity<super::groups::TagGroupsManager>),
 }
 
 pub struct TagsState {

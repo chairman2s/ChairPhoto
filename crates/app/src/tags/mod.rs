@@ -1,6 +1,8 @@
 //! Tags (#107): the collection browser's tag panel, the tag editor and the tag-maintenance
-//! dialogs. Ports of `TagPanel.tsx`, `TagEditor.tsx`, `TagCreateModal.tsx`,
-//! `TagMergeModal.tsx`, `TagSplitModal.tsx` and the tag wiring of `App.tsx`; `docs/plans/gpui/parity.md` § Tag
+//! dialogs, and the inspector tags tab's tagging block. Ports of `TagPanel.tsx`,
+//! `TagEditor.tsx`, `TagCreateModal.tsx`, `TagMergeModal.tsx`, `TagSplitModal.tsx`,
+//! `TagGroupsManager.tsx`, `Inspector.tsx`'s `QuickTagGroups`, the tags tab of
+//! `PhotoInspector.tsx`, and the tag wiring of `App.tsx`; `docs/plans/gpui/parity.md` § Tag
 //! panel is the acceptance list, `docs/taxonomy.md` the model.
 //!
 //! - [`state::TagsState`] owns the tag tree and the tag clipboard, and every write goes
@@ -10,16 +12,21 @@
 //!   `LibrarySession::select_tag`).
 //! - [`editor::TagEditor`]: one tag's name, description, export gate, translations, synonyms
 //!   and export preview, plus the `tag-editor` module slot.
-//! - The dialogs: [`create`], [`move_tag`], [`merge`], [`split`].
+//! - [`photo_tags::PhotoTags`]: the tags tab's block — the photo's chips, copy/paste,
+//!   add-tag with autocomplete, nearby suggestions and the quick-tag groups — built for the
+//!   photos it edits ([`photo_tags::TagTarget`]), so the Photo inspector (#108) mounts it.
+//! - The dialogs: [`create`], [`move_tag`], [`merge`], [`split`], [`groups`].
 //!
 //! The tree logic (search ranking, visibility, drop and move targets, report wording) is the
 //! sans-IO `chairphoto_model::tag_tree`; pasted hierarchies are `chairphoto_model::tag_paste`.
 
 pub mod create;
 pub mod editor;
+pub mod groups;
 pub mod merge;
 pub mod move_tag;
 pub mod panel;
+pub mod photo_tags;
 pub mod split;
 pub mod state;
 

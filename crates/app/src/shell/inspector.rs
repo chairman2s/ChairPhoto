@@ -2,7 +2,9 @@
 //! header (the UI sans, not the display serif — App.css: filenames are identifiers, not
 //! titles) with the photo's colour-label swatch and a hide button, the lowercase tab row
 //! (details / tags / versions / publish), and the body the Photo inspector (#108) fills.
-//! QuickTagGroups, the tags tab's extra zone, comes with the Tag panel (#107). The enabled
+//! The tags tab shows the tagging block ([`crate::tags::photo_tags::PhotoTags`]: chips,
+//! copy/paste, add-tag, nearby, quick-tag groups), which #108 keeps when it ports the tab
+//! content; the other tabs wait for #108. The enabled
 //! modules' inspector panels ([`crate::modules::PanelSlot::Inspector`]) render on the tags tab
 //! under its built-in blocks, as `PhotoInspector.tsx` did, while a photo is active.
 
@@ -90,8 +92,15 @@ impl RootView {
                     ),
             )
             .child(tabs)
-            .child(
-                div()
+            .child(match (active, shell.inspector_tab) {
+                (Some(_), InspectorTab::Tags) => div()
+                    .id("inspector-tags-body")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .child(self.photo_tags.clone())
+                    .into_any_element(),
+                _ => div()
                     .flex_1()
                     .p(px(16.))
                     .text_size(px(11.))
@@ -99,8 +108,9 @@ impl RootView {
                     .child(match active {
                         Some(_) => "Photo inspector — not yet ported (#108)",
                         None => "Select a photo",
-                    }),
-            )
+                    })
+                    .into_any_element(),
+            })
             .children(module_panels.map(|panels| div().id("module-slot-inspector").flex().flex_col().child(panels)))
             .into_any_element()
     }

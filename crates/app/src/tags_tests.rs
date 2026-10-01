@@ -1,4 +1,4 @@
-//! Headless tests of Tags (#107): the tag panel and its dialogs,
+//! Headless tests of Tags (#107): the tag panel, its dialogs and the inspector's tagging block,
 //! driven through the real window and wiring; the catalog-switch interleavings forced.
 //!
 //! Tag work runs on GPUI's background executor (`tags::state::run`), which the deterministic
@@ -7,6 +7,7 @@
 
 use super::*;
 use crate::tags::panel::TagPanel;
+use crate::tags::photo_tags::{PhotoTags, RECENT_GROUP};
 use crate::tags::state::TagDialog;
 use chairphoto_core::catalog::Catalog;
 use chairphoto_model::library::session::SelectMods;
@@ -59,6 +60,10 @@ fn parent_of(app: &App, id: i64) -> Option<i64> {
 
 fn panel(app: &App, cx: &mut TestAppContext) -> Entity<TagPanel> {
     app.wired.root.as_ref().unwrap().read_with(cx, |r, _| r.tag_panel.clone())
+}
+
+fn photo_tags(app: &App, cx: &mut TestAppContext) -> Entity<PhotoTags> {
+    app.wired.root.as_ref().unwrap().read_with(cx, |r, _| r.photo_tags.clone())
 }
 
 fn scope_tag(app: &App, cx: &mut TestAppContext) -> Option<i64> {
@@ -362,6 +367,85 @@ fn split_moves_the_selected_photos_to_a_new_tag(cx: &mut TestAppContext) {
     let on_photo: Vec<i64> = with_catalog(&app, |c| c.get_photo_tags(s.photos[0]).unwrap().iter().map(|t| t.id).collect());
     assert_eq!(on_photo, [venue]);
     assert_eq!(status(&app, cx), "1 photo moved to Venue/Grieghallen.");
+}
+
+// --- the inspector's tagging block ------------------------------------------------------------
+
+/// Add-tag creates a typed path on every target; × removes from every target; copy and
+/// paste carry tags to another photo; Recently used lists what was applied.
+#[gpui_kit::test]
+fn the_tagging_block_adds_removes_copies_and_pastes(cx: &mut TestAppContext) {
+    let dir = TempDir::new("tags-block");
+    let app = start(cx);
+    let s = open_tagged(&app, &dir, "a", cx);
+    select_photo(&app, s.photos[0], cx);
+    click(&app, "inspector-tab-tags", cx);
+    let block = photo_tags(&app, cx);
+    block.read_with(cx, |b, _| {
+        assert_eq!(b.target.active, Some(s.photos[0]));
+        assert_eq!(b.assigned.iter().map(|t| t.id).collect::<Vec<_>>(), [s.bergen]);
+    });
+
+    let input = block.read_with(cx, |b, _| b.input.clone());
+    set_input(&app, &input, "Events/Festival", cx);
+    press_in(&app, &input, "enter", cx);
+    let festival = with_catalog(&app, |c| c.find_tag_id_by_path("Events/Festival").unwrap()).expect("created");
+    block.read_with(cx, |b, _| assert!(b.assigned.iter().any(|t| t.id == festival), "the chip shows"));
+
+    // Suggestions skip assigned tags; Enter assigns the highlighted one.
+    set_input(&app, &input, "anna", cx);
+    assert_eq!(cx.update(|cx| block.read(cx).suggestions(cx)).len(), 1);
+    press_in(&app, &input, "enter", cx);
+    let anna = with_catalog(&app, |c| c.find_tag_id_by_path("People/Anna").unwrap().unwrap());
+    assert!(with_catalog(&app, |c| c.get_photo_tags(s.photos[0]).unwrap().iter().any(|t| t.id == anna)));
+
+    click(&app, "photo-tags-copy", cx);
+    assert_eq!(status(&app, cx), "Copied 3 tag(s)");
+    select_photo(&app, s.photos[1], cx);
+    click(&app, "photo-tags-paste", cx);
+    assert_eq!(status(&app, cx), "Pasted 3 tag(s) onto 1 photo(s)");
+    assert_eq!(with_catalog(&app, |c| c.get_photo_tags(s.photos[1]).unwrap().len()), 3);
+
+    let remove: &'static str = Box::leak(format!("photo-tag-remove-{anna}").into_boxed_str());
+    click(&app, remove, cx);
+    assert!(!with_catalog(&app, |c| c.get_photo_tags(s.photos[1]).unwrap().iter().any(|t| t.id == anna)));
+
+    block.read_with(cx, |b, _| {
+        assert_eq!(b.group, RECENT_GROUP);
+        assert!(!b.members.is_empty(), "Recently used lists the tags applied");
+    });
+}
+
+/// The groups manager: a new group, a member added by path (created if new), and the
+/// quick-tag button assigns it to the selection.
+#[gpui_kit::test]
+fn quick_tag_groups_are_managed_and_assign(cx: &mut TestAppContext) {
+    let dir = TempDir::new("tags-groups");
+    let app = start(cx);
+    let s = open_tagged(&app, &dir, "a", cx);
+    select_photo(&app, s.photos[2], cx);
+    click(&app, "inspector-tab-tags", cx);
+    click(&app, "quick-groups-manage", cx);
+    let TagDialog::Groups(manager) = last_dialog(&app, cx) else { panic!("the groups manager") };
+    let manager = up(manager);
+    let (new_group, new_member) = manager.read_with(cx, |m, _| (m.new_group.clone(), m.new_member.clone()));
+    set_input(&app, &new_group, "Street", cx);
+    press_in(&app, &new_group, "enter", cx);
+    set_input(&app, &new_member, "Street/Candid", cx);
+    press_in(&app, &new_member, "enter", cx);
+    let group = manager.read_with(cx, |m, _| {
+        assert_eq!(m.members.iter().map(|t| t.full_path.as_str()).collect::<Vec<_>>(), ["Street/Candid"]);
+        m.active.unwrap()
+    });
+    cx.update_window(app.window(), |_, window, cx| window.close_dialog(cx)).unwrap();
+    cx.run_until_parked();
+
+    let chip: &'static str = Box::leak(format!("quick-group-{group}").into_boxed_str());
+    click(&app, chip, cx);
+    let candid = with_catalog(&app, |c| c.find_tag_id_by_path("Street/Candid").unwrap().unwrap());
+    let button: &'static str = Box::leak(format!("quick-tag-{candid}").into_boxed_str());
+    click(&app, button, cx);
+    assert!(with_catalog(&app, |c| c.get_photo_tags(s.photos[2]).unwrap().iter().any(|t| t.id == candid)));
 }
 
 // --- catalog switches ---------------------------------------------------------------------

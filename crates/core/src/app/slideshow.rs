@@ -148,16 +148,15 @@ impl SlideshowJob {
 
     /// [`run`](Self::run) with an explicit frame writer.
     ///
-    /// The frames go to a temp dir private to this job (process id and job id), so a
-    /// superseded render's cleanup never removes a newer render's frames. The movie goes to a
-    /// fresh `slideshow.mp4` / `slideshow (N).mp4` in the destination, reserved by an exclusive
-    /// create before ffmpeg starts; nothing else there is touched, and a cancelled or failed
-    /// encode removes its own reservation / partial movie.
+    /// The frames go to a `FrameDir` private to this run, so no other render — and no other
+    /// user — reads or removes them. The movie goes to a fresh `slideshow.mp4` /
+    /// `slideshow (N).mp4` in the destination, reserved by an exclusive create before ffmpeg
+    /// starts; nothing else there is touched, and a cancelled or failed encode removes its own
+    /// reservation / partial movie.
     pub fn run_with(self, write_frame: &FrameWriter) -> Result<PathBuf, String> {
         let SlideshowJob { state, items, opts, dest_dir, ffmpeg, abort, job } = self;
         let cancelled = || abort.load(Ordering::Relaxed);
-        let work = std::env::temp_dir().join(format!("chairphoto_slideshow_{}_{job}", std::process::id()));
-        std::fs::create_dir_all(&work).map_err(|e| e.to_string())?;
+        let work = FrameDir::create()?;
         let result = (|| {
             // Frames comfortably above the output, so the Ken Burns zoom (the engine
             // oversamples to 2× the target) has pixels to crop into; capped so a huge RAW
@@ -168,7 +167,7 @@ impl SlideshowJob {
                 if cancelled() {
                     return Err(SLIDESHOW_CANCELLED.to_string());
                 }
-                let frame = work.join(format!("frame_{i:04}.jpg"));
+                let frame = work.0.join(format!("frame_{i:04}.jpg"));
                 write_frame(item, frame_max_width, &frame)?;
                 frames.push(frame);
             }
@@ -192,8 +191,34 @@ impl SlideshowJob {
                 }
             }
         })();
-        let _ = std::fs::remove_dir_all(&work);
+        drop(work);
         result
+    }
+}
+
+/// A render's frame directory: a fresh `chairphoto-slideshow-<random>` under the temp dir,
+/// created exclusively with mode 0700 (the frames are full-size renders of the user's photos;
+/// the random name cannot be predicted or pre-created by another user). Dropping it removes
+/// the directory, so it goes on every exit — success, error, cancel, or a panic in a frame
+/// writer.
+struct FrameDir(PathBuf);
+
+impl FrameDir {
+    fn create() -> Result<Self, String> {
+        let path = std::env::temp_dir().join(format!("chairphoto-slideshow-{}", uuid::Uuid::new_v4().simple()));
+        let mut builder = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+        // `create`, not `create_dir_all`: an existing directory of that name is an error,
+        // never adopted.
+        builder.create(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+        Ok(FrameDir(path))
+    }
+}
+
+impl Drop for FrameDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
     }
 }
 
@@ -239,6 +264,16 @@ mod tests {
         Arc::new(|item, _, out| std::fs::copy(&item.original, out).map(|_| ()).map_err(|e| e.to_string()))
     }
 
+    /// [`copy_frames`], recording each frame's directory and its permission bits.
+    fn recording_frames(seen: Arc<Mutex<Vec<(PathBuf, u32)>>>) -> FrameWriter {
+        Arc::new(move |item, _, out| {
+            let dir = out.parent().unwrap().to_path_buf();
+            let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+            seen.lock().unwrap().push((dir, mode));
+            std::fs::copy(&item.original, out).map(|_| ()).map_err(|e| e.to_string())
+        })
+    }
+
     fn setup(tag: &str, photos: usize) -> (TestTmpDir, AppState, Arc<Progress>, Vec<i64>) {
         let dir = TestTmpDir::new(&format!("slideshow-{tag}"));
         let root = dir.join("library");
@@ -270,14 +305,15 @@ mod tests {
         std::fs::write(out.join("slideshow.mp4"), b"earlier").unwrap();
         let job = claim_slideshow(&state, None, &ids, opts(), out.to_str().unwrap(), Some(fake_ffmpeg(false))).unwrap();
         let id = job.job;
-        let path = job.run_with(&copy_frames()).unwrap();
+        let dirs = Arc::new(Mutex::new(Vec::new()));
+        let path = job.run_with(&recording_frames(dirs.clone())).unwrap();
         assert_eq!(path, out.join("slideshow (2).mp4"), "never clobbers an earlier movie");
         assert_eq!(std::fs::read(&path).unwrap(), b"movie");
         assert_eq!(std::fs::read(out.join("slideshow.mp4")).unwrap(), b"earlier");
         let seen = progress.0.lock().unwrap().clone();
         assert_eq!(seen.first().map(|p| (p.0, p.2)), Some((10, id)));
         assert_eq!(seen.last().map(|p| (p.0 == p.1, p.2)), Some((true, id)), "progress=end reports done == total");
-        let work = std::env::temp_dir().join(format!("chairphoto_slideshow_{}_{id}", std::process::id()));
+        let (work, _) = dirs.lock().unwrap()[0].clone();
         assert!(!work.exists(), "the job's frames are removed");
         for i in 0..2 {
             assert_eq!(std::fs::read(dir.join("library").join(format!("IMG_{i}.jpg"))).unwrap(), format!("jpeg {i}").as_bytes(), "originals untouched");
@@ -300,6 +336,74 @@ mod tests {
                 (before.mtime(), before.mtime_nsec(), before.ino()),
                 "{path:?} was rewritten"
             );
+        }
+    }
+
+    /// The frame dir is 0700, named unpredictably (two renders with the same job id and pid
+    /// get different dirs), and removed even when a frame writer panics or fails.
+    #[test]
+    fn the_frame_dir_is_private_unpredictable_and_removed_even_on_a_panic() {
+        let (a_dir, a, _ap, a_ids) = setup("frames-a", 2);
+        let (b_dir, b, _bp, b_ids) = setup("frames-b", 2);
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let out = |d: &TestTmpDir| d.join("out").to_str().unwrap().to_string();
+        let ja = claim_slideshow(&a, None, &a_ids, opts(), &out(&a_dir), Some(fake_ffmpeg(false))).unwrap();
+        let jb = claim_slideshow(&b, None, &b_ids, opts(), &out(&b_dir), Some(fake_ffmpeg(false))).unwrap();
+        assert_eq!(ja.job, jb.job, "same pid, same job id");
+        ja.run_with(&recording_frames(seen.clone())).unwrap();
+        jb.run_with(&recording_frames(seen.clone())).unwrap();
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 4);
+        assert!(seen.iter().all(|(_, mode)| *mode == 0o700), "frame dirs are owner-only: {seen:?}");
+        assert_ne!(seen[0].0, seen[2].0, "each render gets its own unpredictable dir");
+        assert!(seen.iter().all(|(d, _)| !d.exists()), "removed after success");
+
+        // **Forced interleaving.** Concurrent renders from two app states (same pid, both job
+        // 1 — as parallel tests in one process are): while A's ffmpeg runs on its frames, B
+        // renders to completion. With frame dirs named from pid + job id, B's frames landed
+        // in A's dir and B's cleanup removed A's frames under it (an ENOENT flake seen in
+        // a_render_writes_a_fresh_movie_…).
+        let (c_dir, c, c_progress, c_ids) = setup("frames-c", 2);
+        let (d_dir, d, _dp, d_ids) = setup("frames-d", 2);
+        let jc = claim_slideshow(&c, None, &c_ids, opts(), &out(&c_dir), Some(fixture("ffmpeg-stall"))).unwrap();
+        let jd = claim_slideshow(&d, None, &d_ids, opts(), &out(&d_dir), Some(fake_ffmpeg(false))).unwrap();
+        assert_eq!(jc.job, jd.job, "same pid, same job id");
+        let (c_abort, c_job) = (jc.abort_handle(), jc.job);
+        let c_seen = Arc::new(Mutex::new(Vec::new()));
+        let c_writer = recording_frames(c_seen.clone());
+        let c_run = std::thread::spawn(move || jc.run_with(&c_writer));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !c_progress.0.lock().unwrap().iter().any(|p| p.2 == c_job) {
+            assert!(std::time::Instant::now() < deadline && !c_run.is_finished(), "C's ffmpeg never started");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let c_frames = c_seen.lock().unwrap()[0].0.clone();
+        jd.run_with(&copy_frames()).unwrap();
+        for i in 0..2 {
+            let frame = c_frames.join(format!("frame_{i:04}.jpg"));
+            assert_eq!(std::fs::read(&frame).ok(), Some(format!("jpeg {i}").into_bytes()), "D left C's running frames alone: {frame:?}");
+        }
+        c_abort.store(true, Ordering::Relaxed);
+        assert_eq!(c_run.join().unwrap().unwrap_err(), SLIDESHOW_CANCELLED);
+        assert!(!c_frames.exists(), "C removed its own frames");
+
+        for how in ["panic", "error"] {
+            let (dir, state, _p, ids) = setup(&format!("frames-{how}"), 2);
+            let job = claim_slideshow(&state, None, &ids, opts(), &out(&dir), Some(fake_ffmpeg(false))).unwrap();
+            let used = Arc::new(Mutex::new(None));
+            let u = used.clone();
+            let panics = how == "panic";
+            let writer: FrameWriter = Arc::new(move |_, _, out| {
+                *u.lock().unwrap() = Some(out.parent().unwrap().to_path_buf());
+                if panics {
+                    panic!("frame writer panicked");
+                }
+                Err("frame writer failed".into())
+            });
+            let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| job.run_with(&writer)));
+            assert_eq!(ran.is_err(), panics, "{how}");
+            let frames = used.lock().unwrap().clone().expect("the writer ran");
+            assert!(!frames.exists(), "{how}: the frame dir is removed: {frames:?}");
         }
     }
 

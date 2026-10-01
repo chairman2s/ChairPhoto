@@ -1,0 +1,10 @@
+#!/bin/sh
+# A fake ffmpeg for the slideshow tests: two progress blocks, then "movie" into the output
+# (the last argument, a file: URL). Checked in, never written by a test: a script written
+# and then executed while other test threads fork can fail with ETXTBSY.
+for last; do :; done
+echo frame=10
+echo progress=continue
+echo frame=40
+echo progress=end
+printf movie > "${last#file:}"

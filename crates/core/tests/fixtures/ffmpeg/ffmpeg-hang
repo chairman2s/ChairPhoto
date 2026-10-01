@@ -1,0 +1,4 @@
+#!/bin/sh
+# A fake ffmpeg that never finishes: the slideshow tests kill it. Checked in, never
+# written by a test (see ffmpeg-ok).
+exec sleep 30

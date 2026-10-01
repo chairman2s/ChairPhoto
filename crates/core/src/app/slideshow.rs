@@ -203,7 +203,7 @@ mod tests {
     use super::*;
     use crate::catalog::Catalog;
     use crate::test_support::TestTmpDir;
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
     use std::sync::Mutex;
 
     #[derive(Default)]
@@ -216,20 +216,14 @@ mod tests {
         }
     }
 
-    /// A fake ffmpeg: a shell script that reports two progress blocks and writes the output
-    /// (the last argument), or — `hang` — replaces itself with a long sleep.
-    fn fake_ffmpeg(dir: &Path, hang: bool) -> PathBuf {
-        let path = dir.join(if hang { "ffmpeg-hang" } else { "ffmpeg-ok" });
-        let body = if hang {
-            "#!/bin/sh\nexec sleep 30\n".to_string()
-        } else {
-            "#!/bin/sh\nfor last; do :; done\necho frame=10\necho progress=continue\necho frame=40\n\
-             echo progress=end\nprintf movie > \"${last#file:}\"\n"
-                .to_string()
-        };
-        std::fs::write(&path, body).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        path
+    /// A fake ffmpeg (`tests/fixtures/ffmpeg/`): a checked-in shell script that reports two
+    /// progress blocks and writes the output (the last argument), or — `hang` — sleeps until
+    /// killed. Never written at run time: a script written and then executed while other test
+    /// threads fork can fail with ETXTBSY (a forked child holding the write descriptor).
+    fn fake_ffmpeg(hang: bool) -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/ffmpeg")
+            .join(if hang { "ffmpeg-hang" } else { "ffmpeg-ok" })
     }
 
     /// A frame writer that copies the original (no thumbnail cache, no exiftool).
@@ -266,7 +260,7 @@ mod tests {
         let out = dir.join("out");
         std::fs::create_dir_all(&out).unwrap();
         std::fs::write(out.join("slideshow.mp4"), b"earlier").unwrap();
-        let job = claim_slideshow(&state, None, &ids, opts(), out.to_str().unwrap(), Some(fake_ffmpeg(&dir, false))).unwrap();
+        let job = claim_slideshow(&state, None, &ids, opts(), out.to_str().unwrap(), Some(fake_ffmpeg(false))).unwrap();
         let id = job.job;
         let path = job.run_with(&copy_frames()).unwrap();
         assert_eq!(path, out.join("slideshow (2).mp4"), "never clobbers an earlier movie");
@@ -279,6 +273,25 @@ mod tests {
         assert!(!work.exists(), "the job's frames are removed");
         for i in 0..2 {
             assert_eq!(std::fs::read(dir.join("library").join(format!("IMG_{i}.jpg"))).unwrap(), format!("jpeg {i}").as_bytes(), "originals untouched");
+        }
+    }
+
+    /// The fake ffmpegs are executable checked-in files the helper only names: asking for
+    /// one never opens it for writing, so no forked child can hold it busy (ETXTBSY).
+    #[test]
+    fn the_fake_ffmpegs_are_checked_in_and_never_written() {
+        for hang in [false, true] {
+            let path = fake_ffmpeg(hang);
+            let before = std::fs::metadata(&path).unwrap();
+            assert!(before.permissions().mode() & 0o111 != 0, "{path:?} is executable");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            assert_eq!(fake_ffmpeg(hang), path);
+            let after = std::fs::metadata(&path).unwrap();
+            assert_eq!(
+                (after.mtime(), after.mtime_nsec(), after.ino()),
+                (before.mtime(), before.mtime_nsec(), before.ino()),
+                "{path:?} was rewritten"
+            );
         }
     }
 
@@ -296,7 +309,7 @@ mod tests {
         let (dir, state, _p, ids) = setup("folder", 2);
         let before = state.jobs.slideshow.job_ids_issued();
         for folder in ["-x", "ftp://example.com/movies", "relative/out", "file:out"] {
-            let err = claim_slideshow(&state, None, &ids, opts(), folder, Some(fake_ffmpeg(&dir, false))).err();
+            let err = claim_slideshow(&state, None, &ids, opts(), folder, Some(fake_ffmpeg(false))).err();
             assert_eq!(err.as_deref(), Some(OUTPUT_FOLDER_NOT_LOCAL), "{folder}");
         }
         assert_eq!(state.jobs.slideshow.job_ids_issued(), before, "no job claimed");
@@ -313,7 +326,7 @@ mod tests {
         crate::app::catalogs::detach_catalog_and_trip_jobs(&state).unwrap();
         let b = Catalog::open(&dir.join("b.chairphoto"), &dir.join("library")).unwrap();
         crate::app::catalogs::publish_catalog_and_reset_jobs(&state, b).unwrap();
-        let err = claim_slideshow(&state, Some(identity), &ids, opts(), dir.to_str().unwrap(), Some(fake_ffmpeg(&dir, false)))
+        let err = claim_slideshow(&state, Some(identity), &ids, opts(), dir.to_str().unwrap(), Some(fake_ffmpeg(false)))
             .err()
             .unwrap();
         assert_eq!(err, CATALOG_CHANGED);
@@ -330,7 +343,7 @@ mod tests {
         for how in ["cancel", "newer", "switch"] {
             let (dir, state, _p, ids) = setup(&format!("abort-{how}"), 2);
             let out = dir.join("out");
-            let job = claim_slideshow(&state, None, &ids, opts(), out.to_str().unwrap(), Some(fake_ffmpeg(&dir, true))).unwrap();
+            let job = claim_slideshow(&state, None, &ids, opts(), out.to_str().unwrap(), Some(fake_ffmpeg(true))).unwrap();
             let handle = job.abort_handle();
             let started = std::time::Instant::now();
             let runner = std::thread::spawn(move || job.run_with(&copy_frames()));
@@ -338,7 +351,7 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(200));
             match how {
                 "cancel" => handle.store(true, Ordering::Relaxed),
-                "newer" => drop(claim_slideshow(&state, None, &ids, opts(), out.to_str().unwrap(), Some(fake_ffmpeg(&dir, false))).unwrap()),
+                "newer" => drop(claim_slideshow(&state, None, &ids, opts(), out.to_str().unwrap(), Some(fake_ffmpeg(false))).unwrap()),
                 _ => {
                     crate::app::catalogs::detach_catalog_and_trip_jobs(&state).unwrap();
                     let b = Catalog::open(&dir.join("b.chairphoto"), &dir.join("b")).unwrap();
@@ -356,7 +369,7 @@ mod tests {
     #[test]
     fn a_cancel_before_the_encode_stops_between_frames() {
         let (dir, state, _p, ids) = setup("between", 3);
-        let job = claim_slideshow(&state, None, &ids, opts(), dir.join("out").to_str().unwrap(), Some(fake_ffmpeg(&dir, false))).unwrap();
+        let job = claim_slideshow(&state, None, &ids, opts(), dir.join("out").to_str().unwrap(), Some(fake_ffmpeg(false))).unwrap();
         let handle = job.abort_handle();
         let written = Arc::new(Mutex::new(0));
         let w = written.clone();

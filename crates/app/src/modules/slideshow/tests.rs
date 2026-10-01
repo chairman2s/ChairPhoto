@@ -15,7 +15,6 @@ use chairphoto_core::catalog::Catalog;
 use gpui_kit::component::WindowExt as _;
 use gpui_kit::test::TestWindowExt as _;
 use gpui_kit::{AppContext as _, Entity, TestAppContext};
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -64,16 +63,11 @@ fn step(cx: &mut TestAppContext) -> usize {
     ran
 }
 
-/// A fake ffmpeg that reports progress and writes `movie` to its output (the last argument).
-fn fake_ffmpeg(dir: &Path) -> PathBuf {
-    let path = dir.join("ffmpeg");
-    std::fs::write(
-        &path,
-        "#!/bin/sh\nfor last; do :; done\necho frame=10\necho progress=end\nprintf movie > \"${last#file:}\"\n",
-    )
-    .unwrap();
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-    path
+/// A fake ffmpeg that reports progress and writes `movie` to its output (the last argument):
+/// core's checked-in fixture script. Never written at run time — a script written and then
+/// executed while other test threads fork can fail with ETXTBSY.
+fn fake_ffmpeg() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../core/tests/fixtures/ffmpeg/ffmpeg-ok")
 }
 
 /// A frame writer that copies the original (no thumbnail cache, no exiftool).
@@ -169,7 +163,7 @@ fn render_writes_the_movie_through_the_worker(cx: &mut TestAppContext) {
     let out = dir.0.join("out");
     std::fs::create_dir_all(&out).unwrap();
     std::fs::write(out.join("slideshow.mp4"), b"earlier").unwrap();
-    let view = open(&app, backend(Some(fake_ffmpeg(&dir.0))), &out, cx);
+    let view = open(&app, backend(Some(fake_ffmpeg())), &out, cx);
     view.read_with(cx, |d, _| assert_eq!(d.order.iter().map(|p| p.id).collect::<Vec<_>>(), ids));
 
     // Drag the second tile onto the first.
@@ -209,7 +203,7 @@ fn progress_is_this_jobs_and_cancel_stops_it(cx: &mut TestAppContext) {
     let app = start(cx);
     catalog_with_files(&app, &dir, 2, cx);
     let out = dir.0.join("out");
-    let view = open(&app, backend(Some(fake_ffmpeg(&dir.0))), &out, cx);
+    let view = open(&app, backend(Some(fake_ffmpeg())), &out, cx);
     render(&app, &view, cx);
     assert!(present(&app, "slideshow-progress", cx));
     step(cx); // the claim
@@ -245,7 +239,7 @@ fn cancel_before_the_claim_keeps_the_job_from_running(cx: &mut TestAppContext) {
     let app = start(cx);
     catalog_with_files(&app, &dir, 2, cx);
     let out = dir.0.join("out");
-    let view = open(&app, backend(Some(fake_ffmpeg(&dir.0))), &out, cx);
+    let view = open(&app, backend(Some(fake_ffmpeg())), &out, cx);
     render(&app, &view, cx);
     view.update(cx, |d, cx| d.cancel(cx));
     assert_eq!(step(cx), 1, "the claim ran");
@@ -278,7 +272,7 @@ fn a_catalog_switch_refuses_the_render_and_closes_the_dialog(cx: &mut TestAppCon
     let dir = TempDir::new("slideshow-switch");
     let app = start(cx);
     let ids = catalog_with_files(&app, &dir, 2, cx);
-    let view = open(&app, backend(Some(fake_ffmpeg(&dir.0))), &dir.0.join("out"), cx);
+    let view = open(&app, backend(Some(fake_ffmpeg())), &dir.0.join("out"), cx);
     let (b, b_ids) = colliding_catalog(&dir, "b", 2);
     assert_eq!(b_ids, ids);
     core_switch(&app, b);
@@ -298,7 +292,7 @@ fn a_switch_after_the_claim_stops_the_render(cx: &mut TestAppContext) {
     let app = start(cx);
     catalog_with_files(&app, &dir, 2, cx);
     let out = dir.0.join("out");
-    let view = open(&app, backend(Some(fake_ffmpeg(&dir.0))), &out, cx);
+    let view = open(&app, backend(Some(fake_ffmpeg())), &out, cx);
     render(&app, &view, cx);
     step(cx); // the claim
     let (b, _) = colliding_catalog(&dir, "b", 2);

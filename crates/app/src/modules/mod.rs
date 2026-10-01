@@ -43,6 +43,8 @@ pub mod statistics;
 
 #[cfg(any(test, feature = "dev-module"))]
 pub mod dev_module;
+#[cfg(feature = "collage")]
+pub mod collage;
 #[cfg(any(feature = "slideshow", feature = "collage"))]
 pub mod dialog;
 #[cfg(feature = "map")]
@@ -394,6 +396,8 @@ pub fn bundled() -> Vec<Rc<dyn Module>> {
     #[cfg(any(test, feature = "dev-module"))]
     modules.push(Rc::new(dev_module::DevModule));
     modules.push(Rc::new(statistics::StatisticsModule));
+    #[cfg(feature = "collage")]
+    modules.push(Rc::new(collage::CollageModule::default()));
     #[cfg(feature = "slideshow")]
     modules.push(Rc::new(slideshow::SlideshowModule::default()));
     #[cfg(feature = "map")]

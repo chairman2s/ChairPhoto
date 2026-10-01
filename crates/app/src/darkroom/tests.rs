@@ -10,7 +10,7 @@ use super::*;
 use crate::image_tests::{pixels, FakePool};
 use crate::shell::state::Surface;
 use crate::storage::Runner;
-use crate::tests::{click, colliding_catalog, core_switch, deliver_switch, open_catalog_with_photos, start, App, TempDir};
+use crate::tests::{click, colliding_catalog, core_switch, open_catalog_with_photos, start, App, TempDir};
 use chairphoto_core::app::{CoreEvent, EventSink as _, CATALOG_CHANGED};
 use chairphoto_core::catalog::Catalog;
 use chairphoto_core::develop::session::DevelopSourceEvent;
@@ -496,9 +496,18 @@ fn autosave_across_a_switch(delivered: bool, cx: &mut TestAppContext) {
     rig.slide(Control::Tone(ToneKey::Ev), -1.0, cx);
     core_switch(&rig.app, b);
     if delivered {
-        deliver_switch(&rig.app, cx);
+        // `catalog:switched` as the router hands it to the model, observed before anything
+        // the handlers spawned has run.
+        let event = CoreEvent::CatalogSwitched("switched.chairphoto".into());
+        rig.app.wired.model.update(cx, |m, cx| m.on_core_event(&event, cx));
         assert_eq!(rig.open_photo(cx), None, "the switch closed the Darkroom");
         assert_eq!(rig.surface(cx), Surface::Library);
+        // What the Darkroom's own close (rather than following the shell to the Library,
+        // which saves and re-reads the rows) prevents: no row read of the new catalog before
+        // the model has read it (`CatalogRead`) …
+        let pending = rig.app.wired.shell.read_with(cx, |s, _| s.rows_pending());
+        assert_eq!(pending, None, "no premature refresh_rows");
+        cx.run_until_parked();
     }
     advance(cx, AUTOSAVE_QUIET);
     work(cx);
@@ -514,6 +523,12 @@ fn autosave_across_a_switch(delivered: bool, cx: &mut TestAppContext) {
         // A refused save is not retried on a timer against the catalog that refuses it.
         advance(cx, AUTOSAVE_QUIET * 3);
         assert_eq!(cx.update(|cx| Runner::get(cx).pending()), 0, "no retry loop");
+    } else {
+        // … and no autosave attempted against the catalog the photo is not in: nothing to
+        // refuse, so nothing reported.
+        assert_eq!(rig.darkroom(cx).read_with(cx, |d, _| d.error.clone()), None, "no autosave was attempted");
+        let line = crate::tests::status(&rig.app, cx);
+        assert!(!line.starts_with("Autosave failed"), "no autosave was attempted: {line}");
     }
 }
 

@@ -578,6 +578,12 @@ impl ShellState {
         self.rows_from
     }
 
+    /// Tests: the generation of the row read in flight, if any.
+    #[cfg(test)]
+    pub(crate) fn rows_pending(&self) -> Option<u64> {
+        self.rows_pending
+    }
+
     /// Re-run the current query off the UI thread (`list_photos`), with the identity of the
     /// catalog it read. Only the newest read lands: the session drops a page whose
     /// generation is stale.

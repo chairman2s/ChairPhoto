@@ -509,6 +509,9 @@ impl Darkroom {
         match event {
             // The photo on the stage belongs to a catalog that is no longer open: close
             // without saving (the write would be refused anyway) and go back to the Library.
+            // Not redundant with the shell's own move to the Library: following that (`sync`
+            // → `leave(true)`) would attempt an autosave the new catalog refuses, and re-read
+            // the rows before the model has read the new catalog.
             CoreEvent::CatalogSwitched(_) => {
                 if self.open.is_some() || self.session_held {
                     self.leave(false, cx);

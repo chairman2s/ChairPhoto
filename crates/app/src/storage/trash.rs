@@ -9,14 +9,21 @@
 //! a run that stopped early, and the failures. Restore trips the trash generation first, so a
 //! delete already walking the filesystem stands down. A result that comes back after a
 //! catalog switch is dropped: its photo ids name another catalog's photos.
+//!
+//! **Catalog switches.** The list is read together with its catalog's identity, and Restore
+//! and Delete send that identity with the ids (`restore_trashed_as`, `empty_trash_as`), so the
+//! core refuses them once another catalog is open — even when the switch has happened but
+//! `catalog:switched` has not reached this dialog yet. When the event does arrive the dialog
+//! drops the old list, selection and confirmation and reads the new catalog's trash.
 
 use super::ui;
+use super::state::StorageEvent;
 use super::{CloseDialog, Runner, StorageState};
 use crate::image_store::{ImageState, ImageStore};
 use crate::model::AppModel;
 use crate::shell::style::Colors;
 use chairphoto_core::app::storage::EmptyTrashReport;
-use chairphoto_core::app::{with_catalog, AppState};
+use chairphoto_core::app::{with_catalog_identified, AppState, CatalogIdentity};
 use chairphoto_core::catalog::Photo;
 use chairphoto_core::image_pool::ImageKind;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
@@ -33,6 +40,8 @@ pub struct TrashDialog {
     model: Entity<AppModel>,
     images: Entity<ImageStore>,
     pub photos: Option<Vec<Photo>>,
+    /// The catalog `photos` (and so every id in `selected`) was read from.
+    pub loaded_from: Option<CatalogIdentity>,
     /// In click order.
     pub selected: Vec<i64>,
     pub error: Option<String>,
@@ -60,19 +69,34 @@ impl TrashDialog {
                 this.destroy(cx);
             }
         });
+        // A switch: the list names another catalog's photos. Drop it, and everything
+        // chosen from it, and read the new catalog's trash.
+        let switched = cx.subscribe(&storage, |this: &mut Self, _, event: &StorageEvent, cx| {
+            if let StorageEvent::CatalogSwitched = event {
+                this.photos = None;
+                this.loaded_from = None;
+                this.selected.clear();
+                this.confirming = false;
+                this.report = None;
+                this.error = None;
+                this.reload(cx);
+                cx.notify();
+            }
+        });
         let mut this = TrashDialog {
             app,
             storage,
             model,
             images,
             photos: None,
+            loaded_from: None,
             selected: Vec::new(),
             error: None,
             confirming: false,
             typed,
             report: None,
             busy: false,
-            _subscriptions: vec![enter],
+            _subscriptions: vec![enter, switched],
         };
         this.reload(cx);
         this
@@ -81,7 +105,7 @@ impl TrashDialog {
     pub fn reload(&mut self, cx: &mut Context<Self>) {
         let state = self.app.clone();
         let epoch = self.storage.read(cx).epoch();
-        let rx = Runner::get(cx).run(move || with_catalog(&state, |c| c.list_trash()));
+        let rx = Runner::get(cx).run(move || with_catalog_identified(&state, |c| c.list_trash()));
         cx.spawn(async move |this, cx| {
             let Ok(result) = rx.await else { return };
             this.update(cx, |s, cx| {
@@ -89,8 +113,9 @@ impl TrashDialog {
                     return;
                 }
                 match result {
-                    Ok(photos) => {
+                    Ok((from, photos)) => {
                         s.photos = Some(photos);
+                        s.loaded_from = Some(from);
                         s.selected.clear();
                     }
                     Err(e) => s.error = Some(e),
@@ -127,6 +152,7 @@ impl TrashDialog {
     }
 
     pub fn restore(&mut self, cx: &mut Context<Self>) {
+        let Some(from) = self.loaded_from else { return };
         if self.busy {
             return;
         }
@@ -134,7 +160,8 @@ impl TrashDialog {
         let ids = self.targets();
         let state = self.app.clone();
         let epoch = self.storage.read(cx).epoch();
-        let rx = Runner::get(cx).run(move || chairphoto_core::app::storage::restore_trashed(&state, &ids));
+        let rx =
+            Runner::get(cx).run(move || chairphoto_core::app::storage::restore_trashed_as(&state, from, &ids));
         cx.spawn(async move |this, cx| {
             let result = rx.await.unwrap_or_else(|_| Err("the restore worker stopped".into()));
             this.update(cx, |s, cx| {
@@ -185,12 +212,13 @@ impl TrashDialog {
         if self.busy || !self.confirming || self.typed.read(cx).value() != CONFIRM_WORD {
             return;
         }
+        let Some(from) = self.loaded_from else { return };
         self.busy = true;
         let ids = self.targets();
         let state = self.app.clone();
         let epoch = self.storage.read(cx).epoch();
         let rx = Runner::get(cx)
-            .run(move || chairphoto_core::app::storage::empty_trash(&state, Some(ids), None, true));
+            .run(move || chairphoto_core::app::storage::empty_trash_as(&state, Some(from), Some(ids), None, true));
         cx.spawn(async move |this, cx| {
             let result = rx.await.unwrap_or_else(|_| Err("the delete worker stopped".into()));
             this.update(cx, |s, cx| {

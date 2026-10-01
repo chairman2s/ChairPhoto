@@ -132,6 +132,10 @@ pub struct LocalSendProgress {
 #[derive(Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ImportProgress {
+    /// The import job this progress belongs to (`scans::claim_import`), so a front end can
+    /// drop a superseded or switched-away import's stragglers. Ids start at 1; `0` is the
+    /// Tauri bundle export, which reuses this event and is no import job.
+    pub job: u64,
     pub done: usize,
     pub total: usize,
 }
@@ -335,9 +339,9 @@ mod tests {
 
     #[test]
     fn visit_hands_over_the_wire_name_and_the_payload_as_its_own_type() {
-        let (name, json) = wire(CoreEvent::ImportProgress(ImportProgress { done: 2, total: 5 }));
+        let (name, json) = wire(CoreEvent::ImportProgress(ImportProgress { job: 3, done: 2, total: 5 }));
         assert_eq!(name, "import:progress");
-        assert_eq!(json, serde_json::json!({ "done": 2, "total": 5 }));
+        assert_eq!(json, serde_json::json!({ "job": 3, "done": 2, "total": 5 }));
 
         let (name, json) = wire(CoreEvent::CatalogSwitched("/tmp/a.chairphoto".into()));
         assert_eq!(name, "catalog:switched");

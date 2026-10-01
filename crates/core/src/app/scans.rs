@@ -118,27 +118,51 @@ pub fn ingest_from_card(
     name: Option<&str>,
     selected: Option<std::collections::HashSet<String>>,
 ) -> Result<ScanResult, String> {
-    let abort = claim_import(state)?;
-    ingest_from_card_claimed(state, &abort, source, name, selected)
+    let claim = claim_import(state)?;
+    ingest_from_card_claimed(state, &claim, source, name, selected)
 }
 
-/// Claim the import generation: trip the running import and install a fresh flag. One abort
-/// lock, never the catalog's — cheap enough for a UI thread, which is the point: a front end
-/// that claims when the user presses Import can cancel (or a switch can trip) the import
-/// before its worker has even started.
-pub fn claim_import(state: &AppState) -> Result<std::sync::Arc<AtomicBool>, String> {
-    state.jobs.import.install_fresh()
+/// An import's ownership: its generation of the import abort flag, and the job id its
+/// `import:progress` events carry.
+#[derive(Clone)]
+pub struct ImportClaim {
+    pub abort: std::sync::Arc<AtomicBool>,
+    pub job: u64,
+}
+
+/// Claim the import generation: trip the running import, install a fresh flag and number the
+/// job. One abort lock, never the catalog's — cheap enough for a UI thread, which is the
+/// point: a front end that claims when the user presses Import can cancel (or a switch can
+/// trip) the import before its worker has even started, and knows the job id its progress
+/// will carry before any arrives.
+pub fn claim_import(state: &AppState) -> Result<ImportClaim, String> {
+    let (abort, job) = state.jobs.import.install_fresh_numbered()?;
+    Ok(ImportClaim { abort, job })
 }
 
 /// [`ingest_from_card`] under an import generation the caller already claimed
 /// ([`claim_import`]). Already tripped: it copies nothing.
 pub fn ingest_from_card_claimed(
     state: &AppState,
-    abort: &AtomicBool,
+    claim: &ImportClaim,
     source: &Path,
     name: Option<&str>,
     selected: Option<std::collections::HashSet<String>>,
 ) -> Result<ScanResult, String> {
+    ingest_claimed_with(state, claim, source, name, selected, &|| {})
+}
+
+/// [`ingest_from_card_claimed`], calling `after_copy` once the copy finished un-cancelled and
+/// before the import commits to indexing — where a test puts a Cancel.
+fn ingest_claimed_with(
+    state: &AppState,
+    claim: &ImportClaim,
+    source: &Path,
+    name: Option<&str>,
+    selected: Option<std::collections::HashSet<String>>,
+    after_copy: &dyn Fn(),
+) -> Result<ScanResult, String> {
+    let (abort, job) = (&*claim.abort, claim.job);
     if abort.load(Ordering::Relaxed) {
         return Err(cancelled_message(0));
     }
@@ -150,17 +174,24 @@ pub fn ingest_from_card_claimed(
     let (result, copied, aborted) = {
         let events = state.clone();
         crate::scanner::copy_from_card_abortable(source, &dest, selected.as_ref(), abort, move |done, total| {
-            events.send(CoreEvent::ImportProgress(ImportProgress { done, total }))
+            events.send(CoreEvent::ImportProgress(ImportProgress { job, done, total }))
         })?
     };
     if aborted || abort.load(Ordering::Relaxed) {
         return Err(cancelled_message(copied.len()));
     }
+    after_copy();
 
-    // Index the copies. The scan generation is taken as `run_blocking_scan` always took it
-    // (a card import supersedes a running scan), and the import generation is checked once
-    // more after it: a switch that landed after the copy must not see these rows indexed.
-    let _scan = begin_scan_generation(state)?;
+    // Index the copies. A card import supersedes a running scan, as `run_blocking_scan`
+    // always did, but only once it commits to indexing. The check of this import's flag and
+    // the replacement of the scan generation happen under both locks
+    // (`install_fresh_if_owner`), so an import cancelled after its copy never stops a
+    // rescan's enrichment. The import flag is checked once more after that: a switch or
+    // Cancel landing after the commit must not see these rows indexed. A tripped scan stays
+    // tripped; its queued enrichment rows are drained by the next scan (I6d).
+    let Some(_scan) = state.jobs.scan.install_fresh_if_owner(&state.jobs.import, abort)? else {
+        return Err(cancelled_message(copied.len()));
+    };
     let indexed = (|| {
         if abort.load(Ordering::Relaxed) {
             return Err(cancelled_message(copied.len()));
@@ -268,6 +299,27 @@ mod tests {
         assert_eq!(photos(&state), 0, "nothing indexed after the cancel");
         let copied = walkdir::WalkDir::new(dir.join("library")).into_iter().filter_map(|e| e.ok()).filter(|e| e.file_type().is_file()).count();
         assert_eq!(copied, 1, "the copy stopped before the second file, and kept the first");
+    }
+
+    /// **Forced interleaving.** A rescan's enrichment is running (its scan generation is
+    /// live) when a card import finishes its copy; the import is cancelled right then, before
+    /// it commits to indexing. The cancelled import indexes nothing and the rescan's
+    /// enrichment keeps running. Without the Cancel, the import does supersede the scan.
+    #[test]
+    fn a_cancelled_import_leaves_a_running_rescan_alone() {
+        let (_dir, state, _names, card) = setup("cancel-vs-scan", 1);
+        let enrichment = state.jobs.scan.install_fresh().unwrap();
+        let claim = claim_import(&state).unwrap();
+        let cancel = || cancel_import(&state).unwrap();
+        let err = ingest_claimed_with(&state, &claim, &card, None, None, &cancel).unwrap_err();
+        assert!(err.contains("1 file already copied"), "{err}");
+        assert!(!enrichment.load(Ordering::Relaxed), "the cancelled import stopped the rescan's enrichment");
+        assert_eq!(photos(&state), 0);
+
+        let claim = claim_import(&state).unwrap();
+        std::fs::write(card.join("IMG_new.jpg"), b"another").unwrap();
+        ingest_claimed_with(&state, &claim, &card, None, None, &|| {}).unwrap();
+        assert!(enrichment.load(Ordering::Relaxed), "an import that indexes supersedes the scan");
     }
 
     #[test]

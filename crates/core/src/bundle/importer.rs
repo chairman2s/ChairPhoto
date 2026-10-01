@@ -115,6 +115,28 @@ pub fn extract_originals(
     dest_base: &Path,
     on_progress: impl Fn(usize, usize),
 ) -> Result<(Vec<ExtractedItem>, BundleImportResult), String> {
+    let never = std::sync::atomic::AtomicBool::new(false);
+    extract_originals_abortable(manifest, archive, dest_base, &never, on_progress)
+        .map(|(extracted, result, _)| (extracted, result))
+}
+
+/// [`extract_originals`], stopping before the next original once `abort` is set (a Cancel,
+/// a newer import or a catalog switch). The third value is whether it stopped early.
+///
+/// A stop never leaves a half-written file: `abort` is read between originals, and each
+/// original is written whole. What was unpacked before the stop **stays** in the library
+/// folder, each copy with its identity sidecar, and nothing is deleted. A same-size
+/// "already here" entry may be the user's own pre-existing original, and this function will
+/// not decide which files it may remove. Importing the bundle again finishes the job: the
+/// copies are then same-size skips, bound by UUID and indexed. A rescan also picks them up
+/// under the bundle's identity.
+pub fn extract_originals_abortable(
+    manifest: &BundleManifest,
+    archive: &mut ZipArchive<std::fs::File>,
+    dest_base: &Path,
+    abort: &std::sync::atomic::AtomicBool,
+    on_progress: impl Fn(usize, usize),
+) -> Result<(Vec<ExtractedItem>, BundleImportResult, bool), String> {
     let total = manifest.photos.len();
     let mut result = BundleImportResult {
         copied: 0,
@@ -125,6 +147,9 @@ pub fn extract_originals(
     let mut extracted: Vec<ExtractedItem> = Vec::new();
 
     for (i, bp) in manifest.photos.iter().enumerate() {
+        if abort.load(std::sync::atomic::Ordering::Relaxed) {
+            return Ok((extracted, result, true));
+        }
         on_progress(i + 1, total);
 
         let arc_orig = format!("{}/{}", ORIGINALS_DIR, bp.relative_path);
@@ -301,7 +326,7 @@ pub fn extract_originals(
         });
     }
 
-    Ok((extracted, result))
+    Ok((extracted, result, false))
 }
 
 // ---------------------------------------------------------------------------
@@ -520,6 +545,13 @@ pub fn index_bundle(
     // `reconcile_missing_for` instead — see `scanner::phase_b_enrich`.
     let _ = catalog.reconcile_missing();
 
+    // The merge counts the photos Step A created as "existing" — it ran after them. To the
+    // user they are what this import added, so report them so: `photos_added` is everything
+    // new to this catalog (created by the upsert, plus metadata-only photos the merge
+    // inserted), and `photos_existing` only what was here before.
+    let mut merge_summary = merge_summary;
+    merge_summary.photos_added += newly_created.len();
+    merge_summary.photos_existing = merge_summary.photos_existing.saturating_sub(newly_created.len());
     partial_result.merge = merge_summary;
     Ok(partial_result)
 }
@@ -721,12 +753,13 @@ mod tests {
         assert_eq!(result.copied, 1);
         assert_eq!(result.errors, 0);
 
-        // The F1c merge adds the batch and sees the photo as existing (the upsert phase
-        // already placed it via upsert_photo_with_identity, so merge sees photos_existing=1
-        // and photos_added=0 — correct additive behaviour).
+        // The F1c merge adds the batch. The upsert phase created the photo before the merge
+        // ran; the result reports it as what this import added (not as existing), and the
+        // merge did not duplicate it.
         assert!(result.merge.batch_added, "batch must be recorded");
-        assert_eq!(result.merge.photos_existing, 1, "upsert pre-placed the photo");
-        assert_eq!(result.merge.photos_added, 0, "merge should not duplicate the photo");
+        assert_eq!(result.merge.photos_existing, 0, "nothing was here before");
+        assert_eq!(result.merge.photos_added, 1, "the import added one photo");
+        assert_eq!(catalog.count_photos(&Default::default()).unwrap(), 1, "and only one");
 
         // The photo is in the catalog with the bundle's state (rating applied by merge).
         let photo = catalog.get_photo_by_uuid("uuid-index-1").unwrap();

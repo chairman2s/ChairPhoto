@@ -159,9 +159,13 @@ pub struct Progress {
 /// The three jobs the bench reports, as their last events left them.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Jobs {
-    /// `import:progress` — cleared by the import flow when it ends (Storage and import,
-    /// #114) and on a catalog switch.
+    /// `import:progress` of [`Self::import_job`] — cleared by the import flow when it ends
+    /// (Storage and import, #114) and on a catalog switch.
     pub import: Option<(usize, usize)>,
+    /// The import job the bench follows, set by the import flow when it claims one. Progress
+    /// from any other job — a superseded import, or one from the catalog that was left — is a
+    /// straggler and moves nothing, so it cannot put the bench back on a dead import.
+    pub import_job: Option<u64>,
     /// `scan:progress` — cleared by its `done` phase.
     pub scan: Option<(String, usize, usize)>,
     /// `develop:progress` — `(phase, editor)`, cleared by done/nochange/error.
@@ -198,7 +202,7 @@ impl Jobs {
     /// Fold one core event in. Returns whether anything changed.
     pub fn on_core_event(&mut self, event: &CoreEvent) -> bool {
         match event {
-            CoreEvent::ImportProgress(p) => self.import = Some((p.done, p.total)),
+            CoreEvent::ImportProgress(p) if self.import_job == Some(p.job) => self.import = Some((p.done, p.total)),
             CoreEvent::ScanProgress(p) if p.phase == "done" => self.scan = None,
             CoreEvent::ScanProgress(p) => self.scan = Some((p.phase.clone(), p.done, p.total)),
             CoreEvent::DevelopProgress(p) if matches!(p.phase.as_str(), "done" | "nochange" | "error") => {
@@ -936,7 +940,8 @@ mod tests {
         );
         jobs.on_core_event(&scan("metadata", 10, 2000));
         assert_eq!(jobs.bench_progress().unwrap().label, "Reading metadata 10/2,000");
-        jobs.on_core_event(&CoreEvent::ImportProgress(ImportProgress { done: 3, total: 9 }));
+        jobs.import_job = Some(4);
+        jobs.on_core_event(&CoreEvent::ImportProgress(ImportProgress { job: 4, done: 3, total: 9 }));
         assert_eq!(
             jobs.bench_progress(),
             Some(Progress { label: "Importing 3/9".into(), done: 3, total: Some(9) })
@@ -951,7 +956,8 @@ mod tests {
     #[test]
     fn a_catalog_switch_clears_every_job() {
         let mut jobs = Jobs::default();
-        jobs.on_core_event(&CoreEvent::ImportProgress(ImportProgress { done: 0, total: 0 }));
+        jobs.import_job = Some(1);
+        jobs.on_core_event(&CoreEvent::ImportProgress(ImportProgress { job: 1, done: 0, total: 0 }));
         assert_eq!(jobs.bench_progress().unwrap().label, "Importing …");
         assert!(jobs.on_core_event(&CoreEvent::CatalogSwitched("x".into())));
         assert_eq!(jobs, Jobs::default());

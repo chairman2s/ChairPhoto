@@ -599,8 +599,9 @@ root setting rather than silently using whatever the caller passed.
 `switch_catalog` performs a safe handoff in four steps:
 
 1. **Abort every in-flight job** — trips the installed abort generation of every family in
-   `AppState::jobs` (scan, face indexing, face matching, sharpness, pHash, Smart Tagging,
-   identity repair) and clears every queryable status slot, so a running job exits at its
+   `AppState::jobs` (scan, face indexing, face matching, sharpness, pHash, trash, import,
+   reconcile, Smart Tagging, identity repair, develop) and clears every queryable status
+   slot, so a running job exits at its
    next cancellation point and stops being reachable as a slot's owner. The scan and the
    identity repair pass each run on their own `open_secondary` connection, so the mutex is
    not held and the swap is not blocked by either.
@@ -622,7 +623,12 @@ runs the same transition — it replaces the catalog handle exactly as a switch 
 
 - **No cross-catalog writes**: an aborted scan stops at the first cancellation point; any
   writes already committed are durable in the *old* catalog only and never appear in the
-  new one (they are separate SQLite files).
+  new one (they are separate SQLite files). A back-up drain (`storage::ReconcileClaim`)
+  runs every op on its own connection to the catalog it claimed, so the op in flight at a
+  switch finishes there and the drain then stops. A write keyed by ids a front end read
+  earlier (Trash today) carries the `CatalogIdentity` it read them with and goes through
+  `with_catalog_as`. That write fails closed once another catalog is open, even before
+  `catalog:switched` reaches the UI.
 - **No dangling state**: between step 2 (close) and step 4 (emit `catalog:switched`) the
   `Option<Catalog>` holds `None`. Any command that calls `with_catalog` during this window
   returns `"No catalog is open"` rather than touching a stale connection.

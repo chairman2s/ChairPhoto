@@ -30,7 +30,7 @@
 //!
 //! **catalog → abort generations → status slots**, and within each of the last two groups
 //! the declaration order of [`JobRegistry`]: scan, face indexing, face matching, sharpness,
-//! pHash, trash, import, Smart Tagging, identity repair.
+//! pHash, trash, import, reconcile, Smart Tagging, identity repair.
 //!
 //! Every nested acquisition in the backend obeys it:
 //!
@@ -39,7 +39,9 @@
 //! | [`JobFamily::begin`] | catalog → that family's abort → that family's slot |
 //! | [`JobRegistry::lock_for_detach`] (switch phase one) | every abort, then every slot |
 //! | [`JobRegistry::lock_for_publish`] (switch phase two) | every abort |
-//! | [`AbortGeneration::install_fresh`] (scan / sharpness / pHash / import starts) | one abort, released before the catalog is read |
+//! | [`AbortGeneration::install_fresh`] (scan / sharpness / pHash starts), `scans::claim_import` | one abort, released before the catalog is read |
+//! | `storage::claim_reconcile` (a back-up drain or offload-policy start) | catalog → the reconcile abort |
+//! | [`AbortGeneration::install_fresh_if_owner`] (a card import committing to index) | the scan abort → the import abort |
 //! | [`AbortGeneration::trip`] (every Cancel command) | one abort |
 //! | [`JobSlot`] writes (workers) | one slot |
 //! | `develop`'s resident set (`develop::with_resident`) | a leaf: after any of the above, never across another lock |
@@ -50,6 +52,17 @@
 //!
 //! Every transition here acquires **all** of its guards before its first mutation, so a
 //! poisoned mutex fails the whole transition rather than leaving a prefix of it applied.
+//!
+//! # Writes keyed by ids read earlier
+//!
+//! Abort generations stop *workers*. A front end's own write keyed by row ids, such as a
+//! culling mark, a burst or stack accept, or a trash delete, needs one more guard. The
+//! switch publishes the new catalog before `catalog:switched` reaches the UI, so such a write
+//! can land on the new catalog's rows. For these, capture [`super::CatalogIdentity`] with the
+//! snapshot (`with_catalog_identified`) and write through `with_catalog_as`. That fails closed
+//! (`CATALOG_CHANGED`) when the open catalog is no longer the one read. It takes no lock of
+//! its own: the identity is checked under the catalog lock the write already holds, so it
+//! adds nothing to the order above.
 
 use crate::catalog::Catalog;
 use std::path::PathBuf;
@@ -115,6 +128,37 @@ impl AbortGeneration {
     pub fn install_fresh(&self) -> Result<Arc<AtomicBool>, String> {
         let mut guard = self.lock()?;
         Ok(trip_and_replace(&mut guard))
+    }
+
+    /// [`Self::install_fresh`], also allocating the new job's id under the same lock, so the
+    /// id order matches the generation order (the import start: its progress carries the id).
+    pub fn install_fresh_numbered(&self) -> Result<(Arc<AtomicBool>, u64), String> {
+        let mut guard = self.lock()?;
+        let job = self.next_job_id();
+        Ok((trip_and_replace(&mut guard), job))
+    }
+
+    /// Replace this generation (trip the running job, install a fresh flag) **only if**
+    /// `owner_flag` — a job of the `owner` family — is still un-tripped, checked while holding
+    /// both locks. `None` when the owner was already stopped; then nothing is tripped.
+    ///
+    /// For one job superseding another family's job only once it commits: a card import
+    /// replaces a running scan when it starts indexing. Checking and replacing under both
+    /// locks means a Cancel of the import (which trips under `owner`'s lock) lands either
+    /// before (nothing is tripped here) or after (the import stops at its next check).
+    /// `self` must precede `owner` in the [`JobRegistry`] declaration order (scan before
+    /// import), which is the order these locks are taken in.
+    pub fn install_fresh_if_owner(
+        &self,
+        owner: &AbortGeneration,
+        owner_flag: &AtomicBool,
+    ) -> Result<Option<Arc<AtomicBool>>, String> {
+        let mut guard = self.lock()?;
+        let _owner = owner.lock()?;
+        if owner_flag.load(Ordering::Relaxed) {
+            return Ok(None);
+        }
+        Ok(Some(trip_and_replace(&mut guard)))
     }
 
     /// Trip the installed generation. Every Cancel command is exactly this; a no-op when
@@ -399,6 +443,12 @@ pub struct JobRegistry {
     /// left. No status slot — progress is `import:progress`, and the start reports its own
     /// terminal result.
     pub import: AbortGeneration,
+    /// Draining the reconcile queue and applying the offload policy (E4) — backups,
+    /// offloads and restores across volumes. Claimed under the catalog lock
+    /// (`storage::claim_reconcile`), so a catalog switch trips every drain that read the
+    /// catalog it is replacing; a newer drain trips an older one. No status slot — a drain
+    /// reports its own terminal summary.
+    pub reconcile: AbortGeneration,
     /// The sidecar-identity repair pass (#34) — retries `pending_sidecar_identity`.
     ///
     /// Not feature-gated, and the first family here that isn't: identity debt is core, so
@@ -439,6 +489,7 @@ impl JobRegistry {
             phash: _,
             trash: _,
             import: _,
+            reconcile: _,
             #[cfg(feature = "smarttags")]
             smarttags,
             identity,
@@ -477,6 +528,7 @@ impl JobRegistry {
             phash,
             trash,
             import,
+            reconcile,
             #[cfg(feature = "smarttags")]
             smarttags,
             identity,
@@ -493,6 +545,7 @@ impl JobRegistry {
             phash: phash.lock()?,
             trash: trash.lock()?,
             import: import.lock()?,
+            reconcile: reconcile.lock()?,
             #[cfg(feature = "smarttags")]
             smarttags: smarttags.abort.lock()?,
             identity: identity.abort.lock()?,
@@ -513,6 +566,7 @@ pub struct AbortGuards<'a> {
     phash: MutexGuard<'a, Arc<AtomicBool>>,
     trash: MutexGuard<'a, Arc<AtomicBool>>,
     import: MutexGuard<'a, Arc<AtomicBool>>,
+    reconcile: MutexGuard<'a, Arc<AtomicBool>>,
     #[cfg(feature = "smarttags")]
     smarttags: MutexGuard<'a, Arc<AtomicBool>>,
     identity: MutexGuard<'a, Arc<AtomicBool>>,
@@ -533,6 +587,7 @@ impl AbortGuards<'_> {
             phash,
             trash,
             import,
+            reconcile,
             #[cfg(feature = "smarttags")]
             smarttags,
             identity,
@@ -548,6 +603,7 @@ impl AbortGuards<'_> {
         phash.store(true, Ordering::Relaxed);
         trash.store(true, Ordering::Relaxed);
         import.store(true, Ordering::Relaxed);
+        reconcile.store(true, Ordering::Relaxed);
         #[cfg(feature = "smarttags")]
         smarttags.store(true, Ordering::Relaxed);
         identity.store(true, Ordering::Relaxed);
@@ -585,6 +641,7 @@ impl AbortGuards<'_> {
             ref mut phash,
             ref mut trash,
             ref mut import,
+            ref mut reconcile,
             #[cfg(feature = "smarttags")]
                 ref mut smarttags,
             ref mut identity,
@@ -602,6 +659,7 @@ impl AbortGuards<'_> {
         **phash = Arc::new(AtomicBool::new(false));
         **trash = Arc::new(AtomicBool::new(false));
         **import = Arc::new(AtomicBool::new(false));
+        **reconcile = Arc::new(AtomicBool::new(false));
         #[cfg(feature = "smarttags")]
         {
             **smarttags = Arc::new(AtomicBool::new(false));

@@ -225,6 +225,67 @@ pub fn with_catalog<T>(
     f(catalog).map_err(|e| e.to_string())
 }
 
+// ── Catalog identity ─────────────────────────────────────────────────────────
+
+/// Which open catalog a snapshot was read from — the guard for a write keyed by row ids.
+///
+/// Photo, op and batch ids are per catalog: id 7 in one catalog is an unrelated photo in the
+/// next. A front end reads a list on a worker, shows it, and later sends a write keyed by
+/// those ids. A catalog switch can land in between: `catalogs::switch_catalog_in` publishes
+/// the new catalog *before* `catalog:switched` reaches the UI. Then the write lands on the new
+/// catalog's rows. To prevent that, capture the identity **with** the snapshot
+/// ([`with_catalog_identified`]) and write through [`with_catalog_as`]. The write then fails
+/// closed with [`CATALOG_CHANGED`] when the open catalog is no longer that one. The check
+/// and the write run under the same catalog lock, so no switch fits between them.
+///
+/// The identity is the open handle's [`Catalog::instance_id`], not its path, so a switch away
+/// and back also counts as a change. That errs towards refusing a write the user can redo.
+/// Lock order: it adds no lock; it is checked under the catalog lock the write takes anyway.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct CatalogIdentity(u64);
+
+/// What [`with_catalog_as`] answers when the catalog it was bound to is no longer open.
+pub const CATALOG_CHANGED: &str = "The catalog changed since this was read";
+
+/// The open catalog's identity, read under a brief lock. Prefer [`with_catalog_identified`]
+/// when a read goes with it, so both come from the same catalog by construction.
+pub fn catalog_identity(state: &AppState) -> Result<CatalogIdentity, String> {
+    with_catalog_identified(state, |_| Ok(())).map(|(id, ())| id)
+}
+
+/// [`with_catalog`], also returning the identity of the catalog `f` read — captured under the
+/// same lock, so the snapshot and the identity cannot disagree.
+pub fn with_catalog_identified<T>(
+    state: &AppState,
+    f: impl FnOnce(&Catalog) -> crate::catalog::Result<T>,
+) -> Result<(CatalogIdentity, T), String> {
+    with_catalog(state, |c| Ok((CatalogIdentity(c.instance_id()), f(c)?)))
+}
+
+/// [`with_catalog`], but only while the open catalog is still `expected`. Otherwise it fails
+/// closed with [`CATALOG_CHANGED`] and does not run `f`. The check and `f` share one lock
+/// hold, so a switch cannot land between them.
+pub fn with_catalog_as<T>(
+    state: &AppState,
+    expected: CatalogIdentity,
+    f: impl FnOnce(&Catalog) -> crate::catalog::Result<T>,
+) -> Result<T, String> {
+    let guard = state.catalog.lock().map_err(|e| e.to_string())?;
+    let catalog = guard.as_ref().ok_or("No catalog is open")?;
+    if catalog.instance_id() != expected.0 {
+        return Err(CATALOG_CHANGED.into());
+    }
+    f(catalog).map_err(|e| e.to_string())
+}
+
+impl CatalogIdentity {
+    /// Whether `catalog` is the handle this identity names — for code that already holds the
+    /// catalog lock (e.g. a multi-step job's plan or record phase).
+    pub fn is(&self, catalog: &Catalog) -> bool {
+        catalog.instance_id() == self.0
+    }
+}
+
 /// Like `with_catalog`, but runs the closure on a blocking worker thread so the
 /// UI thread and the async runtime are never stalled by SQLite work.
 pub async fn with_catalog_blocking<T: Send + 'static>(
@@ -381,6 +442,35 @@ mod tests {
         worker.send(ev());
         state.send(ev());
         assert_eq!(sink.0.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    /// **Forced interleaving.** A list is read with its identity, then the catalog switches
+    /// (both phases), then the write keyed by the list's ids arrives: it fails closed and the
+    /// new catalog's row with the same id is untouched. A write bound to the new catalog works.
+    #[test]
+    fn a_write_bound_to_the_old_catalog_fails_closed_after_a_switch() {
+        let dir = crate::test_support::TestTmpDir::new("catalog-identity");
+        let open = |n: &str| Catalog::open(&dir.join(format!("{n}.chairphoto")), &dir.join(n)).unwrap();
+        let (a, b) = (open("a"), open("b"));
+        let a_id = a.upsert_photo(&dir.join("a/x.jpg"), None, 1, 1).unwrap().id;
+        let b_id = b.upsert_photo(&dir.join("b/y.jpg"), None, 1, 1).unwrap().id;
+        assert_eq!(a_id, b_id, "the ids collide, as real catalogs' do");
+        let state = AppState::default();
+        *state.catalog.lock().unwrap() = Some(a);
+
+        let (seen, ids) = with_catalog_identified(&state, |c| Ok(vec![c.get_photo(a_id)?.id])).unwrap();
+        assert_eq!(catalog_identity(&state).unwrap(), seen);
+        catalogs::detach_catalog_and_trip_jobs(&state).unwrap();
+        catalogs::publish_catalog_and_reset_jobs(&state, b).unwrap();
+
+        let err = with_catalog_as(&state, seen, |c| c.set_culling(ids[0], Some(5), None, None)).unwrap_err();
+        assert_eq!(err, CATALOG_CHANGED);
+        assert_eq!(with_catalog(&state, |c| c.get_photo(b_id)).unwrap().rating, 0, "the new catalog's photo kept its rating");
+
+        let now = catalog_identity(&state).unwrap();
+        assert_ne!(now, seen);
+        with_catalog_as(&state, now, |c| c.set_culling(b_id, Some(3), None, None)).unwrap();
+        assert_eq!(with_catalog(&state, |c| c.get_photo(b_id)).unwrap().rating, 3);
     }
 
     #[test]

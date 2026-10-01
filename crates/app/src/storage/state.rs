@@ -5,9 +5,9 @@
 //! **Ownership.** Every job start takes a sequence number, and every start also records the
 //! catalog epoch (bumped by `catalog:switched`). A result lands only when both are still
 //! current: a newer start of the same job or a catalog switch makes an older worker's result
-//! unreachable, as AGENTS.md requires. The core does the other half — the import and identity
-//! generations are tripped by a newer start, by Cancel and by the switch itself, so the old
-//! worker stops at its next file or copy rather than running on.
+//! unreachable, as AGENTS.md requires. The core does the other half — the import, reconcile
+//! and identity generations are tripped by a newer start, by Cancel and by the switch itself,
+//! so the old worker stops at its next file, op or copy rather than running on.
 //!
 //! **Identity repair.** The pass's events carry its job id; this entity follows exactly one
 //! job. `identity:repair_done` is the required terminal signal. The job id reaches the UI
@@ -68,6 +68,9 @@ pub enum StorageEvent {
     BundleImported(Result<BundleImportResult, String>),
     /// The identity repair pass this entity followed ended: the queue changed.
     RepairEnded,
+    /// `catalog:switched` arrived and [`StorageState::epoch`] has moved on: whatever a dialog
+    /// read from the old catalog names other photos now.
+    CatalogSwitched,
 }
 
 pub struct StorageState {
@@ -80,9 +83,11 @@ pub struct StorageState {
     pub import: Option<ImportJob>,
     /// The running rescan's `(seq, epoch)`.
     scan: Option<(u64, u64)>,
-    /// A back-up drain is running (overlapping triggers start no second one, as React's
-    /// `reconciling` ref).
-    pub reconciling: bool,
+    /// The epoch of the back-up drain running now: overlapping triggers in one catalog start
+    /// no second one (React's `reconciling` ref). A drain from before a catalog switch does
+    /// not count — the switch tripped it in the core (`storage::ReconcileClaim`), so the new
+    /// catalog's launch drain must not wait for it.
+    pub reconciling: Option<u64>,
     pub repair: RepairState,
     /// The storage dialog opened last (tests drive it through this).
     pub last_dialog: Option<super::open::StorageDialog>,
@@ -115,7 +120,7 @@ impl StorageState {
             seq: 0,
             import: None,
             scan: None,
-            reconciling: false,
+            reconciling: None,
             repair: RepairState::default(),
             last_dialog: None,
             launch_checked: None,
@@ -150,8 +155,10 @@ impl StorageState {
         self.model.update(cx, |m, cx| m.refresh(cx));
     }
 
-    fn set_bench_import(&self, progress: Option<(usize, usize)>, cx: &mut Context<Self>) {
+    /// Put the bench on import job `job` (its `import:progress` events move it), or clear it.
+    fn set_bench_import(&self, job: Option<u64>, progress: Option<(usize, usize)>, cx: &mut Context<Self>) {
         self.shell.update(cx, |s, cx| {
+            s.jobs.import_job = job;
             s.jobs.import = progress;
             cx.notify();
         });
@@ -168,6 +175,7 @@ impl StorageState {
                 self.import = None;
                 self.scan = None;
                 self.repair = RepairState::default();
+                cx.emit(StorageEvent::CatalogSwitched);
                 cx.notify();
             }
             CoreEvent::IdentityRepairProgress(p) => {
@@ -192,19 +200,19 @@ impl StorageState {
     pub fn start_card_import(&mut self, source: PathBuf, name: String, selected: Vec<String>, cx: &mut Context<Self>) {
         let job = ImportJob { seq: self.next_seq(), epoch: self.epoch, kind: ImportKind::Card };
         self.import = Some(job.clone());
-        self.set_bench_import(Some((0, 0)), cx);
         self.status("Importing from card…".into(), cx);
         let state = self.app.clone();
         let name = (!name.trim().is_empty()).then(|| name.trim().to_string());
         let selected: HashSet<String> = selected.into_iter().collect();
         // Claimed here, not on the worker: a Cancel or a catalog switch before the worker
         // starts must still stop it. One abort-flag lock, never the catalog's.
-        let abort = match scans::claim_import(&self.app) {
-            Ok(a) => a,
+        let claim = match scans::claim_import(&self.app) {
+            Ok(c) => c,
             Err(e) => return self.finish_import(&job, Err(e), cx),
         };
+        self.set_bench_import(Some(claim.job), Some((0, 0)), cx);
         let rx = Runner::get(cx)
-            .run(move || scans::ingest_from_card_claimed(&state, &abort, &source, name.as_deref(), Some(selected)));
+            .run(move || scans::ingest_from_card_claimed(&state, &claim, &source, name.as_deref(), Some(selected)));
         cx.spawn(async move |this, cx| {
             let Ok(result) = rx.await else { return };
             this.update(cx, |s, cx| s.finish_import(&job, result.map(ImportOutcome::Card), cx)).ok();
@@ -217,15 +225,15 @@ impl StorageState {
     pub fn start_bundle_import(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         let job = ImportJob { seq: self.next_seq(), epoch: self.epoch, kind: ImportKind::Bundle };
         self.import = Some(job.clone());
-        self.set_bench_import(Some((0, 0)), cx);
         self.status("Importing bundle…".into(), cx);
         let state = self.app.clone();
-        let abort = match scans::claim_import(&self.app) {
-            Ok(a) => a,
+        let claim = match scans::claim_import(&self.app) {
+            Ok(c) => c,
             Err(e) => return self.finish_import(&job, Err(e), cx),
         };
+        self.set_bench_import(Some(claim.job), Some((0, 0)), cx);
         let rx =
-            Runner::get(cx).run(move || chairphoto_core::app::bundles::import_bundle_claimed(&state, &abort, &path));
+            Runner::get(cx).run(move || chairphoto_core::app::bundles::import_bundle_claimed(&state, &claim, &path));
         cx.spawn(async move |this, cx| {
             let Ok(result) = rx.await else { return };
             this.update(cx, |s, cx| s.finish_import(&job, result.map(ImportOutcome::Bundle), cx)).ok();
@@ -239,7 +247,7 @@ impl StorageState {
             return; // superseded by a newer import, or by a catalog switch
         }
         self.import = None;
-        self.set_bench_import(None, cx);
+        self.set_bench_import(None, None, cx);
         match (job.kind, result) {
             (_, Ok(ImportOutcome::Card(r))) => {
                 self.status(card_import_line(&r), cx);
@@ -344,26 +352,32 @@ impl StorageState {
     /// The "⤓ N waiting for the NAS" chip and More ⋯ → Back-up queue (App.tsx
     /// `runReconcile`): back up, then apply the offload policy.
     pub fn run_reconcile(&mut self, cx: &mut Context<Self>) {
-        if self.reconciling {
+        if self.reconciling == Some(self.epoch) {
             return;
         }
-        self.reconciling = true;
         let epoch = self.epoch;
+        self.reconciling = Some(epoch);
         let pending = self.shell.read(cx).counts.pending;
         if pending > 0 {
             self.status(format!("Backing up {pending} to NAS…"), cx);
         }
         let state = self.app.clone();
         let rx = Runner::get(cx).run(move || {
-            let summary = storage::reconcile_now(&state)?;
+            // One claim for both steps: a switch between the drain and the policy stops the
+            // policy too, and neither ever touches a catalog other than the one claimed.
+            let claim = storage::claim_reconcile(&state)?;
+            let summary = claim.drain(&state)?;
             // Best-effort: never blocks the result.
-            let offloaded = if summary.skipped_offline { 0 } else { storage::apply_offload_policy(&state).unwrap_or(0) };
+            let offloaded = if summary.skipped_offline { 0 } else { claim.apply_offload_policy().unwrap_or(0) };
             Ok::<_, String>((summary, offloaded))
         });
         cx.spawn(async move |this, cx| {
             let result = rx.await;
             this.update(cx, |s, cx| {
-                s.reconciling = false;
+                // Only this drain's own mark: a newer catalog's drain may own it by now.
+                if s.reconciling == Some(epoch) {
+                    s.reconciling = None;
+                }
                 if epoch != s.epoch {
                     return;
                 }

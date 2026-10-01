@@ -213,6 +213,64 @@ fn a_catalog_switch_stops_a_queued_import(cx: &mut TestAppContext) {
     app.wired.shell.read_with(cx, |s, _| assert_eq!(s.jobs.import, None, "the switch cleared the bench"));
 }
 
+/// The bench's import readout and the job it follows.
+fn bench_import(app: &App, cx: &mut TestAppContext) -> (Option<(usize, usize)>, Option<u64>) {
+    app.wired.shell.read_with(cx, |s, _| (s.jobs.import, s.jobs.import_job))
+}
+
+/// A straggling `import:progress` from `job`, as a worker sends it after passing its last
+/// abort check: it arrives after whatever the UI thread has already seen.
+fn straggler(app: &App, job: u64, cx: &mut TestAppContext) {
+    use chairphoto_core::app::{EventSink as _, ImportProgress};
+    app.state.send(CoreEvent::ImportProgress(ImportProgress { job, done: 1, total: 2 }));
+    cx.run_until_parked();
+}
+
+/// **Forced interleaving.** An import's progress arrives after the catalog switch reset the
+/// bench: it is a straggler from the left catalog's import and must not put the bench back on
+/// an import nothing will ever finish (whose Cancel would be dead).
+#[gpui_kit::test]
+fn a_straggler_from_before_a_switch_leaves_the_bench_clear(cx: &mut TestAppContext) {
+    let dir = TempDir::new("import-bench-switch");
+    let app = start(cx);
+    open_catalog(&app, &dir, cx);
+    let source = card(&dir, 2);
+    let all: Vec<String> = (0..2).map(|i| source.join(format!("IMG_{i:04}.jpg")).to_string_lossy().to_string()).collect();
+    app.wired.storage.update(cx, |s, cx| s.start_card_import(source, String::new(), all, cx));
+    let (shown, job) = bench_import(&app, cx);
+    assert_eq!(shown, Some((0, 0)));
+    let job = job.expect("the bench follows the claimed job");
+    switch_catalog_now(&app, &dir, cx);
+    assert_eq!(bench_import(&app, cx), (None, None), "the switch cleared the bench");
+    straggler(&app, job, cx);
+    assert_eq!(bench_import(&app, cx).0, None, "a straggler put the bench back on a dead import");
+    work(cx);
+    assert_eq!(bench_import(&app, cx).0, None);
+}
+
+/// **Forced interleaving.** A newer import supersedes an older one; the older one's progress
+/// arrives while the newer runs, and again after it finished. Neither moves the bench.
+#[gpui_kit::test]
+fn a_superseded_imports_stragglers_never_move_the_bench(cx: &mut TestAppContext) {
+    let dir = TempDir::new("import-bench-newer");
+    let app = start(cx);
+    open_catalog(&app, &dir, cx);
+    let source = card(&dir, 1);
+    let all = vec![source.join("IMG_0000.jpg").to_string_lossy().to_string()];
+    app.wired.storage.update(cx, |s, cx| s.start_card_import(source.clone(), String::new(), all.clone(), cx));
+    let older = bench_import(&app, cx).1.unwrap();
+    app.wired.storage.update(cx, |s, cx| s.start_card_import(source, String::new(), all, cx));
+    let newer = bench_import(&app, cx).1.unwrap();
+    assert_ne!(older, newer);
+    straggler(&app, older, cx);
+    assert_eq!(bench_import(&app, cx), (Some((0, 0)), Some(newer)), "the older import's progress moved the bench");
+    work(cx);
+    assert_eq!(status(&app, cx), "Imported 1 new of 1 on card");
+    assert_eq!(bench_import(&app, cx).0, None, "the newer import cleared the bench");
+    straggler(&app, older, cx);
+    assert_eq!(bench_import(&app, cx).0, None, "the older import's straggler revived the bench");
+}
+
 // --- rescan -------------------------------------------------------------------------------
 
 /// Rescan library: Phase A's result sets the status line; a result that lands after a
@@ -337,6 +395,31 @@ fn window_focus_leaves_the_queue_while_the_nas_is_away(cx: &mut TestAppContext) 
     assert_eq!(pending.len(), 1);
 }
 
+/// **Forced interleaving.** A drain is in flight (queued, its result not landed) when the
+/// catalog switches: the new catalog's drain is not skipped because of it.
+#[gpui_kit::test]
+fn a_drain_from_before_a_switch_does_not_block_the_new_catalogs_drain(cx: &mut TestAppContext) {
+    let dir = TempDir::new("reconcile-switch");
+    let app = start(cx);
+    let id = catalog_with_backup(&app, &dir, cx);
+    work(cx); // the launch check: nothing waits
+    app.state.catalog.lock().unwrap().as_ref().unwrap().enqueue_operation("backup", id).unwrap();
+    dispatch(&app, crate::shell::actions::Reconcile, cx);
+    let runner = cx.update(|cx| Runner::get(cx));
+    assert_eq!(runner.pending(), 1, "the old catalog's drain is in flight");
+
+    switch_catalog_now(&app, &dir, cx);
+    // The new catalog's drain (its launch check, the chip or the menu all end here).
+    let before = runner.pending();
+    app.wired.storage.update(cx, |s, cx| s.run_reconcile(cx));
+    assert_eq!(runner.pending(), before + 1, "the new catalog's drain was skipped for the old one");
+    let epoch = app.wired.storage.read_with(cx, |s, _| s.epoch());
+    assert_eq!(app.wired.storage.read_with(cx, |s, _| s.reconciling), Some(epoch));
+
+    work(cx);
+    app.wired.storage.read_with(cx, |s, _| assert_eq!(s.reconciling, None, "both drains ended"));
+}
+
 // --- trash --------------------------------------------------------------------------------
 
 /// Two trashed photos whose files exist; returns their ids.
@@ -440,6 +523,68 @@ fn a_trash_report_that_lands_after_a_switch_is_dropped(cx: &mut TestAppContext) 
     storage_sees_switch(&app, cx);
     cx.run_until_parked();
     trash.read_with(cx, |t, _| assert!(t.report.is_none(), "the left catalog's report landed"));
+}
+
+/// **Forced interleaving.** The core has switched to a catalog whose trashed photos carry the
+/// same ids, but `catalog:switched` has not reached the open Trash dialog yet, and Delete is
+/// confirmed on the old list. The core refuses the old ids (the new catalog's files and rows
+/// survive). When the event arrives, the dialog drops the old list and reads the new
+/// catalog's trash.
+#[gpui_kit::test]
+fn old_trash_ids_never_reach_the_new_catalogs_delete(cx: &mut TestAppContext) {
+    let dir = TempDir::new("trash-switch-ids");
+    let app = start(cx);
+    let old_ids = catalog_with_trash(&app, &dir, cx);
+    dispatch(&app, crate::shell::actions::OpenTrash, cx);
+    let StorageDialog::Trash(trash) = dialog(&app, cx) else { panic!() };
+    work(cx);
+    trash.read_with(cx, |t, _| assert_eq!(t.photos.as_ref().map(Vec::len), Some(2)));
+
+    // The core switch, with the event not delivered.
+    let other = dir.0.join("other");
+    let b = Catalog::open(&other.join("b.chairphoto"), &other).unwrap();
+    let files: Vec<PathBuf> = (0..2).map(|i| other.join(format!("2026/q{i}.ARW"))).collect();
+    let new_ids: Vec<i64> = files
+        .iter()
+        .map(|f| {
+            std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+            std::fs::write(f, b"another catalog's raw").unwrap();
+            b.upsert_photo(f, None, 0, 1).unwrap().id
+        })
+        .collect();
+    assert_eq!(new_ids, old_ids, "the ids collide, as real catalogs' do");
+    b.trash_photos(&new_ids).unwrap();
+    chairphoto_core::app::detach_catalog_and_trip_jobs(&app.state).unwrap();
+    chairphoto_core::app::publish_catalog_and_reset_jobs(&app.state, b).unwrap();
+    app.state.volume_health.invalidate();
+
+    click(&app, "trash-delete", cx);
+    cx.update_window(app.window(), |_, window, cx| {
+        window.render_frame(cx);
+        window.input("delete", cx);
+    })
+    .unwrap();
+    trash.update(cx, |t, cx| t.destroy(cx));
+    assert_eq!(work_once(cx), 1);
+    cx.run_until_parked();
+    assert!(files.iter().all(|f| f.exists()), "the new catalog's originals were deleted");
+    let trashed = chairphoto_core::app::with_catalog(&app.state, |c| c.list_trash()).unwrap();
+    assert_eq!(trashed.len(), 2, "the new catalog's rows were removed");
+    trash.read_with(cx, |t, _| {
+        assert_eq!(t.error.as_deref(), Some(chairphoto_core::app::CATALOG_CHANGED));
+        assert!(t.report.is_none());
+    });
+
+    storage_sees_switch(&app, cx);
+    trash.read_with(cx, |t, _| {
+        assert!(t.photos.is_none() && t.selected.is_empty() && !t.confirming, "the old list was dropped");
+    });
+    work(cx);
+    let now = chairphoto_core::app::catalog_identity(&app.state).unwrap();
+    trash.read_with(cx, |t, _| {
+        assert_eq!(t.photos.as_ref().map(Vec::len), Some(2));
+        assert_eq!(t.loaded_from, Some(now), "the new catalog's trash was read");
+    });
 }
 
 // --- identity debt ------------------------------------------------------------------------
@@ -622,9 +767,9 @@ fn a_bundle_previews_and_imports(cx: &mut TestAppContext) {
     click(&app, "bundle-run", cx);
     dlg.read_with(cx, |d, _| assert!(d.importing));
     work(cx);
-    // React's line, from the core's result: the bundle importer indexes its photos before
-    // the merge runs, so the merge itself counts none as added (pre-existing reporting).
-    dlg.read_with(cx, |d, _| assert_eq!(d.result.as_deref(), Some("Import complete. No new photos. 2 originals copied.")));
+    // React's line, from the core's result: the photos the importer created before the merge
+    // ran count as added.
+    dlg.read_with(cx, |d, _| assert_eq!(d.result.as_deref(), Some("Import complete. 2 photos added. 2 originals copied.")));
     assert_eq!(photo_count(&app), 2);
 
     click(&app, "bundle-check", cx);

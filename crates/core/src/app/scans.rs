@@ -29,8 +29,9 @@ pub type PhaseA<'a> =
 
 /// Run a two-phase scan's Phase A and return its result with the Phase B job to run next.
 ///
-/// Starts a fresh scan generation (tripping any earlier scan, including a still-running
-/// detached Phase B), reads the catalog path and root under a brief lock, and runs Phase A on
+/// Under one brief catalog lock, reads the catalog path and root and starts a fresh scan
+/// generation (tripping any earlier scan, including a still-running detached Phase B), and
+/// runs Phase A on
 /// its own secondary connection so the shared one keeps serving reads. A Phase A failure
 /// sends the terminal `scan:progress {phase:"done"}` itself, so a progress indicator always
 /// clears. Stale queue rows a previous aborted Phase B left behind are merged into this
@@ -39,21 +40,24 @@ pub fn scan_two_phase(state: &AppState, phase_a: Box<PhaseA<'_>>) -> Result<(Sca
     scan_two_phase_as(state, None, phase_a)
 }
 
-/// [`scan_two_phase`], with `expected`: only into that catalog. Checked under the catalog
-/// lock after the generation is installed, so a switch either lands first (and this fails
-/// closed with `CATALOG_CHANGED`) or after (and trips this scan).
+/// [`scan_two_phase`], with `expected`: only into that catalog. The identity is checked
+/// **before** the generation is installed, both under one catalog lock hold (lock order
+/// catalog → scan abort, `app::jobs`). So a request bound to a catalog that is no longer
+/// open fails closed with `CATALOG_CHANGED` without tripping the open catalog's scan, and a
+/// switch, which takes the catalog lock first, lands either before both (refused) or after
+/// both (and trips this scan).
 fn scan_two_phase_as(
     state: &AppState,
     expected: Option<super::CatalogIdentity>,
     phase_a: Box<PhaseA<'_>>,
 ) -> Result<(ScanResult, EnrichJob), String> {
     let (path, root, abort) = {
-        let abort = begin_scan_generation(state)?;
         let guard = state.catalog.lock().map_err(|e| e.to_string())?;
         let catalog = guard.as_ref().ok_or("No catalog is open")?;
         if expected.is_some_and(|e| !e.is(catalog)) {
             return Err(super::CATALOG_CHANGED.into());
         }
+        let abort = begin_scan_generation(state)?;
         (catalog.db_path().to_path_buf(), catalog.root().to_path_buf(), abort)
     };
     let phase_a_out = Catalog::open_secondary(&path, &root).map_err(|e| e.to_string()).and_then(|scan_catalog| {

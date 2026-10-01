@@ -75,9 +75,10 @@ pub const ENABLED_KEY: &str = "modules.enabled";
 /// - `basic-editor` — the Darkroom's presets (`basic-editor.presets`; the Basic Editor
 ///   folded into the Darkroom, #104);
 /// - `metrics` — `metrics.exportParity`;
-/// - `geocode` — the map backend's `geocode.endpoint` (the Map module's id is `map`).
+/// - `geocode` — the map backend's `geocode.endpoint` (the Map module's id is `map`);
+/// - `cull` — the cull session's resume point, `cull.cursor.photo_id` (`loupe::cull`).
 pub const RESERVED_NAMESPACES: &[&str] =
-    &["modules", "indexing", "sharpness", "editor", "develop", "basic-editor", "metrics", "geocode"];
+    &["modules", "indexing", "sharpness", "editor", "develop", "basic-editor", "metrics", "geocode", "cull"];
 
 /// Namespaces a module shares with its own backend, deliberately, as in React: the module
 /// whose id this is reads and writes the keys its core backend reads (`ai.*` burst settings,

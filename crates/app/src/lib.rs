@@ -44,6 +44,7 @@ pub mod inspector;
 pub mod keymap;
 pub mod launch;
 pub mod library;
+pub mod loupe;
 pub mod machine_prefs;
 pub mod model;
 pub mod preferences;
@@ -149,6 +150,10 @@ pub struct WireOptions {
     /// Re-reads the system theme (Preferences → Appearance, Reload theme): the Omarchy state
     /// files in production, a fixed answer in tests.
     pub read_system_theme: theme::ThemeReader,
+    /// The image layer's decode pool in place of the one `run` boots: tests hand in a pool
+    /// they drive by hand (`image_tests::FakePool`), to force an answer order. `None` uses
+    /// [`wire`]'s `pool` argument.
+    pub image_pool: Option<Arc<dyn image_store::Submit>>,
 }
 
 impl WireOptions {
@@ -159,6 +164,7 @@ impl WireOptions {
             unthrottled: false,
             machine_prefs: machine_prefs::MachinePrefs::load_default(),
             read_system_theme: Arc::new(chairphoto_core::appearance::read_current_theme),
+            image_pool: None,
         }
     }
 
@@ -171,6 +177,7 @@ impl WireOptions {
             unthrottled: false,
             machine_prefs: machine_prefs::MachinePrefs::in_memory(),
             read_system_theme: Arc::new(SystemThemeResult::unavailable),
+            image_pool: None,
         }
     }
 }
@@ -226,9 +233,10 @@ pub fn wire(
     events::spawn_router(events_rx, model.clone(), cx).detach();
     let shell = cx.new(|cx| shell::ShellState::new(&model, cx));
     // Without a pool (tests), every image request fails at once instead of waiting forever.
-    let submit: Arc<dyn image_store::Submit> = match &pool {
-        Some(pool) => pool.clone(),
-        None => Arc::new(NoPool),
+    let submit: Arc<dyn image_store::Submit> = match (options.image_pool.clone(), &pool) {
+        (Some(submit), _) => submit,
+        (None, Some(pool)) => pool.clone(),
+        (None, None) => Arc::new(NoPool),
     };
     let images = cx.new(|cx| ImageStore::new(submit, image_store::DEFAULT_BUDGET_BYTES, cx));
     clear_images_on_catalog_switch(&model, &images, cx).detach();

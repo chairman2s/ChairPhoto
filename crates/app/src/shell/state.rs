@@ -17,6 +17,7 @@
 //! ([`crate::machine_prefs::MachinePrefs`], #113, which holds the appearance mode), but these
 //! keys are not written to it yet, so they start at React's defaults each launch.
 
+use crate::loupe::compare::{CompareMode, CompareSession, Verdict};
 use crate::model::{AppModel, AppModelEvent, DeepLinkTarget};
 use chairphoto_core::app::{
     with_catalog, with_catalog_as, with_catalog_identified, AppState, CatalogIdentity, CoreEvent, ExportKind,
@@ -27,7 +28,9 @@ use chairphoto_core::catalog::{
 };
 use chairphoto_model::deep_link::DeepLinkView;
 use chairphoto_model::library::query::{RefreshRequest, StatusRequest};
-use chairphoto_model::library::session::{LibrarySession, SelectMods};
+use chairphoto_model::compare_duel::DuelSide;
+use chairphoto_model::library::session::{LibrarySession, SelectMods, StepSnapshot};
+use futures::channel::oneshot;
 use gpui_kit::{Context, Entity, EventEmitter, Subscription, Task};
 
 /// React's column defaults and drag limits (`App.tsx`).
@@ -313,6 +316,25 @@ impl Mark {
     }
 }
 
+/// What a queued culling write does once it has run.
+enum AfterMark {
+    /// Re-read the rows and the scope, and — for the keyboard — step past the photo marked
+    /// (over the rows as they were when the key was pressed). Failures go to the status line.
+    Refresh(Option<StepSnapshot>),
+    /// Report the result to the caller and touch nothing else: the cull session records its
+    /// own decisions and re-reads the rows once, at its end (CullSession.tsx).
+    Report(oneshot::Sender<Result<(), String>>),
+}
+
+/// What the Library stage shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StageView {
+    Grid,
+    /// The inline loupe on the active photo.
+    Loupe,
+    Compare,
+}
+
 /// A `chairphoto://<uuid>` link waiting for the widened grid to list its photo (App.tsx's
 /// `deepLinkTarget`).
 #[derive(Debug, Clone)]
@@ -363,6 +385,14 @@ pub struct ShellState {
     /// The tag the tag editor is showing, if one is open: what `tag-editor`-slot module
     /// panels edit (host.ts's `getEditingTag`). Set and cleared by `tags::editor::TagEditor`.
     pub editing_tag: Option<i64>,
+    /// The inline loupe is on (App.tsx's `loupeInline`): the stage shows the active photo
+    /// instead of the grid while there is one. Kept across a cleared selection, as React did.
+    pub loupe_open: bool,
+    /// Compare, while open, and the catalog its pool was read from (#109).
+    compare: Option<(CompareSession, CatalogIdentity)>,
+    /// Compare's presentation for the next open (`panel.compareMode`; the root view seeds it
+    /// from the per-machine preferences and stores changes back).
+    pub compare_mode: CompareMode,
     /// The newest culling write: each write waits for the one before, so marks land in the
     /// order they were made.
     last_mark: Option<Task<()>>,
@@ -419,6 +449,9 @@ impl ShellState {
             pending_link: None,
             active_version: None,
             editing_tag: None,
+            loupe_open: false,
+            compare: None,
+            compare_mode: CompareMode::Duel,
             last_mark: None,
             catalog_generation: 0,
             burst_job: 0,
@@ -600,6 +633,140 @@ impl ShellState {
         cx.notify();
     }
 
+    // --- loupe and Compare (#109) ---------------------------------------------------------
+
+    /// What the stage shows: Compare while it has a pane to show, else the loupe while it is
+    /// on and a photo is active, else the grid.
+    pub fn stage_view(&self) -> StageView {
+        if !self.compare_panes().is_empty() {
+            StageView::Compare
+        } else if self.loupe_open && self.library.selection().active_id.is_some() {
+            StageView::Loupe
+        } else {
+            StageView::Grid
+        }
+    }
+
+    /// Enter (with an active photo) or the More menu's "Loupe": toggle the inline loupe.
+    pub fn toggle_loupe(&mut self, cx: &mut Context<Self>) {
+        let open = !self.loupe_open && self.library.selection().active_id.is_some();
+        self.set_loupe(open, cx);
+    }
+
+    pub fn set_loupe(&mut self, open: bool, cx: &mut Context<Self>) {
+        if self.loupe_open != open {
+            self.loupe_open = open;
+            cx.notify();
+        }
+    }
+
+    /// Open `photo` in the loupe even when the grid does not list it — a stacked child
+    /// (App.tsx's `viewPhotoInLoupe`: the session holds it aside, the shell opens the loupe).
+    pub fn view_in_loupe(&mut self, photo: Photo, cx: &mut Context<Self>) {
+        self.compare = None;
+        self.loupe_open = true;
+        self.select_with(cx, |l| l.view_photo(photo));
+    }
+
+    /// The photo the loupe and the inspector follow (`shellTarget.ts`): Compare's focused
+    /// pane while Compare is open, else the active photo.
+    pub fn loupe_target(&self) -> Option<&Photo> {
+        if let Some((session, _)) = &self.compare {
+            let panes = self.compare_panes();
+            let ids: Vec<i64> = panes.iter().map(|p| p.id).collect();
+            if let Some(id) = session.focused(&ids) {
+                return panes.into_iter().find(|p| p.id == id);
+            }
+        }
+        self.library.selection().active
+    }
+
+    /// Open Compare on the selection (two or more; C in the grid, the bench's Compare). The
+    /// pool is frozen with the catalog its ids were read from. Closes the loupe.
+    pub fn open_compare(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(from) = self.rows_from else { return false };
+        let selection = self.library.selection();
+        let Some(session) = CompareSession::open(selection.ids, selection.active_id, self.compare_mode) else {
+            return false;
+        };
+        self.compare = Some((session, from));
+        self.loupe_open = false;
+        cx.notify();
+        true
+    }
+
+    pub fn close_compare(&mut self, cx: &mut Context<Self>) {
+        if self.compare.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    pub fn compare(&self) -> Option<&CompareSession> {
+        self.compare.as_ref().map(|(s, _)| s)
+    }
+
+    /// The panes on screen: this round's ids, looked up in the current rows (a rating shows
+    /// on its own pane); a row that vanished is left out.
+    pub fn compare_panes(&self) -> Vec<&Photo> {
+        let Some((session, _)) = &self.compare else { return Vec::new() };
+        let photos = self.library.photos();
+        session.batch().into_iter().filter_map(|id| photos.iter().find(|p| p.id == id)).collect()
+    }
+
+    fn compare_pane_ids(&self) -> Vec<i64> {
+        self.compare_panes().iter().map(|p| p.id).collect()
+    }
+
+    /// Change Compare's state with the ids of the panes on screen; the shell re-renders.
+    pub fn update_compare(&mut self, cx: &mut Context<Self>, f: impl FnOnce(&mut CompareSession, &[i64])) {
+        let ids = self.compare_pane_ids();
+        if let Some((session, _)) = &mut self.compare {
+            f(session, &ids);
+            cx.notify();
+        }
+    }
+
+    /// Duel/Grid: switch the open Compare and remember the mode for the next one.
+    pub fn set_compare_mode(&mut self, mode: CompareMode, cx: &mut Context<Self>) {
+        self.compare_mode = mode;
+        if let Some((session, _)) = &mut self.compare {
+            session.switch_mode(mode);
+        }
+        cx.notify();
+    }
+
+    /// The focused pane, which the culling keys and the bench's marks act on in Compare.
+    pub fn compare_focused(&self) -> Option<i64> {
+        let (session, _) = self.compare.as_ref()?;
+        session.focused(&self.compare_pane_ids())
+    }
+
+    /// ←/→ in a duel: the verdict for that side (loser rejected, last winner picked).
+    pub fn compare_verdict(&mut self, side: DuelSide, cx: &mut Context<Self>) {
+        let Some((session, from)) = &mut self.compare else { return };
+        let from = *from;
+        if let Some(verdict) = session.verdict(side) {
+            self.write_verdict(verdict, from, cx);
+        }
+    }
+
+    /// K / "Keep this" / "This one wins" on `keeper` (`None`: the focused pane).
+    pub fn compare_keep(&mut self, keeper: Option<i64>, cx: &mut Context<Self>) {
+        let Some(keeper) = keeper.or_else(|| self.compare_focused()) else { return };
+        let Some((session, from)) = &mut self.compare else { return };
+        let from = *from;
+        if let Some(verdict) = session.keep(keeper) {
+            self.write_verdict(verdict, from, cx);
+        }
+    }
+
+    fn write_verdict(&mut self, verdict: Verdict, from: CatalogIdentity, cx: &mut Context<Self>) {
+        for (id, pick) in verdict.writes {
+            self.queue_mark(Mark::Pick(pick), vec![id], from, AfterMark::Refresh(None), cx);
+        }
+        cx.notify();
+    }
+
     // --- the Library's rows ----------------------------------------------------------
 
     /// The catalog the rows shown were read from ([`Self::rows_from`]'s field docs): what a
@@ -647,6 +814,8 @@ impl ShellState {
                         self.library.clear_selection();
                         self.pending_link = None;
                         self.active_version = None;
+                        // Compare's pool held the other catalog's ids.
+                        self.compare = None;
                     }
                     self.rows_from = Some(from);
                 }
@@ -717,14 +886,25 @@ impl ShellState {
     /// catalog is open the write fails closed (`CATALOG_CHANGED`) and the status line says
     /// so — whether or not `catalog:switched` has reached the shell yet. A write still
     /// queued when the event arrives is dropped without running.
+    ///
+    /// While Compare is open the mark goes to its focused pane alone, never advancing: Compare
+    /// exists to separate one frame from its neighbours, which rating the whole selection
+    /// would defeat (App.tsx's Compare key branch and `applyMark`).
     pub fn apply_mark(&mut self, mark: Mark, advance: bool, cx: &mut Context<Self>) {
+        if let Some((_, from)) = &self.compare {
+            let from = *from;
+            if let Some(focused) = self.compare_focused() {
+                self.queue_mark(mark, vec![focused], from, AfterMark::Refresh(None), cx);
+            }
+            return;
+        }
         let targets = self.library.selection().targets;
         let Some(from) = self.rows_from else { return };
         if targets.is_empty() {
             return;
         }
         let snapshot = (advance && targets.len() == 1).then(|| self.library.step_snapshot());
-        self.queue_mark(mark, targets, from, snapshot, cx);
+        self.queue_mark(mark, targets, from, AfterMark::Refresh(snapshot), cx);
     }
 
     /// [`apply_mark`](Self::apply_mark) on named photos rather than the selection, never
@@ -734,8 +914,24 @@ impl ShellState {
     /// the order they were made.
     pub fn apply_mark_to(&mut self, mark: Mark, targets: Vec<i64>, from: CatalogIdentity, cx: &mut Context<Self>) {
         if !targets.is_empty() {
-            self.queue_mark(mark, targets, from, None, cx);
+            self.queue_mark(mark, targets, from, AfterMark::Refresh(None), cx);
         }
+    }
+
+    /// One cull-session decision on `photo` (read from `from`): the same queue as every other
+    /// mark, so it lands in order with them, but without the per-write row re-read — the
+    /// session re-reads once when it ends. The answer says whether the catalog took it; a
+    /// write dropped by a catalog switch answers [`chairphoto_core::app::CATALOG_CHANGED`].
+    pub fn apply_mark_reported(
+        &mut self,
+        mark: Mark,
+        photo: i64,
+        from: CatalogIdentity,
+        cx: &mut Context<Self>,
+    ) -> oneshot::Receiver<Result<(), String>> {
+        let (tx, rx) = oneshot::channel();
+        self.queue_mark(mark, vec![photo], from, AfterMark::Report(tx), cx);
+        rx
     }
 
     fn queue_mark(
@@ -743,7 +939,7 @@ impl ShellState {
         mark: Mark,
         targets: Vec<i64>,
         from: CatalogIdentity,
-        snapshot: Option<chairphoto_model::library::session::StepSnapshot>,
+        after: AfterMark,
         cx: &mut Context<Self>,
     ) {
         let previous = self.last_mark.take();
@@ -755,12 +951,22 @@ impl ShellState {
             }
             let current = this.update(cx, |s, _| s.catalog_generation == generation).unwrap_or(false);
             if !current {
+                if let AfterMark::Report(tx) = after {
+                    let _ = tx.send(Err(chairphoto_core::app::CATALOG_CHANGED.into()));
+                }
                 return;
             }
             let write = cx.background_executor().spawn(async move {
                 with_catalog_as(&state, from, |c| targets.iter().try_for_each(|&id| mark.write(c, id).map(drop)))
             });
             let result = write.await;
+            let snapshot = match after {
+                AfterMark::Report(tx) => {
+                    let _ = tx.send(result);
+                    return;
+                }
+                AfterMark::Refresh(snapshot) => snapshot,
+            };
             this.update(cx, |s, cx| {
                 if s.catalog_generation != generation {
                     return;
@@ -901,7 +1107,10 @@ impl ShellState {
         }
         match link.view {
             DeepLinkView::Grid => {}
-            DeepLinkView::Loupe => self.model.update(cx, |m, cx| m.not_yet_ported("Deep link into the loupe", 109, cx)),
+            DeepLinkView::Loupe => {
+                self.compare = None;
+                self.loupe_open = true;
+            }
             DeepLinkView::Develop => {
                 self.model.update(cx, |m, cx| m.not_yet_ported("Deep link into the Darkroom", 111, cx))
             }
@@ -924,6 +1133,8 @@ impl ShellState {
                 self.pending_link = None;
                 self.active_version = None;
                 self.editing_tag = None;
+                self.loupe_open = false;
+                self.compare = None;
                 self.catalog_generation += 1;
                 self.surface = Surface::Library;
                 self.counts = Counts::default();

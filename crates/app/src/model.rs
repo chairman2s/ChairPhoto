@@ -65,7 +65,7 @@ pub struct CatalogSummary {
 /// | Link | Applied by |
 /// |---|---|
 /// | photo, view `grid` | the Library selects it, scope widened (`ShellState::apply_deep_link`) |
-/// | photo, view `loupe` | … then opens the inline loupe (not ported yet, #109) |
+/// | photo, view `loupe` | … then opens the inline loupe on it |
 /// | photo, view `develop` | … then opens the Darkroom (not ported yet, #111) |
 /// | tag | the Library filters to the tag |
 #[derive(Debug, Clone)]

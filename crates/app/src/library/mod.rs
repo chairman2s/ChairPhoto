@@ -64,9 +64,9 @@ actions!(
         LabelBlue,
         LabelPurple,
         LabelNone,
-        /// Enter: open the active photo (the loupe, #109).
+        /// Enter: open the active photo in the loupe (`crate::loupe`).
         OpenActive,
-        /// C: Compare, with two or more selected (#109).
+        /// C: Compare, with two or more selected (`crate::loupe`).
         CompareSelection,
         /// Escape in the "Stack bursts" dialog.
         CloseDialog,

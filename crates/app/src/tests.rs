@@ -67,6 +67,16 @@ impl App {
 }
 
 pub(crate) fn start(cx: &mut TestAppContext) -> App {
+    start_with(cx, None)
+}
+
+/// [`start`] with the image layer on `pool`, a decode pool the test answers by hand
+/// (`image_tests::FakePool`).
+pub(crate) fn start_with_pool(cx: &mut TestAppContext, pool: Arc<dyn crate::image_store::Submit>) -> App {
+    start_with(cx, Some(pool))
+}
+
+fn start_with(cx: &mut TestAppContext, pool: Option<Arc<dyn crate::image_store::Submit>>) -> App {
     // Storage jobs queue until a test runs them (`Runner::manual`): the core runtime's
     // threads could not wake GPUI's deterministic test scheduler.
     cx.update(|cx| cx.set_global(crate::storage::Runner::manual()));
@@ -83,7 +93,7 @@ pub(crate) fn start(cx: &mut TestAppContext) -> App {
             events_rx,
             None,
             &SystemThemeResult::unavailable(),
-            WireOptions::headless(on_exit),
+            WireOptions { image_pool: pool, ..WireOptions::headless(on_exit) },
         )
     });
     // Not parked here: the event router has not been polled yet, which the worker-thread
@@ -507,7 +517,8 @@ fn model_status(model: &Entity<AppModel>, cx: &mut TestAppContext) -> String {
 #[gpui_kit::test]
 fn a_photo_link_waits_for_the_catalog_then_resolves(cx: &mut TestAppContext) {
     let dir = TempDir::new("link-wait");
-    let (state, model) = wired(cx);
+    let app = start(cx);
+    let (state, model) = (app.state.clone(), app.wired.model.clone());
     let (photo_uuid, _) = catalog_with_a_photo_and_a_tag(&dir, &state);
 
     let url = format!("chairphoto:///{}/LOUPE", photo_uuid.to_uppercase());
@@ -526,8 +537,12 @@ fn a_photo_link_waits_for_the_catalog_then_resolves(cx: &mut TestAppContext) {
         }
         other => panic!("expected the photo, got {other:?}"),
     });
-    // The shell selected it in the widened grid; the loupe itself is #109.
-    assert_eq!(model_status(&model, cx), not_yet_ported_line("Deep link into the loupe", 109));
+    // The shell selected it in the widened grid and opened the loupe on it.
+    let (active, stage) = app.wired.shell.read_with(cx, |s, _| {
+        (s.library.selection().active.map(|p| p.uuid.clone()), s.stage_view())
+    });
+    assert_eq!(active.as_deref(), Some(photo_uuid.as_str()));
+    assert_eq!(stage, crate::shell::state::StageView::Loupe);
 }
 
 /// Tag links resolve by uuid; unknown uuids and non-links are reported, as App.tsx did.

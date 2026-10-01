@@ -3,7 +3,6 @@
 //! links, thumbnails per window, and the "Stack bursts" dialog.
 
 use crate::library::grid::LibraryView;
-use crate::model::not_yet_ported_line;
 use crate::shell::state::Mark;
 use crate::tests::{
     click, click_menu_row, colliding_catalog, core_switch, deliver_switch, open_catalog_with_photos, press, start, status,
@@ -112,7 +111,7 @@ fn clicks_select_toggle_and_range(cx: &mut TestAppContext) {
     assert_eq!(selection(&app, cx), (Some(ids[5]), vec![ids[3], ids[4], ids[5]]), "range from the Ctrl anchor");
 }
 
-/// Double-click selects and asks for the loupe, which is #109's.
+/// Double-click selects and opens the loupe on the photo.
 #[gpui_kit::test]
 fn a_double_click_opens_the_loupe(cx: &mut TestAppContext) {
     let dir = TempDir::new("grid-open");
@@ -121,7 +120,10 @@ fn a_double_click_opens_the_loupe(cx: &mut TestAppContext) {
     cx.update_window(app.window(), |_, window, cx| window.double_click(tile(ids[2]), cx)).unwrap();
     cx.run_until_parked();
     assert_eq!(selection(&app, cx).0, Some(ids[2]));
-    assert_eq!(status(&app, cx), not_yet_ported_line("Loupe", 109));
+    assert_eq!(
+        app.wired.shell.read_with(cx, |s, _| s.stage_view()),
+        crate::shell::state::StageView::Loupe
+    );
 }
 
 /// The arrows step the active photo (Shift extends), Home/End jump, Ctrl+A selects all —

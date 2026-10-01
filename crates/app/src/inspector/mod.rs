@@ -11,7 +11,8 @@
 //! | publish | where the photo was published (and which version), "Mark as published", "Publish…" |
 //!
 //! **The photo shown** is the Library's active photo (`ShellState::library`). React's
-//! inspector also followed Compare's focused pane; Compare is the Loupe ticket (#109).
+//! inspector also followed Compare's focused pane (`shellTarget.ts`); the shell resolves that
+//! target now (`ShellState::loupe_target`, #109), but the inspector does not follow it yet.
 //!
 //! **Data flow.** Everything the inspector shows about the photo beyond its row — signals,
 //! the stack, IPTC, metadata, versions, publications — is read off the UI thread, lazily (only
@@ -720,11 +721,10 @@ impl PhotoInspector {
     }
 
     /// Stack: "View" — show a member of the stack. A stacked child is not in the grid's
-    /// rows, so the Library views it off-grid (`LibrarySession::view_photo`); React also
-    /// opened the loupe, which is #109.
+    /// rows, so the Library views it off-grid (`LibrarySession::view_photo`) and opens the
+    /// loupe on it (`ShellState::view_in_loupe`), as React did.
     pub fn view_stack_member(&mut self, photo: Photo, cx: &mut Context<Self>) {
-        self.shell.update(cx, |s, cx| s.select_with(cx, |l| l.view_photo(photo)));
-        self.model.update(cx, |m, cx| m.not_yet_ported("Viewing a stack member in the loupe", 109, cx));
+        self.shell.update(cx, |s, cx| s.view_in_loupe(photo, cx));
     }
 
     /// Stack: "Unstack" — the child returns to the grid as its own photo.

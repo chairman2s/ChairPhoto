@@ -67,7 +67,8 @@ actions!(
 /// The shell's own keys are App.tsx's panel toggles (`[`, `]`; they also work in Compare,
 /// and a Darkroom/module/cull context mutes them with `NoAction` when those land) and
 /// Menu.tsx's menu keys, which gpui-component's `PopupMenu` binds itself. The rest of
-/// App.tsx's window handler — culling, Compare, loupe — binds with its views (#106, #109).
+/// App.tsx's window handler — culling, Compare, loupe — binds with its views
+/// ([`crate::library::bindings`], [`crate::loupe::bindings`]).
 pub fn bindings() -> Vec<KeyBinding> {
     let mut bindings = vec![
         KeyBinding::new("ctrl-q", Quit, Some(contexts::ROOT)),
@@ -84,5 +85,6 @@ pub fn bindings() -> Vec<KeyBinding> {
         bindings.push(KeyBinding::new(key, NoAction, Some(contexts::INPUT)));
     }
     bindings.extend(crate::library::bindings());
+    bindings.extend(crate::loupe::bindings());
     bindings
 }

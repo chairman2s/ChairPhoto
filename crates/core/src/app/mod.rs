@@ -264,6 +264,26 @@ pub async fn with_catalog_blocking<T: Send + 'static>(
 #[cfg(test)]
 pub(crate) mod test_env_helpers;
 
+/// The bytes the Darkroom's `.rawf` decode cache holds (Preferences → Darkroom): 0 in a build
+/// without the decoder and the engine (`raw` + `edit`), which decodes nothing into it.
+/// **Blocking** (walks the cache directory): run it off the UI thread.
+pub fn decode_cache_usage() -> u64 {
+    #[cfg(all(feature = "raw", feature = "edit"))]
+    return crate::develop::cache::usage_bytes();
+    #[cfg(not(all(feature = "raw", feature = "edit")))]
+    0
+}
+
+/// Preferences → Darkroom → Clear: empty the decode cache. Returns the bytes freed; 0 in a
+/// build without `raw` + `edit`. Photos open in Develop stay open — their working images are
+/// in memory; only the next first open pays a decode. **Blocking**: off the UI thread.
+pub fn decode_cache_clear() -> u64 {
+    #[cfg(all(feature = "raw", feature = "edit"))]
+    return crate::develop::cache::trim_to(0);
+    #[cfg(not(all(feature = "raw", feature = "edit")))]
+    0
+}
+
 /// The app's data dir (`$XDG_DATA_HOME/chairphoto` or `~/.local/share/chairphoto`) —
 /// home of the default catalog DB and the user's LUT folder.
 pub fn app_data_dir() -> Result<PathBuf, String> {

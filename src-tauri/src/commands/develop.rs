@@ -99,31 +99,22 @@ pub async fn develop_close(app: AppHandle) -> Result<(), String> {
     }
 }
 
-/// Bytes the `.rawf` decode cache holds right now (Preferences → Darkroom).
+/// Bytes the `.rawf` decode cache holds right now (Preferences → Darkroom); 0 in a build
+/// without `raw` + `edit` (`app::decode_cache_usage`).
 #[tauri::command]
 pub async fn develop_cache_usage() -> Result<u64, String> {
-    #[cfg(all(feature = "raw", feature = "edit"))]
-    {
-        return crate::app::spawn_blocking(crate::develop::cache::usage_bytes)
-            .await
-            .map_err(|e| e.to_string());
-    }
-    #[cfg(not(all(feature = "raw", feature = "edit")))]
-    Ok(0)
+    crate::app::spawn_blocking(crate::app::decode_cache_usage)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 /// Empty the `.rawf` decode cache. Returns the bytes freed. Photos open in Develop stay
 /// open — their working images are in memory; only the next first open pays a decode.
 #[tauri::command]
 pub async fn develop_cache_clear() -> Result<u64, String> {
-    #[cfg(all(feature = "raw", feature = "edit"))]
-    {
-        return crate::app::spawn_blocking(|| crate::develop::cache::trim_to(0))
-            .await
-            .map_err(|e| e.to_string());
-    }
-    #[cfg(not(all(feature = "raw", feature = "edit")))]
-    Ok(0)
+    crate::app::spawn_blocking(crate::app::decode_cache_clear)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 /// The develop source state right now (a remounted view re-attaching).

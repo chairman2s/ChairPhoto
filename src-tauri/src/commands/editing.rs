@@ -6,8 +6,6 @@
 use super::*;
 #[cfg(feature = "edit")]
 use crate::media::{render_edit_bytes, working_image};
-#[cfg(feature = "edit")]
-use std::path::PathBuf;
 use tauri::{AppHandle, Manager, State};
 
 /// Read a photo's edit record (opaque JSON), or null if it has none.
@@ -73,19 +71,8 @@ pub async fn render_edit(
     }
 }
 
-/// A `source` argument as a working-image token, or `None` for the preview path.
 #[cfg(feature = "edit")]
-fn parse_working_token(source: Option<&str>) -> Result<Option<crate::plugins::edit::SourceToken>, String> {
-    use crate::plugins::edit::SourceToken;
-    match source {
-        None | Some("") | Some("p") => Ok(None),
-        Some(s) => match SourceToken::parse(s) {
-            Some(SourceToken::Preview) => Ok(None),
-            Some(t) => Ok(Some(t)),
-            None => Err(format!("bad source token {s:?}")),
-        },
-    }
-}
+use crate::app::editing::parse_working_token;
 
 /// Render a photo's preview proxy with *several* edit records in one call — the
 /// preset browser's thumbnail strip. The proxy is decoded and pre-scaled **once**
@@ -192,43 +179,8 @@ pub async fn edit_zone_masses(
     }
     #[cfg(feature = "edit")]
     {
-        let state = app.state::<AppState>();
-        let candidates = {
-            let guard = state.catalog.lock().map_err(|e| e.to_string())?;
-            let catalog = guard.as_ref().ok_or("No catalog is open")?;
-            catalog.photo_path_candidates(photo_id).map_err(|e| e.to_string())?
-        };
-        let health = state.volume_health.clone();
         crate::app::spawn_blocking(move || {
-            // OriginalRequired: the masses describe an edit render of the real original,
-            // so a cached-unreachable flag must never stand in for a stat.
-            let path = crate::volume_health::pick_existing(
-                &candidates,
-                &health,
-                crate::catalog::ResolveMode::OriginalRequired,
-            )
-            .ok_or_else(|| format!("no reachable copy of photo {photo_id}"))?;
-            // 1024px is plenty of resolution for an 8-bin histogram, and keeps the
-            // render far cheaper than the preview tier's. Through the framed-base cache:
-            // the settle that asks for masses has the same geometry as the drag before it.
-            let out = if let Some(token) = parse_working_token(source.as_deref())? {
-                let image = working_image(&token)?;
-                crate::plugins::edit::render_proxy(
-                    crate::plugins::edit::RenderSource::Working { token, image },
-                    &edit_json,
-                    1024,
-                    crate::plugins::edit::RenderOpts::default(),
-                )?
-            } else {
-                let jpeg = crate::thumbnails::preview_bytes(&path)?;
-                crate::plugins::edit::render_proxy(
-                    crate::plugins::edit::RenderSource::PreviewJpeg(&jpeg),
-                    &edit_json,
-                    1024,
-                    crate::plugins::edit::RenderOpts::default(),
-                )?
-            };
-            Ok(crate::plugins::edit::zone_masses(&out.to_rgb8()))
+            crate::app::editing::zone_masses(&app.state::<AppState>(), None, photo_id, &edit_json, source.as_deref())
         })
         .await
         .map_err(|e| e.to_string())?
@@ -305,21 +257,9 @@ pub async fn suggest_auto_tone(
 /// List the `.cube` LUT filenames available in the app's luts folder.
 #[tauri::command]
 pub async fn list_luts() -> Result<Vec<String>, String> {
-    crate::app::spawn_blocking(|| {
-        let dir = luts_dir()?;
-        let mut out = Vec::new();
-        for entry in std::fs::read_dir(&dir).map_err(|e| e.to_string())? {
-            let entry = entry.map_err(|e| e.to_string())?;
-            let name = entry.file_name().to_string_lossy().to_string();
-            if name.to_lowercase().ends_with(".cube") {
-                out.push(name);
-            }
-        }
-        out.sort();
-        Ok(out)
-    })
-    .await
-    .map_err(|e| e.to_string())?
+    crate::app::spawn_blocking(|| crate::app::editing::list_luts_in(&luts_dir()?))
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 /// Validate a `.cube` file (by fully parsing it) and copy it into the luts folder.
@@ -333,24 +273,9 @@ pub async fn import_lut(path: String) -> Result<String, String> {
     }
     #[cfg(feature = "edit")]
     {
-        crate::app::spawn_blocking(move || {
-            let src = PathBuf::from(&path);
-            let name = src
-                .file_name()
-                .ok_or("not a file path")?
-                .to_string_lossy()
-                .to_string();
-            if !name.to_lowercase().ends_with(".cube") {
-                return Err("only .cube LUTs are supported".to_string());
-            }
-            let text = std::fs::read_to_string(&src).map_err(|e| e.to_string())?;
-            crate::plugins::edit::cube::CubeLut::parse(&text)
-                .map_err(|e| format!("invalid LUT: {e}"))?;
-            std::fs::write(luts_dir()?.join(&name), text).map_err(|e| e.to_string())?;
-            Ok(name)
-        })
-        .await
-        .map_err(|e| e.to_string())?
+        crate::app::spawn_blocking(move || crate::app::editing::import_lut_into(&luts_dir()?, std::path::Path::new(&path)))
+            .await
+            .map_err(|e| e.to_string())?
     }
 }
 
@@ -424,73 +349,24 @@ async fn set_version_edit_in_state(
     version_id: i64,
     edit_json: &str,
 ) -> Result<(), String> {
-    write_version_then_refresh_monochrome(state, version_id, |c| c.set_version_edit(version_id, edit_json)).await
+    let edit_json = edit_json.to_string();
+    write_version_then_refresh_monochrome(state, version_id, move |c| c.set_version_edit(version_id, &edit_json)).await
 }
 
 /// Any write that changes a version's settings, followed by the monochrome refresh every
-/// such write owes (H6): a plain save, a history commit, a step back or forward. Returns
-/// what `write` returned.
+/// such write owes (H6), on a blocking worker (`app::editing::write_version_then_refresh_monochrome`).
 #[cfg(feature = "edit")]
-async fn write_version_then_refresh_monochrome<T>(
+async fn write_version_then_refresh_monochrome<T: Send + 'static>(
     state: &AppState,
     version_id: i64,
-    write: impl FnOnce(&crate::catalog::Catalog) -> crate::catalog::Result<T>,
+    write: impl FnOnce(&crate::catalog::Catalog) -> crate::catalog::Result<T> + Send + 'static,
 ) -> Result<T, String> {
-    // Save + gather everything the monochrome refresh needs under one brief lock.
-    let (written, photo_id, any_bw, stored_gray, candidates) = {
-        let guard = state.catalog.lock().map_err(|e| e.to_string())?;
-        let catalog = guard.as_ref().ok_or("No catalog is open")?;
-        let written = write(catalog).map_err(|e| e.to_string())?;
-        let photo_id = catalog.version_photo_id(version_id).map_err(|e| e.to_string())?;
-        let any_bw = catalog
-            .list_versions(photo_id)
-            .map_err(|e| e.to_string())?
-            .iter()
-            .any(|v| crate::plugins::edit::is_bw(&v.edit_json));
-        let stored = catalog.is_grayscale(photo_id).map_err(|e| e.to_string())?;
-        let cands = catalog.photo_path_candidates(photo_id).map_err(|e| e.to_string())?;
-        (written, photo_id, any_bw, stored, cands)
-    };
-    let gray = if any_bw {
-        true
-    } else if !stored_gray {
-        // Not B&W by edit and already not flagged — nothing can change.
-        return Ok(written);
-    } else {
-        // The flag was set but no version is B&W anymore: fall back to the
-        // pixel-derived signal (the photo itself may still be monochrome).
-        let health = state.volume_health.clone();
-        // OriginalRequired: the outcome is PERSISTED (`set_grayscale` + auto-tags), so it
-        // must not be decided by a cached reachability flag — or by a decode failure.
-        // `None` here covers BOTH ways "could not tell" happens: no reachable copy
-        // (`pick_existing` fails) and a reachable copy that fails to decode
-        // (`thumbnail_bytes` fails). Both are "could not tell", not "not grayscale", so
-        // both skip the write below and leave the stored flag alone (AGENTS.md:
-        // missing/unmounted storage is normal, never evidence the row is wrong). Only an
-        // actual decoded verdict is ever persisted.
-        let outcome = crate::app::spawn_blocking(move || {
-            crate::volume_health::pick_existing(
-                &candidates,
-                &health,
-                crate::catalog::ResolveMode::OriginalRequired,
-            )
-            .and_then(|p| thumbnail_bytes(&p).ok())
-            .map(|t| crate::thumbnails::is_grayscale_jpeg(&t))
-        })
-        .await
-        .map_err(|e| e.to_string())?;
-        match outcome {
-            Some(g) => g,
-            None => return Ok(written),
-        }
-    };
-    if gray != stored_gray {
-        let guard = state.catalog.lock().map_err(|e| e.to_string())?;
-        let catalog = guard.as_ref().ok_or("No catalog is open")?;
-        catalog.set_grayscale(photo_id, gray).map_err(|e| e.to_string())?;
-        catalog.apply_auto_tags().map_err(|e| e.to_string())?;
-    }
-    Ok(written)
+    let state = state.clone();
+    crate::app::spawn_blocking(move || {
+        crate::app::editing::write_version_then_refresh_monochrome(&state, None, version_id, write)
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// Make a version the photo's cover — the look its Library thumbnail shows — or clear it
@@ -528,7 +404,7 @@ pub async fn commit_version_edit(
     }
     #[cfg(feature = "edit")]
     {
-        write_version_then_refresh_monochrome(&state, version_id, |c| {
+        write_version_then_refresh_monochrome(&state, version_id, move |c| {
             c.commit_version_edit(version_id, &edit_json, &label, amend)
         })
         .await
@@ -550,7 +426,7 @@ pub async fn goto_version_step(
     }
     #[cfg(feature = "edit")]
     {
-        write_version_then_refresh_monochrome(&state, version_id, |c| c.goto_version_step(version_id, seq)).await
+        write_version_then_refresh_monochrome(&state, version_id, move |c| c.goto_version_step(version_id, seq)).await
     }
 }
 
@@ -670,12 +546,12 @@ mod tests {
 
         let bw = r#"{"bw":{"enabled":true,"r":0.3,"g":0.6,"b":0.1}}"#;
         let h = rt
-            .block_on(write_version_then_refresh_monochrome(&state, v, |c| c.commit_version_edit(v, bw, "B&W Neutral", false)))
+            .block_on(write_version_then_refresh_monochrome(&state, v, move |c| c.commit_version_edit(v, bw, "B&W Neutral", false)))
             .unwrap();
         assert_eq!(h.head, Some(1));
         assert_eq!(tagged(&state), (true, true), "a B&W commit marks and tags the photo");
 
-        rt.block_on(write_version_then_refresh_monochrome(&state, v, |c| c.goto_version_step(v, 0)))
+        rt.block_on(write_version_then_refresh_monochrome(&state, v, move |c| c.goto_version_step(v, 0)))
             .unwrap();
         assert_eq!(tagged(&state), (false, false), "stepping back to colour clears both");
     }

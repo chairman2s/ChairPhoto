@@ -33,52 +33,14 @@ pub async fn raw_probe(app: AppHandle, photo_id: i64) -> Result<DevelopSource, S
     .map_err(|e| e.to_string())?
 }
 
-/// Resolve a photo's original path off the catalog lock (the same brief-lock-then-stat
-/// shape every render command uses).
-fn resolve_original(app: &AppHandle, photo_id: i64) -> Result<std::path::PathBuf, String> {
-    let state = app.state::<AppState>();
-    let candidates = {
-        let guard = state.catalog.lock().map_err(|e| e.to_string())?;
-        let catalog = guard.as_ref().ok_or("No catalog is open")?;
-        catalog.photo_path_candidates(photo_id).map_err(|e| e.to_string())?
-    };
-    crate::volume_health::pick_existing(
-        &candidates,
-        &state.volume_health,
-        crate::catalog::ResolveMode::OriginalRequired,
-    )
-    .ok_or_else(|| format!("no reachable copy of photo {photo_id}"))
-}
-
 /// The Darkroom opened `photo_id`: claim the develop session and start preparing its
 /// working image, then — at lower priority, silently — its `neighbours` (N+1 first).
-/// Returns the state right now; changes arrive as `develop:source`. A neighbour that is not
-/// a RAW or whose original is unreachable is simply not preloaded.
+/// Returns the state right now; changes arrive as `develop:source`
+/// (`app::editing::develop_open`).
 #[tauri::command]
 pub async fn develop_open(app: AppHandle, photo_id: i64, neighbours: Vec<i64>) -> Result<DevelopSource, String> {
     crate::app::spawn_blocking(move || {
-        let path = resolve_original(&app, photo_id)?;
-        if !crate::scanner::is_raw(&path) {
-            // Nothing to prepare for a JPEG; `session::open` is not reached, so a previous
-            // photo's image is released by the next open or by Develop's close.
-            return Ok(DevelopSource::Jpeg);
-        }
-        let probe = probe_source(&path);
-        #[cfg(all(feature = "raw", feature = "edit"))]
-        {
-            let neighbours: Vec<(i64, std::path::PathBuf)> = neighbours
-                .into_iter()
-                .filter(|&n| n != photo_id)
-                .filter_map(|n| resolve_original(&app, n).ok().map(|p| (n, p)))
-                .filter(|(_, p)| crate::scanner::is_raw(p))
-                .collect();
-            return crate::develop::session::open(&app.state::<AppState>(), photo_id, path, probe, neighbours);
-        }
-        #[cfg(not(all(feature = "raw", feature = "edit")))]
-        {
-            let _ = (path, neighbours);
-            Ok(probe)
-        }
+        crate::app::editing::develop_open(&app.state::<AppState>(), None, photo_id, &neighbours)
     })
     .await
     .map_err(|e| e.to_string())?
@@ -87,16 +49,7 @@ pub async fn develop_open(app: AppHandle, photo_id: i64, neighbours: Vec<i64>) -
 /// The Darkroom closed: release the working images. Idempotent.
 #[tauri::command]
 pub async fn develop_close(app: AppHandle) -> Result<(), String> {
-    #[cfg(all(feature = "raw", feature = "edit"))]
-    {
-        let state = app.state::<AppState>();
-        return crate::develop::session::close(&state);
-    }
-    #[cfg(not(all(feature = "raw", feature = "edit")))]
-    {
-        let _ = app;
-        Ok(())
-    }
+    crate::app::editing::develop_close(&app.state::<AppState>())
 }
 
 /// Bytes the `.rawf` decode cache holds right now (Preferences → Darkroom); 0 in a build
@@ -120,24 +73,9 @@ pub async fn develop_cache_clear() -> Result<u64, String> {
 /// The develop source state right now (a remounted view re-attaching).
 #[tauri::command]
 pub async fn develop_source(app: AppHandle, photo_id: i64) -> Result<DevelopSource, String> {
-    crate::app::spawn_blocking(move || {
-        let path = resolve_original(&app, photo_id)?;
-        if !crate::scanner::is_raw(&path) {
-            return Ok(DevelopSource::Jpeg);
-        }
-        let probe = probe_source(&path);
-        #[cfg(all(feature = "raw", feature = "edit"))]
-        {
-            let state = app.state::<AppState>();
-            return Ok(crate::develop::session::current(&state, photo_id, probe));
-        }
-        #[cfg(not(all(feature = "raw", feature = "edit")))]
-        {
-            Ok(probe)
-        }
-    })
-    .await
-    .map_err(|e| e.to_string())?
+    crate::app::spawn_blocking(move || crate::app::editing::develop_current(&app.state::<AppState>(), None, photo_id))
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 #[cfg(test)]

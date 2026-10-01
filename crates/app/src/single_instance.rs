@@ -12,8 +12,24 @@
 //!   next primary (which can only be one, it holds the lock) removes it before binding.
 //!
 //! The directory is `$XDG_RUNTIME_DIR/chairphoto`, or `<tmp>/chairphoto-<uid>` when
-//! `XDG_RUNTIME_DIR` is unset; either way created `0700` and refused unless it is owned by
-//! this user and not writable by anyone else. A socket path must fit `sun_path`
+//! `XDG_RUNTIME_DIR` is unset; either way created `0700`, refused unless it is a real
+//! directory (not a symlink) owned by this user, and tightened to `0700` if it already exists
+//! with any group/other bits ([`ensure_private_dir`]).
+//!
+//! # Who may connect
+//!
+//! Only this user. Three layers, each enough on its own against another local user:
+//!
+//! 1. The directory is `0700`, so nobody else can reach the socket file at all (connecting
+//!    to a Unix socket needs search permission on every directory of its path).
+//! 2. The socket is `chmod 0600` right after `bind`. Between the two it has the umask's mode,
+//!    but it is already inside the `0700` directory, so that moment exposes nothing; this
+//!    avoids changing the process-global umask, which would race every other thread that
+//!    creates files.
+//! 3. The primary reads each peer's uid (`SO_PEERCRED`, [`peer_uid`]) and drops a connection
+//!    from any other uid unanswered.
+//!
+//! A socket path must fit `sun_path`
 //! ([`MAX_SOCKET_PATH`] bytes): when `$TMPDIR` is too deep for that, the fallback is
 //! `/tmp/chairphoto-<uid>`, and a path that still does not fit is refused by [`claim`] with an
 //! error that says so (the app then runs without single-instance).
@@ -49,8 +65,8 @@
 //!
 //! The primary serves one connection at a time, gives each peer one deadline for its whole
 //! request (not a timeout per read, which a trickling peer could renew forever), and caps
-//! line length and URL count, so a stuck or hostile peer (the socket is private to this user
-//! anyway) costs at most that deadline.
+//! line length and URL count, so a stuck or hostile peer (only this user can connect, see
+//! "Who may connect") costs at most that deadline.
 
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, ErrorKind, Read, Write};
@@ -155,28 +171,87 @@ fn fallback_dir(tmp: &Path, uid: u32) -> PathBuf {
     }
 }
 
-/// This process's uid, read from `/proc/self` (no libc call needed on Linux).
+/// This process's effective uid: what the kernel checks file access against and what a peer
+/// sees through `SO_PEERCRED`.
 fn current_uid() -> io::Result<u32> {
-    std::fs::metadata("/proc/self").map(|m| m.uid())
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    Ok(unsafe { libc::geteuid() })
 }
 
-/// Create `dir` (mode 0700) if missing; refuse it unless it is a real directory owned by
-/// `uid` with no group/other write permission. A shared temp dir makes this matter: another
-/// user could otherwise pre-create the directory and receive our URLs.
+/// Create `dir` (mode 0700) if missing. Refuse it unless it is a real directory (not a
+/// symlink) owned by `uid`; if it has any group/other permission bits, tighten it to `0700`.
+/// A shared temp dir makes this matter: another user could otherwise pre-create the
+/// directory and receive our URLs, or reach a socket in a `0755` directory of ours.
+///
+/// The checks and the `chmod` act on one open descriptor (`O_NOFOLLOW`, `fstat`, `fchmod`),
+/// so the directory cannot be swapped for a symlink or another directory in between.
 fn ensure_private_dir(dir: &Path, uid: u32) -> io::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let refuse = |why: &str| {
+        io::Error::new(
+            ErrorKind::PermissionDenied,
+            format!("{} is not a private directory owned by uid {uid}: {why}", dir.display()),
+        )
+    };
     match std::fs::DirBuilder::new().mode(0o700).create(dir) {
         Ok(()) => {}
         Err(e) if e.kind() == ErrorKind::AlreadyExists => {}
         Err(e) => return Err(e),
     }
-    let meta = std::fs::symlink_metadata(dir)?;
-    if !meta.is_dir() || meta.uid() != uid || meta.permissions().mode() & 0o022 != 0 {
-        return Err(io::Error::new(
-            ErrorKind::PermissionDenied,
-            format!("{} is not a private directory owned by uid {uid}", dir.display()),
-        ));
+    let handle = match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(dir)
+    {
+        Ok(handle) => handle,
+        // O_NOFOLLOW on a symlink: ELOOP; O_DIRECTORY on anything else: ENOTDIR.
+        Err(e) if matches!(e.raw_os_error(), Some(libc::ELOOP) | Some(libc::ENOTDIR)) => {
+            return Err(refuse("not a directory (or a symlink)"))
+        }
+        Err(e) => return Err(e),
+    };
+    let meta = handle.metadata()?;
+    if !meta.is_dir() {
+        return Err(refuse("not a directory"));
+    }
+    if meta.uid() != uid {
+        return Err(refuse(&format!("owned by uid {}", meta.uid())));
+    }
+    let mode = meta.permissions().mode() & 0o7777;
+    if mode & 0o077 != 0 {
+        eprintln!("single instance: {} had mode {mode:o}; tightening it to 700", dir.display());
+        handle.set_permissions(std::fs::Permissions::from_mode(0o700))?;
+        if handle.metadata()?.permissions().mode() & 0o077 != 0 {
+            return Err(refuse("could not remove its group/other permissions"));
+        }
     }
     Ok(())
+}
+
+/// The uid of the process on the other end of `stream` when it connected (`SO_PEERCRED`;
+/// std's `UnixStream::peer_cred` is unstable).
+fn peer_uid(stream: &UnixStream) -> io::Result<u32> {
+    use std::os::fd::AsRawFd as _;
+    let mut cred = libc::ucred { pid: 0, uid: 0, gid: 0 };
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    // SAFETY: `cred` and `len` are valid for writes and `len` is `cred`'s size; the fd is
+    // open for as long as `stream` is borrowed.
+    let rc = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            (&mut cred as *mut libc::ucred).cast(),
+            &mut len,
+        )
+    };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if len as usize != std::mem::size_of::<libc::ucred>() {
+        return Err(io::Error::other("SO_PEERCRED returned a short ucred"));
+    }
+    Ok(cred.uid)
 }
 
 /// Why [`claim`] failed.
@@ -213,6 +288,8 @@ pub struct Primary {
     listener: Option<UnixListener>,
     socket: PathBuf,
     closing: Closer,
+    /// The only uid whose connections are served: this process's.
+    peer_uid: u32,
     _lock: File,
 }
 
@@ -271,10 +348,22 @@ impl Primary {
     ) -> io::Result<Self> {
         let listener = self.listener.take().expect("serve is called once");
         let closing = self.closing.clone();
+        let allowed_uid = self.peer_uid;
         std::thread::Builder::new().name("chairphoto-instance".into()).spawn(move || {
             for stream in listener.incoming() {
                 match stream {
                     Ok(stream) => {
+                        match peer_uid(&stream) {
+                            Ok(uid) if uid == allowed_uid => {}
+                            Ok(uid) => {
+                                eprintln!("single instance: refused a connection from uid {uid}");
+                                continue;
+                            }
+                            Err(e) => {
+                                eprintln!("single instance: refused a connection, no peer credentials: {e}");
+                                continue;
+                            }
+                        }
                         let accept = |request: Request| {
                             if closing.is_closed() {
                                 Err(Refused::Closing)
@@ -360,10 +449,15 @@ fn become_primary(endpoint: &Endpoint, lock: File) -> Result<Claim, ClaimError> 
         Err(e) => return Err(ClaimError::Endpoint(e)),
     }
     let listener = UnixListener::bind(&endpoint.socket).map_err(ClaimError::Endpoint)?;
+    // The socket was created with the umask's mode, inside the 0700 directory (see the module
+    // docs, "Who may connect"); narrow it to this user before anyone is served.
+    std::fs::set_permissions(&endpoint.socket, std::fs::Permissions::from_mode(0o600))
+        .map_err(ClaimError::Endpoint)?;
     Ok(Claim::Primary(Primary {
         listener: Some(listener),
         socket: endpoint.socket.clone(),
         closing: Closer::default(),
+        peer_uid: current_uid().map_err(ClaimError::Endpoint)?,
         _lock: lock,
     }))
 }
@@ -805,23 +899,83 @@ mod tests {
         }
     }
 
+    /// The runtime dir is created 0700; an existing one of ours with group/other bits (0755,
+    /// 0777, 0710) is tightened to 0700; someone else's, a symlink, or a file is refused and
+    /// left as it was.
     #[test]
-    fn a_shared_runtime_dir_is_refused() {
+    fn the_runtime_dir_is_made_private_or_refused() {
         let dir = TempDir::new("perm");
         let uid = current_uid().unwrap();
+        let mode = |p: &Path| std::fs::symlink_metadata(p).unwrap().permissions().mode() & 0o7777;
         let private = dir.0.join("private");
         ensure_private_dir(&private, uid).unwrap();
-        assert_eq!(std::fs::metadata(&private).unwrap().permissions().mode() & 0o777, 0o700);
+        assert_eq!(mode(&private), 0o700);
 
-        let shared = dir.0.join("shared");
-        std::fs::create_dir(&shared).unwrap();
-        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o777)).unwrap();
-        assert!(ensure_private_dir(&shared, uid).is_err());
+        for loose in [0o755, 0o777, 0o710] {
+            let existing = dir.0.join(format!("loose-{loose:o}"));
+            std::fs::create_dir(&existing).unwrap();
+            std::fs::set_permissions(&existing, std::fs::Permissions::from_mode(loose)).unwrap();
+            ensure_private_dir(&existing, uid).unwrap();
+            assert_eq!(mode(&existing), 0o700, "a {loose:o} dir of ours was not tightened");
+        }
 
         let link = dir.0.join("link");
         std::os::unix::fs::symlink(&private, &link).unwrap();
         assert!(ensure_private_dir(&link, uid).is_err(), "a symlink is not accepted");
+        let loose_target = dir.0.join("loose-target");
+        std::fs::create_dir(&loose_target).unwrap();
+        std::fs::set_permissions(&loose_target, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let link_to_loose = dir.0.join("link-to-loose");
+        std::os::unix::fs::symlink(&loose_target, &link_to_loose).unwrap();
+        assert!(ensure_private_dir(&link_to_loose, uid).is_err());
+        assert_eq!(mode(&loose_target), 0o755, "the chmod followed a symlink");
 
-        assert!(ensure_private_dir(&private, uid + 1).is_err(), "someone else's directory");
+        let file = dir.0.join("file");
+        std::fs::write(&file, b"").unwrap();
+        assert!(ensure_private_dir(&file, uid).is_err(), "a file is not a directory");
+
+        let theirs = dir.0.join("theirs");
+        std::fs::create_dir(&theirs).unwrap();
+        std::fs::set_permissions(&theirs, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(ensure_private_dir(&theirs, uid + 1).is_err(), "someone else's directory");
+        assert_eq!(mode(&theirs), 0o755, "someone else's directory was changed");
+    }
+
+    /// The primary's socket is 0600, whatever mode the umask gave it at bind.
+    #[test]
+    fn the_socket_is_private_to_this_user() {
+        let dir = TempDir::new("sockmode");
+        let endpoint = Endpoint::new(&dir.0, "k");
+        let _primary = primary(claim(&endpoint, &Request::default(), CONNECT_PATIENCE));
+        let meta = std::fs::symlink_metadata(&endpoint.socket).unwrap();
+        assert_eq!(meta.permissions().mode() & 0o7777, 0o600);
+    }
+
+    /// SO_PEERCRED on a connection of ours names this user.
+    #[test]
+    fn peer_credentials_name_this_user() {
+        let (a, _b) = UnixStream::pair().unwrap();
+        assert_eq!(peer_uid(&a).unwrap(), current_uid().unwrap());
+    }
+
+    /// A connection from any other uid is dropped unanswered, and its request never reaches
+    /// the app. Another user cannot be had without root, so this primary serves only a uid
+    /// that is not ours, and our own connection plays the stranger.
+    #[test]
+    fn a_peer_with_another_uid_is_dropped_unanswered() {
+        let dir = TempDir::new("peercred");
+        let endpoint = Endpoint::new(&dir.0, "k");
+        let (tx, rx) = mpsc::channel();
+        let mut stranger_only = primary(claim(&endpoint, &Request::default(), CONNECT_PATIENCE));
+        stranger_only.peer_uid = current_uid().unwrap() + 1;
+        let _primary = stranger_only.serve(move |r| tx.send(r).map_err(|_| Refused::Closing)).unwrap();
+
+        let mut stream = UnixStream::connect(&endpoint.socket).unwrap();
+        stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let _ = stream.write_all(format!("{HELLO}\nurl {PHOTO}\nend\n").as_bytes());
+        let mut answer = String::new();
+        let _ = stream.read_to_string(&mut answer);
+        assert_eq!(answer, "", "a stranger was answered");
+        assert!(rx.recv_timeout(Duration::from_millis(200)).is_err(), "a stranger's link reached the app");
     }
 }

@@ -112,19 +112,22 @@ fn export_photos_claimed_with(
     }
     // Resolve originals + assemble the optional reach-hashtag bundle under one lock hold,
     // then release it so the file work never holds the catalog.
-    let (resolved, hashtags) = {
+    let (resolved, hashtags, read_from) = {
         let guard = state.catalog.lock().map_err(|e| e.to_string())?;
         let catalog = guard.as_ref().ok_or("No catalog is open")?;
         if from.is_some_and(|f| !f.is(catalog)) {
             return Err(CATALOG_CHANGED.into());
         }
+        // The catalog this export reads — its parity tally is recorded there, not into
+        // whichever catalog is open once the copies are written.
+        let read_from = CatalogIdentity(catalog.instance_id());
         // Languages for keyword assembly: canonical + neutral synonyms for now.
         let resolved = crate::export::resolve_originals(catalog, &request.photo_ids, &[], request.version_id);
         let hashtags = match request.hashtag_group_id {
             Some(g) => catalog.assemble_hashtag_bundle(g, request.hashtag_limit).map_err(|e| e.to_string())?,
             None => Vec::new(),
         };
-        (resolved, hashtags)
+        (resolved, hashtags, read_from)
     };
     let job = claim.job;
     let events = state.clone();
@@ -141,7 +144,7 @@ fn export_photos_claimed_with(
             }
         },
     )?;
-    record_export_parity(state);
+    record_export_parity_as(state, Some(read_from));
     if run.stopped {
         return Err(format!(
             "{EXPORT_CANCELLED}: {} of {} exported to {}.",
@@ -212,6 +215,13 @@ pub const EXPORT_PARITY_KEY: &str = "metrics.exportParity";
 /// after every command that writes an export (the Export dialog, publishing, Instagram,
 /// LocalSend); best-effort — a failed write loses a count, never an export.
 pub fn record_export_parity(state: &AppState) {
+    record_export_parity_as(state, None);
+}
+
+/// [`record_export_parity`] bound to `from`, the catalog the export read: once another
+/// catalog is open the tally is dropped (it counts the old catalog's exports), never added
+/// to the new catalog's total.
+pub fn record_export_parity_as(state: &AppState, from: Option<CatalogIdentity>) {
     #[cfg(feature = "edit")]
     {
         use crate::plugins::edit::parity::{take, ParityTally};
@@ -221,6 +231,10 @@ pub fn record_export_parity(state: &AppState) {
         }
         let Ok(guard) = state.catalog.lock() else { return };
         let Some(catalog) = guard.as_ref() else { return };
+        if from.is_some_and(|f| !f.is(catalog)) {
+            eprintln!("export: the catalog changed during the export; its parity tally is not recorded");
+            return;
+        }
         let total: ParityTally = catalog
             .get_setting(EXPORT_PARITY_KEY)
             .ok()
@@ -235,7 +249,7 @@ pub fn record_export_parity(state: &AppState) {
         }
     }
     #[cfg(not(feature = "edit"))]
-    let _ = state;
+    let _ = (state, from);
 }
 
 #[cfg(test)]
@@ -410,6 +424,30 @@ mod tests {
         assert!(err.starts_with(crate::bundle::writer::BUNDLE_EXPORT_CANCELLED), "{err}");
         assert!(!dest2.exists());
         assert_eq!(files(&f.dir.join("out")), ["trip.chairphoto"], "no temp file is left behind");
+    }
+
+    /// The export-parity tally is recorded into the catalog the export read. A switch while
+    /// the copies are written (forced from the per-photo hook, with a checked export tallied
+    /// just before it) drops the tally: the newly open catalog's total is never touched.
+    #[cfg(feature = "edit")]
+    #[test]
+    fn the_export_parity_tally_never_lands_in_a_catalog_switched_to_mid_export() {
+        let f = fixture("parity-switch", 2);
+        let dest = f.dir.join("out");
+        let other = fixture("parity-switch-other", 1);
+        let swapped = std::sync::Mutex::new(other.state.catalog.lock().unwrap().take());
+        let claim = claim_export(&f.state).unwrap();
+        let switch = |done: usize| {
+            if done == 1 {
+                crate::plugins::edit::parity::record(0.0);
+                let next = swapped.lock().unwrap().take();
+                *f.state.catalog.lock().unwrap() = next;
+            }
+        };
+        export_photos_claimed_with(&f.state, &claim, None, &request(&f, &dest), &switch).unwrap();
+        let guard = f.state.catalog.lock().unwrap();
+        let now = guard.as_ref().unwrap();
+        assert_eq!(now.get_setting(EXPORT_PARITY_KEY).unwrap(), None, "the switched-to catalog's total is untouched");
     }
 
     /// A Cancel during the last photo (its preview step, the final progress call) — after

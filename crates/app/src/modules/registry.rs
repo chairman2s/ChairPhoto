@@ -29,6 +29,14 @@
 //! line, and applied on top of the restored set once it lands; then the result is written.
 //! A toggle can therefore never overwrite the saved set with a partial one.
 //!
+//! **Queued toggles belong to a catalog.** Each remembers the catalog the UI had read when it
+//! was made (the model's `catalog_identity`; none before the first read lands). A catalog
+//! switch drops every queued toggle, with a status line saying so: they were asked for against
+//! the old catalog's modules, and the new catalog's saved set must not inherit them. A restore
+//! applies only the toggles made against the catalog it read (or made before any catalog was
+//! read), so a core switch the UI has not heard of yet cannot carry them over either. Dropped
+//! toggles are the user's to redo; nothing is written for them.
+//!
 //! **Events.** Every [`CoreEvent`] the app model routes ([`AppModelEvent::Core`]) reaches each
 //! enabled module's `on_event`, in registration order. `appearance:theme_changed` is applied
 //! to the theme by the router and does not reach modules.
@@ -40,7 +48,7 @@ use super::{
 use crate::image_store::ImageStore;
 use crate::model::{AppModel, AppModelEvent};
 use crate::shell::ShellState;
-use chairphoto_core::app::{with_catalog_as, with_catalog_identified, AppState, CoreEvent, CATALOG_CHANGED};
+use chairphoto_core::app::{with_catalog_as, with_catalog_identified, AppState, CatalogIdentity, CoreEvent, CATALOG_CHANGED};
 use gpui_kit::component::WindowExt as _;
 use gpui_kit::prelude::*;
 use gpui_kit::{AnyView, App, Context, Entity, SharedString, Window, WindowId};
@@ -156,6 +164,14 @@ enum Restore {
     Done,
 }
 
+/// A toggle waiting for the restore.
+struct Queued {
+    id: String,
+    enable: bool,
+    /// The catalog the UI had read when it was asked for; `None` before any read had landed.
+    made_on: Option<CatalogIdentity>,
+}
+
 /// A contributed view, per window: a panel's view in the main window is not the same entity
 /// as the same panel's view in a pop-out loupe window. A window's views are dropped when it
 /// closes, and every view of a module when it is disabled.
@@ -181,8 +197,9 @@ pub struct ModuleRegistry {
     /// one (tests).
     images: Option<Entity<ImageStore>>,
     restore: Restore,
-    /// Enables (`true`) and disables asked for while the restore had not landed, in order.
-    queued: Vec<(String, bool)>,
+    /// Enables (`true`) and disables asked for while the restore had not landed, in order,
+    /// each with the catalog the UI had read when it was asked for (see the module docs).
+    queued: Vec<Queued>,
     /// Bumped by every catalog switch: a restore read from before it is dropped.
     restore_generation: u64,
     /// The catalog the enabled set was restored from; writes go only to it. Its identity,
@@ -521,8 +538,9 @@ impl ModuleRegistry {
             return false;
         }
         let Some(name) = name else { return true };
+        let made_on = this.read(cx).model.read(cx).catalog_identity();
         this.update(cx, |r, cx| {
-            r.queued.push((id.to_string(), enable));
+            r.queued.push(Queued { id: id.to_string(), enable, made_on });
             cx.notify();
         });
         let verb = if enable { "enabled" } else { "disabled" };
@@ -647,6 +665,7 @@ impl ModuleRegistry {
                 if this.read(cx).restore_generation != generation {
                     return; // the catalog was switched while reading: the new one's read follows
                 }
+                let read_from = read.as_ref().ok().map(|(from, _)| *from);
                 match read {
                     Ok((from, csv)) => {
                         this.read(cx).restored_from.set(Some(from));
@@ -665,15 +684,20 @@ impl ModuleRegistry {
                     }
                     Err(e) => eprintln!("modules: could not read the enabled modules: {e}"),
                 }
-                let queued = this.update(cx, |r, _| {
+                let (queued, foreign): (Vec<Queued>, Vec<Queued>) = this.update(cx, |r, _| {
                     r.restore = Restore::Done;
-                    std::mem::take(&mut r.queued)
+                    // Only the toggles made against the catalog this restore read (or before
+                    // any read): a core switch may have published another under the UI.
+                    std::mem::take(&mut r.queued).into_iter().partition(|q| q.made_on.is_none() || q.made_on == read_from)
                 });
-                for (id, enable) in &queued {
-                    if *enable {
-                        Self::enable_inner(&this, id, false, &mut HashSet::new(), cx);
+                if !foreign.is_empty() {
+                    Self::report_dropped(&this, foreign.len(), cx);
+                }
+                for q in &queued {
+                    if q.enable {
+                        Self::enable_inner(&this, &q.id, false, &mut HashSet::new(), cx);
                     } else {
-                        Self::disable_inner(&this, id, false, cx);
+                        Self::disable_inner(&this, &q.id, false, cx);
                     }
                 }
                 this.update(cx, |r, cx| {
@@ -688,13 +712,27 @@ impl ModuleRegistry {
     }
 
     /// A catalog switch: the saved set is the new catalog's, read on the model's next catalog
-    /// read; until then toggles queue, and a read still running for the old one is dropped.
+    /// read; until then toggles queue, and a read still running for the old one is dropped —
+    /// as are the toggles queued for the old one (see the module docs).
     fn catalog_switched(this: &Entity<Self>, cx: &mut App) {
-        this.update(cx, |r, _| {
+        let dropped = this.update(cx, |r, cx| {
             r.restore = Restore::Waiting;
             r.restore_generation += 1;
             r.restored_from.set(None);
+            let dropped = std::mem::take(&mut r.queued).len();
+            if dropped > 0 {
+                cx.notify();
+            }
+            dropped
         });
+        if dropped > 0 {
+            Self::report_dropped(this, dropped, cx);
+        }
+    }
+
+    fn report_dropped(this: &Entity<Self>, n: usize, cx: &mut App) {
+        let what = if n == 1 { "a module change".to_string() } else { format!("{n} module changes") };
+        Self::report(this, format!("Modules: the catalog changed before its saved modules were read; {what} not applied"), cx);
     }
 
     /// Hand `event` to every enabled module, in registration order. A module disabled by an

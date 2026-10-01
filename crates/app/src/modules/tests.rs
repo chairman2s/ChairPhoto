@@ -537,6 +537,44 @@ fn a_restore_read_overtaken_by_a_switch_is_dropped(cx: &mut TestAppContext) {
     assert_eq!(*log.borrow(), ["load:b"], "A's set was never applied");
 }
 
+/// **Forced interleaving.** A toggle queued while A's restore read runs was asked for against
+/// A; when B (with its own saved set) opens before that read lands it never applies to B nor
+/// reaches B's saved set — with the event (the switch drops it) and without it (the restore,
+/// which read B, refuses a toggle made against A). A toggle made after the event waits for
+/// B's restore and lands on B.
+#[gpui_kit::test]
+fn toggles_queued_for_one_catalog_never_apply_to_the_next(cx: &mut TestAppContext) {
+    for deliver in [false, true] {
+        let dir = TempDir::new("queued-switch");
+        let log = Log::default();
+        let b = bench_unrestored(
+            vec![probe(ModuleMeta::new("a", "A"), &log), probe(ModuleMeta::new("b", "B"), &log), probe(ModuleMeta::new("c", "C"), &log)],
+            &[],
+            &dir,
+            cx,
+        );
+        b.state.catalog.lock().unwrap().as_ref().unwrap().set_setting(ENABLED_KEY, "a").unwrap();
+        b.model.update(cx, |m, cx| m.refresh(cx));
+        while !b.registry.read_with(cx, |r, _| r.restore_reading()) {
+            cx.executor().tick();
+        }
+        cx.update(|cx| ModuleRegistry::enable(&b.registry, "c", cx)); // queued, made against A
+        let other = Catalog::open(&dir.0.join("b.chairphoto"), &dir.0.join("photos")).unwrap();
+        other.set_setting(ENABLED_KEY, "b").unwrap();
+        b.state.catalog.lock().unwrap().replace(other);
+        if deliver {
+            b.model.update(cx, |m, cx| m.on_core_event(&CoreEvent::CatalogSwitched("b".into()), cx));
+            assert!(b.status(cx).contains("not applied"), "said so: {}", b.status(cx));
+            cx.update(|cx| ModuleRegistry::enable(&b.registry, "a", cx)); // made against B
+        }
+        cx.run_until_parked();
+        let (want_on, want_saved) = if deliver { (vec!["a", "b"], "a,b") } else { (vec!["b"], "b") };
+        assert_eq!(b.enabled(cx), want_on, "deliver={deliver}: A's queued toggle did not apply to B");
+        assert_eq!(b.setting(ENABLED_KEY).as_deref(), Some(want_saved), "deliver={deliver}: B's saved set");
+        assert!(!log.borrow().contains(&"load:c".to_string()), "deliver={deliver}: C never loaded: {:?}", log.borrow());
+    }
+}
+
 /// **Forced interleaving, A→B→A.** A toggle's write for catalog A is still queued when the app
 /// switches to B and back to A — a new opening of the same file. The write is refused: the
 /// reopened A's saved set is what its own restore read, not the old opening's toggle. Without

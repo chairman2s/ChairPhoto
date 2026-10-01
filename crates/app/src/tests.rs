@@ -595,6 +595,37 @@ fn links_waiting_for_the_catalog_are_coalesced_to_the_newest(cx: &mut TestAppCon
     assert_eq!(model.read_with(cx, |m, _| m.pending_link_count()), 0);
 }
 
+/// Link resolution is bounded once the catalog is open, too (Codex gate, #100): a flood of
+/// links while a catalog operation holds the lock starts one lookup, and the rest coalesce
+/// into one waiting slot, rather than a parked lookup per link. The newest is the one that
+/// lands once the lock is free.
+#[gpui_kit::test]
+fn a_flood_of_links_runs_one_resolution_at_a_time(cx: &mut TestAppContext) {
+    let dir = TempDir::new("link-bound");
+    let (state, model) = wired(cx);
+    let (photo_uuid, tag_uuid) = catalog_with_a_photo_and_a_tag(&dir, &state);
+    model.update(cx, |m, cx| m.refresh(cx));
+    cx.run_until_parked();
+    assert_eq!(model.read_with(cx, |m, _| m.resolutions_started()), 0);
+
+    {
+        // A long catalog operation (a scan, a backup) holds the lock throughout the flood.
+        let _held = state.catalog.lock().unwrap();
+        for _ in 0..100 {
+            model.update(cx, |m, cx| m.open_url(&format!("chairphoto://{photo_uuid}"), cx));
+        }
+        model.update(cx, |m, cx| m.open_url(&format!("chairphoto://tag/{tag_uuid}"), cx));
+        assert_eq!(model.read_with(cx, |m, _| m.resolutions_started()), 1, "one lookup, not one per link");
+        assert_eq!(model.read_with(cx, |m, _| m.pending_link_count()), 1);
+    }
+    cx.run_until_parked();
+    // The first lookup ran and was superseded; the newest link's ran next and landed.
+    assert_eq!(model.read_with(cx, |m, _| m.resolutions_started()), 2);
+    assert_eq!(model.read_with(cx, |m, _| m.pending_link_count()), 0);
+    model.read_with(cx, |m, _| assert!(matches!(m.deep_link, Some(DeepLinkTarget::Tag { .. }))));
+    assert_eq!(model_status(&model, cx), "Deep link: filter by tag Places/Oslo");
+}
+
 /// The queue between the single-instance thread and the main thread is bounded: past
 /// `MAX_QUEUED_REQUESTS` a request is refused `Busy` (the second launch hears `busy`), and
 /// draining makes room again.
@@ -663,6 +694,40 @@ fn a_link_in_flight_at_a_switch_resolves_against_the_new_catalog(cx: &mut TestAp
         }
         other => panic!("the link was lost across the switch: {other:?}"),
     });
+}
+
+/// A newer link always wins across a switch (Codex gate, #100): link A is in flight when the
+/// catalog switches, so it is carried over to wait for the new catalog's read; link B
+/// arrives after the switch but before that read lands. B must be the one applied — the
+/// refresh must not replay the older A over it.
+#[gpui_kit::test]
+fn a_link_after_a_switch_supersedes_the_carried_over_one(cx: &mut TestAppContext) {
+    let dir = TempDir::new("link-newer");
+    let (state, model) = wired(cx);
+    catalog_with_a_photo_and_a_tag(&dir, &state);
+    model.update(cx, |m, cx| m.refresh(cx));
+    cx.run_until_parked();
+    let (other, other_uuid) = second_catalog(&dir);
+    let tag_id = other.create_tag("Places/Bergen").unwrap();
+    let tag_uuid = other.get_tag(tag_id).unwrap().uuid;
+
+    // A starts against the first catalog; the switch lands (the new catalog already in
+    // state, as `switch_catalog` leaves it) before A or the switch's refresh has run.
+    model.update(cx, |m, cx| m.open_url(&format!("chairphoto://{other_uuid}"), cx));
+    *state.catalog.lock().unwrap() = Some(other);
+    model.update(cx, |m, cx| m.on_core_event(&CoreEvent::CatalogSwitched("other".into()), cx));
+    // B, newer, before the refresh lands.
+    model.update(cx, |m, cx| m.open_url(&format!("chairphoto://tag/{tag_uuid}"), cx));
+    cx.run_until_parked();
+
+    model.read_with(cx, |m, _| match &m.deep_link {
+        Some(DeepLinkTarget::Tag { uuid, full_path, .. }) => {
+            assert_eq!(uuid, &tag_uuid);
+            assert_eq!(full_path, "Places/Bergen");
+        }
+        other => panic!("the older link landed over the newer one: {other:?}"),
+    });
+    assert_eq!(model_status(&model, cx), "Deep link: filter by tag Places/Bergen");
 }
 
 /// Asking to quit closes the single-instance endpoint at once (before the event loop ends),

@@ -178,6 +178,34 @@ pub fn js_trim(s: &str) -> &str {
     s.trim_matches(is_js_whitespace)
 }
 
+/// The value of a `0x`/`0o`/`0b` literal's digits, rounded once to the nearest double, as JS
+/// does (`Number("0x1000000000000081")` is 1152921504606847232). Accumulating in `f64` rounds
+/// at every digit and goes wrong past 2^53; a `u64` overflows to NaN past 64 bits. Digits are
+/// gathered exactly in a `u128`; past 128 bits the leading ones are kept, a sticky bit records
+/// whether any dropped digit was non-zero (so a tie still rounds the right way), and the result
+/// is scaled by the exact power of two the dropped digits stood for.
+fn radix_literal_to_number(digits: &str, radix: u32) -> f64 {
+    if digits.is_empty() {
+        return f64::NAN;
+    }
+    let bits = radix.trailing_zeros(); // 16 → 4, 8 → 3, 2 → 1
+    let (mut acc, mut dropped_bits, mut sticky) = (0u128, 0i32, false);
+    for c in digits.chars() {
+        let Some(d) = c.to_digit(radix) else { return f64::NAN };
+        if acc.leading_zeros() >= bits {
+            acc = (acc << bits) | u128::from(d);
+        } else {
+            dropped_bits += bits as i32;
+            sticky |= d != 0;
+        }
+    }
+    if sticky {
+        acc |= 1; // far below a double's 53 bits: it only breaks an exact tie upward
+    }
+    // `u128 as f64` rounds to nearest, ties to even; 2^k scaling is exact (or overflows to ∞).
+    (acc as f64) * 2f64.powi(dropped_bits)
+}
+
 fn string_to_number(s: &str) -> f64 {
     let t = js_trim(s);
     if t.is_empty() {
@@ -190,16 +218,7 @@ fn string_to_number(s: &str) -> f64 {
     }
     for (prefix, radix) in [("0x", 16), ("0X", 16), ("0o", 8), ("0O", 8), ("0b", 2), ("0B", 2)] {
         if let Some(digits) = t.strip_prefix(prefix) {
-            // Accumulated in f64, as JS does: no u64 overflow to NaN for long hex strings.
-            if digits.is_empty() {
-                return f64::NAN;
-            }
-            let mut n = 0.0_f64;
-            for c in digits.chars() {
-                let Some(d) = c.to_digit(radix) else { return f64::NAN };
-                n = n * f64::from(radix) + f64::from(d);
-            }
-            return n;
+            return radix_literal_to_number(digits, radix);
         }
     }
     // JS decimal literal: optional sign, digits with an optional point, optional exponent.
@@ -381,6 +400,11 @@ mod tests {
         assert_eq!(to_number(&Value::String("0xFFFFFFFFFFFFFFFFFF".into())), 4.722366482869645e21);
         assert!(to_number(&Value::String("0x".into())).is_nan());
         assert_eq!(to_number(&Value::String("0b101".into())), 5.0);
+        // Codex review of 39bba5c: rounded once, not per digit (node v25's Number()).
+        assert_eq!(to_number(&Value::String("0x1000000000000081".into())), 1152921504606847232.0);
+        assert_eq!(to_number(&Value::String("0x1fffffffffffff".into())), 9007199254740991.0);
+        assert_eq!(to_number(&Value::String("0x20000000000001".into())), 9007199254740992.0);
+        assert_eq!(to_number(&Value::String(format!("0x{}", "f".repeat(40)))), 1.461501637330903e48);
         assert_eq!(js_trim("\u{85}a\u{85}"), "\u{85}a\u{85}");
     }
 

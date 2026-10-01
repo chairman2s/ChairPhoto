@@ -39,18 +39,26 @@
 //! connection of their own to that catalog (`storage::backup_photo_as` and its siblings).
 //!
 //! **IPTC saves** are serialized per photo: Save is disabled while the photo's fields are
-//! still loading, and a Save while that photo's previous save is in flight runs after it,
-//! with the form's values then (so a catalog row and its sidecar never interleave).
+//! still loading, and a Save while that photo's previous save is in flight is queued with
+//! its photo, catalog and the form's values at that press ([`IptcSave`]; a newer press
+//! replaces it), and runs after the running one — also once the selection has moved on (so a
+//! catalog row and its sidecar never interleave, and no save is silently dropped). A save
+//! whose photo is no longer shown reports its outcome on the status line.
 //!
 //! **External editors** (darktable / RawTherapee / ART) and **RapidRAW** run on the storage
-//! [`Runner`] (the core runtime's blocking pool). A sidecar-editor run is owned by a sequence
-//! number per photo; its result lands only if no newer run for that photo started and the
-//! catalog did not switch. A RapidRAW round-trip gets a core job id
-//! (`rapidraw::next_job_id`) before it starts: its `rapidraw:progress` events (routed here
+//! [`Runner`] (the core runtime's blocking pool), bound to the photo's catalog like every
+//! write (`external_edit::develop_in_editor_as` / `import_developed_as`,
+//! `rapidraw::edit_in_rapidraw_as`): a run whose worker starts after a switch fails closed
+//! under the catalog lock, before anything is launched or imported. A sidecar-editor run is
+//! owned by a sequence number per photo; its result lands only if no newer run for that photo started and the
+//! catalog did not switch. A RapidRAW round-trip is queued under a core job id
+//! (`rapidraw::queue_job`) before its worker starts — cancellable from then on, so a Cancel
+//! before the worker runs means RapidRAW is never launched: its `rapidraw:progress` events (routed here
 //! through `AppModel`) and its result update the photo's entry only while that job still owns
 //! it, and Cancel cancels exactly that job (`cancel_rapidraw_job`). A catalog switch drops
-//! every entry; the round-trips themselves keep running and import into the catalog they
-//! started on (the core captured its path), but this inspector no longer follows them.
+//! every entry; round-trips already running keep running and import into the catalog they
+//! started on (the core captured its file under the identity check), but this inspector no
+//! longer follows them.
 //!
 //! **Not persisted yet.** React kept each section's open state in localStorage
 //! (`inspector.section.<id>`, default collapsed); with no per-machine settings store yet
@@ -209,7 +217,6 @@ pub struct IptcForm {
     pub saved: IptcFields,
     pub status: String,
     fill: Option<IptcFields>,
-    save_seq: u64,
 }
 
 impl IptcForm {
@@ -236,6 +243,21 @@ impl IptcForm {
             input.update(cx, |i, cx| i.set_value(v, window, cx));
         }
     }
+}
+
+/// An IPTC save as Save captured it: the photo's catalog, the form's values then, and the
+/// photo's file name for the status line. A save queued behind a running one carries all of
+/// it, so it runs — and reports — after the inspector has moved to another photo.
+#[derive(Debug, Clone)]
+pub(crate) struct IptcSave {
+    from: CatalogIdentity,
+    fields: IptcFields,
+    name: String,
+}
+
+/// The last component of a catalog-relative path, for messages.
+fn file_name(path: &str) -> String {
+    path.rsplit('/').next().unwrap_or(path).to_string()
 }
 
 /// Which editors this machine has (`availableEditors` filtered to those with a GUI, and
@@ -327,9 +349,9 @@ pub struct PhotoInspector {
     pub rapid: HashMap<i64, RapidRun>,
     pub notes: HashMap<i64, String>,
     seq: u64,
-    /// Photos with an IPTC save in flight, and those whose next Save waits for it.
+    /// Photos with an IPTC save in flight, and the save queued behind each.
     pub iptc_saving: HashSet<i64>,
-    iptc_queued: HashSet<i64>,
+    iptc_queued: HashMap<i64, IptcSave>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -382,7 +404,7 @@ impl PhotoInspector {
             seen_version: None,
             sections: HashSet::new(),
             data: PhotoData::default(),
-            iptc: IptcForm { description, fields, saved: IptcFields::default(), status: String::new(), fill: None, save_seq: 0 },
+            iptc: IptcForm { description, fields, saved: IptcFields::default(), status: String::new(), fill: None },
             meta_open: META_DEFAULT_OPEN.iter().map(|s| s.to_string()).collect(),
             version_name,
             renaming: None,
@@ -396,7 +418,7 @@ impl PhotoInspector {
             notes: HashMap::new(),
             seq: 0,
             iptc_saving: HashSet::new(),
-            iptc_queued: HashSet::new(),
+            iptc_queued: HashMap::new(),
             _subscriptions: subscriptions,
         };
         this.sync(cx);
@@ -820,45 +842,63 @@ impl PhotoInspector {
 
     /// "Save IPTC": the catalog, then the sidecar (`app::iptc::save_iptc_as`, bound to the
     /// photo's catalog), on a worker. One save per photo at a time: a Save while one is in
-    /// flight runs when it ends, with the form's values then.
+    /// flight is queued with the form's values now and runs when it ends.
     pub fn save_iptc(&mut self, cx: &mut Context<Self>) {
         let (Some(id), Some(from)) = (self.photo_id, self.from) else { return };
         if !self.iptc_loaded() {
             return;
         }
+        let name = self.photo(cx).map(|p| file_name(&p.path)).unwrap_or_else(|| format!("photo {id}"));
+        let save = IptcSave { from, fields: self.iptc.values(cx), name };
+        self.iptc.status = "Saving…".into();
+        cx.notify();
         if self.iptc_saving.contains(&id) {
-            self.iptc_queued.insert(id);
+            // A newer Save replaces a still-queued one: its values are the form's now.
+            self.iptc_queued.insert(id, save);
             return;
         }
+        self.start_iptc_save(id, save, cx);
+    }
+
+    /// Run one IPTC save for `id`, then the save queued behind it — whatever the inspector
+    /// shows by then: the queued save carries its own photo, catalog and values.
+    fn start_iptc_save(&mut self, id: i64, save: IptcSave, cx: &mut Context<Self>) {
         self.iptc_saving.insert(id);
-        let fields = self.iptc.values(cx);
-        self.iptc.status = "Saving…".into();
-        self.iptc.save_seq += 1;
-        let (seq, generation, epoch) = (self.iptc.save_seq, self.generation, self.epoch);
-        cx.notify();
+        let epoch = self.epoch;
+        let IptcSave { from, fields, name } = save;
         let saved = fields.clone();
         self.run_blocking_always(
             move |state| chairphoto_core::app::iptc::save_iptc_as(state, from, id, &fields),
             move |this, result, cx| {
                 if this.epoch != epoch {
-                    return;
+                    return; // a switch cleared the bookkeeping; the save was bound to the old catalog
                 }
                 this.iptc_saving.remove(&id);
-                if this.iptc_queued.remove(&id) && this.photo_id == Some(id) && this.generation == generation {
-                    this.save_iptc(cx);
-                    return;
-                }
-                if this.generation != generation || this.iptc.save_seq != seq {
-                    return;
-                }
-                match result {
-                    Ok(()) => {
-                        this.iptc.saved = saved;
-                        this.iptc.status = "Saved to sidecar".into();
+                let shown = this.photo_id == Some(id) && this.from == Some(from);
+                if let Some(next) = this.iptc_queued.remove(&id) {
+                    if let Err(e) = result {
+                        this.status(format!("IPTC save for {name} failed: {e}"), cx);
                     }
-                    Err(e) => this.iptc.status = format!("Failed: {e}"),
+                    this.start_iptc_save(id, next, cx);
+                    return;
                 }
-                cx.notify();
+                if shown {
+                    match result {
+                        Ok(()) => {
+                            this.iptc.saved = saved;
+                            this.iptc.status = "Saved to sidecar".into();
+                        }
+                        Err(e) => this.iptc.status = format!("Failed: {e}"),
+                    }
+                    cx.notify();
+                } else {
+                    // The inspector moved on: the status line says what became of it.
+                    let line = match result {
+                        Ok(()) => format!("IPTC saved to sidecar for {name}"),
+                        Err(e) => format!("IPTC save for {name} failed: {e}"),
+                    };
+                    this.status(line, cx);
+                }
             },
             cx,
         );
@@ -1030,14 +1070,14 @@ impl PhotoInspector {
     /// "Edit in <editor>": launch it on the original; when it closes, the core renders the
     /// sidecar's result and stacks it (`develop_in_editor`).
     pub fn develop(&mut self, editor: &str, label: &str, cx: &mut Context<Self>) {
-        let Some(id) = self.photo_id else { return };
+        let (Some(id), Some(from)) = (self.photo_id, self.from) else { return };
         let note = format!("Editing in {label}… the result imports when you close it.");
         let label = label.to_string();
         let key = editor.to_string();
         let seq = self.begin_sidecar(id, editor, note, cx);
         self.run_blocking(
             move |state| {
-                futures::executor::block_on(chairphoto_core::external_edit::develop_in_editor(state.clone(), id, key))
+                futures::executor::block_on(chairphoto_core::external_edit::develop_in_editor_as(state.clone(), from, id, key))
             },
             move |this, result, cx| {
                 let note = match result {
@@ -1055,12 +1095,14 @@ impl PhotoInspector {
 
     /// "Import result": render the current sidecar and stack it, without relaunching.
     pub fn import_result(&mut self, editor: &str, cx: &mut Context<Self>) {
-        let Some(id) = self.photo_id else { return };
+        let (Some(id), Some(from)) = (self.photo_id, self.from) else { return };
         let key = editor.to_string();
         let note = self.notes.get(&id).cloned().unwrap_or_default();
         let seq = self.begin_sidecar(id, editor, note, cx);
         self.run_blocking(
-            move |state| futures::executor::block_on(chairphoto_core::external_edit::import_developed(state.clone(), id, key)),
+            move |state| {
+                futures::executor::block_on(chairphoto_core::external_edit::import_developed_as(state.clone(), from, id, key))
+            },
             move |this, result, cx| this.end_sidecar(id, seq, result.err(), cx),
             cx,
         );
@@ -1096,16 +1138,20 @@ impl PhotoInspector {
     /// match from the first one. The entry shows "editing" at once (React's optimistic
     /// entry); the events then drive it, and the result writes the terminal note.
     pub fn edit_in_rapidraw(&mut self, cx: &mut Context<Self>) {
-        let Some(id) = self.photo_id else { return };
+        let (Some(id), Some(from)) = (self.photo_id, self.from) else { return };
         if self.rapid.contains_key(&id) {
             return;
         }
-        let job = chairphoto_core::rapidraw::next_job_id();
+        // Queued under its job id now, so a Cancel before the worker starts still lands.
+        let queued = chairphoto_core::rapidraw::queue_job();
+        let job = queued.id();
         self.rapid.insert(id, RapidRun { job, phase: RapidPhase::Editing });
         self.notes.remove(&id);
         cx.notify();
         self.run_blocking(
-            move |state| futures::executor::block_on(chairphoto_core::rapidraw::edit_in_rapidraw_as(state.clone(), id, job)),
+            move |state| {
+                futures::executor::block_on(chairphoto_core::rapidraw::edit_in_rapidraw_as(state.clone(), from, id, queued))
+            },
             move |this, result, cx| this.on_rapidraw_result(id, job, result, cx),
             cx,
         );

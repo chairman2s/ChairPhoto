@@ -1,8 +1,9 @@
 //! Headless tests of the Photo inspector (#108) through the real wiring (`start` → `wire`
 //! → the main window): what each tab shows, its writes, and who owns each result. Blocking
 //! work (IPTC save, storage, editors) runs on `Runner::manual`, so a test decides when it
-//! runs; editor jobs are never run here (that would launch a real editor) — their ownership
-//! is driven through the same entry points the worker's result and the routed events use.
+//! runs. Editor jobs run only against a fake editor script configured as every editor's
+//! binary ([`fake_editor`]) — never a real editor; their ownership is otherwise driven through
+//! the same entry points the worker's result and the routed events use.
 
 use super::*;
 use crate::shell::state::InspectorTab;
@@ -522,6 +523,88 @@ fn iptc_saves_wait_for_the_fields_and_run_one_at_a_time(cx: &mut TestAppContext)
     assert_eq!(aria(&app, "iptc-status", cx).as_deref(), Some("Saved to sidecar"));
 }
 
+/// Photo 0 with its original on disk, the IPTC section open and loaded, Save pressed with
+/// "First" and pressed again with "Second" while the first save is still queued on the
+/// runner: one save running (not yet run), one queued behind it.
+fn two_iptc_saves(app: &App, dir: &TempDir, ids: &[i64], cx: &mut TestAppContext) -> Entity<PhotoInspector> {
+    let original = dir.0.join("photos/2026/p0.ARW");
+    std::fs::create_dir_all(original.parent().unwrap()).unwrap();
+    std::fs::write(&original, b"raw").unwrap();
+    select(app, ids[0], SelectMods::default(), cx);
+    work(cx); // whatever else is queued (the editors probe)
+    click(app, "section-iptc", cx);
+    let insp = inspector(app, cx);
+    render(app, cx);
+    let headline = insp.read_with(cx, |i, _| i.iptc.fields[0].clone());
+    set_input(app, &headline, "First", cx);
+    insp.update(cx, |i, cx| i.save_iptc(cx));
+    set_input(app, &headline, "Second", cx);
+    insp.update(cx, |i, cx| i.save_iptc(cx));
+    insp
+}
+
+/// **A queued save survives navigating away** (#108 gate). Save "First", then "Second" while
+/// the first is in flight, then select another photo before either runs: both run, in order,
+/// on photo 0 — "Second" lands in the catalog and the sidecar — and, the inspector showing
+/// photo 1 by then, the outcome goes to the status line. Photo 1 is untouched.
+/// (Mutation-checked: running the queued save only while its photo is still shown —
+/// `iptc_queued.remove(&id).filter(|_| shown)` — leaves "First" and this fails.)
+#[gpui_kit::test]
+fn a_queued_iptc_save_survives_navigating_away(cx: &mut TestAppContext) {
+    let dir = TempDir::new("insp-iptc-away");
+    let app = start(cx);
+    let ids = open_catalog_with_photos(&app, &dir, 2, cx);
+    let insp = two_iptc_saves(&app, &dir, &ids, cx);
+    select(&app, ids[1], SelectMods::default(), cx);
+    insp.read_with(cx, |i, _| assert_eq!(i.photo_id, Some(ids[1])));
+    assert_eq!(cx.update(|cx| Runner::get(cx).run_pending()), 1, "the first save runs alone");
+    cx.run_until_parked();
+    assert_eq!(catalog(&app, |c| c.get_iptc(ids[0]).unwrap().headline), "First");
+    assert_eq!(cx.update(|cx| Runner::get(cx).run_pending()), 1, "the queued save runs after it");
+    cx.run_until_parked();
+    assert_eq!(catalog(&app, |c| c.get_iptc(ids[0]).unwrap().headline), "Second");
+    let sidecar = std::fs::read_to_string(dir.0.join("photos/2026/p0.ARW.xmp")).unwrap();
+    assert!(sidecar.contains("Second") && !sidecar.contains("First"), "{sidecar}");
+    assert_eq!(crate::tests::status(&app, cx), "IPTC saved to sidecar for p0.ARW");
+    assert_eq!(catalog(&app, |c| c.get_iptc(ids[1]).unwrap().headline), "", "the photo shown now was not written");
+    insp.read_with(cx, |i, _| assert!(i.iptc_saving.is_empty() && i.iptc_queued.is_empty()));
+}
+
+/// **Forced interleaving.** The two saves are pending when the core switches to a catalog
+/// whose photo 0 has the same id (and its own original), with `catalog:switched` withheld or
+/// delivered: neither save writes the new catalog's row or sidecar.
+/// (Mutation-checked: an unbound queued save — `save_iptc` instead of `save_iptc_as` —
+/// writes the new catalog's photo and this fails.)
+fn queued_iptc_across_a_switch(delivered: bool, cx: &mut TestAppContext) {
+    let dir = TempDir::new("insp-iptc-queued-switch");
+    let app = start(cx);
+    let ids = open_catalog_with_photos(&app, &dir, 1, cx);
+    let insp = two_iptc_saves(&app, &dir, &ids, cx);
+    let (b, b_ids) = colliding_catalog(&dir, "b", 1);
+    assert_eq!(b_ids, ids, "the ids collide, as real catalogs' do");
+    let b_original = dir.0.join("b/2026/b0.ARW");
+    std::fs::create_dir_all(b_original.parent().unwrap()).unwrap();
+    std::fs::write(&b_original, b"raw").unwrap();
+    core_switch(&app, b);
+    if delivered {
+        deliver_switch(&app, cx);
+    }
+    work(cx);
+    assert_eq!(catalog(&app, |c| c.get_iptc(b_ids[0]).unwrap().headline), "", "a save wrote the new catalog's photo");
+    assert!(!dir.0.join("b/2026/b0.ARW.xmp").exists(), "a save wrote the new catalog's sidecar");
+    insp.read_with(cx, |i, _| assert!(i.iptc_saving.is_empty() && i.iptc_queued.is_empty()));
+}
+
+#[gpui_kit::test]
+fn a_queued_iptc_save_never_reaches_the_new_catalog_before_the_switch_event(cx: &mut TestAppContext) {
+    queued_iptc_across_a_switch(false, cx);
+}
+
+#[gpui_kit::test]
+fn a_queued_iptc_save_never_reaches_the_new_catalog_after_the_switch_event(cx: &mut TestAppContext) {
+    queued_iptc_across_a_switch(true, cx);
+}
+
 /// Metadata: grouped, the default groups open, "No metadata" when there is none.
 #[gpui_kit::test]
 fn metadata_groups_render_and_toggle(cx: &mut TestAppContext) {
@@ -758,6 +841,109 @@ fn a_superseded_sidecar_run_does_not_write_its_note(cx: &mut TestAppContext) {
         assert!(!i.editing(id));
         assert_eq!(i.notes[&id], "no rawtherapee sidecar");
     });
+}
+
+/// A stand-in for every external editor binary (never a real editor): it appends its
+/// arguments to `log` and exits 1, so a sidecar editor reports "no changes", its CLI and
+/// RapidRAW report an error — and the log says what it was launched on.
+fn fake_editor(dir: &TempDir) -> (std::path::PathBuf, std::path::PathBuf) {
+    use std::os::unix::fs::PermissionsExt as _;
+    let (script, log) = (dir.0.join("fake-editor.sh"), dir.0.join("fake-editor.log"));
+    std::fs::write(&script, format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nexit 1\n", log.display())).unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    (script, log)
+}
+
+/// Point RawTherapee (GUI and CLI) and RapidRAW at `script`, and give `original` a file and a
+/// RawTherapee sidecar, so every editor action has something to launch on.
+fn editors_on(c: &chairphoto_core::catalog::Catalog, script: &std::path::Path, original: &std::path::Path) {
+    let script = script.to_str().unwrap();
+    for key in ["editor.rawtherapee.gui", "editor.rawtherapee.cli", "editor.rapidraw.bin"] {
+        c.set_setting(key, script).unwrap();
+    }
+    std::fs::create_dir_all(original.parent().unwrap()).unwrap();
+    std::fs::write(original, b"raw").unwrap();
+    let mut pp3 = original.as_os_str().to_os_string();
+    pp3.push(".pp3");
+    std::fs::write(pp3, b"[Version]").unwrap();
+}
+
+/// **Forced interleaving** (#108 gate). Develop, Import result and RapidRAW are queued for
+/// photo 1 of catalog A; the core then switches to B, whose photo 1 has its own original,
+/// sidecar and the same (fake) editors configured — with `catalog:switched` withheld or
+/// delivered — and only then do the workers run. Nothing is launched on B's photo and
+/// nothing is imported into B. (A run bound to the open catalog does reach this fake: the
+/// core's `bound_runs_launch_and_switched_runs_fail_closed` tests — run here, the editor's
+/// worker thread would trip GPUI's deterministic scheduler.) (Mutation-checked: without the
+/// identity check in `external_edit::resolve` and `rapidraw::resolve`, the fake is launched
+/// on B's photo and this fails.)
+fn editors_across_a_switch(delivered: bool, cx: &mut TestAppContext) {
+    let dir = TempDir::new("insp-editors-switch");
+    let (script, log) = fake_editor(&dir);
+    let app = start(cx);
+    let ids = open_catalog_with_photos(&app, &dir, 1, cx);
+    let a_original = dir.0.join("photos/2026/p0.ARW");
+    catalog(&app, |c| editors_on(c, &script, &a_original));
+    select(&app, ids[0], SelectMods::default(), cx);
+    let insp = inspector(&app, cx);
+
+    let (b, b_ids) = colliding_catalog(&dir, "b", 1);
+    assert_eq!(b_ids, ids, "the ids collide, as real catalogs' do");
+    let b_original = dir.0.join("b/2026/b0.ARW");
+    editors_on(&b, &script, &b_original);
+    insp.update(cx, |i, cx| {
+        i.develop("rawtherapee", "RawTherapee", cx);
+        i.import_result("rawtherapee", cx);
+        i.edit_in_rapidraw(cx);
+    });
+    core_switch(&app, b);
+    if delivered {
+        deliver_switch(&app, cx);
+    }
+    work(cx);
+
+    assert!(!log.exists(), "an editor was launched on the new catalog's photo: {:?}", std::fs::read_to_string(&log));
+    let photos = catalog(&app, |c| c.count_photos(&Default::default()).unwrap());
+    assert_eq!(photos, 1, "nothing was imported into the new catalog");
+    if !delivered {
+        insp.read_with(cx, |i, _| assert!(!i.editing(ids[0]), "the refused runs ended their entries"));
+    }
+}
+
+/// **Cancel before the worker starts** (#108 gate). RapidRAW is queued (the entry shows
+/// "editing" at once, with its Cancel) and cancelled before the runner gets to it: when the
+/// worker then runs, RapidRAW (the fake) is never launched, and the round-trip ends as
+/// cancelled. (Mutation-checked: without the queued-job lookup in `cancel_rapidraw_job`, the
+/// cancel finds nothing, the fake is launched and this fails.)
+#[gpui_kit::test]
+fn cancelling_a_queued_rapidraw_launch_launches_nothing(cx: &mut TestAppContext) {
+    let dir = TempDir::new("insp-rapidraw-cancel");
+    let (script, log) = fake_editor(&dir);
+    let app = start(cx);
+    let ids = open_catalog_with_photos(&app, &dir, 1, cx);
+    catalog(&app, |c| editors_on(c, &script, &dir.0.join("photos/2026/p0.ARW")));
+    select(&app, ids[0], SelectMods::default(), cx);
+    work(cx); // whatever else is queued (the editors probe)
+    let insp = inspector(&app, cx);
+    insp.update(cx, |i, cx| i.edit_in_rapidraw(cx));
+    insp.read_with(cx, |i, _| assert!(i.rapid.contains_key(&ids[0]), "the entry shows at once"));
+    insp.update(cx, |i, cx| i.cancel_rapidraw(cx));
+    work(cx);
+    assert!(!log.exists(), "RapidRAW was launched after its cancel: {:?}", std::fs::read_to_string(&log));
+    insp.read_with(cx, |i, _| {
+        assert!(!i.rapid.contains_key(&ids[0]), "the round-trip ended");
+        assert_eq!(i.notes.get(&ids[0]).map(String::as_str), Some("Cancelled — nothing was imported."));
+    });
+}
+
+#[gpui_kit::test]
+fn editor_actions_never_reach_the_new_catalog_before_the_switch_event(cx: &mut TestAppContext) {
+    editors_across_a_switch(false, cx);
+}
+
+#[gpui_kit::test]
+fn editor_actions_never_reach_the_new_catalog_after_the_switch_event(cx: &mut TestAppContext) {
+    editors_across_a_switch(true, cx);
 }
 
 trait UpdateInWindow {

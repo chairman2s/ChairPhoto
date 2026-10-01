@@ -11,13 +11,15 @@
 //! - **Drag-and-drop** reparents a tag: GPUI `on_drag` on each row, `on_drop` on each row and
 //!   on All photos (= top level). Only a valid target lights up (`TagIndex::can_drop`); a
 //!   drop onto the tag's own subtree is refused with the backend's reason, as React's failed
-//!   `move_tag` reported it.
+//!   `move_tag` reported it. The dragged row carries its tree's [`CatalogGuard`]: a drop after
+//!   a catalog switch landed mid-drag is refused (the ids name two catalogs' tags), and the
+//!   move runs under the drag's guard (`TagsState::move_tag_as`).
 //! - **Context menu** (right-click): Move to…, Move to top level, Make private/public (and
 //!   incl. sub-tags), Merge into…, Split off N selected…, Edit…, New child tags…. Escape or
 //!   a click outside closes it (gpui-component's `ContextMenu`). Outcomes go to the status
 //!   line.
 
-use super::state::{TagDialog, TagsState};
+use super::state::{CatalogGuard, TagDialog, TagsState};
 use super::{create, editor, merge, move_tag, split};
 use crate::modules::ModuleRegistry;
 use crate::shell::style::Colors;
@@ -34,11 +36,14 @@ use gpui_kit::{
 };
 use std::collections::HashSet;
 
-/// What a row carries while it is dragged.
+/// What a row carries while it is dragged: the tag, and the guard of the tree it was dragged
+/// from — a catalog switch can land mid-drag, and the tag's id names another tag in the next
+/// catalog's tree.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DraggedTag {
     pub id: i64,
     pub name: SharedString,
+    pub from: CatalogGuard,
 }
 
 /// The drag preview: the tag's name in a chip.
@@ -173,9 +178,19 @@ impl TagPanel {
         cx.notify();
     }
 
-    /// A drop of `dragged` onto `target` (`None` = All photos, the top level).
-    pub fn drop_tag(&mut self, dragged: i64, target: Option<i64>, cx: &mut Context<Self>) {
-        let index = self.tags.read(cx).index.clone();
+    /// A drop of `dragged` onto `target` (`None` = All photos, the top level). A drag from a
+    /// tree the panel no longer shows (a catalog switch landed mid-drag) is refused: its id
+    /// and the target's would name tags of two different catalogs.
+    pub fn drop_tag(&mut self, dragged: &DraggedTag, target: Option<i64>, cx: &mut Context<Self>) {
+        let (index, now) = {
+            let t = self.tags.read(cx);
+            (t.index.clone(), t.guard())
+        };
+        if dragged.from.superseded_by(&now) || !dragged.from.identity.is_some_and(|i| now.identity == Some(i)) {
+            self.tags.update(cx, |t, cx| t.set_status("Move failed: the catalog changed during the drag", cx));
+            return;
+        }
+        let (from, dragged) = (dragged.from, dragged.id);
         if Some(dragged) == target || !index.can_drop(dragged, target) {
             if target.is_some_and(|t| index.subtree(dragged).contains(&t)) && Some(dragged) != target {
                 self.tags.update(cx, |t, cx| {
@@ -184,7 +199,7 @@ impl TagPanel {
             }
             return;
         }
-        self.tags.update(cx, |t, cx| t.move_tag(dragged, target, cx));
+        self.tags.update(cx, |t, cx| t.move_tag_as(from, dragged, target, cx));
     }
 
     // --- dialogs -----------------------------------------------------------------------------
@@ -285,7 +300,10 @@ impl TagPanel {
     }
 
     fn row(&self, tag: &TagWithCount, active: Option<i64>, colors: Colors, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
-        let index = self.tags.read(cx).index.clone();
+        let (index, guard) = {
+            let t = self.tags.read(cx);
+            (t.index.clone(), t.guard())
+        };
         let id = tag.tag.id;
         let depth = tag_tree::depth(&tag.tag.full_path) - 1;
         let has_children = index.has_children(id);
@@ -378,15 +396,17 @@ impl TagPanel {
                     .on_click(cx.listener(move |p, _, window, cx| p.open_editor(edit_tag.clone(), window, cx)))
                     .test_support(),
             )
-            .on_drag(DraggedTag { id, name: tag.tag.name.clone().into() }, |d, _, _, cx| cx.new(|_| DragChip(d.name.clone())))
+            .on_drag(DraggedTag { id, name: tag.tag.name.clone().into(), from: guard }, |d, _, _, cx| {
+                cx.new(|_| DragChip(d.name.clone()))
+            })
             .drag_over::<DraggedTag>(move |s, d, _, _| {
-                if drop_index.can_drop(d.id, Some(id)) {
+                if d.from == guard && drop_index.can_drop(d.id, Some(id)) {
                     s.bg(colors.sel).border_1().border_color(colors.accent)
                 } else {
                     s
                 }
             })
-            .on_drop(cx.listener(move |p, d: &DraggedTag, _, cx| p.drop_tag(d.id, Some(id), cx)))
+            .on_drop(cx.listener(move |p, d: &DraggedTag, _, cx| p.drop_tag(d, Some(id), cx)))
             .test_support()
             .context_menu(move |menu, _, cx| Self::context_menu(&weak, &menu_tag, menu, cx))
             .into_any_element()
@@ -514,9 +534,16 @@ impl Render for TagPanel {
             .child("All photos")
             .drag_over::<DraggedTag>({
                 let index = index.clone();
-                move |s, d, _, _| if index.can_drop(d.id, None) { s.border_1().border_color(colors.accent) } else { s }
+                let guard = self.tags.read(cx).guard();
+                move |s, d, _, _| {
+                    if d.from == guard && index.can_drop(d.id, None) {
+                        s.border_1().border_color(colors.accent)
+                    } else {
+                        s
+                    }
+                }
             })
-            .on_drop(cx.listener(|p, d: &DraggedTag, _, cx| p.drop_tag(d.id, None, cx)))
+            .on_drop(cx.listener(|p, d: &DraggedTag, _, cx| p.drop_tag(d, None, cx)))
             .on_click(cx.listener(|p, _, _, cx| p.select(None, cx)))
             .test_support();
 

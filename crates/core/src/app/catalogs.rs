@@ -351,21 +351,40 @@ pub fn publish_catalog_and_reset_jobs(state: &AppState, catalog: Catalog) -> Res
 /// Emits no `catalog:switched` (the Tauri command never did); the caller refreshes what it
 /// shows.
 pub fn reroot_library(state: &AppState, new_root: PathBuf, catalog_path: &Path) -> Result<(), String> {
+    reroot(state, new_root, Some(catalog_path))
+}
+
+/// [`reroot_library`] for the catalog that is open, whichever it is: the reopen uses the
+/// outgoing handle's own database path, read inside phase one, so a switch racing the
+/// re-root cannot make it reopen a different file.
+///
+/// The Tauri command reopens the *default* catalog (`default_catalog_path`), which is only
+/// the same thing while the default catalog is the open one: with another catalog open it
+/// writes the root into that catalog and then reopens the default one at its own stored
+/// root. The GPUI app's Preferences uses this instead.
+pub fn reroot_open_catalog(state: &AppState, new_root: PathBuf) -> Result<(), String> {
+    reroot(state, new_root, None)
+}
+
+/// The re-root; `catalog_path` `None` = the open catalog's own file.
+fn reroot(state: &AppState, new_root: PathBuf, catalog_path: Option<&Path>) -> Result<(), String> {
     // Before anything is tripped, so a bad path fails with every job still running.
     std::fs::create_dir_all(&new_root).map_err(|e| e.to_string())?;
 
     // Phase one: persist the new root through the outgoing handle, trip every job generation,
     // clear every status slot, drop the handle — one transition under the catalog lock. A
     // failed persist leaves the catalog open and nothing tripped.
+    let mut reopen = catalog_path.map(Path::to_path_buf);
     detach_catalog_and_trip_jobs_with(state, |catalog| {
-        catalog
-            .ok_or("No catalog is open")?
-            .set_setting("catalog_root", &new_root.to_string_lossy())
-            .map_err(|e| e.to_string())
+        let catalog = catalog.ok_or("No catalog is open")?;
+        catalog.set_setting("catalog_root", &new_root.to_string_lossy()).map_err(|e| e.to_string())?;
+        reopen.get_or_insert_with(|| catalog.db_path().to_path_buf());
+        Ok(())
     })?;
+    let catalog_path = reopen.ok_or("No catalog is open")?;
 
     // Runs migrations.
-    let reopened = Catalog::open(catalog_path, &new_root).map_err(|e| e.to_string())?;
+    let reopened = Catalog::open(&catalog_path, &new_root).map_err(|e| e.to_string())?;
 
     // Phase two: publish it with fresh un-tripped generations, tripping whatever a racing
     // start installed while the catalog was `None` so it cannot survive unreachable.
@@ -694,6 +713,23 @@ mod switch_tests {
         let c = guard.as_ref().unwrap();
         assert_eq!((c.db_path(), c.root()), (db.as_path(), new_root.as_path()));
         assert!(names.0.lock().unwrap().is_empty(), "a re-root is not a switch");
+    }
+
+    /// Re-rooting the open catalog reopens *that* file — not the default catalog — at the
+    /// new root.
+    #[test]
+    fn a_reroot_of_the_open_catalog_reopens_its_own_file() {
+        let dir = crate::test_support::TestTmpDir::new("reroot-open");
+        let state = AppState::default();
+        let db = dir.join("other/B.chairphoto");
+        *state.catalog.lock().unwrap() = Some(Catalog::open(&db, &dir.join("old")).unwrap());
+        let import = state.jobs.import.install_fresh().unwrap();
+        let new_root = dir.join("new");
+        reroot_open_catalog(&state, new_root.clone()).unwrap();
+        assert!(import.load(Ordering::Relaxed), "the running import was tripped");
+        let guard = state.catalog.lock().unwrap();
+        let c = guard.as_ref().unwrap();
+        assert_eq!((c.db_path(), c.root()), (db.as_path(), new_root.as_path()));
     }
 
     /// With nothing open, a re-root fails before it trips anything.

@@ -15,8 +15,9 @@
 //! 3. the GPUI application ([`wire`]): embedded fonts, gpui-kit's init, the theme from the
 //!    current system theme (before the first window: `theme::init` switches to Light), the
 //!    keymap and the quit wiring;
-//! 4. the [`model::AppModel`] entity and the event router, the [`shell::ShellState`], and the
-//!    [`image_store::ImageStore`] (cleared on every catalog switch);
+//! 4. the [`model::AppModel`] entity and the event router, the [`shell::ShellState`], the
+//!    [`modules::ModuleRegistry`] (it restores the enabled modules on the first catalog read)
+//!    and the [`image_store::ImageStore`] (cleared on every catalog switch);
 //! 5. `app::open_default_catalog`, off the UI thread;
 //! 6. the main window, 1400×900, `app_id` `chairphoto`; then the routers for second launches
 //!    and quit signals ([`launch`]), and this launch's own `chairphoto://` URLs.
@@ -40,6 +41,7 @@ pub mod image_store;
 pub mod keymap;
 pub mod launch;
 pub mod model;
+pub mod modules;
 pub mod shell;
 pub mod signals;
 pub mod single_instance;
@@ -144,6 +146,8 @@ pub struct Wired {
     /// The image layer's cache and request queue (#101), cleared on every catalog switch.
     pub images: Entity<ImageStore>,
     pub shell: Entity<shell::ShellState>,
+    /// The first-party modules and what the enabled ones contribute (#122).
+    pub modules: Entity<modules::ModuleRegistry>,
     /// The main window, or why it could not open (the app has then been asked to quit).
     pub main_window: Result<AnyWindowHandle, String>,
 }
@@ -175,6 +179,7 @@ pub fn wire(
     let model = cx.new(|_| AppModel::new(state, pool.clone()));
     events::spawn_router(events_rx, model.clone(), cx).detach();
     let shell = cx.new(|cx| shell::ShellState::new(&model, cx));
+    let modules = modules::ModuleRegistry::install(&model, &shell, cx);
     // Without a pool (tests), every image request fails at once instead of waiting forever.
     let submit: Arc<dyn image_store::Submit> = match &pool {
         Some(pool) => pool.clone(),
@@ -188,8 +193,8 @@ pub fn wire(
 
     let window_options = main_window_options(cx);
     let opened = gpui_kit::open_window(window_options, cx, {
-        let (model, shell, images) = (model.clone(), shell.clone(), images.clone());
-        move |window, cx| cx.new(|cx| view::RootView::new(model, shell, images, window, cx))
+        let (model, shell, images, modules) = (model.clone(), shell.clone(), images.clone(), modules.clone());
+        move |window, cx| cx.new(|cx| view::RootView::new(model, shell, images, modules, window, cx))
     });
     let main_window = match opened {
         Ok((handle, _)) => {
@@ -208,7 +213,7 @@ pub fn wire(
             Err(e.to_string())
         }
     };
-    Wired { model, images, shell, main_window }
+    Wired { model, images, shell, modules, main_window }
 }
 
 /// Become this app data dir's primary instance, serving second launches into `tx`; or hand

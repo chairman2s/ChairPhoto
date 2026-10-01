@@ -16,10 +16,18 @@
 //! The root owns focus and the [`contexts::ROOT`] key context: the app-wide bindings and every
 //! shell action (`shell::actions`) are handled here — ported ones by [`ShellState`], the rest by
 //! [`AppModel::not_yet_ported`].
+//!
+//! **Module slots** ([`crate::modules`]): enabled modules' main views are rail items and fill
+//! the stage as `Surface::Module(id)` (the shell falls back to the Library when that module is
+//! disabled); sidebar panels render under the collection browser's sections, inspector panels
+//! on the inspector's tags tab; their actions are More ⋯ → Modules, their publish targets the
+//! Publish dialog, their settings panels the Modules panel.
 
 use crate::keymap::{contexts, ReloadTheme};
 use crate::image_store::{ImageState, ImageStore};
 use crate::model::AppModel;
+use crate::modules::registry::SlotView;
+use crate::modules::{panel as module_panel, ModuleRegistry, PanelSlot};
 use chairphoto_core::image_pool::ImageKind;
 use crate::shell::actions::*;
 use crate::shell::state::{ShellState, Side, Surface, NARROW_MAX_W};
@@ -28,7 +36,7 @@ use gpui_kit::component::slider::SliderState;
 use gpui_kit::prelude::*;
 use gpui_kit::{
     div, img, px, AnyElement, Context, CursorStyle, Entity, FocusHandle, MouseButton, MouseMoveEvent, ObjectFit,
-    Pixels, Subscription, TestSupportExt as _, Window,
+    Pixels, SharedString, Subscription, TestSupportExt as _, Window,
 };
 
 /// A column-edge drag in progress: which column, where the pointer started, the width then.
@@ -43,10 +51,11 @@ pub struct RootView {
     pub(crate) model: Entity<AppModel>,
     pub(crate) shell: Entity<ShellState>,
     pub(crate) images: Entity<ImageStore>,
+    pub(crate) modules: Entity<ModuleRegistry>,
     pub(crate) focus: FocusHandle,
     pub(crate) thumb_slider: Entity<SliderState>,
     resize: Option<Resize>,
-    _observers: [Subscription; 4],
+    _observers: [Subscription; 5],
 }
 
 /// One cell of the stage's thumbnail strip — the image layer's on-screen proof (#101) until
@@ -60,6 +69,7 @@ impl RootView {
         model: Entity<AppModel>,
         shell: Entity<ShellState>,
         images: Entity<ImageStore>,
+        modules: Entity<ModuleRegistry>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -70,6 +80,18 @@ impl RootView {
             cx.observe(&model, |_, _, cx| cx.notify()),
             cx.observe(&shell, |_, _, cx| cx.notify()),
             cx.observe(&images, |_, _, cx| cx.notify()),
+            // A module disabled while its main view is on the stage takes the view with it:
+            // back to the Library, as React fell back when `activeView` vanished.
+            cx.observe(&modules, |this, modules, cx| {
+                let orphaned = match &this.shell.read(cx).surface {
+                    Surface::Module(id) => !modules.read(cx).main_views().iter().any(|(_, v)| v.id.as_ref() == id),
+                    _ => false,
+                };
+                if orphaned {
+                    this.shell.update(cx, |s, cx| s.show_library(cx));
+                }
+                cx.notify();
+            }),
             // React re-read the back-up queue and the trash count on window focus
             // (App.tsx `onFocus`): an external change or a finished backup shows on return.
             cx.observe_window_activation(window, |this, window, cx| {
@@ -78,7 +100,7 @@ impl RootView {
                 }
             }),
         ];
-        Self { model, shell, images, focus, thumb_slider, resize: None, _observers }
+        Self { model, shell, images, modules, focus, thumb_slider, resize: None, _observers }
     }
 
     pub fn focus_handle(&self) -> &FocusHandle {
@@ -176,11 +198,36 @@ impl RootView {
             .into_any_element()
     }
 
-    fn render_stage(&self, shell: &ShellState, model: &AppModel, colors: Colors, strip: Vec<(i64, ImageState)>) -> AnyElement {
+    fn render_stage(
+        &self,
+        shell: &ShellState,
+        model: &AppModel,
+        colors: Colors,
+        strip: Vec<(i64, ImageState)>,
+        module_view: Option<SlotView>,
+    ) -> AnyElement {
+        if let Some(v) = module_view {
+            return div()
+                .id("stage")
+                .relative()
+                .flex_1()
+                .min_h_0()
+                .flex()
+                .flex_col()
+                .child(
+                    div()
+                        .id(SharedString::from(format!("module-view-{}", v.id)))
+                        .flex_1()
+                        .min_h_0()
+                        .child(v.view)
+                        .test_support(),
+                )
+                .into_any_element();
+        }
         let surface = match &shell.surface {
             Surface::Library => "The library grid comes with the Library view (#106).".to_string(),
             Surface::Develop => "The Darkroom comes with #111.".to_string(),
-            Surface::Module(id) => format!("Module view {id}: Module registry (#104)."),
+            Surface::Module(id) => format!("Module view {id} is not available."),
         };
         let last_event = model.last_event.clone().unwrap_or_else(|| "Waiting for core events…".into());
         div()
@@ -214,24 +261,37 @@ impl Render for RootView {
         self.shell.update(cx, |s, _| s.set_narrow(narrow));
         let strip = self.strip_cells(cx);
         let colors = Colors::get(cx);
+        // Module contributions, built (once per window) before the shell is borrowed below.
+        let module_view = match &self.shell.read(cx).surface {
+            Surface::Module(id) => {
+                let id = id.clone();
+                ModuleRegistry::main_view(&self.modules, &id, window, cx)
+            }
+            _ => None,
+        };
+        let sidebar_panels = module_panel::render_panel_blocks(&self.modules, PanelSlot::Sidebar, colors, window, cx);
+        let inspector_panels = module_panel::render_panel_blocks(&self.modules, PanelSlot::Inspector, colors, window, cx);
+        let rail_views = self.modules.read(cx).main_views();
         let shell_entity = self.shell.clone();
         let model_entity = self.model.clone();
         let shell = shell_entity.read(cx);
         let model = model_entity.read(cx);
 
         let title_bar = self.render_title_bar(shell, model, colors, window);
-        let rail = self.render_rail(shell, colors, cx);
+        let rail = self.render_rail(shell, colors, rail_views, cx);
         let library = shell.surface == Surface::Library;
         let pill = library.then(|| self.render_command_pill(shell, colors, cx));
-        let stage = self.render_stage(shell, model, colors, strip);
+        let stage = self.render_stage(shell, model, colors, strip, module_view);
         let bench = library.then(|| self.render_bench(shell, model, colors, cx));
         let (left_w, right_w) = (shell.layout.left_w, shell.layout.right_w);
         let show_left = !narrow && !shell.layout.left_hidden;
         let show_right = !narrow && !shell.layout.right_hidden && shell.surface != Surface::Develop;
         let overlay_left = narrow && shell.layout.overlay_left;
         let overlay_right = narrow && shell.layout.overlay_right;
-        let browser = (show_left || overlay_left).then(|| self.render_collection_browser(shell, colors, cx));
-        let inspector = (show_right || overlay_right).then(|| self.render_inspector(shell, colors, cx));
+        let browser =
+            (show_left || overlay_left).then(|| self.render_collection_browser(shell, colors, sidebar_panels, cx));
+        let inspector =
+            (show_right || overlay_right).then(|| self.render_inspector(shell, colors, inspector_panels, cx));
 
         let mut body = div().id("body").relative().flex().flex_row().flex_1().min_h_0().child(rail);
         let (browser_col, overlay_browser) = if show_left { (browser, None) } else { (None, browser) };
@@ -340,6 +400,12 @@ impl Render for RootView {
             }))
             .on_action(cx.listener(|this, _: &ShowLibrary, _, cx| this.shell.update(cx, |s, cx| s.show_library(cx))))
             .on_action(cx.listener(|this, _: &ClearSelection, _, cx| this.shell.update(cx, |s, cx| s.clear_selection(cx))))
+            .on_action(cx.listener(|this, _: &OpenModules, window, cx| {
+                module_panel::open_modules_panel(&this.modules, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &PublishSelection, window, cx| {
+                module_panel::open_publish_dialog(&this.modules, window, cx)
+            }))
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| this.on_mouse_move(event, cx)))
             .on_mouse_up(MouseButton::Left, cx.listener(|this, _, _, _| this.resize = None))
             .size_full()

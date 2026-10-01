@@ -89,7 +89,7 @@ pub enum Surface {
     Library,
     /// Reserved for the Darkroom (#111); the rail's Develop is not ported yet.
     Develop,
-    /// A module's main view (Module registry, #104), by view id.
+    /// A module's main view (`modules::MainView`), by view id.
     Module(String),
 }
 
@@ -390,6 +390,12 @@ impl ShellState {
 
     pub fn show_library(&mut self, cx: &mut Context<Self>) {
         self.surface = Surface::Library;
+        cx.notify();
+    }
+
+    /// A module main view's rail item: the stage shows that view.
+    pub fn show_module_view(&mut self, view_id: &str, cx: &mut Context<Self>) {
+        self.surface = Surface::Module(view_id.to_string());
         cx.notify();
     }
 

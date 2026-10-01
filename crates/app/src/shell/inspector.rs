@@ -2,7 +2,9 @@
 //! header (the UI sans, not the display serif — App.css: filenames are identifiers, not
 //! titles) with the photo's colour-label swatch and a hide button, the lowercase tab row
 //! (details / tags / versions / publish), and the body the Photo inspector (#108) fills.
-//! QuickTagGroups, the tags tab's extra zone, comes with the Tag panel (#107).
+//! QuickTagGroups, the tags tab's extra zone, comes with the Tag panel (#107). The enabled
+//! modules' inspector panels ([`crate::modules::PanelSlot::Inspector`]) render on the tags tab
+//! under its built-in blocks, as `PhotoInspector.tsx` did, while a photo is active.
 
 use crate::shell::state::{InspectorTab, ShellState, Side};
 use crate::shell::style::{Colors, COLOR_LABELS};
@@ -12,7 +14,15 @@ use gpui_kit::prelude::*;
 use gpui_kit::{div, px, AnyElement, Context, FontWeight, SharedString, TestSupportExt as _};
 
 impl RootView {
-    pub(crate) fn render_inspector(&self, shell: &ShellState, colors: Colors, cx: &Context<Self>) -> AnyElement {
+    pub(crate) fn render_inspector(
+        &self,
+        shell: &ShellState,
+        colors: Colors,
+        module_panels: Option<AnyElement>,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let module_panels =
+            module_panels.filter(|_| shell.inspector_tab == InspectorTab::Tags && shell.library.selection().active.is_some());
         let active = shell.library.selection().active;
         let filename = active.map(|p| p.path.rsplit('/').next().unwrap_or(&p.path).to_string()).unwrap_or_default();
         let swatch = active.and_then(|p| COLOR_LABELS.iter().find(|l| l.name.eq_ignore_ascii_case(&p.label)));
@@ -91,6 +101,7 @@ impl RootView {
                         None => "Select a photo",
                     }),
             )
+            .children(module_panels.map(|panels| div().id("module-slot-inspector").flex().flex_col().child(panels)))
             .into_any_element()
     }
 }

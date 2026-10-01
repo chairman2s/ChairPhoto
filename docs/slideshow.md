@@ -57,12 +57,18 @@ order is the current grid order.
 
 - `crates/core/src/slideshow/mod.rs` — ffmpeg detection, filtergraph construction, and the
   run with progress parsing.
-- The `make_slideshow` async command renders the frames into a temp dir, calls the engine
-  off the UI thread, and streams progress.
+- `crates/core/src/app/slideshow.rs` — the render as a job (`JobRegistry::slideshow`):
+  `claim_slideshow` resolves the Originals and claims the job under one catalog lock
+  (optionally bound to a `CatalogIdentity`), and `SlideshowJob::run` renders the frames into
+  a temp dir private to the job and encodes. A newer render, Cancel (the job's own abort
+  handle) or a catalog switch kills ffmpeg, removes the partial movie and answers
+  "Slideshow cancelled". Missing ffmpeg is refused before anything is claimed.
+- The `make_slideshow` async command (Tauri) and the GPUI Slideshow module both run that job
+  off the UI thread; progress is cosmetic, the job's return value is the terminal result.
 
   ```
   make_slideshow(photoIds, opts, destDir) -> outputPath
-  event "slideshow:progress" { done, total }
+  event "slideshow:progress" { done, total, job }
   ```
 
 - `SlideshowDialog.tsx` owns the module's backend surface: private `SlideshowOptions` and

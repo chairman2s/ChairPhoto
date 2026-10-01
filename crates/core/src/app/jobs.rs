@@ -30,7 +30,8 @@
 //!
 //! **catalog → abort generations → status slots**, and within each of the last two groups
 //! the declaration order of [`JobRegistry`]: scan, face indexing, face matching, sharpness,
-//! pHash, trash, import, reconcile, Smart Tagging, identity repair, burst analysis.
+//! pHash, trash, import, reconcile, Smart Tagging, identity repair, burst analysis,
+//! slideshow.
 //!
 //! Every nested acquisition in the backend obeys it:
 //!
@@ -41,6 +42,7 @@
 //! | [`JobRegistry::lock_for_publish`] (switch phase two) | every abort |
 //! | [`AbortGeneration::install_fresh`] (scan / sharpness / pHash starts), `scans::claim_import` | one abort, released before the catalog is read |
 //! | `storage::claim_reconcile` (a back-up drain or offload-policy start) | catalog → the reconcile abort |
+//! | `slideshow::claim_slideshow` (a slideshow render start) | catalog → the slideshow abort |
 //! | [`AbortGeneration::install_fresh_if_owner`] (a card import committing to index) | the scan abort → the import abort |
 //! | [`AbortGeneration::install_fresh_if_newer`] (a burst-analysis worker's claim) | one abort, released before the catalog is read |
 //! | [`AbortGeneration::trip`] (every Cancel command) | one abort |
@@ -485,6 +487,12 @@ pub struct JobRegistry {
     /// newer run's. No status slot: each run reports its own terminal result, tagged with its
     /// job id so a front end drops a superseded run's.
     pub burst: AbortGeneration,
+    /// Rendering a slideshow movie (`app::slideshow`): the frame export and the ffmpeg
+    /// encode. Claimed under the catalog lock (`slideshow::claim_slideshow`); a newer render,
+    /// Cancel or a catalog switch trips it, which kills ffmpeg. No status slot — the render
+    /// returns its own terminal result, and its `slideshow:progress` events carry the job id.
+    #[cfg(feature = "slideshow")]
+    pub slideshow: AbortGeneration,
     /// The Develop session's working image (docs/plans/raw-foundation): one claim per
     /// opened photo; a switch, exit or catalog change trips it and the image is released.
     #[cfg(all(feature = "raw", feature = "edit"))]
@@ -523,6 +531,8 @@ impl JobRegistry {
             smarttags,
             identity,
             burst: _,
+            #[cfg(feature = "slideshow")]
+            slideshow: _,
             #[cfg(all(feature = "raw", feature = "edit"))]
             develop,
         } = self;
@@ -563,6 +573,8 @@ impl JobRegistry {
             smarttags,
             identity,
             burst,
+            #[cfg(feature = "slideshow")]
+            slideshow,
             #[cfg(all(feature = "raw", feature = "edit"))]
             develop,
         } = self;
@@ -581,6 +593,8 @@ impl JobRegistry {
             smarttags: smarttags.abort.lock()?,
             identity: identity.abort.lock()?,
             burst: burst.lock()?,
+            #[cfg(feature = "slideshow")]
+            slideshow: slideshow.lock()?,
             #[cfg(all(feature = "raw", feature = "edit"))]
             develop: develop.abort.lock()?,
         })
@@ -603,6 +617,8 @@ pub struct AbortGuards<'a> {
     smarttags: MutexGuard<'a, Arc<AtomicBool>>,
     identity: MutexGuard<'a, Arc<AtomicBool>>,
     burst: MutexGuard<'a, Arc<AtomicBool>>,
+    #[cfg(feature = "slideshow")]
+    slideshow: MutexGuard<'a, Arc<AtomicBool>>,
     #[cfg(all(feature = "raw", feature = "edit"))]
     develop: MutexGuard<'a, Arc<AtomicBool>>,
 }
@@ -625,6 +641,8 @@ impl AbortGuards<'_> {
             smarttags,
             identity,
             burst,
+            #[cfg(feature = "slideshow")]
+            slideshow,
             #[cfg(all(feature = "raw", feature = "edit"))]
             develop,
         } = self;
@@ -642,6 +660,8 @@ impl AbortGuards<'_> {
         smarttags.store(true, Ordering::Relaxed);
         identity.store(true, Ordering::Relaxed);
         burst.store(true, Ordering::Relaxed);
+        #[cfg(feature = "slideshow")]
+        slideshow.store(true, Ordering::Relaxed);
         #[cfg(all(feature = "raw", feature = "edit"))]
         develop.store(true, Ordering::Relaxed);
     }
@@ -681,6 +701,8 @@ impl AbortGuards<'_> {
                 ref mut smarttags,
             ref mut identity,
             ref mut burst,
+            #[cfg(feature = "slideshow")]
+                ref mut slideshow,
             #[cfg(all(feature = "raw", feature = "edit"))]
                 ref mut develop,
         } = self;
@@ -702,6 +724,10 @@ impl AbortGuards<'_> {
         }
         **identity = Arc::new(AtomicBool::new(false));
         **burst = Arc::new(AtomicBool::new(false));
+        #[cfg(feature = "slideshow")]
+        {
+            **slideshow = Arc::new(AtomicBool::new(false));
+        }
         #[cfg(all(feature = "raw", feature = "edit"))]
         {
             **develop = Arc::new(AtomicBool::new(false));
@@ -1099,6 +1125,8 @@ mod tests {
         let scan = registry.scan.install_fresh().unwrap();
         let sharpness = registry.sharpness.install_fresh().unwrap();
         let burst = registry.burst.install_fresh_if_newer(registry.burst.next_job_id()).unwrap().unwrap();
+        #[cfg(feature = "slideshow")]
+        let (slideshow, _) = registry.slideshow.install_fresh_numbered().unwrap();
 
         let identity = begin_identity(&registry, &catalog).unwrap();
         #[cfg(feature = "smarttags")]
@@ -1112,6 +1140,8 @@ mod tests {
         assert!(scan.load(Ordering::Relaxed), "phase one must trip the scan generation");
         assert!(sharpness.load(Ordering::Relaxed), "phase one must trip sharpness too");
         assert!(burst.load(Ordering::Relaxed), "and a burst analysis");
+        #[cfg(feature = "slideshow")]
+        assert!(slideshow.load(Ordering::Relaxed), "and a slideshow render");
         assert!(identity.abort.load(Ordering::Relaxed), "and the identity repair pass");
         assert!(
             registry.identity.status().unwrap().is_none(),

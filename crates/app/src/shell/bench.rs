@@ -60,6 +60,23 @@ impl RootView {
                             .bg(colors.elev)
                             .child(div().h_full().rounded_full().bg(colors.accent).w(relative(fill))),
                     )
+                    // An import can be stopped before its next file (Storage and import, #114).
+                    .when(shell.jobs.import.is_some(), |d| {
+                        d.child(
+                            div()
+                                .id("bench-cancel-import")
+                                .mt(px(4.))
+                                .text_size(px(10.5))
+                                .text_color(colors.dim)
+                                .cursor_pointer()
+                                .hover(|s| s.text_color(colors.txt))
+                                .child("Cancel import")
+                                .on_click(|_, window, cx| {
+                                    window.dispatch_action(Box::new(crate::shell::actions::CancelImport), cx)
+                                })
+                                .test_support(),
+                        )
+                    })
                     .test_support()
                     .into_any_element()
             }

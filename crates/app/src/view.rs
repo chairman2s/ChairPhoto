@@ -20,6 +20,7 @@
 use crate::keymap::{contexts, ReloadTheme};
 use crate::image_store::{ImageState, ImageStore};
 use crate::model::AppModel;
+use crate::storage::StorageState;
 use chairphoto_core::image_pool::ImageKind;
 use crate::shell::actions::*;
 use crate::shell::state::{ShellState, Side, Surface, NARROW_MAX_W};
@@ -43,10 +44,14 @@ pub struct RootView {
     pub(crate) model: Entity<AppModel>,
     pub(crate) shell: Entity<ShellState>,
     pub(crate) images: Entity<ImageStore>,
+    /// Storage and import (#114): its jobs and dialogs.
+    pub(crate) storage: Entity<StorageState>,
+    /// The open storage dialog's close request (`crate::storage::open`).
+    pub(crate) dialog_close: Option<Subscription>,
     pub(crate) focus: FocusHandle,
     pub(crate) thumb_slider: Entity<SliderState>,
     resize: Option<Resize>,
-    _observers: [Subscription; 4],
+    _observers: [Subscription; 5],
 }
 
 /// One cell of the stage's thumbnail strip — the image layer's on-screen proof (#101) until
@@ -60,6 +65,7 @@ impl RootView {
         model: Entity<AppModel>,
         shell: Entity<ShellState>,
         images: Entity<ImageStore>,
+        storage: Entity<StorageState>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -70,15 +76,20 @@ impl RootView {
             cx.observe(&model, |_, _, cx| cx.notify()),
             cx.observe(&shell, |_, _, cx| cx.notify()),
             cx.observe(&images, |_, _, cx| cx.notify()),
-            // React re-read the back-up queue and the trash count on window focus
-            // (App.tsx `onFocus`): an external change or a finished backup shows on return.
+            cx.observe(&storage, |_, _, cx| cx.notify()),
+            // React re-read the back-up queue and the trash count on window focus, and backed
+            // up what waited when the NAS was reachable (App.tsx `onFocus`: `checkReconcile` +
+            // `refreshTrashCount`): an external change or a reconnected NAS shows on return.
             cx.observe_window_activation(window, |this, window, cx| {
                 if window.is_window_active() {
                     this.shell.update(cx, |s, cx| s.refresh_on_focus(cx));
+                    if this.model.read(cx).catalog.is_some() {
+                        this.storage.update(cx, |s, cx| s.check_reconcile(cx));
+                    }
                 }
             }),
         ];
-        Self { model, shell, images, focus, thumb_slider, resize: None, _observers }
+        Self { model, shell, images, storage, dialog_close: None, focus, thumb_slider, resize: None, _observers }
     }
 
     pub fn focus_handle(&self) -> &FocusHandle {
@@ -340,6 +351,17 @@ impl Render for RootView {
             }))
             .on_action(cx.listener(|this, _: &ShowLibrary, _, cx| this.shell.update(cx, |s, cx| s.show_library(cx))))
             .on_action(cx.listener(|this, _: &ClearSelection, _, cx| this.shell.update(cx, |s, cx| s.clear_selection(cx))))
+            // Storage and import (#114).
+            .on_action(cx.listener(|this, _: &OpenCatalogs, window, cx| this.open_catalogs(window, cx)))
+            .on_action(cx.listener(|this, _: &ImportFromCard, window, cx| this.open_import_card(window, cx)))
+            .on_action(cx.listener(|this, _: &ImportBundle, window, cx| this.open_import_bundle(window, cx)))
+            .on_action(cx.listener(|this, _: &OpenIdentityDebt, window, cx| this.open_identity_debt(window, cx)))
+            .on_action(cx.listener(|this, _: &OpenTrash, window, cx| this.open_trash(window, cx)))
+            .on_action(cx.listener(|this, _: &OpenVolumes, window, cx| this.open_volumes(window, cx)))
+            .on_action(cx.listener(|this, _: &RescanLibrary, _, cx| this.storage.update(cx, |s, cx| s.rescan(cx))))
+            .on_action(cx.listener(|this, _: &Reconcile, _, cx| this.storage.update(cx, |s, cx| s.run_reconcile(cx))))
+            .on_action(cx.listener(|this, _: &CancelImport, _, cx| this.storage.update(cx, |s, cx| s.cancel_import(cx))))
+            .on_action(cx.listener(|this, _: &BackUpSelection, _, cx| this.back_up_selection(cx)))
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| this.on_mouse_move(event, cx)))
             .on_mouse_up(MouseButton::Left, cx.listener(|this, _, _, _| this.resize = None))
             .size_full()

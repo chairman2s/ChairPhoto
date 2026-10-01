@@ -1,0 +1,601 @@
+//! [`StorageState`]: the storage jobs the app runs in the background and follows — card and
+//! bundle imports, the library rescan, the back-up drain (reconcile) and the identity repair
+//! pass — and who owns each one's result.
+//!
+//! **Ownership.** Every job start takes a sequence number, and every start also records the
+//! catalog epoch (bumped by `catalog:switched`). A result lands only when both are still
+//! current: a newer start of the same job or a catalog switch makes an older worker's result
+//! unreachable, as AGENTS.md requires. The core does the other half — the import and identity
+//! generations are tripped by a newer start, by Cancel and by the switch itself, so the old
+//! worker stops at its next file or copy rather than running on.
+//!
+//! **Identity repair.** The pass's events carry its job id; this entity follows exactly one
+//! job. `identity:repair_done` is the required terminal signal. The job id reaches the UI
+//! thread by one channel and the events by another, so a terminal event can arrive before the
+//! id is adopted: such an event is buffered while a start or re-attach is in flight and
+//! replayed on adoption (React's `terminalBuffer`), so the panel never waits forever for a
+//! pass that already ended.
+
+use super::runner::Runner;
+use crate::model::{AppModel, AppModelEvent};
+use crate::shell::ShellState;
+use chairphoto_core::app::{scans, storage, AppState, CoreEvent, IdentityRepairDone};
+use chairphoto_core::bundle::importer::BundleImportResult;
+use chairphoto_core::catalog::IdentityRepairSummary;
+use chairphoto_core::scanner::ScanResult;
+use gpui_kit::{Context, Entity, EventEmitter, Subscription};
+use std::collections::HashSet;
+use std::path::PathBuf;
+
+/// Which import runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImportKind {
+    Card,
+    Bundle,
+}
+
+/// The import this entity follows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportJob {
+    seq: u64,
+    epoch: u64,
+    pub kind: ImportKind,
+}
+
+/// The identity repair pass as the debt panel shows it.
+#[derive(Debug, Clone, Default)]
+pub struct RepairState {
+    /// A pass is starting, re-attaching or running.
+    pub running: bool,
+    /// The followed pass's job id, once adopted.
+    pub job: Option<u64>,
+    pub progress: Option<(usize, usize)>,
+    /// The last pass's summary (finished or stopped).
+    pub result: Option<IdentityRepairSummary>,
+    pub error: Option<String>,
+    /// Bumped by every start/re-attach; a superseded attempt's job id is not adopted.
+    attempt: u64,
+    /// Terminal events that arrived while no job was adopted yet.
+    early_done: Vec<IdentityRepairDone>,
+}
+
+/// What [`StorageState`] tells the dialogs.
+#[derive(Debug, Clone)]
+pub enum StorageEvent {
+    /// A card import ended (its status line is already set).
+    ImportEnded(ImportKind),
+    /// A bundle import ended, with what it did.
+    BundleImported(Result<BundleImportResult, String>),
+    /// The identity repair pass this entity followed ended: the queue changed.
+    RepairEnded,
+}
+
+pub struct StorageState {
+    app: AppState,
+    model: Entity<AppModel>,
+    shell: Entity<ShellState>,
+    /// Bumped by every `catalog:switched`.
+    epoch: u64,
+    seq: u64,
+    pub import: Option<ImportJob>,
+    /// The running rescan's `(seq, epoch)`.
+    scan: Option<(u64, u64)>,
+    /// A back-up drain is running (overlapping triggers start no second one, as React's
+    /// `reconciling` ref).
+    pub reconciling: bool,
+    pub repair: RepairState,
+    /// The storage dialog opened last (tests drive it through this).
+    pub last_dialog: Option<super::open::StorageDialog>,
+    /// The epoch whose launch reconcile check ran (React's on-`ready` `checkReconcile`).
+    launch_checked: Option<u64>,
+    _model_events: Subscription,
+}
+
+impl EventEmitter<StorageEvent> for StorageState {}
+
+impl StorageState {
+    pub fn new(model: &Entity<AppModel>, shell: &Entity<ShellState>, cx: &mut Context<Self>) -> Self {
+        let app = model.read(cx).state().clone();
+        let _model_events = cx.subscribe(model, |this, _, event: &AppModelEvent, cx| match event {
+            AppModelEvent::Core(event) => this.on_core_event(event, cx),
+            // The catalog is open (startup, or after a switch): back up what waits, once.
+            AppModelEvent::CatalogRead => {
+                if this.launch_checked != Some(this.epoch) {
+                    this.launch_checked = Some(this.epoch);
+                    this.check_reconcile(cx);
+                }
+            }
+        });
+        StorageState {
+            app,
+            model: model.clone(),
+            shell: shell.clone(),
+            epoch: 0,
+            seq: 0,
+            import: None,
+            scan: None,
+            reconciling: false,
+            repair: RepairState::default(),
+            last_dialog: None,
+            launch_checked: None,
+            _model_events,
+        }
+    }
+
+    pub fn app_state(&self) -> &AppState {
+        &self.app
+    }
+
+    pub fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    fn next_seq(&mut self) -> u64 {
+        self.seq += 1;
+        self.seq
+    }
+
+    fn status(&self, line: String, cx: &mut Context<Self>) {
+        eprintln!("storage: {line}");
+        self.model.update(cx, |m, cx| {
+            m.status = line.into();
+            cx.notify();
+        });
+    }
+
+    /// Everything catalog-derived may have changed: the model re-reads, and its `CatalogRead`
+    /// makes the shell re-read its lists and counts.
+    fn invalidate(&self, cx: &mut Context<Self>) {
+        self.model.update(cx, |m, cx| m.refresh(cx));
+    }
+
+    fn set_bench_import(&self, progress: Option<(usize, usize)>, cx: &mut Context<Self>) {
+        self.shell.update(cx, |s, cx| {
+            s.jobs.import = progress;
+            cx.notify();
+        });
+    }
+
+    // --- events -----------------------------------------------------------------------
+
+    pub(crate) fn on_core_event(&mut self, event: &CoreEvent, cx: &mut Context<Self>) {
+        match event {
+            CoreEvent::CatalogSwitched(_) => {
+                // Every job result from before the switch is unreachable now; the switch
+                // itself tripped the import and identity generations and cleared the slot.
+                self.epoch += 1;
+                self.import = None;
+                self.scan = None;
+                self.repair = RepairState::default();
+                cx.notify();
+            }
+            CoreEvent::IdentityRepairProgress(p) => {
+                if self.repair.running && self.repair.job == Some(p.job) {
+                    self.repair.progress = Some((p.done, p.total));
+                    cx.notify();
+                }
+            }
+            CoreEvent::IdentityRepairDone(d) => match self.repair.job {
+                Some(job) if self.repair.running && job == d.job => self.end_repair(d.clone(), cx),
+                None if self.repair.running => self.repair.early_done.push(d.clone()),
+                _ => {} // another pass's straggler
+            },
+            _ => {}
+        }
+    }
+
+    // --- imports ----------------------------------------------------------------------
+
+    /// Import ▾ → Import from card…'s hand-off: the background import (App.tsx
+    /// `startImport`). Progress shows on the bench; the result on the status line.
+    pub fn start_card_import(&mut self, source: PathBuf, name: String, selected: Vec<String>, cx: &mut Context<Self>) {
+        let job = ImportJob { seq: self.next_seq(), epoch: self.epoch, kind: ImportKind::Card };
+        self.import = Some(job.clone());
+        self.set_bench_import(Some((0, 0)), cx);
+        self.status("Importing from card…".into(), cx);
+        let state = self.app.clone();
+        let name = (!name.trim().is_empty()).then(|| name.trim().to_string());
+        let selected: HashSet<String> = selected.into_iter().collect();
+        let rx = Runner::get(cx).run(move || scans::ingest_from_card(&state, &source, name.as_deref(), Some(selected)));
+        cx.spawn(async move |this, cx| {
+            let Ok(result) = rx.await else { return };
+            this.update(cx, |s, cx| s.finish_import(&job, result.map(ImportOutcome::Card), cx)).ok();
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// The bundle dialog's Import (BundleImportDialog `run`).
+    pub fn start_bundle_import(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        let job = ImportJob { seq: self.next_seq(), epoch: self.epoch, kind: ImportKind::Bundle };
+        self.import = Some(job.clone());
+        self.set_bench_import(Some((0, 0)), cx);
+        self.status("Importing bundle…".into(), cx);
+        let state = self.app.clone();
+        let rx = Runner::get(cx).run(move || chairphoto_core::app::bundles::import_bundle(&state, &path));
+        cx.spawn(async move |this, cx| {
+            let Ok(result) = rx.await else { return };
+            this.update(cx, |s, cx| s.finish_import(&job, result.map(ImportOutcome::Bundle), cx)).ok();
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn finish_import(&mut self, job: &ImportJob, result: Result<ImportOutcome, String>, cx: &mut Context<Self>) {
+        if self.import.as_ref() != Some(job) || job.epoch != self.epoch {
+            return; // superseded by a newer import, or by a catalog switch
+        }
+        self.import = None;
+        self.set_bench_import(None, cx);
+        match (job.kind, result) {
+            (_, Ok(ImportOutcome::Card(r))) => {
+                self.status(card_import_line(&r), cx);
+                cx.emit(StorageEvent::ImportEnded(ImportKind::Card));
+            }
+            (_, Ok(ImportOutcome::Bundle(r))) => {
+                self.status(bundle_import_line(&r), cx);
+                cx.emit(StorageEvent::BundleImported(Ok(r)));
+            }
+            (ImportKind::Card, Err(e)) => {
+                self.status(format!("Import failed: {e}"), cx);
+                cx.emit(StorageEvent::ImportEnded(ImportKind::Card));
+            }
+            (ImportKind::Bundle, Err(e)) => {
+                self.status(format!("Bundle import failed: {e}"), cx);
+                cx.emit(StorageEvent::BundleImported(Err(e)));
+            }
+        }
+        // Even a cancelled or failed import may have changed the catalog.
+        self.invalidate(cx);
+        cx.notify();
+    }
+
+    /// Stop the running import before its next file. Its result still arrives, as the
+    /// cancelled import's own report.
+    pub fn cancel_import(&mut self, cx: &mut Context<Self>) {
+        if self.import.is_none() {
+            return;
+        }
+        // One abort-flag store; it never waits on the catalog lock.
+        if let Err(e) = scans::cancel_import(&self.app) {
+            self.status(format!("Cancel failed: {e}"), cx);
+        } else {
+            self.status("Cancelling import…".into(), cx);
+        }
+    }
+
+    // --- rescan -----------------------------------------------------------------------
+
+    /// Import ▾ → Rescan library (App.tsx `onScan`). Phase A's result lands here; Phase B
+    /// runs on, on the same worker, and reports through `scan:progress` on the bench.
+    pub fn rescan(&mut self, cx: &mut Context<Self>) {
+        let token = (self.next_seq(), self.epoch);
+        self.scan = Some(token);
+        self.status("Scanning library…".into(), cx);
+        let state = self.app.clone();
+        let (tx, rx) = futures::channel::oneshot::channel();
+        Runner::get(cx).spawn(move || match scans::rescan_library(&state) {
+            Ok((result, enrich)) => {
+                let _ = tx.send(Ok(result));
+                enrich.run();
+            }
+            Err(e) => {
+                let _ = tx.send(Err(e));
+            }
+        });
+        cx.spawn(async move |this, cx| {
+            let Ok(result) = rx.await else { return };
+            this.update(cx, |s, cx| s.finish_rescan(token, result, cx)).ok();
+        })
+        .detach();
+    }
+
+    fn finish_rescan(&mut self, token: (u64, u64), result: Result<ScanResult, String>, cx: &mut Context<Self>) {
+        if self.scan != Some(token) || token.1 != self.epoch {
+            return;
+        }
+        self.scan = None;
+        match result {
+            Ok(r) => self.status(rescan_line(&r), cx),
+            Err(e) => self.status(format!("Scan failed: {e}"), cx),
+        }
+        self.invalidate(cx);
+    }
+
+    pub fn scanning(&self) -> bool {
+        self.scan.is_some()
+    }
+
+    // --- reconcile --------------------------------------------------------------------
+
+    /// On launch and on window focus (App.tsx `checkReconcile`): when ops are pending and a
+    /// backup volume is reachable, drain them in the background.
+    pub fn check_reconcile(&mut self, cx: &mut Context<Self>) {
+        let state = self.app.clone();
+        let epoch = self.epoch;
+        let rx = Runner::get(cx).run(move || storage::reconcile_due(&state));
+        cx.spawn(async move |this, cx| {
+            let Ok(Ok((_, due))) = rx.await else { return };
+            this.update(cx, |s, cx| {
+                if due && epoch == s.epoch {
+                    s.run_reconcile(cx);
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// The "⤓ N waiting for the NAS" chip and More ⋯ → Back-up queue (App.tsx
+    /// `runReconcile`): back up, then apply the offload policy.
+    pub fn run_reconcile(&mut self, cx: &mut Context<Self>) {
+        if self.reconciling {
+            return;
+        }
+        self.reconciling = true;
+        let epoch = self.epoch;
+        let pending = self.shell.read(cx).counts.pending;
+        if pending > 0 {
+            self.status(format!("Backing up {pending} to NAS…"), cx);
+        }
+        let state = self.app.clone();
+        let rx = Runner::get(cx).run(move || {
+            let summary = storage::reconcile_now(&state)?;
+            // Best-effort: never blocks the result.
+            let offloaded = if summary.skipped_offline { 0 } else { storage::apply_offload_policy(&state).unwrap_or(0) };
+            Ok::<_, String>((summary, offloaded))
+        });
+        cx.spawn(async move |this, cx| {
+            let result = rx.await;
+            this.update(cx, |s, cx| {
+                s.reconciling = false;
+                if epoch != s.epoch {
+                    return;
+                }
+                match result {
+                    Ok(Ok((summary, offloaded))) => {
+                        if !summary.skipped_offline && summary.ran + summary.failed > 0 {
+                            let failed =
+                                if summary.failed > 0 { format!(", {} failed", summary.failed) } else { String::new() };
+                            s.status(format!("Backed up {}{failed}", summary.ran), cx);
+                        }
+                        if offloaded > 0 {
+                            s.status(format!("Offloaded {offloaded} older photo(s) to the NAS"), cx);
+                        }
+                    }
+                    Ok(Err(e)) => s.status(format!("Backup failed: {e}"), cx),
+                    Err(_) => s.status("Backup failed: the worker stopped".into(), cx),
+                }
+                s.invalidate(cx);
+                s.shell.update(cx, |sh, cx| sh.refresh_on_focus(cx));
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// The bench's Back up: queue a backup for each target and drain now (React's
+    /// `enqueueOperations` + reconcile). Queued, not copied here: an offline NAS keeps them
+    /// for the next drain.
+    pub fn back_up(&mut self, photo_ids: Vec<i64>, cx: &mut Context<Self>) {
+        if photo_ids.is_empty() {
+            self.status("Select photos to back up.".into(), cx);
+            return;
+        }
+        let state = self.app.clone();
+        let epoch = self.epoch;
+        let rx = Runner::get(cx).run(move || {
+            chairphoto_core::app::with_catalog(&state, |c| c.enqueue_operations("backup", &photo_ids))
+        });
+        cx.spawn(async move |this, cx| {
+            let Ok(result) = rx.await else { return };
+            this.update(cx, |s, cx| {
+                if epoch != s.epoch {
+                    return;
+                }
+                match result {
+                    Ok(n) => {
+                        s.status(format!("Queued {n} for backup"), cx);
+                        s.shell.update(cx, |sh, cx| sh.refresh_on_focus(cx));
+                        s.run_reconcile(cx);
+                    }
+                    Err(e) => s.status(format!("Back up failed: {e}"), cx),
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    // --- identity repair ----------------------------------------------------------------
+
+    /// "Start repair pass". A second start while one is followed does nothing (the button
+    /// is disabled then); the core would supersede the first anyway.
+    pub fn start_repair(&mut self, cx: &mut Context<Self>) {
+        if self.repair.running {
+            return;
+        }
+        let attempt = self.begin_attempt(cx);
+        let state = self.app.clone();
+        let (tx, rx) = futures::channel::oneshot::channel();
+        Runner::get(cx).spawn(move || match chairphoto_core::app::identity::claim_identity_repair(&state) {
+            Ok(pass) => {
+                // The id goes out before the pass sends anything.
+                let _ = tx.send(Ok(Some((pass.job, 0, 0))));
+                pass.run();
+            }
+            Err(e) => {
+                let _ = tx.send(Err(e));
+            }
+        });
+        self.adopt_when_ready(attempt, rx, cx);
+    }
+
+    /// The debt panel opened: follow a pass that is already running (re-attach), so a
+    /// reopened panel never invites a second pass over the same queue. Idle costs nothing.
+    pub fn reattach_repair(&mut self, cx: &mut Context<Self>) {
+        if self.repair.running {
+            return;
+        }
+        let state = self.app.clone();
+        let epoch = self.epoch;
+        let rx = Runner::get(cx).run(move || chairphoto_core::app::identity::identity_repair_status(&state));
+        cx.spawn(async move |this, cx| {
+            let Ok(Ok(Some(_))) = rx.await else { return };
+            this.update(cx, |s, cx| {
+                if epoch != s.epoch || s.repair.running {
+                    return;
+                }
+                // Something runs: follow it, and ask again now that terminal events buffer —
+                // a pass that ended in between has already cleared its slot.
+                let attempt = s.begin_attempt(cx);
+                let state = s.app.clone();
+                let rx = Runner::get(cx).run(move || {
+                    chairphoto_core::app::identity::identity_repair_status(&state)
+                        .map(|st| st.map(|st| (st.job, st.done, st.total)))
+                });
+                s.adopt_when_ready(attempt, rx, cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn begin_attempt(&mut self, cx: &mut Context<Self>) -> (u64, u64) {
+        self.repair.attempt += 1;
+        self.repair = RepairState { running: true, attempt: self.repair.attempt, ..RepairState::default() };
+        cx.notify();
+        (self.repair.attempt, self.epoch)
+    }
+
+    fn adopt_when_ready(
+        &mut self,
+        attempt: (u64, u64),
+        rx: futures::channel::oneshot::Receiver<Result<Option<(u64, usize, usize)>, String>>,
+        cx: &mut Context<Self>,
+    ) {
+        cx.spawn(async move |this, cx| {
+            let result = rx.await.unwrap_or_else(|_| Err("the repair worker stopped".into()));
+            this.update(cx, |s, cx| s.adopt(attempt, result, cx)).ok();
+        })
+        .detach();
+    }
+
+    /// The job id of a start or re-attach arrived.
+    pub(crate) fn adopt(&mut self, attempt: (u64, u64), result: Result<Option<(u64, usize, usize)>, String>, cx: &mut Context<Self>) {
+        if attempt != (self.repair.attempt, self.epoch) || !self.repair.running || self.repair.job.is_some() {
+            return; // superseded (a catalog switch reset the attempt)
+        }
+        match result {
+            Ok(Some((job, done, total))) => {
+                self.repair.job = Some(job);
+                if total > 0 {
+                    self.repair.progress = Some((done, total));
+                }
+                // A terminal event that beat the id is replayed now.
+                let early = std::mem::take(&mut self.repair.early_done);
+                if let Some(done) = early.into_iter().find(|d| d.job == job) {
+                    self.end_repair(done, cx);
+                    return;
+                }
+            }
+            Ok(None) => {
+                // A re-attach that found nothing running any more.
+                self.repair = RepairState { attempt: self.repair.attempt, ..RepairState::default() };
+                cx.emit(StorageEvent::RepairEnded);
+            }
+            Err(e) => {
+                self.repair = RepairState { attempt: self.repair.attempt, error: Some(e), ..RepairState::default() };
+            }
+        }
+        cx.notify();
+    }
+
+    fn end_repair(&mut self, done: IdentityRepairDone, cx: &mut Context<Self>) {
+        let attempt = self.repair.attempt;
+        self.repair = RepairState {
+            attempt,
+            result: done.error.is_none().then_some(done.summary),
+            error: done.error,
+            ..RepairState::default()
+        };
+        cx.emit(StorageEvent::RepairEnded);
+        // The debt count in the title bar.
+        self.invalidate(cx);
+        cx.notify();
+    }
+
+    /// Cancel: the pass stops at its next copy and still sends its terminal event, whose
+    /// partial, `aborted` summary is the honest report — so nothing changes here yet.
+    pub fn cancel_repair(&mut self, cx: &mut Context<Self>) {
+        if let Err(e) = chairphoto_core::app::identity::cancel_identity_repair(&self.app) {
+            self.repair.error = Some(e);
+            cx.notify();
+        }
+    }
+}
+
+enum ImportOutcome {
+    Card(ScanResult),
+    Bundle(BundleImportResult),
+}
+
+/// React's status line after a card import.
+pub fn card_import_line(r: &ScanResult) -> String {
+    let mut line = format!("Imported {} new of {} on card", r.created, r.scanned);
+    if r.skipped > 0 {
+        line += &format!(", {} already imported", r.skipped);
+    }
+    if r.errors > 0 {
+        line += &format!(", {} errors", r.errors);
+    }
+    line
+}
+
+/// React's status line after a rescan.
+pub fn rescan_line(r: &ScanResult) -> String {
+    let mut line = format!("Scanned {}, imported {} ({} new)", r.scanned, r.imported, r.created);
+    if r.errors > 0 {
+        line += &format!(", {} errors", r.errors);
+    }
+    line
+}
+
+/// BundleImportDialog's result line.
+pub fn bundle_import_line(r: &BundleImportResult) -> String {
+    let plural = |n: usize, one: &str, many: &str| if n == 1 { one.to_string() } else { many.to_string() };
+    let added = r.merge.photos_added;
+    let mut line = if added > 0 {
+        format!("Import complete. {added} {} added.", plural(added, "photo", "photos"))
+    } else {
+        "Import complete. No new photos.".to_string()
+    };
+    if r.copied > 0 {
+        line += &format!(" {} {} copied.", r.copied, plural(r.copied, "original", "originals"));
+    }
+    if r.skipped_duplicate > 0 {
+        line += &format!(" {} already present (skipped).", r.skipped_duplicate);
+    }
+    if r.merge.tags_created > 0 {
+        line += &format!(" {} {} created.", r.merge.tags_created, plural(r.merge.tags_created, "tag", "tags"));
+    }
+    if r.errors > 0 {
+        line += &format!(" {} error(s).", r.errors);
+    }
+    line
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn status_lines_match_reacts() {
+        let r = ScanResult { scanned: 5, imported: 4, created: 3, errors: 1, skipped: 2 };
+        assert_eq!(card_import_line(&r), "Imported 3 new of 5 on card, 2 already imported, 1 errors");
+        assert_eq!(rescan_line(&r), "Scanned 5, imported 4 (3 new), 1 errors");
+        let clean = ScanResult { scanned: 2, imported: 2, created: 2, errors: 0, skipped: 0 };
+        assert_eq!(card_import_line(&clean), "Imported 2 new of 2 on card");
+    }
+}

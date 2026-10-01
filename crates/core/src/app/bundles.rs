@@ -64,6 +64,17 @@ pub fn import_bundle_claimed(
     claim: &super::scans::ImportClaim,
     bundle_path: &Path,
 ) -> Result<BundleImportResult, String> {
+    import_bundle_claimed_with(state, claim, bundle_path, &|_| {})
+}
+
+/// [`import_bundle_claimed`], calling `after_indexed(n)` after each original indexed — where
+/// a test puts a Cancel.
+fn import_bundle_claimed_with(
+    state: &AppState,
+    claim: &super::scans::ImportClaim,
+    bundle_path: &Path,
+    after_indexed: &dyn Fn(usize),
+) -> Result<BundleImportResult, String> {
     let (abort, job) = (&*claim.abort, claim.job);
     if abort.load(Ordering::Relaxed) {
         return Err(format!("{IMPORT_CANCELLED} before the bundle was opened."));
@@ -84,7 +95,20 @@ pub fn import_bundle_claimed(
         return Err(cancelled_message(partial.copied));
     }
     let sec = crate::catalog::Catalog::open_secondary(&db_path, &dest).map_err(|e| e.to_string())?;
-    crate::bundle::importer::index_bundle(&sec, &manifest, &extracted, &dest, partial).map_err(|e| e.to_string())
+    // Stops before its next original once the flag trips (Cancel, a newer import, a switch),
+    // with the originals indexed so far imported whole (`index_bundle_abortable`).
+    let indexed =
+        crate::bundle::importer::index_bundle_with(&sec, &manifest, &extracted, &dest, partial, abort, after_indexed)?;
+    if indexed.aborted() {
+        return Err(cancelled_while_indexing(indexed.indexed, indexed.total));
+    }
+    Ok(indexed.result)
+}
+
+/// What a bundle import stopped during indexing reports: the originals indexed so far are
+/// imported; importing the bundle again finishes it.
+fn cancelled_while_indexing(indexed: usize, total: usize) -> String {
+    format!("{IMPORT_CANCELLED}: {indexed} of {total} unpacked originals imported — import the bundle again to finish.")
 }
 
 /// What a stopped bundle import reports. The unpacked copies are left in place, never
@@ -201,6 +225,60 @@ mod tests {
                 let a = Catalog::open_secondary(&dir.join("a.chairphoto"), &root).unwrap();
                 assert_eq!(a.count_photos(&Default::default()).unwrap(), 0, "nothing merged into the left catalog");
             }
+        }
+    }
+
+    /// **Forced interleaving** (#114 Codex, finding D). Cancel, a newer import and a catalog
+    /// switch each land after the first of three originals is indexed: indexing stops before
+    /// the second. The first is imported whole into the catalog the import started against —
+    /// its row with the bundle's identity, its batch and its queued backup — and the other two
+    /// are not inserted as metadata-only rows; importing the bundle again finishes it without
+    /// duplicating the first.
+    #[test]
+    fn cancel_switch_or_a_newer_import_stops_bundle_indexing_between_photos() {
+        for how in ["cancel", "newer", "switch"] {
+            let dir = crate::test_support::TestTmpDir::new(&format!("bundle-index-abort-{how}"));
+            let path = bundle(&dir, 3);
+            let root = dir.join("library");
+            let state = AppState::default();
+            *state.catalog.lock().unwrap() = Some(Catalog::open(&dir.join("a.chairphoto"), &root).unwrap());
+            let claim = super::super::scans::claim_import(&state).unwrap();
+            let trip = |n: usize| {
+                if n != 1 {
+                    return;
+                }
+                match how {
+                    "cancel" => super::super::scans::cancel_import(&state).unwrap(),
+                    "newer" => drop(super::super::scans::claim_import(&state).unwrap()),
+                    _ => {
+                        crate::app::catalogs::detach_catalog_and_trip_jobs(&state).unwrap();
+                        let b = Catalog::open(&dir.join("b.chairphoto"), &dir.join("b")).unwrap();
+                        crate::app::catalogs::publish_catalog_and_reset_jobs(&state, b).unwrap();
+                    }
+                }
+            };
+            let err = import_bundle_claimed_with(&state, &claim, &path, &trip).unwrap_err();
+            assert_eq!(err, "Import cancelled: 1 of 3 unpacked originals imported — import the bundle again to finish.", "{how}");
+            let a = Catalog::open_secondary(&dir.join("a.chairphoto"), &root).unwrap();
+            let rows = a.list_photos(&Default::default()).unwrap();
+            assert_eq!(rows.len(), 1, "{how}: one original indexed, not three");
+            assert_eq!(rows[0].uuid, "00000000-0000-4000-8000-000000000000", "{how}: with the bundle's identity");
+            let backups: Vec<i64> = a.list_pending_operations().unwrap().iter().map(|o| o.photo_id).collect();
+            assert_eq!(backups, [rows[0].id], "{how}: its queued backup");
+            assert_eq!(
+                a.import_batch_uuid_for_photo(rows[0].id).unwrap().as_deref(),
+                Some("batch-abort"),
+                "{how}: its batch, merged for it alone"
+            );
+            if how == "switch" {
+                assert_eq!(crate::app::with_catalog(&state, |c| c.count_photos(&Default::default())).unwrap(), 0, "B untouched");
+                continue;
+            }
+            // Again, uninterrupted: finished, the first photo matched rather than duplicated.
+            import_bundle(&state, &path).unwrap();
+            let rows = a.list_photos(&Default::default()).unwrap();
+            assert_eq!(rows.len(), 3, "{how}: the re-import finished it without a duplicate");
+            assert!(rows.iter().all(|p| a.import_batch_uuid_for_photo(p.id).unwrap().is_some()), "{how}: all batched");
         }
     }
 }

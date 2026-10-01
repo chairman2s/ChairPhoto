@@ -7,7 +7,7 @@
 use super::*;
 use crate::storage::open::StorageDialog;
 use crate::storage::{RecentRegistry, Runner};
-use chairphoto_core::catalog::{SidecarIdentity, VolumeKind};
+use chairphoto_core::catalog::{IdentityConflictAction, SidecarIdentity, VolumeKind};
 use gpui_kit::component::input::InputState;
 
 /// Run every queued storage job, then let the UI thread take the results.
@@ -420,6 +420,71 @@ fn a_drain_from_before_a_switch_does_not_block_the_new_catalogs_drain(cx: &mut T
     app.wired.storage.read_with(cx, |s, _| assert_eq!(s.reconciling, None, "both drains ended"));
 }
 
+/// **Forced interleaving.** The bench's Back up on catalog A's selection, with the core
+/// switched to B whose photos carry the same ids: before `catalog:switched` arrives (the UI
+/// still shows A's selection when Back up is pressed) and with the job queued before the
+/// switch and the event delivered before it runs. B's photos are never queued for backup.
+fn back_up_across_a_switch(delivered: bool, cx: &mut TestAppContext) {
+    let dir = TempDir::new("backup-switch");
+    let app = start(cx);
+    let ids = open_catalog_with_photos(&app, &dir, 2, cx);
+    work(cx);
+    app.wired.shell.update(cx, |s, cx| {
+        s.library.select_all();
+        cx.notify();
+    });
+    let targets = app.wired.shell.read_with(cx, |s, _| s.library.selection().targets.clone());
+    assert_eq!(targets, ids, "A's photos are selected");
+    let (b, b_ids) = colliding_catalog(&dir, "b", 2);
+    assert_eq!(b_ids, ids, "the ids collide, as real catalogs' do");
+    if delivered {
+        dispatch(&app, crate::shell::actions::BackUpSelection, cx);
+        core_switch(&app, b);
+        deliver_switch(&app, cx);
+    } else {
+        core_switch(&app, b);
+        dispatch(&app, crate::shell::actions::BackUpSelection, cx);
+    }
+    work(cx);
+    let pending = chairphoto_core::app::with_catalog(&app.state, |c| c.list_pending_operations()).unwrap();
+    assert!(pending.is_empty(), "delivered={delivered}: B's photos were queued for backup: {pending:?}");
+    if !delivered {
+        assert_eq!(status(&app, cx), format!("Back up failed: {}", chairphoto_core::app::CATALOG_CHANGED));
+    }
+}
+
+#[gpui_kit::test]
+fn back_up_never_queues_the_new_catalogs_photos_before_the_switch_event(cx: &mut TestAppContext) {
+    back_up_across_a_switch(false, cx);
+}
+
+#[gpui_kit::test]
+fn back_up_never_queues_the_new_catalogs_photos_after_the_switch_event(cx: &mut TestAppContext) {
+    back_up_across_a_switch(true, cx);
+}
+
+/// The bench's Back up on A's selection queues A's photos (the binding does not refuse the
+/// catalog the ids came from).
+#[gpui_kit::test]
+fn back_up_queues_the_selection(cx: &mut TestAppContext) {
+    let dir = TempDir::new("backup");
+    let app = start(cx);
+    let ids = open_catalog_with_photos(&app, &dir, 2, cx);
+    work(cx);
+    app.wired.shell.update(cx, |s, cx| {
+        s.library.select_all();
+        cx.notify();
+    });
+    dispatch(&app, crate::shell::actions::BackUpSelection, cx);
+    assert_eq!(work_once(cx), 1, "the queueing ran");
+    cx.run_until_parked();
+    let pending = chairphoto_core::app::with_catalog(&app.state, |c| c.list_pending_operations()).unwrap();
+    let mut queued: Vec<i64> = pending.iter().map(|op| op.photo_id).collect();
+    queued.sort();
+    assert_eq!(queued, ids);
+    assert_eq!(status(&app, cx), "Queued 2 for backup");
+}
+
 // --- trash --------------------------------------------------------------------------------
 
 /// Two trashed photos whose files exist; returns their ids.
@@ -606,6 +671,72 @@ fn catalog_with_debt(app: &App, dir: &TempDir, n: usize, cx: &mut TestAppContext
     work(cx);
 }
 
+/// Record a sidecar-identity conflict for each of `ids`, whose files are `<root>/2026/p<i>.ARW`.
+fn record_conflicts(c: &Catalog, root: &std::path::Path, ids: &[i64]) {
+    for (i, id) in ids.iter().enumerate() {
+        let p = root.join(format!("2026/p{i}.ARW"));
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, b"raw").unwrap();
+        c.record_sidecar_identity(*id, &p, &SidecarIdentity::Conflict("another photo's uuid".into())).unwrap();
+    }
+}
+
+/// **Forced interleaving** (#114 Codex, finding A). The debt panel shows catalog A's
+/// conflicted copies; the core switches to B, whose copies have the same photo ids, volume
+/// ids and relative paths, also in conflict. Dismissing A's row — pressed after the switch
+/// with the event undelivered, or queued before it with the event delivered before the
+/// worker runs — never touches B's queue.
+fn resolve_across_a_switch(delivered: bool, cx: &mut TestAppContext) {
+    let dir = TempDir::new("debt-switch");
+    let app = start(cx);
+    let ids = open_catalog_with_photos(&app, &dir, 2, cx);
+    record_conflicts(app.state.catalog.lock().unwrap().as_ref().unwrap(), &dir.0.join("photos"), &ids);
+    app.wired.model.update(cx, |m, cx| m.refresh(cx));
+    work(cx);
+    click(&app, "attn-identity", cx);
+    let StorageDialog::IdentityDebt(panel) = dialog(&app, cx) else { panic!("the debt panel") };
+    work(cx);
+    panel.read_with(cx, |p, _| assert_eq!(p.rows.as_ref().map(Vec::len), Some(2)));
+
+    let other = dir.0.join("other");
+    let b = Catalog::open(&other.join("b.chairphoto"), &other).unwrap();
+    let b_ids: Vec<i64> = (0..2).map(|i| b.upsert_photo(&other.join(format!("2026/p{i}.ARW")), None, 0, 1).unwrap().id).collect();
+    assert_eq!(b_ids, ids, "the ids collide, as real catalogs' do");
+    record_conflicts(&b, &other, &b_ids);
+    let (a_row, b_row) = {
+        let a_row = panel.read_with(cx, |p, _| p.rows.as_ref().unwrap()[0].clone());
+        let b_row = b.list_pending_identity_page(10, 0, false).unwrap().into_iter().find(|r| r.photo_id == a_row.photo_id).unwrap();
+        (a_row, b_row)
+    };
+    assert_eq!((b_row.volume_id, &b_row.relative_path), (a_row.volume_id, &a_row.relative_path), "the same copy coordinates");
+
+    let dismiss = |cx: &mut TestAppContext| panel.update(cx, |p, cx| p.resolve(0, IdentityConflictAction::Dismiss, cx));
+    if delivered {
+        dismiss(cx);
+        core_switch(&app, b);
+        deliver_switch(&app, cx);
+    } else {
+        core_switch(&app, b);
+        dismiss(cx);
+    }
+    work(cx);
+    let summary = chairphoto_core::app::with_catalog(&app.state, |c| c.summarize_pending_identity()).unwrap();
+    assert_eq!((summary.total, summary.dismissed), (2, 0), "delivered={delivered}: B's copy was dismissed");
+    if !delivered {
+        panel.read_with(cx, |p, _| assert_eq!(p.action_error.as_deref(), Some(chairphoto_core::app::CATALOG_CHANGED)));
+    }
+}
+
+#[gpui_kit::test]
+fn a_resolution_never_reaches_the_new_catalog_before_the_switch_event(cx: &mut TestAppContext) {
+    resolve_across_a_switch(false, cx);
+}
+
+#[gpui_kit::test]
+fn a_resolution_never_reaches_the_new_catalog_after_the_switch_event(cx: &mut TestAppContext) {
+    resolve_across_a_switch(true, cx);
+}
+
 /// The identity-debt chip opens the panel; a repair pass runs as a job — progress and its
 /// terminal event follow the job id — and its end reloads the queue (now empty).
 #[gpui_kit::test]
@@ -781,6 +912,61 @@ fn a_bundle_previews_and_imports(cx: &mut TestAppContext) {
 
 /// Add a volume (Enter in the path adds); the library folder cannot be removed; removing
 /// another asks first, and Cancel keeps it.
+/// **Forced interleaving** (#114 Codex, finding B). Preferences → Storage lists catalog A's
+/// volumes; the core switches to B, whose NAS volume has the same id. Removing A's NAS —
+/// confirmed after the switch with the event undelivered, or confirmed before it with the
+/// event delivered before the worker runs — never removes B's volume.
+fn remove_volume_across_a_switch(delivered: bool, cx: &mut TestAppContext) {
+    let dir = TempDir::new("volumes-switch");
+    let app = start(cx);
+    open_catalog(&app, &dir, cx);
+    std::fs::create_dir_all(dir.0.join("nas")).unwrap();
+    let nas_id = app.state.catalog.lock().unwrap().as_ref().unwrap().add_volume("NAS", &dir.0.join("nas"), VolumeKind::Backup).unwrap();
+    dispatch(&app, crate::shell::actions::OpenPreferences, cx);
+    settle(&app, cx);
+    let prefs = cx.update(|cx| cx.global::<crate::preferences::LastPreferences>().0.upgrade()).expect("Preferences opened");
+    let panel = prefs.read_with(cx, |p, _| match &p.content {
+        crate::preferences::Content::Storage(s) => s.volumes.clone(),
+        _ => panic!("Preferences opens on Storage"),
+    });
+    work(cx);
+    let nas = panel.read_with(cx, |p, _| p.volumes.iter().position(|v| v.id == nas_id).expect("listed"));
+    let remove: &'static str = Box::leak(format!("volume-remove-{nas}").into_boxed_str());
+
+    let other = dir.0.join("other");
+    let b = Catalog::open(&other.join("b.chairphoto"), &other).unwrap();
+    let b_nas = b.add_volume("NAS", &dir.0.join("nas"), VolumeKind::Backup).unwrap();
+    assert_eq!(b_nas, nas_id, "the volume ids collide, as real catalogs' do");
+    if delivered {
+        click(&app, remove, cx);
+        settle(&app, cx);
+        click(&app, "ok", cx);
+        core_switch(&app, b);
+        deliver_switch(&app, cx);
+    } else {
+        core_switch(&app, b);
+        click(&app, remove, cx);
+        settle(&app, cx);
+        click(&app, "ok", cx);
+    }
+    work(cx);
+    let vols = chairphoto_core::app::with_catalog(&app.state, |c| c.volume_rows()).unwrap();
+    assert!(vols.iter().any(|v| v.id == b_nas), "delivered={delivered}: B's volume was removed: {vols:?}");
+    if !delivered {
+        panel.read_with(cx, |p, _| assert_eq!(p.error.as_deref(), Some(chairphoto_core::app::CATALOG_CHANGED)));
+    }
+}
+
+#[gpui_kit::test]
+fn removing_a_volume_never_reaches_the_new_catalog_before_the_switch_event(cx: &mut TestAppContext) {
+    remove_volume_across_a_switch(false, cx);
+}
+
+#[gpui_kit::test]
+fn removing_a_volume_never_reaches_the_new_catalog_after_the_switch_event(cx: &mut TestAppContext) {
+    remove_volume_across_a_switch(true, cx);
+}
+
 #[gpui_kit::test]
 fn volumes_add_and_remove_behind_a_confirm(cx: &mut TestAppContext) {
     let dir = TempDir::new("volumes");

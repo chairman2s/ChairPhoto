@@ -11,7 +11,7 @@
 use super::ui;
 use super::{CloseDialog, Runner};
 use crate::shell::style::Colors;
-use chairphoto_core::app::{expand_home, with_catalog, AppState};
+use chairphoto_core::app::{expand_home, with_catalog, with_catalog_as, with_catalog_identified, AppState, CatalogIdentity};
 use chairphoto_core::catalog::{Volume, VolumeKind};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::prelude::*;
@@ -24,6 +24,8 @@ pub const LIBRARY_VOLUME: &str = "catalog-root";
 pub struct VolumesPanel {
     app: AppState,
     pub volumes: Vec<Volume>,
+    /// The catalog `volumes` were read from: a Remove of one of them is bound to it.
+    pub volumes_from: Option<CatalogIdentity>,
     pub name: Entity<InputState>,
     pub path: Entity<InputState>,
     pub kind: VolumeKind,
@@ -45,6 +47,7 @@ impl VolumesPanel {
         let mut this = VolumesPanel {
             app,
             volumes: Vec::new(),
+            volumes_from: None,
             name,
             path,
             kind: VolumeKind::Backup,
@@ -58,19 +61,22 @@ impl VolumesPanel {
     pub fn reload(&mut self, cx: &mut Context<Self>) {
         let state = self.app.clone();
         let rx = Runner::get(cx).run(move || {
-            let mut vols = with_catalog(&state, |c| c.volume_rows())?;
+            let (from, mut vols) = with_catalog_identified(&state, |c| c.volume_rows())?;
             let pairs: Vec<(i64, String)> = vols.iter().map(|v| (v.id, v.base_path.clone())).collect();
             let reachable = state.volume_health.refresh(&pairs);
             for v in &mut vols {
                 v.reachable = reachable.get(&v.id).copied().unwrap_or(false);
             }
-            Ok::<_, String>(vols)
+            Ok::<_, String>((from, vols))
         });
         cx.spawn(async move |this, cx| {
             let Ok(result) = rx.await else { return };
             this.update(cx, |s, cx| {
                 match result {
-                    Ok(v) => s.volumes = v,
+                    Ok((from, v)) => {
+                        s.volumes = v;
+                        s.volumes_from = Some(from);
+                    }
                     Err(e) => s.error = Some(e),
                 }
                 cx.notify();
@@ -121,9 +127,12 @@ impl VolumesPanel {
         .detach();
     }
 
-    /// Remove, after the confirm React showed with `window.confirm`.
+    /// Remove, after the confirm React showed with `window.confirm` — from the catalog the
+    /// list was read from: volume ids are per catalog, so once another catalog is open (the
+    /// confirm is asynchronous) it fails closed with `CATALOG_CHANGED` and removes nothing.
     pub fn remove(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
         let Some(v) = self.volumes.get(index).cloned() else { return };
+        let Some(from) = self.volumes_from else { return };
         if v.name == LIBRARY_VOLUME {
             return;
         }
@@ -144,7 +153,7 @@ impl VolumesPanel {
                 return;
             }
             let rx = runner.run(move || {
-                with_catalog(&state, |c| c.remove_volume(v.id))?;
+                with_catalog_as(&state, from, |c| c.remove_volume(v.id))?;
                 state.volume_health.invalidate();
                 Ok::<_, String>(())
             });

@@ -537,6 +537,77 @@ fn a_restore_read_overtaken_by_a_switch_is_dropped(cx: &mut TestAppContext) {
     assert_eq!(*log.borrow(), ["load:b"], "A's set was never applied");
 }
 
+/// **Forced interleaving.** A toggle queued while A's restore read runs was asked for against
+/// A; when B (with its own saved set) opens before that read lands it never applies to B nor
+/// reaches B's saved set — with the event (the switch drops it) and without it (the restore,
+/// which read B, refuses a toggle made against A). A toggle made after the event waits for
+/// B's restore and lands on B.
+#[gpui_kit::test]
+fn toggles_queued_for_one_catalog_never_apply_to_the_next(cx: &mut TestAppContext) {
+    for deliver in [false, true] {
+        let dir = TempDir::new("queued-switch");
+        let log = Log::default();
+        let b = bench_unrestored(
+            vec![probe(ModuleMeta::new("a", "A"), &log), probe(ModuleMeta::new("b", "B"), &log), probe(ModuleMeta::new("c", "C"), &log)],
+            &[],
+            &dir,
+            cx,
+        );
+        b.state.catalog.lock().unwrap().as_ref().unwrap().set_setting(ENABLED_KEY, "a").unwrap();
+        b.model.update(cx, |m, cx| m.refresh(cx));
+        while !b.registry.read_with(cx, |r, _| r.restore_reading()) {
+            cx.executor().tick();
+        }
+        cx.update(|cx| ModuleRegistry::enable(&b.registry, "c", cx)); // queued, made against A
+        let other = Catalog::open(&dir.0.join("b.chairphoto"), &dir.0.join("photos")).unwrap();
+        other.set_setting(ENABLED_KEY, "b").unwrap();
+        b.state.catalog.lock().unwrap().replace(other);
+        if deliver {
+            b.model.update(cx, |m, cx| m.on_core_event(&CoreEvent::CatalogSwitched("b".into()), cx));
+            assert!(b.status(cx).contains("not applied"), "said so: {}", b.status(cx));
+            cx.update(|cx| ModuleRegistry::enable(&b.registry, "a", cx)); // made against B
+        }
+        cx.run_until_parked();
+        let (want_on, want_saved) = if deliver { (vec!["a", "b"], "a,b") } else { (vec!["b"], "b") };
+        assert_eq!(b.enabled(cx), want_on, "deliver={deliver}: A's queued toggle did not apply to B");
+        assert_eq!(b.setting(ENABLED_KEY).as_deref(), Some(want_saved), "deliver={deliver}: B's saved set");
+        assert!(!log.borrow().contains(&"load:c".to_string()), "deliver={deliver}: C never loaded: {:?}", log.borrow());
+    }
+}
+
+/// **Forced interleaving, A→B→A.** A toggle's write for catalog A is still queued when the app
+/// switches to B and back to A — a new opening of the same file. The write is refused: the
+/// reopened A's saved set is what its own restore read, not the old opening's toggle. Without
+/// the event (the core switch alone) and with it (the reopened A's restore running too).
+#[gpui_kit::test]
+fn a_write_for_a_catalog_never_lands_in_a_later_opening_of_it(cx: &mut TestAppContext) {
+    for deliver in [false, true] {
+        let dir = TempDir::new("reopen");
+        let log = Log::default();
+        let b = bench(vec![probe(ModuleMeta::new("a", "A"), &log), probe(ModuleMeta::new("c", "C"), &log)], &[], &dir, cx);
+        b.enable("a", cx);
+        assert_eq!(b.setting(ENABLED_KEY).as_deref(), Some("a"));
+
+        cx.update(|cx| ModuleRegistry::enable(&b.registry, "c", cx)); // its write is queued, not run
+        let other = Catalog::open(&dir.0.join("b.chairphoto"), &dir.0.join("photos")).unwrap();
+        b.state.catalog.lock().unwrap().replace(other);
+        let switched = |cx: &mut TestAppContext| {
+            if deliver {
+                b.model.update(cx, |m, cx| m.on_core_event(&CoreEvent::CatalogSwitched("x".into()), cx));
+            }
+        };
+        switched(cx);
+        let reopened = Catalog::open(&dir.0.join("m.chairphoto"), &dir.0.join("photos")).unwrap();
+        b.state.catalog.lock().unwrap().replace(reopened);
+        switched(cx);
+        cx.run_until_parked();
+        assert_eq!(b.setting(ENABLED_KEY).as_deref(), Some("a"), "deliver={deliver}: the old opening's write did not land");
+        if deliver {
+            assert_eq!(b.enabled(cx), ["a"], "the reopened catalog's saved set applies");
+        }
+    }
+}
+
 /// With no catalog open, a toggle waits (it has nowhere to be saved) and lands once one is.
 #[gpui_kit::test]
 fn a_toggle_with_no_catalog_waits_for_one(cx: &mut TestAppContext) {
@@ -571,21 +642,88 @@ fn the_newest_toggle_is_what_is_persisted(cx: &mut TestAppContext) {
     assert_eq!(b.setting(ENABLED_KEY).as_deref(), Some("c"));
 }
 
+/// Keeps the host it was loaded with, for the settings tests.
+struct HostGrab {
+    meta: ModuleMeta,
+    host: Rc<RefCell<Option<ModuleHost>>>,
+}
+
+impl Module for HostGrab {
+    fn meta(&self) -> ModuleMeta {
+        self.meta.clone()
+    }
+
+    fn load(&self, host: ModuleHost, _: &mut App) -> Result<Box<dyn ModuleInstance>, String> {
+        *self.host.borrow_mut() = Some(host);
+        Ok(Box::new(GrabInstance))
+    }
+}
+
+struct GrabInstance;
+
+impl ModuleInstance for GrabInstance {
+    fn contributions(&self) -> Contributions {
+        Contributions::default()
+    }
+}
+
+/// A bench with one [`HostGrab`] module `id`, enabled; returns the host it was loaded with.
+fn grab_bench(id: &'static str, dir: &TempDir, cx: &mut TestAppContext) -> (Bench, ModuleHost) {
+    let slot: Rc<RefCell<Option<ModuleHost>>> = Rc::default();
+    let b = bench(vec![Rc::new(HostGrab { meta: ModuleMeta::new(id, id), host: slot.clone() })], &[], dir, cx);
+    b.enable(id, cx);
+    let host = slot.borrow().clone().expect("loaded");
+    (b, host)
+}
+
 /// A module's settings are `<id>.<key>` in the catalog.
 #[gpui_kit::test]
 fn module_settings_are_namespaced_by_id(cx: &mut TestAppContext) {
     let dir = TempDir::new("settings");
-    let b = bench(Vec::new(), &[], &dir, cx);
-    let host = cx.update(|cx| {
-        let shell = cx.new(|cx| ShellState::new(&b.model, cx));
-        ModuleHost::new(ModuleMeta::new("ai", "AI"), b.state.clone(), b.model.clone(), shell)
-    });
+    let (b, host) = grab_bench("ai", &dir, cx);
     host.settings().set("provider", "ollama").unwrap();
     assert_eq!(b.setting("ai.provider").as_deref(), Some("ollama"));
     assert_eq!(host.settings().get("provider").unwrap().as_deref(), Some("ollama"));
     assert_eq!(host.settings().get(&ENABLED_KEY["modules.".len()..]).unwrap(), None, "the host's own keys are out of reach");
     assert_eq!(ModuleMeta::new("ai", "AI").marker(), "ai");
     assert_eq!(ModuleMeta::new("snap", "Snap").publication_marker("snapchat").marker(), "snapchat");
+}
+
+/// **Forced interleaving.** A settings handle a module took while catalog A was open — say for
+/// a background write — is bound to A: once B (holding the same key) is open it neither reads
+/// nor writes B, whether or not `catalog:switched` has reached the UI. A handle taken between
+/// the event and B's restore is bound to nothing; one taken after B's restore reads and
+/// writes B.
+#[gpui_kit::test]
+fn a_settings_handle_never_reaches_a_catalog_opened_after_it(cx: &mut TestAppContext) {
+    use chairphoto_core::app::CATALOG_CHANGED;
+    for deliver in [false, true] {
+        let dir = TempDir::new("settings-switch");
+        let (b, host) = grab_bench("probe", &dir, cx);
+        let on_a = host.settings();
+        on_a.set("level", "a").unwrap();
+
+        let other = Catalog::open(&dir.0.join("b.chairphoto"), &dir.0.join("photos")).unwrap();
+        other.set_setting("probe.level", "b").unwrap();
+        b.state.catalog.lock().unwrap().replace(other);
+        if deliver {
+            // The event, with B's restore not landed yet.
+            b.model.update(cx, |m, cx| m.on_core_event(&CoreEvent::CatalogSwitched("b".into()), cx));
+            let fresh = host.settings();
+            assert_eq!(fresh.set("level", "x"), Err(super::SETTINGS_NOT_READY.to_string()), "unbound until B is restored");
+        }
+        assert_eq!(on_a.set("level", "stale"), Err(CATALOG_CHANGED.to_string()), "deliver={deliver}: the write failed closed");
+        assert_eq!(on_a.get("level"), Err(CATALOG_CHANGED.to_string()), "deliver={deliver}: and the read");
+        assert_eq!(b.setting("probe.level").as_deref(), Some("b"), "deliver={deliver}: B's value is untouched");
+
+        if deliver {
+            cx.run_until_parked(); // B's restore
+            let on_b = host.settings();
+            assert_eq!(on_b.get("level").unwrap().as_deref(), Some("b"), "a fresh handle reads B");
+            on_b.set("level", "b2").unwrap();
+            assert_eq!(b.setting("probe.level").as_deref(), Some("b2"), "and writes B");
+        }
+    }
 }
 
 // --- events ------------------------------------------------------------------------------
@@ -741,6 +879,88 @@ fn closing_a_window_drops_its_module_views(cx: &mut TestAppContext) {
     cx.run_until_parked();
     assert_eq!(b.registry.read_with(cx, |r, _| r.cached_view_count()), 1, "the closed window's view is gone");
     assert_eq!(views(first, cx)[0].view.entity_id(), in_first, "the open window's view is still cached");
+}
+
+/// A module whose inspector panel's factory, the first time it runs, disables its own module
+/// (`reload`: and enables it again) through the registry — module code the registry runs with
+/// no lease on itself. Counts the views it builds.
+struct FactoryToggler {
+    reload: bool,
+    registry: Rc<RefCell<Option<Entity<ModuleRegistry>>>>,
+    built: Rc<RefCell<usize>>,
+}
+
+struct FactoryTogglerInstance {
+    reload: bool,
+    registry: Rc<RefCell<Option<Entity<ModuleRegistry>>>>,
+    built: Rc<RefCell<usize>>,
+}
+
+impl Module for FactoryToggler {
+    fn meta(&self) -> ModuleMeta {
+        ModuleMeta::new("toggler", "Toggler")
+    }
+
+    fn load(&self, _: ModuleHost, _: &mut App) -> Result<Box<dyn ModuleInstance>, String> {
+        Ok(Box::new(FactoryTogglerInstance { reload: self.reload, registry: self.registry.clone(), built: self.built.clone() }))
+    }
+}
+
+impl ModuleInstance for FactoryTogglerInstance {
+    fn contributions(&self) -> Contributions {
+        let (reload, registry, built) = (self.reload, self.registry.clone(), self.built.clone());
+        Contributions {
+            panels: vec![Panel {
+                id: "toggler-panel".into(),
+                label: "Toggler".into(),
+                slot: PanelSlot::Inspector,
+                view: Rc::new(move |_, cx| {
+                    *built.borrow_mut() += 1;
+                    if *built.borrow() == 1 {
+                        let registry = registry.borrow().clone().unwrap();
+                        ModuleRegistry::disable(&registry, "toggler", cx);
+                        if reload {
+                            ModuleRegistry::enable(&registry, "toggler", cx);
+                        }
+                    }
+                    cx.new(|_| Empty).into()
+                }),
+            }],
+            ..Default::default()
+        }
+    }
+}
+
+/// A view factory that disables its own module leaves no view cached for the unloaded
+/// instance; one that disables and re-enables it does not hand the old instance's view to the
+/// new one — the next build is fresh.
+#[gpui_kit::test]
+fn a_view_built_while_its_module_went_away_is_not_cached(cx: &mut TestAppContext) {
+    for reload in [false, true] {
+        let dir = TempDir::new("factory");
+        let slot: Rc<RefCell<Option<Entity<ModuleRegistry>>>> = Rc::default();
+        let built = Rc::new(RefCell::new(0));
+        let b = bench(vec![Rc::new(FactoryToggler { reload, registry: slot.clone(), built: built.clone() })], &[], &dir, cx);
+        *slot.borrow_mut() = Some(b.registry.clone());
+        b.enable("toggler", cx);
+        let window: AnyWindowHandle = cx.update(|cx| cx.open_window(Default::default(), |_, cx| cx.new(|_| Empty)).unwrap()).into();
+        let views = |cx: &mut TestAppContext| {
+            let registry = b.registry.clone();
+            cx.update_window(window, |_, window, cx| ModuleRegistry::panel_views(&registry, PanelSlot::Inspector, window, cx))
+                .unwrap()
+        };
+        let first = views(cx);
+        cx.run_until_parked();
+        assert!(first.is_empty(), "reload={reload}: the view of the instance that went away is not shown");
+        assert_eq!(b.registry.read_with(cx, |r, _| r.cached_view_count()), 0, "reload={reload}: nor cached");
+        assert_eq!(b.enabled(cx).is_empty(), !reload, "reload={reload}");
+        if reload {
+            let again = views(cx);
+            assert_eq!(again.len(), 1);
+            assert_eq!(*built.borrow(), 2, "the re-enabled instance got a freshly built view");
+            assert_eq!(views(cx)[0].view.entity_id(), again[0].view.entity_id(), "which is cached");
+        }
+    }
 }
 
 // --- the shell's slots, with the dev module -------------------------------------------------

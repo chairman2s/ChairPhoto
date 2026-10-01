@@ -14,7 +14,7 @@ use super::state::StorageEvent;
 use super::ui;
 use super::{CloseDialog, Runner, StorageState};
 use crate::shell::style::Colors;
-use chairphoto_core::app::{with_catalog, AppState};
+use chairphoto_core::app::{with_catalog, with_catalog_identified, AppState, CatalogIdentity};
 use chairphoto_core::catalog::{
     IdentityConflictAction, IdentityConflictOutcome, IdentityRepairSummary, PendingIdentity, PendingIdentityField,
     PendingIdentitySummary,
@@ -32,6 +32,8 @@ pub struct IdentityDebtPanel {
     storage: Entity<StorageState>,
     pub summary: Option<PendingIdentitySummary>,
     pub rows: Option<Vec<PendingIdentity>>,
+    /// The catalog `rows` were read from: a resolution of one of them is bound to it.
+    pub rows_from: Option<CatalogIdentity>,
     volumes: HashMap<i64, String>,
     pub page: i64,
     pub show_dismissed: bool,
@@ -72,6 +74,7 @@ impl IdentityDebtPanel {
             storage: storage.clone(),
             summary: None,
             rows: None,
+            rows_from: None,
             volumes: HashMap::new(),
             page: 0,
             show_dismissed: false,
@@ -115,7 +118,7 @@ impl IdentityDebtPanel {
         let seq = self.page_seq;
         let (state, offset, dismissed) = (self.app.clone(), self.page * PAGE_SIZE, self.show_dismissed);
         let rx = Runner::get(cx)
-            .run(move || with_catalog(&state, |c| c.list_pending_identity_page(PAGE_SIZE, offset, dismissed)));
+            .run(move || with_catalog_identified(&state, |c| c.list_pending_identity_page(PAGE_SIZE, offset, dismissed)));
         cx.spawn(async move |this, cx| {
             let Ok(result) = rx.await else { return };
             this.update(cx, |s, cx| {
@@ -123,7 +126,10 @@ impl IdentityDebtPanel {
                     return;
                 }
                 match result {
-                    Ok(rows) => s.rows = Some(rows),
+                    Ok((from, rows)) => {
+                        s.rows = Some(rows);
+                        s.rows_from = Some(from);
+                    }
                     Err(e) => s.list_error = Some(e),
                 }
                 cx.notify();
@@ -160,9 +166,11 @@ impl IdentityDebtPanel {
         cx.notify();
     }
 
-    /// Adopt / Overwrite / Dismiss / Restore one copy.
+    /// Adopt / Overwrite / Dismiss / Restore one copy — in the catalog its row was read from
+    /// (`CATALOG_CHANGED` once another is open: the ids and path would name another copy).
     pub fn resolve(&mut self, index: usize, action: IdentityConflictAction, cx: &mut Context<Self>) {
         let Some(p) = self.rows.as_ref().and_then(|r| r.get(index)).cloned() else { return };
+        let Some(from) = self.rows_from else { return };
         let key = row_key(&p);
         if self.resolving.is_some() {
             return;
@@ -173,7 +181,14 @@ impl IdentityDebtPanel {
         let state = self.app.clone();
         let epoch = self.storage.read(cx).epoch();
         let rx = Runner::get(cx).run(move || {
-            chairphoto_core::app::identity::resolve_identity_conflict(&state, p.photo_id, p.volume_id, &p.relative_path, action)
+            chairphoto_core::app::identity::resolve_identity_conflict_as(
+                &state,
+                from,
+                p.photo_id,
+                p.volume_id,
+                &p.relative_path,
+                action,
+            )
         });
         cx.spawn(async move |this, cx| {
             let result = rx.await.unwrap_or_else(|_| Err("the resolve worker stopped".into()));

@@ -18,8 +18,10 @@
 //! after every `catalog:switched`, from the new catalog: the modules it lists are enabled and
 //! those it does not list disabled, without writing (React kept the old set and the next
 //! toggle overwrote the new catalog's). A catalog that has never saved a set keeps the
-//! modules that are on. A write is tied to the catalog it was made for: one that would land
-//! in a catalog opened since is dropped.
+//! modules that are on. A write is tied to the catalog opening the set was restored from (its
+//! `CatalogIdentity`, checked under the write's catalog lock): one that would land in a catalog
+//! opened since — another catalog, or the same file reopened after a switch away — is dropped,
+//! and so is one made while no catalog's set has been read.
 //!
 //! **Toggles wait for the restore.** React awaited `initHost` before anything could toggle.
 //! Here the restore's read is asynchronous, so an enable or disable asked for before it has
@@ -27,18 +29,26 @@
 //! line, and applied on top of the restored set once it lands; then the result is written.
 //! A toggle can therefore never overwrite the saved set with a partial one.
 //!
+//! **Queued toggles belong to a catalog.** Each remembers the catalog the UI had read when it
+//! was made (the model's `catalog_identity`; none before the first read lands). A catalog
+//! switch drops every queued toggle, with a status line saying so: they were asked for against
+//! the old catalog's modules, and the new catalog's saved set must not inherit them. A restore
+//! applies only the toggles made against the catalog it read (or made before any catalog was
+//! read), so a core switch the UI has not heard of yet cannot carry them over either. Dropped
+//! toggles are the user's to redo; nothing is written for them.
+//!
 //! **Events.** Every [`CoreEvent`] the app model routes ([`AppModelEvent::Core`]) reaches each
 //! enabled module's `on_event`, in registration order. `appearance:theme_changed` is applied
 //! to the theme by the router and does not reach modules.
 
 use super::{
     ActionKind, Contributions, MainView, Module, ModuleAction, ModuleHost, ModuleInstance, ModuleMeta, Panel,
-    PanelSlot, PublishTarget, SettingsPanel, ViewFactory,
+    PanelSlot, PublishTarget, RestoredCatalog, SettingsPanel, ViewFactory,
 };
 use crate::image_store::ImageStore;
 use crate::model::{AppModel, AppModelEvent};
 use crate::shell::ShellState;
-use chairphoto_core::app::{with_catalog, AppState, CoreEvent};
+use chairphoto_core::app::{with_catalog_as, with_catalog_identified, AppState, CatalogIdentity, CoreEvent, CATALOG_CHANGED};
 use gpui_kit::component::WindowExt as _;
 use gpui_kit::prelude::*;
 use gpui_kit::{AnyView, App, Context, Entity, SharedString, Window, WindowId};
@@ -135,6 +145,9 @@ pub struct SlotView {
 struct Live {
     instance: Rc<RefCell<Box<dyn ModuleInstance>>>,
     contributions: Contributions,
+    /// Which load this is (unique per registry): a view built for one instance is never
+    /// cached for another ([`ModuleRegistry::cached_view`]).
+    generation: u64,
 }
 
 struct Entry {
@@ -152,6 +165,14 @@ enum Restore {
     Reading,
     /// Restored: toggles apply and persist at once.
     Done,
+}
+
+/// A toggle waiting for the restore.
+struct Queued {
+    id: String,
+    enable: bool,
+    /// The catalog the UI had read when it was asked for; `None` before any read had landed.
+    made_on: Option<CatalogIdentity>,
 }
 
 /// A contributed view, per window: a panel's view in the main window is not the same entity
@@ -179,16 +200,22 @@ pub struct ModuleRegistry {
     /// one (tests).
     images: Option<Entity<ImageStore>>,
     restore: Restore,
-    /// Enables (`true`) and disables asked for while the restore had not landed, in order.
-    queued: Vec<(String, bool)>,
+    /// Enables (`true`) and disables asked for while the restore had not landed, in order,
+    /// each with the catalog the UI had read when it was asked for (see the module docs).
+    queued: Vec<Queued>,
     /// Bumped by every catalog switch: a restore read from before it is dropped.
     restore_generation: u64,
-    /// The catalog the enabled set was restored from; writes go only to it.
-    catalog_path: Option<std::path::PathBuf>,
+    /// The catalog the enabled set was restored from; writes go only to it. Its identity,
+    /// not its path: after a switch away and back the reopened catalog is another opening,
+    /// whose restore may already have read the set an old write would overwrite.
+    /// Shared with every module's host: their settings handles are bound to it.
+    restored_from: RestoredCatalog,
     views: HashMap<ViewKey, AnyView>,
     persist_generation: u64,
     /// The generation of the newest `modules.enabled` write that ran.
     persisted: Arc<Mutex<u64>>,
+    /// The last [`Live::generation`] handed out.
+    live_generation: u64,
     /// How many module callbacks (`load`, `on_event`, `on_unload`) are running now. An enable
     /// or disable asked for from inside one is deferred until it returns ([`Self::enable`]).
     in_callback: u32,
@@ -242,10 +269,11 @@ impl ModuleRegistry {
             restore: Restore::Waiting,
             queued: Vec::new(),
             restore_generation: 0,
-            catalog_path: None,
+            restored_from: RestoredCatalog::default(),
             views: HashMap::new(),
             persist_generation: 0,
             persisted: Arc::new(Mutex::new(0)),
+            live_generation: 0,
             in_callback: 0,
         });
         let weak = registry.downgrade();
@@ -471,13 +499,15 @@ impl ModuleRegistry {
         }
         let host = {
             let r = this.read(cx);
-            ModuleHost::new(meta.clone(), r.app.clone(), r.model.clone(), r.shell.clone()).with_images(r.images.clone())
+            ModuleHost::new(meta.clone(), r.app.clone(), r.restored_from.clone(), r.model.clone(), r.shell.clone())
+                .with_images(r.images.clone())
         };
         match Self::in_module(this, cx, |cx| module.load(host, cx)) {
             Ok(instance) => {
                 let contributions = instance.contributions();
-                let live = Live { instance: Rc::new(RefCell::new(instance)), contributions };
                 this.update(cx, |r, cx| {
+                    r.live_generation += 1;
+                    let live = Live { instance: Rc::new(RefCell::new(instance)), contributions, generation: r.live_generation };
                     if let Some(entry) = r.entry_mut(id) {
                         entry.live = Some(live);
                     }
@@ -515,8 +545,9 @@ impl ModuleRegistry {
             return false;
         }
         let Some(name) = name else { return true };
+        let made_on = this.read(cx).model.read(cx).catalog_identity();
         this.update(cx, |r, cx| {
-            r.queued.push((id.to_string(), enable));
+            r.queued.push(Queued { id: id.to_string(), enable, made_on });
             cx.notify();
         });
         let verb = if enable { "enabled" } else { "disabled" };
@@ -594,7 +625,7 @@ impl ModuleRegistry {
         let csv = self.enabled_ids_in_dep_order().iter().map(|id| id.as_ref()).collect::<Vec<_>>().join(",");
         let app = self.app.clone();
         let persisted = self.persisted.clone();
-        let catalog = self.catalog_path.clone();
+        let from = self.restored_from.get();
         cx.background_executor()
             .spawn(async move {
                 let mut newest = persisted.lock().unwrap_or_else(|e| e.into_inner());
@@ -602,16 +633,17 @@ impl ModuleRegistry {
                     return;
                 }
                 *newest = generation;
-                let written = with_catalog(&app, |c| match &catalog {
-                    // Under the catalog lock, so no switch can come between check and write.
-                    Some(path) if c.db_path() != path.as_path() => Ok(false),
-                    _ => c.set_setting(ENABLED_KEY, &csv).map(|()| true),
-                });
-                if let Ok(false) = written {
-                    eprintln!("modules: not saving the enabled modules: the catalog was switched");
-                }
-                if let Err(e) = written {
-                    eprintln!("modules: could not save the enabled modules: {e}");
+                let Some(from) = from else {
+                    eprintln!("modules: not saving the enabled modules: the open catalog's set was never read");
+                    return;
+                };
+                // The identity check and the write share one catalog lock: no switch fits between.
+                match with_catalog_as(&app, from, |c| c.set_setting(ENABLED_KEY, &csv)) {
+                    Ok(()) => {}
+                    Err(e) if e == CATALOG_CHANGED => {
+                        eprintln!("modules: not saving the enabled modules: the catalog was switched")
+                    }
+                    Err(e) => eprintln!("modules: could not save the enabled modules: {e}"),
                 }
             })
             .detach();
@@ -630,7 +662,7 @@ impl ModuleRegistry {
         });
         let app = this.read(cx).app.clone();
         let read = cx.background_executor().spawn(async move {
-            with_catalog(&app, |c| Ok((c.get_setting(ENABLED_KEY)?, c.db_path().to_path_buf())))
+            with_catalog_identified(&app, |c| c.get_setting(ENABLED_KEY))
         });
         let weak = this.downgrade();
         cx.spawn(async move |cx| {
@@ -640,9 +672,10 @@ impl ModuleRegistry {
                 if this.read(cx).restore_generation != generation {
                     return; // the catalog was switched while reading: the new one's read follows
                 }
+                let read_from = read.as_ref().ok().map(|(from, _)| *from);
                 match read {
-                    Ok((csv, path)) => {
-                        this.update(cx, |r, _| r.catalog_path = Some(path));
+                    Ok((from, csv)) => {
+                        this.read(cx).restored_from.set(Some(from));
                         if let Some(csv) = csv {
                             let listed: Vec<&str> = csv.split(',').filter(|id| !id.is_empty()).collect();
                             // Dependents first, so a cascade finds nothing left to do.
@@ -658,15 +691,20 @@ impl ModuleRegistry {
                     }
                     Err(e) => eprintln!("modules: could not read the enabled modules: {e}"),
                 }
-                let queued = this.update(cx, |r, _| {
+                let (queued, foreign): (Vec<Queued>, Vec<Queued>) = this.update(cx, |r, _| {
                     r.restore = Restore::Done;
-                    std::mem::take(&mut r.queued)
+                    // Only the toggles made against the catalog this restore read (or before
+                    // any read): a core switch may have published another under the UI.
+                    std::mem::take(&mut r.queued).into_iter().partition(|q| q.made_on.is_none() || q.made_on == read_from)
                 });
-                for (id, enable) in &queued {
-                    if *enable {
-                        Self::enable_inner(&this, id, false, &mut HashSet::new(), cx);
+                if !foreign.is_empty() {
+                    Self::report_dropped(&this, foreign.len(), cx);
+                }
+                for q in &queued {
+                    if q.enable {
+                        Self::enable_inner(&this, &q.id, false, &mut HashSet::new(), cx);
                     } else {
-                        Self::disable_inner(&this, id, false, cx);
+                        Self::disable_inner(&this, &q.id, false, cx);
                     }
                 }
                 this.update(cx, |r, cx| {
@@ -681,13 +719,27 @@ impl ModuleRegistry {
     }
 
     /// A catalog switch: the saved set is the new catalog's, read on the model's next catalog
-    /// read; until then toggles queue, and a read still running for the old one is dropped.
+    /// read; until then toggles queue, and a read still running for the old one is dropped —
+    /// as are the toggles queued for the old one (see the module docs).
     fn catalog_switched(this: &Entity<Self>, cx: &mut App) {
-        this.update(cx, |r, _| {
+        let dropped = this.update(cx, |r, cx| {
             r.restore = Restore::Waiting;
             r.restore_generation += 1;
-            r.catalog_path = None;
+            r.restored_from.set(None);
+            let dropped = std::mem::take(&mut r.queued).len();
+            if dropped > 0 {
+                cx.notify();
+            }
+            dropped
         });
+        if dropped > 0 {
+            Self::report_dropped(this, dropped, cx);
+        }
+    }
+
+    fn report_dropped(this: &Entity<Self>, n: usize, cx: &mut App) {
+        let what = if n == 1 { "a module change".to_string() } else { format!("{n} module changes") };
+        Self::report(this, format!("Modules: the catalog changed before its saved modules were read; {what} not applied"), cx);
     }
 
     /// Hand `event` to every enabled module, in registration order. A module disabled by an
@@ -724,8 +776,18 @@ impl ModuleRegistry {
         self.views.len()
     }
 
+    /// Which load of module `id` is live, if it is enabled.
+    fn live_generation(&self, id: &str) -> Option<u64> {
+        self.entry(id).and_then(|e| e.live.as_ref()).map(|l| l.generation)
+    }
+
     /// The view for one contribution in `window`, built on first use and kept until its
     /// module is disabled.
+    ///
+    /// The factory is module code run with no lease on the registry, so it may disable — or
+    /// disable and re-enable — its own module. A view whose module instance is no longer the
+    /// one it was built for is neither cached nor returned (`None`): it would outlive the
+    /// unload, and a re-enabled module would get the old instance's view back.
     fn cached_view(
         this: &Entity<Self>,
         module: &SharedString,
@@ -734,14 +796,23 @@ impl ModuleRegistry {
         factory: &ViewFactory,
         window: &mut Window,
         cx: &mut App,
-    ) -> AnyView {
+    ) -> Option<AnyView> {
         let key = ViewKey { window: window.window_handle().window_id(), module: module.clone(), kind, id: id.clone() };
-        if let Some(view) = this.read(cx).views.get(&key) {
-            return view.clone();
-        }
+        let built_for = {
+            let r = this.read(cx);
+            if let Some(view) = r.views.get(&key) {
+                return Some(view.clone());
+            }
+            r.live_generation(module)?
+        };
         let view = factory(window, cx);
-        this.update(cx, |r, _| r.views.insert(key, view.clone()));
-        view
+        this.update(cx, |r, _| {
+            if r.live_generation(module) != Some(built_for) {
+                return None; // disabled or reloaded while the factory ran
+            }
+            r.views.insert(key, view.clone());
+            Some(view)
+        })
     }
 
     /// The views of the enabled modules' panels at `slot`, in registration order.
@@ -749,9 +820,9 @@ impl ModuleRegistry {
         let panels = this.read(cx).panels(slot);
         panels
             .into_iter()
-            .map(|(module_id, p)| {
-                let view = Self::cached_view(this, &module_id, slot.name(), &p.id, &p.view, window, cx);
-                SlotView { module_id, id: p.id, label: p.label, view }
+            .filter_map(|(module_id, p)| {
+                let view = Self::cached_view(this, &module_id, slot.name(), &p.id, &p.view, window, cx)?;
+                Some(SlotView { module_id, id: p.id, label: p.label, view })
             })
             .collect()
     }
@@ -759,14 +830,14 @@ impl ModuleRegistry {
     /// The view of main view `view_id`, if an enabled module contributes it.
     pub fn main_view(this: &Entity<Self>, view_id: &str, window: &mut Window, cx: &mut App) -> Option<SlotView> {
         let (module_id, v) = this.read(cx).main_views().into_iter().find(|(_, v)| v.id.as_ref() == view_id)?;
-        let view = Self::cached_view(this, &module_id, "main-view", &v.id, &v.view, window, cx);
+        let view = Self::cached_view(this, &module_id, "main-view", &v.id, &v.view, window, cx)?;
         Some(SlotView { module_id, id: v.id, label: v.label, view })
     }
 
     /// The views of one enabled module's settings panels.
     pub fn settings_views(this: &Entity<Self>, module_id: &SharedString, window: &mut Window, cx: &mut App) -> Vec<AnyView> {
         let panels = this.read(cx).settings_panels(module_id);
-        panels.iter().map(|p| Self::cached_view(this, module_id, "settings", &p.id, &p.view, window, cx)).collect()
+        panels.iter().filter_map(|p| Self::cached_view(this, module_id, "settings", &p.id, &p.view, window, cx)).collect()
     }
 
     /// Fresh views of every enabled publish target, for a Publish dialog that is opening.

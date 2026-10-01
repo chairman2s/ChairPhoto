@@ -162,6 +162,8 @@ no configuration needed:
 - A global rate limiter holds a mutex across the sleep, so concurrent callers cannot race
   past the ≤1 req/s limit. The limiter is a global static, so the single-photo and batch
   commands share one budget.
+- Each request gives up after 20 s (`NOMINATIM_TIMEOUT`), so a server that never answers
+  cannot hold a geocode forever.
 
 ### Self-hosting
 

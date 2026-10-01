@@ -255,6 +255,15 @@ pub async fn nominatim_reverse(
     lat: f64,
     lng: f64,
 ) -> Result<GeocodeResult, String> {
+    nominatim_reverse_within(endpoint, lat, lng, NOMINATIM_TIMEOUT).await
+}
+
+/// How long one Nominatim request may take, connect to body. Without it a server that
+/// accepts and never answers held a single-photo geocode, or a whole Geocode all run,
+/// forever.
+pub const NOMINATIM_TIMEOUT: Duration = Duration::from_secs(20);
+
+async fn nominatim_reverse_within(endpoint: &str, lat: f64, lng: f64, timeout: Duration) -> Result<GeocodeResult, String> {
     throttle().await;
 
     let url = format!(
@@ -266,6 +275,7 @@ pub async fn nominatim_reverse(
 
     let resp = reqwest::Client::builder()
         .user_agent(USER_AGENT)
+        .timeout(timeout)
         .build()
         .map_err(|e| format!("geocode: failed to build HTTP client: {e}"))?
         .get(&url)
@@ -1072,6 +1082,29 @@ mod tests {
         // Already cancelled: not even a request.
         let err = geocode_all_to_iptc_with(&state, None, &abort, |_| {}).await.unwrap_err();
         assert_eq!((err.as_str(), requests.load(Ordering::SeqCst)), (GEOCODE_CANCELLED, 1));
+        server.abort();
+    }
+
+    /// Review #119: the Nominatim client had no timeout, so a server that accepts and never
+    /// answers held the geocode forever. A request now fails after its timeout.
+    #[tokio::test]
+    async fn a_silent_nominatim_times_out() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        let server = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                held.push(stream); // accepted, never answered
+            }
+        });
+        assert!(NOMINATIM_TIMEOUT <= Duration::from_secs(30), "{NOMINATIM_TIMEOUT:?}");
+        let started = Instant::now();
+        let outcome =
+            tokio::time::timeout(Duration::from_secs(10), nominatim_reverse_within(&endpoint, 1.0, 2.0, Duration::from_millis(300)))
+                .await;
+        let err = outcome.expect("the request never gave up").unwrap_err();
+        assert!(err.contains("HTTP request failed"), "{err}");
+        assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
         server.abort();
     }
 

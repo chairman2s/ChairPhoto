@@ -46,9 +46,62 @@ pub struct HttpRequest {
     pub if_none_match: Option<String>,
     pub if_modified_since: Option<String>,
     /// Hosts (as [`authority`] names them) a redirect may lead to besides the request's
-    /// own: the other hosts the user allowed. A redirect anywhere else fails the tile
-    /// without contacting that host.
-    pub redirect_hosts: Vec<String>,
+    /// own: the other hosts the user allowed, read **when the redirect arrives**. A redirect
+    /// anywhere else fails the tile without contacting that host.
+    pub redirect_hosts: AllowedHosts,
+}
+
+/// The other hosts the user allowed, shared between the map and every load it started:
+/// [`set`](Self::set) changes the list every pending request consults at its next redirect,
+/// so revoking a host cuts off requests already in flight, not only later ones (gate #119).
+/// `Clone` shares the list; equality compares the hosts.
+#[derive(Clone, Default)]
+pub struct AllowedHosts(Arc<std::sync::RwLock<Arc<[String]>>>);
+
+impl AllowedHosts {
+    pub fn new(hosts: Vec<String>) -> Self {
+        AllowedHosts(Arc::new(std::sync::RwLock::new(Arc::from(hosts))))
+    }
+
+    /// Replace the hosts for every holder of this list. Returns whether they changed.
+    pub fn set(&self, hosts: Vec<String>) -> bool {
+        let mut current = self.0.write().unwrap_or_else(|e| e.into_inner());
+        if **current == *hosts {
+            return false;
+        }
+        *current = Arc::from(hosts);
+        true
+    }
+
+    /// The hosts now.
+    pub fn snapshot(&self) -> Vec<String> {
+        self.0.read().unwrap_or_else(|e| e.into_inner()).to_vec()
+    }
+
+    /// Whether `host` is allowed now.
+    pub fn allows(&self, host: &str) -> bool {
+        self.0.read().unwrap_or_else(|e| e.into_inner()).iter().any(|a| a.eq_ignore_ascii_case(host))
+    }
+}
+
+impl From<Vec<String>> for AllowedHosts {
+    fn from(hosts: Vec<String>) -> Self {
+        AllowedHosts::new(hosts)
+    }
+}
+
+impl PartialEq for AllowedHosts {
+    fn eq(&self, other: &Self) -> bool {
+        self.snapshot() == other.snapshot()
+    }
+}
+
+impl Eq for AllowedHosts {}
+
+impl std::fmt::Debug for AllowedHosts {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list().entries(self.snapshot()).finish()
+    }
 }
 
 /// What came back.
@@ -73,8 +126,8 @@ pub trait TileHttp: Send + Sync + 'static {
 /// **Redirects are followed by hand**, never by reqwest: consent is per host (decision
 /// #118), and reqwest's default policy would follow a tile server's redirect to any host.
 /// Each `Location` is checked before it is requested — the request's own host or one of
-/// [`HttpRequest::redirect_hosts`], `http`/`https` only, at most [`MAX_REDIRECTS`] —
-/// and anything else fails the tile.
+/// [`HttpRequest::redirect_hosts`] as they are at that moment, `http`/`https` only, at most
+/// [`MAX_REDIRECTS`] — and anything else fails the tile.
 pub struct ReqwestHttp {
     client: reqwest::Client,
 }
@@ -92,13 +145,13 @@ impl ReqwestHttp {
 }
 
 /// Where a redirect from `from` to `location` may go, or why not.
-fn redirect_target(from: &reqwest::Url, location: &str, origin: &str, allowed: &[String]) -> Result<reqwest::Url, String> {
+fn redirect_target(from: &reqwest::Url, location: &str, origin: &str, allowed: &AllowedHosts) -> Result<reqwest::Url, String> {
     let next = from.join(location).map_err(|e| format!("the tile server redirected to an invalid URL: {e}"))?;
     if !matches!(next.scheme(), "http" | "https") {
         return Err(format!("the tile server redirected to a {} URL", next.scheme()));
     }
     let host = authority(&next);
-    if host == origin || allowed.iter().any(|a| a.eq_ignore_ascii_case(&host)) {
+    if host == origin || allowed.allows(&host) {
         Ok(next)
     } else {
         Err(format!("the tile server redirected to {host}, which you have not allowed"))
@@ -235,12 +288,13 @@ impl TileFetcher {
     /// exists), else the stale entry. Dropping the future before it reaches the network
     /// (while it waits for a permit) sends nothing.
     pub async fn load(&self, source: &TileSource, key: TileKey) -> Result<LoadedTile, String> {
-        self.load_allowing(source, key, &[]).await
+        self.load_allowing(source, key, &AllowedHosts::default()).await
     }
 
     /// [`load`](Self::load), where a redirect may also lead to `redirect_hosts` (the other
-    /// hosts the user allowed); with none, only to the source's own host.
-    pub async fn load_allowing(&self, source: &TileSource, key: TileKey, redirect_hosts: &[String]) -> Result<LoadedTile, String> {
+    /// hosts the user allowed, consulted when the redirect arrives); with none, only to the
+    /// source's own host.
+    pub async fn load_allowing(&self, source: &TileSource, key: TileKey, redirect_hosts: &AllowedHosts) -> Result<LoadedTile, String> {
         let cached = {
             let (cache, source) = (self.cache.clone(), source.clone());
             tokio::task::spawn_blocking(move || cache.get(&source, key)).await.map_err(|e| e.to_string())?
@@ -257,7 +311,7 @@ impl TileFetcher {
                 url: source.url(key),
                 if_none_match: cached.as_ref().and_then(|c| c.meta.etag.clone()),
                 if_modified_since: cached.as_ref().and_then(|c| c.meta.last_modified.clone()),
-                redirect_hosts: redirect_hosts.to_vec(),
+                redirect_hosts: redirect_hosts.clone(),
             };
             self.http.get(request).await
         };
@@ -612,7 +666,7 @@ mod tests {
         .await;
         let http = ReqwestHttp::new().unwrap();
         let get = |path: &str, allowed: Vec<String>| {
-            http.get(HttpRequest { url: format!("http://{origin}{path}"), redirect_hosts: allowed, ..Default::default() })
+            http.get(HttpRequest { url: format!("http://{origin}{path}"), redirect_hosts: allowed.into(), ..Default::default() })
         };
 
         let err = get("/away", Vec::new()).await.unwrap_err();
@@ -626,7 +680,7 @@ mod tests {
         assert_eq!((allowed.status, allowed.body.as_slice()), (200, &b"else"[..]));
         assert_eq!(elsewhere_hits.load(Ordering::SeqCst), 1);
 
-        let to_file = redirect_target(&reqwest::Url::parse("http://h.org/a").unwrap(), "file:///etc/passwd", "h.org", &[]);
+        let to_file = redirect_target(&reqwest::Url::parse("http://h.org/a").unwrap(), "file:///etc/passwd", "h.org", &AllowedHosts::default());
         assert!(to_file.unwrap_err().contains("file URL"));
         s1.abort();
         s2.abort();
@@ -660,7 +714,7 @@ mod tests {
                 url: src.url(K),
                 if_none_match: Some("\"e1\"".into()),
                 if_modified_since: Some("Mon, 31 Aug 2026 00:00:00 GMT".into()),
-                redirect_hosts: Vec::new(),
+                redirect_hosts: AllowedHosts::default(),
             })
             .await
             .unwrap();

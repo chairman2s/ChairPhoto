@@ -22,7 +22,7 @@
 //!   its own tiles in a loop. An evicted or cleared tile is released from every window's
 //!   sprite atlas with `drop_image` (deferred: it may be evicted inside a render).
 
-use chairphoto_core::plugins::map::tiles::fetch::TileFetcher;
+use chairphoto_core::plugins::map::tiles::fetch::{AllowedHosts, TileFetcher};
 use chairphoto_core::plugins::map::tiles::{TileKey, TileSource};
 use futures::channel::mpsc::{unbounded, UnboundedReceiver, UnboundedSender};
 use gpui_kit::{App, Global, RenderImage};
@@ -59,8 +59,9 @@ pub trait TileTicket {
 /// Where tiles come from. [`NetTiles`] in the app; a recording fake in tests.
 pub trait TileBackend: Send + Sync {
     /// Load `key` from `source`. A redirect may lead only to the source's own host or to
-    /// one of `redirect_hosts` (the other hosts the user allowed).
-    fn load(&self, source: &TileSource, redirect_hosts: &Arc<[String]>, key: TileKey, respond: TileRespond) -> Box<dyn TileTicket>;
+    /// one of `redirect_hosts` (the other hosts the user allowed) — as the list is when the
+    /// redirect arrives: the layer updates it in place, so keep the shared handle.
+    fn load(&self, source: &TileSource, redirect_hosts: &AllowedHosts, key: TileKey, respond: TileRespond) -> Box<dyn TileTicket>;
 }
 
 /// The installed backend, a GPUI global; absent means [`NetTiles`] (made on first use).
@@ -97,7 +98,7 @@ impl TileTicket for Abort {
 }
 
 impl TileBackend for NetTiles {
-    fn load(&self, source: &TileSource, redirect_hosts: &Arc<[String]>, key: TileKey, respond: TileRespond) -> Box<dyn TileTicket> {
+    fn load(&self, source: &TileSource, redirect_hosts: &AllowedHosts, key: TileKey, respond: TileRespond) -> Box<dyn TileTicket> {
         let (fetcher, source, redirect_hosts) = (self.fetcher.clone(), source.clone(), redirect_hosts.clone());
         let task = chairphoto_core::app::runtime().spawn(async move {
             let result = match fetcher.load_allowing(&source, key, &redirect_hosts).await {
@@ -122,7 +123,7 @@ impl TileTicket for NoTicket {
 }
 
 impl TileBackend for Unavailable {
-    fn load(&self, _: &TileSource, _: &Arc<[String]>, _: TileKey, respond: TileRespond) -> Box<dyn TileTicket> {
+    fn load(&self, _: &TileSource, _: &AllowedHosts, _: TileKey, respond: TileRespond) -> Box<dyn TileTicket> {
         respond(Err(self.0.clone()));
         Box::new(NoTicket)
     }
@@ -159,8 +160,9 @@ pub struct TileStats {
 pub struct TileLayer {
     backend: Arc<dyn TileBackend>,
     source: Option<TileSource>,
-    /// The other hosts the user allowed: where a redirect may also lead.
-    redirect_hosts: Arc<[String]>,
+    /// The other hosts the user allowed: where a redirect may also lead. Shared with every
+    /// pending load, which reads it when a redirect arrives.
+    redirect_hosts: AllowedHosts,
     held: HashMap<TileKey, (Arc<RenderImage>, u64)>,
     order: BTreeMap<u64, TileKey>,
     tick: u64,
@@ -184,7 +186,7 @@ impl TileLayer {
         let layer = TileLayer {
             backend,
             source: None,
-            redirect_hosts: Arc::from(Vec::new()),
+            redirect_hosts: AllowedHosts::default(),
             held: HashMap::new(),
             order: BTreeMap::new(),
             tick: 0,
@@ -237,11 +239,11 @@ impl TileLayer {
     /// Show tiles of `source` from now on; a different source drops everything held and
     /// pending (returned, to be released). `None` = no tiles (no consent).
     /// The other hosts the user allowed (a tile server's redirect may lead there, and
-    /// nowhere else but its own host). Applies to loads started from now on.
+    /// nowhere else but its own host). Updated in place, so it applies to the loads already
+    /// pending too: a host revoked now is not contacted by a redirect that arrives later
+    /// (gate #119), whenever that load started.
     pub fn set_redirect_hosts(&mut self, hosts: Vec<String>) {
-        if *self.redirect_hosts != *hosts {
-            self.redirect_hosts = Arc::from(hosts);
-        }
+        self.redirect_hosts.set(hosts);
     }
 
     pub fn set_source(&mut self, source: Option<TileSource>) -> Vec<Arc<RenderImage>> {
@@ -422,11 +424,11 @@ pub(crate) mod fake {
     }
 
     impl TileBackend for FakeTiles {
-        fn load(&self, source: &TileSource, redirect_hosts: &Arc<[String]>, key: TileKey, respond: TileRespond) -> Box<dyn TileTicket> {
+        fn load(&self, source: &TileSource, redirect_hosts: &AllowedHosts, key: TileKey, respond: TileRespond) -> Box<dyn TileTicket> {
             let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
             self.loads.lock().unwrap().push(Load {
                 host: source.host().to_string(),
-                redirect_hosts: redirect_hosts.to_vec(),
+                redirect_hosts: redirect_hosts.snapshot(),
                 key,
                 respond: Some(respond),
                 cancelled: cancelled.clone(),
@@ -616,6 +618,80 @@ mod tests {
         assert_eq!(fake.answer_all(), 1);
         drain(&mut l, &mut rx);
         assert!(l.get(&key(0)).is_some() && l.retry_in(&key(0)).is_none(), "a success forgets the failures");
+    }
+
+    /// Gate #119 (privacy): the redirect hosts were copied into each load when it started,
+    /// so revoking a host reached only later loads — a request already in flight to allowed
+    /// host A could still follow A's redirect to the just-revoked B. **Forced interleaving**,
+    /// over loopback through the real backend: the load reaches A and A holds its answer; B
+    /// is revoked; only then does A redirect to B. B is never contacted and the tile fails.
+    #[test]
+    fn revoking_a_host_cuts_off_a_pending_loads_redirect_to_it() {
+        use chairphoto_core::plugins::map::tiles::cache::{TileCache, DEFAULT_CAP_BYTES};
+        use chairphoto_core::plugins::map::tiles::fetch::{ReqwestHttp, MAX_CONCURRENT};
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::mpsc;
+
+        // B: the host about to be revoked. Counts every connection.
+        let b = TcpListener::bind("127.0.0.1:0").unwrap();
+        let b_host = format!("127.0.0.1:{}", b.local_addr().unwrap().port());
+        let b_hits = Arc::new(AtomicUsize::new(0));
+        let hits = b_hits.clone();
+        std::thread::spawn(move || {
+            for stream in b.incoming() {
+                let Ok(mut stream) = stream else { break };
+                hits.fetch_add(1, Ordering::SeqCst);
+                let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+            }
+        });
+        // A: the allowed source. Says when the request arrived, then waits to redirect to B.
+        let a = TcpListener::bind("127.0.0.1:0").unwrap();
+        let a_host = format!("127.0.0.1:{}", a.local_addr().unwrap().port());
+        let (arrived_tx, arrived) = mpsc::channel();
+        let (release, release_rx) = mpsc::channel::<()>();
+        let target = b_host.clone();
+        std::thread::spawn(move || {
+            let (mut stream, _) = a.accept().unwrap();
+            let mut request = Vec::new();
+            let mut buf = [0u8; 1024];
+            while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                match stream.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => request.extend_from_slice(&buf[..n]),
+                }
+            }
+            arrived_tx.send(()).unwrap();
+            let _ = release_rx.recv();
+            let answer = format!("HTTP/1.1 302 Found\r\nLocation: http://{target}/tile.png\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+            let _ = stream.write_all(answer.as_bytes());
+        });
+
+        let dir = crate::tests::TempDir::new("map-revoke");
+        let cache = Arc::new(TileCache::new(dir.0.join("tiles"), DEFAULT_CAP_BYTES));
+        let fetcher = TileFetcher::new(Arc::new(ReqwestHttp::new().unwrap()), cache, MAX_CONCURRENT);
+        let (mut l, mut rx) = TileLayer::new(Arc::new(NetTiles { fetcher }), 8);
+        l.set_source(Some(TileSource::parse(&format!("http://{a_host}/{{z}}/{{x}}/{{y}}.png")).unwrap()));
+        l.set_redirect_hosts(vec![b_host.clone()]);
+        l.want(&[key(0)]);
+        arrived.recv_timeout(Duration::from_secs(10)).expect("the load reached A");
+
+        l.set_redirect_hosts(Vec::new()); // the user revokes B while the load is pending
+        release.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let done = loop {
+            if let Ok(done) = rx.try_recv() {
+                break done;
+            }
+            assert!(Instant::now() < deadline, "the load never finished");
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        let err = done.result.as_ref().map(|_| ()).expect_err("the tile loaded through the revoked host");
+        assert!(err.contains(&format!("redirected to {b_host}, which you have not allowed")), "{err}");
+        assert_eq!(b_hits.load(Ordering::SeqCst), 0, "the revoked host was contacted");
+        l.complete(done);
+        assert_eq!(l.last_error().map(|e| e.contains("not allowed")), Some(true));
     }
 
     #[test]

@@ -237,6 +237,13 @@ fn ensure_private_dir(dir: &Path, uid: u32) -> io::Result<()> {
         Err(e) if matches!(e.raw_os_error(), Some(libc::ELOOP) | Some(libc::ENOTDIR)) => {
             return Err(refuse("not a directory (or a symlink)"))
         }
+        // It exists but we may not open it: most likely someone else's (a `0700` directory of
+        // another user under the shared `/tmp` fallback). Its owner cannot be checked through
+        // a descriptor we cannot get, and it is no place to coordinate (Codex re-check of
+        // 252368e).
+        Err(e) if matches!(e.raw_os_error(), Some(libc::EACCES) | Some(libc::EPERM)) => {
+            return Err(refuse(&format!("it cannot be opened ({e}); it may belong to another user")))
+        }
         Err(e) => return Err(e),
     };
     let meta = handle.metadata()?;
@@ -1025,6 +1032,14 @@ mod tests {
             assert!(is_unsafe_dir(&e), "{} not told apart: {e}", path.display());
             assert!(e.to_string().contains("remove it"), "{e}");
         }
+        // Genuinely unreadable (as another user's 0700 dir is to us): open fails with EACCES
+        // before any ownership check can run, and that must count as unsafe too.
+        let unreadable = dir.0.join("unreadable");
+        std::fs::create_dir(&unreadable).unwrap();
+        std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let e = ensure_private_dir(&unreadable, uid).unwrap_err();
+        std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(is_unsafe_dir(&e), "an unreadable dir not told apart: {e}");
         let missing_parent = dir.0.join("no/such/parent");
         let e = ensure_private_dir(&missing_parent, uid).unwrap_err();
         assert!(!is_unsafe_dir(&e), "an ordinary failure taken for an unsafe dir: {e}");

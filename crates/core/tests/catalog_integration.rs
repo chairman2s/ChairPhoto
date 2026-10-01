@@ -3542,7 +3542,7 @@ fn catalog_stats_cull_survival_and_exposure_crossings() {
     assert!((astats.cull_by_shutter[0].key - 0.004).abs() < 1e-9);
     assert_eq!(astats.cull_by_shutter[0].total, 1);
 
-    // --- nonexistent tag scope: the empty_stats path ------------------------
+    // --- nonexistent tag scope: the zeroed (`Default`) path ------------------------
     let estats = catalog.catalog_stats(Some(999_999), None, None).unwrap();
     assert_eq!(estats.picked, 0);
     assert_eq!(estats.rejected, 0);

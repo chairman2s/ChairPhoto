@@ -18,7 +18,10 @@ use std::collections::{BTreeMap, HashMap};
 /// Excluded photos are surfaced separately via `invalid_dates`.
 const SANE_DATE_FLOOR: &str = "1950";
 
-/// Raw statistics gathered from the catalog in one lock acquisition.
+/// Raw statistics gathered from the catalog in one lock acquisition. The Tauri shell
+/// serialises it (`commands/graph.rs`); the GPUI Statistics module reads it as is.
+/// `Default` is the zeroed result of an empty scope.
+#[derive(Debug, Clone)]
 pub struct CatalogStatsRaw {
     pub total_photos: i64,
     pub with_capture_time: i64,
@@ -72,6 +75,7 @@ pub struct CatalogStatsRaw {
 ///
 /// Named `cull_*`, not `keeper_*` — "keeper" is taken by burst-stack proposals
 /// (`commands/culling.rs::keeper_reason`), which are unrelated.
+#[derive(Debug, Clone, PartialEq)]
 pub struct CullCross<K> {
     /// Raw grouped value (lens/camera string, focal mm, ISO, f-number, seconds).
     pub key: K,
@@ -109,7 +113,7 @@ impl Catalog {
             let ids = self.descendant_tag_ids(tid)?;
             if ids.is_empty() {
                 // tag doesn't exist — scope is empty, return zeroed stats
-                return Ok(empty_stats());
+                return Ok(CatalogStatsRaw::default());
             }
             let id_list = ids
                 .iter()
@@ -531,32 +535,34 @@ fn parse_shutter_groups(raw: Vec<CullCross<String>>) -> Vec<CullCross<f64>> {
     merged
 }
 
-/// Return a zeroed `CatalogStatsRaw` — used when the scope resolves to nothing
+/// Zeroed statistics — what a scope that resolves to nothing returns
 /// (e.g. a `tag_id` that doesn't exist in the catalog).
-fn empty_stats() -> CatalogStatsRaw {
-    CatalogStatsRaw {
-        total_photos: 0,
-        with_capture_time: 0,
-        first_month: None,
-        last_month: None,
-        timeline: Vec::new(),
-        hours: vec![0i64; 24],
-        weekdays: vec![0i64; 7],
-        top_tags: Vec::new(),
-        cameras: Vec::new(),
-        lenses: Vec::new(),
-        focal_lengths: Vec::new(),
-        ratings: vec![0i64; 6],
-        top_days: Vec::new(),
-        invalid_dates: 0,
-        picked: 0,
-        rejected: 0,
-        cull_by_lens: Vec::new(),
-        cull_by_camera: Vec::new(),
-        cull_by_focal: Vec::new(),
-        cull_by_iso: Vec::new(),
-        cull_by_aperture: Vec::new(),
-        cull_by_shutter: Vec::new(),
+impl Default for CatalogStatsRaw {
+    fn default() -> Self {
+        CatalogStatsRaw {
+            total_photos: 0,
+            with_capture_time: 0,
+            first_month: None,
+            last_month: None,
+            timeline: Vec::new(),
+            hours: vec![0i64; 24],
+            weekdays: vec![0i64; 7],
+            top_tags: Vec::new(),
+            cameras: Vec::new(),
+            lenses: Vec::new(),
+            focal_lengths: Vec::new(),
+            ratings: vec![0i64; 6],
+            top_days: Vec::new(),
+            invalid_dates: 0,
+            picked: 0,
+            rejected: 0,
+            cull_by_lens: Vec::new(),
+            cull_by_camera: Vec::new(),
+            cull_by_focal: Vec::new(),
+            cull_by_iso: Vec::new(),
+            cull_by_aperture: Vec::new(),
+            cull_by_shutter: Vec::new(),
+        }
     }
 }
 

@@ -12,6 +12,11 @@
 //! - **Writes** are what the caller performs ([`Verdict::writes`]): pick and reject marks
 //!   through `ShellState`'s culling queue, bound to the catalog the pool was read from
 //!   (`ShellState` keeps that identity next to the session).
+//! - **A verdict moves on only once written.** [`CompareSession::verdict`] and
+//!   [`CompareSession::keep`] leave the session where it is and hold further verdicts until
+//!   the caller [`settle`](CompareSession::settle)s that one: written, the duel advances (or
+//!   the grid pages on); failed, it stays on the same pair (React awaited `applyMark` before
+//!   it moved the duel on).
 
 use chairphoto_core::catalog::PickState;
 use chairphoto_model::compare_duel::{advance_duel, duel_round, duel_total_rounds, initial_duel, DuelSide, DuelState};
@@ -48,10 +53,20 @@ impl CompareMode {
     }
 }
 
-/// The marks one Compare decision writes, in order.
+/// The marks one Compare decision writes, in order, and where the session goes once they
+/// are written ([`CompareSession::settle`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Verdict {
     pub writes: Vec<(i64, PickState)>,
+    next: Advance,
+}
+
+/// Where a settled verdict takes the session, from the state it was decided in: a verdict
+/// whose session has since moved (a mode switch) changes nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Advance {
+    Duel { from: DuelState, to: DuelState },
+    Grid { from_start: usize, keeper: i64 },
 }
 
 /// An open Compare. See the module docs.
@@ -63,6 +78,8 @@ pub struct CompareSession {
     mode: CompareMode,
     duel: DuelState,
     focus: Option<i64>,
+    /// A verdict is being written: no other is decided until it settles.
+    pending: bool,
 }
 
 impl CompareSession {
@@ -85,6 +102,7 @@ impl CompareSession {
             mode,
             duel: initial_duel(),
             focus: Some(focus),
+            pending: false,
         })
     }
 
@@ -162,6 +180,8 @@ impl CompareSession {
     /// nothing across modes); the grid keeps its page.
     pub fn switch_mode(&mut self, mode: CompareMode) {
         self.mode = mode;
+        // A verdict still being written was decided in the old mode; settling it is a no-op.
+        self.pending = false;
         self.duel = initial_duel();
         self.focus = match mode {
             CompareMode::Duel => self.pool.get(1).or(self.pool.first()).copied(),
@@ -184,11 +204,17 @@ impl CompareSession {
         true
     }
 
-    /// One duel verdict: the loser is rejected; on the last round the winner is picked.
-    /// The focus moves to the next challenger (the winner once done). `None` when there is
-    /// nothing to decide (grid mode, a finished duel).
+    /// Whether a verdict is being written.
+    pub fn pending(&self) -> bool {
+        self.pending
+    }
+
+    /// One duel verdict: the loser is rejected; on the last round the winner is picked. Once
+    /// [settled](Self::settle) as written, the focus moves to the next challenger (the winner
+    /// once done). `None` when there is nothing to decide (grid mode, a finished duel, a
+    /// verdict still being written).
     pub fn verdict(&mut self, side: DuelSide) -> Option<Verdict> {
-        if self.mode != CompareMode::Duel {
+        if self.mode != CompareMode::Duel || self.pending {
             return None;
         }
         let result = advance_duel(&self.pool, &self.duel, side)?;
@@ -196,29 +222,48 @@ impl CompareSession {
         if let Some(winner) = result.winner_id {
             writes.push((winner, PickState::Pick));
         }
-        self.duel = result.next;
-        let focus_idx = if self.duel.done { self.duel.champion_idx } else { self.duel.challenger_idx };
-        self.focus = self.pool.get(focus_idx).copied();
-        Some(Verdict { writes })
+        self.pending = true;
+        Some(Verdict { writes, next: Advance::Duel { from: self.duel, to: result.next } })
+    }
+
+    /// The writes of `verdict` landed (`written`) or failed. Written, the session moves on —
+    /// unless it has moved since the verdict was decided; failed, it stays where it was.
+    /// Either way the next verdict may be decided.
+    pub fn settle(&mut self, verdict: &Verdict, written: bool) {
+        self.pending = false;
+        if !written {
+            return;
+        }
+        match verdict.next {
+            Advance::Duel { from, to } if self.mode == CompareMode::Duel && self.duel == from => {
+                self.duel = to;
+                let focus_idx = if to.done { to.champion_idx } else { to.challenger_idx };
+                self.focus = self.pool.get(focus_idx).copied();
+            }
+            Advance::Grid { from_start, keeper } if self.mode == CompareMode::Grid && self.start == from_start => {
+                self.focus = Some(keeper);
+                self.page(1);
+            }
+            _ => {}
+        }
     }
 
     /// "Keep this" / K on `keeper`. In a duel it is the verdict for that pane's side. In the
     /// grid the keeper is picked and its on-screen rivals rejected — the batch, never the
-    /// whole pool — then the next batch comes up.
+    /// whole pool — then, once [settled](Self::settle) as written, the next batch comes up.
     pub fn keep(&mut self, keeper: i64) -> Option<Verdict> {
         if self.mode == CompareMode::Duel {
             let side = if Some(keeper) == self.champion() { DuelSide::Left } else { DuelSide::Right };
             return self.verdict(side);
         }
         let batch = self.batch();
-        if !batch.contains(&keeper) {
+        if self.pending || !batch.contains(&keeper) {
             return None;
         }
         let mut writes = vec![(keeper, PickState::Pick)];
         writes.extend(batch.iter().filter(|&&id| id != keeper).map(|&id| (id, PickState::Reject)));
-        self.focus = Some(keeper);
-        self.page(1);
-        Some(Verdict { writes })
+        self.pending = true;
+        Some(Verdict { writes, next: Advance::Grid { from_start: self.start, keeper } })
     }
 }
 
@@ -263,11 +308,13 @@ mod tests {
             v.writes,
             vec![(3, PickState::Pick), (1, PickState::Reject), (2, PickState::Reject), (4, PickState::Reject)]
         );
+        s.settle(&v, true);
         assert_eq!((s.batch(), s.focus()), (vec![5, 6], Some(5)));
         assert!(s.keep(1).is_none(), "not on screen");
         // On the last batch keep stays put.
         let v = s.keep(6).unwrap();
         assert_eq!(v.writes, vec![(6, PickState::Pick), (5, PickState::Reject)]);
+        s.settle(&v, true);
         assert_eq!((s.start(), s.focus()), (4, Some(6)));
     }
 
@@ -277,13 +324,38 @@ mod tests {
         assert_eq!(s.duel_progress(), (1, 2));
         let v = s.verdict(DuelSide::Right).unwrap();
         assert_eq!(v.writes, vec![(1, PickState::Reject)]);
+        s.settle(&v, true);
         assert_eq!((s.batch(), s.champion(), s.focus()), (vec![2, 3], Some(2), Some(3)));
         // K on the champion's pane is a left verdict.
         let v = s.keep(2).unwrap();
         assert_eq!(v.writes, vec![(3, PickState::Reject), (2, PickState::Pick)]);
+        s.settle(&v, true);
         assert!(s.duel().done);
         assert_eq!((s.batch(), s.focus()), (vec![2], Some(2)));
         assert!(s.verdict(DuelSide::Left).is_none(), "done");
+    }
+
+    #[test]
+    fn a_verdict_moves_on_only_once_written_and_holds_the_next_until_then() {
+        let mut s = CompareSession::open(&[1, 2, 3], None, CompareMode::Duel).unwrap();
+        let v = s.verdict(DuelSide::Right).unwrap();
+        assert_eq!((s.batch(), s.focus()), (vec![1, 2], Some(2)), "not before the write lands");
+        assert!(s.verdict(DuelSide::Left).is_none() && s.keep(1).is_none(), "one verdict at a time");
+        s.settle(&v, false);
+        assert_eq!((s.batch(), s.duel_progress()), (vec![1, 2], (1, 2)), "a failed write stays on the pair");
+        let v = s.verdict(DuelSide::Right).unwrap();
+        s.settle(&v, true);
+        assert_eq!((s.batch(), s.focus()), (vec![2, 3], Some(3)));
+        // A verdict decided before a mode switch changes nothing when it settles.
+        let v = s.verdict(DuelSide::Left).unwrap();
+        s.switch_mode(CompareMode::Grid);
+        s.settle(&v, true);
+        assert_eq!((s.mode(), s.start(), s.duel_progress().0), (CompareMode::Grid, 0, 1));
+        // The grid pages on only once its Keep is written.
+        let mut g = grid(&(1..=6).collect::<Vec<_>>(), None);
+        let v = g.keep(2).unwrap();
+        g.settle(&v, false);
+        assert_eq!((g.start(), g.focus()), (0, Some(1)));
     }
 
     #[test]
@@ -306,7 +378,8 @@ mod tests {
         let mut s = grid(&ids, Some(6));
         s.switch_mode(CompareMode::Duel);
         assert_eq!((s.batch(), s.focus()), (vec![1, 2], Some(2)));
-        s.verdict(DuelSide::Left);
+        let v = s.verdict(DuelSide::Left).unwrap();
+        s.settle(&v, true);
         s.switch_mode(CompareMode::Grid);
         assert_eq!((s.start(), s.batch(), s.focus()), (4, vec![5, 6], Some(5)));
         assert!(!s.duel().done && s.duel_progress().0 == 1);

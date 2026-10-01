@@ -148,26 +148,36 @@ impl LoupeView {
         showing.then(|| shell.loupe_target().cloned()).flatten()
     }
 
-    /// Follow the target: show it, and on a change ask for it first, then its neighbours.
+    /// Follow the target: show it, and on a change ask for it first, then its neighbours. The
+    /// photo left gives up its full-resolution tier — pending or loaded; the target keeps its.
     fn sync(&mut self, cx: &mut Context<Self>) {
         let target = self.target(cx).map(|p| p.id);
         self.zoom.update(cx, |z, cx| z.set_photo(target, cx));
         if target != self.navigated {
-            self.navigated = target;
+            let left = std::mem::replace(&mut self.navigated, target);
             let rows = self.shell.read(cx).library.photo_ids();
-            self.images.update(cx, |store, _| match target {
-                Some(id) => {
-                    match rows.iter().position(|&r| r == id) {
-                        Some(index) => {
-                            store.navigate_window(&rows, index, ImageKind::Preview, PRELOAD_AHEAD, PRELOAD_BEHIND)
-                        }
-                        // Off-grid (a stacked child): just this one.
-                        None => store.navigate_window(&[id], 0, ImageKind::Preview, 0, 0),
-                    }
-                    store.release_pending(|k| k.kind != ImageKind::Zoom || k.photo == id);
+            self.images.update(cx, |store, cx| {
+                if let Some(left) = left {
+                    store.evict(|k| k.kind == ImageKind::Zoom && k.photo == left, cx);
                 }
-                // Closed: the grid's thumbnails come first again.
-                None => store.release_pending(|k| k.kind == ImageKind::Thumb),
+                match target {
+                    Some(id) => {
+                        match rows.iter().position(|&r| r == id) {
+                            Some(index) => store.navigate_window(
+                                &rows,
+                                index,
+                                ImageKind::Preview,
+                                PRELOAD_AHEAD,
+                                PRELOAD_BEHIND,
+                            ),
+                            // Off-grid (a stacked child): just this one.
+                            None => store.navigate_window(&[id], 0, ImageKind::Preview, 0, 0),
+                        }
+                        store.release_pending(|k| k.kind != ImageKind::Zoom || k.photo == id);
+                    }
+                    // Closed: the grid's thumbnails come first again.
+                    None => store.release_pending(|k| k.kind == ImageKind::Thumb),
+                }
             });
         }
         #[cfg(feature = "edit")]
@@ -396,6 +406,11 @@ impl Render for LoupeView {
             .on_action(cx.listener(|this, _: &SelectPrevious, _, cx| this.step(-1, false, cx)))
             .on_action(cx.listener(|this, _: &ExtendNext, _, cx| this.step(1, true, cx)))
             .on_action(cx.listener(|this, _: &ExtendPrevious, _, cx| this.step(-1, true, cx)))
+            // Select every photo in the view, keeping the one shown active (React's grid handler,
+            // which stayed live under the inline loupe).
+            .on_action(cx.listener(|this, _: &SelectAll, _, cx| {
+                this.shell.update(cx, |s, cx| s.select_with(cx, |l| l.select_all()))
+            }))
             .on_action(cx.listener(|this, _: &CloseLoupe, _, cx| this.shell.update(cx, |s, cx| s.set_loupe(false, cx))))
             .on_action(cx.listener(|this, _: &CompareSelection, window, cx| {
                 if this.shell.read(cx).library.selection().ids.len() >= 2 {

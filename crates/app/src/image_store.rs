@@ -486,6 +486,17 @@ impl ImageStore {
         self.submit(&wanted, true);
     }
 
+    /// Drop the cached images `matches` selects and release their textures. For what a view
+    /// is done with and the LRU would otherwise keep: a full-resolution tier (180–245 MB for a
+    /// typical RAW) costs hundreds of thumbnails while it waits for eviction.
+    pub fn evict(&mut self, matches: impl FnMut(&ImageKey) -> bool, cx: &mut Context<Self>) {
+        let gone = self.lru.remove_where(matches);
+        if !gone.is_empty() {
+            self.release(gone, cx);
+            cx.notify();
+        }
+    }
+
     /// A photo's pixels changed (rotation, cover version): drop what is cached for it, and
     /// make its pending requests stale. The next request renders it again.
     pub fn invalidate(&mut self, photo: i64, cx: &mut Context<Self>) {

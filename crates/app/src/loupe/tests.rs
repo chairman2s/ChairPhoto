@@ -16,11 +16,12 @@ use crate::tests::{
 };
 use crate::view::RootView;
 use chairphoto_core::app::EventSink as _;
-use chairphoto_core::catalog::PickState;
+use chairphoto_core::catalog::{CullingFilter, PickState};
 use chairphoto_core::image_pool::{ImageKind, JobKey};
 use gpui_kit::test::TestWindowExt as _;
 use gpui_kit::{
-    point, AppContext as _, Entity, InputEvent as _, Modifiers, ScrollDelta, ScrollWheelEvent, TestAppContext, TouchPhase,
+    point, AppContext as _, Entity, InputEvent as _, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, ScrollDelta, ScrollWheelEvent, TestAppContext, TouchPhase,
 };
 use std::cell::RefCell;
 use std::path::PathBuf;
@@ -217,6 +218,48 @@ fn zooming_in_swaps_to_the_zoom_tier_and_stepping_releases_it(cx: &mut TestAppCo
     assert!(pool.cancelled.lock().unwrap().contains(&zoom_key(ids[1])), "the old zoom tier is released");
 }
 
+fn cached(app: &App, id: i64, kind: ImageKind, cx: &mut TestAppContext) -> bool {
+    app.wired.images.read_with(cx, |s, _| s.lru().peek(&s.key(id, kind)).is_some())
+}
+
+/// Stepping away releases the loaded full-resolution tier of the photo left, not just a
+/// pending one; its preview stays cached, and the new photo's own zoom tier is kept.
+#[gpui_kit::test]
+fn stepping_away_evicts_the_loaded_zoom_tier_of_the_photo_left(cx: &mut TestAppContext) {
+    let (app, pool, _dir, ids) = app_with(3, "loupe-evict", cx);
+    select(&app, ids[0], cx);
+    press(&app, "enter", cx);
+    pool.finish(&preview(ids[0]), Ok(pixels(300, 200)));
+    cx.run_until_parked();
+    wheel(&app, "loupe-image", true, cx);
+    pool.finish(&zoom_key(ids[0]), Ok(pixels(3000, 2000)));
+    cx.run_until_parked();
+    assert!(cached(&app, ids[0], ImageKind::Zoom, cx), "the zoom tier is in");
+
+    press(&app, "right", cx);
+    assert!(!cached(&app, ids[0], ImageKind::Zoom, cx), "released with the step");
+    assert!(cached(&app, ids[0], ImageKind::Preview, cx), "the preview stays for a step back");
+
+    pool.finish(&preview(ids[1]), Ok(pixels(300, 200)));
+    cx.run_until_parked();
+    wheel(&app, "loupe-image", true, cx);
+    pool.finish(&zoom_key(ids[1]), Ok(pixels(3000, 2000)));
+    cx.run_until_parked();
+    // A re-sync that is no step (a render, a shell change) keeps the target's tier.
+    app.wired.shell.update(cx, |_, cx| cx.notify());
+    render(&app, cx);
+    assert!(cached(&app, ids[1], ImageKind::Zoom, cx), "the target keeps its own");
+    // Stepping onto a photo whose zoom tier is already in (another view loaded it) keeps it.
+    app.wired.images.update(cx, |s, _| s.request(ids[2], ImageKind::Zoom));
+    pool.finish(&zoom_key(ids[2]), Ok(pixels(3000, 2000)));
+    cx.run_until_parked();
+    press(&app, "right", cx);
+    assert!(!cached(&app, ids[1], ImageKind::Zoom, cx));
+    assert!(cached(&app, ids[2], ImageKind::Zoom, cx), "the target's tier is kept");
+    press(&app, "escape", cx);
+    assert!(!cached(&app, ids[2], ImageKind::Zoom, cx), "closing the loupe leaves the photo too");
+}
+
 /// A double-click at fit waits for the full-resolution image, then shows it at 100 %.
 #[gpui_kit::test]
 fn a_double_click_waits_for_the_zoom_tier_then_shows_100_percent(cx: &mut TestAppContext) {
@@ -263,6 +306,19 @@ fn loupe_keys_mark_advance_and_close(cx: &mut TestAppContext) {
     assert_eq!(stage(&app, cx), StageView::Loupe);
     press(&app, "enter", cx);
     assert_eq!(stage(&app, cx), StageView::Grid, "Enter toggles");
+}
+
+/// Ctrl+A in the loupe selects every photo in the view, as in the grid, and the loupe stays
+/// on the photo it showed.
+#[gpui_kit::test]
+fn ctrl_a_in_the_loupe_selects_the_whole_view(cx: &mut TestAppContext) {
+    let (app, _pool, _dir, ids) = app_with(4, "loupe-all", cx);
+    select(&app, ids[2], cx);
+    press(&app, "enter", cx);
+    press(&app, "ctrl-a", cx);
+    let selected = app.wired.shell.read_with(cx, |s, _| s.library.selection().ids.to_vec());
+    assert_eq!(selected, ids);
+    assert_eq!((active(&app, cx), stage(&app, cx)), (Some(ids[2]), StageView::Loupe));
 }
 
 /// A video shows its poster and hands the file to the system player.
@@ -392,6 +448,73 @@ fn compare_panes_share_one_pan_and_zoom(cx: &mut TestAppContext) {
     assert_eq!(shared.read_with(cx, |s, _| s.view), ZoomView::FIT);
 }
 
+/// A duel verdict whose write fails does not advance: the loser's row is gone from the
+/// catalog, so its reject fails, and the duel stays on round 1 with the challenger unpicked.
+#[gpui_kit::test]
+fn a_failed_duel_verdict_stays_on_the_pair(cx: &mut TestAppContext) {
+    let (app, _pool, _dir, ids) = app_with(3, "cmp-fail", cx);
+    select_all(&app, cx);
+    press(&app, "c", cx);
+    app.state.catalog.lock().unwrap().as_ref().unwrap().remove_photo(ids[0]).unwrap();
+    press(&app, "right", cx);
+    assert!(status(&app, cx).starts_with("Could not mark"), "{}", status(&app, cx));
+    let session = app.wired.shell.read_with(cx, |s, _| s.compare().cloned()).expect("Compare stays open");
+    assert_eq!(session.duel_progress(), (1, 2), "still the first pair");
+    assert_eq!((session.batch(), session.focus()), (vec![ids[0], ids[1]], Some(ids[1])));
+    assert!(!session.pending(), "settled: the next verdict may be decided");
+    assert_eq!(culling(&app, ids[2]).1, PickState::None);
+}
+
+/// When every pane drops out of the view — here the duel's champion, rated under the Unrated
+/// filter once the duel is done — Compare ends, and the grid's keys mark the selection again
+/// (React's `inCompare` required a pane).
+#[gpui_kit::test]
+fn compare_ends_when_every_pane_leaves_the_view(cx: &mut TestAppContext) {
+    let (app, _pool, _dir, ids) = app_with(3, "cmp-gone", cx);
+    app.wired.shell.update(cx, |s, cx| s.update_scope(cx, |l| l.set_filter(CullingFilter::Unrated)));
+    cx.run_until_parked();
+    select_all(&app, cx);
+    press(&app, "c", cx);
+    press(&app, "right", cx);
+    press(&app, "left", cx);
+    assert!(app.wired.shell.read_with(cx, |s, _| s.compare().unwrap().duel().done));
+    assert_eq!(culling(&app, ids[1]).1, PickState::Pick, "the champion");
+    // Rejected but unrated, the rivals stay in the view; the rated champion leaves it.
+    press(&app, "3", cx);
+    assert_eq!(culling(&app, ids[1]).0, 3);
+    assert!(app.wired.shell.read_with(cx, |s, _| s.compare().is_none()), "Compare ended");
+    assert_eq!(stage(&app, cx), StageView::Grid);
+    select(&app, ids[0], cx);
+    press(&app, "2", cx);
+    assert_eq!(culling(&app, ids[0]).0, 2, "the grid's selection is marked");
+}
+
+/// Closing Compare resets its view: reopened on the same frames it starts at fit, on the
+/// preview tier.
+#[gpui_kit::test]
+fn reopening_compare_on_the_same_set_starts_fresh(cx: &mut TestAppContext) {
+    let (app, pool, _dir, ids) = app_with(3, "cmp-reopen", cx);
+    select_all(&app, cx);
+    press(&app, "c", cx);
+    for &id in &ids {
+        pool.finish(&preview(id), Ok(pixels(300, 200)));
+    }
+    cx.run_until_parked();
+    wheel(&app, "compare-image-1", true, cx);
+    let compare = root(&app).read_with(cx, |r, _| r.compare().clone());
+    let shared = compare.read_with(cx, |c, _| c.shared_view().clone());
+    let pane = compare.read_with(cx, |c, _| c.panes()[1].clone());
+    assert!(shared.read_with(cx, |s, _| s.view.zoomed()));
+    assert!(pane.read_with(cx, |z, _| z.wants_hi()), "zoomed: the full-resolution tier");
+    press(&app, "escape", cx);
+    assert_eq!(stage(&app, cx), StageView::Grid);
+    press(&app, "c", cx);
+    assert_eq!(stage(&app, cx), StageView::Compare);
+    render(&app, cx);
+    assert_eq!(shared.read_with(cx, |s, _| s.view), ZoomView::FIT, "the same frames, at fit");
+    assert!(!pane.read_with(cx, |z, _| z.wants_hi()), "on the preview tier again");
+}
+
 /// Catalog identity: a verdict after the core switched writes nothing to the colliding ids;
 /// `catalog:switched` closes Compare.
 #[gpui_kit::test]
@@ -446,12 +569,18 @@ fn a_cull_session_resumes_decides_saves_and_summarises(cx: &mut TestAppContext) 
     press(&app, "[", cx);
     assert!(app.wired.shell.read_with(cx, |s, _| s.panel_visible(crate::shell::state::Side::Left)), "panel keys are muted");
 
+    // The debounced save: on photo 4 (not the seeded photo 3), only once the pause is over.
+    press(&app, "right", cx);
+    let saved = || app.state.catalog.lock().unwrap().as_ref().unwrap().get_setting(CURSOR_KEY).unwrap();
+    assert_eq!(saved(), Some(ids[2].to_string()), "not before the pause");
     cx.executor().advance_clock(CURSOR_DEBOUNCE);
     cx.run_until_parked();
-    let saved = app.state.catalog.lock().unwrap().as_ref().unwrap().get_setting(CURSOR_KEY).unwrap();
-    assert_eq!(saved, Some(ids[2].to_string()));
+    assert_eq!(saved(), Some(ids[3].to_string()), "saved after the pause");
 
+    // The finish save: back to photo 3 and end at once — the end saves it, not the debounce.
+    press(&app, "left", cx);
     press(&app, "escape", cx);
+    assert_eq!(saved(), Some(ids[2].to_string()), "saved at the end, without the pause");
     assert!(view.read_with(cx, |v, _| v.state.summary.is_some()));
     assert_eq!(label_of(&app, "cull-summary-lead", cx).as_deref(), Some("2 of 5 photos reviewed · 3 still to go"));
     press(&app, "enter", cx);
@@ -463,6 +592,54 @@ fn a_cull_session_resumes_decides_saves_and_summarises(cx: &mut TestAppContext) 
         })
         .unwrap();
     assert!(grid_focused, "the grid has the keys again");
+}
+
+/// The session occludes the shell: a click on the cull photo, over a grid tile, neither focuses
+/// the grid nor changes its selection, and the culling keys still mark the cull photo.
+#[gpui_kit::test]
+fn a_click_on_the_cull_session_does_not_reach_the_grid(cx: &mut TestAppContext) {
+    let (app, _pool, _dir, ids) = app_with(4, "cull-occlude", cx);
+    select_all(&app, cx);
+    render(&app, cx);
+    start_cull(&app, cx);
+    let view = cull(&app, cx).unwrap();
+    assert_eq!(view.read_with(cx, |v, _| v.state.at()), Some(0));
+    let selection = |cx: &mut TestAppContext| app.wired.shell.read_with(cx, |s, _| s.library.selection().ids.to_vec());
+    let before = selection(cx);
+    cx.update_window(app.window(), |_, window, cx| {
+        window.render_frame(cx);
+        // A tile under the session, which a click there would select alone.
+        let position = window.find(("tile", ids[3] as u64)).bounds().center();
+        let hover = MouseMoveEvent { position, pressed_button: None, modifiers: Modifiers::default() };
+        window.dispatch_event(hover.to_platform_input(), cx);
+        let down = MouseDownEvent {
+            button: MouseButton::Left,
+            position,
+            modifiers: Modifiers::default(),
+            click_count: 1,
+            first_mouse: false,
+        };
+        window.dispatch_event(down.to_platform_input(), cx);
+        let up = MouseUpEvent { button: MouseButton::Left, position, modifiers: Modifiers::default(), click_count: 1 };
+        window.dispatch_event(up.to_platform_input(), cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    let (cull_focused, grid_focused) = cx
+        .update_window(app.window(), |_, window, cx| {
+            (
+                view.read(cx).focus_handle().is_focused(window),
+                root(&app).read(cx).library().read(cx).focus_handle().is_focused(window),
+            )
+        })
+        .unwrap();
+    assert!(cull_focused && !grid_focused, "the session keeps the keys");
+    assert_eq!(selection(cx), before, "the grid's selection is untouched");
+    press(&app, "p", cx);
+    assert_eq!(culling(&app, ids[0]).1, PickState::Pick, "the cull photo is marked");
+    assert_eq!(culling(&app, ids[3]).1, PickState::None, "the tile under the click is not");
+    assert_eq!(view.read_with(cx, |v, _| v.state.at()), Some(1));
 }
 
 /// A decision the catalog did not take (the core switched under the session) is rolled back

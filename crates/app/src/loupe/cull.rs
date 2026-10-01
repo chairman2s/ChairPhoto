@@ -463,6 +463,10 @@ impl Render for CullView {
             .top_0()
             .left_0()
             .size_full()
+            // Full screen over the shell: nothing beneath it sees the mouse. Without this a
+            // click reaches the grid, which takes the focus (and the selection) and with it
+            // the culling keys.
+            .occlude()
             .bg(gpui_kit::black())
             .text_color(colors.txt)
             .on_action(cx.listener(|this, _: &CullNext, _, cx| this.step(1, cx)))

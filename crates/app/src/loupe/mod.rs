@@ -125,6 +125,7 @@ pub fn bindings() -> Vec<KeyBinding> {
         KeyBinding::new("shift-down", ExtendNext, loupe),
         KeyBinding::new("shift-left", ExtendPrevious, loupe),
         KeyBinding::new("shift-up", ExtendPrevious, loupe),
+        KeyBinding::new("ctrl-a", SelectAll, loupe),
         KeyBinding::new("enter", CloseLoupe, loupe),
         KeyBinding::new("escape", CloseLoupe, loupe),
         KeyBinding::new("c", CompareSelection, loupe),

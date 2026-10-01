@@ -324,6 +324,9 @@ enum AfterMark {
     /// Report the result to the caller and touch nothing else: the cull session records its
     /// own decisions and re-reads the rows once, at its end (CullSession.tsx).
     Report(oneshot::Sender<Result<(), String>>),
+    /// A Compare verdict's writes: as `Refresh(None)`, and settle the verdict — written, the
+    /// duel moves on; failed, it stays on the same pair (React awaited `applyMark`).
+    Verdict(Verdict),
 }
 
 /// What the Library stage shows.
@@ -760,10 +763,11 @@ impl ShellState {
         }
     }
 
+    /// Queue the verdict's writes as one job, in order, stopping at the first that fails;
+    /// the session moves on once they are all in ([`CompareSession::settle`]).
     fn write_verdict(&mut self, verdict: Verdict, from: CatalogIdentity, cx: &mut Context<Self>) {
-        for (id, pick) in verdict.writes {
-            self.queue_mark(Mark::Pick(pick), vec![id], from, AfterMark::Refresh(None), cx);
-        }
+        let writes = verdict.writes.iter().map(|&(id, pick)| (Mark::Pick(pick), id)).collect();
+        self.queue_writes(writes, from, AfterMark::Verdict(verdict), cx);
         cx.notify();
     }
 
@@ -831,6 +835,13 @@ impl ShellState {
                 if landed {
                     self.rows_pending = None;
                     self.rows_loaded = true;
+                    // Every pane dropped out of the view (a filter the culling just failed,
+                    // say): Compare ends rather than linger off screen swallowing the marks.
+                    // React's `inCompare` required a pane; the grid's keys then marked the
+                    // selection again.
+                    if self.compare.is_some() && self.compare_panes().is_empty() {
+                        self.compare = None;
+                    }
                     self.apply_pending_link(cx);
                     self.after_input(cx);
                 }
@@ -942,6 +953,19 @@ impl ShellState {
         after: AfterMark,
         cx: &mut Context<Self>,
     ) {
+        let writes = targets.into_iter().map(|id| (mark.clone(), id)).collect();
+        self.queue_writes(writes, from, after, cx);
+    }
+
+    /// [`queue_mark`](Self::queue_mark) with a mark per photo: written in order, stopping at
+    /// the first failure.
+    fn queue_writes(
+        &mut self,
+        writes: Vec<(Mark, i64)>,
+        from: CatalogIdentity,
+        after: AfterMark,
+        cx: &mut Context<Self>,
+    ) {
         let previous = self.last_mark.take();
         let generation = self.catalog_generation;
         let state = self.app.clone();
@@ -957,19 +981,23 @@ impl ShellState {
                 return;
             }
             let write = cx.background_executor().spawn(async move {
-                with_catalog_as(&state, from, |c| targets.iter().try_for_each(|&id| mark.write(c, id).map(drop)))
+                with_catalog_as(&state, from, |c| writes.iter().try_for_each(|(mark, id)| mark.write(c, *id).map(drop)))
             });
             let result = write.await;
-            let snapshot = match after {
+            let (snapshot, verdict) = match after {
                 AfterMark::Report(tx) => {
                     let _ = tx.send(result);
                     return;
                 }
-                AfterMark::Refresh(snapshot) => snapshot,
+                AfterMark::Refresh(snapshot) => (snapshot, None),
+                AfterMark::Verdict(verdict) => (None, Some(verdict)),
             };
             this.update(cx, |s, cx| {
                 if s.catalog_generation != generation {
                     return;
+                }
+                if let (Some(verdict), Some((session, _))) = (&verdict, &mut s.compare) {
+                    session.settle(verdict, result.is_ok());
                 }
                 match result {
                     // The keyboard advances only past a mark that was written (React advanced

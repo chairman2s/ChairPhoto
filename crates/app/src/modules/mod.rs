@@ -48,6 +48,7 @@ mod tests;
 
 pub use registry::{ModuleInfo, ModuleRegistry, RequirementInfo};
 
+use crate::image_store::ImageStore;
 use crate::model::AppModel;
 use crate::shell::ShellState;
 use chairphoto_core::app::{with_catalog, AppState, CoreEvent};
@@ -245,19 +246,33 @@ pub struct Contributions {
 }
 
 /// What the registry hands a module when it loads: its settings, and the app entities that
-/// hold what `ChairPhotoAPI` used to expose (selection, active photo, Library scope, status).
+/// hold what `ChairPhotoAPI` used to expose (selection, active photo, Library scope, status),
+/// and the image layer for thumbnails (`thumb://` in the React app).
 #[derive(Clone)]
 pub struct ModuleHost {
     meta: ModuleMeta,
     settings: ModuleSettings,
     model: Entity<AppModel>,
     shell: Entity<ShellState>,
+    images: Option<Entity<ImageStore>>,
 }
 
 impl ModuleHost {
     pub(crate) fn new(meta: ModuleMeta, app: AppState, model: Entity<AppModel>, shell: Entity<ShellState>) -> Self {
         let settings = ModuleSettings { app, prefix: format!("{}.", meta.id) };
-        ModuleHost { meta, settings, model, shell }
+        ModuleHost { meta, settings, model, shell, images: None }
+    }
+
+    pub(crate) fn with_images(mut self, images: Option<Entity<ImageStore>>) -> Self {
+        self.images = images;
+        self
+    }
+
+    /// The image layer (#101): photo thumbnails and previews as GPU-ready images, through the
+    /// app's one cache. Optional: a module shows its thumbnails only when it is there, and
+    /// everything else works without it.
+    pub fn images(&self) -> Option<&Entity<ImageStore>> {
+        self.images.as_ref()
     }
 
     pub fn meta(&self) -> &ModuleMeta {

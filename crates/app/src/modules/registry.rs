@@ -35,6 +35,7 @@ use super::{
     ActionKind, Contributions, MainView, Module, ModuleAction, ModuleHost, ModuleInstance, ModuleMeta, Panel,
     PanelSlot, PublishTarget, SettingsPanel, ViewFactory,
 };
+use crate::image_store::ImageStore;
 use crate::model::{AppModel, AppModelEvent};
 use crate::shell::ShellState;
 use chairphoto_core::app::{with_catalog, AppState, CoreEvent};
@@ -174,6 +175,9 @@ pub struct ModuleRegistry {
     app: AppState,
     model: Entity<AppModel>,
     shell: Entity<ShellState>,
+    /// The image layer, handed to modules for thumbnails; `None` in registries built without
+    /// one (tests).
+    images: Option<Entity<ImageStore>>,
     restore: Restore,
     /// Enables (`true`) and disables asked for while the restore had not landed, in order.
     queued: Vec<(String, bool)>,
@@ -191,9 +195,17 @@ pub struct ModuleRegistry {
 }
 
 impl ModuleRegistry {
-    /// The production registry: [`super::bundled`] against [`super::compiled_features`].
-    pub fn install(model: &Entity<AppModel>, shell: &Entity<ShellState>, cx: &mut App) -> Entity<Self> {
-        Self::install_with(super::bundled(), super::compiled_features(), model, shell, cx)
+    /// The production registry: [`super::bundled`] against [`super::compiled_features`], with
+    /// the app's image layer for the modules' thumbnails ([`ModuleHost::images`]).
+    pub fn install(
+        model: &Entity<AppModel>,
+        shell: &Entity<ShellState>,
+        images: &Entity<ImageStore>,
+        cx: &mut App,
+    ) -> Entity<Self> {
+        let registry = Self::install_with(super::bundled(), super::compiled_features(), model, shell, cx);
+        registry.update(cx, |r, _| r.images = Some(images.clone()));
+        registry
     }
 
     /// Register `modules` (in order) and subscribe to the model: its first catalog read
@@ -226,6 +238,7 @@ impl ModuleRegistry {
             app,
             model: model.clone(),
             shell: shell.clone(),
+            images: None,
             restore: Restore::Waiting,
             queued: Vec::new(),
             restore_generation: 0,
@@ -457,7 +470,7 @@ impl ModuleRegistry {
         }
         let host = {
             let r = this.read(cx);
-            ModuleHost::new(meta.clone(), r.app.clone(), r.model.clone(), r.shell.clone())
+            ModuleHost::new(meta.clone(), r.app.clone(), r.model.clone(), r.shell.clone()).with_images(r.images.clone())
         };
         match Self::in_module(this, cx, |cx| module.load(host, cx)) {
             Ok(instance) => {

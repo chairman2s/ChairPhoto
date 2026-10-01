@@ -313,6 +313,22 @@ pub fn write_bundle(
     dest_path: &Path,
     on_progress: impl Fn(usize, usize),
 ) -> Result<BundleWriteResult, String> {
+    let never = std::sync::atomic::AtomicBool::new(false);
+    write_bundle_abortable(bundle, dest_path, &never, on_progress)
+}
+
+/// What a bundle write stopped by its abort flag reports (`write_bundle_abortable`).
+pub const BUNDLE_EXPORT_CANCELLED: &str = "Bundle export cancelled";
+
+/// [`write_bundle`], checking `abort` before each photo. A tripped flag stops the write
+/// there with [`BUNDLE_EXPORT_CANCELLED`]: the temporary file is removed and nothing is
+/// placed at `dest_path`, so a half-written bundle never looks like a finished one.
+pub fn write_bundle_abortable(
+    bundle: &GatheredBundle,
+    dest_path: &Path,
+    abort: &std::sync::atomic::AtomicBool,
+    on_progress: impl Fn(usize, usize),
+) -> Result<BundleWriteResult, String> {
     let total_photos = bundle.manifest.photos.len();
     // 2 steps per photo: original + preview
     let total_steps = total_photos * 2;
@@ -323,7 +339,7 @@ pub fn write_bundle(
 
     // Write to a temp file first; rename to dest on success (atomic-ish).
     let tmp_path = dest_path.with_extension("chairphoto.tmp");
-    let result = write_bundle_to_file(bundle, &tmp_path, total_steps, &on_progress);
+    let result = write_bundle_to_file(bundle, &tmp_path, total_steps, abort, &on_progress);
 
     match result {
         Ok(r) => {
@@ -342,6 +358,7 @@ fn write_bundle_to_file(
     bundle: &GatheredBundle,
     tmp_path: &Path,
     total_steps: usize,
+    abort: &std::sync::atomic::AtomicBool,
     on_progress: &impl Fn(usize, usize),
 ) -> Result<BundleWriteResult, String> {
     let file = std::fs::File::create(tmp_path)
@@ -374,6 +391,9 @@ fn write_bundle_to_file(
     let mut done = 0usize;
 
     for bp in &bundle.manifest.photos {
+        if abort.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(format!("{BUNDLE_EXPORT_CANCELLED} — nothing was written to the destination."));
+        }
         let original_path = bundle.originals.get(&bp.uuid).and_then(|o| o.as_ref());
 
         // Step 1: Original (and its sidecar)

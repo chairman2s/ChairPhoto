@@ -10,6 +10,8 @@ use tauri::{AppHandle, State};
 /// Export photos to a destination folder using a preset (Hand-off RAW+XMP, or
 /// Show-off JPEG). `destDir`'s leading "~" is expanded. Unreachable originals are
 /// reported in the result so the UI can warn instead of silently exporting a subset.
+/// The core's `app::exports::export_photos` on a blocking worker: an owned job (a newer
+/// export or a catalog switch stops it), progress as `export:progress`.
 #[tauri::command]
 pub async fn export_photos(
     state: State<'_, AppState>,
@@ -20,79 +22,28 @@ pub async fn export_photos(
     hashtag_limit: Option<usize>,
     version_id: Option<i64>,
 ) -> Result<crate::export::ExportResult, String> {
-    let dest = expand_home(&dest_dir);
-    // Resolve originals + assemble the optional reach-hashtag bundle under the lock,
-    // then release it so the file copying runs off the UI thread.
-    let (resolved, hashtags) = {
-        let guard = state.catalog.lock().map_err(|e| e.to_string())?;
-        let catalog = guard.as_ref().ok_or("No catalog is open")?;
-        // Languages for keyword assembly: canonical + neutral synonyms for now (a
-        // per-language export option can pass real codes here later).
-        let resolved = crate::export::resolve_originals(catalog, &photo_ids, &[], version_id);
-        let hashtags = match hashtag_group_id {
-            Some(g) => catalog
-                .assemble_hashtag_bundle(g, hashtag_limit)
-                .map_err(|e| e.to_string())?,
-            None => Vec::new(),
-        };
-        (resolved, hashtags)
+    let request = crate::app::exports::ExportRequest {
+        photo_ids,
+        preset,
+        dest_dir: expand_home(&dest_dir),
+        hashtag_group_id,
+        hashtag_limit,
+        version_id,
     };
-    let result = crate::app::spawn_blocking(move || {
-        crate::export::write_exports(&resolved, preset, &dest, &hashtags)
-    })
-    .await
-    .map_err(|e| e.to_string())?;
-    record_export_parity(&state);
-    result
+    let state = state.inner().clone();
+    crate::app::spawn_blocking(move || crate::app::exports::export_photos(&state, &request))
+        .await
+        .map_err(|e| e.to_string())?
 }
 
-/// The settings key holding this catalog's "export equals view" total
-/// (`plugins::edit::parity::ParityTally` as JSON): exports checked, exports that differed.
-#[cfg(feature = "edit")]
-pub const EXPORT_PARITY_KEY: &str = "metrics.exportParity";
-
-/// Add the engine-2 exports checked since the last call to this catalog's total. Called
-/// after every command that writes an export (the Export dialog, publishing, Instagram,
-/// LocalSend); best-effort — a failed write loses a count, never an export.
-pub(crate) fn record_export_parity(state: &AppState) {
-    #[cfg(feature = "edit")]
-    {
-        use crate::plugins::edit::parity::{take, ParityTally};
-        let tally = take();
-        if tally.checked == 0 {
-            return;
-        }
-        let Ok(guard) = state.catalog.lock() else { return };
-        let Some(catalog) = guard.as_ref() else { return };
-        let total: ParityTally = catalog
-            .get_setting(EXPORT_PARITY_KEY)
-            .ok()
-            .flatten()
-            .and_then(|v| serde_json::from_str(&v).ok())
-            .unwrap_or_default();
-        let next = tally.plus(total);
-        if let Ok(json) = serde_json::to_string(&next) {
-            if let Err(e) = catalog.set_setting(EXPORT_PARITY_KEY, &json) {
-                eprintln!("export: could not record the export-parity tally: {e}");
-            }
-        }
-    }
-    #[cfg(not(feature = "edit"))]
-    let _ = state;
-}
-
-/// Export one import batch as a `.chairphoto` bundle zip to `dest_path`.
+/// Export one import batch as a `.chairphoto` bundle zip to `dest_path` — the core's
+/// `app::exports::export_bundle_claimed_with` on a blocking worker, an owned job (a newer
+/// bundle export or a catalog switch stops it, leaving nothing at the destination).
 ///
-/// The bundle carries the full catalog metadata (ratings, tags, versions, IPTC, edit
-/// records) and — where the originals are reachable — copies the raw files and their
-/// XMP sidecars into `originals/`, plus a cached JPEG preview under `previews/`.
-///
-/// Unreachable originals (offline NAS, missing file) are counted and reported in the
-/// result; their metadata still travels so the importing catalog can merge it. Silently
-/// truncating is not allowed: the UI must surface `skipped_offline` to the user.
-///
-/// Progress is streamed as `import:progress` events (`{done, total}`) — the same shape
-/// E5/ingest uses — so the frontend can reuse its progress bar.
+/// The bundle carries the full catalog metadata and, where the originals are reachable,
+/// the raw files and their XMP sidecars. Unreachable originals are counted in
+/// `skipped_offline`; their metadata still travels. Progress is streamed as
+/// `import:progress` events with job 0 — the shape the React topbar listens for.
 #[tauri::command]
 pub async fn export_bundle(
     app: AppHandle,
@@ -101,35 +52,10 @@ pub async fn export_bundle(
     dest_path: String,
 ) -> Result<crate::bundle::writer::BundleWriteResult, String> {
     let dest = expand_home(&dest_path);
-
-    // Phase 1 — gather all catalog data under the lock, then release it.
-    // This is pure DB work (no file IO), so it completes quickly.
-    let bundle = {
-        let guard = state.catalog.lock().map_err(|e| e.to_string())?;
-        let catalog = guard.as_ref().ok_or("No catalog is open")?;
-        crate::bundle::writer::gather_bundle(catalog, batch_id)
-            .map_err(|e| e.to_string())?
-            .ok_or_else(|| format!("Import batch {batch_id} not found"))?
-    };
-
-    // Warn on offline originals (count, never silently truncate). We log here; the
-    // frontend should surface the `skipped_offline` field in the returned result.
-    let offline_count = bundle
-        .originals
-        .values()
-        .filter(|o| o.is_none())
-        .count();
-    if offline_count > 0 {
-        eprintln!(
-            "export_bundle: {offline_count} original(s) are offline — \
-             their metadata will be included but no bytes copied"
-        );
-    }
-
-    // Phase 2 — write the zip off the catalog lock (file IO can be slow for large RAW sets).
-    // Progress events mirror the `import:progress` shape used by E5 (ingest_from_card).
+    let state = state.inner().clone();
+    let claim = crate::app::exports::claim_bundle_export(&state)?;
     crate::app::spawn_blocking(move || {
-        crate::bundle::writer::write_bundle(&bundle, &dest, |done, total| {
+        crate::app::exports::export_bundle_claimed_with(&state, &claim, None, batch_id, &dest, &|done, total| {
             let _ = app.send(CoreEvent::ImportProgress(ImportProgress { job: 0, done, total }));
         })
     })

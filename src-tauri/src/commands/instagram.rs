@@ -47,7 +47,7 @@ pub async fn post_to_instagram(
     })
     .await
     .map_err(|e| e.to_string())??;
-    super::export::record_export_parity(&app.state::<AppState>());
+    crate::app::exports::record_export_parity(&app.state::<AppState>());
 
     let profile_dir = instagram_profile_dir()?;
     let chrome = find_chrome().ok_or(

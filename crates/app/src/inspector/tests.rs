@@ -523,6 +523,88 @@ fn iptc_saves_wait_for_the_fields_and_run_one_at_a_time(cx: &mut TestAppContext)
     assert_eq!(aria(&app, "iptc-status", cx).as_deref(), Some("Saved to sidecar"));
 }
 
+/// Photo 0 with its original on disk, the IPTC section open and loaded, Save pressed with
+/// "First" and pressed again with "Second" while the first save is still queued on the
+/// runner: one save running (not yet run), one queued behind it.
+fn two_iptc_saves(app: &App, dir: &TempDir, ids: &[i64], cx: &mut TestAppContext) -> Entity<PhotoInspector> {
+    let original = dir.0.join("photos/2026/p0.ARW");
+    std::fs::create_dir_all(original.parent().unwrap()).unwrap();
+    std::fs::write(&original, b"raw").unwrap();
+    select(app, ids[0], SelectMods::default(), cx);
+    work(cx); // whatever else is queued (the editors probe)
+    click(app, "section-iptc", cx);
+    let insp = inspector(app, cx);
+    render(app, cx);
+    let headline = insp.read_with(cx, |i, _| i.iptc.fields[0].clone());
+    set_input(app, &headline, "First", cx);
+    insp.update(cx, |i, cx| i.save_iptc(cx));
+    set_input(app, &headline, "Second", cx);
+    insp.update(cx, |i, cx| i.save_iptc(cx));
+    insp
+}
+
+/// **A queued save survives navigating away** (#108 gate). Save "First", then "Second" while
+/// the first is in flight, then select another photo before either runs: both run, in order,
+/// on photo 0 — "Second" lands in the catalog and the sidecar — and, the inspector showing
+/// photo 1 by then, the outcome goes to the status line. Photo 1 is untouched.
+/// (Mutation-checked: running the queued save only while its photo is still shown —
+/// `iptc_queued.remove(&id).filter(|_| shown)` — leaves "First" and this fails.)
+#[gpui_kit::test]
+fn a_queued_iptc_save_survives_navigating_away(cx: &mut TestAppContext) {
+    let dir = TempDir::new("insp-iptc-away");
+    let app = start(cx);
+    let ids = open_catalog_with_photos(&app, &dir, 2, cx);
+    let insp = two_iptc_saves(&app, &dir, &ids, cx);
+    select(&app, ids[1], SelectMods::default(), cx);
+    insp.read_with(cx, |i, _| assert_eq!(i.photo_id, Some(ids[1])));
+    assert_eq!(cx.update(|cx| Runner::get(cx).run_pending()), 1, "the first save runs alone");
+    cx.run_until_parked();
+    assert_eq!(catalog(&app, |c| c.get_iptc(ids[0]).unwrap().headline), "First");
+    assert_eq!(cx.update(|cx| Runner::get(cx).run_pending()), 1, "the queued save runs after it");
+    cx.run_until_parked();
+    assert_eq!(catalog(&app, |c| c.get_iptc(ids[0]).unwrap().headline), "Second");
+    let sidecar = std::fs::read_to_string(dir.0.join("photos/2026/p0.ARW.xmp")).unwrap();
+    assert!(sidecar.contains("Second") && !sidecar.contains("First"), "{sidecar}");
+    assert_eq!(crate::tests::status(&app, cx), "IPTC saved to sidecar for p0.ARW");
+    assert_eq!(catalog(&app, |c| c.get_iptc(ids[1]).unwrap().headline), "", "the photo shown now was not written");
+    insp.read_with(cx, |i, _| assert!(i.iptc_saving.is_empty() && i.iptc_queued.is_empty()));
+}
+
+/// **Forced interleaving.** The two saves are pending when the core switches to a catalog
+/// whose photo 0 has the same id (and its own original), with `catalog:switched` withheld or
+/// delivered: neither save writes the new catalog's row or sidecar.
+/// (Mutation-checked: an unbound queued save — `save_iptc` instead of `save_iptc_as` —
+/// writes the new catalog's photo and this fails.)
+fn queued_iptc_across_a_switch(delivered: bool, cx: &mut TestAppContext) {
+    let dir = TempDir::new("insp-iptc-queued-switch");
+    let app = start(cx);
+    let ids = open_catalog_with_photos(&app, &dir, 1, cx);
+    let insp = two_iptc_saves(&app, &dir, &ids, cx);
+    let (b, b_ids) = colliding_catalog(&dir, "b", 1);
+    assert_eq!(b_ids, ids, "the ids collide, as real catalogs' do");
+    let b_original = dir.0.join("b/2026/b0.ARW");
+    std::fs::create_dir_all(b_original.parent().unwrap()).unwrap();
+    std::fs::write(&b_original, b"raw").unwrap();
+    core_switch(&app, b);
+    if delivered {
+        deliver_switch(&app, cx);
+    }
+    work(cx);
+    assert_eq!(catalog(&app, |c| c.get_iptc(b_ids[0]).unwrap().headline), "", "a save wrote the new catalog's photo");
+    assert!(!dir.0.join("b/2026/b0.ARW.xmp").exists(), "a save wrote the new catalog's sidecar");
+    insp.read_with(cx, |i, _| assert!(i.iptc_saving.is_empty() && i.iptc_queued.is_empty()));
+}
+
+#[gpui_kit::test]
+fn a_queued_iptc_save_never_reaches_the_new_catalog_before_the_switch_event(cx: &mut TestAppContext) {
+    queued_iptc_across_a_switch(false, cx);
+}
+
+#[gpui_kit::test]
+fn a_queued_iptc_save_never_reaches_the_new_catalog_after_the_switch_event(cx: &mut TestAppContext) {
+    queued_iptc_across_a_switch(true, cx);
+}
+
 /// Metadata: grouped, the default groups open, "No metadata" when there is none.
 #[gpui_kit::test]
 fn metadata_groups_render_and_toggle(cx: &mut TestAppContext) {

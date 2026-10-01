@@ -39,15 +39,18 @@
 //! connection of their own to that catalog (`storage::backup_photo_as` and its siblings).
 //!
 //! **IPTC saves** are serialized per photo: Save is disabled while the photo's fields are
-//! still loading, and a Save while that photo's previous save is in flight runs after it,
-//! with the form's values then (so a catalog row and its sidecar never interleave).
+//! still loading, and a Save while that photo's previous save is in flight is queued with
+//! its photo, catalog and the form's values at that press ([`IptcSave`]; a newer press
+//! replaces it), and runs after the running one — also once the selection has moved on (so a
+//! catalog row and its sidecar never interleave, and no save is silently dropped). A save
+//! whose photo is no longer shown reports its outcome on the status line.
 //!
 //! **External editors** (darktable / RawTherapee / ART) and **RapidRAW** run on the storage
 //! [`Runner`] (the core runtime's blocking pool), bound to the photo's catalog like every
 //! write (`external_edit::develop_in_editor_as` / `import_developed_as`,
 //! `rapidraw::edit_in_rapidraw_as`): a run whose worker starts after a switch fails closed
-//! under the catalog lock, before anything is launched or imported. A sidecar-editor run is owned by a sequence
-//! number per photo; its result lands only if no newer run for that photo started and the
+//! under the catalog lock, before anything is launched or imported. A sidecar-editor run is
+//! owned by a sequence number per photo; its result lands only if no newer run for that photo started and the
 //! catalog did not switch. A RapidRAW round-trip gets a core job id
 //! (`rapidraw::next_job_id`) before it starts: its `rapidraw:progress` events (routed here
 //! through `AppModel`) and its result update the photo's entry only while that job still owns
@@ -213,7 +216,6 @@ pub struct IptcForm {
     pub saved: IptcFields,
     pub status: String,
     fill: Option<IptcFields>,
-    save_seq: u64,
 }
 
 impl IptcForm {
@@ -240,6 +242,21 @@ impl IptcForm {
             input.update(cx, |i, cx| i.set_value(v, window, cx));
         }
     }
+}
+
+/// An IPTC save as Save captured it: the photo's catalog, the form's values then, and the
+/// photo's file name for the status line. A save queued behind a running one carries all of
+/// it, so it runs — and reports — after the inspector has moved to another photo.
+#[derive(Debug, Clone)]
+pub(crate) struct IptcSave {
+    from: CatalogIdentity,
+    fields: IptcFields,
+    name: String,
+}
+
+/// The last component of a catalog-relative path, for messages.
+fn file_name(path: &str) -> String {
+    path.rsplit('/').next().unwrap_or(path).to_string()
 }
 
 /// Which editors this machine has (`availableEditors` filtered to those with a GUI, and
@@ -331,9 +348,9 @@ pub struct PhotoInspector {
     pub rapid: HashMap<i64, RapidRun>,
     pub notes: HashMap<i64, String>,
     seq: u64,
-    /// Photos with an IPTC save in flight, and those whose next Save waits for it.
+    /// Photos with an IPTC save in flight, and the save queued behind each.
     pub iptc_saving: HashSet<i64>,
-    iptc_queued: HashSet<i64>,
+    iptc_queued: HashMap<i64, IptcSave>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -386,7 +403,7 @@ impl PhotoInspector {
             seen_version: None,
             sections: HashSet::new(),
             data: PhotoData::default(),
-            iptc: IptcForm { description, fields, saved: IptcFields::default(), status: String::new(), fill: None, save_seq: 0 },
+            iptc: IptcForm { description, fields, saved: IptcFields::default(), status: String::new(), fill: None },
             meta_open: META_DEFAULT_OPEN.iter().map(|s| s.to_string()).collect(),
             version_name,
             renaming: None,
@@ -400,7 +417,7 @@ impl PhotoInspector {
             notes: HashMap::new(),
             seq: 0,
             iptc_saving: HashSet::new(),
-            iptc_queued: HashSet::new(),
+            iptc_queued: HashMap::new(),
             _subscriptions: subscriptions,
         };
         this.sync(cx);
@@ -824,45 +841,63 @@ impl PhotoInspector {
 
     /// "Save IPTC": the catalog, then the sidecar (`app::iptc::save_iptc_as`, bound to the
     /// photo's catalog), on a worker. One save per photo at a time: a Save while one is in
-    /// flight runs when it ends, with the form's values then.
+    /// flight is queued with the form's values now and runs when it ends.
     pub fn save_iptc(&mut self, cx: &mut Context<Self>) {
         let (Some(id), Some(from)) = (self.photo_id, self.from) else { return };
         if !self.iptc_loaded() {
             return;
         }
+        let name = self.photo(cx).map(|p| file_name(&p.path)).unwrap_or_else(|| format!("photo {id}"));
+        let save = IptcSave { from, fields: self.iptc.values(cx), name };
+        self.iptc.status = "Saving…".into();
+        cx.notify();
         if self.iptc_saving.contains(&id) {
-            self.iptc_queued.insert(id);
+            // A newer Save replaces a still-queued one: its values are the form's now.
+            self.iptc_queued.insert(id, save);
             return;
         }
+        self.start_iptc_save(id, save, cx);
+    }
+
+    /// Run one IPTC save for `id`, then the save queued behind it — whatever the inspector
+    /// shows by then: the queued save carries its own photo, catalog and values.
+    fn start_iptc_save(&mut self, id: i64, save: IptcSave, cx: &mut Context<Self>) {
         self.iptc_saving.insert(id);
-        let fields = self.iptc.values(cx);
-        self.iptc.status = "Saving…".into();
-        self.iptc.save_seq += 1;
-        let (seq, generation, epoch) = (self.iptc.save_seq, self.generation, self.epoch);
-        cx.notify();
+        let epoch = self.epoch;
+        let IptcSave { from, fields, name } = save;
         let saved = fields.clone();
         self.run_blocking_always(
             move |state| chairphoto_core::app::iptc::save_iptc_as(state, from, id, &fields),
             move |this, result, cx| {
                 if this.epoch != epoch {
-                    return;
+                    return; // a switch cleared the bookkeeping; the save was bound to the old catalog
                 }
                 this.iptc_saving.remove(&id);
-                if this.iptc_queued.remove(&id) && this.photo_id == Some(id) && this.generation == generation {
-                    this.save_iptc(cx);
-                    return;
-                }
-                if this.generation != generation || this.iptc.save_seq != seq {
-                    return;
-                }
-                match result {
-                    Ok(()) => {
-                        this.iptc.saved = saved;
-                        this.iptc.status = "Saved to sidecar".into();
+                let shown = this.photo_id == Some(id) && this.from == Some(from);
+                if let Some(next) = this.iptc_queued.remove(&id) {
+                    if let Err(e) = result {
+                        this.status(format!("IPTC save for {name} failed: {e}"), cx);
                     }
-                    Err(e) => this.iptc.status = format!("Failed: {e}"),
+                    this.start_iptc_save(id, next, cx);
+                    return;
                 }
-                cx.notify();
+                if shown {
+                    match result {
+                        Ok(()) => {
+                            this.iptc.saved = saved;
+                            this.iptc.status = "Saved to sidecar".into();
+                        }
+                        Err(e) => this.iptc.status = format!("Failed: {e}"),
+                    }
+                    cx.notify();
+                } else {
+                    // The inspector moved on: the status line says what became of it.
+                    let line = match result {
+                        Ok(()) => format!("IPTC saved to sidecar for {name}"),
+                        Err(e) => format!("IPTC save for {name} failed: {e}"),
+                    };
+                    this.status(line, cx);
+                }
             },
             cx,
         );

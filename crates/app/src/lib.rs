@@ -50,6 +50,7 @@ pub mod shell;
 pub mod signals;
 pub mod single_instance;
 pub mod storage;
+pub mod tags;
 pub mod theme;
 pub mod view;
 
@@ -182,6 +183,8 @@ pub struct Wired {
     pub modules: Entity<modules::ModuleRegistry>,
     /// Storage and import's jobs (#114).
     pub storage: Entity<storage::StorageState>,
+    /// The tag tree, the tag clipboard and the tag write path (#107).
+    pub tags: Entity<tags::TagsState>,
     /// The main window, or why it could not open (the app has then been asked to quit).
     pub main_window: Result<AnyWindowHandle, String>,
     /// The main window's root view (the shell and the Library grid), when it opened.
@@ -224,6 +227,7 @@ pub fn wire(
     let images = cx.new(|cx| ImageStore::new(submit, image_store::DEFAULT_BUDGET_BYTES, cx));
     let modules = modules::ModuleRegistry::install(&model, &shell, &images, cx);
     let storage = cx.new(|cx| storage::StorageState::new(&model, &shell, cx));
+    let tags = cx.new(|cx| tags::TagsState::new(&model, cx));
     clear_images_on_catalog_switch(&model, &images, cx).detach();
     if options.open_default_catalog {
         model.update(cx, |m, cx| m.open_default_catalog(cx));
@@ -234,9 +238,9 @@ pub fn wire(
         window_options.inactive_frame_interval = None;
     }
     let opened = gpui_kit::open_window(window_options, cx, {
-        let (model, shell, images, modules, storage) =
-            (model.clone(), shell.clone(), images.clone(), modules.clone(), storage.clone());
-        move |window, cx| cx.new(|cx| view::RootView::new(model, shell, images, modules, storage, window, cx))
+        let (model, shell, images, modules, storage, tags) =
+            (model.clone(), shell.clone(), images.clone(), modules.clone(), storage.clone(), tags.clone());
+        move |window, cx| cx.new(|cx| view::RootView::new(model, shell, images, modules, storage, tags, window, cx))
     });
     let root = opened.as_ref().ok().map(|(_, root)| root.clone());
     let main_window = match opened {
@@ -256,7 +260,7 @@ pub fn wire(
             Err(e.to_string())
         }
     };
-    Wired { model, images, shell, modules, storage, main_window, root }
+    Wired { model, images, shell, modules, storage, tags, main_window, root }
 }
 
 /// Become this app data dir's primary instance, serving second launches into `tx`; or hand

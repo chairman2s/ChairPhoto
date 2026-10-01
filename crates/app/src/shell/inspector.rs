@@ -3,8 +3,8 @@
 //! titles) with the photo's colour-label swatch and a hide button, the lowercase tab row
 //! (details / tags / versions / publish), and the scrolling body. The details, versions and
 //! publish bodies are the Photo inspector ([`crate::inspector::PhotoInspector`], #108). The
-//! tags tab is the Tag panel's slot ([`crate::inspector::tags::tags_tab`]; its content and
-//! QuickTagGroups are #107), then the enabled modules' inspector panels
+//! tags tab shows the tagging block ([`crate::tags::photo_tags::PhotoTags`], #107: chips,
+//! copy/paste, add-tag, nearby, quick-tag groups), then the enabled modules' inspector panels
 //! ([`crate::modules::PanelSlot::Inspector`]), as `PhotoInspector.tsx` did, while a photo is
 //! active.
 
@@ -101,7 +101,7 @@ impl RootView {
                     .flex()
                     .flex_col()
                     .map(|body| match (shell.inspector_tab, active) {
-                        (InspectorTab::Tags, Some(photo)) => body.child(crate::inspector::tags::tags_tab(photo, colors)).children(
+                        (InspectorTab::Tags, Some(_)) => body.child(self.photo_tags.clone()).children(
                             module_panels.map(|panels| div().id("module-slot-inspector").flex().flex_col().child(panels)),
                         ),
                         _ => body.child(self.inspector.clone()),

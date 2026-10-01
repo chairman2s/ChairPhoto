@@ -33,6 +33,9 @@ use crate::model::AppModel;
 use crate::modules::registry::SlotView;
 use crate::modules::{panel as module_panel, ModuleRegistry, PanelSlot};
 use crate::storage::StorageState;
+use crate::tags::panel::TagPanel;
+use crate::tags::photo_tags::{PhotoTags, TagTarget};
+use crate::tags::TagsState;
 use crate::shell::actions::*;
 use crate::shell::state::{ShellState, Side, Surface, NARROW_MAX_W};
 use crate::shell::style::Colors;
@@ -58,6 +61,10 @@ pub struct RootView {
     pub(crate) modules: Entity<ModuleRegistry>,
     /// Storage and import (#114): its jobs and dialogs.
     pub(crate) storage: Entity<StorageState>,
+    /// Tags (#107): the collection browser's tag panel, and the inspector tags tab's tagging
+    /// block (mounted on the Photo inspector's tags tab, #108).
+    pub(crate) tag_panel: Entity<TagPanel>,
+    pub(crate) photo_tags: Entity<PhotoTags>,
     /// The open storage or Preferences dialog's close request (`crate::storage::open`).
     pub(crate) dialog_close: Option<Subscription>,
     pub(crate) focus: FocusHandle,
@@ -82,6 +89,7 @@ impl RootView {
         images: Entity<ImageStore>,
         modules: Entity<ModuleRegistry>,
         storage: Entity<StorageState>,
+        tags: Entity<TagsState>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -92,6 +100,9 @@ impl RootView {
         library.read(cx).focus_handle().clone().focus(window, cx);
         let thumb_slider = crate::shell::command_pill::thumb_slider(&shell, window, cx);
         let inspector = cx.new(|cx| PhotoInspector::new(model.clone(), shell.clone(), images.clone(), window, cx));
+        let tag_panel = cx.new(|cx| TagPanel::new(tags.clone(), shell.clone(), modules.clone(), window, cx));
+        let target = tag_target(shell.read(cx));
+        let photo_tags = cx.new(|cx| PhotoTags::new(tags.clone(), target, window, cx));
         let catalog_epoch = model.read(cx).catalog_epoch;
         let _observers = [
             cx.observe(&model, |this, model, cx| {
@@ -103,7 +114,12 @@ impl RootView {
                 }
                 cx.notify()
             }),
-            cx.observe(&shell, |_, _, cx| cx.notify()),
+            cx.observe(&shell, |this, shell, cx| {
+                // The tagging block follows the selection.
+                let target = tag_target(shell.read(cx));
+                this.photo_tags.update(cx, |p, cx| p.set_target(target, cx));
+                cx.notify()
+            }),
             cx.observe(&images, |_, _, cx| cx.notify()),
             // A module disabled while its main view is on the stage takes the view with it:
             // back to the Library, as React fell back when `activeView` vanished.
@@ -136,6 +152,8 @@ impl RootView {
             images,
             modules,
             storage,
+            tag_panel,
+            photo_tags,
             dialog_close: None,
             focus,
             thumb_slider,
@@ -249,6 +267,12 @@ impl RootView {
             }
         }
     }
+}
+
+/// What the inspector's tagging block edits: the active photo, and the selection's targets.
+fn tag_target(shell: &ShellState) -> TagTarget {
+    let selection = shell.library.selection();
+    TagTarget { active: selection.active.map(|p| p.id), targets: selection.targets }
 }
 
 impl Render for RootView {

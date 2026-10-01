@@ -25,6 +25,7 @@ pub mod iptc;
 pub mod jobs;
 pub mod scans;
 pub mod storage;
+pub mod tags;
 
 pub use boot::{boot, boot_with, Boot};
 // `catalogs::switch_catalog` is deliberately not re-exported here: the Tauri shell re-exports

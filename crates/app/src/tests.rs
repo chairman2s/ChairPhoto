@@ -836,3 +836,7 @@ mod preferences_tests;
 #[cfg(feature = "map")]
 #[path = "map_tests.rs"]
 mod map_tests;
+
+// Tags (#107).
+#[path = "tags_tests.rs"]
+mod tags_tests;

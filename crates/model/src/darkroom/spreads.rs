@@ -47,10 +47,10 @@ fn geometry_of(base: &VersionEdit) -> VersionEdit {
 }
 
 /// Sparse-over-sparse tone merge (`b`'s keys win); absent when neither is truthy
-/// (`a || b`). A raw (non-object) tone spreads nothing.
+/// (`a || b`). A raw array or string tone spreads its index keys ([`Field::spread`]).
 fn merge_tone(a: &Field<Tone>, b: &Field<Tone>) -> Field<Tone> {
     if a.is_truthy() || b.is_truthy() {
-        Field::Set(a.value_or_default().merged(&b.value_or_default()))
+        Field::Set(a.spread().merged(&b.spread()))
     } else {
         Field::Absent
     }
@@ -62,7 +62,7 @@ fn warmed(t: &Field<Tone>, temp: f64) -> Tone {
     // `t?.wb?.tint ?? 0`: a raw tint is carried as it is.
     let tint = t.value().and_then(|t| t.wb.value()).map_or(Field::Set(0.0), |w| w.tint.or_set(0.0));
     let wb = Wb { tint, ..Wb::relative(temp, 0.0) };
-    Tone { wb: Field::Set(wb), ..t.value_or_default() }
+    Tone { wb: Field::Set(wb), ..t.spread() }
 }
 
 fn group_of(p: &DevelopPreset) -> ProofGroup {
@@ -141,7 +141,7 @@ fn clamp1(v: f64) -> f64 {
 }
 
 fn with_tone(r: &VersionEdit, patch: Tone) -> VersionEdit {
-    VersionEdit { tone: Field::Set(r.tone.value_or_default().merged(&patch)), ..r.clone() }
+    VersionEdit { tone: Field::Set(r.tone.spread().merged(&patch)), ..r.clone() }
 }
 
 /// A/B variants around `working` for `dim`; `visit` counts prior rounds on this dim.
@@ -418,6 +418,22 @@ mod tests {
         assert_eq!((look.crop.clone(), look.straighten.clone(), look.bw.clone()), (Field::Absent, Field::Null, Field::Absent));
         let change = crate::darkroom::history::describe_change(&base, &VersionEdit::default(), None);
         assert_eq!(change.key, "none");
+    }
+
+    /// Codex review of c718349: a raw array or string tone was replaced by an empty tone in
+    /// a tone adjustment. TS spreads it (`{ ...(r.tone ?? {}), ...patch }`), copying index
+    /// keys; node: duel → {"tone":{"0":{"future":42},"ev":-0.4}}.
+    #[test]
+    fn a_raw_array_or_string_tone_spreads_its_index_keys() {
+        use serde_json::{json, Value};
+        let working = crate::editing::parse_edit(Some(r#"{"tone":[{"future":42}]}"#));
+        let [a, b] = duel_pair(&working, DuelDim::Ev, 0, None);
+        let json = |r: &VersionEdit| serde_json::from_str::<Value>(&r.to_json()).unwrap();
+        assert_eq!(json(&a), json!({"tone": {"0": {"future": 42}, "ev": -0.4}}));
+        assert_eq!(json(&b), json!({"tone": {"0": {"future": 42}, "ev": 0.4}}));
+        // A string spreads its characters; Auto merges over it the same way.
+        let spread = proof_spread(&crate::editing::parse_edit(Some(r#"{"tone":"ab"}"#)), &auto(), &[], None);
+        assert_eq!(json(&spread[1].record)["tone"], json!({"0": "a", "1": "b", "ev": 0.5, "contrast": 0.1}));
     }
 
     #[test]

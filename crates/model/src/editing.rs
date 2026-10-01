@@ -28,9 +28,10 @@
 //!   `{}` to `isEngine1Version`.
 //! - **Using a raw value.** Operations read it the way the TS expressions did where that
 //!   is cheap to state: truthiness and `?? x` see it as present; arithmetic and labels
-//!   coerce it with JS `ToNumber` ([`Field::num_or`]); spreading a non-object tone or
-//!   white balance spreads nothing. Where TS would have thrown or concatenated strings
-//!   (`"5" + 0.4`), the port coerces to a number instead.
+//!   coerce it with JS `ToNumber` ([`Field::num_or`]); spreading a raw tone copies what
+//!   JS object spread copies — an array's or string's index keys ([`Field::spread`]).
+//!   Where TS would have thrown or concatenated strings (`"5" + 0.4`), the port coerces
+//!   to a number instead.
 //! - **Writing.** [`VersionEdit::to_json`] omits absent fields (as `JSON.stringify` omits
 //!   `undefined`) and spells integral numbers as integers — core reads `engine` and
 //!   `grain.seed` as integers and rejects `2.0`. See [`crate::js_compat::to_json_string`].
@@ -116,13 +117,32 @@ impl<T> Field<T> {
         }
     }
 
-    /// For an object-typed field read by spreading (`{ ...(x ?? {}) }`): the value, or an
-    /// empty one for absent, `null` and a raw value (a non-object spreads nothing).
+    /// For an object-typed field read by member (`x?.ev`): the value, or an empty one for
+    /// absent, `null` and a raw value (a raw value has none of the members). Not for a
+    /// spread — see [`Field::spread`].
     pub fn value_or_default(&self) -> T
     where
         T: Clone + Default,
     {
         self.value().cloned().unwrap_or_default()
+    }
+
+    /// `{ ...(x ?? {}) }` for an object-typed field whose type takes any key (unknown ones
+    /// into its `extra`): the value; for a raw value, what JS object spread copies — an
+    /// array's elements under index keys `"0"`, `"1"`, …, a string's UTF-16 code units
+    /// likewise, nothing for a number or boolean; nothing for absent or `null`.
+    ///
+    /// As far as JSON allows: a character outside the BMP is two code units in JS, each a
+    /// lone surrogate no JSON string can hold, so each is written as U+FFFD.
+    pub fn spread(&self) -> T
+    where
+        T: Clone + Default + serde::de::DeserializeOwned,
+    {
+        match self {
+            Field::Set(v) => v.clone(),
+            Field::Raw(v) => serde_json::from_value(Value::Object(spread_keys(v))).unwrap_or_default(),
+            Field::Absent | Field::Null => T::default(),
+        }
     }
 
     /// The JS value of the key: `None` for absent (`undefined`), else its JSON.
@@ -144,6 +164,25 @@ impl<T> Field<T> {
         T: Serialize,
     {
         js_compat::truthy(self.js().as_ref())
+    }
+}
+
+/// The own enumerable keys JS object spread copies from a non-object JSON value: an
+/// array's indices, a string's UTF-16 code unit indices (a lone surrogate as U+FFFD),
+/// nothing else. An object (never raw for the types [`Field::spread`] serves) copies as is.
+fn spread_keys(v: &Value) -> Map<String, Value> {
+    match v {
+        Value::Object(o) => o.clone(),
+        Value::Array(a) => a.iter().enumerate().map(|(i, e)| (i.to_string(), e.clone())).collect(),
+        Value::String(s) => s
+            .encode_utf16()
+            .enumerate()
+            .map(|(i, u)| {
+                let c = char::from_u32(u32::from(u)).unwrap_or('\u{fffd}');
+                (i.to_string(), Value::String(c.to_string()))
+            })
+            .collect(),
+        Value::Null | Value::Bool(_) | Value::Number(_) => Map::new(),
     }
 }
 

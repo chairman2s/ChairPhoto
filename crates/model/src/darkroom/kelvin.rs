@@ -127,7 +127,7 @@ pub fn with_kelvin_shift(record: &VersionEdit, ctx: &KelvinContext, mireds: f64)
         WbShown::Kelvin { kelvin, tint } => (kelvin, tint),
         WbShown::Relative => (ctx.as_shot.kelvin, ctx.as_shot.tint),
     };
-    let tone = Tone { wb: Field::Set(kelvin_wb(mired_shift(kelvin, mireds), tint)), ..record.tone.value_or_default() };
+    let tone = Tone { wb: Field::Set(kelvin_wb(mired_shift(kelvin, mireds), tint)), ..record.tone.spread() };
     VersionEdit { tone: Field::Set(tone), ..record.clone() }
 }
 

@@ -77,7 +77,7 @@ pub struct RootView {
     /// The catalog the dialog was opened on: a switch closes it.
     catalog_epoch: u64,
     resize: Option<Resize>,
-    _observers: [Subscription; 6],
+    _observers: [Subscription; 7],
 }
 
 impl RootView {
@@ -105,14 +105,27 @@ impl RootView {
         let photo_tags = cx.new(|cx| PhotoTags::new(tags.clone(), target, window, cx));
         let catalog_epoch = model.read(cx).catalog_epoch;
         let _observers = [
-            cx.observe(&model, |this, model, cx| {
+            cx.observe_in(&model, window, |this, model, window, cx| {
                 // A catalog switch closes the dialog: its groups name the old catalog's photos.
+                // The dialog had the focus; the grid gets it back, as on Close.
                 let epoch = model.read(cx).catalog_epoch;
                 if epoch != this.catalog_epoch {
                     this.catalog_epoch = epoch;
-                    this.stacks = None;
+                    if this.stacks.take().is_some() {
+                        this.library.read(cx).focus_handle().clone().focus(window, cx);
+                    }
                 }
                 cx.notify()
+            }),
+            // The root itself focused — by a title-bar menu (its `action_context` focuses the
+            // root before dispatching, and gpui-component's popup then leaves focus there), by
+            // a dialog opened from such a menu restoring focus on close, or by a click on the
+            // chrome: hand it to the grid, so its keys work again. Only on the Library
+            // surface and with no Stack dialog open, where the grid is what takes keys.
+            cx.on_focus(&focus, window, |this, window, cx| {
+                if this.stacks.is_none() && this.shell.read(cx).surface == Surface::Library {
+                    this.library.read(cx).focus_handle().clone().focus(window, cx);
+                }
             }),
             cx.observe(&shell, |this, shell, cx| {
                 // The tagging block follows the selection.
@@ -223,12 +236,12 @@ impl RootView {
     /// `openStackProposals`).
     fn open_stack_proposals(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let targets = self.shell.read(cx).whole_view_targets();
-        if targets.is_empty() {
+        let Some(from) = self.shell.read(cx).rows_from().filter(|_| !targets.is_empty()) else {
             self.model.update(cx, |m, cx| m.set_status("No photos to group — scan or select some first.", cx));
             return;
-        }
+        };
         let (model, shell, images) = (self.model.clone(), self.shell.clone(), self.images.clone());
-        let dialog = cx.new(|cx| StackDialog::new(&model, shell, images, targets, window, cx));
+        let dialog = cx.new(|cx| StackDialog::new(&model, shell, images, targets, from, window, cx));
         let closed = cx.subscribe_in(&dialog, window, |this, _, _: &Closed, window, cx| {
             this.stacks = None;
             this.library.read(cx).focus_handle().clone().focus(window, cx);

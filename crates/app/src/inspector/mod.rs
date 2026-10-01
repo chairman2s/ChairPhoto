@@ -638,13 +638,15 @@ impl PhotoInspector {
     /// The stars: a click on the current rating clears it.
     pub fn rate(&mut self, stars: i64, cx: &mut Context<Self>) {
         let Some(p) = self.photo(cx) else { return };
+        let Some(from) = self.shell.read(cx).rows_from() else { return };
         let rating = next_rating(p.rating, stars);
-        self.shell.update(cx, |s, cx| s.apply_mark_to(Mark::Rating(rating), vec![p.id], cx));
+        self.shell.update(cx, |s, cx| s.apply_mark_to(Mark::Rating(rating), vec![p.id], from, cx));
     }
 
     pub fn pick(&mut self, pick: PickState, cx: &mut Context<Self>) {
         let Some(p) = self.photo(cx) else { return };
-        self.shell.update(cx, |s, cx| s.apply_mark_to(Mark::Pick(pick), vec![p.id], cx));
+        let Some(from) = self.shell.read(cx).rows_from() else { return };
+        self.shell.update(cx, |s, cx| s.apply_mark_to(Mark::Pick(pick), vec![p.id], from, cx));
     }
 
     /// A swatch: a click on the current label clears it; `""` is the Clear swatch, which
@@ -652,7 +654,8 @@ impl PhotoInspector {
     pub fn label(&mut self, name: &str, cx: &mut Context<Self>) {
         let Some(p) = self.photo(cx) else { return };
         let Some(label) = next_label(&p.label, name) else { return };
-        self.shell.update(cx, |s, cx| s.apply_mark_to(Mark::Label(label), vec![p.id], cx));
+        let Some(from) = self.shell.read(cx).rows_from() else { return };
+        self.shell.update(cx, |s, cx| s.apply_mark_to(Mark::Label(label), vec![p.id], from, cx));
     }
 
     /// Orientation: turn the displayed image (non-destructive), then drop its cached images

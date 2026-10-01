@@ -115,6 +115,32 @@ pub(crate) fn open_catalog_with_photos(app: &App, dir: &TempDir, n: usize, cx: &
     ids
 }
 
+/// A second catalog in `dir/<name>` with `n` photos whose ids collide with
+/// [`open_catalog_with_photos`]'s, as two real catalogs' ids do; returns it and the ids.
+pub(crate) fn colliding_catalog(dir: &TempDir, name: &str, n: usize) -> (Catalog, Vec<i64>) {
+    let root = dir.0.join(name);
+    let catalog = Catalog::open(&root.join(format!("{name}.chairphoto")), &root).unwrap();
+    let ids = (0..n)
+        .map(|i| catalog.upsert_photo(&root.join(format!("2026/{name}{i}.ARW")), None, 0, 1).unwrap().id)
+        .collect();
+    (catalog, ids)
+}
+
+/// The core half of a catalog switch (`switch_catalog_in`'s two phases) to `catalog`, with
+/// `catalog:switched` **not** delivered: the window in which the UI still shows the old
+/// catalog's ids while the new catalog is open.
+pub(crate) fn core_switch(app: &App, catalog: Catalog) {
+    chairphoto_core::app::detach_catalog_and_trip_jobs(&app.state).unwrap();
+    chairphoto_core::app::publish_catalog_and_reset_jobs(&app.state, catalog).unwrap();
+    app.state.volume_health.invalidate();
+}
+
+/// Deliver `catalog:switched`, as `switch_catalog_in` sends it after publishing.
+pub(crate) fn deliver_switch(app: &App, cx: &mut TestAppContext) {
+    app.state.send(CoreEvent::CatalogSwitched("switched.chairphoto".into()));
+    cx.run_until_parked();
+}
+
 /// Take focus away from the main window (to a second window) and give it back: the
 /// platform's activation change, as a window manager would send it.
 fn refocus_main_window(app: &App, cx: &mut TestAppContext) {
@@ -146,7 +172,7 @@ pub(crate) fn click(app: &App, id: &'static str, cx: &mut TestAppContext) {
 }
 
 /// Open the menu behind `trigger`, check row `index` is `label`, and click it.
-fn click_menu_row(app: &App, trigger: &'static str, index: usize, label: &str, cx: &mut TestAppContext) {
+pub(crate) fn click_menu_row(app: &App, trigger: &'static str, index: usize, label: &str, cx: &mut TestAppContext) {
     click(app, trigger, cx);
     cx.update_window(app.window(), |_, window, cx| {
         window.render_frame(cx);

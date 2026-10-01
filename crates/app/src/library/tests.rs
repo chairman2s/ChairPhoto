@@ -5,7 +5,10 @@
 use crate::library::grid::LibraryView;
 use crate::model::not_yet_ported_line;
 use crate::shell::state::Mark;
-use crate::tests::{click, open_catalog_with_photos, press, start, status, App, TempDir};
+use crate::tests::{
+    click, click_menu_row, colliding_catalog, core_switch, deliver_switch, open_catalog_with_photos, press, start, status,
+    App, TempDir,
+};
 use chairphoto_core::app::CoreEvent;
 use chairphoto_core::catalog::{CullingFilter, PhotoPage, PickState};
 use gpui_kit::test::TestWindowExt as _;
@@ -214,6 +217,311 @@ fn a_mark_queued_across_a_catalog_switch_is_dropped(cx: &mut TestAppContext) {
     assert_eq!(rating_of(&app, ids[0]).0, 0, "written into whatever catalog was open after the switch");
 }
 
+/// **Forced interleaving** (#106 review, finding 1). A mark is queued on the open catalog's
+/// photo; then the core switches to a catalog whose photo carries the same id, before the
+/// write runs — with `catalog:switched` delivered or still on its way. The new catalog's photo
+/// keeps its rating either way. Both the keys' path (`apply_mark`) and the inspector's
+/// (`apply_mark_to`) are covered.
+fn mark_across_a_switch(delivered: bool, cx: &mut TestAppContext) {
+    let dir = TempDir::new("grid-switch-ids");
+    let app = start(cx);
+    let ids = open_catalog_with_photos(&app, &dir, 2, cx);
+    click_tile(&app, ids[0], Modifiers::default(), cx);
+    let from = app.wired.shell.read_with(cx, |s, _| s.rows_from().unwrap());
+    app.wired.shell.update(cx, |s, cx| {
+        s.apply_mark(Mark::Rating(5), false, cx);
+        s.apply_mark_to(Mark::Pick(PickState::Pick), vec![ids[1]], from, cx);
+    });
+    let (b, b_ids) = colliding_catalog(&dir, "b", 2);
+    assert_eq!(b_ids, ids, "the ids collide, as real catalogs' do");
+    core_switch(&app, b);
+    if delivered {
+        deliver_switch(&app, cx);
+    }
+    cx.run_until_parked();
+    assert_eq!(rating_of(&app, b_ids[0]).0, 0, "the old catalog's mark landed on the new catalog's photo");
+    assert_eq!(rating_of(&app, b_ids[1]).1, PickState::None, "the inspector's mark landed on the new catalog");
+    if !delivered {
+        assert_eq!(status(&app, cx), format!("Could not mark: {}", chairphoto_core::app::CATALOG_CHANGED));
+        // The rows the refused write re-read are the new catalog's: the old selection is gone.
+        assert_eq!(selection(&app, cx), (None, vec![]));
+    }
+}
+
+#[gpui_kit::test]
+fn a_mark_never_reaches_the_new_catalog_before_the_switch_event(cx: &mut TestAppContext) {
+    mark_across_a_switch(false, cx);
+}
+
+#[gpui_kit::test]
+fn a_mark_never_reaches_the_new_catalog_after_the_switch_event(cx: &mut TestAppContext) {
+    mark_across_a_switch(true, cx);
+}
+
+/// **Forced interleaving** (finding 2). Burst analysis started on the open catalog runs
+/// after the core switched to a catalog with the same ids: the new catalog's burst flags are
+/// untouched (an analysis of unscored photos would clear them), event delivered or not.
+fn burst_across_a_switch(delivered: bool, cx: &mut TestAppContext) {
+    let dir = TempDir::new("grid-burst-switch");
+    let app = start(cx);
+    let ids = open_catalog_with_photos(&app, &dir, 3, cx);
+    let (b, b_ids) = colliding_catalog(&dir, "b", 3);
+    assert_eq!(b_ids, ids);
+    b.set_burst_flags(b_ids.iter().map(|&id| (id, "soft-in-burst".to_string())).collect()).unwrap();
+    cx.update_window(app.window(), |_, window, cx| {
+        window.dispatch_action(Box::new(crate::shell::actions::AnalyseBurst), cx)
+    })
+    .unwrap();
+    core_switch(&app, b);
+    if delivered {
+        deliver_switch(&app, cx);
+    }
+    cx.run_until_parked();
+    let flags: Vec<Option<String>> = {
+        let guard = app.state.catalog.lock().unwrap();
+        b_ids.iter().map(|&id| guard.as_ref().unwrap().get_photo(id).unwrap().burst_flag).collect()
+    };
+    assert!(flags.iter().all(|f| f.as_deref() == Some("soft-in-burst")), "flags rewritten in the new catalog: {flags:?}");
+    if !delivered {
+        assert_eq!(status(&app, cx), format!("Burst analysis failed: {}", chairphoto_core::app::CATALOG_CHANGED));
+    }
+}
+
+#[gpui_kit::test]
+fn burst_analysis_never_reaches_the_new_catalog_before_the_switch_event(cx: &mut TestAppContext) {
+    burst_across_a_switch(false, cx);
+}
+
+#[gpui_kit::test]
+fn burst_analysis_never_reaches_the_new_catalog_after_the_switch_event(cx: &mut TestAppContext) {
+    burst_across_a_switch(true, cx);
+}
+
+/// The first three photos a second apart with one hash, the rest an hour or more later: one
+/// burst.
+fn make_burst(c: &chairphoto_core::catalog::Catalog, ids: &[i64]) {
+    for (i, id) in ids.iter().enumerate() {
+        let time = if i < 3 { format!("2026-01-01T10:00:0{i}") } else { format!("2026-01-01T{}:00:00", 11 + i) };
+        c.conn().execute("UPDATE photos SET capture_time = ?1, phash = 7 WHERE id = ?2", (time.as_str(), *id)).unwrap();
+    }
+}
+
+fn stack_dialog(app: &App, cx: &mut TestAppContext) -> Entity<crate::library::stacks::StackDialog> {
+    let root = app.wired.root.clone().unwrap();
+    root.read_with(cx, |root, _| root.stacks.as_ref().map(|(d, _)| d.clone())).expect("the Stack dialog is open")
+}
+
+/// **Forced interleaving** (finding 2). The Stack dialog proposed a burst in the open
+/// catalog; the core switches to a catalog whose photos carry the same ids and form the same
+/// burst; then Stack is accepted (before the event closes the dialog), or accepted and the
+/// event delivered before the write runs. Nothing is stacked in the new catalog.
+fn stack_accept_across_a_switch(delivered: bool, cx: &mut TestAppContext) {
+    let dir = TempDir::new("grid-stack-switch");
+    let app = start(cx);
+    let ids = open_catalog_with_photos(&app, &dir, 4, cx);
+    make_burst(app.state.catalog.lock().unwrap().as_ref().unwrap(), &ids);
+    cx.update_window(app.window(), |_, window, cx| {
+        window.dispatch_action(Box::new(crate::shell::actions::ProposeStacks), cx)
+    })
+    .unwrap();
+    cx.run_until_parked();
+    let dialog = stack_dialog(&app, cx);
+    let group = dialog.read_with(cx, |d, _| {
+        let r = d.result.as_ref().expect("proposed");
+        assert_eq!(r.proposals.len(), 1);
+        r.proposals[0].keeper_id
+    });
+
+    let (b, b_ids) = colliding_catalog(&dir, "b", 4);
+    assert_eq!(b_ids, ids);
+    make_burst(&b, &b_ids);
+    core_switch(&app, b);
+    dialog.update(cx, |d, cx| d.accept(group, cx));
+    if delivered {
+        deliver_switch(&app, cx);
+    }
+    cx.run_until_parked();
+    let stacked = {
+        let guard = app.state.catalog.lock().unwrap();
+        b_ids.iter().filter(|&&id| guard.as_ref().unwrap().get_photo(id).unwrap().stack_parent_id.is_some()).count()
+    };
+    assert_eq!(stacked, 0, "the old catalog's proposal stacked the new catalog's photos");
+    if !delivered {
+        dialog.read_with(cx, |d, _| assert_eq!(d.error.as_deref(), Some(chairphoto_core::app::CATALOG_CHANGED)));
+    }
+}
+
+#[gpui_kit::test]
+fn a_stack_accept_never_reaches_the_new_catalog_before_the_switch_event(cx: &mut TestAppContext) {
+    stack_accept_across_a_switch(false, cx);
+}
+
+#[gpui_kit::test]
+fn a_stack_accept_never_reaches_the_new_catalog_after_the_switch_event(cx: &mut TestAppContext) {
+    stack_accept_across_a_switch(true, cx);
+}
+
+/// Whether the grid holds the focus (its keys work).
+fn grid_focused(app: &App, cx: &mut TestAppContext) -> bool {
+    let grid = library_view(app, cx);
+    cx.update_window(app.window(), |_, window, cx| grid.read(cx).focus_handle().is_focused(window)).unwrap()
+}
+
+/// Make the main window the active one, as on screen: GPUI reports focus changes to its
+/// listeners only in an active window.
+fn activate(app: &App, cx: &mut TestAppContext) {
+    cx.update_window(app.window(), |_, window, _| window.activate_window()).unwrap();
+    cx.run_until_parked();
+}
+
+/// More ⋯ → Preferences…, its row in the menu.
+const PREFERENCES_ROW: usize = 15;
+
+/// Finding 4: a title-bar menu action leaves the grid's keys working. gpui-component's
+/// popup focuses the menu's action context (the root) to dispatch, and leaves focus there;
+/// the root hands it back to the grid.
+#[gpui_kit::test]
+fn grid_keys_work_after_a_title_bar_menu_action(cx: &mut TestAppContext) {
+    let dir = TempDir::new("grid-menu-focus");
+    let app = start(cx);
+    let ids = open_catalog_with_photos(&app, &dir, 3, cx);
+    activate(&app, cx);
+    click_tile(&app, ids[1], Modifiers::default(), cx);
+    click_menu_row(&app, "import-menu", 4, "Cache previews on import", cx);
+    render(&app, cx);
+    assert!(grid_focused(&app, cx), "focus stayed on the root after the menu action");
+    press(&app, "4", cx);
+    assert_eq!(rating_of(&app, ids[1]).0, 4, "the grid's key did nothing after the menu");
+}
+
+/// Finding 4, a dialog opened from a menu: when it closes, focus returns to the root, and
+/// the root hands it to the grid.
+#[gpui_kit::test]
+fn grid_keys_work_after_a_dialog_opened_from_a_menu_closes(cx: &mut TestAppContext) {
+    use gpui_kit::component::WindowExt as _;
+    let dir = TempDir::new("grid-dialog-focus");
+    let app = start(cx);
+    let ids = open_catalog_with_photos(&app, &dir, 3, cx);
+    activate(&app, cx);
+    click_tile(&app, ids[1], Modifiers::default(), cx);
+    click_menu_row(&app, "more-menu", PREFERENCES_ROW, "Preferences…", cx);
+    render(&app, cx);
+    assert!(!grid_focused(&app, cx), "the dialog took the focus");
+    cx.update_window(app.window(), |_, window, cx| window.close_dialog(cx)).unwrap();
+    cx.run_until_parked();
+    render(&app, cx);
+    assert!(grid_focused(&app, cx), "the closed dialog left the focus on the root");
+    press(&app, "3", cx);
+    assert_eq!(rating_of(&app, ids[1]).0, 3);
+}
+
+/// Finding 5: a catalog switch that closes the Stack dialog gives the grid its focus back.
+#[gpui_kit::test]
+fn a_switch_closing_the_stack_dialog_refocuses_the_grid(cx: &mut TestAppContext) {
+    let dir = TempDir::new("grid-stack-refocus");
+    let app = start(cx);
+    let ids = open_catalog_with_photos(&app, &dir, 4, cx);
+    make_burst(app.state.catalog.lock().unwrap().as_ref().unwrap(), &ids);
+    cx.update_window(app.window(), |_, window, cx| {
+        window.dispatch_action(Box::new(crate::shell::actions::ProposeStacks), cx)
+    })
+    .unwrap();
+    cx.run_until_parked();
+    render(&app, cx);
+    stack_dialog(&app, cx);
+    assert!(!grid_focused(&app, cx));
+    let (b, _) = colliding_catalog(&dir, "b", 2);
+    core_switch(&app, b);
+    deliver_switch(&app, cx);
+    render(&app, cx);
+    let root = app.wired.root.clone().unwrap();
+    assert!(root.read_with(cx, |root, _| root.stacks.is_none()), "the switch closed the dialog");
+    assert!(grid_focused(&app, cx), "the grid lost its keys with the dialog");
+}
+
+/// Finding 6: the Stack dialog asks for the thumbnails of the groups on screen (plus an
+/// overscan), not all of them; what scrolls away is released, and closing releases the rest.
+/// Its image store here has a pool that answers nothing, so a request stays pending until it
+/// is released (cancelled in the pool).
+#[gpui_kit::test]
+fn the_stack_dialog_windows_and_releases_its_thumbnails(cx: &mut TestAppContext) {
+    use crate::image_tests::FakePool;
+    use crate::library::stacks::StackDialog;
+    use chairphoto_core::image_pool::{ImageKind, JobKey};
+    let dir = TempDir::new("grid-stack-thumbs");
+    let app = start(cx);
+    let groups = 40;
+    let ids = open_catalog_with_photos(&app, &dir, groups * 2, cx);
+    {
+        let guard = app.state.catalog.lock().unwrap();
+        let c = guard.as_ref().unwrap();
+        // Pairs a second apart, pairs an hour apart, each pair its own hash.
+        for (i, id) in ids.iter().enumerate() {
+            let (g, k) = (i / 2, i % 2);
+            let time = format!("2026-01-{:02}T{:02}:00:0{k}", 1 + g / 20, g % 20);
+            c.conn()
+                .execute(
+                    "UPDATE photos SET capture_time = ?1, phash = ?2 WHERE id = ?3",
+                    (time.as_str(), (g as i64) * 1_000_003, *id),
+                )
+                .unwrap();
+        }
+    }
+    let pool = std::sync::Arc::new(FakePool::default());
+    let images = cx.update(|cx| {
+        let submit: std::sync::Arc<dyn crate::image_store::Submit> = pool.clone();
+        cx.new(|cx| crate::image_store::ImageStore::new(submit, crate::image_store::DEFAULT_BUDGET_BYTES, cx))
+    });
+    let (model, shell) = (app.wired.model.clone(), app.wired.shell.clone());
+    let from = shell.read_with(cx, |s, _| s.rows_from().unwrap());
+    let dialog_window = cx.update(|cx| {
+        let (images, ids) = (images.clone(), ids.clone());
+        cx.open_window(Default::default(), |window, cx| {
+            cx.new(|cx| StackDialog::new(&model, shell, images, ids, from, window, cx))
+        })
+        .unwrap()
+    });
+    let dialog = dialog_window.root(cx).unwrap();
+    let window: gpui_kit::AnyWindowHandle = dialog_window.into();
+    cx.run_until_parked();
+    for _ in 0..3 {
+        cx.update_window(window, |_, window, cx| window.render_frame(cx)).unwrap();
+        cx.run_until_parked();
+    }
+    dialog.read_with(cx, |d, _| assert_eq!(d.result.as_ref().map(|r| r.proposals.len()), Some(groups)));
+    let first = pool.submitted();
+    assert!(first > 0, "the visible groups asked for their frames");
+    assert!(first < groups, "{first} of {} frames requested at once", groups * 2);
+    let first_window = dialog.read_with(cx, |d, _| d.requested.clone());
+
+    for _ in 0..6 {
+        cx.update_window(window, |_, window, cx| {
+            window.scroll("stack-body", ScrollDelta::Pixels(point(px(0.), px(-600.))), cx)
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(window, |_, window, cx| window.render_frame(cx)).unwrap();
+        cx.run_until_parked();
+    }
+    let later = dialog.read_with(cx, |d, _| d.requested.clone());
+    assert!(pool.submitted() > first, "scrolling asked for the revealed groups");
+    let cancelled: Vec<JobKey> = pool.cancelled.lock().unwrap().clone();
+    let gone: Vec<i64> = first_window.difference(&later).copied().collect();
+    assert!(!gone.is_empty(), "the window did not move");
+    for id in &gone {
+        assert!(cancelled.contains(&JobKey::photo(*id, ImageKind::Thumb)), "frame {id} scrolled away but was not released");
+    }
+
+    drop(dialog);
+    cx.update_window(window, |_, window, _| window.remove_window()).unwrap();
+    cx.run_until_parked();
+    let cancelled: Vec<JobKey> = pool.cancelled.lock().unwrap().clone();
+    for id in &later {
+        assert!(cancelled.contains(&JobKey::photo(*id, ImageKind::Thumb)), "frame {id} still wanted after the dialog closed");
+    }
+    images.read_with(cx, |s, _| assert!(later.iter().all(|&id| !s.is_pending(id, ImageKind::Thumb))));
+}
+
 /// A page from a superseded read does not replace the newer rows (the session's
 /// generation), and the newest read is the one that marks the rows loaded.
 #[gpui_kit::test]
@@ -226,7 +534,8 @@ fn a_stale_page_does_not_replace_newer_rows(cx: &mut TestAppContext) {
     click(&app, "filter-Picks", cx);
     assert!(rows(&app, cx).is_empty());
     app.wired.shell.update(cx, |s, cx| {
-        s.on_page(&stale, Ok(PhotoPage { photos: all_rows, offset: 0, total: ids.len() }), cx)
+        let from = s.rows_from().unwrap();
+        s.on_page(&stale, Ok((from, PhotoPage { photos: all_rows, offset: 0, total: ids.len() })), cx)
     });
     assert!(rows(&app, cx).is_empty(), "the old unfiltered page landed over the Picks view");
 }

@@ -334,6 +334,22 @@ pub fn create_fence_for(
     create_fence(catalog.conn(), name, tag_path, polygon)
 }
 
+/// Update a fence via a `Catalog` reference (the GPUI Map module). Returns rows changed.
+pub fn update_fence_for(
+    catalog: &crate::catalog::Catalog,
+    id: i64,
+    name: &str,
+    tag_path: &str,
+    polygon: &[LatLng],
+) -> rusqlite::Result<usize> {
+    update_fence(catalog.conn(), id, name, tag_path, polygon)
+}
+
+/// Delete a fence via a `Catalog` reference (the GPUI Map module). Returns rows removed.
+pub fn delete_fence_for(catalog: &crate::catalog::Catalog, id: i64) -> rusqlite::Result<usize> {
+    delete_fence(catalog.conn(), id)
+}
+
 /// List all fences via a `Catalog` reference.
 pub fn list_fences_for(catalog: &crate::catalog::Catalog) -> rusqlite::Result<Vec<Fence>> {
     list_fences(catalog.conn())

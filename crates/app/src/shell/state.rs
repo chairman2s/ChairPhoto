@@ -260,7 +260,10 @@ pub struct ShellState {
     pub scope_info: ScopeInfo,
     lists_generation: u64,
     scope_generation: u64,
-    focus_generation: u64,
+    /// Owns `counts.pending`/`counts.trash`: bumped by every read that writes them (a catalog
+    /// refresh and a focus refresh alike) and by a catalog switch, so only the newest read's
+    /// counts land (Codex review of e06d3c5).
+    counts_generation: u64,
     _model_events: Subscription,
 }
 
@@ -294,7 +297,7 @@ impl ShellState {
             scope_info: ScopeInfo::default(),
             lists_generation: 0,
             scope_generation: 0,
-            focus_generation: 0,
+            counts_generation: 0,
             _model_events,
         }
     }
@@ -436,7 +439,7 @@ impl ShellState {
                 // the model's `CatalogRead`.
                 self.lists_generation += 1;
                 self.scope_generation += 1;
-                self.focus_generation += 1;
+                self.counts_generation += 1;
                 cx.notify();
             }
             _ if jobs_changed => cx.notify(),
@@ -447,7 +450,8 @@ impl ShellState {
     /// Re-read the lists, the counts and the scope's match count, off the UI thread.
     pub fn refresh_catalog_data(&mut self, cx: &mut Context<Self>) {
         self.lists_generation += 1;
-        let generation = self.lists_generation;
+        self.counts_generation += 1;
+        let (generation, counts_generation) = (self.lists_generation, self.counts_generation);
         let state = self.app.clone();
         // GPUI's background executor, as `AppModel::refresh` (and for the same reason: the
         // deterministic test scheduler). Short catalog reads only.
@@ -455,18 +459,21 @@ impl ShellState {
         cx.spawn(async move |this, cx| {
             let (lists, counts) = read.await;
             this.update(cx, |s, cx| {
-                if s.lists_generation != generation {
-                    return;
+                if s.lists_generation == generation {
+                    match lists {
+                        Ok(lists) => s.lists = lists,
+                        Err(e) => eprintln!("shell: lists unavailable: {e}"),
+                    }
+                    if counts.identity_debt.is_some() {
+                        s.counts.identity_debt = counts.identity_debt;
+                    }
                 }
-                match lists {
-                    Ok(lists) => s.lists = lists,
-                    Err(e) => eprintln!("shell: lists unavailable: {e}"),
+                // The back-up queue and trash counts are also written by `refresh_on_focus`; a
+                // newer read of either kind supersedes this one.
+                if s.counts_generation == counts_generation {
+                    s.counts.pending = counts.pending;
+                    s.counts.trash = counts.trash.or(s.counts.trash);
                 }
-                s.counts.pending = counts.pending;
-                if counts.identity_debt.is_some() {
-                    s.counts.identity_debt = counts.identity_debt;
-                }
-                s.counts.trash = counts.trash.or(s.counts.trash);
                 cx.notify();
             })
             .ok();
@@ -480,8 +487,8 @@ impl ShellState {
     /// start is Storage and import, #114). Off the UI thread; a read that a newer focus or a
     /// catalog switch superseded is dropped. No-op with no catalog open.
     pub fn refresh_on_focus(&mut self, cx: &mut Context<Self>) {
-        self.focus_generation += 1;
-        let generation = self.focus_generation;
+        self.counts_generation += 1;
+        let generation = self.counts_generation;
         let state = self.app.clone();
         let read = cx.background_executor().spawn(async move {
             let pending = with_catalog(&state, |c| c.list_pending_operations())
@@ -492,7 +499,7 @@ impl ShellState {
         cx.spawn(async move |this, cx| {
             let (pending, trash) = read.await;
             this.update(cx, |s, cx| {
-                if s.focus_generation != generation {
+                if s.counts_generation != generation {
                     return;
                 }
                 // A failed read (e.g. no catalog yet) leaves the counts as they were: unknown

@@ -51,12 +51,21 @@ struct InFlight {
     flag: Arc<AtomicBool>,
 }
 
-/// Registry of per-photo cancel flags for in-flight RapidRAW watchers. A `cancel_rapidraw`
-/// command trips the flag for a photo; the watcher loop checks it each tick. Kept module-local
-/// (rather than on `AppState`) so this feature is self-contained.
-fn cancels() -> &'static Mutex<HashMap<i64, InFlight>> {
-    static CANCELS: OnceLock<Mutex<HashMap<i64, InFlight>>> = OnceLock::new();
-    CANCELS.get_or_init(|| Mutex::new(HashMap::new()))
+/// The cancel registry: per photo, the round-trip in flight and its abandon flag; per job id,
+/// the flag of a round-trip queued but not started yet ([`queue_job`]). One mutex for both,
+/// so a cancel always finds a job's flag: a starting worker registers it in flight before it
+/// leaves the queue. A `cancel_rapidraw` command trips the flag; the worker checks it before
+/// launching and the watcher loop each tick. Kept module-local (rather than on `AppState`) so
+/// this feature is self-contained.
+#[derive(Default)]
+struct Registry {
+    in_flight: HashMap<i64, InFlight>,
+    queued: HashMap<u64, Arc<AtomicBool>>,
+}
+
+fn registry() -> std::sync::MutexGuard<'static, Registry> {
+    static REGISTRY: OnceLock<Mutex<Registry>> = OnceLock::new();
+    REGISTRY.get_or_init(Mutex::default).lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// A fresh job id for [`edit_in_rapidraw_as`]. Ids are process-wide and never reused, so a
@@ -67,17 +76,45 @@ pub fn next_job_id() -> u64 {
     NEXT.fetch_add(1, Ordering::Relaxed)
 }
 
-/// Install a fresh cancel flag for `photo_id` (owned by `job_id`) and return it, or `None` if
-/// an edit for this photo is already in flight. Rejecting the second edit (rather than replacing the entry)
-/// keeps each worker's `clear_cancel` unambiguous — otherwise the first worker's clear would
-/// drop the second's flag, leaving the second watcher uncancellable. It also matches RapidRAW's
-/// single-instance nature: a second launch on the same photo forwards into the first anyway.
-fn register_cancel(photo_id: i64, job_id: u64) -> Option<Arc<AtomicBool>> {
+/// A round-trip queued for a worker, under a fresh job id ([`next_job_id`]) whose cancel flag
+/// is registered from now on: [`cancel_rapidraw_job`] before the worker starts makes
+/// [`edit_in_rapidraw_as`] end as cancelled without launching RapidRAW. Dropped unstarted
+/// (the queue discarded it), it unregisters itself.
+pub struct QueuedJob {
+    id: u64,
+    flag: Arc<AtomicBool>,
+}
+
+impl QueuedJob {
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+}
+
+impl Drop for QueuedJob {
+    fn drop(&mut self) {
+        registry().queued.remove(&self.id);
+    }
+}
+
+/// Queue a round-trip: its job id, cancellable from this moment.
+pub fn queue_job() -> QueuedJob {
+    let (id, flag) = (next_job_id(), Arc::new(AtomicBool::new(false)));
+    registry().queued.insert(id, flag.clone());
+    QueuedJob { id, flag }
+}
+
+/// Register `flag` as the cancel flag of `photo_id`'s round-trip (owned by `job_id`) and return
+/// it, or `None` if an edit for this photo is already in flight. Rejecting the second edit
+/// (rather than replacing the entry) keeps each worker's `clear_cancel` unambiguous — otherwise
+/// the first worker's clear would drop the second's flag, leaving the second watcher
+/// uncancellable. It also matches RapidRAW's single-instance nature: a second launch on the
+/// same photo forwards into the first anyway.
+fn register_cancel(photo_id: i64, job_id: u64, flag: Arc<AtomicBool>) -> Option<Arc<AtomicBool>> {
     use std::collections::hash_map::Entry;
-    match cancels().lock().unwrap().entry(photo_id) {
+    match registry().in_flight.entry(photo_id) {
         Entry::Occupied(_) => None,
         Entry::Vacant(v) => {
-            let flag = Arc::new(AtomicBool::new(false));
             v.insert(InFlight { job_id, flag: flag.clone() });
             Some(flag)
         }
@@ -86,7 +123,7 @@ fn register_cancel(photo_id: i64, job_id: u64) -> Option<Arc<AtomicBool>> {
 
 /// Remove the cancel flag for `photo_id` once its workflow has ended (on every path).
 fn clear_cancel(photo_id: i64) {
-    cancels().lock().unwrap().remove(&photo_id);
+    registry().in_flight.remove(&photo_id);
 }
 
 /// Whether a command is runnable: an absolute/relative path is checked directly; a bare name
@@ -345,6 +382,9 @@ pub fn run_roundtrip(
         "png" => "png",
         _ => "tiff",
     };
+    if cancel.load(Ordering::Relaxed) {
+        return Ok(None); // cancelled before the launch
+    }
     let source_photo_id = r.source_photo_id;
     let out = unique_output_path(&r.source, ext)?;
     progress("editing", &out.to_string_lossy());
@@ -394,32 +434,41 @@ pub fn run_roundtrip(
 ///
 /// Returns the new stacked child's id on success, or `None` if the wait was cancelled.
 pub async fn edit_in_rapidraw(state: AppState, photo_id: i64) -> Result<Option<i64>, String> {
-    edit(state, None, photo_id, next_job_id()).await
+    edit(state, None, photo_id, queue_job()).await
 }
 
 /// [`edit_in_rapidraw`] of a photo read from the catalog `expected` names, under a job id the
-/// caller chose ([`next_job_id`]), so it can follow the job's `rapidraw:progress` events from
-/// the first one and cancel exactly this job ([`cancel_rapidraw_job`]). Once another catalog
+/// caller queued ([`queue_job`]), so it can follow the job's `rapidraw:progress` events from
+/// the first one and cancel exactly this job ([`cancel_rapidraw_job`]) — also before this
+/// starts, which then launches nothing and ends as cancelled. Once another catalog
 /// is open it fails closed with [`CATALOG_CHANGED`]: RapidRAW is not launched on, and nothing
 /// is imported into, the new catalog's photo with the same id.
 pub async fn edit_in_rapidraw_as(
     state: AppState,
     expected: CatalogIdentity,
     photo_id: i64,
-    job_id: u64,
+    job: QueuedJob,
 ) -> Result<Option<i64>, String> {
-    edit(state, Some(expected), photo_id, job_id).await
+    edit(state, Some(expected), photo_id, job).await
 }
 
 async fn edit(
     state: AppState,
     expected: Option<CatalogIdentity>,
     photo_id: i64,
-    job_id: u64,
+    job: QueuedJob,
 ) -> Result<Option<i64>, String> {
+    let job_id = job.id;
+    if job.flag.load(Ordering::Relaxed) {
+        // Cancelled while queued: nothing was launched.
+        emit(&state, photo_id, job_id, "cancelled", "");
+        return Ok(None);
+    }
     let r = resolve(&state, expected, photo_id)?;
-    let cancel = register_cancel(photo_id, job_id)
+    let cancel = register_cancel(photo_id, job_id, job.flag.clone())
         .ok_or("This photo is already being edited in RapidRAW — finish or cancel that edit first")?;
+    // In flight now (same flag), so it leaves the queue: a cancel finds it either way.
+    drop(job);
     let state2 = state.clone();
 
     let joined = crate::app::spawn_blocking(move || {
@@ -444,20 +493,23 @@ async fn edit(
 /// abandons the wait (used both to give up on a forwarded session and to resolve the
 /// "closed without Done" case, which the app can't distinguish from forwarding).
 pub fn cancel_rapidraw(photo_id: i64) -> Result<(), String> {
-    if let Some(in_flight) = cancels().lock().map_err(|e| e.to_string())?.get(&photo_id) {
+    if let Some(in_flight) = registry().in_flight.get(&photo_id) {
         in_flight.flag.store(true, Ordering::Relaxed);
     }
     Ok(())
 }
 
-/// [`cancel_rapidraw`], only if `job_id` is the round-trip in flight for `photo_id`: a front
-/// end that followed one job cannot cancel another (one started later, or on the same photo
-/// id in another catalog).
+/// [`cancel_rapidraw`], only if `job_id` is the round-trip in flight for `photo_id` — or one
+/// still queued ([`queue_job`]), which then never launches: a front end that followed one job
+/// cannot cancel another (one started later, or on the same photo id in another catalog).
 pub fn cancel_rapidraw_job(photo_id: i64, job_id: u64) -> Result<(), String> {
-    if let Some(in_flight) = cancels().lock().map_err(|e| e.to_string())?.get(&photo_id) {
-        if in_flight.job_id == job_id {
-            in_flight.flag.store(true, Ordering::Relaxed);
-        }
+    let registry = registry();
+    let flag = match registry.in_flight.get(&photo_id) {
+        Some(in_flight) if in_flight.job_id == job_id => Some(&in_flight.flag),
+        _ => registry.queued.get(&job_id),
+    };
+    if let Some(flag) = flag {
+        flag.store(true, Ordering::Relaxed);
     }
     Ok(())
 }
@@ -511,10 +563,10 @@ mod tests {
         clear_cancel(pid); // ensure a clean slate regardless of test order
 
         // First edit registers a flag.
-        let first = register_cancel(pid, 1).expect("first edit registers a cancel flag");
+        let first = register_cancel(pid, 1, Arc::default()).expect("first edit registers a cancel flag");
         // A second edit for the SAME photo is rejected — it must NOT overwrite the entry
         // (otherwise the first worker's clear_cancel would drop the second's flag).
-        assert!(register_cancel(pid, 2).is_none(), "a second in-flight edit must be rejected");
+        assert!(register_cancel(pid, 2, Arc::default()).is_none(), "a second in-flight edit must be rejected");
 
         // cancel_rapidraw still targets the (single) in-flight flag.
         cancel_rapidraw(pid).unwrap();
@@ -522,7 +574,7 @@ mod tests {
 
         // Once the first worker clears its entry, a fresh edit can register again.
         clear_cancel(pid);
-        assert!(register_cancel(pid, 3).is_some(), "after clear, a new edit registers");
+        assert!(register_cancel(pid, 3, Arc::default()).is_some(), "after clear, a new edit registers");
         clear_cancel(pid);
     }
 
@@ -532,13 +584,58 @@ mod tests {
         clear_cancel(pid);
         let (old, new) = (next_job_id(), next_job_id());
         assert_ne!(old, new, "job ids are never reused");
-        let flag = register_cancel(pid, new).expect("registers");
+        let flag = register_cancel(pid, new, Arc::default()).expect("registers");
 
         cancel_rapidraw_job(pid, old).unwrap();
         assert!(!flag.load(Ordering::Relaxed), "another job's cancel must not trip this one");
         cancel_rapidraw_job(pid, new).unwrap();
         assert!(flag.load(Ordering::Relaxed), "its own job id cancels it");
         clear_cancel(pid);
+    }
+
+    /// A job cancelled while queued (#108 gate): `cancel_rapidraw_job` before the worker
+    /// starts makes `edit_in_rapidraw_as` end as cancelled (`Ok(None)`) without launching the
+    /// binary (a fake script that logs its arguments — never RapidRAW), and the job leaves the
+    /// registry. A queued job that is not cancelled does launch it (the positive control).
+    /// (Mutation-checked: without the `queued` lookup in `cancel_rapidraw_job`, the cancelled
+    /// job launches the fake and this fails.)
+    #[test]
+    fn a_job_cancelled_before_it_starts_launches_nothing() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = crate::test_support::TestTmpDir::new("rapidraw-cancel-queued");
+        let (script, log) = (dir.join("fake-rapidraw.sh"), dir.join("fake-rapidraw.log"));
+        std::fs::write(&script, format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nexit 1\n", log.display())).unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let c = Catalog::open(&dir.join("c.chairphoto"), &dir.join("photos")).unwrap();
+        c.set_setting(BIN_SETTING, script.to_str().unwrap()).unwrap();
+        // Photo 3: other tests in this binary edit photo 1, and the registry is per photo id.
+        let photo = (0..3)
+            .map(|i| {
+                let original = dir.join(format!("photos/p{i}.ARW"));
+                std::fs::create_dir_all(original.parent().unwrap()).unwrap();
+                std::fs::write(&original, b"raw").unwrap();
+                c.upsert_photo(&original, None, 0, 1).unwrap().id
+            })
+            .last()
+            .unwrap();
+        let state = AppState::default();
+        *state.catalog.lock().unwrap() = Some(c);
+        let from = crate::app::catalog_identity(&state).unwrap();
+        let rt = crate::app::runtime();
+
+        let job = queue_job();
+        let id = job.id();
+        cancel_rapidraw_job(photo, id).unwrap();
+        assert_eq!(rt.block_on(edit_in_rapidraw_as(state.clone(), from, photo, job)), Ok(None));
+        assert!(!log.exists(), "launched after its cancel: {:?}", std::fs::read_to_string(&log));
+        assert!(!registry().queued.contains_key(&id), "the job left the queue");
+
+        assert!(rt.block_on(edit_in_rapidraw_as(state.clone(), from, photo, queue_job())).is_err(), "the fake exits 1");
+        assert_eq!(std::fs::read_to_string(&log).expect("an uncancelled job launches").lines().count(), 1);
+        let dropped = queue_job();
+        let dropped_id = dropped.id();
+        drop(dropped);
+        assert!(!registry().queued.contains_key(&dropped_id), "a job dropped unstarted unregisters");
     }
 
     #[test]

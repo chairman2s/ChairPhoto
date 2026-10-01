@@ -51,8 +51,9 @@
 //! `rapidraw::edit_in_rapidraw_as`): a run whose worker starts after a switch fails closed
 //! under the catalog lock, before anything is launched or imported. A sidecar-editor run is
 //! owned by a sequence number per photo; its result lands only if no newer run for that photo started and the
-//! catalog did not switch. A RapidRAW round-trip gets a core job id
-//! (`rapidraw::next_job_id`) before it starts: its `rapidraw:progress` events (routed here
+//! catalog did not switch. A RapidRAW round-trip is queued under a core job id
+//! (`rapidraw::queue_job`) before its worker starts — cancellable from then on, so a Cancel
+//! before the worker runs means RapidRAW is never launched: its `rapidraw:progress` events (routed here
 //! through `AppModel`) and its result update the photo's entry only while that job still owns
 //! it, and Cancel cancels exactly that job (`cancel_rapidraw_job`). A catalog switch drops
 //! every entry; round-trips already running keep running and import into the catalog they
@@ -1142,13 +1143,15 @@ impl PhotoInspector {
         if self.rapid.contains_key(&id) {
             return;
         }
-        let job = chairphoto_core::rapidraw::next_job_id();
+        // Queued under its job id now, so a Cancel before the worker starts still lands.
+        let queued = chairphoto_core::rapidraw::queue_job();
+        let job = queued.id();
         self.rapid.insert(id, RapidRun { job, phase: RapidPhase::Editing });
         self.notes.remove(&id);
         cx.notify();
         self.run_blocking(
             move |state| {
-                futures::executor::block_on(chairphoto_core::rapidraw::edit_in_rapidraw_as(state.clone(), from, id, job))
+                futures::executor::block_on(chairphoto_core::rapidraw::edit_in_rapidraw_as(state.clone(), from, id, queued))
             },
             move |this, result, cx| this.on_rapidraw_result(id, job, result, cx),
             cx,

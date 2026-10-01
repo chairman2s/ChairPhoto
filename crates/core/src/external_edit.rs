@@ -565,7 +565,7 @@ mod tests {
         let develop = rt.block_on(develop_in_editor_as(state.clone(), from, a_id, key()));
         assert_eq!(develop, Ok(None), "the fake GUI changed no sidecar");
         assert!(rt.block_on(import_developed_as(state.clone(), from, a_id, key())).is_err(), "the fake CLI renders nothing");
-        let job = crate::rapidraw::next_job_id();
+        let job = crate::rapidraw::queue_job();
         assert!(rt.block_on(crate::rapidraw::edit_in_rapidraw_as(state.clone(), from, a_id, job)).is_err());
         let ran = std::fs::read_to_string(&log).expect("the bound runs launched the fake");
         assert_eq!(ran.lines().count(), 3, "{ran}");
@@ -577,7 +577,7 @@ mod tests {
         let changed = Err(CATALOG_CHANGED.to_string());
         assert_eq!(rt.block_on(develop_in_editor_as(state.clone(), from, b_id, key())), changed);
         assert_eq!(rt.block_on(import_developed_as(state.clone(), from, b_id, key())).map(Some), changed);
-        let job = crate::rapidraw::next_job_id();
+        let job = crate::rapidraw::queue_job();
         assert_eq!(rt.block_on(crate::rapidraw::edit_in_rapidraw_as(state.clone(), from, b_id, job)), changed);
         assert!(!log.exists(), "launched on the new catalog's photo: {:?}", std::fs::read_to_string(&log));
     }

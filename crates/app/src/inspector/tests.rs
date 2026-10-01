@@ -910,6 +910,32 @@ fn editors_across_a_switch(delivered: bool, cx: &mut TestAppContext) {
     }
 }
 
+/// **Cancel before the worker starts** (#108 gate). RapidRAW is queued (the entry shows
+/// "editing" at once, with its Cancel) and cancelled before the runner gets to it: when the
+/// worker then runs, RapidRAW (the fake) is never launched, and the round-trip ends as
+/// cancelled. (Mutation-checked: without the queued-job lookup in `cancel_rapidraw_job`, the
+/// cancel finds nothing, the fake is launched and this fails.)
+#[gpui_kit::test]
+fn cancelling_a_queued_rapidraw_launch_launches_nothing(cx: &mut TestAppContext) {
+    let dir = TempDir::new("insp-rapidraw-cancel");
+    let (script, log) = fake_editor(&dir);
+    let app = start(cx);
+    let ids = open_catalog_with_photos(&app, &dir, 1, cx);
+    catalog(&app, |c| editors_on(c, &script, &dir.0.join("photos/2026/p0.ARW")));
+    select(&app, ids[0], SelectMods::default(), cx);
+    work(cx); // whatever else is queued (the editors probe)
+    let insp = inspector(&app, cx);
+    insp.update(cx, |i, cx| i.edit_in_rapidraw(cx));
+    insp.read_with(cx, |i, _| assert!(i.rapid.contains_key(&ids[0]), "the entry shows at once"));
+    insp.update(cx, |i, cx| i.cancel_rapidraw(cx));
+    work(cx);
+    assert!(!log.exists(), "RapidRAW was launched after its cancel: {:?}", std::fs::read_to_string(&log));
+    insp.read_with(cx, |i, _| {
+        assert!(!i.rapid.contains_key(&ids[0]), "the round-trip ended");
+        assert_eq!(i.notes.get(&ids[0]).map(String::as_str), Some("Cancelled — nothing was imported."));
+    });
+}
+
 #[gpui_kit::test]
 fn editor_actions_never_reach_the_new_catalog_before_the_switch_event(cx: &mut TestAppContext) {
     editors_across_a_switch(false, cx);

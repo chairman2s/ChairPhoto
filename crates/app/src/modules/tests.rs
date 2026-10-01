@@ -792,7 +792,7 @@ fn shell(dir: &TempDir, cx: &mut TestAppContext) -> (Shell, i64) {
             events_rx,
             None,
             &SystemThemeResult::unavailable(),
-            WireOptions { on_exit: Rc::new(|| {}), open_default_catalog: false },
+            WireOptions { on_exit: Rc::new(|| {}), open_default_catalog: false, unthrottled: false },
         )
     });
     let db = dir.0.join("s.chairphoto");

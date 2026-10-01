@@ -712,27 +712,12 @@ pub async fn photo_statuses(
     state: State<'_, AppState>,
     photo_ids: Vec<i64>,
 ) -> Result<Vec<(i64, crate::catalog::StorageStatus)>, String> {
-    // Hand-rolled (rather than `with_catalog_blocking`) because it needs to lock →
-    // release → stat → lock again: the volume stats must happen OFF the catalog lock so
-    // a slow/offline NAS can't serialize the whole app.
-    let catalog = state.catalog.clone();
-    let health = state.volume_health.clone();
-    crate::app::spawn_blocking(move || {
-        // 1. Under the lock: pull the (id, base_path) pairs (pure SQL, no stats).
-        let pairs: Vec<(i64, String)> = {
-            let guard = catalog.lock().map_err(|e| e.to_string())?;
-            let c = guard.as_ref().ok_or("No catalog is open")?;
-            c.volume_base_paths().map_err(|e| e.to_string())?
-        };
-        // 2. Off the lock, on this worker: stat (or reuse cached) reachability.
-        let reachable = health.refresh(&pairs);
-        // 3. Back under the lock: derive statuses using the off-lock reachability.
-        let guard = catalog.lock().map_err(|e| e.to_string())?;
-        let c = guard.as_ref().ok_or("No catalog is open")?;
-        c.photo_storage_statuses(&photo_ids, &reachable).map_err(|e| e.to_string())
-    })
-    .await
-    .map_err(|e| e.to_string())?
+    // Not `with_catalog_blocking`: it locks → releases → stats → locks again, so the volume
+    // stats run off the catalog lock (see `app::photo_storage_statuses`, which the GPUI app shares).
+    let state = state.inner().clone();
+    crate::app::spawn_blocking(move || crate::app::photo_storage_statuses(&state, &photo_ids))
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 /// Remove a storage volume registration (not the default catalog-root volume). This

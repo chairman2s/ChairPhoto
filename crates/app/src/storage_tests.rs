@@ -347,6 +347,9 @@ fn catalog_with_trash(app: &App, dir: &TempDir, cx: &mut TestAppContext) -> Vec<
         std::fs::create_dir_all(p.parent().unwrap()).unwrap();
         std::fs::write(&p, b"raw").unwrap();
     }
+    // The files appear behind the app's back, after the Library grid's storage badges have
+    // already read (and cached) the library folder as missing.
+    app.state.volume_health.invalidate();
     app.state.catalog.lock().unwrap().as_ref().unwrap().trash_photos(&ids).unwrap();
     ids
 }

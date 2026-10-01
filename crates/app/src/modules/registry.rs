@@ -253,6 +253,7 @@ impl ModuleRegistry {
                     }
                     Self::deliver(&registry, event, cx)
                 }
+                AppModelEvent::DeepLink(_) => {}
             }
         })
         .detach();

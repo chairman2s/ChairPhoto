@@ -40,6 +40,7 @@ pub mod events;
 pub mod image_store;
 pub mod keymap;
 pub mod launch;
+pub mod library;
 pub mod model;
 pub mod modules;
 pub mod shell;
@@ -133,11 +134,19 @@ pub struct WireOptions {
     /// Open the default catalog under the XDG data dir (production), or leave the catalog
     /// to the caller (tests).
     pub open_default_catalog: bool,
+    /// Draw every frame while the window is unfocused too (`inactive_frame_interval:
+    /// None`). Only the frame bench (`examples/grid_bench.rs`) sets it: GPUI throttles an
+    /// unfocused window to 30 Hz by default, which would alias its measurement.
+    pub unthrottled: bool,
 }
 
 impl WireOptions {
     pub fn production() -> Self {
-        WireOptions { on_exit: Rc::new(chairphoto_core::crash_marker::clean_exit), open_default_catalog: true }
+        WireOptions {
+            on_exit: Rc::new(chairphoto_core::crash_marker::clean_exit),
+            open_default_catalog: true,
+            unthrottled: false,
+        }
     }
 }
 
@@ -153,6 +162,8 @@ pub struct Wired {
     pub storage: Entity<storage::StorageState>,
     /// The main window, or why it could not open (the app has then been asked to quit).
     pub main_window: Result<AnyWindowHandle, String>,
+    /// The main window's root view (the shell and the Library grid), when it opened.
+    pub root: Option<Entity<view::RootView>>,
 }
 
 /// Steps 3–6, inside the GPUI application: fonts, components, theme, keymap, quit wiring,
@@ -195,12 +206,16 @@ pub fn wire(
         model.update(cx, |m, cx| m.open_default_catalog(cx));
     }
 
-    let window_options = main_window_options(cx);
+    let mut window_options = main_window_options(cx);
+    if options.unthrottled {
+        window_options.inactive_frame_interval = None;
+    }
     let opened = gpui_kit::open_window(window_options, cx, {
         let (model, shell, images, modules, storage) =
             (model.clone(), shell.clone(), images.clone(), modules.clone(), storage.clone());
         move |window, cx| cx.new(|cx| view::RootView::new(model, shell, images, modules, storage, window, cx))
     });
+    let root = opened.as_ref().ok().map(|(_, root)| root.clone());
     let main_window = match opened {
         Ok((handle, _)) => {
             let main = handle.window_id();
@@ -218,7 +233,7 @@ pub fn wire(
             Err(e.to_string())
         }
     };
-    Wired { model, images, shell, modules, storage, main_window }
+    Wired { model, images, shell, modules, storage, main_window, root }
 }
 
 /// Become this app data dir's primary instance, serving second launches into `tx`; or hand

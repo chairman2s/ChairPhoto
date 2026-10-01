@@ -57,6 +57,12 @@ actions!(
         BackUpSelection,
         /// More ⋯ → Storage volumes… (Preferences → Storage mounts the same panel, #113).
         OpenVolumes,
+        /// More ⋯ → Analyse burst sharpness, and the bench's Analyse: over the selection,
+        /// else the whole view (`ShellState::analyse_burst`).
+        AnalyseBurst,
+        /// More ⋯ → Propose stacks…, and the bench's Stack: the "Stack bursts" dialog over
+        /// the selection, else the whole view (`library::stacks`).
+        ProposeStacks,
     ]
 );
 
@@ -99,11 +105,6 @@ not_yet_ported! {
     PopOutLoupe => ("Open loupe in a new window", 110),
     /// More ⋯ → Loupe (Enter in the grid).
     ToggleLoupe => ("Loupe", 109),
-    /// More ⋯ → Analyse burst sharpness, and the bench's Analyse. Needs the grid's rows.
-    AnalyseBurst => ("Analyse burst sharpness", 106),
-    /// More ⋯ → Propose stacks…, and the bench's Stack. The dialog has no ticket of its own;
-    /// the Library view is the closest.
-    ProposeStacks => ("Propose stacks", 106),
     /// More ⋯ → Start cull session, and the bench's Cull.
     StartCullSession => ("Start cull session", 109),
     /// More ⋯ → Preferences…, and the rail's gear.

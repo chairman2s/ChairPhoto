@@ -29,7 +29,7 @@
 
 use chairphoto_core::app::{with_catalog, AppState, CoreEvent, EventVisitor};
 use crate::image_store::Loaded;
-use chairphoto_core::catalog::{CatalogError, PhotoQuery, PhotoWindow};
+use chairphoto_core::catalog::{CatalogError, Photo, PhotoQuery};
 use chairphoto_core::image_pool::ImagePool;
 use chairphoto_model::deep_link::{self, DeepLink, DeepLinkView};
 use gpui_kit::{Context, EventEmitter, SharedString};
@@ -45,6 +45,9 @@ pub enum AppModelEvent {
     /// Startup's `open_default_catalog` sends no `catalog:switched`, so this is how the
     /// first catalog reaches the other entities.
     CatalogRead,
+    /// A `chairphoto://` link resolved against the open catalog: the shell applies it to
+    /// the Library (`ShellState::apply_deep_link`).
+    DeepLink(DeepLinkTarget),
 }
 
 /// What the shell shows about the open catalog.
@@ -54,26 +57,22 @@ pub struct CatalogSummary {
     pub name: String,
     /// Every photo in the library view with no filter (`PhotoQuery::default()`).
     pub photo_count: usize,
-    /// The first [`FIRST_PHOTOS`] photo ids in that view's order — the root view's thumbnail
-    /// strip, the image layer's on-screen proof (#101) until the Library view replaces it.
-    pub first_photos: Vec<i64>,
 }
 
-/// How many photos [`CatalogSummary::first_photos`] holds.
-pub const FIRST_PHOTOS: usize = 24;
-/// A `chairphoto://` link, resolved against the open catalog: what the Library view, the
-/// loupe and the Darkroom apply once they are ported. Until then the model holds the newest
-/// one and says so on the status line.
+/// A `chairphoto://` link, resolved against the open catalog. The model holds the newest
+/// one and emits it ([`AppModelEvent::DeepLink`]); the shell applies it.
 ///
-/// | Link | Applied by (not ported yet) |
+/// | Link | Applied by |
 /// |---|---|
-/// | photo, view `grid` | the Library view selects it, scope widened (#106) |
-/// | photo, view `loupe` | … then opens the inline loupe (#109) |
-/// | photo, view `develop` | … then opens the Darkroom (#111) |
-/// | tag | the Library filters to the tag (#106) |
-#[derive(Debug, Clone, PartialEq)]
+/// | photo, view `grid` | the Library selects it, scope widened (`ShellState::apply_deep_link`) |
+/// | photo, view `loupe` | … then opens the inline loupe (not ported yet, #109) |
+/// | photo, view `develop` | … then opens the Darkroom (not ported yet, #111) |
+/// | tag | the Library filters to the tag |
+#[derive(Debug, Clone)]
 pub enum DeepLinkTarget {
-    Photo { id: i64, uuid: String, path: String, view: DeepLinkView },
+    /// `photo` is the whole row: a stacked child, which the grid never lists, is viewed
+    /// off-grid from it.
+    Photo { id: i64, uuid: String, path: String, view: DeepLinkView, photo: Box<Photo> },
     Tag { id: i64, uuid: String, full_path: String },
 }
 
@@ -248,7 +247,8 @@ impl AppModel {
                 match resolved {
                     Ok(target) => {
                         m.status = link_status(&target).into();
-                        m.deep_link = Some(target);
+                        m.deep_link = Some(target.clone());
+                        cx.emit(AppModelEvent::DeepLink(target));
                     }
                     Err(message) => m.status = message.into(),
                 }
@@ -313,6 +313,12 @@ impl AppModel {
         cx.notify();
     }
 
+    /// Put one line on the status line (the bench shows it).
+    pub fn set_status(&mut self, line: impl Into<SharedString>, cx: &mut Context<Self>) {
+        self.status = line.into();
+        cx.notify();
+    }
+
     /// Record `name payload` as the last event.
     pub fn note_event(&mut self, name: &str, payload: String, cx: &mut Context<Self>) {
         self.events_seen += 1;
@@ -330,14 +336,12 @@ pub fn not_yet_ported_line(what: &str, ticket: u32) -> String {
 fn read_summary(state: &AppState) -> Result<CatalogSummary, String> {
     with_catalog(state, |c| {
         let photo_count = c.count_photos(&PhotoQuery::default())?;
-        let window = PhotoQuery { window: Some(PhotoWindow::new(0, FIRST_PHOTOS)), ..Default::default() };
-        let first_photos = c.list_photos(&window)?.into_iter().map(|p| p.id).collect();
         let path = c.db_path();
         let name = path
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| path.to_string_lossy().to_string());
-        Ok(CatalogSummary { name, photo_count, first_photos })
+        Ok(CatalogSummary { name, photo_count })
     })
 }
 
@@ -353,7 +357,13 @@ fn resolve_link(state: &AppState, link: &DeepLink) -> Result<DeepLinkTarget, Str
             })
             .map_err(|e| format!("Deep link: {e}"))?;
             let photo = photo.ok_or_else(|| format!("Deep link: no photo {uuid} in this catalog"))?;
-            Ok(DeepLinkTarget::Photo { id: photo.id, uuid: photo.uuid, path: photo.path, view: *view })
+            Ok(DeepLinkTarget::Photo {
+                id: photo.id,
+                uuid: photo.uuid.clone(),
+                path: photo.path.clone(),
+                view: *view,
+                photo: Box::new(photo),
+            })
         }
         DeepLink::Tag { uuid } => {
             // App.tsx matched against the loaded tag tree (`tags.find(t => t.uuid === uuid)`).
@@ -368,8 +378,8 @@ fn resolve_link(state: &AppState, link: &DeepLink) -> Result<DeepLinkTarget, Str
     }
 }
 
-/// The status line for a resolved link: what it asks for, and that the view that applies it
-/// is not ported yet.
+/// The status line for a resolved link: what it asks for. (Opening the loupe or the
+/// Darkroom answers with its own not-yet-ported line once the photo is selected.)
 fn link_status(target: &DeepLinkTarget) -> String {
     match target {
         DeepLinkTarget::Photo { path, view, .. } => {
@@ -378,11 +388,9 @@ fn link_status(target: &DeepLinkTarget) -> String {
                 DeepLinkView::Loupe => "loupe",
                 DeepLinkView::Develop => "Darkroom",
             };
-            format!("Deep link: {path} → {surface} (view not ported yet)")
+            format!("Deep link: {path} → {surface}")
         }
-        DeepLinkTarget::Tag { full_path, .. } => {
-            format!("Deep link: filter by tag {full_path} (view not ported yet)")
-        }
+        DeepLinkTarget::Tag { full_path, .. } => format!("Deep link: filter by tag {full_path}"),
     }
 }
 

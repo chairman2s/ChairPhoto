@@ -105,6 +105,7 @@ impl StorageState {
                     this.check_reconcile(cx);
                 }
             }
+            AppModelEvent::DeepLink(_) => {}
         });
         StorageState {
             app,

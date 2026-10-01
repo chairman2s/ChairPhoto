@@ -3,16 +3,13 @@
 //! the marking controls for the photo the inspector shows; the selection pile ("N on the
 //! table") with the selection's actions.
 //!
-//! The marking and pile sections appear only with an active photo / a selection, which
-//! only the Library view (#106) can make. Their marks write through the one culling path
-//! the grid's keys will use, so they are wired when that path exists; until then a mark
-//! reports "not yet ported" like every other unported action, instead of writing through
-//! a second path the keys would not share (Bench.tsx's "one code path" invariant). The
-//! pile's thumbnails come from the image layer (#101).
+//! The marking and pile sections appear only with an active photo / a selection. Marks
+//! write through the one culling path the grid's keys use (`ShellState::apply_mark`,
+//! Bench.tsx's "one code path" invariant), without the keys' auto-advance.
 
 use crate::model::AppModel;
 use crate::shell::actions::*;
-use crate::shell::state::ShellState;
+use crate::shell::state::{Mark, ShellState};
 use crate::shell::style::{grouped, Colors, COLOR_LABELS};
 use crate::view::RootView;
 use chairphoto_core::catalog::PickState;
@@ -127,6 +124,8 @@ impl RootView {
             let mut stars = div().flex().gap(px(3.));
             for n in 1..=5i64 {
                 let on = n <= rating as i64;
+                // Clicking the active star clears the rating (Bench.tsx).
+                let mark = Mark::Rating(if n == rating { 0 } else { n });
                 stars = stars.child(
                     div()
                         .id(SharedString::from(format!("bench-star-{n}")))
@@ -136,7 +135,8 @@ impl RootView {
                         .text_color(if on { colors.rating } else { colors.mute })
                         .opacity(if on { 1. } else { 0.5 })
                         .child("★")
-                        .on_click(cx.listener(|this, _, _, cx| this.mark(cx))),
+                        .on_click(cx.listener(move |this, _, _, cx| this.mark(mark.clone(), cx)))
+                        .test_support(),
                 );
             }
             let pick = |id: &'static str, label: &'static str, on: bool| {
@@ -157,6 +157,7 @@ impl RootView {
             let mut dots = div().flex().items_center().gap(px(5.));
             for label in COLOR_LABELS {
                 let on = active.label.eq_ignore_ascii_case(label.name);
+                let mark = Mark::Label(if on { String::new() } else { label.name.to_string() });
                 dots = dots.child(
                     crate::shell::command_pill::label_dot(
                         SharedString::from(format!("bench-label-{}", label.name)),
@@ -164,13 +165,22 @@ impl RootView {
                         on,
                         colors,
                     )
-                    .on_click(cx.listener(|this, _, _, cx| this.mark(cx))),
+                    .on_click(cx.listener(move |this, _, _, cx| this.mark(mark.clone(), cx)))
+                    .test_support(),
                 );
             }
+            let has_label = !active.label.is_empty();
             dots = dots.child(
-                crate::shell::command_pill::label_dot("bench-label-none".into(), None, false, colors)
-                    .on_click(cx.listener(|this, _, _, cx| this.mark(cx))),
+                crate::shell::command_pill::label_dot("bench-label-none".into(), None, false, colors).on_click(
+                    cx.listener(move |this, _, _, cx| {
+                        if has_label {
+                            this.mark(Mark::Label(String::new()), cx)
+                        }
+                    }),
+                ).test_support(),
             );
+            let picked = active.pick_state == PickState::Pick;
+            let rejected = active.pick_state == PickState::Reject;
             bench = bench.child(div().flex_none().w(px(1.)).h(px(38.)).bg(colors.border)).child(
                 div()
                     .id("bench-mark")
@@ -191,12 +201,14 @@ impl RootView {
                             .gap(px(14.))
                             .child(stars)
                             .child(
-                                pick("bench-pick", "Pick", active.pick_state == PickState::Pick)
-                                    .on_click(cx.listener(|this, _, _, cx| this.mark(cx))),
+                                pick("bench-pick", "Pick", picked).on_click(cx.listener(move |this, _, _, cx| {
+                                    this.mark(Mark::Pick(if picked { PickState::None } else { PickState::Pick }), cx)
+                                })).test_support(),
                             )
                             .child(
-                                pick("bench-reject", "Reject", active.pick_state == PickState::Reject)
-                                    .on_click(cx.listener(|this, _, _, cx| this.mark(cx))),
+                                pick("bench-reject", "Reject", rejected).on_click(cx.listener(move |this, _, _, cx| {
+                                    this.mark(Mark::Pick(if rejected { PickState::None } else { PickState::Reject }), cx)
+                                })).test_support(),
                             )
                             .child(dots),
                     ),
@@ -272,10 +284,11 @@ impl RootView {
         bench.into_any_element()
     }
 
-    /// A bench mark (star, pick/reject, label). See the module docs: marks go through the
-    /// culling path the Library view (#106) brings, so they are not wired twice.
-    fn mark(&mut self, cx: &mut Context<Self>) {
-        self.model.update(cx, |m, cx| m.not_yet_ported("Marking from the bench", 106, cx));
+    /// A bench mark (star, pick/reject, label): the culling keys' write path
+    /// (`ShellState::apply_mark`), without their auto-advance — clicking a star must not
+    /// move the selection.
+    fn mark(&mut self, mark: Mark, cx: &mut Context<Self>) {
+        self.shell.update(cx, |s, cx| s.apply_mark(mark, false, cx));
     }
 }
 

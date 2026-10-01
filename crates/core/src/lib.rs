@@ -10,6 +10,7 @@ pub mod app;
 pub mod appearance;
 pub mod bundle;
 pub mod burst;
+pub mod burst_analysis;
 pub mod catalog;
 #[cfg(feature = "collage")]
 pub mod collage;
@@ -47,6 +48,7 @@ pub mod sharpness_regions;
 pub mod slideshow;
 #[cfg(feature = "smugmug")]
 pub mod smugmug;
+pub mod stack_proposals;
 #[cfg(test)]
 mod test_support;
 pub mod thumbnails;

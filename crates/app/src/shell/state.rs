@@ -17,11 +17,16 @@
 //! yet (the same gap as the appearance mode, `theme/mod.rs`; Preferences, #113), so these
 //! start at React's defaults each launch.
 
-use crate::model::{AppModel, AppModelEvent};
+use crate::model::{AppModel, AppModelEvent, DeepLinkTarget};
 use chairphoto_core::app::{with_catalog, AppState, CoreEvent};
-use chairphoto_core::catalog::{Album, Facet, ImportBatch, PhotoQuery, SmartAlbum};
-use chairphoto_model::library::session::LibrarySession;
-use gpui_kit::{Context, Entity, EventEmitter, Subscription};
+use chairphoto_core::catalog::{
+    Album, Catalog, Facet, ImportBatch, Photo, PhotoPage, PhotoQuery, PickState, SmartAlbum,
+    SOFT_THRESHOLD_DEFAULT, SOFT_THRESHOLD_KEY,
+};
+use chairphoto_model::deep_link::DeepLinkView;
+use chairphoto_model::library::query::{RefreshRequest, StatusRequest};
+use chairphoto_model::library::session::{LibrarySession, SelectMods};
+use gpui_kit::{Context, Entity, EventEmitter, Subscription, Task};
 
 /// React's column defaults and drag limits (`App.tsx`).
 pub const LEFT_DEFAULT_W: f32 = 210.;
@@ -242,6 +247,38 @@ pub struct ScopeInfo {
     pub smart_album_name: Option<String>,
 }
 
+/// A culling mark — what the Library's keys (0–5, P/X/U, R/Y/G/B/V/N) and the bench's
+/// marking controls write. Both go through [`ShellState::apply_mark`], the one write path
+/// (App.tsx's `applyToSelection`), so the two surfaces cannot drift apart.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Mark {
+    /// Stars, 0–5 (0 clears).
+    Rating(i64),
+    Pick(PickState),
+    /// A colour label's stored name; `""` clears it.
+    Label(String),
+}
+
+impl Mark {
+    /// Write the mark on one photo: the Tauri `set_rating` / `set_pick_state` /
+    /// `set_label` commands' body (`Catalog::set_culling`).
+    fn write(&self, c: &Catalog, photo_id: i64) -> chairphoto_core::catalog::Result<Photo> {
+        match self {
+            Mark::Rating(r) => c.set_culling(photo_id, Some(*r), None, None),
+            Mark::Pick(p) => c.set_culling(photo_id, None, None, Some(*p)),
+            Mark::Label(l) => c.set_culling(photo_id, None, Some(l), None),
+        }
+    }
+}
+
+/// A `chairphoto://<uuid>` link waiting for the widened grid to list its photo (App.tsx's
+/// `deepLinkTarget`).
+#[derive(Debug, Clone)]
+pub struct PendingPhotoLink {
+    pub photo: Photo,
+    pub view: DeepLinkView,
+}
+
 /// The shell's state. See the module docs.
 pub struct ShellState {
     app: AppState,
@@ -258,6 +295,22 @@ pub struct ShellState {
     pub lists: Lists,
     pub counts: Counts,
     pub scope_info: ScopeInfo,
+    /// `sharpness.soft_threshold`: below it a tile shows the soft `~` badge.
+    pub soft_threshold: f64,
+    /// Whether the current query's rows have landed — until then the grid shows no
+    /// "No photos" empty state, which would read as an answer.
+    pub rows_loaded: bool,
+    /// The generation of the row read still in flight, if any.
+    rows_pending: Option<u64>,
+    /// A photo link waiting for the grid to list its photo.
+    pub pending_link: Option<PendingPhotoLink>,
+    /// The newest culling write: each write waits for the one before, so marks land in the
+    /// order they were made.
+    last_mark: Option<Task<()>>,
+    /// Bumped by every `catalog:switched`: a mark or burst analysis queued before it names
+    /// photos of the catalog that closed and must not be written.
+    catalog_generation: u64,
+    model: Entity<AppModel>,
     lists_generation: u64,
     scope_generation: u64,
     /// Owns `counts.pending`/`counts.trash`: bumped by every read that writes them (a catalog
@@ -281,6 +334,7 @@ impl ShellState {
         let _model_events = cx.subscribe(model, |this, _, event: &AppModelEvent, cx| match event {
             AppModelEvent::CatalogRead => this.refresh_catalog_data(cx),
             AppModelEvent::Core(event) => this.on_core_event(event, cx),
+            AppModelEvent::DeepLink(target) => this.apply_deep_link(target.clone(), cx),
         });
         ShellState {
             app,
@@ -295,6 +349,13 @@ impl ShellState {
             lists: Lists::default(),
             counts: Counts::default(),
             scope_info: ScopeInfo::default(),
+            soft_threshold: SOFT_THRESHOLD_DEFAULT,
+            rows_loaded: false,
+            rows_pending: None,
+            pending_link: None,
+            last_mark: None,
+            catalog_generation: 0,
+            model: model.clone(),
             lists_generation: 0,
             scope_generation: 0,
             counts_generation: 0,
@@ -409,6 +470,7 @@ impl ShellState {
         let after = self.library.query_revision();
         if after != before {
             self.refresh_scope(cx);
+            self.refresh_rows(cx);
             cx.emit(ScopeChanged { query_revision: after });
         }
         cx.notify();
@@ -425,6 +487,233 @@ impl ShellState {
         cx.notify();
     }
 
+    /// Run a selection verb (a click, a key), then ask for the active photo's storage badge
+    /// if it changed — what React's effect on the active id did after a commit.
+    pub fn select_with(&mut self, cx: &mut Context<Self>, f: impl FnOnce(&mut LibrarySession)) {
+        f(&mut self.library);
+        self.after_input(cx);
+    }
+
+    fn after_input(&mut self, cx: &mut Context<Self>) {
+        if let Some(request) = self.library.take_active_status_request() {
+            self.fetch_statuses(request, cx);
+        }
+        cx.notify();
+    }
+
+    // --- the Library's rows ----------------------------------------------------------
+
+    /// Re-run the current query off the UI thread (`list_photos`). Only the newest read
+    /// lands: the session drops a page whose generation is stale.
+    pub fn refresh_rows(&mut self, cx: &mut Context<Self>) {
+        let request = self.library.refresh();
+        self.rows_pending = Some(request.generation);
+        let state = self.app.clone();
+        let query = request.query.clone();
+        let read = cx.background_executor().spawn(async move { with_catalog(&state, |c| c.photo_page(&query)) });
+        cx.spawn(async move |this, cx| {
+            let page = read.await;
+            this.update(cx, |s, cx| s.on_page(&request, page, cx)).ok();
+        })
+        .detach();
+    }
+
+    pub(crate) fn on_page(&mut self, request: &RefreshRequest, page: Result<PhotoPage, String>, cx: &mut Context<Self>) {
+        let landed = self.rows_pending == Some(request.generation);
+        match self.library.apply_page(request, page) {
+            Ok(statuses) => {
+                if let Some(statuses) = statuses {
+                    self.fetch_statuses(statuses, cx);
+                }
+                if landed {
+                    self.rows_pending = None;
+                    self.rows_loaded = true;
+                    self.apply_pending_link(cx);
+                    self.after_input(cx);
+                }
+            }
+            // The rows stay as they were: an empty grid would read as "no photos match".
+            Err(e) if landed => {
+                self.rows_pending = None;
+                eprintln!("library: rows unavailable: {e}");
+                self.model.update(cx, |m, cx| m.set_status(format!("Could not list photos: {e}"), cx));
+            }
+            Err(_) => {}
+        }
+        cx.notify();
+    }
+
+    /// The grid's on-screen rows (plus overscan), as a half-open range over the rows: their
+    /// storage badges are fetched, and only theirs (`LibraryQuery::set_visible_range`).
+    pub fn set_visible_range(&mut self, start: usize, end: usize, cx: &mut Context<Self>) {
+        if let Some(request) = self.library.set_visible_range(start, end) {
+            self.fetch_statuses(request, cx);
+        }
+    }
+
+    fn fetch_statuses(&mut self, request: StatusRequest, cx: &mut Context<Self>) {
+        let state = self.app.clone();
+        let ids = request.ids.clone();
+        let read = cx
+            .background_executor()
+            .spawn(async move { chairphoto_core::app::photo_storage_statuses(&state, &ids) });
+        cx.spawn(async move |this, cx| {
+            let result = read.await;
+            this.update(cx, |s, cx| {
+                s.library.apply_statuses(&request, result);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    // --- culling marks ---------------------------------------------------------------
+
+    /// The one write path for culling marks (App.tsx's `applyToSelection`): write `mark` on
+    /// every targeted photo (the selection, else the active photo), then re-read the rows.
+    ///
+    /// `advance` is the keyboard's own behaviour: when exactly one photo was marked, step
+    /// to the next one — over the rows as they were when the key was pressed, not the
+    /// refreshed ones the photo may have been filtered out of (`step_active_over`). The
+    /// bench's controls pass `false`: clicking a star must not move the selection.
+    ///
+    /// Writes run off the UI thread, one after another in the order they were made. A
+    /// write still queued at a catalog switch is dropped: its ids name the closed catalog's
+    /// photos. (One already running when the switch lands cannot be recalled; the switch
+    /// itself is Storage and import, #114.)
+    pub fn apply_mark(&mut self, mark: Mark, advance: bool, cx: &mut Context<Self>) {
+        let targets = self.library.selection().targets;
+        if targets.is_empty() {
+            return;
+        }
+        let snapshot = (advance && targets.len() == 1).then(|| self.library.step_snapshot());
+        let previous = self.last_mark.take();
+        let generation = self.catalog_generation;
+        let state = self.app.clone();
+        self.last_mark = Some(cx.spawn(async move |this, cx| {
+            if let Some(previous) = previous {
+                previous.await;
+            }
+            let current = this.update(cx, |s, _| s.catalog_generation == generation).unwrap_or(false);
+            if !current {
+                return;
+            }
+            let write = cx.background_executor().spawn(async move {
+                with_catalog(&state, |c| targets.iter().try_for_each(|&id| mark.write(c, id).map(drop)))
+            });
+            let result = write.await;
+            this.update(cx, |s, cx| {
+                if s.catalog_generation != generation {
+                    return;
+                }
+                if let Err(e) = result {
+                    eprintln!("library: mark failed: {e}");
+                    s.model.update(cx, |m, cx| m.set_status(format!("Could not mark: {e}"), cx));
+                }
+                if let Some(snapshot) = snapshot {
+                    s.library.step_active_over(&snapshot, 1, false);
+                }
+                s.refresh_rows(cx);
+                s.refresh_scope(cx);
+                s.after_input(cx);
+            })
+            .ok();
+        }));
+    }
+
+    /// Run burst-relative sharpness analysis over the selection, else the whole view
+    /// (App.tsx's `runBurstAnalysis`), off the UI thread; report on the status line and
+    /// re-read the rows for the new badges.
+    pub fn analyse_burst(&mut self, cx: &mut Context<Self>) {
+        let targets = self.whole_view_targets();
+        if targets.is_empty() {
+            self.model.update(cx, |m, cx| m.set_status("No photos to analyse — scan or select some first.", cx));
+            return;
+        }
+        let status = format!("Analysing burst sharpness for {} photos…", targets.len());
+        self.model.update(cx, |m, cx| m.set_status(status, cx));
+        let generation = self.catalog_generation;
+        let state = self.app.clone();
+        let run = cx.background_executor().spawn(async move {
+            chairphoto_core::burst_analysis::analyze_burst_sharpness(&state, &targets)
+        });
+        cx.spawn(async move |this, cx| {
+            let result = run.await;
+            this.update(cx, |s, cx| {
+                if s.catalog_generation != generation {
+                    return;
+                }
+                let line = match result {
+                    Ok(r) => format!(
+                        "Burst analysis done — {} cluster(s), {} best frame(s), {} soft-in-burst.",
+                        r.clusters, r.flagged_best, r.flagged_soft
+                    ),
+                    Err(e) => format!("Burst analysis failed: {e}"),
+                };
+                s.model.update(cx, |m, cx| m.set_status(line, cx));
+                s.refresh_rows(cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// What the whole-view tools (burst analysis, stack proposals) act on: the selection,
+    /// else every row of the current view — not the active photo alone (App.tsx).
+    pub fn whole_view_targets(&self) -> Vec<i64> {
+        let ids = self.library.selection().ids.to_vec();
+        if ids.is_empty() {
+            self.library.photo_ids()
+        } else {
+            ids
+        }
+    }
+
+    // --- deep links ------------------------------------------------------------------
+
+    /// A resolved `chairphoto://` link (App.tsx's deep-link effects): back to the Library;
+    /// a photo widens the scope to the whole library (keeping the sort) and is selected
+    /// once the grid lists it; a tag becomes the scope.
+    pub fn apply_deep_link(&mut self, target: DeepLinkTarget, cx: &mut Context<Self>) {
+        self.surface = Surface::Library;
+        match target {
+            DeepLinkTarget::Photo { photo, view, .. } => {
+                self.pending_link = Some(PendingPhotoLink { photo: *photo, view });
+                // `clear_scope` always changes the query, so the rows are re-read and the
+                // link is applied when they land.
+                self.update_scope(cx, |l| l.clear_scope());
+            }
+            DeepLinkTarget::Tag { id, .. } => {
+                self.pending_link = None;
+                self.update_scope(cx, |l| l.select_tag(Some(id)));
+            }
+        }
+        cx.notify();
+    }
+
+    /// Select a waiting link's photo once the rows hold it; a stacked child, which the
+    /// grid never lists, is viewed off-grid. Otherwise keep waiting for the next rows.
+    fn apply_pending_link(&mut self, cx: &mut Context<Self>) {
+        let Some(link) = self.pending_link.take() else { return };
+        let id = link.photo.id;
+        if self.library.photos().iter().any(|p| p.id == id) {
+            self.library.select(id, SelectMods::default());
+        } else if link.photo.stack_parent_id.is_some() {
+            self.library.view_photo(link.photo.clone());
+        } else {
+            self.pending_link = Some(link);
+            return;
+        }
+        match link.view {
+            DeepLinkView::Grid => {}
+            DeepLinkView::Loupe => self.model.update(cx, |m, cx| m.not_yet_ported("Deep link into the loupe", 109, cx)),
+            DeepLinkView::Develop => {
+                self.model.update(cx, |m, cx| m.not_yet_ported("Deep link into the Darkroom", 111, cx))
+            }
+        }
+    }
+
     // --- events and reads ---------------------------------------------------------------
 
     pub(crate) fn on_core_event(&mut self, event: &CoreEvent, cx: &mut Context<Self>) {
@@ -434,6 +723,10 @@ impl ShellState {
                 // Every id in the session names something in the catalog that just closed.
                 let before = self.library.query_revision();
                 self.library.reset();
+                self.rows_loaded = false;
+                self.rows_pending = None;
+                self.pending_link = None;
+                self.catalog_generation += 1;
                 self.surface = Surface::Library;
                 self.counts = Counts::default();
                 self.scope_info = ScopeInfo::default();
@@ -467,7 +760,10 @@ impl ShellState {
             this.update(cx, |s, cx| {
                 if s.lists_generation == generation {
                     match lists {
-                        Ok(lists) => s.lists = lists,
+                        Ok((lists, soft_threshold)) => {
+                            s.lists = lists;
+                            s.soft_threshold = soft_threshold;
+                        }
                         Err(e) => eprintln!("shell: lists unavailable: {e}"),
                     }
                     if counts.identity_debt.is_some() {
@@ -486,6 +782,7 @@ impl ShellState {
         })
         .detach();
         self.refresh_scope(cx);
+        self.refresh_rows(cx);
     }
 
     /// The main window regained focus: re-read the back-up queue and the trash count, as
@@ -570,17 +867,23 @@ impl ShellState {
     }
 }
 
-/// The lists the menus offer. Blocking: background only.
-fn read_lists(state: &AppState) -> Result<Lists, String> {
+/// The lists the menus offer, and the soft-badge threshold. Blocking: background only.
+fn read_lists(state: &AppState) -> Result<(Lists, f64), String> {
     with_catalog(state, |c| {
-        Ok(Lists {
+        let soft_threshold = c
+            .get_setting(SOFT_THRESHOLD_KEY)?
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite())
+            .unwrap_or(SOFT_THRESHOLD_DEFAULT);
+        let lists = Lists {
             facets: c.available_facets(),
             cameras: c.distinct_photo_values("camera")?,
             lenses: c.distinct_photo_values("lens")?,
             batches: c.list_import_batches()?,
             albums: c.list_albums()?,
             smart_albums: c.list_smart_albums()?,
-        })
+        };
+        Ok((lists, soft_threshold))
     })
 }
 

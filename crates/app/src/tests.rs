@@ -31,10 +31,10 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 /// A private directory under the system temp dir, removed on drop.
-struct TempDir(PathBuf);
+pub(crate) struct TempDir(pub(crate) PathBuf);
 
 impl TempDir {
-    fn new(tag: &str) -> Self {
+    pub(crate) fn new(tag: &str) -> Self {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -54,19 +54,19 @@ impl Drop for TempDir {
 
 /// `run`'s startup, with a boot that starts nothing, no default catalog, and a counter in
 /// place of `clean_exit`.
-struct App {
-    state: AppState,
-    wired: Wired,
+pub(crate) struct App {
+    pub(crate) state: AppState,
+    pub(crate) wired: Wired,
     exits: Rc<Cell<u32>>,
 }
 
 impl App {
-    fn window(&self) -> AnyWindowHandle {
+    pub(crate) fn window(&self) -> AnyWindowHandle {
         *self.wired.main_window.as_ref().expect("the main window opened")
     }
 }
 
-fn start(cx: &mut TestAppContext) -> App {
+pub(crate) fn start(cx: &mut TestAppContext) -> App {
     // Storage jobs queue until a test runs them (`Runner::manual`): the core runtime's
     // threads could not wake GPUI's deterministic test scheduler.
     cx.update(|cx| cx.set_global(crate::storage::Runner::manual()));
@@ -83,7 +83,7 @@ fn start(cx: &mut TestAppContext) -> App {
             events_rx,
             None,
             &SystemThemeResult::unavailable(),
-            WireOptions { on_exit, open_default_catalog: false },
+            WireOptions { on_exit, open_default_catalog: false, unthrottled: false },
         )
     });
     // Not parked here: the event router has not been polled yet, which the worker-thread
@@ -102,7 +102,7 @@ fn open_catalog(app: &App, dir: &TempDir, cx: &mut TestAppContext) {
 }
 
 /// Like [`open_catalog`], with `n` photos in it (unrated, unpicked); returns their ids.
-fn open_catalog_with_photos(app: &App, dir: &TempDir, n: usize, cx: &mut TestAppContext) -> Vec<i64> {
+pub(crate) fn open_catalog_with_photos(app: &App, dir: &TempDir, n: usize, cx: &mut TestAppContext) -> Vec<i64> {
     let db = dir.0.join("photos.chairphoto");
     let root = dir.0.join("photos");
     let catalog = Catalog::open(&db, &root).unwrap();
@@ -127,7 +127,7 @@ fn refocus_main_window(app: &App, cx: &mut TestAppContext) {
     cx.run_until_parked();
 }
 
-fn press(app: &App, key: &str, cx: &mut TestAppContext) {
+pub(crate) fn press(app: &App, key: &str, cx: &mut TestAppContext) {
     cx.update_window(app.window(), |_, window, cx| {
         window.render_frame(cx);
         window.press(key, cx);
@@ -136,7 +136,7 @@ fn press(app: &App, key: &str, cx: &mut TestAppContext) {
     cx.run_until_parked();
 }
 
-fn click(app: &App, id: &'static str, cx: &mut TestAppContext) {
+pub(crate) fn click(app: &App, id: &'static str, cx: &mut TestAppContext) {
     cx.update_window(app.window(), |_, window, cx| {
         window.render_frame(cx);
         window.click(id, cx);
@@ -158,7 +158,7 @@ fn click_menu_row(app: &App, trigger: &'static str, index: usize, label: &str, c
     cx.run_until_parked();
 }
 
-fn status(app: &App, cx: &mut TestAppContext) -> String {
+pub(crate) fn status(app: &App, cx: &mut TestAppContext) -> String {
     app.wired.model.read_with(cx, |m, _| m.status.to_string())
 }
 
@@ -238,7 +238,7 @@ fn a_core_event_from_a_worker_thread_reaches_the_model(cx: &mut TestAppContext) 
         assert!(full.starts_with(line.trim_end_matches('…')), "{line}\nis not a prefix of\n{full}");
         assert_eq!(
             m.catalog,
-            Some(CatalogSummary { name: "bridge.chairphoto".into(), photo_count: 0, first_photos: vec![] }),
+            Some(CatalogSummary { name: "bridge.chairphoto".into(), photo_count: 0 }),
             "catalog:switched must refresh the catalog summary"
         );
     });
@@ -488,7 +488,7 @@ fn a_photo_link_waits_for_the_catalog_then_resolves(cx: &mut TestAppContext) {
     model.update(cx, |m, cx| m.open_url(&url, cx));
     cx.run_until_parked();
     assert_eq!(model_status(&model, cx), "Deep link: waiting for the catalog…");
-    model.read_with(cx, |m, _| assert_eq!(m.deep_link, None));
+    model.read_with(cx, |m, _| assert!(m.deep_link.is_none()));
 
     model.update(cx, |m, cx| m.refresh(cx));
     cx.run_until_parked();
@@ -500,7 +500,8 @@ fn a_photo_link_waits_for_the_catalog_then_resolves(cx: &mut TestAppContext) {
         }
         other => panic!("expected the photo, got {other:?}"),
     });
-    assert_eq!(model_status(&model, cx), "Deep link: 2026/a.ARW → loupe (view not ported yet)");
+    // The shell selected it in the widened grid; the loupe itself is #109.
+    assert_eq!(model_status(&model, cx), not_yet_ported_line("Deep link into the loupe", 109));
 }
 
 /// Tag links resolve by uuid; unknown uuids and non-links are reported, as App.tsx did.
@@ -521,7 +522,7 @@ fn tag_links_resolve_and_misses_are_reported(cx: &mut TestAppContext) {
         }
         other => panic!("expected the tag, got {other:?}"),
     });
-    assert_eq!(model_status(&model, cx), "Deep link: filter by tag Places/Oslo (view not ported yet)");
+    assert_eq!(model_status(&model, cx), "Deep link: filter by tag Places/Oslo");
 
     let missing = "0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d";
     model.update(cx, |m, cx| m.open_url(&format!("chairphoto://{missing}/develop"), cx));
@@ -562,7 +563,7 @@ fn a_second_launch_request_from_a_worker_thread_opens_its_links(cx: &mut TestApp
         }
         other => panic!("expected the photo (the last link), got {other:?}"),
     });
-    assert_eq!(model_status(&model, cx), "Deep link: 2026/a.ARW → Library (view not ported yet)");
+    assert_eq!(model_status(&model, cx), "Deep link: 2026/a.ARW → Library");
 }
 
 /// A second catalog (its own directory) holding a photo with the same relative path; returns
@@ -626,7 +627,7 @@ fn a_catalog_switch_drops_the_resolved_link(cx: &mut TestAppContext) {
     *state.catalog.lock().unwrap() = Some(other);
     model.update(cx, |m, cx| m.on_core_event(&CoreEvent::CatalogSwitched("other".into()), cx));
     cx.run_until_parked();
-    model.read_with(cx, |m, _| assert_eq!(m.deep_link, None, "the old catalog's photo id survived the switch"));
+    model.read_with(cx, |m, _| assert!(m.deep_link.is_none(), "the old catalog's photo id survived the switch"));
 }
 
 /// A link still resolving when the catalog switches is neither lost nor landed from the old
@@ -649,7 +650,7 @@ fn a_link_in_flight_at_a_switch_resolves_against_the_new_catalog(cx: &mut TestAp
     cx.run_until_parked();
     // The switch's refresh found no catalog; the old resolution's error did not land.
     assert_eq!(model_status(&model, cx), "Catalog unavailable: No catalog is open");
-    model.read_with(cx, |m, _| assert_eq!(m.deep_link, None));
+    model.read_with(cx, |m, _| assert!(m.deep_link.is_none()));
 
     *state.catalog.lock().unwrap() = Some(other);
     model.update(cx, |m, cx| m.refresh(cx));

@@ -393,6 +393,23 @@ fn compare_panes_share_one_pan_and_zoom(cx: &mut TestAppContext) {
     assert_eq!(shared.read_with(cx, |s, _| s.view), ZoomView::FIT);
 }
 
+/// A duel verdict whose write fails does not advance: the loser's row is gone from the
+/// catalog, so its reject fails, and the duel stays on round 1 with the challenger unpicked.
+#[gpui_kit::test]
+fn a_failed_duel_verdict_stays_on_the_pair(cx: &mut TestAppContext) {
+    let (app, _pool, _dir, ids) = app_with(3, "cmp-fail", cx);
+    select_all(&app, cx);
+    press(&app, "c", cx);
+    app.state.catalog.lock().unwrap().as_ref().unwrap().remove_photo(ids[0]).unwrap();
+    press(&app, "right", cx);
+    assert!(status(&app, cx).starts_with("Could not mark"), "{}", status(&app, cx));
+    let session = app.wired.shell.read_with(cx, |s, _| s.compare().cloned()).expect("Compare stays open");
+    assert_eq!(session.duel_progress(), (1, 2), "still the first pair");
+    assert_eq!((session.batch(), session.focus()), (vec![ids[0], ids[1]], Some(ids[1])));
+    assert!(!session.pending(), "settled: the next verdict may be decided");
+    assert_eq!(culling(&app, ids[2]).1, PickState::None);
+}
+
 /// When every pane drops out of the view — here the duel's champion, rated under the Unrated
 /// filter once the duel is done — Compare ends, and the grid's keys mark the selection again
 /// (React's `inCompare` required a pane).

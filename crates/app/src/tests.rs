@@ -229,8 +229,10 @@ fn a_core_event_from_a_worker_thread_reaches_the_model(cx: &mut TestAppContext) 
     app.wired.model.read_with(cx, |m, _| {
         assert_eq!(m.events_seen, 1);
         let line = m.last_event.as_ref().expect("the event was noted").to_string();
-        assert!(line.starts_with("catalog:switched "), "{line}");
-        assert!(line.contains("bridge.chairphoto"), "{line}");
+        // The line is the payload cut at 160 characters (`payload_line`), so with a long
+        // TMPDIR the file name may fall past the cut: compare as a prefix of the full line.
+        let full = format!("catalog:switched {}", serde_json::to_string(&db.to_string_lossy()).unwrap());
+        assert!(full.starts_with(line.trim_end_matches('…')), "{line}\nis not a prefix of\n{full}");
         assert_eq!(
             m.catalog,
             Some(CatalogSummary { name: "bridge.chairphoto".into(), photo_count: 0, first_photos: vec![] }),

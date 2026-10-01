@@ -477,6 +477,60 @@ fn dragging_a_vertex_saves_the_new_shape(cx: &mut TestAppContext) {
     assert_eq!(saved[0], square[0], "the other vertices stay");
 }
 
+/// **Forced interleaving** (review #119, catalog identity): the core switches to a catalog
+/// whose fence and photo ids collide, and `catalog:switched` has not reached the module
+/// yet. Every fence write the user can still click — save a drawn fence, edit, delete,
+/// apply (one and all share the guard) — is bound to the catalog the fences were read from and fails
+/// closed; the new catalog's fence and tags are untouched.
+#[gpui_kit::test]
+fn old_fence_ids_never_reach_the_new_catalog(cx: &mut TestAppContext) {
+    let dir = TempDir::new("map-ident");
+    let m = open_map(&dir, &[OSLO], cx);
+    m.click("map-consent-deny", cx);
+    let square = vec![(59.90, 10.74), (59.90, 10.76), (59.92, 10.76), (59.92, 10.74)];
+    {
+        let guard = m.app.state.catalog.lock().unwrap();
+        backend::create_fence_for(guard.as_ref().unwrap(), "Old", "Places/Old", &square).unwrap();
+    }
+    let state = m.view(cx).read_with(cx, |v, _| v.state.clone());
+    state.update(cx, |s, cx| s.reload_fences(cx));
+    work(&m.app, cx);
+    let old = state.read_with(cx, |s, _| s.fences[0].clone());
+
+    // The core switch, with the event not delivered.
+    let other = dir.0.join("other");
+    let b = chairphoto_core::catalog::Catalog::open(&other.join("b.chairphoto"), &other).unwrap();
+    let photo = b.upsert_photo(&other.join("2026/q0.ARW"), None, 0, 1).unwrap().id;
+    assert_eq!(photo, m.ids[0], "the photo ids collide");
+    backend::ensure_schema_for(&b).unwrap();
+    backend::set_photo_gps(&b, &[photo], OSLO.0, OSLO.1).unwrap();
+    let theirs = backend::create_fence_for(&b, "Theirs", "Places/Theirs", &square).unwrap();
+    assert_eq!(theirs.id, old.id, "the fence ids collide");
+    chairphoto_core::app::detach_catalog_and_trip_jobs(&m.app.state).unwrap();
+    chairphoto_core::app::publish_catalog_and_reset_jobs(&m.app.state, b).unwrap();
+
+    // All queued before any lands (a failed edit re-reads the fences, which are then the
+    // new catalog's, read with its identity: consistent, so later writes may go there).
+    state.update(cx, |s, cx| {
+        s.apply(None, cx);
+        let mut edited = old.clone();
+        edited.name = "Renamed".into();
+        s.update_fence(edited, cx);
+        s.create_fence("Drawn".into(), "Places/Drawn".into(), square.clone(), cx);
+        s.delete_fence(old.id, cx);
+    });
+    work(&m.app, cx);
+
+    let status = m.app.wired.model.read_with(cx, |m, _| m.status.to_string());
+    assert!(status.contains(chairphoto_core::app::CATALOG_CHANGED), "the write failed closed: {status}");
+    let guard = m.app.state.catalog.lock().unwrap();
+    let c = guard.as_ref().unwrap();
+    let fences = backend::list_fences_for(c).unwrap();
+    assert_eq!(fences.len(), 1, "nothing created or deleted in the new catalog: {fences:?}");
+    assert_eq!((fences[0].name.as_str(), fences[0].tag_path.as_str()), ("Theirs", "Places/Theirs"), "not renamed");
+    assert_eq!(backend::apply_fence(c, theirs.id).unwrap(), 1, "the new catalog's photo had not been tagged");
+}
+
 /// Escape closes the editor first, then cancels drawing, then closes the filmstrip.
 #[gpui_kit::test]
 fn escape_unwinds_editor_then_drawing_then_filmstrip(cx: &mut TestAppContext) {

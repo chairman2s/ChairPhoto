@@ -175,6 +175,13 @@ impl GeocodePanel {
         if self.busy {
             return;
         }
+        // The photo id is the shown catalog's: the fill is bound to it (fails closed after a
+        // switch, writing neither the new catalog's row nor any sidecar).
+        let Some(from) = self.state.read(cx).catalog() else {
+            self.status = "The catalog is still loading; try again.".into();
+            cx.notify();
+            return;
+        };
         self.busy = true;
         self.status = "Geocoding…".into();
         cx.notify();
@@ -182,7 +189,7 @@ impl GeocodePanel {
         let app = self.state.read(cx).app().clone();
         // Network (Nominatim): the core runtime, never the UI thread.
         let task = chairphoto_core::app::runtime()
-            .spawn(async move { chairphoto_core::plugins::map::geocode::geocode_photo_to_iptc(&app, photo).await });
+            .spawn(async move { chairphoto_core::plugins::map::geocode::geocode_photo_to_iptc(&app, Some(from), photo).await });
         cx.spawn(async move |this, cx| {
             let result = task.await.unwrap_or_else(|e| Err(e.to_string()));
             this.update(cx, |p, cx| {

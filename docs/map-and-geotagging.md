@@ -126,7 +126,12 @@ Three commands:
 
 Fields that already hold a value are **never overwritten** — this fills blanks, it does not
 replace. The write path is `set_iptc` + `xmp::write_iptc`, identical to a manual IPTC save,
-so XMP sidecars stay merge-safe. The single-photo path uses a TOCTOU-safe three-step
+so XMP sidecars stay merge-safe. Both fills are bound to the catalog they read the photo
+from (`CatalogIdentity`): the cache, the row, the sidecar path and the IPTC written into it
+all come from that catalog, and a catalog switch during the Nominatim call makes the next
+step fail closed with `CATALOG_CHANGED` instead of writing the new catalog's row (whose ids
+collide) or the old catalog's sidecar. The GPUI module binds its fence writes the same way,
+to the catalog the fences were read from. The single-photo path uses a TOCTOU-safe three-step
 pattern (read GPS and check cache, async HTTP, store result) so it never blocks the UI
 thread. The inspector exposes "Geocode location" for one photo and "Geocode all with GPS"
 for the batch, with a progress bar and a summary.

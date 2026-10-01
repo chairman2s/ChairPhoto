@@ -9,6 +9,14 @@
 //! read the app model announces (startup, a switch, a finished scan) and after the module's
 //! own writes.
 //!
+//! **Catalog identity.** The switch publishes the new catalog before `catalog:switched`
+//! reaches this state, so a write keyed by ids read earlier (a fence id, a photo id) could
+//! land on the new catalog's rows. Each read records the [`CatalogIdentity`] it came from;
+//! every write — fence create/update/delete/apply, the inspector's geocode and Geocode all —
+//! runs through `with_catalog_as` with it and fails closed with `CATALOG_CHANGED` once
+//! another catalog is open. Before the first read lands (or after a switch) there is no
+//! identity and a write is refused with a status line.
+//!
 //! **Consent** (decision #118) is a catalog setting, `map.tileHosts`, so it is remembered
 //! per catalog: another catalog asks again. Until it has been read, the host counts as
 //! "never asked" and nothing is fetched.
@@ -17,7 +25,7 @@ use super::logic::{Consent, HostConsent, TILE_HOSTS_KEY, TILE_URL_KEY};
 use crate::model::{AppModel, AppModelEvent};
 use crate::modules::ModuleSettings;
 use crate::storage::Runner;
-use chairphoto_core::app::{with_catalog, AppState, CoreEvent};
+use chairphoto_core::app::{with_catalog_as, with_catalog_identified, AppState, CatalogIdentity, CoreEvent};
 use chairphoto_core::plugins::map::cluster::{project_points, ProjectedPoint};
 use chairphoto_core::plugins::map::tiles::TileSource;
 use chairphoto_core::plugins::map::{self as backend, Fence, LatLng};
@@ -58,7 +66,11 @@ pub struct MapState {
     pub points: Load<Arc<Vec<ProjectedPoint>>>,
     /// Bumped whenever `points` is replaced, so views re-cluster and re-fit.
     pub points_revision: u64,
+    /// The catalog `points` were read from (photo ids: the inspector's geocode, Geocode all).
+    points_from: Option<CatalogIdentity>,
     pub fences: Vec<Fence>,
+    /// The catalog `fences` were read from (fence ids: every fence write).
+    fences_from: Option<CatalogIdentity>,
     pub fence_error: Option<String>,
     /// `None` until the settings have been read.
     pub stored: Option<MapSettingsData>,
@@ -95,7 +107,9 @@ impl MapState {
             model: model.clone(),
             points: Load::Loading,
             points_revision: 0,
+            points_from: None,
             fences: Vec::new(),
+            fences_from: None,
             fence_error: None,
             stored: None,
             source: TileSource::default(),
@@ -121,6 +135,12 @@ impl MapState {
         &self.app
     }
 
+    /// The catalog the shown photos were read from: what a write keyed by a photo id the
+    /// user sees now is bound to. `None` until a read lands (and after a switch).
+    pub fn catalog(&self) -> Option<CatalogIdentity> {
+        self.points_from
+    }
+
     /// The consent for the current tile host. `Unknown` until the settings are read.
     pub fn consent(&self) -> Consent {
         self.stored.as_ref().map_or(Consent::Unknown, |s| s.consent.get(self.source.host()))
@@ -135,7 +155,9 @@ impl MapState {
         self.generation += 1;
         self.points = Load::Loading;
         self.points_revision += 1;
+        self.points_from = None;
         self.fences.clear();
+        self.fences_from = None;
         self.fence_error = None;
         self.stored = None;
         self.source = TileSource::default();
@@ -181,15 +203,18 @@ impl MapState {
         self.run(
             cx,
             |app, _| {
-                with_catalog(app, |c| {
+                with_catalog_identified(app, |c| {
                     backend::ensure_schema_for(c)?;
                     Ok(backend::map_photo_points_for(c)?)
                 })
-                .map(|points| project_points(&points)) // projected off the UI thread too
+                .map(|(from, points)| (from, project_points(&points))) // projected off the UI thread too
             },
             |s, result, _| {
                 s.points = match result {
-                    Ok(points) => Load::Ready(Arc::new(points)),
+                    Ok((from, points)) => {
+                        s.points_from = Some(from);
+                        Load::Ready(Arc::new(points))
+                    }
                     Err(e) => Load::Failed(e),
                 };
                 s.points_revision += 1;
@@ -201,13 +226,14 @@ impl MapState {
         self.run(
             cx,
             |app, _| {
-                with_catalog(app, |c| {
+                with_catalog_identified(app, |c| {
                     backend::ensure_schema_for(c)?;
                     Ok(backend::list_fences_for(c)?)
                 })
             },
             |s, result, _| match result {
-                Ok(f) => {
+                Ok((from, f)) => {
+                    s.fences_from = Some(from);
                     s.fences = f;
                     s.fence_error = None;
                 }
@@ -293,11 +319,21 @@ impl MapState {
         self.model.update(cx, |m, cx| m.refresh(cx));
     }
 
+    /// The catalog the fences were read from, or — before one has — a status line and `None`.
+    fn fence_catalog(&self, cx: &mut Context<Self>) -> Option<CatalogIdentity> {
+        if self.fences_from.is_none() {
+            self.status("The catalog's fences are still loading; try again.".into(), cx);
+        }
+        self.fences_from
+    }
+
+    /// Draw-and-save: into the catalog whose fences the map shows.
     pub fn create_fence(&mut self, name: String, tag_path: String, polygon: Vec<LatLng>, cx: &mut Context<Self>) {
+        let Some(from) = self.fence_catalog(cx) else { return };
         self.run(
             cx,
             move |app, _| {
-                with_catalog(app, |c| {
+                with_catalog_as(app, from, |c| {
                     backend::ensure_schema_for(c)?;
                     Ok(backend::create_fence_for(c, &name, &tag_path, &polygon)?)
                 })
@@ -312,6 +348,7 @@ impl MapState {
     /// Save a fence's name, tag path and polygon. The local copy changes at once (a dragged
     /// vertex must not snap back while the write runs); a failure reloads the stored one.
     pub fn update_fence(&mut self, fence: Fence, cx: &mut Context<Self>) {
+        let Some(from) = self.fence_catalog(cx) else { return };
         if let Some(f) = self.fences.iter_mut().find(|f| f.id == fence.id) {
             *f = fence.clone();
         }
@@ -319,7 +356,7 @@ impl MapState {
         self.run(
             cx,
             move |app, _| {
-                with_catalog(app, |c| {
+                with_catalog_as(app, from, |c| {
                     backend::ensure_schema_for(c)?;
                     Ok(backend::update_fence_for(c, fence.id, &fence.name, &fence.tag_path, &fence.polygon)?)
                 })
@@ -334,9 +371,10 @@ impl MapState {
     }
 
     pub fn delete_fence(&mut self, id: i64, cx: &mut Context<Self>) {
+        let Some(from) = self.fence_catalog(cx) else { return };
         self.run(
             cx,
-            move |app, _| with_catalog(app, |c| Ok(backend::delete_fence_for(c, id)?)),
+            move |app, _| with_catalog_as(app, from, |c| Ok(backend::delete_fence_for(c, id)?)),
             |s, r, cx| match r {
                 Ok(_) => s.reload_fences(cx),
                 Err(e) => s.status(format!("Failed to delete fence: {e}"), cx),
@@ -350,13 +388,14 @@ impl MapState {
         if self.applying.is_some() {
             return;
         }
+        let Some(from) = self.fence_catalog(cx) else { return };
         self.applying = Some(fence);
         let name = fence.and_then(|id| self.fences.iter().find(|f| f.id == id)).map(|f| f.name.clone());
         cx.notify();
         self.run(
             cx,
             move |app, _| {
-                with_catalog(app, |c| {
+                with_catalog_as(app, from, |c| {
                     backend::ensure_schema_for(c)?;
                     match fence {
                         Some(id) => backend::apply_fence(c, id),
@@ -388,11 +427,15 @@ impl MapState {
         if self.geocode.busy {
             return;
         }
+        let Some(from) = self.points_from else {
+            self.status("The catalog is still loading; try again.".into(), cx);
+            return;
+        };
         self.geocode = GeocodeRun { busy: true, status: "Starting…".into(), ..Default::default() };
         cx.notify();
         let (generation, app) = (self.generation, self.app.clone());
         let task = chairphoto_core::app::runtime()
-            .spawn(async move { backend::geocode::geocode_all_to_iptc(&app).await });
+            .spawn(async move { backend::geocode::geocode_all_to_iptc(&app, Some(from)).await });
         cx.spawn(async move |this, cx| {
             let result = task.await.unwrap_or_else(|e| Err(e.to_string()));
             this.update(cx, |s, cx| {

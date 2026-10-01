@@ -41,6 +41,9 @@ smarttags = ["chairphoto-core/smarttags"]
 smarttags-cuda = ["smarttags", "chairphoto-core/smarttags-cuda"]
 slideshow = ["chairphoto-core/slideshow"]
 raw = ["chairphoto-core/raw"]
+# The module registry's dev module (`modules::dev_module`), which contributes to every slot:
+# for looking at the slots in the running app. Never in `default`; tests get it anyway.
+dev-module = []
 
 [dependencies]
 # Features are forwarded one by one above, so `--no-default-features` here builds no backend.

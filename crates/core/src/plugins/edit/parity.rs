@@ -26,7 +26,7 @@ pub const PARITY_EDGE: u32 = 512;
 /// Exactness itself is locked at 100 % by `export_at_full_size_is_the_view_at_full_size`.
 pub const PARITY_TOLERANCE: f32 = 6.0;
 
-/// Exports checked and exports that differed, since the last [`take`].
+/// Exports checked and exports that differed — in one [`collect`], or since the last [`take`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ParityTally {
@@ -34,7 +34,36 @@ pub struct ParityTally {
     pub differing: u64,
 }
 
+/// Checks recorded outside any [`collect`] — the commands that still drain it with [`take`]
+/// (publishing, Instagram, LocalSend).
 static TALLY: Mutex<ParityTally> = Mutex::new(ParityTally { checked: 0, differing: 0 });
+
+thread_local! {
+    /// The tally of the export running on this thread under [`collect`], if any.
+    static COLLECTOR: std::cell::RefCell<Option<ParityTally>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Run one export, `f`, collecting the checks it records into a tally of its own instead of
+/// the process-wide one: the export job carries its own count to its own catalog, and no
+/// other export — before or after a catalog switch — can drain or add to it. An export
+/// records on the thread that runs it (`export::export_engine2`), so the collector is
+/// thread-local. A nested `collect` keeps its checks to itself; the outer one resumes after.
+pub fn collect<R>(f: impl FnOnce() -> R) -> (R, ParityTally) {
+    /// Puts the outer collector back even if `f` panics.
+    struct Restore(Option<Option<ParityTally>>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            if let Some(outer) = self.0.take() {
+                COLLECTOR.with(|c| *c.borrow_mut() = outer);
+            }
+        }
+    }
+    let mut restore = Restore(Some(COLLECTOR.with(|c| c.borrow_mut().replace(ParityTally::default()))));
+    let r = f();
+    let outer = restore.0.take().unwrap_or_default();
+    let mine = COLLECTOR.with(|c| std::mem::replace(&mut *c.borrow_mut(), outer)).unwrap_or_default();
+    (r, mine)
+}
 
 /// Mean |Δ| between the view's render of `edit_json` at [`PARITY_EDGE`] and `export`
 /// scaled to that size.
@@ -59,17 +88,25 @@ pub fn fit_difference(
     Ok(sum as f32 / view.as_raw().len() as f32)
 }
 
-/// Tally one checked export.
+/// Tally one checked export: into the [`collect`] running on this thread, else the
+/// process-wide tally.
 pub fn record(difference: f32) {
-    let mut t = TALLY.lock().unwrap_or_else(|e| e.into_inner());
-    t.checked += 1;
-    if difference > PARITY_TOLERANCE {
-        t.differing += 1;
+    let differs = difference > PARITY_TOLERANCE;
+    if differs {
         eprintln!("export: differs from the view at Fit by {difference:.2} levels (tolerance {PARITY_TOLERANCE})");
+    }
+    let add = |t: &mut ParityTally| {
+        t.checked += 1;
+        t.differing += differs as u64;
+    };
+    let collected = COLLECTOR.with(|c| c.borrow_mut().as_mut().map(add).is_some());
+    if !collected {
+        add(&mut TALLY.lock().unwrap_or_else(|e| e.into_inner()));
     }
 }
 
-/// The tally since the last take, reset to zero.
+/// The process-wide tally (checks recorded outside any [`collect`]) since the last take,
+/// reset to zero.
 pub fn take() -> ParityTally {
     std::mem::take(&mut *TALLY.lock().unwrap_or_else(|e| e.into_inner()))
 }
@@ -129,5 +166,21 @@ mod tests {
         assert_eq!(take(), ParityTally { checked: 2, differing: 1 });
         assert_eq!(take(), ParityTally::default());
         assert_eq!(ParityTally { checked: 2, differing: 1 }.plus(ParityTally { checked: 5, differing: 0 }), ParityTally { checked: 7, differing: 1 });
+    }
+
+    /// A collected export's checks are its own: never in the process-wide tally, not in an
+    /// enclosing collect, and the enclosing one resumes after the inner returns.
+    #[test]
+    fn a_collect_keeps_its_checks_to_itself() {
+        let ((inner, ()), outer) = collect(|| {
+            record(0.5);
+            let inner = collect(|| record(PARITY_TOLERANCE + 1.0));
+            record(0.5);
+            (inner, ())
+        });
+        assert_eq!(inner.1, ParityTally { checked: 1, differing: 1 });
+        assert_eq!(outer, ParityTally { checked: 2, differing: 0 });
+        // No collector is left installed on this thread.
+        COLLECTOR.with(|c| assert!(c.borrow().is_none()));
     }
 }

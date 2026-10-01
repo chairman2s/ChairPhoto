@@ -131,20 +131,25 @@ fn export_photos_claimed_with(
     };
     let job = claim.job;
     let events = state.clone();
-    let run = crate::export::write_exports_with(
-        &resolved,
-        request.preset,
-        &request.dest_dir,
-        &hashtags,
-        &claim.abort,
-        &|done, total| {
-            events.send(CoreEvent::ExportProgress(ExportProgress { kind: ExportKind::Photos, job, done, total }));
-            if done > 0 {
-                after_photo(done);
-            }
-        },
-    )?;
-    record_export_parity_as(state, Some(read_from));
+    // This job's own parity tally: collected while its copies are written, so no other
+    // export's checks are counted into it, nor its checks into another's.
+    let (run, tally) = collect_parity(|| {
+        crate::export::write_exports_with(
+            &resolved,
+            request.preset,
+            &request.dest_dir,
+            &hashtags,
+            &claim.abort,
+            &|done, total| {
+                events.send(CoreEvent::ExportProgress(ExportProgress { kind: ExportKind::Photos, job, done, total }));
+                if done > 0 {
+                    after_photo(done);
+                }
+            },
+        )
+    });
+    let run = run?;
+    record_parity_tally(state, Some(read_from), tally);
     if run.stopped {
         return Err(format!(
             "{EXPORT_CANCELLED}: {} of {} exported to {}.",
@@ -239,21 +244,40 @@ fn export_bundle_claimed_hooked(
 #[cfg(feature = "edit")]
 pub const EXPORT_PARITY_KEY: &str = "metrics.exportParity";
 
-/// Add the engine-2 exports checked since the last call to this catalog's total. Called
-/// after every command that writes an export (the Export dialog, publishing, Instagram,
-/// LocalSend); best-effort — a failed write loses a count, never an export.
-pub fn record_export_parity(state: &AppState) {
-    record_export_parity_as(state, None);
+/// One export job's parity tally (`plugins::edit::parity::ParityTally`); nothing without
+/// the `edit` feature, which is what checks exports.
+#[cfg(feature = "edit")]
+type JobParity = crate::plugins::edit::parity::ParityTally;
+#[cfg(not(feature = "edit"))]
+type JobParity = ();
+
+/// Run one export job's writes, `f`, collecting the parity checks they record into the
+/// job's own tally (`plugins::edit::parity::collect`) rather than the process-wide one.
+fn collect_parity<R>(f: impl FnOnce() -> R) -> (R, JobParity) {
+    #[cfg(feature = "edit")]
+    return crate::plugins::edit::parity::collect(f);
+    #[cfg(not(feature = "edit"))]
+    (f(), ())
 }
 
-/// [`record_export_parity`] bound to `from`, the catalog the export read: once another
-/// catalog is open the tally is dropped (it counts the old catalog's exports), never added
-/// to the new catalog's total.
-pub fn record_export_parity_as(state: &AppState, from: Option<CatalogIdentity>) {
+/// Add the engine-2 exports checked outside any export job's own tally (the process-wide
+/// `parity::take`) to the open catalog's total. Called after the commands that write an
+/// export without collecting their own (publishing, Instagram, LocalSend); best-effort — a
+/// failed write loses a count, never an export.
+pub fn record_export_parity(state: &AppState) {
+    #[cfg(feature = "edit")]
+    record_parity_tally(state, None, crate::plugins::edit::parity::take());
+    #[cfg(not(feature = "edit"))]
+    record_parity_tally(state, None, ());
+}
+
+/// Add `tally` — one export job's own — to the total of `from`, the catalog the export read:
+/// once another catalog is open the tally is dropped (it counts the old catalog's exports),
+/// never added to the new catalog's total. `None`: whichever catalog is open.
+fn record_parity_tally(state: &AppState, from: Option<CatalogIdentity>, tally: JobParity) {
     #[cfg(feature = "edit")]
     {
-        use crate::plugins::edit::parity::{take, ParityTally};
-        let tally = take();
+        use crate::plugins::edit::parity::ParityTally;
         if tally.checked == 0 {
             return;
         }
@@ -277,7 +301,7 @@ pub fn record_export_parity_as(state: &AppState, from: Option<CatalogIdentity>) 
         }
     }
     #[cfg(not(feature = "edit"))]
-    let _ = (state, from);
+    let _ = (state, from, tally);
 }
 
 #[cfg(test)]
@@ -476,6 +500,55 @@ mod tests {
         let guard = f.state.catalog.lock().unwrap();
         let now = guard.as_ref().unwrap();
         assert_eq!(now.get_setting(EXPORT_PARITY_KEY).unwrap(), None, "the switched-to catalog's total is untouched");
+    }
+
+    /// Each export's parity tally is its own. Export A (catalog A) records one check after
+    /// its first photo and is held there; the app switches to catalog B, where export B
+    /// records two checks and finishes; the app switches back to A and export A resumes (it
+    /// stops — B tripped it — and records). B's total must be B's two checks only, and A's
+    /// total A's one: neither drains nor carries the other's counts.
+    #[cfg(feature = "edit")]
+    #[test]
+    fn interleaved_exports_across_a_switch_record_each_tally_only_into_its_own_catalog() {
+        use crate::plugins::edit::parity::{record, ParityTally};
+        use std::sync::mpsc::channel;
+        let f = fixture("parity-own", 2);
+        let other = fixture("parity-own-other", 2);
+        let parked = Mutex::new(other.state.catalog.lock().unwrap().take());
+        let swap = || std::mem::swap(&mut *f.state.catalog.lock().unwrap(), &mut *parked.lock().unwrap());
+        let total = |c: &Catalog| -> Option<ParityTally> {
+            c.get_setting(EXPORT_PARITY_KEY).unwrap().map(|v| serde_json::from_str(&v).unwrap())
+        };
+        let (mid_tx, mid_rx) = channel::<()>();
+        let (resume_tx, resume_rx) = channel::<()>();
+        let claim_a = claim_export(&f.state).unwrap();
+        std::thread::scope(|s| {
+            let (f, claim_a) = (&f, &claim_a);
+            let a = s.spawn(move || {
+                export_photos_claimed_with(&f.state, claim_a, None, &request(f, &f.dir.join("out-a")), &|done| {
+                    if done == 1 {
+                        record(0.0);
+                        mid_tx.send(()).unwrap();
+                        wait(&resume_rx);
+                    }
+                })
+            });
+            wait(&mid_rx);
+            swap(); // → catalog B
+            let claim_b = claim_export(&f.state).unwrap();
+            export_photos_claimed_with(&f.state, &claim_b, None, &request(&other, &other.dir.join("out-b")), &|_| {
+                record(0.0)
+            })
+            .unwrap();
+            swap(); // → catalog A
+            resume_tx.send(()).unwrap();
+            let err = a.join().unwrap().unwrap_err();
+            assert!(err.starts_with(EXPORT_CANCELLED), "{err}");
+        });
+        let guard = f.state.catalog.lock().unwrap();
+        assert_eq!(total(guard.as_ref().unwrap()), Some(ParityTally { checked: 1, differing: 0 }), "A's own check");
+        let parked = parked.lock().unwrap();
+        assert_eq!(total(parked.as_ref().unwrap()), Some(ParityTally { checked: 2, differing: 0 }), "B's own checks");
     }
 
     /// A Cancel during the last photo (its preview step, the final progress call) — after

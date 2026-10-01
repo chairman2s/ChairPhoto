@@ -201,6 +201,32 @@ fn batch_marks_and_bench_marks_do_not_advance(cx: &mut TestAppContext) {
     assert_eq!(rating_of(&app, ids[3]).2, "Green");
 }
 
+/// A culling key whose write fails does not advance: the selection stays on the photo the
+/// user tried to mark, and the status line says why (React advanced only after
+/// `applyToSelection` resolved). The failure is injected with a temporary trigger on the
+/// catalog's own connection that aborts every update of `photos`.
+#[gpui_kit::test]
+fn a_failed_culling_write_does_not_advance(cx: &mut TestAppContext) {
+    let dir = TempDir::new("grid-cull-fail");
+    let app = start(cx);
+    let ids = open_catalog_with_photos(&app, &dir, 3, cx);
+    click_tile(&app, ids[1], Modifiers::default(), cx);
+    app.state
+        .catalog
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .conn()
+        .execute_batch("CREATE TEMP TRIGGER refuse_marks BEFORE UPDATE ON photos BEGIN SELECT RAISE(ABORT, 'injected'); END;")
+        .unwrap();
+
+    press(&app, "3", cx);
+    assert_eq!(rating_of(&app, ids[1]).0, 0, "the injected failure refused the write");
+    assert!(status(&app, cx).starts_with("Could not mark:"), "status: {}", status(&app, cx));
+    assert_eq!(selection(&app, cx), (Some(ids[1]), vec![ids[1]]), "a failed mark advanced the selection");
+}
+
 /// A mark queued when the catalog switches is not written: its ids name the closed
 /// catalog's photos (AGENTS.md: a catalog switch makes older work unreachable).
 #[gpui_kit::test]

@@ -656,8 +656,8 @@ impl ShellState {
     /// The one write path for culling marks (App.tsx's `applyToSelection`): write `mark` on
     /// every targeted photo (the selection, else the active photo), then re-read the rows.
     ///
-    /// `advance` is the keyboard's own behaviour: when exactly one photo was marked, step
-    /// to the next one — over the rows as they were when the key was pressed, not the
+    /// `advance` is the keyboard's own behaviour: when exactly one photo was marked — and the
+    /// write succeeded — step to the next one — over the rows as they were when the key was pressed, not the
     /// refreshed ones the photo may have been filtered out of (`step_active_over`). The
     /// bench's controls pass `false`: clicking a star must not move the selection.
     ///
@@ -714,12 +714,18 @@ impl ShellState {
                 if s.catalog_generation != generation {
                     return;
                 }
-                if let Err(e) = result {
-                    eprintln!("library: mark failed: {e}");
-                    s.model.update(cx, |m, cx| m.set_status(format!("Could not mark: {e}"), cx));
-                }
-                if let Some(snapshot) = snapshot {
-                    s.library.step_active_over(&snapshot, 1, false);
+                match result {
+                    // The keyboard advances only past a mark that was written (React advanced
+                    // after `applyToSelection` resolved; a failed write threw first).
+                    Ok(()) => {
+                        if let Some(snapshot) = snapshot {
+                            s.library.step_active_over(&snapshot, 1, false);
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("library: mark failed: {e}");
+                        s.model.update(cx, |m, cx| m.set_status(format!("Could not mark: {e}"), cx));
+                    }
                 }
                 s.refresh_rows(cx);
                 s.refresh_scope(cx);

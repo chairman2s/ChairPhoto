@@ -406,6 +406,11 @@ impl Render for LoupeView {
             .on_action(cx.listener(|this, _: &SelectPrevious, _, cx| this.step(-1, false, cx)))
             .on_action(cx.listener(|this, _: &ExtendNext, _, cx| this.step(1, true, cx)))
             .on_action(cx.listener(|this, _: &ExtendPrevious, _, cx| this.step(-1, true, cx)))
+            // Select every photo in the view, keeping the one shown active (React's grid handler,
+            // which stayed live under the inline loupe).
+            .on_action(cx.listener(|this, _: &SelectAll, _, cx| {
+                this.shell.update(cx, |s, cx| s.select_with(cx, |l| l.select_all()))
+            }))
             .on_action(cx.listener(|this, _: &CloseLoupe, _, cx| this.shell.update(cx, |s, cx| s.set_loupe(false, cx))))
             .on_action(cx.listener(|this, _: &CompareSelection, window, cx| {
                 if this.shell.read(cx).library.selection().ids.len() >= 2 {

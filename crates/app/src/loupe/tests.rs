@@ -308,6 +308,19 @@ fn loupe_keys_mark_advance_and_close(cx: &mut TestAppContext) {
     assert_eq!(stage(&app, cx), StageView::Grid, "Enter toggles");
 }
 
+/// Ctrl+A in the loupe selects every photo in the view, as in the grid, and the loupe stays
+/// on the photo it showed.
+#[gpui_kit::test]
+fn ctrl_a_in_the_loupe_selects_the_whole_view(cx: &mut TestAppContext) {
+    let (app, _pool, _dir, ids) = app_with(4, "loupe-all", cx);
+    select(&app, ids[2], cx);
+    press(&app, "enter", cx);
+    press(&app, "ctrl-a", cx);
+    let selected = app.wired.shell.read_with(cx, |s, _| s.library.selection().ids.to_vec());
+    assert_eq!(selected, ids);
+    assert_eq!((active(&app, cx), stage(&app, cx)), (Some(ids[2]), StageView::Loupe));
+}
+
 /// A video shows its poster and hands the file to the system player.
 #[gpui_kit::test]
 fn a_video_plays_in_the_system_player(cx: &mut TestAppContext) {

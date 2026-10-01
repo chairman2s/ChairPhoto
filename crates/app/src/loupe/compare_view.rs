@@ -52,7 +52,17 @@ impl CompareView {
                 cx.new(|cx| ZoomImage::shared(images, shared, format!("compare-image-{i}"), cx))
             })
             .collect();
-        let _observers = [cx.observe(&shell, |_, _, cx| cx.notify()), cx.observe(&shared, |_, _, cx| cx.notify())];
+        let _observers = [
+            cx.observe(&shell, |this, shell, cx| {
+                // Closed: reset here, not in render — a closed Compare is not on the stage, so
+                // it is not rendered, and reopening on the same frames would find the old zoom.
+                if shell.read(cx).compare().is_none() {
+                    this.reset(cx);
+                }
+                cx.notify()
+            }),
+            cx.observe(&shared, |_, _, cx| cx.notify()),
+        ];
         CompareView { shell, images, shared, panes, focus: cx.focus_handle(), shown: Vec::new(), _observers }
     }
 
@@ -62,6 +72,24 @@ impl CompareView {
 
     pub fn shared_view(&self) -> &Entity<ZoomShared> {
         &self.shared
+    }
+
+    /// The panes' images, in pane order.
+    pub fn panes(&self) -> &[Entity<ZoomImage>] {
+        &self.panes
+    }
+
+    /// Compare closed: the next one starts fresh, whatever its frames — fit, the preview
+    /// tier, no photo held.
+    fn reset(&mut self, cx: &mut Context<Self>) {
+        if self.shown.is_empty() {
+            return;
+        }
+        self.shown.clear();
+        self.shared.update(cx, |s, cx| s.set(ZoomView::FIT, cx));
+        for pane in &self.panes {
+            pane.update(cx, |z, cx| z.set_photo(None, cx));
+        }
     }
 
     fn duel(&self, cx: &Context<Self>) -> bool {
@@ -192,11 +220,7 @@ impl Render for CompareView {
         let shell = self.shell.read(cx);
         let panes: Vec<Photo> = shell.compare_panes().into_iter().cloned().collect();
         let Some(session) = shell.compare().cloned() else {
-            // Closed: the next Compare starts from fit, whatever its frames.
-            self.shown.clear();
-            for pane in &self.panes {
-                pane.update(cx, |z, cx| z.set_photo(None, cx));
-            }
+            self.reset(cx);
             return div().id("compare").into_any_element();
         };
         let soft = shell.soft_threshold;

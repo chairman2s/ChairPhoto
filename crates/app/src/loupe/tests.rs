@@ -434,6 +434,32 @@ fn compare_ends_when_every_pane_leaves_the_view(cx: &mut TestAppContext) {
     assert_eq!(culling(&app, ids[0]).0, 2, "the grid's selection is marked");
 }
 
+/// Closing Compare resets its view: reopened on the same frames it starts at fit, on the
+/// preview tier.
+#[gpui_kit::test]
+fn reopening_compare_on_the_same_set_starts_fresh(cx: &mut TestAppContext) {
+    let (app, pool, _dir, ids) = app_with(3, "cmp-reopen", cx);
+    select_all(&app, cx);
+    press(&app, "c", cx);
+    for &id in &ids {
+        pool.finish(&preview(id), Ok(pixels(300, 200)));
+    }
+    cx.run_until_parked();
+    wheel(&app, "compare-image-1", true, cx);
+    let compare = root(&app).read_with(cx, |r, _| r.compare().clone());
+    let shared = compare.read_with(cx, |c, _| c.shared_view().clone());
+    let pane = compare.read_with(cx, |c, _| c.panes()[1].clone());
+    assert!(shared.read_with(cx, |s, _| s.view.zoomed()));
+    assert!(pane.read_with(cx, |z, _| z.wants_hi()), "zoomed: the full-resolution tier");
+    press(&app, "escape", cx);
+    assert_eq!(stage(&app, cx), StageView::Grid);
+    press(&app, "c", cx);
+    assert_eq!(stage(&app, cx), StageView::Compare);
+    render(&app, cx);
+    assert_eq!(shared.read_with(cx, |s, _| s.view), ZoomView::FIT, "the same frames, at fit");
+    assert!(!pane.read_with(cx, |z, _| z.wants_hi()), "on the preview tier again");
+}
+
 /// Catalog identity: a verdict after the core switched writes nothing to the colliding ids;
 /// `catalog:switched` closes Compare.
 #[gpui_kit::test]

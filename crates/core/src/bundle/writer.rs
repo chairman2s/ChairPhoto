@@ -359,20 +359,38 @@ pub fn write_bundle_abortable(
         if aborted(abort) {
             return Err(cancelled());
         }
+        // The temp file was fsynced before this: a crash after the rename leaves either the
+        // previous bundle or this whole one at `dest_path`, never a truncated one.
+        std::fs::rename(&tmp_path, dest_path).map_err(|e| format!("rename bundle into place: {e}"))?;
         Ok(r)
     });
 
     match result {
         Ok(r) => {
-            std::fs::rename(&tmp_path, dest_path)
-                .map_err(|e| format!("rename bundle into place: {e}"))?;
+            // Make the rename itself durable. The bundle is in place either way, so a failure
+            // here is logged, not reported as a failed export.
+            if let Err(e) = sync_dir(dir) {
+                eprintln!("bundle: could not sync {} after the rename: {e}", dir.display());
+            }
             Ok(r)
         }
         Err(e) => {
+            // Any failure after the temp file was created — the write, a cancel, the rename —
+            // removes it (it is this write's own; a failed rename leaves it where it was).
             let _ = std::fs::remove_file(&tmp_path);
             Err(e)
         }
     }
+}
+
+/// fsync directory `dir`, so a rename into it survives a crash (a no-op where a directory
+/// cannot be opened as a file).
+fn sync_dir(dir: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    std::fs::File::open(dir)?.sync_all()?;
+    #[cfg(not(unix))]
+    let _ = dir;
+    Ok(())
 }
 
 /// Create a fresh temp file in `dir` for one bundle write: a name no other write uses
@@ -498,7 +516,9 @@ fn write_bundle_to_file(
     if aborted(abort) {
         return Err(cancelled());
     }
-    zip.finish().map_err(|e| format!("zip finish: {e}"))?;
+    let file = zip.finish().map_err(|e| format!("zip finish: {e}"))?;
+    // Durable before the rename can expose it.
+    file.sync_all().map_err(|e| format!("sync bundle file: {e}"))?;
     Ok(result)
 }
 
@@ -543,6 +563,33 @@ mod tests {
     fn tmp_bundle(name: &str) -> crate::test_support::TestSubPath {
         crate::test_support::TestTmpDir::new(&format!("bundle-{name}"))
             .into_subpath("test.chairphoto")
+    }
+
+    /// A rename that fails after the zip was written (the destination is a non-empty
+    /// directory) reports the error and removes the temp file: nothing is left behind.
+    #[test]
+    fn a_failed_rename_removes_the_temp_file() {
+        let dir = crate::test_support::TestTmpDir::new("bundle-rename-fails");
+        let dest = dir.join("taken.chairphoto");
+        std::fs::create_dir_all(dest.join("inside")).unwrap();
+        let bundle = GatheredBundle {
+            manifest: BundleManifest::new(
+                crate::bundle::BundleBatch {
+                    uuid: "batch-rename".into(),
+                    source_label: "Rename".into(),
+                    note: String::new(),
+                    created_at: 1_700_000_000,
+                },
+                1_700_100_000,
+            ),
+            originals: HashMap::new(),
+        };
+        let err = write_bundle(&bundle, &dest, |_, _| {}).unwrap_err();
+        assert!(err.starts_with("rename bundle into place"), "{err}");
+        let left: Vec<String> =
+            std::fs::read_dir(&*dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        assert_eq!(left, ["taken.chairphoto"], "only the directory that was in the way");
+        assert!(dest.join("inside").is_dir(), "the destination is untouched");
     }
 
     /// Build a minimal manifest + empty originals map and write it to a zip; verify

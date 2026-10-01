@@ -1037,9 +1037,15 @@ mod tests {
         let unreadable = dir.0.join("unreadable");
         std::fs::create_dir(&unreadable).unwrap();
         std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o000)).unwrap();
-        let e = ensure_private_dir(&unreadable, uid).unwrap_err();
+        // With a permission bypass (root, CAP_DAC_OVERRIDE) mode 000 does not stop the open,
+        // so this case cannot be staged (Codex re-check of 272b36c).
+        if std::fs::read_dir(&unreadable).is_ok() {
+            println!("SKIPPED: an_unsafe_runtime_dir_is_told_apart_from_an_unusable_one (unreadable case) — this process bypasses file permissions, so mode 000 cannot make a directory unopenable");
+        } else {
+            let e = ensure_private_dir(&unreadable, uid).unwrap_err();
+            assert!(is_unsafe_dir(&e), "an unreadable dir not told apart: {e}");
+        }
         std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o700)).unwrap();
-        assert!(is_unsafe_dir(&e), "an unreadable dir not told apart: {e}");
         let missing_parent = dir.0.join("no/such/parent");
         let e = ensure_private_dir(&missing_parent, uid).unwrap_err();
         assert!(!is_unsafe_dir(&e), "an ordinary failure taken for an unsafe dir: {e}");

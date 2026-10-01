@@ -556,12 +556,18 @@ fn a_cull_session_resumes_decides_saves_and_summarises(cx: &mut TestAppContext) 
     press(&app, "[", cx);
     assert!(app.wired.shell.read_with(cx, |s, _| s.panel_visible(crate::shell::state::Side::Left)), "panel keys are muted");
 
+    // The debounced save: on photo 4 (not the seeded photo 3), only once the pause is over.
+    press(&app, "right", cx);
+    let saved = || app.state.catalog.lock().unwrap().as_ref().unwrap().get_setting(CURSOR_KEY).unwrap();
+    assert_eq!(saved(), Some(ids[2].to_string()), "not before the pause");
     cx.executor().advance_clock(CURSOR_DEBOUNCE);
     cx.run_until_parked();
-    let saved = app.state.catalog.lock().unwrap().as_ref().unwrap().get_setting(CURSOR_KEY).unwrap();
-    assert_eq!(saved, Some(ids[2].to_string()));
+    assert_eq!(saved(), Some(ids[3].to_string()), "saved after the pause");
 
+    // The finish save: back to photo 3 and end at once — the end saves it, not the debounce.
+    press(&app, "left", cx);
     press(&app, "escape", cx);
+    assert_eq!(saved(), Some(ids[2].to_string()), "saved at the end, without the pause");
     assert!(view.read_with(cx, |v, _| v.state.summary.is_some()));
     assert_eq!(label_of(&app, "cull-summary-lead", cx).as_deref(), Some("2 of 5 photos reviewed · 3 still to go"));
     press(&app, "enter", cx);

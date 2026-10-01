@@ -346,8 +346,9 @@ pub fn make_freeform(
 /// non-exportable). Returns the new photo id.
 ///
 /// The ids, the root and the index are all bound to one catalog: `expected`, or the one open
-/// when this starts. If another catalog opens while the collage renders, the index fails
-/// closed with [`CATALOG_CHANGED`] and the rendered file is removed.
+/// when this starts. If another catalog opens while the collage renders — or none is open
+/// because a switch is between its phases — the index fails closed with [`CATALOG_CHANGED`]
+/// and the rendered file is removed.
 pub fn save_to_catalog(
     state: &AppState,
     expected: Option<CatalogIdentity>,
@@ -373,10 +374,13 @@ pub fn save_to_catalog(
     // contract, written out because `index_generated_file` answers a plain message).
     let indexed = (|| {
         let guard = state.catalog.lock().map_err(|e| e.to_string())?;
-        let catalog = guard.as_ref().ok_or("No catalog is open")?;
-        if !identity.is(catalog) {
-            return Err(CATALOG_CHANGED.to_string());
-        }
+        // No catalog open means a switch is between its phases (detached, not yet
+        // published): the bound catalog is gone all the same, so this is CATALOG_CHANGED
+        // and the file is removed, not a plain error that leaves it orphaned.
+        let catalog = match guard.as_ref() {
+            Some(c) if identity.is(c) => c,
+            _ => return Err(CATALOG_CHANGED.to_string()),
+        };
         let photo_id = crate::scanner::index_generated_file(catalog, &dest)?;
         // Organizational tags: the parent AND the leaf are non-exportable, so they are never
         // emitted as keywords on export/publish.
@@ -594,6 +598,35 @@ mod tests {
         let err = save_to_catalog(&state, None, &halves(&ids), &freeform(), "png", "Grid", &switching).unwrap_err();
         assert_eq!(err, CATALOG_CHANGED);
         assert!(!dir.join("library/Collages/collage.png").exists(), "the unindexed collage is removed");
+        let count = state.catalog.lock().unwrap().as_ref().unwrap().count_photos(&Default::default()).unwrap();
+        assert_eq!(count, 0, "the new catalog gained nothing");
+    }
+
+    /// **Forced interleaving.** The save's index runs between a switch's two phases: the
+    /// switch has detached the old catalog (none is open) and not yet published the new one.
+    /// The save fails closed with `CATALOG_CHANGED` and removes its file, exactly as when the
+    /// new catalog is already open.
+    #[test]
+    fn a_library_save_indexing_mid_switch_removes_the_file() {
+        // Switches catalogs: phase one releases develop's process-wide resident image, so
+        // this must not interleave with the develop tests that assert on it (#133).
+        let _serial = crate::develop::serial();
+        let (dir, state, ids) = setup("save-mid-switch");
+        let detached = std::sync::atomic::AtomicBool::new(false);
+        let s = state.clone();
+        // Phase one lands during the render; phase two only after the save has answered.
+        let detaching: PreviewLoader = Arc::new(move |path| {
+            if !detached.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                crate::app::catalogs::detach_catalog_and_trip_jobs(&s).unwrap();
+            }
+            decode_upright(&std::fs::read(path).map_err(|e| e.to_string())?)
+        });
+        let err = save_to_catalog(&state, None, &halves(&ids), &freeform(), "png", "Grid", &detaching).unwrap_err();
+        assert!(state.catalog.lock().unwrap().is_none(), "the index ran with no catalog open");
+        assert_eq!(err, CATALOG_CHANGED);
+        assert!(!dir.join("library/Collages/collage.png").exists(), "the unindexed collage is removed");
+        let b = Catalog::open(&dir.join("b.chairphoto"), &dir.join("b")).unwrap();
+        crate::app::catalogs::publish_catalog_and_reset_jobs(&state, b).unwrap();
         let count = state.catalog.lock().unwrap().as_ref().unwrap().count_photos(&Default::default()).unwrap();
         assert_eq!(count, 0, "the new catalog gained nothing");
     }

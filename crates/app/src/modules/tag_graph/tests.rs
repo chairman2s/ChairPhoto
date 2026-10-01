@@ -19,8 +19,9 @@ use chairphoto_model::tag_graph::synthetic::{library, Scale};
 use chairphoto_model::tag_graph::view::View;
 use gpui_kit::test::TestWindowExt as _;
 use gpui_kit::{
-    point, px, AppContext as _, Entity, InputEvent as _, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, ScrollDelta, TestAppContext, WindowHandle,
+    div, point, px, AppContext as _, Context, Entity, InputEvent as _, IntoElement, Modifiers, MouseButton,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement as _, Render, RenderImage, ScrollDelta, Styled as _,
+    TestAppContext, Window, WindowHandle,
 };
 use std::cell::RefCell;
 use std::path::PathBuf;
@@ -31,9 +32,21 @@ use std::sync::Arc;
 struct Fixture {
     model: Entity<AppModel>,
     shell: Entity<ShellState>,
-    window: WindowHandle<TagGraphView>,
+    window: WindowHandle<Host>,
     view: Entity<TagGraphView>,
     loads: Arc<AtomicUsize>,
+}
+
+/// The window's root: holds the view, and can drop it while the window stays (as disabling
+/// the module does in the shell).
+struct Host {
+    view: Option<Entity<TagGraphView>>,
+}
+
+impl Render for Host {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div().size_full().flex().children(self.view.clone())
+    }
 }
 
 /// A window holding only the Tag graph view over `graph` (counting its loads).
@@ -56,11 +69,12 @@ fn fixture(graph: LibraryGraph, cx: &mut TestAppContext) -> Fixture {
     let (m, s) = (model.clone(), shell.clone());
     let window = cx.update(|cx| {
         cx.open_window(Default::default(), move |window, cx| {
-            cx.new(|cx| TagGraphView::new(&m, s, None, source, window, cx))
+            let view = cx.new(|cx| TagGraphView::new(&m, s, None, source, window, cx));
+            cx.new(|_| Host { view: Some(view) })
         })
         .unwrap()
     });
-    let view = window.root(cx).unwrap();
+    let view = window.root(cx).unwrap().read_with(cx, |h, _| h.view.clone().unwrap());
     let f = Fixture { model, shell, window, view, loads };
     f.settle(cx);
     f
@@ -152,6 +166,16 @@ impl Fixture {
     fn raster_view(&self, cx: &mut TestAppContext) -> Option<View> {
         self.view.read_with(cx, |v, _| v.raster().map(|r| r.view))
     }
+
+    /// The raster on screen now.
+    fn raster_image(&self, cx: &mut TestAppContext) -> Arc<RenderImage> {
+        self.view.read_with(cx, |v, _| v.raster().expect("a raster").image.clone())
+    }
+
+    /// Whether the window's sprite atlas holds `image` — the texture itself, not a request.
+    fn in_atlas(&self, image: &RenderImage, cx: &mut TestAppContext) -> bool {
+        cx.update_window(self.any(), |_, window, _| window.has_image_atlas_entry(image)).unwrap()
+    }
 }
 
 fn small() -> LibraryGraph {
@@ -233,6 +257,8 @@ fn wheel_zoom_reprojects_then_rasters_once_settled(cx: &mut TestAppContext) {
     f.click("tg-type-tags", cx);
     let before = f.stats(cx);
     let fitted = f.view_state(cx);
+    let old = f.raster_image(cx);
+    assert!(f.in_atlas(&old, cx), "the fitted raster was painted");
 
     f.wheel(3., cx);
     f.wheel(3., cx);
@@ -245,7 +271,10 @@ fn wheel_zoom_reprojects_then_rasters_once_settled(cx: &mut TestAppContext) {
     assert_eq!(f.raster_view(cx), Some(zoomed), "the crisp raster follows once quiet");
     let after = f.stats(cx);
     assert_eq!(after.rasters_applied - before.rasters_applied, 1, "one raster for the whole gesture");
-    assert_eq!(after.images_released - before.images_released, 1, "the replaced texture left the atlas");
+    assert_eq!(after.images_released - before.images_released, 1, "one release ran");
+    assert!(!f.in_atlas(&old, cx), "the replaced texture left the atlas");
+    f.settle(cx);
+    assert!(f.in_atlas(&f.raster_image(cx), cx), "the crisp raster is painted");
 }
 
 /// Two raster requests in a row: the first is already in flight, so it runs to completion —
@@ -324,6 +353,8 @@ fn a_catalog_switch_drops_the_load_in_flight(cx: &mut TestAppContext) {
     let f = fixture(small(), cx);
     f.click("tg-type-tags", cx);
     let before = f.stats(cx);
+    let old = f.raster_image(cx);
+    assert!(f.in_atlas(&old, cx), "the raster was painted");
     // A catalog read marks the graph stale; the next render starts the reload …
     f.model.update(cx, |_, cx| cx.emit(crate::model::AppModelEvent::CatalogRead));
     cx.update_window(f.any(), |_, window, cx| window.render_frame(cx)).unwrap();
@@ -335,7 +366,8 @@ fn a_catalog_switch_drops_the_load_in_flight(cx: &mut TestAppContext) {
         assert!(s.graph().is_none() && s.scene().is_none() && v.raster().is_none(), "the old catalog's state is gone");
         assert!(s.visible().tags, "the node-type choice survives the switch");
     });
-    assert_eq!(f.stats(cx).images_released - before.images_released, 1, "the old raster left the atlas");
+    assert_eq!(f.stats(cx).images_released - before.images_released, 1, "the release ran");
+    assert!(!f.in_atlas(&old, cx), "the old catalog's raster left the atlas");
     cx.run_until_parked();
     let after = f.stats(cx);
     assert_eq!(after.loads_dropped - before.loads_dropped, 1, "the old catalog's load was dropped");
@@ -343,6 +375,32 @@ fn a_catalog_switch_drops_the_load_in_flight(cx: &mut TestAppContext) {
     let after = f.stats(cx);
     assert_eq!(after.loads_applied - before.loads_applied, 1, "one fresh load for the new catalog");
     assert!(f.view.read_with(cx, |v, _| v.session().scene().is_some_and(|s| !s.layout.order.is_empty())));
+}
+
+/// Dropping the view while its window stays (the module disabled): its last raster leaves
+/// that window's atlas.
+#[gpui_kit::test]
+fn a_dropped_view_takes_its_raster_out_of_the_atlas(cx: &mut TestAppContext) {
+    let f = fixture(small(), cx);
+    f.click("tg-type-tags", cx);
+    let old = f.raster_image(cx);
+    assert!(f.in_atlas(&old, cx), "the raster was painted");
+    let (weak, any) = (f.view.downgrade(), f.any());
+    let Fixture { window, view, .. } = f;
+    drop(view);
+    window
+        .update(cx, |h, _, cx| {
+            h.view = None;
+            cx.notify();
+        })
+        .unwrap();
+    cx.update_window(any, |_, window, cx| window.render_frame(cx)).unwrap();
+    cx.run_until_parked();
+    assert!(weak.upgrade().is_none(), "the view is gone");
+    assert!(
+        cx.update_window(any, |_, window, _| !window.has_image_atlas_entry(&old)).unwrap(),
+        "its raster left the atlas"
+    );
 }
 
 /// Closing the window drops the view: its last raster leaves the atlas, and work still in

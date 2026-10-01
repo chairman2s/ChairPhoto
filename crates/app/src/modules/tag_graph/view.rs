@@ -70,7 +70,7 @@ pub struct TagGraphStats {
     pub rasters_started: u64,
     pub rasters_applied: u64,
     pub rasters_dropped: u64,
-    /// Raster textures handed to `drop_image`.
+    /// Raster textures released with `drop_image` (counted once it has run).
     pub images_released: u64,
 }
 
@@ -140,8 +140,7 @@ impl TagGraphView {
         // stored in the view itself is dropped with it before the release listeners run.
         cx.on_release(|this, cx| {
             if let Some(old) = this.raster.take() {
-                this.stats.borrow_mut().images_released += 1;
-                cx.defer(move |cx| cx.drop_image(old.image, None));
+                release_raster(old, this.stats.clone(), cx);
             }
         })
         .detach();
@@ -227,8 +226,7 @@ impl TagGraphView {
     }
 
     fn release(&mut self, old: RasterShown, cx: &mut Context<Self>) {
-        self.stats.borrow_mut().images_released += 1;
-        cx.defer(move |cx: &mut App| cx.drop_image(old.image, None));
+        release_raster(old, self.stats.clone(), cx);
     }
 
     fn start_load(&mut self, cx: &mut Context<Self>) {
@@ -901,6 +899,15 @@ impl gpui_kit::Focusable for TagGraphView {
     fn focus_handle(&self, _: &App) -> FocusHandle {
         self.focus.clone()
     }
+}
+
+/// Take `old`'s texture out of every window's atlas. Deferred: while a window is being
+/// updated it is out of `App::windows`, and `drop_image` would miss it.
+fn release_raster(old: RasterShown, stats: Rc<RefCell<TagGraphStats>>, cx: &mut App) {
+    cx.defer(move |cx| {
+        cx.drop_image(old.image, None);
+        stats.borrow_mut().images_released += 1;
+    });
 }
 
 impl Render for TagGraphView {

@@ -5,7 +5,7 @@
 //! in `render`. Placed labels and the canvas's bounds go back to the view through the
 //! shared [`PaintCache`] for hit testing. Lit edges are stroked as one GPUI path per edge
 //! (a path past ~65k vertices fails to tessellate, `path_builder.rs`), cached until the
-//! focus, the scene or the view changes.
+//! focus, the scene, the view or the canvas changes.
 
 use super::raster::Region;
 use crate::shell::style::Colors;
@@ -56,8 +56,9 @@ pub struct Frame {
     pub colors: Colors,
 }
 
-/// Lit edges built for one focus/scene/view/origin.
-type LitKey = (u64, Vec<NodeId>, [u64; 3], [i32; 2]);
+/// Lit edges built for one focus/scene/view/canvas: the scene generation, the focus, the view
+/// (`k`, `x`, `y`), the canvas size (`View::to_screen` centres on it) and its origin.
+type LitKey = (u64, Vec<NodeId>, [u64; 3], [u64; 2], [i32; 2]);
 
 /// State the canvas shares with its view across frames.
 #[derive(Default)]
@@ -86,6 +87,13 @@ impl PaintCache {
 
     pub fn canvas_size(&self) -> Option<Size> {
         self.bounds.map(|b| Size { w: f64::from(b.size.width), h: f64::from(b.size.height) })
+    }
+
+    /// The union of the cached lit-edge paths' bounds, window coordinates.
+    #[cfg(test)]
+    pub fn lit_bounds(&self) -> Option<Bounds<Pixels>> {
+        let (_, paths) = self.lit.as_ref()?;
+        paths.iter().map(|(p, _)| p.bounds).reduce(|a, b| a.union(&b))
     }
 
     fn record(&mut self, d: Duration) {
@@ -198,6 +206,7 @@ pub fn paint(bounds: Bounds<Pixels>, frame: &Frame, cache: &mut PaintCache, wind
                 frame.scene.generation,
                 ids,
                 [v.k.to_bits(), v.x.to_bits(), v.y.to_bits()],
+                [size.w.to_bits(), size.h.to_bits()],
                 [f32::from(origin.x).round() as i32, f32::from(origin.y).round() as i32],
             );
             if cache.lit.as_ref().is_none_or(|(k, _)| *k != key) {

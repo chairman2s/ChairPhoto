@@ -200,8 +200,18 @@ impl MapView {
     }
 
     fn tile_done(&mut self, done: TileDone, cx: &mut Context<Self>) {
+        let key = done.key;
         let gone = self.tiles.complete(done);
         release(gone, cx);
+        // A failed tile is retried once its backoff ends: repaint then (`want` asks again if
+        // it is still visible).
+        if let Some(wait) = self.tiles.retry_in(&key) {
+            cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(wait).await;
+                this.update(cx, |_, cx| cx.notify()).ok();
+            })
+            .detach();
+        }
         cx.notify();
     }
 

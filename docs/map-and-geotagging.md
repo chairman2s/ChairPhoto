@@ -102,7 +102,9 @@ and `{s}` is never used (dropped on OSM's host, `a` elsewhere). Every request ca
 `plugins::map::USER_AGENT`. Tiles are cached on disk under
 `$XDG_CACHE_HOME/chairphoto/tiles/` (512 MiB cap, least recently used evicted), fresh for
 `max(max-age, 7 days)`, then revalidated with `If-None-Match`/`If-Modified-Since`; a stale
-tile is shown when revalidation fails. Only the tiles intersecting the view load, at most
+tile is shown when revalidation fails. A 2xx answer is cached only if it decodes as an
+image, and a body over 2 MiB fails the tile; a failed tile is asked for again after a
+backoff that doubles from 2 s up to 2 minutes while it stays in view. Only the tiles intersecting the view load, at most
 four requests at a time, and a load that leaves the view before its request starts is
 cancelled. Decoded tiles are GPU textures in a least-recently-used set of 256; a tile on
 screen is never evicted, so a 4K canvas showing ~300 tiles holds them all rather than

@@ -28,12 +28,24 @@ use futures::channel::mpsc::{unbounded, UnboundedReceiver, UnboundedSender};
 use gpui_kit::{App, Global, RenderImage};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 /// Decoded tiles held beyond the visible set: 256 × 256 × 4 bytes each, so about 64 MiB of
 /// textures. A 4K viewport just above a half zoom (the next zoom's tiles drawn at ≈ 0.7×) shows about 300,
 /// more than this: visible tiles are pinned ([`TileLayer::want`]), so the layer then holds
 /// exactly the visible set until the view shrinks or zooms.
 pub const TILE_BUDGET: usize = 256;
+
+/// A failed tile is asked for again after this long, doubling per failure up to
+/// [`RETRY_MAX`]: a server hiccup or a captive portal heals by itself, and a tile that
+/// keeps failing costs at most one request per visible tile every two minutes.
+pub const RETRY_FIRST: Duration = Duration::from_secs(2);
+pub const RETRY_MAX: Duration = Duration::from_secs(120);
+
+/// The wait before retrying a tile that has failed `failures` times (≥ 1).
+pub fn retry_delay(failures: u32) -> Duration {
+    RETRY_FIRST.saturating_mul(1u32 << failures.saturating_sub(1).min(16)).min(RETRY_MAX)
+}
 
 /// Answers one tile load: the texture, or why not.
 pub type TileRespond = Box<dyn FnOnce(Result<Arc<RenderImage>, String>) + Send>;
@@ -142,8 +154,8 @@ pub struct TileStats {
     pub released: u64,
 }
 
-/// The view's tiles: an LRU of textures, the pending loads, and failures (not retried
-/// until the source changes).
+/// The view's tiles: an LRU of textures, the pending loads, and failures (retried after a
+/// bounded backoff, [`retry_delay`]; forgotten when the source changes).
 pub struct TileLayer {
     backend: Arc<dyn TileBackend>,
     source: Option<TileSource>,
@@ -155,7 +167,9 @@ pub struct TileLayer {
     pending: HashMap<TileKey, (u64, Box<dyn TileTicket>)>,
     /// The keys of the last [`want`](Self::want): pinned, never evicted.
     visible: HashSet<TileKey>,
-    failed: HashSet<TileKey>,
+    /// Tiles whose last load failed: how many times in a row, and when to ask again.
+    failed: HashMap<TileKey, (u32, Instant)>,
+    clock: Box<dyn Fn() -> Instant>,
     last_error: Option<String>,
     generation: u64,
     done: UnboundedSender<TileDone>,
@@ -176,7 +190,8 @@ impl TileLayer {
             tick: 0,
             pending: HashMap::new(),
             visible: HashSet::new(),
-            failed: HashSet::new(),
+            failed: HashMap::new(),
+            clock: Box::new(Instant::now),
             last_error: None,
             generation: 0,
             done,
@@ -200,6 +215,18 @@ impl TileLayer {
 
     pub fn is_pending(&self, key: &TileKey) -> bool {
         self.pending.contains_key(key)
+    }
+
+    /// Replace the clock retries are timed by (tests).
+    pub fn with_clock(mut self, clock: impl Fn() -> Instant + 'static) -> Self {
+        self.clock = Box::new(clock);
+        self
+    }
+
+    /// How long until `key`, which failed, may be asked for again (`None`: it has not
+    /// failed). The view repaints then, so a visible tile is retried without user input.
+    pub fn retry_in(&self, key: &TileKey) -> Option<Duration> {
+        self.failed.get(key).map(|&(_, at)| at.saturating_duration_since((self.clock)()))
     }
 
     /// The newest load error, for the status line.
@@ -258,7 +285,9 @@ impl TileLayer {
         }
         let mut seen = HashSet::new();
         for &key in keys {
-            if !seen.insert(key) || self.held.contains_key(&key) || self.pending.contains_key(&key) || self.failed.contains(&key) {
+            let now = (self.clock)();
+            let waiting = self.failed.get(&key).is_some_and(|&(_, retry_at)| now < retry_at);
+            if !seen.insert(key) || self.held.contains_key(&key) || self.pending.contains_key(&key) || waiting {
                 continue;
             }
             self.generation += 1;
@@ -284,10 +313,14 @@ impl TileLayer {
         }
         self.pending.remove(&done.key);
         match done.result {
-            Ok(image) => self.insert(done.key, image),
+            Ok(image) => {
+                self.failed.remove(&done.key);
+                self.insert(done.key, image)
+            }
             Err(e) => {
                 eprintln!("map: tile {:?}: {e}", done.key);
-                self.failed.insert(done.key);
+                let failures = self.failed.get(&done.key).map_or(0, |&(n, _)| n) + 1;
+                self.failed.insert(done.key, (failures, (self.clock)() + retry_delay(failures)));
                 self.last_error = Some(e);
                 Vec::new()
             }
@@ -538,16 +571,51 @@ mod tests {
         assert_eq!(released.len(), unique.len() + next_unique.len() - l.held());
     }
 
+    /// Review #119: a failed tile was never asked for again until the source changed. Now
+    /// it waits out a backoff that doubles per failure (2 s, 4 s, … at most 120 s), is not
+    /// re-requested before then however often the view repaints, and is asked for again
+    /// after; a success forgets the failures.
     #[test]
-    fn a_failed_tile_is_not_retried_until_the_source_changes() {
-        let (mut l, fake, mut rx) = layer(4);
+    fn a_failed_tile_is_retried_after_a_bounded_backoff() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+        assert_eq!(
+            (retry_delay(1), retry_delay(2), retry_delay(3), retry_delay(7), retry_delay(40)),
+            (Duration::from_secs(2), Duration::from_secs(4), Duration::from_secs(8), RETRY_MAX, RETRY_MAX)
+        );
+        let start = Instant::now();
+        let now = Rc::new(Cell::new(start));
+        let fake = Arc::new(FakeTiles::default());
+        let (l, mut rx) = TileLayer::new(fake.clone(), 4);
+        let clock = now.clone();
+        let mut l = l.with_clock(move || clock.get());
+        l.set_source(Some(TileSource::default()));
+        let fail = |l: &mut TileLayer, rx: &mut UnboundedReceiver<TileDone>, i: usize| {
+            let respond = fake.loads.lock().unwrap()[i].respond.take().unwrap();
+            respond(Err("HTTP 503".into()));
+            drain(l, rx);
+        };
+
         l.want(&[key(0)]);
-        let respond = fake.loads.lock().unwrap()[0].respond.take().unwrap();
-        respond(Err("HTTP 404".into()));
+        fail(&mut l, &mut rx, 0);
+        assert_eq!(l.last_error(), Some("HTTP 503"));
+        assert_eq!(l.retry_in(&key(0)), Some(Duration::from_secs(2)));
+        l.want(&[key(0)]);
+        now.set(start + Duration::from_millis(1999));
+        l.want(&[key(0)]);
+        assert_eq!(fake.count(), 1, "not before the backoff");
+        now.set(start + Duration::from_secs(2));
+        l.want(&[key(0)]);
+        assert_eq!(fake.count(), 2, "asked again after it");
+
+        fail(&mut l, &mut rx, 1);
+        assert_eq!(l.retry_in(&key(0)), Some(Duration::from_secs(4)), "doubled");
+        now.set(start + Duration::from_secs(6));
+        l.want(&[key(0)]);
+        assert_eq!(fake.count(), 3);
+        assert_eq!(fake.answer_all(), 1);
         drain(&mut l, &mut rx);
-        l.want(&[key(0)]);
-        assert_eq!(fake.count(), 1);
-        assert_eq!(l.last_error(), Some("HTTP 404"));
+        assert!(l.get(&key(0)).is_some() && l.retry_in(&key(0)).is_none(), "a success forgets the failures");
     }
 
     #[test]

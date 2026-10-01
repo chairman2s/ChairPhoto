@@ -35,6 +35,9 @@ pub const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 
 /// Redirects one tile request may follow.
 pub const MAX_REDIRECTS: usize = 5;
+/// The largest tile body accepted (a 256 px raster tile is tens of KiB): a server that
+/// sends more fails the tile instead of filling memory and the disk cache.
+pub const MAX_TILE_BYTES: usize = 2 * 1024 * 1024;
 
 /// One GET, with the validators of a stale cached copy.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -138,7 +141,19 @@ impl TileHttp for ReqwestHttp {
             let (etag, last_modified, cache_control) =
                 (text(header::ETAG), text(header::LAST_MODIFIED), text(header::CACHE_CONTROL));
             let status = response.status().as_u16();
-            let body = response.bytes().await.map_err(|e| format!("tile download failed: {e}"))?.to_vec();
+            let too_big = || format!("the tile is larger than {} MiB", MAX_TILE_BYTES / (1024 * 1024));
+            if response.content_length().is_some_and(|n| n > MAX_TILE_BYTES as u64) {
+                return Err(too_big());
+            }
+            // Read in chunks, so a body without (or with a lying) Content-Length stops at the cap.
+            let mut response = response;
+            let mut body = Vec::new();
+            while let Some(chunk) = response.chunk().await.map_err(|e| format!("tile download failed: {e}"))? {
+                if body.len() + chunk.len() > MAX_TILE_BYTES {
+                    return Err(too_big());
+                }
+                body.extend_from_slice(&chunk);
+            }
             Ok(HttpResponse { status, body, etag, last_modified, cache_control })
         })
     }
@@ -173,6 +188,13 @@ pub enum Origin {
 pub struct LoadedTile {
     pub bytes: Vec<u8>,
     pub origin: Origin,
+}
+
+/// Whether `bytes` decode as an image, on a blocking worker (a full decode: a truncated
+/// PNG has a valid header).
+async fn decodes(bytes: &[u8]) -> bool {
+    let bytes = bytes.to_vec();
+    tokio::task::spawn_blocking(move || image::load_from_memory(&bytes).is_ok()).await.unwrap_or(false)
 }
 
 fn unix_now() -> i64 {
@@ -238,6 +260,15 @@ impl TileFetcher {
                 redirect_hosts: redirect_hosts.to_vec(),
             };
             self.http.get(request).await
+        };
+        // A 2xx body is cached for a week, so it must be a tile: one that does not decode
+        // (a captive portal's page, an error served as 200) is a failure — never cached,
+        // and the map retries it later — with a stale copy still shown meanwhile.
+        let response = match response {
+            Ok(r) if (200..300).contains(&r.status) && !r.body.is_empty() && !decodes(&r.body).await => {
+                Err(format!("the tile server's answer (HTTP {}) is not an image", r.status))
+            }
+            other => other,
         };
         let now = (self.clock)();
         match (response, cached) {
@@ -315,6 +346,62 @@ mod tests {
         }
     }
 
+    /// A real (tiny) PNG, distinct per `shade`.
+    pub(crate) fn png(shade: u8) -> Vec<u8> {
+        let mut out = Vec::new();
+        let img = image::RgbaImage::from_pixel(2, 2, image::Rgba([shade, 0, 0, 255]));
+        image::DynamicImage::ImageRgba8(img).write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png).unwrap();
+        out
+    }
+
+    /// Review #119: a 2xx answer that is not an image (a captive portal's page, an error
+    /// served as 200) was cached for a week and shown as a failed tile until then. It is now
+    /// a failure: not cached, so the next load asks again; a stale copy is shown meanwhile.
+    #[tokio::test]
+    async fn a_2xx_body_that_is_not_an_image_is_never_cached() {
+        let dir = TempDir::new("notimage");
+        let portal = ok(b"<html>Log in to the hotel wifi</html>", None, None);
+        let http = Fake::answering(vec![portal.clone(), ok(&png(3), None, None)]);
+        let f = fetcher(http.clone(), &dir);
+        let src = TileSource::default();
+        let err = f.load(&src, K).await.unwrap_err();
+        assert!(err.contains("not an image"), "{err}");
+        assert!(f.cache().get(&src, K).is_none(), "the portal page was cached");
+        assert_eq!(f.load(&src, K).await.unwrap(), LoadedTile { bytes: png(3), origin: Origin::Network }, "asked again");
+        assert_eq!(http.requests().len(), 2);
+
+        // With a stale copy, it is shown and kept.
+        let other = TileKey { z: 4, x: 9, y: 5 };
+        f.cache().put(&src, other, &png(4), &TileMeta { expires: NOW - 1, ..Default::default() }).unwrap();
+        let http = Fake::answering(vec![portal]);
+        let f = fetcher(http, &dir);
+        assert_eq!(f.load(&src, other).await.unwrap(), LoadedTile { bytes: png(4), origin: Origin::Stale });
+        assert_eq!(f.cache().get(&src, other).unwrap().bytes, png(4));
+    }
+
+    /// Review #119: the body was read whole, however large. Over `MAX_TILE_BYTES` the tile
+    /// fails — by its Content-Length up front, or while reading when there is none.
+    #[tokio::test]
+    async fn an_oversized_body_fails_the_tile() {
+        let big = MAX_TILE_BYTES + 1;
+        let (declared, _, s1) = loopback(move |_| {
+            format!("HTTP/1.1 200 OK\r\nContent-Length: {big}\r\nConnection: close\r\n\r\n{}", "x".repeat(big))
+        })
+        .await;
+        let (undeclared, _, s2) = loopback(move |_| {
+            format!("HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n{}", "x".repeat(big))
+        })
+        .await;
+        let http = ReqwestHttp::new().unwrap();
+        for host in [declared, undeclared] {
+            let got = http.get(HttpRequest { url: format!("http://{host}/1/2/3.png"), ..Default::default() }).await;
+            let err = got.map(|r| r.body.len()).expect_err("an oversized body was accepted (its length above)");
+            assert!(err.contains("larger than 2 MiB"), "{host}: {err}");
+        }
+        s1.abort();
+        s2.abort();
+    }
+
     fn ok(body: &[u8], etag: Option<&str>, cache_control: Option<&str>) -> Result<HttpResponse, String> {
         Ok(HttpResponse {
             status: 200,
@@ -341,11 +428,11 @@ mod tests {
     #[tokio::test]
     async fn a_fresh_cached_tile_makes_no_request() {
         let dir = TempDir::new("fresh");
-        let http = Fake::answering(vec![ok(b"tile", Some("\"e1\""), None)]);
+        let http = Fake::answering(vec![ok(&png(1), Some("\"e1\""), None)]);
         let f = fetcher(http.clone(), &dir);
         let src = TileSource::default();
         let first = f.load(&src, K).await.unwrap();
-        assert_eq!(first, LoadedTile { bytes: b"tile".to_vec(), origin: Origin::Network });
+        assert_eq!(first, LoadedTile { bytes: png(1), origin: Origin::Network });
         assert_eq!(http.requests(), vec![HttpRequest { url: "https://tile.openstreetmap.org/4/8/5.png".into(), ..Default::default() }]);
         let again = f.load(&src, K).await.unwrap();
         assert_eq!(again.origin, Origin::Cache);
@@ -374,13 +461,13 @@ mod tests {
     #[tokio::test]
     async fn a_changed_tile_replaces_the_stale_one() {
         let dir = TempDir::new("changed");
-        let http = Fake::answering(vec![ok(b"new", Some("\"e2\""), Some("max-age=999999999"))]);
+        let http = Fake::answering(vec![ok(&png(2), Some("\"e2\""), Some("max-age=999999999"))]);
         let f = fetcher(http, &dir);
         let src = TileSource::default();
         f.cache().put(&src, K, b"old", &TileMeta { etag: Some("\"e1\"".into()), expires: NOW - 1, ..Default::default() }).unwrap();
-        assert_eq!(f.load(&src, K).await.unwrap(), LoadedTile { bytes: b"new".to_vec(), origin: Origin::Network });
+        assert_eq!(f.load(&src, K).await.unwrap(), LoadedTile { bytes: png(2), origin: Origin::Network });
         let c = f.cache().get(&src, K).unwrap();
-        assert_eq!((c.bytes.as_slice(), c.meta.expires), (&b"new"[..], NOW + 999_999_999));
+        assert_eq!((c.bytes, c.meta.expires), (png(2), NOW + 999_999_999));
     }
 
     /// Offline or refused: a stale copy is still shown; with none, the error.
@@ -424,7 +511,7 @@ mod tests {
                 s.max.fetch_max(n, Ordering::SeqCst);
                 let _open = s.open.acquire().await.unwrap();
                 s.now.fetch_sub(1, Ordering::SeqCst);
-                Ok(HttpResponse { status: 200, body: b"t".to_vec(), ..Default::default() })
+                Ok(HttpResponse { status: 200, body: png(1), ..Default::default() })
             })
         }
     }

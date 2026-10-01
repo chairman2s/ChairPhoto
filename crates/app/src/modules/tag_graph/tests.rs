@@ -14,6 +14,7 @@ use chairphoto_core::appearance::SystemThemeResult;
 use chairphoto_core::catalog::Catalog;
 use chairphoto_model::tag_graph::graph::{LibraryGraph, NodeId};
 use chairphoto_model::tag_graph::labels::slot_point;
+use chairphoto_model::tag_graph::scene::Scene;
 use chairphoto_model::tag_graph::synthetic::{library, Scale};
 use chairphoto_model::tag_graph::view::View;
 use gpui_kit::test::TestWindowExt as _;
@@ -247,7 +248,8 @@ fn wheel_zoom_reprojects_then_rasters_once_settled(cx: &mut TestAppContext) {
     assert_eq!(after.images_released - before.images_released, 1, "the replaced texture left the atlas");
 }
 
-/// Two raster requests in a row: only the newer one lands.
+/// Two raster requests in a row: the first is already in flight, so it runs to completion —
+/// and is dropped, its generation superseded; only the newer one lands.
 #[gpui_kit::test]
 fn a_superseded_raster_never_lands(cx: &mut TestAppContext) {
     let f = fixture(small(), cx);
@@ -260,8 +262,37 @@ fn a_superseded_raster_never_lands(cx: &mut TestAppContext) {
     });
     cx.run_until_parked();
     let after = f.stats(cx);
+    assert_eq!(after.rasters_started - before.rasters_started, 2, "the first ran to completion, then the newer");
+    assert_eq!(after.rasters_dropped - before.rasters_dropped, 1, "the superseded one came back and was dropped");
     assert_eq!(after.rasters_applied - before.rasters_applied, 1);
     assert_eq!(f.raster_view(cx), Some(f.view_state(cx)), "the newer view's raster");
+}
+
+/// A raster that comes back after the scene it was made from has been replaced is dropped,
+/// even with no newer raster asked for (its generation is still current).
+#[gpui_kit::test]
+fn a_raster_of_a_replaced_scene_never_lands(cx: &mut TestAppContext) {
+    let f = fixture(small(), cx);
+    f.click("tg-type-tags", cx);
+    let before = f.stats(cx);
+    let shown = f.view.read_with(cx, |v, _| v.raster().map(|r| r.scene_generation));
+    f.view.update(cx, |v, cx| {
+        v.request_raster(false, cx);
+        let generation = v.raster_generation();
+        // A new scene lands while that raster is in flight, without asking for a raster.
+        v.update_session(cx, |s| {
+            s.toggle_cameras();
+            let input = s.take_scene_request().expect("a scene request");
+            assert!(s.apply_scene(Scene::build(&input)));
+        });
+        assert_eq!(v.raster_generation(), generation, "only the scene is stale");
+    });
+    cx.run_until_parked();
+    let after = f.stats(cx);
+    assert_eq!(after.rasters_started - before.rasters_started, 1);
+    assert_eq!(after.rasters_dropped - before.rasters_dropped, 1, "the old scene's raster came back and was dropped");
+    assert_eq!(after.rasters_applied, before.rasters_applied);
+    assert_eq!(f.view.read_with(cx, |v, _| v.raster().map(|r| r.scene_generation)), shown, "nothing new shown");
 }
 
 /// A burst of raster requests (a slider sweep, a zoom while one runs): one raster runs at a

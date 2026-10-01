@@ -42,6 +42,7 @@ pub mod keymap;
 pub mod launch;
 pub mod machine_prefs;
 pub mod model;
+pub mod preferences;
 pub mod modules;
 pub mod shell;
 pub mod signals;

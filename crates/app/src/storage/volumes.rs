@@ -3,8 +3,8 @@
 //! on every volume but the library folder (`catalog-root`); Add with name, base path (`~`
 //! expands) and kind, Enter in the path adds.
 //!
-//! A view entity the Preferences dialog (#113) mounts in its Storage section; until it lands
-//! the root view opens it on its own ([`super::open`]). Reachability is stated off the catalog
+//! A view entity Preferences mounts in its Storage tab ([`crate::preferences`], #113), the
+//! one way in, as in React. Reachability is stated off the catalog
 //! lock through the volume-health cache, which add and remove invalidate, as the Tauri
 //! commands do.
 

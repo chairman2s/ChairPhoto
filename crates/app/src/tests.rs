@@ -386,7 +386,7 @@ fn menu_items_dispatch_their_actions(cx: &mut TestAppContext) {
     let app = start(cx);
     open_catalog(&app, &dir, cx);
 
-    click_menu_row(&app, "more-menu", 13, "Tags & collections panel", cx);
+    click_menu_row(&app, "more-menu", 12, "Tags & collections panel", cx);
     assert!(!left_visible(&app, cx), "More ⋯ → View → Tags & collections panel");
 
     click_menu_row(&app, "more-menu", 0, "Open loupe in a new window", cx);
@@ -761,3 +761,7 @@ fn reads_started_before_a_catalog_switch_are_dropped(cx: &mut TestAppContext) {
 // Storage and import (#114).
 #[path = "storage_tests.rs"]
 mod storage_tests;
+
+// Preferences (#113).
+#[path = "preferences_tests.rs"]
+mod preferences_tests;

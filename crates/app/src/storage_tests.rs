@@ -11,7 +11,7 @@ use chairphoto_core::catalog::{SidecarIdentity, VolumeKind};
 use gpui_kit::component::input::InputState;
 
 /// Run every queued storage job, then let the UI thread take the results.
-fn work(cx: &mut TestAppContext) -> usize {
+pub(super) fn work(cx: &mut TestAppContext) -> usize {
     let mut total = 0;
     loop {
         let ran = cx.update(|cx| Runner::get(cx).run_pending());
@@ -24,7 +24,7 @@ fn work(cx: &mut TestAppContext) -> usize {
 }
 
 /// Run only what is queued now — nothing those jobs queue in turn lands yet.
-fn work_once(cx: &mut TestAppContext) -> usize {
+pub(super) fn work_once(cx: &mut TestAppContext) -> usize {
     cx.update(|cx| Runner::get(cx).run_pending())
 }
 
@@ -35,29 +35,29 @@ fn dialog(app: &App, cx: &mut TestAppContext) -> StorageDialog {
 
 /// Let a dialog's opening animation (gpui-component's 250 ms slide, on the wall clock) finish:
 /// a click while the dialog still moves can land its mouse-up away from its mouse-down.
-fn settle(app: &App, cx: &mut TestAppContext) {
+pub(super) fn settle(app: &App, cx: &mut TestAppContext) {
     std::thread::sleep(std::time::Duration::from_millis(300));
     cx.update_window(app.window(), |_, window, cx| window.render_frame(cx)).unwrap();
     cx.run_until_parked();
 }
 
-fn set_input(app: &App, input: &Entity<InputState>, text: &str, cx: &mut TestAppContext) {
+pub(super) fn set_input(app: &App, input: &Entity<InputState>, text: &str, cx: &mut TestAppContext) {
     let input = input.clone();
     let text = text.to_string();
     cx.update_window(app.window(), |_, window, cx| input.update(cx, |i, cx| i.set_value(text, window, cx))).unwrap();
 }
 
-fn dispatch(app: &App, action: impl gpui_kit::Action, cx: &mut TestAppContext) {
+pub(super) fn dispatch(app: &App, action: impl gpui_kit::Action, cx: &mut TestAppContext) {
     cx.update_window(app.window(), |_, window, cx| window.dispatch_action(Box::new(action), cx)).unwrap();
     cx.run_until_parked();
 }
 
-fn has_dialog(app: &App, cx: &mut TestAppContext) -> bool {
+pub(super) fn has_dialog(app: &App, cx: &mut TestAppContext) -> bool {
     use gpui_kit::component::WindowExt as _;
     cx.update_window(app.window(), |_, window, cx| window.has_active_dialog(cx)).unwrap()
 }
 
-fn photo_count(app: &App) -> usize {
+pub(super) fn photo_count(app: &App) -> usize {
     app.state.catalog.lock().unwrap().as_ref().unwrap().count_photos(&Default::default()).unwrap()
 }
 
@@ -639,8 +639,13 @@ fn volumes_add_and_remove_behind_a_confirm(cx: &mut TestAppContext) {
     let app = start(cx);
     open_catalog(&app, &dir, cx);
     std::fs::create_dir_all(dir.0.join("nas")).unwrap();
-    click_menu_row(&app, "more-menu", 10, "Storage volumes…", cx);
-    let StorageDialog::Volumes(panel) = dialog(&app, cx) else { panic!("the volumes panel") };
+    dispatch(&app, crate::shell::actions::OpenPreferences, cx);
+    settle(&app, cx);
+    let prefs = cx.update(|cx| cx.global::<crate::preferences::LastPreferences>().0.upgrade()).expect("Preferences opened");
+    let panel = prefs.read_with(cx, |p, _| match &p.content {
+        crate::preferences::Content::Storage(s) => s.volumes.clone(),
+        _ => panic!("Preferences opens on Storage"),
+    });
     work(cx);
     panel.read_with(cx, |p, _| assert_eq!(p.volumes.iter().map(|v| v.name.as_str()).collect::<Vec<_>>(), ["catalog-root"]));
     cx.update_window(app.window(), |_, window, cx| {

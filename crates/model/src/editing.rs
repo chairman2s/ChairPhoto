@@ -136,7 +136,10 @@ impl<T> Field<T> {
     /// lone surrogate a Rust string cannot hold. The pair stays whole under the first unit's
     /// index and the second index is left out, so joining the values in index order gives
     /// the original string back, as it does from JS's `"\ud83d"`, `"\ude00"` (Codex re-check
-    /// of c6defd2: U+FFFD per unit lost the character).
+    /// of c6defd2: U+FFFD per unit lost the character). Known limit: a later merge that
+    /// overwrites the first index (a preset's `tone: {"0": …}`) drops the whole character,
+    /// where JS keeps the orphaned low surrogate `"\ude00"`; that half alone is not a string
+    /// serde_json can hold (Codex re-check of f455b1d).
     pub fn spread(&self) -> T
     where
         T: Clone + Default + serde::de::DeserializeOwned,

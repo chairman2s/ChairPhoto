@@ -67,6 +67,8 @@ pub struct PaintCache {
     pub scale: f32,
     /// The labels of the last frame (label-zone hit testing).
     pub labels: Vec<PlacedLabel>,
+    /// The scene generation of the base raster the last frame painted, if it painted one.
+    pub raster_painted: Option<u64>,
     widths: HashMap<NodeId, f64>,
     widths_scene: u64,
     lit: Option<(LitKey, Vec<(Path<Pixels>, Hsla)>)>,
@@ -172,8 +174,12 @@ pub fn paint(bounds: Bounds<Pixels>, frame: &Frame, cache: &mut PaintCache, wind
     let rs = layout.r * v.k;
 
     window.with_content_mask(Some(gpui_kit::ContentMask { bounds }), |window| {
-        // ── Base edges: the raster, reprojected from the view it was made under. ──
-        if let Some(r) = &frame.raster {
+        // ── Base edges: the raster, reprojected from the view it was made under — only one
+        // made from this scene: an older scene's edges do not fit the new ring, so between a
+        // scene change and its raster the base layer is blank. ──
+        cache.raster_painted = None;
+        if let Some(r) = frame.raster.as_ref().filter(|r| r.scene_generation == frame.scene.generation) {
+            cache.raster_painted = Some(r.scene_generation);
             let s = v.k / r.view.k;
             let o = v.reproject(r.view, (r.region.x, r.region.y));
             let image_bounds = Bounds::new(at(o), gpui_kit::size(px((r.region.w * s) as f32), px((r.region.h * s) as f32)));

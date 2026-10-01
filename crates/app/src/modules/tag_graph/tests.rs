@@ -324,6 +324,32 @@ fn a_raster_of_a_replaced_scene_never_lands(cx: &mut TestAppContext) {
     assert_eq!(f.view.read_with(cx, |v, _| v.raster().map(|r| r.scene_generation)), shown, "nothing new shown");
 }
 
+/// Between a scene change and its raster, the old scene's raster is not painted under the
+/// new ring; the new scene's raster is, once it lands.
+#[gpui_kit::test]
+fn a_raster_is_painted_only_under_its_own_scene(cx: &mut TestAppContext) {
+    let f = fixture(small(), cx);
+    f.click("tg-type-tags", cx);
+    let scene_generation = |cx: &mut TestAppContext| f.view.read_with(cx, |v, _| v.session().scene().unwrap().generation);
+    let painted = |cx: &mut TestAppContext| f.view.read_with(cx, |v, _| v.paint_cache().borrow().raster_painted);
+    let old = scene_generation(cx);
+    assert_eq!(painted(cx), Some(old));
+
+    f.view.update(cx, |v, cx| v.update_session(cx, |s| s.toggle_cameras()));
+    // Step until the new scene has landed, then paint before its raster can.
+    while scene_generation(cx) == old {
+        assert!(cx.executor().tick(), "the scene build ran out of work");
+    }
+    cx.update_window(f.any(), |_, window, cx| window.render_frame(cx)).unwrap();
+    assert_eq!(f.view.read_with(cx, |v, _| v.raster().map(|r| r.scene_generation)), Some(old), "the old raster is still held");
+    assert_eq!(painted(cx), None, "but not painted under the new ring");
+
+    f.settle(cx);
+    let new = scene_generation(cx);
+    assert_ne!(new, old);
+    assert_eq!(painted(cx), Some(new), "the new scene's raster is painted");
+}
+
 /// A burst of raster requests (a slider sweep, a zoom while one runs): one raster runs at a
 /// time, the burst coalesces into one more made from the latest state, and that one lands.
 #[gpui_kit::test]

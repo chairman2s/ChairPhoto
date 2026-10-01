@@ -104,6 +104,11 @@ impl RootView {
         &self.shell
     }
 
+    /// The Library grid.
+    pub fn library(&self) -> &Entity<LibraryView> {
+        &self.library
+    }
+
     /// Re-read the system theme off the UI thread and apply it.
     fn reload_theme(&mut self, cx: &mut Context<Self>) {
         let read = cx

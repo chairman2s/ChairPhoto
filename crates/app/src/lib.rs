@@ -131,11 +131,19 @@ pub struct WireOptions {
     /// Open the default catalog under the XDG data dir (production), or leave the catalog
     /// to the caller (tests).
     pub open_default_catalog: bool,
+    /// Draw every frame while the window is unfocused too (`inactive_frame_interval:
+    /// None`). Only the frame bench (`examples/grid_bench.rs`) sets it: GPUI throttles an
+    /// unfocused window to 30 Hz by default, which would alias its measurement.
+    pub unthrottled: bool,
 }
 
 impl WireOptions {
     pub fn production() -> Self {
-        WireOptions { on_exit: Rc::new(chairphoto_core::crash_marker::clean_exit), open_default_catalog: true }
+        WireOptions {
+            on_exit: Rc::new(chairphoto_core::crash_marker::clean_exit),
+            open_default_catalog: true,
+            unthrottled: false,
+        }
     }
 }
 
@@ -189,7 +197,10 @@ pub fn wire(
         model.update(cx, |m, cx| m.open_default_catalog(cx));
     }
 
-    let window_options = main_window_options(cx);
+    let mut window_options = main_window_options(cx);
+    if options.unthrottled {
+        window_options.inactive_frame_interval = None;
+    }
     let opened = gpui_kit::open_window(window_options, cx, {
         let (model, shell, images) = (model.clone(), shell.clone(), images.clone());
         move |window, cx| cx.new(|cx| view::RootView::new(model, shell, images, window, cx))

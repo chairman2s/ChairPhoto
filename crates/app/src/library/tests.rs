@@ -369,3 +369,64 @@ fn overlapping_culls_both_step_from_the_photo_they_started_on(cx: &mut TestAppCo
     assert_eq!(rows(&app, cx), vec![ids[0], ids[2], ids[3]]);
     assert_eq!(selection(&app, cx).0, Some(ids[2]), "not skipped past the unjudged ids[2]");
 }
+
+/// Measurement, not a check (run it with `--ignored --nocapture`): the grid's UI-thread
+/// cost per frame — render, layout, prepaint and paint into the scene, no GPU — while it
+/// scrolls a 20,000-photo synthetic catalog 24 px per frame, as the frame bench
+/// (`examples/grid_bench.rs`) does on screen. The test platform has no decode pool, so
+/// every tile ends as a failed-thumbnail tile (text, no image).
+#[gpui_kit::test]
+#[ignore = "measurement: the grid's CPU frame cost on a synthetic catalog"]
+fn measure_grid_frame_cost(cx: &mut TestAppContext) {
+    use chairphoto_core::app::EventSink as _;
+    use std::time::Instant;
+    let dir = TempDir::new("grid-frames");
+    let app = start(cx);
+    let n = 20_000;
+    {
+        let root = dir.0.join("photos");
+        let catalog = chairphoto_core::catalog::Catalog::open(&dir.0.join("frames.chairphoto"), &root).unwrap();
+        let tx = catalog.conn().unchecked_transaction().unwrap();
+        for i in 0..n {
+            catalog.upsert_photo(&root.join(format!("bench/{i:06}.jpg")), None, 0, 1).unwrap();
+        }
+        tx.commit().unwrap();
+        *app.state.catalog.lock().unwrap() = Some(catalog);
+    }
+    app.state.send(CoreEvent::CatalogSwitched("frames.chairphoto".into()));
+    cx.run_until_parked();
+    assert_eq!(rows(&app, cx).len(), n);
+    for _ in 0..3 {
+        render(&app, cx);
+    }
+    let handle = library_view(&app, cx).read_with(cx, |v, _| v.scroll_handle().clone());
+    let mut frames = Vec::new();
+    for _ in 0..300 {
+        {
+            let base = &handle.0.borrow().base_handle;
+            let mut offset = base.offset();
+            offset.y = (offset.y + px(24.)).min(px(0.));
+            base.set_offset(offset);
+        }
+        let took = cx
+            .update_window(app.window(), |_, window, cx| {
+                let start = Instant::now();
+                window.render_frame(cx);
+                start.elapsed()
+            })
+            .unwrap();
+        frames.push(took.as_secs_f64() * 1e3);
+        cx.run_until_parked(); // the image answers land between frames
+    }
+    frames.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let pct = |p: f64| frames[((frames.len() - 1) as f64 * p) as usize];
+    let submitted = app.wired.images.read_with(cx, |s, _| s.stats().submitted);
+    let cols = library_view(&app, cx).read_with(cx, |v, _| v.columns());
+    eprintln!(
+        "MEASURE grid frame cost, {n} photos, {cols} columns, 300 frames at 24 px: p50 {:.2} ms, p95 {:.2} ms, \
+         max {:.2} ms; thumbnails requested {submitted}",
+        pct(0.5),
+        pct(0.95),
+        frames.last().unwrap()
+    );
+}

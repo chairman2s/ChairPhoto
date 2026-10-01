@@ -214,7 +214,7 @@ pub fn build_args(frame_paths: &[PathBuf], opts: &SlideshowOptions, out: &Path) 
         args.push("-t".to_string());
         args.push(dur.clone());
         args.push("-i".to_string());
-        args.push(p.to_string_lossy().to_string());
+        args.push(file_url(p));
     }
 
     let (graph, map) = filter_complex(frame_paths.len(), opts);
@@ -236,9 +236,15 @@ pub fn build_args(frame_paths: &[PathBuf], opts: &SlideshowOptions, out: &Path) 
     args.push("-progress".to_string());
     args.push("pipe:1".to_string());
     args.push("-nostats".to_string());
-    args.push(out.to_string_lossy().to_string());
+    args.push(file_url(out));
 
     args
+}
+
+/// A path as ffmpeg's `file:` protocol: never read as an option (a leading `-`) or as another
+/// protocol (`ftp://…`, `pipe:`), whatever the path's spelling.
+fn file_url(path: &Path) -> String {
+    format!("file:{}", path.to_string_lossy())
 }
 
 /// Total expected output frame count (used to turn ffmpeg's `frame=` counter into a fraction).
@@ -482,8 +488,21 @@ mod tests {
         assert!(a.iter().any(|x| x == "libx264"));
         assert!(a.iter().any(|x| x == "yuv420p"));
         assert!(a.iter().any(|x| x == "+faststart"));
-        assert!(a.iter().any(|x| x == "/tmp/out.mp4"));
+        assert_eq!(a.last().map(String::as_str), Some("file:/tmp/out.mp4"));
+        assert!(a.iter().any(|x| x == "file:/tmp/f0.jpg"));
         assert!(a.iter().any(|x| x == "-progress"));
+    }
+
+    /// However the output is spelled, ffmpeg sees a `file:` path: a leading `-` is not an
+    /// option and a URL is not a network output.
+    #[test]
+    fn build_args_passes_every_path_through_the_file_protocol() {
+        for out in ["-x/slideshow.mp4", "ftp://example.com/slideshow.mp4"] {
+            let a = build_args(&[PathBuf::from("-frame.jpg")], &opts(), Path::new(out));
+            assert_eq!(a.last().unwrap(), &format!("file:{out}"));
+            let i = a.iter().position(|x| x == "-i").unwrap();
+            assert_eq!(a[i + 1], "file:-frame.jpg");
+        }
     }
 
     #[test]

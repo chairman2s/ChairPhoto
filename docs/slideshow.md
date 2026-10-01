@@ -48,7 +48,9 @@ that invoke ffmpeg skip gracefully when it is not on PATH.
 `transition` on/off with `transition_duration` (clamped below `duration_per_photo` so every
 clip keeps some non-overlapping visible time), `ken_burns` on/off, `fps` (default 30), and
 an aspect/resolution preset: 16:9 1080p, 16:9 4K, 1:1 1080, or 9:16 1080×1920. Plus the
-output folder, defaulting to `~/Videos` or `~/Pictures/Export`.
+output folder, defaulting to `~/Videos` or `~/Pictures/Export`. It must be an absolute local
+path (`~` expanded); a relative path or a URL is refused before the render is claimed, and
+every path reaches ffmpeg as a `file:` URL, so it is never read as an option or a protocol.
 
 The dialog also lets you drag-reorder the selected photos before rendering; the default
 order is the current grid order.

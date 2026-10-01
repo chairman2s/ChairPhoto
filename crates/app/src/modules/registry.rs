@@ -158,6 +158,9 @@ pub struct ModuleRegistry {
     persist_generation: u64,
     /// The generation of the newest `modules.enabled` write that ran.
     persisted: Arc<Mutex<u64>>,
+    /// How many module callbacks (`load`, `on_event`, `on_unload`) are running now. An enable
+    /// or disable asked for from inside one is deferred until it returns ([`Self::enable`]).
+    in_callback: u32,
 }
 
 impl ModuleRegistry {
@@ -200,6 +203,7 @@ impl ModuleRegistry {
             views: HashMap::new(),
             persist_generation: 0,
             persisted: Arc::new(Mutex::new(0)),
+            in_callback: 0,
         });
         let weak = registry.downgrade();
         cx.subscribe(model, move |_, event: &AppModelEvent, cx| {
@@ -370,7 +374,14 @@ impl ModuleRegistry {
 
     /// Enable module `id` (and its requirements) and persist the enabled set. A no-op when
     /// it is unknown or already enabled; a refusal says why on the status line.
+    ///
+    /// Asked for from inside a module callback (a module disabling itself from `on_event`, say)
+    /// it is not run there, where the module's instance is borrowed: it is logged and deferred
+    /// until the callback has returned.
     pub fn enable(this: &Entity<Self>, id: &str, cx: &mut App) {
+        if Self::defer_if_in_callback(this, id, true, cx) {
+            return;
+        }
         Self::enable_inner(this, id, true, &mut HashSet::new(), cx);
     }
 
@@ -404,7 +415,7 @@ impl ModuleRegistry {
             let r = this.read(cx);
             ModuleHost::new(meta.clone(), r.app.clone(), r.model.clone(), r.shell.clone())
         };
-        match module.load(host, cx) {
+        match Self::in_module(this, cx, |cx| module.load(host, cx)) {
             Ok(instance) => {
                 let contributions = instance.contributions();
                 let live = Live { instance: Rc::new(RefCell::new(instance)), contributions };
@@ -428,8 +439,39 @@ impl ModuleRegistry {
 
     /// Disable module `id`, cascading to every enabled module that requires it, and persist
     /// the enabled set. A no-op when it is unknown or not enabled.
+    /// Deferred like [`enable`](Self::enable) when asked for from inside a module callback.
     pub fn disable(this: &Entity<Self>, id: &str, cx: &mut App) {
+        if Self::defer_if_in_callback(this, id, false, cx) {
+            return;
+        }
         Self::disable_inner(this, id, true, cx);
+    }
+
+    /// Run `f`, a call into a module, counted in `in_callback`.
+    fn in_module<R>(this: &Entity<Self>, cx: &mut App, f: impl FnOnce(&mut App) -> R) -> R {
+        this.update(cx, |r, _| r.in_callback += 1);
+        let out = f(cx);
+        this.update(cx, |r, _| r.in_callback -= 1);
+        out
+    }
+
+    /// Inside a module callback: log, and run the enable/disable once the callback (and the
+    /// effect cycle it is part of) has returned. Returns whether it deferred.
+    fn defer_if_in_callback(this: &Entity<Self>, id: &str, enable: bool, cx: &mut App) -> bool {
+        if this.read(cx).in_callback == 0 {
+            return false;
+        }
+        let verb = if enable { "enable" } else { "disable" };
+        eprintln!("modules: {verb} {id:?} asked for from inside a module callback; deferred until it returns");
+        let (this, id) = (this.clone(), id.to_string());
+        cx.defer(move |cx| {
+            if enable {
+                Self::enable(&this, &id, cx)
+            } else {
+                Self::disable(&this, &id, cx)
+            }
+        });
+        true
     }
 
     fn disable_inner(this: &Entity<Self>, id: &str, persist: bool, cx: &mut App) {
@@ -456,7 +498,7 @@ impl ModuleRegistry {
             r.entry_mut(id).and_then(|e| e.live.take())
         });
         if let Some(live) = live {
-            live.instance.borrow_mut().on_unload(cx);
+            Self::in_module(this, cx, |cx| live.instance.borrow_mut().on_unload(cx));
         }
         this.update(cx, |r, cx| {
             if persist {
@@ -522,7 +564,7 @@ impl ModuleRegistry {
         for id in this.read(cx).enabled_ids() {
             let instance = this.read(cx).entry(&id).and_then(|e| e.live.as_ref()).map(|l| l.instance.clone());
             if let Some(instance) = instance {
-                instance.borrow_mut().on_event(event, cx);
+                Self::in_module(this, cx, |cx| instance.borrow_mut().on_event(event, cx));
             }
         }
     }

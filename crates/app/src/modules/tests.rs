@@ -455,6 +455,72 @@ fn module_settings_are_namespaced_by_id(cx: &mut TestAppContext) {
 
 // --- events ------------------------------------------------------------------------------
 
+/// Disables `target` from its `on_event`, through a registry handle set after install.
+struct Disabler {
+    meta: ModuleMeta,
+    target: &'static str,
+    registry: Rc<RefCell<Option<Entity<ModuleRegistry>>>>,
+    log: Log,
+}
+
+struct DisablerInstance {
+    target: &'static str,
+    registry: Rc<RefCell<Option<Entity<ModuleRegistry>>>>,
+    log: Log,
+}
+
+impl Module for Disabler {
+    fn meta(&self) -> ModuleMeta {
+        self.meta.clone()
+    }
+
+    fn load(&self, _: ModuleHost, _: &mut App) -> Result<Box<dyn ModuleInstance>, String> {
+        Ok(Box::new(DisablerInstance { target: self.target, registry: self.registry.clone(), log: self.log.clone() }))
+    }
+}
+
+impl ModuleInstance for DisablerInstance {
+    fn contributions(&self) -> Contributions {
+        Contributions::default()
+    }
+
+    fn on_event(&mut self, _: &CoreEvent, cx: &mut App) {
+        let registry = self.registry.borrow().clone().unwrap();
+        ModuleRegistry::disable(&registry, self.target, cx);
+    }
+
+    fn on_unload(&mut self, _: &mut App) {
+        self.log.borrow_mut().push("unload:self".into());
+    }
+}
+
+/// A module that disables itself, or a module it requires, from `on_event` does not crash
+/// the dispatch ("already borrowed"): the disable runs after the callback returns.
+#[gpui_kit::test]
+fn a_module_disabling_itself_from_on_event_is_deferred_not_a_crash(cx: &mut TestAppContext) {
+    for target in ["self", "base"] {
+        let dir = TempDir::new("reentry");
+        let log = Log::default();
+        let slot: Rc<RefCell<Option<Entity<ModuleRegistry>>>> = Rc::default();
+        let b = bench(
+            vec![
+                probe(ModuleMeta::new("base", "Base"), &log),
+                Rc::new(Disabler { meta: ModuleMeta::new("self", "Self").requires("base"), target, registry: slot.clone(), log: log.clone() }),
+            ],
+            &[],
+            &dir,
+            cx,
+        );
+        *slot.borrow_mut() = Some(b.registry.clone());
+        b.enable("self", cx);
+        b.event(scan_done(), cx);
+        assert!(!b.registry.read_with(cx, |r, _| r.is_enabled("self")), "{target}: the module ended up disabled");
+        assert!(log.borrow().contains(&"unload:self".to_string()), "{target}: and unloaded: {:?}", log.borrow());
+        let base_on = b.registry.read_with(cx, |r, _| r.is_enabled("base"));
+        assert_eq!(base_on, target == "self", "{target}: only what was asked for went");
+    }
+}
+
 /// Core events reach enabled modules only, in registration order, through the real event
 /// router (a worker thread's `send` → the model → the registry).
 #[gpui_kit::test]

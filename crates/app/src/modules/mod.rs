@@ -32,8 +32,10 @@
 //! is `Err` from [`Module::load`]; a panic is a bug and fails like any other panic in the app.
 //!
 //! **Re-entrancy rule.** The registry calls `load`, `on_event`, `on_unload` and every view
-//! factory while it holds no lease on itself, so a module may read the registry from them;
-//! it must not *enable or disable* modules from inside them.
+//! factory while it holds no lease on itself, so a module may read the registry from them.
+//! An enable or disable asked for from inside `load`, `on_event` or `on_unload` is not run
+//! there (the module's instance is in use): it is logged and deferred until the callback
+//! returns.
 
 pub mod panel;
 pub mod registry;

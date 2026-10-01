@@ -351,7 +351,7 @@ impl Preferences {
                 self.content_subscriptions.push(cx.subscribe(&safety, |_, _, _: &CloseDialog, cx| cx.emit(CloseDialog)));
                 Content::Storage(StorageTab {
                     library: cx.new(|cx| storage::LibrarySection::new(ctx.clone(), window, cx)),
-                    volumes: cx.new(|cx| VolumesPanel::new(ctx.app.clone(), window, cx)),
+                    volumes: cx.new(|cx| VolumesPanel::new(ctx.scope(), window, cx)),
                     safety,
                     tiering: cx.new(|cx| storage::TieringSection::new(ctx.clone(), window, cx)),
                     maintenance: cx.new(|cx| storage::MaintenanceSection::new(ctx.clone(), cx)),

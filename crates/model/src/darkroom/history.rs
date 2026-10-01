@@ -220,6 +220,33 @@ pub fn should_amend(last: Option<&LastStep>, change: &Change, now: i64, at_tip: 
         && now - last.at < AMEND_WINDOW_MS
 }
 
+/// Ctrl+Z (`delta` −1) or Ctrl+Shift+Z / Ctrl+Y (+1): the step to make current
+/// (`stepBy`), or `None` — no history yet, or nothing further that way.
+pub fn step_by(history: Option<&chairphoto_core::catalog::VersionHistory>, delta: i64) -> Option<i64> {
+    let h = history?;
+    let head = h.head?;
+    // `findIndex` gives −1 for a head not in the list; `steps[-1 + delta]` as TS read it.
+    let i = h.steps.iter().position(|s| s.seq == head).map_or(-1, |i| i as i64);
+    usize::try_from(i + delta).ok().and_then(|j| h.steps.get(j)).map(|s| s.seq)
+}
+
+/// How the History panel marks a step: the current one, an undone one (after the current,
+/// kept until the next change replaces it), or a plain earlier one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StepState {
+    Current,
+    Undone,
+    Done,
+}
+
+pub fn step_state(seq: i64, head: Option<i64>) -> StepState {
+    match head {
+        Some(h) if seq == h => StepState::Current,
+        Some(h) if seq > h => StepState::Undone,
+        _ => StepState::Done,
+    }
+}
+
 /// When a history step was made, relative to now (`whenLabel`).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum WhenLabel {
@@ -402,5 +429,28 @@ mod tests {
         // An empty caller label does not force a multi step, but is still the "nothing" label.
         assert_eq!(describe_change(&rec(json!({})), &rec(json!({"fade": 0.2})), Some("")).key, "fade");
         assert_eq!(describe_change(&rec(json!({})), &rec(json!({})), Some("")).label, "");
+    }
+
+    // --- `stepBy` and the panel's marks (DarkroomView.tsx / HistoryPanel.tsx; new) ---
+
+    #[test]
+    fn undo_and_redo_walk_the_steps_from_the_head() {
+        use chairphoto_core::catalog::{HistoryStep, VersionHistory};
+        let h = |head: Option<i64>| VersionHistory {
+            version_id: 1,
+            steps: (0..4).map(|seq| HistoryStep { seq, label: format!("s{seq}"), created_at: 0 }).collect(),
+            head,
+        };
+        assert_eq!(step_by(None, -1), None, "no history yet");
+        assert_eq!(step_by(Some(&h(None)), -1), None);
+        assert_eq!(step_by(Some(&h(Some(3))), -1), Some(2));
+        assert_eq!(step_by(Some(&h(Some(3))), 1), None, "nothing to redo at the tip");
+        assert_eq!(step_by(Some(&h(Some(1))), 1), Some(2));
+        assert_eq!(step_by(Some(&h(Some(0))), -1), None, "the baseline is the oldest");
+        assert_eq!(step_by(Some(&h(Some(9))), 1), Some(0), "a head not listed reads as index -1, as findIndex did");
+        assert_eq!(step_state(2, Some(2)), StepState::Current);
+        assert_eq!(step_state(3, Some(2)), StepState::Undone);
+        assert_eq!(step_state(1, Some(2)), StepState::Done);
+        assert_eq!(step_state(1, None), StepState::Done);
     }
 }

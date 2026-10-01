@@ -14,6 +14,7 @@ use serde_json::Map;
 
 use crate::darkroom::kelvin::{kelvin_wb, slider_to_kelvin, wb_shown, KelvinContext, WbShown};
 use crate::editing::{Bw, Field, Grain, Look, LutRef, Split, Tone, VersionEdit, Wb};
+use crate::presets::DevelopPreset;
 
 /// A tone or colour slider's key in the record's `tone`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -446,6 +447,33 @@ fn strip_cube(f: &str) -> String {
     }
 }
 
+/// A preset card clicked (`applyPreset`): the preset's tone over zero (white balance whole),
+/// all six look fields from the preset (`fade`/`vignette` defaulting to 0), the tone strip
+/// flattened — a fresh look deserves one — and the framing, engine fields, lens and unknown
+/// keys of `working` kept. A payload this build cannot read applies as an empty look.
+pub fn apply_preset(working: &VersionEdit, preset: &DevelopPreset) -> VersionEdit {
+    let e = preset.edit.value_or_default();
+    VersionEdit {
+        tone: Field::Set(tone_of(&e)),
+        bw: e.bw.clone(),
+        split: e.split.clone(),
+        grain: e.grain.clone(),
+        fade: e.fade.or_set(0.0),
+        vignette: e.vignette.or_set(0.0),
+        lut: e.lut.clone(),
+        zones: Field::Absent,
+        ..working.clone()
+    }
+}
+
+/// Whether `working` looks exactly as `preset` would make it (the card's highlight): the
+/// bridged tone and the look with defaults dropped, compared with what the preset gives.
+pub fn preset_is_active(preset: &DevelopPreset, working: &VersionEdit) -> bool {
+    let e = preset.edit.value_or_default();
+    let applied = (tone_of(&e), crate::editing::look_fields(&Look::zero().merged(&e.look())));
+    applied == (tone_of(working), crate::editing::look_fields(&look_of(working)))
+}
+
 /// The tone strip changed: the record's `zones`.
 pub fn set_zones(working: &VersionEdit, zones: Vec<f64>) -> VersionEdit {
     VersionEdit { zones: Field::Set(zones), ..working.clone() }
@@ -565,6 +593,29 @@ mod tests {
             ("b.CUBE".into(), "b".into()),
             ("Kodak.CUBE".into(), "Kodak.CUBE (missing)".into()),
         ]);
+    }
+
+    #[test]
+    fn a_preset_replaces_tone_and_look_flattens_zones_and_keeps_the_framing() {
+        let preset = crate::presets::builtin_presets().into_iter().find(|p| p.id == "bw-red").expect("a builtin");
+        let w = rec(json!({
+            "crop": {"x": 0.1, "y": 0.1, "w": 0.8, "h": 0.8}, "straighten": 2, "engine": 2, "lens": {"builtin": true},
+            "tone": {"ev": 1, "wb": {"temp": 0.3}}, "zones": [0, 0.5, 0, 0, 0, 0, 0, 0], "lut": {"file": "x.cube", "amount": 1},
+            "future": {"keep": true},
+        }));
+        let next = apply_preset(&w, &preset);
+        let v = js(&next);
+        assert_eq!(v["crop"], json!({"x": 0.1, "y": 0.1, "w": 0.8, "h": 0.8}));
+        assert_eq!((v["straighten"].clone(), v["engine"].clone(), v["lens"].clone()), (json!(2), json!(2), json!({"builtin": true})));
+        assert_eq!(v["future"], json!({"keep": true}), "unknown keys ride along");
+        assert_eq!(v.get("zones"), None, "the strip is flattened");
+        assert_eq!(v.get("lut"), None, "the preset's look replaces the old one");
+        assert_eq!(v["tone"]["wb"], json!({"temp": 0, "tint": 0}), "the preset's tone over zero");
+        assert!(v["bw"].is_object());
+        assert!(preset_is_active(&preset, &next), "the card is highlighted after applying it");
+        assert!(!preset_is_active(&preset, &w));
+        let tweaked = set_tone_key(&next, ToneKey::Ev, 0.4);
+        assert!(!preset_is_active(&preset, &tweaked), "a later tweak turns the highlight off");
     }
 
     #[test]

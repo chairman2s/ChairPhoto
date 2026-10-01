@@ -473,7 +473,9 @@ pub async fn find_similar_tags(
     state: State<'_, AppState>,
     min_similarity: Option<f64>,
 ) -> Result<Vec<crate::catalog::tag_maintenance::SimilarTagPair>, String> {
-    let threshold = min_similarity.unwrap_or(0.82).clamp(0.0, 1.0);
+    let threshold = min_similarity
+        .unwrap_or(crate::catalog::tag_maintenance::DEFAULT_MIN_SIMILARITY)
+        .clamp(0.0, 1.0);
     with_catalog_blocking(&state, move |c| {
         crate::catalog::tag_maintenance::find_similar_tags(c.conn(), threshold)
     })

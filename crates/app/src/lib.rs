@@ -41,7 +41,9 @@ pub mod image_store;
 pub mod keymap;
 pub mod launch;
 pub mod library;
+pub mod machine_prefs;
 pub mod model;
+pub mod preferences;
 pub mod modules;
 pub mod shell;
 pub mod signals;
@@ -138,6 +140,11 @@ pub struct WireOptions {
     /// None`). Only the frame bench (`examples/grid_bench.rs`) sets it: GPUI throttles an
     /// unfocused window to 30 Hz by default, which would alias its measurement.
     pub unthrottled: bool,
+    /// The per-machine preferences: read from the app data dir (production), or memory only.
+    pub machine_prefs: machine_prefs::MachinePrefs,
+    /// Re-reads the system theme (Preferences → Appearance, Reload theme): the Omarchy state
+    /// files in production, a fixed answer in tests.
+    pub read_system_theme: theme::ThemeReader,
 }
 
 impl WireOptions {
@@ -146,6 +153,20 @@ impl WireOptions {
             on_exit: Rc::new(chairphoto_core::crash_marker::clean_exit),
             open_default_catalog: true,
             unthrottled: false,
+            machine_prefs: machine_prefs::MachinePrefs::load_default(),
+            read_system_theme: Arc::new(chairphoto_core::appearance::read_current_theme),
+        }
+    }
+
+    /// Nothing that touches the user's data: no default catalog, preferences in memory, and
+    /// "no Omarchy theme" from every re-read.
+    pub fn headless(on_exit: Rc<dyn Fn()>) -> Self {
+        WireOptions {
+            on_exit,
+            open_default_catalog: false,
+            unthrottled: false,
+            machine_prefs: machine_prefs::MachinePrefs::in_memory(),
+            read_system_theme: Arc::new(SystemThemeResult::unavailable),
         }
     }
 }
@@ -180,7 +201,8 @@ pub fn wire(
         eprintln!("fonts: {e}; falling back to the system UI font");
     }
     gpui_kit::init(cx);
-    theme::apply_system_theme(initial_theme, cx);
+    cx.set_global(options.machine_prefs);
+    theme::init_appearance(initial_theme, options.read_system_theme, cx);
     cx.bind_keys(keymap::bindings());
     cx.on_action(|_: &keymap::Quit, cx| quit_app(QuitReason::Requested, cx));
     let on_exit = options.on_exit;
@@ -309,6 +331,9 @@ pub fn run() {
     // Two small files under ~/.local/state/omarchy, read before the event loop starts so the
     // first frame is already in the right palette.
     let initial_theme = chairphoto_core::appearance::read_current_theme();
+    // And the per-machine preferences (one small JSON file), for the same reason: the first
+    // frame paints the appearance mode they hold.
+    let options = WireOptions::production();
 
     gpui_kit::application()
         .with_assets(assets::Assets)
@@ -317,7 +342,7 @@ pub fn run() {
         .with_quit_mode(QuitMode::Explicit)
         .run(move |cx| {
             let wired =
-                wire(cx, state, events_rx, Some(boot.pool.clone()), &initial_theme, WireOptions::production());
+                wire(cx, state, events_rx, Some(boot.pool.clone()), &initial_theme, options);
             launch::spawn_quit_on_signal(quit_rx, cx).detach();
             if let Some(closer) = instance_closer {
                 launch::close_instance_on_quit(closer, cx);

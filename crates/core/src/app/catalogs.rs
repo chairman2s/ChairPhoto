@@ -329,6 +329,93 @@ pub fn publish_catalog_and_reset_jobs(state: &AppState, catalog: Catalog) -> Res
     Ok(fresh_abort)
 }
 
+/// Re-root the catalog at `new_root` (the library folder; `set_library_root`): persist the
+/// root through the outgoing handle, trip every job, reopen the catalog at `catalog_path`
+/// rooted there and publish it. Photos are stored relative to the root, so existing entries
+/// won't resolve until re-scanned. **Blocking** (a directory create, a SQLite open with
+/// migrations): run it on the blocking pool, never the UI thread.
+///
+/// This replaces the active catalog handle, so it runs the **same two-phase ownership
+/// transition as [`switch_catalog`]** rather than a hand-rolled swap (issue #22). It used to
+/// hold the catalog lock across persist → reopen → swap and trip nothing, which left a scan,
+/// face index, face match, Smart Tagging index, sharpness or pHash job running against a
+/// catalog the app had replaced — the invariant in AGENTS.md ("a newer job start or catalog
+/// switch must make older workers abortable and unreachable as owners") applied to a function
+/// nobody had connected to it.
+///
+/// The one thing it does that a switch does not: `catalog_root` must be written **through the
+/// outgoing handle**, before the reopen, because `Catalog::open` adopts the stored setting
+/// over the root argument it is passed. That write rides inside phase one via
+/// [`detach_catalog_and_trip_jobs_with`], so persist, trip and drop stay one transition.
+///
+/// Emits no `catalog:switched` (the Tauri command never did); the caller refreshes what it
+/// shows.
+pub fn reroot_library(state: &AppState, new_root: PathBuf, catalog_path: &Path) -> Result<(), String> {
+    reroot(state, new_root, Some(catalog_path))
+}
+
+/// [`reroot_library`] for the catalog that is open, whichever it is: the reopen uses the
+/// outgoing handle's own database path, read inside phase one, so a switch racing the
+/// re-root cannot make it reopen a different file.
+///
+/// The Tauri command reopens the *default* catalog (`default_catalog_path`), which is only
+/// the same thing while the default catalog is the open one: with another catalog open it
+/// writes the root into that catalog and then reopens the default one at its own stored
+/// root. The GPUI app's Preferences uses this instead.
+pub fn reroot_open_catalog(state: &AppState, new_root: PathBuf) -> Result<(), String> {
+    reroot(state, new_root, None)
+}
+
+/// The re-root; `catalog_path` `None` = the open catalog's own file.
+fn reroot(state: &AppState, new_root: PathBuf, catalog_path: Option<&Path>) -> Result<(), String> {
+    // Before anything is tripped, so a bad path fails with every job still running.
+    std::fs::create_dir_all(&new_root).map_err(|e| e.to_string())?;
+
+    // Phase one: persist the new root through the outgoing handle, trip every job generation,
+    // clear every status slot, drop the handle — one transition under the catalog lock. A
+    // failed persist leaves the catalog open and nothing tripped.
+    let mut reopen = catalog_path.map(Path::to_path_buf);
+    detach_catalog_and_trip_jobs_with(state, |catalog| {
+        let catalog = catalog.ok_or("No catalog is open")?;
+        catalog.set_setting("catalog_root", &new_root.to_string_lossy()).map_err(|e| e.to_string())?;
+        reopen.get_or_insert_with(|| catalog.db_path().to_path_buf());
+        Ok(())
+    })?;
+    let catalog_path = reopen.ok_or("No catalog is open")?;
+
+    // Runs migrations.
+    let reopened = Catalog::open(&catalog_path, &new_root).map_err(|e| e.to_string())?;
+
+    // Phase two: publish it with fresh un-tripped generations, tripping whatever a racing
+    // start installed while the catalog was `None` so it cannot survive unreachable.
+    publish_catalog_and_reset_jobs(state, reopened)?;
+    // The catalog-root volume's base path just moved — drop cached reachability.
+    state.volume_health.invalidate();
+    Ok(())
+}
+
+/// Before/after on-disk catalog size for a VACUUM.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VacuumResult {
+    pub before_bytes: i64,
+    pub after_bytes: i64,
+}
+
+/// Compact the open catalog (SQLite VACUUM): reclaim space from deleted rows, defragment, and
+/// shed retired columns. Holds the catalog lock for its duration — **blocking**, run it on the
+/// blocking pool. Returns the size before and after.
+pub fn vacuum_catalog(state: &AppState) -> Result<VacuumResult, String> {
+    // `&mut`: compaction also sheds retired columns, which changes the connection's own view
+    // of the table shape (see `Catalog::vacuum`).
+    let mut guard = state.catalog.lock().map_err(|e| e.to_string())?;
+    let catalog = guard.as_mut().ok_or("No catalog is open")?;
+    let before = catalog.db_size_bytes().map_err(|e| e.to_string())?;
+    catalog.vacuum().map_err(|e| e.to_string())?;
+    let after = catalog.db_size_bytes().map_err(|e| e.to_string())?;
+    Ok(VacuumResult { before_bytes: before, after_bytes: after })
+}
+
 /// Path of the default catalog database file (separate from the photo library root).
 pub fn default_catalog_path() -> Result<PathBuf, String> {
     Ok(app_data_dir()?.join("default.chairphoto"))
@@ -604,5 +691,67 @@ mod switch_tests {
         let recent = load_recent_catalogs_in(&dir.join("reg")).unwrap();
         assert_eq!((recent.len(), recent[0].name.as_str()), (1, "B"));
         assert_eq!(names.0.lock().unwrap().as_slice(), ["catalog:switched"]);
+    }
+
+    /// A re-root trips the running jobs, publishes the same catalog file rooted at the new
+    /// folder (the root persisted through the outgoing handle, or `Catalog::open` would have
+    /// adopted the old one), creates the folder, and announces nothing.
+    #[test]
+    fn a_reroot_trips_jobs_and_reopens_the_catalog_at_the_new_root() {
+        let dir = crate::test_support::TestTmpDir::new("reroot");
+        let state = AppState::default();
+        let names = Arc::new(Names::default());
+        state.set_events(names.clone());
+        let db = dir.join("a.chairphoto");
+        *state.catalog.lock().unwrap() = Some(Catalog::open(&db, &dir.join("old")).unwrap());
+        let import = state.jobs.import.install_fresh().unwrap();
+        let new_root = dir.join("new/root");
+        reroot_library(&state, new_root.clone(), &db).unwrap();
+        assert!(import.load(Ordering::Relaxed), "the running import was tripped");
+        assert!(new_root.is_dir());
+        let guard = state.catalog.lock().unwrap();
+        let c = guard.as_ref().unwrap();
+        assert_eq!((c.db_path(), c.root()), (db.as_path(), new_root.as_path()));
+        assert!(names.0.lock().unwrap().is_empty(), "a re-root is not a switch");
+    }
+
+    /// Re-rooting the open catalog reopens *that* file — not the default catalog — at the
+    /// new root.
+    #[test]
+    fn a_reroot_of_the_open_catalog_reopens_its_own_file() {
+        let dir = crate::test_support::TestTmpDir::new("reroot-open");
+        let state = AppState::default();
+        let db = dir.join("other/B.chairphoto");
+        *state.catalog.lock().unwrap() = Some(Catalog::open(&db, &dir.join("old")).unwrap());
+        let import = state.jobs.import.install_fresh().unwrap();
+        let new_root = dir.join("new");
+        reroot_open_catalog(&state, new_root.clone()).unwrap();
+        assert!(import.load(Ordering::Relaxed), "the running import was tripped");
+        let guard = state.catalog.lock().unwrap();
+        let c = guard.as_ref().unwrap();
+        assert_eq!((c.db_path(), c.root()), (db.as_path(), new_root.as_path()));
+    }
+
+    /// With nothing open, a re-root fails before it trips anything.
+    #[test]
+    fn a_reroot_without_a_catalog_fails_and_trips_nothing() {
+        let dir = crate::test_support::TestTmpDir::new("reroot-none");
+        let state = AppState::default();
+        let import = state.jobs.import.install_fresh().unwrap();
+        let err = reroot_library(&state, dir.join("r"), &dir.join("a.chairphoto")).unwrap_err();
+        assert_eq!(err, "No catalog is open");
+        assert!(!import.load(Ordering::Relaxed));
+    }
+
+    /// VACUUM reports the file's size before and after, and needs an open catalog.
+    #[test]
+    fn vacuum_reports_the_size_before_and_after() {
+        let dir = crate::test_support::TestTmpDir::new("vacuum");
+        let state = AppState::default();
+        assert_eq!(vacuum_catalog(&state).unwrap_err(), "No catalog is open");
+        *state.catalog.lock().unwrap() = Some(Catalog::open(&dir.join("v.chairphoto"), &dir.join("v")).unwrap());
+        let r = vacuum_catalog(&state).unwrap();
+        assert!(r.before_bytes > 0 && r.after_bytes > 0, "{r:?}");
+        assert!(r.after_bytes <= r.before_bytes, "{r:?}");
     }
 }

@@ -10,16 +10,143 @@
 //! `font-display` — live in the [`Palette`] global, set in the same `cx` update so both are
 //! current in the same frame.
 //!
-//! **Appearance mode.** The React app persists "Follow Omarchy" / "ChairPhoto Standard" in
-//! localStorage (`src/theme/prefs.ts`); the GPUI app has no per-machine settings store yet
-//! (Preferences, #113). Until then it always follows Omarchy — the product default — and
-//! falls back to Standard when no usable Omarchy theme exists, exactly as follow mode does.
+//! **Appearance mode** (`src/theme/{prefs,controller}.ts`; Preferences → Appearance, #113).
+//! "Follow Omarchy" — the product default — paints the system theme and tracks its changes,
+//! falling back to Standard when no usable Omarchy theme exists; "ChairPhoto Standard" paints
+//! Standard whatever the system does. The mode is a per-machine preference
+//! ([`MachinePrefs`] key [`MODE_PREF`], React's `localStorage` key), not a catalog setting.
+//! The [`Appearance`] global holds the mode and the latest system-theme answer, so a mode
+//! change repaints at once and Preferences can say what is being followed. Every window
+//! shares the one theme, so a pop-out loupe follows a mode change too (React's could not).
 
+use crate::machine_prefs::MachinePrefs;
 use chairphoto_core::appearance::{OmarchyMode, SystemThemeResult};
 use chairphoto_model::theme::{omarchy, standard as model_standard, tokens::ThemeTokens};
 use gpui_kit::component::{Theme, ThemeConfig, ThemeConfigColors, ThemeMode};
 use gpui_kit::{App, Global, SharedString};
 use std::rc::Rc;
+use std::sync::Arc;
+
+/// The appearance mode's per-machine key (`STORAGE_KEY` in `src/theme/prefs.ts`). Not a
+/// catalog setting, so not in a catalog settings namespace.
+pub const MODE_PREF: &str = "appearance.mode";
+
+/// Which palette source paints the app (`AppearanceMode` in `src/theme/tokens.ts`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AppearanceMode {
+    #[default]
+    FollowOmarchy,
+    Standard,
+}
+
+impl AppearanceMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AppearanceMode::FollowOmarchy => "follow-omarchy",
+            AppearanceMode::Standard => "standard",
+        }
+    }
+
+    /// A stored value; absent or unrecognised is the default, as `loadAppearanceMode`.
+    pub fn parse(stored: Option<&str>) -> Self {
+        match stored {
+            Some("standard") => AppearanceMode::Standard,
+            _ => AppearanceMode::FollowOmarchy,
+        }
+    }
+}
+
+/// Reads the current system theme: `appearance::read_current_theme` in the app; tests
+/// install a fake so nothing reads the machine's Omarchy state. Blocking (two small files).
+pub type ThemeReader = Arc<dyn Fn() -> SystemThemeResult + Send + Sync>;
+
+/// The appearance mode and the latest system-theme answer (startup's read, then every
+/// `appearance:theme_changed` and re-read). A GPUI global, installed by [`init_appearance`].
+#[derive(Clone)]
+pub struct Appearance {
+    pub mode: AppearanceMode,
+    pub system: SystemThemeResult,
+    reader: ThemeReader,
+}
+
+impl Global for Appearance {}
+
+/// Install the appearance (the mode from [`MachinePrefs`], the startup system theme) and
+/// paint it.
+pub fn init_appearance(system: &SystemThemeResult, reader: ThemeReader, cx: &mut App) {
+    let mode = AppearanceMode::parse(MachinePrefs::read(cx, MODE_PREF).as_deref());
+    cx.set_global(Appearance { mode, system: system.clone(), reader });
+    paint(cx);
+}
+
+/// The current mode (the default before [`init_appearance`]).
+pub fn mode(cx: &App) -> AppearanceMode {
+    cx.try_global::<Appearance>().map(|a| a.mode).unwrap_or_default()
+}
+
+/// A system-theme answer arrived (`appearance:theme_changed`, a re-read): remember it, and
+/// paint it when following. Standard ignores it.
+pub fn on_system_theme(result: &SystemThemeResult, cx: &mut App) {
+    match cx.try_global::<Appearance>().is_some() {
+        true => {
+            cx.global_mut::<Appearance>().system = result.clone();
+            paint(cx);
+        }
+        // Not initialised (a bare test app): behave as follow mode.
+        false => apply_system_theme(result, cx),
+    }
+}
+
+/// Preferences → Appearance: switch the mode, persist it per machine and repaint — and, when
+/// switching to Follow, re-read the system theme off the UI thread rather than trust the
+/// last answer (`refreshAppearance`).
+pub fn set_mode(next: AppearanceMode, cx: &mut App) {
+    if !cx.has_global::<Appearance>() {
+        return;
+    }
+    cx.global_mut::<Appearance>().mode = next;
+    MachinePrefs::set(cx, MODE_PREF, next.as_str());
+    paint(cx);
+    if next == AppearanceMode::FollowOmarchy {
+        reread_system_theme(cx);
+    }
+}
+
+/// Re-read the system theme off the UI thread and hand it to [`on_system_theme`].
+pub fn reread_system_theme(cx: &mut App) {
+    let Some(reader) = cx.try_global::<Appearance>().map(|a| a.reader.clone()) else { return };
+    let read = cx.background_executor().spawn(async move { reader() });
+    cx.spawn(async move |cx| {
+        let result = read.await;
+        cx.update(|cx| on_system_theme(&result, cx));
+    })
+    .detach();
+}
+
+/// Paint what the mode says: the system theme when following, else Standard.
+fn paint(cx: &mut App) {
+    let Some(a) = cx.try_global::<Appearance>() else { return };
+    match a.mode {
+        AppearanceMode::FollowOmarchy => {
+            let system = a.system.clone();
+            apply_system_theme(&system, cx);
+        }
+        AppearanceMode::Standard => apply(standard(), STANDARD_MODE, None, cx),
+    }
+}
+
+/// Preferences → Appearance's status line under Follow Omarchy (`appearanceStatusLine`).
+pub fn status_line(result: &SystemThemeResult) -> String {
+    if result.available {
+        let mode = match result.palette.as_ref().map(|p| &p.mode) {
+            Some(OmarchyMode::Dark) => "dark",
+            Some(OmarchyMode::Light) => "light",
+            None => "",
+        };
+        return format!("Following Omarchy · {} · {mode}", result.theme_name.as_deref().unwrap_or("unnamed theme"));
+    }
+    "Omarchy not detected — ChairPhoto Standard is in use. This is normal without Omarchy; nothing is missing.".into()
+}
 
 /// The UI font family (`font-sans`), embedded by [`crate::assets`].
 pub const FONT_SANS: &str = "Instrument Sans";
@@ -227,6 +354,81 @@ mod tests {
             assert_eq!(palette.tokens.rating, "#FFD700");
             assert_eq!(palette.omarchy_theme, None);
         });
+    }
+
+    fn omarchy(name: &str, background: &str) -> SystemThemeResult {
+        let toml = format!(
+            "mode = \"dark\"\naccent = \"#7aa2f7\"\nselection = \"#33467c\"\nmuted = \"#565f89\"\n\
+             background = \"{background}\"\nforeground = \"#c0caf5\"\n"
+        );
+        let palette = chairphoto_core::appearance::parse_palette(&toml).unwrap();
+        SystemThemeResult { available: true, theme_name: Some(name.into()), palette: Some(palette) }
+    }
+
+    fn install(stored_mode: Option<&str>, system: &SystemThemeResult, reread: SystemThemeResult, cx: &mut App) {
+        gpui_kit::init(cx);
+        cx.set_global(crate::storage::Runner::manual());
+        let mut prefs = MachinePrefs::in_memory();
+        if let Some(m) = stored_mode {
+            cx.set_global(prefs.clone());
+            MachinePrefs::set(cx, MODE_PREF, m);
+            prefs = cx.global::<MachinePrefs>().clone();
+        }
+        cx.set_global(prefs);
+        init_appearance(system, Arc::new(move || reread.clone()), cx);
+    }
+
+    /// Standard holds whatever the system does: startup with an Omarchy theme available, and
+    /// a later `theme_changed`, both leave Standard painted — but the answer is remembered,
+    /// so switching to Follow paints the newest theme at once, persists the mode per machine,
+    /// and the re-read it starts lands too.
+    #[gpui_kit::test]
+    fn standard_ignores_the_system_theme_and_follow_paints_it(cx: &mut TestAppContext) {
+        let first = omarchy("tokyo-night", "#1a1b26");
+        let reread = omarchy("re-read", "#101010");
+        cx.update(|cx| install(Some("standard"), &first, reread, cx));
+        cx.update(|cx| {
+            assert_eq!(mode(cx), AppearanceMode::Standard);
+            assert_eq!(cx.global::<Palette>().tokens, standard(), "Standard at startup");
+            on_system_theme(&omarchy("nord", "#2e3440"), cx);
+            assert_eq!(cx.global::<Palette>().tokens, standard(), "a theme change does not repaint Standard");
+            assert_eq!(cx.global::<Appearance>().system.theme_name.as_deref(), Some("nord"));
+
+            set_mode(AppearanceMode::FollowOmarchy, cx);
+            assert_eq!(cx.global::<Palette>().omarchy_theme.as_deref(), Some("nord"), "the remembered answer, at once");
+            assert_eq!(MachinePrefs::read(cx, MODE_PREF).as_deref(), Some("follow-omarchy"));
+        });
+        cx.run_until_parked();
+        cx.update(|cx| {
+            assert_eq!(cx.global::<Palette>().omarchy_theme.as_deref(), Some("re-read"), "the re-read landed");
+            on_system_theme(&omarchy("nord", "#2e3440"), cx);
+            assert_eq!(cx.global::<Palette>().omarchy_theme.as_deref(), Some("nord"), "following tracks changes");
+            set_mode(AppearanceMode::Standard, cx);
+            assert_eq!(cx.global::<Palette>().tokens, standard());
+            assert_eq!(MachinePrefs::read(cx, MODE_PREF).as_deref(), Some("standard"));
+        });
+    }
+
+    /// No stored mode, or one this build does not know, is Follow (`loadAppearanceMode`).
+    #[gpui_kit::test]
+    fn an_absent_or_unknown_mode_follows_omarchy(cx: &mut TestAppContext) {
+        assert_eq!(AppearanceMode::parse(Some("sepia")), AppearanceMode::FollowOmarchy);
+        assert_eq!(AppearanceMode::parse(Some("standard")), AppearanceMode::Standard);
+        cx.update(|cx| {
+            install(None, &omarchy("tokyo-night", "#1a1b26"), SystemThemeResult::unavailable(), cx);
+            assert_eq!(mode(cx), AppearanceMode::FollowOmarchy);
+            assert_eq!(cx.global::<Palette>().omarchy_theme.as_deref(), Some("tokyo-night"));
+        });
+    }
+
+    /// Preferences → Appearance's status line, both of React's wordings.
+    #[test]
+    fn the_status_line_says_what_is_followed() {
+        assert_eq!(status_line(&omarchy("tokyo-night", "#1a1b26")), "Following Omarchy · tokyo-night · dark");
+        assert_eq!(
+            status_line(&SystemThemeResult::unavailable()),
+            "Omarchy not detected — ChairPhoto Standard is in use. This is normal without Omarchy; nothing is missing."
+        );
     }
 
     /// No usable Omarchy theme is follow mode's fallback: Standard, not a half theme.

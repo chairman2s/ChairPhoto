@@ -8,7 +8,6 @@ use super::catalog_switcher::CatalogSwitcher;
 use super::identity_debt::IdentityDebtPanel;
 use super::import_panel::ImportPanel;
 use super::trash::TrashDialog;
-use super::volumes::VolumesPanel;
 use super::CloseDialog;
 use crate::view::RootView;
 use gpui_kit::component::WindowExt as _;
@@ -24,7 +23,6 @@ pub enum StorageDialog {
     ImportBundle(Entity<BundleImport>),
     IdentityDebt(Entity<IdentityDebtPanel>),
     Trash(Entity<TrashDialog>),
-    Volumes(Entity<VolumesPanel>),
 }
 
 impl RootView {
@@ -99,12 +97,6 @@ impl RootView {
             Rc::new(move |window: &mut Window, cx: &mut App| view.update(cx, |t, cx| t.on_dialog_cancel(window, cx)))
         };
         self.show_dialog_with("Trash", 760., view.clone(), StorageDialog::Trash(view), Some(cancel), window, cx);
-    }
-
-    pub(crate) fn open_volumes(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let app = self.model.read(cx).state().clone();
-        let view = cx.new(|cx| VolumesPanel::new(app, window, cx));
-        self.show_dialog("Storage volumes", 640., view.clone(), StorageDialog::Volumes(view), window, cx);
     }
 
     /// The bench's Back up: the selection's targets.

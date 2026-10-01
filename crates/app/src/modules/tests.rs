@@ -13,7 +13,7 @@ use super::dev_module::DEV_MODULE_ID;
 use super::registry::{validate_id, ModuleRegistry, ENABLED_KEY};
 use super::*;
 use crate::model::AppModel;
-use crate::shell::actions::{OpenModules, PublishSelection};
+use crate::shell::actions::{OpenPreferences, PublishSelection};
 use crate::shell::state::{InspectorTab, Surface};
 use crate::shell::ShellState;
 use crate::{start_core, wire, WireOptions, Wired};
@@ -792,7 +792,7 @@ fn shell(dir: &TempDir, cx: &mut TestAppContext) -> (Shell, i64) {
             events_rx,
             None,
             &SystemThemeResult::unavailable(),
-            WireOptions { on_exit: Rc::new(|| {}), open_default_catalog: false, unthrottled: false },
+            WireOptions::headless(Rc::new(|| {})),
         )
     });
     let db = dir.0.join("s.chairphoto");
@@ -805,8 +805,8 @@ fn shell(dir: &TempDir, cx: &mut TestAppContext) -> (Shell, i64) {
     (Shell { state, wired }, id)
 }
 
-/// The Modules panel lists the dev module; ticking it puts the module's contributions in
-/// every slot the shell has (rail, stage, sidebar, inspector, settings), and unticking it takes
+/// Preferences → Modules lists the dev module; ticking it puts the module's contributions in
+/// every slot the shell has (rail, stage, sidebar, inspector, its Preferences tab), and unticking it takes
 /// them all away again — the stage falling back to the Library.
 #[gpui_kit::test]
 fn the_modules_panel_toggles_every_slot(cx: &mut TestAppContext) {
@@ -821,10 +821,11 @@ fn the_modules_panel_toggles_every_slot(cx: &mut TestAppContext) {
         assert!(!app.present(id, cx), "{id} before the module is enabled");
     }
 
-    app.dispatch(Box::new(OpenModules), cx);
+    app.dispatch(Box::new(OpenPreferences), cx);
     settle_dialog(cx);
-    assert!(app.present("module-row-dev", cx), "the Modules panel lists the dev module");
-    assert!(!app.present("dev-settings", cx), "no settings panel while disabled");
+    app.click("prefs-tab-modules", cx);
+    assert!(app.present("module-row-dev", cx), "Preferences → Modules lists the dev module");
+    assert!(!app.present("prefs-tab-module-dev", cx), "no settings tab while disabled");
     app.click("module-toggle-dev", cx);
     assert!(app.wired.modules.read_with(cx, |r, _| r.is_enabled(DEV_MODULE_ID)));
     assert_eq!(
@@ -832,9 +833,11 @@ fn the_modules_panel_toggles_every_slot(cx: &mut TestAppContext) {
         Some(DEV_MODULE_ID),
         "the toggle persisted"
     );
-    for id in ["dev-settings", "rail-view-dev-view", "dev-sidebar", "module-panel-sidebar-dev-sidebar", "dev-inspector"] {
+    for id in ["prefs-tab-module-dev", "rail-view-dev-view", "dev-sidebar", "module-panel-sidebar-dev-sidebar", "dev-inspector"] {
         assert!(app.present(id, cx), "{id} once the module is enabled");
     }
+    app.click("prefs-tab-module-dev", cx);
+    assert!(app.present("dev-settings", cx), "the module's tab shows its settings panel");
 
     // The modal dialog covers the window: close it to reach the rail.
     cx.update_window(app.window(), |_, window, cx| window.close_dialog(cx)).unwrap();
@@ -843,12 +846,13 @@ fn the_modules_panel_toggles_every_slot(cx: &mut TestAppContext) {
     assert_eq!(app.surface(cx), Surface::Module("dev-view".into()));
     assert!(app.present("dev-main", cx), "the main view fills the stage");
 
-    app.dispatch(Box::new(OpenModules), cx);
+    app.dispatch(Box::new(OpenPreferences), cx);
     settle_dialog(cx);
+    app.click("prefs-tab-modules", cx);
     app.click("module-toggle-dev", cx);
     assert!(!app.wired.modules.read_with(cx, |r, _| r.is_enabled(DEV_MODULE_ID)));
     assert_eq!(app.surface(cx), Surface::Library, "the stage fell back to the Library");
-    for id in ["dev-settings", "rail-view-dev-view", "dev-sidebar", "dev-inspector", "dev-main"] {
+    for id in ["prefs-tab-module-dev", "dev-settings", "rail-view-dev-view", "dev-sidebar", "dev-inspector", "dev-main"] {
         assert!(!app.present(id, cx), "{id} after the module is disabled");
     }
 }

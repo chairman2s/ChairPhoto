@@ -1,0 +1,505 @@
+//! Headless tests of Preferences (#113): opened from the rail's gear through the real window,
+//! each tab's sections driven through their buttons and fields, and the catalog-switch
+//! interleaving forced. Reads and writes run on `Runner::manual` ([`work`]).
+
+use super::storage_tests::{photo_count, set_input, settle, work, work_once};
+use super::*;
+use crate::preferences::editors::{DarkroomSection, EditorsSection};
+use crate::preferences::storage::{MaintenanceSection, Removal, SafetySection, TieringSection};
+use crate::preferences::tags::TagMaintenance;
+use crate::preferences::{Content, LastPreferences, Preferences, Tab};
+use chairphoto_core::catalog::{StorageTier, VolumeKind};
+use chairphoto_model::darkroom::kelvin::WbPrefer;
+
+fn prefs(cx: &mut TestAppContext) -> Entity<Preferences> {
+    cx.update(|cx| cx.try_global::<LastPreferences>().and_then(|p| p.0.upgrade())).expect("Preferences is open")
+}
+
+/// Open Preferences with the rail's gear and let its first reads land.
+fn open(app: &App, cx: &mut TestAppContext) -> Entity<Preferences> {
+    click(app, "rail-preferences", cx);
+    settle(app, cx);
+    work(cx);
+    prefs(cx)
+}
+
+fn tab(app: &App, id: &'static str, cx: &mut TestAppContext) {
+    click(app, id, cx);
+    work(cx);
+}
+
+fn setting(app: &App, key: &str) -> Option<String> {
+    app.state.catalog.lock().unwrap().as_ref().unwrap().get_setting(key).unwrap()
+}
+
+fn put_setting(app: &App, key: &str, value: &str) {
+    app.state.catalog.lock().unwrap().as_ref().unwrap().set_setting(key, value).unwrap();
+}
+
+fn present(app: &App, id: &'static str, cx: &mut TestAppContext) -> bool {
+    cx.update_window(app.window(), |_, window, cx| {
+        window.render_frame(cx);
+        window.try_find(id).is_some()
+    })
+    .unwrap()
+}
+
+/// Run `f` in the main window — for controls the dialog's scroll area has below the fold,
+/// which the test platform will not click.
+fn in_window<R>(app: &App, cx: &mut TestAppContext, f: impl FnOnce(&mut Window, &mut gpui_kit::App) -> R) -> R {
+    let r = cx.update_window(app.window(), |_, window, cx| f(window, cx)).unwrap();
+    cx.run_until_parked();
+    r
+}
+
+fn close_dialog(app: &App, cx: &mut TestAppContext) {
+    use gpui_kit::component::WindowExt as _;
+    cx.update_window(app.window(), |_, window, cx| window.close_dialog(cx)).unwrap();
+    cx.run_until_parked();
+}
+
+fn library(p: &Entity<Preferences>, cx: &mut TestAppContext) -> Entity<crate::preferences::storage::LibrarySection> {
+    p.read_with(cx, |p, _| match &p.content {
+        Content::Storage(s) => s.library.clone(),
+        _ => panic!("not on Storage"),
+    })
+}
+
+fn safety(p: &Entity<Preferences>, cx: &mut TestAppContext) -> Entity<SafetySection> {
+    p.read_with(cx, |p, _| match &p.content {
+        Content::Storage(s) => s.safety.clone(),
+        _ => panic!("not on Storage"),
+    })
+}
+
+fn tiering(p: &Entity<Preferences>, cx: &mut TestAppContext) -> Entity<TieringSection> {
+    p.read_with(cx, |p, _| match &p.content {
+        Content::Storage(s) => s.tiering.clone(),
+        _ => panic!("not on Storage"),
+    })
+}
+
+fn maintenance(p: &Entity<Preferences>, cx: &mut TestAppContext) -> Entity<MaintenanceSection> {
+    p.read_with(cx, |p, _| match &p.content {
+        Content::Storage(s) => s.maintenance.clone(),
+        _ => panic!("not on Storage"),
+    })
+}
+
+fn tags(p: &Entity<Preferences>, cx: &mut TestAppContext) -> Entity<TagMaintenance> {
+    p.read_with(cx, |p, _| match &p.content {
+        Content::Tags(t) => t.clone(),
+        _ => panic!("not on Tags"),
+    })
+}
+
+fn editors(p: &Entity<Preferences>, cx: &mut TestAppContext) -> (Entity<EditorsSection>, Entity<DarkroomSection>) {
+    p.read_with(cx, |p, _| match &p.content {
+        Content::Editors(e, d) => (e.clone(), d.clone()),
+        _ => panic!("not on Editors"),
+    })
+}
+
+// --- the dialog and its tabs ------------------------------------------------------------------
+
+/// The gear opens Preferences on Storage (More ⋯ → Preferences… too); the tabs switch what is
+/// built; an enabled module with settings gets a tab named after it, which goes away — back to
+/// Storage — when the module is disabled.
+#[gpui_kit::test]
+fn the_gear_opens_preferences_and_module_tabs_follow_the_registry(cx: &mut TestAppContext) {
+    let dir = TempDir::new("prefs-tabs");
+    let app = start(cx);
+    open_catalog(&app, &dir, cx);
+    let p = open(&app, cx);
+    assert_eq!(p.read_with(cx, |p, _| p.tab.clone()), Tab::Storage);
+    let root = dir.0.join("photos").to_string_lossy().to_string();
+    let lib = library(&p, cx);
+    assert_eq!(lib.read_with(cx, |l, cx| l.root.read(cx).value().to_string()), root, "the library folder was read");
+
+    for (id, want) in [
+        ("prefs-tab-tags", Tab::Tags),
+        ("prefs-tab-editors", Tab::Editors),
+        ("prefs-tab-modules", Tab::Modules),
+        ("prefs-tab-appearance", Tab::Appearance),
+    ] {
+        tab(&app, id, cx);
+        assert_eq!(p.read_with(cx, |p, _| p.tab.clone()), want);
+    }
+    tab(&app, "prefs-tab-modules", cx);
+    assert!(!present(&app, "prefs-tab-module-dev", cx));
+    click(&app, "module-toggle-dev", cx);
+    assert!(present(&app, "prefs-tab-module-dev", cx), "an enabled module with settings has a tab");
+    tab(&app, "prefs-tab-module-dev", cx);
+    assert!(present(&app, "dev-settings", cx), "the tab shows the module's settings panel");
+    cx.update(|cx| crate::modules::ModuleRegistry::disable(&app.wired.modules, "dev", cx));
+    cx.run_until_parked();
+    assert_eq!(p.read_with(cx, |p, _| p.tab.clone()), Tab::Storage, "its tab vanished: back to Storage");
+    assert!(!present(&app, "prefs-tab-module-dev", cx));
+
+    close_dialog(&app, cx);
+    click(&app, "more-menu", cx);
+    let row = cx
+        .update_window(app.window(), |_, window, cx| {
+            window.render_frame(cx);
+            let menu = window.within("popup-menu");
+            (0..30).find(|i| menu.find(*i).label() == Some("Preferences…"))
+        })
+        .unwrap()
+        .expect("More ⋯ has Preferences…");
+    press(&app, "escape", cx);
+    click_menu_row(&app, "more-menu", row, "Preferences…", cx);
+    settle(&app, cx);
+    assert_ne!(prefs(cx).entity_id(), p.entity_id(), "More ⋯ → Preferences… opened it again");
+}
+
+// --- storage --------------------------------------------------------------------------------
+
+/// Set re-roots the open catalog (the same file, the new root, the folder created) and says
+/// to rescan, on the section and on the status line.
+#[gpui_kit::test]
+fn set_reroots_the_open_catalog(cx: &mut TestAppContext) {
+    let dir = TempDir::new("prefs-root");
+    let app = start(cx);
+    open_catalog(&app, &dir, cx);
+    let db = app.state.catalog.lock().unwrap().as_ref().unwrap().db_path().to_path_buf();
+    let p = open(&app, cx);
+    let lib = library(&p, cx);
+    let new_root = dir.0.join("library");
+    let input = lib.read_with(cx, |l, _| l.root.clone());
+    set_input(&app, &input, &new_root.to_string_lossy(), cx);
+    click(&app, "library-set", cx);
+    work(cx);
+    {
+        let guard = app.state.catalog.lock().unwrap();
+        let c = guard.as_ref().unwrap();
+        assert_eq!((c.db_path(), c.root()), (db.as_path(), new_root.as_path()));
+    }
+    assert!(new_root.is_dir());
+    assert_eq!(lib.read_with(cx, |l, _| l.status.clone()).as_deref(), Some("Library folder set — re-scan to index it."));
+    assert_eq!(status(&app, cx), "Library folder changed — click Rescan library to index it.");
+}
+
+/// The day count takes digits only and loads what is stored; Save writes React's key and
+/// line; blank turns the policy off.
+#[gpui_kit::test]
+fn tiering_saves_the_offload_age(cx: &mut TestAppContext) {
+    let dir = TempDir::new("prefs-tiering");
+    let app = start(cx);
+    open_catalog(&app, &dir, cx);
+    put_setting(&app, "offload_age_days", "30");
+    let p = open(&app, cx);
+    let t = tiering(&p, cx);
+    let days = t.read_with(cx, |t, _| t.days.clone());
+    assert_eq!(days.read_with(cx, |i, _| i.value().to_string()), "30");
+    set_input(&app, &days, "", cx);
+    in_window(&app, cx, |window, cx| {
+        days.update(cx, |i, cx| i.focus(window, cx));
+        window.input("9x0", cx);
+    });
+    assert_eq!(days.read_with(cx, |i, _| i.value().to_string()), "90", "digits only");
+    t.update(cx, |t, cx| t.save(cx));
+    work(cx);
+    assert_eq!(setting(&app, "offload_age_days").as_deref(), Some("90"));
+    assert_eq!(
+        t.read_with(cx, |t, _| t.status.clone()).as_deref(),
+        Some("Saved — photos older than 90 day(s) will be offloaded to the NAS.")
+    );
+    set_input(&app, &days, "", cx);
+    t.update(cx, |t, cx| t.save(cx));
+    work(cx);
+    assert_eq!(setting(&app, "offload_age_days").as_deref(), Some("0"));
+    assert_eq!(
+        t.read_with(cx, |t, _| t.status.clone()).as_deref(),
+        Some("Saved — automatic offload is off (photos stay on local disk).")
+    );
+    // Offload older now with no NAS: nothing to do, said so.
+    t.update(cx, |t, cx| t.offload_now(cx));
+    work(cx);
+    let line = t.read_with(cx, |t, _| t.status.clone()).unwrap();
+    assert!(line.starts_with("Nothing to offload") || line.contains("backup"), "{line}");
+}
+
+/// Index existing NAS photos: an empty field asks for a folder; Enter in the field indexes a
+/// folder on a registered NAS volume in place, and the photos are in the catalog.
+#[gpui_kit::test]
+fn the_nas_index_runs_in_place(cx: &mut TestAppContext) {
+    let dir = TempDir::new("prefs-nas");
+    let app = start(cx);
+    open_catalog(&app, &dir, cx);
+    let nas = dir.0.join("nas");
+    std::fs::create_dir_all(nas.join("2020")).unwrap();
+    std::fs::write(nas.join("2020/IMG_0001.jpg"), "not really a jpeg").unwrap();
+    app.state
+        .catalog
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .add_volume("NAS", &nas, VolumeKind::Backup)
+        .unwrap();
+    let p = open(&app, cx);
+    let t = tiering(&p, cx);
+    t.update(cx, |t, cx| t.index_nas(cx));
+    assert_eq!(t.read_with(cx, |t, _| t.status.clone()).as_deref(), Some("Choose the NAS folder to index."));
+    let field = t.read_with(cx, |t, _| t.nas.clone());
+    set_input(&app, &field, &nas.to_string_lossy(), cx);
+    in_window(&app, cx, |window, cx| {
+        field.update(cx, |i, cx| i.focus(window, cx));
+        window.press("enter", cx);
+    });
+    assert!(t.read_with(cx, |t, _| t.busy), "Enter started the index");
+    work(cx);
+    let line = t.read_with(cx, |t, _| t.status.clone()).unwrap();
+    assert_eq!(line, "Indexed 1 new photo(s) from the NAS. Find them under the \"On NAS\" filter.");
+    assert_eq!(photo_count(&app), 1);
+}
+
+/// Remove unavailable photos: the confirm lists them; Cancel keeps them ("Cancelled."), OK
+/// removes the catalog rows only. Remove empty finds none. Compact reports the sizes.
+#[gpui_kit::test]
+fn maintenance_removes_behind_a_confirm_and_compacts(cx: &mut TestAppContext) {
+    let dir = TempDir::new("prefs-maint");
+    let app = start(cx);
+    std::fs::create_dir_all(dir.0.join("photos")).unwrap(); // the library folder is mounted
+    open_catalog_with_photos(&app, &dir, 2, cx); // rows whose files do not exist
+    let p = open(&app, cx);
+    let m = maintenance(&p, cx);
+    in_window(&app, cx, |w, cx| m.update(cx, |m, cx| m.remove(Removal::Unavailable, w, cx)));
+    work(cx);
+    settle(&app, cx);
+    click(&app, "cancel", cx);
+    work(cx);
+    assert_eq!(m.read_with(cx, |m, _| m.status.clone()).as_deref(), Some("Cancelled."));
+    assert_eq!(photo_count(&app), 2);
+    in_window(&app, cx, |w, cx| m.update(cx, |m, cx| m.remove(Removal::Unavailable, w, cx)));
+    work(cx);
+    settle(&app, cx);
+    click(&app, "ok", cx);
+    work(cx);
+    assert_eq!(m.read_with(cx, |m, _| m.status.clone()).as_deref(), Some("Removed 2 unavailable entries (no files deleted)."));
+    assert_eq!(photo_count(&app), 0);
+    app.wired.model.read_with(cx, |m, _| assert_eq!(m.catalog.as_ref().unwrap().photo_count, 0, "the model re-read"));
+
+    in_window(&app, cx, |w, cx| m.update(cx, |m, cx| m.remove(Removal::Empty, w, cx)));
+    work(cx);
+    assert_eq!(m.read_with(cx, |m, _| m.status.clone()).as_deref(), Some("No empty (0-byte) photos found."));
+
+    m.update(cx, |m, cx| m.compact(cx));
+    assert!(m.read_with(cx, |m, _| m.busy));
+    work(cx);
+    let line = m.read_with(cx, |m, _| m.status.clone()).unwrap();
+    assert!(line.starts_with("Compacted: ") || line.starts_with("Already compact ("), "{line}");
+}
+
+/// **Forced interleaving.** Compact's worker finishes, the catalog switches, then its result
+/// reaches the UI thread: Preferences rebuilt the tab for the new catalog, and the old
+/// section's result is dropped — it never says the new catalog was compacted.
+#[gpui_kit::test]
+fn a_result_from_before_a_catalog_switch_is_dropped(cx: &mut TestAppContext) {
+    let dir = TempDir::new("prefs-switch");
+    let app = start(cx);
+    open_catalog(&app, &dir, cx);
+    let p = open(&app, cx);
+    let old = maintenance(&p, cx);
+    old.update(cx, |m, cx| m.compact(cx));
+    assert_eq!(work_once(cx), 1, "the worker ran; its result waits for the UI thread");
+    // A real switch, and the model hears `catalog:switched` before anything else runs.
+    chairphoto_core::app::catalogs::switch_catalog_in(
+        &app.state,
+        Some(&dir.0.join("registry")),
+        &dir.0.join("other/other.chairphoto"),
+        &dir.0.join("other"),
+        true,
+        None,
+    )
+    .unwrap();
+    app.wired.model.update(cx, |m, cx| m.on_core_event(&CoreEvent::CatalogSwitched("other".into()), cx));
+    work(cx);
+    let new = maintenance(&p, cx);
+    assert_ne!(new.entity_id(), old.entity_id(), "the tab was rebuilt for the new catalog");
+    assert_eq!(new.read_with(cx, |m, _| m.status.clone()), None);
+    assert_eq!(
+        old.read_with(cx, |m, _| m.status.clone()).as_deref(),
+        Some("Compacting the catalog… this can take a moment."),
+        "the old catalog's result landed"
+    );
+}
+
+/// Safety counts the library; "Show me" filters the grid to the bucket and closes
+/// Preferences.
+#[gpui_kit::test]
+fn safety_show_me_filters_to_the_bucket(cx: &mut TestAppContext) {
+    let dir = TempDir::new("prefs-safety");
+    let app = start(cx);
+    open_catalog_with_photos(&app, &dir, 3, cx);
+    let p = open(&app, cx);
+    let s = safety(&p, cx).read_with(cx, |s, _| s.summary.clone()).expect("counted");
+    assert_eq!(s.at_risk + s.missing + s.unverified + s.stale + s.safe, 3, "{s:?}");
+    if s.at_risk == 0 {
+        panic!("photos with only a local copy are at risk: {s:?}");
+    }
+    click(&app, "safety-show-at-risk", cx);
+    assert_eq!(app.wired.shell.read_with(cx, |s, _| s.library.scope().storage_tier), StorageTier::AtRisk);
+    use gpui_kit::component::WindowExt as _;
+    assert!(!cx.update_window(app.window(), |_, window, cx| window.has_active_dialog(cx)).unwrap(), "Preferences closed");
+}
+
+// --- tags -------------------------------------------------------------------------------------
+
+/// Tidy drops an implied ancestor; duplicates list a look-alike pair and its merge says where
+/// the merge lives; unused tags list, a leaf deletes at once and a branch asks first.
+#[gpui_kit::test]
+fn tag_maintenance_tidies_finds_and_deletes(cx: &mut TestAppContext) {
+    let dir = TempDir::new("prefs-tags");
+    let app = start(cx);
+    let ids = open_catalog_with_photos(&app, &dir, 1, cx);
+    {
+        let guard = app.state.catalog.lock().unwrap();
+        let c = guard.as_ref().unwrap();
+        let harbor = c.create_tag("Harbor").unwrap();
+        let marina = c.create_tag("Harbor/Marina").unwrap();
+        c.conn()
+            .execute("INSERT INTO photo_tags(photo_id, tag_id, created_at) VALUES(?1, ?2, 0), (?1, ?3, 0)", (ids[0], harbor, marina))
+            .unwrap();
+        c.create_tag("Sunset").unwrap();
+        c.create_tag("Sunsets").unwrap();
+        c.create_tag("Empty/Leaf").unwrap();
+    }
+    let p = open(&app, cx);
+    tab(&app, "prefs-tab-tags", cx);
+    let t = tags(&p, cx);
+
+    click(&app, "tags-tidy", cx);
+    work(cx);
+    assert_eq!(t.read_with(cx, |t, _| t.status.clone()).as_deref(), Some("Removed 1 redundant tag(s)."));
+
+    click(&app, "tags-find-duplicates", cx);
+    assert!(t.read_with(cx, |t, _| t.busy.is_some()), "Looking…");
+    work(cx);
+    let pairs = t.read_with(cx, |t, _| t.duplicates.clone()).expect("found");
+    let i = pairs.iter().position(|p| [&p.a_path, &p.b_path].iter().all(|x| x.starts_with("Sunset"))).expect("Sunset/Sunsets");
+    let merge: &'static str = Box::leak(format!("tags-merge-a-{i}").into_boxed_str());
+    click(&app, merge, cx);
+    assert_eq!(t.read_with(cx, |t, _| t.status.clone()), Some(crate::model::not_yet_ported_line("Merge tags", 107)));
+
+    click(&app, "tags-find-unused", cx);
+    work(cx);
+    let orphans = t.read_with(cx, |t, _| t.orphans.clone()).expect("found");
+    let leaf = orphans.iter().find(|o| o.path == "Sunsets").expect("an unused leaf").id;
+    let branch = orphans.iter().find(|o| o.path == "Empty").expect("an empty branch");
+    assert!(branch.has_children);
+    let branch = branch.id;
+    in_window(&app, cx, |w, cx| t.update(cx, |t, cx| t.delete(leaf, w, cx)));
+    work(cx);
+    assert_eq!(t.read_with(cx, |t, _| t.status.clone()).as_deref(), Some("Deleted Sunsets."));
+    in_window(&app, cx, |w, cx| t.update(cx, |t, cx| t.delete(branch, w, cx)));
+    settle(&app, cx);
+    click(&app, "cancel", cx);
+    work(cx);
+    assert!(t.read_with(cx, |t, _| t.orphans.as_ref().unwrap().iter().any(|o| o.id == branch)), "Cancel kept the branch");
+    in_window(&app, cx, |w, cx| t.update(cx, |t, cx| t.delete(branch, w, cx)));
+    settle(&app, cx);
+    click(&app, "ok", cx);
+    work(cx);
+    assert_eq!(t.read_with(cx, |t, _| t.status.clone()).as_deref(), Some("Deleted Empty."));
+    let left: i64 = app
+        .state
+        .catalog
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .conn()
+        .query_row("SELECT COUNT(*) FROM tags WHERE full_path LIKE 'Empty%' OR full_path = 'Sunsets'", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(left, 0, "the branch went with its sub-tag");
+}
+
+// --- editors ----------------------------------------------------------------------------------
+
+/// Editors: a path override saves under React's key and re-checks availability; RapidRAW's
+/// format saves. Darkroom: the stored values load; the cache size normalises and saves; preload,
+/// white balance and render timing save React's values.
+#[gpui_kit::test]
+fn editors_and_darkroom_save_reacts_keys(cx: &mut TestAppContext) {
+    let dir = TempDir::new("prefs-editors");
+    let app = start(cx);
+    open_catalog(&app, &dir, cx);
+    put_setting(&app, "develop.preloadNeighbours", "0");
+    put_setting(&app, "metrics.exportParity", "{\"checked\":2,\"differing\":0}");
+    put_setting(&app, "editor.renderTiming", "1");
+    put_setting(&app, "editor.renderTiming.lastSummary", "p50 12 ms");
+    let p = open(&app, cx);
+    tab(&app, "prefs-tab-editors", cx);
+    let (e, d) = editors(&p, cx);
+
+    let keys: Vec<String> = e.read_with(cx, |e, _| e.paths.iter().map(|p| p.key.clone()).collect());
+    assert!(keys.iter().any(|k| k == "darktable"), "{keys:?}");
+    e.update(cx, |e, cx| e.save("darktable", "gui", " /nonexistent/darktable-gui ".into(), cx));
+    work(cx);
+    assert_eq!(setting(&app, "editor.darktable.gui").as_deref(), Some("/nonexistent/darktable-gui"));
+    e.read_with(cx, |e, _| {
+        assert_eq!(e.status.as_deref(), Some("Saved."));
+        assert!(e.editors.iter().find(|x| x.key == "darktable").unwrap().gui, "re-checked: an override counts as configured");
+    });
+    e.update(cx, |e, cx| e.set_rapidraw_format("png", cx));
+    work(cx);
+    assert_eq!(setting(&app, "editor.rapidraw.format").as_deref(), Some("png"));
+
+    d.read_with(cx, |d, cx| {
+        assert_eq!(d.gb.read(cx).value(), "20", "the default size");
+        assert_eq!(d.preload, Some(false));
+        assert_eq!(d.wb, Some(WbPrefer::Kelvin));
+        assert_eq!(d.timing, Some(true));
+        assert_eq!(d.last_summary, "p50 12 ms");
+        assert_eq!(d.usage.is_some(), true);
+        assert!(d.parity.as_deref().unwrap().contains("2 RAW exports checked, none differed"));
+    });
+    assert!(d.read_with(cx, |d, _| d.timing == Some(true) && !d.last_summary.is_empty()), "the summary line shows");
+    let gb = d.read_with(cx, |d, _| d.gb.clone());
+    set_input(&app, &gb, "abc", cx);
+    cx.update_window(app.window(), |_, window, cx| d.update(cx, |d, cx| d.save_gb(window, cx))).unwrap();
+    work(cx);
+    assert_eq!(gb.read_with(cx, |i, _| i.value().to_string()), "20", "an invalid size is the default");
+    assert_eq!(setting(&app, "develop.decodeCacheGb").as_deref(), Some("20"));
+    set_input(&app, &gb, "2.5", cx);
+    cx.update_window(app.window(), |_, window, cx| d.update(cx, |d, cx| d.save_gb(window, cx))).unwrap();
+    work(cx);
+    assert_eq!(setting(&app, "develop.decodeCacheGb").as_deref(), Some("2.5"));
+
+    d.update(cx, |d, cx| d.set_preload(true, cx));
+    work(cx);
+    assert_eq!(setting(&app, "develop.preloadNeighbours").as_deref(), Some("1"));
+    d.update(cx, |d, cx| d.set_wb(WbPrefer::Relative, cx));
+    work(cx);
+    assert_eq!(setting(&app, "develop.wbSlider").as_deref(), Some("relative"));
+    d.update(cx, |d, cx| d.set_timing(false, cx));
+    work(cx);
+    assert_eq!(setting(&app, "editor.renderTiming").as_deref(), Some("0"));
+    assert_eq!(d.read_with(cx, |d, _| d.timing), Some(false));
+}
+
+// --- appearance -------------------------------------------------------------------------------
+
+/// Appearance: Standard paints Standard and hides the status line; Follow shows what is
+/// followed (no Omarchy here). The mode is the per-machine preference, not a catalog setting.
+#[gpui_kit::test]
+fn appearance_switches_the_mode_per_machine(cx: &mut TestAppContext) {
+    use crate::machine_prefs::MachinePrefs;
+    use crate::theme::{AppearanceMode, MODE_PREF};
+    let dir = TempDir::new("prefs-appearance");
+    let app = start(cx);
+    open_catalog(&app, &dir, cx);
+    open(&app, cx);
+    tab(&app, "prefs-tab-appearance", cx);
+    assert!(present(&app, "appearance-status", cx), "following: the status line");
+    click(&app, "appearance-standard", cx);
+    assert_eq!(cx.update(|cx| crate::theme::mode(cx)), AppearanceMode::Standard);
+    assert_eq!(cx.update(|cx| MachinePrefs::read(cx, MODE_PREF)).as_deref(), Some("standard"));
+    assert_eq!(setting(&app, MODE_PREF), None, "not a catalog setting");
+    assert!(!present(&app, "appearance-status", cx));
+    click(&app, "appearance-follow", cx);
+    cx.run_until_parked();
+    assert_eq!(cx.update(|cx| crate::theme::mode(cx)), AppearanceMode::FollowOmarchy);
+    assert!(present(&app, "appearance-status", cx));
+}

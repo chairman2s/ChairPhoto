@@ -13,9 +13,9 @@
 //!
 //! **Not persisted yet.** React kept the layout in localStorage (`panel.leftW`,
 //! `panel.rightW`, `panel.leftHidden`, `panel.rightHidden`, `panel.thumbSize`,
-//! `panel.inspectorTab`, `panel.section.*`). The GPUI app has no per-machine settings store
-//! yet (the same gap as the appearance mode, `theme/mod.rs`; Preferences, #113), so these
-//! start at React's defaults each launch.
+//! `panel.inspectorTab`, `panel.section.*`). The per-machine store for them exists now
+//! ([`crate::machine_prefs::MachinePrefs`], #113, which holds the appearance mode), but these
+//! keys are not written to it yet, so they start at React's defaults each launch.
 
 use crate::model::{AppModel, AppModelEvent, DeepLinkTarget};
 use chairphoto_core::app::{with_catalog, AppState, CoreEvent};

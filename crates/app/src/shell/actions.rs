@@ -5,7 +5,7 @@
 //!
 //! - **Ported** — the shell does them itself ([`crate::shell::ShellState`]): panel
 //!   toggles, the cache-previews toggle, widening to all photos, clearing the selection; and
-//!   the module registry's dialogs (the Modules panel, the Publish dialog, [`crate::modules`]).
+//!   the Publish dialog ([`crate::modules`]); Preferences ([`crate::preferences`], #113);
 //!   Storage and import's (#114), which the root view hands to `crate::storage`.
 //! - **Not yet ported** — the feature's surface belongs to a later ticket. Its menu item or
 //!   button still dispatches a real action, and [`crate::model::AppModel::not_yet_ported`]
@@ -31,9 +31,8 @@ actions!(
         ShowLibrary,
         /// The bench's ✕: clear the selection.
         ClearSelection,
-        /// More ⋯ → Modules…: the Modules panel (module registry, #122), until Preferences
-        /// (#113) takes it in as its Modules tab.
-        OpenModules,
+        /// More ⋯ → Preferences…, and the rail's gear: Preferences (#113), on its Storage tab.
+        OpenPreferences,
         /// The bench's Publish: the Publish dialog over the enabled modules' publish targets.
         PublishSelection,
         // Storage and import (#114, `crate::storage`):
@@ -55,8 +54,6 @@ actions!(
         OpenTrash,
         /// The bench's Back up.
         BackUpSelection,
-        /// More ⋯ → Storage volumes… (Preferences → Storage mounts the same panel, #113).
-        OpenVolumes,
         /// More ⋯ → Analyse burst sharpness, and the bench's Analyse: over the selection,
         /// else the whole view (`ShellState::analyse_burst`).
         AnalyseBurst,
@@ -107,8 +104,6 @@ not_yet_ported! {
     ToggleLoupe => ("Loupe", 109),
     /// More ⋯ → Start cull session, and the bench's Cull.
     StartCullSession => ("Start cull session", 109),
-    /// More ⋯ → Preferences…, and the rail's gear.
-    OpenPreferences => ("Preferences", 113),
     /// The bench's Compare (C in the grid).
     OpenCompare => ("Compare", 109),
     /// The icon rail's Develop.

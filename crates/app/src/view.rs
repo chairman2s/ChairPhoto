@@ -22,7 +22,7 @@
 //! the stage as `Surface::Module(id)` (the shell falls back to the Library when that module is
 //! disabled); sidebar panels render under the collection browser's sections, inspector panels
 //! on the inspector's tags tab; their actions are More ⋯ → Modules, their publish targets the
-//! Publish dialog, their settings panels the Modules panel.
+//! Publish dialog, their settings panels a Preferences tab each (`crate::preferences`).
 
 use crate::keymap::{contexts, ReloadTheme};
 use crate::image_store::ImageStore;
@@ -57,7 +57,7 @@ pub struct RootView {
     pub(crate) modules: Entity<ModuleRegistry>,
     /// Storage and import (#114): its jobs and dialogs.
     pub(crate) storage: Entity<StorageState>,
-    /// The open storage dialog's close request (`crate::storage::open`).
+    /// The open storage or Preferences dialog's close request (`crate::storage::open`).
     pub(crate) dialog_close: Option<Subscription>,
     pub(crate) focus: FocusHandle,
     pub(crate) thumb_slider: Entity<SliderState>,
@@ -156,16 +156,9 @@ impl RootView {
         &self.library
     }
 
-    /// Re-read the system theme off the UI thread and apply it.
+    /// Re-read the system theme off the UI thread; it paints when following.
     fn reload_theme(&mut self, cx: &mut Context<Self>) {
-        let read = cx
-            .background_executor()
-            .spawn(async { chairphoto_core::appearance::read_current_theme() });
-        cx.spawn(async move |_, cx| {
-            let result = read.await;
-            cx.update(|cx| crate::theme::apply_system_theme(&result, cx));
-        })
-        .detach();
+        crate::theme::reread_system_theme(cx);
     }
 
     fn on_mouse_move(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
@@ -397,8 +390,8 @@ impl Render for RootView {
             }))
             .on_action(cx.listener(|this, _: &ShowLibrary, _, cx| this.shell.update(cx, |s, cx| s.show_library(cx))))
             .on_action(cx.listener(|this, _: &ClearSelection, _, cx| this.shell.update(cx, |s, cx| s.clear_selection(cx))))
-            .on_action(cx.listener(|this, _: &OpenModules, window, cx| {
-                module_panel::open_modules_panel(&this.modules, window, cx)
+            .on_action(cx.listener(|this, _: &OpenPreferences, window, cx| {
+                this.open_preferences(crate::preferences::Tab::Storage, window, cx)
             }))
             .on_action(cx.listener(|this, _: &PublishSelection, window, cx| {
                 module_panel::open_publish_dialog(&this.modules, window, cx)
@@ -409,7 +402,6 @@ impl Render for RootView {
             .on_action(cx.listener(|this, _: &ImportBundle, window, cx| this.open_import_bundle(window, cx)))
             .on_action(cx.listener(|this, _: &OpenIdentityDebt, window, cx| this.open_identity_debt(window, cx)))
             .on_action(cx.listener(|this, _: &OpenTrash, window, cx| this.open_trash(window, cx)))
-            .on_action(cx.listener(|this, _: &OpenVolumes, window, cx| this.open_volumes(window, cx)))
             .on_action(cx.listener(|this, _: &RescanLibrary, _, cx| this.storage.update(cx, |s, cx| s.rescan(cx))))
             .on_action(cx.listener(|this, _: &Reconcile, _, cx| this.storage.update(cx, |s, cx| s.run_reconcile(cx))))
             .on_action(cx.listener(|this, _: &CancelImport, _, cx| this.storage.update(cx, |s, cx| s.cancel_import(cx))))

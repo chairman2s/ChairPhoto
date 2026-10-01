@@ -215,8 +215,8 @@ pub struct PublishTarget {
     pub view: ViewFactory,
 }
 
-/// A module's settings section (`SettingsPanel`), shown under the module in the Modules panel
-/// (Preferences, #113, gives each its tab).
+/// A module's settings section (`SettingsPanel`), shown on the module's Preferences tab
+/// (`crate::preferences`), which an enabled module with settings gets.
 #[derive(Clone)]
 pub struct SettingsPanel {
     pub id: SharedString,

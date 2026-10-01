@@ -4,10 +4,10 @@
 //! **Modules panel.** One row per registered module, in registration order: name,
 //! description, "Requires: …" (an unavailable requirement marked), "backend … not included
 //! in this build", any other reason it cannot be enabled, and the enabled checkbox (disabled
-//! while blocked). An enabled module's settings panels render under its row until
-//! Preferences (#113) gives each module its own tab and takes this panel in as its Modules
-//! tab. Dropped from React (parity.md, #104): the external-modules section, the install hint,
-//! versions, and the permission and network-access review.
+//! while blocked). It is Preferences → Modules ([`crate::preferences`], #113), which gives
+//! each enabled module's settings panels a tab of their own. Dropped from React (parity.md,
+//! #104): the external-modules section, the install hint, versions, and the permission and
+//! network-access review.
 
 use super::registry::{ModuleRegistry, SlotView};
 use super::PanelSlot;
@@ -17,14 +17,8 @@ use gpui_kit::component::{Disableable as _, WindowExt as _};
 use gpui_kit::prelude::*;
 use gpui_kit::{div, px, AnyElement, App, Context, Entity, FontWeight, SharedString, Subscription, TestSupportExt as _, Window};
 
-/// The Modules panel's width in its dialog.
+/// The Publish dialog's width.
 const PANEL_W: f32 = 560.;
-
-/// Open the Modules panel in a dialog.
-pub fn open_modules_panel(registry: &Entity<ModuleRegistry>, window: &mut Window, cx: &mut App) {
-    let panel = cx.new(|cx| ModulesPanel::new(registry.clone(), cx));
-    window.open_dialog(cx, move |dialog, _, _| dialog.title("Modules").w(px(PANEL_W)).child(panel.clone()));
-}
 
 /// Open the Publish dialog over the enabled modules' publish targets.
 pub fn open_publish_dialog(registry: &Entity<ModuleRegistry>, window: &mut Window, cx: &mut App) {
@@ -47,7 +41,7 @@ impl ModulesPanel {
 }
 
 impl Render for ModulesPanel {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = Colors::get(cx);
         let rows = self.registry.read(cx).list();
         let mut list = div().id("modules-panel").flex().flex_col().gap(px(10.)).text_size(px(12.));
@@ -55,7 +49,6 @@ impl Render for ModulesPanel {
             return list.child(div().text_color(colors.mute).child("No modules in this build.")).into_any_element();
         }
         for m in rows {
-            let settings = if m.enabled { ModuleRegistry::settings_views(&self.registry, &m.id, window, cx) } else { Vec::new() };
             let blocked = !m.enabled && m.blocked_reason.is_some();
             let registry = self.registry.clone();
             let id = m.id.clone();
@@ -106,7 +99,6 @@ impl Render for ModulesPanel {
                 .border_b_1()
                 .border_color(colors.line)
                 .child(div().flex().flex_row().items_start().gap(px(12.)).child(info).child(div().flex_none().child(toggle)))
-                .children(settings.into_iter().map(|view| div().pl(px(12.)).child(view)))
                 .test_support();
             list = list.child(row);
         }
@@ -129,7 +121,7 @@ impl Render for PublishDialog {
                 .child(
                     div()
                         .text_color(colors.mute)
-                        .child("Enable a publishing module (Instagram, Flickr, SmugMug) in Modules first."),
+                        .child("Enable a publishing module (Instagram, Flickr, SmugMug) in Preferences → Modules first."),
                 )
                 .into_any_element();
         }

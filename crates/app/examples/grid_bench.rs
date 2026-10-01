@@ -149,11 +149,8 @@ fn main() {
     let state2: AppState = state.clone();
 
     gpui_kit::application().with_assets(chairphoto_app::assets::Assets).run(move |cx| {
-        let options = WireOptions {
-            on_exit: Rc::new(chairphoto_core::crash_marker::clean_exit),
-            open_default_catalog: synthetic.is_none(),
-            unthrottled: true,
-        };
+        let options =
+            WireOptions { open_default_catalog: synthetic.is_none(), unthrottled: true, ..WireOptions::production() };
         let wired = wire(cx, state2, events_rx, Some(boot.pool.clone()), &initial_theme, options);
         let handle = wired.main_window.clone().expect("main window");
         // Weak: a frame callback still pending at exit must not keep the entities alive

@@ -36,6 +36,7 @@ pub mod metadata;
 pub mod oauth1;
 pub mod phash;
 pub mod phash_indexer;
+pub mod photo_signals;
 pub mod plugins;
 pub mod rapidraw;
 #[cfg(feature = "raw")]

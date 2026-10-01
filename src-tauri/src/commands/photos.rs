@@ -112,23 +112,16 @@ pub fn get_iptc(state: State<'_, AppState>, photo_id: i64) -> Result<IptcFields,
 
 /// Save a photo's authored IPTC fields to the catalog AND write them to the photo's
 /// XMP sidecar (merge-safe — preserves darktable/other data). The sidecar is written
-/// next to the original file resolved by the location resolver.
+/// next to the original file resolved by the location resolver (`app::iptc::save_iptc`, on
+/// a blocking worker).
 #[tauri::command]
 pub async fn set_iptc(
     state: State<'_, AppState>,
     photo_id: i64,
     fields: IptcFields,
 ) -> Result<(), String> {
-    // Persist under the catalog lock, then write the sidecar off it. The XMP write is a
-    // read-modify-write of an XML document — far too slow to hold the catalog mutex (or
-    // the main thread) across.
-    let stored = fields.clone();
-    let original = with_catalog_blocking(&state, move |c| {
-        c.set_iptc(photo_id, &stored)?;
-        c.require_photo_path(photo_id)
-    })
-    .await?;
-    crate::app::spawn_blocking(move || crate::xmp::write_iptc(&original, &fields))
+    let state = state.inner().clone();
+    crate::app::spawn_blocking(move || crate::app::iptc::save_iptc(&state, photo_id, &fields))
         .await
         .map_err(|e| e.to_string())?
 }
@@ -144,10 +137,7 @@ pub fn rotate_photo(
     photo_id: i64,
     delta: i64,
 ) -> Result<i64, String> {
-    with_catalog(&state, |c| {
-        let current = c.photo_rotation(photo_id)?;
-        c.set_photo_rotation(photo_id, current + delta)
-    })
+    with_catalog(&state, |c| c.rotate_photo(photo_id, delta))
 }
 
 /// The photos stacked under `photo_id` (e.g. a camera JPEG under its RAW).

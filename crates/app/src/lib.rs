@@ -38,6 +38,7 @@ pub mod darkroom;
 pub mod desktop;
 pub mod events;
 pub mod image_store;
+pub mod inspector;
 pub mod keymap;
 pub mod launch;
 pub mod library;

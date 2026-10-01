@@ -1002,6 +1002,13 @@ impl Catalog {
         Ok(norm)
     }
 
+    /// Turn a photo's orientation override by `delta` degrees clockwise (±90, 180) and
+    /// return the new absolute rotation (0/90/180/270). The inspector's Orientation buttons.
+    pub fn rotate_photo(&self, photo_id: i64, delta: i64) -> Result<i64> {
+        let current = self.photo_rotation(photo_id)?;
+        self.set_photo_rotation(photo_id, current + delta)
+    }
+
     // --- RAW + JPEG stacking ---------------------------------------------------
     // A derivative photo (e.g. the camera JPEG) is stacked under its master (the RAW)
     // via `photos.stack_parent_id`. Children are hidden from the main grid (see
@@ -2478,5 +2485,19 @@ mod tests {
         assert_eq!(by_path["Animals/Dogs"], 1, "3; 5 is trashed");
         assert_eq!(by_path["Places"], 0);
         assert_eq!(animals, fast[0].tag.id, "path order: Animals first");
+    }
+
+    /// The Orientation buttons turn relative to the stored override and wrap at 360°.
+    #[test]
+    fn rotate_photo_turns_relative_to_the_override_and_wraps() {
+        let dir = crate::test_support::TestTmpDir::new("rotate-photo");
+        let root = dir.join("photos");
+        std::fs::create_dir_all(&root).unwrap();
+        let c = Catalog::open(&dir.join("test.chairphoto"), &root).unwrap();
+        let id = c.upsert_photo(&root.join("a.ARW"), None, 0, 1).unwrap().id;
+        assert_eq!(c.rotate_photo(id, -90).unwrap(), 270);
+        assert_eq!(c.rotate_photo(id, 180).unwrap(), 90);
+        assert_eq!(c.rotate_photo(id, 90).unwrap(), 180);
+        assert_eq!(c.photo_rotation(id).unwrap(), 180);
     }
 }

@@ -28,7 +28,7 @@ use crate::app::{AppState, CoreEvent, EventSink};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -45,26 +45,40 @@ const DEFAULT_FORMAT: &str = "tiff";
 /// completion feel responsive without busy-spinning.
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
 
+/// One in-flight round-trip in the cancel registry: its job id and its abandon flag.
+struct InFlight {
+    job_id: u64,
+    flag: Arc<AtomicBool>,
+}
+
 /// Registry of per-photo cancel flags for in-flight RapidRAW watchers. A `cancel_rapidraw`
 /// command trips the flag for a photo; the watcher loop checks it each tick. Kept module-local
 /// (rather than on `AppState`) so this feature is self-contained.
-fn cancels() -> &'static Mutex<HashMap<i64, Arc<AtomicBool>>> {
-    static CANCELS: OnceLock<Mutex<HashMap<i64, Arc<AtomicBool>>>> = OnceLock::new();
+fn cancels() -> &'static Mutex<HashMap<i64, InFlight>> {
+    static CANCELS: OnceLock<Mutex<HashMap<i64, InFlight>>> = OnceLock::new();
     CANCELS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// Install a fresh cancel flag for `photo_id` and return it, or `None` if an edit for this
-/// photo is already in flight. Rejecting the second edit (rather than replacing the entry)
+/// A fresh job id for [`edit_in_rapidraw_as`]. Ids are process-wide and never reused, so a
+/// round-trip's events and its cancel can be told apart from any other's — including one
+/// started on the same photo id in another catalog.
+pub fn next_job_id() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Install a fresh cancel flag for `photo_id` (owned by `job_id`) and return it, or `None` if
+/// an edit for this photo is already in flight. Rejecting the second edit (rather than replacing the entry)
 /// keeps each worker's `clear_cancel` unambiguous — otherwise the first worker's clear would
 /// drop the second's flag, leaving the second watcher uncancellable. It also matches RapidRAW's
 /// single-instance nature: a second launch on the same photo forwards into the first anyway.
-fn register_cancel(photo_id: i64) -> Option<Arc<AtomicBool>> {
+fn register_cancel(photo_id: i64, job_id: u64) -> Option<Arc<AtomicBool>> {
     use std::collections::hash_map::Entry;
     match cancels().lock().unwrap().entry(photo_id) {
         Entry::Occupied(_) => None,
         Entry::Vacant(v) => {
             let flag = Arc::new(AtomicBool::new(false));
-            v.insert(flag.clone());
+            v.insert(InFlight { job_id, flag: flag.clone() });
             Some(flag)
         }
     }
@@ -140,14 +154,22 @@ pub fn rapidraw_available(state: &AppState) -> Result<RapidRawStatus, String> {
 #[serde(rename_all = "camelCase")]
 pub struct RapidRawProgress {
     pub photo_id: i64,
+    /// The round-trip this event belongs to ([`next_job_id`]): a front end drops events of a
+    /// job it does not follow (a superseded one, or one from before a catalog switch).
+    pub job_id: u64,
     /// editing | waiting | importing | done | error | cancelled
     pub phase: String,
     /// Human-readable detail (error text, or the output path being watched).
     pub message: String,
 }
 
-fn emit(state: &AppState, photo_id: i64, phase: &str, message: &str) {
-    state.send(CoreEvent::RapidRawProgress(RapidRawProgress { photo_id, phase: phase.into(), message: message.into() }));
+fn emit(state: &AppState, photo_id: i64, job_id: u64, phase: &str, message: &str) {
+    state.send(CoreEvent::RapidRawProgress(RapidRawProgress {
+        photo_id,
+        job_id,
+        phase: phase.into(),
+        message: message.into(),
+    }));
 }
 
 /// Everything needed to run a round-trip, resolved under a brief catalog lock so the long
@@ -366,13 +388,20 @@ pub fn run_roundtrip(
 ///
 /// Returns the new stacked child's id on success, or `None` if the wait was cancelled.
 pub async fn edit_in_rapidraw(state: AppState, photo_id: i64) -> Result<Option<i64>, String> {
+    edit_in_rapidraw_as(state, photo_id, next_job_id()).await
+}
+
+/// [`edit_in_rapidraw`] under a job id the caller chose ([`next_job_id`]), so it can follow
+/// the job's `rapidraw:progress` events from the first one and cancel exactly this job
+/// ([`cancel_rapidraw_job`]).
+pub async fn edit_in_rapidraw_as(state: AppState, photo_id: i64, job_id: u64) -> Result<Option<i64>, String> {
     let r = resolve(&state, photo_id)?;
-    let cancel = register_cancel(photo_id)
+    let cancel = register_cancel(photo_id, job_id)
         .ok_or("This photo is already being edited in RapidRAW — finish or cancel that edit first")?;
     let state2 = state.clone();
 
     let joined = crate::app::spawn_blocking(move || {
-        run_roundtrip(&r, &cancel, &|phase, message| emit(&state2, photo_id, phase, message))
+        run_roundtrip(&r, &cancel, &|phase, message| emit(&state2, photo_id, job_id, phase, message))
     })
     .await;
 
@@ -382,9 +411,9 @@ pub async fn edit_in_rapidraw(state: AppState, photo_id: i64) -> Result<Option<i
     clear_cancel(photo_id);
     let result = joined.map_err(|e| e.to_string())?;
     match &result {
-        Ok(None) => emit(&state, photo_id, "cancelled", ""),
+        Ok(None) => emit(&state, photo_id, job_id, "cancelled", ""),
         Ok(Some(_)) => {} // "done" already emitted from the worker
-        Err(e) => emit(&state, photo_id, "error", e),
+        Err(e) => emit(&state, photo_id, job_id, "error", e),
     }
     result
 }
@@ -393,8 +422,20 @@ pub async fn edit_in_rapidraw(state: AppState, photo_id: i64) -> Result<Option<i
 /// abandons the wait (used both to give up on a forwarded session and to resolve the
 /// "closed without Done" case, which the app can't distinguish from forwarding).
 pub fn cancel_rapidraw(photo_id: i64) -> Result<(), String> {
-    if let Some(flag) = cancels().lock().map_err(|e| e.to_string())?.get(&photo_id) {
-        flag.store(true, Ordering::Relaxed);
+    if let Some(in_flight) = cancels().lock().map_err(|e| e.to_string())?.get(&photo_id) {
+        in_flight.flag.store(true, Ordering::Relaxed);
+    }
+    Ok(())
+}
+
+/// [`cancel_rapidraw`], only if `job_id` is the round-trip in flight for `photo_id`: a front
+/// end that followed one job cannot cancel another (one started later, or on the same photo
+/// id in another catalog).
+pub fn cancel_rapidraw_job(photo_id: i64, job_id: u64) -> Result<(), String> {
+    if let Some(in_flight) = cancels().lock().map_err(|e| e.to_string())?.get(&photo_id) {
+        if in_flight.job_id == job_id {
+            in_flight.flag.store(true, Ordering::Relaxed);
+        }
     }
     Ok(())
 }
@@ -448,10 +489,10 @@ mod tests {
         clear_cancel(pid); // ensure a clean slate regardless of test order
 
         // First edit registers a flag.
-        let first = register_cancel(pid).expect("first edit registers a cancel flag");
+        let first = register_cancel(pid, 1).expect("first edit registers a cancel flag");
         // A second edit for the SAME photo is rejected — it must NOT overwrite the entry
         // (otherwise the first worker's clear_cancel would drop the second's flag).
-        assert!(register_cancel(pid).is_none(), "a second in-flight edit must be rejected");
+        assert!(register_cancel(pid, 2).is_none(), "a second in-flight edit must be rejected");
 
         // cancel_rapidraw still targets the (single) in-flight flag.
         cancel_rapidraw(pid).unwrap();
@@ -459,7 +500,22 @@ mod tests {
 
         // Once the first worker clears its entry, a fresh edit can register again.
         clear_cancel(pid);
-        assert!(register_cancel(pid).is_some(), "after clear, a new edit registers");
+        assert!(register_cancel(pid, 3).is_some(), "after clear, a new edit registers");
+        clear_cancel(pid);
+    }
+
+    #[test]
+    fn cancel_by_job_trips_only_the_job_in_flight() {
+        let pid = 987_654_322;
+        clear_cancel(pid);
+        let (old, new) = (next_job_id(), next_job_id());
+        assert_ne!(old, new, "job ids are never reused");
+        let flag = register_cancel(pid, new).expect("registers");
+
+        cancel_rapidraw_job(pid, old).unwrap();
+        assert!(!flag.load(Ordering::Relaxed), "another job's cancel must not trip this one");
+        cancel_rapidraw_job(pid, new).unwrap();
+        assert!(flag.load(Ordering::Relaxed), "its own job id cancels it");
         clear_cancel(pid);
     }
 

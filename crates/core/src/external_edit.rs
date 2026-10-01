@@ -222,7 +222,7 @@ fn emit(state: &AppState, phase: &str, editor: &str) {
     state.send(CoreEvent::DevelopProgress(DevelopProgress { phase: phase.into(), editor: editor.into() }));
 }
 
-#[derive(serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AvailableEditor {
     /// The editor's key: `editor.<key>.gui` / `editor.<key>.cli` hold its path overrides.

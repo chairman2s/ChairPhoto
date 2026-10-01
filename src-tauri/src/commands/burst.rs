@@ -14,7 +14,7 @@ use tauri::State;
 
 // ── H16e — Burst-relative sharpness flagging ─────────────────────────────────
 
-pub use crate::burst_analysis::{BurstAnalysisResult, BURST_SOFT_THRESHOLD_DEFAULT, BURST_SOFT_THRESHOLD_KEY};
+pub use crate::burst_analysis::BurstAnalysisResult;
 
 /// Analyse burst-relative sharpness for a set of photos (H16e); see
 /// `burst_analysis::analyze_burst_sharpness`, which the GPUI app shares.

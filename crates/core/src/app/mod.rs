@@ -21,6 +21,7 @@ pub mod catalogs;
 pub mod bundles;
 pub mod events;
 pub mod identity;
+pub mod iptc;
 pub mod jobs;
 pub mod scans;
 pub mod storage;

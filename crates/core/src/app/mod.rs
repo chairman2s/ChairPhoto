@@ -234,6 +234,24 @@ pub async fn with_catalog_blocking<T: Send + 'static>(
     .map_err(|e| e.to_string())?
 }
 
+/// Storage status (local-only / backed-up / archived / offline / missing) for many photos at
+/// once — the grid's storage badges. Returns `(photo_id, status)` pairs. Blocking: call it
+/// on a worker.
+///
+/// It locks, releases, stats and locks again: the volume stats run OFF the catalog lock, so
+/// a slow or offline NAS cannot serialize the whole app behind one badge fetch.
+pub fn photo_storage_statuses(
+    state: &AppState,
+    photo_ids: &[i64],
+) -> Result<Vec<(i64, crate::catalog::StorageStatus)>, String> {
+    // 1. Under the lock: the (volume id, base path) pairs (pure SQL, no stats).
+    let pairs = with_catalog(state, |c| c.volume_base_paths())?;
+    // 2. Off the lock: stat (or reuse the cached) reachability.
+    let reachable = state.volume_health.refresh(&pairs);
+    // 3. Back under the lock: derive the statuses from that reachability.
+    with_catalog(state, |c| c.photo_storage_statuses(photo_ids, &reachable))
+}
+
 // ── Shared test helpers (env-var serialization) ───────────────────────────────
 //
 // Several test modules in this crate (this file's submodules, and `appearance`)

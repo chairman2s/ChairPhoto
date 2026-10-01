@@ -47,6 +47,7 @@ pub mod sharpness_regions;
 pub mod slideshow;
 #[cfg(feature = "smugmug")]
 pub mod smugmug;
+pub mod stack_proposals;
 #[cfg(test)]
 mod test_support;
 pub mod thumbnails;

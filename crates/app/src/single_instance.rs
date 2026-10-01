@@ -185,6 +185,27 @@ fn current_uid() -> io::Result<u32> {
     Ok(unsafe { libc::geteuid() })
 }
 
+/// The runtime directory exists but is not safe to coordinate through (someone else's, a
+/// symlink, a file, or writable by others). Unlike an endpoint that simply cannot be made,
+/// this must not degrade to running without single-instance: every launch would then start
+/// on its own against the same catalog (Codex re-check of 9c3c834). See [`is_unsafe_dir`].
+#[derive(Debug)]
+pub struct UnsafeRuntimeDir(String);
+
+impl std::fmt::Display for UnsafeRuntimeDir {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}; remove it (or fix its owner and mode) and start ChairPhoto again", self.0)
+    }
+}
+
+impl std::error::Error for UnsafeRuntimeDir {}
+
+/// Whether `e` is the refusal of an unsafe runtime directory ([`UnsafeRuntimeDir`]), which
+/// the app treats as fatal rather than running without single-instance.
+pub fn is_unsafe_dir(e: &io::Error) -> bool {
+    e.get_ref().is_some_and(|inner| inner.is::<UnsafeRuntimeDir>())
+}
+
 /// Create `dir` (mode 0700) if missing. Refuse it unless it is a real directory (not a
 /// symlink) owned by `uid` that no one else could write; if others could read or search it,
 /// tighten it to `0700`.
@@ -198,7 +219,7 @@ fn ensure_private_dir(dir: &Path, uid: u32) -> io::Result<()> {
     let refuse = |why: &str| {
         io::Error::new(
             ErrorKind::PermissionDenied,
-            format!("{} is not a private directory owned by uid {uid}: {why}", dir.display()),
+            UnsafeRuntimeDir(format!("{} is not a private directory owned by uid {uid}: {why}", dir.display())),
         )
     };
     match std::fs::DirBuilder::new().mode(0o700).create(dir) {
@@ -986,6 +1007,27 @@ mod tests {
         std::fs::set_permissions(&theirs, std::fs::Permissions::from_mode(0o755)).unwrap();
         assert!(ensure_private_dir(&theirs, uid + 1).is_err(), "someone else's directory");
         assert_eq!(mode(&theirs), 0o755, "someone else's directory was changed");
+    }
+
+    /// Every refusal of an unsafe directory is recognisable as one (the app stops on it), and
+    /// an ordinary I/O failure is not (the app may then run without single-instance).
+    #[test]
+    fn an_unsafe_runtime_dir_is_told_apart_from_an_unusable_one() {
+        let dir = TempDir::new("unsafe");
+        let uid = current_uid().unwrap();
+        let writable = dir.0.join("writable");
+        std::fs::create_dir(&writable).unwrap();
+        std::fs::set_permissions(&writable, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let file = dir.0.join("file");
+        std::fs::write(&file, b"").unwrap();
+        for (path, owner) in [(&writable, uid), (&file, uid), (&dir.0, uid + 1)] {
+            let e = ensure_private_dir(path, owner).unwrap_err();
+            assert!(is_unsafe_dir(&e), "{} not told apart: {e}", path.display());
+            assert!(e.to_string().contains("remove it"), "{e}");
+        }
+        let missing_parent = dir.0.join("no/such/parent");
+        let e = ensure_private_dir(&missing_parent, uid).unwrap_err();
+        assert!(!is_unsafe_dir(&e), "an ordinary failure taken for an unsafe dir: {e}");
     }
 
     /// The primary's socket is 0600, whatever mode the umask gave it at bind.

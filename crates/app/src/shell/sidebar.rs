@@ -2,17 +2,20 @@
 //! collection browser column (`CollectionBrowser.tsx`).
 //!
 //! **Rail.** Library; Develop when an editor exists (the `edit` feature) — disabled with
-//! nothing selected, and not ported yet (#111); one button per module main view, in
-//! [`rail_order`] (none until the Module registry, #104); the Preferences gear at the foot.
+//! nothing selected, and not ported yet (#111); one button per enabled module's main view, in
+//! [`rail_order`] (`rail-view-<id>`, [`crate::modules::MainView`]); the Preferences gear at the
+//! foot.
 //!
 //! **Collection browser.** The fixed "library" header with All photos and Trash, then the
 //! collapsible sections — tags, smart albums, albums, import batches — whose panels are later
 //! tickets (Tag panel #107, Albums and export #115, Storage and import #114). Each section
-//! body says which ticket fills it. Below them is the module slot the Module registry
-//! (#104) fills with module panels; it renders nothing while no module contributes.
+//! body says which ticket fills it. Below them, `module-slot-sidebar` holds the enabled
+//! modules' sidebar panels ([`crate::modules::PanelSlot::Sidebar`]); it is empty while no
+//! module contributes one.
 
 use crate::shell::actions::*;
 use crate::shell::state::{Section, ShellState, Surface};
+use crate::modules::MainView;
 use crate::shell::style::{grouped, Colors};
 use crate::view::RootView;
 use gpui_kit::component::{Icon, IconName};
@@ -48,7 +51,13 @@ fn section_placeholder(section: Section) -> &'static str {
 }
 
 impl RootView {
-    pub(crate) fn render_rail(&self, shell: &ShellState, colors: Colors, cx: &Context<Self>) -> AnyElement {
+    pub(crate) fn render_rail(
+        &self,
+        shell: &ShellState,
+        colors: Colors,
+        module_views: Vec<(SharedString, MainView)>,
+        cx: &Context<Self>,
+    ) -> AnyElement {
         let can_develop = cfg!(feature = "edit");
         let develop_enabled = shell.library.selection().active.is_some();
         let item = |id: &'static str, icon: Icon, on: bool, enabled: bool, action: Box<dyn Action>| {
@@ -75,7 +84,38 @@ impl RootView {
                 .when(!enabled, |b| b.opacity(0.4))
                 .test_support()
         };
-        let _ = cx;
+        let ordered = rail_order(&module_views, |(_, v)| v.id.as_ref());
+        let module_items: Vec<AnyElement> = ordered
+            .into_iter()
+            .map(|(_, v)| {
+                let on = matches!(&shell.surface, Surface::Module(id) if id == v.id.as_ref());
+                let view_id = v.id.clone();
+                let label = v.label.clone();
+                let icon = v.icon.clone().unwrap_or_else(|| Icon::new(IconName::LayoutDashboard));
+                div()
+                    .id(SharedString::from(format!("rail-view-{}", v.id)))
+                    .relative()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .size(px(34.))
+                    .rounded(px(9.))
+                    .cursor_pointer()
+                    .child(icon.size(px(17.)))
+                    .when(on, |b| {
+                        b.bg(colors.sel).text_color(colors.accent).child(
+                            div().absolute().bottom(px(3.)).size(px(4.)).rounded_full().bg(colors.accent),
+                        )
+                    })
+                    .when(!on, |b| b.text_color(colors.mute).hover(|s| s.text_color(colors.dim).bg(colors.panel)))
+                    .tooltip(move |window, cx| gpui_kit::component::tooltip::Tooltip::new(label.clone()).build(window, cx))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.shell.update(cx, |s, cx| s.show_module_view(&view_id, cx))
+                    }))
+                    .test_support()
+                    .into_any_element()
+            })
+            .collect();
         div()
             .id("rail")
             .flex()
@@ -105,6 +145,7 @@ impl RootView {
                     .tooltip(crate::shell::title_bar::tooltip("Develop the selected photo (crop & tone)")),
                 )
             })
+            .children(module_items)
             .child(div().flex_1())
             .child(
                 item("rail-preferences", Icon::new(IconName::Settings), false, true, Box::new(OpenPreferences))
@@ -113,7 +154,13 @@ impl RootView {
             .into_any_element()
     }
 
-    pub(crate) fn render_collection_browser(&self, shell: &ShellState, colors: Colors, cx: &Context<Self>) -> AnyElement {
+    pub(crate) fn render_collection_browser(
+        &self,
+        shell: &ShellState,
+        colors: Colors,
+        module_panels: Option<AnyElement>,
+        cx: &Context<Self>,
+    ) -> AnyElement {
         let all_on = shell.is_all_scope();
         let row = |id: &'static str| {
             div()
@@ -202,8 +249,8 @@ impl RootView {
                 );
             }
         }
-        // The module slot (Module registry, #104): module-contributed sidebar panels mount here.
-        browser = browser.child(div().id("module-slot-sidebar").flex().flex_col());
+        // The enabled modules' sidebar panels.
+        browser = browser.child(div().id("module-slot-sidebar").flex().flex_col().children(module_panels));
         browser.into_any_element()
     }
 }

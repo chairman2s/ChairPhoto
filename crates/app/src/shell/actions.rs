@@ -4,7 +4,8 @@
 //! Two kinds:
 //!
 //! - **Ported** — the shell does them itself ([`crate::shell::ShellState`]): panel
-//!   toggles, the cache-previews toggle, widening to all photos, clearing the selection.
+//!   toggles, the cache-previews toggle, widening to all photos, clearing the selection; and
+//!   the module registry's dialogs (the Modules panel, the Publish dialog, [`crate::modules`]).
 //! - **Not yet ported** — the feature's surface belongs to a later ticket. Its menu item or
 //!   button still dispatches a real action, and [`crate::model::AppModel::not_yet_ported`]
 //!   answers with a visible status line naming the ticket, rather than faking the feature.
@@ -29,6 +30,11 @@ actions!(
         ShowLibrary,
         /// The bench's ✕: clear the selection.
         ClearSelection,
+        /// More ⋯ → Modules…: the Modules panel (module registry, #122), until Preferences
+        /// (#113) takes it in as its Modules tab.
+        OpenModules,
+        /// The bench's Publish: the Publish dialog over the enabled modules' publish targets.
+        PublishSelection,
     ]
 );
 
@@ -96,8 +102,6 @@ not_yet_ported! {
     OpenTrash => ("Trash", 114),
     /// The bench's Compare (C in the grid).
     OpenCompare => ("Compare", 109),
-    /// The bench's Publish.
-    PublishSelection => ("Publish", 108),
     /// The bench's Back up.
     BackUpSelection => ("Back up the selection", 114),
     /// The icon rail's Develop.

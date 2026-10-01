@@ -19,6 +19,7 @@
 //! (React kept `MenuCheckItem` open).
 
 use crate::model::AppModel;
+use crate::modules::ModuleRegistry;
 use crate::shell::actions::*;
 use crate::shell::state::{ShellState, Side};
 use crate::shell::style::{grouped, Colors, RADIUS};
@@ -29,7 +30,7 @@ use gpui_kit::component::menu::{DropdownMenu as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::{Icon, IconName, Sizable as _, TitleBar};
 use gpui_kit::prelude::*;
 use gpui_kit::{
-    div, px, Action, AnyElement, Anchor, Decorations, FocusHandle, FontWeight, SharedString,
+    div, px, Action, AnyElement, Anchor, Decorations, Entity, FocusHandle, FontWeight, SharedString,
     TestSupportExt as _, Window,
 };
 
@@ -212,32 +213,24 @@ impl RootView {
         let pending = shell.counts.pending.to_string();
         let left_on = shell.panel_visible(Side::Left);
         let right_on = shell.panel_visible(Side::Right);
+        let modules = self.modules.clone();
         Button::new("more-menu")
             .ghost()
             .small()
             .icon(IconName::Ellipsis)
             .text_color(colors.dim)
             .tooltip("More")
-            .dropdown_menu_with_anchor(Anchor::TopRight, move |menu: PopupMenu, _, _| {
-                more_menu_items(menu, root.clone(), ready, loupe_enabled, &debt, &pending, left_on, right_on, colors)
+            .dropdown_menu_with_anchor(Anchor::TopRight, move |menu: PopupMenu, window, cx| {
+                let menu = more_menu_head(menu, root.clone(), ready, loupe_enabled);
+                let menu = module_actions_submenu(menu, &modules, window, cx);
+                more_menu_tail(menu, &debt, &pending, left_on, right_on, colors)
             })
     }
 }
 
-/// More ⋯, in React's order. Module actions (the "Modules" submenu) join when modules can
-/// contribute them (Module registry, #104); with none, React showed no submenu either.
-#[allow(clippy::too_many_arguments)]
-fn more_menu_items(
-    menu: PopupMenu,
-    root: FocusHandle,
-    ready: bool,
-    loupe_enabled: bool,
-    debt: &str,
-    pending: &str,
-    left_on: bool,
-    right_on: bool,
-    colors: Colors,
-) -> PopupMenu {
+/// More ⋯, in React's order: [`more_menu_head`], the "Modules" submenu
+/// ([`module_actions_submenu`]), [`more_menu_tail`].
+fn more_menu_head(menu: PopupMenu, root: FocusHandle, ready: bool, loupe_enabled: bool) -> PopupMenu {
     menu.action_context(root)
         .min_w(px(200.))
         .menu("Open loupe in a new window", Box::new(PopOutLoupe))
@@ -248,13 +241,45 @@ fn more_menu_items(
         .menu_with_disabled("Propose stacks…", Box::new(ProposeStacks), !ready)
         .menu_with_disabled("Start cull session", Box::new(StartCullSession), !ready)
         .separator()
-        .item(badge_item("Identity debt", debt.to_string(), Box::new(OpenIdentityDebt), colors))
+}
+
+/// More ⋯ → Modules: each enabled module's actions under its name, in registration order
+/// (host.ts `toolbarActionGroups`), then a separator. With no module actions there is no
+/// submenu, as in React.
+fn module_actions_submenu(
+    menu: PopupMenu,
+    modules: &Entity<ModuleRegistry>,
+    window: &mut Window,
+    cx: &mut gpui_kit::Context<PopupMenu>,
+) -> PopupMenu {
+    let groups = modules.read(cx).action_groups();
+    if groups.is_empty() {
+        return menu;
+    }
+    let modules = modules.clone();
+    menu.submenu("Modules", window, cx, move |sub, _, _| {
+        groups.iter().fold(sub, |sub, group| {
+            let sub = sub.label(group.module_name.clone());
+            group.actions.iter().fold(sub, |sub, action| {
+                let (modules, module_id, action_id) = (modules.clone(), group.module_id.clone(), action.id.clone());
+                sub.item(PopupMenuItem::new(action.label.clone()).on_click(move |_, window, cx| {
+                    ModuleRegistry::activate(&modules, &module_id, &action_id, window, cx)
+                }))
+            })
+        })
+    })
+    .separator()
+}
+
+fn more_menu_tail(menu: PopupMenu, debt: &str, pending: &str, left_on: bool, right_on: bool, colors: Colors) -> PopupMenu {
+    menu.item(badge_item("Identity debt", debt.to_string(), Box::new(OpenIdentityDebt), colors))
         .item(badge_item("Back-up queue", pending.to_string(), Box::new(Reconcile), colors))
         .separator()
         .label("VIEW")
         .menu_with_check("Tags & collections panel", left_on, Box::new(ToggleLeftPanel))
         .menu_with_check("Inspector", right_on, Box::new(ToggleRightPanel))
         .separator()
+        .menu("Modules…", Box::new(OpenModules))
         .menu("Preferences…", Box::new(OpenPreferences))
 }
 

@@ -19,7 +19,7 @@
 //! - **Lifecycle.** [`Module::load`] on enable (an `Err` rolls the enable back and says why),
 //!   [`ModuleInstance::on_unload`] on disable; the instance and every view it contributed are
 //!   dropped with it.
-//! - **Enable/disable** per module in the Modules panel, persisted
+//! - **Enable/disable** per module in the Modules panel ([`panel::ModulesPanel`]), persisted
 //!   in the catalog setting `modules.enabled` in dependency order; `requires` enables
 //!   dependencies first and cascade-disables dependents (ported from `host.ts`).
 //!
@@ -35,6 +35,7 @@
 //! factory while it holds no lease on itself, so a module may read the registry from them;
 //! it must not *enable or disable* modules from inside them.
 
+pub mod panel;
 pub mod registry;
 
 #[cfg(any(test, feature = "dev-module"))]

@@ -1,6 +1,7 @@
 //! Headless tests of the module registry: `requires` ordering and refusals, enable/disable
 //! persistence in `modules.enabled`, event delivery only to enabled modules, `on_unload`,
-//! namespaced settings — against probe modules that log what the registry does to them.
+//! namespaced settings — against probe modules that log what the registry does to them —
+//! and the shell's slots, driven through the real window with the dev module.
 //!
 //! The registry logic tests translate the `host.test.ts` cases that survive the Rust contract
 //! (unmetRequirement, enableModule, disableModule's cascade, toolbarActionGroups); the
@@ -8,15 +9,21 @@
 //! counterpart (#104 dropped those concepts; module callbacks are infallible Rust, a failed
 //! load is `Err`).
 
+use super::dev_module::DEV_MODULE_ID;
 use super::registry::{validate_id, ModuleRegistry, ENABLED_KEY};
 use super::*;
 use crate::model::AppModel;
+use crate::shell::actions::{OpenModules, PublishSelection};
+use crate::shell::state::{InspectorTab, Surface};
 use crate::shell::ShellState;
-use crate::start_core;
+use crate::{start_core, wire, WireOptions, Wired};
 use chairphoto_core::app::{AppState, CoreEvent, EventSink as _};
+use chairphoto_core::appearance::SystemThemeResult;
 use chairphoto_core::catalog::Catalog;
 use chairphoto_core::scanner::ScanProgress;
-use gpui_kit::{AppContext as _, Empty, TestAppContext};
+use gpui_kit::component::WindowExt as _;
+use gpui_kit::test::TestWindowExt as _;
+use gpui_kit::{AnyWindowHandle, AppContext as _, Empty, TestAppContext};
 use std::cell::RefCell;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -442,4 +449,217 @@ fn a_disabled_module_gets_no_events(cx: &mut TestAppContext) {
     b.disable("a", cx);
     b.event(scan_done(), cx);
     assert_eq!(*log.borrow(), ["load:a", "event:a:scan:progress", "unload:a"]);
+}
+
+// --- the shell's slots, with the dev module -------------------------------------------------
+
+struct Shell {
+    state: AppState,
+    wired: Wired,
+}
+
+impl Shell {
+    fn window(&self) -> AnyWindowHandle {
+        *self.wired.main_window.as_ref().unwrap()
+    }
+
+    fn present(&self, id: &'static str, cx: &mut TestAppContext) -> bool {
+        cx.update_window(self.window(), |_, window, cx| {
+            window.render_frame(cx);
+            window.try_find(id).is_some()
+        })
+        .unwrap()
+    }
+
+    fn click(&self, id: &'static str, cx: &mut TestAppContext) {
+        cx.update_window(self.window(), |_, window, cx| {
+            window.render_frame(cx);
+            window.click(id, cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+    }
+
+    fn dispatch(&self, action: Box<dyn gpui_kit::Action>, cx: &mut TestAppContext) {
+        cx.update_window(self.window(), |_, window, cx| window.dispatch_action(action, cx)).unwrap();
+        cx.run_until_parked();
+    }
+
+    fn surface(&self, cx: &mut TestAppContext) -> Surface {
+        self.wired.shell.read_with(cx, |s, _| s.surface.clone())
+    }
+}
+
+/// `run`'s wiring with a fresh catalog holding one photo, opened as `catalog:switched` does.
+fn shell(dir: &TempDir, cx: &mut TestAppContext) -> (Shell, i64) {
+    let (state, events_rx, ()) = start_core(|_| ());
+    let wired = cx.update(|cx| {
+        wire(
+            cx,
+            state.clone(),
+            events_rx,
+            None,
+            &SystemThemeResult::unavailable(),
+            WireOptions { on_exit: Rc::new(|| {}), open_default_catalog: false },
+        )
+    });
+    let db = dir.0.join("s.chairphoto");
+    let root = dir.0.join("photos");
+    let catalog = Catalog::open(&db, &root).unwrap();
+    let id = catalog.upsert_photo(&root.join("2026/p.ARW"), None, 0, 1).unwrap().id;
+    *state.catalog.lock().unwrap() = Some(catalog);
+    state.send(CoreEvent::CatalogSwitched(db.to_string_lossy().to_string()));
+    cx.run_until_parked();
+    (Shell { state, wired }, id)
+}
+
+/// The Modules panel lists the dev module; ticking it puts the module's contributions in
+/// every slot the shell has (rail, stage, sidebar, inspector, settings), and unticking it takes
+/// them all away again — the stage falling back to the Library.
+#[gpui_kit::test]
+fn the_modules_panel_toggles_every_slot(cx: &mut TestAppContext) {
+    let dir = TempDir::new("slots");
+    let (app, photo_id) = shell(&dir, cx);
+    let photo = app.state.catalog.lock().unwrap().as_ref().unwrap().get_photo(photo_id).unwrap();
+    app.wired.shell.update(cx, |s, cx| {
+        s.library.view_photo(photo);
+        s.set_inspector_tab(InspectorTab::Tags, cx);
+    });
+    for id in ["rail-view-dev-view", "dev-sidebar", "dev-inspector"] {
+        assert!(!app.present(id, cx), "{id} before the module is enabled");
+    }
+
+    app.dispatch(Box::new(OpenModules), cx);
+    settle_dialog(cx);
+    assert!(app.present("module-row-dev", cx), "the Modules panel lists the dev module");
+    assert!(!app.present("dev-settings", cx), "no settings panel while disabled");
+    app.click("module-toggle-dev", cx);
+    assert!(app.wired.modules.read_with(cx, |r, _| r.is_enabled(DEV_MODULE_ID)));
+    assert_eq!(
+        app.state.catalog.lock().unwrap().as_ref().unwrap().get_setting(ENABLED_KEY).unwrap().as_deref(),
+        Some(DEV_MODULE_ID),
+        "the toggle persisted"
+    );
+    for id in ["dev-settings", "rail-view-dev-view", "dev-sidebar", "module-panel-sidebar-dev-sidebar", "dev-inspector"] {
+        assert!(app.present(id, cx), "{id} once the module is enabled");
+    }
+
+    // The modal dialog covers the window: close it to reach the rail.
+    cx.update_window(app.window(), |_, window, cx| window.close_dialog(cx)).unwrap();
+    cx.run_until_parked();
+    app.click("rail-view-dev-view", cx);
+    assert_eq!(app.surface(cx), Surface::Module("dev-view".into()));
+    assert!(app.present("dev-main", cx), "the main view fills the stage");
+
+    app.dispatch(Box::new(OpenModules), cx);
+    settle_dialog(cx);
+    app.click("module-toggle-dev", cx);
+    assert!(!app.wired.modules.read_with(cx, |r, _| r.is_enabled(DEV_MODULE_ID)));
+    assert_eq!(app.surface(cx), Surface::Library, "the stage fell back to the Library");
+    for id in ["dev-settings", "rail-view-dev-view", "dev-sidebar", "dev-inspector", "dev-main"] {
+        assert!(!app.present(id, cx), "{id} after the module is disabled");
+    }
+}
+
+/// Inspector panels show on the tags tab only, with a photo active (`PhotoInspector.tsx`).
+#[gpui_kit::test]
+fn inspector_panels_live_on_the_tags_tab(cx: &mut TestAppContext) {
+    let dir = TempDir::new("inspector");
+    let (app, photo_id) = shell(&dir, cx);
+    cx.update(|cx| ModuleRegistry::enable(&app.wired.modules, DEV_MODULE_ID, cx));
+    app.wired.shell.update(cx, |s, cx| s.set_inspector_tab(InspectorTab::Tags, cx));
+    assert!(!app.present("dev-inspector", cx), "no photo, no inspector panels");
+    let photo = app.state.catalog.lock().unwrap().as_ref().unwrap().get_photo(photo_id).unwrap();
+    app.wired.shell.update(cx, |s, _| s.library.view_photo(photo));
+    assert!(app.present("dev-inspector", cx));
+    app.wired.shell.update(cx, |s, cx| s.set_inspector_tab(InspectorTab::Details, cx));
+    assert!(!app.present("dev-inspector", cx), "details tab");
+}
+
+/// Actions: a run action runs; a modal action opens its view in a dialog; the More ⋯ menu
+/// gains a "Modules" submenu only while some module has actions. Publish targets fill the
+/// Publish dialog.
+#[gpui_kit::test]
+fn actions_and_publish_targets_open_where_they_belong(cx: &mut TestAppContext) {
+    let dir = TempDir::new("actions");
+    let (app, _) = shell(&dir, cx);
+    let more_row = |app: &Shell, index: usize, cx: &mut TestAppContext| -> Option<String> {
+        app.click("more-menu", cx);
+        let label = cx
+            .update_window(app.window(), |_, window, cx| {
+                window.render_frame(cx);
+                window.within("popup-menu").find(index).label().map(str::to_string)
+            })
+            .unwrap();
+        app.press_escape(cx);
+        label
+    };
+    assert_ne!(more_row(&app, 8, cx).as_deref(), Some("Modules"));
+
+    cx.update(|cx| ModuleRegistry::enable(&app.wired.modules, DEV_MODULE_ID, cx));
+    cx.run_until_parked();
+    // Row 7 is the separator under "Start cull session".
+    assert_eq!(more_row(&app, 8, cx).as_deref(), Some("Modules"), "after Start cull session's separator");
+    let groups = app.wired.modules.read_with(cx, |r, _| r.action_groups());
+    assert_eq!(groups.len(), 1);
+    assert_eq!(groups[0].module_name.as_ref(), "Dev module");
+
+    cx.update_window(app.window(), |_, window, cx| {
+        ModuleRegistry::activate(&app.wired.modules, DEV_MODULE_ID, "dev-run", window, cx)
+    })
+    .unwrap();
+    assert_eq!(app.wired.model.read_with(cx, |m, _| m.status.to_string()), "Dev module: action ran");
+
+    assert!(!app.present("dev-modal", cx));
+    cx.update_window(app.window(), |_, window, cx| {
+        ModuleRegistry::activate(&app.wired.modules, DEV_MODULE_ID, "dev-modal", window, cx)
+    })
+    .unwrap();
+    cx.run_until_parked();
+    assert!(app.present("dev-modal", cx), "the modal action's view is in a dialog");
+    cx.update_window(app.window(), |_, window, cx| window.close_dialog(cx)).unwrap();
+    cx.run_until_parked();
+
+    app.dispatch(Box::new(PublishSelection), cx);
+    settle_dialog(cx);
+    assert!(app.present("publish-target-dev-target", cx));
+    assert!(app.present("dev-publish", cx), "the target's form");
+}
+
+/// The loupe and tag-editor slots, which their views (#109, #107) mount: one cached view per
+/// window while the module stays enabled, none after.
+#[gpui_kit::test]
+fn loupe_and_tag_editor_panels_are_built_once_per_window(cx: &mut TestAppContext) {
+    let dir = TempDir::new("loupe");
+    let (app, _) = shell(&dir, cx);
+    let registry = app.wired.modules.clone();
+    cx.update(|cx| ModuleRegistry::enable(&registry, DEV_MODULE_ID, cx));
+    let views = |slot: PanelSlot, cx: &mut TestAppContext| {
+        cx.update_window(app.window(), |_, window, cx| ModuleRegistry::panel_views(&registry, slot, window, cx))
+            .unwrap()
+    };
+    for (slot, id) in [(PanelSlot::Loupe, "dev-loupe"), (PanelSlot::TagEditor, "dev-tag-editor")] {
+        let first = views(slot, cx);
+        assert_eq!(first.iter().map(|v| v.id.to_string()).collect::<Vec<_>>(), [id]);
+        let again = views(slot, cx);
+        assert_eq!(first[0].view.entity_id(), again[0].view.entity_id(), "{id}: cached");
+    }
+    cx.update(|cx| ModuleRegistry::disable(&registry, DEV_MODULE_ID, cx));
+    assert!(views(PanelSlot::Loupe, cx).is_empty());
+}
+
+/// Let a dialog's entrance animation finish, so clicks land on its content where it rests:
+/// gpui-component animates dialogs on the wall clock for `dialog::ANIMATION_DURATION` (250 ms
+/// in 0.7.0), which the test scheduler does not advance; until then a click on the panel's
+/// checkbox reached nothing.
+fn settle_dialog(cx: &mut TestAppContext) {
+    std::thread::sleep(std::time::Duration::from_millis(450));
+    cx.run_until_parked();
+}
+
+impl Shell {
+    fn press_escape(&self, cx: &mut TestAppContext) {
+        cx.update_window(self.window(), |_, window, cx| window.press("escape", cx)).unwrap();
+        cx.run_until_parked();
+    }
 }

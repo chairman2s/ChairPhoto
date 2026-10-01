@@ -193,8 +193,8 @@ pub fn wire(
 
     let window_options = main_window_options(cx);
     let opened = gpui_kit::open_window(window_options, cx, {
-        let (model, shell, images) = (model.clone(), shell.clone(), images.clone());
-        move |window, cx| cx.new(|cx| view::RootView::new(model, shell, images, window, cx))
+        let (model, shell, images, modules) = (model.clone(), shell.clone(), images.clone(), modules.clone());
+        move |window, cx| cx.new(|cx| view::RootView::new(model, shell, images, modules, window, cx))
     });
     let main_window = match opened {
         Ok((handle, _)) => {

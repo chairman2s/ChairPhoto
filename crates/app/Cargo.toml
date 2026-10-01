@@ -22,6 +22,11 @@ name = "chairphoto_app"
 name = "chairphoto-gpui"
 path = "src/main.rs"
 
+# The Tag graph's measurement path (#121); it needs the module.
+[[example]]
+name = "tag_graph_bench"
+required-features = ["tag-graph"]
+
 [features]
 # The same names as the core's features, forwarded one by one (the Tauri shell does the same),
 # and the same default set as the Tauri shell's minus `module-fetch`, which gates a Tauri

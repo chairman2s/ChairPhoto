@@ -5,7 +5,7 @@
 //! (`tag_tree::split_summary`). Photos in the selection that never carried the tag are
 //! counted, not tagged.
 
-use super::state::{run, TagsState};
+use super::state::{bind_dialog, run_as, CatalogGuard, TagsState};
 use crate::shell::style::Colors;
 use crate::storage::{ui, CloseDialog};
 use chairphoto_core::catalog::tag_maintenance::TagSplitReport;
@@ -17,6 +17,8 @@ use gpui_kit::{div, px, Context, Entity, EventEmitter, Subscription, TestSupport
 
 pub struct TagSplit {
     tags: Entity<TagsState>,
+    /// The tree this dialog opened over ([`bind_dialog`]): its jobs run under it.
+    guard: CatalogGuard,
     pub source: TagWithCount,
     pub photo_ids: Vec<i64>,
     pub path: Entity<InputState>,
@@ -43,7 +45,8 @@ impl TagSplit {
             InputEvent::PressEnter { .. } => this.run(true, cx),
             _ => {}
         });
-        TagSplit { tags, source, photo_ids, path, keep_source: false, preview: None, error: None, busy: false, attempt: 0, _subscriptions: vec![events] }
+        let (guard, bound) = bind_dialog(&tags, cx);
+        TagSplit { tags, guard, source, photo_ids, path, keep_source: false, preview: None, error: None, busy: false, attempt: 0, _subscriptions: vec![events, bound] }
     }
 
     pub fn toggle_keep(&mut self, cx: &mut Context<Self>) {
@@ -64,8 +67,9 @@ impl TagSplit {
         self.busy = true;
         self.error = None;
         let (source, ids, keep) = (self.source.tag.id, self.photo_ids.clone(), self.keep_source);
-        run(
+        run_as(
             &self.tags,
+            &self.guard,
             cx,
             !dry_run,
             move |c| chairphoto_core::app::tags::split_tag(c, source, &ids, &target, keep, dry_run),

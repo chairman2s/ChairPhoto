@@ -27,7 +27,7 @@
 //! having changed everything catalog-derived** — the caller invalidates every catalog-derived
 //! entity rather than guess. A stale list is a correctness bug; an extra refetch is only work.
 
-use chairphoto_core::app::{with_catalog, AppState, CoreEvent, EventVisitor};
+use chairphoto_core::app::{with_catalog, with_catalog_identified, AppState, CatalogIdentity, CoreEvent, EventVisitor};
 use crate::image_store::Loaded;
 use chairphoto_core::catalog::{CatalogError, Photo, PhotoQuery};
 use chairphoto_core::image_pool::ImagePool;
@@ -72,7 +72,7 @@ pub struct CatalogSummary {
 pub enum DeepLinkTarget {
     /// `photo` is the whole row: a stacked child, which the grid never lists, is viewed
     /// off-grid from it.
-    Photo { id: i64, uuid: String, path: String, view: DeepLinkView, photo: Box<Photo> },
+    Photo { id: i64, uuid: String, path: String, view: DeepLinkView, photo: Box<Photo>, from: CatalogIdentity },
     Tag { id: i64, uuid: String, full_path: String },
 }
 
@@ -83,6 +83,10 @@ pub struct AppModel {
     pool: Option<Arc<ImagePool<Loaded>>>,
     /// The open catalog, once [`AppModel::refresh`] has read it.
     pub catalog: Option<CatalogSummary>,
+    /// The identity of the catalog [`catalog`](Self::catalog) was read from, while it is the
+    /// current one (`None` from a switch until its refresh lands). What a dialog that opens
+    /// now binds its writes to (`with_catalog_as`), e.g. Preferences.
+    identity: Option<CatalogIdentity>,
     /// One line on what the app is doing ("Opening catalog…", an error).
     pub status: SharedString,
     /// The last core event: its wire name and a short rendering of its payload.
@@ -130,6 +134,7 @@ impl AppModel {
             state,
             pool,
             catalog: None,
+            identity: None,
             status: "Starting…".into(),
             last_event: None,
             events_seen: 0,
@@ -148,6 +153,11 @@ impl AppModel {
 
     pub fn state(&self) -> &AppState {
         &self.state
+    }
+
+    /// See the field [`identity`](Self::identity).
+    pub fn catalog_identity(&self) -> Option<CatalogIdentity> {
+        self.identity
     }
 
     pub fn pool(&self) -> Option<&Arc<ImagePool<Loaded>>> {
@@ -206,15 +216,17 @@ impl AppModel {
                     return; // superseded
                 }
                 match summary {
-                    Ok(summary) => {
+                    Ok((identity, summary)) => {
                         eprintln!("catalog: {} · {} photos", summary.name, summary.photo_count);
                         m.catalog = Some(summary);
+                        m.identity = Some(identity);
                         m.catalog_current = true;
                         cx.emit(AppModelEvent::CatalogRead);
                         m.start_pending_link(cx);
                     }
                     Err(e) => {
                         m.catalog = None;
+                        m.identity = None;
                         m.catalog_current = false;
                         m.status = format!("Catalog unavailable: {e}").into();
                     }
@@ -328,6 +340,7 @@ impl AppModel {
     fn on_catalog_switched(&mut self) {
         self.catalog_epoch += 1;
         self.catalog_current = false;
+        self.identity = None;
         self.link_generation += 1;
         self.deep_link = None;
         if let Some(link) = self.in_flight_link.take() {
@@ -383,8 +396,8 @@ pub fn not_yet_ported_line(what: &str, ticket: u32) -> String {
 }
 
 /// The open catalog's name and photo count. Blocking (catalog lock + SQLite): background only.
-fn read_summary(state: &AppState) -> Result<CatalogSummary, String> {
-    with_catalog(state, |c| {
+fn read_summary(state: &AppState) -> Result<(CatalogIdentity, CatalogSummary), String> {
+    with_catalog_identified(state, |c| {
         let photo_count = c.count_photos(&PhotoQuery::default())?;
         let path = c.db_path();
         let name = path
@@ -400,7 +413,7 @@ fn read_summary(state: &AppState) -> Result<CatalogSummary, String> {
 fn resolve_link(state: &AppState, link: &DeepLink) -> Result<DeepLinkTarget, String> {
     match link {
         DeepLink::Photo { uuid, view } => {
-            let photo = with_catalog(state, |c| match c.get_photo_by_uuid(uuid) {
+            let (from, photo) = with_catalog_identified(state, |c| match c.get_photo_by_uuid(uuid) {
                 Ok(p) => Ok(Some(p)),
                 Err(CatalogError::NotFound(_)) => Ok(None),
                 Err(e) => Err(e),
@@ -413,6 +426,7 @@ fn resolve_link(state: &AppState, link: &DeepLink) -> Result<DeepLinkTarget, Str
                 path: photo.path.clone(),
                 view: *view,
                 photo: Box::new(photo),
+                from,
             })
         }
         DeepLink::Tag { uuid } => {

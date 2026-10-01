@@ -497,3 +497,187 @@ fn a_dialog_read_landing_after_a_switch_is_dropped(cx: &mut TestAppContext) {
     cx.run_until_parked();
     merge.read_with(cx, |m, _| assert!(m.preview.is_none() && m.error.is_none(), "the old catalog's preview landed"));
 }
+
+// --- dialogs bound to the catalog they opened on (#107 review) ----------------------------
+
+/// The core switches to a second catalog seeded the same way — every tag, photo and group id
+/// collides — with `catalog:switched` delivered (and the new tree read) or still on its way.
+fn switch_to_twin(app: &App, dir: &TempDir, delivered: bool, cx: &mut TestAppContext) -> Seed {
+    let root = dir.0.join("photos-b");
+    let b = Catalog::open(&dir.0.join("b.chairphoto"), &root).unwrap();
+    let s = seed(&b, &root);
+    b.create_tag_group("Street").unwrap();
+    core_switch(app, b);
+    if delivered {
+        deliver_switch(app, cx);
+    }
+    s
+}
+
+/// What a refused dialog write shows, when the dialog is still there to show it.
+fn changed() -> Option<String> {
+    Some(chairphoto_core::app::CATALOG_CHANGED.to_string())
+}
+
+/// **Forced interleaving** (#107 review, finding 1). Merge opened (and previewed) in one
+/// catalog; the core switches to its twin; Merge is confirmed. Nothing merges in the new
+/// catalog. With the event delivered, the dialog has closed itself; the confirm that raced
+/// it is refused too.
+fn merge_across_a_switch(delivered: bool, cx: &mut TestAppContext) {
+    let dir = TempDir::new("tags-merge-switch");
+    let app = start(cx);
+    let s = open_tagged(&app, &dir, "a", cx);
+    let row: &'static str = Box::leak(format!("tag-row-{}", s.bergen).into_boxed_str());
+    right_click_menu_row(&app, row, "Merge into…", cx);
+    let TagDialog::Merge(merge) = last_dialog(&app, cx) else { panic!("the merge dialog") };
+    let merge = up(merge);
+    let target = app.wired.tags.read_with(cx, |t, _| t.tag(s.people).unwrap().clone());
+    merge.update(cx, |m, cx| m.pick(target, cx));
+    cx.run_until_parked();
+    assert!(merge.read_with(cx, |m, _| m.preview.is_some()));
+    let b = switch_to_twin(&app, &dir, delivered, cx);
+    assert_eq!(b.bergen, s.bergen);
+    if delivered {
+        settle(&app, cx);
+        assert!(!has_dialog(&app, cx), "the switch closed the dialog");
+    }
+    merge.update(cx, |m, cx| m.commit(cx));
+    cx.run_until_parked();
+    assert!(with_catalog(&app, |c| c.get_tag(b.bergen).is_ok()), "the old catalog's merge removed the new catalog's tag");
+    if !delivered {
+        assert_eq!(merge.read_with(cx, |m, _| m.error.clone()), changed());
+    }
+}
+
+#[gpui_kit::test]
+fn merge_never_reaches_the_new_catalog_before_the_switch_event(cx: &mut TestAppContext) {
+    merge_across_a_switch(false, cx);
+}
+
+#[gpui_kit::test]
+fn merge_never_reaches_the_new_catalog_after_the_switch_event(cx: &mut TestAppContext) {
+    merge_across_a_switch(true, cx);
+}
+
+/// Split: opened over the selection in one catalog, run after the core switched.
+fn split_across_a_switch(delivered: bool, cx: &mut TestAppContext) {
+    let dir = TempDir::new("tags-split-switch");
+    let app = start(cx);
+    let s = open_tagged(&app, &dir, "a", cx);
+    select_photo(&app, s.photos[0], cx);
+    let row: &'static str = Box::leak(format!("tag-row-{}", s.bergen).into_boxed_str());
+    right_click_menu_row(&app, row, "Split off 1 selected…", cx);
+    let TagDialog::Split(split) = last_dialog(&app, cx) else { panic!("the split dialog") };
+    let split = up(split);
+    let path = split.read_with(cx, |s, _| s.path.clone());
+    set_input(&app, &path, "Venue/Grieghallen", cx);
+    split.update(cx, |s, cx| s.run(true, cx));
+    cx.run_until_parked();
+    assert!(split.read_with(cx, |s, _| s.preview.is_some()), "previewed: the split may run");
+    let b = switch_to_twin(&app, &dir, delivered, cx);
+    if delivered {
+        settle(&app, cx);
+        assert!(!has_dialog(&app, cx), "the switch closed the dialog");
+    }
+    split.update(cx, |s, cx| s.run(false, cx));
+    cx.run_until_parked();
+    assert!(with_catalog(&app, |c| c.find_tag_id_by_path("Venue/Grieghallen").unwrap().is_none()), "split in the new catalog");
+    let on_photo: Vec<i64> = with_catalog(&app, |c| c.get_photo_tags(b.photos[0]).unwrap().iter().map(|t| t.id).collect());
+    assert_eq!(on_photo, [b.bergen]);
+    if !delivered {
+        assert_eq!(split.read_with(cx, |s, _| s.error.clone()), changed());
+    }
+}
+
+#[gpui_kit::test]
+fn split_never_reaches_the_new_catalog_before_the_switch_event(cx: &mut TestAppContext) {
+    split_across_a_switch(false, cx);
+}
+
+#[gpui_kit::test]
+fn split_never_reaches_the_new_catalog_after_the_switch_event(cx: &mut TestAppContext) {
+    split_across_a_switch(true, cx);
+}
+
+/// The tag editor: Delete asked in one catalog, confirmed after the core switched.
+fn editor_delete_across_a_switch(delivered: bool, cx: &mut TestAppContext) {
+    let dir = TempDir::new("tags-editor-switch");
+    let app = start(cx);
+    let s = open_tagged(&app, &dir, "a", cx);
+    let edit: &'static str = Box::leak(format!("tag-edit-{}", s.bergen).into_boxed_str());
+    click(&app, edit, cx);
+    let TagDialog::Editor(editor) = last_dialog(&app, cx) else { panic!("the editor") };
+    let editor = up(editor);
+    editor.update(cx, |e, cx| e.delete(cx));
+    assert!(editor.read_with(cx, |e, _| e.confirm_delete), "the first press asks");
+    let b = switch_to_twin(&app, &dir, delivered, cx);
+    if delivered {
+        settle(&app, cx);
+        assert!(!has_dialog(&app, cx), "the switch closed the editor");
+    }
+    editor.update(cx, |e, cx| e.delete(cx));
+    cx.run_until_parked();
+    assert!(with_catalog(&app, |c| c.get_tag(b.bergen).is_ok()), "the old catalog's delete removed the new catalog's tag");
+    if !delivered {
+        assert_eq!(editor.read_with(cx, |e, _| e.error.clone()), changed());
+    }
+}
+
+#[gpui_kit::test]
+fn editor_delete_never_reaches_the_new_catalog_before_the_switch_event(cx: &mut TestAppContext) {
+    editor_delete_across_a_switch(false, cx);
+}
+
+#[gpui_kit::test]
+fn editor_delete_never_reaches_the_new_catalog_after_the_switch_event(cx: &mut TestAppContext) {
+    editor_delete_across_a_switch(true, cx);
+}
+
+/// The groups manager: a group chosen in one catalog, deleted after the core switched.
+fn groups_delete_across_a_switch(delivered: bool, cx: &mut TestAppContext) {
+    let dir = TempDir::new("tags-groups-switch");
+    let app = start(cx);
+    let s = open_tagged(&app, &dir, "a", cx);
+    let group = with_catalog(&app, |c| c.create_tag_group("Street").unwrap());
+    select_photo(&app, s.photos[2], cx);
+    click(&app, "inspector-tab-tags", cx);
+    click(&app, "quick-groups-manage", cx);
+    let TagDialog::Groups(manager) = last_dialog(&app, cx) else { panic!("the groups manager") };
+    let manager = up(manager);
+    manager.update(cx, |m, cx| m.select(group, cx));
+    cx.run_until_parked();
+    switch_to_twin(&app, &dir, delivered, cx);
+    if delivered {
+        settle(&app, cx);
+        assert!(!has_dialog(&app, cx), "the switch closed the manager");
+    }
+    manager.update(cx, |m, cx| m.delete_active(cx));
+    cx.run_until_parked();
+    let groups = with_catalog(&app, |c| c.list_tag_groups().unwrap());
+    assert!(groups.iter().any(|g| g.id == group), "the old catalog's delete removed the new catalog's group");
+}
+
+#[gpui_kit::test]
+fn groups_delete_never_reaches_the_new_catalog_before_the_switch_event(cx: &mut TestAppContext) {
+    groups_delete_across_a_switch(false, cx);
+}
+
+#[gpui_kit::test]
+fn groups_delete_never_reaches_the_new_catalog_after_the_switch_event(cx: &mut TestAppContext) {
+    groups_delete_across_a_switch(true, cx);
+}
+
+/// Finding 3: the tagging block's nearby window is remembered in the catalog its tree came
+/// from — after the core switched (the event not yet delivered) it is not written into the
+/// new catalog.
+#[gpui_kit::test]
+fn the_nearby_window_is_not_written_into_the_new_catalog(cx: &mut TestAppContext) {
+    let dir = TempDir::new("tags-window-switch");
+    let app = start(cx);
+    let s = open_tagged(&app, &dir, "a", cx);
+    select_photo(&app, s.photos[0], cx);
+    switch_to_twin(&app, &dir, false, cx);
+    photo_tags(&app, cx).update(cx, |p, cx| p.set_window(600, cx));
+    cx.run_until_parked();
+    assert_eq!(with_catalog(&app, |c| c.get_setting(crate::tags::photo_tags::WINDOW_SETTING).unwrap()), None);
+}

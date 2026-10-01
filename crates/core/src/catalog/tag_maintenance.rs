@@ -675,6 +675,10 @@ pub struct SimilarTagPair {
     pub reason: String,
 }
 
+/// The `min_similarity` a caller uses when it has no opinion (Preferences → Tags, and the
+/// `find_similar_tags` command without one).
+pub const DEFAULT_MIN_SIMILARITY: f64 = 0.82;
+
 /// Candidate duplicate tags: leaf names within `min_similarity` of each other, each reported
 /// with how often the two are used together.
 ///
@@ -689,10 +693,6 @@ pub struct SimilarTagPair {
 /// walks names (cheap, in memory, with a length prefilter that skips pairs too far apart to
 /// possibly qualify) and asks the database only about the pairs that survive. The cost is
 /// that two duplicates with unlike names, `Bike` and `Velocipede`, will not surface here.
-/// The `min_similarity` a caller uses when it has no opinion (Preferences → Tags, and the
-/// `find_similar_tags` command without one).
-pub const DEFAULT_MIN_SIMILARITY: f64 = 0.82;
-
 pub fn find_similar_tags(conn: &Connection, min_similarity: f64) -> Result<Vec<SimilarTagPair>> {
     let tags: Vec<(i64, String, String)> = {
         let mut stmt = conn.prepare("SELECT id, name_norm, full_path FROM tags ORDER BY full_path")?;

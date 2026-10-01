@@ -5,7 +5,7 @@
 //! "Pick a different tag" goes back. A committed merge closes the dialog and puts its counts
 //! on the status line (`tag_tree::merge_summary`).
 
-use super::state::{run, TagsState};
+use super::state::{bind_dialog, run_as, CatalogGuard, TagsState};
 use crate::shell::style::Colors;
 use crate::storage::{ui, CloseDialog};
 use chairphoto_core::catalog::tag_maintenance::TagMergeReport;
@@ -17,6 +17,8 @@ use gpui_kit::{div, px, Context, Entity, EventEmitter, SharedString, Subscriptio
 
 pub struct TagMerge {
     tags: Entity<TagsState>,
+    /// The tree this dialog opened over ([`bind_dialog`]): its jobs run under it.
+    guard: CatalogGuard,
     pub source: TagWithCount,
     pub filter: Entity<InputState>,
     pub target: Option<TagWithCount>,
@@ -34,7 +36,8 @@ impl TagMerge {
     pub fn new(tags: Entity<TagsState>, source: TagWithCount, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let filter = cx.new(|cx| InputState::new(window, cx).placeholder("Merge into…"));
         let changes = cx.subscribe(&filter, |_, _, _: &InputEvent, cx| cx.notify());
-        TagMerge { tags, source, filter, target: None, preview: None, error: None, busy: false, attempt: 0, _subscriptions: vec![changes] }
+        let (guard, bound) = bind_dialog(&tags, cx);
+        TagMerge { tags, guard, source, filter, target: None, preview: None, error: None, busy: false, attempt: 0, _subscriptions: vec![changes, bound] }
     }
 
     pub fn candidates(&self, cx: &gpui_kit::App) -> Vec<TagWithCount> {
@@ -50,7 +53,7 @@ impl TagMerge {
         self.preview = None;
         self.error = None;
         self.busy = true;
-        run(&self.tags, cx, false, move |c| chairphoto_core::app::tags::merge_tags(c, &[source], target_id, true), move |s: &mut Self, r, cx| {
+        run_as(&self.tags, &self.guard, cx, false, move |c| chairphoto_core::app::tags::merge_tags(c, &[source], target_id, true), move |s: &mut Self, r, cx| {
             if s.attempt != attempt {
                 return;
             }
@@ -82,7 +85,7 @@ impl TagMerge {
         self.busy = true;
         self.error = None;
         let (source, target_id) = (self.source.tag.id, target.tag.id);
-        run(&self.tags, cx, true, move |c| chairphoto_core::app::tags::merge_tags(c, &[source], target_id, false), |s: &mut Self, r, cx| {
+        run_as(&self.tags, &self.guard, cx, true, move |c| chairphoto_core::app::tags::merge_tags(c, &[source], target_id, false), |s: &mut Self, r, cx| {
             s.busy = false;
             match r {
                 Ok(report) => {

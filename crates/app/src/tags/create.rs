@@ -4,7 +4,7 @@
 //! them in order on one worker and stops at the first failure, naming it. Escape closes (the
 //! Dialog's own binding).
 
-use super::state::{run, TagsState};
+use super::state::{bind_dialog, run_as, CatalogGuard, TagsState};
 use crate::shell::style::Colors;
 use crate::storage::{ui, CloseDialog};
 use chairphoto_model::tag_paste::parse_tag_paste;
@@ -29,6 +29,8 @@ pub fn paths_for(text: &str, parent: Option<&str>) -> Vec<String> {
 
 pub struct TagCreate {
     tags: Entity<TagsState>,
+    /// The tree this dialog opened over ([`bind_dialog`]): its jobs run under it.
+    guard: CatalogGuard,
     pub parent: Option<String>,
     pub text: Entity<TextareaState>,
     pub error: Option<String>,
@@ -49,7 +51,8 @@ impl TagCreate {
         });
         let focus = text.read(cx).focus_handle(cx);
         window.focus(&focus, cx);
-        TagCreate { tags, parent, text, error: None, busy: false, _subscriptions: vec![changes] }
+        let (guard, bound) = bind_dialog(&tags, cx);
+        TagCreate { tags, guard, parent, text, error: None, busy: false, _subscriptions: vec![changes, bound] }
     }
 
     pub fn paths(&self, cx: &gpui_kit::App) -> Vec<String> {
@@ -64,8 +67,9 @@ impl TagCreate {
         }
         self.busy = true;
         self.error = None;
-        run(
+        run_as(
             &self.tags,
+            &self.guard,
             cx,
             true,
             move |c| {

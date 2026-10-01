@@ -7,7 +7,7 @@
 //! Moved here from the Tauri shell's `commands/burst.rs` (gpui #106), so the GPUI app's
 //! "Analyse burst sharpness" and the Tauri command run the same code.
 
-use crate::app::{with_catalog, AppState};
+use crate::app::{with_catalog_as, with_catalog_identified, AppState, CatalogIdentity};
 use crate::burst::{group_into_clusters, BurstConfig, BurstPhoto, BurstVerdict};
 use serde::Serialize;
 
@@ -48,13 +48,33 @@ pub const BURST_SOFT_THRESHOLD_DEFAULT: f64 = 0.60;
 /// `photo_ids` is typically the current selection or view. Unscored photos (sharpness IS
 /// NULL) are clustered but flagged neither way (they have no score to compare).
 /// Re-running is idempotent: flags are overwritten on every call.
+///
+/// Bound to the catalog open when step 1 runs: a switch between the read and the write makes
+/// step 4 fail closed (`CATALOG_CHANGED`) rather than flag the new catalog's same ids. The
+/// Tauri command calls this; a front end that read `photo_ids` itself passes the identity it
+/// read them with ([`analyze_burst_sharpness_as`]).
 pub fn analyze_burst_sharpness(state: &AppState, photo_ids: &[i64]) -> Result<BurstAnalysisResult, String> {
+    analyze(state, None, photo_ids)
+}
+
+/// [`analyze_burst_sharpness`] over ids read from the catalog `expected` names: both the
+/// read (step 1) and the write (step 4) fail closed with `CATALOG_CHANGED` once another
+/// catalog is open, so the ids never reach another catalog's rows.
+pub fn analyze_burst_sharpness_as(
+    state: &AppState,
+    expected: CatalogIdentity,
+    photo_ids: &[i64],
+) -> Result<BurstAnalysisResult, String> {
+    analyze(state, Some(expected), photo_ids)
+}
+
+fn analyze(state: &AppState, expected: Option<CatalogIdentity>, photo_ids: &[i64]) -> Result<BurstAnalysisResult, String> {
     if photo_ids.is_empty() {
         return Ok(BurstAnalysisResult { total: 0, clusters: 0, flagged_soft: 0, flagged_best: 0, cleared: 0 });
     }
 
     // ── Step 1: settings and inputs, under the lock ───────────────────────────
-    let (burst_soft_threshold, cfg, inputs) = with_catalog(state, |c| {
+    let read = |c: &crate::catalog::Catalog| {
         let setting = |key: &str| c.get_setting(key).ok().flatten();
         let soft_t: f64 = setting(BURST_SOFT_THRESHOLD_KEY)
             .and_then(|s| s.parse().ok())
@@ -65,7 +85,11 @@ pub fn analyze_burst_sharpness(state: &AppState, photo_ids: &[i64]) -> Result<Bu
             setting("ai.burst_hamming_threshold").and_then(|s| s.parse().ok()).unwrap_or(10);
         let inputs = c.burst_inputs(photo_ids)?;
         Ok((soft_t, BurstConfig { time_gap_secs, hamming_threshold }, inputs))
-    })?;
+    };
+    let (read_from, (burst_soft_threshold, cfg, inputs)) = match expected {
+        Some(expected) => (expected, with_catalog_as(state, expected, read)?),
+        None => with_catalog_identified(state, read)?,
+    };
 
     let total = inputs.len();
     let burst_photo = |bi: &crate::catalog::BurstInput| BurstPhoto {
@@ -118,7 +142,7 @@ pub fn analyze_burst_sharpness(state: &AppState, photo_ids: &[i64]) -> Result<Bu
     }
 
     // ── Step 4: persist ───────────────────────────────────────────────────────
-    with_catalog(state, |c| c.set_burst_flags(flags))?;
+    with_catalog_as(state, read_from, |c| c.set_burst_flags(flags))?;
 
     Ok(BurstAnalysisResult { total, clusters: num_clusters, flagged_soft, flagged_best, cleared })
 }

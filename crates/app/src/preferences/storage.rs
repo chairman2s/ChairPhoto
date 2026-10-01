@@ -6,7 +6,7 @@ use super::{heading, section, status, thousands, Ctx};
 use crate::storage::{ui, CloseDialog, Runner};
 use crate::shell::style::Colors;
 use chairphoto_core::app::storage::OFFLOAD_AGE_SETTING;
-use chairphoto_core::app::{catalogs, expand_home, scans, storage as core_storage, with_catalog, AppState};
+use chairphoto_core::app::{catalogs, expand_home, scans, storage as core_storage};
 use chairphoto_core::catalog::{SafetySummary, StorageTier};
 use chairphoto_core::scanner::ScanResult;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
@@ -29,7 +29,7 @@ impl LibrarySection {
         ctx.run_in(
             window,
             cx,
-            |state| with_catalog(state, |c| Ok(c.root().to_string_lossy().to_string())),
+            |scope| scope.catalog(|c| Ok(c.root().to_string_lossy().to_string())),
             |s: &mut Self, result, window, cx| {
                 if let Ok(path) = result {
                     s.root.update(cx, |i, cx| i.set_value(path, window, cx));
@@ -39,8 +39,9 @@ impl LibrarySection {
         LibrarySection { ctx, root, status: None, busy: false }
     }
 
-    /// Set: re-root the open catalog there (`reroot_open_catalog`, the two-phase transition
-    /// that trips every job), then say to rescan.
+    /// Set: re-root the open catalog there (`reroot_open_catalog_as`, the two-phase
+    /// transition that trips every job; refused once another catalog is open), then say to
+    /// rescan.
     pub fn apply(&mut self, cx: &mut Context<Self>) {
         self.status = None;
         let root = self.root.read(cx).value().trim().to_string();
@@ -52,7 +53,7 @@ impl LibrarySection {
         cx.notify();
         self.ctx.run(
             cx,
-            move |state| catalogs::reroot_open_catalog(state, expand_home(&root)),
+            move |scope| catalogs::reroot_open_catalog_as(scope.state(), scope.identity()?, expand_home(&root)),
             |s: &mut Self, result, cx| {
                 s.busy = false;
                 match result {
@@ -113,7 +114,7 @@ pub fn since(unix_secs: i64, now: i64) -> String {
 
 impl SafetySection {
     pub fn new(ctx: Ctx, cx: &mut Context<Self>) -> Self {
-        ctx.run(cx, |state| with_catalog(state, |c| c.library_safety_summary()), |s: &mut Self, result, _| match result {
+        ctx.run(cx, |scope| scope.catalog(|c| c.library_safety_summary()), |s: &mut Self, result, _| match result {
             Ok(summary) => {
                 s.summary = Some(summary);
                 s.error = None;
@@ -294,7 +295,7 @@ impl TieringSection {
         ctx.run_in(
             window,
             cx,
-            |state| with_catalog(state, |c| c.get_setting(OFFLOAD_AGE_SETTING)),
+            |scope| scope.catalog(|c| c.get_setting(OFFLOAD_AGE_SETTING)),
             |s: &mut Self, result, window, cx| {
                 if let Ok(Some(v)) = result {
                     if v != "0" {
@@ -306,11 +307,17 @@ impl TieringSection {
         TieringSection { ctx, days, nas, status: None, busy: false, _subscriptions }
     }
 
+    /// The catalog this section is bound to (tests).
+    #[cfg(test)]
+    pub fn ctx_identity(&self) -> Option<chairphoto_core::app::CatalogIdentity> {
+        self.ctx.identity
+    }
+
     pub fn save(&mut self, cx: &mut Context<Self>) {
         let n = parse_days(&self.days.read(cx).value());
         self.ctx.run(
             cx,
-            move |state| with_catalog(state, |c| c.set_setting(OFFLOAD_AGE_SETTING, &n.to_string())),
+            move |scope| scope.catalog(|c| c.set_setting(OFFLOAD_AGE_SETTING, &n.to_string())),
             move |s: &mut Self, result, _| {
                 s.status = Some(match result {
                     Ok(()) if n > 0 => format!("Saved — photos older than {n} day(s) will be offloaded to the NAS."),
@@ -326,7 +333,8 @@ impl TieringSection {
         self.busy = true;
         self.status = Some("Offloading older photos to the NAS…".into());
         cx.notify();
-        self.ctx.run(cx, core_storage::apply_offload_policy, |s: &mut Self, result, cx| {
+        let offload = |scope: &super::Scope| core_storage::apply_offload_policy_as(scope.state(), scope.identity()?);
+        self.ctx.run(cx, offload, |s: &mut Self, result, cx| {
             s.busy = false;
             match result {
                 Ok(n) => {
@@ -392,8 +400,9 @@ impl TieringSection {
         self.status = Some("Indexing NAS photos… (this can take a while for a large archive)".into());
         cx.notify();
         let (tx, rx) = futures::channel::oneshot::channel();
-        let state: AppState = self.ctx.app.clone();
-        Runner::get(cx).spawn(move || match scans::scan_nas_folder(&state, expand_home(&path)) {
+        let scope = self.ctx.scope();
+        let scan = move || scans::scan_nas_folder_as(scope.state(), scope.identity()?, expand_home(&path));
+        Runner::get(cx).spawn(move || match scan() {
             Ok((result, enrich)) => {
                 let _ = tx.send(Ok(result));
                 enrich.run();
@@ -548,13 +557,15 @@ impl MaintenanceSection {
             cx,
         );
         let runner = Runner::get(cx);
-        let state = self.ctx.app.clone();
+        // The check and the removal both bound to the section's catalog: the confirm names
+        // that catalog's photos, so the purge must not run in another.
+        let scope = self.ctx.scope();
         let ctx = self.ctx.clone();
         cx.spawn_in(window, async move |this, cx| {
-            let finder = state.clone();
+            let finder = scope.clone();
             let found = runner
                 .run(move || {
-                    with_catalog(&finder, |c| match kind {
+                    finder.catalog(|c| match kind {
                         Removal::Unavailable => c.find_unavailable_photos(),
                         Removal::Empty => c.find_empty_photos(),
                     })
@@ -608,7 +619,7 @@ impl MaintenanceSection {
             }
             let purged = runner
                 .run(move || {
-                    with_catalog(&state, |c| match kind {
+                    scope.catalog(|c| match kind {
                         Removal::Unavailable => c.purge_unavailable_photos(),
                         Removal::Empty => c.purge_empty_photos(),
                     })
@@ -630,7 +641,8 @@ impl MaintenanceSection {
         }
         self.busy = true;
         self.set_status("Compacting the catalog… this can take a moment.", cx);
-        self.ctx.run(cx, catalogs::vacuum_catalog, |s: &mut Self, result, _| {
+        let vacuum = |scope: &super::Scope| catalogs::vacuum_catalog_as(scope.state(), scope.identity()?);
+        self.ctx.run(cx, vacuum, |s: &mut Self, result, _| {
             s.busy = false;
             s.status = Some(match result {
                 Ok(r) => compact_line(r.before_bytes, r.after_bytes),

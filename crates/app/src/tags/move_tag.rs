@@ -2,7 +2,7 @@
 //! none in its own subtree, not its current parent (`tag_tree::move_candidates`) — plus
 //! "↑ Top level" (disabled when it already is). A pick moves it and closes.
 
-use super::state::TagsState;
+use super::state::{bind_dialog, CatalogGuard, TagsState};
 use crate::shell::style::Colors;
 use crate::storage::{ui, CloseDialog};
 use chairphoto_core::catalog::TagWithCount;
@@ -13,6 +13,8 @@ use gpui_kit::{div, px, Context, Entity, EventEmitter, SharedString, Subscriptio
 
 pub struct TagMove {
     tags: Entity<TagsState>,
+    /// The tree this dialog opened over ([`bind_dialog`]): its jobs run under it.
+    guard: CatalogGuard,
     pub moving: TagWithCount,
     pub filter: Entity<InputState>,
     _subscriptions: Vec<Subscription>,
@@ -24,7 +26,8 @@ impl TagMove {
     pub fn new(tags: Entity<TagsState>, moving: TagWithCount, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let filter = cx.new(|cx| InputState::new(window, cx).placeholder("Filter parents…"));
         let changes = cx.subscribe(&filter, |_, _, _: &InputEvent, cx| cx.notify());
-        TagMove { tags, moving, filter, _subscriptions: vec![changes] }
+        let (guard, bound) = bind_dialog(&tags, cx);
+        TagMove { tags, guard, moving, filter, _subscriptions: vec![changes, bound] }
     }
 
     /// The candidate parents' ids, in list order.
@@ -35,8 +38,8 @@ impl TagMove {
 
     pub fn move_to(&mut self, parent: Option<i64>, cx: &mut Context<Self>) {
         if parent != self.moving.tag.parent_id {
-            let id = self.moving.tag.id;
-            self.tags.update(cx, |t, cx| t.move_tag(id, parent, cx));
+            let (id, guard) = (self.moving.tag.id, self.guard);
+            self.tags.update(cx, |t, cx| t.move_tag_as(guard, id, parent, cx));
         }
         cx.emit(CloseDialog);
     }

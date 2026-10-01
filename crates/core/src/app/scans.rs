@@ -36,10 +36,24 @@ pub type PhaseA<'a> =
 /// clears. Stale queue rows a previous aborted Phase B left behind are merged into this
 /// scan's Phase B (I6d), so a rescan drains them without re-walking.
 pub fn scan_two_phase(state: &AppState, phase_a: Box<PhaseA<'_>>) -> Result<(ScanResult, EnrichJob), String> {
+    scan_two_phase_as(state, None, phase_a)
+}
+
+/// [`scan_two_phase`], with `expected`: only into that catalog. Checked under the catalog
+/// lock after the generation is installed, so a switch either lands first (and this fails
+/// closed with `CATALOG_CHANGED`) or after (and trips this scan).
+fn scan_two_phase_as(
+    state: &AppState,
+    expected: Option<super::CatalogIdentity>,
+    phase_a: Box<PhaseA<'_>>,
+) -> Result<(ScanResult, EnrichJob), String> {
     let (path, root, abort) = {
         let abort = begin_scan_generation(state)?;
         let guard = state.catalog.lock().map_err(|e| e.to_string())?;
         let catalog = guard.as_ref().ok_or("No catalog is open")?;
+        if expected.is_some_and(|e| !e.is(catalog)) {
+            return Err(super::CATALOG_CHANGED.into());
+        }
         (catalog.db_path().to_path_buf(), catalog.root().to_path_buf(), abort)
     };
     let phase_a_out = Catalog::open_secondary(&path, &root).map_err(|e| e.to_string()).and_then(|scan_catalog| {
@@ -86,8 +100,26 @@ pub fn scan_folder(state: &AppState, folder: PathBuf) -> Result<(ScanResult, Enr
 
 /// Index an existing archive on a non-root volume in place — nothing is copied.
 pub fn scan_nas_folder(state: &AppState, folder: PathBuf) -> Result<(ScanResult, EnrichJob), String> {
-    scan_two_phase(
+    scan_nas_folder_in(state, None, folder)
+}
+
+/// [`scan_nas_folder`] into the catalog `expected` names only; otherwise `CATALOG_CHANGED`.
+pub fn scan_nas_folder_as(
+    state: &AppState,
+    expected: super::CatalogIdentity,
+    folder: PathBuf,
+) -> Result<(ScanResult, EnrichJob), String> {
+    scan_nas_folder_in(state, Some(expected), folder)
+}
+
+fn scan_nas_folder_in(
+    state: &AppState,
+    expected: Option<super::CatalogIdentity>,
+    folder: PathBuf,
+) -> Result<(ScanResult, EnrichJob), String> {
+    scan_two_phase_as(
         state,
+        expected,
         Box::new(move |c, abort, progress| crate::scanner::scan_external_folder_phase_a(c, &folder, abort, progress)),
     )
 }

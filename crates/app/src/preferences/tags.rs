@@ -8,7 +8,6 @@ use super::{heading, section, status, thousands, Ctx};
 use crate::model::not_yet_ported_line;
 use crate::shell::style::Colors;
 use crate::storage::{ui, Runner};
-use chairphoto_core::app::with_catalog;
 use chairphoto_core::catalog::tag_maintenance::{self, OrphanTag, SimilarTagPair, DEFAULT_MIN_SIMILARITY};
 use gpui_kit::prelude::*;
 use gpui_kit::TestSupportExt as _;
@@ -40,7 +39,7 @@ impl TagMaintenance {
     pub fn tidy(&mut self, cx: &mut Context<Self>) {
         self.status = Some("Tidying…".into());
         cx.notify();
-        self.ctx.run(cx, |state| with_catalog(state, |c| c.tidy_redundant_tags()), |s: &mut Self, result, cx| {
+        self.ctx.run(cx, |scope| scope.catalog(|c| c.tidy_redundant_tags()), |s: &mut Self, result, cx| {
             match result {
                 Ok(n) => {
                     s.status = Some(if n > 0 {
@@ -64,7 +63,7 @@ impl TagMaintenance {
         cx.notify();
         self.ctx.run(
             cx,
-            |state| with_catalog(state, |c| tag_maintenance::find_similar_tags(c.conn(), DEFAULT_MIN_SIMILARITY)),
+            |scope| scope.catalog(|c| tag_maintenance::find_similar_tags(c.conn(), DEFAULT_MIN_SIMILARITY)),
             |s: &mut Self, result, _| {
                 s.busy = None;
                 match result {
@@ -84,7 +83,7 @@ impl TagMaintenance {
         cx.notify();
         self.ctx.run(
             cx,
-            |state| with_catalog(state, |c| tag_maintenance::find_orphan_tags(c.conn())),
+            |scope| scope.catalog(|c| tag_maintenance::find_orphan_tags(c.conn())),
             |s: &mut Self, result, _| {
                 s.busy = None;
                 match result {
@@ -120,14 +119,15 @@ impl TagMaintenance {
             )
         });
         let runner = Runner::get(cx);
-        let state = self.ctx.app.clone();
+        // Bound to the catalog the orphan list was read from: the id names its tag only.
+        let scope = self.ctx.scope();
         cx.spawn(async move |this, cx| {
             if let Some(answer) = answer {
                 if answer.await != Ok(true) {
                     return;
                 }
             }
-            let deleted = runner.run(move || with_catalog(&state, |c| c.delete_tag(orphan.id))).await;
+            let deleted = runner.run(move || scope.catalog(|c| c.delete_tag(orphan.id))).await;
             this.update(cx, |s, cx| {
                 if !s.ctx.live(cx) {
                     return;

@@ -9,7 +9,17 @@
 //!
 //! The dialog is an entity the root view holds while it is open; closing drops it, and with
 //! it any answer still on its way (the `this.update` of a dropped entity fails). A catalog
-//! switch closes it (`RootView`).
+//! switch closes it (`RootView`) and gives the grid its focus back.
+//!
+//! **Catalog identity.** The dialog is opened over ids from the grid's rows, so it is bound
+//! to the catalog those rows came from (`ShellState::rows_from`): the proposals are read and
+//! every Stack is written through `with_catalog_as`, which fails closed once another catalog
+//! is open — also in the window before `catalog:switched` closes the dialog.
+//!
+//! **Thumbnails** are requested for the groups on screen plus [`OVERSCAN_GROUPS`] either
+//! side, never for all of up to 200 proposals at once, and whatever scrolled away (or was
+//! stacked or skipped) is released, as is everything when the dialog closes — so it cannot
+//! flood the image layer and evict the grid's thumbnails.
 
 use crate::image_store::{ImageState, ImageStore};
 use crate::keymap::contexts;
@@ -17,15 +27,20 @@ use crate::library::CloseDialog;
 use crate::model::AppModel;
 use crate::shell::state::ShellState;
 use crate::shell::style::Colors;
-use chairphoto_core::app::{with_catalog, AppState};
+use chairphoto_core::app::{with_catalog_as, AppState, CatalogIdentity};
 use chairphoto_core::image_pool::ImageKind;
 use chairphoto_core::stack_proposals::{StackProposal, StackProposals};
 use gpui_kit::prelude::*;
 use gpui_kit::{
     div, img, px, relative, AnyElement, Context, Entity, EventEmitter, FocusHandle, FontWeight, ObjectFit,
-    SharedString, TestSupportExt as _, Window,
+    ScrollHandle, SharedString, TestSupportExt as _, Window,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+
+/// Groups past the visible ones, either side, whose thumbnails are requested too.
+pub const OVERSCAN_GROUPS: usize = 2;
+/// Groups whose thumbnails are requested before the body's first layout says which show.
+pub const INITIAL_GROUPS: usize = 4;
 
 /// Asks the root view to close the dialog.
 pub struct Closed;
@@ -43,6 +58,11 @@ pub struct StackDialog {
     shell: Entity<ShellState>,
     images: Entity<ImageStore>,
     focus: FocusHandle,
+    /// The catalog the ids (and so the proposals) came from.
+    pub from: CatalogIdentity,
+    scroll: ScrollHandle,
+    /// The thumbnails requested for the groups last on screen: the ones to release.
+    pub requested: HashSet<i64>,
     pub result: Option<StackProposals>,
     pub error: Option<String>,
     /// Keeper chosen by hand, per group.
@@ -108,12 +128,14 @@ pub fn summary(r: &StackProposals) -> String {
 }
 
 impl StackDialog {
-    /// Open over `photo_ids` and start proposing, off the UI thread.
+    /// Open over `photo_ids`, read from the catalog `from` names, and start proposing, off
+    /// the UI thread.
     pub fn new(
         model: &Entity<AppModel>,
         shell: Entity<ShellState>,
         images: Entity<ImageStore>,
         photo_ids: Vec<i64>,
+        from: CatalogIdentity,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -122,7 +144,7 @@ impl StackDialog {
         focus.focus(window, cx);
         let state = app.clone();
         let read = cx.background_executor().spawn(async move {
-            with_catalog(&state, |c| chairphoto_core::stack_proposals::propose_stacks(c, &photo_ids))
+            with_catalog_as(&state, from, |c| chairphoto_core::stack_proposals::propose_stacks(c, &photo_ids))
         });
         cx.spawn(async move |this, cx| {
             let result = read.await;
@@ -136,11 +158,24 @@ impl StackDialog {
             .ok();
         })
         .detach();
+        // Closing (or a switch) drops the dialog: stop wanting what it asked for.
+        cx.on_release(|d: &mut Self, cx| {
+            let requested = std::mem::take(&mut d.requested);
+            if !requested.is_empty() {
+                d.images.update(cx, |store, _| {
+                    store.release_pending(|k| k.kind != ImageKind::Thumb || !requested.contains(&k.photo))
+                });
+            }
+        })
+        .detach();
         Self {
             app,
             shell,
             images,
             focus,
+            from,
+            scroll: ScrollHandle::new(),
+            requested: HashSet::new(),
             result: None,
             error: None,
             keepers: HashMap::new(),
@@ -181,8 +216,9 @@ impl StackDialog {
         let members: Vec<i64> = p.members.iter().map(|m| m.photo_id).collect();
         self.busy = Some(group);
         let state = self.app.clone();
+        let from = self.from;
         let write = cx.background_executor().spawn(async move {
-            with_catalog(&state, |c| chairphoto_core::stack_proposals::apply_stack_proposal(c, keeper, &members))
+            with_catalog_as(&state, from, |c| chairphoto_core::stack_proposals::apply_stack_proposal(c, keeper, &members))
         });
         cx.spawn(async move |this, cx| {
             let result = write.await;
@@ -205,6 +241,37 @@ impl StackDialog {
 
     fn close(&mut self, cx: &mut Context<Self>) {
         cx.emit(Closed);
+    }
+
+    /// The pending groups on screen at the body's last layout, plus [`OVERSCAN_GROUPS`]
+    /// either side; before the first layout, the first [`INITIAL_GROUPS`]. `lead` is how
+    /// many body children precede the first group.
+    fn group_window(&self, lead: usize, groups: usize) -> std::ops::Range<usize> {
+        if self.scroll.bounds_for_item(lead).is_none() {
+            return 0..groups.min(INITIAL_GROUPS);
+        }
+        let top = self.scroll.top_item().saturating_sub(lead);
+        let bottom = self.scroll.bottom_item().saturating_sub(lead);
+        let start = top.saturating_sub(OVERSCAN_GROUPS).min(groups);
+        start..(bottom + 1 + OVERSCAN_GROUPS).min(groups).max(start)
+    }
+
+    /// Request the thumbnails of `groups` (the window), release the ones asked for before
+    /// that left it, and answer what the store holds for the window.
+    fn request_window(&mut self, groups: &[StackProposal], cx: &mut Context<Self>) -> HashMap<i64, ImageState> {
+        let ids: Vec<(i64, ImageKind)> =
+            groups.iter().flat_map(|p| p.members.iter().map(|m| (m.photo_id, ImageKind::Thumb))).collect();
+        let keep: HashSet<i64> = ids.iter().map(|&(id, _)| id).collect();
+        let dropped: HashSet<i64> = self.requested.difference(&keep).copied().collect();
+        let thumbs = self.images.update(cx, |store, _| {
+            store.request_batch(&ids);
+            if !dropped.is_empty() {
+                store.release_pending(|k| k.kind != ImageKind::Thumb || !dropped.contains(&k.photo));
+            }
+            ids.iter().map(|&(id, kind)| (id, store.get(id, kind))).collect()
+        });
+        self.requested = keep;
+        thumbs
     }
 
     fn render_group(&self, p: &StackProposal, thumbs: &HashMap<i64, ImageState>, colors: Colors, cx: &mut Context<Self>) -> AnyElement {
@@ -361,16 +428,24 @@ impl Render for StackDialog {
             .as_ref()
             .map(|r| r.proposals.iter().filter(|p| !self.done.contains_key(&p.keeper_id)).cloned().collect())
             .unwrap_or_default();
-        // The pending groups' frames, through the image layer like the grid's.
-        let ids: Vec<(i64, ImageKind)> =
-            pending.iter().flat_map(|p| p.members.iter().map(|m| (m.photo_id, ImageKind::Thumb))).collect();
-        let thumbs: HashMap<i64, ImageState> = self.images.update(cx, |store, _| {
-            store.request_batch(&ids);
-            ids.iter().map(|&(id, kind)| (id, store.get(id, kind))).collect()
-        });
+        // The body's children before the first group: the error, the summary and its note.
+        let lead = usize::from(self.error.is_some())
+            + self.result.as_ref().map_or(usize::from(self.error.is_none()), |r| 1 + usize::from(!r.proposals.is_empty()));
+        let window = self.group_window(lead, pending.len());
+        let thumbs = self.request_window(&pending[window], cx);
         let stacked = self.done.values().filter(|o| **o == Outcome::Stacked).count();
 
-        let mut body = div().id("stack-body").flex().flex_col().gap(px(10.)).p(px(14.)).overflow_y_scroll().flex_1().min_h_0();
+        let mut body = div()
+            .id("stack-body")
+            .flex()
+            .flex_col()
+            .gap(px(10.))
+            .p(px(14.))
+            .overflow_y_scroll()
+            .track_scroll(&self.scroll)
+            .flex_1()
+            .min_h_0()
+            .test_support();
         if let Some(e) = &self.error {
             body = body.child(div().id("stack-error").text_size(px(12.)).text_color(colors.danger).child(e.clone()).test_support());
         }

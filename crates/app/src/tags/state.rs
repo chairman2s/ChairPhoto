@@ -6,42 +6,74 @@
 //! mutation below, which calls [`AppModel::refresh`] — React's `refresh`, which re-ran the
 //! library query *and* `listTags`). Only the newest read lands.
 //!
-//! **Writes** (and the dialogs' reads) go through [`run`]: the work runs on GPUI's background
-//! executor, never the UI thread, and its result lands in the view that asked only while the
-//! catalog it was asked against is still open. Two fences, because a catalog switch can come
-//! between any two steps:
+//! **Writes** (and the dialogs' reads) go through [`run`] / [`run_as`]: the work runs on
+//! GPUI's background executor, never the UI thread, and its result lands in the view that
+//! asked only while the catalog it was asked against is still open. Two fences, because a
+//! catalog switch can come between any two steps:
 //!
-//! - **Under the catalog lock**, a mutating job first checks the open catalog's file is the
-//!   one whose tree the view showed ([`CatalogGuard`]); if not, it writes nothing. Tag and
-//!   photo ids are per-catalog, so an id from the closed catalog would name some other row.
+//! - **Under the catalog lock**, a job runs only while the open catalog is the one the tree
+//!   was read from ([`CatalogGuard`], whose `CatalogIdentity` is captured with the tree:
+//!   `with_catalog_as`); otherwise it fails closed with `CATALOG_CHANGED`. Tag and photo ids
+//!   are per-catalog, so an id from the closed catalog would name some other row. The
+//!   identity is the open handle's, not its file: a switch away and back, or a re-root's
+//!   reopen, also counts as a change.
 //! - **On landing**, a result is dropped when `catalog:switched` arrived since the job
 //!   started (the [`TagsState::epoch`]).
+//!
+//! **Dialogs** (merge, split, editor, groups, create, move) take their guard when they open
+//! ([`bind_dialog`]) — the tree they show ids from — not when a button is clicked, and close
+//! themselves once that tree is superseded (a switch, or a re-read of another catalog).
 //!
 //! Tag writes are catalog-only: in-library tag assignments write no sidecar
 //! (`xmp::write_keywords` has one caller, the export destination — docs/taxonomy.md
 //! § Tag maintenance), so nothing here touches XMP.
 
 use crate::model::{AppModel, AppModelEvent};
-use chairphoto_core::app::{with_catalog, AppState, CoreEvent};
-use chairphoto_core::catalog::{Catalog, CatalogError, TagWithCount};
+use crate::storage::CloseDialog;
+use chairphoto_core::app::{with_catalog, with_catalog_as, with_catalog_identified, AppState, CatalogIdentity, CoreEvent, CATALOG_CHANGED};
+use chairphoto_core::catalog::{Catalog, TagWithCount};
 use chairphoto_model::tag_tree::TagIndex;
-use gpui_kit::{App, Context, Entity, Subscription, WeakEntity};
+use gpui_kit::{App, Context, Entity, EventEmitter, Subscription, WeakEntity};
+use std::cell::Cell;
 use std::rc::Rc;
-use std::path::PathBuf;
 
-/// The open catalog a job was started against: the switch epoch, and the catalog file the
-/// tree was read from (`None` until a tree has been read).
-#[derive(Debug, Clone, PartialEq)]
+/// The open catalog a job was started against: the switch epoch, and the identity of the
+/// catalog the tree was read from (`None` until a tree has been read).
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CatalogGuard {
     pub epoch: u64,
-    pub path: Option<PathBuf>,
+    pub identity: Option<CatalogIdentity>,
 }
 
 impl CatalogGuard {
     /// Whether `c` is the catalog this guard was taken on. Checked under the catalog lock.
     pub fn holds(&self, c: &Catalog) -> bool {
-        self.path.as_deref() == Some(c.db_path())
+        self.identity.is_some_and(|i| i.is(c))
     }
+
+    /// Whether `now` (the tag state's guard) names another catalog than this one: a switch
+    /// since, or a tree read from another catalog handle.
+    pub fn superseded_by(&self, now: &CatalogGuard) -> bool {
+        now.epoch != self.epoch || (now.identity.is_some() && now.identity != self.identity)
+    }
+}
+
+/// A dialog's binding to the tree it opened over: the guard its jobs run under ([`run_as`]),
+/// and a subscription that closes it (one [`CloseDialog`]) once that tree is superseded —
+/// its ids would name another catalog's tags.
+pub fn bind_dialog<V: EventEmitter<CloseDialog> + 'static>(
+    tags: &Entity<TagsState>,
+    cx: &mut Context<V>,
+) -> (CatalogGuard, Subscription) {
+    let guard = tags.read(cx).guard();
+    let closed = Rc::new(Cell::new(false));
+    let sub = cx.observe(tags, move |_, tags, cx| {
+        if !closed.get() && guard.superseded_by(&tags.read(cx).guard()) {
+            closed.set(true);
+            cx.emit(CloseDialog);
+        }
+    });
+    (guard, sub)
 }
 
 /// The dialog a tag view opened last — what a test drives. Weak: holding it must not keep a
@@ -64,8 +96,8 @@ pub struct TagsState {
     pub index: Rc<TagIndex>,
     /// A tree has been read for the open catalog.
     pub loaded: bool,
-    /// The catalog file the tree was read from.
-    catalog_path: Option<PathBuf>,
+    /// The catalog the tree was read from.
+    identity: Option<CatalogIdentity>,
     /// Bumped by every `catalog:switched`.
     epoch: u64,
     /// Bumped by every tree read; an older read's result is dropped.
@@ -94,7 +126,7 @@ impl TagsState {
             tags: Vec::new(),
             index: Rc::default(),
             loaded: false,
-            catalog_path: None,
+            identity: None,
             epoch: 0,
             generation: 0,
             revision: 0,
@@ -114,7 +146,7 @@ impl TagsState {
 
     /// The guard a job started now carries.
     pub fn guard(&self) -> CatalogGuard {
-        CatalogGuard { epoch: self.epoch, path: self.catalog_path.clone() }
+        CatalogGuard { epoch: self.epoch, identity: self.identity }
     }
 
     pub fn tag(&self, id: i64) -> Option<&TagWithCount> {
@@ -128,7 +160,7 @@ impl TagsState {
         self.tags.clear();
         self.index = Rc::default();
         self.loaded = false;
-        self.catalog_path = None;
+        self.identity = None;
         self.clipboard.clear();
         self.revision += 1;
         cx.notify();
@@ -140,7 +172,7 @@ impl TagsState {
         let (generation, epoch) = (self.generation, self.epoch);
         let state = self.app.clone();
         let read = cx.background_executor().spawn(async move {
-            with_catalog(&state, |c| Ok((c.db_path().to_path_buf(), c.list_tags_with_counts()?)))
+            with_catalog_identified(&state, |c| c.list_tags_with_counts())
         });
         cx.spawn(async move |this, cx| {
             let result = read.await;
@@ -149,10 +181,10 @@ impl TagsState {
                     return;
                 }
                 match result {
-                    Ok((path, tags)) => {
+                    Ok((identity, tags)) => {
                         s.index = Rc::new(TagIndex::new(&tags));
                         s.tags = tags;
-                        s.catalog_path = Some(path);
+                        s.identity = Some(identity);
                         s.loaded = true;
                     }
                     Err(e) => eprintln!("tags: tree unavailable: {e}"),
@@ -193,7 +225,13 @@ impl TagsState {
     /// Reparent a tag (drag-and-drop, Move to…, Move to top level). Failures go to the
     /// status line as React's `Move failed: …`.
     pub fn move_tag(&mut self, tag_id: i64, parent: Option<i64>, cx: &mut Context<Self>) {
-        self.run(cx, move |c| c.move_tag(tag_id, parent), |s, result, cx| {
+        self.move_tag_as(self.guard(), tag_id, parent, cx);
+    }
+
+    /// [`move_tag`](Self::move_tag) under `guard` — the Move dialog's, taken when it opened.
+    pub fn move_tag_as(&mut self, guard: CatalogGuard, tag_id: i64, parent: Option<i64>, cx: &mut Context<Self>) {
+        let tags = cx.entity();
+        run_on(tags, self.app.clone(), guard, cx, true, move |c| c.move_tag(tag_id, parent), |s, result, cx| {
             if let Err(e) = result {
                 s.set_status(format!("Move failed: {e}"), cx);
             }
@@ -294,11 +332,27 @@ impl TagsState {
     }
 }
 
-/// Run `work` against the open catalog on GPUI's background executor and hand its result to
-/// `then` on the view `cx` belongs to — only while the catalog it was started against is
-/// still open (see the module docs). `mutates`: the work writes, so it runs only if the open
-/// catalog is still the guard's (checked under the lock, before `work`), and a successful
-/// write calls [`TagsState::changed`] — also when the view that asked has since closed.
+/// [`run`] under a guard the caller took earlier — a dialog's, from when it opened over the
+/// tree its ids came from ([`bind_dialog`]).
+pub fn run_as<V: 'static, R: Send + 'static>(
+    tags: &Entity<TagsState>,
+    guard: &CatalogGuard,
+    cx: &mut Context<V>,
+    mutates: bool,
+    work: impl FnOnce(&Catalog) -> chairphoto_core::catalog::Result<R> + Send + 'static,
+    then: impl FnOnce(&mut V, Result<R, String>, &mut Context<V>) + 'static,
+) {
+    let state = tags.read(cx).app.clone();
+    run_on(tags.clone(), state, *guard, cx, mutates, work, then);
+}
+
+/// Run `work` against the catalog the tree was read from, on GPUI's background executor, and
+/// hand its result to `then` on the view `cx` belongs to — only while the catalog it was
+/// started against is still open (see the module docs). The work runs under the guard's
+/// catalog identity (`with_catalog_as`: `CATALOG_CHANGED` once another catalog is open); a
+/// read before any tree was read runs against the open catalog, a write then fails closed.
+/// `mutates`: a successful write calls [`TagsState::changed`] — also when the view that asked
+/// has since closed.
 pub fn run<V: 'static, R: Send + 'static>(
     tags: &Entity<TagsState>,
     cx: &mut Context<V>,
@@ -322,14 +376,12 @@ fn run_on<V: 'static, R: Send + 'static>(
     work: impl FnOnce(&Catalog) -> chairphoto_core::catalog::Result<R> + Send + 'static,
     then: impl FnOnce(&mut V, Result<R, String>, &mut Context<V>) + 'static,
 ) {
-    let fence = guard.clone();
     let job = cx.background_executor().spawn(async move {
-        with_catalog(&state, |c| {
-            if mutates && !fence.holds(c) {
-                return Err(CatalogError::Tag("the catalog changed; nothing was written".into()));
-            }
-            work(c)
-        })
+        match guard.identity {
+            Some(identity) => with_catalog_as(&state, identity, work),
+            None if !mutates => with_catalog(&state, work),
+            None => Err(CATALOG_CHANGED.to_string()),
+        }
     });
     cx.spawn(async move |this, cx| {
         let result = job.await;

@@ -18,7 +18,7 @@
 //! keys are not written to it yet, so they start at React's defaults each launch.
 
 use crate::model::{AppModel, AppModelEvent, DeepLinkTarget};
-use chairphoto_core::app::{with_catalog, AppState, CoreEvent};
+use chairphoto_core::app::{with_catalog, with_catalog_as, with_catalog_identified, AppState, CatalogIdentity, CoreEvent};
 use chairphoto_core::catalog::{
     Album, Catalog, Facet, ImportBatch, Photo, PhotoPage, PhotoQuery, PhotoVersion, PickState, SmartAlbum,
     SOFT_THRESHOLD_DEFAULT, SOFT_THRESHOLD_KEY,
@@ -281,6 +281,8 @@ impl Mark {
 pub struct PendingPhotoLink {
     pub photo: Photo,
     pub view: DeepLinkView,
+    /// The catalog the link resolved against: it is applied only over rows from that one.
+    pub from: CatalogIdentity,
 }
 
 /// The shell's state. See the module docs.
@@ -306,6 +308,11 @@ pub struct ShellState {
     pub rows_loaded: bool,
     /// The generation of the row read still in flight, if any.
     rows_pending: Option<u64>,
+    /// The catalog the rows — and so every id in the selection — were read from. Every
+    /// write keyed by those ids (marks, burst analysis, stacks, the inspector's) is bound to
+    /// it (`with_catalog_as`), so it fails closed once another catalog is open, even before
+    /// `catalog:switched` reaches the shell. `None` until rows land, and after a switch.
+    rows_from: Option<CatalogIdentity>,
     /// A photo link waiting for the grid to list its photo.
     pub pending_link: Option<PendingPhotoLink>,
     /// The version of the active photo the loupe shows (`None` = Original): picked in the
@@ -363,6 +370,7 @@ impl ShellState {
             soft_threshold: SOFT_THRESHOLD_DEFAULT,
             rows_loaded: false,
             rows_pending: None,
+            rows_from: None,
             pending_link: None,
             active_version: None,
             editing_tag: None,
@@ -548,14 +556,22 @@ impl ShellState {
 
     // --- the Library's rows ----------------------------------------------------------
 
-    /// Re-run the current query off the UI thread (`list_photos`). Only the newest read
-    /// lands: the session drops a page whose generation is stale.
+    /// The catalog the rows shown were read from ([`Self::rows_from`]'s field docs): what a
+    /// write keyed by their ids, or by the selection's, is bound to.
+    pub fn rows_from(&self) -> Option<CatalogIdentity> {
+        self.rows_from
+    }
+
+    /// Re-run the current query off the UI thread (`list_photos`), with the identity of the
+    /// catalog it read. Only the newest read lands: the session drops a page whose
+    /// generation is stale.
     pub fn refresh_rows(&mut self, cx: &mut Context<Self>) {
         let request = self.library.refresh();
         self.rows_pending = Some(request.generation);
         let state = self.app.clone();
         let query = request.query.clone();
-        let read = cx.background_executor().spawn(async move { with_catalog(&state, |c| c.photo_page(&query)) });
+        let read =
+            cx.background_executor().spawn(async move { with_catalog_identified(&state, |c| c.photo_page(&query)) });
         cx.spawn(async move |this, cx| {
             let page = read.await;
             this.update(cx, |s, cx| s.on_page(&request, page, cx)).ok();
@@ -563,8 +579,30 @@ impl ShellState {
         .detach();
     }
 
-    pub(crate) fn on_page(&mut self, request: &RefreshRequest, page: Result<PhotoPage, String>, cx: &mut Context<Self>) {
+    /// A row read's answer. A page from another catalog than the rows shown (the core has
+    /// switched, `catalog:switched` is still on its way; or a re-root reopened the catalog)
+    /// empties the selection first: its ids were chosen from the other catalog's rows.
+    pub(crate) fn on_page(
+        &mut self,
+        request: &RefreshRequest,
+        page: Result<(CatalogIdentity, PhotoPage), String>,
+        cx: &mut Context<Self>,
+    ) {
         let landed = self.rows_pending == Some(request.generation);
+        let page = match page {
+            Ok((from, page)) => {
+                if landed {
+                    if self.rows_from.is_some_and(|shown| shown != from) {
+                        self.library.clear_selection();
+                        self.pending_link = None;
+                        self.active_version = None;
+                    }
+                    self.rows_from = Some(from);
+                }
+                Ok(page)
+            }
+            Err(e) => Err(e),
+        };
         match self.library.apply_page(request, page) {
             Ok(statuses) => {
                 if let Some(statuses) = statuses {
@@ -623,26 +661,29 @@ impl ShellState {
     /// refreshed ones the photo may have been filtered out of (`step_active_over`). The
     /// bench's controls pass `false`: clicking a star must not move the selection.
     ///
-    /// Writes run off the UI thread, one after another in the order they were made. A
-    /// write still queued at a catalog switch is dropped: its ids name the closed catalog's
-    /// photos. (One already running when the switch lands cannot be recalled; the switch
-    /// itself is Storage and import, #114.)
+    /// Writes run off the UI thread, one after another in the order they were made, each
+    /// bound to the catalog its ids were read from ([`Self::rows_from`]): once another
+    /// catalog is open the write fails closed (`CATALOG_CHANGED`) and the status line says
+    /// so — whether or not `catalog:switched` has reached the shell yet. A write still
+    /// queued when the event arrives is dropped without running.
     pub fn apply_mark(&mut self, mark: Mark, advance: bool, cx: &mut Context<Self>) {
         let targets = self.library.selection().targets;
+        let Some(from) = self.rows_from else { return };
         if targets.is_empty() {
             return;
         }
         let snapshot = (advance && targets.len() == 1).then(|| self.library.step_snapshot());
-        self.queue_mark(mark, targets, snapshot, cx);
+        self.queue_mark(mark, targets, from, snapshot, cx);
     }
 
     /// [`apply_mark`](Self::apply_mark) on named photos rather than the selection, never
     /// advancing: the inspector's stars, pick and label controls mark the photo it shows
-    /// (`PhotoInspector.tsx` wrote `photo.id` only, not the selection). The same queue, so
-    /// these marks and the keys' land in the order they were made.
-    pub fn apply_mark_to(&mut self, mark: Mark, targets: Vec<i64>, cx: &mut Context<Self>) {
+    /// (`PhotoInspector.tsx` wrote `photo.id` only, not the selection). `from` is the catalog
+    /// the caller read `targets` from. The same queue, so these marks and the keys' land in
+    /// the order they were made.
+    pub fn apply_mark_to(&mut self, mark: Mark, targets: Vec<i64>, from: CatalogIdentity, cx: &mut Context<Self>) {
         if !targets.is_empty() {
-            self.queue_mark(mark, targets, None, cx);
+            self.queue_mark(mark, targets, from, None, cx);
         }
     }
 
@@ -650,6 +691,7 @@ impl ShellState {
         &mut self,
         mark: Mark,
         targets: Vec<i64>,
+        from: CatalogIdentity,
         snapshot: Option<chairphoto_model::library::session::StepSnapshot>,
         cx: &mut Context<Self>,
     ) {
@@ -665,7 +707,7 @@ impl ShellState {
                 return;
             }
             let write = cx.background_executor().spawn(async move {
-                with_catalog(&state, |c| targets.iter().try_for_each(|&id| mark.write(c, id).map(drop)))
+                with_catalog_as(&state, from, |c| targets.iter().try_for_each(|&id| mark.write(c, id).map(drop)))
             });
             let result = write.await;
             this.update(cx, |s, cx| {
@@ -689,19 +731,21 @@ impl ShellState {
 
     /// Run burst-relative sharpness analysis over the selection, else the whole view
     /// (App.tsx's `runBurstAnalysis`), off the UI thread; report on the status line and
-    /// re-read the rows for the new badges.
+    /// re-read the rows for the new badges. Bound to the catalog the rows came from
+    /// (`analyze_burst_sharpness_as`): after a switch it fails closed rather than flag the
+    /// new catalog's photos that carry the same ids.
     pub fn analyse_burst(&mut self, cx: &mut Context<Self>) {
         let targets = self.whole_view_targets();
-        if targets.is_empty() {
+        let Some(from) = self.rows_from.filter(|_| !targets.is_empty()) else {
             self.model.update(cx, |m, cx| m.set_status("No photos to analyse — scan or select some first.", cx));
             return;
-        }
+        };
         let status = format!("Analysing burst sharpness for {} photos…", targets.len());
         self.model.update(cx, |m, cx| m.set_status(status, cx));
         let generation = self.catalog_generation;
         let state = self.app.clone();
         let run = cx.background_executor().spawn(async move {
-            chairphoto_core::burst_analysis::analyze_burst_sharpness(&state, &targets)
+            chairphoto_core::burst_analysis::analyze_burst_sharpness_as(&state, from, &targets)
         });
         cx.spawn(async move |this, cx| {
             let result = run.await;
@@ -743,8 +787,8 @@ impl ShellState {
     pub fn apply_deep_link(&mut self, target: DeepLinkTarget, cx: &mut Context<Self>) {
         self.surface = Surface::Library;
         match target {
-            DeepLinkTarget::Photo { photo, view, .. } => {
-                self.pending_link = Some(PendingPhotoLink { photo: *photo, view });
+            DeepLinkTarget::Photo { photo, view, from, .. } => {
+                self.pending_link = Some(PendingPhotoLink { photo: *photo, view, from });
                 // `clear_scope` always changes the query, so the rows are re-read and the
                 // link is applied when they land.
                 self.update_scope(cx, |l| l.clear_scope());
@@ -761,6 +805,10 @@ impl ShellState {
     /// grid never lists, is viewed off-grid. Otherwise keep waiting for the next rows.
     fn apply_pending_link(&mut self, cx: &mut Context<Self>) {
         let Some(link) = self.pending_link.take() else { return };
+        // Resolved against another catalog than these rows: its id names another photo here.
+        if self.rows_from != Some(link.from) {
+            return;
+        }
         let id = link.photo.id;
         if self.library.photos().iter().any(|p| p.id == id) {
             self.library.select(id, SelectMods::default());
@@ -790,6 +838,7 @@ impl ShellState {
                 self.library.reset();
                 self.rows_loaded = false;
                 self.rows_pending = None;
+                self.rows_from = None;
                 self.pending_link = None;
                 self.active_version = None;
                 self.editing_tag = None;

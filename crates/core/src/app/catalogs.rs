@@ -8,7 +8,7 @@
 //! ([`detach_catalog_and_trip_jobs`], [`publish_catalog_and_reset_jobs`]) `set_library_root`
 //! runs too.
 
-use super::{app_data_dir, begin_scan_generation, expand_home, spawn_blocking, AppState};
+use super::{app_data_dir, begin_scan_generation, expand_home, spawn_blocking, AppState, CatalogIdentity, CATALOG_CHANGED};
 use super::events::{CoreEvent, EventSink};
 use crate::catalog::Catalog;
 use serde::{Deserialize, Serialize};
@@ -322,8 +322,22 @@ pub fn detach_catalog_and_trip_jobs_with(
 /// The status slots are left alone — each aborted worker clears its own on the way out, and
 /// only if it still owns it.
 pub fn publish_catalog_and_reset_jobs(state: &AppState, catalog: Catalog) -> Result<Arc<AtomicBool>, String> {
+    publish(state, catalog, false)
+}
+
+/// What a re-root answers when another catalog was published between its two phases.
+pub const REROOT_OVERTAKEN: &str =
+    "Another catalog was opened while the library folder changed; the new folder is saved in the old catalog, which was not reopened";
+
+/// Phase two; with `only_if_vacant` it fails closed ([`REROOT_OVERTAKEN`]), before any
+/// mutation, when a catalog is already published — a switch that ran both its phases while
+/// this transition's caller was between its own.
+fn publish(state: &AppState, catalog: Catalog, only_if_vacant: bool) -> Result<Arc<AtomicBool>, String> {
     let mut cat_guard = state.catalog.lock().map_err(|e| e.to_string())?;
     let job_guards = state.jobs.lock_for_publish()?;
+    if only_if_vacant && cat_guard.is_some() {
+        return Err(REROOT_OVERTAKEN.into());
+    }
     let fresh_abort = job_guards.trip_and_replace_all();
     *cat_guard = Some(catalog);
     Ok(fresh_abort)
@@ -348,26 +362,51 @@ pub fn publish_catalog_and_reset_jobs(state: &AppState, catalog: Catalog) -> Res
 /// over the root argument it is passed. That write rides inside phase one via
 /// [`detach_catalog_and_trip_jobs_with`], so persist, trip and drop stay one transition.
 ///
+/// **A switch racing the re-root.** Phase one runs under the catalog lock, but the reopen
+/// between the phases does not: a `switch_catalog` can run both of its phases there and
+/// publish its catalog. Phase two then fails closed ([`REROOT_OVERTAKEN`]) instead of
+/// publishing the reopened catalog over the one the switch opened (and announced); the new
+/// root stays persisted in the re-rooted catalog for its next open. A switch whose phase one
+/// lands between them, with its phase two still to come, publishes over the re-root — the
+/// later request wins, and it announces itself with `catalog:switched`.
+///
 /// Emits no `catalog:switched` (the Tauri command never did); the caller refreshes what it
 /// shows.
 pub fn reroot_library(state: &AppState, new_root: PathBuf, catalog_path: &Path) -> Result<(), String> {
-    reroot(state, new_root, Some(catalog_path))
+    reroot(state, new_root, Some(catalog_path), None, || ())
 }
 
 /// [`reroot_library`] for the catalog that is open, whichever it is: the reopen uses the
-/// outgoing handle's own database path, read inside phase one, so a switch racing the
-/// re-root cannot make it reopen a different file.
+/// outgoing handle's own database path, read inside phase one, so the file reopened is the
+/// one whose root was just persisted. That alone does not settle a switch racing the
+/// re-root — one that publishes between the phases is the case [`REROOT_OVERTAKEN`]
+/// handles (see [`reroot_library`]); one that lands before phase one is refused only by
+/// [`reroot_open_catalog_as`], which the GPUI app's Preferences uses.
 ///
 /// The Tauri command reopens the *default* catalog (`default_catalog_path`), which is only
 /// the same thing while the default catalog is the open one: with another catalog open it
 /// writes the root into that catalog and then reopens the default one at its own stored
 /// root. The GPUI app's Preferences uses this instead.
 pub fn reroot_open_catalog(state: &AppState, new_root: PathBuf) -> Result<(), String> {
-    reroot(state, new_root, None)
+    reroot(state, new_root, None, None, || ())
 }
 
-/// The re-root; `catalog_path` `None` = the open catalog's own file.
-fn reroot(state: &AppState, new_root: PathBuf, catalog_path: Option<&Path>) -> Result<(), String> {
+/// [`reroot_open_catalog`], only while the open catalog is `expected` (the one the user set
+/// the folder in): otherwise it fails closed with `CATALOG_CHANGED` in phase one, before
+/// anything is persisted or tripped.
+pub fn reroot_open_catalog_as(state: &AppState, expected: CatalogIdentity, new_root: PathBuf) -> Result<(), String> {
+    reroot(state, new_root, None, Some(expected), || ())
+}
+
+/// The re-root; `catalog_path` `None` = the open catalog's own file. `between` runs between
+/// the phases (tests force a racing switch there).
+fn reroot(
+    state: &AppState,
+    new_root: PathBuf,
+    catalog_path: Option<&Path>,
+    expected: Option<CatalogIdentity>,
+    between: impl FnOnce(),
+) -> Result<(), String> {
     // Before anything is tripped, so a bad path fails with every job still running.
     std::fs::create_dir_all(&new_root).map_err(|e| e.to_string())?;
 
@@ -377,6 +416,9 @@ fn reroot(state: &AppState, new_root: PathBuf, catalog_path: Option<&Path>) -> R
     let mut reopen = catalog_path.map(Path::to_path_buf);
     detach_catalog_and_trip_jobs_with(state, |catalog| {
         let catalog = catalog.ok_or("No catalog is open")?;
+        if expected.is_some_and(|e| !e.is(catalog)) {
+            return Err(CATALOG_CHANGED.into());
+        }
         catalog.set_setting("catalog_root", &new_root.to_string_lossy()).map_err(|e| e.to_string())?;
         reopen.get_or_insert_with(|| catalog.db_path().to_path_buf());
         Ok(())
@@ -385,10 +427,12 @@ fn reroot(state: &AppState, new_root: PathBuf, catalog_path: Option<&Path>) -> R
 
     // Runs migrations.
     let reopened = Catalog::open(&catalog_path, &new_root).map_err(|e| e.to_string())?;
+    between();
 
     // Phase two: publish it with fresh un-tripped generations, tripping whatever a racing
-    // start installed while the catalog was `None` so it cannot survive unreachable.
-    publish_catalog_and_reset_jobs(state, reopened)?;
+    // start installed while the catalog was `None` so it cannot survive unreachable — unless a
+    // switch published its own catalog meanwhile (see `reroot_library`).
+    publish(state, reopened, true)?;
     // The catalog-root volume's base path just moved — drop cached reachability.
     state.volume_health.invalidate();
     Ok(())
@@ -406,10 +450,22 @@ pub struct VacuumResult {
 /// shed retired columns. Holds the catalog lock for its duration — **blocking**, run it on the
 /// blocking pool. Returns the size before and after.
 pub fn vacuum_catalog(state: &AppState) -> Result<VacuumResult, String> {
+    vacuum(state, None)
+}
+
+/// [`vacuum_catalog`], only while the open catalog is `expected`; else `CATALOG_CHANGED`.
+pub fn vacuum_catalog_as(state: &AppState, expected: CatalogIdentity) -> Result<VacuumResult, String> {
+    vacuum(state, Some(expected))
+}
+
+fn vacuum(state: &AppState, expected: Option<CatalogIdentity>) -> Result<VacuumResult, String> {
     // `&mut`: compaction also sheds retired columns, which changes the connection's own view
     // of the table shape (see `Catalog::vacuum`).
     let mut guard = state.catalog.lock().map_err(|e| e.to_string())?;
     let catalog = guard.as_mut().ok_or("No catalog is open")?;
+    if expected.is_some_and(|e| !e.is(catalog)) {
+        return Err(CATALOG_CHANGED.into());
+    }
     let before = catalog.db_size_bytes().map_err(|e| e.to_string())?;
     catalog.vacuum().map_err(|e| e.to_string())?;
     let after = catalog.db_size_bytes().map_err(|e| e.to_string())?;
@@ -741,6 +797,59 @@ mod switch_tests {
         let err = reroot_library(&state, dir.join("r"), &dir.join("a.chairphoto")).unwrap_err();
         assert_eq!(err, "No catalog is open");
         assert!(!import.load(Ordering::Relaxed));
+    }
+
+    /// **Forced interleaving** (#113 review, finding 3). A switch runs both its phases while
+    /// a re-root is between its own: the re-root fails closed and the switch's catalog stays
+    /// published; the new root is persisted in the re-rooted catalog file.
+    #[test]
+    fn a_reroot_overtaken_by_a_switch_does_not_publish_over_it() {
+        // A switch's phase one releases develop's process-global resident set: not while a
+        // develop test holds it.
+        #[cfg(all(feature = "raw", feature = "edit"))]
+        let _serial = crate::develop::serial();
+        let dir = crate::test_support::TestTmpDir::new("reroot-race");
+        let state = AppState::default();
+        let db = dir.join("a.chairphoto");
+        *state.catalog.lock().unwrap() = Some(Catalog::open(&db, &dir.join("old")).unwrap());
+        let b = Catalog::open(&dir.join("b.chairphoto"), &dir.join("b")).unwrap();
+        let b_id = b.instance_id();
+        let new_root = dir.join("new");
+        let err = reroot(&state, new_root.clone(), None, None, || {
+            detach_catalog_and_trip_jobs(&state).unwrap();
+            publish_catalog_and_reset_jobs(&state, b).unwrap();
+        })
+        .unwrap_err();
+        assert_eq!(err, REROOT_OVERTAKEN);
+        assert_eq!(state.catalog.lock().unwrap().as_ref().unwrap().instance_id(), b_id, "the switch's catalog was replaced");
+        let reopened = Catalog::open(&db, &dir.join("ignored")).unwrap();
+        assert_eq!(reopened.root(), new_root.as_path(), "the new root was persisted in the re-rooted catalog");
+    }
+
+    /// A re-root bound to a catalog that is no longer open fails closed before it persists
+    /// or trips anything; the open catalog keeps its root.
+    #[test]
+    fn a_reroot_bound_to_a_closed_catalog_fails_closed() {
+        // A switch's phase one releases develop's process-global resident set: not while a
+        // develop test holds it.
+        #[cfg(all(feature = "raw", feature = "edit"))]
+        let _serial = crate::develop::serial();
+        let dir = crate::test_support::TestTmpDir::new("reroot-as");
+        let state = AppState::default();
+        *state.catalog.lock().unwrap() = Some(Catalog::open(&dir.join("a.chairphoto"), &dir.join("a")).unwrap());
+        let a = super::super::catalog_identity(&state).unwrap();
+        detach_catalog_and_trip_jobs(&state).unwrap();
+        publish_catalog_and_reset_jobs(&state, Catalog::open(&dir.join("b.chairphoto"), &dir.join("b")).unwrap()).unwrap();
+        let import = state.jobs.import.install_fresh().unwrap();
+        assert_eq!(reroot_open_catalog_as(&state, a, dir.join("new")).unwrap_err(), CATALOG_CHANGED);
+        assert!(!import.load(Ordering::Relaxed), "a refused re-root tripped a job");
+        assert_eq!(state.catalog.lock().unwrap().as_ref().unwrap().root(), dir.join("b").as_path());
+        assert_eq!(vacuum_catalog_as(&state, a).unwrap_err(), CATALOG_CHANGED);
+        assert_eq!(crate::app::storage::apply_offload_policy_as(&state, a).unwrap_err(), CATALOG_CHANGED);
+        let scanned = crate::app::scans::scan_nas_folder_as(&state, a, dir.join("nas")).map(drop);
+        assert_eq!(scanned.unwrap_err(), CATALOG_CHANGED);
+        let b = super::super::catalog_identity(&state).unwrap();
+        assert!(vacuum_catalog_as(&state, b).is_ok(), "bound to the open catalog, it runs");
     }
 
     /// VACUUM reports the file's size before and after, and needs an open catalog.

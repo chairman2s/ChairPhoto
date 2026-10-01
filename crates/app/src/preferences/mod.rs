@@ -22,9 +22,16 @@
 //! shown and dropped when another is; each reads what it shows as it is built. Every read
 //! and write runs on the [`Runner`] ([`Ctx::run`]), never the UI thread, and its result
 //! reaches the section through a weak handle, only while the catalog it was started against
-//! is still open: a `catalog:switched` rebuilds the open tab's sections, so a result from
-//! before the switch finds its section gone and is dropped ([`Ctx::live`] checks the epoch
-//! too).
+//! is still open: a `catalog:switched` (or a re-root, which reopens the catalog) rebuilds the
+//! open tab's sections, so a result from before it finds its section gone and is dropped
+//! ([`Ctx::live`] checks the epoch and the identity too).
+//!
+//! **Catalog identity.** A tab is built bound to the catalog the model last read
+//! ([`AppModel::catalog_identity`]); its work gets a [`Scope`] whose catalog access goes
+//! through `with_catalog_as`. So a read, a settings write or a delete queued in one catalog
+//! fails closed (`CATALOG_CHANGED`) when it runs after the core switched to another — also
+//! before `catalog:switched` reaches the dialog — instead of landing on the other catalog's
+//! settings or on its rows with the same ids.
 //!
 //! **Dropped** (parity.md): the GlSpike probe ("Run WebGL probe", `editor.glSpike.lastReport`).
 //! **Not here yet:** "Merge X away…" opens the tag merge preview, `TagMergeModal`, which the
@@ -43,7 +50,7 @@ use crate::shell::ShellState;
 use crate::storage::volumes::VolumesPanel;
 use crate::storage::{CloseDialog, Runner};
 use crate::view::RootView;
-use chairphoto_core::app::AppState;
+use chairphoto_core::app::{with_catalog_as, AppState, CatalogIdentity};
 use gpui_kit::component::WindowExt as _;
 use gpui_kit::prelude::*;
 use gpui_kit::TestSupportExt as _;
@@ -93,24 +100,64 @@ pub struct Ctx {
     pub shell: Entity<ShellState>,
     /// [`AppModel::catalog_epoch`] when the section was built.
     pub epoch: u64,
+    /// The catalog the section was built for ([`AppModel::catalog_identity`] then): every
+    /// catalog access of its work is bound to it ([`Scope`]).
+    pub identity: Option<CatalogIdentity>,
+}
+
+/// What a section's queued work runs against: the core state and the catalog the section
+/// was built for. Catalog access goes through [`Scope::catalog`], which fails closed with
+/// `CATALOG_CHANGED` once another catalog is open; core functions that touch the catalog
+/// themselves get [`Scope::identity`].
+#[derive(Clone)]
+pub struct Scope {
+    state: AppState,
+    identity: Option<CatalogIdentity>,
+}
+
+impl Scope {
+    /// For work that is not the catalog's (the decode cache, which editors are on `PATH`).
+    pub fn state(&self) -> &AppState {
+        &self.state
+    }
+
+    /// The catalog the work is bound to.
+    pub fn identity(&self) -> Result<CatalogIdentity, String> {
+        self.identity.ok_or_else(|| "No catalog is open".to_string())
+    }
+
+    /// `f` against the catalog the work is bound to (`with_catalog_as`).
+    pub fn catalog<T>(
+        &self,
+        f: impl FnOnce(&chairphoto_core::catalog::Catalog) -> chairphoto_core::catalog::Result<T>,
+    ) -> Result<T, String> {
+        with_catalog_as(&self.state, self.identity()?, f)
+    }
 }
 
 impl Ctx {
     /// Still the catalog the section was built for.
     pub fn live(&self, cx: &App) -> bool {
-        self.model.read(cx).catalog_epoch == self.epoch
+        let model = self.model.read(cx);
+        model.catalog_epoch == self.epoch && model.catalog_identity() == self.identity
+    }
+
+    /// The [`Scope`] this section's work runs in.
+    pub fn scope(&self) -> Scope {
+        Scope { state: self.app.clone(), identity: self.identity }
     }
 
     /// Run `work` on the [`Runner`] and hand its result to `apply` on the UI thread — only if
-    /// the section still exists and its catalog is still open.
+    /// the section still exists and its catalog is still open. `work`'s catalog access is
+    /// bound to the section's catalog ([`Scope`]).
     pub fn run<V: 'static, R: Send + 'static>(
         &self,
         cx: &mut Context<V>,
-        work: impl FnOnce(&AppState) -> R + Send + 'static,
+        work: impl FnOnce(&Scope) -> R + Send + 'static,
         apply: impl FnOnce(&mut V, R, &mut Context<V>) + 'static,
     ) {
-        let state = self.app.clone();
-        let rx = Runner::get(cx).run(move || work(&state));
+        let scope = self.scope();
+        let rx = Runner::get(cx).run(move || work(&scope));
         let ctx = self.clone();
         cx.spawn(async move |this, cx| {
             let Ok(result) = rx.await else { return };
@@ -130,11 +177,11 @@ impl Ctx {
         &self,
         window: &mut Window,
         cx: &mut Context<V>,
-        work: impl FnOnce(&AppState) -> R + Send + 'static,
+        work: impl FnOnce(&Scope) -> R + Send + 'static,
         apply: impl FnOnce(&mut V, R, &mut Window, &mut Context<V>) + 'static,
     ) {
-        let state = self.app.clone();
-        let rx = Runner::get(cx).run(move || work(&state));
+        let scope = self.scope();
+        let rx = Runner::get(cx).run(move || work(&scope));
         let ctx = self.clone();
         cx.spawn_in(window, async move |this, cx| {
             let Ok(result) = rx.await else { return };
@@ -194,8 +241,9 @@ pub struct Preferences {
     /// The tab shown.
     pub tab: Tab,
     pub content: Content,
-    /// The catalog epoch [`Self::content`] was built in.
+    /// The catalog epoch and identity [`Self::content`] was built in.
     epoch: u64,
+    identity: Option<CatalogIdentity>,
     /// The sections' own subscriptions (Safety's "Show me" closes the dialog).
     content_subscriptions: Vec<Subscription>,
     _subscriptions: Vec<Subscription>,
@@ -221,10 +269,12 @@ impl Preferences {
         let app = model.read(cx).state().clone();
         let epoch = model.read(cx).catalog_epoch;
         let _subscriptions = vec![
-            // A catalog switch: rebuild the open tab against the new catalog; whatever the
-            // old sections still had in flight finds them gone.
+            // A catalog switch (or a re-root's reopen, or the first read): rebuild the open tab
+            // against the catalog now open; whatever the old sections still had in flight
+            // finds them gone.
             cx.observe_in(&model, window, |this, model, window, cx| {
-                if model.read(cx).catalog_epoch != this.epoch {
+                let m = model.read(cx);
+                if m.catalog_epoch != this.epoch || m.catalog_identity() != this.identity {
                     this.rebuild(window, cx);
                 }
             }),
@@ -249,6 +299,7 @@ impl Preferences {
             tab,
             content: placeholder,
             epoch,
+            identity: None,
             content_subscriptions: Vec::new(),
             _subscriptions,
         };
@@ -262,7 +313,14 @@ impl Preferences {
     }
 
     fn ctx(&self, cx: &App) -> Ctx {
-        Ctx { app: self.app.clone(), model: self.model.clone(), shell: self.shell.clone(), epoch: self.model.read(cx).catalog_epoch }
+        let model = self.model.read(cx);
+        Ctx {
+            app: self.app.clone(),
+            model: self.model.clone(),
+            shell: self.shell.clone(),
+            epoch: model.catalog_epoch,
+            identity: model.catalog_identity(),
+        }
     }
 
     /// The enabled modules with settings panels, in registration order: `(id, name)`.
@@ -285,6 +343,7 @@ impl Preferences {
     fn rebuild(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let ctx = self.ctx(cx);
         self.epoch = ctx.epoch;
+        self.identity = ctx.identity;
         self.content_subscriptions.clear();
         self.content = match &self.tab {
             Tab::Storage => {

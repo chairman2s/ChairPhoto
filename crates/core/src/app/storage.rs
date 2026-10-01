@@ -66,6 +66,41 @@ fn backup_in(cat: &impl CatalogAccess, photo_id: i64, backup_id: i64) -> Result<
     cat.with(|c| c.record_copy(photo_id, volume_id, &rel, LocationRole::Backup, &outcome))
 }
 
+/// A connection of its own to the catalog `expected` names, if that is the open one —
+/// otherwise `CATALOG_CHANGED`. For a one-photo lifecycle step a front end started on ids it
+/// read from that catalog: its plan, file IO and record then all run against that catalog
+/// even if a switch lands mid-copy (as a drain's do, [`ReconcileClaim`]), instead of
+/// recording into whichever catalog is open by then.
+fn bound(state: &AppState, expected: super::CatalogIdentity) -> Result<Catalog, String> {
+    let (db, root) = super::with_catalog_as(state, expected, |c| Ok((c.db_path().to_path_buf(), c.root().to_path_buf())))?;
+    Catalog::open_secondary(&db, &root).map_err(|e| e.to_string())
+}
+
+/// [`backup_photo`] of a photo read from the catalog `expected` names (see [`bound`]).
+pub fn backup_photo_as(state: &AppState, expected: super::CatalogIdentity, photo_id: i64) -> Result<(), String> {
+    let cat = bound(state, expected)?;
+    let backup_id = cat.with(|c| single_volume_of_kind(c, VolumeKind::Backup, "backup"))?;
+    backup_in(&cat, photo_id, backup_id)
+}
+
+/// Queue a backup of a photo read from the catalog `expected` names; `CATALOG_CHANGED` once
+/// another is open.
+pub fn enqueue_backup_as(state: &AppState, expected: super::CatalogIdentity, photo_id: i64) -> Result<(), String> {
+    super::with_catalog_as(state, expected, |c| c.enqueue_operation("backup", photo_id)).map(drop)
+}
+
+/// [`offload_photo`] of a photo read from the catalog `expected` names (see [`bound`]).
+pub fn offload_photo_as(state: &AppState, expected: super::CatalogIdentity, photo_id: i64) -> Result<(), String> {
+    offload_in(&bound(state, expected)?, photo_id)
+}
+
+/// [`restore_photo`] of a photo read from the catalog `expected` names (see [`bound`]).
+pub fn restore_photo_as(state: &AppState, expected: super::CatalogIdentity, photo_id: i64) -> Result<(), String> {
+    let cat = bound(state, expected)?;
+    let local_id = cat.with(|c| single_volume_of_kind(c, VolumeKind::Local, "local"))?;
+    restore_in(&cat, photo_id, local_id)
+}
+
 /// Free a photo's local copies, only after re-verifying its backup. Persists an id-keyed
 /// thumbnail from a local copy first, so the photo stays visible once only the NAS copy
 /// remains.
@@ -143,6 +178,12 @@ pub fn apply_offload_policy(state: &AppState) -> Result<usize, String> {
     claim_reconcile(state)?.apply_offload_policy()
 }
 
+/// [`apply_offload_policy`] claimed only while the open catalog is `expected` (the one the
+/// user asked in); otherwise `CATALOG_CHANGED`, with no generation installed.
+pub fn apply_offload_policy_as(state: &AppState, expected: super::CatalogIdentity) -> Result<usize, String> {
+    claim(state, Some(expected))?.apply_offload_policy()
+}
+
 // ── Reconcile ────────────────────────────────────────────────────────────────
 
 /// A back-up drain's (or the offload policy's) ownership: the reconcile generation it
@@ -168,8 +209,15 @@ pub struct ReconcileClaim {
 /// un-tripped generation for a catalog that has been replaced. Blocking (the catalog lock):
 /// run it on a worker.
 pub fn claim_reconcile(state: &AppState) -> Result<ReconcileClaim, String> {
+    claim(state, None)
+}
+
+fn claim(state: &AppState, expected: Option<super::CatalogIdentity>) -> Result<ReconcileClaim, String> {
     let guard = state.catalog.lock().map_err(|e| e.to_string())?;
     let c = guard.as_ref().ok_or("No catalog is open")?;
+    if expected.is_some_and(|e| !e.is(c)) {
+        return Err(super::CATALOG_CHANGED.into());
+    }
     let (db_path, root) = (c.db_path().to_path_buf(), c.root().to_path_buf());
     let abort = state.jobs.reconcile.install_fresh()?;
     Ok(ReconcileClaim { db_path, root, abort })

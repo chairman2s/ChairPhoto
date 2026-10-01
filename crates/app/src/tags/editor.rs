@@ -17,7 +17,7 @@
 //! Every read and write goes through [`run`] (off the UI thread, fenced against a catalog
 //! switch); a write re-reads the catalog-derived state as React's `onChanged` did.
 
-use super::state::{run, TagsState};
+use super::state::{bind_dialog, run_as, CatalogGuard, TagsState};
 use crate::modules::{panel as module_panel, ModuleRegistry, PanelSlot};
 use crate::shell::style::Colors;
 use crate::shell::ShellState;
@@ -30,6 +30,8 @@ use gpui_kit::{div, px, Context, Entity, EventEmitter, FontWeight, SharedString,
 
 pub struct TagEditor {
     tags: Entity<TagsState>,
+    /// The tree this dialog opened over ([`bind_dialog`]): its jobs run under it.
+    guard: CatalogGuard,
     modules: Option<Entity<ModuleRegistry>>,
     /// The tag as the editor opened on it.
     pub tag: TagWithCount,
@@ -80,7 +82,9 @@ impl TagEditor {
         let tr_text = cx.new(|cx| InputState::new(window, cx).placeholder("Translated name"));
         let syn_lang = cx.new(|cx| InputState::new(window, cx).placeholder("lang (opt)"));
         let syn_text = cx.new(|cx| InputState::new(window, cx).placeholder("Synonym"));
+        let (guard, bound) = bind_dialog(&tags, cx);
         let subscriptions = vec![
+            bound,
             cx.subscribe_in(&name, window, |this: &mut Self, _, event: &InputEvent, window, cx| {
                 if matches!(event, InputEvent::PressEnter { .. } | InputEvent::Blur) {
                     this.rename(window, cx);
@@ -118,6 +122,7 @@ impl TagEditor {
         shell.update(cx, |s, cx| s.set_editing_tag(Some(id), cx));
         let mut this = TagEditor {
             tags,
+            guard,
             modules,
             committed_name: tag.tag.name.clone(),
             committed_description: tag.tag.description.clone(),
@@ -142,7 +147,7 @@ impl TagEditor {
         this.reload(cx);
         let id = this.id();
         // A failed read leaves the tag exportable, as React's `.catch(() => setExportable(true))`.
-        run(&this.tags, cx, false, move |c| c.tag_exportable(id), |s: &mut Self, r, cx| {
+        run_as(&this.tags, &this.guard, cx, false, move |c| c.tag_exportable(id), |s: &mut Self, r, cx| {
             s.exportable = r.unwrap_or(true);
             s.refresh_preview(cx);
         });
@@ -156,7 +161,7 @@ impl TagEditor {
     /// Re-read the terms and the languages, then the preview.
     pub fn reload(&mut self, cx: &mut Context<Self>) {
         let id = self.id();
-        run(&self.tags, cx, false, move |c| Ok((c.list_terms(id)?, c.list_languages()?)), |s: &mut Self, r, cx| {
+        run_as(&self.tags, &self.guard, cx, false, move |c| Ok((c.list_terms(id)?, c.list_languages()?)), |s: &mut Self, r, cx| {
             match r {
                 Ok((terms, languages)) => {
                     s.terms = terms;
@@ -173,7 +178,7 @@ impl TagEditor {
         self.preview_generation += 1;
         let generation = self.preview_generation;
         let (id, langs) = (self.id(), self.preview_langs.clone());
-        run(&self.tags, cx, false, move |c| c.export_labels(id, &langs), move |s: &mut Self, r, cx| {
+        run_as(&self.tags, &self.guard, cx, false, move |c| c.export_labels(id, &langs), move |s: &mut Self, r, cx| {
             if s.preview_generation == generation {
                 s.preview = r.unwrap_or_default();
                 cx.notify();
@@ -183,7 +188,7 @@ impl TagEditor {
 
     /// A write of this editor's: on success re-read the terms (and the preview).
     fn write(&mut self, cx: &mut Context<Self>, work: impl FnOnce(&chairphoto_core::catalog::Catalog) -> chairphoto_core::catalog::Result<()> + Send + 'static) {
-        run(&self.tags, cx, true, work, |s: &mut Self, r, cx| {
+        run_as(&self.tags, &self.guard, cx, true, work, |s: &mut Self, r, cx| {
             if let Err(e) = r {
                 s.error = Some(e);
             }
@@ -201,7 +206,7 @@ impl TagEditor {
         // The field reverts to the last committed name if the rename is refused.
         let name = self.name.clone();
         let window_handle = window.window_handle();
-        run(&self.tags, cx, true, move |c| c.rename_tag(id, &next), move |s: &mut Self, r, cx| match r {
+        run_as(&self.tags, &self.guard, cx, true, move |c| c.rename_tag(id, &next), move |s: &mut Self, r, cx| match r {
             Ok(()) => {
                 s.committed_name = attempted;
                 s.error = None;
@@ -231,7 +236,7 @@ impl TagEditor {
     pub fn set_exportable(&mut self, exportable: bool, cx: &mut Context<Self>) {
         self.exportable = exportable;
         let id = self.id();
-        run(&self.tags, cx, true, move |c| c.set_tag_exportable(id, exportable), |s: &mut Self, r, cx| {
+        run_as(&self.tags, &self.guard, cx, true, move |c| c.set_tag_exportable(id, exportable), |s: &mut Self, r, cx| {
             if let Err(e) = r {
                 s.error = Some(e);
             }
@@ -298,7 +303,7 @@ impl TagEditor {
             return;
         }
         let id = self.id();
-        run(&self.tags, cx, true, move |c| c.delete_tag(id), |s: &mut Self, r, cx| match r {
+        run_as(&self.tags, &self.guard, cx, true, move |c| c.delete_tag(id), |s: &mut Self, r, cx| match r {
             Ok(()) => cx.emit(CloseDialog),
             Err(e) => {
                 s.error = Some(e);

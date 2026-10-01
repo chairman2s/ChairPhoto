@@ -6,7 +6,7 @@
 
 use super::*;
 use crate::shell::state::InspectorTab;
-use crate::tests::{open_catalog_with_photos, start, App, TempDir};
+use crate::tests::{colliding_catalog, core_switch, deliver_switch, open_catalog_with_photos, start, App, TempDir};
 use chairphoto_core::app::EventSink as _;
 use chairphoto_core::catalog::PromotedMetadata;
 use chairphoto_core::image_pool::ImageKind;
@@ -329,9 +329,12 @@ fn iptc_saves_to_the_catalog_and_the_sidecar(cx: &mut TestAppContext) {
     assert!(!insp.read_with(cx, |i, cx| i.iptc.dirty(cx)), "saved values are the new baseline");
 }
 
-/// A save that a catalog switch overtook does not write its status into the new catalog's
-/// inspector. Two guards drop it: the epoch in `run_blocking` and the save's own generation
-/// check. (Mutation-checked: removing both fails this; removing either alone passes.)
+/// A save that a catalog switch overtook neither writes the new catalog nor puts its status
+/// into the new catalog's inspector. **Forced:** the core really switches to a catalog whose
+/// photo carries the same id (its original on disk) before the save's worker runs, and the
+/// event is delivered before it runs too. The new catalog's IPTC and sidecar are untouched;
+/// the epoch drops the result. (Mutation-checked: an unbound save writes the new catalog's
+/// row and sidecar.)
 #[gpui_kit::test]
 fn a_save_overtaken_by_a_catalog_switch_is_dropped(cx: &mut TestAppContext) {
     let dir = TempDir::new("insp-iptc-switch");
@@ -340,12 +343,183 @@ fn a_save_overtaken_by_a_catalog_switch_is_dropped(cx: &mut TestAppContext) {
     select(&app, ids[0], SelectMods::default(), cx);
     click(&app, "section-iptc", cx);
     let insp = inspector(&app, cx);
+    render(&app, cx);
+    let headline = insp.read_with(cx, |i, _| i.iptc.fields[0].clone());
+    set_input(&app, &headline, "Old catalog", cx);
     insp.update(cx, |i, cx| i.save_iptc(cx));
-    app.state.send(CoreEvent::CatalogSwitched("other".into()));
-    cx.run_until_parked();
+    let (b, b_ids) = colliding_catalog(&dir, "b", 1);
+    assert_eq!(b_ids, ids);
+    let b_original = b.require_photo_path(b_ids[0]).unwrap_or_else(|_| dir.0.join("b/2026/b0.ARW"));
+    std::fs::create_dir_all(b_original.parent().unwrap()).unwrap();
+    std::fs::write(&b_original, b"raw").unwrap();
+    core_switch(&app, b);
+    deliver_switch(&app, cx);
     insp.update(cx, |i, _| i.iptc.status = "after switch".into());
     work(cx);
     insp.read_with(cx, |i, _| assert_eq!(i.iptc.status, "after switch", "the old save's result was dropped"));
+    assert_eq!(catalog(&app, |c| c.get_iptc(b_ids[0]).unwrap().headline), "", "the old save wrote the new catalog's photo");
+    let mut sidecar = b_original.into_os_string();
+    sidecar.push(".xmp");
+    assert!(!std::path::Path::new(&sidecar).exists(), "the old save wrote the new catalog's sidecar");
+}
+
+/// **Forced interleaving** (#108 review). Every inspector write keyed by the photo shown, or
+/// by ids read with it, is queued; then the core switches to a catalog whose photo, child,
+/// version and publication carry the same ids — with `catalog:switched` withheld or delivered
+/// — and only then do the writes run. The new catalog is untouched: rotation, stack,
+/// back-up queue, IPTC and sidecar, versions, publications, marks.
+fn writes_across_a_switch(delivered: bool, cx: &mut TestAppContext) {
+    let dir = TempDir::new("insp-identity");
+    let app = start(cx);
+    let ids = open_catalog_with_photos(&app, &dir, 2, cx);
+    let seed = |c: &chairphoto_core::catalog::Catalog, ids: &[i64]| {
+        c.set_stack_parent(ids[1], ids[0]).unwrap();
+        let v = c.create_version(ids[0], "Square").unwrap();
+        let p = c.record_publication(ids[0], None, "flickr", None).unwrap();
+        (v, p)
+    };
+    let (version, publication) = catalog(&app, |c| seed(c, &ids));
+    app.wired.model.update(cx, |m, cx| m.refresh(cx));
+    cx.run_until_parked();
+    select(&app, ids[0], SelectMods::default(), cx);
+    click(&app, "section-iptc", cx);
+    let insp = inspector(&app, cx);
+    render(&app, cx);
+    let headline = insp.read_with(cx, |i, _| i.iptc.fields[0].clone());
+    set_input(&app, &headline, "Old catalog", cx);
+
+    let (b, b_ids) = colliding_catalog(&dir, "b", 2);
+    assert_eq!(b_ids, ids);
+    let (b_version, b_publication) = seed(&b, &b_ids);
+    assert_eq!((b_version, b_publication), (version, publication), "the ids collide, as real catalogs' do");
+    let b_original = dir.0.join("b/2026/b0.ARW");
+    std::fs::create_dir_all(b_original.parent().unwrap()).unwrap();
+    std::fs::write(&b_original, b"raw").unwrap();
+
+    insp.update(cx, |i, cx| {
+        i.rotate(90, cx);
+        i.unstack(ids[1], cx);
+        i.back_up(cx);
+        i.save_iptc(cx);
+        i.duplicate_version(version, cx);
+        i.delete_version(version, cx);
+        i.mark_published(cx);
+        i.delete_publication(publication, cx);
+        i.rate(4, cx);
+    });
+    core_switch(&app, b);
+    if delivered {
+        deliver_switch(&app, cx);
+    }
+    work(cx);
+
+    catalog(&app, |c| {
+        assert_eq!(c.photo_rotation(b_ids[0]).unwrap(), 0, "rotate");
+        assert_eq!(c.get_photo(b_ids[1]).unwrap().stack_parent_id, Some(b_ids[0]), "unstack");
+        assert!(c.list_pending_operations().unwrap().is_empty(), "back up queued in the new catalog");
+        assert_eq!(c.get_iptc(b_ids[0]).unwrap().headline, "", "IPTC");
+        assert_eq!(c.list_versions(b_ids[0]).unwrap().len(), 1, "versions");
+        let pubs = c.list_publications(b_ids[0]).unwrap();
+        assert_eq!(pubs.iter().map(|p| p.id).collect::<Vec<_>>(), [b_publication], "publications");
+        assert_eq!(c.get_photo(b_ids[0]).unwrap().rating, 0, "mark");
+    });
+    assert!(!dir.0.join("b/2026/b0.ARW.xmp").exists(), "the new catalog's sidecar was written");
+    // (Without the event, the refused writes' re-reads land the new catalog's rows, which
+    // empties the selection: the inspector shows no photo, so their messages are dropped.)
+}
+
+#[gpui_kit::test]
+fn inspector_writes_never_reach_the_new_catalog_before_the_switch_event(cx: &mut TestAppContext) {
+    writes_across_a_switch(false, cx);
+}
+
+#[gpui_kit::test]
+fn inspector_writes_never_reach_the_new_catalog_after_the_switch_event(cx: &mut TestAppContext) {
+    writes_across_a_switch(true, cx);
+}
+
+/// An IPTC save over a sidecar another tool wrote: the sidecar is backed up once before
+/// ChairPhoto's first write (it has no `chairphoto:LastWrite`), the IPTC lands, and the
+/// foreign namespace and its element survive (AGENTS.md, XMP safety).
+#[gpui_kit::test]
+fn iptc_save_backs_up_a_foreign_sidecar_and_keeps_its_elements(cx: &mut TestAppContext) {
+    let dir = TempDir::new("insp-iptc-foreign");
+    let app = start(cx);
+    let ids = open_catalog_with_photos(&app, &dir, 1, cx);
+    let original = dir.0.join("photos/2026/p0.ARW");
+    std::fs::create_dir_all(original.parent().unwrap()).unwrap();
+    std::fs::write(&original, b"raw").unwrap();
+    let sidecar = dir.0.join("photos/2026/p0.ARW.xmp");
+    let foreign = r#"<?xpacket begin="" id="W5M0MpCehiHzreSzNTczkc9d"?>
+<x:xmpmeta xmlns:x="adobe:ns:meta/">
+ <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+  <rdf:Description rdf:about="" xmlns:darktable="http://darktable.sf.net/" darktable:xmp_version="5">
+   <darktable:history_end>3</darktable:history_end>
+  </rdf:Description>
+ </rdf:RDF>
+</x:xmpmeta>
+<?xpacket end="w"?>"#;
+    std::fs::write(&sidecar, foreign).unwrap();
+    select(&app, ids[0], SelectMods::default(), cx);
+    click(&app, "section-iptc", cx);
+    let insp = inspector(&app, cx);
+    render(&app, cx);
+    let headline = insp.read_with(cx, |i, _| i.iptc.fields[0].clone());
+    set_input(&app, &headline, "Fjord at dawn", cx);
+    insp.update(cx, |i, cx| i.save_iptc(cx));
+    work(cx);
+    assert_eq!(aria(&app, "iptc-status", cx).as_deref(), Some("Saved to sidecar"));
+    let written = std::fs::read_to_string(&sidecar).unwrap();
+    assert!(written.contains("Fjord at dawn"), "{written}");
+    assert!(written.contains("http://darktable.sf.net/"), "the foreign namespace was dropped: {written}");
+    assert!(written.contains("history_end") && written.contains(">3<"), "the foreign element was dropped: {written}");
+    let backup = std::fs::read_to_string(dir.0.join("photos/2026/p0.ARW.xmp.chairphoto-backup"))
+        .expect("the foreign sidecar was backed up before the first write");
+    assert_eq!(backup, foreign);
+}
+
+/// Save IPTC waits for the photo's fields (a save of the still-empty form would wipe them),
+/// and a second Save while the first is in flight runs after it — one save per photo at a
+/// time, the newer values last in both the catalog and the sidecar.
+#[gpui_kit::test]
+fn iptc_saves_wait_for_the_fields_and_run_one_at_a_time(cx: &mut TestAppContext) {
+    let dir = TempDir::new("insp-iptc-serial");
+    let app = start(cx);
+    let ids = open_catalog_with_photos(&app, &dir, 1, cx);
+    let original = dir.0.join("photos/2026/p0.ARW");
+    std::fs::create_dir_all(original.parent().unwrap()).unwrap();
+    std::fs::write(&original, b"raw").unwrap();
+    catalog(&app, |c| {
+        c.set_iptc(ids[0], &IptcFields { headline: "Stored".into(), ..Default::default() }).unwrap()
+    });
+    select(&app, ids[0], SelectMods::default(), cx);
+    work(cx); // whatever else is queued (the editors probe)
+    let insp = inspector(&app, cx);
+    // Open the section and press Save before its read lands.
+    insp.update(cx, |i, cx| {
+        i.toggle_section(Section::Iptc, cx);
+        assert!(!i.iptc_loaded());
+        i.save_iptc(cx);
+    });
+    assert_eq!(cx.update(|cx| Runner::get(cx).run_pending()), 0, "a save started before the fields loaded");
+    render(&app, cx);
+    assert_eq!(catalog(&app, |c| c.get_iptc(ids[0]).unwrap().headline), "Stored");
+
+    let headline = insp.read_with(cx, |i, _| i.iptc.fields[0].clone());
+    assert_eq!(headline.read_with(cx, |i, _| i.value().to_string()), "Stored");
+    set_input(&app, &headline, "First", cx);
+    insp.update(cx, |i, cx| i.save_iptc(cx));
+    set_input(&app, &headline, "Second", cx);
+    insp.update(cx, |i, cx| i.save_iptc(cx));
+    assert_eq!(cx.update(|cx| Runner::get(cx).run_pending()), 1, "two saves of one photo ran at once");
+    cx.run_until_parked();
+    assert_eq!(catalog(&app, |c| c.get_iptc(ids[0]).unwrap().headline), "First");
+    assert_eq!(cx.update(|cx| Runner::get(cx).run_pending()), 1, "the queued save runs after the first");
+    cx.run_until_parked();
+    assert_eq!(catalog(&app, |c| c.get_iptc(ids[0]).unwrap().headline), "Second");
+    let sidecar = std::fs::read_to_string(dir.0.join("photos/2026/p0.ARW.xmp")).unwrap();
+    assert!(sidecar.contains("Second") && !sidecar.contains("First"), "{sidecar}");
+    assert_eq!(aria(&app, "iptc-status", cx).as_deref(), Some("Saved to sidecar"));
 }
 
 /// Metadata: grouped, the default groups open, "No metadata" when there is none.

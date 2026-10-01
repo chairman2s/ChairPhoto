@@ -12,6 +12,17 @@
 //!   (dropping the pending one), so a gesture reprojects the last raster and the crisp one
 //!   follows when it stops.
 //!
+//! **One raster in flight.** A raster that has started cannot be cancelled (it strokes on
+//! scoped threads), so at most one runs at a time: a request while one is running only marks
+//! another as wanted, and when the running one finishes the wanted one starts from the state
+//! *then* — however many requests came in between, the latest wins and at most one more
+//! raster is made. A finished raster whose generation or scene is no longer current is
+//! dropped (never painted, so never in the atlas). Peak raster memory is therefore bounded:
+//! one raster being stroked — its BGRA output plus the strips' pixmaps, each at most
+//! [`MAX_EDGE`](super::raster::MAX_EDGE)² × 4 B = 64 MiB, so ≈ 128 MiB — plus the raster on
+//! screen and, until the next frame, the one it replaced (≤ 64 MiB each). Before this, a
+//! link-strength slider sweep could stroke one full raster per scene at once.
+//!
 //! A result for a view that has been dropped (module disabled, window closed) has nowhere to
 //! land: its `WeakEntity` update fails. A replaced raster's texture is released from the atlas
 //! with `drop_image`, and so is the last one when the view is released.
@@ -20,7 +31,7 @@
 //! happens only while the view is on the stage) starts the reload.
 
 use super::paint::{self, Frame, PaintCache, RasterShown};
-use super::raster::{region_for, rasterize, scale_for, strips_for, to_render_image, RasterJob, SETTLE};
+use super::raster::{region_for, rasterize, scale_for, strips_for, to_render_image, RasterJob, Region, SETTLE};
 use super::{Back, GraphSource};
 use crate::image_store::{ImageState, ImageStore};
 use crate::keymap::contexts;
@@ -40,12 +51,13 @@ use gpui_kit::component::slider::{Slider, SliderEvent, SliderState};
 use gpui_kit::prelude::*;
 use gpui_kit::{
     canvas, div, img, px, AnyElement, App, Context, CursorStyle, Entity, FocusHandle, FontWeight, MouseButton,
-    MouseDownEvent, MouseMoveEvent, ObjectFit, PinchEvent, Pixels, Point, ScrollDelta, ScrollWheelEvent, SharedString,
+    MouseDownEvent, MouseMoveEvent, ObjectFit, PinchEvent, Pixels, Point, RenderImage, ScrollDelta, ScrollWheelEvent, SharedString,
     Subscription, Task, TestSupportExt as _, Window,
 };
 use std::cell::RefCell;
 use std::collections::HashSet;
 use std::rc::Rc;
+use std::sync::Arc;
 
 /// Counters of what happened to background results; tests and the bench read them.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -54,9 +66,11 @@ pub struct TagGraphStats {
     pub loads_dropped: u64,
     pub scenes_applied: u64,
     pub scenes_dropped: u64,
+    /// Rasters handed to the background (at most one at a time).
+    pub rasters_started: u64,
     pub rasters_applied: u64,
     pub rasters_dropped: u64,
-    /// Raster textures handed to `drop_image`.
+    /// Raster textures released with `drop_image` (counted once it has run).
     pub images_released: u64,
 }
 
@@ -78,7 +92,12 @@ pub struct TagGraphView {
     stale: bool,
     raster: Option<RasterShown>,
     raster_generation: u64,
-    raster_task: Option<Task<()>>,
+    /// The quiet-time wait before a settled raster starts; replacing it drops the wait.
+    raster_settle: Option<Task<()>>,
+    /// A raster is being made (its task is detached: it always reports back).
+    raster_in_flight: bool,
+    /// Another raster was asked for while one was in flight; it starts when that one ends.
+    raster_wanted: bool,
     paint: Rc<RefCell<PaintCache>>,
     drag: Option<Drag>,
     slider: Entity<SliderState>,
@@ -121,8 +140,7 @@ impl TagGraphView {
         // stored in the view itself is dropped with it before the release listeners run.
         cx.on_release(|this, cx| {
             if let Some(old) = this.raster.take() {
-                this.stats.borrow_mut().images_released += 1;
-                cx.defer(move |cx| cx.drop_image(old.image, None));
+                release_raster(old, this.stats.clone(), cx);
             }
         })
         .detach();
@@ -139,7 +157,9 @@ impl TagGraphView {
             stale: true,
             raster: None,
             raster_generation: 0,
-            raster_task: None,
+            raster_settle: None,
+            raster_in_flight: false,
+            raster_wanted: false,
             paint: Rc::default(),
             drag: None,
             slider,
@@ -193,8 +213,10 @@ impl TagGraphView {
     fn catalog_switched(&mut self, cx: &mut Context<Self>) {
         self.session.reset();
         self.stale = true;
+        // A raster in flight finishes into a stale generation and is dropped.
         self.raster_generation += 1;
-        self.raster_task = None;
+        self.raster_settle = None;
+        self.raster_wanted = false;
         self.top_photos = None;
         self.top_generation += 1;
         if let Some(old) = self.raster.take() {
@@ -204,8 +226,7 @@ impl TagGraphView {
     }
 
     fn release(&mut self, old: RasterShown, cx: &mut Context<Self>) {
-        self.stats.borrow_mut().images_released += 1;
-        cx.defer(move |cx: &mut App| cx.drop_image(old.image, None));
+        release_raster(old, self.stats.clone(), cx);
     }
 
     fn start_load(&mut self, cx: &mut Context<Self>) {
@@ -254,33 +275,70 @@ impl TagGraphView {
     }
 
     /// Ask for a raster of the base edges: now, or after [`SETTLE`] of quiet (`settle`).
-    /// Supersedes any pending request.
+    /// Supersedes any pending request; while a raster is in flight it waits for that one
+    /// (see the module docs).
     pub fn request_raster(&mut self, settle: bool, cx: &mut Context<Self>) {
         self.raster_generation += 1;
-        let generation = self.raster_generation;
-        self.raster_task = Some(cx.spawn(async move |this, cx| {
-            if settle {
+        if settle {
+            self.raster_settle = Some(cx.spawn(async move |this, cx| {
                 cx.background_executor().timer(SETTLE).await;
-            }
-            let Ok(Some(job)) = this.update(cx, |v, _| v.raster_job()) else { return };
-            let (scene_generation, view, region) = (job.scene.generation, job.view, job.region);
-            let made = cx.background_executor().spawn(async move { rasterize(&job).map(to_render_image) }).await;
-            this.update(cx, |v, cx| {
-                let current = v.session.scene().map(|s| s.generation);
-                let Some(image) = made else { return };
-                if generation != v.raster_generation || current != Some(scene_generation) {
-                    v.stats.borrow_mut().rasters_dropped += 1;
-                    return; // never painted, so never in the atlas
-                }
-                v.stats.borrow_mut().rasters_applied += 1;
+                this.update(cx, |v, cx| v.start_raster(cx)).ok();
+            }));
+        } else {
+            self.raster_settle = None;
+            self.start_raster(cx);
+        }
+    }
+
+    /// Start a raster of the current scene and view, or, with one in flight, mark it wanted.
+    fn start_raster(&mut self, cx: &mut Context<Self>) {
+        if self.raster_in_flight {
+            self.raster_wanted = true;
+            return;
+        }
+        self.raster_wanted = false;
+        let Some(job) = self.raster_job() else { return };
+        let generation = self.raster_generation;
+        let (scene_generation, view, region) = (job.scene.generation, job.view, job.region);
+        self.raster_in_flight = true;
+        self.stats.borrow_mut().rasters_started += 1;
+        let made = cx.background_executor().spawn(async move { rasterize(&job).map(to_render_image) });
+        // Detached, so it always reports back and clears `raster_in_flight` (unless the view is
+        // gone, and then nothing is left to clear).
+        cx.spawn(async move |this, cx| {
+            let made = made.await;
+            this.update(cx, |v, cx| v.finish_raster(generation, scene_generation, view, region, made, cx)).ok();
+        })
+        .detach();
+    }
+
+    /// A raster came back: show it if it is still current, then start the wanted one.
+    fn finish_raster(
+        &mut self,
+        generation: u64,
+        scene_generation: u64,
+        view: chairphoto_model::tag_graph::view::View,
+        region: Region,
+        made: Option<Arc<RenderImage>>,
+        cx: &mut Context<Self>,
+    ) {
+        self.raster_in_flight = false;
+        if let Some(image) = made {
+            let current = self.session.scene().map(|s| s.generation);
+            if generation != self.raster_generation || current != Some(scene_generation) {
+                self.stats.borrow_mut().rasters_dropped += 1; // never painted, so never in the atlas
+            } else {
+                self.stats.borrow_mut().rasters_applied += 1;
                 let shown = RasterShown { image, region, view, scene_generation };
-                if let Some(old) = v.raster.replace(shown) {
-                    v.release(old, cx);
+                if let Some(old) = self.raster.replace(shown) {
+                    self.release(old, cx);
                 }
                 cx.notify();
-            })
-            .ok();
-        }));
+            }
+        }
+        if self.raster_wanted {
+            self.start_raster(cx);
+        }
     }
 
     fn raster_job(&self) -> Option<RasterJob> {
@@ -294,6 +352,8 @@ impl TagGraphView {
         Some(RasterJob { scene, view, size, region, scale, strips })
     }
 
+    /// (Re)read the selected tag's first photos: on a new selection, and after every applied
+    /// load — a catalog read can change a tag's photos while the same tag stays selected.
     fn load_top_photos(&mut self, cx: &mut Context<Self>) {
         self.top_generation += 1;
         let generation = self.top_generation;
@@ -304,10 +364,10 @@ impl TagGraphView {
                 return;
             }
         };
-        if self.top_photos.as_ref().is_some_and(|(t, _)| *t == tag) {
-            return;
+        // The same tag's photos stay up while they are re-read; another tag's go at once.
+        if self.top_photos.as_ref().is_some_and(|(t, _)| *t != tag) {
+            self.top_photos = None;
         }
-        self.top_photos = None;
         let app = self.app.clone();
         let read = cx.background_executor().spawn(async move {
             let query = PhotoQuery { tag_id: Some(tag), window: Some(PhotoWindow::new(0, 6)), ..Default::default() };
@@ -841,6 +901,15 @@ impl gpui_kit::Focusable for TagGraphView {
     fn focus_handle(&self, _: &App) -> FocusHandle {
         self.focus.clone()
     }
+}
+
+/// Take `old`'s texture out of every window's atlas. Deferred: while a window is being
+/// updated it is out of `App::windows`, and `drop_image` would miss it.
+fn release_raster(old: RasterShown, stats: Rc<RefCell<TagGraphStats>>, cx: &mut App) {
+    cx.defer(move |cx| {
+        cx.drop_image(old.image, None);
+        stats.borrow_mut().images_released += 1;
+    });
 }
 
 impl Render for TagGraphView {

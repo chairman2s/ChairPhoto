@@ -9,17 +9,19 @@ use crate::modules::ModuleRegistry;
 use crate::shell::state::Surface;
 use crate::shell::ShellState;
 use crate::{start_core, wire, WireOptions};
-use chairphoto_core::app::{AppState, CoreEvent, EventSink as _};
+use chairphoto_core::app::{with_catalog, AppState, CoreEvent, EventSink as _};
 use chairphoto_core::appearance::SystemThemeResult;
 use chairphoto_core::catalog::Catalog;
 use chairphoto_model::tag_graph::graph::{LibraryGraph, NodeId};
 use chairphoto_model::tag_graph::labels::slot_point;
+use chairphoto_model::tag_graph::scene::Scene;
 use chairphoto_model::tag_graph::synthetic::{library, Scale};
 use chairphoto_model::tag_graph::view::View;
 use gpui_kit::test::TestWindowExt as _;
 use gpui_kit::{
-    point, px, AppContext as _, Entity, InputEvent as _, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, ScrollDelta, TestAppContext, WindowHandle,
+    div, point, px, AppContext as _, Context, Entity, InputEvent as _, IntoElement, Modifiers, MouseButton,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement as _, Render, RenderImage, ScrollDelta, Styled as _,
+    TestAppContext, Window, WindowHandle,
 };
 use std::cell::RefCell;
 use std::path::PathBuf;
@@ -30,36 +32,58 @@ use std::sync::Arc;
 struct Fixture {
     model: Entity<AppModel>,
     shell: Entity<ShellState>,
-    window: WindowHandle<TagGraphView>,
+    window: WindowHandle<Host>,
     view: Entity<TagGraphView>,
     loads: Arc<AtomicUsize>,
 }
 
+/// The window's root: holds the view, and can drop it while the window stays (as disabling
+/// the module does in the shell).
+struct Host {
+    view: Option<Entity<TagGraphView>>,
+}
+
+impl Render for Host {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div().size_full().flex().children(self.view.clone())
+    }
+}
+
 /// A window holding only the Tag graph view over `graph` (counting its loads).
 fn fixture(graph: LibraryGraph, cx: &mut TestAppContext) -> Fixture {
+    fixture_with(AppState::default(), move || Ok(graph.clone()), cx)
+}
+
+/// The same over `app` (its catalog, for the inspector's photo reads) and a graph source.
+fn fixture_with(
+    app: AppState,
+    graph: impl Fn() -> Result<LibraryGraph, String> + Send + Sync + 'static,
+    cx: &mut TestAppContext,
+) -> Fixture {
     cx.update(|cx| {
         gpui_kit::init(cx);
         crate::theme::apply_system_theme(&SystemThemeResult::unavailable(), cx);
         cx.bind_keys(crate::keymap::bindings());
     });
-    let model = cx.new(|_| AppModel::new(AppState::default(), None));
+    let model = cx.new(|_| AppModel::new(app, None));
     let shell = cx.new(|cx| ShellState::new(&model, cx));
     let loads = Arc::new(AtomicUsize::new(0));
     let source: GraphSource = {
         let loads = loads.clone();
         Arc::new(move || {
             loads.fetch_add(1, Ordering::SeqCst);
-            Ok(graph.clone())
+            graph()
         })
     };
     let (m, s) = (model.clone(), shell.clone());
     let window = cx.update(|cx| {
         cx.open_window(Default::default(), move |window, cx| {
-            cx.new(|cx| TagGraphView::new(&m, s, None, source, window, cx))
+            let view = cx.new(|cx| TagGraphView::new(&m, s, None, source, window, cx));
+            cx.new(|_| Host { view: Some(view) })
         })
         .unwrap()
     });
-    let view = window.root(cx).unwrap();
+    let view = window.root(cx).unwrap().read_with(cx, |h, _| h.view.clone().unwrap());
     let f = Fixture { model, shell, window, view, loads };
     f.settle(cx);
     f
@@ -151,6 +175,16 @@ impl Fixture {
     fn raster_view(&self, cx: &mut TestAppContext) -> Option<View> {
         self.view.read_with(cx, |v, _| v.raster().map(|r| r.view))
     }
+
+    /// The raster on screen now.
+    fn raster_image(&self, cx: &mut TestAppContext) -> Arc<RenderImage> {
+        self.view.read_with(cx, |v, _| v.raster().expect("a raster").image.clone())
+    }
+
+    /// Whether the window's sprite atlas holds `image` — the texture itself, not a request.
+    fn in_atlas(&self, image: &RenderImage, cx: &mut TestAppContext) -> bool {
+        cx.update_window(self.any(), |_, window, _| window.has_image_atlas_entry(image)).unwrap()
+    }
 }
 
 fn small() -> LibraryGraph {
@@ -232,6 +266,8 @@ fn wheel_zoom_reprojects_then_rasters_once_settled(cx: &mut TestAppContext) {
     f.click("tg-type-tags", cx);
     let before = f.stats(cx);
     let fitted = f.view_state(cx);
+    let old = f.raster_image(cx);
+    assert!(f.in_atlas(&old, cx), "the fitted raster was painted");
 
     f.wheel(3., cx);
     f.wheel(3., cx);
@@ -244,10 +280,14 @@ fn wheel_zoom_reprojects_then_rasters_once_settled(cx: &mut TestAppContext) {
     assert_eq!(f.raster_view(cx), Some(zoomed), "the crisp raster follows once quiet");
     let after = f.stats(cx);
     assert_eq!(after.rasters_applied - before.rasters_applied, 1, "one raster for the whole gesture");
-    assert_eq!(after.images_released - before.images_released, 1, "the replaced texture left the atlas");
+    assert_eq!(after.images_released - before.images_released, 1, "one release ran");
+    assert!(!f.in_atlas(&old, cx), "the replaced texture left the atlas");
+    f.settle(cx);
+    assert!(f.in_atlas(&f.raster_image(cx), cx), "the crisp raster is painted");
 }
 
-/// Two raster requests in a row: only the newer one lands.
+/// Two raster requests in a row: the first is already in flight, so it runs to completion —
+/// and is dropped, its generation superseded; only the newer one lands.
 #[gpui_kit::test]
 fn a_superseded_raster_never_lands(cx: &mut TestAppContext) {
     let f = fixture(small(), cx);
@@ -260,8 +300,85 @@ fn a_superseded_raster_never_lands(cx: &mut TestAppContext) {
     });
     cx.run_until_parked();
     let after = f.stats(cx);
+    assert_eq!(after.rasters_started - before.rasters_started, 2, "the first ran to completion, then the newer");
+    assert_eq!(after.rasters_dropped - before.rasters_dropped, 1, "the superseded one came back and was dropped");
     assert_eq!(after.rasters_applied - before.rasters_applied, 1);
     assert_eq!(f.raster_view(cx), Some(f.view_state(cx)), "the newer view's raster");
+}
+
+/// A raster that comes back after the scene it was made from has been replaced is dropped,
+/// even with no newer raster asked for (its generation is still current).
+#[gpui_kit::test]
+fn a_raster_of_a_replaced_scene_never_lands(cx: &mut TestAppContext) {
+    let f = fixture(small(), cx);
+    f.click("tg-type-tags", cx);
+    let before = f.stats(cx);
+    let shown = f.view.read_with(cx, |v, _| v.raster().map(|r| r.scene_generation));
+    f.view.update(cx, |v, cx| {
+        v.request_raster(false, cx);
+        let generation = v.raster_generation();
+        // A new scene lands while that raster is in flight, without asking for a raster.
+        v.update_session(cx, |s| {
+            s.toggle_cameras();
+            let input = s.take_scene_request().expect("a scene request");
+            assert!(s.apply_scene(Scene::build(&input)));
+        });
+        assert_eq!(v.raster_generation(), generation, "only the scene is stale");
+    });
+    cx.run_until_parked();
+    let after = f.stats(cx);
+    assert_eq!(after.rasters_started - before.rasters_started, 1);
+    assert_eq!(after.rasters_dropped - before.rasters_dropped, 1, "the old scene's raster came back and was dropped");
+    assert_eq!(after.rasters_applied, before.rasters_applied);
+    assert_eq!(f.view.read_with(cx, |v, _| v.raster().map(|r| r.scene_generation)), shown, "nothing new shown");
+}
+
+/// Between a scene change and its raster, the old scene's raster is not painted under the
+/// new ring; the new scene's raster is, once it lands.
+#[gpui_kit::test]
+fn a_raster_is_painted_only_under_its_own_scene(cx: &mut TestAppContext) {
+    let f = fixture(small(), cx);
+    f.click("tg-type-tags", cx);
+    let scene_generation = |cx: &mut TestAppContext| f.view.read_with(cx, |v, _| v.session().scene().unwrap().generation);
+    let painted = |cx: &mut TestAppContext| f.view.read_with(cx, |v, _| v.paint_cache().borrow().raster_painted);
+    let old = scene_generation(cx);
+    assert_eq!(painted(cx), Some(old));
+
+    f.view.update(cx, |v, cx| v.update_session(cx, |s| s.toggle_cameras()));
+    // Step until the new scene has landed, then paint before its raster can.
+    while scene_generation(cx) == old {
+        assert!(cx.executor().tick(), "the scene build ran out of work");
+    }
+    cx.update_window(f.any(), |_, window, cx| window.render_frame(cx)).unwrap();
+    assert_eq!(f.view.read_with(cx, |v, _| v.raster().map(|r| r.scene_generation)), Some(old), "the old raster is still held");
+    assert_eq!(painted(cx), None, "but not painted under the new ring");
+
+    f.settle(cx);
+    let new = scene_generation(cx);
+    assert_ne!(new, old);
+    assert_eq!(painted(cx), Some(new), "the new scene's raster is painted");
+}
+
+/// A burst of raster requests (a slider sweep, a zoom while one runs): one raster runs at a
+/// time, the burst coalesces into one more made from the latest state, and that one lands.
+#[gpui_kit::test]
+fn raster_requests_coalesce_behind_the_one_in_flight(cx: &mut TestAppContext) {
+    let f = fixture(small(), cx);
+    f.click("tg-type-tags", cx);
+    let before = f.stats(cx);
+    f.view.update(cx, |v, cx| {
+        v.request_raster(false, cx);
+        for _ in 0..4 {
+            v.update_session(cx, |s| s.zoom_step(true));
+            v.request_raster(false, cx);
+        }
+    });
+    assert_eq!(f.stats(cx).rasters_started - before.rasters_started, 1, "one in flight; the rest wait");
+    cx.run_until_parked();
+    let after = f.stats(cx);
+    assert_eq!(after.rasters_started - before.rasters_started, 2, "the burst coalesced into one more raster");
+    assert_eq!(after.rasters_applied - before.rasters_applied, 1, "only the latest lands");
+    assert_eq!(f.raster_view(cx), Some(f.view_state(cx)), "made from the latest view");
 }
 
 /// A catalog switch while a reload is in flight: the old catalog's graph never lands, the
@@ -271,6 +388,8 @@ fn a_catalog_switch_drops_the_load_in_flight(cx: &mut TestAppContext) {
     let f = fixture(small(), cx);
     f.click("tg-type-tags", cx);
     let before = f.stats(cx);
+    let old = f.raster_image(cx);
+    assert!(f.in_atlas(&old, cx), "the raster was painted");
     // A catalog read marks the graph stale; the next render starts the reload …
     f.model.update(cx, |_, cx| cx.emit(crate::model::AppModelEvent::CatalogRead));
     cx.update_window(f.any(), |_, window, cx| window.render_frame(cx)).unwrap();
@@ -282,7 +401,8 @@ fn a_catalog_switch_drops_the_load_in_flight(cx: &mut TestAppContext) {
         assert!(s.graph().is_none() && s.scene().is_none() && v.raster().is_none(), "the old catalog's state is gone");
         assert!(s.visible().tags, "the node-type choice survives the switch");
     });
-    assert_eq!(f.stats(cx).images_released - before.images_released, 1, "the old raster left the atlas");
+    assert_eq!(f.stats(cx).images_released - before.images_released, 1, "the release ran");
+    assert!(!f.in_atlas(&old, cx), "the old catalog's raster left the atlas");
     cx.run_until_parked();
     let after = f.stats(cx);
     assert_eq!(after.loads_dropped - before.loads_dropped, 1, "the old catalog's load was dropped");
@@ -290,6 +410,32 @@ fn a_catalog_switch_drops_the_load_in_flight(cx: &mut TestAppContext) {
     let after = f.stats(cx);
     assert_eq!(after.loads_applied - before.loads_applied, 1, "one fresh load for the new catalog");
     assert!(f.view.read_with(cx, |v, _| v.session().scene().is_some_and(|s| !s.layout.order.is_empty())));
+}
+
+/// Dropping the view while its window stays (the module disabled): its last raster leaves
+/// that window's atlas.
+#[gpui_kit::test]
+fn a_dropped_view_takes_its_raster_out_of_the_atlas(cx: &mut TestAppContext) {
+    let f = fixture(small(), cx);
+    f.click("tg-type-tags", cx);
+    let old = f.raster_image(cx);
+    assert!(f.in_atlas(&old, cx), "the raster was painted");
+    let (weak, any) = (f.view.downgrade(), f.any());
+    let Fixture { window, view, .. } = f;
+    drop(view);
+    window
+        .update(cx, |h, _, cx| {
+            h.view = None;
+            cx.notify();
+        })
+        .unwrap();
+    cx.update_window(any, |_, window, cx| window.render_frame(cx)).unwrap();
+    cx.run_until_parked();
+    assert!(weak.upgrade().is_none(), "the view is gone");
+    assert!(
+        cx.update_window(any, |_, window, _| !window.has_image_atlas_entry(&old)).unwrap(),
+        "its raster left the atlas"
+    );
 }
 
 /// Closing the window drops the view: its last raster leaves the atlas, and work still in
@@ -321,6 +467,43 @@ impl Drop for TempDir {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
     }
+}
+
+/// A catalog read re-reads the inspector's top photos even when the same tag stays selected.
+#[gpui_kit::test]
+fn a_catalog_read_refreshes_the_selected_tags_photos(cx: &mut TestAppContext) {
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+    let dir = TempDir(std::env::temp_dir().join(format!("cp-tg-top-{}-{nanos}", std::process::id())));
+    std::fs::create_dir_all(&dir.0).unwrap();
+    let root = dir.0.join("photos");
+    let catalog = Catalog::open(&dir.0.join("t.chairphoto"), &root).unwrap();
+    let bird = catalog.create_tag("Animals/Bird").unwrap();
+    let dog = catalog.create_tag("Animals/Dog").unwrap();
+    let p: Vec<i64> = (0..3).map(|i| catalog.upsert_photo(&root.join(format!("p{i}.ARW")), None, 0, 1).unwrap().id).collect();
+    for &id in &p[..2] {
+        catalog.assign_tag(id, bird).unwrap();
+        catalog.assign_tag(id, dog).unwrap();
+    }
+    let app = AppState::default();
+    *app.catalog.lock().unwrap() = Some(catalog);
+    let source = super::catalog_source(app.clone());
+    let f = fixture_with(app.clone(), move || source(), cx);
+    f.click("tg-type-tags", cx);
+    f.view.update(cx, |v, cx| v.update_session(cx, |s| s.select(Some(NodeId::Tag(bird)))));
+    f.settle(cx);
+    let top = |cx: &mut TestAppContext| {
+        f.view.read_with(cx, |v, _| v.top_photos().cloned()).map(|(t, mut ids)| {
+            ids.sort();
+            (t, ids)
+        })
+    };
+    assert_eq!(top(cx), Some((bird, p[..2].to_vec())));
+
+    with_catalog(&app, |c| c.assign_tag(p[2], bird)).unwrap();
+    f.model.update(cx, |_, cx| cx.emit(crate::model::AppModelEvent::CatalogRead));
+    f.settle(cx);
+    assert_eq!(f.view.read_with(cx, |v, _| v.session().selected()), Some(NodeId::Tag(bird)), "still selected");
+    assert_eq!(top(cx), Some((bird, p.clone())), "the new photo shows");
 }
 
 /// The module in the real wiring: enabled from the registry, its rail item shows the view,

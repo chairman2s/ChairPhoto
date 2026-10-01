@@ -82,7 +82,21 @@ impl AlbumsState {
         then: impl FnOnce(&mut Self, &mut Context<Self>) + 'static,
         cx: &mut Context<Self>,
     ) {
-        let Some(from) = self.shell.read(cx).lists_from() else {
+        let from = self.shell.read(cx).lists_from();
+        self.write_as(from, what, work, then, cx);
+    }
+
+    /// [`Self::write`] bound to `from`, the catalog the ids were read from when the user
+    /// acted — a delete confirm captures it as it opens, so an OK after a switch fails closed.
+    fn write_as(
+        &mut self,
+        from: Option<CatalogIdentity>,
+        what: &'static str,
+        work: impl FnOnce(&Catalog) -> chairphoto_core::catalog::Result<()> + Send + 'static,
+        then: impl FnOnce(&mut Self, &mut Context<Self>) + 'static,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(from) = from else {
             self.status("The albums are still loading; try again.".into(), cx);
             return;
         };
@@ -112,8 +126,10 @@ impl AlbumsState {
     }
 
     /// ✕ Delete (after its confirm): photos are not deleted; an active filter on it clears.
-    pub fn delete_album(&mut self, id: i64, cx: &mut Context<Self>) {
-        self.write(
+    /// `from`: the lists' catalog when ✕ was clicked ([`ShellState::lists_from`]).
+    pub fn delete_album(&mut self, id: i64, from: Option<CatalogIdentity>, cx: &mut Context<Self>) {
+        self.write_as(
+            from,
             "Deleting the album",
             move |c| c.delete_album(id),
             move |this, cx| {
@@ -160,8 +176,10 @@ impl AlbumsState {
     }
 
     /// ✕ Delete a smart album (after its confirm); an active filter on it clears.
-    pub fn delete_smart_album(&mut self, id: i64, cx: &mut Context<Self>) {
-        self.write(
+    /// `from`: the lists' catalog when ✕ was clicked.
+    pub fn delete_smart_album(&mut self, id: i64, from: Option<CatalogIdentity>, cx: &mut Context<Self>) {
+        self.write_as(
+            from,
             "Deleting the smart album",
             move |c| c.delete_smart_album(id),
             move |this, cx| {

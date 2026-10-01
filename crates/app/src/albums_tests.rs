@@ -186,7 +186,8 @@ fn album_writes_keyed_by_the_old_lists_ids_never_reach_another_catalog(cx: &mut 
     assert_eq!(status(&app, cx), format!("Renaming the album failed: {CATALOG_CHANGED}"));
     app.wired.albums.update(cx, |a, cx| a.add_selection(id, cx));
     cx.run_until_parked();
-    app.wired.albums.update(cx, |a, cx| a.delete_album(id, cx));
+    let lists_from = app.wired.shell.read_with(cx, |s, _| s.lists_from());
+    app.wired.albums.update(cx, |a, cx| a.delete_album(id, lists_from, cx));
     cx.run_until_parked();
     with_catalog(&app, |c| {
         let list = c.list_albums().unwrap();
@@ -296,6 +297,50 @@ fn smart_albums_rename_and_delete_from_the_section(cx: &mut TestAppContext) {
     click(&app, "ok", cx);
     assert!(with_catalog(&app, |c| c.list_smart_albums().unwrap().is_empty()));
     assert_eq!(app.wired.shell.read_with(cx, |s, _| s.library.scope().smart_album_id), None);
+}
+
+/// **Catalog identity.** A ✕ Delete confirm opened over catalog A's lists stays open while the
+/// catalog switches to B (colliding album and smart-album ids), `catalog:switched` arrives
+/// and the lists reload from B. OK then fails closed (`CATALOG_CHANGED`): the confirm's id
+/// is A's, and B's album and smart album with the same ids are untouched.
+#[gpui_kit::test]
+fn a_delete_confirm_left_open_across_a_switch_never_deletes_the_new_catalogs_album(cx: &mut TestAppContext) {
+    let dir = TempDir::new("albums-delete-switch");
+    let app = start(cx);
+    open_catalog_with_photos(&app, &dir, 1, cx);
+    with_catalog(&app, |c| {
+        c.create_album("A's").unwrap();
+        c.create_smart_album("A's smart", r#"{"match":"all","conditions":[]}"#).unwrap();
+    });
+    app.wired.model.update(cx, |m, cx| m.refresh(cx));
+    cx.run_until_parked();
+    let (id, smart_id) = app.wired.shell.read_with(cx, |s, _| (s.lists.albums[0].id, s.lists.smart_albums[0].id));
+
+    let cases = [(format!("album-delete-{id}"), "album", "b1"), (format!("smart-album-delete-{smart_id}"), "smart album", "b2")];
+    for (trigger, what, name) in cases {
+        let (b, _) = colliding_catalog(&dir, name, 1);
+        assert_eq!(b.create_album("B's").unwrap(), id, "the album ids collide");
+        assert_eq!(b.create_smart_album("B's smart", r#"{"match":"all","conditions":[]}"#).unwrap(), smart_id);
+        click(&app, leak(trigger), cx);
+        settle(&app, cx);
+        assert!(has_dialog(&app, cx), "the {what} confirm is open");
+
+        core_switch(&app, b);
+        deliver_switch(&app, cx);
+        settle(&app, cx);
+        let reloaded = app.wired.shell.read_with(cx, |s, _| s.lists.albums.iter().map(|a| a.name.clone()).collect::<Vec<_>>());
+        assert_eq!(reloaded, ["B's"], "the lists reloaded from B");
+
+        assert!(has_dialog(&app, cx), "the confirm was left open across the switch");
+        click(&app, "ok", cx);
+        settle(&app, cx);
+        with_catalog(&app, |c| {
+            assert_eq!(c.list_albums().unwrap()[0].name, "B's", "B's album survives the {what} confirm");
+            assert_eq!(c.list_smart_albums().unwrap()[0].name, "B's smart", "B's smart album survives");
+        });
+        let line = status(&app, cx);
+        assert!(line.ends_with(CATALOG_CHANGED), "{what}: {line}");
+    }
 }
 
 /// **Catalog identity.** The editor opened over catalog A (its tag and batch ids are A's);

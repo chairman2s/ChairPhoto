@@ -7,6 +7,7 @@
 //! - [`geocode`] — Nominatim reverse-geocode client + `map__geocode_cache` table.
 //! - [`tiles`] — the slippy map's headless half: Web Mercator maths with fractional zoom,
 //!   the tile source, a disk tile cache and an OSM-policy-compliant fetcher.
+//! - [`cluster`] — grid clustering of photo markers per zoom level.
 //!
 //! This module owns:
 //!
@@ -25,6 +26,7 @@
 //!   to a single photo (newly-created only, so existing assignments are never redone
 //!   involuntarily).
 
+pub mod cluster;
 pub mod geocode;
 pub mod tiles;
 

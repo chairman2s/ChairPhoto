@@ -11,6 +11,8 @@ use crate::modules::map::state::{Load, MapGeocode};
 use chairphoto_core::app::GeocodeProgress;
 use chairphoto_core::plugins::map::geocode::GeocodeAllSummary;
 use crate::modules::map::tiles::fake::{tiny, FakeTiles};
+use crate::machine_prefs::{MachinePrefs, FILE_NAME as MACHINE_PREFS_FILE};
+use crate::modules::map::logic::MACHINE_TILE_HOSTS;
 use crate::modules::map::tiles::MapTiles;
 use crate::modules::map::view::MapView;
 use crate::modules::map::{MAP_MODULE_ID, MAP_VIEW_ID};
@@ -330,7 +332,39 @@ fn a_tile_url_saved_across_a_switch_does_not_reach_the_new_catalog(cx: &mut Test
 }
 
 fn machine_hosts(cx: &mut TestAppContext) -> Option<String> {
-    cx.update(|cx| crate::machine_prefs::MachinePrefs::read(cx, crate::modules::map::logic::MACHINE_TILE_HOSTS))
+    cx.update(|cx| MachinePrefs::read(cx, MACHINE_TILE_HOSTS))
+}
+
+/// Gate #119: the migration emptied the catalog's old answers without waiting for the
+/// machine's copy to be written, whose failure was only logged — a failed write lost the
+/// remembered decisions. Here every write fails (the store's directory is a file): the
+/// answers apply for the session, and the catalog keeps its copy. Once the store can be
+/// written, the next read of the catalog saves the answers and only then empties the copy.
+#[gpui_kit::test]
+fn a_failed_machine_prefs_write_keeps_the_catalogs_old_answers(cx: &mut TestAppContext) {
+    let dir = TempDir::new("map-migrate-fail");
+    cx.update(|cx| cx.set_global(MapTiles(Arc::new(FakeTiles::default()))));
+    let app = start(cx);
+    let blocker = dir.0.join("blocker");
+    std::fs::write(&blocker, "a file where the store's directory should be").unwrap();
+    let prefs = blocker.join(MACHINE_PREFS_FILE);
+    cx.update(|cx| cx.set_global(MachinePrefs::load(prefs.clone())));
+    open_catalog_with_photos(&app, &dir, 1, cx);
+    let legacy = r#"{"b.example":true,"tile.openstreetmap.org":false}"#;
+    app.state.catalog.lock().unwrap().as_ref().unwrap().set_setting(LEGACY_HOSTS, legacy).unwrap();
+    work(&app, cx);
+    cx.update(|cx| ModuleRegistry::enable(&app.wired.modules, MAP_MODULE_ID, cx));
+    work(&app, cx);
+    let setting = |app: &App| app.state.catalog.lock().unwrap().as_ref().unwrap().get_setting(LEGACY_HOSTS).unwrap();
+    assert_eq!(machine_hosts(cx).as_deref(), Some(legacy), "merged for this session");
+    assert!(!prefs.exists(), "the write failed");
+    assert_eq!(setting(&app).as_deref(), Some(legacy), "the catalog's answers were dropped though nothing was saved");
+
+    std::fs::remove_file(&blocker).unwrap();
+    open_catalog_with_photos(&app, &dir, 1, cx); // the same catalog, read again
+    work(&app, cx);
+    assert_eq!(MachinePrefs::load(prefs).get(MACHINE_TILE_HOSTS), Some(legacy), "saved now");
+    assert_eq!(setting(&app).as_deref(), Some("{}"), "and only then emptied");
 }
 
 /// Answers stored per catalog by the first port move to this machine on each catalog's
@@ -344,6 +378,9 @@ fn per_catalog_answers_migrate_to_this_machine_and_show_in_preferences(cx: &mut 
     let fake = Arc::new(FakeTiles::default());
     cx.update(|cx| cx.set_global(MapTiles(fake.clone())));
     let app = start(cx);
+    // On disk (in the test's dir): the catalog's copy is emptied only once this is written.
+    let prefs = dir.0.join("prefs").join(MACHINE_PREFS_FILE);
+    cx.update(|cx| cx.set_global(MachinePrefs::load(prefs.clone())));
     open_catalog_with_photos(&app, &dir, 1, cx);
     {
         let guard = app.state.catalog.lock().unwrap();
@@ -358,6 +395,7 @@ fn per_catalog_answers_migrate_to_this_machine_and_show_in_preferences(cx: &mut 
     assert_eq!(machine_hosts(cx).as_deref(), Some(r#"{"b.example":true,"tile.openstreetmap.org":true}"#));
     let setting = |app: &App| app.state.catalog.lock().unwrap().as_ref().unwrap().get_setting(LEGACY_HOSTS).unwrap();
     assert_eq!(setting(&app).as_deref(), Some("{}"), "the catalog's copy was emptied");
+    assert_eq!(MachinePrefs::load(prefs.clone()).get(MACHINE_TILE_HOSTS), machine_hosts(cx).as_deref(), "after the machine's was saved");
     show_map(&app, cx);
     assert!(fake.count() > 0, "allowed by the migrated answer: no question");
 

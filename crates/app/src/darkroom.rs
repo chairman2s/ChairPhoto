@@ -11,9 +11,22 @@
 //! frame is shown only if it is newer than the one on screen — a later generation, or the
 //! full frame of the generation whose fast frame is showing. Anything else is stale and
 //! dropped, so a slow full render of an old state can never paint over a newer fast frame.
-//! A replaced frame's texture is removed from the atlas. A request also cancels the stage's
-//! older requests still queued in the pool — they could only ever be stale — unless the
-//! pool merged the new request into one of them (the same record and size again).
+//! A replaced frame's texture is removed from the atlas.
+//!
+//! A frame that fails is never silent: if it was rendering the newest record (the stage's
+//! current generation), the stage holds a [`StageFailure`] until a frame of that generation
+//! or a newer one is shown, so the view can mark the shown frame — older than the record, or
+//! none at all — as not current. A failure of an older generation while a newer one is still
+//! on its way is not reported: the newer frame is what the stage waits for.
+//!
+//! A request also cancels the stage's older requests still queued in the pool — they could
+//! only ever be stale — unless the pool merged the new request into one of them (the same
+//! record and size again).
+//!
+//! Every job carries the catalog epoch the stage was opened under (`EditJob::catalog_epoch`).
+//! A render cannot be interrupted, and the pool merges identical keys; without the epoch a
+//! stage opened after a catalog switch for the same photo id, record and source would adopt a
+//! render still running for the other catalog's photo.
 //!
 //! The Darkroom view itself is a later ticket; this is its frame source.
 
@@ -58,6 +71,15 @@ pub struct StageFrame {
     pub tier: FrameTier,
 }
 
+/// The newest record's render failed. The frame on the stage, if any, is older than the
+/// record the user sees in the controls.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StageFailure {
+    pub generation: u64,
+    pub tier: FrameTier,
+    pub message: String,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct FrameStats {
     pub fast_requested: u64,
@@ -77,10 +99,14 @@ struct FrameDone {
 pub struct DarkroomStage {
     pool: Arc<dyn Submit>,
     photo_id: i64,
+    /// The catalog this stage renders for (`AppModel::catalog_epoch` when it was opened).
+    catalog_epoch: u64,
     source: SourceToken,
     edit_json: String,
     generation: u64,
     frame: Option<StageFrame>,
+    /// Set when the current generation's render failed; see the module docs.
+    failure: Option<StageFailure>,
     last_fast: Option<Instant>,
     fast_timer: Option<Task<()>>,
     settle_timer: Option<Task<()>>,
@@ -94,11 +120,14 @@ pub struct DarkroomStage {
 }
 
 impl DarkroomStage {
-    /// A stage for `photo_id` rendering from `source` (the camera preview, or a resident
-    /// RAW working image by token) with the record `edit_json`. Renders nothing until asked.
+    /// A stage for `photo_id` of the catalog open under `catalog_epoch`
+    /// (`AppModel::catalog_epoch`), rendering from `source` (the camera preview, or a
+    /// resident RAW working image by token) with the record `edit_json`. Renders nothing
+    /// until asked. A catalog switch needs a new stage: this one's frames are its catalog's.
     pub fn new(
         pool: Arc<dyn Submit>,
         photo_id: i64,
+        catalog_epoch: u64,
         source: SourceToken,
         edit_json: String,
         cx: &mut Context<Self>,
@@ -114,10 +143,12 @@ impl DarkroomStage {
         Self {
             pool,
             photo_id,
+            catalog_epoch,
             source,
             edit_json,
             generation: 0,
             frame: None,
+            failure: None,
             last_fast: None,
             fast_timer: None,
             settle_timer: None,
@@ -131,6 +162,13 @@ impl DarkroomStage {
 
     pub fn frame(&self) -> Option<&StageFrame> {
         self.frame.as_ref()
+    }
+
+    /// The newest record's render failed, and no frame of that record (or a newer one) has
+    /// been shown since: the stage must say so instead of showing [`frame`](Self::frame) as
+    /// if it were current.
+    pub fn failure(&self) -> Option<&StageFailure> {
+        self.failure.as_ref()
     }
 
     pub fn generation(&self) -> u64 {
@@ -183,6 +221,7 @@ impl DarkroomStage {
             base_only: false,
             source: self.source.clone(),
             clip: false,
+            catalog_epoch: self.catalog_epoch,
         });
         self.cancel_older(generation, Some(&job));
         self.outstanding.push((generation, job.clone()));
@@ -221,6 +260,7 @@ impl DarkroomStage {
         if let Some(old) = self.frame.take() {
             cx.defer(move |cx: &mut App| cx.drop_image(old.image, None));
         }
+        self.failure = None;
         self.closed_at = Some(self.generation);
         cx.notify();
     }
@@ -259,11 +299,21 @@ impl DarkroomStage {
                 if let Some(old) = old {
                     cx.defer(move |cx: &mut App| cx.drop_image(old.image, None));
                 }
+                if self.failure.as_ref().is_some_and(|f| done.generation >= f.generation) {
+                    self.failure = None;
+                }
                 cx.notify();
             }
             Err(e) => {
                 self.stats.failed += 1;
                 eprintln!("darkroom: photo {} frame {}: {e}", self.photo_id, done.generation);
+                // Only the current record's failure is the stage's state; an older one is
+                // superseded by the newer frame already on its way.
+                if done.generation == self.generation {
+                    self.failure =
+                        Some(StageFailure { generation: done.generation, tier: done.tier, message: e });
+                    cx.notify();
+                }
             }
         }
     }
@@ -286,7 +336,7 @@ mod tests {
         let pool = Arc::new(FakePool::default());
         let stage = cx.update(|cx| {
             let pool: Arc<dyn Submit> = pool.clone();
-            cx.new(|cx| DarkroomStage::new(pool, 42, SourceToken::Preview, "{}".into(), cx))
+            cx.new(|cx| DarkroomStage::new(pool, 42, 0, SourceToken::Preview, "{}".into(), cx))
         });
         (pool, stage)
     }
@@ -439,6 +489,99 @@ mod tests {
             assert_eq!(f.generation, 4);
             assert_eq!(s.stats().failed, 0, "a cancellation is not a failure");
             assert_eq!(s.stats().stale_dropped, 1, "g2's cancellation");
+        });
+    }
+
+    /// Codex gate finding 2: the newest record's render fails. The older frame stays on the
+    /// stage, but the stage reports the failure instead of passing it off as current. A failure
+    /// of an older generation while a newer one is on its way is not reported (progressive
+    /// display while dragging), and a newer frame clears a reported failure.
+    #[gpui_kit::test]
+    fn a_failed_newest_frame_is_reported_not_hidden(cx: &mut TestAppContext) {
+        let (pool, stage) = stage(cx);
+        let g1 = stage.update(cx, |s, cx| {
+            s.edit_changed(r#"{"tone":{"ev":0.1}}"#.into(), cx);
+            s.request(FrameTier::Fast, cx)
+        });
+        pool.finish(&pool.last_batch()[0], Ok(pixels(4, 4)));
+        cx.run_until_parked();
+        let g2 = stage.update(cx, |s, cx| {
+            s.edit_changed(r#"{"tone":{"ev":0.2}}"#.into(), cx);
+            s.request(FrameTier::Fast, cx)
+        });
+        pool.finish(&pool.last_batch()[0], Err("decode failed".into()));
+        cx.run_until_parked();
+        stage.update(cx, |s, _| {
+            assert_eq!(s.frame().map(|f| f.generation), Some(g1), "the older frame stays");
+            let f = s.failure().expect("the newest record's failure is reported");
+            assert_eq!((f.generation, f.tier, f.message.as_str()), (g2, FrameTier::Fast, "decode failed"));
+        });
+
+        // Dragging on: g3 and g4 go out; g3 fails while g4 is on its way — not reported (g4
+        // is what the stage waits for) — then g4 lands and clears the g2 failure.
+        let g3 = stage.update(cx, |s, cx| {
+            s.edit_changed(r#"{"tone":{"ev":0.3}}"#.into(), cx);
+            s.request(FrameTier::Fast, cx)
+        });
+        let k3 = pool.last_batch()[0].clone();
+        pool.start(k3.clone()); // running: g4 cannot cancel it
+        let g4 = stage.update(cx, |s, cx| {
+            s.edit_changed(r#"{"tone":{"ev":0.4}}"#.into(), cx);
+            s.request(FrameTier::Fast, cx)
+        });
+        let k4 = pool.last_batch()[0].clone();
+        assert!(g2 < g3 && g3 < g4 && k3 != k4);
+        pool.finish(&k3, Err("g3 failed".into()));
+        cx.run_until_parked();
+        stage.update(cx, |s, _| {
+            assert_eq!(s.failure().map(|f| f.generation), Some(g2), "g3's failure is superseded by g4");
+        });
+        pool.finish(&k4, Ok(pixels(4, 4)));
+        cx.run_until_parked();
+        stage.update(cx, |s, _| {
+            assert_eq!(s.frame().map(|f| f.generation), Some(g4));
+            assert!(s.failure().is_none(), "a newer frame clears the failure");
+            assert_eq!(s.stats().failed, 2);
+        });
+    }
+
+    /// Codex gate finding 3: a stage opened after a catalog switch, for the same photo id,
+    /// record and source, must not adopt a render still running for the old catalog. The pool
+    /// merges equal keys (the fake answers every responder of a key at once), so the keys must
+    /// differ.
+    #[gpui_kit::test]
+    fn a_new_catalogs_stage_never_adopts_the_old_catalogs_render(cx: &mut TestAppContext) {
+        let pool = Arc::new(FakePool::default());
+        let open = |epoch: u64, cx: &mut TestAppContext| {
+            let pool: Arc<dyn Submit> = pool.clone();
+            cx.update(|cx| {
+                cx.new(|cx| DarkroomStage::new(pool, 42, epoch, SourceToken::Preview, "{}".into(), cx))
+            })
+        };
+        let old_stage = open(0, cx);
+        old_stage.update(cx, |s, cx| s.request(FrameTier::Full, cx));
+        let old_job = pool.last_batch()[0].clone();
+        pool.start(old_job.clone()); // a worker renders the old catalog's photo 42
+        old_stage.update(cx, |s, cx| s.close(cx)); // the catalog switches away
+
+        let new_stage = open(1, cx);
+        new_stage.update(cx, |s, cx| s.request(FrameTier::Full, cx));
+        let new_job = pool.last_batch()[0].clone();
+        assert_ne!(old_job, new_job, "the new catalog's request would merge into the old render");
+
+        let old_pixels = pixels(8, 8);
+        pool.finish(&old_job, Ok(old_pixels.clone()));
+        cx.run_until_parked();
+        new_stage.update(cx, |s, _| {
+            if let Some(f) = s.frame() {
+                assert!(!Arc::ptr_eq(&f.image, &old_pixels.image), "the old catalog's photo was shown");
+            }
+        });
+        let new_pixels = pixels(8, 8);
+        pool.finish(&new_job, Ok(new_pixels.clone()));
+        cx.run_until_parked();
+        new_stage.update(cx, |s, _| {
+            assert!(Arc::ptr_eq(&s.frame().expect("its own frame").image, &new_pixels.image));
         });
     }
 

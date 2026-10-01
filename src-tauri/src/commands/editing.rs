@@ -59,6 +59,7 @@ pub async fn render_edit(
             base_only: false,
             source: crate::plugins::edit::SourceToken::Preview,
             clip: false,
+            catalog_epoch: 0,
         };
         // Render and base64-wrap on a blocking worker: both are CPU work, neither belongs
         // on the async thread.

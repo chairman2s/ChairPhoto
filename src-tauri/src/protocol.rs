@@ -95,6 +95,7 @@ pub(crate) fn edit_job_from_uri<T>(request: &Request<T>) -> Result<EditJob, Stri
         base_only: false,
         source: crate::plugins::edit::SourceToken::Preview,
         clip: false,
+        catalog_epoch: 0,
     };
     let query = request.uri().query().unwrap_or("");
     for pair in query.split('&').filter(|p| !p.is_empty()) {

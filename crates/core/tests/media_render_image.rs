@@ -256,6 +256,7 @@ fn an_edit_frame_is_the_protocol_render_without_the_encode() {
         base_only,
         source: SourceToken::Preview,
         clip: false,
+        catalog_epoch: 0,
     };
 
     let base = job(720, true);

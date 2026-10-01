@@ -69,6 +69,38 @@ Leaflet (BSD-2) and MapLibre (BSD-3) are permissive; OpenStreetMap tiles are fre
 ODbL with **attribution** and a usage policy — fine for personal desktop use, with a custom
 tile source available for heavy use.
 
+### The GPUI map (`crates/app/src/modules/map/`)
+
+The GPUI port draws the map itself — no map library (`docs/plans/gpui/map.md`). The
+headless half lives in the core under `plugins::map`: `tiles::math` (Web Mercator, fractional
+zoom, the visible tile grid, fit-to-points), `tiles::source` (the tile URL), `tiles::cache`
+and `tiles::fetch` (below), and `cluster` (grid clustering, 60 px). The module paints tiles,
+fences and markers on one canvas, with the fence list, filmstrip, status bar and fence editor
+as overlays, and contributes the same settings and inspector "Geocode" panels as React.
+
+**Tiles need the user's yes, per host** (decision #118). The first time the map opens with a
+tile host it has no answer for, a card asks whether to load tiles from that host and says
+what a tile request reveals (the IP address and roughly where the photos are). The answer is
+the catalog setting `map.tileHosts` (`{"tile.openstreetmap.org": true}`), changeable in the
+Map module's settings ("Block", "Ask again") or from the status bar's "Map tiles off" chip.
+Until a host is allowed nothing is fetched; markers and fences show on a plain background
+with a graticule. A new tile URL on another host asks again. Being a catalog setting, the
+answer is per catalog. Reverse geocoding stays user-initiated per click, as before.
+
+**OSM tile policy.** The default URL is the policy's exact
+`https://tile.openstreetmap.org/{z}/{x}/{y}.png`; React's stored `{s}.` default reads as it,
+and `{s}` is never used (dropped on OSM's host, `a` elsewhere). Every request carries
+`plugins::map::USER_AGENT`. Tiles are cached on disk under
+`$XDG_CACHE_HOME/chairphoto/tiles/` (512 MiB cap, least recently used evicted), fresh for
+`max(max-age, 7 days)`, then revalidated with `If-None-Match`/`If-Modified-Since`; a stale
+tile is shown when revalidation fails. Only the tiles intersecting the view load, at most
+four requests at a time, and a load that leaves the view before its request starts is
+cancelled. The attribution is always on the status bar while tiles show.
+
+**Measuring.** `CHAIRPHOTO_MAP_TIMING=1` logs the map's render and paint CPU time per frame
+(p50/p95/max every 120 frames); `cargo run --release -p chairphoto-app --example map_bench`
+times clustering and the tile grid on synthetic points.
+
 ## Reverse-geocoding
 
 Geofences handle the fine personal spots a geocoder will never know. Reverse-geocoding

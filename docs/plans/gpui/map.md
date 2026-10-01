@@ -9,6 +9,12 @@ Researched 2026-09-30 against `feature/gpui` at `ebe3259`. File:line references 
 that tree unless they name a crate in `~/.cargo/registry/src/index.crates.io-*/` or a
 URL. Statements marked **(inference)** are reasoned, not observed.
 
+**Built** (ticket #119, branch `wf/map-module`): as recommended below, with the owner's
+privacy decision from #118 (ask per host on first open, remembered as the catalog setting
+`map.tileHosts`) instead of the `map.tiles.enabled` switch proposed under "Opt-in and privacy
+in the port". What was built, and how to measure it: `docs/map-and-geotagging.md` § "The
+GPUI map".
+
 ## Recommendation
 
 **Write our own map widget; use no map crate.** Split it in two:

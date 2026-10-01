@@ -115,6 +115,28 @@ pub fn extract_originals(
     dest_base: &Path,
     on_progress: impl Fn(usize, usize),
 ) -> Result<(Vec<ExtractedItem>, BundleImportResult), String> {
+    let never = std::sync::atomic::AtomicBool::new(false);
+    extract_originals_abortable(manifest, archive, dest_base, &never, on_progress)
+        .map(|(extracted, result, _)| (extracted, result))
+}
+
+/// [`extract_originals`], stopping before the next original once `abort` is set (a Cancel,
+/// a newer import or a catalog switch). The third value is whether it stopped early.
+///
+/// A stop never leaves a half-written file: `abort` is read between originals, and each
+/// original is written whole. What was unpacked before the stop **stays** in the library
+/// folder, each copy with its identity sidecar, and nothing is deleted. A same-size
+/// "already here" entry may be the user's own pre-existing original, and this function will
+/// not decide which files it may remove. Importing the bundle again finishes the job: the
+/// copies are then same-size skips, bound by UUID and indexed. A rescan also picks them up
+/// under the bundle's identity.
+pub fn extract_originals_abortable(
+    manifest: &BundleManifest,
+    archive: &mut ZipArchive<std::fs::File>,
+    dest_base: &Path,
+    abort: &std::sync::atomic::AtomicBool,
+    on_progress: impl Fn(usize, usize),
+) -> Result<(Vec<ExtractedItem>, BundleImportResult, bool), String> {
     let total = manifest.photos.len();
     let mut result = BundleImportResult {
         copied: 0,
@@ -125,6 +147,9 @@ pub fn extract_originals(
     let mut extracted: Vec<ExtractedItem> = Vec::new();
 
     for (i, bp) in manifest.photos.iter().enumerate() {
+        if abort.load(std::sync::atomic::Ordering::Relaxed) {
+            return Ok((extracted, result, true));
+        }
         on_progress(i + 1, total);
 
         let arc_orig = format!("{}/{}", ORIGINALS_DIR, bp.relative_path);
@@ -301,7 +326,7 @@ pub fn extract_originals(
         });
     }
 
-    Ok((extracted, result))
+    Ok((extracted, result, false))
 }
 
 // ---------------------------------------------------------------------------

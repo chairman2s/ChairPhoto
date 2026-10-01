@@ -7,9 +7,9 @@
 //! foot.
 //!
 //! **Collection browser.** The fixed "library" header with All photos and Trash, then the
-//! collapsible sections — tags ([`crate::tags::panel::TagPanel`]), smart albums, albums,
-//! import batches ([`crate::storage::batches`]); a section whose panel is a later ticket
-//! (Albums and export #115) says so. The browser scrolls as one column; the tag panel holds
+//! collapsible sections — tags ([`crate::tags::panel::TagPanel`]), smart albums and albums
+//! ([`crate::albums::panel`]), import batches ([`crate::storage::batches`]). The browser
+//! scrolls as one column; the tag panel holds
 //! its scroll handle, so a tag search can scroll its row into view. Below them, `module-slot-sidebar` holds the enabled
 //! modules' sidebar panels ([`crate::modules::PanelSlot::Sidebar`]); it is empty while no
 //! module contributes one.
@@ -39,16 +39,6 @@ pub fn rail_order<'a, V>(views: &'a [V], id: impl Fn(&V) -> &str) -> Vec<&'a V> 
         .collect();
     out.extend(views.iter().filter(|v| !PREFERRED_ORDER.contains(&id(v))));
     out
-}
-
-/// What each section's panel is waiting for.
-fn section_placeholder(section: Section) -> &'static str {
-    match section {
-        Section::Tags => "", // `crate::tags::panel`
-        Section::SmartAlbums => "Smart albums — not yet ported (#115)",
-        Section::Albums => "Albums — not yet ported (#115)",
-        Section::Batches => "", // `crate::storage::batches`
-    }
 }
 
 impl RootView {
@@ -244,15 +234,10 @@ impl RootView {
                 browser = browser.child(self.render_batches(shell, colors, cx));
             } else if open && section == Section::Tags {
                 browser = browser.child(self.tag_panel.clone());
-            } else if open {
-                browser = browser.child(
-                    div()
-                        .px(px(14.))
-                        .py(px(4.))
-                        .text_size(px(11.))
-                        .text_color(colors.mute)
-                        .child(section_placeholder(section)),
-                );
+            } else if open && section == Section::Albums {
+                browser = browser.child(self.render_albums(shell, colors, cx));
+            } else if open && section == Section::SmartAlbums {
+                browser = browser.child(self.render_smart_albums(shell, colors, cx));
             }
         }
         // The enabled modules' sidebar panels.

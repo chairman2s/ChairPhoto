@@ -43,8 +43,14 @@ use gpui_kit::component::slider::SliderState;
 use gpui_kit::prelude::*;
 use gpui_kit::{
     div, px, AnyElement, Context, CursorStyle, Entity, FocusHandle, MouseButton, MouseMoveEvent, Pixels,
-    SharedString, Subscription, TestSupportExt as _, Window,
+    SharedString, Subscription, TestSupportExt as _, WeakEntity, Window,
 };
+
+/// Albums and export's entities (#115), handed to the root view together.
+pub struct Collections {
+    pub albums: Entity<crate::albums::AlbumsState>,
+    pub exports: Entity<crate::export::ExportState>,
+}
 
 /// A column-edge drag in progress: which column, where the pointer started, the width then.
 #[derive(Debug, Clone, Copy)]
@@ -65,6 +71,16 @@ pub struct RootView {
     /// block (mounted on the Photo inspector's tags tab, #108).
     pub(crate) tag_panel: Entity<TagPanel>,
     pub(crate) photo_tags: Entity<PhotoTags>,
+    /// Albums and smart albums (#115): their write path and dialogs.
+    pub(crate) albums: Entity<crate::albums::AlbumsState>,
+    /// The export jobs and dialogs (#115).
+    pub(crate) exports: Entity<crate::export::ExportState>,
+    /// The open name prompt's submission.
+    pub(crate) album_prompt: Option<Subscription>,
+    /// The open Export dialog's "Export as bundle…".
+    pub(crate) export_batch: Option<Subscription>,
+    /// This view, for menu rows that open a dialog over it.
+    pub(crate) this: WeakEntity<RootView>,
     /// The open storage or Preferences dialog's close request (`crate::storage::open`).
     pub(crate) dialog_close: Option<Subscription>,
     pub(crate) focus: FocusHandle,
@@ -77,7 +93,7 @@ pub struct RootView {
     /// The catalog the dialog was opened on: a switch closes it.
     catalog_epoch: u64,
     resize: Option<Resize>,
-    _observers: [Subscription; 7],
+    _observers: [Subscription; 8],
 }
 
 impl RootView {
@@ -90,6 +106,7 @@ impl RootView {
         modules: Entity<ModuleRegistry>,
         storage: Entity<StorageState>,
         tags: Entity<TagsState>,
+        collections: Collections,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -147,6 +164,7 @@ impl RootView {
                 cx.notify();
             }),
             cx.observe(&storage, |_, _, cx| cx.notify()),
+            cx.observe(&collections.exports, |_, _, cx| cx.notify()),
             // React re-read the back-up queue and the trash count on window focus, and backed
             // up what waited when the NAS was reachable (App.tsx `onFocus`: `checkReconcile` +
             // `refreshTrashCount`): an external change or a reconnected NAS shows on return.
@@ -167,6 +185,11 @@ impl RootView {
             storage,
             tag_panel,
             photo_tags,
+            albums: collections.albums,
+            exports: collections.exports,
+            album_prompt: None,
+            export_batch: None,
+            this: cx.entity().downgrade(),
             dialog_close: None,
             focus,
             thumb_slider,
@@ -450,6 +473,9 @@ impl Render for RootView {
             .on_action(cx.listener(|this, _: &BackUpSelection, _, cx| this.back_up_selection(cx)))
             .on_action(cx.listener(|this, _: &AnalyseBurst, _, cx| this.shell.update(cx, |s, cx| s.analyse_burst(cx))))
             .on_action(cx.listener(|this, _: &ProposeStacks, window, cx| this.open_stack_proposals(window, cx)))
+            // Albums and export (#115).
+            .on_action(cx.listener(|this, _: &ExportSelection, window, cx| this.open_export(window, cx)))
+            .on_action(cx.listener(|this, _: &CancelExport, _, cx| this.exports.update(cx, |e, cx| e.cancel(cx))))
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| this.on_mouse_move(event, cx)))
             .on_mouse_up(MouseButton::Left, cx.listener(|this, _, _, _| this.resize = None))
             .size_full()

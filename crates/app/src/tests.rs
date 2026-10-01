@@ -866,3 +866,7 @@ mod map_tests;
 // Tags (#107).
 #[path = "tags_tests.rs"]
 mod tags_tests;
+
+// Albums and export (#115).
+#[path = "albums_tests.rs"]
+mod albums_tests;

@@ -74,6 +74,23 @@ impl RootView {
                                 .test_support(),
                         )
                     })
+                    // An export stops before its next photo (Albums and export, #115).
+                    .when(shell.jobs.import.is_none() && (shell.jobs.export_photos.is_some() || shell.jobs.export_bundle.is_some()), |d| {
+                        d.child(
+                            div()
+                                .id("bench-cancel-export")
+                                .mt(px(4.))
+                                .text_size(px(10.5))
+                                .text_color(colors.dim)
+                                .cursor_pointer()
+                                .hover(|s| s.text_color(colors.txt))
+                                .child("Cancel export")
+                                .on_click(|_, window, cx| {
+                                    window.dispatch_action(Box::new(crate::shell::actions::CancelExport), cx)
+                                })
+                                .test_support(),
+                        )
+                    })
                     .test_support()
                     .into_any_element()
             }

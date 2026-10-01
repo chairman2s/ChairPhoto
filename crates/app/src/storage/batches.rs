@@ -1,7 +1,7 @@
 //! The collection browser's "import batches" section (`BatchesPanel.tsx`): each batch's
 //! last-path-segment title and photo count; a click filters the library to that batch (a
-//! second click on the active one clears it); ⬇ "Export as bundle" per row (Albums and
-//! export, #115); "No imports yet". The list is the shell's (`Lists::batches`), re-read
+//! second click on the active one clears it); ⬇ "Export as bundle" per row (the bundle
+//! export, `crate::export::bundle`); "No imports yet". The list is the shell's (`Lists::batches`), re-read
 //! whenever the catalog is (after an import or a scan, too).
 
 use crate::shell::state::ShellState;
@@ -56,10 +56,13 @@ impl RootView {
                             .tooltip(crate::shell::title_bar::tooltip(
                                 "Export this batch as a .chairphoto bundle for transfer to another machine",
                             ))
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                cx.stop_propagation();
-                                this.model.update(cx, |m, cx| m.not_yet_ported("Export a bundle", 115, cx));
-                            }))
+                            .on_click({
+                                let batch = b.clone();
+                                cx.listener(move |this, _, window, cx| {
+                                    cx.stop_propagation();
+                                    this.open_bundle_export(batch.clone(), window, cx);
+                                })
+                            })
                             .test_support(),
                     )
                     .on_click(cx.listener(move |this, _, _, cx| {

@@ -83,6 +83,10 @@ pub struct AppModel {
     pool: Option<Arc<ImagePool<Loaded>>>,
     /// The open catalog, once [`AppModel::refresh`] has read it.
     pub catalog: Option<CatalogSummary>,
+    /// The identity of the catalog [`catalog`](Self::catalog) was read from, while it is the
+    /// current one (`None` from a switch until its refresh lands). What a dialog that opens
+    /// now binds its writes to (`with_catalog_as`), e.g. Preferences.
+    identity: Option<CatalogIdentity>,
     /// One line on what the app is doing ("Opening catalog…", an error).
     pub status: SharedString,
     /// The last core event: its wire name and a short rendering of its payload.
@@ -130,6 +134,7 @@ impl AppModel {
             state,
             pool,
             catalog: None,
+            identity: None,
             status: "Starting…".into(),
             last_event: None,
             events_seen: 0,
@@ -148,6 +153,11 @@ impl AppModel {
 
     pub fn state(&self) -> &AppState {
         &self.state
+    }
+
+    /// See the field [`identity`](Self::identity).
+    pub fn catalog_identity(&self) -> Option<CatalogIdentity> {
+        self.identity
     }
 
     pub fn pool(&self) -> Option<&Arc<ImagePool<Loaded>>> {
@@ -206,15 +216,17 @@ impl AppModel {
                     return; // superseded
                 }
                 match summary {
-                    Ok(summary) => {
+                    Ok((identity, summary)) => {
                         eprintln!("catalog: {} · {} photos", summary.name, summary.photo_count);
                         m.catalog = Some(summary);
+                        m.identity = Some(identity);
                         m.catalog_current = true;
                         cx.emit(AppModelEvent::CatalogRead);
                         m.start_pending_link(cx);
                     }
                     Err(e) => {
                         m.catalog = None;
+                        m.identity = None;
                         m.catalog_current = false;
                         m.status = format!("Catalog unavailable: {e}").into();
                     }
@@ -328,6 +340,7 @@ impl AppModel {
     fn on_catalog_switched(&mut self) {
         self.catalog_epoch += 1;
         self.catalog_current = false;
+        self.identity = None;
         self.link_generation += 1;
         self.deep_link = None;
         if let Some(link) = self.in_flight_link.take() {
@@ -383,8 +396,8 @@ pub fn not_yet_ported_line(what: &str, ticket: u32) -> String {
 }
 
 /// The open catalog's name and photo count. Blocking (catalog lock + SQLite): background only.
-fn read_summary(state: &AppState) -> Result<CatalogSummary, String> {
-    with_catalog(state, |c| {
+fn read_summary(state: &AppState) -> Result<(CatalogIdentity, CatalogSummary), String> {
+    with_catalog_identified(state, |c| {
         let photo_count = c.count_photos(&PhotoQuery::default())?;
         let path = c.db_path();
         let name = path

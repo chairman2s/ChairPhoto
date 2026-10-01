@@ -143,6 +143,12 @@ pub fn apply_offload_policy(state: &AppState) -> Result<usize, String> {
     claim_reconcile(state)?.apply_offload_policy()
 }
 
+/// [`apply_offload_policy`] claimed only while the open catalog is `expected` (the one the
+/// user asked in); otherwise `CATALOG_CHANGED`, with no generation installed.
+pub fn apply_offload_policy_as(state: &AppState, expected: super::CatalogIdentity) -> Result<usize, String> {
+    claim(state, Some(expected))?.apply_offload_policy()
+}
+
 // ── Reconcile ────────────────────────────────────────────────────────────────
 
 /// A back-up drain's (or the offload policy's) ownership: the reconcile generation it
@@ -168,8 +174,15 @@ pub struct ReconcileClaim {
 /// un-tripped generation for a catalog that has been replaced. Blocking (the catalog lock):
 /// run it on a worker.
 pub fn claim_reconcile(state: &AppState) -> Result<ReconcileClaim, String> {
+    claim(state, None)
+}
+
+fn claim(state: &AppState, expected: Option<super::CatalogIdentity>) -> Result<ReconcileClaim, String> {
     let guard = state.catalog.lock().map_err(|e| e.to_string())?;
     let c = guard.as_ref().ok_or("No catalog is open")?;
+    if expected.is_some_and(|e| !e.is(c)) {
+        return Err(super::CATALOG_CHANGED.into());
+    }
     let (db_path, root) = (c.db_path().to_path_buf(), c.root().to_path_buf());
     let abort = state.jobs.reconcile.install_fresh()?;
     Ok(ReconcileClaim { db_path, root, abort })

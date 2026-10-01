@@ -8,10 +8,9 @@
 //! `develop.decodeCacheGb`, `develop.preloadNeighbours`, `develop.wbSlider`,
 //! `metrics.exportParity`, `editor.renderTiming`, `editor.renderTiming.lastSummary`.
 
-use super::{section, status, Ctx};
+use super::{section, status, Ctx, Scope};
 use crate::shell::style::Colors;
 use crate::storage::ui;
-use chairphoto_core::app::{with_catalog, AppState};
 use chairphoto_core::external_edit::{available_editors, AvailableEditor};
 use chairphoto_core::rapidraw::rapidraw_available;
 use chairphoto_model::darkroom::kelvin::{WbPrefer, WB_SLIDER_KEY};
@@ -90,17 +89,17 @@ struct EditorsRead {
     rapidraw_bin: String,
 }
 
-fn read_editors(state: &AppState) -> Result<EditorsRead, String> {
-    let list = available_editors(state)?;
+fn read_editors(scope: &Scope) -> Result<EditorsRead, String> {
+    let list = available_editors(scope.state())?;
     let mut editors = Vec::new();
     for e in list {
-        let (gui, cli) = with_catalog(state, |c| {
+        let (gui, cli) = scope.catalog(|c| {
             Ok((c.get_setting(&format!("editor.{}.gui", e.key))?, c.get_setting(&format!("editor.{}.cli", e.key))?))
         })?;
         editors.push((e, gui.unwrap_or_default(), cli.unwrap_or_default()));
     }
-    let rapidraw = rapidraw_available(state).ok().map(|s| (s.available, s.format));
-    let rapidraw_bin = with_catalog(state, |c| c.get_setting(RAPIDRAW_BIN_KEY))?.unwrap_or_default();
+    let rapidraw = rapidraw_available(scope.state()).ok().map(|s| (s.available, s.format));
+    let rapidraw_bin = scope.catalog(|c| c.get_setting(RAPIDRAW_BIN_KEY))?.unwrap_or_default();
     Ok(EditorsRead { editors, rapidraw, rapidraw_bin })
 }
 
@@ -113,6 +112,10 @@ pub struct EditorsSection {
     pub rapidraw_bin: Entity<InputState>,
     pub rapidraw_format: String,
     pub status: Option<String>,
+    /// Whether the stored values are in the fields. Until then a blur must not save: it
+    /// would overwrite the stored binary with the still-empty field (and with a failed read,
+    /// any blur would).
+    pub loaded: bool,
     subscriptions: Vec<Subscription>,
 }
 
@@ -120,7 +123,7 @@ impl EditorsSection {
     pub fn new(ctx: Ctx, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let rapidraw_bin = cx.new(|cx| InputState::new(window, cx).placeholder("RapidRAW (binary command / path)"));
         let blur = cx.subscribe_in(&rapidraw_bin, window, |this, input, event: &InputEvent, _, cx| {
-            if matches!(event, InputEvent::Blur) {
+            if matches!(event, InputEvent::Blur) && this.loaded {
                 let value = input.read(cx).value().to_string();
                 this.save_rapidraw(RAPIDRAW_BIN_KEY, value, cx);
             }
@@ -137,6 +140,7 @@ impl EditorsSection {
             rapidraw_bin,
             rapidraw_format: "tiff".into(),
             status: None,
+            loaded: false,
             subscriptions: vec![blur],
         }
     }
@@ -164,6 +168,7 @@ impl EditorsSection {
             self.rapidraw_format = format;
         }
         self.rapidraw_bin.update(cx, |i, cx| i.set_value(read.rapidraw_bin, window, cx));
+        self.loaded = true;
     }
 
     /// Save one path (blank = the auto-detected command on PATH), then re-check availability.
@@ -171,9 +176,9 @@ impl EditorsSection {
         let setting = format!("editor.{key}.{which}");
         self.ctx.run(
             cx,
-            move |state| {
-                with_catalog(state, |c| c.set_setting(&setting, value.trim()))?;
-                available_editors(state)
+            move |scope| {
+                scope.catalog(|c| c.set_setting(&setting, value.trim()))?;
+                available_editors(scope.state())
             },
             |s: &mut Self, result, _| match result {
                 Ok(editors) => {
@@ -189,9 +194,9 @@ impl EditorsSection {
     pub fn save_rapidraw(&mut self, key: &'static str, value: String, cx: &mut Context<Self>) {
         self.ctx.run(
             cx,
-            move |state| {
-                with_catalog(state, |c| c.set_setting(key, value.trim()))?;
-                rapidraw_available(state)
+            move |scope| {
+                scope.catalog(|c| c.set_setting(key, value.trim()))?;
+                rapidraw_available(scope.state())
             },
             |s: &mut Self, result, _| match result {
                 Ok(st) => {
@@ -290,6 +295,9 @@ pub struct DarkroomSection {
     pub parity: Option<String>,
     pub timing: Option<bool>,
     pub last_summary: String,
+    /// Whether the stored cache size is in its field: until then Enter or a blur saves
+    /// nothing (it would store the empty field's default over the user's size).
+    pub gb_loaded: bool,
     /// Clearing the cache.
     pub busy: bool,
     _subscriptions: Vec<Subscription>,
@@ -306,8 +314,8 @@ impl DarkroomSection {
         ctx.run_in(
             window,
             cx,
-            |state| {
-                let get = |key: &str| with_catalog(state, |c| c.get_setting(key)).ok().flatten();
+            |scope| {
+                let get = |key: &str| scope.catalog(|c| c.get_setting(key)).ok().flatten();
                 DarkroomRead {
                     gb: parse_cache_gb(get(DECODE_CACHE_GB_KEY).as_deref()),
                     preload: get(PRELOAD_KEY).as_deref() != Some("0"),
@@ -319,6 +327,7 @@ impl DarkroomSection {
             },
             |s: &mut Self, r, window, cx| {
                 s.gb.update(cx, |i, cx| i.set_value(r.gb.to_string(), window, cx));
+                s.gb_loaded = true;
                 s.preload = Some(r.preload);
                 s.wb = Some(r.wb);
                 s.parity = r.parity;
@@ -335,6 +344,7 @@ impl DarkroomSection {
             parity: None,
             timing: None,
             last_summary: String::new(),
+            gb_loaded: false,
             busy: false,
             _subscriptions: vec![save],
         };
@@ -348,12 +358,15 @@ impl DarkroomSection {
 
     /// Enter or leaving the field: normalise the value and store it.
     pub fn save_gb(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.gb_loaded {
+            return;
+        }
         let n = parse_cache_gb(Some(&self.gb.read(cx).value()));
         let text = n.to_string();
         if self.gb.read(cx).value() != text.as_str() {
             self.gb.update(cx, |i, cx| i.set_value(text.clone(), window, cx));
         }
-        self.ctx.run(cx, move |state| with_catalog(state, |c| c.set_setting(DECODE_CACHE_GB_KEY, &text)), |_: &mut Self, _, _| {});
+        self.ctx.run(cx, move |scope| scope.catalog(|c| c.set_setting(DECODE_CACHE_GB_KEY, &text)), |_: &mut Self, _, _| {});
     }
 
     pub fn clear_cache(&mut self, cx: &mut Context<Self>) {
@@ -379,7 +392,7 @@ impl DarkroomSection {
         *field(self) = Some(next);
         cx.notify();
         let value = if next { "1" } else { "0" };
-        self.ctx.run(cx, move |state| with_catalog(state, |c| c.set_setting(key, value)), move |s: &mut Self, result, _| {
+        self.ctx.run(cx, move |scope| scope.catalog(|c| c.set_setting(key, value)), move |s: &mut Self, result, _| {
             if result.is_err() {
                 *field(s) = Some(!next);
             }
@@ -402,7 +415,7 @@ impl DarkroomSection {
             WbPrefer::Kelvin => "kelvin",
             WbPrefer::Relative => "relative",
         };
-        self.ctx.run(cx, move |state| with_catalog(state, |c| c.set_setting(WB_SLIDER_KEY, value)), move |s: &mut Self, result, _| {
+        self.ctx.run(cx, move |scope| scope.catalog(|c| c.set_setting(WB_SLIDER_KEY, value)), move |s: &mut Self, result, _| {
             if result.is_err() {
                 s.wb = before;
             }

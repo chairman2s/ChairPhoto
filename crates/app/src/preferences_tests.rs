@@ -503,3 +503,122 @@ fn appearance_switches_the_mode_per_machine(cx: &mut TestAppContext) {
     assert_eq!(cx.update(|cx| crate::theme::mode(cx)), AppearanceMode::FollowOmarchy);
     assert!(present(&app, "appearance-status", cx));
 }
+
+// --- catalog identity (#113 review) -----------------------------------------------------------
+
+/// **Forced interleaving** (#113 review, finding 1). Work queued by Preferences in one
+/// catalog — a tag delete keyed by the orphan list's id, a tiering Save, Compact — runs after
+/// the core switched to a catalog whose tag carries the same id; `catalog:switched` withheld
+/// or delivered. Every one fails closed: the new catalog's tag and settings are untouched.
+fn queued_work_across_a_switch(delivered: bool, cx: &mut TestAppContext) {
+    let dir = TempDir::new("prefs-identity");
+    let app = start(cx);
+    open_catalog(&app, &dir, cx);
+    let orphan = app.state.catalog.lock().unwrap().as_ref().unwrap().create_tag("Unused").unwrap();
+    let p = open(&app, cx);
+    tab(&app, "prefs-tab-tags", cx);
+    let t = tags(&p, cx);
+    click(&app, "tags-find-unused", cx);
+    work(cx);
+    assert!(t.read_with(cx, |t, _| t.orphans.as_ref().unwrap().iter().any(|o| o.id == orphan)));
+    in_window(&app, cx, |w, cx| t.update(cx, |t, cx| t.delete(orphan, w, cx)));
+    // Storage, without running anything queued.
+    in_window(&app, cx, |w, cx| p.update(cx, |p, cx| p.select(Tab::Storage, w, cx)));
+    let tier = tiering(&p, cx);
+    let days = tier.read_with(cx, |t, _| t.days.clone());
+    set_input(&app, &days, "7", cx);
+    tier.update(cx, |t, cx| t.save(cx));
+    let m = maintenance(&p, cx);
+    m.update(cx, |m, cx| m.compact(cx));
+
+    let (b, _) = colliding_catalog(&dir, "b", 0);
+    let kept = b.create_tag("Kept").unwrap();
+    assert_eq!(kept, orphan, "the tag ids collide, as real catalogs' do");
+    core_switch(&app, b);
+    if delivered {
+        deliver_switch(&app, cx);
+    }
+    work(cx);
+    assert!(
+        app.state.catalog.lock().unwrap().as_ref().unwrap().get_tag(kept).is_ok(),
+        "the old catalog's delete removed the new catalog's tag"
+    );
+    assert_eq!(setting(&app, "offload_age_days"), None, "the old catalog's Save wrote into the new one");
+    if !delivered {
+        let changed = Some(chairphoto_core::app::CATALOG_CHANGED.to_string());
+        assert_eq!(t.read_with(cx, |t, _| t.status.clone()), changed);
+        assert_eq!(tier.read_with(cx, |t, _| t.status.clone()), changed);
+        assert_eq!(m.read_with(cx, |m, _| m.status.clone()), changed);
+    }
+}
+
+#[gpui_kit::test]
+fn queued_work_fails_closed_before_the_switch_event(cx: &mut TestAppContext) {
+    queued_work_across_a_switch(false, cx);
+}
+
+#[gpui_kit::test]
+fn queued_work_fails_closed_after_the_switch_event(cx: &mut TestAppContext) {
+    queued_work_across_a_switch(true, cx);
+}
+
+/// Once `catalog:switched` and the model's read of the new catalog land, the open tab is
+/// rebuilt bound to the new catalog, and its work runs there.
+#[gpui_kit::test]
+fn after_a_switch_the_rebuilt_tab_works_in_the_new_catalog(cx: &mut TestAppContext) {
+    let dir = TempDir::new("prefs-identity-new");
+    let app = start(cx);
+    open_catalog(&app, &dir, cx);
+    let p = open(&app, cx);
+    let (b, _) = colliding_catalog(&dir, "b", 0);
+    core_switch(&app, b);
+    deliver_switch(&app, cx);
+    work(cx);
+    let now = chairphoto_core::app::catalog_identity(&app.state).unwrap();
+    let tier = tiering(&p, cx);
+    assert_eq!(tier.read_with(cx, |t, _| t.ctx_identity()), Some(now));
+    let days = tier.read_with(cx, |t, _| t.days.clone());
+    set_input(&app, &days, "7", cx);
+    tier.update(cx, |t, cx| t.save(cx));
+    work(cx);
+    assert_eq!(setting(&app, "offload_age_days").as_deref(), Some("7"));
+}
+
+/// Finding 2: a blur (or Enter) before the stored values have loaded saves nothing — the
+/// RapidRAW binary and the decode-cache size keep what is stored.
+#[gpui_kit::test]
+fn editors_save_nothing_before_their_values_load(cx: &mut TestAppContext) {
+    let dir = TempDir::new("prefs-editors-early");
+    let app = start(cx);
+    open_catalog(&app, &dir, cx);
+    put_setting(&app, "editor.rapidraw.bin", "/opt/rapidraw/bin");
+    put_setting(&app, "develop.decodeCacheGb", "7");
+    let p = open(&app, cx);
+    // The Editors tab, its reads queued and not run.
+    in_window(&app, cx, |w, cx| p.update(cx, |p, cx| p.select(Tab::Editors, w, cx)));
+    let (e, d) = editors(&p, cx);
+    let bin = e.read_with(cx, |e, _| e.rapidraw_bin.clone());
+    // Focus changes reach their listeners (the input's Blur) in an active window, at a frame.
+    in_window(&app, cx, |w, _| w.activate_window());
+    let blur = |cx: &mut TestAppContext| {
+        in_window(&app, cx, |w, cx| {
+            bin.update(cx, |i, cx| i.focus(w, cx));
+            w.render_frame(cx);
+        });
+        in_window(&app, cx, |w, cx| {
+            w.blur(cx);
+            w.render_frame(cx);
+        });
+    };
+    // Into the field and out again: a blur.
+    blur(cx);
+    in_window(&app, cx, |w, cx| d.update(cx, |d, cx| d.save_gb(w, cx)));
+    work(cx);
+    assert_eq!(setting(&app, "editor.rapidraw.bin").as_deref(), Some("/opt/rapidraw/bin"), "the early blur wiped the binary");
+    assert_eq!(setting(&app, "develop.decodeCacheGb").as_deref(), Some("7"), "the early save stored the default");
+    assert_eq!(bin.read_with(cx, |i, _| i.value().to_string()), "/opt/rapidraw/bin", "then it loaded");
+    // Loaded: a blur saves (and so the early one was a real blur).
+    blur(cx);
+    work(cx);
+    assert_eq!(e.read_with(cx, |e, _| e.status.clone()).as_deref(), Some("Saved."));
+}

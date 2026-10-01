@@ -29,6 +29,8 @@ actions!(
         ShowAllPhotos,
         /// The icon rail's Library item.
         ShowLibrary,
+        /// The icon rail's Develop: the Darkroom on the active photo (#111).
+        OpenDevelop,
         /// The bench's ✕: clear the selection.
         ClearSelection,
         /// More ⋯ → Preferences…, and the rail's gear: Preferences (#113), on its Storage tab.
@@ -106,8 +108,6 @@ not_yet_ported! {
     StartCullSession => ("Start cull session", 109),
     /// The bench's Compare (C in the grid).
     OpenCompare => ("Compare", 109),
-    /// The icon rail's Develop.
-    OpenDevelop => ("Develop", 111),
 }
 
 #[cfg(test)]

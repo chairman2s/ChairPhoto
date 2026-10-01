@@ -28,16 +28,31 @@
 //! stage opened after a catalog switch for the same photo id, record and source would adopt a
 //! render still running for the other catalog's photo.
 //!
-//! The Darkroom view itself is a later ticket; this is its frame source.
+//! **Frame timing.** Every request is stamped ([`FrameSample`], `chairphoto_model`'s
+//! `render_timing`): requested, answered (the BGRA frame is back on the UI thread) and taken
+//! as the stage's frame — or superseded (cancelled or stale). The last [`MAX_SAMPLES`] are
+//! kept for [`DarkroomStage::timing_summary`]; with logging on, each finished frame prints
+//! an `[edit-timing]` line (the Darkroom turns it on with `editor.renderTiming`).
+//!
+//! **Clipping layer.** A stage made [`clip_layer`](DarkroomStage::clip_layer) asks for the
+//! sensor-clipping overlay (`EditJob::clip`) instead of the render; it is the same frame
+//! source, so its frames are just as ordered and as catalog-bound.
+//!
+//! The Darkroom view (`super::view`) draws these frames; `super::session` owns the stage.
 
 use crate::image_store::{Loaded, Submit};
 use chairphoto_core::image_pool::{EditJob, JobKey, CANCELLED};
 use chairphoto_core::plugins::edit::SourceToken;
+use chairphoto_model::darkroom::render_timing::{format_sample, summarize, FrameSample, Tier, TimingSummary};
 use futures::channel::mpsc::{unbounded, UnboundedSender};
 use futures::StreamExt as _;
 use gpui_kit::{App, Context, RenderImage, Task};
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+/// How many frame samples a stage keeps (the React log kept 200–400).
+pub const MAX_SAMPLES: usize = 400;
 
 /// The live-drag tier's longest edge (React `PREVIEW_FAST`).
 pub const FAST_EDGE: u32 = 720;
@@ -59,6 +74,14 @@ impl FrameTier {
         match self {
             FrameTier::Fast => FAST_EDGE,
             FrameTier::Full => FULL_EDGE,
+        }
+    }
+
+    /// The timing log's name for the tier (`fast`, `settled`).
+    pub fn timing_tier(self) -> Tier {
+        match self {
+            FrameTier::Fast => Tier::Fast,
+            FrameTier::Full => Tier::Settled,
         }
     }
 }
@@ -89,6 +112,14 @@ pub struct FrameStats {
     pub failed: u64,
 }
 
+/// How a requested frame ended, for its timing sample.
+#[derive(Clone, Copy)]
+enum Outcome {
+    Shown,
+    Superseded,
+    Failed,
+}
+
 struct FrameDone {
     generation: u64,
     tier: FrameTier,
@@ -116,6 +147,12 @@ pub struct DarkroomStage {
     closed_at: Option<u64>,
     /// Requests not yet answered: generation and pool key.
     outstanding: Vec<(u64, JobKey)>,
+    /// Ask for the sensor-clipping overlay instead of the render.
+    clip: bool,
+    /// The clock the samples are measured on, and the samples.
+    clock0: Instant,
+    samples: VecDeque<FrameSample>,
+    log_timing: bool,
     _drain: Task<()>,
 }
 
@@ -156,7 +193,66 @@ impl DarkroomStage {
             stats: FrameStats::default(),
             closed_at: None,
             outstanding: Vec::new(),
+            clip: false,
+            clock0: cx.background_executor().now(),
+            samples: VecDeque::new(),
+            log_timing: false,
             _drain,
+        }
+    }
+
+    /// This stage renders the sensor-clipping overlay (`EditJob::clip`), not the picture.
+    pub fn clip_layer(mut self) -> Self {
+        self.clip = true;
+        self
+    }
+
+    pub fn photo_id(&self) -> i64 {
+        self.photo_id
+    }
+
+    pub fn source(&self) -> &SourceToken {
+        &self.source
+    }
+
+    /// Print an `[edit-timing]` line per finished frame.
+    pub fn set_timing_log(&mut self, on: bool) {
+        self.log_timing = on;
+    }
+
+    /// The kept frame samples, oldest first.
+    pub fn samples(&self) -> impl Iterator<Item = &FrameSample> {
+        self.samples.iter()
+    }
+
+    /// The kept samples summarized (latency, answer, take, cadence, per tier).
+    pub fn timing_summary(&self) -> TimingSummary {
+        summarize(&self.samples.iter().cloned().collect::<Vec<_>>())
+    }
+
+    fn now_ms(&self, cx: &Context<Self>) -> f64 {
+        cx.background_executor().now().saturating_duration_since(self.clock0).as_secs_f64() * 1e3
+    }
+
+    /// Stamp the answer of the newest unanswered sample of `generation` at `tier`.
+    fn stamp(&mut self, generation: u64, tier: FrameTier, outcome: Outcome, cx: &Context<Self>) {
+        let now = self.now_ms(cx);
+        let Some(s) = self
+            .samples
+            .iter_mut()
+            .rev()
+            .find(|s| s.seq == generation && s.tier == tier.timing_tier() && s.resolved.is_none() && !s.superseded)
+        else {
+            return;
+        };
+        s.resolved = Some(now);
+        match outcome {
+            Outcome::Shown => s.painted = Some(now),
+            Outcome::Superseded => s.superseded = true,
+            Outcome::Failed => {}
+        }
+        if self.log_timing {
+            eprintln!("{}", format_sample(s));
         }
     }
 
@@ -220,9 +316,14 @@ impl DarkroomStage {
             hi_res: false,
             base_only: false,
             source: self.source.clone(),
-            clip: false,
+            clip: self.clip,
             catalog_epoch: self.catalog_epoch,
         });
+        let requested = self.now_ms(cx);
+        if self.samples.len() >= MAX_SAMPLES {
+            self.samples.pop_front();
+        }
+        self.samples.push_back(FrameSample::new(generation, tier.timing_tier(), requested));
         self.cancel_older(generation, Some(&job));
         self.outstanding.push((generation, job.clone()));
         let done = self.done.clone();
@@ -274,10 +375,12 @@ impl DarkroomStage {
         }
         if matches!(&done.result, Err(e) if e == CANCELLED) {
             self.stats.stale_dropped += 1;
+            self.stamp(done.generation, done.tier, Outcome::Superseded, cx);
             return;
         }
         if self.closed_at.is_some_and(|g| done.generation < g) {
             self.stats.stale_dropped += 1;
+            self.stamp(done.generation, done.tier, Outcome::Superseded, cx);
             return;
         }
         let newer = match &self.frame {
@@ -286,11 +389,13 @@ impl DarkroomStage {
         };
         if !newer {
             self.stats.stale_dropped += 1;
+            self.stamp(done.generation, done.tier, Outcome::Superseded, cx);
             return;
         }
         match done.result {
             Ok(loaded) => {
                 self.stats.shown += 1;
+                self.stamp(done.generation, done.tier, Outcome::Shown, cx);
                 let old = self.frame.replace(StageFrame {
                     image: loaded.image,
                     generation: done.generation,
@@ -306,6 +411,7 @@ impl DarkroomStage {
             }
             Err(e) => {
                 self.stats.failed += 1;
+                self.stamp(done.generation, done.tier, Outcome::Failed, cx);
                 eprintln!("darkroom: photo {} frame {}: {e}", self.photo_id, done.generation);
                 // Only the current record's failure is the stage's state; an older one is
                 // superseded by the newer frame already on its way.

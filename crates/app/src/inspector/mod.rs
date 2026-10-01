@@ -937,12 +937,11 @@ impl PhotoInspector {
         );
     }
 
-    /// ✎ on a version: the Darkroom (#111) edits it. React chose the version and opened
-    /// the Basic Editor's develop view; the version is chosen here, the Darkroom is not
-    /// ported yet.
+    /// ✎ on a version: the Darkroom (#111) edits it — the version is chosen, then Develop
+    /// opens on it, as React chose it and opened the develop view.
     pub fn edit_version(&mut self, version: PhotoVersion, cx: &mut Context<Self>) {
         self.select_version(Some(version), cx);
-        self.model.update(cx, |m, cx| m.not_yet_ported("Editing a version in the Darkroom", 111, cx));
+        self.shell.update(cx, |s, cx| s.open_develop(cx));
     }
 
     fn after_version_change(&mut self, result: Result<(), String>, cx: &mut Context<Self>) {

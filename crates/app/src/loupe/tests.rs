@@ -16,7 +16,7 @@ use crate::tests::{
 };
 use crate::view::RootView;
 use chairphoto_core::app::EventSink as _;
-use chairphoto_core::catalog::PickState;
+use chairphoto_core::catalog::{CullingFilter, PickState};
 use chairphoto_core::image_pool::{ImageKind, JobKey};
 use gpui_kit::test::TestWindowExt as _;
 use gpui_kit::{
@@ -391,6 +391,30 @@ fn compare_panes_share_one_pan_and_zoom(cx: &mut TestAppContext) {
     press(&app, "right", cx);
     render(&app, cx);
     assert_eq!(shared.read_with(cx, |s, _| s.view), ZoomView::FIT);
+}
+
+/// When every pane drops out of the view — here the duel's champion, rated under the Unrated
+/// filter once the duel is done — Compare ends, and the grid's keys mark the selection again
+/// (React's `inCompare` required a pane).
+#[gpui_kit::test]
+fn compare_ends_when_every_pane_leaves_the_view(cx: &mut TestAppContext) {
+    let (app, _pool, _dir, ids) = app_with(3, "cmp-gone", cx);
+    app.wired.shell.update(cx, |s, cx| s.update_scope(cx, |l| l.set_filter(CullingFilter::Unrated)));
+    cx.run_until_parked();
+    select_all(&app, cx);
+    press(&app, "c", cx);
+    press(&app, "right", cx);
+    press(&app, "left", cx);
+    assert!(app.wired.shell.read_with(cx, |s, _| s.compare().unwrap().duel().done));
+    assert_eq!(culling(&app, ids[1]).1, PickState::Pick, "the champion");
+    // Rejected but unrated, the rivals stay in the view; the rated champion leaves it.
+    press(&app, "3", cx);
+    assert_eq!(culling(&app, ids[1]).0, 3);
+    assert!(app.wired.shell.read_with(cx, |s, _| s.compare().is_none()), "Compare ended");
+    assert_eq!(stage(&app, cx), StageView::Grid);
+    select(&app, ids[0], cx);
+    press(&app, "2", cx);
+    assert_eq!(culling(&app, ids[0]).0, 2, "the grid's selection is marked");
 }
 
 /// Catalog identity: a verdict after the core switched writes nothing to the colliding ids;

@@ -831,6 +831,13 @@ impl ShellState {
                 if landed {
                     self.rows_pending = None;
                     self.rows_loaded = true;
+                    // Every pane dropped out of the view (a filter the culling just failed,
+                    // say): Compare ends rather than linger off screen swallowing the marks.
+                    // React's `inCompare` required a pane; the grid's keys then marked the
+                    // selection again.
+                    if self.compare.is_some() && self.compare_panes().is_empty() {
+                        self.compare = None;
+                    }
                     self.apply_pending_link(cx);
                     self.after_input(cx);
                 }

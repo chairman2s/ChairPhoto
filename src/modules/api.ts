@@ -644,6 +644,8 @@ export const cancelRapidraw = (photoId: number) =>
 
 export interface RapidRawProgress {
   photoId: number;
+  /** The round-trip's job id (never reused); the React inspector keys by photo only. */
+  jobId: number;
   /** editing | waiting | importing | done | error | cancelled */
   phase: string;
   message: string;

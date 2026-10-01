@@ -43,12 +43,15 @@ pub mod statistics;
 
 #[cfg(any(test, feature = "dev-module"))]
 pub mod dev_module;
+#[cfg(feature = "map")]
+pub mod map;
 
 #[cfg(test)]
 mod tests;
 
 pub use registry::{ModuleInfo, ModuleRegistry, RequirementInfo};
 
+use crate::image_store::ImageStore;
 use crate::model::AppModel;
 use crate::shell::ShellState;
 use chairphoto_core::app::{with_catalog, AppState, CoreEvent};
@@ -253,12 +256,18 @@ pub struct ModuleHost {
     settings: ModuleSettings,
     model: Entity<AppModel>,
     shell: Entity<ShellState>,
+    images: Option<Entity<ImageStore>>,
 }
 
 impl ModuleHost {
     pub(crate) fn new(meta: ModuleMeta, app: AppState, model: Entity<AppModel>, shell: Entity<ShellState>) -> Self {
         let settings = ModuleSettings { app, prefix: format!("{}.", meta.id) };
-        ModuleHost { meta, settings, model, shell }
+        ModuleHost { meta, settings, model, shell, images: None }
+    }
+
+    pub(crate) fn with_images(mut self, images: Option<Entity<ImageStore>>) -> Self {
+        self.images = images;
+        self
     }
 
     pub fn meta(&self) -> &ModuleMeta {
@@ -278,6 +287,12 @@ impl ModuleHost {
     /// The shell: the Library session (scope, selection, active photo) and the surface.
     pub fn shell(&self) -> &Entity<ShellState> {
         &self.shell
+    }
+
+    /// The app's image layer (thumbnails, previews), when the app has one: `None` in a
+    /// registry built without it (tests of the registry alone).
+    pub fn images(&self) -> Option<&Entity<ImageStore>> {
+        self.images.as_ref()
     }
 }
 
@@ -322,6 +337,8 @@ pub fn bundled() -> Vec<Rc<dyn Module>> {
     #[cfg(any(test, feature = "dev-module"))]
     modules.push(Rc::new(dev_module::DevModule));
     modules.push(Rc::new(statistics::StatisticsModule));
+    #[cfg(feature = "map")]
+    modules.push(Rc::new(map::MapModule));
     modules
 }
 

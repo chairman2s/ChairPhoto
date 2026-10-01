@@ -215,14 +215,14 @@ pub fn wire(
     let model = cx.new(|_| AppModel::new(state, pool.clone()));
     events::spawn_router(events_rx, model.clone(), cx).detach();
     let shell = cx.new(|cx| shell::ShellState::new(&model, cx));
-    let modules = modules::ModuleRegistry::install(&model, &shell, cx);
-    let storage = cx.new(|cx| storage::StorageState::new(&model, &shell, cx));
     // Without a pool (tests), every image request fails at once instead of waiting forever.
     let submit: Arc<dyn image_store::Submit> = match &pool {
         Some(pool) => pool.clone(),
         None => Arc::new(NoPool),
     };
     let images = cx.new(|cx| ImageStore::new(submit, image_store::DEFAULT_BUDGET_BYTES, cx));
+    let modules = modules::ModuleRegistry::install(&model, &shell, &images, cx);
+    let storage = cx.new(|cx| storage::StorageState::new(&model, &shell, cx));
     clear_images_on_catalog_switch(&model, &images, cx).detach();
     if options.open_default_catalog {
         model.update(cx, |m, cx| m.open_default_catalog(cx));

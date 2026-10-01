@@ -831,3 +831,8 @@ mod storage_tests;
 // Preferences (#113).
 #[path = "preferences_tests.rs"]
 mod preferences_tests;
+
+// The Map module (#119).
+#[cfg(feature = "map")]
+#[path = "map_tests.rs"]
+mod map_tests;

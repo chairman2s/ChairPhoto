@@ -5,6 +5,9 @@
 //! Sub-modules:
 //!
 //! - [`geocode`] — Nominatim reverse-geocode client + `map__geocode_cache` table.
+//! - [`tiles`] — the slippy map's headless half: Web Mercator maths with fractional zoom,
+//!   the tile source, a disk tile cache and an OSM-policy-compliant fetcher.
+//! - [`cluster`] — grid clustering of photo markers per zoom level.
 //!
 //! This module owns:
 //!
@@ -23,7 +26,16 @@
 //!   to a single photo (newly-created only, so existing assignments are never redone
 //!   involuntarily).
 
+pub mod cluster;
 pub mod geocode;
+pub mod tiles;
+
+/// The User-Agent of every request the map plugin makes (Nominatim reverse geocoding, map
+/// tiles). Both OSM services require "a clear, unique User-Agent string that names your app"
+/// and block generic library UAs; this names ChairPhoto and where to reach its authors. No
+/// version: the core crate has none of its own (the app's lives in the shell manifests until
+/// the GPUI cutover gives it one source).
+pub const USER_AGENT: &str = "ChairPhoto (photo organizer; +https://github.com/chairman2s/ChairPhoto)";
 
 use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
@@ -320,6 +332,22 @@ pub fn create_fence_for(
     polygon: &[LatLng],
 ) -> rusqlite::Result<Fence> {
     create_fence(catalog.conn(), name, tag_path, polygon)
+}
+
+/// Update a fence via a `Catalog` reference (the GPUI Map module). Returns rows changed.
+pub fn update_fence_for(
+    catalog: &crate::catalog::Catalog,
+    id: i64,
+    name: &str,
+    tag_path: &str,
+    polygon: &[LatLng],
+) -> rusqlite::Result<usize> {
+    update_fence(catalog.conn(), id, name, tag_path, polygon)
+}
+
+/// Delete a fence via a `Catalog` reference (the GPUI Map module). Returns rows removed.
+pub fn delete_fence_for(catalog: &crate::catalog::Catalog, id: i64) -> rusqlite::Result<usize> {
+    delete_fence(catalog.conn(), id)
 }
 
 /// List all fences via a `Catalog` reference.

@@ -25,6 +25,13 @@
 
 pub mod geocode;
 
+/// The User-Agent of every request the map plugin makes (Nominatim reverse geocoding, map
+/// tiles). Both OSM services require "a clear, unique User-Agent string that names your app"
+/// and block generic library UAs; this names ChairPhoto and where to reach its authors. No
+/// version: the core crate has none of its own (the app's lives in the shell manifests until
+/// the GPUI cutover gives it one source).
+pub const USER_AGENT: &str = "ChairPhoto (photo organizer; +https://github.com/chairman2s/ChairPhoto)";
+
 use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 

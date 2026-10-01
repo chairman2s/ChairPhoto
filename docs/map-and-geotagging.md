@@ -102,8 +102,9 @@ for the batch, with a progress bar and a summary.
 meaningful User-Agent and at most one request per second. Both are enforced in code, with
 no configuration needed:
 
-- ChairPhoto sends `User-Agent: ChairPhoto/0.1 (photo-organizer;
-  https://github.com/chairphoto/chairphoto)`.
+- ChairPhoto sends `User-Agent: ChairPhoto (photo organizer;
+  +https://github.com/chairman2s/ChairPhoto)` (`plugins::map::USER_AGENT`, which the map
+  tiles send too).
 - A global rate limiter holds a mutex across the sleep, so concurrent callers cannot race
   past the ≤1 req/s limit. The limiter is a global static, so the single-photo and batch
   commands share one budget.

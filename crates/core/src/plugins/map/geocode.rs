@@ -26,9 +26,10 @@ use tokio::sync::Mutex;
 pub const SETTING_ENDPOINT: &str = "geocode.endpoint";
 pub const DEFAULT_ENDPOINT: &str = "https://nominatim.openstreetmap.org";
 
-/// User-Agent sent with every Nominatim request.  Nominatim's policy requires a
-/// meaningful, non-default UA that identifies the application and contact details.
-const USER_AGENT: &str = "ChairPhoto/0.1 (photo-organizer; https://github.com/chairphoto/chairphoto)";
+/// User-Agent sent with every Nominatim request: the map plugin's one identification,
+/// shared with the tile fetcher. Nominatim's policy requires a meaningful, non-default UA
+/// that identifies the application and how to reach its authors.
+use super::USER_AGENT;
 
 // ── Rate limiter ──────────────────────────────────────────────────────────────
 
@@ -651,5 +652,38 @@ mod tests {
         assert!(result.country_code.is_none());
 
         handle.abort();
+    }
+
+    /// Nominatim blocks generic or misleading clients: every request names ChairPhoto and
+    /// its real repository (the UA used to point at a repository that does not exist).
+    #[tokio::test]
+    async fn nominatim_requests_carry_the_chairphoto_user_agent() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buf = [0u8; 1024];
+            while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                let n = stream.read(&mut buf).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buf[..n]);
+            }
+            let body = r#"{"address":{}}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+            String::from_utf8_lossy(&request).to_lowercase()
+        });
+        nominatim_reverse(&format!("http://127.0.0.1:{port}"), 1.0, 2.0).await.unwrap();
+        let request = server.await.unwrap();
+        let ua = format!("user-agent: {}", USER_AGENT.to_lowercase());
+        assert!(request.contains(&ua), "request without the ChairPhoto UA:\n{request}");
+        assert!(USER_AGENT.contains("https://github.com/chairman2s/ChairPhoto"), "{USER_AGENT}");
     }
 }

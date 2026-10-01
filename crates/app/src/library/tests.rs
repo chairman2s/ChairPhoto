@@ -668,6 +668,48 @@ fn thumbnails_are_requested_per_window(cx: &mut TestAppContext) {
     assert!(after < 1200, "{after} requests after scrolling past a fraction of {n}");
 }
 
+/// Codex gate (Low): a filter that empties the grid releases the thumbnails the last window
+/// asked for — an empty grid draws no list, so the per-frame window hook never runs. The
+/// grid here is a second `LibraryView` over the app's shell with a pool that answers
+/// nothing, so each request stays pending until it is released (cancelled in the pool).
+#[gpui_kit::test]
+fn a_filter_that_empties_the_grid_releases_its_thumbnails(cx: &mut TestAppContext) {
+    use crate::image_tests::FakePool;
+    use chairphoto_core::image_pool::{ImageKind, JobKey};
+    let dir = TempDir::new("grid-empty-release");
+    let app = start(cx);
+    let ids = open_catalog_with_photos(&app, &dir, 12, cx);
+    let pool = std::sync::Arc::new(FakePool::default());
+    let images = cx.update(|cx| {
+        let submit: std::sync::Arc<dyn crate::image_store::Submit> = pool.clone();
+        cx.new(|cx| crate::image_store::ImageStore::new(submit, crate::image_store::DEFAULT_BUDGET_BYTES, cx))
+    });
+    let shell = app.wired.shell.clone();
+    let grid_window = cx.update(|cx| {
+        let images = images.clone();
+        cx.open_window(Default::default(), |_, cx| cx.new(|cx| LibraryView::new(shell, images, cx))).unwrap()
+    });
+    let window: gpui_kit::AnyWindowHandle = grid_window.into();
+    let frame = |cx: &mut TestAppContext| {
+        cx.update_window(window, |_, window, cx| window.render_frame(cx)).unwrap();
+        cx.run_until_parked();
+    };
+    frame(cx);
+    frame(cx);
+    let pending: Vec<i64> =
+        images.read_with(cx, |s, _| ids.iter().copied().filter(|&id| s.is_pending(id, ImageKind::Thumb)).collect());
+    assert!(!pending.is_empty(), "the grid asked for its tiles' thumbnails");
+
+    click(&app, "filter-Picks", cx);
+    assert!(rows(&app, cx).is_empty());
+    frame(cx);
+    let cancelled: Vec<JobKey> = pool.cancelled.lock().unwrap().clone();
+    for id in &pending {
+        assert!(cancelled.contains(&JobKey::photo(*id, ImageKind::Thumb)), "thumbnail {id} still queued for an empty grid");
+    }
+    images.read_with(cx, |s, _| assert!(pending.iter().all(|&id| !s.is_pending(id, ImageKind::Thumb))));
+}
+
 /// The "Stack bursts" dialog proposes the burst, and accepting stacks it under the keeper:
 /// the other frames leave the grid.
 #[gpui_kit::test]

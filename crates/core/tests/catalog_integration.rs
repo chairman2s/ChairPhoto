@@ -3097,9 +3097,10 @@ fn bundle_round_trip_export_import_and_idempotent_reimport() {
     assert_eq!(result.copied, 2);
     assert_eq!(result.errors, 0);
     assert!(result.merge.batch_added, "new batch must be recorded");
-    // The upsert pre-placed both photos, so merge counts them as existing.
-    assert_eq!(result.merge.photos_existing, 2, "upsert placed both photos");
-    assert_eq!(result.merge.photos_added, 0, "merge must not duplicate upserted photos");
+    // The upsert created both photos before the merge; the result reports them as added
+    // (what the user sees as "2 photos added"), not as existing.
+    assert_eq!(result.merge.photos_existing, 0, "neither photo was in catalog B before");
+    assert_eq!(result.merge.photos_added, 2, "the import added both photos");
     // Birds already existed in catalog B (path-match); Birds/Owls is new.
     assert_eq!(result.merge.tags_created, 1, "only the leaf Birds/Owls is new");
     // Both photos get the Birds/Owls assignment via the union.

@@ -545,6 +545,13 @@ pub fn index_bundle(
     // `reconcile_missing_for` instead — see `scanner::phase_b_enrich`.
     let _ = catalog.reconcile_missing();
 
+    // The merge counts the photos Step A created as "existing" — it ran after them. To the
+    // user they are what this import added, so report them so: `photos_added` is everything
+    // new to this catalog (created by the upsert, plus metadata-only photos the merge
+    // inserted), and `photos_existing` only what was here before.
+    let mut merge_summary = merge_summary;
+    merge_summary.photos_added += newly_created.len();
+    merge_summary.photos_existing = merge_summary.photos_existing.saturating_sub(newly_created.len());
     partial_result.merge = merge_summary;
     Ok(partial_result)
 }
@@ -746,12 +753,13 @@ mod tests {
         assert_eq!(result.copied, 1);
         assert_eq!(result.errors, 0);
 
-        // The F1c merge adds the batch and sees the photo as existing (the upsert phase
-        // already placed it via upsert_photo_with_identity, so merge sees photos_existing=1
-        // and photos_added=0 — correct additive behaviour).
+        // The F1c merge adds the batch. The upsert phase created the photo before the merge
+        // ran; the result reports it as what this import added (not as existing), and the
+        // merge did not duplicate it.
         assert!(result.merge.batch_added, "batch must be recorded");
-        assert_eq!(result.merge.photos_existing, 1, "upsert pre-placed the photo");
-        assert_eq!(result.merge.photos_added, 0, "merge should not duplicate the photo");
+        assert_eq!(result.merge.photos_existing, 0, "nothing was here before");
+        assert_eq!(result.merge.photos_added, 1, "the import added one photo");
+        assert_eq!(catalog.count_photos(&Default::default()).unwrap(), 1, "and only one");
 
         // The photo is in the catalog with the bundle's state (rating applied by merge).
         let photo = catalog.get_photo_by_uuid("uuid-index-1").unwrap();

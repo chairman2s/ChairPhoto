@@ -767,9 +767,9 @@ fn a_bundle_previews_and_imports(cx: &mut TestAppContext) {
     click(&app, "bundle-run", cx);
     dlg.read_with(cx, |d, _| assert!(d.importing));
     work(cx);
-    // React's line, from the core's result: the bundle importer indexes its photos before
-    // the merge runs, so the merge itself counts none as added (pre-existing reporting).
-    dlg.read_with(cx, |d, _| assert_eq!(d.result.as_deref(), Some("Import complete. No new photos. 2 originals copied.")));
+    // React's line, from the core's result: the photos the importer created before the merge
+    // ran count as added.
+    dlg.read_with(cx, |d, _| assert_eq!(d.result.as_deref(), Some("Import complete. 2 photos added. 2 originals copied.")));
     assert_eq!(photo_count(&app), 2);
 
     click(&app, "bundle-check", cx);

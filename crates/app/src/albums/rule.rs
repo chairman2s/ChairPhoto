@@ -232,8 +232,50 @@ fn coerce(kind: ValueKind, raw: &str) -> Option<Value> {
         ValueKind::Int => raw.parse::<i64>().ok().map(Value::from),
         ValueKind::Real => raw.parse::<f64>().ok().filter(|v| v.is_finite()).map(Value::from),
         ValueKind::Tag | ValueKind::Batch => raw.parse::<i64>().ok().map(Value::from),
-        ValueKind::Text | ValueKind::Enum | ValueKind::Date => Some(Value::from(raw)),
+        ValueKind::Text | ValueKind::Enum => Some(Value::from(raw)),
+        ValueKind::Date => normalize_date(raw).map(Value::from),
     }
+}
+
+/// What the editor says when a typed date is not one.
+pub const DATE_FORMAT_ERROR: &str = "Enter dates as YYYY-MM-DD, e.g. 2026-01-05.";
+
+/// A typed date as `YYYY-MM-DD` — what React's `<input type="date">` sends — or `None` when
+/// it is not a calendar date in that order. One-digit months and days are padded
+/// (`2026-1-5` → `2026-01-05`): `capture_time` is compared as ISO text, so an unpadded
+/// date would compare wrongly.
+pub fn normalize_date(raw: &str) -> Option<String> {
+    let mut parts = raw.trim().split('-');
+    let (y, m, d) = (parts.next()?, parts.next()?, parts.next()?);
+    let digits = |s: &str, len: std::ops::RangeInclusive<usize>| len.contains(&s.len()) && s.bytes().all(|b| b.is_ascii_digit());
+    if parts.next().is_some() || !digits(y, 4..=4) || !digits(m, 1..=2) || !digits(d, 1..=2) {
+        return None;
+    }
+    let (y, m, d): (u32, u32, u32) = (y.parse().ok()?, m.parse().ok()?, d.parse().ok()?);
+    let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+    let days = match m {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap => 29,
+        2 => 28,
+        _ => return None,
+    };
+    (1..=days).contains(&d).then(|| format!("{y:04}-{m:02}-{d:02}"))
+}
+
+/// Why the rows cannot be saved as typed, if they cannot: a date row with text that is not
+/// a `YYYY-MM-DD` date. (An *empty* value is only incomplete and is left out, as in React.)
+pub fn rule_error(conditions: &[Condition]) -> Option<&'static str> {
+    conditions.iter().find_map(|c| {
+        let needs = match c.op {
+            Op::IsSet => 0,
+            Op::Between => 2,
+            _ => 1,
+        };
+        let bad = c.def().kind == ValueKind::Date
+            && c.value[..needs].iter().any(|v| !v.trim().is_empty() && normalize_date(v).is_none());
+        bad.then_some(DATE_FORMAT_ERROR)
+    })
 }
 
 /// The Rule JSON for `conditions`, leaving out incomplete rows. No conditions match every
@@ -331,6 +373,25 @@ mod tests {
                 { "field": "capture_time", "op": "after", "value": "2026-01-01" },
             ]})
         );
+    }
+
+    /// Dates are `YYYY-MM-DD` calendar dates (React's type=date); one-digit parts are padded,
+    /// anything else is refused — never sent as text the ISO comparison would mis-order.
+    #[test]
+    fn a_date_value_is_normalized_to_yyyy_mm_dd_or_refused() {
+        assert_eq!(normalize_date(" 2026-1-5 ").as_deref(), Some("2026-01-05"));
+        assert_eq!(normalize_date("2024-02-29").as_deref(), Some("2024-02-29"));
+        for bad in ["2026-02-29", "2026-13-01", "2026-00-10", "2026-01-32", "26-01-05", "05/01/2026", "2026-01-05T10:00", "2026-01", "2026--5", "January 5", "+2026-01-05"] {
+            assert_eq!(normalize_date(bad), None, "{bad}");
+        }
+        let rule = build_rule_json(&[row("capture_time", Op::Between, "2026-1-5", "2026-12-31")]);
+        assert!(rule.contains(r#""value":["2026-01-05","2026-12-31"]"#), "{rule}");
+        let v: Value = serde_json::from_str(&build_rule_json(&[row("capture_time", Op::After, "2026-1-x", "")])).unwrap();
+        assert_eq!(v, json!({ "match": "all", "conditions": [] }), "a non-date is never sent");
+        assert_eq!(rule_error(&[row("capture_time", Op::Before, "5.1.2026", "")]), Some(DATE_FORMAT_ERROR));
+        assert_eq!(rule_error(&[row("capture_time", Op::Between, "2026-01-05", "soon")]), Some(DATE_FORMAT_ERROR));
+        assert_eq!(rule_error(&[row("capture_time", Op::After, "", "")]), None, "empty is only incomplete");
+        assert_eq!(rule_error(&[row("lens", Op::Contains, "5.1.2026", "")]), None, "text fields take any text");
     }
 
     #[test]

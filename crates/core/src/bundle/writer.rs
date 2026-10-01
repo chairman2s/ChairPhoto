@@ -320,9 +320,18 @@ pub fn write_bundle(
 /// What a bundle write stopped by its abort flag reports (`write_bundle_abortable`).
 pub const BUNDLE_EXPORT_CANCELLED: &str = "Bundle export cancelled";
 
-/// [`write_bundle`], checking `abort` before each photo. A tripped flag stops the write
-/// there with [`BUNDLE_EXPORT_CANCELLED`]: the temporary file is removed and nothing is
-/// placed at `dest_path`, so a half-written bundle never looks like a finished one.
+fn aborted(abort: &std::sync::atomic::AtomicBool) -> bool {
+    abort.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+fn cancelled() -> String {
+    format!("{BUNDLE_EXPORT_CANCELLED} — nothing was written to the destination.")
+}
+
+/// [`write_bundle`], checking `abort` before each photo, before the zip's finish and before
+/// the rename. A tripped flag stops the write there with [`BUNDLE_EXPORT_CANCELLED`]: the
+/// temporary file is removed and nothing is placed at `dest_path`, so a half-written bundle
+/// never looks like a finished one.
 pub fn write_bundle_abortable(
     bundle: &GatheredBundle,
     dest_path: &Path,
@@ -333,37 +342,81 @@ pub fn write_bundle_abortable(
     // 2 steps per photo: original + preview
     let total_steps = total_photos * 2;
 
-    if let Some(parent) = dest_path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("create dest dir: {e}"))?;
-    }
+    let dir = match dest_path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    std::fs::create_dir_all(dir).map_err(|e| format!("create dest dir: {e}"))?;
 
-    // Write to a temp file first; rename to dest on success (atomic-ish).
-    let tmp_path = dest_path.with_extension("chairphoto.tmp");
-    let result = write_bundle_to_file(bundle, &tmp_path, total_steps, abort, &on_progress);
+    // Write to a temp file of this write's own, beside the destination (same filesystem),
+    // then rename it into place. Two writes to one destination (a newer export while an
+    // older, tripped one is still mid-photo) never share a temp file, so neither truncates,
+    // deletes nor renames the other's.
+    let (tmp_path, file) = create_unique_temp(dir)?;
+    let result = write_bundle_to_file(bundle, file, total_steps, abort, &on_progress).and_then(|r| {
+        // A trip during the last photo or the zip's finish still stops it: checked again
+        // right before the rename, the last point where nothing has reached `dest_path`.
+        if aborted(abort) {
+            return Err(cancelled());
+        }
+        // The temp file was fsynced before this: a crash after the rename leaves either the
+        // previous bundle or this whole one at `dest_path`, never a truncated one.
+        std::fs::rename(&tmp_path, dest_path).map_err(|e| format!("rename bundle into place: {e}"))?;
+        Ok(r)
+    });
 
     match result {
         Ok(r) => {
-            std::fs::rename(&tmp_path, dest_path)
-                .map_err(|e| format!("rename bundle into place: {e}"))?;
+            // Make the rename itself durable. The bundle is in place either way, so a failure
+            // here is logged, not reported as a failed export.
+            if let Err(e) = sync_dir(dir) {
+                eprintln!("bundle: could not sync {} after the rename: {e}", dir.display());
+            }
             Ok(r)
         }
         Err(e) => {
+            // Any failure after the temp file was created — the write, a cancel, the rename —
+            // removes it (it is this write's own; a failed rename leaves it where it was).
             let _ = std::fs::remove_file(&tmp_path);
             Err(e)
         }
     }
 }
 
+/// fsync directory `dir`, so a rename into it survives a crash (a no-op where a directory
+/// cannot be opened as a file).
+fn sync_dir(dir: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    std::fs::File::open(dir)?.sync_all()?;
+    #[cfg(not(unix))]
+    let _ = dir;
+    Ok(())
+}
+
+/// Create a fresh temp file in `dir` for one bundle write: a name no other write uses
+/// (process id + random UUID), created exclusively (`O_EXCL`), so it is never another
+/// write's file. Hidden, and named so a leftover is recognisable.
+fn create_unique_temp(dir: &Path) -> Result<(PathBuf, std::fs::File), String> {
+    let mut last = None;
+    for _ in 0..8 {
+        let name = format!(".chairphoto-bundle-{}-{}.tmp", std::process::id(), uuid::Uuid::new_v4().simple());
+        let path = dir.join(name);
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(file) => return Ok((path, file)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => last = Some(e),
+            Err(e) => return Err(format!("create bundle file: {e}")),
+        }
+    }
+    Err(format!("create bundle file: {}", last.map(|e| e.to_string()).unwrap_or_default()))
+}
+
 fn write_bundle_to_file(
     bundle: &GatheredBundle,
-    tmp_path: &Path,
+    file: std::fs::File,
     total_steps: usize,
     abort: &std::sync::atomic::AtomicBool,
     on_progress: &impl Fn(usize, usize),
 ) -> Result<BundleWriteResult, String> {
-    let file = std::fs::File::create(tmp_path)
-        .map_err(|e| format!("create bundle file: {e}"))?;
-
     let mut zip = ZipWriter::new(file);
 
     // Stored (no compression) for originals — they're already compressed (RAW/JPEG).
@@ -391,8 +444,8 @@ fn write_bundle_to_file(
     let mut done = 0usize;
 
     for bp in &bundle.manifest.photos {
-        if abort.load(std::sync::atomic::Ordering::Relaxed) {
-            return Err(format!("{BUNDLE_EXPORT_CANCELLED} — nothing was written to the destination."));
+        if aborted(abort) {
+            return Err(cancelled());
         }
         let original_path = bundle.originals.get(&bp.uuid).and_then(|o| o.as_ref());
 
@@ -459,7 +512,13 @@ fn write_bundle_to_file(
         }
     }
 
-    zip.finish().map_err(|e| format!("zip finish: {e}"))?;
+    // A trip during the last photo stops it before the central directory is written.
+    if aborted(abort) {
+        return Err(cancelled());
+    }
+    let file = zip.finish().map_err(|e| format!("zip finish: {e}"))?;
+    // Durable before the rename can expose it.
+    file.sync_all().map_err(|e| format!("sync bundle file: {e}"))?;
     Ok(result)
 }
 
@@ -504,6 +563,33 @@ mod tests {
     fn tmp_bundle(name: &str) -> crate::test_support::TestSubPath {
         crate::test_support::TestTmpDir::new(&format!("bundle-{name}"))
             .into_subpath("test.chairphoto")
+    }
+
+    /// A rename that fails after the zip was written (the destination is a non-empty
+    /// directory) reports the error and removes the temp file: nothing is left behind.
+    #[test]
+    fn a_failed_rename_removes_the_temp_file() {
+        let dir = crate::test_support::TestTmpDir::new("bundle-rename-fails");
+        let dest = dir.join("taken.chairphoto");
+        std::fs::create_dir_all(dest.join("inside")).unwrap();
+        let bundle = GatheredBundle {
+            manifest: BundleManifest::new(
+                crate::bundle::BundleBatch {
+                    uuid: "batch-rename".into(),
+                    source_label: "Rename".into(),
+                    note: String::new(),
+                    created_at: 1_700_000_000,
+                },
+                1_700_100_000,
+            ),
+            originals: HashMap::new(),
+        };
+        let err = write_bundle(&bundle, &dest, |_, _| {}).unwrap_err();
+        assert!(err.starts_with("rename bundle into place"), "{err}");
+        let left: Vec<String> =
+            std::fs::read_dir(&*dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        assert_eq!(left, ["taken.chairphoto"], "only the directory that was in the way");
+        assert!(dest.join("inside").is_dir(), "the destination is untouched");
     }
 
     /// Build a minimal manifest + empty originals map and write it to a zip; verify

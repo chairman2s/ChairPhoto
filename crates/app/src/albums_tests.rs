@@ -186,7 +186,8 @@ fn album_writes_keyed_by_the_old_lists_ids_never_reach_another_catalog(cx: &mut 
     assert_eq!(status(&app, cx), format!("Renaming the album failed: {CATALOG_CHANGED}"));
     app.wired.albums.update(cx, |a, cx| a.add_selection(id, cx));
     cx.run_until_parked();
-    app.wired.albums.update(cx, |a, cx| a.delete_album(id, cx));
+    let lists_from = app.wired.shell.read_with(cx, |s, _| s.lists_from());
+    app.wired.albums.update(cx, |a, cx| a.delete_album(id, lists_from, cx));
     cx.run_until_parked();
     with_catalog(&app, |c| {
         let list = c.list_albums().unwrap();
@@ -296,6 +297,84 @@ fn smart_albums_rename_and_delete_from_the_section(cx: &mut TestAppContext) {
     click(&app, "ok", cx);
     assert!(with_catalog(&app, |c| c.list_smart_albums().unwrap().is_empty()));
     assert_eq!(app.wired.shell.read_with(cx, |s, _| s.library.scope().smart_album_id), None);
+}
+
+/// **Catalog identity.** A ✕ Delete confirm opened over catalog A's lists stays open while the
+/// catalog switches to B (colliding album and smart-album ids), `catalog:switched` arrives
+/// and the lists reload from B. OK then fails closed (`CATALOG_CHANGED`): the confirm's id
+/// is A's, and B's album and smart album with the same ids are untouched.
+#[gpui_kit::test]
+fn a_delete_confirm_left_open_across_a_switch_never_deletes_the_new_catalogs_album(cx: &mut TestAppContext) {
+    let dir = TempDir::new("albums-delete-switch");
+    let app = start(cx);
+    open_catalog_with_photos(&app, &dir, 1, cx);
+    with_catalog(&app, |c| {
+        c.create_album("A's").unwrap();
+        c.create_smart_album("A's smart", r#"{"match":"all","conditions":[]}"#).unwrap();
+    });
+    app.wired.model.update(cx, |m, cx| m.refresh(cx));
+    cx.run_until_parked();
+    let (id, smart_id) = app.wired.shell.read_with(cx, |s, _| (s.lists.albums[0].id, s.lists.smart_albums[0].id));
+
+    let cases = [(format!("album-delete-{id}"), "album", "b1"), (format!("smart-album-delete-{smart_id}"), "smart album", "b2")];
+    for (trigger, what, name) in cases {
+        let (b, _) = colliding_catalog(&dir, name, 1);
+        assert_eq!(b.create_album("B's").unwrap(), id, "the album ids collide");
+        assert_eq!(b.create_smart_album("B's smart", r#"{"match":"all","conditions":[]}"#).unwrap(), smart_id);
+        click(&app, leak(trigger), cx);
+        settle(&app, cx);
+        assert!(has_dialog(&app, cx), "the {what} confirm is open");
+
+        core_switch(&app, b);
+        deliver_switch(&app, cx);
+        settle(&app, cx);
+        let reloaded = app.wired.shell.read_with(cx, |s, _| s.lists.albums.iter().map(|a| a.name.clone()).collect::<Vec<_>>());
+        assert_eq!(reloaded, ["B's"], "the lists reloaded from B");
+
+        assert!(has_dialog(&app, cx), "the confirm was left open across the switch");
+        click(&app, "ok", cx);
+        settle(&app, cx);
+        with_catalog(&app, |c| {
+            assert_eq!(c.list_albums().unwrap()[0].name, "B's", "B's album survives the {what} confirm");
+            assert_eq!(c.list_smart_albums().unwrap()[0].name, "B's smart", "B's smart album survives");
+        });
+        let line = status(&app, cx);
+        assert!(line.ends_with(CATALOG_CHANGED), "{what}: {line}");
+    }
+}
+
+/// A capture-date value must be a `YYYY-MM-DD` date (React's type=date): other text is
+/// refused at Save with a message and nothing is written; a one-digit month or day is
+/// padded, so the saved rule compares correctly against `capture_time`'s ISO text.
+#[gpui_kit::test]
+fn the_smart_album_editor_refuses_a_date_that_is_not_yyyy_mm_dd(cx: &mut TestAppContext) {
+    let dir = TempDir::new("smart-date");
+    let app = start(cx);
+    open_catalog_with_photos(&app, &dir, 1, cx);
+    click(&app, "smart-album-new", cx);
+    let ed = editor(&app, cx);
+    click(&app, "sa-add", cx);
+    cx.update_window(app.window(), |_, window, cx| {
+        ed.update(cx, |e, cx| {
+            e.set_field(0, "capture_time", window, cx);
+            e.set_op(0, Op::After, window, cx);
+        })
+    })
+    .unwrap();
+    set_input(&app, &ed.read_with(cx, |e, _| e.name.clone()), "Recent", cx);
+    let input = ed.read_with(cx, |e, _| e.rows[0].inputs[0].clone());
+    type_into(&app, &input, "5.1.2026", cx);
+    click(&app, "sa-save", cx);
+    assert_eq!(ed.read_with(cx, |e, _| e.error.clone()).as_deref(), Some(crate::albums::rule::DATE_FORMAT_ERROR));
+    assert!(has_dialog(&app, cx), "the editor stays open");
+    assert!(with_catalog(&app, |c| c.list_smart_albums().unwrap().is_empty()), "nothing written");
+
+    type_into(&app, &input, "2026-1-5", cx);
+    click(&app, "sa-save", cx);
+    assert!(!has_dialog(&app, cx), "a date saves");
+    let rule = with_catalog(&app, |c| c.list_smart_albums().unwrap()[0].rule_json.clone());
+    let rule: serde_json::Value = serde_json::from_str(&rule).unwrap();
+    assert_eq!(rule["conditions"][0]["value"], "2026-01-05", "padded to YYYY-MM-DD");
 }
 
 /// **Catalog identity.** The editor opened over catalog A (its tag and batch ids are A's);

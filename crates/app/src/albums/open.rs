@@ -71,11 +71,13 @@ impl RootView {
 
     pub(crate) fn confirm_delete_album(&mut self, album: &Album, window: &mut Window, cx: &mut Context<Self>) {
         let (id, body) = (album.id, format!("Delete album \"{}\"? Photos are not deleted.", album.name));
+        // The catalog the ✕'s id came from, captured now: an OK after a switch fails closed.
+        let from = self.shell.read(cx).lists_from();
         let answer = ui::confirm(window, cx, "Delete album".into(), body.into(), "Delete");
         let albums = self.albums.clone();
         cx.spawn(async move |_, cx| {
             if answer.await == Ok(true) {
-                albums.update(cx, |a, cx| a.delete_album(id, cx));
+                albums.update(cx, |a, cx| a.delete_album(id, from, cx));
             }
         })
         .detach();
@@ -83,11 +85,12 @@ impl RootView {
 
     pub(crate) fn confirm_delete_smart_album(&mut self, album: &SmartAlbum, window: &mut Window, cx: &mut Context<Self>) {
         let (id, body) = (album.id, format!("Delete smart album \"{}\"? Photos are not deleted.", album.name));
+        let from = self.shell.read(cx).lists_from();
         let answer = ui::confirm(window, cx, "Delete smart album".into(), body.into(), "Delete");
         let albums = self.albums.clone();
         cx.spawn(async move |_, cx| {
             if answer.await == Ok(true) {
-                albums.update(cx, |a, cx| a.delete_smart_album(id, cx));
+                albums.update(cx, |a, cx| a.delete_smart_album(id, from, cx));
             }
         })
         .detach();

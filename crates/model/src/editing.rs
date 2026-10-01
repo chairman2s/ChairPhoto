@@ -133,7 +133,10 @@ impl<T> Field<T> {
     /// likewise, nothing for a number or boolean; nothing for absent or `null`.
     ///
     /// As far as JSON allows: a character outside the BMP is two code units in JS, each a
-    /// lone surrogate no JSON string can hold, so each is written as U+FFFD.
+    /// lone surrogate a Rust string cannot hold. The pair stays whole under the first unit's
+    /// index and the second index is left out, so joining the values in index order gives
+    /// the original string back, as it does from JS's `"\ud83d"`, `"\ude00"` (Codex re-check
+    /// of c6defd2: U+FFFD per unit lost the character).
     pub fn spread(&self) -> T
     where
         T: Clone + Default + serde::de::DeserializeOwned,
@@ -168,20 +171,22 @@ impl<T> Field<T> {
 }
 
 /// The own enumerable keys JS object spread copies from a non-object JSON value: an
-/// array's indices, a string's UTF-16 code unit indices (a lone surrogate as U+FFFD),
-/// nothing else. An object (never raw for the types [`Field::spread`] serves) copies as is.
+/// array's indices, a string's UTF-16 code unit indices (a surrogate pair whole under its
+/// first index, see [`Field::spread`]), nothing else. An object (never raw for the types
+/// [`Field::spread`] serves) copies as is.
 fn spread_keys(v: &Value) -> Map<String, Value> {
     match v {
         Value::Object(o) => o.clone(),
         Value::Array(a) => a.iter().enumerate().map(|(i, e)| (i.to_string(), e.clone())).collect(),
-        Value::String(s) => s
-            .encode_utf16()
-            .enumerate()
-            .map(|(i, u)| {
-                let c = char::from_u32(u32::from(u)).unwrap_or('\u{fffd}');
-                (i.to_string(), Value::String(c.to_string()))
-            })
-            .collect(),
+        Value::String(s) => {
+            let mut keys = Map::new();
+            let mut unit = 0;
+            for c in s.chars() {
+                keys.insert(unit.to_string(), Value::String(c.to_string()));
+                unit += c.len_utf16();
+            }
+            keys
+        }
         Value::Null | Value::Bool(_) | Value::Number(_) => Map::new(),
     }
 }

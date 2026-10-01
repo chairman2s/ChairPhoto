@@ -438,6 +438,11 @@ mod tests {
         // A string spreads its characters; Auto merges over it the same way.
         let spread = proof_spread(&crate::editing::parse_edit(Some(r#"{"tone":"ab"}"#)), &auto(), &[], None);
         assert_eq!(json(&spread[1].record)["tone"], json!({"0": "a", "1": "b", "ev": 0.5, "contrast": 0.1}));
+        // A character outside the BMP is two code units in JS; it is kept whole under the
+        // first index, not lost to U+FFFD, and the next character keeps its JS index.
+        let working = crate::editing::parse_edit(Some(r#"{"tone":"\ud83d\ude00b"}"#));
+        let [a, _] = duel_pair(&working, DuelDim::Ev, 0, None);
+        assert_eq!(json(&a)["tone"], json!({"0": "\u{1f600}", "2": "b", "ev": -0.4}));
     }
 
     #[test]

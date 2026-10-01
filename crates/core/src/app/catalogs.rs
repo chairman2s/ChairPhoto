@@ -3,8 +3,10 @@
 //!
 //! [`open_default_catalog`] is what the Tauri `init_catalog` command runs and what the GPUI
 //! app calls after [`boot`](super::boot). It is not a catalog *switch*: nothing can be open
-//! yet, so it publishes the handle directly (the switch protocol lives with the
-//! `switch_catalog` command). It emits no `catalog:switched`; a front end reads the result.
+//! yet, so it publishes the handle directly and emits no `catalog:switched`; a front end
+//! reads the result. A switch is [`switch_catalog`], whose two ownership phases
+//! ([`detach_catalog_and_trip_jobs`], [`publish_catalog_and_reset_jobs`]) `set_library_root`
+//! runs too.
 
 use super::{app_data_dir, begin_scan_generation, expand_home, spawn_blocking, AppState};
 use super::events::{CoreEvent, EventSink};
@@ -75,49 +77,240 @@ pub async fn open_default_catalog(state: &AppState) -> Result<PathBuf, String> {
     Ok(catalog_path)
 }
 
-/// Detach a Phase B enrichment worker for the given catalog `path`/`root`, using the
-/// supplied `abort` flag. The worker opens its own secondary connection, loads the
-/// pending-enrichment queue, and calls `phase_b_enrich` — streaming
-/// `scan:progress {phase:"metadata"|"finalizing"}` events and the terminal
-/// `scan:progress {phase:"done"}` event when it finishes (or is aborted).
-///
-/// Used by the auto-resume path on startup (I6d) and `drain_enrichment_queue`.
-/// Does nothing (and emits no events) if the queue is empty.
+/// Detach a Phase B enrichment worker for the given catalog `path`/`root` on the core
+/// runtime's blocking pool: [`EnrichJob::resume`], run there. Used by the auto-resume path on
+/// startup (I6d) and `drain_enrichment_queue`. Does nothing (and emits no events) if the
+/// queue is empty.
 pub fn spawn_detached_phase_b(
     events: AppState,
     path: PathBuf,
     root: PathBuf,
     abort: Arc<AtomicBool>,
 ) {
-    crate::app::spawn_blocking(move || {
+    let job = EnrichJob::resume(events, path, root, abort);
+    crate::app::spawn_blocking(move || job.run());
+}
+
+/// A Phase B enrichment pass (I6), ready to run: EXIF/IPTC/XMP extraction and finalizing on
+/// its own secondary connection, under one scan generation's abort flag. It streams
+/// `scan:progress {phase:"metadata"|"finalizing"}` and ends with the terminal
+/// `scan:progress {phase:"done"}` whether it finishes, fails or is aborted.
+///
+/// A value rather than a spawned thread so each front end runs it on its own worker: the
+/// Tauri shell on the core runtime's blocking pool, the GPUI app on its job runner.
+/// [`run`](Self::run) blocks for the whole pass — never call it on a UI thread.
+pub struct EnrichJob {
+    events: AppState,
+    path: PathBuf,
+    root: PathBuf,
+    abort: Arc<AtomicBool>,
+    /// `None`: resume whatever the persistent queue holds (startup auto-resume, a drain, a
+    /// switch to a catalog with pending rows). `Some`: a scan's Phase A hand-off.
+    pending: Option<crate::scanner::PendingEnrich>,
+}
+
+impl EnrichJob {
+    /// Resume the catalog's persistent pending-enrichment queue. An empty queue emits
+    /// nothing, not even `done`.
+    pub fn resume(events: AppState, path: PathBuf, root: PathBuf, abort: Arc<AtomicBool>) -> Self {
+        EnrichJob { events, path, root, abort, pending: None }
+    }
+
+    /// Enrich what a scan's Phase A handed over.
+    pub fn after_scan(
+        events: AppState,
+        path: PathBuf,
+        root: PathBuf,
+        abort: Arc<AtomicBool>,
+        pending: crate::scanner::PendingEnrich,
+    ) -> Self {
+        EnrichJob { events, path, root, abort, pending: Some(pending) }
+    }
+
+    /// Run the pass to its end. Blocking.
+    pub fn run(self) {
+        let EnrichJob { events, path, root, abort, pending } = self;
         let enrich_catalog = match Catalog::open_secondary(&path, &root) {
             Ok(c) => c,
             Err(e) => {
-                eprintln!("resume phase B: couldn't open enrichment connection: {e}");
-                events.send(CoreEvent::ScanProgress(crate::scanner::ScanProgress { phase: "done".into(), done: 0, total: 0 }));
+                eprintln!("phase B: couldn't open enrichment connection: {e}");
+                send_scan_done(&events);
                 return;
             }
         };
-        let pending = match crate::scanner::resume_pending_enrichment(&enrich_catalog) {
-            Ok(Some(p)) => p,
-            Ok(None) => return, // queue is empty — nothing to do, no events emitted
-            Err(e) => {
-                eprintln!("resume phase B: couldn't load enrichment queue: {e}");
-                events.send(CoreEvent::ScanProgress(crate::scanner::ScanProgress { phase: "done".into(), done: 0, total: 0 }));
-                return;
-            }
+        let pending = match pending {
+            Some(p) => p,
+            None => match crate::scanner::resume_pending_enrichment(&enrich_catalog) {
+                Ok(Some(p)) => p,
+                Ok(None) => return, // queue is empty — nothing to do, no events emitted
+                Err(e) => {
+                    eprintln!("resume phase B: couldn't load enrichment queue: {e}");
+                    send_scan_done(&events);
+                    return;
+                }
+            },
         };
         let emit = {
             let events = events.clone();
             move |p: crate::scanner::ScanProgress| events.send(CoreEvent::ScanProgress(p))
         };
         if let Err(e) = crate::scanner::phase_b_enrich(&enrich_catalog, pending, &abort, &emit) {
+            // SCAN_ABORTED is a clean stop (catalog switch / second scan); anything else is
+            // a real failure. Either way, the terminal event below clears the indicator.
             if e != crate::scanner::SCAN_ABORTED {
-                eprintln!("resume phase B: enrichment failed: {e}");
+                eprintln!("phase B: enrichment failed: {e}");
             }
         }
-        events.send(CoreEvent::ScanProgress(crate::scanner::ScanProgress { phase: "done".into(), done: 0, total: 0 }));
+        send_scan_done(&events);
+    }
+}
+
+/// The scan's terminal `scan:progress {phase:"done"}`.
+pub(crate) fn send_scan_done(events: &AppState) {
+    events.send(CoreEvent::ScanProgress(crate::scanner::ScanProgress { phase: "done".into(), done: 0, total: 0 }));
+}
+
+// ── Catalog switching ────────────────────────────────────────────────────────
+
+/// Switch the active catalog with a safe teardown → reinit lifecycle (I4b). The body of the
+/// Tauri `switch_catalog` command and of the GPUI catalog switcher. **Blocking** (it opens
+/// and may migrate a SQLite file): run it on a worker, never the UI thread.
+///
+/// 1. Checks the target exists (or, with `create`, does not) before anything is mutated, so
+///    a rejected switch leaves every job running.
+/// 2. Detaches the outgoing catalog: trips every job generation, clears every status slot
+///    and drops the handle (flushing the WAL) as one transition —
+///    [`detach_catalog_and_trip_jobs`].
+/// 3. Opens (or creates, with its folders) the new catalog.
+/// 4. Publishes it with fresh un-tripped generations ([`publish_catalog_and_reset_jobs`]),
+///    drops stale volume health and records it in the recent-catalogs registry.
+/// 5. Emits `catalog:switched`, so every front end resets and re-reads.
+///
+/// Returns the Phase B auto-resume (I6d) when the new catalog has pending enrichment rows;
+/// the caller runs it on a worker. A failed open after step 2 leaves **no** catalog open —
+/// the old handle is gone by then, as it always was in the Tauri command.
+pub fn switch_catalog(
+    state: &AppState,
+    catalog_path: &Path,
+    root: &Path,
+    create: bool,
+    name: Option<String>,
+) -> Result<Option<EnrichJob>, String> {
+    if create {
+        if catalog_path.exists() {
+            return Err(format!("Catalog file already exists: {}", catalog_path.display()));
+        }
+    } else if !catalog_path.exists() {
+        return Err(format!("Catalog file does not exist: {}", catalog_path.display()));
+    }
+
+    detach_catalog_and_trip_jobs(state)?;
+
+    if create {
+        if let Some(parent) = catalog_path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        std::fs::create_dir_all(root).map_err(|e| e.to_string())?;
+    }
+    let catalog = Catalog::open(catalog_path, root).map_err(|e| e.to_string())?;
+
+    // The name for the registry: caller-supplied, else inferred from the filename.
+    let catalog_name = name.unwrap_or_else(|| {
+        catalog_path.file_stem().and_then(|s| s.to_str()).unwrap_or("catalog").to_string()
     });
+    let actual_root = catalog.root().to_path_buf();
+
+    let fresh_abort = publish_catalog_and_reset_jobs(state, catalog)?;
+    // A different catalog may have entirely different volumes — drop stale reachability.
+    state.volume_health.invalidate();
+    // Non-fatal if it fails.
+    let _ = record_recent_catalog(&catalog_name, catalog_path, &actual_root);
+
+    state.send(CoreEvent::CatalogSwitched(catalog_path.to_string_lossy().to_string()));
+
+    // Only start the resume (and burn a generation) when there is something to do.
+    let pending_count = {
+        let guard = state.catalog.lock().map_err(|e| e.to_string())?;
+        let c = guard.as_ref().ok_or("No catalog is open")?;
+        c.pending_enrichment_count().map_err(|e| e.to_string())?
+    };
+    Ok((pending_count > 0).then(|| {
+        EnrichJob::resume(state.clone(), catalog_path.to_path_buf(), actual_root, fresh_abort)
+    }))
+}
+
+/// Phase one of a catalog switch: trip every job generation, clear every status slot AND
+/// drop the catalog handle in ONE transition, holding the catalog lock across all of them.
+///
+/// Tripping and releasing separately is not enough for the families that claim under the
+/// catalog lock (Faces, Smart Tagging, identity repair), which take catalog -> abort -> slot.
+/// If the trip happened outside the catalog lock such a start could install a fresh
+/// un-tripped generation *after* the only abort signal and then work on a catalog this
+/// function is about to close — and phase two's replacement would overwrite that generation
+/// without tripping it, leaving the worker unreachable by Cancel, by a later start, and by
+/// the next switch. Holding the catalog lock gives those starts two outcomes: one completes
+/// first and is tripped here, or it blocks and then finds no catalog open. Dropping the handle
+/// under the same lock also flushes the WAL before the new connection opens, and leaves no
+/// stale handle if the open fails.
+///
+/// The scan, sharpness, pHash and import starts install their generation and release that
+/// lock *before* reading the catalog, so this phase cannot fence them; phase two covers them
+/// by tripping whatever it finds installed before replacing it.
+///
+/// Every guard is acquired before anything is stored, so a poisoned mutex fails the whole
+/// phase instead of leaving some generations tripped and others live. Nested acquisition is
+/// always catalog -> abort -> slot (the order `jobs` documents).
+pub fn detach_catalog_and_trip_jobs(state: &AppState) -> Result<(), String> {
+    detach_catalog_and_trip_jobs_with(state, |_| Ok(()))
+}
+
+/// As [`detach_catalog_and_trip_jobs`], but runs `before_drop` against the outgoing catalog
+/// while this phase still holds its lock, immediately before the handle is dropped.
+///
+/// `set_library_root` needs exactly this: it has to persist `catalog_root` **through the
+/// still-open handle** — `Catalog::open` adopts the stored setting over the `root` argument —
+/// so persist, trip and drop stay one transition (issue #22).
+///
+/// `before_drop` runs after every guard is acquired but before the first mutation, so a
+/// failing callback aborts the whole phase with nothing tripped and the catalog still open.
+/// It must not take any `AppState` lock: this holds the catalog lock, every abort lock and
+/// every status-slot lock, so anything reaching back for one deadlocks.
+pub fn detach_catalog_and_trip_jobs_with(
+    state: &AppState,
+    before_drop: impl FnOnce(Option<&Catalog>) -> Result<(), String>,
+) -> Result<(), String> {
+    let mut cat_guard = state.catalog.lock().map_err(|e| e.to_string())?;
+    // Every abort generation AND every status slot, locked and unmutated. The status slots
+    // matter as much as the flags: tripping alone leaves the old job reachable as a slot's
+    // owner, so a remounting panel would adopt a job belonging to the catalog the user has
+    // left (issue #51). `JobRegistry` enumerates both groups exhaustively.
+    let job_guards = state.jobs.lock_for_detach()?;
+
+    // `Option`, not `&Catalog`: this phase tolerates running with no catalog open (it ends
+    // with an unconditional `*cat_guard = None`), and `switch_catalog` relies on that.
+    before_drop(cat_guard.as_ref())?;
+
+    job_guards.trip_and_clear_all();
+    *cat_guard = None;
+    Ok(())
+}
+
+/// Phase two of a catalog switch: publish `catalog` and its fresh un-tripped generations in
+/// ONE transition, holding the catalog lock across both. Returns the new scan generation
+/// (the caller hands it to an auto-resumed Phase B).
+///
+/// Whatever is installed at this point is tripped before being replaced: the scan,
+/// sharpness, pHash and import starts install their generation *before* reading the catalog,
+/// so one of those can hold a live generation right now, blocked on the catalog read.
+/// Replacing it silently would leave its worker running with a handle nothing can reach.
+/// The status slots are left alone — each aborted worker clears its own on the way out, and
+/// only if it still owns it.
+pub fn publish_catalog_and_reset_jobs(state: &AppState, catalog: Catalog) -> Result<Arc<AtomicBool>, String> {
+    let mut cat_guard = state.catalog.lock().map_err(|e| e.to_string())?;
+    let job_guards = state.jobs.lock_for_publish()?;
+    let fresh_abort = job_guards.trip_and_replace_all();
+    *cat_guard = Some(catalog);
+    Ok(fresh_abort)
 }
 
 /// Path of the default catalog database file (separate from the photo library root).

@@ -626,6 +626,22 @@ pub fn copy_from_card(
     selected: Option<&std::collections::HashSet<String>>,
     progress: impl Fn(usize, usize),
 ) -> Result<(ScanResult, Vec<CopiedItem>), String> {
+    let never = AtomicBool::new(false);
+    let (result, copied, _) = copy_from_card_abortable(source, dest_base, selected, &never, progress)?;
+    Ok((result, copied))
+}
+
+/// [`copy_from_card`] that stops before the next file once `abort` is set (a Cancel, a newer
+/// import, a catalog switch). The third value says whether it stopped early; the files copied
+/// until then are returned, and are already in the library folder — a caller that does not
+/// index them leaves them for the next rescan, never deletes them.
+pub fn copy_from_card_abortable(
+    source: &Path,
+    dest_base: &Path,
+    selected: Option<&std::collections::HashSet<String>>,
+    abort: &AtomicBool,
+    progress: impl Fn(usize, usize),
+) -> Result<(ScanResult, Vec<CopiedItem>, bool), String> {
     if !source.is_dir() {
         return Err(format!("Not a directory: {}", source.display()));
     }
@@ -647,6 +663,9 @@ pub fn copy_from_card(
     let mut result = ScanResult::default();
     let mut copied: Vec<CopiedItem> = Vec::new();
     for src in &sources {
+        if abort.load(Ordering::Relaxed) {
+            return Ok((result, copied, true));
+        }
         result.scanned += 1;
         progress(result.scanned, total);
         // Take ownership of this file's metadata so it travels to the index phase.
@@ -689,7 +708,7 @@ pub fn copy_from_card(
         }
         copied.push(CopiedItem { dest, meta: m });
     }
-    Ok((result, copied))
+    Ok((result, copied, false))
 }
 
 /// Phase 2 of import: index the already-copied files into the catalog, batch them, and

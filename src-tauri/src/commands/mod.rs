@@ -17,8 +17,7 @@ use crate::scanner::ScanResult;
 use crate::thumbnails::{preview_bytes, thumbnail_bytes};
 use base64::Engine;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 // ── Domain submodules ────────────────────────────────────────────────────────
 //

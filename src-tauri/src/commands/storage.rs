@@ -827,6 +827,7 @@ mod tests {
 #[cfg(test)]
 mod identity_repair_ownership_tests {
     use super::*;
+    use std::sync::Arc;
     use std::sync::Mutex;
     use crate::commands::catalog::{detach_catalog_and_trip_jobs, publish_catalog_and_reset_jobs};
     use crate::catalog::SidecarIdentity;

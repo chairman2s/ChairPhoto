@@ -579,7 +579,7 @@ impl ShellState {
     }
 
     /// Tests: the generation of the row read in flight, if any.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "edit"))]
     pub(crate) fn rows_pending(&self) -> Option<u64> {
         self.rows_pending
     }

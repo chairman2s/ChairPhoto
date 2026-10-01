@@ -62,6 +62,8 @@ macro_rules! core_events {
 core_events! {
     ScanProgress(crate::scanner::ScanProgress) = "scan:progress",
     ImportProgress(ImportProgress) = "import:progress",
+    /// An export's progress (`exports`): photos to a folder, or a batch as a bundle.
+    ExportProgress(ExportProgress) = "export:progress",
     CacheProgress(CacheProgress) = "cache:progress",
     /// The catalog at this path is now the open one; the UI resets against it.
     CatalogSwitched(String) = "catalog:switched",
@@ -135,6 +137,29 @@ pub struct ImportProgress {
     /// The import job this progress belongs to (`scans::claim_import`), so a front end can
     /// drop a superseded or switched-away import's stragglers. Ids start at 1; `0` is the
     /// Tauri bundle export, which reuses this event and is no import job.
+    pub job: u64,
+    pub done: usize,
+    pub total: usize,
+}
+
+/// Which export an `export:progress` event belongs to: the two are separate job families
+/// (`JobRegistry::export`, `JobRegistry::bundle_export`) with their own job ids.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ExportKind {
+    /// Photos written to a folder (the Export dialog).
+    Photos,
+    /// An import batch written as a `.chairphoto` bundle.
+    Bundle,
+}
+
+/// Progress event payload for an export, emitted as `export:progress`: `done` of `total`
+/// steps (photos; a bundle counts two steps per photo, original and preview). Carries the
+/// kind and job id so a front end drops a superseded or switched-away export's stragglers.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportProgress {
+    pub kind: ExportKind,
     pub job: u64,
     pub done: usize,
     pub total: usize,

@@ -6,7 +6,8 @@
 //! - **Ported** — the shell does them itself ([`crate::shell::ShellState`]): panel
 //!   toggles, the cache-previews toggle, widening to all photos, clearing the selection; and
 //!   the Publish dialog ([`crate::modules`]); Preferences ([`crate::preferences`], #113);
-//!   Storage and import's (#114), which the root view hands to `crate::storage`.
+//!   Storage and import's (#114), which the root view hands to `crate::storage`; Albums and
+//!   export's (#115), to `crate::albums` and `crate::export`.
 //! - **Not yet ported** — the feature's surface belongs to a later ticket. Its menu item or
 //!   button still dispatches a real action, and [`crate::model::AppModel::not_yet_ported`]
 //!   answers with a visible status line naming the ticket, rather than faking the feature.
@@ -60,6 +61,11 @@ actions!(
         /// More ⋯ → Propose stacks…, and the bench's Stack: the "Stack bursts" dialog over
         /// the selection, else the whole view (`library::stacks`).
         ProposeStacks,
+        // Albums and export (#115, `crate::export`):
+        /// The title bar's and the bench's Export: the Export dialog over the selection.
+        ExportSelection,
+        /// The bench's Cancel while an export runs.
+        CancelExport,
     ]
 );
 
@@ -96,8 +102,6 @@ macro_rules! not_yet_ported {
 }
 
 not_yet_ported! {
-    /// The title bar's and the bench's Export.
-    ExportSelection => ("Export", 115),
     /// More ⋯ → Open loupe in a new window.
     PopOutLoupe => ("Open loupe in a new window", 110),
     /// More ⋯ → Loupe (Enter in the grid).

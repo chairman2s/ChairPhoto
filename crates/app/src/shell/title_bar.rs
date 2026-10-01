@@ -177,10 +177,10 @@ impl RootView {
         let cache_previews = shell.cache_previews;
         let batches = shell.lists.batches.clone();
         let root = self.focus.clone();
-        let model = self.model.clone();
+        let this = self.this.clone();
         menu_trigger("import-menu", "Import ▾", colors).dropdown_menu(move |menu, window, cx| {
             let batches = batches.clone();
-            let model = model.clone();
+            let this = this.clone();
             menu.action_context(root.clone())
                 .min_w(px(200.))
                 .menu_with_disabled("Import from card…", Box::new(ImportFromCard), !ready)
@@ -194,9 +194,10 @@ impl RootView {
                         return sub.item(PopupMenuItem::new("No import batches yet").disabled(true));
                     }
                     batches.iter().fold(sub, |sub, b| {
-                        let model = model.clone();
-                        sub.item(PopupMenuItem::new(batch_label(b)).on_click(move |_, _, cx| {
-                            model.update(cx, |m, cx| m.not_yet_ported("Export a bundle", 115, cx));
+                        let (this, batch) = (this.clone(), b.clone());
+                        sub.item(PopupMenuItem::new(batch_label(b)).on_click(move |_, window, cx| {
+                            let batch = batch.clone();
+                            this.update(cx, |root, cx| root.open_bundle_export(batch, window, cx)).ok();
                         }))
                     })
                 })

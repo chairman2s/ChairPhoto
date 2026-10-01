@@ -135,7 +135,7 @@ async fn render_localsend_jpegs(
             Err(e) => eprintln!("localsend: render failed for a photo: {e}"),
         }
     }
-    super::export::record_export_parity(&app.state::<AppState>());
+    crate::app::exports::record_export_parity(&app.state::<AppState>());
     Ok((dir, out))
 }
 

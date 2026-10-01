@@ -20,6 +20,7 @@ mod boot;
 pub mod catalogs;
 pub mod bundles;
 pub mod events;
+pub mod exports;
 pub mod identity;
 pub mod iptc;
 pub mod jobs;

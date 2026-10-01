@@ -30,7 +30,8 @@
 //!
 //! **catalog → abort generations → status slots**, and within each of the last two groups
 //! the declaration order of [`JobRegistry`]: scan, face indexing, face matching, sharpness,
-//! pHash, trash, import, reconcile, Smart Tagging, identity repair, burst analysis.
+//! pHash, trash, import, reconcile, Smart Tagging, identity repair, burst analysis, export,
+//! bundle export.
 //!
 //! Every nested acquisition in the backend obeys it:
 //!
@@ -43,6 +44,7 @@
 //! | `storage::claim_reconcile` (a back-up drain or offload-policy start) | catalog → the reconcile abort |
 //! | [`AbortGeneration::install_fresh_if_owner`] (a card import committing to index) | the scan abort → the import abort |
 //! | [`AbortGeneration::install_fresh_if_newer`] (a burst-analysis worker's claim) | one abort, released before the catalog is read |
+//! | `exports::claim_export`, `exports::claim_bundle_export` | one abort, released before the catalog is read |
 //! | [`AbortGeneration::trip`] (every Cancel command) | one abort |
 //! | [`JobSlot`] writes (workers) | one slot |
 //! | `develop`'s resident set (`develop::with_resident`) | a leaf: after any of the above, never across another lock |
@@ -485,6 +487,14 @@ pub struct JobRegistry {
     /// newer run's. No status slot: each run reports its own terminal result, tagged with its
     /// job id so a front end drops a superseded run's.
     pub burst: AbortGeneration,
+    /// Exporting photos to a folder (`exports`, the Export dialog). A newer export, Cancel or
+    /// a catalog switch trips it; the worker stops before its next photo. No status slot —
+    /// progress is `export:progress` and the start reports its own terminal result.
+    pub export: AbortGeneration,
+    /// Writing an import batch as a `.chairphoto` bundle (`exports`). Its own family, so an
+    /// export to a folder never cancels a bundle being written, and vice versa. A tripped
+    /// bundle write removes its temporary file and places nothing at the destination.
+    pub bundle_export: AbortGeneration,
     /// The Develop session's working image (docs/plans/raw-foundation): one claim per
     /// opened photo; a switch, exit or catalog change trips it and the image is released.
     #[cfg(all(feature = "raw", feature = "edit"))]
@@ -523,6 +533,8 @@ impl JobRegistry {
             smarttags,
             identity,
             burst: _,
+            export: _,
+            bundle_export: _,
             #[cfg(all(feature = "raw", feature = "edit"))]
             develop,
         } = self;
@@ -563,6 +575,8 @@ impl JobRegistry {
             smarttags,
             identity,
             burst,
+            export,
+            bundle_export,
             #[cfg(all(feature = "raw", feature = "edit"))]
             develop,
         } = self;
@@ -581,6 +595,8 @@ impl JobRegistry {
             smarttags: smarttags.abort.lock()?,
             identity: identity.abort.lock()?,
             burst: burst.lock()?,
+            export: export.lock()?,
+            bundle_export: bundle_export.lock()?,
             #[cfg(all(feature = "raw", feature = "edit"))]
             develop: develop.abort.lock()?,
         })
@@ -603,6 +619,8 @@ pub struct AbortGuards<'a> {
     smarttags: MutexGuard<'a, Arc<AtomicBool>>,
     identity: MutexGuard<'a, Arc<AtomicBool>>,
     burst: MutexGuard<'a, Arc<AtomicBool>>,
+    export: MutexGuard<'a, Arc<AtomicBool>>,
+    bundle_export: MutexGuard<'a, Arc<AtomicBool>>,
     #[cfg(all(feature = "raw", feature = "edit"))]
     develop: MutexGuard<'a, Arc<AtomicBool>>,
 }
@@ -625,6 +643,8 @@ impl AbortGuards<'_> {
             smarttags,
             identity,
             burst,
+            export,
+            bundle_export,
             #[cfg(all(feature = "raw", feature = "edit"))]
             develop,
         } = self;
@@ -642,6 +662,8 @@ impl AbortGuards<'_> {
         smarttags.store(true, Ordering::Relaxed);
         identity.store(true, Ordering::Relaxed);
         burst.store(true, Ordering::Relaxed);
+        export.store(true, Ordering::Relaxed);
+        bundle_export.store(true, Ordering::Relaxed);
         #[cfg(all(feature = "raw", feature = "edit"))]
         develop.store(true, Ordering::Relaxed);
     }
@@ -681,6 +703,8 @@ impl AbortGuards<'_> {
                 ref mut smarttags,
             ref mut identity,
             ref mut burst,
+            ref mut export,
+            ref mut bundle_export,
             #[cfg(all(feature = "raw", feature = "edit"))]
                 ref mut develop,
         } = self;
@@ -702,6 +726,8 @@ impl AbortGuards<'_> {
         }
         **identity = Arc::new(AtomicBool::new(false));
         **burst = Arc::new(AtomicBool::new(false));
+        **export = Arc::new(AtomicBool::new(false));
+        **bundle_export = Arc::new(AtomicBool::new(false));
         #[cfg(all(feature = "raw", feature = "edit"))]
         {
             **develop = Arc::new(AtomicBool::new(false));

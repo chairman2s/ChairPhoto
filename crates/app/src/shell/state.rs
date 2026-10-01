@@ -18,7 +18,9 @@
 //! keys are not written to it yet, so they start at React's defaults each launch.
 
 use crate::model::{AppModel, AppModelEvent, DeepLinkTarget};
-use chairphoto_core::app::{with_catalog, with_catalog_as, with_catalog_identified, AppState, CatalogIdentity, CoreEvent};
+use chairphoto_core::app::{
+    with_catalog, with_catalog_as, with_catalog_identified, AppState, CatalogIdentity, CoreEvent, ExportKind,
+};
 use chairphoto_core::catalog::{
     Album, Catalog, Facet, ImportBatch, Photo, PhotoPage, PhotoQuery, PhotoVersion, PickState, SmartAlbum,
     SOFT_THRESHOLD_DEFAULT, SOFT_THRESHOLD_KEY,
@@ -170,6 +172,26 @@ pub struct Jobs {
     pub scan: Option<(String, usize, usize)>,
     /// `develop:progress` — `(phase, editor)`, cleared by done/nochange/error.
     pub develop: Option<(String, String)>,
+    /// The photo export the bench follows (`export:progress` of kind `photos` and this job),
+    /// set and cleared by `crate::export::ExportState`; a straggler of any other job moves
+    /// nothing.
+    pub export_photos: Option<ExportTrack>,
+    /// The bundle export the bench follows, likewise.
+    pub export_bundle: Option<ExportTrack>,
+}
+
+/// An export the bench follows: its job id and its last `(done, total)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExportTrack {
+    pub job: u64,
+    pub done: usize,
+    pub total: usize,
+}
+
+impl ExportTrack {
+    pub fn new(job: u64) -> Self {
+        ExportTrack { job, done: 0, total: 0 }
+    }
 }
 
 impl Jobs {
@@ -178,6 +200,12 @@ impl Jobs {
         if let Some((done, total)) = self.import {
             let label = if total > 0 { format!("Importing {done}/{total}") } else { "Importing …".into() };
             return Some(Progress { label, done, total: (total > 0).then_some(total) });
+        }
+        for (track, verb) in [(&self.export_photos, "Exporting"), (&self.export_bundle, "Writing bundle")] {
+            if let Some(t) = track {
+                let label = if t.total > 0 { format!("{verb} {}/{}", t.done, t.total) } else { format!("{verb} …") };
+                return Some(Progress { label, done: t.done, total: (t.total > 0).then_some(t.total) });
+            }
         }
         if let Some((phase, done, total)) = &self.scan {
             let label = match phase.as_str() {
@@ -203,6 +231,16 @@ impl Jobs {
     pub fn on_core_event(&mut self, event: &CoreEvent) -> bool {
         match event {
             CoreEvent::ImportProgress(p) if self.import_job == Some(p.job) => self.import = Some((p.done, p.total)),
+            CoreEvent::ExportProgress(p) => {
+                let track = match p.kind {
+                    ExportKind::Photos => &mut self.export_photos,
+                    ExportKind::Bundle => &mut self.export_bundle,
+                };
+                match track {
+                    Some(t) if t.job == p.job => (t.done, t.total) = (p.done, p.total),
+                    _ => return false,
+                }
+            }
             CoreEvent::ScanProgress(p) if p.phase == "done" => self.scan = None,
             CoreEvent::ScanProgress(p) => self.scan = Some((p.phase.clone(), p.done, p.total)),
             CoreEvent::DevelopProgress(p) if matches!(p.phase.as_str(), "done" | "nochange" | "error") => {
@@ -313,6 +351,9 @@ pub struct ShellState {
     /// it (`with_catalog_as`), so it fails closed once another catalog is open, even before
     /// `catalog:switched` reaches the shell. `None` until rows land, and after a switch.
     rows_from: Option<CatalogIdentity>,
+    /// The catalog [`Self::lists`] were read from: what a write keyed by their ids (an album,
+    /// a smart album, an import batch) is bound to. `None` until they land, and after a switch.
+    lists_from: Option<CatalogIdentity>,
     /// A photo link waiting for the grid to list its photo.
     pub pending_link: Option<PendingPhotoLink>,
     /// The version of the active photo the loupe shows (`None` = Original): picked in the
@@ -374,6 +415,7 @@ impl ShellState {
             rows_loaded: false,
             rows_pending: None,
             rows_from: None,
+            lists_from: None,
             pending_link: None,
             active_version: None,
             editing_tag: None,
@@ -564,6 +606,11 @@ impl ShellState {
     /// write keyed by their ids, or by the selection's, is bound to.
     pub fn rows_from(&self) -> Option<CatalogIdentity> {
         self.rows_from
+    }
+
+    /// The catalog the lists shown were read from ([`Self::lists_from`]'s field docs).
+    pub fn lists_from(&self) -> Option<CatalogIdentity> {
+        self.lists_from
     }
 
     /// Re-run the current query off the UI thread (`list_photos`), with the identity of the
@@ -873,6 +920,7 @@ impl ShellState {
                 self.rows_loaded = false;
                 self.rows_pending = None;
                 self.rows_from = None;
+                self.lists_from = None;
                 self.pending_link = None;
                 self.active_version = None;
                 self.editing_tag = None;
@@ -910,8 +958,9 @@ impl ShellState {
             this.update(cx, |s, cx| {
                 if s.lists_generation == generation {
                     match lists {
-                        Ok((lists, soft_threshold)) => {
+                        Ok((from, (lists, soft_threshold))) => {
                             s.lists = lists;
+                            s.lists_from = Some(from);
                             s.soft_threshold = soft_threshold;
                         }
                         Err(e) => eprintln!("shell: lists unavailable: {e}"),
@@ -1018,8 +1067,8 @@ impl ShellState {
 }
 
 /// The lists the menus offer, and the soft-badge threshold. Blocking: background only.
-fn read_lists(state: &AppState) -> Result<(Lists, f64), String> {
-    with_catalog(state, |c| {
+fn read_lists(state: &AppState) -> Result<(CatalogIdentity, (Lists, f64)), String> {
+    with_catalog_identified(state, |c| {
         let soft_threshold = c
             .get_setting(SOFT_THRESHOLD_KEY)?
             .and_then(|v| v.parse::<f64>().ok())

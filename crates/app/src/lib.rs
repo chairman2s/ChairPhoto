@@ -32,11 +32,13 @@
 //! calls around the event loop, and the tests call the same two functions with a test boot,
 //! no default catalog and a counter for `clean_exit`.
 
+pub mod albums;
 pub mod assets;
 #[cfg(feature = "edit")]
 pub mod darkroom;
 pub mod desktop;
 pub mod events;
+pub mod export;
 pub mod image_store;
 pub mod inspector;
 pub mod keymap;
@@ -185,6 +187,10 @@ pub struct Wired {
     pub storage: Entity<storage::StorageState>,
     /// The tag tree, the tag clipboard and the tag write path (#107).
     pub tags: Entity<tags::TagsState>,
+    /// Albums and smart albums' write path (#115).
+    pub albums: Entity<albums::AlbumsState>,
+    /// The export jobs (#115).
+    pub exports: Entity<export::ExportState>,
     /// The main window, or why it could not open (the app has then been asked to quit).
     pub main_window: Result<AnyWindowHandle, String>,
     /// The main window's root view (the shell and the Library grid), when it opened.
@@ -229,6 +235,8 @@ pub fn wire(
     let modules = modules::ModuleRegistry::install(&model, &shell, &images, cx);
     let storage = cx.new(|cx| storage::StorageState::new(&model, &shell, cx));
     let tags = cx.new(|cx| tags::TagsState::new(&model, cx));
+    let albums = cx.new(|cx| albums::AlbumsState::new(&model, &shell, cx));
+    let exports = cx.new(|cx| export::ExportState::new(&model, &shell, cx));
     if options.open_default_catalog {
         model.update(cx, |m, cx| m.open_default_catalog(cx));
     }
@@ -240,7 +248,10 @@ pub fn wire(
     let opened = gpui_kit::open_window(window_options, cx, {
         let (model, shell, images, modules, storage, tags) =
             (model.clone(), shell.clone(), images.clone(), modules.clone(), storage.clone(), tags.clone());
-        move |window, cx| cx.new(|cx| view::RootView::new(model, shell, images, modules, storage, tags, window, cx))
+        let collections = view::Collections { albums: albums.clone(), exports: exports.clone() };
+        move |window, cx| {
+            cx.new(|cx| view::RootView::new(model, shell, images, modules, storage, tags, collections, window, cx))
+        }
     });
     let root = opened.as_ref().ok().map(|(_, root)| root.clone());
     let main_window = match opened {
@@ -260,7 +271,7 @@ pub fn wire(
             Err(e.to_string())
         }
     };
-    Wired { model, images, shell, modules, storage, tags, main_window, root }
+    Wired { model, images, shell, modules, storage, tags, albums, exports, main_window, root }
 }
 
 /// Become this app data dir's primary instance, serving second launches into `tx`; or hand

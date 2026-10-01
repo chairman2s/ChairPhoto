@@ -43,7 +43,7 @@ pub enum ExportPreset {
 /// (preserving aspect, never upscaling) yields the platform-correct pixel size.
 const INSTAGRAM_WIDTH: u32 = 1080;
 
-#[derive(Debug, Default, Clone, serde::Serialize)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ExportResult {
     pub exported: usize,
@@ -147,13 +147,49 @@ pub fn write_exports(
     dest_dir: &Path,
     hashtags: &[String],
 ) -> Result<ExportResult, String> {
+    let never = std::sync::atomic::AtomicBool::new(false);
+    write_exports_with(resolved, preset, dest_dir, hashtags, &never, &|_, _| {}).map(|run| run.result)
+}
+
+/// What [`write_exports_with`] did: its counts, and whether `abort` stopped it early.
+#[derive(Debug, Clone)]
+pub struct ExportRun {
+    pub result: ExportResult,
+    /// The abort flag tripped: the photos after `result.exported + errors` were not
+    /// written, and neither was `hashtags.txt`.
+    pub stopped: bool,
+}
+
+/// [`write_exports`], checking `abort` before each photo — a tripped flag stops it there
+/// (what was written stays; it is a destination copy, never an original) — and reporting
+/// `on_progress(done, total)` once before the first photo and after each one.
+pub fn write_exports_with(
+    resolved: &ResolvedExport,
+    preset: ExportPreset,
+    dest_dir: &Path,
+    hashtags: &[String],
+    abort: &std::sync::atomic::AtomicBool,
+    on_progress: &dyn Fn(usize, usize),
+) -> Result<ExportRun, String> {
+    use std::sync::atomic::Ordering;
+    if abort.load(Ordering::Relaxed) {
+        return Ok(ExportRun {
+            result: ExportResult { exported: 0, skipped_offline: resolved.skipped_offline, errors: resolved.resolve_errors },
+            stopped: true,
+        });
+    }
     std::fs::create_dir_all(dest_dir).map_err(|e| e.to_string())?;
     let mut result = ExportResult {
         exported: 0,
         skipped_offline: resolved.skipped_offline,
         errors: resolved.resolve_errors,
     };
-    for item in &resolved.items {
+    let total = resolved.items.len();
+    on_progress(0, total);
+    for (i, item) in resolved.items.iter().enumerate() {
+        if abort.load(Ordering::Relaxed) {
+            return Ok(ExportRun { result, stopped: true });
+        }
         let outcome = match preset {
             ExportPreset::HandOff => export_handoff(item, dest_dir),
             ExportPreset::ShowOff => export_jpeg(item, dest_dir, None),
@@ -163,6 +199,7 @@ pub fn write_exports(
             Ok(()) => result.exported += 1,
             Err(_) => result.errors += 1,
         }
+        on_progress(i + 1, total);
     }
     if !hashtags.is_empty() {
         // Best-effort, like the keyword write: photos are already exported, so a failed
@@ -172,7 +209,7 @@ pub fn write_exports(
             result.errors += 1;
         }
     }
-    Ok(result)
+    Ok(ExportRun { result, stopped: false })
 }
 
 /// Copy the original next to its XMP sidecar (if one exists), never overwriting an

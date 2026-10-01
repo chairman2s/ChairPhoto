@@ -42,6 +42,8 @@ pub mod registry;
 
 #[cfg(any(test, feature = "dev-module"))]
 pub mod dev_module;
+#[cfg(feature = "tag-graph")]
+pub mod tag_graph;
 
 #[cfg(test)]
 mod tests;
@@ -335,6 +337,8 @@ pub fn bundled() -> Vec<Rc<dyn Module>> {
     let mut modules: Vec<Rc<dyn Module>> = Vec::new();
     #[cfg(any(test, feature = "dev-module"))]
     modules.push(Rc::new(dev_module::DevModule));
+    #[cfg(feature = "tag-graph")]
+    modules.push(Rc::new(tag_graph::TagGraphModule));
     modules
 }
 

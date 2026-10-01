@@ -150,12 +150,20 @@ impl GraphSession {
         true
     }
 
-    /// The catalog switched (or the view is going away): forget everything that named the old
-    /// catalog, and make every load and scene in flight stale.
+    /// The catalog switched: forget everything that named the old catalog (graph, branch,
+    /// selection, community, isolation, view), and make every load and scene in flight stale.
+    /// The panel's choices — node types and link strength — stay, as React's state did.
     pub fn reset(&mut self) {
         let (load, scene) = (self.load_generation + 1, self.scene_generation + 1);
-        let size = self.size;
-        *self = GraphSession { load_generation: load, scene_generation: scene, size, ..Default::default() };
+        let (size, visible, link_threshold) = (self.size, self.visible, self.link_threshold);
+        *self = GraphSession {
+            load_generation: load,
+            scene_generation: scene,
+            size,
+            visible,
+            link_threshold,
+            ..Default::default()
+        };
     }
 
     pub fn graph(&self) -> Option<&Arc<Graph>> {
@@ -630,12 +638,15 @@ mod tests {
         let new = s.begin_load();
         assert!(!s.apply_load(old, Ok(sample())), "older load");
         assert!(s.graph().is_none());
+        s.toggle_tags();
+        s.set_link_threshold(4);
         s.reset();
+        assert!(s.visible().tags && s.link_threshold() == 4, "the panel's choices survive a switch");
         assert!(!s.apply_load(new, Ok(sample())), "started before the catalog switch");
         assert!(s.graph().is_none());
         let g = s.begin_load();
         assert!(s.apply_load(g, Ok(sample())));
-        assert_eq!(s.status(), "0 nodes · 0 links · 2 communities");
+        assert_eq!(s.status(), "4 nodes · 0 links · 2 communities");
     }
 
     #[test]

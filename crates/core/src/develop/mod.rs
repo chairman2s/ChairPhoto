@@ -133,10 +133,40 @@ pub fn resident_bytes() -> usize {
 
 /// The resident set is process-global, so tests that assert on it must not interleave:
 /// each takes this lock for its whole body.
+///
+/// A catalog switch's phase one releases the whole set ([`release_all`] from
+/// `DetachGuards::trip_and_clear_all`), whichever `AppState` it runs on, so it takes this
+/// lock too — in `trip_and_clear_all` itself, under `cfg(test)`, so that no switch-running
+/// test anywhere in the crate has to remember it (#133). That is why the lock is
+/// re-entrant per thread: a develop test that holds it may run a switch on the same thread.
+/// A switch on *another* thread waits for the holder's test to end.
 #[cfg(test)]
-pub(crate) fn serial() -> std::sync::MutexGuard<'static, ()> {
+pub(crate) fn serial() -> Serial {
     static LOCK: Mutex<()> = Mutex::new(());
-    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    if SERIAL_HELD.with(|h| h.get()) {
+        return Serial(None);
+    }
+    let guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    SERIAL_HELD.with(|h| h.set(true));
+    Serial(Some(guard))
+}
+
+#[cfg(test)]
+thread_local! {
+    static SERIAL_HELD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// [`serial`]'s guard: the outermost one on a thread holds the lock.
+#[cfg(test)]
+pub(crate) struct Serial(#[allow(dead_code)] Option<std::sync::MutexGuard<'static, ()>>);
+
+#[cfg(test)]
+impl Drop for Serial {
+    fn drop(&mut self) {
+        if self.0.is_some() {
+            SERIAL_HELD.with(|h| h.set(false));
+        }
+    }
 }
 
 /// A small synthetic working image for ownership tests (`w`×`h`, all black).

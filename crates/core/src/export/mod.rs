@@ -1137,6 +1137,8 @@ mod engine2_export_tests {
             println!("SKIPPED: a_raw_engine_export_is_full_size_and_equals_the_view — set CHAIRPHOTO_RAW_FIXTURE");
             return;
         };
+        // Uses and clears develop's process-global offline slot (#133).
+        let _serial = crate::develop::serial();
         let path = std::path::Path::new(&fixture);
         let json = r#"{"engine":2,"display":"camera.2","cameraEv":-0.3,"tone":{"contrast":0.2}}"#;
         let _ = crate::plugins::edit::parity::take();

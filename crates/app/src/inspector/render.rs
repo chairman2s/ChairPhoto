@@ -1,5 +1,5 @@
 //! What [`PhotoInspector`] draws: the details, versions and publish tab bodies (the tags tab
-//! is the shell's: `tags::tags_tab` and the module panels). After `PhotoInspector.tsx`'s
+//! is the shell's: `crate::tags::photo_tags::PhotoTags` and the module panels). After `PhotoInspector.tsx`'s
 //! markup and App.css's `.ins-*`, `.field*`, `.stars`, `.pick-seg`, `.label-swatches`,
 //! `.versions*` and `.published*` rules.
 

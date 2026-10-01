@@ -491,16 +491,17 @@ fn mark_as_published_follows_the_active_version(cx: &mut TestAppContext) {
 
 // --- tags tab --------------------------------------------------------------------------
 
-/// The tags tab is the Tag panel's slot (#107) for the photo shown.
+/// The tags tab shows the Tag panel's tagging block (#107, `tags::photo_tags::PhotoTags`) for
+/// the photo shown.
 #[gpui_kit::test]
-fn the_tags_tab_is_the_tag_panels_slot(cx: &mut TestAppContext) {
+fn the_tags_tab_is_the_tag_panels_block(cx: &mut TestAppContext) {
     let dir = TempDir::new("insp-tags");
     let app = start(cx);
     let ids = open_catalog_with_photos(&app, &dir, 1, cx);
     tab(&app, InspectorTab::Tags, cx);
-    assert!(!present(&app, "inspector-tags-slot", cx), "no photo, no slot");
+    assert!(!present(&app, "photo-tags-chips", cx), "no photo, no tagging block");
     select(&app, ids[0], SelectMods::default(), cx);
-    assert!(present(&app, "inspector-tags-slot", cx));
+    assert!(present(&app, "photo-tags-chips", cx));
     assert!(!present(&app, "star-1", cx), "the details body is not drawn on the tags tab");
 }
 

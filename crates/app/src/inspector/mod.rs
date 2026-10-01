@@ -6,7 +6,7 @@
 //! | Tab | Body |
 //! |---|---|
 //! | details | EXIF line; stars, Pick/Reject/None, colour label; culling signals; the collapsible Stack, Orientation, Edit in, Storage, IPTC and Metadata sections |
-//! | tags | the Tag panel's slot ([`tags::tags_tab`], #107), then the enabled modules' inspector panels |
+//! | tags | the Tag panel's tagging block ([`crate::tags::photo_tags::PhotoTags`], #107), then the enabled modules' inspector panels |
 //! | versions | Original + named versions: choose the one the loupe shows, rename, duplicate, delete, add |
 //! | publish | where the photo was published (and which version), "Mark as published", "Publish…" |
 //!
@@ -44,7 +44,6 @@
 
 pub mod render;
 pub mod signals;
-pub mod tags;
 #[cfg(test)]
 mod tests;
 

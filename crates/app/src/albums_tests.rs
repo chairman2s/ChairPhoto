@@ -343,6 +343,40 @@ fn a_delete_confirm_left_open_across_a_switch_never_deletes_the_new_catalogs_alb
     }
 }
 
+/// A capture-date value must be a `YYYY-MM-DD` date (React's type=date): other text is
+/// refused at Save with a message and nothing is written; a one-digit month or day is
+/// padded, so the saved rule compares correctly against `capture_time`'s ISO text.
+#[gpui_kit::test]
+fn the_smart_album_editor_refuses_a_date_that_is_not_yyyy_mm_dd(cx: &mut TestAppContext) {
+    let dir = TempDir::new("smart-date");
+    let app = start(cx);
+    open_catalog_with_photos(&app, &dir, 1, cx);
+    click(&app, "smart-album-new", cx);
+    let ed = editor(&app, cx);
+    click(&app, "sa-add", cx);
+    cx.update_window(app.window(), |_, window, cx| {
+        ed.update(cx, |e, cx| {
+            e.set_field(0, "capture_time", window, cx);
+            e.set_op(0, Op::After, window, cx);
+        })
+    })
+    .unwrap();
+    set_input(&app, &ed.read_with(cx, |e, _| e.name.clone()), "Recent", cx);
+    let input = ed.read_with(cx, |e, _| e.rows[0].inputs[0].clone());
+    type_into(&app, &input, "5.1.2026", cx);
+    click(&app, "sa-save", cx);
+    assert_eq!(ed.read_with(cx, |e, _| e.error.clone()).as_deref(), Some(crate::albums::rule::DATE_FORMAT_ERROR));
+    assert!(has_dialog(&app, cx), "the editor stays open");
+    assert!(with_catalog(&app, |c| c.list_smart_albums().unwrap().is_empty()), "nothing written");
+
+    type_into(&app, &input, "2026-1-5", cx);
+    click(&app, "sa-save", cx);
+    assert!(!has_dialog(&app, cx), "a date saves");
+    let rule = with_catalog(&app, |c| c.list_smart_albums().unwrap()[0].rule_json.clone());
+    let rule: serde_json::Value = serde_json::from_str(&rule).unwrap();
+    assert_eq!(rule["conditions"][0]["value"], "2026-01-05", "padded to YYYY-MM-DD");
+}
+
 /// **Catalog identity.** The editor opened over catalog A (its tag and batch ids are A's);
 /// the core switches to B. Save fails closed and creates nothing in B; the event's arrival
 /// closes the editor.

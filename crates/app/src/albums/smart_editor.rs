@@ -9,7 +9,9 @@
 //! tags and batches it offers, the count and the write all run under that identity, and it
 //! closes on a switch.
 
-use super::rule::{build_rule_json, enum_values, field_def, parse_rule_json, Condition, Op, ValueKind, FIELDS, GROUPS};
+use super::rule::{
+    build_rule_json, enum_values, field_def, parse_rule_json, rule_error, Condition, Op, ValueKind, FIELDS, GROUPS,
+};
 use super::state::{bind_dialog, run_bound, AlbumsState};
 use crate::shell::style::Colors;
 use crate::storage::{ui, CloseDialog};
@@ -239,6 +241,11 @@ impl SmartAlbumEditor {
         let name = self.name.read(cx).value().trim().to_string();
         if name.is_empty() {
             self.error = Some("Give the smart album a name.".into());
+            cx.notify();
+            return;
+        }
+        if let Some(e) = rule_error(&self.conditions(cx)) {
+            self.error = Some(e.into());
             cx.notify();
             return;
         }

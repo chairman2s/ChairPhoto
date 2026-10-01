@@ -328,6 +328,9 @@ pub struct ShellState {
     /// Bumped by every `catalog:switched`: a mark or burst analysis queued before it names
     /// photos of the catalog that closed and must not be written.
     catalog_generation: u64,
+    /// The newest burst analysis's job id (`burst_analysis::next_burst_job`): only its
+    /// result reaches the status line and re-reads the rows ([`Self::finish_burst`]).
+    burst_job: u64,
     model: Entity<AppModel>,
     lists_generation: u64,
     scope_generation: u64,
@@ -376,6 +379,7 @@ impl ShellState {
             editing_tag: None,
             last_mark: None,
             catalog_generation: 0,
+            burst_job: 0,
             model: model.clone(),
             lists_generation: 0,
             scope_generation: 0,
@@ -739,7 +743,9 @@ impl ShellState {
     /// (App.tsx's `runBurstAnalysis`), off the UI thread; report on the status line and
     /// re-read the rows for the new badges. Bound to the catalog the rows came from
     /// (`analyze_burst_sharpness_as`): after a switch it fails closed rather than flag the
-    /// new catalog's photos that carry the same ids.
+    /// new catalog's photos that carry the same ids. A newer run makes this one unreachable:
+    /// the core does not persist a superseded run's flags (`BURST_SUPERSEDED`), and the shell
+    /// shows only the newest run's result ([`Self::finish_burst`]).
     pub fn analyse_burst(&mut self, cx: &mut Context<Self>) {
         let targets = self.whole_view_targets();
         let Some(from) = self.rows_from.filter(|_| !targets.is_empty()) else {
@@ -750,28 +756,50 @@ impl ShellState {
         self.model.update(cx, |m, cx| m.set_status(status, cx));
         let generation = self.catalog_generation;
         let state = self.app.clone();
+        // The id is allocated here, where the user started the run, so the newest start owns
+        // the burst generation whichever worker claims it first (`install_fresh_if_newer`).
+        let job = chairphoto_core::burst_analysis::next_burst_job(&state);
+        self.burst_job = job;
         let run = cx.background_executor().spawn(async move {
-            chairphoto_core::burst_analysis::analyze_burst_sharpness_as(&state, from, &targets)
+            chairphoto_core::burst_analysis::analyze_burst_sharpness_as(&state, from, &targets, job)
         });
         cx.spawn(async move |this, cx| {
             let result = run.await;
-            this.update(cx, |s, cx| {
-                if s.catalog_generation != generation {
-                    return;
-                }
-                let line = match result {
-                    Ok(r) => format!(
-                        "Burst analysis done — {} cluster(s), {} best frame(s), {} soft-in-burst.",
-                        r.clusters, r.flagged_best, r.flagged_soft
-                    ),
-                    Err(e) => format!("Burst analysis failed: {e}"),
-                };
-                s.model.update(cx, |m, cx| m.set_status(line, cx));
-                s.refresh_rows(cx);
-            })
-            .ok();
+            this.update(cx, |s, cx| s.finish_burst(job, generation, result, cx)).ok();
         })
         .detach();
+    }
+
+    /// A burst run's terminal result, shown only while `job` is still the newest run and
+    /// the catalog it started on is still the shell's: a superseded run's result — its
+    /// `BURST_SUPERSEDED` refusal, or a success that raced the newer start — is dropped
+    /// without touching the status line or the rows.
+    pub(crate) fn finish_burst(
+        &mut self,
+        job: u64,
+        generation: u64,
+        result: Result<chairphoto_core::burst_analysis::BurstAnalysisResult, String>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.catalog_generation != generation || self.burst_job != job {
+            return;
+        }
+        let line = match result {
+            Ok(r) => format!(
+                "Burst analysis done — {} cluster(s), {} best frame(s), {} soft-in-burst.",
+                r.clusters, r.flagged_best, r.flagged_soft
+            ),
+            Err(e) => format!("Burst analysis failed: {e}"),
+        };
+        self.model.update(cx, |m, cx| m.set_status(line, cx));
+        self.refresh_rows(cx);
+    }
+
+    /// The newest burst run's job id and the catalog generation, as [`Self::finish_burst`]
+    /// compares them — for tests that deliver a superseded run's late result.
+    #[cfg(test)]
+    pub(crate) fn burst_owner(&self) -> (u64, u64) {
+        (self.burst_job, self.catalog_generation)
     }
 
     /// What the whole-view tools (burst analysis, stack proposals) act on: the selection,

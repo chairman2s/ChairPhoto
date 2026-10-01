@@ -332,6 +332,53 @@ fn make_burst(c: &chairphoto_core::catalog::Catalog, ids: &[i64]) {
     }
 }
 
+/// Two burst analyses (gpui #106 gate): A over the whole view (a four-frame burst with a
+/// soft third frame), then B over that soft frame alone, which clears its flag. Whichever
+/// worker runs first, B's verdict stands and B's result is the status line; A's late result
+/// — delivered after B's — is dropped (the core's own half, an older run never writing after
+/// a newer one, is forced in `burst_analysis::ownership_tests`).
+#[gpui_kit::test]
+fn a_superseded_burst_analysis_is_neither_persisted_nor_shown(cx: &mut TestAppContext) {
+    let dir = TempDir::new("grid-burst-runs");
+    let app = start(cx);
+    let ids = open_catalog_with_photos(&app, &dir, 4, cx);
+    {
+        let guard = app.state.catalog.lock().unwrap();
+        let c = guard.as_ref().unwrap();
+        make_burst(c, &ids);
+        for (&id, sharpness) in ids.iter().zip([100.0, 100.0, 10.0, 90.0]) {
+            c.conn().execute("UPDATE photos SET sharpness = ?1 WHERE id = ?2", (sharpness, id)).unwrap();
+        }
+    }
+    let analyse = |cx: &mut TestAppContext| {
+        cx.update_window(app.window(), |_, window, cx| {
+            window.dispatch_action(Box::new(crate::shell::actions::AnalyseBurst), cx)
+        })
+        .unwrap();
+    };
+    analyse(cx); // A: nothing selected, so the whole view
+    let (job_a, generation) = app.wired.shell.read_with(cx, |s, _| s.burst_owner());
+    app.wired.shell.update(cx, |s, _| s.library.select(ids[2], Default::default()));
+    analyse(cx); // B: the soft frame alone
+    cx.run_until_parked();
+    let b_line = "Burst analysis done — 1 cluster(s), 0 best frame(s), 0 soft-in-burst.";
+    assert_eq!(status(&app, cx), b_line);
+    let soft_flag = app.state.catalog.lock().unwrap().as_ref().unwrap().get_photo(ids[2]).unwrap().burst_flag;
+    assert_eq!(soft_flag, None, "A's soft-in-burst flag overwrote B's verdict");
+
+    // A's result arriving after B's, as a slower run's would.
+    let late = chairphoto_core::burst_analysis::BurstAnalysisResult {
+        total: 4,
+        clusters: 1,
+        flagged_soft: 1,
+        flagged_best: 1,
+        cleared: 0,
+    };
+    app.wired.shell.update(cx, |s, cx| s.finish_burst(job_a, generation, Ok(late), cx));
+    cx.run_until_parked();
+    assert_eq!(status(&app, cx), b_line, "the superseded run's result was shown");
+}
+
 fn stack_dialog(app: &App, cx: &mut TestAppContext) -> Entity<crate::library::stacks::StackDialog> {
     let root = app.wired.root.clone().unwrap();
     root.read_with(cx, |root, _| root.stacks.as_ref().map(|(d, _)| d.clone())).expect("the Stack dialog is open")

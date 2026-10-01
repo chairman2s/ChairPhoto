@@ -264,6 +264,28 @@ fn a_superseded_raster_never_lands(cx: &mut TestAppContext) {
     assert_eq!(f.raster_view(cx), Some(f.view_state(cx)), "the newer view's raster");
 }
 
+/// A burst of raster requests (a slider sweep, a zoom while one runs): one raster runs at a
+/// time, the burst coalesces into one more made from the latest state, and that one lands.
+#[gpui_kit::test]
+fn raster_requests_coalesce_behind_the_one_in_flight(cx: &mut TestAppContext) {
+    let f = fixture(small(), cx);
+    f.click("tg-type-tags", cx);
+    let before = f.stats(cx);
+    f.view.update(cx, |v, cx| {
+        v.request_raster(false, cx);
+        for _ in 0..4 {
+            v.update_session(cx, |s| s.zoom_step(true));
+            v.request_raster(false, cx);
+        }
+    });
+    assert_eq!(f.stats(cx).rasters_started - before.rasters_started, 1, "one in flight; the rest wait");
+    cx.run_until_parked();
+    let after = f.stats(cx);
+    assert_eq!(after.rasters_started - before.rasters_started, 2, "the burst coalesced into one more raster");
+    assert_eq!(after.rasters_applied - before.rasters_applied, 1, "only the latest lands");
+    assert_eq!(f.raster_view(cx), Some(f.view_state(cx)), "made from the latest view");
+}
+
 /// A catalog switch while a reload is in flight: the old catalog's graph never lands, the
 /// raster is released, and the next render loads afresh.
 #[gpui_kit::test]

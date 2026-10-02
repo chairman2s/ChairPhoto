@@ -1,10 +1,11 @@
 //! The Faces module's pure parts (unit-tested): box geometry over the loupe's zoomable
-//! image, the person picker's rows, the root type-ahead, and the result lines.
+//! image, the person picker's rows, the root type-ahead, the result lines, and the People
+//! view's naming paths, avatar crops and review threshold.
 
 use crate::loupe::zoom::ZoomView;
 use crate::shell::style::Colors;
 use chairphoto_core::app::faces::{AcceptPersonOutcome, FaceBboxJson};
-use chairphoto_core::app::FacesIndexDone;
+use chairphoto_core::app::{FacesIndexDone, FacesMatchDone};
 use chairphoto_core::catalog::Tag;
 use gpui_kit::Hsla;
 
@@ -216,9 +217,140 @@ pub fn progress_line(done: usize, total: usize) -> (String, Option<usize>) {
     (line, pct)
 }
 
+/// The matching run's progress line: the phase, then `done / total (pct%)` once the phase has
+/// a size.
+pub fn match_progress_line(phase: &str, done: usize, total: usize) -> (String, Option<usize>) {
+    let pct = (total > 0).then(|| ((done as f64 / total as f64) * 100.).round() as usize);
+    let line = match pct {
+        Some(p) => format!("Matching ({phase}): {done} / {total} ({p}%)"),
+        None => format!("Matching ({phase})…"),
+    };
+    (line, pct)
+}
+
+/// The line a finished match leaves (`handleMatchDone` in faces.tsx): `Err` for a failure.
+pub fn match_done_message(d: &FacesMatchDone) -> Result<String, String> {
+    if let Some(e) = &d.error {
+        return Err(format!("Matching failed: {e}"));
+    }
+    if d.aborted {
+        return Ok("Matching cancelled — partial results were kept.".into());
+    }
+    let Some(o) = &d.outcome else {
+        return Err("Matching finished without reporting what it did.".into());
+    };
+    let suggested = o.constrained + o.open;
+    Ok(if o.seeded + suggested + o.clustered == 0 {
+        if o.people == 0 {
+            "Matching: no seeds found yet — check that the people root matches your person tags, and that indexing has \
+             run."
+                .into()
+        } else {
+            format!("Matching: nothing new to propose ({} known people).", o.people)
+        }
+    } else {
+        format!(
+            "Matching: {} seeded, {suggested} suggested, {} clustered ({} known people).",
+            o.seeded, o.clustered, o.people
+        )
+    })
+}
+
+/// The person tag a name typed in the People view becomes (`NameClusterModal`): under the
+/// people root, unless the text already is the root or a path below it.
+pub fn named_path(root: &str, typed: &str) -> String {
+    let (root, typed) = (root.trim(), typed.trim().trim_matches('/').trim());
+    if root.is_empty() || typed == root || typed.starts_with(&format!("{root}/")) {
+        typed.to_string()
+    } else {
+        format!("{root}/{typed}")
+    }
+}
+
+/// The name type-ahead (`NameClusterModal`): up to 8 people-root tag paths containing the
+/// text, case-insensitively; nothing for an empty text.
+pub fn name_suggestions(tags: &[Tag], typed: &str) -> Vec<String> {
+    let q = typed.trim().to_lowercase();
+    if q.is_empty() {
+        return Vec::new();
+    }
+    tags.iter().filter(|t| t.full_path.to_lowercase().contains(&q)).take(8).map(|t| t.full_path.clone()).collect()
+}
+
+/// Where a face avatar draws its photo's thumbnail inside a `size`×`size` square: scaled
+/// uniformly so the face's longer side fills the square, the face centred. `bbox` is the
+/// face in the thumbnail's frame (turned by the user rotation, [`rotate_box`]); `natural` is
+/// the thumbnail's pixel size. Returns `(left, top, width, height)` of the whole thumbnail.
+/// (React stretched the image non-uniformly to the box.)
+pub fn avatar_placement(bbox: (f32, f32, f32, f32), natural: (f32, f32), size: f32) -> (f32, f32, f32, f32) {
+    let (x, y, w, h) = bbox;
+    let (nw, nh) = (natural.0.max(1.), natural.1.max(1.));
+    let face = (w.max(0.01) * nw).max(h.max(0.01) * nh);
+    let s = size / face;
+    let (dw, dh) = (nw * s, nh * s);
+    let (cx, cy) = ((x + w / 2.) * dw, (y + h / 2.) * dh);
+    (size / 2. - cx, size / 2. - cy, dw, dh)
+}
+
+/// The suggestions at or above `threshold` (the queue's "Confirm all ≥ X%"), by index.
+pub fn at_or_above(confidences: impl IntoIterator<Item = f64>, threshold: f64) -> Vec<usize> {
+    // Compare in whole percent, as the slider shows them: 0.8 must include a 0.8 stored as
+    // 0.7999999.
+    let t = (threshold * 100.).round();
+    confidences.into_iter().enumerate().filter(|(_, c)| (c * 100.).round() >= t).map(|(i, _)| i).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_name_goes_under_the_people_root_unless_it_already_is() {
+        assert_eq!(named_path("People", "Jane"), "People/Jane");
+        assert_eq!(named_path("People", " People/Family/Jane "), "People/Family/Jane");
+        assert_eq!(named_path("People", "People"), "People");
+        assert_eq!(named_path("People", "Peoples/Jane"), "People/Peoples/Jane", "a prefix of the root is not under it");
+        assert_eq!(named_path("", "Jane"), "Jane");
+    }
+
+    #[test]
+    fn an_avatar_centres_the_face_and_keeps_the_aspect() {
+        // A 400×200 thumbnail, a face 40×40 px at (100,50): scale 72/40 = 1.8.
+        let (l, t, w, h) = avatar_placement((0.25, 0.25, 0.1, 0.2), (400., 200.), 72.);
+        assert!((w - 720.).abs() < 1e-3 && (h - 360.).abs() < 1e-3, "uniform scale: {w}×{h}");
+        // Face centre (120, 70) px × 1.8 = (216, 126) lands on the square's centre (36, 36).
+        assert!((l - (36. - 216.)).abs() < 1e-3 && (t - (36. - 126.)).abs() < 1e-3, "{l},{t}");
+    }
+
+    #[test]
+    fn confirm_all_counts_in_whole_percent() {
+        assert_eq!(at_or_above([0.95, 0.7999999, 0.79, 0.5], 0.8), vec![0, 1]);
+        assert_eq!(at_or_above([0.5], 0.0), vec![0]);
+    }
+
+    #[test]
+    fn match_results_read_like_react() {
+        use chairphoto_core::plugins::faces::MatchOutcome;
+        let done = |outcome: Option<MatchOutcome>, aborted: bool, error: Option<&str>| FacesMatchDone {
+            ok: error.is_none() && !aborted,
+            outcome,
+            aborted,
+            job: 1,
+            error: error.map(str::to_string),
+        };
+        let o = MatchOutcome { seeded: 1, constrained: 2, open: 3, clustered: 4, people: 5 };
+        assert_eq!(
+            match_done_message(&done(Some(o), false, None)).unwrap(),
+            "Matching: 1 seeded, 5 suggested, 4 clustered (5 known people)."
+        );
+        assert!(match_done_message(&done(Some(MatchOutcome::default()), false, None)).unwrap().contains("no seeds"));
+        let none = MatchOutcome { people: 2, ..Default::default() };
+        assert_eq!(match_done_message(&done(Some(none), false, None)).unwrap(), "Matching: nothing new to propose (2 known people).");
+        assert!(match_done_message(&done(None, true, None)).unwrap().contains("cancelled"));
+        assert_eq!(match_done_message(&done(None, false, Some("boom"))).unwrap_err(), "Matching failed: boom");
+        assert!(match_done_message(&done(None, false, None)).is_err());
+        assert_eq!(match_progress_line("clustering unknowns", 5, 10).0, "Matching (clustering unknowns): 5 / 10 (50%)");
+    }
 
     fn bb(x: f32, y: f32, w: f32, h: f32) -> FaceBboxJson {
         FaceBboxJson { x, y, w, h }

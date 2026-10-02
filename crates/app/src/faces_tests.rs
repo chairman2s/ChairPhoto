@@ -1,7 +1,9 @@
-//! Headless tests of the Faces module's first half (#129) through the real wiring: the
-//! settings panel, the indexing job's ownership (start, progress, done, Cancel, a catalog
-//! switch, re-attaching), the inspector's verbs and the person picker, and the loupe
-//! overlay's geometry (orientation, zoom, pan) with its keys and draw mode.
+//! Headless tests of the Faces module through the real wiring: the settings panel, the
+//! indexing and matching jobs' ownership (start, progress, done, Cancel, a catalog switch,
+//! re-attaching) (#129, #130), the inspector's verbs and the person picker, and the loupe
+//! overlay's geometry (orientation, zoom, pan) with its keys and draw mode, and the People view
+//! (#130): the wall and filter-by-person, naming, merging and splitting clusters, the review
+//! queue, catalog identity, and the avatars' image claims.
 //!
 //! No ONNX and no network: [`FakeFaces`] stands in for the model check, the download and the
 //! worker. Its start runs the **real** core claim (`app::faces::begin_index_job`), so ownership
@@ -15,15 +17,15 @@ use crate::machine_prefs::MachinePrefs;
 use crate::modules::faces::inspector::FacesInspector;
 use crate::modules::faces::overlay::{FaceOverlay, SHOW_BOXES_PREF};
 use crate::modules::faces::settings::FacesSettings;
-use crate::modules::faces::state::{FacesBackend, FacesBackendGlobal, FacesState, IndexPhase};
+use crate::modules::faces::state::{FacesBackend, FacesBackendGlobal, FacesState, IndexPhase, MatchPhase};
 use crate::modules::faces::FACES_MODULE_ID;
 use crate::modules::{ModuleRegistry, PanelSlot};
 use crate::shell::state::InspectorTab;
 use crate::storage::Runner;
 use chairphoto_core::app::faces::{self as core_faces, FaceBboxJson};
 use chairphoto_core::app::{
-    CatalogIdentity, FacesIndexDone, FacesJobStatus, FacesMatchDone, FacesMatchProgressEvent, FacesProgressEvent,
-    JobClaim, CATALOG_CHANGED,
+    CatalogIdentity, FacesIndexDone, FacesJobStatus, FacesMatchDone, FacesMatchJobStatus, FacesMatchProgressEvent,
+    FacesProgressEvent, JobClaim, CATALOG_CHANGED,
 };
 use chairphoto_core::image_pool::{ImageKind, JobKey};
 use chairphoto_core::plugins::faces::models::{ModelReport, ModelStatus};
@@ -40,6 +42,8 @@ struct FakeFaces {
     downloads: Mutex<usize>,
     claims: Mutex<Vec<JobClaim<FacesJobStatus>>>,
     starts: Mutex<Vec<Result<u64, String>>>,
+    match_claims: Mutex<Vec<JobClaim<FacesMatchJobStatus>>>,
+    match_starts: Mutex<Vec<Result<u64, String>>>,
 }
 
 impl FacesBackend for FakeFaces {
@@ -70,6 +74,17 @@ impl FacesBackend for FakeFaces {
         self.starts.lock().unwrap().push(result.clone());
         result
     }
+
+    /// The real core claim (`begin_match_job`); the test plays the worker.
+    fn start_match(&self, app: &AppState, from: CatalogIdentity) -> Result<u64, String> {
+        let result = core_faces::begin_match_job(app, Some(from)).map(|claim| {
+            let job = claim.job;
+            self.match_claims.lock().unwrap().push(claim);
+            job
+        });
+        self.match_starts.lock().unwrap().push(result.clone());
+        result
+    }
 }
 
 impl FakeFaces {
@@ -93,6 +108,17 @@ fn send_done(app: &App, job: u64, done: usize, total: usize, cx: &mut TestAppCon
         job,
         error: None,
     }));
+    cx.run_until_parked();
+}
+
+fn send_match_progress(app: &App, job: u64, done: usize, total: usize, cx: &mut TestAppContext) {
+    app.state.send(CoreEvent::FacesMatchProgress(FacesMatchProgressEvent { done, total, phase: "clustering unknowns", job }));
+    cx.run_until_parked();
+}
+
+fn send_match_done(app: &App, job: u64, cx: &mut TestAppContext) {
+    let outcome = chairphoto_core::plugins::faces::MatchOutcome { seeded: 1, constrained: 1, open: 1, clustered: 2, people: 3 };
+    app.state.send(CoreEvent::FacesMatchDone(FacesMatchDone { ok: true, outcome: Some(outcome), aborted: false, job, error: None }));
     cx.run_until_parked();
 }
 
@@ -295,6 +321,23 @@ fn settings_save_into_the_catalog_they_were_read_from(cx: &mut TestAppContext) {
     cx.run_until_parked();
     f.click("prefs-tab-module-faces", cx);
     assert!(f.present("faces-settings", cx), "the module's tab shows its settings panel");
+    // "Run matching" is on the panel (below the fold: started through the state); its run
+    // shows its step until its end.
+    assert!(f.present("faces-match", cx));
+    let state = f.state(cx);
+    state.update(cx, |s, cx| s.run_matching(cx));
+    work(&f.app, cx);
+    let job = f.fake.match_starts.lock().unwrap()[0].clone().unwrap();
+    send_match_progress(&f.app, job, 3, 6, cx);
+    assert_eq!(f.label("faces-match-progress", cx).as_deref(), Some("Matching (clustering unknowns): 3 / 6 (50%)"));
+    assert!(f.present("faces-match-cancel", cx));
+    f.fake.match_claims.lock().unwrap()[0].slot.clear();
+    send_match_done(&f.app, job, cx);
+    work(&f.app, cx);
+    assert_eq!(
+        f.label("faces-match-result", cx).as_deref(),
+        Some("Matching: 1 seeded, 2 suggested, 2 clustered (3 known people).")
+    );
     assert_eq!(f.label("faces-models", cx).as_deref(), Some("YuNet + AuraFace ready"));
     assert_eq!(root.read_with(cx, |i, _| i.value().to_string()), "Family");
     assert_eq!(threshold.read_with(cx, |i, _| i.value().to_string()), "0.45", "the default when unset");
@@ -479,12 +522,139 @@ fn reattach_never_adopts_a_finished_run_and_waits_for_a_match(cx: &mut TestAppCo
     assert_eq!(f.phase(cx), IndexPhase::Idle, "a finished run is not re-adopted");
     stale.slot.clear();
 
-    f.app.state.send(CoreEvent::FacesMatchProgress(FacesMatchProgressEvent { done: 1, total: 5, phase: "seed", job: 1 }));
-    cx.run_until_parked();
-    state.read_with(cx, |s, _| assert!(s.index.match_busy && !s.can_index()));
-    f.app.state.send(CoreEvent::FacesMatchDone(FacesMatchDone { ok: true, outcome: None, aborted: false, job: 1, error: None }));
+    // A match started elsewhere: its progress makes the panel read its slot and adopt it.
+    let elsewhere = core_faces::begin_match_job(&f.app.state, None).unwrap();
+    send_match_progress(&f.app, elsewhere.job, 1, 5, cx);
     work(&f.app, cx);
-    state.read_with(cx, |s, _| assert!(!s.index.match_busy && s.can_index()));
+    state.read_with(cx, |s, _| assert!(s.matching.busy() && !s.can_index() && !s.can_match()));
+    elsewhere.slot.clear();
+    send_match_done(&f.app, elsewhere.job, cx);
+    work(&f.app, cx);
+    state.read_with(cx, |s, _| assert!(!s.matching.busy() && s.can_index()));
+}
+
+// --- the matching job (#130) ----------------------------------------------------------------
+
+fn match_phase(f: &Faces, cx: &mut TestAppContext) -> MatchPhase {
+    let state = f.state(cx);
+    state.read_with(cx, |s, _| s.matching.phase)
+}
+
+/// "Run matching" follows its own run by id: a superseded run's progress and end change
+/// nothing, its own progress shows the step, its `faces:match_done` ends it with the result
+/// line — and an end that beats the start's answer is replayed. While it runs, neither job
+/// can start.
+#[gpui_kit::test]
+fn the_match_follows_only_its_own_events(cx: &mut TestAppContext) {
+    let f = open_faces(1, true, "faces-match", cx);
+    let state = f.state(cx);
+    state.update(cx, |s, cx| s.run_matching(cx));
+    assert_eq!(match_phase(&f, cx), MatchPhase::Starting);
+    work(&f.app, cx);
+    let job = f.fake.match_starts.lock().unwrap()[0].clone().unwrap();
+    assert_eq!(match_phase(&f, cx), MatchPhase::Running { job, done: 0, total: 0, step: "", progress: false });
+    state.read_with(cx, |s, _| assert!(!s.can_index() && !s.can_match(), "one job at a time"));
+    state.update(cx, |s, cx| s.index_faces(cx));
+    work(&f.app, cx);
+    assert!(f.fake.starts.lock().unwrap().is_empty(), "no index starts while matching");
+
+    send_match_progress(&f.app, job + 100, 5, 9, cx);
+    send_match_done(&f.app, job + 100, cx);
+    work(&f.app, cx);
+    assert_eq!(match_phase(&f, cx), MatchPhase::Running { job, done: 0, total: 0, step: "", progress: false });
+    send_match_progress(&f.app, job, 2, 4, cx);
+    assert_eq!(match_phase(&f, cx), MatchPhase::Running { job, done: 2, total: 4, step: "clustering unknowns", progress: true });
+
+    f.fake.match_claims.lock().unwrap()[0].slot.clear();
+    send_match_done(&f.app, job, cx);
+    work(&f.app, cx);
+    let line = "Matching: 1 seeded, 2 suggested, 2 clustered (3 known people).";
+    state.read_with(cx, |s, _| {
+        assert_eq!(s.matching.phase, MatchPhase::Idle);
+        assert_eq!(s.matching.last_result.as_deref(), Some(line));
+        assert!(s.can_index() && s.can_match());
+    });
+    assert_eq!(status(&f.app, cx), line);
+
+    // A tiny run: its end arrives before the start's answer, and is replayed.
+    let next = f.app.state.jobs.faces_match.abort().job_ids_issued() + 1;
+    state.update(cx, |s, cx| s.run_matching(cx));
+    send_match_done(&f.app, next, cx);
+    assert_eq!(match_phase(&f, cx), MatchPhase::Starting);
+    work(&f.app, cx);
+    assert_eq!(f.fake.match_starts.lock().unwrap()[1], Ok(next));
+    // Its slot still reads as running (the claim landed after the end was sent): a finished
+    // run is never re-adopted from it.
+    assert_eq!(match_phase(&f, cx), MatchPhase::Idle, "the early end ended the run");
+    f.fake.match_claims.lock().unwrap()[1].slot.clear();
+}
+
+/// Cancel names its run: once another start superseded ours, our Cancel stops nothing; our
+/// own run's flag is tripped and the panel says so until the end arrives.
+#[gpui_kit::test]
+fn match_cancel_stops_only_the_followed_run(cx: &mut TestAppContext) {
+    let f = open_faces(1, true, "faces-match-cancel", cx);
+    let state = f.state(cx);
+    state.update(cx, |s, cx| s.run_matching(cx));
+    work(&f.app, cx);
+    let ours = f.fake.match_claims.lock().unwrap()[0].abort.clone();
+    let newer = core_faces::begin_match_job(&f.app.state, None).unwrap();
+    state.update(cx, |s, cx| s.cancel_match(cx));
+    work(&f.app, cx);
+    assert!(!newer.abort.load(std::sync::atomic::Ordering::Relaxed), "our Cancel must not stop the newer run");
+    newer.slot.clear();
+    send_match_done(&f.app, state.read_with(cx, |s, _| s.matching.job().unwrap()), cx);
+    send_match_done(&f.app, newer.job, cx);
+    work(&f.app, cx);
+
+    state.update(cx, |s, cx| s.run_matching(cx));
+    work(&f.app, cx);
+    let claim_abort = f.fake.match_claims.lock().unwrap()[1].abort.clone();
+    state.update(cx, |s, cx| s.cancel_match(cx));
+    work(&f.app, cx);
+    assert!(claim_abort.load(std::sync::atomic::Ordering::Relaxed));
+    assert!(ours.load(std::sync::atomic::Ordering::Relaxed), "the first was superseded");
+    state.read_with(cx, |s, _| assert_eq!(s.matching.last_result.as_deref(), Some("Cancelling — stops at the next face…")));
+}
+
+/// A catalog switch: before `catalog:switched` reaches the UI a start bound to the old
+/// catalog is refused (the new catalog's run is not tripped); after it, the old run's end
+/// changes nothing and the new catalog's running match is adopted from its slot — and a
+/// straggler of the old run does not resurrect it.
+#[gpui_kit::test]
+fn a_switch_drops_the_old_match_and_adopts_the_new_catalogs(cx: &mut TestAppContext) {
+    let f = open_faces(1, true, "faces-match-switch", cx);
+    let state = f.state(cx);
+    state.update(cx, |s, cx| s.run_matching(cx));
+    work(&f.app, cx);
+    let old = state.read_with(cx, |s, _| s.matching.job().unwrap());
+    send_match_done(&f.app, old, cx); // ours ends
+    work(&f.app, cx);
+
+    let (b, _) = colliding_catalog(&f._dir, "b", 1);
+    core_switch(&f.app, b);
+    let theirs = core_faces::begin_match_job(&f.app.state, None).unwrap();
+    state.update(cx, |s, cx| s.run_matching(cx));
+    work(&f.app, cx);
+    assert_eq!(f.fake.match_starts.lock().unwrap().last().cloned(), Some(Err(CATALOG_CHANGED.to_string())));
+    assert!(!theirs.abort.load(std::sync::atomic::Ordering::Relaxed), "the refused start tripped nothing");
+    state.read_with(cx, |s, _| assert!(s.matching.error.as_deref().unwrap().contains(CATALOG_CHANGED)));
+
+    deliver_switch(&f.app, cx);
+    work(&f.app, cx);
+    assert!(matches!(match_phase(&f, cx), MatchPhase::Running { job, .. } if job == theirs.job), "the new catalog's run");
+    send_match_progress(&f.app, old, 9, 9, cx);
+    send_match_done(&f.app, old, cx);
+    work(&f.app, cx);
+    assert!(matches!(match_phase(&f, cx), MatchPhase::Running { job, .. } if job == theirs.job), "old events are ignored");
+
+    // Its end; afterwards an old straggler finds no slot and adopts nothing.
+    theirs.slot.clear();
+    send_match_done(&f.app, theirs.job, cx);
+    work(&f.app, cx);
+    send_match_progress(&f.app, theirs.job + 50, 1, 2, cx);
+    work(&f.app, cx);
+    assert_eq!(match_phase(&f, cx), MatchPhase::Idle);
 }
 
 // --- the inspector --------------------------------------------------------------------------
@@ -983,4 +1153,312 @@ fn overlay_boxes_turn_with_the_user_rotation(cx: &mut TestAppContext) {
         state.update(cx, |s, cx| s.follow_photo(true, cx));
         work(&f.app, cx);
     }
+}
+
+// --- the People view (#130) -----------------------------------------------------------------
+
+use crate::modules::faces::people::{People, Tab, PEOPLE_VIEW_ID, WAIT_FOR_MATCHING};
+use crate::modules::faces::people_view::PeopleView;
+use crate::shell::state::Surface;
+
+/// Put `face` in cluster `cluster` (the clustering step's output).
+fn cluster(app: &App, face: i64, cluster: i64) {
+    with_cat(app, |c| {
+        c.conn()
+            .execute("INSERT OR IGNORE INTO faces__clusters (id, centroid, size, created_at) VALUES (?1, x'00', 0, 0)", [cluster])
+            .unwrap();
+        c.conn().execute("UPDATE faces__faces SET cluster_id = ?2 WHERE id = ?1", [face, cluster]).unwrap();
+    });
+}
+
+fn confirm_as(app: &App, face: i64, tag: i64) {
+    with_cat(app, |c| {
+        c.conn().execute("UPDATE faces__faces SET state = 'confirmed', person_tag_id = ?2 WHERE id = ?1", [face, tag]).unwrap()
+    });
+}
+
+fn suggest_at(app: &App, face: i64, tag: i64, confidence: f64) {
+    with_cat(app, |c| {
+        c.conn()
+            .execute(
+                &format!("UPDATE faces__faces SET person_tag_id = ?2, state = 'suggested', match_confidence = {confidence} WHERE id = ?1"),
+                [face, tag],
+            )
+            .unwrap()
+    });
+}
+
+impl Faces {
+    /// Put the People view on the stage; its view and state.
+    fn people(&self, cx: &mut TestAppContext) -> (Entity<PeopleView>, Entity<People>) {
+        self.app.wired.shell.update(cx, |s, cx| s.show_module_view(PEOPLE_VIEW_ID, cx));
+        work(&self.app, cx);
+        let modules = self.app.wired.modules.clone();
+        let view = cx
+            .update_window(self.window(), |_, window, cx| {
+                ModuleRegistry::main_view(&modules, PEOPLE_VIEW_ID, window, cx)
+                    .expect("the People view")
+                    .view
+                    .downcast::<PeopleView>()
+                    .expect("a PeopleView")
+            })
+            .unwrap();
+        work(&self.app, cx);
+        let people = view.read_with(cx, |v, _| v.people.clone());
+        (view, people)
+    }
+
+    fn type_name(&self, view: &Entity<PeopleView>, text: &str, cx: &mut TestAppContext) {
+        let input = view.read_with(cx, |v, _| v.name_input.clone());
+        cx.update_window(self.window(), |_, window, cx| input.update(cx, |i, cx| i.set_value(text.to_string(), window, cx)))
+            .unwrap();
+        work(&self.app, cx);
+    }
+}
+
+fn tag_of(app: &App, path: &str) -> Option<i64> {
+    with_cat(app, |c| c.find_tag_id_by_path(path).unwrap())
+}
+
+/// The wall lists each named person with their counts; a card filters the Library by that
+/// person and puts the Library on the stage. Bound to its catalog: after a switch the UI has
+/// not heard of, the click is refused and the scope stays.
+#[gpui_kit::test]
+fn the_wall_filters_the_library_by_person(cx: &mut TestAppContext) {
+    let f = open_faces(3, true, "people-wall", cx);
+    let alice = with_cat(&f.app, |c| c.create_tag("People/Alice").unwrap());
+    for &p in &f.ids[..2] {
+        let face = add_face(&f.app, p, "[0.1,0.1,0.2,0.2]");
+        confirm_as(&f.app, face, alice);
+    }
+    let (_view, people) = f.people(cx);
+    assert_eq!(f.label(&format!("faces-person-{alice}"), cx).as_deref(), Some("Filter Library to People/Alice"));
+    people.read_with(cx, |p, _| {
+        let d = p.data.as_ref().unwrap();
+        assert_eq!((d.people.len(), d.people[0].photo_count, d.people[0].face_count), (1, 2, 2));
+    });
+
+    f.click(&format!("faces-person-{alice}"), cx);
+    f.app.wired.shell.read_with(cx, |s, _| {
+        assert_eq!(s.library.scope().tag_id, Some(alice));
+        assert_eq!(s.surface, Surface::Library);
+    });
+
+    // Back on the People view; another catalog is opened under it (no event yet).
+    f.app.wired.shell.update(cx, |s, cx| s.update_scope(cx, |l| l.clear_scope()));
+    let _ = f.people(cx);
+    let (other, _) = colliding_catalog(&f._dir, "other", 3);
+    core_switch(&f.app, other);
+    f.click(&format!("faces-person-{alice}"), cx);
+    assert!(status(&f.app, cx).contains(CATALOG_CHANGED), "{}", status(&f.app, cx));
+    f.app.wired.shell.read_with(cx, |s, _| assert_eq!(s.library.scope().tag_id, None, "the scope is untouched"));
+}
+
+/// Name a cluster from its card (Enter saves), merge two picked clusters into the same person
+/// through the type-ahead, and split a cluster from its face sheet — naming one face apart
+/// and ignoring another. Esc closes the dialog without naming.
+#[gpui_kit::test]
+fn clusters_are_named_merged_and_split(cx: &mut TestAppContext) {
+    let f = open_faces(4, true, "people-clusters", cx);
+    let face = |p: usize, x: f32| add_face(&f.app, f.ids[p], &format!("[{x},0.1,0.1,0.1]"));
+    let (a1, a2) = (face(0, 0.1), face(1, 0.1));
+    let b1 = face(2, 0.1);
+    let (c1, c2) = (face(3, 0.1), face(3, 0.4));
+    let (d1, d2, d3) = (face(0, 0.5), face(1, 0.5), face(2, 0.5));
+    for (fc, cl) in [(a1, 10), (a2, 10), (b1, 11), (c1, 12), (c2, 12), (d1, 13), (d2, 13), (d3, 13)] {
+        cluster(&f.app, fc, cl);
+    }
+    let (view, people) = f.people(cx);
+    f.click("faces-tab-clusters", cx);
+    assert!(f.present("faces-cluster-10", cx));
+
+    // Esc cancels.
+    f.click("faces-cluster-10", cx);
+    assert!(f.present("faces-name-dialog", cx));
+    f.press("escape", cx);
+    assert!(!f.present("faces-name-dialog", cx), "Esc closes the dialog");
+    assert_eq!(face_row(&f.app, a1).0, "unassigned");
+
+    // Name: the card, a name, Enter.
+    f.click("faces-cluster-10", cx);
+    f.type_name(&view, "Ann", cx);
+    f.press("enter", cx);
+    let ann = tag_of(&f.app, "People/Ann").expect("created under the people root");
+    assert_eq!(face_row(&f.app, a1), ("confirmed".into(), Some(ann)));
+    assert_eq!(face_row(&f.app, a2), ("confirmed".into(), Some(ann)));
+    assert!(with_cat(&f.app, |c| c.get_photo_tags(f.ids[1]).unwrap().iter().any(|t| t.id == ann)), "the photo is tagged");
+    assert!(status(&f.app, cx).starts_with("Named 2 faces on 2 photos as People/Ann."), "{}", status(&f.app, cx));
+    assert!(!f.present("faces-cluster-10", cx), "the named cluster is gone after the re-read");
+
+    // Merge: pick 11 and 12, "Name 2 together…", the type-ahead's existing person.
+    f.click("faces-cluster-pick-11", cx);
+    f.click("faces-cluster-pick-12", cx);
+    people.read_with(cx, |p, _| assert_eq!(p.picked_clusters, vec![11, 12]));
+    f.click("faces-name-together", cx);
+    f.type_name(&view, "ann", cx);
+    assert_eq!(f.label("faces-name-suggestion-0", cx).as_deref(), Some("People/Ann"));
+    f.click("faces-name-suggestion-0", cx);
+    f.click("faces-name-confirm", cx);
+    for fc in [b1, c1, c2] {
+        assert_eq!(face_row(&f.app, fc), ("confirmed".into(), Some(ann)), "merged into Ann");
+    }
+    people.read_with(cx, |p, _| {
+        assert!(p.picked_clusters.is_empty() && p.naming.is_none());
+        assert_eq!(p.data.as_ref().unwrap().clusters.iter().map(|c| c.cluster_id).collect::<Vec<_>>(), vec![13]);
+    });
+
+    // Split: the sheet of 13; pick d1, name it Bob; pick d2, ignore it; d3 stays.
+    f.click("faces-cluster-faces-13", cx);
+    assert!(f.present(&format!("faces-face-{d3}"), cx));
+    f.click(&format!("faces-face-{d1}"), cx);
+    f.click("faces-sheet-name", cx);
+    f.type_name(&view, "Bob", cx);
+    f.click("faces-name-confirm", cx);
+    let bob = tag_of(&f.app, "People/Bob").unwrap();
+    assert_eq!(face_row(&f.app, d1), ("confirmed".into(), Some(bob)));
+    assert_eq!(face_row(&f.app, d2).0, "unassigned", "a face not picked is not named");
+    assert!(!f.present(&format!("faces-face-{d1}"), cx), "the sheet re-read without the named face");
+    f.click(&format!("faces-face-{d2}"), cx);
+    f.click("faces-sheet-ignore", cx);
+    assert_eq!(face_row(&f.app, d2).0, "ignored");
+    assert_eq!(face_row(&f.app, d3).0, "unassigned");
+    people.read_with(cx, |p, _| {
+        let sheet = p.sheet.as_ref().expect("the sheet stays open");
+        assert_eq!(sheet.faces.as_ref().unwrap().iter().map(|f| f.face_id).collect::<Vec<_>>(), vec![d3]);
+    });
+}
+
+/// The naming dialog is bound to the catalog it opened on: confirmed after another catalog
+/// was opened under it (no event yet), it is refused and the new catalog — with colliding
+/// ids — is untouched; the event then closes the dialog and drops the data.
+#[gpui_kit::test]
+fn naming_is_bound_to_the_catalog_it_was_opened_on(cx: &mut TestAppContext) {
+    let f = open_faces(1, true, "people-switch", cx);
+    let a = add_face(&f.app, f.ids[0], "[0.1,0.1,0.2,0.2]");
+    cluster(&f.app, a, 5);
+    let (view, people) = f.people(cx);
+    f.click("faces-tab-clusters", cx);
+    f.click("faces-cluster-5", cx);
+
+    let (other, ids) = colliding_catalog(&f._dir, "other", 1);
+    store::ensure_schema(other.conn()).unwrap();
+    let b = store::insert_face(other.conn(), ids[0], "[0.1,0.1,0.2,0.2]", "[]", 0.99, None, "detect", 0).unwrap();
+    assert_eq!(a, b, "colliding ids");
+    core_switch(&f.app, other);
+    with_cat(&f.app, |c| {
+        c.conn().execute("INSERT INTO faces__clusters (id, centroid, size, created_at) VALUES (5, x'00', 1, 0)", []).unwrap();
+        c.conn().execute("UPDATE faces__faces SET cluster_id = 5 WHERE id = ?1", [b]).unwrap();
+    });
+    f.type_name(&view, "Eve", cx);
+    f.click("faces-name-confirm", cx);
+    assert!(f.present("faces-name-error", cx));
+    people.read_with(cx, |p, _| assert!(p.naming.as_ref().unwrap().error.as_deref().unwrap().contains(CATALOG_CHANGED)));
+    assert_eq!(face_row(&f.app, b).0, "unassigned", "the open catalog's face is untouched");
+    assert_eq!(tag_of(&f.app, "People/Eve"), None);
+
+    deliver_switch(&f.app, cx);
+    work(&f.app, cx);
+    people.read_with(cx, |p, _| assert!(p.naming.is_none() && p.data.is_none() && p.sheet.is_none()));
+}
+
+/// The queue: "Confirm all ≥ 80%" confirms exactly the suggestions at or above it, ✕
+/// rejects one (remembered), and a ✓ on a suggestion re-matched since the read leaves it
+/// alone and says so.
+#[gpui_kit::test]
+fn the_review_queue_confirms_above_the_threshold_and_rejects(cx: &mut TestAppContext) {
+    let f = open_faces(4, true, "people-review", cx);
+    let alice = with_cat(&f.app, |c| c.create_tag("People/Alice").unwrap());
+    let bob = with_cat(&f.app, |c| c.create_tag("People/Bob").unwrap());
+    let s: Vec<i64> = f.ids.iter().map(|&p| add_face(&f.app, p, "[0.1,0.1,0.2,0.2]")).collect();
+    suggest_at(&f.app, s[0], alice, 0.95);
+    suggest_at(&f.app, s[1], bob, 0.8);
+    suggest_at(&f.app, s[2], alice, 0.5);
+    suggest_at(&f.app, s[3], bob, 0.4);
+    let (_view, people) = f.people(cx);
+    f.click("faces-tab-suggestions", cx);
+    assert_eq!(f.label("faces-threshold", cx).as_deref(), Some("80%"));
+    assert!(f.present(&format!("faces-sugg-{}", s[3]), cx));
+
+    f.click("faces-confirm-all", cx);
+    assert_eq!(face_row(&f.app, s[0]), ("confirmed".into(), Some(alice)));
+    assert_eq!(face_row(&f.app, s[1]), ("confirmed".into(), Some(bob)), "80% is at the threshold");
+    assert_eq!(face_row(&f.app, s[2]).0, "suggested");
+    assert_eq!(status(&f.app, cx), "Suggestions: 2 confirmed.");
+
+    f.click(&format!("faces-sugg-reject-{}", s[2]), cx);
+    assert_eq!(face_row(&f.app, s[2]), ("unassigned".into(), None));
+    let remembered: i64 = with_cat(&f.app, |c| {
+        c.conn().query_row("SELECT COUNT(*) FROM faces__rejections WHERE face_id = ?1", [s[2]], |r| r.get(0)).unwrap()
+    });
+    assert_eq!(remembered, 1);
+
+    // Re-matched to Alice behind the queue's back: ✓ on the row that shows Bob does nothing.
+    suggest_at(&f.app, s[3], alice, 0.6);
+    f.click(&format!("faces-sugg-confirm-{}", s[3]), cx);
+    assert_eq!(face_row(&f.app, s[3]), ("suggested".into(), Some(alice)));
+    assert!(status(&f.app, cx).contains("changed since the list was read"), "{}", status(&f.app, cx));
+    people.read_with(cx, |p, _| assert_eq!(p.data.as_ref().unwrap().suggestions[0].person_tag_id, alice, "re-read"));
+}
+
+/// While a matching run regroups the faces, the view's writes wait (the core's matcher does
+/// not re-check a face's state before writing a suggestion); its end re-reads the view.
+#[gpui_kit::test]
+fn writes_wait_for_a_running_match_and_its_end_rereads(cx: &mut TestAppContext) {
+    let f = open_faces(1, true, "people-matching", cx);
+    let a = add_face(&f.app, f.ids[0], "[0.1,0.1,0.2,0.2]");
+    cluster(&f.app, a, 7);
+    let (_view, people) = f.people(cx);
+    f.click("faces-tab-clusters", cx);
+    let run = core_faces::begin_match_job(&f.app.state, None).unwrap();
+    send_match_progress(&f.app, run.job, 1, 2, cx);
+    work(&f.app, cx);
+    people.update(cx, |p, cx| p.name_cluster(7, cx));
+    work(&f.app, cx);
+    people.read_with(cx, |p, _| assert!(p.naming.is_none()));
+    assert_eq!(status(&f.app, cx), WAIT_FOR_MATCHING);
+
+    // The run regroups: a new cluster appears with its end.
+    let b = add_face(&f.app, f.ids[0], "[0.5,0.1,0.2,0.2]");
+    cluster(&f.app, b, 8);
+    run.slot.clear();
+    send_match_done(&f.app, run.job, cx);
+    work(&f.app, cx);
+    assert!(f.present("faces-cluster-8", cx), "the end re-read the clusters");
+    people.update(cx, |p, cx| p.name_cluster(8, cx));
+    people.read_with(cx, |p, _| assert!(p.naming.is_some()));
+}
+
+/// The lists are virtualised and the avatars come from the image layer under the view's
+/// claim: a long cluster list holds only the visible rows' thumbnails (plus the overscan),
+/// scrolling moves the claim, and leaving the view releases it.
+#[gpui_kit::test]
+fn avatars_are_claimed_for_the_visible_rows_and_released(cx: &mut TestAppContext) {
+    let f = open_faces(400, true, "people-avatars", cx);
+    for (i, &p) in f.ids.iter().enumerate() {
+        let face = add_face(&f.app, p, "[0.1,0.1,0.2,0.2]");
+        cluster(&f.app, face, 1000 + i as i64);
+    }
+    let (view, people) = f.people(cx);
+    people.update(cx, |p, cx| p.set_tab(Tab::Clusters, cx));
+    work(&f.app, cx);
+    let held = view.read_with(cx, |v, cx| v.held(cx));
+    assert!(!held.is_empty() && held.len() < 200, "only the rows on screen and the overscan: {}", held.len());
+    // The first card's photo is held and asked of the pool.
+    let first = people.read_with(cx, |p, _| p.data.as_ref().unwrap().clusters[0].avatar_photo_id);
+    assert!(held.contains(&first));
+    assert!(f.app.wired.images.read_with(cx, |s, _| s.is_pending(first, ImageKind::Thumb)));
+
+    cx.update_window(f.window(), |_, window, cx| {
+        window.render_frame(cx);
+        window.scroll("faces-people-scroll", ScrollDelta::Pixels(point(px(0.), px(-4000.))), cx)
+    })
+    .unwrap();
+    work(&f.app, cx);
+    let moved = view.read_with(cx, |v, cx| v.held(cx));
+    assert!(!moved.contains(&first), "scrolled away: released");
+    assert!(!f.app.wired.images.read_with(cx, |s, _| s.is_pending(first, ImageKind::Thumb)), "its queued render is cancelled");
+
+    f.app.wired.shell.update(cx, |s, cx| s.show_library(cx));
+    work(&f.app, cx);
+    assert!(view.read_with(cx, |v, cx| v.held(cx)).is_empty(), "off stage: nothing held");
 }

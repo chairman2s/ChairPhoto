@@ -878,7 +878,7 @@ mod preferences_tests;
 #[path = "map_tests.rs"]
 mod map_tests;
 
-// The Faces module, first half (#129).
+// The Faces module (#129, #130).
 #[cfg(feature = "faces")]
 #[path = "faces_tests.rs"]
 mod faces_tests;

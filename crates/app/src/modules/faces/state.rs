@@ -22,10 +22,14 @@
 //! once the id is known. A run already going when the module loads, or after a switch, is
 //! re-attached from the core's status slot; a run whose `faces:index_done` was already seen is
 //! never adopted. Cancel names its job (`cancel_index_job`), so it can never stop a newer one.
-//! A **matching** run (#130) is not followed here; while one is running "Index faces" stays
-//! disabled, as in React, until its `faces:match_done`.
+//!
+//! **The matching job** (#130, [`MatchRun`]) is followed the same way — by id, an early end
+//! replayed, Cancel scoped to its job (`cancel_match_job`), the start bound to the settings'
+//! catalog — and, unlike React (which only noted an untracked run), a run started elsewhere
+//! is adopted from its status slot or its first progress event, unless its end was already
+//! heard. While either job runs, neither can be started here (React's shared job phase).
 
-use super::logic::{batch_confirm_message, index_done_message};
+use super::logic::{batch_confirm_message, index_done_message, match_done_message};
 use crate::image_store::ImageStore;
 use crate::model::{AppModel, AppModelEvent};
 use crate::modules::ModuleSettings;
@@ -34,7 +38,7 @@ use crate::storage::Runner;
 use chairphoto_core::app::faces::{self as core_faces, FaceForPhoto, FacesInferenceInfo, PeopleTags};
 use chairphoto_core::app::{
     with_catalog_as, with_catalog_identified, AppState, CatalogIdentity, CoreEvent, FacesIndexDone, FacesJobStatus,
-    FacesMatchJobStatus,
+    FacesMatchDone, FacesMatchJobStatus,
 };
 use chairphoto_core::catalog::{Catalog, Tag};
 use chairphoto_core::image_pool::ImageKind;
@@ -56,6 +60,8 @@ pub trait FacesBackend: Send + Sync {
     fn download_models(&self) -> ModelStatus;
     /// Start an index bound to `from`; its id.
     fn start_index(&self, app: &AppState, from: CatalogIdentity) -> Result<u64, String>;
+    /// Start a matching run bound to `from`; its id.
+    fn start_match(&self, app: &AppState, from: CatalogIdentity) -> Result<u64, String>;
 }
 
 /// The real backend: the core's models and `app::faces::start_index`.
@@ -72,6 +78,10 @@ impl FacesBackend for CoreFaces {
 
     fn start_index(&self, app: &AppState, from: CatalogIdentity) -> Result<u64, String> {
         core_faces::start_index(app, Some(from))
+    }
+
+    fn start_match(&self, app: &AppState, from: CatalogIdentity) -> Result<u64, String> {
+        core_faces::start_match(app, Some(from))
     }
 }
 
@@ -113,8 +123,6 @@ pub struct IndexRun {
     /// How the last run ended (stays until the next start).
     pub last_result: Option<String>,
     pub error: Option<String>,
-    /// A face-matching run is going (started elsewhere; #130 follows it).
-    pub match_busy: bool,
     /// Events for a job whose id the start has not answered yet.
     early: Vec<CoreEvent>,
 }
@@ -127,6 +135,42 @@ impl IndexRun {
     pub fn job(&self) -> Option<u64> {
         match self.phase {
             IndexPhase::Running { job, .. } => Some(job),
+            _ => None,
+        }
+    }
+}
+
+/// Where the followed matching run stands.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub enum MatchPhase {
+    #[default]
+    Idle,
+    /// "Run matching" was clicked; the start's answer (the job id) is on its way.
+    Starting,
+    /// Following `job`, in pipeline step `step` (the core's label). `progress` once a progress
+    /// event (or the re-attach snapshot) gave numbers.
+    Running { job: u64, done: usize, total: usize, step: &'static str, progress: bool },
+}
+
+/// The matching section's state.
+#[derive(Clone, Default)]
+pub struct MatchRun {
+    pub phase: MatchPhase,
+    /// How the last run ended (stays until the next start).
+    pub last_result: Option<String>,
+    pub error: Option<String>,
+    /// Events for a job whose id the start has not answered yet.
+    early: Vec<CoreEvent>,
+}
+
+impl MatchRun {
+    pub fn busy(&self) -> bool {
+        self.phase != MatchPhase::Idle
+    }
+
+    pub fn job(&self) -> Option<u64> {
+        match self.phase {
+            MatchPhase::Running { job, .. } => Some(job),
             _ => None,
         }
     }
@@ -181,6 +225,9 @@ pub struct FacesState {
     pub index: IndexRun,
     /// Index jobs whose `faces:index_done` has been seen: never re-adopted.
     finished: HashSet<u64>,
+    pub matching: MatchRun,
+    /// Matching jobs whose `faces:match_done` has been seen: never re-adopted.
+    match_finished: HashSet<u64>,
     pub photo: PhotoView,
     /// What the photo read in flight (or done) is for: `(photo, rows' catalog, image version)`.
     photo_key: Option<(i64, CatalogIdentity, u64)>,
@@ -232,6 +279,8 @@ impl FacesState {
             saves: 0,
             index: IndexRun::default(),
             finished: HashSet::new(),
+            matching: MatchRun::default(),
+            match_finished: HashSet::new(),
             photo: PhotoView::None,
             photo_key: None,
             images,
@@ -259,7 +308,13 @@ impl FacesState {
 
     /// Whether "Index faces" may start now.
     pub fn can_index(&self) -> bool {
-        self.live && !self.index.busy() && !self.index.match_busy && self.models_ready() && self.settings_from.is_some()
+        self.live && !self.index.busy() && !self.matching.busy() && self.models_ready() && self.settings_from.is_some()
+    }
+
+    /// Whether "Run matching" may start now: as "Index faces" (React gated both on the models
+    /// and on no job running).
+    pub fn can_match(&self) -> bool {
+        self.can_index()
     }
 
     /// Run `work` off the UI thread and hand its result to `land`, unless the catalog was
@@ -316,6 +371,7 @@ impl FacesState {
         // still arrives under the old id and is ignored. The new catalog is re-attached on
         // its first read.
         self.index = IndexRun::default();
+        self.matching = MatchRun::default();
         self.photo = PhotoView::None;
         self.photo_key = None;
         self.batch_busy = None;
@@ -351,18 +407,36 @@ impl FacesState {
                     _ => {}
                 }
             }
-            CoreEvent::FacesMatchProgress(_) => {
-                if !self.index.match_busy {
-                    self.index.match_busy = true;
-                    cx.notify();
+            CoreEvent::FacesMatchProgress(p) => {
+                match &mut self.matching.phase {
+                    MatchPhase::Running { job, done, total, step, progress } if *job == p.job => {
+                        (*done, *total, *step, *progress) = (p.done, p.total, p.phase, true);
+                    }
+                    MatchPhase::Starting => self.matching.early.push(event.clone()),
+                    // Possibly a run started elsewhere (the Tauri shell, a second window) — or
+                    // a straggler of the old catalog's run after a switch. The event cannot
+                    // tell; the status slot can (a switch clears it): adopt from there.
+                    MatchPhase::Idle if !self.match_finished.contains(&p.job) => {
+                        self.reattach(cx);
+                        return;
+                    }
+                    _ => return, // another run's straggler
                 }
+                cx.notify();
             }
-            CoreEvent::FacesMatchDone(_) => {
-                // A match ended (or a superseded one did): read the slots again rather than
-                // assume nothing else is running.
-                self.index.match_busy = false;
+            CoreEvent::FacesMatchDone(d) => {
+                self.match_finished.insert(d.job);
+                match self.matching.phase {
+                    MatchPhase::Running { job, .. } if job == d.job => self.finish_match(d, cx),
+                    MatchPhase::Starting => {
+                        self.matching.early.push(event.clone());
+                        return;
+                    }
+                    _ => {}
+                }
+                // A match ended (ours or another): new suggestions may show in the inspector
+                // and the overlay, and another run may still be going.
                 self.reattach(cx);
-                // New suggestions may show in the inspector and the overlay.
                 self.follow_photo(true, cx);
                 cx.notify();
             }
@@ -562,27 +636,97 @@ impl FacesState {
         cx.notify();
     }
 
-    /// Adopt an index run that is going without us (started before the module loaded, or
-    /// before a panel reopened), and note a running match.
+    /// Adopt an index or a matching run that is going without us (started before the module
+    /// loaded, before a panel reopened, or elsewhere) — never one whose end was already heard.
     fn reattach(&mut self, cx: &mut Context<Self>) {
-        if self.index.busy() || !self.live {
+        if (self.index.busy() && self.matching.busy()) || !self.live {
             return;
         }
         type Slots = (Option<FacesJobStatus>, Option<FacesMatchJobStatus>);
         self.run(
             cx,
-            |app| -> Result<Slots, String> { Ok((core_faces::index_status(app)?, app.jobs.faces_match.status()?)) },
+            |app| -> Result<Slots, String> { Ok((core_faces::index_status(app)?, core_faces::match_status(app)?)) },
             |s, result, _| {
                 let Ok((index, matching)) = result else { return };
-                s.index.match_busy = matching.is_some();
-                if s.index.busy() {
-                    return; // a start of ours came in between
+                // A start of ours may have come in between: it is never replaced.
+                if !s.index.busy() {
+                    if let Some(st) = index.filter(|st| !s.finished.contains(&st.job)) {
+                        s.index.phase = IndexPhase::Running { job: st.job, done: st.done, total: st.total, progress: true };
+                    }
                 }
-                if let Some(st) = index.filter(|st| !s.finished.contains(&st.job)) {
-                    s.index.phase = IndexPhase::Running { job: st.job, done: st.done, total: st.total, progress: true };
+                if !s.matching.busy() {
+                    if let Some(st) = matching.filter(|st| !s.match_finished.contains(&st.job)) {
+                        s.matching.phase =
+                            MatchPhase::Running { job: st.job, done: st.done, total: st.total, step: st.phase, progress: true };
+                    }
                 }
             },
         );
+    }
+
+    // --- the matching job -----------------------------------------------------------------
+
+    /// "Run matching": seed, match and cluster the indexed faces, bound to the settings'
+    /// catalog. The run ends only on its `faces:match_done`.
+    pub fn run_matching(&mut self, cx: &mut Context<Self>) {
+        if !self.can_match() {
+            return;
+        }
+        let Some(from) = self.settings_from else { return };
+        self.matching.phase = MatchPhase::Starting;
+        self.matching.error = None;
+        self.matching.last_result = None;
+        self.matching.early.clear();
+        cx.notify();
+        let backend = FacesBackendGlobal::get(cx);
+        self.run(cx, move |app| backend.start_match(app, from), |s, result, cx| {
+            if s.matching.phase != MatchPhase::Starting {
+                return;
+            }
+            match result {
+                Ok(job) => {
+                    s.matching.phase = MatchPhase::Running { job, done: 0, total: 0, step: "", progress: false };
+                    // Replay what arrived before the id was known, in order.
+                    for event in std::mem::take(&mut s.matching.early) {
+                        s.core_event(&event, cx);
+                    }
+                }
+                Err(e) => {
+                    s.matching.phase = MatchPhase::Idle;
+                    s.matching.early.clear();
+                    s.matching.error = Some(format!("Matching failed: {e}"));
+                }
+            }
+        });
+    }
+
+    /// Cancel the followed match (only it: `cancel_match_job`). It stops at the next face and
+    /// still ends with its `faces:match_done`.
+    pub fn cancel_match(&mut self, cx: &mut Context<Self>) {
+        let Some(job) = self.matching.job() else { return };
+        self.matching.last_result = Some("Cancelling — stops at the next face…".into());
+        cx.notify();
+        self.run(cx, move |app| core_faces::cancel_match_job(app, job), |s, r, cx| {
+            if let Err(e) = r {
+                s.status(format!("Faces: could not cancel: {e}"), cx);
+            }
+        });
+    }
+
+    fn finish_match(&mut self, d: &FacesMatchDone, cx: &mut Context<Self>) {
+        self.matching.phase = MatchPhase::Idle;
+        self.matching.early.clear();
+        match match_done_message(d) {
+            Ok(line) => {
+                self.matching.last_result = Some(line.clone());
+                self.status(line, cx);
+            }
+            Err(e) => {
+                self.matching.last_result = None;
+                self.matching.error = Some(e);
+            }
+        }
+        self.changed(cx); // suggestions and clusters changed: every catalog view re-reads
     }
 
     // --- the shown photo ------------------------------------------------------------------

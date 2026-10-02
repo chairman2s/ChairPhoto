@@ -6,11 +6,12 @@
 //! error. The panel follows whatever run [`FacesState`] follows, so closing and reopening it
 //! — or a run started before the module loaded — shows the run, not idle.
 //!
-//! "Run matching" and its progress are the matching job's, ported in #130; until then a
-//! matching run started elsewhere only disables "Index faces" (as React's shared job phase did).
+//! "Run matching" (#130) has its own section — the button, Cancel, the step and progress, the
+//! last run's result and its error — and, like React's shared job phase, neither job can be
+//! started while the other runs.
 
-use super::logic::{progress_line, root_suggestions, step_highlight};
-use super::state::{FacesState, IndexPhase, DEFAULT_THRESHOLD};
+use super::logic::{match_progress_line, progress_line, root_suggestions, step_highlight};
+use super::state::{FacesState, IndexPhase, MatchPhase, DEFAULT_THRESHOLD};
 use crate::shell::style::Colors;
 use crate::storage::ui;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
@@ -260,7 +261,7 @@ impl FacesSettings {
                         }))
                     })
                     .when(!s.models_ready(), |d| d.child(ui::sub("Download models first", colors)))
-                    .when(run.match_busy && !run.busy(), |d| d.child(ui::sub("Face matching is running…", colors))),
+                    .when(s.matching.busy() && !run.busy(), |d| d.child(ui::sub("Face matching is running…", colors))),
             )
             .when_some(progress, |d, (line, pct)| {
                 d.child(div().id("faces-progress").text_color(colors.dim).child(line.clone()).aria_label(line).test_support())
@@ -280,6 +281,66 @@ impl FacesSettings {
                 d.child(div().id("faces-last-result").text_color(color).child(r.clone()).aria_label(r).test_support())
             })
             .when_some(run.error.clone(), |d, e| d.child(ui::error("faces-index-error", e, colors)))
+    }
+}
+
+impl FacesSettings {
+    fn render_match(&self, colors: Colors, cx: &mut Context<Self>) -> gpui_kit::Div {
+        let s = self.state.read(cx);
+        let can = s.can_match();
+        let run = s.matching.clone();
+        let label = if run.busy() { "Matching…" } else { "Run matching" };
+        let progress = match run.phase {
+            MatchPhase::Idle => None,
+            MatchPhase::Starting | MatchPhase::Running { progress: false, .. } => Some(("Starting…".to_string(), None)),
+            MatchPhase::Running { done, total, step, progress: true, .. } => Some(match_progress_line(step, done, total)),
+        };
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(6.))
+            .pt(px(12.))
+            .border_t_1()
+            .border_color(colors.border)
+            .child(div().font_weight(FontWeight::SEMIBOLD).text_color(colors.txt).child("Match"))
+            .child(ui::sub(
+                "\u{201c}Run matching\u{201d} seeds known people from your existing person tags, then suggests matches \
+                 and groups unknown faces into clusters. Nothing is confirmed without you, except a photo with one face \
+                 and one person tag.",
+                colors,
+            ))
+            .child(
+                ui::row()
+                    .child(ui::clickable(ui::primary("faces-match", label, can, colors), can, {
+                        let state = self.state.clone();
+                        move |_, _, cx| state.update(cx, |s, cx| s.run_matching(cx))
+                    }))
+                    .when(run.job().is_some(), |d| {
+                        let state = self.state.clone();
+                        d.child(ui::clickable(ui::chip("faces-match-cancel", "Cancel", true, colors), true, move |_, _, cx| {
+                            state.update(cx, |s, cx| s.cancel_match(cx))
+                        }))
+                    })
+                    .when(s.index.busy() && !run.busy(), |d| d.child(ui::sub("Face indexing is running…", colors))),
+            )
+            .when_some(progress, |d, (line, pct)| {
+                d.child(div().id("faces-match-progress").text_color(colors.dim).child(line.clone()).aria_label(line).test_support())
+                    .when_some(pct, |d, p| {
+                        d.child(
+                            div()
+                                .h(px(4.))
+                                .w_full()
+                                .rounded(px(2.))
+                                .bg(colors.txt.opacity(0.12))
+                                .child(div().h_full().rounded(px(2.)).bg(colors.accent).w(relative(p as f32 / 100.))),
+                        )
+                    })
+            })
+            .when_some(run.last_result.clone(), |d, r| {
+                let color = if run.busy() { colors.dim } else { colors.ok };
+                d.child(div().id("faces-match-result").text_color(color).child(r.clone()).aria_label(r).test_support())
+            })
+            .when_some(run.error.clone(), |d, e| d.child(ui::error("faces-match-error", e, colors)))
     }
 }
 
@@ -360,6 +421,7 @@ impl Render for FacesSettings {
                 cx.listener(|this, _, _, cx| this.save(cx)),
             )))
             .child(self.render_index(colors, cx))
+            .child(self.render_match(colors, cx))
             .test_support()
     }
 }

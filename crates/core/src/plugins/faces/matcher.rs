@@ -878,6 +878,137 @@ pub fn name_cluster(conn: &Connection, cluster_id: i64, tag_id: i64) -> rusqlite
     Ok(photos)
 }
 
+/// What [`name_faces`] / [`ignore_faces`] changed: how many faces, the distinct photos they
+/// are on (the caller assigns the person tag to these and re-exports their regions), and the
+/// clusters they left (for [`tidy_clusters`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FacesChanged {
+    pub faces: usize,
+    pub photos: Vec<i64>,
+    pub clusters: Vec<i64>,
+}
+
+/// The states a People-view verb may move a face out of: still pending a decision. A face the
+/// user (or a seed, or an import) already confirmed, or ignored, is never overwritten by a
+/// list read before that happened.
+const PENDING_STATES: &str = "('unassigned', 'suggested')";
+
+/// Confirm `face_ids` as the person `tag_id` (`source='manual'`) — the People view's naming
+/// of a cluster, of several clusters at once (a merge), or of some of a cluster's faces (a
+/// split). Only faces still pending a decision change; the rest are skipped and not counted.
+/// A naming is the user's explicit word, so it clears a remembered rejection of that pair,
+/// as [`assign`] does.
+pub fn name_faces(conn: &Connection, face_ids: &[i64], tag_id: i64) -> rusqlite::Result<FacesChanged> {
+    let mut read = conn.prepare(&format!(
+        "SELECT photo_id, cluster_id FROM faces__faces WHERE id = ?1 AND state IN {PENDING_STATES}"
+    ))?;
+    let mut confirm = conn.prepare(&format!(
+        "UPDATE faces__faces
+            SET person_tag_id = ?2, state = ?3, source = ?4, match_confidence = 1.0, cluster_id = NULL
+          WHERE id = ?1 AND state IN {PENDING_STATES}"
+    ))?;
+    let mut forget = conn.prepare("DELETE FROM faces__rejections WHERE face_id = ?1 AND person_tag_id = ?2")?;
+    let mut out = FacesChanged::default();
+    let mut seen = std::collections::HashSet::new();
+    for &face in face_ids {
+        if !seen.insert(face) {
+            continue;
+        }
+        let Some((photo, cluster)) =
+            read.query_row([face], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Option<i64>>(1)?))).optional()?
+        else {
+            continue;
+        };
+        confirm.execute(rusqlite::params![face, tag_id, STATE_CONFIRMED, SOURCE_MANUAL])?;
+        forget.execute(rusqlite::params![face, tag_id])?;
+        out.faces += 1;
+        if !out.photos.contains(&photo) {
+            out.photos.push(photo);
+        }
+        if let Some(c) = cluster.filter(|c| !out.clusters.contains(c)) {
+            out.clusters.push(c);
+        }
+    }
+    Ok(out)
+}
+
+/// Mark `face_ids` `ignored` (a stranger, a crowd) — only those still pending a decision.
+/// `photos` is left empty: a pending face is in no exported region, so no sidecar changes.
+pub fn ignore_faces(conn: &Connection, face_ids: &[i64]) -> rusqlite::Result<FacesChanged> {
+    let mut read =
+        conn.prepare(&format!("SELECT cluster_id FROM faces__faces WHERE id = ?1 AND state IN {PENDING_STATES}"))?;
+    let mut set = conn.prepare(&format!(
+        "UPDATE faces__faces
+            SET state = ?2, person_tag_id = NULL, match_confidence = NULL, cluster_id = NULL
+          WHERE id = ?1 AND state IN {PENDING_STATES}"
+    ))?;
+    let mut out = FacesChanged::default();
+    for &face in face_ids {
+        let Some(cluster) = read.query_row([face], |r| r.get::<_, Option<i64>>(0)).optional()? else { continue };
+        if set.execute(rusqlite::params![face, STATE_IGNORED])? == 0 {
+            continue;
+        }
+        out.faces += 1;
+        if let Some(c) = cluster.filter(|c| !out.clusters.contains(c)) {
+            out.clusters.push(c);
+        }
+    }
+    Ok(out)
+}
+
+/// Bring the bookkeeping of `clusters` up to date after faces left them: a cluster with no
+/// member left is dropped, the others get their member count. (Their centroids stay as they
+/// were until the next matching run rebuilds every cluster.)
+pub fn tidy_clusters(conn: &Connection, clusters: &[i64]) -> rusqlite::Result<()> {
+    for &c in clusters {
+        let left: i64 = conn.query_row("SELECT COUNT(*) FROM faces__faces WHERE cluster_id = ?1", [c], |r| r.get(0))?;
+        if left == 0 {
+            conn.execute("DELETE FROM faces__clusters WHERE id = ?1", [c])?;
+        } else {
+            conn.execute("UPDATE faces__clusters SET size = ?2 WHERE id = ?1", rusqlite::params![c, left])?;
+        }
+    }
+    Ok(())
+}
+
+/// Confirm a suggestion **as it was shown**: only while face `face_id` is still `suggested` as
+/// `tag_id`. A review list read before a re-run of matching (which may now suggest someone
+/// else) can therefore never confirm a person the user did not see. Returns the photo when it
+/// confirmed, `None` when the suggestion had changed.
+pub fn accept_suggestion(conn: &Connection, face_id: i64, tag_id: i64) -> rusqlite::Result<Option<i64>> {
+    let photo: Option<i64> = conn
+        .query_row(
+            "SELECT photo_id FROM faces__faces WHERE id = ?1 AND state = ?2 AND person_tag_id = ?3",
+            rusqlite::params![face_id, STATE_SUGGESTED, tag_id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if photo.is_some() {
+        conn.execute(
+            "UPDATE faces__faces SET state = ?2, match_confidence = 1.0, cluster_id = NULL WHERE id = ?1",
+            rusqlite::params![face_id, STATE_CONFIRMED],
+        )?;
+    }
+    Ok(photo)
+}
+
+/// Reject a suggestion as it was shown (see [`accept_suggestion`]): only while the face is
+/// still `suggested` as `tag_id`. Returns whether it rejected.
+pub fn reject_suggestion(conn: &Connection, face_id: i64, tag_id: i64, now: i64) -> rusqlite::Result<bool> {
+    let current = conn
+        .query_row(
+            "SELECT 1 FROM faces__faces WHERE id = ?1 AND state = ?2 AND person_tag_id = ?3",
+            rusqlite::params![face_id, STATE_SUGGESTED, tag_id],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if current {
+        reject(conn, face_id, now)?;
+    }
+    Ok(current)
+}
+
 /// Counters from [`accept_person_on_photos`], so a batch confirm can report what it actually
 /// did instead of implying every selected photo changed.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]

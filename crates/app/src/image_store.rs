@@ -90,12 +90,15 @@ pub struct Loaded {
     pub image: Arc<RenderImage>,
     /// A video with no poster frame, shown as the core's generic video tile.
     pub video_tile: bool,
+    /// A thumbnail of the photo's cover version, not of the original's frame
+    /// (`DecodedImage::cover`): boxes in the original's coordinates do not belong on it.
+    pub cover: bool,
 }
 
 impl Loaded {
     /// Convert on the worker thread that decoded it.
     pub fn from_decoded(decoded: DecodedImage) -> Self {
-        Self { image: to_bgra(decoded.image), video_tile: decoded.video_tile }
+        Self { image: to_bgra(decoded.image), video_tile: decoded.video_tile, cover: decoded.cover }
     }
 
     /// Decoded size in bytes (what the LRU budgets).
@@ -295,6 +298,16 @@ pub enum ImageState {
     Failed(SharedString),
     /// Not requested (or released).
     Absent,
+}
+
+impl ImageState {
+    /// `Ready` only when `keep` takes the image; otherwise `Absent`.
+    pub fn filter(self, keep: impl FnOnce(&Loaded) -> bool) -> Self {
+        match self {
+            ImageState::Ready(l) if !keep(&l) => ImageState::Absent,
+            other => other,
+        }
+    }
 }
 
 /// Counters for tests and the bench.

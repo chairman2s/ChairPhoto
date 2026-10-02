@@ -862,6 +862,40 @@ fn overlay_boxes_show_on_a_thumbnail_the_darkroom_rendered_again(cx: &mut TestAp
     assert!(f.present(&format!("faces-box-{a}"), cx), "the boxes show on the thumbnail");
 }
 
+/// A `w`×`h` render of the photo's cover version (`Loaded::cover`): may be cropped, so not
+/// the original's frame.
+fn cover_pixels(w: u32, h: u32) -> crate::image_store::Loaded {
+    crate::image_store::Loaded { cover: true, ..pixels(w, h) }
+}
+
+/// #152: while the loupe draws the thumbnail as the placeholder and that thumbnail is the
+/// cover version's render (possibly cropped), the boxes — in the original's frame — are not
+/// drawn on it; the note says why. When the preview (the original's frame) lands, they are.
+#[gpui_kit::test]
+fn overlay_boxes_hide_on_a_cover_thumbnail_placeholder(cx: &mut TestAppContext) {
+    use crate::loupe::zoom::Drawn;
+    let f = open_faces(2, true, "faces-cover-thumb", cx);
+    let photo = f.ids[0];
+    let a = add_face(&f.app, photo, "[0.25,0.5,0.25,0.25]");
+    let images = f.app.wired.images.clone();
+    images.update(cx, |s, _| s.request(photo, ImageKind::Thumb));
+    f.pool.finish(&JobKey::photo(photo, ImageKind::Thumb), Ok(cover_pixels(200, 200)));
+    work(&f.app, cx);
+
+    f.select(photo, cx);
+    f.press("enter", cx);
+    work(&f.app, cx);
+    assert_eq!(f.zoom(cx).read_with(cx, |z, _| z.drawn()), Some((photo, Drawn::Thumb)));
+    assert!(!f.present(&format!("faces-box-{a}"), cx), "no box on the cover's thumbnail");
+    assert!(f.present("faces-overlay-version", cx), "the note says the faces are on the original");
+
+    f.pool.finish(&JobKey::photo(photo, ImageKind::Preview), Ok(pixels(400, 200)));
+    work(&f.app, cx);
+    assert_eq!(f.zoom(cx).read_with(cx, |z, _| z.drawn()), Some((photo, Drawn::Preview)));
+    assert!(f.present(&format!("faces-box-{a}"), cx), "the preview is the original's frame: boxes");
+    assert!(!f.present("faces-overlay-version", cx));
+}
+
 /// F toggles the boxes and remembers it on this machine; Esc in draw mode leaves draw mode,
 /// not the loupe; a drag draws a box that becomes a face and opens the picker on it.
 #[gpui_kit::test]
@@ -1467,6 +1501,33 @@ fn writes_wait_for_a_running_match_and_its_end_rereads(cx: &mut TestAppContext) 
     assert!(f.present("faces-cluster-8", cx), "the end re-read the clusters");
     people.update(cx, |p, cx| p.name_cluster(8, cx));
     people.read_with(cx, |p, _| assert!(p.naming.is_some()));
+}
+
+/// #152: a card's avatar is a face cut from its photo's thumbnail by the face's box, in the
+/// original's frame. A cover version's thumbnail (possibly cropped) is not cut — the circle
+/// stays empty — and the plain thumbnail is.
+#[gpui_kit::test]
+fn an_avatar_is_not_cut_from_a_cover_thumbnail(cx: &mut TestAppContext) {
+    let f = open_faces(2, true, "people-cover-avatar", cx);
+    let alice = with_cat(&f.app, |c| c.create_tag("People/Alice").unwrap());
+    let photo = f.ids[0];
+    let face = add_face(&f.app, photo, "[0.1,0.1,0.2,0.2]");
+    confirm_as(&f.app, face, alice);
+    let (_view, people) = f.people(cx);
+    assert_eq!(people.read_with(cx, |p, _| p.data.as_ref().unwrap().people[0].avatar_photo_id), photo);
+    let thumb = JobKey::photo(photo, ImageKind::Thumb);
+    f.pool.finish(&thumb, Ok(cover_pixels(400, 200)));
+    work(&f.app, cx);
+    assert!(f.present(&format!("faces-person-{alice}"), cx), "the card is drawn");
+    assert!(!f.present(&format!("faces-avatar-{photo}"), cx), "no face cut from the cover's thumbnail");
+
+    // The cover taken off: the plain thumbnail, cut by the box.
+    let images = f.app.wired.images.clone();
+    images.update(cx, |s, cx| s.invalidate(photo, cx));
+    work(&f.app, cx);
+    f.pool.finish(&thumb, Ok(pixels(400, 200)));
+    work(&f.app, cx);
+    assert!(f.present(&format!("faces-avatar-{photo}"), cx), "the face is cut from the original's thumbnail");
 }
 
 /// The lists are virtualised and the avatars come from the image layer under the view's

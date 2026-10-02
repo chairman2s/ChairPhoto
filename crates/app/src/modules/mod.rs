@@ -57,6 +57,8 @@ pub mod faces;
 pub mod map;
 #[cfg(feature = "slideshow")]
 pub mod slideshow;
+#[cfg(feature = "smarttags")]
+pub mod smart_tagging;
 #[cfg(feature = "tag-graph")]
 pub mod tag_graph;
 
@@ -433,6 +435,8 @@ pub fn bundled() -> Vec<Rc<dyn Module>> {
     modules.push(Rc::new(faces::FacesModule));
     #[cfg(feature = "tag-graph")]
     modules.push(Rc::new(tag_graph::TagGraphModule));
+    #[cfg(feature = "smarttags")]
+    modules.push(Rc::new(smart_tagging::SmartTaggingModule));
     modules
 }
 

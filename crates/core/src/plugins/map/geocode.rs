@@ -380,14 +380,23 @@ impl SidecarFill {
     /// Write only the owed fields: every field neither this fill nor an earlier failed write
     /// changed — a foreign creator, rights or caption included — stays as the sidecar has
     /// it (#144). Settled in the catalog the fill stored in; a failure leaves the fields
-    /// owed for the next save or repair pass (#148), and is answered as an error.
+    /// owed for the next save or repair pass (#148), and is answered as an error that says
+    /// so in a geocode's terms ([`pending_message`]).
     fn write(&self, state: &crate::app::AppState, identity: CatalogIdentity) -> Result<(), String> {
         let outcome = crate::app::iptc::write_and_settle(state, identity, &self.original, &self.write);
         match outcome.sidecar {
-            crate::catalog::IptcSidecarState::Pending => Err(outcome.status()),
+            crate::catalog::IptcSidecarState::Pending => Err(pending_message(&outcome)),
             _ => Ok(()),
         }
     }
+}
+
+/// What a single-photo geocode answers when the location reached the catalog but not the
+/// sidecar. It is shown where a geocode error is, so it speaks of the geocode, not of a
+/// save the user did not make (review of #148, N2).
+fn pending_message(outcome: &crate::app::iptc::IptcSaveOutcome) -> String {
+    let why = outcome.reason.as_deref().map(|r| format!(" ({r})")).unwrap_or_default();
+    format!("Geocoded location stored in the catalog, but not yet in the sidecar{why}; the repair pass will write it")
 }
 
 /// Step 3 of a fill, in the catalog the photo was read from: re-read the IPTC (a value the
@@ -1025,6 +1034,29 @@ mod tests {
             assert_eq!(iptc(&xml), expected, "single={single}:\n{xml}");
             assert_non_iptc_intact(&xml, "lightroom");
         }
+        server.abort();
+    }
+
+    /// Review of #148, N2: a single-photo geocode whose sidecar write fails (here an
+    /// unparseable sidecar) says the geocoded location is in the catalog and the sidecar is
+    /// pending, in a geocode's words, not a save's. The filled fields stay owed.
+    #[tokio::test]
+    async fn a_geocode_whose_sidecar_is_pending_says_so_as_a_geocode() {
+        let (server, endpoint) =
+            serve_forever(r#"{"address":{"city":"Oslo","state":"Oslo","country":"Norway","country_code":"no"}}"#).await;
+        let (dir, state, id, _progress) = geo_catalog("geo-148-pending", &endpoint);
+        let xmp = crate::xmp::sidecar_path(&dir.join("library").join("IMG_1.jpg"));
+        std::fs::write(&xmp, "<x:xmpmeta not xml").unwrap();
+
+        let err = geocode_photo_to_iptc(&state, None, id).await.unwrap_err();
+        assert!(err.starts_with("Geocoded location stored in the catalog, but not yet in the sidecar ("), "{err}");
+        assert!(err.ends_with("; the repair pass will write it"), "{err}");
+        assert!(!err.contains("Saved"), "{err}");
+        let guard = state.catalog.lock().unwrap();
+        let c = guard.as_ref().unwrap();
+        assert_eq!(c.get_iptc(id).unwrap().city, "Oslo");
+        assert!(c.owed_iptc(id).unwrap().contains(crate::catalog::IptcMask::CITY));
+        drop(guard);
         server.abort();
     }
 

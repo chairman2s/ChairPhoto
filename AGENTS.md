@@ -67,7 +67,9 @@ Read only the documents triggered by the task:
   Name + Area match. Preserve every other element/attribute and foreign namespace.
 - A `write_iptc` caller reads `before` in the same catalog lock hold that stores `after`,
   and resolves the original's path before that store, so the diff written is the change
-  stored and an unreachable original changes nothing. A sidecar write that fails after the
+  stored and an unreachable original changes nothing. It takes the sidecar's write turn
+  (`xmp::lock::WriteOrder`) before that hold and keeps it through the sidecar write, so
+  overlapping saves store and write in one order. A sidecar write that fails after the
   catalog commit is not yet retried: the catalog then holds IPTC the sidecar lacks.
 - Sidecars are `<original_filename>.xmp`, alongside the original.
 - Before ChairPhoto's first in-library write to an existing sidecar, back it up if it lacks

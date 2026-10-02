@@ -239,6 +239,10 @@ pub fn wire(
         (None, None) => Arc::new(NoPool),
     };
     let images = cx.new(|cx| ImageStore::new(submit, image_store::DEFAULT_BUDGET_BYTES, cx));
+    let probe_state = model.read(cx).state().clone();
+    images.update(cx, |store, _| {
+        store.set_identity_probe(Arc::new(move || chairphoto_core::app::catalog_identity(&probe_state).ok()))
+    });
     clear_images_on_catalog_switch(&model, &images, cx).detach();
     let modules = modules::ModuleRegistry::install(&model, &shell, &images, cx);
     let storage = cx.new(|cx| storage::StorageState::new(&model, &shell, cx));

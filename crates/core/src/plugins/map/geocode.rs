@@ -369,18 +369,22 @@ fn with_bound<T>(
     }
 }
 
-/// The sidecar half of a fill, done off the catalog lock: the original, and the IPTC before
-/// and after the fill.
+/// The sidecar half of a fill, done off the catalog lock: the original, the IPTC before
+/// and after the fill, and the sidecar's write turn, held since before the fill stored, so
+/// this write and a manual save's land in the order they stored (#149).
 struct SidecarFill {
     original: std::path::PathBuf,
     before: crate::catalog::IptcFields,
     after: crate::catalog::IptcFields,
+    _turn: crate::xmp::lock::WriteOrder,
 }
 
 impl SidecarFill {
     /// Write only the filled fields: `xmp::write_iptc` leaves every field the fill did not
     /// change — a foreign creator, rights or caption included — as the sidecar has it (#144).
-    fn write(&self) -> Result<(), String> {
+    /// The turn is released when the write is done; call it with no lock held and no
+    /// `.await` between the fill and this write.
+    fn write(self) -> Result<(), String> {
         crate::xmp::write_iptc(&self.original, &self.before, &self.after)
     }
 }
@@ -396,6 +400,12 @@ fn fill_in(
     photo_id: i64,
     geo: &GeocodeResult,
 ) -> Result<Option<SidecarFill>, String> {
+    // The sidecar's write turn first, as a manual save takes it (#149): reserved under the
+    // lock, waited for with none held. The store below runs with it held.
+    let turn = crate::app::with_catalog_as(state, identity, |c| {
+        Ok(crate::xmp::lock::WriteOrder::reserve(&c.require_photo_path(photo_id)?))
+    })?
+    .wait();
     crate::app::with_catalog_as(state, identity, |c| {
         let current = c.get_iptc(photo_id)?;
         let (updated, changed) = fill_empty_iptc(&current, geo);
@@ -404,7 +414,7 @@ fn fill_in(
         }
         let original = c.require_photo_path(photo_id)?;
         c.set_iptc(photo_id, &updated)?;
-        Ok(Some(SidecarFill { original, before: current, after: updated }))
+        Ok(Some(SidecarFill { original, before: current, after: updated, _turn: turn }))
     })
 }
 

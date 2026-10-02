@@ -291,6 +291,57 @@ pub async fn resolve_identity_conflict(
     .await
     .map_err(|e| e.to_string())?
 }
+// ── Owed IPTC per photo (#153) ───────────────────────────────────────────────
+//
+// The bodies are the core's `app::iptc_owed` (the GPUI identity-debt panel runs the same,
+// bound to the catalog its page was read from). This shell carries no catalog identity, so
+// Dismiss and Retry are guarded by the row's UUID (and Dismiss by its generation).
+
+/// One page (`limit`/`offset`, in photo-id order) of the photos whose catalog IPTC has
+/// fields their sidecar has not received yet: id, UUID, path, owed fields, last error and
+/// the generation Dismiss compares against.
+#[tauri::command]
+pub async fn list_owed_iptc(
+    state: State<'_, AppState>,
+    limit: i64,
+    offset: i64,
+) -> Result<Vec<crate::catalog::OwedIptc>, String> {
+    with_catalog_blocking(&state, move |c| c.list_owed_iptc_page(limit, offset)).await
+}
+
+/// Stop owing one photo's IPTC without writing (the catalog keeps its values). `false` when
+/// nothing was dismissed: a newer save owes something since the row was read (its
+/// `generation` moved on), or the id no longer names the photo with `uuid`.
+#[tauri::command]
+pub async fn dismiss_owed_iptc(
+    state: State<'_, AppState>,
+    photo_id: i64,
+    uuid: String,
+    generation: i64,
+) -> Result<bool, String> {
+    let state = state.inner().clone();
+    crate::app::spawn_blocking(move || {
+        crate::app::iptc_owed::dismiss_owed_iptc_as(&state, None, photo_id, &uuid, generation)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Write one photo's owed IPTC into its sidecar now, through the save's write turn and
+/// compare-and-set. Answers like `set_iptc`: `written`, `unchanged` (nothing owed any more)
+/// or `pending` with the reason. On a blocking worker: it waits for the sidecar's write turn.
+#[tauri::command]
+pub async fn retry_owed_iptc(
+    state: State<'_, AppState>,
+    photo_id: i64,
+    uuid: String,
+) -> Result<crate::app::iptc::IptcSaveOutcome, String> {
+    let state = state.inner().clone();
+    crate::app::spawn_blocking(move || crate::app::iptc_owed::retry_owed_iptc_as(&state, None, photo_id, &uuid))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
 async fn record_identity_on_catalog(
     db_path: PathBuf,
     root: PathBuf,

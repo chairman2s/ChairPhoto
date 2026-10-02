@@ -415,6 +415,73 @@ fn an_aborted_index_job_leaves_the_pre_marker_record() {
     assert_eq!(left, [p1]);
 }
 
+/// Review N1, probe R2's shape through the verbs: a copy of a catalog file (a sync between
+/// two machines, a restored backup) shares the original's identity *and* its face-id
+/// counter. After the copy, A draws Carol on photo P (face k, exported as `U/k`) and B,
+/// which never had her, gets its own face k on another photo Q. B's face writes on P — an
+/// accept, then a reject — know no face k on P, so A's Carol is left exactly as she is.
+#[test]
+fn a_copied_catalogs_face_writes_leave_the_other_copys_regions() {
+    let (a, root) = temp_catalog("n1-a");
+    let p = add_photo(&a, &root, "p.NEF");
+    let q = add_photo(&a, &root, "q.NEF");
+    let copy_dir = TestTmpDir::new("app-faces-n1-b");
+    let copy = copy_dir.join("copy.chairphoto");
+    a.conn().execute("VACUUM INTO ?1", [copy.to_str().unwrap()]).unwrap();
+    let b = Catalog::open(&copy, &root).unwrap();
+    assert_eq!(b.catalog_uuid().unwrap(), a.catalog_uuid().unwrap(), "a copy shares the identity");
+
+    let carol = a.create_tag("People/Carol").unwrap();
+    let fc = add_manual(&a, p, 0.7, 0.7, 0.1, 0.1).unwrap();
+    assign(&a, fc, carol).unwrap();
+    let path = root.join("p.NEF");
+    let carol_region = || {
+        let xml = std::fs::read_to_string(crate::xmp::sidecar_path(&path)).unwrap();
+        let got = crate::xmp::region_fixtures::mwg(&xml);
+        (got.regions.iter().filter(|r| r.name == "Carol").cloned().collect::<Vec<_>>(), xml)
+    };
+    let (before, _) = carol_region();
+    assert_eq!(before.len(), 1);
+
+    let dave = b.create_tag("People/Dave").unwrap();
+    let fd = add_face(&b, q, "[0.4,0.1,0.1,0.1]");
+    assert_eq!(fd, fc, "the copies' id counters collide");
+    assign(&b, fd, dave).unwrap();
+    let alice = b.create_tag("People/Alice").unwrap();
+    let fa = add_face(&b, p, "[0.1,0.1,0.2,0.2]");
+    suggest(&b, fa, alice);
+    accept(&b, fa).unwrap();
+    let (after, xml) = carol_region();
+    assert_eq!(after, before, "B's accept touched A's Carol:\n{xml}");
+    reject(&b, fa).unwrap();
+    let (after, xml) = carol_region();
+    assert_eq!(after, before, "B's reject removed A's Carol:\n{xml}");
+}
+
+/// Review N1: deleting a drawn box writes the photo's regions while the row still exists, so
+/// a region of it is removed — afterwards its id would be unknown and the region kept for
+/// ever. (A box still `drawn` is normally never exported; the region here stands in for one
+/// left by a write that was skipped while the photo was offline.)
+#[test]
+fn deleting_a_drawn_face_removes_its_region() {
+    let (c, root) = temp_catalog("n1-drawn");
+    let p = add_photo(&c, &root, "p.NEF");
+    let path = root.join("p.NEF");
+    let carol = c.create_tag("People/Carol").unwrap();
+    let f = add_manual(&c, p, 0.7, 0.7, 0.1, 0.1).unwrap();
+    assign(&c, f, carol).unwrap();
+    assert!(crate::xmp::read_face_regions(&path).iter().any(|r| r.name == "Carol"));
+    // The box is unassigned again and still `drawn`, its region still in the sidecar.
+    c.conn()
+        .execute(
+            "UPDATE faces__faces SET state = 'unassigned', person_tag_id = NULL, source = 'drawn' WHERE id = ?1",
+            [f],
+        )
+        .unwrap();
+    delete_drawn(&c, f).unwrap();
+    assert!(crate::xmp::read_face_regions(&path).iter().all(|r| r.name != "Carol"), "the region stayed");
+}
+
 /// #135 through the verbs: ignoring a confirmed face takes its region out of the sidecar,
 /// as rejecting does, and every foreign region and structure stays.
 #[test]

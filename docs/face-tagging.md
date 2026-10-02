@@ -193,9 +193,16 @@ lowercase and hyphenated, minted once on the catalog's first open; `catalog::CAT
 a `/`, and the face's `faces__faces.id` in decimal. Face ids are `AUTOINCREMENT`, so a catalog
 never reuses one. A region whose marker names another catalog — a second catalog over the same
 folders, or this catalog's predecessor before a rebuild — or whose value is anything but exactly
-this form is **foreign**: never removed, never re-marked. (A copy of a catalog file shares its
-identity with the original; the name-or-place check in step 1 is what keeps a copy's ids from
-renaming a region.)
+this form is **foreign**: never removed, never re-marked.
+
+A copy of a catalog file — a sync between two machines, a restored backup — shares the
+original's identity *and* its face-id counter, so the two copies write the same markers for
+different faces. A marker is therefore this catalog's only for a **face it knows on that
+photo**: one in the set being written, or one of the photo's faces that has left it (rejected,
+ignored, unnamed). A marker with this catalog's identity but a face id it does not know on that
+photo came from a copy and is foreign like any other (review N1). And a region of a face that is
+still in the set but no longer recognisably that face (step 1) is kept as it is, not removed.
+Deleting a drawn box writes the photo's regions first, while its id is still known.
 
 Each write sends the photo's whole confirmed set, and for each existing region, in this order:
 
@@ -204,8 +211,9 @@ Each write sends the photo's whole confirmed set, and for each existing region, 
    re-detected box no longer leaves a stale copy behind.
 2. **This catalog's marker, same Name and center within `AREA_EPSILON = 0.02` of a face in the
    set** (a face id that changed): taken over the same way.
-3. **This catalog's marker, matched by nothing:** removed. This is how a **rejected or ignored**
-   face, or one whose person was removed, leaves the sidecar.
+3. **This catalog's marker, matched by nothing, for a face of this photo that has left the
+   set:** removed. This is how a **rejected or ignored** face, or one whose person was removed,
+   leaves the sidecar.
 4. **Anything else — unmarked, or another catalog's:** foreign, and **always kept**. When its
    Name and center (within `AREA_EPSILON`) match a face in the set it is that face already in
    the file — a Lightroom region ingested earlier, say: only its `Area` coordinates

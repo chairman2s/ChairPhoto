@@ -87,6 +87,22 @@ pub fn confirmed_regions(conn: &Connection, photo_id: i64) -> rusqlite::Result<V
     )
 }
 
+/// This catalog's faces on `photo_id` that are not in its exported set `regions` — rejected,
+/// ignored, unassigned, suggested: the only marked regions a write may remove (review N1).
+/// A marker whose face id is neither here nor in the set is not this catalog's to touch.
+pub fn retired_faces(conn: &Connection, photo_id: i64, regions: &[FaceRegion]) -> rusqlite::Result<Vec<i64>> {
+    let mut stmt = conn.prepare("SELECT id FROM faces__faces WHERE photo_id = ?1 ORDER BY id")?;
+    let ids = stmt.query_map([photo_id], |r| r.get::<_, i64>(0))?;
+    let mut out = Vec::new();
+    for id in ids {
+        let id = id?;
+        if !regions.iter().any(|r| r.face_id == id) {
+            out.push(id);
+        }
+    }
+    Ok(out)
+}
+
 /// The faces ChairPhoto exported into this photo's sidecar before regions carried its marker
 /// (`faces__legacy_regions`, see [`store::ensure_schema`](super::store::ensure_schema)), with
 /// the name and box they were exported with. The writer recognises a pre-marker region of
@@ -209,13 +225,14 @@ where
     super::store::ensure_schema(conn).map_err(|e| e.to_string())?;
     let catalog = crate::catalog::catalog_uuid(conn).map_err(|e| e.to_string())?;
     let regions = confirmed_regions(conn, photo_id).map_err(|e| e.to_string())?;
+    let retired = retired_faces(conn, photo_id, &regions).map_err(|e| e.to_string())?;
     let legacy = legacy_regions(conn, photo_id).map_err(|e| e.to_string())?;
     let frame = region_frame(conn, photo_id).map_err(|e| e.to_string())?;
 
     let Some(path) = resolve(photo_id)? else {
         return Ok(()); // offline — skip, re-sync later.
     };
-    crate::xmp::write_face_regions(&path, &catalog, &regions, &legacy, frame)?;
+    crate::xmp::write_face_regions(&path, &catalog, &regions, &retired, &legacy, frame)?;
     conn.execute("DELETE FROM faces__legacy_regions WHERE photo_id = ?1", [photo_id])
         .map_err(|e| e.to_string())?;
     Ok(())
@@ -544,7 +561,7 @@ mod tests {
         let ours = crate::xmp::FaceRegion { face_id: 0, name: "Dora".into(), bbox: (0.5, 0.5, 0.1, 0.1) };
         let unmarked = crate::xmp::RegionFrame { orientation: None, stored_size: Some((6000, 4000)) };
         let catalog = crate::catalog::catalog_uuid(&conn).unwrap();
-        crate::xmp::write_face_regions(&photo_path, &catalog, &[ours], &[], unmarked).unwrap();
+        crate::xmp::write_face_regions(&photo_path, &catalog, &[ours], &[], &[], unmarked).unwrap();
         let xml = std::fs::read_to_string(crate::xmp::sidecar_path(&photo_path)).unwrap();
         let unmarked_xml = xml.replace(&format!("<chairphoto:FaceId>{catalog}/0</chairphoto:FaceId>"), "");
         assert_ne!(xml, unmarked_xml, "the marker was not where the test expects it");

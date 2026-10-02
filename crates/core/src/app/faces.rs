@@ -478,7 +478,20 @@ pub fn add_manual(c: &Catalog, photo_id: i64, x: f64, y: f64, w: f64, h: f64) ->
 
 /// Delete a drawn, still-unassigned box (a mis-draw). Only `source='drawn'`: a detected face
 /// must be rejected or ignored instead, so re-indexing cannot resurrect it.
+///
+/// The photo's regions are written first, while the row still exists: a write removes a
+/// region carrying this catalog's marker only for a face id it knows on the photo (review
+/// N1), so a region of this face written now is removed, and after the delete it never could
+/// be. (A face still `drawn` was never confirmed — confirming makes it `manual` or keeps the
+/// matcher's `match` — so normally it has no region; this is the defensive half.)
 pub fn delete_drawn(c: &Catalog, face_id: i64) -> CatalogResult<()> {
+    let drawn: Option<i64> = c
+        .conn()
+        .query_row("SELECT photo_id FROM faces__faces WHERE id = ?1 AND source = 'drawn'", [face_id], |r| r.get(0))
+        .optional()?;
+    if let Some(photo_id) = drawn {
+        write_regions(c, photo_id);
+    }
     let n = c.conn().execute("DELETE FROM faces__faces WHERE id = ?1 AND source = 'drawn'", [face_id])?;
     if n == 0 {
         return Err(CatalogError::Validation("only unassigned drawn face boxes can be deleted".into()));

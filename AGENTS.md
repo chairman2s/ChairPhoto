@@ -74,8 +74,9 @@ Read only the documents triggered by the task:
   `chairphoto:LastWrite`. Export-only destination copies are not subject to this rule.
 - Face-region writes replace or remove only regions carrying the writing catalog's own
   `chairphoto:FaceId` marker, `<catalog UUID>/<face id>` (a stable format, see
-  `docs/face-tagging.md`), or, for pre-marker regions, matching the catalog's record of what it
-  exported. Every other region — another catalog's included — is foreign and preserved.
+  `docs/face-tagging.md`) for a face that catalog knows on that photo, or, for pre-marker
+  regions, matching the catalog's record of what it exported. Every other region — another
+  catalog's or a copied catalog's included — is foreign and preserved.
   MWG areas use normalized center coordinates in the stored frame — the image before its EXIF
   Orientation is applied (MWG 2.0 § 5.9) — and `AppliedToDimensions` is the stored pixel size;
   ChairPhoto's face boxes are in the EXIF-oriented frame and are converted on export and

@@ -419,6 +419,13 @@ impl Catalog {
             // same filename stem). Future imports are paired by the scanner.
             let _ = self.pair_raw_jpeg_stacks();
         }
+        if prior_version < 23 {
+            // #146: before #141 a scan adopted a sidecar's non-UUID `xmp:Identifier` as
+            // `photos.uuid`. Give those rows a minted UUID and queue each copy's sidecar
+            // as the conflict it now is. Needs the locations (v2) and the queue's
+            // `dismissed_at` column, both established above.
+            self.remint_non_identity_photos()?;
+        }
         // Keep the catalog-root (local) volume pointing at the current root, so
         // re-rooting the catalog moves it too.
         self.sync_default_volume_root()?;
@@ -725,7 +732,9 @@ impl Catalog {
             )?;
             UpsertResult { id, uuid, created: false, unchanged }
         } else if let Some(id) = by_uuid {
-            // Re-home the moved file: point the existing row at the new path.
+            // Re-home the moved file: point the existing row at the new path. Debt queued
+            // for the path it left would name a file that is no longer there.
+            self.forget_identity_debt_left_behind(id, absolute_path)?;
             self.conn.execute(
                 "UPDATE photos SET path = ?1, folder_id = ?2, mtime_ns = ?3, size = ?4,
                     extension = ?5, missing = 0, updated_at = ?6 WHERE id = ?7",

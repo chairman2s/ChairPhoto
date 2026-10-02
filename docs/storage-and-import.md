@@ -138,6 +138,15 @@ uses it to re-home a row; the file gets its own minted UUID, and the foreign val
 the sidecar as a conflict. Adopt refuses it; Overwrite (after the backup) or Dismiss resolve
 it.
 
+Before #141 a scan did adopt such a value, so an older catalog can hold rows whose
+`photos.uuid` is a DAM id. Schema v23 (#146) gives each of them a minted UUID, keeps the old
+value in `photo_legacy_identifiers`, and queues every copy it records as a conflict; it writes
+no sidecar. Until that conflict is resolved the sidecar's foreign value is the file's only link
+to its row, so a scan re-homes a moved file onto the row holding it as a legacy identifier —
+only when no other row holds it and every copy the row records is gone (present storage, no
+file; an unmounted volume does not count). Otherwise the file is a different photo and gets
+its own row, as above. The legacy value is never a merge key or a deep-link target.
+
 **Adopt changes what merge matches on.** Identity is the merge key (`merge_photo` looks up
 `photos WHERE uuid = ?`), so a catalog that has already been merged or bundled elsewhere
 holds the *previous* identity for that photo:

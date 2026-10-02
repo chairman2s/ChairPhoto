@@ -1415,6 +1415,144 @@ impl Catalog {
     pub fn repair_pending_identity(&self) -> Result<IdentityRepairSummary> {
         self.run_identity_repair(&AtomicBool::new(false), |_| {})
     }
+
+    /// What a scan may match or adopt as the identity of a file whose sidecar's
+    /// `xmp:Identifier` holds `found`, or `None` to match by path alone and mint if new.
+    ///
+    /// A UUID is the identity (#141). Anything else is another tool's identifier and is
+    /// never adopted, with one exception (#146): the identifier a row held before schema v23
+    /// re-minted it ([`Self::remint_non_identity_photos`]). Its sidecar still carries that
+    /// value — overwriting it is a person's decision — so it is the only link from the file
+    /// back to its row, and without it a moved file would be catalogued a second time and
+    /// its tags, ratings and faces left on a row nobody sees. It answers the row's minted
+    /// UUID only when exactly one row holds that legacy identifier and every copy that row
+    /// records is gone ([`Self::every_copy_is_gone`]): two files sharing a DAM id must not
+    /// take turns owning one row (#141), and an unmounted volume is not a moved file.
+    ///
+    /// The caller still binds with the raw `found`, so the foreign value stays in the
+    /// sidecar and is reported as a conflict.
+    pub fn scan_identity(&self, found: Option<&str>) -> Result<Option<String>> {
+        let Some(found) = found else {
+            return Ok(None);
+        };
+        if is_photo_identity(found) {
+            return Ok(Some(found.to_string()));
+        }
+        let owners: Vec<(i64, String)> = self
+            .conn
+            .prepare(
+                "SELECT l.photo_id, p.uuid
+                 FROM photo_legacy_identifiers l JOIN photos p ON p.id = l.photo_id
+                 WHERE l.identifier = ?1
+                 LIMIT 2",
+            )?
+            .query_map(params![found], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        match owners.as_slice() {
+            [(photo_id, uuid)] if self.every_copy_is_gone(*photo_id)? => Ok(Some(uuid.clone())),
+            _ => Ok(None),
+        }
+    }
+
+    /// True when every copy the catalog records for `photo_id` — each location, and the
+    /// catalog-root path — sits on storage that is present and no longer holds the file.
+    /// A copy on an absent volume (an unmounted NAS) may still be there, so it is not gone.
+    fn every_copy_is_gone(&self, photo_id: i64) -> Result<bool> {
+        let mut copies: Vec<(PathBuf, PathBuf)> = self
+            .conn
+            .prepare(
+                "SELECT v.base_path, l.relative_path
+                 FROM photo_locations l JOIN volumes v ON v.id = l.volume_id
+                 WHERE l.photo_id = ?1",
+            )?
+            .query_map(params![photo_id], |r| {
+                let base = PathBuf::from(r.get::<_, String>(0)?);
+                let relative: String = r.get(1)?;
+                Ok((base.clone(), base.join(relative)))
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        let logical = self.get_photo(photo_id)?.path;
+        copies.push((self.root().to_path_buf(), self.to_absolute(&logical)));
+        Ok(copies.iter().all(|(base, file)| base.is_dir() && !file.exists()))
+    }
+
+    /// Schema v23 (#146): give every row whose `photos.uuid` is not a photo identity a
+    /// minted UUID. Returns how many rows were re-minted.
+    ///
+    /// Before #141 a scan adopted a sidecar's `xmp:Identifier` verbatim, so a DAM asset id
+    /// could become `photos.uuid`. #141 stopped matching on such values, and that left those
+    /// rows unreachable by identity: a moved file was catalogued again beside them. Each one
+    /// now gets a UUID, and keeps its previous value in `photo_legacy_identifiers` for
+    /// [`Self::scan_identity`].
+    ///
+    /// No sidecar is touched here. Each recorded copy is queued as the conflict it now is —
+    /// its sidecar carries the old value, adopted from it in the first place — so the debt
+    /// panel shows it at once, and Overwrite (after a backup) or Dismiss settles it, as for
+    /// any non-UUID identifier (docs/storage-and-import.md § Resolving a conflict). Adopt
+    /// refuses it. The repair pass and each decision re-read the file, so a copy that never
+    /// carried the value is reported as whatever it really is the first time either runs.
+    pub(super) fn remint_non_identity_photos(&self) -> Result<usize> {
+        let stale: Vec<(i64, String)> = self
+            .conn
+            .prepare("SELECT id, uuid FROM photos")?
+            .query_map([], |r| Ok((r.get(0)?, r.get::<_, String>(1)?)))?
+            .filter(|row| !matches!(row, Ok((_, uuid)) if is_photo_identity(uuid)))
+            .collect::<rusqlite::Result<_>>()?;
+        let ts = now();
+        for (photo_id, previous) in &stale {
+            self.conn.execute(
+                "UPDATE photos SET uuid = ?1, updated_at = ?2 WHERE id = ?3",
+                params![uuid::Uuid::new_v4().to_string(), ts, photo_id],
+            )?;
+            // An empty value was never in any sidecar: such a copy simply owes the write,
+            // which the repair pass does for a copy queued as not yet bound.
+            let outcome = if previous.is_empty() {
+                SidecarIdentity::Unreachable
+            } else {
+                self.conn.execute(
+                    "INSERT INTO photo_legacy_identifiers(photo_id, identifier) VALUES(?1, ?2)
+                     ON CONFLICT(photo_id) DO UPDATE SET identifier = excluded.identifier",
+                    params![photo_id, previous],
+                )?;
+                SidecarIdentity::Conflict(previous.clone())
+            };
+            let copies: Vec<(i64, String)> = self
+                .conn
+                .prepare("SELECT volume_id, relative_path FROM photo_locations WHERE photo_id = ?1")?
+                .query_map(params![photo_id], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .collect::<rusqlite::Result<_>>()?;
+            for (volume_id, relative_path) in copies {
+                self.record_sidecar_field_target(
+                    *photo_id,
+                    SidecarField::Identifier,
+                    volume_id,
+                    &relative_path,
+                    &outcome,
+                )?;
+            }
+        }
+        Ok(stale.len())
+    }
+
+    /// Drop the sidecar debt recorded for the primary copy a re-homed photo is leaving:
+    /// `new_location` is where the file is now, and a queue row for the path it moved from
+    /// names a file that is no longer there, so it could only ever report it unreachable.
+    /// The debt the new path owes is recorded by the caller's binding, as for any scan.
+    pub(super) fn forget_identity_debt_left_behind(
+        &self,
+        photo_id: i64,
+        new_location: &Path,
+    ) -> Result<()> {
+        let (volume_id, relative_path) = self.volume_for_path(new_location)?;
+        self.conn.execute(
+            "DELETE FROM pending_sidecar_identity
+             WHERE photo_id = ?1 AND volume_id = ?2 AND relative_path <> ?3
+               AND relative_path IN (SELECT relative_path FROM photo_locations
+                                     WHERE photo_id = ?1 AND volume_id = ?2 AND role = 'primary')",
+            params![photo_id, volume_id, relative_path],
+        )?;
+        Ok(())
+    }
 }
 
 /// Queue rows planned per round trip to SQLite.
@@ -3036,5 +3174,53 @@ mod tests {
             "asking for dismissed copies must show exactly the two disjoint groups"
         );
         assert!(all.iter().any(|p| p.photo_id == dismissed_id));
+    }
+
+    /// #146: a legacy identifier leads a scan back to its row only when that row is the
+    /// only one holding it and every copy it records is gone — not while one is still in
+    /// place, and not while one sits on a volume that is not there to look at.
+    #[test]
+    fn a_legacy_identifier_matches_only_a_row_whose_every_copy_is_gone() {
+        let (catalog, root, dir) = temp_catalog("legacy-identifier-match");
+        let (id, path) = seed_photo(&catalog, &root, "x.jpg");
+        let nas = dir.path().join("nas");
+        std::fs::create_dir_all(&nas).unwrap();
+        let volume = catalog
+            .add_volume("NAS", &nas, crate::catalog::VolumeKind::Backup)
+            .unwrap();
+        catalog
+            .add_location(id, volume, "x.jpg", crate::catalog::LocationRole::Backup)
+            .unwrap();
+        catalog
+            .conn()
+            .execute("UPDATE photos SET uuid = 'dam:1' WHERE id = ?1", params![id])
+            .unwrap();
+        assert_eq!(catalog.remint_non_identity_photos().unwrap(), 1);
+        let uuid = photo_uuid(&catalog, id);
+        assert!(is_photo_identity(&uuid), "{uuid}");
+
+        assert_eq!(catalog.scan_identity(Some("dam:1")).unwrap(), None, "its file is still there");
+        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_dir(&nas).unwrap();
+        assert_eq!(catalog.scan_identity(Some("dam:1")).unwrap(), None,
+            "the backup copy may still exist on the volume that is not mounted");
+        std::fs::create_dir_all(&nas).unwrap();
+        assert_eq!(catalog.scan_identity(Some("dam:1")).unwrap(), Some(uuid.clone()));
+
+        assert_eq!(catalog.scan_identity(Some(&uuid)).unwrap(), Some(uuid.clone()));
+        assert_eq!(catalog.scan_identity(Some("dam:2")).unwrap(), None);
+        assert_eq!(catalog.scan_identity(None).unwrap(), None);
+
+        // Two rows holding the same legacy value: the file could be either, so neither.
+        let (other, other_path) = seed_photo(&catalog, &root, "y.jpg");
+        std::fs::remove_file(&other_path).unwrap();
+        catalog
+            .conn()
+            .execute(
+                "INSERT INTO photo_legacy_identifiers(photo_id, identifier) VALUES(?1, 'dam:1')",
+                params![other],
+            )
+            .unwrap();
+        assert_eq!(catalog.scan_identity(Some("dam:1")).unwrap(), None);
     }
 }

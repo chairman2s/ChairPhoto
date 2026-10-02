@@ -474,6 +474,105 @@ fn scan_ignores_a_non_uuid_sidecar_identifier_but_preserves_it() {
     assert_eq!(rows(&catalog), first);
 }
 
+/// Issue #146: before #141 a scan adopted a non-UUID sidecar identifier as `photos.uuid`.
+/// #141 stopped matching on such values, so when that file moved, the next scan catalogued
+/// it again and left its tags and rating on a row nobody sees. Schema v23 re-mints those rows
+/// and keeps the old value as a legacy identifier; a moved file comes back to its row, the
+/// foreign value stays in the sidecar as a conflict, and a second file sharing it does not
+/// take the row over.
+#[test]
+fn a_row_holding_a_pre_141_non_uuid_identity_survives_its_file_moving() {
+    let (catalog, root) = temp_catalog("legacy-non-uuid-identity");
+    const DAM_ID: &str = "dam:asset/1";
+    let sidecar = format!(r#"<?xml version="1.0" encoding="UTF-8"?>
+<x:xmpmeta xmlns:x="adobe:ns:meta/">
+ <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+  <rdf:Description rdf:about="" xmlns:xmp="http://ns.adobe.com/xap/1.0/">
+   <xmp:Identifier>{DAM_ID}</xmp:Identifier>
+  </rdf:Description>
+ </rdf:RDF>
+</x:xmpmeta>"#);
+    let place = |f: &std::path::Path| {
+        std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+        std::fs::write(f, b"notarealjpeg").unwrap();
+        std::fs::write(chairphoto_core::xmp::sidecar_path(f), &sidecar).unwrap();
+    };
+    let original = root.join("a/x.jpg");
+    place(&original);
+    let abort = chairphoto_core::scanner::never_abort();
+    chairphoto_core::scanner::scan_folder(&catalog, &root, &abort, &|_| {}).unwrap();
+    let id = catalog.list_photos(&PhotoQuery::default()).unwrap()[0].id;
+    catalog.set_culling(id, Some(4), None, None).unwrap();
+    let tag = catalog.create_tag("Places/Harbour").unwrap();
+    catalog.assign_tag(id, tag).unwrap();
+
+    // Make it the catalog a pre-#141 scan left: the foreign value adopted as the identity,
+    // the copy counted as bound, and the catalog at schema v22.
+    catalog
+        .conn()
+        .execute_batch(&format!(
+            "UPDATE photos SET uuid = '{DAM_ID}' WHERE id = {id};
+             DELETE FROM pending_sidecar_identity;
+             UPDATE settings SET value = '22' WHERE key = 'schema_version';"
+        ))
+        .unwrap();
+    let db = catalog.db_path().to_path_buf();
+    drop(catalog);
+    let catalog = Catalog::open(&db, &root).unwrap();
+
+    let reminted = catalog.get_photo(id).unwrap().uuid;
+    assert!(chairphoto_core::catalog::is_photo_identity(&reminted), "{reminted}");
+    let queue = |catalog: &Catalog| -> Vec<(i64, String, String)> {
+        catalog
+            .list_pending_identity()
+            .unwrap()
+            .into_iter()
+            .map(|p| (p.photo_id, p.relative_path, p.state))
+            .collect()
+    };
+    assert_eq!(queue(&catalog), [(id, "a/x.jpg".to_string(), "conflict".to_string())]);
+    assert_eq!(chairphoto_core::xmp::read_identifier(&original).as_deref(), Some(DAM_ID),
+        "the migration writes no sidecar");
+
+    // The file moves, sidecar and all, and the folder is rescanned.
+    let moved = root.join("b/x.jpg");
+    std::fs::create_dir_all(moved.parent().unwrap()).unwrap();
+    std::fs::rename(&original, &moved).unwrap();
+    std::fs::rename(
+        chairphoto_core::xmp::sidecar_path(&original),
+        chairphoto_core::xmp::sidecar_path(&moved),
+    )
+    .unwrap();
+    chairphoto_core::scanner::scan_folder(&catalog, &root, &abort, &|_| {}).unwrap();
+
+    let visible = catalog.list_photos(&PhotoQuery::default()).unwrap();
+    assert_eq!(visible.len(), 1, "one row, not a duplicate: {visible:?}");
+    assert_eq!((visible[0].id, visible[0].path.as_str()), (id, "b/x.jpg"));
+    assert_eq!(visible[0].uuid, reminted);
+    assert_eq!(visible[0].rating, 4);
+    let tags: Vec<String> = catalog.get_photo_tags(id).unwrap().into_iter().map(|t| t.name).collect();
+    assert_eq!(tags, ["Harbour"]);
+    assert_eq!(chairphoto_core::xmp::read_identifier(&moved).as_deref(), Some(DAM_ID));
+    assert_eq!(queue(&catalog), [(id, "b/x.jpg".to_string(), "conflict".to_string())],
+        "the conflict follows the file; the path it left owes nothing");
+
+    // Another file carrying the same foreign id, while the row's own file is still there:
+    // it is a different photo and gets its own row, and the moved one keeps its own.
+    place(&root.join("c/y.jpg"));
+    chairphoto_core::scanner::scan_folder(&catalog, &root, &abort, &|_| {}).unwrap();
+    chairphoto_core::scanner::scan_folder(&catalog, &root, &abort, &|_| {}).unwrap();
+    let mut paths: Vec<(String, i64)> = catalog
+        .list_photos(&PhotoQuery::default())
+        .unwrap()
+        .into_iter()
+        .map(|p| (p.path, p.id))
+        .collect();
+    paths.sort();
+    assert_eq!(paths.len(), 2, "{paths:?}");
+    assert_eq!(paths[0], ("b/x.jpg".to_string(), id));
+    assert_eq!(paths[1].0, "c/y.jpg");
+}
+
 #[test]
 fn culling_round_trips() {
     let (catalog, root) = temp_catalog("culling");

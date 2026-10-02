@@ -966,6 +966,38 @@ fn cancelling_a_queued_rapidraw_launch_launches_nothing(cx: &mut TestAppContext)
     });
 }
 
+/// **Forced interleaving** (#161). The "Edit in" list is re-read on `EditorsChanged`, even
+/// with a list cached; of two re-reads, the older — which ran before the newer setting was
+/// stored and lands last — is dropped.
+#[gpui_kit::test]
+fn an_editors_change_rereads_the_list_and_only_the_newest_read_lands(cx: &mut TestAppContext) {
+    let dir = TempDir::new("insp-editors-reread");
+    let app = start(cx);
+    open_catalog_with_photos(&app, &dir, 1, cx);
+    catalog(&app, |c| c.set_setting("editor.rapidraw.bin", "/nonexistent/rapidraw").unwrap());
+    work(cx);
+    let insp = inspector(&app, cx);
+    assert_eq!(insp.read_with(cx, |i, _| i.editors.as_ref().map(|e| e.rapidraw)), Some(false));
+
+    // The older read runs before the binary exists: it would say "not found".
+    app.wired.model.update(cx, |m, cx| m.editors_changed(cx));
+    cx.run_until_parked();
+    let older = cx.update(|cx| Runner::get(cx).hold_pending());
+    assert_eq!(older.len(), 1, "the change queued a read although a list was cached");
+    let bin = dir.0.join("rapidraw");
+    std::fs::write(&bin, b"#!/bin/sh\n").unwrap();
+    catalog(&app, |c| c.set_setting("editor.rapidraw.bin", bin.to_str().unwrap()).unwrap());
+    app.wired.model.update(cx, |m, cx| m.editors_changed(cx));
+    cx.run_until_parked();
+    work(cx); // the newer read lands
+    assert_eq!(insp.read_with(cx, |i, _| i.editors.as_ref().map(|e| e.rapidraw)), Some(true));
+    // The older one ran against the old setting and lands last.
+    catalog(&app, |c| c.set_setting("editor.rapidraw.bin", "/nonexistent/rapidraw").unwrap());
+    cx.update(|cx| Runner::get(cx).release(older));
+    work(cx);
+    assert_eq!(insp.read_with(cx, |i, _| i.editors.as_ref().map(|e| e.rapidraw)), Some(true), "the stale read was dropped");
+}
+
 #[gpui_kit::test]
 fn editor_actions_never_reach_the_new_catalog_before_the_switch_event(cx: &mut TestAppContext) {
     editors_across_a_switch(false, cx);

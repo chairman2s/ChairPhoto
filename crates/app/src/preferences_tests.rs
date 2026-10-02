@@ -578,6 +578,41 @@ fn the_merge_preview_closes_when_a_reroot_supersedes_its_tree(cx: &mut TestAppCo
 
 // --- editors ----------------------------------------------------------------------------------
 
+/// The inspector's "Edit in" list follows a save in Preferences → Editors, with no catalog
+/// switch: RapidRAW pointed at a missing binary is not offered; pointing it at one that exists
+/// offers it once the save lands. (#161)
+#[gpui_kit::test]
+fn the_edit_in_list_follows_an_editor_saved_in_preferences(cx: &mut TestAppContext) {
+    let dir = TempDir::new("prefs-editors-inspector");
+    let app = start(cx);
+    open_catalog_with_photos(&app, &dir, 1, cx);
+    put_setting(&app, crate::preferences::editors::RAPIDRAW_BIN_KEY, "/nonexistent/rapidraw");
+    work(cx);
+    let insp = app.wired.root.as_ref().unwrap().read_with(cx, |r, _| r.inspector.clone());
+    assert_eq!(insp.read_with(cx, |i, _| i.editors.as_ref().map(|e| e.rapidraw)), Some(false), "read once, not offered");
+
+    let bin = dir.0.join("rapidraw");
+    std::fs::write(&bin, b"#!/bin/sh\n").unwrap();
+    let p = open(&app, cx);
+    tab(&app, "prefs-tab-editors", cx);
+    let (e, _) = editors(&p, cx);
+    e.update(cx, |e, cx| e.save_rapidraw(crate::preferences::editors::RAPIDRAW_BIN_KEY, bin.to_string_lossy().into(), cx));
+    work(cx);
+    assert_eq!(e.read_with(cx, |e, _| e.status.clone()).as_deref(), Some("Saved."));
+    assert_eq!(insp.read_with(cx, |i, _| i.editors.as_ref().map(|e| e.rapidraw)), Some(true), "re-checked after the save");
+
+    // A darktable/RawTherapee/ART path says so too. (Which of them the list then offers
+    // depends on this machine's PATH, so the event is what is checked.)
+    let seen = std::rc::Rc::new(std::cell::Cell::new(0));
+    let _sub = cx.update(|cx| {
+        let seen = seen.clone();
+        cx.subscribe(&app.wired.model, move |_, _: &crate::model::EditorsChanged, _| seen.set(seen.get() + 1))
+    });
+    e.update(cx, |e, cx| e.save("darktable", "gui", "/nonexistent/darktable".into(), cx));
+    work(cx);
+    assert_eq!(seen.get(), 1, "the path save announced the change");
+}
+
 /// Editors: a path override saves under React's key and re-checks availability; RapidRAW's
 /// format saves. Darkroom: the stored values load; the cache size normalises and saves; preload,
 /// white balance and render timing save React's values.

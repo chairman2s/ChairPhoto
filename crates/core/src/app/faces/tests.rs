@@ -143,11 +143,9 @@ fn a_failed_assignment_rolls_back_the_whole_batch() {
 
 /// A sidecar another tool wrote — raw XML, not ChairPhoto's writer, no `chairphoto:LastWrite`,
 /// another frame size: a named MWG region carrying a foreign child element (digiKam's face
-/// engine), an unnamed region in the nested-`rdf:Description` form (which ChairPhoto does not
-/// even parse), a Microsoft Photo `MP:RegionInfo` and a digiKam tag list beside them. Every
-/// property is in element form: ChairPhoto's XML layer keeps elements and their namespaces but
-/// drops the prefix of every *attribute* it re-serialises (xmltree 0.11 stores attributes by
-/// local name) — a separate, pre-existing defect this test deliberately does not cover.
+/// engine), an unnamed region in the nested-`rdf:Description` form (read since #139), a
+/// Microsoft Photo `MP:RegionInfo` and a digiKam tag list beside them. Every property is in
+/// element form; attribute-form sidecars are covered by the `xmp` tests (#138).
 fn seed_foreign_sidecar(photo_path: &std::path::Path) {
     let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
 <x:xmpmeta xmlns:x="adobe:ns:meta/">
@@ -227,7 +225,14 @@ fn assert_foreign_kept(photo_path: &std::path::Path, ours: &[&str]) {
     };
     let (x, y, w, h) = stranger.bbox;
     assert!((x - 0.6).abs() < 1e-4 && (y - 0.6).abs() < 1e-4 && (w - 0.2).abs() < 1e-4 && (h - 0.2).abs() < 1e-4, "{:?}", stranger.bbox);
-    let mut names: Vec<&str> = regions.iter().map(|r| r.name.as_str()).filter(|n| *n != "Stranger").collect();
+    // The unnamed nested-Description region is the foreign tool's, not ours (#139 reads it).
+    let Some(pet) = regions.iter().find(|r| r.name.is_empty()) else {
+        panic!("the foreign unnamed region is lost: {regions:?}\n{xml}")
+    };
+    let (x, y, w, h) = pet.bbox;
+    assert!((x - 0.26).abs() < 1e-4 && (y - 0.75).abs() < 1e-4 && (w - 0.1).abs() < 1e-4 && (h - 0.1).abs() < 1e-4, "{:?}", pet.bbox);
+    let mut names: Vec<&str> =
+        regions.iter().map(|r| r.name.as_str()).filter(|n| *n != "Stranger" && !n.is_empty()).collect();
     names.sort();
     assert_eq!(names, ours, "ChairPhoto's regions");
 

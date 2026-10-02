@@ -168,6 +168,18 @@ fn debt_state(error: &str, dismissed_at: i64) -> &'static str {
     }
 }
 
+/// True when `value`, as read from a sidecar's `xmp:Identifier`, can be a photo's identity: a
+/// non-nil UUID in the hyphenated form ChairPhoto writes and `photos.uuid` holds (#141).
+///
+/// Anything else — a DAM asset id, a path, a braced or `urn:uuid:` spelling — is somebody
+/// else's identifier. It is never adopted as `photos.uuid` and never used to re-home a row
+/// (two files carrying the same foreign id would otherwise take turns owning one row), but
+/// it is not ours to remove either: [`bind_sidecar_identity`] still sees it, reports a
+/// conflict, and leaves the sidecar alone until a person resolves it.
+pub fn is_photo_identity(value: &str) -> bool {
+    value.len() == 36 && uuid::Uuid::parse_str(value).is_ok_and(|u| !u.is_nil())
+}
+
 /// Ensure the file's XMP sidecar carries `uuid`. Pure filesystem work — it touches no
 /// catalog and holds no lock, so it is safe to run on a blocking worker.
 ///
@@ -1178,6 +1190,16 @@ impl Catalog {
 
         match action {
             IdentityConflictAction::Adopt => {
+                // A value that is not a UUID is another tool's identifier, not a photo
+                // identity (#141): adopting it would make `photos.uuid` something no merge,
+                // deep link or later scan treats as one.
+                if !is_photo_identity(&found) {
+                    return Err(CatalogError::Validation(format!(
+                        "cannot adopt {found:?}: it is not a UUID, so it cannot be a photo's \
+                         identity. Overwrite this copy's sidecar (it is backed up first), or \
+                         Dismiss to leave it as it is"
+                    )));
+                }
                 // Refuse BEFORE the write, naming the photo that already holds it. The
                 // `photos.uuid` UNIQUE constraint would also stop this, but only as an
                 // opaque SQL error where a stated precondition belongs (#32) — and
@@ -2033,7 +2055,7 @@ mod tests {
     fn adopt_takes_the_sidecars_identity_without_touching_the_file() {
         let (catalog, root, _dir) = temp_catalog("resolve-adopt");
         let (photo_id, path, catalog_uuid) =
-            seed_conflicted_copy(&catalog, &root, "adopt-me.arw", "identity-from-the-file");
+            seed_conflicted_copy(&catalog, &root, "adopt-me.arw", "0f11e1d0-5a1d-4e00-8f11-e1d0f11e1d00");
         let (volume_id, relative_path) = copy_of(&catalog, &path);
         let sidecar_before = std::fs::read_to_string(crate::xmp::sidecar_path(&path)).unwrap();
 
@@ -2047,11 +2069,11 @@ mod tests {
             .unwrap();
 
         assert_eq!(outcome.action, "adopt");
-        assert_eq!(outcome.catalog_uuid, "identity-from-the-file");
-        assert_eq!(outcome.previous_sidecar_uuid, "identity-from-the-file");
+        assert_eq!(outcome.catalog_uuid, "0f11e1d0-5a1d-4e00-8f11-e1d0f11e1d00");
+        assert_eq!(outcome.previous_sidecar_uuid, "0f11e1d0-5a1d-4e00-8f11-e1d0f11e1d00");
         assert_eq!(outcome.sidecar_backup, None, "Adopt writes no file, so it backs none up");
-        assert_eq!(photo_uuid(&catalog, photo_id), "identity-from-the-file");
-        assert_ne!(catalog_uuid, "identity-from-the-file", "sanity: it really changed");
+        assert_eq!(photo_uuid(&catalog, photo_id), "0f11e1d0-5a1d-4e00-8f11-e1d0f11e1d00");
+        assert_ne!(catalog_uuid, "0f11e1d0-5a1d-4e00-8f11-e1d0f11e1d00", "sanity: it really changed");
         assert_eq!(
             std::fs::read_to_string(crate::xmp::sidecar_path(&path)).unwrap(),
             sidecar_before,
@@ -2072,7 +2094,7 @@ mod tests {
     fn adopt_requeues_another_copy_still_carrying_the_previous_identity() {
         let (catalog, root, _dir) = temp_catalog("resolve-adopt-other-copies");
         let (photo_id, path, catalog_uuid) =
-            seed_conflicted_copy(&catalog, &root, "primary.arw", "identity-from-the-file");
+            seed_conflicted_copy(&catalog, &root, "primary.arw", "0f11e1d0-5a1d-4e00-8f11-e1d0f11e1d00");
         let (volume_id, relative_path) = copy_of(&catalog, &path);
 
         // A backup copy of the same photo, correctly bound to the catalog's CURRENT uuid.
@@ -2242,7 +2264,7 @@ mod tests {
     fn a_catalog_whose_only_debts_are_conflicts_can_reach_a_clean_terminal_state() {
         let (catalog, root, _dir) = temp_catalog("resolve-clean-terminal");
         let (adopt_id, adopt_path, _) =
-            seed_conflicted_copy(&catalog, &root, "adopt.arw", "uuid-to-adopt");
+            seed_conflicted_copy(&catalog, &root, "adopt.arw", "0add0000-5a1d-4e00-8000-00000000add0");
         let (overwrite_id, overwrite_path, _) =
             seed_conflicted_copy(&catalog, &root, "overwrite.arw", "uuid-to-destroy");
         let (dismiss_id, dismiss_path, _) =
@@ -2432,7 +2454,7 @@ mod tests {
     fn a_resolution_landing_mid_pass_does_not_get_overwritten_by_it() {
         let (catalog, root, _dir) = temp_catalog("repair-vs-resolution");
         let (photo_id, path, _) =
-            seed_conflicted_copy(&catalog, &root, "contested.arw", "identity-from-the-file");
+            seed_conflicted_copy(&catalog, &root, "contested.arw", "0f11e1d0-5a1d-4e00-8f11-e1d0f11e1d00");
         let (volume_id, relative_path) = copy_of(&catalog, &path);
 
         // The pass plans the row and refreshes it, exactly as `run_identity_repair` does.
@@ -2453,7 +2475,7 @@ mod tests {
                 IdentityConflictAction::Adopt,
             )
             .unwrap();
-        assert_eq!(photo_uuid(&catalog, photo_id), "identity-from-the-file");
+        assert_eq!(photo_uuid(&catalog, photo_id), "0f11e1d0-5a1d-4e00-8f11-e1d0f11e1d00");
         assert!(queue_row(&catalog, photo_id, &path).is_none(), "the Adopt cleared the row");
 
         // The pass finishes its IO and tries to record. It must lose.
@@ -2469,7 +2491,7 @@ mod tests {
         );
         assert_eq!(
             photo_uuid(&catalog, photo_id),
-            "identity-from-the-file",
+            "0f11e1d0-5a1d-4e00-8f11-e1d0f11e1d00",
             "the adopted identity must still stand"
         );
     }
@@ -2677,7 +2699,7 @@ mod tests {
     fn the_pass_re_reads_a_plans_value_before_writing_it() {
         let (catalog, root, _dir) = temp_catalog("repair-refreshes-value");
         let (photo_id, path, old_uuid) =
-            seed_conflicted_copy(&catalog, &root, "adopted.arw", "identity-from-the-file");
+            seed_conflicted_copy(&catalog, &root, "adopted.arw", "0f11e1d0-5a1d-4e00-8f11-e1d0f11e1d00");
 
         // A second copy of the same photo, reachable, with nothing in its sidecar yet.
         let other_dir = root.parent().unwrap().join("second-volume-refresh");
@@ -2712,7 +2734,7 @@ mod tests {
                 IdentityConflictAction::Adopt,
             )
             .unwrap();
-        assert_eq!(photo_uuid(&catalog, photo_id), "identity-from-the-file");
+        assert_eq!(photo_uuid(&catalog, photo_id), "0f11e1d0-5a1d-4e00-8f11-e1d0f11e1d00");
 
         // The pass now reaches the second copy. Its plan predates the Adopt.
         assert!(catalog.refresh_identity_repair(&mut other_plan).unwrap());
@@ -2722,7 +2744,7 @@ mod tests {
 
         assert_eq!(
             crate::xmp::read_identifier(&other_path).as_deref(),
-            Some("identity-from-the-file"),
+            Some("0f11e1d0-5a1d-4e00-8f11-e1d0f11e1d00"),
             "the pass wrote the identity the photo had when the page was planned, not the \
              one it has now — the sidecar now carries {old_uuid}, which belongs to nobody"
         );
@@ -2755,7 +2777,7 @@ mod tests {
                 &catalog,
                 &root,
                 &format!("contested-{i}.arw"),
-                &format!("foreign-uuid-{i}"),
+                &format!("f0000000-0000-4000-8000-{i:012}"),
             );
             let (volume_id, relative_path) = copy_of(&catalog, &path);
             copies.push((id, path, volume_id, relative_path));

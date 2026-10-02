@@ -395,6 +395,85 @@ fn moved_file_matches_by_uuid_instead_of_duplicating() {
     assert_eq!(imported.uuid, "known-uuid-123");
 }
 
+/// Issue #141: a sidecar identifier that is not a UUID is another tool's (here a DAM asset
+/// id, in the XMP spec's Bag form, written by hand rather than by ChairPhoto). Two files
+/// carrying the same one must not share a row: before the fix the scan adopted it as the
+/// first file's `photos.uuid` and then re-homed that row onto the second file's path, and
+/// every later scan moved it back. Now each file gets its own minted UUID, the foreign value
+/// stays in both sidecars as a reported conflict, and Adopt refuses to make it an identity.
+#[test]
+fn scan_ignores_a_non_uuid_sidecar_identifier_but_preserves_it() {
+    let (catalog, root) = temp_catalog("non-uuid-identifier");
+    const DAM_ID: &str = "dam:asset/4711";
+    let sidecar = format!(r#"<?xml version="1.0" encoding="UTF-8"?>
+<x:xmpmeta xmlns:x="adobe:ns:meta/">
+ <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+  <rdf:Description rdf:about=""
+    xmlns:xmp="http://ns.adobe.com/xap/1.0/"
+    xmlns:darktable="http://darktable.sf.net/">
+   <xmp:Identifier><rdf:Bag><rdf:li>{DAM_ID}</rdf:li></rdf:Bag></xmp:Identifier>
+   <darktable:history_end>3</darktable:history_end>
+  </rdf:Description>
+ </rdf:RDF>
+</x:xmpmeta>"#);
+    let files = [root.join("a/one.jpg"), root.join("b/two.jpg")];
+    for f in &files {
+        std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+        std::fs::write(f, b"notarealjpeg").unwrap();
+        std::fs::write(chairphoto_core::xmp::sidecar_path(f), &sidecar).unwrap();
+    }
+
+    let abort = chairphoto_core::scanner::never_abort();
+    let rows = |catalog: &Catalog| -> Vec<(i64, String, String)> {
+        let mut rows: Vec<_> = catalog
+            .list_photos(&PhotoQuery::default())
+            .unwrap()
+            .into_iter()
+            .map(|p| (p.id, p.path, p.uuid))
+            .collect();
+        rows.sort_by(|a, b| a.1.cmp(&b.1));
+        rows
+    };
+    chairphoto_core::scanner::scan_folder(&catalog, &root, &abort, &|_| {}).unwrap();
+    let first = rows(&catalog);
+    let paths: Vec<&str> = first.iter().map(|r| r.1.as_str()).collect();
+    assert_eq!(paths, ["a/one.jpg", "b/two.jpg"], "one row per file: {first:?}");
+    for (_, path, uuid) in &first {
+        assert!(chairphoto_core::catalog::is_photo_identity(uuid),
+            "{path} got a minted UUID, not the foreign id: {uuid}");
+    }
+    assert_ne!(first[0].2, first[1].2);
+
+    // A re-scan matches each file to its own row by path: nothing moves.
+    chairphoto_core::scanner::scan_folder(&catalog, &root, &abort, &|_| {}).unwrap();
+    assert_eq!(rows(&catalog), first, "a re-scan must not move rows between the files");
+
+    // The foreign identifier is ignored, not removed: both sidecars still carry it (and the
+    // rest of their content), and each copy is reported as a conflict for a person to decide.
+    for f in &files {
+        assert_eq!(chairphoto_core::xmp::read_identifier(f).as_deref(), Some(DAM_ID));
+        let xml = std::fs::read_to_string(chairphoto_core::xmp::sidecar_path(f)).unwrap();
+        assert!(xml.contains("history_end"), "{xml}");
+    }
+    let pending = catalog.list_pending_identity().unwrap();
+    let conflicts: Vec<_> = pending.iter().filter(|p| p.state == "conflict").collect();
+    assert_eq!(conflicts.len(), 2, "{pending:#?}");
+    assert!(conflicts.iter().all(|p| p.error.contains(DAM_ID)), "{pending:#?}");
+
+    // Adopt would make the foreign id a photo identity; it is refused, and nothing changes.
+    let c = conflicts[0];
+    let err = catalog
+        .resolve_identity_conflict(
+            c.photo_id,
+            c.volume_id,
+            &c.relative_path,
+            chairphoto_core::catalog::IdentityConflictAction::Adopt,
+        )
+        .expect_err("a non-UUID identifier must not be adopted");
+    assert!(err.to_string().contains("not a UUID"), "{err}");
+    assert_eq!(rows(&catalog), first);
+}
+
 #[test]
 fn culling_round_trips() {
     let (catalog, root) = temp_catalog("culling");

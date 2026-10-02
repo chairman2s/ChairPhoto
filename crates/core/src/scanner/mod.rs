@@ -509,7 +509,7 @@ pub(crate) fn upsert_external_one(catalog: &Catalog, path: &Path) -> Result<(i64
     let size = meta.len() as i64;
     let sidecar_uuid = crate::xmp::read_identifier(path);
     let res = catalog
-        .upsert_photo_on_volume(path, mtime_ns, size, sidecar_uuid.as_deref())
+        .upsert_photo_on_volume(path, mtime_ns, size, sidecar_identity(&sidecar_uuid))
         .map_err(|e| e.to_string())?;
     // Same binding invariant as the local scan (see `upsert_one`): bind the identity to
     // the file, or queue a repair. A NAS scan is exactly where this matters — an archive
@@ -969,7 +969,7 @@ fn upsert_one(catalog: &Catalog, path: &Path, folder_id: i64) -> Result<(i64, bo
     // matched to its existing row by UUID rather than duplicated.
     let sidecar_uuid = crate::xmp::read_identifier(path);
     let res = catalog
-        .upsert_photo_with_identity(path, Some(folder_id), mtime_ns, size, sidecar_uuid.as_deref())
+        .upsert_photo_with_identity(path, Some(folder_id), mtime_ns, size, sidecar_identity(&sidecar_uuid))
         .map_err(|e| e.to_string())?;
 
     // Honor the binding invariant: the file's sidecar must carry this photo's UUID so
@@ -983,6 +983,13 @@ fn upsert_one(catalog: &Catalog, path: &Path, folder_id: i64) -> Result<(i64, bo
         eprintln!("scan: couldn't queue identity repair for {}: {e}", path.display());
     }
     Ok((res.id, res.created, res.unchanged))
+}
+
+/// The identity a scan may match or adopt from what a sidecar's `xmp:Identifier` holds: the
+/// value only if it is a UUID (#141). The raw value still goes to `ensure_sidecar_identity`,
+/// which reports anything else as a conflict and leaves it in the sidecar.
+fn sidecar_identity(found: &Option<String>) -> Option<&str> {
+    found.as_deref().filter(|v| crate::catalog::is_photo_identity(v))
 }
 
 /// A 0-byte file — an empty/corrupt placeholder (e.g. a long-ago bad sync). Skipped on

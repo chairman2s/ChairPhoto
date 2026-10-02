@@ -34,7 +34,7 @@
 //! the current one.
 
 use std::path::{Path, PathBuf};
-use xmltree::{Element, Namespace, XMLNode};
+use xmltree::{Element, XMLNode};
 
 use super::{attr_is, child_mut, declare_namespaces, new_root, now, ns_attr, parse_xml, plain,
     sidecar_backup_path, sidecar_path, NS_CHAIRPHOTO, NS_RDF};
@@ -57,7 +57,7 @@ pub(super) enum BackupPolicy {
 /// A parsed (or freshly created) XMP sidecar document, mid-transaction.
 ///
 /// Lifecycle: [`Self::open`] (or [`Self::open_no_backup`]) → zero or more mutations against
-/// [`Self::description_mut`] / [`Self::replace_owned`] / [`Self::declare_extra_namespaces`] →
+/// [`Self::description_mut`] / [`Self::rdf_mut`] / [`Self::replace_owned`] →
 /// [`Self::commit`]. Dropping without calling `commit` writes nothing (matches every existing
 /// writer: an error before the final `std::fs::write` leaves the sidecar untouched).
 pub(super) struct SidecarDocument {
@@ -145,16 +145,10 @@ impl SidecarDocument {
         child_mut(rdf, "rdf", NS_RDF, "Description")
     }
 
-    /// Declare additional namespace prefixes on the Description, beyond the base set `open`
-    /// already declared — used by writers whose properties live outside that base set (the
-    /// face-region writer's `mwg-rs`/`stArea`/`stDim`).
-    pub(super) fn declare_extra_namespaces(&mut self, extra: &[(&str, &str)]) {
-        let desc = self.description_mut();
-        let mut ns = desc.namespaces.take().unwrap_or_else(Namespace::empty);
-        for (prefix, uri) in extra {
-            ns.put(*prefix, *uri);
-        }
-        desc.namespaces = Some(ns);
+    /// The `rdf:RDF` element, for a writer that has to look past the first Description: the
+    /// face-region writer edits `mwg-rs:Regions` in whichever top-level Description holds it.
+    pub(super) fn rdf_mut(&mut self) -> &mut Element {
+        child_mut(&mut self.root, "rdf", NS_RDF, "RDF")
     }
 
     /// Remove every existing Description child matching one of `owned` (namespace, local-name)
@@ -167,20 +161,31 @@ impl SidecarDocument {
     ///
     /// Not used by the face-region writer, which has its own Name+Area matching rule for
     /// deciding what to keep (see `write_face_regions` in `mod.rs`).
+    ///
+    /// The owned properties are removed from **every** top-level `rdf:Description` — exiftool
+    /// writes one per namespace, so a stale value can sit in any of them (#142) — and the
+    /// replacements go into the first.
     pub(super) fn replace_owned(&mut self, owned: &[(&str, &str)], replacements: Vec<XMLNode>) {
-        let desc = self.description_mut();
-        remove_owned(desc, owned);
-        desc.children.extend(replacements);
+        self.remove_owned_everywhere(owned);
+        self.description_mut().children.extend(replacements);
+    }
+
+    fn remove_owned_everywhere(&mut self, owned: &[(&str, &str)]) {
+        for node in &mut self.rdf_mut().children {
+            if let XMLNode::Element(desc) = node {
+                if desc.namespace.as_deref() == Some(NS_RDF) && desc.name == "Description" {
+                    remove_owned(desc, owned);
+                }
+            }
+        }
     }
 
     /// Commit the transaction: re-stamp `chairphoto:LastWrite` (removing any prior instance —
     /// this is the single path every writer's completion timestamp goes through), serialize,
     /// and write the sidecar to disk, creating parent directories as needed.
     pub(super) fn commit(mut self) -> Result<(), String> {
-        let desc = self.description_mut();
-        remove_owned(desc, &[(NS_CHAIRPHOTO, "LastWrite")]);
-        desc.children
-            .push(plain("chairphoto", NS_CHAIRPHOTO, "LastWrite", &now().to_string()));
+        let stamp = plain("chairphoto", NS_CHAIRPHOTO, "LastWrite", &now().to_string());
+        self.replace_owned(&[(NS_CHAIRPHOTO, "LastWrite")], vec![stamp]);
 
         let mut buf = Vec::new();
         self.root.write(&mut buf).map_err(|e| e.to_string())?;

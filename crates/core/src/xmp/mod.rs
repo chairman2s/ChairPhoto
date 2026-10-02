@@ -418,8 +418,9 @@ fn dms_to_decimal(s: &str) -> Option<f64> {
 // with `stArea:w/h` and `stArea:unit='normalized'`.
 //
 // This write is merge-safe like the rest of this module, but with an extra twist: the
-// RegionList may already contain regions written by *other tools* (digiKam etc.). We must
-// replace only the regions chairphoto itself wrote and preserve every foreign region. A
+// RegionList may already contain regions written by *other tools* (digiKam etc.). We edit the
+// existing Regions in place, replace only the regions chairphoto itself wrote and preserve
+// every foreign region; a Regions laid out in a way we do not recognise is not written. A
 // chairphoto-written region is identified by matching its Name against one of the names we
 // are about to write AND its center-Area being within `AREA_EPSILON` of the incoming region
 // — when in doubt we preserve. See AGENTS.md ("XMP Sidecar Convention").
@@ -455,12 +456,23 @@ pub struct ReadRegion {
 /// merge-safely. `oriented_w`/`oriented_h` are the photo's oriented pixel dimensions, written
 /// as `mwg-rs:AppliedToDimensions` (the reference frame the normalized Area coords apply to).
 ///
-/// Merge-safety (binding, AGENTS.md): every foreign region already in the `RegionList` — and
-/// every foreign XML element anywhere in the sidecar — is preserved untouched. Only regions
-/// chairphoto previously wrote (matched by Name + center-Area within [`AREA_EPSILON`]) are
-/// replaced. When `regions` is empty this removes only chairphoto's own regions; a RegionList
-/// that becomes empty of foreign entries is left with an empty Bag (harmless), and if there is
-/// no foreign content and no chairphoto content the whole `Regions` property is dropped.
+/// Merge-safety (binding, AGENTS.md): the existing `mwg-rs:Regions` is edited in place, never
+/// rebuilt. Every foreign region in its `RegionList`, every foreign attribute or child of
+/// `Regions`, `AppliedToDimensions` and the list, and every foreign XML element anywhere else
+/// in the sidecar is preserved. Only regions chairphoto previously wrote (matched by Name +
+/// center-Area within [`AREA_EPSILON`]) are changed, and only in their Area's coordinates:
+/// such a region's other fields and foreign attributes and children stay (#140). Each incoming
+/// region updates at most one existing region. The `Regions` may sit in any top-level
+/// `rdf:Description` (exiftool writes one per namespace), and its struct values may be written
+/// with `rdf:parseType="Resource"`, as a nested `rdf:Description`, or (for
+/// `AppliedToDimensions`) as attributes. The list may be an `rdf:Bag` or an `rdf:Seq`.
+///
+/// A `Regions` this writer does not recognise (two of them, a list in another container, a
+/// struct in a form it cannot read) is **not** written: the write fails with an error and the
+/// sidecar is left as it was. Losing a region another tool wrote is worse than missing ours.
+///
+/// When `regions` is empty nothing in the sidecar's regions changes: there is no region to add,
+/// and a region that matches nothing being written is kept.
 ///
 /// Backs up a pre-existing foreign sidecar once before the first write, mirroring the other
 /// managed-property writers.
@@ -471,45 +483,52 @@ pub fn write_face_regions(
     oriented_h: u32,
 ) -> Result<(), String> {
     let mut doc = SidecarDocument::open(photo_path)?;
-    doc.declare_extra_namespaces(&[
-        ("mwg-rs", NS_MWG_RS),
-        ("stArea", NS_STAREA),
-        ("stDim", NS_STDIM),
-    ]);
 
     // Regions don't fit `replace_owned`'s "strip a fixed set of (ns, name) pairs, push flat
     // replacements" shape: which existing `rdf:li` entries to keep is decided per-entry by
     // Name + center-Area matching (AGENTS.md), not by a static owned-node list. So this writer
     // reaches into the Description directly instead.
-    let desc = doc.description_mut();
-
-    // Split out any existing mwg-rs:Regions element; keep everything else in place.
-    let existing_regions = take_child(desc, NS_MWG_RS, "Regions");
-
-    // Collect the foreign regions we must preserve (those NOT matching an incoming region).
-    let foreign = existing_regions
-        .as_ref()
-        .map(|e| foreign_region_lis(e, regions))
-        .unwrap_or_default();
-
-    // Rebuild the Regions element from foreign + our new ones — unless there is nothing at all.
-    if !foreign.is_empty() || !regions.is_empty() {
-        let mut lis: Vec<XMLNode> = foreign;
-        for r in regions {
-            lis.push(region_li(r));
+    if !regions.is_empty() {
+        let rdf = doc.rdf_mut();
+        let found = find_description_properties(rdf, NS_MWG_RS, "Regions");
+        match found.as_slice() {
+            [] => {
+                let desc = doc.description_mut();
+                declare_region_namespaces(desc);
+                let lis = regions.iter().map(region_li).collect();
+                desc.children.push(XMLNode::Element(new_regions(oriented_w, oriented_h, lis)));
+            }
+            [(d, p)] => {
+                let desc = element_at_mut(rdf, *d);
+                declare_region_namespaces(desc);
+                update_regions(element_at_mut(desc, *p), regions, oriented_w, oriented_h)
+                    .map_err(|why| unrecognised_regions(photo_path, &why))?;
+            }
+            more => {
+                let why = format!("it holds {} mwg-rs:Regions properties", more.len());
+                return Err(unrecognised_regions(photo_path, &why));
+            }
         }
-        desc.children
-            .push(build_regions(oriented_w, oriented_h, lis));
     }
 
     doc.commit()
 }
 
+fn unrecognised_regions(photo_path: &Path, why: &str) -> String {
+    format!(
+        "{}: face regions not written, sidecar left unchanged: {why}, a layout ChairPhoto \
+         does not recognise",
+        sidecar_path(photo_path).display()
+    )
+}
+
 /// Read the MWG face regions (`mwg-rs:Regions`) from the photo's sidecar. Returns each region's
 /// name and its **top-left** normalized bbox (converted from MWG's center form). Regions whose
 /// Area is missing/unparseable are skipped. Returns an empty vec when there is no sidecar or no
-/// Regions property. Tolerant of both the `rdf:parseType="Resource"` and nested-Description
-/// encodings that different tools emit.
+/// Regions property. Reads the layouts [`write_face_regions`] accepts: `Regions` in any
+/// top-level Description; `Regions`, each region and its `Area` as `rdf:parseType="Resource"`,
+/// a nested `rdf:Description`, or attributes; the list as an `rdf:Bag` or `rdf:Seq`. A
+/// `Regions` in any other layout is skipped.
 pub fn read_face_regions(photo_path: &Path) -> Vec<ReadRegion> {
     let path = sidecar_path(photo_path);
     let Ok(file) = std::fs::File::open(&path) else {
@@ -522,23 +541,15 @@ pub fn read_face_regions(photo_path: &Path) -> Vec<ReadRegion> {
         return Vec::new();
     };
     let mut out = Vec::new();
-    for node in &rdf.children {
-        let XMLNode::Element(desc) = node else { continue };
-        if desc.name != "Description" {
-            continue;
-        }
-        let Some(regions) = child(desc, NS_MWG_RS, "Regions") else {
+    for (d, p) in find_description_properties(rdf, NS_MWG_RS, "Regions") {
+        let regions = element_at(element_at(rdf, d), p);
+        let Ok(RegionsLayout { list: Some((l, c)), .. }) = regions_layout(regions) else {
             continue;
         };
-        // RegionList → rdf:Bag → rdf:li (each an Area-bearing region struct).
-        let Some(region_list) = mwg_child(regions, "RegionList") else {
-            continue;
-        };
-        let Some(bag) = region_list.get_child(("Bag", NS_RDF)) else {
-            continue;
-        };
-        for li in bag.children.iter().filter_map(node_element) {
-            if li.name != "li" {
+        let body = struct_body(regions).expect("regions_layout checked the form");
+        let container = element_at(element_at(body, l), c);
+        for li in container.children.iter().filter_map(node_element) {
+            if !is_rdf(li, "li") {
                 continue;
             }
             if let Some(r) = parse_region_li(li) {
@@ -573,28 +584,284 @@ pub fn region_iou(a: (f32, f32, f32, f32), b: (f32, f32, f32, f32)) -> f32 {
 
 // --- MWG region element construction & parsing ----------------------------
 
-/// Build a full `mwg-rs:Regions` element with AppliedToDimensions + a RegionList Bag of `lis`.
-fn build_regions(w: u32, h: u32, lis: Vec<XMLNode>) -> XMLNode {
-    // AppliedToDimensions as an rdf:parseType="Resource" struct: stDim:w / stDim:h / stDim:unit.
-    let mut dims = el("mwg-rs", NS_MWG_RS, "AppliedToDimensions");
-    dims.attributes
-        .insert("rdf:parseType".to_string(), "Resource".to_string());
-    dims.children.push(plain("stDim", NS_STDIM, "w", &w.to_string()));
-    dims.children.push(plain("stDim", NS_STDIM, "h", &h.to_string()));
-    dims.children.push(plain("stDim", NS_STDIM, "unit", "pixel"));
+/// The prefixes the region elements chairphoto builds are written with, declared on the
+/// Description that holds (or will hold) `mwg-rs:Regions`. A prefix the file already binds is
+/// left alone.
+fn declare_region_namespaces(desc: &mut Element) {
+    let ns = desc.namespaces.get_or_insert_with(Namespace::empty);
+    ns.put("rdf", NS_RDF);
+    ns.put("mwg-rs", NS_MWG_RS);
+    ns.put("stArea", NS_STAREA);
+    ns.put("stDim", NS_STDIM);
+}
 
-    let mut bag = el("rdf", NS_RDF, "Bag");
-    bag.children.extend(lis);
-    let mut region_list = el("mwg-rs", NS_MWG_RS, "RegionList");
-    region_list.children.push(XMLNode::Element(bag));
-
+/// A new `mwg-rs:Regions` element with AppliedToDimensions + a RegionList Bag of `lis`, for a
+/// sidecar that has none.
+fn new_regions(w: u32, h: u32, lis: Vec<XMLNode>) -> Element {
     let mut regions = el("mwg-rs", NS_MWG_RS, "Regions");
     regions
         .attributes
         .insert("rdf:parseType".to_string(), "Resource".to_string());
-    regions.children.push(XMLNode::Element(dims));
-    regions.children.push(XMLNode::Element(region_list));
-    XMLNode::Element(regions)
+    regions.children.push(XMLNode::Element(new_dimensions(w, h)));
+    regions.children.push(XMLNode::Element(new_region_list(lis)));
+    regions
+}
+
+/// AppliedToDimensions as an rdf:parseType="Resource" struct: stDim:w / stDim:h / stDim:unit.
+fn new_dimensions(w: u32, h: u32) -> Element {
+    let mut dims = el("mwg-rs", NS_MWG_RS, "AppliedToDimensions");
+    dims.attributes
+        .insert("rdf:parseType".to_string(), "Resource".to_string());
+    for (field, value) in dimension_fields(w, h) {
+        dims.children.push(plain("stDim", NS_STDIM, field, &value));
+    }
+    dims
+}
+
+fn dimension_fields(w: u32, h: u32) -> [(&'static str, String); 3] {
+    [("w", w.to_string()), ("h", h.to_string()), ("unit", "pixel".to_string())]
+}
+
+fn new_region_list(lis: Vec<XMLNode>) -> Element {
+    let mut bag = el("rdf", NS_RDF, "Bag");
+    bag.children.extend(lis);
+    let mut region_list = el("mwg-rs", NS_MWG_RS, "RegionList");
+    region_list.children.push(XMLNode::Element(bag));
+    region_list
+}
+
+/// Where the parts of an existing `mwg-rs:Regions` the writer edits sit, as child indices into
+/// the Regions struct's body (see [`struct_body`]). Built by [`regions_layout`], which is
+/// also the check that the Regions is one chairphoto recognises.
+struct RegionsLayout {
+    /// `mwg-rs:AppliedToDimensions`, if present.
+    dims: Option<usize>,
+    /// `mwg-rs:RegionList`, if present, and its container (`rdf:Bag` / `rdf:Seq`) within it.
+    list: Option<(usize, usize)>,
+}
+
+/// Check that `regions` is laid out the way chairphoto can edit without losing anything, and
+/// say where its parts are. `Err` names what was not recognised.
+fn regions_layout(regions: &Element) -> Result<RegionsLayout, String> {
+    let body = match struct_form(regions) {
+        Some(StructForm::Resource | StructForm::Nested(_)) => {
+            struct_body(regions).expect("form checked")
+        }
+        Some(StructForm::Attributes) => return Err("mwg-rs:Regions is in attribute form".into()),
+        None => return Err("mwg-rs:Regions is not a struct".into()),
+    };
+    if body
+        .attributes
+        .keys()
+        .any(|k| attr_is(body, k, NS_MWG_RS, "RegionList")
+            || attr_is(body, k, NS_MWG_RS, "AppliedToDimensions"))
+    {
+        return Err("mwg-rs:Regions carries a list or dimensions as an attribute".into());
+    }
+    let mut layout = RegionsLayout { dims: None, list: None };
+    for (i, node) in body.children.iter().enumerate() {
+        let XMLNode::Element(e) = node else { continue };
+        if e.namespace.as_deref() != Some(NS_MWG_RS) {
+            continue;
+        }
+        match e.name.as_str() {
+            "AppliedToDimensions" => {
+                if layout.dims.is_some() {
+                    return Err("mwg-rs:Regions has two AppliedToDimensions".into());
+                }
+                if struct_form(e).is_none() {
+                    return Err("its AppliedToDimensions is not a struct".into());
+                }
+                layout.dims = Some(i);
+            }
+            "RegionList" => {
+                if layout.list.is_some() {
+                    return Err("mwg-rs:Regions has two RegionLists".into());
+                }
+                layout.list = Some((i, region_container(e)?));
+            }
+            _ => {}
+        }
+    }
+    Ok(layout)
+}
+
+/// The index of the `rdf:Bag` (or `rdf:Seq`) a `mwg-rs:RegionList` holds its regions in. Any
+/// other shape (no container, another container, a container next to other content) is `Err`.
+fn region_container(list: &Element) -> Result<usize, String> {
+    if has_text(list) || list.attributes.keys().any(|k| attr_ns(list, k) == Some(NS_RDF)) {
+        return Err("its RegionList is not an rdf:Bag".into());
+    }
+    let elements: Vec<(usize, &Element)> = element_children(list).collect();
+    match elements.as_slice() {
+        [(i, c)] if is_rdf(c, "Bag") || is_rdf(c, "Seq") => Ok(*i),
+        [(_, c)] => Err(format!("its RegionList holds {{{}}}{}, not an rdf:Bag",
+            c.namespace.as_deref().unwrap_or(""), c.name)),
+        [] => Err("its RegionList holds no rdf:Bag".into()),
+        _ => Err("its RegionList holds more than one element".into()),
+    }
+}
+
+/// Edit an existing, recognised `mwg-rs:Regions` in place: refresh AppliedToDimensions' own
+/// fields, move each region chairphoto wrote that an incoming one matches to the incoming
+/// geometry (see [`set_region_area`]), and append the incoming regions that matched none.
+/// Everything else on Regions, AppliedToDimensions, RegionList and its container is kept.
+fn update_regions(
+    regions: &mut Element,
+    incoming: &[FaceRegion],
+    w: u32,
+    h: u32,
+) -> Result<(), String> {
+    let layout = regions_layout(regions)?;
+    let body = struct_body_mut(regions).expect("regions_layout checked the form");
+    match layout.list {
+        Some((l, c)) => {
+            let container = element_at_mut(element_at_mut(body, l), c);
+            // Each incoming region updates at most one existing region it matches, in place
+            // (#140); the rest are appended.
+            let mut written = vec![false; incoming.len()];
+            for node in &mut container.children {
+                let XMLNode::Element(li) = node else { continue };
+                if !is_rdf(li, "li") {
+                    continue;
+                }
+                if let Some(k) = matching_region(li, incoming, &written) {
+                    written[k] = true;
+                    set_region_area(li, &incoming[k]);
+                }
+            }
+            let new = incoming.iter().zip(&written).filter(|(_, w)| !**w);
+            container.children.extend(new.map(|(r, _)| region_li(r)));
+        }
+        None => {
+            let lis = incoming.iter().map(region_li).collect();
+            body.children.push(XMLNode::Element(new_region_list(lis)));
+        }
+    }
+    // Last: inserting moves the indices `layout` recorded.
+    match layout.dims {
+        Some(i) => set_struct_fields(element_at_mut(body, i), NS_STDIM, "stDim",
+            &dimension_fields(w, h)),
+        None => body.children.insert(0, XMLNode::Element(new_dimensions(w, h))),
+    }
+    Ok(())
+}
+
+/// How a struct-valued property element (`Regions`, `AppliedToDimensions`, a region `rdf:li`,
+/// an `Area`) carries its fields in RDF/XML.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum StructForm {
+    /// `rdf:parseType="Resource"`: the fields are the element's own children.
+    Resource,
+    /// The fields are attributes on the element itself, which has no children.
+    Attributes,
+    /// The fields are on the element's one child, an `rdf:Description` (at this child index).
+    Nested(usize),
+}
+
+/// How `prop` carries a struct, or `None` if it does not carry one in a form chairphoto reads
+/// (text, an `rdf:resource` reference, another parseType, several node elements, …).
+fn struct_form(prop: &Element) -> Option<StructForm> {
+    if has_text(prop) {
+        return None;
+    }
+    match ns_attr(prop, NS_RDF, "parseType") {
+        Some("Resource") => return Some(StructForm::Resource),
+        Some(_) => return None,
+        None => {}
+    }
+    let mut rdf_attrs = prop.attributes.keys().filter(|k| attr_ns(prop, k) == Some(NS_RDF));
+    if rdf_attrs.next().is_some() {
+        return None; // rdf:resource, rdf:nodeID, rdf:datatype: not an inline struct
+    }
+    let elements: Vec<(usize, &Element)> = element_children(prop).collect();
+    match elements.as_slice() {
+        [] if prop.attributes.keys().any(|k| attr_ns(prop, k).is_some()) => {
+            Some(StructForm::Attributes)
+        }
+        [(i, d)] if is_rdf(d, "Description") => Some(StructForm::Nested(*i)),
+        _ => None,
+    }
+}
+
+/// The element that holds `prop`'s struct fields: `prop` itself, or its nested Description.
+fn struct_body(prop: &Element) -> Option<&Element> {
+    match struct_form(prop)? {
+        StructForm::Resource | StructForm::Attributes => Some(prop),
+        StructForm::Nested(i) => Some(element_at(prop, i)),
+    }
+}
+
+fn struct_body_mut(prop: &mut Element) -> Option<&mut Element> {
+    match struct_form(prop)? {
+        StructForm::Resource | StructForm::Attributes => Some(prop),
+        StructForm::Nested(i) => Some(element_at_mut(prop, i)),
+    }
+}
+
+/// A struct field's text, whether written as an attribute or as a child element.
+fn struct_field(body: &Element, ns: &str, local: &str) -> Option<String> {
+    if let Some(v) = ns_attr(body, ns, local) {
+        if !v.trim().is_empty() {
+            return Some(v.trim().to_string());
+        }
+    }
+    child(body, ns, local).and_then(first_text)
+}
+
+/// Set `fields` of the struct `prop` carries, in place and in the form each is already written
+/// in (attribute or element). A field it lacks is added in the struct's own form. Every other
+/// attribute and child is kept. `prop` must be a struct ([`struct_form`] is `Some`).
+fn set_struct_fields(prop: &mut Element, ns: &str, prefix: &str, fields: &[(&str, String)]) {
+    let form = struct_form(prop).expect("caller checked the struct form");
+    let body = struct_body_mut(prop).expect("caller checked the struct form");
+    for (local, value) in fields {
+        let mut found = false;
+        let keys: Vec<String> = body
+            .attributes
+            .keys()
+            .filter(|k| attr_is(body, k, ns, local))
+            .cloned()
+            .collect();
+        for key in keys {
+            body.attributes.insert(key, value.clone());
+            found = true;
+        }
+        for node in &mut body.children {
+            if let XMLNode::Element(e) = node {
+                if e.namespace.as_deref() == Some(ns) && e.name == *local {
+                    e.children = vec![XMLNode::Text(value.clone())];
+                    found = true;
+                }
+            }
+        }
+        if !found {
+            let p = prefix_for(body, ns, prefix);
+            if form == StructForm::Attributes {
+                body.attributes.insert(format!("{p}:{local}"), value.clone());
+            } else {
+                body.children.push(plain(&p, ns, local, value));
+            }
+        }
+    }
+}
+
+/// A prefix that names `ns` where `e` is written: one `e`'s in-scope namespaces already bind to
+/// it, else `preferred` (or `preferred` plus a number, if that prefix means something else
+/// there), declared on `e`.
+fn prefix_for(e: &mut Element, ns: &str, preferred: &str) -> String {
+    let map = e.namespaces.get_or_insert_with(Namespace::empty);
+    if let Some((p, _)) = map.iter().find(|(p, uri)| *uri == ns && !p.is_empty()) {
+        return p.to_string();
+    }
+    let mut p = preferred.to_string();
+    let mut n = 1;
+    while map.get(&p).is_some() {
+        p = format!("{preferred}{n}");
+        n += 1;
+    }
+    map.put(p.clone(), ns);
+    p
 }
 
 /// Build one `rdf:li` region struct for a face: Name + Type=Face + center-form Area.
@@ -623,37 +890,46 @@ fn region_li(r: &FaceRegion) -> XMLNode {
     XMLNode::Element(li)
 }
 
-/// Return the `rdf:li` children of an existing Regions element that chairphoto did NOT write,
-/// i.e. that must be preserved. A li is considered "ours" (and thus dropped, to be re-added
-/// fresh) when its Name matches one of the incoming region names AND its center-Area is within
-/// [`AREA_EPSILON`] of that region's center. When in doubt, the li is preserved.
-fn foreign_region_lis(regions: &Element, incoming: &[FaceRegion]) -> Vec<XMLNode> {
-    let Some(region_list) = mwg_child(regions, "RegionList") else {
-        return Vec::new();
-    };
-    let Some(bag) = region_list.get_child(("Bag", NS_RDF)) else {
-        return Vec::new();
-    };
-    let mut kept = Vec::new();
-    for node in &bag.children {
-        let XMLNode::Element(li) = node else { continue };
-        if li.name != "li" {
-            // Preserve any non-li node verbatim (defensive; shouldn't normally occur).
-            kept.push(node.clone());
-            continue;
-        }
-        let parsed = parse_region_li(li);
-        let is_ours = parsed.as_ref().is_some_and(|p| {
-            incoming.iter().any(|r| {
-                r.name == p.name
-                    && center_close(r.bbox, p.bbox)
-            })
-        });
-        if !is_ours {
-            kept.push(node.clone());
-        }
-    }
-    kept
+/// The index of the incoming region that region `li` is chairphoto's earlier write of, if any:
+/// its Name matches that region's AND its center-Area is within [`AREA_EPSILON`] of that
+/// region's center. Regions already marked in `taken` are skipped, so each incoming region
+/// claims at most one existing one. A li that does not parse matches nothing: when in doubt,
+/// it is preserved.
+fn matching_region(li: &Element, incoming: &[FaceRegion], taken: &[bool]) -> Option<usize> {
+    let p = parse_region_li(li)?;
+    incoming
+        .iter()
+        .zip(taken)
+        .position(|(r, taken)| !taken && r.name == p.name && center_close(r.bbox, p.bbox))
+}
+
+/// Move a matched region to `r`'s geometry, in place (#140). ChairPhoto owns only the Area's
+/// `stArea:x/y/w/h/unit`: the Name already equals `r.name` (that is how it matched), and its
+/// Type, any other field (`mwg-rs:Rotation`, extensions) and every foreign attribute of the
+/// region or its Area (`digiKam:Confidence`, …) are kept. `li` parsed, so its struct and Area
+/// forms are ones [`set_struct_fields`] can edit.
+fn set_region_area(li: &mut Element, r: &FaceRegion) {
+    let (x, y, w, h) = r.bbox;
+    // Convert stored top-left (x,y = corner) → MWG center (cx,cy = center).
+    let fields = [
+        ("x", fmt_coord(x + w / 2.0)),
+        ("y", fmt_coord(y + h / 2.0)),
+        ("w", fmt_coord(w)),
+        ("h", fmt_coord(h)),
+        ("unit", "normalized".to_string()),
+    ];
+    let body = struct_body_mut(li).expect("the region parsed");
+    let area = body
+        .children
+        .iter_mut()
+        .find_map(|n| match n {
+            XMLNode::Element(e) if e.namespace.as_deref() == Some(NS_MWG_RS) && e.name == "Area" => {
+                Some(e)
+            }
+            _ => None,
+        })
+        .expect("the region parsed, so it has an Area");
+    set_struct_fields(area, NS_STAREA, "stArea", &fields);
 }
 
 /// True if two top-left bboxes have centers within [`AREA_EPSILON`] on both axes.
@@ -668,14 +944,14 @@ fn center_close(a: (f32, f32, f32, f32), b: (f32, f32, f32, f32)) -> bool {
 /// Parse one region `rdf:li` into a [`ReadRegion`] (Name + top-left bbox from the center Area).
 /// Returns `None` if the Area is missing or its coordinates are unparseable.
 fn parse_region_li(li: &Element) -> Option<ReadRegion> {
-    let name = mwg_child(li, "Name")
-        .and_then(first_text)
-        .unwrap_or_default();
-    let area = mwg_child(li, "Area")?;
-    let cx: f32 = starea_value(area, "x")?;
-    let cy: f32 = starea_value(area, "y")?;
-    let w: f32 = starea_value(area, "w")?;
-    let h: f32 = starea_value(area, "h")?;
+    let body = struct_body(li)?;
+    let name = struct_field(body, NS_MWG_RS, "Name").unwrap_or_default();
+    let area = struct_body(child(body, NS_MWG_RS, "Area")?)?;
+    let coord = |field| struct_field(area, NS_STAREA, field)?.parse::<f32>().ok();
+    let cx = coord("x")?;
+    let cy = coord("y")?;
+    let w = coord("w")?;
+    let h = coord("h")?;
     // MWG stores the CENTER; convert to top-left corner.
     let x = cx - w / 2.0;
     let y = cy - h / 2.0;
@@ -683,36 +959,6 @@ fn parse_region_li(li: &Element) -> Option<ReadRegion> {
         name,
         bbox: (x, y, w, h),
     })
-}
-
-/// Read a numeric `stArea:<field>` from an Area element, whether encoded as an attribute
-/// (`rdf:parseType="Resource"` compact form uses child elements; the shorthand form uses
-/// attributes) or as a child element.
-fn starea_value(area: &Element, field: &str) -> Option<f32> {
-    // Attribute (shorthand) form: stArea:x="0.5".
-    if let Some(v) = ns_attr(area, NS_STAREA, field) {
-        if let Ok(n) = v.trim().parse::<f32>() {
-            return Some(n);
-        }
-    }
-    // Child-element form.
-    for node in &area.children {
-        if let XMLNode::Element(e) = node {
-            if e.namespace.as_deref() == Some(NS_STAREA) && e.name == field {
-                if let Some(t) = first_text(e) {
-                    if let Ok(n) = t.trim().parse::<f32>() {
-                        return Some(n);
-                    }
-                }
-            }
-        }
-    }
-    None
-}
-
-/// Find a direct child by the mwg-rs namespace + local name.
-fn mwg_child<'a>(parent: &'a Element, name: &str) -> Option<&'a Element> {
-    child(parent, NS_MWG_RS, name)
 }
 
 /// Find a direct child element by (namespace, name).
@@ -723,19 +969,54 @@ fn child<'a>(parent: &'a Element, ns: &str, name: &str) -> Option<&'a Element> {
     })
 }
 
-/// Remove and return a direct child element of `parent` by (namespace, name), if present.
-fn take_child(parent: &mut Element, ns: &str, name: &str) -> Option<Element> {
-    let pos = parent.children.iter().position(|n| {
-        matches!(n, XMLNode::Element(e)
-            if e.namespace.as_deref() == Some(ns) && e.name == name)
-    })?;
-    match parent.children.remove(pos) {
-        XMLNode::Element(e) => Some(e),
-        other => {
-            parent.children.insert(pos, other);
-            None
+/// Every `{ns}name` property element on every top-level `rdf:Description` under `rdf`, as
+/// (Description index in `rdf.children`, property index in that Description's children).
+fn find_description_properties(rdf: &Element, ns: &str, name: &str) -> Vec<(usize, usize)> {
+    let mut found = Vec::new();
+    for (d, desc) in element_children(rdf) {
+        if !is_rdf(desc, "Description") {
+            continue;
+        }
+        for (p, prop) in element_children(desc) {
+            if prop.namespace.as_deref() == Some(ns) && prop.name == name {
+                found.push((d, p));
+            }
         }
     }
+    found
+}
+
+/// The element children of `parent`, with their index in `parent.children`.
+fn element_children(parent: &Element) -> impl Iterator<Item = (usize, &Element)> {
+    parent.children.iter().enumerate().filter_map(|(i, n)| match n {
+        XMLNode::Element(e) => Some((i, e)),
+        _ => None,
+    })
+}
+
+/// The element at `parent.children[i]`; `i` came from [`element_children`] on the same tree.
+fn element_at(parent: &Element, i: usize) -> &Element {
+    match &parent.children[i] {
+        XMLNode::Element(e) => e,
+        _ => unreachable!("index {i} was taken from an element child"),
+    }
+}
+
+fn element_at_mut(parent: &mut Element, i: usize) -> &mut Element {
+    match &mut parent.children[i] {
+        XMLNode::Element(e) => e,
+        _ => unreachable!("index {i} was taken from an element child"),
+    }
+}
+
+fn is_rdf(e: &Element, name: &str) -> bool {
+    e.namespace.as_deref() == Some(NS_RDF) && e.name == name
+}
+
+/// True when `e` holds non-whitespace character data (it is a literal, not a struct or array).
+fn has_text(e: &Element) -> bool {
+    e.children.iter().any(|n| matches!(n,
+        XMLNode::Text(t) | XMLNode::CData(t) if !t.trim().is_empty()))
 }
 
 fn node_element(n: &XMLNode) -> Option<&Element> {
@@ -836,6 +1117,13 @@ fn attr_is(e: &Element, key: &str, ns: &str, local: &str) -> bool {
         return false; // an unprefixed attribute is in no namespace
     };
     name == local && e.namespaces.as_ref().and_then(|n| n.get(prefix)) == Some(ns)
+}
+
+/// The namespace URI of attribute key `key` on `e` (as [`parse_xml`] stores it), or `None` for
+/// an unprefixed attribute or an unbound prefix.
+fn attr_ns<'a>(e: &'a Element, key: &str) -> Option<&'a str> {
+    let (prefix, _) = key.split_once(':')?;
+    e.namespaces.as_ref()?.get(prefix)
 }
 
 /// The value of attribute `{ns}local` on `e`, whatever prefix the file bound `ns` to.
@@ -2021,5 +2309,508 @@ mod tests {
         assert!(has(NS_XMP, "Rating"), "a property no writer owns must survive:\n{xml}");
         assert_eq!(xml.matches("Oslo").count(), 0, "{xml}");
         assert_eq!(xml.matches("<photoshop:City>Trondheim</photoshop:City>").count(), 1, "{xml}");
+    }
+
+    /// Issue #142: exiftool writes one `rdf:Description` per namespace, so an owned property
+    /// can sit in any of them, as an element or in compact attribute form. The identifier,
+    /// IPTC and GPS writers must remove every stale instance, not only the first
+    /// Description's, and write exactly one value — while every property they do not own,
+    /// in every Description, survives.
+    #[test]
+    fn writers_replace_owned_properties_in_every_description() {
+        let dir = crate::test_support::TestTmpDir::new("xmp-142-multi-desc");
+        let photo = dir.join("DSC142.ARW");
+        std::fs::write(&photo, b"raw").unwrap();
+        // Hand-written in exiftool's shape: single quotes, one Description per namespace.
+        std::fs::write(sidecar_path(&photo), r#"<?xpacket begin='' id='W5M0MpCehiHzreSzNTczkc9d'?>
+<x:xmpmeta xmlns:x='adobe:ns:meta/' x:xmptk='Image::ExifTool 12.76'>
+<rdf:RDF xmlns:rdf='http://www.w3.org/1999/02/22-rdf-syntax-ns#'>
+ <rdf:Description rdf:about='' xmlns:dc='http://purl.org/dc/elements/1.1/'>
+  <dc:format>image/x-sony-arw</dc:format>
+ </rdf:Description>
+ <rdf:Description rdf:about='' xmlns:exif='http://ns.adobe.com/exif/1.0/'>
+  <exif:ExposureTime>1/250</exif:ExposureTime>
+  <exif:GPSLatitude>59,54.834000N</exif:GPSLatitude>
+  <exif:GPSLongitude>10,45.132000E</exif:GPSLongitude>
+ </rdf:Description>
+ <rdf:Description rdf:about='' xmlns:photoshop='http://ns.adobe.com/photoshop/1.0/'
+  photoshop:City='Oslo' photoshop:Instructions='keep'/>
+ <rdf:Description rdf:about='' xmlns:xmp='http://ns.adobe.com/xap/1.0/'>
+  <xmp:Identifier>
+   <rdf:Bag><rdf:li>dam:asset/4711</rdf:li></rdf:Bag>
+  </xmp:Identifier>
+  <xmp:Rating>3</xmp:Rating>
+ </rdf:Description>
+</rdf:RDF>
+</x:xmpmeta>
+<?xpacket end='w'?>"#).unwrap();
+
+        let uuid = "6f1c1f0e-8f5e-4a51-9a51-3c1b2a0d1420";
+        overwrite_identifier(&photo, uuid).unwrap();
+        write_iptc(&photo, &IptcFields { city: "Trondheim".into(), ..Default::default() })
+            .unwrap();
+        write_gps(&photo, 63.4305, 10.3951).unwrap();
+
+        let xml = read(&sidecar_path(&photo));
+        let attrs = namespaced_attributes(&xml);
+        let compact = |ns: &str, local: &str| attrs.iter().filter(|a| a.2 == ns && a.3 == local).count();
+        let elements = namespaced_elements(&xml);
+        let texts = |ns: &str, local: &str| -> Vec<String> {
+            elements
+                .iter()
+                .filter(|e| e.name.0 == ns && e.name.1 == local)
+                .map(|e| e.text.clone())
+                .collect()
+        };
+        // Exactly one value of each owned property, ChairPhoto's, in element form.
+        assert_eq!(texts(NS_XMP, "Identifier"), [uuid], "{xml}");
+        assert_eq!(compact(NS_XMP, "Identifier"), 0, "{xml}");
+        assert!(!xml.contains("dam:asset/4711"), "the overwritten identifier lingers:\n{xml}");
+        assert_eq!(texts(NS_PHOTOSHOP, "City"), ["Trondheim"], "{xml}");
+        assert_eq!(compact(NS_PHOTOSHOP, "City"), 0, "stale compact City kept:\n{xml}");
+        assert_eq!(texts(NS_EXIF, "GPSLatitude"), ["63,25.830000N"], "{xml}");
+        assert_eq!(texts(NS_EXIF, "GPSLongitude"), ["10,23.706000E"], "{xml}");
+        assert_eq!(read_identifier(&photo).as_deref(), Some(uuid));
+        let (lat, lng) = read_gps(&photo).unwrap();
+        assert!((lat - 63.4305).abs() < 1e-6 && (lng - 10.3951).abs() < 1e-6, "{lat},{lng}");
+        // What no writer owns survives in its own Description.
+        assert_eq!(texts(NS_DC, "format"), ["image/x-sony-arw"], "{xml}");
+        assert_eq!(texts(NS_EXIF, "ExposureTime"), ["1/250"], "{xml}");
+        assert_eq!(texts(NS_XMP, "Rating"), ["3"], "{xml}");
+        assert_eq!(compact(NS_PHOTOSHOP, "Instructions"), 1, "{xml}");
+        assert_eq!(texts(NS_CHAIRPHOTO, "LastWrite").len(), 1, "{xml}");
+    }
+
+    /// Issue #143 item 4: owned compact properties are recognised by namespace URI, never by
+    /// local name or prefix. A foreign namespace may use an owned local name (`foo:Identifier`,
+    /// `foo:City`): those attributes are not ours and must survive. An owned namespace may be
+    /// bound to a non-canonical prefix (`xap:` for xmp, `ps:` for photoshop): those attributes
+    /// are ours and must go. Before this test, `attr_is` ignoring the namespace passed every
+    /// test in this module.
+    #[test]
+    fn compact_owned_properties_are_matched_by_namespace_not_local_name() {
+        let dir = crate::test_support::TestTmpDir::new("xmp-143-attr-ns");
+        let photo = dir.join("DSC143.ARW");
+        std::fs::write(&photo, b"raw").unwrap();
+        std::fs::write(sidecar_path(&photo), r#"<?xml version="1.0" encoding="UTF-8"?>
+<x:xmpmeta xmlns:x="adobe:ns:meta/">
+ <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+  <rdf:Description rdf:about=""
+    xmlns:foo="urn:example:foreign"
+    xmlns:xap="http://ns.adobe.com/xap/1.0/"
+    xmlns:ps="http://ns.adobe.com/photoshop/1.0/"
+    foo:Identifier="keep-me" foo:City="keep-city"
+    xap:Identifier="drop-me" ps:City="Oslo"/>
+ </rdf:RDF>
+</x:xmpmeta>"#).unwrap();
+        assert_eq!(read_identifier(&photo).as_deref(), Some("drop-me"),
+            "the identifier is read by namespace, whatever its prefix");
+
+        let uuid = "6f1c1f0e-8f5e-4a51-9a51-3c1b2a0d1430";
+        overwrite_identifier(&photo, uuid).unwrap();
+        write_iptc(&photo, &IptcFields { city: "Trondheim".into(), ..Default::default() })
+            .unwrap();
+
+        let xml = read(&sidecar_path(&photo));
+        let desc = (NS_RDF, "Description");
+        assert!(has_attr(&xml, desc, (NS_FOREIGN, "Identifier"), "keep-me"),
+            "a foreign attribute with an owned local name was removed:\n{xml}");
+        assert!(has_attr(&xml, desc, (NS_FOREIGN, "City"), "keep-city"),
+            "a foreign attribute with an owned local name was removed:\n{xml}");
+        let attrs = namespaced_attributes(&xml);
+        let compact = |ns: &str, local: &str| attrs.iter().any(|a| a.2 == ns && a.3 == local);
+        assert!(!compact(NS_XMP, "Identifier"), "xap:Identifier is ours and was kept:\n{xml}");
+        assert!(!compact(NS_PHOTOSHOP, "City"), "ps:City is ours and was kept:\n{xml}");
+        assert_eq!(read_identifier(&photo).as_deref(), Some(uuid), "{xml}");
+        assert_eq!(element_text(&xml, desc, (NS_PHOTOSHOP, "City")).as_deref(),
+            Some("Trondheim"), "{xml}");
+    }
+
+    // ── face regions in layouts other tools write (issue #139) ─────────────
+
+    const NS_FOREIGN: &str = "urn:example:foreign";
+
+    /// One element as an independent namespace-aware reader (xml-rs, not ChairPhoto's parser)
+    /// sees it: its parent's `{ns}local`, its own, and its direct non-blank text.
+    #[derive(Debug)]
+    struct SeenElement {
+        parent: (String, String),
+        name: (String, String),
+        text: String,
+    }
+
+    fn namespaced_elements(xml: &str) -> Vec<SeenElement> {
+        use xml::reader::{EventReader, XmlEvent};
+        let mut out: Vec<SeenElement> = Vec::new();
+        let mut open: Vec<usize> = Vec::new();
+        for ev in EventReader::new(xml.as_bytes()) {
+            match ev.unwrap_or_else(|e| panic!("sidecar is not well-formed XML: {e}\n{xml}")) {
+                XmlEvent::StartElement { name, .. } => {
+                    let parent = open.last().map(|&i| out[i].name.clone()).unwrap_or_default();
+                    let name = (name.namespace.unwrap_or_default(), name.local_name);
+                    open.push(out.len());
+                    out.push(SeenElement { parent, name, text: String::new() });
+                }
+                XmlEvent::Characters(t) => {
+                    if let Some(&i) = open.last() {
+                        out[i].text.push_str(t.trim());
+                    }
+                }
+                XmlEvent::EndElement { .. } => {
+                    open.pop();
+                }
+                _ => {}
+            }
+        }
+        out
+    }
+
+    fn count_elements(xml: &str, ns: &str, local: &str) -> usize {
+        namespaced_elements(xml)
+            .iter()
+            .filter(|e| e.name.0 == ns && e.name.1 == local)
+            .count()
+    }
+
+    /// The text of the one `{ns}local` element whose parent is `{parent_ns}parent`.
+    fn element_text(xml: &str, parent: (&str, &str), name: (&str, &str)) -> Option<String> {
+        let seen = namespaced_elements(xml);
+        let mut hits = seen.iter().filter(|e| {
+            e.parent.0 == parent.0 && e.parent.1 == parent.1 && e.name.0 == name.0
+                && e.name.1 == name.1
+        });
+        let hit = hits.next()?;
+        assert!(hits.next().is_none(), "more than one {name:?} under {parent:?}\n{xml}");
+        Some(hit.text.clone())
+    }
+
+    fn has_attr(xml: &str, el: (&str, &str), attr: (&str, &str), value: &str) -> bool {
+        namespaced_attributes(xml).iter().any(|(e_ns, e_l, a_ns, a_l, v)| {
+            e_ns == el.0 && e_l == el.1 && a_ns == attr.0 && a_l == attr.1 && v == value
+        })
+    }
+
+    fn region_names(photo: &Path) -> Vec<String> {
+        let mut names: Vec<String> = read_face_regions(photo).into_iter().map(|r| r.name).collect();
+        names.sort();
+        names
+    }
+
+    fn seeded_photo(tag: &str, sidecar: &str) -> (crate::test_support::TestTmpDir, PathBuf) {
+        let dir = crate::test_support::TestTmpDir::new(tag);
+        let photo = dir.join("DSC.ARW");
+        std::fs::write(&photo, b"raw").unwrap();
+        std::fs::write(sidecar_path(&photo), sidecar).unwrap();
+        (dir, photo)
+    }
+
+    fn alice() -> Vec<FaceRegion> {
+        vec![FaceRegion { name: "Alice".into(), bbox: (0.1, 0.1, 0.2, 0.2) }]
+    }
+
+    /// A hand-written sidecar whose Regions value, each region and their Areas are nested
+    /// `rdf:Description`s or attributes (no `rdf:parseType="Resource"` anywhere), with foreign
+    /// attributes and a foreign child on the Regions struct and a foreign attribute on
+    /// AppliedToDimensions. Before #139 the writer found no RegionList here, so it deleted Bob.
+    const NESTED_DESCRIPTION_REGIONS: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<x:xmpmeta xmlns:x="adobe:ns:meta/">
+ <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+  <rdf:Description rdf:about=""
+    xmlns:mwg-rs="http://www.metadataworkinggroup.com/schemas/regions/"
+    xmlns:stArea="http://ns.adobe.com/xmp/sType/Area#"
+    xmlns:stDim="http://ns.adobe.com/xap/1.0/sType/Dimensions#"
+    xmlns:f="urn:example:foreign">
+   <mwg-rs:Regions>
+    <rdf:Description f:keep="regions-attr">
+     <mwg-rs:AppliedToDimensions stDim:w="4000" stDim:h="3000" stDim:unit="pixel"
+       f:dimkeep="dims-attr"/>
+     <mwg-rs:RegionList>
+      <rdf:Bag>
+       <rdf:li>
+        <rdf:Description mwg-rs:Name="Bob" mwg-rs:Type="Face">
+         <mwg-rs:Area stArea:x="0.8" stArea:y="0.7" stArea:w="0.1" stArea:h="0.2"
+           stArea:unit="normalized"/>
+        </rdf:Description>
+       </rdf:li>
+      </rdf:Bag>
+     </mwg-rs:RegionList>
+     <f:extra>regions-child</f:extra>
+    </rdf:Description>
+   </mwg-rs:Regions>
+  </rdf:Description>
+ </rdf:RDF>
+</x:xmpmeta>"#;
+
+    #[test]
+    fn face_regions_nested_description_layout_keeps_foreign_regions_and_content() {
+        let (_dir, photo) = seeded_photo("xmp-139-nested", NESTED_DESCRIPTION_REGIONS);
+        assert_eq!(region_names(&photo), ["Bob"], "the fixture's region is read");
+
+        write_face_regions(&photo, &alice(), 6000, 4000).unwrap();
+
+        let xml = read(&sidecar_path(&photo));
+        assert_eq!(region_names(&photo), ["Alice", "Bob"], "{xml}");
+        assert_eq!(count_elements(&xml, NS_MWG_RS, "Regions"), 1, "{xml}");
+        assert_eq!(count_elements(&xml, NS_MWG_RS, "RegionList"), 1, "{xml}");
+        assert!(has_attr(&xml, (NS_RDF, "Description"), (NS_FOREIGN, "keep"), "regions-attr"),
+            "foreign attribute on the Regions struct lost:\n{xml}");
+        assert_eq!(element_text(&xml, (NS_RDF, "Description"), (NS_FOREIGN, "extra")).as_deref(),
+            Some("regions-child"), "foreign child of the Regions struct lost:\n{xml}");
+        let dims = (NS_MWG_RS, "AppliedToDimensions");
+        assert!(has_attr(&xml, dims, (NS_FOREIGN, "dimkeep"), "dims-attr"),
+            "foreign attribute on AppliedToDimensions lost:\n{xml}");
+        // ChairPhoto's dimensions are set where they were, in attribute form.
+        assert!(has_attr(&xml, dims, (NS_STDIM, "w"), "6000"), "{xml}");
+        assert!(has_attr(&xml, dims, (NS_STDIM, "h"), "4000"), "{xml}");
+        assert_eq!(count_elements(&xml, NS_STDIM, "w"), 0, "no second, element-form width:\n{xml}");
+        // Bob is untouched, attributes and all.
+        assert!(has_attr(&xml, (NS_RDF, "Description"), (NS_MWG_RS, "Name"), "Bob"), "{xml}");
+        assert!(has_attr(&xml, (NS_MWG_RS, "Area"), (NS_STAREA, "x"), "0.8"), "{xml}");
+    }
+
+    /// A RegionList held in an `rdf:Seq` (some tools order their regions) keeps its container:
+    /// Bob survives, Alice joins him in the same Seq, and no Bag appears.
+    #[test]
+    fn face_regions_seq_region_list_keeps_its_regions_and_container() {
+        let (_dir, photo) = seeded_photo("xmp-139-seq", r#"<?xml version="1.0" encoding="UTF-8"?>
+<x:xmpmeta xmlns:x="adobe:ns:meta/">
+ <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+  <rdf:Description rdf:about=""
+    xmlns:mwg-rs="http://www.metadataworkinggroup.com/schemas/regions/"
+    xmlns:stArea="http://ns.adobe.com/xmp/sType/Area#">
+   <mwg-rs:Regions rdf:parseType="Resource">
+    <mwg-rs:RegionList>
+     <rdf:Seq>
+      <rdf:li rdf:parseType="Resource">
+       <mwg-rs:Name>Bob</mwg-rs:Name>
+       <mwg-rs:Type>Face</mwg-rs:Type>
+       <mwg-rs:Area rdf:parseType="Resource">
+        <stArea:x>0.8</stArea:x><stArea:y>0.7</stArea:y>
+        <stArea:w>0.1</stArea:w><stArea:h>0.2</stArea:h>
+        <stArea:unit>normalized</stArea:unit>
+       </mwg-rs:Area>
+      </rdf:li>
+     </rdf:Seq>
+    </mwg-rs:RegionList>
+   </mwg-rs:Regions>
+  </rdf:Description>
+ </rdf:RDF>
+</x:xmpmeta>"#);
+        assert_eq!(region_names(&photo), ["Bob"], "the fixture's region is read");
+
+        write_face_regions(&photo, &alice(), 6000, 4000).unwrap();
+
+        let xml = read(&sidecar_path(&photo));
+        assert_eq!(region_names(&photo), ["Alice", "Bob"], "{xml}");
+        assert_eq!(count_elements(&xml, NS_RDF, "Seq"), 1, "{xml}");
+        assert_eq!(count_elements(&xml, NS_RDF, "Bag"), 0, "{xml}");
+        let lis = namespaced_elements(&xml)
+            .into_iter()
+            .filter(|e| e.parent == (NS_RDF.to_string(), "Seq".to_string()))
+            .count();
+        assert_eq!(lis, 2, "both regions in the one Seq:\n{xml}");
+    }
+
+    /// The `rdf:parseType="Resource"` layout ChairPhoto itself writes, with foreign content
+    /// where the old writer rebuilt the elements from scratch: an attribute on Regions, an
+    /// attribute and a child on AppliedToDimensions, and a child of Regions.
+    #[test]
+    fn face_regions_keep_foreign_content_of_regions_and_dimensions() {
+        let (_dir, photo) = seeded_photo("xmp-139-resource", r#"<?xml version="1.0" encoding="UTF-8"?>
+<x:xmpmeta xmlns:x="adobe:ns:meta/">
+ <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+  <rdf:Description rdf:about=""
+    xmlns:mwg-rs="http://www.metadataworkinggroup.com/schemas/regions/"
+    xmlns:stArea="http://ns.adobe.com/xmp/sType/Area#"
+    xmlns:stDim="http://ns.adobe.com/xap/1.0/sType/Dimensions#"
+    xmlns:f="urn:example:foreign">
+   <mwg-rs:Regions rdf:parseType="Resource" f:keep="regions-attr">
+    <mwg-rs:AppliedToDimensions rdf:parseType="Resource" f:keep2="dims-attr">
+     <stDim:w>4000</stDim:w>
+     <stDim:h>3000</stDim:h>
+     <stDim:unit>pixel</stDim:unit>
+     <f:dimextra>dims-child</f:dimextra>
+    </mwg-rs:AppliedToDimensions>
+    <mwg-rs:RegionList>
+     <rdf:Bag>
+      <rdf:li rdf:parseType="Resource">
+       <mwg-rs:Name>Bob</mwg-rs:Name>
+       <mwg-rs:Area stArea:x="0.8" stArea:y="0.7" stArea:w="0.1" stArea:h="0.2"
+         stArea:unit="normalized"/>
+      </rdf:li>
+     </rdf:Bag>
+    </mwg-rs:RegionList>
+    <f:extra>regions-child</f:extra>
+   </mwg-rs:Regions>
+  </rdf:Description>
+ </rdf:RDF>
+</x:xmpmeta>"#);
+
+        write_face_regions(&photo, &alice(), 6000, 4000).unwrap();
+
+        let xml = read(&sidecar_path(&photo));
+        assert_eq!(region_names(&photo), ["Alice", "Bob"], "{xml}");
+        let regions = (NS_MWG_RS, "Regions");
+        let dims = (NS_MWG_RS, "AppliedToDimensions");
+        assert!(has_attr(&xml, regions, (NS_FOREIGN, "keep"), "regions-attr"), "{xml}");
+        assert!(has_attr(&xml, dims, (NS_FOREIGN, "keep2"), "dims-attr"), "{xml}");
+        assert_eq!(element_text(&xml, dims, (NS_FOREIGN, "dimextra")).as_deref(),
+            Some("dims-child"), "{xml}");
+        assert_eq!(element_text(&xml, regions, (NS_FOREIGN, "extra")).as_deref(),
+            Some("regions-child"), "{xml}");
+        assert_eq!(element_text(&xml, dims, (NS_STDIM, "w")).as_deref(), Some("6000"), "{xml}");
+        assert_eq!(element_text(&xml, dims, (NS_STDIM, "h")).as_deref(), Some("4000"), "{xml}");
+        assert_eq!(element_text(&xml, dims, (NS_STDIM, "unit")).as_deref(), Some("pixel"));
+    }
+
+    /// exiftool writes one Description per namespace, so Regions may sit in a later one. The
+    /// writer edits it there instead of adding a second Regions property to the first.
+    #[test]
+    fn face_regions_are_edited_in_the_description_that_holds_them() {
+        let (_dir, photo) = seeded_photo("xmp-139-second-desc", r#"<?xml version="1.0" encoding="UTF-8"?>
+<x:xmpmeta xmlns:x="adobe:ns:meta/">
+ <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+  <rdf:Description rdf:about="" xmlns:xmp="http://ns.adobe.com/xap/1.0/">
+   <xmp:Rating>3</xmp:Rating>
+  </rdf:Description>
+  <rdf:Description rdf:about=""
+    xmlns:mwg-rs="http://www.metadataworkinggroup.com/schemas/regions/"
+    xmlns:stArea="http://ns.adobe.com/xmp/sType/Area#">
+   <mwg-rs:Regions rdf:parseType="Resource">
+    <mwg-rs:RegionList>
+     <rdf:Bag>
+      <rdf:li rdf:parseType="Resource">
+       <mwg-rs:Name>Bob</mwg-rs:Name>
+       <mwg-rs:Area stArea:x="0.8" stArea:y="0.7" stArea:w="0.1" stArea:h="0.2"/>
+      </rdf:li>
+     </rdf:Bag>
+    </mwg-rs:RegionList>
+   </mwg-rs:Regions>
+  </rdf:Description>
+ </rdf:RDF>
+</x:xmpmeta>"#);
+
+        write_face_regions(&photo, &alice(), 6000, 4000).unwrap();
+
+        let xml = read(&sidecar_path(&photo));
+        assert_eq!(region_names(&photo), ["Alice", "Bob"], "{xml}");
+        assert_eq!(count_elements(&xml, NS_MWG_RS, "Regions"), 1, "{xml}");
+        assert_eq!(count_elements(&xml, NS_RDF, "Bag"), 1, "{xml}");
+    }
+
+    /// Issue #140: a region another tool wrote that matches one ChairPhoto writes by Name +
+    /// Area is updated in place. Only its Area coordinates change, in the form they are
+    /// written in; its Type, `mwg-rs:Rotation`, foreign children and foreign attributes stay.
+    /// Bob is Lightroom-style (attribute-form Area with a `digiKam:Confidence`), Carol is a
+    /// nested-Description region with a foreign attribute and a foreign child in her Area.
+    #[test]
+    fn face_regions_matched_foreign_region_keeps_its_foreign_content() {
+        let (_dir, photo) = seeded_photo("xmp-140-in-place", r#"<?xml version="1.0" encoding="UTF-8"?>
+<x:xmpmeta xmlns:x="adobe:ns:meta/">
+ <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+  <rdf:Description rdf:about=""
+    xmlns:mwg-rs="http://www.metadataworkinggroup.com/schemas/regions/"
+    xmlns:stArea="http://ns.adobe.com/xmp/sType/Area#"
+    xmlns:digiKam="http://www.digikam.org/ns/1.0/"
+    xmlns:f="urn:example:foreign">
+   <mwg-rs:Regions rdf:parseType="Resource">
+    <mwg-rs:RegionList>
+     <rdf:Bag>
+      <rdf:li rdf:parseType="Resource">
+       <mwg-rs:Name>Bob</mwg-rs:Name>
+       <mwg-rs:Type>Face</mwg-rs:Type>
+       <mwg-rs:Area stArea:x="0.8" stArea:y="0.7" stArea:w="0.1" stArea:h="0.2"
+         stArea:unit="normalized" digiKam:Confidence="87"/>
+       <mwg-rs:Rotation>0.25</mwg-rs:Rotation>
+       <f:note>bob-child</f:note>
+      </rdf:li>
+      <rdf:li>
+       <rdf:Description mwg-rs:Name="Carol" f:tag="carol-attr">
+        <mwg-rs:Area rdf:parseType="Resource">
+         <stArea:x>0.3</stArea:x><stArea:y>0.3</stArea:y>
+         <stArea:w>0.1</stArea:w><stArea:h>0.1</stArea:h>
+         <f:areanote>carol-area-child</f:areanote>
+        </mwg-rs:Area>
+       </rdf:Description>
+      </rdf:li>
+     </rdf:Bag>
+    </mwg-rs:RegionList>
+   </mwg-rs:Regions>
+  </rdf:Description>
+ </rdf:RDF>
+</x:xmpmeta>"#);
+        assert_eq!(region_names(&photo), ["Bob", "Carol"], "the fixture's regions are read");
+
+        // Both moved by 0.01, well inside AREA_EPSILON: ChairPhoto's write of the same faces.
+        let ours = [
+            FaceRegion { name: "Bob".into(), bbox: (0.76, 0.61, 0.1, 0.2) },
+            FaceRegion { name: "Carol".into(), bbox: (0.26, 0.26, 0.1, 0.1) },
+        ];
+        write_face_regions(&photo, &ours, 6000, 4000).unwrap();
+
+        let xml = read(&sidecar_path(&photo));
+        let back = read_face_regions(&photo);
+        assert_eq!(back.len(), 2, "updated, not duplicated: {back:?}\n{xml}");
+        for want in &ours {
+            let got = back.iter().find(|r| r.name == want.name).unwrap();
+            let (a, b) = (got.bbox, want.bbox);
+            assert!((a.0 - b.0).abs() < 1e-4 && (a.1 - b.1).abs() < 1e-4,
+                "{} not moved to the written geometry: {a:?}\n{xml}", want.name);
+        }
+
+        // Bob: the Area stays in attribute form, with its foreign attribute.
+        let area = (NS_MWG_RS, "Area");
+        assert!(has_attr(&xml, area, (NS_DIGIKAM, "Confidence"), "87"), "{xml}");
+        assert!(has_attr(&xml, area, (NS_STAREA, "x"), "0.81"), "{xml}");
+        assert!(has_attr(&xml, area, (NS_STAREA, "unit"), "normalized"), "{xml}");
+        let li = (NS_RDF, "li");
+        assert_eq!(element_text(&xml, li, (NS_MWG_RS, "Rotation")).as_deref(), Some("0.25"),
+            "{xml}");
+        assert_eq!(element_text(&xml, li, (NS_MWG_RS, "Type")).as_deref(), Some("Face"));
+        assert_eq!(element_text(&xml, li, (NS_FOREIGN, "note")).as_deref(), Some("bob-child"));
+        // Carol: the nested Description keeps its attribute, the Area its foreign child, and
+        // her coordinates stay elements.
+        assert!(has_attr(&xml, (NS_RDF, "Description"), (NS_FOREIGN, "tag"), "carol-attr"));
+        assert_eq!(element_text(&xml, area, (NS_FOREIGN, "areanote")).as_deref(),
+            Some("carol-area-child"), "{xml}");
+        assert_eq!(element_text(&xml, area, (NS_STAREA, "x")).as_deref(), Some("0.31"), "{xml}");
+        assert_eq!(element_text(&xml, area, (NS_STAREA, "unit")).as_deref(),
+            Some("normalized"), "the missing unit is added in the Area's own form:\n{xml}");
+    }
+
+    /// A Regions the writer does not recognise is never rebuilt: the write is refused with an
+    /// error naming the sidecar, and the file is left byte for byte as it was.
+    #[test]
+    fn face_regions_refuse_a_layout_they_do_not_recognise() {
+        let wrap = |desc_body: &str| format!(r#"<?xml version="1.0" encoding="UTF-8"?>
+<x:xmpmeta xmlns:x="adobe:ns:meta/">
+ <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+  <rdf:Description rdf:about=""
+    xmlns:mwg-rs="http://www.metadataworkinggroup.com/schemas/regions/"
+    xmlns:stArea="http://ns.adobe.com/xmp/sType/Area#">
+{desc_body}
+  </rdf:Description>
+ </rdf:RDF>
+</x:xmpmeta>"#);
+        let bob = r#"<rdf:li rdf:parseType="Resource"><mwg-rs:Name>Bob</mwg-rs:Name>
+       <mwg-rs:Area stArea:x="0.8" stArea:y="0.7" stArea:w="0.1" stArea:h="0.2"/></rdf:li>"#;
+        let cases = [
+            ("alt container", wrap(&format!(
+                r#"<mwg-rs:Regions rdf:parseType="Resource"><mwg-rs:RegionList><rdf:Alt>{bob}</rdf:Alt></mwg-rs:RegionList></mwg-rs:Regions>"#))),
+            ("no container", wrap(&format!(
+                r#"<mwg-rs:Regions rdf:parseType="Resource"><mwg-rs:RegionList>{bob}</mwg-rs:RegionList></mwg-rs:Regions>"#))),
+            ("two lists", wrap(&format!(
+                r#"<mwg-rs:Regions rdf:parseType="Resource"><mwg-rs:RegionList><rdf:Bag>{bob}</rdf:Bag></mwg-rs:RegionList><mwg-rs:RegionList><rdf:Bag/></mwg-rs:RegionList></mwg-rs:Regions>"#))),
+            ("two Regions", wrap(&format!(
+                r#"<mwg-rs:Regions rdf:parseType="Resource"><mwg-rs:RegionList><rdf:Bag>{bob}</rdf:Bag></mwg-rs:RegionList></mwg-rs:Regions><mwg-rs:Regions rdf:parseType="Resource"/>"#))),
+            ("Regions by reference", wrap(r#"<mwg-rs:Regions rdf:resource="urn:example:regions"/>"#)),
+        ];
+        for (case, sidecar) in cases {
+            let (_dir, photo) = seeded_photo("xmp-139-refuse", &sidecar);
+            let err = write_face_regions(&photo, &alice(), 6000, 4000)
+                .expect_err(&format!("{case}: an unrecognised Regions must not be written"));
+            assert!(err.contains(&sidecar_path(&photo).display().to_string()), "{case}: {err}");
+            assert_eq!(read(&sidecar_path(&photo)), sidecar, "{case}: sidecar changed");
+        }
     }
 }

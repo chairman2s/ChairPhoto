@@ -131,6 +131,13 @@ queue row's recorded reason, which describes the last attempt, not the file now.
 does. `photos.uuid` is `UNIQUE`, so the write would fail regardless — but as an opaque
 constraint error, and resolving one conflict must not manufacture another.
 
+**Only a UUID is an identity.** A sidecar `xmp:Identifier` that is not a non-nil UUID in the
+hyphenated form (`catalog::is_photo_identity`) belongs to another tool: a DAM asset id, say,
+which several files may share. A scan or bundle import never adopts it as `photos.uuid` or
+uses it to re-home a row; the file gets its own minted UUID, and the foreign value stays in
+the sidecar as a conflict. Adopt refuses it; Overwrite (after the backup) or Dismiss resolve
+it.
+
 **Adopt changes what merge matches on.** Identity is the merge key (`merge_photo` looks up
 `photos WHERE uuid = ?`), so a catalog that has already been merged or bundled elsewhere
 holds the *previous* identity for that photo:

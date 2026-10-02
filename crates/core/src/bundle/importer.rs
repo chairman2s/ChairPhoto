@@ -449,7 +449,11 @@ pub(crate) fn index_bundle_with(
         // sidecar doesn't parse), fall back to the manifest: this photo's identity is
         // known, so minting a fresh UUID here would be inventing a second one for it
         // and leaving `merge_bundle` to insert the bundle's photo a second time.
-        let identity = sidecar_uuid.as_deref().unwrap_or(item.photo_uuid.as_str());
+        // A sidecar identifier that is not a UUID is another tool's, not an identity (#141).
+        let identity = sidecar_uuid
+            .as_deref()
+            .filter(|v| crate::catalog::is_photo_identity(v))
+            .unwrap_or(item.photo_uuid.as_str());
 
         let upsert = match catalog.upsert_photo_with_identity(
             path,

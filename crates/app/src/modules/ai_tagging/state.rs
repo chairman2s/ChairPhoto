@@ -11,7 +11,9 @@
 //! from [`AiState::run`] or a confirmed batch, both after [`AiState::may_send`]: Ollama is local;
 //! a cloud provider needs its own saved API key (the per-provider opt-in), and a cloud batch of
 //! more than one photo needs the user's Proceed on the cost confirm, which closes when the
-//! engine, the model or the catalog changes. The API keys are settings like any other `ai.*`
+//! engine, the model or the catalog changes. Every run passes the engine the user consented
+//! to down to the core ([`Confirmed`]), which refuses when the catalog's settings name another
+//! by then — a save landing between the consent and the run sends nothing. The API keys are settings like any other `ai.*`
 //! key (as the React app stored them), shown masked, and never logged here.
 //!
 //! **Catalog identity** (map #92). The settings are read with their identity and written back
@@ -25,7 +27,7 @@ use crate::model::{AppModel, AppModelEvent};
 use crate::modules::ModuleSettings;
 use crate::shell::ShellState;
 use crate::storage::Runner;
-use chairphoto_core::app::ai::{self as core_ai, AiSuggestion, GroupedDispatchResult, Region};
+use chairphoto_core::app::ai::{self as core_ai, AiSuggestion, Confirmed, GroupedDispatchResult, Region};
 use chairphoto_core::app::{with_catalog_as, with_catalog_identified, AppState, CatalogIdentity, CoreEvent};
 use chairphoto_core::catalog::Catalog;
 use gpui_kit::{App, Context, Entity, Global, SharedString, Subscription};
@@ -34,18 +36,29 @@ use std::sync::Arc;
 
 /// What the module asks of the provider side — the only path a photo leaves by. Blocking:
 /// called on the [`Runner`]. Tests install a fake that counts calls and sends nothing.
+///
+/// Every run carries the engine the user consented to (`confirmed`: the provider and model
+/// shown when they asked, or on the confirm they proceeded with); the core refuses when the
+/// catalog's settings name another.
 pub trait AiBackend: Send + Sync {
     /// One photo (a region of it, a follow-up), bound to `from`; the photo's pending set.
     fn suggest(
         &self,
         app: &AppState,
         from: CatalogIdentity,
+        confirmed: Confirmed,
         photo: i64,
         question: Option<String>,
         region: Option<Region>,
     ) -> Result<Vec<AiSuggestion>, String>;
     /// The grouped burst run over `photos`, bound to `from`.
-    fn suggest_grouped(&self, app: &AppState, from: CatalogIdentity, photos: Vec<i64>) -> Result<GroupedDispatchResult, String>;
+    fn suggest_grouped(
+        &self,
+        app: &AppState,
+        from: CatalogIdentity,
+        confirmed: Confirmed,
+        photos: Vec<i64>,
+    ) -> Result<GroupedDispatchResult, String>;
     /// The models on the Ollama server at `url` (local; no photo).
     fn ollama_models(&self, url: &str) -> Result<Vec<String>, String>;
 }
@@ -58,15 +71,22 @@ impl AiBackend for CoreAi {
         &self,
         app: &AppState,
         from: CatalogIdentity,
+        confirmed: Confirmed,
         photo: i64,
         question: Option<String>,
         region: Option<Region>,
     ) -> Result<Vec<AiSuggestion>, String> {
-        chairphoto_core::app::runtime().block_on(core_ai::suggest_tags(app, Some(from), photo, question, region))
+        chairphoto_core::app::runtime().block_on(core_ai::suggest_tags(app, Some(from), Some(confirmed), photo, question, region))
     }
 
-    fn suggest_grouped(&self, app: &AppState, from: CatalogIdentity, photos: Vec<i64>) -> Result<GroupedDispatchResult, String> {
-        chairphoto_core::app::runtime().block_on(core_ai::suggest_tags_grouped(app, Some(from), photos))
+    fn suggest_grouped(
+        &self,
+        app: &AppState,
+        from: CatalogIdentity,
+        confirmed: Confirmed,
+        photos: Vec<i64>,
+    ) -> Result<GroupedDispatchResult, String> {
+        chairphoto_core::app::runtime().block_on(core_ai::suggest_tags_grouped(app, Some(from), Some(confirmed), photos))
     }
 
     fn ollama_models(&self, url: &str) -> Result<Vec<String>, String> {
@@ -114,6 +134,11 @@ impl Stored {
     /// The provider's saved API key; empty for Ollama or when none is saved.
     pub fn api_key(&self) -> &str {
         api_key_key(&self.provider()).map_or("", |k| self.raw(k))
+    }
+
+    /// The engine these settings name — what a run started from them is consenting to.
+    pub fn engine(&self) -> Confirmed {
+        Confirmed { provider: self.provider(), model: self.model() }
     }
 }
 
@@ -509,13 +534,16 @@ impl AiState {
             cx.notify();
             return;
         }
+        // The engine the panel shows now is the one the user is asking; the core refuses if
+        // the catalog names another by the time the run reads it.
+        let Some(engine) = self.stored.as_ref().map(Stored::engine) else { return };
         let region = if with_region { self.region } else { None };
         let asking = question.is_some();
         self.busy = true;
         self.error = None;
         cx.notify();
         let backend = AiBackendGlobal::get(cx);
-        self.run_off(cx, move |app| backend.suggest(app, from, photo, question, region), move |s, result, _| {
+        self.run_off(cx, move |app| backend.suggest(app, from, engine, photo, question, region), move |s, result, _| {
             s.busy = false;
             match result {
                 Ok(list) => {
@@ -551,7 +579,7 @@ impl AiState {
         let Some(stored) = self.stored.clone() else { return };
         let (provider, model) = (stored.provider(), stored.model());
         if !is_cloud(&provider) || photos.len() <= 1 {
-            self.dispatch(photos, from, cx);
+            self.dispatch(photos, from, stored.engine(), cx);
             return;
         }
         self.estimating = true;
@@ -602,7 +630,8 @@ impl AiState {
             cx.notify();
             return;
         }
-        self.dispatch(confirm.photos, confirm.from, cx);
+        let engine = Confirmed { provider: confirm.provider, model: confirm.model };
+        self.dispatch(confirm.photos, confirm.from, engine, cx);
     }
 
     pub fn cancel_confirm(&mut self, cx: &mut Context<Self>) {
@@ -610,14 +639,14 @@ impl AiState {
         cx.notify();
     }
 
-    fn dispatch(&mut self, photos: Vec<i64>, from: CatalogIdentity, cx: &mut Context<Self>) {
+    fn dispatch(&mut self, photos: Vec<i64>, from: CatalogIdentity, engine: Confirmed, cx: &mut Context<Self>) {
         self.busy = true;
         self.confirm = None;
         self.error = None;
         self.batch_msg = Some(format!("Grouping {}…", photos.len()));
         cx.notify();
         let backend = AiBackendGlobal::get(cx);
-        self.run_off(cx, move |app| backend.suggest_grouped(app, from, photos), |s, result, cx| {
+        self.run_off(cx, move |app| backend.suggest_grouped(app, from, engine, photos), |s, result, cx| {
             s.busy = false;
             match result {
                 Ok(r) => s.batch_msg = Some(logic::batch_done_line(r.total, r.representatives, r.propagated)),

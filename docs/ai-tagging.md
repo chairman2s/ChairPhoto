@@ -31,7 +31,11 @@ opt-in**, and a bulk cloud run shows a "N images → ~$X" confirmation first. Th
 provider: choosing a cloud engine and saving that provider's API key (stored, like every `ai.*`
 setting, in the catalog; shown masked; never logged). The GPUI module (`modules::ai_tagging`)
 refuses a cloud run before reading any preview while that key is missing, and the bulk confirm
-closes unsent when the engine, model or catalog changes.
+closes unsent when the engine, model or catalog changes. Every run also carries the engine the
+user consented to (`app::ai::Confirmed` — the provider and model shown at Suggest, or on the
+confirm at Proceed); the core compares it with the settings it reads and refuses before reading
+a preview when they differ, so a settings save landing between the consent and the run sends
+nothing.
 
 A tag can be marked **private** (`tags.private`) — typically every name under `People`. Private
 tags are stripped from the vocabulary sent to cloud providers, so personal names never leave the

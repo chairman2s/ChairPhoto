@@ -39,6 +39,16 @@ impl Config {
     pub fn is_local(&self) -> bool {
         self.provider == "ollama"
     }
+
+    /// The model the configured provider runs.
+    pub fn model(&self) -> &str {
+        match self.provider.as_str() {
+            "claude" => &self.cloud_model,
+            "openai" => &self.openai_model,
+            "gemini" => &self.gemini_model,
+            _ => &self.ollama_model,
+        }
+    }
 }
 
 /// One raw suggestion from the model (before resolving against the taxonomy).

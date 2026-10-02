@@ -31,7 +31,7 @@ pub async fn ai_suggest_tags(
     }
     #[cfg(feature = "ai")]
     {
-        core_ai::suggest_tags(&state, None, photo_id, question, region).await
+        core_ai::suggest_tags(&state, None, None, photo_id, question, region).await
     }
 }
 
@@ -153,6 +153,6 @@ pub async fn ai_suggest_tags_grouped(
     }
     #[cfg(feature = "ai")]
     {
-        core_ai::suggest_tags_grouped(&state, None, photo_ids).await
+        core_ai::suggest_tags_grouped(&state, None, None, photo_ids).await
     }
 }

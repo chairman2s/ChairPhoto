@@ -655,7 +655,8 @@ impl Rig {
 }
 
 /// Ctrl+Z / Ctrl+Shift+Z / Ctrl+Y through the real key path: undo first saves the change not
-/// yet saved (so it can be redone), then steps back; the step's settings go back into the
+/// yet saved (so it can be redone), then steps back one step from there — to the head the
+/// change was made on, not React's head − 1; the step's settings go back into the
 /// version; redo walks forward; a new change replaces the undone steps.
 #[gpui_kit::test]
 fn undo_and_redo_walk_the_history_and_save_the_pending_change_first(cx: &mut TestAppContext) {
@@ -668,7 +669,9 @@ fn undo_and_redo_walk_the_history_and_save_the_pending_change_first(cx: &mut Tes
     work(cx);
     let (labels, head) = rig.labels(v);
     assert_eq!(labels, ["Before", "Exposure +0.50", "Contrast +0.30"], "the pending change was saved first");
-    assert_eq!(head, Some(1), "then undone");
+    // Deliberately not React's H−1 (0 here: React chose the target before saving the
+    // pending change): one Ctrl+Z takes back the unsaved change only.
+    assert_eq!(head, Some(1), "then undone, landing on the step before the pending change");
     assert_eq!(rig.working(cx)["tone"]["contrast"], json!(0));
     assert_eq!(rig.working(cx)["tone"]["ev"], json!(0.5));
     assert_eq!(rig.saved(v)["tone"]["contrast"], json!(0), "the step's settings are the version's");
@@ -716,6 +719,51 @@ fn undo_during_a_running_autosave_runs_after_it(cx: &mut TestAppContext) {
     assert_eq!(rig.labels(v), (vec!["Before".to_string(), "Exposure +0.50".to_string()], Some(0)));
     assert_eq!(rig.working(cx), json!({}));
     assert_eq!(rig.saved(v), json!({}));
+}
+
+/// **Forced interleaving.** Ctrl+Z is on the worker (Runner::manual holds it) when a slider
+/// moves and a preset is clicked: both are refused — the rail is not editable until the step
+/// lands — so the undo is not cancelled by a save of "pre-undo + change", the redo branch is
+/// kept (core cuts steps past the head on a commit), and the refused preset's label does not
+/// name the next, unrelated change.
+#[gpui_kit::test]
+fn a_change_while_an_undo_is_on_the_worker_neither_cancels_it_nor_cuts_redo(cx: &mut TestAppContext) {
+    use chairphoto_model::darkroom::controls::EffectKey;
+    let rig = rig("dk-undo-change", 1, cx);
+    rig.slide(Control::Tone(ToneKey::Ev), 0.5, cx);
+    rig.settle_and_save(cx);
+    rig.slide(Control::Tone(ToneKey::Contrast), 0.3, cx);
+    rig.settle_and_save(cx);
+    let v = rig.versions()[0].id;
+    let steps = vec!["Before".to_string(), "Exposure +0.50".to_string(), "Contrast +0.30".to_string()];
+    assert_eq!(rig.labels(v), (steps.clone(), Some(2)));
+
+    rig.press("ctrl-z", cx);
+    let d = rig.darkroom(cx);
+    assert!(d.read_with(cx, |d, _| !d.open.as_ref().unwrap().editable()), "the step is on the worker");
+    rig.slide(Control::Effect(EffectKey::Fade), 0.2, cx);
+    let preset = chairphoto_model::presets::builtin_presets().into_iter().next().unwrap();
+    d.update(cx, |d, cx| d.apply_preset(&preset, cx));
+    cx.run_until_parked();
+    assert_eq!(rig.working(cx)["tone"]["contrast"], json!(0.3), "the record is not changed under the step");
+    assert_eq!(rig.working(cx).get("fade"), None, "neither the fade nor the preset was taken");
+    work(cx);
+    advance(cx, AUTOSAVE_QUIET);
+    work(cx);
+    assert_eq!(rig.labels(v), (steps.clone(), Some(1)), "undone, the redo branch kept");
+    assert_eq!(rig.working(cx)["tone"]["contrast"], json!(0), "the step's record is the working one");
+    assert_eq!(rig.saved(v)["tone"]["contrast"], json!(0));
+    assert!(d.read_with(cx, |d, _| d.open.as_ref().unwrap().editable()), "changes are taken again");
+
+    // Redo still reaches the step the change would have cut.
+    rig.press("ctrl-shift-z", cx);
+    work(cx);
+    assert_eq!(rig.labels(v).1, Some(2));
+    assert_eq!(rig.working(cx)["tone"]["contrast"], json!(0.3));
+    // The next change is named for itself, not for the refused preset.
+    rig.slide(Control::Effect(EffectKey::Fade), 0.2, cx);
+    rig.settle_and_save(cx);
+    assert_eq!(rig.labels(v).0.last().unwrap(), "Fade 0.20");
 }
 
 /// The version shelf: "+ New version" copies the settings and continues there; Original shows
@@ -767,6 +815,81 @@ fn the_version_shelf_new_version_switching_and_the_cover(cx: &mut TestAppContext
     rig.darkroom(cx).update(cx, |d, cx| d.toggle_cover(cx));
     work(cx);
     assert_eq!(rig.catalog(|c| c.cover_of(photo).unwrap()), None);
+}
+
+/// **Forced interleaving.** A version switch and "Develop with the new engine" replace the
+/// record: a change made while either is on the worker is refused (the rail is not
+/// editable), not made on screen and then silently dropped as React did. The version left
+/// keeps what it held; the one arrived at shows its own record. "+ New version" copies the
+/// record instead, so a change made while it is written is kept and saved into it.
+#[gpui_kit::test]
+fn changes_during_a_switch_or_a_new_engine_fork_are_refused_not_dropped(cx: &mut TestAppContext) {
+    use chairphoto_model::darkroom::controls::EffectKey;
+    let rig = rig("dk-switch-refuse", 1, cx);
+    let photo = rig.ids[0];
+    rig.slide(Control::Tone(ToneKey::Ev), 0.5, cx);
+    rig.settle_and_save(cx);
+    let v1 = rig.versions()[0].id;
+    let old = r#"{"tone":{"ev":1},"crop":{"x":0.1,"y":0.1,"w":0.8,"h":0.8}}"#;
+    let mine = rig.catalog(|c| {
+        let id = c.create_version(photo, "Mine").unwrap();
+        c.set_version_edit(id, old).unwrap();
+        id
+    });
+    let d = rig.darkroom(cx);
+    let editable = |cx: &mut TestAppContext| d.read_with(cx, |d, _| d.open.as_ref().unwrap().editable());
+
+    // The switch on the worker: a slider is refused.
+    d.update(cx, |d, cx| d.switch_version(Some(mine), cx));
+    assert!(!editable(cx), "the switch is on the worker");
+    rig.slide(Control::Effect(EffectKey::Fade), 0.2, cx);
+    assert_eq!(rig.working(cx).get("fade"), None, "refused: not shown as if it would be kept");
+    assert_eq!(rig.working(cx)["tone"]["ev"], json!(0.5), "still version 1's record");
+    work(cx);
+    assert!(editable(cx));
+    assert_eq!(rig.version_id(cx), Some(mine));
+    assert_eq!(rig.working(cx)["tone"]["ev"], json!(1), "the version switched to");
+    assert_eq!(rig.saved(v1).get("fade"), None, "nothing written to the version left");
+    assert_eq!(rig.saved(mine)["tone"]["ev"], json!(1));
+
+    // The new-engine fork on the worker: a slider is refused.
+    let source = DevelopSource::Raw {
+        camera: "Sony".into(),
+        megapixels: 61.0,
+        bits: 16,
+        decoder: "0.22".into(),
+        token: Some(format!("w:{photo}:3")),
+        camera_ev: Some(-0.5),
+        as_shot_wb: None,
+        lens: None,
+    };
+    rig.app.state.send(CoreEvent::DevelopSource(DevelopSourceEvent { photo_id: photo, job: 3, source }));
+    cx.run_until_parked();
+    assert!(d.read_with(cx, |d, _| d.open.as_ref().unwrap().engine1_version));
+    d.update(cx, |d, cx| d.develop_with_new_engine(cx));
+    assert!(!editable(cx), "the fork is on the worker");
+    rig.slide(Control::Effect(EffectKey::Fade), 0.2, cx);
+    assert_eq!(rig.working(cx).get("fade"), None, "refused during the fork");
+    work(cx);
+    advance(cx, AUTOSAVE_QUIET);
+    work(cx);
+    assert!(editable(cx));
+    let fork = rig.versions().into_iter().find(|v| v.name == "Mine (RAW)").expect("the fork");
+    assert_eq!(rig.version_id(cx), Some(fork.id));
+    assert_eq!(rig.working(cx).get("fade"), None);
+    assert_eq!(rig.working(cx).get("tone"), None, "tone starts over on the new engine");
+    assert_eq!(rig.catalog(|c| c.get_version(mine).unwrap().unwrap().edit_json), old, "the engine-1 version is untouched");
+
+    // "+ New version" keeps a change made while it is written.
+    d.update(cx, |d, cx| d.new_version(cx));
+    assert!(editable(cx), "a copy does not replace the record");
+    rig.slide(Control::Effect(EffectKey::Fade), 0.2, cx);
+    work(cx);
+    advance(cx, AUTOSAVE_QUIET);
+    work(cx);
+    let copy = rig.version_id(cx).unwrap();
+    assert_ne!(copy, fork.id);
+    assert_eq!(rig.saved(copy)["fade"], json!(0.2), "saved into the new version");
 }
 
 /// "Develop with the new engine": an engine-1 version's framing as a fresh engine-2 version
@@ -867,6 +990,59 @@ fn presets_apply_save_rename_and_delete_keeping_unknown_data(cx: &mut TestAppCon
     work(cx);
     assert_eq!(rig.presets_setting().unwrap(), json!([theirs_saved]));
     assert_eq!(rig.darkroom(cx).read_with(cx, |d, _| d.user_presets.len()), 1);
+}
+
+/// Run the queued worker jobs **newest first**, as a pool of workers may take them, and what
+/// they queue in turn, letting the UI take each result.
+fn work_newest_first(cx: &mut TestAppContext) {
+    loop {
+        let ran = cx.update(|cx| Runner::get(cx).run_pending_reversed());
+        cx.run_until_parked();
+        if ran == 0 {
+            return;
+        }
+    }
+}
+
+/// **Forced interleaving.** Two quick writes of one setting, the worker taking the newer
+/// first: the preset saves and the overlay choices still land in the order made — in the
+/// catalog and on screen — because a key's next write waits for the one before it.
+#[gpui_kit::test]
+fn preset_and_overlay_writes_land_in_the_order_made(cx: &mut TestAppContext) {
+    use chairphoto_model::darkroom::geometry::OVERLAY_KEY;
+    use chairphoto_model::editing::CropOverlay;
+    let rig = rig("dk-setting-order", 1, cx);
+    let d = rig.darkroom(cx);
+    let pending = |cx: &mut TestAppContext| cx.update(|cx| Runner::get(cx).pending());
+
+    d.update(cx, |d, cx| d.set_overlay(CropOverlay::Golden, cx));
+    d.update(cx, |d, cx| d.set_overlay(CropOverlay::None, cx));
+    assert_eq!(pending(cx), 1, "the second choice waits for the first");
+    work_newest_first(cx);
+    assert_eq!(rig.catalog(|c| c.get_setting(OVERLAY_KEY).unwrap()).as_deref(), Some("none"), "the last choice is remembered");
+    assert_eq!(d.read_with(cx, |d, _| d.overlay), CropOverlay::None);
+
+    d.update(cx, |d, cx| d.save_preset("First", cx));
+    d.update(cx, |d, cx| d.save_preset("Second", cx));
+    let first = d.read_with(cx, |d, _| d.user_presets.len());
+    assert_eq!(first, 0);
+    work_newest_first(cx);
+    let stored: Vec<Value> = serde_json::from_value(rig.presets_setting().unwrap()).unwrap();
+    let names: Vec<&str> = stored.iter().map(|p| p["name"].as_str().unwrap()).collect();
+    assert_eq!(names, ["First", "Second"], "saved in the order made");
+    let shown: Vec<String> = d.read_with(cx, |d, _| d.user_presets.iter().map(|p| p.name.clone()).collect());
+    assert_eq!(shown, ["First", "Second"], "the list shown is the last one written");
+
+    // A delete then a save: the deleted preset does not come back, here or on screen.
+    let id = stored[0]["id"].as_str().unwrap().to_string();
+    d.update(cx, |d, cx| d.delete_preset(id, cx));
+    d.update(cx, |d, cx| d.save_preset("Third", cx));
+    work_newest_first(cx);
+    let stored: Vec<Value> = serde_json::from_value(rig.presets_setting().unwrap()).unwrap();
+    let names: Vec<&str> = stored.iter().map(|p| p["name"].as_str().unwrap()).collect();
+    assert_eq!(names, ["Second", "Third"]);
+    let shown: Vec<String> = d.read_with(cx, |d, _| d.user_presets.iter().map(|p| p.name.clone()).collect());
+    assert_eq!(shown, ["Second", "Third"]);
 }
 
 /// Crop & rotate: an aspect chip fits a crop of that aspect to the frame; the angle slider
@@ -971,6 +1147,51 @@ fn the_proof_sheet_and_duel_are_mounted_and_feed_the_record(cx: &mut TestAppCont
     assert!(rig.view(cx).read_with(cx, |v, _| v.overlay().is_none()));
 }
 
+/// **Forced interleaving.** A duel's ⑂ pressed while the photo's versions are still being
+/// read (the read held on the worker) is not dropped: it waits for the version and banks the
+/// variant once it is resolved, and the duel says it was kept. If the versions cannot be
+/// read, the operation is not run and the banner says so.
+#[gpui_kit::test]
+fn a_duel_fork_before_the_version_resolves_waits_for_it(cx: &mut TestAppContext) {
+    use super::view::Overlay;
+    let rig = rig("dk-fork-early", 3, cx);
+    let order = rig.app.wired.shell.read_with(cx, |s, _| s.library.photo_ids());
+    let d = rig.darkroom(cx);
+    let loaded = |cx: &mut TestAppContext| d.read_with(cx, |d, _| d.open.as_ref().unwrap().loaded);
+    rig.press("right", cx); // the next photo opens; its version read waits on the worker
+    assert_eq!(rig.open_photo(cx), Some(order[1]));
+    assert!(!loaded(cx), "the version is not resolved yet");
+    rig.with_view(cx, |v, window, cx| v.open_duel(window, cx));
+    let duel = rig.view(cx).read_with(cx, |v, _| match v.overlay() {
+        Some(Overlay::Duel(d)) => d.clone(),
+        _ => panic!("the duel is mounted"),
+    });
+    duel.update(cx, |d, cx| d.fork(1, cx));
+    cx.run_until_parked();
+    assert!(!loaded(cx));
+    assert!(rig.catalog(|c| c.list_versions(order[1]).unwrap()).is_empty(), "nothing written before the version is known");
+    work(cx);
+    assert!(loaded(cx));
+    let names: Vec<String> = rig.catalog(|c| c.list_versions(order[1]).unwrap()).into_iter().map(|v| v.name).collect();
+    assert_eq!(names.len(), 1, "{names:?}");
+    assert!(names[0].starts_with("What-if — "), "the variant was banked once the version resolved: {names:?}");
+    assert!(rig.present("duel-note", cx), "the duel says it was kept");
+    assert_eq!(rig.darkroom(cx).read_with(cx, |d, _| d.error.clone()), None);
+
+    // The versions cannot be read (the catalog switched, the event withheld): the queued
+    // operation does not run, and the banner says why.
+    rig.press("escape", cx);
+    rig.press("right", cx);
+    assert_eq!(rig.open_photo(cx), Some(order[2]));
+    assert!(!loaded(cx));
+    rig.darkroom(cx).update(cx, |d, cx| d.toggle_cover(cx));
+    let (b, _) = colliding_catalog(&rig.dir, "b", 3);
+    core_switch(&rig.app, b);
+    work(cx);
+    let error = rig.darkroom(cx).read_with(cx, |d, _| d.error.clone()).unwrap_or_default();
+    assert!(error.contains("was not done"), "{error}");
+}
+
 /// **Catalog identity.** The core switches to a catalog with colliding ids, the event
 /// withheld: a version operation (the cover), a history step and a preset save fail closed
 /// and touch nothing in the new catalog.
@@ -999,4 +1220,77 @@ fn rails_writes_fail_closed_across_a_switch(cx: &mut TestAppContext) {
         assert!(c.version_history(v).unwrap().steps.is_empty(), "no step taken there");
         assert_eq!(c.list_versions(photo).unwrap()[0].edit_json, "{}");
     });
+}
+
+/// The Darkroom's keys stand down while the proof sheet or the duel is up (React's
+/// filmstrip `keysDisabled`): under the proof sheet — which binds only Esc — ← / → do not
+/// step the filmstrip, Enter does not zoom to the crop, and Ctrl+Z / Ctrl+Shift+Z / Ctrl+Y
+/// do not move the history; under the duel — which binds the arrows, ↓ and Esc — Ctrl+Z,
+/// Ctrl+Y and Enter do nothing either. Each key is first shown to act with no overlay up.
+#[gpui_kit::test]
+fn the_darkroom_keys_stand_down_under_the_proof_sheet_and_the_duel(cx: &mut TestAppContext) {
+    use super::view::Overlay;
+    let rig = rig("dk-key-guard", 2, cx);
+    let photo = rig.open_photo(cx);
+    work(cx); // the auto-tone fragment
+    advance(cx, SETTLE);
+    let key = rig.pool.last_batch()[0].clone();
+    rig.pool.finish(&key, Ok(pixels(6, 4)));
+    cx.run_until_parked();
+    rig.with_view(cx, |v, _, cx| v.set_aspect("1:1", cx));
+    rig.settle_and_save(cx);
+    rig.slide(Control::Tone(ToneKey::Ev), 0.5, cx);
+    rig.settle_and_save(cx);
+    let v = rig.versions()[0].id;
+    let head = rig.labels(v).1;
+    assert_eq!(head, Some(2), "Before, the crop, the exposure");
+    let stage_view = |cx: &mut TestAppContext| rig.view(cx).read_with(cx, |v, _| v.stage_view());
+    let overlay = |cx: &mut TestAppContext| {
+        rig.view(cx).read_with(cx, |v, _| match v.overlay() {
+            Some(Overlay::Proof(_)) => "proof",
+            Some(Overlay::Duel(_)) => "duel",
+            None => "none",
+        })
+    };
+
+    // With no overlay up, each key acts.
+    rig.press("enter", cx);
+    assert!(!stage_view(cx).is_fit(), "Enter zooms to the crop");
+    rig.press("escape", cx);
+    assert!(stage_view(cx).is_fit());
+    rig.press("ctrl-z", cx);
+    work(cx);
+    assert_eq!(rig.labels(v).1, Some(1), "Ctrl+Z undoes");
+    rig.press("ctrl-y", cx);
+    work(cx);
+    assert_eq!(rig.labels(v).1, head, "Ctrl+Y redoes");
+
+    // Under the proof sheet: nothing.
+    rig.with_view(cx, |v, window, cx| v.open_proof_sheet(window, cx));
+    assert_eq!(overlay(cx), "proof");
+    for key in ["right", "left", "ctrl-z", "ctrl-shift-z", "ctrl-y", "enter"] {
+        rig.press(key, cx);
+        work(cx);
+        assert_eq!(rig.open_photo(cx), photo, "{key} under the proof sheet does not step the filmstrip");
+        assert!(stage_view(cx).is_fit(), "{key} under the proof sheet does not zoom");
+        assert_eq!(rig.labels(v).1, head, "{key} under the proof sheet does not move the history");
+        if key != "enter" {
+            assert_eq!(overlay(cx), "proof", "{key}: the sheet stays up");
+        }
+    }
+    // Enter is the focused backdrop's keyboard click: the sheet declines and closes (its own
+    // behaviour, `loupe::proof_sheet`) — but the Darkroom did not also take it as "zoom".
+    assert_eq!(overlay(cx), "none", "Enter declines the sheet");
+
+    // Under the duel: no undo, redo or zoom.
+    rig.with_view(cx, |v, window, cx| v.open_duel(window, cx));
+    assert_eq!(overlay(cx), "duel");
+    for key in ["ctrl-z", "ctrl-shift-z", "ctrl-y", "enter"] {
+        rig.press(key, cx);
+        work(cx);
+        assert_eq!(rig.labels(v).1, head, "{key} under the duel does not move the history");
+        assert!(stage_view(cx).is_fit(), "{key} under the duel does not zoom");
+        assert_eq!(overlay(cx), "duel", "{key}: the duel stays up");
+    }
+    assert_eq!(rig.saved(v)["tone"]["ev"], json!(0.5), "the version is as it was");
 }

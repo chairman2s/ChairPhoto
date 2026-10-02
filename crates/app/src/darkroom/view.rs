@@ -372,7 +372,10 @@ impl DarkroomView {
             return;
         }
         // The proof sheet and the duel own the keys while they are up (React's filmstrip
-        // `keysDisabled`): their arrows and Esc must not also step or fit the stage.
+        // `keysDisabled`): their arrows and Esc must not also step or fit the stage. Not only
+        // defensive: the proof sheet binds Esc alone, so without this ← / → would step the
+        // filmstrip under it, Enter zoom to the crop, and Ctrl+Z / Ctrl+Y move the history
+        // under either overlay (`the_darkroom_keys_stand_down_under_the_proof_sheet_and_the_duel`).
         if self.rails.overlay_open() {
             return;
         }
@@ -831,6 +834,11 @@ impl DarkroomView {
     fn render_rail(&self, d: &Darkroom, colors: Colors, cx: &Context<Self>) -> AnyElement {
         let mut rail = div().id("dk-rail").flex().flex_col().flex_none().w(px(280.)).h_full().p(px(12.)).overflow_y_scroll().border_l_1().border_color(colors.line);
         let Some(open) = d.open.as_ref() else { return rail.into_any_element() };
+        if !open.editable() {
+            // A step, a switch or the new-engine fork is replacing the record: changes are
+            // refused until it lands.
+            rail = rail.opacity(0.5);
+        }
         let working = open.working.clone();
         let kelvin = d.kelvin();
         let k = kelvin.as_ref();

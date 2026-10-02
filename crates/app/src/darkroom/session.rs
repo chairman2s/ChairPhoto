@@ -42,8 +42,17 @@
 //! (`rails`): it saves what is pending first and runs after any commit already on the
 //! worker, one at a time, as React chained them after its autosave (`chainRef`). A save that
 //! fails drops the operations queued behind it (the change stays on screen, the banner says
-//! why). Presets live in the catalog's settings (`basic-editor.presets`), read-modify-written
-//! on a worker under one catalog lock.
+//! why). While an operation that replaces the record — a history step, a version switch,
+//! "Develop with the new engine" — is on the worker the record is not editable
+//! (`OpenPhoto::editable`): a change is refused, not made and then dropped as React's
+//! `setWorking(record)` did (saved on top of a step it would also cut the redo branch the
+//! step left). "+ New version", the cover and a duel's ⑂ keep the record, so a change made
+//! while they run is kept and saved after them.
+//!
+//! Presets live in the catalog's settings (`basic-editor.presets`), read-modify-written on a
+//! worker under one catalog lock; they and the crop overlay (`editor.crop_overlay`) are
+//! written one at a time per key, in the order made (`Darkroom::write_in_order`), so a stale
+//! write can never land after a newer one in the catalog or on screen.
 
 use super::stage::{DarkroomStage, FrameTier, SETTLE};
 use crate::image_store::{ImageStore, Submit};
@@ -65,7 +74,7 @@ use chairphoto_model::darkroom::geometry::OVERLAY_KEY;
 use chairphoto_model::editing::{as_linear_record, is_engine1_version, parse_edit, CropOverlay, VersionEdit};
 use chairphoto_model::presets::{parse_user_presets, DevelopPreset, USER_PRESETS_KEY};
 use gpui_kit::{AppContext as _, Context, Entity, Subscription, Task};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -75,6 +84,17 @@ pub use rails::DarkroomEvent;
 
 /// A version operation waiting for the commit before it (see the module docs).
 type Op = Box<dyn FnOnce(&mut Darkroom, u64, &mut Context<Darkroom>)>;
+
+/// A catalog-setting write waiting for the one before it of the same key.
+type SettingWrite = Box<dyn FnOnce(&mut Darkroom, &mut Context<Darkroom>)>;
+
+/// The Darkroom's writes of one catalog setting, one on the worker at a time
+/// (`Darkroom::write_in_order`).
+#[derive(Default)]
+struct SettingChain {
+    running: bool,
+    queued: VecDeque<SettingWrite>,
+}
 
 /// Quiet time after a change before it is saved as a history step (React: 600 ms).
 pub const AUTOSAVE_QUIET: Duration = Duration::from_millis(600);
@@ -138,6 +158,10 @@ pub struct OpenPhoto {
     autosave_timer: Option<Task<()>>,
     /// A commit is on the worker; another change waits for it (`commit_again`).
     committing: bool,
+    /// A version operation that replaces the working record (a history step, a version
+    /// switch, "Develop with the new engine") is on the worker: changes are refused until it
+    /// answers (see [`Darkroom::apply`]).
+    replacing: bool,
     commit_again: bool,
     pub saving: bool,
     _stage_observer: Subscription,
@@ -211,6 +235,11 @@ impl OpenPhoto {
     pub fn busy(&self) -> bool {
         self.committing
     }
+
+    /// Changes are taken: no operation that replaces the working record is on the worker.
+    pub fn editable(&self) -> bool {
+        !self.replacing
+    }
 }
 
 /// The cover version a row's token names (`"<version>:<rev>"`).
@@ -267,6 +296,8 @@ pub struct Darkroom {
     /// A passing notice ("Saved preset …").
     pub notice: Option<String>,
     notice_timer: Option<Task<()>>,
+    /// Per setting key (the user presets, the crop overlay), the writes in the order made.
+    setting_writes: HashMap<&'static str, SettingChain>,
     _subscriptions: [Subscription; 2],
 }
 
@@ -306,6 +337,7 @@ impl Darkroom {
             user_presets: Vec::new(),
             notice: None,
             notice_timer: None,
+            setting_writes: HashMap::new(),
             _subscriptions,
         }
     }
@@ -405,6 +437,7 @@ impl Darkroom {
             masses_timer: None,
             autosave_timer: None,
             committing: false,
+            replacing: false,
             commit_again: false,
             saving: false,
             _stage_observer,
@@ -482,7 +515,7 @@ impl Darkroom {
                     Ok((versions, v, history))
                 })
             },
-            |this, result, cx| {
+            move |this, result, cx| {
                 let Some(open) = this.open.as_mut() else { return };
                 match result {
                     Ok((versions, v, history)) => {
@@ -506,13 +539,26 @@ impl Darkroom {
                         open.version_id = v.map(|v| v.id);
                         open.history = history;
                         open.loaded = true;
+                        let waiting = !open.ops.is_empty();
                         this.restage(before, cx);
-                        this.schedule_autosave(cx);
+                        if waiting {
+                            // Operations asked for while the version resolved: what is pending
+                            // is saved first, then they run in order (`idle`).
+                            this.commit(seq, cx);
+                            if !this.open.as_ref().is_some_and(|o| o.committing) {
+                                this.idle(seq, false, cx);
+                            }
+                        } else {
+                            this.schedule_autosave(cx);
+                        }
                     }
                     Err(e) => {
                         // Versions unreadable (or the catalog changed): autosave stays off, so
-                        // nothing is written over a version this view never resolved.
-                        this.error = Some(format!("Could not read the versions: {e}"));
+                        // nothing is written over a version this view never resolved, and
+                        // what was asked for meanwhile does not run.
+                        let dropped = this.open.as_mut().map(|o| std::mem::take(&mut o.ops).len()).unwrap_or(0);
+                        let also = if dropped > 0 { " — what was asked for meanwhile was not done" } else { "" };
+                        this.error = Some(format!("Could not read the versions: {e}{also}"));
                     }
                 }
                 cx.notify();
@@ -654,8 +700,20 @@ impl Darkroom {
 
     /// A control produced the next record. `label` names the change for history when the
     /// caller knows it better than a diff ("Reset"; #112's "Preset: X", "Proof: Y").
+    ///
+    /// Refused while an operation that replaces the record (a history step, a version switch,
+    /// the new-engine fork) is on the worker ([`OpenPhoto::editable`]): the change would be
+    /// made on a record about to be replaced, and saving it on top of a history step would
+    /// cut the redo branch the step left. React let the change happen and then dropped it
+    /// (`setWorking(record)`); here the controls show the refusal instead (the rail is
+    /// dimmed, a slider snaps back) and nothing is silently lost.
     pub fn apply(&mut self, next: VersionEdit, label: Option<&str>, cx: &mut Context<Self>) {
         let Some(open) = self.open.as_mut() else { return };
+        if !open.editable() {
+            // A re-render puts the refused change's slider thumb back on the record.
+            cx.notify();
+            return;
+        }
         if next == open.working {
             return;
         }

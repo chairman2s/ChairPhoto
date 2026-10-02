@@ -34,11 +34,15 @@ type Created = (i64, Vec<PhotoVersion>);
 impl Darkroom {
     // --- ordering ----------------------------------------------------------------------------
 
-    /// Run `op` once what is pending is saved: now, or after the commit on the worker.
+    /// Run `op` once what is pending is saved: now, or after the commit on the worker — or,
+    /// the version not resolved yet, once it is.
     fn after_save(&mut self, op: Op, cx: &mut Context<Self>) {
-        let Some(open) = self.open.as_ref() else { return };
+        let Some(open) = self.open.as_mut() else { return };
         if !open.loaded {
-            // The version is not resolved yet: there is nothing to step, switch or fork from.
+            // Nothing to step, switch or fork from yet (a duel's ⑂, a key, pressed while the
+            // photo opens): the operation waits for the version, as React's waited on its
+            // load. If the versions cannot be read it is dropped and the banner says why.
+            open.ops.push_back(op);
             return;
         }
         let seq = open.seq;
@@ -52,11 +56,13 @@ impl Darkroom {
     }
 
     /// One version operation on a worker. Photo `seq` is busy until it answers (a change
-    /// meanwhile waits, as for a commit); `done` runs only while `seq` is the open photo. A
-    /// left photo's failure goes to the status line.
+    /// meanwhile waits, as for a commit) — or, for an operation that `replaces` the working
+    /// record, refuses changes until it answers ([`Darkroom::apply`]); `done` runs only while
+    /// `seq` is the open photo. A left photo's failure goes to the status line.
     fn run_op<T: Send + 'static>(
         &mut self,
         seq: u64,
+        replaces: bool,
         work: impl FnOnce(&AppState) -> Result<T, String> + Send + 'static,
         done: impl FnOnce(&mut Self, Result<T, String>, &mut Context<Self>) + 'static,
         cx: &mut Context<Self>,
@@ -64,6 +70,7 @@ impl Darkroom {
         let Some(open) = self.photo_mut(seq) else { return };
         open.committing = true;
         open.saving = true;
+        open.replacing = replaces;
         let state = self.app.clone();
         let rx = Runner::get(cx).run(move || work(&state));
         cx.spawn(async move |this, cx| {
@@ -72,6 +79,7 @@ impl Darkroom {
                 let Some(open) = this.photo_mut(seq) else { return };
                 open.committing = false;
                 open.saving = false;
+                open.replacing = false;
                 if this.open.as_ref().is_some_and(|o| o.seq == seq) {
                     done(this, result, cx);
                 } else if let Err(e) = result {
@@ -108,6 +116,12 @@ impl Darkroom {
 
     /// Ctrl+Z: one step back, counted from the history as it stands once what is pending is
     /// saved — so undo first takes back the change not yet saved.
+    ///
+    /// **Deliberately not React.** With a change pending at head H, React's `stepBy` picked
+    /// its target from the history *before* `gotoStep` flushed the change, so it saved the
+    /// change as H+1 and then went to H−1: one Ctrl+Z took back the unsaved change *and* the
+    /// step before it. Here the target is counted after the save, so it lands on H: only the
+    /// unsaved change is taken back (and Ctrl+Shift+Z brings it back).
     pub fn undo(&mut self, cx: &mut Context<Self>) {
         self.after_save(Box::new(|this, seq, cx| this.goto_now(seq, None, -1, cx)), cx);
     }
@@ -122,9 +136,10 @@ impl Darkroom {
         let Some(open) = self.open.as_ref() else { return };
         let Some(vid) = open.version_id else { return };
         let Some(step) = step.or_else(|| step_by(open.history.as_ref(), delta)) else { return };
-        let (from, base) = (open.from, open.working.clone());
+        let from = open.from;
         self.run_op(
             seq,
+            true,
             move |state| {
                 editing::write_version_then_refresh_monochrome(state, Some(from), vid, |c| c.goto_version_step(vid, step))
             },
@@ -138,11 +153,10 @@ impl Darkroom {
                     let record = parse_edit(Some(&json));
                     Self::adopt_committed(open, &record);
                     open.history = Some(history);
-                    // A change made while the step was on the worker stays (it is newer):
-                    // the next save makes it a step on top of this one.
-                    if open.working == base {
-                        open.working = record;
-                    }
+                    // The step's record is what the version holds now. No change was made
+                    // while the step ran (changes were refused): one saved on top of it
+                    // would have cut the redo branch the step just left.
+                    open.working = record;
                     let mut shown = None;
                     if let Some(v) = open.versions.iter_mut().find(|v| v.id == vid) {
                         v.edit_json = json;
@@ -170,8 +184,10 @@ impl Darkroom {
     fn switch_now(&mut self, seq: u64, target: Option<i64>, cx: &mut Context<Self>) {
         let Some(open) = self.open.as_ref() else { return };
         let (from, photo_id) = (open.from, open.photo.id);
+        // Replaces the record: changes are refused until the other version is on screen.
         self.run_op(
             seq,
+            true,
             move |state| {
                 with_catalog_as(state, from, |c| {
                     let versions = c.list_versions(photo_id)?;
@@ -189,8 +205,9 @@ impl Darkroom {
                     let before = (open.source_token().map(str::to_string), open.stage_json());
                     let record = parse_edit(v.as_ref().map(|v| v.edit_json.as_str()));
                     Self::adopt_committed(open, &record);
-                    // The other version's record replaces the screen; a change made on the
-                    // old one while this ran belonged to it and is not carried across.
+                    // The other version's record replaces the screen. No change was made on
+                    // the old one while this ran: changes were refused (React made them and
+                    // then dropped them here).
                     open.working = record.clone();
                     open.commit_again = false;
                     open.engine1_version = v.is_some() && is_engine1_version(&record);
@@ -249,20 +266,25 @@ impl Darkroom {
         };
         let json = if new_engine { record.to_json() } else { open.stamped(&record).to_json() };
         let saved = json.clone();
+        // The new-engine fork replaces the record (tone and look start over): changes are
+        // refused until it lands. "+ New version" copies the record, so a change made while
+        // it is written is kept and saved into the new version.
         self.run_op(
             seq,
+            new_engine,
             Self::create_with(from, photo_id, name, json),
             move |this, result, cx| match result {
                 Ok((id, versions)) => {
                     let open = this.open.as_mut().expect("open");
                     let before = (open.source_token().map(str::to_string), open.stage_json());
                     if new_engine {
+                        // Nothing was changed meanwhile (refused): the fork's record is shown.
                         open.working = record.clone();
                         open.commit_again = false;
                         open.engine1_version = false;
                     }
-                    // A change made while the copy was written stays on screen and is saved
-                    // into the new version.
+                    // "+ New version": a change made while the copy was written stays on
+                    // screen and is saved into the new version.
                     Self::adopt_committed(open, &record);
                     open.version_id = Some(id);
                     open.version_unlisted = false;
@@ -293,6 +315,7 @@ impl Darkroom {
                 let kept = name.clone();
                 this.run_op(
                     seq,
+                    false,
                     Self::create_with(from, photo_id, name, json),
                     move |this, result, cx| match result {
                         Ok((_, versions)) => {
@@ -322,6 +345,7 @@ impl Darkroom {
                 let (from, photo_id) = (open.from, open.photo.id);
                 this.run_op(
                     seq,
+                    false,
                     move |state| with_catalog_as(state, from, |c| c.set_cover_version(photo_id, next)),
                     move |this, result, cx| match result {
                         Ok(_) => {
@@ -352,8 +376,40 @@ impl Darkroom {
         all_presets(self.user_presets.clone())
     }
 
+    /// Run `start` — which writes the catalog setting `key` on a worker and calls
+    /// [`setting_written`](Self::setting_written) when that write answers — once every
+    /// earlier write of `key` has answered. The Runner's workers take tasks in any order, so
+    /// two quick writes of one setting (a save then a delete; Golden then None) could
+    /// otherwise land oldest last: in the catalog, and — the answers arriving in that order —
+    /// on screen. Chained, not numbered as Preferences' `Ctx::write_setting` does: a preset
+    /// edit is a read-modify-write, and skipping a stale one would lose its change.
+    fn write_in_order(
+        &mut self,
+        key: &'static str,
+        start: impl FnOnce(&mut Self, &mut Context<Self>) + 'static,
+        cx: &mut Context<Self>,
+    ) {
+        let chain = self.setting_writes.entry(key).or_default();
+        if chain.running {
+            chain.queued.push_back(Box::new(start));
+            return;
+        }
+        chain.running = true;
+        start(self, cx);
+    }
+
+    /// A write of `key` answered: the next one made, if any, goes to the worker.
+    fn setting_written(&mut self, key: &'static str, cx: &mut Context<Self>) {
+        let Some(chain) = self.setting_writes.get_mut(key) else { return };
+        match chain.queued.pop_front() {
+            Some(next) => next(self, cx),
+            None => chain.running = false,
+        }
+    }
+
     /// Read-modify-write the stored user presets on a worker, under one catalog lock bound
-    /// to the open photo's catalog; the list shown follows while that catalog is open.
+    /// to the open photo's catalog, after any edit of them still on the worker; the list
+    /// shown follows while that catalog is open.
     fn edit_presets(
         &mut self,
         change: impl FnOnce(Option<&str>) -> Vec<DevelopPreset> + Send + 'static,
@@ -361,33 +417,40 @@ impl Darkroom {
         cx: &mut Context<Self>,
     ) {
         let Some(from) = self.open.as_ref().map(|o| o.from) else { return };
-        let state = self.app.clone();
-        let rx = Runner::get(cx).run(move || {
-            with_catalog_as(&state, from, |c| {
-                let stored = c.get_setting(USER_PRESETS_KEY)?;
-                let list = change(stored.as_deref());
-                c.set_setting(USER_PRESETS_KEY, &serialize_user_presets(&list))?;
-                Ok(list)
-            })
-        });
-        cx.spawn(async move |this, cx| {
-            let result = rx.await.unwrap_or_else(|_| Err("the worker stopped".into()));
-            this.update(cx, |this, cx| {
-                if !this.open.as_ref().is_some_and(|o| o.from == from) {
-                    return;
-                }
-                match result {
-                    Ok(list) => {
-                        this.user_presets = list;
-                        done(this, cx);
-                    }
-                    Err(e) => this.error = Some(format!("Could not save the presets: {e}")),
-                }
-                cx.notify();
-            })
-            .ok();
-        })
-        .detach();
+        self.write_in_order(
+            USER_PRESETS_KEY,
+            move |this, cx| {
+                let state = this.app.clone();
+                let rx = Runner::get(cx).run(move || {
+                    with_catalog_as(&state, from, |c| {
+                        let stored = c.get_setting(USER_PRESETS_KEY)?;
+                        let list = change(stored.as_deref());
+                        c.set_setting(USER_PRESETS_KEY, &serialize_user_presets(&list))?;
+                        Ok(list)
+                    })
+                });
+                cx.spawn(async move |this, cx| {
+                    let result = rx.await.unwrap_or_else(|_| Err("the worker stopped".into()));
+                    this.update(cx, |this, cx| {
+                        this.setting_written(USER_PRESETS_KEY, cx);
+                        if !this.open.as_ref().is_some_and(|o| o.from == from) {
+                            return;
+                        }
+                        match result {
+                            Ok(list) => {
+                                this.user_presets = list;
+                                done(this, cx);
+                            }
+                            Err(e) => this.error = Some(format!("Could not save the presets: {e}")),
+                        }
+                        cx.notify();
+                    })
+                    .ok();
+                })
+                .detach();
+            },
+            cx,
+        );
     }
 
     /// "☆ Save as preset": the current look (never the framing) under `name`.
@@ -480,6 +543,9 @@ impl Darkroom {
     /// A proof clicked: its record becomes the working state, named "Proof: <label>" (the
     /// as-shot cell is a plain change), and its label is what "+ New version" will be called.
     pub fn adopt_proof(&mut self, candidate: ProofCandidate, cx: &mut Context<Self>) {
+        if !self.open.as_ref().is_some_and(|o| o.editable()) {
+            return;
+        }
         let label = (candidate.group != ProofGroup::AsShot).then(|| candidate.label.clone());
         if let (Some(open), Some(l)) = (self.open.as_mut(), &label) {
             open.adopted_label = Some(l.clone());
@@ -503,7 +569,7 @@ impl Darkroom {
     /// "Correct perspective" / "Adjust corners": the quad (the default one if none) and the
     /// handles up; the crop goes.
     pub fn start_perspective(&mut self, cx: &mut Context<Self>) {
-        let Some(open) = self.open.as_ref() else { return };
+        let Some(open) = self.open.as_ref().filter(|o| o.editable()) else { return };
         let next = geometry::start_perspective(&open.working);
         self.set_perspective_mode(true, cx);
         self.apply(next, None, cx);
@@ -511,20 +577,31 @@ impl Darkroom {
 
     /// Perspective "Reset": quad and crop go, the handles down.
     pub fn clear_perspective(&mut self, cx: &mut Context<Self>) {
-        let Some(open) = self.open.as_ref() else { return };
+        let Some(open) = self.open.as_ref().filter(|o| o.editable()) else { return };
         let next = geometry::clear_perspective(&open.working);
         self.set_perspective_mode(false, cx);
         self.apply(next, None, cx);
     }
 
-    /// An overlay chip: drawn in the crop box from now on, and remembered (`editor.crop_overlay`).
+    /// An overlay chip: drawn in the crop box from now on, and remembered
+    /// (`editor.crop_overlay`) after any earlier choice still being written.
     pub fn set_overlay(&mut self, overlay: CropOverlay, cx: &mut Context<Self>) {
         self.overlay = overlay;
         if let Some(from) = self.open.as_ref().map(|o| o.from) {
-            let state = self.app.clone();
-            Runner::get(cx).spawn(move || {
-                let _ = with_catalog_as(&state, from, |c| c.set_setting(OVERLAY_KEY, overlay.key()));
-            });
+            self.write_in_order(
+                OVERLAY_KEY,
+                move |this, cx| {
+                    let state = this.app.clone();
+                    let rx = Runner::get(cx).run(move || with_catalog_as(&state, from, |c| c.set_setting(OVERLAY_KEY, overlay.key())));
+                    cx.spawn(async move |this, cx| {
+                        // Cosmetic: a failed write leaves the choice for this session only.
+                        let _ = rx.await;
+                        this.update(cx, |this, cx| this.setting_written(OVERLAY_KEY, cx)).ok();
+                    })
+                    .detach();
+                },
+                cx,
+            );
         }
         cx.notify();
     }

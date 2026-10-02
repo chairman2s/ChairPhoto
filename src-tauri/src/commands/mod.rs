@@ -10,9 +10,12 @@
 //! broad enough to serve the submodules, not just this file's own code.
 
 use crate::catalog::{
-    Album, Catalog, IptcFields, MetadataEntry, Photo, PhotoLocation, PhotoVersion, PickState,
+    Album, IptcFields, MetadataEntry, Photo, PhotoLocation, PhotoVersion, PickState,
     Publication, SmartAlbum, Tag, TagGroup, TagTerm, TagWithCount, Volume,
 };
+// The submodules' tests open catalogs through this glob (`use super::*`).
+#[cfg(test)]
+use crate::catalog::Catalog;
 use crate::scanner::ScanResult;
 use crate::thumbnails::{preview_bytes, thumbnail_bytes};
 use base64::Engine;

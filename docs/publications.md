@@ -62,6 +62,11 @@ const pubs = await api.listPublications(photoId);
 await api.deletePublication(pubs[0].id);
 ```
 
+In the GPUI app a module's marker is `ModuleMeta::marker()` (declared `publication_marker`,
+else the id), and a publish target records through `modules::publishing::record_publications`,
+bound to the catalog its photo ids were read from (`with_catalog_as`), so a record never lands
+in a catalog opened since. The React host below did the same stamping in TypeScript.
+
 The host wires `recordPublication` to stamp the calling module's marker
 (`getPublicationMarker(mod.id)` in `src/modules/host.ts`), so the "module declares it,
 host enforces the fallback" rule holds for every module by construction — a module can't
@@ -91,13 +96,12 @@ What each publish path reports while it runs, as of this writing:
 |---|---|---|
 | Flickr, SmugMug | none — one render, one upload request, and the command returns when it finishes | none |
 | Instagram | none — the supervised flow ends by handing you the composer, which *is* the progress report | none |
-| LocalSend | `localsend:progress` `{ done, total }` after each file, rendered by `SendToDevicePanel.tsx` | none — the protocol's `POST /cancel?sessionId=` exists but ChairPhoto never calls it |
+| LocalSend | `localsend:progress` `{ done, total, job }` after each file; a panel shows only its own job's | the GPUI panel's Cancel, a newer send or a catalog switch trips the send job (`app::localsend`): it stops before its next render or file, or mid-upload, and calls `POST /cancel?sessionId=` (React's panel has no Cancel) |
 
-**Nothing in the publish UI stops a publish once it has started.** That is a real gap for a
-multi-photo LocalSend send, where a wrong selection means waiting out every file; it is much
-less of one for the single-photo services, where by the time a user reaches for Cancel the
-request is usually already in flight and aborting it would leave the service holding a
-partial upload it may or may not commit. Instagram cannot be cancelled by us at all in the
+**Only a LocalSend send can be stopped once it has started** (the GPUI app's Cancel; a multi-photo
+send was where a wrong selection meant waiting out every file). For the single-photo services it
+matters much less: by the time a user reaches for Cancel the request is usually already in
+flight, and aborting it would leave the service holding a partial upload it may or may not commit. Instagram cannot be cancelled by us at all in the
 supervised case — the post is finished by the user, in a browser ChairPhoto deliberately
 does not own; closing that window is the cancel.
 
@@ -131,10 +135,12 @@ Today every path renders to JPEG specifically because RAW decode is slow, so the
 yet active. It is recorded here against the condition that would trigger it, so that whoever changes
 an upload path to send originals meets the requirement before writing the code rather than after.
 
-Temp renders do not depend on any of this. Each job renders into a directory of its own that
-is removed when the job ends, whichever way it ends — see `publishing::JobTempDir` in
-`src-tauri/src/commands/publishing.rs`, and [instagram.md](instagram.md) for the one flow
-whose render outlives the command on purpose.
+Temp renders do not depend on any of this. Each job renders into a directory of its own (mode
+0700, a random name) that is removed when the job ends, whichever way it ends — see
+`publishing::JobTempDir` in `crates/core/src/publishing.rs`, and [instagram.md](instagram.md)
+for the one flow whose render outlives the command on purpose. A render is an export, so its
+"export equals view" checks are collected per job (`app::exports::collect_parity`) and added to
+the catalog the photo was read from — dropped if another catalog opened meanwhile.
 
 ## Migration
 

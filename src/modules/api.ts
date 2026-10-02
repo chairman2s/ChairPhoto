@@ -1738,7 +1738,8 @@ export const getIptc = (photoId: number) => invoke<IptcFields>("get_iptc", { pho
 
 /** What became of an IPTC save's sidecar write. The catalog always has the values once
  *  `setIptc` resolves; `pending` means the sidecar does not yet — the fields stay owed and
- *  the next save or the identity-debt repair pass writes them (#148). */
+ *  the next save or the identity-debt repair pass writes them (#148). `unchanged` means
+ *  nothing was owed, so the sidecar was not opened. */
 export interface IptcSaveOutcome {
   sidecar: "written" | "unchanged" | "pending";
   /** Why the sidecar is pending, when it is. */

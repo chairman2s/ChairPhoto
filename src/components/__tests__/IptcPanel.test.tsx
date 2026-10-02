@@ -52,7 +52,7 @@ describe("iptcSaveStatus", () => {
   it("claims the sidecar only when it was written", () => {
     expect(iptcSaveStatus({ sidecar: "written", reason: null })).toBe("Saved to sidecar");
     expect(iptcSaveStatus({ sidecar: "unchanged", reason: null })).toBe(
-      "Saved — the sidecar already had these values",
+      "Saved (no sidecar change needed)",
     );
     expect(iptcSaveStatus({ sidecar: "pending", reason: "read-only" })).toBe(
       "Saved to catalog; sidecar pending (read-only)",

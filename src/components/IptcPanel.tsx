@@ -36,7 +36,8 @@ export function iptcSaveStatus(outcome: IptcSaveOutcome | null | undefined): str
     case "written":
       return "Saved to sidecar";
     case "unchanged":
-      return "Saved — the sidecar already had these values";
+      // Nothing was owed, so the sidecar was not opened: no claim about what it holds.
+      return "Saved (no sidecar change needed)";
     case "pending":
       return outcome.reason
         ? `Saved to catalog; sidecar pending (${outcome.reason})`

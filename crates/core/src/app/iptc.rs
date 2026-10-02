@@ -36,7 +36,9 @@ impl IptcSaveOutcome {
     pub fn status(&self) -> String {
         match (self.sidecar, &self.reason) {
             (IptcSidecarState::Written, _) => "Saved to sidecar".into(),
-            (IptcSidecarState::Unchanged, _) => "Saved — the sidecar already had these values".into(),
+            // Nothing was owed, so the sidecar was not opened: say that, not that it holds
+            // the values — it was never read (review of #148, N3).
+            (IptcSidecarState::Unchanged, _) => "Saved (no sidecar change needed)".into(),
             (IptcSidecarState::Pending, Some(why)) => format!("Saved to catalog; sidecar pending ({why})"),
             (IptcSidecarState::Pending, None) => "Saved to catalog; sidecar pending".into(),
         }
@@ -293,7 +295,7 @@ mod tests {
         // With nothing owed, a further identical save writes nothing and says so.
         let outcome = save_iptc(&state, id, &typed()).unwrap();
         assert_eq!(outcome.sidecar, crate::catalog::IptcSidecarState::Unchanged);
-        assert!(!outcome.status().contains("sidecar pending"));
+        assert_eq!(outcome.status(), "Saved (no sidecar change needed)");
     }
 
     /// The volume unmounts between the store and the sidecar write: the fields stay owed,

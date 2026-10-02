@@ -177,7 +177,7 @@ impl IptcSidecarWrite {
 pub enum IptcSettled {
     /// The owed fields are in the sidecar and nothing is owed any more.
     Written,
-    /// Nothing was owed: the sidecar already had every value, and was not opened.
+    /// Nothing was owed, so the sidecar was not opened. (Not a claim about what it holds.)
     Unchanged,
     /// The write landed, but a newer store changed the photo's IPTC meanwhile; its fields
     /// stay owed, and so do this write's whose value is no longer the catalog's (they may
@@ -195,7 +195,7 @@ pub enum IptcSettled {
 pub enum IptcSidecarState {
     /// The sidecar now has every IPTC value the catalog holds for the photo.
     Written,
-    /// Nothing was owed, so nothing was written: the sidecar already had the values.
+    /// Nothing was owed, so nothing was written and the sidecar was not read.
     Unchanged,
     /// Saved to the catalog only: some fields have not reached the sidecar yet. They stay
     /// owed, and the next save of the photo or the repair pass writes them.

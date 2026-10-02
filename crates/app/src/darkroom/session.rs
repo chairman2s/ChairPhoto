@@ -47,8 +47,12 @@
 //! (`OpenPhoto::editable`): a change is refused, not made and then dropped as React's
 //! `setWorking(record)` did (saved on top of a step it would also cut the redo branch the
 //! step left). "+ New version", the cover and a duel's ⑂ keep the record, so a change made
-//! while they run is kept and saved after them. Presets live in the catalog's settings (`basic-editor.presets`), read-modify-written
-//! on a worker under one catalog lock.
+//! while they run is kept and saved after them.
+//!
+//! Presets live in the catalog's settings (`basic-editor.presets`), read-modify-written on a
+//! worker under one catalog lock; they and the crop overlay (`editor.crop_overlay`) are
+//! written one at a time per key, in the order made (`Darkroom::write_in_order`), so a stale
+//! write can never land after a newer one in the catalog or on screen.
 
 use super::stage::{DarkroomStage, FrameTier, SETTLE};
 use crate::image_store::{ImageStore, Submit};
@@ -70,7 +74,7 @@ use chairphoto_model::darkroom::geometry::OVERLAY_KEY;
 use chairphoto_model::editing::{as_linear_record, is_engine1_version, parse_edit, CropOverlay, VersionEdit};
 use chairphoto_model::presets::{parse_user_presets, DevelopPreset, USER_PRESETS_KEY};
 use gpui_kit::{AppContext as _, Context, Entity, Subscription, Task};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -80,6 +84,17 @@ pub use rails::DarkroomEvent;
 
 /// A version operation waiting for the commit before it (see the module docs).
 type Op = Box<dyn FnOnce(&mut Darkroom, u64, &mut Context<Darkroom>)>;
+
+/// A catalog-setting write waiting for the one before it of the same key.
+type SettingWrite = Box<dyn FnOnce(&mut Darkroom, &mut Context<Darkroom>)>;
+
+/// The Darkroom's writes of one catalog setting, one on the worker at a time
+/// (`Darkroom::write_in_order`).
+#[derive(Default)]
+struct SettingChain {
+    running: bool,
+    queued: VecDeque<SettingWrite>,
+}
 
 /// Quiet time after a change before it is saved as a history step (React: 600 ms).
 pub const AUTOSAVE_QUIET: Duration = Duration::from_millis(600);
@@ -281,6 +296,8 @@ pub struct Darkroom {
     /// A passing notice ("Saved preset …").
     pub notice: Option<String>,
     notice_timer: Option<Task<()>>,
+    /// Per setting key (the user presets, the crop overlay), the writes in the order made.
+    setting_writes: HashMap<&'static str, SettingChain>,
     _subscriptions: [Subscription; 2],
 }
 
@@ -320,6 +337,7 @@ impl Darkroom {
             user_presets: Vec::new(),
             notice: None,
             notice_timer: None,
+            setting_writes: HashMap::new(),
             _subscriptions,
         }
     }

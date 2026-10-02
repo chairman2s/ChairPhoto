@@ -372,8 +372,40 @@ impl Darkroom {
         all_presets(self.user_presets.clone())
     }
 
+    /// Run `start` — which writes the catalog setting `key` on a worker and calls
+    /// [`setting_written`](Self::setting_written) when that write answers — once every
+    /// earlier write of `key` has answered. The Runner's workers take tasks in any order, so
+    /// two quick writes of one setting (a save then a delete; Golden then None) could
+    /// otherwise land oldest last: in the catalog, and — the answers arriving in that order —
+    /// on screen. Chained, not numbered as Preferences' `Ctx::write_setting` does: a preset
+    /// edit is a read-modify-write, and skipping a stale one would lose its change.
+    fn write_in_order(
+        &mut self,
+        key: &'static str,
+        start: impl FnOnce(&mut Self, &mut Context<Self>) + 'static,
+        cx: &mut Context<Self>,
+    ) {
+        let chain = self.setting_writes.entry(key).or_default();
+        if chain.running {
+            chain.queued.push_back(Box::new(start));
+            return;
+        }
+        chain.running = true;
+        start(self, cx);
+    }
+
+    /// A write of `key` answered: the next one made, if any, goes to the worker.
+    fn setting_written(&mut self, key: &'static str, cx: &mut Context<Self>) {
+        let Some(chain) = self.setting_writes.get_mut(key) else { return };
+        match chain.queued.pop_front() {
+            Some(next) => next(self, cx),
+            None => chain.running = false,
+        }
+    }
+
     /// Read-modify-write the stored user presets on a worker, under one catalog lock bound
-    /// to the open photo's catalog; the list shown follows while that catalog is open.
+    /// to the open photo's catalog, after any edit of them still on the worker; the list
+    /// shown follows while that catalog is open.
     fn edit_presets(
         &mut self,
         change: impl FnOnce(Option<&str>) -> Vec<DevelopPreset> + Send + 'static,
@@ -381,33 +413,40 @@ impl Darkroom {
         cx: &mut Context<Self>,
     ) {
         let Some(from) = self.open.as_ref().map(|o| o.from) else { return };
-        let state = self.app.clone();
-        let rx = Runner::get(cx).run(move || {
-            with_catalog_as(&state, from, |c| {
-                let stored = c.get_setting(USER_PRESETS_KEY)?;
-                let list = change(stored.as_deref());
-                c.set_setting(USER_PRESETS_KEY, &serialize_user_presets(&list))?;
-                Ok(list)
-            })
-        });
-        cx.spawn(async move |this, cx| {
-            let result = rx.await.unwrap_or_else(|_| Err("the worker stopped".into()));
-            this.update(cx, |this, cx| {
-                if !this.open.as_ref().is_some_and(|o| o.from == from) {
-                    return;
-                }
-                match result {
-                    Ok(list) => {
-                        this.user_presets = list;
-                        done(this, cx);
-                    }
-                    Err(e) => this.error = Some(format!("Could not save the presets: {e}")),
-                }
-                cx.notify();
-            })
-            .ok();
-        })
-        .detach();
+        self.write_in_order(
+            USER_PRESETS_KEY,
+            move |this, cx| {
+                let state = this.app.clone();
+                let rx = Runner::get(cx).run(move || {
+                    with_catalog_as(&state, from, |c| {
+                        let stored = c.get_setting(USER_PRESETS_KEY)?;
+                        let list = change(stored.as_deref());
+                        c.set_setting(USER_PRESETS_KEY, &serialize_user_presets(&list))?;
+                        Ok(list)
+                    })
+                });
+                cx.spawn(async move |this, cx| {
+                    let result = rx.await.unwrap_or_else(|_| Err("the worker stopped".into()));
+                    this.update(cx, |this, cx| {
+                        this.setting_written(USER_PRESETS_KEY, cx);
+                        if !this.open.as_ref().is_some_and(|o| o.from == from) {
+                            return;
+                        }
+                        match result {
+                            Ok(list) => {
+                                this.user_presets = list;
+                                done(this, cx);
+                            }
+                            Err(e) => this.error = Some(format!("Could not save the presets: {e}")),
+                        }
+                        cx.notify();
+                    })
+                    .ok();
+                })
+                .detach();
+            },
+            cx,
+        );
     }
 
     /// "☆ Save as preset": the current look (never the framing) under `name`.
@@ -540,14 +579,25 @@ impl Darkroom {
         self.apply(next, None, cx);
     }
 
-    /// An overlay chip: drawn in the crop box from now on, and remembered (`editor.crop_overlay`).
+    /// An overlay chip: drawn in the crop box from now on, and remembered
+    /// (`editor.crop_overlay`) after any earlier choice still being written.
     pub fn set_overlay(&mut self, overlay: CropOverlay, cx: &mut Context<Self>) {
         self.overlay = overlay;
         if let Some(from) = self.open.as_ref().map(|o| o.from) {
-            let state = self.app.clone();
-            Runner::get(cx).spawn(move || {
-                let _ = with_catalog_as(&state, from, |c| c.set_setting(OVERLAY_KEY, overlay.key()));
-            });
+            self.write_in_order(
+                OVERLAY_KEY,
+                move |this, cx| {
+                    let state = this.app.clone();
+                    let rx = Runner::get(cx).run(move || with_catalog_as(&state, from, |c| c.set_setting(OVERLAY_KEY, overlay.key())));
+                    cx.spawn(async move |this, cx| {
+                        // Cosmetic: a failed write leaves the choice for this session only.
+                        let _ = rx.await;
+                        this.update(cx, |this, cx| this.setting_written(OVERLAY_KEY, cx)).ok();
+                    })
+                    .detach();
+                },
+                cx,
+            );
         }
         cx.notify();
     }

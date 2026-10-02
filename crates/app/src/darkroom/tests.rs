@@ -992,6 +992,59 @@ fn presets_apply_save_rename_and_delete_keeping_unknown_data(cx: &mut TestAppCon
     assert_eq!(rig.darkroom(cx).read_with(cx, |d, _| d.user_presets.len()), 1);
 }
 
+/// Run the queued worker jobs **newest first**, as a pool of workers may take them, and what
+/// they queue in turn, letting the UI take each result.
+fn work_newest_first(cx: &mut TestAppContext) {
+    loop {
+        let ran = cx.update(|cx| Runner::get(cx).run_pending_reversed());
+        cx.run_until_parked();
+        if ran == 0 {
+            return;
+        }
+    }
+}
+
+/// **Forced interleaving.** Two quick writes of one setting, the worker taking the newer
+/// first: the preset saves and the overlay choices still land in the order made — in the
+/// catalog and on screen — because a key's next write waits for the one before it.
+#[gpui_kit::test]
+fn preset_and_overlay_writes_land_in_the_order_made(cx: &mut TestAppContext) {
+    use chairphoto_model::darkroom::geometry::OVERLAY_KEY;
+    use chairphoto_model::editing::CropOverlay;
+    let rig = rig("dk-setting-order", 1, cx);
+    let d = rig.darkroom(cx);
+    let pending = |cx: &mut TestAppContext| cx.update(|cx| Runner::get(cx).pending());
+
+    d.update(cx, |d, cx| d.set_overlay(CropOverlay::Golden, cx));
+    d.update(cx, |d, cx| d.set_overlay(CropOverlay::None, cx));
+    assert_eq!(pending(cx), 1, "the second choice waits for the first");
+    work_newest_first(cx);
+    assert_eq!(rig.catalog(|c| c.get_setting(OVERLAY_KEY).unwrap()).as_deref(), Some("none"), "the last choice is remembered");
+    assert_eq!(d.read_with(cx, |d, _| d.overlay), CropOverlay::None);
+
+    d.update(cx, |d, cx| d.save_preset("First", cx));
+    d.update(cx, |d, cx| d.save_preset("Second", cx));
+    let first = d.read_with(cx, |d, _| d.user_presets.len());
+    assert_eq!(first, 0);
+    work_newest_first(cx);
+    let stored: Vec<Value> = serde_json::from_value(rig.presets_setting().unwrap()).unwrap();
+    let names: Vec<&str> = stored.iter().map(|p| p["name"].as_str().unwrap()).collect();
+    assert_eq!(names, ["First", "Second"], "saved in the order made");
+    let shown: Vec<String> = d.read_with(cx, |d, _| d.user_presets.iter().map(|p| p.name.clone()).collect());
+    assert_eq!(shown, ["First", "Second"], "the list shown is the last one written");
+
+    // A delete then a save: the deleted preset does not come back, here or on screen.
+    let id = stored[0]["id"].as_str().unwrap().to_string();
+    d.update(cx, |d, cx| d.delete_preset(id, cx));
+    d.update(cx, |d, cx| d.save_preset("Third", cx));
+    work_newest_first(cx);
+    let stored: Vec<Value> = serde_json::from_value(rig.presets_setting().unwrap()).unwrap();
+    let names: Vec<&str> = stored.iter().map(|p| p["name"].as_str().unwrap()).collect();
+    assert_eq!(names, ["Second", "Third"]);
+    let shown: Vec<String> = d.read_with(cx, |d, _| d.user_presets.iter().map(|p| p.name.clone()).collect());
+    assert_eq!(shown, ["Second", "Third"]);
+}
+
 /// Crop & rotate: an aspect chip fits a crop of that aspect to the frame; the angle slider
 /// straightens with the crop inset; perspective puts the quad up (the stage renders
 /// un-warped), a handle moves a corner, Done renders it warped; each is a history step.

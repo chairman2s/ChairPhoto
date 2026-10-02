@@ -23,7 +23,8 @@
 //!
 //! * The file lock is a **leaf**. Some writers take it while holding the catalog lock (face
 //!   regions, GPS, an identity Overwrite); nothing is acquired while it is held — the XML
-//!   work and the file I/O only.
+//!   work and the file I/O only, plus, for a face-region write, the SQLite reads of the
+//!   photo's face set (#156: `xmp::write_face_regions_gathered`).
 //! * [`WriteOrder::reserve`] never blocks, so it may be called under the catalog lock.
 //!   [`WriteOrder::wait`] blocks, and is called with **no lock held**, never across an
 //!   `.await`, and **never on an async runtime's worker thread**: on a blocking thread

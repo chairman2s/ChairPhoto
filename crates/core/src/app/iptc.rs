@@ -606,6 +606,44 @@ mod tests {
         assert_eq!(read(&crate::xmp::sidecar_path(&nas_file)), crate::xmp::test_fixtures::LIGHTROOM);
     }
 
+    /// #155 R2: the unbound save (the Tauri `set_iptc`, which names no catalog) is bound to
+    /// the catalog it reserved its turn in. A switch while it waits — the window #149 opened
+    /// between the reserve and the store — fails it closed with `CATALOG_CHANGED`: the new
+    /// catalog's row with the same id is not stored into, and neither catalog's sidecar is
+    /// written.
+    #[test]
+    fn an_unbound_save_waiting_through_a_catalog_switch_changes_neither_catalog() {
+        let (dir, state, id, xmp) = foreign_photo("iptc-155-switch", crate::xmp::test_fixtures::LIGHTROOM);
+        let other = dir.join("other");
+        std::fs::create_dir_all(&other).unwrap();
+        let other_file = other.join("IMG_B.ARW");
+        std::fs::write(&other_file, b"another catalog's photo").unwrap();
+        let other_xmp = crate::xmp::sidecar_path(&other_file);
+        std::fs::write(&other_xmp, crate::xmp::test_fixtures::LIGHTROOM).unwrap();
+        let b = crate::catalog::Catalog::open(&dir.join("b.chairphoto"), &other).unwrap();
+        assert_eq!(b.upsert_photo(&other_file, None, 0, 1).unwrap().id, id, "the ids collide");
+
+        let earlier = WriteOrder::reserve(&dir.join("library").join("DSC144.ARW"));
+        let state = std::sync::Arc::new(state);
+        let save = {
+            let state = state.clone();
+            std::thread::spawn(move || save_iptc(&state, id, &IptcFields { title: "T".into(), ..Default::default() }))
+        };
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(!save.is_finished(), "the save must wait behind the earlier write");
+        let a = state.catalog.lock().unwrap().replace(b).unwrap();
+        drop(earlier);
+
+        assert_eq!(save.join().unwrap().unwrap_err(), crate::app::CATALOG_CHANGED);
+        let guard = state.catalog.lock().unwrap();
+        let b = guard.as_ref().unwrap();
+        assert_eq!(b.get_iptc(id).unwrap(), IptcFields::default(), "the new catalog's row was stored into");
+        assert_eq!(b.owed_iptc(id).unwrap(), crate::catalog::IptcMask::NONE);
+        assert_eq!(a.get_iptc(id).unwrap(), IptcFields::default(), "the old catalog's row was stored into");
+        assert_eq!(read(&xmp), crate::xmp::test_fixtures::LIGHTROOM);
+        assert_eq!(read(&other_xmp), crate::xmp::test_fixtures::LIGHTROOM);
+    }
+
     /// Issue #149 F1: the library's volume goes away while a save waits for its turn. The
     /// save fails, the catalog row is unchanged (the store runs only once the turn is held),
     /// nothing is created where the volume was mounted, and the sidecar on the volume is

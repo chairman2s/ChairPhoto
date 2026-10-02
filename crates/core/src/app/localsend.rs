@@ -134,6 +134,12 @@ impl LocalSendJob {
         self.items.iter().map(|i| i.photo_id).collect()
     }
 
+    /// What each reachable photo will be sent as, in send order: its id and the name of the
+    /// version it is rendered from (`None` = the unedited original).
+    pub fn sent_as(&self) -> Vec<(i64, Option<String>)> {
+        self.items.iter().map(|i| (i.photo_id, i.version_name.clone())).collect()
+    }
+
     /// Render and send with the production [`full_resolution`] renderer. Blocking: runs the
     /// transfer on the core runtime and waits, so call it from a worker thread (never an async
     /// task or the UI thread).

@@ -69,6 +69,8 @@ struct Net {
     discoveries: usize,
     /// (device, pin, photo ids) per send that ran.
     sends: Vec<(Device, Option<String>, Vec<i64>)>,
+    /// Per send that ran: what the claimed job resolved each photo to (id, version name).
+    sent_as: Vec<Vec<(i64, Option<String>)>>,
     /// Stop each send after this many photos, with this error (a rejection, a Cancel).
     stop_after: Option<(usize, String)>,
 }
@@ -101,6 +103,7 @@ fn fake(found: Vec<Device>, net: Arc<Mutex<Net>>) -> LocalSendBackend {
             let ids = job.photo_ids();
             let mut net = net.lock().unwrap();
             net.sends.push((device.clone(), pin.map(str::to_string), ids.clone()));
+            net.sent_as.push(job.sent_as());
             if let Some((n, error)) = net.stop_after.clone() {
                 return Err(SendStopped { sent: ids[..n].to_vec(), error });
             }
@@ -158,6 +161,13 @@ fn present(app: &App, id: &'static str, cx: &mut TestAppContext) -> bool {
 
 fn has_dialog(app: &App, cx: &mut TestAppContext) -> bool {
     cx.update_window(app.window(), |_, window, cx| window.has_active_dialog(cx)).unwrap()
+}
+
+/// The version names recorded for `id` under `platform` (`None` = the Original).
+fn recorded_version_names(app: &App, id: i64, platform: &str) -> Vec<Option<String>> {
+    let guard = app.state.catalog.lock().unwrap();
+    let pubs = guard.as_ref().unwrap().list_publications(id).unwrap();
+    pubs.into_iter().filter(|p| p.platform == platform).map(|p| p.version_name).collect()
 }
 
 fn publications(app: &App, id: i64) -> Vec<(String, Option<i64>)> {
@@ -363,6 +373,12 @@ fn snapchat_warns_and_records_what_was_sent(cx: &mut TestAppContext) {
     click(&app, "send-send", cx);
     work(cx);
     assert_eq!(net.lock().unwrap().sends[0].2, [ids[0]]);
+    // What the job resolved and sent is what was recorded: the chosen version, by id and name.
+    let sent_as = net.lock().unwrap().sent_as[0].clone();
+    for (id, name) in &sent_as {
+        assert_eq!(recorded_version_names(&app, *id, "snapchat"), [name.clone()], "recorded as the version that was sent");
+    }
+    assert_eq!(sent_as, [(ids[0], Some("Story crop".to_string()))], "the claimed job rendered the chosen version");
     assert_eq!(publications(&app, ids[0]), [("snapchat".to_string(), Some(version))]);
     assert!(publications(&app, ids[1]).is_empty(), "not selected, not sent, not recorded");
 }

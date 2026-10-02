@@ -319,6 +319,17 @@ fn module_panels_are_per_window_and_go_with_the_pop_out(cx: &mut TestAppContext)
     let main_views = registry.read_with(cx, |r, _| r.cached_view_count());
     let h = open(cx);
     assert!(present_in(h, "dev-loupe", cx), "the pop-out mounts the loupe slot");
+    // Each window's loupe-slot panels find the image they draw over (`loupe_image`), with no
+    // reach into a root view: the inline loupe's in the main window, the pop-out's there.
+    let image_in = |w: AnyWindowHandle, cx: &mut TestAppContext| {
+        cx.update_window(w, |_, window, cx| crate::loupe::view::loupe_image(window, cx).map(|z| z.entity_id()))
+            .unwrap()
+    };
+    let inline = app.wired.root.clone().unwrap().read_with(cx, |r, cx| r.loupe().read(cx).zoom().entity_id());
+    let popped = popout_zoom(cx).entity_id();
+    assert_ne!(inline, popped);
+    assert_eq!(image_in(app.window(), cx), Some(inline));
+    assert_eq!(image_in(h, cx), Some(popped));
     assert_eq!(registry.read_with(cx, |r, _| r.cached_view_count()), main_views + 1, "a view of its own");
     close(cx);
     assert_eq!(registry.read_with(cx, |r, _| r.cached_view_count()), main_views, "dropped with the window");

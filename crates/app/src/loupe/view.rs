@@ -41,8 +41,9 @@ use chairphoto_core::image_pool::ImageKind;
 use gpui_kit::prelude::*;
 use gpui_kit::{
     div, px, AnyElement, App, Context, Entity, FocusHandle, Global, Hsla, InteractiveElement, SharedString,
-    Subscription, TestSupportExt as _, Window,
+    Subscription, TestSupportExt as _, WeakEntity, Window, WindowId,
 };
+use std::collections::HashMap;
 use std::path::Path;
 use std::rc::Rc;
 
@@ -62,6 +63,21 @@ fn open_with_system(path: &Path, cx: &mut App) {
         Some(opener) => (opener.0)(path, cx),
         None => cx.open_with_system(path),
     }
+}
+
+/// The loupe image each window shows, for loupe-slot module panels (the face overlay) that
+/// draw over it: every [`LoupeView`] registers its image for the window it renders in, before
+/// it builds those panels. Weak, so a closed window's entry dies with its view.
+#[derive(Default)]
+struct LoupeImages(HashMap<WindowId, WeakEntity<ZoomImage>>);
+
+impl Global for LoupeImages {}
+
+/// The loupe image `window` shows — the inline loupe in the main window, the pop-out's in the
+/// pop-out — so a loupe-slot panel can follow its transform without reaching into a window's
+/// root view. `None` when no loupe has rendered in `window`.
+pub fn loupe_image(window: &Window, cx: &App) -> Option<Entity<ZoomImage>> {
+    cx.try_global::<LoupeImages>()?.0.get(&window.window_handle().window_id())?.upgrade()
 }
 
 /// Which photo a loupe follows.
@@ -501,6 +517,10 @@ impl Render for LoupeView {
         };
         let video = chairphoto_core::scanner::is_video(Path::new(&photo.path));
         let bar = self.render_bar(&photo, colors, cx);
+        // The image the loupe-slot panels draw over, for this window ([`loupe_image`]).
+        let images = &mut cx.default_global::<LoupeImages>().0;
+        images.retain(|_, zoom| zoom.upgrade().is_some());
+        images.insert(window.window_handle().window_id(), self.zoom.downgrade());
         let panels = ModuleRegistry::panel_views(&self.modules, PanelSlot::Loupe, window, cx);
         let id = photo.id;
         let stage: AnyElement = div()

@@ -142,6 +142,10 @@ pub struct ObsidianSettings {
     shown: Option<(String, String)>,
     /// Why the last Save was refused.
     pub error: Option<String>,
+    /// The state's generation and save count this view last saw: a catalog switch clears a
+    /// refusal that was about the old catalog's form; a save puts the stored (trimmed)
+    /// values back into the fields even when they equal what was shown before.
+    seen: (u64, u64),
     _subscriptions: Vec<Subscription>,
 }
 
@@ -149,8 +153,19 @@ impl ObsidianSettings {
     pub fn new(state: Entity<ObsidianState>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let vault = cx.new(|cx| InputState::new(window, cx).placeholder("My vault"));
         let folder = cx.new(|cx| InputState::new(window, cx).placeholder("ChairPhoto"));
-        let _subscriptions = vec![cx.observe(&state, |_, _, cx| cx.notify())];
-        ObsidianSettings { state, vault, folder, shown: None, error: None, _subscriptions }
+        let _subscriptions = vec![cx.observe(&state, |this, state, cx| {
+            let seen = (state.read(cx).generation(), state.read(cx).saves);
+            if seen.0 != this.seen.0 {
+                this.error = None;
+            }
+            if seen.1 != this.seen.1 {
+                this.shown = None;
+            }
+            this.seen = seen;
+            cx.notify();
+        })];
+        let seen = (state.read(cx).generation(), state.read(cx).saves);
+        ObsidianSettings { state, vault, folder, shown: None, error: None, seen, _subscriptions }
     }
 
     pub fn save(&mut self, cx: &mut Context<Self>) {

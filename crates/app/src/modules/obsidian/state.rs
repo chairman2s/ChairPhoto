@@ -200,6 +200,11 @@ impl ObsidianState {
         }
     }
 
+    /// Bumped by every catalog switch (and by unloading the module).
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
     /// Whether the settings have been read (Save needs the catalog they came from).
     pub fn settings_ready(&self) -> bool {
         self.settings_from.is_some()

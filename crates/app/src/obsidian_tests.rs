@@ -289,6 +289,38 @@ fn a_stale_settings_reload_does_not_undo_a_save(cx: &mut TestAppContext) {
     state.read_with(cx, |st, _| assert_eq!(st.vault.as_deref(), Some("New"), "a later reload agrees"));
 }
 
+/// After a Save the fields show what was stored — trimmed — even when that equals what they
+/// showed before the edit; a refusal shown for one catalog's form is cleared by a switch.
+///
+/// Mutation-checked: not resetting `shown` on a save leaves "  Vault " in the field; not
+/// clearing the error on a new generation leaves the refusal up after the switch. Each fails
+/// this test.
+#[gpui_kit::test]
+fn the_settings_fields_follow_a_save_and_a_switch_clears_a_refusal(cx: &mut TestAppContext) {
+    let s = open_ob(1, "ob-settings-nits", cx);
+    s.set_vault("Vault");
+    s.app.wired.model.update(cx, |m, cx| m.refresh(cx));
+    work(&s.app, cx);
+    let settings = s.open_settings(cx);
+    let vault = settings.read_with(cx, |v, _| v.vault.clone());
+    assert_eq!(vault.read_with(cx, |i, _| i.value().to_string()), "Vault");
+
+    s.set_input(&vault, "  Vault ", cx);
+    s.click("obsidian-save", cx);
+    assert_eq!(status(&s.app, cx), "Obsidian settings saved");
+    assert_eq!(vault.read_with(cx, |i, _| i.value().to_string()), "Vault", "the field shows the stored, trimmed value");
+
+    s.set_input(&vault, "/home/me/Vault", cx);
+    s.click("obsidian-save", cx);
+    settings.read_with(cx, |v, _| assert!(v.error.is_some(), "a path is refused"));
+
+    let (b, _) = colliding_catalog(&s.dir, "b", 1);
+    core_switch(&s.app, b);
+    deliver_switch(&s.app, cx);
+    work(&s.app, cx);
+    settings.read_with(cx, |v, _| assert_eq!(v.error, None, "the switch cleared the refusal"));
+}
+
 // --- photo notes ----------------------------------------------------------------------------
 
 /// The inspector's "Note": without a vault, Create only says where to set one (nothing opens,

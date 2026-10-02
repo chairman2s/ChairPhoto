@@ -247,13 +247,13 @@ pub const EXPORT_PARITY_KEY: &str = "metrics.exportParity";
 /// One export job's parity tally (`plugins::edit::parity::ParityTally`); nothing without
 /// the `edit` feature, which is what checks exports.
 #[cfg(feature = "edit")]
-type JobParity = crate::plugins::edit::parity::ParityTally;
+pub(crate) type JobParity = crate::plugins::edit::parity::ParityTally;
 #[cfg(not(feature = "edit"))]
-type JobParity = ();
+pub(crate) type JobParity = ();
 
 /// Run one export job's writes, `f`, collecting the parity checks they record into the
 /// job's own tally (`plugins::edit::parity::collect`) rather than the process-wide one.
-fn collect_parity<R>(f: impl FnOnce() -> R) -> (R, JobParity) {
+pub(crate) fn collect_parity<R>(f: impl FnOnce() -> R) -> (R, JobParity) {
     #[cfg(feature = "edit")]
     return crate::plugins::edit::parity::collect(f);
     #[cfg(not(feature = "edit"))]
@@ -262,8 +262,9 @@ fn collect_parity<R>(f: impl FnOnce() -> R) -> (R, JobParity) {
 
 /// Add the engine-2 exports checked outside any export job's own tally (the process-wide
 /// `parity::take`) to the open catalog's total. Called after the commands that write an
-/// export without collecting their own (publishing, Instagram, LocalSend); best-effort — a
-/// failed write loses a count, never an export.
+/// export without collecting their own — Instagram today; the Flickr/SmugMug render
+/// (`crate::publishing`) and the LocalSend send (`app::localsend`) collect their own.
+/// Best-effort — a failed write loses a count, never an export.
 pub fn record_export_parity(state: &AppState) {
     #[cfg(feature = "edit")]
     record_parity_tally(state, None, crate::plugins::edit::parity::take());
@@ -274,7 +275,7 @@ pub fn record_export_parity(state: &AppState) {
 /// Add `tally` — one export job's own — to the total of `from`, the catalog the export read:
 /// once another catalog is open the tally is dropped (it counts the old catalog's exports),
 /// never added to the new catalog's total. `None`: whichever catalog is open.
-fn record_parity_tally(state: &AppState, from: Option<CatalogIdentity>, tally: JobParity) {
+pub(crate) fn record_parity_tally(state: &AppState, from: Option<CatalogIdentity>, tally: JobParity) {
     #[cfg(feature = "edit")]
     {
         use crate::plugins::edit::parity::ParityTally;

@@ -4,7 +4,7 @@
 //! network. Discovery does bind a short-lived inbound port to hear peers' register replies
 //! (see [`register`], issue #55); that port answers `register` and refuses uploads.
 //!
-//! Commands in `commands.rs` wire these to the catalog and the render path (LS2); the
+//! The send job (`app::localsend`) wires these to the catalog and the render path; the
 //! frontend module renders the device picker and (for Snapchat) records the publication.
 //! Endpoints per the LocalSend v2 protocol (github.com/localsend/protocol).
 //!
@@ -25,6 +25,8 @@ use tokio::net::UdpSocket;
 mod identity;
 mod register;
 mod scan;
+#[cfg(test)]
+pub(crate) mod test_receiver;
 
 /// LocalSend's well-known multicast group + port for discovery announcements.
 const MULTICAST_ADDR: Ipv4Addr = Ipv4Addr::new(224, 0, 0, 167);
@@ -821,17 +823,41 @@ pub async fn probe_protocol(ip: &str, port: u16) -> Option<&'static str> {
     None
 }
 
+/// What a send answers when it was stopped — by Cancel, a newer send or a catalog switch
+/// (`app::localsend`). Files already uploaded stay on the device; the receiver's session is
+/// cancelled so it stops waiting for the rest.
+pub const SEND_CANCELLED: &str = "Send cancelled";
+
 /// Send `paths` to `device` over LocalSend v2: prepare-upload (retrying with `?pin=` on a 401
 /// from a PIN-protected receiver), then upload each file's raw bytes. `progress(done, total)`
-/// is called after each file completes (LS2 forwards it to a `localsend:progress` event).
+/// is called after each file completes. Not cancellable — see [`send_files_abortable`].
 pub async fn send_files(
     device: &Device,
     paths: &[std::path::PathBuf],
     pin: Option<&str>,
+    progress: impl FnMut(usize, usize),
+) -> Result<(), String> {
+    send_files_abortable(device, paths, pin, &std::sync::atomic::AtomicBool::new(false), progress).await
+}
+
+/// [`send_files`], stopping with [`SEND_CANCELLED`] once `abort` is set: before the
+/// handshake, while it waits on prepare-upload, between files, and in the middle of an upload
+/// (the request is dropped). Once a session exists, a stop also sends `POST /cancel` for it,
+/// best-effort, so the receiver does not sit waiting for files that will never come.
+pub async fn send_files_abortable(
+    device: &Device,
+    paths: &[std::path::PathBuf],
+    pin: Option<&str>,
+    abort: &std::sync::atomic::AtomicBool,
     mut progress: impl FnMut(usize, usize),
 ) -> Result<(), String> {
+    use std::sync::atomic::Ordering;
     if paths.is_empty() {
         return Err("LocalSend: nothing to send".into());
+    }
+    let aborted = || abort.load(Ordering::Relaxed);
+    if aborted() {
+        return Err(SEND_CANCELLED.into());
     }
 
     // A manually entered address carries no announced scheme (see `probe_protocol`). Resolve
@@ -839,7 +865,10 @@ pub async fn send_files(
     // what the peer actually speaks.
     let resolved;
     let device = if device.protocol.trim().is_empty() {
-        let scheme = probe_protocol(&device.ip, device.port).await.unwrap_or("https");
+        let scheme = tokio::select! {
+            scheme = probe_protocol(&device.ip, device.port) => scheme.unwrap_or("https"),
+            _ = until_aborted(abort) => return Err(SEND_CANCELLED.into()),
+        };
         resolved = Device { protocol: scheme.to_string(), ..device.clone() };
         &resolved
     } else {
@@ -858,11 +887,19 @@ pub async fn send_files(
     let client = client_for(device)?;
     let base = base_url(device);
 
-    // prepare-upload (retry once with the PIN if the receiver demands one).
-    let session = prepare_upload(&client, &base, &body, pin).await?;
+    // prepare-upload (retry once with the PIN if the receiver demands one). A stop here has
+    // no session to cancel yet.
+    let session = tokio::select! {
+        session = prepare_upload(&client, &base, &body, pin) => session?,
+        _ = until_aborted(abort) => return Err(SEND_CANCELLED.into()),
+    };
 
     let total = metas.len();
     for (i, (meta, path)) in metas.iter().zip(paths.iter()).enumerate() {
+        if aborted() {
+            cancel_session(&client, &base, &session.session_id).await;
+            return Err(SEND_CANCELLED.into());
+        }
         let token = session.tokens.get(&meta.id).cloned().ok_or_else(|| {
             format!("LocalSend: receiver returned no upload token for {}", meta.file_name)
         })?;
@@ -875,13 +912,18 @@ pub async fn send_files(
             urlencode(&meta.id),
             urlencode(&token),
         );
-        let resp = client
+        let upload = client
             .post(&url)
             .header("Content-Type", "application/octet-stream")
             .body(bytes)
-            .send()
-            .await
-            .map_err(|e| format!("LocalSend upload failed ({}): {e}", meta.file_name))?;
+            .send();
+        let resp = tokio::select! {
+            resp = upload => resp.map_err(|e| format!("LocalSend upload failed ({}): {e}", meta.file_name))?,
+            _ = until_aborted(abort) => {
+                cancel_session(&client, &base, &session.session_id).await;
+                return Err(SEND_CANCELLED.into());
+            }
+        };
         if !resp.status().is_success() {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
@@ -893,6 +935,35 @@ pub async fn send_files(
         progress(i + 1, total);
     }
     Ok(())
+}
+
+/// How often a running send looks at its abort flag.
+const ABORT_POLL: Duration = Duration::from_millis(50);
+/// How long a stopped send waits for the receiver to take its `cancel`.
+const CANCEL_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Resolves once `abort` is set.
+async fn until_aborted(abort: &std::sync::atomic::AtomicBool) {
+    while !abort.load(std::sync::atomic::Ordering::Relaxed) {
+        tokio::time::sleep(ABORT_POLL).await;
+    }
+}
+
+/// `POST /cancel?sessionId=` — tell the receiver this session ends here. Best-effort: a
+/// receiver that does not answer only keeps its "receiving…" screen up a little longer.
+async fn cancel_session(client: &reqwest::Client, base: &str, session_id: &str) {
+    let url = format!("{base}/cancel?sessionId={}", urlencode(session_id));
+    match tokio::time::timeout(CANCEL_TIMEOUT, client.post(&url).send()).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => eprintln!("localsend: cancel request failed: {e}"),
+        Err(_) => eprintln!("localsend: the receiver did not answer the cancel in time"),
+    }
+}
+
+/// [`discover`] for a caller off the async runtime (a blocking worker): runs it on the core
+/// runtime and waits. Not from inside an async task.
+pub fn discover_blocking(timeout_ms: u64) -> Result<Vec<Device>, String> {
+    crate::app::runtime().block_on(discover(timeout_ms))
 }
 
 /// POST prepare-upload; on a `401` retry once with `?pin=<pin>` (PIN-protected receiver).

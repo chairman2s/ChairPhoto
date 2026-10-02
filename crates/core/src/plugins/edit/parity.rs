@@ -35,7 +35,7 @@ pub struct ParityTally {
 }
 
 /// Checks recorded outside any [`collect`] — the commands that still drain it with [`take`]
-/// (publishing, Instagram, LocalSend).
+/// (Instagram).
 static TALLY: Mutex<ParityTally> = Mutex::new(ParityTally { checked: 0, differing: 0 });
 
 thread_local! {

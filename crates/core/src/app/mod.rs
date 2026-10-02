@@ -27,6 +27,8 @@ pub mod exports;
 pub mod identity;
 pub mod iptc;
 pub mod jobs;
+#[cfg(feature = "localsend")]
+pub mod localsend;
 pub mod scans;
 #[cfg(feature = "slideshow")]
 pub mod slideshow;
@@ -284,6 +286,13 @@ pub fn with_catalog_as<T>(
         return Err(CATALOG_CHANGED.into());
     }
     f(catalog).map_err(|e| e.to_string())
+}
+
+/// The identity of `catalog`, for code that already holds the catalog lock and must say
+/// which catalog it read (a job's claim, a render's parity tally).
+#[cfg(any(feature = "flickr", feature = "smugmug", feature = "instagram", feature = "localsend"))]
+pub(crate) fn identity_of(catalog: &Catalog) -> CatalogIdentity {
+    CatalogIdentity(catalog.instance_id())
 }
 
 impl CatalogIdentity {

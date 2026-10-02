@@ -130,6 +130,9 @@ pub struct SlideshowProgress {
 pub struct LocalSendProgress {
     pub done: usize,
     pub total: usize,
+    /// The send this belongs to (`app::localsend::claim_send`), so a front end drops a
+    /// superseded send's stragglers.
+    pub job: u64,
 }
 
 /// Progress event payload for card import, emitted as `import:progress` during the copy.

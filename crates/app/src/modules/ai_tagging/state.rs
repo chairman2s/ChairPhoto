@@ -8,8 +8,9 @@
 //! a catalog switch (or unloading the module) bumps it, so a late answer changes nothing.
 //!
 //! **Privacy (AGENTS.md).** A photo reaches a provider only through [`AiBackend`], and only
-//! from [`AiState::run`] or a confirmed batch, both after [`AiState::may_send`]: Ollama is local;
-//! a cloud provider needs its own saved API key (the per-provider opt-in), and a cloud batch of
+//! from [`AiState::run`] or a confirmed batch, both after [`AiState::may_send`]: Ollama at a
+//! loopback URL is local; an Ollama server elsewhere needs that URL allowed, a cloud provider
+//! its own saved API key (the per-provider opt-ins), and a cloud batch of
 //! more than one photo needs the user's Proceed on the cost confirm, which closes when the
 //! engine, the model or the catalog changes. Every run passes the engine the user consented
 //! to down to the core ([`Confirmed`]), which refuses when the catalog's settings name another
@@ -134,6 +135,11 @@ impl Stored {
     /// The provider's saved API key; empty for Ollama or when none is saved.
     pub fn api_key(&self) -> &str {
         api_key_key(&self.provider()).map_or("", |k| self.raw(k))
+    }
+
+    /// Whether these settings opt into sending ([`logic::send_opt_in`]).
+    pub fn opt_in(&self) -> Result<(), String> {
+        logic::send_opt_in(&self.provider(), self.api_key(), &self.value("ollama_url"), self.raw("ollama_remote_url"))
     }
 
     /// The engine these settings name — what a run started from them is consenting to.
@@ -504,13 +510,14 @@ impl AiState {
     // --- consent ----------------------------------------------------------------------------
 
     /// Whether a run may send photos now, and bound to which catalog: the settings must be
-    /// read from the catalog the photos are from, and a cloud engine needs its saved API key.
+    /// read from the catalog the photos are from, and a remote engine needs its opt-in — a
+    /// cloud engine its saved API key, an Ollama server not on this machine its allowed URL.
     /// Nothing is read or sent when this refuses.
     pub fn may_send(&self, from: CatalogIdentity) -> Result<(), String> {
         let stored = self.stored.as_ref().filter(|_| self.settings_from == Some(from)).ok_or_else(|| {
             "AI tagging: the settings are still loading; try again.".to_string()
         })?;
-        logic::cloud_opt_in(&stored.provider(), stored.api_key())
+        stored.opt_in()
     }
 
     // --- runs -------------------------------------------------------------------------------

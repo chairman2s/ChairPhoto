@@ -69,9 +69,11 @@ pub fn provider_fields(provider: &str) -> [(&'static str, &'static str); 2] {
 
 /// Every `ai.*` key the settings panel saves, with its default (`DEFAULTS`). A blank stored
 /// value reads as the default, as the backend's `read_config` does.
-pub const DEFAULTS: [(&str, &str); 12] = [
+pub const DEFAULTS: [(&str, &str); 13] = [
     ("provider", "ollama"),
     ("ollama_url", "http://localhost:11434"),
+    // The non-loopback Ollama URL the user allowed photos to go to (blank: none).
+    ("ollama_remote_url", ""),
     ("ollama_model", "llava:latest"),
     ("cloud_model", "claude-sonnet-4-6"),
     ("cloud_api_key", ""),
@@ -177,17 +179,17 @@ pub fn batch_done_line(total: usize, representatives: usize, propagated: usize) 
     format!("Done — {total} photos → {representatives} representatives, {propagated} suggestions. Review each photo.")
 }
 
-/// Whether a run may send photos to `provider` now: Ollama is local; a cloud provider is
-/// opted into by choosing it **and** saving its API key (the per-provider, explicit opt-in the
-/// React app had). Without the key no preview is even read: the refusal names the fix.
-pub fn cloud_opt_in(provider: &str, api_key: &str) -> Result<(), String> {
-    if !is_cloud(provider) || !api_key.trim().is_empty() {
-        return Ok(());
-    }
-    Err(format!(
-        "{} is a cloud engine: photos are sent to it only after you save its API key in Preferences → AI Tagging.",
-        provider_short(provider)
-    ))
+/// Whether a run may send photos to `provider` now — the core's rule
+/// (`plugins::ai::opt_in`): Ollama at a loopback URL is local; a cloud provider is opted into
+/// by choosing it **and** saving its API key; an Ollama server not on this machine by allowing
+/// that exact URL. Without the opt-in no preview is even read: the refusal names the fix.
+pub fn send_opt_in(provider: &str, api_key: &str, ollama_url: &str, ollama_remote_url: &str) -> Result<(), String> {
+    chairphoto_core::plugins::ai::opt_in(provider, api_key, ollama_url, ollama_remote_url)
+}
+
+/// Whether the Ollama server at `url` is on this machine (a loopback literal; no DNS).
+pub fn is_local_url(url: &str) -> bool {
+    chairphoto_core::plugins::ai::is_loopback_url(url)
 }
 
 #[cfg(test)]
@@ -244,11 +246,12 @@ mod tests {
     }
 
     #[test]
-    fn cloud_needs_its_key_and_ollama_needs_nothing() {
-        assert!(cloud_opt_in("ollama", "").is_ok());
-        assert!(cloud_opt_in("claude", "sk-x").is_ok());
-        let e = cloud_opt_in("gemini", "  ").unwrap_err();
+    fn cloud_needs_its_key_and_local_ollama_needs_nothing() {
+        assert!(send_opt_in("ollama", "", "http://localhost:11434", "").is_ok());
+        assert!(send_opt_in("claude", "sk-x", "", "").is_ok());
+        let e = send_opt_in("gemini", "  ", "", "").unwrap_err();
         assert!(e.contains("Gemini") && e.contains("API key"), "{e}");
+        assert!(send_opt_in("ollama", "", "http://10.0.0.2:11434", "").is_err());
     }
 
     #[test]

@@ -342,6 +342,50 @@ fn no_photo_reaches_a_cloud_engine_without_its_key(cx: &mut TestAppContext) {
     assert_eq!(a.fake.suggests.lock().unwrap().len(), 1);
 }
 
+/// An Ollama URL that is not a loopback literal is remote: neither Suggest nor a batch reaches
+/// the provider side until the user allows that server in the settings (which saves its URL as
+/// `ai.ollama_remote_url`); the settings say photos leave the machine. Pointing the URL at
+/// another host needs a new opt-in. Loopback Ollama needs none (the test above).
+///
+/// Mutation-checked: `Stored::opt_in` always Ok makes the first `sent() == 0` fail.
+#[gpui_kit::test]
+fn a_remote_ollama_gets_nothing_until_allowed(cx: &mut TestAppContext) {
+    let remote = "http://192.168.1.20:11434";
+    let a = open_ai(3, &[("ollama_url", remote)], "ai-remote-ollama", cx);
+    a.select(a.ids[0], cx);
+    a.click("ai-suggest", cx);
+    assert_eq!(a.fake.sent(), 0, "a photo went to an Ollama server elsewhere without its opt-in");
+    let state = a.state(cx);
+    state.read_with(cx, |s, _| assert!(s.error.as_deref().unwrap().contains("not on this machine")));
+    a.select_all(cx);
+    a.click("ai-batch", cx);
+    assert_eq!(a.fake.sent(), 0, "a batch went to an Ollama server elsewhere without its opt-in");
+
+    // Preferences: the server is flagged remote; allowing it saves its URL.
+    cx.update_window(a.window(), |_, window, cx| window.dispatch_action(Box::new(crate::shell::actions::OpenPreferences), cx))
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(450)); // the dialog's open animation
+    cx.run_until_parked();
+    a.click("prefs-tab-module-ai", cx);
+    assert!(a.present("ai-remote-note", cx), "the settings say photos leave the machine");
+    a.click("ai-set-ollama-remote", cx);
+    a.click("ai-set-save", cx);
+    with_cat(&a.app, |c| assert_eq!(c.get_setting("ai.ollama_remote_url").unwrap().as_deref(), Some(remote)));
+    // (Preferences is still open over the panel: run as its Suggest button does.)
+    a.select(a.ids[0], cx);
+    state.update(cx, |s, cx| s.run(None, false, cx));
+    work(&a.app, cx);
+    state.read_with(cx, |s, _| assert_eq!(s.error, None));
+    assert_eq!(a.fake.suggests.lock().unwrap().len(), 1, "allowed, the server is asked");
+
+    // Another host is another opt-in.
+    state.update(cx, |s, cx| s.save(vec![("ollama_url", "http://192.168.1.21:11434".into())], cx));
+    work(&a.app, cx);
+    state.update(cx, |s, cx| s.run(None, false, cx));
+    work(&a.app, cx);
+    assert_eq!(a.fake.suggests.lock().unwrap().len(), 1, "the opt-in carried to another server");
+}
+
 // --- the bulk cloud confirm ---------------------------------------------------------------
 
 /// A cloud batch of several photos waits for Proceed: the estimate (per burst

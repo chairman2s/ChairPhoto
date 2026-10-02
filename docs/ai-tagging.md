@@ -37,10 +37,23 @@ confirm at Proceed); the core compares it with the settings it reads and refuses
 a preview when they differ, so a settings save landing between the consent and the run sends
 nothing.
 
+**What counts as local.** Only Ollama at a **loopback literal** is local: an `ai.ollama_url`
+whose host is `localhost`, an IPv4 address in `127.0.0.0/8`, or `::1` (also the IPv4-mapped
+`::ffff:127.x.x.x`) — `plugins::ai::is_loopback_url`. The rule reads the URL text alone; it does
+no DNS lookup at check time, so a LAN address, a host name (even one that resolves to this
+machine today), `0.0.0.0`, `*.localhost` and an unparseable URL all count as **remote**. A remote
+Ollama server is treated like a cloud provider: photos go to it only after the user allows that
+exact URL (Preferences → AI Tagging → "Send photos to this Ollama server", stored as
+`ai.ollama_remote_url`; pointing the URL at another host needs a new opt-in), and private tags
+are withheld from it. The core enforces the opt-in (`plugins::ai::opt_in`, checked by
+`app::ai::admit` before any preview is read) for every front end; the React settings panel has
+no control for it, so the Tauri shell refuses a remote Ollama until the setting is saved.
+
 A tag can be marked **private** (`tags.private`) — typically every name under `People`. Private
-tags are stripped from the vocabulary sent to cloud providers, so personal names never leave the
-machine; the local model still receives the full list. Set through the tag context menu
-("Make private…", recursive on a parent) via `set_tag_private`. Filtering happens in
+tags are stripped from the vocabulary sent to remote engines (cloud providers, or Ollama not on
+this machine), so personal names never leave the machine; a local model (Ollama at a loopback
+URL) still receives the full list. Set through the tag context menu ("Make private…", recursive
+on a parent) via `set_tag_private`. Filtering happens in
 `ai::taxonomy_text`, gated on `Config::is_local`. Privacy affects only what is transmitted — not
 export, filtering, or display.
 

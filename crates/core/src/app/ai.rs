@@ -9,8 +9,10 @@
 //! the default) or a cloud provider the user chose, whose own API key must be saved. The
 //! per-run consent a front end owes the user (the bulk cloud cost confirm) is the front end's;
 //! it passes the engine the user consented to as a [`Confirmed`], and a run refuses before any
-//! preview is read when the settings name another provider or model. Private
-//! tags are withheld from cloud providers (`plugins::ai::taxonomy_text`). Nothing here logs
+//! preview is read when the settings name another provider or model, or when that engine is
+//! not opted into (a cloud provider without its key; an Ollama server that is not on this
+//! machine — `plugins::ai::is_loopback_url` — without its URL allowed). Private tags are
+//! withheld from every remote engine (`plugins::ai::taxonomy_text`). Nothing here logs
 //! the configuration (it holds the API keys).
 //!
 //! **Catalog identity.** Every body takes an optional [`CatalogIdentity`]: with one, each of
@@ -259,12 +261,13 @@ pub struct Confirmed {
 pub const ENGINE_CHANGED: &str = "The AI engine or model changed since you asked — nothing was sent; try again.";
 
 /// Whether a run with `config` may send: it must be the engine the user confirmed (when the
-/// front end passed one).
+/// front end passed one), and that engine must be opted into ([`ai::Config::opt_in`]: a cloud
+/// provider's saved key, or the allowed URL of an Ollama server not on this machine).
 #[cfg(feature = "ai")]
 pub fn admit(config: &ai::Config, confirmed: Option<&Confirmed>) -> Result<(), String> {
     match confirmed {
         Some(c) if c.provider != config.provider || c.model != config.model() => Err(ENGINE_CHANGED.to_string()),
-        _ => Ok(()),
+        _ => config.opt_in(),
     }
 }
 
@@ -560,6 +563,7 @@ mod tests {
     pub(crate) struct FakeProvider {
         pub images: std::sync::atomic::AtomicUsize,
         pub calls: std::sync::Mutex<Vec<String>>,
+        pub taxonomies: std::sync::Mutex<Vec<String>>,
     }
 
     impl Provider for FakeProvider {
@@ -568,8 +572,9 @@ mod tests {
             Ok("aW1n".into())
         }
 
-        async fn suggest(&self, config: &ai::Config, _: &str, _: &str, _: &[String], _: Option<&str>) -> Result<Vec<ai::Raw>, String> {
+        async fn suggest(&self, config: &ai::Config, _: &str, taxonomy: &str, _: &[String], _: Option<&str>) -> Result<Vec<ai::Raw>, String> {
             self.calls.lock().unwrap().push(format!("{}/{}", config.provider, config.model()));
+            self.taxonomies.lock().unwrap().push(taxonomy.to_string());
             Ok(vec![raw("Animals/Gull", 0.9)])
         }
     }
@@ -606,6 +611,43 @@ mod tests {
         let list = rt.block_on(suggest_tags_via(&state, None, confirmed("claude", "claude-opus-4-8"), 1, None, None, fake.clone())).unwrap();
         assert_eq!(list.len(), 1);
         assert_eq!(*fake.calls.lock().unwrap(), vec!["claude/claude-opus-4-8".to_string()]);
+    }
+
+    /// An Ollama server that is not on this machine is remote: without its URL allowed nothing
+    /// is read or sent; allowed, it runs — and, like a cloud provider, gets no private tags.
+    /// Ollama at a loopback URL needs no opt-in and gets the whole vocabulary.
+    ///
+    /// Mutation-checked: `is_local` back to `provider == "ollama"` fails the private-tag
+    /// assertion; `admit` without `opt_in` fails the "nothing sent" one.
+    #[test]
+    fn a_remote_ollama_needs_its_opt_in_and_gets_no_private_tags() {
+        let (c, _dir) = catalog("remote-ollama", 2);
+        c.create_tag("Animals/Gull").unwrap();
+        let alice = c.create_tag("People/Alice").unwrap();
+        c.set_tag_private(alice, true, false).unwrap();
+        c.set_setting("ai.ollama_url", "http://192.168.1.20:11434").unwrap();
+        let state = AppState::default();
+        *state.catalog.lock().unwrap() = Some(c);
+        let fake = std::sync::Arc::new(FakeProvider::default());
+        let rt = super::super::runtime();
+        let set = |k: &str, v: &str| state.catalog.lock().unwrap().as_ref().unwrap().set_setting(k, v).unwrap();
+
+        let e = rt.block_on(suggest_tags_via(&state, None, None, 1, None, None, fake.clone())).unwrap_err();
+        assert!(e.contains("not on this machine"), "{e}");
+        let e = rt.block_on(suggest_tags_grouped_via(&state, None, None, vec![1, 2], fake.clone())).unwrap_err();
+        assert!(e.contains("not on this machine"), "{e}");
+        assert_eq!(fake.images.load(std::sync::atomic::Ordering::SeqCst), 0, "a preview was read for a remote server");
+        assert!(fake.calls.lock().unwrap().is_empty(), "a photo went to a remote Ollama without its opt-in");
+
+        set("ai.ollama_remote_url", "http://192.168.1.20:11434");
+        rt.block_on(suggest_tags_via(&state, None, None, 1, None, None, fake.clone())).unwrap();
+        let sent = fake.taxonomies.lock().unwrap().last().cloned().unwrap();
+        assert!(sent.contains("Animals/Gull") && !sent.contains("Alice"), "a remote server got the private tags: {sent}");
+
+        set("ai.ollama_url", "http://127.0.0.1:11434");
+        rt.block_on(suggest_tags_via(&state, None, None, 1, None, None, fake.clone())).unwrap();
+        let sent = fake.taxonomies.lock().unwrap().last().cloned().unwrap();
+        assert!(sent.contains("People/Alice"), "the local model gets the whole vocabulary: {sent}");
     }
 
     /// The estimate and every phase of a bound run read only the catalog they were bound to.

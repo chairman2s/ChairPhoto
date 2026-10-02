@@ -161,20 +161,31 @@ impl SidecarDocument {
     ///
     /// Not used by the face-region writer, which has its own Name+Area matching rule for
     /// deciding what to keep (see `write_face_regions` in `mod.rs`).
+    ///
+    /// The owned properties are removed from **every** top-level `rdf:Description` — exiftool
+    /// writes one per namespace, so a stale value can sit in any of them (#142) — and the
+    /// replacements go into the first.
     pub(super) fn replace_owned(&mut self, owned: &[(&str, &str)], replacements: Vec<XMLNode>) {
-        let desc = self.description_mut();
-        remove_owned(desc, owned);
-        desc.children.extend(replacements);
+        self.remove_owned_everywhere(owned);
+        self.description_mut().children.extend(replacements);
+    }
+
+    fn remove_owned_everywhere(&mut self, owned: &[(&str, &str)]) {
+        for node in &mut self.rdf_mut().children {
+            if let XMLNode::Element(desc) = node {
+                if desc.namespace.as_deref() == Some(NS_RDF) && desc.name == "Description" {
+                    remove_owned(desc, owned);
+                }
+            }
+        }
     }
 
     /// Commit the transaction: re-stamp `chairphoto:LastWrite` (removing any prior instance —
     /// this is the single path every writer's completion timestamp goes through), serialize,
     /// and write the sidecar to disk, creating parent directories as needed.
     pub(super) fn commit(mut self) -> Result<(), String> {
-        let desc = self.description_mut();
-        remove_owned(desc, &[(NS_CHAIRPHOTO, "LastWrite")]);
-        desc.children
-            .push(plain("chairphoto", NS_CHAIRPHOTO, "LastWrite", &now().to_string()));
+        let stamp = plain("chairphoto", NS_CHAIRPHOTO, "LastWrite", &now().to_string());
+        self.replace_owned(&[(NS_CHAIRPHOTO, "LastWrite")], vec![stamp]);
 
         let mut buf = Vec::new();
         self.root.write(&mut buf).map_err(|e| e.to_string())?;

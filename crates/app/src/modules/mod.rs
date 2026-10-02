@@ -38,10 +38,13 @@
 //! returns.
 
 pub mod dialog;
+pub mod flickr;
+pub mod instagram;
 pub mod obsidian;
 pub mod panel;
 pub mod publishing;
 pub mod registry;
+pub mod smugmug;
 pub mod statistics;
 
 #[cfg(feature = "ai")]
@@ -395,6 +398,13 @@ impl ModuleSettings {
         self.catalog
     }
 
+    /// The same module's settings, bound to `catalog` instead: for a long-lived view (a
+    /// settings panel outlives a catalog switch) that has just read which catalog is open
+    /// ([`AppModel::catalog_identity`] on `CatalogRead`). Still fails closed once another opens.
+    pub fn rebound(&self, catalog: CatalogIdentity) -> ModuleSettings {
+        ModuleSettings { app: self.app.clone(), prefix: self.prefix.clone(), catalog: Some(catalog) }
+    }
+
     pub fn get(&self, key: &str) -> Result<Option<String>, String> {
         let key = self.key(key);
         with_catalog_as(&self.app, self.bound()?, |c| c.get_setting(&key))
@@ -410,6 +420,19 @@ impl ModuleSettings {
     }
 }
 
+/// A publishing module's settings are its service's (`<id>.api_key`, `.access_token`, …): the
+/// keys core's publish bodies (`chairphoto_core::app::oauth`, `::flickr`, `::smugmug`) read
+/// and write, through this handle — so bound to its catalog like every other module write.
+impl chairphoto_core::app::uploads::ServiceSettings for ModuleSettings {
+    fn get(&self, key: &str) -> Result<Option<String>, String> {
+        ModuleSettings::get(self, key)
+    }
+
+    fn set(&self, key: &str, value: &str) -> Result<(), String> {
+        ModuleSettings::set(self, key, value)
+    }
+}
+
 /// The first-party modules this build ships, in registration order: the order of
 /// `BUNDLED_MODULES` in `src/modules/bundled.ts` as each is ported (#123–#129), each behind
 /// its backend's cargo feature like the Tauri shell's features. A module whose backend is
@@ -422,6 +445,11 @@ pub fn bundled() -> Vec<Rc<dyn Module>> {
     #[cfg(feature = "ai")]
     modules.push(Rc::new(ai_tagging::AiTaggingModule));
     modules.push(Rc::new(statistics::StatisticsModule));
+    // Registered without their backends too (Flickr's and SmugMug's are opt-in features):
+    // the Modules panel then says so.
+    modules.push(Rc::new(instagram::InstagramModule::default()));
+    modules.push(Rc::new(flickr::FlickrModule::default()));
+    modules.push(Rc::new(smugmug::SmugMugModule::default()));
     #[cfg(feature = "collage")]
     modules.push(Rc::new(collage::CollageModule::default()));
     #[cfg(feature = "slideshow")]

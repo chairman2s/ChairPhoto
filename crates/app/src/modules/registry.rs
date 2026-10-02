@@ -82,8 +82,9 @@ pub const RESERVED_NAMESPACES: &[&str] =
 
 /// Namespaces a module shares with its own backend, deliberately, as in React: the module
 /// whose id this is reads and writes the keys its core backend reads (`ai.*` burst settings,
-/// `faces.*`, `smarttags.*`). Only that module may take the id.
-pub const BACKEND_NAMESPACES: &[&str] = &["ai", "faces", "smarttags"];
+/// `faces.*`, `smarttags.*`, and the Flickr/SmugMug keys and OAuth tokens the Tauri commands
+/// read as `flickr.*` / `smugmug.*`). Only that module may take the id.
+pub const BACKEND_NAMESPACES: &[&str] = &["ai", "faces", "smarttags", "flickr", "smugmug"];
 
 /// Why `id` cannot be a module id, or `Ok`. Ids are settings namespaces (`<id>.<key>`) and
 /// entries in a comma-separated list: a `.` would let `a` + `b.c` and `a.b` + `c` name the

@@ -20,6 +20,8 @@ pub mod ai;
 mod boot;
 pub mod catalogs;
 pub mod editing;
+#[cfg(feature = "flickr")]
+pub mod flickr;
 pub mod bundles;
 #[cfg(feature = "collage")]
 pub mod collage;
@@ -28,8 +30,12 @@ pub mod exports;
 #[cfg(feature = "faces")]
 pub mod faces;
 pub mod identity;
+#[cfg(feature = "instagram")]
+pub mod instagram;
 pub mod iptc;
 pub mod jobs;
+#[cfg(any(feature = "flickr", feature = "smugmug"))]
+pub mod oauth;
 pub mod publications;
 #[cfg(feature = "localsend")]
 pub mod localsend;
@@ -38,8 +44,11 @@ pub mod scans;
 pub mod smarttags;
 #[cfg(feature = "slideshow")]
 pub mod slideshow;
+#[cfg(feature = "smugmug")]
+pub mod smugmug;
 pub mod storage;
 pub mod tags;
+pub mod uploads;
 
 pub use boot::{boot, boot_with, Boot};
 // `catalogs::switch_catalog` is deliberately not re-exported here: the Tauri shell re-exports
@@ -296,7 +305,6 @@ pub fn with_catalog_as<T>(
 
 /// The identity of `catalog`, for code that already holds the catalog lock and must say
 /// which catalog it read (a job's claim, a render's parity tally).
-#[cfg(any(feature = "flickr", feature = "smugmug", feature = "instagram", feature = "localsend"))]
 pub(crate) fn identity_of(catalog: &Catalog) -> CatalogIdentity {
     CatalogIdentity(catalog.instance_id())
 }

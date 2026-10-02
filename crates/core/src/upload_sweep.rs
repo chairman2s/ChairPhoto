@@ -2,11 +2,11 @@
 //! for.
 //!
 //! The publishing modules (Flickr, SmugMug, Instagram, LocalSend) render each upload into its
-//! own `<temp>/chairphoto-upload-<service>-<random>/` directory (the Tauri shell's
-//! `commands::publishing::JobTempDir`). A crash, a SIGKILL, or a kept Instagram render can
+//! own `<temp>/chairphoto-upload-<service>-<random>/` directory
+//! ([`crate::publishing::JobTempDir`]). A crash, a SIGKILL, or a kept Instagram render can
 //! strand one; [`sweep_abandoned`] reclaims them on the next publish, and
 //! [`sweep_abandoned_uploads_at_startup`] at every start (called by `app::boot`, so every front
-//! end runs it). Compiled only with one of those features.
+//! end runs it; the startup sweep only in a build with one of those features).
 
 use std::path::Path;
 

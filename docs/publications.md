@@ -82,7 +82,8 @@ wrapper in `src/modules/api.ts`, which takes an explicit platform.
 ## How it's surfaced
 
 - **Auto-record:** a confirmed Instagram post records a publication with the version it
-  actually rendered (`post_to_instagram`, `src-tauri/src/commands/instagram.rs`).
+  actually rendered — the React module after `post_to_instagram`, the GPUI module in the post's
+  own job (`crates/app/src/modules/instagram/`); a supervised post only on "Yes, I posted it".
 - **Manual:** the inspector's **Published to** panel (`src/components/PublishedPanel.tsx`)
   lists publications and lets the user mark a Flickr/SmugMug/other post by picking a
   platform and which version (defaults to the inspector's active version).
@@ -95,16 +96,19 @@ What each publish path reports while it runs, as of this writing:
 
 | path | progress | cancellation |
 |---|---|---|
-| Flickr, SmugMug | none — one render, one upload request, and the command returns when it finishes | none |
-| Instagram | none — the supervised flow ends by handing you the composer, which *is* the progress report | none |
+| Flickr, SmugMug | the GPUI panel shows the job's step (Preparing…, Rendering…, Uploading to X…); the Tauri command reports nothing until it returns | a publish is a job per service (`app::uploads`): the GPUI panel's Cancel, a newer publish to the same service or a catalog switch stops it before its render or its upload; **an upload already in flight is not interrupted** |
+| Instagram | the GPUI panel shows Preparing…, Rendering…, then Composing the post in Chrome…; the supervised flow ends by handing you the composer | as Flickr's until Chrome has the render; from then on closing the browser window is the cancel |
 | LocalSend | `localsend:progress` `{ done, total, job }` after each file; a panel shows only its own job's | the GPUI panel's Cancel, a newer send or a catalog switch trips the send job (`app::localsend`): it stops before its next render or file, or mid-upload, and calls `POST /cancel?sessionId=` (React's panel has no Cancel) |
 
-**Only a LocalSend send can be stopped once it has started** (the GPUI app's Cancel; a multi-photo
-send was where a wrong selection meant waiting out every file). For the single-photo services it
-matters much less: by the time a user reaches for Cancel the request is usually already in
-flight, and aborting it would leave the service holding a partial upload it may or may not commit. Instagram cannot be cancelled by us at all in the
-supervised case — the post is finished by the user, in a browser ChairPhoto deliberately
-does not own; closing that window is the cancel.
+**Only a LocalSend send can be stopped mid-transfer** (a multi-photo send was where a wrong
+selection meant waiting out every file). A single-photo publish stops only *before* its upload:
+the render (a full-resolution RAW decode) is the slow part, and aborting an upload in flight
+would leave the service holding bytes it may or may not commit — the user could not know
+whether the photo is online. A catalog switch during an upload lets it finish; recording the
+publication then fails closed (it is bound to the catalog the photo came from) and the panel
+says the photo is published but not recorded, so it is not uploaded twice. Instagram cannot be
+cancelled by us once Chrome has the render — the post is finished by the user, in a browser
+ChairPhoto deliberately does not own; closing that window is the cancel.
 
 ## Rendering and upload strategy: render-first by design
 
@@ -112,10 +116,10 @@ Every upload path renders to a JPEG first and reads the whole render into memory
 
 | Path | How it reads the render | Approx. peak |
 |---|---|---|
-| Flickr (`flickr/mod.rs:739`) | `fs::read()` into memory | ~5–25 MB |
-| SmugMug (`smugmug/mod.rs:208`) | `fs::read()` into memory | ~5–25 MB |
+| Flickr (`flickr/mod.rs`, `upload`) | `fs::read()` into memory | ~5–25 MB |
+| SmugMug (`smugmug/mod.rs`, `upload`) | `fs::read()` into memory | ~5–25 MB |
 | LocalSend (`localsend/mod.rs:863`) | `tokio::fs::read()` into memory, one file per loop iteration | ~5–25 MB |
-| Instagram (`commands/instagram.rs`) | rendered to disk, path passed to Chrome (not uploaded by ChairPhoto) | ~200 KB (1080px cap) |
+| Instagram (`app/instagram.rs`) | rendered to disk, path passed to Chrome (not uploaded by ChairPhoto) | ~200 KB (1080px cap) |
 
 This design is deliberate. **Peak exposure is roughly one full-resolution JPEG** (~5–25 MB for Flickr,
 SmugMug, and LocalSend; ~200 KB for Instagram). LocalSend's batch loop reads one file at a time

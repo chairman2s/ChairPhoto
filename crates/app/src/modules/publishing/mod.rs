@@ -19,18 +19,20 @@
 //! `catalog:switched` reaches the UI. When the event does arrive the form's dialog closes
 //! ([`super::dialog::close_on_switch`]).
 //!
-//! **Temp renders** are core's: each publish renders into a job-scoped, private directory
-//! (`chairphoto_core::publishing::JobTempDir`, mode 0700, a random name) removed however the
-//! job ends.
+//! **A publish is a job** (`chairphoto_core::app::uploads`): claimed per service, rendered into
+//! a job-scoped, private directory (`chairphoto_core::publishing::JobTempDir`, mode 0700, a
+//! random name) removed however the job ends, then uploaded. The panel shows each step; Cancel
+//! stops it before the upload starts; its terminal answer is the upload's own result.
 
 pub mod oauth;
 pub mod panel;
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 use crate::shell::ShellState;
 use crate::storage::Runner;
+use chairphoto_core::app::uploads::{RenderedJob, UploadJob, UploadService};
 use chairphoto_core::app::{with_catalog_as, AppState, CatalogIdentity};
 use chairphoto_core::catalog::PhotoVersion;
 use gpui_kit::component::button::Button;
@@ -166,8 +168,8 @@ pub struct Album {
 /// What one Publish asks a service to do.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PublishRequest {
-    /// The catalog the photo id was read from: the service's render must be bound to it
-    /// (`chairphoto_core::publishing::render_upload_jpeg(state, Some(catalog), …)`).
+    /// The catalog the photo id was read from: the publish job is claimed against it
+    /// (`chairphoto_core::app::uploads::claim_upload`), so it fails closed once another opens.
     pub catalog: CatalogIdentity,
     pub photo_id: i64,
     /// `None` = Original.
@@ -182,21 +184,34 @@ pub struct PublishRequest {
 
 /// The per-service plumbing the shared forms call (`PublishService` in publishing.tsx): what
 /// the Flickr and SmugMug modules implement (#124). Every method is **blocking** (network,
-/// catalog) and runs on a worker; `settings` is the module's own namespaced settings handle,
-/// bound to the catalog its form opened on.
+/// catalog, render) and runs on a worker; `settings` is the module's own namespaced settings
+/// handle, bound to the catalog its form opened on.
+///
+/// A Publish is core's publish job (`chairphoto_core::app::uploads`) in three worker steps the
+/// panel shows as it goes: [`ready`](Self::ready) and the claim, [`render`](Self::render),
+/// [`upload`](Self::upload). Cancel (or a newer publish to the same service, or a catalog
+/// switch) stops it before the render and before the upload; an upload in flight finishes.
 pub trait PublishService: Send + Sync + 'static {
     /// Display name, e.g. "Flickr".
     fn name(&self) -> SharedString;
     /// Where to register the developer app (shown as a hint).
     fn signup_url(&self) -> SharedString;
+    /// The job family a publish claims (one per service).
+    fn service(&self) -> UploadService;
+    /// Whether a publish may start (signed in): checked before anything is claimed or rendered.
+    fn ready(&self, _settings: &super::ModuleSettings) -> Result<(), String> {
+        Ok(())
+    }
+    /// Render a claimed publish (the service's size rules).
+    fn render(&self, settings: &super::ModuleSettings, job: UploadJob) -> Result<RenderedJob, String>;
+    /// Upload the render; returns the published page/image URL (recorded on the publication
+    /// when it is a web address). Must check [`RenderedJob::ensure_live`] before sending.
+    fn upload(&self, settings: &super::ModuleSettings, rendered: &RenderedJob, request: &PublishRequest) -> Result<String, String>;
     /// Start the OAuth 1.0a out-of-band flow; the URL to authorize at.
     fn begin_auth(&self, settings: &super::ModuleSettings) -> Result<String, String>;
     /// Finish it with the verifier the user pasted.
     fn complete_auth(&self, settings: &super::ModuleSettings, verifier: &str) -> Result<(), String>;
     fn connected(&self, settings: &super::ModuleSettings) -> Result<bool, String>;
-    /// Upload; returns the published page/image URL (recorded on the publication when it is a
-    /// web address).
-    fn publish(&self, settings: &super::ModuleSettings, request: PublishRequest) -> Result<String, String>;
     /// Services with native tags (Flickr): whether the form shows a Tags field.
     fn has_tags(&self) -> bool {
         false

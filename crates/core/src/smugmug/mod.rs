@@ -27,7 +27,7 @@ pub struct AccessToken {
 }
 
 /// An album the user can upload into. `uri` is the SmugMug AlbumUri (e.g. `/api/v2/album/abc`).
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Album {
     pub uri: String,
@@ -159,8 +159,8 @@ pub async fn create_album(
         .body(serde_json::to_vec(&body).unwrap_or_default())
         .send()
         .await
-        .map_err(|e| format!("SmugMug create-album request failed: {e}"))?;
-    let text = resp.text().await.map_err(|e| e.to_string())?;
+        .map_err(|e| format!("SmugMug create-album request failed: {}", e.without_url()))?;
+    let text = resp.text().await.map_err(|e| e.without_url().to_string())?;
     let v: serde_json::Value =
         serde_json::from_str(&text).map_err(|e| format!("SmugMug: bad JSON ({e}): {text}"))?;
     let album = &v["Response"]["Album"];
@@ -229,8 +229,8 @@ pub async fn upload(
         .body(bytes)
         .send()
         .await
-        .map_err(|e| format!("SmugMug upload request failed: {e}"))?;
-    let text = resp.text().await.map_err(|e| e.to_string())?;
+        .map_err(|e| format!("SmugMug upload request failed: {}", e.without_url()))?;
+    let text = resp.text().await.map_err(|e| e.without_url().to_string())?;
     parse_upload_response(&text)
 }
 
@@ -265,10 +265,10 @@ async fn http_get_text(url: &str, auth: Option<&str>) -> Result<String, String> 
     }
     req.send()
         .await
-        .map_err(|e| format!("SmugMug request failed: {e}"))?
+        .map_err(|e| format!("SmugMug request failed: {}", e.without_url()))?
         .text()
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.without_url().to_string())
 }
 
 /// Upload reply is JSON: `{"stat":"ok","Image":{"URL":"…","ImageUri":"…"}}` on success.

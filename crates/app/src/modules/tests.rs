@@ -284,6 +284,30 @@ fn enabling_loads_requirements_first_and_persists_in_dependency_order(cx: &mut T
     assert_eq!(log.borrow().len(), 3, "enabling an enabled module loads nothing");
 }
 
+/// Instagram, Flickr and SmugMug register in every build (Flickr's and SmugMug's backends are
+/// opt-in, as in the Tauri shell): without the feature the Modules panel lists them with the
+/// reason and an enable is refused; with it they enable and contribute a publish target (and
+/// the OAuth services a settings tab).
+#[gpui_kit::test]
+fn the_publish_modules_register_with_or_without_their_backend(cx: &mut TestAppContext) {
+    let dir = TempDir::new("publish-modules");
+    let b = bench(super::bundled(), &super::compiled_features().iter().map(|f| f.as_ref()).collect::<Vec<_>>(), &dir, cx);
+    for (id, feature, compiled) in [("instagram", "instagram", cfg!(feature = "instagram")), ("flickr", "flickr", cfg!(feature = "flickr")), ("smugmug", "smugmug", cfg!(feature = "smugmug"))] {
+        let list = b.registry.read_with(cx, |r, _| r.list());
+        let info = list.iter().find(|m| m.id.as_ref() == id).unwrap_or_else(|| panic!("{id} is not registered"));
+        b.enable(id, cx);
+        if compiled {
+            assert_eq!(info.blocked_reason, None);
+            assert!(b.enabled(cx).contains(&id.to_string()));
+            let (settings, targets) = b.registry.read_with(cx, |r, _| (r.settings_panels(id).len(), r.publish_targets().iter().filter(|(m, _)| m.as_ref() == id).count()));
+            assert!(settings >= usize::from(id != "instagram") && targets == 1, "{id}: {settings} settings panels, {targets} targets");
+        } else {
+            assert_eq!(info.blocked_reason.as_deref(), Some(format!("backend \"{feature}\" not included in this build").as_str()));
+            assert!(!b.enabled(cx).contains(&id.to_string()), "{id} enabled without its backend");
+        }
+    }
+}
+
 /// A module whose requirement is missing, or whose own or a requirement's backend is
 /// compiled out, is refused with the reason; nothing loads.
 #[gpui_kit::test]

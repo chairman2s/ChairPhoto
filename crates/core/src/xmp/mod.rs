@@ -460,7 +460,9 @@ pub struct ReadRegion {
 /// rebuilt. Every foreign region in its `RegionList`, every foreign attribute or child of
 /// `Regions`, `AppliedToDimensions` and the list, and every foreign XML element anywhere else
 /// in the sidecar is preserved. Only regions chairphoto previously wrote (matched by Name +
-/// center-Area within [`AREA_EPSILON`]) are replaced. The `Regions` may sit in any top-level
+/// center-Area within [`AREA_EPSILON`]) are changed, and only in their Area's coordinates:
+/// such a region's other fields and foreign attributes and children stay (#140). Each incoming
+/// region updates at most one existing region. The `Regions` may sit in any top-level
 /// `rdf:Description` (exiftool writes one per namespace), and its struct values may be written
 /// with `rdf:parseType="Resource"`, as a nested `rdf:Description`, or (for
 /// `AppliedToDimensions`) as attributes. The list may be an `rdf:Bag` or an `rdf:Seq`.
@@ -701,7 +703,8 @@ fn region_container(list: &Element) -> Result<usize, String> {
 }
 
 /// Edit an existing, recognised `mwg-rs:Regions` in place: refresh AppliedToDimensions' own
-/// fields, drop the regions chairphoto wrote that `incoming` replaces, and append `incoming`.
+/// fields, move each region chairphoto wrote that an incoming one matches to the incoming
+/// geometry (see [`set_region_area`]), and append the incoming regions that matched none.
 /// Everything else on Regions, AppliedToDimensions, RegionList and its container is kept.
 fn update_regions(
     regions: &mut Element,
@@ -711,17 +714,29 @@ fn update_regions(
 ) -> Result<(), String> {
     let layout = regions_layout(regions)?;
     let body = struct_body_mut(regions).expect("regions_layout checked the form");
-    let lis = incoming.iter().map(region_li);
     match layout.list {
         Some((l, c)) => {
             let container = element_at_mut(element_at_mut(body, l), c);
-            container.children.retain(|node| match node {
-                XMLNode::Element(li) if is_rdf(li, "li") => !is_ours(li, incoming),
-                _ => true,
-            });
-            container.children.extend(lis);
+            // Each incoming region updates at most one existing region it matches, in place
+            // (#140); the rest are appended.
+            let mut written = vec![false; incoming.len()];
+            for node in &mut container.children {
+                let XMLNode::Element(li) = node else { continue };
+                if !is_rdf(li, "li") {
+                    continue;
+                }
+                if let Some(k) = matching_region(li, incoming, &written) {
+                    written[k] = true;
+                    set_region_area(li, &incoming[k]);
+                }
+            }
+            let new = incoming.iter().zip(&written).filter(|(_, w)| !**w);
+            container.children.extend(new.map(|(r, _)| region_li(r)));
         }
-        None => body.children.push(XMLNode::Element(new_region_list(lis.collect()))),
+        None => {
+            let lis = incoming.iter().map(region_li).collect();
+            body.children.push(XMLNode::Element(new_region_list(lis)));
+        }
     }
     // Last: inserting moves the indices `layout` recorded.
     match layout.dims {
@@ -875,15 +890,46 @@ fn region_li(r: &FaceRegion) -> XMLNode {
     XMLNode::Element(li)
 }
 
-/// True when region `li` is one chairphoto wrote and `incoming` replaces: its Name matches one
-/// of the incoming region names AND its center-Area is within [`AREA_EPSILON`] of that
-/// region's center. A li that does not parse is never ours: when in doubt, it is preserved.
-fn is_ours(li: &Element, incoming: &[FaceRegion]) -> bool {
-    parse_region_li(li).is_some_and(|p| {
-        incoming
-            .iter()
-            .any(|r| r.name == p.name && center_close(r.bbox, p.bbox))
-    })
+/// The index of the incoming region that region `li` is chairphoto's earlier write of, if any:
+/// its Name matches that region's AND its center-Area is within [`AREA_EPSILON`] of that
+/// region's center. Regions already marked in `taken` are skipped, so each incoming region
+/// claims at most one existing one. A li that does not parse matches nothing: when in doubt,
+/// it is preserved.
+fn matching_region(li: &Element, incoming: &[FaceRegion], taken: &[bool]) -> Option<usize> {
+    let p = parse_region_li(li)?;
+    incoming
+        .iter()
+        .zip(taken)
+        .position(|(r, taken)| !taken && r.name == p.name && center_close(r.bbox, p.bbox))
+}
+
+/// Move a matched region to `r`'s geometry, in place (#140). ChairPhoto owns only the Area's
+/// `stArea:x/y/w/h/unit`: the Name already equals `r.name` (that is how it matched), and its
+/// Type, any other field (`mwg-rs:Rotation`, extensions) and every foreign attribute of the
+/// region or its Area (`digiKam:Confidence`, …) are kept. `li` parsed, so its struct and Area
+/// forms are ones [`set_struct_fields`] can edit.
+fn set_region_area(li: &mut Element, r: &FaceRegion) {
+    let (x, y, w, h) = r.bbox;
+    // Convert stored top-left (x,y = corner) → MWG center (cx,cy = center).
+    let fields = [
+        ("x", fmt_coord(x + w / 2.0)),
+        ("y", fmt_coord(y + h / 2.0)),
+        ("w", fmt_coord(w)),
+        ("h", fmt_coord(h)),
+        ("unit", "normalized".to_string()),
+    ];
+    let body = struct_body_mut(li).expect("the region parsed");
+    let area = body
+        .children
+        .iter_mut()
+        .find_map(|n| match n {
+            XMLNode::Element(e) if e.namespace.as_deref() == Some(NS_MWG_RS) && e.name == "Area" => {
+                Some(e)
+            }
+            _ => None,
+        })
+        .expect("the region parsed, so it has an Area");
+    set_struct_fields(area, NS_STAREA, "stArea", &fields);
 }
 
 /// True if two top-left bboxes have centers within [`AREA_EPSILON`] on both axes.
@@ -2535,6 +2581,86 @@ mod tests {
         assert_eq!(region_names(&photo), ["Alice", "Bob"], "{xml}");
         assert_eq!(count_elements(&xml, NS_MWG_RS, "Regions"), 1, "{xml}");
         assert_eq!(count_elements(&xml, NS_RDF, "Bag"), 1, "{xml}");
+    }
+
+    /// Issue #140: a region another tool wrote that matches one ChairPhoto writes by Name +
+    /// Area is updated in place. Only its Area coordinates change, in the form they are
+    /// written in; its Type, `mwg-rs:Rotation`, foreign children and foreign attributes stay.
+    /// Bob is Lightroom-style (attribute-form Area with a `digiKam:Confidence`), Carol is a
+    /// nested-Description region with a foreign attribute and a foreign child in her Area.
+    #[test]
+    fn face_regions_matched_foreign_region_keeps_its_foreign_content() {
+        let (_dir, photo) = seeded_photo("xmp-140-in-place", r#"<?xml version="1.0" encoding="UTF-8"?>
+<x:xmpmeta xmlns:x="adobe:ns:meta/">
+ <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+  <rdf:Description rdf:about=""
+    xmlns:mwg-rs="http://www.metadataworkinggroup.com/schemas/regions/"
+    xmlns:stArea="http://ns.adobe.com/xmp/sType/Area#"
+    xmlns:digiKam="http://www.digikam.org/ns/1.0/"
+    xmlns:f="urn:example:foreign">
+   <mwg-rs:Regions rdf:parseType="Resource">
+    <mwg-rs:RegionList>
+     <rdf:Bag>
+      <rdf:li rdf:parseType="Resource">
+       <mwg-rs:Name>Bob</mwg-rs:Name>
+       <mwg-rs:Type>Face</mwg-rs:Type>
+       <mwg-rs:Area stArea:x="0.8" stArea:y="0.7" stArea:w="0.1" stArea:h="0.2"
+         stArea:unit="normalized" digiKam:Confidence="87"/>
+       <mwg-rs:Rotation>0.25</mwg-rs:Rotation>
+       <f:note>bob-child</f:note>
+      </rdf:li>
+      <rdf:li>
+       <rdf:Description mwg-rs:Name="Carol" f:tag="carol-attr">
+        <mwg-rs:Area rdf:parseType="Resource">
+         <stArea:x>0.3</stArea:x><stArea:y>0.3</stArea:y>
+         <stArea:w>0.1</stArea:w><stArea:h>0.1</stArea:h>
+         <f:areanote>carol-area-child</f:areanote>
+        </mwg-rs:Area>
+       </rdf:Description>
+      </rdf:li>
+     </rdf:Bag>
+    </mwg-rs:RegionList>
+   </mwg-rs:Regions>
+  </rdf:Description>
+ </rdf:RDF>
+</x:xmpmeta>"#);
+        assert_eq!(region_names(&photo), ["Bob", "Carol"], "the fixture's regions are read");
+
+        // Both moved by 0.01, well inside AREA_EPSILON: ChairPhoto's write of the same faces.
+        let ours = [
+            FaceRegion { name: "Bob".into(), bbox: (0.76, 0.61, 0.1, 0.2) },
+            FaceRegion { name: "Carol".into(), bbox: (0.26, 0.26, 0.1, 0.1) },
+        ];
+        write_face_regions(&photo, &ours, 6000, 4000).unwrap();
+
+        let xml = read(&sidecar_path(&photo));
+        let back = read_face_regions(&photo);
+        assert_eq!(back.len(), 2, "updated, not duplicated: {back:?}\n{xml}");
+        for want in &ours {
+            let got = back.iter().find(|r| r.name == want.name).unwrap();
+            let (a, b) = (got.bbox, want.bbox);
+            assert!((a.0 - b.0).abs() < 1e-4 && (a.1 - b.1).abs() < 1e-4,
+                "{} not moved to the written geometry: {a:?}\n{xml}", want.name);
+        }
+
+        // Bob: the Area stays in attribute form, with its foreign attribute.
+        let area = (NS_MWG_RS, "Area");
+        assert!(has_attr(&xml, area, (NS_DIGIKAM, "Confidence"), "87"), "{xml}");
+        assert!(has_attr(&xml, area, (NS_STAREA, "x"), "0.81"), "{xml}");
+        assert!(has_attr(&xml, area, (NS_STAREA, "unit"), "normalized"), "{xml}");
+        let li = (NS_RDF, "li");
+        assert_eq!(element_text(&xml, li, (NS_MWG_RS, "Rotation")).as_deref(), Some("0.25"),
+            "{xml}");
+        assert_eq!(element_text(&xml, li, (NS_MWG_RS, "Type")).as_deref(), Some("Face"));
+        assert_eq!(element_text(&xml, li, (NS_FOREIGN, "note")).as_deref(), Some("bob-child"));
+        // Carol: the nested Description keeps its attribute, the Area its foreign child, and
+        // her coordinates stay elements.
+        assert!(has_attr(&xml, (NS_RDF, "Description"), (NS_FOREIGN, "tag"), "carol-attr"));
+        assert_eq!(element_text(&xml, area, (NS_FOREIGN, "areanote")).as_deref(),
+            Some("carol-area-child"), "{xml}");
+        assert_eq!(element_text(&xml, area, (NS_STAREA, "x")).as_deref(), Some("0.31"), "{xml}");
+        assert_eq!(element_text(&xml, area, (NS_STAREA, "unit")).as_deref(),
+            Some("normalized"), "the missing unit is added in the Area's own form:\n{xml}");
     }
 
     /// A Regions the writer does not recognise is never rebuilt: the write is refused with an

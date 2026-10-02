@@ -151,12 +151,17 @@ and the reader converts back.
 
 **Merge safety is binding.** The RegionList may already contain regions written by other tools.
 The writer edits the existing `Regions` in place, never rebuilds it: it refreshes the
-`AppliedToDimensions` fields, replaces the regions it wrote, and appends the rest of ChairPhoto's
-current confirmed set. A region counts as ours — and is therefore replaced — only when its `Name`
-matches one we are writing *and* its center area is within `AREA_EPSILON = 0.02`. **When in
-doubt, the region is preserved.** Re-writing updates only ChairPhoto's own regions and can never
-duplicate or clobber a foreign face. Foreign attributes and children of `Regions`,
-`AppliedToDimensions` and the list survive.
+`AppliedToDimensions` fields, updates the regions it wrote, and appends the rest of ChairPhoto's
+current confirmed set. A region counts as ours — and is therefore updated — only when its `Name`
+matches one we are writing *and* its center area is within `AREA_EPSILON = 0.02`; each region we
+write updates at most one. **When in doubt, the region is preserved.** Re-writing updates only
+ChairPhoto's own regions and can never duplicate or clobber a foreign face. Foreign attributes
+and children of `Regions`, `AppliedToDimensions` and the list survive.
+
+Updating a region changes only its `Area` coordinates (`stArea:x/y/w/h/unit`), in the form they
+are written in. Everything else on it stays: a region another tool wrote that happens to match
+by name and area (a Lightroom region ingested earlier, say) keeps its `mwg-rs:Rotation`, its
+`Type`, extensions and foreign attributes such as `digiKam:Confidence`.
 
 The writer and reader accept `Regions` in any top-level `rdf:Description`, struct values written
 with `rdf:parseType="Resource"`, as a nested `rdf:Description` or as attributes, and a list in an

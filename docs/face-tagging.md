@@ -263,8 +263,14 @@ on a turned photo. **Every face index run converts them first** (`convert_legacy
 before it indexes anything): it writes each photo still on the record through the normal region
 write, which adopts and marks (or removes) the old regions in the stored frame and spends the
 record. It shares the index job's abort flag, ownership and catalog connection, and the record
-is its queue: an abort, an offline original or a refused write leaves that photo's rows for the
-next run, and rows of photos no longer in the catalog are dropped. It reports no progress of its
+is its queue: an abort, an offline original or a failed write leaves that photo's rows for the
+next run, and rows of photos no longer in the catalog are dropped. A photo whose sidecar
+*refuses* the write for its own layout or frame — a `Regions` this writer cannot read, such as
+the unprefixed `parseType` a pre-#138 build's xmltree left behind, or an `AppliedToDimensions`
+of another frame — is tried once and then set aside (`faces__legacy_refused`, counted as
+`refused`): the same write would be refused on every run until the file changes. It keeps its
+record, so a face verb that later writes the photo still adopts or removes its old regions, and
+that write clears the refusal. Repairing such sidecars is #143's. It reports no progress of its
 own (the index's `faces:progress` starts after it) and logs what it did. It is part of the index
 job rather than a job of its own to keep this branch small: the record is a one-time backlog,
 indexing is the faces job a user runs, and it already owns the faces worker. A catalog that is

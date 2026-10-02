@@ -180,6 +180,15 @@ fn create_schema(conn: &Connection, record_legacy: bool) -> rusqlite::Result<()>
         CREATE INDEX IF NOT EXISTS faces__legacy_regions_photo
             ON faces__legacy_regions (photo_id);
 
+        -- Photos on the pre-marker record whose sidecar refused the region write for its
+        -- own layout or frame (review N2): the one-time conversion pass skips them rather
+        -- than retry for ever; a later successful write of the photo clears the row.
+        CREATE TABLE IF NOT EXISTS faces__legacy_refused (
+            photo_id    INTEGER PRIMARY KEY,
+            refused_at  INTEGER NOT NULL,
+            reason      TEXT    NOT NULL
+        );
+
         -- One-time steps already taken, by name: a row is claimed by the one call that
         -- takes the step (`INSERT OR IGNORE`, inside that call's savepoint), so two
         -- connections opening the tables at once never both take it.

@@ -603,9 +603,9 @@ pub fn write_face_regions(
     retired: &[i64],
     legacy: &[FaceRegion],
     frame: RegionFrame,
-) -> Result<(), String> {
+) -> Result<(), RegionWriteError> {
     if catalog.is_empty() || catalog.contains('/') {
-        return Err(format!("face regions not written: {catalog:?} is no catalog identity"));
+        return Err(RegionWriteError::Failed(format!("face regions not written: {catalog:?} is no catalog identity")));
     }
     let mut doc = SidecarDocument::open(photo_path)?;
     // Written only into a Regions that has no AppliedToDimensions of its own.
@@ -658,14 +658,40 @@ pub fn write_face_regions(
         }
     }
 
-    doc.commit()
+    Ok(doc.commit()?)
 }
 
-fn unrecognised_frame(photo_path: &Path, why: &str) -> String {
-    format!(
+fn unrecognised_frame(photo_path: &Path, why: &str) -> RegionWriteError {
+    RegionWriteError::Refused(format!(
         "{}: face regions not written, sidecar left unchanged: {why}",
         sidecar_path(photo_path).display()
-    )
+    ))
+}
+
+/// Why [`write_face_regions`] wrote nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RegionWriteError {
+    /// The sidecar's own content rules the write out — a `Regions` laid out in a way this
+    /// writer does not recognise, or declaring a frame it cannot place its boxes in — and the
+    /// sidecar was left as it was. Writing again changes nothing until the file does.
+    Refused(String),
+    /// Anything else: the sidecar could not be read, parsed or written (IO, a volume gone, an
+    /// unparseable file), or the caller passed no catalog identity. Trying again may succeed.
+    Failed(String),
+}
+
+impl std::fmt::Display for RegionWriteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Refused(why) | Self::Failed(why) => f.write_str(why),
+        }
+    }
+}
+
+impl From<String> for RegionWriteError {
+    fn from(why: String) -> Self {
+        Self::Failed(why)
+    }
 }
 
 /// The frame ChairPhoto's boxes are written in, and read back from, for one `mwg-rs:Regions`.
@@ -765,12 +791,12 @@ fn region_target(
 /// to a whole pixel, and a RAW's recorded size can differ from a converter's by a few pixels.
 const ASPECT_TOLERANCE: f64 = 0.01;
 
-fn unrecognised_regions(photo_path: &Path, why: &str) -> String {
-    format!(
+fn unrecognised_regions(photo_path: &Path, why: &str) -> RegionWriteError {
+    RegionWriteError::Refused(format!(
         "{}: face regions not written, sidecar left unchanged: {why}, a layout ChairPhoto \
          does not recognise",
         sidecar_path(photo_path).display()
-    )
+    ))
 }
 
 /// The photo's MWG face regions in the display frame ChairPhoto stores face boxes in (#136):
@@ -3522,7 +3548,8 @@ mod tests {
             let (_dir, photo) = seeded_photo("xmp-139-refuse", &sidecar);
             let err = write_face_regions(&photo, CAT, &alice(), &[], &[], sized(6000, 4000))
                 .expect_err(&format!("{case}: an unrecognised Regions must not be written"));
-            assert!(err.contains(&sidecar_path(&photo).display().to_string()), "{case}: {err}");
+            assert!(matches!(err, RegionWriteError::Refused(_)), "{case}: {err:?}");
+            assert!(err.to_string().contains(&sidecar_path(&photo).display().to_string()), "{case}: {err}");
             assert_eq!(read(&sidecar_path(&photo)), sidecar, "{case}: sidecar changed");
         }
     }
@@ -3749,7 +3776,8 @@ mod tests {
             let (_dir, photo) = seeded_photo("xmp-145-refuse", &sidecar);
             let err = write_face_regions(&photo, CAT, &alice, &[], &[], frame)
                 .expect_err(&format!("{case}: the write must be refused"));
-            assert!(err.contains(&sidecar_path(&photo).display().to_string()), "{case}: {err}");
+            assert!(matches!(err, RegionWriteError::Refused(_)), "{case}: {err:?}");
+            assert!(err.to_string().contains(&sidecar_path(&photo).display().to_string()), "{case}: {err}");
             assert_eq!(read(&sidecar_path(&photo)), sidecar, "{case}: sidecar changed");
             assert!(read_face_regions_in(&photo, frame).is_empty(), "{case}: imported anyway");
         }

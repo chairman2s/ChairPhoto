@@ -24,7 +24,7 @@
 
 use rusqlite::{Connection, OptionalExtension};
 
-use crate::xmp::{FaceRegion, ReadRegion, RegionFrame};
+use crate::xmp::{FaceRegion, ReadRegion, RegionFrame, RegionWriteError};
 
 /// Minimum IoU for an imported region to be considered the same face as a detection.
 /// Matches the design doc ("IoU-match to detections", `>= 0.5`).
@@ -123,8 +123,14 @@ pub struct LegacyConversion {
     pub written: usize,
     /// Photos whose original was unreachable: skipped, record kept for a later pass.
     pub offline: usize,
-    /// Photos whose write failed or was refused (logged): record kept for a later pass.
+    /// Photos whose write failed (logged): record kept for a later pass.
     pub failed: usize,
+    /// Photos whose sidecar refused the write for its own layout or frame (review N2): record
+    /// kept, the refusal recorded in `faces__legacy_refused`, and the photo not tried by later
+    /// passes — the same write would be refused again until the file changes. A face verb on
+    /// the photo still writes it, and once that succeeds the refusal is cleared with the
+    /// record. Photos refused by an earlier pass are not counted again.
+    pub refused: usize,
     /// The pass stopped at its abort flag; the photos it did not reach keep their record.
     pub aborted: bool,
 }
@@ -137,10 +143,13 @@ pub struct LegacyConversion {
 /// until a face verb happens to touch it.
 ///
 /// Resumable and abortable: the record is the queue. `abort` is checked before each photo,
-/// each photo's write-then-spend is its own step, and a photo that is offline, fails or is
-/// refused keeps its rows for the next pass. Rows of photos no longer in the catalog are
-/// dropped first. Blocking (sidecar IO per photo): run it on a worker with its own catalog
-/// connection — the faces index job runs it before indexing.
+/// each photo's write-then-spend is its own step, and a photo that is offline or fails keeps
+/// its rows for the next pass. A photo whose sidecar refuses the write
+/// ([`RegionWriteError::Refused`]) keeps its rows too but is set aside for good
+/// (`faces__legacy_refused`), so a sidecar this writer cannot edit — a pre-#138 build's
+/// unprefixed `parseType`, say — is not retried on every index run. Rows of photos no longer
+/// in the catalog are dropped first. Blocking (sidecar IO per photo): run it on a worker with
+/// its own catalog connection — the faces index job runs it before indexing.
 pub fn convert_legacy_regions<R>(
     conn: &Connection,
     mut resolve: R,
@@ -152,7 +161,11 @@ where
     super::store::ensure_schema(conn)?;
     conn.execute("DELETE FROM faces__legacy_regions WHERE photo_id NOT IN (SELECT id FROM photos)", [])?;
     let photos: Vec<i64> = {
-        let mut stmt = conn.prepare("SELECT DISTINCT photo_id FROM faces__legacy_regions ORDER BY photo_id")?;
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT photo_id FROM faces__legacy_regions
+              WHERE photo_id NOT IN (SELECT photo_id FROM faces__legacy_refused)
+              ORDER BY photo_id",
+        )?;
         let rows = stmt.query_map([], |r| r.get(0))?;
         rows.collect::<rusqlite::Result<_>>()?
     };
@@ -176,7 +189,16 @@ where
         };
         match write_photo_regions(conn, photo, |_| Ok(Some(path))) {
             Ok(()) => out.written += 1,
-            Err(e) => {
+            Err(RegionWriteError::Refused(why)) => {
+                eprintln!("faces: pre-marker regions of photo {photo} not converted, set aside: {why}");
+                conn.execute(
+                    "INSERT OR REPLACE INTO faces__legacy_refused (photo_id, refused_at, reason)
+                     VALUES (?1, strftime('%s', 'now'), ?2)",
+                    rusqlite::params![photo, why],
+                )?;
+                out.refused += 1;
+            }
+            Err(RegionWriteError::Failed(e)) => {
                 eprintln!("faces: pre-marker regions of photo {photo} not converted: {e}");
                 out.failed += 1;
             }
@@ -218,7 +240,7 @@ pub fn write_photo_regions<R>(
     conn: &Connection,
     photo_id: i64,
     resolve: R,
-) -> Result<(), String>
+) -> Result<(), RegionWriteError>
 where
     R: FnOnce(i64) -> Result<Option<std::path::PathBuf>, String>,
 {
@@ -233,8 +255,11 @@ where
         return Ok(()); // offline — skip, re-sync later.
     };
     crate::xmp::write_face_regions(&path, &catalog, &regions, &retired, &legacy, frame)?;
-    conn.execute("DELETE FROM faces__legacy_regions WHERE photo_id = ?1", [photo_id])
-        .map_err(|e| e.to_string())?;
+    conn.execute_batch(&format!(
+        "DELETE FROM faces__legacy_regions WHERE photo_id = {photo_id};
+         DELETE FROM faces__legacy_refused WHERE photo_id = {photo_id};"
+    ))
+    .map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -540,6 +565,59 @@ mod tests {
         confirm(&conn, 1, 11, "[0.3,0.3,0.1,0.1]", "manual", "confirmed");
         store::ensure_schema(&conn).unwrap();
         assert_eq!(record(&conn), want, "taken once, not on every open");
+    }
+
+    /// A pre-marker sidecar after a pre-#138 build's other writers rewrote it (review probe
+    /// R4): xmltree 0.11 wrote every attribute key unprefixed, so `parseType`, `about` and the
+    /// dimension fields lost their namespaces and the whole Regions is unreadable.
+    const PRE_138_MANGLED: &str = r#"<?xml version="1.0" encoding="UTF-8"?><x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"><rdf:Description xmlns:mwg-rs="http://www.metadataworkinggroup.com/schemas/regions/" xmlns:stArea="http://ns.adobe.com/xmp/sType/Area#" xmlns:stDim="http://ns.adobe.com/xap/1.0/sType/Dimensions#" about=""><mwg-rs:Regions parseType="Resource"><mwg-rs:AppliedToDimensions w="6000" h="4000" unit="pixel" /><mwg-rs:RegionList><rdf:Bag><rdf:li parseType="Resource"><mwg-rs:Name>Alice</mwg-rs:Name><mwg-rs:Type>Face</mwg-rs:Type><mwg-rs:Area parseType="Resource"><stArea:x>0.2</stArea:x><stArea:y>0.2</stArea:y><stArea:w>0.2</stArea:w><stArea:h>0.2</stArea:h><stArea:unit>normalized</stArea:unit></mwg-rs:Area></rdf:li></rdf:Bag></mwg-rs:RegionList></mwg-rs:Regions></rdf:Description></rdf:RDF></x:xmpmeta>"#;
+
+    /// Review N2: a photo whose sidecar refuses the write (R4's mangled pre-#138 shape) is
+    /// set aside after one try — counted as refused, its refusal recorded, its record and
+    /// sidecar left as they were — and later passes do not try it again. An offline photo is
+    /// tried on every pass. Once the photo is written after all (the file repaired, a verb),
+    /// the refusal goes with the record.
+    #[test]
+    fn a_refused_photo_is_set_aside_and_an_offline_one_retried() {
+        let dir = crate::test_support::TestTmpDir::new("faces-regions-legacy-refused");
+        let photo_path = dir.join("OLD.JPG");
+        std::fs::write(&photo_path, b"jpg").unwrap();
+        let sidecar = crate::xmp::sidecar_path(&photo_path);
+        std::fs::write(&sidecar, PRE_138_MANGLED).unwrap();
+        let conn = mem_conn();
+        conn.execute_batch(
+            "INSERT INTO photos (id, width, height, exif_orientation) VALUES (1, 6000, 4000, 1), (2, 6000, 4000, 1);
+             INSERT INTO faces__legacy_regions (face_id, photo_id, name, bbox)
+                 VALUES (100, 1, 'Alice', '[0.1,0.1,0.2,0.2]'), (200, 2, 'Eve', '[0.1,0.1,0.1,0.1]');",
+        )
+        .unwrap();
+        let abort = std::sync::atomic::AtomicBool::new(false);
+        let resolve = |id: i64| Ok(if id == 1 { Some(photo_path.clone()) } else { None });
+        let refused = |conn: &Connection| -> Vec<i64> {
+            let mut stmt = conn.prepare("SELECT photo_id FROM faces__legacy_refused").unwrap();
+            stmt.query_map([], |r| r.get(0)).unwrap().collect::<rusqlite::Result<_>>().unwrap()
+        };
+
+        let first = convert_legacy_regions(&conn, resolve, &abort).unwrap();
+        assert_eq!(first, LegacyConversion { refused: 1, offline: 1, ..Default::default() });
+        assert_eq!(std::fs::read_to_string(&sidecar).unwrap(), PRE_138_MANGLED);
+        assert_eq!(refused(&conn), [1]);
+        let second = convert_legacy_regions(&conn, resolve, &abort).unwrap();
+        assert_eq!(second, LegacyConversion { offline: 1, ..Default::default() }, "photo 1 tried again");
+        let left: Vec<i64> = record(&conn).into_iter().map(|r| r.1).collect();
+        assert_eq!(left, [1, 2], "both keep their record");
+
+        // The sidecar is repaired; a verb's write goes through and clears the refusal.
+        let repaired = PRE_138_MANGLED
+            .replace(" parseType=", " rdf:parseType=")
+            .replace(" about=", " rdf:about=")
+            .replace(r#"w="6000" h="4000" unit="pixel""#, r#"stDim:w="6000" stDim:h="4000" stDim:unit="pixel""#);
+        std::fs::write(&sidecar, repaired).unwrap();
+        write_photo_regions(&conn, 1, |_| Ok(Some(photo_path.clone()))).unwrap();
+        assert!(refused(&conn).is_empty());
+        let left: Vec<i64> = record(&conn).into_iter().map(|r| r.1).collect();
+        assert_eq!(left, [2]);
+        assert!(crate::xmp::read_face_regions(&photo_path).is_empty(), "the retired Alice stayed");
     }
 
     /// A write that reaches the sidecar spends the photo's record — the region it described

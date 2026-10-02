@@ -842,3 +842,41 @@ fn the_overlay_works_in_the_pop_out(cx: &mut TestAppContext) {
     assert_eq!(drawn.len(), 1, "one face drawn in the pop-out");
     assert!(close_bbox(drawn[0].bbox, (0.6, 0.2, 0.2, 0.4)), "{:?}", drawn[0].bbox);
 }
+
+/// The Faces block shows — and its verbs act on — the photo the rest of the inspector shows:
+/// Compare's focused pane, not the Library's active photo.
+#[gpui_kit::test]
+fn the_inspectors_faces_follow_compares_focused_pane(cx: &mut TestAppContext) {
+    let f = open_faces(4, true, "faces-compare", cx);
+    let alice = with_cat(&f.app, |c| c.create_tag("People/Alice").unwrap());
+    let faces: Vec<i64> = f.ids.iter().map(|&p| add_face(&f.app, p, "[0.1,0.1,0.2,0.2]")).collect();
+    for &face in &faces {
+        suggest(&f.app, face, alice);
+    }
+    f.app.wired.shell.update(cx, |s, cx| s.set_inspector_tab(InspectorTab::Tags, cx));
+    f.select(f.ids[0], cx);
+    f.app.wired.shell.update(cx, |s, cx| s.select_with(cx, |l| l.select_all()));
+    work(&f.app, cx);
+    let active = f.app.wired.shell.read_with(cx, |s, _| s.library.selection().active_id).unwrap();
+    f.press("c", cx);
+    let mut focused = f.app.wired.shell.read_with(cx, |s, _| s.compare_focused()).expect("Compare is open");
+    for _ in 0..4 {
+        if focused != active {
+            break;
+        }
+        f.press("down", cx);
+        focused = f.app.wired.shell.read_with(cx, |s, _| s.compare_focused()).unwrap();
+    }
+    assert_ne!(focused, active, "the focus is not the active photo");
+    let face_of = |photo: i64| faces[f.ids.iter().position(|&p| p == photo).unwrap()];
+    let (shown, other) = (face_of(focused), face_of(active));
+
+    assert!(f.present(&format!("faces-insp-name-{shown}"), cx), "the focused pane's faces are listed");
+    assert!(!f.present(&format!("faces-insp-name-{other}"), cx), "not the active photo's");
+    f.click(&format!("faces-insp-confirm-{shown}"), cx);
+    assert_eq!(face_row(&f.app, shown).0, "confirmed", "✓ confirmed the shown face");
+    assert_eq!(face_row(&f.app, other).0, "suggested", "the active photo's face is untouched");
+    assert!(with_cat(&f.app, |c| c.get_photo_tags(focused).unwrap().iter().any(|t| t.id == alice)), "the shown photo is tagged");
+    let state = f.state(cx);
+    assert!(state.read_with(cx, |s, cx| s.selection_targets(cx).contains(&focused)));
+}

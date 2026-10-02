@@ -1,14 +1,14 @@
 //! [`FacesState`]: the Faces module's live state, shared by its three views (the settings
 //! panel, the inspector's Faces block and the loupe overlay) — the models and inference
-//! lines, the module's settings, the indexing job this app follows, and the active photo's
-//! faces with every per-face write.
+//! lines, the module's settings, the indexing job this app follows, and the shown photo's
+//! faces (the inspector's photo, [`FacesState::shown_photo`]) with every per-face write.
 //!
 //! **Off the UI thread.** Every catalog read and write, the model check and download, and the
 //! job start run on the storage [`Runner`] (the core runtime's blocking pool; a manual queue
 //! in tests). Each result carries the generation it started under; a catalog switch bumps
 //! it, so an answer from before the switch is dropped.
 //!
-//! **Catalog identity** (map #92). The active photo's faces are read **bound to the catalog
+//! **Catalog identity** (map #92). The shown photo's faces are read **bound to the catalog
 //! the Library rows came from** (`ShellState::rows_from`) — the photo id is that catalog's —
 //! and every write keyed by a face, tag or photo id runs through `with_catalog_as` with that
 //! identity, failing closed (`CATALOG_CHANGED`) once another catalog is open, even before
@@ -130,7 +130,7 @@ impl IndexRun {
     }
 }
 
-/// The active photo's faces, read bound to `from`.
+/// The shown photo's faces, read bound to `from`.
 #[derive(Debug, Clone)]
 pub struct PhotoFaces {
     pub photo_id: i64,
@@ -141,7 +141,7 @@ pub struct PhotoFaces {
 
 #[derive(Debug, Clone, Default)]
 pub enum PhotoView {
-    /// No active photo, or the rows' catalog is not known yet.
+    /// No shown photo, or the rows' catalog is not known yet.
     #[default]
     None,
     Loading(i64),
@@ -566,18 +566,23 @@ impl FacesState {
         );
     }
 
-    // --- the active photo -----------------------------------------------------------------
+    // --- the shown photo ------------------------------------------------------------------
 
-    /// Follow the Library's active photo: read its faces, bound to the rows' catalog, when it
-    /// (or that catalog) changes, or always with `force` (after a write).
+    /// The photo whose faces are shown: the one the inspector and the loupes show
+    /// ([`ShellState::loupe_target`] — Compare's focused pane while Compare is open, else the
+    /// active photo), so the Faces block never acts on a different photo than the inspector
+    /// around it.
+    pub fn shown_photo(&self, cx: &App) -> Option<i64> {
+        self.shell.read(cx).loupe_target().map(|p| p.id)
+    }
+
+    /// Follow the shown photo ([`Self::shown_photo`]): read its faces, bound to the rows'
+    /// catalog, when it (or that catalog) changes, or always with `force` (after a write).
     pub fn follow_photo(&mut self, force: bool, cx: &mut Context<Self>) {
         if !self.live {
             return;
         }
-        let (active, from) = {
-            let shell = self.shell.read(cx);
-            (shell.library.selection().active_id, shell.rows_from())
-        };
+        let (active, from) = (self.shown_photo(cx), self.shell.read(cx).rows_from());
         let key = active.zip(from);
         if key == self.photo_key && !force {
             return;
@@ -681,13 +686,11 @@ impl FacesState {
         self.face_write("draw the box", cx, move |c| core_faces::add_manual(c, photo, x, y, w, h), move |_, id, cx| then(id, cx));
     }
 
-    /// The photos "✓✓ confirm on N" acts on: the selection, plus the active photo (whose
-    /// faces the panel shows) — `None` when the shown faces are not the rows' catalog's.
+    /// The photos "✓✓ confirm on N" acts on: the selection, plus the shown photo (whose faces
+    /// the panel shows, [`Self::shown_photo`]).
     pub fn selection_targets(&self, cx: &App) -> Vec<i64> {
-        let shell = self.shell.read(cx);
-        let sel = shell.library.selection();
-        let mut ids = sel.ids.to_vec();
-        if let Some(a) = sel.active_id {
+        let mut ids = self.shell.read(cx).library.selection().ids.to_vec();
+        if let Some(a) = self.shown_photo(cx) {
             if !ids.contains(&a) {
                 ids.push(a);
             }

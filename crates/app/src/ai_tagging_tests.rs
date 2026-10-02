@@ -19,6 +19,7 @@ use chairphoto_core::app::ai::{self as core_ai, AiSuggestion, Confirmed, Grouped
 use chairphoto_core::app::{CatalogIdentity, CATALOG_CHANGED};
 use chairphoto_core::plugins::ai as plugin_ai;
 use gpui_kit::SharedString;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 type SuggestCall = (CatalogIdentity, i64, Option<String>, Option<Region>);
@@ -47,10 +48,17 @@ impl AiBackend for FakeAi {
         Ok(self.answer.lock().unwrap().clone())
     }
 
-    fn suggest_grouped(&self, _: &AppState, from: CatalogIdentity, _: Confirmed, photos: Vec<i64>) -> Result<GroupedDispatchResult, String> {
+    fn suggest_grouped(
+        &self,
+        _: &AppState,
+        from: CatalogIdentity,
+        _: Confirmed,
+        photos: Vec<i64>,
+        _: Arc<AtomicBool>,
+    ) -> Result<GroupedDispatchResult, String> {
         let n = photos.len();
         self.grouped.lock().unwrap().push((from, photos));
-        Ok(GroupedDispatchResult { total: n, representatives: 1, dispatched: 1, propagated: n })
+        Ok(GroupedDispatchResult { total: n, representatives: 1, dispatched: 1, propagated: n, cancelled: false })
     }
 
     fn ollama_models(&self, url: &str) -> Result<Vec<String>, String> {
@@ -70,6 +78,8 @@ impl FakeAi {
 #[derive(Default)]
 struct CountingProvider {
     calls: Mutex<Vec<String>>,
+    /// Each grouped run's cancel flag, as the module handed it over.
+    flags: Mutex<Vec<Arc<AtomicBool>>>,
 }
 
 impl core_ai::Provider for CountingProvider {
@@ -108,8 +118,16 @@ impl AiBackend for ViaCore {
         chairphoto_core::app::runtime().block_on(run)
     }
 
-    fn suggest_grouped(&self, app: &AppState, from: CatalogIdentity, confirmed: Confirmed, photos: Vec<i64>) -> Result<GroupedDispatchResult, String> {
-        let run = core_ai::suggest_tags_grouped_via(app, Some(from), Some(confirmed), photos, self.0.clone());
+    fn suggest_grouped(
+        &self,
+        app: &AppState,
+        from: CatalogIdentity,
+        confirmed: Confirmed,
+        photos: Vec<i64>,
+        cancel: Arc<AtomicBool>,
+    ) -> Result<GroupedDispatchResult, String> {
+        self.0.flags.lock().unwrap().push(cancel.clone());
+        let run = core_ai::suggest_tags_grouped_via(app, Some(from), Some(confirmed), photos, &cancel, self.0.clone());
         chairphoto_core::app::runtime().block_on(run)
     }
 
@@ -494,6 +512,65 @@ fn a_save_in_the_consent_window_sends_nothing(cx: &mut TestAppContext) {
     // Asked again, with the engine now shown, it sends — with exactly that engine.
     a.click("ai-suggest", cx);
     assert_eq!(*provider.calls.lock().unwrap(), vec!["ollama/llava:latest".to_string()]);
+}
+
+/// A running batch stops sending at Cancel, at disabling the module and at a catalog switch
+/// (#126 review): the run is started (its job queued on the manual runner, so no
+/// representative has gone yet), then stopped, then let run — over the real core body with a
+/// counting provider and three photos hours apart (three representatives).
+///
+/// Mutation-checked: dropping `stop_batch` from `cancel_batch` makes three calls after Cancel;
+/// from `unload`, three after disabling; from `catalog_switched`, the flag stays clear.
+#[gpui_kit::test]
+fn a_grouped_run_stops_at_cancel_disable_and_switch(cx: &mut TestAppContext) {
+    let a = open_ai(3, &[], "ai-batch-cancel", cx);
+    reachable(&a);
+    with_cat(&a.app, |c| {
+        for (i, id) in a.ids.iter().enumerate() {
+            let t = format!("2026-05-01T{:02}:00:00", 8 + 4 * i);
+            c.conn().execute("UPDATE photos SET capture_time = ?1 WHERE id = ?2", (t.as_str(), *id)).unwrap();
+        }
+    });
+    let provider = Arc::new(CountingProvider::default());
+    cx.update(|cx| cx.set_global(AiBackendGlobal(Arc::new(ViaCore(provider.clone())))));
+    a.select(a.ids[0], cx);
+    a.select_all(cx);
+    let state = a.state(cx);
+
+    // Cancel: the panel offers it while the batch runs.
+    state.update(cx, |s, cx| s.run_batch(cx));
+    assert!(a.present("ai-batch-cancel", cx), "a running batch offers Cancel");
+    a.click("ai-batch-cancel", cx);
+    assert!(provider.calls.lock().unwrap().is_empty(), "a representative was sent after Cancel");
+    assert_eq!(provider.flags.lock().unwrap().len(), 1, "the batch ran");
+    assert_eq!(a.label("ai-batch-msg", cx).as_deref(), Some("Cancelled — 0 of 3 representatives sent, 0 suggestions stored."));
+    assert!(!a.present("ai-batch-cancel", cx), "Cancel goes with the run");
+
+    // Not cancelled, the same batch sends every representative.
+    state.update(cx, |s, cx| s.run_batch(cx));
+    work(&a.app, cx);
+    assert_eq!(provider.calls.lock().unwrap().len(), 3);
+
+    // Disabling the module stops it.
+    state.update(cx, |s, cx| s.run_batch(cx));
+    cx.update(|cx| ModuleRegistry::disable(&a.app.wired.modules, AI_MODULE_ID, cx));
+    work(&a.app, cx);
+    assert_eq!(provider.flags.lock().unwrap().len(), 3);
+    assert_eq!(provider.calls.lock().unwrap().len(), 3, "a representative was sent after the module was disabled");
+
+    // A catalog switch stops it (its flag is set before the old run can send again).
+    cx.update(|cx| ModuleRegistry::enable(&a.app.wired.modules, AI_MODULE_ID, cx));
+    work(&a.app, cx);
+    let state = a.state(cx);
+    state.update(cx, |s, cx| s.run_batch(cx));
+    assert_eq!(cx.update(|cx| Runner::get(cx).pending()), 1, "the batch is queued");
+    let (b, _) = colliding_catalog(&a.dir, "b", 3);
+    core_switch(&a.app, b);
+    deliver_switch(&a.app, cx);
+    work(&a.app, cx);
+    assert_eq!(provider.flags.lock().unwrap().len(), 4, "the queued batch ran");
+    assert!(provider.flags.lock().unwrap()[3].load(Ordering::SeqCst), "the switch left the batch running");
+    assert_eq!(provider.calls.lock().unwrap().len(), 3);
 }
 
 /// The confirm's answer is bound to the catalog it priced: after a switch it closes, and a

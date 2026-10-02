@@ -33,6 +33,7 @@ use chairphoto_core::app::{with_catalog_as, with_catalog_identified, AppState, C
 use chairphoto_core::catalog::Catalog;
 use gpui_kit::{App, Context, Entity, Global, SharedString, Subscription};
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 /// What the module asks of the provider side — the only path a photo leaves by. Blocking:
@@ -52,13 +53,15 @@ pub trait AiBackend: Send + Sync {
         question: Option<String>,
         region: Option<Region>,
     ) -> Result<Vec<AiSuggestion>, String>;
-    /// The grouped burst run over `photos`, bound to `from`.
+    /// The grouped burst run over `photos`, bound to `from`. Once `cancel` is set no further
+    /// representative is sent.
     fn suggest_grouped(
         &self,
         app: &AppState,
         from: CatalogIdentity,
         confirmed: Confirmed,
         photos: Vec<i64>,
+        cancel: Arc<AtomicBool>,
     ) -> Result<GroupedDispatchResult, String>;
     /// The models on the Ollama server at `url` (local; no photo).
     fn ollama_models(&self, url: &str) -> Result<Vec<String>, String>;
@@ -86,8 +89,9 @@ impl AiBackend for CoreAi {
         from: CatalogIdentity,
         confirmed: Confirmed,
         photos: Vec<i64>,
+        cancel: Arc<AtomicBool>,
     ) -> Result<GroupedDispatchResult, String> {
-        chairphoto_core::app::runtime().block_on(core_ai::suggest_tags_grouped(app, Some(from), Some(confirmed), photos))
+        chairphoto_core::app::runtime().block_on(core_ai::suggest_tags_grouped(app, Some(from), Some(confirmed), photos, &cancel))
     }
 
     fn ollama_models(&self, url: &str) -> Result<Vec<String>, String> {
@@ -202,6 +206,9 @@ pub struct AiState {
     photo_seq: u64,
     /// A run (one photo or a batch) is in flight.
     pub busy: bool,
+    /// The grouped run in flight, by its cancel flag: Cancel, unloading the module and a
+    /// catalog switch set it, and the core sends no further representative.
+    batch_cancel: Option<Arc<AtomicBool>>,
     pub error: Option<String>,
     pub batch_msg: Option<String>,
     pub confirm: Option<BulkConfirm>,
@@ -247,6 +254,7 @@ impl AiState {
             photo_key: None,
             photo_seq: 0,
             busy: false,
+            batch_cancel: None,
             error: None,
             batch_msg: None,
             confirm: None,
@@ -316,8 +324,9 @@ impl AiState {
         self.settings_from = None;
         self.photo = PhotoView::None;
         self.photo_key = None;
-        // A run of the old catalog is dropped (its answer is stale); the confirm, bound to the
-        // old catalog's photos, closes.
+        // A run of the old catalog is dropped (its answer is stale) and a grouped one stops
+        // sending; the confirm, bound to the old catalog's photos, closes.
+        self.stop_batch();
         self.busy = false;
         self.estimating = false;
         self.confirm = None;
@@ -327,8 +336,10 @@ impl AiState {
         cx.notify();
     }
 
-    /// Disabled: nothing it started is heard any more.
+    /// Disabled: nothing it started is heard any more, and a grouped run sends no further
+    /// representative.
     pub fn unload(&mut self, cx: &mut Context<Self>) {
+        self.stop_batch();
         self.live = false;
         self.generation += 1;
         cx.notify();
@@ -646,16 +657,48 @@ impl AiState {
         cx.notify();
     }
 
+    /// Set the running batch's cancel flag (if any) and forget it.
+    fn stop_batch(&mut self) {
+        if let Some(flag) = self.batch_cancel.take() {
+            flag.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// A grouped run is in flight (its Cancel is offered).
+    pub fn batch_running(&self) -> bool {
+        self.batch_cancel.is_some()
+    }
+
+    /// "Cancel" on a running batch: the representative with the provider finishes; no
+    /// further one is sent.
+    pub fn cancel_batch(&mut self, cx: &mut Context<Self>) {
+        if self.batch_cancel.is_none() {
+            return;
+        }
+        self.stop_batch();
+        self.batch_msg = Some("Cancelling — the photo with the engine now finishes; no more are sent…".into());
+        cx.notify();
+    }
+
     fn dispatch(&mut self, photos: Vec<i64>, from: CatalogIdentity, engine: Confirmed, cx: &mut Context<Self>) {
         self.busy = true;
         self.confirm = None;
         self.error = None;
         self.batch_msg = Some(format!("Grouping {}…", photos.len()));
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.batch_cancel = Some(cancel.clone());
         cx.notify();
         let backend = AiBackendGlobal::get(cx);
-        self.run_off(cx, move |app| backend.suggest_grouped(app, from, engine, photos), |s, result, cx| {
+        let mine = cancel.clone();
+        self.run_off(cx, move |app| backend.suggest_grouped(app, from, engine, photos, cancel), move |s, result, cx| {
             s.busy = false;
+            if s.batch_cancel.as_ref().is_some_and(|f| Arc::ptr_eq(f, &mine)) {
+                s.batch_cancel = None;
+            }
             match result {
+                Ok(r) if r.cancelled => {
+                    s.batch_msg = Some(logic::batch_cancelled_line(r.dispatched, r.representatives, r.propagated))
+                }
                 Ok(r) => s.batch_msg = Some(logic::batch_done_line(r.total, r.representatives, r.propagated)),
                 Err(e) => {
                     s.error = Some(e);

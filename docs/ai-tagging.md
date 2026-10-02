@@ -144,6 +144,11 @@ member can be re-run individually, which supersedes its propagated suggestions. 
 never silent auto-apply: it trades a little recall for a large cost cut, so it has to stay
 reviewable.
 
+A grouped run can be stopped: the GPUI panel's "Cancel batch", disabling the module and a
+catalog switch set the run's cancel flag, which the core checks before each representative's
+preview is read and again just before it is sent. The representative already with the provider
+finishes and is stored; no further one is sent, and the result reports `cancelled`.
+
 ## Smart Tagging (`smarttags` plugin)
 
 Learns from the photos you have already tagged. Fully local, no language model.

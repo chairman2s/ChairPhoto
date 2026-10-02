@@ -86,6 +86,8 @@ pub struct GroupedDispatchResult {
     pub dispatched: usize,
     /// Pending suggestions stored across all cluster members (direct + propagated).
     pub propagated: usize,
+    /// The run was cancelled: the representatives after the one in flight were not sent.
+    pub cancelled: bool,
 }
 
 /// `f` under the catalog lock — bound to `expected` when given (`with_catalog_as`).
@@ -419,14 +421,20 @@ pub fn grouped_estimate(
 /// A representative whose photo or preview is gone, or whose provider call fails, leaves its
 /// cluster untouched. No progress is reported: the caller awaits it behind a busy flag
 /// (restoring progress means the full job treatment, not a bare emit — #12).
+///
+/// **Cancel.** `cancel` is checked before each representative's preview is read and again
+/// just before it is sent: once set, no further photo goes to the provider (the one already
+/// in flight finishes and is stored) and the result says `cancelled`. A catalog switch stops
+/// the run the same way (the next phase fails [`super::CATALOG_CHANGED`]).
 #[cfg(feature = "ai")]
 pub async fn suggest_tags_grouped(
     state: &AppState,
     expected: Option<CatalogIdentity>,
     confirmed: Option<Confirmed>,
     photo_ids: Vec<i64>,
+    cancel: &std::sync::atomic::AtomicBool,
 ) -> Result<GroupedDispatchResult, String> {
-    suggest_tags_grouped_via(state, expected, confirmed, photo_ids, std::sync::Arc::new(Network)).await
+    suggest_tags_grouped_via(state, expected, confirmed, photo_ids, cancel, std::sync::Arc::new(Network)).await
 }
 
 /// [`suggest_tags_grouped`] through `provider`.
@@ -436,8 +444,10 @@ pub async fn suggest_tags_grouped_via<P: Provider>(
     expected: Option<CatalogIdentity>,
     confirmed: Option<Confirmed>,
     photo_ids: Vec<i64>,
+    cancel: &std::sync::atomic::AtomicBool,
     provider: std::sync::Arc<P>,
 ) -> Result<GroupedDispatchResult, String> {
+    let cancelled = || cancel.load(std::sync::atomic::Ordering::SeqCst);
     let st = state.clone();
     let clusters = spawn_blocking(move || cluster_photo_ids(&st, expected, photo_ids)).await.map_err(|e| e.to_string())??;
     let total: usize = clusters.iter().map(|c| c.photo_ids.len()).sum();
@@ -457,6 +467,9 @@ pub async fn suggest_tags_grouped_via<P: Provider>(
 
     let (mut dispatched, mut propagated) = (0usize, 0usize);
     for cluster in clusters {
+        if cancelled() {
+            return Ok(GroupedDispatchResult { total, representatives, dispatched, propagated, cancelled: true });
+        }
         let rep_id = cluster.representative_id();
         let prep = bound_blocking(state, expected, move |c| Ok((c.require_photo_path(rep_id)?, ai::rejected_paths(c.conn(), rep_id)?))).await;
         let (image_path, rejected) = match prep {
@@ -470,6 +483,10 @@ pub async fn suggest_tags_grouped_via<P: Provider>(
             Ok(b) => b,
             Err(_) => continue,
         };
+        // The preview read can take a while: a Cancel meanwhile still stops this one.
+        if cancelled() {
+            return Ok(GroupedDispatchResult { total, representatives, dispatched, propagated, cancelled: true });
+        }
         let raw = match provider.suggest(&config, &image, &taxonomy, &rejected, None).await {
             Ok(r) => r,
             Err(_) => continue, // a later re-run can retry this cluster
@@ -492,7 +509,7 @@ pub async fn suggest_tags_grouped_via<P: Provider>(
         .await?;
     }
 
-    Ok(GroupedDispatchResult { total, representatives, dispatched, propagated })
+    Ok(GroupedDispatchResult { total, representatives, dispatched, propagated, cancelled: false })
 }
 
 /// The models installed on the Ollama server at `url` (`ai_ollama_models`), for the model
@@ -564,6 +581,8 @@ mod tests {
         pub images: std::sync::atomic::AtomicUsize,
         pub calls: std::sync::Mutex<Vec<String>>,
         pub taxonomies: std::sync::Mutex<Vec<String>>,
+        /// Set on the first provider call: the user cancels while it is in flight.
+        pub trip: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     }
 
     impl Provider for FakeProvider {
@@ -575,6 +594,9 @@ mod tests {
         async fn suggest(&self, config: &ai::Config, _: &str, taxonomy: &str, _: &[String], _: Option<&str>) -> Result<Vec<ai::Raw>, String> {
             self.calls.lock().unwrap().push(format!("{}/{}", config.provider, config.model()));
             self.taxonomies.lock().unwrap().push(taxonomy.to_string());
+            if let Some(t) = &self.trip {
+                t.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
             Ok(vec![raw("Animals/Gull", 0.9)])
         }
     }
@@ -602,7 +624,7 @@ mod tests {
         for stale in [confirmed("claude", "claude-sonnet-4-6"), confirmed("ollama", "llava:latest")] {
             let e = rt.block_on(suggest_tags_via(&state, None, stale.clone(), 1, None, None, fake.clone())).unwrap_err();
             assert_eq!(e, ENGINE_CHANGED);
-            let e = rt.block_on(suggest_tags_grouped_via(&state, None, stale, vec![1, 2], fake.clone())).unwrap_err();
+            let e = rt.block_on(suggest_tags_grouped_via(&state, None, stale, vec![1, 2], &Default::default(), fake.clone())).unwrap_err();
             assert_eq!(e, ENGINE_CHANGED);
         }
         assert_eq!(fake.images.load(std::sync::atomic::Ordering::SeqCst), 0, "a preview was read for an unconfirmed engine");
@@ -634,7 +656,7 @@ mod tests {
 
         let e = rt.block_on(suggest_tags_via(&state, None, None, 1, None, None, fake.clone())).unwrap_err();
         assert!(e.contains("not on this machine"), "{e}");
-        let e = rt.block_on(suggest_tags_grouped_via(&state, None, None, vec![1, 2], fake.clone())).unwrap_err();
+        let e = rt.block_on(suggest_tags_grouped_via(&state, None, None, vec![1, 2], &Default::default(), fake.clone())).unwrap_err();
         assert!(e.contains("not on this machine"), "{e}");
         assert_eq!(fake.images.load(std::sync::atomic::Ordering::SeqCst), 0, "a preview was read for a remote server");
         assert!(fake.calls.lock().unwrap().is_empty(), "a photo went to a remote Ollama without its opt-in");
@@ -648,6 +670,36 @@ mod tests {
         rt.block_on(suggest_tags_via(&state, None, None, 1, None, None, fake.clone())).unwrap();
         let sent = fake.taxonomies.lock().unwrap().last().cloned().unwrap();
         assert!(sent.contains("People/Alice"), "the local model gets the whole vocabulary: {sent}");
+    }
+
+    /// A grouped run stops at Cancel: cancelled while the first representative is with the
+    /// provider, it stores that one and sends no other; cancelled before it starts, it sends
+    /// nothing. Three photos hours apart are three clusters.
+    ///
+    /// Mutation-checked: dropping both `cancelled()` checks in the loop makes three calls.
+    #[test]
+    fn a_cancelled_grouped_run_sends_no_further_representative() {
+        let (c, _dir) = catalog("grouped-cancel", 3);
+        for (id, t) in [(1, "2026-05-01T08:00:00"), (2, "2026-05-01T12:00:00"), (3, "2026-05-01T16:00:00")] {
+            c.conn().execute("UPDATE photos SET capture_time = ?1 WHERE id = ?2", rusqlite::params![t, id]).unwrap();
+        }
+        let state = AppState::default();
+        *state.catalog.lock().unwrap() = Some(c);
+        let rt = super::super::runtime();
+        assert_eq!(grouped_estimate(&state, None, vec![1, 2, 3]).unwrap().representatives, 3);
+
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let fake = std::sync::Arc::new(FakeProvider { trip: Some(cancel.clone()), ..Default::default() });
+        let r = rt.block_on(suggest_tags_grouped_via(&state, None, None, vec![1, 2, 3], &cancel, fake.clone())).unwrap();
+        assert_eq!(fake.calls.lock().unwrap().len(), 1, "a representative was sent after Cancel");
+        assert_eq!(fake.images.load(std::sync::atomic::Ordering::SeqCst), 1, "a preview was read after Cancel");
+        assert_eq!((r.representatives, r.dispatched, r.cancelled), (3, 1, true));
+        assert!(r.propagated >= 1, "the one in flight is stored");
+
+        let before = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let fake = std::sync::Arc::new(FakeProvider::default());
+        let r = rt.block_on(suggest_tags_grouped_via(&state, None, None, vec![1, 2, 3], &before, fake.clone())).unwrap();
+        assert!(fake.calls.lock().unwrap().is_empty() && r.cancelled && r.dispatched == 0);
     }
 
     /// The estimate and every phase of a bound run read only the catalog they were bound to.

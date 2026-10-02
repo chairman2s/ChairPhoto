@@ -179,6 +179,11 @@ pub fn batch_done_line(total: usize, representatives: usize, propagated: usize) 
     format!("Done — {total} photos → {representatives} representatives, {propagated} suggestions. Review each photo.")
 }
 
+/// The batch line after Cancel.
+pub fn batch_cancelled_line(sent: usize, representatives: usize, propagated: usize) -> String {
+    format!("Cancelled — {sent} of {representatives} representatives sent, {propagated} suggestions stored.")
+}
+
 /// Whether a run may send photos to `provider` now — the core's rule
 /// (`plugins::ai::opt_in`): Ollama at a loopback URL is local; a cloud provider is opted into
 /// by choosing it **and** saving its API key; an Ollama server not on this machine by allowing

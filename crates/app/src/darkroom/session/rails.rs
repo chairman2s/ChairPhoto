@@ -112,6 +112,12 @@ impl Darkroom {
 
     /// Ctrl+Z: one step back, counted from the history as it stands once what is pending is
     /// saved — so undo first takes back the change not yet saved.
+    ///
+    /// **Deliberately not React.** With a change pending at head H, React's `stepBy` picked
+    /// its target from the history *before* `gotoStep` flushed the change, so it saved the
+    /// change as H+1 and then went to H−1: one Ctrl+Z took back the unsaved change *and* the
+    /// step before it. Here the target is counted after the save, so it lands on H: only the
+    /// unsaved change is taken back (and Ctrl+Shift+Z brings it back).
     pub fn undo(&mut self, cx: &mut Context<Self>) {
         self.after_save(Box::new(|this, seq, cx| this.goto_now(seq, None, -1, cx)), cx);
     }

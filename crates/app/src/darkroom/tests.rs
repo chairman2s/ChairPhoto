@@ -655,7 +655,8 @@ impl Rig {
 }
 
 /// Ctrl+Z / Ctrl+Shift+Z / Ctrl+Y through the real key path: undo first saves the change not
-/// yet saved (so it can be redone), then steps back; the step's settings go back into the
+/// yet saved (so it can be redone), then steps back one step from there — to the head the
+/// change was made on, not React's head − 1; the step's settings go back into the
 /// version; redo walks forward; a new change replaces the undone steps.
 #[gpui_kit::test]
 fn undo_and_redo_walk_the_history_and_save_the_pending_change_first(cx: &mut TestAppContext) {
@@ -668,7 +669,9 @@ fn undo_and_redo_walk_the_history_and_save_the_pending_change_first(cx: &mut Tes
     work(cx);
     let (labels, head) = rig.labels(v);
     assert_eq!(labels, ["Before", "Exposure +0.50", "Contrast +0.30"], "the pending change was saved first");
-    assert_eq!(head, Some(1), "then undone");
+    // Deliberately not React's H−1 (0 here: React chose the target before saving the
+    // pending change): one Ctrl+Z takes back the unsaved change only.
+    assert_eq!(head, Some(1), "then undone, landing on the step before the pending change");
     assert_eq!(rig.working(cx)["tone"]["contrast"], json!(0));
     assert_eq!(rig.working(cx)["tone"]["ev"], json!(0.5));
     assert_eq!(rig.saved(v)["tone"]["contrast"], json!(0), "the step's settings are the version's");

@@ -221,16 +221,31 @@ the file (#147). The faces that claimed none are appended, marked. **When in dou
 regions (an empty set and nothing of ours, or the set as the file already has it) leaves the
 sidecar untouched and creates none.
 
-**Regions written before the marker existed** are recognised by Name + Area only, against the
-catalog's record of what the old writer exported: `faces__legacy_regions`, taken once — when a
-catalog that already has faces first opens the faces tables after the upgrade — from every
-confirmed, named face not itself confirmed from another tool's region (`source = 'xmp'`), with
-the name and display-frame box it had then (the old writer did not convert frames). An unmarked
-region matching a recorded face is adopted (moved and marked) while the face is in the set, and
-removed once it is not. A photo's record is spent by its first write that reaches the sidecar,
-so a region another tool writes later under the same name and place is never taken for ours.
-Pre-marker regions of a face rejected *before* the upgrade are not on the record and stay — the
-catalog no longer knows they were ours.
+**Regions written before the marker existed** are recognised against the catalog's record of
+what the old writer exported: `faces__legacy_regions`, taken once — when a catalog that already
+has faces first opens the faces tables after the upgrade — with the name and display-frame box
+each face had then (the old writer did not convert frames). The old writer exported a photo's
+whole confirmed set after every face verb on it and never otherwise, so the record holds the
+confirmed, named faces it can tell were exported:
+
+- a face a verb confirmed (accepted, assigned, named — every source but `seed` and `xmp`);
+- an auto-seeded face (`seed`; the matching pass exported nothing) only on a photo a verb
+  touched — a verb-confirmed face, an ignored face or a remembered rejection there;
+- never a face confirmed from another tool's region (`xmp`).
+
+Whether a write succeeded was never recorded (an offline photo's was skipped), and a seed made
+after the verb is still counted, so the record can over-count. That is why only an unmarked
+region in **exactly the old writer's shape** can be taken for its: `rdf:li
+rdf:parseType="Resource"` holding exactly `mwg-rs:Name`, `mwg-rs:Type` = `Face` and an
+`mwg-rs:Area rdf:parseType="Resource"` of exactly `stArea:x/y/w/h` and `stArea:unit` =
+`normalized`, all as plain elements, with no other attribute, field or child. A region another
+tool wrote at the same place under the same name — digiKam's nested `rdf:Description` with
+`digiKam:Confidence`, a Lightroom region with `mwg-rs:Rotation` — has another shape and stays
+foreign. Such an old-shaped region matching a recorded face by Name + Area is adopted (moved and
+marked) while the face is in the set, and removed once it is not. A photo's record is spent by
+its first write that reaches the sidecar, so a region another tool writes later under the same
+name and place is never taken for ours. Pre-marker regions of a face rejected *before* the
+upgrade are not on the record and stay — the catalog no longer knows they were ours.
 
 A sidecar may be rooted at `x:xmpmeta` or, as the XMP spec allows, at a bare `rdf:RDF`, which
 is read and written in place (#147); a file rooted at anything else is not written. The writer

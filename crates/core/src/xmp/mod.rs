@@ -571,8 +571,9 @@ fn stored_to_display(o: u8, bbox: (f32, f32, f32, f32)) -> (f32, f32, f32, f32) 
 ///   foreign attributes and children stay (#140), and no marked copy is appended.
 /// - `legacy` is the catalog's record of the faces ChairPhoto exported **before the marker
 ///   existed** (face id, name and box at that time, in the display frame those writes used).
-///   An unmarked region matching such a face by Name + Area was ChairPhoto's: it is adopted
-///   (moved and marked) when the face is still in the set, removed when it is not.
+///   An unmarked region in exactly the pre-marker writer's shape ([`is_pre_marker_shape`])
+///   matching such a face by Name + Area was ChairPhoto's: it is adopted (moved and marked)
+///   when the face is still in the set, removed when it is not. Any other shape is foreign.
 ///
 /// Each incoming region claims at most one existing region. Merge-safety (binding, AGENTS.md):
 /// the existing `mwg-rs:Regions` is edited in place, never rebuilt. Every foreign region in
@@ -1009,6 +1010,9 @@ struct ExistingRegion {
     node: usize,
     /// Who wrote it, by its `chairphoto:FaceId`.
     owner: Owner,
+    /// Whether it has exactly the shape the pre-marker writer gave its regions
+    /// ([`is_pre_marker_shape`]): only such an unmarked region can be one it wrote.
+    pre_marker_shape: bool,
     /// Its Name and box, in the file's frame; `None` when it does not parse.
     region: Option<ReadRegion>,
 }
@@ -1063,7 +1067,12 @@ fn reconcile_regions(container: &mut Element, catalog: &str, incoming: &[FaceReg
         .filter(|(_, li)| is_rdf(li, "li"))
         .map(|(node, li)| {
             let marker = struct_body(li).and_then(|b| struct_field(b, NS_CHAIRPHOTO, "FaceId"));
-            ExistingRegion { node, owner: marker_owner(catalog, marker.as_deref()), region: parse_region_li(li) }
+            ExistingRegion {
+                node,
+                owner: marker_owner(catalog, marker.as_deref()),
+                pre_marker_shape: is_pre_marker_shape(li),
+                region: parse_region_li(li),
+            }
         })
         .collect();
     let mut claims = vec![Claim::Keep; existing.len()];
@@ -1104,7 +1113,7 @@ fn reconcile_regions(container: &mut Element, catalog: &str, incoming: &[FaceReg
         .map(|l| incoming.iter().zip(&written).any(|(r, w)| !w && r.face_id == l.face_id))
         .collect();
     let pairs = closest_pairs(&existing, legacy, &free(&claims), &in_set, |e, p, l| {
-        e.owner == Owner::Unmarked && same_face(p, l)
+        e.owner == Owner::Unmarked && e.pre_marker_shape && same_face(p, l)
     });
     for (i, j) in pairs {
         let k = incoming
@@ -1135,7 +1144,7 @@ fn reconcile_regions(container: &mut Element, catalog: &str, incoming: &[FaceReg
     let retired: Vec<bool> =
         legacy.iter().zip(&legacy_free).map(|(l, free)| *free && !ids.contains(&l.face_id)).collect();
     let pairs = closest_pairs(&existing, legacy, &free(&claims), &retired, |e, p, l| {
-        e.owner == Owner::Unmarked && same_face(p, l)
+        e.owner == Owner::Unmarked && e.pre_marker_shape && same_face(p, l)
     });
     for (i, _) in pairs {
         claims[i] = Claim::Remove;
@@ -1351,6 +1360,91 @@ fn center_distance(a: (f32, f32, f32, f32), b: (f32, f32, f32, f32)) -> f32 {
     let dx = (a.0 + a.2 / 2.0) - (b.0 + b.2 / 2.0);
     let dy = (a.1 + a.3 / 2.0) - (b.1 + b.3 / 2.0);
     dx.hypot(dy)
+}
+
+/// Whether `li` has exactly the shape of a region the pre-marker writer wrote — its
+/// [`region_li`] output, unchanged from the first public release until the marker (#135):
+///
+/// ```xml
+/// <rdf:li rdf:parseType="Resource">
+///   <mwg-rs:Name>…</mwg-rs:Name> <mwg-rs:Type>Face</mwg-rs:Type>
+///   <mwg-rs:Area rdf:parseType="Resource">
+///     <stArea:x/> <stArea:y/> <stArea:w/> <stArea:h/> <stArea:unit>normalized</stArea:unit>
+///   </mwg-rs:Area>
+/// </rdf:li>
+/// ```
+///
+/// Exactly those fields, each once, in elements (any order, whitespace between them), and no
+/// other attribute, field or child — no foreign property at all. Only such a region can be on
+/// the legacy record (review M2): a region another tool wrote at the recorded place under the
+/// recorded name (digiKam's nested `rdf:Description` with `digiKam:Confidence`, a Lightroom
+/// region with `mwg-rs:Rotation`, …) has another shape and stays foreign. The old writer's
+/// in-place Area update (#140) kept a foreign region's shape, so a region it updated but did
+/// not write is not taken for one it wrote.
+fn is_pre_marker_shape(li: &Element) -> bool {
+    /// Only `rdf:parseType="Resource"` among its attributes.
+    fn resource_struct(e: &Element) -> bool {
+        ns_attr(e, NS_RDF, "parseType") == Some("Resource") && e.attributes.len() == 1
+    }
+    /// Its child elements, when every other child is whitespace.
+    fn fields(e: &Element) -> Option<Vec<&Element>> {
+        let mut out = Vec::new();
+        for n in &e.children {
+            match n {
+                XMLNode::Element(c) => out.push(c),
+                XMLNode::Text(t) if t.trim().is_empty() => {}
+                _ => return None,
+            }
+        }
+        Some(out)
+    }
+    /// The text of a plain literal field with no attributes, `None` for anything else.
+    fn literal(e: &Element) -> Option<String> {
+        if !e.attributes.is_empty() {
+            return None;
+        }
+        let mut text = String::new();
+        for n in &e.children {
+            match n {
+                XMLNode::Text(t) => text.push_str(t),
+                _ => return None,
+            }
+        }
+        Some(text)
+    }
+    /// The fields of `e` in namespace `ns`, matched one to one with `names` in any order.
+    fn exactly<'a>(e: &'a Element, ns: &str, names: &[&str]) -> Option<Vec<&'a Element>> {
+        let kids = fields(e)?;
+        if kids.len() != names.len() {
+            return None;
+        }
+        names
+            .iter()
+            .map(|name| {
+                let mut found = kids.iter().filter(|k| k.namespace.as_deref() == Some(ns) && k.name == *name);
+                match (found.next(), found.next()) {
+                    (Some(k), None) => Some(*k),
+                    _ => None,
+                }
+            })
+            .collect()
+    }
+
+    if !is_rdf(li, "li") || !resource_struct(li) {
+        return false;
+    }
+    let Some([name, kind, area]) = exactly(li, NS_MWG_RS, &["Name", "Type", "Area"]).map(|v| [v[0], v[1], v[2]])
+    else {
+        return false;
+    };
+    if literal(name).is_none() || literal(kind).as_deref() != Some("Face") || !resource_struct(area) {
+        return false;
+    }
+    let Some(coords) = exactly(area, NS_STAREA, &["x", "y", "w", "h", "unit"]) else {
+        return false;
+    };
+    coords[..4].iter().all(|c| literal(c).is_some_and(|v| v.trim().parse::<f32>().is_ok()))
+        && literal(coords[4]).as_deref() == Some("normalized")
 }
 
 /// A new region for `r`, carrying catalog `catalog`'s marker.
@@ -4023,5 +4117,74 @@ mod tests {
         assert!(near4(alices[0].area, center((0.105, 0.1, 0.2, 0.2))), "{xml}");
         write_face_regions(&photo, CAT, &[], &[], sized(6000, 4000)).unwrap();
         assert_eq!(rf::named(&rf::mwg(&read(&sidecar_path(&photo))), "Alice").len(), 1);
+    }
+
+    // ── #135 M2: only the pre-marker writer's exact shape is legacy ────────────
+
+    /// Review M2 / probes Q4, Q4b: an unmarked region at the recorded place under the recorded
+    /// name is taken for the pre-marker writer's only when it has exactly that writer's shape.
+    /// digiKam's (nested `rdf:Description`, `digiKam:Confidence`) and every other variant —
+    /// an extra field, a foreign child or attribute, another struct form — stays foreign: a
+    /// reject never removes it, a confirmed face never marks it (only its Area moves, #140).
+    /// The control, the exact shape, is adopted and then removed.
+    #[test]
+    fn only_the_pre_marker_shape_is_adopted_or_removed() {
+        const AREA: &str = r#"<mwg-rs:Area rdf:parseType="Resource"><stArea:x>0.2</stArea:x><stArea:y>0.2</stArea:y><stArea:w>0.2</stArea:w><stArea:h>0.2</stArea:h><stArea:unit>normalized</stArea:unit></mwg-rs:Area>"#;
+        let exact = |li_attrs: &str, extra: &str| {
+            format!(
+                r#"<rdf:li rdf:parseType="Resource"{li_attrs}><mwg-rs:Name>Alice</mwg-rs:Name><mwg-rs:Type>Face</mwg-rs:Type>{AREA}{extra}</rdf:li>"#
+            )
+        };
+        let foreign = [
+            (
+                "digiKam (Q4)",
+                r#"<rdf:li><rdf:Description mwg-rs:Name="Alice" mwg-rs:Type="Face" digiKam:Confidence="0.97"><mwg-rs:Area stArea:x="0.2" stArea:y="0.2" stArea:w="0.2" stArea:h="0.2" stArea:unit="normalized"/></rdf:Description></rdf:li>"#.to_string(),
+            ),
+            ("an extra MWG field", exact("", "<mwg-rs:Rotation>0</mwg-rs:Rotation>")),
+            ("a foreign child", exact("", "<digiKam:FaceEngine>dnn</digiKam:FaceEngine>")),
+            ("a foreign attribute", exact(r#" digiKam:Confidence="0.97""#, "")),
+            (
+                "an Area in attribute form",
+                r#"<rdf:li rdf:parseType="Resource"><mwg-rs:Name>Alice</mwg-rs:Name><mwg-rs:Type>Face</mwg-rs:Type><mwg-rs:Area stArea:x="0.2" stArea:y="0.2" stArea:w="0.2" stArea:h="0.2" stArea:unit="normalized"/></rdf:li>"#.to_string(),
+            ),
+            (
+                "a foreign Area field",
+                exact("", "").replace("<stArea:unit>", r#"<digiKam:Source>user</digiKam:Source><stArea:unit>"#),
+            ),
+        ];
+        let alice = face(1, "Alice", (0.1, 0.1, 0.2, 0.2));
+        let record = [alice.clone()];
+        for (case, li) in &foreign {
+            let sidecar = digikam_with(li);
+            let before = rf::named(&rf::mwg(&sidecar), "Alice")[0].clone();
+            assert_eq!(before.area, (0.2, 0.2, 0.2, 0.2), "{case}: fixture");
+
+            // Q4: the face was rejected.
+            let (_dir, photo) = seeded_photo("xmp-135-shape-reject", &sidecar);
+            write_face_regions(&photo, CAT, &[], &record, sized(6000, 4000)).unwrap();
+            let xml = read(&sidecar_path(&photo));
+            assert_eq!(rf::named(&rf::mwg(&xml), "Alice"), [&before], "{case}: deleted:\n{xml}");
+
+            // Q4b: the face is still confirmed (moved a little).
+            let (_dir, photo) = seeded_photo("xmp-135-shape-keep", &sidecar);
+            let moved = face(1, "Alice", (0.105, 0.1, 0.2, 0.2));
+            write_face_regions(&photo, CAT, &[moved], &record, sized(6000, 4000)).unwrap();
+            let xml = read(&sidecar_path(&photo));
+            let alices = rf::named(&rf::mwg(&xml), "Alice").into_iter().cloned().collect::<Vec<_>>();
+            assert_eq!(alices.len(), 1, "{case}: duplicated:\n{xml}");
+            assert_eq!(alices[0].face_id, None, "{case}: adopted as ours:\n{xml}");
+            write_face_regions(&photo, CAT, &[], &record, sized(6000, 4000)).unwrap();
+            assert_eq!(rf::named(&rf::mwg(&read(&sidecar_path(&photo))), "Alice").len(), 1, "{case}");
+        }
+
+        // The control: the exact shape is the old writer's.
+        let sidecar = digikam_with(&exact("", ""));
+        let (_dir, photo) = seeded_photo("xmp-135-shape-exact", &sidecar);
+        write_face_regions(&photo, CAT, &[alice.clone()], &record, sized(6000, 4000)).unwrap();
+        let got = rf::mwg(&read(&sidecar_path(&photo)));
+        assert_eq!(rf::named(&got, "Alice")[0].face_id.as_deref(), Some(ours(1).as_str()), "not adopted");
+        let (_dir, photo) = seeded_photo("xmp-135-shape-exact-reject", &sidecar);
+        write_face_regions(&photo, CAT, &[], &record, sized(6000, 4000)).unwrap();
+        assert!(rf::named(&rf::mwg(&read(&sidecar_path(&photo))), "Alice").is_empty(), "not removed");
     }
 }

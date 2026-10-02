@@ -410,26 +410,44 @@ mod tests {
             .unwrap()
     }
 
-    /// The record is taken once, when the faces tables predate it: every confirmed, named face
-    /// the pre-marker writer exported — not one confirmed from another tool's region
-    /// (`source = 'xmp'`), not one that was never confirmed. A face confirmed afterwards is
+    /// The record is taken once, when the faces tables predate it, from the confirmed, named
+    /// faces the pre-marker writer exported as far as the catalog can tell (review M2): one a
+    /// verb confirmed, and an auto-seeded one only on a photo a verb touched (a verb-confirmed
+    /// face, an ignored face or a remembered rejection there). Not a seed on an untouched
+    /// photo (the matching pass exported nothing), not one confirmed from another tool's
+    /// region (`source = 'xmp'`), not one never confirmed. A face confirmed afterwards is
     /// written with the marker and never joins it.
     #[test]
-    fn the_pre_marker_record_is_the_confirmed_faces_of_an_older_catalog() {
+    fn the_pre_marker_record_is_the_faces_the_old_writer_exported() {
         let conn = mem_conn();
         conn.execute_batch(
             "DROP TABLE faces__legacy_regions;
-             INSERT INTO photos (id) VALUES (1);
+             INSERT INTO photos (id) VALUES (1), (2), (3), (4);
              INSERT INTO tags (id, name, full_path) VALUES (10, 'Alice', 'People/Alice'),
                                                           (11, 'Bob', 'People/Bob');",
         )
         .unwrap();
-        let alice = confirm(&conn, 1, 10, "[0.1,0.1,0.2,0.2]", "seed", "confirmed");
+        let alice = confirm(&conn, 1, 10, "[0.1,0.1,0.2,0.2]", "manual", "confirmed");
+        let bob_seed = confirm(&conn, 1, 11, "[0.4,0.1,0.1,0.1]", "seed", "confirmed");
         confirm(&conn, 1, 11, "[0.5,0.5,0.1,0.1]", "xmp", "confirmed");
         confirm(&conn, 1, 11, "[0.7,0.7,0.1,0.1]", "match", "suggested");
+        // Photo 2: a seed nothing ever exported.
+        confirm(&conn, 2, 10, "[0.1,0.1,0.2,0.2]", "seed", "confirmed");
+        // Photo 3: a seed beside an ignored face; photo 4: beside a rejected one.
+        let seed3 = confirm(&conn, 3, 10, "[0.1,0.1,0.2,0.2]", "seed", "confirmed");
+        confirm(&conn, 3, 11, "[0.6,0.6,0.1,0.1]", "detect", "ignored");
+        let seed4 = confirm(&conn, 4, 10, "[0.1,0.1,0.2,0.2]", "seed", "confirmed");
+        let rejected = confirm(&conn, 4, 11, "[0.6,0.6,0.1,0.1]", "detect", "unassigned");
+        conn.execute(
+            "INSERT INTO faces__rejections (face_id, person_tag_id, rejected_at) VALUES (?1, 11, 0)",
+            [rejected],
+        )
+        .unwrap();
         store::ensure_schema(&conn).unwrap();
-        let want = vec![(alice, 1, "Alice".to_string(), "[0.1,0.1,0.2,0.2]".to_string())];
-        assert_eq!(record(&conn), want);
+        let ids: Vec<i64> = record(&conn).into_iter().map(|r| r.0).collect();
+        assert_eq!(ids, [alice, bob_seed, seed3, seed4]);
+        let want = record(&conn);
+        assert_eq!(want[0], (alice, 1, "Alice".to_string(), "[0.1,0.1,0.2,0.2]".to_string()));
 
         confirm(&conn, 1, 11, "[0.3,0.3,0.1,0.1]", "manual", "confirmed");
         store::ensure_schema(&conn).unwrap();

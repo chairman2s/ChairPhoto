@@ -167,16 +167,33 @@ fn create_schema(conn: &Connection, record_legacy: bool) -> rusqlite::Result<()>
             ON faces__legacy_regions (photo_id);
         ",
     )?;
-    // Filled once, when the table is created in a catalog that already has faces: every
-    // confirmed, named face was written to its sidecar on confirmation by the pre-marker
-    // writer (or would have been, had its photo been online). A face confirmed from a region
-    // another tool wrote (source 'xmp') was never ours to export, so it is left off.
+    // Filled once, when the table is created in a catalog that already has faces, with the
+    // confirmed, named faces the pre-marker writer exported as far as the catalog can tell
+    // (review M2). It exported a photo's whole confirmed set after every face verb on it, and
+    // never otherwise:
+    // - a face confirmed by a verb was ('match' accepted, 'manual' assigned or named: every
+    //   source but the two below);
+    // - an auto-seeded face ('seed', confirmed by the matching pass, which exports nothing)
+    //   was only if a verb touched its photo — evidence of which is a verb-confirmed face, an
+    //   ignored one, or a remembered rejection there (the order of the seed and the verb is
+    //   not recorded, so a seed made after the verb is still counted);
+    // - a face confirmed from another tool's region ('xmp') was never ours to export.
+    // Whether the sidecar write succeeded was never recorded — an offline photo's was skipped —
+    // so the record still over-counts those; the shape check on adoption covers that.
     if record_legacy && table_exists(conn, "tags")? {
         conn.execute(
             "INSERT OR IGNORE INTO faces__legacy_regions (face_id, photo_id, name, bbox)
              SELECT f.id, f.photo_id, t.name, f.bbox
                FROM faces__faces f JOIN tags t ON t.id = f.person_tag_id
-              WHERE f.state = 'confirmed' AND f.source <> 'xmp'",
+              WHERE f.state = 'confirmed'
+                AND (f.source NOT IN ('seed', 'xmp')
+                     OR (f.source = 'seed' AND EXISTS (
+                           SELECT 1 FROM faces__faces g
+                            WHERE g.photo_id = f.photo_id
+                              AND ((g.state = 'confirmed' AND g.source NOT IN ('seed', 'xmp'))
+                                   OR g.state = 'ignored'
+                                   OR EXISTS (SELECT 1 FROM faces__rejections r
+                                               WHERE r.face_id = g.id)))))",
             [],
         )?;
     }

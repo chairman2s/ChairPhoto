@@ -422,6 +422,7 @@ mod tests {
         let conn = mem_conn();
         conn.execute_batch(
             "DROP TABLE faces__legacy_regions;
+             DROP TABLE faces__once;
              INSERT INTO photos (id) VALUES (1), (2), (3), (4);
              INSERT INTO tags (id, name, full_path) VALUES (10, 'Alice', 'People/Alice'),
                                                           (11, 'Bob', 'People/Bob');",

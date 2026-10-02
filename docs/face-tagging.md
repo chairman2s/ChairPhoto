@@ -223,7 +223,9 @@ sidecar untouched and creates none.
 
 **Regions written before the marker existed** are recognised against the catalog's record of
 what the old writer exported: `faces__legacy_regions`, taken once — when a catalog that already
-has faces first opens the faces tables after the upgrade — with the name and display-frame box
+has faces first opens the faces tables after the upgrade; the one call whose `faces__once` claim
+row is new takes it, in the same savepoint, so two connections opening at once never take it
+twice or bring back rows already spent — with the name and display-frame box
 each face had then (the old writer did not convert frames). The old writer exported a photo's
 whole confirmed set after every face verb on it and never otherwise, so the record holds the
 confirmed, named faces it can tell were exported:

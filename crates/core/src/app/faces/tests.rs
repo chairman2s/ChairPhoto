@@ -373,7 +373,7 @@ fn rejecting_a_face_exported_before_the_marker_removes_its_region() {
     let marker = format!("<chairphoto:FaceId>{}/{f}</chairphoto:FaceId>", c.catalog_uuid().unwrap());
     assert!(xml.contains(&marker), "{xml}");
     std::fs::write(crate::xmp::sidecar_path(&photo_path), xml.replace(&marker, "")).unwrap();
-    c.conn().execute_batch("DROP TABLE faces__legacy_regions").unwrap();
+    c.conn().execute_batch("DROP TABLE faces__legacy_regions; DROP TABLE faces__once").unwrap();
 
     reject(&c, f).unwrap();
 

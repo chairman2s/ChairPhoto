@@ -19,7 +19,12 @@ import {
   resolutionMessage,
   summaryHeadline,
   pagingLabel,
+  identityDebtBadge,
 } from "../IdentityDebtPanel";
+
+const APP_TSX = (
+  import.meta.glob("../../App.tsx", { query: "?raw", eager: true, import: "default" }) as Record<string, string>
+)["../../App.tsx"];
 import type {
   IdentityDebtState,
   IdentityRepairSummary,
@@ -162,6 +167,18 @@ describe("summaryHeadline", () => {
   it("uses plural copies/owe for many copies", () => {
     const s: PendingIdentitySummary = { total: 74488, conflicts: 0, dismissed: 0 };
     expect(summaryHeadline(s)).toBe("74488 copies owe their identity to a sidecar");
+  });
+
+  it("badges copies owing identity plus photos owing IPTC (#148)", () => {
+    expect(identityDebtBadge({ total: 0, conflicts: 0, dismissed: 0, iptcOwed: 2 })).toBe(2);
+    expect(identityDebtBadge({ total: 3, conflicts: 0, dismissed: 4, iptcOwed: 2 })).toBe(5);
+    // A backend older than #148 omits iptcOwed.
+    expect(identityDebtBadge({ total: 3, conflicts: 0, dismissed: 0 })).toBe(3);
+  });
+
+  // App.tsx cannot be mounted here; pin that its chip/menu count is this function's.
+  it("is what App badges the title bar with", () => {
+    expect(APP_TSX).toContain("setIdentityDebtCount(identityDebtBadge(s));");
   });
 
   it("names photos owing IPTC to a sidecar (#148) only when there are some", () => {

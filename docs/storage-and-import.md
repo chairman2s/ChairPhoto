@@ -135,7 +135,9 @@ The debt is therefore a **set of fields per photo**, in `pending_sidecar_iptc`
 - **Retried by the repair pass.** After the identity queue, `run_identity_repair` drains the
   photos owing IPTC under the same job, abort flag and progress (`iptcWritten`,
   `iptcUnreachable`, `iptcFailed` in its summary; `iptcOwed` in the panel's summary). The
-  per-photo record writes the sidecar of the copy the resolver picks, as a save does.
+  per-photo record writes the sidecar of the copy the resolver picks, as a save does. The
+  title-bar "identity debt" chip and menu badge count copies owing identity plus photos owing
+  IPTC, and the panel's Start is enabled by either.
 - **Reported honestly.** A save that reached only the catalog answers `pending` with the
   reason (`IptcSaveOutcome`, returned by the Tauri `set_iptc` command and shown by both
   inspectors as "Saved to catalog; sidecar pending (…)"); `unchanged` when nothing was owed.

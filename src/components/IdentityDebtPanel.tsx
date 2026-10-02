@@ -82,6 +82,12 @@ const PAGE_SIZE = 500;
  * component isn't testable here, but this plural/singular + conflict logic is ordinary
  * string math and doesn't need one.
  */
+export function identityDebtBadge(summary: PendingIdentitySummary): number {
+  // Copies owing identity plus photos owing IPTC (#148): the repair pass this panel starts
+  // pays both, and a badge of 0 would hide the only lasting signal of owed IPTC.
+  return summary.total + (summary.iptcOwed ?? 0);
+}
+
 export function summaryHeadline(summary: PendingIdentitySummary | null): string {
   if (!summary) return "Loading…";
   const copies = summary.total === 1 ? "copy" : "copies";
@@ -623,7 +629,7 @@ export function IdentityDebtPanel({ onClose }: { onClose: () => void }) {
           <div className="row" style={{ marginTop: 10, marginBottom: 10, alignItems: "center" }}>
             <button
               className="scan-btn"
-              disabled={repairing || !summary || (summary.total === 0 && (summary.iptcOwed ?? 0) === 0)}
+              disabled={repairing || !summary || identityDebtBadge(summary) === 0}
               onClick={runRepair}
               title="Retry every queued copy now"
             >

@@ -708,6 +708,36 @@ fn legacy_catalog(tag: &str, files: &[(&str, &str)]) -> (Catalog, common::TestSu
     (Catalog::open(&db, &root).unwrap(), root, ids)
 }
 
+/// #146 review F3: a legacy row whose original also has a backup copy in place. The original
+/// moves; the backup is the same row's copy, not another photo, so the scan still brings the
+/// moved file back to the row instead of cataloguing it again.
+#[test]
+fn a_backup_in_place_does_not_stop_a_moved_legacy_file_coming_home() {
+    let (catalog, root, ids) = legacy_catalog("legacy-backup-in-place", &[("a/x.jpg", "dam:asset/9")]);
+    let nas = root.parent().unwrap().join("nas");
+    std::fs::create_dir_all(nas.join("a")).unwrap();
+    std::fs::write(nas.join("a/x.jpg"), b"notarealjpeg").unwrap();
+    let volume = catalog.add_volume("NAS", &nas, VolumeKind::Backup).unwrap();
+    catalog.add_location(ids[0], volume, "a/x.jpg", LocationRole::Backup).unwrap();
+    catalog.set_culling(ids[0], Some(5), None, None).unwrap();
+
+    let moved = root.join("b/x.jpg");
+    std::fs::create_dir_all(moved.parent().unwrap()).unwrap();
+    std::fs::rename(root.join("a/x.jpg"), &moved).unwrap();
+    std::fs::rename(
+        chairphoto_core::xmp::sidecar_path(&root.join("a/x.jpg")),
+        chairphoto_core::xmp::sidecar_path(&moved),
+    )
+    .unwrap();
+    let abort = chairphoto_core::scanner::never_abort();
+    chairphoto_core::scanner::scan_folder(&catalog, &root, &abort, &|_| {}).unwrap();
+
+    let all: i64 = catalog.conn().query_row("SELECT count(*) FROM photos", [], |r| r.get(0)).unwrap();
+    assert_eq!(all, 1, "no second row for the moved file");
+    let photo = catalog.get_photo(ids[0]).unwrap();
+    assert_eq!((photo.path.as_str(), photo.rating), ("b/x.jpg", 5));
+}
+
 /// A bundle of `photos`, each `(uuid, relative path)`, with nothing else in it.
 fn bare_bundle(photos: &[(&str, &str)]) -> chairphoto_core::bundle::BundleManifest {
     let mut m = chairphoto_core::bundle::BundleManifest::new(

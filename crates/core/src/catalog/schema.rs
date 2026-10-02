@@ -519,8 +519,8 @@ CREATE INDEX IF NOT EXISTS idx_photos_sort_date ON photos(
 -- That sidecar still carries it (it is somebody else's, so only a person may overwrite it),
 -- so it is the one link between the file and its row until the conflict is resolved: a scan
 -- re-homes a moved file onto the row holding its legacy identifier, but only when that is
--- the only such row and every copy it records is gone (`Catalog::scan_identity`). Never a
--- merge key and never written to a sidecar; one row per re-minted photo.
+-- the only such row and every primary copy it records is gone (`Catalog::scan_identity`).
+-- Never a merge key and never written to a sidecar; one row per re-minted photo.
 CREATE TABLE IF NOT EXISTS photo_legacy_identifiers (
     photo_id   INTEGER PRIMARY KEY REFERENCES photos(id) ON DELETE CASCADE,
     identifier TEXT NOT NULL

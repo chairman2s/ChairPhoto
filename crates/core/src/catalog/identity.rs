@@ -1482,8 +1482,8 @@ impl Catalog {
     /// value — overwriting it is a person's decision — so it is the only link from the file
     /// back to its row, and without it a moved file would be catalogued a second time and
     /// its tags, ratings and faces left on a row nobody sees. It answers the row's minted
-    /// UUID only when exactly one row holds that legacy identifier and every copy that row
-    /// records is gone ([`Self::every_copy_is_gone`]): two files sharing a DAM id must not
+    /// UUID only when exactly one row holds that legacy identifier and every primary copy
+    /// that row records is gone ([`Self::every_primary_copy_is_gone`]): two files sharing a DAM id must not
     /// take turns owning one row (#141), and an unmounted volume is not a moved file.
     ///
     /// The caller still binds with the raw `found`, so the foreign value stays in the
@@ -1506,21 +1506,27 @@ impl Catalog {
             .query_map(params![found], |r| Ok((r.get(0)?, r.get(1)?)))?
             .collect::<rusqlite::Result<_>>()?;
         match owners.as_slice() {
-            [(photo_id, uuid)] if self.every_copy_is_gone(*photo_id)? => Ok(Some(uuid.clone())),
+            [(photo_id, uuid)] if self.every_primary_copy_is_gone(*photo_id)? => Ok(Some(uuid.clone())),
             _ => Ok(None),
         }
     }
 
-    /// True when every copy the catalog records for `photo_id` — each location, and the
-    /// catalog-root path — sits on storage that is present and no longer holds the file.
-    /// A copy on an absent volume (an unmounted NAS) may still be there, so it is not gone.
-    fn every_copy_is_gone(&self, photo_id: i64) -> Result<bool> {
+    /// True when every primary copy the catalog records for `photo_id` — each primary
+    /// location, and the catalog-root path — sits on storage that is present and no longer
+    /// holds the file. A copy on an absent volume (an unmounted NAS) may still be there, so
+    /// it is not gone.
+    ///
+    /// Only primary copies count (#146 review F3). A backup, local cache or export copy is
+    /// another recorded location of this very row, so its presence says nothing about which
+    /// row a moved original belongs to — and since new photos get a backup enqueued, insisting
+    /// on it would leave the legacy re-home dead for most real libraries.
+    fn every_primary_copy_is_gone(&self, photo_id: i64) -> Result<bool> {
         let mut copies: Vec<(PathBuf, PathBuf)> = self
             .conn
             .prepare(
                 "SELECT v.base_path, l.relative_path
                  FROM photo_locations l JOIN volumes v ON v.id = l.volume_id
-                 WHERE l.photo_id = ?1",
+                 WHERE l.photo_id = ?1 AND l.role = 'primary'",
             )?
             .query_map(params![photo_id], |r| {
                 let base = PathBuf::from(r.get::<_, String>(0)?);
@@ -3295,35 +3301,57 @@ mod tests {
     }
 
     /// #146: a legacy identifier leads a scan back to its row only when that row is the
-    /// only one holding it and every copy it records is gone — not while one is still in
-    /// place, and not while one sits on a volume that is not there to look at.
+    /// only one holding it and every primary copy it records is gone — not while one is
+    /// still in place, and not while one sits on a volume that is not there to look at. A
+    /// backup still in place does not hold it back (review F3): it is the same row's copy.
     #[test]
-    fn a_legacy_identifier_matches_only_a_row_whose_every_copy_is_gone() {
+    fn a_legacy_identifier_matches_only_a_row_whose_every_primary_copy_is_gone() {
         let (catalog, root, dir) = temp_catalog("legacy-identifier-match");
         let (id, path) = seed_photo(&catalog, &root, "x.jpg");
+        let backup = dir.path().join("backup");
+        std::fs::create_dir_all(&backup).unwrap();
+        std::fs::write(backup.join("x.jpg"), b"raw-bytes").unwrap();
+        let backup_volume = catalog
+            .add_volume("Backup", &backup, crate::catalog::VolumeKind::Backup)
+            .unwrap();
+        catalog
+            .add_location(id, backup_volume, "x.jpg", crate::catalog::LocationRole::Backup)
+            .unwrap();
+        // A second photo whose primary copy lives on a NAS volume.
+        let (on_nas, nas_local) = seed_photo(&catalog, &root, "z.jpg");
+        std::fs::remove_file(&nas_local).unwrap();
         let nas = dir.path().join("nas");
         std::fs::create_dir_all(&nas).unwrap();
-        let volume = catalog
-            .add_volume("NAS", &nas, crate::catalog::VolumeKind::Backup)
+        let nas_volume = catalog
+            .add_volume("NAS", &nas, crate::catalog::VolumeKind::Local)
             .unwrap();
         catalog
-            .add_location(id, volume, "x.jpg", crate::catalog::LocationRole::Backup)
+            .add_location(on_nas, nas_volume, "z.jpg", crate::catalog::LocationRole::Primary)
             .unwrap();
+        std::fs::write(nas.join("z.jpg"), b"raw-bytes").unwrap();
         catalog
             .conn()
-            .execute("UPDATE photos SET uuid = 'dam:1' WHERE id = ?1", params![id])
+            .execute_batch(&format!(
+                "UPDATE photos SET uuid = 'dam:1' WHERE id = {id};
+                 UPDATE photos SET uuid = 'dam:3' WHERE id = {on_nas};"
+            ))
             .unwrap();
-        assert_eq!(catalog.remint_non_identity_photos().unwrap(), 1);
+        assert_eq!(catalog.remint_non_identity_photos().unwrap(), 2);
         let uuid = photo_uuid(&catalog, id);
         assert!(is_photo_identity(&uuid), "{uuid}");
 
         assert_eq!(catalog.scan_identity(Some("dam:1")).unwrap(), None, "its file is still there");
         std::fs::remove_file(&path).unwrap();
-        std::fs::remove_dir(&nas).unwrap();
-        assert_eq!(catalog.scan_identity(Some("dam:1")).unwrap(), None,
-            "the backup copy may still exist on the volume that is not mounted");
+        assert_eq!(catalog.scan_identity(Some("dam:1")).unwrap(), Some(uuid.clone()),
+            "the backup still in place is this row's own copy, not another photo");
+
+        let nas_uuid = photo_uuid(&catalog, on_nas);
+        assert_eq!(catalog.scan_identity(Some("dam:3")).unwrap(), None, "its NAS file is there");
+        std::fs::remove_dir_all(&nas).unwrap();
+        assert_eq!(catalog.scan_identity(Some("dam:3")).unwrap(), None,
+            "the primary copy may still exist on the volume that is not mounted");
         std::fs::create_dir_all(&nas).unwrap();
-        assert_eq!(catalog.scan_identity(Some("dam:1")).unwrap(), Some(uuid.clone()));
+        assert_eq!(catalog.scan_identity(Some("dam:3")).unwrap(), Some(nas_uuid));
 
         assert_eq!(catalog.scan_identity(Some(&uuid)).unwrap(), Some(uuid.clone()));
         assert_eq!(

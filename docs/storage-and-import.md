@@ -143,9 +143,10 @@ Before #141 a scan did adopt such a value, so an older catalog can hold rows who
 `photo_legacy_identifiers`, and queues every copy it records as a conflict; it writes no
 sidecar. Until that conflict is resolved the sidecar's foreign value is the file's only link
 to its row, so a scan re-homes a moved file onto the row holding it as a legacy identifier —
-only when no other row holds it and every copy the row records is gone (present storage, no
-file; an unmounted volume does not count). Otherwise the file is a different photo and gets
-its own row, as above.
+only when no other row holds it and every primary copy the row records is gone (present
+storage, no file; an unmounted volume does not count). A backup, cache or export copy still in
+place does not hold it back: it is the same row's copy, not evidence of another photo.
+Otherwise the file is a different photo and gets its own row, as above.
 
 **A re-minted legacy identity is a UUID v5, not v4.** This is the one exception to "a UUID v4
 on first import": a photo imported fresh still gets a random v4, but a value that already

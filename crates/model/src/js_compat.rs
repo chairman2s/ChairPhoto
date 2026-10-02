@@ -12,6 +12,8 @@
 //! - [`to_json_string`] writes JSON the way `JSON.stringify` writes numbers where it matters.
 //! - [`js_trim`]/[`is_js_whitespace`] are `String.prototype.trim`'s set, which includes U+FEFF
 //!   (a BOM) and excludes U+0085 (NEL), unlike `str::trim`.
+//! - [`encode_uri_component`] is `encodeURIComponent` (a Rust `str` holds no lone surrogate,
+//!   the one input it throws on).
 
 use serde::Serialize;
 use serde_json::Value;
@@ -349,6 +351,21 @@ pub fn integral_floats_as_ints(v: &mut Value) {
     }
 }
 
+/// `encodeURIComponent`: every UTF-8 byte percent-encoded (uppercase hex) except the ASCII
+/// letters, digits and `-_.!~*'()`. Not RFC 3986's unreserved set (`oauth1::percent_encode`):
+/// `!*'()` stay as they are, as in the URIs the React app built.
+pub fn encode_uri_component(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || b"-_.!~*'()".contains(&b) {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -445,5 +462,15 @@ mod tests {
     #[test]
     fn integral_doubles_serialize_as_integers() {
         assert_eq!(to_json_string(&serde_json::json!({"a": 2.0, "b": [0.5, -0.0, 3.0]})), r#"{"a":2,"b":[0.5,0,3]}"#);
+    }
+
+    /// Node's `encodeURIComponent` on the same string (v25.2.1).
+    #[test]
+    fn encode_uri_component_matches_node() {
+        assert_eq!(
+            encode_uri_component("a b/c?d&e=f#g!'()*~-_.ÆØÅ ✓ 😀\n:@$,;+"),
+            "a%20b%2Fc%3Fd%26e%3Df%23g!'()*~-_.%C3%86%C3%98%C3%85%20%E2%9C%93%20%F0%9F%98%80%0A%3A%40%24%2C%3B%2B"
+        );
+        assert_eq!(encode_uri_component(""), "");
     }
 }

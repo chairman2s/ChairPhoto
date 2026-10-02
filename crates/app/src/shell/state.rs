@@ -400,6 +400,9 @@ pub struct ShellState {
     /// The tag the tag editor is showing, if one is open: what `tag-editor`-slot module
     /// panels edit (host.ts's `getEditingTag`). Set and cleared by `tags::editor::TagEditor`.
     pub editing_tag: Option<i64>,
+    /// The catalog the editing tag's id was read from (the tree the editor opened over), so a
+    /// panel can bind its reads and writes to it. `None` while no tag is edited.
+    pub editing_tag_from: Option<CatalogIdentity>,
     /// The inline loupe is on (App.tsx's `loupeInline`): the stage shows the active photo
     /// instead of the grid while there is one. Kept across a cleared selection, as React did.
     pub loupe_open: bool,
@@ -470,6 +473,7 @@ impl ShellState {
             pending_link: None,
             active_version: None,
             editing_tag: None,
+            editing_tag_from: None,
             loupe_open: false,
             compare: None,
             loupe_card: None,
@@ -568,10 +572,12 @@ impl ShellState {
         cx.notify();
     }
 
-    /// The tag editor opened on `tag` (`Some`) or closed (`None`).
-    pub fn set_editing_tag(&mut self, tag: Option<i64>, cx: &mut Context<Self>) {
-        if self.editing_tag != tag {
+    /// The tag editor opened on `tag` (`Some`), read from catalog `from`, or closed (`None`).
+    pub fn set_editing_tag(&mut self, tag: Option<i64>, from: Option<CatalogIdentity>, cx: &mut Context<Self>) {
+        let from = tag.and(from);
+        if self.editing_tag != tag || self.editing_tag_from != from {
             self.editing_tag = tag;
+            self.editing_tag_from = from;
             cx.notify();
         }
     }
@@ -1240,6 +1246,7 @@ impl ShellState {
                 self.pending_link = None;
                 self.active_version = None;
                 self.editing_tag = None;
+                self.editing_tag_from = None;
                 self.loupe_open = false;
                 self.compare = None;
                 // Its photo scope names the closed catalog's tags.

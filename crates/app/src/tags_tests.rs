@@ -266,6 +266,9 @@ fn the_tag_editor_renames_adds_terms_and_deletes(cx: &mut TestAppContext) {
     let TagDialog::Editor(editor) = last_dialog(&app, cx) else { panic!("the editor") };
     let editor = up(editor);
     assert_eq!(app.wired.shell.read_with(cx, |sh, _| sh.editing_tag), Some(s.bergen), "module panels see the tag");
+    let tree_from = app.wired.tags.read_with(cx, |t, _| t.guard().identity);
+    assert!(tree_from.is_some());
+    assert_eq!(app.wired.shell.read_with(cx, |sh, _| sh.editing_tag_from), tree_from, "…and the catalog it is a tag of");
 
     let name = editor.read_with(cx, |e, _| e.name.clone());
     set_input(&app, &name, "Bjørgvin", cx);
@@ -306,6 +309,7 @@ fn the_tag_editor_renames_adds_terms_and_deletes(cx: &mut TestAppContext) {
     drop(editor);
     settle(&app, cx);
     assert_eq!(app.wired.shell.read_with(cx, |sh, _| sh.editing_tag), None, "a closed editor names no tag");
+    assert_eq!(app.wired.shell.read_with(cx, |sh, _| sh.editing_tag_from), None);
 }
 
 /// New tags: an indented paste under a parent previews and creates every path.

@@ -32,6 +32,10 @@ The module's Preferences tab takes two values:
 
 Creating a note without a vault name set shows a reminder rather than failing silently.
 
+In the GPUI app, Save checks both values: the vault field refuses a path (Obsidian wants
+the name), and the folder must stay inside the vault — no `..`, `.` or empty segments, no
+`\`. Surrounding slashes are dropped, so `Notes/` is stored as `Notes`.
+
 ## Photo notes
 
 The inspector gains a **Note** panel. **Create note in Obsidian** opens Obsidian with a new
@@ -123,6 +127,15 @@ tag, re-parenting it, moving the photo on disk, or merging catalogs across machi
 
 `src/modules/plugins/obsidian.tsx`. The module registers an inspector panel, a tag-editor
 panel, and a settings panel, and reaches the OS only through `openExternal`.
+
+In the GPUI app it is `crates/app/src/modules/obsidian/` (the panels, the settings and the
+state behind them), with the notes themselves — names, initial text, the `obsidian://`
+URIs and the record's JSON — in `chairphoto_model::obsidian`, tested against the React
+functions' output. URIs go to the desktop's opener (`App::open_url`: `xdg-open` or the
+portal, the URI as one argument, no shell). Reads and writes run off the UI thread and are
+bound to the catalog the photo or tag was read from: after a catalog switch, Create and
+Forget are refused rather than write a record keyed by another catalog's ids. Create stores
+its record and then opens Obsidian, so a refused write opens nothing.
 
 The photo↔note mapping is stored in the module's own settings, keyed by the subject's UUID
 — `obsidian.note.<photo-uuid>` and `obsidian.tagnote.<tag-uuid>` after the host namespaces

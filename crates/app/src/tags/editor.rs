@@ -12,7 +12,8 @@
 //! - **Export preview:** the labels a photo with this tag would export, for the languages
 //!   ticked ("default" = the canonical name), re-read after every change.
 //! - Sections from enabled modules in the `tag-editor` slot; they read the tag being edited
-//!   from [`ShellState::editing_tag`], which this view sets while it lives.
+//!   from [`ShellState::editing_tag`] (and the catalog it names a tag of,
+//!   [`ShellState::editing_tag_from`]), which this view sets while it lives.
 //!
 //! Every read and write goes through [`run`] (off the UI thread, fenced against a catalog
 //! switch); a write re-reads the catalog-derived state as React's `onChanged` did.
@@ -113,13 +114,13 @@ impl TagEditor {
                 move |_, cx| {
                     shell.update(cx, |s, cx| {
                         if s.editing_tag == Some(id) {
-                            s.set_editing_tag(None, cx);
+                            s.set_editing_tag(None, None, cx);
                         }
                     })
                 }
             }),
         ];
-        shell.update(cx, |s, cx| s.set_editing_tag(Some(id), cx));
+        shell.update(cx, |s, cx| s.set_editing_tag(Some(id), guard.identity, cx));
         let mut this = TagEditor {
             tags,
             guard,

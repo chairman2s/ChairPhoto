@@ -190,8 +190,8 @@ legacy rule of its own. It is a `chairphoto:FaceId` struct field
 
 — the writing catalog's identity, exactly as `settings.catalog_uuid` holds it (a UUID v4,
 lowercase and hyphenated, minted once on the catalog's first open; `catalog::CATALOG_UUID_KEY`),
-a `/`, and the face's `faces__faces.id` in canonical decimal (no sign, no leading zero: `/007` is not `/7`). Face ids are `AUTOINCREMENT`, so a catalog
-never reuses one. A region whose marker names another catalog — a second catalog over the same
+a `/`, and the face's `faces__faces.id` in canonical decimal (no sign, no leading zero:
+`/007` is not `/7`). Face ids are `AUTOINCREMENT`, so a catalog never reuses one. A region whose marker names another catalog — a second catalog over the same
 folders, or this catalog's predecessor before a rebuild — or whose value is anything but exactly
 this form is **foreign**: never removed, never re-marked.
 
@@ -224,8 +224,9 @@ Each write sends the photo's whole confirmed set, and for each existing region, 
 
 Each existing region is claimed by at most one face and each face claims at most one region;
 where several regions match a face by Name + Area, the **closest** center wins, not the first in
-the file (#147). The faces that claimed none are appended, marked. **When in doubt, the region is preserved.** Foreign attributes and children of
-`Regions`, `AppliedToDimensions` and the list survive. A write that changes nothing in the
+the file (#147). The faces that claimed none are appended, marked. **When in doubt, the
+region is preserved.** Foreign attributes and children of `Regions`, `AppliedToDimensions`
+and the list survive. A write that changes nothing in the
 regions (an empty set and nothing of ours, or the set as the file already has it) leaves the
 sidecar untouched and creates none.
 

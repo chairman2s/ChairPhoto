@@ -27,6 +27,7 @@ pub mod exports;
 pub mod identity;
 pub mod iptc;
 pub mod jobs;
+pub mod publications;
 #[cfg(feature = "localsend")]
 pub mod localsend;
 pub mod scans;

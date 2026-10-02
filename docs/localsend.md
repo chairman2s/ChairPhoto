@@ -127,7 +127,7 @@ localsend_send(photoIds, versionId?, device, pin?) -> { sent, failed }
 
 In the GPUI app (`crates/app/src/modules/localsend/`) the LocalSend and Snapchat modules each
 contribute a publish target rendering `send::SendToDevicePanel`; Snapchat records through
-`modules::publishing::record_publications` with its marker, only for the photos that reached the
+core's `app::publications::record_publications_as` with its marker, only for the photos that reached the
 device — including those delivered before a send stopped part-way (the status then reads
 "Sent 3 of 5 to Phone, then stopped: …"). The Publish dialog builds a target's form when its chip is chosen, so the opening scan
 runs only for a form the user is looking at. Tests fake the network at `LocalSendBackend`;

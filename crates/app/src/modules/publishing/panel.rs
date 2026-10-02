@@ -9,12 +9,13 @@
 //! Every service call runs on a worker ([`crate::storage::Runner`]); the panel's photo id is
 //! bound to the catalog it was read from ([`PublishSubject::catalog`]).
 
-use super::{record_publications, Album, PublishRequest, PublishService, PublishSubject, VersionPicker, NO_ROWS};
+use super::{Album, PublishRequest, PublishService, PublishSubject, VersionPicker, NO_ROWS};
 use crate::model::AppModel;
 use crate::modules::{dialog, ModuleSettings};
 use crate::shell::style::Colors;
 use crate::shell::ShellState;
 use crate::storage::{ui, Runner};
+use chairphoto_core::app::publications::record_publications_as;
 use chairphoto_core::app::AppState;
 use chairphoto_model::publishing::{default_album, publication_url};
 use gpui_kit::component::button::Button;
@@ -291,7 +292,7 @@ impl PublishPanel {
         // publish (a retry would upload it twice).
         let rx = Runner::get(cx).run(move || -> Result<Result<(), String>, String> {
             let answer = service.publish(&settings, request)?;
-            Ok(record_publications(&app, catalog, &[(photo, version)], &marker, publication_url(&answer)))
+            Ok(record_publications_as(&app, catalog, &[(photo, version)], &marker, publication_url(&answer)))
         });
         let (model, name) = (self.model.clone(), self.service.name());
         cx.spawn(async move |this, cx| {

@@ -16,10 +16,11 @@
 use super::{LocalSendBackend, SendMode};
 use crate::model::AppModelEvent;
 use crate::modules::dialog::{self, DialogHost};
-use crate::modules::publishing::{record_publications, PublishSubject, VersionPicker, NO_ROWS};
+use crate::modules::publishing::{PublishSubject, VersionPicker, NO_ROWS};
 use crate::shell::style::Colors;
 use crate::storage::{ui, Runner};
 use chairphoto_core::app::localsend::{claim_send, Device, LocalSendJob, SendOutcome, SEND_CANCELLED};
+use chairphoto_core::app::publications::record_publications_as;
 use chairphoto_core::app::CoreEvent;
 use chairphoto_model::publishing::{device_label, manual_port, progress_line, sent_line, snapchat_preflight, stopped_line, DEFAULT_PORT};
 use gpui_kit::component::button::Button;
@@ -264,7 +265,7 @@ impl SendToDevicePanel {
                             // version it was sent as (the chosen one applies to the active photo).
                             let published: Vec<(i64, Option<i64>)> =
                                 sent.iter().map(|&id| (id, if Some(id) == active { version } else { None })).collect();
-                            record_publications(&app, catalog, &published, marker, None)
+                            record_publications_as(&app, catalog, &published, marker, None)
                         }
                         _ => Ok(()),
                     };

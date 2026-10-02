@@ -6,8 +6,8 @@
 //!   the catalog their ids were read from.
 //! - [`VersionPicker`] — the active photo's versions, read on a worker under that catalog,
 //!   and the one chosen (default: the active version; `None` = Original).
-//! - [`record_publications`] — records publications under the module's marker, bound to the
-//!   subject's catalog.
+//! - Recording is core's `app::publications::record_publications_as` — under the module's
+//!   marker, bound to the subject's catalog, in one transaction.
 //! - [`PublishService`] — the per-service plumbing Flickr and SmugMug implement (#124), and
 //!   the forms they share: [`panel::PublishPanel`] (version, title, description, tags,
 //!   album, Publish → a publication with its URL) and [`oauth::OAuthSettings`] (API key and
@@ -154,25 +154,6 @@ impl VersionPicker {
             },
         )
     }
-}
-
-/// Record that each `(photo id, version id)` of `published` went to `marker` (the module's
-/// [`super::ModuleMeta::marker`]), with `url` when there is one — in one catalog lock hold, and
-/// only while `catalog` is still the open one (`CATALOG_CHANGED` otherwise, nothing written).
-/// Blocking: call it on a worker.
-pub fn record_publications(
-    app: &AppState,
-    catalog: CatalogIdentity,
-    published: &[(i64, Option<i64>)],
-    marker: &str,
-    url: Option<&str>,
-) -> Result<(), String> {
-    with_catalog_as(app, catalog, |c| {
-        for &(photo, version) in published {
-            c.record_publication(photo, version, marker, url)?;
-        }
-        Ok(())
-    })
 }
 
 /// An upload-target album (`SmugMugAlbum`): SmugMug is the only service with albums today.

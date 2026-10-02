@@ -77,6 +77,17 @@ impl Catalog {
         }
     }
 
+    /// [`record_publication`](Self::record_publication) for every `(photo id, version id)` of
+    /// `published`, in one transaction: if any row fails, none is recorded.
+    pub fn record_publications(&self, published: &[(i64, Option<i64>)], platform: &str, url: Option<&str>) -> Result<()> {
+        let tx = self.begin()?;
+        for &(photo_id, version_id) in published {
+            self.record_publication(photo_id, version_id, platform, url)?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     /// All publications for a photo, grouped by platform (newest first within a platform).
     pub fn list_publications(&self, photo_id: i64) -> Result<Vec<Publication>> {
         let mut stmt = self.conn.prepare(

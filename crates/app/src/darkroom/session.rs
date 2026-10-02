@@ -1193,7 +1193,7 @@ impl Darkroom {
         let owner = self.strip_claim;
         self.images.update(cx, |store, cx| match from {
             Some(from) if !wanted.is_empty() => store.request_looks(owner, from, &wanted, cx),
-            _ => store.set_claim(owner, []),
+            _ => store.release_looks(owner),
         });
     }
 

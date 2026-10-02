@@ -50,8 +50,13 @@
 //!   the earlier look is dropped by generation. A thumbnail of a photo with a look is bound
 //!   to that catalog: after the render, on the worker, the open catalog's identity is
 //!   checked ([`ImageStore::set_identity_probe`]); another catalog (a switch whose
-//!   `catalog:switched` has not arrived) makes the result an error, never pixels shown under
-//!   the old row. The catalog cannot have changed and changed back: identities never repeat.
+//!   `catalog:switched` has not arrived, a re-root, which sends none) refuses the result,
+//!   never pixels shown under the old row. The catalog cannot have changed and changed back:
+//!   identities never repeat. A refusal is not a failure: the tier is left empty and not
+//!   asked again under that look, and a new look (the rows re-read from the new catalog),
+//!   the photo leaving the strip, or an invalidate asks again. Looks are the strip's frames
+//!   only: a photo that leaves the strip loses its look, so no other view's thumbnail is
+//!   bound to a catalog it never read.
 //!
 //! The pool is behind [`Submit`] so tests can hold responders and deliver them in any order.
 
@@ -290,6 +295,8 @@ pub struct StoreStats {
     pub submitted: u64,
     /// Results that arrived for a key no longer pending under their generation.
     pub stale_dropped: u64,
+    /// Bound thumbnails rendered in another catalog than their row's, left empty.
+    pub refused: u64,
     /// Textures handed to `drop_image` (evicted, replaced, invalidated, cleared).
     pub released: u64,
 }
@@ -308,6 +315,8 @@ struct Done {
     /// The answer to a navigation promotion: never the one a pending key waits for, so
     /// dropping it is not counted as stale.
     promotion: bool,
+    /// Rendered in another catalog than the look's (see the module docs).
+    refused: bool,
     result: Result<Loaded, String>,
 }
 
@@ -351,6 +360,8 @@ pub struct ImageStore {
     next_claim: u64,
     /// The look each photo's thumbnail tier was last asked for (see the module docs).
     looks: HashMap<i64, Look>,
+    /// Tiers whose render for their look was refused: not asked again until that changes.
+    refused: HashSet<ImageKey>,
     probe: Option<IdentityProbe>,
     done: UnboundedSender<Done>,
     stats: StoreStats,
@@ -382,6 +393,7 @@ impl ImageStore {
             claims: HashMap::new(),
             next_claim: 0,
             looks: HashMap::new(),
+            refused: HashSet::new(),
             probe: None,
             done,
             stats: StoreStats::default(),
@@ -472,7 +484,7 @@ impl ImageStore {
         let mut seen = HashSet::new();
         for &(photo, kind) in wanted {
             let key = self.key(photo, kind);
-            if !seen.insert(key) || self.lru.peek(&key).is_some() || self.failed.contains_key(&key) {
+            if !seen.insert(key) || self.lru.peek(&key).is_some() || self.failed.contains_key(&key) || self.refused.contains(&key) {
                 continue;
             }
             if self.outdated_in_flight((photo, kind), key.version) {
@@ -510,12 +522,10 @@ impl ImageStore {
                 Box::new(move |result| {
                     // On the worker, after the render: pixels from another catalog are not
                     // this row's photo.
-                    let result = match bound {
-                        Some((from, probe)) if result.is_ok() && probe() != Some(from) => Err(CATALOG_CHANGED.to_string()),
-                        _ => result,
-                    };
+                    let refused = matches!(&bound, Some((from, probe)) if result.is_ok() && probe() != Some(*from));
+                    let result = if refused { Err(CATALOG_CHANGED.to_string()) } else { result };
                     // Fails only when the store is gone; the result is then unwanted.
-                    let _ = done.unbounded_send(Done { key, generation, promotion, result });
+                    let _ = done.unbounded_send(Done { key, generation, promotion, refused, result });
                 }),
             ));
         }
@@ -635,8 +645,8 @@ impl ImageStore {
     /// tiers, most urgent first, each to show the cover look its row names, read from the
     /// catalog `from`. A tier asked for another look before — or cached, pending or failed
     /// with no look said — is invalidated first, so what it held or will still answer for
-    /// the earlier look is never shown (see the module docs). Calling it again with the same
-    /// looks sends nothing.
+    /// the earlier look is never shown (see the module docs). A photo not in `wanted` loses
+    /// its look. Calling it again with the same looks sends nothing.
     pub fn request_looks(
         &mut self,
         owner: ClaimId,
@@ -658,9 +668,25 @@ impl ImageStore {
             }
             self.looks.insert(photo, look);
         }
+        let kept: HashSet<i64> = wanted.iter().map(|&(photo, _)| photo).collect();
+        self.forget_looks(|photo| !kept.contains(&photo));
         let tiers: Vec<(i64, ImageKind)> = wanted.iter().map(|&(photo, _)| (photo, ImageKind::Thumb)).collect();
         self.set_claim(owner, tiers.iter().copied());
         self.request_batch(&tiers);
+    }
+
+    /// No strip: `owner` holds nothing, and no photo keeps a look.
+    pub fn release_looks(&mut self, owner: ClaimId) {
+        self.set_claim(owner, []);
+        self.forget_looks(|_| true);
+    }
+
+    /// Forget the looks of the photos `gone` selects, and their refusals: what the photo's
+    /// thumbnail tier holds is the photo's, whichever view asks next.
+    fn forget_looks(&mut self, mut gone: impl FnMut(i64) -> bool) {
+        self.looks.retain(|&photo, _| !gone(photo));
+        let looks = &self.looks;
+        self.refused.retain(|k| looks.contains_key(&k.photo));
     }
 
     /// Drop the cached images `matches` selects and no claim holds, and release their
@@ -693,6 +719,7 @@ impl ImageStore {
         self.release(gone, cx);
         self.abandon(tier);
         self.failed.retain(|k, _| !tier(k));
+        self.refused.retain(|k| !tier(k));
         cx.notify();
     }
 
@@ -709,6 +736,7 @@ impl ImageStore {
         self.failed.clear();
         self.versions.clear();
         self.looks.clear();
+        self.refused.clear();
         cx.notify();
     }
 
@@ -749,6 +777,12 @@ impl ImageStore {
             return;
         }
         self.pending.remove(&done.key);
+        if done.refused {
+            self.stats.refused += 1;
+            self.refused.insert(done.key);
+            cx.notify();
+            return;
+        }
         match done.result {
             Ok(loaded) => {
                 let gone = self.lru.insert(done.key, loaded);

@@ -1,6 +1,8 @@
-//! The face verbs and the indexing job's ownership against **real catalogs**. No ONNX: the
-//! verbs are model-free, and the job tests drive the claim and its guards directly (the
-//! worker needs the models; `plugins::faces::indexer` tests its loop with a fake detector).
+//! The face verbs, the People view's verbs, and the indexing and matching jobs' ownership
+//! against **real catalogs**. No ONNX: the verbs and the matcher are model-free; the index
+//! tests drive the claim and its guards directly (its worker needs the models;
+//! `plugins::faces::indexer` tests its loop with a fake detector), the match tests run the
+//! real worker on synthetic embeddings.
 
 use super::*;
 use crate::app::{detach_catalog_and_trip_jobs, publish_catalog_and_reset_jobs, with_catalog_as, CATALOG_CHANGED};
@@ -364,4 +366,278 @@ fn a_face_write_bound_to_the_old_catalog_refuses_the_new_one() {
     assert_eq!(with_catalog_as(&state, from, |c| ignore(c, fa)).unwrap_err(), CATALOG_CHANGED);
     let state_b = crate::app::with_catalog(&state, |c| Ok(face_state(c, fb))).unwrap();
     assert_eq!(state_b, "unassigned", "the new catalog's face was not touched");
+}
+
+// --- the matching job (#130) ----------------------------------------------------------------
+
+/// A face with an embedding pointing along `axis` (a unit vector), clustered or matched by
+/// the real matcher.
+fn add_embedded_face(c: &Catalog, photo_id: i64, axis: usize) -> i64 {
+    let mut e = vec![0.0f32; 8];
+    e[axis] = 1.0;
+    let blob = store::embedding_to_blob(&e);
+    store::insert_face(c.conn(), photo_id, "[0.1,0.1,0.2,0.2]", "[]", 0.99, Some(&blob), "detect", 0).unwrap()
+}
+
+/// What a worker sent, with whether the matching slot was still claimed at that moment.
+struct MatchRecorder {
+    state: AppState,
+    seen: std::sync::Mutex<Vec<(String, bool, CoreEvent)>>,
+}
+
+impl EventSink for MatchRecorder {
+    fn send(&self, event: CoreEvent) {
+        let slot_busy = self.state.jobs.faces_match.status().unwrap().is_some();
+        self.seen.lock().unwrap().push((event.name().to_string(), slot_busy, event));
+    }
+}
+
+/// The real worker on a real catalog: progress carries the job id, the faces end up in one
+/// cluster, and the slot is released **before** the one terminal `faces:match_done`, which
+/// carries the counters.
+#[test]
+fn the_match_worker_clusters_then_clears_the_slot_before_its_end() {
+    let (c, root) = temp_catalog("match-run");
+    let p1 = add_photo(&c, &root, "m1.NEF");
+    let p2 = add_photo(&c, &root, "m2.NEF");
+    let f1 = add_embedded_face(&c, p1, 0);
+    let f2 = add_embedded_face(&c, p2, 0);
+    let state = state_with(c);
+    let from = crate::app::catalog_identity(&state).unwrap();
+    let claim = begin_match_job(&state, Some(from)).unwrap();
+    let job = claim.job;
+    assert_eq!(match_status(&state).unwrap().map(|s| s.job), Some(job), "running as soon as it is claimed");
+
+    let recorder = MatchRecorder { state: state.clone(), seen: Default::default() };
+    run_match_job(&recorder, claim);
+
+    let seen = recorder.seen.lock().unwrap();
+    let (last_name, last_busy, last) = seen.last().unwrap();
+    assert_eq!((last_name.as_str(), *last_busy), ("faces:match_done", false), "the slot is clear before the end");
+    let CoreEvent::FacesMatchDone(d) = last else { unreachable!() };
+    assert!(d.ok && !d.aborted && d.job == job, "{d:?}");
+    assert_eq!(d.outcome.as_ref().map(|o| o.clustered), Some(2));
+    assert_eq!(seen.iter().filter(|(n, ..)| n == "faces:match_done").count(), 1, "one terminal event");
+    assert!(seen.iter().any(|(n, ..)| n == "faces:match_progress"));
+    for (name, busy, e) in seen.iter().filter(|(n, ..)| n == "faces:match_progress") {
+        let CoreEvent::FacesMatchProgress(p) = e else { unreachable!() };
+        assert!(*busy && p.job == job, "{name}: progress while owned, with the job id");
+    }
+    drop(seen);
+    let clusters = crate::app::with_catalog(&state, cluster_summary).unwrap();
+    assert_eq!(clusters.len(), 1);
+    assert_eq!(clusters[0].member_count, 2);
+    let members: Vec<i64> = crate::app::with_catalog(&state, |c| cluster_faces(c, clusters[0].cluster_id))
+        .unwrap()
+        .iter()
+        .map(|f| f.face_id)
+        .collect();
+    assert_eq!(members, vec![f1, f2]);
+}
+
+/// A tripped run stops, still sends its one `faces:match_done` (`aborted`, not ok), and a
+/// superseded run's end does not clear the newer job's slot.
+#[test]
+fn a_cancelled_match_still_ends_and_never_clears_a_newer_jobs_slot() {
+    let (c, root) = temp_catalog("match-cancel");
+    let p = add_photo(&c, &root, "m.NEF");
+    add_embedded_face(&c, p, 1);
+    let state = state_with(c);
+    let first = begin_match_job(&state, None).unwrap();
+    let second = begin_match_job(&state, None).unwrap();
+    assert!(first.abort.load(Ordering::Relaxed), "the newer start tripped the first");
+    assert!(!cancel_match_job(&state, first.job).unwrap(), "a superseded job's Cancel is a no-op");
+    assert!(!second.abort.load(Ordering::Relaxed));
+
+    let first_job = first.job;
+    let recorder = MatchRecorder { state: state.clone(), seen: Default::default() };
+    run_match_job(&recorder, first);
+    let seen = recorder.seen.lock().unwrap();
+    assert_eq!(seen.len(), 1, "a tripped run stops before its first progress: {:?}", seen.iter().map(|s| &s.0).collect::<Vec<_>>());
+    let CoreEvent::FacesMatchDone(d) = &seen[0].2 else { panic!("the end") };
+    assert!(d.aborted && !d.ok && d.job == first_job);
+    assert_eq!(match_status(&state).unwrap().map(|s| s.job), Some(second.job), "the newer job keeps its slot");
+    drop(seen);
+
+    assert!(cancel_match_job(&state, second.job).unwrap());
+    assert!(second.abort.load(Ordering::Relaxed));
+}
+
+/// A start bound to a catalog that is no longer open fails closed: the open catalog's match
+/// keeps its flag and slot, and no job id is consumed.
+#[test]
+fn a_match_start_bound_to_another_catalog_touches_nothing() {
+    let (a, _ra) = temp_catalog("mbound-a");
+    let state = state_with(a);
+    let from_a = crate::app::catalog_identity(&state).unwrap();
+    let (b, _rb) = temp_catalog("mbound-b");
+    detach_catalog_and_trip_jobs(&state).unwrap();
+    publish_catalog_and_reset_jobs(&state, b).unwrap();
+    let on_b = begin_match_job(&state, None).unwrap();
+    let issued = state.jobs.faces_match.abort().job_ids_issued();
+
+    assert_eq!(start_match(&state, Some(from_a)).unwrap_err(), CATALOG_CHANGED);
+    assert!(!on_b.abort.load(Ordering::Relaxed));
+    assert_eq!(match_status(&state).unwrap().map(|s| s.job), Some(on_b.job));
+    assert_eq!(state.jobs.faces_match.abort().job_ids_issued(), issued);
+}
+
+// --- the People view's verbs (#130) ---------------------------------------------------------
+
+fn put_in_cluster(c: &Catalog, face: i64, cluster: i64) {
+    c.conn()
+        .execute("INSERT OR IGNORE INTO faces__clusters (id, centroid, size, created_at) VALUES (?1, x'00', 0, 0)", [cluster])
+        .unwrap();
+    c.conn().execute("UPDATE faces__faces SET cluster_id = ?2 WHERE id = ?1", [face, cluster]).unwrap();
+}
+
+fn cluster_rows(c: &Catalog) -> Vec<(i64, i64)> {
+    let mut stmt = c.conn().prepare("SELECT id, size FROM faces__clusters ORDER BY id").unwrap();
+    stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?))).unwrap().map(Result::unwrap).collect()
+}
+
+/// Merge: two clusters named as one person confirm every member, tag every photo, drop both
+/// clusters and export the regions (keeping a foreign one).
+#[test]
+fn naming_two_clusters_together_merges_them_into_one_person() {
+    let (c, root) = temp_catalog("merge");
+    let p1 = add_photo(&c, &root, "a.NEF");
+    let p2 = add_photo(&c, &root, "b.NEF");
+    crate::xmp::write_face_regions(
+        &root.join("a.NEF"),
+        &[crate::xmp::FaceRegion { name: "Stranger".into(), bbox: (0.6, 0.6, 0.2, 0.2) }],
+        100,
+        100,
+    )
+    .unwrap();
+    let a1 = add_face(&c, p1, "[0.1,0.1,0.2,0.2]");
+    let a2 = add_face(&c, p1, "[0.4,0.1,0.2,0.2]");
+    let b1 = add_face(&c, p2, "[0.1,0.1,0.2,0.2]");
+    put_in_cluster(&c, a1, 10);
+    put_in_cluster(&c, b1, 11);
+    put_in_cluster(&c, a2, 12); // another cluster, untouched
+
+    let out = name_clusters(&c, &[10, 11], "People/Jane").unwrap();
+    let jane = c.find_tag_id_by_path("People/Jane").unwrap().unwrap();
+    assert_eq!(out, NameOutcome { tag_id: jane, faces: 2, photos: 2, skipped: 0 });
+    assert_eq!(face_state(&c, a1), "confirmed");
+    assert_eq!(face_state(&c, b1), "confirmed");
+    assert_eq!(face_state(&c, a2), "unassigned");
+    assert!(has_tag(&c, p1, jane) && has_tag(&c, p2, jane));
+    assert_eq!(cluster_rows(&c).iter().map(|r| r.0).collect::<Vec<_>>(), vec![12], "both named clusters are gone");
+    let mut names: Vec<String> = crate::xmp::read_face_regions(&root.join("a.NEF")).into_iter().map(|r| r.name).collect();
+    names.sort();
+    assert_eq!(names, vec!["Jane".to_string(), "Stranger".to_string()], "ours added, the foreign region kept");
+    let people = people_summary(&c).unwrap();
+    assert_eq!((people.len(), people[0].face_count, people[0].photo_count), (1, 2, 2));
+}
+
+/// Split: naming some of a cluster's faces confirms only those; the rest stay in the cluster
+/// with its size brought up to date, and a face confirmed meanwhile is skipped, not renamed.
+#[test]
+fn naming_some_of_a_clusters_faces_splits_them_off() {
+    let (c, root) = temp_catalog("split");
+    let p = add_photo(&c, &root, "s.NEF");
+    let faces: Vec<i64> = (0..4).map(|i| add_face(&c, p, &format!("[0.{i},0.1,0.1,0.1]"))).collect();
+    for &f in &faces {
+        put_in_cluster(&c, f, 20);
+    }
+    let bob = c.create_tag("People/Bob").unwrap();
+    c.conn()
+        .execute("UPDATE faces__faces SET state = 'confirmed', person_tag_id = ?2 WHERE id = ?1", [faces[1], bob])
+        .unwrap();
+
+    let out = name_faces(&c, &[faces[0], faces[1]], "People/Ann").unwrap();
+    assert_eq!((out.faces, out.skipped), (1, 1));
+    assert_eq!(face_state(&c, faces[0]), "confirmed");
+    let bob_still: i64 =
+        c.conn().query_row("SELECT person_tag_id FROM faces__faces WHERE id = ?1", [faces[1]], |r| r.get(0)).unwrap();
+    assert_eq!(bob_still, bob, "a confirmed face is never renamed by a stale list");
+    let left: Vec<i64> = cluster_faces(&c, 20).unwrap().iter().map(|f| f.face_id).collect();
+    assert_eq!(left, vec![faces[2], faces[3]]);
+    assert_eq!(cluster_rows(&c), vec![(20, 3)], "the size counts the faces still in it");
+
+    // Ignoring the rest empties the cluster: its row goes; a confirmed face is not ignored.
+    assert_eq!(ignore_faces(&c, &[faces[2], faces[3], faces[0]]).unwrap(), 2);
+    assert_eq!(face_state(&c, faces[0]), "confirmed");
+    c.conn().execute("UPDATE faces__faces SET cluster_id = NULL WHERE id = ?1", [faces[1]]).unwrap();
+    matcher::tidy_clusters(c.conn(), &[20]).unwrap();
+    assert!(cluster_rows(&c).is_empty());
+    assert!(cluster_summary(&c).unwrap().is_empty());
+}
+
+/// A cluster a matching run has since regrouped (its id is never reused) names nothing: the
+/// naming is refused and creates no tag.
+#[test]
+fn naming_a_stale_cluster_is_refused_and_creates_no_tag() {
+    let (c, root) = temp_catalog("stale");
+    let p = add_photo(&c, &root, "x.NEF");
+    let f = add_face(&c, p, "[0.1,0.1,0.2,0.2]");
+    put_in_cluster(&c, f, 30);
+    c.conn().execute("UPDATE faces__faces SET state = 'ignored', cluster_id = NULL WHERE id = ?1", [f]).unwrap();
+    assert!(name_clusters(&c, &[30], "People/Ghost").unwrap_err().to_string().contains(NOTHING_TO_NAME));
+    assert!(name_faces(&c, &[f], "People/Ghost").unwrap_err().to_string().contains(NOTHING_TO_NAME));
+    assert_eq!(c.find_tag_id_by_path("People/Ghost").unwrap(), None, "the transaction rolled the tag back");
+    assert!(name_faces(&c, &[f], "  /  ").is_err(), "a blank name is refused");
+}
+
+/// The review queue confirms and rejects a suggestion only as it was shown: one re-matched
+/// to someone else since is left alone (stale), a confirmation tags the photo, a rejection is
+/// remembered.
+#[test]
+fn reviews_apply_only_to_the_suggestion_that_was_shown() {
+    let (c, root) = temp_catalog("review");
+    let p = add_photo(&c, &root, "r.NEF");
+    let alice = c.create_tag("People/Alice").unwrap();
+    let bob = c.create_tag("People/Bob").unwrap();
+    let f1 = add_face(&c, p, "[0.1,0.1,0.2,0.2]");
+    let f2 = add_face(&c, p, "[0.4,0.1,0.2,0.2]");
+    let f3 = add_face(&c, p, "[0.7,0.1,0.2,0.2]");
+    suggest(&c, f1, alice);
+    suggest(&c, f2, alice);
+    suggest(&c, f3, bob);
+    assert_eq!(suggestion_list(&c).unwrap().len(), 3);
+    suggest(&c, f2, bob); // a re-run now suggests Bob for f2
+
+    let out = review_suggestions(
+        &c,
+        &[
+            Review { face_id: f1, tag_id: alice, verdict: Verdict::Confirm },
+            Review { face_id: f2, tag_id: alice, verdict: Verdict::Confirm },
+            Review { face_id: f3, tag_id: bob, verdict: Verdict::Reject },
+        ],
+    )
+    .unwrap();
+    assert_eq!(out, ReviewOutcome { confirmed: 1, rejected: 1, stale: 1 });
+    assert_eq!(face_state(&c, f1), "confirmed");
+    assert_eq!(face_state(&c, f2), "suggested");
+    assert_eq!(face_state(&c, f3), "unassigned");
+    assert!(has_tag(&c, p, alice) && !has_tag(&c, p, bob));
+    let remembered: i64 = c
+        .conn()
+        .query_row("SELECT COUNT(*) FROM faces__rejections WHERE face_id = ?1 AND person_tag_id = ?2", [f3, bob], |r| r.get(0))
+        .unwrap();
+    assert_eq!(remembered, 1);
+    let regions: Vec<String> = crate::xmp::read_face_regions(&root.join("r.NEF")).into_iter().map(|r| r.name).collect();
+    assert_eq!(regions, vec!["Alice".to_string()]);
+}
+
+/// The summaries carry each avatar photo's user rotation (the thumbnail is drawn turned), and
+/// the people root defaults to the matcher's.
+#[test]
+fn summaries_carry_the_avatar_rotation() {
+    let (c, root) = temp_catalog("rotation");
+    let p = add_photo(&c, &root, "o.NEF");
+    c.set_photo_rotation(p, 90).unwrap();
+    let alice = c.create_tag("People/Alice").unwrap();
+    let f = add_face(&c, p, "[0.1,0.2,0.3,0.4]");
+    suggest(&c, f, alice);
+    assert_eq!(suggestion_list(&c).unwrap()[0].rotation, 90);
+    accept(&c, f).unwrap();
+    let person = &people_summary(&c).unwrap()[0];
+    assert_eq!((person.avatar_photo_id, person.avatar_rotation), (p, 90));
+    assert_eq!(person.avatar_bbox, FaceBboxJson { x: 0.1, y: 0.2, w: 0.3, h: 0.4 });
+    assert_eq!(effective_people_root(&c).unwrap(), "People");
+    c.set_setting("faces.people_root", "Family").unwrap();
+    assert_eq!(effective_people_root(&c).unwrap(), "Family");
 }

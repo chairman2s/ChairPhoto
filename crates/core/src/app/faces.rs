@@ -1,7 +1,7 @@
-//! Face tagging — the bodies of the Tauri `faces_*` commands the GPUI Faces module runs
-//! (#129): settings (inference line, `indexing.speed`), the indexing job, the per-photo
-//! face list and the per-face review verbs, plus the MWG-Regions sidecar wiring they share
-//! with the matching commands.
+//! Face tagging — the bodies of the Tauri `faces_*` commands the GPUI Faces module runs:
+//! settings (inference line, `indexing.speed`), the indexing job, the per-photo face list and
+//! the per-face review verbs, and the MWG-Regions sidecar wiring they share (#129); the
+//! matching job ([`matching`]) and the People view's reads and verbs ([`people`]) (#130).
 //!
 //! **Blocking.** Everything here takes the catalog (or does disk/model work): call it on a
 //! worker, never a UI thread. The per-face verbs take a `&Catalog`, so a caller picks the
@@ -28,6 +28,15 @@ use rusqlite::OptionalExtension;
 
 pub use matcher::AcceptPersonOutcome;
 pub use store::{FaceBboxJson, FaceForPhoto};
+
+pub mod matching;
+pub mod people;
+pub use matching::{begin_match_job, cancel_match, cancel_match_job, match_status, run_match_job, start_match};
+pub use people::{
+    cluster_faces, cluster_summary, effective_people_root, ignore_faces, name_clusters, name_faces, people_summary,
+    review_suggestions, suggestion_list, ClusterFace, ClusterSummary, NameOutcome, PersonSummary, Review,
+    ReviewOutcome, SuggestionEntry, Verdict, NOTHING_TO_NAME,
+};
 
 /// What starting an index answers while the models are missing.
 pub const MODELS_MISSING: &str = "Face models are not downloaded. Use faces_download_models first.";

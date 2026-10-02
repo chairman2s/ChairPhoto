@@ -4,16 +4,16 @@
 //! Gated on the `faces` Cargo feature; see `docs/face-tagging.md` and
 //! `plugins/faces/`. All inference is local — no image ever leaves the machine.
 //!
-//! The settings, indexing and per-face bodies live in the core (`app::faces`), which the GPUI
-//! app runs too (#129); the commands here are their thin Tauri wrappers.
+//! The settings, indexing and per-face bodies (#129), and the matching job and the People
+//! view's summaries (#130), live in the core (`app::faces`), which the GPUI app runs too; the
+//! commands here are their thin Tauri wrappers.
 
 use super::*;
 #[cfg(feature = "faces")]
 use crate::app::faces as core_faces;
 #[cfg(all(test, feature = "faces"))]
 use crate::app::faces::begin_index_job;
-use serde::Serialize;
-use tauri::{AppHandle, State};
+use tauri::State;
 
 /// Report which face models are present, so the UI can offer a download and keep the module
 /// inert until they are. Never fails — a missing model is a clean state. `async` so it runs
@@ -87,136 +87,18 @@ pub async fn faces_index_cancel(state: State<'_, AppState>) -> Result<(), String
 //
 // The recognition brain: auto-seed 1-face+1-person photos, per-person centroids,
 // Hungarian-constrained matching for N-faces/M-tags photos, nearest-centroid open matching,
-// incremental clustering for the rest — plus the accept/reject/ignore/assign/name-cluster
-// mutations. The engine itself lives in `plugins::faces::matcher` and is model-free; these
-// commands only wire it to the open catalog. Confirming a face also assigns the person tag
-// to the *photo* through the catalog's `assign_tag` (XMP export + cross-catalog merge).
+// incremental clustering for the rest. The job's body is the core's
+// (`app::faces::matching`, #130), which the GPUI app runs too; these are its Tauri wrappers.
 
-/// Claim ownership of the face-matching job: snapshot the catalog, allocate the job id,
-/// trip the previous match, install this job's abort flag and claim the status slot as ONE
-/// transition, holding catalog -> abort -> slot throughout.
-///
-/// The transition itself is [`crate::app::jobs::JobFamily::begin`], shared with face
-/// indexing and Smart Tagging; see it for why releasing any of the three locks early leaves
-/// either a dead job owning the status slot or a worker no cancel can reach. Matching is its
-/// own family, so cancelling a match does not stop an index and the two never collide on an
-/// id.
-///
-/// Kept as a named function so the transition can be driven directly by tests, which have no
-/// Tauri `AppHandle`.
-#[cfg(feature = "faces")]
-fn begin_faces_match_job(state: &AppState) -> Result<JobClaim<FacesMatchJobStatus>, String> {
-    use crate::plugins::faces::matcher::MatchPhase;
-
-    state.jobs.faces_match.begin(&state.catalog, |job| FacesMatchJobStatus {
-        job,
-        done: 0,
-        total: 0,
-        phase: MatchPhase::Seed.label(),
-    })
-}
-
-/// Run the full seed / match / cluster pipeline over all indexed faces as a background job.
-/// Idempotent and re-runnable (confirmed/ignored/manual faces are never touched, rejected
-/// pairs never re-proposed).
-///
-/// The command returns as soon as the job has STARTED, yielding its job id; progress arrives
-/// as `faces:match_progress` and the counters as a terminal `faces:match_done`. It runs on a
-/// blocking worker against its own secondary connection, so a matching pass no longer holds
-/// the primary catalog mutex for its whole run — which on a large library meant every grid
-/// and inspector read queued behind clustering.
-///
-/// Re-invoking while a match is running trips the old job's abort flag first, then starts a
-/// fresh run. The claim below is the same catalog -> abort -> slot transition as
-/// `faces_index_photos`; see that command for why all three locks are held across it. The
-/// matching job has its own flag and slot, so cancelling a match does not stop an index.
+/// Run the full seed / match / cluster pipeline over all indexed faces as a background job
+/// and return its id as soon as it has STARTED; progress arrives as `faces:match_progress`
+/// and the counters as a terminal `faces:match_done` (`app::faces::start_match`). A start
+/// supersedes a running match.
 #[cfg(feature = "faces")]
 #[tauri::command]
-pub async fn faces_run_matching(app: AppHandle, state: State<'_, AppState>) -> Result<u64, String> {
-    use crate::plugins::faces::matcher::{self, MatchPhase, MatchSettings};
-
-    let JobClaim { db_path, root, abort, job, slot: job_slot } = begin_faces_match_job(&state)?;
-
-    crate::app::spawn_blocking(move || {
-        use crate::catalog::Catalog;
-
-        // Release the status slot — but only if a newer job hasn't already claimed it.
-        // `JobSlot::clear` is the shared guard; it always runs BEFORE the terminal event.
-        let clear_job_slot = || job_slot.clear();
-
-        let fail = |app: &AppHandle, error: String| {
-            let _ = app.send(CoreEvent::FacesMatchDone(FacesMatchDone { ok: false, outcome: None, aborted: false, job, error: Some(error) }));
-        };
-
-        // Secondary connection — never contends with the primary's UI reads.
-        let sec = match Catalog::open_secondary(&db_path, &root) {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!("faces_match: couldn't open secondary connection: {e}");
-                clear_job_slot();
-                fail(&app, format!("couldn't open catalog connection: {e}"));
-                return;
-            }
-        };
-
-        let settings = match MatchSettings::load(sec.conn()) {
-            Ok(s) => s,
-            Err(e) => {
-                clear_job_slot();
-                fail(&app, e.to_string());
-                return;
-            }
-        };
-
-        // Forward pipeline progress to the UI, throttled: phase changes and phase ends
-        // always fire; within a phase, every 25th item (steps iterate thousands of
-        // faces and per-item events would flood the IPC bridge). The abort flag is read
-        // on EVERY call, not only the ones that emit — throttling progress must not
-        // throttle cancellation.
-        let mut last: Option<(MatchPhase, usize)> = None;
-        let mut on_progress = |phase: MatchPhase, done: usize, total: usize| -> bool {
-            if abort.load(Ordering::Relaxed) {
-                return false;
-            }
-            let fire = match last {
-                Some((p, d)) => p != phase || done >= total || done >= d + 25,
-                None => true,
-            };
-            if fire {
-                last = Some((phase, done));
-                // Never overwrite a newer job's slot — `JobSlot::publish` is the shared guard.
-                job_slot.publish(|job| FacesMatchJobStatus {
-                    job,
-                    done,
-                    total,
-                    phase: phase.label(),
-                });
-                let _ = app.send(CoreEvent::FacesMatchProgress(FacesMatchProgressEvent { done, total, phase: phase.label(), job }));
-            }
-            true
-        };
-
-        let result =
-            matcher::run_matching_with_progress(sec.conn(), &settings, now_secs(), &mut on_progress);
-        let aborted = abort.load(Ordering::Relaxed);
-
-        // Clear the slot before the terminal event, and only if this job still owns it.
-        clear_job_slot();
-        let _ = app.send(CoreEvent::FacesMatchDone(match result {
-                Ok(outcome) => {
-                    FacesMatchDone { ok: !aborted, outcome: Some(outcome), aborted, job, error: None }
-                }
-                Err(e) => FacesMatchDone {
-                    ok: false,
-                    outcome: None,
-                    aborted,
-                    job,
-                    error: Some(e.to_string()),
-                },
-            }));
-    });
-
-    Ok(job)
+pub async fn faces_run_matching(state: State<'_, AppState>) -> Result<u64, String> {
+    let state = state.inner().clone();
+    crate::app::spawn_blocking(move || core_faces::start_match(&state, None)).await.map_err(|e| e.to_string())?
 }
 
 /// Snapshot of the running face-matching job, `None` when idle. Lets the panel re-attach to
@@ -226,7 +108,7 @@ pub async fn faces_run_matching(app: AppHandle, state: State<'_, AppState>) -> R
 pub async fn faces_match_status(
     state: State<'_, AppState>,
 ) -> Result<Option<FacesMatchJobStatus>, String> {
-    state.jobs.faces_match.status()
+    core_faces::match_status(&state)
 }
 
 /// Cancel the running match. The pipeline stops at its next item and still emits
@@ -234,7 +116,7 @@ pub async fn faces_match_status(
 #[cfg(feature = "faces")]
 #[tauri::command]
 pub async fn faces_match_cancel(state: State<'_, AppState>) -> Result<(), String> {
-    state.jobs.faces_match.cancel()
+    core_faces::cancel_match(&state)
 }
 
 /// Confirm a suggested/seeded face: mark it `confirmed` AND assign the person tag to the
@@ -288,8 +170,9 @@ pub async fn faces_assign(state: State<'_, AppState>, face_id: i64, tag_id: i64)
 }
 
 /// Name an unnamed cluster: create/bind the person tag at `tag_path`, confirm every member
-/// face against it, and assign the tag to each member's photo. Returns nothing; the UI
-/// re-queries.
+/// face still pending against it, and assign the tag to each member's photo
+/// (`app::faces::name_clusters`). Refused when the cluster has no pending face left (a
+/// matching run regrouped the faces since the list was read). The UI re-queries.
 #[cfg(feature = "faces")]
 #[tauri::command]
 pub async fn faces_name_cluster(
@@ -297,19 +180,7 @@ pub async fn faces_name_cluster(
     cluster: i64,
     tag_path: String,
 ) -> Result<(), String> {
-    use crate::plugins::faces::matcher;
-    with_catalog_blocking(&state, move |c| {
-        // Create (or resolve) the person tag by path — the existing tag-creation path.
-        let tag_id = c.create_tag(&tag_path)?;
-        // Bind the cluster members to it and collect their photos.
-        let photos = matcher::name_cluster(c.conn(), cluster, tag_id)?;
-        for photo_id in photos {
-            c.assign_tag(photo_id, tag_id)?;
-            core_faces::write_regions(c, photo_id);
-        }
-        Ok(())
-    })
-    .await
+    with_catalog_blocking(&state, move |c| core_faces::name_clusters(c, &[cluster], &tag_path).map(|_| ())).await
 }
 
 /// Insert a manually drawn face box for a face the detector missed. `x/y/w/h` are
@@ -353,237 +224,36 @@ pub async fn faces_for_photo(
 }
 
 // ── People-view summary queries (H13e) ─────────────────────────────────────────
+//
+// The bodies are the core's (`app::faces::people`, #130).
 
-/// One row in the people summary — a named person with face/photo counts and a
-/// representative face for the avatar (the first confirmed face for that person).
-#[cfg(feature = "faces")]
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PersonSummary {
-    /// Person tag id (FK → tags.id).
-    pub tag_id: i64,
-    /// Leaf name of the person tag.
-    pub name: String,
-    /// Full hierarchical path of the person tag (e.g. "People/Family/Alice").
-    pub full_path: String,
-    /// Total number of confirmed face rows for this person.
-    pub face_count: i64,
-    /// Number of distinct photos that have at least one confirmed face for this person.
-    pub photo_count: i64,
-    /// Photo id of the representative face (for the avatar crop).
-    pub avatar_photo_id: i64,
-    /// Bbox of the representative face (normalized 0–1), serialized as `{x,y,w,h}`.
-    pub avatar_bbox: crate::plugins::faces::store::FaceBboxJson,
-}
-
-/// Return a summary of all named people (confirmed faces, ≥1 face each). Used by
-/// the People main view to render the people wall.
+/// Every named person (confirmed faces, ≥1 face each) with an avatar face — the People
+/// view's wall.
 #[cfg(feature = "faces")]
 #[tauri::command]
 pub async fn faces_people_summary(
     state: State<'_, AppState>,
-) -> Result<Vec<PersonSummary>, String> {
-    with_catalog_blocking(&state, move |c| {
-        use crate::plugins::faces::store::{ensure_schema, FaceBboxJson};
-        use rusqlite::OptionalExtension;
-
-        ensure_schema(c.conn()).map_err(crate::catalog::CatalogError::Sqlite)?;
-
-        // Aggregate confirmed faces grouped by person_tag_id.
-        let mut stmt = c.conn().prepare(
-            "SELECT f.person_tag_id,
-                    t.name,
-                    t.full_path,
-                    COUNT(f.id)                                  AS face_count,
-                    COUNT(DISTINCT f.photo_id)                   AS photo_count,
-                    MIN(f.id)                                    AS rep_face_id
-               FROM faces__faces f
-               JOIN tags t ON t.id = f.person_tag_id
-              WHERE f.state = 'confirmed' AND f.person_tag_id IS NOT NULL
-              GROUP BY f.person_tag_id
-              ORDER BY t.full_path",
-        ).map_err(crate::catalog::CatalogError::Sqlite)?;
-
-        let rows = stmt.query_map([], |r| {
-            Ok((
-                r.get::<_, i64>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, String>(2)?,
-                r.get::<_, i64>(3)?,
-                r.get::<_, i64>(4)?,
-                r.get::<_, i64>(5)?,
-            ))
-        }).map_err(crate::catalog::CatalogError::Sqlite)?;
-
-        let mut out = Vec::new();
-        for row in rows {
-            let (tag_id, name, full_path, face_count, photo_count, rep_face_id) =
-                row.map_err(crate::catalog::CatalogError::Sqlite)?;
-
-            // Fetch the representative face's photo_id and bbox.
-            let rep: Option<(i64, String)> = c.conn().query_row(
-                "SELECT photo_id, bbox FROM faces__faces WHERE id = ?1",
-                [rep_face_id],
-                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)),
-            ).optional().map_err(crate::catalog::CatalogError::Sqlite)?;
-
-            if let Some((photo_id, bbox_s)) = rep {
-                let bbox = FaceBboxJson::from_str(&bbox_s);
-                out.push(PersonSummary {
-                    tag_id,
-                    name,
-                    full_path,
-                    face_count,
-                    photo_count,
-                    avatar_photo_id: photo_id,
-                    avatar_bbox: bbox,
-                });
-            }
-        }
-        Ok(out)
-    })
-    .await
+) -> Result<Vec<core_faces::PersonSummary>, String> {
+    with_catalog_blocking(&state, core_faces::people_summary).await
 }
 
-/// One row in the cluster summary — an unnamed cluster with member count and a
-/// representative face for the avatar.
-#[cfg(feature = "faces")]
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ClusterSummary {
-    /// Cluster id (FK → faces__clusters.id).
-    pub cluster_id: i64,
-    /// Number of faces in this cluster.
-    pub member_count: i64,
-    /// Photo id of the representative face.
-    pub avatar_photo_id: i64,
-    /// Bbox of the representative face.
-    pub avatar_bbox: crate::plugins::faces::store::FaceBboxJson,
-}
-
-/// Return a summary of all unnamed clusters (faces with a cluster_id but no
-/// confirmed person). Used by the People view's "Unnamed clusters" section.
+/// Every unnamed cluster with its member count and an avatar face — the People view's
+/// "Unnamed clusters".
 #[cfg(feature = "faces")]
 #[tauri::command]
 pub async fn faces_cluster_summary(
     state: State<'_, AppState>,
-) -> Result<Vec<ClusterSummary>, String> {
-    with_catalog_blocking(&state, move |c| {
-        use crate::plugins::faces::store::{ensure_schema, FaceBboxJson};
-        use rusqlite::OptionalExtension;
-
-        ensure_schema(c.conn()).map_err(crate::catalog::CatalogError::Sqlite)?;
-
-        // One row per cluster_id: count of members + first face as representative.
-        let mut stmt = c.conn().prepare(
-            "SELECT cluster_id, COUNT(*) AS cnt, MIN(id) AS rep_face_id
-               FROM faces__faces
-              WHERE cluster_id IS NOT NULL
-                AND (state = 'unassigned' OR state = 'suggested')
-              GROUP BY cluster_id
-              ORDER BY cnt DESC",
-        ).map_err(crate::catalog::CatalogError::Sqlite)?;
-
-        let rows = stmt.query_map([], |r| {
-            Ok((
-                r.get::<_, i64>(0)?,
-                r.get::<_, i64>(1)?,
-                r.get::<_, i64>(2)?,
-            ))
-        }).map_err(crate::catalog::CatalogError::Sqlite)?;
-
-        let mut out = Vec::new();
-        for row in rows {
-            let (cluster_id, member_count, rep_face_id) =
-                row.map_err(crate::catalog::CatalogError::Sqlite)?;
-
-            let rep: Option<(i64, String)> = c.conn().query_row(
-                "SELECT photo_id, bbox FROM faces__faces WHERE id = ?1",
-                [rep_face_id],
-                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)),
-            ).optional().map_err(crate::catalog::CatalogError::Sqlite)?;
-
-            if let Some((photo_id, bbox_s)) = rep {
-                let bbox = FaceBboxJson::from_str(&bbox_s);
-                out.push(ClusterSummary {
-                    cluster_id,
-                    member_count,
-                    avatar_photo_id: photo_id,
-                    avatar_bbox: bbox,
-                });
-            }
-        }
-        Ok(out)
-    })
-    .await
+) -> Result<Vec<core_faces::ClusterSummary>, String> {
+    with_catalog_blocking(&state, core_faces::cluster_summary).await
 }
 
-/// One suggested face row for the review queue.
-#[cfg(feature = "faces")]
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SuggestionEntry {
-    pub face_id: i64,
-    pub photo_id: i64,
-    pub bbox: crate::plugins::faces::store::FaceBboxJson,
-    pub person_tag_id: i64,
-    pub person_name: String,
-    pub person_full_path: String,
-    pub confidence: f64,
-}
-
-/// Return the full list of suggested (unconfirmed) face assignments, ordered by
-/// confidence descending. Used by the People view's "Review suggestions" queue.
+/// Every suggested face, most confident first — the People view's "Review suggestions".
 #[cfg(feature = "faces")]
 #[tauri::command]
 pub async fn faces_suggestion_list(
     state: State<'_, AppState>,
-) -> Result<Vec<SuggestionEntry>, String> {
-    with_catalog_blocking(&state, move |c| {
-        use crate::plugins::faces::store::{ensure_schema, FaceBboxJson};
-
-        ensure_schema(c.conn()).map_err(crate::catalog::CatalogError::Sqlite)?;
-
-        let mut stmt = c.conn().prepare(
-            "SELECT f.id, f.photo_id, f.bbox,
-                    f.person_tag_id, t.name, t.full_path,
-                    COALESCE(f.match_confidence, 0.0)
-               FROM faces__faces f
-               JOIN tags t ON t.id = f.person_tag_id
-              WHERE f.state = 'suggested' AND f.person_tag_id IS NOT NULL
-              ORDER BY f.match_confidence DESC NULLS LAST",
-        ).map_err(crate::catalog::CatalogError::Sqlite)?;
-
-        let rows = stmt.query_map([], |r| {
-            Ok((
-                r.get::<_, i64>(0)?,
-                r.get::<_, i64>(1)?,
-                r.get::<_, String>(2)?,
-                r.get::<_, i64>(3)?,
-                r.get::<_, String>(4)?,
-                r.get::<_, String>(5)?,
-                r.get::<_, f64>(6)?,
-            ))
-        }).map_err(crate::catalog::CatalogError::Sqlite)?;
-
-        let mut out = Vec::new();
-        for row in rows {
-            let (face_id, photo_id, bbox_s, tag_id, name, full_path, conf) =
-                row.map_err(crate::catalog::CatalogError::Sqlite)?;
-            let bbox = FaceBboxJson::from_str(&bbox_s);
-            out.push(SuggestionEntry {
-                face_id,
-                photo_id,
-                bbox,
-                person_tag_id: tag_id,
-                person_name: name,
-                person_full_path: full_path,
-                confidence: conf,
-            });
-        }
-        Ok(out)
-    })
-    .await
+) -> Result<Vec<core_faces::SuggestionEntry>, String> {
+    with_catalog_blocking(&state, core_faces::suggestion_list).await
 }
 
 // ── H16b: Sharpness index job ────────────────────────────────────────────────
@@ -626,7 +296,7 @@ mod faces_job_ownership_tests {
         let (cat_b, _db_b) = temp_catalog("switch-b");
         let state = state_with(cat_a);
 
-        let claim = begin_faces_match_job(&state).unwrap();
+        let claim = core_faces::begin_match_job(&state, None).unwrap();
         assert_eq!(claim.db_path, db_a.to_path_buf());
         assert!(!claim.abort.load(Ordering::Relaxed));
         assert_eq!(
@@ -664,7 +334,7 @@ mod faces_job_ownership_tests {
         let before = state.jobs.faces_match.installed().unwrap();
         let seq_before = state.jobs.faces_match.abort().job_ids_issued();
 
-        let err = begin_faces_match_job(&state).unwrap_err();
+        let err = core_faces::begin_match_job(&state, None).unwrap_err();
         assert_eq!(err, "No catalog is open");
 
         let after = state.jobs.faces_match.installed().unwrap();
@@ -684,8 +354,8 @@ mod faces_job_ownership_tests {
         let (cat, _db) = temp_catalog("supersede");
         let state = state_with(cat);
 
-        let first = begin_faces_match_job(&state).unwrap();
-        let second = begin_faces_match_job(&state).unwrap();
+        let first = core_faces::begin_match_job(&state, None).unwrap();
+        let second = core_faces::begin_match_job(&state, None).unwrap();
 
         assert!(first.abort.load(Ordering::Relaxed), "the superseded run must be tripped");
         assert!(!second.abort.load(Ordering::Relaxed));
@@ -757,7 +427,7 @@ mod faces_job_ownership_tests {
         let state = state_with(cat_a);
 
         let index = begin_index_job(&state, None).unwrap();
-        let matching = begin_faces_match_job(&state).unwrap();
+        let matching = core_faces::begin_match_job(&state, None).unwrap();
         assert_eq!(state.jobs.faces.status().unwrap().map(|s| s.job), Some(index.job));
         assert_eq!(
             state.jobs.faces_match.status().unwrap().map(|s| s.job),

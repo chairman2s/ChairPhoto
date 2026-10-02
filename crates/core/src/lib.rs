@@ -38,6 +38,8 @@ pub mod phash;
 pub mod phash_indexer;
 pub mod photo_signals;
 pub mod plugins;
+#[cfg(any(feature = "flickr", feature = "smugmug", feature = "instagram", feature = "localsend"))]
+pub mod publishing;
 pub mod rapidraw;
 #[cfg(feature = "raw")]
 pub mod raw;

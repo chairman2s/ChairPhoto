@@ -31,7 +31,7 @@
 //! **catalog → abort generations → status slots**, and within each of the last two groups
 //! the declaration order of [`JobRegistry`]: scan, face indexing, face matching, sharpness,
 //! pHash, trash, import, reconcile, Smart Tagging, identity repair, burst analysis, export,
-//! bundle export, slideshow.
+//! bundle export, slideshow, LocalSend send.
 //!
 //! Every nested acquisition in the backend obeys it:
 //!
@@ -44,6 +44,7 @@
 //! | a scan start (`scans::scan_two_phase`), `storage::empty_trash_as`, `storage::restore_trashed_as` | catalog → that family's abort (the catalog identity checked before the abort is touched) |
 //! | `storage::claim_reconcile` (a back-up drain or offload-policy start) | catalog → the reconcile abort |
 //! | `slideshow::claim_slideshow` (a slideshow render start) | catalog → the slideshow abort |
+//! | `localsend::claim_send` (a LocalSend send start) | catalog → the LocalSend abort |
 //! | [`AbortGeneration::install_fresh_if_owner`] (a card import committing to index) | the scan abort → the import abort |
 //! | [`AbortGeneration::install_fresh_if_newer`] (a burst-analysis worker's claim) | one abort, released before the catalog is read |
 //! | `exports::claim_export`, `exports::claim_bundle_export` | one abort, released before the catalog is read |
@@ -504,6 +505,13 @@ pub struct JobRegistry {
     /// returns its own terminal result, and its `slideshow:progress` events carry the job id.
     #[cfg(feature = "slideshow")]
     pub slideshow: AbortGeneration,
+    /// Sending photos to a device on the LAN (`app::localsend`): the full-resolution renders and
+    /// the LocalSend upload. Claimed under the catalog lock (`localsend::claim_send`); a newer
+    /// send, Cancel or a catalog switch trips it — the send stops before its next render or
+    /// file and cancels the receiver's session. No status slot: the send returns its own
+    /// terminal result, and its `localsend:progress` events carry the job id.
+    #[cfg(feature = "localsend")]
+    pub localsend: AbortGeneration,
     /// The Develop session's working image (docs/plans/raw-foundation): one claim per
     /// opened photo; a switch, exit or catalog change trips it and the image is released.
     #[cfg(all(feature = "raw", feature = "edit"))]
@@ -546,6 +554,8 @@ impl JobRegistry {
             bundle_export: _,
             #[cfg(feature = "slideshow")]
             slideshow: _,
+            #[cfg(feature = "localsend")]
+            localsend: _,
             #[cfg(all(feature = "raw", feature = "edit"))]
             develop,
         } = self;
@@ -590,6 +600,8 @@ impl JobRegistry {
             bundle_export,
             #[cfg(feature = "slideshow")]
             slideshow,
+            #[cfg(feature = "localsend")]
+            localsend,
             #[cfg(all(feature = "raw", feature = "edit"))]
             develop,
         } = self;
@@ -612,6 +624,8 @@ impl JobRegistry {
             bundle_export: bundle_export.lock()?,
             #[cfg(feature = "slideshow")]
             slideshow: slideshow.lock()?,
+            #[cfg(feature = "localsend")]
+            localsend: localsend.lock()?,
             #[cfg(all(feature = "raw", feature = "edit"))]
             develop: develop.abort.lock()?,
         })
@@ -638,6 +652,8 @@ pub struct AbortGuards<'a> {
     bundle_export: MutexGuard<'a, Arc<AtomicBool>>,
     #[cfg(feature = "slideshow")]
     slideshow: MutexGuard<'a, Arc<AtomicBool>>,
+    #[cfg(feature = "localsend")]
+    localsend: MutexGuard<'a, Arc<AtomicBool>>,
     #[cfg(all(feature = "raw", feature = "edit"))]
     develop: MutexGuard<'a, Arc<AtomicBool>>,
 }
@@ -664,6 +680,8 @@ impl AbortGuards<'_> {
             bundle_export,
             #[cfg(feature = "slideshow")]
             slideshow,
+            #[cfg(feature = "localsend")]
+            localsend,
             #[cfg(all(feature = "raw", feature = "edit"))]
             develop,
         } = self;
@@ -685,6 +703,8 @@ impl AbortGuards<'_> {
         bundle_export.store(true, Ordering::Relaxed);
         #[cfg(feature = "slideshow")]
         slideshow.store(true, Ordering::Relaxed);
+        #[cfg(feature = "localsend")]
+        localsend.store(true, Ordering::Relaxed);
         #[cfg(all(feature = "raw", feature = "edit"))]
         develop.store(true, Ordering::Relaxed);
     }
@@ -728,6 +748,8 @@ impl AbortGuards<'_> {
             ref mut bundle_export,
             #[cfg(feature = "slideshow")]
                 ref mut slideshow,
+            #[cfg(feature = "localsend")]
+                ref mut localsend,
             #[cfg(all(feature = "raw", feature = "edit"))]
                 ref mut develop,
         } = self;
@@ -754,6 +776,10 @@ impl AbortGuards<'_> {
         #[cfg(feature = "slideshow")]
         {
             **slideshow = Arc::new(AtomicBool::new(false));
+        }
+        #[cfg(feature = "localsend")]
+        {
+            **localsend = Arc::new(AtomicBool::new(false));
         }
         #[cfg(all(feature = "raw", feature = "edit"))]
         {
@@ -1161,6 +1187,8 @@ mod tests {
         let burst = registry.burst.install_fresh_if_newer(registry.burst.next_job_id()).unwrap().unwrap();
         #[cfg(feature = "slideshow")]
         let (slideshow, _) = registry.slideshow.install_fresh_numbered().unwrap();
+        #[cfg(feature = "localsend")]
+        let (localsend, _) = registry.localsend.install_fresh_numbered().unwrap();
 
         let identity = begin_identity(&registry, &catalog).unwrap();
         #[cfg(feature = "smarttags")]
@@ -1176,6 +1204,8 @@ mod tests {
         assert!(burst.load(Ordering::Relaxed), "and a burst analysis");
         #[cfg(feature = "slideshow")]
         assert!(slideshow.load(Ordering::Relaxed), "and a slideshow render");
+        #[cfg(feature = "localsend")]
+        assert!(localsend.load(Ordering::Relaxed), "and a LocalSend send");
         assert!(identity.abort.load(Ordering::Relaxed), "and the identity repair pass");
         assert!(
             registry.identity.status().unwrap().is_none(),

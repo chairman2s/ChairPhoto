@@ -26,11 +26,15 @@ phone* — and ChairPhoto records it as published to Snapchat.
 A **publish target**, "Device (LocalSend)", in the unified **Publish** dialog. It sends the
 current selection of one or more photos.
 
-Rendering is `render_localsend_jpegs` (`commands/localsend.rs`) — **not**
-`commands::publishing::render_export_jpeg`, the SmugMug/Flickr helper. The two are siblings
-built from the same `export` primitives (`resolve_originals`, `upload_file_name`,
-`JobTempDir`, `write_item_jpeg`), not one calling the other, so they share behaviour by
-construction rather than by delegation:
+A send is a core job, `crates/core/src/app/localsend.rs` (`claim_send`, then
+`LocalSendJob::run`), shared by the Tauri `localsend_send` command and the GPUI panel. The claim
+checks the catalog the ids were read from, resolves the originals and takes the LocalSend job
+generation under one catalog lock; a newer send, Cancel or a catalog switch trips it, and the
+send stops before its next render or file — mid-upload too — and cancels the receiver's session
+(`POST /cancel`). Its rendering is **not** `publishing::render_upload_jpeg`, the SmugMug/Flickr
+helper. The two are siblings built from the same `export` primitives (`resolve_originals`,
+`upload_file_name`, `JobTempDir`, `write_item_jpeg`), not one calling the other, so they share
+behaviour by construction rather than by delegation:
 
 - **Shared.** Version-picking (the selected version where it matches), and EXIF/GPS carried
   into the render — `write_item_jpeg` re-encodes, which strips metadata, then copies EXIF+GPS
@@ -109,8 +113,9 @@ reuses `reqwest` and does UDP through tokio:
   subnet sweep, yielding `Device { alias, deviceModel, deviceType, ip, port, protocol,
   fingerprint }`. The three sources (UDP announcement, register POST, sweep) feed one channel
   and one dedupe map, so each peer yields one `Device` however many ways it was heard.
-- `send_files(device, [paths], pin?)` — prepare-upload then per-file upload, emitting a
-  `localsend:progress` event stream like card import.
+- `send_files_abortable(device, [paths], pin?, abort)` — prepare-upload then per-file upload,
+  calling back after each file (the job turns that into `localsend:progress` with its job id),
+  and stopping on `abort` (`send_files` is the same without one).
 
 Two feature-gated commands:
 
@@ -118,6 +123,14 @@ Two feature-gated commands:
 localsend_discover() -> [{ alias, deviceModel, deviceType, ip, port, protocol, fingerprint }]
 localsend_send(photoIds, versionId?, device, pin?) -> { sent, failed }
 ```
+
+In the GPUI app (`crates/app/src/modules/localsend/`) the LocalSend and Snapchat modules each
+contribute a publish target rendering `send::SendToDevicePanel`; Snapchat records through
+`modules::publishing::record_publications` with its marker, only for the photos that reached the
+device. The Publish dialog builds a target's form when its chip is chosen, so the opening scan
+runs only for a form the user is looking at. Tests fake the network at `LocalSendBackend`;
+core's `app::localsend` tests drive the real send against a loopback stub receiver
+(`localsend/test_receiver.rs`, an ephemeral `127.0.0.1` port).
 
 `SendToDevicePanel.tsx` owns the module's backend surface: the `localsend_discover` and
 `localsend_send` wrappers go through `ChairPhotoAPI.invoke`, and the `localsend:progress`

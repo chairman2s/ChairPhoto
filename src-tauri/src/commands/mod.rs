@@ -57,9 +57,9 @@ mod map;
 mod net;
 mod photos;
 mod publications;
-// Shared publish/transfer helpers. Compiled for LocalSend and Instagram too: they render
-// through the same job-scoped temp directories (`publishing::JobTempDir`).
-#[cfg(any(feature = "flickr", feature = "smugmug", feature = "instagram", feature = "localsend"))]
+// Shared publish helpers for Flickr, SmugMug and Instagram (the job-scoped temp directory
+// itself is the core's `publishing::JobTempDir`; LocalSend uses it through the core's job).
+#[cfg(any(feature = "flickr", feature = "smugmug", feature = "instagram"))]
 pub(crate) mod publishing;
 mod scan;
 mod settings;

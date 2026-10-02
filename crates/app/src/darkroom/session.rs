@@ -32,12 +32,18 @@
 //! catalog epoch (`EditJob::catalog_epoch`), so a render for the old catalog's photo id can
 //! never be adopted by a stage of the new one.
 //!
-//! # Seams for #112 (the rails)
+//! # The rails (#112)
 //!
-//! History (Ctrl+Z, the panel, `goto_version_step`), presets, the lens rail, crop/rotate,
-//! the version shelf, cover, proof sheet and duels are #112's. They plug in here: a labelled
-//! [`Darkroom::apply`] is how a preset, proof or reset becomes one named step; `history`,
-//! `version_id` and [`Darkroom::flush`] are what undo, the shelf and "+ New version" need.
+//! A preset, a proof, a duel pick or a reset is one named step through a labelled
+//! [`Darkroom::apply`]; crop, rotate, perspective and the lens switch are record changes like
+//! any slider's. What changes *which* version is edited, or its place in history — a history
+//! step (the panel, Ctrl+Z / Ctrl+Shift+Z / Ctrl+Y), the version shelf, "+ New version",
+//! "Develop with the new engine", the cover, a duel's ⑂ — is a **version operation**
+//! (`rails`): it saves what is pending first and runs after any commit already on the
+//! worker, one at a time, as React chained them after its autosave (`chainRef`). A save that
+//! fails drops the operations queued behind it (the change stays on screen, the banner says
+//! why). Presets live in the catalog's settings (`basic-editor.presets`), read-modify-written
+//! on a worker under one catalog lock.
 
 use super::stage::{DarkroomStage, FrameTier, SETTLE};
 use crate::image_store::{ImageStore, Submit};
@@ -55,11 +61,20 @@ use chairphoto_model::darkroom::history::{describe_change, should_amend, LastSte
 use chairphoto_model::darkroom::kelvin::{KelvinContext, WbPrefer, WB_SLIDER_KEY};
 use chairphoto_model::darkroom::render_timing::{RENDER_TIMING_KEY, RENDER_TIMING_SUMMARY_KEY};
 use chairphoto_model::darkroom::stage_json::stage_json_for;
-use chairphoto_model::editing::{as_linear_record, is_engine1_version, parse_edit, VersionEdit};
+use chairphoto_model::darkroom::geometry::OVERLAY_KEY;
+use chairphoto_model::editing::{as_linear_record, is_engine1_version, parse_edit, CropOverlay, VersionEdit};
+use chairphoto_model::presets::{parse_user_presets, DevelopPreset, USER_PRESETS_KEY};
 use gpui_kit::{AppContext as _, Context, Entity, Subscription, Task};
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
+
+mod rails;
+pub use rails::DarkroomEvent;
+
+/// A version operation waiting for the commit before it (see the module docs).
+type Op = Box<dyn FnOnce(&mut Darkroom, u64, &mut Context<Darkroom>)>;
 
 /// Quiet time after a change before it is saved as a history step (React: 600 ms).
 pub const AUTOSAVE_QUIET: Duration = Duration::from_millis(600);
@@ -83,6 +98,21 @@ pub struct OpenPhoto {
     version_unlisted: bool,
     /// How many versions the photo had, for the "Version N" a first change creates.
     pub versions_len: usize,
+    /// The photo's versions, for the shelf (read at the open and after each operation).
+    pub versions: Vec<PhotoVersion>,
+    /// The version the Library shows for the photo (its cover), if any.
+    pub cover: Option<i64>,
+    /// The proof last adopted: the name "+ New version" gives.
+    adopted_label: Option<String>,
+    /// Version operations waiting for the commit on the worker.
+    ops: VecDeque<Op>,
+    /// The perspective handles are up: the stage renders the picture un-warped.
+    pub perspective_mode: bool,
+    /// The proof sheet's auto-tone fragment (`None` until measured for this source).
+    pub auto_fragment: Option<VersionEdit>,
+    auto_seq: u64,
+    /// The record the clipping layer was last asked for.
+    clip_shown: String,
     /// The working record: what the controls show.
     pub working: VersionEdit,
     /// What the version holds (last saved or loaded), as JSON and as a record.
@@ -159,7 +189,7 @@ impl OpenPhoto {
     }
 
     fn stage_json(&self) -> String {
-        stage_json_for(&self.stamped(&self.working), false)
+        stage_json_for(&self.stamped(&self.working), self.perspective_mode)
     }
 
     fn clip_json(&self) -> String {
@@ -169,8 +199,23 @@ impl OpenPhoto {
             perspective: self.working.perspective.clone(),
             ..VersionEdit::default()
         };
-        stage_json_for(&self.stamped(&geometry), false)
+        stage_json_for(&self.stamped(&geometry), self.perspective_mode)
     }
+
+    /// The version being edited, from the shelf's list.
+    pub fn version(&self) -> Option<&PhotoVersion> {
+        self.version_id.and_then(|id| self.versions.iter().find(|v| v.id == id))
+    }
+
+    /// A version operation (or a commit) is on the worker.
+    pub fn busy(&self) -> bool {
+        self.committing
+    }
+}
+
+/// The cover version a row's token names (`"<version>:<rev>"`).
+fn cover_of(photo: &Photo) -> Option<i64> {
+    photo.cover_token.as_deref()?.split(':').next()?.parse().ok()
 }
 
 /// What a commit's worker answers: the version id it created, if it did — known even when
@@ -215,6 +260,13 @@ pub struct Darkroom {
     pub timing_log: bool,
     /// A develop session is held (opened and not closed yet).
     session_held: bool,
+    /// The composition overlay drawn in the crop box (`editor.crop_overlay`).
+    pub overlay: CropOverlay,
+    /// The user's presets (`basic-editor.presets`), read with the settings.
+    pub user_presets: Vec<DevelopPreset>,
+    /// A passing notice ("Saved preset …").
+    pub notice: Option<String>,
+    notice_timer: Option<Task<()>>,
     _subscriptions: [Subscription; 2],
 }
 
@@ -250,6 +302,10 @@ impl Darkroom {
             wb_prefer: WbPrefer::Kelvin,
             timing_log: false,
             session_held: false,
+            overlay: CropOverlay::Thirds,
+            user_presets: Vec::new(),
+            notice: None,
+            notice_timer: None,
             _subscriptions,
         }
     }
@@ -312,6 +368,7 @@ impl Darkroom {
         let working = parse_edit(version.as_ref().map(|v| v.edit_json.as_str()));
         let engine1_version = version.is_some() && is_engine1_version(&working);
         let photo_id = photo.id;
+        let cover = cover_of(&photo);
         let stage = self.new_stage(photo_id, epoch, SourceToken::Preview, None, cx);
         let _stage_observer = cx.observe(&stage, |_, _, cx| cx.notify());
         let committed_json = working.to_json();
@@ -323,6 +380,14 @@ impl Darkroom {
             version_id: version.as_ref().map(|v| v.id),
             version_unlisted: false,
             versions_len: 0,
+            versions: Vec::new(),
+            cover,
+            adopted_label: None,
+            ops: VecDeque::new(),
+            perspective_mode: false,
+            auto_fragment: None,
+            auto_seq: 0,
+            clip_shown: String::new(),
             committed: working.clone(),
             committed_json,
             working,
@@ -351,6 +416,7 @@ impl Darkroom {
         self.resolve_version(seq, version.map(|v| v.id), cx);
         self.open_session(seq, cx);
         self.read_settings(seq, cx);
+        self.measure_auto_tone(cx);
         cx.notify();
     }
 
@@ -413,15 +479,16 @@ impl Darkroom {
                         Some(v) => Some(c.version_history(v.id)?),
                         None => None,
                     };
-                    Ok((versions.len(), v, history))
+                    Ok((versions, v, history))
                 })
             },
             |this, result, cx| {
                 let Some(open) = this.open.as_mut() else { return };
                 match result {
-                    Ok((n, v, history)) => {
+                    Ok((versions, v, history)) => {
                         let before = (open.source_token().map(str::to_string), open.stage_json());
-                        open.versions_len = n;
+                        open.versions_len = versions.len();
+                        open.versions = versions;
                         if let Some(v) = &v {
                             if Some(v.id) != open.version_id {
                                 // Not the shell's version: adopt what this one holds.
@@ -476,23 +543,33 @@ impl Darkroom {
         );
     }
 
-    /// `develop.wbSlider`, `editor.renderTiming`, and the LUT folder.
+    /// `develop.wbSlider`, `editor.renderTiming`, the crop overlay, the user presets, and the
+    /// LUT folder.
     fn read_settings(&mut self, seq: u64, cx: &mut Context<Self>) {
         let Some(from) = self.open.as_ref().map(|o| o.from) else { return };
         let luts_dir = self.luts_dir.clone();
         self.run(
             seq,
             move |state| {
-                let (wb, timing) = with_catalog_as(state, from, |c| {
-                    Ok((c.get_setting(WB_SLIDER_KEY)?, c.get_setting(RENDER_TIMING_KEY)?))
+                let (wb, timing, overlay, presets) = with_catalog_as(state, from, |c| {
+                    Ok((
+                        c.get_setting(WB_SLIDER_KEY)?,
+                        c.get_setting(RENDER_TIMING_KEY)?,
+                        c.get_setting(OVERLAY_KEY)?,
+                        c.get_setting(USER_PRESETS_KEY)?,
+                    ))
                 })?;
                 let luts = luts_dir().and_then(|d| editing::list_luts_in(&d)).unwrap_or_default();
-                Ok((wb, timing, luts))
+                Ok((wb, timing, overlay, presets, luts))
             },
             |this, result, cx| {
-                if let Ok((wb, timing, luts)) = result {
+                if let Ok((wb, timing, overlay, presets, luts)) = result {
                     this.wb_prefer = WbPrefer::from_setting(wb.as_deref());
                     this.timing_log = timing.as_deref() == Some("1");
+                    if let Some(o) = overlay.as_deref().and_then(CropOverlay::from_key) {
+                        this.overlay = o;
+                    }
+                    this.user_presets = parse_user_presets(presets.as_deref());
                     this.luts = luts;
                     if let Some(open) = &this.open {
                         let on = this.timing_log;
@@ -566,6 +643,8 @@ impl Darkroom {
                 self.set_clipping(true, cx);
             }
             self.rendered_changed(cx);
+            // The auto-tone fragment is measured on what the stage shows.
+            self.measure_auto_tone(cx);
         } else if before.1 != open.stage_json() {
             self.rendered_changed(cx);
         }
@@ -600,6 +679,12 @@ impl Darkroom {
         let Some(open) = self.open.as_mut() else { return };
         let json = open.stage_json();
         open.stage.update(cx, |s, cx| s.edit_changed(json, cx));
+        // The clipping layer follows the geometry (straighten, perspective) and the handles.
+        let clip = open.clip_json();
+        if let Some(stage) = open.clip_stage.clone().filter(|_| clip != open.clip_shown) {
+            open.clip_shown = clip.clone();
+            stage.update(cx, |s, cx| s.edit_changed(clip, cx));
+        }
         open.masses_seq += 1;
         let masses_seq = open.masses_seq;
         let timer = cx.background_executor().timer(SETTLE);
@@ -649,6 +734,7 @@ impl Darkroom {
             _ => None,
         };
         let open = self.open.as_mut().expect("open");
+        open.clip_shown = open.clip_json();
         if let Some(old) = std::mem::replace(&mut open.clip_stage, clip_stage) {
             old.update(cx, |s, cx| s.close(cx));
         }
@@ -783,6 +869,14 @@ impl Darkroom {
                 open.history = Some(c.history);
                 open.last_step = Some(LastStep { key: change.key, at: now });
                 let photo_id = open.photo.id;
+                if let Some(v) = &c.version {
+                    if !open.versions.iter().any(|x| x.id == v.id) {
+                        open.versions.push(v.clone());
+                    }
+                }
+                if let Some(v) = open.versions.iter_mut().find(|v| v.id == c.version_id) {
+                    v.edit_json = c.saved.clone();
+                }
                 let active = match c.version {
                     Some(v) => {
                         open.version_unlisted = false;
@@ -816,20 +910,45 @@ impl Darkroom {
                 }
             }
         }
-        let again = self.photo_mut(seq).map(|o| std::mem::take(&mut o.commit_again)).unwrap_or(false);
-        if again {
-            // A change came in while this commit ran (or was pending when the photo was
-            // left): it is the user's, so it is tried.
-            self.commit(seq, cx);
-        } else if is_open && !failed {
-            self.schedule_autosave(cx);
-        }
-        if !is_open {
-            self.finish_leaving(seq, cx);
-        }
+        self.idle(seq, failed, cx);
         // A refused or failed save is not retried on a timer (a switched-away catalog would
         // refuse it forever): the next change, Ctrl+S or leaving tries again.
         cx.notify();
+    }
+
+    /// Photo `seq`'s commit or version operation answered (`failed`: a commit that did not
+    /// save). What waited for it runs now, in order: a change made meanwhile is committed
+    /// (it is the user's, so it is tried); then the queued version operations — dropped
+    /// instead when the save before them failed; then, idle, the autosave is rescheduled. A
+    /// photo being left is dropped once nothing more is on the worker for it.
+    fn idle(&mut self, seq: u64, failed: bool, cx: &mut Context<Self>) {
+        let is_open = self.open.as_ref().is_some_and(|o| o.seq == seq);
+        let again = self.photo_mut(seq).map(|o| std::mem::take(&mut o.commit_again)).unwrap_or(false);
+        if again {
+            self.commit(seq, cx);
+            if self.photo_mut(seq).is_some_and(|o| o.committing) {
+                return;
+            }
+        }
+        if !is_open {
+            self.finish_leaving(seq, cx);
+            return;
+        }
+        if failed {
+            if let Some(o) = self.open.as_mut() {
+                o.ops.clear();
+            }
+            return;
+        }
+        while let Some(op) = self.open.as_mut().filter(|o| o.seq == seq).and_then(|o| o.ops.pop_front()) {
+            op(self, seq, cx);
+            if self.photo_mut(seq).is_some_and(|o| o.committing) {
+                return;
+            }
+        }
+        if self.open.as_ref().is_some_and(|o| o.seq == seq) {
+            self.schedule_autosave(cx);
+        }
     }
 
     // --- leaving ------------------------------------------------------------------------------
@@ -842,6 +961,8 @@ impl Darkroom {
             self.flush(cx);
         }
         let Some(mut open) = self.open.take() else { return };
+        // Operations queued for this photo were asked of the view being left.
+        open.ops.clear();
         if !save {
             open.commit_again = false;
         }

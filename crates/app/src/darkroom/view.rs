@@ -6,10 +6,12 @@
 //! state (zoom, drags, the split-toning fold).
 //!
 //! Keys (the view's focus, not while a text field has it): ← / → step the filmstrip (no
-//! wrap, ignored with modifiers), Esc fits the stage, Ctrl+S saves now.
+//! wrap, ignored with modifiers), Esc fits the stage, Enter zooms to the crop, Ctrl+S saves
+//! now (even in a field), Ctrl+Z undoes, Ctrl+Shift+Z / Ctrl+Y redo.
 //!
-//! #112's rails (history, presets, lens, crop & rotate, versions) go in the right rail and
-//! the bar; the crop/perspective/straighten handles go on the stage over the frame.
+//! The rails of #112 (`rails`): the version shelf and cover on the bar; History, Presets,
+//! Lens and Crop & Rotate on the right rail; the crop box, perspective quad and level line
+//! over the frame; the proof sheet and duel (`crate::loupe`) over the whole view.
 
 use super::session::Darkroom;
 use super::stage::FrameTier;
@@ -34,6 +36,9 @@ use gpui_kit::{
 };
 use std::cell::Cell;
 use std::rc::Rc;
+
+mod rails;
+pub use rails::Overlay;
 
 // --- controls ------------------------------------------------------------------------------
 
@@ -230,6 +235,14 @@ enum Drag {
     Pan { x: f64, y: f64, tx: f64, ty: f64 },
     /// A tone-strip zone: which, where the pointer started, the zones then.
     Zone { zone: usize, y: f64, zones: Option<Vec<f64>> },
+    /// The crop body: where the pointer started and the crop then.
+    CropMove { x: f64, y: f64, start: chairphoto_model::editing::Crop },
+    /// A crop corner, the opposite one fixed.
+    CropCorner { anchor: (f64, f64) },
+    /// A perspective handle.
+    Quad(chairphoto_model::editing::QuadCorner),
+    /// The level line, in fit-frame pixels.
+    Level { x0: f64, y0: f64, x1: f64, y1: f64 },
 }
 
 /// The Darkroom view. See the module docs.
@@ -243,19 +256,23 @@ pub struct DarkroomView {
     stage_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
     /// The open photo the zoom belongs to: another photo starts at fit.
     view_photo: Option<i64>,
+    rails: rails::RailsState,
     _subscriptions: Vec<Subscription>,
 }
 
 impl DarkroomView {
     pub fn new(darkroom: Entity<Darkroom>, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let mut subs = vec![cx.observe(&darkroom, |this, darkroom, cx| {
+        let mut subs = vec![cx.observe_in(&darkroom, window, |this, darkroom, window, cx| {
             let photo = darkroom.read(cx).open.as_ref().map(|o| o.photo.id);
             if photo != this.view_photo {
                 this.view_photo = photo;
                 this.view = StageView::FIT;
+                this.photo_changed(window, cx);
             }
+            this.sync_preset_renders(cx);
             cx.notify()
         })];
+        subs.push(cx.subscribe(&darkroom, |this, _, event: &super::session::DarkroomEvent, cx| this.on_darkroom_event(event, cx)));
         let mut sliders = Vec::new();
         for control in Control::all() {
             let (_, min, max, step) = control.def();
@@ -267,6 +284,8 @@ impl DarkroomView {
             }));
             sliders.push((control, state));
         }
+        let (rails, rail_subs) = rails::RailsState::new(window, cx);
+        subs.extend(rail_subs);
         DarkroomView {
             darkroom,
             focus: cx.focus_handle(),
@@ -276,6 +295,7 @@ impl DarkroomView {
             show_split: false,
             stage_bounds: Rc::default(),
             view_photo: None,
+            rails,
             _subscriptions: subs,
         }
     }
@@ -343,7 +363,7 @@ impl DarkroomView {
         true
     }
 
-    fn on_key(&mut self, e: &KeyDownEvent, cx: &mut Context<Self>) {
+    fn on_key(&mut self, e: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let k = &e.keystroke;
         let m = k.modifiers;
         if (m.control || m.platform) && k.key == "s" {
@@ -351,10 +371,30 @@ impl DarkroomView {
             cx.stop_propagation();
             return;
         }
-        if m.control || m.platform || m.alt {
+        // The proof sheet and the duel own the keys while they are up (React's filmstrip
+        // `keysDisabled`): their arrows and Esc must not also step or fit the stage.
+        if self.rails.overlay_open() {
+            return;
+        }
+        // A text field keeps its own undo, and its own Enter and arrows.
+        let typing = self.rails.typing(window, cx);
+        if (m.control || m.platform) && !m.alt && !typing {
+            match k.key.as_str() {
+                "z" if m.shift => self.darkroom.update(cx, |d, cx| d.redo(cx)),
+                "z" => self.darkroom.update(cx, |d, cx| d.undo(cx)),
+                "y" => self.darkroom.update(cx, |d, cx| d.redo(cx)),
+                _ => return,
+            }
+            cx.stop_propagation();
+            return;
+        }
+        if m.control || m.platform || m.alt || typing {
             return;
         }
         match k.key.as_str() {
+            "enter" => {
+                self.zoom_to_crop(cx);
+            }
             "left" | "right" => {
                 if self.step(if k.key == "right" { 1 } else { -1 }, None, cx) {
                     cx.stop_propagation();
@@ -399,6 +439,7 @@ impl DarkroomView {
                 let next = tone_strip::apply_zone_drag(zones.as_deref(), zone, tone_strip::drag_delta_ev(y0, y));
                 self.edit(cx, |w, _| ctl::set_zones(w, next));
             }
+            Some(other) => self.drag_frame(other, x, y, cx),
             None => {}
         }
     }
@@ -465,6 +506,7 @@ impl DarkroomView {
                 shell.update(cx, |s, cx| s.show_library(cx))
             }))
             .child(div().text_size(px(13.)).font_weight(FontWeight::SEMIBOLD).child("Darkroom"))
+            .children(self.render_shelf(d, colors))
             .child(div().id("dk-hint").text_size(px(11.)).text_color(colors.mute).child(hint).test_support());
         if let Some(open) = open {
             if let Some(source) = &open.source.source {
@@ -498,6 +540,16 @@ impl DarkroomView {
                         .tooltip(move |window, cx| gpui_kit::component::tooltip::Tooltip::new(title.clone()).build(window, cx))
                         .test_support(),
                 );
+                if open.engine1_version && open.source.token.is_some() {
+                    let dk = self.darkroom.clone();
+                    bar = bar.child(clickable(
+                        chip("dk-new-engine", "Develop with the new engine", true, colors).tooltip(crate::shell::title_bar::tooltip(
+                            "Start a new version on the RAW with this version's framing (tone and look start fresh — the engines read sliders differently)",
+                        )),
+                        true,
+                        move |_, _, cx| dk.update(cx, |d, cx| d.develop_with_new_engine(cx)),
+                    ));
+                }
             }
             if open.source_token().is_some() {
                 let on = open.show_clipping;
@@ -510,6 +562,7 @@ impl DarkroomView {
                 bar = bar.child(clickable(el, true, move |_, _, cx| dk.update(cx, |d, cx| d.set_clipping(!on, cx))));
             }
         }
+        bar = bar.children(self.render_bar_actions(d, colors));
         bar.into_any_element()
     }
 
@@ -573,6 +626,8 @@ impl DarkroomView {
                 if let Some(clip) = open.clip_stage.as_ref().and_then(|c| c.read(cx).frame().cloned()) {
                     stage = stage.child(place("dk-clip-layer", clip.image));
                 }
+                let shown = (size.width.0 as f64, size.height.0 as f64);
+                stage = stage.children(self.frame_overlays(d, (x, y, w, h), shown, colors, cx));
             }
             None if s.failure().is_none() => {
                 stage = stage.items_center().justify_center().flex().child(
@@ -669,14 +724,16 @@ impl DarkroomView {
         div().flex().flex_col().flex_none().child(strip).child(labels).into_any_element()
     }
 
-    fn render_actions(&self, colors: Colors) -> AnyElement {
+    fn render_actions(&self, d: &Darkroom, colors: Colors, cx: &Context<Self>) -> AnyElement {
         let dk = self.darkroom.clone();
         div()
             .flex()
             .flex_none()
+            .items_center()
             .gap(px(8.))
             .px(px(12.))
             .py(px(6.))
+            .children(self.rails_actions(d, colors, cx))
             .child(clickable(
                 chip("dk-reset", "Reset", true, colors)
                     .tooltip(crate::shell::title_bar::tooltip("Back to as shot — clears every adjustment, framing included")),
@@ -779,6 +836,8 @@ impl DarkroomView {
         let k = kelvin.as_ref();
         let look = ctl::look_of(&working);
 
+        rail = rail.child(self.render_history(open, colors, cx));
+
         // White balance.
         let shown = ctl::wb_shown_for(&working, k);
         let mut wb = Self::group("White Balance", colors);
@@ -812,6 +871,7 @@ impl DarkroomView {
             colour = colour.child(self.slider_row(Control::Tone(d.key), &working, k, colors, cx));
         }
         rail = rail.child(colour);
+        rail = rail.child(self.render_presets(d, colors, cx));
 
         // Effects.
         let mut fx = Self::group("Effects", colors);
@@ -890,6 +950,8 @@ impl DarkroomView {
             fx = fx.child(self.slider_row(Control::LutAmount, &working, k, colors, cx));
         }
         rail = rail.child(fx);
+        rail = rail.children(self.render_lens(open, colors, cx));
+        rail = rail.child(self.render_geometry(d, colors, cx));
         rail.into_any_element()
     }
 }
@@ -911,23 +973,26 @@ impl Render for DarkroomView {
         let darkroom = self.darkroom.clone();
         if let Some((working, kelvin)) = darkroom.read(cx).open.as_ref().map(|o| (o.working.clone(), darkroom.read(cx).kelvin())) {
             self.sync_sliders(&working, kelvin.as_ref(), window, cx);
+            self.rails.sync_straighten(&working, window, cx);
         }
         let d = darkroom.read(cx);
         let bar = self.render_bar(d, colors, cx);
         let error = d.error.clone();
         let stage = self.render_stage(d, colors, cx);
         let strip = self.render_tone_strip(d, colors, cx);
-        let actions = self.render_actions(colors);
+        let actions = self.render_actions(d, colors, cx);
         let film = self.render_filmstrip(d, colors, cx);
         let rail = self.render_rail(d, colors, cx);
         let empty = d.open.is_none();
+        let overlay = self.rails.overlay_element();
         div()
             .id("darkroom")
             .key_context("Darkroom")
+            .relative()
             .track_focus(&self.focus)
-            .on_key_down(cx.listener(|this, e: &KeyDownEvent, _, cx| this.on_key(e, cx)))
+            .on_key_down(cx.listener(|this, e: &KeyDownEvent, window, cx| this.on_key(e, window, cx)))
             .on_mouse_move(cx.listener(|this, e: &MouseMoveEvent, _, cx| this.on_mouse_move(e, cx)))
-            .on_mouse_up(MouseButton::Left, cx.listener(|this, _, _, _| this.drag = None))
+            .on_mouse_up(MouseButton::Left, cx.listener(|this, e: &gpui_kit::MouseUpEvent, _, cx| this.end_drag(e, cx)))
             .on_mouse_down(MouseButton::Left, cx.listener(|this, _, window, cx| this.focus.focus(window, cx)))
             .size_full()
             .flex()
@@ -956,6 +1021,7 @@ impl Render for DarkroomView {
                     )
                     .child(rail),
             )
+            .children(overlay)
     }
 }
 

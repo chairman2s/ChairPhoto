@@ -85,6 +85,8 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg"]
 # Map tile loads run on the core's tokio runtime; a load's `AbortHandle` cancels it when its
 # tile leaves the view (`modules::map::tiles`). Already the core's dependency.
 tokio = { version = "1", default-features = false, features = ["rt"] }
+# A user preset's id (`darkroom::session::rails`, TS `crypto.randomUUID()`). Already the core's dependency.
+uuid = { version = "1", features = ["v4"] }
 # The quit-signal handlers (`signals.rs`: sigaction, a self-pipe, `_exit`). Already in the
 # lockfile through the core and gpui.
 libc = "0.2"

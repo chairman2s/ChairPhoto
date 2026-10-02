@@ -261,6 +261,29 @@ pub fn add_user_preset(stored: Option<&str>, id: String, name: &str, record: &Ve
     list
 }
 
+/// The stored user presets with preset `id` renamed to `name` (trimmed; the preset
+/// browser's ✎). An empty name, or an id not stored, changes nothing. The caller saves
+/// [`serialize_user_presets`] of the result. Every other entry is written back as read —
+/// its unknown keys and payload included; as in TS, an entry without a string `id` and
+/// `name` is not one the browser can show, and is not kept.
+pub fn rename_user_preset(stored: Option<&str>, id: &str, name: &str) -> Vec<DevelopPreset> {
+    let name = js_trim(name);
+    let mut list = parse_user_presets(stored);
+    if !name.is_empty() {
+        for p in list.iter_mut().filter(|p| p.id == id) {
+            p.name = name.to_string();
+        }
+    }
+    list
+}
+
+/// The stored user presets without preset `id` (the browser's ×, no confirm).
+pub fn delete_user_preset(stored: Option<&str>, id: &str) -> Vec<DevelopPreset> {
+    let mut list = parse_user_presets(stored);
+    list.retain(|p| p.id != id);
+    list
+}
+
 /// All presets in display order: the built-in groups first, then the user's.
 pub fn all_presets(user: Vec<DevelopPreset>) -> Vec<DevelopPreset> {
     let mut out = builtin_presets();
@@ -322,6 +345,26 @@ mod tests {
         assert_eq!(back[0].edit.value().unwrap().fade, Field::Set(0.3));
         let two = add_user_preset(Some(&text), "u-2".into(), "Two", &VersionEdit::default());
         assert_eq!(two.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(), ["u-1", "u-2"]);
+    }
+
+    #[test]
+    fn renaming_and_deleting_keep_every_other_entry_and_unknown_keys() {
+        let stored = json!([
+            {"id": "a", "name": "A", "category": "User", "edit": {"fade": 0.3, "future": {"k": 1}}, "note": "keep"},
+            {"id": "b", "name": "B", "category": "User", "edit": "a payload this build cannot read"},
+        ])
+        .to_string();
+        let renamed = rename_user_preset(Some(&stored), "a", "  Matte ");
+        let v: Value = serde_json::from_str(&serialize_user_presets(&renamed)).unwrap();
+        assert_eq!(v[0]["name"], json!("Matte"));
+        assert_eq!(v[0]["note"], json!("keep"));
+        assert_eq!(v[0]["edit"], json!({"fade": 0.3, "future": {"k": 1}}));
+        assert_eq!(v[1]["edit"], json!("a payload this build cannot read"), "the other preset's payload as stored");
+        assert_eq!(rename_user_preset(Some(&stored), "a", "   ")[0].name, "A", "an empty name changes nothing");
+        let left = delete_user_preset(Some(&stored), "a");
+        assert_eq!(left.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(), ["b"]);
+        let v: Value = serde_json::from_str(&serialize_user_presets(&left)).unwrap();
+        assert_eq!(v[0]["edit"], json!("a payload this build cannot read"));
     }
 
     #[test]

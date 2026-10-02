@@ -172,6 +172,20 @@ pub fn claim_upload(
     photo_id: i64,
     version_id: Option<i64>,
 ) -> Result<UploadJob, String> {
+    claim_upload_hooked(state, expected, service, photo_id, version_id, &|| {})
+}
+
+/// [`claim_upload`], calling `before_join` after the identity check and the resolve, just
+/// before the generation is joined — still under the catalog lock. Tests land a catalog switch
+/// there; production passes a no-op.
+fn claim_upload_hooked(
+    state: &AppState,
+    expected: Option<CatalogIdentity>,
+    service: UploadService,
+    photo_id: i64,
+    version_id: Option<i64>,
+    before_join: &dyn Fn(),
+) -> Result<UploadJob, String> {
     let guard = state.catalog.lock().map_err(|e| e.to_string())?;
     let catalog = guard.as_ref().ok_or("No catalog is open")?;
     if expected.is_some_and(|e| !e.is(catalog)) {
@@ -180,6 +194,7 @@ pub fn claim_upload(
     let resolved = crate::export::resolve_originals(catalog, &[photo_id], &[], version_id);
     let item = resolved.items.into_iter().next().ok_or("Photo is unavailable (original offline?)")?;
     let read = super::identity_of(catalog);
+    before_join();
     let (generation, job) = service.generation(state).join_numbered()?;
     drop(guard);
     let stop = Stop { own: Arc::new(AtomicBool::new(false)), generation };
@@ -371,6 +386,39 @@ mod tests {
         // A publish claimed after the switch is live.
         let after = claim_upload(&state, None, UploadService::Flickr, id, None).unwrap();
         after.render(&fake(&calls)).unwrap().ensure_live().unwrap();
+    }
+
+    /// **Forced interleaving.** A catalog switch that tries to land between the claim's
+    /// identity check and its join of the service generation must not leave a live job for the
+    /// catalog it closed. The hook starts the switch on another thread at exactly that point
+    /// and gives it time to finish: with the claim holding the catalog lock throughout, the
+    /// switch waits and then trips the job; were the lock released before the join, the
+    /// switch would complete first and the job would join the new catalog's fresh generation.
+    #[test]
+    fn a_switch_cannot_land_between_the_check_and_the_join() {
+        let dir = TestTmpDir::new("uploads-claim-lock");
+        let (state, id) = catalog_with_photo(&dir);
+        let read = crate::app::catalog_identity(&state).unwrap();
+        let (b, _) = catalog_with_photo(&dir.join("b"));
+        let b = Mutex::new(b.catalog.lock().unwrap().take());
+        let switch: Mutex<Option<std::thread::JoinHandle<()>>> = Mutex::new(None);
+        let job = claim_upload_hooked(&state, Some(read), UploadService::Flickr, id, None, &|| {
+            let (state, b) = (state.clone(), b.lock().unwrap().take().unwrap());
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            *switch.lock().unwrap() = Some(std::thread::spawn(move || {
+                crate::app::detach_catalog_and_trip_jobs(&state).unwrap();
+                crate::app::publish_catalog_and_reset_jobs(&state, b).unwrap();
+                let _ = done_tx.send(()); // the hook may have stopped waiting
+            }));
+            // Blocked behind the claim's catalog lock, the switch cannot finish in time.
+            let _ = done_rx.recv_timeout(std::time::Duration::from_millis(300));
+        })
+        .unwrap();
+        switch.lock().unwrap().take().unwrap().join().unwrap();
+        assert_ne!(crate::app::catalog_identity(&state).unwrap(), read, "the switch landed");
+        let calls = Arc::new(Mutex::new(0));
+        assert_eq!(job.render(&fake(&calls)).err().as_deref(), Some(CATALOG_CHANGED), "a live job for the closed catalog");
+        assert_eq!(*calls.lock().unwrap(), 0);
     }
 
     /// Bound to a catalog that is no longer open: the claim refuses; a switch after the

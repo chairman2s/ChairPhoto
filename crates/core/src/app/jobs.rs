@@ -54,7 +54,7 @@
 //! | [`JobSlot`] writes (workers) | one slot |
 //! | `develop`'s resident set (`develop::with_resident`) | a leaf: after any of the above, never across another lock |
 //! | a sidecar's file lock (`xmp::document::SidecarDocument`, open to commit; `xmp::lock`) | a leaf: taken under the catalog by the face-region, GPS and identity-Overwrite writes, and with no lock by the rest — the faces index job's pre-marker region conversion included (its own secondary connection, never a `WriteOrder` turn, no database work while the file lock is held); nothing is acquired while it is held |
-//! | `xmp::lock::WriteOrder::reserve` (`app::iptc::reserve`, the geocoder's `fill_in`) | catalog → that sidecar's write order, reserved without blocking |
+//! | `xmp::lock::WriteOrder::reserve` (`app::iptc::reserve`, the geocoder's `fill_in`) and `WriteOrder::moved_to` (`app::iptc::store_in_turn`, #155) | catalog → that sidecar's write order, reserved without blocking; a turn moved to another sidecar is released, and the new one waited for, only once the catalog lock is released |
 //! | `xmp::lock::WriteOrder::wait`, then the turn held (the IPTC save, the geocoder's fill) | no lock while it waits, and on a blocking thread, never an async worker (#148); with the turn held: catalog (the store), released, then the sidecar's file lock, then catalog again (the settle). No catalog holder ever waits on a turn |
 //!
 //! The sharpness and pHash starts never hold two of these at once, so they cannot

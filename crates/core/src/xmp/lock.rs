@@ -12,7 +12,10 @@
 //!   catalog, releases the catalog lock and only then writes the sidecar (the IPTC save and
 //!   the geocoder's fill). It reserves a place in line under the catalog lock, waits for its
 //!   turn with no lock held, then stores and writes while holding the turn, so stores and
-//!   sidecar writes run in one order: the catalog's newest value is also the sidecar's.
+//!   sidecar writes run in one order: the catalog's newest value is also the sidecar's. The
+//!   store resolves the original again and checks it still maps to the turn's sidecar
+//!   ([`WriteOrder::moved_to`]); a photo whose reachable copy changed meanwhile takes the
+//!   new sidecar's turn before it stores (`app::iptc::store_in_turn`, #155 R1).
 //!
 //! # Lock order
 //!
@@ -158,6 +161,19 @@ impl WriteOrder {
     /// called under the catalog lock (where the path was resolved).
     pub fn reserve(photo_path: &Path) -> Self {
         Self(ORDER_TURNS.reserve(key(&super::sidecar_path(photo_path))))
+    }
+
+    /// `None` while `photo_path` — the original as resolved again where this turn is used —
+    /// still maps to the sidecar the turn was reserved for; otherwise a fresh reservation for
+    /// the sidecar it maps to now. Never blocks.
+    ///
+    /// A photo with two locations resolves to whichever copy is reachable, so the copy can
+    /// change while a writer waits (its primary volume comes back). A turn for the old
+    /// sidecar does not order writes to the new one, so a writer that finds itself moved must
+    /// give this turn up and wait for the new one before it stores (#155 R1).
+    pub fn moved_to(&self, photo_path: &Path) -> Option<Self> {
+        let now = key(&super::sidecar_path(photo_path));
+        (now != self.0.key).then(|| Self(ORDER_TURNS.reserve(now)))
     }
 
     /// Wait (holding no lock) until every write reserved before this one is done, then

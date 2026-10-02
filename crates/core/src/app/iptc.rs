@@ -99,9 +99,61 @@ fn save_in_turn(
     photo_id: i64,
     fields: &IptcFields,
 ) -> Result<IptcSaveOutcome, String> {
-    let turn = turn.wait();
-    let (original, write) = super::with_catalog_as(state, identity, |c| store(c, photo_id, fields))?;
+    let ((original, write), turn) = store_in_turn(state, identity, photo_id, turn, |c, original| {
+        Ok((original, c.set_iptc(photo_id, fields)?))
+    })?;
     Ok(write_and_settle(state, identity, &original, &write, turn))
+}
+
+/// How many times a store follows its photo to another sidecar before it gives up.
+const MAX_MOVES: usize = 3;
+
+/// Refusal of a store whose photo kept resolving to another copy while it waited: nothing
+/// was stored, and saving again is safe.
+pub const LOCATION_CHANGED: &str = "The photo's reachable copy changed while saving; nothing was saved, save again";
+
+/// Wait for `turn` (no lock held), then — under catalog `identity`'s lock, with the turn
+/// held — resolve the photo's original and run `store` with it. Returns `store`'s value
+/// and the turn, to hold across the sidecar write. The path is resolved before `store`
+/// writes anything, so an original that is unreachable now — gone while this waited for
+/// its turn included — fails here and leaves the catalog unchanged.
+///
+/// The turn is keyed by the sidecar the original resolved to when it was reserved. When
+/// the original now resolves to another sidecar — a photo with two locations whose
+/// preferred copy came back while this waited — nothing is stored under it (#155 R1):
+/// storing and writing under the old turn would order this write against the wrong
+/// sidecar's writers, so two overlapping saves could each hold a turn while writing the
+/// same file and the older value land last. Instead this turn is released, the new
+/// sidecar's turn ([`WriteOrder::moved_to`], reserved under the lock) waited for with no
+/// lock held, and the resolve is tried again. After [`MAX_MOVES`] moves it fails with
+/// [`LOCATION_CHANGED`], nothing stored.
+///
+/// Blocking: call it on a blocking thread, never an async worker (see `xmp::lock`).
+pub(crate) fn store_in_turn<T>(
+    state: &AppState,
+    identity: CatalogIdentity,
+    photo_id: i64,
+    turn: WriteOrder,
+    mut store: impl FnMut(&crate::catalog::Catalog, std::path::PathBuf) -> crate::catalog::Result<T>,
+) -> Result<(T, WriteOrder), String> {
+    let mut turn = turn.wait();
+    for _ in 0..=MAX_MOVES {
+        let tried = super::with_catalog_as(state, identity, |c| {
+            let original = c.require_photo_path(photo_id)?;
+            Ok(match turn.moved_to(&original) {
+                Some(next) => Err(next),
+                None => Ok(store(c, original)?),
+            })
+        })?;
+        match tried {
+            Ok(value) => return Ok((value, turn)),
+            Err(next) => {
+                drop(turn);
+                turn = next.wait();
+            }
+        }
+    }
+    Err(LOCATION_CHANGED.into())
 }
 
 /// Reserve the place in line of the photo's sidecar write — under the catalog lock, which
@@ -135,24 +187,22 @@ pub(crate) fn write_and_settle(
     }
 }
 
-/// Store `fields`, returning the original's path and the sidecar write the store owes.
-/// Called with the write turn held. The path is resolved before the row is written (as the
-/// geocoder's `fill_in` does), so an original that is unreachable now — gone while this
-/// save waited for its turn included — leaves the catalog unchanged.
-fn store(
-    c: &crate::catalog::Catalog,
-    photo_id: i64,
-    fields: &IptcFields,
-) -> crate::catalog::Result<(std::path::PathBuf, IptcSidecarWrite)> {
-    let original = c.require_photo_path(photo_id)?;
-    let write = c.set_iptc(photo_id, fields)?;
-    Ok((original, write))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::xmp::test_fixtures::{assert_non_iptc_intact, foreign_iptc, iptc, with, FOREIGN};
+
+    /// A save's store without its turn check: the tests below that drive `write_and_settle`
+    /// by hand use it to force landings a save in turn never makes.
+    fn store(
+        c: &crate::catalog::Catalog,
+        photo_id: i64,
+        fields: &IptcFields,
+    ) -> crate::catalog::Result<(std::path::PathBuf, IptcSidecarWrite)> {
+        let original = c.require_photo_path(photo_id)?;
+        let write = c.set_iptc(photo_id, fields)?;
+        Ok((original, write))
+    }
 
     /// A catalog with one photo whose sidecar is `sidecar`, a foreign file ChairPhoto has
     /// never written (its IPTC is empty in the catalog). Returns the sidecar's path.
@@ -503,6 +553,57 @@ mod tests {
         let stored = state.catalog.lock().unwrap().as_ref().unwrap().get_iptc(id).unwrap();
         assert_eq!(stored, second);
         assert_eq!(state.catalog.lock().unwrap().as_ref().unwrap().owed_iptc(id).unwrap(), crate::catalog::IptcMask::NONE);
+    }
+
+    /// #155 R1: a photo with two copies — the primary in the library, a backup on a NAS —
+    /// whose primary comes back while a save waits. The save reserved the NAS sidecar's turn
+    /// (the primary was away), but at its store the original resolves to the library again.
+    /// It must not store and write the library sidecar under the NAS turn while another
+    /// writer holds the library sidecar's: it gives the NAS turn up, waits for the library
+    /// one, and only then stores and writes there. The NAS sidecar is never touched.
+    #[test]
+    fn a_save_whose_copy_changes_while_it_waits_takes_the_new_sidecars_turn() {
+        let (dir, state, id, library_xmp) = foreign_photo("iptc-155-moved", crate::xmp::test_fixtures::LIGHTROOM);
+        let library = dir.join("library");
+        let nas = dir.join("nas");
+        std::fs::create_dir_all(&nas).unwrap();
+        let nas_file = nas.join("DSC144.ARW");
+        std::fs::write(&nas_file, b"raw").unwrap();
+        std::fs::write(crate::xmp::sidecar_path(&nas_file), crate::xmp::test_fixtures::LIGHTROOM).unwrap();
+        {
+            let guard = state.catalog.lock().unwrap();
+            let c = guard.as_ref().unwrap();
+            let volume = c.add_volume("NAS", &nas, crate::catalog::VolumeKind::Backup).unwrap();
+            c.add_location(id, volume, "DSC144.ARW", crate::catalog::LocationRole::Backup).unwrap();
+        }
+
+        // The primary is away: the save resolves the NAS copy and waits behind a write that
+        // holds that sidecar's turn.
+        let away = dir.join("library.away");
+        std::fs::rename(&library, &away).unwrap();
+        let nas_writer = WriteOrder::reserve(&nas_file);
+        let state = std::sync::Arc::new(state);
+        let save = {
+            let state = state.clone();
+            std::thread::spawn(move || save_iptc(&state, id, &IptcFields { title: "t1".into(), ..Default::default() }))
+        };
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(!save.is_finished(), "the save must wait behind the NAS sidecar's writer");
+
+        // The primary is back, and another writer holds the library sidecar's turn.
+        std::fs::rename(&away, &library).unwrap();
+        let library_writer = WriteOrder::reserve(&library.join("DSC144.ARW")).wait();
+        drop(nas_writer);
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(!save.is_finished(), "the save wrote the library sidecar under the NAS sidecar's turn");
+        let stored = state.catalog.lock().unwrap().as_ref().unwrap().get_iptc(id).unwrap();
+        assert_eq!(stored, IptcFields::default(), "the save stored before it held the library sidecar's turn");
+
+        drop(library_writer);
+        let outcome = save.join().unwrap().unwrap();
+        assert_eq!(outcome.sidecar, crate::catalog::IptcSidecarState::Written, "{outcome:?}");
+        assert_eq!(iptc(&read(&library_xmp)), with(foreign_iptc(), "dc:title", &["t1"]));
+        assert_eq!(read(&crate::xmp::sidecar_path(&nas_file)), crate::xmp::test_fixtures::LIGHTROOM);
     }
 
     /// Issue #149 F1: the library's volume goes away while a save waits for its turn. The

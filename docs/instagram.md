@@ -70,10 +70,17 @@ is never overwritten.
 ## Where it lives
 
 - `crates/core/src/instagram/mod.rs` — the Chrome automation.
+- `crates/core/src/app/instagram.rs` — the post as a publish job (`app::uploads`, the
+  Instagram family): the caption prefill, the 1080-px render into a directory belonging to that
+  post alone (`publishing::JobTempDir`), whose lifetime follows the outcome as described above,
+  and the hand-off to an `InstagramDriver` (Chrome; tests fake it and never launch a browser).
+  A tripped job (Cancel, a newer post, a catalog switch) stops before Chrome sees the render.
 - `src-tauri/src/commands/instagram.rs` — `post_to_instagram` and
-  `build_instagram_caption`, both gated on the `instagram` feature. The render goes to a
-  temp JPEG in a directory belonging to that post alone (`publishing::JobTempDir`), whose
-  lifetime follows the outcome as described above.
+  `build_instagram_caption`, thin wrappers gated on the `instagram` feature.
+- `crates/app/src/modules/instagram/` — the GPUI publish target: version, caption (prefilled
+  until edited), "Publish automatically", Post, Cancel until Chrome has the render, and the
+  "Did you click Share?" confirmation, which records the photo and version that were
+  composed in the catalog they came from.
 - `src/modules/plugins/instagram.tsx` — the publish target in the unified Publish dialog:
   version picker, caption box, auto-publish toggle, and the post-run confirmation.
 

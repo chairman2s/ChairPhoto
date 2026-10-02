@@ -55,9 +55,16 @@ module.
 albums against `api.smugmug.com` (API v2), and the raw-binary upload to
 `upload.smugmug.com`.
 
-Commands, all gated on the `smugmug` feature: `smugmug_begin_auth`,
-`smugmug_complete_auth`, `smugmug_connected`, `post_to_smugmug`, `smugmug_list_albums`,
-`smugmug_create_album`.
+The command bodies live in core so both front ends run them: `crates/core/src/app/oauth.rs`
+(sign-in), `app/smugmug.rs` (albums and upload, over a `SmugMugApi` trait whose live impl is
+`crate::smugmug` and which tests fake) and `app/uploads.rs` (a publish as an owned,
+cancellable job). Commands, all gated on the `smugmug` feature and thin wrappers over those:
+`smugmug_begin_auth`, `smugmug_complete_auth`, `smugmug_connected`, `post_to_smugmug`,
+`smugmug_list_albums`, `smugmug_create_album`.
+
+The GPUI app's module is `crates/app/src/modules/smugmug/`: the shared `OAuthSettings` on its
+Preferences tab and the shared `PublishPanel` (album picker, no tags; the description is the
+caption) as its publish target.
 
 Frontend: `src/modules/plugins/smugmug.tsx` is a thin module definition over shared UI in
 `plugins/publishing.tsx` — the OAuth settings panel and the per-photo publish panel, whose

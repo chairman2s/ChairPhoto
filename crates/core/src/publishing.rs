@@ -1,17 +1,11 @@
 //! What every publish path shares (docs/publications.md): the job-scoped temp directory a
-//! render goes to, the filename the receiving service or device sees, rendering one photo for
-//! an upload, and recording publications under the catalog the photo ids were read from.
+//! render goes to and the filename the receiving service or device sees.
 //!
 //! Moved here from the Tauri shell's `commands/publishing.rs` so the GPUI app's publish
-//! targets (LocalSend and Snapchat today, Flickr/SmugMug/Instagram in #124) run the same code;
-//! the shell keeps thin wrappers.
-//!
-//! **Export parity.** A render here is an export, so its engine-2 parity checks count. Each
-//! render collects its own tally (`app::exports::collect_parity`) and adds it to the catalog
-//! it read — dropped once another catalog is open — instead of draining the process-wide one,
-//! which an unrelated export could have filled (acf746b).
+//! targets run the same code. The render itself is a publish job's (`app::uploads` for
+//! Flickr, SmugMug and Instagram; `app::localsend` for a send), each collecting its own
+//! export-parity tally for the catalog it read.
 
-use crate::app::{AppState, CatalogIdentity, CATALOG_CHANGED};
 use crate::upload_sweep::{sweep_abandoned, ABANDONED_AFTER, JOB_DIR_PREFIX};
 use std::path::{Path, PathBuf};
 
@@ -136,58 +130,6 @@ pub fn sanitize_filename(name: &str) -> String {
     }
 }
 
-/// A rendered upload: the JPEG plus the job directory holding it. Keep the value alive
-/// until the upload finishes — dropping it deletes the render.
-pub struct RenderedUpload {
-    _dir: JobTempDir,
-    path: PathBuf,
-}
-
-impl RenderedUpload {
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
-}
-
-/// Render photo `photo_id` (version `version_id`, `None` = Original) to an upload JPEG in a
-/// fresh [`JobTempDir`] for `service`, downscaled to `max_long_edge` when set (`None`/`0` =
-/// full resolution). The Flickr and SmugMug publish path.
-///
-/// `from`: the catalog the id was read from — `Some` fails closed with [`CATALOG_CHANGED`]
-/// once another catalog is open; `None` = the open one (the Tauri commands). The render's
-/// parity checks go to that catalog's total (see the module doc). Blocking: run it on a
-/// worker.
-pub fn render_upload_jpeg(
-    state: &AppState,
-    from: Option<CatalogIdentity>,
-    photo_id: i64,
-    version_id: Option<i64>,
-    service: &str,
-    max_long_edge: Option<u32>,
-) -> Result<RenderedUpload, String> {
-    let (read, resolved) = {
-        let guard = state.catalog.lock().map_err(|e| e.to_string())?;
-        let catalog = guard.as_ref().ok_or("No catalog is open")?;
-        if from.is_some_and(|f| !f.is(catalog)) {
-            return Err(CATALOG_CHANGED.into());
-        }
-        (crate::app::identity_of(catalog), crate::export::resolve_originals(catalog, &[photo_id], &[], version_id))
-    };
-    let item = resolved.items.into_iter().next().ok_or("Photo is unavailable (original offline?)")?;
-
-    // Name the upload after the source (with the version suffix), so the service shows a
-    // meaningful filename (e.g. "DSC01234.jpg", "DSC01234 - Punchy crop.jpg") instead of a
-    // temp name. The job-scoped directory keeps that name collision-free.
-    let dir = JobTempDir::new(service)?;
-    let out = dir.join(&upload_file_name(&item.original, item.version_name.as_deref()));
-    let (written, tally) = crate::app::exports::collect_parity(|| {
-        crate::export::write_item_jpeg_with_long_edge(&item, max_long_edge, &out)
-    });
-    crate::app::exports::record_parity_tally(state, Some(read), tally);
-    written?;
-    Ok(RenderedUpload { _dir: dir, path: out })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -295,31 +237,5 @@ mod tests {
         assert_eq!(upload_file_name(original, Some("Punchy crop")), "DSC01234 - Punchy crop.jpg");
         // Non-ASCII and separators collapse to `_` (SmugMug sends this as an HTTP header).
         assert_eq!(upload_file_name(Path::new("/photos/vår/tur:2.jpg"), None), "tur_2.jpg");
-    }
-
-    fn catalog_with_photo(dir: &Path) -> (AppState, i64) {
-        let root = dir.join("library");
-        std::fs::create_dir_all(&root).unwrap();
-        let state = AppState::default();
-        let c = crate::catalog::Catalog::open(&dir.join("c.chairphoto"), &root).unwrap();
-        let p = root.join("IMG_1.jpg");
-        std::fs::write(&p, b"jpeg").unwrap();
-        let id = c.upsert_photo(&p, None, 0, 6).unwrap().id;
-        *state.catalog.lock().unwrap() = Some(c);
-        (state, id)
-    }
-
-    /// A render bound to a catalog that is no longer open refuses before rendering anything.
-    #[test]
-    fn a_render_bound_to_a_closed_catalog_refuses() {
-        let dir = crate::test_support::TestTmpDir::new("publishing-render");
-        let (state, id) = catalog_with_photo(&dir);
-        let read = crate::app::catalog_identity(&state).unwrap();
-        let other = crate::test_support::TestTmpDir::new("publishing-render-b");
-        let (b, _) = catalog_with_photo(&other);
-        let catalog_b = b.catalog.lock().unwrap().take();
-        *state.catalog.lock().unwrap() = catalog_b;
-        let err = render_upload_jpeg(&state, Some(read), id, None, "flickr", None).err().unwrap();
-        assert_eq!(err, CATALOG_CHANGED);
     }
 }

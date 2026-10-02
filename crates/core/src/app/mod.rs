@@ -20,6 +20,8 @@ pub mod ai;
 mod boot;
 pub mod catalogs;
 pub mod editing;
+#[cfg(feature = "flickr")]
+pub mod flickr;
 pub mod bundles;
 #[cfg(feature = "collage")]
 pub mod collage;
@@ -30,6 +32,8 @@ pub mod faces;
 pub mod identity;
 pub mod iptc;
 pub mod jobs;
+#[cfg(any(feature = "flickr", feature = "smugmug"))]
+pub mod oauth;
 pub mod publications;
 #[cfg(feature = "localsend")]
 pub mod localsend;
@@ -38,6 +42,8 @@ pub mod scans;
 pub mod smarttags;
 #[cfg(feature = "slideshow")]
 pub mod slideshow;
+#[cfg(feature = "smugmug")]
+pub mod smugmug;
 pub mod storage;
 pub mod tags;
 pub mod uploads;

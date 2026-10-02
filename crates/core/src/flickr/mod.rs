@@ -774,18 +774,18 @@ pub async fn upload(
         .body(body)
         .send()
         .await
-        .map_err(|e| format!("Flickr upload request failed: {e}"))?;
-    let text = resp.text().await.map_err(|e| e.to_string())?;
+        .map_err(|e| format!("Flickr upload request failed: {}", e.without_url()))?;
+    let text = resp.text().await.map_err(|e| e.without_url().to_string())?;
     parse_upload_response(&text)
 }
 
 async fn http_get_text(url: &str) -> Result<String, String> {
     reqwest::get(url)
         .await
-        .map_err(|e| format!("Flickr request failed: {e}"))?
+        .map_err(|e| format!("Flickr request failed: {}", e.without_url()))?
         .text()
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.without_url().to_string())
 }
 
 /// Build a `multipart/form-data` body by hand (avoids reqwest's `multipart` feature): the

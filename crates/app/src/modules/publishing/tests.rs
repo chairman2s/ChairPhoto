@@ -65,6 +65,9 @@ impl PublishService for Fake {
     }
     fn upload(&self, _: &ModuleSettings, rendered: &RenderedJob, request: &PublishRequest) -> Result<String, String> {
         rendered.ensure_live()?;
+        if let Some(e) = self.answer.strip_prefix("error: ") {
+            return Err(e.into());
+        }
         assert_eq!(std::fs::read(rendered.path()).unwrap(), b"pixels", "uploads the job's own render");
         self.calls.lock().unwrap().published.push(request.clone());
         Ok(self.answer.clone())
@@ -585,4 +588,94 @@ fn oauth_settings_follow_a_catalog_switch(cx: &mut TestAppContext) {
     view.update(cx, |v, cx| v.save(cx));
     work(cx);
     view.read_with(cx, |v, _| assert_eq!(v.status, "Saved."));
+}
+
+/// Close the publish dialog and let go of the test's handle on its panel: what the user's
+/// closing it leaves — a publish in flight with no panel to answer to.
+fn close_panel(app: &App, view: Entity<PublishPanel>, cx: &mut TestAppContext) {
+    let weak = view.downgrade();
+    drop(view);
+    cx.update_window(app.window(), |_, window, cx| window.close_dialog(cx)).unwrap();
+    cx.run_until_parked();
+    assert!(weak.upgrade().is_none(), "the closed dialog's panel is still alive");
+}
+
+/// A publish whose dialog was closed before it finished still reports how it ended on the
+/// status line — not only a success: an upload error, a catalog change (a switch not yet
+/// delivered) and a Cancel pressed just before the close, which also still stops it.
+#[gpui_kit::test]
+fn a_closed_dialogs_publish_reports_every_ending_on_the_status_line(cx: &mut TestAppContext) {
+    let dir = TempDir::new("publish-closed");
+    let app = start(cx);
+    let ids = with_files(&app, &dir, 1, cx);
+    work(cx);
+    select(&app, ids[0], cx);
+    let host = host(&app, cx);
+    let calls = Arc::new(Mutex::new(Calls::default()));
+
+    // An upload error.
+    let view = open_panel(&app, &host, Arc::new(Fake { calls: calls.clone(), answer: "error: HTTP 503".into() }), cx);
+    view.update(cx, |p, cx| p.publish(cx));
+    step(cx); // claimed: rendering is queued
+    close_panel(&app, view, cx);
+    work(cx);
+    assert_eq!(crate::tests::status(&app, cx), "Fakr: HTTP 503");
+
+    // A Cancel pressed before the claim landed, then the dialog closed: nothing is rendered.
+    let view = open_panel(&app, &host, Arc::new(Fake { calls: calls.clone(), answer: "https://x/1".into() }), cx);
+    view.update(cx, |p, cx| {
+        p.publish(cx);
+        p.cancel(cx);
+    });
+    close_panel(&app, view, cx);
+    work(cx);
+    assert_eq!(calls.lock().unwrap().rendered, 1, "a publish cancelled before its dialog closed rendered");
+    assert!(calls.lock().unwrap().published.is_empty(), "a publish cancelled before its dialog closed uploaded");
+    assert_eq!(crate::tests::status(&app, cx), format!("Fakr: {UPLOAD_CANCELLED}"));
+
+    // A switch lands while it renders (catalog:switched not delivered yet).
+    let view = open_panel(&app, &host, Arc::new(Fake { calls: calls.clone(), answer: "https://x/1".into() }), cx);
+    view.update(cx, |p, cx| p.publish(cx));
+    step(cx);
+    close_panel(&app, view, cx);
+    let (b, _) = colliding_catalog(&dir, "b", 1);
+    core_switch(&app, b);
+    work(cx);
+    assert_eq!(crate::tests::status(&app, cx), format!("Fakr: {CATALOG_CHANGED}"));
+    assert!(calls.lock().unwrap().published.is_empty());
+}
+
+/// Publish photo A, close the dialog while it renders, publish photo B from a new dialog: the
+/// newer publish does not stop the older one — both upload and both are recorded (each is its
+/// own job). Forced overlap: A is claimed, then B runs to completion before A renders.
+#[gpui_kit::test]
+fn a_second_publish_does_not_stop_the_first(cx: &mut TestAppContext) {
+    let dir = TempDir::new("publish-two");
+    let app = start(cx);
+    let ids = with_files(&app, &dir, 2, cx);
+    work(cx);
+    let host = host(&app, cx);
+    let calls = Arc::new(Mutex::new(Calls::default()));
+    let service: Arc<dyn PublishService> = Arc::new(Fake { calls: calls.clone(), answer: "https://x/1".into() });
+
+    select(&app, ids[0], cx);
+    let first = open_panel(&app, &host, service.clone(), cx);
+    first.update(cx, |p, cx| p.publish(cx));
+    step(cx); // A claimed; its render is queued
+    let held = cx.update(|cx| Runner::get(cx).hold_pending());
+    assert_eq!(held.len(), 1, "A's render");
+    close_panel(&app, first, cx);
+
+    select(&app, ids[1], cx);
+    let second = open_panel(&app, &host, service, cx);
+    second.update(cx, |p, cx| p.publish(cx));
+    work(cx);
+    second.read_with(cx, |p, _| assert_eq!(p.status, "Published to Fakr ✓"));
+    cx.update(|cx| Runner::get(cx).release(held));
+    work(cx);
+    let published: Vec<i64> = calls.lock().unwrap().published.iter().map(|r| r.photo_id).collect();
+    assert_eq!(published, [ids[1], ids[0]], "the newer publish stopped the older one");
+    assert_eq!(publications(&app, ids[0]).len(), 1);
+    assert_eq!(publications(&app, ids[1]).len(), 1);
+    assert_eq!(crate::tests::status(&app, cx), "Published to Fakr.");
 }

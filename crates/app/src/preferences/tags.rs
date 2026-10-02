@@ -1,17 +1,26 @@
 //! Preferences → Tags (`TagMaintenanceSection`): tidy redundant ancestor tags, find duplicate
 //! tags (the 50 most similar, "Merge X away…"), find unused tags and delete them (a branch
-//! with children behind a confirm). The merge itself opens the tag merge preview
-//! (`TagMergeModal.tsx`), which the Tag panel ticket (#107) ports; until then the button says
-//! so in the section's status line.
+//! with children behind a confirm).
+//!
+//! "Merge X away…" opens the Tag panel's merge preview (`tags::merge::TagMerge`, React's
+//! `TagMergeModal`) over Preferences ([`OpenTagMerge`]; Preferences opens it and owns its
+//! subscriptions, so the dialog still closes when this section is rebuilt under it). As in
+//! React, a pair's button is live only while its tag is in the tag tree. The pair's ids were
+//! read from this section's catalog and the dialog runs under the tree's ([`TagsState`]), so
+//! the button opens nothing unless both are the same open catalog. A committed merge shows
+//! its summary here (`tag_tree::merge_summary`, the Tag panel's wording) and clears the
+//! duplicate and unused lists, which it made stale ([`TagMaintenance::merged`]).
 
 use super::{heading, section, status, thousands, Ctx};
-use crate::model::not_yet_ported_line;
 use crate::shell::style::Colors;
 use crate::storage::{ui, Runner};
-use chairphoto_core::catalog::tag_maintenance::{self, OrphanTag, SimilarTagPair, DEFAULT_MIN_SIMILARITY};
+use crate::tags::TagsState;
+use chairphoto_core::catalog::tag_maintenance::{self, OrphanTag, SimilarTagPair, TagMergeReport, DEFAULT_MIN_SIMILARITY};
+use chairphoto_core::catalog::TagWithCount;
+use chairphoto_model::tag_tree::merge_summary;
 use gpui_kit::prelude::*;
 use gpui_kit::TestSupportExt as _;
-use gpui_kit::{div, px, Context, SharedString, Window};
+use gpui_kit::{div, px, App, Context, Entity, EventEmitter, SharedString, Subscription, Window};
 
 /// How many duplicate pairs are listed.
 pub const MAX_PAIRS: usize = 50;
@@ -23,17 +32,42 @@ pub enum Looking {
     Orphans,
 }
 
+/// "Merge X away…" was pressed: Preferences opens the merge preview for this tag.
+#[derive(Debug, Clone)]
+pub struct OpenTagMerge(pub TagWithCount);
+
+/// What "Merge X away…" says when it cannot open the preview: the tag tree is not (yet) the
+/// one of the catalog the pairs were found in…
+pub const TREE_NOT_READY: &str = "The tag list is still loading — try again in a moment.";
+/// … or the tag is gone from it.
+pub const TAG_GONE: &str = "That tag no longer exists — find duplicate tags again.";
+
 pub struct TagMaintenance {
     ctx: Ctx,
+    /// The tag tree the merge preview runs under.
+    tags: Entity<TagsState>,
     pub status: Option<String>,
     pub duplicates: Option<Vec<SimilarTagPair>>,
     pub orphans: Option<Vec<OrphanTag>>,
     pub busy: Option<Looking>,
+    _tree: Subscription,
 }
 
 impl TagMaintenance {
-    pub fn new(ctx: Ctx, _: &mut Context<Self>) -> Self {
-        TagMaintenance { ctx, status: None, duplicates: None, orphans: None, busy: None }
+    pub fn new(ctx: Ctx, tags: Entity<TagsState>, cx: &mut Context<Self>) -> Self {
+        // A pair's buttons are live only while its tag is in the tree: follow the tree.
+        let _tree = cx.observe(&tags, |_, _, cx| cx.notify());
+        TagMaintenance { ctx, tags, status: None, duplicates: None, orphans: None, busy: None, _tree }
+    }
+
+    /// The tree's record of `tag_id` — only while the tree is the one of the catalog this
+    /// section found its pairs in (tag ids are per catalog).
+    fn tree_tag(&self, tag_id: i64, cx: &App) -> Result<TagWithCount, &'static str> {
+        let tags = self.tags.read(cx);
+        if !self.ctx.live(cx) || !tags.loaded || tags.guard().identity != self.ctx.identity {
+            return Err(TREE_NOT_READY);
+        }
+        tags.tag(tag_id).cloned().ok_or(TAG_GONE)
     }
 
     pub fn tidy(&mut self, cx: &mut Context<Self>) {
@@ -94,9 +128,23 @@ impl TagMaintenance {
         );
     }
 
-    /// "Merge X away…": the merge preview is #107's.
-    pub fn merge(&mut self, cx: &mut Context<Self>) {
-        self.status = Some(not_yet_ported_line("Merge tags", 107));
+    /// "Merge X away…": ask Preferences to open the merge preview with `tag_id` as its source.
+    pub fn merge(&mut self, tag_id: i64, cx: &mut Context<Self>) {
+        match self.tree_tag(tag_id, cx) {
+            Ok(tag) => cx.emit(OpenTagMerge(tag)),
+            Err(why) => {
+                self.status = Some(why.into());
+                cx.notify();
+            }
+        }
+    }
+
+    /// A merge opened from here committed: report it and drop the lists it made stale (React's
+    /// `onMerged`). The model's re-read follows from the merge itself (`run_as`, mutating).
+    pub fn merged(&mut self, report: &TagMergeReport, cx: &mut Context<Self>) {
+        self.status = Some(merge_summary(report));
+        self.duplicates = None;
+        self.orphans = None;
         cx.notify();
     }
 
@@ -151,6 +199,8 @@ impl TagMaintenance {
     }
 }
 
+impl EventEmitter<OpenTagMerge> for TagMaintenance {}
+
 fn badge(text: &'static str, colors: Colors) -> gpui_kit::Div {
     div().px(px(6.)).rounded_full().border_1().border_color(colors.border).text_size(px(10.)).text_color(colors.mute).child(text)
 }
@@ -188,6 +238,8 @@ impl Render for TagMaintenance {
             Some(pairs) => {
                 let mut list = div().id("tags-duplicates").flex().flex_col().gap(px(8.));
                 for (i, pair) in pairs.iter().take(MAX_PAIRS).enumerate() {
+                    let (a, b) = (pair.a_id, pair.b_id);
+                    let (a_live, b_live) = (self.tree_tag(a, cx).is_ok(), self.tree_tag(b, cx).is_ok());
                     list = list.child(
                         div()
                             .flex()
@@ -205,14 +257,14 @@ impl Render for TagMaintenance {
                             .child(
                                 ui::row()
                                     .child(ui::clickable(
-                                        ui::chip(SharedString::from(format!("tags-merge-a-{i}")), format!("Merge {} away…", pair.a_path), true, colors),
-                                        true,
-                                        cx.listener(|s, _, _, cx| s.merge(cx)),
+                                        ui::chip(SharedString::from(format!("tags-merge-a-{i}")), format!("Merge {} away…", pair.a_path), a_live, colors),
+                                        a_live,
+                                        cx.listener(move |s, _, _, cx| s.merge(a, cx)),
                                     ))
                                     .child(ui::clickable(
-                                        ui::chip(SharedString::from(format!("tags-merge-b-{i}")), format!("Merge {} away…", pair.b_path), true, colors),
-                                        true,
-                                        cx.listener(|s, _, _, cx| s.merge(cx)),
+                                        ui::chip(SharedString::from(format!("tags-merge-b-{i}")), format!("Merge {} away…", pair.b_path), b_live, colors),
+                                        b_live,
+                                        cx.listener(move |s, _, _, cx| s.merge(b, cx)),
                                     )),
                             ),
                     );

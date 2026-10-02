@@ -48,8 +48,8 @@ impl Module for FacesModule {
 
     fn load(&self, host: ModuleHost, cx: &mut App) -> Result<Box<dyn ModuleInstance>, String> {
         let app = host.model().read(cx).state().clone();
-        let (settings, model, shell) = (host.settings(), host.model().clone(), host.shell().clone());
-        let state = cx.new(|cx| state::FacesState::new(app, settings, model, shell, cx));
+        let (settings, model, shell, images) = (host.settings(), host.model().clone(), host.shell().clone(), host.images().cloned());
+        let state = cx.new(|cx| state::FacesState::new(app, settings, model, shell, images, cx));
         Ok(Box::new(FacesInstance { state, host }))
     }
 }

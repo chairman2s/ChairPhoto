@@ -1,14 +1,14 @@
 //! [`FacesState`]: the Faces module's live state, shared by its three views (the settings
 //! panel, the inspector's Faces block and the loupe overlay) — the models and inference
-//! lines, the module's settings, the indexing job this app follows, and the active photo's
-//! faces with every per-face write.
+//! lines, the module's settings, the indexing job this app follows, and the shown photo's
+//! faces (the inspector's photo, [`FacesState::shown_photo`]) with every per-face write.
 //!
 //! **Off the UI thread.** Every catalog read and write, the model check and download, and the
 //! job start run on the storage [`Runner`] (the core runtime's blocking pool; a manual queue
 //! in tests). Each result carries the generation it started under; a catalog switch bumps
 //! it, so an answer from before the switch is dropped.
 //!
-//! **Catalog identity** (map #92). The active photo's faces are read **bound to the catalog
+//! **Catalog identity** (map #92). The shown photo's faces are read **bound to the catalog
 //! the Library rows came from** (`ShellState::rows_from`) — the photo id is that catalog's —
 //! and every write keyed by a face, tag or photo id runs through `with_catalog_as` with that
 //! identity, failing closed (`CATALOG_CHANGED`) once another catalog is open, even before
@@ -26,6 +26,7 @@
 //! disabled, as in React, until its `faces:match_done`.
 
 use super::logic::{batch_confirm_message, index_done_message};
+use crate::image_store::ImageStore;
 use crate::model::{AppModel, AppModelEvent};
 use crate::modules::ModuleSettings;
 use crate::shell::ShellState;
@@ -36,6 +37,7 @@ use chairphoto_core::app::{
     FacesMatchJobStatus,
 };
 use chairphoto_core::catalog::{Catalog, Tag};
+use chairphoto_core::image_pool::ImageKind;
 use chairphoto_core::plugins::faces::models::ModelStatus;
 use gpui_kit::{App, Context, Entity, Global, SharedString, Subscription};
 use std::collections::HashSet;
@@ -130,18 +132,27 @@ impl IndexRun {
     }
 }
 
-/// The active photo's faces, read bound to `from`.
+/// The shown photo's faces, read bound to `from`.
 #[derive(Debug, Clone)]
 pub struct PhotoFaces {
     pub photo_id: i64,
     pub from: CatalogIdentity,
+    /// Each box in the canonical frame: the photo as its metadata orients it, without the
+    /// user rotation ([`super::logic::rotate_box`]).
     pub faces: Vec<FaceForPhoto>,
     pub people: PeopleTags,
+    /// The photo's non-destructive `user_rotation` (degrees clockwise), read with the faces:
+    /// how far the loupe's tiers are turned from the boxes' frame.
+    pub rotation: i64,
+    /// The photo's image version ([`ImageStore::invalidate`] bumps it — a rotation does) when
+    /// this was read: the overlay draws only over tiers of the same version, whose pixels were
+    /// rendered with `rotation`.
+    pub image_version: u64,
 }
 
 #[derive(Debug, Clone, Default)]
 pub enum PhotoView {
-    /// No active photo, or the rows' catalog is not known yet.
+    /// No shown photo, or the rows' catalog is not known yet.
     #[default]
     None,
     Loading(i64),
@@ -171,8 +182,10 @@ pub struct FacesState {
     /// Index jobs whose `faces:index_done` has been seen: never re-adopted.
     finished: HashSet<u64>,
     pub photo: PhotoView,
-    /// What the photo read in flight (or done) is for: `(photo, rows' catalog)`.
-    photo_key: Option<(i64, CatalogIdentity)>,
+    /// What the photo read in flight (or done) is for: `(photo, rows' catalog, image version)`.
+    photo_key: Option<(i64, CatalogIdentity, u64)>,
+    /// The image layer, whose per-photo version says the photo's pixels (its rotation) changed.
+    images: Option<Entity<ImageStore>>,
     photo_seq: u64,
     /// The face whose "confirm on N" is in flight.
     pub batch_busy: Option<i64>,
@@ -188,9 +201,10 @@ impl FacesState {
         settings: ModuleSettings,
         model: Entity<AppModel>,
         shell: Entity<ShellState>,
+        images: Option<Entity<ImageStore>>,
         cx: &mut Context<Self>,
     ) -> Self {
-        let subscriptions = vec![
+        let mut subscriptions = vec![
             cx.subscribe(&model, |this, _, event: &AppModelEvent, cx| match event {
                 AppModelEvent::CatalogRead => this.catalog_read(cx),
                 AppModelEvent::Core(e) => this.core_event(e, cx),
@@ -198,6 +212,10 @@ impl FacesState {
             }),
             cx.observe(&shell, |this, _, cx| this.follow_photo(false, cx)),
         ];
+        if let Some(images) = &images {
+            // A rotation invalidates the photo's images: re-read its rotation (and faces).
+            subscriptions.push(cx.observe(images, |this, _, cx| this.follow_photo(false, cx)));
+        }
         let mut this = FacesState {
             app,
             settings,
@@ -216,6 +234,7 @@ impl FacesState {
             finished: HashSet::new(),
             photo: PhotoView::None,
             photo_key: None,
+            images,
             photo_seq: 0,
             batch_busy: None,
             generation: 0,
@@ -566,29 +585,37 @@ impl FacesState {
         );
     }
 
-    // --- the active photo -----------------------------------------------------------------
+    // --- the shown photo ------------------------------------------------------------------
 
-    /// Follow the Library's active photo: read its faces, bound to the rows' catalog, when it
-    /// (or that catalog) changes, or always with `force` (after a write).
+    /// The photo whose faces are shown: the one the inspector and the loupes show
+    /// ([`ShellState::loupe_target`] — Compare's focused pane while Compare is open, else the
+    /// active photo), so the Faces block never acts on a different photo than the inspector
+    /// around it.
+    pub fn shown_photo(&self, cx: &App) -> Option<i64> {
+        self.shell.read(cx).loupe_target().map(|p| p.id)
+    }
+
+    /// Follow the shown photo ([`Self::shown_photo`]): read its faces, bound to the rows'
+    /// catalog, when it (or that catalog) changes, or always with `force` (after a write).
     pub fn follow_photo(&mut self, force: bool, cx: &mut Context<Self>) {
         if !self.live {
             return;
         }
-        let (active, from) = {
-            let shell = self.shell.read(cx);
-            (shell.library.selection().active_id, shell.rows_from())
-        };
-        let key = active.zip(from);
+        let (active, from) = (self.shown_photo(cx), self.shell.read(cx).rows_from());
+        let version = |photo: i64| self.images.as_ref().map_or(0, |i| i.read(cx).key(photo, ImageKind::Preview).version);
+        let key = active.zip(from).map(|(photo, from)| (photo, from, version(photo)));
         if key == self.photo_key && !force {
             return;
         }
-        let Some((photo_id, from)) = key else {
+        let Some((photo_id, from, image_version)) = key else {
             self.photo_key = None;
             self.photo = PhotoView::None;
             cx.notify();
             return;
         };
-        if self.photo_key != key {
+        // Another photo (or catalog) loads afresh; the same photo's re-read (after a write or a
+        // rotation) keeps showing the last read until it lands.
+        if self.photo_key.map(|(p, f, _)| (p, f)) != Some((photo_id, from)) {
             self.photo = PhotoView::Loading(photo_id);
         }
         self.photo_key = key;
@@ -596,13 +623,19 @@ impl FacesState {
         let seq = self.photo_seq;
         self.run(
             cx,
-            move |app| with_catalog_as(app, from, |c| Ok((core_faces::faces_for_photo(c, photo_id)?, core_faces::people_tags(c)?))),
+            move |app| {
+                with_catalog_as(app, from, |c| {
+                    Ok((core_faces::faces_for_photo(c, photo_id)?, core_faces::people_tags(c)?, c.photo_rotation(photo_id)?))
+                })
+            },
             move |s, result, _| {
                 if s.photo_seq != seq {
                     return; // a newer read is on its way
                 }
                 s.photo = match result {
-                    Ok((faces, people)) => PhotoView::Ready(PhotoFaces { photo_id, from, faces, people }),
+                    Ok((faces, people, rotation)) => {
+                        PhotoView::Ready(PhotoFaces { photo_id, from, faces, people, rotation, image_version })
+                    }
                     Err(e) => PhotoView::Failed(photo_id, e),
                 };
             },
@@ -681,13 +714,11 @@ impl FacesState {
         self.face_write("draw the box", cx, move |c| core_faces::add_manual(c, photo, x, y, w, h), move |_, id, cx| then(id, cx));
     }
 
-    /// The photos "✓✓ confirm on N" acts on: the selection, plus the active photo (whose
-    /// faces the panel shows) — `None` when the shown faces are not the rows' catalog's.
+    /// The photos "✓✓ confirm on N" acts on: the selection, plus the shown photo (whose faces
+    /// the panel shows, [`Self::shown_photo`]).
     pub fn selection_targets(&self, cx: &App) -> Vec<i64> {
-        let shell = self.shell.read(cx);
-        let sel = shell.library.selection();
-        let mut ids = sel.ids.to_vec();
-        if let Some(a) = sel.active_id {
+        let mut ids = self.shell.read(cx).library.selection().ids.to_vec();
+        if let Some(a) = self.shown_photo(cx) {
             if !ids.contains(&a) {
                 ids.push(a);
             }

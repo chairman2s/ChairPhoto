@@ -1,4 +1,5 @@
-//! The inspector's "Faces" block (`FacesInspectorPanel`): the active photo's faces, each with
+//! The inspector's "Faces" block (`FacesInspectorPanel`): the faces of the photo the inspector
+//! shows ([`FacesState::shown_photo`]: Compare's focused pane while Compare is open), each with
 //! its number, name, confidence and state, and ✓ confirm, "✓✓ confirm on N" (the whole
 //! selection, reported on the status line), ✕ reject, ⇄ reassign (the person picker inline),
 //! – ignore and 🗑 delete (drawn boxes only). Every write is [`FacesState`]'s, bound to the
@@ -164,7 +165,9 @@ impl Render for FacesInspector {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = Colors::get(cx);
         let state = self.state.read(cx);
-        let active = state.shell().read(cx).library.selection().active_id;
+        // The inspector's photo (Compare's focused pane while Compare is open), not the
+        // Library's active one: the block acts on the photo the inspector shows.
+        let active = state.shown_photo(cx);
         if active.is_none() {
             return ui::empty("faces-insp-none", "No photo selected", colors);
         }

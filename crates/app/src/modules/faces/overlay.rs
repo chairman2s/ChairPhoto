@@ -10,17 +10,33 @@
 //!
 //! **Geometry.** A box is drawn through the very transform the loupe draws its picture with
 //! ([`ZoomView::placement`] of the drawn picture's size in the image's container), so it stays
-//! glued to the face at any zoom, pan or window size; face boxes are normalized against the
-//! oriented image, which is what the preview and zoom tiers are. Over an edited version's
-//! render the boxes are hidden: a version may be cropped or rotated, and its frame is no
-//! longer the one the boxes were measured in (React drew them there anyway, misplaced).
+//! glued to the face at any zoom, pan or window size. Face boxes are stored in the canonical
+//! frame — the photo as its metadata orients it, **without** the non-destructive user rotation
+//! (the indexer detects on the unrotated preview; the MWG export writes that frame) — while the
+//! loupe's tiers are rendered turned by the user rotation. So each box is turned by the
+//! rotation read with the faces before it is placed ([`rotate_box`]), and a box drawn on the
+//! turned picture is turned back before it is stored ([`unrotate_box`]). The boxes are drawn
+//! only over a tier of the image version the faces were read with: a rotation invalidates the
+//! photo's images and re-reads its rotation, so a turned box never lands on stale pixels (or
+//! fresh pixels with a stale angle). React placed unturned boxes on the turned picture.
+//!
+//! Over an edited version's render the boxes are hidden: a version may be cropped or rotated,
+//! and its frame is no longer the one the boxes were measured in (React drew them there anyway,
+//! misplaced). The same holds for the Darkroom's **print** in the pop-out (#110): it is drawn
+//! from the edit's own render (`Drawn::OverrideLo`/`Hi`), so the boxes are hidden there too,
+//! with the same note. Drawing them when the print's geometry equals the original's (no crop,
+//! straighten or rotation in the edit) was considered and not done: the overlay would have to
+//! read the edit's geometry, which lives in the Darkroom and reaches the loupe only as pixels,
+//! and a rule that shows boxes on some prints and not others would read as a bug. Hidden with
+//! the note is the decision, until the edit carries a box transform the overlay can apply.
 //!
 //! **Where the transform comes from.** The slot hands a panel only a window, so the overlay
-//! finds the loupe's image through the window's root view ([`loupe_zoom`]) and observes it.
-//! That reads the loupe's public accessors and changes nothing in it. The pop-out loupe
-//! window (#110) needs its root added there — or the slot to carry the image; see the seam.
+//! asks the host which loupe image that window shows ([`loupe_zoom`], i.e.
+//! [`crate::loupe::view::loupe_image`]: the inline loupe's in the main window, the pop-out's in
+//! the pop-out, #110) and observes it. That reads the loupe's public accessors and changes
+//! nothing in it.
 
-use super::logic::{bbox_to_screen, chip_name, drag_to_bbox, state_color};
+use super::logic::{bbox_to_screen, chip_name, drag_to_bbox, rotate_box, state_color, unrotate_box};
 use super::picker::{PersonPicker, PickerEvent};
 use super::state::FacesState;
 use crate::image_store::{ImageState, ImageStore};
@@ -28,6 +44,7 @@ use crate::keymap::contexts;
 use crate::loupe::zoom::{Drawn, ZoomImage, ZoomView};
 use crate::machine_prefs::MachinePrefs;
 use crate::shell::style::Colors;
+use chairphoto_core::app::faces::FaceBboxJson;
 use chairphoto_core::image_pool::ImageKind;
 use gpui_kit::prelude::*;
 use gpui_kit::{
@@ -38,12 +55,10 @@ use gpui_kit::{
 /// The per-machine preference: `"0"` hides the boxes.
 pub const SHOW_BOXES_PREF: &str = "faces.showBoxes";
 
-/// The loupe image of `window`: the main window's inline loupe. The pop-out loupe (#110)
-/// adds its own root here when it lands.
+/// The loupe image `window` shows — the main window's inline loupe, or the pop-out's (#110) —
+/// as every loupe registers it before building its loupe-slot panels.
 pub fn loupe_zoom(window: &Window, cx: &App) -> Option<Entity<ZoomImage>> {
-    let root = window.root::<gpui_kit::base::Root>().flatten()?;
-    let view = root.read(cx).view().clone().downcast::<crate::view::RootView>().ok()?;
-    Some(view.read(cx).loupe().read(cx).zoom().clone())
+    crate::loupe::view::loupe_image(window, cx)
 }
 
 /// What the overlay draws against this frame.
@@ -56,6 +71,8 @@ pub struct Frame {
     pub origin: Point<Pixels>,
     pub container: (f32, f32),
     pub view: ZoomView,
+    /// How far the drawn picture is turned (clockwise) from the boxes' canonical frame.
+    pub rotation: i64,
 }
 
 pub struct FaceOverlay {
@@ -163,7 +180,8 @@ impl FaceOverlay {
         let zoom = self.zoom.as_ref()?.upgrade()?;
         let z = zoom.read(cx);
         let (photo, drawn) = z.drawn()?;
-        if z.photo() != Some(photo) || self.state.read(cx).faces().map(|p| p.photo_id) != Some(photo) {
+        let faces = self.state.read(cx).faces()?;
+        if z.photo() != Some(photo) || faces.photo_id != photo {
             return None;
         }
         let kind = match drawn {
@@ -172,7 +190,13 @@ impl FaceOverlay {
             Drawn::Zoom => ImageKind::Zoom,
             Drawn::OverrideLo | Drawn::OverrideHi => return None,
         };
-        let ImageState::Ready(loaded) = self.images.as_ref()?.read(cx).peek(photo, kind) else { return None };
+        let images = self.images.as_ref()?.read(cx);
+        // The faces' rotation is the one these pixels were rendered with only at the version
+        // it was read for (a rotation bumps it and re-reads).
+        if images.key(photo, kind).version != faces.image_version {
+            return None;
+        }
+        let ImageState::Ready(loaded) = images.peek(photo, kind) else { return None };
         let size = loaded.image.size(0);
         let bounds = z.bounds()?;
         Some(Frame {
@@ -181,6 +205,7 @@ impl FaceOverlay {
             origin: bounds.origin,
             container: (f32::from(bounds.size.width), f32::from(bounds.size.height)),
             view: z.view(cx),
+            rotation: faces.rotation,
         })
     }
 
@@ -215,7 +240,10 @@ impl FaceOverlay {
         self.draw_mode = false;
         let b = Self::local(&frame, e.position);
         cx.notify();
-        let Some(bbox) = drag_to_bbox(a, b, frame.natural, frame.container, frame.view) else { return };
+        let Some((x, y, w, h)) = drag_to_bbox(a, b, frame.natural, frame.container, frame.view) else { return };
+        // Drawn on the turned picture: stored in the canonical frame.
+        let (x, y, w, h) = unrotate_box((x as f32, y as f32, w as f32, h as f32), frame.rotation);
+        let bbox = (x as f64, y as f64, w as f64, h as f64);
         let this = cx.entity().downgrade();
         self.state.update(cx, |s, cx| {
             s.add_manual(
@@ -385,7 +413,9 @@ impl Render for FaceOverlay {
         let mut layers: Vec<AnyElement> = Vec::new();
         if self.show_boxes {
             for face in &faces {
-                let r = bbox_to_screen(face.bbox, frame.natural, frame.container, frame.view);
+                let b = face.bbox;
+                let (x, y, w, h) = rotate_box((b.x, b.y, b.w, b.h), frame.rotation);
+                let r = bbox_to_screen(FaceBboxJson { x, y, w, h }, frame.natural, frame.container, frame.view);
                 let color = state_color(&face.state, colors);
                 let id = face.id;
                 let state = face.state.as_str();

@@ -205,9 +205,13 @@ impl Render for LoupeWindowView {
         if card::shown(&self.shell, &self.modules, cx) {
             return root.child(self.card.clone());
         }
-        // With the card down, the loupe has the keys again.
+        // With the card down, the loupe has the keys again: when nothing has focus, or the card
+        // still does. A card photo shown full-size took focus with the card's handle, and the
+        // window still reports that handle after the card stops rendering (its entity lives on
+        // here), so `focused()` alone is not `None` and the arrows would go nowhere.
         let focus = self.loupe.read(cx).focus_handle().clone();
-        if window.focused(cx).is_none() {
+        let card_focus = self.card.read(cx).focus_handle().clone();
+        if window.focused(cx).is_none_or(|f| f == card_focus) {
             focus.focus(window, cx);
         }
         root.child(self.loupe.clone())

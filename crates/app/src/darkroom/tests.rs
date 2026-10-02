@@ -718,6 +718,51 @@ fn undo_during_a_running_autosave_runs_after_it(cx: &mut TestAppContext) {
     assert_eq!(rig.saved(v), json!({}));
 }
 
+/// **Forced interleaving.** Ctrl+Z is on the worker (Runner::manual holds it) when a slider
+/// moves and a preset is clicked: both are refused — the rail is not editable until the step
+/// lands — so the undo is not cancelled by a save of "pre-undo + change", the redo branch is
+/// kept (core cuts steps past the head on a commit), and the refused preset's label does not
+/// name the next, unrelated change.
+#[gpui_kit::test]
+fn a_change_while_an_undo_is_on_the_worker_neither_cancels_it_nor_cuts_redo(cx: &mut TestAppContext) {
+    use chairphoto_model::darkroom::controls::EffectKey;
+    let rig = rig("dk-undo-change", 1, cx);
+    rig.slide(Control::Tone(ToneKey::Ev), 0.5, cx);
+    rig.settle_and_save(cx);
+    rig.slide(Control::Tone(ToneKey::Contrast), 0.3, cx);
+    rig.settle_and_save(cx);
+    let v = rig.versions()[0].id;
+    let steps = vec!["Before".to_string(), "Exposure +0.50".to_string(), "Contrast +0.30".to_string()];
+    assert_eq!(rig.labels(v), (steps.clone(), Some(2)));
+
+    rig.press("ctrl-z", cx);
+    let d = rig.darkroom(cx);
+    assert!(d.read_with(cx, |d, _| !d.open.as_ref().unwrap().editable()), "the step is on the worker");
+    rig.slide(Control::Effect(EffectKey::Fade), 0.2, cx);
+    let preset = chairphoto_model::presets::builtin_presets().into_iter().next().unwrap();
+    d.update(cx, |d, cx| d.apply_preset(&preset, cx));
+    cx.run_until_parked();
+    assert_eq!(rig.working(cx)["tone"]["contrast"], json!(0.3), "the record is not changed under the step");
+    assert_eq!(rig.working(cx).get("fade"), None, "neither the fade nor the preset was taken");
+    work(cx);
+    advance(cx, AUTOSAVE_QUIET);
+    work(cx);
+    assert_eq!(rig.labels(v), (steps.clone(), Some(1)), "undone, the redo branch kept");
+    assert_eq!(rig.working(cx)["tone"]["contrast"], json!(0), "the step's record is the working one");
+    assert_eq!(rig.saved(v)["tone"]["contrast"], json!(0));
+    assert!(d.read_with(cx, |d, _| d.open.as_ref().unwrap().editable()), "changes are taken again");
+
+    // Redo still reaches the step the change would have cut.
+    rig.press("ctrl-shift-z", cx);
+    work(cx);
+    assert_eq!(rig.labels(v).1, Some(2));
+    assert_eq!(rig.working(cx)["tone"]["contrast"], json!(0.3));
+    // The next change is named for itself, not for the refused preset.
+    rig.slide(Control::Effect(EffectKey::Fade), 0.2, cx);
+    rig.settle_and_save(cx);
+    assert_eq!(rig.labels(v).0.last().unwrap(), "Fade 0.20");
+}
+
 /// The version shelf: "+ New version" copies the settings and continues there; Original shows
 /// the unedited photo and the next change there starts another version; a chip switches back
 /// (saving first); the cover toggles in the catalog.

@@ -42,7 +42,10 @@
 //! (`rails`): it saves what is pending first and runs after any commit already on the
 //! worker, one at a time, as React chained them after its autosave (`chainRef`). A save that
 //! fails drops the operations queued behind it (the change stays on screen, the banner says
-//! why). Presets live in the catalog's settings (`basic-editor.presets`), read-modify-written
+//! why). While a history step is on the worker the record is not editable
+//! (`OpenPhoto::editable`): a change is refused, not made and then dropped as React's
+//! `setWorking(record)` did — saved on top of the step it would cut the redo branch the step
+//! left. Presets live in the catalog's settings (`basic-editor.presets`), read-modify-written
 //! on a worker under one catalog lock.
 
 use super::stage::{DarkroomStage, FrameTier, SETTLE};
@@ -138,6 +141,9 @@ pub struct OpenPhoto {
     autosave_timer: Option<Task<()>>,
     /// A commit is on the worker; another change waits for it (`commit_again`).
     committing: bool,
+    /// A version operation that replaces the working record (a history step) is on the
+    /// worker: changes are refused until it answers (see [`Darkroom::apply`]).
+    replacing: bool,
     commit_again: bool,
     pub saving: bool,
     _stage_observer: Subscription,
@@ -210,6 +216,11 @@ impl OpenPhoto {
     /// A version operation (or a commit) is on the worker.
     pub fn busy(&self) -> bool {
         self.committing
+    }
+
+    /// Changes are taken: no operation that replaces the working record is on the worker.
+    pub fn editable(&self) -> bool {
+        !self.replacing
     }
 }
 
@@ -405,6 +416,7 @@ impl Darkroom {
             masses_timer: None,
             autosave_timer: None,
             committing: false,
+            replacing: false,
             commit_again: false,
             saving: false,
             _stage_observer,
@@ -654,8 +666,20 @@ impl Darkroom {
 
     /// A control produced the next record. `label` names the change for history when the
     /// caller knows it better than a diff ("Reset"; #112's "Preset: X", "Proof: Y").
+    ///
+    /// Refused while an operation that replaces the record is on the worker
+    /// ([`OpenPhoto::editable`]): the change would be made on a record about to be replaced,
+    /// and saving it on top of a history step would cut the redo branch the step left. React
+    /// let the change happen and then dropped it (`setWorking(record)`); here the controls
+    /// show the refusal instead (the rail is dimmed, a slider snaps back) and nothing is
+    /// silently lost.
     pub fn apply(&mut self, next: VersionEdit, label: Option<&str>, cx: &mut Context<Self>) {
         let Some(open) = self.open.as_mut() else { return };
+        if !open.editable() {
+            // A re-render puts the refused change's slider thumb back on the record.
+            cx.notify();
+            return;
+        }
         if next == open.working {
             return;
         }

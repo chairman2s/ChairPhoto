@@ -52,11 +52,13 @@ impl Darkroom {
     }
 
     /// One version operation on a worker. Photo `seq` is busy until it answers (a change
-    /// meanwhile waits, as for a commit); `done` runs only while `seq` is the open photo. A
-    /// left photo's failure goes to the status line.
+    /// meanwhile waits, as for a commit) — or, for an operation that `replaces` the working
+    /// record, refuses changes until it answers ([`Darkroom::apply`]); `done` runs only while
+    /// `seq` is the open photo. A left photo's failure goes to the status line.
     fn run_op<T: Send + 'static>(
         &mut self,
         seq: u64,
+        replaces: bool,
         work: impl FnOnce(&AppState) -> Result<T, String> + Send + 'static,
         done: impl FnOnce(&mut Self, Result<T, String>, &mut Context<Self>) + 'static,
         cx: &mut Context<Self>,
@@ -64,6 +66,7 @@ impl Darkroom {
         let Some(open) = self.photo_mut(seq) else { return };
         open.committing = true;
         open.saving = true;
+        open.replacing = replaces;
         let state = self.app.clone();
         let rx = Runner::get(cx).run(move || work(&state));
         cx.spawn(async move |this, cx| {
@@ -72,6 +75,7 @@ impl Darkroom {
                 let Some(open) = this.photo_mut(seq) else { return };
                 open.committing = false;
                 open.saving = false;
+                open.replacing = false;
                 if this.open.as_ref().is_some_and(|o| o.seq == seq) {
                     done(this, result, cx);
                 } else if let Err(e) = result {
@@ -122,9 +126,10 @@ impl Darkroom {
         let Some(open) = self.open.as_ref() else { return };
         let Some(vid) = open.version_id else { return };
         let Some(step) = step.or_else(|| step_by(open.history.as_ref(), delta)) else { return };
-        let (from, base) = (open.from, open.working.clone());
+        let from = open.from;
         self.run_op(
             seq,
+            true,
             move |state| {
                 editing::write_version_then_refresh_monochrome(state, Some(from), vid, |c| c.goto_version_step(vid, step))
             },
@@ -138,11 +143,10 @@ impl Darkroom {
                     let record = parse_edit(Some(&json));
                     Self::adopt_committed(open, &record);
                     open.history = Some(history);
-                    // A change made while the step was on the worker stays (it is newer):
-                    // the next save makes it a step on top of this one.
-                    if open.working == base {
-                        open.working = record;
-                    }
+                    // The step's record is what the version holds now. No change was made
+                    // while the step ran (changes were refused): one saved on top of it
+                    // would have cut the redo branch the step just left.
+                    open.working = record;
                     let mut shown = None;
                     if let Some(v) = open.versions.iter_mut().find(|v| v.id == vid) {
                         v.edit_json = json;
@@ -172,6 +176,7 @@ impl Darkroom {
         let (from, photo_id) = (open.from, open.photo.id);
         self.run_op(
             seq,
+            false,
             move |state| {
                 with_catalog_as(state, from, |c| {
                     let versions = c.list_versions(photo_id)?;
@@ -251,6 +256,7 @@ impl Darkroom {
         let saved = json.clone();
         self.run_op(
             seq,
+            false,
             Self::create_with(from, photo_id, name, json),
             move |this, result, cx| match result {
                 Ok((id, versions)) => {
@@ -293,6 +299,7 @@ impl Darkroom {
                 let kept = name.clone();
                 this.run_op(
                     seq,
+                    false,
                     Self::create_with(from, photo_id, name, json),
                     move |this, result, cx| match result {
                         Ok((_, versions)) => {
@@ -322,6 +329,7 @@ impl Darkroom {
                 let (from, photo_id) = (open.from, open.photo.id);
                 this.run_op(
                     seq,
+                    false,
                     move |state| with_catalog_as(state, from, |c| c.set_cover_version(photo_id, next)),
                     move |this, result, cx| match result {
                         Ok(_) => {
@@ -480,6 +488,9 @@ impl Darkroom {
     /// A proof clicked: its record becomes the working state, named "Proof: <label>" (the
     /// as-shot cell is a plain change), and its label is what "+ New version" will be called.
     pub fn adopt_proof(&mut self, candidate: ProofCandidate, cx: &mut Context<Self>) {
+        if !self.open.as_ref().is_some_and(|o| o.editable()) {
+            return;
+        }
         let label = (candidate.group != ProofGroup::AsShot).then(|| candidate.label.clone());
         if let (Some(open), Some(l)) = (self.open.as_mut(), &label) {
             open.adopted_label = Some(l.clone());
@@ -503,7 +514,7 @@ impl Darkroom {
     /// "Correct perspective" / "Adjust corners": the quad (the default one if none) and the
     /// handles up; the crop goes.
     pub fn start_perspective(&mut self, cx: &mut Context<Self>) {
-        let Some(open) = self.open.as_ref() else { return };
+        let Some(open) = self.open.as_ref().filter(|o| o.editable()) else { return };
         let next = geometry::start_perspective(&open.working);
         self.set_perspective_mode(true, cx);
         self.apply(next, None, cx);
@@ -511,7 +522,7 @@ impl Darkroom {
 
     /// Perspective "Reset": quad and crop go, the handles down.
     pub fn clear_perspective(&mut self, cx: &mut Context<Self>) {
-        let Some(open) = self.open.as_ref() else { return };
+        let Some(open) = self.open.as_ref().filter(|o| o.editable()) else { return };
         let next = geometry::clear_perspective(&open.working);
         self.set_perspective_mode(false, cx);
         self.apply(next, None, cx);

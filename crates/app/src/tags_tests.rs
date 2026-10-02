@@ -312,6 +312,45 @@ fn the_tag_editor_renames_adds_terms_and_deletes(cx: &mut TestAppContext) {
     assert_eq!(app.wired.shell.read_with(cx, |sh, _| sh.editing_tag_from), None);
 }
 
+/// An editor's release clears the shell's editing tag only if it is still its own (tag,
+/// catalog): an editor on tag N of catalog A released after an editor on tag N of catalog B
+/// (the same id) has published leaves B's publication — the tag-editor module sections —
+/// alone.
+///
+/// Mutation-checked: comparing the tag id only (as before) clears B's publication and fails
+/// this test.
+#[gpui_kit::test]
+fn a_late_editor_release_keeps_another_catalogs_tag_with_the_same_id(cx: &mut TestAppContext) {
+    let dir = TempDir::new("tags-editor-release");
+    let app = start(cx);
+    let a = open_tagged(&app, &dir, "a", cx);
+    let edit: &'static str = Box::leak(format!("tag-edit-{}", a.bergen).into_boxed_str());
+    click(&app, edit, cx);
+    let TagDialog::Editor(first) = last_dialog(&app, cx) else { panic!("the editor") };
+    let first = up(first); // held: its release runs late, when the test drops it
+    let a_from = app.wired.tags.read_with(cx, |t, _| t.guard().identity);
+    assert_eq!(app.wired.shell.read_with(cx, |sh, _| (sh.editing_tag, sh.editing_tag_from)), (Some(a.bergen), a_from));
+
+    // Catalog B, whose Bergen has the same id; the switch closes A's editor (still alive).
+    let b = open_tagged(&app, &dir, "b", cx);
+    assert_eq!(b.bergen, a.bergen, "colliding tag ids");
+    settle(&app, cx);
+    let b_from = app.wired.tags.read_with(cx, |t, _| t.guard().identity);
+    assert!(b_from.is_some() && b_from != a_from);
+    click(&app, edit, cx);
+    let TagDialog::Editor(second) = last_dialog(&app, cx) else { panic!("B's editor") };
+    let _second = up(second);
+    assert_eq!(app.wired.shell.read_with(cx, |sh, _| (sh.editing_tag, sh.editing_tag_from)), (Some(b.bergen), b_from));
+
+    drop(first);
+    settle(&app, cx);
+    assert_eq!(
+        app.wired.shell.read_with(cx, |sh, _| (sh.editing_tag, sh.editing_tag_from)),
+        (Some(b.bergen), b_from),
+        "A's editor's release leaves B's editing tag"
+    );
+}
+
 /// New tags: an indented paste under a parent previews and creates every path.
 #[gpui_kit::test]
 fn new_child_tags_create_a_pasted_hierarchy(cx: &mut TestAppContext) {

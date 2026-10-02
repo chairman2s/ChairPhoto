@@ -132,6 +132,9 @@ pub struct ObsidianState {
     pub vault: Option<String>,
     pub folder: Option<String>,
     settings_from: Option<CatalogIdentity>,
+    /// Bumped by every settings read and every committed save; a read's answer lands only
+    /// if nothing has bumped it since the read started.
+    settings_seq: u64,
     /// Bumped by every successful save (the settings view's "Saved").
     pub saves: u64,
     pub photo: Slot,
@@ -165,6 +168,7 @@ impl ObsidianState {
             vault: None,
             folder: None,
             settings_from: None,
+            settings_seq: 0,
             saves: 0,
             photo: Slot::default(),
             tag: Slot::default(),
@@ -194,6 +198,11 @@ impl ObsidianState {
             Kind::Photo => &mut self.photo,
             Kind::Tag => &mut self.tag,
         }
+    }
+
+    /// Bumped by every catalog switch (and by unloading the module).
+    pub fn generation(&self) -> u64 {
+        self.generation
     }
 
     /// Whether the settings have been read (Save needs the catalog they came from).
@@ -258,6 +267,8 @@ impl ObsidianState {
 
     pub fn reload_settings(&mut self, cx: &mut Context<Self>) {
         let (vault_key, folder_key) = (self.settings.key(ob::VAULT_KEY), self.settings.key(ob::FOLDER_KEY));
+        self.settings_seq += 1;
+        let seq = self.settings_seq;
         self.run(
             cx,
             move |app| {
@@ -265,7 +276,9 @@ impl ObsidianState {
                     Ok((c.get_setting(&vault_key)?.unwrap_or_default(), c.get_setting(&folder_key)?.unwrap_or_default()))
                 })
             },
-            |s, result, _| match result {
+            move |s, result, _| match result {
+                // A save committed (or a newer read started) after this read did.
+                _ if s.settings_seq != seq => {}
                 Ok((from, (vault, folder))) => {
                     s.settings_from = Some(from);
                     s.vault = Some(vault);
@@ -297,6 +310,9 @@ impl ObsidianState {
             },
             move |s, result, cx| match result {
                 Ok(()) => {
+                    // A reload in flight may have read the values before this save committed
+                    // and land after it, putting the old ones back: drop it.
+                    s.settings_seq += 1;
                     (s.vault, s.folder) = (Some(stored.0), Some(stored.1));
                     s.saves += 1;
                     s.status("Obsidian settings saved", cx);
@@ -369,11 +385,17 @@ impl ObsidianState {
         );
     }
 
-    /// Set the shown subject's record, if `(id, from)` is still the one shown.
+    /// Set the shown subject's record, if `(id, from)` is still the one shown — a Create or
+    /// Forget that has committed. It also bumps the slot's sequence: a re-read still in
+    /// flight (every `CatalogRead` forces one) may have read the record before that write
+    /// committed, and on a pool of workers it can land after it; its answer is stale. A
+    /// re-read started after this one reads the committed record.
     fn set_record(&mut self, kind: Kind, id: i64, from: CatalogIdentity, record: Option<NoteRecord>) {
-        if let NoteView::Ready(l) = &mut self.slot_mut(kind).view {
+        let slot = self.slot_mut(kind);
+        if let NoteView::Ready(l) = &mut slot.view {
             if l.id == id && l.from == from {
                 l.record = record;
+                slot.seq += 1;
             }
         }
     }

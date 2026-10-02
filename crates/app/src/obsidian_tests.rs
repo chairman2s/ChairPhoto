@@ -96,6 +96,18 @@ impl Ob {
         .unwrap()
     }
 
+    /// The settings panel, shown in Preferences → Obsidian.
+    fn open_settings(&self, cx: &mut TestAppContext) -> Entity<ObsidianSettings> {
+        let settings = self.settings(cx);
+        cx.update_window(self.window(), |_, window, cx| window.dispatch_action(Box::new(crate::shell::actions::OpenPreferences), cx))
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(450)); // the dialog's open animation
+        cx.run_until_parked();
+        self.click("prefs-tab-module-obsidian", cx);
+        assert!(self.present("obsidian-settings", cx), "the module's Preferences tab shows its settings");
+        settings
+    }
+
     fn select(&self, id: i64, cx: &mut TestAppContext) {
         self.app.wired.shell.update(cx, |s, cx| s.select_with(cx, |l| l.select_single(id)));
         work(&self.app, cx);
@@ -234,6 +246,81 @@ fn settings_are_validated_saved_and_bound_to_their_catalog(cx: &mut TestAppConte
     assert!(s.obsidian_settings().is_empty(), "the save reached the new catalog");
 }
 
+/// A settings reload (every `CatalogRead` starts one) that read the values before a Save
+/// committed must not put the old values back when it lands after the Save — on the state
+/// nor in the inputs.
+///
+/// Forced as in [`a_stale_reread_does_not_undo_create_or_forget`]: the Save is held while a
+/// refresh starts the reload; the Save commits and lands; the held reload then runs against
+/// the values as they were before the Save, and lands.
+///
+/// Mutation-checked: without the sequence bump in Save's landing the inputs show the old
+/// vault again and this test fails.
+#[gpui_kit::test]
+fn a_stale_settings_reload_does_not_undo_a_save(cx: &mut TestAppContext) {
+    let s = open_ob(1, "ob-settings-race", cx);
+    s.set_vault("Old");
+    s.app.wired.model.update(cx, |m, cx| m.refresh(cx));
+    work(&s.app, cx);
+    let settings = s.open_settings(cx);
+    let (vault, state) = settings.read_with(cx, |v, _| (v.vault.clone(), v.state.clone()));
+    assert_eq!(vault.read_with(cx, |i, _| i.value().to_string()), "Old");
+
+    s.set_input(&vault, "New", cx);
+    settings.update(cx, |v, cx| v.save(cx));
+    let save = hold(cx);
+    assert_eq!(save.len(), 1, "Save's job");
+    s.app.wired.model.update(cx, |m, cx| m.refresh(cx));
+    cx.run_until_parked();
+    let reload = hold(cx);
+    assert!(!reload.is_empty(), "the CatalogRead started a reload");
+    run_held(save);
+    cx.run_until_parked();
+    assert_eq!(s.setting("obsidian.vault").as_deref(), Some("New"), "Save committed");
+    // The reload, as read before the Save committed.
+    s.set_vault("Old");
+    run_held(reload);
+    s.set_vault("New");
+    cx.run_until_parked();
+    assert!(s.present("obsidian-settings", cx));
+    state.read_with(cx, |st, _| assert_eq!(st.vault.as_deref(), Some("New"), "a stale reload does not undo the Save"));
+    assert_eq!(vault.read_with(cx, |i, _| i.value().to_string()), "New", "…nor reset the input");
+    work(&s.app, cx);
+    state.read_with(cx, |st, _| assert_eq!(st.vault.as_deref(), Some("New"), "a later reload agrees"));
+}
+
+/// After a Save the fields show what was stored — trimmed — even when that equals what they
+/// showed before the edit; a refusal shown for one catalog's form is cleared by a switch.
+///
+/// Mutation-checked: not resetting `shown` on a save leaves "  Vault " in the field; not
+/// clearing the error on a new generation leaves the refusal up after the switch. Each fails
+/// this test.
+#[gpui_kit::test]
+fn the_settings_fields_follow_a_save_and_a_switch_clears_a_refusal(cx: &mut TestAppContext) {
+    let s = open_ob(1, "ob-settings-nits", cx);
+    s.set_vault("Vault");
+    s.app.wired.model.update(cx, |m, cx| m.refresh(cx));
+    work(&s.app, cx);
+    let settings = s.open_settings(cx);
+    let vault = settings.read_with(cx, |v, _| v.vault.clone());
+    assert_eq!(vault.read_with(cx, |i, _| i.value().to_string()), "Vault");
+
+    s.set_input(&vault, "  Vault ", cx);
+    s.click("obsidian-save", cx);
+    assert_eq!(status(&s.app, cx), "Obsidian settings saved");
+    assert_eq!(vault.read_with(cx, |i, _| i.value().to_string()), "Vault", "the field shows the stored, trimmed value");
+
+    s.set_input(&vault, "/home/me/Vault", cx);
+    s.click("obsidian-save", cx);
+    settings.read_with(cx, |v, _| assert!(v.error.is_some(), "a path is refused"));
+
+    let (b, _) = colliding_catalog(&s.dir, "b", 1);
+    core_switch(&s.app, b);
+    deliver_switch(&s.app, cx);
+    work(&s.app, cx);
+    settings.read_with(cx, |v, _| assert_eq!(v.error, None, "the switch cleared the refusal"));
+}
+
 // --- photo notes ----------------------------------------------------------------------------
 
 /// The inspector's "Note": without a vault, Create only says where to set one (nothing opens,
@@ -368,6 +455,184 @@ fn create_and_forget_fail_closed_after_a_switch(cx: &mut TestAppContext) {
         assert_eq!(l.uuid, b_uuid, "the panel names B's photo");
         assert_eq!(l.record, None);
     });
+}
+
+/// Run `held` Runner work (from `hold_pending`) on this thread, without letting its results
+/// land: a worker that has read and answered, whose answer the UI has not taken yet.
+fn run_held(held: Vec<Box<dyn FnOnce() + Send>>) -> usize {
+    let n = held.len();
+    for w in held {
+        w();
+    }
+    n
+}
+
+/// Hold everything queued on the Runner (work started but not yet picked up by a worker).
+fn hold(cx: &mut TestAppContext) -> Vec<Box<dyn FnOnce() + Send>> {
+    cx.update(|cx| Runner::get(cx).hold_pending())
+}
+
+/// A refresh (`CatalogRead`) while a Create, then a Forget, is in flight forces a re-read of
+/// the record. On a pool of workers that re-read can read the record before the write
+/// commits and land after the write has: its answer is stale and must not undo the write on
+/// the panel (Create offered again for a stored note, or Open for a forgotten one).
+///
+/// The test scheduler orders two ready landings at random, so the re-read's stale snapshot is
+/// forced instead: the write commits and lands first, then the held re-read runs against the
+/// catalog as it was before the write (the key put back as it was), then lands.
+///
+/// Mutation-checked: without the sequence bump in `set_record` the panel shows "Create note"
+/// after Create and this test fails; bumping only when a record is set (Create, not Forget)
+/// fails the Forget half.
+#[gpui_kit::test]
+fn a_stale_reread_does_not_undo_create_or_forget(cx: &mut TestAppContext) {
+    let s = open_ob(1, "ob-reread", cx);
+    let p = s.ids[0];
+    s.set_vault("V");
+    s.select(p, cx);
+    let state = s.state(cx);
+    let key = format!("obsidian.note.{}", with_cat(&s.app, |c| c.get_photo(p).unwrap().uuid));
+    let set_raw = |value: Option<&str>| {
+        with_cat(&s.app, |c| match value {
+            Some(v) => c.set_setting(&key, v).unwrap(),
+            None => {
+                c.conn().execute("DELETE FROM settings WHERE key = ?1", [&key]).unwrap();
+            }
+        })
+    };
+
+    // Create starts; a refresh then forces a re-read of the record while Create is held.
+    state.update(cx, |st, cx| st.create(Kind::Photo, cx));
+    let create = hold(cx);
+    assert_eq!(create.len(), 1, "Create's job");
+    s.app.wired.model.update(cx, |m, cx| m.refresh(cx));
+    cx.run_until_parked();
+    let reread = hold(cx);
+    assert!(!reread.is_empty(), "the CatalogRead forced a re-read");
+    // Create commits and lands.
+    run_held(create);
+    cx.run_until_parked();
+    assert!(s.present("obsidian-open", cx), "Create landed");
+    // The re-read, as read before Create committed (no record), lands after it.
+    let stored = s.setting(&key).expect("Create's record");
+    set_raw(None);
+    run_held(reread);
+    set_raw(Some(&stored));
+    cx.run_until_parked();
+    assert!(s.present("obsidian-open", cx), "a stale re-read does not take back Create's record");
+    state.read_with(cx, |st, _| assert!(st.photo.linked().unwrap().record.is_some()));
+
+    // Forget, the same way: the re-read read the record before Forget blanked it.
+    state.update(cx, |st, cx| st.forget(Kind::Photo, cx));
+    let forget = hold(cx);
+    assert_eq!(forget.len(), 1, "Forget's job");
+    s.app.wired.model.update(cx, |m, cx| m.refresh(cx));
+    cx.run_until_parked();
+    let reread = hold(cx);
+    assert!(!reread.is_empty(), "the CatalogRead forced a re-read");
+    run_held(forget);
+    cx.run_until_parked();
+    assert!(s.present("obsidian-create", cx), "Forget landed");
+    set_raw(Some(&stored));
+    run_held(reread);
+    set_raw(Some(""));
+    cx.run_until_parked();
+    assert!(s.present("obsidian-create", cx), "a stale re-read does not bring back a forgotten record");
+    state.read_with(cx, |st, _| assert!(st.photo.linked().unwrap().record.is_none()));
+    work(&s.app, cx);
+    assert!(s.present("obsidian-create", cx), "a later re-read agrees");
+}
+
+/// A tag with a note in catalog A, shown in its open tag editor (the record read, "Open
+/// note"). Returns the tag's id and uuid.
+fn tag_with_note(s: &Ob, cx: &mut TestAppContext) -> (i64, String) {
+    s.set_vault("A");
+    let tag_id = with_cat(&s.app, |c| c.create_tag("Places/Here").unwrap());
+    s.app.wired.model.update(cx, |m, cx| m.refresh(cx));
+    work(&s.app, cx);
+    s.edit_tag(tag_id, cx);
+    s.click("obsidian-tag-create", cx);
+    assert!(s.present("obsidian-tag-open", cx), "the tag's note is shown");
+    (tag_id, with_cat(&s.app, |c| c.get_tag(tag_id).unwrap().uuid))
+}
+
+fn has_dialog(s: &Ob, cx: &mut TestAppContext) -> bool {
+    cx.update_window(s.window(), |_, window, cx| gpui_kit::component::WindowExt::has_active_dialog(window, cx)).unwrap()
+}
+
+/// `catalog:switched` delivered while the tag editor shows a tag's note — to a catalog whose
+/// tag has the same id: the editor closes, the shell names no tag and the Tag slot is empty
+/// at once (nothing of A's tag stays on screen), and stays empty after B is read.
+///
+/// Mutation-checked: the editor kept open on a switch (`bind_dialog` not closing it) fails
+/// this test; so does keeping the Tag slot on a switch (no reset in `catalog_switched` nor in
+/// `follow_kind`'s "no subject" branch).
+#[gpui_kit::test]
+fn a_delivered_switch_closes_the_tag_editor_and_empties_the_tag_note(cx: &mut TestAppContext) {
+    let s = open_ob(1, "ob-tag-switched", cx);
+    let (tag_id, _) = tag_with_note(&s, cx);
+    let state = s.state(cx);
+    let (b, _) = colliding_catalog(&s.dir, "b", 1);
+    assert_eq!(b.create_tag("Other/There").unwrap(), tag_id, "colliding tag ids");
+    b.set_setting(&ob_setting("vault"), "B").unwrap();
+    core_switch(&s.app, b);
+    s.app.state.send(CoreEvent::CatalogSwitched("switched.chairphoto".into()));
+    cx.run_until_parked();
+    state.read_with(cx, |st, _| assert_eq!(st.slot(Kind::Tag).view, NoteView::None, "the Tag slot is empty at once"));
+    s.app.wired.shell.read_with(cx, |sh, _| assert_eq!((sh.editing_tag, sh.editing_tag_from), (None, None)));
+    work(&s.app, cx);
+    assert!(!has_dialog(&s, cx), "the tag editor closed");
+    state.read_with(cx, |st, _| assert_eq!(st.slot(Kind::Tag).view, NoteView::None, "…and stays empty once B is read"));
+    assert!(!s.present("obsidian-tag-panel", cx));
+}
+
+/// Closing the tag editor (no switch) empties the Tag slot: the module stops showing, and
+/// stops acting on, the closed editor's tag.
+///
+/// Mutation-checked: a `follow_kind` that keeps the slot when its subject goes away fails it.
+#[gpui_kit::test]
+fn closing_the_tag_editor_empties_the_tag_note(cx: &mut TestAppContext) {
+    let s = open_ob(1, "ob-tag-close", cx);
+    tag_with_note(&s, cx);
+    let state = s.state(cx);
+    state.read_with(cx, |st, _| assert!(st.slot(Kind::Tag).linked().is_some_and(|l| l.record.is_some())));
+    cx.update_window(s.window(), |_, window, cx| gpui_kit::component::WindowExt::close_dialog(window, cx)).unwrap();
+    work(&s.app, cx);
+    assert!(!has_dialog(&s, cx), "the tag editor closed");
+    s.app.wired.shell.read_with(cx, |sh, _| assert_eq!((sh.editing_tag, sh.editing_tag_from), (None, None)));
+    state.read_with(cx, |st, _| assert_eq!(st.slot(Kind::Tag).view, NoteView::None, "the Tag slot is empty"));
+}
+
+/// A Create still queued when a catalog switch lands (the new catalog published and
+/// `catalog:switched` delivered) runs against the new catalog, whose photo has the same id:
+/// it is refused — nothing opens, nothing is written to either catalog.
+///
+/// Mutation-checked: running Create under `with_catalog` (whatever is open) instead of
+/// `with_catalog_as` writes B's record and opens a URI, failing this test.
+#[gpui_kit::test]
+fn a_create_in_flight_across_a_switch_neither_opens_nor_writes_the_new_catalog(cx: &mut TestAppContext) {
+    let s = open_ob(1, "ob-create-switch", cx);
+    let p = s.ids[0];
+    s.set_vault("A");
+    s.select(p, cx);
+    let state = s.state(cx);
+    let a_uuid = with_cat(&s.app, |c| c.get_photo(p).unwrap().uuid);
+
+    state.update(cx, |st, cx| st.create(Kind::Photo, cx));
+    let create = hold(cx);
+    assert_eq!(create.len(), 1, "Create's job");
+    let (b, b_ids) = colliding_catalog(&s.dir, "b", 1);
+    assert_eq!(b_ids[0], p, "colliding photo ids");
+    b.set_setting(&ob_setting("vault"), "B").unwrap();
+    core_switch(&s.app, b);
+    deliver_switch(&s.app, cx);
+    cx.update(|cx| Runner::get(cx).release(create));
+    work(&s.app, cx);
+    assert_eq!(cx.opened_url(), None, "nothing opens");
+    assert_eq!(s.obsidian_settings(), vec![("obsidian.vault".to_string(), "B".to_string())], "B got no record");
+    assert!(status(&s.app, cx).contains(CATALOG_CHANGED), "{}", status(&s.app, cx));
+    state.read_with(cx, |st, _| assert!(!st.photo.creating));
+    assert_eq!(reopen_a(&s.dir).get_setting(&ob_setting(&format!("note.{a_uuid}"))).unwrap(), None, "A got no record");
 }
 
 /// Catalog A ([`open_catalog_with_photos`]'s file), reopened after a switch away from it, to

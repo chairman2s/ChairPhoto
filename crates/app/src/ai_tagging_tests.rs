@@ -15,10 +15,11 @@ use crate::modules::ai_tagging::AI_MODULE_ID;
 use crate::modules::{ModuleRegistry, PanelSlot};
 use crate::shell::state::InspectorTab;
 use crate::storage::Runner;
-use chairphoto_core::app::ai::{AiSuggestion, GroupedDispatchResult, Region};
+use chairphoto_core::app::ai::{self as core_ai, AiSuggestion, Confirmed, GroupedDispatchResult, Region};
 use chairphoto_core::app::{CatalogIdentity, CATALOG_CHANGED};
 use chairphoto_core::plugins::ai as plugin_ai;
 use gpui_kit::SharedString;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 type SuggestCall = (CatalogIdentity, i64, Option<String>, Option<Region>);
@@ -38,6 +39,7 @@ impl AiBackend for FakeAi {
         &self,
         _: &AppState,
         from: CatalogIdentity,
+        _: Confirmed,
         photo: i64,
         question: Option<String>,
         region: Option<Region>,
@@ -46,10 +48,17 @@ impl AiBackend for FakeAi {
         Ok(self.answer.lock().unwrap().clone())
     }
 
-    fn suggest_grouped(&self, _: &AppState, from: CatalogIdentity, photos: Vec<i64>) -> Result<GroupedDispatchResult, String> {
+    fn suggest_grouped(
+        &self,
+        _: &AppState,
+        from: CatalogIdentity,
+        _: Confirmed,
+        photos: Vec<i64>,
+        _: Arc<AtomicBool>,
+    ) -> Result<GroupedDispatchResult, String> {
         let n = photos.len();
         self.grouped.lock().unwrap().push((from, photos));
-        Ok(GroupedDispatchResult { total: n, representatives: 1, dispatched: 1, propagated: n })
+        Ok(GroupedDispatchResult { total: n, representatives: 1, dispatched: 1, propagated: n, cancelled: false })
     }
 
     fn ollama_models(&self, url: &str) -> Result<Vec<String>, String> {
@@ -61,6 +70,69 @@ impl AiBackend for FakeAi {
 impl FakeAi {
     fn sent(&self) -> usize {
         self.suggests.lock().unwrap().len() + self.grouped.lock().unwrap().len()
+    }
+}
+
+/// The provider under the real core bodies, counted: no preview is read from disk and nothing
+/// is sent. Each call records the engine it was asked to send with.
+#[derive(Default)]
+struct CountingProvider {
+    calls: Mutex<Vec<String>>,
+    /// Each grouped run's cancel flag, as the module handed it over.
+    flags: Mutex<Vec<Arc<AtomicBool>>>,
+}
+
+impl core_ai::Provider for CountingProvider {
+    fn image(&self, _: &std::path::Path, _: Option<Region>) -> Result<String, String> {
+        Ok("aW1n".into())
+    }
+
+    async fn suggest(
+        &self,
+        config: &plugin_ai::Config,
+        _: &str,
+        _: &str,
+        _: &[String],
+        _: Option<&str>,
+    ) -> Result<Vec<plugin_ai::Raw>, String> {
+        self.calls.lock().unwrap().push(format!("{}/{}", config.provider, config.model()));
+        Ok(Vec::new())
+    }
+}
+
+/// The real core run bodies (settings read, consent check, clustering, storing) over a
+/// [`CountingProvider`].
+struct ViaCore(Arc<CountingProvider>);
+
+impl AiBackend for ViaCore {
+    fn suggest(
+        &self,
+        app: &AppState,
+        from: CatalogIdentity,
+        confirmed: Confirmed,
+        photo: i64,
+        question: Option<String>,
+        region: Option<Region>,
+    ) -> Result<Vec<AiSuggestion>, String> {
+        let run = core_ai::suggest_tags_via(app, Some(from), Some(confirmed), photo, question, region, self.0.clone());
+        chairphoto_core::app::runtime().block_on(run)
+    }
+
+    fn suggest_grouped(
+        &self,
+        app: &AppState,
+        from: CatalogIdentity,
+        confirmed: Confirmed,
+        photos: Vec<i64>,
+        cancel: Arc<AtomicBool>,
+    ) -> Result<GroupedDispatchResult, String> {
+        self.0.flags.lock().unwrap().push(cancel.clone());
+        let run = core_ai::suggest_tags_grouped_via(app, Some(from), Some(confirmed), photos, &cancel, self.0.clone());
+        chairphoto_core::app::runtime().block_on(run)
+    }
+
+    fn ollama_models(&self, _: &str) -> Result<Vec<String>, String> {
+        Ok(Vec::new())
     }
 }
 
@@ -288,6 +360,50 @@ fn no_photo_reaches_a_cloud_engine_without_its_key(cx: &mut TestAppContext) {
     assert_eq!(a.fake.suggests.lock().unwrap().len(), 1);
 }
 
+/// An Ollama URL that is not a loopback literal is remote: neither Suggest nor a batch reaches
+/// the provider side until the user allows that server in the settings (which saves its URL as
+/// `ai.ollama_remote_url`); the settings say photos leave the machine. Pointing the URL at
+/// another host needs a new opt-in. Loopback Ollama needs none (the test above).
+///
+/// Mutation-checked: `Stored::opt_in` always Ok makes the first `sent() == 0` fail.
+#[gpui_kit::test]
+fn a_remote_ollama_gets_nothing_until_allowed(cx: &mut TestAppContext) {
+    let remote = "http://192.168.1.20:11434";
+    let a = open_ai(3, &[("ollama_url", remote)], "ai-remote-ollama", cx);
+    a.select(a.ids[0], cx);
+    a.click("ai-suggest", cx);
+    assert_eq!(a.fake.sent(), 0, "a photo went to an Ollama server elsewhere without its opt-in");
+    let state = a.state(cx);
+    state.read_with(cx, |s, _| assert!(s.error.as_deref().unwrap().contains("not on this machine")));
+    a.select_all(cx);
+    a.click("ai-batch", cx);
+    assert_eq!(a.fake.sent(), 0, "a batch went to an Ollama server elsewhere without its opt-in");
+
+    // Preferences: the server is flagged remote; allowing it saves its URL.
+    cx.update_window(a.window(), |_, window, cx| window.dispatch_action(Box::new(crate::shell::actions::OpenPreferences), cx))
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(450)); // the dialog's open animation
+    cx.run_until_parked();
+    a.click("prefs-tab-module-ai", cx);
+    assert!(a.present("ai-remote-note", cx), "the settings say photos leave the machine");
+    a.click("ai-set-ollama-remote", cx);
+    a.click("ai-set-save", cx);
+    with_cat(&a.app, |c| assert_eq!(c.get_setting("ai.ollama_remote_url").unwrap().as_deref(), Some(remote)));
+    // (Preferences is still open over the panel: run as its Suggest button does.)
+    a.select(a.ids[0], cx);
+    state.update(cx, |s, cx| s.run(None, false, cx));
+    work(&a.app, cx);
+    state.read_with(cx, |s, _| assert_eq!(s.error, None));
+    assert_eq!(a.fake.suggests.lock().unwrap().len(), 1, "allowed, the server is asked");
+
+    // Another host is another opt-in.
+    state.update(cx, |s, cx| s.save(vec![("ollama_url", "http://192.168.1.21:11434".into())], cx));
+    work(&a.app, cx);
+    state.update(cx, |s, cx| s.run(None, false, cx));
+    work(&a.app, cx);
+    assert_eq!(a.fake.suggests.lock().unwrap().len(), 1, "the opt-in carried to another server");
+}
+
 // --- the bulk cloud confirm ---------------------------------------------------------------
 
 /// A cloud batch of several photos waits for Proceed: the estimate (per burst
@@ -343,6 +459,118 @@ fn a_cloud_batch_waits_for_the_cost_confirm(cx: &mut TestAppContext) {
     work(&a.app, cx);
     a.click("ai-batch", cx);
     assert_eq!(a.fake.grouped.lock().unwrap().len(), 2, "a local batch runs at once");
+}
+
+/// Give every photo an original on disk, so a run gets as far as its provider (the
+/// [`CountingProvider`] never reads it).
+fn reachable(a: &Ai) {
+    for i in 0..a.ids.len() {
+        let p = a.dir.0.join(format!("photos/2026/p{i}.ARW"));
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, b"raw").unwrap();
+    }
+}
+
+/// A settings save that lands in the catalog between the user's consent and the run — the
+/// confirm's Proceed, or Suggest — sends nothing: the run carries the engine the user saw, and
+/// the core refuses because the catalog now names another (#126 review).
+///
+/// Forced interleaving: the save's catalog write runs on the manual runner, and Proceed /
+/// Suggest are clicked before its answer reaches `AiState` (so the module's own checks still
+/// see the old engine). Mutation-checked: dropping `admit` from the core's grouped body makes
+/// the first `calls` assertion fail (the batch goes to the unconfirmed model).
+#[gpui_kit::test]
+fn a_save_in_the_consent_window_sends_nothing(cx: &mut TestAppContext) {
+    let a = open_ai(3, &[("provider", "claude"), ("cloud_api_key", "sk-test-not-real")], "ai-consent-window", cx);
+    let provider = Arc::new(CountingProvider::default());
+    cx.update(|cx| cx.set_global(AiBackendGlobal(Arc::new(ViaCore(provider.clone())))));
+    reachable(&a);
+    let state = a.state(cx);
+    a.select(a.ids[0], cx);
+    a.select_all(cx);
+    a.click("ai-batch", cx);
+    state.read_with(cx, |s, _| assert_eq!(s.confirm.as_ref().expect("the confirm is open").model, "claude-sonnet-4-6"));
+
+    // Preferences saves another model: its write lands, its answer has not reached the module.
+    state.update(cx, |s, cx| s.save(vec![("cloud_model", "claude-opus-4-8".into())], cx));
+    assert_eq!(cx.update(|cx| Runner::get(cx).run_pending()), 1, "the save's write ran");
+    with_cat(&a.app, |c| assert_eq!(c.get_setting("ai.cloud_model").unwrap().as_deref(), Some("claude-opus-4-8")));
+    state.update(cx, |s, cx| s.proceed(cx));
+    work(&a.app, cx);
+    assert!(provider.calls.lock().unwrap().is_empty(), "the batch went to a model the user did not confirm");
+    state.read_with(cx, |s, _| assert_eq!(s.error.as_deref(), Some(core_ai::ENGINE_CHANGED)));
+
+    // The same for one photo: Suggest asked with Claude, the catalog now says Ollama.
+    a.select(a.ids[0], cx);
+    state.update(cx, |s, cx| s.save(vec![("provider", "ollama".into())], cx));
+    assert_eq!(cx.update(|cx| Runner::get(cx).run_pending()), 1);
+    state.update(cx, |s, cx| s.run(None, false, cx));
+    work(&a.app, cx);
+    assert!(provider.calls.lock().unwrap().is_empty(), "the photo went to an engine the user did not ask");
+    state.read_with(cx, |s, _| assert_eq!(s.error.as_deref(), Some(core_ai::ENGINE_CHANGED)));
+
+    // Asked again, with the engine now shown, it sends — with exactly that engine.
+    a.click("ai-suggest", cx);
+    assert_eq!(*provider.calls.lock().unwrap(), vec!["ollama/llava:latest".to_string()]);
+}
+
+/// A running batch stops sending at Cancel, at disabling the module and at a catalog switch
+/// (#126 review): the run is started (its job queued on the manual runner, so no
+/// representative has gone yet), then stopped, then let run — over the real core body with a
+/// counting provider and three photos hours apart (three representatives).
+///
+/// Mutation-checked: dropping `stop_batch` from `cancel_batch` makes three calls after Cancel;
+/// from `unload`, three after disabling; from `catalog_switched`, the flag stays clear.
+#[gpui_kit::test]
+fn a_grouped_run_stops_at_cancel_disable_and_switch(cx: &mut TestAppContext) {
+    let a = open_ai(3, &[], "ai-batch-cancel", cx);
+    reachable(&a);
+    with_cat(&a.app, |c| {
+        for (i, id) in a.ids.iter().enumerate() {
+            let t = format!("2026-05-01T{:02}:00:00", 8 + 4 * i);
+            c.conn().execute("UPDATE photos SET capture_time = ?1 WHERE id = ?2", (t.as_str(), *id)).unwrap();
+        }
+    });
+    let provider = Arc::new(CountingProvider::default());
+    cx.update(|cx| cx.set_global(AiBackendGlobal(Arc::new(ViaCore(provider.clone())))));
+    a.select(a.ids[0], cx);
+    a.select_all(cx);
+    let state = a.state(cx);
+
+    // Cancel: the panel offers it while the batch runs.
+    state.update(cx, |s, cx| s.run_batch(cx));
+    assert!(a.present("ai-batch-cancel", cx), "a running batch offers Cancel");
+    a.click("ai-batch-cancel", cx);
+    assert!(provider.calls.lock().unwrap().is_empty(), "a representative was sent after Cancel");
+    assert_eq!(provider.flags.lock().unwrap().len(), 1, "the batch ran");
+    assert_eq!(a.label("ai-batch-msg", cx).as_deref(), Some("Cancelled — 0 of 3 representatives sent, 0 suggestions stored."));
+    assert!(!a.present("ai-batch-cancel", cx), "Cancel goes with the run");
+
+    // Not cancelled, the same batch sends every representative.
+    state.update(cx, |s, cx| s.run_batch(cx));
+    work(&a.app, cx);
+    assert_eq!(provider.calls.lock().unwrap().len(), 3);
+
+    // Disabling the module stops it.
+    state.update(cx, |s, cx| s.run_batch(cx));
+    cx.update(|cx| ModuleRegistry::disable(&a.app.wired.modules, AI_MODULE_ID, cx));
+    work(&a.app, cx);
+    assert_eq!(provider.flags.lock().unwrap().len(), 3);
+    assert_eq!(provider.calls.lock().unwrap().len(), 3, "a representative was sent after the module was disabled");
+
+    // A catalog switch stops it (its flag is set before the old run can send again).
+    cx.update(|cx| ModuleRegistry::enable(&a.app.wired.modules, AI_MODULE_ID, cx));
+    work(&a.app, cx);
+    let state = a.state(cx);
+    state.update(cx, |s, cx| s.run_batch(cx));
+    assert_eq!(cx.update(|cx| Runner::get(cx).pending()), 1, "the batch is queued");
+    let (b, _) = colliding_catalog(&a.dir, "b", 3);
+    core_switch(&a.app, b);
+    deliver_switch(&a.app, cx);
+    work(&a.app, cx);
+    assert_eq!(provider.flags.lock().unwrap().len(), 4, "the queued batch ran");
+    assert!(provider.flags.lock().unwrap()[3].load(Ordering::SeqCst), "the switch left the batch running");
+    assert_eq!(provider.calls.lock().unwrap().len(), 3);
 }
 
 /// The confirm's answer is bound to the catalog it priced: after a switch it closes, and a

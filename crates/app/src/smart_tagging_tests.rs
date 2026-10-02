@@ -423,6 +423,55 @@ fn suggest_accept_reject_and_identity(cx: &mut TestAppContext) {
     });
 }
 
+/// A Suggest that finishes after the user moved to another photo stores its rows for the photo
+/// it ran on but does not replace the shown photo's list (#126 review).
+///
+/// Forced interleaving: the Suggest job is held on the manual runner while the next photo's
+/// list loads and lands, then released. Mutation-checked: dropping the shown-photo check in
+/// `SmarttagsState::suggest` makes the panel show photo 1's list on photo 2.
+#[gpui_kit::test]
+fn a_suggest_for_a_photo_no_longer_shown_is_dropped(cx: &mut TestAppContext) {
+    let s = open_st(3, true, "st-sug-nav", cx);
+    with_cat(&s.app, |c| {
+        store::ensure_schema(c.conn()).unwrap();
+        let mut v = vec![0.0f32; 512];
+        v[0] = 1.0;
+        for id in &s.ids {
+            store::upsert_embedding(c.conn(), *id, &store::embedding_to_blob(&v)).unwrap();
+        }
+        let gull = c.create_tag("Animals/Gull").unwrap();
+        for id in &s.ids[2..] {
+            c.assign_tag(*id, gull).unwrap();
+        }
+    });
+    let (p0, p1) = (s.ids[0], s.ids[1]);
+    s.select(p0, cx);
+    // Click Suggest, but hold its job: it has not run when the user moves on.
+    cx.update_window(s.window(), |_, window, cx| {
+        window.render_frame(cx);
+        window.click(SharedString::from("smarttags-suggest"), cx);
+    })
+    .unwrap();
+    let held = cx.update(|cx| Runner::get(cx).hold_pending());
+    assert_eq!(held.len(), 1, "the Suggest job is queued");
+    s.select(p1, cx);
+    let state = s.state(cx);
+    state.read_with(cx, |st, _| assert_eq!(st.suggestions().map(|p| p.photo_id), Some(p1)));
+
+    cx.update(|cx| Runner::get(cx).release(held));
+    work(&s.app, cx);
+    state.read_with(cx, |st, _| {
+        assert!(!st.suggesting, "the Suggest ended");
+        let shown = st.suggestions().expect("photo 2's list");
+        assert_eq!(shown.photo_id, p1, "photo 1's Suggest replaced the shown photo's list");
+        assert!(shown.list.is_empty(), "photo 2 has no suggestions of its own");
+    });
+    assert!(!s.present("smarttags-sug-Animals_Gull", cx));
+    // Photo 1's rows were stored: going back shows them.
+    s.select(p0, cx);
+    assert!(s.present("smarttags-sug-Animals_Gull", cx), "the Suggest's rows are photo 1's");
+}
+
 // --- settings -------------------------------------------------------------------------------
 
 /// The model path saves into its catalog (and the model is checked again); training reports

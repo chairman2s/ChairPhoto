@@ -6,10 +6,13 @@
 //! this build" without the feature); everything that runs a provider is behind `ai`.
 //!
 //! **Privacy.** Which provider runs is the catalog's `ai.provider` setting — `ollama` (local,
-//! the default) or a cloud provider the user chose, whose own API key must be saved. These
-//! bodies do what the settings say; the per-run consent a front end owes the user (the bulk
-//! cloud cost confirm) is the front end's, before it calls [`suggest_tags_grouped`]. Private
-//! tags are withheld from cloud providers (`plugins::ai::taxonomy_text`). Nothing here logs
+//! the default) or a cloud provider the user chose, whose own API key must be saved. The
+//! per-run consent a front end owes the user (the bulk cloud cost confirm) is the front end's;
+//! it passes the engine the user consented to as a [`Confirmed`], and a run refuses before any
+//! preview is read when the settings name another provider or model, or when that engine is
+//! not opted into (a cloud provider without its key; an Ollama server that is not on this
+//! machine — `plugins::ai::is_loopback_url` — without its URL allowed). Private tags are
+//! withheld from every remote engine (`plugins::ai::taxonomy_text`). Nothing here logs
 //! the configuration (it holds the API keys).
 //!
 //! **Catalog identity.** Every body takes an optional [`CatalogIdentity`]: with one, each of
@@ -83,6 +86,8 @@ pub struct GroupedDispatchResult {
     pub dispatched: usize,
     /// Pending suggestions stored across all cluster members (direct + propagated).
     pub propagated: usize,
+    /// The run was cancelled: the representatives after the one in flight were not sent.
+    pub cancelled: bool,
 }
 
 /// `f` under the catalog lock — bound to `expected` when given (`with_catalog_as`).
@@ -243,30 +248,115 @@ pub fn store_direct(
     load_suggestions(c, photo_id)
 }
 
+/// The engine the user consented to send with — the provider and model a front end showed
+/// when the user asked (Suggest) or confirmed (the bulk cost confirm's Proceed). A run given
+/// one compares it with the settings it reads in its first catalog phase and refuses on any
+/// difference, before a preview is read: a settings save that lands between the consent and
+/// the run cannot redirect photos to an engine (or a price) the user did not see.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Confirmed {
+    pub provider: String,
+    pub model: String,
+}
+
+/// The refusal when the settings no longer match the [`Confirmed`] engine.
+pub const ENGINE_CHANGED: &str = "The AI engine or model changed since you asked — nothing was sent; try again.";
+
+/// Whether a run with `config` may send: it must be the engine the user confirmed (when the
+/// front end passed one), and that engine must be opted into ([`ai::Config::opt_in`]: a cloud
+/// provider's saved key, or the allowed URL of an Ollama server not on this machine).
+#[cfg(feature = "ai")]
+pub fn admit(config: &ai::Config, confirmed: Option<&Confirmed>) -> Result<(), String> {
+    match confirmed {
+        Some(c) if c.provider != config.provider || c.model != config.model() => Err(ENGINE_CHANGED.to_string()),
+        _ => config.opt_in(),
+    }
+}
+
+/// Where a run's photo goes: reading its preview and asking the provider. [`Network`] is the
+/// real one; tests pass a fake that counts calls and sends nothing.
+#[cfg(feature = "ai")]
+pub trait Provider: Send + Sync + 'static {
+    /// The preview a provider is sent, base64 JPEG, cropped to `region`. Blocking.
+    fn image(&self, path: &std::path::Path, region: Option<Region>) -> Result<String, String>;
+    /// One provider call.
+    fn suggest(
+        &self,
+        config: &ai::Config,
+        image: &str,
+        taxonomy: &str,
+        rejected: &[String],
+        question: Option<&str>,
+    ) -> impl std::future::Future<Output = Result<Vec<ai::Raw>, String>> + Send;
+}
+
+/// The configured provider over the network ([`ai::suggest`]), on the photo's preview.
+#[cfg(feature = "ai")]
+pub struct Network;
+
+#[cfg(feature = "ai")]
+impl Provider for Network {
+    fn image(&self, path: &std::path::Path, region: Option<Region>) -> Result<String, String> {
+        image_b64(path, region)
+    }
+
+    async fn suggest(
+        &self,
+        config: &ai::Config,
+        image: &str,
+        taxonomy: &str,
+        rejected: &[String],
+        question: Option<&str>,
+    ) -> Result<Vec<ai::Raw>, String> {
+        ai::suggest(config, image, taxonomy, rejected, question).await
+    }
+}
+
 /// Suggest tags for one photo with the configured provider and persist them
 /// (`ai_suggest_tags`): honours per-photo rejections, "existing tags only" and the confidence
 /// floor. With `region`, only that box of the photo is sent; with `question`, the model
-/// refines toward the user's follow-up. Returns the photo's pending set.
+/// refines toward the user's follow-up. With `confirmed`, refuses ([`ENGINE_CHANGED`]) unless
+/// the settings name that engine. Returns the photo's pending set.
 #[cfg(feature = "ai")]
 pub async fn suggest_tags(
     state: &AppState,
     expected: Option<CatalogIdentity>,
+    confirmed: Option<Confirmed>,
     photo_id: i64,
     question: Option<String>,
     region: Option<Region>,
 ) -> Result<Vec<AiSuggestion>, String> {
-    // Inputs under the lock; released for the decode and the network call.
+    suggest_tags_via(state, expected, confirmed, photo_id, question, region, std::sync::Arc::new(Network)).await
+}
+
+/// [`suggest_tags`] through `provider`.
+#[cfg(feature = "ai")]
+pub async fn suggest_tags_via<P: Provider>(
+    state: &AppState,
+    expected: Option<CatalogIdentity>,
+    confirmed: Option<Confirmed>,
+    photo_id: i64,
+    question: Option<String>,
+    region: Option<Region>,
+    provider: std::sync::Arc<P>,
+) -> Result<Vec<AiSuggestion>, String> {
+    // Inputs under the lock; released for the decode and the network call. The settings are
+    // read once: the run sends with exactly the config it admitted.
     let (config, image_path, taxonomy, rejected) = bound_blocking(state, expected, move |c| {
         ai::ensure_schema(c.conn())?;
         let config = ai::read_config(c)?;
         // Private tags (people's names etc.) are withheld from cloud providers.
         let taxonomy = ai::taxonomy_text(c, config.is_local())?;
-        Ok((config, c.require_photo_path(photo_id)?, taxonomy, ai::rejected_paths(c.conn(), photo_id)?))
+        // The path's error waits for `admit`: an unconfirmed engine is the refusal shown.
+        Ok((config, c.require_photo_path(photo_id).map_err(|e| e.to_string()), taxonomy, ai::rejected_paths(c.conn(), photo_id)?))
     })
     .await?;
+    admit(&config, confirmed.as_ref())?;
+    let image_path = image_path?;
 
-    let image = spawn_blocking(move || image_b64(&image_path, region)).await.map_err(|e| e.to_string())??;
-    let raw = ai::suggest(&config, &image, &taxonomy, &rejected, question.as_deref()).await?;
+    let p = provider.clone();
+    let image = spawn_blocking(move || p.image(&image_path, region)).await.map_err(|e| e.to_string())??;
+    let raw = provider.suggest(&config, &image, &taxonomy, &rejected, question.as_deref()).await?;
 
     bound_blocking(state, expected, move |c| store_direct(c, photo_id, &config, &rejected, &raw)).await
 }
@@ -325,22 +415,46 @@ pub fn grouped_estimate(
 /// GPU), and store its suggestions for every member as `pending`: directly on the
 /// representative, **propagated** (with its `source_photo_id`, at slightly reduced
 /// confidence) on the rest. A later direct run on a member supersedes its propagated rows.
+/// With `confirmed`, refuses ([`ENGINE_CHANGED`]) before any preview is read unless the
+/// settings name that engine.
 ///
 /// A representative whose photo or preview is gone, or whose provider call fails, leaves its
 /// cluster untouched. No progress is reported: the caller awaits it behind a busy flag
 /// (restoring progress means the full job treatment, not a bare emit — #12).
+///
+/// **Cancel.** `cancel` is checked before each representative's preview is read and again
+/// just before it is sent: once set, no further photo goes to the provider (the one already
+/// in flight finishes and is stored) and the result says `cancelled`. A catalog switch stops
+/// the run the same way (the next phase fails [`super::CATALOG_CHANGED`]).
 #[cfg(feature = "ai")]
 pub async fn suggest_tags_grouped(
     state: &AppState,
     expected: Option<CatalogIdentity>,
+    confirmed: Option<Confirmed>,
     photo_ids: Vec<i64>,
+    cancel: &std::sync::atomic::AtomicBool,
 ) -> Result<GroupedDispatchResult, String> {
+    suggest_tags_grouped_via(state, expected, confirmed, photo_ids, cancel, std::sync::Arc::new(Network)).await
+}
+
+/// [`suggest_tags_grouped`] through `provider`.
+#[cfg(feature = "ai")]
+pub async fn suggest_tags_grouped_via<P: Provider>(
+    state: &AppState,
+    expected: Option<CatalogIdentity>,
+    confirmed: Option<Confirmed>,
+    photo_ids: Vec<i64>,
+    cancel: &std::sync::atomic::AtomicBool,
+    provider: std::sync::Arc<P>,
+) -> Result<GroupedDispatchResult, String> {
+    let cancelled = || cancel.load(std::sync::atomic::Ordering::SeqCst);
     let st = state.clone();
     let clusters = spawn_blocking(move || cluster_photo_ids(&st, expected, photo_ids)).await.map_err(|e| e.to_string())??;
     let total: usize = clusters.iter().map(|c| c.photo_ids.len()).sum();
     let representatives = clusters.len();
 
-    // Config + taxonomy are stable across the run; read once.
+    // Config + taxonomy are stable across the run; read once, and admitted once: every
+    // representative goes with exactly this config.
     let (config, taxonomy) = bound_blocking(state, expected, |c| {
         ai::ensure_schema(c.conn())?;
         let config = ai::read_config(c)?;
@@ -348,10 +462,14 @@ pub async fn suggest_tags_grouped(
         Ok((config, taxonomy))
     })
     .await?;
+    admit(&config, confirmed.as_ref())?;
     let config = std::sync::Arc::new(config);
 
     let (mut dispatched, mut propagated) = (0usize, 0usize);
     for cluster in clusters {
+        if cancelled() {
+            return Ok(GroupedDispatchResult { total, representatives, dispatched, propagated, cancelled: true });
+        }
         let rep_id = cluster.representative_id();
         let prep = bound_blocking(state, expected, move |c| Ok((c.require_photo_path(rep_id)?, ai::rejected_paths(c.conn(), rep_id)?))).await;
         let (image_path, rejected) = match prep {
@@ -360,11 +478,16 @@ pub async fn suggest_tags_grouped(
             Err(e) if e == super::CATALOG_CHANGED => return Err(e),
             Err(_) => continue,
         };
-        let image = match spawn_blocking(move || image_b64(&image_path, None)).await.map_err(|e| e.to_string())? {
+        let p = provider.clone();
+        let image = match spawn_blocking(move || p.image(&image_path, None)).await.map_err(|e| e.to_string())? {
             Ok(b) => b,
             Err(_) => continue,
         };
-        let raw = match ai::suggest(&config, &image, &taxonomy, &rejected, None).await {
+        // The preview read can take a while: a Cancel meanwhile still stops this one.
+        if cancelled() {
+            return Ok(GroupedDispatchResult { total, representatives, dispatched, propagated, cancelled: true });
+        }
+        let raw = match provider.suggest(&config, &image, &taxonomy, &rejected, None).await {
             Ok(r) => r,
             Err(_) => continue, // a later re-run can retry this cluster
         };
@@ -386,7 +509,7 @@ pub async fn suggest_tags_grouped(
         .await?;
     }
 
-    Ok(GroupedDispatchResult { total, representatives, dispatched, propagated })
+    Ok(GroupedDispatchResult { total, representatives, dispatched, propagated, cancelled: false })
 }
 
 /// The models installed on the Ollama server at `url` (`ai_ollama_models`), for the model
@@ -450,6 +573,133 @@ mod tests {
         reject_suggestion(&c, 1, "Animals/Birds").unwrap();
         assert!(load_suggestions(&c, 1).unwrap().is_empty());
         assert_eq!(ai::rejected_paths(c.conn(), 1).unwrap(), vec!["Animals/Birds".to_string()]);
+    }
+
+    /// The provider side, counted: no preview is read and nothing is sent.
+    #[derive(Default)]
+    pub(crate) struct FakeProvider {
+        pub images: std::sync::atomic::AtomicUsize,
+        pub calls: std::sync::Mutex<Vec<String>>,
+        pub taxonomies: std::sync::Mutex<Vec<String>>,
+        /// Set on the first provider call: the user cancels while it is in flight.
+        pub trip: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    }
+
+    impl Provider for FakeProvider {
+        fn image(&self, _: &std::path::Path, _: Option<Region>) -> Result<String, String> {
+            self.images.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok("aW1n".into())
+        }
+
+        async fn suggest(&self, config: &ai::Config, _: &str, taxonomy: &str, _: &[String], _: Option<&str>) -> Result<Vec<ai::Raw>, String> {
+            self.calls.lock().unwrap().push(format!("{}/{}", config.provider, config.model()));
+            self.taxonomies.lock().unwrap().push(taxonomy.to_string());
+            if let Some(t) = &self.trip {
+                t.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            Ok(vec![raw("Animals/Gull", 0.9)])
+        }
+    }
+
+    fn confirmed(provider: &str, model: &str) -> Option<Confirmed> {
+        Some(Confirmed { provider: provider.into(), model: model.into() })
+    }
+
+    /// A run sends only with the engine the user confirmed: when the settings name another
+    /// model or provider (a save that landed after the user's consent), it refuses before any
+    /// preview is read; with the confirmed engine it sends, with exactly that config.
+    ///
+    /// Mutation-checked: removing `admit` from either body makes a provider call happen here.
+    #[test]
+    fn a_run_refuses_an_engine_the_user_did_not_confirm() {
+        let (c, _dir) = catalog("confirmed", 2);
+        c.set_setting("ai.provider", "claude").unwrap();
+        c.set_setting("ai.cloud_api_key", "sk-test-not-real").unwrap();
+        c.set_setting("ai.cloud_model", "claude-opus-4-8").unwrap();
+        let state = AppState::default();
+        *state.catalog.lock().unwrap() = Some(c);
+        let fake = std::sync::Arc::new(FakeProvider::default());
+        let rt = super::super::runtime();
+
+        for stale in [confirmed("claude", "claude-sonnet-4-6"), confirmed("ollama", "llava:latest")] {
+            let e = rt.block_on(suggest_tags_via(&state, None, stale.clone(), 1, None, None, fake.clone())).unwrap_err();
+            assert_eq!(e, ENGINE_CHANGED);
+            let e = rt.block_on(suggest_tags_grouped_via(&state, None, stale, vec![1, 2], &Default::default(), fake.clone())).unwrap_err();
+            assert_eq!(e, ENGINE_CHANGED);
+        }
+        assert_eq!(fake.images.load(std::sync::atomic::Ordering::SeqCst), 0, "a preview was read for an unconfirmed engine");
+        assert!(fake.calls.lock().unwrap().is_empty(), "a photo went to an unconfirmed engine");
+
+        let list = rt.block_on(suggest_tags_via(&state, None, confirmed("claude", "claude-opus-4-8"), 1, None, None, fake.clone())).unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(*fake.calls.lock().unwrap(), vec!["claude/claude-opus-4-8".to_string()]);
+    }
+
+    /// An Ollama server that is not on this machine is remote: without its URL allowed nothing
+    /// is read or sent; allowed, it runs — and, like a cloud provider, gets no private tags.
+    /// Ollama at a loopback URL needs no opt-in and gets the whole vocabulary.
+    ///
+    /// Mutation-checked: `is_local` back to `provider == "ollama"` fails the private-tag
+    /// assertion; `admit` without `opt_in` fails the "nothing sent" one.
+    #[test]
+    fn a_remote_ollama_needs_its_opt_in_and_gets_no_private_tags() {
+        let (c, _dir) = catalog("remote-ollama", 2);
+        c.create_tag("Animals/Gull").unwrap();
+        let alice = c.create_tag("People/Alice").unwrap();
+        c.set_tag_private(alice, true, false).unwrap();
+        c.set_setting("ai.ollama_url", "http://192.168.1.20:11434").unwrap();
+        let state = AppState::default();
+        *state.catalog.lock().unwrap() = Some(c);
+        let fake = std::sync::Arc::new(FakeProvider::default());
+        let rt = super::super::runtime();
+        let set = |k: &str, v: &str| state.catalog.lock().unwrap().as_ref().unwrap().set_setting(k, v).unwrap();
+
+        let e = rt.block_on(suggest_tags_via(&state, None, None, 1, None, None, fake.clone())).unwrap_err();
+        assert!(e.contains("not on this machine"), "{e}");
+        let e = rt.block_on(suggest_tags_grouped_via(&state, None, None, vec![1, 2], &Default::default(), fake.clone())).unwrap_err();
+        assert!(e.contains("not on this machine"), "{e}");
+        assert_eq!(fake.images.load(std::sync::atomic::Ordering::SeqCst), 0, "a preview was read for a remote server");
+        assert!(fake.calls.lock().unwrap().is_empty(), "a photo went to a remote Ollama without its opt-in");
+
+        set("ai.ollama_remote_url", "http://192.168.1.20:11434");
+        rt.block_on(suggest_tags_via(&state, None, None, 1, None, None, fake.clone())).unwrap();
+        let sent = fake.taxonomies.lock().unwrap().last().cloned().unwrap();
+        assert!(sent.contains("Animals/Gull") && !sent.contains("Alice"), "a remote server got the private tags: {sent}");
+
+        set("ai.ollama_url", "http://127.0.0.1:11434");
+        rt.block_on(suggest_tags_via(&state, None, None, 1, None, None, fake.clone())).unwrap();
+        let sent = fake.taxonomies.lock().unwrap().last().cloned().unwrap();
+        assert!(sent.contains("People/Alice"), "the local model gets the whole vocabulary: {sent}");
+    }
+
+    /// A grouped run stops at Cancel: cancelled while the first representative is with the
+    /// provider, it stores that one and sends no other; cancelled before it starts, it sends
+    /// nothing. Three photos hours apart are three clusters.
+    ///
+    /// Mutation-checked: dropping both `cancelled()` checks in the loop makes three calls.
+    #[test]
+    fn a_cancelled_grouped_run_sends_no_further_representative() {
+        let (c, _dir) = catalog("grouped-cancel", 3);
+        for (id, t) in [(1, "2026-05-01T08:00:00"), (2, "2026-05-01T12:00:00"), (3, "2026-05-01T16:00:00")] {
+            c.conn().execute("UPDATE photos SET capture_time = ?1 WHERE id = ?2", rusqlite::params![t, id]).unwrap();
+        }
+        let state = AppState::default();
+        *state.catalog.lock().unwrap() = Some(c);
+        let rt = super::super::runtime();
+        assert_eq!(grouped_estimate(&state, None, vec![1, 2, 3]).unwrap().representatives, 3);
+
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let fake = std::sync::Arc::new(FakeProvider { trip: Some(cancel.clone()), ..Default::default() });
+        let r = rt.block_on(suggest_tags_grouped_via(&state, None, None, vec![1, 2, 3], &cancel, fake.clone())).unwrap();
+        assert_eq!(fake.calls.lock().unwrap().len(), 1, "a representative was sent after Cancel");
+        assert_eq!(fake.images.load(std::sync::atomic::Ordering::SeqCst), 1, "a preview was read after Cancel");
+        assert_eq!((r.representatives, r.dispatched, r.cancelled), (3, 1, true));
+        assert!(r.propagated >= 1, "the one in flight is stored");
+
+        let before = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let fake = std::sync::Arc::new(FakeProvider::default());
+        let r = rt.block_on(suggest_tags_grouped_via(&state, None, None, vec![1, 2, 3], &before, fake.clone())).unwrap();
+        assert!(fake.calls.lock().unwrap().is_empty() && r.cancelled && r.dispatched == 0);
     }
 
     /// The estimate and every phase of a bound run read only the catalog they were bound to.

@@ -377,6 +377,13 @@ impl Render for AiPanel {
             }));
         }
 
+        if s.batch_running() {
+            actions = actions.child(ui::clickable(ui::danger_chip("ai-batch-cancel", "Cancel batch", true, colors), true, {
+                let st = st.clone();
+                move |_, _, cx| st.update(cx, |s, cx| s.cancel_batch(cx))
+            }));
+        }
+
         let mut body = div().id("ai-panel").flex().flex_col().gap(px(8.)).text_size(px(12.)).child(self.pickers(colors, cx)).child(actions);
         if region_mode {
             body = body.child(self.render_region(colors, cx));

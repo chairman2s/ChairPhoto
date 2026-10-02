@@ -1,6 +1,7 @@
 //! The AI Tagging settings panel (`AiSettings` in aiTagging.tsx), on the module's Preferences
 //! tab: the engine (with the cloud upload note), the selected provider's URL / model / API key
-//! (masked), "Suggest only existing tags", the confidence floor, the Advanced prompt editor
+//! (masked) — with "Send photos to this Ollama server" when the Ollama URL is not on this machine —
+//! "Suggest only existing tags", the confidence floor, the Advanced prompt editor
 //! (Load default / Reset to default) and "Save AI settings". Nothing is stored until Save; the
 //! engine chosen here is the per-provider opt-in [`AiState::may_send`] checks.
 
@@ -37,6 +38,9 @@ pub struct AiSettings {
     /// The engine and "existing only" as edited (stored on Save).
     pub provider: String,
     pub existing_only: bool,
+    /// "Send photos to this Ollama server" — the opt-in for an Ollama URL that is not on this
+    /// machine; saved as `ai.ollama_remote_url` = that URL (blank when unchecked or local).
+    pub ollama_remote: bool,
     pub advanced: bool,
     shown: Option<super::state::Stored>,
     /// The save count when last edited: "Saved" shows only after a save.
@@ -71,6 +75,7 @@ impl AiSettings {
             prompt,
             provider: "ollama".into(),
             existing_only: false,
+            ollama_remote: false,
             advanced: false,
             shown: None,
             edited_at: None,
@@ -108,6 +113,10 @@ impl AiSettings {
             let v = match key {
                 "provider" => self.provider.clone(),
                 "existing_only" => if self.existing_only { "true" } else { "false" }.to_string(),
+                "ollama_remote_url" => {
+                    let url = self.value("ollama_url", cx).trim().to_string();
+                    if self.ollama_remote && !url.is_empty() && !logic::is_local_url(&url) { url } else { String::new() }
+                }
                 "prompt_template" => self.prompt.read(cx).value().to_string(),
                 k => self.value(k, cx).trim().to_string(),
             };
@@ -159,6 +168,8 @@ impl Render for AiSettings {
                 self.prompt.update(cx, |i, cx| i.set_value(st.raw("prompt_template").to_string(), window, cx));
                 self.provider = st.provider();
                 self.existing_only = st.value("existing_only") == "true";
+                let url = st.value("ollama_url");
+                self.ollama_remote = !st.raw("ollama_remote_url").is_empty() && st.raw("ollama_remote_url") == url.trim();
             }
         }
         let saves = self.state.read(cx).saves;
@@ -200,6 +211,26 @@ impl Render for AiSettings {
             if api_key_key(&self.provider) == Some(key) {
                 body = body.child(ui::sub("Stored in this catalog's settings; shown masked, never logged.", colors));
             }
+        }
+        let url = self.value("ollama_url", cx);
+        if !is_cloud(&self.provider) && !url.trim().is_empty() && !logic::is_local_url(&url) {
+            // Not a loopback address: photos would leave this machine — its own opt-in.
+            let note = format!(
+                "{} is not on this machine: each photo you tag is uploaded to it. Private tags are not sent.",
+                url.trim()
+            );
+            body = body
+                .child(div().id("ai-remote-note").text_color(colors.dim).child(note.clone()).aria_label(note).test_support())
+                .child(
+                    Checkbox::new("ai-set-ollama-remote")
+                        .label("Send photos to this Ollama server")
+                        .checked(self.ollama_remote)
+                        .on_change(cx.listener(|this, checked: &bool, _, cx| {
+                            this.ollama_remote = *checked;
+                            this.edited_at = None;
+                            cx.notify();
+                        })),
+                );
         }
         body = body
             .child(

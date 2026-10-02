@@ -8,10 +8,13 @@
 //! a catalog switch (or unloading the module) bumps it, so a late answer changes nothing.
 //!
 //! **Privacy (AGENTS.md).** A photo reaches a provider only through [`AiBackend`], and only
-//! from [`AiState::run`] or a confirmed batch, both after [`AiState::may_send`]: Ollama is local;
-//! a cloud provider needs its own saved API key (the per-provider opt-in), and a cloud batch of
+//! from [`AiState::run`] or a confirmed batch, both after [`AiState::may_send`]: Ollama at a
+//! loopback URL is local; an Ollama server elsewhere needs that URL allowed, a cloud provider
+//! its own saved API key (the per-provider opt-ins), and a cloud batch of
 //! more than one photo needs the user's Proceed on the cost confirm, which closes when the
-//! engine, the model or the catalog changes. The API keys are settings like any other `ai.*`
+//! engine, the model or the catalog changes. Every run passes the engine the user consented
+//! to down to the core ([`Confirmed`]), which refuses when the catalog's settings name another
+//! by then — a save landing between the consent and the run sends nothing. The API keys are settings like any other `ai.*`
 //! key (as the React app stored them), shown masked, and never logged here.
 //!
 //! **Catalog identity** (map #92). The settings are read with their identity and written back
@@ -25,27 +28,41 @@ use crate::model::{AppModel, AppModelEvent};
 use crate::modules::ModuleSettings;
 use crate::shell::ShellState;
 use crate::storage::Runner;
-use chairphoto_core::app::ai::{self as core_ai, AiSuggestion, GroupedDispatchResult, Region};
+use chairphoto_core::app::ai::{self as core_ai, AiSuggestion, Confirmed, GroupedDispatchResult, Region};
 use chairphoto_core::app::{with_catalog_as, with_catalog_identified, AppState, CatalogIdentity, CoreEvent};
 use chairphoto_core::catalog::Catalog;
 use gpui_kit::{App, Context, Entity, Global, SharedString, Subscription};
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 /// What the module asks of the provider side — the only path a photo leaves by. Blocking:
 /// called on the [`Runner`]. Tests install a fake that counts calls and sends nothing.
+///
+/// Every run carries the engine the user consented to (`confirmed`: the provider and model
+/// shown when they asked, or on the confirm they proceeded with); the core refuses when the
+/// catalog's settings name another.
 pub trait AiBackend: Send + Sync {
     /// One photo (a region of it, a follow-up), bound to `from`; the photo's pending set.
     fn suggest(
         &self,
         app: &AppState,
         from: CatalogIdentity,
+        confirmed: Confirmed,
         photo: i64,
         question: Option<String>,
         region: Option<Region>,
     ) -> Result<Vec<AiSuggestion>, String>;
-    /// The grouped burst run over `photos`, bound to `from`.
-    fn suggest_grouped(&self, app: &AppState, from: CatalogIdentity, photos: Vec<i64>) -> Result<GroupedDispatchResult, String>;
+    /// The grouped burst run over `photos`, bound to `from`. Once `cancel` is set no further
+    /// representative is sent.
+    fn suggest_grouped(
+        &self,
+        app: &AppState,
+        from: CatalogIdentity,
+        confirmed: Confirmed,
+        photos: Vec<i64>,
+        cancel: Arc<AtomicBool>,
+    ) -> Result<GroupedDispatchResult, String>;
     /// The models on the Ollama server at `url` (local; no photo).
     fn ollama_models(&self, url: &str) -> Result<Vec<String>, String>;
 }
@@ -58,15 +75,23 @@ impl AiBackend for CoreAi {
         &self,
         app: &AppState,
         from: CatalogIdentity,
+        confirmed: Confirmed,
         photo: i64,
         question: Option<String>,
         region: Option<Region>,
     ) -> Result<Vec<AiSuggestion>, String> {
-        chairphoto_core::app::runtime().block_on(core_ai::suggest_tags(app, Some(from), photo, question, region))
+        chairphoto_core::app::runtime().block_on(core_ai::suggest_tags(app, Some(from), Some(confirmed), photo, question, region))
     }
 
-    fn suggest_grouped(&self, app: &AppState, from: CatalogIdentity, photos: Vec<i64>) -> Result<GroupedDispatchResult, String> {
-        chairphoto_core::app::runtime().block_on(core_ai::suggest_tags_grouped(app, Some(from), photos))
+    fn suggest_grouped(
+        &self,
+        app: &AppState,
+        from: CatalogIdentity,
+        confirmed: Confirmed,
+        photos: Vec<i64>,
+        cancel: Arc<AtomicBool>,
+    ) -> Result<GroupedDispatchResult, String> {
+        chairphoto_core::app::runtime().block_on(core_ai::suggest_tags_grouped(app, Some(from), Some(confirmed), photos, &cancel))
     }
 
     fn ollama_models(&self, url: &str) -> Result<Vec<String>, String> {
@@ -114,6 +139,16 @@ impl Stored {
     /// The provider's saved API key; empty for Ollama or when none is saved.
     pub fn api_key(&self) -> &str {
         api_key_key(&self.provider()).map_or("", |k| self.raw(k))
+    }
+
+    /// Whether these settings opt into sending ([`logic::send_opt_in`]).
+    pub fn opt_in(&self) -> Result<(), String> {
+        logic::send_opt_in(&self.provider(), self.api_key(), &self.value("ollama_url"), self.raw("ollama_remote_url"))
+    }
+
+    /// The engine these settings name — what a run started from them is consenting to.
+    pub fn engine(&self) -> Confirmed {
+        Confirmed { provider: self.provider(), model: self.model() }
     }
 }
 
@@ -171,6 +206,9 @@ pub struct AiState {
     photo_seq: u64,
     /// A run (one photo or a batch) is in flight.
     pub busy: bool,
+    /// The grouped run in flight, by its cancel flag: Cancel, unloading the module and a
+    /// catalog switch set it, and the core sends no further representative.
+    batch_cancel: Option<Arc<AtomicBool>>,
     pub error: Option<String>,
     pub batch_msg: Option<String>,
     pub confirm: Option<BulkConfirm>,
@@ -216,6 +254,7 @@ impl AiState {
             photo_key: None,
             photo_seq: 0,
             busy: false,
+            batch_cancel: None,
             error: None,
             batch_msg: None,
             confirm: None,
@@ -285,8 +324,9 @@ impl AiState {
         self.settings_from = None;
         self.photo = PhotoView::None;
         self.photo_key = None;
-        // A run of the old catalog is dropped (its answer is stale); the confirm, bound to the
-        // old catalog's photos, closes.
+        // A run of the old catalog is dropped (its answer is stale) and a grouped one stops
+        // sending; the confirm, bound to the old catalog's photos, closes.
+        self.stop_batch();
         self.busy = false;
         self.estimating = false;
         self.confirm = None;
@@ -296,8 +336,10 @@ impl AiState {
         cx.notify();
     }
 
-    /// Disabled: nothing it started is heard any more.
+    /// Disabled: nothing it started is heard any more, and a grouped run sends no further
+    /// representative.
     pub fn unload(&mut self, cx: &mut Context<Self>) {
+        self.stop_batch();
         self.live = false;
         self.generation += 1;
         cx.notify();
@@ -479,13 +521,14 @@ impl AiState {
     // --- consent ----------------------------------------------------------------------------
 
     /// Whether a run may send photos now, and bound to which catalog: the settings must be
-    /// read from the catalog the photos are from, and a cloud engine needs its saved API key.
+    /// read from the catalog the photos are from, and a remote engine needs its opt-in — a
+    /// cloud engine its saved API key, an Ollama server not on this machine its allowed URL.
     /// Nothing is read or sent when this refuses.
     pub fn may_send(&self, from: CatalogIdentity) -> Result<(), String> {
         let stored = self.stored.as_ref().filter(|_| self.settings_from == Some(from)).ok_or_else(|| {
             "AI tagging: the settings are still loading; try again.".to_string()
         })?;
-        logic::cloud_opt_in(&stored.provider(), stored.api_key())
+        stored.opt_in()
     }
 
     // --- runs -------------------------------------------------------------------------------
@@ -509,13 +552,16 @@ impl AiState {
             cx.notify();
             return;
         }
+        // The engine the panel shows now is the one the user is asking; the core refuses if
+        // the catalog names another by the time the run reads it.
+        let Some(engine) = self.stored.as_ref().map(Stored::engine) else { return };
         let region = if with_region { self.region } else { None };
         let asking = question.is_some();
         self.busy = true;
         self.error = None;
         cx.notify();
         let backend = AiBackendGlobal::get(cx);
-        self.run_off(cx, move |app| backend.suggest(app, from, photo, question, region), move |s, result, _| {
+        self.run_off(cx, move |app| backend.suggest(app, from, engine, photo, question, region), move |s, result, _| {
             s.busy = false;
             match result {
                 Ok(list) => {
@@ -551,7 +597,7 @@ impl AiState {
         let Some(stored) = self.stored.clone() else { return };
         let (provider, model) = (stored.provider(), stored.model());
         if !is_cloud(&provider) || photos.len() <= 1 {
-            self.dispatch(photos, from, cx);
+            self.dispatch(photos, from, stored.engine(), cx);
             return;
         }
         self.estimating = true;
@@ -602,7 +648,8 @@ impl AiState {
             cx.notify();
             return;
         }
-        self.dispatch(confirm.photos, confirm.from, cx);
+        let engine = Confirmed { provider: confirm.provider, model: confirm.model };
+        self.dispatch(confirm.photos, confirm.from, engine, cx);
     }
 
     pub fn cancel_confirm(&mut self, cx: &mut Context<Self>) {
@@ -610,16 +657,48 @@ impl AiState {
         cx.notify();
     }
 
-    fn dispatch(&mut self, photos: Vec<i64>, from: CatalogIdentity, cx: &mut Context<Self>) {
+    /// Set the running batch's cancel flag (if any) and forget it.
+    fn stop_batch(&mut self) {
+        if let Some(flag) = self.batch_cancel.take() {
+            flag.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// A grouped run is in flight (its Cancel is offered).
+    pub fn batch_running(&self) -> bool {
+        self.batch_cancel.is_some()
+    }
+
+    /// "Cancel" on a running batch: the representative with the provider finishes; no
+    /// further one is sent.
+    pub fn cancel_batch(&mut self, cx: &mut Context<Self>) {
+        if self.batch_cancel.is_none() {
+            return;
+        }
+        self.stop_batch();
+        self.batch_msg = Some("Cancelling — the photo with the engine now finishes; no more are sent…".into());
+        cx.notify();
+    }
+
+    fn dispatch(&mut self, photos: Vec<i64>, from: CatalogIdentity, engine: Confirmed, cx: &mut Context<Self>) {
         self.busy = true;
         self.confirm = None;
         self.error = None;
         self.batch_msg = Some(format!("Grouping {}…", photos.len()));
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.batch_cancel = Some(cancel.clone());
         cx.notify();
         let backend = AiBackendGlobal::get(cx);
-        self.run_off(cx, move |app| backend.suggest_grouped(app, from, photos), |s, result, cx| {
+        let mine = cancel.clone();
+        self.run_off(cx, move |app| backend.suggest_grouped(app, from, engine, photos, cancel), move |s, result, cx| {
             s.busy = false;
+            if s.batch_cancel.as_ref().is_some_and(|f| Arc::ptr_eq(f, &mine)) {
+                s.batch_cancel = None;
+            }
             match result {
+                Ok(r) if r.cancelled => {
+                    s.batch_msg = Some(logic::batch_cancelled_line(r.dispatched, r.representatives, r.propagated))
+                }
                 Ok(r) => s.batch_msg = Some(logic::batch_done_line(r.total, r.representatives, r.propagated)),
                 Err(e) => {
                     s.error = Some(e);

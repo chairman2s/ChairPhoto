@@ -18,6 +18,9 @@ pub struct Config {
     /// "ollama" (local) | "claude" | "openai" | "gemini" (cloud).
     pub provider: String,
     pub ollama_url: String,
+    /// The non-loopback Ollama URL the user explicitly allowed photos to go to
+    /// (`ai.ollama_remote_url`); blank = none. Counts only while it equals `ollama_url`.
+    pub ollama_remote_url: String,
     pub ollama_model: String,
     pub cloud_model: String, // Claude
     pub cloud_key: String,   // Claude (Anthropic)
@@ -34,10 +37,79 @@ pub struct Config {
 }
 
 impl Config {
-    /// True when the configured provider runs on-machine (Ollama). Cloud providers
-    /// (Claude/OpenAI/Gemini) are remote — private tags are withheld from them.
+    /// True when the configured provider runs on this machine: Ollama at a loopback URL
+    /// ([`is_loopback_url`]). Cloud providers (Claude/OpenAI/Gemini) and an Ollama server
+    /// elsewhere are remote — private tags are withheld from them.
     pub fn is_local(&self) -> bool {
-        self.provider == "ollama"
+        self.provider == "ollama" && is_loopback_url(&self.ollama_url)
+    }
+
+    /// The explicit, per-provider opt-in a run needs before any photo is read for it
+    /// ([`opt_in`]).
+    pub fn opt_in(&self) -> Result<(), String> {
+        let key = match self.provider.as_str() {
+            "claude" => &self.cloud_key,
+            "openai" => &self.openai_key,
+            "gemini" => &self.gemini_key,
+            _ => "",
+        };
+        opt_in(&self.provider, key, &self.ollama_url, &self.ollama_remote_url)
+    }
+
+    /// The model the configured provider runs.
+    pub fn model(&self) -> &str {
+        match self.provider.as_str() {
+            "claude" => &self.cloud_model,
+            "openai" => &self.openai_model,
+            "gemini" => &self.gemini_model,
+            _ => &self.ollama_model,
+        }
+    }
+}
+
+/// Whether `url` names this machine by a **loopback literal**: the host `localhost`, an IPv4
+/// address in `127.0.0.0/8`, or `::1` (also as the IPv4-mapped `::ffff:127.x.x.x`). Decided on
+/// the text alone — no DNS lookup at check time, so a name that merely resolves to loopback
+/// today (or `0.0.0.0`, or `*.localhost`) counts as remote. An unparseable URL is remote.
+pub fn is_loopback_url(url: &str) -> bool {
+    let Ok(u) = reqwest::Url::parse(url.trim()) else { return false };
+    let Some(host) = u.host_str() else { return false };
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    match host.trim_start_matches('[').trim_end_matches(']').parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(ip)) => ip.is_loopback(),
+        Ok(std::net::IpAddr::V6(ip)) => ip.is_loopback() || ip.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback()),
+        Err(_) => false,
+    }
+}
+
+/// Whether photos may go to `provider` (AGENTS.md: nothing leaves the machine without an
+/// explicit, feature-specific opt-in). Ollama at a loopback URL is local and needs nothing. A
+/// cloud provider is opted into by saving its own API key. An Ollama server elsewhere is opted
+/// into by allowing that exact URL (`ai.ollama_remote_url` equal to `ai.ollama_url`), so
+/// pointing the URL at another host needs a new opt-in. The refusal names the fix.
+pub fn opt_in(provider: &str, api_key: &str, ollama_url: &str, ollama_remote_url: &str) -> Result<(), String> {
+    match provider {
+        "ollama" | "" => {
+            let allowed = !ollama_remote_url.trim().is_empty() && ollama_remote_url.trim() == ollama_url.trim();
+            if is_loopback_url(ollama_url) || allowed {
+                Ok(())
+            } else {
+                Err(format!(
+                    "The Ollama server at {} is not on this machine: photos are sent to it only after you allow it in Preferences → AI Tagging.",
+                    ollama_url.trim()
+                ))
+            }
+        }
+        _ if !api_key.trim().is_empty() => Ok(()),
+        p => {
+            let mut c = p.chars();
+            let name: String = c.next().map(|f| f.to_uppercase().collect::<String>() + c.as_str()).unwrap_or_default();
+            Err(format!(
+                "{name} is a cloud engine: photos are sent to it only after you save its API key in Preferences → AI Tagging."
+            ))
+        }
     }
 }
 
@@ -60,6 +132,7 @@ pub fn read_config(c: &Catalog) -> crate::catalog::Result<Config> {
     Ok(Config {
         provider: get("ai.provider", "ollama")?,
         ollama_url: get("ai.ollama_url", "http://localhost:11434")?,
+        ollama_remote_url: get("ai.ollama_remote_url", "")?,
         ollama_model: get("ai.ollama_model", "llava:latest")?,
         cloud_model: get("ai.cloud_model", "claude-sonnet-4-6")?,
         cloud_key: get("ai.cloud_api_key", "")?,
@@ -947,12 +1020,61 @@ mod tests {
         assert!(!p.contains("start a NEW branch"));
     }
 
+    /// Loopback is decided on literals only: `localhost`, 127.0.0.0/8, `::1` (and its
+    /// IPv4-mapped form). Everything else — LAN addresses, names, look-alikes — is remote.
+    #[test]
+    fn only_loopback_literals_are_local() {
+        for local in [
+            "http://localhost:11434",
+            "http://LOCALHOST",
+            "https://localhost/",
+            "http://127.0.0.1:11434",
+            "http://127.8.9.10",
+            "http://[::1]:11434",
+            "http://[::ffff:127.0.0.1]:11434",
+            " http://localhost:11434 ",
+        ] {
+            assert!(is_loopback_url(local), "{local} is this machine");
+        }
+        for remote in [
+            "http://192.168.1.20:11434",
+            "http://10.0.0.2",
+            "http://ollama.lan:11434",
+            "http://localhost.example.com",
+            "http://127.0.0.1.nip.io",
+            "http://0.0.0.0:11434",
+            "http://api.localhost",
+            "http://[::ffff:192.168.0.1]",
+            "http://[fe80::1]",
+            "localhost:11434",
+            "not a url",
+            "",
+        ] {
+            assert!(!is_loopback_url(remote), "{remote} must count as remote");
+        }
+    }
+
+    /// The opt-in: local Ollama needs none; a remote Ollama needs that exact URL allowed; a
+    /// cloud provider needs its key.
+    #[test]
+    fn remote_ollama_needs_its_url_allowed_and_cloud_its_key() {
+        assert!(opt_in("ollama", "", "http://localhost:11434", "").is_ok());
+        let e = opt_in("ollama", "", "http://192.168.1.20:11434", "").unwrap_err();
+        assert!(e.contains("not on this machine"), "{e}");
+        assert!(opt_in("ollama", "", "http://192.168.1.20:11434", "http://192.168.1.20:11434").is_ok());
+        assert!(opt_in("ollama", "", "http://192.168.1.21:11434", "http://192.168.1.20:11434").is_err(), "another host needs a new opt-in");
+        assert!(opt_in("claude", "sk-x", "", "").is_ok());
+        let e = opt_in("gemini", " ", "", "").unwrap_err();
+        assert!(e.contains("Gemini") && e.contains("API key"), "{e}");
+    }
+
     // ------ Claude structured-output (tool-use) tests ------
 
     fn dummy_cfg() -> Config {
         Config {
             provider: "claude".into(),
             ollama_url: String::new(),
+            ollama_remote_url: String::new(),
             ollama_model: String::new(),
             cloud_model: "claude-sonnet-4-6".into(),
             cloud_key: "test-key".into(),

@@ -19,8 +19,34 @@ pub struct ScreenRect {
     pub height: f32,
 }
 
-/// Where a face box lands on screen. `bbox` is normalized 0–1 against the **oriented** image
-/// (the detector's space, the same as the oriented preview the loupe draws); `natural` is the
+/// A normalized box `(x, y, w, h)` (top-left corner) in an image's frame, carried into the
+/// frame of that image turned `degrees` clockwise — what `thumbnails::rotate_image` does to
+/// the pixels (90: a point `(x, y)` lands at `(1 − y, x)`). Anything but 90/180/270 (after
+/// normalising) is no turn.
+///
+/// **The canonical frame.** Face boxes are stored in the photo's EXIF-oriented frame without
+/// its non-destructive `user_rotation`: the frame the indexer detects in (the unrotated
+/// preview) and the one the MWG export writes. The loupe draws the picture with the user
+/// rotation applied, so the overlay turns each box by it to draw it and turns a drawn box back
+/// by it ([`unrotate_box`]) to store it.
+pub fn rotate_box(b: (f32, f32, f32, f32), degrees: i64) -> (f32, f32, f32, f32) {
+    let (x, y, w, h) = b;
+    match ((degrees % 360) + 360) % 360 {
+        90 => (1. - y - h, x, h, w),
+        180 => (1. - x - w, 1. - y - h, w, h),
+        270 => (y, 1. - x - w, h, w),
+        _ => b,
+    }
+}
+
+/// [`rotate_box`]'s inverse: a box in the frame turned `degrees` clockwise, back in the
+/// unturned (canonical) frame.
+pub fn unrotate_box(b: (f32, f32, f32, f32), degrees: i64) -> (f32, f32, f32, f32) {
+    rotate_box(b, -degrees)
+}
+
+/// Where a face box lands on screen. `bbox` is normalized 0–1 against the frame of the picture
+/// the loupe draws (the caller turns a stored box into it with [`rotate_box`]); `natural` is the
 /// size of the picture the loupe draws, `container` its container, and `view` its pan/zoom.
 /// The image's own placement ([`ZoomView::placement`]) is the reference, so a box is drawn
 /// through exactly the transform the picture is (React mapped through the parsed CSS transform).
@@ -241,6 +267,37 @@ mod tests {
         let r = bbox_to_screen(bb(0.3, 0.6, 0.1, 0.1), natural, container, view);
         let (x, y) = screen_to_image((r.left, r.top), natural, container, view);
         assert!(close(x, 0.3) && close(y, 0.6), "{x} {y}");
+    }
+
+    /// A box turned with the photo lands on the pixels the turned picture has there: paint the
+    /// box into a 40×20 canonical image, turn it with the core's own `rotate_image` (what the
+    /// loupe's tiers get), and measure where the paint went. The inverse brings it back.
+    #[test]
+    fn a_turned_box_follows_the_turned_pixels() {
+        use image::{DynamicImage, GenericImageView as _, Rgb, RgbImage};
+        let (cw, ch) = (40u32, 20u32);
+        let canonical = (0.1, 0.2, 0.3, 0.4); // x 4..16, y 4..12
+        let mut img = RgbImage::new(cw, ch);
+        for x in 4..16 {
+            for y in 4..12 {
+                img.put_pixel(x, y, Rgb([255, 0, 0]));
+            }
+        }
+        for degrees in [0i64, 90, 180, 270, -90, 450] {
+            let turned = chairphoto_core::thumbnails::rotate_image(DynamicImage::ImageRgb8(img.clone()), degrees);
+            let (w, h) = turned.dimensions();
+            let painted: Vec<(u32, u32)> =
+                turned.pixels().filter(|(_, _, p)| p.0[0] == 255).map(|(x, y, _)| (x, y)).collect();
+            let (x0, x1) = (painted.iter().map(|p| p.0).min().unwrap(), painted.iter().map(|p| p.0).max().unwrap() + 1);
+            let (y0, y1) = (painted.iter().map(|p| p.1).min().unwrap(), painted.iter().map(|p| p.1).max().unwrap() + 1);
+            let want = (x0 as f32 / w as f32, y0 as f32 / h as f32, (x1 - x0) as f32 / w as f32, (y1 - y0) as f32 / h as f32);
+            let got = rotate_box(canonical, degrees);
+            let near = |a: (f32, f32, f32, f32), b: (f32, f32, f32, f32)| {
+                close(a.0, b.0) && close(a.1, b.1) && close(a.2, b.2) && close(a.3, b.3)
+            };
+            assert!(near(got, want), "{degrees}°: {got:?} vs the pixels' {want:?}");
+            assert!(near(unrotate_box(got, degrees), canonical), "{degrees}°: back");
+        }
     }
 
     /// A drawn drag: clicks and letterbox-only drags draw nothing; a drag past the image's

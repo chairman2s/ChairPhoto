@@ -880,3 +880,62 @@ fn the_inspectors_faces_follow_compares_focused_pane(cx: &mut TestAppContext) {
     let state = f.state(cx);
     assert!(state.read_with(cx, |s, cx| s.selection_targets(cx).contains(&focused)));
 }
+
+/// A user-rotated photo: the loupe draws its tiers turned, the boxes stay in the canonical
+/// (unturned) frame. At 0/90/180/270 a stored box lands on the turned picture where the turned
+/// face is, and a box drawn on the turned picture is stored back in the canonical frame (and
+/// shows where it was drawn). The turned positions are worked out by hand here (90° clockwise
+/// carries a point (x, y) to (1 − y, x)); `logic::a_turned_box_follows_the_turned_pixels`
+/// checks that rule against the core's own `rotate_image`.
+#[gpui_kit::test]
+fn overlay_boxes_turn_with_the_user_rotation(cx: &mut TestAppContext) {
+    let f = open_faces(1, true, "faces-rotate", cx);
+    let photo = f.ids[0];
+    let a = add_face(&f.app, photo, "[0.1,0.2,0.3,0.4]");
+    f.loupe(photo, 400, 200, cx);
+    let zoom = f.zoom(cx);
+    let state = f.state(cx);
+    // (rotation, where face `a` shows on the turned picture, where the drag below is stored)
+    let cases = [
+        (0, (0.1, 0.2, 0.3, 0.4), (0.6, 0.2, 0.2, 0.4)),
+        (90, (0.4, 0.1, 0.4, 0.3), (0.2, 0.2, 0.4, 0.2)),
+        (180, (0.6, 0.4, 0.3, 0.4), (0.2, 0.4, 0.2, 0.4)),
+        (270, (0.2, 0.6, 0.4, 0.3), (0.4, 0.6, 0.4, 0.2)),
+    ];
+    for (rotation, shown, stored) in cases {
+        // Turn the photo as ↻ does: the catalog first, then its images are invalidated.
+        with_cat(&f.app, |c| c.set_photo_rotation(photo, rotation).unwrap());
+        f.app.wired.images.update(cx, |s, cx| s.invalidate(photo, cx));
+        cx.run_until_parked();
+        // The turned pixels land before the faces' re-read (still queued on the manual
+        // Runner): the last read's angle is not this picture's, so no box is drawn yet.
+        let natural = if rotation % 180 == 0 { (400., 200.) } else { (200., 400.) };
+        assert!(!f.present(&format!("faces-box-{a}"), cx), "{rotation}°: no box while the new tier loads");
+        f.pool.finish(&JobKey::photo(photo, ImageKind::Preview), Ok(pixels(natural.0 as u32, natural.1 as u32)));
+        cx.run_until_parked();
+        assert!(!f.present(&format!("faces-box-{a}"), cx), "{rotation}°: no box until the faces are re-read for these pixels");
+        work(&f.app, cx);
+
+        let c = zoom.read_with(cx, |z, _| z.bounds().unwrap());
+        let size = (f32::from(c.size.width), f32::from(c.size.height));
+        let want = expected(bb(shown.0, shown.1, shown.2, shown.3), natural, size, ZoomView::FIT);
+        assert!(f.present(&format!("faces-box-{a}"), cx), "{rotation}°: the box is drawn");
+        assert_rect(f.bounds(&format!("faces-box-{a}"), cx), c.origin, want);
+
+        // Draw (60%, 20%)–(80%, 60%) of the turned picture.
+        f.click("faces-draw", cx);
+        let (l, t, w, h) = ZoomView::FIT.placement(natural, size);
+        let at = |x: f32, y: f32| c.origin + point(px(l + x * w), px(t + y * h));
+        drag_in(&f, f.window(), at(0.6, 0.2), at(0.8, 0.6), cx);
+        let drawn = drawn_faces(&f, photo);
+        assert_eq!(drawn.len(), 1, "{rotation}°");
+        assert!(close_bbox(drawn[0].bbox, stored), "{rotation}°: stored {:?}, want {stored:?}", drawn[0].bbox);
+        let want = expected(bb(0.6, 0.2, 0.2, 0.4), natural, size, ZoomView::FIT);
+        assert_rect(f.bounds(&format!("faces-box-{}", drawn[0].id), cx), c.origin, want);
+
+        f.press("escape", cx); // the picker on the drawn face
+        with_cat(&f.app, |c| c.conn().execute("DELETE FROM faces__faces WHERE source = 'drawn'", []).unwrap());
+        state.update(cx, |s, cx| s.follow_photo(true, cx));
+        work(&f.app, cx);
+    }
+}

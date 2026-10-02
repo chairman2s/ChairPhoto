@@ -4,8 +4,9 @@
 //! `read_face_regions`); this module bridges it to the `faces__faces` table and the catalog:
 //!
 //! - **Write** ([`write_photo_regions`]): gather a photo's **confirmed** faces (with a person
-//!   tag), resolve the photo path via the resolver (never `photos.path`), compute the photo's
-//!   oriented pixel dimensions, and write them as `mwg-rs:Regions`. Triggered from the
+//!   tag), resolve the photo path via the resolver (never `photos.path`), take the photo's
+//!   recorded pixel dimensions ([`region_dimensions`]: never turned by the user rotation), and
+//!   write them as `mwg-rs:Regions`. Triggered from the
 //!   confirm/unconfirm hook points in `commands.rs` (`faces_accept` / `faces_assign` /
 //!   `faces_reject` / `faces_ignore` / `faces_name_cluster`), the same place keyword XMP
 //!   export happens. Writing the full current set each time keeps the sidecar in sync as
@@ -32,39 +33,41 @@ pub const IMPORT_IOU: f32 = 0.5;
 /// The `source` written for a face confirmed from an imported MWG region.
 pub const SOURCE_XMP: &str = "xmp";
 
-// ── Oriented dimensions ─────────────────────────────────────────────────────────
+// ── Region dimensions ───────────────────────────────────────────────────────────
 
-/// The photo's oriented pixel dimensions `(w, h)` for `mwg-rs:AppliedToDimensions` — the
-/// reference frame the normalized region coordinates apply to.
+/// The pixel dimensions `(w, h)` written as `mwg-rs:AppliedToDimensions`: the photo's
+/// recorded `width`/`height`.
 ///
-/// Face bboxes are normalized to the **oriented** preview, so the AppliedToDimensions must
-/// describe the oriented image. We take the stored EXIF `width`/`height` and apply the
-/// non-destructive `user_rotation` (90/270 swap the axes). When dimensions are missing we
-/// fall back to a square unit frame — the region coordinates stay normalized and correct
-/// regardless; only the declared reference size is approximate.
-pub fn oriented_dimensions(conn: &Connection, photo_id: i64) -> rusqlite::Result<(u32, u32)> {
-    let row: Option<(Option<i64>, Option<i64>, i64)> = conn
-        .query_row(
-            "SELECT width, height, user_rotation FROM photos WHERE id = ?1",
-            [photo_id],
-            |r| {
-                Ok((
-                    r.get::<_, Option<i64>>(0)?,
-                    r.get::<_, Option<i64>>(1)?,
-                    r.get::<_, i64>(2)?,
-                ))
-            },
-        )
+/// **The non-destructive `user_rotation` is not applied** — neither here nor to the region
+/// coordinates. It lives only in the catalog: the original is never rewritten and the sidecar
+/// carries no orientation of ours, so a tool reading these regions (digiKam, Lightroom, a
+/// later ChairPhoto import) sees the file as its own metadata orients it, never turned by the
+/// user's override. The faces are stored in that same unturned frame (the indexer detects on
+/// the unrotated preview; the GPUI overlay turns a box drawn on the rotated loupe back before
+/// storing it), so coordinates and dimensions stay one frame whatever the user rotation is.
+/// Swapping the axes for a 90°/270° user rotation (as this did before) declared a frame the
+/// coordinates were never in.
+///
+/// **Known deviation, not handled here:** MWG 2.0 § 5.9 applies regions to the *stored* image
+/// ("When applying a rotation by applying Exif Orientation, the rotation must be applied to the
+/// regions as well"), while the stored boxes are normalized to the EXIF-*oriented* preview.
+/// For a file whose EXIF Orientation is not 1 (a camera held upright) the coordinates are
+/// therefore in the oriented frame, and `width`/`height` (EXIF `ExifImageWidth`/`Height`) may
+/// describe the stored one. Fixing that needs the EXIF Orientation at write and import time,
+/// which the catalog does not keep; see docs/face-tagging.md.
+///
+/// When dimensions are missing we fall back to a square unit frame — the region coordinates
+/// stay normalized; only the declared reference size is approximate.
+pub fn region_dimensions(conn: &Connection, photo_id: i64) -> rusqlite::Result<(u32, u32)> {
+    let row: Option<(Option<i64>, Option<i64>)> = conn
+        .query_row("SELECT width, height FROM photos WHERE id = ?1", [photo_id], |r| {
+            Ok((r.get::<_, Option<i64>>(0)?, r.get::<_, Option<i64>>(1)?))
+        })
         .optional()?;
-
-    let (w, h, rot) = match row {
-        Some((Some(w), Some(h), rot)) if w > 0 && h > 0 => (w as u32, h as u32, rot),
-        _ => return Ok((1, 1)),
-    };
-
-    // 90°/270° user rotation swaps width and height.
-    let swap = matches!(((rot % 360) + 360) % 360, 90 | 270);
-    Ok(if swap { (h, w) } else { (w, h) })
+    Ok(match row {
+        Some((Some(w), Some(h))) if w > 0 && h > 0 => (w as u32, h as u32),
+        _ => (1, 1),
+    })
 }
 
 // ── Write path ──────────────────────────────────────────────────────────────────
@@ -112,7 +115,7 @@ where
     R: FnOnce(i64) -> Result<Option<std::path::PathBuf>, String>,
 {
     let regions = confirmed_regions(conn, photo_id).map_err(|e| e.to_string())?;
-    let (w, h) = oriented_dimensions(conn, photo_id).map_err(|e| e.to_string())?;
+    let (w, h) = region_dimensions(conn, photo_id).map_err(|e| e.to_string())?;
 
     match resolve(photo_id)? {
         Some(path) => crate::xmp::write_face_regions(&path, &regions, w, h),
@@ -250,35 +253,65 @@ mod tests {
         conn
     }
 
-    // ── oriented_dimensions ────────────────────────────────────────────────────
+    // ── region_dimensions ──────────────────────────────────────────────────────
 
     #[test]
-    fn oriented_dims_no_rotation() {
+    fn region_dims_are_the_recorded_ones() {
         let conn = mem_conn();
         conn.execute(
             "INSERT INTO photos (id, width, height, user_rotation) VALUES (1, 6000, 4000, 0)",
             [],
         )
         .unwrap();
-        assert_eq!(oriented_dimensions(&conn, 1).unwrap(), (6000, 4000));
+        assert_eq!(region_dimensions(&conn, 1).unwrap(), (6000, 4000));
     }
 
     #[test]
-    fn oriented_dims_90_swaps() {
-        let conn = mem_conn();
-        conn.execute(
-            "INSERT INTO photos (id, width, height, user_rotation) VALUES (1, 6000, 4000, 90)",
-            [],
-        )
-        .unwrap();
-        assert_eq!(oriented_dimensions(&conn, 1).unwrap(), (4000, 6000));
-    }
-
-    #[test]
-    fn oriented_dims_missing_falls_back() {
+    fn region_dims_missing_falls_back() {
         let conn = mem_conn();
         conn.execute("INSERT INTO photos (id) VALUES (1)", []).unwrap();
-        assert_eq!(oriented_dimensions(&conn, 1).unwrap(), (1, 1));
+        assert_eq!(region_dimensions(&conn, 1).unwrap(), (1, 1));
+    }
+
+    /// A user rotation is the catalog's alone (never in the original or the sidecar), so the
+    /// exported regions are the same at 0/90/180/270: the stored boxes' frame, with the
+    /// recorded dimensions — coordinates and AppliedToDimensions in one frame. (Before, a
+    /// 90°/270° rotation swapped the dimensions and left the coordinates unturned.)
+    #[test]
+    fn exported_regions_ignore_the_user_rotation() {
+        let dir = crate::test_support::TestTmpDir::new("faces-regions-rotation");
+        let photo_path = dir.join("DSC31.ARW");
+        std::fs::write(&photo_path, b"raw").unwrap();
+        let mut seen = Vec::new();
+        for rotation in [0i64, 90, 180, 270] {
+            let conn = mem_conn();
+            conn.execute(
+                "INSERT INTO photos (id, width, height, user_rotation) VALUES (1, 6000, 4000, ?1)",
+                [rotation],
+            )
+            .unwrap();
+            conn.execute("INSERT INTO tags (id, name, full_path) VALUES (10, 'Alice', 'People/Alice')", [])
+                .unwrap();
+            let f = store::insert_face(&conn, 1, "[0.1,0.2,0.3,0.4]", "[]", 0.9, None, "drawn", 0).unwrap();
+            conn.execute("UPDATE faces__faces SET person_tag_id = 10, state = 'confirmed' WHERE id = ?1", [f])
+                .unwrap();
+            let _ = std::fs::remove_file(crate::xmp::sidecar_path(&photo_path));
+            write_photo_regions(&conn, 1, |_| Ok(Some(photo_path.clone()))).unwrap();
+            let read = crate::xmp::read_face_regions(&photo_path);
+            assert_eq!(read.len(), 1, "{rotation}°");
+            let (x, y, w, h) = read[0].bbox;
+            let near = |a: f32, b: f32| (a - b).abs() < 1e-4;
+            assert!(near(x, 0.1) && near(y, 0.2) && near(w, 0.3) && near(h, 0.4), "{rotation}°: {:?}", read[0].bbox);
+            let xml = std::fs::read_to_string(crate::xmp::sidecar_path(&photo_path)).unwrap();
+            let dims = |tag: &str| {
+                let open = format!("<stDim:{tag}>");
+                let at = xml.find(&open).unwrap_or_else(|| panic!("{rotation}°: no stDim:{tag} in {xml}")) + open.len();
+                xml[at..xml[at..].find('<').unwrap() + at].to_string()
+            };
+            assert_eq!((dims("w"), dims("h")), ("6000".to_string(), "4000".to_string()), "{rotation}°");
+            seen.push(read[0].bbox);
+        }
+        assert!(seen.windows(2).all(|p| p[0] == p[1]), "{seen:?}");
     }
 
     // ── confirmed_regions ──────────────────────────────────────────────────────

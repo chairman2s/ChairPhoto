@@ -129,9 +129,21 @@ Working Group schema that digiKam, Lightroom and Picasa all understand. The code
 `crate::xmp` (`write_face_regions` / `read_face_regions`); the catalog-side wiring is in
 `plugins/faces/regions.rs`.
 
-**Structure.** `mwg-rs:AppliedToDimensions` records the photo's **oriented** pixel size — EXIF
-dimensions with the non-destructive `user_rotation` applied, so a 90°/270° rotation swaps the
-axes. That is the reference frame for the normalized areas. Each region in the `RegionList`
+**The frame.** Face boxes are stored normalized in one canonical frame: the photo as its own
+metadata orients it (the EXIF-oriented preview the indexer detects on), **without** the
+non-destructive `user_rotation`. The loupe draws the picture with the user rotation applied, so
+the overlay turns each box by it for display and turns a box drawn on the rotated picture back
+before storing it. The user rotation lives only in the catalog — the original is never rewritten
+and the sidecar carries no orientation of ours — so the export ignores it too: other tools see
+the file unturned, and so must its regions.
+
+**Structure.** `mwg-rs:AppliedToDimensions` records the photo's recorded pixel size (`width` /
+`height`), never swapped for a user rotation. Known deviation: MWG 2.0 § 5.9 applies regions to
+the *stored* image ("when applying a rotation by applying Exif Orientation, the rotation must be
+applied to the regions as well"), but the stored boxes are normalized to the EXIF-*oriented*
+preview; for a file whose EXIF Orientation is not 1 the coordinates are in the oriented frame.
+Converting needs the EXIF Orientation at write and import time, which the catalog does not keep
+yet. Each region in the `RegionList`
 carries `mwg-rs:Name` (the person tag's leaf name), `mwg-rs:Type="Face"`, and an `mwg-rs:Area`
 whose `x`/`y` are the rectangle's normalized **center** — MWG stores centers, not corners — with
 `w`/`h` as the size. Stored bboxes are top-left-normalized, so the writer converts corner→center

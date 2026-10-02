@@ -32,45 +32,36 @@ const NS_MWG_RS: &str = "http://www.metadataworkinggroup.com/schemas/regions/";
 const NS_STAREA: &str = "http://ns.adobe.com/xmp/sType/Area#";
 const NS_STDIM: &str = "http://ns.adobe.com/xap/1.0/sType/Dimensions#";
 
-/// Properties chairphoto manages via [`write_iptc`], by (namespace, local name), in the
-/// order of [`managed_values`]. A write touches only the ones whose catalog value changed
-/// (issue #144): it removes every existing instance of a changed property — element or
-/// compact form, in every Description — and re-adds it when the new value is non-empty.
-/// Every other element in the sidecar, an unchanged managed property included, is preserved.
+/// One property [`write_iptc`] manages: its (namespace, local name) and the catalog field
+/// that holds its value, side by side so the mapping cannot drift between two lists.
+struct Managed {
+    ns: &'static str,
+    name: &'static str,
+    value: fn(&IptcFields) -> &str,
+}
+
+/// Properties chairphoto manages via [`write_iptc`]. A write touches only the ones whose
+/// catalog value changed (issue #144): it removes every existing instance of a changed
+/// property — element or compact form, in every Description — and re-adds it when the new
+/// value is non-empty. Every other element in the sidecar, an unchanged managed property
+/// included, is preserved.
 /// Note: `chairphoto:ImportBatch` is managed separately by [`write_import_batch`]
 /// and is intentionally NOT listed here so IPTC writes don't clobber it. Likewise
 /// `chairphoto:LastWrite` is not listed: every writer's completion stamp is applied
 /// uniformly by [`SidecarDocument::commit`], not per-writer.
-const MANAGED: [(&str, &str); 11] = [
-    (NS_DC, "description"),
-    (NS_DC, "title"),
-    (NS_DC, "rights"),
-    (NS_DC, "creator"),
-    (NS_PHOTOSHOP, "Headline"),
-    (NS_PHOTOSHOP, "Credit"),
-    (NS_PHOTOSHOP, "Source"),
-    (NS_PHOTOSHOP, "City"),
-    (NS_PHOTOSHOP, "State"),
-    (NS_PHOTOSHOP, "Country"),
-    (NS_IPTC, "CountryCode"),
+const MANAGED: [Managed; 11] = [
+    Managed { ns: NS_DC, name: "description", value: |f| &f.description },
+    Managed { ns: NS_DC, name: "title", value: |f| &f.title },
+    Managed { ns: NS_DC, name: "rights", value: |f| &f.copyright },
+    Managed { ns: NS_DC, name: "creator", value: |f| &f.creator },
+    Managed { ns: NS_PHOTOSHOP, name: "Headline", value: |f| &f.headline },
+    Managed { ns: NS_PHOTOSHOP, name: "Credit", value: |f| &f.credit },
+    Managed { ns: NS_PHOTOSHOP, name: "Source", value: |f| &f.source },
+    Managed { ns: NS_PHOTOSHOP, name: "City", value: |f| &f.city },
+    Managed { ns: NS_PHOTOSHOP, name: "State", value: |f| &f.state },
+    Managed { ns: NS_PHOTOSHOP, name: "Country", value: |f| &f.country },
+    Managed { ns: NS_IPTC, name: "CountryCode", value: |f| &f.country_code },
 ];
-
-/// The catalog value of each [`MANAGED`] property, in the same order.
-fn managed_values(f: &IptcFields) -> [&str; MANAGED.len()] {
-    [
-        &f.description,
-        &f.title,
-        &f.copyright,
-        &f.creator,
-        &f.headline,
-        &f.credit,
-        &f.source,
-        &f.city,
-        &f.state,
-        &f.country,
-        &f.country_code,
-    ]
-}
 
 /// The sidecar node for one managed property's non-empty value.
 fn managed_node(ns: &str, name: &str, value: &str) -> XMLNode {
@@ -106,14 +97,14 @@ pub fn sidecar_path(photo_path: &Path) -> PathBuf {
 pub fn write_iptc(photo_path: &Path, before: &IptcFields, after: &IptcFields) -> Result<(), String> {
     let mut owned = Vec::new();
     let mut replacements = Vec::new();
-    let values = managed_values(before).into_iter().zip(managed_values(after));
-    for (&(ns, name), (old, new)) in MANAGED.iter().zip(values) {
-        if old == new {
+    for m in &MANAGED {
+        let new = (m.value)(after);
+        if (m.value)(before) == new {
             continue;
         }
-        owned.push((ns, name));
+        owned.push((m.ns, m.name));
         if !new.is_empty() {
-            replacements.push(managed_node(ns, name, new));
+            replacements.push(managed_node(m.ns, m.name, new));
         }
     }
     if owned.is_empty() {
@@ -1503,6 +1494,48 @@ mod tests {
 
         assert_eq!(read(&sidecar_path(&photo)), test_fixtures::LIGHTROOM);
         assert!(!sidecar_backup_path(&sidecar_path(&photo)).exists());
+    }
+
+    /// Every catalog field lands in its own IPTC property — checked against a table written
+    /// out here, not derived from `MANAGED`, so a swapped mapping (Credit written as Source,
+    /// say) fails. Each field carries a distinct value.
+    #[test]
+    fn every_iptc_field_maps_to_its_own_property() {
+        let dir = crate::test_support::TestTmpDir::new("xmp-144-mapping");
+        let photo = dir.join("DSC144.ARW");
+        std::fs::write(&photo, b"raw").unwrap();
+        let fields = IptcFields {
+            description: "v-description".into(),
+            headline: "v-headline".into(),
+            title: "v-title".into(),
+            creator: "v-creator".into(),
+            copyright: "v-copyright".into(),
+            credit: "v-credit".into(),
+            source: "v-source".into(),
+            city: "v-city".into(),
+            state: "v-state".into(),
+            country: "v-country".into(),
+            country_code: "v-country_code".into(),
+        };
+        write_iptc(&photo, &IptcFields::default(), &fields).unwrap();
+
+        let xml = read(&sidecar_path(&photo));
+        let expected = [
+            (NS_DC, "description", "v-description"),
+            (NS_DC, "title", "v-title"),
+            (NS_DC, "rights", "v-copyright"),
+            (NS_DC, "creator", "v-creator"),
+            (NS_PHOTOSHOP, "Headline", "v-headline"),
+            (NS_PHOTOSHOP, "Credit", "v-credit"),
+            (NS_PHOTOSHOP, "Source", "v-source"),
+            (NS_PHOTOSHOP, "City", "v-city"),
+            (NS_PHOTOSHOP, "State", "v-state"),
+            (NS_PHOTOSHOP, "Country", "v-country"),
+            (NS_IPTC, "CountryCode", "v-country_code"),
+        ];
+        for (ns, name, value) in expected {
+            assert_eq!(test_fixtures::property_values(&xml, ns, name), [value], "{name}:\n{xml}");
+        }
     }
 
     #[test]

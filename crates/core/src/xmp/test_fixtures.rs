@@ -152,7 +152,7 @@ fn label(ns: &str, local: &str) -> String {
 
 /// Every managed IPTC property in the sidecar with all its values, labelled `prefix:local`.
 pub(crate) fn iptc(xml: &str) -> Vec<(String, Vec<String>)> {
-    MANAGED.iter().map(|&(ns, local)| (label(ns, local), property_values(xml, ns, local))).collect()
+    MANAGED.iter().map(|m| (label(m.ns, m.name), property_values(xml, m.ns, m.name))).collect()
 }
 
 /// What [`iptc`] reads from either foreign fixture before ChairPhoto writes anything.
@@ -168,8 +168,8 @@ pub(crate) fn foreign_iptc() -> Vec<(String, Vec<String>)> {
     ];
     MANAGED
         .iter()
-        .map(|&(ns, local)| {
-            let l = label(ns, local);
+        .map(|m| {
+            let l = label(m.ns, m.name);
             let values = foreign.iter().filter(|(f, _)| *f == l).map(|(_, v)| v.to_string()).collect();
             (l, values)
         })

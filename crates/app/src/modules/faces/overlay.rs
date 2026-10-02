@@ -16,9 +16,10 @@
 //! longer the one the boxes were measured in (React drew them there anyway, misplaced).
 //!
 //! **Where the transform comes from.** The slot hands a panel only a window, so the overlay
-//! finds the loupe's image through the window's root view ([`loupe_zoom`]) and observes it.
-//! That reads the loupe's public accessors and changes nothing in it. The pop-out loupe
-//! window (#110) needs its root added there — or the slot to carry the image; see the seam.
+//! asks the host which loupe image that window shows ([`loupe_zoom`], i.e.
+//! [`crate::loupe::view::loupe_image`]: the inline loupe's in the main window, the pop-out's in
+//! the pop-out, #110) and observes it. That reads the loupe's public accessors and changes
+//! nothing in it.
 
 use super::logic::{bbox_to_screen, chip_name, drag_to_bbox, state_color};
 use super::picker::{PersonPicker, PickerEvent};
@@ -38,12 +39,10 @@ use gpui_kit::{
 /// The per-machine preference: `"0"` hides the boxes.
 pub const SHOW_BOXES_PREF: &str = "faces.showBoxes";
 
-/// The loupe image of `window`: the main window's inline loupe. The pop-out loupe (#110)
-/// adds its own root here when it lands.
+/// The loupe image `window` shows — the main window's inline loupe, or the pop-out's (#110) —
+/// as every loupe registers it before building its loupe-slot panels.
 pub fn loupe_zoom(window: &Window, cx: &App) -> Option<Entity<ZoomImage>> {
-    let root = window.root::<gpui_kit::base::Root>().flatten()?;
-    let view = root.read(cx).view().clone().downcast::<crate::view::RootView>().ok()?;
-    Some(view.read(cx).loupe().read(cx).zoom().clone())
+    crate::loupe::view::loupe_image(window, cx)
 }
 
 /// What the overlay draws against this frame.

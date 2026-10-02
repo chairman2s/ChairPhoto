@@ -721,3 +721,124 @@ fn overlay_keys_and_drawing_a_missed_face(cx: &mut TestAppContext) {
     f.click(&format!("faces-delete-{}", drawn.id), cx);
     assert_eq!(with_cat(&f.app, |c| core_faces::faces_for_photo(c, photo).unwrap()).len(), 1);
 }
+
+// --- any window: the pop-out loupe (#110) ---------------------------------------------------
+
+fn in_window<R: 'static>(
+    h: AnyWindowHandle,
+    cx: &mut TestAppContext,
+    f: impl FnOnce(&mut gpui_kit::Window, &mut gpui_kit::App) -> R,
+) -> R {
+    cx.update_window(h, |_, window, cx| {
+        window.render_frame(cx);
+        f(window, cx)
+    })
+    .unwrap()
+}
+
+fn present_in(h: AnyWindowHandle, id: &str, cx: &mut TestAppContext) -> bool {
+    let id = SharedString::from(id.to_string());
+    in_window(h, cx, |window, _| window.try_find(id).is_some())
+}
+
+fn bounds_in(h: AnyWindowHandle, id: &str, cx: &mut TestAppContext) -> gpui_kit::Bounds<gpui_kit::Pixels> {
+    let id = SharedString::from(id.to_string());
+    in_window(h, cx, |window, _| window.find(id).bounds())
+}
+
+fn press_in(f: &Faces, h: AnyWindowHandle, key: &'static str, cx: &mut TestAppContext) {
+    in_window(h, cx, |window, cx| window.press(key, cx));
+    work(&f.app, cx);
+}
+
+fn click_in(f: &Faces, h: AnyWindowHandle, id: &str, cx: &mut TestAppContext) {
+    let id = SharedString::from(id.to_string());
+    in_window(h, cx, |window, cx| window.click(id, cx));
+    work(&f.app, cx);
+}
+
+/// One left-button drag from `from` to `to` (window coordinates) in `h`.
+fn drag_in(
+    f: &Faces,
+    h: AnyWindowHandle,
+    from: gpui_kit::Point<gpui_kit::Pixels>,
+    to: gpui_kit::Point<gpui_kit::Pixels>,
+    cx: &mut TestAppContext,
+) {
+    in_window(h, cx, |window, cx| {
+        window.dispatch_event(MouseMoveEvent { position: from, pressed_button: None, modifiers: Modifiers::default() }.to_platform_input(), cx);
+        window.dispatch_event(
+            MouseDownEvent { button: MouseButton::Left, position: from, modifiers: Modifiers::default(), click_count: 1, first_mouse: false }
+                .to_platform_input(),
+            cx,
+        );
+        window.render_frame(cx);
+        window.dispatch_event(
+            MouseMoveEvent { position: to, pressed_button: Some(MouseButton::Left), modifiers: Modifiers::default() }.to_platform_input(),
+            cx,
+        );
+        window.render_frame(cx);
+        window.dispatch_event(
+            MouseUpEvent { button: MouseButton::Left, position: to, modifiers: Modifiers::default(), click_count: 1 }.to_platform_input(),
+            cx,
+        );
+        window.render_frame(cx);
+    });
+    work(&f.app, cx);
+}
+
+fn drawn_faces(f: &Faces, photo: i64) -> Vec<core_faces::FaceForPhoto> {
+    with_cat(&f.app, |c| core_faces::faces_for_photo(c, photo).unwrap()).into_iter().filter(|r| r.source == "drawn").collect()
+}
+
+fn open_popout(cx: &mut TestAppContext) -> AnyWindowHandle {
+    cx.update(crate::loupe::window::open);
+    cx.run_until_parked();
+    cx.update(|cx| crate::loupe::window::handle(cx)).expect("the pop-out opened")
+}
+
+fn popout_zoom(cx: &mut TestAppContext) -> Entity<ZoomImage> {
+    let view = cx.update(|cx| crate::loupe::window::view(cx)).expect("open");
+    view.read_with(cx, |v, cx| v.loupe().read(cx).zoom().clone())
+}
+
+fn close_bbox(got: FaceBboxJson, want: (f32, f32, f32, f32)) -> bool {
+    let close = |a: f32, b: f32| (a - b).abs() < 0.01;
+    close(got.x, want.0) && close(got.y, want.1) && close(got.w, want.2) && close(got.h, want.3)
+}
+
+/// The overlay works in the pop-out loupe (#110) as in the inline one: the boxes sit on the
+/// pop-out's own picture, F toggles them there, and "＋ face" draws a face there — with the
+/// main window on the grid, so no inline loupe is drawing anything.
+#[gpui_kit::test]
+fn the_overlay_works_in_the_pop_out(cx: &mut TestAppContext) {
+    cx.update(|cx| cx.set_global(MachinePrefs::in_memory()));
+    let f = open_faces(1, true, "faces-popout", cx);
+    let photo = f.ids[0];
+    let a = add_face(&f.app, photo, "[0.25,0.5,0.25,0.25]");
+    f.select(photo, cx);
+    let h = open_popout(cx);
+    f.pool.finish(&JobKey::photo(photo, ImageKind::Preview), Ok(pixels(400, 200)));
+    work(&f.app, cx);
+    assert_eq!(f.app.wired.shell.read_with(cx, |s, _| s.stage_view()), crate::shell::state::StageView::Grid);
+
+    let box_id = format!("faces-box-{a}");
+    assert!(present_in(h, &box_id, cx), "the pop-out draws the boxes");
+    let zoom = popout_zoom(cx);
+    let c = zoom.read_with(cx, |z, _| z.bounds().unwrap());
+    let size = (f32::from(c.size.width), f32::from(c.size.height));
+    assert_rect(bounds_in(h, &box_id, cx), c.origin, expected(bb(0.25, 0.5, 0.25, 0.25), (400., 200.), size, ZoomView::FIT));
+
+    press_in(&f, h, "f", cx);
+    assert!(!present_in(h, &box_id, cx), "F in the pop-out hid the boxes");
+    press_in(&f, h, "f", cx);
+    assert!(present_in(h, &box_id, cx), "…and showed them again");
+
+    click_in(&f, h, "faces-draw", cx);
+    let (l, t, w, hh) = ZoomView::FIT.placement((400., 200.), size);
+    let at = |x: f32, y: f32| c.origin + point(px(l + x * w), px(t + y * hh));
+    drag_in(&f, h, at(0.6, 0.2), at(0.8, 0.6), cx);
+    let drawn = drawn_faces(&f, photo);
+    assert_eq!(drawn.len(), 1, "one face drawn in the pop-out");
+    assert!(close_bbox(drawn[0].bbox, (0.6, 0.2, 0.2, 0.4)), "{:?}", drawn[0].bbox);
+}

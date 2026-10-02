@@ -605,6 +605,20 @@ pub(crate) fn index_bundle_with(
         }
     }
 
+    // Step C.1 — #148: a new photo's IPTC came from the manifest, and the sidecar beside it
+    // (the bundle's own, possibly stale, or a bare identity sidecar) need not carry it.
+    // `set_iptc` recorded the fields as owed; write them now. A failure leaves them owed for
+    // the repair pass rather than being logged and forgotten.
+    for &photo_id in &newly_created {
+        match catalog.write_owed_iptc(photo_id) {
+            Ok(Some((crate::catalog::IptcSettled::Failed(e), _))) => {
+                eprintln!("bundle import: IPTC sidecar write for photo {photo_id} owed for repair: {e}")
+            }
+            Ok(_) => {}
+            Err(e) => eprintln!("bundle import: couldn't write owed IPTC for photo {photo_id}: {e}"),
+        }
+    }
+
     // Apply auto-tags (monochrome, long-exposure, etc.) and pair RAW+JPEG stacks.
     let _ = catalog.apply_auto_tags();
     let _ = catalog.pair_raw_jpeg_stacks();
@@ -835,6 +849,48 @@ mod tests {
         assert_eq!(photo.rating, 3);
         let iptc = catalog.get_iptc(photo.id).unwrap();
         assert_eq!(iptc.headline, "Test sunset");
+    }
+
+    /// #148 (review of #144, L1): the bundle's IPTC reaches the catalog and, from there, the
+    /// sidecar beside the extracted original — which the bundle need not have carried it in.
+    #[test]
+    fn index_bundle_writes_the_bundles_iptc_into_the_sidecar() {
+        let bundle_path = make_test_bundle("iptc-148", "uuid-iptc-148", "2026/06/28/DSC01234.ARW");
+        let (manifest, mut archive) = open_bundle(&bundle_path).expect("open_bundle");
+        let (catalog, root) = temp_catalog("iptc-148");
+        let (extracted, partial) =
+            extract_originals(&manifest, &mut archive, &root, |_, _| {}).expect("extract_originals");
+        index_bundle(&catalog, &manifest, &extracted, &root, partial).expect("index_bundle");
+
+        let photo = catalog.get_photo_by_uuid(&crate::catalog::photo_identity_for("uuid-iptc-148").unwrap()).unwrap();
+        let xmp = crate::xmp::sidecar_path(&catalog.require_photo_path(photo.id).unwrap());
+        let xml = std::fs::read_to_string(&xmp).unwrap();
+        assert!(xml.contains("Test sunset"), "the bundle's headline is in the sidecar:\n{xml}");
+        assert_eq!(catalog.owed_iptc(photo.id).unwrap(), crate::catalog::IptcMask::NONE);
+    }
+
+    /// A bundle photo whose sidecar cannot take its IPTC (here: an unparseable sidecar in the
+    /// bundle) is left owing it, and the repair pass writes it once the sidecar is fixed.
+    #[test]
+    fn index_bundle_owes_iptc_a_sidecar_could_not_take() {
+        let bundle_path = make_test_bundle("iptc-148-owed", "uuid-iptc-148-owed", "2026/06/28/DSC01234.ARW");
+        let (manifest, mut archive) = open_bundle(&bundle_path).expect("open_bundle");
+        let (catalog, root) = temp_catalog("iptc-148-owed");
+        let (extracted, partial) =
+            extract_originals(&manifest, &mut archive, &root, |_, _| {}).expect("extract_originals");
+        let xmp = crate::xmp::sidecar_path(&extracted[0].dest);
+        std::fs::write(&xmp, "<x:xmpmeta not xml").unwrap();
+        index_bundle(&catalog, &manifest, &extracted, &root, partial).expect("index_bundle");
+
+        let photo = catalog.get_photo_by_uuid(&crate::catalog::photo_identity_for("uuid-iptc-148-owed").unwrap()).unwrap();
+        assert_eq!(catalog.owed_iptc(photo.id).unwrap(), crate::catalog::IptcMask::HEADLINE);
+        assert_eq!(catalog.summarize_pending_identity().unwrap().iptc_owed, 1);
+
+        std::fs::remove_file(&xmp).unwrap();
+        let summary = catalog.repair_pending_identity().unwrap();
+        assert_eq!(summary.iptc_written, 1, "{summary:?}");
+        assert!(std::fs::read_to_string(&xmp).unwrap().contains("Test sunset"));
+        assert_eq!(catalog.owed_iptc(photo.id).unwrap(), crate::catalog::IptcMask::NONE);
     }
 
     #[test]

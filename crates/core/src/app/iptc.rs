@@ -2,23 +2,65 @@
 //!
 //! Shared by the Tauri `set_iptc` command and the GPUI inspector (gpui #108).
 
-use super::{with_catalog, AppState};
-use crate::catalog::IptcFields;
+use super::{AppState, CatalogIdentity};
+use crate::catalog::{IptcFields, IptcSettled, IptcSidecarState, IptcSidecarWrite};
 
-/// Store `fields` in the catalog, then write the change to the photo's XMP sidecar
-/// (merge-safe: `xmp::write_iptc` touches only the managed IPTC fields whose catalog value
-/// this save changed, so a sidecar value ChairPhoto never imported survives a save that
-/// left that field alone — issue #144). The sidecar sits next to the original the location
-/// resolver finds. With no reachable copy the save fails closed: the error says why, and
-/// neither the catalog nor the sidecar changes, so a retry once the original is back writes
-/// the whole change (a stored change with no sidecar write would make a retry a no-op).
+/// What an IPTC save did. The catalog half always succeeded (a failure there is the save's
+/// `Err`); `sidecar` says whether the sidecar has caught up.
 ///
-/// Blocking: the catalog lock is held only for the path lookup, the read of the previous
-/// values and the store — one hold, so the change written is the change stored — and the
-/// sidecar's read-modify-write runs after it is released. Call it off the UI thread.
-pub fn save_iptc(state: &AppState, photo_id: i64, fields: &IptcFields) -> Result<(), String> {
-    let (original, before) = with_catalog(state, |c| store(c, photo_id, fields))?;
-    crate::xmp::write_iptc(&original, &before, fields)
+/// The Tauri `set_iptc` command returns this where it used to return nothing, so a caller
+/// that ignored the result still works.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IptcSaveOutcome {
+    /// `written`: the sidecar now has every value the catalog holds. `unchanged`: nothing
+    /// was owed, so the sidecar was not opened. `pending`: saved to the catalog only — the
+    /// fields stay owed (#148) and the next save or the repair pass writes them.
+    pub sidecar: IptcSidecarState,
+    /// Why the sidecar is pending, when it is.
+    pub reason: Option<String>,
+}
+
+impl IptcSaveOutcome {
+    fn from_settled(settled: IptcSettled) -> Self {
+        let reason = match &settled {
+            IptcSettled::Failed(e) => Some(e.clone()),
+            IptcSettled::Superseded => Some("a newer change to this photo's IPTC is being written".into()),
+            IptcSettled::Written | IptcSettled::Unchanged => None,
+        };
+        IptcSaveOutcome { sidecar: settled.state(), reason }
+    }
+
+    /// The status line a front end shows for it. Never claims a sidecar write that did not
+    /// happen.
+    pub fn status(&self) -> String {
+        match (self.sidecar, &self.reason) {
+            (IptcSidecarState::Written, _) => "Saved to sidecar".into(),
+            (IptcSidecarState::Unchanged, _) => "Saved — the sidecar already had these values".into(),
+            (IptcSidecarState::Pending, Some(why)) => format!("Saved to catalog; sidecar pending ({why})"),
+            (IptcSidecarState::Pending, None) => "Saved to catalog; sidecar pending".into(),
+        }
+    }
+}
+
+/// Store `fields` in the catalog, then write the photo's owed IPTC to its XMP sidecar
+/// (merge-safe: `xmp::write_iptc_fields` touches only the managed fields this save changed
+/// plus any an earlier write left owed — #144, #148 — so a sidecar value ChairPhoto never
+/// imported survives a save that left that field alone). The sidecar sits next to the
+/// original the location resolver finds.
+///
+/// With no reachable copy the save fails closed: the error says why, and neither the
+/// catalog nor the sidecar changes. Once the catalog has stored the values, a sidecar write
+/// that fails (read-only storage, an unparseable sidecar, a volume gone mid-save) is not an
+/// error: the fields stay owed and the outcome says `pending`. The next save of the photo or
+/// the repair pass writes them.
+///
+/// Blocking: the catalog lock is held for the path lookup and the store (one hold, so the
+/// fields owed are the change stored), released for the sidecar's read-modify-write, and
+/// taken again for the compare-and-set that records it. Call it off the UI thread.
+pub fn save_iptc(state: &AppState, photo_id: i64, fields: &IptcFields) -> Result<IptcSaveOutcome, String> {
+    let (identity, (original, write)) = super::with_catalog_identified(state, |c| store(c, photo_id, fields))?;
+    Ok(write_and_settle(state, identity, &original, &write))
 }
 
 /// [`save_iptc`] of a photo read from the catalog `expected` names: the store and the path
@@ -26,26 +68,44 @@ pub fn save_iptc(state: &AppState, photo_id: i64, fields: &IptcFields) -> Result
 /// other catalog's row with the same id nor its photo's sidecar is written.
 pub fn save_iptc_as(
     state: &AppState,
-    expected: super::CatalogIdentity,
+    expected: CatalogIdentity,
     photo_id: i64,
     fields: &IptcFields,
-) -> Result<(), String> {
-    let (original, before) = super::with_catalog_as(state, expected, |c| store(c, photo_id, fields))?;
-    crate::xmp::write_iptc(&original, &before, fields)
+) -> Result<IptcSaveOutcome, String> {
+    let (original, write) = super::with_catalog_as(state, expected, |c| store(c, photo_id, fields))?;
+    Ok(write_and_settle(state, expected, &original, &write))
 }
 
-/// Store `fields`, returning the original's path and the values they replaced. The path is
-/// resolved before the row is written (as the geocoder's `fill_in` does), so an unreachable
-/// original leaves the catalog unchanged.
+/// Do `write`'s sidecar IO off the lock, then record it in the catalog that stored it. A
+/// switch in between leaves the fields owed in that catalog, for its next repair pass.
+pub(crate) fn write_and_settle(
+    state: &AppState,
+    identity: CatalogIdentity,
+    original: &std::path::Path,
+    write: &IptcSidecarWrite,
+) -> IptcSaveOutcome {
+    let outcome = write.run(original);
+    match super::with_catalog_as(state, identity, |c| c.settle_iptc_write(write, &outcome)) {
+        Ok(settled) => IptcSaveOutcome::from_settled(settled),
+        Err(_) if write.fields.is_empty() => IptcSaveOutcome { sidecar: IptcSidecarState::Unchanged, reason: None },
+        Err(e) => IptcSaveOutcome {
+            sidecar: IptcSidecarState::Pending,
+            reason: Some(format!("could not record the sidecar write: {e}")),
+        },
+    }
+}
+
+/// Store `fields`, returning the original's path and the sidecar write the store owes. The
+/// path is resolved before the row is written (as the geocoder's `fill_in` does), so an
+/// unreachable original leaves the catalog unchanged.
 fn store(
     c: &crate::catalog::Catalog,
     photo_id: i64,
     fields: &IptcFields,
-) -> crate::catalog::Result<(std::path::PathBuf, IptcFields)> {
+) -> crate::catalog::Result<(std::path::PathBuf, IptcSidecarWrite)> {
     let original = c.require_photo_path(photo_id)?;
-    let before = c.get_iptc(photo_id)?;
-    c.set_iptc(photo_id, fields)?;
-    Ok((original, before))
+    let write = c.set_iptc(photo_id, fields)?;
+    Ok((original, write))
 }
 
 #[cfg(test)]
@@ -148,5 +208,168 @@ mod tests {
             assert_eq!(iptc(&xml), expected, "{layout}:\n{xml}");
             assert_non_iptc_intact(&xml, layout);
         }
+    }
+
+    // ── #148: a sidecar write that fails after the store is owed, and retried ─────────
+
+    fn owed(state: &AppState, id: i64) -> crate::catalog::IptcMask {
+        state.catalog.lock().unwrap().as_ref().unwrap().owed_iptc(id).unwrap()
+    }
+
+    fn repair(state: &AppState) -> crate::catalog::IdentityRepairSummary {
+        state.catalog.lock().unwrap().as_ref().unwrap().repair_pending_identity().unwrap()
+    }
+
+    fn typed() -> IptcFields {
+        IptcFields { title: "Mine".into(), creator: "Me".into(), ..Default::default() }
+    }
+
+    /// The Lightroom fixture's IPTC once `typed()` has reached it.
+    fn written() -> Vec<(String, Vec<String>)> {
+        with(with(foreign_iptc(), "dc:title", &["Mine"]), "dc:creator", &["Me"])
+    }
+
+    #[cfg(unix)]
+    fn set_mode(path: &std::path::Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    /// Read-only storage: the save reaches the catalog, reports the sidecar pending (never
+    /// "Saved to sidecar"), and owes both fields. Once the volume is writable the repair pass
+    /// writes them and nothing is owed.
+    #[cfg(unix)]
+    #[test]
+    fn a_read_only_volume_leaves_the_fields_owed_and_the_pass_writes_them() {
+        let (dir, state, id, xmp) = foreign_photo("iptc-148-ro", crate::xmp::test_fixtures::LIGHTROOM);
+        let library = dir.join("library");
+        set_mode(&xmp, 0o444);
+        set_mode(&library, 0o555);
+        if std::fs::write(library.join("probe"), b"").is_ok() {
+            set_mode(&library, 0o755);
+            println!("SKIPPED: a_read_only_volume_leaves_the_fields_owed_and_the_pass_writes_them — running with permission to write a read-only directory (root?)");
+            return;
+        }
+
+        let outcome = save_iptc(&state, id, &typed()).unwrap();
+        set_mode(&library, 0o755);
+        set_mode(&xmp, 0o644);
+        assert_eq!(outcome.sidecar, crate::catalog::IptcSidecarState::Pending, "{outcome:?}");
+        assert!(outcome.status().starts_with("Saved to catalog; sidecar pending"), "{}", outcome.status());
+        assert_eq!(read(&xmp), crate::xmp::test_fixtures::LIGHTROOM, "nothing reached the sidecar");
+        assert_eq!(owed(&state, id), crate::catalog::IptcMask::TITLE | crate::catalog::IptcMask::CREATOR);
+
+        let summary = repair(&state);
+        assert_eq!((summary.iptc_written, summary.iptc_failed, summary.total), (1, 0, 1), "{summary:?}");
+        let xml = read(&xmp);
+        assert_eq!(iptc(&xml), written(), "the pass wrote the owed fields:\n{xml}");
+        assert_eq!(owed(&state, id), crate::catalog::IptcMask::NONE);
+    }
+
+    /// An unparseable sidecar: pending and owed. Once the file parses again, a re-save of
+    /// the same values (the retry a user makes) writes them — it is no longer a no-op.
+    #[test]
+    fn an_unparseable_sidecar_leaves_the_fields_owed_and_a_re_save_writes_them() {
+        let (_dir, state, id, xmp) = foreign_photo("iptc-148-garbage", "<x:xmpmeta this is not xml");
+        let outcome = save_iptc(&state, id, &typed()).unwrap();
+        assert_eq!(outcome.sidecar, crate::catalog::IptcSidecarState::Pending, "{outcome:?}");
+        assert!(outcome.reason.is_some());
+        assert_eq!(owed(&state, id), crate::catalog::IptcMask::TITLE | crate::catalog::IptcMask::CREATOR);
+        let stored = state.catalog.lock().unwrap().as_ref().unwrap().get_iptc(id).unwrap();
+        assert_eq!(stored, typed(), "the catalog has the values");
+
+        // A pass while the file is still broken leaves the fields owed and says so.
+        let summary = repair(&state);
+        assert_eq!((summary.iptc_written, summary.iptc_failed), (0, 1), "{summary:?}");
+        assert_eq!(owed(&state, id), crate::catalog::IptcMask::TITLE | crate::catalog::IptcMask::CREATOR);
+
+        std::fs::write(&xmp, crate::xmp::test_fixtures::LIGHTROOM).unwrap();
+        let outcome = save_iptc(&state, id, &typed()).unwrap();
+        assert_eq!(outcome.sidecar, crate::catalog::IptcSidecarState::Written, "{outcome:?}");
+        let xml = read(&xmp);
+        assert_eq!(iptc(&xml), written(), "the re-save wrote the owed fields:\n{xml}");
+        assert_eq!(owed(&state, id), crate::catalog::IptcMask::NONE);
+
+        // With nothing owed, a further identical save writes nothing and says so.
+        let outcome = save_iptc(&state, id, &typed()).unwrap();
+        assert_eq!(outcome.sidecar, crate::catalog::IptcSidecarState::Unchanged);
+        assert!(!outcome.status().contains("sidecar pending"));
+    }
+
+    /// The volume unmounts between the store and the sidecar write: the fields stay owed,
+    /// and once it is back the repair pass writes them. A pass while it is away counts the
+    /// photo unreachable and leaves it owed.
+    #[test]
+    fn an_unmount_mid_save_leaves_the_fields_owed_and_the_pass_writes_them_once_mounted() {
+        let (dir, state, id, xmp) = foreign_photo("iptc-148-unmount", crate::xmp::test_fixtures::LIGHTROOM);
+        let identity = crate::app::catalog_identity(&state).unwrap();
+        let (original, write) =
+            crate::app::with_catalog_as(&state, identity, |c| store(c, id, &typed())).unwrap();
+        let library = dir.join("library");
+        let away = dir.join("library.away");
+        std::fs::rename(&library, &away).unwrap();
+
+        let outcome = write_and_settle(&state, identity, &original, &write);
+        assert_eq!(outcome.sidecar, crate::catalog::IptcSidecarState::Pending, "{outcome:?}");
+        assert_eq!(owed(&state, id), crate::catalog::IptcMask::TITLE | crate::catalog::IptcMask::CREATOR);
+        let summary = repair(&state);
+        assert_eq!((summary.iptc_written, summary.iptc_unreachable), (0, 1), "{summary:?}");
+
+        std::fs::rename(&away, &library).unwrap();
+        let summary = repair(&state);
+        assert_eq!(summary.iptc_written, 1, "{summary:?}");
+        let xml = read(&xmp);
+        assert_eq!(iptc(&xml), written(), "{xml}");
+        assert_eq!(owed(&state, id), crate::catalog::IptcMask::NONE);
+    }
+
+    /// Two saves overlap: the older one's write runs after the newer one's store. Its
+    /// compare-and-set must not clear the newer save's debt — the sidecar it wrote holds the
+    /// older title — and the next write puts the catalog's values on disk.
+    #[test]
+    fn a_stale_save_does_not_clear_a_newer_saves_debt() {
+        let (_dir, state, id, xmp) = foreign_photo("iptc-148-cas", crate::xmp::test_fixtures::LIGHTROOM);
+        let identity = crate::app::catalog_identity(&state).unwrap();
+        let older = IptcFields { title: "Older".into(), ..Default::default() };
+        let newer = IptcFields { title: "Newer".into(), creator: "Me".into(), ..Default::default() };
+        let (original, a) = crate::app::with_catalog_as(&state, identity, |c| store(c, id, &older)).unwrap();
+        let (_, b) = crate::app::with_catalog_as(&state, identity, |c| store(c, id, &newer)).unwrap();
+
+        let outcome = write_and_settle(&state, identity, &original, &a);
+        assert_eq!(outcome.sidecar, crate::catalog::IptcSidecarState::Pending, "{outcome:?}");
+        assert!(iptc(&read(&xmp)).contains(&("dc:title".into(), vec!["Older".into()])));
+        assert_eq!(owed(&state, id), crate::catalog::IptcMask::TITLE | crate::catalog::IptcMask::CREATOR);
+
+        // The newer save's own write lands; it was read before the stale write re-owed, so it
+        // too reports pending rather than claiming the sidecar is settled.
+        let outcome = write_and_settle(&state, identity, &original, &b);
+        assert_eq!(outcome.sidecar, crate::catalog::IptcSidecarState::Pending, "{outcome:?}");
+        assert_eq!(repair(&state).iptc_written, 1);
+        let xml = read(&xmp);
+        let expected = with(with(foreign_iptc(), "dc:title", &["Newer"]), "dc:creator", &["Me"]);
+        assert_eq!(iptc(&xml), expected, "{xml}");
+        assert_eq!(owed(&state, id), crate::catalog::IptcMask::NONE);
+    }
+
+    /// The newer save writes and settles first, then the older save's bytes land: they are
+    /// the last on disk, so the older save owes its fields again and the pass restores the
+    /// catalog's values.
+    #[test]
+    fn a_stale_write_landing_after_the_newer_one_is_repaired() {
+        let (_dir, state, id, xmp) = foreign_photo("iptc-148-late", crate::xmp::test_fixtures::LIGHTROOM);
+        let identity = crate::app::catalog_identity(&state).unwrap();
+        let older = IptcFields { title: "Older".into(), ..Default::default() };
+        let newer = IptcFields { title: "Newer".into(), ..Default::default() };
+        let (original, a) = crate::app::with_catalog_as(&state, identity, |c| store(c, id, &older)).unwrap();
+        let (_, b) = crate::app::with_catalog_as(&state, identity, |c| store(c, id, &newer)).unwrap();
+
+        let outcome = write_and_settle(&state, identity, &original, &b);
+        assert_eq!(outcome.sidecar, crate::catalog::IptcSidecarState::Written, "{outcome:?}");
+        write_and_settle(&state, identity, &original, &a);
+        assert!(iptc(&read(&xmp)).contains(&("dc:title".into(), vec!["Older".into()])), "the stale bytes landed last");
+        assert_eq!(owed(&state, id), crate::catalog::IptcMask::TITLE, "so the title is owed again");
+
+        repair(&state);
+        assert_eq!(iptc(&read(&xmp)), with(foreign_iptc(), "dc:title", &["Newer"]));
     }
 }

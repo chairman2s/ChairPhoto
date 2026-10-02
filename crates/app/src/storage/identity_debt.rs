@@ -273,6 +273,11 @@ pub fn summary_headline(summary: Option<&PendingIdentitySummary>) -> String {
     if s.dismissed > 0 {
         line += &format!("{} {} dismissed", if s.conflicts > 0 { "," } else { " —" }, s.dismissed);
     }
+    // #148: IPTC the catalog holds that a sidecar has not received; the pass retries it too.
+    if s.iptc_owed > 0 {
+        let (photos, owe) = if s.iptc_owed == 1 { ("photo", "owes") } else { ("photos", "owe") };
+        line += &format!("; {} {photos} {owe} IPTC to a sidecar", s.iptc_owed);
+    }
     line
 }
 
@@ -287,8 +292,15 @@ pub fn repair_summary_line(s: &IdentityRepairSummary) -> String {
     if s.superseded > 0 {
         parts.push(format!("{} decided elsewhere while the pass ran", s.superseded));
     }
+    // Only when the pass met owed IPTC (#148): permanent zeros would read as a failure mode.
+    if s.iptc_written + s.iptc_unreachable + s.iptc_failed > 0 {
+        parts.push(format!(
+            "IPTC written {}, still unreachable {}, failed {}",
+            s.iptc_written, s.iptc_unreachable, s.iptc_failed
+        ));
+    }
     let lead = if s.aborted {
-        format!("Stopped after {} of {}", s.bound + s.unreachable + s.conflicts + s.failed + s.superseded, s.total)
+        format!("Stopped after {} of {}", s.done(), s.total)
     } else {
         "Finished".into()
     };
@@ -402,7 +414,7 @@ impl Render for IdentityDebtPanel {
                  Adopting an identity another photo already holds is refused — no two photos may share one.",
                 colors,
             ));
-        let can_start = !repair.running && summary.is_some_and(|s| s.total > 0);
+        let can_start = !repair.running && summary.is_some_and(|s| s.total > 0 || s.iptc_owed > 0);
         let mut controls = ui::row().child(ui::clickable(
             ui::primary("repair-start", if repair.running { "Repairing…" } else { "Start repair pass" }, can_start, colors),
             can_start,
@@ -550,7 +562,7 @@ mod tests {
     use super::*;
 
     fn summary(total: i64, conflicts: i64, dismissed: i64) -> PendingIdentitySummary {
-        PendingIdentitySummary { total, conflicts, dismissed }
+        PendingIdentitySummary { total, conflicts, dismissed, iptc_owed: 0 }
     }
 
     /// The cases IdentityDebtPanel.test.ts pinned for `summaryHeadline`.
@@ -561,6 +573,33 @@ mod tests {
         assert_eq!(summary_headline(Some(&summary(3, 1, 0))), "3 copies owe their identity to a sidecar — 1 conflict");
         assert_eq!(summary_headline(Some(&summary(3, 2, 4))), "3 copies owe their identity to a sidecar — 2 conflicts, 4 dismissed");
         assert_eq!(summary_headline(Some(&summary(0, 0, 2))), "0 copies owe their identity to a sidecar — 2 dismissed");
+    }
+
+    /// #148: the cases IdentityDebtPanel.test.ts pins for owed IPTC.
+    #[test]
+    fn owed_iptc_is_named_only_when_there_is_some() {
+        let owing = |total, iptc_owed| PendingIdentitySummary { iptc_owed, ..summary(total, 0, 0) };
+        assert!(!summary_headline(Some(&owing(1, 0))).contains("IPTC"));
+        assert_eq!(
+            summary_headline(Some(&owing(0, 1))),
+            "0 copies owe their identity to a sidecar; 1 photo owes IPTC to a sidecar"
+        );
+        assert_eq!(
+            summary_headline(Some(&owing(2, 3))),
+            "2 copies owe their identity to a sidecar; 3 photos owe IPTC to a sidecar"
+        );
+        let s = IdentityRepairSummary {
+            iptc_written: 2,
+            iptc_unreachable: 1,
+            iptc_failed: 1,
+            total: 9,
+            aborted: true,
+            ..Default::default()
+        };
+        let line = repair_summary_line(&s);
+        assert!(line.contains("IPTC written 2, still unreachable 1, failed 1"), "{line}");
+        assert!(line.starts_with("Stopped after 4 of 9"), "{line}");
+        assert!(!repair_summary_line(&IdentityRepairSummary::default()).contains("IPTC"));
     }
 
     #[test]

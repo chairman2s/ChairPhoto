@@ -369,19 +369,24 @@ fn with_bound<T>(
     }
 }
 
-/// The sidecar half of a fill, done off the catalog lock: the original, and the IPTC before
-/// and after the fill.
+/// The sidecar half of a fill, done off the catalog lock: the original, and the sidecar
+/// write the fill's store owes (the filled fields, plus any an earlier write left owed).
 struct SidecarFill {
     original: std::path::PathBuf,
-    before: crate::catalog::IptcFields,
-    after: crate::catalog::IptcFields,
+    write: crate::catalog::IptcSidecarWrite,
 }
 
 impl SidecarFill {
-    /// Write only the filled fields: `xmp::write_iptc` leaves every field the fill did not
-    /// change — a foreign creator, rights or caption included — as the sidecar has it (#144).
-    fn write(&self) -> Result<(), String> {
-        crate::xmp::write_iptc(&self.original, &self.before, &self.after)
+    /// Write only the owed fields: every field neither this fill nor an earlier failed write
+    /// changed — a foreign creator, rights or caption included — stays as the sidecar has
+    /// it (#144). Settled in the catalog the fill stored in; a failure leaves the fields
+    /// owed for the next save or repair pass (#148), and is answered as an error.
+    fn write(&self, state: &crate::app::AppState, identity: CatalogIdentity) -> Result<(), String> {
+        let outcome = crate::app::iptc::write_and_settle(state, identity, &self.original, &self.write);
+        match outcome.sidecar {
+            crate::catalog::IptcSidecarState::Pending => Err(outcome.status()),
+            _ => Ok(()),
+        }
     }
 }
 
@@ -403,8 +408,8 @@ fn fill_in(
             return Ok(None);
         }
         let original = c.require_photo_path(photo_id)?;
-        c.set_iptc(photo_id, &updated)?;
-        Ok(Some(SidecarFill { original, before: current, after: updated }))
+        let write = c.set_iptc(photo_id, &updated)?;
+        Ok(Some(SidecarFill { original, write }))
     })
 }
 
@@ -485,7 +490,7 @@ pub async fn geocode_photo_to_iptc(
     let Some(fill) = fill_in(state, identity, photo_id, &geo)? else {
         return Ok(false);
     };
-    fill.write()?;
+    fill.write(state, identity)?;
     Ok(true)
 }
 
@@ -588,7 +593,7 @@ pub async fn geocode_all_to_iptc_with(
         // Counted as filled only when the sidecar write also succeeded, so the summary does
         // not claim a photo whose sidecar diverged.
         if let Some(fill) = write {
-            if fill.write().is_ok() {
+            if fill.write(state, identity).is_ok() {
                 filled += 1;
             }
         }
@@ -987,7 +992,9 @@ mod tests {
     /// Issue #144: both fill paths write only the location fields they filled. A foreign
     /// Lightroom sidecar's creator, rights, caption and headline — never imported, so empty
     /// in the catalog — survive, and so does its title although the catalog holds a
-    /// different one: the fill did not change the title, so it is not ChairPhoto's to write.
+    /// different one: the fill did not change the title, and the sidecar is not owed it (the
+    /// title reached it earlier and another tool changed it since), so it is not ChairPhoto's
+    /// to write. A title still owed would be written (#148; `app::iptc` tests).
     #[tokio::test]
     async fn a_fill_writes_only_the_fields_it_filled_into_a_foreign_sidecar() {
         use crate::xmp::test_fixtures::{assert_non_iptc_intact, foreign_iptc, iptc, with, LIGHTROOM};
@@ -1000,7 +1007,9 @@ mod tests {
             {
                 let guard = state.catalog.lock().unwrap();
                 let c = guard.as_ref().unwrap();
-                c.set_iptc(id, &crate::catalog::IptcFields { title: "Catalog title".into(), ..Default::default() }).unwrap();
+                let w = c.set_iptc(id, &crate::catalog::IptcFields { title: "Catalog title".into(), ..Default::default() }).unwrap();
+                // Settled as written: the sidecar's foreign title replaced it afterwards.
+                c.settle_iptc_write(&w, &Ok(())).unwrap();
             }
             if single {
                 assert!(geocode_photo_to_iptc(&state, None, id).await.unwrap());

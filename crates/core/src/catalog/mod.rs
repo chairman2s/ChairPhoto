@@ -15,6 +15,7 @@ pub use edits::{HISTORY_BASELINE_LABEL, HISTORY_CAP};
 mod facets;
 mod groups;
 mod identity;
+mod iptc_owed;
 mod lifecycle;
 mod merge;
 mod reconcile;
@@ -42,6 +43,7 @@ pub use identity::{
     IdentityRepairPlan, IdentityRepairSummary, PendingIdentity, PendingIdentityField,
     PendingIdentityRow, PendingIdentitySummary, SidecarIdentity,
 };
+pub use iptc_owed::{IptcMask, IptcSettled, IptcSidecarState, IptcSidecarWrite};
 pub use locations::{PathCandidate, ResolveMode};
 pub use lifecycle::{
     carry_companions, copy_and_verify, copy_with_companions, verify_and_delete_locals, BackupPlan,
@@ -432,6 +434,9 @@ impl Catalog {
             // that is not a UUID has already been re-minted.
             self.canonicalise_photo_identities()?;
         }
+        // Schema v25 (#148): `pending_sidecar_iptc`, created by SCHEMA_SQL above. No backfill:
+        // which earlier writes failed is unknown, and owing every photo's IPTC would rewrite
+        // every sidecar in the library on the next repair pass.
         // Keep the catalog-root (local) volume pointing at the current root, so
         // re-rooting the catalog moves it too.
         self.sync_default_volume_root()?;
@@ -1302,9 +1307,22 @@ impl Catalog {
             .ok_or_else(|| CatalogError::NotFound(format!("photo {photo_id}")))
     }
 
-    /// Write a photo's authored IPTC fields to the catalog. (XMP-sidecar writing is
-    /// done by the caller via the `xmp` module so it can target the original file.)
-    pub fn set_iptc(&self, photo_id: i64, f: &IptcFields) -> Result<()> {
+    /// Write a photo's authored IPTC fields to the catalog, and owe the photo's sidecar the
+    /// fields this changed (#148, `iptc_owed`), in one transaction (a savepoint, so it nests
+    /// in a caller's). Returns the sidecar write that pays everything the photo owes — this
+    /// change and any earlier write that never landed. The caller runs it off the lock
+    /// ([`IptcSidecarWrite::run`]) and records the outcome ([`Catalog::settle_iptc_write`]);
+    /// a caller that does neither leaves the fields owed for the repair pass.
+    pub fn set_iptc(&self, photo_id: i64, f: &IptcFields) -> Result<IptcSidecarWrite> {
+        self.conn.execute_batch("SAVEPOINT set_iptc")?;
+        let out = self.set_iptc_owing(photo_id, f);
+        let end = if out.is_ok() { "RELEASE set_iptc" } else { "ROLLBACK TO set_iptc; RELEASE set_iptc" };
+        self.conn.execute_batch(end)?;
+        out
+    }
+
+    fn set_iptc_owing(&self, photo_id: i64, f: &IptcFields) -> Result<IptcSidecarWrite> {
+        let before = self.get_iptc(photo_id)?;
         self.conn.execute(
             "UPDATE photos SET iptc_description = ?1, iptc_headline = ?2, iptc_title = ?3,
                 iptc_creator = ?4, iptc_copyright = ?5, iptc_credit = ?6, iptc_source = ?7,
@@ -1327,7 +1345,7 @@ impl Catalog {
                 photo_id
             ],
         )?;
-        Ok(())
+        self.owe_iptc(photo_id, IptcMask::changed(&before, f))
     }
 
     /// All stored metadata entries for a photo, grouped-friendly (ordered by group).

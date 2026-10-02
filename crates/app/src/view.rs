@@ -611,7 +611,7 @@ impl Render for RootView {
                 this.open_preferences(crate::preferences::Tab::Storage, window, cx)
             }))
             .on_action(cx.listener(|this, _: &PublishSelection, window, cx| {
-                module_panel::open_publish_dialog(&this.modules, window, cx)
+                module_panel::open_publish_dialog(&this.modules, window, cx);
             }))
             // Storage and import (#114).
             .on_action(cx.listener(|this, _: &OpenCatalogs, window, cx| this.open_catalogs(window, cx)))

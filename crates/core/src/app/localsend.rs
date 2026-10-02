@@ -101,6 +101,11 @@ impl LocalSendJob {
         self.items.len()
     }
 
+    /// The reachable photos, in send order.
+    pub fn photo_ids(&self) -> Vec<i64> {
+        self.items.iter().map(|i| i.photo_id).collect()
+    }
+
     /// Render and send with the production [`full_resolution`] renderer. Blocking: runs the
     /// transfer on the core runtime and waits, so call it from a worker thread (never an async
     /// task or the UI thread).

@@ -13,6 +13,7 @@ pub mod editing;
 pub mod js_compat;
 pub mod library;
 pub mod presets;
+pub mod publishing;
 pub mod shell_timing;
 pub mod slideshow;
 pub mod statistics;

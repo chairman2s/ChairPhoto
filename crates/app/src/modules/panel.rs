@@ -9,22 +9,25 @@
 //! #104): the external-modules section, the install hint, versions, and the permission and
 //! network-access review.
 
-use super::registry::{ModuleRegistry, SlotView};
-use super::PanelSlot;
+use super::registry::ModuleRegistry;
+use super::{PanelSlot, PublishTarget};
+use std::collections::HashMap;
 use crate::shell::style::Colors;
 use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::{Disableable as _, WindowExt as _};
 use gpui_kit::prelude::*;
-use gpui_kit::{div, px, AnyElement, App, Context, Entity, FontWeight, SharedString, Subscription, TestSupportExt as _, Window};
+use gpui_kit::{div, px, AnyElement, AnyView, App, Context, Entity, FontWeight, SharedString, Subscription, TestSupportExt as _, Window};
 
 /// The Publish dialog's width.
 const PANEL_W: f32 = 560.;
 
 /// Open the Publish dialog over the enabled modules' publish targets.
-pub fn open_publish_dialog(registry: &Entity<ModuleRegistry>, window: &mut Window, cx: &mut App) {
-    let targets = ModuleRegistry::publish_target_views(registry, window, cx);
-    let dialog_view = cx.new(|_| PublishDialog { targets, selected: 0 });
-    window.open_dialog(cx, move |dialog, _, _| dialog.title("Publish").w(px(PANEL_W)).child(dialog_view.clone()));
+pub fn open_publish_dialog(registry: &Entity<ModuleRegistry>, window: &mut Window, cx: &mut App) -> Entity<PublishDialog> {
+    let targets = registry.read(cx).publish_targets().into_iter().map(|(_, t)| t).collect();
+    let dialog_view = cx.new(|_| PublishDialog { targets, built: HashMap::new(), selected: 0 });
+    let shown = dialog_view.clone();
+    window.open_dialog(cx, move |dialog, _, _| dialog.title("Publish").w(px(PANEL_W)).child(shown.clone()));
+    dialog_view
 }
 
 /// The Modules panel (`ModulesSection` in ModulesPanel.tsx).
@@ -107,13 +110,40 @@ impl Render for ModulesPanel {
 }
 
 /// The Publish dialog: a chip per publish target, and the chosen target's form.
+///
+/// A target's form is built the first time its chip is chosen, not when the dialog opens
+/// (React mounted only the chosen target's form): building one can start work — the LocalSend
+/// form scans the network when it opens — which must not happen for a target the user never
+/// looked at. A built form is kept while the dialog is open, so switching back keeps what was
+/// typed into it.
 pub struct PublishDialog {
-    targets: Vec<SlotView>,
+    targets: Vec<PublishTarget>,
+    built: HashMap<usize, AnyView>,
     selected: usize,
 }
 
+impl PublishDialog {
+    /// The chosen target's id, if any.
+    pub fn selected_target(&self) -> Option<SharedString> {
+        self.targets.get(self.selected.min(self.targets.len().saturating_sub(1))).map(|t| t.id.clone())
+    }
+
+    /// Choose the target with id `id` (its chip).
+    pub fn select(&mut self, id: &str, cx: &mut Context<Self>) {
+        if let Some(i) = self.targets.iter().position(|t| t.id.as_ref() == id) {
+            self.selected = i;
+            cx.notify();
+        }
+    }
+
+    /// Whether target `id`'s form has been built.
+    pub fn is_built(&self, id: &str) -> bool {
+        self.targets.iter().position(|t| t.id.as_ref() == id).is_some_and(|i| self.built.contains_key(&i))
+    }
+}
+
 impl Render for PublishDialog {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = Colors::get(cx);
         let body = div().id("publish-dialog").flex().flex_col().gap(px(10.)).text_size(px(12.));
         if self.targets.is_empty() {
@@ -121,7 +151,7 @@ impl Render for PublishDialog {
                 .child(
                     div()
                         .text_color(colors.mute)
-                        .child("Enable a publishing module (Instagram, Flickr, SmugMug) in Preferences → Modules first."),
+                        .child("Enable a publishing module (LocalSend, Snapchat, Instagram, Flickr, SmugMug) in Preferences → Modules first."),
                 )
                 .into_any_element();
         }
@@ -147,7 +177,9 @@ impl Render for PublishDialog {
                     .test_support(),
             );
         }
-        body.child(chips).child(self.targets[selected].view.clone()).into_any_element()
+        let factory = self.targets[selected].view.clone();
+        let form = self.built.entry(selected).or_insert_with(|| factory(window, cx)).clone();
+        body.child(chips).child(form).into_any_element()
     }
 }
 

@@ -37,7 +37,9 @@
 //! there (the module's instance is in use): it is logged and deferred until the callback
 //! returns.
 
+pub mod dialog;
 pub mod panel;
+pub mod publishing;
 pub mod registry;
 pub mod statistics;
 
@@ -45,8 +47,8 @@ pub mod statistics;
 pub mod dev_module;
 #[cfg(feature = "collage")]
 pub mod collage;
-#[cfg(any(feature = "slideshow", feature = "collage"))]
-pub mod dialog;
+#[cfg(feature = "localsend")]
+pub mod localsend;
 #[cfg(feature = "map")]
 pub mod map;
 #[cfg(feature = "slideshow")]
@@ -400,6 +402,10 @@ pub fn bundled() -> Vec<Rc<dyn Module>> {
     modules.push(Rc::new(collage::CollageModule::default()));
     #[cfg(feature = "slideshow")]
     modules.push(Rc::new(slideshow::SlideshowModule::default()));
+    #[cfg(feature = "localsend")]
+    modules.push(Rc::new(localsend::LocalSendModule::default()));
+    #[cfg(feature = "localsend")]
+    modules.push(Rc::new(localsend::SnapchatModule::default()));
     #[cfg(feature = "map")]
     modules.push(Rc::new(map::MapModule));
     #[cfg(feature = "tag-graph")]

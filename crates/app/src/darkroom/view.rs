@@ -259,8 +259,9 @@ pub struct DarkroomView {
     rails: rails::RailsState,
     /// The filmstrip's scroll position.
     strip_scroll: ScrollHandle,
-    /// The open (`OpenPhoto::seq`) the strip was last centred on ([`Self::centre_strip`]).
-    strip_centred: Option<u64>,
+    /// The open (`OpenPhoto::seq`) the strip was last centred on, and the strip width that
+    /// centring used ([`Self::centre_strip`]).
+    strip_centred: Option<(u64, f32)>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -768,15 +769,20 @@ impl DarkroomView {
     /// `scrollIntoView({ inline: "center" })` on each change of the current photo, clamped at
     /// the strip's ends. Once per open, whatever moved it (← / →, a click, the active photo
     /// changed elsewhere), so a strip scrolled by hand stays where it was left until the
-    /// photo changes. The strip's width is the last frame's; before it has one (its first
-    /// frame), the next frame centres it.
+    /// photo changes. The strip's width is the last laid-out frame's, which may be stale (the
+    /// window resized while the Darkroom was not on screen): each centring asks for one more
+    /// frame, and centres again while the width laid out differs from the one it used. So a
+    /// resize also centres again — React's `scrollIntoView` ran on the photo change alone,
+    /// against the live layout. Before the strip has a width (its first frame), the next
+    /// frame centres it.
     fn centre_strip(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let d = self.darkroom.read(cx);
         let Some(open) = d.open.as_ref() else {
             self.strip_centred = None;
             return;
         };
-        if self.strip_centred == Some(open.seq) {
+        let viewport = f32::from(self.strip_scroll.bounds().size.width);
+        if self.strip_centred == Some((open.seq, viewport)) {
             return;
         }
         let (_, shown, total) = d.strip(cx);
@@ -786,17 +792,18 @@ impl DarkroomView {
         let seq = open.seq;
         let Some(index) = shown.iter().position(|p| p.id == open.photo.id) else {
             // Not in the Library's list: no frame to centre, as React's missing ref.
-            self.strip_centred = Some(seq);
+            self.strip_centred = Some((seq, viewport));
             return;
         };
-        let viewport = f32::from(self.strip_scroll.bounds().size.width);
         if viewport <= 0.0 {
             window.request_animation_frame();
             return;
         }
         let x = STRIP_LAYOUT.centre(index, shown.len(), viewport);
         self.strip_scroll.set_offset(gpui_kit::point(px(-x), px(0.)));
-        self.strip_centred = Some(seq);
+        self.strip_centred = Some((seq, viewport));
+        // The width used may be the last visit's: the next frame checks it against its layout.
+        window.request_animation_frame();
     }
 
     /// The filmstrip's scroll position (tests).

@@ -822,6 +822,41 @@ fn overlay_boxes_follow_the_orientation_zoom_and_pan(cx: &mut TestAppContext) {
     assert_rect(f.bounds(&format!("faces-box-{p}"), cx), container.origin, want);
 }
 
+/// A Darkroom visit renders a strip photo's thumbnail again for its cover look, which moves
+/// the Thumb tier's version past the Preview's (#134). The boxes still show on that
+/// thumbnail while the loupe draws it as the placeholder before the preview lands (review
+/// rv134 L1).
+#[gpui_kit::test]
+fn overlay_boxes_show_on_a_thumbnail_the_darkroom_rendered_again(cx: &mut TestAppContext) {
+    use crate::loupe::zoom::Drawn;
+    let f = open_faces(2, true, "faces-thumb-version", cx);
+    let photo = f.ids[0];
+    let a = add_face(&f.app, photo, "[0.25,0.5,0.25,0.25]");
+    let images = f.app.wired.images.clone();
+    let thumb = JobKey::photo(photo, ImageKind::Thumb);
+    images.update(cx, |s, _| s.request(photo, ImageKind::Thumb));
+    f.pool.finish(&thumb, Ok(pixels(400, 200)));
+    work(&f.app, cx);
+
+    // What the strip does: ask for the photo's look (the cached one is rendered again), then
+    // let go when the Darkroom closes.
+    let from = f.app.wired.shell.read_with(cx, |s, _| s.rows_from()).unwrap();
+    let claim = images.update(cx, |s, _| s.new_claim());
+    images.update(cx, |s, cx| s.request_looks(claim, from, &[(photo, None)], cx));
+    f.pool.finish(&thumb, Ok(pixels(400, 200)));
+    work(&f.app, cx);
+    images.update(cx, |s, _| s.release_looks(claim));
+    let (t, p) = images.read_with(cx, |s, _| (s.key(photo, ImageKind::Thumb).version, s.key(photo, ImageKind::Preview).version));
+    assert_ne!(t, p, "the tiers' versions differ");
+
+    // The loupe on it, the preview not yet rendered: the thumbnail is drawn, with the boxes.
+    f.select(photo, cx);
+    f.press("enter", cx);
+    work(&f.app, cx);
+    assert_eq!(f.zoom(cx).read_with(cx, |z, _| z.drawn()), Some((photo, Drawn::Thumb)));
+    assert!(f.present(&format!("faces-box-{a}"), cx), "the boxes show on the thumbnail");
+}
+
 /// F toggles the boxes and remembers it on this machine; Esc in draw mode leaves draw mode,
 /// not the loupe; a drag draws a box that becomes a face and opens the picker on it.
 #[gpui_kit::test]

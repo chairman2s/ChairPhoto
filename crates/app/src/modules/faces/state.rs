@@ -188,9 +188,11 @@ pub struct PhotoFaces {
     /// The photo's non-destructive `user_rotation` (degrees clockwise), read with the faces:
     /// how far the loupe's tiers are turned from the boxes' frame.
     pub rotation: i64,
-    /// The photo's image version ([`ImageStore::invalidate`] bumps it — a rotation does) when
-    /// this was read: the overlay draws only over tiers of the same version, whose pixels were
-    /// rendered with `rotation`.
+    /// The photo's Preview tier version ([`ImageStore::invalidate`] bumps every tier — a
+    /// rotation does) when this was read: the overlay draws only while the Preview tier is
+    /// still at this version, so whichever tier it draws was rendered with `rotation`. The
+    /// Thumb tier's own version also moves with the Darkroom strip's cover looks, so it is
+    /// not compared.
     pub image_version: u64,
 }
 

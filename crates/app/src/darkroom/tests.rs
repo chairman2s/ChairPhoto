@@ -1590,6 +1590,72 @@ fn the_strip_is_clamped_at_its_ends(cx: &mut TestAppContext) {
     assert!(at.frame_left + at.frame_width / 2.0 < at.left + at.viewport / 2.0, "not centred: clamped");
 }
 
+/// The strip's width is the last frame it was laid out in. Leave the Darkroom, make the
+/// window narrower, come back on another photo: it is centred in the new width, not the
+/// last visit's (review rv134 M2).
+#[gpui_kit::test]
+fn the_strip_centres_in_a_width_changed_outside_the_darkroom(cx: &mut TestAppContext) {
+    let rig = rig("dk-centre-resize", 60, cx);
+    let order = order(&rig, cx);
+    let n = order.len();
+    select(&rig, order[30], cx);
+    draw(&rig, cx);
+    assert_centred(&rig, 30, n, "before", cx);
+    let wide = strip_at(&rig, 30, cx).viewport;
+
+    rig.app.wired.shell.update(cx, |s, cx| s.show_library(cx));
+    cx.run_until_parked();
+    work(cx);
+    rig.render(cx);
+    cx.simulate_window_resize(rig.app.window(), gpui_kit::size(gpui_kit::px(900.), gpui_kit::px(700.)));
+    cx.run_until_parked();
+    rig.render(cx);
+    select(&rig, order[31], cx);
+    rig.app.wired.shell.update(cx, |s, cx| s.open_develop(cx));
+    cx.run_until_parked();
+    work(cx);
+    draw(&rig, cx);
+    let narrow = strip_at(&rig, 31, cx).viewport;
+    assert!(narrow < wide, "the window is narrower: {narrow} < {wide}");
+    assert_centred(&rig, 31, n, "after a resize outside the Darkroom", cx);
+}
+
+/// The strip's frames are asked for nearest the open photo first — it, then +1, −1, +2,
+/// −2 … — as one batch whose first job ends on top of the pool's LIFO stack (review rv134
+/// L2; the navigation rule: the requested photo first, then N±1).
+#[gpui_kit::test]
+fn the_strips_frames_are_asked_for_nearest_the_open_photo_first(cx: &mut TestAppContext) {
+    let rig = rig_with(
+        "dk-strip-order",
+        7,
+        |rig, cx| {
+            // The Library's thumbnails have landed (pending ones would be cancelled, and the
+            // strip's requests held back until each cancellation answers).
+            rig.render(cx);
+            for photo in order(rig, cx) {
+                rig.pool.finish(&JobKey::photo(photo, ImageKind::Thumb), Ok(pixels(4, 4)));
+            }
+            cx.run_until_parked();
+            let middle = order(rig, cx)[3];
+            rig.app.wired.shell.update(cx, |s, cx| s.select_with(cx, |l| l.select_single(middle)));
+            cx.run_until_parked();
+        },
+        cx,
+    );
+    let order = order(&rig, cx);
+    assert_eq!(rig.open_photo(cx), Some(order[3]));
+    let thumb = |i: usize| JobKey::photo(order[i], ImageKind::Thumb);
+    let want: Vec<JobKey> = [3, 4, 2, 5, 1, 6, 0].into_iter().map(thumb).collect();
+    let batches = rig.pool.batches.lock().unwrap().clone();
+    let strip = batches
+        .iter()
+        .rev()
+        .map(|b| b.iter().filter(|k| want.contains(k)).cloned().collect::<Vec<_>>())
+        .find(|b| b.len() == want.len())
+        .expect("the strip's batch");
+    assert_eq!(strip, want);
+}
+
 /// The Thumb jobs for `photo` submitted so far.
 fn thumb_jobs(rig: &Rig, photo: i64) -> usize {
     let key = JobKey::photo(photo, ImageKind::Thumb);
@@ -1606,6 +1672,10 @@ fn image(rig: &Rig, photo: i64, cx: &mut TestAppContext) -> ImageState {
 
 fn stale_dropped(rig: &Rig, cx: &mut TestAppContext) -> u64 {
     rig.app.wired.images.read_with(cx, |s, _| s.stats().stale_dropped)
+}
+
+fn refused(rig: &Rig, cx: &mut TestAppContext) -> u64 {
+    rig.app.wired.images.read_with(cx, |s, _| s.stats().refused)
 }
 
 fn refresh_rows(rig: &Rig, cx: &mut TestAppContext) {
@@ -1716,7 +1786,7 @@ fn a_result_for_an_earlier_look_is_dropped(cx: &mut TestAppContext) {
 }
 
 /// A photo that leaves the strip's window (±40 around the open one) is let go: its pending
-/// frame is released, and its late answer is dropped.
+/// frame is released, its late answer is dropped, and it loses its look.
 #[gpui_kit::test]
 fn a_frame_that_leaves_the_strip_is_released(cx: &mut TestAppContext) {
     let rig = rig("dk-cover-window", 43, cx);
@@ -1728,8 +1798,10 @@ fn a_frame_that_leaves_the_strip_is_released(cx: &mut TestAppContext) {
     let key = JobKey::photo(first, ImageKind::Thumb);
     rig.pool.start(key.clone());
 
+    assert!(look(&rig, first, cx).is_some());
     select(&rig, order[41], cx);
     assert!(!pending(&rig, cx), "out of the window: released");
+    assert_eq!(look(&rig, first, cx), None, "and no longer the strip's look: no view's request is bound");
     let dropped = stale_dropped(&rig, cx);
     rig.pool.finish(&key, Ok(pixels(4, 4)));
     cx.run_until_parked();
@@ -1765,13 +1837,16 @@ fn cover_look_across_a_switch(delivered: bool, cx: &mut TestAppContext) {
     core_switch(&rig.app, b);
 
     if !delivered {
+        let refused_before = refused(&rig, cx);
         rig.pool.finish(&key, Ok(pixels(4, 4)));
         cx.run_until_parked();
         match image(&rig, photo, cx) {
-            ImageState::Failed(e) => assert_eq!(e.as_ref(), CATALOG_CHANGED),
             ImageState::Ready(_) => panic!("B's pixels were shown under A's row"),
-            _ => panic!("the refused render is an error"),
+            ImageState::Failed(_) => panic!("a refusal is not a failure: it would stick"),
+            ImageState::Loading => panic!("the refused render is answered"),
+            ImageState::Absent => {}
         }
+        assert_eq!(refused(&rig, cx), refused_before + 1, "refused on the worker");
         crate::tests::deliver_switch(&rig.app, cx);
         work(cx);
         assert_eq!(rig.surface(cx), Surface::Library);
@@ -1815,4 +1890,82 @@ fn a_cover_look_never_shows_the_new_catalog_before_the_switch_event(cx: &mut Tes
 #[gpui_kit::test]
 fn a_cover_look_never_shows_the_old_catalog_after_the_switch_event(cx: &mut TestAppContext) {
     cover_look_across_a_switch(true, cx);
+}
+
+/// A re-root (Preferences → Library folder) reopens the catalog under a new identity and
+/// sends no `catalog:switched`. The strip's looks go with the strip: back in the Library, a
+/// photo the strip showed is no one's look, so its next thumbnail (a rotation, an eviction)
+/// is not checked against the catalog the strip read and lands (review rv134 M1).
+#[gpui_kit::test]
+fn a_re_root_leaves_no_library_thumbnail_bound_to_the_old_catalog(cx: &mut TestAppContext) {
+    let rig = rig("dk-reroot", 3, cx);
+    let photo = order(&rig, cx)[1];
+    let a = rig.app.wired.shell.read_with(cx, |s, _| s.rows_from()).unwrap();
+    assert_eq!(look(&rig, photo, cx).map(|l| l.from), Some(a));
+    let key = JobKey::photo(photo, ImageKind::Thumb);
+    rig.pool.finish(&key, Ok(pixels(4, 4)));
+    cx.run_until_parked();
+    assert!(matches!(image(&rig, photo, cx), ImageState::Ready(_)));
+
+    rig.app.wired.shell.update(cx, |s, cx| s.show_library(cx));
+    cx.run_until_parked();
+    work(cx);
+    assert_eq!(look(&rig, photo, cx), None, "no strip, no looks");
+    let new_root = rig.dir.0.join("newroot");
+    chairphoto_core::app::catalogs::reroot_open_catalog_as(&rig.app.state, a, new_root).unwrap();
+    refresh_rows(&rig, cx);
+    work(cx);
+    assert_ne!(rig.app.wired.shell.read_with(cx, |s, _| s.rows_from()), Some(a), "a new identity");
+
+    let images = rig.app.wired.images.clone();
+    images.update(cx, |s, cx| s.invalidate(photo, cx));
+    images.update(cx, |s, _| s.request(photo, ImageKind::Thumb));
+    rig.pool.finish(&key, Ok(pixels(4, 4)));
+    cx.run_until_parked();
+    assert!(matches!(image(&rig, photo, cx), ImageState::Ready(_)), "the Library's thumbnail lands");
+}
+
+/// A frame rendered across a re-root is refused, not failed: the frame stays empty (asked
+/// nothing more while its row still names the old catalog). Rows re-read from the reopened
+/// catalog close the Darkroom; the photo's thumbnail is then the Library's again, asked and
+/// landing, and Develop asks for the new catalog's look (review rv134 M1).
+#[gpui_kit::test]
+fn a_frame_refused_across_a_re_root_is_asked_again_for_the_new_rows(cx: &mut TestAppContext) {
+    let rig = rig("dk-reroot-strip", 3, cx);
+    let photo = order(&rig, cx)[1];
+    let a = rig.app.wired.shell.read_with(cx, |s, _| s.rows_from()).unwrap();
+    let key = JobKey::photo(photo, ImageKind::Thumb);
+    rig.pool.start(key.clone());
+    let new_root = rig.dir.0.join("newroot");
+    chairphoto_core::app::catalogs::reroot_open_catalog_as(&rig.app.state, a, new_root).unwrap();
+    let (before, jobs) = (refused(&rig, cx), thumb_jobs(&rig, photo));
+
+    rig.pool.finish(&key, Ok(pixels(4, 4)));
+    cx.run_until_parked();
+    assert_eq!(refused(&rig, cx), before + 1, "rendered in the reopened catalog: refused");
+    assert!(matches!(image(&rig, photo, cx), ImageState::Absent), "empty, not failed");
+    rig.render(cx);
+    rig.app.wired.shell.update(cx, |_, cx| cx.notify());
+    cx.run_until_parked();
+    assert_eq!(thumb_jobs(&rig, photo), jobs, "not asked again under the old row");
+
+    refresh_rows(&rig, cx);
+    work(cx);
+    let b = rig.app.wired.shell.read_with(cx, |s, _| s.rows_from()).unwrap();
+    assert_ne!(a, b);
+    // Rows from another catalog close the Darkroom (as a switch does), and its strip with it.
+    assert_eq!(rig.surface(cx), Surface::Library);
+    assert_eq!(look(&rig, photo, cx), None, "no strip, no looks");
+    rig.render(cx);
+    assert_eq!(thumb_jobs(&rig, photo), jobs + 1, "the Library asks for it again: the refusal did not stick");
+    rig.pool.finish(&key, Ok(pixels(4, 4)));
+    cx.run_until_parked();
+    assert!(matches!(image(&rig, photo, cx), ImageState::Ready(_)), "it lands");
+
+    // Develop again: the frame is asked for the reopened catalog's look.
+    select(&rig, photo, cx);
+    rig.app.wired.shell.update(cx, |s, cx| s.open_develop(cx));
+    cx.run_until_parked();
+    work(cx);
+    assert_eq!(look(&rig, photo, cx).map(|l| l.from), Some(b));
 }

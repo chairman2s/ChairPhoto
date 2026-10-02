@@ -1620,6 +1620,42 @@ fn the_strip_centres_in_a_width_changed_outside_the_darkroom(cx: &mut TestAppCon
     assert_centred(&rig, 31, n, "after a resize outside the Darkroom", cx);
 }
 
+/// The strip's frames are asked for nearest the open photo first — it, then +1, −1, +2,
+/// −2 … — as one batch whose first job ends on top of the pool's LIFO stack (review rv134
+/// L2; the navigation rule: the requested photo first, then N±1).
+#[gpui_kit::test]
+fn the_strips_frames_are_asked_for_nearest_the_open_photo_first(cx: &mut TestAppContext) {
+    let rig = rig_with(
+        "dk-strip-order",
+        7,
+        |rig, cx| {
+            // The Library's thumbnails have landed (pending ones would be cancelled, and the
+            // strip's requests held back until each cancellation answers).
+            rig.render(cx);
+            for photo in order(rig, cx) {
+                rig.pool.finish(&JobKey::photo(photo, ImageKind::Thumb), Ok(pixels(4, 4)));
+            }
+            cx.run_until_parked();
+            let middle = order(rig, cx)[3];
+            rig.app.wired.shell.update(cx, |s, cx| s.select_with(cx, |l| l.select_single(middle)));
+            cx.run_until_parked();
+        },
+        cx,
+    );
+    let order = order(&rig, cx);
+    assert_eq!(rig.open_photo(cx), Some(order[3]));
+    let thumb = |i: usize| JobKey::photo(order[i], ImageKind::Thumb);
+    let want: Vec<JobKey> = [3, 4, 2, 5, 1, 6, 0].into_iter().map(thumb).collect();
+    let batches = rig.pool.batches.lock().unwrap().clone();
+    let strip = batches
+        .iter()
+        .rev()
+        .map(|b| b.iter().filter(|k| want.contains(k)).cloned().collect::<Vec<_>>())
+        .find(|b| b.len() == want.len())
+        .expect("the strip's batch");
+    assert_eq!(strip, want);
+}
+
 /// The Thumb jobs for `photo` submitted so far.
 fn thumb_jobs(rig: &Rig, photo: i64) -> usize {
     let key = JobKey::photo(photo, ImageKind::Thumb);

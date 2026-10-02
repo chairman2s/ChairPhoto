@@ -642,11 +642,13 @@ impl ImageStore {
     }
 
     /// The Darkroom filmstrip's frames (#134): `owner` holds exactly `wanted`'s thumbnail
-    /// tiers, most urgent first, each to show the cover look its row names, read from the
-    /// catalog `from`. A tier asked for another look before — or cached, pending or failed
-    /// with no look said — is invalidated first, so what it held or will still answer for
-    /// the earlier look is never shown (see the module docs). A photo not in `wanted` loses
-    /// its look. Calling it again with the same looks sends nothing.
+    /// tiers, sent as one batch in `wanted`'s order — the caller's, most urgent first (the
+    /// strip's: the open photo's frame, then outwards) — each to show the cover look its row
+    /// names, read from the catalog `from`. A tier asked for another look before — or
+    /// cached, pending or failed with no look said — is invalidated first, so what it held
+    /// or will still answer for the earlier look is never shown (see the module docs). A
+    /// photo not in `wanted` loses its look. Calling it again with the same looks sends
+    /// nothing.
     pub fn request_looks(
         &mut self,
         owner: ClaimId,

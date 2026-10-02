@@ -75,7 +75,7 @@ use chairphoto_core::catalog::{Photo, PhotoVersion, VersionHistory};
 use chairphoto_core::develop_source::DevelopSource;
 use chairphoto_core::plugins::edit::SourceToken;
 use chairphoto_model::darkroom::develop_source::{is_preparing, reduce_source, SourceState};
-use chairphoto_model::darkroom::filmstrip::{cover_look, window_around, CoverLook, STRIP_RADIUS};
+use chairphoto_model::darkroom::filmstrip::{cover_look, nearest_first, window_around, CoverLook, STRIP_RADIUS};
 use chairphoto_model::darkroom::history::{describe_change, should_amend, LastStep};
 use chairphoto_model::darkroom::kelvin::{KelvinContext, WbPrefer, WB_SLIDER_KEY};
 use chairphoto_model::darkroom::render_timing::{RENDER_TIMING_KEY, RENDER_TIMING_SUMMARY_KEY};
@@ -1181,13 +1181,19 @@ impl Darkroom {
     }
 
     /// The strip's frames: each photo's cover look as its row names it, from the catalog the
-    /// rows were read from (see the module docs). No strip (one photo, or none open), no
-    /// frames: the claim is let go.
+    /// rows were read from (see the module docs), the open photo's first, then outwards
+    /// (`nearest_first`). No strip (one photo, or none open), no frames: the claim is let go.
     fn request_strip_thumbs(&mut self, cx: &mut Context<Self>) {
         let from = self.shell.read(cx).rows_from();
         let (_, shown, total) = self.strip(cx);
         let wanted: Vec<(i64, Option<CoverLook>)> = match (&self.open, from) {
-            (Some(_), Some(_)) if total > 1 => shown.iter().map(|p| (p.id, cover_look(p.cover_token.as_deref()))).collect(),
+            (Some(open), Some(_)) if total > 1 => {
+                let current = shown.iter().position(|p| p.id == open.photo.id).unwrap_or(shown.len());
+                nearest_first(shown.len(), current)
+                    .into_iter()
+                    .map(|i| (shown[i].id, cover_look(shown[i].cover_token.as_deref())))
+                    .collect()
+            }
             _ => Vec::new(),
         };
         let owner = self.strip_claim;

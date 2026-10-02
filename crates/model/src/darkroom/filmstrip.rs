@@ -35,6 +35,27 @@ pub fn step_target(ids: &[i64], current_id: i64, delta: isize) -> Option<i64> {
     ids.get(j).copied()
 }
 
+/// The order to ask for `count` frames in, nearest the frame at `current` first: `current`,
+/// then +1, −1, +2, −2 … — the navigation rule (the requested photo first, then N±1) over
+/// the whole strip. Indices past either end are skipped; a `current` past the end (no frame
+/// for the open photo) orders from the start.
+pub fn nearest_first(count: usize, current: usize) -> Vec<usize> {
+    if current >= count {
+        return (0..count).collect();
+    }
+    let mut out = Vec::with_capacity(count);
+    out.push(current);
+    for d in 1..count {
+        if current + d < count {
+            out.push(current + d);
+        }
+        if d <= current {
+            out.push(current - d);
+        }
+    }
+    out
+}
+
 /// The strip as the view draws it: fixed-width frames in a row, `gap` apart, inside
 /// `padding` on either side. The view lays the frames out with these numbers, so where a
 /// frame sits follows from its index.
@@ -184,6 +205,16 @@ mod tests {
         assert_eq!(l.centre(15, 30, 1000.0), 12.0 + 15.0 * 76.0 + 36.0 - 500.0);
         assert_eq!(l.centre(0, 30, 1000.0), 0.0);
         assert_eq!(l.centre(29, 30, 1000.0), l.content_width(30) - 1000.0);
+    }
+
+    #[test]
+    fn frames_are_asked_for_nearest_the_open_one_first() {
+        assert_eq!(nearest_first(7, 3), vec![3, 4, 2, 5, 1, 6, 0]);
+        assert_eq!(nearest_first(5, 0), vec![0, 1, 2, 3, 4], "at the start: rightwards");
+        assert_eq!(nearest_first(5, 4), vec![4, 3, 2, 1, 0], "at the end: leftwards");
+        assert_eq!(nearest_first(6, 1), vec![1, 2, 0, 3, 4, 5], "one side runs out first");
+        assert_eq!(nearest_first(3, 9), vec![0, 1, 2], "no current frame: from the start");
+        assert_eq!(nearest_first(0, 0), Vec::<usize>::new());
     }
 
     #[test]

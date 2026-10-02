@@ -253,11 +253,16 @@ fn require_original(original: &Path) -> Result<(), String> {
 ///   back to an in-place write.
 /// * **The temp file** ([`temp_path`]) is a dotfile ending in `.chairphoto-tmp`, so the
 ///   scanner's walks (which skip hidden entries and keep only image extensions) never import
-///   it, and nothing takes it for a sidecar (`<original>.xmp`). Its name is fixed per
-///   sidecar: the file lock makes this writer its only user in the process, so one left by a
-///   crash is removed here, by the next write to the same sidecar.
-/// * **On failure** the temp file is removed and the sidecar is untouched — a read-only
-///   volume fails at the temp file's creation, before anything changed.
+///   it, and nothing takes it for a sidecar (`<original>.xmp`). Its name is unique to this
+///   write (process id and a random suffix) and it is created exclusively, so a second
+///   ChairPhoto process writing the same sidecar — which the in-process file lock cannot
+///   stop — never touches this writer's temp file, nor this one its. The writes then race
+///   only at the rename: the last one wins whole.
+/// * **On failure** this writer's own temp file is removed and the sidecar is untouched — a
+///   read-only volume fails at the temp file's creation, before anything changed. No other
+///   temp file is ever removed: one left by a crash (killed between the write and the rename)
+///   stays as a hidden file, because from here it cannot be told apart from another
+///   process's write in progress.
 /// * **Permissions** of an existing sidecar are carried over (best effort: a filesystem that
 ///   cannot set them, such as some SMB mounts, keeps its own). A sidecar made read-only is
 ///   refused, as the in-place write it replaces was — a rename would otherwise replace it.
@@ -276,13 +281,14 @@ fn write_atomically(original: &Path, path: &Path, bytes: &[u8]) -> Result<(), St
         return Err(format!("cannot write {}: the file is read-only", target.display()));
     }
     let temp = temp_path(&target);
-    match std::fs::remove_file(&temp) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(format!("cannot remove stale {}: {e}", temp.display())),
-    }
     require_original(original)?;
-    let written = write_temp_then_rename(&temp, &target, bytes, existing.as_ref());
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temp)
+        .map_err(|e| format!("cannot create {}: {e}", temp.display()))?;
+    // From here the temp file is ours, and only ours is removed on failure.
+    let written = write_temp_then_rename(file, &temp, &target, bytes, existing.as_ref());
     if written.is_err() {
         let _ = std::fs::remove_file(&temp);
     }
@@ -290,17 +296,13 @@ fn write_atomically(original: &Path, path: &Path, bytes: &[u8]) -> Result<(), St
 }
 
 fn write_temp_then_rename(
+    mut file: std::fs::File,
     temp: &Path,
     target: &Path,
     bytes: &[u8],
     existing: Option<&std::fs::Metadata>,
 ) -> Result<(), String> {
     let fail = |what: &str, e: std::io::Error| format!("cannot {what} {}: {e}", temp.display());
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(temp)
-        .map_err(|e| fail("create", e))?;
     file.write_all(bytes).map_err(|e| fail("write", e))?;
     if let Some(m) = existing {
         let _ = file.set_permissions(m.permissions());
@@ -337,13 +339,17 @@ fn sync_dir(dir: Option<&Path>) {
     let _ = dir;
 }
 
-/// `<dir>/.<sidecar name>.chairphoto-tmp` — see [`write_atomically`].
+/// `<dir>/.<sidecar name>.<pid>-<random>.chairphoto-tmp`, a new name on every call — see
+/// [`write_atomically`].
 fn temp_path(sidecar: &Path) -> PathBuf {
     let mut name = std::ffi::OsString::from(".");
     name.push(sidecar.file_name().unwrap_or_default());
-    name.push(".chairphoto-tmp");
+    let random = uuid::Uuid::new_v4().simple().to_string();
+    name.push(format!(".{}-{}{TEMP_SUFFIX}", std::process::id(), &random[..12]));
     sidecar.with_file_name(name)
 }
+
+const TEMP_SUFFIX: &str = ".chairphoto-tmp";
 
 fn has_chairphoto_last_write(desc: &Element) -> bool {
     desc.children.iter().any(|n| {
@@ -604,6 +610,49 @@ mod tests {
         doc.replace_owned(&[(NS_CHAIRPHOTO, name)], vec![plain("chairphoto", NS_CHAIRPHOTO, name, value)]);
     }
 
+    /// The temp files in `sidecar`'s directory.
+    fn temps_beside(sidecar: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(sidecar.parent().unwrap())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(TEMP_SUFFIX))
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// Review F2 of #149: two processes write one sidecar. The in-process file lock does not
+    /// reach across processes, so two threads call `write_atomically` directly, as two
+    /// processes would. No commit may fail (a shared temp name made the loser's rename fail
+    /// with ENOENT), the sidecar always parses, and no temp file is left.
+    #[test]
+    fn two_writers_past_the_lock_never_fail_or_leave_a_partial_sidecar() {
+        use std::sync::{Arc, Barrier};
+        let (_dir, p) = photo("doc-149-procs", "S.ARW");
+        let xmp = sidecar_path(&p);
+        std::fs::write(&xmp, FOREIGN).unwrap();
+        let barrier = Arc::new(Barrier::new(2));
+        let writers: Vec<_> = (0..2)
+            .map(|w| {
+                let (p, xmp, barrier) = (p.clone(), xmp.clone(), barrier.clone());
+                std::thread::spawn(move || {
+                    let body = FOREIGN.replace("<darktable:history_end>7", &format!(
+                        "<darktable:history_end>{}", "7".repeat(256 * 1024 + w)));
+                    barrier.wait();
+                    for i in 0..60 {
+                        write_atomically(&p, &xmp, body.as_bytes())
+                            .unwrap_or_else(|e| panic!("writer {w}, commit {i}: {e}"));
+                    }
+                })
+            })
+            .collect();
+        for w in writers {
+            w.join().unwrap();
+        }
+        assert_parses(&std::fs::read_to_string(&xmp).unwrap());
+        assert_eq!(temps_beside(&xmp), Vec::<String>::new());
+    }
+
     fn assert_parses(xml: &str) {
         parse_xml(xml.as_bytes()).unwrap_or_else(|e| panic!("sidecar does not parse ({e}):\n{xml}"));
     }
@@ -624,7 +673,7 @@ mod tests {
 
         assert!(err.contains("before the rename"), "{err}");
         assert_eq!(std::fs::read(&xmp).unwrap(), FOREIGN.as_bytes(), "the sidecar must be untouched");
-        assert!(!temp_path(&xmp).exists(), "the temp file must be removed");
+        assert_eq!(temps_beside(&xmp), Vec::<String>::new(), "the temp file must be removed");
         // The lock went with the failed document: the next write goes through.
         let mut doc = SidecarDocument::open(&p).unwrap();
         set_prop(&mut doc, "Foo", "bar");
@@ -632,31 +681,39 @@ mod tests {
         assert!(std::fs::read_to_string(&xmp).unwrap().contains("<chairphoto:Foo>bar</chairphoto:Foo>"));
     }
 
-    /// A temp file a crash left behind (killed between write and rename) is swept by the next
-    /// write to that sidecar, and is never read as the sidecar meanwhile.
+    /// A temp file a crash left behind (killed between write and rename) — or another
+    /// process's write in progress, which looks the same — neither blocks the next write nor is
+    /// read as the sidecar, and is left alone (F2 of the #149 review).
     #[test]
-    fn a_temp_left_by_a_crash_is_swept_by_the_next_write() {
+    fn a_temp_left_by_a_crash_is_left_alone_and_does_not_block_the_next_write() {
         let (_dir, p) = photo("doc-149-sweep", "L.ARW");
         let xmp = sidecar_path(&p);
         std::fs::write(&xmp, FOREIGN).unwrap();
-        std::fs::write(temp_path(&xmp), "<x:xmpmeta><half").unwrap();
+        let stale = temp_path(&xmp);
+        std::fs::write(&stale, "<x:xmpmeta><half").unwrap();
 
         let mut doc = SidecarDocument::open(&p).unwrap();
         set_prop(&mut doc, "Foo", "bar");
         doc.commit().unwrap();
 
-        assert!(!temp_path(&xmp).exists(), "the stale temp file must be gone");
+        assert_eq!(std::fs::read_to_string(&stale).unwrap(), "<x:xmpmeta><half", "another writer's temp was touched");
+        assert_eq!(temps_beside(&xmp).len(), 1, "only the stale temp may remain");
         let xml = std::fs::read_to_string(&xmp).unwrap();
         assert_parses(&xml);
         assert!(xml.contains("history_end") && xml.contains("<chairphoto:Foo>bar</chairphoto:Foo>"), "{xml}");
     }
 
     /// The temp file is invisible to the scanner (a dotfile — its walks skip hidden entries —
-    /// with no image extension) and is not a sidecar name (`<original>.xmp`).
+    /// with no image extension), is not a sidecar name (`<original>.xmp`), and is new for
+    /// every write.
     #[test]
     fn the_temp_file_is_neither_scanned_nor_a_sidecar() {
         let xmp = sidecar_path(Path::new("/library/2026/DSC1.ARW"));
         let temp = temp_path(&xmp);
+        assert_ne!(temp, temp_path(&xmp), "two writes must not share a temp name");
+        let name = temp.file_name().unwrap().to_str().unwrap();
+        let pid = format!(".DSC1.ARW.xmp.{}-", std::process::id());
+        assert!(name.starts_with(&pid) && name.ends_with(TEMP_SUFFIX), "{name}");
         assert_eq!(temp.parent(), xmp.parent(), "same directory, so the rename stays on one volume");
         let name = temp.file_name().unwrap().to_str().unwrap();
         assert!(name.starts_with('.'), "{name}");
@@ -792,7 +849,7 @@ mod tests {
         let err = SidecarDocument::open(&p).unwrap().commit().unwrap_err();
         assert!(err.contains("read-only"), "{err}");
         assert_eq!(std::fs::read(&xmp).unwrap(), FOREIGN.as_bytes());
-        assert!(!temp_path(&xmp).exists());
+        assert_eq!(temps_beside(&xmp), Vec::<String>::new());
     }
 
     /// A symlinked sidecar is written through to its target; the link stays a link.
@@ -813,6 +870,6 @@ mod tests {
         assert!(std::fs::symlink_metadata(&xmp).unwrap().file_type().is_symlink(), "the link was replaced");
         let xml = std::fs::read_to_string(&real).unwrap();
         assert!(xml.contains("history_end") && xml.contains("<chairphoto:Foo>bar</chairphoto:Foo>"), "{xml}");
-        assert!(!temp_path(&real).exists() && !temp_path(&xmp).exists());
+        assert!(temps_beside(&real).is_empty() && temps_beside(&xmp).is_empty());
     }
 }

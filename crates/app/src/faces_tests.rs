@@ -881,6 +881,51 @@ fn the_inspectors_faces_follow_compares_focused_pane(cx: &mut TestAppContext) {
     assert!(state.read_with(cx, |s, cx| s.selection_targets(cx).contains(&focused)));
 }
 
+/// A Darkroom print in the pop-out (the edit rendered from the print's own pixels) is an
+/// edited version's frame — possibly cropped, straightened or turned — so the boxes are hidden
+/// there with the note, exactly as over an active version in the loupe, even though the
+/// original's preview is loaded and the faces are the print's photo's.
+#[cfg(feature = "edit")]
+#[gpui_kit::test]
+fn a_darkroom_print_in_the_pop_out_hides_the_boxes_with_a_note(cx: &mut TestAppContext) {
+    use crate::loupe::zoom::Drawn;
+    use crate::shell::state::LoupePrint;
+    use chairphoto_core::plugins::edit::SourceToken;
+    let f = open_faces(1, true, "faces-print", cx);
+    let photo = f.ids[0];
+    let a = add_face(&f.app, photo, "[0.25,0.5,0.25,0.25]");
+    f.select(photo, cx);
+    let h = open_popout(cx);
+    f.pool.finish(&JobKey::photo(photo, ImageKind::Preview), Ok(pixels(400, 200)));
+    work(&f.app, cx);
+    assert!(present_in(h, &format!("faces-box-{a}"), cx), "the original: boxes");
+
+    let row = f.app.wired.shell.read_with(cx, |s, _| s.library.photos().iter().find(|p| p.id == photo).cloned()).unwrap();
+    let source = SourceToken::Working { photo_id: photo, generation: 1 };
+    let print = LoupePrint { photo: row, edit_json: "{\"ev\":1}".into(), source };
+    f.app.wired.shell.update(cx, |s, cx| s.set_loupe_print(Some(print), cx));
+    work(&f.app, cx);
+    in_window(h, cx, |_, _| ());
+    let job = f
+        .pool
+        .batches
+        .lock()
+        .unwrap()
+        .iter()
+        .flatten()
+        .find_map(|k| match k {
+            JobKey::Edit(job) if job.photo_id == photo => Some(job.clone()),
+            _ => None,
+        })
+        .expect("the print's render was asked for");
+    f.pool.finish(&JobKey::Edit(job), Ok(pixels(400, 200)));
+    work(&f.app, cx);
+    in_window(h, cx, |_, _| ());
+    assert!(matches!(popout_zoom(cx).read_with(cx, |z, _| z.drawn()), Some((p, Drawn::OverrideLo | Drawn::OverrideHi)) if p == photo));
+    assert!(!present_in(h, &format!("faces-box-{a}"), cx), "no boxes over the print");
+    assert!(present_in(h, "faces-overlay-version", cx), "the note says why");
+}
+
 /// A user-rotated photo: the loupe draws its tiers turned, the boxes stay in the canonical
 /// (unturned) frame. At 0/90/180/270 a stored box lands on the turned picture where the turned
 /// face is, and a box drawn on the turned picture is stored back in the canonical frame (and

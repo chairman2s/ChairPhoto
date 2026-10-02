@@ -22,7 +22,13 @@
 //!
 //! Over an edited version's render the boxes are hidden: a version may be cropped or rotated,
 //! and its frame is no longer the one the boxes were measured in (React drew them there anyway,
-//! misplaced).
+//! misplaced). The same holds for the Darkroom's **print** in the pop-out (#110): it is drawn
+//! from the edit's own render (`Drawn::OverrideLo`/`Hi`), so the boxes are hidden there too,
+//! with the same note. Drawing them when the print's geometry equals the original's (no crop,
+//! straighten or rotation in the edit) was considered and not done: the overlay would have to
+//! read the edit's geometry, which lives in the Darkroom and reaches the loupe only as pixels,
+//! and a rule that shows boxes on some prints and not others would read as a bug. Hidden with
+//! the note is the decision, until the edit carries a box transform the overlay can apply.
 //!
 //! **Where the transform comes from.** The slot hands a panel only a window, so the overlay
 //! asks the host which loupe image that window shows ([`loupe_zoom`], i.e.

@@ -297,23 +297,50 @@ pub fn import_apply(state: &AppState, from: Option<CatalogIdentity>, marker: &st
     }
 }
 
-/// Fetch a preview thumbnail (`url_s`) from Flickr's static image hosts — only those, over
-/// HTTPS, and only for a preview the user asked for. Blocking.
+/// The most a preview thumbnail may weigh. `url_s` is Flickr's 240 px size, a few tens of KB;
+/// anything far larger is not a thumbnail.
+pub const THUMB_MAX_BYTES: usize = 1024 * 1024;
+
+/// `url` as a Flickr static-image URL: HTTPS, no user info, no explicit port, and a domain
+/// (not an IP address) that is `staticflickr.com` or ends in `.staticflickr.com` — judged on
+/// the parsed URL, so `#`, `?`, `\` or `@` in the authority cannot smuggle another host past
+/// the check. `None` for anything else.
+pub fn flickr_thumb_url(url: &str) -> Option<reqwest::Url> {
+    let parsed = reqwest::Url::parse(url).ok()?;
+    let host_ok = parsed.domain().is_some_and(|h| h == "staticflickr.com" || h.ends_with(".staticflickr.com"));
+    let ok = parsed.scheme() == "https" && parsed.username().is_empty() && parsed.password().is_none() && parsed.port().is_none() && host_ok;
+    ok.then_some(parsed)
+}
+
+/// Fetch a preview thumbnail (`url_s`) from Flickr's static image hosts — only those
+/// ([`flickr_thumb_url`]), never following a redirect, at most [`THUMB_MAX_BYTES`], and only
+/// for a preview the user asked for. Blocking.
 pub fn fetch_thumb(url: &str) -> Result<Vec<u8>, String> {
-    let host_ok = url
-        .strip_prefix("https://")
-        .and_then(|rest| rest.split('/').next())
-        .is_some_and(|host| host == "staticflickr.com" || host.ends_with(".staticflickr.com"));
-    if !host_ok {
-        return Err("not a Flickr image URL".into());
+    let url = flickr_thumb_url(url).ok_or("not a Flickr image URL")?;
+    super::runtime().block_on(fetch_capped(url, THUMB_MAX_BYTES))
+}
+
+/// GET `url` without following redirects (a redirect is an error: it would leave the checked
+/// host), refusing a body over `max` bytes, announced or streamed.
+async fn fetch_capped(url: reqwest::Url, max: usize) -> Result<Vec<u8>, String> {
+    let failed = |e: reqwest::Error| format!("Flickr thumbnail failed: {}", e.without_url());
+    let client = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).build().map_err(failed)?;
+    let mut resp = client.get(url).send().await.map_err(failed)?;
+    if !resp.status().is_success() {
+        return Err(format!("Flickr thumbnail failed: HTTP {}", resp.status()));
     }
-    super::runtime().block_on(async {
-        let resp = reqwest::get(url).await.map_err(|e| format!("Flickr thumbnail failed: {}", e.without_url()))?;
-        if !resp.status().is_success() {
-            return Err(format!("Flickr thumbnail failed: HTTP {}", resp.status()));
+    let too_large = || format!("Flickr thumbnail failed: larger than {max} bytes");
+    if resp.content_length().is_some_and(|n| n > max as u64) {
+        return Err(too_large());
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = resp.chunk().await.map_err(failed)? {
+        if body.len() + chunk.len() > max {
+            return Err(too_large());
         }
-        resp.bytes().await.map(|b| b.to_vec()).map_err(|e| e.without_url().to_string())
-    })
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
 }
 
 #[cfg(test)]
@@ -535,10 +562,81 @@ mod tests {
         assert_eq!(with_catalog(&state, |c| c.list_publications(ids[1])).unwrap().len(), 1);
     }
 
+    /// The host check is made on the parsed URL: the authority tricks that fooled a check on
+    /// the text up to the first `/` (`#`, `?`, `\`, user info, a port) are all refused, before
+    /// any request is made.
     #[test]
     fn thumbnails_come_only_from_flickrs_image_hosts() {
-        for bad in ["http://live.staticflickr.com/x.jpg", "https://evil.example/x.jpg", "https://staticflickr.com.evil.example/x.jpg", "file:///etc/passwd"] {
+        for bad in [
+            "http://live.staticflickr.com/x.jpg",
+            "https://evil.example/x.jpg",
+            "https://staticflickr.com.evil.example/x.jpg",
+            "https://evilstaticflickr.com/x.jpg",
+            "file:///etc/passwd",
+            "https://127.0.0.1:1#.staticflickr.com",
+            "https://127.0.0.1:1?.staticflickr.com",
+            "https://127.0.0.1:1/#.staticflickr.com",
+            r"https://x@127.0.0.1:1\.staticflickr.com",
+            r"https://evil.example\.staticflickr.com/x.jpg",
+            "https://live.staticflickr.com@evil.example/x.jpg",
+            "https://user:pw@live.staticflickr.com/x.jpg",
+            "https://live.staticflickr.com:8443/x.jpg",
+            "https://live.staticflickr.com:1/x.jpg",
+            "https://127.0.0.1/x.staticflickr.com",
+            "not a url",
+        ] {
+            assert!(flickr_thumb_url(bad).is_none(), "accepted {bad}");
             assert_eq!(fetch_thumb(bad).unwrap_err(), "not a Flickr image URL", "{bad}");
         }
+        for good in ["https://live.staticflickr.com/65535/1_abc_s.jpg", "https://farm5.staticflickr.com/x.jpg", "https://LIVE.StaticFlickr.com:443/x.jpg"] {
+            assert!(flickr_thumb_url(good).is_some(), "refused {good}");
+        }
+    }
+
+    /// A loopback HTTP server answering every request with `response`; returns its base URL
+    /// and how many requests it saw.
+    fn serve(response: Vec<u8>) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = hits.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                seen.fetch_add(1, Ordering::SeqCst);
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                let _ = stream.write_all(&response);
+            }
+        });
+        (base, hits)
+    }
+
+    /// The fetch behind [`fetch_thumb`] (loopback only, no network): a redirect is an error,
+    /// not followed; a body over the cap is refused, whether announced or streamed.
+    #[test]
+    fn a_thumbnail_fetch_follows_no_redirect_and_caps_the_body() {
+        let run = |url: String, max| crate::app::runtime().block_on(fetch_capped(reqwest::Url::parse(&url).unwrap(), max));
+        let (base, hits) = serve(b"HTTP/1.1 302 Found\r\nLocation: /elsewhere\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec());
+        let err = run(format!("{base}/x.jpg"), 1024).unwrap_err();
+        assert!(err.contains("HTTP 302"), "{err}");
+        assert_eq!(hits.load(Ordering::SeqCst), 1, "the redirect was followed");
+
+        // Refused on the announced length alone, before the body is read (only 16 bytes come).
+        let mut announced = b"HTTP/1.1 200 OK\r\nContent-Length: 2048\r\nConnection: close\r\n\r\n".to_vec();
+        announced.extend(vec![0u8; 16]);
+        let (base, _) = serve(announced);
+        assert!(run(format!("{base}/x.jpg"), 1024).unwrap_err().contains("larger than 1024 bytes"));
+
+        let mut streamed = b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n".to_vec();
+        streamed.extend(vec![0u8; 4096]);
+        let (base, _) = serve(streamed);
+        assert!(run(format!("{base}/x.jpg"), 1024).unwrap_err().contains("larger than 1024 bytes"));
+
+        let mut small = b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: close\r\n\r\n".to_vec();
+        small.extend(b"jpg");
+        let (base, _) = serve(small);
+        assert_eq!(run(format!("{base}/x.jpg"), 1024).unwrap(), b"jpg");
     }
 }

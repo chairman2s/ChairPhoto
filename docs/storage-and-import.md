@@ -77,7 +77,10 @@ the sidecar. A reader, another tool or a crash sees the old sidecar or the new o
 mix. Writers of one sidecar in one process take turns, and an IPTC save and a geocode fill
 store and write in one order. A write is **refused, leaving the sidecar as it was**, when:
 
-- the original or its folder is missing — an unmounted volume; no folder is ever created;
+- the original or its folder is missing — an unmounted volume; no folder is ever created.
+  On Unix the original's folder is held open from the read to the rename, and the temp file
+  is created and renamed through that handle, so a volume that goes away after the last
+  check cannot redirect the write into the empty mount point (#155);
 - the sidecar exists but this process may not write it (permissions, ownership, ACL);
 - **the folder is not writable**, even if the sidecar itself is (a share that grants
   modify but not create, a mount ACL). The rename needs a new file in the folder, and

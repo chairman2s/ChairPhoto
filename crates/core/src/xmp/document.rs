@@ -41,6 +41,15 @@
 //! lost. [`SidecarDocument::commit`] never writes the sidecar in place: it writes a hidden
 //! temp file beside it, syncs it, and renames it over the sidecar, so a reader — another
 //! tool, or a crash at any point — sees the old file or the new one, never a mix.
+//!
+//! ## One folder from read to commit (#155, F1 of the #149 review)
+//!
+//! [`SidecarDocument::open`] also opens the original's folder ([`Folder`]) and holds it until
+//! the commit: the sidecar is read, and the temp file created, renamed and synced, relative to
+//! that handle (`openat`/`renameat` on Unix). Checking the original by path and then creating
+//! the temp by path left a gap in which an unmount could send the temp file to the disk under
+//! the empty mount point; through the handle it can only land in the folder the original was
+//! read from. While the handle is open a plain unmount of that volume fails as busy.
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -74,6 +83,8 @@ pub(super) struct SidecarDocument {
     /// The original photo the sidecar belongs to. It must still be there at commit.
     original: PathBuf,
     path: PathBuf,
+    /// The original's folder, open from before the read to the commit (see the module docs).
+    folder: Folder,
     root: Element,
     /// Where this open copied the pre-existing sidecar, if it did. Reported so a
     /// destructive writer can tell the user what it preserved and where.
@@ -111,11 +122,13 @@ impl SidecarDocument {
         // Before the read: the read-modify-write is one turn (issue #149).
         let turn = super::lock::FILE_TURNS.lock(super::lock::key(&path));
         // An unmounted volume makes the sidecar look absent; never start a fresh one then.
-        require_original(photo_path)?;
-        let existed = path.exists();
+        let folder = Folder::open(photo_path)?;
+        folder.require_original(photo_path)?;
+        let name = file_name(&path)?;
+        let existed = folder.exists(name);
 
         let mut root = if existed {
-            let file = std::fs::File::open(&path).map_err(|e| e.to_string())?;
+            let file = folder.open_read(name).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
             parse_xml(file).map_err(|e| format!("cannot parse {}: {e}", path.display()))?
         } else {
             new_root()
@@ -151,15 +164,16 @@ impl SidecarDocument {
         // `BackupPolicy::Always` must not trade that away for a newer, chairphoto-written
         // one. `BeforeFirstWrite` cannot reach an existing backup twice anyway (the first
         // write stamps `chairphoto:LastWrite`), so this only ever binds for `Always`.
-        let backup = if wants_backup && !backup_path.exists() {
-            std::fs::copy(&path, &backup_path).ok().map(|_| backup_path)
+        let backup_name = file_name(&backup_path)?;
+        let backup = if wants_backup && !folder.exists(backup_name) {
+            folder.copy(name, backup_name).ok().map(|_| backup_path)
         } else {
             None
         };
 
         declare_namespaces(desc);
 
-        Ok(Self { original: photo_path.to_path_buf(), path, root, backup, _turn: turn })
+        Ok(Self { original: photo_path.to_path_buf(), path, folder, root, backup, _turn: turn })
     }
 
     /// Where this open copied the pre-existing sidecar, if it did. `None` when nothing was
@@ -219,8 +233,11 @@ impl SidecarDocument {
     /// or its folder has gone since [`Self::open`] — a volume unmounted while the writer
     /// waited its turn — the commit fails and creates nothing (no directory is ever made, so
     /// a write cannot land on the disk under an empty mount point). The original is checked
-    /// at open and again just before the temp file is created; a removal in between those
-    /// two system calls is not caught.
+    /// at open and again just before the temp file is created, and the temp file is created
+    /// and renamed through the folder handle held since open ([`Folder`]), so a change after
+    /// that check can at worst put the sidecar beside the original in the folder it was read
+    /// from, never in another folder at the same path (#155 F1; on Unix — elsewhere the
+    /// operations go by path and the gap between check and create remains).
     ///
     /// A sidecar in a folder this process cannot create files in is refused too, even when
     /// the sidecar itself is writable: the temp file cannot be made, and there is no fallback
@@ -233,32 +250,185 @@ impl SidecarDocument {
 
         let mut buf = Vec::new();
         self.root.write(&mut buf).map_err(|e| e.to_string())?;
-        write_atomically(&self.original, &self.path, &buf)
+        write_atomically(&self.folder, &self.original, &self.path, &buf)
     }
 }
 
-/// Fail unless `original` is a file in a directory that exists: a sidecar is only ever
-/// written beside its original (AGENTS.md "Sidecars are `<original_filename>.xmp`, alongside
-/// the original"). A missing folder is reported as such, so an unmounted volume reads as one.
-fn require_original(original: &Path) -> Result<(), String> {
-    let dir = match original.parent() {
-        Some(d) if d.as_os_str().is_empty() => Path::new("."),
-        Some(d) => d,
-        None => return Err(format!("{} has no folder", original.display())),
-    };
-    if !dir.is_dir() {
-        return Err(format!(
-            "not writing the sidecar of {}: its folder is missing (offline or moved)",
-            original.display()
-        ));
+fn file_name(path: &Path) -> Result<&std::ffi::OsStr, String> {
+    path.file_name().ok_or_else(|| format!("{} has no file name", path.display()))
+}
+
+fn missing_folder(original: &Path) -> String {
+    format!("not writing the sidecar of {}: its folder is missing (offline or moved)", original.display())
+}
+
+/// A folder held open for one sidecar transaction: the original's (see the module docs), or
+/// a symlinked sidecar's target's. On Unix every operation is relative to the open handle, so
+/// it reaches the folder that was opened even if its path now names another one (a volume
+/// unmounted, a folder moved); elsewhere it falls back to paths under the folder's path.
+struct Folder {
+    path: PathBuf,
+    #[cfg(unix)]
+    fd: rustix::fd::OwnedFd,
+}
+
+impl Folder {
+    /// The folder `original` is in. A folder that is not there fails as missing, so an
+    /// unmounted volume reads as one.
+    fn open(original: &Path) -> Result<Self, String> {
+        let dir = match original.parent() {
+            Some(d) if d.as_os_str().is_empty() => Path::new("."),
+            Some(d) => d,
+            None => return Err(format!("{} has no folder", original.display())),
+        };
+        Self::open_dir(dir).map_err(|e| match e.kind() {
+            std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory => missing_folder(original),
+            _ => format!("cannot open the folder of {}: {e}", original.display()),
+        })
     }
-    if !original.is_file() {
-        return Err(format!(
-            "not writing the sidecar of {}: the original is missing (offline or moved)",
-            original.display()
-        ));
+
+    fn open_dir(dir: &Path) -> std::io::Result<Self> {
+        #[cfg(unix)]
+        {
+            use rustix::fs::{Mode, OFlags};
+            let fd = rustix::fs::open(dir, OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC, Mode::empty())?;
+            Ok(Self { path: dir.to_path_buf(), fd })
+        }
+        #[cfg(not(unix))]
+        {
+            if !dir.is_dir() {
+                return Err(std::io::ErrorKind::NotFound.into());
+            }
+            Ok(Self { path: dir.to_path_buf() })
+        }
     }
-    Ok(())
+
+    /// Fail unless the folder's path still names this folder and `original` is a file in it:
+    /// a sidecar is only ever written beside its original (AGENTS.md "Sidecars are
+    /// `<original_filename>.xmp`, alongside the original"). A folder whose path is gone or now
+    /// names another folder (an unmount, a move) is reported missing, as the path check before
+    /// the handle was; a removal after this check still cannot redirect the write, because
+    /// the write goes through the handle.
+    fn require_original(&self, original: &Path) -> Result<(), String> {
+        let name = file_name(original)?;
+        #[cfg(unix)]
+        let (in_place, is_file) = {
+            let same = |a: &rustix::fs::Stat, b: &rustix::fs::Stat| a.st_dev == b.st_dev && a.st_ino == b.st_ino;
+            let here = rustix::fs::fstat(&self.fd).map_err(|e| e.to_string())?;
+            let in_place = rustix::fs::stat(&self.path).is_ok_and(|at_path| same(&at_path, &here));
+            let is_file = rustix::fs::statat(&self.fd, name, rustix::fs::AtFlags::empty())
+                .is_ok_and(|st| rustix::fs::FileType::from_raw_mode(st.st_mode) == rustix::fs::FileType::RegularFile);
+            (in_place, is_file)
+        };
+        #[cfg(not(unix))]
+        let (in_place, is_file) = (self.path.is_dir(), self.path.join(name).is_file());
+        if !in_place {
+            return Err(missing_folder(original));
+        }
+        if !is_file {
+            return Err(format!(
+                "not writing the sidecar of {}: the original is missing (offline or moved)",
+                original.display()
+            ));
+        }
+        Ok(())
+    }
+
+    /// Whether `name` exists here (a symlink counts by its target, as `Path::exists`).
+    fn exists(&self, name: &std::ffi::OsStr) -> bool {
+        #[cfg(unix)]
+        return rustix::fs::statat(&self.fd, name, rustix::fs::AtFlags::empty()).is_ok();
+        #[cfg(not(unix))]
+        return self.path.join(name).exists();
+    }
+
+    /// Whether `name` is a symbolic link.
+    fn is_symlink(&self, name: &std::ffi::OsStr) -> bool {
+        #[cfg(unix)]
+        return rustix::fs::statat(&self.fd, name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW)
+            .is_ok_and(|st| rustix::fs::FileType::from_raw_mode(st.st_mode) == rustix::fs::FileType::Symlink);
+        #[cfg(not(unix))]
+        return std::fs::symlink_metadata(self.path.join(name)).is_ok_and(|m| m.file_type().is_symlink());
+    }
+
+    /// `name`'s permissions, when it exists.
+    fn permissions(&self, name: &std::ffi::OsStr) -> Option<std::fs::Permissions> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let st = rustix::fs::statat(&self.fd, name, rustix::fs::AtFlags::empty()).ok()?;
+            Some(std::fs::Permissions::from_mode(u32::from(st.st_mode) & 0o7777))
+        }
+        #[cfg(not(unix))]
+        std::fs::metadata(self.path.join(name)).ok().map(|m| m.permissions())
+    }
+
+    fn open_with(&self, name: &std::ffi::OsStr, flags: OpenFor) -> std::io::Result<std::fs::File> {
+        #[cfg(unix)]
+        {
+            use rustix::fs::{Mode, OFlags};
+            let (flags, mode) = match flags {
+                OpenFor::Read => (OFlags::RDONLY, Mode::empty()),
+                OpenFor::WriteExisting => (OFlags::WRONLY, Mode::empty()),
+                OpenFor::CreateNew => (OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL, Mode::from_raw_mode(0o666)),
+                OpenFor::Replace => (OFlags::WRONLY | OFlags::CREATE | OFlags::TRUNC, Mode::from_raw_mode(0o666)),
+            };
+            Ok(rustix::fs::openat(&self.fd, name, flags | OFlags::CLOEXEC, mode)?.into())
+        }
+        #[cfg(not(unix))]
+        {
+            let mut options = std::fs::OpenOptions::new();
+            match flags {
+                OpenFor::Read => options.read(true),
+                OpenFor::WriteExisting => options.write(true),
+                OpenFor::CreateNew => options.write(true).create_new(true),
+                OpenFor::Replace => options.write(true).create(true).truncate(true),
+            };
+            options.open(self.path.join(name))
+        }
+    }
+
+    fn open_read(&self, name: &std::ffi::OsStr) -> std::io::Result<std::fs::File> {
+        self.open_with(name, OpenFor::Read)
+    }
+
+    /// Copy `from` to `to`, permissions included, replacing `to` (as `std::fs::copy`).
+    fn copy(&self, from: &std::ffi::OsStr, to: &std::ffi::OsStr) -> std::io::Result<()> {
+        let mut source = self.open_read(from)?;
+        let mut copy = self.open_with(to, OpenFor::Replace)?;
+        std::io::copy(&mut source, &mut copy)?;
+        copy.set_permissions(source.metadata()?.permissions())
+    }
+
+    fn rename(&self, from: &std::ffi::OsStr, to: &std::ffi::OsStr) -> std::io::Result<()> {
+        #[cfg(unix)]
+        return Ok(rustix::fs::renameat(&self.fd, from, &self.fd, to)?);
+        #[cfg(not(unix))]
+        return std::fs::rename(self.path.join(from), self.path.join(to));
+    }
+
+    fn remove(&self, name: &std::ffi::OsStr) -> std::io::Result<()> {
+        #[cfg(unix)]
+        return Ok(rustix::fs::unlinkat(&self.fd, name, rustix::fs::AtFlags::empty())?);
+        #[cfg(not(unix))]
+        return std::fs::remove_file(self.path.join(name));
+    }
+
+    /// Make a rename in this folder durable. Best effort: not every platform or filesystem
+    /// lets a directory be synced, and the new contents are already safe in the file.
+    fn sync(&self) {
+        #[cfg(unix)]
+        let _ = rustix::fs::fsync(&self.fd);
+    }
+}
+
+#[derive(Clone, Copy)]
+enum OpenFor {
+    Read,
+    /// For writing, neither creating nor truncating: asks whether we may write the file.
+    WriteExisting,
+    CreateNew,
+    Replace,
 }
 
 /// Replace `path` with `bytes` so that no reader ever sees a partial file: write a temp file
@@ -287,50 +457,63 @@ fn require_original(original: &Path) -> Result<(), String> {
 ///   The owner becomes the writing user, and hard links to the old file keep the old
 ///   contents: a rename makes a new file.
 /// * **A symlinked sidecar** is written through to its target, as the in-place write was;
-///   the link stays a link.
-fn write_atomically(original: &Path, path: &Path, bytes: &[u8]) -> Result<(), String> {
-    let target = match std::fs::symlink_metadata(path) {
-        Ok(m) if m.file_type().is_symlink() => std::fs::canonicalize(path)
-            .map_err(|e| format!("cannot resolve {}: {e}", path.display()))?,
-        _ => path.to_path_buf(),
+///   the link stays a link. The temp file then goes beside the target, in the target's folder
+///   (opened by path); the original is still checked through `folder`.
+/// * **Through the folder handle** (`folder`, the original's, held since the sidecar was read):
+///   the original is checked, and the temp file created, renamed over the sidecar and synced,
+///   relative to it — see the module docs.
+fn write_atomically(folder: &Folder, original: &Path, path: &Path, bytes: &[u8]) -> Result<(), String> {
+    let linked;
+    let (dir, target) = if folder.is_symlink(file_name(path)?) {
+        let target = std::fs::canonicalize(path).map_err(|e| format!("cannot resolve {}: {e}", path.display()))?;
+        let target_dir = target.parent().ok_or_else(|| format!("{} has no folder", target.display()))?;
+        linked = Folder::open_dir(target_dir).map_err(|e| format!("cannot open {}: {e}", target_dir.display()))?;
+        (&linked, target)
+    } else {
+        (folder, path.to_path_buf())
     };
-    let existing = std::fs::metadata(&target).ok();
+    let name = file_name(&target)?;
+    let existing = dir.permissions(name);
     if existing.is_some() {
         // The in-place write this replaces needed write access to the file itself; a rename
         // needs only the directory's. Ask the filesystem the old question — open for writing,
         // without truncating or writing anything — so a sidecar we may not write (no write bit
         // for us, another user's file in a shared folder, an ACL) is still refused rather than
         // replaced.
-        if let Err(e) = std::fs::OpenOptions::new().write(true).open(&target) {
+        if let Err(e) = dir.open_with(name, OpenFor::WriteExisting) {
             return Err(format!("cannot write {}: the file is read-only for us ({e})", target.display()));
         }
     }
     let temp = temp_path(&target);
-    require_original(original)?;
-    let file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temp)
+    let temp_name = file_name(&temp)?;
+    folder.require_original(original)?;
+    #[cfg(test)]
+    if let Some(hook) = tests::AFTER_THE_LAST_CHECK.with(|h| h.take()) {
+        hook();
+    }
+    let file = dir
+        .open_with(temp_name, OpenFor::CreateNew)
         .map_err(|e| format!("cannot create {}: {e}", temp.display()))?;
     // From here the temp file is ours, and only ours is removed on failure.
-    let written = write_temp_then_rename(file, &temp, &target, bytes, existing.as_ref());
+    let written = write_temp_then_rename(dir, file, &temp, &target, bytes, existing);
     if written.is_err() {
-        let _ = std::fs::remove_file(&temp);
+        let _ = dir.remove(temp_name);
     }
     written
 }
 
 fn write_temp_then_rename(
+    dir: &Folder,
     mut file: std::fs::File,
     temp: &Path,
     target: &Path,
     bytes: &[u8],
-    existing: Option<&std::fs::Metadata>,
+    existing: Option<std::fs::Permissions>,
 ) -> Result<(), String> {
     let fail = |what: &str, e: std::io::Error| format!("cannot {what} {}: {e}", temp.display());
     file.write_all(bytes).map_err(|e| fail("write", e))?;
-    if let Some(m) = existing {
-        let _ = file.set_permissions(m.permissions());
+    if let Some(permissions) = existing {
+        let _ = file.set_permissions(permissions);
     }
     // A network filesystem may report a failed write only here; a filesystem without
     // fsync says so with Unsupported/InvalidInput, which is no reason to fail the write.
@@ -344,24 +527,10 @@ fn write_temp_then_rename(
     if tests::FAIL_BEFORE_RENAME.with(|f| f.get()) {
         return Err("simulated failure before the rename".to_string());
     }
-    std::fs::rename(temp, target)
+    dir.rename(file_name(temp)?, file_name(target)?)
         .map_err(|e| format!("cannot replace {}: {e}", target.display()))?;
-    sync_dir(target.parent());
+    dir.sync();
     Ok(())
-}
-
-/// Make the rename itself durable. Best effort: not every platform or filesystem lets a
-/// directory be opened and synced, and the new contents are already safe in the file.
-fn sync_dir(dir: Option<&Path>) {
-    #[cfg(unix)]
-    if let Some(dir) = dir {
-        let dir = if dir.as_os_str().is_empty() { Path::new(".") } else { dir };
-        if let Ok(d) = std::fs::File::open(dir) {
-            let _ = d.sync_all();
-        }
-    }
-    #[cfg(not(unix))]
-    let _ = dir;
 }
 
 /// `<dir>/.<sidecar name>.<pid>-<random>.chairphoto-tmp`, a new name on every call — see
@@ -419,6 +588,10 @@ mod tests {
         /// Makes this thread's next commits fail after the temp file is written and synced,
         /// before the rename — where a crash or a full disk would stop it.
         pub(super) static FAIL_BEFORE_RENAME: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        /// Runs once in this thread's next commit, after its last check that the original is
+        /// there and before the temp file is created — the gap #155 F1 is about.
+        pub(super) static AFTER_THE_LAST_CHECK: std::cell::Cell<Option<Box<dyn FnOnce()>>> =
+            const { std::cell::Cell::new(None) };
     }
 
     const FOREIGN: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -676,8 +849,9 @@ mod tests {
                     let body = FOREIGN.replace("<darktable:history_end>7", &format!(
                         "<darktable:history_end>{}", "7".repeat(256 * 1024 + w)));
                     barrier.wait();
+                    let folder = Folder::open(&p).unwrap();
                     for i in 0..60 {
-                        write_atomically(&p, &xmp, body.as_bytes())
+                        write_atomically(&folder, &p, &xmp, body.as_bytes())
                             .unwrap_or_else(|e| panic!("writer {w}, commit {i}: {e}"));
                     }
                 })
@@ -910,6 +1084,39 @@ mod tests {
         assert_eq!(std::fs::read(&xmp).unwrap(), FOREIGN.as_bytes());
         assert_eq!(std::fs::metadata(&xmp).unwrap().permissions().mode() & 0o777, 0o464);
         assert_eq!(temps_beside(&xmp), Vec::<String>::new());
+    }
+
+    /// #155 F1: the volume is swapped out in the gap between the commit's last check that the
+    /// original is there and the temp file's creation — the library folder moved away and an
+    /// empty folder left at its path, as an unmount leaves its mount point. The write goes
+    /// through the folder handle held since open, so it lands beside the original in the
+    /// folder it was read from; nothing is created in the folder now at the old path. (By
+    /// path, the temp file and then the sidecar were created in that empty folder.)
+    #[cfg(unix)]
+    #[test]
+    fn a_folder_swapped_after_the_last_check_cannot_redirect_the_write() {
+        let dir = crate::test_support::TestTmpDir::new("doc-155-f1");
+        let library = dir.join("library");
+        std::fs::create_dir_all(&library).unwrap();
+        let p = library.join("R.ARW");
+        std::fs::write(&p, b"raw").unwrap();
+        std::fs::write(sidecar_path(&p), FOREIGN).unwrap();
+        let mut doc = SidecarDocument::open(&p).unwrap();
+        set_prop(&mut doc, "Foo", "bar");
+
+        let away = dir.join("away");
+        let (from, to) = (library.clone(), away.clone());
+        AFTER_THE_LAST_CHECK.with(|h| h.set(Some(Box::new(move || {
+            std::fs::rename(&from, &to).unwrap();
+            std::fs::create_dir(&from).unwrap(); // the empty mount point
+        }))));
+        doc.commit().unwrap();
+
+        let stub: Vec<_> = std::fs::read_dir(&library).unwrap().map(|e| e.unwrap().file_name()).collect();
+        assert!(stub.is_empty(), "the write went to the folder now at the old path: {stub:?}");
+        let xml = std::fs::read_to_string(sidecar_path(&away.join("R.ARW"))).unwrap();
+        assert!(xml.contains("history_end") && xml.contains("<chairphoto:Foo>bar</chairphoto:Foo>"), "{xml}");
+        assert_eq!(temps_beside(&sidecar_path(&away.join("R.ARW"))), Vec::<String>::new());
     }
 
     /// A symlinked sidecar is written through to its target; the link stays a link.

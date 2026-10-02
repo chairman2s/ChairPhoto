@@ -5,16 +5,20 @@
 use super::{with_catalog, AppState};
 use crate::catalog::IptcFields;
 
-/// Store `fields` in the catalog, then write them to the photo's XMP sidecar (merge-safe:
-/// `xmp::write_iptc` touches only the IPTC elements it manages). The sidecar sits next to
-/// the original the location resolver finds; with no reachable copy the catalog keeps the
-/// values and the error says why the sidecar was not written.
+/// Store `fields` in the catalog, then write the change to the photo's XMP sidecar
+/// (merge-safe: `xmp::write_iptc` touches only the managed IPTC fields whose catalog value
+/// this save changed, so a sidecar value ChairPhoto never imported survives a save that
+/// left that field alone — issue #144). The sidecar sits next to the original the location
+/// resolver finds. With no reachable copy the save fails closed: the error says why, and
+/// neither the catalog nor the sidecar changes, so a retry once the original is back writes
+/// the whole change (a stored change with no sidecar write would make a retry a no-op).
 ///
-/// Blocking: the catalog lock is held only for the store and the path lookup, and the
+/// Blocking: the catalog lock is held only for the path lookup, the read of the previous
+/// values and the store — one hold, so the change written is the change stored — and the
 /// sidecar's read-modify-write runs after it is released. Call it off the UI thread.
 pub fn save_iptc(state: &AppState, photo_id: i64, fields: &IptcFields) -> Result<(), String> {
-    let original = with_catalog(state, |c| store(c, photo_id, fields))?;
-    crate::xmp::write_iptc(&original, fields)
+    let (original, before) = with_catalog(state, |c| store(c, photo_id, fields))?;
+    crate::xmp::write_iptc(&original, &before, fields)
 }
 
 /// [`save_iptc`] of a photo read from the catalog `expected` names: the store and the path
@@ -26,11 +30,123 @@ pub fn save_iptc_as(
     photo_id: i64,
     fields: &IptcFields,
 ) -> Result<(), String> {
-    let original = super::with_catalog_as(state, expected, |c| store(c, photo_id, fields))?;
-    crate::xmp::write_iptc(&original, fields)
+    let (original, before) = super::with_catalog_as(state, expected, |c| store(c, photo_id, fields))?;
+    crate::xmp::write_iptc(&original, &before, fields)
 }
 
-fn store(c: &crate::catalog::Catalog, photo_id: i64, fields: &IptcFields) -> crate::catalog::Result<std::path::PathBuf> {
+/// Store `fields`, returning the original's path and the values they replaced. The path is
+/// resolved before the row is written (as the geocoder's `fill_in` does), so an unreachable
+/// original leaves the catalog unchanged.
+fn store(
+    c: &crate::catalog::Catalog,
+    photo_id: i64,
+    fields: &IptcFields,
+) -> crate::catalog::Result<(std::path::PathBuf, IptcFields)> {
+    let original = c.require_photo_path(photo_id)?;
+    let before = c.get_iptc(photo_id)?;
     c.set_iptc(photo_id, fields)?;
-    c.require_photo_path(photo_id)
+    Ok((original, before))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::xmp::test_fixtures::{assert_non_iptc_intact, foreign_iptc, iptc, with, FOREIGN};
+
+    /// A catalog with one photo whose sidecar is `sidecar`, a foreign file ChairPhoto has
+    /// never written (its IPTC is empty in the catalog). Returns the sidecar's path.
+    fn foreign_photo(tag: &str, sidecar: &str) -> (crate::test_support::TestTmpDir, AppState, i64, std::path::PathBuf) {
+        let dir = crate::test_support::TestTmpDir::new(tag);
+        let root = dir.join("library");
+        std::fs::create_dir_all(&root).unwrap();
+        let file = root.join("DSC144.ARW");
+        std::fs::write(&file, b"raw").unwrap();
+        std::fs::write(crate::xmp::sidecar_path(&file), sidecar).unwrap();
+        let catalog = crate::catalog::Catalog::open(&dir.join("c.chairphoto"), &root).unwrap();
+        let id = catalog.upsert_photo(&file, None, 0, 1).unwrap().id;
+        let state = AppState::default();
+        *state.catalog.lock().unwrap() = Some(catalog);
+        let xmp = crate::xmp::sidecar_path(&file);
+        (dir, state, id, xmp)
+    }
+
+    fn read(path: &std::path::Path) -> String {
+        std::fs::read_to_string(path).unwrap()
+    }
+
+    /// Issue #144: a save that sets the title writes the title. The creator, rights and every
+    /// other value another tool wrote — empty in the catalog before and after — survive.
+    #[test]
+    fn a_save_that_sets_the_title_keeps_the_foreign_creator_and_rights() {
+        for (layout, sidecar) in FOREIGN {
+            let (_dir, state, id, xmp) = foreign_photo("iptc-144-title", sidecar);
+            save_iptc(&state, id, &IptcFields { title: "Mine".into(), ..Default::default() }).unwrap();
+
+            let xml = read(&xmp);
+            assert_eq!(iptc(&xml), with(foreign_iptc(), "dc:title", &["Mine"]), "{layout}:\n{xml}");
+            assert_non_iptc_intact(&xml, layout);
+        }
+    }
+
+    /// A field ChairPhoto had set and the user then clears is removed from the sidecar; the
+    /// foreign values beside it stay.
+    #[test]
+    fn a_save_that_clears_a_field_chairphoto_set_removes_it() {
+        for (layout, sidecar) in FOREIGN {
+            let (_dir, state, id, xmp) = foreign_photo("iptc-144-clear", sidecar);
+            let set = IptcFields { title: "Mine".into(), headline: "Ours".into(), ..Default::default() };
+            save_iptc(&state, id, &set).unwrap();
+            save_iptc(&state, id, &IptcFields { headline: "Ours".into(), ..Default::default() }).unwrap();
+
+            let xml = read(&xmp);
+            let expected = with(with(foreign_iptc(), "dc:title", &[]), "photoshop:Headline", &["Ours"]);
+            assert_eq!(iptc(&xml), expected, "{layout}:\n{xml}");
+            assert_non_iptc_intact(&xml, layout);
+        }
+    }
+
+    /// A save while the original is offline fails closed: an error, the catalog row and the
+    /// sidecar unchanged. Once the original is back, the retry — the same fields, as the
+    /// still-dirty form sends them — writes the whole change. (Storing first made the retry's
+    /// diff empty, so it reported success and never wrote the sidecar: review of 3ce3835, H1.)
+    #[test]
+    fn an_offline_save_changes_nothing_and_the_retry_writes_the_sidecar() {
+        let (dir, state, id, xmp) = foreign_photo("iptc-144-offline", crate::xmp::test_fixtures::LIGHTROOM);
+        let file = dir.join("library").join("DSC144.ARW");
+        let away = dir.join("DSC144.ARW.away");
+        std::fs::rename(&file, &away).unwrap();
+
+        let typed = IptcFields { title: "Mine".into(), creator: "Me".into(), ..Default::default() };
+        let err = save_iptc(&state, id, &typed).unwrap_err();
+        assert!(err.contains("no reachable copy"), "{err}");
+        let stored = state.catalog.lock().unwrap().as_ref().unwrap().get_iptc(id).unwrap();
+        assert_eq!(stored, IptcFields::default(), "an offline save must not change the catalog");
+        assert_eq!(read(&xmp), crate::xmp::test_fixtures::LIGHTROOM, "nor the sidecar");
+
+        std::fs::rename(&away, &file).unwrap();
+        save_iptc(&state, id, &typed).unwrap();
+        let xml = read(&xmp);
+        let expected = with(with(foreign_iptc(), "dc:title", &["Mine"]), "dc:creator", &["Me"]);
+        assert_eq!(iptc(&xml), expected, "the retry must write the change:\n{xml}");
+        let stored = state.catalog.lock().unwrap().as_ref().unwrap().get_iptc(id).unwrap();
+        assert_eq!(stored, typed);
+    }
+
+    /// A creator the user sets replaces the foreign one wherever it sits — Description #2 in
+    /// exiftool's layout — leaving exactly ChairPhoto's; a value saved earlier and unchanged
+    /// now is neither dropped nor duplicated.
+    #[test]
+    fn a_save_that_sets_the_creator_replaces_the_foreign_creator_in_every_description() {
+        for (layout, sidecar) in FOREIGN {
+            let (_dir, state, id, xmp) = foreign_photo("iptc-144-creator", sidecar);
+            let titled = IptcFields { title: "Mine".into(), ..Default::default() };
+            save_iptc(&state, id, &titled).unwrap();
+            save_iptc(&state, id, &IptcFields { creator: "Andreas".into(), ..titled }).unwrap();
+
+            let xml = read(&xmp);
+            let expected = with(with(foreign_iptc(), "dc:title", &["Mine"]), "dc:creator", &["Andreas"]);
+            assert_eq!(iptc(&xml), expected, "{layout}:\n{xml}");
+            assert_non_iptc_intact(&xml, layout);
+        }
+    }
 }

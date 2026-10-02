@@ -135,11 +135,17 @@ Three commands:
 | `geocode_to_iptc(photo_id)` | Fill the photo's **empty** `iptc_city` / `iptc_state` / `iptc_country` / `iptc_country_code`. Returns whether anything was filled. |
 | `geocode_all_to_iptc()` | The same fill across the library, emitting `geocode:progress` events. Returns a summary of totals, filled, and skipped. |
 
-Fields that already hold a value are **never overwritten** — this fills blanks, it does not
-replace. The write path is `set_iptc` + `xmp::write_iptc`, identical to a manual IPTC save,
-so XMP sidecars stay merge-safe. Both fills are bound to the catalog they read the photo
-from (`CatalogIdentity`): the cache, the row, the sidecar path and the IPTC written into it
-all come from that catalog, and a catalog switch during the Nominatim call makes the next
+Catalog fields that already hold a value are **never overwritten** — this fills blanks, it
+does not replace. The write path is `set_iptc` + `xmp::write_iptc`, identical to a manual
+IPTC save, so XMP sidecars stay merge-safe: `write_iptc` is given the IPTC before and after
+the fill and writes only the fields that changed, so a creator, rights, caption or title
+another tool put in the sidecar — which the catalog never imported — survives a geocode
+(#144). "Never overwritten" is about the catalog, not the sidecar: a location field that is
+empty in the catalog is filled, and its sidecar property is then replaced, so a city another
+tool wrote (and the catalog never imported) gives way to the geocoded one.
+
+Both fills are bound to the catalog they read the photo from (`CatalogIdentity`): the cache,
+the row, the sidecar path and the IPTC written into it all come from that catalog, and a catalog switch during the Nominatim call makes the next
 step fail closed with `CATALOG_CHANGED` instead of writing the new catalog's row (whose ids
 collide) or the old catalog's sidecar. The GPUI module binds its fence writes the same way,
 to the catalog the fences were read from. In the GPUI module, Geocode all is an owned job

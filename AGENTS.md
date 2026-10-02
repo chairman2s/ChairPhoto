@@ -55,9 +55,14 @@ Read only the documents triggered by the task:
 ### XMP safety
 
 - Read-modify-write the existing sidecar. Each writer touches only what it owns:
-  `write_iptc` through `MANAGED`, `write_keywords` through its local set, identifier/import/GPS
-  through their named elements, and face regions by Name + Area match. Preserve every other
-  element/attribute and foreign namespace.
+  `write_iptc` through the `MANAGED` fields whose catalog value this write changed (an
+  unchanged field, empty included, is left as the sidecar has it), `write_keywords` through
+  its local set, identifier/import/GPS through their named elements, and face regions by
+  Name + Area match. Preserve every other element/attribute and foreign namespace.
+- A `write_iptc` caller reads `before` in the same catalog lock hold that stores `after`,
+  and resolves the original's path before that store, so the diff written is the change
+  stored and an unreachable original changes nothing. A sidecar write that fails after the
+  catalog commit is not yet retried: the catalog then holds IPTC the sidecar lacks.
 - Sidecars are `<original_filename>.xmp`, alongside the original.
 - Before ChairPhoto's first in-library write to an existing sidecar, back it up if it lacks
   `chairphoto:LastWrite`. Export-only destination copies are not subject to this rule.

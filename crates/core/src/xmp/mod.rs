@@ -14,6 +14,8 @@ use xmltree::{Element, Namespace, XMLNode};
 
 mod document;
 use document::SidecarDocument;
+#[cfg(test)]
+pub(crate) mod test_fixtures;
 
 const NS_X: &str = "adobe:ns:meta/";
 const NS_RDF: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#";
@@ -30,26 +32,46 @@ const NS_MWG_RS: &str = "http://www.metadataworkinggroup.com/schemas/regions/";
 const NS_STAREA: &str = "http://ns.adobe.com/xmp/sType/Area#";
 const NS_STDIM: &str = "http://ns.adobe.com/xap/1.0/sType/Dimensions#";
 
-/// Properties chairphoto manages via [`write_iptc`], by (namespace, local name).
-/// On write we remove any existing instances of these and re-add from the current
-/// field values; every other element in the sidecar is preserved.
+/// One property [`write_iptc`] manages: its (namespace, local name) and the catalog field
+/// that holds its value, side by side so the mapping cannot drift between two lists.
+struct Managed {
+    ns: &'static str,
+    name: &'static str,
+    value: fn(&IptcFields) -> &str,
+}
+
+/// Properties chairphoto manages via [`write_iptc`]. A write touches only the ones whose
+/// catalog value changed (issue #144): it removes every existing instance of a changed
+/// property — element or compact form, in every Description — and re-adds it when the new
+/// value is non-empty. Every other element in the sidecar, an unchanged managed property
+/// included, is preserved.
 /// Note: `chairphoto:ImportBatch` is managed separately by [`write_import_batch`]
 /// and is intentionally NOT listed here so IPTC writes don't clobber it. Likewise
 /// `chairphoto:LastWrite` is not listed: every writer's completion stamp is applied
 /// uniformly by [`SidecarDocument::commit`], not per-writer.
-const MANAGED: &[(&str, &str)] = &[
-    (NS_DC, "description"),
-    (NS_DC, "title"),
-    (NS_DC, "rights"),
-    (NS_DC, "creator"),
-    (NS_PHOTOSHOP, "Headline"),
-    (NS_PHOTOSHOP, "Credit"),
-    (NS_PHOTOSHOP, "Source"),
-    (NS_PHOTOSHOP, "City"),
-    (NS_PHOTOSHOP, "State"),
-    (NS_PHOTOSHOP, "Country"),
-    (NS_IPTC, "CountryCode"),
+const MANAGED: [Managed; 11] = [
+    Managed { ns: NS_DC, name: "description", value: |f| &f.description },
+    Managed { ns: NS_DC, name: "title", value: |f| &f.title },
+    Managed { ns: NS_DC, name: "rights", value: |f| &f.copyright },
+    Managed { ns: NS_DC, name: "creator", value: |f| &f.creator },
+    Managed { ns: NS_PHOTOSHOP, name: "Headline", value: |f| &f.headline },
+    Managed { ns: NS_PHOTOSHOP, name: "Credit", value: |f| &f.credit },
+    Managed { ns: NS_PHOTOSHOP, name: "Source", value: |f| &f.source },
+    Managed { ns: NS_PHOTOSHOP, name: "City", value: |f| &f.city },
+    Managed { ns: NS_PHOTOSHOP, name: "State", value: |f| &f.state },
+    Managed { ns: NS_PHOTOSHOP, name: "Country", value: |f| &f.country },
+    Managed { ns: NS_IPTC, name: "CountryCode", value: |f| &f.country_code },
 ];
+
+/// The sidecar node for one managed property's non-empty value.
+fn managed_node(ns: &str, name: &str, value: &str) -> XMLNode {
+    match (ns, name) {
+        (NS_DC, "creator") => seq_creator(value),
+        (NS_DC, _) => lang_alt(name, value),
+        (NS_PHOTOSHOP, _) => plain("photoshop", NS_PHOTOSHOP, name, value),
+        _ => plain("Iptc4xmpCore", NS_IPTC, name, value),
+    }
+}
 
 /// The sidecar path for a photo: `<original_filename>.xmp` (darktable convention).
 pub fn sidecar_path(photo_path: &Path) -> PathBuf {
@@ -58,44 +80,39 @@ pub fn sidecar_path(photo_path: &Path) -> PathBuf {
     PathBuf::from(s)
 }
 
-/// Write the authored IPTC fields into the photo's XMP sidecar, merging with any
-/// existing content. Creates the sidecar if absent; backs up a pre-existing
-/// non-chairphoto sidecar once before the first write.
-pub fn write_iptc(photo_path: &Path, fields: &IptcFields) -> Result<(), String> {
-    let mut doc = SidecarDocument::open(photo_path)?;
-
-    // Build replacement nodes from current values (skip empties).
-    let f = fields;
+/// Write a change of the authored IPTC fields into the photo's XMP sidecar, merging with
+/// any existing content. `before` is the catalog's value before this change and `after`
+/// the value now stored; callers read both in the lock hold that stores `after`, so the
+/// diff is the change the catalog actually made.
+///
+/// Only a field whose value changed is written (issue #144): a new non-empty value replaces
+/// every existing instance of the property, and a value the user cleared removes them. A
+/// field that did not change — empty before and after included — is left exactly as the
+/// sidecar has it, so a creator, rights or caption another tool wrote (ChairPhoto never
+/// imports them into the catalog) survive a city-only geocode or a title-only save. With
+/// nothing changed the sidecar is not opened at all.
+///
+/// Creates the sidecar if absent; backs up a pre-existing non-chairphoto sidecar once
+/// before the first write.
+pub fn write_iptc(photo_path: &Path, before: &IptcFields, after: &IptcFields) -> Result<(), String> {
+    let mut owned = Vec::new();
     let mut replacements = Vec::new();
-    if !f.description.is_empty() {
-        replacements.push(lang_alt("description", &f.description));
-    }
-    if !f.title.is_empty() {
-        replacements.push(lang_alt("title", &f.title));
-    }
-    if !f.copyright.is_empty() {
-        replacements.push(lang_alt("rights", &f.copyright));
-    }
-    if !f.creator.is_empty() {
-        replacements.push(seq_creator(&f.creator));
-    }
-    for (val, name) in [
-        (&f.headline, "Headline"),
-        (&f.credit, "Credit"),
-        (&f.source, "Source"),
-        (&f.city, "City"),
-        (&f.state, "State"),
-        (&f.country, "Country"),
-    ] {
-        if !val.is_empty() {
-            replacements.push(plain("photoshop", NS_PHOTOSHOP, name, val));
+    for m in &MANAGED {
+        let new = (m.value)(after);
+        if (m.value)(before) == new {
+            continue;
+        }
+        owned.push((m.ns, m.name));
+        if !new.is_empty() {
+            replacements.push(managed_node(m.ns, m.name, new));
         }
     }
-    if !f.country_code.is_empty() {
-        replacements.push(plain("Iptc4xmpCore", NS_IPTC, "CountryCode", &f.country_code));
+    if owned.is_empty() {
+        return Ok(());
     }
 
-    doc.replace_owned(MANAGED, replacements);
+    let mut doc = SidecarDocument::open(photo_path)?;
+    doc.replace_owned(&owned, replacements);
     doc.commit()
 }
 
@@ -1273,7 +1290,7 @@ mod tests {
             city: "Trondheim".into(),
             ..Default::default()
         };
-        write_iptc(&photo, &fields).unwrap();
+        write_iptc(&photo, &IptcFields::default(), &fields).unwrap();
 
         let xmp = read(&sidecar_path(&photo));
         assert!(xmp.contains("A ferry"));
@@ -1304,7 +1321,7 @@ mod tests {
             description: "Edited photo".into(),
             ..Default::default()
         };
-        write_iptc(&photo, &fields).unwrap();
+        write_iptc(&photo, &IptcFields::default(), &fields).unwrap();
 
         let xmp = read(&sidecar_path(&photo));
         // Our field is present AND darktable's element survived.
@@ -1329,7 +1346,7 @@ mod tests {
 
         // A later IPTC write must not drop the identifier, and re-writing the identifier
         // keeps a single instance.
-        write_iptc(&photo, &IptcFields { description: "x".into(), ..Default::default() }).unwrap();
+        write_iptc(&photo, &IptcFields::default(), &IptcFields { description: "x".into(), ..Default::default() }).unwrap();
         assert_eq!(read_identifier(&photo).as_deref(), Some("uuid-abc-123"));
         write_identifier(&photo, "uuid-abc-123").unwrap();
         let xmp = read(&sidecar_path(&photo));
@@ -1429,13 +1446,96 @@ mod tests {
         let photo = dir.join("DSC3.ARW");
         std::fs::write(&photo, b"raw").unwrap();
 
-        write_iptc(&photo, &IptcFields { headline: "First".into(), ..Default::default() }).unwrap();
-        write_iptc(&photo, &IptcFields { headline: "Second".into(), ..Default::default() }).unwrap();
+        let first = IptcFields { headline: "First".into(), ..Default::default() };
+        write_iptc(&photo, &IptcFields::default(), &first).unwrap();
+        write_iptc(&photo, &first, &IptcFields { headline: "Second".into(), ..Default::default() }).unwrap();
 
         let xmp = read(&sidecar_path(&photo));
         assert!(xmp.contains("Second"));
         assert!(!xmp.contains("First"), "old value should be replaced, not duplicated");
         assert_eq!(xmp.matches("photoshop:Headline").count(), 2); // open + close tag, once
+    }
+
+    /// Issue #144: the geocoder fills an empty city, and writes nothing else. The creator,
+    /// rights, caption, title, headline and country code another tool wrote — values the
+    /// catalog never imported, so they are empty there before and after — must survive, in
+    /// a Lightroom single-Description sidecar and in exiftool's one-Description-per-namespace
+    /// layout alike. The city itself changed, so the foreign one is replaced.
+    #[test]
+    fn a_city_only_write_keeps_every_other_foreign_iptc_field() {
+        use test_fixtures::{assert_non_iptc_intact, foreign_iptc, iptc, with, FOREIGN};
+        for (layout, sidecar) in FOREIGN {
+            let dir = crate::test_support::TestTmpDir::new("xmp-144-city-only");
+            let photo = dir.join("DSC144.ARW");
+            std::fs::write(&photo, b"raw").unwrap();
+            std::fs::write(sidecar_path(&photo), sidecar).unwrap();
+
+            let filled = IptcFields { city: "Trondheim".into(), ..Default::default() };
+            write_iptc(&photo, &IptcFields::default(), &filled).unwrap();
+
+            let xml = read(&sidecar_path(&photo));
+            assert_eq!(iptc(&xml), with(foreign_iptc(), "photoshop:City", &["Trondheim"]),
+                "{layout}:\n{xml}");
+            assert_non_iptc_intact(&xml, layout);
+        }
+    }
+
+    /// A write that changes no field does not open the sidecar: no stamp, no backup, the
+    /// file byte-identical.
+    #[test]
+    fn an_unchanged_write_leaves_the_sidecar_alone() {
+        let dir = crate::test_support::TestTmpDir::new("xmp-144-unchanged");
+        let photo = dir.join("DSC144.ARW");
+        std::fs::write(&photo, b"raw").unwrap();
+        std::fs::write(sidecar_path(&photo), test_fixtures::LIGHTROOM).unwrap();
+
+        let same = IptcFields { title: "Mine".into(), ..Default::default() };
+        write_iptc(&photo, &same, &same).unwrap();
+
+        assert_eq!(read(&sidecar_path(&photo)), test_fixtures::LIGHTROOM);
+        assert!(!sidecar_backup_path(&sidecar_path(&photo)).exists());
+    }
+
+    /// Every catalog field lands in its own IPTC property — checked against a table written
+    /// out here, not derived from `MANAGED`, so a swapped mapping (Credit written as Source,
+    /// say) fails. Each field carries a distinct value.
+    #[test]
+    fn every_iptc_field_maps_to_its_own_property() {
+        let dir = crate::test_support::TestTmpDir::new("xmp-144-mapping");
+        let photo = dir.join("DSC144.ARW");
+        std::fs::write(&photo, b"raw").unwrap();
+        let fields = IptcFields {
+            description: "v-description".into(),
+            headline: "v-headline".into(),
+            title: "v-title".into(),
+            creator: "v-creator".into(),
+            copyright: "v-copyright".into(),
+            credit: "v-credit".into(),
+            source: "v-source".into(),
+            city: "v-city".into(),
+            state: "v-state".into(),
+            country: "v-country".into(),
+            country_code: "v-country_code".into(),
+        };
+        write_iptc(&photo, &IptcFields::default(), &fields).unwrap();
+
+        let xml = read(&sidecar_path(&photo));
+        let expected = [
+            (NS_DC, "description", "v-description"),
+            (NS_DC, "title", "v-title"),
+            (NS_DC, "rights", "v-copyright"),
+            (NS_DC, "creator", "v-creator"),
+            (NS_PHOTOSHOP, "Headline", "v-headline"),
+            (NS_PHOTOSHOP, "Credit", "v-credit"),
+            (NS_PHOTOSHOP, "Source", "v-source"),
+            (NS_PHOTOSHOP, "City", "v-city"),
+            (NS_PHOTOSHOP, "State", "v-state"),
+            (NS_PHOTOSHOP, "Country", "v-country"),
+            (NS_IPTC, "CountryCode", "v-country_code"),
+        ];
+        for (ns, name, value) in expected {
+            assert_eq!(test_fixtures::property_values(&xml, ns, name), [value], "{name}:\n{xml}");
+        }
     }
 
     #[test]
@@ -1460,7 +1560,7 @@ mod tests {
         );
 
         // A later IPTC write must not drop the batch field.
-        write_iptc(&photo, &IptcFields { description: "boat".into(), ..Default::default() }).unwrap();
+        write_iptc(&photo, &IptcFields::default(), &IptcFields { description: "boat".into(), ..Default::default() }).unwrap();
         assert_eq!(read_import_batch(&photo).as_deref(), Some("batch-uuid-001"),
             "batch uuid must survive an IPTC write");
 
@@ -1723,7 +1823,7 @@ mod tests {
         // No sidecar.
         assert!(read_face_regions(&photo).is_empty());
         // Sidecar with only IPTC, no regions.
-        write_iptc(&photo, &IptcFields { description: "x".into(), ..Default::default() }).unwrap();
+        write_iptc(&photo, &IptcFields::default(), &IptcFields { description: "x".into(), ..Default::default() }).unwrap();
         assert!(read_face_regions(&photo).is_empty());
     }
 
@@ -2239,7 +2339,7 @@ mod tests {
                     city: "Trondheim".into(),
                     ..Default::default()
                 };
-                write_iptc(&photo, &fields).unwrap();
+                write_iptc(&photo, &IptcFields::default(), &fields).unwrap();
             })),
             ("write_keywords", Box::new(|| {
                 write_keywords(&photo, &["boat".into()], &["Places|Norway".into()]).unwrap();
@@ -2297,7 +2397,7 @@ mod tests {
 
         let uuid = "0b7d5f7e-4d0c-4c55-8a3e-1f5e6f0a1390";
         overwrite_identifier(&photo, uuid).unwrap();
-        write_iptc(&photo, &IptcFields { city: "Trondheim".into(), ..Default::default() })
+        write_iptc(&photo, &IptcFields::default(), &IptcFields { city: "Trondheim".into(), ..Default::default() })
             .unwrap();
 
         let xml = read(&sidecar_path(&photo));
@@ -2347,7 +2447,7 @@ mod tests {
 
         let uuid = "6f1c1f0e-8f5e-4a51-9a51-3c1b2a0d1420";
         overwrite_identifier(&photo, uuid).unwrap();
-        write_iptc(&photo, &IptcFields { city: "Trondheim".into(), ..Default::default() })
+        write_iptc(&photo, &IptcFields::default(), &IptcFields { city: "Trondheim".into(), ..Default::default() })
             .unwrap();
         write_gps(&photo, 63.4305, 10.3951).unwrap();
 
@@ -2408,7 +2508,7 @@ mod tests {
 
         let uuid = "6f1c1f0e-8f5e-4a51-9a51-3c1b2a0d1430";
         overwrite_identifier(&photo, uuid).unwrap();
-        write_iptc(&photo, &IptcFields { city: "Trondheim".into(), ..Default::default() })
+        write_iptc(&photo, &IptcFields::default(), &IptcFields { city: "Trondheim".into(), ..Default::default() })
             .unwrap();
 
         let xml = read(&sidecar_path(&photo));

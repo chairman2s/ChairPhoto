@@ -4713,7 +4713,7 @@ fn reverse_geocode_iptc_fill_integration() {
     catalog.set_iptc(photo_id, &updated_iptc).unwrap();
 
     // Write to XMP sidecar (merge-safe path).
-    chairphoto_core::xmp::write_iptc(&photo_path, &updated_iptc).unwrap();
+    chairphoto_core::xmp::write_iptc(&photo_path, &current_iptc, &updated_iptc).unwrap();
 
     // Verify IPTC fields were updated in the catalog.
     let final_iptc = catalog.get_iptc(photo_id).unwrap();
@@ -4761,7 +4761,10 @@ fn reverse_geocode_preserves_existing_iptc_values() {
     pre_iptc.city = "CustomCity".to_string();
     pre_iptc.country = "CustomCountry".to_string();
     // state and country_code remain empty — these should be filled by geocoding.
+    // Stored and written to the sidecar as the user's IPTC save does.
+    let empty_iptc = catalog.get_iptc(photo_id).unwrap();
     catalog.set_iptc(photo_id, &pre_iptc).unwrap();
+    chairphoto_core::xmp::write_iptc(&photo_path, &empty_iptc, &pre_iptc).unwrap();
 
     // Simulate a geocoder response (GeocodeResult as returned by the actual geocoder).
     use chairphoto_core::plugins::map::geocode::GeocodeResult;
@@ -4790,7 +4793,7 @@ fn reverse_geocode_preserves_existing_iptc_values() {
 
     // Write to catalog and XMP sidecar (demonstrating the full write path).
     catalog.set_iptc(photo_id, &updated_iptc).unwrap();
-    chairphoto_core::xmp::write_iptc(&photo_path, &updated_iptc).unwrap();
+    chairphoto_core::xmp::write_iptc(&photo_path, &current_iptc, &updated_iptc).unwrap();
 
     // Verify the sidecar was written correctly.
     let sidecar_path = photo_path.with_extension("jpg.xmp");

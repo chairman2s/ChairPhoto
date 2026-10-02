@@ -1147,6 +1147,51 @@ fn the_proof_sheet_and_duel_are_mounted_and_feed_the_record(cx: &mut TestAppCont
     assert!(rig.view(cx).read_with(cx, |v, _| v.overlay().is_none()));
 }
 
+/// **Forced interleaving.** A duel's ⑂ pressed while the photo's versions are still being
+/// read (the read held on the worker) is not dropped: it waits for the version and banks the
+/// variant once it is resolved, and the duel says it was kept. If the versions cannot be
+/// read, the operation is not run and the banner says so.
+#[gpui_kit::test]
+fn a_duel_fork_before_the_version_resolves_waits_for_it(cx: &mut TestAppContext) {
+    use super::view::Overlay;
+    let rig = rig("dk-fork-early", 3, cx);
+    let order = rig.app.wired.shell.read_with(cx, |s, _| s.library.photo_ids());
+    let d = rig.darkroom(cx);
+    let loaded = |cx: &mut TestAppContext| d.read_with(cx, |d, _| d.open.as_ref().unwrap().loaded);
+    rig.press("right", cx); // the next photo opens; its version read waits on the worker
+    assert_eq!(rig.open_photo(cx), Some(order[1]));
+    assert!(!loaded(cx), "the version is not resolved yet");
+    rig.with_view(cx, |v, window, cx| v.open_duel(window, cx));
+    let duel = rig.view(cx).read_with(cx, |v, _| match v.overlay() {
+        Some(Overlay::Duel(d)) => d.clone(),
+        _ => panic!("the duel is mounted"),
+    });
+    duel.update(cx, |d, cx| d.fork(1, cx));
+    cx.run_until_parked();
+    assert!(!loaded(cx));
+    assert!(rig.catalog(|c| c.list_versions(order[1]).unwrap()).is_empty(), "nothing written before the version is known");
+    work(cx);
+    assert!(loaded(cx));
+    let names: Vec<String> = rig.catalog(|c| c.list_versions(order[1]).unwrap()).into_iter().map(|v| v.name).collect();
+    assert_eq!(names.len(), 1, "{names:?}");
+    assert!(names[0].starts_with("What-if — "), "the variant was banked once the version resolved: {names:?}");
+    assert!(rig.present("duel-note", cx), "the duel says it was kept");
+    assert_eq!(rig.darkroom(cx).read_with(cx, |d, _| d.error.clone()), None);
+
+    // The versions cannot be read (the catalog switched, the event withheld): the queued
+    // operation does not run, and the banner says why.
+    rig.press("escape", cx);
+    rig.press("right", cx);
+    assert_eq!(rig.open_photo(cx), Some(order[2]));
+    assert!(!loaded(cx));
+    rig.darkroom(cx).update(cx, |d, cx| d.toggle_cover(cx));
+    let (b, _) = colliding_catalog(&rig.dir, "b", 3);
+    core_switch(&rig.app, b);
+    work(cx);
+    let error = rig.darkroom(cx).read_with(cx, |d, _| d.error.clone()).unwrap_or_default();
+    assert!(error.contains("was not done"), "{error}");
+}
+
 /// **Catalog identity.** The core switches to a catalog with colliding ids, the event
 /// withheld: a version operation (the cover), a history step and a preset save fail closed
 /// and touch nothing in the new catalog.

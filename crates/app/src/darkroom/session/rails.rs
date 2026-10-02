@@ -34,11 +34,15 @@ type Created = (i64, Vec<PhotoVersion>);
 impl Darkroom {
     // --- ordering ----------------------------------------------------------------------------
 
-    /// Run `op` once what is pending is saved: now, or after the commit on the worker.
+    /// Run `op` once what is pending is saved: now, or after the commit on the worker — or,
+    /// the version not resolved yet, once it is.
     fn after_save(&mut self, op: Op, cx: &mut Context<Self>) {
-        let Some(open) = self.open.as_ref() else { return };
+        let Some(open) = self.open.as_mut() else { return };
         if !open.loaded {
-            // The version is not resolved yet: there is nothing to step, switch or fork from.
+            // Nothing to step, switch or fork from yet (a duel's ⑂, a key, pressed while the
+            // photo opens): the operation waits for the version, as React's waited on its
+            // load. If the versions cannot be read it is dropped and the banner says why.
+            open.ops.push_back(op);
             return;
         }
         let seq = open.seq;

@@ -515,7 +515,7 @@ impl Darkroom {
                     Ok((versions, v, history))
                 })
             },
-            |this, result, cx| {
+            move |this, result, cx| {
                 let Some(open) = this.open.as_mut() else { return };
                 match result {
                     Ok((versions, v, history)) => {
@@ -539,13 +539,26 @@ impl Darkroom {
                         open.version_id = v.map(|v| v.id);
                         open.history = history;
                         open.loaded = true;
+                        let waiting = !open.ops.is_empty();
                         this.restage(before, cx);
-                        this.schedule_autosave(cx);
+                        if waiting {
+                            // Operations asked for while the version resolved: what is pending
+                            // is saved first, then they run in order (`idle`).
+                            this.commit(seq, cx);
+                            if !this.open.as_ref().is_some_and(|o| o.committing) {
+                                this.idle(seq, false, cx);
+                            }
+                        } else {
+                            this.schedule_autosave(cx);
+                        }
                     }
                     Err(e) => {
                         // Versions unreadable (or the catalog changed): autosave stays off, so
-                        // nothing is written over a version this view never resolved.
-                        this.error = Some(format!("Could not read the versions: {e}"));
+                        // nothing is written over a version this view never resolved, and
+                        // what was asked for meanwhile does not run.
+                        let dropped = this.open.as_mut().map(|o| std::mem::take(&mut o.ops).len()).unwrap_or(0);
+                        let also = if dropped > 0 { " — what was asked for meanwhile was not done" } else { "" };
+                        this.error = Some(format!("Could not read the versions: {e}{also}"));
                     }
                 }
                 cx.notify();

@@ -136,7 +136,7 @@ pub fn write_keywords(
 pub fn read_identifier(photo_path: &Path) -> Option<String> {
     let path = sidecar_path(photo_path);
     let file = std::fs::File::open(&path).ok()?;
-    let root = Element::parse(file).ok()?;
+    let root = parse_xml(file).ok()?;
     let rdf = root.get_child(("RDF", NS_RDF))?;
     for node in &rdf.children {
         let XMLNode::Element(desc) = node else { continue };
@@ -144,7 +144,7 @@ pub fn read_identifier(photo_path: &Path) -> Option<String> {
             continue;
         }
         // Compact (attribute) form: rdf:Description xmp:Identifier="…".
-        if let Some(v) = desc.attributes.get("xmp:Identifier") {
+        if let Some(v) = ns_attr(desc, NS_XMP, "Identifier") {
             if !v.trim().is_empty() {
                 return Some(v.trim().to_string());
             }
@@ -237,7 +237,7 @@ pub fn write_import_batch(photo_path: &Path, batch_uuid: &str) -> Result<(), Str
 pub fn read_import_batch(photo_path: &Path) -> Option<String> {
     let path = sidecar_path(photo_path);
     let file = std::fs::File::open(&path).ok()?;
-    let root = Element::parse(file).ok()?;
+    let root = parse_xml(file).ok()?;
     let rdf = root.get_child(("RDF", NS_RDF))?;
     for node in &rdf.children {
         let XMLNode::Element(desc) = node else { continue };
@@ -286,7 +286,7 @@ pub fn write_gps(photo_path: &Path, lat: f64, lng: f64) -> Result<(), String> {
 pub fn read_gps(photo_path: &Path) -> Option<(f64, f64)> {
     let path = sidecar_path(photo_path);
     let file = std::fs::File::open(&path).ok()?;
-    let root = Element::parse(file).ok()?;
+    let root = parse_xml(file).ok()?;
     let rdf = root.get_child(("RDF", NS_RDF))?;
     let mut lat_str: Option<String> = None;
     let mut lng_str: Option<String> = None;
@@ -515,7 +515,7 @@ pub fn read_face_regions(photo_path: &Path) -> Vec<ReadRegion> {
     let Ok(file) = std::fs::File::open(&path) else {
         return Vec::new();
     };
-    let Ok(root) = Element::parse(file) else {
+    let Ok(root) = parse_xml(file) else {
         return Vec::new();
     };
     let Some(rdf) = root.get_child(("RDF", NS_RDF)) else {
@@ -690,8 +690,7 @@ fn parse_region_li(li: &Element) -> Option<ReadRegion> {
 /// attributes) or as a child element.
 fn starea_value(area: &Element, field: &str) -> Option<f32> {
     // Attribute (shorthand) form: stArea:x="0.5".
-    let attr_key = format!("stArea:{field}");
-    if let Some(v) = area.attributes.get(&attr_key) {
+    if let Some(v) = ns_attr(area, NS_STAREA, field) {
         if let Ok(n) = v.trim().parse::<f32>() {
             return Some(n);
         }
@@ -757,6 +756,94 @@ fn fmt_coord(v: f32) -> String {
     } else {
         trimmed.to_string()
     }
+}
+
+// --- parsing and attribute lookup -----------------------------------------
+
+/// Parse a sidecar into an `xmltree` DOM, keeping each prefixed attribute under its
+/// **qualified** name (`stArea:x`, `xmp:Rating`, `xml:lang`) — issue #138.
+///
+/// `xmltree::Element::parse` (0.11) keys attributes by local name only and writes those keys
+/// back unprefixed, so every read-modify-write turned `digiKam:Confidence` into a
+/// no-namespace `Confidence`. This is the same tree xmltree builds (same parser and config:
+/// comments kept, whitespace-only text dropped), except for the attribute key. Writing it
+/// back with `Element::write` stays well-formed: the writer emits a key verbatim, and every
+/// parsed element carries its full in-scope namespace map, so the writer re-declares any
+/// prefix that is not already in scope where the element lands.
+///
+/// Look such attributes up with [`ns_attr`], which matches by namespace URI, not prefix.
+fn parse_xml<R: std::io::Read>(r: R) -> Result<Element, String> {
+    use xml::reader::{EventReader, ParserConfig, XmlEvent};
+    let reader =
+        EventReader::new_with_config(r, ParserConfig::new().ignore_comments(false));
+    let mut open: Vec<Element> = Vec::new();
+    let mut root: Option<Element> = None;
+    for ev in reader {
+        let parent = open.last_mut();
+        match ev.map_err(|e| e.to_string())? {
+            XmlEvent::StartElement { name, attributes, namespace } => {
+                let mut e = Element::new(&name.local_name);
+                e.prefix = name.prefix;
+                e.namespace = name.namespace;
+                e.namespaces = (!namespace.is_essentially_empty()).then_some(namespace);
+                for a in attributes {
+                    let key = match a.name.prefix {
+                        Some(prefix) => format!("{prefix}:{}", a.name.local_name),
+                        None => a.name.local_name,
+                    };
+                    e.attributes.insert(key, a.value);
+                }
+                open.push(e);
+            }
+            XmlEvent::EndElement { .. } => {
+                let done = open.pop().ok_or("unbalanced end element")?;
+                match open.last_mut() {
+                    Some(parent) => parent.children.push(XMLNode::Element(done)),
+                    None => root = root.or(Some(done)),
+                }
+            }
+            XmlEvent::Characters(s) => {
+                if let Some(p) = parent {
+                    p.children.push(XMLNode::Text(s));
+                }
+            }
+            XmlEvent::CData(s) => {
+                if let Some(p) = parent {
+                    p.children.push(XMLNode::CData(s));
+                }
+            }
+            XmlEvent::Comment(s) => {
+                if let Some(p) = parent {
+                    p.children.push(XMLNode::Comment(s));
+                }
+            }
+            XmlEvent::ProcessingInstruction { name, data } => {
+                if let Some(p) = parent {
+                    p.children.push(XMLNode::ProcessingInstruction(name, data));
+                }
+            }
+            XmlEvent::EndDocument => break,
+            XmlEvent::StartDocument { .. } | XmlEvent::Whitespace(_) => {}
+        }
+    }
+    root.ok_or_else(|| "no root element".to_string())
+}
+
+/// True when attribute key `key` (as [`parse_xml`] stores it, `prefix:local`) of element `e`
+/// names `{ns}local`, resolving the prefix through `e`'s in-scope namespaces.
+fn attr_is(e: &Element, key: &str, ns: &str, local: &str) -> bool {
+    let Some((prefix, name)) = key.split_once(':') else {
+        return false; // an unprefixed attribute is in no namespace
+    };
+    name == local && e.namespaces.as_ref().and_then(|n| n.get(prefix)) == Some(ns)
+}
+
+/// The value of attribute `{ns}local` on `e`, whatever prefix the file bound `ns` to.
+fn ns_attr<'a>(e: &'a Element, ns: &str, local: &str) -> Option<&'a str> {
+    e.attributes
+        .iter()
+        .find(|(k, _)| attr_is(e, k, ns, local))
+        .map(|(_, v)| v.as_str())
 }
 
 // --- element construction helpers ----------------------------------------
@@ -1502,7 +1589,7 @@ mod tests {
     /// land under `dc:subject` and hierarchical ones under `lr:hierarchicalSubject`, not
     /// swapped or merged together.
     fn bag_items(xmp: &str, ns: &str, name: &str) -> Vec<String> {
-        let root = Element::parse(xmp.as_bytes()).unwrap();
+        let root = parse_xml(xmp.as_bytes()).unwrap();
         let rdf = root.get_child(("RDF", NS_RDF)).unwrap();
         for node in &rdf.children {
             let XMLNode::Element(desc) = node else { continue };
@@ -1727,5 +1814,212 @@ mod tests {
     #[test]
     fn decimal_to_dms_lat_awkward_rounding_does_not_spuriously_carry() {
         assert_eq!(decimal_to_dms_lat(10.1), "10,6.000000N");
+    }
+
+    // ── prefixed attributes survive every writer (issue #138) ───────────────
+
+    const NS_XML: &str = "http://www.w3.org/XML/1998/namespace";
+    const NS_DARKTABLE: &str = "http://darktable.sf.net/";
+    const NS_CRS: &str = "http://ns.adobe.com/camera-raw-settings/1.0/";
+    const NS_DIGIKAM: &str = "http://www.digikam.org/ns/1.0/";
+
+    /// A foreign sidecar written by hand — not by ChairPhoto — whose foreign data is carried
+    /// in prefixed *attributes*: Exiv2's `x:xmptk`, compact `xmp:`/`darktable:`/`crs:`
+    /// properties on `rdf:Description`, an MWG region whose Area is in the attribute
+    /// (shorthand) form with a `digiKam:` extra, and a foreign Lang Alt's `xml:lang`.
+    const FOREIGN_PREFIXED_ATTRS: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<x:xmpmeta xmlns:x="adobe:ns:meta/" x:xmptk="XMP Core 4.4.0-Exiv2">
+ <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+  <rdf:Description rdf:about=""
+    xmlns:xmp="http://ns.adobe.com/xap/1.0/"
+    xmlns:darktable="http://darktable.sf.net/"
+    xmlns:crs="http://ns.adobe.com/camera-raw-settings/1.0/"
+    xmlns:xmpRights="http://ns.adobe.com/xap/1.0/rights/"
+    xmlns:mwg-rs="http://www.metadataworkinggroup.com/schemas/regions/"
+    xmlns:stArea="http://ns.adobe.com/xmp/sType/Area#"
+    xmlns:digiKam="http://www.digikam.org/ns/1.0/"
+    xmp:Rating="1"
+    darktable:xmp_version="5"
+    darktable:auto_presets_applied="1"
+    crs:Exposure2012="+0.50">
+   <xmpRights:UsageTerms>
+    <rdf:Alt>
+     <rdf:li xml:lang="x-default">All rights reserved</rdf:li>
+    </rdf:Alt>
+   </xmpRights:UsageTerms>
+   <mwg-rs:Regions rdf:parseType="Resource">
+    <mwg-rs:RegionList>
+     <rdf:Bag>
+      <rdf:li rdf:parseType="Resource">
+       <mwg-rs:Name>Bob</mwg-rs:Name>
+       <mwg-rs:Type>Face</mwg-rs:Type>
+       <mwg-rs:Area stArea:x="0.8" stArea:y="0.7" stArea:w="0.1" stArea:h="0.2"
+         stArea:unit="normalized" digiKam:Confidence="87"/>
+      </rdf:li>
+     </rdf:Bag>
+    </mwg-rs:RegionList>
+   </mwg-rs:Regions>
+  </rdf:Description>
+ </rdf:RDF>
+</x:xmpmeta>"#;
+
+    /// Every attribute in `xml`, namespace-resolved by an independent namespace-aware reader
+    /// (xml-rs's event reader, not ChairPhoto's parser): `(element ns, element local,
+    /// attr ns, attr local, value)`, `""` meaning "no namespace". Panics if `xml` is not
+    /// well-formed, which includes using a prefix that is not declared in scope.
+    fn namespaced_attributes(xml: &str) -> Vec<(String, String, String, String, String)> {
+        use xml::reader::{EventReader, XmlEvent};
+        let mut out = Vec::new();
+        for ev in EventReader::new(xml.as_bytes()) {
+            if let XmlEvent::StartElement { name, attributes, .. } =
+                ev.unwrap_or_else(|e| panic!("sidecar is not well-formed XML: {e}\n{xml}"))
+            {
+                for a in attributes {
+                    out.push((
+                        name.namespace.clone().unwrap_or_default(),
+                        name.local_name.clone(),
+                        a.name.namespace.unwrap_or_default(),
+                        a.name.local_name,
+                        a.value,
+                    ));
+                }
+            }
+        }
+        out
+    }
+
+    fn assert_foreign_attributes_intact(xml: &str, after: &str) {
+        let attrs = namespaced_attributes(xml);
+        let expected = [
+            (NS_X, "xmpmeta", NS_X, "xmptk", "XMP Core 4.4.0-Exiv2"),
+            (NS_RDF, "Description", NS_RDF, "about", ""),
+            (NS_RDF, "Description", NS_XMP, "Rating", "1"),
+            (NS_RDF, "Description", NS_DARKTABLE, "xmp_version", "5"),
+            (NS_RDF, "Description", NS_DARKTABLE, "auto_presets_applied", "1"),
+            (NS_RDF, "Description", NS_CRS, "Exposure2012", "+0.50"),
+            (NS_RDF, "li", NS_XML, "lang", "x-default"),
+            (NS_MWG_RS, "Area", NS_STAREA, "x", "0.8"),
+            (NS_MWG_RS, "Area", NS_STAREA, "y", "0.7"),
+            (NS_MWG_RS, "Area", NS_STAREA, "w", "0.1"),
+            (NS_MWG_RS, "Area", NS_STAREA, "h", "0.2"),
+            (NS_MWG_RS, "Area", NS_STAREA, "unit", "normalized"),
+            (NS_MWG_RS, "Area", NS_DIGIKAM, "Confidence", "87"),
+        ];
+        for (ens, el_name, ans, an, v) in expected {
+            let found = attrs.iter().any(|(e_ns, e_l, a_ns, a_l, val)| {
+                e_ns == ens && e_l == el_name && a_ns == ans && a_l == an && val == v
+            });
+            assert!(found, "after {after}: {{{ans}}}{an}=\"{v}\" on {{{ens}}}{el_name} was lost \
+                or moved to another namespace\nattributes: {attrs:#?}\n{xml}");
+        }
+        // No attribute was demoted to no-namespace (the #138 symptom: `x`, `Rating`, …).
+        // Every attribute in the fixture and in ChairPhoto's own output is prefixed.
+        let stripped: Vec<_> = attrs.iter().filter(|(_, _, a_ns, _, _)| a_ns.is_empty()).collect();
+        assert!(stripped.is_empty(), "after {after}: attributes lost their namespace: {stripped:?}");
+    }
+
+    /// Issue #138: every ChairPhoto sidecar writer read-modify-writes the sidecar, and must
+    /// keep each foreign attribute's namespace. A hand-written foreign sidecar carrying
+    /// prefixed attributes from several namespaces goes through every writer in turn; after
+    /// each one an independent namespace-aware reader must still find every foreign
+    /// attribute under its original namespace URI with its original value, and ChairPhoto's
+    /// own reader must still read the attribute-form (`stArea:x="…"`) region.
+    #[test]
+    fn writers_preserve_prefixed_foreign_attributes() {
+        let dir = crate::test_support::TestTmpDir::new("xmp-prefixed-attrs");
+        let photo = dir.join("DSC138.ARW");
+        std::fs::write(&photo, b"raw").unwrap();
+        std::fs::write(sidecar_path(&photo), FOREIGN_PREFIXED_ATTRS).unwrap();
+        assert_foreign_attributes_intact(FOREIGN_PREFIXED_ATTRS, "nothing (fixture self-check)");
+
+        let bob = |regions: &[ReadRegion], after: &str| {
+            let r = regions.iter().find(|r| r.name == "Bob").unwrap_or_else(|| {
+                panic!("after {after}: Bob's attribute-form region unread: {regions:?}")
+            });
+            // Center (0.8, 0.7), size 0.1×0.2 → top-left (0.75, 0.6).
+            let (x, y, w, h) = r.bbox;
+            assert!((x - 0.75).abs() < 1e-4 && (y - 0.6).abs() < 1e-4, "after {after}: {r:?}");
+            assert!((w - 0.1).abs() < 1e-4 && (h - 0.2).abs() < 1e-4, "after {after}: {r:?}");
+        };
+        bob(&read_face_regions(&photo), "nothing");
+
+        let uuid = "6f1c1f0e-8f5e-4a51-9a51-3c1b2a0d1388";
+        let steps: Vec<(&str, Box<dyn Fn()>)> = vec![
+            ("write_iptc", Box::new(|| {
+                let fields = IptcFields {
+                    title: "Ferry".into(),
+                    city: "Trondheim".into(),
+                    ..Default::default()
+                };
+                write_iptc(&photo, &fields).unwrap();
+            })),
+            ("write_keywords", Box::new(|| {
+                write_keywords(&photo, &["boat".into()], &["Places|Norway".into()]).unwrap();
+            })),
+            ("write_identifier", Box::new(|| write_identifier(&photo, uuid).unwrap())),
+            ("write_import_batch", Box::new(|| write_import_batch(&photo, uuid).unwrap())),
+            ("write_gps", Box::new(|| write_gps(&photo, 63.43, 10.39).unwrap())),
+            ("write_face_regions", Box::new(|| {
+                let ours = [FaceRegion { name: "Alice".into(), bbox: (0.1, 0.1, 0.2, 0.2) }];
+                write_face_regions(&photo, &ours, 6000, 4000).unwrap();
+            })),
+            ("overwrite_identifier", Box::new(|| {
+                overwrite_identifier(&photo, uuid).unwrap();
+            })),
+        ];
+        for (name, step) in steps {
+            step();
+            assert_foreign_attributes_intact(&read(&sidecar_path(&photo)), name);
+            bob(&read_face_regions(&photo), name);
+        }
+
+        // ChairPhoto's own data from those writers reads back too.
+        assert_eq!(read_identifier(&photo).as_deref(), Some(uuid));
+        assert_eq!(read_import_batch(&photo).as_deref(), Some(uuid));
+        assert!(read_gps(&photo).is_some());
+        let names: Vec<String> = read_face_regions(&photo).into_iter().map(|r| r.name).collect();
+        assert!(names.contains(&"Alice".to_string()), "{names:?}");
+    }
+
+    /// The other half of #138: once prefixed attributes survive parsing, a property a writer
+    /// owns can arrive in compact attribute form (`xmp:Identifier="…"`, `photoshop:City="…"`
+    /// on the Description, as exiftool and darktable write them). The writer owns that form
+    /// too: it must be replaced, not left beside the new element as a second value — and for
+    /// the identifier, `read_identifier` (which checks the attribute first) must then see the
+    /// new UUID, or an Overwrite (issue #33) silently would not take.
+    #[test]
+    fn writers_replace_owned_properties_in_compact_attribute_form() {
+        let dir = crate::test_support::TestTmpDir::new("xmp-compact-owned");
+        let photo = dir.join("DSC139.ARW");
+        std::fs::write(&photo, b"raw").unwrap();
+        std::fs::write(
+            sidecar_path(&photo),
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<x:xmpmeta xmlns:x="adobe:ns:meta/">
+ <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+  <rdf:Description rdf:about=""
+    xmlns:xmp="http://ns.adobe.com/xap/1.0/"
+    xmlns:photoshop="http://ns.adobe.com/photoshop/1.0/"
+    xmp:Identifier="foreign-id" photoshop:City="Oslo" xmp:Rating="3"/>
+ </rdf:RDF>
+</x:xmpmeta>"#,
+        )
+        .unwrap();
+        assert_eq!(read_identifier(&photo).as_deref(), Some("foreign-id"), "compact form is read");
+
+        let uuid = "0b7d5f7e-4d0c-4c55-8a3e-1f5e6f0a1390";
+        overwrite_identifier(&photo, uuid).unwrap();
+        write_iptc(&photo, &IptcFields { city: "Trondheim".into(), ..Default::default() })
+            .unwrap();
+
+        let xml = read(&sidecar_path(&photo));
+        assert_eq!(read_identifier(&photo).as_deref(), Some(uuid), "{xml}");
+        let attrs = namespaced_attributes(&xml);
+        let has = |ns: &str, local: &str| attrs.iter().any(|a| a.2 == ns && a.3 == local);
+        assert!(!has(NS_XMP, "Identifier"), "stale compact identifier kept:\n{xml}");
+        assert!(!has(NS_PHOTOSHOP, "City"), "stale compact City kept:\n{xml}");
+        assert!(has(NS_XMP, "Rating"), "a property no writer owns must survive:\n{xml}");
+        assert_eq!(xml.matches("Oslo").count(), 0, "{xml}");
+        assert_eq!(xml.matches("<photoshop:City>Trondheim</photoshop:City>").count(), 1, "{xml}");
     }
 }

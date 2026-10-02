@@ -128,9 +128,11 @@ The debt is therefore a **set of fields per photo**, in `pending_sidecar_iptc`
   directory on the disk beneath it.
 - **Cleared by compare-and-set.** `settle_iptc_write` clears the mask only while
   `generation` is still the one the write read, and only for the photo with that UUID. A
-  newer store keeps its fields owed. A superseded write that *succeeded* owes its own fields
-  again: its older values may have reached the disk after the newer write's, and only
-  another write can prove otherwise. Rows stay at `owed = 0` rather than being deleted, so
+  newer store keeps its fields owed. A superseded write that *succeeded* owes again each
+  field it wrote with a value the catalog no longer holds: those older values may have
+  reached the disk after the newer write's, and only another write can prove otherwise. A
+  field it wrote with the current value is right whichever write landed last, so it is not
+  owed again, and when nothing is left owed the settle reports written. Rows stay at `owed = 0` rather than being deleted, so
   a photo's generation only grows.
 - **Retried by the repair pass.** After the identity queue, `run_identity_repair` drains the
   photos owing IPTC under the same job, abort flag and progress (`iptcWritten`,

@@ -20,8 +20,10 @@
 //! 3. **Clear by compare-and-set.** [`Catalog::settle_iptc_write`] clears `owed` only while
 //!    `generation` is still the one the write read. A newer store in the meantime keeps its
 //!    fields owed. And because the older write's bytes may land on disk *after* the newer
-//!    one's, a superseded successful write owes its own fields again: it cannot prove its
-//!    stale values were overwritten, so the next write puts the catalog's values back.
+//!    one's, a superseded successful write owes again each field it wrote with a value the
+//!    catalog no longer holds: it cannot prove those stale values were overwritten, so the
+//!    next write puts the catalog's values back. A field it wrote with the current value is
+//!    right whenever it landed, and is not owed again.
 //! 4. **Retry.** The identity repair pass ([`Catalog::run_identity_repair`]) drains the
 //!    owed set after the identity queue, under the same job, abort flag and progress. An
 //!    unreachable original stays owed: unmounted storage is a normal state.
@@ -94,6 +96,11 @@ impl IptcMask {
             .into_iter()
             .filter(|m| m.value(before) != m.value(after))
             .fold(Self::NONE, |a, m| a | m)
+    }
+
+    /// The fields in both sets.
+    pub fn intersect(self, other: Self) -> Self {
+        Self(self.0 & other.0)
     }
 
     /// The fields of this set that are not in `other`.
@@ -173,7 +180,9 @@ pub enum IptcSettled {
     /// Nothing was owed: the sidecar already had every value, and was not opened.
     Unchanged,
     /// The write landed, but a newer store changed the photo's IPTC meanwhile; its fields
-    /// (and this write's, which may have landed after the newer write) stay owed.
+    /// stay owed, and so do this write's whose value is no longer the catalog's (they may
+    /// have landed after the newer write). When neither leaves anything owed, the settle
+    /// is [`IptcSettled::Written`] instead.
     Superseded,
     /// The write failed — the reason is kept on the record — and the fields stay owed.
     Failed(String),
@@ -305,15 +314,36 @@ impl Catalog {
                 }
                 // A newer store ran meantime. Its own write may already have landed and
                 // cleared the set, and this write's older values may have landed after it:
-                // owe them again, so the next write restores the catalog's values.
-                self.conn.execute(
-                    "UPDATE pending_sidecar_iptc
-                     SET owed = owed | ?2, generation = generation + 1
-                     WHERE photo_id = ?1
-                       AND EXISTS (SELECT 1 FROM photos WHERE id = ?1 AND uuid = ?3)",
-                    params![write.photo_id, write.fields.bits(), write.uuid],
+                // owe again each field this write put there with a value the catalog no
+                // longer holds, so the next write restores it. A field it wrote with the
+                // catalog's current value is right whenever its bytes landed (review of
+                // #148, L6). A store after `current` is read owes what it changes itself,
+                // and its write comes after this one's bytes, which have already landed.
+                let current = match self.get_iptc(write.photo_id) {
+                    Ok(current) => current,
+                    Err(super::CatalogError::NotFound(_)) => return Ok(IptcSettled::Superseded),
+                    Err(e) => return Err(e),
+                };
+                let stale = IptcMask::changed(&write.values, &current).intersect(write.fields);
+                if !stale.is_empty() {
+                    self.conn.execute(
+                        "UPDATE pending_sidecar_iptc
+                         SET owed = owed | ?2, generation = generation + 1
+                         WHERE photo_id = ?1
+                           AND EXISTS (SELECT 1 FROM photos WHERE id = ?1 AND uuid = ?3)",
+                        params![write.photo_id, stale.bits(), write.uuid],
+                    )?;
+                    return Ok(IptcSettled::Superseded);
+                }
+                // Every value it wrote is the catalog's: if nothing else is owed (the newer
+                // write has landed too), the sidecar has the catalog's IPTC.
+                let still_owed: bool = self.conn.query_row(
+                    "SELECT NOT EXISTS (SELECT 1 FROM photos WHERE id = ?1 AND uuid = ?2)
+                         OR EXISTS (SELECT 1 FROM pending_sidecar_iptc WHERE photo_id = ?1 AND owed != 0)",
+                    params![write.photo_id, write.uuid],
+                    |r| r.get(0),
                 )?;
-                Ok(IptcSettled::Superseded)
+                Ok(if still_owed { IptcSettled::Superseded } else { IptcSettled::Written })
             }
             Err(e) => {
                 // Only this generation's record: a newer store's row describes its own write.
@@ -512,6 +542,37 @@ mod tests {
         assert_eq!(c.settle_iptc_write(&stale, &Ok(())).unwrap(), IptcSettled::Superseded);
         assert_eq!(c.owed_iptc(reused).unwrap(), IptcMask::TITLE, "the new photo still owes its title");
         assert_eq!(c.owed_iptc_write(reused).unwrap().unwrap().values.title, "new photo");
+    }
+
+    /// Review of #148, L6: a superseded write that landed re-owes only the fields it wrote
+    /// with a value the catalog no longer holds. Here the newer store changed the title
+    /// but kept the headline the older write also carried: only the title is owed again.
+    #[test]
+    fn a_superseded_write_re_owes_only_the_fields_whose_value_changed() {
+        let (_dir, c, id, _) = photo("iptc-owed-reowe-changed");
+        let older = c.set_iptc(id, &IptcFields { headline: "H".into(), ..titled("A") }).unwrap();
+        assert_eq!(older.fields, IptcMask::TITLE | IptcMask::HEADLINE);
+        let newer = c.set_iptc(id, &IptcFields { headline: "H".into(), ..titled("B") }).unwrap();
+        assert_eq!(c.settle_iptc_write(&newer, &Ok(())).unwrap(), IptcSettled::Written);
+
+        // The older write's bytes land last.
+        assert_eq!(c.settle_iptc_write(&older, &Ok(())).unwrap(), IptcSettled::Superseded);
+        assert_eq!(c.owed_iptc(id).unwrap(), IptcMask::TITLE, "the headline it wrote is still the catalog's");
+    }
+
+    /// The other case: every value the superseded write put in the sidecar is still the
+    /// catalog's (the newer store changed only a field it did not write), so nothing is owed
+    /// again, and with the newer write landed the save reports written, not pending.
+    #[test]
+    fn a_superseded_write_whose_values_are_current_owes_nothing() {
+        let (_dir, c, id, _) = photo("iptc-owed-reowe-none");
+        let older = c.set_iptc(id, &titled("A")).unwrap();
+        let newer = c.set_iptc(id, &IptcFields { creator: "C".into(), ..titled("A") }).unwrap();
+        assert_eq!(newer.fields, IptcMask::TITLE | IptcMask::CREATOR);
+        assert_eq!(c.settle_iptc_write(&newer, &Ok(())).unwrap(), IptcSettled::Written);
+
+        assert_eq!(c.settle_iptc_write(&older, &Ok(())).unwrap(), IptcSettled::Written);
+        assert_eq!(c.owed_iptc(id).unwrap(), IptcMask::NONE);
     }
 
     /// The repair pass drains owed IPTC under its abort flag: a cancel between photos stops

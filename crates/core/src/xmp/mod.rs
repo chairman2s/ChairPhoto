@@ -4187,4 +4187,39 @@ mod tests {
         write_face_regions(&photo, CAT, &[], &record, sized(6000, 4000)).unwrap();
         assert!(rf::named(&rf::mwg(&read(&sidecar_path(&photo))), "Alice").is_empty(), "not removed");
     }
+
+    // ── review L5: the name-or-place guard on a FaceId match ───────────────────
+
+    /// Step 1 follows our marker only while the region is still recognisably that face — its
+    /// Name, or its place. A region carrying our marker for face 5 whose name *and* place
+    /// both differ from face 5's (a copy of this catalog's file that diverged, sharing its
+    /// identity) is not renamed and moved, keeping another face's annotations: it is ours and
+    /// stale, so it is removed and face 5 is written fresh. With either the name or the place
+    /// still matching, the marker is followed and the annotation kept.
+    #[test]
+    fn a_marker_is_followed_only_while_the_name_or_place_still_matches() {
+        let annotated = |name: &str, bbox| {
+            marked_region(&ours(5), name, bbox)
+                .replace("</rdf:li>", "<digiKam:FaceEngine>dnn</digiKam:FaceEngine></rdf:li>")
+        };
+        let carl_place = (0.7, 0.7, 0.1, 0.1);
+        let alice_place = (0.1, 0.1, 0.2, 0.2);
+        for (case, existing, follows) in [
+            ("name and place differ", annotated("Carl", carl_place), false),
+            ("same name, moved", annotated("Alice", carl_place), true),
+            ("renamed, same place", annotated("Carl", alice_place), true),
+        ] {
+            let (_dir, photo) = seeded_photo("xmp-l5-guard", &digikam_with(&existing));
+            write_face_regions(&photo, CAT, &[face(5, "Alice", alice_place)], &[], sized(6000, 4000)).unwrap();
+            let xml = read(&sidecar_path(&photo));
+            let got = rf::mwg(&xml);
+            assert!(rf::named(&got, "Carl").is_empty(), "{case}: Carl stayed:\n{xml}");
+            let alices = rf::named(&got, "Alice");
+            assert_eq!(alices.len(), 1, "{case}:\n{xml}");
+            assert_eq!(alices[0].face_id.as_deref(), Some(ours(5).as_str()), "{case}");
+            assert!(near4(alices[0].area, center(alice_place)), "{case}:\n{xml}");
+            let kept = rf::subtree(&xml, rf::NS_DIGIKAM, "FaceEngine").len();
+            assert_eq!(kept, usize::from(follows), "{case}: the annotation:\n{xml}");
+        }
+    }
 }

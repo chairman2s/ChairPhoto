@@ -96,6 +96,11 @@ export function summaryHeadline(summary: PendingIdentitySummary | null): string 
   if (summary.dismissed > 0) {
     line += `${summary.conflicts > 0 ? "," : " —"} ${summary.dismissed} dismissed`;
   }
+  // #148: IPTC the catalog holds that a sidecar has not received; the pass retries it too.
+  const iptcOwed = summary.iptcOwed ?? 0;
+  if (iptcOwed > 0) {
+    line += `; ${iptcOwed} ${iptcOwed === 1 ? "photo owes" : "photos owe"} IPTC to a sidecar`;
+  }
   return line;
 }
 
@@ -125,9 +130,25 @@ export function repairSummaryLine(summary: IdentityRepairSummary | null): string
   if (summary.superseded > 0) {
     parts.push(`${summary.superseded} decided elsewhere while the pass ran`);
   }
-  const lead = summary.aborted
-    ? `Stopped after ${summary.bound + summary.unreachable + summary.conflicts + summary.failed + summary.superseded} of ${summary.total}`
-    : "Finished";
+  // Only when the pass met owed IPTC (#148): permanent zeros would read as a failure mode.
+  const iptcWritten = summary.iptcWritten ?? 0;
+  const iptcUnreachable = summary.iptcUnreachable ?? 0;
+  const iptcFailed = summary.iptcFailed ?? 0;
+  if (iptcWritten + iptcUnreachable + iptcFailed > 0) {
+    parts.push(
+      `IPTC written ${iptcWritten}, still unreachable ${iptcUnreachable}, failed ${iptcFailed}`,
+    );
+  }
+  const done =
+    summary.bound +
+    summary.unreachable +
+    summary.conflicts +
+    summary.failed +
+    summary.superseded +
+    iptcWritten +
+    iptcUnreachable +
+    iptcFailed;
+  const lead = summary.aborted ? `Stopped after ${done} of ${summary.total}` : "Finished";
   return `${lead} — ${parts.join(" · ")}`;
 }
 
@@ -602,7 +623,7 @@ export function IdentityDebtPanel({ onClose }: { onClose: () => void }) {
           <div className="row" style={{ marginTop: 10, marginBottom: 10, alignItems: "center" }}>
             <button
               className="scan-btn"
-              disabled={repairing || !summary || summary.total === 0}
+              disabled={repairing || !summary || (summary.total === 0 && (summary.iptcOwed ?? 0) === 0)}
               onClick={runRepair}
               title="Retry every queued copy now"
             >

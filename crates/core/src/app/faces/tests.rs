@@ -5,7 +5,9 @@
 //! real worker on synthetic embeddings.
 
 use super::*;
-use crate::app::{detach_catalog_and_trip_jobs, publish_catalog_and_reset_jobs, with_catalog_as, CATALOG_CHANGED};
+use crate::app::{
+    detach_catalog_and_trip_jobs, publish_catalog_and_reset_jobs, with_catalog_as, FacesMatchDone, CATALOG_CHANGED,
+};
 use crate::catalog::Catalog;
 use crate::test_support::{TestSubPath, TestTmpDir};
 use rusqlite::OptionalExtension;
@@ -480,6 +482,123 @@ fn a_match_start_bound_to_another_catalog_touches_nothing() {
     assert!(!on_b.abort.load(Ordering::Relaxed));
     assert_eq!(match_status(&state).unwrap().map(|s| s.job), Some(on_b.job));
     assert_eq!(state.jobs.faces_match.abort().job_ids_issued(), issued);
+}
+
+/// A user decision to make while the matching worker is running, on the **main** connection.
+type Decision = Box<dyn FnOnce(&Catalog) -> CatalogResult<()> + Send>;
+
+/// A sink that makes the user's decisions in the middle of a real run: `at_seed` when the
+/// seed phase starts (its candidates already read), `after_load` at the first progress of a
+/// later phase (the pending faces already read by `load_pending_faces`). The worker is on
+/// its own connection, so this is the interleaving the inspector, overlay or Tauri UI can
+/// produce at any time (#137).
+struct DecideMidRun {
+    state: AppState,
+    at_seed: std::sync::Mutex<Option<Decision>>,
+    after_load: std::sync::Mutex<Option<Decision>>,
+    done: std::sync::Mutex<Option<FacesMatchDone>>,
+}
+
+impl EventSink for DecideMidRun {
+    fn send(&self, event: CoreEvent) {
+        match event {
+            CoreEvent::FacesMatchProgress(p) => {
+                let hook = if p.phase == matcher::MatchPhase::Seed.label() { &self.at_seed } else { &self.after_load };
+                if let Some(decide) = hook.lock().unwrap().take() {
+                    crate::app::with_catalog(&self.state, decide).unwrap();
+                }
+            }
+            CoreEvent::FacesMatchDone(d) => *self.done.lock().unwrap() = Some(d),
+            _ => {}
+        }
+    }
+}
+
+/// Catalog, tags and sidecar agree on a photo: every confirmed face's person is tagged on the
+/// photo and exported as a region, and nothing else is exported.
+fn assert_consistent(c: &Catalog, root: &std::path::Path, photo: i64, name: &str) {
+    let mut confirmed: Vec<String> = Vec::new();
+    for f in faces_for_photo(c, photo).unwrap().into_iter().filter(|f| f.state == "confirmed") {
+        assert!(has_tag(c, photo, f.person_tag_id.unwrap()), "{name}: a confirmed face's person is tagged");
+        confirmed.push(f.person_name.unwrap());
+    }
+    confirmed.sort();
+    let mut exported: Vec<String> = crate::xmp::read_face_regions(&root.join(name)).into_iter().map(|r| r.name).collect();
+    exported.sort();
+    assert_eq!(confirmed, exported, "{name}: the sidecar's regions are the catalog's confirmed faces");
+}
+
+/// A decision made while matching runs stands (#137). The run reads its candidates, then the
+/// user — on the main connection — ignores the face it was about to seed, assigns the face it
+/// was about to suggest as Alice to Bob, ignores another, and names one it was about to
+/// cluster. After the run each decision is intact and the catalog, photo tags and sidecars
+/// agree.
+#[test]
+fn a_decision_made_during_a_match_run_is_never_overwritten() {
+    let (c, root) = temp_catalog("match-race");
+    let alice = c.create_tag("People/Alice").unwrap();
+    let bob = c.create_tag("People/Bob").unwrap();
+    // Alice's centroid: a face confirmed as her.
+    let p0 = add_photo(&c, &root, "p0.NEF");
+    let f0 = add_embedded_face(&c, p0, 0);
+    assign(&c, f0, alice).unwrap();
+    // A seed candidate: one face, one person tag on the photo.
+    let ps = add_photo(&c, &root, "ps.NEF");
+    let fs = add_embedded_face(&c, ps, 5);
+    c.assign_tag(ps, alice).unwrap();
+    // Two faces open matching would suggest as Alice.
+    let pa = add_photo(&c, &root, "pa.NEF");
+    let fa = add_embedded_face(&c, pa, 0);
+    let pi = add_photo(&c, &root, "pi.NEF");
+    let fi = add_embedded_face(&c, pi, 0);
+    // Two unknown faces clustering would group.
+    let pc1 = add_photo(&c, &root, "pc1.NEF");
+    let fc1 = add_embedded_face(&c, pc1, 3);
+    let pc2 = add_photo(&c, &root, "pc2.NEF");
+    let fc2 = add_embedded_face(&c, pc2, 3);
+
+    let state = state_with(c);
+    let claim = begin_match_job(&state, None).unwrap();
+    let sink = DecideMidRun {
+        state: state.clone(),
+        at_seed: std::sync::Mutex::new(Some(Box::new(move |c: &Catalog| ignore(c, fs)))),
+        after_load: std::sync::Mutex::new(Some(Box::new(move |c: &Catalog| {
+            assign(c, fa, bob)?;
+            ignore(c, fi)?;
+            name_faces(c, &[fc1], "People/Carol").map(|_| ())
+        }))),
+        done: Default::default(),
+    };
+    run_match_job(&sink, claim);
+
+    assert!(sink.at_seed.lock().unwrap().is_none() && sink.after_load.lock().unwrap().is_none(), "both hooks ran");
+    let done = sink.done.lock().unwrap().take().expect("the run ended");
+    assert!(done.ok, "{done:?}");
+    let outcome = done.outcome.unwrap();
+    assert_eq!((outcome.seeded, outcome.open, outcome.clustered), (0, 0, 1), "{outcome:?}");
+
+    let guard = state.catalog.lock().unwrap();
+    let c = guard.as_ref().unwrap();
+    let row = |f: i64| -> (String, Option<i64>, String, Option<i64>) {
+        c.conn()
+            .query_row(
+                "SELECT state, person_tag_id, source, cluster_id FROM faces__faces WHERE id = ?1",
+                [f],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap()
+    };
+    assert_eq!(row(f0), ("confirmed".into(), Some(alice), "manual".into(), None), "a prior decision is untouched");
+    assert_eq!(row(fs).0, "ignored", "ignored after the seed candidates were read: not seeded");
+    assert_eq!(row(fa), ("confirmed".into(), Some(bob), "manual".into(), None), "assigned to Bob: not re-suggested as Alice");
+    assert_eq!(row(fi).0, "ignored", "ignored after the pending faces were read: not suggested");
+    let carol = c.find_tag_id_by_path("People/Carol").unwrap().unwrap();
+    assert_eq!(row(fc1), ("confirmed".into(), Some(carol), "manual".into(), None), "named: in no cluster");
+    let fc2_cluster = row(fc2).3.expect("the still-unknown face is clustered");
+    assert_eq!(cluster_rows(c), vec![(fc2_cluster, 1)], "the cluster holds only the face still pending");
+    for (photo, name) in [(p0, "p0.NEF"), (ps, "ps.NEF"), (pa, "pa.NEF"), (pi, "pi.NEF"), (pc1, "pc1.NEF"), (pc2, "pc2.NEF")] {
+        assert_consistent(c, &root, photo, name);
+    }
 }
 
 // --- the People view's verbs (#130) ---------------------------------------------------------

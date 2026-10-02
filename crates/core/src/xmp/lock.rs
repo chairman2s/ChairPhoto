@@ -10,9 +10,9 @@
 //!   every writer takes it by construction.
 //! * **The write order** ([`WriteOrder`]) — for a writer that stores its change in the
 //!   catalog, releases the catalog lock and only then writes the sidecar (the IPTC save and
-//!   the geocoder's fill). It reserves a place in line while it still holds the catalog
-//!   lock, so sidecar writes land in the order their catalog stores did: the catalog's newest
-//!   value is also the sidecar's.
+//!   the geocoder's fill). It reserves a place in line under the catalog lock, waits for its
+//!   turn with no lock held, then stores and writes while holding the turn, so stores and
+//!   sidecar writes run in one order: the catalog's newest value is also the sidecar's.
 //!
 //! # Lock order
 //!
@@ -21,12 +21,13 @@
 //! * The file lock is a **leaf**. Some writers take it while holding the catalog lock (face
 //!   regions, GPS, an identity Overwrite); nothing is acquired while it is held — the XML
 //!   work and the file I/O only.
-//! * [`WriteOrder::reserve`] never blocks: it may be called under the catalog lock, and
-//!   that is where it must be called, so the reservation order is the store order.
+//! * [`WriteOrder::reserve`] never blocks, so it may be called under the catalog lock.
 //!   [`WriteOrder::wait`] blocks, and is called with **no lock held** and never across an
-//!   `.await`; the turn it returns is held only for the sidecar write, which takes the file
-//!   lock. A waiter holds nothing another thread needs, and the earliest ticket's holder is
-//!   always running towards its write, so the line always moves.
+//!   `.await`. The turn it returns is held for one store and its sidecar write: the turn
+//!   holder takes the catalog lock (the store), releases it, then takes the file lock (the
+//!   write). That is safe because no catalog holder ever waits on a turn: a waiter holds
+//!   nothing another thread needs, and the earliest ticket's holder is always running towards
+//!   its write, so the line always moves.
 //!
 //! Both are process-wide and keyed by the sidecar's resolved path ([`key`]); an entry exists
 //! only while some ticket for that path is outstanding. Neither protects against a second
@@ -143,19 +144,20 @@ pub(super) fn key(sidecar: &Path) -> PathBuf {
     }
 }
 
-/// A reserved place for one sidecar write, in the order the catalog stored the changes
-/// (see the module docs for where it may be reserved and waited on).
+/// A reserved place for one store-and-sidecar-write (see the module docs for where it may
+/// be reserved and waited on).
 pub struct WriteOrder(Ticket);
 
 impl WriteOrder {
-    /// Reserve the next place in line for `photo_path`'s sidecar. Never blocks; call it
-    /// under the catalog lock the store ran in, so the line's order is the store order.
+    /// Reserve the next place in line for `photo_path`'s sidecar. Never blocks, so it may be
+    /// called under the catalog lock (where the path was resolved).
     pub fn reserve(photo_path: &Path) -> Self {
         Self(ORDER_TURNS.reserve(key(&super::sidecar_path(photo_path))))
     }
 
     /// Wait (holding no lock) until every write reserved before this one is done, then
-    /// return the turn. Hold it across the sidecar write; dropping it lets the next go.
+    /// return the turn. Hold it across the store and the sidecar write; dropping it lets the
+    /// next go.
     pub fn wait(self) -> Self {
         self.0.wait_turn();
         self

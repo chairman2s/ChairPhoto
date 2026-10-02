@@ -71,6 +71,8 @@ pub(super) enum BackupPolicy {
 /// [`Self::commit`]. Dropping without calling `commit` writes nothing (an error before the
 /// commit leaves the sidecar untouched) and releases the sidecar's file lock.
 pub(super) struct SidecarDocument {
+    /// The original photo the sidecar belongs to. It must still be there at commit.
+    original: PathBuf,
     path: PathBuf,
     root: Element,
     /// Where this open copied the pre-existing sidecar, if it did. Reported so a
@@ -108,6 +110,8 @@ impl SidecarDocument {
         let path = sidecar_path(photo_path);
         // Before the read: the read-modify-write is one turn (issue #149).
         let turn = super::lock::FILE_TURNS.lock(super::lock::key(&path));
+        // An unmounted volume makes the sidecar look absent; never start a fresh one then.
+        require_original(photo_path)?;
         let existed = path.exists();
 
         let mut root = if existed {
@@ -144,7 +148,7 @@ impl SidecarDocument {
 
         declare_namespaces(desc);
 
-        Ok(Self { path, root, backup, _turn: turn })
+        Ok(Self { original: photo_path.to_path_buf(), path, root, backup, _turn: turn })
     }
 
     /// Where this open copied the pre-existing sidecar, if it did. `None` when nothing was
@@ -197,19 +201,47 @@ impl SidecarDocument {
 
     /// Commit the transaction: re-stamp `chairphoto:LastWrite` (removing any prior instance —
     /// this is the single path every writer's completion timestamp goes through), serialize,
-    /// and replace the sidecar on disk atomically ([`write_atomically`]), creating parent
-    /// directories as needed. The file lock is released after the rename.
+    /// and replace the sidecar on disk atomically ([`write_atomically`]). The file lock is
+    /// released after the rename.
+    ///
+    /// The sidecar is written only next to an original that is still there: if the original
+    /// or its folder has gone since [`Self::open`] — a volume unmounted while the writer
+    /// waited its turn — the commit fails and creates nothing (no directory is ever made, so
+    /// a write cannot land on the disk under an empty mount point). The original is checked
+    /// at open and again just before the temp file is created; a removal in between those
+    /// two system calls is not caught.
     pub(super) fn commit(mut self) -> Result<(), String> {
         let stamp = plain("chairphoto", NS_CHAIRPHOTO, "LastWrite", &now().to_string());
         self.replace_owned(&[(NS_CHAIRPHOTO, "LastWrite")], vec![stamp]);
 
         let mut buf = Vec::new();
         self.root.write(&mut buf).map_err(|e| e.to_string())?;
-        if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent).ok();
-        }
-        write_atomically(&self.path, &buf)
+        write_atomically(&self.original, &self.path, &buf)
     }
+}
+
+/// Fail unless `original` is a file in a directory that exists: a sidecar is only ever
+/// written beside its original (AGENTS.md "Sidecars are `<original_filename>.xmp`, alongside
+/// the original"). A missing folder is reported as such, so an unmounted volume reads as one.
+fn require_original(original: &Path) -> Result<(), String> {
+    let dir = match original.parent() {
+        Some(d) if d.as_os_str().is_empty() => Path::new("."),
+        Some(d) => d,
+        None => return Err(format!("{} has no folder", original.display())),
+    };
+    if !dir.is_dir() {
+        return Err(format!(
+            "not writing the sidecar of {}: its folder is missing (offline or moved)",
+            original.display()
+        ));
+    }
+    if !original.is_file() {
+        return Err(format!(
+            "not writing the sidecar of {}: the original is missing (offline or moved)",
+            original.display()
+        ));
+    }
+    Ok(())
 }
 
 /// Replace `path` with `bytes` so that no reader ever sees a partial file: write a temp file
@@ -233,7 +265,7 @@ impl SidecarDocument {
 ///   contents: a rename makes a new file.
 /// * **A symlinked sidecar** is written through to its target, as the in-place write was;
 ///   the link stays a link.
-fn write_atomically(path: &Path, bytes: &[u8]) -> Result<(), String> {
+fn write_atomically(original: &Path, path: &Path, bytes: &[u8]) -> Result<(), String> {
     let target = match std::fs::symlink_metadata(path) {
         Ok(m) if m.file_type().is_symlink() => std::fs::canonicalize(path)
             .map_err(|e| format!("cannot resolve {}: {e}", path.display()))?,
@@ -249,6 +281,7 @@ fn write_atomically(path: &Path, bytes: &[u8]) -> Result<(), String> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(format!("cannot remove stale {}: {e}", temp.display())),
     }
+    require_original(original)?;
     let written = write_temp_then_rename(&temp, &target, bytes, existing.as_ref());
     if written.is_err() {
         let _ = std::fs::remove_file(&temp);
@@ -493,19 +526,78 @@ mod tests {
         assert_eq!(xmp.matches("chairphoto:LastWrite").count(), 2, "one open + one close tag only");
     }
 
-    /// `commit` creates the sidecar's parent directory if it doesn't exist yet.
+    /// Issue #149 F1 (with #148): a sidecar is never written where the original is not. With
+    /// the original's folder gone (an unmounted volume) or the original itself gone, `open`
+    /// refuses, and a `commit` whose original vanished after `open` refuses too — and no
+    /// directory is created in either case.
     #[test]
-    fn commit_creates_parent_directories() {
+    fn commit_refuses_when_the_original_or_its_directory_is_missing() {
         let dir = crate::test_support::TestTmpDir::new("doc-mkdir");
         let photo = dir.join("nested/deep/G.ARW");
-        std::fs::create_dir_all(photo.parent().unwrap()).unwrap();
+        let folder = photo.parent().unwrap().to_path_buf();
+        std::fs::create_dir_all(&folder).unwrap();
         std::fs::write(&photo, b"raw").unwrap();
-        // Delete the dir again to prove `commit` recreates it.
-        std::fs::remove_dir_all(photo.parent().unwrap()).unwrap();
 
+        // The folder vanishes between open and commit.
         let doc = SidecarDocument::open(&photo).unwrap();
-        doc.commit().unwrap();
-        assert!(sidecar_path(&photo).exists());
+        std::fs::rename(&folder, dir.join("away")).unwrap();
+        let err = doc.commit().unwrap_err();
+        assert!(err.contains("folder is missing"), "{err}");
+        assert!(!folder.exists(), "commit must not recreate the original's folder");
+
+        // Opened with the folder already gone.
+        let err = SidecarDocument::open(&photo).err().expect("open must refuse a missing folder");
+        assert!(err.contains("folder is missing"), "{err}");
+        assert!(!folder.exists());
+
+        // The folder is back but the original is not: refused at open and at commit.
+        std::fs::rename(dir.join("away"), &folder).unwrap();
+        let doc = SidecarDocument::open(&photo).unwrap();
+        std::fs::remove_file(&photo).unwrap();
+        let err = doc.commit().unwrap_err();
+        assert!(err.contains("original is missing"), "{err}");
+        assert!(SidecarDocument::open(&photo).is_err());
+        assert!(!sidecar_path(&photo).exists(), "no sidecar for a missing original");
+    }
+
+    /// Every writer refuses a missing original and creates nothing — identifier, import batch,
+    /// Overwrite, GPS, faces and IPTC — while the export keyword writer and the bundle
+    /// importer's identifier write, whose targets exist, still write.
+    #[test]
+    fn every_writer_refuses_a_missing_original_and_existing_targets_still_work() {
+        use crate::catalog::IptcFields;
+        use crate::xmp::FaceRegion;
+        let dir = crate::test_support::TestTmpDir::new("doc-149-writers");
+        let gone = dir.join("unmounted").join("A.ARW");
+        let uuid = "8d0a2c1e-4f5b-4c6d-9e7f-0a1b2c3d4e5f";
+        let face = [FaceRegion { name: "Ada".into(), bbox: (0.1, 0.1, 0.2, 0.2) }];
+        let title = IptcFields { title: "T".into(), ..Default::default() };
+        let writes: Vec<(&str, Box<dyn Fn(&Path) -> Result<(), String>>)> = vec![
+            ("identifier", Box::new(|p| crate::xmp::write_identifier(p, uuid))),
+            ("import batch", Box::new(|p| crate::xmp::write_import_batch(p, uuid))),
+            ("overwrite", Box::new(|p| crate::xmp::overwrite_identifier(p, uuid).map(|_| ()))),
+            ("gps", Box::new(|p| crate::xmp::write_gps(p, 59.9, 10.7))),
+            ("faces", Box::new(move |p| crate::xmp::write_face_regions(p, &face, 600, 400))),
+            ("iptc", Box::new(move |p| crate::xmp::write_iptc(p, &IptcFields::default(), &title))),
+        ];
+        for (name, write) in &writes {
+            assert!(write(&gone).is_err(), "{name}: a missing folder must be refused");
+            assert!(!gone.parent().unwrap().exists(), "{name}: the folder was created");
+        }
+        std::fs::create_dir_all(gone.parent().unwrap()).unwrap();
+        for (name, write) in &writes {
+            assert!(write(&gone).is_err(), "{name}: a missing original must be refused");
+            assert!(!sidecar_path(&gone).exists(), "{name}: a sidecar was created");
+        }
+
+        // An export destination and a bundle-imported photo exist before their sidecar write.
+        let exported = dir.join("export").join("A.jpg");
+        std::fs::create_dir_all(exported.parent().unwrap()).unwrap();
+        std::fs::write(&exported, b"jpeg").unwrap();
+        crate::xmp::write_keywords(&exported, &["a".into()], &["x|a".into()]).unwrap();
+        crate::xmp::write_identifier(&exported, uuid).unwrap();
+        let xml = std::fs::read_to_string(sidecar_path(&exported)).unwrap();
+        assert!(xml.contains(uuid) && xml.contains(">a<"), "{xml}");
     }
 
     fn set_prop(doc: &mut SidecarDocument, name: &str, value: &str) {

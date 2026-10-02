@@ -156,7 +156,7 @@ pub fn read_identifier(photo_path: &Path) -> Option<String> {
     let path = sidecar_path(photo_path);
     let file = std::fs::File::open(&path).ok()?;
     let root = parse_xml(file).ok()?;
-    let rdf = root.get_child(("RDF", NS_RDF))?;
+    let rdf = rdf_of(&root)?;
     for node in &rdf.children {
         let XMLNode::Element(desc) = node else { continue };
         if desc.name != "Description" {
@@ -257,7 +257,7 @@ pub fn read_import_batch(photo_path: &Path) -> Option<String> {
     let path = sidecar_path(photo_path);
     let file = std::fs::File::open(&path).ok()?;
     let root = parse_xml(file).ok()?;
-    let rdf = root.get_child(("RDF", NS_RDF))?;
+    let rdf = rdf_of(&root)?;
     for node in &rdf.children {
         let XMLNode::Element(desc) = node else { continue };
         if desc.name != "Description" {
@@ -306,7 +306,7 @@ pub fn read_gps(photo_path: &Path) -> Option<(f64, f64)> {
     let path = sidecar_path(photo_path);
     let file = std::fs::File::open(&path).ok()?;
     let root = parse_xml(file).ok()?;
-    let rdf = root.get_child(("RDF", NS_RDF))?;
+    let rdf = rdf_of(&root)?;
     let mut lat_str: Option<String> = None;
     let mut lng_str: Option<String> = None;
     for node in &rdf.children {
@@ -798,7 +798,7 @@ fn read_regions(photo_path: &Path) -> Vec<(Option<Result<(f64, f64), String>>, V
     let Ok(root) = parse_xml(file) else {
         return Vec::new();
     };
-    let Some(rdf) = root.get_child(("RDF", NS_RDF)) else {
+    let Some(rdf) = rdf_of(&root) else {
         return Vec::new();
     };
     let mut out = Vec::new();
@@ -1051,61 +1051,59 @@ fn reconcile_regions(container: &mut Element, incoming: &[FaceRegion], legacy: &
         }
     }
     // 2. A marked region another catalog (or an id that changed) wrote for the same face.
-    for (i, e) in existing.iter().enumerate() {
-        if claims[i] != Claim::Keep || e.marker.is_none() {
-            continue;
-        }
-        if let Some(k) = e.region.as_ref().and_then(|p| matching_region(p, incoming, &written)) {
-            written[k] = true;
-            claims[i] = Claim::Ours(k);
-        }
+    let free = |claims: &[Claim]| claims.iter().map(|c| *c == Claim::Keep).collect::<Vec<_>>();
+    let unwritten = |written: &[bool]| written.iter().map(|w| !w).collect::<Vec<_>>();
+    let pairs = closest_pairs(&existing, incoming, &free(&claims), &unwritten(&written), |e, p, r| {
+        e.marker.is_some() && same_face(p, r)
+    });
+    for (i, k) in pairs {
+        written[k] = true;
+        claims[i] = Claim::Ours(k);
     }
     // 3. An unmarked region a pre-marker ChairPhoto wrote for a face still in the set: adopted.
-    let mut legacy_used = vec![false; legacy.len()];
-    for (i, e) in existing.iter().enumerate() {
-        let (None, Some(p)) = (&e.marker, &e.region) else { continue };
-        let found = legacy.iter().enumerate().find_map(|(j, l)| {
-            if legacy_used[j] || l.name != p.name || !center_close(l.bbox, p.bbox) {
-                return None;
-            }
-            let k = incoming.iter().enumerate().position(|(k, r)| !written[k] && r.face_id == l.face_id)?;
-            Some((j, k))
-        });
-        if let Some((j, k)) = found {
-            legacy_used[j] = true;
-            written[k] = true;
-            claims[i] = Claim::Ours(k);
-        }
+    //    Matched against the record (the box the old writer wrote, in its frame), then
+    //    claimed for the record's face.
+    let mut legacy_free = vec![true; legacy.len()];
+    let in_set: Vec<bool> = legacy
+        .iter()
+        .map(|l| incoming.iter().zip(&written).any(|(r, w)| !w && r.face_id == l.face_id))
+        .collect();
+    let pairs = closest_pairs(&existing, legacy, &free(&claims), &in_set, |e, p, l| {
+        e.marker.is_none() && same_face(p, l)
+    });
+    for (i, j) in pairs {
+        let k = incoming
+            .iter()
+            .zip(&written)
+            .position(|(r, w)| !w && r.face_id == legacy[j].face_id)
+            .expect("in_set found it unwritten");
+        legacy_free[j] = false;
+        written[k] = true;
+        claims[i] = Claim::Ours(k);
     }
     // 4. An unmarked region that is the same face as one being written: a foreign region (or
     //    one off the legacy record) that already holds it.
-    for (i, e) in existing.iter().enumerate() {
-        if claims[i] != Claim::Keep || e.marker.is_some() {
-            continue;
-        }
-        if let Some(k) = e.region.as_ref().and_then(|p| matching_region(p, incoming, &written)) {
-            written[k] = true;
-            claims[i] = Claim::Foreign(k);
-        }
+    let pairs = closest_pairs(&existing, incoming, &free(&claims), &unwritten(&written), |e, p, r| {
+        e.marker.is_none() && same_face(p, r)
+    });
+    for (i, k) in pairs {
+        written[k] = true;
+        claims[i] = Claim::Foreign(k);
     }
     // What nothing claimed: a marked region is ours and stale; an unmarked one is removed only
     // when it matches a legacy export whose face has left the set.
     for (i, e) in existing.iter().enumerate() {
-        if claims[i] != Claim::Keep {
-            continue;
-        }
-        if e.marker.is_some() {
-            claims[i] = Claim::Remove;
-            continue;
-        }
-        let Some(p) = &e.region else { continue };
-        let retired = legacy.iter().enumerate().position(|(j, l)| {
-            !legacy_used[j] && !ids.contains(&l.face_id) && l.name == p.name && center_close(l.bbox, p.bbox)
-        });
-        if let Some(j) = retired {
-            legacy_used[j] = true;
+        if claims[i] == Claim::Keep && e.marker.is_some() {
             claims[i] = Claim::Remove;
         }
+    }
+    let retired: Vec<bool> =
+        legacy.iter().zip(&legacy_free).map(|(l, free)| *free && !ids.contains(&l.face_id)).collect();
+    let pairs = closest_pairs(&existing, legacy, &free(&claims), &retired, |e, p, l| {
+        e.marker.is_none() && same_face(p, l)
+    });
+    for (i, _) in pairs {
+        claims[i] = Claim::Remove;
     }
 
     for (e, claim) in existing.iter().zip(&claims) {
@@ -1272,16 +1270,52 @@ fn region_li(r: &FaceRegion) -> XMLNode {
     XMLNode::Element(li)
 }
 
-/// The index of the incoming region that the existing region `p` is the same face as, if any:
-/// its Name matches that region's AND its center-Area is within [`AREA_EPSILON`] of that
-/// region's center. Regions already marked in `taken` are skipped, so each incoming region
-/// claims at most one existing one. A li that does not parse matches nothing: when in doubt,
-/// it is preserved.
-fn matching_region(p: &ReadRegion, incoming: &[FaceRegion], taken: &[bool]) -> Option<usize> {
-    incoming
-        .iter()
-        .zip(taken)
-        .position(|(r, taken)| !taken && r.name == p.name && center_close(r.bbox, p.bbox))
+/// Whether the existing region `p` is the same face as `r`: its Name matches AND its center is
+/// within [`AREA_EPSILON`] of `r`'s.
+fn same_face(p: &ReadRegion, r: &FaceRegion) -> bool {
+    r.name == p.name && center_close(r.bbox, p.bbox)
+}
+
+/// Pair existing regions with candidates one-to-one, **closest first** (#147 L2): every pair
+/// `(existing, candidate)` that `admits`, ordered by the distance between their centers (ties
+/// by document order, then candidate order), taken greedily while both sides are free. The
+/// first region in document order is not preferred over a closer one, so a foreign region
+/// listed before ours is not the one moved. Each candidate claims at most one region and each
+/// region at most one candidate (#147 L1).
+fn closest_pairs(
+    existing: &[ExistingRegion],
+    candidates: &[FaceRegion],
+    existing_free: &[bool],
+    candidate_free: &[bool],
+    admits: impl Fn(&ExistingRegion, &ReadRegion, &FaceRegion) -> bool,
+) -> Vec<(usize, usize)> {
+    let mut pairs: Vec<(f32, usize, usize)> = Vec::new();
+    for (i, e) in existing.iter().enumerate() {
+        let Some(p) = e.region.as_ref().filter(|_| existing_free[i]) else { continue };
+        for (k, r) in candidates.iter().enumerate() {
+            if candidate_free[k] && admits(e, p, r) {
+                pairs.push((center_distance(p.bbox, r.bbox), i, k));
+            }
+        }
+    }
+    pairs.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
+    let (mut e_used, mut c_used) = (vec![false; existing.len()], vec![false; candidates.len()]);
+    let mut out = Vec::new();
+    for (_, i, k) in pairs {
+        if !e_used[i] && !c_used[k] {
+            e_used[i] = true;
+            c_used[k] = true;
+            out.push((i, k));
+        }
+    }
+    out
+}
+
+/// The distance between two top-left bboxes' centers.
+fn center_distance(a: (f32, f32, f32, f32), b: (f32, f32, f32, f32)) -> f32 {
+    let dx = (a.0 + a.2 / 2.0) - (b.0 + b.2 / 2.0);
+    let dy = (a.1 + a.3 / 2.0) - (b.1 + b.3 / 2.0);
+    dx.hypot(dy)
 }
 
 /// A new region for `r`, carrying ChairPhoto's marker.
@@ -1593,6 +1627,30 @@ fn seq_creator(value: &str) -> XMLNode {
     let mut e = el("dc", NS_DC, "creator");
     e.children.push(XMLNode::Element(seq));
     XMLNode::Element(e)
+}
+
+/// The sidecar's `rdf:RDF`: the root itself when the file has no `x:xmpmeta` wrapper (the XMP
+/// spec allows a bare `rdf:RDF`), else the root's `rdf:RDF` child (#147 L4).
+fn rdf_of(root: &Element) -> Option<&Element> {
+    if is_rdf(root, "RDF") {
+        return Some(root);
+    }
+    root.get_child(("RDF", NS_RDF))
+}
+
+/// [`rdf_of`] for writing: a wrapper without one gets an `rdf:RDF`, a bare `rdf:RDF` root is
+/// used as it is — never a second `rdf:RDF` nested inside the first.
+fn rdf_of_mut(root: &mut Element) -> &mut Element {
+    if is_rdf(root, "RDF") {
+        return root;
+    }
+    child_mut(root, "rdf", NS_RDF, "RDF")
+}
+
+/// Whether `root` is an element a sidecar can be rooted at: the `x:xmpmeta` wrapper (or the
+/// older `x:xapmeta`), or a bare `rdf:RDF`.
+fn is_xmp_root(root: &Element) -> bool {
+    root.namespace.as_deref() == Some(NS_X) || is_rdf(root, "RDF")
 }
 
 /// Find a child element by (namespace, name) or create it, returning a mut ref.
@@ -3726,5 +3784,124 @@ mod tests {
         let first = read(&sidecar_path(&photo));
         write_face_regions(&photo, &alice, &[], sized(6000, 4000)).unwrap();
         assert_eq!(read(&sidecar_path(&photo)), first);
+    }
+
+    // ── #147: matching and the bare rdf:RDF root ───────────────────────────────
+
+    /// Two unmarked Bobs, the one listed first at center x 0.515, the second at 0.50. With the
+    /// Bob being written at 0.505 both are within `AREA_EPSILON`.
+    fn two_foreign_bobs() -> String {
+        let bob = |x: &str| {
+            format!(
+                r#"<rdf:li><rdf:Description mwg-rs:Name="Bob" mwg-rs:Type="Face"><mwg-rs:Area stArea:x="{x}" stArea:y="0.5" stArea:w="0.1" stArea:h="0.1" stArea:unit="normalized" digiKam:Confidence="{x}"/></rdf:Description></rdf:li>"#
+            )
+        };
+        let digikam_bob = r#"      <rdf:li>
+       <rdf:Description mwg-rs:Name="Bob" mwg-rs:Type="Face">
+        <mwg-rs:Area stArea:x="0.8" stArea:y="0.7" stArea:w="0.1" stArea:h="0.2" stArea:unit="normalized"/>
+       </rdf:Description>
+      </rdf:li>"#;
+        assert!(rf::DIGIKAM.contains(digikam_bob));
+        rf::DIGIKAM.replace(digikam_bob, &[bob("0.515"), bob("0.5")].concat())
+    }
+
+    /// Review L1 (probe P04): one incoming region updates at most one existing region, and
+    /// L2: the one it updates is the closest, not the first in document order. The other Bob,
+    /// listed first, is left exactly as it was.
+    #[test]
+    fn face_regions_update_only_the_closest_matching_region() {
+        let sidecar = two_foreign_bobs();
+        assert_eq!(rf::named(&rf::mwg(&sidecar), "Bob").len(), 2, "fixture:\n{sidecar}");
+        let (_dir, photo) = seeded_photo("xmp-147-closest", &sidecar);
+        let bob = face(3, "Bob", (0.455, 0.45, 0.1, 0.1)); // center (0.505, 0.5)
+        write_face_regions(&photo, &[bob], &[], sized(6000, 4000)).unwrap();
+
+        let xml = read(&sidecar_path(&photo));
+        let bobs = rf::named(&rf::mwg(&xml), "Bob").into_iter().cloned().collect::<Vec<_>>();
+        assert_eq!(bobs.len(), 2, "no Bob appended or removed:\n{xml}");
+        assert_eq!(bobs[0].area.0, 0.515, "the farther Bob, listed first, moved:\n{xml}");
+        assert!((bobs[1].area.0 - 0.505).abs() < 1e-5, "the closest Bob did not move:\n{xml}");
+        assert!(bobs.iter().all(|b| b.face_id.is_none()), "a foreign region was marked:\n{xml}");
+    }
+
+    /// L2 with ChairPhoto's own region in the file: a digiKam Bob listed first and closer to
+    /// the old position never takes the update meant for ChairPhoto's marked Bob.
+    #[test]
+    fn face_regions_update_their_own_region_before_a_foreign_one() {
+        let (_dir, photo) = seeded_photo("xmp-147-ours-first", &two_foreign_bobs());
+        // ChairPhoto's own Bob, marked, at center (0.51, 0.5): written as Zed far away, then
+        // edited into place, so no foreign Bob is matched on the way.
+        write_face_regions(&photo, &[face(99, "Zed", (0.1, 0.1, 0.1, 0.1))], &[], sized(6000, 4000))
+            .unwrap();
+        let xml = read(&sidecar_path(&photo)).replace(
+            "<mwg-rs:Name>Zed</mwg-rs:Name>",
+            "<mwg-rs:Name>Bob</mwg-rs:Name>",
+        )
+        .replace("<chairphoto:FaceId>99</chairphoto:FaceId>", "<chairphoto:FaceId>3</chairphoto:FaceId>")
+        .replace("<stArea:x>0.15</stArea:x><stArea:y>0.15</stArea:y>", "<stArea:x>0.51</stArea:x><stArea:y>0.5</stArea:y>");
+        assert!(xml.contains("<stArea:x>0.51</stArea:x>"), "{xml}");
+        std::fs::write(sidecar_path(&photo), &xml).unwrap();
+
+        write_face_regions(&photo, &[face(3, "Bob", (0.455, 0.45, 0.1, 0.1))], &[], sized(6000, 4000))
+            .unwrap();
+        let xml = read(&sidecar_path(&photo));
+        let got = rf::mwg(&xml);
+        let bobs = rf::named(&got, "Bob");
+        assert_eq!(bobs.len(), 3, "{xml}");
+        assert_eq!((bobs[0].area.0, bobs[1].area.0), (0.515, 0.5), "a foreign Bob moved:\n{xml}");
+        assert_eq!(bobs[2].face_id.as_deref(), Some("3"));
+        assert!((bobs[2].area.0 - 0.505).abs() < 1e-5, "ours did not move:\n{xml}");
+    }
+
+    /// Review L4 (probe P12): a sidecar whose root is a bare `rdf:RDF` — no `x:xmpmeta`, which
+    /// the XMP spec allows — is read and written in place: one `rdf:RDF`, one `Regions`, the
+    /// foreign region kept and ChairPhoto's added; the identifier reads and writes too. A root
+    /// that is no XMP packet at all is refused and left as it was.
+    #[test]
+    fn a_bare_rdf_root_is_written_in_place() {
+        let start = rf::DIGIKAM.find("<rdf:RDF").unwrap();
+        let end = rf::DIGIKAM.find("</x:xmpmeta>").unwrap();
+        let bare = format!(r#"<?xml version="1.0" encoding="UTF-8"?>{}"#, &rf::DIGIKAM[start..end]);
+        let (_dir, photo) = seeded_photo("xmp-147-bare", &bare);
+        assert_eq!(region_names(&photo), ["Bob"], "the bare root is read");
+
+        write_face_regions(&photo, &[face(4, "Alice", (0.1, 0.1, 0.2, 0.2))], &[], sized(6000, 4000))
+            .unwrap();
+        write_identifier(&photo, "6f1c1f0e-2b7a-4c3d-9e8f-0a1b2c3d4e5f").unwrap();
+
+        let xml = read(&sidecar_path(&photo));
+        let got = rf::mwg(&xml);
+        assert_eq!(got.rdf_elements, 1, "a second rdf:RDF:\n{xml}");
+        assert_eq!(got.dims.len(), 1, "a second Regions:\n{xml}");
+        assert_eq!(rf::named(&got, "Bob")[0].area, (0.8, 0.7, 0.1, 0.2));
+        assert_eq!(rf::named(&got, "Alice")[0].face_id.as_deref(), Some("4"));
+        assert_eq!(read_identifier(&photo).as_deref(), Some("6f1c1f0e-2b7a-4c3d-9e8f-0a1b2c3d4e5f"));
+        assert_eq!(rf::foreign_structures(&xml), rf::foreign_structures(rf::DIGIKAM));
+
+        let (_dir, photo) = seeded_photo("xmp-147-not-xmp", "<foo><bar/></foo>");
+        assert!(write_face_regions(&photo, &[face(4, "Alice", (0.1, 0.1, 0.2, 0.2))], &[], sized(6000, 4000))
+            .is_err());
+        assert!(write_identifier(&photo, "6f1c1f0e-2b7a-4c3d-9e8f-0a1b2c3d4e5f").is_err());
+        assert_eq!(read(&sidecar_path(&photo)), "<foo><bar/></foo>");
+    }
+
+    /// The #147 nit: a `chairphoto:LastWrite` exiftool moved into a later Description still
+    /// says ChairPhoto has written the file, so no backup of a ChairPhoto-written state is
+    /// taken as if it were the foreign original.
+    #[test]
+    fn last_write_in_a_later_description_counts() {
+        let sidecar = r#"<?xml version="1.0" encoding="UTF-8"?>
+<x:xmpmeta xmlns:x="adobe:ns:meta/">
+ <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+  <rdf:Description rdf:about="" xmlns:xmp="http://ns.adobe.com/xap/1.0/" xmp:Rating="2"/>
+  <rdf:Description rdf:about="" xmlns:chairphoto="https://chairphoto.local/ns/1.0/">
+   <chairphoto:LastWrite>1700000000</chairphoto:LastWrite>
+  </rdf:Description>
+ </rdf:RDF>
+</x:xmpmeta>"#;
+        let (_dir, photo) = seeded_photo("xmp-147-lastwrite", sidecar);
+        write_face_regions(&photo, &[face(4, "Alice", (0.1, 0.1, 0.2, 0.2))], &[], sized(6000, 4000))
+            .unwrap();
+        assert!(!sidecar_backup_path(&sidecar_path(&photo)).exists(), "backed up a file ChairPhoto wrote");
     }
 }

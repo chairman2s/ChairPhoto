@@ -195,8 +195,9 @@ confirmed set, and for each existing region, in this order:
    `mwg-rs:Rotation`, `Type`, extensions and foreign attributes such as `digiKam:Confidence`
    stay, and it is never marked, so rejecting the face later never removes it.
 
-Each existing region is claimed by at most one face, and the faces that claimed none are
-appended, marked. **When in doubt, the region is preserved.** Foreign attributes and children of
+Each existing region is claimed by at most one face and each face claims at most one region;
+where several regions match a face by Name + Area, the **closest** center wins, not the first in
+the file (#147). The faces that claimed none are appended, marked. **When in doubt, the region is preserved.** Foreign attributes and children of
 `Regions`, `AppliedToDimensions` and the list survive. A write that changes nothing in the
 regions (an empty set and nothing of ours, or the set as the file already has it) leaves the
 sidecar untouched and creates none.
@@ -212,7 +213,9 @@ so a region another tool writes later under the same name and place is never tak
 Pre-marker regions of a face rejected *before* the upgrade are not on the record and stay — the
 catalog no longer knows they were ours.
 
-The writer and reader accept `Regions` in any top-level `rdf:Description`, struct values written
+A sidecar may be rooted at `x:xmpmeta` or, as the XMP spec allows, at a bare `rdf:RDF`, which
+is read and written in place (#147); a file rooted at anything else is not written. The writer
+and reader accept `Regions` in any top-level `rdf:Description`, struct values written
 with `rdf:parseType="Resource"`, as a nested `rdf:Description` or as attributes, and a list in an
 `rdf:Bag` or `rdf:Seq`. A `Regions` in any other layout (two of them, another container, a
 reference) is **not written**: the write fails with an error and the sidecar is left as it was,

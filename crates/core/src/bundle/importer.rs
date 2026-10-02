@@ -234,7 +234,7 @@ pub fn extract_originals_abortable(
                 let found = crate::xmp::read_identifier(&dest);
                 let outcome = crate::catalog::bind_sidecar_identity(
                     &dest,
-                    &crate::catalog::photo_identity_key(&bp.uuid),
+                    &crate::catalog::photo_identity_for(&bp.uuid),
                     found.as_deref(),
                 );
                 if outcome != crate::catalog::SidecarIdentity::Bound {
@@ -313,7 +313,7 @@ pub fn extract_originals_abortable(
         // end of it — the photo has no catalog row yet, so index_bundle is the one that
         // records the repair once the row exists.
         if !bundle_sidecar_extracted && !sidecar_dest.exists() {
-            if let Err(e) = crate::xmp::write_identifier(&dest, &crate::catalog::photo_identity_key(&bp.uuid)) {
+            if let Err(e) = crate::xmp::write_identifier(&dest, &crate::catalog::photo_identity_for(&bp.uuid)) {
                 eprintln!(
                     "bundle import: couldn't write UUID sidecar for {} — queued for repair: {e}",
                     dest.display()
@@ -450,7 +450,8 @@ pub(crate) fn index_bundle_with(
         // known, so minting a fresh UUID here would be inventing a second one for it
         // and leaving `merge_bundle` to insert the bundle's photo a second time.
         // A sidecar identifier that is not a UUID is another tool's, not an identity (#141).
-        // `upsert_photo_with_identity` canonicalises it (#146).
+        // `upsert_photo_with_identity` canonicalises it, and maps a manifest id that is not a
+        // UUID (a bundle from a pre-#146 catalog) to the identity v23 gave it (#146).
         let identity = sidecar_uuid
             .as_deref()
             .filter(|v| crate::catalog::is_photo_identity(v))

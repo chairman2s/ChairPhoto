@@ -37,11 +37,11 @@ mod performance_harness;
 
 pub use facets::{Facet, SOFT_THRESHOLD_DEFAULT, SOFT_THRESHOLD_KEY};
 pub use identity::{
-    bind_sidecar_identity, canonical_photo_identity, is_photo_identity, IdentityConflictAction, IdentityConflictOutcome, IdentityRepairCursor,
+    bind_sidecar_identity, canonical_photo_identity, is_photo_identity, legacy_photo_identity,
+    photo_identity_for, IdentityConflictAction, LEGACY_IDENTITY_NAMESPACE, IdentityConflictOutcome, IdentityRepairCursor,
     IdentityRepairPlan, IdentityRepairSummary, PendingIdentity, PendingIdentityField,
     PendingIdentityRow, PendingIdentitySummary, SidecarIdentity,
 };
-pub(crate) use identity::photo_identity_key;
 pub use locations::{PathCandidate, ResolveMode};
 pub use lifecycle::{
     carry_companions, copy_and_verify, copy_with_companions, verify_and_delete_locals, BackupPlan,
@@ -688,7 +688,11 @@ impl Catalog {
     ///
     /// `sidecar_uuid` is trusted as an identity: a caller that read it from a sidecar passes
     /// it only if [`is_photo_identity`] accepts it (#141). A UUID is matched and stored in
-    /// its canonical lowercase spelling (#146), whatever case the sidecar wrote it in.
+    /// its canonical lowercase spelling (#146), whatever case the sidecar wrote it in. A
+    /// trusted value that is not a UUID — an old bundle's manifest id — is the identity an
+    /// older catalog gave the photo, so it is matched and stored as its
+    /// [`legacy_photo_identity`] and recorded as the row's legacy identifier, as schema v23
+    /// does: `photos.uuid` never holds a non-UUID.
     pub fn upsert_photo_with_identity(
         &self,
         absolute_path: &Path,
@@ -697,7 +701,8 @@ impl Catalog {
         size: i64,
         sidecar_uuid: Option<&str>,
     ) -> Result<UpsertResult> {
-        let sidecar_uuid = sidecar_uuid.map(identity::photo_identity_key);
+        let trusted = sidecar_uuid;
+        let sidecar_uuid = trusted.map(photo_identity_for);
         let sidecar_uuid = sidecar_uuid.as_deref();
         let rel = self.to_relative(absolute_path)?;
         let extension = absolute_path
@@ -777,6 +782,7 @@ impl Catalog {
 
         // Record where the bytes physically are, so the resolver can find them.
         self.set_primary_location(result.id, absolute_path)?;
+        self.record_legacy_identifier(result.id, trusted)?;
         Ok(result)
     }
 
@@ -788,8 +794,8 @@ impl Catalog {
     /// volume+path, then by sidecar UUID, else creates a new row (folder_id null — it's
     /// not under an indexed local folder). See `scanner::scan_external_folder`.
     ///
-    /// `sidecar_uuid` is trusted as an identity, and canonicalised, as in
-    /// [`Self::upsert_photo_with_identity`].
+    /// `sidecar_uuid` is trusted as an identity, and canonicalised (or mapped from a legacy
+    /// value), as in [`Self::upsert_photo_with_identity`].
     pub fn upsert_photo_on_volume(
         &self,
         absolute: &Path,
@@ -797,7 +803,8 @@ impl Catalog {
         size: i64,
         sidecar_uuid: Option<&str>,
     ) -> Result<UpsertResult> {
-        let sidecar_uuid = sidecar_uuid.map(identity::photo_identity_key);
+        let trusted = sidecar_uuid;
+        let sidecar_uuid = trusted.map(photo_identity_for);
         let sidecar_uuid = sidecar_uuid.as_deref();
         let (volume_id, rel) = self.volume_for_path(absolute)?;
         let extension = absolute
@@ -866,6 +873,7 @@ impl Catalog {
 
         // Record the file's location on its (NAS) volume so the resolver finds it there.
         self.add_location(result.id, volume_id, &rel, LocationRole::Primary)?;
+        self.record_legacy_identifier(result.id, trusted)?;
         Ok(result)
     }
 
@@ -892,7 +900,7 @@ impl Catalog {
                     "SELECT {cols} FROM photos WHERE uuid = ?1",
                     cols = query::photo_columns("photos")
                 ),
-                params![identity::photo_identity_key(uuid)],
+                params![photo_identity_for(uuid)],
                 row_to_photo,
             )
             .optional()?
@@ -907,7 +915,7 @@ impl Catalog {
             return Ok(0);
         }
         const CHUNK: usize = 999;
-        let uuids: Vec<String> = uuids.iter().map(|u| identity::photo_identity_key(u)).collect();
+        let uuids: Vec<String> = uuids.iter().map(|u| photo_identity_for(u)).collect();
         let mut total: usize = 0;
         for chunk in uuids.chunks(CHUNK) {
             // Build the parameterised placeholder list: (?1,?2,…,?N).

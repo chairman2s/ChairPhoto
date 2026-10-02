@@ -275,9 +275,13 @@ impl MergeCtx<'_> {
     /// existing row untouched. Either way, union its tag assignments.
     ///
     /// A UUID is matched in its canonical lowercase spelling (#146), so a bundle that carries
-    /// it in another case still finds the photo.
+    /// it in another case still finds the photo. A bundle written before #146 can carry a
+    /// non-UUID id that an older catalog had adopted; it is matched and stored as its
+    /// [`super::legacy_photo_identity`] — the identity schema v23 gave that photo in every
+    /// catalog — and recorded as the row's legacy identifier, so it never becomes a
+    /// non-UUID `photos.uuid` again.
     fn merge_photo(&mut self, photo: &BundlePhoto, batch_id: i64) -> Result<()> {
-        let uuid = super::identity::photo_identity_key(&photo.uuid);
+        let uuid = super::photo_identity_for(&photo.uuid);
         let existing: Option<i64> = self
             .tx
             .query_row(
@@ -299,6 +303,13 @@ impl MergeCtx<'_> {
                 id
             }
         };
+
+        if super::identity::is_legacy_identifier(&photo.uuid) {
+            self.tx.execute(
+                super::identity::RECORD_LEGACY_IDENTIFIER_SQL,
+                params![photo_id, photo.uuid],
+            )?;
+        }
 
         self.union_assignments(photo_id, photo)?;
         Ok(())
@@ -552,15 +563,16 @@ mod tests {
     #[test]
     fn existing_photo_is_never_overwritten_only_assignments_union() {
         let (cat, _root) = temp_catalog("preserve");
-        // Seed a photo the "desktop" already has, matching photo-a's uuid but with
-        // DIFFERENT local state (higher rating, a manual tag, its own version).
+        // Seed a photo the "desktop" already has, matching photo-a's identity but with
+        // DIFFERENT local state (higher rating, a manual tag, its own version). The fixture's
+        // "photo-a" is not a UUID, so the identity it names is its legacy mapping (#146).
         cat.conn()
             .execute(
                 "INSERT INTO photos(uuid, path, mtime_ns, size, extension, rating,
                     color_label, pick_state, iptc_headline, created_at, updated_at)
-                 VALUES('photo-a', 'existing/local.ARW', 1, 1, 'arw', 5, 'red', 'reject',
+                 VALUES(?1, 'existing/local.ARW', 1, 1, 'arw', 5, 'red', 'reject',
                         'Local headline', 1, 1)",
-                [],
+                params![crate::catalog::photo_identity_for("photo-a")],
             )
             .unwrap();
         let local = cat.get_photo_by_uuid("photo-a").unwrap();

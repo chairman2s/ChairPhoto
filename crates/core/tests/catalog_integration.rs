@@ -389,10 +389,16 @@ fn moved_file_matches_by_uuid_instead_of_duplicating() {
 
     // A brand-new file with a UUID from another machine adopts that identity.
     let imported = catalog
-        .upsert_photo_with_identity(&root.join("FROM-LAPTOP.ARW"), None, 3, 3, Some("known-uuid-123"))
+        .upsert_photo_with_identity(
+            &root.join("FROM-LAPTOP.ARW"),
+            None,
+            3,
+            3,
+            Some("3b2f7c1e-8a4d-4e6f-9b0a-1c2d3e4f5a6b"),
+        )
         .unwrap();
     assert!(imported.created);
-    assert_eq!(imported.uuid, "known-uuid-123");
+    assert_eq!(imported.uuid, "3b2f7c1e-8a4d-4e6f-9b0a-1c2d3e4f5a6b");
 }
 
 /// Issue #141: a sidecar identifier that is not a UUID is another tool's (here a DAM asset
@@ -659,6 +665,160 @@ fn schema_v24_lowercases_identities_and_re_mints_a_collision() {
     assert_eq!(pending.len(), 1, "{pending:#?}");
     assert_eq!((pending[0].photo_id, pending[0].state.as_str()), (ids[1], "conflict"));
     assert!(pending[0].error.contains(&shared_upper), "{}", pending[0].error);
+}
+
+/// A catalog as a pre-#141 scan left it: each `(relative path, sidecar identifier)` file
+/// scanned, its row holding the identifier as `photos.uuid`, copies counted as bound, and the
+/// catalog stamped schema v22 — then reopened, which runs v23 and v24.
+fn legacy_catalog(tag: &str, files: &[(&str, &str)]) -> (Catalog, common::TestSubPath, Vec<i64>) {
+    let (catalog, root) = temp_catalog(tag);
+    for (rel, id) in files {
+        let f = root.join(rel);
+        std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+        std::fs::write(&f, b"notarealjpeg").unwrap();
+        std::fs::write(
+            chairphoto_core::xmp::sidecar_path(&f),
+            format!(r#"<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"><rdf:Description rdf:about="" xmlns:xmp="http://ns.adobe.com/xap/1.0/"><xmp:Identifier>{id}</xmp:Identifier></rdf:Description></rdf:RDF></x:xmpmeta>"#),
+        )
+        .unwrap();
+    }
+    let abort = chairphoto_core::scanner::never_abort();
+    chairphoto_core::scanner::scan_folder(&catalog, &root, &abort, &|_| {}).unwrap();
+    let mut ids = Vec::new();
+    for (rel, id) in files {
+        let photo: i64 = catalog
+            .conn()
+            .query_row("SELECT id FROM photos WHERE path = ?1", [rel], |r| r.get(0))
+            .unwrap();
+        catalog
+            .conn()
+            .execute("UPDATE photos SET uuid = ?1 WHERE id = ?2", rusqlite::params![id, photo])
+            .unwrap();
+        ids.push(photo);
+    }
+    catalog
+        .conn()
+        .execute_batch(
+            "DELETE FROM pending_sidecar_identity;
+             UPDATE settings SET value = '22' WHERE key = 'schema_version';",
+        )
+        .unwrap();
+    let db = catalog.db_path().to_path_buf();
+    drop(catalog);
+    (Catalog::open(&db, &root).unwrap(), root, ids)
+}
+
+/// A bundle of `photos`, each `(uuid, relative path)`, with nothing else in it.
+fn bare_bundle(photos: &[(&str, &str)]) -> chairphoto_core::bundle::BundleManifest {
+    let mut m = chairphoto_core::bundle::BundleManifest::new(
+        chairphoto_core::bundle::BundleBatch {
+            uuid: "5c0e9d2a-1b3f-4a6c-8d7e-9f0a1b2c3d4e".into(),
+            source_label: "laptop".into(),
+            note: String::new(),
+            created_at: 1,
+        },
+        2,
+    );
+    m.photos = photos
+        .iter()
+        .map(|(uuid, rel)| chairphoto_core::bundle::BundlePhoto {
+            uuid: (*uuid).into(),
+            relative_path: (*rel).into(),
+            rating: 0,
+            label: String::new(),
+            pick_state: PickState::None,
+            iptc: Default::default(),
+            edit_record: None,
+            versions: vec![],
+            tag_uuids: vec![],
+        })
+        .collect();
+    m
+}
+
+fn non_uuid_rows(catalog: &Catalog) -> Vec<String> {
+    catalog
+        .list_photos(&PhotoQuery::default())
+        .unwrap()
+        .into_iter()
+        .map(|p| p.uuid)
+        .filter(|u| !chairphoto_core::catalog::is_photo_identity(u))
+        .collect()
+}
+
+/// #146 review F1: two catalogs that each held one photo as `dam:asset/1` before #141 migrate
+/// independently, and must still agree on its identity — it is the merge key, and a bundle
+/// does not carry the legacy value. A bundle from one then merges onto the other's row,
+/// whatever path it gives the photo.
+#[test]
+fn two_catalogs_that_held_one_legacy_photo_agree_on_its_identity() {
+    let (a, _ra, ia) = legacy_catalog("legacy-merge-a", &[("x.jpg", "dam:asset/1")]);
+    let (b, _rb, ib) = legacy_catalog("legacy-merge-b", &[("x.jpg", "dam:asset/1")]);
+    let ua = a.get_photo(ia[0]).unwrap().uuid;
+    let ub = b.get_photo(ib[0]).unwrap().uuid;
+    assert_eq!(ua, ub, "independent migrations of one legacy photo must agree");
+    assert_eq!(ua, chairphoto_core::catalog::legacy_photo_identity("dam:asset/1"));
+    assert!(chairphoto_core::catalog::is_photo_identity(&ua), "{ua}");
+
+    for rel in ["x.jpg", "elsewhere/x.jpg"] {
+        let s = a.merge_bundle(&bare_bundle(&[(&ub, rel)])).unwrap();
+        assert_eq!((s.photos_existing, s.photos_added), (1, 0), "bundle from B at {rel}");
+    }
+    assert_eq!(a.list_photos(&PhotoQuery::default()).unwrap().len(), 1);
+}
+
+/// #146 review F2: a bundle written before #146 carries the photo's non-UUID id. It merges
+/// onto the row v23 re-minted (same path or not), and into a catalog that never had the
+/// photo it lands under the same identity v23 would have given it, with the legacy value
+/// recorded — never as a non-UUID `photos.uuid`.
+#[test]
+fn an_old_bundles_non_uuid_id_never_becomes_a_photos_uuid() {
+    let (a, _ra, ia) = legacy_catalog("legacy-old-bundle", &[("x.jpg", "dam:asset/1")]);
+    for rel in ["x.jpg", "y.jpg"] {
+        let s = a.merge_bundle(&bare_bundle(&[("dam:asset/1", rel)])).unwrap();
+        assert_eq!((s.photos_existing, s.photos_added), (1, 0), "old bundle at {rel}");
+    }
+    assert_eq!(a.list_photos(&PhotoQuery::default()).unwrap().len(), 1);
+    assert!(non_uuid_rows(&a).is_empty());
+    assert_eq!(a.get_photo(ia[0]).unwrap().uuid, chairphoto_core::catalog::legacy_photo_identity("dam:asset/1"));
+
+    let (fresh, _root) = temp_catalog("legacy-old-bundle-fresh");
+    let s = fresh.merge_bundle(&bare_bundle(&[("dam:asset/2", "z.jpg")])).unwrap();
+    assert_eq!((s.photos_existing, s.photos_added), (0, 1));
+    assert!(non_uuid_rows(&fresh).is_empty());
+    let landed = fresh.list_photos(&PhotoQuery::default()).unwrap().remove(0);
+    assert_eq!(landed.uuid, chairphoto_core::catalog::legacy_photo_identity("dam:asset/2"));
+    let legacy: String = fresh
+        .conn()
+        .query_row("SELECT identifier FROM photo_legacy_identifiers WHERE photo_id = ?1", [landed.id], |r| r.get(0))
+        .unwrap();
+    assert_eq!(legacy, "dam:asset/2");
+    assert_eq!(fresh.count_existing_uuids(&["dam:asset/2".to_string()]).unwrap(), 1,
+        "the import preview counts it as already present");
+}
+
+/// #146 review F2: the bundle importer falls back to the manifest id when the copied file's
+/// sidecar has none, through `upsert_photo_with_identity`. A non-UUID id there is mapped and
+/// recorded exactly as merge and v23 do.
+#[test]
+fn a_trusted_non_uuid_identity_is_stored_as_its_legacy_mapping() {
+    let (catalog, root) = temp_catalog("legacy-upsert");
+    let f = root.join("a/x.jpg");
+    std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+    std::fs::write(&f, b"notarealjpeg").unwrap();
+    let up = catalog.upsert_photo_with_identity(&f, None, 1, 1, Some("dam:asset/5")).unwrap();
+    assert!(up.created);
+    assert_eq!(up.uuid, chairphoto_core::catalog::legacy_photo_identity("dam:asset/5"));
+    assert_eq!(catalog.get_photo(up.id).unwrap().uuid, up.uuid);
+    let again = catalog
+        .upsert_photo_with_identity(&root.join("b/x.jpg"), None, 1, 1, Some("dam:asset/5"))
+        .unwrap();
+    assert_eq!((again.id, again.created), (up.id, false), "the same old id finds the same row");
+    let legacy: String = catalog
+        .conn()
+        .query_row("SELECT identifier FROM photo_legacy_identifiers WHERE photo_id = ?1", [up.id], |r| r.get(0))
+        .unwrap();
+    assert_eq!(legacy, "dam:asset/5");
 }
 
 #[test]

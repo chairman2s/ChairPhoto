@@ -139,13 +139,27 @@ the sidecar as a conflict. Adopt refuses it; Overwrite (after the backup) or Dis
 it.
 
 Before #141 a scan did adopt such a value, so an older catalog can hold rows whose
-`photos.uuid` is a DAM id. Schema v23 (#146) gives each of them a minted UUID, keeps the old
-value in `photo_legacy_identifiers`, and queues every copy it records as a conflict; it writes
-no sidecar. Until that conflict is resolved the sidecar's foreign value is the file's only link
+`photos.uuid` is a DAM id. Schema v23 (#146) re-mints each of them, keeps the old value in
+`photo_legacy_identifiers`, and queues every copy it records as a conflict; it writes no
+sidecar. Until that conflict is resolved the sidecar's foreign value is the file's only link
 to its row, so a scan re-homes a moved file onto the row holding it as a legacy identifier —
 only when no other row holds it and every copy the row records is gone (present storage, no
 file; an unmounted volume does not count). Otherwise the file is a different photo and gets
-its own row, as above. The legacy value is never a merge key or a deep-link target.
+its own row, as above.
+
+**A re-minted legacy identity is a UUID v5, not v4.** This is the one exception to "a UUID v4
+on first import": a photo imported fresh still gets a random v4, but a value that already
+served as a photo's identity is re-minted as `catalog::legacy_photo_identity` — UUID v5 of the
+value under the fixed `catalog::LEGACY_IDENTITY_NAMESPACE`, which must never change. Two
+catalogs that each held a photo as `dam:asset/1` migrate independently and must still agree on
+its identity, because identity is the merge key and a bundle does not carry the legacy value; a
+random v4 per catalog would split that photo in two at the next merge. For the same reason
+merge and bundle import map an old bundle's non-UUID id through the same function
+(`catalog::photo_identity_for`) and record it as the row's legacy identifier: no path stores a
+non-UUID `photos.uuid` any more. If v23 finds the v5 already held by another row (a migrated
+catalog's bundle merged in first), the two rows claim one photo and it cannot tell which is
+right, so that row gets a v4 and its copies stay queued as conflicts. The legacy value itself
+is never a merge key or a deep-link target.
 
 A UUID is one identity in either case. `photos.uuid` holds it lowercase, as ChairPhoto mints
 it (`catalog::canonical_photo_identity`): a scan, a bundle import, a merge, Adopt and a deep

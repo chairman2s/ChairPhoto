@@ -10,6 +10,10 @@ React frontend that only displays.
 > **Status: early.** This is a personal project released in the hope it's useful to
 > someone else. It works on the author's machine and library; expect rough edges.
 
+> **In transition.** The React/Tauri front end is being replaced by a native Rust front
+> end built on [GPUI](https://www.gpui.rs/). Both build from this tree until the
+> switch-over; see [The GPUI front end](#the-gpui-front-end).
+
 ## What it does
 
 - **Catalog & culling** — virtualized grid over large libraries, ratings, colour labels,
@@ -106,15 +110,26 @@ Checks:
 ```bash
 npm test                                    # frontend tests (vitest)
 npx tsc --noEmit                            # frontend typecheck
-cargo test --workspace                      # backend tests (crates/core + src-tauri)
+npm run build
+cargo test --workspace                      # all Rust crates
 cargo check --workspace --all-features --all-targets
 cargo check --workspace --no-default-features   # verifies feature gating still holds
 ```
 
-The backend is a Cargo workspace at the repository root: `crates/core` (`chairphoto-core`)
-holds the catalog, import, decode and module backends with no Tauri dependency, and
-`src-tauri` (`chairphoto`) is the Tauri shell — commands, media protocols and plugins —
-forwarding the same feature names. Build output is in `target/` at the root.
+Tests that need something this machine lacks (a RAW fixture, ONNX Runtime, a model, a free
+LocalSend port) skip and print `SKIPPED: <test> — <why>`; run
+`cargo test --workspace -- --nocapture` to see which ran.
+
+The Rust side is a Cargo workspace at the repository root, with build output in `target/`:
+
+| Crate | Package | Role |
+|---|---|---|
+| `crates/core` | `chairphoto-core` | Catalog, import, decode, XMP, jobs and module backends. No UI or Tauri dependency. |
+| `crates/model` | `chairphoto-model` | UI logic with no I/O (library session, editing, presets, tag graph layout, deep links, …), shared by the GPUI views and tested on its own. |
+| `crates/app` | `chairphoto-app` | The GPUI front end (binary `chairphoto-gpui`). |
+| `src-tauri` | `chairphoto` | The Tauri shell: commands, media protocols and plugins over the core. |
+
+Feature names are the same in every crate that forwards them.
 
 The tree is warning-clean under every feature combination. Please keep it that way.
 
@@ -144,7 +159,44 @@ cargo build -p chairphoto --no-default-features --features edit,collage,slidesho
 `faces-cuda` and `smarttags-cuda` additionally run inference on an NVIDIA GPU; both fall
 back to CPU rather than failing.
 
+## The GPUI front end
+
+`crates/app` is a native Rust front end on GPUI that calls the core directly: no webview,
+no IPC, and image pixels go straight from the decoder to the GPU. It is being built to
+parity with the React app, view by view and module by module. Progress is tracked row by
+row in [`docs/plans/gpui/parity.md`](docs/plans/gpui/parity.md). When it reaches parity
+it replaces the Tauri shell and `src/`.
+
+```bash
+cargo run --release -p chairphoto-app --bin chairphoto-gpui
+```
+
+It opens the same catalog as the Tauri app. To try it without touching your own library,
+point it at throwaway data directories:
+
+```bash
+XDG_DATA_HOME=/tmp/cp-data XDG_CACHE_HOME=/tmp/cp-cache \
+  cargo run --release -p chairphoto-app --bin chairphoto-gpui
+```
+
+At run time it needs a Vulkan driver (on Arch, `vulkan-icd-loader` and your GPU's
+driver), plus `libxkbcommon`, `libxkbcommon-x11` and `libxcb`. It does not need
+webkit2gtk.
+
+Known differences from the React app, by design:
+
+- **Modules are compiled in.** First-party modules are Rust and follow the same Cargo
+  features. Third-party JavaScript modules (the API in [Writing a module](#writing-a-module))
+  are not loaded; user extensions are planned after parity.
+- **Video** shows its poster frame with *Play in system player*, instead of playing
+  inline.
+- **The tag graph** shows the Communities view only.
+
 ## Writing a module
+
+> The JavaScript module API below belongs to the React/Tauri app. The GPUI front end does
+> not load external modules, so it goes away at the switch-over.
+
 
 Modules load through a small, stable host API (`ChairPhotoAPI` / `ChairPhotoModule`) and
 can add panels and actions without touching core. The API is additive-only within a major

@@ -369,18 +369,23 @@ fn with_bound<T>(
     }
 }
 
-/// The sidecar half of a fill, done off the catalog lock: the original, and the IPTC before
-/// and after the fill.
+/// The sidecar half of a fill, done off the catalog lock: the original, the IPTC before
+/// and after the fill, and the write's place in line — reserved under the lock the fill
+/// stored in, so this write and a manual save's land in the order they stored (#149).
 struct SidecarFill {
     original: std::path::PathBuf,
     before: crate::catalog::IptcFields,
     after: crate::catalog::IptcFields,
+    order: crate::xmp::lock::WriteOrder,
 }
 
 impl SidecarFill {
     /// Write only the filled fields: `xmp::write_iptc` leaves every field the fill did not
     /// change — a foreign creator, rights or caption included — as the sidecar has it (#144).
-    fn write(&self) -> Result<(), String> {
+    /// Waits first for every write reserved before it; call it with no lock held and no
+    /// `.await` between the fill and this write.
+    fn write(self) -> Result<(), String> {
+        let _turn = self.order.wait();
         crate::xmp::write_iptc(&self.original, &self.before, &self.after)
     }
 }
@@ -404,7 +409,8 @@ fn fill_in(
         }
         let original = c.require_photo_path(photo_id)?;
         c.set_iptc(photo_id, &updated)?;
-        Ok(Some(SidecarFill { original, before: current, after: updated }))
+        let order = crate::xmp::lock::WriteOrder::reserve(&original);
+        Ok(Some(SidecarFill { original, before: current, after: updated, order }))
     })
 }
 

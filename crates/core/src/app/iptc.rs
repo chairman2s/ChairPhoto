@@ -16,9 +16,14 @@ use crate::catalog::IptcFields;
 /// Blocking: the catalog lock is held only for the path lookup, the read of the previous
 /// values and the store — one hold, so the change written is the change stored — and the
 /// sidecar's read-modify-write runs after it is released. Call it off the UI thread.
+///
+/// Overlapping saves of one photo write its sidecar in the order they stored (issue #149):
+/// the store reserves the sidecar write's place in line ([`crate::xmp::lock::WriteOrder`])
+/// under the catalog lock, so a later save never has its change overwritten by an earlier
+/// one that reached the disk last.
 pub fn save_iptc(state: &AppState, photo_id: i64, fields: &IptcFields) -> Result<(), String> {
-    let (original, before) = with_catalog(state, |c| store(c, photo_id, fields))?;
-    crate::xmp::write_iptc(&original, &before, fields)
+    let (original, before, order) = with_catalog(state, |c| store(c, photo_id, fields))?;
+    write(&original, &before, fields, order)
 }
 
 /// [`save_iptc`] of a photo read from the catalog `expected` names: the store and the path
@@ -30,22 +35,36 @@ pub fn save_iptc_as(
     photo_id: i64,
     fields: &IptcFields,
 ) -> Result<(), String> {
-    let (original, before) = super::with_catalog_as(state, expected, |c| store(c, photo_id, fields))?;
-    crate::xmp::write_iptc(&original, &before, fields)
+    let (original, before, order) = super::with_catalog_as(state, expected, |c| store(c, photo_id, fields))?;
+    write(&original, &before, fields, order)
 }
 
-/// Store `fields`, returning the original's path and the values they replaced. The path is
-/// resolved before the row is written (as the geocoder's `fill_in` does), so an unreachable
-/// original leaves the catalog unchanged.
+/// Store `fields`, returning the original's path, the values they replaced and the sidecar
+/// write's place in line, reserved here — under the catalog lock the store holds — so the
+/// line's order is the store order. The path is resolved before the row is written (as the
+/// geocoder's `fill_in` does), so an unreachable original leaves the catalog unchanged.
 fn store(
     c: &crate::catalog::Catalog,
     photo_id: i64,
     fields: &IptcFields,
-) -> crate::catalog::Result<(std::path::PathBuf, IptcFields)> {
+) -> crate::catalog::Result<(std::path::PathBuf, IptcFields, crate::xmp::lock::WriteOrder)> {
     let original = c.require_photo_path(photo_id)?;
     let before = c.get_iptc(photo_id)?;
     c.set_iptc(photo_id, fields)?;
-    Ok((original, before))
+    let order = crate::xmp::lock::WriteOrder::reserve(&original);
+    Ok((original, before, order))
+}
+
+/// The sidecar half of a save, off the catalog lock: wait for every earlier save's write,
+/// then write this one's change.
+fn write(
+    original: &std::path::Path,
+    before: &IptcFields,
+    after: &IptcFields,
+    order: crate::xmp::lock::WriteOrder,
+) -> Result<(), String> {
+    let _turn = order.wait();
+    crate::xmp::write_iptc(original, before, after)
 }
 
 #[cfg(test)]
@@ -148,5 +167,33 @@ mod tests {
             assert_eq!(iptc(&xml), expected, "{layout}:\n{xml}");
             assert_non_iptc_intact(&xml, layout);
         }
+    }
+
+    /// Issue #149, probe P2: two overlapping saves of one photo. The first stores t1; before
+    /// its sidecar write runs, a second stores t2 and a creator and goes to write. The second
+    /// must wait for the first, so the sidecar ends where the catalog does — t2 — instead of
+    /// the first save's late write putting t1 back.
+    #[test]
+    fn overlapping_saves_write_the_sidecar_in_the_order_they_stored() {
+        let (_dir, state, id, xmp) = foreign_photo("iptc-149-order", crate::xmp::test_fixtures::LIGHTROOM);
+        let state = std::sync::Arc::new(state);
+        let first = IptcFields { title: "t1".into(), ..Default::default() };
+        let (original, before, order) = with_catalog(&state, |c| store(c, id, &first)).unwrap();
+
+        let second = IptcFields { title: "t2".into(), creator: "c".into(), ..Default::default() };
+        let later = {
+            let (state, second) = (state.clone(), second.clone());
+            std::thread::spawn(move || save_iptc(&state, id, &second))
+        };
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(!later.is_finished(), "the later save must wait for the earlier one's write");
+        write(&original, &before, &first, order).unwrap();
+        later.join().unwrap().unwrap();
+
+        let xml = read(&xmp);
+        let expected = with(with(foreign_iptc(), "dc:title", &["t2"]), "dc:creator", &["c"]);
+        assert_eq!(iptc(&xml), expected, "the sidecar must end on the newest save:\n{xml}");
+        let stored = state.catalog.lock().unwrap().as_ref().unwrap().get_iptc(id).unwrap();
+        assert_eq!(stored, second);
     }
 }

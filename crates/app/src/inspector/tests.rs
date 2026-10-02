@@ -967,3 +967,49 @@ impl UpdateInWindow for Entity<PhotoInspector> {
         cx.run_until_parked();
     }
 }
+
+/// While Compare is open the inspector shows its focused pane, not the active photo
+/// (`shellTarget.ts`, #110), and its marks land on that pane; closing Compare hands it back.
+#[gpui_kit::test]
+fn the_inspector_follows_compares_focused_pane(cx: &mut TestAppContext) {
+    let dir = TempDir::new("insp-compare");
+    let app = start(cx);
+    let ids = open_catalog_with_photos(&app, &dir, 4, cx);
+    select(&app, ids[0], SelectMods::default(), cx);
+    app.wired.shell.update(cx, |s, cx| s.select_with(cx, |l| l.select_all()));
+    cx.run_until_parked();
+    let active = app.wired.shell.read_with(cx, |s, _| s.library.selection().active_id);
+    crate::tests::press(&app, "c", cx);
+    let shown = |cx: &mut TestAppContext| {
+        render(&app, cx);
+        inspector(&app, cx).read_with(cx, |i, _| i.photo_id)
+    };
+    let first = app.wired.shell.read_with(cx, |s, _| s.compare_focused()).expect("Compare is open");
+    assert_eq!(shown(cx), Some(first));
+    // Move the focus to a pane that is not the active photo.
+    let mut next = first;
+    for _ in 0..4 {
+        crate::tests::press(&app, "down", cx);
+        next = app.wired.shell.read_with(cx, |s, _| s.compare_focused()).unwrap();
+        if Some(next) != active {
+            break;
+        }
+    }
+    assert_ne!(Some(next), active, "the focus is not the active photo");
+    assert_eq!(shown(cx), Some(next), "follows the focus");
+
+    click(&app, "star-4", cx);
+    let rating = |id: i64| {
+        let guard = app.state.catalog.lock().unwrap();
+        guard.as_ref().unwrap().get_photo(id).unwrap().rating
+    };
+    assert_eq!(rating(next), 4, "the pane shown is rated");
+    assert_eq!(rating(active.unwrap()), 0);
+
+    // The click took focus to the inspector; close Compare as its Escape does.
+    app.wired.shell.update(cx, |s, cx| s.close_compare(cx));
+    cx.run_until_parked();
+    let active_now = app.wired.shell.read_with(cx, |s, _| s.library.selection().active_id);
+    assert!(active_now.is_some() && active_now != Some(next), "{active_now:?} vs the pane {next}");
+    assert_eq!(shown(cx), active_now, "the active photo again");
+}

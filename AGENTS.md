@@ -38,7 +38,13 @@ Read only the documents triggered by the task:
 ### Photo identity
 
 - Assign every photo a UUID v4 on first import.
-- Persist it in both SQLite and `xmp:Identifier`; never skip the sidecar write.
+- One exception: a non-UUID value that already served as a photo's identity (a foreign
+  DAM id from a sidecar, an old bundle, or a pre-#141 catalog) is re-minted as
+  `catalog::legacy_photo_identity`, a UUID v5 under the fixed `LEGACY_IDENTITY_NAMESPACE`,
+  which must never change, so independent catalogs agree on it. See
+  `docs/storage-and-import.md`.
+- Store identities lowercase; never store a non-UUID or blank `photos.uuid`.
+- Persist the identity in both SQLite and `xmp:Identifier`; never skip the sidecar write.
 - Catalog merge matches photos by UUID, not path.
 
 ### Paths and storage

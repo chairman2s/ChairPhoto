@@ -47,6 +47,8 @@ pub mod dev_module;
 pub mod collage;
 #[cfg(any(feature = "slideshow", feature = "collage"))]
 pub mod dialog;
+#[cfg(feature = "faces")]
+pub mod faces;
 #[cfg(feature = "map")]
 pub mod map;
 #[cfg(feature = "slideshow")]
@@ -402,6 +404,8 @@ pub fn bundled() -> Vec<Rc<dyn Module>> {
     modules.push(Rc::new(slideshow::SlideshowModule::default()));
     #[cfg(feature = "map")]
     modules.push(Rc::new(map::MapModule));
+    #[cfg(feature = "faces")]
+    modules.push(Rc::new(faces::FacesModule));
     #[cfg(feature = "tag-graph")]
     modules.push(Rc::new(tag_graph::TagGraphModule));
     modules

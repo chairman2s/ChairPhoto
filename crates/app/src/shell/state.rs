@@ -11,11 +11,12 @@
 //! `catalog:switched` first drops everything that named the old catalog. Each read carries a
 //! generation; a result a newer read superseded is dropped.
 //!
-//! **Not persisted yet.** React kept the layout in localStorage (`panel.leftW`,
+//! **Persisted per machine.** The layout React kept in localStorage (`panel.leftW`,
 //! `panel.rightW`, `panel.leftHidden`, `panel.rightHidden`, `panel.thumbSize`,
-//! `panel.inspectorTab`, `panel.section.*`). The per-machine store for them exists now
-//! ([`crate::machine_prefs::MachinePrefs`], #113, which holds the appearance mode), but these
-//! keys are not written to it yet, so they start at React's defaults each launch.
+//! `panel.inspectorTab`, `panel.section.*`) is restored from
+//! [`crate::machine_prefs::MachinePrefs`] when this entity is built and written back when it
+//! changes, under the same keys with the same values ([`super::layout_prefs`]). A column
+//! width is written when its drag ends ([`ShellState::persist_layout`]), not per pointer move.
 
 use crate::loupe::card::{LoupeCard, ShownCard};
 use crate::loupe::compare::{CompareMode, CompareSession, Verdict};
@@ -452,15 +453,17 @@ impl ShellState {
             AppModelEvent::Core(event) => this.on_core_event(event, cx),
             AppModelEvent::DeepLink(target) => this.apply_deep_link(target.clone(), cx),
         });
+        // The layout this machine left last time (React's localStorage reads).
+        let restored = super::layout_prefs::restore(|key| crate::machine_prefs::MachinePrefs::read(cx, key));
         ShellState {
             app,
-            layout: Layout::default(),
+            layout: restored.layout,
             narrow: false,
             surface: Surface::Library,
             library: LibrarySession::new(),
             cache_previews: true,
-            inspector_tab: InspectorTab::Details,
-            sections_open: [true; 4],
+            inspector_tab: restored.inspector_tab,
+            sections_open: restored.sections_open,
             jobs: Jobs::default(),
             lists: Lists::default(),
             counts: Counts::default(),
@@ -493,6 +496,14 @@ impl ShellState {
 
     // --- layout ----------------------------------------------------------------------
 
+    /// Write the layout to the per-machine preferences (React's effect over `panel.*`). Only
+    /// changed values are written; the narrow overlays are never stored.
+    pub fn persist_layout(&self, cx: &mut Context<Self>) {
+        for (key, value) in super::layout_prefs::layout_entries(&self.layout, self.inspector_tab) {
+            crate::machine_prefs::MachinePrefs::set(cx, key, &value);
+        }
+    }
+
     /// `[` and More ⋯ → View → "Tags & collections panel". Narrow: the overlay.
     pub fn toggle_panel(&mut self, side: Side, cx: &mut Context<Self>) {
         let l = &mut self.layout;
@@ -502,6 +513,7 @@ impl ShellState {
             (Side::Right, true) => l.overlay_right = !l.overlay_right,
             (Side::Right, false) => l.right_hidden = !l.right_hidden,
         }
+        self.persist_layout(cx);
         cx.notify();
     }
 
@@ -515,6 +527,7 @@ impl ShellState {
             (Side::Right, true) => l.overlay_right = false,
             (Side::Right, false) => l.right_hidden = true,
         }
+        self.persist_layout(cx);
         cx.notify();
     }
 
@@ -553,6 +566,7 @@ impl ShellState {
         let v = snap_thumb(v);
         if self.layout.thumb_size != v {
             self.layout.thumb_size = v;
+            self.persist_layout(cx);
             cx.notify();
         }
     }
@@ -564,11 +578,14 @@ impl ShellState {
     pub fn toggle_section(&mut self, section: Section, cx: &mut Context<Self>) {
         let open = &mut self.sections_open[section.index()];
         *open = !*open;
+        let value = super::layout_prefs::section_value(*open);
+        crate::machine_prefs::MachinePrefs::set(cx, &super::layout_prefs::section_key(section), value);
         cx.notify();
     }
 
     pub fn set_inspector_tab(&mut self, tab: InspectorTab, cx: &mut Context<Self>) {
         self.inspector_tab = tab;
+        self.persist_layout(cx);
         cx.notify();
     }
 
@@ -879,11 +896,18 @@ impl ShellState {
         self.rows_pending = Some(request.generation);
         let state = self.app.clone();
         let query = request.query.clone();
+        // Timed while a Develop → Library transition is recorded (`shell::timing`).
+        let span = super::timing::ShellTimer::begin_invoke(cx);
         let read =
             cx.background_executor().spawn(async move { with_catalog_identified(&state, |c| c.photo_page(&query)) });
         cx.spawn(async move |this, cx| {
             let page = read.await;
-            this.update(cx, |s, cx| s.on_page(&request, page, cx)).ok();
+            this.update(cx, |s, cx| {
+                let rows = page.as_ref().ok().map(|(_, p)| p.photos.len());
+                super::timing::ShellTimer::end_invoke(span, "list_photos", rows, cx);
+                s.on_page(&request, page, cx)
+            })
+            .ok();
         })
         .detach();
     }

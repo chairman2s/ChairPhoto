@@ -1,0 +1,312 @@
+//! Headless tests of the shell's per-machine layout, the panel keys' scope and the shell
+//! timing host (#159), through the real wiring (`start` → `wire` → the main window).
+
+use crate::machine_prefs::{MachinePrefs, FILE_NAME};
+use crate::shell::actions::{StartCullSession, ToggleLeftPanel};
+use crate::shell::state::{InspectorTab, Section, Side, Surface};
+use crate::shell::timing::ShellTimer;
+use crate::storage::Runner;
+use crate::tests::{click, open_catalog_with_photos, press, start, start_with_options, App, TempDir};
+use crate::WireOptions;
+use chairphoto_model::shell_timing::SHELL_TIMING_KEY;
+use gpui_kit::test::TestWindowExt as _;
+use gpui_kit::{point, px, AppContext as _, TestAppContext};
+use std::collections::BTreeMap;
+use std::path::PathBuf;
+use std::time::Duration;
+
+/// Run every queued storage job (here: preference writes, setting writes), then let the UI
+/// take the results.
+fn work(cx: &mut TestAppContext) -> usize {
+    let mut total = 0;
+    loop {
+        let ran = cx.update(|cx| Runner::get(cx).run_pending());
+        cx.run_until_parked();
+        if ran == 0 {
+            return total;
+        }
+        total += ran;
+    }
+}
+
+fn pending(cx: &mut TestAppContext) -> usize {
+    cx.update(|cx| Runner::get(cx).pending())
+}
+
+fn visible(app: &App, side: Side, cx: &mut TestAppContext) -> bool {
+    app.wired.shell.read_with(cx, |s, _| s.panel_visible(side))
+}
+
+/// The preference file as it is on disk now.
+fn on_disk(path: &PathBuf) -> BTreeMap<String, String> {
+    serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+}
+
+/// The app with this machine's preferences read from `path`.
+fn start_with_prefs(path: &PathBuf, cx: &mut TestAppContext) -> App {
+    let prefs = MachinePrefs::load(path.clone());
+    start_with_options(cx, move |o| WireOptions { machine_prefs: prefs, ..o })
+}
+
+// --- layout persistence -----------------------------------------------------------------
+
+/// What the last session left in `machine-prefs.json` is what the shell opens with: React's
+/// keys and values (`panel.*`, `panel.section.*`, `inspector.section.*`).
+#[gpui_kit::test]
+fn the_layout_opens_as_this_machine_left_it(cx: &mut TestAppContext) {
+    let dir = TempDir::new("layout-restore");
+    let path = dir.0.join(FILE_NAME);
+    let stored = serde_json::json!({
+        "panel.leftW": "250",
+        "panel.rightW": "333.5",
+        "panel.leftHidden": "0",
+        "panel.rightHidden": "1",
+        "panel.thumbSize": "200",
+        "panel.inspectorTab": "tags",
+        "panel.section.albums": "0",
+        "inspector.section.iptc": "1",
+        "inspector.section.stack": "0",
+    });
+    std::fs::write(&path, stored.to_string()).unwrap();
+    let app = start_with_prefs(&path, cx);
+    app.wired.shell.read_with(cx, |s, _| {
+        assert_eq!((s.layout.left_w, s.layout.right_w), (250., 333.5));
+        assert!(!s.layout.left_hidden && s.layout.right_hidden);
+        assert_eq!(s.layout.thumb_size, 200.);
+        assert_eq!(s.inspector_tab, InspectorTab::Tags);
+        assert!(!s.section_open(Section::Albums), "panel.section.albums = 0");
+        assert!(s.section_open(Section::Tags), "an unset section is open");
+    });
+    let root = app.wired.root.clone().unwrap();
+    let inspector = root.read_with(cx, |r, _| r.inspector.clone());
+    inspector.read_with(cx, |i, _| {
+        use crate::inspector::Section as S;
+        assert!(i.section_open(S::Iptc), "inspector.section.iptc = 1");
+        assert!(!i.section_open(S::Stack) && !i.section_open(S::Metadata), "the rest collapsed");
+    });
+    // The thumbnail slider starts where the size is.
+    let slider = root.read_with(cx, |r, _| r.thumb_slider.clone());
+    assert_eq!(slider.read_with(cx, |s, _| s.value().start()), 200.);
+    assert_eq!(pending(cx), 0, "opening writes nothing");
+}
+
+/// Each change writes its key with React's value, off the UI thread; the narrow overlays are
+/// never stored; a column drag writes once, when it ends.
+#[gpui_kit::test]
+fn layout_changes_are_written_with_reacts_keys(cx: &mut TestAppContext) {
+    let dir = TempDir::new("layout-write");
+    let path = dir.0.join(FILE_NAME);
+    let app = start_with_prefs(&path, cx);
+
+    press(&app, "[", cx);
+    assert!(!visible(&app, Side::Left, cx));
+    assert!(!path.exists(), "nothing written on the UI thread");
+    work(cx);
+    assert_eq!(on_disk(&path).get("panel.leftHidden").map(String::as_str), Some("1"));
+
+    app.wired.shell.update(cx, |s, cx| {
+        s.toggle_section(Section::SmartAlbums, cx);
+        s.set_inspector_tab(InspectorTab::Versions, cx);
+        s.set_thumb_size(248., cx);
+    });
+    let root = app.wired.root.clone().unwrap();
+    let inspector = root.read_with(cx, |r, _| r.inspector.clone());
+    inspector.update(cx, |i, cx| i.toggle_section(crate::inspector::Section::Metadata, cx));
+    work(cx);
+    let disk = on_disk(&path);
+    assert_eq!(disk.get("panel.section.smartAlbums").map(String::as_str), Some("0"));
+    assert_eq!(disk.get("panel.inspectorTab").map(String::as_str), Some("versions"));
+    assert_eq!(disk.get("panel.thumbSize").map(String::as_str), Some("248"));
+    assert_eq!(disk.get("inspector.section.metadata").map(String::as_str), Some("1"));
+    assert_eq!(disk.get("panel.rightHidden").map(String::as_str), Some("0"));
+
+    // Narrow: `[` opens an overlay, which is never stored.
+    app.wired.shell.update(cx, |s, cx| {
+        s.set_narrow(true);
+        s.toggle_panel(Side::Right, cx);
+    });
+    assert!(visible(&app, Side::Right, cx), "the overlay opened");
+    work(cx);
+    assert_eq!(on_disk(&path).get("panel.rightHidden").map(String::as_str), Some("0"), "the desktop preference");
+    app.wired.shell.update(cx, |s, _| s.set_narrow(false));
+
+    // Show the left column again, then drag its edge 40 px wider.
+    press(&app, "[", cx);
+    work(cx);
+    let w0 = app.wired.shell.read_with(cx, |s, _| s.layout.left_w);
+    cx.update_window(app.window(), |_, window, cx| {
+        window.render_frame(cx);
+        // The drag handle straddles the column's inner edge.
+        let column = window.find("left-column").bounds();
+        let from = point(column.origin.x + column.size.width - px(2.), column.center().y);
+        window.drag(from, point(from.x + px(40.), from.y), cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    let w1 = app.wired.shell.read_with(cx, |s, _| s.layout.left_w);
+    assert_eq!(w1, w0 + 40., "the drag widened the column");
+    assert_eq!(pending(cx), 1, "one write for the whole drag, not one per pointer move");
+    work(cx);
+    assert_eq!(on_disk(&path).get("panel.leftW"), Some(&w1.to_string()));
+
+    // A fresh launch on the same file opens with all of it.
+    let again = MachinePrefs::load(path.clone());
+    let restored = crate::shell::layout_prefs::restore(|k| again.get(k).map(str::to_string));
+    assert_eq!(restored.layout.left_w, w1);
+    assert_eq!(restored.inspector_tab, InspectorTab::Versions);
+    assert!(!restored.sections_open[1]);
+}
+
+// --- panel keys -------------------------------------------------------------------------
+
+/// React's window handler was off in module views: `[`/`]` do nothing while a module's main
+/// view is on the stage, and work again back in the Library.
+#[gpui_kit::test]
+fn panel_keys_are_off_in_a_module_view(cx: &mut TestAppContext) {
+    let dir = TempDir::new("keys-module");
+    let app = start(cx);
+    open_catalog_with_photos(&app, &dir, 1, cx);
+    cx.update(|cx| crate::modules::ModuleRegistry::enable(&app.wired.modules, crate::modules::dev_module::DEV_MODULE_ID, cx));
+    cx.run_until_parked();
+    click(&app, "rail-view-dev-view", cx);
+    assert_eq!(app.wired.shell.read_with(cx, |s, _| s.surface.clone()), Surface::Module("dev-view".into()));
+    press(&app, "[", cx);
+    press(&app, "]", cx);
+    assert!(visible(&app, Side::Left, cx) && visible(&app, Side::Right, cx), "[ or ] toggled a column in a module view");
+
+    // The View menu still toggles: it dispatches the action, not the key.
+    cx.update_window(app.window(), |_, window, cx| window.dispatch_action(Box::new(ToggleLeftPanel), cx)).unwrap();
+    cx.run_until_parked();
+    assert!(!visible(&app, Side::Left, cx), "the menu's toggle works in a module view");
+
+    click(&app, "rail-library", cx);
+    press(&app, "[", cx);
+    assert!(visible(&app, Side::Left, cx), "back in the Library, [ toggles again");
+}
+
+/// The cull session too.
+#[gpui_kit::test]
+fn panel_keys_are_off_in_a_cull_session(cx: &mut TestAppContext) {
+    let dir = TempDir::new("keys-cull");
+    let app = start(cx);
+    open_catalog_with_photos(&app, &dir, 2, cx);
+    cx.update_window(app.window(), |_, window, cx| window.dispatch_action(Box::new(StartCullSession), cx)).unwrap();
+    cx.run_until_parked();
+    assert!(app.wired.root.as_ref().unwrap().read_with(cx, |r, _| r.cull().is_some()), "the session opened");
+    press(&app, "[", cx);
+    assert!(visible(&app, Side::Left, cx), "[ toggled a column under the cull session");
+}
+
+/// And the Darkroom: its key context mutes them, also after a title-bar menu has taken focus
+/// back to the root (React checked the surface, not the focus).
+#[cfg(feature = "edit")]
+#[gpui_kit::test]
+fn panel_keys_are_off_in_the_darkroom(cx: &mut TestAppContext) {
+    let dir = TempDir::new("keys-darkroom");
+    let app = start(cx);
+    let ids = open_catalog_with_photos(&app, &dir, 1, cx);
+    app.wired.shell.update(cx, |s, cx| {
+        s.select_with(cx, |l| l.select(ids[0], chairphoto_model::library::session::SelectMods::default()))
+    });
+    click(&app, "rail-develop", cx);
+    assert_eq!(app.wired.shell.read_with(cx, |s, _| s.surface.clone()), Surface::Develop);
+    press(&app, "[", cx);
+    assert!(visible(&app, Side::Left, cx), "[ toggled the left column in the Darkroom");
+
+    // Focus lands on the root itself (a menu's action context, a dialog closing) with no
+    // shell change to wake the Darkroom's own focus: the root hands it back to the Darkroom.
+    cx.update_window(app.window(), |_, window, _| window.activate_window()).unwrap();
+    cx.run_until_parked();
+    let root = app.wired.root.clone().unwrap();
+    cx.update_window(app.window(), |_, window, cx| {
+        let focus = root.read(cx).focus_handle().clone();
+        focus.focus(window, cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(app.window(), |_, window, cx| window.render_frame(cx)).unwrap();
+    let darkroom = root.read_with(cx, |r, _| r.darkroom.clone());
+    let focused = cx
+        .update_window(app.window(), |_, window, cx| darkroom.read(cx).focus_handle().contains_focused(window, cx))
+        .unwrap();
+    assert!(focused, "the Darkroom has the keys again after the root took focus");
+    press(&app, "[", cx);
+    assert!(visible(&app, Side::Left, cx), "[ toggled the left column after the root took focus");
+}
+
+// --- shell timing -----------------------------------------------------------------------
+
+fn written(cx: &mut TestAppContext) -> Vec<String> {
+    cx.update(|cx| cx.global::<ShellTimer>().written.clone())
+}
+
+fn stored(app: &App) -> Option<String> {
+    app.state.catalog.lock().unwrap().as_ref().unwrap().get_setting(SHELL_TIMING_KEY).unwrap()
+}
+
+/// With `editor.renderTiming` on, leaving the Darkroom records Develop → Library: the started
+/// marker at once, then — once no tile has loaded for the quiet time — the summary with the
+/// grid's first render and its tiles, both written to the catalog off the UI thread.
+#[gpui_kit::test]
+fn a_develop_to_library_transition_is_timed_and_stored(cx: &mut TestAppContext) {
+    let dir = TempDir::new("shell-timing");
+    let app = start(cx);
+    open_catalog_with_photos(&app, &dir, 3, cx);
+    // Off: nothing.
+    let from = app.wired.shell.read_with(cx, |s, _| s.rows_from());
+    cx.update(|cx| ShellTimer::leave("develop", from, cx));
+    assert!(written(cx).is_empty(), "the instrument is off by default");
+
+    cx.update(|cx| {
+        ShellTimer::set_enabled(true, cx);
+        ShellTimer::leave("develop", from, cx);
+    });
+    assert_eq!(written(cx), [r#"{"from":"develop","started":true}"#]);
+    work(cx);
+    assert_eq!(stored(&app).as_deref(), Some(r#"{"from":"develop","started":true}"#), "the marker is in the catalog");
+
+    // The grid renders (its "commit"), building its three tiles; the rows are re-read.
+    app.wired.shell.update(cx, |s, cx| s.refresh_rows(cx));
+    cx.update_window(app.window(), |_, window, cx| window.render_frame(cx)).unwrap();
+    cx.run_until_parked();
+    let t = cx.update(|cx| ShellTimer::current(cx)).unwrap();
+    assert!(t.commit_at.is_some(), "the grid's first render after Back");
+    assert_eq!(t.tiles_mounted, 3);
+    assert!(t.marks.contains("timeout0"));
+    assert!(!t.finished);
+
+    cx.executor().advance_clock(Duration::from_millis(9_000));
+    cx.run_until_parked();
+    assert_eq!(written(cx).len(), 1, "still inside the quiet time");
+    cx.executor().advance_clock(Duration::from_millis(1_100));
+    cx.run_until_parked();
+    let w = written(cx);
+    assert_eq!(w.len(), 2, "the summary: {w:?}");
+    let summary: serde_json::Value = serde_json::from_str(&w[1]).unwrap();
+    assert_eq!(summary["from"], "develop");
+    assert_eq!(summary["tilesMounted"], 3);
+    assert!(summary["toCommitMs"].is_number(), "{summary}");
+    assert!(!cx.update(|cx| ShellTimer::live(cx)));
+    work(cx);
+    assert_eq!(stored(&app).as_deref(), Some(w[1].as_str()), "the summary is in the catalog");
+}
+
+/// The Darkroom's switch turns the instrument on, and its ← Library starts the transition.
+#[cfg(feature = "edit")]
+#[gpui_kit::test]
+fn the_darkrooms_back_starts_the_transition(cx: &mut TestAppContext) {
+    let dir = TempDir::new("shell-timing-back");
+    let app = start(cx);
+    let ids = open_catalog_with_photos(&app, &dir, 1, cx);
+    app.state.catalog.lock().unwrap().as_ref().unwrap().set_setting("editor.renderTiming", "1").unwrap();
+    app.wired.shell.update(cx, |s, cx| {
+        s.select_with(cx, |l| l.select(ids[0], chairphoto_model::library::session::SelectMods::default()))
+    });
+    click(&app, "rail-develop", cx);
+    work(cx); // the Darkroom's settings read
+    click(&app, "dk-back", cx);
+    assert_eq!(app.wired.shell.read_with(cx, |s, _| s.surface.clone()), Surface::Library);
+    assert_eq!(written(cx), [r#"{"from":"develop","started":true}"#]);
+    assert!(cx.update(|cx| ShellTimer::live(cx)));
+}

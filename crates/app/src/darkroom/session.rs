@@ -649,6 +649,9 @@ impl Darkroom {
                     }
                     this.wb_prefer = WbPrefer::from_setting(wb.as_deref());
                     this.timing_log = timing.as_deref() == Some("1");
+                    // The same switch times Develop → Library (DarkroomView.tsx's
+                    // `setShellTimingEnabled`).
+                    crate::shell::timing::ShellTimer::set_enabled(this.timing_log, cx);
                     if let Some(o) = overlay.as_deref().and_then(CropOverlay::from_key) {
                         this.overlay = o;
                     }

@@ -18,6 +18,7 @@
 
 use crate::image_store::{ImageState, ImageStore};
 use crate::keymap::contexts;
+use crate::shell::timing::ShellTimer;
 use crate::library::layout::{self, GAP, NAME_H, OVERSCAN_ROWS};
 use crate::library::*;
 use crate::shell::actions::{OpenCompare, ToggleLoupe};
@@ -251,6 +252,12 @@ impl LibraryView {
             .collect();
         let images: Vec<ImageState> =
             self.images.update(cx, |store, _| tiles.iter().map(|t| store.get(t.id, ImageKind::Thumb)).collect());
+        // A Develop → Library transition counts the tiles built and painted (`shell::timing`).
+        if ShellTimer::live(cx) {
+            for (tile, image) in tiles.iter().zip(&images) {
+                ShellTimer::note_tile(tile.id, matches!(image, ImageState::Ready(_)), cx);
+            }
+        }
 
         let mut tiles = tiles.into_iter().zip(images);
         range
@@ -538,6 +545,8 @@ fn tip(text: String) -> impl Fn(&mut Window, &mut gpui_kit::App) -> gpui_kit::An
 
 impl Render for LibraryView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Its own cost, for a Develop → Library transition's "commit" (`shell::timing`).
+        let began = std::time::Instant::now();
         let colors = Colors::get(cx);
         let shell = self.shell.read(cx);
         let n = shell.library.photos().len();
@@ -607,6 +616,7 @@ impl Render for LibraryView {
             // No list is drawn, so `on_visible` never runs to release the last window: the
             // thumbnails it asked for would stay queued for tiles that are gone.
             self.release_requested(cx);
+            ShellTimer::note_grid_commit(began.elapsed().as_secs_f64() * 1000.0, cx);
             return root
                 .items_center()
                 .justify_center()
@@ -638,6 +648,7 @@ impl Render for LibraryView {
             if self.scrolled_for != Some((a, cols)) {
                 if let Some(ix) = active_index {
                     self.scroll.scroll_to_item(ix / cols, ScrollStrategy::Nearest);
+                    ShellTimer::note_grid_scroll(cx);
                 }
                 self.scrolled_for = Some((a, cols));
             }
@@ -653,6 +664,7 @@ impl Render for LibraryView {
         .flex_1()
         .min_h_0()
         .w_full();
+        ShellTimer::note_grid_commit(began.elapsed().as_secs_f64() * 1000.0, cx);
         root.px(px(12.)).pt(px(8.)).child(list)
     }
 }

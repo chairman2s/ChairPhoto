@@ -229,6 +229,7 @@ pub fn wire(
     })
     .detach();
 
+    shell::timing::ShellTimer::install(state.clone(), cx);
     let model = cx.new(|_| AppModel::new(state, pool.clone()));
     events::spawn_router(events_rx, model.clone(), cx).detach();
     let shell = cx.new(|cx| shell::ShellState::new(&model, cx));

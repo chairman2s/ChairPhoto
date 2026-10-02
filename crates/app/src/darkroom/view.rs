@@ -513,6 +513,9 @@ impl DarkroomView {
             .border_b_1()
             .border_color(colors.line)
             .child(clickable(chip("dk-back", "← Library", true, colors), true, move |_, _, cx| {
+                // DarkroomView.tsx's `markShellLeave("develop")` before `onBack()`.
+                let rows_from = shell.read(cx).rows_from();
+                crate::shell::timing::ShellTimer::leave("develop", rows_from, cx);
                 shell.update(cx, |s, cx| s.show_library(cx))
             }))
             .child(div().text_size(px(13.)).font_weight(FontWeight::SEMIBOLD).child("Darkroom"))
@@ -1071,7 +1074,7 @@ impl Render for DarkroomView {
         let overlay = self.rails.overlay_element();
         div()
             .id("darkroom")
-            .key_context("Darkroom")
+            .key_context(crate::keymap::contexts::DARKROOM)
             .relative()
             .track_focus(&self.focus)
             .on_key_down(cx.listener(|this, e: &KeyDownEvent, window, cx| this.on_key(e, window, cx)))

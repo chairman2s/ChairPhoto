@@ -291,7 +291,7 @@ pub fn blob_to_embedding(blob: &[u8]) -> Result<Vec<f32>, String> {
 }
 
 /// One face row as returned to the frontend.
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FaceForPhoto {
     pub id: i64,
@@ -307,7 +307,7 @@ pub struct FaceForPhoto {
 
 /// Normalized bbox as a typed object for the frontend (`{x,y,w,h}`). The DB stores
 /// this as a `[x,y,w,h]` JSON array; we deserialize then re-serialize as an object.
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct FaceBboxJson {
     pub x: f32,
     pub y: f32,

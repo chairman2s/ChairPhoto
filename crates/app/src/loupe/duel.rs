@@ -62,27 +62,28 @@ impl VariantSource {
     }
 }
 
-/// A variant cell's picture: the render, "Rendering…", or the error.
-pub fn variant_image(state: RenderState, loading: &'static str, colors: Colors) -> AnyElement {
+/// What a variant cell shows in place of its picture (`RenderedImage.tsx`): `loading` while it
+/// renders, a quiet "—" once it failed (React showed no error text there), nothing once ready.
+pub fn variant_placeholder(state: &RenderState, loading: &'static str) -> Option<&'static str> {
     match state {
-        RenderState::Ready(image) => img(image).size_full().object_fit(ObjectFit::Contain).into_any_element(),
-        RenderState::Failed(e) => div()
-            .size_full()
-            .flex()
-            .items_center()
-            .justify_center()
-            .text_size(px(11.))
-            .text_color(colors.danger)
-            .child(e)
-            .into_any_element(),
-        _ => div()
+        RenderState::Ready(_) => None,
+        RenderState::Failed(_) => Some("—"),
+        RenderState::Rendering | RenderState::Absent => Some(loading),
+    }
+}
+
+/// A variant cell's picture: the render, or its placeholder ([`variant_placeholder`]).
+pub fn variant_image(state: RenderState, loading: &'static str, colors: Colors) -> AnyElement {
+    match (variant_placeholder(&state, loading), state) {
+        (_, RenderState::Ready(image)) => img(image).size_full().object_fit(ObjectFit::Contain).into_any_element(),
+        (text, _) => div()
             .size_full()
             .flex()
             .items_center()
             .justify_center()
             .text_size(px(12.))
             .text_color(colors.mute)
-            .child(loading)
+            .child(text.unwrap_or_default())
             .into_any_element(),
     }
 }
@@ -341,5 +342,19 @@ impl Render for DuelView {
             .child(head)
             .child(panes)
             .test_support()
+    }
+}
+
+#[cfg(test)]
+mod placeholder_tests {
+    use super::*;
+
+    /// `RenderedImage.tsx`: the loading text while a variant renders (or is not wanted yet), a
+    /// quiet "—" when it failed — never the error text (#161) — and nothing once it is ready.
+    #[test]
+    fn a_failed_variant_shows_a_dash_not_its_error() {
+        assert_eq!(variant_placeholder(&RenderState::Failed("decode failed: boom".into()), "Rendering…"), Some("—"));
+        assert_eq!(variant_placeholder(&RenderState::Rendering, "Rendering…"), Some("Rendering…"));
+        assert_eq!(variant_placeholder(&RenderState::Absent, "…"), Some("…"));
     }
 }

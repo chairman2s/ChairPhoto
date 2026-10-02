@@ -856,3 +856,12 @@ fn measure_grid_frame_cost(cx: &mut TestAppContext) {
         frames.last().unwrap()
     );
 }
+
+/// The video badge's tooltip says what a double-click does here — open the loupe, whose button
+/// plays the video — not React's "double-click to play" (#161).
+#[test]
+fn the_video_tooltip_names_the_loupes_play_button() {
+    let tip = crate::library::grid::video_tip();
+    assert_eq!(tip, "Video — double-click to open, then Play in system player");
+    assert!(crate::loupe::view::PLAY_LABEL.ends_with("Play in system player"), "the loupe's button is the one named");
+}

@@ -10,7 +10,7 @@ use super::*;
 use crate::image_tests::{pixels, FakePool};
 use crate::shell::state::Surface;
 use crate::storage::Runner;
-use crate::tests::{click, colliding_catalog, core_switch, open_catalog_with_photos, start, App, TempDir};
+use crate::tests::{click, colliding_catalog, core_switch, open_catalog_with_photos, start_with_pool, App, TempDir};
 use chairphoto_core::app::{CoreEvent, EventSink as _, CATALOG_CHANGED};
 use chairphoto_core::catalog::Catalog;
 use chairphoto_core::develop::session::DevelopSourceEvent;
@@ -125,9 +125,11 @@ fn advance(cx: &mut TestAppContext, d: Duration) {
 /// Develop, and its first reads answered.
 fn rig(tag: &str, n: usize, cx: &mut TestAppContext) -> Rig {
     let dir = TempDir::new(tag);
-    let app = start(cx);
-    let ids = open_catalog_with_photos(&app, &dir, n, cx);
+    // The image layer shares the hand-driven pool: the proof sheet, duel and preset cards
+    // render through it.
     let pool = Arc::new(FakePool::default());
+    let app = start_with_pool(cx, pool.clone());
+    let ids = open_catalog_with_photos(&app, &dir, n, cx);
     let rig = Rig { app, dir, ids, pool };
     let luts = rig.dir.0.join("luts");
     std::fs::create_dir_all(&luts).unwrap();
@@ -597,4 +599,404 @@ fn a_lut_import_overtaken_by_a_step_refreshes_the_list_only(cx: &mut TestAppCont
     advance(cx, AUTOSAVE_QUIET);
     work(cx);
     assert!(rig.catalog(|c| c.list_versions(order[1]).unwrap()).is_empty());
+}
+
+// --- the rails (#112) -----------------------------------------------------------------------
+
+impl Rig {
+    fn press(&self, key: &str, cx: &mut TestAppContext) {
+        cx.update_window(self.app.window(), |_, window, cx| {
+            window.render_frame(cx);
+            window.press(key, cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+    }
+
+    /// Run `f` on the view with its window.
+    fn with_view<T>(
+        &self,
+        cx: &mut TestAppContext,
+        f: impl FnOnce(&mut DarkroomView, &mut gpui_kit::Window, &mut gpui_kit::Context<DarkroomView>) -> T,
+    ) -> T {
+        let view = self.view(cx);
+        let out = cx.update_window(self.app.window(), |_, window, cx| view.update(cx, |v, cx| f(v, window, cx))).unwrap();
+        cx.run_until_parked();
+        out
+    }
+
+    fn versions(&self) -> Vec<chairphoto_core::catalog::PhotoVersion> {
+        self.catalog(|c| c.list_versions(self.ids[0]).unwrap())
+    }
+
+    fn labels(&self, version: i64) -> (Vec<String>, Option<i64>) {
+        let h = self.catalog(|c| c.version_history(version).unwrap());
+        (h.steps.iter().map(|s| s.label.clone()).collect(), h.head)
+    }
+
+    fn saved(&self, version: i64) -> Value {
+        let v = self.catalog(|c| c.get_version(version).unwrap().unwrap());
+        serde_json::from_str(&v.edit_json).unwrap()
+    }
+
+    fn settle_and_save(&self, cx: &mut TestAppContext) {
+        advance(cx, AUTOSAVE_QUIET);
+        work(cx);
+    }
+
+    fn version_id(&self, cx: &mut TestAppContext) -> Option<i64> {
+        self.darkroom(cx).read_with(cx, |d, _| d.open.as_ref().unwrap().version_id)
+    }
+
+    fn presets_setting(&self) -> Option<Value> {
+        self.catalog(|c| c.get_setting(chairphoto_model::presets::USER_PRESETS_KEY).unwrap())
+            .map(|t| serde_json::from_str(&t).unwrap())
+    }
+}
+
+/// Ctrl+Z / Ctrl+Shift+Z / Ctrl+Y through the real key path: undo first saves the change not
+/// yet saved (so it can be redone), then steps back; the step's settings go back into the
+/// version; redo walks forward; a new change replaces the undone steps.
+#[gpui_kit::test]
+fn undo_and_redo_walk_the_history_and_save_the_pending_change_first(cx: &mut TestAppContext) {
+    let rig = rig("dk-undo", 1, cx);
+    rig.slide(Control::Tone(ToneKey::Ev), 0.5, cx);
+    rig.settle_and_save(cx);
+    let v = rig.versions()[0].id;
+    rig.slide(Control::Tone(ToneKey::Contrast), 0.3, cx); // pending, not yet saved
+    rig.press("ctrl-z", cx);
+    work(cx);
+    let (labels, head) = rig.labels(v);
+    assert_eq!(labels, ["Before", "Exposure +0.50", "Contrast +0.30"], "the pending change was saved first");
+    assert_eq!(head, Some(1), "then undone");
+    assert_eq!(rig.working(cx)["tone"]["contrast"], json!(0));
+    assert_eq!(rig.working(cx)["tone"]["ev"], json!(0.5));
+    assert_eq!(rig.saved(v)["tone"]["contrast"], json!(0), "the step's settings are the version's");
+    let active = rig.app.wired.shell.read_with(cx, |s, _| s.active_version().map(|v| v.edit_json.clone()));
+    let active: Value = serde_json::from_str(&active.expect("the shell shows the version")).unwrap();
+    assert_eq!(active["tone"]["contrast"], json!(0), "the shell's copy follows");
+
+    rig.press("ctrl-shift-z", cx);
+    work(cx);
+    assert_eq!(rig.labels(v).1, Some(2));
+    assert_eq!(rig.working(cx)["tone"]["contrast"], json!(0.3));
+    rig.press("ctrl-y", cx);
+    work(cx);
+    assert_eq!(rig.labels(v).1, Some(2), "nothing to redo at the tip");
+
+    // Back two, then a new change: the undone steps are replaced.
+    rig.press("ctrl-z", cx);
+    work(cx);
+    rig.press("ctrl-z", cx);
+    work(cx);
+    assert_eq!(rig.labels(v).1, Some(0));
+    assert_eq!(rig.working(cx), json!({}), "the baseline is the version before its first change");
+    rig.slide(Control::Effect(chairphoto_model::darkroom::controls::EffectKey::Fade), 0.2, cx);
+    rig.settle_and_save(cx);
+    assert_eq!(rig.labels(v), (vec!["Before".to_string(), "Fade 0.20".to_string()], Some(1)));
+    // The panel lists the steps; a click goes to one.
+    assert!(rig.present("dk-step-0", cx));
+    rig.darkroom(cx).update(cx, |d, cx| d.goto_step(0, cx));
+    work(cx);
+    assert_eq!(rig.labels(v).1, Some(0));
+}
+
+/// **Forced interleaving.** Ctrl+Z while the autosave's commit is on the worker: the undo
+/// waits for the commit and steps back from the history it produced — it is not lost, and
+/// it does not run against the history before the save.
+#[gpui_kit::test]
+fn undo_during_a_running_autosave_runs_after_it(cx: &mut TestAppContext) {
+    let rig = rig("dk-undo-chain", 1, cx);
+    rig.slide(Control::Tone(ToneKey::Ev), 0.5, cx);
+    advance(cx, AUTOSAVE_QUIET);
+    assert!(rig.darkroom(cx).read_with(cx, |d, _| d.open.as_ref().unwrap().saving), "the commit is running");
+    rig.press("ctrl-z", cx);
+    work(cx);
+    let v = rig.versions()[0].id;
+    assert_eq!(rig.labels(v), (vec!["Before".to_string(), "Exposure +0.50".to_string()], Some(0)));
+    assert_eq!(rig.working(cx), json!({}));
+    assert_eq!(rig.saved(v), json!({}));
+}
+
+/// The version shelf: "+ New version" copies the settings and continues there; Original shows
+/// the unedited photo and the next change there starts another version; a chip switches back
+/// (saving first); the cover toggles in the catalog.
+#[gpui_kit::test]
+fn the_version_shelf_new_version_switching_and_the_cover(cx: &mut TestAppContext) {
+    let rig = rig("dk-shelf", 1, cx);
+    let photo = rig.ids[0];
+    rig.slide(Control::Tone(ToneKey::Ev), 0.5, cx);
+    rig.settle_and_save(cx);
+    let v1 = rig.versions()[0].id;
+    rig.darkroom(cx).update(cx, |d, cx| d.new_version(cx));
+    work(cx);
+    let vs = rig.versions();
+    assert_eq!(vs.iter().map(|v| v.name.as_str()).collect::<Vec<_>>(), ["Version 1", "Version 2"]);
+    let v2 = vs[1].id;
+    assert_eq!(rig.saved(v2)["tone"]["ev"], json!(0.5), "the settings were copied");
+    assert_eq!(rig.version_id(cx), Some(v2));
+    assert_eq!(rig.app.wired.shell.read_with(cx, |s, _| s.active_version().map(|v| v.id)), Some(v2));
+    assert!(rig.present(&format!("dk-shelf-{v2}"), cx));
+
+    // A change on version 2, then Original: the change is saved to version 2 first.
+    rig.slide(Control::Tone(ToneKey::Contrast), 0.3, cx);
+    rig.darkroom(cx).update(cx, |d, cx| d.switch_version(None, cx));
+    work(cx);
+    assert_eq!(rig.saved(v2)["tone"]["contrast"], json!(0.3));
+    assert_eq!(rig.saved(v1)["tone"]["contrast"], json!(0), "version 1 untouched");
+    assert_eq!(rig.version_id(cx), None);
+    assert_eq!(rig.working(cx), json!({}));
+    // A change on the Original starts "Version 3".
+    rig.slide(Control::Effect(chairphoto_model::darkroom::controls::EffectKey::Fade), 0.2, cx);
+    rig.settle_and_save(cx);
+    assert_eq!(rig.versions().last().unwrap().name, "Version 3");
+
+    // Back to version 1.
+    rig.darkroom(cx).update(cx, |d, cx| d.switch_version(Some(v1), cx));
+    work(cx);
+    assert_eq!(rig.version_id(cx), Some(v1));
+    assert_eq!(rig.working(cx)["tone"]["ev"], json!(0.5));
+    let shown = rig.darkroom(cx).read_with(cx, |d, _| d.open.as_ref().unwrap().history.as_ref().map(|h| h.version_id));
+    assert_eq!(shown, Some(v1), "its history is shown");
+
+    // The cover.
+    rig.darkroom(cx).update(cx, |d, cx| d.toggle_cover(cx));
+    work(cx);
+    assert_eq!(rig.catalog(|c| c.cover_of(photo).unwrap().map(|c| c.0)), Some(v1));
+    assert!(rig.present("dk-cover", cx));
+    rig.darkroom(cx).update(cx, |d, cx| d.toggle_cover(cx));
+    work(cx);
+    assert_eq!(rig.catalog(|c| c.cover_of(photo).unwrap()), None);
+}
+
+/// "Develop with the new engine": an engine-1 version's framing as a fresh engine-2 version
+/// "<name> (RAW)"; the engine-1 version is left as it was.
+#[gpui_kit::test]
+fn develop_with_the_new_engine_forks_the_framing_onto_the_raw(cx: &mut TestAppContext) {
+    let rig = rig("dk-engine", 1, cx);
+    let photo = rig.ids[0];
+    let old = r#"{"tone":{"ev":1},"crop":{"x":0.1,"y":0.1,"w":0.8,"h":0.8},"future":1}"#;
+    let v1 = rig.catalog(|c| {
+        let id = c.create_version(photo, "Mine").unwrap();
+        c.set_version_edit(id, old).unwrap();
+        id
+    });
+    rig.darkroom(cx).update(cx, |d, cx| d.switch_version(Some(v1), cx));
+    work(cx);
+    let source = DevelopSource::Raw {
+        camera: "Sony".into(),
+        megapixels: 61.0,
+        bits: 16,
+        decoder: "0.22".into(),
+        token: Some(format!("w:{photo}:3")),
+        camera_ev: Some(-0.5),
+        as_shot_wb: None,
+        lens: None,
+    };
+    rig.app.state.send(CoreEvent::DevelopSource(DevelopSourceEvent { photo_id: photo, job: 3, source }));
+    cx.run_until_parked();
+    assert!(rig.darkroom(cx).read_with(cx, |d, _| d.open.as_ref().unwrap().engine1_version));
+    assert!(rig.present("dk-new-engine", cx));
+    rig.darkroom(cx).update(cx, |d, cx| d.develop_with_new_engine(cx));
+    work(cx);
+    let vs = rig.versions();
+    let fork = vs.iter().find(|v| v.name == "Mine (RAW)").expect("the fork");
+    let saved: Value = serde_json::from_str(&fork.edit_json).unwrap();
+    assert_eq!(saved, json!({"crop": {"x": 0.1, "y": 0.1, "w": 0.8, "h": 0.8}, "engine": 2, "display": "camera.2", "cameraEv": -0.5}));
+    assert_eq!(rig.catalog(|c| c.get_version(v1).unwrap().unwrap().edit_json), old, "the engine-1 version is untouched");
+    assert_eq!(rig.version_id(cx), Some(fork.id));
+    assert!(!rig.darkroom(cx).read_with(cx, |d, _| d.open.as_ref().unwrap().engine1_version));
+    assert_eq!(rig.last_edit_job().source, SourceToken::Working { photo_id: photo, generation: 3 }, "the stage renders the RAW");
+}
+
+/// Presets: a card applies one named step (framing kept); "Save as preset" stores the look
+/// only; rename and delete rewrite the stored list keeping every other entry as it was.
+#[gpui_kit::test]
+fn presets_apply_save_rename_and_delete_keeping_unknown_data(cx: &mut TestAppContext) {
+    let rig = rig("dk-presets", 1, cx);
+    let theirs = json!({"id": "theirs", "name": "Theirs", "category": "User", "edit": "kept as is", "note": 1});
+    // As TS wrote it back: `loadUserPresets` marks every stored entry `builtin: false`.
+    let theirs_saved = json!({"id": "theirs", "name": "Theirs", "category": "User", "edit": "kept as is", "builtin": false, "note": 1});
+    rig.catalog(|c| c.set_setting(chairphoto_model::presets::USER_PRESETS_KEY, &json!([theirs]).to_string()).unwrap());
+    // Leave and come back so the settings are read again.
+    rig.app.wired.shell.update(cx, |s, cx| s.show_library(cx));
+    cx.run_until_parked();
+    work(cx);
+    rig.app.wired.shell.update(cx, |s, cx| s.open_develop(cx));
+    cx.run_until_parked();
+    work(cx);
+    assert_eq!(rig.darkroom(cx).read_with(cx, |d, _| d.user_presets.len()), 1);
+
+    // A crop first, then a preset: the crop stays.
+    rig.darkroom(cx).update(cx, |d, cx| {
+        let w = d.open.as_ref().unwrap().working.clone();
+        let next = chairphoto_model::darkroom::geometry::apply_aspect(&w, "Free", None).unwrap();
+        d.apply(next, None, cx)
+    });
+    let preset = chairphoto_model::presets::builtin_presets().into_iter().next().unwrap();
+    rig.darkroom(cx).update(cx, |d, cx| d.apply_preset(&preset, cx));
+    rig.settle_and_save(cx);
+    let v = rig.versions()[0].id;
+    assert_eq!(rig.labels(v).0.last().unwrap(), &format!("Preset: {}", preset.name));
+    assert_eq!(rig.working(cx)["crop"]["aspect"], json!("Free"), "framing kept");
+
+    // The browser: opened, the cards ask for their renders.
+    let before = rig.edit_jobs().len();
+    rig.with_view(cx, |v, _, cx| v.set_presets_open(true, cx));
+    assert!(rig.edit_jobs().len() > before, "the cards render");
+    assert!(rig.present(&format!("dk-preset-{}", preset.id), cx));
+
+    // Save as preset, through the name field.
+    rig.with_view(cx, |v, window, cx| v.start_naming(window, cx));
+    let input = rig.view(cx).read_with(cx, |v, _| v.preset_name_input().clone());
+    cx.update_window(rig.app.window(), |_, window, cx| input.update(cx, |i, cx| i.replace_all("  Mine ", window, cx))).unwrap();
+    rig.with_view(cx, |v, window, cx| v.save_preset(window, cx));
+    work(cx);
+    let list = rig.presets_setting().unwrap();
+    assert_eq!(list[0], theirs_saved, "the other preset as stored");
+    assert_eq!(list[1]["name"], json!("Mine"));
+    assert_eq!(list[1]["edit"].get("crop"), None, "a preset holds the look, not the framing");
+    assert!(rig.present("dk-notice", cx));
+    let mine = list[1]["id"].as_str().unwrap().to_string();
+
+    rig.darkroom(cx).update(cx, |d, cx| d.rename_preset(mine.clone(), "Matte".into(), cx));
+    work(cx);
+    let list = rig.presets_setting().unwrap();
+    assert_eq!((list[0].clone(), list[1]["name"].clone()), (theirs_saved.clone(), json!("Matte")));
+    rig.darkroom(cx).update(cx, |d, cx| d.delete_preset(mine, cx));
+    work(cx);
+    assert_eq!(rig.presets_setting().unwrap(), json!([theirs_saved]));
+    assert_eq!(rig.darkroom(cx).read_with(cx, |d, _| d.user_presets.len()), 1);
+}
+
+/// Crop & rotate: an aspect chip fits a crop of that aspect to the frame; the angle slider
+/// straightens with the crop inset; perspective puts the quad up (the stage renders
+/// un-warped), a handle moves a corner, Done renders it warped; each is a history step.
+#[gpui_kit::test]
+fn crop_rotate_and_perspective_change_the_record(cx: &mut TestAppContext) {
+    use chairphoto_model::editing::{Field, QuadCorner};
+    let rig = rig("dk-geometry", 1, cx);
+    advance(cx, SETTLE);
+    let key = rig.pool.last_batch()[0].clone();
+    rig.pool.finish(&key, Ok(pixels(6, 4)));
+    cx.run_until_parked();
+    rig.with_view(cx, |v, _, cx| v.set_aspect("1:1", cx));
+    let crop = rig.working(cx)["crop"].clone();
+    assert_eq!(crop["aspect"], json!("1:1"));
+    let (w, h) = (crop["w"].as_f64().unwrap(), crop["h"].as_f64().unwrap());
+    assert!((w * 6.0 - h * 4.0).abs() < 1e-9, "square on the 6×4 frame: {crop}");
+    assert!(rig.present("dk-crop", cx) && rig.present("dk-crop-se", cx), "the box and its handles are drawn");
+    assert_eq!(parse_edit(Some(&rig.last_edit_job().edit_json)).crop, Field::Absent, "the stage renders without the crop");
+    rig.settle_and_save(cx);
+
+    let slider = rig.view(cx).read_with(cx, |v, _| v.straighten_slider().clone());
+    slider.update(cx, |_, cx| cx.emit(SliderEvent::Change(SliderValue::from(3.0_f32))));
+    cx.run_until_parked();
+    let rec = rig.working(cx);
+    assert_eq!(rec["straighten"], json!(3));
+    assert_eq!(rec["crop"]["aspect"], json!("Original"), "the crop is inset to hide the corners");
+    rig.settle_and_save(cx);
+
+    let d = rig.darkroom(cx);
+    d.update(cx, |d, cx| d.start_perspective(cx));
+    cx.run_until_parked();
+    assert!(d.read_with(cx, |d, _| d.open.as_ref().unwrap().perspective_mode));
+    assert_eq!(rig.working(cx).get("crop"), None, "the crop goes with a new quad");
+    assert!(rig.present("dk-quad-tl", cx));
+    advance(cx, SETTLE);
+    assert_eq!(parse_edit(Some(&rig.last_edit_job().edit_json)).perspective, Field::Absent, "un-warped while the handles are up");
+    rig.with_view(cx, |v, _, cx| v.drag_quad_to(QuadCorner::Tl, 0.2, 0.1, cx));
+    assert_eq!(rig.working(cx)["perspective"]["tl"], json!([0.2, 0.1]));
+    d.update(cx, |d, cx| d.set_perspective_mode(false, cx));
+    advance(cx, SETTLE);
+    assert!(parse_edit(Some(&rig.last_edit_job().edit_json)).perspective.is_set(), "Done: rendered warped");
+    rig.settle_and_save(cx);
+    let v = rig.versions()[0].id;
+    let labels = rig.labels(v).0;
+    assert!(labels.len() >= 4, "crop, straighten and perspective are steps: {labels:?}");
+    assert_eq!(rig.saved(v)["perspective"]["tl"], json!([0.2, 0.1]));
+    d.update(cx, |d, cx| d.clear_perspective(cx));
+    cx.run_until_parked();
+    assert_eq!(rig.working(cx).get("perspective"), None);
+}
+
+/// The proof sheet and the duel mount over the Darkroom: a proof adopts as "Proof: <label>"
+/// and names the next "+ New version"; a duel pick (← with the duel's keys) applies, ⑂ banks
+/// a variant and the duel says so; Esc closes it.
+#[gpui_kit::test]
+fn the_proof_sheet_and_duel_are_mounted_and_feed_the_record(cx: &mut TestAppContext) {
+    use super::view::Overlay;
+    let rig = rig("dk-proof", 2, cx);
+    let photo = rig.open_photo(cx);
+    work(cx); // the auto-tone fragment (unmeasurable here: empty)
+    assert!(rig.darkroom(cx).read_with(cx, |d, _| d.open.as_ref().unwrap().auto_fragment.is_some()));
+    rig.with_view(cx, |v, window, cx| v.open_proof_sheet(window, cx));
+    let sheet = rig.view(cx).read_with(cx, |v, _| match v.overlay() {
+        Some(Overlay::Proof(p)) => p.clone(),
+        _ => panic!("the proof sheet is mounted"),
+    });
+    assert!(rig.present("proof-backdrop", cx));
+    let (i, label) = sheet.read_with(cx, |s, _| {
+        let i = s.candidates().iter().position(|c| c.group == chairphoto_model::darkroom::spreads::ProofGroup::Film).unwrap();
+        (i, s.candidates()[i].label.clone())
+    });
+    sheet.update(cx, |s, cx| s.adopt(i, cx));
+    cx.run_until_parked();
+    assert!(rig.view(cx).read_with(cx, |v, _| v.overlay().is_none()), "closed after adopting");
+    rig.settle_and_save(cx);
+    let v1 = rig.versions()[0].id;
+    assert_eq!(rig.labels(v1).0.last().unwrap(), &format!("Proof: {label}"));
+    rig.darkroom(cx).update(cx, |d, cx| d.new_version(cx));
+    work(cx);
+    assert_eq!(rig.versions().last().unwrap().name, label, "+ New version is named after the proof");
+
+    rig.with_view(cx, |v, window, cx| v.open_duel(window, cx));
+    let duel = rig.view(cx).read_with(cx, |v, _| match v.overlay() {
+        Some(Overlay::Duel(d)) => d.clone(),
+        _ => panic!("the duel is mounted"),
+    });
+    let ev_before = rig.working(cx)["tone"]["ev"].as_f64().unwrap_or(0.0);
+    rig.press("left", cx); // the duel has the keys: the left variant wins round 1
+    let ev_after = rig.working(cx)["tone"]["ev"].as_f64().unwrap();
+    assert!((ev_after - (ev_before - 0.4)).abs() < 1e-9, "{ev_before} → {ev_after}");
+    assert_eq!(duel.read_with(cx, |d, _| d.round()), 2);
+    rig.press("right", cx);
+    assert_eq!(rig.open_photo(cx), photo, "the duel's arrows do not step the filmstrip");
+    assert_eq!(duel.read_with(cx, |d, _| d.round()), 3);
+    duel.update(cx, |d, cx| d.fork(1, cx));
+    work(cx);
+    assert!(rig.versions().iter().any(|v| v.name == "What-if — contrast"), "the variant was banked");
+    assert!(rig.present("duel-note", cx), "the duel says it was kept");
+    rig.press("escape", cx);
+    assert!(rig.view(cx).read_with(cx, |v, _| v.overlay().is_none()));
+}
+
+/// **Catalog identity.** The core switches to a catalog with colliding ids, the event
+/// withheld: a version operation (the cover), a history step and a preset save fail closed
+/// and touch nothing in the new catalog.
+#[gpui_kit::test]
+fn rails_writes_fail_closed_across_a_switch(cx: &mut TestAppContext) {
+    let rig = rig("dk-rails-switch", 1, cx);
+    let photo = rig.ids[0];
+    rig.slide(Control::Tone(ToneKey::Ev), 0.5, cx);
+    rig.settle_and_save(cx);
+    let v = rig.versions()[0].id;
+    let (b, b_ids) = colliding_catalog(&rig.dir, "b", 1);
+    let b_version = b.create_version(b_ids[0], "B's").unwrap();
+    assert_eq!((b_ids[0], b_version), (photo, v), "the ids collide");
+    core_switch(&rig.app, b);
+    rig.darkroom(cx).update(cx, |d, cx| d.toggle_cover(cx));
+    work(cx);
+    let error = rig.darkroom(cx).read_with(cx, |d, _| d.error.clone()).unwrap_or_default();
+    assert!(error.contains(CATALOG_CHANGED), "{error}");
+    rig.darkroom(cx).update(cx, |d, cx| d.goto_step(0, cx));
+    work(cx);
+    rig.darkroom(cx).update(cx, |d, cx| d.save_preset("Mine", cx));
+    work(cx);
+    rig.catalog(|c| {
+        assert_eq!(c.cover_of(photo).unwrap(), None, "no cover set in the new catalog");
+        assert_eq!(c.get_setting(chairphoto_model::presets::USER_PRESETS_KEY).unwrap(), None, "no preset saved there");
+        assert!(c.version_history(v).unwrap().steps.is_empty(), "no step taken there");
+        assert_eq!(c.list_versions(photo).unwrap()[0].edit_json, "{}");
+    });
 }

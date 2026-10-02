@@ -379,8 +379,25 @@ impl<S: JobStatus> JobFamily<S> {
         catalog: &Mutex<Option<Catalog>>,
         build_status: impl FnOnce(u64) -> S,
     ) -> Result<JobClaim<S>, String> {
+        self.begin_as(catalog, None, build_status)
+    }
+
+    /// [`Self::begin`], bound to the catalog a front end showed when the user asked for the
+    /// job: with `expected`, a start that finds another catalog open fails closed with
+    /// [`super::CATALOG_CHANGED`] before its first mutation — nothing tripped, no slot
+    /// claimed, no job id consumed. The identity is checked under the catalog lock the claim
+    /// takes first anyway, so it adds no lock and no switch fits between check and claim.
+    pub fn begin_as(
+        &self,
+        catalog: &Mutex<Option<Catalog>>,
+        expected: Option<super::CatalogIdentity>,
+        build_status: impl FnOnce(u64) -> S,
+    ) -> Result<JobClaim<S>, String> {
         let cat_guard = catalog.lock().map_err(|e| e.to_string())?;
         let c = cat_guard.as_ref().ok_or("No catalog is open")?;
+        if expected.is_some_and(|e| !e.is(c)) {
+            return Err(super::CATALOG_CHANGED.into());
+        }
         let (db_path, root) = (c.db_path().to_path_buf(), c.root().to_path_buf());
 
         let mut abort_guard = self.abort.lock()?;
@@ -406,6 +423,20 @@ impl<S: JobStatus> JobFamily<S> {
     /// Trip the running job's abort flag. The worker stops at its next cancellation point.
     pub fn cancel(&self) -> Result<(), String> {
         self.abort.trip()
+    }
+
+    /// Cancel `job` only: trip the installed flag while the status slot still names `job`,
+    /// checked under the abort and slot locks (the order [`Self::begin`] takes them), so a
+    /// newer job — started by another view, or after a catalog switch — is never stopped by
+    /// a Cancel meant for the one before it. Returns whether `job` was running.
+    pub fn cancel_job(&self, job: u64) -> Result<bool, String> {
+        let abort = self.abort.lock()?;
+        let slot = self.slot.lock().map_err(|e| e.to_string())?;
+        if slot.map(|s| s.job_id()) != Some(job) {
+            return Ok(false);
+        }
+        abort.store(true, Ordering::Relaxed);
+        Ok(true)
     }
 
     /// The running job's status, or `None` when idle — what the `*_index_status` commands

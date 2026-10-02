@@ -24,6 +24,8 @@ pub mod bundles;
 pub mod collage;
 pub mod events;
 pub mod exports;
+#[cfg(feature = "faces")]
+pub mod faces;
 pub mod identity;
 pub mod iptc;
 pub mod jobs;

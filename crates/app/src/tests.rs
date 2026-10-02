@@ -897,6 +897,10 @@ mod smart_tagging_tests;
 #[path = "tags_tests.rs"]
 mod tags_tests;
 
+// The Obsidian module (#128).
+#[path = "obsidian_tests.rs"]
+mod obsidian_tests;
+
 // Albums and export (#115).
 #[path = "albums_tests.rs"]
 mod albums_tests;

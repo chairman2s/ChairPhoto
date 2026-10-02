@@ -38,6 +38,7 @@
 //! returns.
 
 pub mod dialog;
+pub mod obsidian;
 pub mod panel;
 pub mod publishing;
 pub mod registry;
@@ -429,6 +430,7 @@ pub fn bundled() -> Vec<Rc<dyn Module>> {
     modules.push(Rc::new(localsend::LocalSendModule::default()));
     #[cfg(feature = "localsend")]
     modules.push(Rc::new(localsend::SnapchatModule::default()));
+    modules.push(Rc::new(obsidian::ObsidianModule));
     #[cfg(feature = "map")]
     modules.push(Rc::new(map::MapModule));
     #[cfg(feature = "faces")]

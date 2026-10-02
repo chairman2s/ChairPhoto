@@ -123,10 +123,8 @@ pub const LOCATION_CHANGED: &str = "The photo's reachable copy changed while sav
 /// preferred copy came back while this waited — nothing is stored under it (#155 R1):
 /// storing and writing under the old turn would order this write against the wrong
 /// sidecar's writers, so two overlapping saves could each hold a turn while writing the
-/// same file and the older value land last. Instead this turn is released, the new
-/// sidecar's turn ([`WriteOrder::moved_to`], reserved under the lock) waited for with no
-/// lock held, and the resolve is tried again. After [`MAX_MOVES`] moves it fails with
-/// [`LOCATION_CHANGED`], nothing stored.
+/// same file and the older value land last. Instead the turn follows the photo
+/// ([`run_in_turn`]).
 ///
 /// Blocking: call it on a blocking thread, never an async worker (see `xmp::lock`).
 pub(crate) fn store_in_turn<T>(
@@ -136,21 +134,75 @@ pub(crate) fn store_in_turn<T>(
     turn: WriteOrder,
     mut store: impl FnMut(&crate::catalog::Catalog, std::path::PathBuf) -> crate::catalog::Result<T>,
 ) -> Result<(T, WriteOrder), String> {
+    run_in_turn(state, identity, turn, |c, check| {
+        let original = c.require_photo_path(photo_id)?;
+        if !check.holds_for(&original) {
+            return Ok(InTurn::Moved);
+        }
+        Ok(InTurn::Done(store(c, original)?))
+    })
+}
+
+/// What one try under a write turn did: its result, or — the photo's original having
+/// resolved to another sidecar than the turn's ([`TurnCheck::holds_for`] said so) — nothing.
+pub(crate) enum InTurn<T> {
+    Done(T),
+    Moved,
+}
+
+/// The turn check handed to a [`run_in_turn`] step: whether a freshly resolved original
+/// still maps to the sidecar the turn is for.
+pub(crate) struct TurnCheck<'a> {
+    turn: &'a WriteOrder,
+    moved: Option<WriteOrder>,
+}
+
+impl TurnCheck<'_> {
+    /// `true` while `original` maps to the turn's sidecar. Otherwise the new sidecar's turn
+    /// is reserved (never blocks) and `false` returned: the step must then store and write
+    /// nothing and answer [`InTurn::Moved`].
+    pub(crate) fn holds_for(&mut self, original: &std::path::Path) -> bool {
+        match self.turn.moved_to(original) {
+            None => true,
+            Some(next) => {
+                self.moved = Some(next);
+                false
+            }
+        }
+    }
+}
+
+/// Wait for `turn` (no lock held), then run `step` under catalog `identity`'s lock with it
+/// held, returning `step`'s value and the turn to hold across the sidecar write. A step that
+/// resolves the original checks it with [`TurnCheck::holds_for`] before it stores or reads
+/// what to write (#155 R1); when it answers [`InTurn::Moved`], this turn is released, the new
+/// sidecar's turn (reserved under the lock) waited for with no lock held, and the step run
+/// again. After [`MAX_MOVES`] moves it fails with [`LOCATION_CHANGED`], nothing stored.
+///
+/// Used by the IPTC save and the geocoder's fill ([`store_in_turn`]) and by the debt panel's
+/// Retry (`app::iptc_owed`), which writes what is owed without storing.
+///
+/// Blocking: call it on a blocking thread, never an async worker (see `xmp::lock`).
+pub(crate) fn run_in_turn<T>(
+    state: &AppState,
+    identity: CatalogIdentity,
+    turn: WriteOrder,
+    mut step: impl FnMut(&crate::catalog::Catalog, &mut TurnCheck<'_>) -> crate::catalog::Result<InTurn<T>>,
+) -> Result<(T, WriteOrder), String> {
     let mut turn = turn.wait();
     for _ in 0..=MAX_MOVES {
-        let tried = super::with_catalog_as(state, identity, |c| {
-            let original = c.require_photo_path(photo_id)?;
-            Ok(match turn.moved_to(&original) {
-                Some(next) => Err(next),
-                None => Ok(store(c, original)?),
-            })
+        let (tried, moved) = super::with_catalog_as(state, identity, |c| {
+            let mut check = TurnCheck { turn: &turn, moved: None };
+            let tried = step(c, &mut check)?;
+            Ok((tried, check.moved))
         })?;
-        match tried {
-            Ok(value) => return Ok((value, turn)),
-            Err(next) => {
+        match (tried, moved) {
+            (InTurn::Done(value), _) => return Ok((value, turn)),
+            (InTurn::Moved, Some(next)) => {
                 drop(turn);
                 turn = next.wait();
             }
+            (InTurn::Moved, None) => return Err("internal error: a write step moved without a new turn".into()),
         }
     }
     Err(LOCATION_CHANGED.into())

@@ -15,7 +15,7 @@
 //!   sidecar writes run in one order: the catalog's newest value is also the sidecar's. The
 //!   store resolves the original again and checks it still maps to the turn's sidecar
 //!   ([`WriteOrder::moved_to`]); a photo whose reachable copy changed meanwhile takes the
-//!   new sidecar's turn before it stores (`app::iptc::store_in_turn`, #155 R1).
+//!   new sidecar's turn before it stores or writes (`app::iptc::run_in_turn`, #155 R1).
 //!
 //! # Lock order
 //!

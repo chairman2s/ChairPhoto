@@ -385,7 +385,7 @@ impl SidecarFill {
     /// it (#144). Settled in the catalog the fill stored in; a failure leaves the fields
     /// owed for the next save or repair pass (#148), and is answered as an error that says
     /// so in a geocode's terms ([`pending_message`]). The turn is released once the write
-    /// is settled; call it with no lock held and no `.await` between the fill and this write.
+    /// is settled. Blocking: runs on the blocking pool with the fill ([`fill_and_write`]).
     fn write(self, state: &crate::app::AppState, identity: CatalogIdentity) -> Result<(), String> {
         let outcome = crate::app::iptc::write_and_settle(state, identity, &self.original, &self.write, self.turn);
         match outcome.sidecar {
@@ -403,11 +403,38 @@ fn pending_message(outcome: &crate::app::iptc::IptcSaveOutcome) -> String {
     format!("Geocoded location stored in the catalog, but not yet in the sidecar{why}; the repair pass will write it")
 }
 
+/// Step 3 of a fill and its sidecar write, on the blocking pool: `Err` when the fill
+/// failed (nothing stored; `CATALOG_CHANGED` after a switch), `Ok(None)` when nothing was
+/// filled, otherwise the sidecar write's result.
+///
+/// The fill waits for the sidecar's write turn ([`crate::xmp::lock::WriteOrder::wait`]),
+/// which blocks its thread until every earlier save or fill of that sidecar is done. That
+/// thread must not be a runtime worker. With the wait on a worker (#148), a fill waiting
+/// behind a save left the runtime's timers unfired: a 20 ms sleep elsewhere on the runtime
+/// did not complete for as long as the fill waited, with the other workers idle, and fired
+/// the moment a newly spawned task woke one of them; on a current-thread runtime the wait
+/// blocked the only thread, so the save holding the turn could never finish. The catalog
+/// lock and the sidecar I/O are blocking work too.
+async fn fill_and_write(
+    state: &crate::app::AppState,
+    identity: CatalogIdentity,
+    photo_id: i64,
+    geo: &GeocodeResult,
+) -> Result<Option<Result<(), String>>, String> {
+    let (state, geo) = (state.clone(), geo.clone());
+    tokio::task::spawn_blocking(move || {
+        Ok(fill_in(&state, identity, photo_id, &geo)?.map(|fill| fill.write(&state, identity)))
+    })
+    .await
+    .map_err(|e| format!("geocode: the fill's worker failed: {e}"))?
+}
+
 /// Step 3 of a fill, in the catalog the photo was read from: re-read the IPTC (a value the
 /// user typed meanwhile wins), resolve the original's path and write the filled fields —
 /// all under one lock hold of that catalog. Returns the sidecar write still to do (off the
 /// lock), or `None` when nothing was filled. The path is resolved before the row is
 /// written, so an unreachable original leaves the catalog and the sidecar in step.
+/// Blocking (it waits for the write turn): call it through [`fill_and_write`].
 fn fill_in(
     state: &crate::app::AppState,
     identity: CatalogIdentity,
@@ -506,10 +533,10 @@ pub async fn geocode_photo_to_iptc(
     let Some(step1) = step1 else { return Ok(false) };
 
     let geo = lookup_or_ask(state, identity, &step1.endpoint, step1.lat, step1.lng).await?;
-    let Some(fill) = fill_in(state, identity, photo_id, &geo)? else {
+    let Some(written) = fill_and_write(state, identity, photo_id, &geo).await? else {
         return Ok(false);
     };
-    fill.write(state, identity)?;
+    written?;
     Ok(true)
 }
 
@@ -604,17 +631,15 @@ pub async fn geocode_all_to_iptc_with(
             return Err(GEOCODE_CANCELLED.into()); // stopped while Nominatim answered
         }
         // An original that went offline since the read is skipped; a switch stops the run.
-        let write = match fill_in(state, identity, candidate.photo_id, &geo) {
+        let written = match fill_and_write(state, identity, candidate.photo_id, &geo).await {
             Err(e) if e == crate::app::CATALOG_CHANGED => return Err(e),
             Err(_) => None,
-            Ok(write) => write,
+            Ok(written) => written,
         };
         // Counted as filled only when the sidecar write also succeeded, so the summary does
         // not claim a photo whose sidecar diverged.
-        if let Some(fill) = write {
-            if fill.write(state, identity).is_ok() {
-                filled += 1;
-            }
+        if let Some(Ok(())) = written {
+            filled += 1;
         }
         done += 1;
         on_progress(GeocodeProgress { done, total, filled });
@@ -1051,11 +1076,16 @@ mod tests {
     /// save holds the sidecar's write turn between its store and its write; the fill must
     /// not store (nor write) until the save's write is settled, and then both land: the
     /// save's title and the fill's location are in the sidecar, and nothing is owed.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
-    async fn a_fill_racing_a_save_stores_and_writes_after_it() {
+    ///
+    /// Run on a small multi-thread runtime and on a current-thread one, with the fill and
+    /// the test body's timers sharing it. With the fill's turn wait on a runtime worker,
+    /// the multi-thread version hung in about one run in five (the test body's 20 ms sleep
+    /// never fired while the fill waited) and the current-thread one in every run (see
+    /// `fill_and_write`).
+    async fn a_fill_racing_a_save(tag: &str) {
         let (server, endpoint) =
             serve_forever(r#"{"address":{"city":"Oslo","state":"Oslo","country":"Norway","country_code":"no"}}"#).await;
-        let (dir, state, id, _progress) = geo_catalog("geo-149-race", &endpoint);
+        let (dir, state, id, _progress) = geo_catalog(tag, &endpoint);
         let state = std::sync::Arc::new(state);
         let xmp = crate::xmp::sidecar_path(&dir.join("library").join("IMG_1.jpg"));
         let identity = crate::app::catalog_identity(&state).unwrap();
@@ -1072,13 +1102,11 @@ mod tests {
         let turn = turn.wait();
         let write = crate::app::with_catalog_as(&state, identity, |c| c.set_iptc(id, &saved)).unwrap();
 
-        // On the app's own runtime, as the GPUI map module runs it: the fill's turn wait
-        // blocks a worker of that runtime, not one of this test's (a 3-worker test runtime
-        // hosting the fill hung about one run in seven, with the test body asleep on a timer).
+        // On this test's runtime, beside the test body's timers: the fill's wait for the
+        // turn must not block one of its workers (see `fill_and_write`).
         let fill = {
             let state = state.clone();
-            let fill = async move { geocode_photo_to_iptc(&state, Some(identity), id).await };
-            std::thread::spawn(move || crate::app::runtime().spawn(fill)).join().unwrap()
+            tokio::spawn(async move { geocode_photo_to_iptc(&state, Some(identity), id).await })
         };
         // The fill caches the answer just before its store step: wait for that (the shared
         // Nominatim throttle can delay the request by seconds), then give it time to store.
@@ -1116,6 +1144,16 @@ mod tests {
         let owed = crate::app::with_catalog_as(&state, identity, |c| c.owed_iptc(id)).unwrap();
         assert_eq!(owed, crate::catalog::IptcMask::NONE);
         server.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_fill_racing_a_save_stores_and_writes_after_it() {
+        a_fill_racing_a_save("geo-149-race-mt").await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_fill_racing_a_save_stores_and_writes_after_it_on_one_thread() {
+        a_fill_racing_a_save("geo-149-race-ct").await;
     }
 
     /// Review of #148, N2: a single-photo geocode whose sidecar write fails (here an

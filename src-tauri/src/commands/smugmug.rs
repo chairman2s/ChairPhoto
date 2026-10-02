@@ -67,13 +67,10 @@ pub async fn post_to_smugmug(
     caption: String,
 ) -> Result<String, String> {
     let state = state.inner().clone();
+    // Checks the album and the connection before it claims a job; another publish running
+    // meanwhile is neither stopped nor stops this one (each is its own job, `app::uploads`).
     blocking(move || {
-        if album_uri.trim().is_empty() {
-            return Err(crate::app::smugmug::CHOOSE_ALBUM.into());
-        }
-        let s = settings(&state);
-        let job = crate::app::uploads::claim_upload(&state, None, crate::app::smugmug::SERVICE, photo_id, version_id)?;
-        crate::app::smugmug::post(&LiveSmugMug, &s, job, &album_uri, &title, &caption)
+        crate::app::smugmug::post(&LiveSmugMug, &settings(&state), &state, photo_id, version_id, &album_uri, &title, &caption)
     })
     .await
 }

@@ -60,12 +60,10 @@ pub async fn post_to_flickr(
     tags: String,
 ) -> Result<String, String> {
     let state = state.inner().clone();
-    blocking(move || {
-        let s = settings(&state);
-        let job = crate::app::uploads::claim_upload(&state, None, crate::app::flickr::SERVICE, photo_id, version_id)?;
-        crate::app::flickr::post(&LiveFlickr, &s, job, &title, &description, &tags)
-    })
-    .await
+    // Checks the connection before it claims a job; another publish running meanwhile is
+    // neither stopped nor stops this one (each is its own job, `app::uploads`).
+    blocking(move || crate::app::flickr::post(&LiveFlickr, &settings(&state), &state, photo_id, version_id, &title, &description, &tags))
+        .await
 }
 
 /// Suggested Flickr tags for a photo: its export keywords in Flickr's `tags` format.

@@ -19,7 +19,7 @@
 //! `catalog:switched` reaches the UI. When the event does arrive the form's dialog closes
 //! ([`super::dialog::close_on_switch`]).
 //!
-//! **A publish is a job** (`chairphoto_core::app::uploads`): claimed per service, rendered into
+//! **A publish is a job** (`chairphoto_core::app::uploads`), its own: claimed, rendered into
 //! a job-scoped, private directory (`chairphoto_core::publishing::JobTempDir`, mode 0700, a
 //! random name) removed however the job ends, then uploaded. The panel shows each step; Cancel
 //! stops it before the upload starts; its terminal answer is the upload's own result.
@@ -189,8 +189,9 @@ pub struct PublishRequest {
 ///
 /// A Publish is core's publish job (`chairphoto_core::app::uploads`) in three worker steps the
 /// panel shows as it goes: [`ready`](Self::ready) and the claim, [`render`](Self::render),
-/// [`upload`](Self::upload). Cancel (or a newer publish to the same service, or a catalog
-/// switch) stops it before the render and before the upload; an upload in flight finishes.
+/// [`upload`](Self::upload). Its Cancel or a catalog switch stops it before the render and
+/// before the upload (a newer publish does not: each is its own job); an upload in flight
+/// finishes.
 pub trait PublishService: Send + Sync + 'static {
     /// Display name, e.g. "Flickr".
     fn name(&self) -> SharedString;

@@ -74,7 +74,8 @@ is never overwritten.
   Instagram family): the caption prefill, the 1080-px render into a directory belonging to that
   post alone (`publishing::JobTempDir`), whose lifetime follows the outcome as described above,
   and the hand-off to an `InstagramDriver` (Chrome; tests fake it and never launch a browser).
-  A tripped job (Cancel, a newer post, a catalog switch) stops before Chrome sees the render.
+  A stopped job (its own Cancel or a catalog switch) stops before Chrome sees the render; a
+  newer post never stops an older one.
 - `src-tauri/src/commands/instagram.rs` — `post_to_instagram` and
   `build_instagram_caption`, thin wrappers gated on the `instagram` feature.
 - `crates/app/src/modules/instagram/` — the GPUI publish target: version, caption (prefilled

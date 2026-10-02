@@ -3,15 +3,20 @@
 //! `app::smugmug` and `app::instagram` run before their upload, for the Tauri commands and the
 //! GPUI publish targets alike.
 //!
-//! A publish is a job per service ([`UploadService`], `JobRegistry::upload_*`):
+//! Every publish is its own job, numbered per service ([`UploadService`],
+//! `JobRegistry::upload_*`), and several may run side by side — a second photo published
+//! while the first still renders, or the same photo twice: a newer publish never stops an
+//! older one. Each job has two ways to stop: its own cancel flag ([`UploadJob::abort_handle`],
+//! the front end's Cancel for *that* publish), and the service's abort generation, which every
+//! running publish of the service shares and a catalog switch trips.
 //!
 //! 1. [`claim_upload`] checks the catalog the photo id was read from, resolves the photo's
-//!    original and chosen version, and takes the service's abort generation — under one catalog
+//!    original and chosen version, and joins the service's abort generation — under one catalog
 //!    lock (catalog → that service's abort), so a switch either lands first (the check fails)
-//!    or after (its trip reaches this job). A newer publish to the same service trips this one.
+//!    or after (its trip reaches this job). Joining trips nothing.
 //! 2. [`UploadJob::render`] renders the JPEG into a private, job-scoped directory
 //!    ([`crate::publishing::JobTempDir`]); its export-parity checks go to the catalog it read.
-//!    It stops before rendering, and refuses to hand the render on, once the job is tripped.
+//!    It stops before rendering, and refuses to hand the render on, once the job is stopped.
 //! 3. The service's upload checks [`RenderedJob::ensure_live`] first, then sends. **An upload
 //!    in flight is not interrupted**: the service may already hold the bytes and could commit
 //!    them, so cancelling there would leave the user not knowing whether the photo is online.
@@ -31,11 +36,11 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-/// What a cancelled (or superseded) publish answers: it stopped before uploading anything.
+/// What a cancelled publish answers: it stopped before uploading anything.
 pub const UPLOAD_CANCELLED: &str = "Cancelled — nothing was uploaded.";
 
-/// The services a publish job can target; each is its own job family, so a Flickr publish
-/// never cancels a SmugMug one.
+/// The services a publish job can target; each is its own job family (its own job ids and
+/// abort generation).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UploadService {
     Flickr,
@@ -59,12 +64,6 @@ impl UploadService {
             UploadService::SmugMug => &state.jobs.upload_smugmug,
             UploadService::Instagram => &state.jobs.upload_instagram,
         }
-    }
-
-    /// Trip this service's running publish, if any (the Cancel of a front end that kept no
-    /// handle on its job).
-    pub fn cancel(self, state: &AppState) -> Result<(), String> {
-        self.generation(state).trip()
     }
 }
 
@@ -142,9 +141,22 @@ pub struct UploadJob {
     /// The catalog the photo was resolved from.
     read: CatalogIdentity,
     item: ResolvedItem,
-    abort: Arc<AtomicBool>,
+    stop: Stop,
     /// This publish's job id (per service).
     pub job: u64,
+}
+
+/// What stops one publish: its own cancel flag, or the service generation it joined (a
+/// catalog switch trips that one).
+struct Stop {
+    own: Arc<AtomicBool>,
+    generation: Arc<AtomicBool>,
+}
+
+impl Stop {
+    fn stopped(&self) -> bool {
+        self.own.load(Ordering::Relaxed) || self.generation.load(Ordering::Relaxed)
+    }
 }
 
 /// Claim a publish of `photo_id` (`version_id`: `None` = Original) to `service`.
@@ -152,7 +164,7 @@ pub struct UploadJob {
 /// `expected`: the catalog the id was read from — `Some` fails closed with
 /// [`CATALOG_CHANGED`] once another catalog is open; `None` = the open one (the Tauri
 /// commands). The identity check, the resolve and the claim run under one catalog lock, the
-/// service's abort taken inside it (catalog → abort). Trips the service's older publish.
+/// service's abort generation joined inside it (catalog → abort). Stops no other publish.
 pub fn claim_upload(
     state: &AppState,
     expected: Option<CatalogIdentity>,
@@ -167,13 +179,14 @@ pub fn claim_upload(
     }
     let resolved = crate::export::resolve_originals(catalog, &[photo_id], &[], version_id);
     let item = resolved.items.into_iter().next().ok_or("Photo is unavailable (original offline?)")?;
-    let (abort, job) = service.generation(state).install_fresh_numbered()?;
     let read = super::identity_of(catalog);
+    let (generation, job) = service.generation(state).join_numbered()?;
     drop(guard);
-    Ok(UploadJob { state: state.clone(), service, read, item, abort, job })
+    let stop = Stop { own: Arc::new(AtomicBool::new(false)), generation };
+    Ok(UploadJob { state: state.clone(), service, read, item, stop, job })
 }
 
-/// Why a tripped job stopped: the catalog it read is gone, or it was cancelled/superseded.
+/// Why a stopped job stopped: the catalog it read is gone, or it was cancelled.
 fn stopped(state: &AppState, read: CatalogIdentity) -> String {
     match super::catalog_identity(state) {
         Ok(open) if open == read => UPLOAD_CANCELLED.into(),
@@ -182,9 +195,9 @@ fn stopped(state: &AppState, read: CatalogIdentity) -> String {
 }
 
 impl UploadJob {
-    /// This publish's own abort flag: tripping it cancels this publish and no other.
+    /// This publish's own cancel flag: tripping it cancels this publish and no other.
     pub fn abort_handle(&self) -> Arc<AtomicBool> {
-        self.abort.clone()
+        self.stop.own.clone()
     }
 
     /// The catalog the photo was read from.
@@ -198,11 +211,11 @@ impl UploadJob {
     }
 
     /// Render the photo with `render` into this job's own temp directory. Blocking. Refuses
-    /// (without rendering) once the job is tripped, and refuses to hand the render on when it
-    /// was tripped while rendering.
+    /// (without rendering) once the job is stopped, and refuses to hand the render on when it
+    /// was stopped while rendering.
     pub fn render(self, render: &UploadRenderer) -> Result<RenderedJob, String> {
-        let UploadJob { state, service, read, item, abort, job } = self;
-        if abort.load(Ordering::Relaxed) {
+        let UploadJob { state, service, read, item, stop, job } = self;
+        if stop.stopped() {
             return Err(stopped(&state, read));
         }
         // Named after the source (with the version suffix), so the service shows a
@@ -212,20 +225,20 @@ impl UploadJob {
         let (written, tally) = super::exports::collect_parity(|| render(&item, &path));
         super::exports::record_parity_tally(&state, Some(read), tally);
         written?;
-        let rendered = RenderedJob { _dir: dir, path, state, read, abort, job };
+        let rendered = RenderedJob { _dir: dir, path, state, read, stop, job };
         rendered.ensure_live()?;
         Ok(rendered)
     }
 }
 
 /// A rendered publish: the JPEG, the job directory holding it (removed when this drops), and
-/// the job's abort flag. Keep it alive until the upload has finished.
+/// what stops the job. Keep it alive until the upload has finished.
 pub struct RenderedJob {
     _dir: JobTempDir,
     path: PathBuf,
     state: AppState,
     read: CatalogIdentity,
-    abort: Arc<AtomicBool>,
+    stop: Stop,
     pub job: u64,
 }
 
@@ -240,10 +253,11 @@ impl RenderedJob {
         self.read
     }
 
-    /// `Ok` while the job is still the service's current one: the last check before the
-    /// upload starts. `Err` says why it stopped ([`UPLOAD_CANCELLED`] or [`CATALOG_CHANGED`]).
+    /// `Ok` while the job was neither cancelled nor stopped by a catalog switch: the last check
+    /// before the upload starts. `Err` says why it stopped ([`UPLOAD_CANCELLED`] or
+    /// [`CATALOG_CHANGED`]).
     pub fn ensure_live(&self) -> Result<(), String> {
-        if self.abort.load(Ordering::Relaxed) {
+        if self.stop.stopped() {
             return Err(stopped(&self.state, self.read));
         }
         Ok(())
@@ -317,23 +331,46 @@ mod tests {
         assert_eq!(*calls.lock().unwrap(), 0, "a cancelled job rendered");
 
         let job = claim_upload(&state, None, UploadService::SmugMug, id, None).unwrap();
+        let abort = job.abort_handle();
         let rendered = job.render(&fake(&calls)).unwrap();
-        UploadService::SmugMug.cancel(&state).unwrap();
+        abort.store(true, Ordering::Relaxed);
         assert_eq!(rendered.ensure_live().unwrap_err(), UPLOAD_CANCELLED);
     }
 
-    /// A newer publish to the same service trips the older; another service's is untouched.
+    /// Publishes run side by side: a newer publish to the same service — of the same photo or
+    /// another — stops no older one, each Cancel stops only its own job, and a catalog switch
+    /// stops every one of them. Forced overlap: the older job is claimed, the newer claimed and
+    /// rendered, then the older renders and both reach their upload check.
     #[test]
-    fn a_newer_publish_supersedes_only_its_own_service() {
-        let dir = TestTmpDir::new("uploads-newer");
+    fn publishes_run_side_by_side_and_a_switch_stops_them_all() {
+        let dir = TestTmpDir::new("uploads-side-by-side");
         let (state, id) = catalog_with_photo(&dir);
+        let calls = Arc::new(Mutex::new(0));
         let older = claim_upload(&state, None, UploadService::Flickr, id, None).unwrap();
-        let smugmug = claim_upload(&state, None, UploadService::SmugMug, id, None).unwrap();
         let newer = claim_upload(&state, None, UploadService::Flickr, id, None).unwrap();
-        assert!(newer.job > older.job);
-        assert!(older.abort_handle().load(Ordering::Relaxed), "the older Flickr publish still runs");
-        assert!(!smugmug.abort_handle().load(Ordering::Relaxed), "a Flickr publish cancelled SmugMug's");
-        assert!(!newer.abort_handle().load(Ordering::Relaxed));
+        let third = claim_upload(&state, None, UploadService::Flickr, id, None).unwrap();
+        assert!(older.job < newer.job && newer.job < third.job, "each publish has its own job id");
+        let newer = newer.render(&fake(&calls)).unwrap();
+        let older = older.render(&fake(&calls)).unwrap();
+        assert_eq!(*calls.lock().unwrap(), 2, "a newer publish stopped an older one's render");
+        older.ensure_live().expect("a newer publish stopped the older one");
+        newer.ensure_live().unwrap();
+
+        // Cancel the third: the other two run on.
+        third.abort_handle().store(true, Ordering::Relaxed);
+        assert_eq!(third.render(&fake(&calls)).err().unwrap(), UPLOAD_CANCELLED);
+        older.ensure_live().expect("one publish's Cancel stopped another");
+        newer.ensure_live().unwrap();
+
+        // A catalog switch stops both.
+        let (b, _) = catalog_with_photo(&dir.join("b"));
+        crate::app::detach_catalog_and_trip_jobs(&state).unwrap();
+        crate::app::publish_catalog_and_reset_jobs(&state, b.catalog.lock().unwrap().take().unwrap()).unwrap();
+        assert_eq!(older.ensure_live().unwrap_err(), CATALOG_CHANGED);
+        assert_eq!(newer.ensure_live().unwrap_err(), CATALOG_CHANGED);
+        // A publish claimed after the switch is live.
+        let after = claim_upload(&state, None, UploadService::Flickr, id, None).unwrap();
+        after.render(&fake(&calls)).unwrap().ensure_live().unwrap();
     }
 
     /// Bound to a catalog that is no longer open: the claim refuses; a switch after the

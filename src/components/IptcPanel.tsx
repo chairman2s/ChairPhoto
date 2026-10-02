@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { getIptc, IptcFields, setIptc } from "../modules/api";
+import { getIptc, IptcFields, IptcSaveOutcome, setIptc } from "../modules/api";
 
 const EMPTY: IptcFields = {
   description: "",
@@ -29,6 +29,25 @@ const FIELDS: { key: keyof IptcFields; label: string }[] = [
   { key: "countryCode", label: "Country code" },
 ];
 
+/** The status line for a save, matching the GPUI inspector's (`IptcSaveOutcome::status`).
+ *  Never claims a sidecar write that did not happen (#148). Pure, exported for tests. */
+export function iptcSaveStatus(outcome: IptcSaveOutcome | null | undefined): string {
+  switch (outcome?.sidecar) {
+    case "written":
+      return "Saved to sidecar";
+    case "unchanged":
+      // Nothing was owed, so the sidecar was not opened: no claim about what it holds.
+      return "Saved (no sidecar change needed)";
+    case "pending":
+      return outcome.reason
+        ? `Saved to catalog; sidecar pending (${outcome.reason})`
+        : "Saved to catalog; sidecar pending";
+    default:
+      // A backend that answers nothing (older than #148) said nothing about the sidecar.
+      return "Saved to catalog";
+  }
+}
+
 // Authored IPTC Core fields for a photo. Saving writes to the catalog AND the XMP
 // sidecar (merge-safe), so other apps and exports see the values.
 export function IptcPanel({ photoId }: { photoId: number }) {
@@ -57,9 +76,10 @@ export function IptcPanel({ photoId }: { photoId: number }) {
   const save = async () => {
     setStatus("Saving…");
     try {
-      await setIptc(photoId, fields);
+      const outcome = await setIptc(photoId, fields);
+      // The catalog has the values whatever became of the sidecar: they are the new baseline.
       setSaved(fields);
-      setStatus("Saved to sidecar");
+      setStatus(iptcSaveStatus(outcome));
     } catch (e) {
       setStatus(`Failed: ${e}`);
     }

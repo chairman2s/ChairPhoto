@@ -164,8 +164,9 @@ export function TitleBar({
             title={
               identityDebtCount === null
                 ? "Identity debt count could not be checked — open to see the current queue"
-                : "Photo copies whose sidecar doesn't carry their identity yet. Most of this " +
-                  "is normally Unreachable (an offline volume), not a failure."
+                : "Photo copies whose sidecar doesn't carry their identity yet, and photos " +
+                  "whose sidecar hasn't received their IPTC. Most of this is normally " +
+                  "Unreachable (an offline volume), not a failure."
             }
           >
             {identityDebtCount === null ? "?" : identityDebtCount} identity debt

@@ -124,8 +124,9 @@ impl RootView {
                 if debt.is_none() {
                     "Identity debt count could not be checked — open to see the current queue"
                 } else {
-                    "Photo copies whose sidecar doesn't carry their identity yet. Most of this is \
-                     normally Unreachable (an offline volume), not a failure."
+                    "Photo copies whose sidecar doesn't carry their identity yet, and photos whose \
+                     sidecar hasn't received their IPTC. Most of this is normally Unreachable (an \
+                     offline volume), not a failure."
                 },
                 Box::new(OpenIdentityDebt),
                 colors,

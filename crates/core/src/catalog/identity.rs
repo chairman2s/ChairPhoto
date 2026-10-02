@@ -489,6 +489,9 @@ pub struct PendingIdentitySummary {
     /// Copies whose every queued field has been dismissed (#33): kept for the record,
     /// never retried, and deliberately not counted as debt (CONTEXT.md § Identity).
     pub dismissed: i64,
+    /// Photos whose catalog IPTC has fields their sidecar has not received yet (#148).
+    /// Photos, not copies, and not part of `total`: the repair pass retries them too.
+    pub iptc_owed: i64,
 }
 
 /// What a human decided to do about one conflicted copy (#33). Deserialized from the
@@ -647,16 +650,26 @@ pub struct IdentityRepairSummary {
     /// row is **discarded**, never written over the newer decision, so it is reported here
     /// rather than in any of the four buckets above — counting it as `bound` or `failed`
     /// would claim an effect the pass did not have. Not a failure: the row was decided,
-    /// just not by this pass.
+    /// just not by this pass. Also counts a photo owing IPTC whose values a save changed
+    /// while the pass wrote them: that save's own write, or the next pass, settles it.
     pub superseded: usize,
-    /// Un-dismissed queue rows when the pass started — the denominator its progress is
-    /// reported against. The queue can grow (a concurrent scan) or shrink (a resolution)
-    /// underneath it, so `done()` is not guaranteed to reach this.
+    /// Un-dismissed queue rows plus photos owing IPTC when the pass started — the
+    /// denominator its progress is reported against. The queue can grow (a concurrent scan)
+    /// or shrink (a resolution) underneath it, so `done()` is not guaranteed to reach this.
     pub total: usize,
     /// True when the pass stopped before the end of the queue: a cancel, a newer pass, or a
     /// catalog switch. Every counter below is then partial, and the UI must say so rather
     /// than present them as a finished result.
     pub aborted: bool,
+    /// Photos whose owed IPTC (#148) the pass wrote into their sidecar; nothing is owed for
+    /// them any more.
+    pub iptc_written: usize,
+    /// Photos owing IPTC with no reachable copy — left owed for the next pass. A normal
+    /// state, not a failure.
+    pub iptc_unreachable: usize,
+    /// Photos owing IPTC whose sidecar write still fails (read-only storage, an unparseable
+    /// sidecar). Left owed.
+    pub iptc_failed: usize,
 }
 
 impl IdentityRepairSummary {
@@ -672,7 +685,14 @@ impl IdentityRepairSummary {
     /// Rows this pass has finished with, whatever the outcome — the numerator of its
     /// progress against [`Self::total`].
     pub fn done(&self) -> usize {
-        self.bound + self.unreachable + self.conflicts + self.failed + self.superseded
+        self.bound
+            + self.unreachable
+            + self.conflicts
+            + self.failed
+            + self.superseded
+            + self.iptc_written
+            + self.iptc_unreachable
+            + self.iptc_failed
     }
 }
 
@@ -956,7 +976,7 @@ impl Catalog {
     /// case-sensitive Rust `starts_with` instead of silently diverging on a differently
     /// cased error string.
     pub fn summarize_pending_identity(&self) -> Result<PendingIdentitySummary> {
-        Ok(self.conn.query_row(
+        let summary = self.conn.query_row(
             "SELECT coalesce(sum(active > 0), 0),
                     coalesce(sum(active_conflicts > 0), 0),
                     coalesce(sum(active = 0), 0)
@@ -972,9 +992,11 @@ impl Catalog {
                     total: r.get(0)?,
                     conflicts: r.get(1)?,
                     dismissed: r.get(2)?,
+                    iptc_owed: 0,
                 })
             },
-        )?)
+        )?;
+        Ok(PendingIdentitySummary { iptc_owed: self.count_owed_iptc()?, ..summary })
     }
 
     /// How many un-dismissed queue rows there are — the repair pass's denominator.
@@ -1449,13 +1471,16 @@ impl Catalog {
     ///
     /// Per row the sequence is refresh → IO → compare-and-set record; see this module's
     /// § Who owns a queue row for why the first and last exist.
+    ///
+    /// After the identity queue, the pass retries the IPTC photos owe their sidecars (#148,
+    /// `iptc_owed`): same abort flag, same progress, counted in `total` from the start.
     pub fn run_identity_repair(
         &self,
         abort: &AtomicBool,
         mut progress: impl FnMut(&IdentityRepairSummary),
     ) -> Result<IdentityRepairSummary> {
         let mut summary = IdentityRepairSummary {
-            total: self.count_active_identity_repairs()? as usize,
+            total: (self.count_active_identity_repairs()? + self.count_owed_iptc()?) as usize,
             ..Default::default()
         };
         let mut cursor: Option<IdentityRepairCursor> = None;
@@ -1466,6 +1491,8 @@ impl Catalog {
             }
             let page = self.plan_identity_repairs_page(cursor.as_ref(), REPAIR_PAGE_SIZE)?;
             if page.is_empty() {
+                // Then the IPTC the catalog owes sidecars (#148), under the same abort flag.
+                summary.aborted = !self.run_iptc_repair(abort, &mut summary, &mut progress)?;
                 return Ok(summary);
             }
             for mut plan in page {

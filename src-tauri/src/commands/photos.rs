@@ -113,13 +113,15 @@ pub fn get_iptc(state: State<'_, AppState>, photo_id: i64) -> Result<IptcFields,
 /// Save a photo's authored IPTC fields to the catalog AND write them to the photo's
 /// XMP sidecar (merge-safe — preserves darktable/other data). The sidecar is written
 /// next to the original file resolved by the location resolver (`app::iptc::save_iptc`, on
-/// a blocking worker).
+/// a blocking worker). The result says whether the sidecar has the values (`written` /
+/// `unchanged`) or the save reached the catalog only (`pending`, with a reason: the fields
+/// stay owed and the repair pass retries them — #148).
 #[tauri::command]
 pub async fn set_iptc(
     state: State<'_, AppState>,
     photo_id: i64,
     fields: IptcFields,
-) -> Result<(), String> {
+) -> Result<crate::app::iptc::IptcSaveOutcome, String> {
     let state = state.inner().clone();
     crate::app::spawn_blocking(move || crate::app::iptc::save_iptc(&state, photo_id, &fields))
         .await

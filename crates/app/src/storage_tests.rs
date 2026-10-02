@@ -768,6 +768,40 @@ fn a_repair_pass_runs_from_the_panel_and_reloads_the_queue(cx: &mut TestAppConte
     app.wired.shell.read_with(cx, |s, _| assert_eq!(s.counts.identity_debt, Some(0), "the chip count too"));
 }
 
+/// #148 (review M3/L3): a catalog whose only debt is owed IPTC still shows the chip with that
+/// count, and the panel's Start runs the pass that writes it.
+#[gpui_kit::test]
+fn owed_iptc_alone_shows_the_chip_and_starts_the_pass(cx: &mut TestAppContext) {
+    let dir = TempDir::new("debt-iptc-only");
+    let app = start(cx);
+    let ids = open_catalog_with_photos(&app, &dir, 1, cx);
+    {
+        let guard = app.state.catalog.lock().unwrap();
+        let c = guard.as_ref().unwrap();
+        let p = dir.0.join("photos/2026/p0.ARW");
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, b"raw").unwrap();
+        // Pay the identity the upsert queued, so IPTC is the only debt left.
+        c.repair_pending_identity().unwrap();
+        let fields = chairphoto_core::catalog::IptcFields { title: "Fjord".into(), ..Default::default() };
+        c.set_iptc(ids[0], &fields).unwrap(); // stored, owed, never written
+        let s = c.summarize_pending_identity().unwrap();
+        assert_eq!((s.total, s.iptc_owed), (0, 1));
+    }
+    app.wired.model.update(cx, |m, cx| m.refresh(cx));
+    work(cx);
+    app.wired.shell.read_with(cx, |s, _| assert_eq!(s.counts.identity_debt, Some(1), "the chip counts owed IPTC"));
+
+    click(&app, "attn-identity", cx);
+    let StorageDialog::IdentityDebt(_panel) = dialog(&app, cx) else { panic!("the debt panel") };
+    work(cx);
+    click(&app, "repair-start", cx);
+    app.wired.storage.read_with(cx, |s, _| assert!(s.repair.running, "Start is enabled for IPTC-only debt"));
+    work(cx);
+    app.wired.storage.read_with(cx, |s, _| assert_eq!(s.repair.result.map(|r| r.iptc_written), Some(1)));
+    app.wired.shell.read_with(cx, |s, _| assert_eq!(s.counts.identity_debt, Some(0)));
+}
+
 /// The panel re-attaches to a pass already running when it opens (claimed elsewhere — by an
 /// earlier panel), follows its job id, and ends with its terminal event.
 #[gpui_kit::test]

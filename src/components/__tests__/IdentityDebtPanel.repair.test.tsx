@@ -52,6 +52,8 @@ let handlers: Map<string, Array<(e: { payload: unknown }) => void>> = new Map();
 let stops: Map<string, ReturnType<typeof vi.fn>> = new Map();
 /** Event names whose registration must reject (an older host / a failed registration). */
 let listenRejects = new Set<string>();
+/** What `summarize_pending_identity` reports. */
+let debtSummary: Record<string, number> = { total: 3, conflicts: 0, dismissed: 0 };
 
 vi.mock("@tauri-apps/api/core", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@tauri-apps/api/core")>();
@@ -61,7 +63,7 @@ vi.mock("@tauri-apps/api/core", async (importOriginal) => {
       calls.push({ command, args: args ?? {} });
       switch (command) {
         case "summarize_pending_identity":
-          return Promise.resolve({ total: 3, conflicts: 0, dismissed: 0 });
+          return Promise.resolve(debtSummary);
         case "list_pending_identity":
           return Promise.resolve([]);
         case "list_volumes":
@@ -146,6 +148,7 @@ beforeEach(() => {
   listenRejects = new Set();
   runningPass = null;
   startPass = async () => 7;
+  debtSummary = { total: 3, conflicts: 0, dismissed: 0 };
   restoreSizes = giveEveryElementASize();
 });
 
@@ -178,6 +181,22 @@ function commandNames() {
 }
 
 describe("starting a repair pass", () => {
+  // #148 (review L3): owed IPTC is paid by the same pass, so it alone enables Start.
+  it("is enabled when the only debt is owed IPTC", async () => {
+    debtSummary = { total: 0, conflicts: 0, dismissed: 0, iptcOwed: 1 };
+    await startAPass();
+    expect(commandNames()).toContain("repair_pending_identity");
+  });
+
+  it("is disabled when nothing is owed", async () => {
+    debtSummary = { total: 0, conflicts: 0, dismissed: 0, iptcOwed: 0 };
+    render(<IdentityDebtPanel onClose={() => {}} />);
+    const start = await screen.findByRole("button", { name: "Start repair pass" });
+    await waitFor(() => expect(commandNames()).toContain("summarize_pending_identity"));
+    await act(async () => {});
+    expect((start as HTMLButtonElement).disabled).toBe(true);
+  });
+
   it("subscribes to both event streams before asking the backend to start", async () => {
     // A pass over an already-clean queue finishes before the command's promise resolves, so
     // a listener installed afterwards would miss the only terminal event there will ever be.

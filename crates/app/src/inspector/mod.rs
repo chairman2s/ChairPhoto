@@ -887,9 +887,12 @@ impl PhotoInspector {
                 }
                 if shown {
                     match result {
-                        Ok(()) => {
+                        // The catalog has the values whatever became of the sidecar, so they
+                        // are the form's new baseline; the status says whether the sidecar
+                        // has them or still owes them (#148).
+                        Ok(outcome) => {
                             this.iptc.saved = saved;
-                            this.iptc.status = "Saved to sidecar".into();
+                            this.iptc.status = outcome.status();
                         }
                         Err(e) => this.iptc.status = format!("Failed: {e}"),
                     }
@@ -897,7 +900,10 @@ impl PhotoInspector {
                 } else {
                     // The inspector moved on: the status line says what became of it.
                     let line = match result {
-                        Ok(()) => format!("IPTC saved to sidecar for {name}"),
+                        Ok(outcome) if outcome.sidecar == chairphoto_core::catalog::IptcSidecarState::Written => {
+                            format!("IPTC saved to sidecar for {name}")
+                        }
+                        Ok(outcome) => format!("IPTC for {name}: {}", outcome.status()),
                         Err(e) => format!("IPTC save for {name} failed: {e}"),
                     };
                     this.status(line, cx);

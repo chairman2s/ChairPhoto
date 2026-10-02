@@ -19,7 +19,12 @@ import {
   resolutionMessage,
   summaryHeadline,
   pagingLabel,
+  identityDebtBadge,
 } from "../IdentityDebtPanel";
+
+const APP_TSX = (
+  import.meta.glob("../../App.tsx", { query: "?raw", eager: true, import: "default" }) as Record<string, string>
+)["../../App.tsx"];
 import type {
   IdentityDebtState,
   IdentityRepairSummary,
@@ -164,6 +169,28 @@ describe("summaryHeadline", () => {
     expect(summaryHeadline(s)).toBe("74488 copies owe their identity to a sidecar");
   });
 
+  it("badges copies owing identity plus photos owing IPTC (#148)", () => {
+    expect(identityDebtBadge({ total: 0, conflicts: 0, dismissed: 0, iptcOwed: 2 })).toBe(2);
+    expect(identityDebtBadge({ total: 3, conflicts: 0, dismissed: 4, iptcOwed: 2 })).toBe(5);
+    // A backend older than #148 omits iptcOwed.
+    expect(identityDebtBadge({ total: 3, conflicts: 0, dismissed: 0 })).toBe(3);
+  });
+
+  // App.tsx cannot be mounted here; pin that its chip/menu count is this function's.
+  it("is what App badges the title bar with", () => {
+    expect(APP_TSX).toContain("setIdentityDebtCount(identityDebtBadge(s));");
+  });
+
+  it("names photos owing IPTC to a sidecar (#148) only when there are some", () => {
+    expect(summaryHeadline({ total: 1, conflicts: 0, dismissed: 0, iptcOwed: 0 })).not.toContain("IPTC");
+    expect(summaryHeadline({ total: 0, conflicts: 0, dismissed: 0, iptcOwed: 1 })).toBe(
+      "0 copies owe their identity to a sidecar; 1 photo owes IPTC to a sidecar",
+    );
+    expect(summaryHeadline({ total: 2, conflicts: 0, dismissed: 0, iptcOwed: 3 })).toBe(
+      "2 copies owe their identity to a sidecar; 3 photos owe IPTC to a sidecar",
+    );
+  });
+
   it("appends the conflict count only when there is at least one", () => {
     const noConflicts: PendingIdentitySummary = { total: 5, conflicts: 0, dismissed: 0 };
     expect(summaryHeadline(noConflicts)).not.toContain("conflict");
@@ -265,6 +292,17 @@ describe("repairSummaryLine", () => {
     );
     expect(line).toContain("Stopped after 3 of 74488");
     expect(line).not.toContain("Finished");
+  });
+
+  // #148: owed IPTC is retried by the same pass. Named only when the pass met some, and
+  // counted in how far a stopped pass got.
+  it("reports the IPTC the pass wrote or left owed, only when there was some", () => {
+    expect(repairSummaryLine(summary({ bound: 1, total: 1 }))).not.toContain("IPTC");
+    const line = repairSummaryLine(
+      summary({ iptcWritten: 2, iptcUnreachable: 1, iptcFailed: 1, total: 9, aborted: true }),
+    );
+    expect(line).toContain("IPTC written 2, still unreachable 1, failed 1");
+    expect(line).toContain("Stopped after 4 of 9");
   });
 
   it("names superseded rows only when there were some", () => {

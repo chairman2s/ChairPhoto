@@ -7,7 +7,7 @@
 //! must survive. We parse the existing sidecar into a DOM, replace our properties,
 //! and write it back; foreign elements are untouched.
 
-use crate::catalog::IptcFields;
+use crate::catalog::{IptcFields, IptcMask};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use xmltree::{Element, Namespace, XMLNode};
@@ -38,7 +38,7 @@ const NS_STDIM: &str = "http://ns.adobe.com/xap/1.0/sType/Dimensions#";
 struct Managed {
     ns: &'static str,
     name: &'static str,
-    value: fn(&IptcFields) -> &str,
+    field: IptcMask,
 }
 
 /// Properties chairphoto manages via [`write_iptc`]. A write touches only the ones whose
@@ -51,17 +51,17 @@ struct Managed {
 /// `chairphoto:LastWrite` is not listed: every writer's completion stamp is applied
 /// uniformly by [`SidecarDocument::commit`], not per-writer.
 const MANAGED: [Managed; 11] = [
-    Managed { ns: NS_DC, name: "description", value: |f| &f.description },
-    Managed { ns: NS_DC, name: "title", value: |f| &f.title },
-    Managed { ns: NS_DC, name: "rights", value: |f| &f.copyright },
-    Managed { ns: NS_DC, name: "creator", value: |f| &f.creator },
-    Managed { ns: NS_PHOTOSHOP, name: "Headline", value: |f| &f.headline },
-    Managed { ns: NS_PHOTOSHOP, name: "Credit", value: |f| &f.credit },
-    Managed { ns: NS_PHOTOSHOP, name: "Source", value: |f| &f.source },
-    Managed { ns: NS_PHOTOSHOP, name: "City", value: |f| &f.city },
-    Managed { ns: NS_PHOTOSHOP, name: "State", value: |f| &f.state },
-    Managed { ns: NS_PHOTOSHOP, name: "Country", value: |f| &f.country },
-    Managed { ns: NS_IPTC, name: "CountryCode", value: |f| &f.country_code },
+    Managed { ns: NS_DC, name: "description", field: IptcMask::DESCRIPTION },
+    Managed { ns: NS_DC, name: "title", field: IptcMask::TITLE },
+    Managed { ns: NS_DC, name: "rights", field: IptcMask::COPYRIGHT },
+    Managed { ns: NS_DC, name: "creator", field: IptcMask::CREATOR },
+    Managed { ns: NS_PHOTOSHOP, name: "Headline", field: IptcMask::HEADLINE },
+    Managed { ns: NS_PHOTOSHOP, name: "Credit", field: IptcMask::CREDIT },
+    Managed { ns: NS_PHOTOSHOP, name: "Source", field: IptcMask::SOURCE },
+    Managed { ns: NS_PHOTOSHOP, name: "City", field: IptcMask::CITY },
+    Managed { ns: NS_PHOTOSHOP, name: "State", field: IptcMask::STATE },
+    Managed { ns: NS_PHOTOSHOP, name: "Country", field: IptcMask::COUNTRY },
+    Managed { ns: NS_IPTC, name: "CountryCode", field: IptcMask::COUNTRY_CODE },
 ];
 
 /// The sidecar node for one managed property's non-empty value.
@@ -96,14 +96,23 @@ pub fn sidecar_path(photo_path: &Path) -> PathBuf {
 /// Creates the sidecar if absent; backs up a pre-existing non-chairphoto sidecar once
 /// before the first write.
 pub fn write_iptc(photo_path: &Path, before: &IptcFields, after: &IptcFields) -> Result<(), String> {
+    write_iptc_fields(photo_path, IptcMask::changed(before, after), after)
+}
+
+/// [`write_iptc`] of an explicit set of fields: each field in `fields` is written from
+/// `values` — replaced when non-empty, removed when empty — and every other property is
+/// left as the sidecar has it. The catalog's owed-IPTC record (#148) names the fields a
+/// sidecar has not received yet; a save or a retry writes those together with its own
+/// change. With `fields` empty the sidecar is not opened at all.
+pub fn write_iptc_fields(photo_path: &Path, fields: IptcMask, values: &IptcFields) -> Result<(), String> {
     let mut owned = Vec::new();
     let mut replacements = Vec::new();
     for m in &MANAGED {
-        let new = (m.value)(after);
-        if (m.value)(before) == new {
+        if !fields.contains(m.field) {
             continue;
         }
         owned.push((m.ns, m.name));
+        let new = m.field.value(values);
         if !new.is_empty() {
             replacements.push(managed_node(m.ns, m.name, new));
         }
@@ -115,6 +124,36 @@ pub fn write_iptc(photo_path: &Path, before: &IptcFields, after: &IptcFields) ->
     let mut doc = SidecarDocument::open(photo_path)?;
     doc.replace_owned(&owned, replacements);
     doc.commit()
+}
+
+/// The managed IPTC fields the photo's sidecar holds a non-empty value for, in element or
+/// compact attribute form, in any `rdf:Description`. No sidecar is [`IptcMask::NONE`]; a
+/// sidecar that does not parse is an error (nothing is known about it).
+pub fn read_iptc_present(photo_path: &Path) -> Result<IptcMask, String> {
+    let path = sidecar_path(photo_path);
+    let file = match std::fs::File::open(&path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(IptcMask::NONE),
+        Err(e) => return Err(e.to_string()),
+    };
+    let root = parse_xml(file)?;
+    let Some(rdf) = root.get_child(("RDF", NS_RDF)) else {
+        return Ok(IptcMask::NONE);
+    };
+    let mut present = IptcMask::NONE;
+    for (_, desc) in element_children(rdf) {
+        if !is_rdf(desc, "Description") {
+            continue;
+        }
+        for m in &MANAGED {
+            let attr = ns_attr(desc, m.ns, m.name).is_some_and(|v| !v.trim().is_empty());
+            let element = child(desc, m.ns, m.name).is_some_and(|e| first_text(e).is_some());
+            if attr || element {
+                present = present | m.field;
+            }
+        }
+    }
+    Ok(present)
 }
 
 /// Write export keywords into the photo's XMP sidecar, merging with existing content.

@@ -16,6 +16,7 @@ use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, OnceLock};
 
+pub mod ai;
 mod boot;
 pub mod catalogs;
 pub mod editing;
@@ -33,6 +34,8 @@ pub mod publications;
 #[cfg(feature = "localsend")]
 pub mod localsend;
 pub mod scans;
+#[cfg(feature = "smarttags")]
+pub mod smarttags;
 #[cfg(feature = "slideshow")]
 pub mod slideshow;
 pub mod storage;

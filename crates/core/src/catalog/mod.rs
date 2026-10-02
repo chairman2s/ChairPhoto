@@ -939,7 +939,7 @@ impl Catalog {
     /// says it comes.
     fn identity_from(&self, source: &IdentitySource<'_>, size: i64) -> Result<Option<String>> {
         match *source {
-            IdentitySource::Trusted(value) => Ok(value.map(photo_identity_for)),
+            IdentitySource::Trusted(value) => Ok(value.and_then(photo_identity_for)),
             IdentitySource::Sidecar(found) => self.scan_identity(found, size),
         }
     }
@@ -961,13 +961,16 @@ impl Catalog {
     /// One photo by its stable uuid — the chairphoto:// deep-link target.
     /// Served by `idx_photos_uuid`.
     pub fn get_photo_by_uuid(&self, uuid: &str) -> Result<Photo> {
+        let Some(identity) = photo_identity_for(uuid) else {
+            return Err(CatalogError::NotFound(format!("photo uuid {uuid:?}")));
+        };
         self.conn
             .query_row(
                 &format!(
                     "SELECT {cols} FROM photos WHERE uuid = ?1",
                     cols = query::photo_columns("photos")
                 ),
-                params![photo_identity_for(uuid)],
+                params![identity],
                 row_to_photo,
             )
             .optional()?
@@ -982,7 +985,7 @@ impl Catalog {
             return Ok(0);
         }
         const CHUNK: usize = 999;
-        let uuids: Vec<String> = uuids.iter().map(|u| photo_identity_for(u)).collect();
+        let uuids: Vec<String> = uuids.iter().filter_map(|u| photo_identity_for(u)).collect();
         let mut total: usize = 0;
         for chunk in uuids.chunks(CHUNK) {
             // Build the parameterised placeholder list: (?1,?2,…,?N).

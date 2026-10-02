@@ -215,8 +215,20 @@ pub fn legacy_photo_identity(value: &str) -> String {
 /// bundle manifest, a deep link, a merge: [`canonical_photo_identity`] when it is a UUID,
 /// otherwise the [`legacy_photo_identity`] an older catalog's non-UUID value now stands for.
 /// Never a non-UUID: no path through here can store one as `photos.uuid` (#146).
-pub fn photo_identity_for(value: &str) -> String {
-    canonical_photo_identity(value).unwrap_or_else(|| legacy_photo_identity(value))
+///
+/// `None` for an empty or whitespace-only value (#146 review N4): that is no identity at all,
+/// not a legacy one. Mapping it to `v5("")` would make every such photo from every catalog
+/// the same photo. Schema v23 gives such a row a random v4 for the same reason.
+pub fn photo_identity_for(value: &str) -> Option<String> {
+    if is_blank_identity(value) {
+        return None;
+    }
+    Some(canonical_photo_identity(value).unwrap_or_else(|| legacy_photo_identity(value)))
+}
+
+/// True when `value` names no identity: empty, or whitespace only.
+fn is_blank_identity(value: &str) -> bool {
+    value.trim().is_empty()
 }
 
 /// Remember that `photo_id` once was `value`, when `value` is a legacy non-UUID identifier,
@@ -242,7 +254,7 @@ thread_local! {
 
 /// True when `value` is a legacy identifier worth recording: not a UUID, not empty.
 pub(super) fn is_legacy_identifier(value: &str) -> bool {
-    !value.is_empty() && !is_photo_identity(value)
+    !is_blank_identity(value) && !is_photo_identity(value)
 }
 
 /// True when a sidecar's `found` identifier is `uuid`, in either case. The sidecar is never
@@ -1508,7 +1520,7 @@ impl Catalog {
     /// The caller still binds with the raw `found`, so the foreign value stays in the
     /// sidecar and is reported as a conflict.
     pub fn scan_identity(&self, found: Option<&str>, size: i64) -> Result<Option<String>> {
-        let Some(found) = found else {
+        let Some(found) = found.filter(|v| !is_blank_identity(v)) else {
             return Ok(None);
         };
         if let Some(identity) = canonical_photo_identity(found) {
@@ -1590,10 +1602,10 @@ impl Catalog {
             .filter(|row| !matches!(row, Ok((_, uuid)) if is_photo_identity(uuid)))
             .collect::<rusqlite::Result<_>>()?;
         for (photo_id, previous) in &stale {
-            // An empty value was never in any sidecar: such a copy simply owes the write,
+            // An empty (or blank) value was never in any sidecar: such a copy owes the write,
             // which the repair pass does for a copy queued as not yet bound. It has no
             // legacy value for another catalog to agree on, so it gets an ordinary v4.
-            if previous.is_empty() {
+            if is_blank_identity(previous) {
                 let fresh = uuid::Uuid::new_v4().to_string();
                 self.remint_photo(*photo_id, previous, &fresh, &SidecarIdentity::Unreachable)?;
                 continue;
@@ -3500,5 +3512,32 @@ mod tests {
         let other = catalog.upsert_scanned_photo(&elsewhere, None, 1, 9, Some("dam:1")).unwrap();
         assert!(other.created, "x.jpg is still there, so y.jpg is another photo");
         assert_eq!(lookups(), before + 1, "a path miss does look it up");
+    }
+
+    /// #146 review N4: v23 agrees with merge that a blank `photos.uuid` names no identity. It
+    /// gets a random v4 — never `legacy_photo_identity` of whitespace, which every catalog
+    /// would share — and no legacy identifier is recorded for it.
+    #[test]
+    fn v23_gives_a_blank_identity_a_v4_and_no_legacy_record() {
+        let (catalog, root, _dir) = temp_catalog("blank-identity-v23");
+        let (id, _) = seed_photo(&catalog, &root, "x.jpg");
+        catalog
+            .conn()
+            .execute("UPDATE photos SET uuid = '  ' WHERE id = ?1", params![id])
+            .unwrap();
+        assert_eq!(catalog.remint_non_identity_photos().unwrap(), 1);
+        let uuid = photo_uuid(&catalog, id);
+        assert!(is_photo_identity(&uuid), "{uuid}");
+        assert_ne!(uuid, legacy_photo_identity("  "));
+        let legacy: i64 = catalog
+            .conn()
+            .query_row("SELECT count(*) FROM photo_legacy_identifiers", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(legacy, 0);
+
+        // A scanned sidecar with a blank identifier is no identity either: no lookup at all.
+        let before = LEGACY_LOOKUPS.with(|n| n.get());
+        assert_eq!(catalog.scan_identity(Some("  "), 9).unwrap(), None);
+        assert_eq!(LEGACY_LOOKUPS.with(|n| n.get()), before);
     }
 }

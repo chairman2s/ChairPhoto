@@ -826,6 +826,38 @@ fn an_offloaded_legacy_photo_is_not_taken_over_by_another_file_with_its_dam_id()
     assert_eq!(all, 2);
 }
 
+/// #146 review N4: an empty or blank uuid names no identity. Two bundles from different
+/// catalogs, each carrying a photo with one, keep separate rows (before, both mapped to
+/// v5("") and merged into one), neither row's identity is v5(""), and no lookup of a blank
+/// uuid finds anything. A blank-uuid photo at a path already catalogued is that photo.
+#[test]
+fn a_blank_uuid_is_no_identity_at_all() {
+    let (catalog, _root) = temp_catalog("blank-identity");
+    for (blank, rel) in [("", "a.jpg"), ("  ", "b.jpg")] {
+        let s = catalog.merge_bundle(&bare_bundle(&[(blank, rel)])).unwrap();
+        assert_eq!((s.photos_existing, s.photos_added), (0, 1), "{blank:?} at {rel}");
+    }
+    let rows = catalog.list_photos(&PhotoQuery::default()).unwrap();
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    for row in &rows {
+        assert!(chairphoto_core::catalog::is_photo_identity(&row.uuid), "{row:?}");
+        assert_ne!(row.uuid, chairphoto_core::catalog::legacy_photo_identity(""));
+    }
+    assert!(catalog.get_photo_by_uuid("").is_err());
+    assert!(catalog.get_photo_by_uuid("   ").is_err());
+    assert_eq!(catalog.count_existing_uuids(&["".to_string()]).unwrap(), 0);
+    let legacy: i64 = catalog
+        .conn()
+        .query_row("SELECT count(*) FROM photo_legacy_identifiers", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(legacy, 0, "a blank value is not a legacy identifier");
+
+    // Re-merging one of them finds it where it is, rather than a second row (or a UNIQUE error).
+    let s = catalog.merge_bundle(&bare_bundle(&[("", "a.jpg")])).unwrap();
+    assert_eq!((s.photos_existing, s.photos_added), (1, 0));
+    assert_eq!(catalog.list_photos(&PhotoQuery::default()).unwrap().len(), 2);
+}
+
 /// A bundle of `photos`, each `(uuid, relative path)`, with nothing else in it.
 fn bare_bundle(photos: &[(&str, &str)]) -> chairphoto_core::bundle::BundleManifest {
     let mut m = chairphoto_core::bundle::BundleManifest::new(

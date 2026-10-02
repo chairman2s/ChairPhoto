@@ -231,17 +231,17 @@ pub fn extract_originals_abortable(
                 // overwriting another photo's identity on the strength of a same-size
                 // filename collision. This phase holds no catalog connection, so an
                 // unbound identity is only reported here; index_bundle records it durably.
-                let found = crate::xmp::read_identifier(&dest);
-                let outcome = crate::catalog::bind_sidecar_identity(
-                    &dest,
-                    &crate::catalog::photo_identity_for(&bp.uuid),
-                    found.as_deref(),
-                );
-                if outcome != crate::catalog::SidecarIdentity::Bound {
-                    eprintln!(
-                        "bundle import: identity not bound for {} ({outcome:?}) — queued for repair",
-                        dest.display()
-                    );
+                // A blank manifest uuid is no identity (#146 N4): the indexer mints one.
+                if let Some(identity) = crate::catalog::photo_identity_for(&bp.uuid) {
+                    let found = crate::xmp::read_identifier(&dest);
+                    let outcome =
+                        crate::catalog::bind_sidecar_identity(&dest, &identity, found.as_deref());
+                    if outcome != crate::catalog::SidecarIdentity::Bound {
+                        eprintln!(
+                            "bundle import: identity not bound for {} ({outcome:?}) — queued for repair",
+                            dest.display()
+                        );
+                    }
                 }
                 // Still record as extracted so the indexer can upsert its location.
                 extracted.push(ExtractedItem {
@@ -312,8 +312,12 @@ pub fn extract_originals_abortable(
         // catalogued photo's XMP sidecar carries its UUID. A failure here is not the
         // end of it — the photo has no catalog row yet, so index_bundle is the one that
         // records the repair once the row exists.
-        if !bundle_sidecar_extracted && !sidecar_dest.exists() {
-            if let Err(e) = crate::xmp::write_identifier(&dest, &crate::catalog::photo_identity_for(&bp.uuid)) {
+        // A blank manifest uuid is no identity (#146 N4); the indexer mints one and binds it.
+        let identity = crate::catalog::photo_identity_for(&bp.uuid);
+        if let (false, false, Some(identity)) =
+            (bundle_sidecar_extracted, sidecar_dest.exists(), identity)
+        {
+            if let Err(e) = crate::xmp::write_identifier(&dest, &identity) {
                 eprintln!(
                     "bundle import: couldn't write UUID sidecar for {} — queued for repair: {e}",
                     dest.display()

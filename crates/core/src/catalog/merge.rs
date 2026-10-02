@@ -280,16 +280,33 @@ impl MergeCtx<'_> {
     /// [`super::legacy_photo_identity`] — the identity schema v23 gave that photo in every
     /// catalog — and recorded as the row's legacy identifier, so it never becomes a
     /// non-UUID `photos.uuid` again.
+    ///
+    /// A photo with an empty or blank uuid has no identity to match (#146 review N4), so it is
+    /// never matched to another catalog's such photo. It can only be the photo already at
+    /// its path — which is where the bundle importer has just indexed it, and where a second
+    /// row could not go anyway (`photos.path` is UNIQUE) — and otherwise it is inserted with a
+    /// fresh v4, as schema v23 does for such a row.
     fn merge_photo(&mut self, photo: &BundlePhoto, batch_id: i64) -> Result<()> {
-        let uuid = super::photo_identity_for(&photo.uuid);
-        let existing: Option<i64> = self
-            .tx
-            .query_row(
-                "SELECT id FROM photos WHERE uuid = ?1",
-                params![uuid],
-                |r| r.get(0),
-            )
-            .optional()?;
+        let (uuid, existing): (String, Option<i64>) = match super::photo_identity_for(&photo.uuid) {
+            Some(uuid) => {
+                let existing = self
+                    .tx
+                    .query_row("SELECT id FROM photos WHERE uuid = ?1", params![uuid], |r| r.get(0))
+                    .optional()?;
+                (uuid, existing)
+            }
+            None => {
+                let existing = self
+                    .tx
+                    .query_row(
+                        "SELECT id FROM photos WHERE path = ?1",
+                        params![photo.relative_path],
+                        |r| r.get(0),
+                    )
+                    .optional()?;
+                (uuid::Uuid::new_v4().to_string(), existing)
+            }
+        };
 
         let photo_id = match existing {
             Some(id) => {
@@ -572,7 +589,7 @@ mod tests {
                     color_label, pick_state, iptc_headline, created_at, updated_at)
                  VALUES(?1, 'existing/local.ARW', 1, 1, 'arw', 5, 'red', 'reject',
                         'Local headline', 1, 1)",
-                params![crate::catalog::photo_identity_for("photo-a")],
+                params![crate::catalog::photo_identity_for("photo-a").unwrap()],
             )
             .unwrap();
         let local = cat.get_photo_by_uuid("photo-a").unwrap();

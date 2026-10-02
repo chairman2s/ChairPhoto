@@ -160,7 +160,10 @@ its identity, because identity is the merge key and a bundle does not carry the 
 random v4 per catalog would split that photo in two at the next merge. For the same reason
 merge and bundle import map an old bundle's non-UUID id through the same function
 (`catalog::photo_identity_for`) and record it as the row's legacy identifier: no path stores a
-non-UUID `photos.uuid` any more. If v23 finds the v5 already held by another row (a migrated
+non-UUID `photos.uuid` any more. An empty or whitespace-only value is no identity at all, not
+a legacy one: v23 gives such a row a random v4, merge never matches it to another catalog's (a
+blank-uuid bundle photo is only ever the photo already at its path, or a new row), and no
+lookup finds it. If v23 finds the v5 already held by another row (a migrated
 catalog's bundle merged in first), the two rows claim one photo and it cannot tell which is
 right, so that row gets a v4 and its copies stay queued as conflicts. The legacy value itself
 is never a merge key or a deep-link target. Settings keyed by the photo's uuid (today only the

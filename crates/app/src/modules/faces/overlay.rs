@@ -192,8 +192,11 @@ impl FaceOverlay {
         };
         let images = self.images.as_ref()?.read(cx);
         // The faces' rotation is the one these pixels were rendered with only at the version
-        // it was read for (a rotation bumps it and re-reads).
-        if images.key(photo, kind).version != faces.image_version {
+        // it was read for (a rotation bumps it and re-reads). That is the Preview tier's
+        // version: an invalidate bumps every tier together, so it says whether the faces were
+        // read after the last one, whichever tier is drawn — the thumbnail's alone also moves
+        // with the Darkroom strip's cover looks (#134), which turn nothing.
+        if images.key(photo, ImageKind::Preview).version != faces.image_version {
             return None;
         }
         let ImageState::Ready(loaded) = images.peek(photo, kind) else { return None };

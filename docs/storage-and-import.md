@@ -139,9 +139,12 @@ The debt is therefore a **set of fields per photo**, in `pending_sidecar_iptc`
 - **Reported honestly.** A save that reached only the catalog answers `pending` with the
   reason (`IptcSaveOutcome`, returned by the Tauri `set_iptc` command and shown by both
   inspectors as "Saved to catalog; sidecar pending (…)"); `unchanged` when nothing was owed.
-- **Bundle import** stores each new photo's manifest IPTC through `set_iptc`, so it is owed
-  until written; the importer writes it right after its transaction commits (the bundle's own
-  sidecar need not carry it), and anything that fails stays owed. A catalog merge's insert of
+- **Bundle import** stores each new photo's manifest IPTC through `set_iptc_carried`, which
+  owes only the fields the sidecar beside the extracted file has no value for. A value that
+  sidecar does carry may be another tool's edit the source catalog never imported, so the
+  import leaves it, as a save would (#144). The importer writes the owed fields right after
+  its transaction commits, and anything that fails stays owed; a sidecar that does not parse
+  owes every field. A catalog merge's insert of
   a new row (`catalog/merge.rs`, typically a metadata-only photo with no original here)
   carries the source's IPTC without owing it.
 

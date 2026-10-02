@@ -125,6 +125,36 @@ pub fn write_iptc_fields(photo_path: &Path, fields: IptcMask, values: &IptcField
     doc.commit()
 }
 
+/// The managed IPTC fields the photo's sidecar holds a non-empty value for, in element or
+/// compact attribute form, in any `rdf:Description`. No sidecar is [`IptcMask::NONE`]; a
+/// sidecar that does not parse is an error (nothing is known about it).
+pub fn read_iptc_present(photo_path: &Path) -> Result<IptcMask, String> {
+    let path = sidecar_path(photo_path);
+    let file = match std::fs::File::open(&path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(IptcMask::NONE),
+        Err(e) => return Err(e.to_string()),
+    };
+    let root = parse_xml(file)?;
+    let Some(rdf) = root.get_child(("RDF", NS_RDF)) else {
+        return Ok(IptcMask::NONE);
+    };
+    let mut present = IptcMask::NONE;
+    for (_, desc) in element_children(rdf) {
+        if !is_rdf(desc, "Description") {
+            continue;
+        }
+        for m in &MANAGED {
+            let attr = ns_attr(desc, m.ns, m.name).is_some_and(|v| !v.trim().is_empty());
+            let element = child(desc, m.ns, m.name).is_some_and(|e| first_text(e).is_some());
+            if attr || element {
+                present = present | m.field;
+            }
+        }
+    }
+    Ok(present)
+}
+
 /// Write export keywords into the photo's XMP sidecar, merging with existing content.
 /// Manages ONLY `dc:subject` (flat) and `lr:hierarchicalSubject` — every other element
 /// (IPTC fields, develop settings, foreign namespaces) is preserved. Mirrors the

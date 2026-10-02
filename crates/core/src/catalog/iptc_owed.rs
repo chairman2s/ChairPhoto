@@ -96,6 +96,11 @@ impl IptcMask {
             .fold(Self::NONE, |a, m| a | m)
     }
 
+    /// The fields of this set that are not in `other`.
+    pub fn without(self, other: Self) -> Self {
+        Self(self.0 & !other.0)
+    }
+
     pub fn is_empty(self) -> bool {
         self.0 == 0
     }

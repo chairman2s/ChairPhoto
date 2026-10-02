@@ -1314,14 +1314,22 @@ impl Catalog {
     /// ([`IptcSidecarWrite::run`]) and records the outcome ([`Catalog::settle_iptc_write`]);
     /// a caller that does neither leaves the fields owed for the repair pass.
     pub fn set_iptc(&self, photo_id: i64, f: &IptcFields) -> Result<IptcSidecarWrite> {
+        self.set_iptc_carried(photo_id, f, IptcMask::NONE)
+    }
+
+    /// [`Catalog::set_iptc`] for values that arrive beside a sidecar of their own (a bundle
+    /// import): the fields in `carried` — the ones that sidecar already holds a value for —
+    /// are stored but not owed, so the import does not overwrite what another tool wrote
+    /// there (#144's rule; review of #148, M1). Everything else it changed is owed as usual.
+    pub fn set_iptc_carried(&self, photo_id: i64, f: &IptcFields, carried: IptcMask) -> Result<IptcSidecarWrite> {
         self.conn.execute_batch("SAVEPOINT set_iptc")?;
-        let out = self.set_iptc_owing(photo_id, f);
+        let out = self.set_iptc_owing(photo_id, f, carried);
         let end = if out.is_ok() { "RELEASE set_iptc" } else { "ROLLBACK TO set_iptc; RELEASE set_iptc" };
         self.conn.execute_batch(end)?;
         out
     }
 
-    fn set_iptc_owing(&self, photo_id: i64, f: &IptcFields) -> Result<IptcSidecarWrite> {
+    fn set_iptc_owing(&self, photo_id: i64, f: &IptcFields, carried: IptcMask) -> Result<IptcSidecarWrite> {
         let before = self.get_iptc(photo_id)?;
         self.conn.execute(
             "UPDATE photos SET iptc_description = ?1, iptc_headline = ?2, iptc_title = ?3,
@@ -1345,7 +1353,7 @@ impl Catalog {
                 photo_id
             ],
         )?;
-        self.owe_iptc(photo_id, IptcMask::changed(&before, f))
+        self.owe_iptc(photo_id, IptcMask::changed(&before, f).without(carried))
     }
 
     /// All stored metadata entries for a photo, grouped-friendly (ordered by group).

@@ -66,8 +66,9 @@ Read only the documents triggered by the task:
   identifier/import/GPS through their named elements, and face regions by Name + Area
   match. Preserve every other element/attribute and foreign namespace.
 - An existing row's IPTC changes only through `Catalog::set_iptc`, which records the fields
-  it changed as owed (`pending_sidecar_iptc`) in the transaction that stores them. (A
-  catalog merge inserting a new row carries IPTC without owing it.) A caller
+  it changed as owed (`pending_sidecar_iptc`) in the transaction that stores them. (Bundle
+  import uses `set_iptc_carried`, which does not owe a field the bundled sidecar already has
+  a value for; a catalog merge inserting a new row carries IPTC without owing it.) A caller
   resolves the original's path before that store, so an unreachable original changes
   nothing; writes the returned owed set (this change plus any earlier write that never
   landed) off the lock; and clears it only through `settle_iptc_write`'s compare-and-set,

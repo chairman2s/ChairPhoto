@@ -129,21 +129,28 @@ Working Group schema that digiKam, Lightroom and Picasa all understand. The code
 `crate::xmp` (`write_face_regions` / `read_face_regions`); the catalog-side wiring is in
 `plugins/faces/regions.rs`.
 
-**The frame.** Face boxes are stored normalized in one canonical frame: the photo as its own
-metadata orients it (the EXIF-oriented preview the indexer detects on), **without** the
-non-destructive `user_rotation`. The loupe draws the picture with the user rotation applied, so
-the overlay turns each box by it for display and turns a box drawn on the rotated picture back
-before storing it. The user rotation lives only in the catalog — the original is never rewritten
-and the sidecar carries no orientation of ours — so the export ignores it too: other tools see
-the file unturned, and so must its regions.
+**The frame.** Face boxes are stored normalized in one canonical frame, the **display frame**:
+the photo as its own metadata orients it (the EXIF-oriented preview the indexer detects on),
+**without** the non-destructive `user_rotation`. The loupe draws the picture with the user
+rotation applied, so the overlay turns each box by it for display and turns a box drawn on the
+rotated picture back before storing it. The user rotation lives only in the catalog — the
+original is never rewritten and the sidecar carries no orientation of ours — so the export
+ignores it too: other tools see the file unturned, and so must its regions.
 
-**Structure.** `mwg-rs:AppliedToDimensions` records the photo's recorded pixel size (`width` /
-`height`), never swapped for a user rotation. Known deviation: MWG 2.0 § 5.9 applies regions to
-the *stored* image ("when applying a rotation by applying Exif Orientation, the rotation must be
-applied to the regions as well"), but the stored boxes are normalized to the EXIF-*oriented*
-preview; for a file whose EXIF Orientation is not 1 the coordinates are in the oriented frame.
-Converting needs the EXIF Orientation at write and import time, which the catalog does not keep
-yet. Each region in the `RegionList`
+MWG regions use a different frame, the **stored frame**: MWG 2.0 § 5.9 requires region
+coordinates "relative to the stored image, prior to the application of the Exif Orientation
+tag", and `AppliedToDimensions` is the stored image's size. A scan records each photo's EXIF
+Orientation (`photos.exif_orientation`, 1–8, from exiftool's `EXIF:Orientation`; schema v26
+fills it for photos scanned earlier from the metadata they already stored). The export turns
+each box from the display frame into the stored frame by that orientation — all eight,
+mirrors included — and the import (`read_face_regions_in`) turns a region back before matching
+it to the detections. **An unknown orientation is never guessed:** the boxes are written and
+read as they are, and an `AppliedToDimensions` the sidecar already has is left alone.
+
+**Structure.** `mwg-rs:AppliedToDimensions` records the stored pixel size — the photo's recorded
+`width` / `height` (EXIF `ExifImageWidth` / `ExifImageHeight`) — never swapped for the EXIF
+Orientation or a user rotation. A photo with no recorded size gets no `AppliedToDimensions`
+(there is no `1×1` stand-in). Each region in the `RegionList`
 carries `mwg-rs:Name` (the person tag's leaf name), `mwg-rs:Type="Face"`, and an `mwg-rs:Area`
 whose `x`/`y` are the rectangle's normalized **center** — MWG stores centers, not corners — with
 `w`/`h` as the size. Stored bboxes are top-left-normalized, so the writer converts corner→center

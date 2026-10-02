@@ -73,8 +73,10 @@ Read only the documents triggered by the task:
 - Before ChairPhoto's first in-library write to an existing sidecar, back it up if it lacks
   `chairphoto:LastWrite`. Export-only destination copies are not subject to this rule.
 - Face-region writes replace only matching ChairPhoto regions and preserve foreign regions.
-  MWG areas use normalized center coordinates and oriented pixel dimensions. When uncertain,
-  preserve.
+  MWG areas use normalized center coordinates in the stored frame — the image before its EXIF
+  Orientation is applied (MWG 2.0 § 5.9) — and `AppliedToDimensions` is the stored pixel size;
+  ChairPhoto's face boxes are in the EXIF-oriented frame and are converted on export and
+  import. An unknown orientation is never guessed. When uncertain, preserve.
 
 ### Background work and ownership
 

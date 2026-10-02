@@ -295,7 +295,15 @@ pub fn import_regions(
     path: &std::path::Path,
     people_root: &str,
 ) {
-    let read = crate::xmp::read_face_regions(path);
+    // In the EXIF-oriented frame the detections are in (#136).
+    let frame = match regions::region_frame(conn, photo_id) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("faces_import: read the region frame of photo {photo_id} failed: {e}");
+            return;
+        }
+    };
+    let read = crate::xmp::read_face_regions_in(path, frame);
     if read.is_empty() {
         return;
     }

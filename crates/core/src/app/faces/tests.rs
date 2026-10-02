@@ -293,6 +293,32 @@ fn accepting_a_face_writes_its_region_and_preserves_a_foreign_one() {
     assert_eq!(face_state(&c, f), "unassigned");
 }
 
+/// #136: the importer reads a region in the frame the detections are in. Lightroom's region
+/// for Bob on a portrait shot (EXIF Orientation 6) is in the stored frame; the detector found
+/// Bob on the EXIF-oriented preview, where the same face sits turned 90° clockwise.
+#[test]
+fn importing_a_region_on_a_rotated_photo_matches_the_face_in_the_display_frame() {
+    let (c, root) = temp_catalog("import-rotated");
+    let p = add_photo(&c, &root, "portrait.ARW");
+    let photo_path = root.join("portrait.ARW");
+    std::fs::write(crate::xmp::sidecar_path(&photo_path), crate::xmp::region_fixtures::LIGHTROOM_ROTATED)
+        .unwrap();
+    c.conn()
+        .execute("UPDATE photos SET width = 6000, height = 4000, exif_orientation = 6 WHERE id = ?1", [p])
+        .unwrap();
+    // Bob's stored-frame box (0.225, 0.2, 0.15, 0.1), turned into the display frame.
+    let f = add_face(&c, p, "[0.7,0.225,0.1,0.15]");
+
+    import_regions(&c, c.conn(), p, &photo_path, "People");
+
+    assert_eq!(face_state(&c, f), "confirmed", "Bob's region did not match his face");
+    let bob: i64 = c
+        .conn()
+        .query_row("SELECT id FROM tags WHERE full_path = 'People/Bob'", [], |r| r.get(0))
+        .unwrap();
+    assert!(has_tag(&c, p, bob));
+}
+
 /// Assigning to a new person creates the tag under the people root and confirms the face on
 /// it; ignore drops the person; a blank name is refused before anything is created.
 #[test]

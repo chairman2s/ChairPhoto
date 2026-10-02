@@ -752,7 +752,7 @@ impl ShellState {
     }
 
     /// Put the Darkroom's print up on the pop-out loupe (`None`: the pop-out follows the
-    /// target again). For the Darkroom's "🖥 Loupe print" (#112's rails wire the toggle).
+    /// target again). The Darkroom's "🖥 Loupe print" (`Darkroom::set_print_on_loupe`).
     #[cfg(feature = "edit")]
     pub fn set_loupe_print(&mut self, print: Option<LoupePrint>, cx: &mut Context<Self>) {
         self.loupe_print = print;

@@ -96,6 +96,9 @@ struct SettingChain {
     queued: VecDeque<SettingWrite>,
 }
 
+/// "🖥 Loupe print" on or off (`"0"` off; anything else, or nothing stored, on).
+pub const PRINT_ON_LOUPE_KEY: &str = "basic-editor.printOnLoupe";
+
 /// Quiet time after a change before it is saved as a history step (React: 600 ms).
 pub const AUTOSAVE_QUIET: Duration = Duration::from_millis(600);
 
@@ -155,6 +158,8 @@ pub struct OpenPhoto {
     pub masses: Vec<f32>,
     masses_seq: u64,
     masses_timer: Option<Task<()>>,
+    /// The loupe print's settle (`Darkroom::schedule_print`).
+    print_timer: Option<Task<()>>,
     autosave_timer: Option<Task<()>>,
     /// A commit is on the worker; another change waits for it (`commit_again`).
     committing: bool,
@@ -298,6 +303,12 @@ pub struct Darkroom {
     notice_timer: Option<Task<()>>,
     /// Per setting key (the user presets, the crop overlay), the writes in the order made.
     setting_writes: HashMap<&'static str, SettingChain>,
+    /// "🖥 Loupe print" (`basic-editor.printOnLoupe`, default on): the working print is put
+    /// on the pop-out loupe (`ShellState::set_loupe_print`) after each settle.
+    pub print_on_loupe: bool,
+    /// Clicks of the print toggle: a stored value read across a click, or while a click's
+    /// write is still on the worker, is older than the click and does not undo it.
+    print_clicks: u64,
     _subscriptions: [Subscription; 2],
 }
 
@@ -338,6 +349,8 @@ impl Darkroom {
             notice: None,
             notice_timer: None,
             setting_writes: HashMap::new(),
+            print_on_loupe: true,
+            print_clicks: 0,
             _subscriptions,
         }
     }
@@ -435,6 +448,7 @@ impl Darkroom {
             masses: Vec::new(),
             masses_seq: 0,
             masses_timer: None,
+            print_timer: None,
             autosave_timer: None,
             committing: false,
             replacing: false,
@@ -589,27 +603,34 @@ impl Darkroom {
         );
     }
 
-    /// `develop.wbSlider`, `editor.renderTiming`, the crop overlay, the user presets, and the
-    /// LUT folder.
+    /// `develop.wbSlider`, `editor.renderTiming`, the crop overlay, the user presets, the
+    /// loupe print, and the LUT folder.
     fn read_settings(&mut self, seq: u64, cx: &mut Context<Self>) {
         let Some(from) = self.open.as_ref().map(|o| o.from) else { return };
         let luts_dir = self.luts_dir.clone();
+        let print_clicks = self.print_clicks;
         self.run(
             seq,
             move |state| {
-                let (wb, timing, overlay, presets) = with_catalog_as(state, from, |c| {
+                let (wb, timing, overlay, presets, print) = with_catalog_as(state, from, |c| {
                     Ok((
                         c.get_setting(WB_SLIDER_KEY)?,
                         c.get_setting(RENDER_TIMING_KEY)?,
                         c.get_setting(OVERLAY_KEY)?,
                         c.get_setting(USER_PRESETS_KEY)?,
+                        c.get_setting(PRINT_ON_LOUPE_KEY)?,
                     ))
                 })?;
                 let luts = luts_dir().and_then(|d| editing::list_luts_in(&d)).unwrap_or_default();
-                Ok((wb, timing, overlay, presets, luts))
+                Ok((wb, timing, overlay, presets, print, luts))
             },
-            |this, result, cx| {
-                if let Ok((wb, timing, overlay, presets, luts)) = result {
+            move |this, result, cx| {
+                if let Ok((wb, timing, overlay, presets, print, luts)) = result {
+                    let writing = this.setting_writes.get(PRINT_ON_LOUPE_KEY).is_some_and(|w| w.running);
+                    if this.print_clicks == print_clicks && !writing {
+                        // Default on (React: `v !== "0"`).
+                        this.print_on_loupe_read(print.as_deref() != Some("0"), cx);
+                    }
                     this.wb_prefer = WbPrefer::from_setting(wb.as_deref());
                     this.timing_log = timing.as_deref() == Some("1");
                     if let Some(o) = overlay.as_deref().and_then(CropOverlay::from_key) {
@@ -693,6 +714,9 @@ impl Darkroom {
             self.measure_auto_tone(cx);
         } else if before.1 != open.stage_json() {
             self.rendered_changed(cx);
+        } else {
+            // The stage's record leaves the crop out: the print's full record may still differ.
+            self.schedule_print(cx);
         }
     }
 
@@ -750,6 +774,7 @@ impl Darkroom {
             timer.await;
             this.update(cx, |this, cx| this.measure_masses(masses_seq, cx)).ok();
         }));
+        self.schedule_print(cx);
     }
 
     fn measure_masses(&mut self, masses_seq: u64, cx: &mut Context<Self>) {
@@ -1019,6 +1044,9 @@ impl Darkroom {
             self.flush(cx);
         }
         let Some(mut open) = self.open.take() else { return };
+        // The print was this photo's: the pop-out follows its target again.
+        open.print_timer = None;
+        self.clear_print(cx);
         // Operations queued for this photo were asked of the view being left.
         open.ops.clear();
         if !save {

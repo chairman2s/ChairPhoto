@@ -565,6 +565,18 @@ impl DarkroomView {
                 bar = bar.child(clickable(el, true, move |_, _, cx| dk.update(cx, |d, cx| d.set_clipping(!on, cx))));
             }
         }
+        {
+            let on = d.print_on_loupe;
+            let dk = self.darkroom.clone();
+            let el = chip("dk-loupe-print", "🖥 Loupe print", true, colors)
+                .when(on, |c| c.border_color(colors.accent).text_color(colors.accent))
+                .tooltip(crate::shell::title_bar::tooltip(if on {
+                    "The loupe window shows this print live — click to stop"
+                } else {
+                    "Open the loupe window and print there live"
+                }));
+            bar = bar.child(clickable(el, true, move |_, _, cx| dk.update(cx, |d, cx| d.set_print_on_loupe(!on, cx))));
+        }
         bar = bar.children(self.render_bar_actions(d, colors));
         bar.into_any_element()
     }

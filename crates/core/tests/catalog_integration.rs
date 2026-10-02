@@ -858,6 +858,54 @@ fn a_blank_uuid_is_no_identity_at_all() {
     assert_eq!(catalog.list_photos(&PhotoQuery::default()).unwrap().len(), 2);
 }
 
+/// #146 review N6: when the bundle importer writes a sidecar identity itself, it writes the
+/// mapped identity, never an old bundle's raw non-UUID id. Two paths write one:
+/// - a copied original with no sidecar in the bundle gets a fresh sidecar;
+/// - a same-size file already at the destination, with no sidecar, is bound in place.
+/// Either way the sidecar ends up with the v5 the row has, and no conflict is queued.
+#[test]
+fn the_bundle_importer_writes_an_old_bundles_id_as_its_mapped_identity() {
+    let (catalog, root) = temp_catalog("import-writes-mapped-identity");
+    let source = root.parent().unwrap().join("bundle-source");
+    let mut manifest = bare_bundle(&[("dam:asset/1", "2020/01/01/x.jpg"), ("dam:asset/2", "2020/01/02/y.jpg")]);
+    manifest.format_version = chairphoto_core::bundle::BUNDLE_FORMAT_VERSION;
+    let mut originals = std::collections::HashMap::new();
+    for (uuid, name) in [("dam:asset/1", "x.jpg"), ("dam:asset/2", "y.jpg")] {
+        let f = source.join(name);
+        std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+        std::fs::write(&f, b"notarealjpeg").unwrap();
+        originals.insert(uuid.to_string(), Some(f));
+    }
+    let bundle = root.parent().unwrap().join("old.chairphoto");
+    chairphoto_core::bundle::writer::write_bundle(
+        &chairphoto_core::bundle::writer::GatheredBundle { manifest, originals },
+        &bundle,
+        |_, _| {},
+    )
+    .unwrap();
+    // y.jpg is already in the library, same size, with no sidecar: the copy is skipped and
+    // the importer binds the identity onto the file that is there.
+    let present = root.join("2020/01/02/y.jpg");
+    std::fs::create_dir_all(present.parent().unwrap()).unwrap();
+    std::fs::write(&present, b"notarealjpeg").unwrap();
+
+    let state = chairphoto_core::app::AppState::default();
+    *state.catalog.lock().unwrap() = Some(catalog);
+    chairphoto_core::app::bundles::import_bundle(&state, &bundle).unwrap();
+    let catalog = state.catalog.lock().unwrap().take().unwrap();
+
+    for (old, rel) in [("dam:asset/1", "2020/01/01/x.jpg"), ("dam:asset/2", "2020/01/02/y.jpg")] {
+        let mapped = chairphoto_core::catalog::legacy_photo_identity(old);
+        assert_eq!(
+            chairphoto_core::xmp::read_identifier(&root.join(rel)).as_deref(),
+            Some(mapped.as_str()),
+            "{rel}'s sidecar"
+        );
+        assert_eq!(catalog.get_photo_by_uuid(&mapped).unwrap().path, rel);
+    }
+    assert!(catalog.list_pending_identity().unwrap().is_empty(), "{:#?}", catalog.list_pending_identity());
+}
+
 /// A bundle of `photos`, each `(uuid, relative path)`, with nothing else in it.
 fn bare_bundle(photos: &[(&str, &str)]) -> chairphoto_core::bundle::BundleManifest {
     let mut m = chairphoto_core::bundle::BundleManifest::new(

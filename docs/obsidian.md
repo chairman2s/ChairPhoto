@@ -137,6 +137,14 @@ bound to the catalog the photo or tag was read from: after a catalog switch, Cre
 Forget are refused rather than write a record keyed by another catalog's ids. Create stores
 its record and then opens Obsidian, so a refused write opens nothing.
 
+The other side of that order: the record is stored **before** Obsidian is asked, and the
+desktop opener does not report whether the launch worked. On Linux, GPUI hands the URI to
+`xdg-open` (or the portal) and only logs a failure — no Obsidian installed, no handler for
+`obsidian://`, or a URI too long for one argument (a long tag description, percent-encoded)
+all go unnoticed. The panel then shows **Open note** for a note Obsidian never created.
+**Forget** clears that record, and Create can be run again. (React awaited the opener before
+storing, but it too only learned of a failure to spawn, not of a handler that failed.)
+
 The photo↔note mapping is stored in the module's own settings, keyed by the subject's UUID
 — `obsidian.note.<photo-uuid>` and `obsidian.tagnote.<tag-uuid>` after the host namespaces
 them — holding the vault, the vault-relative file path, and a creation timestamp.

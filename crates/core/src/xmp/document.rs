@@ -36,8 +36,8 @@
 use std::path::{Path, PathBuf};
 use xmltree::{Element, Namespace, XMLNode};
 
-use super::{child_mut, declare_namespaces, new_root, now, plain, sidecar_backup_path,
-    sidecar_path, NS_CHAIRPHOTO, NS_RDF};
+use super::{attr_is, child_mut, declare_namespaces, new_root, now, ns_attr, parse_xml, plain,
+    sidecar_backup_path, sidecar_path, NS_CHAIRPHOTO, NS_RDF};
 
 /// When [`SidecarDocument::open`] copies the existing sidecar to `<sidecar>.chairphoto-backup`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -97,16 +97,16 @@ impl SidecarDocument {
 
         let mut root = if existed {
             let file = std::fs::File::open(&path).map_err(|e| e.to_string())?;
-            Element::parse(file).map_err(|e| format!("cannot parse {}: {e}", path.display()))?
+            parse_xml(file).map_err(|e| format!("cannot parse {}: {e}", path.display()))?
         } else {
             new_root()
         };
 
         let rdf = child_mut(&mut root, "rdf", NS_RDF, "RDF");
         let desc = child_mut(rdf, "rdf", NS_RDF, "Description");
-        desc.attributes
-            .entry("rdf:about".to_string())
-            .or_insert_with(String::new);
+        if ns_attr(desc, NS_RDF, "about").is_none() {
+            desc.attributes.insert("rdf:about".to_string(), String::new());
+        }
 
         // Back up the existing sidecar before any writer-specific mutation runs — a
         // document-level decision (see module docs), not a per-writer one.
@@ -158,16 +158,18 @@ impl SidecarDocument {
     }
 
     /// Remove every existing Description child matching one of `owned` (namespace, local-name)
-    /// pairs and append `replacements` in their place. This is the "declare what I own, add
-    /// replacements" shape shared by the plain-property writers (IPTC, keywords, identifier,
-    /// import batch, GPS): every other element — foreign namespaces, develop history, anything
-    /// this writer doesn't list in `owned` — is left exactly as parsed.
+    /// pairs — and the same property in compact attribute form (`xmp:Identifier="…"` on the
+    /// Description), which another tool may have written — and append `replacements` in
+    /// their place. This is the "declare what I own, add replacements" shape shared by the
+    /// plain-property writers (IPTC, keywords, identifier, import batch, GPS): every other
+    /// element and attribute — foreign namespaces, develop history, anything this writer
+    /// doesn't list in `owned` — is left exactly as parsed.
     ///
     /// Not used by the face-region writer, which has its own Name+Area matching rule for
     /// deciding what to keep (see `write_face_regions` in `mod.rs`).
     pub(super) fn replace_owned(&mut self, owned: &[(&str, &str)], replacements: Vec<XMLNode>) {
         let desc = self.description_mut();
-        desc.children.retain(|n| !matches_owned(n, owned));
+        remove_owned(desc, owned);
         desc.children.extend(replacements);
     }
 
@@ -176,8 +178,7 @@ impl SidecarDocument {
     /// and write the sidecar to disk, creating parent directories as needed.
     pub(super) fn commit(mut self) -> Result<(), String> {
         let desc = self.description_mut();
-        desc.children
-            .retain(|n| !matches_owned(n, &[(NS_CHAIRPHOTO, "LastWrite")]));
+        remove_owned(desc, &[(NS_CHAIRPHOTO, "LastWrite")]);
         desc.children
             .push(plain("chairphoto", NS_CHAIRPHOTO, "LastWrite", &now().to_string()));
 
@@ -196,6 +197,23 @@ fn has_chairphoto_last_write(desc: &Element) -> bool {
         matches!(n, XMLNode::Element(e)
             if e.namespace.as_deref() == Some(NS_CHAIRPHOTO) && e.name == "LastWrite")
     })
+}
+
+/// Drop the `owned` (namespace, local-name) properties from `desc`, in element form and in
+/// compact attribute form alike. Leaving the attribute form behind would give the property two
+/// values once the replacement element lands — and readers such as `read_identifier` check
+/// the attribute first, so an Overwrite would not take.
+fn remove_owned(desc: &mut Element, owned: &[(&str, &str)]) {
+    desc.children.retain(|n| !matches_owned(n, owned));
+    let doomed: Vec<String> = desc
+        .attributes
+        .keys()
+        .filter(|k| owned.iter().any(|(ns, name)| attr_is(desc, k, ns, name)))
+        .cloned()
+        .collect();
+    for key in doomed {
+        desc.attributes.remove(&key);
+    }
 }
 
 fn matches_owned(node: &XMLNode, owned: &[(&str, &str)]) -> bool {

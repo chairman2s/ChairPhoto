@@ -150,13 +150,19 @@ pub struct LegacyConversion {
 /// unprefixed `parseType`, say — is not retried on every index run. Rows of photos no longer
 /// in the catalog are dropped first. Blocking (sidecar IO per photo): run it on a worker with
 /// its own catalog connection — the faces index job runs it before indexing.
-pub fn convert_legacy_regions<R>(
+///
+/// `progress(done, total)` counts the photos this pass visits (review N3): `0/total` before
+/// the first, then after each, ending at `total/total` unless aborted. Nothing is reported
+/// when there is nothing to visit.
+pub fn convert_legacy_regions<R, P>(
     conn: &Connection,
     mut resolve: R,
     abort: &std::sync::atomic::AtomicBool,
+    mut progress: P,
 ) -> rusqlite::Result<LegacyConversion>
 where
     R: FnMut(i64) -> Result<Option<std::path::PathBuf>, String>,
+    P: FnMut(usize, usize),
 {
     super::store::ensure_schema(conn)?;
     conn.execute("DELETE FROM faces__legacy_regions WHERE photo_id NOT IN (SELECT id FROM photos)", [])?;
@@ -170,7 +176,9 @@ where
         rows.collect::<rusqlite::Result<_>>()?
     };
     let mut out = LegacyConversion::default();
-    for photo in photos {
+    let total = photos.len();
+    for (done, photo) in photos.into_iter().enumerate() {
+        progress(done, total);
         if abort.load(std::sync::atomic::Ordering::Relaxed) {
             out.aborted = true;
             break;
@@ -203,6 +211,9 @@ where
                 out.failed += 1;
             }
         }
+    }
+    if total > 0 && !out.aborted {
+        progress(total, total);
     }
     Ok(out)
 }
@@ -598,11 +609,11 @@ mod tests {
             stmt.query_map([], |r| r.get(0)).unwrap().collect::<rusqlite::Result<_>>().unwrap()
         };
 
-        let first = convert_legacy_regions(&conn, resolve, &abort).unwrap();
+        let first = convert_legacy_regions(&conn, resolve, &abort, |_, _| {}).unwrap();
         assert_eq!(first, LegacyConversion { refused: 1, offline: 1, ..Default::default() });
         assert_eq!(std::fs::read_to_string(&sidecar).unwrap(), PRE_138_MANGLED);
         assert_eq!(refused(&conn), [1]);
-        let second = convert_legacy_regions(&conn, resolve, &abort).unwrap();
+        let second = convert_legacy_regions(&conn, resolve, &abort, |_, _| {}).unwrap();
         assert_eq!(second, LegacyConversion { offline: 1, ..Default::default() }, "photo 1 tried again");
         let left: Vec<i64> = record(&conn).into_iter().map(|r| r.1).collect();
         assert_eq!(left, [1, 2], "both keep their record");

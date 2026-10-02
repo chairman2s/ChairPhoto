@@ -400,6 +400,41 @@ fn the_index_job_converts_the_pre_marker_regions_first() {
     assert_eq!(left, [p2], "the written photo spends its record, the offline one keeps it");
 }
 
+/// Review N3: the conversion reports through the index job's own progress — the status slot
+/// and `faces:progress` with the job's id — counting photos to convert, `0/n` to `n/n`, before
+/// the index's own count, instead of a silent `0/0` for however long the pass takes.
+#[test]
+fn the_index_jobs_conversion_reports_progress() {
+    use std::sync::Mutex;
+    struct Recorder {
+        state: AppState,
+        seen: Mutex<Vec<(usize, usize, u64, Option<(usize, usize)>)>>,
+    }
+    impl EventSink for Recorder {
+        fn send(&self, event: CoreEvent) {
+            if let CoreEvent::FacesProgress(p) = event {
+                let slot = self.state.jobs.faces.status().unwrap().map(|s| (s.done, s.total));
+                self.seen.lock().unwrap().push((p.done, p.total, p.job, slot));
+            }
+        }
+    }
+    let (c, root) = temp_catalog("legacy-pass-progress");
+    pre_marker_photo(&c, &root, "p1.NEF");
+    pre_marker_photo(&c, &root, "p2.NEF");
+    let state = state_with(c);
+    let claim = begin_index_job(&state, None).unwrap();
+    let job = claim.job;
+    let recorder = Recorder { state: state.clone(), seen: Mutex::new(Vec::new()) };
+    run_index_job(&recorder, claim);
+    let seen = recorder.seen.lock().unwrap().clone();
+    assert!(seen.len() >= 3, "{seen:?}");
+    assert_eq!(
+        seen[..3],
+        [(0, 2, job, Some((0, 2))), (1, 2, job, Some((1, 2))), (2, 2, job, Some((2, 2)))],
+        "{seen:?}"
+    );
+}
+
 /// The pass stops at the job's abort flag: nothing written, every record row kept.
 #[test]
 fn an_aborted_index_job_leaves_the_pre_marker_record() {

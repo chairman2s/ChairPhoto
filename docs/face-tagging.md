@@ -270,8 +270,10 @@ the unprefixed `parseType` a pre-#138 build's xmltree left behind, or an `Applie
 of another frame — is tried once and then set aside (`faces__legacy_refused`, counted as
 `refused`): the same write would be refused on every run until the file changes. It keeps its
 record, so a face verb that later writes the photo still adopts or removes its old regions, and
-that write clears the refusal. Repairing such sidecars is #143's. It reports no progress of its
-own (the index's `faces:progress` starts after it) and logs what it did. It is part of the index
+that write clears the refusal. Repairing such sidecars is #143's. Its progress goes out through
+the index job's own status and `faces:progress` — photos converted of photos to convert, `0/n`
+to `n/n` — before the index's own count starts again from `0`; there is no phase label, which
+would need a new field in both front ends. It logs a summary of what it did. It is part of the index
 job rather than a job of its own to keep this branch small: the record is a one-time backlog,
 indexing is the faces job a user runs, and it already owns the faces worker. A catalog that is
 never indexed again keeps its record until a face verb touches each photo.

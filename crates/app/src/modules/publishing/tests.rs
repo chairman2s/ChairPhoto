@@ -679,3 +679,70 @@ fn a_second_publish_does_not_stop_the_first(cx: &mut TestAppContext) {
     assert_eq!(publications(&app, ids[1]).len(), 1);
     assert_eq!(crate::tests::status(&app, cx), "Published to Fakr.");
 }
+
+/// The review's probe order (#124 M1): the new catalog is read (`CatalogRead` for B) before
+/// `catalog:switched` is delivered. The read binds the settings to B and loads B's keys; the
+/// event then clears the fields — and must unbind, so the switch's own catalog read rebinds
+/// and reloads B's keys instead of leaving blank fields bound to B. Until that load lands,
+/// Save and Connect refuse; once it has, Save writes B's own keys back, never blanks.
+#[gpui_kit::test]
+fn oauth_settings_reload_when_the_new_catalog_is_read_before_the_switch_event(cx: &mut TestAppContext) {
+    let dir = TempDir::new("publish-oauth-early-read");
+    let app = start(cx);
+    with_files(&app, &dir, 1, cx);
+    work(cx);
+    app.state.catalog.lock().unwrap().as_ref().unwrap().set_setting(&format!("{FAKR}.api_key"), "key-a").unwrap();
+    let host = host(&app, cx);
+    let calls = Arc::new(Mutex::new(Calls::default()));
+    let service: Arc<dyn PublishService> = Arc::new(Fake { calls, answer: String::new() });
+    let view = cx
+        .update_window(app.window(), |_, window, cx| {
+            let (settings, model) = (host.settings(), host.model().clone());
+            let view = cx.new(|cx| OAuthSettings::new(settings, &model, service, window, cx));
+            crate::modules::dialog::open("Settings", 560., true, view.clone(), window, cx);
+            view
+        })
+        .unwrap();
+    work(cx);
+    let key = |cx: &mut TestAppContext| {
+        cx.update_window(app.window(), |_, window, cx| {
+            window.render_frame(cx);
+            view.read(cx).key.read(cx).value().to_string()
+        })
+        .unwrap()
+    };
+    assert_eq!(key(cx), "key-a");
+
+    let (b, _) = colliding_catalog(&dir, "b", 1);
+    b.set_setting(&format!("{FAKR}.api_key"), "key-b").unwrap();
+    b.set_setting(&format!("{FAKR}.api_secret"), "secret-b").unwrap();
+    core_switch(&app, b);
+    // An ordinary refresh reads B before catalog:switched is delivered.
+    app.wired.model.update(cx, |m, cx| m.refresh(cx));
+    work(cx);
+    deliver_switch(&app, cx);
+    assert_eq!(key(cx), "", "A's or B's key shown across the switch event");
+
+    // The switch's own read (on the background executor) has landed: the settings are
+    // rebound to B, but B's keys have not loaded yet — the fields are blank. Save and Connect
+    // write nothing.
+    let b_identity = chairphoto_core::app::catalog_identity(&app.state).unwrap();
+    view.read_with(cx, |v, _| assert_eq!(v.bound_catalog(), Some(b_identity), "rebound to B by the switch's read"));
+    assert_eq!(key(cx), "", "B's load landed already");
+    view.update(cx, |v, cx| v.save(cx));
+    let saved = view.read_with(cx, |v, _| v.status.clone());
+    view.update(cx, |v, cx| v.connect(cx));
+    let connected = view.read_with(cx, |v, _| v.status.clone());
+    work(cx);
+    assert_eq!(setting(&app, "fakr.api_key").as_deref(), Some("key-b"), "blank fields saved over B's key");
+    assert_eq!(setting(&app, "fakr.api_secret").as_deref(), Some("secret-b"), "blank fields saved over B's secret");
+    assert_eq!((saved.as_str(), connected.as_str()), (super::oauth::NOT_LOADED, super::oauth::NOT_LOADED));
+
+    // The switch's own read rebinds to B and reloads: B's keys show, and Save keeps them.
+    assert_eq!(key(cx), "key-b", "blank fields left bound to B");
+    view.update(cx, |v, cx| v.save(cx));
+    work(cx);
+    view.read_with(cx, |v, _| assert_eq!(v.status, "Saved."));
+    assert_eq!(setting(&app, "fakr.api_key").as_deref(), Some("key-b"));
+    assert_eq!(setting(&app, "fakr.api_secret").as_deref(), Some("secret-b"));
+}

@@ -405,6 +405,13 @@ impl ModuleSettings {
         ModuleSettings { app: self.app.clone(), prefix: self.prefix.clone(), catalog: Some(catalog) }
     }
 
+    /// The same module's settings, bound to no catalog: every read and write fails closed
+    /// ([`SETTINGS_NOT_READY`]) until a long-lived view [`rebound`](Self::rebound)s it — what such
+    /// a view holds from `catalog:switched` until it has read which catalog is open.
+    pub fn unbound(&self) -> ModuleSettings {
+        ModuleSettings { app: self.app.clone(), prefix: self.prefix.clone(), catalog: None }
+    }
+
     pub fn get(&self, key: &str) -> Result<Option<String>, String> {
         let key = self.key(key);
         with_catalog_as(&self.app, self.bound()?, |c| c.get_setting(&key))

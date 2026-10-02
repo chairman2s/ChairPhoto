@@ -9,11 +9,12 @@ use crate::catalog::IptcFields;
 /// (merge-safe: `xmp::write_iptc` touches only the managed IPTC fields whose catalog value
 /// this save changed, so a sidecar value ChairPhoto never imported survives a save that
 /// left that field alone — issue #144). The sidecar sits next to the original the location
-/// resolver finds; with no reachable copy the catalog keeps the values and the error says
-/// why the sidecar was not written.
+/// resolver finds. With no reachable copy the save fails closed: the error says why, and
+/// neither the catalog nor the sidecar changes, so a retry once the original is back writes
+/// the whole change (a stored change with no sidecar write would make a retry a no-op).
 ///
-/// Blocking: the catalog lock is held only for the read of the previous values, the store
-/// and the path lookup — one hold, so the change written is the change stored — and the
+/// Blocking: the catalog lock is held only for the path lookup, the read of the previous
+/// values and the store — one hold, so the change written is the change stored — and the
 /// sidecar's read-modify-write runs after it is released. Call it off the UI thread.
 pub fn save_iptc(state: &AppState, photo_id: i64, fields: &IptcFields) -> Result<(), String> {
     let (original, before) = with_catalog(state, |c| store(c, photo_id, fields))?;
@@ -33,15 +34,18 @@ pub fn save_iptc_as(
     crate::xmp::write_iptc(&original, &before, fields)
 }
 
-/// Store `fields`, returning the original's path and the values they replaced.
+/// Store `fields`, returning the original's path and the values they replaced. The path is
+/// resolved before the row is written (as the geocoder's `fill_in` does), so an unreachable
+/// original leaves the catalog unchanged.
 fn store(
     c: &crate::catalog::Catalog,
     photo_id: i64,
     fields: &IptcFields,
 ) -> crate::catalog::Result<(std::path::PathBuf, IptcFields)> {
+    let original = c.require_photo_path(photo_id)?;
     let before = c.get_iptc(photo_id)?;
     c.set_iptc(photo_id, fields)?;
-    Ok((c.require_photo_path(photo_id)?, before))
+    Ok((original, before))
 }
 
 #[cfg(test)]
@@ -99,6 +103,33 @@ mod tests {
             assert_eq!(iptc(&xml), expected, "{layout}:\n{xml}");
             assert_non_iptc_intact(&xml, layout);
         }
+    }
+
+    /// A save while the original is offline fails closed: an error, the catalog row and the
+    /// sidecar unchanged. Once the original is back, the retry — the same fields, as the
+    /// still-dirty form sends them — writes the whole change. (Storing first made the retry's
+    /// diff empty, so it reported success and never wrote the sidecar: review of 3ce3835, H1.)
+    #[test]
+    fn an_offline_save_changes_nothing_and_the_retry_writes_the_sidecar() {
+        let (dir, state, id, xmp) = foreign_photo("iptc-144-offline", crate::xmp::test_fixtures::LIGHTROOM);
+        let file = dir.join("library").join("DSC144.ARW");
+        let away = dir.join("DSC144.ARW.away");
+        std::fs::rename(&file, &away).unwrap();
+
+        let typed = IptcFields { title: "Mine".into(), creator: "Me".into(), ..Default::default() };
+        let err = save_iptc(&state, id, &typed).unwrap_err();
+        assert!(err.contains("no reachable copy"), "{err}");
+        let stored = state.catalog.lock().unwrap().as_ref().unwrap().get_iptc(id).unwrap();
+        assert_eq!(stored, IptcFields::default(), "an offline save must not change the catalog");
+        assert_eq!(read(&xmp), crate::xmp::test_fixtures::LIGHTROOM, "nor the sidecar");
+
+        std::fs::rename(&away, &file).unwrap();
+        save_iptc(&state, id, &typed).unwrap();
+        let xml = read(&xmp);
+        let expected = with(with(foreign_iptc(), "dc:title", &["Mine"]), "dc:creator", &["Me"]);
+        assert_eq!(iptc(&xml), expected, "the retry must write the change:\n{xml}");
+        let stored = state.catalog.lock().unwrap().as_ref().unwrap().get_iptc(id).unwrap();
+        assert_eq!(stored, typed);
     }
 
     /// A creator the user sets replaces the foreign one wherever it sits — Description #2 in

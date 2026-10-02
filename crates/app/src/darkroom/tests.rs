@@ -1000,3 +1000,76 @@ fn rails_writes_fail_closed_across_a_switch(cx: &mut TestAppContext) {
         assert_eq!(c.list_versions(photo).unwrap()[0].edit_json, "{}");
     });
 }
+
+/// The Darkroom's keys stand down while the proof sheet or the duel is up (React's
+/// filmstrip `keysDisabled`): under the proof sheet — which binds only Esc — ← / → do not
+/// step the filmstrip, Enter does not zoom to the crop, and Ctrl+Z / Ctrl+Shift+Z / Ctrl+Y
+/// do not move the history; under the duel — which binds the arrows, ↓ and Esc — Ctrl+Z,
+/// Ctrl+Y and Enter do nothing either. Each key is first shown to act with no overlay up.
+#[gpui_kit::test]
+fn the_darkroom_keys_stand_down_under_the_proof_sheet_and_the_duel(cx: &mut TestAppContext) {
+    use super::view::Overlay;
+    let rig = rig("dk-key-guard", 2, cx);
+    let photo = rig.open_photo(cx);
+    work(cx); // the auto-tone fragment
+    advance(cx, SETTLE);
+    let key = rig.pool.last_batch()[0].clone();
+    rig.pool.finish(&key, Ok(pixels(6, 4)));
+    cx.run_until_parked();
+    rig.with_view(cx, |v, _, cx| v.set_aspect("1:1", cx));
+    rig.settle_and_save(cx);
+    rig.slide(Control::Tone(ToneKey::Ev), 0.5, cx);
+    rig.settle_and_save(cx);
+    let v = rig.versions()[0].id;
+    let head = rig.labels(v).1;
+    assert_eq!(head, Some(2), "Before, the crop, the exposure");
+    let stage_view = |cx: &mut TestAppContext| rig.view(cx).read_with(cx, |v, _| v.stage_view());
+    let overlay = |cx: &mut TestAppContext| {
+        rig.view(cx).read_with(cx, |v, _| match v.overlay() {
+            Some(Overlay::Proof(_)) => "proof",
+            Some(Overlay::Duel(_)) => "duel",
+            None => "none",
+        })
+    };
+
+    // With no overlay up, each key acts.
+    rig.press("enter", cx);
+    assert!(!stage_view(cx).is_fit(), "Enter zooms to the crop");
+    rig.press("escape", cx);
+    assert!(stage_view(cx).is_fit());
+    rig.press("ctrl-z", cx);
+    work(cx);
+    assert_eq!(rig.labels(v).1, Some(1), "Ctrl+Z undoes");
+    rig.press("ctrl-y", cx);
+    work(cx);
+    assert_eq!(rig.labels(v).1, head, "Ctrl+Y redoes");
+
+    // Under the proof sheet: nothing.
+    rig.with_view(cx, |v, window, cx| v.open_proof_sheet(window, cx));
+    assert_eq!(overlay(cx), "proof");
+    for key in ["right", "left", "ctrl-z", "ctrl-shift-z", "ctrl-y", "enter"] {
+        rig.press(key, cx);
+        work(cx);
+        assert_eq!(rig.open_photo(cx), photo, "{key} under the proof sheet does not step the filmstrip");
+        assert!(stage_view(cx).is_fit(), "{key} under the proof sheet does not zoom");
+        assert_eq!(rig.labels(v).1, head, "{key} under the proof sheet does not move the history");
+        if key != "enter" {
+            assert_eq!(overlay(cx), "proof", "{key}: the sheet stays up");
+        }
+    }
+    // Enter is the focused backdrop's keyboard click: the sheet declines and closes (its own
+    // behaviour, `loupe::proof_sheet`) — but the Darkroom did not also take it as "zoom".
+    assert_eq!(overlay(cx), "none", "Enter declines the sheet");
+
+    // Under the duel: no undo, redo or zoom.
+    rig.with_view(cx, |v, window, cx| v.open_duel(window, cx));
+    assert_eq!(overlay(cx), "duel");
+    for key in ["ctrl-z", "ctrl-shift-z", "ctrl-y", "enter"] {
+        rig.press(key, cx);
+        work(cx);
+        assert_eq!(rig.labels(v).1, head, "{key} under the duel does not move the history");
+        assert!(stage_view(cx).is_fit(), "{key} under the duel does not zoom");
+        assert_eq!(overlay(cx), "duel", "{key}: the duel stays up");
+    }
+    assert_eq!(rig.saved(v)["tone"]["ev"], json!(0.5), "the version is as it was");
+}

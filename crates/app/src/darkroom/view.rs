@@ -372,7 +372,10 @@ impl DarkroomView {
             return;
         }
         // The proof sheet and the duel own the keys while they are up (React's filmstrip
-        // `keysDisabled`): their arrows and Esc must not also step or fit the stage.
+        // `keysDisabled`): their arrows and Esc must not also step or fit the stage. Not only
+        // defensive: the proof sheet binds Esc alone, so without this ← / → would step the
+        // filmstrip under it, Enter zoom to the crop, and Ctrl+Z / Ctrl+Y move the history
+        // under either overlay (`the_darkroom_keys_stand_down_under_the_proof_sheet_and_the_duel`).
         if self.rails.overlay_open() {
             return;
         }

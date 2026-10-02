@@ -250,7 +250,13 @@ impl SidecarDocument {
 
         let mut buf = Vec::new();
         self.root.write(&mut buf).map_err(|e| e.to_string())?;
-        write_atomically(&self.folder, &self.original, &self.path, &buf)
+        let written = write_atomically(&self.folder, &self.original, &self.path, &buf);
+        let Self { folder, _turn, .. } = self;
+        drop(_turn); // the sweep below needs no file lock: it touches no sidecar
+        if written.is_ok() {
+            folder.sweep_stale_temps();
+        }
+        written
     }
 }
 
@@ -369,6 +375,7 @@ impl Folder {
             use rustix::fs::{Mode, OFlags};
             let (flags, mode) = match flags {
                 OpenFor::Read => (OFlags::RDONLY, Mode::empty()),
+                OpenFor::ReadNoFollow => (OFlags::RDONLY | OFlags::NOFOLLOW, Mode::empty()),
                 OpenFor::WriteExisting => (OFlags::WRONLY, Mode::empty()),
                 OpenFor::CreateNew => (OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL, Mode::from_raw_mode(0o666)),
                 OpenFor::Replace => (OFlags::WRONLY | OFlags::CREATE | OFlags::TRUNC, Mode::from_raw_mode(0o666)),
@@ -379,7 +386,7 @@ impl Folder {
         {
             let mut options = std::fs::OpenOptions::new();
             match flags {
-                OpenFor::Read => options.read(true),
+                OpenFor::Read | OpenFor::ReadNoFollow => options.read(true),
                 OpenFor::WriteExisting => options.write(true),
                 OpenFor::CreateNew => options.write(true).create_new(true),
                 OpenFor::Replace => options.write(true).create(true).truncate(true),
@@ -425,6 +432,8 @@ impl Folder {
 #[derive(Clone, Copy)]
 enum OpenFor {
     Read,
+    /// For reading, failing on a symbolic link (on Unix).
+    ReadNoFollow,
     /// For writing, neither creating nor truncating: asks whether we may write the file.
     WriteExisting,
     CreateNew,
@@ -447,9 +456,10 @@ enum OpenFor {
 ///   only at the rename: the last one wins whole.
 /// * **On failure** this writer's own temp file is removed and the sidecar is untouched — a
 ///   read-only volume fails at the temp file's creation, before anything changed. No other
-///   temp file is ever removed: one left by a crash (killed between the write and the rename)
-///   stays as a hidden file, because from here it cannot be told apart from another
-///   process's write in progress.
+///   temp file is removed here: a fresh one left by a crash (killed between the write and the
+///   rename) cannot be told apart from another process's write in progress. Once it is a day
+///   old it can, and a later successful write to its folder removes it
+///   ([`Folder::sweep_stale_temps`]).
 /// * **Permissions** of an existing sidecar are carried over (best effort: a filesystem that
 ///   cannot set them, such as some SMB mounts, keeps its own). A sidecar this process may not
 ///   write is refused, as the in-place write it replaces was — a rename would otherwise
@@ -544,6 +554,71 @@ fn temp_path(sidecar: &Path) -> PathBuf {
 }
 
 const TEMP_SUFFIX: &str = ".chairphoto-tmp";
+
+/// Whether `name` is a temp file [`temp_path`] made: `.<name>.<pid>-<12 hex>.chairphoto-tmp`.
+/// Nothing else is ever swept.
+fn is_temp_name(name: &std::ffi::OsStr) -> bool {
+    let Some(rest) = name.to_str().and_then(|n| n.strip_prefix('.')).and_then(|n| n.strip_suffix(TEMP_SUFFIX)) else {
+        return false;
+    };
+    let Some((sidecar, tag)) = rest.rsplit_once('.') else { return false };
+    let Some((pid, random)) = tag.split_once('-') else { return false };
+    !sidecar.is_empty()
+        && !pid.is_empty()
+        && pid.bytes().all(|b| b.is_ascii_digit())
+        && random.len() == 12
+        && random.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// How old a temp file must be before [`Folder::sweep_stale_temps`] removes it. A write holds
+/// its temp file for the time it takes to write and sync one sidecar; a day leaves room for
+/// any clock skew between the machines sharing a NAS folder.
+const STALE_TEMP_AGE: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+
+/// The folders this process has swept (by the path they were opened at): each is listed at
+/// most once per run, so a folder of thousands of photos is not listed on every save.
+static SWEPT: std::sync::Mutex<std::collections::BTreeSet<PathBuf>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
+
+impl Folder {
+    /// Remove the temp files ([`is_temp_name`]) older than [`STALE_TEMP_AGE`] in this folder:
+    /// left by a write killed between its create and its rename, never another write in
+    /// progress (#155 R4). Called after a successful commit, once per folder per run, with no
+    /// lock held. Best effort: a file that cannot be read or removed is left.
+    fn sweep_stale_temps(&self) {
+        if !SWEPT.lock().unwrap_or_else(|e| e.into_inner()).insert(self.path.clone()) {
+            return;
+        }
+        let now = std::time::SystemTime::now();
+        for name in self.temp_names() {
+            let stale = self
+                .open_with(&name, OpenFor::ReadNoFollow)
+                .and_then(|f| f.metadata())
+                .is_ok_and(|m| m.is_file() && m.modified().is_ok_and(|t| now.duration_since(t).is_ok_and(|age| age > STALE_TEMP_AGE)));
+            if stale {
+                let _ = self.remove(&name);
+            }
+        }
+    }
+
+    /// The names in this folder that are ChairPhoto temp files.
+    fn temp_names(&self) -> Vec<std::ffi::OsString> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt as _;
+            let Ok(dir) = rustix::fs::Dir::read_from(&self.fd) else { return Vec::new() };
+            dir.filter_map(Result::ok)
+                .map(|e| std::ffi::OsStr::from_bytes(e.file_name().to_bytes()).to_os_string())
+                .filter(|n| is_temp_name(n))
+                .collect()
+        }
+        #[cfg(not(unix))]
+        {
+            let Ok(entries) = std::fs::read_dir(&self.path) else { return Vec::new() };
+            entries.filter_map(Result::ok).map(|e| e.file_name()).filter(|n| is_temp_name(n)).collect()
+        }
+    }
+}
 
 /// Whether any top-level `rdf:Description` carries `chairphoto:LastWrite`: exiftool keeps one
 /// Description per namespace, so the stamp need not sit in the first (#147).
@@ -894,7 +969,8 @@ mod tests {
 
     /// A temp file a crash left behind (killed between write and rename) — or another
     /// process's write in progress, which looks the same — neither blocks the next write nor is
-    /// read as the sidecar, and is left alone (F2 of the #149 review).
+    /// read as the sidecar, and while fresh is left alone (F2 of the #149 review; a day-old one
+    /// is swept, see `a_write_sweeps_day_old_temps_of_its_folder_once`).
     #[test]
     fn a_temp_left_by_a_crash_is_left_alone_and_does_not_block_the_next_write() {
         let (_dir, p) = photo("doc-149-sweep", "L.ARW");
@@ -1117,6 +1193,59 @@ mod tests {
         let xml = std::fs::read_to_string(sidecar_path(&away.join("R.ARW"))).unwrap();
         assert!(xml.contains("history_end") && xml.contains("<chairphoto:Foo>bar</chairphoto:Foo>"), "{xml}");
         assert_eq!(temps_beside(&sidecar_path(&away.join("R.ARW"))), Vec::<String>::new());
+    }
+
+    /// #155 R4: a successful write removes the temp files a crash left in its folder once they
+    /// are a day old — only names of the temp pattern, never a fresh one (another write may be
+    /// in progress), never anything else — and lists a folder only once per run.
+    #[test]
+    fn a_write_sweeps_day_old_temps_of_its_folder_once() {
+        let (dir, p) = photo("doc-155-sweep", "T.ARW");
+        let xmp = sidecar_path(&p);
+        std::fs::write(&xmp, FOREIGN).unwrap();
+        let aged = |path: &Path| {
+            std::fs::write(path, "<x:xmpmeta><half").unwrap();
+            let file = std::fs::File::options().write(true).open(path).unwrap();
+            file.set_modified(std::time::SystemTime::now() - STALE_TEMP_AGE - std::time::Duration::from_secs(60)).unwrap();
+        };
+        let crashed = temp_path(&xmp);
+        aged(&crashed);
+        let other_sidecars = temp_path(&dir.join("U.ARW.xmp"));
+        aged(&other_sidecars);
+        let fresh = temp_path(&xmp);
+        std::fs::write(&fresh, "<x:xmpmeta><in progress").unwrap();
+        let not_ours = [dir.join(".T.ARW.xmp.chairphoto-tmp"), dir.join(".T.ARW.xmp.12-notahexsuffix.chairphoto-tmp"),
+            dir.join("T.ARW.xmp.12-0123456789ab.chairphoto-tmp")];
+        for path in &not_ours {
+            aged(path);
+        }
+
+        let mut doc = SidecarDocument::open(&p).unwrap();
+        set_prop(&mut doc, "Foo", "bar");
+        doc.commit().unwrap();
+
+        assert!(!crashed.exists() && !other_sidecars.exists(), "a day-old temp stayed");
+        assert!(fresh.exists(), "a fresh temp (a write in progress?) was removed");
+        for path in &not_ours {
+            assert!(path.exists(), "{} is not a temp name of ours", path.display());
+        }
+
+        // Listed once per run: a stale temp that appears later stays through the next write.
+        let later = temp_path(&xmp);
+        aged(&later);
+        SidecarDocument::open(&p).unwrap().commit().unwrap();
+        assert!(later.exists(), "the folder was listed again");
+    }
+
+    #[test]
+    fn only_the_temp_pattern_is_a_temp_name() {
+        let made = temp_path(Path::new("/library/DSC1.ARW.xmp"));
+        assert!(is_temp_name(made.file_name().unwrap()), "{made:?}");
+        for name in [".DSC1.ARW.xmp.chairphoto-tmp", ".DSC1.ARW.xmp.1-0123456789ab.chairphoto-tmpx",
+            ".DSC1.ARW.xmp.x1-0123456789ab.chairphoto-tmp", ".DSC1.ARW.xmp.1-0123456789AB.chairphoto-tmp",
+            "..1-0123456789ab.chairphoto-tmp", "DSC1.ARW.xmp", ".DSC1.ARW.xmp.-0123456789ab.chairphoto-tmp"] {
+            assert!(!is_temp_name(std::ffi::OsStr::new(name)), "{name}");
+        }
     }
 
     /// A symlinked sidecar is written through to its target; the link stays a link.

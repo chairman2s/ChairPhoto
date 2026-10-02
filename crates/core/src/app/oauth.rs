@@ -5,8 +5,9 @@
 //!    its secret in the service's settings, and returns the authorize URL the user opens.
 //! 2. The user approves in the browser and pastes back the verifier code.
 //! 3. [`complete_auth`] exchanges the stored request token + verifier for the access token,
-//!    stores it, and clears the request token — so a verifier is accepted only after this
-//!    install's own Connect, and only once.
+//!    stores it and clears the request token in one catalog write — so a verifier is accepted
+//!    only after this install's own Connect, and only once, and the token and its secret are
+//!    never stored apart.
 //!
 //! There is no loopback callback: the verifier is pasted, so nothing listens on a port. The
 //! request token is the flow's state (a verifier for any other token fails at the service).
@@ -117,17 +118,16 @@ pub fn complete_auth(api: &dyn OAuthApi, settings: &dyn ServiceSettings, service
         return Err(CONNECT_FIRST.into());
     }
     let at = api.access_token(&key, &secret, &token, &token_secret, verifier.trim())?;
-    settings.set(ACCESS_TOKEN, &at.token)?;
-    settings.set(ACCESS_SECRET, &at.secret)?;
-    if let Some(nsid) = at.user_nsid.as_deref() {
-        settings.set(USER_NSID, nsid)?;
-    } else if settings.get(USER_NSID)?.is_some() {
-        // A reconnect to an account whose answer has no NSID must not keep the old one.
-        settings.set(USER_NSID, "")?;
-    }
-    settings.set(REQUEST_TOKEN, "")?;
-    settings.set(REQUEST_SECRET, "")?;
-    Ok(())
+    // One write, all or nothing: a catalog switch can land before it (it then fails closed,
+    // writing nothing) or after it, never between a token and its secret. An answer without
+    // an NSID clears the old one: a reconnect to another account must not keep it.
+    settings.set_all(&[
+        (ACCESS_TOKEN, &at.token),
+        (ACCESS_SECRET, &at.secret),
+        (USER_NSID, at.user_nsid.as_deref().unwrap_or("")),
+        (REQUEST_TOKEN, ""),
+        (REQUEST_SECRET, ""),
+    ])
 }
 
 /// In-memory settings and a fake token service, for the flows' tests here and in the
@@ -160,6 +160,13 @@ pub(crate) mod fake {
         }
         fn set(&self, key: &str, value: &str) -> Result<(), String> {
             self.0.lock().unwrap().insert(key.into(), value.into());
+            Ok(())
+        }
+        fn set_all(&self, pairs: &[(&str, &str)]) -> Result<(), String> {
+            let mut map = self.0.lock().unwrap();
+            for (k, v) in pairs {
+                map.insert((*k).into(), (*v).into());
+            }
             Ok(())
         }
     }
@@ -214,6 +221,73 @@ mod tests {
         let c = credentials(&s, "flickr").unwrap();
         let shown = format!("{c:?}");
         assert!(!shown.contains("access-") && !shown.contains("\"s\""), "Debug shows a secret: {shown}");
+    }
+
+    /// Finishing stores the access token and its secret in one catalog write: a catalog switch
+    /// landing right after the first write Finish makes cannot leave the catalog with the new
+    /// token and the old secret (or anything in the catalog opened since). The settings here
+    /// are bound to catalog A (`with_catalog_as`, as the GPUI module's are) and switch to B
+    /// after their first write.
+    #[test]
+    fn a_switch_during_finish_cannot_leave_a_mixed_token_pair() {
+        use crate::app::{with_catalog_as, AppState, CatalogIdentity};
+        use crate::catalog::Catalog;
+        use std::sync::Mutex;
+        struct SwitchAfterFirstWrite {
+            state: AppState,
+            read: CatalogIdentity,
+            next: Mutex<Option<Catalog>>,
+        }
+        impl SwitchAfterFirstWrite {
+            fn switch_once(&self) {
+                if let Some(b) = self.next.lock().unwrap().take() {
+                    crate::app::detach_catalog_and_trip_jobs(&self.state).unwrap();
+                    crate::app::publish_catalog_and_reset_jobs(&self.state, b).unwrap();
+                }
+            }
+        }
+        impl ServiceSettings for SwitchAfterFirstWrite {
+            fn get(&self, key: &str) -> Result<Option<String>, String> {
+                with_catalog_as(&self.state, self.read, |c| c.get_setting(&format!("flickr.{key}")))
+            }
+            fn set(&self, key: &str, value: &str) -> Result<(), String> {
+                let written = with_catalog_as(&self.state, self.read, |c| c.set_setting(&format!("flickr.{key}"), value));
+                self.switch_once();
+                written
+            }
+            fn set_all(&self, pairs: &[(&str, &str)]) -> Result<(), String> {
+                let keys: Vec<String> = pairs.iter().map(|(k, _)| format!("flickr.{k}")).collect();
+                let pairs: Vec<(&str, &str)> = keys.iter().zip(pairs).map(|(k, (_, v))| (k.as_str(), *v)).collect();
+                let written = with_catalog_as(&self.state, self.read, |c| c.set_settings(&pairs));
+                self.switch_once();
+                written
+            }
+        }
+        let dir = crate::test_support::TestTmpDir::new("oauth-finish-switch");
+        let a_db = dir.join("a.chairphoto");
+        let a = Catalog::open(&a_db, &dir.join("a")).unwrap();
+        for (k, v) in [(API_KEY, "k"), (API_SECRET, "s"), (ACCESS_TOKEN, "old-tok"), (ACCESS_SECRET, "old-sec"), (REQUEST_TOKEN, "rt-1"), (REQUEST_SECRET, "rs")] {
+            a.set_setting(&format!("flickr.{k}"), v).unwrap();
+        }
+        let state = AppState::default();
+        *state.catalog.lock().unwrap() = Some(a);
+        let read = crate::app::catalog_identity(&state).unwrap();
+        let b = Catalog::open(&dir.join("b.chairphoto"), &dir.join("b")).unwrap();
+        let settings = SwitchAfterFirstWrite { state: state.clone(), read, next: Mutex::new(Some(b)) };
+        let api = FakeTokens::default();
+        api.issued.lock().unwrap().push("rt-1".into());
+
+        // The one write lands in A before the switch it triggers, so Finish succeeds.
+        let finished = complete_auth(&api, &settings, "flickr", "ok-verifier");
+        assert_ne!(crate::app::catalog_identity(&state).unwrap(), read, "the switch landed");
+        let a = Catalog::open(&a_db, &dir.join("a")).unwrap();
+        let get = |k: &str| a.get_setting(&format!("flickr.{k}")).unwrap().unwrap_or_default();
+        let pair = (get(ACCESS_TOKEN), get(ACCESS_SECRET));
+        assert_eq!(pair, ("access-tok".to_string(), "access-sec".to_string()), "catalog A holds a mixed or stale token pair");
+        assert_eq!((get(REQUEST_TOKEN), get(REQUEST_SECRET)), (String::new(), String::new()), "the request token outlived Finish");
+        finished.unwrap();
+        let b_token = crate::app::with_catalog(&state, |c| c.get_setting("flickr.access_token")).unwrap();
+        assert_eq!(b_token, None, "Finish wrote into the catalog opened since");
     }
 
     /// Finish without Connect, keys missing, and a refused verifier: each says what to do and

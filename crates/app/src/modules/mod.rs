@@ -415,6 +415,14 @@ impl ModuleSettings {
         with_catalog_as(&self.app, self.bound()?, |c| c.set_setting(&key, value))
     }
 
+    /// Set every pair in one transaction under one catalog lock, bound like [`Self::set`]: all
+    /// of them land in the bound catalog, or none does.
+    pub fn set_all(&self, pairs: &[(&str, &str)]) -> Result<(), String> {
+        let keys: Vec<String> = pairs.iter().map(|(k, _)| self.key(k)).collect();
+        let pairs: Vec<(&str, &str)> = keys.iter().zip(pairs).map(|(k, (_, v))| (k.as_str(), *v)).collect();
+        with_catalog_as(&self.app, self.bound()?, |c| c.set_settings(&pairs))
+    }
+
     fn bound(&self) -> Result<CatalogIdentity, String> {
         self.catalog.ok_or_else(|| SETTINGS_NOT_READY.to_string())
     }
@@ -430,6 +438,10 @@ impl chairphoto_core::app::uploads::ServiceSettings for ModuleSettings {
 
     fn set(&self, key: &str, value: &str) -> Result<(), String> {
         ModuleSettings::set(self, key, value)
+    }
+
+    fn set_all(&self, pairs: &[(&str, &str)]) -> Result<(), String> {
+        ModuleSettings::set_all(self, pairs)
     }
 }
 

@@ -80,6 +80,9 @@ impl UploadService {
 pub trait ServiceSettings: Send + Sync {
     fn get(&self, key: &str) -> Result<Option<String>, String>;
     fn set(&self, key: &str, value: &str) -> Result<(), String>;
+    /// Set every pair in one catalog write — all of them or none, in one catalog: for values
+    /// that must never be seen half-written (an OAuth access token and its secret).
+    fn set_all(&self, pairs: &[(&str, &str)]) -> Result<(), String>;
 }
 
 /// [`ServiceSettings`] over whichever catalog is open, under `<prefix>.` (the Tauri commands).
@@ -104,6 +107,12 @@ impl ServiceSettings for CatalogSettings {
     fn set(&self, key: &str, value: &str) -> Result<(), String> {
         let key = format!("{}.{key}", self.prefix);
         super::with_catalog(&self.state, |c| c.set_setting(&key, value))
+    }
+
+    fn set_all(&self, pairs: &[(&str, &str)]) -> Result<(), String> {
+        let keys: Vec<String> = pairs.iter().map(|(k, _)| format!("{}.{k}", self.prefix)).collect();
+        let pairs: Vec<(&str, &str)> = keys.iter().zip(pairs).map(|(k, (_, v))| (k.as_str(), *v)).collect();
+        super::with_catalog(&self.state, |c| c.set_settings(&pairs))
     }
 }
 
@@ -480,6 +489,9 @@ mod tests {
                 Ok(self.0.map(String::from))
             }
             fn set(&self, _: &str, _: &str) -> Result<(), String> {
+                Ok(())
+            }
+            fn set_all(&self, _: &[(&str, &str)]) -> Result<(), String> {
                 Ok(())
             }
         }

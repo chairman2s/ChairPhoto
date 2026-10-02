@@ -276,9 +276,32 @@ fn parse_object(obj: &serde_json::Map<String, serde_json::Value>) -> Option<(Pat
             .and_then(|v| parse_leading_f64(&v)),
         gps_longitude: first(&["Composite:GPSLongitude", "EXIF:GPSLongitude"])
             .and_then(|v| parse_leading_f64(&v)),
+        exif_orientation: first(&["EXIF:Orientation"]).and_then(|v| parse_exif_orientation(&v)),
     };
 
     Some((path, PhotoMetadata { promoted, entries }))
+}
+
+/// The EXIF Orientation code (1-8) from what exiftool prints for `EXIF:Orientation`: its
+/// phrase in the main pass ("Rotate 90 CW"), or the bare number under `-Orientation#` (the
+/// AF-point pass). Anything else is `None`: unknown, never guessed (#136).
+pub fn parse_exif_orientation(value: &str) -> Option<u8> {
+    let value = value.trim();
+    if let Ok(code) = value.parse::<u8>() {
+        return (1..=8).contains(&code).then_some(code);
+    }
+    // exiftool's PrintConv for EXIF:Orientation (Image::ExifTool::Exif, tag 0x0112).
+    Some(match value {
+        "Horizontal (normal)" => 1,
+        "Mirror horizontal" => 2,
+        "Rotate 180" => 3,
+        "Mirror vertical" => 4,
+        "Mirror horizontal and rotate 270 CW" => 5,
+        "Rotate 90 CW" => 6,
+        "Mirror horizontal and rotate 90 CW" => 7,
+        "Rotate 270 CW" => 8,
+        _ => return None,
+    })
 }
 
 /// Convert a JSON scalar to a display string; ignore arrays/objects/null.
@@ -333,6 +356,50 @@ fn normalize_datetime(s: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every phrase exiftool prints for `EXIF:Orientation`, as captured from exiftool 13.55
+    /// writing each code into a JPEG, and the bare code `-Orientation#` gives.
+    #[test]
+    fn parses_every_exif_orientation() {
+        let phrases = [
+            "Horizontal (normal)",
+            "Mirror horizontal",
+            "Rotate 180",
+            "Mirror vertical",
+            "Mirror horizontal and rotate 270 CW",
+            "Rotate 90 CW",
+            "Mirror horizontal and rotate 90 CW",
+            "Rotate 270 CW",
+        ];
+        for (i, phrase) in phrases.iter().enumerate() {
+            let code = i as u8 + 1;
+            assert_eq!(parse_exif_orientation(phrase), Some(code), "{phrase}");
+            assert_eq!(parse_exif_orientation(&code.to_string()), Some(code));
+        }
+        for unknown in ["", "0", "9", "Unknown (0)", "rotate 90 cw"] {
+            assert_eq!(parse_exif_orientation(unknown), None, "{unknown:?}");
+        }
+    }
+
+    /// A scan promotes the main pass's `EXIF:Orientation` phrase to the column; a file
+    /// without one is unknown, not 1.
+    #[test]
+    fn scan_promotes_the_exif_orientation() {
+        let object = |extra: serde_json::Value| {
+            let mut obj = serde_json::json!({"SourceFile": "/p/a.jpg", "EXIF:ImageWidth": 6000});
+            obj.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            obj.as_object().unwrap().clone()
+        };
+        let (_, meta) = parse_object(&object(serde_json::json!({"EXIF:Orientation": "Rotate 90 CW"})))
+            .unwrap();
+        assert_eq!(meta.promoted.exif_orientation, Some(6));
+        let (_, meta) = parse_object(&object(serde_json::json!({}))).unwrap();
+        assert_eq!(meta.promoted.exif_orientation, None);
+        // XMP's tiff:Orientation is not the file's EXIF and is not read for it.
+        let (_, meta) = parse_object(&object(serde_json::json!({"XMP:Orientation": "Rotate 90 CW"})))
+            .unwrap();
+        assert_eq!(meta.promoted.exif_orientation, None);
+    }
 
     #[test]
     fn parses_numbers_and_dates() {

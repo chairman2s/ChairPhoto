@@ -93,6 +93,8 @@ raw = []
 # verified by inspecting target/release/.fingerprint/rusqlite-*/lib-rusqlite.json.
 [dev-dependencies]
 rusqlite = { version = "0.31", features = ["hooks"] }
+# A second, independent XMP reader for the face-region tests (namespace-aware, not xml-rs).
+roxmltree = "0.20"
 
 [build-dependencies]
 # Only used when the `raw` feature is on (gated inside build.rs by CARGO_FEATURE_RAW);

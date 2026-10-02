@@ -17,6 +17,8 @@ use document::SidecarDocument;
 pub mod lock;
 #[cfg(test)]
 pub(crate) mod test_fixtures;
+#[cfg(test)]
+pub(crate) mod region_fixtures;
 
 const NS_X: &str = "adobe:ns:meta/";
 const NS_RDF: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#";
@@ -194,7 +196,7 @@ pub fn read_identifier(photo_path: &Path) -> Option<String> {
     let path = sidecar_path(photo_path);
     let file = std::fs::File::open(&path).ok()?;
     let root = parse_xml(file).ok()?;
-    let rdf = root.get_child(("RDF", NS_RDF))?;
+    let rdf = rdf_of(&root)?;
     for node in &rdf.children {
         let XMLNode::Element(desc) = node else { continue };
         if desc.name != "Description" {
@@ -295,7 +297,7 @@ pub fn read_import_batch(photo_path: &Path) -> Option<String> {
     let path = sidecar_path(photo_path);
     let file = std::fs::File::open(&path).ok()?;
     let root = parse_xml(file).ok()?;
-    let rdf = root.get_child(("RDF", NS_RDF))?;
+    let rdf = rdf_of(&root)?;
     for node in &rdf.children {
         let XMLNode::Element(desc) = node else { continue };
         if desc.name != "Description" {
@@ -344,7 +346,7 @@ pub fn read_gps(photo_path: &Path) -> Option<(f64, f64)> {
     let path = sidecar_path(photo_path);
     let file = std::fs::File::open(&path).ok()?;
     let root = parse_xml(file).ok()?;
-    let rdf = root.get_child(("RDF", NS_RDF))?;
+    let rdf = rdf_of(&root)?;
     let mut lat_str: Option<String> = None;
     let mut lng_str: Option<String> = None;
     for node in &rdf.children {
@@ -468,19 +470,25 @@ fn dms_to_decimal(s: &str) -> Option<f64> {
 //
 // Confirmed faces are written to the sidecar as MWG Regions — the Metadata Working
 // Group schema that digiKam, Lightroom and Picasa understand. A `mwg-rs:Regions`
-// property carries `mwg-rs:AppliedToDimensions` (the oriented pixel size the region
-// coordinates apply to) plus a `mwg-rs:RegionList` (an rdf:Bag of region structs).
+// property carries `mwg-rs:AppliedToDimensions` (the pixel size of the stored image the
+// region coordinates apply to) plus a `mwg-rs:RegionList` (an rdf:Bag of region structs).
+//
+// MWG 2.0 § 5.9 measures regions on the **stored** image, before its EXIF Orientation is
+// applied ("A Creator or Changer MUST express region coordinates, width and height relative
+// to the stored image, prior to the application of the Exif Orientation tag"). ChairPhoto
+// measures faces on the EXIF-oriented preview, so the writer turns each box into the stored
+// frame and the reader turns it back (#136). See [`RegionFrame`].
 // Each region has a `mwg-rs:Name`, `mwg-rs:Type='Face'` and a `mwg-rs:Area` whose
 // `stArea:x/y` are the **CENTER** of the rectangle (MWG stores centers, not top-left),
 // with `stArea:w/h` and `stArea:unit='normalized'`.
 //
 // This write is merge-safe like the rest of this module, but with an extra twist: the
 // RegionList may already contain regions written by *other tools* (digiKam etc.). We edit the
-// existing Regions in place, replace only the regions chairphoto itself wrote and preserve
-// every foreign region; a Regions laid out in a way we do not recognise is not written. A
-// chairphoto-written region is identified by matching its Name against one of the names we
-// are about to write AND its center-Area being within `AREA_EPSILON` of the incoming region
-// — when in doubt we preserve. See AGENTS.md ("XMP Sidecar Convention").
+// existing Regions in place, replace or remove only the regions chairphoto itself wrote and
+// preserve every foreign region; a Regions laid out in a way we do not recognise is not
+// written. A region chairphoto writes carries its marker, a `chairphoto:FaceId` field (#135);
+// a region without one is foreign — or was written before the marker existed, see
+// [`write_face_regions`] — and when in doubt we preserve. See AGENTS.md ("XMP safety").
 
 /// Epsilon (in normalized coordinates) for deciding whether an existing region is "the same"
 /// as one chairphoto is writing — i.e. previously written by us for that same person. Coarse
@@ -488,38 +496,133 @@ fn dms_to_decimal(s: &str) -> Option<f64> {
 /// while a re-detection of the same face drifts far less than this.
 const AREA_EPSILON: f32 = 0.02;
 
-/// One face region for the MWG writer. `bbox` is the stored **top-left** normalized rectangle
-/// (`x, y` = top-left corner, `w, h` = size, all 0–1 of the oriented image) — exactly what
-/// `faces__faces.bbox` holds. The writer converts it to MWG's center form.
+/// One face region for the MWG writer. `bbox` is the **top-left** normalized rectangle
+/// (`x, y` = top-left corner, `w, h` = size, all 0–1 of the EXIF-oriented image, the frame
+/// the faces are detected and drawn in) — exactly what `faces__faces.bbox` holds. The writer
+/// turns it into the stored frame ([`RegionFrame`]) and MWG's center form.
 #[derive(Debug, Clone, PartialEq)]
 pub struct FaceRegion {
+    /// The face's `faces__faces.id`, written as the region's `chairphoto:FaceId` marker (#135).
+    pub face_id: i64,
     /// Person tag leaf name (the region's `mwg-rs:Name`).
     pub name: String,
-    /// Top-left-normalized bbox: `(x, y, w, h)`, each 0–1 of the oriented image.
+    /// Top-left-normalized bbox: `(x, y, w, h)`, each 0–1 of the EXIF-oriented image.
     pub bbox: (f32, f32, f32, f32),
 }
 
-/// A region parsed back out of a sidecar by [`read_face_regions`]. Coordinates are converted
-/// from MWG's center form back to the **top-left** normalized bbox chairphoto stores.
+/// A region parsed back out of a sidecar. Coordinates are converted from MWG's center form
+/// back to a **top-left** normalized bbox: in the file's own frame from [`read_face_regions`],
+/// in the EXIF-oriented frame ChairPhoto stores from [`read_face_regions_in`].
 #[derive(Debug, Clone, PartialEq)]
 pub struct ReadRegion {
     /// `mwg-rs:Name` (may be empty for an unnamed region).
     pub name: String,
-    /// Top-left-normalized bbox: `(x, y, w, h)`, each 0–1 of the applied-to dimensions.
+    /// Top-left-normalized bbox: `(x, y, w, h)`, each 0–1.
     pub bbox: (f32, f32, f32, f32),
 }
 
-/// Write the given confirmed face regions into the photo's XMP sidecar as `mwg-rs:Regions`,
-/// merge-safely. `oriented_w`/`oriented_h` are the photo's oriented pixel dimensions, written
-/// as `mwg-rs:AppliedToDimensions` (the reference frame the normalized Area coords apply to).
+/// What the catalog knows of a photo's frames, for converting its face boxes (#136).
 ///
-/// Merge-safety (binding, AGENTS.md): the existing `mwg-rs:Regions` is edited in place, never
-/// rebuilt. Every foreign region in its `RegionList`, every foreign attribute or child of
-/// `Regions`, `AppliedToDimensions` and the list, and every foreign XML element anywhere else
-/// in the sidecar is preserved. Only regions chairphoto previously wrote (matched by Name +
-/// center-Area within [`AREA_EPSILON`]) are changed, and only in their Area's coordinates:
-/// such a region's other fields and foreign attributes and children stay (#140). Each incoming
-/// region updates at most one existing region. The `Regions` may sit in any top-level
+/// Face boxes live in the **display** frame: the image as its EXIF Orientation turns it.
+/// MWG regions and their `AppliedToDimensions` live in the **stored** frame: the pixels as the
+/// file holds them, before the Orientation is applied (MWG 2.0 § 5.9). The non-destructive
+/// user rotation plays no part in either; it is the catalog's alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RegionFrame {
+    /// The original's EXIF Orientation code (1-8), `None` when unknown. Unknown is never
+    /// guessed: the boxes are written as they are and an existing `AppliedToDimensions` is
+    /// left alone.
+    pub orientation: Option<u8>,
+    /// The stored image's pixel size (`photos.width`/`height`, EXIF `ExifImageWidth`/`Height`),
+    /// `None` when unknown — then no `AppliedToDimensions` is written.
+    pub stored_size: Option<(u32, u32)>,
+}
+
+/// Where a normalized point `(u, v)` of the stored image lands in the image displayed under
+/// EXIF Orientation `o` — the turn the preview the faces are detected on went through.
+fn stored_to_display_point(o: u8, (u, v): (f32, f32)) -> (f32, f32) {
+    match o {
+        2 => (1.0 - u, v),       // mirror horizontal
+        3 => (1.0 - u, 1.0 - v), // rotate 180
+        4 => (u, 1.0 - v),       // mirror vertical
+        5 => (v, u),             // mirror horizontal and rotate 270 CW (transpose)
+        6 => (1.0 - v, u),       // rotate 90 CW
+        7 => (1.0 - v, 1.0 - u), // mirror horizontal and rotate 90 CW (transverse)
+        8 => (v, 1.0 - u),       // rotate 270 CW
+        _ => (u, v),
+    }
+}
+
+/// The inverse of [`stored_to_display_point`]: 6 and 8 undo each other, every other
+/// orientation undoes itself.
+fn display_to_stored_point(o: u8, p: (f32, f32)) -> (f32, f32) {
+    let inverse = match o {
+        6 => 8,
+        8 => 6,
+        o => o,
+    };
+    stored_to_display_point(inverse, p)
+}
+
+/// A top-left bbox mapped point by point: both corners, then the box they span.
+fn map_bbox(
+    bbox: (f32, f32, f32, f32),
+    point: impl Fn((f32, f32)) -> (f32, f32),
+) -> (f32, f32, f32, f32) {
+    let (x, y, w, h) = bbox;
+    let (ax, ay) = point((x, y));
+    let (bx, by) = point((x + w, y + h));
+    (ax.min(bx), ay.min(by), (ax - bx).abs(), (ay - by).abs())
+}
+
+/// A display-frame box in the stored frame of a photo with EXIF Orientation `o`.
+fn display_to_stored(o: u8, bbox: (f32, f32, f32, f32)) -> (f32, f32, f32, f32) {
+    map_bbox(bbox, |p| display_to_stored_point(o, p))
+}
+
+/// A stored-frame box in the display frame of a photo with EXIF Orientation `o`.
+fn stored_to_display(o: u8, bbox: (f32, f32, f32, f32)) -> (f32, f32, f32, f32) {
+    map_bbox(bbox, |p| stored_to_display_point(o, p))
+}
+
+/// Write the given confirmed face regions into the photo's XMP sidecar as `mwg-rs:Regions`,
+/// merge-safely. The boxes are in the display frame; with a known EXIF Orientation in `frame`
+/// they are written in the stored frame MWG measures regions in, and a new
+/// `AppliedToDimensions` is the stored size. With an unknown orientation they are written as
+/// they are (#136).
+///
+/// An `AppliedToDimensions` the sidecar already has is **never rewritten** (#145): the regions
+/// other tools wrote are normalized against it, so changing it would move them. ChairPhoto's
+/// regions are written in the frame it declares instead — see [`region_target`] — and when
+/// that frame is not one of this image's (another aspect, or which way it is turned cannot be
+/// told), the write is refused and the sidecar left as it was.
+///
+/// `regions` is the photo's whole current set: every region ChairPhoto writes carries a
+/// `chairphoto:FaceId` marker, `<catalog>/<face id>` ([`face_marker`]; `catalog` is the
+/// writing catalog's identity, `catalog::CATALOG_UUID_KEY`), and on each write ChairPhoto
+/// **replaces or removes only regions carrying this catalog's marker** (#135), and only for a
+/// face this catalog knows on this photo: one in `regions`, or one in `retired` — this
+/// catalog's faces on this photo that have left the set (rejected, ignored, unnamed). Such a
+/// region whose face is retired is removed; one whose face is in the set is moved to the face's
+/// geometry and name. Every other region is foreign and kept — unmarked, marked by another
+/// catalog (a rebuilt one, a second one over the same folders), marked with a face id this
+/// catalog does not know on this photo (a copy of this catalog's file shares its identity,
+/// review N1), or carrying a marker this build does not recognise:
+///
+/// - When its Name and center-Area (within [`AREA_EPSILON`]) match a face being written, it is
+///   that face already in the file, and only its Area's coordinates change; its other fields,
+///   foreign attributes and children stay (#140), and no marked copy is appended.
+/// - `legacy` is the catalog's record of the faces ChairPhoto exported **before the marker
+///   existed** (face id, name and box at that time, in the display frame those writes used).
+///   An unmarked region in exactly the pre-marker writer's shape ([`is_pre_marker_shape`])
+///   matching such a face by Name + Area was ChairPhoto's: it is adopted (moved and marked)
+///   when the face is still in the set, removed when it is not. Any other shape is foreign.
+///
+/// Each incoming region claims at most one existing region. Merge-safety (binding, AGENTS.md):
+/// the existing `mwg-rs:Regions` is edited in place, never rebuilt. Every foreign region in
+/// its `RegionList`, every foreign attribute or child of `Regions`, `AppliedToDimensions` and
+/// the list, and every foreign XML element anywhere else in the sidecar is preserved. The
+/// `Regions` may sit in any top-level
 /// `rdf:Description` (exiftool writes one per namespace), and its struct values may be written
 /// with `rdf:parseType="Resource"`, as a nested `rdf:Description`, or (for
 /// `AppliedToDimensions`) as attributes. The list may be an `rdf:Bag` or an `rdf:Seq`.
@@ -528,65 +631,244 @@ pub struct ReadRegion {
 /// struct in a form it cannot read) is **not** written: the write fails with an error and the
 /// sidecar is left as it was. Losing a region another tool wrote is worse than missing ours.
 ///
-/// When `regions` is empty nothing in the sidecar's regions changes: there is no region to add,
-/// and a region that matches nothing being written is kept.
+/// A write that changes nothing in the regions — an empty set and no region of ours, or the
+/// set already as the file has it — leaves the sidecar untouched (it creates none).
 ///
 /// Backs up a pre-existing foreign sidecar once before the first write, mirroring the other
 /// managed-property writers.
 pub fn write_face_regions(
     photo_path: &Path,
+    catalog: &str,
     regions: &[FaceRegion],
-    oriented_w: u32,
-    oriented_h: u32,
-) -> Result<(), String> {
+    retired: &[i64],
+    legacy: &[FaceRegion],
+    frame: RegionFrame,
+) -> Result<(), RegionWriteError> {
+    if catalog.is_empty() || catalog.contains('/') {
+        return Err(RegionWriteError::Failed(format!("face regions not written: {catalog:?} is no catalog identity")));
+    }
     let mut doc = SidecarDocument::open(photo_path)?;
+    // Written only into a Regions that has no AppliedToDimensions of its own.
+    let dims = frame.stored_size;
 
     // Regions don't fit `replace_owned`'s "strip a fixed set of (ns, name) pairs, push flat
     // replacements" shape: which existing `rdf:li` entries to keep is decided per-entry by
-    // Name + center-Area matching (AGENTS.md), not by a static owned-node list. So this writer
-    // reaches into the Description directly instead.
-    if !regions.is_empty() {
-        let rdf = doc.rdf_mut();
-        let found = find_description_properties(rdf, NS_MWG_RS, "Regions");
-        match found.as_slice() {
-            [] => {
-                let desc = doc.description_mut();
-                declare_region_namespaces(desc);
-                let lis = regions.iter().map(region_li).collect();
-                desc.children.push(XMLNode::Element(new_regions(oriented_w, oriented_h, lis)));
+    // marker, Name + center-Area matching (AGENTS.md), not by a static owned-node list. So this
+    // writer reaches into the Description directly instead.
+    let rdf = doc.rdf_mut();
+    let found = find_description_properties(rdf, NS_MWG_RS, "Regions");
+    match found.as_slice() {
+        [] if regions.is_empty() => return Ok(()),
+        [] => {
+            let target = region_target(frame, None).expect("no dimensions, no conflict");
+            let desc = doc.description_mut();
+            declare_region_namespaces(desc);
+            let lis = regions.iter().map(|r| marked_li(&target.write(r), catalog)).collect();
+            desc.children.push(XMLNode::Element(new_regions(dims, lis)));
+        }
+        [(d, p)] => {
+            let existing = element_at(element_at(rdf, *d), *p);
+            let layout = regions_layout(existing)
+                .map_err(|why| unrecognised_regions(photo_path, &why))?;
+            let declared = layout.dims.map(|i| {
+                let body = struct_body(existing).expect("regions_layout checked the form");
+                applied_dimensions(element_at(body, i))
+            });
+            // With nothing to write, the frame only matters for what is removed, which is
+            // found by its marker or in the legacy frame.
+            let target = match regions {
+                [] => RegionTarget::AsIs,
+                _ => region_target(frame, declared)
+                    .map_err(|why| unrecognised_frame(photo_path, &why))?,
+            };
+            let regions: Vec<FaceRegion> = regions.iter().map(|r| target.write(r)).collect();
+            let mut edited = existing.clone();
+            update_regions(&mut edited, catalog, &regions, retired, legacy, dims)
+                .map_err(|why| unrecognised_regions(photo_path, &why))?;
+            if edited == *existing {
+                return Ok(());
             }
-            [(d, p)] => {
-                let desc = element_at_mut(rdf, *d);
-                declare_region_namespaces(desc);
-                update_regions(element_at_mut(desc, *p), regions, oriented_w, oriented_h)
-                    .map_err(|why| unrecognised_regions(photo_path, &why))?;
-            }
-            more => {
-                let why = format!("it holds {} mwg-rs:Regions properties", more.len());
-                return Err(unrecognised_regions(photo_path, &why));
-            }
+            let desc = element_at_mut(rdf, *d);
+            declare_region_namespaces(desc);
+            *element_at_mut(desc, *p) = edited;
+        }
+        more => {
+            let why = format!("it holds {} mwg-rs:Regions properties", more.len());
+            return Err(unrecognised_regions(photo_path, &why));
         }
     }
 
-    doc.commit()
+    Ok(doc.commit()?)
 }
 
-fn unrecognised_regions(photo_path: &Path, why: &str) -> String {
-    format!(
+fn unrecognised_frame(photo_path: &Path, why: &str) -> RegionWriteError {
+    RegionWriteError::Refused(format!(
+        "{}: face regions not written, sidecar left unchanged: {why}",
+        sidecar_path(photo_path).display()
+    ))
+}
+
+/// Why [`write_face_regions`] wrote nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RegionWriteError {
+    /// The sidecar's own content rules the write out — a `Regions` laid out in a way this
+    /// writer does not recognise, or declaring a frame it cannot place its boxes in — and the
+    /// sidecar was left as it was. Writing again changes nothing until the file does.
+    Refused(String),
+    /// Anything else: the sidecar could not be read, parsed or written (IO, a volume gone, an
+    /// unparseable file), or the caller passed no catalog identity. Trying again may succeed.
+    Failed(String),
+}
+
+impl std::fmt::Display for RegionWriteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Refused(why) | Self::Failed(why) => f.write_str(why),
+        }
+    }
+}
+
+impl From<String> for RegionWriteError {
+    fn from(why: String) -> Self {
+        Self::Failed(why)
+    }
+}
+
+/// The frame ChairPhoto's boxes are written in, and read back from, for one `mwg-rs:Regions`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RegionTarget {
+    /// The boxes as they are: the orientation is unknown, or the sidecar's own
+    /// `AppliedToDimensions` declares the display frame.
+    AsIs,
+    /// The stored frame of a photo with this EXIF Orientation (MWG 2.0 § 5.9).
+    Stored(u8),
+}
+
+impl RegionTarget {
+    /// A display-frame face as it is written.
+    fn write(self, r: &FaceRegion) -> FaceRegion {
+        match self {
+            Self::AsIs => r.clone(),
+            Self::Stored(o) => FaceRegion { bbox: display_to_stored(o, r.bbox), ..r.clone() },
+        }
+    }
+
+    /// A region as read, in the display frame.
+    fn read(self, bbox: (f32, f32, f32, f32)) -> (f32, f32, f32, f32) {
+        match self {
+            Self::AsIs => bbox,
+            Self::Stored(o) => stored_to_display(o, bbox),
+        }
+    }
+}
+
+/// The size an `AppliedToDimensions` declares, or why it declares none ChairPhoto can use.
+fn applied_dimensions(dims: &Element) -> Result<(f64, f64), String> {
+    let body = struct_body(dims).ok_or("its AppliedToDimensions is not a struct")?;
+    let side = |f| {
+        struct_field(body, NS_STDIM, f)
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v > 0.0)
+    };
+    match (side("w"), side("h")) {
+        (Some(w), Some(h)) => Ok((w, h)),
+        _ => Err("its AppliedToDimensions declares no usable width and height".into()),
+    }
+}
+
+/// Which frame ChairPhoto's boxes go into a `Regions` whose `AppliedToDimensions` is
+/// `declared` (`None`: it has none), never changing that declaration (#145):
+///
+/// - Unknown orientation: as they are (#136, never guessed).
+/// - No declared size, or ChairPhoto's own old `1x1` stand-in, which declares no frame: the
+///   stored frame, as MWG requires.
+/// - A size with the stored image's aspect (the same image, perhaps resized): the stored frame.
+/// - A size with the aspect swapped, on a photo whose orientation turns it a quarter (5-8):
+///   the display frame that size describes — the regions already there are measured in it.
+/// - Anything else — another aspect, a swapped one the orientation does not explain, or a
+///   quarter-turned photo whose stored size is unknown, so which frame is declared cannot be
+///   told — is `Err`: the write is refused rather than mixing frames.
+fn region_target(
+    frame: RegionFrame,
+    declared: Option<Result<(f64, f64), String>>,
+) -> Result<RegionTarget, String> {
+    let Some(o) = frame.orientation else {
+        return Ok(RegionTarget::AsIs);
+    };
+    let stored = RegionTarget::Stored(o);
+    let quarter = (5..=8).contains(&o);
+    let (dw, dh) = match declared {
+        None => return Ok(stored),
+        Some(Ok((w, h))) if w == 1.0 && h == 1.0 => return Ok(stored),
+        Some(Ok(size)) => size,
+        Some(Err(why)) => return Err(why),
+    };
+    let Some((sw, sh)) = frame.stored_size else {
+        return if quarter {
+            Err(format!(
+                "its AppliedToDimensions {dw}x{dh} may be either frame of a photo turned a quarter \
+                 (EXIF Orientation {o}), and the photo's own size is not known"
+            ))
+        } else {
+            Ok(stored)
+        };
+    };
+    let (sw, sh) = (f64::from(sw), f64::from(sh));
+    let same_aspect = |w: f64, h: f64| ((dw / dh) / (w / h) - 1.0).abs() <= ASPECT_TOLERANCE;
+    if same_aspect(sw, sh) {
+        Ok(stored)
+    } else if quarter && same_aspect(sh, sw) {
+        Ok(RegionTarget::AsIs)
+    } else {
+        Err(format!(
+            "its AppliedToDimensions {dw}x{dh} is not a frame of this {sw}x{sh} image \
+             (EXIF Orientation {o})"
+        ))
+    }
+}
+
+/// How far two aspect ratios may differ and still be one image's: a resize rounds each side
+/// to a whole pixel, and a RAW's recorded size can differ from a converter's by a few pixels.
+const ASPECT_TOLERANCE: f64 = 0.01;
+
+fn unrecognised_regions(photo_path: &Path, why: &str) -> RegionWriteError {
+    RegionWriteError::Refused(format!(
         "{}: face regions not written, sidecar left unchanged: {why}, a layout ChairPhoto \
          does not recognise",
         sidecar_path(photo_path).display()
-    )
+    ))
+}
+
+/// The photo's MWG face regions in the display frame ChairPhoto stores face boxes in (#136):
+/// each `Regions` property's boxes turned out of the frame its `AppliedToDimensions` declares
+/// ([`region_target`], the rule the writer follows). With an unknown orientation the boxes are
+/// returned as the file has them. A `Regions` whose frame is not one of this image's is
+/// skipped: a region read in the wrong frame would name the wrong face.
+pub fn read_face_regions_in(photo_path: &Path, frame: RegionFrame) -> Vec<ReadRegion> {
+    let mut out = Vec::new();
+    for (declared, regions) in read_regions(photo_path) {
+        let Ok(target) = region_target(frame, declared) else { continue };
+        out.extend(regions.into_iter().map(|r| ReadRegion { bbox: target.read(r.bbox), ..r }));
+    }
+    out
 }
 
 /// Read the MWG face regions (`mwg-rs:Regions`) from the photo's sidecar. Returns each region's
-/// name and its **top-left** normalized bbox (converted from MWG's center form). Regions whose
+/// name and its **top-left** normalized bbox (converted from MWG's center form), in the frame
+/// the file measures them in (the stored image, for a file that follows MWG). Regions whose
 /// Area is missing/unparseable are skipped. Returns an empty vec when there is no sidecar or no
 /// Regions property. Reads the layouts [`write_face_regions`] accepts: `Regions` in any
 /// top-level Description; `Regions`, each region and its `Area` as `rdf:parseType="Resource"`,
 /// a nested `rdf:Description`, or attributes; the list as an `rdf:Bag` or `rdf:Seq`. A
 /// `Regions` in any other layout is skipped.
 pub fn read_face_regions(photo_path: &Path) -> Vec<ReadRegion> {
+    read_regions(photo_path).into_iter().flat_map(|(_, regions)| regions).collect()
+}
+
+/// Every recognised `Regions` property's declared `AppliedToDimensions` (`None` when it has
+/// none) and its regions, in the file's frame.
+#[allow(clippy::type_complexity)]
+fn read_regions(photo_path: &Path) -> Vec<(Option<Result<(f64, f64), String>>, Vec<ReadRegion>)> {
     let path = sidecar_path(photo_path);
     let Ok(file) = std::fs::File::open(&path) else {
         return Vec::new();
@@ -594,25 +876,20 @@ pub fn read_face_regions(photo_path: &Path) -> Vec<ReadRegion> {
     let Ok(root) = parse_xml(file) else {
         return Vec::new();
     };
-    let Some(rdf) = root.get_child(("RDF", NS_RDF)) else {
+    let Some(rdf) = rdf_of(&root) else {
         return Vec::new();
     };
     let mut out = Vec::new();
     for (d, p) in find_description_properties(rdf, NS_MWG_RS, "Regions") {
         let regions = element_at(element_at(rdf, d), p);
-        let Ok(RegionsLayout { list: Some((l, c)), .. }) = regions_layout(regions) else {
+        let Ok(RegionsLayout { list: Some((l, c)), dims }) = regions_layout(regions) else {
             continue;
         };
         let body = struct_body(regions).expect("regions_layout checked the form");
+        let declared = dims.map(|i| applied_dimensions(element_at(body, i)));
         let container = element_at(element_at(body, l), c);
-        for li in container.children.iter().filter_map(node_element) {
-            if !is_rdf(li, "li") {
-                continue;
-            }
-            if let Some(r) = parse_region_li(li) {
-                out.push(r);
-            }
-        }
+        let lis = container.children.iter().filter_map(node_element).filter(|li| is_rdf(li, "li"));
+        out.push((declared, lis.filter_map(parse_region_li).collect()));
     }
     out
 }
@@ -652,14 +929,16 @@ fn declare_region_namespaces(desc: &mut Element) {
     ns.put("stDim", NS_STDIM);
 }
 
-/// A new `mwg-rs:Regions` element with AppliedToDimensions + a RegionList Bag of `lis`, for a
-/// sidecar that has none.
-fn new_regions(w: u32, h: u32, lis: Vec<XMLNode>) -> Element {
+/// A new `mwg-rs:Regions` element with AppliedToDimensions (when the size is known) + a
+/// RegionList Bag of `lis`, for a sidecar that has none.
+fn new_regions(dims: Option<(u32, u32)>, lis: Vec<XMLNode>) -> Element {
     let mut regions = el("mwg-rs", NS_MWG_RS, "Regions");
     regions
         .attributes
         .insert("rdf:parseType".to_string(), "Resource".to_string());
-    regions.children.push(XMLNode::Element(new_dimensions(w, h)));
+    if let Some((w, h)) = dims {
+        regions.children.push(XMLNode::Element(new_dimensions(w, h)));
+    }
     regions.children.push(XMLNode::Element(new_region_list(lis)));
     regions
 }
@@ -759,49 +1038,227 @@ fn region_container(list: &Element) -> Result<usize, String> {
     }
 }
 
-/// Edit an existing, recognised `mwg-rs:Regions` in place: refresh AppliedToDimensions' own
-/// fields, move each region chairphoto wrote that an incoming one matches to the incoming
-/// geometry (see [`set_region_area`]), and append the incoming regions that matched none.
-/// Everything else on Regions, AppliedToDimensions, RegionList and its container is kept.
+/// Edit an existing, recognised `mwg-rs:Regions` in place, by the rules [`write_face_regions`]
+/// documents: claim each existing region for at most one incoming face (its marker first,
+/// then a marked region's Name + Area, then an unmarked region on the `legacy` record, then an
+/// unmarked region's Name + Area), move what was claimed, remove the marked regions nothing
+/// claimed and the legacy ones whose face is gone, and append the faces that claimed nothing,
+/// marked. When something is written, `dims` becomes its AppliedToDimensions if it has none
+/// (one it has is never rewritten, #145). `incoming` is already in the frame the Regions
+/// declares ([`region_target`]); `legacy` is in the display frame its writes used. Everything
+/// else on Regions, AppliedToDimensions, RegionList and its container is kept.
 fn update_regions(
     regions: &mut Element,
+    catalog: &str,
     incoming: &[FaceRegion],
-    w: u32,
-    h: u32,
+    retired: &[i64],
+    legacy: &[FaceRegion],
+    dims: Option<(u32, u32)>,
 ) -> Result<(), String> {
     let layout = regions_layout(regions)?;
     let body = struct_body_mut(regions).expect("regions_layout checked the form");
     match layout.list {
         Some((l, c)) => {
             let container = element_at_mut(element_at_mut(body, l), c);
-            // Each incoming region updates at most one existing region it matches, in place
-            // (#140); the rest are appended.
-            let mut written = vec![false; incoming.len()];
-            for node in &mut container.children {
-                let XMLNode::Element(li) = node else { continue };
-                if !is_rdf(li, "li") {
-                    continue;
-                }
-                if let Some(k) = matching_region(li, incoming, &written) {
-                    written[k] = true;
-                    set_region_area(li, &incoming[k]);
-                }
-            }
-            let new = incoming.iter().zip(&written).filter(|(_, w)| !**w);
-            container.children.extend(new.map(|(r, _)| region_li(r)));
+            reconcile_regions(container, catalog, incoming, retired, legacy);
         }
+        None if incoming.is_empty() => {}
         None => {
-            let lis = incoming.iter().map(region_li).collect();
+            let lis = incoming.iter().map(|r| marked_li(r, catalog)).collect();
             body.children.push(XMLNode::Element(new_region_list(lis)));
         }
     }
     // Last: inserting moves the indices `layout` recorded.
-    match layout.dims {
-        Some(i) => set_struct_fields(element_at_mut(body, i), NS_STDIM, "stDim",
-            &dimension_fields(w, h)),
-        None => body.children.insert(0, XMLNode::Element(new_dimensions(w, h))),
+    if let (None, Some((w, h)), false) = (layout.dims, dims, incoming.is_empty()) {
+        body.children.insert(0, XMLNode::Element(new_dimensions(w, h)));
     }
     Ok(())
+}
+
+/// One `rdf:li` of a RegionList as the reconciliation sees it.
+struct ExistingRegion {
+    /// Its index in the container's children.
+    node: usize,
+    /// Who wrote it, by its `chairphoto:FaceId`.
+    owner: Owner,
+    /// Whether it has exactly the shape the pre-marker writer gave its regions
+    /// ([`is_pre_marker_shape`]): only such an unmarked region can be one it wrote.
+    pre_marker_shape: bool,
+    /// Its Name and box, in the file's frame; `None` when it does not parse.
+    region: Option<ReadRegion>,
+}
+
+/// Who an existing region belongs to, by its `chairphoto:FaceId` marker (#135).
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Owner {
+    /// No marker: another tool's, or written by ChairPhoto before the marker existed.
+    Unmarked,
+    /// This catalog's marker, for this face id.
+    Ours(i64),
+    /// A marker of another catalog, or one this build does not recognise: foreign.
+    Other,
+}
+
+/// The `chairphoto:FaceId` value ChairPhoto writes for face `face_id` of catalog `catalog`:
+/// `<catalog>/<face id>`, the catalog's UUID and the face's decimal id. A stable on-disk format
+/// (docs/face-tagging.md): reading it is [`marker_owner`].
+fn face_marker(catalog: &str, face_id: i64) -> String {
+    format!("{catalog}/{face_id}")
+}
+
+/// Whose marker `marker` is, read from catalog `catalog`'s side: [`Owner::Ours`] only for
+/// exactly `<catalog>/<decimal id>` in canonical form (`/007`, `/+7`, `/-7` are not).
+fn marker_owner(catalog: &str, marker: Option<&str>) -> Owner {
+    let Some(marker) = marker else { return Owner::Unmarked };
+    match marker.split_once('/') {
+        Some((c, id)) if c == catalog => match id.parse::<i64>() {
+            // Exactly the form `face_marker` writes: decimal digits, no sign, no leading zero.
+            Ok(n) if n >= 0 && n.to_string() == id => Owner::Ours(n),
+            _ => Owner::Other,
+        },
+        _ => Owner::Other,
+    }
+}
+
+/// What becomes of an existing region.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Claim {
+    /// Left as it is.
+    Keep,
+    /// Ours (marked, or adopted from the legacy record): moved to this incoming face, renamed
+    /// to it and marked with its id.
+    Ours(usize),
+    /// Foreign, the same face as this incoming one: only its Area moves (#140).
+    Foreign(usize),
+    /// Ours, and no face in the set claims it: removed.
+    Remove,
+}
+
+/// The heart of [`update_regions`] for a container (`rdf:Bag` / `rdf:Seq`) of regions.
+fn reconcile_regions(
+    container: &mut Element,
+    catalog: &str,
+    incoming: &[FaceRegion],
+    retired: &[i64],
+    legacy: &[FaceRegion],
+) {
+    // Ours only for a face this catalog knows on this photo: a marker with another id came
+    // from a copy of this catalog's file (review N1) and is foreign.
+    let known = |id: i64| retired.contains(&id) || incoming.iter().any(|r| r.face_id == id);
+    let existing: Vec<ExistingRegion> = element_children(container)
+        .filter(|(_, li)| is_rdf(li, "li"))
+        .map(|(node, li)| {
+            let marker = struct_body(li).and_then(|b| struct_field(b, NS_CHAIRPHOTO, "FaceId"));
+            let owner = match marker_owner(catalog, marker.as_deref()) {
+                Owner::Ours(id) if !known(id) => Owner::Other,
+                owner => owner,
+            };
+            ExistingRegion {
+                node,
+                owner,
+                pre_marker_shape: is_pre_marker_shape(li),
+                region: parse_region_li(li),
+            }
+        })
+        .collect();
+    let mut claims = vec![Claim::Keep; existing.len()];
+    let mut written = vec![false; incoming.len()];
+    let ids: Vec<i64> = incoming.iter().map(|r| r.face_id).collect();
+
+    // 1. A region of ours whose face id is an incoming face's, and that is still recognisably
+    //    that face (its Name, or its place): a copied catalog file shares its identity with
+    //    the original, so the id alone could name another face.
+    for (i, e) in existing.iter().enumerate() {
+        let Owner::Ours(id) = e.owner else { continue };
+        let k = incoming.iter().enumerate().position(|(k, r)| {
+            !written[k]
+                && r.face_id == id
+                && e.region.as_ref().is_some_and(|p| p.name == r.name || center_close(p.bbox, r.bbox))
+        });
+        if let Some(k) = k {
+            written[k] = true;
+            claims[i] = Claim::Ours(k);
+        }
+    }
+    // 2. A region of ours, written for a face id that has changed, that is the same face.
+    let free = |claims: &[Claim]| claims.iter().map(|c| *c == Claim::Keep).collect::<Vec<_>>();
+    let unwritten = |written: &[bool]| written.iter().map(|w| !w).collect::<Vec<_>>();
+    let pairs = closest_pairs(&existing, incoming, &free(&claims), &unwritten(&written), |e, p, r| {
+        matches!(e.owner, Owner::Ours(_)) && same_face(p, r)
+    });
+    for (i, k) in pairs {
+        written[k] = true;
+        claims[i] = Claim::Ours(k);
+    }
+    // 3. An unmarked region a pre-marker ChairPhoto wrote for a face still in the set: adopted.
+    //    Matched against the record (the box the old writer wrote, in its frame), then
+    //    claimed for the record's face.
+    let mut legacy_free = vec![true; legacy.len()];
+    let in_set: Vec<bool> = legacy
+        .iter()
+        .map(|l| incoming.iter().zip(&written).any(|(r, w)| !w && r.face_id == l.face_id))
+        .collect();
+    let pairs = closest_pairs(&existing, legacy, &free(&claims), &in_set, |e, p, l| {
+        e.owner == Owner::Unmarked && e.pre_marker_shape && same_face(p, l)
+    });
+    for (i, j) in pairs {
+        let k = incoming
+            .iter()
+            .zip(&written)
+            .position(|(r, w)| !w && r.face_id == legacy[j].face_id)
+            .expect("in_set found it unwritten");
+        legacy_free[j] = false;
+        written[k] = true;
+        claims[i] = Claim::Ours(k);
+    }
+    // 4. A foreign region (unmarked, or another catalog's) that is the same face as one being
+    //    written: it already holds it.
+    let pairs = closest_pairs(&existing, incoming, &free(&claims), &unwritten(&written), |e, p, r| {
+        !matches!(e.owner, Owner::Ours(_)) && same_face(p, r)
+    });
+    for (i, k) in pairs {
+        written[k] = true;
+        claims[i] = Claim::Foreign(k);
+    }
+    // What nothing claimed: a region of ours whose face has left the set is stale; one whose
+    // face is still in it but no longer recognisably that face (step 1's guard) is kept. An
+    // unmarked one is removed only when it matches a legacy export whose face has left the
+    // set. Another catalog's is kept.
+    for (i, e) in existing.iter().enumerate() {
+        if let (Claim::Keep, Owner::Ours(id)) = (claims[i], e.owner) {
+            if retired.contains(&id) {
+                claims[i] = Claim::Remove;
+            }
+        }
+    }
+    let retired: Vec<bool> =
+        legacy.iter().zip(&legacy_free).map(|(l, free)| *free && !ids.contains(&l.face_id)).collect();
+    let pairs = closest_pairs(&existing, legacy, &free(&claims), &retired, |e, p, l| {
+        e.owner == Owner::Unmarked && e.pre_marker_shape && same_face(p, l)
+    });
+    for (i, _) in pairs {
+        claims[i] = Claim::Remove;
+    }
+
+    for (e, claim) in existing.iter().zip(&claims) {
+        let XMLNode::Element(li) = &mut container.children[e.node] else { unreachable!() };
+        match *claim {
+            Claim::Ours(k) => mark_region(li, &incoming[k], catalog),
+            Claim::Foreign(k) => set_region_area(li, &incoming[k]),
+            Claim::Keep | Claim::Remove => {}
+        }
+    }
+    let doomed: Vec<usize> = existing
+        .iter()
+        .zip(&claims)
+        .filter(|(_, c)| **c == Claim::Remove)
+        .map(|(e, _)| e.node)
+        .collect();
+    for node in doomed.into_iter().rev() {
+        container.children.remove(node);
+    }
+    let new = incoming.iter().zip(&written).filter(|(_, w)| !**w);
+    container.children.extend(new.map(|(r, _)| marked_li(r, catalog)));
 }
 
 /// How a struct-valued property element (`Regions`, `AppliedToDimensions`, a region `rdf:li`,
@@ -947,17 +1404,163 @@ fn region_li(r: &FaceRegion) -> XMLNode {
     XMLNode::Element(li)
 }
 
-/// The index of the incoming region that region `li` is chairphoto's earlier write of, if any:
-/// its Name matches that region's AND its center-Area is within [`AREA_EPSILON`] of that
-/// region's center. Regions already marked in `taken` are skipped, so each incoming region
-/// claims at most one existing one. A li that does not parse matches nothing: when in doubt,
-/// it is preserved.
-fn matching_region(li: &Element, incoming: &[FaceRegion], taken: &[bool]) -> Option<usize> {
-    let p = parse_region_li(li)?;
-    incoming
-        .iter()
-        .zip(taken)
-        .position(|(r, taken)| !taken && r.name == p.name && center_close(r.bbox, p.bbox))
+/// Whether the existing region `p` is the same face as `r`: its Name matches AND its center is
+/// within [`AREA_EPSILON`] of `r`'s.
+fn same_face(p: &ReadRegion, r: &FaceRegion) -> bool {
+    r.name == p.name && center_close(r.bbox, p.bbox)
+}
+
+/// Pair existing regions with candidates one-to-one, **closest first** (#147 L2): every pair
+/// `(existing, candidate)` that `admits`, ordered by the distance between their centers (ties
+/// by document order, then candidate order), taken greedily while both sides are free. The
+/// first region in document order is not preferred over a closer one, so a foreign region
+/// listed before ours is not the one moved. Each candidate claims at most one region and each
+/// region at most one candidate (#147 L1).
+fn closest_pairs(
+    existing: &[ExistingRegion],
+    candidates: &[FaceRegion],
+    existing_free: &[bool],
+    candidate_free: &[bool],
+    admits: impl Fn(&ExistingRegion, &ReadRegion, &FaceRegion) -> bool,
+) -> Vec<(usize, usize)> {
+    let mut pairs: Vec<(f32, usize, usize)> = Vec::new();
+    for (i, e) in existing.iter().enumerate() {
+        let Some(p) = e.region.as_ref().filter(|_| existing_free[i]) else { continue };
+        for (k, r) in candidates.iter().enumerate() {
+            if candidate_free[k] && admits(e, p, r) {
+                pairs.push((center_distance(p.bbox, r.bbox), i, k));
+            }
+        }
+    }
+    pairs.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
+    let (mut e_used, mut c_used) = (vec![false; existing.len()], vec![false; candidates.len()]);
+    let mut out = Vec::new();
+    for (_, i, k) in pairs {
+        if !e_used[i] && !c_used[k] {
+            e_used[i] = true;
+            c_used[k] = true;
+            out.push((i, k));
+        }
+    }
+    out
+}
+
+/// The distance between two top-left bboxes' centers.
+fn center_distance(a: (f32, f32, f32, f32), b: (f32, f32, f32, f32)) -> f32 {
+    let dx = (a.0 + a.2 / 2.0) - (b.0 + b.2 / 2.0);
+    let dy = (a.1 + a.3 / 2.0) - (b.1 + b.3 / 2.0);
+    dx.hypot(dy)
+}
+
+/// Whether `li` has exactly the shape of a region the pre-marker writer wrote — its
+/// [`region_li`] output, unchanged from the first public release until the marker (#135):
+///
+/// ```xml
+/// <rdf:li rdf:parseType="Resource">
+///   <mwg-rs:Name>…</mwg-rs:Name> <mwg-rs:Type>Face</mwg-rs:Type>
+///   <mwg-rs:Area rdf:parseType="Resource">
+///     <stArea:x/> <stArea:y/> <stArea:w/> <stArea:h/> <stArea:unit>normalized</stArea:unit>
+///   </mwg-rs:Area>
+/// </rdf:li>
+/// ```
+///
+/// Exactly those fields, each once, in elements (any order, whitespace between them), and no
+/// other attribute, field or child — no foreign property at all. Only such a region can be on
+/// the legacy record (review M2): a region another tool wrote at the recorded place under the
+/// recorded name (digiKam's nested `rdf:Description` with `digiKam:Confidence`, a Lightroom
+/// region with `mwg-rs:Rotation`, …) has another shape and stays foreign. The old writer's
+/// in-place Area update (#140) kept a foreign region's shape, so a region it updated but did
+/// not write is not taken for one it wrote.
+fn is_pre_marker_shape(li: &Element) -> bool {
+    /// Only `rdf:parseType="Resource"` among its attributes.
+    fn resource_struct(e: &Element) -> bool {
+        ns_attr(e, NS_RDF, "parseType") == Some("Resource") && e.attributes.len() == 1
+    }
+    /// Its child elements, when every other child is whitespace.
+    fn fields(e: &Element) -> Option<Vec<&Element>> {
+        let mut out = Vec::new();
+        for n in &e.children {
+            match n {
+                XMLNode::Element(c) => out.push(c),
+                XMLNode::Text(t) if t.trim().is_empty() => {}
+                _ => return None,
+            }
+        }
+        Some(out)
+    }
+    /// The text of a plain literal field with no attributes, `None` for anything else.
+    fn literal(e: &Element) -> Option<String> {
+        if !e.attributes.is_empty() {
+            return None;
+        }
+        let mut text = String::new();
+        for n in &e.children {
+            match n {
+                XMLNode::Text(t) => text.push_str(t),
+                _ => return None,
+            }
+        }
+        Some(text)
+    }
+    /// The fields of `e` in namespace `ns`, matched one to one with `names` in any order.
+    fn exactly<'a>(e: &'a Element, ns: &str, names: &[&str]) -> Option<Vec<&'a Element>> {
+        let kids = fields(e)?;
+        if kids.len() != names.len() {
+            return None;
+        }
+        names
+            .iter()
+            .map(|name| {
+                let mut found = kids.iter().filter(|k| k.namespace.as_deref() == Some(ns) && k.name == *name);
+                match (found.next(), found.next()) {
+                    (Some(k), None) => Some(*k),
+                    _ => None,
+                }
+            })
+            .collect()
+    }
+
+    if !is_rdf(li, "li") || !resource_struct(li) {
+        return false;
+    }
+    let Some([name, kind, area]) = exactly(li, NS_MWG_RS, &["Name", "Type", "Area"]).map(|v| [v[0], v[1], v[2]])
+    else {
+        return false;
+    };
+    if literal(name).is_none() || literal(kind).as_deref() != Some("Face") || !resource_struct(area) {
+        return false;
+    }
+    let Some(coords) = exactly(area, NS_STAREA, &["x", "y", "w", "h", "unit"]) else {
+        return false;
+    };
+    coords[..4].iter().all(|c| literal(c).is_some_and(|v| v.trim().parse::<f32>().is_ok()))
+        && literal(coords[4]).as_deref() == Some("normalized")
+}
+
+/// A new region for `r`, carrying catalog `catalog`'s marker.
+fn marked_li(r: &FaceRegion, catalog: &str) -> XMLNode {
+    let XMLNode::Element(mut li) = region_li(r) else { unreachable!("region_li builds an element") };
+    // Declared on the field itself: the Description it lands in may bind `chairphoto` to
+    // something else, or not at all.
+    let XMLNode::Element(mut marker) =
+        plain("chairphoto", NS_CHAIRPHOTO, "FaceId", &face_marker(catalog, r.face_id))
+    else {
+        unreachable!("plain builds an element")
+    };
+    let mut ns = Namespace::empty();
+    ns.put("chairphoto", NS_CHAIRPHOTO);
+    marker.namespaces = Some(ns);
+    li.children.push(XMLNode::Element(marker));
+    XMLNode::Element(li)
+}
+
+/// Make an existing region ChairPhoto's write of `r`: its Area moved ([`set_region_area`]), its
+/// Name the face's, and its marker this catalog's for the face. Every other field, attribute
+/// and child stays.
+fn mark_region(li: &mut Element, r: &FaceRegion, catalog: &str) {
+    set_region_area(li, r);
+    set_struct_fields(li, NS_MWG_RS, "mwg-rs", &[("Name", r.name.clone())]);
+    set_struct_fields(li, NS_CHAIRPHOTO, "chairphoto", &[("FaceId", face_marker(catalog, r.face_id))]);
 }
 
 /// Move a matched region to `r`'s geometry, in place (#140). ChairPhoto owns only the Area's
@@ -1246,6 +1849,30 @@ fn seq_creator(value: &str) -> XMLNode {
     XMLNode::Element(e)
 }
 
+/// The sidecar's `rdf:RDF`: the root itself when the file has no `x:xmpmeta` wrapper (the XMP
+/// spec allows a bare `rdf:RDF`), else the root's `rdf:RDF` child (#147 L4).
+fn rdf_of(root: &Element) -> Option<&Element> {
+    if is_rdf(root, "RDF") {
+        return Some(root);
+    }
+    root.get_child(("RDF", NS_RDF))
+}
+
+/// [`rdf_of`] for writing: a wrapper without one gets an `rdf:RDF`, a bare `rdf:RDF` root is
+/// used as it is — never a second `rdf:RDF` nested inside the first.
+fn rdf_of_mut(root: &mut Element) -> &mut Element {
+    if is_rdf(root, "RDF") {
+        return root;
+    }
+    child_mut(root, "rdf", NS_RDF, "RDF")
+}
+
+/// Whether `root` is an element a sidecar can be rooted at: the `x:xmpmeta` wrapper (or the
+/// older `x:xapmeta`), or a bare `rdf:RDF`.
+fn is_xmp_root(root: &Element) -> bool {
+    root.namespace.as_deref() == Some(NS_X) || is_rdf(root, "RDF")
+}
+
 /// Find a child element by (namespace, name) or create it, returning a mut ref.
 fn child_mut<'a>(parent: &'a mut Element, prefix: &str, ns: &str, name: &str) -> &'a mut Element {
     let pos = parent.children.iter().position(|n| {
@@ -1311,6 +1938,14 @@ fn now() -> i64 {
 
 #[cfg(test)]
 mod tests {
+    /// The writing catalog's identity in these tests (`catalog::CATALOG_UUID_KEY`).
+    const CAT: &str = "0b7c6e2a-1d3f-4e5a-9b8c-7d6e5f4a3b2c";
+
+    /// This catalog's marker for face `id`, as the file holds it.
+    fn ours(id: i64) -> String {
+        format!("{CAT}/{id}")
+    }
+
     use super::*;
 
     fn read(path: &Path) -> String {
@@ -1643,8 +2278,13 @@ mod tests {
         crate::test_support::TestTmpDir::new(tag)
     }
 
+    /// An upright photo (EXIF Orientation 1) of a known stored size.
+    fn sized(w: u32, h: u32) -> RegionFrame {
+        RegionFrame { orientation: Some(1), stored_size: Some((w, h)) }
+    }
+
     /// Write regions, read them back: names + top-left bboxes survive the center↔corner
-    /// conversion round-trip, and AppliedToDimensions is written with the oriented pixel size.
+    /// conversion round-trip, and AppliedToDimensions is written with the stored pixel size.
     #[test]
     fn face_regions_round_trip() {
         let dir = region_dir("xmp-regions-rt");
@@ -1652,10 +2292,10 @@ mod tests {
         std::fs::write(&photo, b"raw").unwrap();
 
         let regions = vec![
-            FaceRegion { name: "Alice".into(), bbox: (0.10, 0.20, 0.30, 0.40) },
-            FaceRegion { name: "Bob".into(), bbox: (0.60, 0.10, 0.20, 0.25) },
+            FaceRegion { face_id: 0, name: "Alice".into(), bbox: (0.10, 0.20, 0.30, 0.40) },
+            FaceRegion { face_id: 0, name: "Bob".into(), bbox: (0.60, 0.10, 0.20, 0.25) },
         ];
-        write_face_regions(&photo, &regions, 6000, 4000).unwrap();
+        write_face_regions(&photo, CAT, &regions, &[], &[], sized(6000, 4000)).unwrap();
 
         let xmp = read(&sidecar_path(&photo));
         // Center coords are written (x = 0.10 + 0.30/2 = 0.25), unit=normalized, Type=Face.
@@ -1687,8 +2327,8 @@ mod tests {
         std::fs::write(&photo, b"raw").unwrap();
 
         // Top-left (0.2, 0.3), size (0.4, 0.2) → center (0.4, 0.4).
-        let regions = vec![FaceRegion { name: "Cara".into(), bbox: (0.2, 0.3, 0.4, 0.2) }];
-        write_face_regions(&photo, &regions, 1000, 1000).unwrap();
+        let regions = vec![FaceRegion { face_id: 0, name: "Cara".into(), bbox: (0.2, 0.3, 0.4, 0.2) }];
+        write_face_regions(&photo, CAT, &regions, &[], &[], sized(1000, 1000)).unwrap();
 
         let xmp = read(&sidecar_path(&photo));
         // The literal center coordinates must be present (0.4 for both x and y).
@@ -1750,8 +2390,8 @@ mod tests {
         std::fs::write(sidecar_path(&photo), existing).unwrap();
 
         // Write one chairphoto region (a different face).
-        let regions = vec![FaceRegion { name: "Alice".into(), bbox: (0.10, 0.10, 0.20, 0.20) }];
-        write_face_regions(&photo, &regions, 6000, 4000).unwrap();
+        let regions = vec![FaceRegion { face_id: 0, name: "Alice".into(), bbox: (0.10, 0.10, 0.20, 0.20) }];
+        write_face_regions(&photo, CAT, &regions, &[], &[], sized(6000, 4000)).unwrap();
 
         let xmp = read(&sidecar_path(&photo));
         assert!(xmp.contains("history_end"), "darktable data clobbered!");
@@ -1809,20 +2449,20 @@ mod tests {
 
         // Write Alice at (0.10, 0.10, 0.20, 0.20), center (0.20, 0.20).
         write_face_regions(
-            &photo,
-            &[FaceRegion { name: "Alice".into(), bbox: (0.10, 0.10, 0.20, 0.20) }],
-            1000,
-            1000,
+            &photo, CAT,
+            &[FaceRegion { face_id: 0, name: "Alice".into(), bbox: (0.10, 0.10, 0.20, 0.20) }], &[],
+            &[],
+            sized(1000, 1000),
         )
         .unwrap();
 
         // Second write: Alice moved slightly (well within AREA_EPSILON so it's recognised as
         // "our" region and replaced, not duplicated).
         write_face_regions(
-            &photo,
-            &[FaceRegion { name: "Alice".into(), bbox: (0.105, 0.105, 0.20, 0.20) }],
-            1000,
-            1000,
+            &photo, CAT,
+            &[FaceRegion { face_id: 0, name: "Alice".into(), bbox: (0.105, 0.105, 0.20, 0.20) }], &[],
+            &[],
+            sized(1000, 1000),
         )
         .unwrap();
 
@@ -2388,8 +3028,8 @@ mod tests {
             ("write_import_batch", Box::new(|| write_import_batch(&photo, uuid).unwrap())),
             ("write_gps", Box::new(|| write_gps(&photo, 63.43, 10.39).unwrap())),
             ("write_face_regions", Box::new(|| {
-                let ours = [FaceRegion { name: "Alice".into(), bbox: (0.1, 0.1, 0.2, 0.2) }];
-                write_face_regions(&photo, &ours, 6000, 4000).unwrap();
+                let ours = [FaceRegion { face_id: 0, name: "Alice".into(), bbox: (0.1, 0.1, 0.2, 0.2) }];
+                write_face_regions(&photo, CAT, &ours, &[], &[], sized(6000, 4000)).unwrap();
             })),
             ("overwrite_identifier", Box::new(|| {
                 overwrite_identifier(&photo, uuid).unwrap();
@@ -2645,7 +3285,7 @@ mod tests {
     }
 
     fn alice() -> Vec<FaceRegion> {
-        vec![FaceRegion { name: "Alice".into(), bbox: (0.1, 0.1, 0.2, 0.2) }]
+        vec![FaceRegion { face_id: 0, name: "Alice".into(), bbox: (0.1, 0.1, 0.2, 0.2) }]
     }
 
     /// A hand-written sidecar whose Regions value, each region and their Areas are nested
@@ -2686,7 +3326,7 @@ mod tests {
         let (_dir, photo) = seeded_photo("xmp-139-nested", NESTED_DESCRIPTION_REGIONS);
         assert_eq!(region_names(&photo), ["Bob"], "the fixture's region is read");
 
-        write_face_regions(&photo, &alice(), 6000, 4000).unwrap();
+        write_face_regions(&photo, CAT, &alice(), &[], &[], sized(8000, 6000)).unwrap();
 
         let xml = read(&sidecar_path(&photo));
         assert_eq!(region_names(&photo), ["Alice", "Bob"], "{xml}");
@@ -2699,9 +3339,10 @@ mod tests {
         let dims = (NS_MWG_RS, "AppliedToDimensions");
         assert!(has_attr(&xml, dims, (NS_FOREIGN, "dimkeep"), "dims-attr"),
             "foreign attribute on AppliedToDimensions lost:\n{xml}");
-        // ChairPhoto's dimensions are set where they were, in attribute form.
-        assert!(has_attr(&xml, dims, (NS_STDIM, "w"), "6000"), "{xml}");
-        assert!(has_attr(&xml, dims, (NS_STDIM, "h"), "4000"), "{xml}");
+        // The dimensions are the file's own, untouched (#145): a 4000x3000 frame of this
+        // 8000x6000 image.
+        assert!(has_attr(&xml, dims, (NS_STDIM, "w"), "4000"), "{xml}");
+        assert!(has_attr(&xml, dims, (NS_STDIM, "h"), "3000"), "{xml}");
         assert_eq!(count_elements(&xml, NS_STDIM, "w"), 0, "no second, element-form width:\n{xml}");
         // Bob is untouched, attributes and all.
         assert!(has_attr(&xml, (NS_RDF, "Description"), (NS_MWG_RS, "Name"), "Bob"), "{xml}");
@@ -2738,7 +3379,7 @@ mod tests {
 </x:xmpmeta>"#);
         assert_eq!(region_names(&photo), ["Bob"], "the fixture's region is read");
 
-        write_face_regions(&photo, &alice(), 6000, 4000).unwrap();
+        write_face_regions(&photo, CAT, &alice(), &[], &[], sized(6000, 4000)).unwrap();
 
         let xml = read(&sidecar_path(&photo));
         assert_eq!(region_names(&photo), ["Alice", "Bob"], "{xml}");
@@ -2786,7 +3427,7 @@ mod tests {
  </rdf:RDF>
 </x:xmpmeta>"#);
 
-        write_face_regions(&photo, &alice(), 6000, 4000).unwrap();
+        write_face_regions(&photo, CAT, &alice(), &[], &[], sized(8000, 6000)).unwrap();
 
         let xml = read(&sidecar_path(&photo));
         assert_eq!(region_names(&photo), ["Alice", "Bob"], "{xml}");
@@ -2798,8 +3439,8 @@ mod tests {
             Some("dims-child"), "{xml}");
         assert_eq!(element_text(&xml, regions, (NS_FOREIGN, "extra")).as_deref(),
             Some("regions-child"), "{xml}");
-        assert_eq!(element_text(&xml, dims, (NS_STDIM, "w")).as_deref(), Some("6000"), "{xml}");
-        assert_eq!(element_text(&xml, dims, (NS_STDIM, "h")).as_deref(), Some("4000"), "{xml}");
+        assert_eq!(element_text(&xml, dims, (NS_STDIM, "w")).as_deref(), Some("4000"), "{xml}");
+        assert_eq!(element_text(&xml, dims, (NS_STDIM, "h")).as_deref(), Some("3000"), "{xml}");
         assert_eq!(element_text(&xml, dims, (NS_STDIM, "unit")).as_deref(), Some("pixel"));
     }
 
@@ -2830,7 +3471,7 @@ mod tests {
  </rdf:RDF>
 </x:xmpmeta>"#);
 
-        write_face_regions(&photo, &alice(), 6000, 4000).unwrap();
+        write_face_regions(&photo, CAT, &alice(), &[], &[], sized(6000, 4000)).unwrap();
 
         let xml = read(&sidecar_path(&photo));
         assert_eq!(region_names(&photo), ["Alice", "Bob"], "{xml}");
@@ -2883,10 +3524,10 @@ mod tests {
 
         // Both moved by 0.01, well inside AREA_EPSILON: ChairPhoto's write of the same faces.
         let ours = [
-            FaceRegion { name: "Bob".into(), bbox: (0.76, 0.61, 0.1, 0.2) },
-            FaceRegion { name: "Carol".into(), bbox: (0.26, 0.26, 0.1, 0.1) },
+            FaceRegion { face_id: 0, name: "Bob".into(), bbox: (0.76, 0.61, 0.1, 0.2) },
+            FaceRegion { face_id: 0, name: "Carol".into(), bbox: (0.26, 0.26, 0.1, 0.1) },
         ];
-        write_face_regions(&photo, &ours, 6000, 4000).unwrap();
+        write_face_regions(&photo, CAT, &ours, &[], &[], sized(6000, 4000)).unwrap();
 
         let xml = read(&sidecar_path(&photo));
         let back = read_face_regions(&photo);
@@ -2947,10 +3588,800 @@ mod tests {
         ];
         for (case, sidecar) in cases {
             let (_dir, photo) = seeded_photo("xmp-139-refuse", &sidecar);
-            let err = write_face_regions(&photo, &alice(), 6000, 4000)
+            let err = write_face_regions(&photo, CAT, &alice(), &[], &[], sized(6000, 4000))
                 .expect_err(&format!("{case}: an unrecognised Regions must not be written"));
-            assert!(err.contains(&sidecar_path(&photo).display().to_string()), "{case}: {err}");
+            assert!(matches!(err, RegionWriteError::Refused(_)), "{case}: {err:?}");
+            assert!(err.to_string().contains(&sidecar_path(&photo).display().to_string()), "{case}: {err}");
             assert_eq!(read(&sidecar_path(&photo)), sidecar, "{case}: sidecar changed");
+        }
+    }
+
+    // ── #136: the stored frame ─────────────────────────────────────────────────
+
+    use super::region_fixtures as rf;
+
+    fn near4(a: (f32, f32, f32, f32), b: (f32, f32, f32, f32)) -> bool {
+        [(a.0, b.0), (a.1, b.1), (a.2, b.2), (a.3, b.3)].iter().all(|(x, y)| (x - y).abs() < 1e-4)
+    }
+
+    /// MWG's center form of a top-left box.
+    fn center(b: (f32, f32, f32, f32)) -> (f32, f32, f32, f32) {
+        (b.0 + b.2 / 2.0, b.1 + b.3 / 2.0, b.2, b.3)
+    }
+
+    fn turned(o: u8, w: u32, h: u32) -> RegionFrame {
+        RegionFrame { orientation: Some(o), stored_size: Some((w, h)) }
+    }
+
+    /// The point maps are checked against an independent implementation of all eight EXIF
+    /// orientations, the image crate's `apply_orientation` (the one the previews go through):
+    /// a block of pixels marked in a stored 12x8 image must land where `stored_to_display`
+    /// says, and `display_to_stored` must bring it back.
+    #[test]
+    fn orientation_maps_agree_with_the_image_crate() {
+        let (sw, sh) = (12u32, 8u32);
+        let stored = (2.0 / 12.0, 1.0 / 8.0, 3.0 / 12.0, 2.0 / 8.0);
+        for o in 1..=8u8 {
+            let mut img = image::RgbImage::new(sw, sh);
+            for x in 2..5 {
+                for y in 1..3 {
+                    img.put_pixel(x, y, image::Rgb([255, 255, 255]));
+                }
+            }
+            let mut img = image::DynamicImage::ImageRgb8(img);
+            img.apply_orientation(image::metadata::Orientation::from_exif(o).unwrap());
+            let img = img.to_rgb8();
+            let (dw, dh) = img.dimensions();
+            assert_eq!((dw, dh), if o >= 5 { (sh, sw) } else { (sw, sh) }, "orientation {o}");
+            let (mut x0, mut y0, mut x1, mut y1) = (u32::MAX, u32::MAX, 0, 0);
+            for (x, y, p) in img.enumerate_pixels() {
+                if p[0] == 255 {
+                    (x0, y0, x1, y1) = (x0.min(x), y0.min(y), x1.max(x + 1), y1.max(y + 1));
+                }
+            }
+            let (dw, dh) = (dw as f32, dh as f32);
+            let want = (x0 as f32 / dw, y0 as f32 / dh, (x1 - x0) as f32 / dw, (y1 - y0) as f32 / dh);
+            let got = stored_to_display(o, stored);
+            assert!(near4(got, want), "orientation {o}: {got:?} vs the image crate's {want:?}");
+            assert!(near4(display_to_stored(o, got), stored), "orientation {o} does not invert");
+        }
+    }
+
+    /// #136: in all eight orientations the written region is the face's box turned into the
+    /// stored frame, `AppliedToDimensions` is the stored size (never swapped), and reading it
+    /// back for the same photo gives the face's box again. The stored-frame centers of four
+    /// orientations are worked out by hand, independently of the code.
+    #[test]
+    fn face_regions_round_trip_in_every_orientation() {
+        let display = (0.1, 0.2, 0.3, 0.4);
+        let by_hand = [
+            (1, (0.25, 0.4, 0.3, 0.4)),
+            (3, (0.75, 0.6, 0.3, 0.4)),
+            (6, (0.4, 0.75, 0.4, 0.3)),
+            (8, (0.6, 0.25, 0.4, 0.3)),
+        ];
+        for o in 1..=8u8 {
+            let dir = region_dir("xmp-136-orientations");
+            let photo = dir.join("P.JPG");
+            std::fs::write(&photo, b"jpeg").unwrap();
+            let frame = turned(o, 6000, 4000);
+            write_face_regions(&photo, CAT, &[FaceRegion { face_id: 0, name: "Alice".into(), bbox: display }], &[], &[], frame)
+                .unwrap();
+
+            let xml = read(&sidecar_path(&photo));
+            let got = rf::mwg(&xml);
+            assert_eq!(got.dims, [Some(("6000".into(), "4000".into()))], "orientation {o}:\n{xml}");
+            assert_eq!(got.regions.len(), 1, "orientation {o}:\n{xml}");
+            let area = got.regions[0].area;
+            assert!(near4(area, center(display_to_stored(o, display))), "orientation {o}: {area:?}");
+            if let Some((_, want)) = by_hand.iter().find(|(h, _)| *h == o) {
+                assert!(near4(area, *want), "orientation {o}: {area:?}, by hand {want:?}");
+            }
+            let back = read_face_regions_in(&photo, frame);
+            assert_eq!(back.len(), 1);
+            assert!(near4(back[0].bbox, display), "orientation {o}: read back {:?}", back[0].bbox);
+        }
+    }
+
+    /// #136 on Lightroom's sidecar of a portrait shot (Orientation 6): Bob's region, in the
+    /// stored frame as MWG requires, comes through ChairPhoto's write of Alice unchanged, and
+    /// so do the dimensions and every other foreign structure; Alice lands in the same frame;
+    /// and the importer reads Bob turned into the display frame the detections are in.
+    #[test]
+    fn face_regions_keep_a_foreign_region_on_a_rotated_photo() {
+        let (_dir, photo) = seeded_photo("xmp-136-lightroom", rf::LIGHTROOM_ROTATED);
+        let bob_before = rf::subtree(rf::LIGHTROOM_ROTATED, NS_RDF, "li");
+        let alice = (0.5, 0.1, 0.2, 0.1);
+        let frame = turned(6, 6000, 4000);
+        write_face_regions(&photo, CAT, &[FaceRegion { face_id: 0, name: "Alice".into(), bbox: alice }], &[], &[], frame).unwrap();
+
+        let xml = read(&sidecar_path(&photo));
+        let got = rf::mwg(&xml);
+        assert_eq!(got.dims, [Some(("6000".into(), "4000".into()))], "{xml}");
+        let bob = rf::named(&got, "Bob");
+        assert_eq!(bob.len(), 1, "{xml}");
+        assert_eq!(bob[0].area, (0.3, 0.25, 0.15, 0.1), "Bob moved:\n{xml}");
+        assert!(rf::subtree(&xml, NS_RDF, "li").contains(&bob_before[0]), "Bob's li changed:\n{xml}");
+        assert_eq!(rf::foreign_structures(&xml), rf::foreign_structures(rf::LIGHTROOM_ROTATED));
+        let ours = rf::named(&got, "Alice");
+        assert!(near4(ours[0].area, center(display_to_stored(6, alice))), "{:?}", ours[0].area);
+
+        let read = read_face_regions_in(&photo, frame);
+        let bob = read.iter().find(|r| r.name == "Bob").unwrap();
+        // Stored top-left (0.225, 0.2, 0.15, 0.1), turned 90° clockwise.
+        assert!(near4(bob.bbox, (0.7, 0.225, 0.1, 0.15)), "{:?}", bob.bbox);
+        let alice_back = read.iter().find(|r| r.name == "Alice").unwrap();
+        assert!(near4(alice_back.bbox, alice), "{:?}", alice_back.bbox);
+    }
+
+    /// #136: an unknown orientation is never guessed. The boxes are written as they are, and
+    /// dimensions the sidecar already has stay, even when the catalog's size disagrees; a
+    /// Regions ChairPhoto creates gets the recorded size, and with no recorded size no
+    /// `AppliedToDimensions` at all (no `1x1` stand-in).
+    #[test]
+    fn face_regions_with_an_unknown_orientation_convert_nothing() {
+        let box_ = (0.1, 0.1, 0.2, 0.2);
+        let alice = [FaceRegion { face_id: 0, name: "Alice".into(), bbox: box_ }];
+        let unknown = |size| RegionFrame { orientation: None, stored_size: size };
+
+        let (_dir, photo) = seeded_photo("xmp-136-unknown-existing", rf::DIGIKAM);
+        write_face_regions(&photo, CAT, &alice, &[], &[], unknown(Some((4000, 6000)))).unwrap();
+        let xml = read(&sidecar_path(&photo));
+        let got = rf::mwg(&xml);
+        assert_eq!(got.dims, [Some(("6000".into(), "4000".into()))], "{xml}");
+        assert!(near4(rf::named(&got, "Alice")[0].area, center(box_)), "{xml}");
+        assert_eq!(rf::named(&got, "Bob")[0].area, (0.8, 0.7, 0.1, 0.2));
+
+        let dir = region_dir("xmp-136-unknown-fresh");
+        let photo = dir.join("U.JPG");
+        std::fs::write(&photo, b"jpeg").unwrap();
+        write_face_regions(&photo, CAT, &alice, &[], &[], unknown(Some((6000, 4000)))).unwrap();
+        let got = rf::mwg(&read(&sidecar_path(&photo)));
+        assert_eq!(got.dims, [Some(("6000".into(), "4000".into()))]);
+        assert!(near4(got.regions[0].area, center(box_)));
+
+        let photo = dir.join("V.JPG");
+        std::fs::write(&photo, b"jpeg").unwrap();
+        write_face_regions(&photo, CAT, &alice, &[], &[], RegionFrame { orientation: Some(6), stored_size: None })
+            .unwrap();
+        let got = rf::mwg(&read(&sidecar_path(&photo)));
+        assert_eq!(got.dims, [None], "no size, no AppliedToDimensions");
+        assert!(near4(got.regions[0].area, center(display_to_stored(6, box_))));
+    }
+
+    // ── #145: a foreign AppliedToDimensions is never rewritten ─────────────────
+
+    /// Lightroom's Orientation-6 sidecar with its `AppliedToDimensions` declaring `w`x`h`.
+    fn lightroom_declaring(w: &str, h: &str) -> String {
+        let fixture = r#"stDim:w="6000" stDim:h="4000""#;
+        assert!(rf::LIGHTROOM_ROTATED.contains(fixture), "the fixture's dims moved");
+        rf::LIGHTROOM_ROTATED.replace(fixture, &format!(r#"stDim:w="{w}" stDim:h="{h}""#))
+    }
+
+    const BOB_STORED: (f32, f32, f32, f32) = (0.3, 0.25, 0.15, 0.1);
+
+    /// Probe P01's shapes (claude-139-142.log M1): a write never changes the frame foreign
+    /// regions are measured in. Where the sidecar declares the stored frame, ChairPhoto writes
+    /// in it; where it declares the display frame (the stored size swapped, on a photo turned
+    /// a quarter), ChairPhoto's regions follow it there instead of the declaration following
+    /// ChairPhoto; a resized image keeps its own size. Bob and the dims are untouched each time.
+    #[test]
+    fn face_regions_follow_the_frame_the_sidecar_declares() {
+        let alice = (0.5, 0.1, 0.2, 0.1);
+        let cases = [
+            ("stored frame", ("6000", "4000"), RegionTarget::Stored(6)),
+            ("display frame", ("4000", "6000"), RegionTarget::AsIs),
+            ("resized stored frame", ("3000", "2000"), RegionTarget::Stored(6)),
+            ("ChairPhoto's old 1x1", ("1", "1"), RegionTarget::Stored(6)),
+        ];
+        for (case, (w, h), target) in cases {
+            let sidecar = lightroom_declaring(w, h);
+            let (_dir, photo) = seeded_photo("xmp-145-frames", &sidecar);
+            let frame = turned(6, 6000, 4000);
+            write_face_regions(&photo, CAT, &[FaceRegion { face_id: 0, name: "Alice".into(), bbox: alice }], &[], &[], frame)
+                .unwrap_or_else(|e| panic!("{case}: {e}"));
+
+            let xml = read(&sidecar_path(&photo));
+            let got = rf::mwg(&xml);
+            assert_eq!(got.dims, [Some((w.to_string(), h.to_string()))], "{case}:\n{xml}");
+            assert_eq!(rf::named(&got, "Bob")[0].area, BOB_STORED, "{case}:\n{xml}");
+            let ours = rf::named(&got, "Alice")[0].area;
+            let want = match target {
+                RegionTarget::AsIs => alice,
+                RegionTarget::Stored(o) => display_to_stored(o, alice),
+            };
+            assert!(near4(ours, center(want)), "{case}: Alice at {ours:?}\n{xml}");
+            let back = read_face_regions_in(&photo, frame);
+            let alice_back = back.iter().find(|r| r.name == "Alice").unwrap();
+            assert!(near4(alice_back.bbox, alice), "{case}: read back {:?}", alice_back.bbox);
+        }
+    }
+
+    /// Probe P02's shape and its neighbours: a sidecar whose declared frame is not one ChairPhoto
+    /// can place its boxes in is not written at all — byte for byte as it was — and reading it
+    /// for import yields nothing rather than regions in the wrong frame. That covers an unknown
+    /// size on a photo turned a quarter (before #145 the declaration became `1x1`), an aspect
+    /// that is neither the image's nor swapped, a swap the orientation does not explain, and a
+    /// declaration without a usable size.
+    #[test]
+    fn face_regions_refuse_a_frame_they_cannot_place_their_boxes_in() {
+        let alice = [FaceRegion { face_id: 0, name: "Alice".into(), bbox: (0.5, 0.1, 0.2, 0.1) }];
+        let no_size = |o| RegionFrame { orientation: Some(o), stored_size: None };
+        let cases = [
+            ("unknown size, turned a quarter", lightroom_declaring("6000", "4000"), no_size(6)),
+            ("another aspect", lightroom_declaring("5000", "5000"), turned(6, 6000, 4000)),
+            ("swapped but upright", lightroom_declaring("4000", "6000"), turned(1, 6000, 4000)),
+            ("no usable size", lightroom_declaring("6000", "wide"), turned(6, 6000, 4000)),
+            ("zero size", lightroom_declaring("0", "4000"), turned(6, 6000, 4000)),
+        ];
+        for (case, sidecar, frame) in cases {
+            let (_dir, photo) = seeded_photo("xmp-145-refuse", &sidecar);
+            let err = write_face_regions(&photo, CAT, &alice, &[], &[], frame)
+                .expect_err(&format!("{case}: the write must be refused"));
+            assert!(matches!(err, RegionWriteError::Refused(_)), "{case}: {err:?}");
+            assert!(err.to_string().contains(&sidecar_path(&photo).display().to_string()), "{case}: {err}");
+            assert_eq!(read(&sidecar_path(&photo)), sidecar, "{case}: sidecar changed");
+            assert!(read_face_regions_in(&photo, frame).is_empty(), "{case}: imported anyway");
+        }
+    }
+
+    /// P02's other halves: an unknown size never replaces a declaration. Upright (or mirrored
+    /// without a quarter turn) the stored and display frames share their aspect, so the boxes
+    /// go into the stored frame MWG prescribes; with an unknown orientation they go as they
+    /// are (#136). Either way the declared 6000x4000 stays.
+    #[test]
+    fn face_regions_with_an_unknown_size_keep_the_declared_dimensions() {
+        let alice = (0.5, 0.1, 0.2, 0.1);
+        for (case, orientation, want) in [
+            ("upright", Some(1), alice),
+            ("rotated 180", Some(3), display_to_stored(3, alice)),
+            ("unknown orientation", None, alice),
+        ] {
+            let (_dir, photo) = seeded_photo("xmp-145-unsized", &lightroom_declaring("6000", "4000"));
+            let frame = RegionFrame { orientation, stored_size: None };
+            write_face_regions(&photo, CAT, &[FaceRegion { face_id: 0, name: "Alice".into(), bbox: alice }], &[], &[], frame)
+                .unwrap_or_else(|e| panic!("{case}: {e}"));
+            let xml = read(&sidecar_path(&photo));
+            let got = rf::mwg(&xml);
+            assert_eq!(got.dims, [Some(("6000".into(), "4000".into()))], "{case}:\n{xml}");
+            assert!(near4(rf::named(&got, "Alice")[0].area, center(want)), "{case}:\n{xml}");
+            assert_eq!(rf::named(&got, "Bob")[0].area, BOB_STORED, "{case}");
+        }
+    }
+
+    // ── #135: ChairPhoto's marker ──────────────────────────────────────────────
+
+    fn face(face_id: i64, name: &str, bbox: (f32, f32, f32, f32)) -> FaceRegion {
+        FaceRegion { face_id, name: name.into(), bbox }
+    }
+
+    /// #135: every region ChairPhoto writes carries `chairphoto:FaceId` in ChairPhoto's
+    /// namespace — even where the Description binds the `chairphoto` prefix to something else —
+    /// and a face that leaves the set takes its region with it, while every foreign region and
+    /// structure in the digiKam, Lightroom (Orientation 6) and MS Photo sidecars stays.
+    #[test]
+    fn face_regions_mark_ours_and_remove_them_when_their_face_leaves() {
+        for (layout, sidecar) in rf::FOREIGN_REGIONS {
+            let (_dir, photo) = seeded_photo("xmp-135-marker", sidecar);
+            let frame = if layout == "lightroom-o6" { turned(6, 6000, 4000) } else { sized(6000, 4000) };
+            let before = rf::mwg(sidecar);
+            let alice = face(41, "Alice", (0.1, 0.1, 0.2, 0.2));
+            let carl = face(42, "Carl", (0.4, 0.4, 0.1, 0.1));
+            write_face_regions(&photo, CAT, &[alice.clone(), carl.clone()], &[], &[], frame).unwrap();
+
+            let xml = read(&sidecar_path(&photo));
+            let got = rf::mwg(&xml);
+            assert_eq!(rf::named(&got, "Alice")[0].face_id.as_deref(), Some(ours(41).as_str()), "{layout}:\n{xml}");
+            assert_eq!(rf::named(&got, "Carl")[0].face_id.as_deref(), Some(ours(42).as_str()), "{layout}:\n{xml}");
+            assert_eq!(got.regions.len(), before.regions.len() + 2, "{layout}:\n{xml}");
+
+            // Alice is rejected, Carl ignored: the set is empty now.
+            write_face_regions(&photo, CAT, &[carl.clone()], &[41], &[], frame).unwrap();
+            let got = rf::mwg(&read(&sidecar_path(&photo)));
+            assert!(rf::named(&got, "Alice").is_empty(), "{layout}: Alice stayed");
+            write_face_regions(&photo, CAT, &[], &[41, 42], &[], frame).unwrap();
+            let xml = read(&sidecar_path(&photo));
+            let got = rf::mwg(&xml);
+            assert_eq!(got.regions, before.regions, "{layout}: only the foreign regions are left:\n{xml}");
+            if !before.dims.is_empty() {
+                assert_eq!(got.dims, before.dims, "{layout}");
+            } // else the Regions ChairPhoto added stays, empty: nothing marks it as ours alone.
+            assert_eq!(rf::foreign_structures(&xml), rf::foreign_structures(sidecar), "{layout}:\n{xml}");
+        }
+
+        // A Description binding `chairphoto` to another namespace.
+        let (_dir, photo) = seeded_photo("xmp-135-prefix", &rf::DIGIKAM.replace(
+            r#"xmlns:digiKam="http://www.digikam.org/ns/1.0/""#,
+            r#"xmlns:digiKam="http://www.digikam.org/ns/1.0/" xmlns:chairphoto="urn:example:not-ours""#,
+        ));
+        write_face_regions(&photo, CAT, &[face(7, "Alice", (0.1, 0.1, 0.2, 0.2))], &[], &[], sized(6000, 4000))
+            .unwrap();
+        let got = rf::mwg(&read(&sidecar_path(&photo)));
+        assert_eq!(rf::named(&got, "Alice")[0].face_id.as_deref(), Some(ours(7).as_str()));
+    }
+
+    /// Review L3 / P05: a marked region follows its face — renamed, then moved further than
+    /// `AREA_EPSILON` by a re-detection or an edited box — instead of a stale copy piling up.
+    /// Its foreign additions survive. (Renamed *and* moved in one write, the marker alone does
+    /// not prove it is the same face — ids are catalog-local — so it is replaced instead.)
+    #[test]
+    fn face_regions_follow_a_renamed_and_moved_face_by_its_marker() {
+        let (_dir, photo) = seeded_photo("xmp-135-follow", rf::DIGIKAM);
+        write_face_regions(&photo, CAT, &[face(9, "Alice", (0.1, 0.1, 0.2, 0.2))], &[], &[], sized(6000, 4000))
+            .unwrap();
+        // Another tool annotates our region.
+        let xml = read(&sidecar_path(&photo)).replace(
+            "<mwg-rs:Type>Face</mwg-rs:Type>",
+            r#"<mwg-rs:Type>Face</mwg-rs:Type><digiKam:FaceEngine>dnn</digiKam:FaceEngine>"#,
+        );
+        std::fs::write(sidecar_path(&photo), &xml).unwrap();
+        write_face_regions(&photo, CAT, &[face(9, "Alicia", (0.1, 0.1, 0.2, 0.2))], &[], &[], sized(6000, 4000))
+            .unwrap();
+        write_face_regions(&photo, CAT, &[face(9, "Alicia", (0.3, 0.2, 0.2, 0.2))], &[], &[], sized(6000, 4000))
+            .unwrap();
+
+        let xml = read(&sidecar_path(&photo));
+        let got = rf::mwg(&xml);
+        assert!(rf::named(&got, "Alice").is_empty(), "the stale name stayed:\n{xml}");
+        let ours = rf::named(&got, "Alicia");
+        assert_eq!(ours.len(), 1, "{xml}");
+        assert!(near4(ours[0].area, center((0.3, 0.2, 0.2, 0.2))), "{xml}");
+        assert_eq!(rf::subtree(&xml, rf::NS_DIGIKAM, "FaceEngine").len(), 1, "{xml}");
+        assert_eq!(got.regions.len(), 2, "Alicia and digiKam's Bob:\n{xml}");
+    }
+
+    /// A foreign region that is the same face as one ChairPhoto writes (by Name + Area) is that
+    /// face already in the file: it is updated in place (#140), never marked, and no marked
+    /// copy is appended. When the face leaves the set it stays — it is not ours to remove.
+    #[test]
+    fn face_regions_never_remove_a_foreign_region() {
+        let (_dir, photo) = seeded_photo("xmp-135-foreign", rf::DIGIKAM);
+        // Bob as ChairPhoto has him (imported from this very region, source 'xmp').
+        let bob = face(3, "Bob", (0.755, 0.6, 0.1, 0.2));
+        write_face_regions(&photo, CAT, &[bob], &[], &[], sized(6000, 4000)).unwrap();
+        let got = rf::mwg(&read(&sidecar_path(&photo)));
+        assert_eq!(got.regions.len(), 1, "{got:?}");
+        assert_eq!(got.regions[0].face_id, None, "a foreign region is never marked");
+
+        write_face_regions(&photo, CAT, &[], &[], &[], sized(6000, 4000)).unwrap();
+        let got = rf::mwg(&read(&sidecar_path(&photo)));
+        assert_eq!(rf::named(&got, "Bob").len(), 1, "a foreign region was removed");
+    }
+
+    /// The decision's rule for regions written before the marker existed: an unmarked region
+    /// matching (Name + Area, in the display frame the old writer used) a face on the
+    /// pre-marker record was ChairPhoto's. While its face is in the set it is adopted — moved
+    /// into the frame and marked — and once the face has left it is removed. An unmarked region
+    /// the record does not describe is foreign and kept, even with a recorded face's name.
+    #[test]
+    fn face_regions_adopt_or_remove_what_a_pre_marker_chairphoto_wrote() {
+        // What the pre-marker writer left on a portrait shot (Orientation 6): Alice and Dora in
+        // the display frame, unmarked, plus a foreign Alice elsewhere and Lightroom's Bob.
+        let pre_marker = |name: &str, (x, y, w, h): (f32, f32, f32, f32)| {
+            format!(
+                r#"<rdf:li rdf:parseType="Resource"><mwg-rs:Name>{name}</mwg-rs:Name><mwg-rs:Type>Face</mwg-rs:Type><mwg-rs:Area rdf:parseType="Resource"><stArea:x>{}</stArea:x><stArea:y>{}</stArea:y><stArea:w>{w}</stArea:w><stArea:h>{h}</stArea:h><stArea:unit>normalized</stArea:unit></mwg-rs:Area></rdf:li>"#,
+                x + w / 2.0,
+                y + h / 2.0
+            )
+        };
+        let alice_then = (0.1, 0.1, 0.2, 0.2);
+        let dora_then = (0.5, 0.5, 0.1, 0.1);
+        let lis = [
+            pre_marker("Alice", alice_then),
+            pre_marker("Dora", dora_then),
+            pre_marker("Alice", (0.7, 0.05, 0.1, 0.1)),
+        ]
+        .concat();
+        let sidecar = rf::LIGHTROOM_ROTATED.replace("     </rdf:Bag>", &format!("{lis}</rdf:Bag>"));
+        let (_dir, photo) = seeded_photo("xmp-135-legacy", &sidecar);
+        assert_eq!(rf::mwg(&sidecar).regions.len(), 4);
+
+        let record = [face(1, "Alice", alice_then), face(2, "Dora", dora_then)];
+        // Alice is still confirmed (re-detected a little off); Dora was rejected.
+        let alice_now = face(1, "Alice", (0.105, 0.1, 0.2, 0.2));
+        write_face_regions(&photo, CAT, &[alice_now.clone()], &[], &record, turned(6, 6000, 4000)).unwrap();
+
+        let xml = read(&sidecar_path(&photo));
+        let got = rf::mwg(&xml);
+        assert!(rf::named(&got, "Dora").is_empty(), "the rejected face's region stayed:\n{xml}");
+        let alices = rf::named(&got, "Alice");
+        assert_eq!(alices.len(), 2, "adopted, not duplicated; the foreign Alice kept:\n{xml}");
+        let ours: Vec<_> = alices.iter().filter(|r| r.face_id.is_some()).collect();
+        assert_eq!(ours.len(), 1, "{xml}");
+        assert_eq!(ours[0].face_id.as_deref(), Some(super::tests::ours(1).as_str()));
+        assert!(near4(ours[0].area, center(display_to_stored(6, alice_now.bbox))), "{xml}");
+        let foreign: Vec<_> = alices.iter().filter(|r| r.face_id.is_none()).collect();
+        assert!(near4(foreign[0].area, (0.75, 0.1, 0.1, 0.1)), "{xml}");
+        assert_eq!(rf::named(&got, "Bob")[0].area, BOB_STORED);
+    }
+
+    /// A write that changes nothing in the regions leaves the sidecar alone: with nothing to
+    /// write and nothing of ours to remove no sidecar is created, and repeating a write leaves
+    /// the file byte for byte as the first one did.
+    #[test]
+    fn face_regions_that_change_nothing_write_nothing() {
+        let dir = region_dir("xmp-135-noop");
+        let photo = dir.join("N.JPG");
+        std::fs::write(&photo, b"jpeg").unwrap();
+        write_face_regions(&photo, CAT, &[], &[], &[], sized(6000, 4000)).unwrap();
+        assert!(!sidecar_path(&photo).exists(), "an empty set created a sidecar");
+
+        let (_dir, photo) = seeded_photo("xmp-135-noop-again", rf::DIGIKAM);
+        write_face_regions(&photo, CAT, &[], &[], &[], sized(6000, 4000)).unwrap();
+        assert_eq!(read(&sidecar_path(&photo)), rf::DIGIKAM, "nothing of ours, nothing written");
+        let alice = [face(5, "Alice", (0.1, 0.1, 0.2, 0.2))];
+        write_face_regions(&photo, CAT, &alice, &[], &[], sized(6000, 4000)).unwrap();
+        let first = read(&sidecar_path(&photo));
+        write_face_regions(&photo, CAT, &alice, &[], &[], sized(6000, 4000)).unwrap();
+        assert_eq!(read(&sidecar_path(&photo)), first);
+    }
+
+    // ── #147: matching and the bare rdf:RDF root ───────────────────────────────
+
+    /// Two unmarked Bobs, the one listed first at center x 0.515, the second at 0.50. With the
+    /// Bob being written at 0.505 both are within `AREA_EPSILON`.
+    fn two_foreign_bobs() -> String {
+        let bob = |x: &str| {
+            format!(
+                r#"<rdf:li><rdf:Description mwg-rs:Name="Bob" mwg-rs:Type="Face"><mwg-rs:Area stArea:x="{x}" stArea:y="0.5" stArea:w="0.1" stArea:h="0.1" stArea:unit="normalized" digiKam:Confidence="{x}"/></rdf:Description></rdf:li>"#
+            )
+        };
+        let digikam_bob = r#"      <rdf:li>
+       <rdf:Description mwg-rs:Name="Bob" mwg-rs:Type="Face">
+        <mwg-rs:Area stArea:x="0.8" stArea:y="0.7" stArea:w="0.1" stArea:h="0.2" stArea:unit="normalized"/>
+       </rdf:Description>
+      </rdf:li>"#;
+        assert!(rf::DIGIKAM.contains(digikam_bob));
+        rf::DIGIKAM.replace(digikam_bob, &[bob("0.515"), bob("0.5")].concat())
+    }
+
+    /// Review L1 (probe P04): one incoming region updates at most one existing region, and
+    /// L2: the one it updates is the closest, not the first in document order. The other Bob,
+    /// listed first, is left exactly as it was.
+    #[test]
+    fn face_regions_update_only_the_closest_matching_region() {
+        let sidecar = two_foreign_bobs();
+        assert_eq!(rf::named(&rf::mwg(&sidecar), "Bob").len(), 2, "fixture:\n{sidecar}");
+        let (_dir, photo) = seeded_photo("xmp-147-closest", &sidecar);
+        let bob = face(3, "Bob", (0.455, 0.45, 0.1, 0.1)); // center (0.505, 0.5)
+        write_face_regions(&photo, CAT, &[bob], &[], &[], sized(6000, 4000)).unwrap();
+
+        let xml = read(&sidecar_path(&photo));
+        let bobs = rf::named(&rf::mwg(&xml), "Bob").into_iter().cloned().collect::<Vec<_>>();
+        assert_eq!(bobs.len(), 2, "no Bob appended or removed:\n{xml}");
+        assert_eq!(bobs[0].area.0, 0.515, "the farther Bob, listed first, moved:\n{xml}");
+        assert!((bobs[1].area.0 - 0.505).abs() < 1e-5, "the closest Bob did not move:\n{xml}");
+        assert!(bobs.iter().all(|b| b.face_id.is_none()), "a foreign region was marked:\n{xml}");
+    }
+
+    /// L2 with ChairPhoto's own region in the file: a digiKam Bob listed first and closer to
+    /// the old position never takes the update meant for ChairPhoto's marked Bob.
+    #[test]
+    fn face_regions_update_their_own_region_before_a_foreign_one() {
+        let (_dir, photo) = seeded_photo("xmp-147-ours-first", &two_foreign_bobs());
+        // ChairPhoto's own Bob, marked, at center (0.51, 0.5): written as Zed far away, then
+        // edited into place, so no foreign Bob is matched on the way.
+        write_face_regions(&photo, CAT, &[face(99, "Zed", (0.1, 0.1, 0.1, 0.1))], &[], &[], sized(6000, 4000))
+            .unwrap();
+        let xml = read(&sidecar_path(&photo)).replace(
+            "<mwg-rs:Name>Zed</mwg-rs:Name>",
+            "<mwg-rs:Name>Bob</mwg-rs:Name>",
+        )
+        .replace(&format!("<chairphoto:FaceId>{}</chairphoto:FaceId>", ours(99)), &format!("<chairphoto:FaceId>{}</chairphoto:FaceId>", ours(3)))
+        .replace("<stArea:x>0.15</stArea:x><stArea:y>0.15</stArea:y>", "<stArea:x>0.51</stArea:x><stArea:y>0.5</stArea:y>");
+        assert!(xml.contains("<stArea:x>0.51</stArea:x>"), "{xml}");
+        std::fs::write(sidecar_path(&photo), &xml).unwrap();
+
+        write_face_regions(&photo, CAT, &[face(3, "Bob", (0.455, 0.45, 0.1, 0.1))], &[], &[], sized(6000, 4000))
+            .unwrap();
+        let xml = read(&sidecar_path(&photo));
+        let got = rf::mwg(&xml);
+        let bobs = rf::named(&got, "Bob");
+        assert_eq!(bobs.len(), 3, "{xml}");
+        assert_eq!((bobs[0].area.0, bobs[1].area.0), (0.515, 0.5), "a foreign Bob moved:\n{xml}");
+        assert_eq!(bobs[2].face_id.as_deref(), Some(ours(3).as_str()));
+        assert!((bobs[2].area.0 - 0.505).abs() < 1e-5, "ours did not move:\n{xml}");
+    }
+
+    /// Review L4 (probe P12): a sidecar whose root is a bare `rdf:RDF` — no `x:xmpmeta`, which
+    /// the XMP spec allows — is read and written in place: one `rdf:RDF`, one `Regions`, the
+    /// foreign region kept and ChairPhoto's added; the identifier reads and writes too. A root
+    /// that is no XMP packet at all is refused and left as it was.
+    #[test]
+    fn a_bare_rdf_root_is_written_in_place() {
+        let start = rf::DIGIKAM.find("<rdf:RDF").unwrap();
+        let end = rf::DIGIKAM.find("</x:xmpmeta>").unwrap();
+        let bare = format!(r#"<?xml version="1.0" encoding="UTF-8"?>{}"#, &rf::DIGIKAM[start..end]);
+        let (_dir, photo) = seeded_photo("xmp-147-bare", &bare);
+        assert_eq!(region_names(&photo), ["Bob"], "the bare root is read");
+
+        write_face_regions(&photo, CAT, &[face(4, "Alice", (0.1, 0.1, 0.2, 0.2))], &[], &[], sized(6000, 4000))
+            .unwrap();
+        write_identifier(&photo, "6f1c1f0e-2b7a-4c3d-9e8f-0a1b2c3d4e5f").unwrap();
+
+        let xml = read(&sidecar_path(&photo));
+        let got = rf::mwg(&xml);
+        assert_eq!(got.rdf_elements, 1, "a second rdf:RDF:\n{xml}");
+        assert_eq!(got.dims.len(), 1, "a second Regions:\n{xml}");
+        assert_eq!(rf::named(&got, "Bob")[0].area, (0.8, 0.7, 0.1, 0.2));
+        assert_eq!(rf::named(&got, "Alice")[0].face_id.as_deref(), Some(ours(4).as_str()));
+        assert_eq!(read_identifier(&photo).as_deref(), Some("6f1c1f0e-2b7a-4c3d-9e8f-0a1b2c3d4e5f"));
+        assert_eq!(rf::foreign_structures(&xml), rf::foreign_structures(rf::DIGIKAM));
+
+        let (_dir, photo) = seeded_photo("xmp-147-not-xmp", "<foo><bar/></foo>");
+        assert!(write_face_regions(&photo, CAT, &[face(4, "Alice", (0.1, 0.1, 0.2, 0.2))], &[], &[], sized(6000, 4000))
+            .is_err());
+        assert!(write_identifier(&photo, "6f1c1f0e-2b7a-4c3d-9e8f-0a1b2c3d4e5f").is_err());
+        assert_eq!(read(&sidecar_path(&photo)), "<foo><bar/></foo>");
+    }
+
+    /// The #147 nit: a `chairphoto:LastWrite` exiftool moved into a later Description still
+    /// says ChairPhoto has written the file, so no backup of a ChairPhoto-written state is
+    /// taken as if it were the foreign original.
+    #[test]
+    fn last_write_in_a_later_description_counts() {
+        let sidecar = r#"<?xml version="1.0" encoding="UTF-8"?>
+<x:xmpmeta xmlns:x="adobe:ns:meta/">
+ <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+  <rdf:Description rdf:about="" xmlns:xmp="http://ns.adobe.com/xap/1.0/" xmp:Rating="2"/>
+  <rdf:Description rdf:about="" xmlns:chairphoto="https://chairphoto.local/ns/1.0/">
+   <chairphoto:LastWrite>1700000000</chairphoto:LastWrite>
+  </rdf:Description>
+ </rdf:RDF>
+</x:xmpmeta>"#;
+        let (_dir, photo) = seeded_photo("xmp-147-lastwrite", sidecar);
+        write_face_regions(&photo, CAT, &[face(4, "Alice", (0.1, 0.1, 0.2, 0.2))], &[], &[], sized(6000, 4000))
+            .unwrap();
+        assert!(!sidecar_backup_path(&sidecar_path(&photo)).exists(), "backed up a file ChairPhoto wrote");
+    }
+
+    // ── #135 M1: the marker is scoped to its catalog ───────────────────────────
+
+    /// A `rdf:li` region in ChairPhoto's own shape, carrying `marker` as its FaceId.
+    fn marked_region(marker: &str, name: &str, (x, y, w, h): (f32, f32, f32, f32)) -> String {
+        format!(
+            r#"<rdf:li rdf:parseType="Resource"><mwg-rs:Name>{name}</mwg-rs:Name><mwg-rs:Type>Face</mwg-rs:Type><mwg-rs:Area rdf:parseType="Resource"><stArea:x>{}</stArea:x><stArea:y>{}</stArea:y><stArea:w>{w}</stArea:w><stArea:h>{h}</stArea:h><stArea:unit>normalized</stArea:unit></mwg-rs:Area><chairphoto:FaceId xmlns:chairphoto="https://chairphoto.local/ns/1.0/">{marker}</chairphoto:FaceId></rdf:li>"#,
+            x + w / 2.0,
+            y + h / 2.0
+        )
+    }
+
+    /// digiKam's sidecar with `lis` added to its RegionList.
+    fn digikam_with(lis: &str) -> String {
+        let end = "     </rdf:Bag>\n    </mwg-rs:RegionList>";
+        assert!(rf::DIGIKAM.contains(end), "the fixture's list moved");
+        rf::DIGIKAM.replacen(end, &format!("{lis}{end}"), 1)
+    }
+
+    /// Review M1 / probe Q5: a region another catalog marked — or a marker this build does not
+    /// recognise — is foreign. A write of this catalog's set never removes it, never marks it
+    /// as ours, and never renames or moves it, even when its face id is one this catalog
+    /// writes; a rejected face of ours beside it still goes.
+    #[test]
+    fn another_catalogs_regions_are_foreign() {
+        const OTHER: &str = "5d0e9a77-3c2b-4f1e-8a6d-2b9c0e1f4a33";
+        let carol = (0.8, 0.8, 0.1, 0.1);
+        for (case, marker) in [
+            ("another catalog", format!("{OTHER}/7")),
+            ("another catalog, our face id", format!("{OTHER}/1")),
+            ("the pre-scope bare id", "1".to_string()),
+            ("not a face id", format!("{CAT}/x1")),
+            ("no face id", format!("{CAT}/")),
+            ("a longer path", format!("{CAT}/1/2")),
+            ("upper-cased catalog", format!("{}/1", CAT.to_uppercase())),
+        ] {
+            let lis = [marked_region(&marker, "Carol", carol), marked_region(&ours(2), "Dora", (0.5, 0.5, 0.1, 0.1))];
+            let sidecar = digikam_with(&lis.concat());
+            let (_dir, photo) = seeded_photo("xmp-135-scope", &sidecar);
+            let carol_before = rf::named(&rf::mwg(&sidecar), "Carol")[0].clone();
+            // This catalog writes Alice as face 1; Dora (face 2) has been rejected.
+            write_face_regions(&photo, CAT, &[face(1, "Alice", (0.1, 0.1, 0.2, 0.2))], &[2], &[], sized(6000, 4000))
+                .unwrap();
+            let xml = read(&sidecar_path(&photo));
+            let got = rf::mwg(&xml);
+            assert_eq!(rf::named(&got, "Carol"), [&carol_before], "{case}: Carol changed:\n{xml}");
+            assert!(rf::named(&got, "Dora").is_empty(), "{case}: our rejected Dora stayed:\n{xml}");
+            assert_eq!(rf::named(&got, "Alice")[0].face_id.as_deref(), Some(ours(1).as_str()), "{case}");
+            assert_eq!(rf::named(&got, "Bob").len(), 1, "{case}");
+
+            write_face_regions(&photo, CAT, &[], &[1, 2], &[], sized(6000, 4000)).unwrap();
+            let got = rf::mwg(&read(&sidecar_path(&photo)));
+            assert_eq!(rf::named(&got, "Carol"), [&carol_before], "{case}: removed with an empty set");
+        }
+    }
+
+    /// Another catalog's region that is the same face as one this catalog writes holds that
+    /// face already: as for an unmarked foreign region (#140), only its Area moves, its marker
+    /// stays the other catalog's, and no copy of ours is appended — so this catalog's reject
+    /// later leaves it in place.
+    #[test]
+    fn another_catalogs_region_of_the_same_face_is_updated_in_place_only() {
+        const OTHER: &str = "5d0e9a77-3c2b-4f1e-8a6d-2b9c0e1f4a33";
+        let theirs = format!("{OTHER}/7");
+        let sidecar = digikam_with(&marked_region(&theirs, "Alice", (0.1, 0.1, 0.2, 0.2)));
+        let (_dir, photo) = seeded_photo("xmp-135-scope-same", &sidecar);
+        write_face_regions(&photo, CAT, &[face(1, "Alice", (0.105, 0.1, 0.2, 0.2))], &[], &[], sized(6000, 4000))
+            .unwrap();
+        let xml = read(&sidecar_path(&photo));
+        let alices = rf::named(&rf::mwg(&xml), "Alice").into_iter().cloned().collect::<Vec<_>>();
+        assert_eq!(alices.len(), 1, "a copy was appended:\n{xml}");
+        assert_eq!(alices[0].face_id.as_deref(), Some(theirs.as_str()), "re-marked as ours:\n{xml}");
+        assert!(near4(alices[0].area, center((0.105, 0.1, 0.2, 0.2))), "{xml}");
+        write_face_regions(&photo, CAT, &[], &[], &[], sized(6000, 4000)).unwrap();
+        assert_eq!(rf::named(&rf::mwg(&read(&sidecar_path(&photo))), "Alice").len(), 1);
+    }
+
+    // ── #135 M2: only the pre-marker writer's exact shape is legacy ────────────
+
+    /// Review M2 / probes Q4, Q4b: an unmarked region at the recorded place under the recorded
+    /// name is taken for the pre-marker writer's only when it has exactly that writer's shape.
+    /// digiKam's (nested `rdf:Description`, `digiKam:Confidence`) and every other variant —
+    /// an extra field, a foreign child or attribute, another struct form — stays foreign: a
+    /// reject never removes it, a confirmed face never marks it (only its Area moves, #140).
+    /// The control, the exact shape, is adopted and then removed.
+    #[test]
+    fn only_the_pre_marker_shape_is_adopted_or_removed() {
+        const AREA: &str = r#"<mwg-rs:Area rdf:parseType="Resource"><stArea:x>0.2</stArea:x><stArea:y>0.2</stArea:y><stArea:w>0.2</stArea:w><stArea:h>0.2</stArea:h><stArea:unit>normalized</stArea:unit></mwg-rs:Area>"#;
+        let exact = |li_attrs: &str, extra: &str| {
+            format!(
+                r#"<rdf:li rdf:parseType="Resource"{li_attrs}><mwg-rs:Name>Alice</mwg-rs:Name><mwg-rs:Type>Face</mwg-rs:Type>{AREA}{extra}</rdf:li>"#
+            )
+        };
+        let foreign = [
+            (
+                "digiKam (Q4)",
+                r#"<rdf:li><rdf:Description mwg-rs:Name="Alice" mwg-rs:Type="Face" digiKam:Confidence="0.97"><mwg-rs:Area stArea:x="0.2" stArea:y="0.2" stArea:w="0.2" stArea:h="0.2" stArea:unit="normalized"/></rdf:Description></rdf:li>"#.to_string(),
+            ),
+            ("an extra MWG field", exact("", "<mwg-rs:Rotation>0</mwg-rs:Rotation>")),
+            ("a foreign child", exact("", "<digiKam:FaceEngine>dnn</digiKam:FaceEngine>")),
+            ("a foreign attribute", exact(r#" digiKam:Confidence="0.97""#, "")),
+            (
+                "an Area in attribute form",
+                r#"<rdf:li rdf:parseType="Resource"><mwg-rs:Name>Alice</mwg-rs:Name><mwg-rs:Type>Face</mwg-rs:Type><mwg-rs:Area stArea:x="0.2" stArea:y="0.2" stArea:w="0.2" stArea:h="0.2" stArea:unit="normalized"/></rdf:li>"#.to_string(),
+            ),
+            (
+                "a foreign Area field",
+                exact("", "").replace("<stArea:unit>", r#"<digiKam:Source>user</digiKam:Source><stArea:unit>"#),
+            ),
+        ];
+        let alice = face(1, "Alice", (0.1, 0.1, 0.2, 0.2));
+        let record = [alice.clone()];
+        for (case, li) in &foreign {
+            let sidecar = digikam_with(li);
+            let before = rf::named(&rf::mwg(&sidecar), "Alice")[0].clone();
+            assert_eq!(before.area, (0.2, 0.2, 0.2, 0.2), "{case}: fixture");
+
+            // Q4: the face was rejected.
+            let (_dir, photo) = seeded_photo("xmp-135-shape-reject", &sidecar);
+            write_face_regions(&photo, CAT, &[], &[], &record, sized(6000, 4000)).unwrap();
+            let xml = read(&sidecar_path(&photo));
+            assert_eq!(rf::named(&rf::mwg(&xml), "Alice"), [&before], "{case}: deleted:\n{xml}");
+
+            // Q4b: the face is still confirmed (moved a little).
+            let (_dir, photo) = seeded_photo("xmp-135-shape-keep", &sidecar);
+            let moved = face(1, "Alice", (0.105, 0.1, 0.2, 0.2));
+            write_face_regions(&photo, CAT, &[moved], &[], &record, sized(6000, 4000)).unwrap();
+            let xml = read(&sidecar_path(&photo));
+            let alices = rf::named(&rf::mwg(&xml), "Alice").into_iter().cloned().collect::<Vec<_>>();
+            assert_eq!(alices.len(), 1, "{case}: duplicated:\n{xml}");
+            assert_eq!(alices[0].face_id, None, "{case}: adopted as ours:\n{xml}");
+            write_face_regions(&photo, CAT, &[], &[], &record, sized(6000, 4000)).unwrap();
+            assert_eq!(rf::named(&rf::mwg(&read(&sidecar_path(&photo))), "Alice").len(), 1, "{case}");
+        }
+
+        // The control: the exact shape is the old writer's.
+        let sidecar = digikam_with(&exact("", ""));
+        let (_dir, photo) = seeded_photo("xmp-135-shape-exact", &sidecar);
+        write_face_regions(&photo, CAT, &[alice.clone()], &[], &record, sized(6000, 4000)).unwrap();
+        let got = rf::mwg(&read(&sidecar_path(&photo)));
+        assert_eq!(rf::named(&got, "Alice")[0].face_id.as_deref(), Some(ours(1).as_str()), "not adopted");
+        let (_dir, photo) = seeded_photo("xmp-135-shape-exact-reject", &sidecar);
+        write_face_regions(&photo, CAT, &[], &[], &record, sized(6000, 4000)).unwrap();
+        assert!(rf::named(&rf::mwg(&read(&sidecar_path(&photo))), "Alice").is_empty(), "not removed");
+    }
+
+    // ── review L5: the name-or-place guard on a FaceId match ───────────────────
+
+    /// Step 1 follows our marker only while the region is still recognisably that face — its
+    /// Name, or its place. A region carrying our marker for face 5 whose name *and* place
+    /// both differ from face 5's (a copy of this catalog's file that diverged, sharing its
+    /// identity) is not renamed and moved: since face 5 is still in the set it has not left
+    /// it either, so the region is kept exactly as it is (review N1) and face 5 is written
+    /// beside it. With either the name or the place still matching, the marker is followed
+    /// and the annotation kept.
+    #[test]
+    fn a_marker_is_followed_only_while_the_name_or_place_still_matches() {
+        let annotated = |name: &str, bbox| {
+            marked_region(&ours(5), name, bbox)
+                .replace("</rdf:li>", "<digiKam:FaceEngine>dnn</digiKam:FaceEngine></rdf:li>")
+        };
+        let carl_place = (0.7, 0.7, 0.1, 0.1);
+        let alice_place = (0.1, 0.1, 0.2, 0.2);
+        for (case, existing, follows) in [
+            ("name and place differ", annotated("Carl", carl_place), false),
+            ("same name, moved", annotated("Alice", carl_place), true),
+            ("renamed, same place", annotated("Carl", alice_place), true),
+        ] {
+            let (_dir, photo) = seeded_photo("xmp-l5-guard", &digikam_with(&existing));
+            write_face_regions(&photo, CAT, &[face(5, "Alice", alice_place)], &[], &[], sized(6000, 4000)).unwrap();
+            let xml = read(&sidecar_path(&photo));
+            let got = rf::mwg(&xml);
+            let carls = rf::named(&got, "Carl");
+            if follows {
+                assert!(carls.is_empty(), "{case}: Carl stayed:\n{xml}");
+            } else {
+                let before = rf::named(&rf::mwg(&digikam_with(&existing)), "Carl")[0].clone();
+                assert_eq!(carls, [&before], "{case}: Carl changed:\n{xml}");
+            }
+            let alices = rf::named(&got, "Alice");
+            assert_eq!(alices.len(), 1, "{case}:\n{xml}");
+            assert_eq!(alices[0].face_id.as_deref(), Some(ours(5).as_str()), "{case}");
+            assert!(near4(alices[0].area, center(alice_place)), "{case}:\n{xml}");
+            let kept = rf::subtree(&xml, rf::NS_DIGIKAM, "FaceEngine").len();
+            assert_eq!(kept, 1, "{case}: the annotation:\n{xml}");
+        }
+    }
+
+    // ── review N1: only a face this catalog knows on the photo ─────────────────
+
+    /// Probe R2: a region carrying this catalog's marker for face 901, which this catalog
+    /// does not know on this photo (a copy of the catalog file wrote it), is foreign — kept
+    /// exactly as it is by a write of another face, by a write whose own face 901 is someone
+    /// else elsewhere (the copies' id counters collide), and by an empty write. Only when 901
+    /// is one of this photo's faces that left the set (`retired`) is it removed.
+    #[test]
+    fn a_marker_for_a_face_unknown_on_the_photo_is_kept() {
+        let carol = marked_region(&ours(901), "Carol", (0.7, 0.7, 0.1, 0.1));
+        let sidecar = digikam_with(&carol);
+        let before = rf::named(&rf::mwg(&sidecar), "Carol")[0].clone();
+        let alice = face(1, "Alice", (0.1, 0.1, 0.2, 0.2));
+        let dave = face(901, "Dave", (0.4, 0.1, 0.1, 0.1));
+        for (case, regions, retired, kept) in [
+            ("unknown id", vec![alice.clone()], vec![], true),
+            ("colliding id, another face", vec![dave], vec![], true),
+            ("empty write", vec![], vec![1], true),
+            ("unknown id, others retired", vec![alice.clone()], vec![2, 3], true),
+            ("retired here", vec![alice.clone()], vec![901], false),
+        ] {
+            let (_dir, photo) = seeded_photo("xmp-n1-unknown", &sidecar);
+            write_face_regions(&photo, CAT, &regions, &retired, &[], sized(6000, 4000)).unwrap();
+            let xml = read(&sidecar_path(&photo));
+            let carols = rf::named(&rf::mwg(&xml), "Carol").into_iter().cloned().collect::<Vec<_>>();
+            if kept {
+                assert_eq!(carols, [before.clone()], "{case}:\n{xml}");
+            } else {
+                assert!(carols.is_empty(), "{case}: not removed:\n{xml}");
+            }
+        }
+
+        // The same face as one this catalog writes (Carol, a little off): like any foreign
+        // region it holds her already — only its Area moves, the copy's marker stays, and no
+        // region of ours is appended beside it.
+        let (_dir, photo) = seeded_photo("xmp-n1-unknown-same", &sidecar);
+        let carol_here = face(3, "Carol", (0.705, 0.7, 0.1, 0.1));
+        write_face_regions(&photo, CAT, &[carol_here], &[], &[], sized(6000, 4000)).unwrap();
+        let xml = read(&sidecar_path(&photo));
+        let carols = rf::named(&rf::mwg(&xml), "Carol").into_iter().cloned().collect::<Vec<_>>();
+        assert_eq!(carols.len(), 1, "{xml}");
+        assert_eq!(carols[0].face_id.as_deref(), Some(ours(901).as_str()), "re-marked:\n{xml}");
+        assert!(near4(carols[0].area, center((0.705, 0.7, 0.1, 0.1))), "{xml}");
+    }
+
+    // ── review round 2 nit: only the canonical face id is ours ─────────────────
+
+    /// A marker is ours only in exactly the form ChairPhoto writes. `<catalog>/02` names
+    /// face 2 to a lenient parser, but ChairPhoto never wrote it, so it is foreign: kept even
+    /// though this photo's face 2 has been retired. The canonical `<catalog>/2` is removed.
+    #[test]
+    fn only_the_canonical_face_id_is_ours() {
+        for (id, removed) in [("2", true), ("02", false), ("002", false), ("+2", false), ("-2", false)] {
+            let marker = format!("{CAT}/{id}");
+            let sidecar = digikam_with(&marked_region(&marker, "Dora", (0.5, 0.5, 0.1, 0.1)));
+            let (_dir, photo) = seeded_photo("xmp-nit-canonical", &sidecar);
+            write_face_regions(&photo, CAT, &[], &[2], &[], sized(6000, 4000)).unwrap();
+            let xml = read(&sidecar_path(&photo));
+            let doras = rf::named(&rf::mwg(&xml), "Dora").len();
+            assert_eq!(doras, usize::from(!removed), "{marker}:\n{xml}");
         }
     }
 }

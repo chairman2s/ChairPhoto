@@ -245,6 +245,22 @@ pub fn run_index_job(sink: &(impl EventSink + ?Sized), claim: JobClaim<FacesJobS
     engine::configure(plan.parallelism, plan.intra_threads);
     engine::configure_force_cpu(indexer::load_force_cpu(sec.conn()));
 
+    // First, the one-time conversion of the pre-marker regions (#135): before indexing, so a
+    // photo's old display-frame regions are converted and marked before anything reads them.
+    // It shares this job's abort flag, ownership and connection; what it does not reach (an
+    // abort, an offline photo, a failure) stays on the record for the next index run. Its
+    // progress goes out through this job's own slot and `faces:progress` events — photos
+    // converted of photos to convert — before the index's own count starts again from 0
+    // (review N3; a phase label would mean a new field in both front ends). A failure to run
+    // it is logged, never fatal to indexing.
+    let resolve = |photo_id: i64| sec.resolve_photo_path(photo_id).map_err(|e| e.to_string());
+    let converting = |done: usize, total: usize| emit_fn(indexer::FacesProgress { done, total });
+    match regions::convert_legacy_regions(sec.conn(), resolve, &abort, converting) {
+        Ok(c) if c == regions::LegacyConversion::default() => {}
+        Ok(c) => eprintln!("faces_index: pre-marker regions: {c:?}"),
+        Err(e) => eprintln!("faces_index: pre-marker region conversion failed: {e}"),
+    }
+
     let result = {
         let resolve_fn = |photo_id: i64| sec.resolve_photo_path(photo_id).map_err(|e| e.to_string());
         let preview_fn = |path: &std::path::Path| crate::thumbnails::preview_bytes(path);
@@ -295,7 +311,15 @@ pub fn import_regions(
     path: &std::path::Path,
     people_root: &str,
 ) {
-    let read = crate::xmp::read_face_regions(path);
+    // In the EXIF-oriented frame the detections are in (#136).
+    let frame = match regions::region_frame(conn, photo_id) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("faces_import: read the region frame of photo {photo_id} failed: {e}");
+            return;
+        }
+    };
+    let read = crate::xmp::read_face_regions_in(path, frame);
     if read.is_empty() {
         return;
     }
@@ -458,7 +482,20 @@ pub fn add_manual(c: &Catalog, photo_id: i64, x: f64, y: f64, w: f64, h: f64) ->
 
 /// Delete a drawn, still-unassigned box (a mis-draw). Only `source='drawn'`: a detected face
 /// must be rejected or ignored instead, so re-indexing cannot resurrect it.
+///
+/// The photo's regions are written first, while the row still exists: a write removes a
+/// region carrying this catalog's marker only for a face id it knows on the photo (review
+/// N1), so a region of this face written now is removed, and after the delete it never could
+/// be. (A face still `drawn` was never confirmed — confirming makes it `manual` or keeps the
+/// matcher's `match` — so normally it has no region; this is the defensive half.)
 pub fn delete_drawn(c: &Catalog, face_id: i64) -> CatalogResult<()> {
+    let drawn: Option<i64> = c
+        .conn()
+        .query_row("SELECT photo_id FROM faces__faces WHERE id = ?1 AND source = 'drawn'", [face_id], |r| r.get(0))
+        .optional()?;
+    if let Some(photo_id) = drawn {
+        write_regions(c, photo_id);
+    }
     let n = c.conn().execute("DELETE FROM faces__faces WHERE id = ?1 AND source = 'drawn'", [face_id])?;
     if n == 0 {
         return Err(CatalogError::Validation("only unassigned drawn face boxes can be deleted".into()));

@@ -129,41 +129,159 @@ Working Group schema that digiKam, Lightroom and Picasa all understand. The code
 `crate::xmp` (`write_face_regions` / `read_face_regions`); the catalog-side wiring is in
 `plugins/faces/regions.rs`.
 
-**The frame.** Face boxes are stored normalized in one canonical frame: the photo as its own
-metadata orients it (the EXIF-oriented preview the indexer detects on), **without** the
-non-destructive `user_rotation`. The loupe draws the picture with the user rotation applied, so
-the overlay turns each box by it for display and turns a box drawn on the rotated picture back
-before storing it. The user rotation lives only in the catalog — the original is never rewritten
-and the sidecar carries no orientation of ours — so the export ignores it too: other tools see
-the file unturned, and so must its regions.
+**The frame.** Face boxes are stored normalized in one canonical frame, the **display frame**:
+the photo as its own metadata orients it (the EXIF-oriented preview the indexer detects on),
+**without** the non-destructive `user_rotation`. The loupe draws the picture with the user
+rotation applied, so the overlay turns each box by it for display and turns a box drawn on the
+rotated picture back before storing it. The user rotation lives only in the catalog — the
+original is never rewritten and the sidecar carries no orientation of ours — so the export
+ignores it too: other tools see the file unturned, and so must its regions.
 
-**Structure.** `mwg-rs:AppliedToDimensions` records the photo's recorded pixel size (`width` /
-`height`), never swapped for a user rotation. Known deviation: MWG 2.0 § 5.9 applies regions to
-the *stored* image ("when applying a rotation by applying Exif Orientation, the rotation must be
-applied to the regions as well"), but the stored boxes are normalized to the EXIF-*oriented*
-preview; for a file whose EXIF Orientation is not 1 the coordinates are in the oriented frame.
-Converting needs the EXIF Orientation at write and import time, which the catalog does not keep
-yet. Each region in the `RegionList`
+MWG regions use a different frame, the **stored frame**: MWG 2.0 § 5.9 requires region
+coordinates "relative to the stored image, prior to the application of the Exif Orientation
+tag", and `AppliedToDimensions` is the stored image's size. A scan records each photo's EXIF
+Orientation (`photos.exif_orientation`, 1–8, from exiftool's `EXIF:Orientation`; schema v26
+fills it for photos scanned earlier from the metadata they already stored). The export turns
+each box from the display frame into the stored frame by that orientation — all eight,
+mirrors included — and the import (`read_face_regions_in`) turns a region back before matching
+it to the detections. **An unknown orientation is never guessed:** the boxes are written and
+read as they are.
+
+**Structure.** `mwg-rs:AppliedToDimensions` records the stored pixel size — the photo's recorded
+`width` / `height` (EXIF `ExifImageWidth` / `ExifImageHeight`) — never swapped for the EXIF
+Orientation or a user rotation. A photo with no recorded size gets no `AppliedToDimensions`
+(there is no `1×1` stand-in).
+
+**An `AppliedToDimensions` already in the sidecar is never rewritten** (#145): the regions
+other tools wrote are normalized against it, so changing it would move them. ChairPhoto writes
+`AppliedToDimensions` only into a `Regions` that has none, and otherwise puts its boxes into the
+frame the sidecar declares (`region_target`; the import reads by the same rule):
+
+| Declared size | Known orientation | ChairPhoto's boxes go in |
+|---|---|---|
+| none, or ChairPhoto's old `1×1` | any | the stored frame |
+| the stored image's aspect (resized or not) | any | the stored frame |
+| the aspect swapped | 5–8 (turned a quarter) | the display frame the size describes |
+| anything else, or a size without a usable `w`/`h` | any | **refused** |
+| any, with the photo's size unknown | 5–8 | **refused** — which frame is meant cannot be told |
+| any | unknown | as they are |
+
+A refused write fails with an error naming the sidecar and leaves it byte for byte as it was;
+a refused frame imports nothing.
+
+Each region in the `RegionList`
 carries `mwg-rs:Name` (the person tag's leaf name), `mwg-rs:Type="Face"`, and an `mwg-rs:Area`
 whose `x`/`y` are the rectangle's normalized **center** — MWG stores centers, not corners — with
 `w`/`h` as the size. Stored bboxes are top-left-normalized, so the writer converts corner→center
 and the reader converts back.
 
 **Merge safety is binding.** The RegionList may already contain regions written by other tools.
-The writer edits the existing `Regions` in place, never rebuilds it: it refreshes the
-`AppliedToDimensions` fields, updates the regions it wrote, and appends the rest of ChairPhoto's
-current confirmed set. A region counts as ours — and is therefore updated — only when its `Name`
-matches one we are writing *and* its center area is within `AREA_EPSILON = 0.02`; each region we
-write updates at most one. **When in doubt, the region is preserved.** Re-writing updates only
-ChairPhoto's own regions and can never duplicate or clobber a foreign face. Foreign attributes
-and children of `Regions`, `AppliedToDimensions` and the list survive.
+The writer edits the existing `Regions` in place, never rebuilds it. **Every region ChairPhoto
+writes carries its marker** (#135), and a catalog replaces or removes only regions carrying
+*its own* marker.
 
-Updating a region changes only its `Area` coordinates (`stArea:x/y/w/h/unit`), in the form they
-are written in. Everything else on it stays: a region another tool wrote that happens to match
-by name and area (a Lightroom region ingested earlier, say) keeps its `mwg-rs:Rotation`, its
-`Type`, extensions and foreign attributes such as `digiKam:Confidence`.
+**The marker format is stable** — it is on disk in users' sidecars, and changing it needs a
+legacy rule of its own. It is a `chairphoto:FaceId` struct field
+(`https://chairphoto.local/ns/1.0/`) of the region, whose value is
 
-The writer and reader accept `Regions` in any top-level `rdf:Description`, struct values written
+```
+<catalog UUID>/<face id>
+```
+
+— the writing catalog's identity, exactly as `settings.catalog_uuid` holds it (a UUID v4,
+lowercase and hyphenated, minted once on the catalog's first open; `catalog::CATALOG_UUID_KEY`),
+a `/`, and the face's `faces__faces.id` in canonical decimal (no sign, no leading zero:
+`/007` is not `/7`). Face ids are `AUTOINCREMENT`, so a catalog never reuses one. A region whose marker names another catalog — a second catalog over the same
+folders, or this catalog's predecessor before a rebuild — or whose value is anything but exactly
+this form is **foreign**: never removed, never re-marked.
+
+A copy of a catalog file — a sync between two machines, a restored backup — shares the
+original's identity *and* its face-id counter, so the two copies write the same markers for
+different faces. A marker is therefore this catalog's only for a **face it knows on that
+photo**: one in the set being written, or one of the photo's faces that has left it (rejected,
+ignored, unnamed). A marker with this catalog's identity but a face id it does not know on that
+photo came from a copy and is foreign like any other (review N1). And a region of a face that is
+still in the set but no longer recognisably that face (step 1) is kept as it is, not removed.
+Deleting a drawn box writes the photo's regions first, while its id is still known.
+
+Each write sends the photo's whole confirmed set, and for each existing region, in this order:
+
+1. **This catalog's marker, with the id of a face in the set** (and still that face's name or
+   place): moved to the face's box and renamed to its person. A renamed person or a
+   re-detected box no longer leaves a stale copy behind.
+2. **This catalog's marker, same Name and center within `AREA_EPSILON = 0.02` of a face in the
+   set** (a face id that changed): taken over the same way.
+3. **This catalog's marker, matched by nothing, for a face of this photo that has left the
+   set:** removed. This is how a **rejected or ignored** face, or one whose person was removed,
+   leaves the sidecar.
+4. **Anything else — unmarked, or another catalog's:** foreign, and **always kept**. When its
+   Name and center (within `AREA_EPSILON`) match a face in the set it is that face already in
+   the file — a Lightroom region ingested earlier, say: only its `Area` coordinates
+   (`stArea:x/y/w/h/unit`) are updated, in the form they are written in, and no marked copy is
+   appended. Its marker (if any), `mwg-rs:Rotation`, `Type`, extensions and foreign attributes
+   such as `digiKam:Confidence` stay, and it is never marked as ours, so rejecting the face
+   later never removes it.
+
+Each existing region is claimed by at most one face and each face claims at most one region;
+where several regions match a face by Name + Area, the **closest** center wins, not the first in
+the file (#147). The faces that claimed none are appended, marked. **When in doubt, the
+region is preserved.** Foreign attributes and children of `Regions`, `AppliedToDimensions`
+and the list survive. A write that changes nothing in the
+regions (an empty set and nothing of ours, or the set as the file already has it) leaves the
+sidecar untouched and creates none.
+
+**Regions written before the marker existed** are recognised against the catalog's record of
+what the old writer exported: `faces__legacy_regions`, taken once — when a catalog that already
+has faces first opens the faces tables after the upgrade; the one call whose `faces__once` claim
+row is new takes it, in the same savepoint, so two connections opening at once never take it
+twice or bring back rows already spent — with the name and display-frame box
+each face had then (the old writer did not convert frames). The old writer exported a photo's
+whole confirmed set after every face verb on it and never otherwise, so the record holds the
+confirmed, named faces it can tell were exported:
+
+- a face a verb confirmed (accepted, assigned, named — every source but `seed` and `xmp`);
+- an auto-seeded face (`seed`; the matching pass exported nothing) only on a photo a verb
+  touched — a verb-confirmed face, an ignored face or a remembered rejection there;
+- never a face confirmed from another tool's region (`xmp`).
+
+Whether a write succeeded was never recorded (an offline photo's was skipped), and a seed made
+after the verb is still counted, so the record can over-count. That is why only an unmarked
+region in **exactly the old writer's shape** can be taken for its: `rdf:li
+rdf:parseType="Resource"` holding exactly `mwg-rs:Name`, `mwg-rs:Type` = `Face` and an
+`mwg-rs:Area rdf:parseType="Resource"` of exactly `stArea:x/y/w/h` and `stArea:unit` =
+`normalized`, all as plain elements, with no other attribute, field or child. A region another
+tool wrote at the same place under the same name — digiKam's nested `rdf:Description` with
+`digiKam:Confidence`, a Lightroom region with `mwg-rs:Rotation` — has another shape and stays
+foreign. Such an old-shaped region matching a recorded face by Name + Area is adopted (moved and
+marked) while the face is in the set, and removed once it is not. A photo's record is spent by
+its first write that reaches the sidecar, so a region another tool writes later under the same
+name and place is never taken for ours. Pre-marker regions of a face rejected *before* the
+upgrade are not on the record and stay — the catalog no longer knows they were ours.
+
+The old writer wrote display-frame boxes, so until a photo's pre-marker regions are converted
+another tool — or a later import, by a rebuilt or second catalog — reads them in the wrong place
+on a turned photo. **Every face index run converts them first** (`convert_legacy_regions`,
+before it indexes anything): it writes each photo still on the record through the normal region
+write, which adopts and marks (or removes) the old regions in the stored frame and spends the
+record. It shares the index job's abort flag, ownership and catalog connection, and the record
+is its queue: an abort, an offline original or a failed write leaves that photo's rows for the
+next run, and rows of photos no longer in the catalog are dropped. A photo whose sidecar
+*refuses* the write for its own layout or frame — a `Regions` this writer cannot read, such as
+the unprefixed `parseType` a pre-#138 build's xmltree left behind, or an `AppliedToDimensions`
+of another frame — is tried once and then set aside (`faces__legacy_refused`, counted as
+`refused`): the same write would be refused on every run until the file changes. It keeps its
+record, so a face verb that later writes the photo still adopts or removes its old regions, and
+that write clears the refusal. Repairing such sidecars is #143's. Its progress goes out through
+the index job's own status and `faces:progress` — photos converted of photos to convert, `0/n`
+to `n/n` — before the index's own count starts again from `0`; there is no phase label, which
+would need a new field in both front ends. It logs a summary of what it did. It is part of the index
+job rather than a job of its own to keep this branch small: the record is a one-time backlog,
+indexing is the faces job a user runs, and it already owns the faces worker. A catalog that is
+never indexed again keeps its record until a face verb touches each photo.
+
+A sidecar may be rooted at `x:xmpmeta` or, as the XMP spec allows, at a bare `rdf:RDF`, which
+is read and written in place (#147); a file rooted at anything else is not written. The writer
+and reader accept `Regions` in any top-level `rdf:Description`, struct values written
 with `rdf:parseType="Resource"`, as a nested `rdf:Description` or as attributes, and a list in an
 `rdf:Bag` or `rdf:Seq`. A `Regions` in any other layout (two of them, another container, a
 reference) is **not written**: the write fails with an error and the sidecar is left as it was,
@@ -171,9 +289,11 @@ because a write that cannot see a foreign region would delete it.
 
 **Writes** fire from the same hooks as keyword export — `faces_accept`, `faces_accept_person`,
 `faces_assign`, `faces_reject`, `faces_ignore`, `faces_name_cluster` — each writing the photo's
-full current confirmed set, so the sidecar stays in sync. The batch confirm writes only the
-photos it actually changed, after its transaction commits: a sidecar that cannot be written
-(offline volume) must not roll back a confirmation the catalog already recorded.
+full current confirmed set right after the verb, so the sidecar stays in sync. The batch confirm
+writes only the photos it actually changed, after its transaction commits: a sidecar that cannot
+be written (offline volume) must not roll back a confirmation the catalog already recorded. An
+offline photo's write is skipped, not queued: its sidecar catches up at the next face write for
+that photo.
 
 **Reads** happen during indexing: existing `mwg-rs:Regions` are parsed and IoU-matched
 (≥ 0.5, greedy best-first, one-to-one) against the photo's still-unassigned detections. A named

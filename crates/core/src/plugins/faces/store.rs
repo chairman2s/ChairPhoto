@@ -81,6 +81,34 @@ fn table_exists(conn: &Connection, name: &str) -> rusqlite::Result<bool> {
 }
 
 pub fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
+    // Read before anything is created: whether this catalog has faces from before the
+    // pre-marker record existed (#135, below).
+    let had_faces = table_exists(conn, "faces__faces")?;
+    let had_record = table_exists(conn, "faces__legacy_regions")?;
+    ensure_schema_seen(conn, had_faces && !had_record)
+}
+
+/// [`ensure_schema`] once the caller has looked: `predates_record` says this connection saw a
+/// catalog whose faces tables predate the pre-marker record. That view can be stale by the
+/// time the tables are created — another connection (the indexer's secondary) may have
+/// created and filled the record, and a face write may have spent rows of it, in between —
+/// so it only *allows* the fill: the fill happens only for the one call whose claim row
+/// (`faces__once`) is new, in the same savepoint (review L3). A stale caller's claim is
+/// ignored and it fills nothing, so it cannot revive a spent row.
+fn ensure_schema_seen(conn: &Connection, predates_record: bool) -> rusqlite::Result<()> {
+    conn.execute_batch("SAVEPOINT faces_schema")?;
+    let out = create_schema(conn, predates_record);
+    conn.execute_batch(if out.is_ok() { "RELEASE faces_schema" } else {
+        "ROLLBACK TO faces_schema; RELEASE faces_schema"
+    })?;
+    out
+}
+
+/// The `faces__once` claim of the one-time pre-marker record.
+const LEGACY_RECORD_CLAIM: &str = "legacy_regions_recorded";
+
+/// The plugin's tables; with `record_legacy`, also the one-time pre-marker record.
+fn create_schema(conn: &Connection, record_legacy: bool) -> rusqlite::Result<()> {
     conn.execute_batch(
         "
         CREATE TABLE IF NOT EXISTS faces__faces (
@@ -137,8 +165,70 @@ pub fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
             indexed_at  INTEGER NOT NULL,
             face_count  INTEGER NOT NULL DEFAULT 0
         );
+
+        -- Pre-marker record (#135): the faces ChairPhoto had exported as MWG regions before
+        -- each region it writes carried a chairphoto:FaceId marker, with the name and the
+        -- (display-frame) box they were written with. The region writer recognises those
+        -- unmarked regions as ours by Name + Area against this, and a successful write for
+        -- a photo spends its rows (regions::write_photo_regions).
+        CREATE TABLE IF NOT EXISTS faces__legacy_regions (
+            face_id   INTEGER PRIMARY KEY,
+            photo_id  INTEGER NOT NULL,
+            name      TEXT    NOT NULL,
+            bbox      TEXT    NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS faces__legacy_regions_photo
+            ON faces__legacy_regions (photo_id);
+
+        -- Photos on the pre-marker record whose sidecar refused the region write for its
+        -- own layout or frame (review N2): the one-time conversion pass skips them rather
+        -- than retry for ever; a later successful write of the photo clears the row.
+        CREATE TABLE IF NOT EXISTS faces__legacy_refused (
+            photo_id    INTEGER PRIMARY KEY,
+            refused_at  INTEGER NOT NULL,
+            reason      TEXT    NOT NULL
+        );
+
+        -- One-time steps already taken, by name: a row is claimed by the one call that
+        -- takes the step (`INSERT OR IGNORE`, inside that call's savepoint), so two
+        -- connections opening the tables at once never both take it.
+        CREATE TABLE IF NOT EXISTS faces__once (
+            key  TEXT PRIMARY KEY
+        );
         ",
     )?;
+    // Claimed on every catalog's first pass here, faces or none, so a later open never fills.
+    let claimed = conn.execute("INSERT OR IGNORE INTO faces__once (key) VALUES (?1)", [LEGACY_RECORD_CLAIM])? == 1;
+    // Filled once, when the table is created in a catalog that already has faces, with the
+    // confirmed, named faces the pre-marker writer exported as far as the catalog can tell
+    // (review M2). It exported a photo's whole confirmed set after every face verb on it, and
+    // never otherwise:
+    // - a face confirmed by a verb was ('match' accepted, 'manual' assigned or named: every
+    //   source but the two below);
+    // - an auto-seeded face ('seed', confirmed by the matching pass, which exports nothing)
+    //   was only if a verb touched its photo — evidence of which is a verb-confirmed face, an
+    //   ignored one, or a remembered rejection there (the order of the seed and the verb is
+    //   not recorded, so a seed made after the verb is still counted);
+    // - a face confirmed from another tool's region ('xmp') was never ours to export.
+    // Whether the sidecar write succeeded was never recorded — an offline photo's was skipped —
+    // so the record still over-counts those; the shape check on adoption covers that.
+    if claimed && record_legacy && table_exists(conn, "tags")? {
+        conn.execute(
+            "INSERT OR IGNORE INTO faces__legacy_regions (face_id, photo_id, name, bbox)
+             SELECT f.id, f.photo_id, t.name, f.bbox
+               FROM faces__faces f JOIN tags t ON t.id = f.person_tag_id
+              WHERE f.state = 'confirmed'
+                AND (f.source NOT IN ('seed', 'xmp')
+                     OR (f.source = 'seed' AND EXISTS (
+                           SELECT 1 FROM faces__faces g
+                            WHERE g.photo_id = f.photo_id
+                              AND ((g.state = 'confirmed' AND g.source NOT IN ('seed', 'xmp'))
+                                   OR g.state = 'ignored'
+                                   OR EXISTS (SELECT 1 FROM faces__rejections r
+                                               WHERE r.face_id = g.id)))))",
+            [],
+        )?;
+    }
     // Future-proof: add new columns to pre-existing tables without breaking an existing DB.
     for sql in [
         "ALTER TABLE faces__faces ADD COLUMN cluster_id INTEGER",
@@ -448,6 +538,53 @@ mod tests {
         .unwrap();
         ensure_schema(&conn).unwrap();
         conn
+    }
+
+    // ── The one-time pre-marker record (#135, review L3) ───────────────────────
+
+    fn legacy_rows(conn: &Connection) -> Vec<i64> {
+        let mut stmt = conn.prepare("SELECT face_id FROM faces__legacy_regions ORDER BY face_id").unwrap();
+        stmt.query_map([], |r| r.get(0)).unwrap().collect::<rusqlite::Result<_>>().unwrap()
+    }
+
+    /// Review L3, the interleaving forced: two connections to one catalog both see faces
+    /// tables that predate the record (the app's and the indexer's secondary, opening at
+    /// once). The first takes the record and a face write spends a row of it; only then does
+    /// the second, acting on its stale view, create the tables. It must not fill again — the
+    /// spent row would come back and a foreign region later written at that place under that
+    /// name would be taken for ours.
+    #[test]
+    fn a_stale_second_connection_never_revives_a_spent_record() {
+        let dir = crate::test_support::TestTmpDir::new("faces-legacy-race");
+        let db = dir.join("catalog.db");
+        let a = Connection::open(&db).unwrap();
+        a.execute_batch(
+            "CREATE TABLE photos (id INTEGER PRIMARY KEY, uuid TEXT NOT NULL DEFAULT '',
+                                  path TEXT NOT NULL DEFAULT '');
+             CREATE TABLE tags (id INTEGER PRIMARY KEY, name TEXT NOT NULL DEFAULT '');
+             INSERT INTO photos (id) VALUES (1), (2);
+             INSERT INTO tags (id, name) VALUES (10, 'Alice');",
+        )
+        .unwrap();
+        // A catalog from before the record: faces tables, no record, no claim.
+        ensure_schema(&a).unwrap();
+        a.execute_batch("DROP TABLE faces__legacy_regions; DROP TABLE faces__once;").unwrap();
+        for photo in [1, 2] {
+            let f = insert_face(&a, photo, "[0.1,0.1,0.2,0.2]", "[]", 0.9, None, "manual", 0).unwrap();
+            a.execute("UPDATE faces__faces SET person_tag_id = 10, state = 'confirmed' WHERE id = ?1", [f])
+                .unwrap();
+        }
+        let b = Connection::open(&db).unwrap();
+        let b_saw = table_exists(&b, "faces__faces").unwrap() && !table_exists(&b, "faces__legacy_regions").unwrap();
+        assert!(b_saw, "B's view is the old catalog's");
+
+        ensure_schema(&a).unwrap();
+        assert_eq!(legacy_rows(&a).len(), 2, "A takes the record");
+        a.execute("DELETE FROM faces__legacy_regions WHERE photo_id = 1", []).unwrap(); // spent
+        let left = legacy_rows(&a);
+
+        ensure_schema_seen(&b, b_saw).unwrap();
+        assert_eq!(legacy_rows(&b), left, "B revived a spent row");
     }
 
     // ── Embedding codec round-trip ────────────────────────────────────────────

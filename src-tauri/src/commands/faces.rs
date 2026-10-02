@@ -205,11 +205,12 @@ pub fn faces_add_manual(
 /// detected faces must be rejected/ignored instead so re-indexing doesn't resurrect
 /// them — a drawn box is never re-created by the indexer, so deleting it is safe.
 /// (Once a drawn box is assigned, `faces_assign` flips its source to 'manual' and it is
-/// treated like any other confirmed face.)
+/// treated like any other confirmed face.) It writes the photo's face regions to the sidecar
+/// before the delete (#135), so it runs on a blocking worker like the other face writes.
 #[cfg(feature = "faces")]
-#[tauri::command(async)]
-pub fn faces_delete_drawn(state: State<'_, AppState>, face_id: i64) -> Result<(), String> {
-    with_catalog(&state, |c| core_faces::delete_drawn(c, face_id))
+#[tauri::command]
+pub async fn faces_delete_drawn(state: State<'_, AppState>, face_id: i64) -> Result<(), String> {
+    with_catalog_blocking(&state, move |c| core_faces::delete_drawn(c, face_id)).await
 }
 
 /// Return all face rows for a single photo, joined to the tags table for the person name.

@@ -284,13 +284,312 @@ fn accepting_a_face_writes_its_region_and_preserves_a_foreign_one() {
     assert!(has_tag(&c, p, alice));
     assert_foreign_kept(&photo_path, &["Alice"]);
 
-    // Rejecting re-exports an empty confirmed set. The writer then cannot tell its own old
-    // region from a foreign one (none matches a name it is writing), so it preserves both —
-    // "when in doubt, preserve" (docs/face-tagging.md) — and the foreign one survives again.
+    // Rejecting re-exports an empty confirmed set: Alice's region carries ChairPhoto's marker,
+    // so it goes (#135); the foreign ones carry none and stay.
     reject(&c, f).unwrap();
-    let names: Vec<String> = crate::xmp::read_face_regions(&photo_path).into_iter().map(|r| r.name).collect();
-    assert!(names.contains(&"Stranger".to_string()), "{names:?}");
+    assert_foreign_kept(&photo_path, &[]);
     assert_eq!(face_state(&c, f), "unassigned");
+}
+
+/// #135 M1, probe Q5's shape through the verbs: a second catalog over the same folder — or this
+/// one rebuilt — never removes or takes over a region the first catalog marked. Catalog A
+/// confirmed a drawn Carol the detector misses and exported her; catalog B, which never had
+/// Carol, accepts and then rejects Alice on the same photo. Carol keeps A's marker throughout.
+#[test]
+fn another_catalogs_marked_region_survives_this_catalogs_face_writes() {
+    let (a, root) = temp_catalog("q5-a");
+    let pa = add_photo(&a, &root, "p.NEF");
+    let photo_path = root.join("p.NEF");
+    let carol = a.create_tag("People/Carol").unwrap();
+    let fc = add_manual(&a, pa, 0.7, 0.7, 0.1, 0.1).unwrap();
+    assign(&a, fc, carol).unwrap();
+    let a_marker = format!("{}/{fc}", a.catalog_uuid().unwrap());
+    let carol_region = || {
+        let xml = std::fs::read_to_string(crate::xmp::sidecar_path(&photo_path)).unwrap();
+        let got = crate::xmp::region_fixtures::mwg(&xml);
+        let carol: Vec<_> = got.regions.iter().filter(|r| r.name == "Carol").cloned().collect();
+        (carol, xml)
+    };
+    let (before, _) = carol_region();
+    assert_eq!(before.len(), 1);
+    assert_eq!(before[0].face_id.as_deref(), Some(a_marker.as_str()));
+
+    let b_dir = TestTmpDir::new("app-faces-q5-b");
+    let b = Catalog::open(&b_dir.join("catalog.chairphoto"), &root).unwrap();
+    store::ensure_schema(b.conn()).unwrap();
+    assert_ne!(b.catalog_uuid().unwrap(), a.catalog_uuid().unwrap());
+    let pb = b.upsert_photo(&photo_path, None, 0, 1).unwrap().id;
+    let alice = b.create_tag("People/Alice").unwrap();
+    let fb = add_face(&b, pb, "[0.1,0.1,0.2,0.2]");
+    suggest(&b, fb, alice);
+    accept(&b, fb).unwrap();
+    let (after, xml) = carol_region();
+    assert_eq!(after, before, "B's first face write touched A's Carol:\n{xml}");
+    reject(&b, fb).unwrap();
+    let (after, xml) = carol_region();
+    assert_eq!(after, before, "B's reject removed A's Carol:\n{xml}");
+    assert!(crate::xmp::read_face_regions(&photo_path).iter().all(|r| r.name != "Alice"), "{xml}");
+}
+
+/// A photo the pre-marker writer exported Alice to, on a portrait shot (EXIF Orientation 6,
+/// stored 6000x4000): its sidecar holds her old-shaped, unmarked region in the display frame
+/// with the stored dimensions, and the catalog's record names her. Returns the photo's path.
+fn pre_marker_photo(c: &Catalog, root: &std::path::Path, name: &str) -> (i64, std::path::PathBuf, i64) {
+    let p = add_photo(c, root, name);
+    c.conn()
+        .execute("UPDATE photos SET width = 6000, height = 4000, exif_orientation = 6 WHERE id = ?1", [p])
+        .unwrap();
+    let alice = c.create_tag("People/Alice").unwrap();
+    let f = add_face(c, p, "[0.1,0.1,0.2,0.2]");
+    assign(c, f, alice).unwrap();
+    let path = root.join(name);
+    std::fs::write(
+        crate::xmp::sidecar_path(&path),
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+<rdf:Description rdf:about="" xmlns:mwg-rs="http://www.metadataworkinggroup.com/schemas/regions/"
+  xmlns:stDim="http://ns.adobe.com/xap/1.0/sType/Dimensions#" xmlns:stArea="http://ns.adobe.com/xmp/sType/Area#">
+<mwg-rs:Regions rdf:parseType="Resource"><mwg-rs:AppliedToDimensions rdf:parseType="Resource"><stDim:w>6000</stDim:w><stDim:h>4000</stDim:h><stDim:unit>pixel</stDim:unit></mwg-rs:AppliedToDimensions>
+<mwg-rs:RegionList><rdf:Bag><rdf:li rdf:parseType="Resource"><mwg-rs:Name>Alice</mwg-rs:Name><mwg-rs:Type>Face</mwg-rs:Type><mwg-rs:Area rdf:parseType="Resource"><stArea:x>0.2</stArea:x><stArea:y>0.2</stArea:y><stArea:w>0.2</stArea:w><stArea:h>0.2</stArea:h><stArea:unit>normalized</stArea:unit></mwg-rs:Area></rdf:li></rdf:Bag></mwg-rs:RegionList></mwg-rs:Regions>
+</rdf:Description></rdf:RDF></x:xmpmeta>"#,
+    )
+    .unwrap();
+    c.conn()
+        .execute(
+            "INSERT INTO faces__legacy_regions (face_id, photo_id, name, bbox) VALUES (?1, ?2, 'Alice', '[0.1,0.1,0.2,0.2]')",
+            rusqlite::params![f, p],
+        )
+        .unwrap();
+    (p, path, f)
+}
+
+fn legacy_photos(c: &Catalog) -> Vec<i64> {
+    let mut stmt = c.conn().prepare("SELECT DISTINCT photo_id FROM faces__legacy_regions ORDER BY photo_id").unwrap();
+    stmt.query_map([], |r| r.get(0)).unwrap().collect::<rusqlite::Result<_>>().unwrap()
+}
+
+/// Review L1: the index job first converts every photo on the pre-marker record — its old
+/// display-frame region moved into the stored frame and marked, the record spent — before
+/// any region is read. An offline photo is skipped and keeps its record; a photo no longer
+/// in the catalog drops off it. The faces already have rows, so the index itself has
+/// nothing to detect and needs no model.
+#[test]
+fn the_index_job_converts_the_pre_marker_regions_first() {
+    let (c, root) = temp_catalog("legacy-pass");
+    let (p1, path1, f1) = pre_marker_photo(&c, &root, "p1.NEF");
+    let (p2, path2, _) = pre_marker_photo(&c, &root, "p2.NEF");
+    let marker = format!("{}/{f1}", c.catalog_uuid().unwrap());
+    std::fs::remove_file(&path2).unwrap(); // offline
+    c.conn()
+        .execute("INSERT INTO faces__legacy_regions (face_id, photo_id, name, bbox) VALUES (999, 4242, 'Gone', '[0,0,0.1,0.1]')", [])
+        .unwrap();
+    assert_eq!(legacy_photos(&c), [p1, p2, 4242]);
+    let state = state_with(c);
+    let claim = begin_index_job(&state, None).unwrap();
+    run_index_job(&crate::app::NoEvents, claim);
+
+    let xml = std::fs::read_to_string(crate::xmp::sidecar_path(&path1)).unwrap();
+    let got = crate::xmp::region_fixtures::mwg(&xml);
+    assert_eq!(got.regions.len(), 1, "{xml}");
+    let alice = &got.regions[0];
+    assert_eq!(alice.face_id.as_deref(), Some(marker.as_str()), "not marked:\n{xml}");
+    let (x, y, w, h) = alice.area;
+    assert!((x - 0.2).abs() < 1e-5 && (y - 0.8).abs() < 1e-5 && (w - 0.2).abs() < 1e-5 && (h - 0.2).abs() < 1e-5,
+        "not in the stored frame: {:?}\n{xml}", alice.area);
+    let left = crate::app::with_catalog(&state, |c| Ok(legacy_photos(c))).unwrap();
+    assert_eq!(left, [p2], "the written photo spends its record, the offline one keeps it");
+}
+
+/// Review N3: the conversion reports through the index job's own progress — the status slot
+/// and `faces:progress` with the job's id — counting photos to convert, `0/n` to `n/n`, before
+/// the index's own count, instead of a silent `0/0` for however long the pass takes.
+#[test]
+fn the_index_jobs_conversion_reports_progress() {
+    use std::sync::Mutex;
+    struct Recorder {
+        state: AppState,
+        seen: Mutex<Vec<(usize, usize, u64, Option<(usize, usize)>)>>,
+    }
+    impl EventSink for Recorder {
+        fn send(&self, event: CoreEvent) {
+            if let CoreEvent::FacesProgress(p) = event {
+                let slot = self.state.jobs.faces.status().unwrap().map(|s| (s.done, s.total));
+                self.seen.lock().unwrap().push((p.done, p.total, p.job, slot));
+            }
+        }
+    }
+    let (c, root) = temp_catalog("legacy-pass-progress");
+    pre_marker_photo(&c, &root, "p1.NEF");
+    pre_marker_photo(&c, &root, "p2.NEF");
+    let state = state_with(c);
+    let claim = begin_index_job(&state, None).unwrap();
+    let job = claim.job;
+    let recorder = Recorder { state: state.clone(), seen: Mutex::new(Vec::new()) };
+    run_index_job(&recorder, claim);
+    let seen = recorder.seen.lock().unwrap().clone();
+    assert!(seen.len() >= 3, "{seen:?}");
+    assert_eq!(
+        seen[..3],
+        [(0, 2, job, Some((0, 2))), (1, 2, job, Some((1, 2))), (2, 2, job, Some((2, 2)))],
+        "{seen:?}"
+    );
+}
+
+/// The pass stops at the job's abort flag: nothing written, every record row kept.
+#[test]
+fn an_aborted_index_job_leaves_the_pre_marker_record() {
+    let (c, root) = temp_catalog("legacy-pass-abort");
+    let (p1, path1, _) = pre_marker_photo(&c, &root, "p1.NEF");
+    let before = std::fs::read(crate::xmp::sidecar_path(&path1)).unwrap();
+    let state = state_with(c);
+    let claim = begin_index_job(&state, None).unwrap();
+    claim.abort.store(true, Ordering::SeqCst);
+    run_index_job(&crate::app::NoEvents, claim);
+    assert_eq!(std::fs::read(crate::xmp::sidecar_path(&path1)).unwrap(), before);
+    let left = crate::app::with_catalog(&state, |c| Ok(legacy_photos(c))).unwrap();
+    assert_eq!(left, [p1]);
+}
+
+/// Review N1, probe R2's shape through the verbs: a copy of a catalog file (a sync between
+/// two machines, a restored backup) shares the original's identity *and* its face-id
+/// counter. After the copy, A draws Carol on photo P (face k, exported as `U/k`) and B,
+/// which never had her, gets its own face k on another photo Q. B's face writes on P — an
+/// accept, then a reject — know no face k on P, so A's Carol is left exactly as she is.
+#[test]
+fn a_copied_catalogs_face_writes_leave_the_other_copys_regions() {
+    let (a, root) = temp_catalog("n1-a");
+    let p = add_photo(&a, &root, "p.NEF");
+    let q = add_photo(&a, &root, "q.NEF");
+    let copy_dir = TestTmpDir::new("app-faces-n1-b");
+    let copy = copy_dir.join("copy.chairphoto");
+    a.conn().execute("VACUUM INTO ?1", [copy.to_str().unwrap()]).unwrap();
+    let b = Catalog::open(&copy, &root).unwrap();
+    assert_eq!(b.catalog_uuid().unwrap(), a.catalog_uuid().unwrap(), "a copy shares the identity");
+
+    let carol = a.create_tag("People/Carol").unwrap();
+    let fc = add_manual(&a, p, 0.7, 0.7, 0.1, 0.1).unwrap();
+    assign(&a, fc, carol).unwrap();
+    let path = root.join("p.NEF");
+    let carol_region = || {
+        let xml = std::fs::read_to_string(crate::xmp::sidecar_path(&path)).unwrap();
+        let got = crate::xmp::region_fixtures::mwg(&xml);
+        (got.regions.iter().filter(|r| r.name == "Carol").cloned().collect::<Vec<_>>(), xml)
+    };
+    let (before, _) = carol_region();
+    assert_eq!(before.len(), 1);
+
+    let dave = b.create_tag("People/Dave").unwrap();
+    let fd = add_face(&b, q, "[0.4,0.1,0.1,0.1]");
+    assert_eq!(fd, fc, "the copies' id counters collide");
+    assign(&b, fd, dave).unwrap();
+    let alice = b.create_tag("People/Alice").unwrap();
+    let fa = add_face(&b, p, "[0.1,0.1,0.2,0.2]");
+    suggest(&b, fa, alice);
+    accept(&b, fa).unwrap();
+    let (after, xml) = carol_region();
+    assert_eq!(after, before, "B's accept touched A's Carol:\n{xml}");
+    reject(&b, fa).unwrap();
+    let (after, xml) = carol_region();
+    assert_eq!(after, before, "B's reject removed A's Carol:\n{xml}");
+}
+
+/// Review N1: deleting a drawn box writes the photo's regions while the row still exists, so
+/// a region of it is removed — afterwards its id would be unknown and the region kept for
+/// ever. (A box still `drawn` is normally never exported; the region here stands in for one
+/// left by a write that was skipped while the photo was offline.)
+#[test]
+fn deleting_a_drawn_face_removes_its_region() {
+    let (c, root) = temp_catalog("n1-drawn");
+    let p = add_photo(&c, &root, "p.NEF");
+    let path = root.join("p.NEF");
+    let carol = c.create_tag("People/Carol").unwrap();
+    let f = add_manual(&c, p, 0.7, 0.7, 0.1, 0.1).unwrap();
+    assign(&c, f, carol).unwrap();
+    assert!(crate::xmp::read_face_regions(&path).iter().any(|r| r.name == "Carol"));
+    // The box is unassigned again and still `drawn`, its region still in the sidecar.
+    c.conn()
+        .execute(
+            "UPDATE faces__faces SET state = 'unassigned', person_tag_id = NULL, source = 'drawn' WHERE id = ?1",
+            [f],
+        )
+        .unwrap();
+    delete_drawn(&c, f).unwrap();
+    assert!(crate::xmp::read_face_regions(&path).iter().all(|r| r.name != "Carol"), "the region stayed");
+}
+
+/// #135 through the verbs: ignoring a confirmed face takes its region out of the sidecar,
+/// as rejecting does, and every foreign region and structure stays.
+#[test]
+fn ignoring_a_confirmed_face_removes_its_region() {
+    let (c, root) = temp_catalog("ignore-region");
+    let p = add_photo(&c, &root, "p.NEF");
+    let photo_path = root.join("p.NEF");
+    seed_foreign_sidecar(&photo_path);
+    let alice = c.create_tag("People/Alice").unwrap();
+    let bob = c.create_tag("People/Bob").unwrap();
+    let fa = add_face(&c, p, "[0.1,0.1,0.2,0.2]");
+    let fb = add_face(&c, p, "[0.4,0.1,0.2,0.2]");
+    suggest(&c, fa, alice);
+    suggest(&c, fb, bob);
+    accept(&c, fa).unwrap();
+    accept(&c, fb).unwrap();
+    assert_foreign_kept(&photo_path, &["Alice", "Bob"]);
+
+    ignore(&c, fa).unwrap();
+    assert_foreign_kept(&photo_path, &["Bob"]);
+    reject(&c, fb).unwrap();
+    assert_foreign_kept(&photo_path, &[]);
+}
+
+/// #135's rule for a catalog from before the marker: a face its old writer exported is on the
+/// record the first faces call after the upgrade takes, so rejecting it — the very first thing
+/// done — still removes its unmarked region, and the foreign ones stay.
+#[test]
+fn rejecting_a_face_exported_before_the_marker_removes_its_region() {
+    let (c, root) = temp_catalog("legacy-reject");
+    let p = add_photo(&c, &root, "p.NEF");
+    let photo_path = root.join("p.NEF");
+    seed_foreign_sidecar(&photo_path);
+    let alice = c.create_tag("People/Alice").unwrap();
+    let f = add_face(&c, p, "[0.1,0.1,0.2,0.2]");
+    suggest(&c, f, alice);
+    accept(&c, f).unwrap();
+    // As the pre-marker writer left it: Alice's region without the marker, and no record yet.
+    let xml = std::fs::read_to_string(crate::xmp::sidecar_path(&photo_path)).unwrap();
+    let marker = format!("<chairphoto:FaceId>{}/{f}</chairphoto:FaceId>", c.catalog_uuid().unwrap());
+    assert!(xml.contains(&marker), "{xml}");
+    std::fs::write(crate::xmp::sidecar_path(&photo_path), xml.replace(&marker, "")).unwrap();
+    c.conn().execute_batch("DROP TABLE faces__legacy_regions; DROP TABLE faces__once").unwrap();
+
+    reject(&c, f).unwrap();
+
+    assert_foreign_kept(&photo_path, &[]);
+}
+
+/// #136: the importer reads a region in the frame the detections are in. Lightroom's region
+/// for Bob on a portrait shot (EXIF Orientation 6) is in the stored frame; the detector found
+/// Bob on the EXIF-oriented preview, where the same face sits turned 90° clockwise.
+#[test]
+fn importing_a_region_on_a_rotated_photo_matches_the_face_in_the_display_frame() {
+    let (c, root) = temp_catalog("import-rotated");
+    let p = add_photo(&c, &root, "portrait.ARW");
+    let photo_path = root.join("portrait.ARW");
+    std::fs::write(crate::xmp::sidecar_path(&photo_path), crate::xmp::region_fixtures::LIGHTROOM_ROTATED)
+        .unwrap();
+    c.conn()
+        .execute("UPDATE photos SET width = 6000, height = 4000, exif_orientation = 6 WHERE id = ?1", [p])
+        .unwrap();
+    // Bob's stored-frame box (0.225, 0.2, 0.15, 0.1), turned into the display frame.
+    let f = add_face(&c, p, "[0.7,0.225,0.1,0.15]");
+
+    import_regions(&c, c.conn(), p, &photo_path, "People");
+
+    assert_eq!(face_state(&c, f), "confirmed", "Bob's region did not match his face");
+    let bob: i64 = c
+        .conn()
+        .query_row("SELECT id FROM tags WHERE full_path = 'People/Bob'", [], |r| r.get(0))
+        .unwrap();
+    assert!(has_tag(&c, p, bob));
 }
 
 /// Assigning to a new person creates the tag under the people root and confirms the face on

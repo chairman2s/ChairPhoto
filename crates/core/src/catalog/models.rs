@@ -282,6 +282,8 @@ pub struct PromotedMetadata {
     pub height: Option<i64>,
     pub gps_latitude: Option<f64>,
     pub gps_longitude: Option<f64>,
+    /// The EXIF Orientation code (1-8); `None` when exiftool reported none (#136).
+    pub exif_orientation: Option<u8>,
 }
 
 /// A label attached to a tag for display, translation, and export.

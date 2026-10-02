@@ -46,8 +46,8 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use xmltree::{Element, XMLNode};
 
-use super::{attr_is, child_mut, declare_namespaces, new_root, now, ns_attr, parse_xml, plain,
-    sidecar_backup_path, sidecar_path, NS_CHAIRPHOTO, NS_RDF};
+use super::{attr_is, child_mut, declare_namespaces, is_xmp_root, new_root, now, ns_attr, parse_xml,
+    plain, rdf_of_mut, sidecar_backup_path, sidecar_path, NS_CHAIRPHOTO, NS_RDF};
 
 /// When [`SidecarDocument::open`] copies the existing sidecar to `<sidecar>.chairphoto-backup`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -120,8 +120,19 @@ impl SidecarDocument {
         } else {
             new_root()
         };
+        // Anything but an XMP packet is not ours to put an `rdf:RDF` into (#147 L4).
+        if !is_xmp_root(&root) {
+            return Err(format!(
+                "{}: not written, its root element {{{}}}{} is not an XMP packet",
+                path.display(),
+                root.namespace.as_deref().unwrap_or(""),
+                root.name
+            ));
+        }
 
-        let rdf = child_mut(&mut root, "rdf", NS_RDF, "RDF");
+        let rdf = rdf_of_mut(&mut root);
+        // Decided before the writer adds anything: has ChairPhoto written this file before?
+        let written_before = has_chairphoto_last_write(rdf);
         let desc = child_mut(rdf, "rdf", NS_RDF, "Description");
         if ns_attr(desc, NS_RDF, "about").is_none() {
             desc.attributes.insert("rdf:about".to_string(), String::new());
@@ -131,7 +142,7 @@ impl SidecarDocument {
         // document-level decision (see module docs), not a per-writer one.
         let wants_backup = existed
             && match backup_policy {
-                BackupPolicy::BeforeFirstWrite => !has_chairphoto_last_write(desc),
+                BackupPolicy::BeforeFirstWrite => !written_before,
                 BackupPolicy::Always => true,
                 BackupPolicy::Never => false,
             };
@@ -160,14 +171,14 @@ impl SidecarDocument {
 
     /// The `rdf:Description` element every writer mutates.
     pub(super) fn description_mut(&mut self) -> &mut Element {
-        let rdf = child_mut(&mut self.root, "rdf", NS_RDF, "RDF");
+        let rdf = rdf_of_mut(&mut self.root);
         child_mut(rdf, "rdf", NS_RDF, "Description")
     }
 
     /// The `rdf:RDF` element, for a writer that has to look past the first Description: the
     /// face-region writer edits `mwg-rs:Regions` in whichever top-level Description holds it.
     pub(super) fn rdf_mut(&mut self) -> &mut Element {
-        child_mut(&mut self.root, "rdf", NS_RDF, "RDF")
+        rdf_of_mut(&mut self.root)
     }
 
     /// Remove every existing Description child matching one of `owned` (namespace, local-name)
@@ -365,10 +376,14 @@ fn temp_path(sidecar: &Path) -> PathBuf {
 
 const TEMP_SUFFIX: &str = ".chairphoto-tmp";
 
-fn has_chairphoto_last_write(desc: &Element) -> bool {
-    desc.children.iter().any(|n| {
-        matches!(n, XMLNode::Element(e)
-            if e.namespace.as_deref() == Some(NS_CHAIRPHOTO) && e.name == "LastWrite")
+/// Whether any top-level `rdf:Description` carries `chairphoto:LastWrite`: exiftool keeps one
+/// Description per namespace, so the stamp need not sit in the first (#147).
+fn has_chairphoto_last_write(rdf: &Element) -> bool {
+    rdf.children.iter().any(|d| {
+        matches!(d, XMLNode::Element(desc)
+            if desc.namespace.as_deref() == Some(NS_RDF) && desc.name == "Description"
+                && desc.children.iter().any(|n| matches!(n, XMLNode::Element(e)
+                    if e.namespace.as_deref() == Some(NS_CHAIRPHOTO) && e.name == "LastWrite")))
     })
 }
 
@@ -590,14 +605,22 @@ mod tests {
         let dir = crate::test_support::TestTmpDir::new("doc-149-writers");
         let gone = dir.join("unmounted").join("A.ARW");
         let uuid = "8d0a2c1e-4f5b-4c6d-9e7f-0a1b2c3d4e5f";
-        let face = [FaceRegion { name: "Ada".into(), bbox: (0.1, 0.1, 0.2, 0.2) }];
+        let face = [FaceRegion { face_id: 1, name: "Ada".into(), bbox: (0.1, 0.1, 0.2, 0.2) }];
+        let frame = crate::xmp::RegionFrame { orientation: None, stored_size: Some((600, 400)) };
         let title = IptcFields { title: "T".into(), ..Default::default() };
         let writes: Vec<(&str, Box<dyn Fn(&Path) -> Result<(), String>>)> = vec![
             ("identifier", Box::new(|p| crate::xmp::write_identifier(p, uuid))),
             ("import batch", Box::new(|p| crate::xmp::write_import_batch(p, uuid))),
             ("overwrite", Box::new(|p| crate::xmp::overwrite_identifier(p, uuid).map(|_| ()))),
             ("gps", Box::new(|p| crate::xmp::write_gps(p, 59.9, 10.7))),
-            ("faces", Box::new(move |p| crate::xmp::write_face_regions(p, &face, 600, 400))),
+            ("faces", Box::new(move |p| {
+                let written = crate::xmp::write_face_regions(p, uuid, &face, &[], &[], frame);
+                // Missing originals are offline, not a sidecar that refuses: tried again later.
+                if let Err(e) = &written {
+                    assert!(matches!(e, crate::xmp::RegionWriteError::Failed(_)), "{e:?}");
+                }
+                written.map_err(|e| e.to_string())
+            })),
             ("iptc", Box::new(move |p| crate::xmp::write_iptc(p, &IptcFields::default(), &title))),
         ];
         for (name, write) in &writes {

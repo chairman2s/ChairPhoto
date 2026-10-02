@@ -1192,6 +1192,7 @@ dependencies = [
  "rayon",
  "rcgen",
  "reqwest 0.12.28",
+ "roxmltree 0.20.0",
  "rusqlite",
  "serde",
  "serde_json",

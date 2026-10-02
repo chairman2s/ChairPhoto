@@ -114,6 +114,14 @@ pub fn catalog_uuid(conn: &Connection) -> rusqlite::Result<String> {
     conn.query_row("SELECT value FROM settings WHERE key = ?1", [CATALOG_UUID_KEY], |r| r.get(0))
 }
 
+/// The catalog's identity as stored, `None` before it is minted — a read only, never a write,
+/// for code outside the core (a plugin's sidecar writer) that must not write core tables.
+/// Every catalog opened through [`Catalog::open`] has one: the migration mints it.
+pub fn read_catalog_uuid(conn: &Connection) -> rusqlite::Result<Option<String>> {
+    conn.query_row("SELECT value FROM settings WHERE key = ?1", [CATALOG_UUID_KEY], |r| r.get(0))
+        .optional()
+}
+
 // SQLite's bind-parameter ceiling (`SQLITE_MAX_VARIABLE_NUMBER`) depends on the build:
 // 32766 since 3.32, and 999 in older builds. We bundle 3.45, but the chunk stays below
 // the older 999 too, so chunked `IN` queries hold if this ever links a system SQLite.

@@ -256,7 +256,10 @@ where
     R: FnOnce(i64) -> Result<Option<std::path::PathBuf>, String>,
 {
     super::store::ensure_schema(conn).map_err(|e| e.to_string())?;
-    let catalog = crate::catalog::catalog_uuid(conn).map_err(|e| e.to_string())?;
+    // Read only: the plugin never writes the core `settings` table; the catalog's open mints it.
+    let catalog = crate::catalog::read_catalog_uuid(conn)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| RegionWriteError::Failed("face regions not written: the catalog has no identity yet".into()))?;
     let regions = confirmed_regions(conn, photo_id).map_err(|e| e.to_string())?;
     let retired = retired_faces(conn, photo_id, &regions).map_err(|e| e.to_string())?;
     let legacy = legacy_regions(conn, photo_id).map_err(|e| e.to_string())?;
@@ -399,7 +402,8 @@ mod tests {
                                   exif_orientation INTEGER);
              CREATE TABLE tags (id INTEGER PRIMARY KEY, name TEXT NOT NULL DEFAULT '',
                                 full_path TEXT NOT NULL DEFAULT '');
-             CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);",
+             CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             INSERT INTO settings (key, value) VALUES ('catalog_uuid', '3f2b8c1e-7a4d-4e9b-8c2a-1d5e6f7a8b9c');",
         )
         .unwrap();
         store::ensure_schema(&conn).unwrap();
@@ -631,6 +635,30 @@ mod tests {
         assert!(crate::xmp::read_face_regions(&photo_path).is_empty(), "the retired Alice stayed");
     }
 
+    /// Review round-2 nit: the plugin's region write only reads the catalog's identity. On a
+    /// catalog with none it writes nothing and fails, leaving core `settings` untouched — it
+    /// never mints one itself.
+    #[test]
+    fn the_region_write_never_mints_the_catalog_identity() {
+        let dir = crate::test_support::TestTmpDir::new("faces-regions-no-identity");
+        let photo_path = dir.join("A.JPG");
+        std::fs::write(&photo_path, b"jpg").unwrap();
+        let conn = mem_conn();
+        conn.execute_batch(
+            "DELETE FROM settings;
+             INSERT INTO photos (id, width, height) VALUES (1, 6000, 4000);
+             INSERT INTO tags (id, name, full_path) VALUES (10, 'Alice', 'People/Alice');",
+        )
+        .unwrap();
+        let f = store::insert_face(&conn, 1, "[0.1,0.1,0.2,0.2]", "[]", 0.9, None, "manual", 0).unwrap();
+        conn.execute("UPDATE faces__faces SET person_tag_id = 10, state = 'confirmed' WHERE id = ?1", [f]).unwrap();
+        let err = write_photo_regions(&conn, 1, |_| Ok(Some(photo_path.clone()))).unwrap_err();
+        assert!(matches!(err, RegionWriteError::Failed(_)), "{err:?}");
+        let settings: i64 = conn.query_row("SELECT COUNT(*) FROM settings", [], |r| r.get(0)).unwrap();
+        assert_eq!(settings, 0, "the plugin wrote core settings");
+        assert!(!crate::xmp::sidecar_path(&photo_path).exists());
+    }
+
     /// A write that reaches the sidecar spends the photo's record — the region it described
     /// was adopted or removed — while an offline photo keeps it for the write that will.
     #[test]
@@ -649,7 +677,7 @@ mod tests {
         // The pre-marker writer's Dora, unmarked; Dora has since been rejected.
         let ours = crate::xmp::FaceRegion { face_id: 0, name: "Dora".into(), bbox: (0.5, 0.5, 0.1, 0.1) };
         let unmarked = crate::xmp::RegionFrame { orientation: None, stored_size: Some((6000, 4000)) };
-        let catalog = crate::catalog::catalog_uuid(&conn).unwrap();
+        let catalog = crate::catalog::read_catalog_uuid(&conn).unwrap().unwrap();
         crate::xmp::write_face_regions(&photo_path, &catalog, &[ours], &[], &[], unmarked).unwrap();
         let xml = std::fs::read_to_string(crate::xmp::sidecar_path(&photo_path)).unwrap();
         let unmarked_xml = xml.replace(&format!("<chairphoto:FaceId>{catalog}/0</chairphoto:FaceId>"), "");

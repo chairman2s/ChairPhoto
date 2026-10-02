@@ -2381,6 +2381,51 @@ mod tests {
         assert_eq!(texts(NS_CHAIRPHOTO, "LastWrite").len(), 1, "{xml}");
     }
 
+    /// Issue #143 item 4: owned compact properties are recognised by namespace URI, never by
+    /// local name or prefix. A foreign namespace may use an owned local name (`foo:Identifier`,
+    /// `foo:City`): those attributes are not ours and must survive. An owned namespace may be
+    /// bound to a non-canonical prefix (`xap:` for xmp, `ps:` for photoshop): those attributes
+    /// are ours and must go. Before this test, `attr_is` ignoring the namespace passed every
+    /// test in this module.
+    #[test]
+    fn compact_owned_properties_are_matched_by_namespace_not_local_name() {
+        let dir = crate::test_support::TestTmpDir::new("xmp-143-attr-ns");
+        let photo = dir.join("DSC143.ARW");
+        std::fs::write(&photo, b"raw").unwrap();
+        std::fs::write(sidecar_path(&photo), r#"<?xml version="1.0" encoding="UTF-8"?>
+<x:xmpmeta xmlns:x="adobe:ns:meta/">
+ <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+  <rdf:Description rdf:about=""
+    xmlns:foo="urn:example:foreign"
+    xmlns:xap="http://ns.adobe.com/xap/1.0/"
+    xmlns:ps="http://ns.adobe.com/photoshop/1.0/"
+    foo:Identifier="keep-me" foo:City="keep-city"
+    xap:Identifier="drop-me" ps:City="Oslo"/>
+ </rdf:RDF>
+</x:xmpmeta>"#).unwrap();
+        assert_eq!(read_identifier(&photo).as_deref(), Some("drop-me"),
+            "the identifier is read by namespace, whatever its prefix");
+
+        let uuid = "6f1c1f0e-8f5e-4a51-9a51-3c1b2a0d1430";
+        overwrite_identifier(&photo, uuid).unwrap();
+        write_iptc(&photo, &IptcFields { city: "Trondheim".into(), ..Default::default() })
+            .unwrap();
+
+        let xml = read(&sidecar_path(&photo));
+        let desc = (NS_RDF, "Description");
+        assert!(has_attr(&xml, desc, (NS_FOREIGN, "Identifier"), "keep-me"),
+            "a foreign attribute with an owned local name was removed:\n{xml}");
+        assert!(has_attr(&xml, desc, (NS_FOREIGN, "City"), "keep-city"),
+            "a foreign attribute with an owned local name was removed:\n{xml}");
+        let attrs = namespaced_attributes(&xml);
+        let compact = |ns: &str, local: &str| attrs.iter().any(|a| a.2 == ns && a.3 == local);
+        assert!(!compact(NS_XMP, "Identifier"), "xap:Identifier is ours and was kept:\n{xml}");
+        assert!(!compact(NS_PHOTOSHOP, "City"), "ps:City is ours and was kept:\n{xml}");
+        assert_eq!(read_identifier(&photo).as_deref(), Some(uuid), "{xml}");
+        assert_eq!(element_text(&xml, desc, (NS_PHOTOSHOP, "City")).as_deref(),
+            Some("Trondheim"), "{xml}");
+    }
+
     // ── face regions in layouts other tools write (issue #139) ─────────────
 
     const NS_FOREIGN: &str = "urn:example:foreign";

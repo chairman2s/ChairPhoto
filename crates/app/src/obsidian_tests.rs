@@ -96,6 +96,18 @@ impl Ob {
         .unwrap()
     }
 
+    /// The settings panel, shown in Preferences → Obsidian.
+    fn open_settings(&self, cx: &mut TestAppContext) -> Entity<ObsidianSettings> {
+        let settings = self.settings(cx);
+        cx.update_window(self.window(), |_, window, cx| window.dispatch_action(Box::new(crate::shell::actions::OpenPreferences), cx))
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(450)); // the dialog's open animation
+        cx.run_until_parked();
+        self.click("prefs-tab-module-obsidian", cx);
+        assert!(self.present("obsidian-settings", cx), "the module's Preferences tab shows its settings");
+        settings
+    }
+
     fn select(&self, id: i64, cx: &mut TestAppContext) {
         self.app.wired.shell.update(cx, |s, cx| s.select_with(cx, |l| l.select_single(id)));
         work(&self.app, cx);
@@ -232,6 +244,49 @@ fn settings_are_validated_saved_and_bound_to_their_catalog(cx: &mut TestAppConte
     work(&s.app, cx);
     assert!(status(&s.app, cx).contains(CATALOG_CHANGED), "{}", status(&s.app, cx));
     assert!(s.obsidian_settings().is_empty(), "the save reached the new catalog");
+}
+
+/// A settings reload (every `CatalogRead` starts one) that read the values before a Save
+/// committed must not put the old values back when it lands after the Save — on the state
+/// nor in the inputs.
+///
+/// Forced as in [`a_stale_reread_does_not_undo_create_or_forget`]: the Save is held while a
+/// refresh starts the reload; the Save commits and lands; the held reload then runs against
+/// the values as they were before the Save, and lands.
+///
+/// Mutation-checked: without the sequence bump in Save's landing the inputs show the old
+/// vault again and this test fails.
+#[gpui_kit::test]
+fn a_stale_settings_reload_does_not_undo_a_save(cx: &mut TestAppContext) {
+    let s = open_ob(1, "ob-settings-race", cx);
+    s.set_vault("Old");
+    s.app.wired.model.update(cx, |m, cx| m.refresh(cx));
+    work(&s.app, cx);
+    let settings = s.open_settings(cx);
+    let (vault, state) = settings.read_with(cx, |v, _| (v.vault.clone(), v.state.clone()));
+    assert_eq!(vault.read_with(cx, |i, _| i.value().to_string()), "Old");
+
+    s.set_input(&vault, "New", cx);
+    settings.update(cx, |v, cx| v.save(cx));
+    let save = hold(cx);
+    assert_eq!(save.len(), 1, "Save's job");
+    s.app.wired.model.update(cx, |m, cx| m.refresh(cx));
+    cx.run_until_parked();
+    let reload = hold(cx);
+    assert!(!reload.is_empty(), "the CatalogRead started a reload");
+    run_held(save);
+    cx.run_until_parked();
+    assert_eq!(s.setting("obsidian.vault").as_deref(), Some("New"), "Save committed");
+    // The reload, as read before the Save committed.
+    s.set_vault("Old");
+    run_held(reload);
+    s.set_vault("New");
+    cx.run_until_parked();
+    assert!(s.present("obsidian-settings", cx));
+    state.read_with(cx, |st, _| assert_eq!(st.vault.as_deref(), Some("New"), "a stale reload does not undo the Save"));
+    assert_eq!(vault.read_with(cx, |i, _| i.value().to_string()), "New", "…nor reset the input");
+    work(&s.app, cx);
+    state.read_with(cx, |st, _| assert_eq!(st.vault.as_deref(), Some("New"), "a later reload agrees"));
 }
 
 // --- photo notes ----------------------------------------------------------------------------

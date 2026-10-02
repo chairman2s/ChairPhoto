@@ -493,6 +493,27 @@ mod tests {
         assert_eq!(c.owed_iptc(id).unwrap(), IptcMask::TITLE);
     }
 
+    /// Review of #148, L2 (its probe P3): the photo a write was read for is removed and its
+    /// id reused by a new photo, whose own store lands on the same generation. The stale
+    /// write's settle matches on id and generation, so only the UUID tells the photos apart:
+    /// it must not clear the new photo's debt.
+    #[test]
+    fn a_stale_write_for_a_removed_photo_does_not_settle_the_photo_that_reused_its_id() {
+        let (dir, c, id, _) = photo("iptc-owed-reused-id");
+        let stale = c.set_iptc(id, &titled("old photo")).unwrap();
+        c.remove_photo(id).unwrap();
+        let file = dir.join("library").join("OTHER.ARW");
+        std::fs::write(&file, b"raw").unwrap();
+        let reused = c.upsert_photo(&file, None, 0, 1).unwrap().id;
+        assert_eq!(reused, id, "the precondition: the id is reused");
+        let fresh = c.set_iptc(reused, &titled("new photo")).unwrap();
+        assert_eq!(fresh.generation, stale.generation, "the precondition: the generations collide");
+
+        assert_eq!(c.settle_iptc_write(&stale, &Ok(())).unwrap(), IptcSettled::Superseded);
+        assert_eq!(c.owed_iptc(reused).unwrap(), IptcMask::TITLE, "the new photo still owes its title");
+        assert_eq!(c.owed_iptc_write(reused).unwrap().unwrap().values.title, "new photo");
+    }
+
     /// The repair pass drains owed IPTC under its abort flag: a cancel between photos stops
     /// it with the rest still owed, and the summary says it stopped.
     #[test]

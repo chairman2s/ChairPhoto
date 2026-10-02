@@ -4,8 +4,8 @@
 //!
 //! - **LocalSend** — "Device (LocalSend)": a transfer, not a publication; it records nothing.
 //! - **Snapchat** — "Snapchat": the same panel, plus a non-blocking 9:16 pre-flight warning
-//!   and, after a successful send, a `snapchat` publication for every photo that reached the
-//!   device (the module's marker). It requires LocalSend.
+//!   and, after a send — including one that stopped part-way — a `snapchat` publication for
+//!   every photo that reached the device (the module's marker). It requires LocalSend.
 //!
 //! The send is core's job (`chairphoto_core::app::localsend`): claimed and run on a worker,
 //! bound to the catalog the selection was read from, cancellable (Cancel, a newer send or a
@@ -24,7 +24,7 @@ pub mod send;
 mod tests;
 
 use super::{view, Contributions, Module, ModuleHost, ModuleInstance, ModuleMeta, PublishTarget};
-use chairphoto_core::app::localsend::{Device, LocalSendJob, SendOutcome};
+use chairphoto_core::app::localsend::{Device, LocalSendJob, SendOutcome, SendStopped};
 use gpui_kit::App;
 use std::sync::Arc;
 
@@ -39,7 +39,7 @@ pub const DISCOVERY_MS: u64 = 2500;
 #[derive(Clone)]
 pub struct LocalSendBackend {
     pub discover: Arc<dyn Fn() -> Result<Vec<Device>, String> + Send + Sync>,
-    pub send: Arc<dyn Fn(LocalSendJob, &Device, Option<&str>) -> Result<SendOutcome, String> + Send + Sync>,
+    pub send: Arc<dyn Fn(LocalSendJob, &Device, Option<&str>) -> Result<SendOutcome, SendStopped> + Send + Sync>,
 }
 
 impl Default for LocalSendBackend {

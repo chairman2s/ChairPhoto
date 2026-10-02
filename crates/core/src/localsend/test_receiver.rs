@@ -14,8 +14,11 @@ use tokio::net::{TcpListener, TcpStream};
 pub(crate) struct Script {
     /// The PIN the receiver demands (`401` on prepare-upload without it).
     pub pin: Option<String>,
-    /// Never answer an upload (a long transfer that a Cancel must interrupt).
-    pub hold_uploads: bool,
+    /// Never answer the upload of this file id or any later one (a long transfer that a
+    /// Cancel must interrupt); `Some(0)` holds every upload.
+    pub hold_from: Option<usize>,
+    /// Answer `500` to the upload of this file id.
+    pub reject: Option<usize>,
 }
 
 /// One request the stub received.
@@ -104,11 +107,16 @@ async fn serve(mut stream: TcpStream, script: Script, log: Arc<Mutex<Vec<Request
                 (401, String::new())
             }
         } else if target.contains("/upload?") {
-            if script.hold_uploads {
+            let file_id = file_id(target);
+            if script.hold_from.is_some_and(|from| file_id.is_some_and(|id| id >= from)) {
                 tokio::time::sleep(Duration::from_secs(30)).await;
                 return;
             }
-            (200, String::new())
+            if script.reject.is_some() && script.reject == file_id {
+                (500, "disk full".to_string())
+            } else {
+                (200, String::new())
+            }
         } else if target.contains("/cancel?") {
             (200, String::new())
         } else {
@@ -119,6 +127,11 @@ async fn serve(mut stream: TcpStream, script: Script, log: Arc<Mutex<Vec<Request
             return;
         }
     }
+}
+
+/// The `fileId` query value of an upload target.
+pub(crate) fn file_id(target: &str) -> Option<usize> {
+    target.split(['?', '&']).find_map(|kv| kv.strip_prefix("fileId=")).and_then(|v| v.parse().ok())
 }
 
 /// Read one request (headers, then a `Content-Length` body). `None` at EOF.

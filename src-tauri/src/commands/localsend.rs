@@ -49,7 +49,7 @@ pub async fn localsend_send(
     let state = state.inner().clone();
     crate::app::spawn_blocking(move || {
         let job = crate::app::localsend::claim_send(&state, None, &photo_ids, version_id)?;
-        let outcome = job.run(&device, pin.as_deref())?;
+        let outcome = job.run(&device, pin.as_deref()).map_err(|stopped| stopped.to_string())?;
         Ok(SendResult { sent: outcome.sent.len(), failed: outcome.failed })
     })
     .await

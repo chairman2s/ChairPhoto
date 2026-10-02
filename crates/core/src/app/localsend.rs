@@ -11,7 +11,9 @@
 //! session and answers [`SEND_CANCELLED`].
 //!
 //! Progress is `localsend:progress` carrying the job id; it is cosmetic. The terminal result
-//! is what `run` returns: which photos reached the device and how many did not.
+//! is what `run` returns: which photos reached the device and how many did not — and, for a
+//! send that stopped part-way ([`SendStopped`]), which photos had already arrived and why the
+//! rest did not.
 //!
 //! **Privacy.** Nothing here runs unless the user picked a device and pressed Send: the
 //! claim is the explicit, per-send action, and it is LAN-only (the device's own address).
@@ -42,6 +44,32 @@ pub fn full_resolution() -> ItemRenderer {
 pub struct SendOutcome {
     pub sent: Vec<i64>,
     pub failed: usize,
+}
+
+/// A send that ended with an error: `sent` are the photos that had already reached the device
+/// before it stopped (in send order; empty when nothing landed) — they stay on the device, so a
+/// caller that records what was sent (Snapchat) records these — and `error` says why the rest
+/// did not go (a receiver rejection, [`SEND_CANCELLED`], …).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SendStopped {
+    pub sent: Vec<i64>,
+    pub error: String,
+}
+
+impl From<String> for SendStopped {
+    /// A failure before any file reached the device.
+    fn from(error: String) -> Self {
+        SendStopped { sent: Vec::new(), error }
+    }
+}
+
+impl std::fmt::Display for SendStopped {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.sent.len() {
+            0 => f.write_str(&self.error),
+            n => write!(f, "Sent {n}, then stopped: {}", self.error),
+        }
+    }
 }
 
 /// A claimed send, not yet running. Dropping it sends nothing; its abort flag stays installed
@@ -109,12 +137,12 @@ impl LocalSendJob {
     /// Render and send with the production [`full_resolution`] renderer. Blocking: runs the
     /// transfer on the core runtime and waits, so call it from a worker thread (never an async
     /// task or the UI thread).
-    pub fn run(self, device: &Device, pin: Option<&str>) -> Result<SendOutcome, String> {
+    pub fn run(self, device: &Device, pin: Option<&str>) -> Result<SendOutcome, SendStopped> {
         self.run_with(device, pin, &full_resolution())
     }
 
     /// [`run`](Self::run) with an explicit renderer.
-    pub fn run_with(self, device: &Device, pin: Option<&str>, render: &ItemRenderer) -> Result<SendOutcome, String> {
+    pub fn run_with(self, device: &Device, pin: Option<&str>, render: &ItemRenderer) -> Result<SendOutcome, SendStopped> {
         let LocalSendJob { state, read, items, requested, abort, job } = self;
         let cancelled = || abort.load(Ordering::Relaxed);
         // This send's own directory: removed when `dir` drops, whichever way this returns.
@@ -151,15 +179,21 @@ impl LocalSendJob {
         super::exports::record_parity_tally(&state, Some(read), tally);
         let rendered = rendered?;
         if rendered.is_empty() {
-            return Err("None of the selected photos could be rendered.".into());
+            return Err(String::from("None of the selected photos could be rendered.").into());
         }
         let paths: Vec<PathBuf> = rendered.iter().map(|(_, p)| p.clone()).collect();
         let pin = pin.map(str::trim).filter(|p| !p.is_empty());
-        crate::app::runtime().block_on(crate::localsend::send_files_abortable(device, &paths, pin, &abort, |done, total| {
+        let result = crate::app::runtime().block_on(crate::localsend::send_files_abortable(device, &paths, pin, &abort, |done, total| {
             state.send(CoreEvent::LocalSendProgress(LocalSendProgress { done, total, job }));
-        }))?;
+        }));
         drop(dir);
-        let sent: Vec<i64> = rendered.into_iter().map(|(id, _)| id).collect();
+        let ids = rendered.into_iter().map(|(id, _)| id);
+        // The transfer goes in `paths` order, so the first `delivered` photos are the ones on
+        // the device.
+        if let Err(stopped) = result {
+            return Err(SendStopped { sent: ids.take(stopped.delivered).collect(), error: stopped.error });
+        }
+        let sent: Vec<i64> = ids.collect();
         let failed = requested.saturating_sub(sent.len());
         Ok(SendOutcome { sent, failed })
     }
@@ -202,7 +236,7 @@ fn unique_in_dir_up_to(dir: &JobTempDir, name: &str, max: u32) -> Result<PathBuf
 mod tests {
     use super::*;
     use crate::catalog::Catalog;
-    use crate::localsend::test_receiver::{Receiver, Script};
+    use crate::localsend::test_receiver::{file_id, Receiver, Script};
     use crate::test_support::TestTmpDir;
     use std::sync::Mutex;
 
@@ -323,7 +357,7 @@ mod tests {
         let receiver = Receiver::start(Script { pin: Some("4321".into()), ..Script::default() });
         let dirs = Arc::new(Mutex::new(Vec::new()));
         let job = claim_send(&state, None, &ids, None).unwrap();
-        let err = job.run_with(&device(&receiver), None, &copying(dirs.clone())).unwrap_err();
+        let err = job.run_with(&device(&receiver), None, &copying(dirs.clone())).unwrap_err().error;
         assert!(err.contains("requires a PIN"), "{err}");
         assert!(!dirs.lock().unwrap()[0].exists(), "a failed send removes its renders");
     }
@@ -334,7 +368,7 @@ mod tests {
     fn cancel_mid_upload_stops_the_send_and_cancels_the_session() {
         let dir = TestTmpDir::new("localsend-cancel");
         let (state, progress, ids) = setup(&dir, 2);
-        let receiver = Receiver::start(Script { hold_uploads: true, ..Script::default() });
+        let receiver = Receiver::start(Script { hold_from: Some(0), ..Script::default() });
         let job = claim_send(&state, None, &ids, None).unwrap();
         let abort = job.abort_handle();
         let dirs = Arc::new(Mutex::new(Vec::new()));
@@ -344,10 +378,48 @@ mod tests {
         receiver.wait_for(|log| log.iter().any(|r| r.target.contains("/upload?")));
         abort.store(true, Ordering::Relaxed);
         let err = run.join().unwrap().unwrap_err();
+        assert!(err.sent.is_empty(), "nothing had arrived");
+        let err = err.error;
         assert_eq!(err, SEND_CANCELLED);
         receiver.wait_for(|log| log.iter().any(|r| r.target.contains("/cancel?sessionId=session-1")));
         assert!(progress.0.lock().unwrap().is_empty(), "no file completed");
         assert!(!dirs.lock().unwrap()[0].exists(), "a cancelled send removes its renders");
+    }
+
+    /// A receiver that rejects the 4th of 5 files: the send stops there and its error carries
+    /// the three photos that had already arrived (in send order) and the rejection.
+    #[test]
+    fn a_rejection_part_way_reports_the_photos_already_delivered() {
+        let dir = TestTmpDir::new("localsend-reject");
+        let (state, _, ids) = setup(&dir, 5);
+        let receiver = Receiver::start(Script { reject: Some(3), ..Script::default() });
+        let job = claim_send(&state, None, &ids, None).unwrap();
+        let dirs = Arc::new(Mutex::new(Vec::new()));
+        let stopped = job.run_with(&device(&receiver), None, &copying(dirs.clone())).unwrap_err();
+        assert_eq!(stopped.sent, ids[..3], "the first three reached the device");
+        assert!(stopped.error.contains("IMG_3.jpg rejected"), "{}", stopped.error);
+        assert!(stopped.to_string().starts_with("Sent 3, then stopped: "), "{stopped}");
+        let uploads = receiver.log().iter().filter(|r| r.target.contains("/upload?")).count();
+        assert_eq!(uploads, 4, "nothing after the rejected file was sent");
+        assert!(!dirs.lock().unwrap()[0].exists(), "a stopped send removes its renders");
+    }
+
+    /// Cancel while the 4th upload is in flight: the three delivered photos come back with
+    /// `SEND_CANCELLED`, and the receiver's session is cancelled.
+    #[test]
+    fn cancel_after_three_reports_the_three_delivered() {
+        let dir = TestTmpDir::new("localsend-cancel3");
+        let (state, _, ids) = setup(&dir, 5);
+        let receiver = Receiver::start(Script { hold_from: Some(3), ..Script::default() });
+        let job = claim_send(&state, None, &ids, None).unwrap();
+        let abort = job.abort_handle();
+        let (dev, render) = (device(&receiver), copying(Arc::default()));
+        let run = std::thread::spawn(move || job.run_with(&dev, None, &render));
+        receiver.wait_for(|log| log.iter().any(|r| r.target.contains("/upload?") && file_id(&r.target) == Some(3)));
+        abort.store(true, Ordering::Relaxed);
+        let stopped = run.join().unwrap().unwrap_err();
+        assert_eq!(stopped, SendStopped { sent: ids[..3].to_vec(), error: SEND_CANCELLED.into() });
+        receiver.wait_for(|log| log.iter().any(|r| r.target.contains("/cancel?sessionId=session-1")));
     }
 
     /// A catalog switch trips a claimed send: it renders and sends nothing. A newer claim
@@ -364,13 +436,13 @@ mod tests {
         let (b, _, _) = setup(&other, 1);
         let catalog_b = b.catalog.lock().unwrap().take().unwrap();
         crate::app::publish_catalog_and_reset_jobs(&state, catalog_b).unwrap();
-        let err = job.run_with(&device(&receiver), None, &copying(rendered.clone())).unwrap_err();
+        let err = job.run_with(&device(&receiver), None, &copying(rendered.clone())).unwrap_err().error;
         assert_eq!(err, SEND_CANCELLED);
 
         let older = claim_send(&state, None, &ids, None).unwrap();
         let newer = claim_send(&state, None, &ids, None).unwrap();
         assert!(newer.job > older.job);
-        let err = older.run_with(&device(&receiver), None, &copying(rendered.clone())).unwrap_err();
+        let err = older.run_with(&device(&receiver), None, &copying(rendered.clone())).unwrap_err().error;
         assert_eq!(err, SEND_CANCELLED);
         assert!(rendered.lock().unwrap().is_empty(), "nothing was rendered");
         assert!(receiver.log().is_empty(), "nothing reached the device");
@@ -420,7 +492,7 @@ mod tests {
 
         let all_fail: ItemRenderer = Arc::new(|_, _| Err("no".into()));
         let job = claim_send(&state, None, &ids, None).unwrap();
-        let err = job.run_with(&device(&receiver), None, &all_fail).unwrap_err();
+        let err = job.run_with(&device(&receiver), None, &all_fail).unwrap_err().error;
         assert!(err.contains("could be rendered"), "{err}");
 
         std::fs::remove_file(dir.join("library/IMG_1.jpg")).unwrap();

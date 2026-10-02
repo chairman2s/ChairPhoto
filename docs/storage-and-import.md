@@ -164,6 +164,19 @@ The debt is therefore a **set of fields per photo**, in `pending_sidecar_iptc`
   per-photo record writes the sidecar of the copy the resolver picks, as a save does. The
   title-bar "identity debt" chip and menu badge count copies owing identity plus photos owing
   IPTC, and the panel's Start is enabled by either.
+- **Listed, dismissed, retried one at a time (#153).** The identity-debt panel lists the
+  photos owing IPTC (`list_owed_iptc_page`: id, UUID, path, owed fields, last error,
+  generation; paged) with **Retry** and **Dismiss** per row (`app::iptc_owed`; the Tauri
+  `list_owed_iptc` / `retry_owed_iptc` / `dismiss_owed_iptc` commands). Retry writes the
+  photo's owed fields as a save does: it takes the sidecar's write turn, reads what is owed
+  now with the turn held, and writes and settles through the save's compare-and-set; an
+  unreachable original is recorded on the row and stays owed. Dismiss clears the owed set
+  without writing — for a photo kept on read-only media — by compare-and-set on the UUID and
+  generation the row was read with, so a store since then (whose debt the user has not seen)
+  or another photo that took the id is never dismissed. The catalog keeps its values; a later
+  save owes only what it changes. Both are bound to the photo's UUID; the GPUI panel also
+  binds them to the catalog its page was read from (`with_catalog_as`). Each re-reads the
+  panel's and the title bar's counts.
 - **Reported honestly.** A save that reached only the catalog answers `pending` with the
   reason (`IptcSaveOutcome`, returned by the Tauri `set_iptc` command and shown by both
   inspectors as "Saved to catalog; sidecar pending (…)"); `unchanged` when nothing was owed.

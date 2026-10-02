@@ -15,9 +15,10 @@ use super::ui;
 use super::{CloseDialog, Runner, StorageState};
 use crate::shell::style::Colors;
 use chairphoto_core::app::{with_catalog, with_catalog_identified, AppState, CatalogIdentity};
+use chairphoto_core::app::iptc::IptcSaveOutcome;
 use chairphoto_core::catalog::{
-    IdentityConflictAction, IdentityConflictOutcome, IdentityRepairSummary, PendingIdentity, PendingIdentityField,
-    PendingIdentitySummary,
+    IdentityConflictAction, IdentityConflictOutcome, IdentityRepairSummary, OwedIptc, PendingIdentity,
+    PendingIdentityField, PendingIdentitySummary,
 };
 use gpui_kit::prelude::*;
 use gpui_kit::TestSupportExt as _;
@@ -26,6 +27,9 @@ use std::collections::HashMap;
 
 /// IPC page size in React; here the page a single read returns.
 pub const PAGE_SIZE: i64 = 500;
+
+/// The page of the owed-IPTC list (#153) a single read returns.
+pub const OWED_PAGE_SIZE: i64 = 100;
 
 pub struct IdentityDebtPanel {
     app: AppState,
@@ -47,6 +51,17 @@ pub struct IdentityDebtPanel {
     pub resolve_result: Option<String>,
     /// Bumped by every page read; an older read's rows are dropped.
     page_seq: u64,
+    /// The photos owing IPTC to their sidecar (#153), one page, and the catalog it was read
+    /// from: a Dismiss or Retry of one of them is bound to it.
+    pub owed: Option<Vec<OwedIptc>>,
+    pub owed_from: Option<CatalogIdentity>,
+    pub owed_page: i64,
+    pub owed_error: Option<String>,
+    /// The photo a Dismiss or Retry is in flight for.
+    pub owed_busy: Option<i64>,
+    pub owed_result: Option<String>,
+    /// Bumped by every owed-IPTC page read; an older read's rows are dropped.
+    owed_seq: u64,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -60,13 +75,27 @@ pub fn row_key(p: &PendingIdentity) -> String {
 impl IdentityDebtPanel {
     pub fn new(storage: Entity<StorageState>, cx: &mut Context<Self>) -> Self {
         let app = storage.read(cx).app_state().clone();
-        let ended = cx.subscribe(&storage, |this: &mut Self, _, event: &StorageEvent, cx| {
-            if let StorageEvent::RepairEnded = event {
+        let ended = cx.subscribe(&storage, |this: &mut Self, _, event: &StorageEvent, cx| match event {
+            StorageEvent::RepairEnded => {
                 // Repaired copies left the queue and every later offset shifted.
                 this.page = 0;
+                this.owed_page = 0;
                 this.reload_summary(cx);
                 this.reload_page(cx);
+                this.reload_owed(cx);
             }
+            StorageEvent::CatalogSwitched => {
+                // The owed rows name another catalog's photos now: drop them (an action on
+                // one would fail closed anyway) and read the new catalog's.
+                this.owed = None;
+                this.owed_from = None;
+                this.owed_page = 0;
+                this.owed_result = None;
+                this.owed_error = None;
+                this.reload_summary(cx);
+                this.reload_owed(cx);
+            }
+            _ => {}
         });
         let observe = cx.observe(&storage, |_, _, cx| cx.notify());
         let mut this = IdentityDebtPanel {
@@ -85,10 +114,18 @@ impl IdentityDebtPanel {
             resolving: None,
             resolve_result: None,
             page_seq: 0,
+            owed: None,
+            owed_from: None,
+            owed_page: 0,
+            owed_error: None,
+            owed_busy: None,
+            owed_result: None,
+            owed_seq: 0,
             _subscriptions: vec![ended, observe],
         };
         this.reload_summary(cx);
         this.reload_page(cx);
+        this.reload_owed(cx);
         this.load_volumes(cx);
         storage.update(cx, |s, cx| s.reattach_repair(cx));
         this
@@ -137,6 +174,187 @@ impl IdentityDebtPanel {
             .ok();
         })
         .detach();
+    }
+
+    /// Read the current page of the photos owing IPTC, with the identity of its catalog.
+    pub fn reload_owed(&mut self, cx: &mut Context<Self>) {
+        self.owed_error = None;
+        self.owed_seq += 1;
+        let seq = self.owed_seq;
+        let (state, offset) = (self.app.clone(), self.owed_page * OWED_PAGE_SIZE);
+        let rx = Runner::get(cx)
+            .run(move || chairphoto_core::app::iptc_owed::list_owed_iptc(&state, OWED_PAGE_SIZE, offset));
+        cx.spawn(async move |this, cx| {
+            let Ok(result) = rx.await else { return };
+            this.update(cx, |s, cx| {
+                if s.owed_seq != seq {
+                    return;
+                }
+                match result {
+                    Ok((from, rows)) => {
+                        s.owed = Some(rows);
+                        s.owed_from = Some(from);
+                    }
+                    Err(e) => s.owed_error = Some(e),
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    pub fn set_owed_page(&mut self, page: i64, cx: &mut Context<Self>) {
+        self.owed_page = page.max(0);
+        self.reload_owed(cx);
+        cx.notify();
+    }
+
+    /// Dismiss (`retry == false`) or Retry one owed-IPTC row — in the catalog its row was
+    /// read from (`CATALOG_CHANGED` once another is open), for the photo with its UUID. Then
+    /// the counts are re-read: the panel's and the title bar's.
+    pub fn act_on_owed(&mut self, index: usize, retry: bool, cx: &mut Context<Self>) {
+        let Some(row) = self.owed.as_ref().and_then(|r| r.get(index)).cloned() else { return };
+        let Some(from) = self.owed_from else { return };
+        if self.owed_busy.is_some() {
+            return;
+        }
+        self.owed_busy = Some(row.photo_id);
+        self.owed_error = None;
+        self.owed_result = None;
+        let state = self.app.clone();
+        let epoch = self.storage.read(cx).epoch();
+        // Retry waits for the sidecar's write turn and writes the sidecar: the runner's
+        // blocking pool, never the UI thread or an async worker.
+        let rx = Runner::get(cx).run(move || {
+            use chairphoto_core::app::iptc_owed::{dismiss_owed_iptc_as, retry_owed_iptc_as};
+            if retry {
+                retry_owed_iptc_as(&state, Some(from), row.photo_id, &row.uuid).map(OwedAction::Retried)
+            } else {
+                dismiss_owed_iptc_as(&state, Some(from), row.photo_id, &row.uuid, row.generation)
+                    .map(OwedAction::Dismissed)
+            }
+        });
+        cx.spawn(async move |this, cx| {
+            let result = rx.await.unwrap_or_else(|_| Err("the owed-IPTC worker stopped".into()));
+            this.update(cx, |s, cx| {
+                s.owed_busy = None;
+                if s.storage.read(cx).epoch() != epoch {
+                    return;
+                }
+                match result {
+                    Ok(done) => {
+                        s.owed_result = Some(owed_action_message(&done));
+                        s.reload_summary(cx);
+                        s.reload_owed(cx);
+                        // The title bar's debt count.
+                        s.storage.update(cx, |st, cx| st.invalidate(cx));
+                    }
+                    // A refusal names what it refused; shown verbatim.
+                    Err(e) => s.owed_error = Some(e),
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn owed_section(&self, colors: Colors, cx: &mut Context<Self>) -> gpui_kit::Div {
+        let mut section = div().flex().flex_col().gap(px(4.)).child(div().text_size(px(12.)).child("IPTC owed to sidecars")).child(
+            ui::sub(
+                "Each row is a photo whose catalog IPTC has fields its sidecar has not received: the sidecar write \
+                 failed after the save. Retry writes them now; the repair pass retries them too. Dismiss stops \
+                 owing them without writing anything — the catalog keeps its values and the sidecar keeps what it \
+                 has (for a photo kept on read-only media).",
+                colors,
+            ),
+        );
+        if let Some(r) = &self.owed_result {
+            section = section.child(div().id("owed-result").child(ui::sub(r.clone(), colors)).test_support());
+        }
+        if let Some(e) = &self.owed_error {
+            section = section.child(ui::error("owed-error", e.clone(), colors));
+        }
+        let Some(rows) = self.owed.as_ref() else {
+            return section.child(ui::empty("owed-loading", "Loading…", colors));
+        };
+        if rows.is_empty() && self.owed_page == 0 {
+            return section.child(ui::empty("owed-empty", "No photo owes IPTC to its sidecar.", colors));
+        }
+        let header = |t: &'static str, w: f32| div().w(px(w)).flex_none().text_size(px(10.5)).text_color(colors.mute).child(t);
+        section = section.child(
+            div()
+                .flex()
+                .gap(px(8.))
+                .child(div().flex_1().text_size(px(10.5)).text_color(colors.mute).child("Path"))
+                .child(header("Fields", 160.))
+                .child(header("Tries", 40.))
+                .child(header("Last attempt", 130.))
+                .child(header("Detail", 160.))
+                .child(header("", 150.)),
+        );
+        let enabled = self.owed_busy.is_none();
+        let mut list = div().id("owed-rows").flex().flex_col().max_h(px(240.)).overflow_y_scroll();
+        for (i, r) in rows.iter().enumerate() {
+            let id = |what: &str| SharedString::from(format!("{what}-{i}"));
+            let cell = |w: f32, text: String| div().w(px(w)).flex_none().text_size(px(11.)).text_color(colors.dim).truncate().child(text);
+            list = list.child(
+                div()
+                    .id(SharedString::from(format!("owed-row-{i}")))
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .py(px(5.))
+                    .border_b_1()
+                    .border_color(colors.line)
+                    .child(div().flex_1().min_w_0().text_size(px(11.)).truncate().child(r.path.clone()))
+                    .child(cell(160., r.fields.join(", ")))
+                    .child(cell(40., format!("{}×", r.attempts)))
+                    .child(cell(130., when_line(r.last_attempt_at)))
+                    .child(cell(160., if r.error.is_empty() { "—".into() } else { r.error.clone() }))
+                    .child(
+                        ui::row()
+                            .w(px(150.))
+                            .flex_none()
+                            .child(ui::clickable(
+                                ui::chip(id("owed-retry"), "Retry", enabled, colors),
+                                enabled,
+                                cx.listener(move |s, _, _, cx| s.act_on_owed(i, true, cx)),
+                            ))
+                            .child(ui::clickable(
+                                ui::chip(id("owed-dismiss"), "Dismiss", enabled, colors),
+                                enabled,
+                                cx.listener(move |s, _, _, cx| s.act_on_owed(i, false, cx)),
+                            )),
+                    )
+                    .test_support(),
+            );
+        }
+        section = section.child(list);
+        let shown = rows.len() as i64;
+        let total = self.summary.map(|s| s.iptc_owed);
+        let (can_prev, can_next) = (self.owed_page > 0, shown == OWED_PAGE_SIZE);
+        section.child(
+            ui::row()
+                .child(
+                    div()
+                        .id("owed-paging")
+                        .child(ui::sub(paging_label(self.owed_page * OWED_PAGE_SIZE, shown, total), colors))
+                        .test_support(),
+                )
+                .child(ui::clickable(
+                    ui::chip("owed-prev", "← Prev", can_prev, colors),
+                    can_prev,
+                    cx.listener(|s, _, _, cx| s.set_owed_page(s.owed_page - 1, cx)),
+                ))
+                .child(ui::clickable(
+                    ui::chip("owed-next", "Next →", can_next, colors),
+                    can_next,
+                    cx.listener(|s, _, _, cx| s.set_owed_page(s.owed_page + 1, cx)),
+                )),
+        )
     }
 
     fn load_volumes(&mut self, cx: &mut Context<Self>) {
@@ -353,6 +571,33 @@ pub fn resolution_message(o: &IdentityConflictOutcome) -> String {
     }
 }
 
+/// What a Dismiss or Retry of one owed-IPTC row did.
+#[derive(Debug, Clone)]
+pub enum OwedAction {
+    /// `true` when the debt was dismissed; `false` when nothing was: a newer save owes
+    /// something since the row was read, or the photo is gone.
+    Dismissed(bool),
+    Retried(IptcSaveOutcome),
+}
+
+/// The line after a Dismiss or Retry, stated from what the core answered (React's
+/// `owedActionMessage`).
+pub fn owed_action_message(done: &OwedAction) -> String {
+    use chairphoto_core::catalog::IptcSidecarState;
+    match done {
+        OwedAction::Dismissed(true) => "Dismissed. The catalog keeps its IPTC; the sidecar was not written.".into(),
+        OwedAction::Dismissed(false) => {
+            "Not dismissed: this photo's IPTC changed since the list was read. Check the refreshed row.".into()
+        }
+        OwedAction::Retried(o) => match (o.sidecar, &o.reason) {
+            (IptcSidecarState::Written, _) => "Written to the sidecar.".into(),
+            (IptcSidecarState::Unchanged, _) => "Nothing was owed any more; the sidecar was not opened.".into(),
+            (IptcSidecarState::Pending, Some(why)) => format!("Still pending ({why})."),
+            (IptcSidecarState::Pending, None) => "Still pending.".into(),
+        },
+    }
+}
+
 /// "Showing N–M of T", never smaller than what is shown.
 pub fn paging_label(offset: i64, shown: i64, total: Option<i64>) -> String {
     if shown == 0 {
@@ -461,6 +706,15 @@ impl Render for IdentityDebtPanel {
             if let Some(e) = e {
                 body = body.child(ui::error(id, e.clone(), colors));
             }
+        }
+        // #153: the photos owing IPTC, listed whenever any do (or the list is paged past).
+        let owes_iptc = summary.is_some_and(|s| s.iptc_owed > 0)
+            || self.owed.as_ref().is_some_and(|r| !r.is_empty())
+            || self.owed_page > 0
+            || self.owed_result.is_some()
+            || self.owed_error.is_some();
+        if owes_iptc {
+            body = body.child(self.owed_section(colors, cx).id("owed-iptc").test_support());
         }
         let Some(rows) = self.rows.clone() else {
             return body.child(ui::empty("debt-loading", "Loading…", colors));

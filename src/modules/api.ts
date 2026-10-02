@@ -43,7 +43,8 @@ const LIST_CACHE_COMMANDS = new Set([
  *  and publication records leave them untouched. Anything else bumps the generation. */
 const LIST_NEUTRAL_COMMANDS = new Set([
   // writes the lists do not depend on
-  "create_version", "delete_version", "duplicate_version", "record_publication",
+  "create_version", "delete_version", "dismiss_owed_iptc", "duplicate_version", "record_publication",
+  "retry_owed_iptc",
   "rename_version", "reorder_versions", "rotate_photo", "set_edit_record", "set_iptc",
   "set_label", "set_photo_gps", "set_pick_state", "set_rating", "set_setting",
   "set_version_edit",
@@ -60,7 +61,7 @@ const LIST_NEUTRAL_COMMANDS = new Set([
   "get_setting", "get_system_theme", "get_tag_exportable", "get_tag_private",
   "get_thumbnail", "identity_repair_status", "library_graph", "library_safety_summary",
   "list_albums", "list_card_photos_cmd", "list_external_modules", "list_facets",
-  "list_fences", "list_import_batches", "list_languages", "list_luts",
+  "list_fences", "list_import_batches", "list_languages", "list_luts", "list_owed_iptc",
   "list_pending_identity", "list_pending_operations", "list_photos", "list_publications",
   "list_recent_catalogs", "list_smart_albums", "list_stack_children", "list_tag_groups",
   "list_tag_terms", "list_tags", "list_trash", "list_versions", "list_volumes",
@@ -1748,6 +1749,40 @@ export interface IptcSaveOutcome {
 
 export const setIptc = (photoId: number, fields: IptcFields) =>
   invoke<IptcSaveOutcome>("set_iptc", { photoId, fields });
+
+/** One photo whose catalog IPTC has fields its sidecar has not received yet (#153), as the
+ *  identity-debt panel lists it. `uuid` and `generation` are what `dismissOwedIptc` compares
+ *  against: a save since the row was read, or another photo that took the id, is never
+ *  dismissed by it. */
+export interface OwedIptc {
+  photoId: number;
+  uuid: string;
+  /** Catalog-root-relative logical path, for display only. */
+  path: string;
+  /** The owed fields' labels ("Title", "Country code", …) in a fixed order. */
+  fields: string[];
+  /** Failed writes of this record; a successful write resets it. */
+  attempts: number;
+  /** Why the last write failed, or "". */
+  error: string;
+  /** Unix seconds; 0 when never attempted. */
+  lastAttemptAt: number;
+  queuedAt: number;
+  generation: number;
+}
+
+/** One page of the photos owing IPTC, in photo-id order. Pair with
+ *  `PendingIdentitySummary.iptcOwed` for the total. */
+export const listOwedIptc = (limit: number, offset: number) =>
+  invoke<OwedIptc[]>("list_owed_iptc", { limit, offset });
+/** Stop owing one photo's IPTC without writing (the catalog keeps its values, the sidecar
+ *  keeps what it has). `false` when nothing was dismissed: the photo's IPTC changed since
+ *  the row was read, or the photo is gone — re-read the list. */
+export const dismissOwedIptc = (photoId: number, uuid: string, generation: number) =>
+  invoke<boolean>("dismiss_owed_iptc", { photoId, uuid, generation });
+/** Write one photo's owed IPTC into its sidecar now. Answers like `setIptc`. */
+export const retryOwedIptc = (photoId: number, uuid: string) =>
+  invoke<IptcSaveOutcome>("retry_owed_iptc", { photoId, uuid });
 
 // ── H16e — Burst-relative sharpness flagging ─────────────────────────────────
 

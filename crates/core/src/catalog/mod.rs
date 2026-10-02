@@ -37,7 +37,7 @@ mod performance_harness;
 
 pub use facets::{Facet, SOFT_THRESHOLD_DEFAULT, SOFT_THRESHOLD_KEY};
 pub use identity::{
-    bind_sidecar_identity, IdentityConflictAction, IdentityConflictOutcome, IdentityRepairCursor,
+    bind_sidecar_identity, is_photo_identity, IdentityConflictAction, IdentityConflictOutcome, IdentityRepairCursor,
     IdentityRepairPlan, IdentityRepairSummary, PendingIdentity, PendingIdentityField,
     PendingIdentityRow, PendingIdentitySummary, SidecarIdentity,
 };
@@ -672,6 +672,9 @@ impl Catalog {
     /// *moved or re-rooted* file onto its existing row (path changed, identity didn't)
     /// instead of creating a duplicate. When there's no match, a new row is created; it
     /// adopts the sidecar UUID if one was supplied, else mints a fresh one.
+    ///
+    /// `sidecar_uuid` is trusted as an identity: a caller that read it from a sidecar passes
+    /// it only if [`is_photo_identity`] accepts it (#141).
     pub fn upsert_photo_with_identity(
         &self,
         absolute_path: &Path,
@@ -766,6 +769,8 @@ impl Catalog {
     /// the NAS ("On NAS"). Matches an existing row by an existing location at this
     /// volume+path, then by sidecar UUID, else creates a new row (folder_id null — it's
     /// not under an indexed local folder). See `scanner::scan_external_folder`.
+    ///
+    /// `sidecar_uuid` is trusted as an identity, as in [`Self::upsert_photo_with_identity`].
     pub fn upsert_photo_on_volume(
         &self,
         absolute: &Path,

@@ -1590,6 +1590,36 @@ fn the_strip_is_clamped_at_its_ends(cx: &mut TestAppContext) {
     assert!(at.frame_left + at.frame_width / 2.0 < at.left + at.viewport / 2.0, "not centred: clamped");
 }
 
+/// The strip's width is the last frame it was laid out in. Leave the Darkroom, make the
+/// window narrower, come back on another photo: it is centred in the new width, not the
+/// last visit's (review rv134 M2).
+#[gpui_kit::test]
+fn the_strip_centres_in_a_width_changed_outside_the_darkroom(cx: &mut TestAppContext) {
+    let rig = rig("dk-centre-resize", 60, cx);
+    let order = order(&rig, cx);
+    let n = order.len();
+    select(&rig, order[30], cx);
+    draw(&rig, cx);
+    assert_centred(&rig, 30, n, "before", cx);
+    let wide = strip_at(&rig, 30, cx).viewport;
+
+    rig.app.wired.shell.update(cx, |s, cx| s.show_library(cx));
+    cx.run_until_parked();
+    work(cx);
+    rig.render(cx);
+    cx.simulate_window_resize(rig.app.window(), gpui_kit::size(gpui_kit::px(900.), gpui_kit::px(700.)));
+    cx.run_until_parked();
+    rig.render(cx);
+    select(&rig, order[31], cx);
+    rig.app.wired.shell.update(cx, |s, cx| s.open_develop(cx));
+    cx.run_until_parked();
+    work(cx);
+    draw(&rig, cx);
+    let narrow = strip_at(&rig, 31, cx).viewport;
+    assert!(narrow < wide, "the window is narrower: {narrow} < {wide}");
+    assert_centred(&rig, 31, n, "after a resize outside the Darkroom", cx);
+}
+
 /// The Thumb jobs for `photo` submitted so far.
 fn thumb_jobs(rig: &Rig, photo: i64) -> usize {
     let key = JobKey::photo(photo, ImageKind::Thumb);

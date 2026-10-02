@@ -776,6 +776,56 @@ fn a_photos_note_record_follows_its_identity_through_v23_and_v24() {
     );
 }
 
+/// #146 review N1: an offloaded legacy photo — its original deleted, its primary location
+/// rows dropped, a verified backup on the NAS — has no primary copy left to be "gone". A
+/// different file whose sidecar shares its DAM id (an export of it, say) must get its own
+/// row, not take the photo's over: the sizes differ, and an original never changes size.
+#[test]
+fn an_offloaded_legacy_photo_is_not_taken_over_by_another_file_with_its_dam_id() {
+    let (catalog, root, ids) = legacy_catalog("legacy-offloaded", &[("a/x.jpg", "dam:asset/5")]);
+    let nas = root.parent().unwrap().join("nas");
+    std::fs::create_dir_all(nas.join("a")).unwrap();
+    std::fs::write(nas.join("a/x.jpg"), b"notarealjpeg").unwrap();
+    let volume = catalog.add_volume("NAS", &nas, VolumeKind::Backup).unwrap();
+    catalog.add_location(ids[0], volume, "a/x.jpg", LocationRole::Backup).unwrap();
+    catalog.set_culling(ids[0], Some(5), None, None).unwrap();
+    // Offload, as commit_offload leaves it: the local file gone, the primary rows dropped.
+    std::fs::remove_file(root.join("a/x.jpg")).unwrap();
+    catalog
+        .conn()
+        .execute(
+            "DELETE FROM photo_locations WHERE photo_id = ?1 AND role = 'primary'",
+            [ids[0]],
+        )
+        .unwrap();
+
+    let export = root.join("exports/x-web.jpg");
+    std::fs::create_dir_all(export.parent().unwrap()).unwrap();
+    std::fs::write(&export, b"a quite different derived jpeg").unwrap();
+    std::fs::copy(
+        chairphoto_core::xmp::sidecar_path(&root.join("a/x.jpg")),
+        chairphoto_core::xmp::sidecar_path(&export),
+    )
+    .unwrap();
+    let abort = chairphoto_core::scanner::never_abort();
+    chairphoto_core::scanner::scan_folder(&catalog, &root, &abort, &|_| {}).unwrap();
+
+    let photo = catalog.get_photo(ids[0]).unwrap();
+    assert_eq!((photo.path.as_str(), photo.rating), ("a/x.jpg", 5), "the offloaded row is untouched");
+    let all: i64 = catalog.conn().query_row("SELECT count(*) FROM photos", [], |r| r.get(0)).unwrap();
+    assert_eq!(all, 2, "the export is another photo");
+
+    // The real original, restored by hand to another folder, still comes home: same size.
+    let restored = root.join("restored/x.jpg");
+    std::fs::create_dir_all(restored.parent().unwrap()).unwrap();
+    std::fs::copy(nas.join("a/x.jpg"), &restored).unwrap();
+    std::fs::copy(chairphoto_core::xmp::sidecar_path(&export), chairphoto_core::xmp::sidecar_path(&restored)).unwrap();
+    chairphoto_core::scanner::scan_folder(&catalog, &root, &abort, &|_| {}).unwrap();
+    assert_eq!(catalog.get_photo(ids[0]).unwrap().path, "restored/x.jpg");
+    let all: i64 = catalog.conn().query_row("SELECT count(*) FROM photos", [], |r| r.get(0)).unwrap();
+    assert_eq!(all, 2);
+}
+
 /// A bundle of `photos`, each `(uuid, relative path)`, with nothing else in it.
 fn bare_bundle(photos: &[(&str, &str)]) -> chairphoto_core::bundle::BundleManifest {
     let mut m = chairphoto_core::bundle::BundleManifest::new(

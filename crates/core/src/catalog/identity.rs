@@ -1500,9 +1500,14 @@ impl Catalog {
     /// that row records is gone ([`Self::every_primary_copy_is_gone`]): two files sharing a DAM id must not
     /// take turns owning one row (#141), and an unmounted volume is not a moved file.
     ///
+    /// The scanned file's `size` must also be the row's (#146 review N1). An offloaded photo
+    /// has no primary copy left to be "gone", so without it any file carrying the same DAM id
+    /// — an export, a derivative — would take the row over. Originals are never modified, so
+    /// a moved or restored original keeps its size, and a different file almost never has it.
+    ///
     /// The caller still binds with the raw `found`, so the foreign value stays in the
     /// sidecar and is reported as a conflict.
-    pub fn scan_identity(&self, found: Option<&str>) -> Result<Option<String>> {
+    pub fn scan_identity(&self, found: Option<&str>, size: i64) -> Result<Option<String>> {
         let Some(found) = found else {
             return Ok(None);
         };
@@ -1511,18 +1516,22 @@ impl Catalog {
         }
         #[cfg(test)]
         LEGACY_LOOKUPS.with(|n| n.set(n.get() + 1));
-        let owners: Vec<(i64, String)> = self
+        let owners: Vec<(i64, String, i64)> = self
             .conn
             .prepare_cached(
-                "SELECT l.photo_id, p.uuid
+                "SELECT l.photo_id, p.uuid, p.size
                  FROM photo_legacy_identifiers l JOIN photos p ON p.id = l.photo_id
                  WHERE l.identifier = ?1
                  LIMIT 2",
             )?
-            .query_map(params![found], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .query_map(params![found], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
             .collect::<rusqlite::Result<_>>()?;
         match owners.as_slice() {
-            [(photo_id, uuid)] if self.every_primary_copy_is_gone(*photo_id)? => Ok(Some(uuid.clone())),
+            [(photo_id, uuid, row_size)]
+                if *row_size == size && self.every_primary_copy_is_gone(*photo_id)? =>
+            {
+                Ok(Some(uuid.clone()))
+            }
             _ => Ok(None),
         }
     }
@@ -3384,27 +3393,29 @@ mod tests {
         let uuid = photo_uuid(&catalog, id);
         assert!(is_photo_identity(&uuid), "{uuid}");
 
-        assert_eq!(catalog.scan_identity(Some("dam:1")).unwrap(), None, "its file is still there");
+        assert_eq!(catalog.scan_identity(Some("dam:1"), 9).unwrap(), None, "its file is still there");
         std::fs::remove_file(&path).unwrap();
-        assert_eq!(catalog.scan_identity(Some("dam:1")).unwrap(), Some(uuid.clone()),
+        assert_eq!(catalog.scan_identity(Some("dam:1"), 10).unwrap(), None,
+            "a file of another size is not the original, whatever DAM id it carries (N1)");
+        assert_eq!(catalog.scan_identity(Some("dam:1"), 9).unwrap(), Some(uuid.clone()),
             "the backup still in place is this row's own copy, not another photo");
 
         let nas_uuid = photo_uuid(&catalog, on_nas);
-        assert_eq!(catalog.scan_identity(Some("dam:3")).unwrap(), None, "its NAS file is there");
+        assert_eq!(catalog.scan_identity(Some("dam:3"), 9).unwrap(), None, "its NAS file is there");
         std::fs::remove_dir_all(&nas).unwrap();
-        assert_eq!(catalog.scan_identity(Some("dam:3")).unwrap(), None,
+        assert_eq!(catalog.scan_identity(Some("dam:3"), 9).unwrap(), None,
             "the primary copy may still exist on the volume that is not mounted");
         std::fs::create_dir_all(&nas).unwrap();
-        assert_eq!(catalog.scan_identity(Some("dam:3")).unwrap(), Some(nas_uuid));
+        assert_eq!(catalog.scan_identity(Some("dam:3"), 9).unwrap(), Some(nas_uuid));
 
-        assert_eq!(catalog.scan_identity(Some(&uuid)).unwrap(), Some(uuid.clone()));
+        assert_eq!(catalog.scan_identity(Some(&uuid), 9).unwrap(), Some(uuid.clone()));
         assert_eq!(
-            catalog.scan_identity(Some(&uuid.to_ascii_uppercase())).unwrap(),
+            catalog.scan_identity(Some(&uuid.to_ascii_uppercase()), 9).unwrap(),
             Some(uuid.clone()),
             "a UUID is answered in its canonical lowercase spelling (#146)"
         );
-        assert_eq!(catalog.scan_identity(Some("dam:2")).unwrap(), None);
-        assert_eq!(catalog.scan_identity(None).unwrap(), None);
+        assert_eq!(catalog.scan_identity(Some("dam:2"), 9).unwrap(), None);
+        assert_eq!(catalog.scan_identity(None, 9).unwrap(), None);
 
         // Two rows holding the same legacy value: the file could be either, so neither.
         let (other, other_path) = seed_photo(&catalog, &root, "y.jpg");
@@ -3416,7 +3427,7 @@ mod tests {
                 params![other],
             )
             .unwrap();
-        assert_eq!(catalog.scan_identity(Some("dam:1")).unwrap(), None);
+        assert_eq!(catalog.scan_identity(Some("dam:1"), 9).unwrap(), None);
     }
 
     /// #146 (L5): Adopt stores the sidecar's identity lowercase, and the conflict it

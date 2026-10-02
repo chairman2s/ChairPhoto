@@ -754,7 +754,7 @@ impl Catalog {
         //    only worked out when the path did not match.
         let identity = match by_path {
             Some(_) => None,
-            None => self.identity_from(&source)?,
+            None => self.identity_from(&source, size)?,
         };
         let sidecar_uuid = identity.as_deref();
         let by_uuid: Option<i64> = match (by_path.is_some(), sidecar_uuid) {
@@ -881,7 +881,7 @@ impl Catalog {
         //    worked out only now that the location did not match.
         let identity = match by_loc {
             Some(_) => None,
-            None => self.identity_from(&source)?,
+            None => self.identity_from(&source, size)?,
         };
         let sidecar_uuid = identity.as_deref();
         let by_uuid: Option<(i64, String)> = match (&by_loc, sidecar_uuid) {
@@ -935,11 +935,12 @@ impl Catalog {
         Ok(result)
     }
 
-    /// The identity an upsert matches and adopts, from where `source` says it comes.
-    fn identity_from(&self, source: &IdentitySource<'_>) -> Result<Option<String>> {
+    /// The identity an upsert of a `size`-byte file matches and adopts, from where `source`
+    /// says it comes.
+    fn identity_from(&self, source: &IdentitySource<'_>, size: i64) -> Result<Option<String>> {
         match *source {
             IdentitySource::Trusted(value) => Ok(value.map(photo_identity_for)),
-            IdentitySource::Sidecar(found) => self.scan_identity(found),
+            IdentitySource::Sidecar(found) => self.scan_identity(found, size),
         }
     }
 

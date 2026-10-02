@@ -145,7 +145,10 @@ sidecar. Until that conflict is resolved the sidecar's foreign value is the file
 to its row, so a scan re-homes a moved file onto the row holding it as a legacy identifier —
 only when no other row holds it and every primary copy the row records is gone (present
 storage, no file; an unmounted volume does not count). A backup, cache or export copy still in
-place does not hold it back: it is the same row's copy, not evidence of another photo.
+place does not hold it back: it is the same row's copy, not evidence of another photo. The
+scanned file must also be the row's size: an offloaded photo has no primary copy left to be
+"gone", and an export or derivative carrying the same DAM id must not take it over, while an
+original is never modified and keeps its size wherever it is moved or restored.
 Otherwise the file is a different photo and gets its own row, as above.
 
 **A re-minted legacy identity is a UUID v5, not v4.** This is the one exception to "a UUID v4

@@ -883,6 +883,16 @@ mod map_tests;
 #[path = "faces_tests.rs"]
 mod faces_tests;
 
+// The AI Tagging module (#126).
+#[cfg(feature = "ai")]
+#[path = "ai_tagging_tests.rs"]
+mod ai_tagging_tests;
+
+// The Smart Tagging module (#126).
+#[cfg(feature = "smarttags")]
+#[path = "smart_tagging_tests.rs"]
+mod smart_tagging_tests;
+
 // Tags (#107).
 #[path = "tags_tests.rs"]
 mod tags_tests;

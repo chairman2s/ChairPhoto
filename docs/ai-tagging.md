@@ -27,7 +27,11 @@ first photo.
 ## Privacy
 
 The default provider is local. **Images are never sent to a cloud provider without an explicit
-opt-in**, and a bulk cloud run shows a "N images → ~$X" confirmation first.
+opt-in**, and a bulk cloud run shows a "N images → ~$X" confirmation first. The opt-in is per
+provider: choosing a cloud engine and saving that provider's API key (stored, like every `ai.*`
+setting, in the catalog; shown masked; never logged). The GPUI module (`modules::ai_tagging`)
+refuses a cloud run before reading any preview while that key is missing, and the bulk confirm
+closes unsent when the engine, model or catalog changes.
 
 A tag can be marked **private** (`tags.private`) — typically every name under `People`. Private
 tags are stripped from the vocabulary sent to cloud providers, so personal names never leave the

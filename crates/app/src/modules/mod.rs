@@ -43,6 +43,8 @@ pub mod publishing;
 pub mod registry;
 pub mod statistics;
 
+#[cfg(feature = "ai")]
+pub mod ai_tagging;
 #[cfg(any(test, feature = "dev-module"))]
 pub mod dev_module;
 #[cfg(feature = "collage")]
@@ -55,6 +57,8 @@ pub mod faces;
 pub mod map;
 #[cfg(feature = "slideshow")]
 pub mod slideshow;
+#[cfg(feature = "smarttags")]
+pub mod smart_tagging;
 #[cfg(feature = "tag-graph")]
 pub mod tag_graph;
 
@@ -414,6 +418,8 @@ pub fn bundled() -> Vec<Rc<dyn Module>> {
     let mut modules: Vec<Rc<dyn Module>> = Vec::new();
     #[cfg(any(test, feature = "dev-module"))]
     modules.push(Rc::new(dev_module::DevModule));
+    #[cfg(feature = "ai")]
+    modules.push(Rc::new(ai_tagging::AiTaggingModule));
     modules.push(Rc::new(statistics::StatisticsModule));
     #[cfg(feature = "collage")]
     modules.push(Rc::new(collage::CollageModule::default()));
@@ -429,6 +435,8 @@ pub fn bundled() -> Vec<Rc<dyn Module>> {
     modules.push(Rc::new(faces::FacesModule));
     #[cfg(feature = "tag-graph")]
     modules.push(Rc::new(tag_graph::TagGraphModule));
+    #[cfg(feature = "smarttags")]
+    modules.push(Rc::new(smart_tagging::SmartTaggingModule));
     modules
 }
 

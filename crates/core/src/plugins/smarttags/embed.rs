@@ -104,7 +104,7 @@ pub fn active_ep() -> ActiveEp {
 ///
 /// [`POOL_SIZE`]/[`INTRA_THREADS`] are process-global, so two Smart Tagging index runs
 /// overlapping (a second `smarttags_index_photos` call trips the first job's abort flag — see
-/// `commands::smarttags::begin_smarttags_job`) can move these out from under the first run's
+/// `app::smarttags::begin_index_job`) can move these out from under the first run's
 /// still-in-flight chunk; see [`crate::plugins::faces::engine::configure`] for the full
 /// reasoning, which applies identically here. A single run's own workers never see this,
 /// because `configure`/[`configure_force_cpu`] are each called exactly once, before that run's

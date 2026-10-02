@@ -942,6 +942,56 @@ fn a_bundle_previews_and_imports(cx: &mut TestAppContext) {
     dlg.read_with(cx, |d, _| assert_eq!(d.preview.as_ref().map(|p| (p.new_count, p.existing)), Some((0, 2))));
 }
 
+/// Browse… cannot filter the portal picker to `.chairphoto` (React could), so the picked file
+/// is checked instead: another file is refused with a message and never previewed; a bundle
+/// name in any case is taken. (#161)
+#[gpui_kit::test]
+fn browse_refuses_a_picked_file_that_is_not_a_bundle(cx: &mut TestAppContext) {
+    let dir = TempDir::new("bundle-browse");
+    let app = start(cx);
+    open_catalog(&app, &dir, cx);
+    click_menu_row(&app, "import-menu", 1, "Import a .chairphoto bundle…", cx);
+    let StorageDialog::ImportBundle(dlg) = dialog(&app, cx) else { panic!("the bundle dialog") };
+    work(cx); // whatever opening the catalog queued
+    let browse = |cx: &mut TestAppContext| {
+        let dlg = dlg.clone();
+        cx.update_window(app.window(), |_, window, cx| dlg.update(cx, |d, cx| d.browse(window, cx))).unwrap();
+        cx.run_until_parked();
+        assert!(cx.did_prompt_for_paths(), "the picker opened");
+    };
+
+    browse(cx);
+    let notes = dir.0.join("notes.txt");
+    cx.simulate_path_prompt_response(|_| Some(vec![notes.clone()]));
+    cx.run_until_parked();
+    dlg.read_with(cx, |d, cx| {
+        assert_eq!(d.error.clone(), Some(format!("Not a .chairphoto bundle: {}", notes.display())));
+        assert_eq!(d.path.read(cx).value(), "", "the path was not taken");
+        assert!(!d.previewing && d.preview.is_none(), "nothing was previewed");
+    });
+    assert_eq!(work(cx), 0, "no preview was queued");
+
+    browse(cx);
+    let bundle = dir.0.join("Trip.CHAIRPHOTO");
+    cx.simulate_path_prompt_response(|_| Some(vec![bundle.clone()]));
+    cx.run_until_parked();
+    dlg.read_with(cx, |d, cx| {
+        assert_eq!(d.path.read(cx).value(), bundle.to_string_lossy().as_ref(), "a bundle name in any case is taken");
+        assert!(d.previewing, "and previewed");
+    });
+}
+
+#[test]
+fn a_bundle_is_recognised_by_its_extension_in_any_case() {
+    use crate::storage::bundle_import::is_bundle_path;
+    use std::path::Path;
+    assert!(is_bundle_path(Path::new("/a/trip.chairphoto")));
+    assert!(is_bundle_path(Path::new("/a/Trip.ChairPhoto")));
+    for not in ["/a/trip.txt", "/a/chairphoto", "/a/trip.chairphoto.zip", "/a/.chairphoto"] {
+        assert!(!is_bundle_path(Path::new(not)), "{not}");
+    }
+}
+
 // --- volumes ------------------------------------------------------------------------------
 
 /// Add a volume (Enter in the path adds); the library folder cannot be removed; removing

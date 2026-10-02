@@ -552,6 +552,22 @@ fn autosave_never_reaches_the_new_catalog_after_the_switch_event(cx: &mut TestAp
     autosave_across_a_switch(true, cx);
 }
 
+/// The LUT picker has no `.cube` filter (GPUI's portal picker takes none; React's `pickFile`
+/// set none either): a picked file that is not a `.cube` is refused by the import with a
+/// message, copies nothing and selects nothing. (#161)
+#[gpui_kit::test]
+fn a_picked_file_that_is_not_a_cube_lut_is_refused(cx: &mut TestAppContext) {
+    let rig = rig("dk-lut-refused", 1, cx);
+    let before = rig.working(cx)["lut"].clone();
+    let src = rig.dir.0.join("notes.txt");
+    std::fs::write(&src, "not a LUT").unwrap();
+    rig.darkroom(cx).update(cx, |d, cx| d.import_lut(src, cx));
+    work(cx);
+    assert_eq!(rig.darkroom(cx).read_with(cx, |d, _| d.error.clone()).as_deref(), Some("only .cube LUTs are supported"));
+    assert!(!rig.dir.0.join("luts/notes.txt").exists(), "nothing was copied");
+    assert_eq!(rig.working(cx)["lut"], before, "nothing was selected");
+}
+
 /// LUTs: a chip selects one from the folder, its amount slider appears, and Import copies a
 /// validated `.cube` into the folder and selects it.
 #[gpui_kit::test]

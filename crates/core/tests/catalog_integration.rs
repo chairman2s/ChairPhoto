@@ -389,10 +389,16 @@ fn moved_file_matches_by_uuid_instead_of_duplicating() {
 
     // A brand-new file with a UUID from another machine adopts that identity.
     let imported = catalog
-        .upsert_photo_with_identity(&root.join("FROM-LAPTOP.ARW"), None, 3, 3, Some("known-uuid-123"))
+        .upsert_photo_with_identity(
+            &root.join("FROM-LAPTOP.ARW"),
+            None,
+            3,
+            3,
+            Some("3b2f7c1e-8a4d-4e6f-9b0a-1c2d3e4f5a6b"),
+        )
         .unwrap();
     assert!(imported.created);
-    assert_eq!(imported.uuid, "known-uuid-123");
+    assert_eq!(imported.uuid, "3b2f7c1e-8a4d-4e6f-9b0a-1c2d3e4f5a6b");
 }
 
 /// Issue #141: a sidecar identifier that is not a UUID is another tool's (here a DAM asset
@@ -472,6 +478,573 @@ fn scan_ignores_a_non_uuid_sidecar_identifier_but_preserves_it() {
         .expect_err("a non-UUID identifier must not be adopted");
     assert!(err.to_string().contains("not a UUID"), "{err}");
     assert_eq!(rows(&catalog), first);
+}
+
+/// Issue #146: before #141 a scan adopted a non-UUID sidecar identifier as `photos.uuid`.
+/// #141 stopped matching on such values, so when that file moved, the next scan catalogued
+/// it again and left its tags and rating on a row nobody sees. Schema v23 re-mints those rows
+/// and keeps the old value as a legacy identifier; a moved file comes back to its row, the
+/// foreign value stays in the sidecar as a conflict, and a second file sharing it does not
+/// take the row over.
+#[test]
+fn a_row_holding_a_pre_141_non_uuid_identity_survives_its_file_moving() {
+    let (catalog, root) = temp_catalog("legacy-non-uuid-identity");
+    const DAM_ID: &str = "dam:asset/1";
+    let sidecar = format!(r#"<?xml version="1.0" encoding="UTF-8"?>
+<x:xmpmeta xmlns:x="adobe:ns:meta/">
+ <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+  <rdf:Description rdf:about="" xmlns:xmp="http://ns.adobe.com/xap/1.0/">
+   <xmp:Identifier>{DAM_ID}</xmp:Identifier>
+  </rdf:Description>
+ </rdf:RDF>
+</x:xmpmeta>"#);
+    let place = |f: &std::path::Path| {
+        std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+        std::fs::write(f, b"notarealjpeg").unwrap();
+        std::fs::write(chairphoto_core::xmp::sidecar_path(f), &sidecar).unwrap();
+    };
+    let original = root.join("a/x.jpg");
+    place(&original);
+    let abort = chairphoto_core::scanner::never_abort();
+    chairphoto_core::scanner::scan_folder(&catalog, &root, &abort, &|_| {}).unwrap();
+    let id = catalog.list_photos(&PhotoQuery::default()).unwrap()[0].id;
+    catalog.set_culling(id, Some(4), None, None).unwrap();
+    let tag = catalog.create_tag("Places/Harbour").unwrap();
+    catalog.assign_tag(id, tag).unwrap();
+
+    // Make it the catalog a pre-#141 scan left: the foreign value adopted as the identity,
+    // the copy counted as bound, and the catalog at schema v22.
+    catalog
+        .conn()
+        .execute_batch(&format!(
+            "UPDATE photos SET uuid = '{DAM_ID}' WHERE id = {id};
+             DELETE FROM pending_sidecar_identity;
+             UPDATE settings SET value = '22' WHERE key = 'schema_version';"
+        ))
+        .unwrap();
+    let db = catalog.db_path().to_path_buf();
+    drop(catalog);
+    let catalog = Catalog::open(&db, &root).unwrap();
+
+    let reminted = catalog.get_photo(id).unwrap().uuid;
+    assert!(chairphoto_core::catalog::is_photo_identity(&reminted), "{reminted}");
+    let queue = |catalog: &Catalog| -> Vec<(i64, String, String)> {
+        catalog
+            .list_pending_identity()
+            .unwrap()
+            .into_iter()
+            .map(|p| (p.photo_id, p.relative_path, p.state))
+            .collect()
+    };
+    assert_eq!(queue(&catalog), [(id, "a/x.jpg".to_string(), "conflict".to_string())]);
+    assert_eq!(chairphoto_core::xmp::read_identifier(&original).as_deref(), Some(DAM_ID),
+        "the migration writes no sidecar");
+
+    // The file moves, sidecar and all, and the folder is rescanned.
+    let moved = root.join("b/x.jpg");
+    std::fs::create_dir_all(moved.parent().unwrap()).unwrap();
+    std::fs::rename(&original, &moved).unwrap();
+    std::fs::rename(
+        chairphoto_core::xmp::sidecar_path(&original),
+        chairphoto_core::xmp::sidecar_path(&moved),
+    )
+    .unwrap();
+    chairphoto_core::scanner::scan_folder(&catalog, &root, &abort, &|_| {}).unwrap();
+
+    let visible = catalog.list_photos(&PhotoQuery::default()).unwrap();
+    assert_eq!(visible.len(), 1, "one row, not a duplicate: {visible:?}");
+    assert_eq!((visible[0].id, visible[0].path.as_str()), (id, "b/x.jpg"));
+    assert_eq!(visible[0].uuid, reminted);
+    assert_eq!(visible[0].rating, 4);
+    let tags: Vec<String> = catalog.get_photo_tags(id).unwrap().into_iter().map(|t| t.name).collect();
+    assert_eq!(tags, ["Harbour"]);
+    assert_eq!(chairphoto_core::xmp::read_identifier(&moved).as_deref(), Some(DAM_ID));
+    assert_eq!(queue(&catalog), [(id, "b/x.jpg".to_string(), "conflict".to_string())],
+        "the conflict follows the file; the path it left owes nothing");
+
+    // Another file carrying the same foreign id, while the row's own file is still there:
+    // it is a different photo and gets its own row, and the moved one keeps its own.
+    place(&root.join("c/y.jpg"));
+    chairphoto_core::scanner::scan_folder(&catalog, &root, &abort, &|_| {}).unwrap();
+    chairphoto_core::scanner::scan_folder(&catalog, &root, &abort, &|_| {}).unwrap();
+    let mut paths: Vec<(String, i64)> = catalog
+        .list_photos(&PhotoQuery::default())
+        .unwrap()
+        .into_iter()
+        .map(|p| (p.path, p.id))
+        .collect();
+    paths.sort();
+    assert_eq!(paths.len(), 2, "{paths:?}");
+    assert_eq!(paths[0], ("b/x.jpg".to_string(), id));
+    assert_eq!(paths[1].0, "c/y.jpg");
+}
+
+/// Issue #146 (L5): a UUID is one identity in either case. A sidecar spelling it upper-case
+/// is bound to the lowercase row, leads a moved file back to it, and is never rewritten;
+/// a new file's upper-case identity is stored lowercase; a deep link finds it either way.
+#[test]
+fn an_upper_case_sidecar_uuid_is_the_lowercase_rows_identity() {
+    let (catalog, root) = temp_catalog("uppercase-identity");
+    let abort = chairphoto_core::scanner::never_abort();
+    let original = root.join("a/x.jpg");
+    std::fs::create_dir_all(original.parent().unwrap()).unwrap();
+    std::fs::write(&original, b"notarealjpeg").unwrap();
+    chairphoto_core::scanner::scan_folder(&catalog, &root, &abort, &|_| {}).unwrap();
+    let row = catalog.list_photos(&PhotoQuery::default()).unwrap().remove(0);
+    let upper = row.uuid.to_ascii_uppercase();
+    assert_ne!(upper, row.uuid);
+    // Another tool rewrites the identity upper-case.
+    chairphoto_core::xmp::write_identifier(&original, &upper).unwrap();
+
+    // The file moves; the scan finds its row, binds it, and leaves the sidecar's spelling.
+    let moved = root.join("b/x.jpg");
+    std::fs::create_dir_all(moved.parent().unwrap()).unwrap();
+    std::fs::rename(&original, &moved).unwrap();
+    std::fs::rename(
+        chairphoto_core::xmp::sidecar_path(&original),
+        chairphoto_core::xmp::sidecar_path(&moved),
+    )
+    .unwrap();
+    chairphoto_core::scanner::scan_folder(&catalog, &root, &abort, &|_| {}).unwrap();
+    let visible = catalog.list_photos(&PhotoQuery::default()).unwrap();
+    assert_eq!(visible.len(), 1, "{visible:?}");
+    assert_eq!((visible[0].id, visible[0].path.as_str(), visible[0].uuid.as_str()),
+        (row.id, "b/x.jpg", row.uuid.as_str()));
+    assert!(catalog.list_pending_identity().unwrap().is_empty(), "an identity in another case is no conflict");
+    assert_eq!(chairphoto_core::xmp::read_identifier(&moved).as_deref(), Some(upper.as_str()));
+    assert_eq!(catalog.get_photo_by_uuid(&upper).unwrap().id, row.id);
+
+    // A file new to this catalog whose sidecar spells its identity upper-case.
+    const ARRIVING: &str = "6F1C1F0E-2B7A-4C3D-9E8F-0A1B2C3D4E5F";
+    let arriving = root.join("c/y.jpg");
+    std::fs::create_dir_all(arriving.parent().unwrap()).unwrap();
+    std::fs::write(&arriving, b"notarealjpeg").unwrap();
+    chairphoto_core::xmp::write_identifier(&arriving, ARRIVING).unwrap();
+    chairphoto_core::scanner::scan_folder(&catalog, &root, &abort, &|_| {}).unwrap();
+    let new_row = catalog.get_photo_by_uuid(&ARRIVING.to_ascii_lowercase()).unwrap();
+    assert_eq!(new_row.uuid, ARRIVING.to_ascii_lowercase());
+    assert!(catalog.list_pending_identity().unwrap().is_empty());
+    assert_eq!(chairphoto_core::xmp::read_identifier(&arriving).as_deref(), Some(ARRIVING));
+}
+
+/// Issue #146 (L5): schema v24 stores every identity lowercase. A row whose lowercase
+/// spelling another row already holds cannot take it; it is re-minted and its copy queued as
+/// a conflict for a person, like any copy whose sidecar carries another photo's identity.
+#[test]
+fn schema_v24_lowercases_identities_and_re_mints_a_collision() {
+    let (catalog, root) = temp_catalog("v24-lowercase");
+    let mut ids = Vec::new();
+    for name in ["a.jpg", "b.jpg", "c.jpg"] {
+        std::fs::write(root.join(name), b"notarealjpeg").unwrap();
+        ids.push(catalog.upsert_photo(&root.join(name), None, 1, 1).unwrap().id);
+    }
+    const SHARED: &str = "6f1c1f0e-2b7a-4c3d-9e8f-0a1b2c3d4e5f";
+    const ALONE: &str = "0d9c8b7a-6f5e-4d3c-8b2a-190807060504";
+    let shared_upper = SHARED.to_ascii_uppercase();
+    let alone_upper = ALONE.to_ascii_uppercase();
+    let set = |id: i64, uuid: &str| {
+        catalog
+            .conn()
+            .execute("UPDATE photos SET uuid = ?1 WHERE id = ?2", rusqlite::params![uuid, id])
+            .unwrap();
+    };
+    set(ids[0], SHARED);
+    set(ids[1], &shared_upper);
+    set(ids[2], &alone_upper);
+    catalog.set_setting("schema_version", "23").unwrap();
+    let db = catalog.db_path().to_path_buf();
+    drop(catalog);
+    let catalog = Catalog::open(&db, &root).unwrap();
+
+    let uuid = |id: i64| catalog.get_photo(id).unwrap().uuid;
+    assert_eq!(uuid(ids[0]), SHARED, "the row already lowercase keeps its identity");
+    assert_eq!(uuid(ids[2]), ALONE, "an upper-case identity nobody else holds is lowercased");
+    let reminted = uuid(ids[1]);
+    assert!(chairphoto_core::catalog::is_photo_identity(&reminted) && reminted != SHARED, "{reminted}");
+    let pending = catalog.list_pending_identity().unwrap();
+    assert_eq!(pending.len(), 1, "{pending:#?}");
+    assert_eq!((pending[0].photo_id, pending[0].state.as_str()), (ids[1], "conflict"));
+    assert!(pending[0].error.contains(&shared_upper), "{}", pending[0].error);
+}
+
+/// A catalog as a pre-#141 scan left it: each `(relative path, sidecar identifier)` file
+/// scanned, its row holding the identifier as `photos.uuid`, copies counted as bound, and the
+/// catalog stamped schema v22 — then reopened, which runs v23 and v24.
+fn legacy_catalog(tag: &str, files: &[(&str, &str)]) -> (Catalog, common::TestSubPath, Vec<i64>) {
+    let (catalog, root) = temp_catalog(tag);
+    for (rel, id) in files {
+        let f = root.join(rel);
+        std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+        std::fs::write(&f, b"notarealjpeg").unwrap();
+        std::fs::write(
+            chairphoto_core::xmp::sidecar_path(&f),
+            format!(r#"<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"><rdf:Description rdf:about="" xmlns:xmp="http://ns.adobe.com/xap/1.0/"><xmp:Identifier>{id}</xmp:Identifier></rdf:Description></rdf:RDF></x:xmpmeta>"#),
+        )
+        .unwrap();
+    }
+    let abort = chairphoto_core::scanner::never_abort();
+    chairphoto_core::scanner::scan_folder(&catalog, &root, &abort, &|_| {}).unwrap();
+    let mut ids = Vec::new();
+    for (rel, id) in files {
+        let photo: i64 = catalog
+            .conn()
+            .query_row("SELECT id FROM photos WHERE path = ?1", [rel], |r| r.get(0))
+            .unwrap();
+        catalog
+            .conn()
+            .execute("UPDATE photos SET uuid = ?1 WHERE id = ?2", rusqlite::params![id, photo])
+            .unwrap();
+        ids.push(photo);
+    }
+    catalog
+        .conn()
+        .execute_batch(
+            "DELETE FROM pending_sidecar_identity;
+             UPDATE settings SET value = '22' WHERE key = 'schema_version';",
+        )
+        .unwrap();
+    let db = catalog.db_path().to_path_buf();
+    drop(catalog);
+    (Catalog::open(&db, &root).unwrap(), root, ids)
+}
+
+/// #146 review F3: a legacy row whose original also has a backup copy in place. The original
+/// moves; the backup is the same row's copy, not another photo, so the scan still brings the
+/// moved file back to the row instead of cataloguing it again.
+#[test]
+fn a_backup_in_place_does_not_stop_a_moved_legacy_file_coming_home() {
+    let (catalog, root, ids) = legacy_catalog("legacy-backup-in-place", &[("a/x.jpg", "dam:asset/9")]);
+    let nas = root.parent().unwrap().join("nas");
+    std::fs::create_dir_all(nas.join("a")).unwrap();
+    std::fs::write(nas.join("a/x.jpg"), b"notarealjpeg").unwrap();
+    let volume = catalog.add_volume("NAS", &nas, VolumeKind::Backup).unwrap();
+    catalog.add_location(ids[0], volume, "a/x.jpg", LocationRole::Backup).unwrap();
+    catalog.set_culling(ids[0], Some(5), None, None).unwrap();
+
+    let moved = root.join("b/x.jpg");
+    std::fs::create_dir_all(moved.parent().unwrap()).unwrap();
+    std::fs::rename(root.join("a/x.jpg"), &moved).unwrap();
+    std::fs::rename(
+        chairphoto_core::xmp::sidecar_path(&root.join("a/x.jpg")),
+        chairphoto_core::xmp::sidecar_path(&moved),
+    )
+    .unwrap();
+    let abort = chairphoto_core::scanner::never_abort();
+    chairphoto_core::scanner::scan_folder(&catalog, &root, &abort, &|_| {}).unwrap();
+
+    let all: i64 = catalog.conn().query_row("SELECT count(*) FROM photos", [], |r| r.get(0)).unwrap();
+    assert_eq!(all, 1, "no second row for the moved file");
+    let photo = catalog.get_photo(ids[0]).unwrap();
+    assert_eq!((photo.path.as_str(), photo.rating), ("b/x.jpg", 5));
+}
+
+/// #146 review F8: the Obsidian module keys a photo's note record by its uuid. When v23
+/// re-mints a legacy row, or v24 lowercases one, the record moves with the photo, so the note
+/// is still found. A tag's note record is keyed by the tag and stays where it is.
+#[test]
+fn a_photos_note_record_follows_its_identity_through_v23_and_v24() {
+    let (catalog, root) = temp_catalog("note-record-rekey");
+    const UPPER: &str = "6F1C1F0E-2B7A-4C3D-9E8F-0A1B2C3D4E5F";
+    let mut ids = Vec::new();
+    for (name, uuid) in [("a.jpg", "dam:asset/1"), ("b.jpg", UPPER)] {
+        std::fs::write(root.join(name), b"notarealjpeg").unwrap();
+        let id = catalog.upsert_photo(&root.join(name), None, 1, 1).unwrap().id;
+        catalog
+            .conn()
+            .execute("UPDATE photos SET uuid = ?1 WHERE id = ?2", rusqlite::params![uuid, id])
+            .unwrap();
+        catalog.set_setting(&format!("obsidian.note.{uuid}"), &format!("record of {name}")).unwrap();
+        ids.push(id);
+    }
+    catalog.set_setting("obsidian.tagnote.dam:asset/1", "a tag's record").unwrap();
+    catalog.set_setting("schema_version", "22").unwrap();
+    let db = catalog.db_path().to_path_buf();
+    drop(catalog);
+    let catalog = Catalog::open(&db, &root).unwrap();
+
+    let a = catalog.get_photo(ids[0]).unwrap().uuid;
+    let b = catalog.get_photo(ids[1]).unwrap().uuid;
+    assert_eq!(b, UPPER.to_ascii_lowercase());
+    let note = |uuid: &str| catalog.get_setting(&format!("obsidian.note.{uuid}")).unwrap();
+    assert_eq!(note(&a).as_deref(), Some("record of a.jpg"));
+    assert_eq!(note(&b).as_deref(), Some("record of b.jpg"));
+    assert_eq!(note("dam:asset/1"), None);
+    assert_eq!(note(UPPER), None);
+    assert_eq!(
+        catalog.get_setting("obsidian.tagnote.dam:asset/1").unwrap().as_deref(),
+        Some("a tag's record")
+    );
+}
+
+/// #146 review N1: an offloaded legacy photo — its original deleted, its primary location
+/// rows dropped, a verified backup on the NAS — has no primary copy left to be "gone". A
+/// different file whose sidecar shares its DAM id (an export of it, say) must get its own
+/// row, not take the photo's over: the sizes differ, and an original never changes size.
+#[test]
+fn an_offloaded_legacy_photo_is_not_taken_over_by_another_file_with_its_dam_id() {
+    let (catalog, root, ids) = legacy_catalog("legacy-offloaded", &[("a/x.jpg", "dam:asset/5")]);
+    let nas = root.parent().unwrap().join("nas");
+    std::fs::create_dir_all(nas.join("a")).unwrap();
+    std::fs::write(nas.join("a/x.jpg"), b"notarealjpeg").unwrap();
+    let volume = catalog.add_volume("NAS", &nas, VolumeKind::Backup).unwrap();
+    catalog.add_location(ids[0], volume, "a/x.jpg", LocationRole::Backup).unwrap();
+    catalog.set_culling(ids[0], Some(5), None, None).unwrap();
+    // Offload, as commit_offload leaves it: the local file gone, the primary rows dropped.
+    std::fs::remove_file(root.join("a/x.jpg")).unwrap();
+    catalog
+        .conn()
+        .execute(
+            "DELETE FROM photo_locations WHERE photo_id = ?1 AND role = 'primary'",
+            [ids[0]],
+        )
+        .unwrap();
+
+    let export = root.join("exports/x-web.jpg");
+    std::fs::create_dir_all(export.parent().unwrap()).unwrap();
+    std::fs::write(&export, b"a quite different derived jpeg").unwrap();
+    std::fs::copy(
+        chairphoto_core::xmp::sidecar_path(&root.join("a/x.jpg")),
+        chairphoto_core::xmp::sidecar_path(&export),
+    )
+    .unwrap();
+    let abort = chairphoto_core::scanner::never_abort();
+    chairphoto_core::scanner::scan_folder(&catalog, &root, &abort, &|_| {}).unwrap();
+
+    let photo = catalog.get_photo(ids[0]).unwrap();
+    assert_eq!((photo.path.as_str(), photo.rating), ("a/x.jpg", 5), "the offloaded row is untouched");
+    let all: i64 = catalog.conn().query_row("SELECT count(*) FROM photos", [], |r| r.get(0)).unwrap();
+    assert_eq!(all, 2, "the export is another photo");
+
+    // The real original, restored by hand to another folder, still comes home: same size.
+    let restored = root.join("restored/x.jpg");
+    std::fs::create_dir_all(restored.parent().unwrap()).unwrap();
+    std::fs::copy(nas.join("a/x.jpg"), &restored).unwrap();
+    std::fs::copy(chairphoto_core::xmp::sidecar_path(&export), chairphoto_core::xmp::sidecar_path(&restored)).unwrap();
+    chairphoto_core::scanner::scan_folder(&catalog, &root, &abort, &|_| {}).unwrap();
+    assert_eq!(catalog.get_photo(ids[0]).unwrap().path, "restored/x.jpg");
+    let all: i64 = catalog.conn().query_row("SELECT count(*) FROM photos", [], |r| r.get(0)).unwrap();
+    assert_eq!(all, 2);
+}
+
+/// #146 review N4: an empty or blank uuid names no identity. Two bundles from different
+/// catalogs, each carrying a photo with one, keep separate rows (before, both mapped to
+/// v5("") and merged into one), neither row's identity is v5(""), and no lookup of a blank
+/// uuid finds anything. A blank-uuid photo at a path already catalogued is that photo.
+#[test]
+fn a_blank_uuid_is_no_identity_at_all() {
+    let (catalog, _root) = temp_catalog("blank-identity");
+    for (blank, rel) in [("", "a.jpg"), ("  ", "b.jpg")] {
+        let s = catalog.merge_bundle(&bare_bundle(&[(blank, rel)])).unwrap();
+        assert_eq!((s.photos_existing, s.photos_added), (0, 1), "{blank:?} at {rel}");
+    }
+    let rows = catalog.list_photos(&PhotoQuery::default()).unwrap();
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    for row in &rows {
+        assert!(chairphoto_core::catalog::is_photo_identity(&row.uuid), "{row:?}");
+        assert_ne!(row.uuid, chairphoto_core::catalog::legacy_photo_identity(""));
+    }
+    assert!(catalog.get_photo_by_uuid("").is_err());
+    assert!(catalog.get_photo_by_uuid("   ").is_err());
+    assert_eq!(catalog.count_existing_uuids(&["".to_string()]).unwrap(), 0);
+    let legacy: i64 = catalog
+        .conn()
+        .query_row("SELECT count(*) FROM photo_legacy_identifiers", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(legacy, 0, "a blank value is not a legacy identifier");
+
+    // Re-merging one of them finds it where it is, rather than a second row (or a UNIQUE error).
+    let s = catalog.merge_bundle(&bare_bundle(&[("", "a.jpg")])).unwrap();
+    assert_eq!((s.photos_existing, s.photos_added), (1, 0));
+    assert_eq!(catalog.list_photos(&PhotoQuery::default()).unwrap().len(), 2);
+}
+
+/// #146 review N6: when the bundle importer writes a sidecar identity itself, it writes the
+/// mapped identity, never an old bundle's raw non-UUID id. Two paths write one:
+/// - a copied original with no sidecar in the bundle gets a fresh sidecar;
+/// - a same-size file already at the destination, with no sidecar, is bound in place.
+/// Either way the sidecar ends up with the v5 the row has, and no conflict is queued.
+#[test]
+fn the_bundle_importer_writes_an_old_bundles_id_as_its_mapped_identity() {
+    let (catalog, root) = temp_catalog("import-writes-mapped-identity");
+    let source = root.parent().unwrap().join("bundle-source");
+    let mut manifest = bare_bundle(&[("dam:asset/1", "2020/01/01/x.jpg"), ("dam:asset/2", "2020/01/02/y.jpg")]);
+    manifest.format_version = chairphoto_core::bundle::BUNDLE_FORMAT_VERSION;
+    let mut originals = std::collections::HashMap::new();
+    for (uuid, name) in [("dam:asset/1", "x.jpg"), ("dam:asset/2", "y.jpg")] {
+        let f = source.join(name);
+        std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+        std::fs::write(&f, b"notarealjpeg").unwrap();
+        originals.insert(uuid.to_string(), Some(f));
+    }
+    let bundle = root.parent().unwrap().join("old.chairphoto");
+    chairphoto_core::bundle::writer::write_bundle(
+        &chairphoto_core::bundle::writer::GatheredBundle { manifest, originals },
+        &bundle,
+        |_, _| {},
+    )
+    .unwrap();
+    // y.jpg is already in the library, same size, with no sidecar: the copy is skipped and
+    // the importer binds the identity onto the file that is there.
+    let present = root.join("2020/01/02/y.jpg");
+    std::fs::create_dir_all(present.parent().unwrap()).unwrap();
+    std::fs::write(&present, b"notarealjpeg").unwrap();
+
+    let state = chairphoto_core::app::AppState::default();
+    *state.catalog.lock().unwrap() = Some(catalog);
+    chairphoto_core::app::bundles::import_bundle(&state, &bundle).unwrap();
+    let catalog = state.catalog.lock().unwrap().take().unwrap();
+
+    for (old, rel) in [("dam:asset/1", "2020/01/01/x.jpg"), ("dam:asset/2", "2020/01/02/y.jpg")] {
+        let mapped = chairphoto_core::catalog::legacy_photo_identity(old);
+        assert_eq!(
+            chairphoto_core::xmp::read_identifier(&root.join(rel)).as_deref(),
+            Some(mapped.as_str()),
+            "{rel}'s sidecar"
+        );
+        assert_eq!(catalog.get_photo_by_uuid(&mapped).unwrap().path, rel);
+    }
+    assert!(catalog.list_pending_identity().unwrap().is_empty(), "{:#?}", catalog.list_pending_identity());
+}
+
+/// A bundle of `photos`, each `(uuid, relative path)`, with nothing else in it.
+fn bare_bundle(photos: &[(&str, &str)]) -> chairphoto_core::bundle::BundleManifest {
+    let mut m = chairphoto_core::bundle::BundleManifest::new(
+        chairphoto_core::bundle::BundleBatch {
+            uuid: "5c0e9d2a-1b3f-4a6c-8d7e-9f0a1b2c3d4e".into(),
+            source_label: "laptop".into(),
+            note: String::new(),
+            created_at: 1,
+        },
+        2,
+    );
+    m.photos = photos
+        .iter()
+        .map(|(uuid, rel)| chairphoto_core::bundle::BundlePhoto {
+            uuid: (*uuid).into(),
+            relative_path: (*rel).into(),
+            rating: 0,
+            label: String::new(),
+            pick_state: PickState::None,
+            iptc: Default::default(),
+            edit_record: None,
+            versions: vec![],
+            tag_uuids: vec![],
+        })
+        .collect();
+    m
+}
+
+fn non_uuid_rows(catalog: &Catalog) -> Vec<String> {
+    catalog
+        .list_photos(&PhotoQuery::default())
+        .unwrap()
+        .into_iter()
+        .map(|p| p.uuid)
+        .filter(|u| !chairphoto_core::catalog::is_photo_identity(u))
+        .collect()
+}
+
+/// #146 review F1: two catalogs that each held one photo as `dam:asset/1` before #141 migrate
+/// independently, and must still agree on its identity — it is the merge key, and a bundle
+/// does not carry the legacy value. A bundle from one then merges onto the other's row,
+/// whatever path it gives the photo.
+#[test]
+fn two_catalogs_that_held_one_legacy_photo_agree_on_its_identity() {
+    let (a, _ra, ia) = legacy_catalog("legacy-merge-a", &[("x.jpg", "dam:asset/1")]);
+    let (b, _rb, ib) = legacy_catalog("legacy-merge-b", &[("x.jpg", "dam:asset/1")]);
+    let ua = a.get_photo(ia[0]).unwrap().uuid;
+    let ub = b.get_photo(ib[0]).unwrap().uuid;
+    assert_eq!(ua, ub, "independent migrations of one legacy photo must agree");
+    assert_eq!(ua, chairphoto_core::catalog::legacy_photo_identity("dam:asset/1"));
+    assert!(chairphoto_core::catalog::is_photo_identity(&ua), "{ua}");
+
+    for rel in ["x.jpg", "elsewhere/x.jpg"] {
+        let s = a.merge_bundle(&bare_bundle(&[(&ub, rel)])).unwrap();
+        assert_eq!((s.photos_existing, s.photos_added), (1, 0), "bundle from B at {rel}");
+    }
+    assert_eq!(a.list_photos(&PhotoQuery::default()).unwrap().len(), 1);
+}
+
+/// #146 review F2: a bundle written before #146 carries the photo's non-UUID id. It merges
+/// onto the row v23 re-minted (same path or not), and into a catalog that never had the
+/// photo it lands under the same identity v23 would have given it, with the legacy value
+/// recorded — never as a non-UUID `photos.uuid`.
+#[test]
+fn an_old_bundles_non_uuid_id_never_becomes_a_photos_uuid() {
+    let (a, _ra, ia) = legacy_catalog("legacy-old-bundle", &[("x.jpg", "dam:asset/1")]);
+    for rel in ["x.jpg", "y.jpg"] {
+        let s = a.merge_bundle(&bare_bundle(&[("dam:asset/1", rel)])).unwrap();
+        assert_eq!((s.photos_existing, s.photos_added), (1, 0), "old bundle at {rel}");
+    }
+    assert_eq!(a.list_photos(&PhotoQuery::default()).unwrap().len(), 1);
+    assert!(non_uuid_rows(&a).is_empty());
+    assert_eq!(a.get_photo(ia[0]).unwrap().uuid, chairphoto_core::catalog::legacy_photo_identity("dam:asset/1"));
+
+    let (fresh, _root) = temp_catalog("legacy-old-bundle-fresh");
+    let s = fresh.merge_bundle(&bare_bundle(&[("dam:asset/2", "z.jpg")])).unwrap();
+    assert_eq!((s.photos_existing, s.photos_added), (0, 1));
+    assert!(non_uuid_rows(&fresh).is_empty());
+    let landed = fresh.list_photos(&PhotoQuery::default()).unwrap().remove(0);
+    assert_eq!(landed.uuid, chairphoto_core::catalog::legacy_photo_identity("dam:asset/2"));
+    let legacy: String = fresh
+        .conn()
+        .query_row("SELECT identifier FROM photo_legacy_identifiers WHERE photo_id = ?1", [landed.id], |r| r.get(0))
+        .unwrap();
+    assert_eq!(legacy, "dam:asset/2");
+    assert_eq!(fresh.count_existing_uuids(&["dam:asset/2".to_string()]).unwrap(), 1,
+        "the import preview counts it as already present");
+}
+
+/// #146 (L5), review mutation gaps: the import preview's count and the in-place volume
+/// upsert canonicalise a UUID like every other entry point. An upper-case spelling counts as
+/// the photo the catalog already has, and a NAS copy carrying it is the same row.
+#[test]
+fn the_import_count_and_the_volume_upsert_see_an_upper_case_uuid_as_the_same_photo() {
+    let (catalog, root) = temp_catalog("uppercase-count-volume");
+    const KNOWN: &str = "6f1c1f0e-2b7a-4c3d-9e8f-0a1b2c3d4e5f";
+    let local = root.join("x.jpg");
+    std::fs::write(&local, b"notarealjpeg").unwrap();
+    let row = catalog.upsert_photo_with_identity(&local, None, 1, 1, Some(KNOWN)).unwrap();
+    assert_eq!(catalog.count_existing_uuids(&[KNOWN.to_ascii_uppercase()]).unwrap(), 1);
+
+    let nas = root.parent().unwrap().join("nas");
+    std::fs::create_dir_all(&nas).unwrap();
+    catalog.add_volume("NAS", &nas, VolumeKind::Backup).unwrap();
+    std::fs::write(nas.join("x.jpg"), b"notarealjpeg").unwrap();
+    let copy = catalog
+        .upsert_photo_on_volume(&nas.join("x.jpg"), 1, 1, Some(&KNOWN.to_ascii_uppercase()))
+        .unwrap();
+    assert_eq!((copy.id, copy.created), (row.id, false), "the NAS copy is the same photo");
+
+    const ARRIVING: &str = "0D9C8B7A-6F5E-4D3C-8B2A-190807060504";
+    std::fs::write(nas.join("y.jpg"), b"notarealjpeg").unwrap();
+    let new_row = catalog.upsert_photo_on_volume(&nas.join("y.jpg"), 1, 1, Some(ARRIVING)).unwrap();
+    assert!(new_row.created);
+    assert_eq!(catalog.get_photo(new_row.id).unwrap().uuid, ARRIVING.to_ascii_lowercase());
+}
+
+/// #146 review F2: the bundle importer falls back to the manifest id when the copied file's
+/// sidecar has none, through `upsert_photo_with_identity`. A non-UUID id there is mapped and
+/// recorded exactly as merge and v23 do.
+#[test]
+fn a_trusted_non_uuid_identity_is_stored_as_its_legacy_mapping() {
+    let (catalog, root) = temp_catalog("legacy-upsert");
+    let f = root.join("a/x.jpg");
+    std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+    std::fs::write(&f, b"notarealjpeg").unwrap();
+    let up = catalog.upsert_photo_with_identity(&f, None, 1, 1, Some("dam:asset/5")).unwrap();
+    assert!(up.created);
+    assert_eq!(up.uuid, chairphoto_core::catalog::legacy_photo_identity("dam:asset/5"));
+    assert_eq!(catalog.get_photo(up.id).unwrap().uuid, up.uuid);
+    let again = catalog
+        .upsert_photo_with_identity(&root.join("b/x.jpg"), None, 1, 1, Some("dam:asset/5"))
+        .unwrap();
+    assert_eq!((again.id, again.created), (up.id, false), "the same old id finds the same row");
+    let legacy: String = catalog
+        .conn()
+        .query_row("SELECT identifier FROM photo_legacy_identifiers WHERE photo_id = ?1", [up.id], |r| r.get(0))
+        .unwrap();
+    assert_eq!(legacy, "dam:asset/5");
 }
 
 #[test]

@@ -37,7 +37,8 @@ mod performance_harness;
 
 pub use facets::{Facet, SOFT_THRESHOLD_DEFAULT, SOFT_THRESHOLD_KEY};
 pub use identity::{
-    bind_sidecar_identity, is_photo_identity, IdentityConflictAction, IdentityConflictOutcome, IdentityRepairCursor,
+    bind_sidecar_identity, canonical_photo_identity, is_photo_identity, legacy_photo_identity,
+    photo_identity_for, IdentityConflictAction, LEGACY_IDENTITY_NAMESPACE, IdentityConflictOutcome, IdentityRepairCursor,
     IdentityRepairPlan, IdentityRepairSummary, PendingIdentity, PendingIdentityField,
     PendingIdentityRow, PendingIdentitySummary, SidecarIdentity,
 };
@@ -419,6 +420,18 @@ impl Catalog {
             // same filename stem). Future imports are paired by the scanner.
             let _ = self.pair_raw_jpeg_stacks();
         }
+        if prior_version < 23 {
+            // #146: before #141 a scan adopted a sidecar's non-UUID `xmp:Identifier` as
+            // `photos.uuid`. Give those rows a minted UUID and queue each copy's sidecar
+            // as the conflict it now is. Needs the locations (v2) and the queue's
+            // `dismissed_at` column, both established above.
+            self.remint_non_identity_photos()?;
+        }
+        if prior_version < 24 {
+            // #146 L5: an identity is stored lowercase. After v23, so every row it sees
+            // that is not a UUID has already been re-minted.
+            self.canonicalise_photo_identities()?;
+        }
         // Keep the catalog-root (local) volume pointing at the current root, so
         // re-rooting the catalog moves it too.
         self.sync_default_volume_root()?;
@@ -685,7 +698,12 @@ impl Catalog {
     /// adopts the sidecar UUID if one was supplied, else mints a fresh one.
     ///
     /// `sidecar_uuid` is trusted as an identity: a caller that read it from a sidecar passes
-    /// it only if [`is_photo_identity`] accepts it (#141).
+    /// it only if [`is_photo_identity`] accepts it (#141). A UUID is matched and stored in
+    /// its canonical lowercase spelling (#146), whatever case the sidecar wrote it in. A
+    /// trusted value that is not a UUID — an old bundle's manifest id — is the identity an
+    /// older catalog gave the photo, so it is matched and stored as its
+    /// [`legacy_photo_identity`] and recorded as the row's legacy identifier, as schema v23
+    /// does: `photos.uuid` never holds a non-UUID.
     pub fn upsert_photo_with_identity(
         &self,
         absolute_path: &Path,
@@ -693,6 +711,35 @@ impl Catalog {
         mtime_ns: i64,
         size: i64,
         sidecar_uuid: Option<&str>,
+    ) -> Result<UpsertResult> {
+        let source = IdentitySource::Trusted(sidecar_uuid);
+        self.upsert_photo_from(absolute_path, folder_id, mtime_ns, size, source)
+    }
+
+    /// [`Self::upsert_photo_with_identity`] for a scanned file whose sidecar's
+    /// `xmp:Identifier` holds `found`, read as [`Self::scan_identity`] reads it. That reading
+    /// can mean a legacy-identifier lookup and a stat of each recorded copy, so it is done
+    /// only when no row is at this path already — a rescan of an unchanged file pays nothing
+    /// for it (#146 review F7).
+    pub fn upsert_scanned_photo(
+        &self,
+        absolute_path: &Path,
+        folder_id: Option<i64>,
+        mtime_ns: i64,
+        size: i64,
+        found: Option<&str>,
+    ) -> Result<UpsertResult> {
+        let source = IdentitySource::Sidecar(found);
+        self.upsert_photo_from(absolute_path, folder_id, mtime_ns, size, source)
+    }
+
+    fn upsert_photo_from(
+        &self,
+        absolute_path: &Path,
+        folder_id: Option<i64>,
+        mtime_ns: i64,
+        size: i64,
+        source: IdentitySource<'_>,
     ) -> Result<UpsertResult> {
         let rel = self.to_relative(absolute_path)?;
         let extension = absolute_path
@@ -714,7 +761,13 @@ impl Catalog {
             .optional()?;
 
         // 2) Otherwise, if the file carries a UUID, an existing row with that UUID is the
-        //    same photo that has moved/re-rooted → re-home it (no duplicate).
+        //    same photo that has moved/re-rooted → re-home it (no duplicate). The identity is
+        //    only worked out when the path did not match.
+        let identity = match by_path {
+            Some(_) => None,
+            None => self.identity_from(&source, size)?,
+        };
+        let sidecar_uuid = identity.as_deref();
         let by_uuid: Option<i64> = match (by_path.is_some(), sidecar_uuid) {
             (false, Some(uuid)) => self
                 .conn
@@ -736,7 +789,9 @@ impl Catalog {
             )?;
             UpsertResult { id, uuid, created: false, unchanged }
         } else if let Some(id) = by_uuid {
-            // Re-home the moved file: point the existing row at the new path.
+            // Re-home the moved file: point the existing row at the new path. Debt queued
+            // for the path it left would name a file that is no longer there.
+            self.forget_identity_debt_left_behind(id, absolute_path)?;
             self.conn.execute(
                 "UPDATE photos SET path = ?1, folder_id = ?2, mtime_ns = ?3, size = ?4,
                     extension = ?5, missing = 0, updated_at = ?6 WHERE id = ?7",
@@ -770,6 +825,7 @@ impl Catalog {
 
         // Record where the bytes physically are, so the resolver can find them.
         self.set_primary_location(result.id, absolute_path)?;
+        self.record_legacy_identifier(result.id, source.trusted())?;
         Ok(result)
     }
 
@@ -781,13 +837,37 @@ impl Catalog {
     /// volume+path, then by sidecar UUID, else creates a new row (folder_id null — it's
     /// not under an indexed local folder). See `scanner::scan_external_folder`.
     ///
-    /// `sidecar_uuid` is trusted as an identity, as in [`Self::upsert_photo_with_identity`].
+    /// `sidecar_uuid` is trusted as an identity, and canonicalised (or mapped from a legacy
+    /// value), as in [`Self::upsert_photo_with_identity`].
     pub fn upsert_photo_on_volume(
         &self,
         absolute: &Path,
         mtime_ns: i64,
         size: i64,
         sidecar_uuid: Option<&str>,
+    ) -> Result<UpsertResult> {
+        self.upsert_photo_on_volume_from(absolute, mtime_ns, size, IdentitySource::Trusted(sidecar_uuid))
+    }
+
+    /// [`Self::upsert_photo_on_volume`] for a scanned file whose sidecar holds `found`; see
+    /// [`Self::upsert_scanned_photo`] for why the identity is read only after the location
+    /// misses.
+    pub fn upsert_scanned_photo_on_volume(
+        &self,
+        absolute: &Path,
+        mtime_ns: i64,
+        size: i64,
+        found: Option<&str>,
+    ) -> Result<UpsertResult> {
+        self.upsert_photo_on_volume_from(absolute, mtime_ns, size, IdentitySource::Sidecar(found))
+    }
+
+    fn upsert_photo_on_volume_from(
+        &self,
+        absolute: &Path,
+        mtime_ns: i64,
+        size: i64,
+        source: IdentitySource<'_>,
     ) -> Result<UpsertResult> {
         let (volume_id, rel) = self.volume_for_path(absolute)?;
         let extension = absolute
@@ -808,7 +888,13 @@ impl Catalog {
             )
             .optional()?;
 
-        // 2) Otherwise match the file's own UUID (same photo from another machine/path).
+        // 2) Otherwise match the file's own UUID (same photo from another machine/path),
+        //    worked out only now that the location did not match.
+        let identity = match by_loc {
+            Some(_) => None,
+            None => self.identity_from(&source, size)?,
+        };
+        let sidecar_uuid = identity.as_deref();
         let by_uuid: Option<(i64, String)> = match (&by_loc, sidecar_uuid) {
             (None, Some(uuid)) => self
                 .conn
@@ -856,7 +942,17 @@ impl Catalog {
 
         // Record the file's location on its (NAS) volume so the resolver finds it there.
         self.add_location(result.id, volume_id, &rel, LocationRole::Primary)?;
+        self.record_legacy_identifier(result.id, source.trusted())?;
         Ok(result)
+    }
+
+    /// The identity an upsert of a `size`-byte file matches and adopts, from where `source`
+    /// says it comes.
+    fn identity_from(&self, source: &IdentitySource<'_>, size: i64) -> Result<Option<String>> {
+        match *source {
+            IdentitySource::Trusted(value) => Ok(value.and_then(photo_identity_for)),
+            IdentitySource::Sidecar(found) => self.scan_identity(found, size),
+        }
     }
 
     pub fn get_photo(&self, photo_id: i64) -> Result<Photo> {
@@ -876,13 +972,16 @@ impl Catalog {
     /// One photo by its stable uuid — the chairphoto:// deep-link target.
     /// Served by `idx_photos_uuid`.
     pub fn get_photo_by_uuid(&self, uuid: &str) -> Result<Photo> {
+        let Some(identity) = photo_identity_for(uuid) else {
+            return Err(CatalogError::NotFound(format!("photo uuid {uuid:?}")));
+        };
         self.conn
             .query_row(
                 &format!(
                     "SELECT {cols} FROM photos WHERE uuid = ?1",
                     cols = query::photo_columns("photos")
                 ),
-                params![uuid],
+                params![identity],
                 row_to_photo,
             )
             .optional()?
@@ -897,6 +996,7 @@ impl Catalog {
             return Ok(0);
         }
         const CHUNK: usize = 999;
+        let uuids: Vec<String> = uuids.iter().filter_map(|u| photo_identity_for(u)).collect();
         let mut total: usize = 0;
         for chunk in uuids.chunks(CHUNK) {
             // Build the parameterised placeholder list: (?1,?2,…,?N).
@@ -2213,6 +2313,24 @@ fn has_column(conn: &Connection, table: &str, column: &str) -> Result<bool> {
         .query_map([], |r| r.get::<_, String>(1))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(columns.iter().any(|c| c == column))
+}
+
+/// Where an upsert's identity comes from.
+enum IdentitySource<'a> {
+    /// A value the caller trusts as an identity (a manifest id, a test's UUID): mapped
+    /// through [`photo_identity_for`], and recorded as a legacy identifier if it is not a UUID.
+    Trusted(Option<&'a str>),
+    /// What a scanned file's sidecar holds, read through [`Catalog::scan_identity`].
+    Sidecar(Option<&'a str>),
+}
+
+impl<'a> IdentitySource<'a> {
+    fn trusted(&self) -> Option<&'a str> {
+        match *self {
+            IdentitySource::Trusted(value) => value,
+            IdentitySource::Sidecar(_) => None,
+        }
+    }
 }
 
 fn now() -> i64 {

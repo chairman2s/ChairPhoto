@@ -5,7 +5,7 @@
 //!  2. Photo `path` is stored RELATIVE to the catalog root (see the
 //!     `catalog_root` setting), so a catalog can be remapped on import.
 
-pub const SCHEMA_VERSION: i64 = 22;
+pub const SCHEMA_VERSION: i64 = 24;
 
 pub const SCHEMA_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS settings (
@@ -513,4 +513,17 @@ CREATE INDEX IF NOT EXISTS idx_photos_sort_date ON photos(
     path COLLATE NOCASE,
     id
 );
+
+-- Schema v23 (#146). The identifier a photo held as `photos.uuid` before it was re-minted
+-- because it was not a UUID: a DAM asset id that a scan adopted from a sidecar before #141.
+-- That sidecar still carries it (it is somebody else's, so only a person may overwrite it),
+-- so it is the one link between the file and its row until the conflict is resolved: a scan
+-- re-homes a moved file onto the row holding its legacy identifier, but only when that is
+-- the only such row and every primary copy it records is gone (`Catalog::scan_identity`).
+-- Never a merge key and never written to a sidecar; one row per re-minted photo.
+CREATE TABLE IF NOT EXISTS photo_legacy_identifiers (
+    photo_id   INTEGER PRIMARY KEY REFERENCES photos(id) ON DELETE CASCADE,
+    identifier TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_photo_legacy_identifiers ON photo_legacy_identifiers(identifier);
 "#;

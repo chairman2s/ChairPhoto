@@ -180,6 +180,89 @@ pub fn is_photo_identity(value: &str) -> bool {
     value.len() == 36 && uuid::Uuid::parse_str(value).is_ok_and(|u| !u.is_nil())
 }
 
+/// `value` as `photos.uuid` holds it, when it is a photo identity: lowercase, as ChairPhoto
+/// mints it (#146 L5). [`is_photo_identity`] accepts either case, and another tool may
+/// upper-case a UUID it rewrites, so every place an identity enters the catalog or is looked
+/// up in it goes through here — otherwise one photo would read as two identities.
+pub fn canonical_photo_identity(value: &str) -> Option<String> {
+    is_photo_identity(value).then(|| value.to_ascii_lowercase())
+}
+
+/// The UUID v5 namespace under which a legacy, non-UUID identifier is turned into a photo
+/// identity (#146): `0a9b4715-6420-429d-b004-48a4fda6ddf9`, generated once for this purpose.
+///
+/// **Never change it.** Its whole point is that every catalog, on every machine and in every
+/// version, maps the same legacy value to the same UUID. Two catalogs that each held a photo
+/// as `dam:asset/1` before #141 re-mint it independently (schema v23) and must still agree on
+/// its identity, because identity is the merge key and a bundle does not carry the legacy
+/// value. A different namespace would split every such photo in two at the next merge.
+pub const LEGACY_IDENTITY_NAMESPACE: uuid::Uuid =
+    uuid::Uuid::from_u128(0x0a9b4715_6420_429d_b004_48a4fda6ddf9);
+
+/// The photo identity a legacy, non-UUID identifier `value` stands for: UUID v5 of `value`
+/// under [`LEGACY_IDENTITY_NAMESPACE`], in the canonical lowercase spelling.
+///
+/// The one exception to "a UUID v4 on first import" (AGENTS.md): a photo minted on import
+/// still gets a v4, but a value that already served as a photo's identity before #141 — in
+/// this catalog's rows or in an old bundle's manifest — is re-minted by this function, so
+/// that catalogs which never met agree on the result. Distinct values give distinct
+/// identities, so rows whose `photos.uuid` was `UNIQUE` stay distinct.
+pub fn legacy_photo_identity(value: &str) -> String {
+    uuid::Uuid::new_v5(&LEGACY_IDENTITY_NAMESPACE, value.as_bytes()).to_string()
+}
+
+/// The identity `value` names, for a caller handing the catalog an identity it trusts — a
+/// bundle manifest, a deep link, a merge: [`canonical_photo_identity`] when it is a UUID,
+/// otherwise the [`legacy_photo_identity`] an older catalog's non-UUID value now stands for.
+/// Never a non-UUID: no path through here can store one as `photos.uuid` (#146).
+///
+/// `None` for an empty or whitespace-only value (#146 review N4): that is no identity at all,
+/// not a legacy one. Mapping it to `v5("")` would make every such photo from every catalog
+/// the same photo. Schema v23 gives such a row a random v4 for the same reason.
+pub fn photo_identity_for(value: &str) -> Option<String> {
+    if is_blank_identity(value) {
+        return None;
+    }
+    Some(canonical_photo_identity(value).unwrap_or_else(|| legacy_photo_identity(value)))
+}
+
+/// True when `value` names no identity: empty, or whitespace only.
+fn is_blank_identity(value: &str) -> bool {
+    value.trim().is_empty()
+}
+
+/// Remember that `photo_id` once was `value`, when `value` is a legacy non-UUID identifier,
+/// so a scan can still lead a file whose sidecar carries it back to the row
+/// ([`Catalog::scan_identity`]). A photo keeps the first legacy value it was recorded with.
+pub(super) const RECORD_LEGACY_IDENTIFIER_SQL: &str =
+    "INSERT INTO photo_legacy_identifiers(photo_id, identifier) VALUES(?1, ?2)
+     ON CONFLICT(photo_id) DO NOTHING";
+
+/// Prefixes of `settings` keys that end in a photo's uuid, which a migration that changes the
+/// uuid must carry over ([`Catalog::carry_photo_keyed_settings`]). Only the Obsidian module's
+/// photo note record (`obsidian.note.<uuid>`, written by the React and GPUI modules alike)
+/// today; its tag notes are keyed by a tag's uuid, which no photo migration touches. Searched
+/// for `#146`: settings keys built from a photo's uuid in crates/, src-tauri/ and src/.
+const PHOTO_KEYED_SETTING_PREFIXES: &[&str] = &["obsidian.note."];
+
+// Per-thread count of legacy-identifier lookups, so a test can prove a rescan of a file
+// already at its path does none (#146 review F7). Thread-local: tests run in parallel threads.
+#[cfg(test)]
+thread_local! {
+    static LEGACY_LOOKUPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// True when `value` is a legacy identifier worth recording: not a UUID, not empty.
+pub(super) fn is_legacy_identifier(value: &str) -> bool {
+    !is_blank_identity(value) && !is_photo_identity(value)
+}
+
+/// True when a sidecar's `found` identifier is `uuid`, in either case. The sidecar is never
+/// rewritten just to change the case of an identity it already carries.
+fn carries_identity(found: &str, uuid: &str) -> bool {
+    found.eq_ignore_ascii_case(uuid)
+}
+
 /// Ensure the file's XMP sidecar carries `uuid`. Pure filesystem work — it touches no
 /// catalog and holds no lock, so it is safe to run on a blocking worker.
 ///
@@ -192,7 +275,7 @@ pub fn bind_sidecar_identity(
     found: Option<&str>,
 ) -> SidecarIdentity {
     match found {
-        Some(existing) if existing == uuid => SidecarIdentity::Bound,
+        Some(existing) if carries_identity(existing, uuid) => SidecarIdentity::Bound,
         Some(existing) => SidecarIdentity::Conflict(existing.to_string()),
         None => match crate::xmp::write_identifier(photo_path, uuid) {
             Ok(()) => SidecarIdentity::Bound,
@@ -1179,7 +1262,7 @@ impl Catalog {
                 )
             }));
         };
-        if found == catalog_uuid {
+        if carries_identity(&found, &catalog_uuid) {
             return Err(CatalogError::Validation(format!(
                 "{}'s sidecar already carries this photo's identity ({found}); the recorded \
                  conflict is stale — run a repair pass to clear it",
@@ -1193,19 +1276,19 @@ impl Catalog {
                 // A value that is not a UUID is another tool's identifier, not a photo
                 // identity (#141): adopting it would make `photos.uuid` something no merge,
                 // deep link or later scan treats as one.
-                if !is_photo_identity(&found) {
+                let Some(adopted) = canonical_photo_identity(&found) else {
                     return Err(CatalogError::Validation(format!(
                         "cannot adopt {found:?}: it is not a UUID, so it cannot be a photo's \
                          identity. Overwrite this copy's sidecar (it is backed up first), or \
                          Dismiss to leave it as it is"
                     )));
-                }
+                };
                 // Refuse BEFORE the write, naming the photo that already holds it. The
                 // `photos.uuid` UNIQUE constraint would also stop this, but only as an
                 // opaque SQL error where a stated precondition belongs (#32) — and
                 // "resolving one conflict manufactures another" is exactly the failure this
                 // check exists to prevent.
-                if let Some((other_id, other_path)) = self.photo_holding_uuid(&found, photo_id)? {
+                if let Some((other_id, other_path)) = self.photo_holding_uuid(&adopted, photo_id)? {
                     return Err(CatalogError::Validation(format!(
                         "cannot adopt {found}: photo {other_id} ({other_path}) already holds \
                          that identity, and no two photos may share one. Overwrite this \
@@ -1214,9 +1297,9 @@ impl Catalog {
                 }
                 self.conn.execute(
                     "UPDATE photos SET uuid = ?1, updated_at = ?2 WHERE id = ?3",
-                    params![found, now(), photo_id],
+                    params![adopted, now(), photo_id],
                 )?;
-                outcome.catalog_uuid = found.clone();
+                outcome.catalog_uuid = adopted.clone();
                 // This copy is bound by construction — its sidecar is where the identity
                 // came from.
                 self.record_sidecar_field_target(
@@ -1228,7 +1311,7 @@ impl Catalog {
                 )?;
                 outcome.rechecked_copies = self.recheck_other_copies_after_adopt(
                     photo_id,
-                    &found,
+                    &adopted,
                     volume_id,
                     relative_path,
                 )?;
@@ -1332,7 +1415,7 @@ impl Catalog {
             }
             let target = Path::new(&base_path).join(&relative_path);
             let outcome = match crate::xmp::read_identifier(&target) {
-                Some(found) if found == uuid => SidecarIdentity::Bound,
+                Some(found) if carries_identity(&found, uuid) => SidecarIdentity::Bound,
                 Some(found) => SidecarIdentity::Conflict(found),
                 None if !target.exists() => SidecarIdentity::Unreachable,
                 None => continue,
@@ -1414,6 +1497,250 @@ impl Catalog {
     /// same steps under a job's abort flag (see [`Catalog::run_identity_repair`]).
     pub fn repair_pending_identity(&self) -> Result<IdentityRepairSummary> {
         self.run_identity_repair(&AtomicBool::new(false), |_| {})
+    }
+
+    /// What a scan may match or adopt as the identity of a file whose sidecar's
+    /// `xmp:Identifier` holds `found`, or `None` to match by path alone and mint if new.
+    ///
+    /// A UUID is the identity (#141). Anything else is another tool's identifier and is
+    /// never adopted, with one exception (#146): the identifier a row held before schema v23
+    /// re-minted it ([`Self::remint_non_identity_photos`]). Its sidecar still carries that
+    /// value — overwriting it is a person's decision — so it is the only link from the file
+    /// back to its row, and without it a moved file would be catalogued a second time and
+    /// its tags, ratings and faces left on a row nobody sees. It answers the row's minted
+    /// UUID only when exactly one row holds that legacy identifier and every primary copy
+    /// that row records is gone ([`Self::every_primary_copy_is_gone`]): two files sharing a DAM id must not
+    /// take turns owning one row (#141), and an unmounted volume is not a moved file.
+    ///
+    /// The scanned file's `size` must also be the row's (#146 review N1). An offloaded photo
+    /// has no primary copy left to be "gone", so without it any file carrying the same DAM id
+    /// — an export, a derivative — would take the row over. Originals are never modified, so
+    /// a moved or restored original keeps its size, and a different file almost never has it.
+    ///
+    /// The caller still binds with the raw `found`, so the foreign value stays in the
+    /// sidecar and is reported as a conflict.
+    pub fn scan_identity(&self, found: Option<&str>, size: i64) -> Result<Option<String>> {
+        let Some(found) = found.filter(|v| !is_blank_identity(v)) else {
+            return Ok(None);
+        };
+        if let Some(identity) = canonical_photo_identity(found) {
+            return Ok(Some(identity));
+        }
+        #[cfg(test)]
+        LEGACY_LOOKUPS.with(|n| n.set(n.get() + 1));
+        let owners: Vec<(i64, String, i64)> = self
+            .conn
+            .prepare_cached(
+                "SELECT l.photo_id, p.uuid, p.size
+                 FROM photo_legacy_identifiers l JOIN photos p ON p.id = l.photo_id
+                 WHERE l.identifier = ?1
+                 LIMIT 2",
+            )?
+            .query_map(params![found], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        match owners.as_slice() {
+            [(photo_id, uuid, row_size)]
+                if *row_size == size && self.every_primary_copy_is_gone(*photo_id)? =>
+            {
+                Ok(Some(uuid.clone()))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// True when every primary copy the catalog records for `photo_id` — each primary
+    /// location, and the catalog-root path — sits on storage that is present and no longer
+    /// holds the file. A copy on an absent volume (an unmounted NAS) may still be there, so
+    /// it is not gone.
+    ///
+    /// Only primary copies count (#146 review F3). A backup, local cache or export copy is
+    /// another recorded location of this very row, so its presence says nothing about which
+    /// row a moved original belongs to — and since new photos get a backup enqueued, insisting
+    /// on it would leave the legacy re-home dead for most real libraries.
+    fn every_primary_copy_is_gone(&self, photo_id: i64) -> Result<bool> {
+        let mut copies: Vec<(PathBuf, PathBuf)> = self
+            .conn
+            .prepare(
+                "SELECT v.base_path, l.relative_path
+                 FROM photo_locations l JOIN volumes v ON v.id = l.volume_id
+                 WHERE l.photo_id = ?1 AND l.role = 'primary'",
+            )?
+            .query_map(params![photo_id], |r| {
+                let base = PathBuf::from(r.get::<_, String>(0)?);
+                let relative: String = r.get(1)?;
+                Ok((base.clone(), base.join(relative)))
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        let logical = self.get_photo(photo_id)?.path;
+        copies.push((self.root().to_path_buf(), self.to_absolute(&logical)));
+        Ok(copies.iter().all(|(base, file)| base.is_dir() && !file.exists()))
+    }
+
+    /// Schema v23 (#146): give every row whose `photos.uuid` is not a photo identity the
+    /// [`legacy_photo_identity`] of that value — a UUID v5, so that every catalog that held
+    /// the photo under the same value agrees on its new identity. Returns how many rows were
+    /// re-minted.
+    ///
+    /// Before #141 a scan adopted a sidecar's `xmp:Identifier` verbatim, so a DAM asset id
+    /// could become `photos.uuid`. #141 stopped matching on such values, and that left those
+    /// rows unreachable by identity: a moved file was catalogued again beside them. Each one
+    /// now gets a UUID, and keeps its previous value in `photo_legacy_identifiers` for
+    /// [`Self::scan_identity`]. Merge and bundle import map an old bundle's non-UUID ids
+    /// through the same function ([`photo_identity_for`]), so they find these rows.
+    ///
+    /// No sidecar is touched here. Each recorded copy is queued as the conflict it now is —
+    /// its sidecar carries the old value, adopted from it in the first place — so the debt
+    /// panel shows it at once, and Overwrite (after a backup) or Dismiss settles it, as for
+    /// any non-UUID identifier (docs/storage-and-import.md § Resolving a conflict). Adopt
+    /// refuses it. The repair pass and each decision re-read the file, so a copy that never
+    /// carried the value is reported as whatever it really is the first time either runs.
+    pub(super) fn remint_non_identity_photos(&self) -> Result<usize> {
+        let stale: Vec<(i64, String)> = self
+            .conn
+            .prepare("SELECT id, uuid FROM photos")?
+            .query_map([], |r| Ok((r.get(0)?, r.get::<_, String>(1)?)))?
+            .filter(|row| !matches!(row, Ok((_, uuid)) if is_photo_identity(uuid)))
+            .collect::<rusqlite::Result<_>>()?;
+        for (photo_id, previous) in &stale {
+            // An empty (or blank) value was never in any sidecar: such a copy owes the write,
+            // which the repair pass does for a copy queued as not yet bound. It has no
+            // legacy value for another catalog to agree on, so it gets an ordinary v4.
+            if is_blank_identity(previous) {
+                let fresh = uuid::Uuid::new_v4().to_string();
+                self.remint_photo(*photo_id, previous, &fresh, &SidecarIdentity::Unreachable)?;
+                continue;
+            }
+            // The same value maps to the same identity in every catalog (F1 of the #146
+            // review). If another row already holds it — a bundle from a migrated catalog
+            // merged in before this one migrated — the two rows claim one photo and this
+            // migration cannot tell which is right: keep them apart with a v4 and let the
+            // queued conflict bring it to a person.
+            let mut identity = legacy_photo_identity(previous);
+            if self.photo_holding_uuid(&identity, *photo_id)?.is_some() {
+                identity = uuid::Uuid::new_v4().to_string();
+            }
+            self.conn
+                .prepare_cached(RECORD_LEGACY_IDENTIFIER_SQL)?
+                .execute(params![photo_id, previous])?;
+            self.remint_photo(*photo_id, previous, &identity, &SidecarIdentity::Conflict(previous.clone()))?;
+        }
+        Ok(stale.len())
+    }
+
+    /// Record `trusted` as `photo_id`'s legacy identifier when it is one (not a UUID, not
+    /// empty); see [`RECORD_LEGACY_IDENTIFIER_SQL`].
+    pub(super) fn record_legacy_identifier(&self, photo_id: i64, trusted: Option<&str>) -> Result<()> {
+        if let Some(value) = trusted.filter(|v| is_legacy_identifier(v)) {
+            self.conn
+                .prepare_cached(RECORD_LEGACY_IDENTIFIER_SQL)?
+                .execute(params![photo_id, value])?;
+        }
+        Ok(())
+    }
+
+    /// Schema v24 (#146 L5): store every photo identity in its canonical lowercase spelling.
+    /// Returns how many rows changed.
+    ///
+    /// [`is_photo_identity`] accepts an upper-case UUID and a scan used to store it as the
+    /// sidecar spelled it, while every lookup — the scan's re-home, merge, deep links —
+    /// compares exactly. A sidecar that keeps the upper-case spelling stays bound: binding
+    /// compares without case.
+    ///
+    /// If the lowercase spelling is already another row's identity, the two rows claim one
+    /// identity and `photos.uuid` is `UNIQUE`. Which of them is that photo is not something
+    /// a migration can know, so the upper-case row is re-minted and its copies queued as a
+    /// conflict for a person, as [`Self::remint_non_identity_photos`] does.
+    pub(super) fn canonicalise_photo_identities(&self) -> Result<usize> {
+        let spelled: Vec<(i64, String)> = self
+            .conn
+            .prepare("SELECT id, uuid FROM photos WHERE uuid <> lower(uuid)")?
+            .query_map([], |r| Ok((r.get(0)?, r.get::<_, String>(1)?)))?
+            .filter(|row| !matches!(row, Ok((_, uuid)) if !is_photo_identity(uuid)))
+            .collect::<rusqlite::Result<_>>()?;
+        for (photo_id, spelling) in &spelled {
+            let canonical = spelling.to_ascii_lowercase();
+            if self.photo_holding_uuid(&canonical, *photo_id)?.is_some() {
+                let fresh = uuid::Uuid::new_v4().to_string();
+                self.remint_photo(*photo_id, spelling, &fresh, &SidecarIdentity::Conflict(spelling.clone()))?;
+            } else {
+                self.conn.execute(
+                    "UPDATE photos SET uuid = ?1, updated_at = ?2 WHERE id = ?3",
+                    params![canonical, now(), photo_id],
+                )?;
+                self.carry_photo_keyed_settings(spelling, &canonical)?;
+            }
+        }
+        Ok(spelled.len())
+    }
+
+    /// Give `photo_id`, which held `previous`, the identity `uuid`, carry its uuid-keyed
+    /// settings over, and record `outcome` for every copy it records, through the queue's one
+    /// writer. Touches no file.
+    fn remint_photo(
+        &self,
+        photo_id: i64,
+        previous: &str,
+        uuid: &str,
+        outcome: &SidecarIdentity,
+    ) -> Result<()> {
+        self.conn
+            .prepare_cached("UPDATE photos SET uuid = ?1, updated_at = ?2 WHERE id = ?3")?
+            .execute(params![uuid, now(), photo_id])?;
+        self.carry_photo_keyed_settings(previous, uuid)?;
+        let copies: Vec<(i64, String)> = self
+            .conn
+            .prepare_cached("SELECT volume_id, relative_path FROM photo_locations WHERE photo_id = ?1")?
+            .query_map(params![photo_id], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        for (volume_id, relative_path) in copies {
+            self.record_sidecar_field_target(
+                photo_id,
+                SidecarField::Identifier,
+                volume_id,
+                &relative_path,
+                outcome,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Move the settings keyed by a photo's uuid from `previous` to `uuid`, when a migration
+    /// changes the photo's identity (#146 review F8). Runs inside the migration's transaction.
+    ///
+    /// Without it, a module record a photo had — today only the Obsidian module's note record,
+    /// `obsidian.note.<photo uuid>` — would no longer be found, and "create note" would make a
+    /// second note for a photo that has one. A record already at the new key is kept, and the
+    /// old one is left where it is rather than overwriting it.
+    fn carry_photo_keyed_settings(&self, previous: &str, uuid: &str) -> Result<()> {
+        if previous == uuid {
+            return Ok(());
+        }
+        for prefix in PHOTO_KEYED_SETTING_PREFIXES {
+            self.conn
+                .prepare_cached("UPDATE OR IGNORE settings SET key = ?1 || ?3 WHERE key = ?1 || ?2")?
+                .execute(params![prefix, previous, uuid])?;
+        }
+        Ok(())
+    }
+
+    /// Drop the sidecar debt recorded for the primary copy a re-homed photo is leaving:
+    /// `new_location` is where the file is now, and a queue row for the path it moved from
+    /// names a file that is no longer there, so it could only ever report it unreachable.
+    /// The debt the new path owes is recorded by the caller's binding, as for any scan.
+    pub(super) fn forget_identity_debt_left_behind(
+        &self,
+        photo_id: i64,
+        new_location: &Path,
+    ) -> Result<()> {
+        let (volume_id, relative_path) = self.volume_for_path(new_location)?;
+        self.conn.execute(
+            "DELETE FROM pending_sidecar_identity
+             WHERE photo_id = ?1 AND volume_id = ?2 AND relative_path <> ?3
+               AND relative_path IN (SELECT relative_path FROM photo_locations
+                                     WHERE photo_id = ?1 AND volume_id = ?2 AND role = 'primary')",
+            params![photo_id, volume_id, relative_path],
+        )?;
+        Ok(())
     }
 }
 
@@ -3036,5 +3363,181 @@ mod tests {
             "asking for dismissed copies must show exactly the two disjoint groups"
         );
         assert!(all.iter().any(|p| p.photo_id == dismissed_id));
+    }
+
+    /// #146: a legacy identifier leads a scan back to its row only when that row is the
+    /// only one holding it and every primary copy it records is gone — not while one is
+    /// still in place, and not while one sits on a volume that is not there to look at. A
+    /// backup still in place does not hold it back (review F3): it is the same row's copy.
+    #[test]
+    fn a_legacy_identifier_matches_only_a_row_whose_every_primary_copy_is_gone() {
+        let (catalog, root, dir) = temp_catalog("legacy-identifier-match");
+        let (id, path) = seed_photo(&catalog, &root, "x.jpg");
+        let backup = dir.path().join("backup");
+        std::fs::create_dir_all(&backup).unwrap();
+        std::fs::write(backup.join("x.jpg"), b"raw-bytes").unwrap();
+        let backup_volume = catalog
+            .add_volume("Backup", &backup, crate::catalog::VolumeKind::Backup)
+            .unwrap();
+        catalog
+            .add_location(id, backup_volume, "x.jpg", crate::catalog::LocationRole::Backup)
+            .unwrap();
+        // A second photo whose primary copy lives on a NAS volume.
+        let (on_nas, nas_local) = seed_photo(&catalog, &root, "z.jpg");
+        std::fs::remove_file(&nas_local).unwrap();
+        let nas = dir.path().join("nas");
+        std::fs::create_dir_all(&nas).unwrap();
+        let nas_volume = catalog
+            .add_volume("NAS", &nas, crate::catalog::VolumeKind::Local)
+            .unwrap();
+        catalog
+            .add_location(on_nas, nas_volume, "z.jpg", crate::catalog::LocationRole::Primary)
+            .unwrap();
+        std::fs::write(nas.join("z.jpg"), b"raw-bytes").unwrap();
+        catalog
+            .conn()
+            .execute_batch(&format!(
+                "UPDATE photos SET uuid = 'dam:1' WHERE id = {id};
+                 UPDATE photos SET uuid = 'dam:3' WHERE id = {on_nas};"
+            ))
+            .unwrap();
+        assert_eq!(catalog.remint_non_identity_photos().unwrap(), 2);
+        let uuid = photo_uuid(&catalog, id);
+        assert!(is_photo_identity(&uuid), "{uuid}");
+
+        assert_eq!(catalog.scan_identity(Some("dam:1"), 9).unwrap(), None, "its file is still there");
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(catalog.scan_identity(Some("dam:1"), 10).unwrap(), None,
+            "a file of another size is not the original, whatever DAM id it carries (N1)");
+        assert_eq!(catalog.scan_identity(Some("dam:1"), 9).unwrap(), Some(uuid.clone()),
+            "the backup still in place is this row's own copy, not another photo");
+
+        let nas_uuid = photo_uuid(&catalog, on_nas);
+        assert_eq!(catalog.scan_identity(Some("dam:3"), 9).unwrap(), None, "its NAS file is there");
+        std::fs::remove_dir_all(&nas).unwrap();
+        assert_eq!(catalog.scan_identity(Some("dam:3"), 9).unwrap(), None,
+            "the primary copy may still exist on the volume that is not mounted");
+        std::fs::create_dir_all(&nas).unwrap();
+        assert_eq!(catalog.scan_identity(Some("dam:3"), 9).unwrap(), Some(nas_uuid));
+
+        assert_eq!(catalog.scan_identity(Some(&uuid), 9).unwrap(), Some(uuid.clone()));
+        assert_eq!(
+            catalog.scan_identity(Some(&uuid.to_ascii_uppercase()), 9).unwrap(),
+            Some(uuid.clone()),
+            "a UUID is answered in its canonical lowercase spelling (#146)"
+        );
+        assert_eq!(catalog.scan_identity(Some("dam:2"), 9).unwrap(), None);
+        assert_eq!(catalog.scan_identity(None, 9).unwrap(), None);
+
+        // Two rows holding the same legacy value: the file could be either, so neither.
+        let (other, other_path) = seed_photo(&catalog, &root, "y.jpg");
+        std::fs::remove_file(&other_path).unwrap();
+        catalog
+            .conn()
+            .execute(
+                "INSERT INTO photo_legacy_identifiers(photo_id, identifier) VALUES(?1, 'dam:1')",
+                params![other],
+            )
+            .unwrap();
+        assert_eq!(catalog.scan_identity(Some("dam:1"), 9).unwrap(), None);
+    }
+
+    /// #146 (L5): Adopt stores the sidecar's identity lowercase, and the conflict it
+    /// resolved — and a copy carrying the same identity upper-case — are bound.
+    #[test]
+    fn adopt_stores_an_upper_case_identity_lowercase() {
+        let (catalog, root, _dir) = temp_catalog("adopt-uppercase");
+        const FOREIGN: &str = "6F1C1F0E-2B7A-4C3D-9E8F-0A1B2C3D4E5F";
+        let (id, path, _) = seed_conflicted_copy(&catalog, &root, "x.arw", FOREIGN);
+        let (volume_id, relative_path) = copy_of(&catalog, &path);
+        let outcome = catalog
+            .resolve_identity_conflict(id, volume_id, &relative_path, IdentityConflictAction::Adopt)
+            .unwrap();
+        let canonical = FOREIGN.to_ascii_lowercase();
+        assert_eq!(outcome.catalog_uuid, canonical);
+        assert_eq!(outcome.previous_sidecar_uuid, FOREIGN);
+        assert_eq!(photo_uuid(&catalog, id), canonical);
+        assert_eq!(queue_row(&catalog, id, &path), None);
+        assert_eq!(crate::xmp::read_identifier(&path).as_deref(), Some(FOREIGN), "Adopt never writes");
+        assert_eq!(bind_sidecar_identity(&path, &canonical, Some(FOREIGN)), SidecarIdentity::Bound);
+    }
+
+    /// #146 review F1: v23 maps a legacy value to its v5 identity, unless another row
+    /// already holds that identity (a migrated catalog's bundle merged in first). Then the
+    /// two rows claim one photo, so this one gets a v4 rather than failing the migration on
+    /// `photos.uuid`'s UNIQUE, and its copy is queued as a conflict for a person.
+    #[test]
+    fn v23_keeps_a_row_apart_when_its_legacy_identity_is_already_held() {
+        let (catalog, root, _dir) = temp_catalog("legacy-identity-held");
+        let (held, _) = seed_photo(&catalog, &root, "held.jpg");
+        let (legacy, path) = seed_photo(&catalog, &root, "legacy.jpg");
+        let mapped = legacy_photo_identity("dam:9");
+        catalog
+            .conn()
+            .execute_batch(&format!(
+                "UPDATE photos SET uuid = '{mapped}' WHERE id = {held};
+                 UPDATE photos SET uuid = 'dam:9' WHERE id = {legacy};"
+            ))
+            .unwrap();
+        assert_eq!(catalog.remint_non_identity_photos().unwrap(), 1);
+        assert_eq!(photo_uuid(&catalog, held), mapped);
+        let reminted = photo_uuid(&catalog, legacy);
+        assert!(is_photo_identity(&reminted) && reminted != mapped, "{reminted}");
+        assert!(queue_row(&catalog, legacy, &path).is_some_and(|(_, e, _)| e.contains("dam:9")));
+    }
+
+    /// #146 review F7: a scan works out a legacy identifier only when the path did not
+    /// match. A rescan of a legacy file still at its path pays no lookup and no stats.
+    #[test]
+    fn a_rescan_at_the_same_path_does_not_look_up_a_legacy_identifier() {
+        let (catalog, root, _dir) = temp_catalog("legacy-lookup-after-path");
+        let (id, path) = seed_photo(&catalog, &root, "x.jpg");
+        catalog
+            .conn()
+            .execute("UPDATE photos SET uuid = 'dam:1' WHERE id = ?1", params![id])
+            .unwrap();
+        catalog.remint_non_identity_photos().unwrap();
+        let lookups = || LEGACY_LOOKUPS.with(|n| n.get());
+
+        let before = lookups();
+        let again = catalog.upsert_scanned_photo(&path, None, 1, 9, Some("dam:1")).unwrap();
+        assert_eq!((again.id, again.created), (id, false));
+        assert_eq!(lookups(), before, "matched by path: no legacy lookup");
+        let on_volume = catalog.upsert_scanned_photo_on_volume(&path, 1, 9, Some("dam:1")).unwrap();
+        assert_eq!((on_volume.id, on_volume.created), (id, false));
+        assert_eq!(lookups(), before, "matched by location: no legacy lookup");
+
+        let elsewhere = root.join("y.jpg");
+        std::fs::write(&elsewhere, b"raw-bytes").unwrap();
+        let other = catalog.upsert_scanned_photo(&elsewhere, None, 1, 9, Some("dam:1")).unwrap();
+        assert!(other.created, "x.jpg is still there, so y.jpg is another photo");
+        assert_eq!(lookups(), before + 1, "a path miss does look it up");
+    }
+
+    /// #146 review N4: v23 agrees with merge that a blank `photos.uuid` names no identity. It
+    /// gets a random v4 — never `legacy_photo_identity` of whitespace, which every catalog
+    /// would share — and no legacy identifier is recorded for it.
+    #[test]
+    fn v23_gives_a_blank_identity_a_v4_and_no_legacy_record() {
+        let (catalog, root, _dir) = temp_catalog("blank-identity-v23");
+        let (id, _) = seed_photo(&catalog, &root, "x.jpg");
+        catalog
+            .conn()
+            .execute("UPDATE photos SET uuid = '  ' WHERE id = ?1", params![id])
+            .unwrap();
+        assert_eq!(catalog.remint_non_identity_photos().unwrap(), 1);
+        let uuid = photo_uuid(&catalog, id);
+        assert!(is_photo_identity(&uuid), "{uuid}");
+        assert_ne!(uuid, legacy_photo_identity("  "));
+        let legacy: i64 = catalog
+            .conn()
+            .query_row("SELECT count(*) FROM photo_legacy_identifiers", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(legacy, 0);
+
+        // A scanned sidecar with a blank identifier is no identity either: no lookup at all.
+        let before = LEGACY_LOOKUPS.with(|n| n.get());
+        assert_eq!(catalog.scan_identity(Some("  "), 9).unwrap(), None);
+        assert_eq!(LEGACY_LOOKUPS.with(|n| n.get()), before);
     }
 }

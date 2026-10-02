@@ -68,6 +68,29 @@ the identifier it has, and the divergence stays visible for a human rather than 
 resolved by clobbering somebody else's identity. A sidecar failure never aborts a
 scan: one unwritable file must not cost the user the other 99,999 rows.
 
+### How a sidecar is written, and when it is refused
+
+Every sidecar write (`xmp::document::SidecarDocument`, issue #149) reads the file, changes
+only what that writer owns, and replaces the whole file at once: a temp file in the same
+folder (a dotfile ending `.chairphoto-tmp`, unique to that write), synced, then renamed over
+the sidecar. A reader, another tool or a crash sees the old sidecar or the new one, never a
+mix. Writers of one sidecar in one process take turns, and an IPTC save and a geocode fill
+store and write in one order. A write is **refused, leaving the sidecar as it was**, when:
+
+- the original or its folder is missing — an unmounted volume; no folder is ever created;
+- the sidecar exists but this process may not write it (permissions, ownership, ACL);
+- **the folder is not writable**, even if the sidecar itself is (a share that grants
+  modify but not create, a mount ACL). The rename needs a new file in the folder, and
+  ChairPhoto keeps failing safe here rather than falling back to a non-atomic in-place
+  write (decided in the #149 review, F3).
+
+A refused write stays as debt, not as a silent success. An identity or import-batch field
+lands in `pending_sidecar_identity` and the repair pass retries it once the folder is
+writable. An IPTC save or a single-photo geocode returns the error, and geocode-all does not
+count that photo as filled. If the catalog was already stored, it then holds IPTC the
+sidecar lacks: that is not retried yet (AGENTS.md, "XMP safety").
+Face-region and GPS writes log the failure, and the catalog stays authoritative.
+
 ### The repair pass is a job
 
 The queue reached 74,488 rows on the 100k harness shape, and every row is a sidecar parse

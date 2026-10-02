@@ -210,6 +210,12 @@ impl SidecarDocument {
     /// a write cannot land on the disk under an empty mount point). The original is checked
     /// at open and again just before the temp file is created; a removal in between those
     /// two system calls is not caught.
+    ///
+    /// A sidecar in a folder this process cannot create files in is refused too, even when
+    /// the sidecar itself is writable: the temp file cannot be made, and there is no fallback
+    /// to a non-atomic in-place write (decided in the #149 review, F3). The write stays as
+    /// debt with the caller — a pending identity field, an IPTC save's error — and the sidecar
+    /// stays as it was (docs/storage-and-import.md, "How a sidecar is written").
     pub(super) fn commit(mut self) -> Result<(), String> {
         let stamp = plain("chairphoto", NS_CHAIRPHOTO, "LastWrite", &now().to_string());
         self.replace_owned(&[(NS_CHAIRPHOTO, "LastWrite")], vec![stamp]);

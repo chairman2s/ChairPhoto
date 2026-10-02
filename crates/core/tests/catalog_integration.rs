@@ -738,6 +738,44 @@ fn a_backup_in_place_does_not_stop_a_moved_legacy_file_coming_home() {
     assert_eq!((photo.path.as_str(), photo.rating), ("b/x.jpg", 5));
 }
 
+/// #146 review F8: the Obsidian module keys a photo's note record by its uuid. When v23
+/// re-mints a legacy row, or v24 lowercases one, the record moves with the photo, so the note
+/// is still found. A tag's note record is keyed by the tag and stays where it is.
+#[test]
+fn a_photos_note_record_follows_its_identity_through_v23_and_v24() {
+    let (catalog, root) = temp_catalog("note-record-rekey");
+    const UPPER: &str = "6F1C1F0E-2B7A-4C3D-9E8F-0A1B2C3D4E5F";
+    let mut ids = Vec::new();
+    for (name, uuid) in [("a.jpg", "dam:asset/1"), ("b.jpg", UPPER)] {
+        std::fs::write(root.join(name), b"notarealjpeg").unwrap();
+        let id = catalog.upsert_photo(&root.join(name), None, 1, 1).unwrap().id;
+        catalog
+            .conn()
+            .execute("UPDATE photos SET uuid = ?1 WHERE id = ?2", rusqlite::params![uuid, id])
+            .unwrap();
+        catalog.set_setting(&format!("obsidian.note.{uuid}"), &format!("record of {name}")).unwrap();
+        ids.push(id);
+    }
+    catalog.set_setting("obsidian.tagnote.dam:asset/1", "a tag's record").unwrap();
+    catalog.set_setting("schema_version", "22").unwrap();
+    let db = catalog.db_path().to_path_buf();
+    drop(catalog);
+    let catalog = Catalog::open(&db, &root).unwrap();
+
+    let a = catalog.get_photo(ids[0]).unwrap().uuid;
+    let b = catalog.get_photo(ids[1]).unwrap().uuid;
+    assert_eq!(b, UPPER.to_ascii_lowercase());
+    let note = |uuid: &str| catalog.get_setting(&format!("obsidian.note.{uuid}")).unwrap();
+    assert_eq!(note(&a).as_deref(), Some("record of a.jpg"));
+    assert_eq!(note(&b).as_deref(), Some("record of b.jpg"));
+    assert_eq!(note("dam:asset/1"), None);
+    assert_eq!(note(UPPER), None);
+    assert_eq!(
+        catalog.get_setting("obsidian.tagnote.dam:asset/1").unwrap().as_deref(),
+        Some("a tag's record")
+    );
+}
+
 /// A bundle of `photos`, each `(uuid, relative path)`, with nothing else in it.
 fn bare_bundle(photos: &[(&str, &str)]) -> chairphoto_core::bundle::BundleManifest {
     let mut m = chairphoto_core::bundle::BundleManifest::new(

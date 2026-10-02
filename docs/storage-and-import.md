@@ -160,7 +160,9 @@ merge and bundle import map an old bundle's non-UUID id through the same functio
 non-UUID `photos.uuid` any more. If v23 finds the v5 already held by another row (a migrated
 catalog's bundle merged in first), the two rows claim one photo and it cannot tell which is
 right, so that row gets a v4 and its copies stay queued as conflicts. The legacy value itself
-is never a merge key or a deep-link target.
+is never a merge key or a deep-link target. Settings keyed by the photo's uuid (today only the
+Obsidian module's note record, `obsidian.note.<uuid>`) move to the new identity in the same
+transaction, in v23 and in v24 alike; Adopt does not move them.
 
 A UUID is one identity in either case. `photos.uuid` holds it lowercase, as ChairPhoto mints
 it (`catalog::canonical_photo_identity`): a scan, a bundle import, a merge, Adopt and a deep

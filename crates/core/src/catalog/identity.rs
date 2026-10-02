@@ -226,6 +226,13 @@ pub(super) const RECORD_LEGACY_IDENTIFIER_SQL: &str =
     "INSERT INTO photo_legacy_identifiers(photo_id, identifier) VALUES(?1, ?2)
      ON CONFLICT(photo_id) DO NOTHING";
 
+/// Prefixes of `settings` keys that end in a photo's uuid, which a migration that changes the
+/// uuid must carry over ([`Catalog::carry_photo_keyed_settings`]). Only the Obsidian module's
+/// photo note record (`obsidian.note.<uuid>`, written by the React and GPUI modules alike)
+/// today; its tag notes are keyed by a tag's uuid, which no photo migration touches. Searched
+/// for `#146`: settings keys built from a photo's uuid in crates/, src-tauri/ and src/.
+const PHOTO_KEYED_SETTING_PREFIXES: &[&str] = &["obsidian.note."];
+
 /// True when `value` is a legacy identifier worth recording: not a UUID, not empty.
 pub(super) fn is_legacy_identifier(value: &str) -> bool {
     !value.is_empty() && !is_photo_identity(value)
@@ -1570,7 +1577,7 @@ impl Catalog {
             // legacy value for another catalog to agree on, so it gets an ordinary v4.
             if previous.is_empty() {
                 let fresh = uuid::Uuid::new_v4().to_string();
-                self.remint_photo(*photo_id, &fresh, &SidecarIdentity::Unreachable)?;
+                self.remint_photo(*photo_id, previous, &fresh, &SidecarIdentity::Unreachable)?;
                 continue;
             }
             // The same value maps to the same identity in every catalog (F1 of the #146
@@ -1585,7 +1592,7 @@ impl Catalog {
             self.conn
                 .prepare_cached(RECORD_LEGACY_IDENTIFIER_SQL)?
                 .execute(params![photo_id, previous])?;
-            self.remint_photo(*photo_id, &identity, &SidecarIdentity::Conflict(previous.clone()))?;
+            self.remint_photo(*photo_id, previous, &identity, &SidecarIdentity::Conflict(previous.clone()))?;
         }
         Ok(stale.len())
     }
@@ -1624,23 +1631,32 @@ impl Catalog {
             let canonical = spelling.to_ascii_lowercase();
             if self.photo_holding_uuid(&canonical, *photo_id)?.is_some() {
                 let fresh = uuid::Uuid::new_v4().to_string();
-                self.remint_photo(*photo_id, &fresh, &SidecarIdentity::Conflict(spelling.clone()))?;
+                self.remint_photo(*photo_id, spelling, &fresh, &SidecarIdentity::Conflict(spelling.clone()))?;
             } else {
                 self.conn.execute(
                     "UPDATE photos SET uuid = ?1, updated_at = ?2 WHERE id = ?3",
                     params![canonical, now(), photo_id],
                 )?;
+                self.carry_photo_keyed_settings(spelling, &canonical)?;
             }
         }
         Ok(spelled.len())
     }
 
-    /// Give `photo_id` the identity `uuid` and record `outcome` for every copy it records,
-    /// through the queue's one writer. Touches no file.
-    fn remint_photo(&self, photo_id: i64, uuid: &str, outcome: &SidecarIdentity) -> Result<()> {
+    /// Give `photo_id`, which held `previous`, the identity `uuid`, carry its uuid-keyed
+    /// settings over, and record `outcome` for every copy it records, through the queue's one
+    /// writer. Touches no file.
+    fn remint_photo(
+        &self,
+        photo_id: i64,
+        previous: &str,
+        uuid: &str,
+        outcome: &SidecarIdentity,
+    ) -> Result<()> {
         self.conn
             .prepare_cached("UPDATE photos SET uuid = ?1, updated_at = ?2 WHERE id = ?3")?
             .execute(params![uuid, now(), photo_id])?;
+        self.carry_photo_keyed_settings(previous, uuid)?;
         let copies: Vec<(i64, String)> = self
             .conn
             .prepare_cached("SELECT volume_id, relative_path FROM photo_locations WHERE photo_id = ?1")?
@@ -1654,6 +1670,25 @@ impl Catalog {
                 &relative_path,
                 outcome,
             )?;
+        }
+        Ok(())
+    }
+
+    /// Move the settings keyed by a photo's uuid from `previous` to `uuid`, when a migration
+    /// changes the photo's identity (#146 review F8). Runs inside the migration's transaction.
+    ///
+    /// Without it, a module record a photo had — today only the Obsidian module's note record,
+    /// `obsidian.note.<photo uuid>` — would no longer be found, and "create note" would make a
+    /// second note for a photo that has one. A record already at the new key is kept, and the
+    /// old one is left where it is rather than overwriting it.
+    fn carry_photo_keyed_settings(&self, previous: &str, uuid: &str) -> Result<()> {
+        if previous == uuid {
+            return Ok(());
+        }
+        for prefix in PHOTO_KEYED_SETTING_PREFIXES {
+            self.conn
+                .prepare_cached("UPDATE OR IGNORE settings SET key = ?1 || ?3 WHERE key = ?1 || ?2")?
+                .execute(params![prefix, previous, uuid])?;
         }
         Ok(())
     }

@@ -25,6 +25,8 @@ pub trait FlickrApi: OAuthApi {
     fn upload(&self, creds: &Credentials, image: &Path, title: &str, description: &str, tags: &str) -> Result<String, String>;
     /// Every photo in the user's photostream.
     fn photostream(&self, creds: &Credentials) -> Result<Vec<FlickrPhoto>, String>;
+    /// A preview's small Flickr thumbnail (`url_s`), as JPEG bytes ([`fetch_thumb`]).
+    fn thumbnail(&self, url: &str) -> Result<Vec<u8>, String>;
 }
 
 /// The real Flickr API (`crate::flickr`), run on the core runtime from the calling worker.
@@ -49,6 +51,10 @@ impl FlickrApi for LiveFlickr {
 
     fn photostream(&self, c: &Credentials) -> Result<Vec<FlickrPhoto>, String> {
         super::runtime().block_on(crate::flickr::fetch_photostream(&c.key, &c.secret, &c.token, &c.token_secret))
+    }
+
+    fn thumbnail(&self, url: &str) -> Result<Vec<u8>, String> {
+        fetch_thumb(url)
     }
 }
 
@@ -326,6 +332,9 @@ pub(crate) mod fake {
         }
         fn photostream(&self, _: &Credentials) -> Result<Vec<FlickrPhoto>, String> {
             Ok(self.stream.lock().unwrap().clone())
+        }
+        fn thumbnail(&self, _: &str) -> Result<Vec<u8>, String> {
+            Err("no thumbnails in tests".into())
         }
     }
 }

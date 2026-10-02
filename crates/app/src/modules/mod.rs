@@ -38,9 +38,11 @@
 //! returns.
 
 pub mod dialog;
+pub mod flickr;
 pub mod panel;
 pub mod publishing;
 pub mod registry;
+pub mod smugmug;
 pub mod statistics;
 
 #[cfg(feature = "ai")]
@@ -441,6 +443,9 @@ pub fn bundled() -> Vec<Rc<dyn Module>> {
     #[cfg(feature = "ai")]
     modules.push(Rc::new(ai_tagging::AiTaggingModule));
     modules.push(Rc::new(statistics::StatisticsModule));
+    // Registered without their (non-default) backends too: the Modules panel then says so.
+    modules.push(Rc::new(flickr::FlickrModule::default()));
+    modules.push(Rc::new(smugmug::SmugMugModule::default()));
     #[cfg(feature = "collage")]
     modules.push(Rc::new(collage::CollageModule::default()));
     #[cfg(feature = "slideshow")]

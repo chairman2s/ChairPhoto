@@ -96,7 +96,7 @@ What each publish path reports while it runs, as of this writing:
 
 | path | progress | cancellation |
 |---|---|---|
-| Flickr, SmugMug | the GPUI panel shows the job's step (Preparing…, Rendering…, Uploading to X…); the Tauri command reports nothing until it returns | a publish is a job per service (`app::uploads`): the GPUI panel's Cancel, a newer publish to the same service or a catalog switch stops it before its render or its upload; **an upload already in flight is not interrupted** |
+| Flickr, SmugMug | the GPUI panel shows the job's step (Preparing…, Rendering…, Uploading to X…); the Tauri command reports nothing until it returns | every publish is its own job (`app::uploads`), so publishes run side by side and a newer one never stops an older one; the GPUI panel's Cancel (that publish only) or a catalog switch (all of them) stops it before its render or its upload; **an upload already in flight is not interrupted**. A publish whose dialog was closed reports how it ended — published, failed, cancelled or the catalog changed — on the status line |
 | Instagram | the GPUI panel shows Preparing…, Rendering…, then Composing the post in Chrome…; the supervised flow ends by handing you the composer | as Flickr's until Chrome has the render; from then on closing the browser window is the cancel |
 | LocalSend | `localsend:progress` `{ done, total, job }` after each file; a panel shows only its own job's | the GPUI panel's Cancel, a newer send or a catalog switch trips the send job (`app::localsend`): it stops before its next render or file, or mid-upload, and calls `POST /cancel?sessionId=` (React's panel has no Cancel) |
 

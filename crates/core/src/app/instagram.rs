@@ -4,9 +4,10 @@
 //! A post is a publish job ([`super::uploads`], the Instagram family): claimed, rendered
 //! 1080 px wide into its own private directory, then handed to Chrome by an
 //! [`InstagramDriver`]. Supervised by default: the driver composes the post and stops before
-//! Share ([`PostOutcome::AwaitingReview`]); only `publish = true` clicks Share. A tripped job
-//! (Cancel, a newer post, a catalog switch) stops before Chrome sees the render; once the
-//! composer has it, the browser window ChairPhoto deliberately does not own is the cancel.
+//! Share ([`PostOutcome::AwaitingReview`]); only `publish = true` clicks Share. A stopped job
+//! (its own Cancel or a catalog switch; a newer post stops no older one) stops before Chrome
+//! sees the render; once the composer has it, the browser window ChairPhoto deliberately does
+//! not own is the cancel.
 //!
 //! **The render outlives a supervised post**: Chrome reads the file only when the user clicks
 //! Share, so [`post`] keeps the directory unless the outcome says the render is no longer
@@ -155,7 +156,7 @@ mod tests {
         }
     }
 
-    fn rendered(dir: &Path) -> (AppState, RenderedJob) {
+    fn rendered(dir: &Path) -> (AppState, RenderedJob, Arc<std::sync::atomic::AtomicBool>) {
         let root = dir.join("library");
         std::fs::create_dir_all(&root).unwrap();
         let state = AppState::default();
@@ -165,16 +166,17 @@ mod tests {
         let id = c.upsert_photo(&p, None, 0, 6).unwrap().id;
         *state.catalog.lock().unwrap() = Some(c);
         let job = claim_upload(&state, None, SERVICE, id, None).unwrap();
+        let abort = job.abort_handle();
         let render: UploadRenderer = Arc::new(|_, out| std::fs::write(out, b"px").map_err(|e| e.to_string()));
         let rendered = job.render(&render).unwrap();
-        (state, rendered)
+        (state, rendered, abort)
     }
 
     /// A supervised post keeps its render for the composer; a confirmed one removes it.
     #[test]
     fn a_supervised_post_keeps_its_render_and_a_posted_one_does_not() {
         let dir = TestTmpDir::new("instagram-keep");
-        let (_state, job) = rendered(&dir);
+        let (_state, job, _) = rendered(&dir);
         let driver = Fake(Mutex::default(), PostOutcome::AwaitingReview);
         assert_eq!(post(&driver, job, "Aurora #sky", false).unwrap(), PostOutcome::AwaitingReview);
         let (path, caption, publish) = driver.0.lock().unwrap()[0].clone();
@@ -182,7 +184,7 @@ mod tests {
         assert!(path.exists(), "the composer's render was deleted");
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
 
-        let (_state, job) = rendered(&dir.join("posted"));
+        let (_state, job, _) = rendered(&dir.join("posted"));
         let driver = Fake(Mutex::default(), PostOutcome::Posted);
         post(&driver, job, "", true).unwrap();
         let path = driver.0.lock().unwrap()[0].0.clone();
@@ -193,8 +195,8 @@ mod tests {
     #[test]
     fn a_cancelled_post_never_reaches_chrome() {
         let dir = TestTmpDir::new("instagram-cancel");
-        let (state, job) = rendered(&dir);
-        SERVICE.cancel(&state).unwrap();
+        let (_state, job, abort) = rendered(&dir);
+        abort.store(true, std::sync::atomic::Ordering::Relaxed);
         let driver = Fake(Mutex::default(), PostOutcome::Posted);
         assert_eq!(post(&driver, job, "", false).unwrap_err(), UPLOAD_CANCELLED);
         assert!(driver.0.lock().unwrap().is_empty());

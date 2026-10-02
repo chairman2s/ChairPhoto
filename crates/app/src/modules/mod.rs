@@ -405,6 +405,13 @@ impl ModuleSettings {
         ModuleSettings { app: self.app.clone(), prefix: self.prefix.clone(), catalog: Some(catalog) }
     }
 
+    /// The same module's settings, bound to no catalog: every read and write fails closed
+    /// ([`SETTINGS_NOT_READY`]) until a long-lived view [`rebound`](Self::rebound)s it — what such
+    /// a view holds from `catalog:switched` until it has read which catalog is open.
+    pub fn unbound(&self) -> ModuleSettings {
+        ModuleSettings { app: self.app.clone(), prefix: self.prefix.clone(), catalog: None }
+    }
+
     pub fn get(&self, key: &str) -> Result<Option<String>, String> {
         let key = self.key(key);
         with_catalog_as(&self.app, self.bound()?, |c| c.get_setting(&key))
@@ -413,6 +420,14 @@ impl ModuleSettings {
     pub fn set(&self, key: &str, value: &str) -> Result<(), String> {
         let key = self.key(key);
         with_catalog_as(&self.app, self.bound()?, |c| c.set_setting(&key, value))
+    }
+
+    /// Set every pair in one transaction under one catalog lock, bound like [`Self::set`]: all
+    /// of them land in the bound catalog, or none does.
+    pub fn set_all(&self, pairs: &[(&str, &str)]) -> Result<(), String> {
+        let keys: Vec<String> = pairs.iter().map(|(k, _)| self.key(k)).collect();
+        let pairs: Vec<(&str, &str)> = keys.iter().zip(pairs).map(|(k, (_, v))| (k.as_str(), *v)).collect();
+        with_catalog_as(&self.app, self.bound()?, |c| c.set_settings(&pairs))
     }
 
     fn bound(&self) -> Result<CatalogIdentity, String> {
@@ -430,6 +445,10 @@ impl chairphoto_core::app::uploads::ServiceSettings for ModuleSettings {
 
     fn set(&self, key: &str, value: &str) -> Result<(), String> {
         ModuleSettings::set(self, key, value)
+    }
+
+    fn set_all(&self, pairs: &[(&str, &str)]) -> Result<(), String> {
+        ModuleSettings::set_all(self, pairs)
     }
 }
 

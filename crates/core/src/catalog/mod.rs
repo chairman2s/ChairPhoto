@@ -580,6 +580,17 @@ impl Catalog {
         Ok(())
     }
 
+    /// Set several settings in one transaction: all of them or none (a pair that must not be
+    /// seen half-written, such as an OAuth token and its secret).
+    pub fn set_settings(&self, pairs: &[(&str, &str)]) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        for (key, value) in pairs {
+            self.set_setting(key, value)?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Current on-disk size of the catalog in bytes (page_count × page_size).
     pub fn db_size_bytes(&self) -> Result<i64> {
         let pages: i64 = self.conn.query_row("PRAGMA page_count", [], |r| r.get(0))?;

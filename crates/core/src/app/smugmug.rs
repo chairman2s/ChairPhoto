@@ -8,7 +8,8 @@
 //! **Privacy.** A photo leaves only through [`upload`], on the user's Publish.
 
 use super::oauth::{credentials, AccessToken, Credentials, OAuthApi, RequestToken};
-use super::uploads::{long_edge, max_long_edge, RenderedJob, ServiceSettings, UploadJob, UploadService};
+use super::uploads::{long_edge, max_long_edge, RenderedJob, ServiceSettings, UploadJob, UploadRenderer, UploadService};
+use super::AppState;
 pub use crate::smugmug::Album;
 use std::path::Path;
 
@@ -76,7 +77,8 @@ pub fn render(settings: &dyn ServiceSettings, job: UploadJob) -> Result<Rendered
 }
 
 /// Upload a rendered publish into `album_uri`; returns the image URL. Refuses, uploading
-/// nothing, without an album, when the job was cancelled or superseded, or when the service
+/// nothing, without an album, when the job was cancelled or stopped by a catalog switch, or
+/// when the service
 /// is not connected.
 pub fn upload(
     api: &dyn SmugMugApi,
@@ -94,11 +96,33 @@ pub fn upload(
     api.upload(&creds, album_uri, rendered.path(), title, caption)
 }
 
-/// The whole publish, for a caller with no steps to show (the Tauri command).
+/// The whole publish of `photo_id` from whichever catalog is open, for a caller with no steps
+/// to show (the Tauri command): check the album and the connection, then claim, render, upload
+/// — so a call that cannot publish claims nothing. Another publish running meanwhile is
+/// neither stopped nor stops this one.
+#[allow(clippy::too_many_arguments)]
 pub fn post(
     api: &dyn SmugMugApi,
     settings: &dyn ServiceSettings,
-    job: UploadJob,
+    state: &AppState,
+    photo_id: i64,
+    version_id: Option<i64>,
+    album_uri: &str,
+    title: &str,
+    caption: &str,
+) -> Result<String, String> {
+    post_with(api, settings, state, photo_id, version_id, &long_edge(max_long_edge(settings)), album_uri, title, caption)
+}
+
+/// [`post`] with the renderer handed in (tests need no thumbnail cache).
+#[allow(clippy::too_many_arguments)]
+fn post_with(
+    api: &dyn SmugMugApi,
+    settings: &dyn ServiceSettings,
+    state: &AppState,
+    photo_id: i64,
+    version_id: Option<i64>,
+    renderer: &UploadRenderer,
     album_uri: &str,
     title: &str,
     caption: &str,
@@ -107,7 +131,8 @@ pub fn post(
         return Err(CHOOSE_ALBUM.into());
     }
     credentials(settings, NAME)?;
-    let rendered = render(settings, job)?;
+    let job = super::uploads::claim_upload(state, None, SERVICE, photo_id, version_id)?;
+    let rendered = job.render(renderer)?;
     upload(api, settings, &rendered, album_uri, title, caption)
 }
 
@@ -160,8 +185,8 @@ mod tests {
     use crate::app::oauth::fake::MemSettings;
     use crate::app::oauth::{ACCESS_SECRET, ACCESS_TOKEN, API_KEY, API_SECRET};
     use crate::app::uploads::{claim_upload, UPLOAD_CANCELLED};
-    use crate::app::AppState;
     use crate::test_support::TestTmpDir;
+    use std::sync::atomic::Ordering;
     use std::sync::Arc;
 
     fn connected() -> MemSettings {
@@ -191,15 +216,36 @@ mod tests {
         assert_eq!(trips.name, "Trips");
         assert_eq!(list_albums(&api, &s).unwrap().len(), 1);
         let job = claim_upload(&state, None, SERVICE, id, None).unwrap();
+        let abort = job.abort_handle();
         let render: crate::app::uploads::UploadRenderer = Arc::new(|_, out| std::fs::write(out, b"px").map_err(|e| e.to_string()));
         let rendered = job.render(&render).unwrap();
         assert_eq!(upload(&api, &s, &rendered, " ", "t", "c").unwrap_err(), CHOOSE_ALBUM);
         let url = upload(&api, &s, &rendered, &trips.uri, "Title", "Caption").unwrap();
         assert_eq!(url, "https://me.smugmug.com/i-1");
         assert_eq!(api.uploads.lock().unwrap()[0].0, trips.uri);
-        SERVICE.cancel(&state).unwrap();
+        abort.store(true, Ordering::Relaxed);
         assert_eq!(upload(&api, &s, &rendered, &trips.uri, "", "").unwrap_err(), UPLOAD_CANCELLED);
         assert_eq!(api.uploads.lock().unwrap().len(), 1, "a cancelled job uploaded");
         assert!(list_albums(&api, &MemSettings::default()).is_err(), "unconfigured");
+    }
+
+    /// The Tauri command's path checks the album and the connection before it claims
+    /// anything: a call that cannot publish takes no job id and leaves a running publish be;
+    /// two posts both upload.
+    #[test]
+    fn a_post_that_cannot_publish_claims_nothing_and_posts_run_side_by_side() {
+        let dir = TestTmpDir::new("smugmug-post");
+        let (state, id) = catalog(&dir);
+        let api = FakeSmugMug::default();
+        let running = claim_upload(&state, None, SERVICE, id, None).unwrap();
+        let issued = state.jobs.upload_smugmug.job_ids_issued();
+        let render: UploadRenderer = Arc::new(|_, out| std::fs::write(out, b"px").map_err(|e| e.to_string()));
+        assert_eq!(post_with(&api, &connected(), &state, id, None, &render, " ", "", "").unwrap_err(), CHOOSE_ALBUM);
+        let unconnected = MemSettings::with(&[(API_KEY, "k"), (API_SECRET, "s")]);
+        assert!(post_with(&api, &unconnected, &state, id, None, &render, "/a/1", "", "").unwrap_err().contains("Connect smugmug"));
+        assert_eq!(state.jobs.upload_smugmug.job_ids_issued(), issued, "a post that cannot publish claimed a job");
+        let running = running.render(&render).expect("a failing post stopped a running publish");
+        assert_eq!(post_with(&api, &connected(), &state, id, None, &render, "/a/1", "second", "").unwrap(), "https://me.smugmug.com/i-1");
+        assert_eq!(upload(&api, &connected(), &running, "/a/1", "first", "").unwrap(), "https://me.smugmug.com/i-2");
     }
 }

@@ -278,7 +278,8 @@ impl PublishPanel {
     /// (bound to the catalog the photo came from), the render, the upload — then the
     /// publication recorded (with the URL when it is a web address) under the module's marker
     /// in that catalog. Each step's landing moves [`Self::stage`]; the terminal answer is the
-    /// last step's. A closed dialog does not stop it: its answer goes to the status line.
+    /// last step's. A closed dialog does not stop it: its answer — published, failed, cancelled
+    /// or the catalog changed — goes to the status line.
     pub fn publish(&mut self, cx: &mut Context<Self>) {
         let Some(photo) = self.photo() else { return };
         let Some(catalog) = self.subject.catalog else {
@@ -293,7 +294,9 @@ impl PublishPanel {
         let attempt = self.attempt;
         self.busy = true;
         self.stage = Some(Stage::Preparing);
-        self.running = Some(Running::default());
+        let running = Running::default();
+        let cancelled = running.cancelled.clone();
+        self.running = Some(running);
         self.status = Stage::Preparing.line(&self.service.name());
         let request = PublishRequest {
             catalog,
@@ -316,21 +319,35 @@ impl PublishPanel {
         let (model, name) = (self.model.clone(), self.service.name());
         cx.spawn(async move |this, cx| {
             let land = |result: Outcome, cx: &mut gpui_kit::AsyncApp| {
+                // A published photo always reaches the status line; a failure, a Cancel or a
+                // catalog change only when the panel is gone (the dialog closed) — it would
+                // otherwise end unseen.
                 let line = match &result {
                     Ok(Ok(())) => Some(format!("Published to {name}.")),
                     Ok(Err(e)) => Some(unrecorded_line(&name, e)),
-                    Err(_) => None,
+                    Err(e) => Some(format!("{name}: {e}")),
                 };
-                if let Some(line) = line {
+                let shown = this.update(cx, |p, cx| p.land(attempt, result.clone(), cx)).is_ok();
+                if let Some(line) = line.filter(|_| result.is_ok() || !shown) {
                     cx.update(|cx| model.update(cx, |m, cx| m.set_status(line, cx)));
                 }
-                this.update(cx, |p, cx| p.land(attempt, result, cx)).ok();
             };
             let job = match claim.await.unwrap_or_else(|_| Err(STOPPED.into())) {
                 Ok(job) => job,
                 Err(e) => return land(Err(e), cx),
             };
-            match this.update(cx, |p, cx| p.step(attempt, Stage::Rendering, Some(job.abort_handle()), cx)).unwrap_or(Go::Run) {
+            // The panel gone (its dialog closed): the publish goes on, unless Cancel was pressed
+            // before it closed.
+            let gone = |abort: Option<&AtomicBool>| {
+                if cancelled.load(Ordering::Relaxed) {
+                    abort.inspect(|a| a.store(true, Ordering::Relaxed));
+                    Go::Cancelled
+                } else {
+                    Go::Run
+                }
+            };
+            let abort = job.abort_handle();
+            match this.update(cx, |p, cx| p.step(attempt, Stage::Rendering, Some(abort.clone()), cx)).unwrap_or_else(|_| gone(Some(&abort))) {
                 Go::Run => {}
                 Go::Cancelled => return land(Err(UPLOAD_CANCELLED.into()), cx),
                 Go::Superseded => return,
@@ -343,7 +360,7 @@ impl PublishPanel {
                 Ok(rendered) => rendered,
                 Err(e) => return land(Err(e), cx),
             };
-            match this.update(cx, |p, cx| p.step(attempt, Stage::Uploading, None, cx)).unwrap_or(Go::Run) {
+            match this.update(cx, |p, cx| p.step(attempt, Stage::Uploading, None, cx)).unwrap_or_else(|_| gone(None)) {
                 Go::Run => {}
                 Go::Cancelled => return land(Err(UPLOAD_CANCELLED.into()), cx),
                 Go::Superseded => return,
@@ -374,7 +391,7 @@ impl PublishPanel {
         if abort.is_some() {
             running.abort = abort;
         }
-        if running.cancelled {
+        if running.cancelled.load(Ordering::Relaxed) {
             return Go::Cancelled;
         }
         self.stage = Some(stage);
@@ -406,7 +423,7 @@ impl PublishPanel {
             return;
         }
         if let Some(r) = self.running.as_mut() {
-            r.cancelled = true;
+            r.cancelled.store(true, Ordering::Relaxed);
             if let Some(abort) = &r.abort {
                 abort.store(true, Ordering::Relaxed);
             }
@@ -449,10 +466,12 @@ enum Go {
     Superseded,
 }
 
-/// The running publish: whether Cancel was pressed, and its job's abort flag once claimed.
+/// The running publish: whether Cancel was pressed (shared with the publish's task, so a
+/// Cancel pressed just before the dialog closed still stops it), and its job's abort flag
+/// once claimed.
 #[derive(Default)]
 struct Running {
-    cancelled: bool,
+    cancelled: Arc<AtomicBool>,
     abort: Option<Arc<AtomicBool>>,
 }
 

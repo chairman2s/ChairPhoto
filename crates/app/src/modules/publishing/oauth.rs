@@ -6,8 +6,12 @@
 //!
 //! Every settings read/write and service call runs on a worker. The section outlives a catalog
 //! switch (Preferences keeps a module's settings views while it is enabled), so it follows the
-//! open catalog: `catalog:switched` clears it and drops every answer still in flight, and the
-//! next catalog read rebinds its settings handle and reloads ([`ModuleSettings::rebound`]).
+//! open catalog: `catalog:switched` clears it, drops every answer still in flight and unbinds
+//! its settings handle ([`ModuleSettings::unbound`]); the next catalog read — whether it
+//! arrives before the event or after — rebinds it and reloads ([`ModuleSettings::rebound`]).
+//! Save and Connect write the fields only once they show the stored values of the catalog the
+//! handle is bound to; until that load lands they refuse ([`NOT_LOADED`]), so blank fields are
+//! never saved over a catalog's keys.
 //!
 //! **Secrets.** The secret field is masked; nothing here logs a key, a secret or a token, and
 //! the status line only ever shows the service's error text.
@@ -17,7 +21,7 @@ use crate::model::{AppModel, AppModelEvent};
 use crate::modules::ModuleSettings;
 use crate::shell::style::Colors;
 use crate::storage::{ui, Runner};
-use chairphoto_core::app::CoreEvent;
+use chairphoto_core::app::{CatalogIdentity, CoreEvent};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::prelude::*;
 use gpui_kit::{div, px, Context, Entity, Subscription, TestSupportExt as _, Window};
@@ -28,6 +32,9 @@ use std::sync::Arc;
 pub const API_KEY: &str = "api_key";
 pub const API_SECRET: &str = "api_secret";
 pub const MAX_LONG_EDGE: &str = chairphoto_core::app::uploads::MAX_LONG_EDGE;
+
+/// What Save and Connect answer while the fields do not show the bound catalog's settings.
+pub const NOT_LOADED: &str = "The settings are still loading for this catalog — try again in a moment.";
 
 pub struct OAuthSettings {
     settings: ModuleSettings,
@@ -45,7 +52,10 @@ pub struct OAuthSettings {
     pub auth_url: Option<String>,
     pub connected: bool,
     pub status: String,
-    /// Bumped by a catalog switch: an answer for the catalog before it is dropped.
+    /// The catalog whose stored settings the fields were loaded from; `None` until a load for
+    /// the bound catalog lands (and again from a switch or a rebind until the next one does).
+    loaded: Option<CatalogIdentity>,
+    /// Bumped by a catalog switch and by a rebind: an answer for the catalog before is dropped.
     generation: u64,
     _subscriptions: Vec<Subscription>,
 }
@@ -73,6 +83,8 @@ impl OAuthSettings {
                 AppModelEvent::CatalogRead => {
                     let open = model.read(cx).catalog_identity();
                     if let Some(open) = open.filter(|&o| Some(o) != this.settings.catalog()) {
+                        this.generation += 1;
+                        this.loaded = None;
                         this.settings = this.settings.rebound(open);
                         this.load(cx);
                     }
@@ -92,6 +104,7 @@ impl OAuthSettings {
             auth_url: None,
             connected: false,
             status: String::new(),
+            loaded: None,
             generation: 0,
             _subscriptions: subs,
         };
@@ -99,10 +112,13 @@ impl OAuthSettings {
         view
     }
 
-    /// Another catalog is open: its keys are not this one's. Clear everything and drop what
-    /// is in flight; the next catalog read loads the new catalog's.
+    /// Another catalog is open: its keys are not this one's. Clear everything, drop what is in
+    /// flight and unbind the settings, so the next catalog read always rebinds and loads — even
+    /// one for the new catalog that arrived before this event and bound the handle to it.
     fn catalog_switched(&mut self, cx: &mut Context<Self>) {
         self.generation += 1;
+        self.settings = self.settings.unbound();
+        self.loaded = None;
         self.fill = Some(Default::default());
         self.clear_verifier = true;
         self.auth_url = None;
@@ -135,29 +151,71 @@ impl OAuthSettings {
         cx.notify();
     }
 
-    /// Read the stored keys and whether the service is connected.
+    /// Read the bound catalog's stored keys and whether the service is connected. Bound to
+    /// none: nothing to read (the next catalog read binds and loads).
     fn load(&mut self, cx: &mut Context<Self>) {
+        let Some(from) = self.settings.catalog() else { return };
         self.run(
             cx,
             |settings, service| {
-                let get = |k: &str| settings.get(k).ok().flatten().unwrap_or_default();
-                ([get(API_KEY), get(API_SECRET), get(MAX_LONG_EDGE)], service.connected(settings).unwrap_or(false))
+                // A read that fails must not pass for an empty setting: the fields would then
+                // count as loaded, and Save would write blanks over the catalog's keys.
+                let fields = [API_KEY, API_SECRET, MAX_LONG_EDGE].map(|k| settings.get(k).map(Option::unwrap_or_default));
+                let connected = service.connected(settings).unwrap_or(false);
+                match fields {
+                    [Ok(key), Ok(secret), Ok(edge)] => Ok(([key, secret, edge], connected)),
+                    [a, b, c] => Err(a.and(b).and(c).unwrap_err()),
+                }
             },
-            |v, (fields, connected), _| {
-                v.fill = Some(fields);
-                v.connected = connected;
+            move |v, result, _| match result {
+                Ok((fields, connected)) => {
+                    v.fill = Some(fields);
+                    v.connected = connected;
+                    v.loaded = Some(from);
+                }
+                Err(e) => v.status = e,
             },
         );
     }
 
-    /// What Save writes: the trimmed fields (an empty max long edge = full resolution).
+    /// The catalog the settings handle is bound to (tests).
+    #[cfg(test)]
+    pub(crate) fn bound_catalog(&self) -> Option<CatalogIdentity> {
+        self.settings.catalog()
+    }
+
+    /// Whether the fields show the stored settings of the catalog the handle is bound to —
+    /// the only state Save and Connect may write from.
+    fn writable(&self) -> bool {
+        self.loaded.is_some() && self.loaded == self.settings.catalog()
+    }
+
+    /// What Save writes: the trimmed fields (an empty max long edge = full resolution) — the
+    /// values a landed load is about to put in them, if the render has not yet.
     fn fields(&self, cx: &Context<Self>) -> [(&'static str, String); 3] {
         let value = |i: &Entity<InputState>| i.read(cx).value().trim().to_string();
-        [(API_KEY, value(&self.key)), (API_SECRET, value(&self.secret)), (MAX_LONG_EDGE, value(&self.max_long_edge))]
+        let [key, secret, edge] = match &self.fill {
+            Some(fill) => fill.clone().map(|v| v.trim().to_string()),
+            None => [value(&self.key), value(&self.secret), value(&self.max_long_edge)],
+        };
+        [(API_KEY, key), (API_SECRET, secret), (MAX_LONG_EDGE, edge)]
+    }
+
+    /// Refuse a write while the fields are not loaded for the bound catalog.
+    fn refuse_unloaded(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.writable() {
+            return false;
+        }
+        self.status = NOT_LOADED.into();
+        cx.notify();
+        true
     }
 
     /// "Save keys".
     pub fn save(&mut self, cx: &mut Context<Self>) {
+        if self.refuse_unloaded(cx) {
+            return;
+        }
         let fields = self.fields(cx);
         self.run(
             cx,
@@ -173,6 +231,9 @@ impl OAuthSettings {
 
     /// Connect / Reconnect: save, get the authorize URL, open it in the browser.
     pub fn connect(&mut self, cx: &mut Context<Self>) {
+        if self.refuse_unloaded(cx) {
+            return;
+        }
         self.status.clear();
         let fields = self.fields(cx);
         self.run(

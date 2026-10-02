@@ -45,7 +45,7 @@
 //! | `storage::claim_reconcile` (a back-up drain or offload-policy start) | catalog → the reconcile abort |
 //! | `slideshow::claim_slideshow` (a slideshow render start) | catalog → the slideshow abort |
 //! | `localsend::claim_send` (a LocalSend send start) | catalog → the LocalSend abort |
-//! | `uploads::claim_upload` (a Flickr/SmugMug upload or an Instagram post start) | catalog → that service's upload abort |
+//! | `uploads::claim_upload` (a Flickr/SmugMug upload or an Instagram post start) | catalog → that service's upload abort, joined ([`AbortGeneration::join_numbered`]), never tripped |
 //! | [`AbortGeneration::install_fresh_if_owner`] (a card import committing to index) | the scan abort → the import abort |
 //! | [`AbortGeneration::install_fresh_if_newer`] (a burst-analysis worker's claim) | one abort, released before the catalog is read |
 //! | `exports::claim_export`, `exports::claim_bundle_export` | one abort, released before the catalog is read |
@@ -147,6 +147,18 @@ impl AbortGeneration {
         let mut guard = self.lock()?;
         let job = self.next_job_id();
         Ok((trip_and_replace(&mut guard), job))
+    }
+
+    /// Join the installed generation **without** tripping it, allocating a job id under the
+    /// same lock: for a family whose jobs run side by side rather than superseding each other
+    /// (the publish uploads). Every joined job holds the same flag, so a catalog switch, which
+    /// trips the installed flag, stops all of them; each keeps a cancel flag of its own for
+    /// its own Cancel. Nothing but a switch may trip a joined generation — a [`Self::trip`]
+    /// would cancel every job that joined it.
+    pub fn join_numbered(&self) -> Result<(Arc<AtomicBool>, u64), String> {
+        let guard = self.lock()?;
+        let job = self.next_job_id();
+        Ok((guard.clone(), job))
     }
 
     /// Replace this generation (trip the running job, install a fresh flag) **only if**
@@ -544,22 +556,24 @@ pub struct JobRegistry {
     /// terminal result, and its `localsend:progress` events carry the job id.
     #[cfg(feature = "localsend")]
     pub localsend: AbortGeneration,
-    /// Publishing one photo to Flickr (`app::uploads`, `app::flickr`): the render and the
-    /// upload. Claimed under the catalog lock (`uploads::claim_upload`); a newer Flickr
-    /// publish, Cancel or a catalog switch trips it — the job stops before its render and
-    /// before its upload (an upload already in flight is not interrupted: the service may
-    /// already hold it). No status slot: the job returns its own terminal result.
+    /// Publishing photos to Flickr (`app::uploads`, `app::flickr`): the render and the
+    /// upload. Unlike the families above, publishes run side by side: each claim joins the
+    /// installed generation under the catalog lock ([`AbortGeneration::join_numbered`],
+    /// `uploads::claim_upload`) and keeps its own cancel flag, so a newer publish stops no
+    /// older one and a Cancel stops only its own. A catalog switch trips the generation and
+    /// so every publish that joined it — each stops before its render and before its upload
+    /// (an upload already in flight is not interrupted: the service may already hold it). No
+    /// status slot: each job returns its own terminal result, numbered by its own job id.
     ///
     /// The three upload families are not feature-gated, unlike their services: the claim and
     /// render (`app::uploads`) are the shared publish flow's, compiled and tested in every
     /// build, and an unused generation costs one mutex.
     pub upload_flickr: AbortGeneration,
-    /// Publishing one photo to SmugMug — as [`Self::upload_flickr`], its own family so a
-    /// Flickr publish never cancels a SmugMug one.
+    /// Publishing photos to SmugMug — as [`Self::upload_flickr`], its own family.
     pub upload_smugmug: AbortGeneration,
-    /// A supervised Instagram post (`app::instagram`): the render, then handing it to Chrome.
-    /// Tripped before Chrome has the render, it stops; once the composer has it, the browser
-    /// window is the cancel (docs/instagram.md).
+    /// Supervised Instagram posts (`app::instagram`): the render, then handing it to Chrome —
+    /// joined as [`Self::upload_flickr`]. Stopped before Chrome has the render, a post stops;
+    /// once the composer has it, the browser window is the cancel (docs/instagram.md).
     pub upload_instagram: AbortGeneration,
     /// The Develop session's working image (docs/plans/raw-foundation): one claim per
     /// opened photo; a switch, exit or catalog change trips it and the image is released.
@@ -1263,7 +1277,7 @@ mod tests {
         #[cfg(feature = "localsend")]
         let (localsend, _) = registry.localsend.install_fresh_numbered().unwrap();
         let uploads = [&registry.upload_flickr, &registry.upload_smugmug, &registry.upload_instagram]
-            .map(|g| g.install_fresh_numbered().unwrap().0);
+            .map(|g| g.join_numbered().unwrap().0);
 
         let identity = begin_identity(&registry, &catalog).unwrap();
         #[cfg(feature = "smarttags")]

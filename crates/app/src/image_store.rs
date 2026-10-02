@@ -41,22 +41,31 @@
 //!   another claim holds it. [`ImageStore::release_pending`] and [`ImageStore::evict`] never
 //!   touch a claimed tier. Only a change of what the pixels are (an invalidate, a catalog
 //!   switch) drops claimed requests, and a switch empties every claim.
-//! - **Cover looks** (#134, the Darkroom filmstrip): a thumbnail shows the photo's cover
-//!   version's look (`media::render_image` renders the cover the catalog names when the
-//!   worker runs). [`ImageStore::request_looks`] keys that tier by the look the caller's row
-//!   names — cover version and revision, as `Filmstrip.tsx` put the cover token in the
-//!   thumbnail URL — and by the catalog the row was read from: a different look, or a tier
-//!   cached or pending with no look said, is invalidated and rendered again, so a result for
-//!   the earlier look is dropped by generation. A thumbnail of a photo with a look is bound
-//!   to that catalog: after the render, on the worker, the open catalog's identity is
-//!   checked ([`ImageStore::set_identity_probe`]); another catalog (a switch whose
-//!   `catalog:switched` has not arrived, a re-root, which sends none) refuses the result,
-//!   never pixels shown under the old row. The catalog cannot have changed and changed back:
-//!   identities never repeat. A refusal is not a failure: the tier is left empty and not
-//!   asked again under that look, and a new look (the rows re-read from the new catalog),
-//!   the photo leaving the strip, or an invalidate asks again. Looks are the strip's frames
-//!   only: a photo that leaves the strip loses its look, so no other view's thumbnail is
-//!   bound to a catalog it never read.
+//! - **Cover looks** (#134 the Darkroom filmstrip, #151 the Library grid): a thumbnail shows
+//!   the photo's cover version's look (`media::render_image` renders the cover the catalog
+//!   names when the worker runs). A view whose rows carry the cover token asks through
+//!   [`ImageStore::request_look_batch`] (the grid) or [`ImageStore::request_looks`] (the
+//!   strip, under its claim): the tier is keyed by the look the row names — cover version and
+//!   revision, as `Thumbnail.tsx` put the cover token in the thumbnail URL — and by the
+//!   catalog the row was read from. A different look, or a tier cached, pending, failed or
+//!   refused with no look said, is invalidated and rendered again, so a result for the
+//!   earlier look is dropped by generation; the same look asks nothing. `looks` says what the
+//!   tier was last asked to show, whoever asked: the views that name looks read them from the
+//!   same rows (the shell's), so they agree, and one view letting go never makes another's
+//!   cached thumbnail unknown (which would render it again). Views without the token (stacks,
+//!   the inspector's stack, cards, collage, the loupe's placeholder) ask plainly and share the
+//!   tier: they show the look the grid or the strip last asked for.
+//! - **A look's catalog.** A submission made for a look is bound to the catalog its row came
+//!   from: after the render, on the worker, the open catalog's identity is checked
+//!   ([`ImageStore::set_identity_probe`]); another catalog (a switch whose `catalog:switched`
+//!   has not arrived, a re-root, which sends none) refuses the result, never pixels shown
+//!   under the old row. Only look submissions are bound: a plain request is never checked
+//!   against a catalog its view did not read (review rv134 M1). The catalog cannot have
+//!   changed and changed back: identities never repeat. A refusal is not a failure: the tier
+//!   is left empty and, while the photo's look is still the refused row's, not asked again
+//!   (by any view: the catalog open is not that row's). Rows read from another catalog forget
+//!   every earlier look and refusal, so the next ask renders again; a refusal that arrives
+//!   for a look already superseded is not kept.
 //!
 //! The pool is behind [`Submit`] so tests can hold responders and deliver them in any order.
 
@@ -315,7 +324,9 @@ struct Done {
     /// The answer to a navigation promotion: never the one a pending key waits for, so
     /// dropping it is not counted as stale.
     promotion: bool,
-    /// Rendered in another catalog than the look's (see the module docs).
+    /// The catalog a look submission was bound to (see the module docs).
+    bound: Option<CatalogIdentity>,
+    /// Rendered in another catalog than the look's.
     refused: bool,
     result: Result<Loaded, String>,
 }
@@ -350,16 +361,20 @@ pub struct ImageStore {
     /// Every submission not yet answered, per tier: (generation, version, epoch). Released
     /// or abandoned ones stay until their answer arrives; see the module docs.
     unanswered: HashMap<(i64, ImageKind), Vec<Submission>>,
-    /// Requests held back by an outdated unanswered submission, sent once none is left.
-    deferred: HashSet<(i64, ImageKind)>,
+    /// Requests held back by an outdated unanswered submission, sent once none is left —
+    /// with the catalog a look request bound them to (a plain request's merges into it).
+    deferred: HashMap<(i64, ImageKind), Option<CatalogIdentity>>,
     /// Bumped by [`clear`](Self::clear): photo ids from an older epoch are other photos.
     epoch: u64,
     generation: u64,
     /// What each claim holds (see the module docs).
     claims: HashMap<ClaimId, HashSet<(i64, ImageKind)>>,
     next_claim: u64,
-    /// The look each photo's thumbnail tier was last asked for (see the module docs).
+    /// The look each photo's thumbnail tier was last asked for, by any view (see the module
+    /// docs). Forgotten when rows come from another catalog, and by a switch.
     looks: HashMap<i64, Look>,
+    /// The catalog the looks in `looks` were read from.
+    looks_from: Option<CatalogIdentity>,
     /// Tiers whose render for their look was refused: not asked again until that changes.
     refused: HashSet<ImageKey>,
     probe: Option<IdentityProbe>,
@@ -387,12 +402,13 @@ impl ImageStore {
             failed: HashMap::new(),
             versions: HashMap::new(),
             unanswered: HashMap::new(),
-            deferred: HashSet::new(),
+            deferred: HashMap::new(),
             epoch: 0,
             generation: 0,
             claims: HashMap::new(),
             next_claim: 0,
             looks: HashMap::new(),
+            looks_from: None,
             refused: HashSet::new(),
             probe: None,
             done,
@@ -472,14 +488,15 @@ impl ImageStore {
     /// the pool's LIFO stack. Cached, failed and already pending keys are skipped, so a view
     /// may call this on every render: once everything it wants is pending, nothing is sent.
     pub fn request_batch(&mut self, wanted: &[(i64, ImageKind)]) {
-        self.submit(wanted, false);
+        self.submit(wanted, false, None);
     }
 
     /// [`request_batch`](Self::request_batch), and with `promote` a pending key is re-sent so
     /// the pool moves it up to its place in this batch — what navigation needs when a preload
     /// becomes the current photo. The re-send is tracked in `unanswered` under its own
     /// generation; its answer only ends that record (the pending key's own answer lands).
-    fn submit(&mut self, wanted: &[(i64, ImageKind)], promote: bool) {
+    /// With `look`, each thumbnail sent is bound to that catalog (see the module docs).
+    fn submit(&mut self, wanted: &[(i64, ImageKind)], promote: bool, look: Option<CatalogIdentity>) {
         let mut batch: Vec<(JobKey, Respond<Loaded>)> = Vec::with_capacity(wanted.len());
         let mut seen = HashSet::new();
         for &(photo, kind) in wanted {
@@ -488,7 +505,10 @@ impl ImageStore {
                 continue;
             }
             if self.outdated_in_flight((photo, kind), key.version) {
-                self.deferred.insert((photo, kind));
+                let bind = self.deferred.entry((photo, kind)).or_insert(None);
+                if look.is_some() {
+                    *bind = look;
+                }
                 continue;
             }
             let job = JobKey::photo(photo, kind);
@@ -512,20 +532,21 @@ impl ImageStore {
                 epoch: self.epoch,
             });
             let done = self.done.clone();
-            // A thumbnail with a look is bound to the catalog its row came from.
-            let bound = match (kind, self.looks.get(&photo), &self.probe) {
-                (ImageKind::Thumb, Some(look), Some(probe)) => Some((look.from, probe.clone())),
+            // A thumbnail asked for a look is bound to the catalog its row came from.
+            let check = match (kind, look, &self.probe) {
+                (ImageKind::Thumb, Some(from), Some(probe)) => Some((from, probe.clone())),
                 _ => None,
             };
+            let bound = check.as_ref().map(|(from, _)| *from);
             batch.push((
                 job,
                 Box::new(move |result| {
                     // On the worker, after the render: pixels from another catalog are not
                     // this row's photo.
-                    let refused = matches!(&bound, Some((from, probe)) if result.is_ok() && probe() != Some(*from));
+                    let refused = matches!(&check, Some((from, probe)) if result.is_ok() && probe() != Some(*from));
                     let result = if refused { Err(CATALOG_CHANGED.to_string()) } else { result };
                     // Fails only when the store is gone; the result is then unwanted.
-                    let _ = done.unbounded_send(Done { key, generation, promotion, refused, result });
+                    let _ = done.unbounded_send(Done { key, generation, promotion, bound, refused, result });
                 }),
             ));
         }
@@ -599,7 +620,7 @@ impl ImageStore {
             self.pool.cancel(&JobKey::photo(key.photo, key.kind));
         }
         let versions = &self.versions;
-        self.deferred.retain(|&(photo, kind)| {
+        self.deferred.retain(|&(photo, kind), _| {
             keep(&ImageKey { photo, kind, version: versions.get(&(photo, kind)).copied().unwrap_or(0) })
         });
     }
@@ -618,7 +639,7 @@ impl ImageStore {
         let wanted = window_of(photos, index, kind, ahead, behind);
         let keep: HashSet<i64> = wanted.iter().map(|&(p, _)| p).collect();
         self.release_pending(|k| k.kind != kind || keep.contains(&k.photo));
-        self.submit(&wanted, true);
+        self.submit(&wanted, true, None);
     }
 
     /// [`navigate_window`](Self::navigate_window) for the view holding `owner`: its claim
@@ -638,17 +659,13 @@ impl ImageStore {
     ) {
         let wanted = window_of(photos, index, kind, ahead, behind);
         self.set_claim(owner, wanted.iter().chain(also).copied());
-        self.submit(&wanted, true);
+        self.submit(&wanted, true, None);
     }
 
     /// The Darkroom filmstrip's frames (#134): `owner` holds exactly `wanted`'s thumbnail
-    /// tiers, sent as one batch in `wanted`'s order — the caller's, most urgent first (the
-    /// strip's: the open photo's frame, then outwards) — each to show the cover look its row
-    /// names, read from the catalog `from`. A tier asked for another look before — or
-    /// cached, pending or failed with no look said — is invalidated first, so what it held
-    /// or will still answer for the earlier look is never shown (see the module docs). A
-    /// photo not in `wanted` loses its look. Calling it again with the same looks sends
-    /// nothing.
+    /// tiers, asked for as [`request_look_batch`](Self::request_look_batch) asks (the strip's
+    /// order: the open photo's frame, then outwards). Calling it again with the same looks
+    /// sends nothing.
     pub fn request_looks(
         &mut self,
         owner: ClaimId,
@@ -656,13 +673,38 @@ impl ImageStore {
         wanted: &[(i64, Option<CoverLook>)],
         cx: &mut Context<Self>,
     ) {
+        let tiers: Vec<(i64, ImageKind)> = wanted.iter().map(|&(photo, _)| (photo, ImageKind::Thumb)).collect();
+        self.set_claim(owner, tiers.iter().copied());
+        self.request_look_batch(from, wanted, cx);
+    }
+
+    /// Thumbnails for rows that carry their cover token (#151: the Library grid; the strip
+    /// through [`request_looks`](Self::request_looks)), sent as one batch in `wanted`'s order
+    /// — the caller's, most urgent first — each to show the cover look its row names, read
+    /// from the catalog `from`. A tier asked for another look before — or cached, pending,
+    /// failed or refused with no look said — is invalidated first, so what it held or will
+    /// still answer for the earlier look is never shown; no other tier, and no other photo, is
+    /// touched. What is sent is bound to `from` (see the module docs). Like
+    /// [`request_batch`](Self::request_batch) it may be called every frame: once the looks
+    /// are pending or cached, nothing is sent.
+    pub fn request_look_batch(&mut self, from: CatalogIdentity, wanted: &[(i64, Option<CoverLook>)], cx: &mut Context<Self>) {
+        if self.looks_from != Some(from) {
+            // Rows from another catalog: the earlier rows' looks, and the refusals made for
+            // them, say nothing about these.
+            self.looks.clear();
+            self.refused.clear();
+            self.looks_from = Some(from);
+        }
         for &(photo, cover) in wanted {
             let look = Look { from, cover };
-            let key = self.key(photo, ImageKind::Thumb);
             let stale = match self.looks.get(&photo) {
                 Some(asked) => *asked != look,
                 None => {
-                    self.lru.peek(&key).is_some() || self.pending.contains_key(&key) || self.failed.contains_key(&key)
+                    let key = self.key(photo, ImageKind::Thumb);
+                    self.lru.peek(&key).is_some()
+                        || self.pending.contains_key(&key)
+                        || self.failed.contains_key(&key)
+                        || self.refused.contains(&key)
                 }
             };
             if stale {
@@ -670,25 +712,13 @@ impl ImageStore {
             }
             self.looks.insert(photo, look);
         }
-        let kept: HashSet<i64> = wanted.iter().map(|&(photo, _)| photo).collect();
-        self.forget_looks(|photo| !kept.contains(&photo));
         let tiers: Vec<(i64, ImageKind)> = wanted.iter().map(|&(photo, _)| (photo, ImageKind::Thumb)).collect();
-        self.set_claim(owner, tiers.iter().copied());
-        self.request_batch(&tiers);
+        self.submit(&tiers, false, Some(from));
     }
 
-    /// No strip: `owner` holds nothing, and no photo keeps a look.
+    /// No strip: `owner` holds nothing. The looks stay: they say what the tiers show.
     pub fn release_looks(&mut self, owner: ClaimId) {
         self.set_claim(owner, []);
-        self.forget_looks(|_| true);
-    }
-
-    /// Forget the looks of the photos `gone` selects, and their refusals: what the photo's
-    /// thumbnail tier holds is the photo's, whichever view asks next.
-    fn forget_looks(&mut self, mut gone: impl FnMut(i64) -> bool) {
-        self.looks.retain(|&photo, _| !gone(photo));
-        let looks = &self.looks;
-        self.refused.retain(|k| looks.contains_key(&k.photo));
     }
 
     /// Drop the cached images `matches` selects and no claim holds, and release their
@@ -738,6 +768,7 @@ impl ImageStore {
         self.failed.clear();
         self.versions.clear();
         self.looks.clear();
+        self.looks_from = None;
         self.refused.clear();
         cx.notify();
     }
@@ -766,10 +797,11 @@ impl ImageStore {
                 self.unanswered.remove(&tier);
             }
         }
-        // Retry a held-back request: `request_batch` sends it only if no outdated submission
-        // for the tier is left unanswered, and holds it back again otherwise.
-        if self.deferred.remove(&tier) {
-            self.request_batch(&[tier]);
+        // Retry a held-back request, bound as it was asked: `submit` sends it only if no
+        // outdated submission for the tier is left unanswered, and holds it back again
+        // otherwise.
+        if let Some(bind) = self.deferred.remove(&tier) {
+            self.submit(&[tier], false, bind);
         }
         if done.promotion {
             return;
@@ -781,7 +813,11 @@ impl ImageStore {
         self.pending.remove(&done.key);
         if done.refused {
             self.stats.refused += 1;
-            self.refused.insert(done.key);
+            // Kept only while the photo's look is still the refused row's: a look read since
+            // from another catalog asks again.
+            if done.bound.is_some() && self.looks.get(&done.key.photo).map(|l| l.from) == done.bound {
+                self.refused.insert(done.key);
+            }
             cx.notify();
             return;
         }

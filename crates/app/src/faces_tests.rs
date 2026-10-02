@@ -838,14 +838,19 @@ fn overlay_boxes_show_on_a_thumbnail_the_darkroom_rendered_again(cx: &mut TestAp
     f.pool.finish(&thumb, Ok(pixels(400, 200)));
     work(&f.app, cx);
 
-    // What the strip does: ask for the photo's look (the cached one is rendered again), then
-    // let go when the Darkroom closes.
+    // What the strip does when a row names another look than the grid's (the rows re-read
+    // in between): the thumbnail is rendered again for it; then the grid's look, again. Only
+    // the Thumb tier's version moves.
     let from = f.app.wired.shell.read_with(cx, |s, _| s.rows_from()).unwrap();
     let claim = images.update(cx, |s, _| s.new_claim());
-    images.update(cx, |s, cx| s.request_looks(claim, from, &[(photo, None)], cx));
+    let other = Some(chairphoto_model::darkroom::filmstrip::CoverLook { version: 1, rev: 0 });
+    images.update(cx, |s, cx| s.request_looks(claim, from, &[(photo, other)], cx));
     f.pool.finish(&thumb, Ok(pixels(400, 200)));
     work(&f.app, cx);
     images.update(cx, |s, _| s.release_looks(claim));
+    images.update(cx, |s, cx| s.request_look_batch(from, &[(photo, None)], cx));
+    f.pool.finish(&thumb, Ok(pixels(400, 200)));
+    work(&f.app, cx);
     let (t, p) = images.read_with(cx, |s, _| (s.key(photo, ImageKind::Thumb).version, s.key(photo, ImageKind::Preview).version));
     assert_ne!(t, p, "the tiers' versions differ");
 

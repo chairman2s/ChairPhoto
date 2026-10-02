@@ -1,6 +1,6 @@
-//! Headless tests of the Faces module's first half (#129) through the real wiring: the
-//! settings panel, the indexing job's ownership (start, progress, done, Cancel, a catalog
-//! switch, re-attaching), the inspector's verbs and the person picker, and the loupe
+//! Headless tests of the Faces module through the real wiring: the settings panel, the
+//! indexing and matching jobs' ownership (start, progress, done, Cancel, a catalog switch,
+//! re-attaching) (#129, #130), the inspector's verbs and the person picker, and the loupe
 //! overlay's geometry (orientation, zoom, pan) with its keys and draw mode.
 //!
 //! No ONNX and no network: [`FakeFaces`] stands in for the model check, the download and the
@@ -15,15 +15,15 @@ use crate::machine_prefs::MachinePrefs;
 use crate::modules::faces::inspector::FacesInspector;
 use crate::modules::faces::overlay::{FaceOverlay, SHOW_BOXES_PREF};
 use crate::modules::faces::settings::FacesSettings;
-use crate::modules::faces::state::{FacesBackend, FacesBackendGlobal, FacesState, IndexPhase};
+use crate::modules::faces::state::{FacesBackend, FacesBackendGlobal, FacesState, IndexPhase, MatchPhase};
 use crate::modules::faces::FACES_MODULE_ID;
 use crate::modules::{ModuleRegistry, PanelSlot};
 use crate::shell::state::InspectorTab;
 use crate::storage::Runner;
 use chairphoto_core::app::faces::{self as core_faces, FaceBboxJson};
 use chairphoto_core::app::{
-    CatalogIdentity, FacesIndexDone, FacesJobStatus, FacesMatchDone, FacesMatchProgressEvent, FacesProgressEvent,
-    JobClaim, CATALOG_CHANGED,
+    CatalogIdentity, FacesIndexDone, FacesJobStatus, FacesMatchDone, FacesMatchJobStatus, FacesMatchProgressEvent,
+    FacesProgressEvent, JobClaim, CATALOG_CHANGED,
 };
 use chairphoto_core::image_pool::{ImageKind, JobKey};
 use chairphoto_core::plugins::faces::models::{ModelReport, ModelStatus};
@@ -40,6 +40,8 @@ struct FakeFaces {
     downloads: Mutex<usize>,
     claims: Mutex<Vec<JobClaim<FacesJobStatus>>>,
     starts: Mutex<Vec<Result<u64, String>>>,
+    match_claims: Mutex<Vec<JobClaim<FacesMatchJobStatus>>>,
+    match_starts: Mutex<Vec<Result<u64, String>>>,
 }
 
 impl FacesBackend for FakeFaces {
@@ -70,6 +72,17 @@ impl FacesBackend for FakeFaces {
         self.starts.lock().unwrap().push(result.clone());
         result
     }
+
+    /// The real core claim (`begin_match_job`); the test plays the worker.
+    fn start_match(&self, app: &AppState, from: CatalogIdentity) -> Result<u64, String> {
+        let result = core_faces::begin_match_job(app, Some(from)).map(|claim| {
+            let job = claim.job;
+            self.match_claims.lock().unwrap().push(claim);
+            job
+        });
+        self.match_starts.lock().unwrap().push(result.clone());
+        result
+    }
 }
 
 impl FakeFaces {
@@ -93,6 +106,17 @@ fn send_done(app: &App, job: u64, done: usize, total: usize, cx: &mut TestAppCon
         job,
         error: None,
     }));
+    cx.run_until_parked();
+}
+
+fn send_match_progress(app: &App, job: u64, done: usize, total: usize, cx: &mut TestAppContext) {
+    app.state.send(CoreEvent::FacesMatchProgress(FacesMatchProgressEvent { done, total, phase: "clustering unknowns", job }));
+    cx.run_until_parked();
+}
+
+fn send_match_done(app: &App, job: u64, cx: &mut TestAppContext) {
+    let outcome = chairphoto_core::plugins::faces::MatchOutcome { seeded: 1, constrained: 1, open: 1, clustered: 2, people: 3 };
+    app.state.send(CoreEvent::FacesMatchDone(FacesMatchDone { ok: true, outcome: Some(outcome), aborted: false, job, error: None }));
     cx.run_until_parked();
 }
 
@@ -295,6 +319,23 @@ fn settings_save_into_the_catalog_they_were_read_from(cx: &mut TestAppContext) {
     cx.run_until_parked();
     f.click("prefs-tab-module-faces", cx);
     assert!(f.present("faces-settings", cx), "the module's tab shows its settings panel");
+    // "Run matching" is on the panel (below the fold: started through the state); its run
+    // shows its step until its end.
+    assert!(f.present("faces-match", cx));
+    let state = f.state(cx);
+    state.update(cx, |s, cx| s.run_matching(cx));
+    work(&f.app, cx);
+    let job = f.fake.match_starts.lock().unwrap()[0].clone().unwrap();
+    send_match_progress(&f.app, job, 3, 6, cx);
+    assert_eq!(f.label("faces-match-progress", cx).as_deref(), Some("Matching (clustering unknowns): 3 / 6 (50%)"));
+    assert!(f.present("faces-match-cancel", cx));
+    f.fake.match_claims.lock().unwrap()[0].slot.clear();
+    send_match_done(&f.app, job, cx);
+    work(&f.app, cx);
+    assert_eq!(
+        f.label("faces-match-result", cx).as_deref(),
+        Some("Matching: 1 seeded, 2 suggested, 2 clustered (3 known people).")
+    );
     assert_eq!(f.label("faces-models", cx).as_deref(), Some("YuNet + AuraFace ready"));
     assert_eq!(root.read_with(cx, |i, _| i.value().to_string()), "Family");
     assert_eq!(threshold.read_with(cx, |i, _| i.value().to_string()), "0.45", "the default when unset");
@@ -479,12 +520,139 @@ fn reattach_never_adopts_a_finished_run_and_waits_for_a_match(cx: &mut TestAppCo
     assert_eq!(f.phase(cx), IndexPhase::Idle, "a finished run is not re-adopted");
     stale.slot.clear();
 
-    f.app.state.send(CoreEvent::FacesMatchProgress(FacesMatchProgressEvent { done: 1, total: 5, phase: "seed", job: 1 }));
-    cx.run_until_parked();
-    state.read_with(cx, |s, _| assert!(s.index.match_busy && !s.can_index()));
-    f.app.state.send(CoreEvent::FacesMatchDone(FacesMatchDone { ok: true, outcome: None, aborted: false, job: 1, error: None }));
+    // A match started elsewhere: its progress makes the panel read its slot and adopt it.
+    let elsewhere = core_faces::begin_match_job(&f.app.state, None).unwrap();
+    send_match_progress(&f.app, elsewhere.job, 1, 5, cx);
     work(&f.app, cx);
-    state.read_with(cx, |s, _| assert!(!s.index.match_busy && s.can_index()));
+    state.read_with(cx, |s, _| assert!(s.matching.busy() && !s.can_index() && !s.can_match()));
+    elsewhere.slot.clear();
+    send_match_done(&f.app, elsewhere.job, cx);
+    work(&f.app, cx);
+    state.read_with(cx, |s, _| assert!(!s.matching.busy() && s.can_index()));
+}
+
+// --- the matching job (#130) ----------------------------------------------------------------
+
+fn match_phase(f: &Faces, cx: &mut TestAppContext) -> MatchPhase {
+    let state = f.state(cx);
+    state.read_with(cx, |s, _| s.matching.phase)
+}
+
+/// "Run matching" follows its own run by id: a superseded run's progress and end change
+/// nothing, its own progress shows the step, its `faces:match_done` ends it with the result
+/// line — and an end that beats the start's answer is replayed. While it runs, neither job
+/// can start.
+#[gpui_kit::test]
+fn the_match_follows_only_its_own_events(cx: &mut TestAppContext) {
+    let f = open_faces(1, true, "faces-match", cx);
+    let state = f.state(cx);
+    state.update(cx, |s, cx| s.run_matching(cx));
+    assert_eq!(match_phase(&f, cx), MatchPhase::Starting);
+    work(&f.app, cx);
+    let job = f.fake.match_starts.lock().unwrap()[0].clone().unwrap();
+    assert_eq!(match_phase(&f, cx), MatchPhase::Running { job, done: 0, total: 0, step: "", progress: false });
+    state.read_with(cx, |s, _| assert!(!s.can_index() && !s.can_match(), "one job at a time"));
+    state.update(cx, |s, cx| s.index_faces(cx));
+    work(&f.app, cx);
+    assert!(f.fake.starts.lock().unwrap().is_empty(), "no index starts while matching");
+
+    send_match_progress(&f.app, job + 100, 5, 9, cx);
+    send_match_done(&f.app, job + 100, cx);
+    work(&f.app, cx);
+    assert_eq!(match_phase(&f, cx), MatchPhase::Running { job, done: 0, total: 0, step: "", progress: false });
+    send_match_progress(&f.app, job, 2, 4, cx);
+    assert_eq!(match_phase(&f, cx), MatchPhase::Running { job, done: 2, total: 4, step: "clustering unknowns", progress: true });
+
+    f.fake.match_claims.lock().unwrap()[0].slot.clear();
+    send_match_done(&f.app, job, cx);
+    work(&f.app, cx);
+    let line = "Matching: 1 seeded, 2 suggested, 2 clustered (3 known people).";
+    state.read_with(cx, |s, _| {
+        assert_eq!(s.matching.phase, MatchPhase::Idle);
+        assert_eq!(s.matching.last_result.as_deref(), Some(line));
+        assert!(s.can_index() && s.can_match());
+    });
+    assert_eq!(status(&f.app, cx), line);
+
+    // A tiny run: its end arrives before the start's answer, and is replayed.
+    let next = f.app.state.jobs.faces_match.abort().job_ids_issued() + 1;
+    state.update(cx, |s, cx| s.run_matching(cx));
+    send_match_done(&f.app, next, cx);
+    assert_eq!(match_phase(&f, cx), MatchPhase::Starting);
+    work(&f.app, cx);
+    assert_eq!(f.fake.match_starts.lock().unwrap()[1], Ok(next));
+    // Its slot still reads as running (the claim landed after the end was sent): a finished
+    // run is never re-adopted from it.
+    assert_eq!(match_phase(&f, cx), MatchPhase::Idle, "the early end ended the run");
+    f.fake.match_claims.lock().unwrap()[1].slot.clear();
+}
+
+/// Cancel names its run: once another start superseded ours, our Cancel stops nothing; our
+/// own run's flag is tripped and the panel says so until the end arrives.
+#[gpui_kit::test]
+fn match_cancel_stops_only_the_followed_run(cx: &mut TestAppContext) {
+    let f = open_faces(1, true, "faces-match-cancel", cx);
+    let state = f.state(cx);
+    state.update(cx, |s, cx| s.run_matching(cx));
+    work(&f.app, cx);
+    let ours = f.fake.match_claims.lock().unwrap()[0].abort.clone();
+    let newer = core_faces::begin_match_job(&f.app.state, None).unwrap();
+    state.update(cx, |s, cx| s.cancel_match(cx));
+    work(&f.app, cx);
+    assert!(!newer.abort.load(std::sync::atomic::Ordering::Relaxed), "our Cancel must not stop the newer run");
+    newer.slot.clear();
+    send_match_done(&f.app, state.read_with(cx, |s, _| s.matching.job().unwrap()), cx);
+    send_match_done(&f.app, newer.job, cx);
+    work(&f.app, cx);
+
+    state.update(cx, |s, cx| s.run_matching(cx));
+    work(&f.app, cx);
+    let claim_abort = f.fake.match_claims.lock().unwrap()[1].abort.clone();
+    state.update(cx, |s, cx| s.cancel_match(cx));
+    work(&f.app, cx);
+    assert!(claim_abort.load(std::sync::atomic::Ordering::Relaxed));
+    assert!(ours.load(std::sync::atomic::Ordering::Relaxed), "the first was superseded");
+    state.read_with(cx, |s, _| assert_eq!(s.matching.last_result.as_deref(), Some("Cancelling — stops at the next face…")));
+}
+
+/// A catalog switch: before `catalog:switched` reaches the UI a start bound to the old
+/// catalog is refused (the new catalog's run is not tripped); after it, the old run's end
+/// changes nothing and the new catalog's running match is adopted from its slot — and a
+/// straggler of the old run does not resurrect it.
+#[gpui_kit::test]
+fn a_switch_drops_the_old_match_and_adopts_the_new_catalogs(cx: &mut TestAppContext) {
+    let f = open_faces(1, true, "faces-match-switch", cx);
+    let state = f.state(cx);
+    state.update(cx, |s, cx| s.run_matching(cx));
+    work(&f.app, cx);
+    let old = state.read_with(cx, |s, _| s.matching.job().unwrap());
+    send_match_done(&f.app, old, cx); // ours ends
+    work(&f.app, cx);
+
+    let (b, _) = colliding_catalog(&f._dir, "b", 1);
+    core_switch(&f.app, b);
+    let theirs = core_faces::begin_match_job(&f.app.state, None).unwrap();
+    state.update(cx, |s, cx| s.run_matching(cx));
+    work(&f.app, cx);
+    assert_eq!(f.fake.match_starts.lock().unwrap().last().cloned(), Some(Err(CATALOG_CHANGED.to_string())));
+    assert!(!theirs.abort.load(std::sync::atomic::Ordering::Relaxed), "the refused start tripped nothing");
+    state.read_with(cx, |s, _| assert!(s.matching.error.as_deref().unwrap().contains(CATALOG_CHANGED)));
+
+    deliver_switch(&f.app, cx);
+    work(&f.app, cx);
+    assert!(matches!(match_phase(&f, cx), MatchPhase::Running { job, .. } if job == theirs.job), "the new catalog's run");
+    send_match_progress(&f.app, old, 9, 9, cx);
+    send_match_done(&f.app, old, cx);
+    work(&f.app, cx);
+    assert!(matches!(match_phase(&f, cx), MatchPhase::Running { job, .. } if job == theirs.job), "old events are ignored");
+
+    // Its end; afterwards an old straggler finds no slot and adopts nothing.
+    theirs.slot.clear();
+    send_match_done(&f.app, theirs.job, cx);
+    work(&f.app, cx);
+    send_match_progress(&f.app, theirs.job + 50, 1, 2, cx);
+    work(&f.app, cx);
+    assert_eq!(match_phase(&f, cx), MatchPhase::Idle);
 }
 
 // --- the inspector --------------------------------------------------------------------------

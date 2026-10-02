@@ -174,9 +174,10 @@ impl Darkroom {
     fn switch_now(&mut self, seq: u64, target: Option<i64>, cx: &mut Context<Self>) {
         let Some(open) = self.open.as_ref() else { return };
         let (from, photo_id) = (open.from, open.photo.id);
+        // Replaces the record: changes are refused until the other version is on screen.
         self.run_op(
             seq,
-            false,
+            true,
             move |state| {
                 with_catalog_as(state, from, |c| {
                     let versions = c.list_versions(photo_id)?;
@@ -194,8 +195,9 @@ impl Darkroom {
                     let before = (open.source_token().map(str::to_string), open.stage_json());
                     let record = parse_edit(v.as_ref().map(|v| v.edit_json.as_str()));
                     Self::adopt_committed(open, &record);
-                    // The other version's record replaces the screen; a change made on the
-                    // old one while this ran belonged to it and is not carried across.
+                    // The other version's record replaces the screen. No change was made on
+                    // the old one while this ran: changes were refused (React made them and
+                    // then dropped them here).
                     open.working = record.clone();
                     open.commit_again = false;
                     open.engine1_version = v.is_some() && is_engine1_version(&record);
@@ -254,21 +256,25 @@ impl Darkroom {
         };
         let json = if new_engine { record.to_json() } else { open.stamped(&record).to_json() };
         let saved = json.clone();
+        // The new-engine fork replaces the record (tone and look start over): changes are
+        // refused until it lands. "+ New version" copies the record, so a change made while
+        // it is written is kept and saved into the new version.
         self.run_op(
             seq,
-            false,
+            new_engine,
             Self::create_with(from, photo_id, name, json),
             move |this, result, cx| match result {
                 Ok((id, versions)) => {
                     let open = this.open.as_mut().expect("open");
                     let before = (open.source_token().map(str::to_string), open.stage_json());
                     if new_engine {
+                        // Nothing was changed meanwhile (refused): the fork's record is shown.
                         open.working = record.clone();
                         open.commit_again = false;
                         open.engine1_version = false;
                     }
-                    // A change made while the copy was written stays on screen and is saved
-                    // into the new version.
+                    // "+ New version": a change made while the copy was written stays on
+                    // screen and is saved into the new version.
                     Self::adopt_committed(open, &record);
                     open.version_id = Some(id);
                     open.version_unlisted = false;

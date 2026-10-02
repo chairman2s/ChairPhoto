@@ -835,7 +835,8 @@ impl DarkroomView {
         let mut rail = div().id("dk-rail").flex().flex_col().flex_none().w(px(280.)).h_full().p(px(12.)).overflow_y_scroll().border_l_1().border_color(colors.line);
         let Some(open) = d.open.as_ref() else { return rail.into_any_element() };
         if !open.editable() {
-            // A history step is replacing the record: changes are refused until it lands.
+            // A step, a switch or the new-engine fork is replacing the record: changes are
+            // refused until it lands.
             rail = rail.opacity(0.5);
         }
         let working = open.working.clone();

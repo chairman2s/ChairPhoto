@@ -814,6 +814,81 @@ fn the_version_shelf_new_version_switching_and_the_cover(cx: &mut TestAppContext
     assert_eq!(rig.catalog(|c| c.cover_of(photo).unwrap()), None);
 }
 
+/// **Forced interleaving.** A version switch and "Develop with the new engine" replace the
+/// record: a change made while either is on the worker is refused (the rail is not
+/// editable), not made on screen and then silently dropped as React did. The version left
+/// keeps what it held; the one arrived at shows its own record. "+ New version" copies the
+/// record instead, so a change made while it is written is kept and saved into it.
+#[gpui_kit::test]
+fn changes_during_a_switch_or_a_new_engine_fork_are_refused_not_dropped(cx: &mut TestAppContext) {
+    use chairphoto_model::darkroom::controls::EffectKey;
+    let rig = rig("dk-switch-refuse", 1, cx);
+    let photo = rig.ids[0];
+    rig.slide(Control::Tone(ToneKey::Ev), 0.5, cx);
+    rig.settle_and_save(cx);
+    let v1 = rig.versions()[0].id;
+    let old = r#"{"tone":{"ev":1},"crop":{"x":0.1,"y":0.1,"w":0.8,"h":0.8}}"#;
+    let mine = rig.catalog(|c| {
+        let id = c.create_version(photo, "Mine").unwrap();
+        c.set_version_edit(id, old).unwrap();
+        id
+    });
+    let d = rig.darkroom(cx);
+    let editable = |cx: &mut TestAppContext| d.read_with(cx, |d, _| d.open.as_ref().unwrap().editable());
+
+    // The switch on the worker: a slider is refused.
+    d.update(cx, |d, cx| d.switch_version(Some(mine), cx));
+    assert!(!editable(cx), "the switch is on the worker");
+    rig.slide(Control::Effect(EffectKey::Fade), 0.2, cx);
+    assert_eq!(rig.working(cx).get("fade"), None, "refused: not shown as if it would be kept");
+    assert_eq!(rig.working(cx)["tone"]["ev"], json!(0.5), "still version 1's record");
+    work(cx);
+    assert!(editable(cx));
+    assert_eq!(rig.version_id(cx), Some(mine));
+    assert_eq!(rig.working(cx)["tone"]["ev"], json!(1), "the version switched to");
+    assert_eq!(rig.saved(v1).get("fade"), None, "nothing written to the version left");
+    assert_eq!(rig.saved(mine)["tone"]["ev"], json!(1));
+
+    // The new-engine fork on the worker: a slider is refused.
+    let source = DevelopSource::Raw {
+        camera: "Sony".into(),
+        megapixels: 61.0,
+        bits: 16,
+        decoder: "0.22".into(),
+        token: Some(format!("w:{photo}:3")),
+        camera_ev: Some(-0.5),
+        as_shot_wb: None,
+        lens: None,
+    };
+    rig.app.state.send(CoreEvent::DevelopSource(DevelopSourceEvent { photo_id: photo, job: 3, source }));
+    cx.run_until_parked();
+    assert!(d.read_with(cx, |d, _| d.open.as_ref().unwrap().engine1_version));
+    d.update(cx, |d, cx| d.develop_with_new_engine(cx));
+    assert!(!editable(cx), "the fork is on the worker");
+    rig.slide(Control::Effect(EffectKey::Fade), 0.2, cx);
+    assert_eq!(rig.working(cx).get("fade"), None, "refused during the fork");
+    work(cx);
+    advance(cx, AUTOSAVE_QUIET);
+    work(cx);
+    assert!(editable(cx));
+    let fork = rig.versions().into_iter().find(|v| v.name == "Mine (RAW)").expect("the fork");
+    assert_eq!(rig.version_id(cx), Some(fork.id));
+    assert_eq!(rig.working(cx).get("fade"), None);
+    assert_eq!(rig.working(cx).get("tone"), None, "tone starts over on the new engine");
+    assert_eq!(rig.catalog(|c| c.get_version(mine).unwrap().unwrap().edit_json), old, "the engine-1 version is untouched");
+
+    // "+ New version" keeps a change made while it is written.
+    d.update(cx, |d, cx| d.new_version(cx));
+    assert!(editable(cx), "a copy does not replace the record");
+    rig.slide(Control::Effect(EffectKey::Fade), 0.2, cx);
+    work(cx);
+    advance(cx, AUTOSAVE_QUIET);
+    work(cx);
+    let copy = rig.version_id(cx).unwrap();
+    assert_ne!(copy, fork.id);
+    assert_eq!(rig.saved(copy)["fade"], json!(0.2), "saved into the new version");
+}
+
 /// "Develop with the new engine": an engine-1 version's framing as a fresh engine-2 version
 /// "<name> (RAW)"; the engine-1 version is left as it was.
 #[gpui_kit::test]

@@ -511,6 +511,98 @@ fn a_stale_reread_does_not_undo_create_or_forget(cx: &mut TestAppContext) {
     assert!(s.present("obsidian-create", cx), "a later re-read agrees");
 }
 
+/// A tag with a note in catalog A, shown in its open tag editor (the record read, "Open
+/// note"). Returns the tag's id and uuid.
+fn tag_with_note(s: &Ob, cx: &mut TestAppContext) -> (i64, String) {
+    s.set_vault("A");
+    let tag_id = with_cat(&s.app, |c| c.create_tag("Places/Here").unwrap());
+    s.app.wired.model.update(cx, |m, cx| m.refresh(cx));
+    work(&s.app, cx);
+    s.edit_tag(tag_id, cx);
+    s.click("obsidian-tag-create", cx);
+    assert!(s.present("obsidian-tag-open", cx), "the tag's note is shown");
+    (tag_id, with_cat(&s.app, |c| c.get_tag(tag_id).unwrap().uuid))
+}
+
+fn has_dialog(s: &Ob, cx: &mut TestAppContext) -> bool {
+    cx.update_window(s.window(), |_, window, cx| gpui_kit::component::WindowExt::has_active_dialog(window, cx)).unwrap()
+}
+
+/// `catalog:switched` delivered while the tag editor shows a tag's note — to a catalog whose
+/// tag has the same id: the editor closes, the shell names no tag and the Tag slot is empty
+/// at once (nothing of A's tag stays on screen), and stays empty after B is read.
+///
+/// Mutation-checked: the editor kept open on a switch (`bind_dialog` not closing it) fails
+/// this test; so does keeping the Tag slot on a switch (no reset in `catalog_switched` nor in
+/// `follow_kind`'s "no subject" branch).
+#[gpui_kit::test]
+fn a_delivered_switch_closes_the_tag_editor_and_empties_the_tag_note(cx: &mut TestAppContext) {
+    let s = open_ob(1, "ob-tag-switched", cx);
+    let (tag_id, _) = tag_with_note(&s, cx);
+    let state = s.state(cx);
+    let (b, _) = colliding_catalog(&s.dir, "b", 1);
+    assert_eq!(b.create_tag("Other/There").unwrap(), tag_id, "colliding tag ids");
+    b.set_setting(&ob_setting("vault"), "B").unwrap();
+    core_switch(&s.app, b);
+    s.app.state.send(CoreEvent::CatalogSwitched("switched.chairphoto".into()));
+    cx.run_until_parked();
+    state.read_with(cx, |st, _| assert_eq!(st.slot(Kind::Tag).view, NoteView::None, "the Tag slot is empty at once"));
+    s.app.wired.shell.read_with(cx, |sh, _| assert_eq!((sh.editing_tag, sh.editing_tag_from), (None, None)));
+    work(&s.app, cx);
+    assert!(!has_dialog(&s, cx), "the tag editor closed");
+    state.read_with(cx, |st, _| assert_eq!(st.slot(Kind::Tag).view, NoteView::None, "…and stays empty once B is read"));
+    assert!(!s.present("obsidian-tag-panel", cx));
+}
+
+/// Closing the tag editor (no switch) empties the Tag slot: the module stops showing, and
+/// stops acting on, the closed editor's tag.
+///
+/// Mutation-checked: a `follow_kind` that keeps the slot when its subject goes away fails it.
+#[gpui_kit::test]
+fn closing_the_tag_editor_empties_the_tag_note(cx: &mut TestAppContext) {
+    let s = open_ob(1, "ob-tag-close", cx);
+    tag_with_note(&s, cx);
+    let state = s.state(cx);
+    state.read_with(cx, |st, _| assert!(st.slot(Kind::Tag).linked().is_some_and(|l| l.record.is_some())));
+    cx.update_window(s.window(), |_, window, cx| gpui_kit::component::WindowExt::close_dialog(window, cx)).unwrap();
+    work(&s.app, cx);
+    assert!(!has_dialog(&s, cx), "the tag editor closed");
+    s.app.wired.shell.read_with(cx, |sh, _| assert_eq!((sh.editing_tag, sh.editing_tag_from), (None, None)));
+    state.read_with(cx, |st, _| assert_eq!(st.slot(Kind::Tag).view, NoteView::None, "the Tag slot is empty"));
+}
+
+/// A Create still queued when a catalog switch lands (the new catalog published and
+/// `catalog:switched` delivered) runs against the new catalog, whose photo has the same id:
+/// it is refused — nothing opens, nothing is written to either catalog.
+///
+/// Mutation-checked: running Create under `with_catalog` (whatever is open) instead of
+/// `with_catalog_as` writes B's record and opens a URI, failing this test.
+#[gpui_kit::test]
+fn a_create_in_flight_across_a_switch_neither_opens_nor_writes_the_new_catalog(cx: &mut TestAppContext) {
+    let s = open_ob(1, "ob-create-switch", cx);
+    let p = s.ids[0];
+    s.set_vault("A");
+    s.select(p, cx);
+    let state = s.state(cx);
+    let a_uuid = with_cat(&s.app, |c| c.get_photo(p).unwrap().uuid);
+
+    state.update(cx, |st, cx| st.create(Kind::Photo, cx));
+    let create = hold(cx);
+    assert_eq!(create.len(), 1, "Create's job");
+    let (b, b_ids) = colliding_catalog(&s.dir, "b", 1);
+    assert_eq!(b_ids[0], p, "colliding photo ids");
+    b.set_setting(&ob_setting("vault"), "B").unwrap();
+    core_switch(&s.app, b);
+    deliver_switch(&s.app, cx);
+    cx.update(|cx| Runner::get(cx).release(create));
+    work(&s.app, cx);
+    assert_eq!(cx.opened_url(), None, "nothing opens");
+    assert_eq!(s.obsidian_settings(), vec![("obsidian.vault".to_string(), "B".to_string())], "B got no record");
+    assert!(status(&s.app, cx).contains(CATALOG_CHANGED), "{}", status(&s.app, cx));
+    state.read_with(cx, |st, _| assert!(!st.photo.creating));
+    assert_eq!(reopen_a(&s.dir).get_setting(&ob_setting(&format!("note.{a_uuid}"))).unwrap(), None, "A got no record");
+}
+
 /// Catalog A ([`open_catalog_with_photos`]'s file), reopened after a switch away from it, to
 /// check what it holds.
 fn reopen_a(dir: &TempDir) -> Catalog {

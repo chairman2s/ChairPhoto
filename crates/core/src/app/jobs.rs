@@ -31,7 +31,7 @@
 //! **catalog → abort generations → status slots**, and within each of the last two groups
 //! the declaration order of [`JobRegistry`]: scan, face indexing, face matching, sharpness,
 //! pHash, trash, import, reconcile, Smart Tagging, identity repair, burst analysis, export,
-//! bundle export, slideshow, LocalSend send.
+//! bundle export, slideshow, LocalSend send, the Flickr, SmugMug and Instagram uploads.
 //!
 //! Every nested acquisition in the backend obeys it:
 //!
@@ -45,6 +45,7 @@
 //! | `storage::claim_reconcile` (a back-up drain or offload-policy start) | catalog → the reconcile abort |
 //! | `slideshow::claim_slideshow` (a slideshow render start) | catalog → the slideshow abort |
 //! | `localsend::claim_send` (a LocalSend send start) | catalog → the LocalSend abort |
+//! | `uploads::claim_upload` (a Flickr/SmugMug upload or an Instagram post start) | catalog → that service's upload abort |
 //! | [`AbortGeneration::install_fresh_if_owner`] (a card import committing to index) | the scan abort → the import abort |
 //! | [`AbortGeneration::install_fresh_if_newer`] (a burst-analysis worker's claim) | one abort, released before the catalog is read |
 //! | `exports::claim_export`, `exports::claim_bundle_export` | one abort, released before the catalog is read |
@@ -543,6 +544,23 @@ pub struct JobRegistry {
     /// terminal result, and its `localsend:progress` events carry the job id.
     #[cfg(feature = "localsend")]
     pub localsend: AbortGeneration,
+    /// Publishing one photo to Flickr (`app::uploads`, `app::flickr`): the render and the
+    /// upload. Claimed under the catalog lock (`uploads::claim_upload`); a newer Flickr
+    /// publish, Cancel or a catalog switch trips it — the job stops before its render and
+    /// before its upload (an upload already in flight is not interrupted: the service may
+    /// already hold it). No status slot: the job returns its own terminal result.
+    ///
+    /// The three upload families are not feature-gated, unlike their services: the claim and
+    /// render (`app::uploads`) are the shared publish flow's, compiled and tested in every
+    /// build, and an unused generation costs one mutex.
+    pub upload_flickr: AbortGeneration,
+    /// Publishing one photo to SmugMug — as [`Self::upload_flickr`], its own family so a
+    /// Flickr publish never cancels a SmugMug one.
+    pub upload_smugmug: AbortGeneration,
+    /// A supervised Instagram post (`app::instagram`): the render, then handing it to Chrome.
+    /// Tripped before Chrome has the render, it stops; once the composer has it, the browser
+    /// window is the cancel (docs/instagram.md).
+    pub upload_instagram: AbortGeneration,
     /// The Develop session's working image (docs/plans/raw-foundation): one claim per
     /// opened photo; a switch, exit or catalog change trips it and the image is released.
     #[cfg(all(feature = "raw", feature = "edit"))]
@@ -587,6 +605,9 @@ impl JobRegistry {
             slideshow: _,
             #[cfg(feature = "localsend")]
             localsend: _,
+            upload_flickr: _,
+            upload_smugmug: _,
+            upload_instagram: _,
             #[cfg(all(feature = "raw", feature = "edit"))]
             develop,
         } = self;
@@ -633,6 +654,9 @@ impl JobRegistry {
             slideshow,
             #[cfg(feature = "localsend")]
             localsend,
+            upload_flickr,
+            upload_smugmug,
+            upload_instagram,
             #[cfg(all(feature = "raw", feature = "edit"))]
             develop,
         } = self;
@@ -657,6 +681,9 @@ impl JobRegistry {
             slideshow: slideshow.lock()?,
             #[cfg(feature = "localsend")]
             localsend: localsend.lock()?,
+            upload_flickr: upload_flickr.lock()?,
+            upload_smugmug: upload_smugmug.lock()?,
+            upload_instagram: upload_instagram.lock()?,
             #[cfg(all(feature = "raw", feature = "edit"))]
             develop: develop.abort.lock()?,
         })
@@ -685,6 +712,9 @@ pub struct AbortGuards<'a> {
     slideshow: MutexGuard<'a, Arc<AtomicBool>>,
     #[cfg(feature = "localsend")]
     localsend: MutexGuard<'a, Arc<AtomicBool>>,
+    upload_flickr: MutexGuard<'a, Arc<AtomicBool>>,
+    upload_smugmug: MutexGuard<'a, Arc<AtomicBool>>,
+    upload_instagram: MutexGuard<'a, Arc<AtomicBool>>,
     #[cfg(all(feature = "raw", feature = "edit"))]
     develop: MutexGuard<'a, Arc<AtomicBool>>,
 }
@@ -713,6 +743,9 @@ impl AbortGuards<'_> {
             slideshow,
             #[cfg(feature = "localsend")]
             localsend,
+            upload_flickr,
+            upload_smugmug,
+            upload_instagram,
             #[cfg(all(feature = "raw", feature = "edit"))]
             develop,
         } = self;
@@ -736,6 +769,9 @@ impl AbortGuards<'_> {
         slideshow.store(true, Ordering::Relaxed);
         #[cfg(feature = "localsend")]
         localsend.store(true, Ordering::Relaxed);
+        upload_flickr.store(true, Ordering::Relaxed);
+        upload_smugmug.store(true, Ordering::Relaxed);
+        upload_instagram.store(true, Ordering::Relaxed);
         #[cfg(all(feature = "raw", feature = "edit"))]
         develop.store(true, Ordering::Relaxed);
     }
@@ -781,6 +817,9 @@ impl AbortGuards<'_> {
                 ref mut slideshow,
             #[cfg(feature = "localsend")]
                 ref mut localsend,
+            ref mut upload_flickr,
+            ref mut upload_smugmug,
+            ref mut upload_instagram,
             #[cfg(all(feature = "raw", feature = "edit"))]
                 ref mut develop,
         } = self;
@@ -812,6 +851,9 @@ impl AbortGuards<'_> {
         {
             **localsend = Arc::new(AtomicBool::new(false));
         }
+        **upload_flickr = Arc::new(AtomicBool::new(false));
+        **upload_smugmug = Arc::new(AtomicBool::new(false));
+        **upload_instagram = Arc::new(AtomicBool::new(false));
         #[cfg(all(feature = "raw", feature = "edit"))]
         {
             **develop = Arc::new(AtomicBool::new(false));
@@ -1220,6 +1262,8 @@ mod tests {
         let (slideshow, _) = registry.slideshow.install_fresh_numbered().unwrap();
         #[cfg(feature = "localsend")]
         let (localsend, _) = registry.localsend.install_fresh_numbered().unwrap();
+        let uploads = [&registry.upload_flickr, &registry.upload_smugmug, &registry.upload_instagram]
+            .map(|g| g.install_fresh_numbered().unwrap().0);
 
         let identity = begin_identity(&registry, &catalog).unwrap();
         #[cfg(feature = "smarttags")]
@@ -1237,6 +1281,7 @@ mod tests {
         assert!(slideshow.load(Ordering::Relaxed), "and a slideshow render");
         #[cfg(feature = "localsend")]
         assert!(localsend.load(Ordering::Relaxed), "and a LocalSend send");
+        assert!(uploads.iter().all(|u| u.load(Ordering::Relaxed)), "and every publish upload");
         assert!(identity.abort.load(Ordering::Relaxed), "and the identity repair pass");
         assert!(
             registry.identity.status().unwrap().is_none(),

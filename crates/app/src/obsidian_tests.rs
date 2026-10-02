@@ -370,6 +370,92 @@ fn create_and_forget_fail_closed_after_a_switch(cx: &mut TestAppContext) {
     });
 }
 
+/// Run `held` Runner work (from `hold_pending`) on this thread, without letting its results
+/// land: a worker that has read and answered, whose answer the UI has not taken yet.
+fn run_held(held: Vec<Box<dyn FnOnce() + Send>>) -> usize {
+    let n = held.len();
+    for w in held {
+        w();
+    }
+    n
+}
+
+/// Hold everything queued on the Runner (work started but not yet picked up by a worker).
+fn hold(cx: &mut TestAppContext) -> Vec<Box<dyn FnOnce() + Send>> {
+    cx.update(|cx| Runner::get(cx).hold_pending())
+}
+
+/// A refresh (`CatalogRead`) while a Create, then a Forget, is in flight forces a re-read of
+/// the record. On a pool of workers that re-read can read the record before the write
+/// commits and land after the write has: its answer is stale and must not undo the write on
+/// the panel (Create offered again for a stored note, or Open for a forgotten one).
+///
+/// The test scheduler orders two ready landings at random, so the re-read's stale snapshot is
+/// forced instead: the write commits and lands first, then the held re-read runs against the
+/// catalog as it was before the write (the key put back as it was), then lands.
+///
+/// Mutation-checked: without the sequence bump in `set_record` the panel shows "Create note"
+/// after Create and this test fails; bumping only when a record is set (Create, not Forget)
+/// fails the Forget half.
+#[gpui_kit::test]
+fn a_stale_reread_does_not_undo_create_or_forget(cx: &mut TestAppContext) {
+    let s = open_ob(1, "ob-reread", cx);
+    let p = s.ids[0];
+    s.set_vault("V");
+    s.select(p, cx);
+    let state = s.state(cx);
+    let key = format!("obsidian.note.{}", with_cat(&s.app, |c| c.get_photo(p).unwrap().uuid));
+    let set_raw = |value: Option<&str>| {
+        with_cat(&s.app, |c| match value {
+            Some(v) => c.set_setting(&key, v).unwrap(),
+            None => {
+                c.conn().execute("DELETE FROM settings WHERE key = ?1", [&key]).unwrap();
+            }
+        })
+    };
+
+    // Create starts; a refresh then forces a re-read of the record while Create is held.
+    state.update(cx, |st, cx| st.create(Kind::Photo, cx));
+    let create = hold(cx);
+    assert_eq!(create.len(), 1, "Create's job");
+    s.app.wired.model.update(cx, |m, cx| m.refresh(cx));
+    cx.run_until_parked();
+    let reread = hold(cx);
+    assert!(!reread.is_empty(), "the CatalogRead forced a re-read");
+    // Create commits and lands.
+    run_held(create);
+    cx.run_until_parked();
+    assert!(s.present("obsidian-open", cx), "Create landed");
+    // The re-read, as read before Create committed (no record), lands after it.
+    let stored = s.setting(&key).expect("Create's record");
+    set_raw(None);
+    run_held(reread);
+    set_raw(Some(&stored));
+    cx.run_until_parked();
+    assert!(s.present("obsidian-open", cx), "a stale re-read does not take back Create's record");
+    state.read_with(cx, |st, _| assert!(st.photo.linked().unwrap().record.is_some()));
+
+    // Forget, the same way: the re-read read the record before Forget blanked it.
+    state.update(cx, |st, cx| st.forget(Kind::Photo, cx));
+    let forget = hold(cx);
+    assert_eq!(forget.len(), 1, "Forget's job");
+    s.app.wired.model.update(cx, |m, cx| m.refresh(cx));
+    cx.run_until_parked();
+    let reread = hold(cx);
+    assert!(!reread.is_empty(), "the CatalogRead forced a re-read");
+    run_held(forget);
+    cx.run_until_parked();
+    assert!(s.present("obsidian-create", cx), "Forget landed");
+    set_raw(Some(&stored));
+    run_held(reread);
+    set_raw(Some(""));
+    cx.run_until_parked();
+    assert!(s.present("obsidian-create", cx), "a stale re-read does not bring back a forgotten record");
+    state.read_with(cx, |st, _| assert!(st.photo.linked().unwrap().record.is_none()));
+    work(&s.app, cx);
+    assert!(s.present("obsidian-create", cx), "a later re-read agrees");
+}
+
 /// Catalog A ([`open_catalog_with_photos`]'s file), reopened after a switch away from it, to
 /// check what it holds.
 fn reopen_a(dir: &TempDir) -> Catalog {

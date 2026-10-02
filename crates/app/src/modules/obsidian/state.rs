@@ -369,11 +369,17 @@ impl ObsidianState {
         );
     }
 
-    /// Set the shown subject's record, if `(id, from)` is still the one shown.
+    /// Set the shown subject's record, if `(id, from)` is still the one shown — a Create or
+    /// Forget that has committed. It also bumps the slot's sequence: a re-read still in
+    /// flight (every `CatalogRead` forces one) may have read the record before that write
+    /// committed, and on a pool of workers it can land after it; its answer is stale. A
+    /// re-read started after this one reads the committed record.
     fn set_record(&mut self, kind: Kind, id: i64, from: CatalogIdentity, record: Option<NoteRecord>) {
-        if let NoteView::Ready(l) = &mut self.slot_mut(kind).view {
+        let slot = self.slot_mut(kind);
+        if let NoteView::Ready(l) = &mut slot.view {
             if l.id == id && l.from == from {
                 l.record = record;
+                slot.seq += 1;
             }
         }
     }

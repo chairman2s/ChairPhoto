@@ -12,6 +12,7 @@ pub mod deep_link;
 pub mod editing;
 pub mod js_compat;
 pub mod library;
+pub mod obsidian;
 pub mod presets;
 pub mod publishing;
 pub mod shell_timing;

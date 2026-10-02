@@ -60,6 +60,20 @@ pub enum DeepLink {
     Tag { uuid: String },
 }
 
+impl DeepLink {
+    /// The link as a URL, in the two-slash form [`parse`] reads back to `self` (for a uuid
+    /// of the catalog's lowercase 36 characters): `chairphoto://<uuid>` (grid),
+    /// `…/loupe`, `…/develop`, `chairphoto://tag/<uuid>`. What the Obsidian module writes
+    /// into a note (`obsidian.tsx` built these strings by hand).
+    pub fn url(&self) -> String {
+        match self {
+            DeepLink::Photo { uuid, view: DeepLinkView::Grid } => format!("chairphoto://{uuid}"),
+            DeepLink::Photo { uuid, view } => format!("chairphoto://{uuid}/{}", view.as_str()),
+            DeepLink::Tag { uuid } => format!("chairphoto://tag/{uuid}"),
+        }
+    }
+}
+
 const UUID_LEN: usize = 36;
 
 /// Parse one URL, as both api.ts matchers together did. `None` for anything else.
@@ -207,6 +221,21 @@ mod tests {
         assert_eq!(parse("chairphoto://ééééééééééééééééééééééééééééééééééé"), None);
         assert_eq!(parse("chairphoto://tag/éééééééééééééééééééééééééééééééééé"), None);
         assert_eq!(parse("chairphotö://x"), None);
+    }
+
+    /// `url` is the exact string obsidian.tsx wrote, and `parse` reads every link back.
+    #[test]
+    fn url_round_trips_through_parse() {
+        let links = [
+            (DeepLink::Photo { uuid: U.into(), view: DeepLinkView::Grid }, format!("chairphoto://{U}")),
+            (DeepLink::Photo { uuid: U.into(), view: DeepLinkView::Loupe }, format!("chairphoto://{U}/loupe")),
+            (DeepLink::Photo { uuid: U.into(), view: DeepLinkView::Develop }, format!("chairphoto://{U}/develop")),
+            (DeepLink::Tag { uuid: U.into() }, format!("chairphoto://tag/{U}")),
+        ];
+        for (link, url) in links {
+            assert_eq!(link.url(), url);
+            assert_eq!(parse(&link.url()), Some(link));
+        }
     }
 
     #[test]

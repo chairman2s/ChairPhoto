@@ -659,6 +659,33 @@ mod tests {
         assert!(!crate::xmp::sidecar_path(&photo_path).exists());
     }
 
+    /// #149 merged: a sidecar write now refuses when the original (or its folder) is missing
+    /// — the volume went away between the resolve and the write. That is an offline photo,
+    /// not a sidecar that refuses: the pass counts it as failed, records no refusal, keeps the
+    /// record and tries again next time.
+    #[test]
+    fn a_vanished_original_is_retried_not_set_aside() {
+        let dir = crate::test_support::TestTmpDir::new("faces-regions-legacy-vanished");
+        let gone = dir.join("unmounted").join("OLD.JPG");
+        let conn = mem_conn();
+        conn.execute_batch(
+            "INSERT INTO photos (id, width, height, exif_orientation) VALUES (1, 6000, 4000, 1);
+             INSERT INTO faces__legacy_regions (face_id, photo_id, name, bbox)
+                 VALUES (100, 1, 'Alice', '[0.1,0.1,0.2,0.2]');",
+        )
+        .unwrap();
+        let abort = std::sync::atomic::AtomicBool::new(false);
+        for pass in 0..2 {
+            let resolve = |_| Ok(Some(gone.clone()));
+            let out = convert_legacy_regions(&conn, resolve, &abort, |_, _| {}).unwrap();
+            assert_eq!(out, LegacyConversion { failed: 1, ..Default::default() }, "pass {pass}");
+        }
+        let refused: i64 = conn.query_row("SELECT COUNT(*) FROM faces__legacy_refused", [], |r| r.get(0)).unwrap();
+        assert_eq!(refused, 0);
+        assert_eq!(record(&conn).len(), 1);
+        assert!(!gone.parent().unwrap().exists(), "the folder was created");
+    }
+
     /// A write that reaches the sidecar spends the photo's record — the region it described
     /// was adopted or removed — while an offline photo keeps it for the write that will.
     #[test]

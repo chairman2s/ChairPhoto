@@ -92,6 +92,11 @@ pub enum CatalogError {
 const WAL_BUSY_RETRY_TIMEOUT: Duration = Duration::from_secs(60);
 const WAL_BUSY_RETRY_DELAY: Duration = Duration::from_millis(10);
 
+/// The schema version whose migration fills `photos.exif_orientation` (#136). Its one use is
+/// the `prior_version` gate in `migrate_locked`; renumbering the migration is changing this
+/// and [`schema::SCHEMA_VERSION`] together.
+pub(crate) const EXIF_ORIENTATION_SINCE: i64 = 26;
+
 // SQLite's bind-parameter ceiling (`SQLITE_MAX_VARIABLE_NUMBER`) depends on the build:
 // 32766 since 3.32, and 999 in older builds. We bundle 3.45, but the chunk stays below
 // the older 999 too, so chunked `IN` queries hold if this ever links a system SQLite.
@@ -331,6 +336,9 @@ impl Catalog {
         self.ensure_column("photos", "is_grayscale", "INTEGER")?;
         // Non-destructive user orientation override (degrees clockwise), schema v17.
         self.ensure_column("photos", "user_rotation", "INTEGER NOT NULL DEFAULT 0")?;
+        // The original's EXIF Orientation (1-8, NULL = unknown), for face regions (#136).
+        // Backfilled below from what earlier scans already stored in `photo_metadata`.
+        self.ensure_column("photos", "exif_orientation", "INTEGER")?;
         // RAW+JPEG stacking: a derivative photo points at its master (schema v18).
         self.ensure_column(
             "photos",
@@ -432,6 +440,12 @@ impl Catalog {
             // that is not a UUID has already been re-minted.
             self.canonicalise_photo_identities()?;
         }
+        if prior_version < EXIF_ORIENTATION_SINCE {
+            // #136: a rescan extracts only new or changed files, so a catalog scanned before
+            // the column existed would never get it. Every earlier scan stored exiftool's
+            // `EXIF:Orientation` as a generic entry; promote that.
+            self.backfill_exif_orientation()?;
+        }
         // Keep the catalog-root (local) volume pointing at the current root, so
         // re-rooting the catalog moves it too.
         self.sync_default_volume_root()?;
@@ -522,6 +536,39 @@ impl Catalog {
         if !existing.iter().any(|c| c == column) {
             self.conn
                 .execute(&format!("ALTER TABLE {table} ADD COLUMN {column} {declaration}"), [])?;
+        }
+        Ok(())
+    }
+
+    /// Schema v26 (#136): fill `photos.exif_orientation` from the `EXIF:Orientation` entry a
+    /// scan stored in `photo_metadata` (exiftool's phrase, "Rotate 90 CW"), or failing that
+    /// the numeric code the AF-point pass stored. A row with neither stays NULL: unknown,
+    /// never guessed. Rows that already hold a value are left alone.
+    fn backfill_exif_orientation(&self) -> Result<()> {
+        let rows: Vec<(i64, String)> = {
+            let mut stmt = self.conn.prepare(
+                "SELECT m.photo_id, m.value FROM photo_metadata m
+                   JOIN photos p ON p.id = m.photo_id AND p.exif_orientation IS NULL
+                  WHERE (m.group_name = 'EXIF' AND m.key = 'Orientation')
+                     OR (m.group_name = ?1 AND m.key = ?2)
+                  ORDER BY m.photo_id, m.group_name = 'EXIF'",
+            )?;
+            let rows = stmt
+                .query_map(
+                    params![crate::metadata::AF_GROUP, crate::metadata::AF_ORIENTATION_KEY],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            rows
+        };
+        // Ordered so a photo's `EXIF:Orientation` comes after its AF-pass code and wins.
+        let mut update = self
+            .conn
+            .prepare("UPDATE photos SET exif_orientation = ?1 WHERE id = ?2")?;
+        for (photo_id, value) in rows {
+            if let Some(code) = crate::metadata::parse_exif_orientation(&value) {
+                update.execute(params![code, photo_id])?;
+            }
         }
         Ok(())
     }
@@ -1064,7 +1111,8 @@ impl Catalog {
         self.conn.execute(
             "UPDATE photos SET width = ?1, height = ?2, capture_time = ?3, camera_make = ?4,
                 camera_model = ?5, lens = ?6, focal_length = ?7, aperture = ?8, shutter_speed = ?9,
-                iso = ?10, gps_latitude = ?11, gps_longitude = ?12, updated_at = ?13
+                iso = ?10, gps_latitude = ?11, gps_longitude = ?12, updated_at = ?13,
+                exif_orientation = ?15
              WHERE id = ?14",
             params![
                 promoted.width,
@@ -1080,7 +1128,8 @@ impl Catalog {
                 promoted.gps_latitude,
                 promoted.gps_longitude,
                 now(),
-                photo_id
+                photo_id,
+                promoted.exif_orientation.map(i64::from),
             ],
         )?;
         Ok(())
@@ -2633,5 +2682,76 @@ mod tests {
         assert_eq!(c.rotate_photo(id, 180).unwrap(), 90);
         assert_eq!(c.rotate_photo(id, 90).unwrap(), 180);
         assert_eq!(c.photo_rotation(id).unwrap(), 180);
+    }
+
+    fn exif_orientation_of(c: &Catalog, id: i64) -> Option<i64> {
+        c.conn
+            .query_row("SELECT exif_orientation FROM photos WHERE id = ?1", [id], |r| r.get(0))
+            .unwrap()
+    }
+
+    /// A scan records the EXIF Orientation it extracted; a later extraction without one
+    /// clears it rather than keeping a stale code.
+    #[test]
+    fn set_photo_metadata_records_the_exif_orientation() {
+        let dir = crate::test_support::TestTmpDir::new("exif-orientation-set");
+        let root = dir.join("photos");
+        std::fs::create_dir_all(&root).unwrap();
+        let c = Catalog::open(&dir.join("test.chairphoto"), &root).unwrap();
+        let id = c.upsert_photo(&root.join("a.ARW"), None, 0, 1).unwrap().id;
+        assert_eq!(exif_orientation_of(&c, id), None, "unknown until extracted");
+        let rotated = PromotedMetadata { exif_orientation: Some(6), ..Default::default() };
+        c.set_photo_metadata(id, &rotated, &[]).unwrap();
+        assert_eq!(exif_orientation_of(&c, id), Some(6));
+        c.set_photo_metadata(id, &PromotedMetadata::default(), &[]).unwrap();
+        assert_eq!(exif_orientation_of(&c, id), None);
+    }
+
+    /// #136: opening a catalog from before `exif_orientation` fills the column from what its
+    /// scans stored in `photo_metadata` — exiftool's `EXIF:Orientation` phrase, else the AF
+    /// pass's numeric code — and leaves a photo with neither unknown. The migration is
+    /// gated on [`EXIF_ORIENTATION_SINCE`], so the test follows a renumbering.
+    #[test]
+    fn opening_an_older_catalog_backfills_the_exif_orientation() {
+        let dir = crate::test_support::TestTmpDir::new("exif-orientation-backfill");
+        let root = dir.join("photos");
+        std::fs::create_dir_all(&root).unwrap();
+        let db = dir.join("test.chairphoto");
+        let c = Catalog::open(&db, &root).unwrap();
+        let photo = |name: &str| c.upsert_photo(&root.join(name), None, 0, 1).unwrap().id;
+        let (phrase, af_only, both, none, kept) =
+            (photo("a.ARW"), photo("b.ARW"), photo("c.ARW"), photo("d.ARW"), photo("e.ARW"));
+        let entry = |key: &str, group: &str, value: &str| MetadataEntry {
+            key: key.into(),
+            group_name: group.into(),
+            value: value.into(),
+        };
+        let af = |code: &str| {
+            entry(crate::metadata::AF_ORIENTATION_KEY, crate::metadata::AF_GROUP, code)
+        };
+        let exif = |phrase: &str| entry("Orientation", "EXIF", phrase);
+        let unknown = PromotedMetadata::default();
+        c.set_photo_metadata(phrase, &unknown, &[exif("Rotate 270 CW")]).unwrap();
+        c.set_photo_metadata(af_only, &unknown, &[af("6")]).unwrap();
+        c.set_photo_metadata(both, &unknown, &[af("1"), exif("Mirror horizontal")]).unwrap();
+        c.set_photo_metadata(none, &unknown, &[entry("Orientation", "XMP", "Rotate 90 CW")])
+            .unwrap();
+        c.set_photo_metadata(kept, &unknown, &[exif("Rotate 180")]).unwrap();
+        c.conn.execute("UPDATE photos SET exif_orientation = 5 WHERE id = ?1", [kept]).unwrap();
+        c.set_setting("schema_version", &(EXIF_ORIENTATION_SINCE - 1).to_string()).unwrap();
+        // The column as an older catalog has it for every row: never written.
+        c.conn
+            .execute("UPDATE photos SET exif_orientation = NULL WHERE id <> ?1", [kept])
+            .unwrap();
+        drop(c);
+
+        let c = Catalog::open(&db, &root).unwrap();
+        assert_eq!(exif_orientation_of(&c, phrase), Some(8));
+        assert_eq!(exif_orientation_of(&c, af_only), Some(6));
+        assert_eq!(exif_orientation_of(&c, both), Some(2), "EXIF:Orientation outranks the AF code");
+        assert_eq!(exif_orientation_of(&c, none), None, "no EXIF orientation: unknown");
+        assert_eq!(exif_orientation_of(&c, kept), Some(5), "a value already recorded is not replaced");
+        assert_eq!(c.get_setting("schema_version").unwrap().as_deref(),
+            Some(schema::SCHEMA_VERSION.to_string().as_str()));
     }
 }

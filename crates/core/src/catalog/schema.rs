@@ -5,7 +5,7 @@
 //!  2. Photo `path` is stored RELATIVE to the catalog root (see the
 //!     `catalog_root` setting), so a catalog can be remapped on import.
 
-pub const SCHEMA_VERSION: i64 = 24;
+pub const SCHEMA_VERSION: i64 = 26;
 
 pub const SCHEMA_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS settings (
@@ -49,6 +49,11 @@ CREATE TABLE IF NOT EXISTS photos (
     -- applied ON TOP of the file's EXIF orientation when rendering. The original is never
     -- rewritten; survives rescans. See protocol.rs (render) and commands::rotate_photo.
     user_rotation          INTEGER NOT NULL DEFAULT 0,
+    -- The original's EXIF Orientation code (1-8) as exiftool read it at scan/import, or
+    -- NULL when unknown (never extracted, or the file carries none). Face boxes are
+    -- measured on the EXIF-oriented preview, while MWG face regions refer to the stored,
+    -- un-oriented image; this is what converts between the two (#136, schema v26).
+    exif_orientation       INTEGER,
     -- Trash: when the user hid this photo, or NULL. A timestamp rather than a boolean so
     -- the trash view can order by it, "empty trash older than N days" is expressible, and
     -- restoring a stack can find the frames that were trashed *together* (cluster B, D8).

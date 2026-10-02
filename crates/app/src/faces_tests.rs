@@ -1372,7 +1372,7 @@ fn the_review_queue_confirms_above_the_threshold_and_rejects(cx: &mut TestAppCon
     let s: Vec<i64> = f.ids.iter().map(|&p| add_face(&f.app, p, "[0.1,0.1,0.2,0.2]")).collect();
     suggest_at(&f.app, s[0], alice, 0.95);
     suggest_at(&f.app, s[1], bob, 0.8);
-    suggest_at(&f.app, s[2], alice, 0.5);
+    suggest_at(&f.app, s[2], alice, 0.795); // shown as 80%, but below 0.8
     suggest_at(&f.app, s[3], bob, 0.4);
     let (_view, people) = f.people(cx);
     f.click("faces-tab-suggestions", cx);
@@ -1382,7 +1382,7 @@ fn the_review_queue_confirms_above_the_threshold_and_rejects(cx: &mut TestAppCon
     f.click("faces-confirm-all", cx);
     assert_eq!(face_row(&f.app, s[0]), ("confirmed".into(), Some(alice)));
     assert_eq!(face_row(&f.app, s[1]), ("confirmed".into(), Some(bob)), "80% is at the threshold");
-    assert_eq!(face_row(&f.app, s[2]).0, "suggested");
+    assert_eq!(face_row(&f.app, s[2]).0, "suggested", "0.795 is not ≥ 0.8, whatever its label rounds to");
     assert_eq!(status(&f.app, cx), "Suggestions: 2 confirmed.");
 
     f.click(&format!("faces-sugg-reject-{}", s[2]), cx);

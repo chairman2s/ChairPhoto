@@ -16,7 +16,7 @@
 //!   root's tags; Enter saves, Esc cancels (taken before any binding while the field has
 //!   focus), a suggestion's click fills the field.
 
-use super::logic::{avatar_placement, name_suggestions, rotate_box};
+use super::logic::{avatar_placement, name_suggestions, reaches, rotate_box};
 use super::people::{NameTarget, People, Tab};
 use crate::image_store::{ClaimId, ImageState, ImageStore};
 use crate::shell::style::Colors;
@@ -473,7 +473,7 @@ impl PeopleView {
         let people = self.people.clone();
         let p = people.read(cx);
         let e = p.data.as_ref()?.suggestions.get(i)?.clone();
-        let below = (e.confidence * 100.).round() < (p.threshold * 100.).round();
+        let below = !reaches(e.confidence, p.threshold);
         let free = !p.busy && !p.matching(cx);
         let thumb = self.thumb(e.photo_id, cx);
         let face = e.face_id;

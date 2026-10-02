@@ -181,7 +181,14 @@ previous ChairPhoto run are therefore ingested for free.
   already confirmed / had no suggestion), so a count never claims more than happened.
 - **People view** — a wall of named people with face crops as avatars and photo counts, plus
   unnamed clusters waiting to be named. Clicking a person filters to their photos, and a review
-  queue supports bulk confirmation.
+  queue supports bulk confirmation. A review verdict applies only while the face is still
+  suggested as the person the queue showed, so a list read before a re-run of matching never
+  confirms someone the user did not see. Clusters can be named together as one person (a merge),
+  and a cluster's faces can be named apart or ignored (a split); only faces still pending a
+  decision change, and a cluster that a matching run has since regrouped names nothing (cluster
+  ids are never reused). Clusters are rebuilt from scratch by every matching run, so merging or
+  splitting is done by *naming* — the only durable form. In the GPUI app these writes wait while
+  a matching run is going: the matcher writes suggestions without re-checking a face's state.
 - **Settings** — people root, model download status, similarity threshold, and index actions
   with progress.
 

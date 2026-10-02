@@ -264,8 +264,9 @@ fn require_original(original: &Path) -> Result<(), String> {
 ///   stays as a hidden file, because from here it cannot be told apart from another
 ///   process's write in progress.
 /// * **Permissions** of an existing sidecar are carried over (best effort: a filesystem that
-///   cannot set them, such as some SMB mounts, keeps its own). A sidecar made read-only is
-///   refused, as the in-place write it replaces was — a rename would otherwise replace it.
+///   cannot set them, such as some SMB mounts, keeps its own). A sidecar this process may not
+///   write is refused, as the in-place write it replaces was — a rename would otherwise
+///   replace it.
 ///   The owner becomes the writing user, and hard links to the old file keep the old
 ///   contents: a rename makes a new file.
 /// * **A symlinked sidecar** is written through to its target, as the in-place write was;
@@ -277,8 +278,15 @@ fn write_atomically(original: &Path, path: &Path, bytes: &[u8]) -> Result<(), St
         _ => path.to_path_buf(),
     };
     let existing = std::fs::metadata(&target).ok();
-    if existing.as_ref().is_some_and(|m| m.permissions().readonly()) {
-        return Err(format!("cannot write {}: the file is read-only", target.display()));
+    if existing.is_some() {
+        // The in-place write this replaces needed write access to the file itself; a rename
+        // needs only the directory's. Ask the filesystem the old question — open for writing,
+        // without truncating or writing anything — so a sidecar we may not write (no write bit
+        // for us, another user's file in a shared folder, an ACL) is still refused rather than
+        // replaced.
+        if let Err(e) = std::fs::OpenOptions::new().write(true).open(&target) {
+            return Err(format!("cannot write {}: the file is read-only for us ({e})", target.display()));
+        }
     }
     let temp = temp_path(&target);
     require_original(original)?;
@@ -849,6 +857,29 @@ mod tests {
         let err = SidecarDocument::open(&p).unwrap().commit().unwrap_err();
         assert!(err.contains("read-only"), "{err}");
         assert_eq!(std::fs::read(&xmp).unwrap(), FOREIGN.as_bytes());
+        assert_eq!(temps_beside(&xmp), Vec::<String>::new());
+    }
+
+    /// Review F4 of #149: a sidecar with a write bit, but not one that lets us write it — mode
+    /// 0464, group-writable, not owner-writable, owned by us — is refused, as the in-place
+    /// write was. `Permissions::readonly()` alone (no write bit at all) let the rename replace
+    /// it.
+    #[cfg(unix)]
+    #[test]
+    fn a_sidecar_writable_only_by_others_is_refused_and_left_alone() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_dir, p) = photo("doc-149-0464", "P2.ARW");
+        let xmp = sidecar_path(&p);
+        std::fs::write(&xmp, FOREIGN).unwrap();
+        std::fs::set_permissions(&xmp, std::fs::Permissions::from_mode(0o464)).unwrap();
+        if std::fs::OpenOptions::new().write(true).open(&xmp).is_ok() {
+            println!("SKIPPED: a_sidecar_writable_only_by_others_is_refused_and_left_alone — running with privileges that ignore the mode");
+            return;
+        }
+        let err = crate::xmp::write_identifier(&p, "8d0a2c1e-4f5b-4c6d-9e7f-0a1b2c3d4e5f").unwrap_err();
+        assert!(err.contains("read-only"), "{err}");
+        assert_eq!(std::fs::read(&xmp).unwrap(), FOREIGN.as_bytes());
+        assert_eq!(std::fs::metadata(&xmp).unwrap().permissions().mode() & 0o777, 0o464);
         assert_eq!(temps_beside(&xmp), Vec::<String>::new());
     }
 

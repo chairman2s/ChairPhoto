@@ -25,6 +25,7 @@
 //!   its cache, so it shows "No photo selected" until a photo of the new catalog is chosen.
 
 use crate::image_store::ImageStore;
+use crate::loupe::card::{self, CardView};
 use crate::loupe::view::{Follow, LoupeView};
 use crate::model::AppModel;
 use crate::modules::ModuleRegistry;
@@ -34,7 +35,7 @@ use crate::APP_ID;
 use gpui_kit::prelude::*;
 use gpui_kit::{
     div, px, size, AnyWindowHandle, App, Bounds, Context, Entity, Global, TitlebarOptions, Window,
-    WindowBackgroundAppearance, WindowBounds, WindowDecorations, WindowId, WindowOptions,
+    Subscription, WindowBackgroundAppearance, WindowBounds, WindowDecorations, WindowId, WindowOptions,
 };
 
 /// The pop-out's title (React's `WebviewWindow` title).
@@ -155,9 +156,14 @@ fn on_closed(closed: WindowId, cx: &mut App) {
     }
 }
 
-/// The pop-out's root: a [`LoupeView`] that follows the target whatever the main stage shows.
+/// The pop-out's root: a module's card while one is up (and its module enabled), else a
+/// [`LoupeView`] that follows the target whatever the main stage shows.
 pub struct LoupeWindowView {
+    shell: Entity<ShellState>,
+    modules: Entity<ModuleRegistry>,
     loupe: Entity<LoupeView>,
+    card: Entity<CardView>,
+    _observers: Vec<Subscription>,
 }
 
 impl LoupeWindowView {
@@ -169,31 +175,41 @@ impl LoupeWindowView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let loupe = cx.new(|cx| LoupeView::new(model, shell, images, modules, Follow::Window, cx));
+        let card = cx.new(|cx| CardView::new(&model, shell.clone(), images.clone(), cx));
+        let loupe = cx.new(|cx| LoupeView::new(model, shell.clone(), images, modules.clone(), Follow::Window, cx));
         loupe.read(cx).focus_handle().clone().focus(window, cx);
-        LoupeWindowView { loupe }
+        let _observers =
+            vec![cx.observe(&shell, |_, _, cx| cx.notify()), cx.observe(&modules, |_, _, cx| cx.notify())];
+        LoupeWindowView { shell, modules, loupe, card, _observers }
     }
 
     pub fn loupe(&self) -> &Entity<LoupeView> {
         &self.loupe
     }
 
-    /// The window closed: see [`LoupeView::release`].
+    pub fn card(&self) -> &Entity<CardView> {
+        &self.card
+    }
+
+    /// The window closed: see [`LoupeView::release`] and [`CardView::release`].
     fn release(&mut self, cx: &mut Context<Self>) {
         self.loupe.update(cx, |l, cx| l.release(cx));
+        self.card.update(cx, |c, cx| c.release(cx));
     }
 }
 
 impl Render for LoupeWindowView {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = Colors::get(cx);
-        div()
-            .id("loupe-window")
-            .size_full()
-            .flex()
-            .flex_col()
-            .bg(colors.canvas)
-            .text_color(colors.txt)
-            .child(self.loupe.clone())
+        let root = div().id("loupe-window").size_full().flex().flex_col().bg(colors.canvas).text_color(colors.txt);
+        if card::shown(&self.shell, &self.modules, cx) {
+            return root.child(self.card.clone());
+        }
+        // With the card down, the loupe has the keys again.
+        let focus = self.loupe.read(cx).focus_handle().clone();
+        if window.focused(cx).is_none() {
+            focus.focus(window, cx);
+        }
+        root.child(self.loupe.clone())
     }
 }

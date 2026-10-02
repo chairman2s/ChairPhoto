@@ -26,6 +26,8 @@ pub mod contexts {
     pub const STACK_DIALOG: &str = "StackProposals";
     /// The inline loupe over the grid, and the pop-out loupe window.
     pub const LOUPE: &str = "Loupe";
+    /// A module's card in the pop-out loupe, while it shows a photo full-size (#110).
+    pub const LOUPE_CARD: &str = "LoupeCard";
     /// Compare (duel/grid modes).
     pub const COMPARE: &str = "Compare";
     /// The full-screen, keyboard-only cull session.

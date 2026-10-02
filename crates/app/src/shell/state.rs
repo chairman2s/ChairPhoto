@@ -17,6 +17,7 @@
 //! ([`crate::machine_prefs::MachinePrefs`], #113, which holds the appearance mode), but these
 //! keys are not written to it yet, so they start at React's defaults each launch.
 
+use crate::loupe::card::{LoupeCard, ShownCard};
 use crate::loupe::compare::{CompareMode, CompareSession, Verdict};
 use crate::model::{AppModel, AppModelEvent, DeepLinkTarget};
 use chairphoto_core::app::{
@@ -31,7 +32,7 @@ use chairphoto_model::library::query::{RefreshRequest, StatusRequest};
 use chairphoto_model::compare_duel::DuelSide;
 use chairphoto_model::library::session::{LibrarySession, SelectMods, StepSnapshot};
 use futures::channel::oneshot;
-use gpui_kit::{Context, Entity, EventEmitter, Subscription, Task};
+use gpui_kit::{Context, Entity, EventEmitter, SharedString, Subscription, Task};
 
 /// React's column defaults and drag limits (`App.tsx`).
 pub const LEFT_DEFAULT_W: f32 = 210.;
@@ -393,6 +394,9 @@ pub struct ShellState {
     pub loupe_open: bool,
     /// Compare, while open, and the catalog its pool was read from (#109).
     compare: Option<(CompareSession, CatalogIdentity)>,
+    /// The card a module put up in the pop-out loupe, with its owner (#110,
+    /// `crate::loupe::card`).
+    loupe_card: Option<ShownCard>,
     /// Compare's presentation for the next open (`panel.compareMode`; the root view seeds it
     /// from the per-machine preferences and stores changes back).
     pub compare_mode: CompareMode,
@@ -454,6 +458,7 @@ impl ShellState {
             editing_tag: None,
             loupe_open: false,
             compare: None,
+            loupe_card: None,
             compare_mode: CompareMode::Duel,
             last_mark: None,
             catalog_generation: 0,
@@ -694,6 +699,34 @@ impl ShellState {
             }
         }
         self.library.selection().active
+    }
+
+    /// The card a module has up in the pop-out loupe, if any.
+    pub fn loupe_card(&self) -> Option<&ShownCard> {
+        self.loupe_card.as_ref()
+    }
+
+    /// Module `module` puts `card` up in the pop-out loupe (host.ts `showLoupeCard`), bound to
+    /// the catalog `from`; `None` takes down its own card and leaves another module's alone.
+    pub fn show_loupe_card(
+        &mut self,
+        module: SharedString,
+        card: Option<LoupeCard>,
+        from: Option<CatalogIdentity>,
+        cx: &mut Context<Self>,
+    ) {
+        match card {
+            Some(card) => {
+                let shown = ShownCard { module, card, from };
+                if self.loupe_card.as_ref() == Some(&shown) {
+                    return;
+                }
+                self.loupe_card = Some(shown);
+            }
+            None if self.loupe_card.as_ref().is_some_and(|c| c.module == module) => self.loupe_card = None,
+            None => return,
+        }
+        cx.notify();
     }
 
     /// Open Compare on the selection (two or more; C in the grid, the bench's Compare). The
@@ -1179,6 +1212,8 @@ impl ShellState {
                 self.editing_tag = None;
                 self.loupe_open = false;
                 self.compare = None;
+                // Its photo scope names the closed catalog's tags.
+                self.loupe_card = None;
                 self.catalog_generation += 1;
                 self.surface = Surface::Library;
                 self.counts = Counts::default();

@@ -27,6 +27,7 @@
 //! (0–5, P/X/U, R/Y/G/B/V/N) are the Library's actions, bound in every context that culls,
 //! so the keymap stays one list.
 
+pub mod card;
 pub mod compare;
 pub mod compare_view;
 pub mod cull;
@@ -39,6 +40,8 @@ pub mod proof_sheet;
 pub mod view;
 pub mod window;
 pub mod zoom;
+#[cfg(test)]
+mod card_tests;
 #[cfg(test)]
 mod popout_tests;
 #[cfg(test)]
@@ -160,6 +163,8 @@ pub fn bindings() -> Vec<KeyBinding> {
         KeyBinding::new("down", DuelSame, duel),
         KeyBinding::new("escape", DuelClose, duel),
         KeyBinding::new("escape", ProofClose, proof),
+        // A module card's full-size photo in the pop-out (#110).
+        KeyBinding::new("escape", card::BackToWall, Some(contexts::LOUPE_CARD)),
     ];
     for context in [contexts::LOUPE, contexts::COMPARE, contexts::CULL] {
         b.extend(culling_keys(context));

@@ -65,16 +65,19 @@ Read only the documents triggered by the task:
   included, is left as the sidecar has it), `write_keywords` through its local set,
   identifier/import/GPS through their named elements, and face regions by Name + Area
   match. Preserve every other element/attribute and foreign namespace.
-- An existing row's IPTC changes only through `Catalog::set_iptc`, which records the fields
-  it changed as owed (`pending_sidecar_iptc`) in the transaction that stores them. (Bundle
-  import uses `set_iptc_carried`, which does not owe a field the bundled sidecar already has
-  a value for; a catalog merge inserting a new row carries IPTC without owing it.) A caller
-  resolves the original's path before that store, so an unreachable original changes
-  nothing; writes the returned owed set (this change plus any earlier write that never
-  landed) off the lock; and clears it only through `settle_iptc_write`'s compare-and-set,
-  never directly. A write that fails after the commit stays owed, and the next save of the
-  photo or the identity repair pass writes it. A front end reports such a save as saved to
-  the catalog with the sidecar pending, never as saved to the sidecar.
+- An existing row's IPTC changes only through `Catalog::set_iptc`, which records
+  the fields it changed as owed (`pending_sidecar_iptc`) in the transaction that
+  stores them. (Bundle import uses `set_iptc_carried`, which does not owe a field the
+  bundled sidecar already has a value for; a catalog merge inserting a new row carries
+  IPTC without owing it.) A caller resolves the original's path before that store, so
+  an unreachable original changes nothing; writes the returned owed set (this change
+  plus any earlier write that never landed) off the lock; and clears it only through
+  `settle_iptc_write`'s compare-and-set, never directly. A save or geocode fill takes
+  the sidecar's write turn (`xmp::lock::WriteOrder`) before that store and keeps it
+  through the write, so overlapping saves store and write in one order. A write that
+  fails after the commit stays owed, and the next save of the photo or the identity
+  repair pass writes it. A front end reports such a save as saved to the catalog with
+  the sidecar pending, never as saved to the sidecar.
 - Sidecars are `<original_filename>.xmp`, alongside the original.
 - Before ChairPhoto's first in-library write to an existing sidecar, back it up if it lacks
   `chairphoto:LastWrite`. Export-only destination copies are not subject to this rule.

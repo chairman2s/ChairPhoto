@@ -32,6 +32,17 @@
 //! catalog epoch (`EditJob::catalog_epoch`), so a render for the old catalog's photo id can
 //! never be adopted by a stage of the new one.
 //!
+//! # The filmstrip (#134)
+//!
+//! The strip is the Library's rows, a window around the open photo. Each frame shows the
+//! photo's cover look — its cover version's edited thumbnail, the same render the Library
+//! grid's tier makes — keyed by the cover token of its row (version and revision) and the
+//! catalog the rows were read from (`ImageStore::request_looks`, under the strip's own
+//! claim): a row re-read with a new token asks again and drops the earlier look's result; a
+//! photo that leaves the window is released; a render that finishes in another catalog is
+//! refused on the worker; `catalog:switched` empties the store. Like React's, the tokens are
+//! the rows': a frame changes when the Library's rows are re-read, not on every autosave.
+//!
 //! # The rails (#112)
 //!
 //! A preset, a proof, a duel pick or a reset is one named step through a labelled
@@ -55,17 +66,16 @@
 //! write can never land after a newer one in the catalog or on screen.
 
 use super::stage::{DarkroomStage, FrameTier, SETTLE};
-use crate::image_store::{ImageStore, Submit};
+use crate::image_store::{ClaimId, ImageStore, Submit};
 use crate::model::{AppModel, AppModelEvent};
 use crate::shell::state::{ShellState, Surface};
 use crate::storage::Runner;
 use chairphoto_core::app::{editing, with_catalog_as, AppState, CatalogIdentity, CoreEvent};
 use chairphoto_core::catalog::{Photo, PhotoVersion, VersionHistory};
 use chairphoto_core::develop_source::DevelopSource;
-use chairphoto_core::image_pool::ImageKind;
 use chairphoto_core::plugins::edit::SourceToken;
 use chairphoto_model::darkroom::develop_source::{is_preparing, reduce_source, SourceState};
-use chairphoto_model::darkroom::filmstrip::{window_around, STRIP_RADIUS};
+use chairphoto_model::darkroom::filmstrip::{cover_look, nearest_first, window_around, CoverLook, STRIP_RADIUS};
 use chairphoto_model::darkroom::history::{describe_change, should_amend, LastStep};
 use chairphoto_model::darkroom::kelvin::{KelvinContext, WbPrefer, WB_SLIDER_KEY};
 use chairphoto_model::darkroom::render_timing::{RENDER_TIMING_KEY, RENDER_TIMING_SUMMARY_KEY};
@@ -275,6 +285,8 @@ pub struct Darkroom {
     model: Entity<AppModel>,
     shell: Entity<ShellState>,
     images: Entity<ImageStore>,
+    /// The filmstrip's hold on its frames' thumbnails.
+    strip_claim: ClaimId,
     pool: Arc<dyn Submit>,
     luts_dir: LutsDir,
     pub open: Option<OpenPhoto>,
@@ -329,11 +341,13 @@ impl Darkroom {
                 }
             }),
         ];
+        let strip_claim = images.update(cx, |store, _| store.new_claim());
         Darkroom {
             app,
             model: model.clone(),
             shell,
             images,
+            strip_claim,
             pool,
             luts_dir: Arc::new(chairphoto_core::app::luts_dir),
             open: None,
@@ -391,6 +405,8 @@ impl Darkroom {
         match (active, from) {
             (Some(photo), Some(from)) => {
                 if self.open.as_ref().is_some_and(|o| o.photo.id == photo.id && o.from == from) {
+                    // The rows may have been re-read: a frame's cover look may be new.
+                    self.request_strip_thumbs(cx);
                     return;
                 }
                 self.leave_photo(true, cx);
@@ -1093,6 +1109,8 @@ impl Darkroom {
     fn leave(&mut self, save: bool, cx: &mut Context<Self>) {
         let had_photo = self.open.is_some();
         self.leave_photo(save, cx);
+        // No strip: its frames are let go.
+        self.request_strip_thumbs(cx);
         if self.session_held {
             self.session_held = false;
             Runner::get(cx).spawn({
@@ -1162,10 +1180,27 @@ impl Darkroom {
         (w.start, shown, photos.len())
     }
 
+    /// The strip's frames: each photo's cover look as its row names it, from the catalog the
+    /// rows were read from (see the module docs), the open photo's first, then outwards
+    /// (`nearest_first`). No strip (one photo, or none open), no frames: the claim is let go.
     fn request_strip_thumbs(&mut self, cx: &mut Context<Self>) {
-        let (_, shown, _) = self.strip(cx);
-        let wanted: Vec<(i64, ImageKind)> = shown.iter().map(|p| (p.id, ImageKind::Thumb)).collect();
-        self.images.update(cx, |store, _| store.request_batch(&wanted));
+        let from = self.shell.read(cx).rows_from();
+        let (_, shown, total) = self.strip(cx);
+        let wanted: Vec<(i64, Option<CoverLook>)> = match (&self.open, from) {
+            (Some(open), Some(_)) if total > 1 => {
+                let current = shown.iter().position(|p| p.id == open.photo.id).unwrap_or(shown.len());
+                nearest_first(shown.len(), current)
+                    .into_iter()
+                    .map(|i| (shown[i].id, cover_look(shown[i].cover_token.as_deref())))
+                    .collect()
+            }
+            _ => Vec::new(),
+        };
+        let owner = self.strip_claim;
+        self.images.update(cx, |store, cx| match from {
+            Some(from) if !wanted.is_empty() => store.request_looks(owner, from, &wanted, cx),
+            _ => store.release_looks(owner),
+        });
     }
 
     /// Move to `photo_id` (a strip click, ← / →): the shell's active photo changes, and

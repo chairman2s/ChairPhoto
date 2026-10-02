@@ -157,16 +157,12 @@ impl IptcSidecarWrite {
     /// call it off the catalog lock. Nothing owed opens nothing.
     ///
     /// The original was resolved under the lock, but its volume can go between then and
-    /// now. A sidecar commit recreates missing parent directories, so without this check a
-    /// write to an unmounted volume's mount point would land on the disk beneath it and be
-    /// recorded as written. (A volume leaving between this check and the write is still
-    /// possible; the window is the check's, not the save's.)
+    /// now. The sidecar document refuses then (#149: it checks the original and its folder
+    /// at open and again before the commit, and never creates a folder), so the write fails
+    /// and the fields stay owed.
     pub fn run(&self, original: &Path) -> std::result::Result<(), String> {
         if self.fields.is_empty() {
             return Ok(());
-        }
-        if !original.exists() {
-            return Err(format!("the original is no longer reachable at {}", original.display()));
         }
         crate::xmp::write_iptc_fields(original, self.fields, &self.values)
     }

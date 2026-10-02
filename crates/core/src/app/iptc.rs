@@ -4,6 +4,7 @@
 
 use super::{AppState, CatalogIdentity};
 use crate::catalog::{IptcFields, IptcSettled, IptcSidecarState, IptcSidecarWrite};
+use crate::xmp::lock::WriteOrder;
 
 /// What an IPTC save did. The catalog half always succeeded (a failure there is the save's
 /// `Err`); `sidecar` says whether the sidecar has caught up.
@@ -57,12 +58,23 @@ impl IptcSaveOutcome {
 /// error: the fields stay owed and the outcome says `pending`. The next save of the photo or
 /// the repair pass writes them.
 ///
-/// Blocking: the catalog lock is held for the path lookup and the store (one hold, so the
-/// fields owed are the change stored), released for the sidecar's read-modify-write, and
-/// taken again for the compare-and-set that records it. Call it off the UI thread.
+/// Overlapping saves of one photo store and write in one order (issue #149): a save first
+/// takes the sidecar's write turn ([`WriteOrder`], reserved under the catalog lock, waited
+/// for with none held) and stores, writes and settles while it holds it, so a later save
+/// never has its change overwritten by an earlier one that reached the disk last. Storing
+/// only once the turn is held also means a volume that went away while the save waited
+/// fails the store, leaving the catalog unchanged, rather than the sidecar write.
+///
+/// The save is bound to the catalog it reserved in: a switch while it waits fails the
+/// store closed with `CATALOG_CHANGED` instead of storing into the new catalog's row.
+///
+/// Blocking: lock order turn → catalog → file lock. The catalog lock is held for the path
+/// lookup and the store (one hold, so the fields owed are the change stored), released for
+/// the sidecar's read-modify-write, and taken again for the compare-and-set that records
+/// it. Call it off the UI thread.
 pub fn save_iptc(state: &AppState, photo_id: i64, fields: &IptcFields) -> Result<IptcSaveOutcome, String> {
-    let (identity, (original, write)) = super::with_catalog_identified(state, |c| store(c, photo_id, fields))?;
-    Ok(write_and_settle(state, identity, &original, &write))
+    let (identity, turn) = super::with_catalog_identified(state, |c| reserve(c, photo_id))?;
+    save_in_turn(state, identity, turn, photo_id, fields)
 }
 
 /// [`save_iptc`] of a photo read from the catalog `expected` names: the store and the path
@@ -74,20 +86,44 @@ pub fn save_iptc_as(
     photo_id: i64,
     fields: &IptcFields,
 ) -> Result<IptcSaveOutcome, String> {
-    let (original, write) = super::with_catalog_as(state, expected, |c| store(c, photo_id, fields))?;
-    Ok(write_and_settle(state, expected, &original, &write))
+    let turn = super::with_catalog_as(state, expected, |c| reserve(c, photo_id))?;
+    save_in_turn(state, expected, turn, photo_id, fields)
 }
 
-/// Do `write`'s sidecar IO off the lock, then record it in the catalog that stored it. A
-/// switch in between leaves the fields owed in that catalog, for its next repair pass.
+/// Wait for `turn` (no lock held), then store, write and settle in catalog `identity` while
+/// holding it.
+fn save_in_turn(
+    state: &AppState,
+    identity: CatalogIdentity,
+    turn: WriteOrder,
+    photo_id: i64,
+    fields: &IptcFields,
+) -> Result<IptcSaveOutcome, String> {
+    let turn = turn.wait();
+    let (original, write) = super::with_catalog_as(state, identity, |c| store(c, photo_id, fields))?;
+    Ok(write_and_settle(state, identity, &original, &write, turn))
+}
+
+/// Reserve the place in line of the photo's sidecar write — under the catalog lock, which
+/// never waits on a turn. An unreachable original fails here, before anything is stored.
+fn reserve(c: &crate::catalog::Catalog, photo_id: i64) -> crate::catalog::Result<WriteOrder> {
+    Ok(WriteOrder::reserve(&c.require_photo_path(photo_id)?))
+}
+
+/// Do `write`'s sidecar IO off the catalog lock with the write turn held, then record it in
+/// the catalog that stored it, and only then let the next writer in line go. A switch in
+/// between leaves the fields owed in that catalog, for its next repair pass.
 pub(crate) fn write_and_settle(
     state: &AppState,
     identity: CatalogIdentity,
     original: &std::path::Path,
     write: &IptcSidecarWrite,
+    turn: WriteOrder,
 ) -> IptcSaveOutcome {
     let outcome = write.run(original);
-    match super::with_catalog_as(state, identity, |c| c.settle_iptc_write(write, &outcome)) {
+    let settled = super::with_catalog_as(state, identity, |c| c.settle_iptc_write(write, &outcome));
+    drop(turn);
+    match settled {
         Ok(settled) => IptcSaveOutcome::from_settled(settled),
         Err(_) if write.fields.is_empty() => IptcSaveOutcome { sidecar: IptcSidecarState::Unchanged, reason: None },
         Err(e) => IptcSaveOutcome {
@@ -97,9 +133,10 @@ pub(crate) fn write_and_settle(
     }
 }
 
-/// Store `fields`, returning the original's path and the sidecar write the store owes. The
-/// path is resolved before the row is written (as the geocoder's `fill_in` does), so an
-/// unreachable original leaves the catalog unchanged.
+/// Store `fields`, returning the original's path and the sidecar write the store owes.
+/// Called with the write turn held. The path is resolved before the row is written (as the
+/// geocoder's `fill_in` does), so an original that is unreachable now — gone while this
+/// save waited for its turn included — leaves the catalog unchanged.
 fn store(
     c: &crate::catalog::Catalog,
     photo_id: i64,
@@ -222,6 +259,14 @@ mod tests {
         state.catalog.lock().unwrap().as_ref().unwrap().repair_pending_identity().unwrap()
     }
 
+    /// A write turn, waited for: what a save holds around its store and write. The tests
+    /// below that drive `write_and_settle` by hand reserve it only for the write, so they
+    /// can force the out-of-order landings the repair pass and bundle import (which take no
+    /// turn) can still produce.
+    fn turn(original: &std::path::Path) -> WriteOrder {
+        WriteOrder::reserve(original).wait()
+    }
+
     fn typed() -> IptcFields {
         IptcFields { title: "Mine".into(), creator: "Me".into(), ..Default::default() }
     }
@@ -311,7 +356,7 @@ mod tests {
         let away = dir.join("library.away");
         std::fs::rename(&library, &away).unwrap();
 
-        let outcome = write_and_settle(&state, identity, &original, &write);
+        let outcome = write_and_settle(&state, identity, &original, &write, turn(&original));
         assert_eq!(outcome.sidecar, crate::catalog::IptcSidecarState::Pending, "{outcome:?}");
         assert_eq!(owed(&state, id), crate::catalog::IptcMask::TITLE | crate::catalog::IptcMask::CREATOR);
         let summary = repair(&state);
@@ -337,14 +382,14 @@ mod tests {
         let (original, a) = crate::app::with_catalog_as(&state, identity, |c| store(c, id, &older)).unwrap();
         let (_, b) = crate::app::with_catalog_as(&state, identity, |c| store(c, id, &newer)).unwrap();
 
-        let outcome = write_and_settle(&state, identity, &original, &a);
+        let outcome = write_and_settle(&state, identity, &original, &a, turn(&original));
         assert_eq!(outcome.sidecar, crate::catalog::IptcSidecarState::Pending, "{outcome:?}");
         assert!(iptc(&read(&xmp)).contains(&("dc:title".into(), vec!["Older".into()])));
         assert_eq!(owed(&state, id), crate::catalog::IptcMask::TITLE | crate::catalog::IptcMask::CREATOR);
 
         // The newer save's own write lands; it was read before the stale write re-owed, so it
         // too reports pending rather than claiming the sidecar is settled.
-        let outcome = write_and_settle(&state, identity, &original, &b);
+        let outcome = write_and_settle(&state, identity, &original, &b, turn(&original));
         assert_eq!(outcome.sidecar, crate::catalog::IptcSidecarState::Pending, "{outcome:?}");
         assert_eq!(repair(&state).iptc_written, 1);
         let xml = read(&xmp);
@@ -365,13 +410,80 @@ mod tests {
         let (original, a) = crate::app::with_catalog_as(&state, identity, |c| store(c, id, &older)).unwrap();
         let (_, b) = crate::app::with_catalog_as(&state, identity, |c| store(c, id, &newer)).unwrap();
 
-        let outcome = write_and_settle(&state, identity, &original, &b);
+        let outcome = write_and_settle(&state, identity, &original, &b, turn(&original));
         assert_eq!(outcome.sidecar, crate::catalog::IptcSidecarState::Written, "{outcome:?}");
-        write_and_settle(&state, identity, &original, &a);
+        write_and_settle(&state, identity, &original, &a, turn(&original));
         assert!(iptc(&read(&xmp)).contains(&("dc:title".into(), vec!["Older".into()])), "the stale bytes landed last");
         assert_eq!(owed(&state, id), crate::catalog::IptcMask::TITLE, "so the title is owed again");
 
         repair(&state);
         assert_eq!(iptc(&read(&xmp)), with(foreign_iptc(), "dc:title", &["Newer"]));
+    }
+
+    /// Issue #149, probe P2: two overlapping saves of one photo. The first holds its turn,
+    /// between storing t1 and writing it; a second (t2 and a creator) arrives. The second
+    /// must wait for the first's write, so the sidecar ends where the catalog does — t2 —
+    /// instead of the first save's late write putting t1 back.
+    #[test]
+    fn overlapping_saves_write_the_sidecar_in_the_order_they_stored() {
+        let (_dir, state, id, xmp) = foreign_photo("iptc-149-order", crate::xmp::test_fixtures::LIGHTROOM);
+        let state = std::sync::Arc::new(state);
+        let identity = crate::app::catalog_identity(&state).unwrap();
+        let first = IptcFields { title: "t1".into(), ..Default::default() };
+        let turn = crate::app::with_catalog_as(&state, identity, |c| reserve(c, id)).unwrap().wait();
+        let (original, write) = crate::app::with_catalog_as(&state, identity, |c| store(c, id, &first)).unwrap();
+
+        let second = IptcFields { title: "t2".into(), creator: "c".into(), ..Default::default() };
+        let later = {
+            let (state, second) = (state.clone(), second.clone());
+            std::thread::spawn(move || save_iptc(&state, id, &second))
+        };
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(!later.is_finished(), "the later save must wait for the earlier one's write");
+        let earlier = write_and_settle(&state, identity, &original, &write, turn);
+        // The later save had not stored yet, so the earlier one's compare-and-set holds.
+        assert_eq!(earlier.sidecar, crate::catalog::IptcSidecarState::Written, "{earlier:?}");
+        let later = later.join().unwrap().unwrap();
+        assert_eq!(later.sidecar, crate::catalog::IptcSidecarState::Written, "{later:?}");
+
+        let xml = read(&xmp);
+        let expected = with(with(foreign_iptc(), "dc:title", &["t2"]), "dc:creator", &["c"]);
+        assert_eq!(iptc(&xml), expected, "the sidecar must end on the newest save:\n{xml}");
+        let stored = state.catalog.lock().unwrap().as_ref().unwrap().get_iptc(id).unwrap();
+        assert_eq!(stored, second);
+        assert_eq!(state.catalog.lock().unwrap().as_ref().unwrap().owed_iptc(id).unwrap(), crate::catalog::IptcMask::NONE);
+    }
+
+    /// Issue #149 F1: the library's volume goes away while a save waits for its turn. The
+    /// save fails, the catalog row is unchanged (the store runs only once the turn is held),
+    /// nothing is created where the volume was mounted, and the sidecar on the volume is
+    /// untouched.
+    #[test]
+    fn a_volume_that_vanishes_while_a_save_waits_fails_the_save_and_changes_nothing() {
+        let (dir, state, id, _xmp) = foreign_photo("iptc-149-unmount", crate::xmp::test_fixtures::LIGHTROOM);
+        let library = dir.join("library");
+        let earlier = crate::xmp::lock::WriteOrder::reserve(&library.join("DSC144.ARW"));
+        let state = std::sync::Arc::new(state);
+        let save = {
+            let state = state.clone();
+            std::thread::spawn(move || {
+                save_iptc(&state, id, &IptcFields { title: "T".into(), ..Default::default() })
+            })
+        };
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(!save.is_finished(), "the save must wait behind the earlier write");
+        let unmounted = dir.join("unmounted");
+        std::fs::rename(&library, &unmounted).unwrap();
+        drop(earlier);
+
+        let err = save.join().unwrap().unwrap_err();
+        assert!(err.contains("no reachable copy"), "{err}");
+        assert!(!library.exists(), "the save recreated the mount point's folder");
+        let stored = state.catalog.lock().unwrap().as_ref().unwrap().get_iptc(id).unwrap();
+        assert_eq!(stored, IptcFields::default(), "a failed save must not change the catalog");
+        let owed = state.catalog.lock().unwrap().as_ref().unwrap().owed_iptc(id).unwrap();
+        assert_eq!(owed, crate::catalog::IptcMask::NONE, "nor owe the sidecar anything");
+        assert_eq!(read(&crate::xmp::sidecar_path(&unmounted.join("DSC144.ARW"))),
+            crate::xmp::test_fixtures::LIGHTROOM);
     }
 }

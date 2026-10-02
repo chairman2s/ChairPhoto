@@ -14,6 +14,7 @@ use xmltree::{Element, Namespace, XMLNode};
 
 mod document;
 use document::SidecarDocument;
+pub mod lock;
 #[cfg(test)]
 pub(crate) mod test_fixtures;
 

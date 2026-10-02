@@ -150,11 +150,19 @@ whose `x`/`y` are the rectangle's normalized **center** — MWG stores centers, 
 and the reader converts back.
 
 **Merge safety is binding.** The RegionList may already contain regions written by other tools.
-The writer rebuilds it from the foreign regions it did not write plus ChairPhoto's current
-confirmed set. A region counts as ours — and is therefore replaced — only when its `Name` matches
-one we are writing *and* its center area is within `AREA_EPSILON = 0.02`. **When in doubt, the
-region is preserved.** Re-writing updates only ChairPhoto's own regions and can never duplicate
-or clobber a foreign face.
+The writer edits the existing `Regions` in place, never rebuilds it: it refreshes the
+`AppliedToDimensions` fields, replaces the regions it wrote, and appends the rest of ChairPhoto's
+current confirmed set. A region counts as ours — and is therefore replaced — only when its `Name`
+matches one we are writing *and* its center area is within `AREA_EPSILON = 0.02`. **When in
+doubt, the region is preserved.** Re-writing updates only ChairPhoto's own regions and can never
+duplicate or clobber a foreign face. Foreign attributes and children of `Regions`,
+`AppliedToDimensions` and the list survive.
+
+The writer and reader accept `Regions` in any top-level `rdf:Description`, struct values written
+with `rdf:parseType="Resource"`, as a nested `rdf:Description` or as attributes, and a list in an
+`rdf:Bag` or `rdf:Seq`. A `Regions` in any other layout (two of them, another container, a
+reference) is **not written**: the write fails with an error and the sidecar is left as it was,
+because a write that cannot see a foreign region would delete it.
 
 **Writes** fire from the same hooks as keyword export — `faces_accept`, `faces_accept_person`,
 `faces_assign`, `faces_reject`, `faces_ignore`, `faces_name_cluster` — each writing the photo's

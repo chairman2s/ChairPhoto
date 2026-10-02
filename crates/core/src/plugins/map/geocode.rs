@@ -400,7 +400,17 @@ impl SidecarFill {
 /// save the user did not make (review of #148, N2).
 fn pending_message(outcome: &crate::app::iptc::IptcSaveOutcome) -> String {
     let why = outcome.reason.as_deref().map(|r| format!(" ({r})")).unwrap_or_default();
-    format!("Geocoded location stored in the catalog, but not yet in the sidecar{why}; the repair pass will write it")
+    format!("{PENDING_LEAD}{why}; the repair pass will write it")
+}
+
+/// How [`pending_message`] begins. That answer is not a failure — the catalog changed — so a
+/// front end tells it apart by this ([`is_pending_message`]) and shows it without an error
+/// prefix (#153).
+pub const PENDING_LEAD: &str = "Geocoded location stored in the catalog, but not yet in the sidecar";
+
+/// Whether a single-photo geocode's `Err` is [`pending_message`]'s: stored, sidecar pending.
+pub fn is_pending_message(message: &str) -> bool {
+    message.starts_with(PENDING_LEAD)
 }
 
 /// Step 3 of a fill and its sidecar write, on the blocking pool: `Err` when the fill
@@ -1171,6 +1181,8 @@ mod tests {
         assert!(err.starts_with("Geocoded location stored in the catalog, but not yet in the sidecar ("), "{err}");
         assert!(err.ends_with("; the repair pass will write it"), "{err}");
         assert!(!err.contains("Saved"), "{err}");
+        assert!(is_pending_message(&err), "a front end tells it from a failure (#153): {err}");
+        assert!(!is_pending_message("geocode: no GPS"), "a failure is not pending");
         let guard = state.catalog.lock().unwrap();
         let c = guard.as_ref().unwrap();
         assert_eq!(c.get_iptc(id).unwrap().city, "Oslo");

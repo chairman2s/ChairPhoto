@@ -7,18 +7,23 @@ import {
   IdentityRepairProgress,
   IdentityRepairStatus,
   IdentityRepairSummary,
+  IptcSaveOutcome,
+  OwedIptc,
   PendingIdentity,
   PendingIdentityField,
   PendingIdentitySummary,
   Volume,
   cancelIdentityRepair,
+  dismissOwedIptc,
   identityRepairStatus,
+  listOwedIptc,
   listPendingIdentity,
   listVolumes,
   onIdentityRepairDone,
   onIdentityRepairProgress,
   repairPendingIdentity,
   resolveIdentityConflict,
+  retryOwedIptc,
   summarizePendingIdentity,
 } from "../modules/api";
 // The shared owned-listener utility (issue #13): an owner token per attempt, a registration
@@ -231,6 +236,33 @@ export function pagingLabel(offset: number, shown: number, total: number | null)
   return `Showing ${from}–${to} of ${displayedTotal}`;
 }
 
+/** Page size of the owed-IPTC list (#153). */
+export const OWED_PAGE_SIZE = 100;
+
+/** What a Dismiss or Retry of one owed-IPTC row did: `dismissed: false` means nothing was
+ *  (the photo's IPTC changed since the list was read, or the photo is gone). */
+export type OwedAction = { dismissed: boolean } | { retried: IptcSaveOutcome | null };
+
+/** The line after a Dismiss or Retry, stated from what the backend answered (the GPUI
+ *  panel's `owed_action_message`). */
+export function owedActionMessage(done: OwedAction): string {
+  if ("dismissed" in done) {
+    return done.dismissed
+      ? "Dismissed. The catalog keeps its IPTC; the sidecar was not written."
+      : "Not dismissed: this photo's IPTC changed since the list was read. Check the refreshed row.";
+  }
+  const o = done.retried;
+  if (!o) return "Still pending.";
+  switch (o.sidecar) {
+    case "written":
+      return "Written to the sidecar.";
+    case "unchanged":
+      return "Nothing was owed any more; the sidecar was not opened.";
+    default:
+      return o.reason ? `Still pending (${o.reason}).` : "Still pending.";
+  }
+}
+
 /**
  * Read-only surface for identity debt (issue #50): the pending-identity queue — every
  * photo COPY whose sidecar doesn't yet carry its identity — with a total/conflict count
@@ -259,7 +291,14 @@ export function pagingLabel(offset: number, shown: number, total: number | null)
  * queue row an owner, so the decision wins and only that row's result is dropped
  * (`catalog/identity.rs` § Who owns a queue row). Both actions stay available at once.
  */
-export function IdentityDebtPanel({ onClose }: { onClose: () => void }) {
+export function IdentityDebtPanel({
+  onClose,
+  onCountsChanged,
+}: {
+  onClose: () => void;
+  /** A Dismiss or Retry changed the debt: the host re-reads its badge count. */
+  onCountsChanged?: () => void;
+}) {
   const [summary, setSummary] = useState<PendingIdentitySummary | null>(null);
   const [rows, setRows] = useState<PendingIdentity[] | null>(null);
   const [volumes, setVolumes] = useState<Volume[]>([]);
@@ -294,6 +333,53 @@ export function IdentityDebtPanel({ onClose }: { onClose: () => void }) {
       .then(setRows)
       .catch((e) => setListError(String(e)));
   }, []);
+
+  // ── Owed IPTC per photo (#153) ─────────────────────────────────────────────
+  const [owed, setOwed] = useState<OwedIptc[] | null>(null);
+  const [owedPage, setOwedPage] = useState(0);
+  const [owedError, setOwedError] = useState("");
+  /** The photo a Dismiss or Retry is in flight for: one at a time. */
+  const [owedBusy, setOwedBusy] = useState<number | null>(null);
+  const [owedResult, setOwedResult] = useState("");
+  /** Bumped by every owed-page read: an older read that resolves late is dropped. */
+  const owedSeqRef = useRef(0);
+
+  const reloadOwed = useCallback((p: number) => {
+    setOwedError("");
+    const seq = ++owedSeqRef.current;
+    listOwedIptc(OWED_PAGE_SIZE, p * OWED_PAGE_SIZE)
+      .then((rows) => {
+        if (owedSeqRef.current === seq) setOwed(rows);
+      })
+      .catch((e) => {
+        if (owedSeqRef.current === seq) setOwedError(String(e));
+      });
+  }, []);
+
+  useEffect(() => {
+    reloadOwed(owedPage);
+  }, [reloadOwed, owedPage]);
+
+  const actOnOwed = async (row: OwedIptc, retry: boolean) => {
+    if (owedBusy !== null) return;
+    setOwedBusy(row.photoId);
+    setOwedError("");
+    setOwedResult("");
+    try {
+      const done: OwedAction = retry
+        ? { retried: await retryOwedIptc(row.photoId, row.uuid) }
+        : { dismissed: await dismissOwedIptc(row.photoId, row.uuid, row.generation) };
+      setOwedResult(owedActionMessage(done));
+      reloadSummary();
+      reloadOwed(owedPage);
+      onCountsChanged?.();
+    } catch (e) {
+      // A refusal ("This photo is no longer in the catalog") names what it refused.
+      setOwedError(String(e));
+    } finally {
+      setOwedBusy(null);
+    }
+  };
 
   // Summary and volumes load once up front; the page reloads whenever `page` changes.
   useEffect(() => {
@@ -352,8 +438,11 @@ export function IdentityDebtPanel({ onClose }: { onClose: () => void }) {
       setPage(0);
       reloadSummary();
       reloadPage(0, showDismissedRef.current);
+      // The pass retried owed IPTC too (#148): those rows may have left as well.
+      setOwedPage(0);
+      reloadOwed(0);
     },
-    [listeners, reloadSummary, reloadPage],
+    [listeners, reloadSummary, reloadPage, reloadOwed],
   );
 
   /**
@@ -670,6 +759,101 @@ export function IdentityDebtPanel({ onClose }: { onClose: () => void }) {
           {summaryError && <div className="modal-error">{summaryError}</div>}
           {listError && <div className="modal-error">{listError}</div>}
           {actionError && <div className="modal-error">{actionError}</div>}
+
+          {/* #153: the photos owing IPTC, listed whenever any do (or after an action on one,
+              so its answer stays visible). */}
+          {((summary?.iptcOwed ?? 0) > 0 ||
+            (owed?.length ?? 0) > 0 ||
+            owedPage > 0 ||
+            owedResult ||
+            owedError) && (
+            <div className="identity-debt-owed" data-testid="owed-iptc">
+              <div className="modal-title" style={{ fontSize: 12, marginTop: 6 }}>
+                IPTC owed to sidecars
+              </div>
+              <div className="modal-sub">
+                Each row is a photo whose catalog IPTC has fields its sidecar has not received:
+                the sidecar write failed after the save. <strong>Retry</strong> writes them now;
+                the repair pass retries them too. <strong>Dismiss</strong> stops owing them
+                without writing anything — the catalog keeps its values and the sidecar keeps
+                what it has (for a photo kept on read-only media).
+              </div>
+              {owedResult && <div className="modal-sub">{owedResult}</div>}
+              {owedError && <div className="modal-error">{owedError}</div>}
+              {owed === null ? (
+                <div className="panel-empty">Loading…</div>
+              ) : owed.length === 0 && owedPage === 0 ? (
+                <div className="panel-empty">No photo owes IPTC to its sidecar.</div>
+              ) : (
+                <>
+                  <div className="identity-debt-row identity-debt-header">
+                    <span className="identity-debt-path">Path</span>
+                    <span className="identity-debt-relpath">Fields</span>
+                    <span className="identity-debt-fieldcol identity-debt-attemptscol">Tries</span>
+                    <span className="identity-debt-fieldcol identity-debt-lastattemptcol">
+                      Last attempt
+                    </span>
+                    <span className="identity-debt-fieldcol identity-debt-errorcol">Detail</span>
+                    <span className="identity-debt-actions" />
+                  </div>
+                  {owed.map((r) => (
+                    <div key={r.photoId} className="identity-debt-row" data-testid={`owed-row-${r.photoId}`}>
+                      <span className="identity-debt-path" title={r.path}>
+                        {r.path}
+                      </span>
+                      <span className="identity-debt-relpath">{r.fields.join(", ")}</span>
+                      <span className="identity-debt-fieldcol identity-debt-attemptscol">
+                        {r.attempts}×
+                      </span>
+                      <span className="identity-debt-fieldcol identity-debt-lastattemptcol">
+                        {fmtWhen(r.lastAttemptAt)}
+                      </span>
+                      <span className="identity-debt-fieldcol identity-debt-errorcol" title={r.error}>
+                        {r.error || "—"}
+                      </span>
+                      <span className="identity-debt-actions">
+                        <button
+                          className="chip"
+                          disabled={owedBusy !== null}
+                          title="Write the owed fields into this photo's sidecar now."
+                          onClick={() => actOnOwed(r, true)}
+                        >
+                          Retry
+                        </button>
+                        <button
+                          className="chip"
+                          disabled={owedBusy !== null}
+                          title="Stop owing these fields without writing. The catalog keeps its values."
+                          onClick={() => actOnOwed(r, false)}
+                        >
+                          Dismiss
+                        </button>
+                      </span>
+                    </div>
+                  ))}
+                  <div className="row" style={{ marginTop: 8, alignItems: "center", gap: 8 }}>
+                    <span className="modal-sub">
+                      {pagingLabel(owedPage * OWED_PAGE_SIZE, owed.length, summary?.iptcOwed ?? null)}
+                    </span>
+                    <button
+                      className="chip"
+                      disabled={owedPage === 0}
+                      onClick={() => setOwedPage((p) => Math.max(0, p - 1))}
+                    >
+                      ← Prev
+                    </button>
+                    <button
+                      className="chip"
+                      disabled={owed.length !== OWED_PAGE_SIZE}
+                      onClick={() => setOwedPage((p) => p + 1)}
+                    >
+                      Next →
+                    </button>
+                  </div>
+                </>
+              )}
+            </div>
+          )}
 
           {rows === null ? (
             <div className="panel-empty">Loading…</div>

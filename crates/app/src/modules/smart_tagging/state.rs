@@ -606,7 +606,11 @@ impl SmarttagsState {
             },
             |s, photo, from, list, _| {
                 s.suggesting = false;
-                s.photo = PhotoView::Ready(PhotoSuggestions { photo_id: photo, from, list });
+                // The user may have moved on while the kNN ran: the list is that photo's, and
+                // lands only while it is still the one shown (its rows are stored either way).
+                if s.photo_key == Some((photo, from)) {
+                    s.photo = PhotoView::Ready(PhotoSuggestions { photo_id: photo, from, list });
+                }
             },
         );
     }

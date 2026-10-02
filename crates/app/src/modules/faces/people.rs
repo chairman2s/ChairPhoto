@@ -19,8 +19,9 @@
 //! several picked clusters at once makes them one person (`name_clusters`); naming some faces
 //! of a cluster's sheet splits them off (`name_faces`), and the sheet can ignore faces. Only
 //! faces still pending a decision change. A running match regroups the clusters, so the
-//! People view's writes wait while one runs (the core's matcher writes suggestions without
-//! re-checking a face's state, so a naming racing it could be overwritten).
+//! People view's writes wait while one runs. That gate is UX only (checked at click time): the
+//! guarantee that a decision made during a run stands is the core matcher's, whose every write
+//! re-checks that the face is still undecided (#137).
 
 use super::state::FacesState;
 use crate::model::{AppModel, AppModelEvent};
@@ -560,15 +561,9 @@ impl People {
 fn read_all(
     c: &Catalog,
 ) -> chairphoto_core::catalog::Result<(Vec<PersonSummary>, Vec<ClusterSummary>, Vec<SuggestionEntry>, String, Vec<Tag>)> {
-    let root = core_faces::effective_people_root(c)?;
-    let prefix = format!("{root}/");
-    let people_tags = c
-        .list_tags_with_counts()?
-        .into_iter()
-        .map(|t| t.tag)
-        .filter(|t| t.full_path == root || t.full_path.starts_with(&prefix))
-        .collect();
-    Ok((core_faces::people_summary(c)?, core_faces::cluster_summary(c)?, core_faces::suggestion_list(c)?, root, people_tags))
+    // The same root and tags as the inspector's person picker.
+    let core_faces::PeopleTags { root, tags } = core_faces::people_tags(c)?;
+    Ok((core_faces::people_summary(c)?, core_faces::cluster_summary(c)?, core_faces::suggestion_list(c)?, root, tags))
 }
 
 /// The status line a naming leaves.

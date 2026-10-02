@@ -5,7 +5,9 @@
 //! real worker on synthetic embeddings.
 
 use super::*;
-use crate::app::{detach_catalog_and_trip_jobs, publish_catalog_and_reset_jobs, with_catalog_as, CATALOG_CHANGED};
+use crate::app::{
+    detach_catalog_and_trip_jobs, publish_catalog_and_reset_jobs, with_catalog_as, FacesMatchDone, CATALOG_CHANGED,
+};
 use crate::catalog::Catalog;
 use crate::test_support::{TestSubPath, TestTmpDir};
 use rusqlite::OptionalExtension;
@@ -139,22 +141,134 @@ fn a_failed_assignment_rolls_back_the_whole_batch() {
 
 // --- the per-face verbs ---------------------------------------------------------------------
 
-/// Confirming writes the person as an MWG region into the photo's sidecar **and keeps a
-/// foreign region** another tool wrote there (AGENTS.md "XMP safety": face regions are
-/// replaced by Name + Area match only).
+/// A sidecar another tool wrote — raw XML, not ChairPhoto's writer, no `chairphoto:LastWrite`,
+/// another frame size: a named MWG region carrying a foreign child element (digiKam's face
+/// engine), an unnamed region in the nested-`rdf:Description` form (which ChairPhoto does not
+/// even parse), a Microsoft Photo `MP:RegionInfo` and a digiKam tag list beside them. Every
+/// property is in element form: ChairPhoto's XML layer keeps elements and their namespaces but
+/// drops the prefix of every *attribute* it re-serialises (xmltree 0.11 stores attributes by
+/// local name) — a separate, pre-existing defect this test deliberately does not cover.
+fn seed_foreign_sidecar(photo_path: &std::path::Path) {
+    let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<x:xmpmeta xmlns:x="adobe:ns:meta/">
+ <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+  <rdf:Description rdf:about=""
+    xmlns:digiKam="http://www.digikam.org/ns/1.0/"
+    xmlns:mwg-rs="http://www.metadataworkinggroup.com/schemas/regions/"
+    xmlns:stDim="http://ns.adobe.com/xap/1.0/sType/Dimensions#"
+    xmlns:stArea="http://ns.adobe.com/xmp/sType/Area#"
+    xmlns:MP="http://ns.microsoft.com/photo/1.2/"
+    xmlns:MPRI="http://ns.microsoft.com/photo/1.2/t/RegionInfo#"
+    xmlns:MPReg="http://ns.microsoft.com/photo/1.2/t/Region#">
+   <digiKam:TagsList>
+    <rdf:Seq>
+     <rdf:li>People/Stranger</rdf:li>
+    </rdf:Seq>
+   </digiKam:TagsList>
+   <mwg-rs:Regions rdf:parseType="Resource">
+    <mwg-rs:AppliedToDimensions rdf:parseType="Resource">
+     <stDim:w>6000</stDim:w>
+     <stDim:h>4000</stDim:h>
+     <stDim:unit>pixel</stDim:unit>
+    </mwg-rs:AppliedToDimensions>
+    <mwg-rs:RegionList>
+     <rdf:Bag>
+      <rdf:li rdf:parseType="Resource">
+       <mwg-rs:Name>Stranger</mwg-rs:Name>
+       <mwg-rs:Type>Face</mwg-rs:Type>
+       <mwg-rs:Area rdf:parseType="Resource">
+        <stArea:x>0.7</stArea:x>
+        <stArea:y>0.7</stArea:y>
+        <stArea:w>0.2</stArea:w>
+        <stArea:h>0.2</stArea:h>
+        <stArea:unit>normalized</stArea:unit>
+       </mwg-rs:Area>
+       <digiKam:FaceEngine>dnn-yunet</digiKam:FaceEngine>
+      </rdf:li>
+      <rdf:li>
+       <rdf:Description>
+        <mwg-rs:Type>Pet</mwg-rs:Type>
+        <mwg-rs:Area rdf:parseType="Resource">
+         <stArea:x>0.31</stArea:x>
+         <stArea:y>0.8</stArea:y>
+         <stArea:w>0.1</stArea:w>
+         <stArea:h>0.1</stArea:h>
+        </mwg-rs:Area>
+       </rdf:Description>
+      </rdf:li>
+     </rdf:Bag>
+    </mwg-rs:RegionList>
+   </mwg-rs:Regions>
+   <MP:RegionInfo rdf:parseType="Resource">
+    <MPRI:Regions>
+     <rdf:Bag>
+      <rdf:li rdf:parseType="Resource">
+       <MPReg:PersonDisplayName>Stranger</MPReg:PersonDisplayName>
+       <MPReg:Rectangle>0.6, 0.6, 0.2, 0.2</MPReg:Rectangle>
+      </rdf:li>
+     </rdf:Bag>
+    </MPRI:Regions>
+   </MP:RegionInfo>
+  </rdf:Description>
+ </rdf:RDF>
+</x:xmpmeta>
+"#;
+    std::fs::write(crate::xmp::sidecar_path(photo_path), xml).unwrap();
+}
+
+/// The foreign tool's content survives a ChairPhoto region write: the named region with its
+/// area and its foreign extra, the unnamed nested-Description one, the MP regions and the tag
+/// list, each in its own namespace — next to ChairPhoto's own regions, `ours`.
+fn assert_foreign_kept(photo_path: &std::path::Path, ours: &[&str]) {
+    let regions = crate::xmp::read_face_regions(photo_path);
+    let xml = std::fs::read_to_string(crate::xmp::sidecar_path(photo_path)).unwrap();
+    let Some(stranger) = regions.iter().find(|r| r.name == "Stranger") else {
+        panic!("the foreign named region is lost: {regions:?}\n{xml}")
+    };
+    let (x, y, w, h) = stranger.bbox;
+    assert!((x - 0.6).abs() < 1e-4 && (y - 0.6).abs() < 1e-4 && (w - 0.2).abs() < 1e-4 && (h - 0.2).abs() < 1e-4, "{:?}", stranger.bbox);
+    let mut names: Vec<&str> = regions.iter().map(|r| r.name.as_str()).filter(|n| *n != "Stranger").collect();
+    names.sort();
+    assert_eq!(names, ours, "ChairPhoto's regions");
+
+    // Namespace-aware: each kept node must still be in its tool's namespace.
+    let doc = xmltree::Element::parse(xml.as_bytes()).unwrap();
+    let mut found: Vec<(String, String, String)> = Vec::new(); // (namespace, name, text)
+    fn walk(e: &xmltree::Element, out: &mut Vec<(String, String, String)>) {
+        let text = e.get_text().map(|t| t.trim().to_string()).unwrap_or_default();
+        out.push((e.namespace.clone().unwrap_or_default(), e.name.clone(), text));
+        for c in e.children.iter().filter_map(|n| n.as_element()) {
+            walk(c, out);
+        }
+    }
+    walk(&doc, &mut found);
+    let has = |ns: &str, name: &str, text: &str| found.iter().any(|(n, l, t)| n == ns && l == name && t == text);
+    const DIGIKAM: &str = "http://www.digikam.org/ns/1.0/";
+    const MWG: &str = "http://www.metadataworkinggroup.com/schemas/regions/";
+    const STAREA: &str = "http://ns.adobe.com/xmp/sType/Area#";
+    const MPREG: &str = "http://ns.microsoft.com/photo/1.2/t/Region#";
+    for (ns, name, text) in [
+        (DIGIKAM, "FaceEngine", "dnn-yunet"),
+        (MWG, "Type", "Pet"),
+        (STAREA, "x", "0.31"),
+        (MPREG, "PersonDisplayName", "Stranger"),
+        (MPREG, "Rectangle", "0.6, 0.6, 0.2, 0.2"),
+        ("http://www.w3.org/1999/02/22-rdf-syntax-ns#", "li", "People/Stranger"),
+    ] {
+        assert!(has(ns, name, text), "{ns}{name} = {text:?} was lost:\n{xml}");
+    }
+    assert!(found.iter().any(|(n, l, _)| n == DIGIKAM && l == "TagsList"), "the digiKam tag list is kept:\n{xml}");
+}
+
+/// Confirming writes the person as an MWG region into the photo's sidecar **and keeps the
+/// foreign regions** another tool wrote there (AGENTS.md "XMP safety": face regions are
+/// replaced by Name + Area match only; foreign namespaces are preserved).
 #[test]
 fn accepting_a_face_writes_its_region_and_preserves_a_foreign_one() {
     let (c, root) = temp_catalog("regions");
     let p = add_photo(&c, &root, "p.NEF");
     let photo_path = root.join("p.NEF");
-    // A region a different tool wrote: another name, elsewhere in the frame.
-    crate::xmp::write_face_regions(
-        &photo_path,
-        &[crate::xmp::FaceRegion { name: "Stranger".into(), bbox: (0.6, 0.6, 0.2, 0.2) }],
-        100,
-        100,
-    )
-    .unwrap();
+    seed_foreign_sidecar(&photo_path);
     let alice = c.create_tag("People/Alice").unwrap();
     let f = add_face(&c, p, "[0.1,0.1,0.2,0.2]");
     suggest(&c, f, alice);
@@ -163,9 +277,7 @@ fn accepting_a_face_writes_its_region_and_preserves_a_foreign_one() {
 
     assert_eq!(face_state(&c, f), "confirmed");
     assert!(has_tag(&c, p, alice));
-    let mut names: Vec<String> = crate::xmp::read_face_regions(&photo_path).into_iter().map(|r| r.name).collect();
-    names.sort();
-    assert_eq!(names, vec!["Alice".to_string(), "Stranger".to_string()], "ours added, the foreign region kept");
+    assert_foreign_kept(&photo_path, &["Alice"]);
 
     // Rejecting re-exports an empty confirmed set. The writer then cannot tell its own old
     // region from a foreign one (none matches a name it is writing), so it preserves both —
@@ -230,27 +342,51 @@ fn drawn_boxes_are_clamped_and_only_they_can_be_deleted() {
     assert_eq!(faces_for_photo(&c, p).unwrap().iter().map(|r| r.id).collect::<Vec<_>>(), vec![detected]);
 }
 
-/// The picker's tags: the people root and its descendants when one is set, else every tag
-/// that is not an auto-tag.
+/// The picker's tags: the people root and its descendants. With no root set (or a blank one)
+/// the root is the matcher's and the People view's default, `People` — so a person created
+/// in the picker goes to `People/<name>` and the matcher counts them.
 #[test]
 fn people_tags_follow_the_people_root() {
-    let (c, _root) = temp_catalog("people");
+    let (c, root) = temp_catalog("people");
     c.create_tag("People/Alice").unwrap();
     c.create_tag("People/Family/Bob").unwrap();
     c.create_tag("Peoples Republic").unwrap();
     c.create_tag("Places/Oslo").unwrap();
+    c.create_tag("Family/Ann").unwrap();
+    let paths = |p: &PeopleTags| {
+        let mut v: Vec<String> = p.tags.iter().map(|t| t.full_path.clone()).collect();
+        v.sort();
+        v
+    };
+    let under_people = vec!["People", "People/Alice", "People/Family", "People/Family/Bob"];
 
-    let all = people_tags(&c).unwrap();
-    assert_eq!(all.root, "");
-    assert!(all.tags.iter().any(|t| t.full_path == "Places/Oslo"), "no root: every non-auto tag");
+    for unset in [None, Some("  ")] {
+        if let Some(blank) = unset {
+            c.set_setting(matcher::PEOPLE_ROOT_SETTING, blank).unwrap();
+        }
+        let picker = people_tags(&c).unwrap();
+        assert_eq!(picker.root, matcher::PEOPLE_ROOT_DEFAULT, "{unset:?}: the matcher's default root");
+        assert_eq!(picker.root, effective_people_root(&c).unwrap(), "{unset:?}: the People view's root");
+        assert_eq!(paths(&picker), under_people, "{unset:?}");
+    }
 
-    c.set_setting(matcher::PEOPLE_ROOT_SETTING, " People ").unwrap();
-    let people = people_tags(&c).unwrap();
-    assert_eq!(people.root, "People");
-    let mut paths: Vec<&str> = people.tags.iter().map(|t| t.full_path.as_str()).collect();
-    paths.sort();
-    assert_eq!(paths, vec!["People", "People/Alice", "People/Family", "People/Family/Bob"]);
-    assert_eq!(person_path(&people.root, "Eve"), "People/Eve");
+    // A person created in the picker with no root set lands under People, where the matcher
+    // looks: it seeds from that photo-level tag.
+    c.conn().execute("DELETE FROM settings WHERE key = ?1", [matcher::PEOPLE_ROOT_SETTING]).unwrap();
+    let p = add_photo(&c, &root, "eve.NEF");
+    let f = add_embedded_face(&c, p, 0);
+    let picker = people_tags(&c).unwrap();
+    let eve = assign_new_person(&c, f, &person_path(&picker.root, "Eve")).unwrap();
+    assert_eq!(c.find_tag_id_by_path("People/Eve").unwrap(), Some(eve));
+    let seen = matcher::run_matching(c.conn(), &matcher::MatchSettings::load(c.conn()).unwrap(), 0).unwrap();
+    assert_eq!(seen.people, 1, "the matcher has a centroid for Eve: {seen:?}");
+
+    c.set_setting(matcher::PEOPLE_ROOT_SETTING, " Family ").unwrap();
+    let family = people_tags(&c).unwrap();
+    assert_eq!(family.root, "Family");
+    assert_eq!(matcher::MatchSettings::load(c.conn()).unwrap().people_root, "Family", "the matcher trims it too");
+    assert_eq!(paths(&family), vec!["Family", "Family/Ann"]);
+    assert_eq!(person_path(&family.root, "Eve"), "Family/Eve");
     assert_eq!(person_path("", "Eve"), "Eve");
 }
 
@@ -482,6 +618,123 @@ fn a_match_start_bound_to_another_catalog_touches_nothing() {
     assert_eq!(state.jobs.faces_match.abort().job_ids_issued(), issued);
 }
 
+/// A user decision to make while the matching worker is running, on the **main** connection.
+type Decision = Box<dyn FnOnce(&Catalog) -> CatalogResult<()> + Send>;
+
+/// A sink that makes the user's decisions in the middle of a real run: `at_seed` when the
+/// seed phase starts (its candidates already read), `after_load` at the first progress of a
+/// later phase (the pending faces already read by `load_pending_faces`). The worker is on
+/// its own connection, so this is the interleaving the inspector, overlay or Tauri UI can
+/// produce at any time (#137).
+struct DecideMidRun {
+    state: AppState,
+    at_seed: std::sync::Mutex<Option<Decision>>,
+    after_load: std::sync::Mutex<Option<Decision>>,
+    done: std::sync::Mutex<Option<FacesMatchDone>>,
+}
+
+impl EventSink for DecideMidRun {
+    fn send(&self, event: CoreEvent) {
+        match event {
+            CoreEvent::FacesMatchProgress(p) => {
+                let hook = if p.phase == matcher::MatchPhase::Seed.label() { &self.at_seed } else { &self.after_load };
+                if let Some(decide) = hook.lock().unwrap().take() {
+                    crate::app::with_catalog(&self.state, decide).unwrap();
+                }
+            }
+            CoreEvent::FacesMatchDone(d) => *self.done.lock().unwrap() = Some(d),
+            _ => {}
+        }
+    }
+}
+
+/// Catalog, tags and sidecar agree on a photo: every confirmed face's person is tagged on the
+/// photo and exported as a region, and nothing else is exported.
+fn assert_consistent(c: &Catalog, root: &std::path::Path, photo: i64, name: &str) {
+    let mut confirmed: Vec<String> = Vec::new();
+    for f in faces_for_photo(c, photo).unwrap().into_iter().filter(|f| f.state == "confirmed") {
+        assert!(has_tag(c, photo, f.person_tag_id.unwrap()), "{name}: a confirmed face's person is tagged");
+        confirmed.push(f.person_name.unwrap());
+    }
+    confirmed.sort();
+    let mut exported: Vec<String> = crate::xmp::read_face_regions(&root.join(name)).into_iter().map(|r| r.name).collect();
+    exported.sort();
+    assert_eq!(confirmed, exported, "{name}: the sidecar's regions are the catalog's confirmed faces");
+}
+
+/// A decision made while matching runs stands (#137). The run reads its candidates, then the
+/// user — on the main connection — ignores the face it was about to seed, assigns the face it
+/// was about to suggest as Alice to Bob, ignores another, and names one it was about to
+/// cluster. After the run each decision is intact and the catalog, photo tags and sidecars
+/// agree.
+#[test]
+fn a_decision_made_during_a_match_run_is_never_overwritten() {
+    let (c, root) = temp_catalog("match-race");
+    let alice = c.create_tag("People/Alice").unwrap();
+    let bob = c.create_tag("People/Bob").unwrap();
+    // Alice's centroid: a face confirmed as her.
+    let p0 = add_photo(&c, &root, "p0.NEF");
+    let f0 = add_embedded_face(&c, p0, 0);
+    assign(&c, f0, alice).unwrap();
+    // A seed candidate: one face, one person tag on the photo.
+    let ps = add_photo(&c, &root, "ps.NEF");
+    let fs = add_embedded_face(&c, ps, 5);
+    c.assign_tag(ps, alice).unwrap();
+    // Two faces open matching would suggest as Alice.
+    let pa = add_photo(&c, &root, "pa.NEF");
+    let fa = add_embedded_face(&c, pa, 0);
+    let pi = add_photo(&c, &root, "pi.NEF");
+    let fi = add_embedded_face(&c, pi, 0);
+    // Two unknown faces clustering would group.
+    let pc1 = add_photo(&c, &root, "pc1.NEF");
+    let fc1 = add_embedded_face(&c, pc1, 3);
+    let pc2 = add_photo(&c, &root, "pc2.NEF");
+    let fc2 = add_embedded_face(&c, pc2, 3);
+
+    let state = state_with(c);
+    let claim = begin_match_job(&state, None).unwrap();
+    let sink = DecideMidRun {
+        state: state.clone(),
+        at_seed: std::sync::Mutex::new(Some(Box::new(move |c: &Catalog| ignore(c, fs)))),
+        after_load: std::sync::Mutex::new(Some(Box::new(move |c: &Catalog| {
+            assign(c, fa, bob)?;
+            ignore(c, fi)?;
+            name_faces(c, &[fc1], "People/Carol").map(|_| ())
+        }))),
+        done: Default::default(),
+    };
+    run_match_job(&sink, claim);
+
+    assert!(sink.at_seed.lock().unwrap().is_none() && sink.after_load.lock().unwrap().is_none(), "both hooks ran");
+    let done = sink.done.lock().unwrap().take().expect("the run ended");
+    assert!(done.ok, "{done:?}");
+    let outcome = done.outcome.unwrap();
+    assert_eq!((outcome.seeded, outcome.open, outcome.clustered), (0, 0, 1), "{outcome:?}");
+
+    let guard = state.catalog.lock().unwrap();
+    let c = guard.as_ref().unwrap();
+    let row = |f: i64| -> (String, Option<i64>, String, Option<i64>) {
+        c.conn()
+            .query_row(
+                "SELECT state, person_tag_id, source, cluster_id FROM faces__faces WHERE id = ?1",
+                [f],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap()
+    };
+    assert_eq!(row(f0), ("confirmed".into(), Some(alice), "manual".into(), None), "a prior decision is untouched");
+    assert_eq!(row(fs).0, "ignored", "ignored after the seed candidates were read: not seeded");
+    assert_eq!(row(fa), ("confirmed".into(), Some(bob), "manual".into(), None), "assigned to Bob: not re-suggested as Alice");
+    assert_eq!(row(fi).0, "ignored", "ignored after the pending faces were read: not suggested");
+    let carol = c.find_tag_id_by_path("People/Carol").unwrap().unwrap();
+    assert_eq!(row(fc1), ("confirmed".into(), Some(carol), "manual".into(), None), "named: in no cluster");
+    let fc2_cluster = row(fc2).3.expect("the still-unknown face is clustered");
+    assert_eq!(cluster_rows(c), vec![(fc2_cluster, 1)], "the cluster holds only the face still pending");
+    for (photo, name) in [(p0, "p0.NEF"), (ps, "ps.NEF"), (pa, "pa.NEF"), (pi, "pi.NEF"), (pc1, "pc1.NEF"), (pc2, "pc2.NEF")] {
+        assert_consistent(c, &root, photo, name);
+    }
+}
+
 // --- the People view's verbs (#130) ---------------------------------------------------------
 
 fn put_in_cluster(c: &Catalog, face: i64, cluster: i64) {
@@ -503,13 +756,7 @@ fn naming_two_clusters_together_merges_them_into_one_person() {
     let (c, root) = temp_catalog("merge");
     let p1 = add_photo(&c, &root, "a.NEF");
     let p2 = add_photo(&c, &root, "b.NEF");
-    crate::xmp::write_face_regions(
-        &root.join("a.NEF"),
-        &[crate::xmp::FaceRegion { name: "Stranger".into(), bbox: (0.6, 0.6, 0.2, 0.2) }],
-        100,
-        100,
-    )
-    .unwrap();
+    seed_foreign_sidecar(&root.join("a.NEF"));
     let a1 = add_face(&c, p1, "[0.1,0.1,0.2,0.2]");
     let a2 = add_face(&c, p1, "[0.4,0.1,0.2,0.2]");
     let b1 = add_face(&c, p2, "[0.1,0.1,0.2,0.2]");
@@ -525,9 +772,7 @@ fn naming_two_clusters_together_merges_them_into_one_person() {
     assert_eq!(face_state(&c, a2), "unassigned");
     assert!(has_tag(&c, p1, jane) && has_tag(&c, p2, jane));
     assert_eq!(cluster_rows(&c).iter().map(|r| r.0).collect::<Vec<_>>(), vec![12], "both named clusters are gone");
-    let mut names: Vec<String> = crate::xmp::read_face_regions(&root.join("a.NEF")).into_iter().map(|r| r.name).collect();
-    names.sort();
-    assert_eq!(names, vec!["Jane".to_string(), "Stranger".to_string()], "ours added, the foreign region kept");
+    assert_foreign_kept(&root.join("a.NEF"), &["Jane"]);
     let people = people_summary(&c).unwrap();
     assert_eq!((people.len(), people[0].face_count, people[0].photo_count), (1, 2, 2));
 }

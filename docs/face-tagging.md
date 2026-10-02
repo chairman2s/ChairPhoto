@@ -188,7 +188,10 @@ previous ChairPhoto run are therefore ingested for free.
   decision change, and a cluster that a matching run has since regrouped names nothing (cluster
   ids are never reused). Clusters are rebuilt from scratch by every matching run, so merging or
   splitting is done by *naming* — the only durable form. In the GPUI app these writes wait while
-  a matching run is going: the matcher writes suggestions without re-checking a face's state.
+  a matching run is going, as UX only: a run regroups the clusters the view shows. The guarantee
+  is in the core — every seed, suggestion and cluster write of the matcher re-checks in its own
+  `UPDATE` that the face is still undecided, so a confirm, naming, assignment or ignore made
+  during a run (from any view, or the Tauri UI) is never overwritten.
 - **Settings** — people root, model download status, similarity threshold, and index actions
   with progress.
 

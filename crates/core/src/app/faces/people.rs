@@ -187,8 +187,9 @@ pub fn cluster_faces(c: &Catalog, cluster: i64) -> CatalogResult<Vec<ClusterFace
     Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
-/// The people root the matcher uses (`faces.people_root`, `People` when unset): where a
-/// person named in the People view goes, so the matcher counts them.
+/// The people root the matcher uses (`faces.people_root`, trimmed; `People` when unset or
+/// blank): where a person named in the People view or created in the person picker goes, so
+/// the matcher counts them.
 pub fn effective_people_root(c: &Catalog) -> CatalogResult<String> {
     Ok(MatchSettings::load(c.conn())?.people_root)
 }

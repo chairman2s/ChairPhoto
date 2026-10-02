@@ -292,12 +292,17 @@ pub fn avatar_placement(bbox: (f32, f32, f32, f32), natural: (f32, f32), size: f
     (size / 2. - cx, size / 2. - cy, dw, dh)
 }
 
+/// Whether a suggestion's `confidence` reaches the queue's `threshold`: the exact fraction,
+/// as React's `e.confidence >= confidenceThreshold` — not the rounded percent the label shows,
+/// so a 0.795 (shown as 80%) is not confirmed by "Confirm all ≥80%". The row dimming uses the
+/// same test, so what is dimmed is exactly what "Confirm all" leaves out.
+pub fn reaches(confidence: f64, threshold: f64) -> bool {
+    confidence >= threshold
+}
+
 /// The suggestions at or above `threshold` (the queue's "Confirm all ≥ X%"), by index.
 pub fn at_or_above(confidences: impl IntoIterator<Item = f64>, threshold: f64) -> Vec<usize> {
-    // Compare in whole percent, as the slider shows them: 0.8 must include a 0.8 stored as
-    // 0.7999999.
-    let t = (threshold * 100.).round();
-    confidences.into_iter().enumerate().filter(|(_, c)| (c * 100.).round() >= t).map(|(i, _)| i).collect()
+    confidences.into_iter().enumerate().filter(|&(_, c)| reaches(c, threshold)).map(|(i, _)| i).collect()
 }
 
 #[cfg(test)]
@@ -322,9 +327,15 @@ mod tests {
         assert!((l - (36. - 216.)).abs() < 1e-3 && (t - (36. - 126.)).abs() < 1e-3, "{l},{t}");
     }
 
+    /// The exact fraction, like React's `>=`: 0.795 is shown as 80% but is below 0.8, so
+    /// "Confirm all ≥80%" leaves it (and dims its row); 0.8 itself is in.
     #[test]
-    fn confirm_all_counts_in_whole_percent() {
-        assert_eq!(at_or_above([0.95, 0.7999999, 0.79, 0.5], 0.8), vec![0, 1]);
+    fn confirm_all_compares_the_exact_fraction() {
+        assert_eq!(at_or_above([0.95, 0.8, 0.795, 0.7999999, 0.5], 0.8), vec![0, 1]);
+        assert!(!reaches(0.795, 0.8) && reaches(0.8, 0.8));
+        // A slider value (step 0.05, quantised as the view does) and an f32-stored confidence.
+        let t = (0.8f32 as f64 * 20.).round() / 20.;
+        assert!(reaches(0.8f32 as f64, t));
         assert_eq!(at_or_above([0.5], 0.0), vec![0]);
     }
 

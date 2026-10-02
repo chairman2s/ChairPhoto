@@ -28,6 +28,10 @@
 //! Re-running is safe and proposes nothing new when nothing changed:
 //! - **Confirmed** / **ignored** / **manual** faces are never touched (never downgraded).
 //! - A **rejected** `(face, person)` pair (recorded by [`reject`]) is never re-proposed.
+//! - A decision made **while a run is going** stands: the run reads its candidates once, but
+//!   every seed, suggestion and cluster write re-checks in its own `UPDATE` that the face is
+//!   still undecided, so a confirm/name/assign/ignore made mid-run is never overwritten
+//!   (#137). This is the guarantee; a UI gate on writes during a run is only UX.
 //! - Existing `suggested` rows are re-evaluated from scratch each run: the matcher first
 //!   resets every still-`suggested`/`unassigned` face back to a clean slate, then recomputes.
 //!   So a run that finds the same best match writes back the same row — no churn — and a run
@@ -96,8 +100,11 @@ impl MatchSettings {
     /// Load the settings from the `settings` key-value table, falling back to defaults for
     /// any missing/blank/unparseable key.
     pub fn load(conn: &Connection) -> rusqlite::Result<Self> {
+        // Trimmed, as the person picker and the People view use it: a root saved as " People "
+        // must not make the matcher look under " People /".
         let people_root = get_setting(conn, PEOPLE_ROOT_SETTING)?
-            .filter(|s| !s.trim().is_empty())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
             .unwrap_or_else(|| PEOPLE_ROOT_DEFAULT.to_string());
         let threshold = get_setting(conn, THRESHOLD_SETTING)?
             .and_then(|s| s.trim().parse::<f32>().ok())
@@ -363,16 +370,6 @@ fn auto_seed(
         if !progress(MatchPhase::Seed, done + 1, candidates.len()) {
             break;
         }
-        // The single face must still be a raw unassigned detection.
-        let state: String = conn.query_row(
-            "SELECT state FROM faces__faces WHERE id = ?1",
-            [face_id],
-            |r| r.get(0),
-        )?;
-        if state != STATE_UNASSIGNED {
-            continue;
-        }
-
         // The photo must have exactly one *person* tag.
         let tags = photo_person_tags(conn, photo_id, person_tags)?;
         if tags.len() != 1 {
@@ -385,15 +382,18 @@ fn auto_seed(
             continue;
         }
 
-        conn.execute(
+        // The single face must still be a raw unassigned detection — checked in the UPDATE
+        // itself, so a confirm/name/ignore that landed since the candidates were read (on
+        // another connection, mid-run) is never overwritten (#137).
+        let changed = conn.execute(
             "UPDATE faces__faces
                 SET person_tag_id = ?2, state = ?3, source = ?4,
                     match_confidence = 1.0, cluster_id = NULL
-              WHERE id = ?1",
-            rusqlite::params![face_id, tag_id, STATE_CONFIRMED, SOURCE_SEED],
+              WHERE id = ?1 AND state = ?5",
+            rusqlite::params![face_id, tag_id, STATE_CONFIRMED, SOURCE_SEED, STATE_UNASSIGNED],
         )?;
         let _ = now; // seeds carry no created_at rewrite; timestamp reserved for future audit.
-        seeded += 1;
+        seeded += changed;
     }
     Ok(seeded)
 }
@@ -581,9 +581,11 @@ fn constrained_match(
             }
             let tag_id = people[ci];
             let confidence = 1.0 - c; // cosine similarity.
-            write_suggestion(conn, pending[fi].id, tag_id, confidence, now)?;
+            // A face decided meanwhile is resolved either way: it must not be clustered.
             resolved.insert(pending[fi].id);
-            suggested += 1;
+            if write_suggestion(conn, pending[fi].id, tag_id, confidence, now)? {
+                suggested += 1;
+            }
         }
     }
     Ok(suggested)
@@ -627,9 +629,10 @@ fn open_match(
             }
         }
         if let Some((tag_id, sim)) = best {
-            write_suggestion(conn, f.id, tag_id, sim, now)?;
             resolved.insert(f.id);
-            suggested += 1;
+            if write_suggestion(conn, f.id, tag_id, sim, now)? {
+                suggested += 1;
+            }
         }
     }
     Ok(suggested)
@@ -679,8 +682,14 @@ fn cluster_leftovers(
             }
         }
 
-        let cluster_id = match best {
+        // The face joins a cluster only while it is still unassigned: `pending` was read
+        // before this step, and a naming or ignore may have landed since (#137). A face that
+        // is no longer pending neither joins nor moves a centroid.
+        match best {
             Some((idx, _)) => {
+                if !assign_cluster(conn, f.id, clusters[idx].0)? {
+                    continue;
+                }
                 // Join: update the running mean centroid.
                 let (cid, cen, size) = &mut clusters[idx];
                 let n = *size as f32;
@@ -696,7 +705,6 @@ fn cluster_leftovers(
                     "UPDATE faces__clusters SET centroid = ?2, size = ?3 WHERE id = ?1",
                     rusqlite::params![cid, embedding_to_blob(cen), *size as i64],
                 )?;
-                cid
             }
             None => {
                 // New cluster seeded from this face's (normalized) embedding.
@@ -706,15 +714,13 @@ fn cluster_leftovers(
                     rusqlite::params![embedding_to_blob(&cen), now],
                 )?;
                 let cid = conn.last_insert_rowid();
+                if !assign_cluster(conn, f.id, cid)? {
+                    conn.execute("DELETE FROM faces__clusters WHERE id = ?1", [cid])?;
+                    continue;
+                }
                 clusters.push((cid, cen, 1));
-                cid
             }
-        };
-
-        conn.execute(
-            "UPDATE faces__faces SET cluster_id = ?2 WHERE id = ?1",
-            rusqlite::params![f.id, cluster_id],
-        )?;
+        }
         clustered += 1;
     }
     Ok(clustered)
@@ -722,22 +728,43 @@ fn cluster_leftovers(
 
 // ── Write helpers ───────────────────────────────────────────────────────────────
 
-/// Write a `suggested` row for a face: set the person, confidence and `source='match'`.
+// The matcher reads its candidates once, then writes them one by one on its own connection,
+// outside any transaction, so the user can confirm, name, assign or ignore a face in between
+// (the inspector, the loupe overlay, the People view, the Tauri UI). Every write below
+// therefore re-checks, in the UPDATE itself, that the face is still undecided: a decision
+// made during a run always stands, in the catalog and so in the sidecar it was exported to
+// (#137).
+
+/// Write a `suggested` row for a face: set the person, confidence and `source='match'` —
+/// only while the face is still pending a decision ([`PENDING_STATES`]). Returns whether it
+/// wrote.
 fn write_suggestion(
     conn: &Connection,
     face_id: i64,
     tag_id: i64,
     confidence: f32,
     _now: i64,
-) -> rusqlite::Result<()> {
-    conn.execute(
-        "UPDATE faces__faces
-            SET person_tag_id = ?2, state = ?3, source = ?4,
-                match_confidence = ?5, cluster_id = NULL
-          WHERE id = ?1",
+) -> rusqlite::Result<bool> {
+    let changed = conn.execute(
+        &format!(
+            "UPDATE faces__faces
+                SET person_tag_id = ?2, state = ?3, source = ?4,
+                    match_confidence = ?5, cluster_id = NULL
+              WHERE id = ?1 AND state IN {PENDING_STATES}"
+        ),
         rusqlite::params![face_id, tag_id, STATE_SUGGESTED, SOURCE_MATCH, confidence as f64],
     )?;
-    Ok(())
+    Ok(changed == 1)
+}
+
+/// Put a face in cluster `cluster_id` — only while it is still `unassigned` (no suggestion,
+/// no decision). Returns whether it did.
+fn assign_cluster(conn: &Connection, face_id: i64, cluster_id: i64) -> rusqlite::Result<bool> {
+    let changed = conn.execute(
+        "UPDATE faces__faces SET cluster_id = ?2 WHERE id = ?1 AND state = ?3",
+        rusqlite::params![face_id, cluster_id, STATE_UNASSIGNED],
+    )?;
+    Ok(changed == 1)
 }
 
 // ── Rejection memory ────────────────────────────────────────────────────────────

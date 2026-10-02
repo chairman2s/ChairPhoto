@@ -82,29 +82,33 @@ pub fn set_indexing_speed(c: &Catalog, speed: &str) -> CatalogResult<()> {
     c.set_setting(indexing::INDEXING_SPEED_SETTING, &v)
 }
 
-/// The tags the person picker offers, and the people root new persons are created under
-/// (`loadPeopleTags` in faces.tsx): the configured `faces.people_root` and its descendants,
-/// or — with no root set — every tag that is not an auto-tag.
+/// The tags the person picker offers, and the people root new persons are created under: the
+/// people root and its descendants. The root is the one the matcher and the People view use
+/// ([`people::effective_people_root`]: `faces.people_root`, `People` when unset), so a person
+/// created in the inspector or the loupe overlay is one the matcher counts. (React's
+/// `loadPeopleTags` treated an unset root as "no root" and created top-level tags the matcher
+/// never saw.)
 #[derive(Debug, Clone, Default)]
 pub struct PeopleTags {
-    /// The trimmed `faces.people_root` setting; empty when unset.
+    /// The effective people root (never empty for a catalog read).
     pub root: String,
     pub tags: Vec<Tag>,
 }
 
 pub fn people_tags(c: &Catalog) -> CatalogResult<PeopleTags> {
-    let root = c.get_setting(matcher::PEOPLE_ROOT_SETTING)?.unwrap_or_default().trim().to_string();
+    let root = effective_people_root(c)?;
     let prefix = format!("{root}/");
     let tags = c
         .list_tags_with_counts()?
         .into_iter()
         .map(|t| t.tag)
-        .filter(|t| if root.is_empty() { t.auto_rule.is_none() } else { t.full_path == root || t.full_path.starts_with(&prefix) })
+        .filter(|t| t.full_path == root || t.full_path.starts_with(&prefix))
         .collect();
     Ok(PeopleTags { root, tags })
 }
 
-/// The tag path a new person named `name` gets: under the people root when one is set.
+/// The tag path a new person named `name` gets: under the people root (`name` alone only for
+/// an empty root, which [`people_tags`] never returns).
 pub fn person_path(root: &str, name: &str) -> String {
     let (root, name) = (root.trim(), name.trim());
     if root.is_empty() {

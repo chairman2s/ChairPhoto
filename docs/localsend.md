@@ -31,7 +31,8 @@ A send is a core job, `crates/core/src/app/localsend.rs` (`claim_send`, then
 checks the catalog the ids were read from, resolves the originals and takes the LocalSend job
 generation under one catalog lock; a newer send, Cancel or a catalog switch trips it, and the
 send stops before its next render or file — mid-upload too — and cancels the receiver's session
-(`POST /cancel`). Its rendering is **not** `publishing::render_upload_jpeg`, the SmugMug/Flickr
+(`POST /cancel`). A send that stops part-way (Cancel, or the receiver rejecting a file) answers
+`SendStopped`: the photos already on the device and why the rest did not go. Its rendering is **not** `publishing::render_upload_jpeg`, the SmugMug/Flickr
 helper. The two are siblings built from the same `export` primitives (`resolve_originals`,
 `upload_file_name`, `JobTempDir`, `write_item_jpeg`), not one calling the other, so they share
 behaviour by construction rather than by delegation:
@@ -126,8 +127,9 @@ localsend_send(photoIds, versionId?, device, pin?) -> { sent, failed }
 
 In the GPUI app (`crates/app/src/modules/localsend/`) the LocalSend and Snapchat modules each
 contribute a publish target rendering `send::SendToDevicePanel`; Snapchat records through
-`modules::publishing::record_publications` with its marker, only for the photos that reached the
-device. The Publish dialog builds a target's form when its chip is chosen, so the opening scan
+core's `app::publications::record_publications_as` with its marker, only for the photos that reached the
+device — including those delivered before a send stopped part-way (the status then reads
+"Sent 3 of 5 to Phone, then stopped: …"). The Publish dialog builds a target's form when its chip is chosen, so the opening scan
 runs only for a form the user is looking at. Tests fake the network at `LocalSendBackend`;
 core's `app::localsend` tests drive the real send against a loopback stub receiver
 (`localsend/test_receiver.rs`, an ephemeral `127.0.0.1` port).

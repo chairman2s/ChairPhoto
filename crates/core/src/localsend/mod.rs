@@ -837,19 +837,48 @@ pub async fn send_files(
     pin: Option<&str>,
     progress: impl FnMut(usize, usize),
 ) -> Result<(), String> {
-    send_files_abortable(device, paths, pin, &std::sync::atomic::AtomicBool::new(false), progress).await
+    send_files_abortable(device, paths, pin, &std::sync::atomic::AtomicBool::new(false), progress)
+        .await
+        .map_err(|stopped| stopped.error)
+}
+
+/// A send that ended before every file was delivered: the first `delivered` of the paths
+/// reached the receiver (and stay there), and `error` says why the rest did not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Stopped {
+    pub delivered: usize,
+    pub error: String,
 }
 
 /// [`send_files`], stopping with [`SEND_CANCELLED`] once `abort` is set: before the
 /// handshake, while it waits on prepare-upload, between files, and in the middle of an upload
 /// (the request is dropped). Once a session exists, a stop also sends `POST /cancel` for it,
 /// best-effort, so the receiver does not sit waiting for files that will never come.
+///
+/// A stop or failure answers [`Stopped`], which says how many files had already been
+/// delivered — part of the terminal result, not something a caller reconstructs from
+/// `progress`.
 pub async fn send_files_abortable(
     device: &Device,
     paths: &[std::path::PathBuf],
     pin: Option<&str>,
     abort: &std::sync::atomic::AtomicBool,
+    progress: impl FnMut(usize, usize),
+) -> Result<(), Stopped> {
+    let mut delivered = 0;
+    send_counting(device, paths, pin, abort, progress, &mut delivered)
+        .await
+        .map_err(|error| Stopped { delivered, error })
+}
+
+/// The body of [`send_files_abortable`]: `delivered` counts each file the receiver accepted.
+async fn send_counting(
+    device: &Device,
+    paths: &[std::path::PathBuf],
+    pin: Option<&str>,
+    abort: &std::sync::atomic::AtomicBool,
     mut progress: impl FnMut(usize, usize),
+    delivered: &mut usize,
 ) -> Result<(), String> {
     use std::sync::atomic::Ordering;
     if paths.is_empty() {
@@ -932,6 +961,7 @@ pub async fn send_files_abortable(
                 meta.file_name
             ));
         }
+        *delivered = i + 1;
         progress(i + 1, total);
     }
     Ok(())

@@ -63,9 +63,10 @@ await api.deletePublication(pubs[0].id);
 ```
 
 In the GPUI app a module's marker is `ModuleMeta::marker()` (declared `publication_marker`,
-else the id), and a publish target records through `modules::publishing::record_publications`,
-bound to the catalog its photo ids were read from (`with_catalog_as`), so a record never lands
-in a catalog opened since. The React host below did the same stamping in TypeScript.
+else the id), and a publish target records through core's
+`app::publications::record_publications_as`, bound to the catalog its photo ids were read from
+(`with_catalog_as`), so a record never lands in a catalog opened since, and run in one
+transaction (`Catalog::record_publications`), so a failing row records none. The React host below did the same stamping in TypeScript.
 
 The host wires `recordPublication` to stamp the calling module's marker
 (`getPublicationMarker(mod.id)` in `src/modules/host.ts`), so the "module declares it,

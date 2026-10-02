@@ -16,12 +16,13 @@
 use super::{LocalSendBackend, SendMode};
 use crate::model::AppModelEvent;
 use crate::modules::dialog::{self, DialogHost};
-use crate::modules::publishing::{record_publications, PublishSubject, VersionPicker, NO_ROWS};
+use crate::modules::publishing::{PublishSubject, VersionPicker, NO_ROWS};
 use crate::shell::style::Colors;
 use crate::storage::{ui, Runner};
 use chairphoto_core::app::localsend::{claim_send, Device, LocalSendJob, SendOutcome, SEND_CANCELLED};
+use chairphoto_core::app::publications::record_publications_as;
 use chairphoto_core::app::CoreEvent;
-use chairphoto_model::publishing::{device_label, manual_port, progress_line, sent_line, snapchat_preflight, DEFAULT_PORT};
+use chairphoto_model::publishing::{device_label, manual_port, progress_line, sent_line, snapchat_preflight, stopped_line, DEFAULT_PORT};
 use gpui_kit::component::button::Button;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
@@ -223,6 +224,7 @@ impl SendToDevicePanel {
         self.progress = Some((0, self.subject.targets.len()));
         self.status = "Sending…".into();
         let (app, ids, version) = (self.host.app.clone(), self.subject.targets.clone(), self.versions.chosen);
+        let requested = ids.len();
         let pin = Some(self.pin.read(cx).value().trim().to_string()).filter(|p| !p.is_empty());
         let active = self.subject.active.map(|a| a.id);
         let (backend, mode, host) = (self.backend.clone(), self.mode.clone(), self.host.clone());
@@ -248,23 +250,37 @@ impl SendToDevicePanel {
                 }
                 Go::Superseded => return,
             }
-            let app = host.app.clone();
+            let (app, to) = (host.app.clone(), alias.clone());
             let run = cx.update(|cx| {
                 Runner::get(cx).run(move || {
-                    let outcome = (backend.send)(job, &device, pin.as_deref())?;
-                    if let SendMode::Snapchat { marker } = &mode {
-                        // Recorded for the photos that reached the device, each with the
-                        // version it was sent as (the chosen one applies to the active photo).
-                        let published: Vec<(i64, Option<i64>)> = outcome
-                            .sent
-                            .iter()
-                            .map(|&id| (id, if Some(id) == active { version } else { None }))
-                            .collect();
-                        if let Err(e) = record_publications(&app, catalog, &published, marker, None) {
-                            return Err(format!("Sent {}, but couldn't record it as published: {e}", outcome.sent.len()));
+                    let result = (backend.send)(job, &device, pin.as_deref());
+                    // A send that stopped part-way still put some photos on the device.
+                    let sent: &[i64] = match &result {
+                        Ok(outcome) => &outcome.sent,
+                        Err(stopped) => &stopped.sent,
+                    };
+                    let recorded = match &mode {
+                        SendMode::Snapchat { marker } if !sent.is_empty() => {
+                            // Recorded for the photos that reached the device, each with the
+                            // version it was sent as (the chosen one applies to the active photo).
+                            let published: Vec<(i64, Option<i64>)> =
+                                sent.iter().map(|&id| (id, if Some(id) == active { version } else { None })).collect();
+                            record_publications_as(&app, catalog, &published, marker, None)
+                        }
+                        _ => Ok(()),
+                    };
+                    let unrecorded = |e: String| format!("couldn't record {} as published: {e}", sent.len());
+                    match (&result, recorded) {
+                        (Ok(outcome), Ok(())) => Ok(outcome.clone()),
+                        (Ok(outcome), Err(e)) => Err(format!("Sent {}, but {}", outcome.sent.len(), unrecorded(e))),
+                        (Err(stopped), recorded) => {
+                            let line = stopped_line(stopped.sent.len(), requested, &to, &stopped.error);
+                            Err(match recorded {
+                                Ok(()) => line,
+                                Err(e) => format!("{line} — and {}", unrecorded(e)),
+                            })
                         }
                     }
-                    Ok(outcome)
                 })
             });
             let result = run.await.unwrap_or_else(|_| Err(STOPPED.into()));

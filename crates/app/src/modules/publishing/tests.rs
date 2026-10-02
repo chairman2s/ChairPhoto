@@ -9,7 +9,7 @@ use super::{Album, PublishRequest, PublishService};
 use crate::modules::{ModuleHost, ModuleMeta, ModuleSettings};
 use crate::storage::Runner;
 use crate::tests::{colliding_catalog, core_switch, deliver_switch, open_catalog_with_photos, start, App, TempDir};
-use chairphoto_core::app::{CatalogIdentity, CATALOG_CHANGED};
+use chairphoto_core::app::{AppState, CatalogIdentity, CATALOG_CHANGED};
 use gpui_kit::component::WindowExt as _;
 use gpui_kit::test::TestWindowExt as _;
 use gpui_kit::{AppContext as _, Entity, SharedString, TestAppContext};
@@ -23,10 +23,13 @@ struct Calls {
     verifier: Option<String>,
 }
 
-/// A service with tags and albums that answers from memory.
+/// A service with tags and albums that answers from memory. Like a real service's render
+/// (`render_upload_jpeg` bound to the request's catalog), it refuses a request whose catalog is
+/// no longer the open one, uploading nothing.
 struct Fake {
     calls: Arc<Mutex<Calls>>,
     answer: String,
+    state: AppState,
 }
 
 impl PublishService for Fake {
@@ -47,6 +50,9 @@ impl PublishService for Fake {
         Ok(settings.get("access_token")?.is_some())
     }
     fn publish(&self, _: &ModuleSettings, request: PublishRequest) -> Result<String, String> {
+        if chairphoto_core::app::catalog_identity(&self.state).ok() != Some(request.catalog) {
+            return Err(CATALOG_CHANGED.into());
+        }
         self.calls.lock().unwrap().published.push(request);
         Ok(self.answer.clone())
     }
@@ -97,11 +103,16 @@ fn setting(app: &App, key: &str) -> Option<String> {
 }
 
 fn open_panel(app: &App, host: &ModuleHost, service: Arc<dyn PublishService>, cx: &mut TestAppContext) -> Entity<PublishPanel> {
+    open_panel_as(app, host, service, "fakr", cx)
+}
+
+/// [`open_panel`] recording under `marker`.
+fn open_panel_as(app: &App, host: &ModuleHost, service: Arc<dyn PublishService>, marker: &'static str, cx: &mut TestAppContext) -> Entity<PublishPanel> {
     let view = cx
         .update_window(app.window(), |_, window, cx| {
             let (model, shell, settings) = (host.model().clone(), host.shell().clone(), host.settings());
             let state = app.state.clone();
-            let view = cx.new(|cx| PublishPanel::new(state, model, &shell, settings, "fakr".into(), service, window, cx));
+            let view = cx.new(|cx| PublishPanel::new(state, model, &shell, settings, marker.into(), service, window, cx));
             crate::modules::dialog::open("Publish", 560., true, view.clone(), window, cx);
             view
         })
@@ -144,7 +155,7 @@ fn publish_records_a_publication_with_its_url(cx: &mut TestAppContext) {
     select(&app, ids[0], cx);
     let host = host(&app, cx);
     let calls = Arc::new(Mutex::new(Calls::default()));
-    let service = Arc::new(Fake { calls: calls.clone(), answer: "https://fakr.example/p/42".into() });
+    let service = Arc::new(Fake { calls: calls.clone(), answer: "https://fakr.example/p/42".into(), state: app.state.clone() });
     let view = open_panel(&app, &host, service.clone(), cx);
     view.read_with(cx, |p, cx| {
         assert_eq!(p.versions.versions.len(), 1, "the active photo's versions");
@@ -207,11 +218,40 @@ fn a_non_url_answer_records_no_url(cx: &mut TestAppContext) {
     select(&app, ids[0], cx);
     let host = host(&app, cx);
     let calls = Arc::new(Mutex::new(Calls::default()));
-    let view = open_panel(&app, &host, Arc::new(Fake { calls, answer: "/api/v2/image/abc".into() }), cx);
+    let view = open_panel(&app, &host, Arc::new(Fake { calls, answer: "/api/v2/image/abc".into(), state: app.state.clone() }), cx);
     view.update(cx, |p, cx| p.publish(cx));
     work(cx);
     let pubs = app.state.catalog.lock().unwrap().as_ref().unwrap().list_publications(ids[0]).unwrap();
     assert_eq!(pubs[0].url, None);
+}
+
+/// The upload succeeds but the record step fails (here: a marker the catalog rejects): the
+/// panel and the status line say it was published and why it wasn't recorded, and warn
+/// against publishing again — not a bare error that reads as "try again".
+#[gpui_kit::test]
+fn an_upload_whose_record_fails_says_it_was_published(cx: &mut TestAppContext) {
+    let dir = TempDir::new("publish-unrecorded");
+    let app = start(cx);
+    let ids = open_catalog_with_photos(&app, &dir, 1, cx);
+    work(cx);
+    select(&app, ids[0], cx);
+    let host = host(&app, cx);
+    let calls = Arc::new(Mutex::new(Calls::default()));
+    let service = Arc::new(Fake { calls: calls.clone(), answer: "https://x".into(), state: app.state.clone() });
+    let view = open_panel_as(&app, &host, service, " ", cx);
+    view.update(cx, |p, cx| p.publish(cx));
+    work(cx);
+    assert_eq!(calls.lock().unwrap().published.len(), 1, "the upload went through");
+    let pubs = app.state.catalog.lock().unwrap().as_ref().unwrap().list_publications(ids[0]).unwrap();
+    assert!(pubs.is_empty(), "the record failed");
+    view.read_with(cx, |p, _| {
+        assert!(!p.busy);
+        assert!(p.status.contains("publication platform is empty"), "the record's error: {}", p.status);
+        assert!(p.status.starts_with("Published 1 to Fakr, but couldn't record"), "{}", p.status);
+        assert!(p.status.ends_with("don't publish it again."), "{}", p.status);
+    });
+    let line = crate::tests::status(&app, cx);
+    assert!(line.starts_with("Published 1 to Fakr, but couldn't record"), "{line}");
 }
 
 /// A switch to a catalog whose ids collide: Publish is refused before anything is recorded in
@@ -225,13 +265,14 @@ fn a_catalog_switch_refuses_the_record_and_closes_the_dialog(cx: &mut TestAppCon
     select(&app, ids[0], cx);
     let host = host(&app, cx);
     let calls = Arc::new(Mutex::new(Calls::default()));
-    let view = open_panel(&app, &host, Arc::new(Fake { calls, answer: "https://x".into() }), cx);
+    let view = open_panel(&app, &host, Arc::new(Fake { calls: calls.clone(), answer: "https://x".into(), state: app.state.clone() }), cx);
     let (b, b_ids) = colliding_catalog(&dir, "b", 1);
     assert_eq!(b_ids, ids);
     core_switch(&app, b);
     view.update(cx, |p, cx| p.publish(cx));
     work(cx);
     view.read_with(cx, |p, _| assert_eq!(p.status, CATALOG_CHANGED));
+    assert!(calls.lock().unwrap().published.is_empty(), "nothing uploaded");
     let pubs = app.state.catalog.lock().unwrap().as_ref().unwrap().list_publications(ids[0]).unwrap();
     assert!(pubs.is_empty(), "nothing recorded in B");
     deliver_switch(&app, cx);
@@ -248,7 +289,7 @@ fn without_a_photo_the_panel_says_so(cx: &mut TestAppContext) {
     work(cx);
     let host = host(&app, cx);
     let calls = Arc::new(Mutex::new(Calls::default()));
-    open_panel(&app, &host, Arc::new(Fake { calls, answer: String::new() }), cx);
+    open_panel(&app, &host, Arc::new(Fake { calls, answer: String::new(), state: app.state.clone() }), cx);
     assert!(present(&app, "publish-panel-empty", cx));
 }
 
@@ -262,7 +303,7 @@ fn oauth_settings_save_connect_and_finish(cx: &mut TestAppContext) {
     work(cx);
     let host = host(&app, cx);
     let calls = Arc::new(Mutex::new(Calls::default()));
-    let service: Arc<dyn PublishService> = Arc::new(Fake { calls: calls.clone(), answer: String::new() });
+    let service: Arc<dyn PublishService> = Arc::new(Fake { calls: calls.clone(), answer: String::new(), state: app.state.clone() });
     let view = cx
         .update_window(app.window(), |_, window, cx| {
             let settings = host.settings();

@@ -93,6 +93,16 @@ pub fn sent_line(sent: usize, failed: usize, alias: &str) -> String {
     format!("Sent {sent} to {alias}{skipped}.")
 }
 
+/// A send that stopped: "Sent 3 of 5 to Phone, then stopped: why" — or just `why` when nothing
+/// had arrived.
+pub fn stopped_line(sent: usize, requested: usize, alias: &str, why: &str) -> String {
+    if sent == 0 {
+        why.to_string()
+    } else {
+        format!("Sent {sent} of {requested} to {alias}, then stopped: {why}")
+    }
+}
+
 /// "Sending d/t…".
 pub fn progress_line(done: usize, total: usize) -> String {
     format!("Sending {done}/{total}…")

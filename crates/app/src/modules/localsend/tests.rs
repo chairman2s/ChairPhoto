@@ -10,7 +10,7 @@ use crate::modules::publishing::ActivePhoto;
 use crate::modules::{Module, ModuleRegistry};
 use crate::storage::Runner;
 use crate::tests::{colliding_catalog, core_switch, deliver_switch, start, App, TempDir};
-use chairphoto_core::app::localsend::{Device, SendOutcome, SEND_CANCELLED};
+use chairphoto_core::app::localsend::{Device, SendOutcome, SendStopped, SEND_CANCELLED};
 use chairphoto_core::app::{CoreEvent, EventSink as _, LocalSendProgress, CATALOG_CHANGED};
 use chairphoto_core::catalog::Catalog;
 use chairphoto_model::publishing::SNAPCHAT_WARNING;
@@ -69,6 +69,10 @@ struct Net {
     discoveries: usize,
     /// (device, pin, photo ids) per send that ran.
     sends: Vec<(Device, Option<String>, Vec<i64>)>,
+    /// Per send that ran: what the claimed job resolved each photo to (id, version name).
+    sent_as: Vec<Vec<(i64, Option<String>)>>,
+    /// Stop each send after this many photos, with this error (a rejection, a Cancel).
+    stop_after: Option<(usize, String)>,
 }
 
 fn device(alias: &str, fp: &str, ip: &str) -> Device {
@@ -94,10 +98,15 @@ fn fake(found: Vec<Device>, net: Arc<Mutex<Net>>) -> LocalSendBackend {
         }),
         send: Arc::new(move |job, device, pin| {
             if job.abort_handle().load(Ordering::Relaxed) {
-                return Err(SEND_CANCELLED.into());
+                return Err(String::from(SEND_CANCELLED).into());
             }
             let ids = job.photo_ids();
-            net.lock().unwrap().sends.push((device.clone(), pin.map(str::to_string), ids.clone()));
+            let mut net = net.lock().unwrap();
+            net.sends.push((device.clone(), pin.map(str::to_string), ids.clone()));
+            net.sent_as.push(job.sent_as());
+            if let Some((n, error)) = net.stop_after.clone() {
+                return Err(SendStopped { sent: ids[..n].to_vec(), error });
+            }
             Ok(SendOutcome { sent: ids, failed: 0 })
         }),
     }
@@ -152,6 +161,13 @@ fn present(app: &App, id: &'static str, cx: &mut TestAppContext) -> bool {
 
 fn has_dialog(app: &App, cx: &mut TestAppContext) -> bool {
     cx.update_window(app.window(), |_, window, cx| window.has_active_dialog(cx)).unwrap()
+}
+
+/// The version names recorded for `id` under `platform` (`None` = the Original).
+fn recorded_version_names(app: &App, id: i64, platform: &str) -> Vec<Option<String>> {
+    let guard = app.state.catalog.lock().unwrap();
+    let pubs = guard.as_ref().unwrap().list_publications(id).unwrap();
+    pubs.into_iter().filter(|p| p.platform == platform).map(|p| p.version_name).collect()
 }
 
 fn publications(app: &App, id: i64) -> Vec<(String, Option<i64>)> {
@@ -357,8 +373,57 @@ fn snapchat_warns_and_records_what_was_sent(cx: &mut TestAppContext) {
     click(&app, "send-send", cx);
     work(cx);
     assert_eq!(net.lock().unwrap().sends[0].2, [ids[0]]);
+    // What the job resolved and sent is what was recorded: the chosen version, by id and name.
+    let sent_as = net.lock().unwrap().sent_as[0].clone();
+    for (id, name) in &sent_as {
+        assert_eq!(recorded_version_names(&app, *id, "snapchat"), [name.clone()], "recorded as the version that was sent");
+    }
+    assert_eq!(sent_as, [(ids[0], Some("Story crop".to_string()))], "the claimed job rendered the chosen version");
     assert_eq!(publications(&app, ids[0]), [("snapchat".to_string(), Some(version))]);
     assert!(publications(&app, ids[1]).is_empty(), "not selected, not sent, not recorded");
+}
+
+/// A Snapchat send that stops part-way — the receiver rejects the 4th of 5, or Cancel lands
+/// after 3 — records a publication for exactly the three delivered photos (the active one with
+/// the version it was sent as), and the status says how many went and why it stopped.
+fn stops_part_way(case: &str, why: &str, cx: &mut TestAppContext) {
+    {
+        let dir = TempDir::new(&format!("localsend-partial-{case}"));
+        let app = start(cx);
+        let ids = catalog_with_files(&app, &dir, 5, cx);
+        let version = app.state.catalog.lock().unwrap().as_ref().unwrap().create_version(ids[0], "Story").unwrap();
+        let net = Arc::new(Mutex::new(Net { stop_after: Some((3, why.to_string())), ..Net::default() }));
+        let view = open(&app, fake(vec![device("Phone", "fp", "192.168.1.9")], net.clone()), SendMode::Snapchat { marker: "snapchat".into() }, cx);
+        work(cx);
+        view.update(cx, |p, _| {
+            p.subject.active = Some(ActivePhoto { id: ids[0], width: Some(1080), height: Some(1920) });
+            p.versions.chosen = Some(version);
+        });
+        click(&app, "send-send", cx);
+        work(cx);
+        assert_eq!(net.lock().unwrap().sends[0].2, ids, "{case}: all five were asked for");
+        assert_eq!(publications(&app, ids[0]), [("snapchat".to_string(), Some(version))], "{case}");
+        for &id in &ids[1..3] {
+            assert_eq!(publications(&app, id), [("snapchat".to_string(), None)], "{case}: delivered, recorded");
+        }
+        for &id in &ids[3..] {
+            assert!(publications(&app, id).is_empty(), "{case}: never reached the device, not recorded");
+        }
+        view.read_with(cx, |p, _| {
+            assert!(!p.busy);
+            assert_eq!(p.status, format!("Sent 3 of 5 to Phone, then stopped: {why}"), "{case}");
+        });
+    }
+}
+
+#[gpui_kit::test]
+fn a_rejection_of_the_4th_of_5_records_the_3_delivered(cx: &mut TestAppContext) {
+    stops_part_way("reject", "LocalSend: upload of p3.jpg rejected (500): disk full", cx);
+}
+
+#[gpui_kit::test]
+fn a_cancel_after_3_records_the_3_delivered(cx: &mut TestAppContext) {
+    stops_part_way("cancel", SEND_CANCELLED, cx);
 }
 
 /// A switch to a catalog whose ids collide: with `catalog:switched` not yet delivered, Send is

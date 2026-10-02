@@ -188,25 +188,6 @@ pub fn render_upload_jpeg(
     Ok(RenderedUpload { _dir: dir, path: out })
 }
 
-/// Record that each `(photo id, version id)` of `published` went to `marker` (the module's
-/// publication marker), with `url` when the service returned one — all in one catalog lock
-/// hold, and only while `catalog` (the one the ids were read from) is still open: otherwise
-/// nothing is written and it answers [`CATALOG_CHANGED`]. Blocking.
-pub fn record_publications_as(
-    state: &AppState,
-    catalog: CatalogIdentity,
-    published: &[(i64, Option<i64>)],
-    marker: &str,
-    url: Option<&str>,
-) -> Result<(), String> {
-    crate::app::with_catalog_as(state, catalog, |c| {
-        for &(photo, version) in published {
-            c.record_publication(photo, version, marker, url)?;
-        }
-        Ok(())
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -326,30 +307,6 @@ mod tests {
         let id = c.upsert_photo(&p, None, 0, 6).unwrap().id;
         *state.catalog.lock().unwrap() = Some(c);
         (state, id)
-    }
-
-    /// Publications are recorded under the module's marker, for exactly the given
-    /// (photo, version) pairs — and not at all once another catalog is open.
-    #[test]
-    fn publications_are_recorded_only_into_the_catalog_the_ids_came_from() {
-        let dir = crate::test_support::TestTmpDir::new("publishing-record");
-        let (state, id) = catalog_with_photo(&dir);
-        let read = crate::app::catalog_identity(&state).unwrap();
-        record_publications_as(&state, read, &[(id, None)], "snapchat", None).unwrap();
-        let pubs = crate::app::with_catalog(&state, |c| c.list_publications(id)).unwrap();
-        assert_eq!(pubs.len(), 1);
-        assert_eq!(pubs[0].platform, "snapchat");
-
-        // Another catalog with a colliding photo id.
-        let other = crate::test_support::TestTmpDir::new("publishing-record-b");
-        let (b, id_b) = catalog_with_photo(&other);
-        assert_eq!(id_b, id, "the ids collide");
-        let catalog_b = b.catalog.lock().unwrap().take();
-        *state.catalog.lock().unwrap() = catalog_b;
-        let err = record_publications_as(&state, read, &[(id, None)], "snapchat", None).unwrap_err();
-        assert_eq!(err, CATALOG_CHANGED);
-        let pubs = crate::app::with_catalog(&state, |c| c.list_publications(id)).unwrap();
-        assert!(pubs.is_empty(), "nothing lands in the catalog that opened since: {pubs:?}");
     }
 
     /// A render bound to a catalog that is no longer open refuses before rendering anything.

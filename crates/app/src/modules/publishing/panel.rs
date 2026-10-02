@@ -3,17 +3,19 @@
 //! keywords until edited), the album when it has them (the cached list at once, Refresh,
 //! "+ New", the last one remembered), Publish. A successful publish records the publication
 //! under the module's marker, with the service's URL when it returned a web address, and says
-//! so on the status line.
+//! so on the status line. An upload whose record step fails still says it was published (and
+//! not to publish it again), then why it wasn't recorded.
 //!
 //! Every service call runs on a worker ([`crate::storage::Runner`]); the panel's photo id is
 //! bound to the catalog it was read from ([`PublishSubject::catalog`]).
 
-use super::{record_publications, Album, PublishRequest, PublishService, PublishSubject, VersionPicker, NO_ROWS};
+use super::{Album, PublishRequest, PublishService, PublishSubject, VersionPicker, NO_ROWS};
 use crate::model::AppModel;
 use crate::modules::{dialog, ModuleSettings};
 use crate::shell::style::Colors;
 use crate::shell::ShellState;
 use crate::storage::{ui, Runner};
+use chairphoto_core::app::publications::record_publications_as;
 use chairphoto_core::app::AppState;
 use chairphoto_model::publishing::{default_album, publication_url};
 use gpui_kit::component::button::Button;
@@ -285,20 +287,29 @@ impl PublishPanel {
         };
         let (service, settings, app, marker) = (self.service.clone(), self.settings.clone(), self.app.clone(), self.marker.clone());
         let version = request.version_id;
-        let rx = Runner::get(cx).run(move || {
+        // Outer `Err`: the upload failed. Inner `Err`: the upload succeeded and only the
+        // record step failed — the photo is on the service, so that must not read as a failed
+        // publish (a retry would upload it twice).
+        let rx = Runner::get(cx).run(move || -> Result<Result<(), String>, String> {
             let answer = service.publish(&settings, request)?;
-            record_publications(&app, catalog, &[(photo, version)], &marker, publication_url(&answer))
+            Ok(record_publications_as(&app, catalog, &[(photo, version)], &marker, publication_url(&answer)))
         });
         let (model, name) = (self.model.clone(), self.service.name());
         cx.spawn(async move |this, cx| {
             let result = rx.await.unwrap_or_else(|_| Err("The publish stopped unexpectedly".into()));
-            if result.is_ok() {
-                cx.update(|cx| model.update(cx, |m, cx| m.set_status(format!("Published to {name}."), cx)));
+            let line = match &result {
+                Ok(Ok(())) => Some(format!("Published to {name}.")),
+                Ok(Err(e)) => Some(unrecorded_line(&name, e)),
+                Err(_) => None,
+            };
+            if let Some(line) = line {
+                cx.update(|cx| model.update(cx, |m, cx| m.set_status(line, cx)));
             }
             this.update(cx, |p, cx| {
                 p.busy = false;
                 p.status = match result {
-                    Ok(()) => format!("Published to {name} ✓"),
+                    Ok(Ok(())) => format!("Published to {name} ✓"),
+                    Ok(Err(e)) => unrecorded_line(&name, &e),
                     Err(e) => e,
                 };
                 cx.notify();
@@ -308,6 +319,12 @@ impl PublishPanel {
         .detach();
         cx.notify();
     }
+}
+
+/// An upload that succeeded but whose publication could not be recorded: says it is published
+/// (so it is not uploaded again) and what went wrong with the record.
+fn unrecorded_line(service: &str, error: &str) -> String {
+    format!("Published 1 to {service}, but couldn't record it as published: {error}. It is on {service} — don't publish it again.")
 }
 
 fn cache_albums(settings: &ModuleSettings, albums: &[Album]) {

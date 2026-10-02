@@ -660,13 +660,14 @@ fn a_switch_drops_the_old_match_and_adopts_the_new_catalogs(cx: &mut TestAppCont
 // --- the inspector --------------------------------------------------------------------------
 
 /// The inspector lists the active photo's faces; ✓ confirms (tagging the photo), the picker
-/// assigns an existing person by Enter and creates a new one under the people root.
+/// assigns an existing person by Enter and creates a new one under the people root — with no
+/// `faces.people_root` set, the matcher's and People view's default, `People`.
 #[gpui_kit::test]
 fn the_inspector_confirms_and_names_faces(cx: &mut TestAppContext) {
     let f = open_faces(2, true, "faces-inspector", cx);
     let photo = f.ids[0];
     let alice = with_cat(&f.app, |c| c.create_tag("People/Alice").unwrap());
-    with_cat(&f.app, |c| c.set_setting("faces.people_root", "People").unwrap());
+    with_cat(&f.app, |c| assert_eq!(c.get_setting("faces.people_root").unwrap(), None, "no people root set"));
     let a = add_face(&f.app, photo, "[0.1,0.1,0.2,0.2]");
     suggest(&f.app, a, alice);
     let b = add_face(&f.app, photo, "[0.5,0.5,0.2,0.2]");

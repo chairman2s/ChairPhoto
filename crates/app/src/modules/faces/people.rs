@@ -561,15 +561,9 @@ impl People {
 fn read_all(
     c: &Catalog,
 ) -> chairphoto_core::catalog::Result<(Vec<PersonSummary>, Vec<ClusterSummary>, Vec<SuggestionEntry>, String, Vec<Tag>)> {
-    let root = core_faces::effective_people_root(c)?;
-    let prefix = format!("{root}/");
-    let people_tags = c
-        .list_tags_with_counts()?
-        .into_iter()
-        .map(|t| t.tag)
-        .filter(|t| t.full_path == root || t.full_path.starts_with(&prefix))
-        .collect();
-    Ok((core_faces::people_summary(c)?, core_faces::cluster_summary(c)?, core_faces::suggestion_list(c)?, root, people_tags))
+    // The same root and tags as the inspector's person picker.
+    let core_faces::PeopleTags { root, tags } = core_faces::people_tags(c)?;
+    Ok((core_faces::people_summary(c)?, core_faces::cluster_summary(c)?, core_faces::suggestion_list(c)?, root, tags))
 }
 
 /// The status line a naming leaves.

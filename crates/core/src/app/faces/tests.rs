@@ -232,27 +232,51 @@ fn drawn_boxes_are_clamped_and_only_they_can_be_deleted() {
     assert_eq!(faces_for_photo(&c, p).unwrap().iter().map(|r| r.id).collect::<Vec<_>>(), vec![detected]);
 }
 
-/// The picker's tags: the people root and its descendants when one is set, else every tag
-/// that is not an auto-tag.
+/// The picker's tags: the people root and its descendants. With no root set (or a blank one)
+/// the root is the matcher's and the People view's default, `People` — so a person created
+/// in the picker goes to `People/<name>` and the matcher counts them.
 #[test]
 fn people_tags_follow_the_people_root() {
-    let (c, _root) = temp_catalog("people");
+    let (c, root) = temp_catalog("people");
     c.create_tag("People/Alice").unwrap();
     c.create_tag("People/Family/Bob").unwrap();
     c.create_tag("Peoples Republic").unwrap();
     c.create_tag("Places/Oslo").unwrap();
+    c.create_tag("Family/Ann").unwrap();
+    let paths = |p: &PeopleTags| {
+        let mut v: Vec<String> = p.tags.iter().map(|t| t.full_path.clone()).collect();
+        v.sort();
+        v
+    };
+    let under_people = vec!["People", "People/Alice", "People/Family", "People/Family/Bob"];
 
-    let all = people_tags(&c).unwrap();
-    assert_eq!(all.root, "");
-    assert!(all.tags.iter().any(|t| t.full_path == "Places/Oslo"), "no root: every non-auto tag");
+    for unset in [None, Some("  ")] {
+        if let Some(blank) = unset {
+            c.set_setting(matcher::PEOPLE_ROOT_SETTING, blank).unwrap();
+        }
+        let picker = people_tags(&c).unwrap();
+        assert_eq!(picker.root, matcher::PEOPLE_ROOT_DEFAULT, "{unset:?}: the matcher's default root");
+        assert_eq!(picker.root, effective_people_root(&c).unwrap(), "{unset:?}: the People view's root");
+        assert_eq!(paths(&picker), under_people, "{unset:?}");
+    }
 
-    c.set_setting(matcher::PEOPLE_ROOT_SETTING, " People ").unwrap();
-    let people = people_tags(&c).unwrap();
-    assert_eq!(people.root, "People");
-    let mut paths: Vec<&str> = people.tags.iter().map(|t| t.full_path.as_str()).collect();
-    paths.sort();
-    assert_eq!(paths, vec!["People", "People/Alice", "People/Family", "People/Family/Bob"]);
-    assert_eq!(person_path(&people.root, "Eve"), "People/Eve");
+    // A person created in the picker with no root set lands under People, where the matcher
+    // looks: it seeds from that photo-level tag.
+    c.conn().execute("DELETE FROM settings WHERE key = ?1", [matcher::PEOPLE_ROOT_SETTING]).unwrap();
+    let p = add_photo(&c, &root, "eve.NEF");
+    let f = add_embedded_face(&c, p, 0);
+    let picker = people_tags(&c).unwrap();
+    let eve = assign_new_person(&c, f, &person_path(&picker.root, "Eve")).unwrap();
+    assert_eq!(c.find_tag_id_by_path("People/Eve").unwrap(), Some(eve));
+    let seen = matcher::run_matching(c.conn(), &matcher::MatchSettings::load(c.conn()).unwrap(), 0).unwrap();
+    assert_eq!(seen.people, 1, "the matcher has a centroid for Eve: {seen:?}");
+
+    c.set_setting(matcher::PEOPLE_ROOT_SETTING, " Family ").unwrap();
+    let family = people_tags(&c).unwrap();
+    assert_eq!(family.root, "Family");
+    assert_eq!(matcher::MatchSettings::load(c.conn()).unwrap().people_root, "Family", "the matcher trims it too");
+    assert_eq!(paths(&family), vec!["Family", "Family/Ann"]);
+    assert_eq!(person_path(&family.root, "Eve"), "Family/Eve");
     assert_eq!(person_path("", "Eve"), "Eve");
 }
 

@@ -100,8 +100,11 @@ impl MatchSettings {
     /// Load the settings from the `settings` key-value table, falling back to defaults for
     /// any missing/blank/unparseable key.
     pub fn load(conn: &Connection) -> rusqlite::Result<Self> {
+        // Trimmed, as the person picker and the People view use it: a root saved as " People "
+        // must not make the matcher look under " People /".
         let people_root = get_setting(conn, PEOPLE_ROOT_SETTING)?
-            .filter(|s| !s.trim().is_empty())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
             .unwrap_or_else(|| PEOPLE_ROOT_DEFAULT.to_string());
         let threshold = get_setting(conn, THRESHOLD_SETTING)?
             .and_then(|s| s.trim().parse::<f32>().ok())

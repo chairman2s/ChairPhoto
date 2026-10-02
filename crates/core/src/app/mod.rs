@@ -30,6 +30,8 @@ pub mod exports;
 #[cfg(feature = "faces")]
 pub mod faces;
 pub mod identity;
+#[cfg(feature = "instagram")]
+pub mod instagram;
 pub mod iptc;
 pub mod jobs;
 #[cfg(any(feature = "flickr", feature = "smugmug"))]

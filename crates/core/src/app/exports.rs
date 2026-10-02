@@ -260,18 +260,6 @@ pub(crate) fn collect_parity<R>(f: impl FnOnce() -> R) -> (R, JobParity) {
     (f(), ())
 }
 
-/// Add the engine-2 exports checked outside any export job's own tally (the process-wide
-/// `parity::take`) to the open catalog's total. Called after the commands that write an
-/// export without collecting their own — Instagram today; the publish uploads
-/// (`app::uploads`) and the LocalSend send (`app::localsend`) collect their own.
-/// Best-effort — a failed write loses a count, never an export.
-pub fn record_export_parity(state: &AppState) {
-    #[cfg(feature = "edit")]
-    record_parity_tally(state, None, crate::plugins::edit::parity::take());
-    #[cfg(not(feature = "edit"))]
-    record_parity_tally(state, None, ());
-}
-
 /// Add `tally` — one export job's own — to the total of `from`, the catalog the export read:
 /// once another catalog is open the tally is dropped (it counts the old catalog's exports),
 /// never added to the new catalog's total. `None`: whichever catalog is open.

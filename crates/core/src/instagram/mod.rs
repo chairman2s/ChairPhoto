@@ -24,7 +24,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// What happened to the post attempt — surfaced to the UI.
-#[derive(Debug, Clone, Copy, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum PostOutcome {
     /// Composed and shared; confirmation seen.

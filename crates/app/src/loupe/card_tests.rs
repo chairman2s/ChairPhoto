@@ -183,6 +183,27 @@ fn a_cards_wall_is_bound_to_its_catalog_and_a_switch_takes_it_down(cx: &mut Test
     assert!(present_in(h, "loupe", cx));
 }
 
+/// A card photo shown full-size takes key focus; once its owner takes the card down, the
+/// pop-out's loupe has the keys again — the arrows step the selection there.
+#[gpui_kit::test]
+fn the_loupe_has_the_keys_again_after_a_card_comes_down(cx: &mut TestAppContext) {
+    let (app, _pool, _dir, ids) = app_with(4, "pop-card-focus", cx);
+    let tag = tag_all(&app, &ids);
+    cx.update(|cx| ModuleRegistry::enable(&app.wired.modules, DEV_MODULE_ID, cx));
+    app.wired.shell.update(cx, |s, cx| s.select_with(cx, |l| l.select_single(ids[0])));
+    cx.run_until_parked();
+    let h = open(cx);
+    show(&app, DEV_MODULE_ID, Some(card("Bird", tag)), cx);
+    click_in(h, format!("loupe-card-tile-{}", ids[2]), cx);
+    assert!(present_in(h, "loupe-card-back", cx), "the card's photo is up and has focus");
+
+    show(&app, DEV_MODULE_ID, None, cx);
+    assert!(present_in(h, "loupe", cx), "the loupe again");
+    press_in(h, "right", cx);
+    let active = app.wired.shell.read_with(cx, |s, _| s.library.selection().active_id);
+    assert_eq!(active, Some(ids[1]), "the arrow reached the loupe");
+}
+
 /// Closing the pop-out on a full-size card photo gives its tiers back.
 #[gpui_kit::test]
 fn closing_the_pop_out_releases_the_cards_photo(cx: &mut TestAppContext) {

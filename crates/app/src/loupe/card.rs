@@ -154,6 +154,11 @@ impl CardView {
         (self.wall.photos.iter().map(|p| p.id).collect(), self.wall.total)
     }
 
+    /// The handle a full-size card photo takes key focus with.
+    pub fn focus_handle(&self) -> &FocusHandle {
+        &self.focus
+    }
+
     pub fn viewing(&self) -> Option<i64> {
         self.viewing
     }

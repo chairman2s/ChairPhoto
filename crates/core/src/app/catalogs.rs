@@ -889,9 +889,18 @@ mod switch_tests {
         let dir = crate::test_support::TestTmpDir::new("vacuum");
         let state = AppState::default();
         assert_eq!(vacuum_catalog(&state).unwrap_err(), "No catalog is open");
-        *state.catalog.lock().unwrap() = Some(Catalog::open(&dir.join("v.chairphoto"), &dir.join("v")).unwrap());
+        let catalog = Catalog::open(&dir.join("v.chairphoto"), &dir.join("v")).unwrap();
+        // Leave space to reclaim. On a catalog with none, VACUUM may come out a page larger
+        // than it went in — how sqlite_master packs is not a size SQLite promises — so only
+        // freed pages make "after is smaller" something this test can hold it to.
+        let filler = "x".repeat(1000);
+        for i in 0..200 {
+            catalog.set_setting(&format!("filler{i}"), &filler).unwrap();
+        }
+        catalog.conn().execute("DELETE FROM settings WHERE key GLOB 'filler*'", []).unwrap();
+        *state.catalog.lock().unwrap() = Some(catalog);
         let r = vacuum_catalog(&state).unwrap();
         assert!(r.before_bytes > 0 && r.after_bytes > 0, "{r:?}");
-        assert!(r.after_bytes <= r.before_bytes, "{r:?}");
+        assert!(r.after_bytes < r.before_bytes, "{r:?}");
     }
 }

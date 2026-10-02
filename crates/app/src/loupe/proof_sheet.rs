@@ -2,6 +2,11 @@
 //! `spreads::proof_spread` candidates, from the Darkroom's own source. Click a proof to adopt
 //! its record ([`ProofEvent::Adopt`]); Esc, ✕ or the backdrop declines.
 //!
+//! Keys, as React's proof cells were buttons: Tab / Shift+Tab move focus through the proofs
+//! (wrapping), and Enter or Space adopts the focused one. The backdrop is focused while no
+//! proof is, but only a pointer click on it declines: Enter there does nothing (it used to be
+//! the backdrop's keyboard click, so Enter declined the sheet).
+//!
 //! The Darkroom (#111/#112) deals it, focuses it (its [`contexts::PROOF_SHEET`] Escape outranks
 //! the Darkroom's own while it has focus, as React's capture-phase listener did) and gives
 //! focus back on [`ProofEvent::Close`] or after an adopt.
@@ -10,12 +15,15 @@ use crate::image_store::ImageStore;
 use crate::keymap::contexts;
 use crate::loupe::duel::{variant_image, VariantSource};
 use crate::loupe::edit_renders::EditRenders;
-use crate::loupe::ProofClose;
+use crate::loupe::{ProofClose, ProofNext, ProofPrevious};
 use crate::shell::style::Colors;
 use chairphoto_core::image_pool::EditJob;
 use chairphoto_model::darkroom::spreads::{ProofCandidate, ProofGroup};
 use gpui_kit::prelude::*;
-use gpui_kit::{div, px, Context, Entity, EventEmitter, FocusHandle, SharedString, Subscription, TestSupportExt as _, Window};
+use gpui_kit::{
+    div, px, ClickEvent, Context, Entity, EventEmitter, FocusHandle, SharedString, Subscription, TestSupportExt as _,
+    Window,
+};
 
 /// A proof's long edge (React rendered 320 px cells).
 pub const PROOF_EDGE: u32 = 320;
@@ -34,6 +42,8 @@ pub struct ProofSheet {
     candidates: Vec<ProofCandidate>,
     renders: Entity<EditRenders>,
     focus: FocusHandle,
+    /// One per proof: Tab moves among them, Enter / Space adopts the focused one.
+    cell_focus: Vec<FocusHandle>,
     closed: bool,
     _observers: [Subscription; 1],
 }
@@ -52,7 +62,8 @@ impl ProofSheet {
         let jobs: Vec<EditJob> = candidates.iter().map(|c| source.job(&c.record, PROOF_EDGE)).collect();
         renders.update(cx, |r, cx| r.want(&jobs, cx));
         let _observers = [cx.observe(&renders, |_, _, cx| cx.notify())];
-        ProofSheet { source, candidates, renders, focus: cx.focus_handle(), closed: false, _observers }
+        let cell_focus = candidates.iter().map(|_| cx.focus_handle()).collect();
+        ProofSheet { source, candidates, renders, focus: cx.focus_handle(), cell_focus, closed: false, _observers }
     }
 
     pub fn focus_handle(&self) -> &FocusHandle {
@@ -65,6 +76,28 @@ impl ProofSheet {
 
     pub fn renders(&self) -> &Entity<EditRenders> {
         &self.renders
+    }
+
+    /// The proof that has focus, if any.
+    pub fn focused(&self, window: &Window) -> Option<usize> {
+        self.cell_focus.iter().position(|f| f.is_focused(window))
+    }
+
+    /// Tab / Shift+Tab: focus the next (previous) proof, wrapping; from the backdrop, the
+    /// first (last).
+    fn cycle(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let n = self.cell_focus.len();
+        if n == 0 {
+            return;
+        }
+        let next = match (self.focused(window), forward) {
+            (Some(i), true) => (i + 1) % n,
+            (Some(i), false) => (i + n - 1) % n,
+            (None, true) => 0,
+            (None, false) => n - 1,
+        };
+        window.focus(&self.cell_focus[next], cx);
+        cx.notify();
     }
 
     pub fn adopt(&mut self, i: usize, cx: &mut Context<Self>) {
@@ -100,7 +133,7 @@ fn group_name(g: ProofGroup) -> Option<&'static str> {
 }
 
 impl Render for ProofSheet {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = Colors::get(cx);
         let renders = self.renders.read(cx);
         let cells: Vec<_> = self
@@ -110,14 +143,22 @@ impl Render for ProofSheet {
             .map(|(i, c)| {
                 let state = renders.get(&self.source.job(&c.record, PROOF_EDGE));
                 let current = c.group == ProofGroup::AsShot;
+                let focused = self.cell_focus[i].is_focused(window);
                 div()
                     .id(("proof-cell", i as u64))
+                    .track_focus(&self.cell_focus[i])
                     .flex()
                     .flex_col()
                     .w(px(PROOF_EDGE as f32 * 0.75))
                     .rounded(px(6.))
                     .border_2()
-                    .border_color(if current { colors.accent } else { colors.border })
+                    .border_color(if focused {
+                        colors.txt
+                    } else if current {
+                        colors.accent
+                    } else {
+                        colors.border
+                    })
                     .overflow_hidden()
                     .cursor_pointer()
                     .on_click(cx.listener(move |this, _, _, cx| this.adopt(i, cx)))
@@ -149,7 +190,15 @@ impl Render for ProofSheet {
             .justify_center()
             .bg(colors.scrim)
             .on_action(cx.listener(|this, _: &ProofClose, _, cx| this.close(cx)))
-            .on_click(cx.listener(|this, _, _, cx| this.close(cx)))
+            .on_action(cx.listener(|this, _: &ProofNext, window, cx| this.cycle(true, window, cx)))
+            .on_action(cx.listener(|this, _: &ProofPrevious, window, cx| this.cycle(false, window, cx)))
+            // A pointer click declines. Enter / Space on the focused backdrop is a keyboard
+            // click here: not a decline (only a focused proof takes Enter, and adopts).
+            .on_click(cx.listener(|this, e: &ClickEvent, _, cx| {
+                if !e.is_keyboard() {
+                    this.close(cx)
+                }
+            }))
             .child(
                 div()
                     .id("proof-sheet")

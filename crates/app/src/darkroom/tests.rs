@@ -1274,13 +1274,11 @@ fn the_darkroom_keys_stand_down_under_the_proof_sheet_and_the_duel(cx: &mut Test
         assert_eq!(rig.open_photo(cx), photo, "{key} under the proof sheet does not step the filmstrip");
         assert!(stage_view(cx).is_fit(), "{key} under the proof sheet does not zoom");
         assert_eq!(rig.labels(v).1, head, "{key} under the proof sheet does not move the history");
-        if key != "enter" {
-            assert_eq!(overlay(cx), "proof", "{key}: the sheet stays up");
-        }
+        // Enter with no proof focused is a no-op of the sheet's own (`loupe::proof_sheet`).
+        assert_eq!(overlay(cx), "proof", "{key}: the sheet stays up");
     }
-    // Enter is the focused backdrop's keyboard click: the sheet declines and closes (its own
-    // behaviour, `loupe::proof_sheet`) — but the Darkroom did not also take it as "zoom".
-    assert_eq!(overlay(cx), "none", "Enter declines the sheet");
+    rig.press("escape", cx);
+    assert_eq!(overlay(cx), "none");
 
     // Under the duel: no undo, redo or zoom.
     rig.with_view(cx, |v, window, cx| v.open_duel(window, cx));
@@ -1390,4 +1388,74 @@ fn the_loupe_print_follows_the_record_onto_the_pop_out(cx: &mut TestAppContext) 
     advance(cx, SETTLE * 2);
     work(cx);
     assert_eq!(print(cx), None);
+}
+
+/// The proof sheet's keys, as React's proof cells were buttons: Enter on the sheet as dealt
+/// (the backdrop focused, no proof) neither declines nor adopts; Tab / Shift+Tab move focus
+/// through the proofs, wrapping; Enter adopts the focused proof. A pointer click on the
+/// backdrop still declines.
+#[gpui_kit::test]
+fn enter_on_the_proof_sheet_adopts_the_focused_proof_and_the_backdrop_click_declines(cx: &mut TestAppContext) {
+    use super::view::Overlay;
+    use crate::loupe::proof_sheet::ProofSheet;
+    let rig = rig("dk-proof-keys", 1, cx);
+    work(cx);
+    let sheet_of = |rig: &Rig, cx: &mut TestAppContext| {
+        rig.view(cx).read_with(cx, |v, _| match v.overlay() {
+            Some(Overlay::Proof(p)) => Some(p.clone()),
+            _ => None,
+        })
+    };
+    let focused = |rig: &Rig, sheet: &Entity<ProofSheet>, cx: &mut TestAppContext| {
+        cx.update_window(rig.app.window(), |_, window, cx| sheet.read(cx).focused(window)).unwrap()
+    };
+    rig.with_view(cx, |v, window, cx| v.open_proof_sheet(window, cx));
+    let sheet = sheet_of(&rig, cx).expect("the proof sheet is mounted");
+    let n = sheet.read_with(cx, |s, _| s.candidates().len());
+    assert!(n > 2);
+    let before = rig.working(cx);
+
+    rig.press("enter", cx);
+    assert!(sheet_of(&rig, cx).is_some(), "Enter with no proof focused does not decline");
+    assert_eq!(rig.working(cx), before, "… nor adopt");
+    assert_eq!(focused(&rig, &sheet, cx), None);
+
+    rig.press("tab", cx);
+    assert_eq!(focused(&rig, &sheet, cx), Some(0));
+    rig.press("tab", cx);
+    rig.press("tab", cx);
+    assert_eq!(focused(&rig, &sheet, cx), Some(2));
+    rig.press("shift-tab", cx);
+    assert_eq!(focused(&rig, &sheet, cx), Some(1));
+    rig.press("shift-tab", cx);
+    rig.press("shift-tab", cx);
+    assert_eq!(focused(&rig, &sheet, cx), Some(n - 1), "wraps");
+    rig.press("tab", cx);
+    rig.press("tab", cx);
+    assert_eq!(focused(&rig, &sheet, cx), Some(1));
+    // On to the first film proof (a change from the record, so it is saved as a step).
+    let k = sheet.read_with(cx, |s, _| {
+        s.candidates().iter().position(|c| c.group == chairphoto_model::darkroom::spreads::ProofGroup::Film).unwrap()
+    });
+    assert!(k > 1);
+    while focused(&rig, &sheet, cx) != Some(k) {
+        rig.press("tab", cx);
+    }
+    let (label, record) = sheet.read_with(cx, |s, _| (s.candidates()[k].label.clone(), s.candidates()[k].record.clone()));
+    rig.press("enter", cx);
+    assert!(sheet_of(&rig, cx).is_none(), "Enter adopted and closed");
+    assert_eq!(rig.working(cx), serde_json::from_str::<Value>(&record.to_json()).unwrap(), "the focused proof's record");
+    rig.settle_and_save(cx);
+    let v1 = rig.versions()[0].id;
+    assert_eq!(rig.labels(v1).0.last().unwrap(), &format!("Proof: {label}"));
+
+    // The backdrop's pointer click declines.
+    rig.with_view(cx, |v, window, cx| v.open_proof_sheet(window, cx));
+    assert!(sheet_of(&rig, cx).is_some());
+    let before = rig.working(cx);
+    let corner = gpui_kit::point(gpui_kit::px(4.), gpui_kit::px(4.));
+    cx.update_window(rig.app.window(), |_, window, cx| window.click_at("proof-backdrop", corner, cx)).unwrap();
+    cx.run_until_parked();
+    assert!(sheet_of(&rig, cx).is_none(), "the backdrop click declines");
+    assert_eq!(rig.working(cx), before);
 }

@@ -414,8 +414,8 @@ fn brackets_are_text_in_a_focused_input(cx: &mut TestAppContext) {
 
 // --- menus and controls ------------------------------------------------------------------
 
-/// The menus dispatch real actions to the root: a check item toggles shell state, and an
-/// unported command answers with its ticket.
+/// The menus dispatch real actions to the root: a check item toggles shell state, and a
+/// command runs.
 #[gpui_kit::test]
 fn menu_items_dispatch_their_actions(cx: &mut TestAppContext) {
     let dir = TempDir::new("menus");
@@ -426,7 +426,7 @@ fn menu_items_dispatch_their_actions(cx: &mut TestAppContext) {
     assert!(!left_visible(&app, cx), "More ⋯ → View → Tags & collections panel");
 
     click_menu_row(&app, "more-menu", 0, "Open loupe in a new window", cx);
-    assert_eq!(status(&app, cx), not_yet_ported_line("Open loupe in a new window", 110));
+    assert!(cx.update(|cx| crate::loupe::window::handle(cx)).is_some(), "the pop-out loupe opened");
 
     assert!(app.wired.shell.read_with(cx, |s, _| s.cache_previews));
     click_menu_row(&app, "import-menu", 4, "Cache previews on import", cx);

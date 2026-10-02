@@ -7,8 +7,9 @@
 //!   zoomed, a transform that Compare's panes share.
 //! - [`view::LoupeView`] — the inline loupe on the Library stage. It follows
 //!   [`ShellState::loupe_target`](crate::shell::ShellState::loupe_target) and holds no state a
-//!   second window could not have too: the pop-out loupe (#110) is another `LoupeView` over
-//!   the same `ShellState`, `ImageStore` and `ModuleRegistry` entities, in its own window.
+//!   second window could not have too.
+//! - [`window`] — the pop-out loupe (#110): another `LoupeView` over the same `ShellState`,
+//!   `ImageStore` and `ModuleRegistry` entities, in its own window.
 //! - [`compare_view::CompareView`] over [`compare::CompareSession`] — two to four frames with
 //!   one pan/zoom, in grid or duel mode.
 //! - [`cull::CullView`] — the full-screen, keyboard-only cull session over a frozen list.
@@ -36,7 +37,10 @@ pub mod edit_renders;
 #[cfg(feature = "edit")]
 pub mod proof_sheet;
 pub mod view;
+pub mod window;
 pub mod zoom;
+#[cfg(test)]
+mod popout_tests;
 #[cfg(test)]
 mod tests;
 

@@ -245,6 +245,7 @@ pub fn wire(
     let tags = cx.new(|cx| tags::TagsState::new(&model, cx));
     let albums = cx.new(|cx| albums::AlbumsState::new(&model, &shell, cx));
     let exports = cx.new(|cx| export::ExportState::new(&model, &shell, cx));
+    loupe::window::install(&model, &shell, &images, &modules, cx);
     if options.open_default_catalog {
         model.update(cx, |m, cx| m.open_default_catalog(cx));
     }

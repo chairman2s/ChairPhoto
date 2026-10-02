@@ -14,9 +14,10 @@
 //! - **Stale frames.** The image shows only tiers keyed by the target's id (the image layer
 //!   drops answers for released keys, and clears on a catalog switch); while the target's
 //!   preview is on its way its own thumbnail stands in, never the previous photo.
-//! - **A second window.** Nothing here is per-window state that the pop-out loupe (#110)
-//!   could not hold too: it would build another `LoupeView` with [`Follow::Window`] over the
-//!   same entities.
+//! - **A second window.** The pop-out loupe ([`crate::loupe::window`], #110) is another
+//!   `LoupeView`, with [`Follow::Window`], over the same entities: it follows the target
+//!   whatever the main stage shows, has no "Back to grid", and ignores Enter/Esc and C. When
+//!   its window closes it is [released](LoupeView::release).
 //!
 //! Keys ([`contexts::LOUPE`]): ←/→/↑/↓ step (Shift extends), Enter/Esc back to the grid, C
 //! Compare, and the culling keys, which mark the targets and advance as in the grid.
@@ -84,6 +85,8 @@ pub struct LoupeView {
     /// This view's hold on the images it navigated to (`ImageStore::set_claim`): another
     /// loupe over the same store — the inline one and the pop-out — keeps its own.
     claim: ClaimId,
+    /// Released ([`Self::release`]): its window closed, so it shows and wants nothing more.
+    released: bool,
     #[cfg(feature = "edit")]
     renders: Entity<crate::loupe::edit_renders::EditRenders>,
     _observers: Vec<Subscription>,
@@ -100,7 +103,8 @@ impl LoupeView {
     ) -> Self {
         let zoom = cx.new(|cx| {
             let mut z = ZoomImage::new(images.clone(), "loupe-image", cx);
-            z.set_unavailable_actions(true);
+            // Relocate / Retrieve / Remove are the main window's actions.
+            z.set_unavailable_actions(follow == Follow::Inline);
             z
         });
         #[allow(unused_mut)]
@@ -130,6 +134,7 @@ impl LoupeView {
             follow,
             navigated: None,
             claim,
+            released: false,
             #[cfg(feature = "edit")]
             renders,
             _observers: observers,
@@ -147,6 +152,9 @@ impl LoupeView {
     }
 
     fn target(&self, cx: &App) -> Option<Photo> {
+        if self.released {
+            return None;
+        }
         let shell = self.shell.read(cx);
         let showing = match self.follow {
             Follow::Inline => shell.stage_view() == StageView::Loupe,
@@ -194,6 +202,25 @@ impl LoupeView {
         }
         #[cfg(feature = "edit")]
         self.sync_version(cx);
+    }
+
+    /// Which photo this loupe follows.
+    pub fn follow(&self) -> Follow {
+        self.follow
+    }
+
+    /// The window this view is in is closing: show nothing more, release what this view alone
+    /// wanted (its preload window, its target's full-resolution tier, its version renders) and
+    /// give up its image claim. The view's module panels go with the window
+    /// (`ModuleRegistry`'s per-window cache).
+    pub fn release(&mut self, cx: &mut Context<Self>) {
+        if self.released {
+            return;
+        }
+        self.released = true;
+        self.sync(cx);
+        let claim = self.claim;
+        self.images.update(cx, |s, _| s.drop_claim(claim));
     }
 
     /// The active version's render in place of the preview, while one is chosen for the
@@ -325,11 +352,14 @@ impl LoupeView {
             .px(px(12.))
             .border_b_1()
             .border_color(colors.border)
-            .child(ui::clickable(ui::chip("loupe-back", "‹ Back to grid (Esc)", true, colors), true, {
+            // The pop-out has no grid to go back to.
+            .when(self.follow == Follow::Inline, |d| {
                 let shell = self.shell.clone();
-                move |_, _, cx| shell.update(cx, |s, cx| s.set_loupe(false, cx))
-            }))
-            .when(back_to_original, |d| {
+                d.child(ui::clickable(ui::chip("loupe-back", "‹ Back to grid (Esc)", true, colors), true, move |_, _, cx| {
+                    shell.update(cx, |s, cx| s.set_loupe(false, cx))
+                }))
+            })
+            .when(back_to_original && self.follow == Follow::Inline, |d| {
                 let shell = self.shell.clone();
                 d.child(ui::clickable(ui::chip("loupe-back-original", "‹ Back to original", true, colors), true, move |_, _, cx| {
                     shell.update(cx, |s, cx| s.select_with(cx, |l| l.back_to_original()))
@@ -423,9 +453,15 @@ impl Render for LoupeView {
             .on_action(cx.listener(|this, _: &SelectAll, _, cx| {
                 this.shell.update(cx, |s, cx| s.select_with(cx, |l| l.select_all()))
             }))
-            .on_action(cx.listener(|this, _: &CloseLoupe, _, cx| this.shell.update(cx, |s, cx| s.set_loupe(false, cx))))
+            // Enter/Esc and C act on the main window's stage; in the pop-out they do nothing (the
+            // window manager closes the window).
+            .on_action(cx.listener(|this, _: &CloseLoupe, _, cx| {
+                if this.follow == Follow::Inline {
+                    this.shell.update(cx, |s, cx| s.set_loupe(false, cx))
+                }
+            }))
             .on_action(cx.listener(|this, _: &CompareSelection, window, cx| {
-                if this.shell.read(cx).library.selection().ids.len() >= 2 {
+                if this.follow == Follow::Inline && this.shell.read(cx).library.selection().ids.len() >= 2 {
                     window.dispatch_action(Box::new(OpenCompare), cx);
                 }
             }))

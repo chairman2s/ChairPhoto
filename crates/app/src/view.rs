@@ -631,6 +631,7 @@ impl Render for RootView {
             .on_action(cx.listener(|this, _: &ToggleLoupe, window, cx| this.toggle_loupe(window, cx)))
             .on_action(cx.listener(|this, _: &OpenCompare, window, cx| this.toggle_compare(window, cx)))
             .on_action(cx.listener(|this, _: &StartCullSession, window, cx| this.start_cull(window, cx)))
+            .on_action(|_: &PopOutLoupe, _, cx| crate::loupe::window::open(cx))
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| this.on_mouse_move(event, cx)))
             .on_mouse_up(MouseButton::Left, cx.listener(|this, _, _, _| this.resize = None))
             .size_full()

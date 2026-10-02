@@ -190,7 +190,7 @@ legacy rule of its own. It is a `chairphoto:FaceId` struct field
 
 — the writing catalog's identity, exactly as `settings.catalog_uuid` holds it (a UUID v4,
 lowercase and hyphenated, minted once on the catalog's first open; `catalog::CATALOG_UUID_KEY`),
-a `/`, and the face's `faces__faces.id` in decimal. Face ids are `AUTOINCREMENT`, so a catalog
+a `/`, and the face's `faces__faces.id` in canonical decimal (no sign, no leading zero: `/007` is not `/7`). Face ids are `AUTOINCREMENT`, so a catalog
 never reuses one. A region whose marker names another catalog — a second catalog over the same
 folders, or this catalog's predecessor before a rebuild — or whose value is anything but exactly
 this form is **foreign**: never removed, never re-marked.

@@ -1067,13 +1067,15 @@ fn face_marker(catalog: &str, face_id: i64) -> String {
 }
 
 /// Whose marker `marker` is, read from catalog `catalog`'s side: [`Owner::Ours`] only for
-/// exactly `<catalog>/<decimal id>`.
+/// exactly `<catalog>/<decimal id>` in canonical form (`/007`, `/+7`, `/-7` are not).
 fn marker_owner(catalog: &str, marker: Option<&str>) -> Owner {
     let Some(marker) = marker else { return Owner::Unmarked };
     match marker.split_once('/') {
-        Some((c, id)) if c == catalog && !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()) => {
-            id.parse().map_or(Owner::Other, Owner::Ours)
-        }
+        Some((c, id)) if c == catalog => match id.parse::<i64>() {
+            // Exactly the form `face_marker` writes: decimal digits, no sign, no leading zero.
+            Ok(n) if n >= 0 && n.to_string() == id => Owner::Ours(n),
+            _ => Owner::Other,
+        },
         _ => Owner::Other,
     }
 }
@@ -4323,5 +4325,23 @@ mod tests {
         assert_eq!(carols.len(), 1, "{xml}");
         assert_eq!(carols[0].face_id.as_deref(), Some(ours(901).as_str()), "re-marked:\n{xml}");
         assert!(near4(carols[0].area, center((0.705, 0.7, 0.1, 0.1))), "{xml}");
+    }
+
+    // ── review round 2 nit: only the canonical face id is ours ─────────────────
+
+    /// A marker is ours only in exactly the form ChairPhoto writes. `<catalog>/02` names
+    /// face 2 to a lenient parser, but ChairPhoto never wrote it, so it is foreign: kept even
+    /// though this photo's face 2 has been retired. The canonical `<catalog>/2` is removed.
+    #[test]
+    fn only_the_canonical_face_id_is_ours() {
+        for (id, removed) in [("2", true), ("02", false), ("002", false), ("+2", false), ("-2", false)] {
+            let marker = format!("{CAT}/{id}");
+            let sidecar = digikam_with(&marked_region(&marker, "Dora", (0.5, 0.5, 0.1, 0.1)));
+            let (_dir, photo) = seeded_photo("xmp-nit-canonical", &sidecar);
+            write_face_regions(&photo, CAT, &[], &[2], &[], sized(6000, 4000)).unwrap();
+            let xml = read(&sidecar_path(&photo));
+            let doras = rf::named(&rf::mwg(&xml), "Dora").len();
+            assert_eq!(doras, usize::from(!removed), "{marker}:\n{xml}");
+        }
     }
 }

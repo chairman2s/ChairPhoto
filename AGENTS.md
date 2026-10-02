@@ -55,7 +55,9 @@ Read only the documents triggered by the task:
 ### XMP safety
 
 - Read-modify-write the existing sidecar. Each writer touches only what it owns:
-  `write_iptc` through `MANAGED`, `write_keywords` through its local set, identifier/import/GPS
+  `write_iptc` through the `MANAGED` fields whose catalog value this write changed (an
+  unchanged field, empty included, is left as the sidecar has it), `write_keywords` through
+  its local set, identifier/import/GPS
   through their named elements, and face regions by Name + Area match. Preserve every other
   element/attribute and foreign namespace.
 - Sidecars are `<original_filename>.xmp`, alongside the original.

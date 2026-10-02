@@ -369,6 +369,22 @@ fn with_bound<T>(
     }
 }
 
+/// The sidecar half of a fill, done off the catalog lock: the original, and the IPTC before
+/// and after the fill.
+struct SidecarFill {
+    original: std::path::PathBuf,
+    before: crate::catalog::IptcFields,
+    after: crate::catalog::IptcFields,
+}
+
+impl SidecarFill {
+    /// Write only the filled fields: `xmp::write_iptc` leaves every field the fill did not
+    /// change — a foreign creator, rights or caption included — as the sidecar has it (#144).
+    fn write(&self) -> Result<(), String> {
+        crate::xmp::write_iptc(&self.original, &self.before, &self.after)
+    }
+}
+
 /// Step 3 of a fill, in the catalog the photo was read from: re-read the IPTC (a value the
 /// user typed meanwhile wins), resolve the original's path and write the filled fields —
 /// all under one lock hold of that catalog. Returns the sidecar write still to do (off the
@@ -379,7 +395,7 @@ fn fill_in(
     identity: CatalogIdentity,
     photo_id: i64,
     geo: &GeocodeResult,
-) -> Result<Option<(std::path::PathBuf, crate::catalog::IptcFields)>, String> {
+) -> Result<Option<SidecarFill>, String> {
     crate::app::with_catalog_as(state, identity, |c| {
         let current = c.get_iptc(photo_id)?;
         let (updated, changed) = fill_empty_iptc(&current, geo);
@@ -388,7 +404,7 @@ fn fill_in(
         }
         let original = c.require_photo_path(photo_id)?;
         c.set_iptc(photo_id, &updated)?;
-        Ok(Some((original, updated)))
+        Ok(Some(SidecarFill { original, before: current, after: updated }))
     })
 }
 
@@ -466,10 +482,10 @@ pub async fn geocode_photo_to_iptc(
     let Some(step1) = step1 else { return Ok(false) };
 
     let geo = lookup_or_ask(state, identity, &step1.endpoint, step1.lat, step1.lng).await?;
-    let Some((original, updated)) = fill_in(state, identity, photo_id, &geo)? else {
+    let Some(fill) = fill_in(state, identity, photo_id, &geo)? else {
         return Ok(false);
     };
-    crate::xmp::write_iptc(&original, &updated)?;
+    fill.write()?;
     Ok(true)
 }
 
@@ -571,8 +587,8 @@ pub async fn geocode_all_to_iptc_with(
         };
         // Counted as filled only when the sidecar write also succeeded, so the summary does
         // not claim a photo whose sidecar diverged.
-        if let Some((original, updated)) = write {
-            if crate::xmp::write_iptc(&original, &updated).is_ok() {
+        if let Some(fill) = write {
+            if fill.write().is_ok() {
                 filled += 1;
             }
         }
@@ -965,6 +981,41 @@ mod tests {
         assert_eq!((iptc.city.as_str(), iptc.country.as_str(), iptc.country_code.as_str()), ("Oslo", "Noreg", "NO"));
         // Every field set now: the single-photo path has nothing to do.
         assert!(!geocode_photo_to_iptc(&state, None, id).await.unwrap());
+        server.abort();
+    }
+
+    /// Issue #144: both fill paths write only the location fields they filled. A foreign
+    /// Lightroom sidecar's creator, rights, caption and headline — never imported, so empty
+    /// in the catalog — survive, and so does its title although the catalog holds a
+    /// different one: the fill did not change the title, so it is not ChairPhoto's to write.
+    #[tokio::test]
+    async fn a_fill_writes_only_the_fields_it_filled_into_a_foreign_sidecar() {
+        use crate::xmp::test_fixtures::{assert_non_iptc_intact, foreign_iptc, iptc, with, LIGHTROOM};
+        let (server, endpoint) =
+            serve_forever(r#"{"address":{"city":"Oslo","state":"Oslo","country":"Norway","country_code":"no"}}"#).await;
+        for single in [true, false] {
+            let (dir, state, id, _progress) = geo_catalog("geo-144-foreign", &endpoint);
+            let xmp = crate::xmp::sidecar_path(&dir.join("library").join("IMG_1.jpg"));
+            std::fs::write(&xmp, LIGHTROOM).unwrap();
+            {
+                let guard = state.catalog.lock().unwrap();
+                let c = guard.as_ref().unwrap();
+                c.set_iptc(id, &crate::catalog::IptcFields { title: "Catalog title".into(), ..Default::default() }).unwrap();
+            }
+            if single {
+                assert!(geocode_photo_to_iptc(&state, None, id).await.unwrap());
+            } else {
+                assert_eq!(geocode_all_to_iptc(&state, None).await.unwrap().filled, 1);
+            }
+
+            let xml = std::fs::read_to_string(&xmp).unwrap();
+            let mut expected = with(foreign_iptc(), "photoshop:City", &["Oslo"]);
+            expected = with(expected, "photoshop:State", &["Oslo"]);
+            expected = with(expected, "photoshop:Country", &["Norway"]);
+            expected = with(expected, "Iptc4xmpCore:CountryCode", &["NO"]);
+            assert_eq!(iptc(&xml), expected, "single={single}:\n{xml}");
+            assert_non_iptc_intact(&xml, "lightroom");
+        }
         server.abort();
     }
 

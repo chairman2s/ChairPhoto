@@ -508,9 +508,8 @@ pub(crate) fn upsert_external_one(catalog: &Catalog, path: &Path) -> Result<(i64
         .unwrap_or(0);
     let size = meta.len() as i64;
     let sidecar_uuid = crate::xmp::read_identifier(path);
-    let identity = catalog.scan_identity(sidecar_uuid.as_deref()).map_err(|e| e.to_string())?;
     let res = catalog
-        .upsert_photo_on_volume(path, mtime_ns, size, identity.as_deref())
+        .upsert_scanned_photo_on_volume(path, mtime_ns, size, sidecar_uuid.as_deref())
         .map_err(|e| e.to_string())?;
     // Same binding invariant as the local scan (see `upsert_one`): bind the identity to
     // the file, or queue a repair. A NAS scan is exactly where this matters — an archive
@@ -969,9 +968,8 @@ fn upsert_one(catalog: &Catalog, path: &Path, folder_id: i64) -> Result<(i64, bo
     // Read the file's own UUID from its sidecar (if any) so a moved/re-rooted file is
     // matched to its existing row by UUID rather than duplicated.
     let sidecar_uuid = crate::xmp::read_identifier(path);
-    let identity = catalog.scan_identity(sidecar_uuid.as_deref()).map_err(|e| e.to_string())?;
     let res = catalog
-        .upsert_photo_with_identity(path, Some(folder_id), mtime_ns, size, identity.as_deref())
+        .upsert_scanned_photo(path, Some(folder_id), mtime_ns, size, sidecar_uuid.as_deref())
         .map_err(|e| e.to_string())?;
 
     // Honor the binding invariant: the file's sidecar must carry this photo's UUID so

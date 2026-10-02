@@ -233,6 +233,13 @@ pub(super) const RECORD_LEGACY_IDENTIFIER_SQL: &str =
 /// for `#146`: settings keys built from a photo's uuid in crates/, src-tauri/ and src/.
 const PHOTO_KEYED_SETTING_PREFIXES: &[&str] = &["obsidian.note."];
 
+// Per-thread count of legacy-identifier lookups, so a test can prove a rescan of a file
+// already at its path does none (#146 review F7). Thread-local: tests run in parallel threads.
+#[cfg(test)]
+thread_local! {
+    static LEGACY_LOOKUPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// True when `value` is a legacy identifier worth recording: not a UUID, not empty.
 pub(super) fn is_legacy_identifier(value: &str) -> bool {
     !value.is_empty() && !is_photo_identity(value)
@@ -1502,9 +1509,11 @@ impl Catalog {
         if let Some(identity) = canonical_photo_identity(found) {
             return Ok(Some(identity));
         }
+        #[cfg(test)]
+        LEGACY_LOOKUPS.with(|n| n.set(n.get() + 1));
         let owners: Vec<(i64, String)> = self
             .conn
-            .prepare(
+            .prepare_cached(
                 "SELECT l.photo_id, p.uuid
                  FROM photo_legacy_identifiers l JOIN photos p ON p.id = l.photo_id
                  WHERE l.identifier = ?1
@@ -3452,5 +3461,33 @@ mod tests {
         let reminted = photo_uuid(&catalog, legacy);
         assert!(is_photo_identity(&reminted) && reminted != mapped, "{reminted}");
         assert!(queue_row(&catalog, legacy, &path).is_some_and(|(_, e, _)| e.contains("dam:9")));
+    }
+
+    /// #146 review F7: a scan works out a legacy identifier only when the path did not
+    /// match. A rescan of a legacy file still at its path pays no lookup and no stats.
+    #[test]
+    fn a_rescan_at_the_same_path_does_not_look_up_a_legacy_identifier() {
+        let (catalog, root, _dir) = temp_catalog("legacy-lookup-after-path");
+        let (id, path) = seed_photo(&catalog, &root, "x.jpg");
+        catalog
+            .conn()
+            .execute("UPDATE photos SET uuid = 'dam:1' WHERE id = ?1", params![id])
+            .unwrap();
+        catalog.remint_non_identity_photos().unwrap();
+        let lookups = || LEGACY_LOOKUPS.with(|n| n.get());
+
+        let before = lookups();
+        let again = catalog.upsert_scanned_photo(&path, None, 1, 9, Some("dam:1")).unwrap();
+        assert_eq!((again.id, again.created), (id, false));
+        assert_eq!(lookups(), before, "matched by path: no legacy lookup");
+        let on_volume = catalog.upsert_scanned_photo_on_volume(&path, 1, 9, Some("dam:1")).unwrap();
+        assert_eq!((on_volume.id, on_volume.created), (id, false));
+        assert_eq!(lookups(), before, "matched by location: no legacy lookup");
+
+        let elsewhere = root.join("y.jpg");
+        std::fs::write(&elsewhere, b"raw-bytes").unwrap();
+        let other = catalog.upsert_scanned_photo(&elsewhere, None, 1, 9, Some("dam:1")).unwrap();
+        assert!(other.created, "x.jpg is still there, so y.jpg is another photo");
+        assert_eq!(lookups(), before + 1, "a path miss does look it up");
     }
 }

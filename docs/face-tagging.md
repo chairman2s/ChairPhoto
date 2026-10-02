@@ -145,21 +145,39 @@ fills it for photos scanned earlier from the metadata they already stored). The 
 each box from the display frame into the stored frame by that orientation — all eight,
 mirrors included — and the import (`read_face_regions_in`) turns a region back before matching
 it to the detections. **An unknown orientation is never guessed:** the boxes are written and
-read as they are, and an `AppliedToDimensions` the sidecar already has is left alone.
+read as they are.
 
 **Structure.** `mwg-rs:AppliedToDimensions` records the stored pixel size — the photo's recorded
 `width` / `height` (EXIF `ExifImageWidth` / `ExifImageHeight`) — never swapped for the EXIF
 Orientation or a user rotation. A photo with no recorded size gets no `AppliedToDimensions`
-(there is no `1×1` stand-in). Each region in the `RegionList`
+(there is no `1×1` stand-in).
+
+**An `AppliedToDimensions` already in the sidecar is never rewritten** (#145): the regions
+other tools wrote are normalized against it, so changing it would move them. ChairPhoto writes
+`AppliedToDimensions` only into a `Regions` that has none, and otherwise puts its boxes into the
+frame the sidecar declares (`region_target`; the import reads by the same rule):
+
+| Declared size | Known orientation | ChairPhoto's boxes go in |
+|---|---|---|
+| none, or ChairPhoto's old `1×1` | any | the stored frame |
+| the stored image's aspect (resized or not) | any | the stored frame |
+| the aspect swapped | 5–8 (turned a quarter) | the display frame the size describes |
+| anything else, or a size without a usable `w`/`h` | any | **refused** |
+| any, with the photo's size unknown | 5–8 | **refused** — which frame is meant cannot be told |
+| any | unknown | as they are |
+
+A refused write fails with an error naming the sidecar and leaves it byte for byte as it was;
+a refused frame imports nothing.
+
+Each region in the `RegionList`
 carries `mwg-rs:Name` (the person tag's leaf name), `mwg-rs:Type="Face"`, and an `mwg-rs:Area`
 whose `x`/`y` are the rectangle's normalized **center** — MWG stores centers, not corners — with
 `w`/`h` as the size. Stored bboxes are top-left-normalized, so the writer converts corner→center
 and the reader converts back.
 
 **Merge safety is binding.** The RegionList may already contain regions written by other tools.
-The writer edits the existing `Regions` in place, never rebuilds it: it refreshes the
-`AppliedToDimensions` fields, updates the regions it wrote, and appends the rest of ChairPhoto's
-current confirmed set. A region counts as ours — and is therefore updated — only when its `Name`
+The writer edits the existing `Regions` in place, never rebuilds it: it updates the regions it
+wrote and appends the rest of ChairPhoto's current confirmed set. A region counts as ours — and is therefore updated — only when its `Name`
 matches one we are writing *and* its center area is within `AREA_EPSILON = 0.02`; each region we
 write updates at most one. **When in doubt, the region is preserved.** Re-writing updates only
 ChairPhoto's own regions and can never duplicate or clobber a foreign face. Foreign attributes

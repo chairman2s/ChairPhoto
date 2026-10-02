@@ -76,7 +76,9 @@ Read only the documents triggered by the task:
   MWG areas use normalized center coordinates in the stored frame — the image before its EXIF
   Orientation is applied (MWG 2.0 § 5.9) — and `AppliedToDimensions` is the stored pixel size;
   ChairPhoto's face boxes are in the EXIF-oriented frame and are converted on export and
-  import. An unknown orientation is never guessed. When uncertain, preserve.
+  import. An unknown orientation is never guessed. An existing `AppliedToDimensions` is never
+  rewritten: ChairPhoto writes into the frame it declares or refuses the write. When uncertain,
+  preserve.
 
 ### Background work and ownership
 

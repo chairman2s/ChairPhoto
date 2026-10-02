@@ -496,13 +496,6 @@ pub struct RegionFrame {
     pub stored_size: Option<(u32, u32)>,
 }
 
-impl RegionFrame {
-    /// The known orientation, when it turns or mirrors the image (not 1).
-    fn turning(&self) -> Option<u8> {
-        self.orientation.filter(|o| (2..=8).contains(o))
-    }
-}
-
 /// Where a normalized point `(u, v)` of the stored image lands in the image displayed under
 /// EXIF Orientation `o` — the turn the preview the faces are detected on went through.
 fn stored_to_display_point(o: u8, (u, v): (f32, f32)) -> (f32, f32) {
@@ -552,9 +545,15 @@ fn stored_to_display(o: u8, bbox: (f32, f32, f32, f32)) -> (f32, f32, f32, f32) 
 
 /// Write the given confirmed face regions into the photo's XMP sidecar as `mwg-rs:Regions`,
 /// merge-safely. The boxes are in the display frame; with a known EXIF Orientation in `frame`
-/// they are written in the stored frame MWG measures regions in, and `AppliedToDimensions`
-/// is the stored size. With an unknown orientation they are written as they are, and an
-/// `AppliedToDimensions` the sidecar already has is left alone (#136).
+/// they are written in the stored frame MWG measures regions in, and a new
+/// `AppliedToDimensions` is the stored size. With an unknown orientation they are written as
+/// they are (#136).
+///
+/// An `AppliedToDimensions` the sidecar already has is **never rewritten** (#145): the regions
+/// other tools wrote are normalized against it, so changing it would move them. ChairPhoto's
+/// regions are written in the frame it declares instead — see [`region_target`] — and when
+/// that frame is not one of this image's (another aspect, or which way it is turned cannot be
+/// told), the write is refused and the sidecar left as it was.
 ///
 /// Merge-safety (binding, AGENTS.md): the existing `mwg-rs:Regions` is edited in place, never
 /// rebuilt. Every foreign region in its `RegionList`, every foreign attribute or child of
@@ -582,18 +581,8 @@ pub fn write_face_regions(
     frame: RegionFrame,
 ) -> Result<(), String> {
     let mut doc = SidecarDocument::open(photo_path)?;
-    let regions: Vec<FaceRegion> = match frame.turning() {
-        Some(o) => regions
-            .iter()
-            .map(|r| FaceRegion { name: r.name.clone(), bbox: display_to_stored(o, r.bbox) })
-            .collect(),
-        None => regions.to_vec(),
-    };
-    let regions = regions.as_slice();
-    // The dimensions written: always into a Regions that has none; over existing ones only
-    // when the orientation is known, so the size is known to be the stored frame's.
+    // Written only into a Regions that has no AppliedToDimensions of its own.
     let dims = frame.stored_size;
-    let refresh_dims = frame.orientation.is_some();
 
     // Regions don't fit `replace_owned`'s "strip a fixed set of (ns, name) pairs, push flat
     // replacements" shape: which existing `rdf:li` entries to keep is decided per-entry by
@@ -604,15 +593,26 @@ pub fn write_face_regions(
         let found = find_description_properties(rdf, NS_MWG_RS, "Regions");
         match found.as_slice() {
             [] => {
+                let target = region_target(frame, None).expect("no dimensions, no conflict");
                 let desc = doc.description_mut();
                 declare_region_namespaces(desc);
-                let lis = regions.iter().map(region_li).collect();
+                let lis = regions.iter().map(|r| region_li(&target.write(r))).collect();
                 desc.children.push(XMLNode::Element(new_regions(dims, lis)));
             }
             [(d, p)] => {
+                let existing = element_at(element_at(rdf, *d), *p);
+                let layout = regions_layout(existing)
+                    .map_err(|why| unrecognised_regions(photo_path, &why))?;
+                let declared = layout.dims.map(|i| {
+                    let body = struct_body(existing).expect("regions_layout checked the form");
+                    applied_dimensions(element_at(body, i))
+                });
+                let target = region_target(frame, declared)
+                    .map_err(|why| unrecognised_frame(photo_path, &why))?;
+                let regions: Vec<FaceRegion> = regions.iter().map(|r| target.write(r)).collect();
                 let desc = element_at_mut(rdf, *d);
                 declare_region_namespaces(desc);
-                update_regions(element_at_mut(desc, *p), regions, dims, refresh_dims)
+                update_regions(element_at_mut(desc, *p), &regions, dims)
                     .map_err(|why| unrecognised_regions(photo_path, &why))?;
             }
             more => {
@@ -625,6 +625,110 @@ pub fn write_face_regions(
     doc.commit()
 }
 
+fn unrecognised_frame(photo_path: &Path, why: &str) -> String {
+    format!(
+        "{}: face regions not written, sidecar left unchanged: {why}",
+        sidecar_path(photo_path).display()
+    )
+}
+
+/// The frame ChairPhoto's boxes are written in, and read back from, for one `mwg-rs:Regions`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RegionTarget {
+    /// The boxes as they are: the orientation is unknown, or the sidecar's own
+    /// `AppliedToDimensions` declares the display frame.
+    AsIs,
+    /// The stored frame of a photo with this EXIF Orientation (MWG 2.0 § 5.9).
+    Stored(u8),
+}
+
+impl RegionTarget {
+    /// A display-frame face as it is written.
+    fn write(self, r: &FaceRegion) -> FaceRegion {
+        match self {
+            Self::AsIs => r.clone(),
+            Self::Stored(o) => FaceRegion { name: r.name.clone(), bbox: display_to_stored(o, r.bbox) },
+        }
+    }
+
+    /// A region as read, in the display frame.
+    fn read(self, bbox: (f32, f32, f32, f32)) -> (f32, f32, f32, f32) {
+        match self {
+            Self::AsIs => bbox,
+            Self::Stored(o) => stored_to_display(o, bbox),
+        }
+    }
+}
+
+/// The size an `AppliedToDimensions` declares, or why it declares none ChairPhoto can use.
+fn applied_dimensions(dims: &Element) -> Result<(f64, f64), String> {
+    let body = struct_body(dims).ok_or("its AppliedToDimensions is not a struct")?;
+    let side = |f| {
+        struct_field(body, NS_STDIM, f)
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v > 0.0)
+    };
+    match (side("w"), side("h")) {
+        (Some(w), Some(h)) => Ok((w, h)),
+        _ => Err("its AppliedToDimensions declares no usable width and height".into()),
+    }
+}
+
+/// Which frame ChairPhoto's boxes go into a `Regions` whose `AppliedToDimensions` is
+/// `declared` (`None`: it has none), never changing that declaration (#145):
+///
+/// - Unknown orientation: as they are (#136, never guessed).
+/// - No declared size, or ChairPhoto's own old `1x1` stand-in, which declares no frame: the
+///   stored frame, as MWG requires.
+/// - A size with the stored image's aspect (the same image, perhaps resized): the stored frame.
+/// - A size with the aspect swapped, on a photo whose orientation turns it a quarter (5-8):
+///   the display frame that size describes — the regions already there are measured in it.
+/// - Anything else — another aspect, a swapped one the orientation does not explain, or a
+///   quarter-turned photo whose stored size is unknown, so which frame is declared cannot be
+///   told — is `Err`: the write is refused rather than mixing frames.
+fn region_target(
+    frame: RegionFrame,
+    declared: Option<Result<(f64, f64), String>>,
+) -> Result<RegionTarget, String> {
+    let Some(o) = frame.orientation else {
+        return Ok(RegionTarget::AsIs);
+    };
+    let stored = RegionTarget::Stored(o);
+    let quarter = (5..=8).contains(&o);
+    let (dw, dh) = match declared {
+        None => return Ok(stored),
+        Some(Ok((w, h))) if w == 1.0 && h == 1.0 => return Ok(stored),
+        Some(Ok(size)) => size,
+        Some(Err(why)) => return Err(why),
+    };
+    let Some((sw, sh)) = frame.stored_size else {
+        return if quarter {
+            Err(format!(
+                "its AppliedToDimensions {dw}x{dh} may be either frame of a photo turned a quarter \
+                 (EXIF Orientation {o}), and the photo's own size is not known"
+            ))
+        } else {
+            Ok(stored)
+        };
+    };
+    let (sw, sh) = (f64::from(sw), f64::from(sh));
+    let same_aspect = |w: f64, h: f64| ((dw / dh) / (w / h) - 1.0).abs() <= ASPECT_TOLERANCE;
+    if same_aspect(sw, sh) {
+        Ok(stored)
+    } else if quarter && same_aspect(sh, sw) {
+        Ok(RegionTarget::AsIs)
+    } else {
+        Err(format!(
+            "its AppliedToDimensions {dw}x{dh} is not a frame of this {sw}x{sh} image \
+             (EXIF Orientation {o})"
+        ))
+    }
+}
+
+/// How far two aspect ratios may differ and still be one image's: a resize rounds each side
+/// to a whole pixel, and a RAW's recorded size can differ from a converter's by a few pixels.
+const ASPECT_TOLERANCE: f64 = 0.01;
+
 fn unrecognised_regions(photo_path: &Path, why: &str) -> String {
     format!(
         "{}: face regions not written, sidecar left unchanged: {why}, a layout ChairPhoto \
@@ -633,17 +737,18 @@ fn unrecognised_regions(photo_path: &Path, why: &str) -> String {
     )
 }
 
-/// The photo's MWG face regions in the display frame ChairPhoto stores face boxes in: what
-/// [`read_face_regions`] returns, turned out of the stored frame by `frame`'s EXIF Orientation
-/// (#136). With an unknown orientation the boxes are returned as the file has them.
+/// The photo's MWG face regions in the display frame ChairPhoto stores face boxes in (#136):
+/// each `Regions` property's boxes turned out of the frame its `AppliedToDimensions` declares
+/// ([`region_target`], the rule the writer follows). With an unknown orientation the boxes are
+/// returned as the file has them. A `Regions` whose frame is not one of this image's is
+/// skipped: a region read in the wrong frame would name the wrong face.
 pub fn read_face_regions_in(photo_path: &Path, frame: RegionFrame) -> Vec<ReadRegion> {
-    let mut regions = read_face_regions(photo_path);
-    if let Some(o) = frame.turning() {
-        for r in &mut regions {
-            r.bbox = stored_to_display(o, r.bbox);
-        }
+    let mut out = Vec::new();
+    for (declared, regions) in read_regions(photo_path) {
+        let Ok(target) = region_target(frame, declared) else { continue };
+        out.extend(regions.into_iter().map(|r| ReadRegion { bbox: target.read(r.bbox), ..r }));
     }
-    regions
+    out
 }
 
 /// Read the MWG face regions (`mwg-rs:Regions`) from the photo's sidecar. Returns each region's
@@ -655,6 +760,13 @@ pub fn read_face_regions_in(photo_path: &Path, frame: RegionFrame) -> Vec<ReadRe
 /// a nested `rdf:Description`, or attributes; the list as an `rdf:Bag` or `rdf:Seq`. A
 /// `Regions` in any other layout is skipped.
 pub fn read_face_regions(photo_path: &Path) -> Vec<ReadRegion> {
+    read_regions(photo_path).into_iter().flat_map(|(_, regions)| regions).collect()
+}
+
+/// Every recognised `Regions` property's declared `AppliedToDimensions` (`None` when it has
+/// none) and its regions, in the file's frame.
+#[allow(clippy::type_complexity)]
+fn read_regions(photo_path: &Path) -> Vec<(Option<Result<(f64, f64), String>>, Vec<ReadRegion>)> {
     let path = sidecar_path(photo_path);
     let Ok(file) = std::fs::File::open(&path) else {
         return Vec::new();
@@ -668,19 +780,14 @@ pub fn read_face_regions(photo_path: &Path) -> Vec<ReadRegion> {
     let mut out = Vec::new();
     for (d, p) in find_description_properties(rdf, NS_MWG_RS, "Regions") {
         let regions = element_at(element_at(rdf, d), p);
-        let Ok(RegionsLayout { list: Some((l, c)), .. }) = regions_layout(regions) else {
+        let Ok(RegionsLayout { list: Some((l, c)), dims }) = regions_layout(regions) else {
             continue;
         };
         let body = struct_body(regions).expect("regions_layout checked the form");
+        let declared = dims.map(|i| applied_dimensions(element_at(body, i)));
         let container = element_at(element_at(body, l), c);
-        for li in container.children.iter().filter_map(node_element) {
-            if !is_rdf(li, "li") {
-                continue;
-            }
-            if let Some(r) = parse_region_li(li) {
-                out.push(r);
-            }
-        }
+        let lis = container.children.iter().filter_map(node_element).filter(|li| is_rdf(li, "li"));
+        out.push((declared, lis.filter_map(parse_region_li).collect()));
     }
     out
 }
@@ -829,16 +936,16 @@ fn region_container(list: &Element) -> Result<usize, String> {
     }
 }
 
-/// Edit an existing, recognised `mwg-rs:Regions` in place: refresh AppliedToDimensions' own
-/// fields to `dims` when `refresh_dims` (add them when there are none), move each region
-/// chairphoto wrote that an incoming one matches to the incoming geometry (see
-/// [`set_region_area`]), and append the incoming regions that matched none. Everything else
-/// on Regions, AppliedToDimensions, RegionList and its container is kept.
+/// Edit an existing, recognised `mwg-rs:Regions` in place: add `dims` as its
+/// AppliedToDimensions when it has none (one it has is never rewritten, #145), move each
+/// region chairphoto wrote that an incoming one matches to the incoming geometry (see
+/// [`set_region_area`]), and append the incoming regions that matched none. `incoming` is
+/// already in the frame the Regions declares ([`region_target`]). Everything else on Regions,
+/// AppliedToDimensions, RegionList and its container is kept.
 fn update_regions(
     regions: &mut Element,
     incoming: &[FaceRegion],
     dims: Option<(u32, u32)>,
-    refresh_dims: bool,
 ) -> Result<(), String> {
     let layout = regions_layout(regions)?;
     let body = struct_body_mut(regions).expect("regions_layout checked the form");
@@ -867,11 +974,8 @@ fn update_regions(
         }
     }
     // Last: inserting moves the indices `layout` recorded.
-    match (layout.dims, dims) {
-        (Some(i), Some((w, h))) if refresh_dims => set_struct_fields(element_at_mut(body, i),
-            NS_STDIM, "stDim", &dimension_fields(w, h)),
-        (None, Some((w, h))) => body.children.insert(0, XMLNode::Element(new_dimensions(w, h))),
-        _ => {}
+    if let (None, Some((w, h))) = (layout.dims, dims) {
+        body.children.insert(0, XMLNode::Element(new_dimensions(w, h)));
     }
     Ok(())
 }
@@ -2761,7 +2865,7 @@ mod tests {
         let (_dir, photo) = seeded_photo("xmp-139-nested", NESTED_DESCRIPTION_REGIONS);
         assert_eq!(region_names(&photo), ["Bob"], "the fixture's region is read");
 
-        write_face_regions(&photo, &alice(), sized(6000, 4000)).unwrap();
+        write_face_regions(&photo, &alice(), sized(8000, 6000)).unwrap();
 
         let xml = read(&sidecar_path(&photo));
         assert_eq!(region_names(&photo), ["Alice", "Bob"], "{xml}");
@@ -2774,9 +2878,10 @@ mod tests {
         let dims = (NS_MWG_RS, "AppliedToDimensions");
         assert!(has_attr(&xml, dims, (NS_FOREIGN, "dimkeep"), "dims-attr"),
             "foreign attribute on AppliedToDimensions lost:\n{xml}");
-        // ChairPhoto's dimensions are set where they were, in attribute form.
-        assert!(has_attr(&xml, dims, (NS_STDIM, "w"), "6000"), "{xml}");
-        assert!(has_attr(&xml, dims, (NS_STDIM, "h"), "4000"), "{xml}");
+        // The dimensions are the file's own, untouched (#145): a 4000x3000 frame of this
+        // 8000x6000 image.
+        assert!(has_attr(&xml, dims, (NS_STDIM, "w"), "4000"), "{xml}");
+        assert!(has_attr(&xml, dims, (NS_STDIM, "h"), "3000"), "{xml}");
         assert_eq!(count_elements(&xml, NS_STDIM, "w"), 0, "no second, element-form width:\n{xml}");
         // Bob is untouched, attributes and all.
         assert!(has_attr(&xml, (NS_RDF, "Description"), (NS_MWG_RS, "Name"), "Bob"), "{xml}");
@@ -2861,7 +2966,7 @@ mod tests {
  </rdf:RDF>
 </x:xmpmeta>"#);
 
-        write_face_regions(&photo, &alice(), sized(6000, 4000)).unwrap();
+        write_face_regions(&photo, &alice(), sized(8000, 6000)).unwrap();
 
         let xml = read(&sidecar_path(&photo));
         assert_eq!(region_names(&photo), ["Alice", "Bob"], "{xml}");
@@ -2873,8 +2978,8 @@ mod tests {
             Some("dims-child"), "{xml}");
         assert_eq!(element_text(&xml, regions, (NS_FOREIGN, "extra")).as_deref(),
             Some("regions-child"), "{xml}");
-        assert_eq!(element_text(&xml, dims, (NS_STDIM, "w")).as_deref(), Some("6000"), "{xml}");
-        assert_eq!(element_text(&xml, dims, (NS_STDIM, "h")).as_deref(), Some("4000"), "{xml}");
+        assert_eq!(element_text(&xml, dims, (NS_STDIM, "w")).as_deref(), Some("4000"), "{xml}");
+        assert_eq!(element_text(&xml, dims, (NS_STDIM, "h")).as_deref(), Some("3000"), "{xml}");
         assert_eq!(element_text(&xml, dims, (NS_STDIM, "unit")).as_deref(), Some("pixel"));
     }
 
@@ -3180,5 +3285,104 @@ mod tests {
         let got = rf::mwg(&read(&sidecar_path(&photo)));
         assert_eq!(got.dims, [None], "no size, no AppliedToDimensions");
         assert!(near4(got.regions[0].area, center(display_to_stored(6, box_))));
+    }
+
+    // ── #145: a foreign AppliedToDimensions is never rewritten ─────────────────
+
+    /// Lightroom's Orientation-6 sidecar with its `AppliedToDimensions` declaring `w`x`h`.
+    fn lightroom_declaring(w: &str, h: &str) -> String {
+        let fixture = r#"stDim:w="6000" stDim:h="4000""#;
+        assert!(rf::LIGHTROOM_ROTATED.contains(fixture), "the fixture's dims moved");
+        rf::LIGHTROOM_ROTATED.replace(fixture, &format!(r#"stDim:w="{w}" stDim:h="{h}""#))
+    }
+
+    const BOB_STORED: (f32, f32, f32, f32) = (0.3, 0.25, 0.15, 0.1);
+
+    /// Probe P01's shapes (claude-139-142.log M1): a write never changes the frame foreign
+    /// regions are measured in. Where the sidecar declares the stored frame, ChairPhoto writes
+    /// in it; where it declares the display frame (the stored size swapped, on a photo turned
+    /// a quarter), ChairPhoto's regions follow it there instead of the declaration following
+    /// ChairPhoto; a resized image keeps its own size. Bob and the dims are untouched each time.
+    #[test]
+    fn face_regions_follow_the_frame_the_sidecar_declares() {
+        let alice = (0.5, 0.1, 0.2, 0.1);
+        let cases = [
+            ("stored frame", ("6000", "4000"), RegionTarget::Stored(6)),
+            ("display frame", ("4000", "6000"), RegionTarget::AsIs),
+            ("resized stored frame", ("3000", "2000"), RegionTarget::Stored(6)),
+            ("ChairPhoto's old 1x1", ("1", "1"), RegionTarget::Stored(6)),
+        ];
+        for (case, (w, h), target) in cases {
+            let sidecar = lightroom_declaring(w, h);
+            let (_dir, photo) = seeded_photo("xmp-145-frames", &sidecar);
+            let frame = turned(6, 6000, 4000);
+            write_face_regions(&photo, &[FaceRegion { name: "Alice".into(), bbox: alice }], frame)
+                .unwrap_or_else(|e| panic!("{case}: {e}"));
+
+            let xml = read(&sidecar_path(&photo));
+            let got = rf::mwg(&xml);
+            assert_eq!(got.dims, [Some((w.to_string(), h.to_string()))], "{case}:\n{xml}");
+            assert_eq!(rf::named(&got, "Bob")[0].area, BOB_STORED, "{case}:\n{xml}");
+            let ours = rf::named(&got, "Alice")[0].area;
+            let want = match target {
+                RegionTarget::AsIs => alice,
+                RegionTarget::Stored(o) => display_to_stored(o, alice),
+            };
+            assert!(near4(ours, center(want)), "{case}: Alice at {ours:?}\n{xml}");
+            let back = read_face_regions_in(&photo, frame);
+            let alice_back = back.iter().find(|r| r.name == "Alice").unwrap();
+            assert!(near4(alice_back.bbox, alice), "{case}: read back {:?}", alice_back.bbox);
+        }
+    }
+
+    /// Probe P02's shape and its neighbours: a sidecar whose declared frame is not one ChairPhoto
+    /// can place its boxes in is not written at all — byte for byte as it was — and reading it
+    /// for import yields nothing rather than regions in the wrong frame. That covers an unknown
+    /// size on a photo turned a quarter (before #145 the declaration became `1x1`), an aspect
+    /// that is neither the image's nor swapped, a swap the orientation does not explain, and a
+    /// declaration without a usable size.
+    #[test]
+    fn face_regions_refuse_a_frame_they_cannot_place_their_boxes_in() {
+        let alice = [FaceRegion { name: "Alice".into(), bbox: (0.5, 0.1, 0.2, 0.1) }];
+        let no_size = |o| RegionFrame { orientation: Some(o), stored_size: None };
+        let cases = [
+            ("unknown size, turned a quarter", lightroom_declaring("6000", "4000"), no_size(6)),
+            ("another aspect", lightroom_declaring("5000", "5000"), turned(6, 6000, 4000)),
+            ("swapped but upright", lightroom_declaring("4000", "6000"), turned(1, 6000, 4000)),
+            ("no usable size", lightroom_declaring("6000", "wide"), turned(6, 6000, 4000)),
+            ("zero size", lightroom_declaring("0", "4000"), turned(6, 6000, 4000)),
+        ];
+        for (case, sidecar, frame) in cases {
+            let (_dir, photo) = seeded_photo("xmp-145-refuse", &sidecar);
+            let err = write_face_regions(&photo, &alice, frame)
+                .expect_err(&format!("{case}: the write must be refused"));
+            assert!(err.contains(&sidecar_path(&photo).display().to_string()), "{case}: {err}");
+            assert_eq!(read(&sidecar_path(&photo)), sidecar, "{case}: sidecar changed");
+            assert!(read_face_regions_in(&photo, frame).is_empty(), "{case}: imported anyway");
+        }
+    }
+
+    /// P02's other halves: an unknown size never replaces a declaration. Upright (or mirrored
+    /// without a quarter turn) the stored and display frames share their aspect, so the boxes
+    /// go into the stored frame MWG prescribes; with an unknown orientation they go as they
+    /// are (#136). Either way the declared 6000x4000 stays.
+    #[test]
+    fn face_regions_with_an_unknown_size_keep_the_declared_dimensions() {
+        let alice = (0.5, 0.1, 0.2, 0.1);
+        for (case, orientation, want) in [
+            ("upright", Some(1), alice),
+            ("rotated 180", Some(3), display_to_stored(3, alice)),
+            ("unknown orientation", None, alice),
+        ] {
+            let (_dir, photo) = seeded_photo("xmp-145-unsized", &lightroom_declaring("6000", "4000"));
+            let frame = RegionFrame { orientation, stored_size: None };
+            write_face_regions(&photo, &[FaceRegion { name: "Alice".into(), bbox: alice }], frame)
+                .unwrap_or_else(|e| panic!("{case}: {e}"));
+            let xml = read(&sidecar_path(&photo));
+            let got = rf::mwg(&xml);
+            assert_eq!(got.dims, [Some(("6000".into(), "4000".into()))], "{case}:\n{xml}");
+            assert!(near4(rf::named(&got, "Alice")[0].area, center(want)), "{case}:\n{xml}");
+            assert_eq!(rf::named(&got, "Bob")[0].area, BOB_STORED, "{case}");
+        }
     }
 }

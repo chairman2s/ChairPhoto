@@ -121,6 +121,8 @@ pub(crate) fn write_and_settle(
     turn: WriteOrder,
 ) -> IptcSaveOutcome {
     let outcome = write.run(original);
+    #[cfg(test)]
+    tests::before_settle(original);
     let settled = super::with_catalog_as(state, identity, |c| c.settle_iptc_write(write, &outcome));
     drop(turn);
     match settled {
@@ -171,6 +173,55 @@ mod tests {
 
     fn read(path: &std::path::Path) -> String {
         std::fs::read_to_string(path).unwrap()
+    }
+
+    /// A hook `write_and_settle` runs between the sidecar write and the settle, once, for
+    /// the write to the original it names — so a test can act inside that window.
+    type Hook = (std::path::PathBuf, Box<dyn FnOnce() + Send>);
+    static BEFORE_SETTLE: std::sync::Mutex<Option<Hook>> = std::sync::Mutex::new(None);
+
+    pub(super) fn before_settle(original: &std::path::Path) {
+        let hook = {
+            let mut slot = BEFORE_SETTLE.lock().unwrap();
+            if slot.as_ref().is_some_and(|(p, _)| p == original) { slot.take() } else { None }
+        };
+        if let Some((_, hook)) = hook {
+            hook();
+        }
+    }
+
+    /// The write turn is held through the settle, not only the write: a later save that
+    /// arrives between an earlier save's write and its settle must not store until the
+    /// settle is done. Otherwise its store bumps the generation first, and the earlier
+    /// save's compare-and-set reports its landed write as superseded (pending) for no reason.
+    #[test]
+    fn the_turn_is_held_until_the_write_is_settled() {
+        let (_dir, state, id, xmp) = foreign_photo("iptc-148-hold", crate::xmp::test_fixtures::LIGHTROOM);
+        let state = std::sync::Arc::new(state);
+        let original = state.catalog.lock().unwrap().as_ref().unwrap().require_photo_path(id).unwrap();
+        let first = IptcFields { title: "t1".into(), ..Default::default() };
+        let second = IptcFields { title: "t2".into(), ..Default::default() };
+        let (tx, rx) = std::sync::mpsc::channel();
+        *BEFORE_SETTLE.lock().unwrap() = Some((original, Box::new({
+            let state = state.clone();
+            move || {
+                let later = {
+                    let state = state.clone();
+                    std::thread::spawn(move || save_iptc(&state, id, &second))
+                };
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                let stored = state.catalog.lock().unwrap().as_ref().unwrap().get_iptc(id).unwrap();
+                tx.send((later, stored.title)).unwrap();
+            }
+        })));
+
+        let earlier = save_iptc(&state, id, &first).unwrap();
+        let (later, title_inside_the_window) = rx.recv().unwrap();
+        assert_eq!(title_inside_the_window, "t1", "the later save stored before the earlier one settled");
+        assert_eq!(earlier.sidecar, crate::catalog::IptcSidecarState::Written, "{earlier:?}");
+        let later = later.join().unwrap().unwrap();
+        assert_eq!(later.sidecar, crate::catalog::IptcSidecarState::Written, "{later:?}");
+        assert!(iptc(&read(&xmp)).contains(&("dc:title".into(), vec!["t2".into()])));
     }
 
     /// Issue #144: a save that sets the title writes the title. The creator, rights and every

@@ -331,6 +331,90 @@ fn another_catalogs_marked_region_survives_this_catalogs_face_writes() {
     assert!(crate::xmp::read_face_regions(&photo_path).iter().all(|r| r.name != "Alice"), "{xml}");
 }
 
+/// A photo the pre-marker writer exported Alice to, on a portrait shot (EXIF Orientation 6,
+/// stored 6000x4000): its sidecar holds her old-shaped, unmarked region in the display frame
+/// with the stored dimensions, and the catalog's record names her. Returns the photo's path.
+fn pre_marker_photo(c: &Catalog, root: &std::path::Path, name: &str) -> (i64, std::path::PathBuf, i64) {
+    let p = add_photo(c, root, name);
+    c.conn()
+        .execute("UPDATE photos SET width = 6000, height = 4000, exif_orientation = 6 WHERE id = ?1", [p])
+        .unwrap();
+    let alice = c.create_tag("People/Alice").unwrap();
+    let f = add_face(c, p, "[0.1,0.1,0.2,0.2]");
+    assign(c, f, alice).unwrap();
+    let path = root.join(name);
+    std::fs::write(
+        crate::xmp::sidecar_path(&path),
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+<rdf:Description rdf:about="" xmlns:mwg-rs="http://www.metadataworkinggroup.com/schemas/regions/"
+  xmlns:stDim="http://ns.adobe.com/xap/1.0/sType/Dimensions#" xmlns:stArea="http://ns.adobe.com/xmp/sType/Area#">
+<mwg-rs:Regions rdf:parseType="Resource"><mwg-rs:AppliedToDimensions rdf:parseType="Resource"><stDim:w>6000</stDim:w><stDim:h>4000</stDim:h><stDim:unit>pixel</stDim:unit></mwg-rs:AppliedToDimensions>
+<mwg-rs:RegionList><rdf:Bag><rdf:li rdf:parseType="Resource"><mwg-rs:Name>Alice</mwg-rs:Name><mwg-rs:Type>Face</mwg-rs:Type><mwg-rs:Area rdf:parseType="Resource"><stArea:x>0.2</stArea:x><stArea:y>0.2</stArea:y><stArea:w>0.2</stArea:w><stArea:h>0.2</stArea:h><stArea:unit>normalized</stArea:unit></mwg-rs:Area></rdf:li></rdf:Bag></mwg-rs:RegionList></mwg-rs:Regions>
+</rdf:Description></rdf:RDF></x:xmpmeta>"#,
+    )
+    .unwrap();
+    c.conn()
+        .execute(
+            "INSERT INTO faces__legacy_regions (face_id, photo_id, name, bbox) VALUES (?1, ?2, 'Alice', '[0.1,0.1,0.2,0.2]')",
+            rusqlite::params![f, p],
+        )
+        .unwrap();
+    (p, path, f)
+}
+
+fn legacy_photos(c: &Catalog) -> Vec<i64> {
+    let mut stmt = c.conn().prepare("SELECT DISTINCT photo_id FROM faces__legacy_regions ORDER BY photo_id").unwrap();
+    stmt.query_map([], |r| r.get(0)).unwrap().collect::<rusqlite::Result<_>>().unwrap()
+}
+
+/// Review L1: the index job first converts every photo on the pre-marker record — its old
+/// display-frame region moved into the stored frame and marked, the record spent — before
+/// any region is read. An offline photo is skipped and keeps its record; a photo no longer
+/// in the catalog drops off it. The faces already have rows, so the index itself has
+/// nothing to detect and needs no model.
+#[test]
+fn the_index_job_converts_the_pre_marker_regions_first() {
+    let (c, root) = temp_catalog("legacy-pass");
+    let (p1, path1, f1) = pre_marker_photo(&c, &root, "p1.NEF");
+    let (p2, path2, _) = pre_marker_photo(&c, &root, "p2.NEF");
+    let marker = format!("{}/{f1}", c.catalog_uuid().unwrap());
+    std::fs::remove_file(&path2).unwrap(); // offline
+    c.conn()
+        .execute("INSERT INTO faces__legacy_regions (face_id, photo_id, name, bbox) VALUES (999, 4242, 'Gone', '[0,0,0.1,0.1]')", [])
+        .unwrap();
+    assert_eq!(legacy_photos(&c), [p1, p2, 4242]);
+    let state = state_with(c);
+    let claim = begin_index_job(&state, None).unwrap();
+    run_index_job(&crate::app::NoEvents, claim);
+
+    let xml = std::fs::read_to_string(crate::xmp::sidecar_path(&path1)).unwrap();
+    let got = crate::xmp::region_fixtures::mwg(&xml);
+    assert_eq!(got.regions.len(), 1, "{xml}");
+    let alice = &got.regions[0];
+    assert_eq!(alice.face_id.as_deref(), Some(marker.as_str()), "not marked:\n{xml}");
+    let (x, y, w, h) = alice.area;
+    assert!((x - 0.2).abs() < 1e-5 && (y - 0.8).abs() < 1e-5 && (w - 0.2).abs() < 1e-5 && (h - 0.2).abs() < 1e-5,
+        "not in the stored frame: {:?}\n{xml}", alice.area);
+    let left = crate::app::with_catalog(&state, |c| Ok(legacy_photos(c))).unwrap();
+    assert_eq!(left, [p2], "the written photo spends its record, the offline one keeps it");
+}
+
+/// The pass stops at the job's abort flag: nothing written, every record row kept.
+#[test]
+fn an_aborted_index_job_leaves_the_pre_marker_record() {
+    let (c, root) = temp_catalog("legacy-pass-abort");
+    let (p1, path1, _) = pre_marker_photo(&c, &root, "p1.NEF");
+    let before = std::fs::read(crate::xmp::sidecar_path(&path1)).unwrap();
+    let state = state_with(c);
+    let claim = begin_index_job(&state, None).unwrap();
+    claim.abort.store(true, Ordering::SeqCst);
+    run_index_job(&crate::app::NoEvents, claim);
+    assert_eq!(std::fs::read(crate::xmp::sidecar_path(&path1)).unwrap(), before);
+    let left = crate::app::with_catalog(&state, |c| Ok(legacy_photos(c))).unwrap();
+    assert_eq!(left, [p1]);
+}
+
 /// #135 through the verbs: ignoring a confirmed face takes its region out of the sidecar,
 /// as rejecting does, and every foreign region and structure stays.
 #[test]

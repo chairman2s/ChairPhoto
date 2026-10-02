@@ -99,6 +99,76 @@ pub fn legacy_regions(conn: &Connection, photo_id: i64) -> rusqlite::Result<Vec<
     )
 }
 
+/// What one [`convert_legacy_regions`] pass did.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LegacyConversion {
+    /// Photos whose sidecar was written: their pre-marker regions adopted (converted to the
+    /// stored frame and marked) or removed, and their record spent.
+    pub written: usize,
+    /// Photos whose original was unreachable: skipped, record kept for a later pass.
+    pub offline: usize,
+    /// Photos whose write failed or was refused (logged): record kept for a later pass.
+    pub failed: usize,
+    /// The pass stopped at its abort flag; the photos it did not reach keep their record.
+    pub aborted: bool,
+}
+
+/// The one-time conversion of the pre-marker regions (#135, review L1): write every photo on
+/// the pre-marker record through [`write_photo_regions`], so its old-shaped regions
+/// ([`crate::xmp`]'s pre-marker shape check) are converted into the stored frame and marked,
+/// or removed if their face has gone, and the photo's record is spent. Without it a photo's
+/// old regions stay in the display frame — misread by a later import on a turned photo —
+/// until a face verb happens to touch it.
+///
+/// Resumable and abortable: the record is the queue. `abort` is checked before each photo,
+/// each photo's write-then-spend is its own step, and a photo that is offline, fails or is
+/// refused keeps its rows for the next pass. Rows of photos no longer in the catalog are
+/// dropped first. Blocking (sidecar IO per photo): run it on a worker with its own catalog
+/// connection — the faces index job runs it before indexing.
+pub fn convert_legacy_regions<R>(
+    conn: &Connection,
+    mut resolve: R,
+    abort: &std::sync::atomic::AtomicBool,
+) -> rusqlite::Result<LegacyConversion>
+where
+    R: FnMut(i64) -> Result<Option<std::path::PathBuf>, String>,
+{
+    super::store::ensure_schema(conn)?;
+    conn.execute("DELETE FROM faces__legacy_regions WHERE photo_id NOT IN (SELECT id FROM photos)", [])?;
+    let photos: Vec<i64> = {
+        let mut stmt = conn.prepare("SELECT DISTINCT photo_id FROM faces__legacy_regions ORDER BY photo_id")?;
+        let rows = stmt.query_map([], |r| r.get(0))?;
+        rows.collect::<rusqlite::Result<_>>()?
+    };
+    let mut out = LegacyConversion::default();
+    for photo in photos {
+        if abort.load(std::sync::atomic::Ordering::Relaxed) {
+            out.aborted = true;
+            break;
+        }
+        let path = match resolve(photo) {
+            Ok(Some(path)) => path,
+            Ok(None) => {
+                out.offline += 1;
+                continue;
+            }
+            Err(e) => {
+                eprintln!("faces: pre-marker regions of photo {photo} not converted: {e}");
+                out.failed += 1;
+                continue;
+            }
+        };
+        match write_photo_regions(conn, photo, |_| Ok(Some(path))) {
+            Ok(()) => out.written += 1,
+            Err(e) => {
+                eprintln!("faces: pre-marker regions of photo {photo} not converted: {e}");
+                out.failed += 1;
+            }
+        }
+    }
+    Ok(out)
+}
+
 fn face_regions(conn: &Connection, sql: &str, photo_id: i64) -> rusqlite::Result<Vec<FaceRegion>> {
     let mut stmt = conn.prepare(sql)?;
     let rows = stmt.query_map([photo_id], |r| {

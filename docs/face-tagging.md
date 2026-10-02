@@ -249,6 +249,19 @@ its first write that reaches the sidecar, so a region another tool writes later 
 name and place is never taken for ours. Pre-marker regions of a face rejected *before* the
 upgrade are not on the record and stay — the catalog no longer knows they were ours.
 
+The old writer wrote display-frame boxes, so until a photo's pre-marker regions are converted
+another tool — or a later import, by a rebuilt or second catalog — reads them in the wrong place
+on a turned photo. **Every face index run converts them first** (`convert_legacy_regions`,
+before it indexes anything): it writes each photo still on the record through the normal region
+write, which adopts and marks (or removes) the old regions in the stored frame and spends the
+record. It shares the index job's abort flag, ownership and catalog connection, and the record
+is its queue: an abort, an offline original or a refused write leaves that photo's rows for the
+next run, and rows of photos no longer in the catalog are dropped. It reports no progress of its
+own (the index's `faces:progress` starts after it) and logs what it did. It is part of the index
+job rather than a job of its own to keep this branch small: the record is a one-time backlog,
+indexing is the faces job a user runs, and it already owns the faces worker. A catalog that is
+never indexed again keeps its record until a face verb touches each photo.
+
 A sidecar may be rooted at `x:xmpmeta` or, as the XMP spec allows, at a bare `rdf:RDF`, which
 is read and written in place (#147); a file rooted at anything else is not written. The writer
 and reader accept `Regions` in any top-level `rdf:Description`, struct values written

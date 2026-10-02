@@ -245,6 +245,18 @@ pub fn run_index_job(sink: &(impl EventSink + ?Sized), claim: JobClaim<FacesJobS
     engine::configure(plan.parallelism, plan.intra_threads);
     engine::configure_force_cpu(indexer::load_force_cpu(sec.conn()));
 
+    // First, the one-time conversion of the pre-marker regions (#135): before indexing, so a
+    // photo's old display-frame regions are converted and marked before anything reads them.
+    // It shares this job's abort flag, ownership and connection; what it does not reach (an
+    // abort, an offline photo, a refusal) stays on the record for the next index run. It
+    // emits no progress of its own, and a failure to run it is logged, never fatal to indexing.
+    let resolve = |photo_id: i64| sec.resolve_photo_path(photo_id).map_err(|e| e.to_string());
+    match regions::convert_legacy_regions(sec.conn(), resolve, &abort) {
+        Ok(c) if c == regions::LegacyConversion::default() => {}
+        Ok(c) => eprintln!("faces_index: pre-marker regions: {c:?}"),
+        Err(e) => eprintln!("faces_index: pre-marker region conversion failed: {e}"),
+    }
+
     let result = {
         let resolve_fn = |photo_id: i64| sec.resolve_photo_path(photo_id).map_err(|e| e.to_string());
         let preview_fn = |path: &std::path::Path| crate::thumbnails::preview_bytes(path);

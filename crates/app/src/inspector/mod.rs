@@ -10,9 +10,11 @@
 //! | versions | Original + named versions: choose the one the loupe shows, rename, duplicate, delete, add |
 //! | publish | where the photo was published (and which version), "Mark as published", "Publish…" |
 //!
-//! **The photo shown** is the Library's active photo (`ShellState::library`). React's
-//! inspector also followed Compare's focused pane (`shellTarget.ts`); the shell resolves that
-//! target now (`ShellState::loupe_target`, #109), but the inspector does not follow it yet.
+//! **The photo shown** is the one the loupes follow (`ShellState::loupe_target`,
+//! `shellTarget.ts`): Compare's focused pane while Compare is open, else the Library's active
+//! photo. The Versions tab's choice belongs to the active photo
+//! (`ShellState::set_active_version` refuses another photo's version), as React's
+//! `activeVersion` did.
 //!
 //! **Data flow.** Everything the inspector shows about the photo beyond its row — signals,
 //! the stack, IPTC, metadata, versions, publications — is read off the UI thread, lazily (only
@@ -425,9 +427,10 @@ impl PhotoInspector {
         this
     }
 
-    /// The photo the inspector shows (the Library's active photo), as the rows hold it.
+    /// The photo the inspector shows ([`ShellState::loupe_target`]: Compare's focused pane,
+    /// else the Library's active photo), as the rows hold it.
     pub fn photo(&self, cx: &gpui_kit::App) -> Option<Photo> {
-        self.shell.read(cx).library.selection().active.cloned()
+        self.shell.read(cx).loupe_target().cloned()
     }
 
     pub fn section_open(&self, section: Section) -> bool {
@@ -456,7 +459,7 @@ impl PhotoInspector {
     fn sync(&mut self, cx: &mut Context<Self>) {
         let (photo, tab, active_version, from) = {
             let shell = self.shell.read(cx);
-            let photo = shell.library.selection().active.map(|p| (p.id, p.stack_parent_id, p.stack_count));
+            let photo = shell.loupe_target().map(|p| (p.id, p.stack_parent_id, p.stack_count));
             (photo, shell.inspector_tab, shell.active_version().map(|v| v.id), shell.rows_from())
         };
         let id = photo.map(|p| p.0);

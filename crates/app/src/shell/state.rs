@@ -17,6 +17,7 @@
 //! ([`crate::machine_prefs::MachinePrefs`], #113, which holds the appearance mode), but these
 //! keys are not written to it yet, so they start at React's defaults each launch.
 
+use crate::loupe::card::{LoupeCard, ShownCard};
 use crate::loupe::compare::{CompareMode, CompareSession, Verdict};
 use crate::model::{AppModel, AppModelEvent, DeepLinkTarget};
 use chairphoto_core::app::{
@@ -31,7 +32,7 @@ use chairphoto_model::library::query::{RefreshRequest, StatusRequest};
 use chairphoto_model::compare_duel::DuelSide;
 use chairphoto_model::library::session::{LibrarySession, SelectMods, StepSnapshot};
 use futures::channel::oneshot;
-use gpui_kit::{Context, Entity, EventEmitter, Subscription, Task};
+use gpui_kit::{Context, Entity, EventEmitter, SharedString, Subscription, Task};
 
 /// React's column defaults and drag limits (`App.tsx`).
 pub const LEFT_DEFAULT_W: f32 = 210.;
@@ -338,6 +339,17 @@ pub enum StageView {
     Compare,
 }
 
+/// The Darkroom's working state as a print on the pop-out loupe (DarkroomView.tsx's "🖥 Loupe
+/// print", `broadcastPrint`): the photo, the stamped record and the pixels it renders from, so
+/// the pop-out shows the stage's own render. Set and cleared by the Darkroom.
+#[cfg(feature = "edit")]
+#[derive(Debug, Clone)]
+pub struct LoupePrint {
+    pub photo: Photo,
+    pub edit_json: String,
+    pub source: chairphoto_core::plugins::edit::SourceToken,
+}
+
 /// A `chairphoto://<uuid>` link waiting for the widened grid to list its photo (App.tsx's
 /// `deepLinkTarget`).
 #[derive(Debug, Clone)]
@@ -393,6 +405,12 @@ pub struct ShellState {
     pub loupe_open: bool,
     /// Compare, while open, and the catalog its pool was read from (#109).
     compare: Option<(CompareSession, CatalogIdentity)>,
+    /// The card a module put up in the pop-out loupe, with its owner (#110,
+    /// `crate::loupe::card`).
+    loupe_card: Option<ShownCard>,
+    /// The Darkroom's print on the pop-out loupe, while one is up (#110).
+    #[cfg(feature = "edit")]
+    loupe_print: Option<LoupePrint>,
     /// Compare's presentation for the next open (`panel.compareMode`; the root view seeds it
     /// from the per-machine preferences and stores changes back).
     pub compare_mode: CompareMode,
@@ -454,6 +472,9 @@ impl ShellState {
             editing_tag: None,
             loupe_open: false,
             compare: None,
+            loupe_card: None,
+            #[cfg(feature = "edit")]
+            loupe_print: None,
             compare_mode: CompareMode::Duel,
             last_mark: None,
             catalog_generation: 0,
@@ -694,6 +715,48 @@ impl ShellState {
             }
         }
         self.library.selection().active
+    }
+
+    /// The card a module has up in the pop-out loupe, if any.
+    pub fn loupe_card(&self) -> Option<&ShownCard> {
+        self.loupe_card.as_ref()
+    }
+
+    /// Module `module` puts `card` up in the pop-out loupe (host.ts `showLoupeCard`), bound to
+    /// the catalog `from`; `None` takes down its own card and leaves another module's alone.
+    pub fn show_loupe_card(
+        &mut self,
+        module: SharedString,
+        card: Option<LoupeCard>,
+        from: Option<CatalogIdentity>,
+        cx: &mut Context<Self>,
+    ) {
+        match card {
+            Some(card) => {
+                let shown = ShownCard { module, card, from };
+                if self.loupe_card.as_ref() == Some(&shown) {
+                    return;
+                }
+                self.loupe_card = Some(shown);
+            }
+            None if self.loupe_card.as_ref().is_some_and(|c| c.module == module) => self.loupe_card = None,
+            None => return,
+        }
+        cx.notify();
+    }
+
+    /// The Darkroom's print on the pop-out loupe, if one is up.
+    #[cfg(feature = "edit")]
+    pub fn loupe_print(&self) -> Option<&LoupePrint> {
+        self.loupe_print.as_ref()
+    }
+
+    /// Put the Darkroom's print up on the pop-out loupe (`None`: the pop-out follows the
+    /// target again). For the Darkroom's "🖥 Loupe print" (#112's rails wire the toggle).
+    #[cfg(feature = "edit")]
+    pub fn set_loupe_print(&mut self, print: Option<LoupePrint>, cx: &mut Context<Self>) {
+        self.loupe_print = print;
+        cx.notify();
     }
 
     /// Open Compare on the selection (two or more; C in the grid, the bench's Compare). The
@@ -1179,6 +1242,12 @@ impl ShellState {
                 self.editing_tag = None;
                 self.loupe_open = false;
                 self.compare = None;
+                // Its photo scope names the closed catalog's tags.
+                self.loupe_card = None;
+                #[cfg(feature = "edit")]
+                {
+                    self.loupe_print = None;
+                }
                 self.catalog_generation += 1;
                 self.surface = Surface::Library;
                 self.counts = Counts::default();

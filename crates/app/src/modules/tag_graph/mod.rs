@@ -10,8 +10,9 @@
 //! **Communities only**: the Photo ↔ tag mode was dropped by the owner (#120). Labels are
 //! horizontal and the edge layer is soft while zooming (also #120).
 //!
-//! **Deferred**: "Open loupe window" and the loupe mirror (`showInLoupe`) wait for the pop-out
-//! loupe (#110); `GraphSession::loupe_card` already derives what it would show.
+//! **The pop-out loupe** (#110): while the Graph is on screen its inspector is mirrored there
+//! (`GraphSession::loupe_card` through `ModuleHost::show_in_loupe`), and "Open loupe window"
+//! opens it; leaving the Graph takes the card down.
 //!
 //! Compiled in behind the `tag-graph` cargo feature (default). The module needs no core
 //! backend (`library_graph` is in every build), so it declares no `backend_feature`.
@@ -89,6 +90,7 @@ impl ModuleInstance for TagGraphInstance {
                         window,
                         cx,
                     )
+                    .with_host(host.clone(), cx)
                 }),
             }],
             ..Default::default()

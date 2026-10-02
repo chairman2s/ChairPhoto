@@ -639,3 +639,91 @@ fn the_module_reads_the_open_catalog_through_the_shell(cx: &mut TestAppContext) 
     })
     .unwrap());
 }
+
+/// The pop-out loupe (#110): the inspector's subject is mirrored there while the Graph is on
+/// screen, "Open loupe window" opens it on that card, and leaving the Graph or disabling the
+/// module takes the card down.
+#[gpui_kit::test]
+fn the_inspector_is_mirrored_to_the_pop_out_loupe(cx: &mut TestAppContext) {
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+    let dir = TempDir(std::env::temp_dir().join(format!("cp-tg-loupe-{}-{nanos}", std::process::id())));
+    std::fs::create_dir_all(&dir.0).unwrap();
+    let (state, events_rx, ()) = start_core(|_| ());
+    let wired = cx.update(|cx| {
+        wire(cx, state.clone(), events_rx, None, &SystemThemeResult::unavailable(), WireOptions::headless(Rc::new(|| {})))
+    });
+    let db = dir.0.join("t.chairphoto");
+    let root = dir.0.join("photos");
+    let catalog = Catalog::open(&db, &root).unwrap();
+    let bird = catalog.create_tag("Animals/Bird").unwrap();
+    let dog = catalog.create_tag("Animals/Dog").unwrap();
+    for i in 0..3 {
+        let p = catalog.upsert_photo(&root.join(format!("p{i}.ARW")), None, 0, 1).unwrap().id;
+        catalog.assign_tag(p, bird).unwrap();
+        if i < 2 {
+            catalog.assign_tag(p, dog).unwrap();
+        }
+    }
+    *state.catalog.lock().unwrap() = Some(catalog);
+    state.send(CoreEvent::CatalogSwitched(db.to_string_lossy().to_string()));
+    cx.run_until_parked();
+    let window = *wired.main_window.as_ref().unwrap();
+    let render = |cx: &mut TestAppContext| {
+        for _ in 0..3 {
+            cx.update_window(window, |_, w, cx| w.render_frame(cx)).unwrap();
+            cx.run_until_parked();
+        }
+    };
+    let card_title = |cx: &mut TestAppContext| {
+        wired.shell.read_with(cx, |s, _| s.loupe_card().map(|c| (c.module.to_string(), c.card.title.to_string())))
+    };
+
+    cx.update(|cx| ModuleRegistry::enable(&wired.modules, TAG_GRAPH_ID, cx));
+    render(cx);
+    cx.update_window(window, |_, w, cx| w.click("rail-view-tag-graph", cx)).unwrap();
+    render(cx);
+    cx.update_window(window, |_, w, cx| w.click("tg-type-tags", cx)).unwrap();
+    render(cx);
+    let view = cx
+        .update_window(window, |_, w, cx| {
+            ModuleRegistry::main_view(&wired.modules, VIEW_ID, w, cx).unwrap().view.downcast::<TagGraphView>().unwrap()
+        })
+        .unwrap();
+    view.update(cx, |v, cx| v.update_session(cx, |s| s.select(Some(NodeId::Tag(bird)))));
+    render(cx);
+    assert_eq!(card_title(cx), Some((TAG_GRAPH_ID.to_string(), "Bird".to_string())), "mirrored");
+
+    cx.update_window(window, |_, w, cx| w.click("tg-open-loupe", cx)).unwrap();
+    cx.run_until_parked();
+    let popout = cx.update(|cx| crate::loupe::window::handle(cx)).expect("Open loupe window opened it");
+    let wall = |cx: &mut TestAppContext| {
+        let v = cx.update(|cx| crate::loupe::window::view(cx)).unwrap();
+        v.read_with(cx, |v, cx| v.card().read(cx).wall().1)
+    };
+    let titled = |cx: &mut TestAppContext| {
+        cx.update_window(popout, |_, w, cx| {
+            w.render_frame(cx);
+            w.try_find("loupe-card-title").and_then(|e| e.label().map(str::to_string))
+        })
+        .unwrap()
+    };
+    assert_eq!(titled(cx).as_deref(), Some("Bird"));
+    assert_eq!(wall(cx), 3, "the tag's photos");
+
+    view.update(cx, |v, cx| v.update_session(cx, |s| s.select(Some(NodeId::Tag(dog)))));
+    render(cx);
+    assert_eq!(titled(cx).as_deref(), Some("Dog"), "follows the selection");
+    assert_eq!(wall(cx), 2);
+
+    // Leaving the Graph hands the loupe back to the photo.
+    wired.shell.update(cx, |s, cx| s.show_library(cx));
+    render(cx);
+    assert_eq!(card_title(cx), None);
+    // Back on the Graph the card is up again; disabling the module takes it down.
+    wired.shell.update(cx, |s, cx| s.show_module_view(VIEW_ID, cx));
+    render(cx);
+    assert_eq!(card_title(cx).map(|c| c.1).as_deref(), Some("Dog"));
+    cx.update(|cx| ModuleRegistry::disable(&wired.modules, TAG_GRAPH_ID, cx));
+    render(cx);
+    assert_eq!(card_title(cx), None);
+}

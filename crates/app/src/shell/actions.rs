@@ -78,6 +78,9 @@ actions!(
         /// The bench's Compare (C in the grid): Compare over the selection (two or more); in
         /// Compare it closes it again.
         OpenCompare,
+        /// More ⋯ → Open loupe in a new window: the pop-out loupe (#110,
+        /// `crate::loupe::window`), or bring it forward when it is open.
+        PopOutLoupe,
     ]
 );
 
@@ -114,8 +117,6 @@ macro_rules! not_yet_ported {
 }
 
 not_yet_ported! {
-    /// More ⋯ → Open loupe in a new window.
-    PopOutLoupe => ("Open loupe in a new window", 110),
     /// The loupe's "unavailable" state: Relocate… (a file picker; the grid context menu's
     /// commands are Storage and import's).
     RelocatePhoto => ("Relocate…", 114),

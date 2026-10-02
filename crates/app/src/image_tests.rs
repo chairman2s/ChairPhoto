@@ -587,3 +587,73 @@ fn a_catalog_switch_clears_the_image_store(cx: &mut TestAppContext) {
     cx.run_until_parked();
     assert!(ready(&images, 1, ImageKind::Thumb, cx).is_none());
 }
+
+// --- claims (#110) ---------------------------------------------------------------------------
+
+fn zoom(id: i64) -> JobKey {
+    JobKey::photo(id, ImageKind::Zoom)
+}
+
+fn cancelled(pool: &FakePool) -> Vec<JobKey> {
+    pool.cancelled.lock().unwrap().clone()
+}
+
+/// Two views navigate over one store: one stepping away releases only what the other does
+/// not hold too, and what one holds survives everybody else's releases.
+#[gpui_kit::test]
+fn a_claim_releases_only_what_no_other_claim_holds(cx: &mut TestAppContext) {
+    let (pool, images) = store(cx, 1 << 30);
+    let photos = [10, 11, 12, 13, 14, 15, 16];
+    let (a, b) = images.update(cx, |s, _| (s.new_claim(), s.new_claim()));
+    images.update(cx, |s, _| {
+        s.navigate_window_as(a, &photos, 1, ImageKind::Preview, 1, 1, &[(11, ImageKind::Zoom)]);
+        s.request(11, ImageKind::Zoom);
+        s.navigate_window_as(b, &photos, 2, ImageKind::Preview, 1, 1, &[]);
+    });
+    assert_eq!(images.read_with(cx, |s, _| s.claim(a).len()), 4, "10, 11, 12 and 11's zoom tier");
+
+    // Another view's blanket release, and an unclaimed navigation, leave both claims alone.
+    images.update(cx, |s, _| {
+        s.release_pending(|_| false);
+        s.navigate_window(&photos, 6, ImageKind::Preview, 0, 0);
+    });
+    assert!(cancelled(&pool).is_empty(), "{:?}", cancelled(&pool));
+
+    // A steps to 15: 10 and 11's zoom tier were only its own; 11 and 12 are B's too.
+    images.update(cx, |s, _| s.navigate_window_as(a, &photos, 5, ImageKind::Preview, 1, 1, &[]));
+    let gone: HashSet<JobKey> = cancelled(&pool).into_iter().collect();
+    assert_eq!(gone, HashSet::from([preview(10), zoom(11)]));
+    assert!(images.read_with(cx, |s, _| s.is_pending(11, ImageKind::Preview) && s.is_pending(12, ImageKind::Preview)));
+
+    // B lets go of 11, 12 and 13, which nobody else holds now.
+    images.update(cx, |s, _| s.drop_claim(b));
+    let gone = cancelled(&pool);
+    for id in [11, 12, 13] {
+        assert!(gone.contains(&preview(id)), "{id} released with B's claim: {gone:?}");
+    }
+    assert!(!gone.contains(&preview(14)), "14 is A's");
+}
+
+/// Eviction skips a tier a claim holds; a catalog switch empties every claim, and a changed
+/// photo (an invalidate) drops its claimed requests — the pixels they would bring are stale.
+#[gpui_kit::test]
+fn claims_guard_eviction_but_not_a_change_of_pixels(cx: &mut TestAppContext) {
+    let (pool, images) = store(cx, 1 << 30);
+    let a = images.update(cx, |s, _| s.new_claim());
+    images.update(cx, |s, _| {
+        s.request(1, ImageKind::Zoom);
+        s.set_claim(a, [(1, ImageKind::Zoom), (2, ImageKind::Preview)]);
+        s.request(2, ImageKind::Preview);
+    });
+    pool.finish(&zoom(1), Ok(pixels(8, 8)));
+    cx.run_until_parked();
+    images.update(cx, |s, cx| s.evict(|k| k.kind == ImageKind::Zoom, cx));
+    assert!(ready(&images, 1, ImageKind::Zoom, cx).is_some(), "claimed: kept");
+
+    images.update(cx, |s, cx| s.invalidate(2, cx));
+    assert_eq!(cancelled(&pool), vec![preview(2)], "an invalidate drops a claimed request");
+
+    images.update(cx, |s, cx| s.clear(cx));
+    assert!(images.read_with(cx, |s, _| s.claim(a).is_empty()), "a switch empties the claims");
+    assert!(!images.read_with(cx, |s, _| s.is_claimed(1, ImageKind::Zoom)));
+}

@@ -318,6 +318,21 @@ impl ModuleHost {
     pub fn images(&self) -> Option<&Entity<ImageStore>> {
         self.images.as_ref()
     }
+
+    /// Show `card` in the pop-out loupe in place of the photo, or take this module's card down
+    /// (`None`; another module's stays) — `ChairPhotoAPI.showInLoupe`. The card's photo scope
+    /// is read from the catalog open now; disabling the module or a catalog switch takes the
+    /// card down ([`crate::loupe::card`]).
+    pub fn show_in_loupe(&self, card: Option<crate::loupe::card::LoupeCard>, cx: &mut App) {
+        let from = self.model.read(cx).catalog_identity();
+        let module = self.meta.id.clone();
+        self.shell.update(cx, |s, cx| s.show_loupe_card(module, card, from, cx));
+    }
+
+    /// Open the pop-out loupe window, or bring it forward (`ChairPhotoAPI.openLoupe`).
+    pub fn open_loupe(&self, cx: &mut App) {
+        crate::loupe::window::open(cx);
+    }
 }
 
 /// A module's settings: the catalog's key/value `settings` table, every key prefixed with

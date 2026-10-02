@@ -36,6 +36,9 @@ use super::{Back, GraphSource};
 use crate::image_store::{ImageState, ImageStore};
 use crate::keymap::contexts;
 use crate::model::{AppModel, AppModelEvent};
+use crate::loupe::card::{CardScope, LoupeCard, Related};
+use crate::modules::ModuleHost;
+use crate::shell::state::Surface;
 use crate::shell::style::Colors;
 use crate::shell::ShellState;
 use chairphoto_core::app::{with_catalog, AppState, CoreEvent};
@@ -74,6 +77,28 @@ pub struct TagGraphStats {
     pub images_released: u64,
 }
 
+/// The session's card (`GraphSession::loupe_card`) as the host's `LoupeCard`.
+pub fn host_card(c: chairphoto_model::tag_graph::session::LoupeCard) -> LoupeCard {
+    use chairphoto_model::tag_graph::session::LoupePhotos;
+    let some = |s: String| (!s.is_empty()).then(|| SharedString::from(s));
+    LoupeCard {
+        title: c.title.into(),
+        subtitle: some(c.subtitle),
+        color: Some(paint::rgb(c.color, 1.)),
+        chips: c.chips.into_iter().map(Into::into).collect(),
+        stats: c.stats.into_iter().map(|(label, n)| (label.into(), n.to_string().into())).collect(),
+        related: c
+            .related
+            .into_iter()
+            .map(|(label, detail, color)| Related { label: label.into(), detail: some(detail), color: Some(paint::rgb(color, 1.)) })
+            .collect(),
+        photos: c.photos.map(|p| match p {
+            LoupePhotos::Tag(id) => CardScope::Tag(id),
+            LoupePhotos::Camera(model) => CardScope::Camera(model),
+        }),
+    }
+}
+
 /// A pan in progress: where the pointer went down and the view then.
 #[derive(Clone, Copy)]
 struct Drag {
@@ -105,6 +130,11 @@ pub struct TagGraphView {
     top_photos: Option<(i64, Vec<i64>)>,
     top_generation: u64,
     stats: Rc<RefCell<TagGraphStats>>,
+    /// The host, for the pop-out loupe's card (`showInLoupe`) and "Open loupe window"; `None`
+    /// in a view built without one (tests of the view alone).
+    host: Option<ModuleHost>,
+    /// The card last put up in the pop-out loupe (`None`: none of this view's is up).
+    mirrored: Option<LoupeCard>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -166,7 +196,53 @@ impl TagGraphView {
             top_photos: None,
             top_generation: 0,
             stats: Rc::default(),
+            host: None,
+            mirrored: None,
             _subscriptions: subs,
+        }
+    }
+
+    /// Mirror the inspector to the pop-out loupe through `host` (tagGraph.tsx's `loupeCard`
+    /// effect), while the Graph is the surface shown; leaving it, or the view going, takes
+    /// the card down.
+    pub fn with_host(mut self, host: ModuleHost, cx: &mut Context<Self>) -> Self {
+        self._subscriptions.push(cx.observe(&self.shell, |this, _, cx| this.mirror(cx)));
+        cx.on_release(|this, cx| {
+            if let (Some(host), Some(_)) = (this.host.take(), this.mirrored.take()) {
+                host.show_in_loupe(None, cx);
+            }
+        })
+        .detach();
+        self.host = Some(host);
+        self.mirror(cx);
+        self
+    }
+
+    /// The card the pop-out should show now: the selection's, else the community's, while
+    /// the Graph is on screen.
+    fn wanted_card(&self, cx: &App) -> Option<LoupeCard> {
+        if self.shell.read(cx).surface != Surface::Module(super::VIEW_ID.into()) {
+            return None;
+        }
+        self.session.loupe_card().map(host_card)
+    }
+
+    /// Put the wanted card up, or take this view's down, when it changed.
+    fn mirror(&mut self, cx: &mut Context<Self>) {
+        let Some(host) = self.host.clone() else { return };
+        let wanted = self.wanted_card(cx);
+        if wanted == self.mirrored {
+            return;
+        }
+        self.mirrored = wanted.clone();
+        host.show_in_loupe(wanted, cx);
+    }
+
+    /// "Open loupe window": the pop-out, showing this inspector's card.
+    fn open_loupe(&mut self, cx: &mut Context<Self>) {
+        self.mirror(cx);
+        if let Some(host) = &self.host {
+            host.open_loupe(cx);
         }
     }
 
@@ -185,6 +261,7 @@ impl TagGraphView {
             self.request_raster(true, cx);
         }
         self.pump(cx);
+        self.mirror(cx);
         cx.notify();
     }
 
@@ -222,6 +299,8 @@ impl TagGraphView {
         if let Some(old) = self.raster.take() {
             self.release(old, cx);
         }
+        // The shell dropped the card with the switch; nothing of this view's is up.
+        self.mirrored = None;
         cx.notify();
     }
 
@@ -244,6 +323,7 @@ impl TagGraphView {
                     v.stats.borrow_mut().loads_applied += 1;
                     v.load_top_photos(cx);
                     v.pump(cx);
+                    v.mirror(cx);
                 } else {
                     v.stats.borrow_mut().loads_dropped += 1;
                 }
@@ -692,6 +772,18 @@ impl TagGraphView {
             .into_any_element()
     }
 
+    /// "Open loupe window" (with a host): the pop-out, mirroring this inspector.
+    fn open_loupe_button(&self, actions: gpui_kit::Div, colors: Colors, cx: &mut Context<Self>) -> gpui_kit::Div {
+        if self.host.is_none() {
+            return actions;
+        }
+        actions.child(
+            Self::button("tg-open-loupe", "Open loupe window", false, colors)
+                .on_click(cx.listener(|this, _, _, cx| this.open_loupe(cx)))
+                .test_support(),
+        )
+    }
+
     fn button(id: &'static str, label: impl Into<SharedString>, primary: bool, colors: Colors) -> gpui_kit::Stateful<gpui_kit::Div> {
         div()
             .id(id)
@@ -840,6 +932,7 @@ impl TagGraphView {
                     .on_click(cx.listener(move |this, _, _, cx| this.update_session(cx, |s| s.toggle_isolate(n.id))))
                     .test_support(),
             );
+            actions = self.open_loupe_button(actions, colors, cx);
         } else if let Some(card) = self.session.community_card() {
             body = body.child(title(paint::rgb(card.color, 1.), card.name.clone()));
             let mut chips = div().flex().flex_row().flex_wrap().gap(px(6.)).child(chip(
@@ -878,6 +971,7 @@ impl TagGraphView {
                     .on_click(cx.listener(|this, _, _, cx| this.update_session(cx, |s| s.clear_community())))
                     .test_support(),
             );
+            actions = self.open_loupe_button(actions, colors, cx);
         } else {
             return col
                 .child(

@@ -7,19 +7,24 @@
 //!   camera preview (`edit` feature), with its hi-res render fetched on the first zoom-in.
 //! - **Navigation order.** When the target changes the image layer is asked for the target's
 //!   preview first, then N+1 and N−1, then N+2…N+5 and N−2 — one pool batch
-//!   (`ImageStore::navigate_window`), superseding the old window's queued requests. A zoom
-//!   tier wanted for the previous photo is released.
+//!   (`ImageStore::navigate_window_as`), superseding the old window's queued requests. A zoom
+//!   tier wanted for the previous photo is released. Each loupe holds its own claim on what
+//!   it navigated to, so it releases only what no other loupe still wants: the inline loupe
+//!   closing leaves the pop-out's preloads alone, and the other way round (#110).
 //! - **Stale frames.** The image shows only tiers keyed by the target's id (the image layer
 //!   drops answers for released keys, and clears on a catalog switch); while the target's
 //!   preview is on its way its own thumbnail stands in, never the previous photo.
-//! - **A second window.** Nothing here is per-window state that the pop-out loupe (#110)
-//!   could not hold too: it would build another `LoupeView` with [`Follow::Window`] over the
-//!   same entities.
+//! - **A second window.** The pop-out loupe ([`crate::loupe::window`], #110) is another
+//!   `LoupeView`, with [`Follow::Window`], over the same entities: it follows the target
+//!   whatever the main stage shows, has no "Back to grid", and ignores Enter/Esc and C. While
+//!   the Darkroom has a print up (`ShellState::set_loupe_print`, `edit` feature) it shows
+//!   that record, rendered from the print's own source, instead. When its window closes it
+//!   is [released](LoupeView::release).
 //!
 //! Keys ([`contexts::LOUPE`]): ←/→/↑/↓ step (Shift extends), Enter/Esc back to the grid, C
 //! Compare, and the culling keys, which mark the targets and advance as in the grid.
 
-use crate::image_store::ImageStore;
+use crate::image_store::{ClaimId, ImageStore};
 use crate::keymap::contexts;
 use crate::library::*;
 use crate::loupe::zoom::ZoomImage;
@@ -36,8 +41,9 @@ use chairphoto_core::image_pool::ImageKind;
 use gpui_kit::prelude::*;
 use gpui_kit::{
     div, px, AnyElement, App, Context, Entity, FocusHandle, Global, Hsla, InteractiveElement, SharedString,
-    Subscription, TestSupportExt as _, Window,
+    Subscription, TestSupportExt as _, WeakEntity, Window, WindowId,
 };
+use std::collections::HashMap;
 use std::path::Path;
 use std::rc::Rc;
 
@@ -57,6 +63,21 @@ fn open_with_system(path: &Path, cx: &mut App) {
         Some(opener) => (opener.0)(path, cx),
         None => cx.open_with_system(path),
     }
+}
+
+/// The loupe image each window shows, for loupe-slot module panels (the face overlay) that
+/// draw over it: every [`LoupeView`] registers its image for the window it renders in, before
+/// it builds those panels. Weak, so a closed window's entry dies with its view.
+#[derive(Default)]
+struct LoupeImages(HashMap<WindowId, WeakEntity<ZoomImage>>);
+
+impl Global for LoupeImages {}
+
+/// The loupe image `window` shows — the inline loupe in the main window, the pop-out's in the
+/// pop-out — so a loupe-slot panel can follow its transform without reaching into a window's
+/// root view. `None` when no loupe has rendered in `window`.
+pub fn loupe_image(window: &Window, cx: &App) -> Option<Entity<ZoomImage>> {
+    cx.try_global::<LoupeImages>()?.0.get(&window.window_handle().window_id())?.upgrade()
 }
 
 /// Which photo a loupe follows.
@@ -79,6 +100,11 @@ pub struct LoupeView {
     follow: Follow,
     /// The target the last navigation was for.
     navigated: Option<i64>,
+    /// This view's hold on the images it navigated to (`ImageStore::set_claim`): another
+    /// loupe over the same store — the inline one and the pop-out — keeps its own.
+    claim: ClaimId,
+    /// Released ([`Self::release`]): its window closed, so it shows and wants nothing more.
+    released: bool,
     #[cfg(feature = "edit")]
     renders: Entity<crate::loupe::edit_renders::EditRenders>,
     _observers: Vec<Subscription>,
@@ -95,7 +121,8 @@ impl LoupeView {
     ) -> Self {
         let zoom = cx.new(|cx| {
             let mut z = ZoomImage::new(images.clone(), "loupe-image", cx);
-            z.set_unavailable_actions(true);
+            // Relocate / Retrieve / Remove are the main window's actions.
+            z.set_unavailable_actions(follow == Follow::Inline);
             z
         });
         #[allow(unused_mut)]
@@ -114,6 +141,7 @@ impl LoupeView {
             observers.push(cx.observe(&zoom, |this, _, cx| this.sync_version(cx)));
             renders
         };
+        let claim = images.update(cx, |s, _| s.new_claim());
         let mut view = LoupeView {
             model,
             shell,
@@ -123,6 +151,8 @@ impl LoupeView {
             focus: cx.focus_handle(),
             follow,
             navigated: None,
+            claim,
+            released: false,
             #[cfg(feature = "edit")]
             renders,
             _observers: observers,
@@ -140,12 +170,28 @@ impl LoupeView {
     }
 
     fn target(&self, cx: &App) -> Option<Photo> {
+        if self.released {
+            return None;
+        }
+        #[cfg(feature = "edit")]
+        if let Some(print) = self.print(cx) {
+            return Some(print.photo.clone());
+        }
         let shell = self.shell.read(cx);
         let showing = match self.follow {
             Follow::Inline => shell.stage_view() == StageView::Loupe,
             Follow::Window => true,
         };
         showing.then(|| shell.loupe_target().cloned()).flatten()
+    }
+
+    /// The Darkroom's print, which the pop-out shows in place of the target while it is up.
+    #[cfg(feature = "edit")]
+    fn print<'a>(&self, cx: &'a App) -> Option<&'a crate::shell::state::LoupePrint> {
+        match self.follow {
+            Follow::Window => self.shell.read(cx).loupe_print(),
+            Follow::Inline => None,
+        }
     }
 
     /// Follow the target: show it, and on a change ask for it first, then its neighbours. The
@@ -156,27 +202,32 @@ impl LoupeView {
         if target != self.navigated {
             let left = std::mem::replace(&mut self.navigated, target);
             let rows = self.shell.read(cx).library.photo_ids();
+            let claim = self.claim;
             self.images.update(cx, |store, cx| {
-                if let Some(left) = left {
-                    store.evict(|k| k.kind == ImageKind::Zoom && k.photo == left, cx);
-                }
                 match target {
+                    // This view's claim becomes the new window and the target's zoom tier:
+                    // what it held before is released unless another view holds it too.
                     Some(id) => {
+                        let zoom = [(id, ImageKind::Zoom)];
                         match rows.iter().position(|&r| r == id) {
-                            Some(index) => store.navigate_window(
+                            Some(index) => store.navigate_window_as(
+                                claim,
                                 &rows,
                                 index,
                                 ImageKind::Preview,
                                 PRELOAD_AHEAD,
                                 PRELOAD_BEHIND,
+                                &zoom,
                             ),
                             // Off-grid (a stacked child): just this one.
-                            None => store.navigate_window(&[id], 0, ImageKind::Preview, 0, 0),
+                            None => store.navigate_window_as(claim, &[id], 0, ImageKind::Preview, 0, 0, &zoom),
                         }
-                        store.release_pending(|k| k.kind != ImageKind::Zoom || k.photo == id);
                     }
-                    // Closed: the grid's thumbnails come first again.
-                    None => store.release_pending(|k| k.kind == ImageKind::Thumb),
+                    // Closed: nothing of this view's is wanted any more.
+                    None => store.set_claim(claim, []),
+                }
+                if let Some(left) = left {
+                    store.evict(|k| k.kind == ImageKind::Zoom && k.photo == left, cx);
                 }
             });
         }
@@ -184,24 +235,53 @@ impl LoupeView {
         self.sync_version(cx);
     }
 
+    /// Which photo this loupe follows.
+    pub fn follow(&self) -> Follow {
+        self.follow
+    }
+
+    /// The window this view is in is closing: show nothing more, release what this view alone
+    /// wanted (its preload window, its target's full-resolution tier, its version renders) and
+    /// give up its image claim. The view's module panels go with the window
+    /// (`ModuleRegistry`'s per-window cache).
+    pub fn release(&mut self, cx: &mut Context<Self>) {
+        if self.released {
+            return;
+        }
+        self.released = true;
+        self.sync(cx);
+        let claim = self.claim;
+        self.images.update(cx, |s, _| s.drop_claim(claim));
+    }
+
     /// The active version's render in place of the preview, while one is chosen for the
     /// photo the loupe shows (App.tsx's `editedSrc` + `renderHiVersion`).
     #[cfg(feature = "edit")]
     fn sync_version(&mut self, cx: &mut Context<Self>) {
         use crate::loupe::edit_renders::{preview_job, RenderState};
+        use chairphoto_core::plugins::edit::SourceToken;
         use crate::loupe::zoom::Override;
         /// React's loupe render size (`renderForLoupe`, `edit://` at 2560 px).
         const LOUPE_EDGE: u32 = 2560;
         let target = self.zoom.read(cx).photo();
         let epoch = self.model.read(cx).catalog_epoch;
-        let version = self.shell.read(cx).active_version().filter(|v| Some(v.photo_id) == target).cloned();
-        let Some(version) = version else {
+        // The record to render and its pixels: the Darkroom's print (pop-out only), else the
+        // active version — each only on its own photo.
+        let shell = self.shell.read(cx);
+        let record = match self.print(cx) {
+            Some(print) => Some((print.photo.id, print.edit_json.clone(), print.source.clone())),
+            None => shell.active_version().map(|v| (v.photo_id, v.edit_json.clone(), SourceToken::Preview)),
+        }
+        .filter(|(photo, _, _)| Some(*photo) == target);
+        let Some((photo, edit_json, source)) = record else {
             self.renders.update(cx, |r, cx| r.want(&[], cx));
             self.zoom.update(cx, |z, cx| z.set_override(None, cx));
             return;
         };
-        let lo = preview_job(version.photo_id, &version.edit_json, LOUPE_EDGE, false, epoch);
-        let hi = preview_job(version.photo_id, &version.edit_json, 0, true, epoch);
+        let mut lo = preview_job(photo, &edit_json, LOUPE_EDGE, false, epoch);
+        let mut hi = preview_job(photo, &edit_json, 0, true, epoch);
+        lo.source = source.clone();
+        hi.source = source;
         let wants_hi = self.zoom.read(cx).wants_hi();
         let jobs = if wants_hi { vec![lo.clone(), hi.clone()] } else { vec![lo.clone()] };
         self.renders.update(cx, |r, cx| r.want(&jobs, cx));
@@ -313,11 +393,14 @@ impl LoupeView {
             .px(px(12.))
             .border_b_1()
             .border_color(colors.border)
-            .child(ui::clickable(ui::chip("loupe-back", "‹ Back to grid (Esc)", true, colors), true, {
+            // The pop-out has no grid to go back to.
+            .when(self.follow == Follow::Inline, |d| {
                 let shell = self.shell.clone();
-                move |_, _, cx| shell.update(cx, |s, cx| s.set_loupe(false, cx))
-            }))
-            .when(back_to_original, |d| {
+                d.child(ui::clickable(ui::chip("loupe-back", "‹ Back to grid (Esc)", true, colors), true, move |_, _, cx| {
+                    shell.update(cx, |s, cx| s.set_loupe(false, cx))
+                }))
+            })
+            .when(back_to_original && self.follow == Follow::Inline, |d| {
                 let shell = self.shell.clone();
                 d.child(ui::clickable(ui::chip("loupe-back-original", "‹ Back to original", true, colors), true, move |_, _, cx| {
                     shell.update(cx, |s, cx| s.select_with(cx, |l| l.back_to_original()))
@@ -411,9 +494,15 @@ impl Render for LoupeView {
             .on_action(cx.listener(|this, _: &SelectAll, _, cx| {
                 this.shell.update(cx, |s, cx| s.select_with(cx, |l| l.select_all()))
             }))
-            .on_action(cx.listener(|this, _: &CloseLoupe, _, cx| this.shell.update(cx, |s, cx| s.set_loupe(false, cx))))
+            // Enter/Esc and C act on the main window's stage; in the pop-out they do nothing (the
+            // window manager closes the window).
+            .on_action(cx.listener(|this, _: &CloseLoupe, _, cx| {
+                if this.follow == Follow::Inline {
+                    this.shell.update(cx, |s, cx| s.set_loupe(false, cx))
+                }
+            }))
             .on_action(cx.listener(|this, _: &CompareSelection, window, cx| {
-                if this.shell.read(cx).library.selection().ids.len() >= 2 {
+                if this.follow == Follow::Inline && this.shell.read(cx).library.selection().ids.len() >= 2 {
                     window.dispatch_action(Box::new(OpenCompare), cx);
                 }
             }))
@@ -428,6 +517,10 @@ impl Render for LoupeView {
         };
         let video = chairphoto_core::scanner::is_video(Path::new(&photo.path));
         let bar = self.render_bar(&photo, colors, cx);
+        // The image the loupe-slot panels draw over, for this window ([`loupe_image`]).
+        let images = &mut cx.default_global::<LoupeImages>().0;
+        images.retain(|_, zoom| zoom.upgrade().is_some());
+        images.insert(window.window_handle().window_id(), self.zoom.downgrade());
         let panels = ModuleRegistry::panel_views(&self.modules, PanelSlot::Loupe, window, cx);
         let id = photo.id;
         let stage: AnyElement = div()

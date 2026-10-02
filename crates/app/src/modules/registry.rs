@@ -610,6 +610,9 @@ impl ModuleRegistry {
         if let Some(live) = live {
             Self::in_module(this, cx, |cx| live.instance.borrow_mut().on_unload(cx));
         }
+        // Its card in the pop-out loupe goes with it (host.ts: "or its disabling").
+        let shell = this.read(cx).shell.clone();
+        shell.update(cx, |s, cx| s.show_loupe_card(id.to_string().into(), None, None, cx));
         this.update(cx, |r, cx| {
             if persist {
                 r.persist(cx);

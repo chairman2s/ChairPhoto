@@ -71,9 +71,11 @@ is never overwritten.
 
 - `crates/core/src/instagram/mod.rs` — the Chrome automation.
 - `crates/core/src/app/instagram.rs` — the post as a publish job (`app::uploads`, the
-  Instagram family): the caption prefill, the 1080-px render into a directory belonging to that
-  post alone (`publishing::JobTempDir`), whose lifetime follows the outcome as described above,
-  and the hand-off to an `InstagramDriver` (Chrome; tests fake it and never launch a browser).
+  Instagram family): the caption prefill, the 1080-px render — always named
+  `chairphoto-instagram.jpg`, so the composer, and so Instagram, never sees the original
+  filename or the version name — into a directory belonging to that post alone
+  (`publishing::JobTempDir`), whose lifetime follows the outcome as described above, and the
+  hand-off to an `InstagramDriver` (Chrome; tests fake it and never launch a browser).
   A stopped job (its own Cancel or a catalog switch) stops before Chrome sees the render; a
   newer post never stops an older one.
 - `src-tauri/src/commands/instagram.rs` — `post_to_instagram` and

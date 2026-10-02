@@ -36,6 +36,10 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+/// The file name an Instagram render gets, whatever the photo: the composer's file input
+/// (and so Instagram) sees this, never the original filename or the version name.
+pub const INSTAGRAM_FILE_NAME: &str = "chairphoto-instagram.jpg";
+
 /// What a cancelled publish answers: it stopped before uploading anything.
 pub const UPLOAD_CANCELLED: &str = "Cancelled — nothing was uploaded.";
 
@@ -233,10 +237,16 @@ impl UploadJob {
         if stop.stopped() {
             return Err(stopped(&state, read));
         }
-        // Named after the source (with the version suffix), so the service shows a
-        // meaningful filename; the job-scoped directory keeps that name collision-free.
+        // Flickr/SmugMug: named after the source (with the version suffix), so the service
+        // shows a meaningful filename. Instagram: a fixed name, so neither the original
+        // filename nor the version name reaches Instagram. The job-scoped directory keeps
+        // either collision-free.
         let dir = JobTempDir::new(service.id())?;
-        let path = dir.join(&upload_file_name(&item.original, item.version_name.as_deref()));
+        let name = match service {
+            UploadService::Instagram => INSTAGRAM_FILE_NAME.to_string(),
+            UploadService::Flickr | UploadService::SmugMug => upload_file_name(&item.original, item.version_name.as_deref()),
+        };
+        let path = dir.join(&name);
         let (written, tally) = super::exports::collect_parity(|| render(&item, &path));
         super::exports::record_parity_tally(&state, Some(read), tally);
         written?;
@@ -331,6 +341,25 @@ mod tests {
         let parent = rendered.path().parent().unwrap().to_path_buf();
         drop(rendered);
         assert!(!parent.exists(), "the job directory outlived the job");
+    }
+
+    /// Privacy: an Instagram render is always `chairphoto-instagram.jpg` — neither the original
+    /// filename nor the version name reaches Instagram — while Flickr and SmugMug get the
+    /// source-derived name.
+    #[test]
+    fn an_instagram_render_has_a_fixed_name() {
+        let dir = TestTmpDir::new("uploads-instagram-name");
+        let (state, id) = catalog_with_photo(&dir);
+        let version = super::super::with_catalog(&state, |c| c.create_version(id, "Punchy crop")).unwrap();
+        let calls = Arc::new(Mutex::new(0));
+        let name = |service| {
+            let rendered = claim_upload(&state, None, service, id, Some(version)).unwrap().render(&fake(&calls)).unwrap();
+            rendered.path().file_name().unwrap().to_string_lossy().into_owned()
+        };
+        assert_eq!(name(UploadService::Instagram), INSTAGRAM_FILE_NAME);
+        assert_eq!(INSTAGRAM_FILE_NAME, "chairphoto-instagram.jpg");
+        assert_eq!(name(UploadService::SmugMug), "IMG_1 - Punchy crop.jpg");
+        assert_eq!(name(UploadService::Flickr), "IMG_1 - Punchy crop.jpg");
     }
 
     /// Cancel before the render: nothing is rendered; cancel after it: the upload's check

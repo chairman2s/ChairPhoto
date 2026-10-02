@@ -23,7 +23,7 @@ use chairphoto_model::darkroom::controls::{
     self as ctl, EffectKey, SliderDef, SplitKey, ToneKey, COLOR_SLIDERS, EFFECT_SLIDERS, SPLIT_SLIDERS, TONE_SLIDERS,
 };
 use chairphoto_model::darkroom::develop_source::{badge_for, BadgeTone};
-use chairphoto_model::darkroom::filmstrip::{step_target, KeyTarget};
+use chairphoto_model::darkroom::filmstrip::{step_target, KeyTarget, STRIP_LAYOUT};
 use chairphoto_model::darkroom::kelvin::{kelvin_to_slider, KelvinContext, WbShown, KELVIN_TINT_RANGE, SLIDER_STEPS};
 use chairphoto_model::darkroom::tone_strip::{self, ZONE_COUNT, ZONE_FILLS, ZONE_LABELS};
 use chairphoto_model::editing::{bw_filters, VersionEdit};
@@ -31,8 +31,8 @@ use gpui_kit::component::slider::{Slider, SliderEvent, SliderState};
 use gpui_kit::prelude::*;
 use gpui_kit::{
     canvas, div, img, px, rgb, AnyElement, Bounds, Context, Entity, FocusHandle, FontWeight, KeyDownEvent, MouseButton,
-    MouseDownEvent, MouseMoveEvent, ObjectFit, PathPromptOptions, Pixels, ScrollDelta, ScrollWheelEvent, SharedString,
-    Subscription, TestSupportExt as _, Window,
+    MouseDownEvent, MouseMoveEvent, ObjectFit, PathPromptOptions, Pixels, ScrollDelta, ScrollHandle, ScrollWheelEvent,
+    SharedString, Subscription, TestSupportExt as _, Window,
 };
 use std::cell::Cell;
 use std::rc::Rc;
@@ -257,6 +257,10 @@ pub struct DarkroomView {
     /// The open photo the zoom belongs to: another photo starts at fit.
     view_photo: Option<i64>,
     rails: rails::RailsState,
+    /// The filmstrip's scroll position.
+    strip_scroll: ScrollHandle,
+    /// The open (`OpenPhoto::seq`) the strip was last centred on ([`Self::centre_strip`]).
+    strip_centred: Option<u64>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -296,6 +300,8 @@ impl DarkroomView {
             stage_bounds: Rc::default(),
             view_photo: None,
             rails,
+            strip_scroll: ScrollHandle::new(),
+            strip_centred: None,
             _subscriptions: subs,
         }
     }
@@ -758,6 +764,46 @@ impl DarkroomView {
             .into_any_element()
     }
 
+    /// Keep the open photo's frame in the middle of the filmstrip — `Filmstrip.tsx`'s
+    /// `scrollIntoView({ inline: "center" })` on each change of the current photo, clamped at
+    /// the strip's ends. Once per open, whatever moved it (← / →, a click, the active photo
+    /// changed elsewhere), so a strip scrolled by hand stays where it was left until the
+    /// photo changes. The strip's width is the last frame's; before it has one (its first
+    /// frame), the next frame centres it.
+    fn centre_strip(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let d = self.darkroom.read(cx);
+        let Some(open) = d.open.as_ref() else {
+            self.strip_centred = None;
+            return;
+        };
+        if self.strip_centred == Some(open.seq) {
+            return;
+        }
+        let (_, shown, total) = d.strip(cx);
+        if total <= 1 {
+            return; // no strip (yet)
+        }
+        let seq = open.seq;
+        let Some(index) = shown.iter().position(|p| p.id == open.photo.id) else {
+            // Not in the Library's list: no frame to centre, as React's missing ref.
+            self.strip_centred = Some(seq);
+            return;
+        };
+        let viewport = f32::from(self.strip_scroll.bounds().size.width);
+        if viewport <= 0.0 {
+            window.request_animation_frame();
+            return;
+        }
+        let x = STRIP_LAYOUT.centre(index, shown.len(), viewport);
+        self.strip_scroll.set_offset(gpui_kit::point(px(-x), px(0.)));
+        self.strip_centred = Some(seq);
+    }
+
+    /// The filmstrip's scroll position (tests).
+    pub fn strip_scroll(&self) -> &ScrollHandle {
+        &self.strip_scroll
+    }
+
     fn render_filmstrip(&self, d: &Darkroom, colors: Colors, cx: &Context<Self>) -> Option<AnyElement> {
         let (start, shown, total) = d.strip(cx);
         if total <= 1 {
@@ -765,7 +811,17 @@ impl DarkroomView {
         }
         let current = d.open.as_ref().map(|o| o.photo.id);
         let images: Vec<ImageState> = shown.iter().map(|p| d.images().read(cx).peek(p.id, ImageKind::Thumb)).collect();
-        let mut strip = div().id("dk-filmstrip").flex().flex_row().flex_none().gap(px(4.)).h(px(64.)).px(px(12.)).py(px(4.)).overflow_x_scroll();
+        let mut strip = div()
+            .id("dk-filmstrip")
+            .flex()
+            .flex_row()
+            .flex_none()
+            .gap(px(STRIP_LAYOUT.gap))
+            .h(px(64.))
+            .px(px(STRIP_LAYOUT.padding))
+            .py(px(4.))
+            .overflow_x_scroll()
+            .track_scroll(&self.strip_scroll);
         for (k, (p, image)) in shown.iter().zip(images).enumerate() {
             let id = p.id;
             let name = p.path.rsplit('/').next().unwrap_or(&p.path).to_string();
@@ -780,7 +836,7 @@ impl DarkroomView {
                 div()
                     .id(SharedString::from(format!("dk-strip-{id}")))
                     .flex_none()
-                    .w(px(72.))
+                    .w(px(STRIP_LAYOUT.frame))
                     .h_full()
                     .rounded(px(4.))
                     .overflow_hidden()
@@ -995,6 +1051,7 @@ impl Render for DarkroomView {
             self.sync_sliders(&working, kelvin.as_ref(), window, cx);
             self.rails.sync_straighten(&working, window, cx);
         }
+        self.centre_strip(window, cx);
         let d = darkroom.read(cx);
         let bar = self.render_bar(d, colors, cx);
         let error = d.error.clone();

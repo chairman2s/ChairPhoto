@@ -1,6 +1,10 @@
 //! The Darkroom filmstrip's pure parts — a port of `src/components/darkroom/filmstrip.ts`:
 //! which photos to render around the current one, and where a step lands. The strip follows
 //! the Library's current order and filter.
+//!
+//! #134 adds what `Filmstrip.tsx` left to the DOM: where the strip scrolls so the current
+//! frame sits in the middle (`scrollIntoView({ inline: "center" })`), and which look a frame
+//! shows (the photo's cover token, which the thumbnail URL carried).
 
 /// How many photos either side of the current one the strip renders.
 pub const STRIP_RADIUS: usize = 40;
@@ -29,6 +33,66 @@ pub fn step_target(ids: &[i64], current_id: i64, delta: isize) -> Option<i64> {
     let i = ids.iter().position(|&id| id == current_id)?;
     let j = i.checked_add_signed(delta)?;
     ids.get(j).copied()
+}
+
+/// The strip as the view draws it: fixed-width frames in a row, `gap` apart, inside
+/// `padding` on either side. The view lays the frames out with these numbers, so where a
+/// frame sits follows from its index.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct StripLayout {
+    /// A frame's outer width (border included).
+    pub frame: f32,
+    pub gap: f32,
+    /// The strip's horizontal padding, each side.
+    pub padding: f32,
+}
+
+/// The GPUI strip: 72 px frames, 4 px apart (React's `gap: 4px`), 12 px padding.
+pub const STRIP_LAYOUT: StripLayout = StripLayout { frame: 72.0, gap: 4.0, padding: 12.0 };
+
+impl StripLayout {
+    /// The left edge of frame `index`, from the strip's left edge when it is not scrolled.
+    pub fn frame_left(&self, index: usize) -> f32 {
+        self.padding + index as f32 * (self.frame + self.gap)
+    }
+
+    /// Everything the strip scrolls over for `count` frames, padding included.
+    pub fn content_width(&self, count: usize) -> f32 {
+        let gaps = count.saturating_sub(1) as f32 * self.gap;
+        2.0 * self.padding + count as f32 * self.frame + gaps
+    }
+
+    /// How far to scroll so frame `index` of `count` is centred in a `viewport`-wide strip
+    /// ([`centred_scroll`]).
+    pub fn centre(&self, index: usize, count: usize, viewport: f32) -> f32 {
+        centred_scroll(self.frame_left(index), self.frame, self.content_width(count), viewport)
+    }
+}
+
+/// `scrollIntoView({ inline: "center" })` along one axis: the scroll position that puts an
+/// item's centre on the viewport's centre, clamped to what the content allows — at the
+/// start of the strip it stays at 0, at the end at `content − viewport`, and a strip that
+/// fits does not scroll at all.
+pub fn centred_scroll(item_left: f32, item_width: f32, content: f32, viewport: f32) -> f32 {
+    let max = (content - viewport).max(0.0);
+    (item_left + item_width / 2.0 - viewport / 2.0).clamp(0.0, max)
+}
+
+/// The look a frame shows: the photo's cover version and that cover's revision — bumped by
+/// every change to the version's settings, a new cover, or the cover taken off — as the
+/// row's cover token `"<version>:<rev>"` names it. `Filmstrip.tsx` put the token in the
+/// thumbnail URL, so any change asked for the thumbnail again.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct CoverLook {
+    pub version: i64,
+    pub rev: i64,
+}
+
+/// The look a row's cover token names; `None` (the plain thumbnail) for no token. The
+/// catalog writes `"<version>:<rev>"` or nothing, so anything else is read as no cover.
+pub fn cover_look(token: Option<&str>) -> Option<CoverLook> {
+    let (version, rev) = token?.split_once(':')?;
+    Some(CoverLook { version: version.parse().ok()?, rev: rev.parse().ok()? })
 }
 
 /// What has keyboard focus when an arrow key arrives. The TS version inspected the DOM
@@ -92,5 +156,42 @@ mod tests {
         assert!(arrows_belong_to_target(Some(KeyTarget::ContentEditable)));
         assert!(!arrows_belong_to_target(Some(KeyTarget::Other)));
         assert!(!arrows_belong_to_target(None));
+    }
+
+    // --- #134: centring and cover looks (no TS cases: the DOM did both) ---
+
+    #[test]
+    fn centring_puts_the_frame_in_the_middle() {
+        // A 400 px strip over 1000 px of content: a frame at 480..520 is centred at 300.
+        assert_eq!(centred_scroll(480.0, 40.0, 1000.0, 400.0), 300.0);
+    }
+
+    #[test]
+    fn centring_is_clamped_at_both_ends_and_a_strip_that_fits_does_not_scroll() {
+        assert_eq!(centred_scroll(12.0, 72.0, 1000.0, 400.0), 0.0, "the first frame: the start");
+        assert_eq!(centred_scroll(916.0, 72.0, 1000.0, 400.0), 600.0, "the last frame: the end");
+        assert_eq!(centred_scroll(200.0, 72.0, 300.0, 400.0), 0.0, "no overflow, no scroll");
+    }
+
+    #[test]
+    fn the_layout_places_frames_by_index() {
+        let l = StripLayout { frame: 72.0, gap: 4.0, padding: 12.0 };
+        assert_eq!(l.frame_left(0), 12.0);
+        assert_eq!(l.frame_left(3), 12.0 + 3.0 * 76.0);
+        assert_eq!(l.content_width(3), 24.0 + 3.0 * 72.0 + 2.0 * 4.0);
+        assert_eq!(l.content_width(0), 24.0);
+        // 30 frames (2300 px) in 1000 px: frame 15's centre minus half the viewport.
+        assert_eq!(l.centre(15, 30, 1000.0), 12.0 + 15.0 * 76.0 + 36.0 - 500.0);
+        assert_eq!(l.centre(0, 30, 1000.0), 0.0);
+        assert_eq!(l.centre(29, 30, 1000.0), l.content_width(30) - 1000.0);
+    }
+
+    #[test]
+    fn a_cover_token_names_the_version_and_its_revision() {
+        assert_eq!(cover_look(Some("12:3")), Some(CoverLook { version: 12, rev: 3 }));
+        assert_eq!(cover_look(None), None);
+        assert_eq!(cover_look(Some("12")), None);
+        assert_eq!(cover_look(Some("x:3")), None);
+        assert_ne!(cover_look(Some("12:3")), cover_look(Some("12:4")), "a new revision is a new look");
     }
 }

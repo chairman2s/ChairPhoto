@@ -18,7 +18,9 @@ use chairphoto_core::develop_source::DevelopSource;
 use chairphoto_core::image_pool::{EditJob, JobKey};
 use chairphoto_core::plugins::edit::SourceToken;
 use chairphoto_model::darkroom::controls::ToneKey;
-use chairphoto_model::darkroom::filmstrip::KeyTarget;
+use crate::image_store::{ImageState, Look};
+use chairphoto_core::image_pool::ImageKind;
+use chairphoto_model::darkroom::filmstrip::{CoverLook, KeyTarget, STRIP_LAYOUT};
 use chairphoto_model::editing::parse_edit;
 use chairphoto_model::library::session::SelectMods;
 use gpui_kit::component::slider::{SliderEvent, SliderValue};
@@ -124,6 +126,11 @@ fn advance(cx: &mut TestAppContext, d: Duration) {
 /// A catalog of `n` photos, the first active, the Darkroom opened on it with the rail's
 /// Develop, and its first reads answered.
 fn rig(tag: &str, n: usize, cx: &mut TestAppContext) -> Rig {
+    rig_with(tag, n, |_, _| {}, cx)
+}
+
+/// [`rig`], with `before` run on the Library before Develop opens.
+fn rig_with(tag: &str, n: usize, before: impl FnOnce(&Rig, &mut TestAppContext), cx: &mut TestAppContext) -> Rig {
     let dir = TempDir::new(tag);
     // The image layer shares the hand-driven pool: the proof sheet, duel and preset cards
     // render through it.
@@ -140,6 +147,7 @@ fn rig(tag: &str, n: usize, cx: &mut TestAppContext) -> Rig {
     let first = rig.ids[0];
     rig.app.wired.shell.update(cx, |s, cx| s.select_with(cx, |l| l.select(first, SelectMods::default())));
     cx.run_until_parked();
+    before(&rig, cx);
     click(&rig.app, "rail-develop", cx);
     work(cx);
     rig
@@ -1458,4 +1466,353 @@ fn enter_on_the_proof_sheet_adopts_the_focused_proof_and_the_backdrop_click_decl
     cx.run_until_parked();
     assert!(sheet_of(&rig, cx).is_none(), "the backdrop click declines");
     assert_eq!(rig.working(cx), before);
+}
+
+// --- the filmstrip: centring and cover looks (#134) -------------------------------------------
+
+/// The Library's order of the rig's photos.
+fn order(rig: &Rig, cx: &mut TestAppContext) -> Vec<i64> {
+    rig.app.wired.shell.read_with(cx, |s, _| s.library.photo_ids())
+}
+
+/// Make `photo` the active one from outside the Darkroom (the Library's selection), as a
+/// pop-out loupe or any other surface would.
+fn select(rig: &Rig, photo: i64, cx: &mut TestAppContext) {
+    rig.app.wired.shell.update(cx, |s, cx| s.select_with(cx, |l| l.select_single(photo)));
+    cx.run_until_parked();
+    work(cx);
+}
+
+/// Two frames: the first lays the strip out (its width is known from then on), the second
+/// is what the user sees.
+fn draw(rig: &Rig, cx: &mut TestAppContext) {
+    rig.render(cx);
+    cx.update_window(rig.app.window(), |_, window, cx| {
+        window.simulate_next_frame(cx);
+    })
+    .unwrap();
+    rig.render(cx);
+}
+
+/// Where the strip stands: its scroll offset (≤ 0), its left edge and width, how far it can
+/// scroll, and frame `index`'s laid-out left edge and width (unscrolled).
+struct StripAt {
+    offset: f32,
+    left: f32,
+    viewport: f32,
+    max: f32,
+    frame_left: f32,
+    frame_width: f32,
+}
+
+fn strip_at(rig: &Rig, index: usize, cx: &mut TestAppContext) -> StripAt {
+    let handle = rig.view(cx).read_with(cx, |v, _| v.strip_scroll().clone());
+    let frame = handle.bounds_for_item(index).expect("the frame was laid out");
+    StripAt {
+        offset: f32::from(handle.offset().x),
+        left: f32::from(handle.bounds().origin.x),
+        viewport: f32::from(handle.bounds().size.width),
+        max: f32::from(handle.max_offset().x),
+        frame_left: f32::from(frame.origin.x),
+        frame_width: f32::from(frame.size.width),
+    }
+}
+
+/// The current frame's centre sits on the strip's centre, as laid out and as scrolled.
+fn assert_centred(rig: &Rig, index: usize, count: usize, why: &str, cx: &mut TestAppContext) {
+    let at = strip_at(rig, index, cx);
+    assert!(at.max > 0.0, "the strip overflows (else nothing scrolls): {why}");
+    let centre = at.frame_left + at.offset + at.frame_width / 2.0;
+    let middle = at.left + at.viewport / 2.0;
+    assert!((centre - middle).abs() < 0.5, "{why}: frame centre {centre}, strip centre {middle}");
+    assert_eq!(-at.offset, STRIP_LAYOUT.centre(index, count, at.viewport), "{why}: the model's position");
+}
+
+/// Centring (`scrollIntoView({ inline: "center" })` per change of the current photo): the
+/// open photo's frame is in the strip's middle after an outside selection change, ← / →,
+/// and a click on a frame — and a strip scrolled by hand stays put until the photo changes.
+#[gpui_kit::test]
+fn the_strip_centres_the_open_photo_as_it_changes(cx: &mut TestAppContext) {
+    let rig = rig("dk-centre", 30, cx);
+    let order = order(&rig, cx);
+    let n = order.len();
+
+    select(&rig, order[15], cx);
+    draw(&rig, cx);
+    assert_eq!(rig.open_photo(cx), Some(order[15]));
+    assert_centred(&rig, 15, n, "an outside selection change", cx);
+
+    cx.update_window(rig.app.window(), |_, window, cx| window.press("right", cx)).unwrap();
+    cx.run_until_parked();
+    work(cx);
+    draw(&rig, cx);
+    assert_eq!(rig.open_photo(cx), Some(order[16]));
+    assert_centred(&rig, 16, n, "→", cx);
+
+    let id = gpui_kit::SharedString::from(format!("dk-strip-{}", order[14]));
+    cx.update_window(rig.app.window(), |_, window, cx| window.click(id, cx)).unwrap();
+    cx.run_until_parked();
+    work(cx);
+    draw(&rig, cx);
+    assert_eq!(rig.open_photo(cx), Some(order[14]));
+    assert_centred(&rig, 14, n, "a click on a frame", cx);
+
+    // Scrolled by hand: a redraw with the same photo leaves it there.
+    let handle = rig.view(cx).read_with(cx, |v, _| v.strip_scroll().clone());
+    handle.set_offset(gpui_kit::point(gpui_kit::px(-10.), gpui_kit::px(0.)));
+    draw(&rig, cx);
+    assert_eq!(strip_at(&rig, 14, cx).offset, -10.0, "the same photo does not re-centre");
+    select(&rig, order[20], cx);
+    draw(&rig, cx);
+    assert_centred(&rig, 20, n, "the next change centres again", cx);
+}
+
+/// At the strip's ends the position is clamped: the last photo leaves the strip scrolled to
+/// its end, the second to its start (neither centred past the content).
+#[gpui_kit::test]
+fn the_strip_is_clamped_at_its_ends(cx: &mut TestAppContext) {
+    let rig = rig("dk-clamp", 30, cx);
+    let order = order(&rig, cx);
+    let n = order.len();
+
+    select(&rig, order[n - 1], cx);
+    draw(&rig, cx);
+    let at = strip_at(&rig, n - 1, cx);
+    assert!(at.max > 0.0);
+    assert_eq!(-at.offset, at.max, "the last photo: scrolled to the end");
+    assert!(at.frame_left + at.offset + at.frame_width / 2.0 > at.left + at.viewport / 2.0, "not centred: clamped");
+    assert_eq!(STRIP_LAYOUT.centre(n - 1, n, at.viewport), at.max, "the model clamps to the same end");
+
+    select(&rig, order[1], cx);
+    draw(&rig, cx);
+    let at = strip_at(&rig, 1, cx);
+    assert_eq!(at.offset, 0.0, "the second photo: at the start");
+    assert!(at.frame_left + at.frame_width / 2.0 < at.left + at.viewport / 2.0, "not centred: clamped");
+}
+
+/// The Thumb jobs for `photo` submitted so far.
+fn thumb_jobs(rig: &Rig, photo: i64) -> usize {
+    let key = JobKey::photo(photo, ImageKind::Thumb);
+    rig.pool.batches.lock().unwrap().iter().flatten().filter(|k| **k == key).count()
+}
+
+fn look(rig: &Rig, photo: i64, cx: &mut TestAppContext) -> Option<Look> {
+    rig.app.wired.images.read_with(cx, |s, _| s.look(photo))
+}
+
+fn image(rig: &Rig, photo: i64, cx: &mut TestAppContext) -> ImageState {
+    rig.app.wired.images.read_with(cx, |s, _| s.peek(photo, ImageKind::Thumb))
+}
+
+fn stale_dropped(rig: &Rig, cx: &mut TestAppContext) -> u64 {
+    rig.app.wired.images.read_with(cx, |s, _| s.stats().stale_dropped)
+}
+
+fn refresh_rows(rig: &Rig, cx: &mut TestAppContext) {
+    rig.app.wired.shell.update(cx, |s, cx| s.refresh_rows(cx));
+    cx.run_until_parked();
+}
+
+/// A frame shows its photo's cover look, asked for under the row's cover token — (photo,
+/// cover version, revision) in the catalog the rows came from: a new cover or a new revision
+/// of it asks again, the same look asks nothing.
+#[gpui_kit::test]
+fn a_frame_asks_for_the_cover_look_its_row_names(cx: &mut TestAppContext) {
+    let rig = rig("dk-cover", 3, cx);
+    let photo = order(&rig, cx)[1];
+    let from = rig.app.wired.shell.read_with(cx, |s, _| s.rows_from()).unwrap();
+    assert_eq!(look(&rig, photo, cx), Some(Look { from, cover: None }), "no cover: the plain thumbnail");
+    let jobs = thumb_jobs(&rig, photo);
+    assert!(jobs >= 1, "the frame was asked for");
+    // The photo's preview (the loupe's tier) is cached: a cover does not change it.
+    let images = rig.app.wired.images.clone();
+    images.update(cx, |s, _| s.request(photo, ImageKind::Preview));
+    rig.pool.finish(&JobKey::photo(photo, ImageKind::Preview), Ok(pixels(4, 4)));
+    cx.run_until_parked();
+    let preview_ready = |cx: &mut TestAppContext| {
+        matches!(images.read_with(cx, |s, _| s.peek(photo, ImageKind::Preview)), ImageState::Ready(_))
+    };
+    assert!(preview_ready(cx));
+
+    let version = rig.catalog(|c| {
+        let v = c.create_version(photo, "Warm").unwrap();
+        c.set_cover_version(photo, Some(v)).unwrap();
+        v
+    });
+    refresh_rows(&rig, cx);
+    assert_eq!(look(&rig, photo, cx), Some(Look { from, cover: Some(CoverLook { version, rev: 0 }) }));
+    assert_eq!(thumb_jobs(&rig, photo), jobs + 1, "a new cover: asked again");
+    assert!(preview_ready(cx), "only the thumbnail shows the cover: the preview stays");
+
+    refresh_rows(&rig, cx);
+    assert_eq!(thumb_jobs(&rig, photo), jobs + 1, "the same look: nothing asked");
+
+    // The cover version's settings change: its revision moves.
+    rig.catalog(|c| c.set_version_edit(version, r#"{"tone":{"ev":1}}"#).unwrap());
+    refresh_rows(&rig, cx);
+    assert_eq!(look(&rig, photo, cx).unwrap().cover, Some(CoverLook { version, rev: 1 }));
+    assert_eq!(thumb_jobs(&rig, photo), jobs + 2, "a new revision: asked again");
+}
+
+/// A thumbnail the Library cached with no look said may be an older cover's (the grid's
+/// tier does not follow the token): the strip renders it again for the look its row names.
+#[gpui_kit::test]
+fn a_thumbnail_cached_with_no_look_is_rendered_again(cx: &mut TestAppContext) {
+    let mut jobs_before = 0;
+    let rig = rig_with(
+        "dk-cover-unknown",
+        3,
+        |rig, cx| {
+            let photo = order(rig, cx)[1];
+            rig.app.wired.images.update(cx, |s, _| s.request(photo, ImageKind::Thumb));
+            rig.pool.finish(&JobKey::photo(photo, ImageKind::Thumb), Ok(pixels(4, 4)));
+            cx.run_until_parked();
+            assert!(matches!(image(rig, photo, cx), ImageState::Ready(_)), "cached by the Library");
+            rig.catalog(|c| {
+                let v = c.create_version(photo, "Warm").unwrap();
+                c.set_cover_version(photo, Some(v)).unwrap();
+            });
+            refresh_rows(rig, cx);
+            jobs_before = thumb_jobs(rig, photo);
+        },
+        cx,
+    );
+    let photo = order(&rig, cx)[1];
+    assert!(look(&rig, photo, cx).unwrap().cover.is_some());
+    assert_eq!(thumb_jobs(&rig, photo), jobs_before + 1, "rendered again for the row's look");
+    assert!(!matches!(image(&rig, photo, cx), ImageState::Ready(_)), "the cached one is not shown");
+    rig.pool.finish(&JobKey::photo(photo, ImageKind::Thumb), Ok(pixels(4, 4)));
+    cx.run_until_parked();
+    assert!(matches!(image(&rig, photo, cx), ImageState::Ready(_)));
+}
+
+/// A render for an earlier look, already running when the row's look changed, answers
+/// late: it is dropped — never shown — and the new look is rendered after it.
+#[gpui_kit::test]
+fn a_result_for_an_earlier_look_is_dropped(cx: &mut TestAppContext) {
+    let rig = rig("dk-cover-stale", 3, cx);
+    let photo = order(&rig, cx)[1];
+    let key = JobKey::photo(photo, ImageKind::Thumb);
+    rig.pool.start(key.clone()); // on a worker: it cannot be cancelled
+    let jobs = thumb_jobs(&rig, photo);
+
+    rig.catalog(|c| {
+        let v = c.create_version(photo, "Warm").unwrap();
+        c.set_cover_version(photo, Some(v)).unwrap();
+    });
+    refresh_rows(&rig, cx);
+    assert_eq!(thumb_jobs(&rig, photo), jobs, "the new look waits for the running render");
+    let dropped = stale_dropped(&rig, cx);
+
+    rig.pool.finish(&key, Ok(pixels(4, 4)));
+    cx.run_until_parked();
+    assert!(!matches!(image(&rig, photo, cx), ImageState::Ready(_)), "the earlier look is not shown");
+    assert_eq!(stale_dropped(&rig, cx), dropped + 1);
+    assert_eq!(thumb_jobs(&rig, photo), jobs + 1, "then the new look is asked for");
+
+    rig.pool.finish(&key, Ok(pixels(4, 4)));
+    cx.run_until_parked();
+    assert!(matches!(image(&rig, photo, cx), ImageState::Ready(_)), "the new look lands");
+}
+
+/// A photo that leaves the strip's window (±40 around the open one) is let go: its pending
+/// frame is released, and its late answer is dropped.
+#[gpui_kit::test]
+fn a_frame_that_leaves_the_strip_is_released(cx: &mut TestAppContext) {
+    let rig = rig("dk-cover-window", 43, cx);
+    let order = order(&rig, cx);
+    select(&rig, order[40], cx);
+    let first = order[0];
+    let pending = |rig: &Rig, cx: &mut TestAppContext| rig.app.wired.images.read_with(cx, |s, _| s.is_pending(first, ImageKind::Thumb));
+    assert!(pending(&rig, cx), "in the window");
+    let key = JobKey::photo(first, ImageKind::Thumb);
+    rig.pool.start(key.clone());
+
+    select(&rig, order[41], cx);
+    assert!(!pending(&rig, cx), "out of the window: released");
+    let dropped = stale_dropped(&rig, cx);
+    rig.pool.finish(&key, Ok(pixels(4, 4)));
+    cx.run_until_parked();
+    assert!(!matches!(image(&rig, first, cx), ImageState::Ready(_)));
+    assert_eq!(stale_dropped(&rig, cx), dropped + 1);
+}
+
+/// **Catalog identity** (map #92). Catalog B's photo and cover carry the same ids and the
+/// same cover token as the frame's. The core switches while the frame's render is running:
+/// - `catalog:switched` withheld: the render answers in B — refused on the worker, never
+///   shown under A's row; then the event arrives and B's thumbnail lands fresh.
+/// - delivered first: the store forgets A; the late answer is dropped; Develop on B asks
+///   for B's look again.
+fn cover_look_across_a_switch(delivered: bool, cx: &mut TestAppContext) {
+    let rig = rig(if delivered { "dk-cover-switch-ev" } else { "dk-cover-switch" }, 2, cx);
+    let photo = order(&rig, cx)[1];
+    let a = rig.app.wired.shell.read_with(cx, |s, _| s.rows_from()).unwrap();
+    let version = rig.catalog(|c| {
+        let v = c.create_version(photo, "A's").unwrap();
+        c.set_cover_version(photo, Some(v)).unwrap();
+        v
+    });
+    refresh_rows(&rig, cx);
+    let cover = Some(CoverLook { version, rev: 0 });
+    assert_eq!(look(&rig, photo, cx), Some(Look { from: a, cover }));
+    let key = JobKey::photo(photo, ImageKind::Thumb);
+    rig.pool.start(key.clone());
+
+    let (b, b_ids) = colliding_catalog(&rig.dir, "b", 2);
+    let b_version = b.create_version(b_ids[1], "B's").unwrap();
+    let token = b.set_cover_version(b_ids[1], Some(b_version)).unwrap();
+    assert_eq!((b_ids[1], token), (photo, Some(format!("{version}:0"))), "the ids and the token collide");
+    core_switch(&rig.app, b);
+
+    if !delivered {
+        rig.pool.finish(&key, Ok(pixels(4, 4)));
+        cx.run_until_parked();
+        match image(&rig, photo, cx) {
+            ImageState::Failed(e) => assert_eq!(e.as_ref(), CATALOG_CHANGED),
+            ImageState::Ready(_) => panic!("B's pixels were shown under A's row"),
+            _ => panic!("the refused render is an error"),
+        }
+        crate::tests::deliver_switch(&rig.app, cx);
+        work(cx);
+        assert_eq!(rig.surface(cx), Surface::Library);
+        assert_eq!(look(&rig, photo, cx), None, "the switch forgot A's looks");
+        // The Library asks for B's thumbnail: not bound to A, so it lands.
+        rig.render(cx);
+        rig.pool.finish(&key, Ok(pixels(4, 4)));
+        cx.run_until_parked();
+        assert!(matches!(image(&rig, photo, cx), ImageState::Ready(_)), "B's thumbnail lands");
+    } else {
+        crate::tests::deliver_switch(&rig.app, cx);
+        work(cx);
+        assert_eq!(rig.surface(cx), Surface::Library);
+        assert_eq!(look(&rig, photo, cx), None, "the switch forgot A's looks");
+        let dropped = stale_dropped(&rig, cx);
+        rig.pool.finish(&key, Ok(pixels(4, 4)));
+        cx.run_until_parked();
+        assert_eq!(stale_dropped(&rig, cx), dropped + 1, "A's answer dropped");
+        assert!(!matches!(image(&rig, photo, cx), ImageState::Ready(_)));
+
+        // Develop on B's photo: its frame asks for B's look, from B.
+        let b = rig.app.wired.shell.read_with(cx, |s, _| s.rows_from()).unwrap();
+        assert_ne!(a, b);
+        let first = order(&rig, cx)[0];
+        select(&rig, first, cx);
+        rig.app.wired.shell.update(cx, |s, cx| s.open_develop(cx));
+        cx.run_until_parked();
+        work(cx);
+        assert_eq!(look(&rig, photo, cx), Some(Look { from: b, cover }));
+        rig.pool.finish(&key, Ok(pixels(4, 4)));
+        cx.run_until_parked();
+        assert!(matches!(image(&rig, photo, cx), ImageState::Ready(_)), "B's look lands");
+    }
+}
+
+#[gpui_kit::test]
+fn a_cover_look_never_shows_the_new_catalog_before_the_switch_event(cx: &mut TestAppContext) {
+    cover_look_across_a_switch(false, cx);
+}
+
+#[gpui_kit::test]
+fn a_cover_look_never_shows_the_old_catalog_after_the_switch_event(cx: &mut TestAppContext) {
+    cover_look_across_a_switch(true, cx);
 }

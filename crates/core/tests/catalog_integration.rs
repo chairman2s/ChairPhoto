@@ -573,6 +573,94 @@ fn a_row_holding_a_pre_141_non_uuid_identity_survives_its_file_moving() {
     assert_eq!(paths[1].0, "c/y.jpg");
 }
 
+/// Issue #146 (L5): a UUID is one identity in either case. A sidecar spelling it upper-case
+/// is bound to the lowercase row, leads a moved file back to it, and is never rewritten;
+/// a new file's upper-case identity is stored lowercase; a deep link finds it either way.
+#[test]
+fn an_upper_case_sidecar_uuid_is_the_lowercase_rows_identity() {
+    let (catalog, root) = temp_catalog("uppercase-identity");
+    let abort = chairphoto_core::scanner::never_abort();
+    let original = root.join("a/x.jpg");
+    std::fs::create_dir_all(original.parent().unwrap()).unwrap();
+    std::fs::write(&original, b"notarealjpeg").unwrap();
+    chairphoto_core::scanner::scan_folder(&catalog, &root, &abort, &|_| {}).unwrap();
+    let row = catalog.list_photos(&PhotoQuery::default()).unwrap().remove(0);
+    let upper = row.uuid.to_ascii_uppercase();
+    assert_ne!(upper, row.uuid);
+    // Another tool rewrites the identity upper-case.
+    chairphoto_core::xmp::write_identifier(&original, &upper).unwrap();
+
+    // The file moves; the scan finds its row, binds it, and leaves the sidecar's spelling.
+    let moved = root.join("b/x.jpg");
+    std::fs::create_dir_all(moved.parent().unwrap()).unwrap();
+    std::fs::rename(&original, &moved).unwrap();
+    std::fs::rename(
+        chairphoto_core::xmp::sidecar_path(&original),
+        chairphoto_core::xmp::sidecar_path(&moved),
+    )
+    .unwrap();
+    chairphoto_core::scanner::scan_folder(&catalog, &root, &abort, &|_| {}).unwrap();
+    let visible = catalog.list_photos(&PhotoQuery::default()).unwrap();
+    assert_eq!(visible.len(), 1, "{visible:?}");
+    assert_eq!((visible[0].id, visible[0].path.as_str(), visible[0].uuid.as_str()),
+        (row.id, "b/x.jpg", row.uuid.as_str()));
+    assert!(catalog.list_pending_identity().unwrap().is_empty(), "an identity in another case is no conflict");
+    assert_eq!(chairphoto_core::xmp::read_identifier(&moved).as_deref(), Some(upper.as_str()));
+    assert_eq!(catalog.get_photo_by_uuid(&upper).unwrap().id, row.id);
+
+    // A file new to this catalog whose sidecar spells its identity upper-case.
+    const ARRIVING: &str = "6F1C1F0E-2B7A-4C3D-9E8F-0A1B2C3D4E5F";
+    let arriving = root.join("c/y.jpg");
+    std::fs::create_dir_all(arriving.parent().unwrap()).unwrap();
+    std::fs::write(&arriving, b"notarealjpeg").unwrap();
+    chairphoto_core::xmp::write_identifier(&arriving, ARRIVING).unwrap();
+    chairphoto_core::scanner::scan_folder(&catalog, &root, &abort, &|_| {}).unwrap();
+    let new_row = catalog.get_photo_by_uuid(&ARRIVING.to_ascii_lowercase()).unwrap();
+    assert_eq!(new_row.uuid, ARRIVING.to_ascii_lowercase());
+    assert!(catalog.list_pending_identity().unwrap().is_empty());
+    assert_eq!(chairphoto_core::xmp::read_identifier(&arriving).as_deref(), Some(ARRIVING));
+}
+
+/// Issue #146 (L5): schema v24 stores every identity lowercase. A row whose lowercase
+/// spelling another row already holds cannot take it; it is re-minted and its copy queued as
+/// a conflict for a person, like any copy whose sidecar carries another photo's identity.
+#[test]
+fn schema_v24_lowercases_identities_and_re_mints_a_collision() {
+    let (catalog, root) = temp_catalog("v24-lowercase");
+    let mut ids = Vec::new();
+    for name in ["a.jpg", "b.jpg", "c.jpg"] {
+        std::fs::write(root.join(name), b"notarealjpeg").unwrap();
+        ids.push(catalog.upsert_photo(&root.join(name), None, 1, 1).unwrap().id);
+    }
+    const SHARED: &str = "6f1c1f0e-2b7a-4c3d-9e8f-0a1b2c3d4e5f";
+    const ALONE: &str = "0d9c8b7a-6f5e-4d3c-8b2a-190807060504";
+    let shared_upper = SHARED.to_ascii_uppercase();
+    let alone_upper = ALONE.to_ascii_uppercase();
+    let set = |id: i64, uuid: &str| {
+        catalog
+            .conn()
+            .execute("UPDATE photos SET uuid = ?1 WHERE id = ?2", rusqlite::params![uuid, id])
+            .unwrap();
+    };
+    set(ids[0], SHARED);
+    set(ids[1], &shared_upper);
+    set(ids[2], &alone_upper);
+    catalog.set_setting("schema_version", "23").unwrap();
+    let db = catalog.db_path().to_path_buf();
+    drop(catalog);
+    let catalog = Catalog::open(&db, &root).unwrap();
+
+    let uuid = |id: i64| catalog.get_photo(id).unwrap().uuid;
+    assert_eq!(uuid(ids[0]), SHARED, "the row already lowercase keeps its identity");
+    assert_eq!(uuid(ids[2]), ALONE, "an upper-case identity nobody else holds is lowercased");
+    let reminted = uuid(ids[1]);
+    assert!(chairphoto_core::catalog::is_photo_identity(&reminted) && reminted != SHARED, "{reminted}");
+    let pending = catalog.list_pending_identity().unwrap();
+    assert_eq!(pending.len(), 1, "{pending:#?}");
+    assert_eq!((pending[0].photo_id, pending[0].state.as_str()), (ids[1], "conflict"));
+    assert!(pending[0].error.contains(&shared_upper), "{}", pending[0].error);
+}
+
 #[test]
 fn culling_round_trips() {
     let (catalog, root) = temp_catalog("culling");

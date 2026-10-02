@@ -37,10 +37,11 @@ mod performance_harness;
 
 pub use facets::{Facet, SOFT_THRESHOLD_DEFAULT, SOFT_THRESHOLD_KEY};
 pub use identity::{
-    bind_sidecar_identity, is_photo_identity, IdentityConflictAction, IdentityConflictOutcome, IdentityRepairCursor,
+    bind_sidecar_identity, canonical_photo_identity, is_photo_identity, IdentityConflictAction, IdentityConflictOutcome, IdentityRepairCursor,
     IdentityRepairPlan, IdentityRepairSummary, PendingIdentity, PendingIdentityField,
     PendingIdentityRow, PendingIdentitySummary, SidecarIdentity,
 };
+pub(crate) use identity::photo_identity_key;
 pub use locations::{PathCandidate, ResolveMode};
 pub use lifecycle::{
     carry_companions, copy_and_verify, copy_with_companions, verify_and_delete_locals, BackupPlan,
@@ -426,6 +427,11 @@ impl Catalog {
             // `dismissed_at` column, both established above.
             self.remint_non_identity_photos()?;
         }
+        if prior_version < 24 {
+            // #146 L5: an identity is stored lowercase. After v23, so every row it sees
+            // that is not a UUID has already been re-minted.
+            self.canonicalise_photo_identities()?;
+        }
         // Keep the catalog-root (local) volume pointing at the current root, so
         // re-rooting the catalog moves it too.
         self.sync_default_volume_root()?;
@@ -681,7 +687,8 @@ impl Catalog {
     /// adopts the sidecar UUID if one was supplied, else mints a fresh one.
     ///
     /// `sidecar_uuid` is trusted as an identity: a caller that read it from a sidecar passes
-    /// it only if [`is_photo_identity`] accepts it (#141).
+    /// it only if [`is_photo_identity`] accepts it (#141). A UUID is matched and stored in
+    /// its canonical lowercase spelling (#146), whatever case the sidecar wrote it in.
     pub fn upsert_photo_with_identity(
         &self,
         absolute_path: &Path,
@@ -690,6 +697,8 @@ impl Catalog {
         size: i64,
         sidecar_uuid: Option<&str>,
     ) -> Result<UpsertResult> {
+        let sidecar_uuid = sidecar_uuid.map(identity::photo_identity_key);
+        let sidecar_uuid = sidecar_uuid.as_deref();
         let rel = self.to_relative(absolute_path)?;
         let extension = absolute_path
             .extension()
@@ -779,7 +788,8 @@ impl Catalog {
     /// volume+path, then by sidecar UUID, else creates a new row (folder_id null — it's
     /// not under an indexed local folder). See `scanner::scan_external_folder`.
     ///
-    /// `sidecar_uuid` is trusted as an identity, as in [`Self::upsert_photo_with_identity`].
+    /// `sidecar_uuid` is trusted as an identity, and canonicalised, as in
+    /// [`Self::upsert_photo_with_identity`].
     pub fn upsert_photo_on_volume(
         &self,
         absolute: &Path,
@@ -787,6 +797,8 @@ impl Catalog {
         size: i64,
         sidecar_uuid: Option<&str>,
     ) -> Result<UpsertResult> {
+        let sidecar_uuid = sidecar_uuid.map(identity::photo_identity_key);
+        let sidecar_uuid = sidecar_uuid.as_deref();
         let (volume_id, rel) = self.volume_for_path(absolute)?;
         let extension = absolute
             .extension()
@@ -880,7 +892,7 @@ impl Catalog {
                     "SELECT {cols} FROM photos WHERE uuid = ?1",
                     cols = query::photo_columns("photos")
                 ),
-                params![uuid],
+                params![identity::photo_identity_key(uuid)],
                 row_to_photo,
             )
             .optional()?
@@ -895,6 +907,7 @@ impl Catalog {
             return Ok(0);
         }
         const CHUNK: usize = 999;
+        let uuids: Vec<String> = uuids.iter().map(|u| identity::photo_identity_key(u)).collect();
         let mut total: usize = 0;
         for chunk in uuids.chunks(CHUNK) {
             // Build the parameterised placeholder list: (?1,?2,…,?N).

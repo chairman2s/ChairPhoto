@@ -147,6 +147,13 @@ only when no other row holds it and every copy the row records is gone (present 
 file; an unmounted volume does not count). Otherwise the file is a different photo and gets
 its own row, as above. The legacy value is never a merge key or a deep-link target.
 
+A UUID is one identity in either case. `photos.uuid` holds it lowercase, as ChairPhoto mints
+it (`catalog::canonical_photo_identity`): a scan, a bundle import, a merge, Adopt and a deep
+link all canonicalise before they store or look up, and schema v24 lowercased the rows an
+older scan stored as the sidecar spelled them. A sidecar that spells the identity upper-case
+is bound as it is and never rewritten for the case alone. If lowercasing a row would give it
+another row's identity, v24 re-mints it instead and queues its copies as conflicts.
+
 **Adopt changes what merge matches on.** Identity is the merge key (`merge_photo` looks up
 `photos WHERE uuid = ?`), so a catalog that has already been merged or bundled elsewhere
 holds the *previous* identity for that photo:

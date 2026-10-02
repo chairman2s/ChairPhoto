@@ -273,12 +273,16 @@ impl MergeCtx<'_> {
 
     /// Merge one photo: insert it with full state if the uuid is new, else leave the
     /// existing row untouched. Either way, union its tag assignments.
+    ///
+    /// A UUID is matched in its canonical lowercase spelling (#146), so a bundle that carries
+    /// it in another case still finds the photo.
     fn merge_photo(&mut self, photo: &BundlePhoto, batch_id: i64) -> Result<()> {
+        let uuid = super::identity::photo_identity_key(&photo.uuid);
         let existing: Option<i64> = self
             .tx
             .query_row(
                 "SELECT id FROM photos WHERE uuid = ?1",
-                params![photo.uuid],
+                params![uuid],
                 |r| r.get(0),
             )
             .optional()?;
@@ -290,7 +294,7 @@ impl MergeCtx<'_> {
                 id
             }
             None => {
-                let id = self.insert_photo(photo, batch_id)?;
+                let id = self.insert_photo(photo, &uuid, batch_id)?;
                 self.summary.photos_added += 1;
                 id
             }
@@ -303,7 +307,7 @@ impl MergeCtx<'_> {
     /// Insert a brand-new photo row carrying the bundle's uuid and full non-destructive
     /// state (rating/label/pick/IPTC + edit record + versions). No location is recorded
     /// — placing the bytes and recording where they live is the importer's job (F1d).
-    fn insert_photo(&mut self, photo: &BundlePhoto, batch_id: i64) -> Result<i64> {
+    fn insert_photo(&mut self, photo: &BundlePhoto, uuid: &str, batch_id: i64) -> Result<i64> {
         let ts = now();
         let extension = std::path::Path::new(&photo.relative_path)
             .extension()
@@ -321,7 +325,7 @@ impl MergeCtx<'_> {
              VALUES(?1, ?2, NULL, 0, 0, ?3, 0, ?4, ?5, ?6, ?7,
                     ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?19)",
             params![
-                photo.uuid,
+                uuid,
                 photo.relative_path,
                 extension,
                 batch_id,
@@ -764,5 +768,37 @@ mod tests {
         assert_eq!(s.assignments_added, 1);
         let photo = cat.get_photo_by_uuid("photo-a").unwrap();
         assert_eq!(cat.get_photo_tags(photo.id).unwrap().len(), 1);
+    }
+
+    /// #146 (L5): merge matches a UUID in either case, and stores a new one lowercase.
+    #[test]
+    fn merge_matches_and_stores_an_identity_lowercase() {
+        let (cat, _root) = temp_catalog("identity-case");
+        const KNOWN: &str = "6f1c1f0e-2b7a-4c3d-9e8f-0a1b2c3d4e5f";
+        cat.conn()
+            .execute(
+                "INSERT INTO photos(uuid, path, mtime_ns, size, extension, created_at, updated_at)
+                 VALUES(?1, 'local/known.ARW', 1, 1, 'arw', 1, 1)",
+                params![KNOWN],
+            )
+            .unwrap();
+        let mut m = sample_manifest();
+        m.photos[0].uuid = KNOWN.to_ascii_uppercase();
+        let mut arriving = m.photos[0].clone();
+        arriving.uuid = "0D9C8B7A-6F5E-4D3C-8B2A-190807060504".into();
+        arriving.relative_path = "2026/06/28/DSC09999.ARW".into();
+        m.photos.push(arriving);
+
+        let s = cat.merge_bundle(&m).unwrap();
+        assert_eq!((s.photos_existing, s.photos_added), (1, 1));
+        let uuids: Vec<String> = cat
+            .conn()
+            .prepare("SELECT uuid FROM photos ORDER BY id")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(uuids, [KNOWN, "0d9c8b7a-6f5e-4d3c-8b2a-190807060504"]);
     }
 }

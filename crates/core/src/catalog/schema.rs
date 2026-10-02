@@ -5,7 +5,7 @@
 //!  2. Photo `path` is stored RELATIVE to the catalog root (see the
 //!     `catalog_root` setting), so a catalog can be remapped on import.
 
-pub const SCHEMA_VERSION: i64 = 23;
+pub const SCHEMA_VERSION: i64 = 24;
 
 pub const SCHEMA_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS settings (

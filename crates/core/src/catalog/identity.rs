@@ -180,6 +180,26 @@ pub fn is_photo_identity(value: &str) -> bool {
     value.len() == 36 && uuid::Uuid::parse_str(value).is_ok_and(|u| !u.is_nil())
 }
 
+/// `value` as `photos.uuid` holds it, when it is a photo identity: lowercase, as ChairPhoto
+/// mints it (#146 L5). [`is_photo_identity`] accepts either case, and another tool may
+/// upper-case a UUID it rewrites, so every place an identity enters the catalog or is looked
+/// up in it goes through here — otherwise one photo would read as two identities.
+pub fn canonical_photo_identity(value: &str) -> Option<String> {
+    is_photo_identity(value).then(|| value.to_ascii_lowercase())
+}
+
+/// `value` canonicalised if it is a photo identity, otherwise exactly as given — for keys
+/// that callers (and tests) may legitimately pass as something other than a UUID.
+pub(crate) fn photo_identity_key(value: &str) -> String {
+    canonical_photo_identity(value).unwrap_or_else(|| value.to_string())
+}
+
+/// True when a sidecar's `found` identifier is `uuid`, in either case. The sidecar is never
+/// rewritten just to change the case of an identity it already carries.
+fn carries_identity(found: &str, uuid: &str) -> bool {
+    found.eq_ignore_ascii_case(uuid)
+}
+
 /// Ensure the file's XMP sidecar carries `uuid`. Pure filesystem work — it touches no
 /// catalog and holds no lock, so it is safe to run on a blocking worker.
 ///
@@ -192,7 +212,7 @@ pub fn bind_sidecar_identity(
     found: Option<&str>,
 ) -> SidecarIdentity {
     match found {
-        Some(existing) if existing == uuid => SidecarIdentity::Bound,
+        Some(existing) if carries_identity(existing, uuid) => SidecarIdentity::Bound,
         Some(existing) => SidecarIdentity::Conflict(existing.to_string()),
         None => match crate::xmp::write_identifier(photo_path, uuid) {
             Ok(()) => SidecarIdentity::Bound,
@@ -1179,7 +1199,7 @@ impl Catalog {
                 )
             }));
         };
-        if found == catalog_uuid {
+        if carries_identity(&found, &catalog_uuid) {
             return Err(CatalogError::Validation(format!(
                 "{}'s sidecar already carries this photo's identity ({found}); the recorded \
                  conflict is stale — run a repair pass to clear it",
@@ -1193,19 +1213,19 @@ impl Catalog {
                 // A value that is not a UUID is another tool's identifier, not a photo
                 // identity (#141): adopting it would make `photos.uuid` something no merge,
                 // deep link or later scan treats as one.
-                if !is_photo_identity(&found) {
+                let Some(adopted) = canonical_photo_identity(&found) else {
                     return Err(CatalogError::Validation(format!(
                         "cannot adopt {found:?}: it is not a UUID, so it cannot be a photo's \
                          identity. Overwrite this copy's sidecar (it is backed up first), or \
                          Dismiss to leave it as it is"
                     )));
-                }
+                };
                 // Refuse BEFORE the write, naming the photo that already holds it. The
                 // `photos.uuid` UNIQUE constraint would also stop this, but only as an
                 // opaque SQL error where a stated precondition belongs (#32) — and
                 // "resolving one conflict manufactures another" is exactly the failure this
                 // check exists to prevent.
-                if let Some((other_id, other_path)) = self.photo_holding_uuid(&found, photo_id)? {
+                if let Some((other_id, other_path)) = self.photo_holding_uuid(&adopted, photo_id)? {
                     return Err(CatalogError::Validation(format!(
                         "cannot adopt {found}: photo {other_id} ({other_path}) already holds \
                          that identity, and no two photos may share one. Overwrite this \
@@ -1214,9 +1234,9 @@ impl Catalog {
                 }
                 self.conn.execute(
                     "UPDATE photos SET uuid = ?1, updated_at = ?2 WHERE id = ?3",
-                    params![found, now(), photo_id],
+                    params![adopted, now(), photo_id],
                 )?;
-                outcome.catalog_uuid = found.clone();
+                outcome.catalog_uuid = adopted.clone();
                 // This copy is bound by construction — its sidecar is where the identity
                 // came from.
                 self.record_sidecar_field_target(
@@ -1228,7 +1248,7 @@ impl Catalog {
                 )?;
                 outcome.rechecked_copies = self.recheck_other_copies_after_adopt(
                     photo_id,
-                    &found,
+                    &adopted,
                     volume_id,
                     relative_path,
                 )?;
@@ -1332,7 +1352,7 @@ impl Catalog {
             }
             let target = Path::new(&base_path).join(&relative_path);
             let outcome = match crate::xmp::read_identifier(&target) {
-                Some(found) if found == uuid => SidecarIdentity::Bound,
+                Some(found) if carries_identity(&found, uuid) => SidecarIdentity::Bound,
                 Some(found) => SidecarIdentity::Conflict(found),
                 None if !target.exists() => SidecarIdentity::Unreachable,
                 None => continue,
@@ -1435,8 +1455,8 @@ impl Catalog {
         let Some(found) = found else {
             return Ok(None);
         };
-        if is_photo_identity(found) {
-            return Ok(Some(found.to_string()));
+        if let Some(identity) = canonical_photo_identity(found) {
+            return Ok(Some(identity));
         }
         let owners: Vec<(i64, String)> = self
             .conn
@@ -1498,12 +1518,7 @@ impl Catalog {
             .query_map([], |r| Ok((r.get(0)?, r.get::<_, String>(1)?)))?
             .filter(|row| !matches!(row, Ok((_, uuid)) if is_photo_identity(uuid)))
             .collect::<rusqlite::Result<_>>()?;
-        let ts = now();
         for (photo_id, previous) in &stale {
-            self.conn.execute(
-                "UPDATE photos SET uuid = ?1, updated_at = ?2 WHERE id = ?3",
-                params![uuid::Uuid::new_v4().to_string(), ts, photo_id],
-            )?;
             // An empty value was never in any sidecar: such a copy simply owes the write,
             // which the repair pass does for a copy queued as not yet bound.
             let outcome = if previous.is_empty() {
@@ -1516,22 +1531,66 @@ impl Catalog {
                 )?;
                 SidecarIdentity::Conflict(previous.clone())
             };
-            let copies: Vec<(i64, String)> = self
-                .conn
-                .prepare("SELECT volume_id, relative_path FROM photo_locations WHERE photo_id = ?1")?
-                .query_map(params![photo_id], |r| Ok((r.get(0)?, r.get(1)?)))?
-                .collect::<rusqlite::Result<_>>()?;
-            for (volume_id, relative_path) in copies {
-                self.record_sidecar_field_target(
-                    *photo_id,
-                    SidecarField::Identifier,
-                    volume_id,
-                    &relative_path,
-                    &outcome,
+            self.remint_photo(*photo_id, &outcome)?;
+        }
+        Ok(stale.len())
+    }
+
+    /// Schema v24 (#146 L5): store every photo identity in its canonical lowercase spelling.
+    /// Returns how many rows changed.
+    ///
+    /// [`is_photo_identity`] accepts an upper-case UUID and a scan used to store it as the
+    /// sidecar spelled it, while every lookup — the scan's re-home, merge, deep links —
+    /// compares exactly. A sidecar that keeps the upper-case spelling stays bound: binding
+    /// compares without case.
+    ///
+    /// If the lowercase spelling is already another row's identity, the two rows claim one
+    /// identity and `photos.uuid` is `UNIQUE`. Which of them is that photo is not something
+    /// a migration can know, so the upper-case row is re-minted and its copies queued as a
+    /// conflict for a person, as [`Self::remint_non_identity_photos`] does.
+    pub(super) fn canonicalise_photo_identities(&self) -> Result<usize> {
+        let spelled: Vec<(i64, String)> = self
+            .conn
+            .prepare("SELECT id, uuid FROM photos WHERE uuid <> lower(uuid)")?
+            .query_map([], |r| Ok((r.get(0)?, r.get::<_, String>(1)?)))?
+            .filter(|row| !matches!(row, Ok((_, uuid)) if !is_photo_identity(uuid)))
+            .collect::<rusqlite::Result<_>>()?;
+        for (photo_id, spelling) in &spelled {
+            let canonical = spelling.to_ascii_lowercase();
+            if self.photo_holding_uuid(&canonical, *photo_id)?.is_some() {
+                self.remint_photo(*photo_id, &SidecarIdentity::Conflict(spelling.clone()))?;
+            } else {
+                self.conn.execute(
+                    "UPDATE photos SET uuid = ?1, updated_at = ?2 WHERE id = ?3",
+                    params![canonical, now(), photo_id],
                 )?;
             }
         }
-        Ok(stale.len())
+        Ok(spelled.len())
+    }
+
+    /// Give `photo_id` a minted UUID and record `outcome` for every copy it records, through
+    /// the queue's one writer. Touches no file.
+    fn remint_photo(&self, photo_id: i64, outcome: &SidecarIdentity) -> Result<()> {
+        self.conn.execute(
+            "UPDATE photos SET uuid = ?1, updated_at = ?2 WHERE id = ?3",
+            params![uuid::Uuid::new_v4().to_string(), now(), photo_id],
+        )?;
+        let copies: Vec<(i64, String)> = self
+            .conn
+            .prepare("SELECT volume_id, relative_path FROM photo_locations WHERE photo_id = ?1")?
+            .query_map(params![photo_id], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        for (volume_id, relative_path) in copies {
+            self.record_sidecar_field_target(
+                photo_id,
+                SidecarField::Identifier,
+                volume_id,
+                &relative_path,
+                outcome,
+            )?;
+        }
+        Ok(())
     }
 
     /// Drop the sidecar debt recorded for the primary copy a re-homed photo is leaving:
@@ -3208,6 +3267,11 @@ mod tests {
         assert_eq!(catalog.scan_identity(Some("dam:1")).unwrap(), Some(uuid.clone()));
 
         assert_eq!(catalog.scan_identity(Some(&uuid)).unwrap(), Some(uuid.clone()));
+        assert_eq!(
+            catalog.scan_identity(Some(&uuid.to_ascii_uppercase())).unwrap(),
+            Some(uuid.clone()),
+            "a UUID is answered in its canonical lowercase spelling (#146)"
+        );
         assert_eq!(catalog.scan_identity(Some("dam:2")).unwrap(), None);
         assert_eq!(catalog.scan_identity(None).unwrap(), None);
 
@@ -3222,5 +3286,25 @@ mod tests {
             )
             .unwrap();
         assert_eq!(catalog.scan_identity(Some("dam:1")).unwrap(), None);
+    }
+
+    /// #146 (L5): Adopt stores the sidecar's identity lowercase, and the conflict it
+    /// resolved — and a copy carrying the same identity upper-case — are bound.
+    #[test]
+    fn adopt_stores_an_upper_case_identity_lowercase() {
+        let (catalog, root, _dir) = temp_catalog("adopt-uppercase");
+        const FOREIGN: &str = "6F1C1F0E-2B7A-4C3D-9E8F-0A1B2C3D4E5F";
+        let (id, path, _) = seed_conflicted_copy(&catalog, &root, "x.arw", FOREIGN);
+        let (volume_id, relative_path) = copy_of(&catalog, &path);
+        let outcome = catalog
+            .resolve_identity_conflict(id, volume_id, &relative_path, IdentityConflictAction::Adopt)
+            .unwrap();
+        let canonical = FOREIGN.to_ascii_lowercase();
+        assert_eq!(outcome.catalog_uuid, canonical);
+        assert_eq!(outcome.previous_sidecar_uuid, FOREIGN);
+        assert_eq!(photo_uuid(&catalog, id), canonical);
+        assert_eq!(queue_row(&catalog, id, &path), None);
+        assert_eq!(crate::xmp::read_identifier(&path).as_deref(), Some(FOREIGN), "Adopt never writes");
+        assert_eq!(bind_sidecar_identity(&path, &canonical, Some(FOREIGN)), SidecarIdentity::Bound);
     }
 }

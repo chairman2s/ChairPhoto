@@ -865,6 +865,34 @@ fn an_old_bundles_non_uuid_id_never_becomes_a_photos_uuid() {
         "the import preview counts it as already present");
 }
 
+/// #146 (L5), review mutation gaps: the import preview's count and the in-place volume
+/// upsert canonicalise a UUID like every other entry point. An upper-case spelling counts as
+/// the photo the catalog already has, and a NAS copy carrying it is the same row.
+#[test]
+fn the_import_count_and_the_volume_upsert_see_an_upper_case_uuid_as_the_same_photo() {
+    let (catalog, root) = temp_catalog("uppercase-count-volume");
+    const KNOWN: &str = "6f1c1f0e-2b7a-4c3d-9e8f-0a1b2c3d4e5f";
+    let local = root.join("x.jpg");
+    std::fs::write(&local, b"notarealjpeg").unwrap();
+    let row = catalog.upsert_photo_with_identity(&local, None, 1, 1, Some(KNOWN)).unwrap();
+    assert_eq!(catalog.count_existing_uuids(&[KNOWN.to_ascii_uppercase()]).unwrap(), 1);
+
+    let nas = root.parent().unwrap().join("nas");
+    std::fs::create_dir_all(&nas).unwrap();
+    catalog.add_volume("NAS", &nas, VolumeKind::Backup).unwrap();
+    std::fs::write(nas.join("x.jpg"), b"notarealjpeg").unwrap();
+    let copy = catalog
+        .upsert_photo_on_volume(&nas.join("x.jpg"), 1, 1, Some(&KNOWN.to_ascii_uppercase()))
+        .unwrap();
+    assert_eq!((copy.id, copy.created), (row.id, false), "the NAS copy is the same photo");
+
+    const ARRIVING: &str = "0D9C8B7A-6F5E-4D3C-8B2A-190807060504";
+    std::fs::write(nas.join("y.jpg"), b"notarealjpeg").unwrap();
+    let new_row = catalog.upsert_photo_on_volume(&nas.join("y.jpg"), 1, 1, Some(ARRIVING)).unwrap();
+    assert!(new_row.created);
+    assert_eq!(catalog.get_photo(new_row.id).unwrap().uuid, ARRIVING.to_ascii_lowercase());
+}
+
 /// #146 review F2: the bundle importer falls back to the manifest id when the copied file's
 /// sidecar has none, through `upsert_photo_with_identity`. A non-UUID id there is mapped and
 /// recorded exactly as merge and v23 do.

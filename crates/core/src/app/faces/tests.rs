@@ -291,6 +291,46 @@ fn accepting_a_face_writes_its_region_and_preserves_a_foreign_one() {
     assert_eq!(face_state(&c, f), "unassigned");
 }
 
+/// #135 M1, probe Q5's shape through the verbs: a second catalog over the same folder — or this
+/// one rebuilt — never removes or takes over a region the first catalog marked. Catalog A
+/// confirmed a drawn Carol the detector misses and exported her; catalog B, which never had
+/// Carol, accepts and then rejects Alice on the same photo. Carol keeps A's marker throughout.
+#[test]
+fn another_catalogs_marked_region_survives_this_catalogs_face_writes() {
+    let (a, root) = temp_catalog("q5-a");
+    let pa = add_photo(&a, &root, "p.NEF");
+    let photo_path = root.join("p.NEF");
+    let carol = a.create_tag("People/Carol").unwrap();
+    let fc = add_manual(&a, pa, 0.7, 0.7, 0.1, 0.1).unwrap();
+    assign(&a, fc, carol).unwrap();
+    let a_marker = format!("{}/{fc}", a.catalog_uuid().unwrap());
+    let carol_region = || {
+        let xml = std::fs::read_to_string(crate::xmp::sidecar_path(&photo_path)).unwrap();
+        let got = crate::xmp::region_fixtures::mwg(&xml);
+        let carol: Vec<_> = got.regions.iter().filter(|r| r.name == "Carol").cloned().collect();
+        (carol, xml)
+    };
+    let (before, _) = carol_region();
+    assert_eq!(before.len(), 1);
+    assert_eq!(before[0].face_id.as_deref(), Some(a_marker.as_str()));
+
+    let b_dir = TestTmpDir::new("app-faces-q5-b");
+    let b = Catalog::open(&b_dir.join("catalog.chairphoto"), &root).unwrap();
+    store::ensure_schema(b.conn()).unwrap();
+    assert_ne!(b.catalog_uuid().unwrap(), a.catalog_uuid().unwrap());
+    let pb = b.upsert_photo(&photo_path, None, 0, 1).unwrap().id;
+    let alice = b.create_tag("People/Alice").unwrap();
+    let fb = add_face(&b, pb, "[0.1,0.1,0.2,0.2]");
+    suggest(&b, fb, alice);
+    accept(&b, fb).unwrap();
+    let (after, xml) = carol_region();
+    assert_eq!(after, before, "B's first face write touched A's Carol:\n{xml}");
+    reject(&b, fb).unwrap();
+    let (after, xml) = carol_region();
+    assert_eq!(after, before, "B's reject removed A's Carol:\n{xml}");
+    assert!(crate::xmp::read_face_regions(&photo_path).iter().all(|r| r.name != "Alice"), "{xml}");
+}
+
 /// #135 through the verbs: ignoring a confirmed face takes its region out of the sidecar,
 /// as rejecting does, and every foreign region and structure stays.
 #[test]
@@ -330,7 +370,7 @@ fn rejecting_a_face_exported_before_the_marker_removes_its_region() {
     accept(&c, f).unwrap();
     // As the pre-marker writer left it: Alice's region without the marker, and no record yet.
     let xml = std::fs::read_to_string(crate::xmp::sidecar_path(&photo_path)).unwrap();
-    let marker = format!("<chairphoto:FaceId>{f}</chairphoto:FaceId>");
+    let marker = format!("<chairphoto:FaceId>{}/{f}</chairphoto:FaceId>", c.catalog_uuid().unwrap());
     assert!(xml.contains(&marker), "{xml}");
     std::fs::write(crate::xmp::sidecar_path(&photo_path), xml.replace(&marker, "")).unwrap();
     c.conn().execute_batch("DROP TABLE faces__legacy_regions").unwrap();

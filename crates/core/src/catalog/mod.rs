@@ -97,6 +97,23 @@ const WAL_BUSY_RETRY_DELAY: Duration = Duration::from_millis(10);
 /// and [`schema::SCHEMA_VERSION`] together.
 pub(crate) const EXIF_ORIENTATION_SINCE: i64 = 26;
 
+/// The `settings` key holding the catalog's own identity: a UUID v4 minted once, the first
+/// time a catalog is opened by a build that knows it, and never changed. It survives reopening,
+/// moving the file and restoring a backup of it; a merge or bundle import never copies it.
+/// Its one use today is scoping ChairPhoto's face-region marker in sidecars (#135, see
+/// `docs/face-tagging.md`), so a region one catalog wrote is foreign to every other.
+pub const CATALOG_UUID_KEY: &str = "catalog_uuid";
+
+/// The catalog's identity ([`CATALOG_UUID_KEY`]), minted on first use. Race-free: two
+/// connections minting at once both read back the one row `INSERT OR IGNORE` let in.
+pub fn catalog_uuid(conn: &Connection) -> rusqlite::Result<String> {
+    conn.execute(
+        "INSERT OR IGNORE INTO settings (key, value) VALUES (?1, ?2)",
+        params![CATALOG_UUID_KEY, uuid::Uuid::new_v4().to_string()],
+    )?;
+    conn.query_row("SELECT value FROM settings WHERE key = ?1", [CATALOG_UUID_KEY], |r| r.get(0))
+}
+
 // SQLite's bind-parameter ceiling (`SQLITE_MAX_VARIABLE_NUMBER`) depends on the build:
 // 32766 since 3.32, and 999 in older builds. We bundle 3.45, but the chunk stays below
 // the older 999 too, so chunked `IN` queries hold if this ever links a system SQLite.
@@ -238,6 +255,8 @@ impl Catalog {
 
     fn migrate_locked(&mut self) -> Result<()> {
         self.conn.execute_batch(schema::SCHEMA_SQL)?;
+        // Mint the catalog's identity once (a no-op on every later open).
+        catalog_uuid(&self.conn)?;
         // Additive columns for catalogs created before the column existed.
         self.ensure_column("tags", "description", "TEXT NOT NULL DEFAULT ''")?;
         self.ensure_column("tags", "auto_rule", "TEXT")?;
@@ -685,6 +704,11 @@ impl Catalog {
             self.legacy_value_norm.set(false);
         }
         Ok(())
+    }
+
+    /// This catalog's identity: see [`CATALOG_UUID_KEY`].
+    pub fn catalog_uuid(&self) -> Result<String> {
+        Ok(catalog_uuid(&self.conn)?)
     }
 
     pub fn get_setting(&self, key: &str) -> Result<Option<String>> {
@@ -2392,6 +2416,26 @@ fn now() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #135 M1: a catalog's identity is minted once — on its first open — and is the same on
+    /// every reopen and on a second connection; another catalog has its own.
+    #[test]
+    fn the_catalog_identity_is_minted_once_and_survives_a_reopen() {
+        let dir = crate::test_support::TestTmpDir::new("catalog-uuid");
+        let root = dir.join("photos");
+        std::fs::create_dir_all(&root).unwrap();
+        let db = dir.join("a.chairphoto");
+        let first = Catalog::open(&db, &root).unwrap();
+        let id = first.get_setting(CATALOG_UUID_KEY).unwrap().expect("minted on open");
+        assert!(uuid::Uuid::parse_str(&id).is_ok(), "{id}");
+        assert_eq!(first.catalog_uuid().unwrap(), id);
+        let secondary = Catalog::open_secondary(&db, &root).unwrap();
+        assert_eq!(secondary.catalog_uuid().unwrap(), id);
+        drop((first, secondary));
+        assert_eq!(Catalog::open(&db, &root).unwrap().catalog_uuid().unwrap(), id, "reopened");
+        let other = Catalog::open(&dir.join("b.chairphoto"), &root).unwrap();
+        assert_ne!(other.catalog_uuid().unwrap(), id);
+    }
 
     /// `migrate_sidecar_identity_fields` rebuilds `pending_sidecar_identity` via
     /// `DROP TABLE` + rename whenever it finds a v20-shaped table (no `field` column) —

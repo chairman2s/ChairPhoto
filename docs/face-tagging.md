@@ -177,23 +177,42 @@ and the reader converts back.
 
 **Merge safety is binding.** The RegionList may already contain regions written by other tools.
 The writer edits the existing `Regions` in place, never rebuilds it. **Every region ChairPhoto
-writes carries its marker**, a `chairphoto:FaceId` field holding the face's id (#135), and
-ChairPhoto replaces or removes only regions that carry it. Each write sends the photo's whole
-confirmed set, and for each existing region, in this order:
+writes carries its marker** (#135), and a catalog replaces or removes only regions carrying
+*its own* marker.
 
-1. **Marked, with the id of a face in the set** (and still that face's name or place — ids are
-   catalog-local): moved to the face's box and renamed to its person. A renamed person or a
+**The marker format is stable** — it is on disk in users' sidecars, and changing it needs a
+legacy rule of its own. It is a `chairphoto:FaceId` struct field
+(`https://chairphoto.local/ns/1.0/`) of the region, whose value is
+
+```
+<catalog UUID>/<face id>
+```
+
+— the writing catalog's identity, exactly as `settings.catalog_uuid` holds it (a UUID v4,
+lowercase and hyphenated, minted once on the catalog's first open; `catalog::CATALOG_UUID_KEY`),
+a `/`, and the face's `faces__faces.id` in decimal. Face ids are `AUTOINCREMENT`, so a catalog
+never reuses one. A region whose marker names another catalog — a second catalog over the same
+folders, or this catalog's predecessor before a rebuild — or whose value is anything but exactly
+this form is **foreign**: never removed, never re-marked. (A copy of a catalog file shares its
+identity with the original; the name-or-place check in step 1 is what keeps a copy's ids from
+renaming a region.)
+
+Each write sends the photo's whole confirmed set, and for each existing region, in this order:
+
+1. **This catalog's marker, with the id of a face in the set** (and still that face's name or
+   place): moved to the face's box and renamed to its person. A renamed person or a
    re-detected box no longer leaves a stale copy behind.
-2. **Marked, same Name and center within `AREA_EPSILON = 0.02` of a face in the set** (another
-   catalog's id): taken over the same way.
-3. **Marked, matched by nothing:** removed. This is how a **rejected or ignored** face, or one
-   whose person was removed, leaves the sidecar.
-4. **Unmarked:** foreign, and **always kept**. When its Name and center (within
-   `AREA_EPSILON`) match a face in the set it is that face already in the file — a Lightroom
-   region ingested earlier, say: only its `Area` coordinates (`stArea:x/y/w/h/unit`) are
-   updated, in the form they are written in, and no marked copy is appended. Its
-   `mwg-rs:Rotation`, `Type`, extensions and foreign attributes such as `digiKam:Confidence`
-   stay, and it is never marked, so rejecting the face later never removes it.
+2. **This catalog's marker, same Name and center within `AREA_EPSILON = 0.02` of a face in the
+   set** (a face id that changed): taken over the same way.
+3. **This catalog's marker, matched by nothing:** removed. This is how a **rejected or ignored**
+   face, or one whose person was removed, leaves the sidecar.
+4. **Anything else — unmarked, or another catalog's:** foreign, and **always kept**. When its
+   Name and center (within `AREA_EPSILON`) match a face in the set it is that face already in
+   the file — a Lightroom region ingested earlier, say: only its `Area` coordinates
+   (`stArea:x/y/w/h/unit`) are updated, in the form they are written in, and no marked copy is
+   appended. Its marker (if any), `mwg-rs:Rotation`, `Type`, extensions and foreign attributes
+   such as `digiKam:Confidence` stay, and it is never marked as ours, so rejecting the face
+   later never removes it.
 
 Each existing region is claimed by at most one face and each face claims at most one region;
 where several regions match a face by Name + Area, the **closest** center wins, not the first in

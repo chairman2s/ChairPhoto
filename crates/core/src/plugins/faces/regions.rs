@@ -137,6 +137,7 @@ where
     R: FnOnce(i64) -> Result<Option<std::path::PathBuf>, String>,
 {
     super::store::ensure_schema(conn).map_err(|e| e.to_string())?;
+    let catalog = crate::catalog::catalog_uuid(conn).map_err(|e| e.to_string())?;
     let regions = confirmed_regions(conn, photo_id).map_err(|e| e.to_string())?;
     let legacy = legacy_regions(conn, photo_id).map_err(|e| e.to_string())?;
     let frame = region_frame(conn, photo_id).map_err(|e| e.to_string())?;
@@ -144,7 +145,7 @@ where
     let Some(path) = resolve(photo_id)? else {
         return Ok(()); // offline — skip, re-sync later.
     };
-    crate::xmp::write_face_regions(&path, &regions, &legacy, frame)?;
+    crate::xmp::write_face_regions(&path, &catalog, &regions, &legacy, frame)?;
     conn.execute("DELETE FROM faces__legacy_regions WHERE photo_id = ?1", [photo_id])
         .map_err(|e| e.to_string())?;
     Ok(())
@@ -274,7 +275,8 @@ mod tests {
                                   width INTEGER, height INTEGER, user_rotation INTEGER NOT NULL DEFAULT 0,
                                   exif_orientation INTEGER);
              CREATE TABLE tags (id INTEGER PRIMARY KEY, name TEXT NOT NULL DEFAULT '',
-                                full_path TEXT NOT NULL DEFAULT '');",
+                                full_path TEXT NOT NULL DEFAULT '');
+             CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);",
         )
         .unwrap();
         store::ensure_schema(&conn).unwrap();
@@ -452,9 +454,10 @@ mod tests {
         // The pre-marker writer's Dora, unmarked; Dora has since been rejected.
         let ours = crate::xmp::FaceRegion { face_id: 0, name: "Dora".into(), bbox: (0.5, 0.5, 0.1, 0.1) };
         let unmarked = crate::xmp::RegionFrame { orientation: None, stored_size: Some((6000, 4000)) };
-        crate::xmp::write_face_regions(&photo_path, &[ours], &[], unmarked).unwrap();
+        let catalog = crate::catalog::catalog_uuid(&conn).unwrap();
+        crate::xmp::write_face_regions(&photo_path, &catalog, &[ours], &[], unmarked).unwrap();
         let xml = std::fs::read_to_string(crate::xmp::sidecar_path(&photo_path)).unwrap();
-        let unmarked_xml = xml.replace("<chairphoto:FaceId>0</chairphoto:FaceId>", "");
+        let unmarked_xml = xml.replace(&format!("<chairphoto:FaceId>{catalog}/0</chairphoto:FaceId>"), "");
         assert_ne!(xml, unmarked_xml, "the marker was not where the test expects it");
         std::fs::write(crate::xmp::sidecar_path(&photo_path), unmarked_xml).unwrap();
 

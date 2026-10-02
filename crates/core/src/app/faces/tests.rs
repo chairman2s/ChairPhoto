@@ -141,22 +141,134 @@ fn a_failed_assignment_rolls_back_the_whole_batch() {
 
 // --- the per-face verbs ---------------------------------------------------------------------
 
-/// Confirming writes the person as an MWG region into the photo's sidecar **and keeps a
-/// foreign region** another tool wrote there (AGENTS.md "XMP safety": face regions are
-/// replaced by Name + Area match only).
+/// A sidecar another tool wrote — raw XML, not ChairPhoto's writer, no `chairphoto:LastWrite`,
+/// another frame size: a named MWG region carrying a foreign child element (digiKam's face
+/// engine), an unnamed region in the nested-`rdf:Description` form (which ChairPhoto does not
+/// even parse), a Microsoft Photo `MP:RegionInfo` and a digiKam tag list beside them. Every
+/// property is in element form: ChairPhoto's XML layer keeps elements and their namespaces but
+/// drops the prefix of every *attribute* it re-serialises (xmltree 0.11 stores attributes by
+/// local name) — a separate, pre-existing defect this test deliberately does not cover.
+fn seed_foreign_sidecar(photo_path: &std::path::Path) {
+    let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<x:xmpmeta xmlns:x="adobe:ns:meta/">
+ <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+  <rdf:Description rdf:about=""
+    xmlns:digiKam="http://www.digikam.org/ns/1.0/"
+    xmlns:mwg-rs="http://www.metadataworkinggroup.com/schemas/regions/"
+    xmlns:stDim="http://ns.adobe.com/xap/1.0/sType/Dimensions#"
+    xmlns:stArea="http://ns.adobe.com/xmp/sType/Area#"
+    xmlns:MP="http://ns.microsoft.com/photo/1.2/"
+    xmlns:MPRI="http://ns.microsoft.com/photo/1.2/t/RegionInfo#"
+    xmlns:MPReg="http://ns.microsoft.com/photo/1.2/t/Region#">
+   <digiKam:TagsList>
+    <rdf:Seq>
+     <rdf:li>People/Stranger</rdf:li>
+    </rdf:Seq>
+   </digiKam:TagsList>
+   <mwg-rs:Regions rdf:parseType="Resource">
+    <mwg-rs:AppliedToDimensions rdf:parseType="Resource">
+     <stDim:w>6000</stDim:w>
+     <stDim:h>4000</stDim:h>
+     <stDim:unit>pixel</stDim:unit>
+    </mwg-rs:AppliedToDimensions>
+    <mwg-rs:RegionList>
+     <rdf:Bag>
+      <rdf:li rdf:parseType="Resource">
+       <mwg-rs:Name>Stranger</mwg-rs:Name>
+       <mwg-rs:Type>Face</mwg-rs:Type>
+       <mwg-rs:Area rdf:parseType="Resource">
+        <stArea:x>0.7</stArea:x>
+        <stArea:y>0.7</stArea:y>
+        <stArea:w>0.2</stArea:w>
+        <stArea:h>0.2</stArea:h>
+        <stArea:unit>normalized</stArea:unit>
+       </mwg-rs:Area>
+       <digiKam:FaceEngine>dnn-yunet</digiKam:FaceEngine>
+      </rdf:li>
+      <rdf:li>
+       <rdf:Description>
+        <mwg-rs:Type>Pet</mwg-rs:Type>
+        <mwg-rs:Area rdf:parseType="Resource">
+         <stArea:x>0.31</stArea:x>
+         <stArea:y>0.8</stArea:y>
+         <stArea:w>0.1</stArea:w>
+         <stArea:h>0.1</stArea:h>
+        </mwg-rs:Area>
+       </rdf:Description>
+      </rdf:li>
+     </rdf:Bag>
+    </mwg-rs:RegionList>
+   </mwg-rs:Regions>
+   <MP:RegionInfo rdf:parseType="Resource">
+    <MPRI:Regions>
+     <rdf:Bag>
+      <rdf:li rdf:parseType="Resource">
+       <MPReg:PersonDisplayName>Stranger</MPReg:PersonDisplayName>
+       <MPReg:Rectangle>0.6, 0.6, 0.2, 0.2</MPReg:Rectangle>
+      </rdf:li>
+     </rdf:Bag>
+    </MPRI:Regions>
+   </MP:RegionInfo>
+  </rdf:Description>
+ </rdf:RDF>
+</x:xmpmeta>
+"#;
+    std::fs::write(crate::xmp::sidecar_path(photo_path), xml).unwrap();
+}
+
+/// The foreign tool's content survives a ChairPhoto region write: the named region with its
+/// area and its foreign extra, the unnamed nested-Description one, the MP regions and the tag
+/// list, each in its own namespace — next to ChairPhoto's own regions, `ours`.
+fn assert_foreign_kept(photo_path: &std::path::Path, ours: &[&str]) {
+    let regions = crate::xmp::read_face_regions(photo_path);
+    let xml = std::fs::read_to_string(crate::xmp::sidecar_path(photo_path)).unwrap();
+    let Some(stranger) = regions.iter().find(|r| r.name == "Stranger") else {
+        panic!("the foreign named region is lost: {regions:?}\n{xml}")
+    };
+    let (x, y, w, h) = stranger.bbox;
+    assert!((x - 0.6).abs() < 1e-4 && (y - 0.6).abs() < 1e-4 && (w - 0.2).abs() < 1e-4 && (h - 0.2).abs() < 1e-4, "{:?}", stranger.bbox);
+    let mut names: Vec<&str> = regions.iter().map(|r| r.name.as_str()).filter(|n| *n != "Stranger").collect();
+    names.sort();
+    assert_eq!(names, ours, "ChairPhoto's regions");
+
+    // Namespace-aware: each kept node must still be in its tool's namespace.
+    let doc = xmltree::Element::parse(xml.as_bytes()).unwrap();
+    let mut found: Vec<(String, String, String)> = Vec::new(); // (namespace, name, text)
+    fn walk(e: &xmltree::Element, out: &mut Vec<(String, String, String)>) {
+        let text = e.get_text().map(|t| t.trim().to_string()).unwrap_or_default();
+        out.push((e.namespace.clone().unwrap_or_default(), e.name.clone(), text));
+        for c in e.children.iter().filter_map(|n| n.as_element()) {
+            walk(c, out);
+        }
+    }
+    walk(&doc, &mut found);
+    let has = |ns: &str, name: &str, text: &str| found.iter().any(|(n, l, t)| n == ns && l == name && t == text);
+    const DIGIKAM: &str = "http://www.digikam.org/ns/1.0/";
+    const MWG: &str = "http://www.metadataworkinggroup.com/schemas/regions/";
+    const STAREA: &str = "http://ns.adobe.com/xmp/sType/Area#";
+    const MPREG: &str = "http://ns.microsoft.com/photo/1.2/t/Region#";
+    for (ns, name, text) in [
+        (DIGIKAM, "FaceEngine", "dnn-yunet"),
+        (MWG, "Type", "Pet"),
+        (STAREA, "x", "0.31"),
+        (MPREG, "PersonDisplayName", "Stranger"),
+        (MPREG, "Rectangle", "0.6, 0.6, 0.2, 0.2"),
+        ("http://www.w3.org/1999/02/22-rdf-syntax-ns#", "li", "People/Stranger"),
+    ] {
+        assert!(has(ns, name, text), "{ns}{name} = {text:?} was lost:\n{xml}");
+    }
+    assert!(found.iter().any(|(n, l, _)| n == DIGIKAM && l == "TagsList"), "the digiKam tag list is kept:\n{xml}");
+}
+
+/// Confirming writes the person as an MWG region into the photo's sidecar **and keeps the
+/// foreign regions** another tool wrote there (AGENTS.md "XMP safety": face regions are
+/// replaced by Name + Area match only; foreign namespaces are preserved).
 #[test]
 fn accepting_a_face_writes_its_region_and_preserves_a_foreign_one() {
     let (c, root) = temp_catalog("regions");
     let p = add_photo(&c, &root, "p.NEF");
     let photo_path = root.join("p.NEF");
-    // A region a different tool wrote: another name, elsewhere in the frame.
-    crate::xmp::write_face_regions(
-        &photo_path,
-        &[crate::xmp::FaceRegion { name: "Stranger".into(), bbox: (0.6, 0.6, 0.2, 0.2) }],
-        100,
-        100,
-    )
-    .unwrap();
+    seed_foreign_sidecar(&photo_path);
     let alice = c.create_tag("People/Alice").unwrap();
     let f = add_face(&c, p, "[0.1,0.1,0.2,0.2]");
     suggest(&c, f, alice);
@@ -165,9 +277,7 @@ fn accepting_a_face_writes_its_region_and_preserves_a_foreign_one() {
 
     assert_eq!(face_state(&c, f), "confirmed");
     assert!(has_tag(&c, p, alice));
-    let mut names: Vec<String> = crate::xmp::read_face_regions(&photo_path).into_iter().map(|r| r.name).collect();
-    names.sort();
-    assert_eq!(names, vec!["Alice".to_string(), "Stranger".to_string()], "ours added, the foreign region kept");
+    assert_foreign_kept(&photo_path, &["Alice"]);
 
     // Rejecting re-exports an empty confirmed set. The writer then cannot tell its own old
     // region from a foreign one (none matches a name it is writing), so it preserves both —
@@ -646,13 +756,7 @@ fn naming_two_clusters_together_merges_them_into_one_person() {
     let (c, root) = temp_catalog("merge");
     let p1 = add_photo(&c, &root, "a.NEF");
     let p2 = add_photo(&c, &root, "b.NEF");
-    crate::xmp::write_face_regions(
-        &root.join("a.NEF"),
-        &[crate::xmp::FaceRegion { name: "Stranger".into(), bbox: (0.6, 0.6, 0.2, 0.2) }],
-        100,
-        100,
-    )
-    .unwrap();
+    seed_foreign_sidecar(&root.join("a.NEF"));
     let a1 = add_face(&c, p1, "[0.1,0.1,0.2,0.2]");
     let a2 = add_face(&c, p1, "[0.4,0.1,0.2,0.2]");
     let b1 = add_face(&c, p2, "[0.1,0.1,0.2,0.2]");
@@ -668,9 +772,7 @@ fn naming_two_clusters_together_merges_them_into_one_person() {
     assert_eq!(face_state(&c, a2), "unassigned");
     assert!(has_tag(&c, p1, jane) && has_tag(&c, p2, jane));
     assert_eq!(cluster_rows(&c).iter().map(|r| r.0).collect::<Vec<_>>(), vec![12], "both named clusters are gone");
-    let mut names: Vec<String> = crate::xmp::read_face_regions(&root.join("a.NEF")).into_iter().map(|r| r.name).collect();
-    names.sort();
-    assert_eq!(names, vec!["Jane".to_string(), "Stranger".to_string()], "ours added, the foreign region kept");
+    assert_foreign_kept(&root.join("a.NEF"), &["Jane"]);
     let people = people_summary(&c).unwrap();
     assert_eq!((people.len(), people[0].face_count, people[0].photo_count), (1, 2, 2));
 }

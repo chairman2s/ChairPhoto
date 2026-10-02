@@ -72,7 +72,9 @@ Read only the documents triggered by the task:
 - Sidecars are `<original_filename>.xmp`, alongside the original.
 - Before ChairPhoto's first in-library write to an existing sidecar, back it up if it lacks
   `chairphoto:LastWrite`. Export-only destination copies are not subject to this rule.
-- Face-region writes replace only matching ChairPhoto regions and preserve foreign regions.
+- Face-region writes replace or remove only regions carrying ChairPhoto's `chairphoto:FaceId`
+  marker (or, for pre-marker regions, matching the catalog's record of what it exported) and
+  preserve foreign regions.
   MWG areas use normalized center coordinates in the stored frame — the image before its EXIF
   Orientation is applied (MWG 2.0 § 5.9) — and `AppliedToDimensions` is the stored pixel size;
   ChairPhoto's face boxes are in the EXIF-oriented frame and are converted on export and

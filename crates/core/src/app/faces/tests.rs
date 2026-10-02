@@ -284,13 +284,60 @@ fn accepting_a_face_writes_its_region_and_preserves_a_foreign_one() {
     assert!(has_tag(&c, p, alice));
     assert_foreign_kept(&photo_path, &["Alice"]);
 
-    // Rejecting re-exports an empty confirmed set. The writer then cannot tell its own old
-    // region from a foreign one (none matches a name it is writing), so it preserves both —
-    // "when in doubt, preserve" (docs/face-tagging.md) — and the foreign one survives again.
+    // Rejecting re-exports an empty confirmed set: Alice's region carries ChairPhoto's marker,
+    // so it goes (#135); the foreign ones carry none and stay.
     reject(&c, f).unwrap();
-    let names: Vec<String> = crate::xmp::read_face_regions(&photo_path).into_iter().map(|r| r.name).collect();
-    assert!(names.contains(&"Stranger".to_string()), "{names:?}");
+    assert_foreign_kept(&photo_path, &[]);
     assert_eq!(face_state(&c, f), "unassigned");
+}
+
+/// #135 through the verbs: ignoring a confirmed face takes its region out of the sidecar,
+/// as rejecting does, and every foreign region and structure stays.
+#[test]
+fn ignoring_a_confirmed_face_removes_its_region() {
+    let (c, root) = temp_catalog("ignore-region");
+    let p = add_photo(&c, &root, "p.NEF");
+    let photo_path = root.join("p.NEF");
+    seed_foreign_sidecar(&photo_path);
+    let alice = c.create_tag("People/Alice").unwrap();
+    let bob = c.create_tag("People/Bob").unwrap();
+    let fa = add_face(&c, p, "[0.1,0.1,0.2,0.2]");
+    let fb = add_face(&c, p, "[0.4,0.1,0.2,0.2]");
+    suggest(&c, fa, alice);
+    suggest(&c, fb, bob);
+    accept(&c, fa).unwrap();
+    accept(&c, fb).unwrap();
+    assert_foreign_kept(&photo_path, &["Alice", "Bob"]);
+
+    ignore(&c, fa).unwrap();
+    assert_foreign_kept(&photo_path, &["Bob"]);
+    reject(&c, fb).unwrap();
+    assert_foreign_kept(&photo_path, &[]);
+}
+
+/// #135's rule for a catalog from before the marker: a face its old writer exported is on the
+/// record the first faces call after the upgrade takes, so rejecting it — the very first thing
+/// done — still removes its unmarked region, and the foreign ones stay.
+#[test]
+fn rejecting_a_face_exported_before_the_marker_removes_its_region() {
+    let (c, root) = temp_catalog("legacy-reject");
+    let p = add_photo(&c, &root, "p.NEF");
+    let photo_path = root.join("p.NEF");
+    seed_foreign_sidecar(&photo_path);
+    let alice = c.create_tag("People/Alice").unwrap();
+    let f = add_face(&c, p, "[0.1,0.1,0.2,0.2]");
+    suggest(&c, f, alice);
+    accept(&c, f).unwrap();
+    // As the pre-marker writer left it: Alice's region without the marker, and no record yet.
+    let xml = std::fs::read_to_string(crate::xmp::sidecar_path(&photo_path)).unwrap();
+    let marker = format!("<chairphoto:FaceId>{f}</chairphoto:FaceId>");
+    assert!(xml.contains(&marker), "{xml}");
+    std::fs::write(crate::xmp::sidecar_path(&photo_path), xml.replace(&marker, "")).unwrap();
+    c.conn().execute_batch("DROP TABLE faces__legacy_regions").unwrap();
+
+    reject(&c, f).unwrap();
+
+    assert_foreign_kept(&photo_path, &[]);
 }
 
 /// #136: the importer reads a region in the frame the detections are in. Lightroom's region

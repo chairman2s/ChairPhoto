@@ -74,23 +74,41 @@ pub fn region_frame(conn: &Connection, photo_id: i64) -> rusqlite::Result<Region
 /// normalized bbox. Ignored/suggested/unassigned faces are excluded — only human-confirmed
 /// (or seed/manual/xmp `confirmed`) faces are exported.
 pub fn confirmed_regions(conn: &Connection, photo_id: i64) -> rusqlite::Result<Vec<FaceRegion>> {
-    let mut stmt = conn.prepare(
-        "SELECT t.name, f.bbox
+    face_regions(
+        conn,
+        "SELECT f.id, t.name, f.bbox
            FROM faces__faces f
            JOIN tags t ON t.id = f.person_tag_id
           WHERE f.photo_id = ?1
             AND f.state = 'confirmed'
             AND f.person_tag_id IS NOT NULL
           ORDER BY f.id",
-    )?;
+        photo_id,
+    )
+}
+
+/// The faces ChairPhoto exported into this photo's sidecar before regions carried its marker
+/// (`faces__legacy_regions`, see [`store::ensure_schema`](super::store::ensure_schema)), with
+/// the name and box they were exported with. The writer recognises a pre-marker region of
+/// ours by them, adopting it while its face is confirmed and removing it once it is not (#135).
+pub fn legacy_regions(conn: &Connection, photo_id: i64) -> rusqlite::Result<Vec<FaceRegion>> {
+    face_regions(
+        conn,
+        "SELECT face_id, name, bbox FROM faces__legacy_regions WHERE photo_id = ?1 ORDER BY face_id",
+        photo_id,
+    )
+}
+
+fn face_regions(conn: &Connection, sql: &str, photo_id: i64) -> rusqlite::Result<Vec<FaceRegion>> {
+    let mut stmt = conn.prepare(sql)?;
     let rows = stmt.query_map([photo_id], |r| {
-        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?))
     })?;
     let mut out = Vec::new();
     for row in rows {
-        let (name, bbox_s) = row?;
+        let (face_id, name, bbox_s) = row?;
         if let Some(bbox) = parse_bbox(&bbox_s) {
-            out.push(FaceRegion { name, bbox });
+            out.push(FaceRegion { face_id, name, bbox });
         }
     }
     Ok(out)
@@ -103,6 +121,13 @@ pub fn confirmed_regions(conn: &Connection, photo_id: i64) -> rusqlite::Result<V
 /// skipped silently (the catalog remains authoritative; the sidecar re-syncs later). Sidecar
 /// write failures are returned as `Err` for the caller to log; they are non-fatal to the
 /// confirm operation.
+///
+/// Rejected, ignored and unnamed faces are not in the set, so their regions — marked as
+/// ChairPhoto's, or on the pre-marker record — leave the sidecar; foreign regions stay
+/// (#135). Once a write has gone through, the photo's pre-marker record is spent: every region
+/// it described has been adopted (and now carries the marker) or removed, and keeping it would
+/// let a region another tool writes later at the same place, under the same name, be taken
+/// for ours.
 pub fn write_photo_regions<R>(
     conn: &Connection,
     photo_id: i64,
@@ -111,13 +136,18 @@ pub fn write_photo_regions<R>(
 where
     R: FnOnce(i64) -> Result<Option<std::path::PathBuf>, String>,
 {
+    super::store::ensure_schema(conn).map_err(|e| e.to_string())?;
     let regions = confirmed_regions(conn, photo_id).map_err(|e| e.to_string())?;
+    let legacy = legacy_regions(conn, photo_id).map_err(|e| e.to_string())?;
     let frame = region_frame(conn, photo_id).map_err(|e| e.to_string())?;
 
-    match resolve(photo_id)? {
-        Some(path) => crate::xmp::write_face_regions(&path, &regions, frame),
-        None => Ok(()), // offline — skip, re-sync later.
-    }
+    let Some(path) = resolve(photo_id)? else {
+        return Ok(()); // offline — skip, re-sync later.
+    };
+    crate::xmp::write_face_regions(&path, &regions, &legacy, frame)?;
+    conn.execute("DELETE FROM faces__legacy_regions WHERE photo_id = ?1", [photo_id])
+        .map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 // ── Import path ─────────────────────────────────────────────────────────────────
@@ -354,6 +384,86 @@ mod tests {
         let frame = region_frame(&conn, 1).unwrap();
         let display = crate::xmp::read_face_regions_in(&photo_path, frame);
         assert!(near(display[0].bbox, (0.1, 0.2, 0.3, 0.4)), "{:?}", display[0].bbox);
+    }
+
+    // ── the pre-marker record (#135) ───────────────────────────────────────────
+
+    fn confirm(conn: &Connection, photo: i64, tag: i64, bbox: &str, source: &str, state: &str) -> i64 {
+        let f = store::insert_face(conn, photo, bbox, "[]", 0.9, None, source, 0).unwrap();
+        conn.execute(
+            "UPDATE faces__faces SET person_tag_id = ?2, state = ?3 WHERE id = ?1",
+            rusqlite::params![f, tag, state],
+        )
+        .unwrap();
+        f
+    }
+
+    fn record(conn: &Connection) -> Vec<(i64, i64, String, String)> {
+        let mut stmt = conn
+            .prepare("SELECT face_id, photo_id, name, bbox FROM faces__legacy_regions ORDER BY face_id")
+            .unwrap();
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    }
+
+    /// The record is taken once, when the faces tables predate it: every confirmed, named face
+    /// the pre-marker writer exported — not one confirmed from another tool's region
+    /// (`source = 'xmp'`), not one that was never confirmed. A face confirmed afterwards is
+    /// written with the marker and never joins it.
+    #[test]
+    fn the_pre_marker_record_is_the_confirmed_faces_of_an_older_catalog() {
+        let conn = mem_conn();
+        conn.execute_batch(
+            "DROP TABLE faces__legacy_regions;
+             INSERT INTO photos (id) VALUES (1);
+             INSERT INTO tags (id, name, full_path) VALUES (10, 'Alice', 'People/Alice'),
+                                                          (11, 'Bob', 'People/Bob');",
+        )
+        .unwrap();
+        let alice = confirm(&conn, 1, 10, "[0.1,0.1,0.2,0.2]", "seed", "confirmed");
+        confirm(&conn, 1, 11, "[0.5,0.5,0.1,0.1]", "xmp", "confirmed");
+        confirm(&conn, 1, 11, "[0.7,0.7,0.1,0.1]", "match", "suggested");
+        store::ensure_schema(&conn).unwrap();
+        let want = vec![(alice, 1, "Alice".to_string(), "[0.1,0.1,0.2,0.2]".to_string())];
+        assert_eq!(record(&conn), want);
+
+        confirm(&conn, 1, 11, "[0.3,0.3,0.1,0.1]", "manual", "confirmed");
+        store::ensure_schema(&conn).unwrap();
+        assert_eq!(record(&conn), want, "taken once, not on every open");
+    }
+
+    /// A write that reaches the sidecar spends the photo's record — the region it described
+    /// was adopted or removed — while an offline photo keeps it for the write that will.
+    #[test]
+    fn a_written_photo_spends_its_pre_marker_record() {
+        let dir = crate::test_support::TestTmpDir::new("faces-regions-legacy-spent");
+        let photo_path = dir.join("DSC33.ARW");
+        std::fs::write(&photo_path, b"raw").unwrap();
+        let conn = mem_conn();
+        conn.execute_batch(
+            "INSERT INTO photos (id, width, height, exif_orientation) VALUES (1, 6000, 4000, 1);
+             INSERT INTO photos (id) VALUES (2);
+             INSERT INTO faces__legacy_regions (face_id, photo_id, name, bbox)
+                 VALUES (100, 1, 'Dora', '[0.5,0.5,0.1,0.1]'), (200, 2, 'Eve', '[0.1,0.1,0.1,0.1]');",
+        )
+        .unwrap();
+        // The pre-marker writer's Dora, unmarked; Dora has since been rejected.
+        let ours = crate::xmp::FaceRegion { face_id: 0, name: "Dora".into(), bbox: (0.5, 0.5, 0.1, 0.1) };
+        let unmarked = crate::xmp::RegionFrame { orientation: None, stored_size: Some((6000, 4000)) };
+        crate::xmp::write_face_regions(&photo_path, &[ours], &[], unmarked).unwrap();
+        let xml = std::fs::read_to_string(crate::xmp::sidecar_path(&photo_path)).unwrap();
+        let unmarked_xml = xml.replace("<chairphoto:FaceId>0</chairphoto:FaceId>", "");
+        assert_ne!(xml, unmarked_xml, "the marker was not where the test expects it");
+        std::fs::write(crate::xmp::sidecar_path(&photo_path), unmarked_xml).unwrap();
+
+        write_photo_regions(&conn, 2, |_| Ok(None)).unwrap();
+        write_photo_regions(&conn, 1, |_| Ok(Some(photo_path.clone()))).unwrap();
+
+        assert!(crate::xmp::read_face_regions(&photo_path).is_empty(), "Dora's old region stayed");
+        let left: Vec<i64> = record(&conn).into_iter().map(|r| r.0).collect();
+        assert_eq!(left, [200], "the offline photo keeps its record, the written one spent it");
     }
 
     // ── confirmed_regions ──────────────────────────────────────────────────────

@@ -821,6 +821,9 @@ pub fn accept(conn: &Connection, face_id: i64) -> rusqlite::Result<(i64, i64)> {
 /// so it is never re-proposed, and return the face to `unassigned`. No-op detail: if the face
 /// has no person assigned there is nothing to remember and the face is simply left unassigned.
 pub fn reject(conn: &Connection, face_id: i64, now: i64) -> rusqlite::Result<()> {
+    // Before the face loses its person: a catalog's first face write after the pre-marker
+    // record arrived must still find this face on it (#135, `store::ensure_schema`).
+    super::store::ensure_schema(conn)?;
     let person: Option<i64> = conn
         .query_row(
             "SELECT person_tag_id FROM faces__faces WHERE id = ?1",
@@ -848,6 +851,7 @@ pub fn reject(conn: &Connection, face_id: i64, now: i64) -> rusqlite::Result<()>
 /// Mark a face `ignored`: excluded from centroids and suggestions but kept so re-indexing
 /// doesn't resurrect it. Clears any person/cluster association.
 pub fn ignore(conn: &Connection, face_id: i64) -> rusqlite::Result<()> {
+    super::store::ensure_schema(conn)?; // as in `reject`
     conn.execute(
         "UPDATE faces__faces
             SET state = ?2, person_tag_id = NULL, match_confidence = NULL, cluster_id = NULL

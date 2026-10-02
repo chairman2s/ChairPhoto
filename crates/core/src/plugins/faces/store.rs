@@ -81,6 +81,20 @@ fn table_exists(conn: &Connection, name: &str) -> rusqlite::Result<bool> {
 }
 
 pub fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
+    // Decided before anything is created: whether this catalog has faces from before the
+    // pre-marker record existed (#135, below).
+    let had_faces = table_exists(conn, "faces__faces")?;
+    let had_record = table_exists(conn, "faces__legacy_regions")?;
+    conn.execute_batch("SAVEPOINT faces_schema")?;
+    let out = create_schema(conn, had_faces && !had_record);
+    conn.execute_batch(if out.is_ok() { "RELEASE faces_schema" } else {
+        "ROLLBACK TO faces_schema; RELEASE faces_schema"
+    })?;
+    out
+}
+
+/// The plugin's tables; with `record_legacy`, also the one-time pre-marker record.
+fn create_schema(conn: &Connection, record_legacy: bool) -> rusqlite::Result<()> {
     conn.execute_batch(
         "
         CREATE TABLE IF NOT EXISTS faces__faces (
@@ -137,8 +151,35 @@ pub fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
             indexed_at  INTEGER NOT NULL,
             face_count  INTEGER NOT NULL DEFAULT 0
         );
+
+        -- Pre-marker record (#135): the faces ChairPhoto had exported as MWG regions before
+        -- each region it writes carried a chairphoto:FaceId marker, with the name and the
+        -- (display-frame) box they were written with. The region writer recognises those
+        -- unmarked regions as ours by Name + Area against this, and a successful write for
+        -- a photo spends its rows (regions::write_photo_regions).
+        CREATE TABLE IF NOT EXISTS faces__legacy_regions (
+            face_id   INTEGER PRIMARY KEY,
+            photo_id  INTEGER NOT NULL,
+            name      TEXT    NOT NULL,
+            bbox      TEXT    NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS faces__legacy_regions_photo
+            ON faces__legacy_regions (photo_id);
         ",
     )?;
+    // Filled once, when the table is created in a catalog that already has faces: every
+    // confirmed, named face was written to its sidecar on confirmation by the pre-marker
+    // writer (or would have been, had its photo been online). A face confirmed from a region
+    // another tool wrote (source 'xmp') was never ours to export, so it is left off.
+    if record_legacy && table_exists(conn, "tags")? {
+        conn.execute(
+            "INSERT OR IGNORE INTO faces__legacy_regions (face_id, photo_id, name, bbox)
+             SELECT f.id, f.photo_id, t.name, f.bbox
+               FROM faces__faces f JOIN tags t ON t.id = f.person_tag_id
+              WHERE f.state = 'confirmed' AND f.source <> 'xmp'",
+            [],
+        )?;
+    }
     // Future-proof: add new columns to pre-existing tables without breaking an existing DB.
     for sql in [
         "ALTER TABLE faces__faces ADD COLUMN cluster_id INTEGER",

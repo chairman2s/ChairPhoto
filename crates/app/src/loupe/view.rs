@@ -16,8 +16,10 @@
 //!   preview is on its way its own thumbnail stands in, never the previous photo.
 //! - **A second window.** The pop-out loupe ([`crate::loupe::window`], #110) is another
 //!   `LoupeView`, with [`Follow::Window`], over the same entities: it follows the target
-//!   whatever the main stage shows, has no "Back to grid", and ignores Enter/Esc and C. When
-//!   its window closes it is [released](LoupeView::release).
+//!   whatever the main stage shows, has no "Back to grid", and ignores Enter/Esc and C. While
+//!   the Darkroom has a print up (`ShellState::set_loupe_print`, `edit` feature) it shows
+//!   that record, rendered from the print's own source, instead. When its window closes it
+//!   is [released](LoupeView::release).
 //!
 //! Keys ([`contexts::LOUPE`]): ←/→/↑/↓ step (Shift extends), Enter/Esc back to the grid, C
 //! Compare, and the culling keys, which mark the targets and advance as in the grid.
@@ -155,12 +157,25 @@ impl LoupeView {
         if self.released {
             return None;
         }
+        #[cfg(feature = "edit")]
+        if let Some(print) = self.print(cx) {
+            return Some(print.photo.clone());
+        }
         let shell = self.shell.read(cx);
         let showing = match self.follow {
             Follow::Inline => shell.stage_view() == StageView::Loupe,
             Follow::Window => true,
         };
         showing.then(|| shell.loupe_target().cloned()).flatten()
+    }
+
+    /// The Darkroom's print, which the pop-out shows in place of the target while it is up.
+    #[cfg(feature = "edit")]
+    fn print<'a>(&self, cx: &'a App) -> Option<&'a crate::shell::state::LoupePrint> {
+        match self.follow {
+            Follow::Window => self.shell.read(cx).loupe_print(),
+            Follow::Inline => None,
+        }
     }
 
     /// Follow the target: show it, and on a change ask for it first, then its neighbours. The
@@ -228,19 +243,29 @@ impl LoupeView {
     #[cfg(feature = "edit")]
     fn sync_version(&mut self, cx: &mut Context<Self>) {
         use crate::loupe::edit_renders::{preview_job, RenderState};
+        use chairphoto_core::plugins::edit::SourceToken;
         use crate::loupe::zoom::Override;
         /// React's loupe render size (`renderForLoupe`, `edit://` at 2560 px).
         const LOUPE_EDGE: u32 = 2560;
         let target = self.zoom.read(cx).photo();
         let epoch = self.model.read(cx).catalog_epoch;
-        let version = self.shell.read(cx).active_version().filter(|v| Some(v.photo_id) == target).cloned();
-        let Some(version) = version else {
+        // The record to render and its pixels: the Darkroom's print (pop-out only), else the
+        // active version — each only on its own photo.
+        let shell = self.shell.read(cx);
+        let record = match self.print(cx) {
+            Some(print) => Some((print.photo.id, print.edit_json.clone(), print.source.clone())),
+            None => shell.active_version().map(|v| (v.photo_id, v.edit_json.clone(), SourceToken::Preview)),
+        }
+        .filter(|(photo, _, _)| Some(*photo) == target);
+        let Some((photo, edit_json, source)) = record else {
             self.renders.update(cx, |r, cx| r.want(&[], cx));
             self.zoom.update(cx, |z, cx| z.set_override(None, cx));
             return;
         };
-        let lo = preview_job(version.photo_id, &version.edit_json, LOUPE_EDGE, false, epoch);
-        let hi = preview_job(version.photo_id, &version.edit_json, 0, true, epoch);
+        let mut lo = preview_job(photo, &edit_json, LOUPE_EDGE, false, epoch);
+        let mut hi = preview_job(photo, &edit_json, 0, true, epoch);
+        lo.source = source.clone();
+        hi.source = source;
         let wants_hi = self.zoom.read(cx).wants_hi();
         let jobs = if wants_hi { vec![lo.clone(), hi.clone()] } else { vec![lo.clone()] };
         self.renders.update(cx, |r, cx| r.want(&jobs, cx));

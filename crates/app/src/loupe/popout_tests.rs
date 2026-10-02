@@ -325,3 +325,54 @@ fn module_panels_are_per_window_and_go_with_the_pop_out(cx: &mut TestAppContext)
     render_main(&app, cx);
     assert_eq!(registry.read_with(cx, |r, _| r.cached_view_count()), main_views, "the main window's is still cached");
 }
+
+/// The Darkroom's print (DarkroomView.tsx's "Loupe print"): while one is up the pop-out —
+/// not the inline loupe — shows that record rendered from the print's own pixels; taking it
+/// down returns the pop-out to the target and drops the render; a catalog switch takes it down.
+#[cfg(feature = "edit")]
+#[gpui_kit::test]
+fn the_pop_out_shows_the_darkrooms_print(cx: &mut TestAppContext) {
+    use crate::shell::state::LoupePrint;
+    use chairphoto_core::plugins::edit::SourceToken;
+    let (app, pool, _dir, ids) = app_with(3, "pop-print", cx);
+    select(&app, ids[0], cx);
+    press(&app, "enter", cx);
+    let h = open(cx);
+    let photo = app.wired.shell.read_with(cx, |s, _| s.library.photos().iter().find(|p| p.id == ids[1]).cloned()).unwrap();
+    let source = SourceToken::Working { photo_id: ids[1], generation: 7 };
+    let print = LoupePrint { photo, edit_json: "{\"ev\":1}".into(), source: source.clone() };
+    app.wired.shell.update(cx, |s, cx| s.set_loupe_print(Some(print), cx));
+    cx.run_until_parked();
+    assert_eq!(shown(h, cx), Some(ids[1]), "the print's photo");
+    let edits: Vec<_> = pool
+        .batches
+        .lock()
+        .unwrap()
+        .iter()
+        .flatten()
+        .filter_map(|k| match k {
+            JobKey::Edit(job) => Some(job.clone()),
+            _ => None,
+        })
+        .collect();
+    let lo = edits.into_iter().find(|j| j.max_edge == 2560).expect("the print's render was asked for");
+    assert_eq!((lo.photo_id, lo.edit_json.as_str(), &lo.source), (ids[1], "{\"ev\":1}", &source));
+    pool.finish(&JobKey::Edit(lo.clone()), Ok(pixels(40, 20)));
+    cx.run_until_parked();
+    render_popout(h, cx);
+    assert_eq!(popout_zoom(cx).read_with(cx, |z, _| z.drawn()), Some((ids[1], Drawn::OverrideLo)));
+    let inline = app.wired.root.clone().unwrap().read_with(cx, |r, cx| r.loupe().read(cx).zoom().read(cx).photo());
+    assert_eq!(inline, Some(ids[0]), "the inline loupe keeps the target");
+
+    app.wired.shell.update(cx, |s, cx| s.set_loupe_print(None, cx));
+    cx.run_until_parked();
+    assert_eq!(shown(h, cx), Some(ids[0]), "the target again");
+    assert_eq!(popout_zoom(cx).read_with(cx, |z, _| z.drawn()), None, "not the print's render");
+
+    let photo = app.wired.shell.read_with(cx, |s, _| s.library.photos()[1].clone());
+    app.wired.shell.update(cx, |s, cx| s.set_loupe_print(Some(LoupePrint { photo, edit_json: "{}".into(), source }), cx));
+    cx.run_until_parked();
+    deliver_switch(&app, cx);
+    assert!(app.wired.shell.read_with(cx, |s, _| s.loupe_print().is_none()), "a switch takes it down");
+    assert_eq!(shown(h, cx), None);
+}

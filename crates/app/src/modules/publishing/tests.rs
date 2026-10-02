@@ -55,8 +55,12 @@ impl PublishService for Fake {
         UploadService::Flickr
     }
     fn render(&self, _: &ModuleSettings, job: UploadJob) -> Result<RenderedJob, String> {
-        self.calls.lock().unwrap().rendered += 1;
-        let render: UploadRenderer = Arc::new(|_, out| std::fs::write(out, b"pixels").map_err(|e| e.to_string()));
+        // Counted when the render really runs (a tripped job refuses before it).
+        let calls = self.calls.clone();
+        let render: UploadRenderer = Arc::new(move |_, out| {
+            calls.lock().unwrap().rendered += 1;
+            std::fs::write(out, b"pixels").map_err(|e| e.to_string())
+        });
         job.render(&render)
     }
     fn upload(&self, _: &ModuleSettings, rendered: &RenderedJob, request: &PublishRequest) -> Result<String, String> {
@@ -433,6 +437,7 @@ fn cancel_stops_a_publish_before_its_upload(cx: &mut TestAppContext) {
     view.update(cx, |p, cx| p.cancel(cx));
     step(cx); // the render refuses (its job is tripped)
     view.read_with(cx, |p, _| assert_eq!((p.busy, p.stage, p.status.as_str()), (false, None, UPLOAD_CANCELLED)));
+    assert_eq!(calls.lock().unwrap().rendered, 0, "Cancel did not stop the render");
     assert!(calls.lock().unwrap().published.is_empty(), "a cancelled publish uploaded");
     assert!(publications(&app, ids[0]).is_empty());
 
@@ -574,7 +579,7 @@ fn oauth_settings_follow_a_catalog_switch(cx: &mut TestAppContext) {
     assert_eq!(key(cx), "", "A's key shown against B");
     cx.update(|cx| Runner::get(cx).release(held));
     work(cx);
-    view.read_with(cx, |v, _| assert_ne!(v.status, "Saved.", "A's answer landed after the switch"));
+    view.read_with(cx, |v, _| assert_eq!(v.status, "", "A's answer landed after the switch"));
     assert_eq!(key(cx), "key-b");
     assert_eq!(setting(&app, "fakr.api_key").as_deref(), Some("key-b"), "A's queued save wrote into B");
     view.update(cx, |v, cx| v.save(cx));

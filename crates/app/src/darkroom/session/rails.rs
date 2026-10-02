@@ -605,4 +605,107 @@ impl Darkroom {
         }
         cx.notify();
     }
+
+    // --- the loupe print ---------------------------------------------------------------------
+
+    /// "🖥 Loupe print" (DarkroomView.tsx's `togglePrintOnLoupe`): remembered
+    /// (`basic-editor.printOnLoupe`) after any earlier click still being written. On opens
+    /// (or raises) the pop-out loupe and puts the working print up at once; off takes it
+    /// down — the pop-out follows its target again.
+    pub fn set_print_on_loupe(&mut self, on: bool, cx: &mut Context<Self>) {
+        self.print_on_loupe = on;
+        self.print_clicks += 1;
+        if let Some(from) = self.open.as_ref().map(|o| o.from) {
+            self.write_in_order(
+                PRINT_ON_LOUPE_KEY,
+                move |this, cx| {
+                    let state = this.app.clone();
+                    let value = if on { "1" } else { "0" };
+                    let rx = Runner::get(cx).run(move || with_catalog_as(&state, from, |c| c.set_setting(PRINT_ON_LOUPE_KEY, value)));
+                    cx.spawn(async move |this, cx| {
+                        // Cosmetic: a failed write leaves the choice for this session only.
+                        let _ = rx.await;
+                        this.update(cx, |this, cx| this.setting_written(PRINT_ON_LOUPE_KEY, cx)).ok();
+                    })
+                    .detach();
+                },
+                cx,
+            );
+        }
+        if on {
+            crate::loupe::window::open(cx);
+            self.publish_print(cx);
+        } else {
+            if let Some(open) = self.open.as_mut() {
+                open.print_timer = None;
+            }
+            self.clear_print(cx);
+        }
+        cx.notify();
+    }
+
+    /// The stored choice arrived (with the photo's settings): follow it without writing it
+    /// back or opening the pop-out (React: the loupe ignores a print while it is closed).
+    pub(super) fn print_on_loupe_read(&mut self, on: bool, cx: &mut Context<Self>) {
+        if on == self.print_on_loupe {
+            return;
+        }
+        self.print_on_loupe = on;
+        if on {
+            self.publish_print(cx);
+        } else {
+            self.clear_print(cx);
+        }
+        cx.notify();
+    }
+
+    /// The print follows the record on the settle, as React's broadcast rode its settle.
+    pub(super) fn schedule_print(&mut self, cx: &mut Context<Self>) {
+        let on = self.print_on_loupe;
+        let Some(open) = self.open.as_mut() else { return };
+        if !on {
+            open.print_timer = None;
+            return;
+        }
+        let seq = open.seq;
+        let timer = cx.background_executor().timer(SETTLE);
+        open.print_timer = Some(cx.spawn(async move |this, cx| {
+            timer.await;
+            this.update(cx, |this, cx| {
+                if this.open.as_ref().is_some_and(|o| o.seq == seq) {
+                    this.publish_print(cx);
+                }
+            })
+            .ok();
+        }));
+    }
+
+    /// Put the open photo's working print up: the full record (crop included — the print,
+    /// not the stage), stamped with the engine that renders it, from the stage's pixels.
+    fn publish_print(&mut self, cx: &mut Context<Self>) {
+        use crate::shell::state::LoupePrint;
+        if !self.print_on_loupe {
+            return;
+        }
+        let Some(open) = self.open.as_ref() else { return };
+        let edit_json = open.stamped(&open.working).to_json();
+        let source = open.source_token().and_then(SourceToken::parse).unwrap_or(SourceToken::Preview);
+        let same = self
+            .shell
+            .read(cx)
+            .loupe_print()
+            .is_some_and(|p| p.photo.id == open.photo.id && p.edit_json == edit_json && p.source == source);
+        if same {
+            return;
+        }
+        let print = LoupePrint { photo: open.photo.clone(), edit_json, source };
+        self.shell.update(cx, |s, cx| s.set_loupe_print(Some(print), cx));
+    }
+
+    /// Take the print down, if one is up (the Darkroom is its only author).
+    pub(super) fn clear_print(&mut self, cx: &mut Context<Self>) {
+        if self.shell.read(cx).loupe_print().is_some() {
+            self.shell.update(cx, |s, cx| s.set_loupe_print(None, cx));
+        }
+    }
 }

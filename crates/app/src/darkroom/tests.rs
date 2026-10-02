@@ -1274,13 +1274,11 @@ fn the_darkroom_keys_stand_down_under_the_proof_sheet_and_the_duel(cx: &mut Test
         assert_eq!(rig.open_photo(cx), photo, "{key} under the proof sheet does not step the filmstrip");
         assert!(stage_view(cx).is_fit(), "{key} under the proof sheet does not zoom");
         assert_eq!(rig.labels(v).1, head, "{key} under the proof sheet does not move the history");
-        if key != "enter" {
-            assert_eq!(overlay(cx), "proof", "{key}: the sheet stays up");
-        }
+        // Enter with no proof focused is a no-op of the sheet's own (`loupe::proof_sheet`).
+        assert_eq!(overlay(cx), "proof", "{key}: the sheet stays up");
     }
-    // Enter is the focused backdrop's keyboard click: the sheet declines and closes (its own
-    // behaviour, `loupe::proof_sheet`) — but the Darkroom did not also take it as "zoom".
-    assert_eq!(overlay(cx), "none", "Enter declines the sheet");
+    rig.press("escape", cx);
+    assert_eq!(overlay(cx), "none");
 
     // Under the duel: no undo, redo or zoom.
     rig.with_view(cx, |v, window, cx| v.open_duel(window, cx));
@@ -1293,4 +1291,171 @@ fn the_darkroom_keys_stand_down_under_the_proof_sheet_and_the_duel(cx: &mut Test
         assert_eq!(overlay(cx), "duel", "{key}: the duel stays up");
     }
     assert_eq!(rig.saved(v)["tone"]["ev"], json!(0.5), "the version is as it was");
+}
+
+/// "🖥 Loupe print" (DarkroomView.tsx's `printOnLoupe`, `basic-editor.printOnLoupe`, default
+/// on): the working print goes up on the pop-out after the settle and follows the record;
+/// the toggle remembers the choice, turning it on opens the pop-out, whose loupe then renders
+/// the print; off, a step, leaving and a catalog switch take it down.
+#[gpui_kit::test]
+fn the_loupe_print_follows_the_record_onto_the_pop_out(cx: &mut TestAppContext) {
+    use crate::loupe::window;
+    use super::session::PRINT_ON_LOUPE_KEY;
+    let rig = rig("dk-print", 3, cx);
+    let order = rig.app.wired.shell.read_with(cx, |s, _| s.library.photo_ids());
+    let print = |cx: &mut TestAppContext| {
+        rig.app.wired.shell.read_with(cx, |s, _| s.loupe_print().map(|p| (p.photo.id, p.edit_json.clone(), p.source.clone())))
+    };
+    let stored = |rig: &Rig| rig.catalog(|c| c.get_setting(PRINT_ON_LOUPE_KEY).unwrap());
+    let ev_of = |json: &str| serde_json::from_str::<Value>(json).unwrap()["tone"]["ev"].clone();
+    // On by default: up after the open's settle.
+    advance(cx, SETTLE);
+    assert_eq!(print(cx), Some((order[0], "{}".to_string(), SourceToken::Preview)));
+
+    click(&rig.app, "dk-loupe-print", cx);
+    work(cx);
+    assert_eq!(print(cx), None, "off takes it down");
+    assert_eq!(stored(&rig).as_deref(), Some("0"));
+    rig.slide(Control::Tone(ToneKey::Ev), 0.5, cx);
+    advance(cx, SETTLE);
+    assert_eq!(print(cx), None, "off, a settle puts nothing up");
+    assert!(cx.update(|cx| window::handle(cx)).is_none());
+
+    click(&rig.app, "dk-loupe-print", cx);
+    work(cx);
+    assert_eq!(stored(&rig).as_deref(), Some("1"));
+    let h = cx.update(|cx| window::handle(cx)).expect("turning the print on opens the pop-out");
+    let (photo, json, _) = print(cx).expect("on puts the print up at once");
+    assert_eq!((photo, ev_of(&json)), (order[0], json!(0.5)));
+    // The pop-out's loupe renders that record (React's 2560 px loupe render).
+    cx.update_window(h, |_, window, cx| window.render_frame(cx)).unwrap();
+    cx.run_until_parked();
+    let zoom = cx.update(|cx| window::view(cx)).unwrap().read_with(cx, |v, cx| v.loupe().read(cx).zoom().clone());
+    assert_eq!(zoom.read_with(cx, |z, _| z.photo()), Some(order[0]));
+    let job = rig.edit_jobs().into_iter().rev().find(|j| j.max_edge == 2560).expect("the pop-out asked for the print");
+    assert_eq!((job.photo_id, job.edit_json.as_str()), (order[0], json.as_str()));
+
+    // It follows the record on the settle, not before.
+    rig.slide(Control::Tone(ToneKey::Ev), 1.0, cx);
+    assert_eq!(print(cx).map(|p| ev_of(&p.1)), Some(json!(0.5)), "not before the settle");
+    advance(cx, SETTLE);
+    assert_eq!(print(cx).map(|p| ev_of(&p.1)), Some(json!(1)));
+
+    // A step takes the photo left's print down; the next photo's follows its settle.
+    let view = rig.view(cx);
+    assert!(view.update(cx, |v, cx| v.step(1, None, cx)));
+    cx.run_until_parked();
+    assert_eq!(rig.open_photo(cx), Some(order[1]));
+    assert_eq!(print(cx), None, "the photo left's print is down");
+    work(cx);
+    advance(cx, SETTLE);
+    assert_eq!(print(cx).map(|p| p.0), Some(order[1]));
+
+    // Leaving the Darkroom takes it down, and nothing late puts it back.
+    click(&rig.app, "dk-back", cx);
+    work(cx);
+    assert_eq!(rig.surface(cx), Surface::Library);
+    assert_eq!(print(cx), None, "leaving takes it down");
+    advance(cx, SETTLE * 2);
+    assert_eq!(print(cx), None);
+
+    // The stored choice is read with the next open: off stays off.
+    rig.catalog(|c| c.set_setting(PRINT_ON_LOUPE_KEY, "0").unwrap());
+    rig.app.wired.shell.update(cx, |s, cx| s.open_develop(cx));
+    work(cx);
+    advance(cx, SETTLE);
+    assert_eq!(print(cx), None, "stored off");
+    let d = rig.darkroom(cx);
+    assert!(!d.read_with(cx, |d, _| d.print_on_loupe));
+    // A click while that read is on the worker is newer than what it reads.
+    click(&rig.app, "dk-back", cx);
+    work(cx);
+    rig.app.wired.shell.update(cx, |s, cx| s.open_develop(cx));
+    cx.run_until_parked();
+    click(&rig.app, "dk-loupe-print", cx);
+    work(cx);
+    assert!(d.read_with(cx, |d, _| d.print_on_loupe), "the stale read did not undo the click");
+    assert_eq!(stored(&rig).as_deref(), Some("1"));
+    advance(cx, SETTLE);
+    assert_eq!(print(cx).map(|p| p.0), Some(order[1]));
+    // A catalog switch takes it down.
+    let (b, _) = colliding_catalog(&rig.dir, "b", 3);
+    core_switch(&rig.app, b);
+    let event = CoreEvent::CatalogSwitched("switched.chairphoto".into());
+    rig.app.wired.model.update(cx, |m, cx| m.on_core_event(&event, cx));
+    cx.run_until_parked();
+    assert_eq!(print(cx), None, "a switch takes it down");
+    advance(cx, SETTLE * 2);
+    work(cx);
+    assert_eq!(print(cx), None);
+}
+
+/// The proof sheet's keys, as React's proof cells were buttons: Enter on the sheet as dealt
+/// (the backdrop focused, no proof) neither declines nor adopts; Tab / Shift+Tab move focus
+/// through the proofs, wrapping; Enter adopts the focused proof. A pointer click on the
+/// backdrop still declines.
+#[gpui_kit::test]
+fn enter_on_the_proof_sheet_adopts_the_focused_proof_and_the_backdrop_click_declines(cx: &mut TestAppContext) {
+    use super::view::Overlay;
+    use crate::loupe::proof_sheet::ProofSheet;
+    let rig = rig("dk-proof-keys", 1, cx);
+    work(cx);
+    let sheet_of = |rig: &Rig, cx: &mut TestAppContext| {
+        rig.view(cx).read_with(cx, |v, _| match v.overlay() {
+            Some(Overlay::Proof(p)) => Some(p.clone()),
+            _ => None,
+        })
+    };
+    let focused = |rig: &Rig, sheet: &Entity<ProofSheet>, cx: &mut TestAppContext| {
+        cx.update_window(rig.app.window(), |_, window, cx| sheet.read(cx).focused(window)).unwrap()
+    };
+    rig.with_view(cx, |v, window, cx| v.open_proof_sheet(window, cx));
+    let sheet = sheet_of(&rig, cx).expect("the proof sheet is mounted");
+    let n = sheet.read_with(cx, |s, _| s.candidates().len());
+    assert!(n > 2);
+    let before = rig.working(cx);
+
+    rig.press("enter", cx);
+    assert!(sheet_of(&rig, cx).is_some(), "Enter with no proof focused does not decline");
+    assert_eq!(rig.working(cx), before, "… nor adopt");
+    assert_eq!(focused(&rig, &sheet, cx), None);
+
+    rig.press("tab", cx);
+    assert_eq!(focused(&rig, &sheet, cx), Some(0));
+    rig.press("tab", cx);
+    rig.press("tab", cx);
+    assert_eq!(focused(&rig, &sheet, cx), Some(2));
+    rig.press("shift-tab", cx);
+    assert_eq!(focused(&rig, &sheet, cx), Some(1));
+    rig.press("shift-tab", cx);
+    rig.press("shift-tab", cx);
+    assert_eq!(focused(&rig, &sheet, cx), Some(n - 1), "wraps");
+    rig.press("tab", cx);
+    rig.press("tab", cx);
+    assert_eq!(focused(&rig, &sheet, cx), Some(1));
+    // On to the first film proof (a change from the record, so it is saved as a step).
+    let k = sheet.read_with(cx, |s, _| {
+        s.candidates().iter().position(|c| c.group == chairphoto_model::darkroom::spreads::ProofGroup::Film).unwrap()
+    });
+    assert!(k > 1);
+    while focused(&rig, &sheet, cx) != Some(k) {
+        rig.press("tab", cx);
+    }
+    let (label, record) = sheet.read_with(cx, |s, _| (s.candidates()[k].label.clone(), s.candidates()[k].record.clone()));
+    rig.press("enter", cx);
+    assert!(sheet_of(&rig, cx).is_none(), "Enter adopted and closed");
+    assert_eq!(rig.working(cx), serde_json::from_str::<Value>(&record.to_json()).unwrap(), "the focused proof's record");
+    rig.settle_and_save(cx);
+    let v1 = rig.versions()[0].id;
+    assert_eq!(rig.labels(v1).0.last().unwrap(), &format!("Proof: {label}"));
+
+    // The backdrop's pointer click declines.
+    rig.with_view(cx, |v, window, cx| v.open_proof_sheet(window, cx));
+    assert!(sheet_of(&rig, cx).is_some());
+    let before = rig.working(cx);
+    let corner = gpui_kit::point(gpui_kit::px(4.), gpui_kit::px(4.));
+    cx.update_window(rig.app.window(), |_, window, cx| window.click_at("proof-backdrop", corner, cx)).unwrap();
+    cx.run_until_parked();
+    assert!(sheet_of(&rig, cx).is_none(), "the backdrop click declines");
+    assert_eq!(rig.working(cx), before);
 }

@@ -90,6 +90,10 @@ actions!(
         DuelClose,
         /// Escape over the Proof sheet: decline.
         ProofClose,
+        /// Tab / Shift+Tab over the Proof sheet: focus the next / previous proof (wrapping,
+        /// inside the sheet — not the Root's window-wide tab order).
+        ProofNext,
+        ProofPrevious,
     ]
 );
 
@@ -163,6 +167,8 @@ pub fn bindings() -> Vec<KeyBinding> {
         KeyBinding::new("down", DuelSame, duel),
         KeyBinding::new("escape", DuelClose, duel),
         KeyBinding::new("escape", ProofClose, proof),
+        KeyBinding::new("tab", ProofNext, proof),
+        KeyBinding::new("shift-tab", ProofPrevious, proof),
         // A module card's full-size photo in the pop-out (#110).
         KeyBinding::new("escape", card::BackToWall, Some(contexts::LOUPE_CARD)),
     ];

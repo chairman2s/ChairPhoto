@@ -394,6 +394,13 @@ impl ModuleSettings {
         self.catalog
     }
 
+    /// The same module's settings, bound to `catalog` instead: for a long-lived view (a
+    /// settings panel outlives a catalog switch) that has just read which catalog is open
+    /// ([`AppModel::catalog_identity`] on `CatalogRead`). Still fails closed once another opens.
+    pub fn rebound(&self, catalog: CatalogIdentity) -> ModuleSettings {
+        ModuleSettings { app: self.app.clone(), prefix: self.prefix.clone(), catalog: Some(catalog) }
+    }
+
     pub fn get(&self, key: &str) -> Result<Option<String>, String> {
         let key = self.key(key);
         with_catalog_as(&self.app, self.bound()?, |c| c.get_setting(&key))
@@ -406,6 +413,19 @@ impl ModuleSettings {
 
     fn bound(&self) -> Result<CatalogIdentity, String> {
         self.catalog.ok_or_else(|| SETTINGS_NOT_READY.to_string())
+    }
+}
+
+/// A publishing module's settings are its service's (`<id>.api_key`, `.access_token`, …): the
+/// keys core's publish bodies (`chairphoto_core::app::oauth`, `::flickr`, `::smugmug`) read
+/// and write, through this handle — so bound to its catalog like every other module write.
+impl chairphoto_core::app::uploads::ServiceSettings for ModuleSettings {
+    fn get(&self, key: &str) -> Result<Option<String>, String> {
+        ModuleSettings::get(self, key)
+    }
+
+    fn set(&self, key: &str, value: &str) -> Result<(), String> {
+        ModuleSettings::set(self, key, value)
     }
 }
 

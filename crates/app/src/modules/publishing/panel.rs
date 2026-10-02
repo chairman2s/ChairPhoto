@@ -7,7 +7,9 @@
 //! not to publish it again), then why it wasn't recorded.
 //!
 //! Every service call runs on a worker ([`crate::storage::Runner`]); the panel's photo id is
-//! bound to the catalog it was read from ([`PublishSubject::catalog`]).
+//! bound to the catalog it was read from ([`PublishSubject::catalog`]). A Publish is core's
+//! publish job, shown step by step ([`Stage`]: preparing, rendering, uploading); Cancel stops
+//! it until the upload starts, and an upload in flight is left to finish.
 
 use super::{Album, PublishRequest, PublishService, PublishSubject, VersionPicker, NO_ROWS};
 use crate::model::AppModel;
@@ -16,6 +18,7 @@ use crate::shell::style::Colors;
 use crate::shell::ShellState;
 use crate::storage::{ui, Runner};
 use chairphoto_core::app::publications::record_publications_as;
+use chairphoto_core::app::uploads::{claim_upload, UPLOAD_CANCELLED};
 use chairphoto_core::app::AppState;
 use chairphoto_model::publishing::{default_album, publication_url};
 use gpui_kit::component::button::Button;
@@ -24,6 +27,7 @@ use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::Sizable as _;
 use gpui_kit::prelude::*;
 use gpui_kit::{div, px, App, ClickEvent, Context, Entity, SharedString, Subscription, TestSupportExt as _, Window};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 /// Settings keys (namespaced `<module id>.` by [`ModuleSettings`]).
@@ -52,6 +56,11 @@ pub struct PublishPanel {
     new_album_cleared: bool,
     pub creating: bool,
     pub busy: bool,
+    /// The running publish's step, shown as progress.
+    pub stage: Option<Stage>,
+    running: Option<Running>,
+    /// Bumped by every Publish; a superseded publish's answers are dropped.
+    attempt: u64,
     pub status: String,
     _subscriptions: Vec<Subscription>,
 }
@@ -105,6 +114,9 @@ impl PublishPanel {
             new_album_cleared: false,
             creating: false,
             busy: false,
+            stage: None,
+            running: None,
+            attempt: 0,
             status: String::new(),
             _subscriptions: subscriptions,
         };
@@ -262,8 +274,11 @@ impl PublishPanel {
         cx.notify();
     }
 
-    /// Publish: upload through the service, then record the publication (with the URL when
-    /// it is a web address) under the module's marker in the catalog the photo came from.
+    /// Publish: core's publish job in three worker steps — the sign-in check and the claim
+    /// (bound to the catalog the photo came from), the render, the upload — then the
+    /// publication recorded (with the URL when it is a web address) under the module's marker
+    /// in that catalog. Each step's landing moves [`Self::stage`]; the terminal answer is the
+    /// last step's. A closed dialog does not stop it: its answer goes to the status line.
     pub fn publish(&mut self, cx: &mut Context<Self>) {
         let Some(photo) = self.photo() else { return };
         let Some(catalog) = self.subject.catalog else {
@@ -274,8 +289,12 @@ impl PublishPanel {
         if self.busy || (self.service.has_albums() && self.album.is_empty()) {
             return;
         }
+        self.attempt += 1;
+        let attempt = self.attempt;
         self.busy = true;
-        self.status = "Publishing…".into();
+        self.stage = Some(Stage::Preparing);
+        self.running = Some(Running::default());
+        self.status = Stage::Preparing.line(&self.service.name());
         let request = PublishRequest {
             catalog,
             photo_id: photo,
@@ -287,38 +306,154 @@ impl PublishPanel {
         };
         let (service, settings, app, marker) = (self.service.clone(), self.settings.clone(), self.app.clone(), self.marker.clone());
         let version = request.version_id;
-        // Outer `Err`: the upload failed. Inner `Err`: the upload succeeded and only the
-        // record step failed — the photo is on the service, so that must not read as a failed
-        // publish (a retry would upload it twice).
-        let rx = Runner::get(cx).run(move || -> Result<Result<(), String>, String> {
-            let answer = service.publish(&settings, request)?;
-            Ok(record_publications_as(&app, catalog, &[(photo, version)], &marker, publication_url(&answer)))
-        });
+        let claim = {
+            let (service, settings, app) = (service.clone(), settings.clone(), app.clone());
+            Runner::get(cx).run(move || {
+                service.ready(&settings)?;
+                claim_upload(&app, Some(catalog), service.service(), photo, version)
+            })
+        };
         let (model, name) = (self.model.clone(), self.service.name());
         cx.spawn(async move |this, cx| {
-            let result = rx.await.unwrap_or_else(|_| Err("The publish stopped unexpectedly".into()));
-            let line = match &result {
-                Ok(Ok(())) => Some(format!("Published to {name}.")),
-                Ok(Err(e)) => Some(unrecorded_line(&name, e)),
-                Err(_) => None,
-            };
-            if let Some(line) = line {
-                cx.update(|cx| model.update(cx, |m, cx| m.set_status(line, cx)));
-            }
-            this.update(cx, |p, cx| {
-                p.busy = false;
-                p.status = match result {
-                    Ok(Ok(())) => format!("Published to {name} ✓"),
-                    Ok(Err(e)) => unrecorded_line(&name, &e),
-                    Err(e) => e,
+            let land = |result: Outcome, cx: &mut gpui_kit::AsyncApp| {
+                let line = match &result {
+                    Ok(Ok(())) => Some(format!("Published to {name}.")),
+                    Ok(Err(e)) => Some(unrecorded_line(&name, e)),
+                    Err(_) => None,
                 };
-                cx.notify();
-            })
-            .ok();
+                if let Some(line) = line {
+                    cx.update(|cx| model.update(cx, |m, cx| m.set_status(line, cx)));
+                }
+                this.update(cx, |p, cx| p.land(attempt, result, cx)).ok();
+            };
+            let job = match claim.await.unwrap_or_else(|_| Err(STOPPED.into())) {
+                Ok(job) => job,
+                Err(e) => return land(Err(e), cx),
+            };
+            match this.update(cx, |p, cx| p.step(attempt, Stage::Rendering, Some(job.abort_handle()), cx)).unwrap_or(Go::Run) {
+                Go::Run => {}
+                Go::Cancelled => return land(Err(UPLOAD_CANCELLED.into()), cx),
+                Go::Superseded => return,
+            }
+            let render = {
+                let (service, settings) = (service.clone(), settings.clone());
+                cx.update(|cx| Runner::get(cx).run(move || service.render(&settings, job)))
+            };
+            let rendered = match render.await.unwrap_or_else(|_| Err(STOPPED.into())) {
+                Ok(rendered) => rendered,
+                Err(e) => return land(Err(e), cx),
+            };
+            match this.update(cx, |p, cx| p.step(attempt, Stage::Uploading, None, cx)).unwrap_or(Go::Run) {
+                Go::Run => {}
+                Go::Cancelled => return land(Err(UPLOAD_CANCELLED.into()), cx),
+                Go::Superseded => return,
+            }
+            // Outer `Err`: the upload failed (or never started). Inner `Err`: the upload
+            // succeeded and only the record step failed — the photo is on the service, so that
+            // must not read as a failed publish (a retry would upload it twice).
+            let upload = cx.update(|cx| {
+                Runner::get(cx).run(move || -> Outcome {
+                    let answer = service.upload(&settings, &rendered, &request)?;
+                    drop(rendered);
+                    Ok(record_publications_as(&app, catalog, &[(photo, version)], &marker, publication_url(&answer)))
+                })
+            });
+            land(upload.await.unwrap_or_else(|_| Err(STOPPED.into())), cx);
         })
         .detach();
         cx.notify();
     }
+
+    /// Publish `attempt` reached `stage`: show it and keep the job's abort flag — unless Cancel
+    /// came first (then it stops here) or a newer Publish superseded it.
+    fn step(&mut self, attempt: u64, stage: Stage, abort: Option<Arc<AtomicBool>>, cx: &mut Context<Self>) -> Go {
+        if attempt != self.attempt {
+            return Go::Superseded;
+        }
+        let Some(running) = self.running.as_mut() else { return Go::Superseded };
+        if abort.is_some() {
+            running.abort = abort;
+        }
+        if running.cancelled {
+            return Go::Cancelled;
+        }
+        self.stage = Some(stage);
+        self.status = stage.line(&self.service.name());
+        cx.notify();
+        Go::Run
+    }
+
+    fn land(&mut self, attempt: u64, result: Outcome, cx: &mut Context<Self>) {
+        if attempt != self.attempt {
+            return; // a superseded publish
+        }
+        let name = self.service.name();
+        self.busy = false;
+        self.stage = None;
+        self.running = None;
+        self.status = match result {
+            Ok(Ok(())) => format!("Published to {name} ✓"),
+            Ok(Err(e)) => unrecorded_line(&name, &e),
+            Err(e) => e,
+        };
+        cx.notify();
+    }
+
+    /// Cancel the running publish: before the upload starts, it stops (nothing is uploaded);
+    /// an upload already in flight is not interrupted (the button is gone by then).
+    pub fn cancel(&mut self, cx: &mut Context<Self>) {
+        if self.stage == Some(Stage::Uploading) {
+            return;
+        }
+        if let Some(r) = self.running.as_mut() {
+            r.cancelled = true;
+            if let Some(abort) = &r.abort {
+                abort.store(true, Ordering::Relaxed);
+            }
+        }
+        cx.notify();
+    }
+}
+
+/// What a publish answers: outer `Err` — nothing was published; inner `Err` — published, but
+/// the publication could not be recorded.
+type Outcome = Result<Result<(), String>, String>;
+
+/// What the panel says when a worker step died (a panic) without an answer.
+const STOPPED: &str = "The publish stopped unexpectedly";
+
+/// Where a publish is: the progress the panel shows. Only [`Stage::Uploading`] cannot be
+/// cancelled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stage {
+    /// The sign-in check and the claim.
+    Preparing,
+    Rendering,
+    Uploading,
+}
+
+impl Stage {
+    pub fn line(self, service: &str) -> String {
+        match self {
+            Stage::Preparing => "Preparing…".into(),
+            Stage::Rendering => "Rendering…".into(),
+            Stage::Uploading => format!("Uploading to {service}…"),
+        }
+    }
+}
+
+/// What a landed step does next.
+enum Go {
+    Run,
+    Cancelled,
+    Superseded,
+}
+
+/// The running publish: whether Cancel was pressed, and its job's abort flag once claimed.
+#[derive(Default)]
+struct Running {
+    cancelled: bool,
+    abort: Option<Arc<AtomicBool>>,
 }
 
 /// An upload that succeeded but whose publication could not be recorded: says it is published
@@ -405,11 +540,12 @@ impl Render for PublishPanel {
         }
         let can = !self.busy && !(self.service.has_albums() && self.album.is_empty());
         let label = if self.busy { "Publishing…".to_string() } else { format!("Publish to {name}") };
-        body.child(
-            ui::row()
-                .child(ui::clickable(ui::primary("publish-panel-publish", label, can, colors), can, cx.listener(|p, _, _, cx| p.publish(cx))))
-                .child(div().id("publish-panel-status").child(ui::sub(self.status.clone(), colors)).test_support()),
-        )
-        .test_support()
+        let mut actions =
+            ui::row().child(ui::clickable(ui::primary("publish-panel-publish", label, can, colors), can, cx.listener(|p, _, _, cx| p.publish(cx))));
+        // Cancel while the publish can still stop without uploading anything.
+        if self.busy && self.stage != Some(Stage::Uploading) {
+            actions = actions.child(ui::clickable(ui::chip("publish-panel-cancel", "Cancel", true, colors), true, cx.listener(|p, _, _, cx| p.cancel(cx))));
+        }
+        body.child(actions.child(div().id("publish-panel-status").child(ui::sub(self.status.clone(), colors)).test_support())).test_support()
     }
 }

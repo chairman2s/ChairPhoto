@@ -108,12 +108,14 @@ impl TagEditor {
             }),
             cx.observe(&tags, |_, _, cx| cx.notify()),
             // Module sections read the tag being edited from the shell; a closed editor stops
-            // naming it — only if a newer editor has not taken over.
+            // naming it — only if a newer editor has not taken over. The publication is the
+            // pair (tag, catalog): another catalog's tag can have the same id.
             cx.on_release({
                 let shell = shell.clone();
+                let from = guard.identity;
                 move |_, cx| {
                     shell.update(cx, |s, cx| {
-                        if s.editing_tag == Some(id) {
+                        if s.editing_tag == Some(id) && s.editing_tag_from == from {
                             s.set_editing_tag(None, None, cx);
                         }
                     })

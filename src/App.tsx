@@ -101,7 +101,7 @@ import { ModuleActionModal, ModuleContent, isModalAction } from "./modules/Modul
 import { BUNDLED_MODULES } from "./modules/bundled";
 import { useOwnedSubscription } from "./modules/ownedEvents";
 import { Preferences } from "./components/Preferences";
-import { IdentityDebtPanel } from "./components/IdentityDebtPanel";
+import { IdentityDebtPanel, identityDebtBadge } from "./components/IdentityDebtPanel";
 import { ExportPanel } from "./components/ExportPanel";
 import { PublishDialog } from "./components/PublishDialog";
 import { ImportPanel } from "./components/ImportPanel";
@@ -889,7 +889,7 @@ export default function App() {
   const refreshIdentityDebtCount = useCallback(async () => {
     try {
       const s = await summarizePendingIdentity();
-      setIdentityDebtCount(s.total);
+      setIdentityDebtCount(identityDebtBadge(s));
     } catch {
       // Leave the count as it was: an IPC error means "unknown", not "zero". Resetting
       // to 0 here would hide the topbar chip and silently remove the panel's only entry

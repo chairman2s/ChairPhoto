@@ -1173,6 +1173,10 @@ export interface PendingIdentitySummary {
    *  deliberately not debt (CONTEXT.md § Identity). List them with
    *  `listPendingIdentity(…, true)` to restore one. */
   dismissed: number;
+  /** Photos whose catalog IPTC has fields their sidecar has not received yet (#148) — a
+   *  sidecar write that failed after the save. Photos, not copies, and not in `total`; the
+   *  repair pass retries them too. Optional: a backend older than #148 omits it. */
+  iptcOwed?: number;
 }
 
 export interface IdentityRepairSummary {
@@ -1198,6 +1202,13 @@ export interface IdentityRepairSummary {
    *  a catalog switch. Every count above is then partial, and must be labelled as such
    *  rather than presented as a finished result. */
   aborted: boolean;
+  /** Photos whose owed IPTC (#148) the pass wrote into their sidecar. The three `iptc*`
+   *  counts are optional: a backend older than #148 omits them. */
+  iptcWritten?: number;
+  /** Photos owing IPTC with no reachable copy; still owed. Not a failure. */
+  iptcUnreachable?: number;
+  /** Photos owing IPTC whose sidecar write still fails; still owed. */
+  iptcFailed?: number;
 }
 
 /** Progress event for a running repair pass (`identity:repair_progress`). `job` is what
@@ -1725,8 +1736,18 @@ export interface IptcFields {
 
 export const getIptc = (photoId: number) => invoke<IptcFields>("get_iptc", { photoId });
 
+/** What became of an IPTC save's sidecar write. The catalog always has the values once
+ *  `setIptc` resolves; `pending` means the sidecar does not yet — the fields stay owed and
+ *  the next save or the identity-debt repair pass writes them (#148). `unchanged` means
+ *  nothing was owed, so the sidecar was not opened. */
+export interface IptcSaveOutcome {
+  sidecar: "written" | "unchanged" | "pending";
+  /** Why the sidecar is pending, when it is. */
+  reason: string | null;
+}
+
 export const setIptc = (photoId: number, fields: IptcFields) =>
-  invoke<void>("set_iptc", { photoId, fields });
+  invoke<IptcSaveOutcome>("set_iptc", { photoId, fields });
 
 // ── H16e — Burst-relative sharpness flagging ─────────────────────────────────
 

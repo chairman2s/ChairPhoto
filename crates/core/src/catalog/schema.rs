@@ -531,4 +531,26 @@ CREATE TABLE IF NOT EXISTS photo_legacy_identifiers (
     identifier TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_photo_legacy_identifiers ON photo_legacy_identifiers(identifier);
+
+-- Schema v25 (#148). Authored IPTC that is in SQLite but NOT yet in the photo's sidecar.
+-- A sidecar write runs after the catalog commit and writes only the fields it owes, so a
+-- write that fails after the store (read-only storage, an unparseable sidecar, a volume
+-- unmounting mid-save) would otherwise leave a field the catalog holds and no later save
+-- writes. `owed` is a bitmask of `IptcMask` fields — its bit numbering is persisted here
+-- and must never change. `Catalog::set_iptc` ORs the fields it changed into `owed` and
+-- bumps `generation` in the same transaction as the store; a successful write clears
+-- `owed` only while `generation` is still the one it wrote (a compare-and-set), so a newer
+-- save's fields are never cleared by an older write. Rows are kept at `owed = 0` rather
+-- than deleted, so `generation` only ever grows for a photo. `attempts`/`error` describe
+-- the last failed write, for diagnosis. Retried by the identity repair pass.
+CREATE TABLE IF NOT EXISTS pending_sidecar_iptc (
+    photo_id        INTEGER PRIMARY KEY REFERENCES photos(id) ON DELETE CASCADE,
+    owed            INTEGER NOT NULL DEFAULT 0 CHECK (owed >= 0 AND owed < 2048),
+    generation      INTEGER NOT NULL DEFAULT 1,
+    attempts        INTEGER NOT NULL DEFAULT 0,
+    error           TEXT NOT NULL DEFAULT '',
+    queued_at       INTEGER NOT NULL,
+    last_attempt_at INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_pending_sidecar_iptc_owed ON pending_sidecar_iptc(photo_id) WHERE owed != 0;
 "#;

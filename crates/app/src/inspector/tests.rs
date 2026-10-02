@@ -479,6 +479,36 @@ fn iptc_save_backs_up_a_foreign_sidecar_and_keeps_its_elements(cx: &mut TestAppC
     assert_eq!(backup, foreign);
 }
 
+/// #148: a save whose sidecar write fails after the catalog stored the values (here an
+/// unparseable sidecar) never says "Saved to sidecar". It says the catalog has them and the
+/// sidecar is pending, the form takes the saved values as its baseline, and the fields stay
+/// owed for the repair pass.
+#[gpui_kit::test]
+fn an_iptc_save_whose_sidecar_write_fails_reports_the_sidecar_pending(cx: &mut TestAppContext) {
+    let dir = TempDir::new("insp-iptc-pending");
+    let app = start(cx);
+    let ids = open_catalog_with_photos(&app, &dir, 1, cx);
+    let original = dir.0.join("photos/2026/p0.ARW");
+    std::fs::create_dir_all(original.parent().unwrap()).unwrap();
+    std::fs::write(&original, b"raw").unwrap();
+    let sidecar = dir.0.join("photos/2026/p0.ARW.xmp");
+    std::fs::write(&sidecar, "<x:xmpmeta not xml").unwrap();
+    select(&app, ids[0], SelectMods::default(), cx);
+    click(&app, "section-iptc", cx);
+    let insp = inspector(&app, cx);
+    render(&app, cx);
+    let headline = insp.read_with(cx, |i, _| i.iptc.fields[0].clone());
+    set_input(&app, &headline, "Fjord at dawn", cx);
+    insp.update(cx, |i, cx| i.save_iptc(cx));
+    work(cx);
+    let status = aria(&app, "iptc-status", cx).unwrap_or_default();
+    assert!(status.starts_with("Saved to catalog; sidecar pending"), "{status}");
+    assert!(!insp.read_with(cx, |i, cx| i.iptc.dirty(cx)), "the catalog has the values: they are the baseline");
+    assert_eq!(catalog(&app, |c| c.get_iptc(ids[0]).unwrap().headline), "Fjord at dawn");
+    assert_eq!(catalog(&app, |c| c.owed_iptc(ids[0]).unwrap()), chairphoto_core::catalog::IptcMask::HEADLINE);
+    assert_eq!(std::fs::read_to_string(&sidecar).unwrap(), "<x:xmpmeta not xml");
+}
+
 /// Save IPTC waits for the photo's fields (a save of the still-empty form would wipe them),
 /// and a second Save while the first is in flight runs after it — one save per photo at a
 /// time, the newer values last in both the catalog and the sidecar.

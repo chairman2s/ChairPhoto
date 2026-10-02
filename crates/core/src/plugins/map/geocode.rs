@@ -369,24 +369,64 @@ fn with_bound<T>(
     }
 }
 
-/// The sidecar half of a fill, done off the catalog lock: the original, the IPTC before
-/// and after the fill, and the sidecar's write turn, held since before the fill stored, so
-/// this write and a manual save's land in the order they stored (#149).
+/// The sidecar half of a fill, done off the catalog lock: the original, the sidecar write
+/// the fill's store owes (the filled fields, plus any an earlier write left owed), and the
+/// sidecar's write turn, held since before the fill stored, so this write and a manual
+/// save's land in the order they stored (#149).
 struct SidecarFill {
     original: std::path::PathBuf,
-    before: crate::catalog::IptcFields,
-    after: crate::catalog::IptcFields,
-    _turn: crate::xmp::lock::WriteOrder,
+    write: crate::catalog::IptcSidecarWrite,
+    turn: crate::xmp::lock::WriteOrder,
 }
 
 impl SidecarFill {
-    /// Write only the filled fields: `xmp::write_iptc` leaves every field the fill did not
-    /// change — a foreign creator, rights or caption included — as the sidecar has it (#144).
-    /// The turn is released when the write is done; call it with no lock held and no
-    /// `.await` between the fill and this write.
-    fn write(self) -> Result<(), String> {
-        crate::xmp::write_iptc(&self.original, &self.before, &self.after)
+    /// Write only the owed fields: every field neither this fill nor an earlier failed write
+    /// changed — a foreign creator, rights or caption included — stays as the sidecar has
+    /// it (#144). Settled in the catalog the fill stored in; a failure leaves the fields
+    /// owed for the next save or repair pass (#148), and is answered as an error that says
+    /// so in a geocode's terms ([`pending_message`]). The turn is released once the write
+    /// is settled. Blocking: runs on the blocking pool with the fill ([`fill_and_write`]).
+    fn write(self, state: &crate::app::AppState, identity: CatalogIdentity) -> Result<(), String> {
+        let outcome = crate::app::iptc::write_and_settle(state, identity, &self.original, &self.write, self.turn);
+        match outcome.sidecar {
+            crate::catalog::IptcSidecarState::Pending => Err(pending_message(&outcome)),
+            _ => Ok(()),
+        }
     }
+}
+
+/// What a single-photo geocode answers when the location reached the catalog but not the
+/// sidecar. It is shown where a geocode error is, so it speaks of the geocode, not of a
+/// save the user did not make (review of #148, N2).
+fn pending_message(outcome: &crate::app::iptc::IptcSaveOutcome) -> String {
+    let why = outcome.reason.as_deref().map(|r| format!(" ({r})")).unwrap_or_default();
+    format!("Geocoded location stored in the catalog, but not yet in the sidecar{why}; the repair pass will write it")
+}
+
+/// Step 3 of a fill and its sidecar write, on the blocking pool: `Err` when the fill
+/// failed (nothing stored; `CATALOG_CHANGED` after a switch), `Ok(None)` when nothing was
+/// filled, otherwise the sidecar write's result.
+///
+/// The fill waits for the sidecar's write turn ([`crate::xmp::lock::WriteOrder::wait`]),
+/// which blocks its thread until every earlier save or fill of that sidecar is done. That
+/// thread must not be a runtime worker. With the wait on a worker (#148), a fill waiting
+/// behind a save left the runtime's timers unfired: a 20 ms sleep elsewhere on the runtime
+/// did not complete for as long as the fill waited, with the other workers idle, and fired
+/// the moment a newly spawned task woke one of them; on a current-thread runtime the wait
+/// blocked the only thread, so the save holding the turn could never finish. The catalog
+/// lock and the sidecar I/O are blocking work too.
+async fn fill_and_write(
+    state: &crate::app::AppState,
+    identity: CatalogIdentity,
+    photo_id: i64,
+    geo: &GeocodeResult,
+) -> Result<Option<Result<(), String>>, String> {
+    let (state, geo) = (state.clone(), geo.clone());
+    tokio::task::spawn_blocking(move || {
+        Ok(fill_in(&state, identity, photo_id, &geo)?.map(|fill| fill.write(&state, identity)))
+    })
+    .await
+    .map_err(|e| format!("geocode: the fill's worker failed: {e}"))?
 }
 
 /// Step 3 of a fill, in the catalog the photo was read from: re-read the IPTC (a value the
@@ -394,6 +434,7 @@ impl SidecarFill {
 /// all under one lock hold of that catalog. Returns the sidecar write still to do (off the
 /// lock), or `None` when nothing was filled. The path is resolved before the row is
 /// written, so an unreachable original leaves the catalog and the sidecar in step.
+/// Blocking (it waits for the write turn): call it through [`fill_and_write`].
 fn fill_in(
     state: &crate::app::AppState,
     identity: CatalogIdentity,
@@ -413,8 +454,8 @@ fn fill_in(
             return Ok(None);
         }
         let original = c.require_photo_path(photo_id)?;
-        c.set_iptc(photo_id, &updated)?;
-        Ok(Some(SidecarFill { original, before: current, after: updated, _turn: turn }))
+        let write = c.set_iptc(photo_id, &updated)?;
+        Ok(Some(SidecarFill { original, write, turn }))
     })
 }
 
@@ -445,7 +486,7 @@ async fn lookup_or_ask(
 /// The catalog lock is never held across the HTTP call: (1) read GPS, the endpoint and the
 /// cache under the lock; (2) ask Nominatim with no lock held; (3) re-read the IPTC under the
 /// lock and fill only what is still empty (a value the user typed meanwhile wins), then
-/// write the sidecar off the lock through `xmp::write_iptc`, as a manual IPTC save does.
+/// write the sidecar off the lock with the write turn held, as a manual IPTC save does.
 ///
 /// **Catalog identity.** `photo_id` means a photo of one catalog. Every step runs in the
 /// catalog step 1 read — `expected` when the caller read the id with an identity, else the
@@ -492,10 +533,10 @@ pub async fn geocode_photo_to_iptc(
     let Some(step1) = step1 else { return Ok(false) };
 
     let geo = lookup_or_ask(state, identity, &step1.endpoint, step1.lat, step1.lng).await?;
-    let Some(fill) = fill_in(state, identity, photo_id, &geo)? else {
+    let Some(written) = fill_and_write(state, identity, photo_id, &geo).await? else {
         return Ok(false);
     };
-    fill.write()?;
+    written?;
     Ok(true)
 }
 
@@ -590,17 +631,15 @@ pub async fn geocode_all_to_iptc_with(
             return Err(GEOCODE_CANCELLED.into()); // stopped while Nominatim answered
         }
         // An original that went offline since the read is skipped; a switch stops the run.
-        let write = match fill_in(state, identity, candidate.photo_id, &geo) {
+        let written = match fill_and_write(state, identity, candidate.photo_id, &geo).await {
             Err(e) if e == crate::app::CATALOG_CHANGED => return Err(e),
             Err(_) => None,
-            Ok(write) => write,
+            Ok(written) => written,
         };
         // Counted as filled only when the sidecar write also succeeded, so the summary does
         // not claim a photo whose sidecar diverged.
-        if let Some(fill) = write {
-            if fill.write().is_ok() {
-                filled += 1;
-            }
+        if let Some(Ok(())) = written {
+            filled += 1;
         }
         done += 1;
         on_progress(GeocodeProgress { done, total, filled });
@@ -997,7 +1036,9 @@ mod tests {
     /// Issue #144: both fill paths write only the location fields they filled. A foreign
     /// Lightroom sidecar's creator, rights, caption and headline — never imported, so empty
     /// in the catalog — survive, and so does its title although the catalog holds a
-    /// different one: the fill did not change the title, so it is not ChairPhoto's to write.
+    /// different one: the fill did not change the title, and the sidecar is not owed it (the
+    /// title reached it earlier and another tool changed it since), so it is not ChairPhoto's
+    /// to write. A title still owed would be written (#148; `app::iptc` tests).
     #[tokio::test]
     async fn a_fill_writes_only_the_fields_it_filled_into_a_foreign_sidecar() {
         use crate::xmp::test_fixtures::{assert_non_iptc_intact, foreign_iptc, iptc, with, LIGHTROOM};
@@ -1010,7 +1051,9 @@ mod tests {
             {
                 let guard = state.catalog.lock().unwrap();
                 let c = guard.as_ref().unwrap();
-                c.set_iptc(id, &crate::catalog::IptcFields { title: "Catalog title".into(), ..Default::default() }).unwrap();
+                let w = c.set_iptc(id, &crate::catalog::IptcFields { title: "Catalog title".into(), ..Default::default() }).unwrap();
+                // Settled as written: the sidecar's foreign title replaced it afterwards.
+                c.settle_iptc_write(&w, &Ok(())).unwrap();
             }
             if single {
                 assert!(geocode_photo_to_iptc(&state, None, id).await.unwrap());
@@ -1026,6 +1069,113 @@ mod tests {
             assert_eq!(iptc(&xml), expected, "single={single}:\n{xml}");
             assert_non_iptc_intact(&xml, "lightroom");
         }
+        server.abort();
+    }
+
+    /// #149 R3 / #155 R3: a fill racing a manual save stores and writes in turn order. The
+    /// save holds the sidecar's write turn between its store and its write; the fill must
+    /// not store (nor write) until the save's write is settled, and then both land: the
+    /// save's title and the fill's location are in the sidecar, and nothing is owed.
+    ///
+    /// Run on a small multi-thread runtime and on a current-thread one, with the fill and
+    /// the test body's timers sharing it. With the fill's turn wait on a runtime worker,
+    /// the multi-thread version hung in about one run in five (the test body's 20 ms sleep
+    /// never fired while the fill waited) and the current-thread one in every run (see
+    /// `fill_and_write`).
+    async fn a_fill_racing_a_save(tag: &str) {
+        let (server, endpoint) =
+            serve_forever(r#"{"address":{"city":"Oslo","state":"Oslo","country":"Norway","country_code":"no"}}"#).await;
+        let (dir, state, id, _progress) = geo_catalog(tag, &endpoint);
+        let state = std::sync::Arc::new(state);
+        let xmp = crate::xmp::sidecar_path(&dir.join("library").join("IMG_1.jpg"));
+        let identity = crate::app::catalog_identity(&state).unwrap();
+        let saved = crate::catalog::IptcFields { title: "Saved first".into(), ..Default::default() };
+        crate::app::with_catalog_as(&state, identity, |c| Ok(ensure_cache_schema(c.conn())?)).unwrap();
+
+        // The save: reserve under the lock, wait with none held, store with the turn held.
+        let (original, turn) = crate::app::with_catalog_as(&state, identity, |c| {
+            let original = c.require_photo_path(id)?;
+            let turn = crate::xmp::lock::WriteOrder::reserve(&original);
+            Ok((original, turn))
+        })
+        .unwrap();
+        let turn = turn.wait();
+        let write = crate::app::with_catalog_as(&state, identity, |c| c.set_iptc(id, &saved)).unwrap();
+
+        // On this test's runtime, beside the test body's timers: the fill's wait for the
+        // turn must not block one of its workers (see `fill_and_write`).
+        let fill = {
+            let state = state.clone();
+            tokio::spawn(async move { geocode_photo_to_iptc(&state, Some(identity), id).await })
+        };
+        // The fill caches the answer just before its store step: wait for that (the shared
+        // Nominatim throttle can delay the request by seconds), then give it time to store.
+        let cached = || {
+            crate::app::with_catalog_as(&state, identity, |c| {
+                Ok(lookup_cache(c.conn(), round_cell(59.91), round_cell(10.75))?)
+            })
+            .unwrap()
+            .is_some()
+        };
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !cached() {
+            assert!(Instant::now() < deadline, "the fill never reached Nominatim");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!fill.is_finished(), "the fill must wait for the save's write");
+        let city = crate::app::with_catalog_as(&state, identity, |c| c.get_iptc(id)).unwrap().city;
+        assert_eq!(city, "", "the fill must not store while the save holds the turn");
+
+        let outcome = tokio::task::spawn_blocking({
+            let state = state.clone();
+            move || crate::app::iptc::write_and_settle(&state, identity, &original, &write, turn)
+        })
+        .await
+        .unwrap();
+        assert_eq!(outcome.sidecar, crate::catalog::IptcSidecarState::Written, "{outcome:?}");
+        assert!(fill.await.unwrap().unwrap(), "the fill filled once the save was done");
+
+        let xml = std::fs::read_to_string(&xmp).unwrap();
+        let dc = "http://purl.org/dc/elements/1.1/";
+        let photoshop = "http://ns.adobe.com/photoshop/1.0/";
+        assert_eq!(crate::xmp::test_fixtures::property_values(&xml, dc, "title"), vec!["Saved first"], "{xml}");
+        assert_eq!(crate::xmp::test_fixtures::property_values(&xml, photoshop, "City"), vec!["Oslo"], "{xml}");
+        let owed = crate::app::with_catalog_as(&state, identity, |c| c.owed_iptc(id)).unwrap();
+        assert_eq!(owed, crate::catalog::IptcMask::NONE);
+        server.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_fill_racing_a_save_stores_and_writes_after_it() {
+        a_fill_racing_a_save("geo-149-race-mt").await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_fill_racing_a_save_stores_and_writes_after_it_on_one_thread() {
+        a_fill_racing_a_save("geo-149-race-ct").await;
+    }
+
+    /// Review of #148, N2: a single-photo geocode whose sidecar write fails (here an
+    /// unparseable sidecar) says the geocoded location is in the catalog and the sidecar is
+    /// pending, in a geocode's words, not a save's. The filled fields stay owed.
+    #[tokio::test]
+    async fn a_geocode_whose_sidecar_is_pending_says_so_as_a_geocode() {
+        let (server, endpoint) =
+            serve_forever(r#"{"address":{"city":"Oslo","state":"Oslo","country":"Norway","country_code":"no"}}"#).await;
+        let (dir, state, id, _progress) = geo_catalog("geo-148-pending", &endpoint);
+        let xmp = crate::xmp::sidecar_path(&dir.join("library").join("IMG_1.jpg"));
+        std::fs::write(&xmp, "<x:xmpmeta not xml").unwrap();
+
+        let err = geocode_photo_to_iptc(&state, None, id).await.unwrap_err();
+        assert!(err.starts_with("Geocoded location stored in the catalog, but not yet in the sidecar ("), "{err}");
+        assert!(err.ends_with("; the repair pass will write it"), "{err}");
+        assert!(!err.contains("Saved"), "{err}");
+        let guard = state.catalog.lock().unwrap();
+        let c = guard.as_ref().unwrap();
+        assert_eq!(c.get_iptc(id).unwrap().city, "Oslo");
+        assert!(c.owed_iptc(id).unwrap().contains(crate::catalog::IptcMask::CITY));
+        drop(guard);
         server.abort();
     }
 

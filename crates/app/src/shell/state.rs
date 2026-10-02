@@ -1424,7 +1424,9 @@ fn read_counts(state: &AppState) -> Counts {
     let pending = with_catalog(state, |c| c.list_pending_operations())
         .map(|ops| ops.iter().filter(|o| o.status == "pending").count())
         .unwrap_or(0);
-    let identity_debt = with_catalog(state, |c| c.summarize_pending_identity()).ok().map(|s| s.total);
+    // Copies owing identity plus photos owing IPTC (#148): both are paid by the repair pass
+    // the chip opens, and a count of 0 would hide the only lasting signal of either.
+    let identity_debt = with_catalog(state, |c| c.summarize_pending_identity()).ok().map(|s| s.total + s.iptc_owed);
     let trash = with_catalog(state, |c| c.list_trash()).ok().map(|t| t.len());
     Counts { pending, identity_debt, trash }
 }

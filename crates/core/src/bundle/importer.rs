@@ -524,7 +524,14 @@ pub(crate) fn index_bundle_with(
                     || !iptc.country.is_empty()
                     || !iptc.country_code.is_empty();
                 if has_iptc {
-                    let _ = catalog.set_iptc(upsert.id, iptc);
+                    // Owe only what the sidecar beside the file has no value for: a value
+                    // there is the bundle's own sidecar's (perhaps another tool's edit the
+                    // source catalog never imported), and the import must not overwrite it
+                    // (#144; review of #148, M1). A sidecar that does not parse tells us
+                    // nothing, so everything is owed (and stays owed until it parses).
+                    let carried =
+                        crate::xmp::read_iptc_present(path).unwrap_or(crate::catalog::IptcMask::NONE);
+                    let _ = catalog.set_iptc_carried(upsert.id, iptc, carried);
                 }
 
                 // Edit record (opaque JSON for the editing module).
@@ -602,6 +609,20 @@ pub(crate) fn index_bundle_with(
                     path.display()
                 );
             }
+        }
+    }
+
+    // Step C.1 — #148: a new photo's IPTC came from the manifest, and the sidecar beside it
+    // (the bundle's own, or a bare identity sidecar) need not carry it. `set_iptc_carried`
+    // owed the fields that sidecar has no value for; write them now. A failure leaves them owed for
+    // the repair pass rather than being logged and forgotten.
+    for &photo_id in &newly_created {
+        match catalog.write_owed_iptc(photo_id) {
+            Ok(Some((crate::catalog::IptcSettled::Failed(e), _))) => {
+                eprintln!("bundle import: IPTC sidecar write for photo {photo_id} owed for repair: {e}")
+            }
+            Ok(_) => {}
+            Err(e) => eprintln!("bundle import: couldn't write owed IPTC for photo {photo_id}: {e}"),
         }
     }
 
@@ -683,8 +704,21 @@ mod tests {
         photo_uuid: &str,
         relative_path: &str,
     ) -> crate::test_support::TestSubPath {
+        let iptc = crate::catalog::IptcFields { headline: "Test sunset".into(), ..Default::default() };
+        make_test_bundle_with(tag, photo_uuid, relative_path, iptc, None)
+    }
+
+    /// [`make_test_bundle`] with the manifest's IPTC and, when given, a sidecar carried in
+    /// the bundle beside the original.
+    fn make_test_bundle_with(
+        tag: &str,
+        photo_uuid: &str,
+        relative_path: &str,
+        iptc: crate::catalog::IptcFields,
+        sidecar: Option<&str>,
+    ) -> crate::test_support::TestSubPath {
         use crate::bundle::BundlePhoto;
-        use crate::catalog::{IptcFields, PickState};
+        use crate::catalog::PickState;
 
         let dir = temp_dir(&format!("{tag}-bundle"));
 
@@ -693,6 +727,9 @@ mod tests {
         std::fs::create_dir_all(&orig_dir).unwrap();
         let orig_path = orig_dir.join("DSC01234.ARW");
         std::fs::write(&orig_path, b"FAKE RAW BYTES").unwrap();
+        if let Some(xml) = sidecar {
+            std::fs::write(crate::xmp::sidecar_path(&orig_path), xml).unwrap();
+        }
 
         let mut manifest = BundleManifest::new(
             BundleBatch {
@@ -709,7 +746,7 @@ mod tests {
             rating: 3,
             label: "green".into(),
             pick_state: PickState::Pick,
-            iptc: IptcFields { headline: "Test sunset".into(), ..Default::default() },
+            iptc,
             edit_record: None,
             versions: Vec::new(),
             tag_uuids: Vec::new(),
@@ -835,6 +872,76 @@ mod tests {
         assert_eq!(photo.rating, 3);
         let iptc = catalog.get_iptc(photo.id).unwrap();
         assert_eq!(iptc.headline, "Test sunset");
+    }
+
+    /// #148 (review of #144, L1): the bundle's IPTC reaches the catalog and, from there, the
+    /// sidecar beside the extracted original — which the bundle need not have carried it in.
+    #[test]
+    fn index_bundle_writes_the_bundles_iptc_into_the_sidecar() {
+        let bundle_path = make_test_bundle("iptc-148", "uuid-iptc-148", "2026/06/28/DSC01234.ARW");
+        let (manifest, mut archive) = open_bundle(&bundle_path).expect("open_bundle");
+        let (catalog, root) = temp_catalog("iptc-148");
+        let (extracted, partial) =
+            extract_originals(&manifest, &mut archive, &root, |_, _| {}).expect("extract_originals");
+        index_bundle(&catalog, &manifest, &extracted, &root, partial).expect("index_bundle");
+
+        let photo = catalog.get_photo_by_uuid(&crate::catalog::photo_identity_for("uuid-iptc-148").unwrap()).unwrap();
+        let xmp = crate::xmp::sidecar_path(&catalog.require_photo_path(photo.id).unwrap());
+        let xml = std::fs::read_to_string(&xmp).unwrap();
+        assert!(xml.contains("Test sunset"), "the bundle's headline is in the sidecar:\n{xml}");
+        assert_eq!(catalog.owed_iptc(photo.id).unwrap(), crate::catalog::IptcMask::NONE);
+    }
+
+    /// Review of #148, M1: a value the bundle's own sidecar carries is another tool's (here
+    /// Lightroom changed the Headline after ChairPhoto wrote it, so the sidecar has
+    /// `chairphoto:LastWrite` and no backup would be made). The import keeps it, and owes
+    /// the sidecar only the manifest fields it has no value for.
+    #[test]
+    fn index_bundle_keeps_a_value_the_bundled_sidecar_carries() {
+        use crate::xmp::test_fixtures::property_values;
+        let sidecar = r#"<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"><rdf:Description rdf:about="" xmlns:photoshop="http://ns.adobe.com/photoshop/1.0/" xmlns:chairphoto="https://chairphoto.local/ns/1.0/" photoshop:Headline="LR"><chairphoto:LastWrite>1700000000</chairphoto:LastWrite></rdf:Description></rdf:RDF></x:xmpmeta>"#;
+        let iptc = crate::catalog::IptcFields { headline: "A".into(), city: "Oslo".into(), ..Default::default() };
+        let bundle_path =
+            make_test_bundle_with("iptc-148-m1", "uuid-iptc-148-m1", "2026/06/28/DSC01234.ARW", iptc, Some(sidecar));
+        let (manifest, mut archive) = open_bundle(&bundle_path).expect("open_bundle");
+        let (catalog, root) = temp_catalog("iptc-148-m1");
+        let (extracted, partial) =
+            extract_originals(&manifest, &mut archive, &root, |_, _| {}).expect("extract_originals");
+        index_bundle(&catalog, &manifest, &extracted, &root, partial).expect("index_bundle");
+
+        let photo =
+            catalog.get_photo_by_uuid(&crate::catalog::photo_identity_for("uuid-iptc-148-m1").unwrap()).unwrap();
+        let xmp = crate::xmp::sidecar_path(&catalog.require_photo_path(photo.id).unwrap());
+        let xml = std::fs::read_to_string(&xmp).unwrap();
+        let photoshop = "http://ns.adobe.com/photoshop/1.0/";
+        assert_eq!(property_values(&xml, photoshop, "Headline"), vec!["LR"], "another tool's value survives:\n{xml}");
+        assert_eq!(property_values(&xml, photoshop, "City"), vec!["Oslo"], "a field the sidecar lacked is written:\n{xml}");
+        assert_eq!(catalog.get_iptc(photo.id).unwrap().headline, "A", "the catalog keeps the manifest's value");
+        assert_eq!(catalog.owed_iptc(photo.id).unwrap(), crate::catalog::IptcMask::NONE);
+    }
+
+    /// A bundle photo whose sidecar cannot take its IPTC (here: an unparseable sidecar in the
+    /// bundle) is left owing it, and the repair pass writes it once the sidecar is fixed.
+    #[test]
+    fn index_bundle_owes_iptc_a_sidecar_could_not_take() {
+        let bundle_path = make_test_bundle("iptc-148-owed", "uuid-iptc-148-owed", "2026/06/28/DSC01234.ARW");
+        let (manifest, mut archive) = open_bundle(&bundle_path).expect("open_bundle");
+        let (catalog, root) = temp_catalog("iptc-148-owed");
+        let (extracted, partial) =
+            extract_originals(&manifest, &mut archive, &root, |_, _| {}).expect("extract_originals");
+        let xmp = crate::xmp::sidecar_path(&extracted[0].dest);
+        std::fs::write(&xmp, "<x:xmpmeta not xml").unwrap();
+        index_bundle(&catalog, &manifest, &extracted, &root, partial).expect("index_bundle");
+
+        let photo = catalog.get_photo_by_uuid(&crate::catalog::photo_identity_for("uuid-iptc-148-owed").unwrap()).unwrap();
+        assert_eq!(catalog.owed_iptc(photo.id).unwrap(), crate::catalog::IptcMask::HEADLINE);
+        assert_eq!(catalog.summarize_pending_identity().unwrap().iptc_owed, 1);
+
+        std::fs::remove_file(&xmp).unwrap();
+        let summary = catalog.repair_pending_identity().unwrap();
+        assert_eq!(summary.iptc_written, 1, "{summary:?}");
+        assert!(std::fs::read_to_string(&xmp).unwrap().contains("Test sunset"));
+        assert_eq!(catalog.owed_iptc(photo.id).unwrap(), crate::catalog::IptcMask::NONE);
     }
 
     #[test]

@@ -136,12 +136,15 @@ Three commands:
 | `geocode_all_to_iptc()` | The same fill across the library, emitting `geocode:progress` events. Returns a summary of totals, filled, and skipped. |
 
 Catalog fields that already hold a value are **never overwritten** — this fills blanks, it
-does not replace. The write path is `set_iptc` + `xmp::write_iptc`, identical to a manual
-IPTC save, so XMP sidecars stay merge-safe: `write_iptc` is given the IPTC before and after
-the fill and writes only the fields that changed, so a creator, rights, caption or title
-another tool put in the sidecar — which the catalog never imported — survives a geocode
-(#144). "Never overwritten" is about the catalog, not the sidecar: a location field that is
-empty in the catalog is filled, and its sidecar property is then replaced, so a city another
+does not replace. The write path is `set_iptc` + `xmp::write_iptc_fields`, identical to a
+manual IPTC save, so XMP sidecars stay merge-safe: the write covers only the fields the fill
+changed (plus any an earlier failed write left owed, #148), so a creator, rights, caption or
+title another tool put in the sidecar — which the catalog never imported — survives a
+geocode (#144). A sidecar write that fails after the fill is stored leaves the filled fields
+owed; the photo is then not counted as filled, and the identity repair pass writes them
+later (`docs/storage-and-import.md` § IPTC that fails to reach the disk). "Never
+overwritten" is about the catalog, not the sidecar: a location field that is empty in the
+catalog is filled, and its sidecar property is then replaced, so a city another
 tool wrote (and the catalog never imported) gives way to the geocoded one.
 
 Both fills are bound to the catalog they read the photo from (`CatalogIdentity`): the cache,

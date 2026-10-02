@@ -22,12 +22,17 @@
 //!   regions, GPS, an identity Overwrite); nothing is acquired while it is held — the XML
 //!   work and the file I/O only.
 //! * [`WriteOrder::reserve`] never blocks, so it may be called under the catalog lock.
-//!   [`WriteOrder::wait`] blocks, and is called with **no lock held** and never across an
-//!   `.await`. The turn it returns is held for one store and its sidecar write: the turn
-//!   holder takes the catalog lock (the store), releases it, then takes the file lock (the
-//!   write). That is safe because no catalog holder ever waits on a turn: a waiter holds
-//!   nothing another thread needs, and the earliest ticket's holder is always running towards
-//!   its write, so the line always moves.
+//!   [`WriteOrder::wait`] blocks, and is called with **no lock held**, never across an
+//!   `.await`, and **never on an async runtime's worker thread**: on a blocking thread
+//!   (`spawn_blocking`, the GPUI blocking runner). A tokio worker blocked in it can stall
+//!   the runtime's timers (#148: a geocode fill waiting there left a 20 ms sleep elsewhere
+//!   on the runtime unfired for as long as the wait lasted, with the other workers idle,
+//!   until a newly spawned task woke one of them). The turn it returns is held for one
+//!   store, its sidecar write and that write's settle: the turn holder takes the catalog
+//!   lock (the store), releases it, takes the file lock (the write), then the catalog lock
+//!   again (the settle). That is safe because no catalog holder ever waits on a turn: a
+//!   waiter holds nothing another thread needs, and the earliest ticket's holder is always
+//!   running towards its write, so the line always moves.
 //!
 //! Both are process-wide and keyed by the sidecar's resolved path ([`key`]); an entry exists
 //! only while some ticket for that path is outstanding. Neither protects against a second

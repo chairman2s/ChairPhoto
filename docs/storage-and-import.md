@@ -86,9 +86,10 @@ store and write in one order. A write is **refused, leaving the sidecar as it wa
 
 A refused write stays as debt, not as a silent success. An identity or import-batch field
 lands in `pending_sidecar_identity` and the repair pass retries it once the folder is
-writable. An IPTC save or a single-photo geocode returns the error, and geocode-all does not
-count that photo as filled. If the catalog was already stored, it then holds IPTC the
-sidecar lacks: that is not retried yet (AGENTS.md, "XMP safety").
+writable. A refused IPTC write after the catalog stored the values leaves those fields owed
+in `pending_sidecar_iptc`; the next save or the repair pass writes them (see IPTC that fails
+to reach the disk). The save reports the sidecar pending, a single-photo geocode returns an
+error saying so, and geocode-all does not count that photo as filled.
 Face-region and GPS writes log the failure, and the catalog stays authoritative.
 
 ### The repair pass is a job
@@ -127,6 +128,56 @@ photo's previous identity into one of those sidecars.
 A resolution deliberately does **not** stop a running pass. Killing a 74k-row pass because
 one row got a decision is a worse trade than dropping that row's result, and the per-row
 ownership above is what makes coexistence safe.
+
+### IPTC that fails to reach the disk
+
+Authored IPTC has the same two halves, but not the same shape of debt. An IPTC save writes
+only the managed fields whose catalog value changed (#144: a field the catalog never changed
+keeps whatever another tool wrote), and it writes after the catalog commit. So a sidecar
+write that fails after the store — read-only storage, an unparseable sidecar, a volume
+unmounting mid-save — would leave values in the catalog that no later write carries: a re-save
+of the same values changes nothing, and the next save writes only its own change.
+
+The debt is therefore a **set of fields per photo**, in `pending_sidecar_iptc`
+(`catalog/iptc_owed.rs`, #148):
+
+- **Owed in the store.** `Catalog::set_iptc` ORs the fields it changed into the photo's
+  `owed` mask and bumps its `generation`, in the transaction (a savepoint) that stores the
+  values. It is the only way to change an existing row's IPTC, so no store can skip it.
+- **Written as owed ∪ changed.** `set_iptc` returns the write that pays everything owed,
+  with the catalog's values now: a cleared field is removed from the sidecar, a field never
+  owed is not touched. The path is resolved before the store, so an unreachable original
+  still fails the save closed with nothing stored. A volume that goes away after the store
+  fails the write (the sidecar document refuses a missing original or folder, #149), so the
+  fields stay owed.
+- **Cleared by compare-and-set.** `settle_iptc_write` clears the mask only while
+  `generation` is still the one the write read, and only for the photo with that UUID. A
+  newer store keeps its fields owed. A superseded write that *succeeded* owes again each
+  field it wrote with a value the catalog no longer holds: those older values may have
+  reached the disk after the newer write's, and only another write can prove otherwise. A
+  field it wrote with the current value is right whichever write landed last, so it is not
+  owed again, and when nothing is left owed the settle reports written. Rows stay at `owed = 0` rather than being deleted, so
+  a photo's generation only grows.
+- **Retried by the repair pass.** After the identity queue, `run_identity_repair` drains the
+  photos owing IPTC under the same job, abort flag and progress (`iptcWritten`,
+  `iptcUnreachable`, `iptcFailed` in its summary; `iptcOwed` in the panel's summary). The
+  per-photo record writes the sidecar of the copy the resolver picks, as a save does. The
+  title-bar "identity debt" chip and menu badge count copies owing identity plus photos owing
+  IPTC, and the panel's Start is enabled by either.
+- **Reported honestly.** A save that reached only the catalog answers `pending` with the
+  reason (`IptcSaveOutcome`, returned by the Tauri `set_iptc` command and shown by both
+  inspectors as "Saved to catalog; sidecar pending (…)"); `unchanged` when nothing was owed.
+- **Bundle import** stores each new photo's manifest IPTC through `set_iptc_carried`, which
+  owes only the fields the sidecar beside the extracted file has no value for. A value that
+  sidecar does carry may be another tool's edit the source catalog never imported, so the
+  import leaves it, as a save would (#144). The importer writes the owed fields right after
+  its transaction commits, and anything that fails stays owed; a sidecar that does not parse
+  owes every field. A catalog merge's insert of
+  a new row (`catalog/merge.rs`, typically a metadata-only photo with no original here)
+  carries the source's IPTC without owing it.
+
+No migration backfills the table: which writes failed before v25 is unknown, and owing every
+photo's IPTC would rewrite every sidecar in the library on the next pass.
 
 ### Resolving a conflict
 
@@ -739,6 +790,10 @@ runs the same transition — it replaces the catalog handle exactly as a switch 
 - `albums` — id, name; `album_photos` — album_id, photo_id (manual M:N).
 - `smart_albums` — id, name, rule definition (AND conditions).
 - `pending_operations` — kind (backup/offload/restore), photo_id, target, status.
+- `pending_sidecar_iptc` (v25) — photo_id, `owed` (a bitmask of managed IPTC fields whose
+  bit numbering is persisted), `generation`, attempts, error, timestamps: catalog IPTC the
+  sidecar has not received (see IPTC that fails to reach the disk). No value columns —
+  `photos.iptc_*` is the source of truth.
 - `pending_sidecar_identity` — photo_id, field (`identifier` or `import_batch`), attempts,
   error, timestamps, `dismissed_at`: sidecar identity fields that are in SQLite but not yet
   on disk. No value column — `photos.uuid` and `import_batches.uuid` are the sources of

@@ -97,7 +97,10 @@ contacting that host. The tile URL itself stays the catalog setting `map.tileUrl
 keyed by the host it names, so it need not move. Answers the first port stored per catalog
 (the module setting `map.tileHosts`) move to the machine on that catalog's first read —
 only allowed/denied entries; where they disagree with the machine's or another catalog's,
-denied wins — and the catalog's copy is then emptied, so a later Allow is not undone.
+denied wins — and the catalog's copy is then emptied, so a later Allow is not undone. It is
+emptied only once the machine's copy is saved, and a switch can interrupt the emptying, so
+a catalog may be merged again; "Ask again" is therefore stored as an explicit `"ask"` entry
+that no catalog's old answer overrides, never as a deleted one that a re-merge could refill.
 Reverse geocoding stays user-initiated per click, as before.
 
 **OSM tile policy.** The default URL is the policy's exact

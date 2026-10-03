@@ -496,6 +496,8 @@ export const cacheImages = (includePreviews: boolean) =>
 export interface CacheProgress {
   done: number;
   total: number;
+  /** The warm-up's job id: it grows with every start (see `cacheWarmup.ts`). */
+  job: number;
 }
 
 /** Subscribe to batch-cache progress. Returns an unlisten function. */

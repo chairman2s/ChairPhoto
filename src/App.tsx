@@ -73,6 +73,7 @@ import {
 import { useLibrarySession } from "./modules/librarySession";
 import { CatalogGrid } from "./components/CatalogGrid";
 import { Splash, BOOT_STAGES } from "./components/Splash";
+import { cacheResultLine, createCacheFollower } from "./modules/cacheWarmup";
 import { TagEditor } from "./components/TagEditor";
 import { PhotoInspector } from "./components/PhotoInspector";
 import { ZoomableImage } from "./components/ZoomableImage";
@@ -984,9 +985,13 @@ export default function App() {
       setBatchesKey((k) => k + 1); // a scan may have created a new import batch
       // Pre-cache so browsing is instant. Thumbnails always; previews if opted in.
       // Progress is shown via the cache:progress listener below.
+      // A newer warm-up or a catalog switch supersedes this one quietly (`cacheWarmup.ts`).
       cacheImages(cachePreviews)
-        .then(() => setStatus("Cache ready"))
-        .catch((e) => setStatus(`Cache failed: ${e}`));
+        .then(() => setStatus(cacheResultLine(null) ?? ""))
+        .catch((e) => {
+          const line = cacheResultLine(e);
+          if (line != null) setStatus(line);
+        });
     } catch (e) {
       setStatus(`Scan failed: ${e}`);
     }
@@ -1072,15 +1077,14 @@ export default function App() {
   // Surface batch-cache progress in the status bar. `useOwnedSubscription` owns the async
   // registration (issue #13): one that resolves after this effect is cleaned up is stopped
   // rather than left running.
-  useOwnedSubscription(
-    () =>
-      onCacheProgress((p) => {
-        setStatus(
-          p.done < p.total ? `Caching ${p.done}/${p.total}…` : `Cache ready (${p.total})`,
-        );
-      }),
-    [],
-  );
+  // Only the newest warm-up's progress: a superseded pass's stragglers move nothing.
+  useOwnedSubscription(() => {
+    const follow = createCacheFollower();
+    return onCacheProgress((p) => {
+      const line = follow.onProgress(p);
+      if (line != null) setStatus(line);
+    });
+  }, []);
 
   // Card import runs in the background (the dialog closes immediately) — track its copy
   // progress for the topbar indicator.

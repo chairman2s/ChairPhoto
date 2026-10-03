@@ -952,6 +952,54 @@ fn the_version_shelf_new_version_switching_and_the_cover(cx: &mut TestAppContext
     assert_eq!(rig.catalog(|c| c.cover_of(photo).unwrap()), None);
 }
 
+/// **Forced interleaving** (#202). "+ New version" on the worker (held by `Runner::manual`),
+/// a change made meanwhile (kept: the fork copies the record), then the photo is left — by a
+/// step (→) or ← Library — before the fork lands: the change is saved into the new version,
+/// as it is when the photo stays open, and the version it was copied from keeps what it
+/// held.
+fn a_change_during_new_version_then_leaving(leave: bool, cx: &mut TestAppContext) {
+    let rig = rig(if leave { "dk-fork-leave" } else { "dk-fork-step" }, 2, cx);
+    let p = rig.app.wired.shell.read_with(cx, |s, _| s.library.photo_ids())[0];
+    rig.slide(Control::Tone(ToneKey::Ev), 0.5, cx);
+    rig.settle_and_save(cx);
+    let v1 = rig.catalog(|c| c.list_versions(p).unwrap())[0].id;
+    rig.darkroom(cx).update(cx, |d, cx| d.new_version(cx));
+    cx.run_until_parked();
+    assert!(rig.darkroom(cx).read_with(cx, |d, _| d.open.as_ref().unwrap().busy()), "the fork is on the worker");
+    rig.slide(Control::Tone(ToneKey::Contrast), 0.3, cx);
+    assert_eq!(rig.working(cx)["tone"]["contrast"], json!(0.3), "kept: the fork does not replace the record");
+    if leave {
+        rig.app.wired.shell.update(cx, |s, cx| s.show_library(cx));
+        cx.run_until_parked();
+        assert_eq!(rig.surface(cx), Surface::Library);
+    } else {
+        assert!(rig.view(cx).update(cx, |v, cx| v.step(1, None, cx)));
+        cx.run_until_parked();
+        assert_ne!(rig.open_photo(cx), Some(p));
+    }
+    work(cx);
+    let versions = rig.catalog(|c| c.list_versions(p).unwrap());
+    let names: Vec<&str> = versions.iter().map(|v| v.name.as_str()).collect();
+    assert_eq!(names, ["Version 1", "Version 2"]);
+    let v2 = versions[1].id;
+    assert_eq!(rig.saved(v1)["tone"]["contrast"], json!(0), "the version copied from is untouched");
+    assert_eq!(rig.saved(v1)["tone"]["ev"], json!(0.5));
+    assert_eq!(rig.saved(v2)["tone"]["contrast"], json!(0.3), "the change belongs to the new version");
+    assert_eq!(rig.saved(v2)["tone"]["ev"], json!(0.5), "the copy");
+    assert_eq!(rig.labels(v2).0.last().map(String::as_str), Some("Contrast +0.30"));
+    assert_eq!(rig.darkroom(cx).read_with(cx, |d, _| d.error.clone()), None);
+}
+
+#[gpui_kit::test]
+fn a_change_during_new_version_then_a_step_is_saved_into_the_new_version(cx: &mut TestAppContext) {
+    a_change_during_new_version_then_leaving(false, cx);
+}
+
+#[gpui_kit::test]
+fn a_change_during_new_version_then_leaving_is_saved_into_the_new_version(cx: &mut TestAppContext) {
+    a_change_during_new_version_then_leaving(true, cx);
+}
+
 /// **Forced interleaving.** A version switch and "Develop with the new engine" replace the
 /// record: a change made while either is on the worker is refused (the rail is not
 /// editable), not made on screen and then silently dropped as React did. The version left

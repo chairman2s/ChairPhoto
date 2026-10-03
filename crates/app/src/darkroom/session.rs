@@ -64,7 +64,8 @@
 //! (`OpenPhoto::editable`): a change is refused, not made and then dropped as React's
 //! `setWorking(record)` did (saved on top of a step it would also cut the redo branch the
 //! step left). "+ New version", the cover and a duel's ⑂ keep the record, so a change made
-//! while they run is kept and saved after them.
+//! while they run is kept and saved after them — after "+ New version", into the new
+//! version, also when the photo is left before the fork lands.
 //!
 //! Presets live in the catalog's settings (`basic-editor.presets`), read-modify-written on a
 //! worker under one catalog lock; they and the crop overlay (`editor.crop_overlay`) are

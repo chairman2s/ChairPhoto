@@ -450,8 +450,20 @@ pub enum ShownVerdict {
 /// was drawn makes the verdict [`ShownVerdict::Stale`]: never a confirmation of someone the
 /// user did not see. When it applies, the photo is tagged in the same transaction and its
 /// regions are re-exported after the commit.
+///
+/// `IMMEDIATE`, not deferred (#217): this takes the write lock before its first read, so a
+/// match worker racing on its own connection (#137) either committed before this call started
+/// — this read already sees it, a plain stale — or cannot write while this transaction holds
+/// the lock, so it can never land mid-flight between this function's read and its `UPDATE`.
+/// A deferred transaction's read instead establishes a snapshot that a racing commit can then
+/// outrun, and SQLite refuses to upgrade a stale snapshot to a write: `SQLITE_BUSY_SNAPSHOT`,
+/// a database error surfacing where the user should see [`ShownVerdict::Stale`] instead
+/// (verified: a deferred transaction here surfaces exactly that error under the race
+/// `accept_shown`'s own test forces). What a racing writer's *own* call gets back for trying
+/// during that window — busy, blocked, or simply too late — is that call's own concern, not
+/// this function's: it never changes what `accept_shown` itself sees or returns.
 pub fn accept_shown(c: &Catalog, face_id: i64, tag_id: i64) -> CatalogResult<ShownVerdict> {
-    let tx = c.conn().unchecked_transaction()?;
+    let tx = rusqlite::Transaction::new_unchecked(c.conn(), rusqlite::TransactionBehavior::Immediate)?;
     let Some(photo_id) = matcher::accept_suggestion(&tx, face_id, tag_id)? else {
         return Ok(ShownVerdict::Stale);
     };

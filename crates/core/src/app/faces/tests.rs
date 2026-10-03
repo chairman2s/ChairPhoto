@@ -816,6 +816,39 @@ fn verdicts_as_shown_never_apply_to_another_person() {
     assert_eq!(regions, vec!["Alice".to_string(), "Bob".to_string()], "and exports its region");
 }
 
+/// #217: `accept_shown` takes the write lock `IMMEDIATE`, before its read (see its doc
+/// comment), so no other connection — the match worker runs on its own (#137) — can land a
+/// write between that read and `accept_suggestion`'s `UPDATE`: a genuine second connection,
+/// opened and tried while `accept_shown`'s transaction is still open, cannot change the row
+/// (it is refused outright or blocked, never races in). `accept_shown` itself therefore never
+/// surfaces a busy/locked error from this race.
+#[test]
+fn a_concurrent_writer_cannot_land_between_accepts_read_and_write() {
+    use crate::plugins::faces::matcher::tests::BEFORE_ACCEPT_UPDATE;
+    let (c, root) = temp_catalog("accept-concurrent");
+    let alice = c.create_tag("People/Alice").unwrap();
+    let p = add_photo(&c, &root, "r.NEF");
+    let f = add_face(&c, p, "[0.1,0.1,0.2,0.2]");
+    suggest(&c, f, alice);
+
+    // A real second connection, opened and tried for real while `accept_shown`'s IMMEDIATE
+    // transaction still holds the write lock (its read has run; its `UPDATE` has not): it
+    // cannot have changed the row, whatever it got back for trying.
+    let other_path = c.db_path().to_path_buf();
+    *BEFORE_ACCEPT_UPDATE.lock().unwrap() = Some(Box::new(move |_conn: &rusqlite::Connection| {
+        let other = rusqlite::Connection::open(&other_path).unwrap();
+        let attempted = matcher::reject_shown(&other, f, Some(alice), 1000);
+        assert!(!attempted.unwrap_or(false), "a concurrent reject never actually lands here");
+    }));
+
+    let verdict = accept_shown(&c, f, alice).unwrap();
+
+    assert!(BEFORE_ACCEPT_UPDATE.lock().unwrap().is_none(), "the hook ran");
+    assert_eq!(verdict, ShownVerdict::Applied, "accept_shown's own call never saw a busy error");
+    assert_eq!(face_state(&c, f), "confirmed");
+    assert!(has_tag(&c, p, alice));
+}
+
 /// The Tauri `faces_accept` on a face with no person says why, not "no assigned person".
 #[test]
 fn accepting_a_face_with_no_suggestion_says_it_changed() {

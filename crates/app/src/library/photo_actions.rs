@@ -7,7 +7,8 @@
 //!   everywhere, reversibly; nothing is deleted and nothing is written to disk. The Trash
 //!   dialog restores them or deletes them for good.
 //! - **Reveal in Files**: resolves the photo's best reachable copy
-//!   (`Catalog::require_photo_path`, never `photos.path`) and hands it to the file manager.
+//!   (`Catalog::require_photo_path`, never `photos.path`) on the storage runner, and hands it
+//!   to the file manager.
 //! - **Relocate…**: a file picker, then the core's `storage::relocate_photo` (the file must be
 //!   under the library root; its sidecar is bound to the photo's UUID). GPUI's picker takes no
 //!   starting folder, so it does not open at the library root as React's did.
@@ -21,14 +22,15 @@
 //! `catalog:switched` has not arrived. The Remove confirm binds the identity when it opens,
 //! and closes when `catalog:switched` arrives. Every result is a status line; a change
 //! re-reads the catalog (rows, counts, trash count), and a recovered file's cached images are
-//! dropped so its tile and loupe render again. Blocking work (sidecar IO, a NAS copy) runs on
-//! the storage [`Runner`]; short catalog reads and writes on GPUI's background executor.
+//! dropped so its tile and loupe render again. Work that can block on a mount (sidecar IO, a
+//! NAS copy, stat-ing copies for Reveal) runs on the storage [`Runner`]; short catalog writes
+//! (trash, remove) on GPUI's background executor.
 
 use super::grid_menu::PhotoCommand;
 use crate::storage::{ui, Runner};
 use crate::view::RootView;
 use chairphoto_core::app::{with_catalog_as, CatalogIdentity};
-use gpui_kit::{App, Context, Global, PathPromptOptions, SharedString, Window};
+use gpui_kit::{App, Context, FocusHandle, Global, PathPromptOptions, SharedString, Window};
 use std::path::Path;
 use std::rc::Rc;
 
@@ -43,6 +45,27 @@ fn reveal_path(path: &Path, cx: &mut App) {
     match cx.try_global::<SystemRevealer>().cloned() {
         Some(revealer) => (revealer.0)(path, cx),
         None => cx.reveal_path(path),
+    }
+}
+
+/// The open Remove confirm, so a catalog switch can close **it** — not whatever dialog is on
+/// top (gpui-component's `close_dialog` pops the top one and has no per-dialog handle).
+///
+/// gpui-component focuses a new dialog's own focus handle as it opens it, and focus stays
+/// inside the top dialog until that closes; the handle captured right after opening therefore
+/// names this dialog. Closing pops only while focus is inside it, i.e. while it is the top
+/// dialog. Once it is answered (and gone) or another dialog lies over it, a switch closes
+/// nothing; the confirm's write is bound to its catalog anyway, so a late OK fails closed.
+pub struct RemoveConfirm {
+    pub(crate) serial: u64,
+    dialog: Option<FocusHandle>,
+}
+
+impl RemoveConfirm {
+    pub(crate) fn close(self, window: &mut Window, cx: &mut App) {
+        if self.dialog.is_some_and(|d| d.contains_focused(window, cx)) {
+            gpui_kit::component::WindowExt::close_dialog(window, cx);
+        }
     }
 }
 
@@ -96,11 +119,15 @@ impl RootView {
     /// Move to trash: `ids` (the selection, or the clicked photo).
     pub(crate) fn trash_photos(&mut self, ids: Vec<i64>, from: CatalogIdentity, cx: &mut Context<Self>) {
         let state = self.model.read(cx).state().clone();
+        let ids_done = ids.clone();
         let run = cx.background_executor().spawn(async move { with_catalog_as(&state, from, |c| c.trash_photos(&ids)) });
         cx.spawn(async move |this, cx| {
             let result = run.await;
             this.update(cx, |this, cx| match result {
                 Ok(s) => {
+                    // Gone from the library: unselected now, before the refresh lands, so the
+                    // next rating or flag key cannot reach them.
+                    this.shell.update(cx, |sh, cx| sh.select_with(cx, |l| l.unselect(&ids_done)));
                     let extra = if s.cascaded > 0 { format!(" (+{} stacked)", s.cascaded) } else { String::new() };
                     this.photo_status(format!("Moved {} to the trash{extra}.", s.trashed), cx);
                     this.photos_changed(cx);
@@ -112,13 +139,14 @@ impl RootView {
         .detach();
     }
 
-    /// Reveal in Files: the best reachable copy, resolved off the UI thread (it stats each
-    /// copy, which can block on an offline NAS).
+    /// Reveal in Files: the best reachable copy, resolved on the storage [`Runner`] — it stats
+    /// each copy under the catalog lock, which can block on a hung NAS mount, so it must not
+    /// park one of GPUI's background executor threads.
     pub(crate) fn reveal_photo(&mut self, id: i64, from: CatalogIdentity, cx: &mut Context<Self>) {
         let state = self.model.read(cx).state().clone();
-        let run = cx.background_executor().spawn(async move { with_catalog_as(&state, from, |c| c.require_photo_path(id)) });
+        let rx = Runner::get(cx).run(move || with_catalog_as(&state, from, |c| c.require_photo_path(id)));
         cx.spawn(async move |this, cx| {
-            let result = run.await;
+            let result = rx.await.unwrap_or_else(|_| Err("the reveal worker stopped".into()));
             this.update(cx, |this, cx| match result {
                 Ok(path) => reveal_path(&path, cx),
                 Err(e) => this.photo_status(format!("Couldn't reveal: {e} (the file may be offline)"), cx),
@@ -194,11 +222,11 @@ impl RootView {
             ui::confirm(window, cx, "Remove from catalog".into(), remove_confirm_body(&name).into(), "Remove");
         self.confirm_serial += 1;
         let serial = self.confirm_serial;
-        self.remove_confirm = Some(serial);
+        self.remove_confirm = Some(RemoveConfirm { serial, dialog: window.focused(cx) });
         cx.spawn(async move |this, cx| {
             let ok = answer.await == Ok(true);
             this.update(cx, |this, cx| {
-                if this.remove_confirm == Some(serial) {
+                if this.remove_confirm.as_ref().is_some_and(|c| c.serial == serial) {
                     this.remove_confirm = None;
                 }
                 if ok {
@@ -218,6 +246,7 @@ impl RootView {
             let result = run.await;
             this.update(cx, |this, cx| match result {
                 Ok(()) => {
+                    this.shell.update(cx, |sh, cx| sh.select_with(cx, |l| l.unselect(&[id])));
                     this.photos_changed(cx);
                     this.photo_status("Removed from catalog (files left untouched).".into(), cx);
                 }

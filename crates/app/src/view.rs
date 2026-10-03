@@ -109,9 +109,10 @@ pub struct RootView {
     stage_seen: StageView,
     /// The catalog the dialog was opened on: a switch closes it.
     catalog_epoch: u64,
-    /// The Remove-from-catalog confirm while it is open (its serial): a switch closes it
-    /// (`crate::library::photo_actions`).
-    pub(crate) remove_confirm: Option<u64>,
+    /// The Remove-from-catalog confirm while it is open: its serial, and the focus handle
+    /// gpui-component gave its dialog layer when it opened. A switch closes it by that handle
+    /// (`crate::library::photo_actions::RemoveConfirm`).
+    pub(crate) remove_confirm: Option<crate::library::photo_actions::RemoveConfirm>,
     pub(crate) confirm_serial: u64,
     resize: Option<Resize>,
     /// The stage's wrapper around a module's main view ([`contexts::MODULE_VIEW`]): focused
@@ -203,8 +204,8 @@ impl RootView {
                 if epoch != this.catalog_epoch {
                     this.catalog_epoch = epoch;
                     // The Remove confirm names the old catalog's photo.
-                    if this.remove_confirm.take().is_some() {
-                        gpui_kit::component::WindowExt::close_dialog(window, cx);
+                    if let Some(confirm) = this.remove_confirm.take() {
+                        confirm.close(window, cx);
                     }
                     // The cull session's list is the old catalog's photos too.
                     let cull = this.cull.take().is_some();

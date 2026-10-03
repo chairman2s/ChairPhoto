@@ -73,11 +73,13 @@ scan: one unwritable file must not cost the user the other 99,999 rows.
 Every sidecar write (`xmp::document::SidecarDocument`, issue #149) reads the file, changes
 only what that writer owns, and replaces the whole file at once: a temp file in the same
 folder (a dotfile ending `.chairphoto-tmp`, unique to that write), synced, then renamed over
-the sidecar. A temp file left by a write killed before its rename stays until it is a day
-old; the next successful write to its folder after that removes it (each folder is checked
-once per run, and only names of that exact pattern are touched). A reader, another tool or a crash sees the old sidecar or the new one, never a
-mix. Writers of one sidecar in one process take turns, and an IPTC save and a geocode fill
-store and write in one order. A write is **refused, leaving the sidecar as it was**, when:
+the sidecar. A reader, another tool or a crash sees the old sidecar or the new one, never a
+mix. A temp file left by a write killed before its rename stays until it is a day old; the
+next successful write to its folder after that has it removed, on a background thread (each
+folder is checked once per run, only regular files with names of that exact pattern are
+touched, and a folder ChairPhoto may write but not list is never checked). Writers of one
+sidecar in one process take turns, and an IPTC save and a geocode fill store and write in
+one order. A write is **refused, leaving the sidecar as it was**, when:
 
 - the original or its folder is missing — an unmounted volume; no folder is ever created.
   On Unix the original's folder is held open from the read to the rename, and the temp file

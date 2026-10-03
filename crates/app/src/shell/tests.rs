@@ -421,6 +421,38 @@ fn a_late_started_marker_never_overwrites_the_summary(cx: &mut TestAppContext) {
     assert_eq!(stored(&app).as_deref(), Some(w[1].as_str()), "the late marker overwrote the summary");
 }
 
+/// The timing record is bound to the catalog the Library rows came from (review
+/// claude-159-160, L4): the core swaps in a catalog with colliding ids and keys between Back
+/// and the writes — with `catalog:switched` delivered and without — and neither the started
+/// marker nor the summary lands in it.
+#[gpui_kit::test]
+fn the_timing_record_never_lands_in_another_catalog(cx: &mut TestAppContext) {
+    use crate::tests::{colliding_catalog, core_switch, deliver_switch};
+    for deliver in [false, true] {
+        let dir = TempDir::new(&format!("shell-timing-swap-{deliver}"));
+        let app = start(cx);
+        open_catalog_with_photos(&app, &dir, 2, cx);
+        work(cx);
+        let from = app.wired.shell.read_with(cx, |s, _| s.rows_from());
+        cx.update(|cx| {
+            ShellTimer::set_enabled(true, cx);
+            ShellTimer::leave("develop", from, cx);
+        });
+        let (b, _) = colliding_catalog(&dir, "b", 2);
+        b.set_setting(SHELL_TIMING_KEY, "b's own").unwrap();
+        core_switch(&app, b);
+        if deliver {
+            deliver_switch(&app, cx);
+        }
+        work(cx); // the started marker's write
+        cx.executor().advance_clock(Duration::from_millis(10_100));
+        cx.run_until_parked();
+        assert_eq!(written(cx).len(), 2, "deliver={deliver}: the summary was handed out");
+        work(cx); // the summary's write
+        assert_eq!(stored(&app).as_deref(), Some("b's own"), "deliver={deliver}: a timing write landed in B");
+    }
+}
+
 /// The Darkroom's switch turns the instrument on, and its ← Library starts the transition.
 #[cfg(feature = "edit")]
 #[gpui_kit::test]

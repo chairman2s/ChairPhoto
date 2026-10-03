@@ -350,9 +350,10 @@ deep links: Deep links;
 state: Library logic
 
 **Status:** built, partly visually checked 2026-10-03 (#163: the grid context menu, `[`/`]`,
-the inline loupe (rotate glyphs: #172), Compare's duel, the culling keys, rescan → cache
-warm-up;
-Compare's inspector header and bench marking: #170), the rest awaiting the visual check
+the inline loupe, Compare's duel, the culling keys, rescan → cache warm-up);
+since then the loupe's rotate chips are Lucide icons and its hint names "F faces" while
+Faces is enabled (#172), and Compare's inspector header and bench marking follow the focused
+pane (#170), both awaiting a visual re-check; the rest awaiting the visual check
 (#105, #106, #109, #114, #158, #159, #160: `crates/app/src/view.rs`,
 `crates/app/src/shell/state.rs`, `crates/app/src/library/grid.rs`,
 `crates/app/src/library/grid_menu.rs`, `crates/app/src/library/photo_actions.rs`,
@@ -528,8 +529,9 @@ indeterminate shows 40 %), otherwise "N photos · M selected" plus the status li
 **Port ticket:** Shell chrome
 
 **Status:** built (#105, #114, #115: `crates/app/src/shell/bench.rs`), visually checked
-2026-10-03 (#163), except: the pile's thumbnails are missing (#171) and in Compare the
-marking follows the selection, not the focused pane (#170): progress (import, export, scan,
+2026-10-03 (#163); since then the pile shows its first three thumbnails with the marked one
+ringed (#171) and in Compare the marking follows the focused pane (#170), both awaiting a
+visual re-check: progress (import, export, scan,
 develop) with Cancel for import/export, count + status line, marking via
 `ShellState::apply_mark`, "N on the table" pile and its actions.
 
@@ -569,7 +571,9 @@ Active item highlighted.
 **Port ticket:** Shell chrome
 
 **Status:** built (#105, #111, #122: `crates/app/src/shell/sidebar.rs` `render_rail`),
-visually checked 2026-10-03 (#163), except the module icons (#173): Library, Develop (`edit`
+visually checked 2026-10-03 (#163); the module icons (Map `map`, Stats
+`chart-no-axes-column`, People `user-group`) are served since #173, awaiting a visual
+re-check: Library, Develop (`edit`
 feature, disabled with no selection), module main views in `rail_order`, Preferences gear.
 
 ### `src/components/shell/Inspector.tsx`
@@ -2154,6 +2158,9 @@ inline confirm, Dismiss, Restore), 500-row pages with Prev/Next/"Back to first p
 Virtualised since #162: the queue is a variable-height virtual list (one 22 px line per owed
 field, React's `rowHeight`) and the owed-IPTC list a `uniform_list`;
 only the rows on screen are built, and each row's buttons are built with it.
+Since #169 every Resolve button captures its copy and the catalog it was read from when it is
+drawn, and a catalog switch re-reads the queue; since #164 the React panel is catalog-bound
+too and closes on a switch (GPUI re-reads instead).
 Difference: the Resolve buttons stay on one line (no wrap, a 240 px column), as React's
 fixed row height assumed.
 Visual check 2026-10-03 (#163): summary, explanation, Start repair pass and the empty state

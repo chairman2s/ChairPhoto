@@ -69,7 +69,7 @@ fn source_for(state: &AppState, photo: i64) -> SourceToken {
         return SourceToken::Preview;
     }
     let from = catalog_identity(state).ok();
-    if let Err(e) = editing::develop_open(state, from, photo, &[]) {
+    if let Err(e) = editing::develop_open(state, from, photo, &[], editing::develop_ticket(state)) {
         println!("  photo {photo}: develop open failed ({e}); the preview path");
         return SourceToken::Preview;
     }
@@ -255,7 +255,7 @@ fn main() {
             println!("  warm-up drag: {} failed", failed_frames(&warm));
         }
     }
-    let _ = editing::develop_close(&state);
+    let _ = editing::develop_close(&state, editing::develop_ticket(&state));
     if failed_total > 0 {
         println!("{failed_total} frames failed: the numbers above leave them out");
     }

@@ -36,11 +36,13 @@ pub async fn raw_probe(app: AppHandle, photo_id: i64) -> Result<DevelopSource, S
 /// The Darkroom opened `photo_id`: claim the develop session and start preparing its
 /// working image, then — at lower priority, silently — its `neighbours` (N+1 first).
 /// Returns the state right now; changes arrive as `develop:source`
-/// (`app::editing::develop_open`).
+/// (`app::editing::develop_open`). Its ticket is taken here, before the blocking pool, so
+/// an open or close invoked after it is never undone by it (#225).
 #[tauri::command]
 pub async fn develop_open(app: AppHandle, photo_id: i64, neighbours: Vec<i64>) -> Result<DevelopSource, String> {
+    let ticket = crate::app::editing::develop_ticket(&app.state::<AppState>());
     crate::app::spawn_blocking(move || {
-        crate::app::editing::develop_open(&app.state::<AppState>(), None, photo_id, &neighbours)
+        crate::app::editing::develop_open(&app.state::<AppState>(), None, photo_id, &neighbours, ticket)
     })
     .await
     .map_err(|e| e.to_string())?
@@ -49,7 +51,12 @@ pub async fn develop_open(app: AppHandle, photo_id: i64, neighbours: Vec<i64>) -
 /// The Darkroom closed: release the working images. Idempotent.
 #[tauri::command]
 pub async fn develop_close(app: AppHandle) -> Result<(), String> {
-    crate::app::editing::develop_close(&app.state::<AppState>())
+    let ticket = crate::app::editing::develop_ticket(&app.state::<AppState>());
+    // On the blocking pool: the close waits its turn behind an open's claim, which takes the
+    // catalog lock.
+    crate::app::spawn_blocking(move || crate::app::editing::develop_close(&app.state::<AppState>(), ticket))
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 /// Bytes the `.rawf` decode cache holds right now (Preferences → Darkroom); 0 in a build

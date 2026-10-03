@@ -27,6 +27,7 @@ use crate::shell::style::Colors;
 use crate::storage::ui;
 use chairphoto_core::app::faces::{FaceBboxJson, Verdict};
 use chairphoto_core::image_pool::ImageKind;
+use gpui_kit::assets::IconName;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::slider::{Slider, SliderEvent, SliderState};
 use gpui_kit::prelude::*;
@@ -313,7 +314,9 @@ impl PeopleView {
             let bar = ui::row()
                 .px(px(16.))
                 .py(px(8.))
-                .child(ui::clickable(ui::chip("faces-sheet-back", "← Clusters", true, colors), true, {
+                // "← Clusters": the UI font has no U+2190, and the fallback font it reaches
+                // for draws it tiny (#197) — Lucide's arrow instead.
+                .child(ui::clickable(ui::icon_label_chip("faces-sheet-back", IconName::ArrowLeft, false, "Clusters", true, colors), true, {
                     let people = people.clone();
                     move |_, _, cx| people.update(cx, |p, cx| p.close_cluster(cx))
                 }))

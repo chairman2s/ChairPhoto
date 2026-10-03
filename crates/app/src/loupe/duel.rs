@@ -23,6 +23,7 @@ use chairphoto_core::plugins::edit::SourceToken;
 use chairphoto_model::darkroom::kelvin::KelvinContext;
 use chairphoto_model::darkroom::spreads::{duel_pair, DuelDim, DUEL_DIMS};
 use chairphoto_model::editing::VersionEdit;
+use gpui_kit::assets::IconName;
 use gpui_kit::prelude::*;
 use gpui_kit::{
     div, px, AnyElement, Context, ElementId, Entity, EventEmitter, FocusHandle, ObjectFit, SharedString, Subscription,
@@ -290,7 +291,20 @@ impl Render for DuelView {
         // taking what the buttons leave (fitted inside it, never under them), the buttons below.
         let panes = div().flex().flex_row().gap(px(10.)).flex_1().min_h_0().p(px(14.)).children(
             states.into_iter().enumerate().map(|(i, state)| {
-                let pick_label = if i == 0 { "← This one" } else { "This one →" };
+                // "← This one" / "This one →": the UI font has no U+2190/U+2192, and the
+                // fallback font it reaches for draws them tiny (#197). The arrow draws as a
+                // Lucide icon, tagged on its own so a layout assertion can tell it is the icon
+                // and not a fallback glyph.
+                let arrow = crate::storage::ui::sized_icon(
+                    SharedString::from(format!("duel-pick-arrow-{i}")),
+                    if i == 0 { IconName::ArrowLeft } else { IconName::ArrowRight },
+                );
+                let pick_label = if i == 0 {
+                    div().flex().items_center().gap(px(4.)).child(arrow).child("This one")
+                } else {
+                    div().flex().items_center().gap(px(4.)).child("This one").child(arrow)
+                };
+                let pick_aria = if i == 0 { "← This one" } else { "This one →" };
                 div()
                     .id(("duel-pane", i as u64))
                     .flex()
@@ -319,7 +333,8 @@ impl Render for DuelView {
                             .justify_center()
                             .gap(px(8.))
                             .child(
-                                crate::storage::ui::chip(SharedString::from(format!("duel-pick-{i}")), pick_label, true, colors)
+                                crate::storage::ui::chip_with(SharedString::from(format!("duel-pick-{i}")), pick_label, true, colors)
+                                    .aria_label(pick_aria)
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         cx.stop_propagation();
                                         this.pick(i, cx)

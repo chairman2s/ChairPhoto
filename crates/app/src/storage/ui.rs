@@ -33,7 +33,39 @@ pub fn icon_chip(
     chip_with(id, gpui_kit::component::Icon::new(icon).size(px(13.)), enabled, colors).aria_label(label)
 }
 
-fn chip_with(id: impl Into<SharedString>, child: impl IntoElement, enabled: bool, colors: Colors) -> Stateful<Div> {
+/// A findable 13 px icon alone, for a layout assertion that it draws at normal size — not a
+/// UI-font fallback's tiny mark (←/→, #197; ↺/↻, #172).
+pub fn sized_icon(id: impl Into<SharedString>, icon: impl gpui_kit::component::IconNamed) -> AnyElement {
+    div().id(id.into()).child(gpui_kit::component::Icon::new(icon).size(px(13.))).test_support().into_any_element()
+}
+
+/// An icon beside text, at the app's 13 px stroke-icon size — icon first, or after `text` when
+/// `after` — for a label whose glyph the embedded UI font lacks and a fallback font drew tiny
+/// (←/→, #197). [`icon_chip`] is for a chip with no text of its own (the loupe's rotate chips,
+/// #172).
+pub fn icon_label(icon: impl gpui_kit::component::IconNamed, after: bool, text: impl Into<SharedString>) -> Div {
+    let icon_el = gpui_kit::component::Icon::new(icon).size(px(13.));
+    let row = div().flex().items_center().gap(px(4.));
+    if after { row.child(text.into()).child(icon_el) } else { row.child(icon_el).child(text.into()) }
+}
+
+/// A [`chip`] pairing [`icon_label`] — e.g. "← Prev" read as [left-arrow icon] Prev — for a
+/// chip whose label the UI font cannot draw at full size (#197).
+pub fn icon_label_chip(
+    id: impl Into<SharedString>,
+    icon: impl gpui_kit::component::IconNamed,
+    after: bool,
+    text: impl Into<SharedString>,
+    enabled: bool,
+    colors: Colors,
+) -> Stateful<Div> {
+    chip_with(id, icon_label(icon, after, text), enabled, colors)
+}
+
+/// A chip around any element, for a caller that needs a child [`chip`]/[`icon_label`] cannot
+/// build alone — e.g. a composite whose icon also needs its own id (the duel's "This one"
+/// buttons, #197, tag their arrow for a layout assertion that it is the icon, not the label).
+pub(crate) fn chip_with(id: impl Into<SharedString>, child: impl IntoElement, enabled: bool, colors: Colors) -> Stateful<Div> {
     div()
         .id(id.into())
         .flex()

@@ -349,7 +349,8 @@ impl LoupeView {
         let back_to_original = selection.extra_photo.is_some() && selection.stack_origin.is_some();
         let soft = shell.soft_threshold;
         let version = shell.active_version().map(|v| v.name.clone());
-        let hint = loupe_hint(faces_enabled(&self.modules, cx));
+        let faces = faces_enabled(&self.modules, cx);
+        let (hint_prefix, hint) = (loupe_hint_prefix(faces), loupe_hint(faces));
         // The row and the catalog it was read from, as drawn: a click acts on these (#207).
         let (id, from) = (photo.id, shell.rows_from());
         let name = file_name(&photo.path);
@@ -433,10 +434,18 @@ impl LoupeView {
             .child(
                 div()
                     .id("loupe-hint")
+                    .flex()
+                    .items_center()
+                    .gap(px(4.))
                     .text_size(px(11.))
                     .text_color(colors.mute)
                     .whitespace_nowrap()
-                    .child(hint)
+                    .child(hint_prefix)
+                    // "← →" drawn as text fell back to a font that renders U+2190/U+2192 tiny;
+                    // Lucide's arrows at the app's 13 px stroke-icon size read the same way the
+                    // rotate chips do (#172, #197).
+                    .child(ui::sized_icon("loupe-hint-arrow-left", IconName::ArrowLeft))
+                    .child(ui::sized_icon("loupe-hint-arrow-right", IconName::ArrowRight))
                     .aria_label(hint)
                     .test_support(),
             )
@@ -461,14 +470,22 @@ fn faces_enabled(modules: &Entity<ModuleRegistry>, cx: &App) -> bool {
     }
 }
 
-/// The loupe bar's key hint (App.tsx's `.loupe-hint`). "F faces" only while the Faces module
-/// is on: F toggles its overlay's boxes, and without it the key does nothing.
-pub fn loupe_hint(faces: bool) -> &'static str {
+/// [`loupe_hint`] without its trailing "· ← →" — what the bar draws as text; the arrows are
+/// Lucide icons instead (#197: the UI font has no U+2190/U+2192, and the fallback font it
+/// reaches for draws them tiny).
+fn loupe_hint_prefix(faces: bool) -> &'static str {
     if faces {
-        "scroll zoom · drag pan · dbl-click 100% · P pick · X reject · F faces · ← →"
+        "scroll zoom · drag pan · dbl-click 100% · P pick · X reject · F faces"
     } else {
-        "scroll zoom · drag pan · dbl-click 100% · P pick · X reject · ← →"
+        "scroll zoom · drag pan · dbl-click 100% · P pick · X reject"
     }
+}
+
+/// The loupe bar's key hint (App.tsx's `.loupe-hint`), as the accessible/test string. "F
+/// faces" only while the Faces module is on: F toggles its overlay's boxes, and without it the
+/// key does nothing.
+pub fn loupe_hint(faces: bool) -> String {
+    format!("{} · ← →", loupe_hint_prefix(faces))
 }
 
 /// The last path component (`path.split("/").pop()`).

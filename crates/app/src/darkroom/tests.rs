@@ -1286,6 +1286,30 @@ fn the_duel_fits_each_variant_above_its_buttons(cx: &mut TestAppContext) {
     }
 }
 
+/// #197: the duel's "← This one" / "This one →" buttons draw Lucide's arrow icons at the
+/// app's 13 px stroke-icon size, not the UI font's tiny fallback mark for U+2190/U+2192 — the
+/// icon leads the text on the left pane and trails it on the right, as the arrows did.
+#[gpui_kit::test]
+fn the_duel_pick_buttons_draw_normal_sized_arrow_icons(cx: &mut TestAppContext) {
+    let rig = rig("dk-duel-arrows", 1, cx);
+    rig.with_view(cx, |v, window, cx| v.open_duel(window, cx));
+    rig.render(cx);
+    cx.update_window(rig.app.window(), |_, window, _| {
+        for i in 0..2u64 {
+            let chip = window.find(format!("duel-pick-{i}")).bounds();
+            let arrow = window.find(format!("duel-pick-arrow-{i}")).bounds();
+            assert_eq!(arrow.size.width, gpui_kit::px(13.), "pane {i}'s arrow is the 13 px icon, not a fallback glyph");
+            assert_eq!(arrow.size.height, gpui_kit::px(13.), "pane {i}'s arrow is the 13 px icon, not a fallback glyph");
+            if i == 0 {
+                assert!(arrow.center().x < chip.center().x, "pane 0: the arrow leads \"This one\"");
+            } else {
+                assert!(arrow.center().x > chip.center().x, "pane 1: the arrow follows \"This one\"");
+            }
+        }
+    })
+    .unwrap();
+}
+
 /// The proof sheet's cells share the duel's picture helper: a portrait proof's picture element
 /// is laid out as its 3:2 cell, not taller (it paints with `cover` there, as React's
 /// `.dk-proof-cell img` does — the fit mode itself is not observable here).

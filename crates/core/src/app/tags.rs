@@ -158,10 +158,15 @@ pub fn split_tag(
 }
 
 /// Add the tag at `path` to a tag group, creating the tag if it does not exist yet. Returns
-/// the tag id. The Tags groups manager's "Add tag (path, created if new)".
+/// the tag id. The Tags groups manager's "Add tag (path, created if new)". An auto-tag is
+/// refused ([`CatalogError::AutoTag`](crate::catalog::CatalogError::AutoTag)): a group's
+/// buttons assign by hand, which an auto-tag refuses (#181).
 pub fn add_tag_to_group(c: &Catalog, group_id: i64, path: &str) -> Result<i64> {
     let tag_id = match c.find_tag_id_by_path(path)? {
-        Some(id) => id,
+        Some(id) => {
+            c.refuse_auto_tag(id)?;
+            id
+        }
         None => c.create_tag(path)?,
     };
     c.add_tag_to_group(group_id, tag_id)?;

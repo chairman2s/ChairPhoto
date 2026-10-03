@@ -614,6 +614,33 @@ fn the_tagging_block_never_assigns_an_auto_tag_by_hand(cx: &mut TestAppContext) 
     assert!(!fast_has_auto(), "the next pass has nothing of the user's to drop");
 }
 
+/// Review #181 nit: the groups manager doesn't take an auto-tag as a member — a group's
+/// buttons assign by hand — and says why.
+#[gpui_kit::test]
+fn the_groups_manager_refuses_an_auto_tag(cx: &mut TestAppContext) {
+    let dir = TempDir::new("tags-groups-auto");
+    let app = start(cx);
+    let s = open_tagged(&app, &dir, "a", cx);
+    with_catalog(&app, |c| {
+        let auto = c.create_tag("Technique/Long Exposure").unwrap();
+        c.conn().execute("UPDATE tags SET auto_rule = 'long-exposure' WHERE id = ?1", [auto]).unwrap();
+    });
+    select_photo(&app, s.photos[2], cx);
+    click(&app, "inspector-tab-tags", cx);
+    click(&app, "quick-groups-manage", cx);
+    let TagDialog::Groups(manager) = last_dialog(&app, cx) else { panic!("the groups manager") };
+    let manager = up(manager);
+    let (new_group, new_member) = manager.read_with(cx, |m, _| (m.new_group.clone(), m.new_member.clone()));
+    set_input(&app, &new_group, "Technique", cx);
+    press_in(&app, &new_group, "enter", cx);
+    set_input(&app, &new_member, "Technique/Long Exposure", cx);
+    press_in(&app, &new_member, "enter", cx);
+    manager.read_with(cx, |m, _| {
+        assert!(m.members.is_empty(), "{:?}", m.members);
+        assert!(m.error.as_deref().is_some_and(|e| e.contains("is an auto-tag")), "{:?}", m.error);
+    });
+}
+
 // --- catalog switches ---------------------------------------------------------------------
 
 /// **Forced interleaving.** A tag write is started, then the catalog switches to another

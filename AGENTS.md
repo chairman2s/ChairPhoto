@@ -108,10 +108,25 @@ Read only the documents triggered by the task:
 - Event listeners are resources: give each async registration an owner, stop late registrations,
   and release only the listener owned by that attempt.
 
+### Catalog identity
+
+- Every UI-originated write keyed by photo/tag/fence ids captures the catalog's
+  `CatalogIdentity` when it reads (`with_catalog_identified`) and writes with
+  `with_catalog_as`, which checks and writes under one catalog lock (`crates/core/src/app/`).
+  A generation check on the UI thread is not enough: a switch publishes the new catalog
+  before `catalog:switched` reaches the UI.
+- Dialogs and panels capture the identity when they open and close on a switch. A row's
+  action captures that row (ids, uuid, generation) and its catalog when it is drawn, never
+  an index looked up at click time.
+- Tests swap the catalog for one with colliding ids, with and without delivering
+  `catalog:switched`.
+
 ### Performance
 
 - Thumbnail/grid work never decodes on the UI thread.
-- Serve image bytes through the native media protocols/cache, never as base64 IPC payloads.
+- GPUI: pixels reach the screen through `ImageStore` (`crates/app/src/image_store.rs`) as GPU
+  textures, decoded on the image pool. React (until #165): through the native media
+  protocols, never as base64 IPC payloads.
 - Navigation loads the requested photo first, then preloads N-1 and N+1. Target display latency
   is under 50 ms when preloaded and under 500 ms cold.
 - Scans, indexing, export, and model work expose progress without making progress events a
@@ -121,29 +136,37 @@ Read only the documents triggered by the task:
 
 - Core tables live in `catalog/schema.rs`; plugins use prefixed tables such as `faces__*` and
   `smarttags__*` and never alter core tables.
-- Modules reach host/backend services through `ChairPhotoAPI`, declared core wrappers, and host
-  hooks; never through `window.__TAURI__` or arbitrary app internals.
-- Core command wrappers stay in `modules/api.ts`; module-owned wrappers stay with the module
-  and call `ChairPhotoAPI.invoke` / optional host capabilities.
+- GPUI modules are compiled in: each implements the `Module` trait in
+  `crates/app/src/modules/` and registers in `modules/registry.rs`, behind the same Cargo
+  feature as its backend. Module logic that needs no UI goes in `crates/model`; backend bodies
+  in `crates/core/src/app/` or `plugins/`.
+- React (until #165): modules reach host/backend services through `ChairPhotoAPI`, declared
+  core wrappers, and host hooks, never through `window.__TAURI__` or app internals; core
+  command wrappers stay in `modules/api.ts`.
 - Missing optional host capabilities degrade only the cosmetic/optional behavior. A required
   terminal signal must fail closed with an explicit state.
 
 ## Architecture
 
 ```
-src/                    React/TypeScript UI and host/module contracts
-crates/core/src/        Rust I/O, catalog, image processing, jobs (`chairphoto-core`, no Tauri)
-src-tauri/src/          Tauri shell: `run()`, commands, media protocols (`chairphoto`)
-crates/app/src/         GPUI front end replacing the Tauri shell (`chairphoto-app`, bin `chairphoto-gpui`)
+crates/core/src/        Rust I/O, catalog, image processing, jobs (`chairphoto-core`, no UI)
+crates/app/src/         GPUI front end, the primary UI (`chairphoto-app`, bin `chairphoto-gpui`)
+crates/model/src/       UI logic with no I/O, unit-tested on its own (`chairphoto-model`)
+src/                    React/TypeScript UI — frozen, removed at the cutover (#165)
+src-tauri/src/          Tauri shell over the core (`chairphoto`) — frozen, removed at #165
 ```
+
+The GPUI app is where new UI work goes. The React app still builds and ships from this
+branch until the cutover, so a changed Tauri command must keep React working.
 
 The Rust side is a Cargo workspace rooted at the repository root. The core crate must build
 with no `tauri` dependency; the shell re-exports it at its crate root and forwards every
 feature under the same name.
 
-Frontend/backend communication is asynchronous Tauri IPC. Rust owns file access,
-catalog queries, image decoding, XMP, and external processes. TypeScript invokes typed
-commands and renders their results; it never reads photo files directly.
+The core owns file access, catalog queries, image decoding, XMP, and external processes.
+The GPUI app calls the core directly (`crates/core/src/app/` services, through `AppState`)
+and never reads photo files itself; blocking calls run on a worker or the storage `Runner`.
+React reaches the same services through Tauri commands.
 
 ### Backend map
 
@@ -152,7 +175,8 @@ shell's (`src-tauri/src/`).
 
 | Path | Responsibility |
 |---|---|
-| `commands/` | Flat Tauri command surface; one submodule per domain. `mod.rs` holds `AppState` and genuinely shared helpers only. |
+| `app/` | The service layer every front end shares: `AppState`, `with_catalog*` and `CatalogIdentity` (`mod.rs`), job families and the documented lock order (`jobs.rs`), events (`events.rs`), and one file per domain (`iptc.rs`, `faces.rs`, `scans.rs`, `uploads.rs`, …). Tauri commands are thin wrappers over these. |
+| `commands/` | (shell) Flat Tauri command surface; one submodule per domain. |
 | `catalog/` | SQLite schema, migrations, lifecycle, locations/resolver, vocabulary (incl. tag maintenance), albums, and merge. |
 | `scanner/`, `thumbnails/`, `image_pool/`, `protocol/` | Import/index, preview generation/cache, bounded decode work, and native media protocols. |
 | `xmp/` | Merge-safe sidecar reads/writes. |
@@ -163,7 +187,28 @@ shell's (`src-tauri/src/`).
 
 Add commands to their domain submodule, not `commands/mod.rs`.
 
-### Frontend map
+### GPUI front-end map
+
+Paths are under `crates/app/src/`. Each top-level module's `//!` doc names its ticket and the
+React component it ports; `docs/plans/gpui/parity.md` maps every React file to its port.
+
+| Path | Responsibility |
+|---|---|
+| `lib.rs`, `view.rs`, `model.rs` | Startup and wiring (`run`, `wire`), the root view, app-wide state. |
+| `shell/`, `keymap.rs` | Title bar, menus, command pill, bench, collection browser, splash, `ShellState`; actions, key contexts and bindings. |
+| `library/` | The virtualised grid, its context menu (`grid_menu.rs`) and photo commands (`photo_actions.rs`). |
+| `loupe/`, `darkroom/`, `inspector/`, `tags/` | Loupe/Compare/Cull/pop-out, Develop, the inspector column, tags. |
+| `storage/`, `albums/`, `export/`, `preferences/` | Import, catalogs, identity debt (`identity_debt.rs`), the `Runner` (`runner.rs`); albums; export; Preferences. |
+| `image_store.rs` | `ImageStore`: thumbnail/preview/zoom tiers as textures, claims, looks, catalog binding. |
+| `events.rs` | Core events into GPUI entities. |
+| `modules/` | The `Module` trait, `registry.rs`, and one directory per first-party module. |
+| `*_tests.rs`, `*/tests.rs` | Headless GPUI tests (TestAppContext) per area; `tests.rs` holds the shared rig. |
+
+`crates/model/src/` holds the pure logic behind these views (library session/query, darkroom,
+editing, presets, tag tree/graph, statistics, deep links, theme), ported from the TypeScript
+with its vitest cases.
+
+### React front-end map (frozen; removed at #165)
 
 | Path | Responsibility |
 |---|---|
@@ -187,7 +232,11 @@ Add commands to their domain submodule, not `commands/mod.rs`.
 
 ### Build and test
 
-Run the full suite for every package touched, not a scoped test that can hide breakage:
+Run the full suite for every package touched, not a scoped test that can hide breakage.
+`.claude/skills/merge-verify/verify.sh <label> [--root DIR] [--features a,b]` runs all of the
+below (frontend only when `src/` changed), counts distinct SKIPPED tests, and prints a
+summary; use it rather than filtering cargo output by hand. It puts test temp files under
+`/home`, because `/tmp` is a quota-limited tmpfs and one test copies the 8 GB real catalog.
 
 ```bash
 # frontend, from repository root
@@ -200,6 +249,10 @@ cargo test --workspace
 cargo check --workspace --all-features --all-targets
 cargo check --workspace --no-default-features
 ```
+
+New tests go next to the code they test or in that area's own test module, grouped under a
+section comment. Don't append to the end of a large shared test file: parallel branches that
+all add there conflict, and twice in October 2026 the merge dropped a closing brace.
 
 `cargo check --workspace --all-features --all-targets` includes `#[cfg(test)]` code; plain
 `cargo check` does not. Keep every feature combination warning-clean.

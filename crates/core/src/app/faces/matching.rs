@@ -17,6 +17,7 @@ use super::super::{
 };
 use crate::catalog::Catalog;
 use crate::plugins::faces::matcher::{self, MatchPhase, MatchSettings};
+use crate::plugins::faces::regions;
 use std::sync::atomic::Ordering;
 
 /// Within a phase, a progress event goes out every this many items (phase changes and ends
@@ -67,6 +68,78 @@ pub fn cancel_match_job(state: &AppState, job: u64) -> Result<bool, String> {
     state.jobs.faces_match.cancel_job(job)
 }
 
+/// What [`write_seeded_regions`] did, for the job's log line.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SeededRegions {
+    /// Photos whose sidecar write went through (or had nothing to change).
+    pub written: usize,
+    /// Photos offline: skipped, as a face verb's write is; the next face write catches up.
+    pub offline: usize,
+    /// Sidecars that refused the write for their layout or frame, left byte for byte as
+    /// they were (docs/face-tagging.md, "Declared size").
+    pub refused: usize,
+    pub failed: usize,
+    /// Photos not reached: the job was cancelled or the catalog switched.
+    pub skipped: usize,
+}
+
+/// Write the face regions of the photos this run's auto-seed confirmed (#210): before, a seed
+/// stayed out of the sidecar until the next face verb on its photo. The write is the face
+/// verbs' own ([`regions::write_photo_regions`]): merge-safe, the sidecar backed up before
+/// ChairPhoto's first write to it, a frame it cannot place its boxes in refused with the file
+/// untouched, and the photo's set read under the sidecar's file lock on this job's own
+/// connection (#156) — so a face verb on the main connection, writing the same sidecar, is
+/// ordered with it and neither writes an older set over the other. Like the pre-marker
+/// conversion it takes no `WriteOrder` turn: that orders a store with its later sidecar write,
+/// and here the store was the seed, made earlier on this connection; the set written is read
+/// fresh under the file lock.
+///
+/// On the job's worker, after the pipeline. `progress` is the job's: it reports
+/// [`MatchPhase::Regions`] and answers `false` once the job is cancelled or superseded, or its
+/// catalog switched; the photos not reached keep their seeds unexported until a face verb on
+/// them, as before. Blocking (sidecar IO per photo).
+pub fn write_seeded_regions(
+    sec: &Catalog,
+    photos: &[i64],
+    progress: &mut dyn FnMut(MatchPhase, usize, usize) -> bool,
+) -> SeededRegions {
+    use crate::xmp::RegionWriteError;
+    let mut out = SeededRegions::default();
+    let total = photos.len();
+    if total == 0 {
+        return out;
+    }
+    if !progress(MatchPhase::Regions, 0, total) {
+        out.skipped = total;
+        return out;
+    }
+    for (done, &photo) in photos.iter().enumerate() {
+        match sec.resolve_photo_path(photo) {
+            Ok(Some(path)) => match regions::write_photo_regions(sec.conn(), photo, |_| Ok(Some(path))) {
+                Ok(()) => out.written += 1,
+                Err(RegionWriteError::Refused(why)) => {
+                    eprintln!("faces_match: the region write of photo {photo} was refused: {why}");
+                    out.refused += 1;
+                }
+                Err(RegionWriteError::Failed(e)) => {
+                    eprintln!("faces_match: the region write of photo {photo} failed: {e}");
+                    out.failed += 1;
+                }
+            },
+            Ok(None) => out.offline += 1,
+            Err(e) => {
+                eprintln!("faces_match: the region write of photo {photo} failed: {e}");
+                out.failed += 1;
+            }
+        }
+        if !progress(MatchPhase::Regions, done + 1, total) {
+            out.skipped = total - done - 1;
+            break;
+        }
+    }
+    out
+}
+
 /// The matching worker: everything after the claim. Blocking — runs on a worker thread.
 pub fn run_match_job(sink: &(impl EventSink + ?Sized), claim: JobClaim<FacesMatchJobStatus>) {
     let JobClaim { db_path, root, abort, job, slot } = claim;
@@ -113,7 +186,17 @@ pub fn run_match_job(sink: &(impl EventSink + ?Sized), claim: JobClaim<FacesMatc
         true
     };
 
-    let result = matcher::run_matching_with_progress(sec.conn(), &settings, now_secs(), &mut on_progress);
+    let result = matcher::run_matching_seeded(sec.conn(), &settings, now_secs(), &mut on_progress).map(
+        |(outcome, seeded)| {
+            // The faces the seed confirmed reach their sidecars now (#210), as a face verb's
+            // confirmation does; `on_progress` stops it on an abort or a switch.
+            let written = write_seeded_regions(&sec, &seeded, &mut on_progress);
+            if written != SeededRegions::default() {
+                eprintln!("faces_match: seeded faces' regions: {written:?}");
+            }
+            outcome
+        },
+    );
     let aborted = abort.load(Ordering::Relaxed);
 
     // Clear the slot before the terminal event, and only if this job still owns it.

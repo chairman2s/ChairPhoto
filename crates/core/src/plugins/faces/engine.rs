@@ -386,6 +386,9 @@ fn auraface_pool() -> Result<Arc<Pool<ort::session::Session>>, EngineError> {
 #[cfg(feature = "faces")]
 fn build_pool(spec: &models::ModelSpec, key: &PoolKey) -> Result<Pool<ort::session::Session>, String> {
     let path = models::verify(spec).map_err(|e| e.to_string())?;
+    // Where CUDA may be tried: a `faces-cuda` build not forced to CPU, whose CUDA session
+    // builds have not crashed the app twice with this driver and runtime (#210).
+    let cuda_subject = cuda_crash_subject(key.force_cpu);
     let mut sessions = Vec::with_capacity(key.pool_size);
     let mut used_cuda = false;
     for _ in 0..key.pool_size {
@@ -394,11 +397,19 @@ fn build_pool(spec: &models::ModelSpec, key: &PoolKey) -> Result<Pool<ort::sessi
         //
         // GPU is tried first (only in a `faces-cuda` build, and only if not forced to CPU).
         // On any failure `try_register_cuda` logs and leaves the builder on CPU — never an
-        // error, never a crash. `key.force_cpu` — not the live `FORCE_CPU` atomic — decides
-        // it, so the built pool always matches the key it was cached under even if a
-        // concurrent `configure_force_cpu` call is landing at the same moment.
+        // error, never a crash — and a session that registered CUDA but then fails to build
+        // is built again on CPU (`onnx::with_cpu_fallback`, #210). `key.force_cpu` — not the
+        // live `FORCE_CPU` atomic — decides it, so the built pool always matches the key it
+        // was cached under even if a concurrent `configure_force_cpu` call is landing at the
+        // same moment.
+        //
+        // A CUDA build is native code that can take the process down (a partial cuDNN can
+        // abort ONNX Runtime during CUDA init), so it runs under a crash marker: two crashes
+        // with this driver and runtime and CUDA is skipped, on CPU, until either changes.
+        let _crash_guard =
+            cuda_subject.as_ref().map(|subject| crate::crash_marker::enter(KIND_CUDA_SESSION, subject, CUDA_LABEL));
         let (session, cuda) = crate::plugins::onnx::build_session(&path, key.intra_threads, |b| {
-            try_register_cuda(b, key.force_cpu)
+            try_register_cuda(b, cuda_subject.is_none())
         })?;
         used_cuda |= cuda;
         sessions.push(session);
@@ -446,6 +457,77 @@ fn try_register_cuda(builder: &mut ort::session::builder::SessionBuilder, force_
             false
         }
     }
+}
+
+/// Crash-marker kind for building a faces session on the CUDA execution provider
+/// (`crate::crash_marker`, #210).
+#[cfg(feature = "faces")]
+const KIND_CUDA_SESSION: &str = "onnx-cuda-session";
+#[cfg(feature = "faces")]
+const CUDA_LABEL: &str = "the CUDA execution provider (face models)";
+
+/// The crash-marker subject of a CUDA session build, when CUDA may be tried: `None` when
+/// forced to CPU, and when CUDA session builds have crashed the app [`BLOCK_AFTER`] times with
+/// this subject — the ONNX Runtime and the NVIDIA driver versions, so either changing earns
+/// CUDA a fresh chance. (A cuDNN repair alone does not change it: `faces.force_cpu` is moot
+/// then, and clearing the app data's `crash-markers/` retries.)
+///
+/// Only the session build is under the marker, not each inference: the documented crash is in
+/// CUDA's init (a partial cuDNN install aborting ONNX Runtime), and a marker write per
+/// inference — every face — would put file I/O on the hot path.
+///
+/// [`BLOCK_AFTER`]: crate::crash_marker::BLOCK_AFTER
+#[cfg(all(feature = "faces", feature = "faces-cuda"))]
+fn cuda_crash_subject(force_cpu: bool) -> Option<String> {
+    let ort = crate::plugins::onnx::ensure_available().unwrap_or("unavailable");
+    let driver = std::fs::read_to_string("/proc/driver/nvidia/version").ok();
+    let subject = cuda_subject(ort, driver.as_deref().and_then(nvidia_driver_version).as_deref());
+    cuda_allowed(force_cpu, subject, crate::crash_marker::blocked)
+}
+
+/// Non-CUDA build: CUDA is never tried, so there is nothing to mark.
+#[cfg(all(feature = "faces", not(feature = "faces-cuda")))]
+fn cuda_crash_subject(_force_cpu: bool) -> Option<String> {
+    None
+}
+
+/// The policy of [`cuda_crash_subject`]: `subject` unless forced to CPU or `blocked`.
+#[cfg(any(test, feature = "faces-cuda"))]
+fn cuda_allowed(
+    force_cpu: bool,
+    subject: String,
+    blocked: impl FnOnce(&str, &str) -> Option<crate::crash_marker::Strikes>,
+) -> Option<String> {
+    if force_cpu {
+        return None;
+    }
+    if let Some(s) = blocked(KIND_CUDA_SESSION, &subject) {
+        eprintln!(
+            "faces engine: building on CUDA crashed the app {} times with this driver and runtime ({subject}); \
+             running on CPU until either changes",
+            s.strikes
+        );
+        return None;
+    }
+    Some(subject)
+}
+
+/// The crash-marker subject for ONNX Runtime `ort` and NVIDIA driver `driver`.
+#[cfg(any(test, feature = "faces-cuda"))]
+fn cuda_subject(ort: &str, driver: Option<&str>) -> String {
+    format!("onnxruntime {ort}|nvidia {}", driver.unwrap_or("unknown"))
+}
+
+/// The driver version in `/proc/driver/nvidia/version` — the first dotted number of its first
+/// line (`NVRM version: NVIDIA UNIX x86_64 Kernel Module  560.35.03  Fri Aug 16 …`, or the
+/// open module's `… Open Kernel Module for x86_64  580.82.09  Release Build …`).
+#[cfg(any(test, feature = "faces-cuda"))]
+fn nvidia_driver_version(text: &str) -> Option<String> {
+    let dotted = |t: &&str| {
+        let parts: Vec<&str> = t.split('.').collect();
+        parts.len() >= 2 && parts.iter().all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+    };
+    text.lines().next()?.split_whitespace().find(dotted).map(str::to_string)
 }
 
 /// Non-CUDA build: no CUDA EP exists, so this is always CPU. Kept as a same-signature stub so
@@ -1011,6 +1093,57 @@ mod tests {
         let norm: f32 = u.iter().map(|x| x * x).sum::<f32>().sqrt();
         assert!((norm - 1.0).abs() < 1e-5, "norm={norm}");
         assert!((cosine(&u, &u) - 1.0).abs() < 1e-5);
+    }
+
+    // ── The CUDA session build's crash marker (#210) ────────────────────────────
+    //
+    // What runs without a GPU: the subject (driver and runtime versions) and the policy. The
+    // marker itself is `crash_marker`'s, tested there.
+
+    /// Both NVIDIA module flavours' version lines give the driver version; anything else none.
+    #[test]
+    fn the_driver_version_is_read_from_procfs_text() {
+        let proprietary = "NVRM version: NVIDIA UNIX x86_64 Kernel Module  560.35.03  Fri Aug 16 21:39:15 UTC 2024\nGCC version:  gcc version 14.2.1 20240805 (GCC)\n";
+        let open = "NVRM version: NVIDIA UNIX Open Kernel Module for x86_64  580.82.09  Release Build  (dvs-builder@U16-I3-B03-4-3)  Tue Aug 26 2025\n";
+        assert_eq!(nvidia_driver_version(proprietary).as_deref(), Some("560.35.03"));
+        assert_eq!(nvidia_driver_version(open).as_deref(), Some("580.82.09"));
+        assert_eq!(nvidia_driver_version("NVRM version: unknown\n"), None);
+        assert_eq!(nvidia_driver_version(""), None);
+    }
+
+    /// The subject names the runtime and the driver, so a new one of either is a new subject.
+    #[test]
+    fn the_cuda_subject_changes_with_the_driver_or_the_runtime() {
+        let s = cuda_subject("1.22.0", Some("560.35.03"));
+        assert_eq!(s, "onnxruntime 1.22.0|nvidia 560.35.03");
+        assert_ne!(s, cuda_subject("1.22.0", Some("580.82.09")));
+        assert_ne!(s, cuda_subject("1.23.0", Some("560.35.03")));
+        assert_eq!(cuda_subject("1.22.0", None), "onnxruntime 1.22.0|nvidia unknown");
+    }
+
+    /// CUDA is tried unless forced to CPU or its subject is blocked, and the block is asked
+    /// about this kind and this subject.
+    #[test]
+    fn cuda_is_skipped_when_forced_or_blocked() {
+        let subject = || "onnxruntime 1.22.0|nvidia 560.35.03".to_string();
+        let blocked = |kind: &str, subject: &str| {
+            Some(crate::crash_marker::Strikes {
+                kind: kind.into(),
+                subject: subject.into(),
+                label: CUDA_LABEL.into(),
+                strikes: crate::crash_marker::BLOCK_AFTER,
+                last_at: 0,
+            })
+        };
+        assert_eq!(cuda_allowed(false, subject(), |_, _| None), Some(subject()));
+        assert_eq!(cuda_allowed(true, subject(), |_, _| None), None, "forced to CPU");
+        assert_eq!(cuda_allowed(false, subject(), blocked), None, "crashed twice");
+        let mut asked = None;
+        cuda_allowed(false, subject(), |k, s| {
+            asked = Some((k.to_string(), s.to_string()));
+            None
+        });
+        assert_eq!(asked, Some((KIND_CUDA_SESSION.to_string(), subject())));
     }
 
     // ── PoolKey / configure (issue #18) ─────────────────────────────────────────

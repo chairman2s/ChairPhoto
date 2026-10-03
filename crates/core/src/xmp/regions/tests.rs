@@ -1245,11 +1245,12 @@ fn only_the_pre_marker_shape_is_adopted_or_removed() {
 
 /// Step 1 follows our marker only while the region is still recognisably that face — its
 /// Name, or its place. A region carrying our marker for face 5 whose name *and* place
-/// both differ from face 5's (a copy of this catalog's file that diverged, sharing its
-/// identity) is not renamed and moved: since face 5 is still in the set it has not left
-/// it either, so the region is kept exactly as it is (review N1) and face 5 is written
-/// beside it. With either the name or the place still matching, the marker is followed
-/// and the annotation kept.
+/// both differ from face 5's is not renamed and moved: it may be a copy of this catalog's
+/// file that diverged, sharing its identity and face ids, so with face 5 still in the set
+/// it is kept exactly as it is (review N1) and face 5 is written beside it. The next write
+/// claims face 5's own region, and then the other one carrying the same marker goes
+/// (#209). With either the name or the place still matching, the marker is followed and
+/// the annotation kept.
 #[test]
 fn a_marker_is_followed_only_while_the_name_or_place_still_matches() {
     let annotated = |name: &str, bbox| {
@@ -1280,7 +1281,73 @@ fn a_marker_is_followed_only_while_the_name_or_place_still_matches() {
         assert!(near4(alices[0].area, center(alice_place)), "{case}:\n{xml}");
         let kept = rf::subtree(&xml, rf::NS_DIGIKAM, "FaceEngine").len();
         assert_eq!(kept, 1, "{case}: the annotation:\n{xml}");
+
+        // The next write: one region carries the marker, the claimed one.
+        write_face_regions(&photo, CAT, &[face(5, "Alice", alice_place)], &[], &[], sized(6000, 4000)).unwrap();
+        let xml = read(&sidecar_path(&photo));
+        let got = rf::mwg(&xml);
+        assert!(rf::named(&got, "Carl").is_empty(), "{case}: the stale copy stayed:\n{xml}");
+        let marked: Vec<_> = got.regions.iter().filter(|r| r.face_id.as_deref() == Some(ours(5).as_str())).collect();
+        assert_eq!(marked.len(), 1, "{case}:\n{xml}");
+        assert_eq!(marked[0].name, "Alice", "{case}");
+        let kept = rf::subtree(&xml, rf::NS_DIGIKAM, "FaceEngine").len();
+        assert_eq!(kept, usize::from(follows), "{case}: the annotation went with its region:\n{xml}");
     }
+}
+
+// ── #209 (review F2): one region per marker of ours ─────────────────────────
+
+/// Probe F2: face 1 is written as "Alice" while the orientation is unknown, then — the
+/// orientation found by a rescan and the face reassigned — as "Bob" on Orientation 6, so
+/// both its name and its place change in one write. That write cannot tell the old region
+/// from a copied catalog's (review N1) and appends Bob beside it; the photo's next write
+/// claims Bob's region by its marker and removes the stale Alice carrying the same one.
+/// digiKam's foreign Bob stays throughout.
+#[test]
+fn a_stale_region_with_the_marker_of_a_claimed_one_is_removed() {
+    let (_dir, photo) = seeded_photo("xmp-209-rename-move", rf::DIGIKAM);
+    let before = rf::mwg(rf::DIGIKAM);
+    let unknown = RegionFrame { orientation: None, stored_size: Some((6000, 4000)) };
+    let bbox = (0.1, 0.2, 0.3, 0.4);
+    let marked = |xml: &str| -> Vec<rf::MwgRegion> {
+        rf::mwg(xml).regions.into_iter().filter(|r| r.face_id.as_deref() == Some(ours(1).as_str())).collect()
+    };
+    write_face_regions(&photo, CAT, &[face(1, "Alice", bbox)], &[], &[], unknown).unwrap();
+    write_face_regions(&photo, CAT, &[face(1, "Bob", bbox)], &[], &[], turned(6, 6000, 4000)).unwrap();
+    let xml = read(&sidecar_path(&photo));
+    let names: Vec<String> = marked(&xml).into_iter().map(|r| r.name).collect();
+    assert_eq!(names, ["Alice", "Bob"], "the write that renamed and moved it appends:\n{xml}");
+
+    write_face_regions(&photo, CAT, &[face(1, "Bob", bbox)], &[], &[], turned(6, 6000, 4000)).unwrap();
+    let xml = read(&sidecar_path(&photo));
+    let ours1 = marked(&xml);
+    assert_eq!(ours1.len(), 1, "the stale copy stayed:\n{xml}");
+    assert_eq!(ours1[0].name, "Bob");
+    // Display (x, y) → stored (y, 1 - x) on O6: centre (0.25, 0.4) → (0.4, 0.75), size swapped.
+    assert!(near4(ours1[0].area, (0.4, 0.75, 0.4, 0.3)), "{:?}\n{xml}", ours1[0].area);
+    let foreign: Vec<_> = rf::mwg(&xml).regions.into_iter().filter(|r| r.face_id.is_none()).collect();
+    assert_eq!(foreign, before.regions, "the foreign regions are untouched:\n{xml}");
+}
+
+/// Two regions carrying the same marker of ours (a file merged by hand, say): the one that
+/// is still the face is claimed and the other removed. A marker for a face unknown on the
+/// photo beside them is still kept (review N1).
+#[test]
+fn of_two_regions_with_our_marker_the_unclaimed_one_goes() {
+    let alice = (0.1, 0.1, 0.2, 0.2);
+    let lis = [
+        marked_region(&ours(5), "Carl", (0.7, 0.7, 0.1, 0.1)),
+        marked_region(&ours(5), "Alice", alice),
+        marked_region(&ours(901), "Dora", (0.4, 0.7, 0.1, 0.1)),
+    ]
+    .concat();
+    let (_dir, photo) = seeded_photo("xmp-209-duplicate", &digikam_with(&lis));
+    write_face_regions(&photo, CAT, &[face(5, "Alice", alice)], &[], &[], sized(6000, 4000)).unwrap();
+    let xml = read(&sidecar_path(&photo));
+    let got = rf::mwg(&xml);
+    assert!(rf::named(&got, "Carl").is_empty(), "{xml}");
+    assert_eq!(rf::named(&got, "Alice").len(), 1, "{xml}");
+    assert_eq!(rf::named(&got, "Dora").len(), 1, "an unknown id stays:\n{xml}");
 }
 
 // ── review N1: only a face this catalog knows on the photo ─────────────────

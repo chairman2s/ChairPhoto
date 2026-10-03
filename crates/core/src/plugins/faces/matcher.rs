@@ -31,7 +31,9 @@
 //! - A decision made **while a run is going** stands: the run reads its candidates once, but
 //!   every seed, suggestion and cluster write re-checks in its own `UPDATE` that the face is
 //!   still undecided, so a confirm/name/assign/ignore made mid-run is never overwritten
-//!   (#137). This is the guarantee; a UI gate on writes during a run is only UX.
+//!   (#137). This is the guarantee; a UI gate on writes during a run is only UX. Seeds and
+//!   suggestions also re-check that the pair is not rejected, and a front end rejects the
+//!   person it showed ([`reject_shown`]), so a reject made after the run's reset stands (#208).
 //! - Existing `suggested` rows are re-evaluated from scratch each run: the matcher first
 //!   resets every still-`suggested`/`unassigned` face back to a clean slate, then recomputes.
 //!   So a run that finds the same best match writes back the same row — no churn — and a run
@@ -151,6 +153,9 @@ pub enum MatchPhase {
     Constrained,
     Open,
     Cluster,
+    /// After the pipeline: the match job writes the face regions of the photos this run
+    /// seeded (#210, `app::faces::matching`). The matcher itself never reports it.
+    Regions,
 }
 
 impl MatchPhase {
@@ -160,6 +165,7 @@ impl MatchPhase {
             MatchPhase::Constrained => "matching tagged photos",
             MatchPhase::Open => "matching known people",
             MatchPhase::Cluster => "clustering unknowns",
+            MatchPhase::Regions => "writing face regions",
         }
     }
 }
@@ -212,6 +218,19 @@ pub fn run_matching_with_progress(
     now: i64,
     progress: MatchProgress,
 ) -> rusqlite::Result<MatchOutcome> {
+    run_matching_seeded(conn, settings, now, progress).map(|(outcome, _)| outcome)
+}
+
+/// [`run_matching_with_progress`], also returning the photos whose face this run's auto-seed
+/// confirmed (one face each), in candidate order: the match job writes their face regions
+/// once the pipeline is done (#210). Every other step only suggests or clusters, which no
+/// sidecar records.
+pub fn run_matching_seeded(
+    conn: &Connection,
+    settings: &MatchSettings,
+    now: i64,
+    progress: MatchProgress,
+) -> rusqlite::Result<(MatchOutcome, Vec<i64>)> {
     super::store::ensure_schema(conn)?;
 
     let mut outcome = MatchOutcome::default();
@@ -235,9 +254,10 @@ pub fn run_matching_with_progress(
     let person_tags = person_tag_ids(conn, &settings.people_root)?;
 
     // Step 1 — auto-seed.
-    outcome.seeded = auto_seed(conn, &person_tags, now, progress)?;
+    let seeded = auto_seed(conn, &person_tags, now, progress)?;
+    outcome.seeded = seeded.len();
     if cancelled.get() {
-        return Ok(outcome);
+        return Ok((outcome, seeded));
     }
 
     // Clear stale suggestions/cluster assignments so the run is idempotent and never stacks
@@ -267,7 +287,7 @@ pub fn run_matching_with_progress(
             progress,
         )?;
         if cancelled.get() {
-            return Ok(outcome);
+            return Ok((outcome, seeded));
         }
 
         // Step 4 — open matching: nearest centroid above threshold for the remainder.
@@ -281,7 +301,7 @@ pub fn run_matching_with_progress(
             progress,
         )?;
         if cancelled.get() {
-            return Ok(outcome);
+            return Ok((outcome, seeded));
         }
     }
 
@@ -289,7 +309,7 @@ pub fn run_matching_with_progress(
     outcome.clustered =
         cluster_leftovers(conn, &pending, settings.threshold, &resolved, now, progress)?;
 
-    Ok(outcome)
+    Ok((outcome, seeded))
 }
 
 // ── Person-tag resolution ───────────────────────────────────────────────────────
@@ -339,15 +359,16 @@ fn photo_person_tags(
 
 /// Auto-seed: a photo with **exactly one** detected face and **exactly one** assigned person
 /// tag becomes a confirmed seed for that person. Skips photos already carrying a confirmed/
-/// ignored/manual face (idempotent), and honours rejection memory. Returns the seed count.
+/// ignored/manual face (idempotent), and honours rejection memory. Returns the photos it
+/// seeded (one face each).
 fn auto_seed(
     conn: &Connection,
     person_tags: &std::collections::HashSet<i64>,
     now: i64,
     progress: MatchProgress,
-) -> rusqlite::Result<usize> {
+) -> rusqlite::Result<Vec<i64>> {
     if person_tags.is_empty() {
-        return Ok(0);
+        return Ok(Vec::new());
     }
 
     // Candidate photos: exactly one face row, and that face is still unassigned (not already
@@ -363,9 +384,9 @@ fn auto_seed(
         .collect::<rusqlite::Result<_>>()?;
 
     if !progress(MatchPhase::Seed, 0, candidates.len()) {
-        return Ok(0);
+        return Ok(Vec::new());
     }
-    let mut seeded = 0usize;
+    let mut seeded = Vec::new();
     for (done, &(photo_id, face_id)) in candidates.iter().enumerate() {
         if !progress(MatchPhase::Seed, done + 1, candidates.len()) {
             break;
@@ -382,18 +403,10 @@ fn auto_seed(
             continue;
         }
 
-        // The single face must still be a raw unassigned detection — checked in the UPDATE
-        // itself, so a confirm/name/ignore that landed since the candidates were read (on
-        // another connection, mid-run) is never overwritten (#137).
-        let changed = conn.execute(
-            "UPDATE faces__faces
-                SET person_tag_id = ?2, state = ?3, source = ?4,
-                    match_confidence = 1.0, cluster_id = NULL
-              WHERE id = ?1 AND state = ?5",
-            rusqlite::params![face_id, tag_id, STATE_CONFIRMED, SOURCE_SEED, STATE_UNASSIGNED],
-        )?;
         let _ = now; // seeds carry no created_at rewrite; timestamp reserved for future audit.
-        seeded += changed;
+        if write_seed(conn, face_id, tag_id)? {
+            seeded.push(photo_id);
+        }
     }
     Ok(seeded)
 }
@@ -735,9 +748,32 @@ fn cluster_leftovers(
 // made during a run always stands, in the catalog and so in the sidecar it was exported to
 // (#137).
 
+/// The pair `(?1 face, ?2 person)` of a seed or suggestion write is not remembered as
+/// rejected. The matcher checks [`is_rejected`] before it writes, but a reject on the main
+/// connection can land in between (#208), so the write checks again in its own `UPDATE`.
+const NOT_REJECTED: &str =
+    "NOT EXISTS (SELECT 1 FROM faces__rejections r WHERE r.face_id = ?1 AND r.person_tag_id = ?2)";
+
+/// Confirm a face as a seed of `tag_id` (`source='seed'`). The single face must still be a raw
+/// unassigned detection — checked in the UPDATE itself, so a confirm/name/ignore that landed
+/// since the candidates were read is never overwritten (#137) — and the pair unrejected
+/// ([`NOT_REJECTED`]). Returns whether it wrote.
+fn write_seed(conn: &Connection, face_id: i64, tag_id: i64) -> rusqlite::Result<bool> {
+    let changed = conn.execute(
+        &format!(
+            "UPDATE faces__faces
+                SET person_tag_id = ?2, state = ?3, source = ?4,
+                    match_confidence = 1.0, cluster_id = NULL
+              WHERE id = ?1 AND state = ?5 AND {NOT_REJECTED}"
+        ),
+        rusqlite::params![face_id, tag_id, STATE_CONFIRMED, SOURCE_SEED, STATE_UNASSIGNED],
+    )?;
+    Ok(changed == 1)
+}
+
 /// Write a `suggested` row for a face: set the person, confidence and `source='match'` —
-/// only while the face is still pending a decision ([`PENDING_STATES`]). Returns whether it
-/// wrote.
+/// only while the face is still pending a decision ([`PENDING_STATES`]) and the pair is not
+/// rejected ([`NOT_REJECTED`]). Returns whether it wrote.
 fn write_suggestion(
     conn: &Connection,
     face_id: i64,
@@ -750,7 +786,7 @@ fn write_suggestion(
             "UPDATE faces__faces
                 SET person_tag_id = ?2, state = ?3, source = ?4,
                     match_confidence = ?5, cluster_id = NULL
-              WHERE id = ?1 AND state IN {PENDING_STATES}"
+              WHERE id = ?1 AND state IN {PENDING_STATES} AND {NOT_REJECTED}"
         ),
         rusqlite::params![face_id, tag_id, STATE_SUGGESTED, SOURCE_MATCH, confidence as f64],
     )?;
@@ -787,9 +823,17 @@ fn is_rejected(conn: &Connection, face_id: i64, person_tag_id: i64) -> rusqlite:
 // merge-safe). That side effect lives in commands.rs, which owns the `Catalog`; here we only
 // return the `(photo_id, person_tag_id)` the caller must assign.
 
+/// What [`accept`] answers for a face with no person to confirm. (It used to say "face has
+/// no assigned person to accept" — misleading for a face the user saw suggested, #208.)
+pub const NO_SUGGESTION_TO_ACCEPT: &str =
+    "the face has no suggestion to confirm any more (matching or a reject changed it since it was shown)";
+
 /// Confirm a suggested/unassigned face: mark it `confirmed`. Returns `(photo_id, person_tag_id)`
-/// so the caller can `assign_tag` the photo through the catalog (XMP + merge). Errors if the
-/// face has no person assigned (nothing to confirm).
+/// so the caller can `assign_tag` the photo through the catalog (XMP + merge). Errors with
+/// [`NO_SUGGESTION_TO_ACCEPT`] if the face has no person (nothing to confirm) — typically a
+/// suggestion that a matching run has reset, or a reject has removed, since it was shown. A
+/// front end that shows the person uses [`accept_suggestion`] instead, which confirms only
+/// the person shown (#208).
 pub fn accept(conn: &Connection, face_id: i64) -> rusqlite::Result<(i64, i64)> {
     let row: Option<(i64, Option<i64>)> = conn
         .query_row(
@@ -805,7 +849,7 @@ pub fn accept(conn: &Connection, face_id: i64) -> rusqlite::Result<(i64, i64)> {
         // No person to confirm — surface as a constraint failure.
         rusqlite::Error::SqliteFailure(
             rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT),
-            Some("face has no assigned person to accept".into()),
+            Some(NO_SUGGESTION_TO_ACCEPT.into()),
         )
     })?;
     conn.execute(
@@ -1036,14 +1080,62 @@ pub fn accept_suggestion(conn: &Connection, face_id: i64, tag_id: i64) -> rusqli
     Ok(photo)
 }
 
-/// Reject a suggestion as it was shown (see [`accept_suggestion`]): only while the face is
-/// still `suggested` as `tag_id`. Returns whether it rejected.
+/// Reject a suggestion as it was shown (see [`accept_suggestion`]), by [`reject_shown`].
+/// Returns whether it rejected.
 pub fn reject_suggestion(conn: &Connection, face_id: i64, tag_id: i64, now: i64) -> rusqlite::Result<bool> {
-    let current = still_suggested(conn, face_id, tag_id)?;
-    if current {
-        reject(conn, face_id, now)?;
+    reject_shown(conn, face_id, Some(tag_id), now)
+}
+
+/// Reject a face **as it was shown**: `shown` is the person the user saw suggested, `None`
+/// for a face shown with no person. It applies only while the face holds no other verdict or
+/// proposal:
+///
+/// - still `suggested` as `shown`: the pair is remembered and the face is unassigned, as
+///   [`reject`] does;
+/// - `unassigned` with no person — for a shown person, a matching run's reset has cleared the
+///   suggestion the user saw (#208): the face stays unassigned and the shown pair is
+///   remembered, so the run, which re-checks rejections before and in each write, never
+///   proposes it again;
+/// - anything else — confirmed, ignored, or now suggested as someone the user did not see —
+///   is **stale**: nothing changes, and no other person is rejected.
+///
+/// The conditional `UPDATE` comes first, inside a savepoint, so this connection holds the
+/// write lock until the pair is remembered: a matching run on another connection cannot slip
+/// a suggestion in between. Returns whether it applied.
+pub fn reject_shown(conn: &Connection, face_id: i64, shown: Option<i64>, now: i64) -> rusqlite::Result<bool> {
+    // As in `reject`: before the face loses its person.
+    super::store::ensure_schema(conn)?;
+    conn.execute_batch("SAVEPOINT faces_reject_shown")?;
+    let applied = (|| -> rusqlite::Result<bool> {
+        let changed = conn.execute(
+            "UPDATE faces__faces
+                SET state = ?2, person_tag_id = NULL, match_confidence = NULL, cluster_id = NULL
+              WHERE id = ?1
+                AND ((state = ?3 AND person_tag_id = ?4) OR (state = ?2 AND person_tag_id IS NULL))",
+            rusqlite::params![face_id, STATE_UNASSIGNED, STATE_SUGGESTED, shown],
+        )?;
+        if changed == 0 {
+            return Ok(false);
+        }
+        if let Some(tag_id) = shown {
+            conn.execute(
+                "INSERT OR IGNORE INTO faces__rejections (face_id, person_tag_id, rejected_at)
+                 VALUES (?1, ?2, ?3)",
+                rusqlite::params![face_id, tag_id, now],
+            )?;
+        }
+        Ok(true)
+    })();
+    match applied {
+        Ok(applied) => {
+            conn.execute_batch("RELEASE faces_reject_shown")?;
+            Ok(applied)
+        }
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK TO faces_reject_shown; RELEASE faces_reject_shown");
+            Err(e)
+        }
     }
-    Ok(current)
 }
 
 /// Counters from [`accept_person_on_photos`], so a batch confirm can report what it actually
@@ -1621,6 +1713,40 @@ mod tests {
         assert_eq!(out2.open, 0, "rejected pair must not be re-proposed");
         assert_eq!(face_state(&conn, f).1, None);
         assert_eq!(out2.clustered, 1);
+    }
+
+    /// A rejection that lands between the run's `is_rejected` check and its write (another
+    /// connection, #208) still stops the write: seed and suggestion re-check it in the UPDATE.
+    #[test]
+    fn a_rejection_landing_before_the_write_stops_it() {
+        let conn = mem_conn();
+        let alice = add_person(&conn, 100, "Alice");
+        add_photo(&conn, 1);
+        let f = add_face(&conn, 1, &embed(0, 0.0));
+        conn.execute("INSERT INTO faces__rejections (face_id, person_tag_id, rejected_at) VALUES (?1, ?2, 0)", [f, alice])
+            .unwrap();
+        assert!(!write_suggestion(&conn, f, alice, 0.9, 0).unwrap(), "a rejected pair is not suggested");
+        assert_eq!(face_state(&conn, f).0, STATE_UNASSIGNED);
+        assert!(!write_seed(&conn, f, alice).unwrap(), "nor seeded");
+        assert_eq!(face_state(&conn, f).0, STATE_UNASSIGNED);
+    }
+
+    /// `reject_shown` remembers the person shown on a face a run has reset (#208), and leaves
+    /// a face suggested as someone else alone.
+    #[test]
+    fn reject_shown_names_the_person_shown() {
+        let conn = mem_conn();
+        let alice = add_person(&conn, 100, "Alice");
+        let bob = add_person(&conn, 101, "Bob");
+        add_photo(&conn, 1);
+        let reset = add_face(&conn, 1, &embed(0, 0.0)); // unassigned, no person: a reset suggestion
+        assert!(reject_shown(&conn, reset, Some(alice), 5).unwrap());
+        assert!(is_rejected(&conn, reset, alice).unwrap());
+        let other = add_face(&conn, 1, &embed(1, 0.0));
+        set_suggested(&conn, other, bob);
+        assert!(!reject_shown(&conn, other, Some(alice), 5).unwrap(), "stale: Bob is suggested now");
+        assert_eq!(face_state(&conn, other).1, Some(bob));
+        assert!(!is_rejected(&conn, other, alice).unwrap() && !is_rejected(&conn, other, bob).unwrap());
     }
 
     // ── Ignore exclusion ──────────────────────────────────────────────────────────

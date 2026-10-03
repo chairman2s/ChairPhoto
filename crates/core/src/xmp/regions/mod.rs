@@ -93,7 +93,9 @@ pub struct ReadRegion {
 /// face this catalog knows on this photo: one in `regions`, or one in `retired` — this
 /// catalog's faces on this photo that have left the set (rejected, ignored, unnamed). Such a
 /// region whose face is retired is removed; one whose face is in the set is moved to the face's
-/// geometry and name. Every other region is foreign and kept — unmarked, marked by another
+/// geometry and name while it is still recognisably that face (its name or its place), and
+/// otherwise kept — unless another region claimed for that face carries the same marker, when
+/// it is a stale copy and removed (#209). Every other region is foreign and kept — unmarked, marked by another
 /// catalog (a rebuilt one, a second one over the same folders), marked with a face id this
 /// catalog does not know on this photo (a copy of this catalog's file shares its identity,
 /// review N1), or carrying a marker this build does not recognise:

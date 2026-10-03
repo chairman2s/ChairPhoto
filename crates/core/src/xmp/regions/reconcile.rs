@@ -193,13 +193,21 @@ fn reconcile_regions(
         written[k] = true;
         claims[i] = Claim::Foreign(k);
     }
-    // What nothing claimed: a region of ours whose face has left the set is stale; one whose
-    // face is still in it but no longer recognisably that face (step 1's guard) is kept. An
-    // unmarked one is removed only when it matches a legacy export whose face has left the
-    // set. Another catalog's is kept.
+    // What nothing claimed: a region of ours whose face has left the set is stale. So is one
+    // whose face is still in the set when another region, claimed above, carries the same
+    // marker after this write (#209, review F2): that one is the face, and this one a stale
+    // copy — left by a write that renamed *and* moved the face, which step 1's guard could
+    // not follow and appended beside it. With no claimed region carrying its marker, a
+    // region whose face is still in the set but fails step 1's guard is kept: a copy of this
+    // catalog's file shares its identity and face-id counter, so the region may be the
+    // copy's face of the same id on this photo (review N1). An unmarked one is removed only
+    // when it matches a legacy export whose face has left the set. Another catalog's is kept.
+    let claimed_as = |id: i64, claims: &[Claim]| {
+        claims.iter().any(|c| matches!(*c, Claim::Ours(k) if incoming[k].face_id == id))
+    };
     for (i, e) in existing.iter().enumerate() {
         if let (Claim::Keep, Owner::Ours(id)) = (claims[i], e.owner) {
-            if retired.contains(&id) {
+            if retired.contains(&id) || claimed_as(id, &claims) {
                 claims[i] = Claim::Remove;
             }
         }

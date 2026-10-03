@@ -65,6 +65,9 @@ impl FacesInspector {
         let id = face.id;
         let state = face.state.as_str();
         let suggested = state == "suggested";
+        // The person drawn as suggested: ✓ and ✕ carry it, so a verdict applies only to the
+        // person the user saw (#208).
+        let shown = face.person_tag_id.filter(|_| suggested);
         let batch_busy = self.state.read(cx).batch_busy;
         let reassigning = self.picker.as_ref().filter(|(f, ..)| *f == id).map(|(_, p, _)| p.clone());
         let chip = |name: String, label: String| ui::chip(SharedString::from(format!("faces-insp-{name}-{id}")), label, true, colors);
@@ -72,7 +75,11 @@ impl FacesInspector {
         if suggested {
             actions = actions.child(ui::clickable(chip("confirm".into(), "✓ confirm".into()), true, {
                 let s = self.state.clone();
-                move |_, _, cx| s.update(cx, |s, cx| s.accept(id, cx))
+                move |_, _, cx| {
+                    if let Some(tag) = shown {
+                        s.update(cx, |s, cx| s.accept(id, tag, cx))
+                    }
+                }
             }));
             if face.person_tag_id.is_some() && selected > 1 {
                 let label = if batch_busy == Some(id) { "confirming…".to_string() } else { format!("✓✓ confirm on {selected}") };
@@ -89,7 +96,7 @@ impl FacesInspector {
         if suggested || state == "unassigned" {
             let s = self.state.clone();
             actions = actions.child(ui::clickable(chip("reject".into(), "✕ reject".into()), true, move |_, _, cx| {
-                s.update(cx, |s, cx| s.reject(id, cx))
+                s.update(cx, |s, cx| s.reject(id, shown, cx))
             }));
         }
         if reassigning.is_none() {

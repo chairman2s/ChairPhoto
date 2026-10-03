@@ -105,6 +105,14 @@ and again at the next phase boundary, and a catalog switch stops it the same way
 stop, not a rollback: the pass is idempotent, so suggestions already written stay and a re-run
 recomputes the rest.
 
+Auto-seeding confirms faces, so the run ends by writing the face regions of the photos it seeded
+(#210; phase "writing face regions"), through the face verbs' own write — merge-safe, backed up
+before ChairPhoto's first write to a sidecar, refused where the sidecar's frame cannot hold the
+boxes. It runs on the job's own connection and reads each photo's set under the sidecar's file
+lock, so a face verb writing the same sidecar meanwhile is ordered with it. A cancel or a switch
+stops it at the next photo; a photo it did not reach, or that was offline, keeps its seed out of
+the sidecar until the next face write for that photo, as do seeds of runs before #210.
+
 ## Indexing
 
 A background worker with its own catalog connection, bounded parallelism,
@@ -200,9 +208,19 @@ original's identity *and* its face-id counter, so the two copies write the same 
 different faces. A marker is therefore this catalog's only for a **face it knows on that
 photo**: one in the set being written, or one of the photo's faces that has left it (rejected,
 ignored, unnamed). A marker with this catalog's identity but a face id it does not know on that
-photo came from a copy and is foreign like any other (review N1). And a region of a face that is
-still in the set but no longer recognisably that face (step 1) is kept as it is, not removed.
-Deleting a drawn box writes the photo's regions first, while its id is still known.
+photo came from a copy and is foreign like any other (review N1). A region of a face that is
+still in the set but no longer recognisably that face (step 1) is kept as it is — it may be the
+copy's face of the same id — until another region carries the same marker and is claimed
+(step 3). Deleting a drawn box writes the photo's regions first, while its id is still known.
+
+**A limit of copies** (review F4, #209): when both copies later create a face with the *same*
+id on the *same* photo — a re-index of a changed file, or a drawn box, after the copy — the
+two faces carry the same marker, and nothing in the sidecar tells them apart. A write by one
+copy then treats the other's region as its own: it removes it once its own face of that id
+leaves the set (rejected, ignored, unnamed), or once its own region with that marker is
+claimed beside it. A per-copy marker would need a new marker format, which is stable on disk,
+so this is documented rather than fixed. Ids colliding on *different* photos, and every region
+from before the copy, are unaffected.
 
 Each write sends the photo's whole confirmed set, and for each existing region, in this order:
 
@@ -213,7 +231,11 @@ Each write sends the photo's whole confirmed set, and for each existing region, 
    set** (a face id that changed): taken over the same way.
 3. **This catalog's marker, matched by nothing, for a face of this photo that has left the
    set:** removed. This is how a **rejected or ignored** face, or one whose person was removed,
-   leaves the sidecar.
+   leaves the sidecar. **Or for a face still in the set, when another region claimed in
+   step 1 or 2 carries the same marker after the write** (#209): that one is the face, and
+   this one a stale copy — left by a write that renamed *and* moved the face in one go (a new
+   person, and the orientation found by a rescan), which step 1 cannot follow and so appends
+   beside it. The photo's next write claims the new region and removes the stale one.
 4. **Anything else — unmarked, or another catalog's:** foreign, and **always kept**. When its
    Name and center (within `AREA_EPSILON`) match a face in the set it is that face already in
    the file — a Lightroom region ingested earlier, say: only its `Area` coordinates
@@ -299,7 +321,8 @@ full current confirmed set right after the verb, so the sidecar stays in sync. T
 writes only the photos it actually changed, after its transaction commits: a sidecar that cannot
 be written (offline volume) must not roll back a confirmation the catalog already recorded. An
 offline photo's write is skipped, not queued: its sidecar catches up at the next face write for
-that photo.
+that photo. The matching job writes the photos its auto-seed confirmed when it ends (see
+"Seeding and matching").
 
 **Reads** happen during indexing: existing `mwg-rs:Regions` are parsed and IoU-matched
 (≥ 0.5, greedy best-first, one-to-one) against the photo's still-unassigned detections. A named
@@ -310,7 +333,13 @@ previous ChairPhoto run are therefore ingested for free.
 ## Interface
 
 - **Loupe overlay** — face rectangles on the photo, each with a chip showing the assigned or
-  suggested name and confirm / reject / reassign / ignore actions.
+  suggested name and confirm / reject / reassign / ignore actions. Confirm and reject here and
+  in the inspector carry **the person the chip showed** (#208), by the review queue's rule
+  below: confirm applies only while the face is still suggested as that person, and reject
+  only while it is, or while it has no person at all — a matching run resets every pending
+  suggestion when it starts, and a reject made then is remembered against the person shown,
+  so the run does not suggest them again. Anything else (the face now suggested as someone
+  else, or decided in another view) is stale: nothing changes, and the app says so.
 - **Inspector panel** — the active photo's face list with the same per-face actions. With more
   than one photo selected, a suggested face also offers *confirm on N*: `faces_accept_person`
   confirms that person across the whole selection in one transaction. It **accepts suggestions,
@@ -322,7 +351,8 @@ previous ChairPhoto run are therefore ingested for free.
   unnamed clusters waiting to be named. Clicking a person filters to their photos, and a review
   queue supports bulk confirmation. A review verdict applies only while the face is still
   suggested as the person the queue showed, so a list read before a re-run of matching never
-  confirms someone the user did not see. Clusters can be named together as one person (a merge),
+  confirms someone the user did not see (a rejection also applies to a face the run has reset
+  to no person: the shown pair is remembered). Clusters can be named together as one person (a merge),
   and a cluster's faces can be named apart or ignored (a split); only faces still pending a
   decision change, and a cluster that a matching run has since regrouped names nothing (cluster
   ids are never reused). Clusters are rebuilt from scratch by every matching run, so merging or
@@ -330,7 +360,9 @@ previous ChairPhoto run are therefore ingested for free.
   a matching run is going, as UX only: a run regroups the clusters the view shows. The guarantee
   is in the core — every seed, suggestion and cluster write of the matcher re-checks in its own
   `UPDATE` that the face is still undecided, so a confirm, naming, assignment or ignore made
-  during a run (from any view, or the Tauri UI) is never overwritten.
+  during a run (from any view, or the Tauri UI) is never overwritten; and every seed and
+  suggestion write re-checks that the pair is not rejected, so a rejection made during a run
+  stands too.
 - **Settings** — people root, model download status, similarity threshold, and index actions
   with progress.
 
@@ -343,8 +375,19 @@ enables `ort/cuda`. Off by default so the standard build stays CPU-only and port
 explicitly per session (`engine::try_register_cuda`) rather than through
 `with_execution_providers`, precisely so a registration failure is observable. If the runtime,
 driver, GPU or **cuDNN 9** is missing, registration returns an error, the reason is logged, and
-inference continues on CPU. `engine::active_ep()` reports where inference actually ran, so the UI
-can be honest about it.
+inference continues on CPU. A provider that registers but whose session then fails to build is
+dropped and the session built again on CPU (`onnx::with_cpu_fallback`, #210), so indexing does
+not fail on it. `engine::active_ep()` reports where inference actually ran, so the UI can be
+honest about it.
+
+A session build on CUDA runs under a **crash marker** (`crash_marker`, kind `onnx-cuda-session`):
+native CUDA init can take the process down rather than return an error. After two such crashes
+with the same ONNX Runtime and NVIDIA driver versions (the subject, read from
+`/proc/driver/nvidia/version`), CUDA is skipped and sessions build on CPU until either version
+changes; a clean build clears the strikes. Inference itself is not under the marker — a marker
+write per face would put file I/O on the hot path, and the documented failure is CUDA's init.
+A cuDNN repair alone does not change the subject: clearing the app data's `crash-markers/`
+retries CUDA.
 
 Setting `faces.force_cpu = "true"` skips CUDA registration even in a `faces-cuda` build — useful
 when the GPU is needed elsewhere or to compare the two directly.

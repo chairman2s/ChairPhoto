@@ -767,6 +767,65 @@ fn indexing_speed_is_validated_and_read_back() {
     assert_eq!(inference_info(&c).unwrap().cuda_built, cfg!(feature = "faces-cuda"));
 }
 
+/// ✓ and ✕ as shown (#208): a face drawn as "Alice?" that is now suggested as Bob is stale
+/// for both — Bob is neither confirmed nor rejected, and Alice is not remembered against a
+/// face the user never saw rejected; a face drawn with no person that a run has suggested
+/// since is stale for ✕; one still as drawn is rejected (and confirmed) as before.
+#[test]
+fn verdicts_as_shown_never_apply_to_another_person() {
+    let (c, root) = temp_catalog("shown");
+    let alice = c.create_tag("People/Alice").unwrap();
+    let bob = c.create_tag("People/Bob").unwrap();
+    let p = add_photo(&c, &root, "s.NEF");
+    let rejections = |f: i64| -> i64 {
+        c.conn().query_row("SELECT COUNT(*) FROM faces__rejections WHERE face_id = ?1", [f], |r| r.get(0)).unwrap()
+    };
+    let moved = add_face(&c, p, "[0.1,0.1,0.2,0.2]");
+    suggest(&c, moved, bob); // drawn as Alice?, re-suggested as Bob since
+    assert_eq!(accept_shown(&c, moved, alice).unwrap(), ShownVerdict::Stale);
+    assert_eq!(reject_shown(&c, moved, Some(alice)).unwrap(), ShownVerdict::Stale);
+    assert_eq!(face_state(&c, moved), "suggested");
+    assert!(!has_tag(&c, p, alice) && !has_tag(&c, p, bob), "nobody confirmed");
+    assert_eq!(rejections(moved), 0, "nobody rejected");
+
+    let drawn_empty = add_face(&c, p, "[0.4,0.1,0.2,0.2]");
+    suggest(&c, drawn_empty, bob); // drawn with no person, suggested as Bob since
+    assert_eq!(reject_shown(&c, drawn_empty, None).unwrap(), ShownVerdict::Stale);
+    assert_eq!(face_state(&c, drawn_empty), "suggested");
+    assert_eq!(rejections(drawn_empty), 0);
+
+    let confirmed = add_face(&c, p, "[0.7,0.1,0.2,0.2]");
+    assign(&c, confirmed, alice).unwrap(); // decided elsewhere since it was drawn as Alice?
+    assert_eq!(reject_shown(&c, confirmed, Some(alice)).unwrap(), ShownVerdict::Stale);
+    assert_eq!(face_state(&c, confirmed), "confirmed");
+    assert_eq!(rejections(confirmed), 0);
+
+    let as_drawn = add_face(&c, p, "[0.1,0.5,0.2,0.2]");
+    suggest(&c, as_drawn, bob);
+    assert_eq!(reject_shown(&c, as_drawn, Some(bob)).unwrap(), ShownVerdict::Applied);
+    assert_eq!((face_state(&c, as_drawn), rejections(as_drawn)), ("unassigned".to_string(), 1));
+    let plain = add_face(&c, p, "[0.4,0.5,0.2,0.2]");
+    assert_eq!(reject_shown(&c, plain, None).unwrap(), ShownVerdict::Applied, "an unassigned face as drawn");
+    assert_eq!(rejections(plain), 0);
+    let ok = add_face(&c, p, "[0.7,0.5,0.2,0.2]");
+    suggest(&c, ok, bob);
+    assert_eq!(accept_shown(&c, ok, bob).unwrap(), ShownVerdict::Applied);
+    assert_eq!(face_state(&c, ok), "confirmed");
+    assert!(has_tag(&c, p, bob), "a confirmation tags the photo");
+    let regions: Vec<String> = crate::xmp::read_face_regions(&root.join("s.NEF")).into_iter().map(|r| r.name).collect();
+    assert_eq!(regions, vec!["Alice".to_string(), "Bob".to_string()], "and exports its region");
+}
+
+/// The Tauri `faces_accept` on a face with no person says why, not "no assigned person".
+#[test]
+fn accepting_a_face_with_no_suggestion_says_it_changed() {
+    let (c, root) = temp_catalog("accept-none");
+    let p = add_photo(&c, &root, "n.NEF");
+    let f = add_face(&c, p, "[0.1,0.1,0.2,0.2]");
+    let err = accept(&c, f).unwrap_err().to_string();
+    assert!(err.contains(matcher::NO_SUGGESTION_TO_ACCEPT), "{err}");
+}
+
 // --- the indexing job's ownership -----------------------------------------------------------
 
 /// A start bound to a catalog that is no longer open fails closed and touches nothing: the
@@ -1032,6 +1091,11 @@ fn assert_consistent(c: &Catalog, root: &std::path::Path, photo: i64, name: &str
 /// was about to suggest as Alice to Bob, ignores another, and names one it was about to
 /// cluster. After the run each decision is intact and the catalog, photo tags and sidecars
 /// agree.
+///
+/// And the inspector's and overlay's ✓/✕ (#208), on two faces a previous run suggested as
+/// Alice, made after this run has reset them: ✕ is remembered against the person shown, so
+/// the run does not suggest Alice again; ✓ is reported stale and confirms nobody (the run
+/// suggests Alice again, for the user to confirm).
 #[test]
 fn a_decision_made_during_a_match_run_is_never_overwritten() {
     let (c, root) = temp_catalog("match-race");
@@ -1055,6 +1119,13 @@ fn a_decision_made_during_a_match_run_is_never_overwritten() {
     let fc1 = add_embedded_face(&c, pc1, 3);
     let pc2 = add_photo(&c, &root, "pc2.NEF");
     let fc2 = add_embedded_face(&c, pc2, 3);
+    // Two faces the inspector shows as "Alice?", from a previous run (#208).
+    let pr = add_photo(&c, &root, "pr.NEF");
+    let fr = add_embedded_face(&c, pr, 0);
+    suggest(&c, fr, alice);
+    let px = add_photo(&c, &root, "px.NEF");
+    let fx = add_embedded_face(&c, px, 0);
+    suggest(&c, fx, alice);
 
     let state = state_with(c);
     let claim = begin_match_job(&state, None).unwrap();
@@ -1064,7 +1135,12 @@ fn a_decision_made_during_a_match_run_is_never_overwritten() {
         after_load: std::sync::Mutex::new(Some(Box::new(move |c: &Catalog| {
             assign(c, fa, bob)?;
             ignore(c, fi)?;
-            name_faces(c, &[fc1], "People/Carol").map(|_| ())
+            name_faces(c, &[fc1], "People/Carol")?;
+            // The run has reset both (they are unassigned now); the user clicks what they saw.
+            assert_eq!(face_state(c, fr), "unassigned", "the interleaving: after the reset");
+            assert_eq!(reject_shown(c, fr, Some(alice))?, ShownVerdict::Applied, "✕ on Alice? stands");
+            assert_eq!(accept_shown(c, fx, alice)?, ShownVerdict::Stale, "✓ on a reset Alice? is reported");
+            Ok(())
         }))),
         done: Default::default(),
     };
@@ -1074,7 +1150,7 @@ fn a_decision_made_during_a_match_run_is_never_overwritten() {
     let done = sink.done.lock().unwrap().take().expect("the run ended");
     assert!(done.ok, "{done:?}");
     let outcome = done.outcome.unwrap();
-    assert_eq!((outcome.seeded, outcome.open, outcome.clustered), (0, 0, 1), "{outcome:?}");
+    assert_eq!((outcome.seeded, outcome.open, outcome.clustered), (0, 1, 2), "{outcome:?}");
 
     let guard = state.catalog.lock().unwrap();
     let c = guard.as_ref().unwrap();
@@ -1094,9 +1170,152 @@ fn a_decision_made_during_a_match_run_is_never_overwritten() {
     let carol = c.find_tag_id_by_path("People/Carol").unwrap().unwrap();
     assert_eq!(row(fc1), ("confirmed".into(), Some(carol), "manual".into(), None), "named: in no cluster");
     let fc2_cluster = row(fc2).3.expect("the still-unknown face is clustered");
-    assert_eq!(cluster_rows(c), vec![(fc2_cluster, 1)], "the cluster holds only the face still pending");
-    for (photo, name) in [(p0, "p0.NEF"), (ps, "ps.NEF"), (pa, "pa.NEF"), (pi, "pi.NEF"), (pc1, "pc1.NEF"), (pc2, "pc2.NEF")] {
+    let (fr_state, fr_person, _, fr_cluster) = row(fr);
+    assert_eq!((fr_state.as_str(), fr_person), ("unassigned", None), "rejected Alice is not suggested again");
+    let fr_cluster = fr_cluster.expect("with Alice rejected, it is an unknown face");
+    let remembered: i64 = c
+        .conn()
+        .query_row("SELECT COUNT(*) FROM faces__rejections WHERE face_id = ?1 AND person_tag_id = ?2", [fr, alice], |r| r.get(0))
+        .unwrap();
+    assert_eq!(remembered, 1, "the rejection names the person the user saw");
+    let mut clusters = cluster_rows(c);
+    clusters.sort();
+    let mut want = vec![(fc2_cluster, 1), (fr_cluster, 1)];
+    want.sort();
+    assert_eq!(clusters, want, "the clusters hold only the faces still pending");
+    assert_eq!(row(fx).0, "suggested", "a stale ✓ confirmed nobody; the run suggested again");
+    assert_eq!(row(fx).1, Some(alice));
+    assert!(!has_tag(c, px, alice), "nor tagged the photo");
+    for (photo, name) in [
+        (p0, "p0.NEF"),
+        (ps, "ps.NEF"),
+        (pa, "pa.NEF"),
+        (pi, "pi.NEF"),
+        (pc1, "pc1.NEF"),
+        (pc2, "pc2.NEF"),
+        (pr, "pr.NEF"),
+        (px, "px.NEF"),
+    ] {
         assert_consistent(c, &root, photo, name);
+    }
+}
+
+// --- the matching job's seeds reach the sidecar (#210) --------------------------------------
+
+/// A photo with one detected face and one person tag (Alice): the run seeds it.
+fn seed_candidate(c: &Catalog, root: &std::path::Path, name: &str, alice: i64) -> i64 {
+    let p = add_photo(c, root, name);
+    add_face(c, p, "[0.1,0.1,0.2,0.2]");
+    c.assign_tag(p, alice).unwrap();
+    p
+}
+
+/// The seeded faces' regions are written at the end of the run, through the face verbs' own
+/// write: into a foreign sidecar, kept and backed up first; into a new sidecar; and not into
+/// one whose declared frame cannot hold the boxes (left byte for byte). A suggestion is not
+/// exported. The write reports its own phase while the job owns its slot.
+#[test]
+fn the_match_job_writes_the_faces_it_seeded() {
+    let (c, root) = temp_catalog("match-seed-regions");
+    let alice = c.create_tag("People/Alice").unwrap();
+    let foreign = seed_candidate(&c, &root, "foreign.NEF", alice);
+    seed_foreign_sidecar(&root.join("foreign.NEF"));
+    let fresh = seed_candidate(&c, &root, "fresh.NEF", alice);
+    let square = seed_candidate(&c, &root, "square.NEF", alice);
+    // Turned a quarter, stored 6000×4000, but the sidecar declares a square frame: refused.
+    c.conn()
+        .execute("UPDATE photos SET exif_orientation = 6, width = 6000, height = 4000 WHERE id = ?1", [square])
+        .unwrap();
+    let square_xml = r#"<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"><rdf:Description rdf:about="" xmlns:mwg-rs="http://www.metadataworkinggroup.com/schemas/regions/" xmlns:stDim="http://ns.adobe.com/xap/1.0/sType/Dimensions#"><mwg-rs:Regions rdf:parseType="Resource"><mwg-rs:AppliedToDimensions stDim:w="5000" stDim:h="5000" stDim:unit="pixel"/><mwg-rs:RegionList><rdf:Bag/></mwg-rs:RegionList></mwg-rs:Regions></rdf:Description></rdf:RDF></x:xmpmeta>"#;
+    std::fs::write(crate::xmp::sidecar_path(&root.join("square.NEF")), square_xml).unwrap();
+    // Two faces: not a seed, only suggested (Alice's centroid needs an embedding: none here).
+    let two = add_photo(&c, &root, "two.NEF");
+    add_face(&c, two, "[0.1,0.1,0.2,0.2]");
+    add_face(&c, two, "[0.5,0.1,0.2,0.2]");
+
+    let state = state_with(c);
+    let claim = begin_match_job(&state, None).unwrap();
+    let recorder = MatchRecorder { state: state.clone(), seen: Default::default() };
+    run_match_job(&recorder, claim);
+
+    let seen = recorder.seen.lock().unwrap();
+    let CoreEvent::FacesMatchDone(d) = &seen.last().unwrap().2 else { panic!("the end") };
+    assert!(d.ok, "{d:?}");
+    assert_eq!(d.outcome.as_ref().map(|o| o.seeded), Some(3));
+    let writing: Vec<(usize, usize, bool)> = seen
+        .iter()
+        .filter_map(|(_, busy, e)| match e {
+            CoreEvent::FacesMatchProgress(p) if p.phase == matcher::MatchPhase::Regions.label() => Some((p.done, p.total, *busy)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(writing.first(), Some(&(0, 3, true)), "{writing:?}");
+    assert_eq!(writing.last(), Some(&(3, 3, true)), "{writing:?}");
+    drop(seen);
+
+    let guard = state.catalog.lock().unwrap();
+    let c = guard.as_ref().unwrap();
+    assert_foreign_kept(&root.join("foreign.NEF"), &["Alice"]);
+    let backup = root.join("foreign.NEF.xmp.chairphoto-backup");
+    assert!(backup.exists(), "the foreign sidecar is backed up before ChairPhoto's first write");
+    seed_foreign_sidecar(&root.join("original.NEF"));
+    assert_eq!(std::fs::read(&backup).unwrap(), std::fs::read(root.join("original.NEF.xmp")).unwrap(), "as it was");
+    let names = |name: &str| -> Vec<String> {
+        crate::xmp::read_face_regions(&root.join(name)).into_iter().map(|r| r.name).collect()
+    };
+    assert_eq!(names("fresh.NEF"), ["Alice"]);
+    assert_eq!(
+        std::fs::read_to_string(crate::xmp::sidecar_path(&root.join("square.NEF"))).unwrap(),
+        square_xml,
+        "a frame the boxes cannot be placed in: refused, untouched"
+    );
+    assert!(!crate::xmp::sidecar_path(&root.join("two.NEF")).exists(), "nothing confirmed there, nothing written");
+    assert_consistent(c, &root, fresh, "fresh.NEF");
+    assert_eq!(faces_for_photo(c, foreign).unwrap()[0].state, "confirmed");
+}
+
+/// A cancel or a catalog switch during the write stops it at the next photo: the photo in
+/// flight is written, the rest are not, and the run still ends with its one terminal event.
+#[test]
+fn the_seeded_regions_write_stops_on_a_cancel_or_a_switch() {
+    for switch in [false, true] {
+        let (c, root) = temp_catalog(if switch { "match-seed-switch" } else { "match-seed-cancel" });
+        let alice = c.create_tag("People/Alice").unwrap();
+        let names = ["s1.NEF", "s2.NEF", "s3.NEF"];
+        for name in names {
+            seed_candidate(&c, &root, name, alice);
+        }
+        let state = state_with(c);
+        let claim = begin_match_job(&state, None).unwrap();
+
+        struct StopAtWrite {
+            state: AppState,
+            switch: bool,
+            done: std::sync::Mutex<Option<FacesMatchDone>>,
+        }
+        impl EventSink for StopAtWrite {
+            fn send(&self, event: CoreEvent) {
+                match event {
+                    CoreEvent::FacesMatchProgress(p) if p.phase == matcher::MatchPhase::Regions.label() && p.done == 0 => {
+                        if self.switch {
+                            detach_catalog_and_trip_jobs(&self.state).unwrap();
+                        } else {
+                            cancel_match(&self.state).unwrap();
+                        }
+                    }
+                    CoreEvent::FacesMatchDone(d) => *self.done.lock().unwrap() = Some(d),
+                    _ => {}
+                }
+            }
+        }
+        let sink = StopAtWrite { state: state.clone(), switch, done: Default::default() };
+        run_match_job(&sink, claim);
+
+        let done = sink.done.lock().unwrap().take().expect("the run ended");
+        assert!(done.aborted && !done.ok, "switch={switch}: {done:?}");
+        let written: Vec<&str> =
+            names.into_iter().filter(|n| crate::xmp::sidecar_path(&root.join(n)).exists()).collect();
+        assert_eq!(written.len(), 1, "switch={switch}: only the photo in flight: {written:?}");
     }
 }
 

@@ -277,6 +277,11 @@ struct Folder {
     path: PathBuf,
     #[cfg(unix)]
     fd: rustix::fd::OwnedFd,
+    /// Whether the folder could be opened for reading. A folder we may create files in and
+    /// traverse but not list (mode `-wx`, a drop-box share) is held as an `O_PATH` handle on
+    /// Linux: enough for `openat`/`renameat`/`unlinkat`/`fstatat`, not for listing or fsync,
+    /// so it is never swept and its sync is skipped (#155 review, L2).
+    listable: bool,
 }
 
 impl Folder {
@@ -298,15 +303,22 @@ impl Folder {
         #[cfg(unix)]
         {
             use rustix::fs::{Mode, OFlags};
-            let fd = rustix::fs::open(dir, OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC, Mode::empty())?;
-            Ok(Self { path: dir.to_path_buf(), fd })
+            let open = |flags: OFlags| rustix::fs::open(dir, flags | OFlags::DIRECTORY | OFlags::CLOEXEC, Mode::empty());
+            match open(OFlags::RDONLY) {
+                Ok(fd) => Ok(Self { path: dir.to_path_buf(), fd, listable: true }),
+                #[cfg(any(target_os = "linux", target_os = "android"))]
+                Err(rustix::io::Errno::ACCESS) => {
+                    Ok(Self { path: dir.to_path_buf(), fd: open(OFlags::PATH)?, listable: false })
+                }
+                Err(e) => Err(e.into()),
+            }
         }
         #[cfg(not(unix))]
         {
             if !dir.is_dir() {
                 return Err(std::io::ErrorKind::NotFound.into());
             }
-            Ok(Self { path: dir.to_path_buf() })
+            Ok(Self { path: dir.to_path_buf(), listable: true })
         }
     }
 
@@ -425,7 +437,9 @@ impl Folder {
     /// lets a directory be synced, and the new contents are already safe in the file.
     fn sync(&self) {
         #[cfg(unix)]
-        let _ = rustix::fs::fsync(&self.fd);
+        if self.listable {
+            let _ = rustix::fs::fsync(&self.fd);
+        }
     }
 }
 
@@ -590,6 +604,9 @@ const SWEEP_QUEUE: usize = 64;
 /// identity-Overwrite write commits under the catalog lock, and listing a large folder on a
 /// NAS there would stall every other catalog user (#155 review, L3).
 fn sweep_later(folder: Folder) {
+    if !folder.listable {
+        return;
+    }
     let path = folder.path.clone();
     if !SWEPT.lock().unwrap_or_else(|e| e.into_inner()).insert(path.clone()) {
         return;
@@ -1338,6 +1355,36 @@ mod tests {
         .unwrap();
         assert_ne!(wait_swept(&dir), committer, "the sweep ran on the committing thread");
         assert!(!stale.exists(), "the day-old temp stayed");
+    }
+
+    /// #155 review L2: a folder we may create files in and traverse but not list (0300, a
+    /// drop-box share) still takes the write — through an `O_PATH` handle — as it did when
+    /// the write went by path; it is just never swept.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn a_folder_we_may_write_but_not_list_still_takes_the_write() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = crate::test_support::TestTmpDir::new("doc-155-wx");
+        let drop_box = dir.join("dropbox");
+        std::fs::create_dir_all(&drop_box).unwrap();
+        let p = drop_box.join("X.ARW");
+        std::fs::write(&p, b"raw").unwrap();
+        std::fs::write(sidecar_path(&p), FOREIGN).unwrap();
+        std::fs::set_permissions(&drop_box, std::fs::Permissions::from_mode(0o300)).unwrap();
+        if std::fs::read_dir(&drop_box).is_ok() {
+            std::fs::set_permissions(&drop_box, std::fs::Permissions::from_mode(0o755)).unwrap();
+            println!("SKIPPED: a_folder_we_may_write_but_not_list_still_takes_the_write — running with privileges that ignore the mode (root?)");
+            return;
+        }
+        let written = SidecarDocument::open(&p).and_then(|mut doc| {
+            set_prop(&mut doc, "Foo", "bar");
+            doc.commit()
+        });
+        std::fs::set_permissions(&drop_box, std::fs::Permissions::from_mode(0o755)).unwrap();
+        written.unwrap();
+        let xml = std::fs::read_to_string(sidecar_path(&p)).unwrap();
+        assert!(xml.contains("history_end") && xml.contains("<chairphoto:Foo>bar</chairphoto:Foo>"), "{xml}");
+        assert_eq!(temps_beside(&sidecar_path(&p)), Vec::<String>::new());
     }
 
     /// #155 review L1: a FIFO named like a day-old temp neither hangs the commit's sweep (an

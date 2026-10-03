@@ -272,6 +272,7 @@ impl LibraryView {
         }
 
         let shell = self.shell.read(cx);
+        let from = shell.rows_from();
         let library = &shell.library;
         let photos = library.photos();
         let n = photos.len();
@@ -286,8 +287,34 @@ impl LibraryView {
             .iter()
             .map(|p| Tile::new(p, statuses.get(&p.id).copied(), self.selected.1.contains(&p.id), active == Some(p.id), soft))
             .collect();
-        let images: Vec<ImageState> =
-            self.images.update(cx, |store, _| tiles.iter().map(|t| store.get(t.id, ImageKind::Thumb)).collect());
+        // A tile whose cached thumbnail rendered in another catalog than these rows' is not
+        // this row's pixels for about a frame around a catalog switch (rv151 L1, #223 F2):
+        // `on_visible`'s `request_look_batch` (prepaint) drops it, but only after this frame's
+        // rows were already built from it. Treat it as absent here too, so that frame draws
+        // nothing instead of the other catalog's render.
+        let images: Vec<ImageState> = self.images.update(cx, |store, _| {
+            tiles
+                .iter()
+                .map(|t| {
+                    let image = store.get(t.id, ImageKind::Thumb);
+                    match from {
+                        Some(from) => image.filter(|l| !store.foreign(l, from)),
+                        None => image,
+                    }
+                })
+                .collect()
+        });
+        // Test-only: what this frame actually drew (not just what the store now holds), so a
+        // test can assert a foreign render was never painted rather than inferring it from
+        // store state afterward (#223 F2).
+        #[cfg(test)]
+        DRAWN_THUMBNAILS.with(|d| {
+            for (tile, image) in tiles.iter().zip(&images) {
+                if let ImageState::Ready(l) = image {
+                    d.borrow_mut().push((tile.id, l.bytes()));
+                }
+            }
+        });
         // A Develop → Library transition counts the tiles built and painted (`shell::timing`).
         if ShellTimer::live(cx) {
             for (tile, image) in tiles.iter().zip(&images) {
@@ -717,4 +744,12 @@ impl Render for LibraryView {
         ShellTimer::note_grid_commit(began.elapsed().as_secs_f64() * 1000.0, cx);
         root.px(px(12.)).pt(px(8.)).child(list).children(menu)
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only: every Ready tile [`LibraryView::render_rows`] actually drew this frame, as
+    /// (photo, decoded bytes) — reset by the test before the frame it checks. See its use
+    /// there (#223 F2) and in `library::tests`.
+    pub(crate) static DRAWN_THUMBNAILS: std::cell::RefCell<Vec<(i64, usize)>> = const { std::cell::RefCell::new(Vec::new()) };
 }

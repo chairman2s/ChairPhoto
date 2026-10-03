@@ -72,6 +72,19 @@ pub fn render_bytes(state: &AppState, key: JobKey) -> Result<Vec<u8>, String> {
         JobKey::Photo { id, kind } => (id, kind),
         #[cfg(feature = "edit")]
         JobKey::Edit(job) => return render_edit_bytes(state, &job),
+        // Never actually requested over `avatar://` (there is no such protocol — the GPUI
+        // app's `image_store::runner` is the only submitter, see `render_image` below), but
+        // the match must still cover it: `JobKey` carries it whenever `faces` is on, the same
+        // as `edit` above.
+        #[cfg(feature = "faces")]
+        JobKey::Avatar(job) => {
+            let image = crate::plugins::faces::avatar::render_avatar(state, &job)?;
+            let mut bytes = Vec::new();
+            image
+                .write_to(&mut std::io::Cursor::new(&mut bytes), image::ImageFormat::Png)
+                .map_err(|e| e.to_string())?;
+            return Ok(bytes);
+        }
     };
     let Resolved { absolute, rotation, cover, .. } = resolve(state, id, kind)?;
     match absolute {
@@ -146,6 +159,10 @@ pub fn render_image(state: &AppState, key: JobKey) -> Result<DecodedImage, Strin
         JobKey::Photo { id, kind } => (id, kind),
         #[cfg(feature = "edit")]
         JobKey::Edit(job) => return render_edit_image(state, &job).map(DecodedImage::pixels),
+        // The People view's avatar crop (#223 F1): a small square of a face, not a photo
+        // tier — `image_store::runner` submits it to the same pool as any other job.
+        #[cfg(feature = "faces")]
+        JobKey::Avatar(job) => return crate::plugins::faces::avatar::render_avatar(state, &job).map(DecodedImage::pixels),
     };
     let resolved = resolve(state, id, kind)?;
     let is_video = resolved.is_video;

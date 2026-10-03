@@ -85,6 +85,8 @@
 //! The pool is behind [`Submit`] so tests can hold responders and deliver them in any order.
 
 use chairphoto_core::app::{CatalogIdentity, CATALOG_CHANGED};
+#[cfg(feature = "faces")]
+use chairphoto_core::image_pool::AvatarJob;
 use chairphoto_core::image_pool::{ImageKind, ImagePool, JobKey, Respond};
 use chairphoto_core::media::DecodedImage;
 use chairphoto_model::darkroom::filmstrip::CoverLook;
@@ -98,6 +100,16 @@ use std::sync::Arc;
 /// Default decoded-image budget: ~1000 grid thumbnails, or ~70 loupe previews, or two
 /// full-resolution zoom tiers. Textures in the atlas are bounded by the same number.
 pub const DEFAULT_BUDGET_BYTES: usize = 768 * 1024 * 1024;
+
+/// An avatar crop's native size, pixels — a 72 px avatar at 2x (#223 F1).
+#[cfg(feature = "faces")]
+pub const AVATAR_SIZE_PX: u32 = 144;
+
+/// Avatar-crop budget: ~2600 avatars at [`AVATAR_SIZE_PX`] BGRA (~83 KB each) — far more
+/// covered avatars than the People view shows on screen at once, so claims never approach
+/// it; still bounded, so browsing many people over a long session does not grow forever.
+#[cfg(feature = "faces")]
+pub const AVATAR_BUDGET_BYTES: usize = 200 * 1024 * 1024;
 
 /// A decoded image ready for GPUI: BGRA pixels in a `RenderImage`.
 #[derive(Clone)]
@@ -163,20 +175,36 @@ pub struct ImageKey {
     pub version: u64,
 }
 
+/// What the store caches a face's avatar crop under (#223 F1) — the photo, the face, and the
+/// photo's `Preview`-tier version ([`ImageKey::version`] for [`ImageKind::Preview`]): an
+/// avatar is always cut from that tier's frame (never a cover render, #152's `avatar()`
+/// never draws one), so a rotation or a catalog clear — whatever bumps that version
+/// ([`ImageStore::invalidate`]) — is exactly what makes a cached crop stale.
+#[cfg(feature = "faces")]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct AvatarKey {
+    pub photo: i64,
+    pub face: i64,
+    version: u64,
+}
+
 // --- LRU ---------------------------------------------------------------------------------
 
-/// A byte-budgeted least-recently-used map of decoded images. Pure data: it only says which
-/// images left, and the caller releases their textures.
-pub struct ImageLru {
+/// A byte-budgeted least-recently-used map of decoded images, generic over its key — the
+/// main store's [`ImageKey`] (photo tiers) and, with its own smaller budget, [`AvatarKey`]
+/// (#223 F1: avatar crops are tiny, but still bounded, not left to grow with every face a
+/// catalog has ever shown). Pure data: it only says which images left, and the caller
+/// releases their textures.
+pub struct ImageLru<K> {
     budget: usize,
     bytes: usize,
     tick: u64,
-    entries: HashMap<ImageKey, (Loaded, u64)>,
+    entries: HashMap<K, (Loaded, u64)>,
     /// Last-use tick → key, oldest first.
-    order: BTreeMap<u64, ImageKey>,
+    order: BTreeMap<u64, K>,
 }
 
-impl ImageLru {
+impl<K: Copy + Eq + std::hash::Hash> ImageLru<K> {
     pub fn new(budget: usize) -> Self {
         Self { budget, bytes: 0, tick: 0, entries: HashMap::new(), order: BTreeMap::new() }
     }
@@ -199,7 +227,7 @@ impl ImageLru {
     }
 
     /// The image under `key`, marked as just used.
-    pub fn get(&mut self, key: &ImageKey) -> Option<&Loaded> {
+    pub fn get(&mut self, key: &K) -> Option<&Loaded> {
         self.tick += 1;
         let tick = self.tick;
         let (loaded, used) = self.entries.get_mut(key)?;
@@ -210,7 +238,7 @@ impl ImageLru {
     }
 
     /// The image under `key`, without marking it used.
-    pub fn peek(&self, key: &ImageKey) -> Option<&Loaded> {
+    pub fn peek(&self, key: &K) -> Option<&Loaded> {
         self.entries.get(key).map(|(l, _)| l)
     }
 
@@ -218,7 +246,7 @@ impl ImageLru {
     /// total fits the budget. The image just inserted is never evicted, so one image larger
     /// than the whole budget is still held (alone). Returns every image that left, including
     /// one `key` replaced.
-    pub fn insert(&mut self, key: ImageKey, loaded: Loaded) -> Vec<Arc<RenderImage>> {
+    pub fn insert(&mut self, key: K, loaded: Loaded) -> Vec<Arc<RenderImage>> {
         let mut gone = self.remove(&key).into_iter().collect::<Vec<_>>();
         self.tick += 1;
         self.bytes += loaded.bytes();
@@ -234,7 +262,7 @@ impl ImageLru {
         gone
     }
 
-    pub fn remove(&mut self, key: &ImageKey) -> Option<Arc<RenderImage>> {
+    pub fn remove(&mut self, key: &K) -> Option<Arc<RenderImage>> {
         let (loaded, used) = self.entries.remove(key)?;
         self.order.remove(&used);
         self.bytes -= loaded.bytes();
@@ -242,8 +270,8 @@ impl ImageLru {
     }
 
     /// Remove every image whose key matches.
-    pub fn remove_where(&mut self, mut matches: impl FnMut(&ImageKey) -> bool) -> Vec<Arc<RenderImage>> {
-        let keys: Vec<ImageKey> = self.entries.keys().filter(|k| matches(k)).copied().collect();
+    pub fn remove_where(&mut self, mut matches: impl FnMut(&K) -> bool) -> Vec<Arc<RenderImage>> {
+        let keys: Vec<K> = self.entries.keys().filter(|k| matches(k)).copied().collect();
         keys.iter().filter_map(|k| self.remove(k)).collect()
     }
 }
@@ -363,6 +391,16 @@ struct Done {
     result: Result<Loaded, String>,
 }
 
+/// An avatar crop's answer (#223 F1) — much simpler than [`Done`]: a crop is never
+/// catalog-bound (like any plain, unlooked request, rv134 M1), so there is no refusal and
+/// no look to track; only cached, pending and failed, dropped by generation like any tier.
+#[cfg(feature = "faces")]
+struct AvatarDone {
+    key: AvatarKey,
+    generation: u64,
+    result: Result<Loaded, String>,
+}
+
 /// A view's hold on the tiers it wants ([`ImageStore::new_claim`]); see the module docs.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct ClaimId(u64);
@@ -383,7 +421,7 @@ pub struct Look {
 /// through it.
 pub struct ImageStore {
     pool: Arc<dyn Submit>,
-    lru: ImageLru,
+    lru: ImageLru<ImageKey>,
     /// Requested and not yet answered: key → the generation of its newest submission.
     pending: HashMap<ImageKey, u64>,
     failed: HashMap<ImageKey, SharedString>,
@@ -413,6 +451,24 @@ pub struct ImageStore {
     done: UnboundedSender<Done>,
     stats: StoreStats,
     _drain: Task<()>,
+    /// Avatar crops (#223 F1): their own small cache, pending set, failures and claims — see
+    /// [`AvatarKey`] and [`AvatarDone`]. `claims`' ids are shared (a view's one [`ClaimId`]
+    /// can hold ordinary tiers and avatar crops together; [`drop_claim`](Self::drop_claim)
+    /// releases both).
+    #[cfg(feature = "faces")]
+    avatars: ImageLru<AvatarKey>,
+    #[cfg(feature = "faces")]
+    avatar_pending: HashMap<AvatarKey, (u64, AvatarJob)>,
+    #[cfg(feature = "faces")]
+    avatar_failed: HashMap<AvatarKey, SharedString>,
+    #[cfg(feature = "faces")]
+    avatar_claims: HashMap<ClaimId, HashSet<AvatarKey>>,
+    #[cfg(feature = "faces")]
+    avatar_generation: u64,
+    #[cfg(feature = "faces")]
+    avatar_done: UnboundedSender<AvatarDone>,
+    #[cfg(feature = "faces")]
+    _avatar_drain: Task<()>,
 }
 
 impl ImageStore {
@@ -423,6 +479,16 @@ impl ImageStore {
         let _drain = cx.spawn(async move |this, cx| {
             while let Some(d) = rx.next().await {
                 if this.update(cx, |store, cx| store.complete(d, cx)).is_err() {
+                    break;
+                }
+            }
+        });
+        #[cfg(feature = "faces")]
+        let (avatar_done, mut avatar_rx) = unbounded::<AvatarDone>();
+        #[cfg(feature = "faces")]
+        let _avatar_drain = cx.spawn(async move |this, cx| {
+            while let Some(d) = avatar_rx.next().await {
+                if this.update(cx, |store, cx| store.complete_avatar(d, cx)).is_err() {
                     break;
                 }
             }
@@ -446,6 +512,20 @@ impl ImageStore {
             done,
             stats: StoreStats::default(),
             _drain,
+            #[cfg(feature = "faces")]
+            avatars: ImageLru::new(AVATAR_BUDGET_BYTES),
+            #[cfg(feature = "faces")]
+            avatar_pending: HashMap::new(),
+            #[cfg(feature = "faces")]
+            avatar_failed: HashMap::new(),
+            #[cfg(feature = "faces")]
+            avatar_claims: HashMap::new(),
+            #[cfg(feature = "faces")]
+            avatar_generation: 0,
+            #[cfg(feature = "faces")]
+            avatar_done,
+            #[cfg(feature = "faces")]
+            _avatar_drain,
         }
     }
 
@@ -464,13 +544,21 @@ impl ImageStore {
         self.looks.get(&photo).copied()
     }
 
+    /// Whether `loaded` was rendered in a catalog other than `from` (`Loaded::rendered_in`) —
+    /// not this row's pixels, whatever `from` asked (rv151 L1, module docs "Where a
+    /// thumbnail was rendered"). Never foreign with no identity probe set, since then
+    /// nothing was checked when it rendered.
+    pub fn foreign(&self, loaded: &Loaded, from: CatalogIdentity) -> bool {
+        self.probe.is_some() && loaded.rendered_in != Some(from)
+    }
+
     /// The decode pool this store submits to: edit renders (the loupe's version render, the
     /// Duel's and the Proof sheet's variants) go to the same workers.
     pub fn pool(&self) -> Arc<dyn Submit> {
         self.pool.clone()
     }
 
-    pub fn lru(&self) -> &ImageLru {
+    pub fn lru(&self) -> &ImageLru<ImageKey> {
         &self.lru
     }
 
@@ -612,6 +700,8 @@ impl ImageStore {
         self.next_claim += 1;
         let id = ClaimId(self.next_claim);
         self.claims.insert(id, HashSet::new());
+        #[cfg(feature = "faces")]
+        self.avatar_claims.insert(id, HashSet::new());
         id
     }
 
@@ -659,6 +749,168 @@ impl ImageStore {
     pub fn drop_claim(&mut self, owner: ClaimId) {
         self.set_claim(owner, []);
         self.claims.remove(&owner);
+        #[cfg(feature = "faces")]
+        {
+            self.set_avatar_claim(owner, []);
+            self.avatar_claims.remove(&owner);
+        }
+    }
+
+    // --- avatar crops (#223 F1) ---------------------------------------------------------
+    //
+    // A face's avatar crop (`AvatarKey`, `AvatarJob`): its own small, bounded cache, kept
+    // apart from the main `lru` (a different key shape, a much smaller budget). Never
+    // catalog-bound — like any plain, unlooked request (rv134 M1) — so there is no refusal
+    // and no look to track, only cached/pending/failed, dropped by generation like any tier.
+
+    /// What `owner`'s avatar claim holds now (tests).
+    #[cfg(feature = "faces")]
+    pub fn avatar_claim(&self, owner: ClaimId) -> HashSet<AvatarKey> {
+        self.avatar_claims.get(&owner).cloned().unwrap_or_default()
+    }
+
+    /// Every avatar crop a claim other than `except` holds.
+    #[cfg(feature = "faces")]
+    fn claimed_avatars(&self, except: Option<ClaimId>) -> HashSet<AvatarKey> {
+        self.avatar_claims.iter().filter(|(id, _)| Some(**id) != except).flat_map(|(_, held)| held.iter().copied()).collect()
+    }
+
+    /// Make `owner` hold exactly `wanted`'s avatar crops. A crop it no longer wants, that no
+    /// other claim holds, is forgotten from `avatar_pending`: cancelled in the pool if still
+    /// queued there (a rendering one cannot be, like any job — `image_pool`'s docs); its
+    /// answer, if it still comes, is then dropped as stale. Sends nothing.
+    #[cfg(feature = "faces")]
+    pub fn set_avatar_claim(&mut self, owner: ClaimId, wanted: impl IntoIterator<Item = AvatarKey>) {
+        let wanted: HashSet<AvatarKey> = wanted.into_iter().collect();
+        let before = self.avatar_claims.insert(owner, wanted.clone()).unwrap_or_default();
+        let others = self.claimed_avatars(Some(owner));
+        for key in before.into_iter().filter(|k| !wanted.contains(k) && !others.contains(k)) {
+            if let Some((_, job)) = self.avatar_pending.remove(&key) {
+                self.pool.cancel(&JobKey::Avatar(job));
+            }
+        }
+    }
+
+    /// The key `photo`'s `face` avatar crop caches under now ([`AvatarKey`]).
+    #[cfg(feature = "faces")]
+    pub fn avatar_key(&self, photo: i64, face: i64) -> AvatarKey {
+        AvatarKey { photo, face, version: self.key(photo, ImageKind::Preview).version }
+    }
+
+    /// The avatar crop for `photo`'s `face`, marking a cached one as used. `Absent` until
+    /// [`request_avatar_batch`](Self::request_avatar_batch) asks for it.
+    #[cfg(feature = "faces")]
+    pub fn get_avatar(&mut self, photo: i64, face: i64) -> ImageState {
+        let key = self.avatar_key(photo, face);
+        if let Some(loaded) = self.avatars.get(&key) {
+            return ImageState::Ready(loaded.clone());
+        }
+        self.avatar_state_uncached(&key)
+    }
+
+    /// [`get_avatar`](Self::get_avatar) without marking it used (tests).
+    #[cfg(feature = "faces")]
+    pub fn peek_avatar(&self, photo: i64, face: i64) -> ImageState {
+        let key = self.avatar_key(photo, face);
+        match self.avatars.peek(&key) {
+            Some(loaded) => ImageState::Ready(loaded.clone()),
+            None => self.avatar_state_uncached(&key),
+        }
+    }
+
+    #[cfg(feature = "faces")]
+    fn avatar_state_uncached(&self, key: &AvatarKey) -> ImageState {
+        if self.avatar_pending.contains_key(key) {
+            ImageState::Loading
+        } else if let Some(e) = self.avatar_failed.get(key) {
+            ImageState::Failed(e.clone())
+        } else {
+            ImageState::Absent
+        }
+    }
+
+    /// Request several avatar crops, most urgent first — `(photo, face, bbox)`, `bbox`
+    /// already turned by the photo's user rotation (`modules::faces::logic::rotate_box`,
+    /// the frame [`ImageKind::Preview`] decodes into). Cached, failed and already-pending
+    /// ones are skipped, so a view may call this on every render.
+    #[cfg(feature = "faces")]
+    pub fn request_avatar_batch(&mut self, wanted: &[(i64, i64, (f32, f32, f32, f32))]) {
+        let mut batch: Vec<(JobKey, Respond<Loaded>)> = Vec::with_capacity(wanted.len());
+        for &(photo, face, bbox) in wanted {
+            let key = self.avatar_key(photo, face);
+            if self.avatars.peek(&key).is_some()
+                || self.avatar_pending.contains_key(&key)
+                || self.avatar_failed.contains_key(&key)
+            {
+                continue;
+            }
+            self.avatar_generation += 1;
+            let generation = self.avatar_generation;
+            let job = AvatarJob::new(photo, face, bbox, AVATAR_SIZE_PX);
+            self.avatar_pending.insert(key, (generation, job.clone()));
+            self.stats.submitted += 1;
+            let done = self.avatar_done.clone();
+            batch.push((
+                JobKey::Avatar(job),
+                Box::new(move |result| {
+                    let _ = done.unbounded_send(AvatarDone { key, generation, result });
+                }),
+            ));
+        }
+        if !batch.is_empty() {
+            self.pool.submit_batch(batch);
+        }
+    }
+
+    #[cfg(feature = "faces")]
+    fn complete_avatar(&mut self, done: AvatarDone, cx: &mut Context<Self>) {
+        if self.avatar_pending.get(&done.key).map(|(g, _)| *g) != Some(done.generation) {
+            self.stats.stale_dropped += 1;
+            return;
+        }
+        self.avatar_pending.remove(&done.key);
+        match done.result {
+            Ok(loaded) => {
+                let gone = self.avatars.insert(done.key, loaded);
+                self.release(gone, cx);
+            }
+            Err(e) => {
+                self.avatar_failed.insert(done.key, e.into());
+            }
+        }
+        cx.notify();
+    }
+
+    /// An avatar crop is cut from the photo's `Preview` tier: once that version moves
+    /// ([`invalidate_tier`](Self::invalidate_tier)), drop every cached crop of the photo (an
+    /// old one is never looked up again under the new version regardless) and any crop still
+    /// queued for it, cancelled in the pool.
+    #[cfg(feature = "faces")]
+    fn invalidate_avatars_for(&mut self, photo: i64, cx: &mut Context<Self>) {
+        let gone = self.avatars.remove_where(|k: &AvatarKey| k.photo == photo);
+        self.release(gone, cx);
+        let stale: Vec<AvatarKey> = self.avatar_pending.keys().filter(|k| k.photo == photo).copied().collect();
+        for key in stale {
+            if let Some((_, job)) = self.avatar_pending.remove(&key) {
+                self.pool.cancel(&JobKey::Avatar(job));
+            }
+        }
+        self.avatar_failed.retain(|k, _| k.photo != photo);
+    }
+
+    /// The catalog changed: forget every avatar crop, claimed or not — like [`clear`](Self::clear)
+    /// does for every other tier.
+    #[cfg(feature = "faces")]
+    fn clear_avatars(&mut self, cx: &mut Context<Self>) {
+        for held in self.avatar_claims.values_mut() {
+            held.clear();
+        }
+        let gone = self.avatars.remove_where(|_| true);
+        self.release(gone, cx);
+        for (_, (_, job)) in self.avatar_pending.drain() {
+            self.pool.cancel(&JobKey::Avatar(job));
+        }
+        self.avatar_failed.clear();
     }
 
     /// [`release_pending`](Self::release_pending) whatever the claims hold: for what no claim
@@ -752,7 +1004,7 @@ impl ImageStore {
             let cached = self.lru.peek(&key);
             // Pixels rendered while another catalog was open (a plain view's render in a
             // switch's window, rv151 L1) are not this row's, whatever look was asked.
-            let foreign = self.probe.is_some() && cached.is_some_and(|l| l.rendered_in != Some(from));
+            let foreign = cached.is_some_and(|l| self.foreign(l, from));
             let stale = foreign
                 || match self.looks.get(&photo) {
                     Some(asked) => *asked != look,
@@ -848,6 +1100,10 @@ impl ImageStore {
         self.abandon(tier);
         self.failed.retain(|k, _| !tier(k));
         self.refused.retain(|k| !tier(k));
+        #[cfg(feature = "faces")]
+        if kind == ImageKind::Preview {
+            self.invalidate_avatars_for(photo, cx);
+        }
         cx.notify();
     }
 
@@ -866,6 +1122,8 @@ impl ImageStore {
         self.looks.clear();
         self.looks_from = None;
         self.refused.clear();
+        #[cfg(feature = "faces")]
+        self.clear_avatars(cx);
         cx.notify();
     }
 

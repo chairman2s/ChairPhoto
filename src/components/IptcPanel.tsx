@@ -36,8 +36,13 @@ export function iptcSaveStatus(outcome: IptcSaveOutcome | null | undefined): str
     case "written":
       return "Saved to sidecar";
     case "unchanged":
-      // Nothing was owed, so the sidecar was not opened: no claim about what it holds.
-      return "Saved (no sidecar change needed)";
+      // Nothing was owed, so the sidecar was not opened: no claim about what it holds. But
+      // a write attempted and failed whose debt was dismissed meanwhile also settles
+      // "unchanged" (nothing owed either way) — carrying a reason, unlike a true no-op
+      // (review of #223, F3): say the write failed, not that none was needed.
+      return outcome.reason
+        ? `Saved to catalog; the sidecar write failed (${outcome.reason})`
+        : "Saved (no sidecar change needed)";
     case "pending":
       return outcome.reason
         ? `Saved to catalog; sidecar pending (${outcome.reason})`

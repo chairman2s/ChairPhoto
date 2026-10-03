@@ -33,13 +33,20 @@ impl IptcSaveOutcome {
     }
 
     /// The status line a front end shows for it. Never claims a sidecar write that did not
-    /// happen.
+    /// happen, and never claims nothing was attempted when a write failed (review of #223,
+    /// F3: a dismiss settling a failed write `Unchanged` — nothing owed — must not read as
+    /// "no sidecar change needed", which this save's own attempt contradicts).
     pub fn status(&self) -> String {
         match (self.sidecar, &self.reason) {
             (IptcSidecarState::Written, _) => "Saved to sidecar".into(),
             // Nothing was owed, so the sidecar was not opened: say that, not that it holds
             // the values — it was never read (review of #148, N3).
-            (IptcSidecarState::Unchanged, _) => "Saved (no sidecar change needed)".into(),
+            (IptcSidecarState::Unchanged, None) => "Saved (no sidecar change needed)".into(),
+            // A write was attempted (fields were owed when it was read) and failed, but by
+            // the time it settled nothing was owed any more — the debt was dismissed while
+            // it ran. Unlike the `None` case above, the sidecar was opened and the write did
+            // not land.
+            (IptcSidecarState::Unchanged, Some(why)) => format!("Saved to catalog; the sidecar write failed ({why})"),
             (IptcSidecarState::Pending, Some(why)) => format!("Saved to catalog; sidecar pending ({why})"),
             (IptcSidecarState::Pending, None) => "Saved to catalog; sidecar pending".into(),
         }
@@ -230,6 +237,14 @@ pub(crate) fn write_and_settle(
     let settled = super::with_catalog_as(state, identity, |c| c.settle_iptc_write(write, &outcome));
     drop(turn);
     match settled {
+        // `settle_iptc_write` answers `Unchanged` both for a write never attempted (nothing
+        // owed to begin with) and for one attempted and failed whose debt was dismissed (or
+        // paid) while it ran — accurate at that layer ("nothing owed" either way), but this
+        // save's own outcome must say a write was tried and failed, not that none was needed
+        // (review of #223, F3).
+        Ok(IptcSettled::Unchanged) if outcome.is_err() => {
+            IptcSaveOutcome { sidecar: IptcSidecarState::Unchanged, reason: outcome.err() }
+        }
         Ok(settled) => IptcSaveOutcome::from_settled(settled),
         Err(_) if write.fields.is_empty() => IptcSaveOutcome { sidecar: IptcSidecarState::Unchanged, reason: None },
         Err(e) => IptcSaveOutcome {
@@ -727,5 +742,48 @@ mod tests {
         assert_eq!(owed, crate::catalog::IptcMask::NONE, "nor owe the sidecar anything");
         assert_eq!(read(&crate::xmp::sidecar_path(&unmounted.join("DSC144.ARW"))),
             crate::xmp::test_fixtures::LIGHTROOM);
+    }
+
+    // ── #223 F3: a dismissed debt's failed write is not "no sidecar change needed" ────
+
+    /// A save stores fields (owing them at generation G); while its write is in flight, the
+    /// user dismisses that exact generation from the debt panel. The write then fails (the
+    /// volume went away). `settle_iptc_write` correctly answers `Unchanged` — nothing is owed,
+    /// the dismiss saw to that — but this save's own outcome must say its write failed, not
+    /// that no sidecar change was needed: the catalog saved and the sidecar did not.
+    #[test]
+    fn a_write_failing_after_its_generation_is_dismissed_reports_the_failed_write_not_a_no_op() {
+        let (dir, state, id, xmp) = foreign_photo("iptc-223-dismiss-fail", crate::xmp::test_fixtures::LIGHTROOM);
+        let identity = crate::app::catalog_identity(&state).unwrap();
+        let (original, write) = crate::app::with_catalog_as(&state, identity, |c| store(c, id, &typed())).unwrap();
+        let shown = state.catalog.lock().unwrap().as_ref().unwrap().list_owed_iptc_page(10, 0).unwrap().remove(0);
+        assert_eq!(shown.photo_id, id);
+        let dismissed =
+            state.catalog.lock().unwrap().as_ref().unwrap().dismiss_owed_iptc(id, &shown.uuid, shown.generation).unwrap();
+        assert_eq!(dismissed, crate::catalog::OwedDismissal::Dismissed);
+
+        // The write's own IO still runs (it was prepared with non-empty fields) and fails: the
+        // library's volume is gone when it tries to open the sidecar.
+        let library = dir.join("library");
+        let unmounted = dir.join("unmounted");
+        std::fs::rename(&library, &unmounted).unwrap();
+        let outcome = write_and_settle(&state, identity, &original, &write, turn(&original));
+
+        assert_eq!(outcome.sidecar, crate::catalog::IptcSidecarState::Unchanged, "{outcome:?} — nothing is owed");
+        assert!(outcome.reason.is_some(), "the failed write's reason is kept: {outcome:?}");
+        let status = outcome.status();
+        assert!(status.contains("the sidecar write failed"), "{status}");
+        assert!(!status.contains("no sidecar change needed"), "{status}: a write was attempted");
+        std::fs::rename(&unmounted, &library).unwrap();
+        assert_eq!(read(&xmp), crate::xmp::test_fixtures::LIGHTROOM, "nothing reached the sidecar");
+        assert_eq!(owed(&state, id), crate::catalog::IptcMask::NONE, "dismissed, so nothing is owed");
+    }
+
+    /// The ordinary case this must not regress: nothing owed from the start (no write
+    /// attempted at all) still reports the original, unqualified wording.
+    #[test]
+    fn an_outcome_with_nothing_ever_owed_keeps_the_no_op_wording() {
+        let outcome = IptcSaveOutcome { sidecar: crate::catalog::IptcSidecarState::Unchanged, reason: None };
+        assert_eq!(outcome.status(), "Saved (no sidecar change needed)");
     }
 }

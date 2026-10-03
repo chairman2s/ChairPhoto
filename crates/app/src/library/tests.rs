@@ -1483,6 +1483,44 @@ fn a_plain_render_in_a_switch_window_is_not_drawn_under_the_old_row(cx: &mut Tes
     assert_eq!(rig.jobs(photo), jobs, "and not asked again under A's row");
 }
 
+/// #223 F2 (review of rv151 L1, probe P2): `render_rows` reads the store before
+/// `on_visible`'s `request_look_batch` (prepaint) finds a cached tile foreign (rendered in
+/// another catalog) and drops it — so the frame that discovers it must not have already
+/// painted the foreign pixels under the old row. Asserts what the frame actually drew
+/// (`DRAWN_THUMBNAILS`), not store state afterward: the gap the test name of
+/// `a_plain_render_in_a_switch_window_is_not_drawn_under_the_old_row` (above) claimed but did
+/// not check — the review found B's 16-wide render painted for 3 frames before this fix.
+#[gpui_kit::test]
+fn a_foreign_render_is_never_painted_even_in_the_frame_that_discovers_it(cx: &mut TestAppContext) {
+    let rig = LookRig::new("grid-plain-switch-paint", 2, cx);
+    let photo = rig.ids[1];
+    let version = rig.cover(photo);
+    rig.refresh_rows(cx);
+    for &id in &rig.ids {
+        rig.finish(id, 4, cx);
+    }
+    let (b, b_ids) = colliding_catalog(&rig.dir, "b", 2);
+    let bv = b.create_version(b_ids[1], "B's").unwrap();
+    assert_eq!(b.set_cover_version(b_ids[1], Some(bv)).unwrap(), Some(format!("{version}:0")), "the token collides");
+    core_switch(&rig.app, b);
+
+    // The eviction and the plain request in one update: the plain view asks first (rv151 L1).
+    let images = rig.app.wired.images.clone();
+    images.update(cx, |s, cx| {
+        s.evict(|k| k.photo == photo, cx);
+        s.request(photo, ImageKind::Thumb);
+    });
+    // Clear before the render lands: `finish`'s own `run_until_parked` can already repaint
+    // the window reactively (GPUI's own scheduler), so the frame under test may happen
+    // inside it, not only in the explicit `render` below.
+    crate::library::grid::DRAWN_THUMBNAILS.with(|d| d.borrow_mut().clear());
+    rig.finish(photo, 16, cx); // B's plain render lands, bound to no look (rv134 M1): not refused.
+    render(&rig.app, cx);
+    let drawn = crate::library::grid::DRAWN_THUMBNAILS.with(|d| d.borrow().clone());
+    let foreign = drawn.iter().filter(|&&(p, bytes)| p == photo && bytes == 16 * 4 * 4).count();
+    assert_eq!(foreign, 0, "B's pixels were painted under A's row: {drawn:?}");
+}
+
 /// #187's audit, on rv151 L1's setup: the frame in which the grid finds a tile's cached
 /// pixels foreign (rendered in another catalog) has already built the tile with them; the
 /// grid drops them from its list's prepaint, and the redraw that takes them off screen must

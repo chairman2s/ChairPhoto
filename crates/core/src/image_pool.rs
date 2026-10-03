@@ -73,6 +73,8 @@ pub enum JobKey {
     Photo { id: i64, kind: ImageKind },
     #[cfg(feature = "edit")]
     Edit(EditJob),
+    #[cfg(feature = "faces")]
+    Avatar(AvatarJob),
 }
 
 impl JobKey {
@@ -86,7 +88,44 @@ impl JobKey {
             JobKey::Photo { id, .. } => *id,
             #[cfg(feature = "edit")]
             JobKey::Edit(job) => job.photo_id,
+            #[cfg(feature = "faces")]
+            JobKey::Avatar(job) => job.photo_id,
         }
+    }
+}
+
+/// One avatar-crop render request (the Faces module's People view, #223 F1): a small square
+/// cut from a face in its photo's original frame (never a cover render — #152), rendered on
+/// the pool like any tier. People-view avatars used to claim the whole `Preview` tier
+/// (≤2048px, tens of MB) just to show a 72px circle; many covered avatars on screen could
+/// exceed the image budget and never settle. This key renders only the avatar's own pixels,
+/// so the budget holds hundreds of them.
+#[cfg(feature = "faces")]
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+pub struct AvatarJob {
+    pub photo_id: i64,
+    /// For the key's identity only — the render itself only needs `bbox` and `size` (below).
+    pub face_id: i64,
+    /// The face's normalized box `(x, y, w, h)`, already turned by the photo's user rotation
+    /// (`modules::faces::logic::rotate_box`, the app crate) — the frame `ImageKind::Preview`
+    /// decodes into. Stored as the four `f32`s' bits so the key hashes and compares exactly
+    /// (`f32` is not `Eq`); a rotation change turns the box, so it is naturally a different
+    /// job, no separate version needed here.
+    bbox_bits: [u32; 4],
+    /// Output edge, pixels — the avatar's native size (e.g. 144 for a 72px avatar at 2x).
+    pub size: u32,
+}
+
+#[cfg(feature = "faces")]
+impl AvatarJob {
+    pub fn new(photo_id: i64, face_id: i64, bbox: (f32, f32, f32, f32), size: u32) -> Self {
+        Self { photo_id, face_id, bbox_bits: [bbox.0.to_bits(), bbox.1.to_bits(), bbox.2.to_bits(), bbox.3.to_bits()], size }
+    }
+
+    /// The box `new` was given, back as floats.
+    pub fn bbox(&self) -> (f32, f32, f32, f32) {
+        let [x, y, w, h] = self.bbox_bits;
+        (f32::from_bits(x), f32::from_bits(y), f32::from_bits(w), f32::from_bits(h))
     }
 }
 

@@ -38,6 +38,9 @@ pub struct PersonSummary {
     /// Distinct photos with at least one confirmed face of this person.
     pub photo_count: i64,
     pub avatar_photo_id: i64,
+    /// The representative face's row id (`faces__faces.id`) — the GPUI People view's avatar
+    /// crop request keys on it (#223 F1), nothing else needs it.
+    pub avatar_face_id: i64,
     /// The representative face's box (normalized 0–1, the unturned frame).
     pub avatar_bbox: FaceBboxJson,
     /// The avatar photo's `user_rotation` (degrees clockwise).
@@ -51,6 +54,8 @@ pub struct ClusterSummary {
     pub cluster_id: i64,
     pub member_count: i64,
     pub avatar_photo_id: i64,
+    /// The representative face's row id (`faces__faces.id`) — see [`PersonSummary::avatar_face_id`].
+    pub avatar_face_id: i64,
     pub avatar_bbox: FaceBboxJson,
     pub avatar_rotation: i64,
 }
@@ -85,7 +90,7 @@ pub fn people_summary(c: &Catalog) -> CatalogResult<Vec<PersonSummary>> {
     ensure_schema(c.conn())?;
     let mut stmt = c.conn().prepare(
         "SELECT g.person_tag_id, t.name, t.full_path, g.face_count, g.photo_count,
-                r.photo_id, r.bbox, COALESCE(p.user_rotation, 0)
+                r.id, r.photo_id, r.bbox, COALESCE(p.user_rotation, 0)
            FROM (SELECT person_tag_id,
                         COUNT(id)                AS face_count,
                         COUNT(DISTINCT photo_id) AS photo_count,
@@ -105,9 +110,10 @@ pub fn people_summary(c: &Catalog) -> CatalogResult<Vec<PersonSummary>> {
             full_path: r.get(2)?,
             face_count: r.get(3)?,
             photo_count: r.get(4)?,
-            avatar_photo_id: r.get(5)?,
-            avatar_bbox: FaceBboxJson::from_str(&r.get::<_, String>(6)?),
-            avatar_rotation: r.get(7)?,
+            avatar_face_id: r.get(5)?,
+            avatar_photo_id: r.get(6)?,
+            avatar_bbox: FaceBboxJson::from_str(&r.get::<_, String>(7)?),
+            avatar_rotation: r.get(8)?,
         })
     })?;
     Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -118,7 +124,7 @@ pub fn people_summary(c: &Catalog) -> CatalogResult<Vec<PersonSummary>> {
 pub fn cluster_summary(c: &Catalog) -> CatalogResult<Vec<ClusterSummary>> {
     ensure_schema(c.conn())?;
     let mut stmt = c.conn().prepare(
-        "SELECT g.cluster_id, g.cnt, r.photo_id, r.bbox, COALESCE(p.user_rotation, 0)
+        "SELECT g.cluster_id, g.cnt, r.id, r.photo_id, r.bbox, COALESCE(p.user_rotation, 0)
            FROM (SELECT cluster_id, COUNT(*) AS cnt, MIN(id) AS rep
                    FROM faces__faces
                   WHERE cluster_id IS NOT NULL AND state IN ('unassigned', 'suggested')
@@ -131,9 +137,10 @@ pub fn cluster_summary(c: &Catalog) -> CatalogResult<Vec<ClusterSummary>> {
         Ok(ClusterSummary {
             cluster_id: r.get(0)?,
             member_count: r.get(1)?,
-            avatar_photo_id: r.get(2)?,
-            avatar_bbox: FaceBboxJson::from_str(&r.get::<_, String>(3)?),
-            avatar_rotation: r.get(4)?,
+            avatar_face_id: r.get(2)?,
+            avatar_photo_id: r.get(3)?,
+            avatar_bbox: FaceBboxJson::from_str(&r.get::<_, String>(4)?),
+            avatar_rotation: r.get(5)?,
         })
     })?;
     Ok(rows.collect::<rusqlite::Result<_>>()?)

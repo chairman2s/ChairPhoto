@@ -1509,6 +1509,7 @@ fn summaries_carry_the_avatar_rotation() {
     let person = &people_summary(&c).unwrap()[0];
     assert_eq!((person.avatar_photo_id, person.avatar_rotation), (p, 90));
     assert_eq!(person.avatar_bbox, FaceBboxJson { x: 0.1, y: 0.2, w: 0.3, h: 0.4 });
+    assert_eq!(person.avatar_face_id, f, "#223 F1: the People view keys its avatar crop on it");
     assert_eq!(effective_people_root(&c).unwrap(), "People");
     c.set_setting("faces.people_root", "Family").unwrap();
     assert_eq!(effective_people_root(&c).unwrap(), "Family");

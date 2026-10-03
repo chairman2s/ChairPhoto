@@ -854,6 +854,11 @@ images from #101 `ImageStore`): "…" placeholder until `metadata_ready`, On NAS
 (`ImageStore::invalidate`) — the cover look keys the tile (#151:
 `ImageStore::request_look_batch`;
 a cover change re-renders only that tile) — awaiting the visual check.
+Since d5eb4d9 (#186) the tile's picture covers its box through `loupe::zoom::fitted`
+(`ObjectFit::Cover`, React's `.thumb` `object-fit: cover`); before, a portrait frame showed its
+top. Grid tile fit visually checked 2026-10-03; the same fix in the bench pile, Darkroom
+filmstrip, Stack rows and dialog, loupe card wall, import and trash grids, Map and Slideshow
+strips, Tag graph top photos and Flickr import is checked headless only.
 
 ### `src/components/StackProposalsDialog.tsx`
 

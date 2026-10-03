@@ -62,7 +62,8 @@ order is the current grid order.
 - `crates/core/src/app/slideshow.rs` — the render as a job (`JobRegistry::slideshow`):
   `claim_slideshow` resolves the Originals and claims the job under one catalog lock
   (optionally bound to a `CatalogIdentity`), and `SlideshowJob::run` renders the frames into
-  a temp dir private to the job and encodes. A newer render, Cancel (the job's own abort
+  a private cache directory (the app's cache dir, not `/tmp`, which can be a quota-limited
+  tmpfs) and encodes. A newer render, Cancel (the job's own abort
   handle) or a catalog switch kills ffmpeg, removes the partial movie and answers
   "Slideshow cancelled". Missing ffmpeg is refused before anything is claimed.
 - The `make_slideshow` async command (Tauri) and the GPUI Slideshow module both run that job

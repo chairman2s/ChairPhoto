@@ -19,6 +19,7 @@ use crate::image_store::ImageState;
 use crate::shell::style::Colors;
 use crate::storage::ui::{chip, clickable, truncating_chip};
 use crate::loupe::zoom::fitted;
+use chairphoto_core::catalog::Photo;
 use chairphoto_core::image_pool::ImageKind;
 use chairphoto_model::darkroom::controls::{
     self as ctl, EffectKey, SliderDef, SplitKey, ToneKey, COLOR_SLIDERS, EFFECT_SLIDERS, SPLIT_SLIDERS, TONE_SLIDERS,
@@ -265,8 +266,19 @@ pub struct DarkroomView {
     /// The open (`OpenPhoto::seq`) the strip was last centred on, and the strip width that
     /// centring used ([`Self::centre_strip`]).
     strip_centred: Option<(u64, f32)>,
+    /// Consecutive [`Self::centre_strip`] calls that found the strip column at zero width,
+    /// for the current `(seq, viewport)` latch. Bounded by [`STRIP_ZERO_WIDTH_RETRIES`] so a
+    /// column that never gets a width (narrower than the right rail, or hidden) does not ask
+    /// for a fresh frame forever (#191 N2).
+    strip_zero_width_retries: u32,
     _subscriptions: Vec<Subscription>,
 }
+
+/// How many times [`DarkroomView::centre_strip`] retries a zero-width strip before giving
+/// up until something else changes `viewport` (a resize, most likely) — enough frames for
+/// the usual one-or-two-frame layout settle, not so many that a column stuck at zero width
+/// redraws for long.
+const STRIP_ZERO_WIDTH_RETRIES: u32 = 3;
 
 impl DarkroomView {
     pub fn new(darkroom: Entity<Darkroom>, window: &mut Window, cx: &mut Context<Self>) -> Self {
@@ -306,6 +318,7 @@ impl DarkroomView {
             rails,
             strip_scroll: ScrollHandle::new(),
             strip_centred: None,
+            strip_zero_width_retries: 0,
             _subscriptions: subs,
         }
     }
@@ -782,31 +795,44 @@ impl DarkroomView {
     /// frame, and centres again while the width laid out differs from the one it used. So a
     /// resize also centres again — React's `scrollIntoView` ran on the photo change alone,
     /// against the live layout. Before the strip has a width (its first frame), the next
-    /// frame centres it.
-    fn centre_strip(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let d = self.darkroom.read(cx);
-        let Some(open) = d.open.as_ref() else {
+    /// frame centres it — bounded (#191 N2): a column stuck at zero width (narrower than the
+    /// right rail, or hidden) gives up after [`STRIP_ZERO_WIDTH_RETRIES`] rather than asking
+    /// for a fresh frame forever; a later resize is a different `viewport`, which clears the
+    /// latch through the check above and retries fresh.
+    ///
+    /// `shown`/`total` are the caller's one `strip()` read for this render, shared with
+    /// [`render_filmstrip`](Self::render_filmstrip) — the view no longer asks for its own
+    /// window twice per frame.
+    fn centre_strip(&mut self, shown: &[Photo], total: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((seq, photo_id)) = self.darkroom.read(cx).open.as_ref().map(|o| (o.seq, o.photo.id)) else {
             self.strip_centred = None;
+            self.strip_zero_width_retries = 0;
             return;
         };
         let viewport = f32::from(self.strip_scroll.bounds().size.width);
-        if self.strip_centred == Some((open.seq, viewport)) {
+        if self.strip_centred == Some((seq, viewport)) {
             return;
         }
-        let (_, shown, total) = d.strip(cx);
         if total <= 1 {
             return; // no strip (yet)
         }
-        let seq = open.seq;
-        let Some(index) = shown.iter().position(|p| p.id == open.photo.id) else {
+        let Some(index) = shown.iter().position(|p| p.id == photo_id) else {
             // Not in the Library's list: no frame to centre, as React's missing ref.
             self.strip_centred = Some((seq, viewport));
+            self.strip_zero_width_retries = 0;
             return;
         };
         if viewport <= 0.0 {
-            window.request_animation_frame();
+            if self.strip_zero_width_retries < STRIP_ZERO_WIDTH_RETRIES {
+                self.strip_zero_width_retries += 1;
+                window.request_animation_frame();
+            } else {
+                // Given up for this (seq, viewport) until something changes it.
+                self.strip_centred = Some((seq, viewport));
+            }
             return;
         }
+        self.strip_zero_width_retries = 0;
         let x = STRIP_LAYOUT.centre(index, shown.len(), viewport);
         self.strip_scroll.set_offset(gpui_kit::point(px(-x), px(0.)));
         self.strip_centred = Some((seq, viewport));
@@ -819,8 +845,7 @@ impl DarkroomView {
         &self.strip_scroll
     }
 
-    fn render_filmstrip(&self, d: &Darkroom, colors: Colors, cx: &Context<Self>) -> Option<AnyElement> {
-        let (start, shown, total) = d.strip(cx);
+    fn render_filmstrip(&self, d: &Darkroom, start: usize, shown: &[Photo], total: usize, colors: Colors, cx: &Context<Self>) -> Option<AnyElement> {
         if total <= 1 {
             return None;
         }
@@ -1069,14 +1094,17 @@ impl Render for DarkroomView {
             self.sync_sliders(&working, kelvin.as_ref(), window, cx);
             self.rails.sync_straighten(&working, window, cx);
         }
-        self.centre_strip(window, cx);
+        // One `strip()` per render (#191 N1c), shared by centring and the filmstrip itself —
+        // they each used to ask for their own window of rows.
+        let (start, shown, total) = darkroom.read(cx).strip(cx);
+        self.centre_strip(&shown, total, window, cx);
         let d = darkroom.read(cx);
         let bar = self.render_bar(d, colors, cx);
         let error = d.error.clone();
         let stage = self.render_stage(d, colors, cx);
         let strip = self.render_tone_strip(d, colors, cx);
         let actions = self.render_actions(d, colors, cx);
-        let film = self.render_filmstrip(d, colors, cx);
+        let film = self.render_filmstrip(d, start, &shown, total, colors, cx);
         let rail = self.render_rail(d, colors, cx);
         let empty = d.open.is_none();
         let overlay = self.rails.overlay_element();

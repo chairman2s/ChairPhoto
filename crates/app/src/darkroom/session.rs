@@ -338,6 +338,14 @@ pub struct Darkroom {
     images: Entity<ImageStore>,
     /// The filmstrip's hold on its frames' thumbnails.
     strip_claim: ClaimId,
+    /// [`request_strip_thumbs`](Self::request_strip_thumbs)'s last-built wanted list (the
+    /// strip's window, nearest-first) and the rows generation + open photo id it was built
+    /// for. `sync` calls that function on every shell notify while the same photo stays
+    /// open, so this is reused — the image store is still asked every time (cheap by
+    /// design, and needed to pick up e.g. an eviction elsewhere) — unless the rows were
+    /// actually re-read or the open photo changed (#191 N1).
+    strip_wanted: Vec<(i64, Option<CoverLook>)>,
+    strip_wanted_for: Option<(u64, i64)>,
     pool: Arc<dyn Submit>,
     luts_dir: LutsDir,
     develop: DevelopCalls,
@@ -375,6 +383,10 @@ pub struct Darkroom {
     /// Clicks of the print toggle: a stored value read across a click, or while a click's
     /// write is still on the worker, is older than the click and does not undo it.
     print_clicks: u64,
+    /// Tests: how many times [`request_strip_thumbs`](Self::request_strip_thumbs) actually
+    /// rebuilt the strip's wanted list, rather than reusing it (#191 N1).
+    #[cfg(test)]
+    strip_rebuild_count: u32,
     _subscriptions: [Subscription; 2],
 }
 
@@ -402,6 +414,8 @@ impl Darkroom {
             shell,
             images,
             strip_claim,
+            strip_wanted: Vec::new(),
+            strip_wanted_for: None,
             pool,
             luts_dir: Arc::new(chairphoto_core::app::luts_dir),
             develop: DevelopCalls::default(),
@@ -421,6 +435,8 @@ impl Darkroom {
             setting_writes: HashMap::new(),
             print_on_loupe: true,
             print_clicks: 0,
+            #[cfg(test)]
+            strip_rebuild_count: 0,
             _subscriptions,
         }
     }
@@ -1314,24 +1330,50 @@ impl Darkroom {
     /// The strip's frames: each photo's cover look as its row names it, from the catalog the
     /// rows were read from (see the module docs), the open photo's first, then outwards
     /// (`nearest_first`). No strip (one photo, or none open), no frames: the claim is let go.
+    ///
+    /// `sync` calls this on every shell notify while the same photo stays open. The image
+    /// store is asked every time regardless — `request_looks` may be called every frame by
+    /// design, and that is what lets it pick up a change elsewhere (an eviction, a
+    /// rotation) even when nothing here changed. What is skipped when nothing changed is
+    /// rebuilding the wanted list itself: `strip()`'s clone of the window (up to
+    /// `2*STRIP_RADIUS+1` rows) and the `nearest_first` ordering, redone only when the
+    /// Library's rows were actually re-read or the open photo changed (#191 N1).
     fn request_strip_thumbs(&mut self, cx: &mut Context<Self>) {
-        let from = self.shell.read(cx).rows_from();
-        let (_, shown, total) = self.strip(cx);
-        let wanted: Vec<(i64, Option<CoverLook>)> = match (&self.open, from) {
-            (Some(open), Some(_)) if total > 1 => {
-                let current = shown.iter().position(|p| p.id == open.photo.id).unwrap_or(shown.len());
-                nearest_first(shown.len(), current)
-                    .into_iter()
-                    .map(|i| (shown[i].id, cover_look(shown[i].cover_token.as_deref())))
-                    .collect()
+        let shell = self.shell.read(cx);
+        let (from, generation) = (shell.rows_from(), shell.library.rows_generation());
+        let photo_id = self.open.as_ref().map(|o| o.photo.id);
+        let key = photo_id.map(|id| (generation, id));
+        if self.strip_wanted_for != key {
+            #[cfg(test)]
+            {
+                self.strip_rebuild_count += 1;
             }
-            _ => Vec::new(),
-        };
+            let (_, shown, total) = self.strip(cx);
+            self.strip_wanted = match (&self.open, from) {
+                (Some(open), Some(_)) if total > 1 => {
+                    let current = shown.iter().position(|p| p.id == open.photo.id).unwrap_or(shown.len());
+                    nearest_first(shown.len(), current)
+                        .into_iter()
+                        .map(|i| (shown[i].id, cover_look(shown[i].cover_token.as_deref())))
+                        .collect()
+                }
+                _ => Vec::new(),
+            };
+            self.strip_wanted_for = key;
+        }
         let owner = self.strip_claim;
+        let wanted = &self.strip_wanted;
         self.images.update(cx, |store, cx| match from {
-            Some(from) if !wanted.is_empty() => store.request_looks(owner, from, &wanted, cx),
+            Some(from) if !wanted.is_empty() => store.request_looks(owner, from, wanted, cx),
             _ => store.release_looks(owner),
         });
+    }
+
+    /// Tests: how many times [`request_strip_thumbs`](Self::request_strip_thumbs) has
+    /// actually rebuilt the strip's wanted list (#191 N1).
+    #[cfg(test)]
+    pub(crate) fn strip_rebuild_count(&self) -> u32 {
+        self.strip_rebuild_count
     }
 
     /// Move to `photo_id` (a strip click, ← / →): the shell's active photo changes, and

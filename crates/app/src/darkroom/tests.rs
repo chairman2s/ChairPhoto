@@ -2090,6 +2090,31 @@ fn the_strip_centres_in_a_width_changed_outside_the_darkroom(cx: &mut TestAppCon
     assert_centred(&rig, 31, n, "after a resize outside the Darkroom", cx);
 }
 
+/// #191 N2: a strip column stuck at zero width must not ask for a fresh frame forever. The
+/// window is resized so narrow that, once the right rail's fixed width is subtracted, the
+/// stage+strip column — and so the filmstrip's tracked scroll area — gets none: `centre_strip`
+/// retries a bounded number of times, then gives up until something else changes the layout.
+#[gpui_kit::test]
+fn a_zero_width_strip_column_stops_asking_for_frames(cx: &mut TestAppContext) {
+    let rig = rig("dk-zero-width", 5, cx);
+    cx.simulate_window_resize(rig.app.window(), gpui_kit::size(gpui_kit::px(4.), gpui_kit::px(400.)));
+    cx.run_until_parked();
+    rig.render(cx);
+    let viewport = strip_at(&rig, 0, cx).viewport;
+    assert_eq!(viewport, 0.0, "the window is too narrow for the strip column to have any width");
+
+    // Each iteration: run whatever `request_animation_frame` queued, then redraw — the loop
+    // this would spin in, pre-fix, forever.
+    let mut ran = 1;
+    let mut frames = 0;
+    while ran > 0 && frames < 20 {
+        ran = cx.update_window(rig.app.window(), |_, window, cx| window.simulate_next_frame(cx)).unwrap();
+        rig.render(cx);
+        frames += 1;
+    }
+    assert!(frames < 20, "bounded: still asking for a fresh frame after {frames} redraws");
+}
+
 /// The strip's frames are asked for nearest the open photo first — it, then +1, −1, +2,
 /// −2 … — as one batch whose first job ends on top of the pool's LIFO stack (review rv134
 /// L2; the navigation rule: the requested photo first, then N±1).
@@ -2132,6 +2157,38 @@ fn the_strips_frames_are_asked_for_nearest_the_open_photo_first(cx: &mut TestApp
         .find(|b| b.len() == want.len())
         .expect("the strip's batch");
     assert_eq!(strip, want);
+}
+
+/// #191 N1: `sync` runs `request_strip_thumbs` on every shell notify while the same photo
+/// stays open (it still asks the image store every time — that is what lets
+/// `the_strips_frames_are_asked_for_nearest_the_open_photo_first` pick up an eviction from a
+/// plain notify), but it only rebuilds the strip's window — `strip()`'s clone of up to
+/// `2*STRIP_RADIUS+1` rows plus the `nearest_first` ordering — when the Library's rows were
+/// actually re-read since the last build.
+#[gpui_kit::test]
+fn repeated_notifies_with_unchanged_rows_do_not_rebuild_the_strip_window(cx: &mut TestAppContext) {
+    let rig = rig("dk-strip-rebuild", 5, cx);
+    let d = rig.darkroom(cx);
+    let before = d.read_with(cx, |d, _| d.strip_rebuild_count());
+    assert!(before > 0, "opening built the strip once");
+
+    // Several shell notifies that touch nothing about the rows.
+    for _ in 0..5 {
+        rig.app.wired.shell.update(cx, |_, cx| cx.notify());
+        cx.run_until_parked();
+    }
+    let after = d.read_with(cx, |d, _| d.strip_rebuild_count());
+    assert_eq!(after, before, "no rows change: the window is not rebuilt");
+
+    // A genuine rows re-read still rebuilds it.
+    rig.app.wired.shell.update(cx, |s, cx| {
+        s.refresh_rows(cx);
+        cx.notify();
+    });
+    cx.run_until_parked();
+    work(cx);
+    let after2 = d.read_with(cx, |d, _| d.strip_rebuild_count());
+    assert!(after2 > after, "a real rows re-read rebuilds it: {after2} > {after}");
 }
 
 /// The Thumb jobs for `photo` submitted so far.

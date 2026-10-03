@@ -336,8 +336,17 @@ pub fn make_freeform(
     let (_, paths) = with_bound(state, expected, |c| resolve_all(c, placements.iter().map(|p| p.photo_id)))?;
     let png = is_png(format);
     let ext = if png { "png" } else { "jpg" };
-    let dest = super::unique_path(&super::expand_home(dest_dir.trim()).join(format!("collage.{ext}")));
-    render_freeform(&paths, placements, opts, png, &dest, load)?;
+    let out_dir = super::expand_home(dest_dir.trim());
+    std::fs::create_dir_all(&out_dir).map_err(|e| e.to_string())?;
+    // Claimed (not just checked free), the way slideshow and export reserve their output
+    // names: two overlapping renders into the same folder must never choose the same name
+    // (#211).
+    let dest = super::reserve_unique_path(&out_dir.join(format!("collage.{ext}")))?;
+    if let Err(e) = render_freeform(&paths, placements, opts, png, &dest, load) {
+        // Our own reservation, never another render's.
+        let _ = std::fs::remove_file(&dest);
+        return Err(e);
+    }
     Ok(dest)
 }
 
@@ -366,8 +375,16 @@ pub fn save_to_catalog(
     })?;
     let png = is_png(format);
     let ext = if png { "png" } else { "jpg" };
-    let dest = super::unique_path(&root.join("Collages").join(format!("collage.{ext}")));
-    render_freeform(&paths, placements, opts, png, &dest, load)?;
+    let collages_dir = root.join("Collages");
+    std::fs::create_dir_all(&collages_dir).map_err(|e| e.to_string())?;
+    // Claimed (not just checked free): two overlapping library saves must each get their own
+    // file, never one truncating the other's still-rendering output (#211).
+    let dest = super::reserve_unique_path(&collages_dir.join(format!("collage.{ext}")))?;
+    if let Err(e) = render_freeform(&paths, placements, opts, png, &dest, load) {
+        // Our own reservation, never another save's.
+        let _ = std::fs::remove_file(&dest);
+        return Err(e);
+    }
 
     let kind = kind.trim().to_string();
     // The identity check and the index share one catalog lock hold (`with_catalog_as`'s
@@ -554,6 +571,54 @@ mod tests {
         let leaf = tags.iter().find(|t| t.full_path == "Collage/Grid").expect("tagged Collage/Grid");
         let parent = leaf.parent_id.expect("under Collage");
         assert!(!c.tag_exportable(leaf.id).unwrap() && !c.tag_exportable(parent).unwrap());
+    }
+
+    /// **Forced interleaving** (#211). The first library save is held in its preview loader —
+    /// after `save_to_catalog` has already reserved its destination name — while a second
+    /// save runs to completion entirely inside that pause. Before the fix (`unique_path`,
+    /// which only checks a name is free, never claims it) both saves chose `collage.png`: the
+    /// second's render truncated the first's not-yet-written file, and both calls indexed the
+    /// same catalog row (`index_generated_file` re-indexing one path twice). With
+    /// `reserve_unique_path`, the second sees `collage.png` already claimed and gets
+    /// `collage (2).png`: each save ends with its own complete, distinct file and photo.
+    #[test]
+    fn two_overlapping_library_saves_end_with_distinct_files() {
+        let (dir, state, ids) = setup("overlap");
+        let p = halves(&ids);
+        let paused = std::sync::atomic::AtomicBool::new(false);
+        let second_id = Arc::new(std::sync::Mutex::new(None));
+        let (s, pp, second_id_inner) = (state.clone(), p.clone(), second_id.clone());
+        let held: PreviewLoader = Arc::new(move |path| {
+            if !paused.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                // Run the second save to completion while the first is still rendering its
+                // first tile — after the first has already reserved its own name.
+                let id = save_to_catalog(&s, None, &pp, &freeform(), "png", "Grid", &direct())
+                    .expect("the second save completes");
+                *second_id_inner.lock().unwrap() = Some(id);
+            }
+            decode_upright(&std::fs::read(path).map_err(|e| e.to_string())?)
+        });
+        let first = save_to_catalog(&state, None, &p, &freeform(), "png", "Grid", &held).unwrap();
+        let second = second_id.lock().unwrap().expect("the held loader ran the second save");
+        assert_ne!(first, second, "each save indexes its own distinct photo");
+
+        let guard = state.catalog.lock().unwrap();
+        let c = guard.as_ref().unwrap();
+        assert_eq!(c.require_photo_path(first).unwrap(), dir.join("library/Collages/collage.png"), "the first keeps its reserved name");
+        assert_eq!(c.require_photo_path(second).unwrap(), dir.join("library/Collages/collage (2).png"));
+        drop(guard);
+
+        let mut names: Vec<String> = std::fs::read_dir(dir.join("library/Collages"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["collage (2).png", "collage (2).png.xmp", "collage.png", "collage.png.xmp"], "{names:?}");
+        for name in ["collage.png", "collage (2).png"] {
+            use image::GenericImageView;
+            let img = image::open(dir.join("library/Collages").join(name)).unwrap();
+            assert_eq!(img.dimensions(), (100, 50), "{name} is a complete render, not an empty reservation");
+        }
     }
 
     /// The ids were read from catalog A; B is open by the time the dialog saves. Every entry

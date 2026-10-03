@@ -27,9 +27,9 @@ use crate::storage::ui;
 use chairphoto_core::image_pool::ImageKind;
 use gpui_kit::prelude::*;
 use gpui_kit::{
-    canvas, div, img, px, Bounds, Context, CursorStyle, Entity, MouseButton, MouseDownEvent, MouseMoveEvent,
-    ObjectFit, Pixels, Point, RenderImage, ScrollWheelEvent, SharedString, Subscription, TestSupportExt as _,
-    Window,
+    canvas, div, img, px, Bounds, Context, CursorStyle, Div, ElementId, Entity, ImageSource, MouseButton,
+    MouseDownEvent, MouseMoveEvent, ObjectFit, Pixels, Point, RenderImage, ScrollWheelEvent, SharedString,
+    Subscription, TestSupportExt as _, Window,
 };
 use std::sync::Arc;
 
@@ -106,6 +106,25 @@ pub fn fit_factor(natural: (f32, f32), container: (f32, f32)) -> f32 {
         return 1.;
     }
     (container.0 / natural.0).min(container.1 / natural.1)
+}
+
+/// `image` fitted to the box its parent gives it with `fit` — `Contain` (whole, centred,
+/// letterboxed) or `Cover` (filling it, centred, cropped) — as the picture element `id`. The
+/// box fills its parent (`size_full`). The cull stage, the duel, the proof sheet and preset
+/// cards draw their pictures with it.
+///
+/// `img(..).size_full()` placed in the flow is not enough. GPUI's `img` gives its element
+/// the image's aspect ratio, and in a block parent the layout then takes the element's height
+/// from its width through that ratio instead of from the parent: a portrait frame — or any
+/// frame narrower than the box's shape — comes out taller than the box, and Contain inside
+/// that taller element fills the width and runs off the bottom (#174), over whatever sits
+/// below it (#178). Positioned absolutely, the element takes both sizes from its containing
+/// box and the ratio is only used to paint.
+pub fn fitted(id: impl Into<ElementId>, image: impl Into<ImageSource>, fit: ObjectFit) -> Div {
+    div()
+        .relative()
+        .size_full()
+        .child(img(image).id(id).absolute().top_0().left_0().size_full().object_fit(fit).test_support())
 }
 
 /// The scale at which one image pixel covers one logical pixel: the inverse of the fit
@@ -548,7 +567,10 @@ impl Render for ZoomImage {
                     .into_any_element()
             }
             // Before the first layout: contained, centred — what fit looks like.
-            (Some(image), None) => img(image.clone()).size_full().object_fit(ObjectFit::Contain).into_any_element(),
+            (Some(image), None) => {
+                fitted(SharedString::from(format!("{}-picture", self.id)), image.clone(), ObjectFit::Contain)
+                    .into_any_element()
+            }
             (None, _) => div().into_any_element(),
         };
         let this = cx.entity().downgrade();

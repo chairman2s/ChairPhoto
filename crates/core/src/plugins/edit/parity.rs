@@ -34,8 +34,12 @@ pub struct ParityTally {
     pub differing: u64,
 }
 
-/// Checks recorded outside any [`collect`] — the commands that still drain it with [`take`]
-/// (Instagram).
+/// Checks recorded outside any [`collect`] — a safety net, not a counter anything currently
+/// drains in production: the export job, uploads (Instagram included), LocalSend and
+/// slideshow each collect their own tally (`app::exports::collect_parity`) and persist it
+/// against the catalog they read. [`take`] exists for this module's own tests and for a
+/// future caller that forgets to collect — never silently losing a check, just mixing it
+/// into this process-wide bucket instead of a job's own.
 static TALLY: Mutex<ParityTally> = Mutex::new(ParityTally { checked: 0, differing: 0 });
 
 thread_local! {

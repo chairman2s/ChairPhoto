@@ -59,6 +59,10 @@ pub struct SlideshowJob {
     dest_dir: PathBuf,
     ffmpeg: PathBuf,
     abort: Arc<AtomicBool>,
+    /// The catalog the photos were read from: its own parity tally gets this render's
+    /// frame checks (`app::exports::record_parity_tally`), never the process-wide one and
+    /// never another catalog's (#212).
+    read_from: CatalogIdentity,
     /// The render's job id: every `slideshow:progress` it sends carries it.
     pub job: u64,
 }
@@ -97,6 +101,7 @@ pub fn claim_slideshow(
     if resolved.items.is_empty() {
         return Err("None of the selected photos are reachable (their volumes may be offline)".into());
     }
+    let read_from = super::identity_of(catalog);
     let (abort, job) = state.jobs.slideshow.install_fresh_numbered()?;
     drop(guard);
     Ok(SlideshowJob {
@@ -106,6 +111,7 @@ pub fn claim_slideshow(
         dest_dir,
         ffmpeg,
         abort,
+        read_from,
         job,
     })
 }
@@ -155,7 +161,7 @@ impl SlideshowJob {
     /// starts; nothing else there is touched, and a cancelled or failed encode removes its own
     /// reservation / partial movie.
     pub fn run_with(self, write_frame: &FrameWriter) -> Result<PathBuf, String> {
-        let SlideshowJob { state, items, opts, dest_dir, ffmpeg, abort, job } = self;
+        let SlideshowJob { state, items, opts, dest_dir, ffmpeg, abort, read_from, job } = self;
         let cancelled = || abort.load(Ordering::Relaxed);
         let work = FrameDir::create()?;
         let result = (|| {
@@ -163,15 +169,24 @@ impl SlideshowJob {
             // oversamples to 2× the target) has pixels to crop into; capped so a huge RAW
             // doesn't produce gigantic intermediate JPEGs.
             let frame_max_width = (opts.width.max(opts.height) * 2).min(4096);
-            let mut frames = Vec::with_capacity(items.len());
-            for (i, item) in items.iter().enumerate() {
-                if cancelled() {
-                    return Err(SLIDESHOW_CANCELLED.to_string());
+            // This render's own parity tally (an engine-2 frame is checked against the
+            // view, `export::export_engine2`): collected here and recorded against the
+            // catalog the photos were read from, not the process-wide tally nothing drains
+            // (#212) and not whichever catalog happens to be open once this returns.
+            let (frames, tally) = super::exports::collect_parity(|| -> Result<Vec<PathBuf>, String> {
+                let mut frames = Vec::with_capacity(items.len());
+                for (i, item) in items.iter().enumerate() {
+                    if cancelled() {
+                        return Err(SLIDESHOW_CANCELLED.to_string());
+                    }
+                    let frame = work.0.join(format!("frame_{i:04}.jpg"));
+                    write_frame(item, frame_max_width, &frame)?;
+                    frames.push(frame);
                 }
-                let frame = work.0.join(format!("frame_{i:04}.jpg"));
-                write_frame(item, frame_max_width, &frame)?;
-                frames.push(frame);
-            }
+                Ok(frames)
+            });
+            super::exports::record_parity_tally(&state, Some(read_from), tally);
+            let frames = frames?;
             if cancelled() {
                 return Err(SLIDESHOW_CANCELLED.to_string());
             }
@@ -341,6 +356,31 @@ mod tests {
         if tmp_root != cache_root {
             assert!(!frame_dir.starts_with(&tmp_root), "{frame_dir:?} is not under the system temp dir {tmp_root:?}");
         }
+    }
+
+    /// #212 Nit-1: a slideshow frame is an engine-2 render too (`export::write_item_jpeg` →
+    /// `export_engine2`, when the frame writer is the production one over an edited photo),
+    /// so its parity check must land in the catalog's own tally (`EXPORT_PARITY_KEY`), the
+    /// way every other export path's does — not the process-wide tally nothing in
+    /// production drains (parity.rs's `TALLY`/`take`).
+    #[cfg(feature = "edit")]
+    #[test]
+    fn frame_checks_record_into_the_catalogs_own_parity_tally() {
+        let (dir, state, _progress, ids) = setup("parity", 2);
+        let out = dir.join("out");
+        let job = claim_slideshow(&state, None, &ids, opts(), out.to_str().unwrap(), Some(fake_ffmpeg(false))).unwrap();
+        // A frame writer standing in for `export_frame`'s real engine-2 path: it checks and
+        // records, then writes the frame like `copy_frames`.
+        let writer: FrameWriter = Arc::new(|item, _, out| {
+            crate::plugins::edit::parity::record(0.0);
+            std::fs::copy(&item.original, out).map(|_| ()).map_err(|e| e.to_string())
+        });
+        job.run_with(&writer).unwrap();
+        let guard = state.catalog.lock().unwrap();
+        let c = guard.as_ref().unwrap();
+        let raw = c.get_setting(crate::app::exports::EXPORT_PARITY_KEY).unwrap().expect("the tally was recorded");
+        let tally: crate::plugins::edit::parity::ParityTally = serde_json::from_str(&raw).unwrap();
+        assert_eq!(tally, crate::plugins::edit::parity::ParityTally { checked: 2, differing: 0 });
     }
 
     /// The fake ffmpegs are executable checked-in files the helper only names: asking for

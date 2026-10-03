@@ -227,6 +227,38 @@ fn write_exports_hooked(
     Ok(ExportRun { result, stopped: false })
 }
 
+/// Removes both of [`reserve_destination`]'s reserved files — the primary and its empty
+/// sidecar — unless [`disarm`](Self::disarm) is called first. Guards the window between
+/// reserving a hand-off export's names and finishing the copy: an I/O error anywhere in
+/// that window (the RAW copy, or the sidecar copy that follows it), or a panic in
+/// `before_write`, leaves neither an empty nor a half-written placeholder (#212) — only a
+/// panic that aborts the process instead of unwinding skips this, same as any other `Drop`.
+struct ReservedPair<'a> {
+    target: &'a Path,
+    sidecar: &'a Path,
+    armed: bool,
+}
+
+impl<'a> ReservedPair<'a> {
+    fn new(target: &'a Path, sidecar: &'a Path) -> Self {
+        ReservedPair { target, sidecar, armed: true }
+    }
+
+    /// The export landed: leave both reserved files as they are.
+    fn disarm(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ReservedPair<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = std::fs::remove_file(self.target);
+            let _ = std::fs::remove_file(self.sidecar);
+        }
+    }
+}
+
 /// Copy the original next to its XMP sidecar (if one exists), never overwriting an
 /// existing file in the destination (duplicate names — possible across volumes — get a
 /// " (n)" suffix; the sidecar is renamed to stay paired with its original). Then emit
@@ -240,16 +272,20 @@ fn export_handoff(item: &ResolvedItem, dest_dir: &Path, before_write: &dyn Fn(&P
         .ok_or_else(|| "original has no file name".to_string())?;
     let (target, mut out) = reserve_destination(&dest_dir.join(name))?;
     let target_sidecar = crate::xmp::sidecar_path(&target);
+    // Both names are this export's own until `disarm()`: a half-copied original, or one
+    // copied but missing its sidecar, must not look exported.
+    let guard = ReservedPair::new(&target, &target_sidecar);
     before_write(&target);
-    let copied = std::fs::File::open(original)
+    std::fs::File::open(original)
         .and_then(|mut src| std::io::copy(&mut src, &mut out))
-        ;
+        .map_err(|e| e.to_string())?;
     drop(out);
-    if let Err(e) = copied {
-        // Both names are this export's own: a half-copied original must not look exported.
-        let _ = std::fs::remove_file(&target);
-        let _ = std::fs::remove_file(&target_sidecar);
-        return Err(e.to_string());
+    // Carry over the original's permission bits: `fs::copy` does this, but the destination
+    // here must stay `reserve_destination`'s exclusive-create reservation (never a fresh
+    // file `fs::copy` would create), so the copy itself is `io::copy` into the open handle,
+    // which does not.
+    if let Ok(meta) = std::fs::metadata(original) {
+        let _ = std::fs::set_permissions(&target, meta.permissions());
     }
 
     let sidecar = crate::xmp::sidecar_path(original);
@@ -264,6 +300,7 @@ fn export_handoff(item: &ResolvedItem, dest_dir: &Path, before_write: &dyn Fn(&P
         // this export holds.
         let _ = std::fs::remove_file(&target_sidecar);
     }
+    guard.disarm();
     // Emit keywords into the destination sidecar (merges into the copied one, or
     // creates it). Best-effort: the RAW + sidecar are already exported, so a malformed
     // foreign sidecar that can't be parsed must not fail the whole item — log and move on.
@@ -1343,5 +1380,45 @@ mod overlap_tests {
         assert_eq!(path, dir.join("IMG (2).CR3"));
         assert!(!dir.join("IMG.CR3").exists(), "the released primary is removed");
         assert_eq!(std::fs::read_to_string(dir.join("IMG.CR3.xmp")).unwrap(), "stale");
+    }
+
+    /// #212: the hand-off copy carries over the original's permission bits. It can't use
+    /// `fs::copy` for the copy itself (the destination must stay `reserve_destination`'s
+    /// exclusive-create reservation, not a fresh file), so the bits are copied explicitly.
+    #[test]
+    fn hand_off_carries_over_the_originals_permission_bits() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TestTmpDir::new("export-handoff-perms");
+        let original = dir.join("IMG.CR3");
+        std::fs::write(&original, "raw bytes").unwrap();
+        std::fs::set_permissions(&original, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let dest = dir.join("out");
+        std::fs::create_dir_all(&dest).unwrap();
+        export_handoff(&item(original.clone()), &dest, &|_| {}).unwrap();
+        let mode = std::fs::metadata(dest.join("IMG.CR3")).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o640, "the copy keeps the original's permission bits");
+    }
+
+    /// #212: a failure after the RAW copy lands — here, the sidecar copy, because the
+    /// source sidecar can't be read — removes the half-exported original too, not just the
+    /// empty sidecar reservation. A failed hand-off must not leave what looks like a
+    /// complete export missing its metadata.
+    #[test]
+    fn a_failed_sidecar_copy_removes_the_half_exported_original_too() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TestTmpDir::new("export-handoff-sidecar-fail");
+        let original = dir.join("IMG.CR3");
+        std::fs::write(&original, "raw bytes").unwrap();
+        let sidecar = crate::xmp::sidecar_path(&original);
+        std::fs::write(&sidecar, "xmp").unwrap();
+        std::fs::set_permissions(&sidecar, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let dest = dir.join("out");
+        std::fs::create_dir_all(&dest).unwrap();
+        let err = export_handoff(&item(original.clone()), &dest, &|_| {});
+        // Restore so `TestTmpDir`'s drop can remove it.
+        std::fs::set_permissions(&sidecar, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(err.is_err(), "an unreadable source sidecar makes the copy fail: {err:?}");
+        assert!(!dest.join("IMG.CR3").exists(), "the half-exported original is removed, not left looking complete");
+        assert!(!dest.join("IMG.CR3.xmp").exists());
     }
 }

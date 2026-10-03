@@ -374,6 +374,48 @@ fn new_child_tags_create_a_pasted_hierarchy(cx: &mut TestAppContext) {
     assert!(!has_dialog(&app, cx));
 }
 
+/// #219: the New tags textarea is tall enough to show its whole 7-line placeholder.
+/// `auto_grow`'s minimum used to size the empty box for 6 rows, cutting the placeholder's
+/// last line off; it now matches React's fixed `rows={10}`. A headless test cannot read the
+/// placeholder's own drawn position, so this derives the box's per-row pixel height from two
+/// known content-driven row counts (11 and 13 lines, both forcing growth past any minimum)
+/// and checks the empty box's height implies at least 7 rows by that measure.
+#[gpui_kit::test]
+fn the_new_tags_textarea_is_tall_enough_for_its_placeholder(cx: &mut TestAppContext) {
+    let dir = TempDir::new("tags-create-placeholder");
+    let app = start(cx);
+    let s = open_tagged(&app, &dir, "a", cx);
+    right_click_menu_row(&app, leak(format!("tag-row-{}", s.people)), "New child tags…", cx);
+    let TagDialog::Create(create) = last_dialog(&app, cx) else { panic!("the create dialog") };
+    let create = up(create);
+    let text = create.read_with(cx, |c, _| c.text.clone());
+    render(&app, cx);
+    let height = |cx: &mut TestAppContext| -> gpui_kit::Pixels {
+        cx.update_window(app.window(), |_, window, cx| {
+            window.render_frame(cx);
+            window.find("tag-create-text").bounds().size.height
+        })
+        .unwrap()
+    };
+    let set_lines = |n: usize, cx: &mut TestAppContext| {
+        let value = vec!["x"; n].join("\n");
+        cx.update_window(app.window(), |_, window, cx| text.update(cx, |t, cx| t.set_value(value, window, cx))).unwrap();
+    };
+    let empty_height = height(cx);
+    set_lines(11, cx);
+    let h11 = height(cx);
+    set_lines(13, cx);
+    let h13 = height(cx);
+    let per_row = (h13 - h11) * 0.5;
+    assert!(per_row > gpui_kit::px(0.), "typing more lines grows the box: {h11:?} -> {h13:?}");
+    let intercept = h11 - per_row * 11.;
+    let implied_rows = (empty_height - intercept) / per_row;
+    assert!(
+        implied_rows >= 6.5,
+        "the empty box ({empty_height:?}) implies {implied_rows:.1} rows, short of the 7-line placeholder"
+    );
+}
+
 /// Merge: the dry run changes nothing; Merge commits it and reports on the status line.
 #[gpui_kit::test]
 fn merge_previews_then_commits(cx: &mut TestAppContext) {

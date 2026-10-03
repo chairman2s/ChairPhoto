@@ -42,7 +42,11 @@ impl EventEmitter<CloseDialog> for TagCreate {}
 
 impl TagCreate {
     pub fn new(tags: Entity<TagsState>, parent: Option<String>, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let text = cx.new(|cx| TextareaState::new(window, cx).placeholder(PLACEHOLDER).auto_grow(6, 14));
+        // `auto_grow`'s minimum sizes the box for the current *value* (empty, at first), not
+        // the placeholder — PLACEHOLDER is 7 lines, so a minimum of 6 cut its last line off
+        // (#219). React's textarea is a fixed `rows={10}` (`TagCreateModal.tsx`); matching that
+        // as the minimum fits the placeholder with room to spare and keeps the same size.
+        let text = cx.new(|cx| TextareaState::new(window, cx).placeholder(PLACEHOLDER).auto_grow(10, 14));
         let changes = cx.subscribe(&text, |this: &mut Self, _, event: &InputEvent, cx| {
             if matches!(event, InputEvent::Change) {
                 this.error = None;

@@ -351,9 +351,10 @@ fn cache_straggler(app: &App, job: u64, cx: &mut TestAppContext) {
     cx.run_until_parked();
 }
 
-/// App.tsx `onScan`: the rescan's result starts the warm-up — previews only while "Cache
-/// previews on import" is on — its own progress moves the status line on the bench, another
-/// job's does not, and its own result ends it.
+/// The rescan's result starts the warm-up while "Cache previews on import" is on — its own
+/// progress moves the status line on the bench, another job's does not, and its own result
+/// ends it. Owner decision (#195): with the option off, the warm-up is skipped entirely
+/// (deliberately not App.tsx's `onScan`, which still ran it for thumbnails alone).
 #[gpui_kit::test]
 fn a_rescan_warms_the_cache_and_reports_on_the_bench(cx: &mut TestAppContext) {
     let dir = TempDir::new("cache");
@@ -376,15 +377,16 @@ fn a_rescan_warms_the_cache_and_reports_on_the_bench(cx: &mut TestAppContext) {
     assert_eq!(status(&app, cx), "Cache ready", "its own result ends it");
     assert_eq!(app.wired.storage.read_with(cx, |s, _| s.cache), None);
 
-    // With the option off, the next rescan's warm-up caches thumbnails only.
+    // With the option off, the next rescan starts no warm-up at all: not even for thumbnails.
     click_menu_row(&app, "import-menu", 4, "Cache previews on import", cx);
     dispatch(&app, crate::shell::actions::RescanLibrary, cx);
     assert_eq!(work_once(cx), 1);
     cx.run_until_parked();
-    let job = app.wired.storage.read_with(cx, |s, _| s.cache).expect("started again");
-    assert!(!job.previews, "the option is read when the warm-up starts");
+    assert_eq!(app.wired.storage.read_with(cx, |s, _| s.cache), None, "no warm-up with the option off");
+    let after = status(&app, cx);
+    assert!(!after.starts_with("Cach"), "nothing warm-up-shaped reached the bench: {after}");
     work(cx);
-    assert_eq!(status(&app, cx), "Cache ready");
+    assert_eq!(app.wired.storage.read_with(cx, |s, _| s.cache), None, "still none: there was nothing to finish");
 }
 
 /// **Forced interleaving.** A catalog switch lands after the warm-up was claimed and before

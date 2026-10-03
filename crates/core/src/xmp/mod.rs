@@ -644,10 +644,54 @@ pub fn write_face_regions(
     legacy: &[FaceRegion],
     frame: RegionFrame,
 ) -> Result<(), RegionWriteError> {
+    require_catalog_identity(catalog)?;
+    let doc = SidecarDocument::open(photo_path)?;
+    write_regions_into(doc, photo_path, catalog, regions, retired, legacy, frame)
+}
+
+/// What one face-region write writes: [`write_face_regions`]'s arguments past the catalog.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct RegionSet {
+    pub regions: Vec<FaceRegion>,
+    pub retired: Vec<i64>,
+    pub legacy: Vec<FaceRegion>,
+    pub frame: RegionFrame,
+}
+
+/// [`write_face_regions`] with the set read by `gather` once the sidecar's file lock is held
+/// (#156), so the set written is never older than one another writer of this sidecar
+/// already wrote. A writer that reads the set and only then waits for the lock can be
+/// overtaken: another connection changes the set and writes it, then the first writes its
+/// older set over it. `gather` runs under the file lock, which is a leaf in the lock order
+/// (`app/jobs.rs`): it must not take a lock — a read on a connection the caller already
+/// holds (or a WAL read on its own) only. Its error fails the write, with nothing written.
+pub fn write_face_regions_gathered(
+    photo_path: &Path,
+    catalog: &str,
+    gather: impl FnOnce() -> Result<RegionSet, String>,
+) -> Result<(), RegionWriteError> {
+    require_catalog_identity(catalog)?;
+    let doc = SidecarDocument::open(photo_path)?;
+    let set = gather()?;
+    write_regions_into(doc, photo_path, catalog, &set.regions, &set.retired, &set.legacy, set.frame)
+}
+
+fn require_catalog_identity(catalog: &str) -> Result<(), RegionWriteError> {
     if catalog.is_empty() || catalog.contains('/') {
         return Err(RegionWriteError::Failed(format!("face regions not written: {catalog:?} is no catalog identity")));
     }
-    let mut doc = SidecarDocument::open(photo_path)?;
+    Ok(())
+}
+
+fn write_regions_into(
+    mut doc: SidecarDocument,
+    photo_path: &Path,
+    catalog: &str,
+    regions: &[FaceRegion],
+    retired: &[i64],
+    legacy: &[FaceRegion],
+    frame: RegionFrame,
+) -> Result<(), RegionWriteError> {
     // Written only into a Regions that has no AppliedToDimensions of its own.
     let dims = frame.stored_size;
 

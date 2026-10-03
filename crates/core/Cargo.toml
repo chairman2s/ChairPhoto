@@ -196,3 +196,11 @@ rcgen = { version = "0.14.9", default-features = false, features = ["pem", "ring
 # pre-existing `Ipv4Addr::UNSPECIFIED` join (see `local_multicast_interfaces`).
 [target."cfg(unix)".dependencies]
 libc = { version = "0.2", optional = true }
+# The sidecar writer's directory handle (xmp/document.rs, #155 F1): the original's folder is
+# held open from a sidecar's read to its commit, and the temp file is created, renamed and
+# synced relative to it (`openat`/`renameat`), so a volume unmounted in between cannot turn
+# the write into one on the disk under an empty mount point. Already resolved in Cargo.lock
+# at 1.1.4 with `fs` and `std` via async-io (`cargo tree --workspace -i rustix`), in the
+# Linux trees of the Tauri shell (zbus) and the GPUI app (smol) alike, so there it adds no
+# download and no compile unit to either binary.
+rustix = { version = "1.1", default-features = false, features = ["fs", "std"] }

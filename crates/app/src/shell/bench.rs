@@ -1,7 +1,7 @@
 //! The bench (`src/components/shell/Bench.tsx`): the 72 px strip under the stage. Left to
 //! right: one background job's progress, else "N photos · M selected" and the status line;
-//! the marking controls for the photo the inspector shows; the selection pile ("N on the
-//! table") with the selection's actions.
+//! the marking controls for the photo the inspector shows (Compare's focused pane, else the
+//! active photo); the selection pile ("N on the table") with the selection's actions.
 //!
 //! The marking and pile sections appear only with an active photo / a selection. Marks
 //! write through the one culling path the grid's keys use (`ShellState::apply_mark`,
@@ -135,7 +135,10 @@ impl RootView {
             .min_w_0()
             .child(div().w(px(214.)).flex_none().min_w_0().child(prog));
 
-        if let Some(active) = selection.active {
+        // The photo the inspector shows ([`ShellState::loupe_target`], React's `shellPhoto`):
+        // in Compare the focused pane, which is also the one `apply_mark` writes, so the
+        // toggles below are resolved against the photo they mark.
+        if let Some(active) = shell.loupe_target() {
             let filename = active.path.rsplit('/').next().unwrap_or(&active.path).to_string();
             let rating = active.rating;
             let mut stars = div().flex().gap(px(3.));
@@ -209,7 +212,15 @@ impl RootView {
                             .text_size(px(9.5))
                             .text_color(colors.mute)
                             .child("MARKING")
-                            .child(div().text_color(colors.dim).font_weight(FontWeight::MEDIUM).child(filename)),
+                            .child(
+                                div()
+                                    .id("bench-mark-name")
+                                    .text_color(colors.dim)
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .child(filename.clone())
+                                    .aria_label(filename)
+                                    .test_support(),
+                            ),
                     )
                     .child(
                         div()

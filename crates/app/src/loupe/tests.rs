@@ -531,6 +531,38 @@ fn compare_writes_fail_closed_across_a_catalog_switch(cx: &mut TestAppContext) {
     assert!(app.wired.shell.read_with(cx, |s, _| s.compare().is_none()));
 }
 
+/// #170: in Compare the inspector's header and the bench's marking name the focused pane —
+/// the photo the inspector's body describes and `apply_mark` writes (React's `shellPhoto`) —
+/// not the selection's active photo, and the bench's toggles resolve against that pane.
+#[gpui_kit::test]
+fn compare_header_and_bench_follow_the_focused_pane(cx: &mut TestAppContext) {
+    let (app, _pool, _dir, ids) = app_with(3, "cmp-shown", cx);
+    select(&app, ids[0], cx);
+    select_all(&app, cx);
+    press(&app, "c", cx);
+    assert_eq!(stage(&app, cx), StageView::Compare);
+    let name_of = |id: i64| format!("p{}.ARW", ids.iter().position(|&i| i == id).unwrap());
+    let focused = app.wired.shell.read_with(cx, |s, _| s.compare_focused()).expect("a focused pane");
+    assert_eq!(active(&app, cx), Some(ids[0]));
+    assert_ne!(focused, ids[0], "the focused pane is not the active photo");
+    assert_eq!(label_of(&app, "inspector-filename", cx), Some(name_of(focused)));
+    assert_eq!(label_of(&app, "bench-mark-name", cx), Some(name_of(focused)));
+
+    // The focused pane is picked, the active photo is not: the bench's Pick shows the pane's
+    // state, so a click clears the pick rather than writing it again.
+    app.wired.shell.update(cx, |s, cx| s.apply_mark(crate::shell::state::Mark::Pick(PickState::Pick), false, cx));
+    cx.run_until_parked();
+    assert_eq!(culling(&app, focused).1, PickState::Pick);
+    cx.update_window(app.window(), |_, window, cx| {
+        window.render_frame(cx);
+        window.click("bench-pick", cx)
+    })
+    .unwrap();
+    cx.run_until_parked();
+    assert_eq!(culling(&app, focused).1, PickState::None, "the bench toggled the focused pane's pick off");
+    assert_eq!(culling(&app, ids[0]).1, PickState::None, "the active photo is untouched");
+}
+
 // --- the cull session -------------------------------------------------------------------------
 
 fn cull(app: &App, cx: &mut TestAppContext) -> Option<Entity<CullView>> {

@@ -130,7 +130,9 @@ element already carries the attribute that would be restored (`parseType` beside
 nothing is repaired and the write is refused as
 before. A repair counts as a first write for the backup rule: the damaged file is copied to
 `<sidecar>.chairphoto-backup` first, unless a backup already exists, and an existing backup is
-never replaced. Reads do not repair. A damaged sidecar's regions become readable after the
+never replaced. Readers (face regions, GPS, identifier, IPTC presence) apply the same repair in
+memory to a sidecar with `chairphoto:LastWrite`, writing nothing and taking no backup, so face
+import reads the regions of a damaged sidecar before any write. The file itself is healed by the
 first ChairPhoto write to it.
 
 ### The repair pass is a job

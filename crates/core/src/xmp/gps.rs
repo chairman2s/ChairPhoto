@@ -5,7 +5,8 @@ use xmltree::XMLNode;
 use super::document::SidecarDocument;
 use super::dom::{first_text, is_rdf, plain, rdf_of};
 use super::ns::NS_EXIF;
-use super::parse::{ns_attr, parse_xml};
+use super::parse::ns_attr;
+use super::repair::parse_for_read;
 use super::sidecar_path;
 
 /// Write GPS coordinates into the photo's XMP sidecar as `exif:GPSLatitude` and
@@ -41,7 +42,7 @@ pub fn write_gps(photo_path: &Path, lat: f64, lng: f64) -> Result<(), String> {
 pub fn read_gps(photo_path: &Path) -> Option<(f64, f64)> {
     let path = sidecar_path(photo_path);
     let file = std::fs::File::open(&path).ok()?;
-    let root = parse_xml(file).ok()?;
+    let root = parse_for_read(file).ok()?;
     let rdf = rdf_of(&root)?;
     let mut lat_str: Option<String> = None;
     let mut lng_str: Option<String> = None;

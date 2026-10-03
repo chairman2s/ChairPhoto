@@ -6,7 +6,8 @@ use xmltree::XMLNode;
 use super::document::SidecarDocument;
 use super::dom::{first_text, plain, rdf_of};
 use super::ns::{NS_CHAIRPHOTO, NS_XMP};
-use super::parse::{ns_attr, parse_xml};
+use super::parse::ns_attr;
+use super::repair::parse_for_read;
 use super::sidecar_path;
 
 /// Read the photo UUID (`xmp:Identifier`) from its sidecar, if present. Used by the
@@ -16,7 +17,7 @@ use super::sidecar_path;
 pub fn read_identifier(photo_path: &Path) -> Option<String> {
     let path = sidecar_path(photo_path);
     let file = std::fs::File::open(&path).ok()?;
-    let root = parse_xml(file).ok()?;
+    let root = parse_for_read(file).ok()?;
     let rdf = rdf_of(&root)?;
     for node in &rdf.children {
         let XMLNode::Element(desc) = node else { continue };
@@ -101,7 +102,7 @@ pub fn write_import_batch(photo_path: &Path, batch_uuid: &str) -> Result<(), Str
 pub fn read_import_batch(photo_path: &Path) -> Option<String> {
     let path = sidecar_path(photo_path);
     let file = std::fs::File::open(&path).ok()?;
-    let root = parse_xml(file).ok()?;
+    let root = parse_for_read(file).ok()?;
     let rdf = rdf_of(&root)?;
     for node in &rdf.children {
         let XMLNode::Element(desc) = node else { continue };

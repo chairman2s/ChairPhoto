@@ -713,7 +713,7 @@ impl Folder {
 
 /// Whether any top-level `rdf:Description` carries `chairphoto:LastWrite`: exiftool keeps one
 /// Description per namespace, so the stamp need not sit in the first (#147).
-fn has_chairphoto_last_write(rdf: &Element) -> bool {
+pub(super) fn has_chairphoto_last_write(rdf: &Element) -> bool {
     rdf.children.iter().any(|d| {
         matches!(d, XMLNode::Element(desc)
             if desc.namespace.as_deref() == Some(NS_RDF) && desc.name == "Description"

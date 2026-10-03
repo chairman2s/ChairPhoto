@@ -29,12 +29,28 @@
 //! element already has the attribute it would restore (`parseType` next to `rdf:parseType`,
 //! `x` next to `stArea:x` or a `stArea:x` element), nothing in the file is repaired and the
 //! writers see it as before. `SidecarDocument::open` applies it in memory before any writer
-//! runs and backs the sidecar up first (see `document.rs`).
+//! runs and backs the sidecar up first (see `document.rs`); the readers apply it in memory too
+//! ([`parse_for_read`]), without writing or backing up anything.
 
 use xmltree::{Element, Namespace, XMLNode};
 use super::dom::{child, is_rdf, prefix_for_ns};
 use super::ns::{NS_MWG_RS, NS_RDF, NS_STAREA, NS_STDIM};
-use super::parse::{attr_is, ns_attr};
+use super::parse::{attr_is, ns_attr, parse_xml};
+
+/// Parse a sidecar for a reader: [`parse_xml`], then, when ChairPhoto wrote the file
+/// (`chairphoto:LastWrite`), the same in-memory repair a writer applies — with nothing written
+/// and no backup (#143 review, M1). So face import sees the regions of a damaged sidecar before
+/// anything writes it. An ambiguous file is read as it is.
+pub(super) fn parse_for_read<R: std::io::Read>(r: R) -> Result<Element, String> {
+    let mut root = parse_xml(r)?;
+    let rdf = if is_rdf(&root, "RDF") { Some(&mut root) } else { root.get_mut_child(("RDF", NS_RDF)) };
+    if let Some(rdf) = rdf {
+        if super::document::has_chairphoto_last_write(rdf) {
+            let _ = repair_dropped_prefixes(rdf);
+        }
+    }
+    Ok(root)
+}
 
 /// Restore the prefixes a pre-#138 ChairPhoto writer dropped under `rdf` (see the module docs),
 /// in place. `Ok(true)` when anything was repaired, `Ok(false)` when nothing needed it, `Err`
@@ -147,7 +163,7 @@ mod tests {
         element_text, has_attr, namespaced_attributes, read, region_names, seeded_photo, sized, CAT,
     };
     use crate::xmp::{
-        read_face_regions, sidecar_backup_path, sidecar_path, write_face_regions, FaceRegion, RegionWriteError,
+        sidecar_backup_path, sidecar_path, write_face_regions, FaceRegion, RegionWriteError,
     };
 
     // ── sidecars a pre-#138 release rewrote (#143 item 3) ───────────────────
@@ -235,7 +251,9 @@ mod tests {
     #[test]
     fn a_face_write_repairs_a_sidecar_whose_prefixes_a_pre_138_release_dropped() {
         let (_dir, photo) = seeded_photo("xmp-143-damaged", DAMAGED);
-        assert!(read_face_regions(&photo).is_empty(), "reading does not repair");
+        assert_eq!(region_names(&photo), ["Ann", "Bob"], "a read repairs in memory (M1)");
+        assert_eq!(read(&sidecar_path(&photo)), DAMAGED, "a read writes nothing");
+        assert!(!sidecar_backup_path(&sidecar_path(&photo)).exists(), "a read backs nothing up");
 
         write_face_regions(&photo, CAT, &[carl()], &[], &[], sized(6000, 4000)).unwrap();
 
@@ -295,6 +313,29 @@ mod tests {
             assert_eq!(abouts.len(), 1, "{case}: one about, in rdf: {abouts:?}\n{xml}");
             assert!(has_attr(&xml, (NS_RDF, "Description"), (NS_RDF, "about"), ""), "{case}: {xml}");
         }
+    }
+
+    /// Reading repairs in memory (#143 review, M1): the regions of a sidecar a released build
+    /// damaged are read — what face import goes through — while the file is not written and not
+    /// backed up. A damaged file ChairPhoto never wrote (no `chairphoto:LastWrite`) is read as it
+    /// is: no regions.
+    #[test]
+    fn reads_repair_in_memory_without_writing() {
+        let damaged = released_rewrite(&intact());
+        let (_dir, photo) = seeded_photo("xmp-143-read", &damaged);
+        assert_eq!(region_names(&photo), ["Ann", "Bob"]);
+        let in_frame: Vec<_> = crate::xmp::read_face_regions_in(&photo, sized(6000, 4000))
+            .into_iter()
+            .map(|r| r.name)
+            .collect();
+        assert_eq!(in_frame.len(), 2, "{in_frame:?}");
+        assert_eq!(read(&sidecar_path(&photo)), damaged, "a read writes nothing");
+        assert!(!sidecar_backup_path(&sidecar_path(&photo)).exists(), "a read backs nothing up");
+
+        let not_ours = damaged.replace("<chairphoto:LastWrite>1727000000</chairphoto:LastWrite>", "");
+        assert_ne!(not_ours, damaged);
+        let (_dir2, photo) = seeded_photo("xmp-143-read-not-ours", &not_ours);
+        assert!(region_names(&photo).is_empty());
     }
 
     /// A Description whose original `rdf:about` was not empty (old Photoshop wrote

@@ -86,7 +86,7 @@ pub const STRIP_OVERSCAN: usize = 8;
 pub struct Filmstrip {
     pub ids: Arc<Vec<i64>>,
     pub active: i64,
-    /// The catalog `ids` were read from (`MapState::catalog` when it opened).
+    /// The catalog `ids` were read from: the clicked marker's ([`MapView::clusters_from`]).
     pub from: Option<CatalogIdentity>,
 }
 
@@ -172,6 +172,10 @@ pub struct MapView {
     bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
     pub tiles: TileLayer,
     pub clusters: Arc<Vec<Cluster>>,
+    /// The catalog the clusters' photo ids are from: the one their points were read from
+    /// (`MapState::catalog`, taken with the points). A marker's click is bound to it, not to
+    /// whatever catalog the state has read by the time the click lands (#199).
+    clusters_from: Option<CatalogIdentity>,
     /// `(points revision, zoom)` the clusters are for, and the one being computed.
     cluster_key: Option<(u64, u8)>,
     clustering: Option<((u64, u8), Task<()>)>,
@@ -251,6 +255,7 @@ impl MapView {
             bounds: Rc::new(Cell::new(None)),
             tiles,
             clusters: Arc::new(Vec::new()),
+            clusters_from: None,
             cluster_key: None,
             clustering: None,
             drag: None,
@@ -317,9 +322,9 @@ impl MapView {
     fn sync(&mut self, cx: &mut Context<Self>) {
         self.sync_source(cx);
         self.sync_strip_catalog(cx);
-        let (points, revision) = {
+        let (points, revision, from) = {
             let s = self.state.read(cx);
-            (s.points.clone(), s.points_revision)
+            (s.points.clone(), s.points_revision, s.catalog())
         };
 
         let (w, h) = self.viewport.size();
@@ -333,7 +338,7 @@ impl MapView {
                 }
             }
         }
-        self.recluster(points, revision, cx);
+        self.recluster(points, revision, from, cx);
         if self.tiles.source().is_some() {
             let keys: Vec<TileKey> = self.viewport.visible_tiles().iter().map(|t| t.key).collect();
             self.tiles.want(&keys);
@@ -341,11 +346,19 @@ impl MapView {
     }
 
     /// Cluster for the current integer zoom, off the UI thread. The old clusters stay up
-    /// until the new ones land, unless the points themselves changed.
-    fn recluster(&mut self, points: Load<Arc<Vec<ProjectedPoint>>>, revision: u64, cx: &mut Context<Self>) {
+    /// until the new ones land, unless the points themselves changed. `from` is the catalog
+    /// `points` were read from; the clusters keep it ([`Self::clusters_from`]).
+    fn recluster(
+        &mut self,
+        points: Load<Arc<Vec<ProjectedPoint>>>,
+        revision: u64,
+        from: Option<CatalogIdentity>,
+        cx: &mut Context<Self>,
+    ) {
         let Load::Ready(points) = points else {
             if self.cluster_key.is_some_and(|(r, _)| r != revision) || !self.clusters.is_empty() {
                 self.clusters = Arc::new(Vec::new());
+                self.clusters_from = None;
                 self.cluster_key = None;
             }
             return;
@@ -356,6 +369,7 @@ impl MapView {
         }
         if self.cluster_key.is_some_and(|(r, _)| r != revision) {
             self.clusters = Arc::new(Vec::new());
+            self.clusters_from = None;
         }
         let task = cx.background_executor().spawn(async move { cluster(&points, key.1, CLUSTER_RADIUS_PX) });
         let task = cx.spawn(async move |this, cx| {
@@ -364,6 +378,7 @@ impl MapView {
                 if v.clustering.as_ref().is_some_and(|(k, _)| *k == key) {
                     v.clustering = None;
                     v.clusters = Arc::new(clusters);
+                    v.clusters_from = from;
                     v.cluster_key = Some(key);
                     cx.notify();
                 }
@@ -569,7 +584,7 @@ impl MapView {
         let targets: Vec<(f64, f64, f64)> = markers.iter().map(|m| (m.x, m.y, m.r)).collect();
         if let Some(i) = logic::hit_nearest(&targets, x, y) {
             let ids = self.clusters[markers[i].cluster].ids.clone();
-            self.open_filmstrip(ids, cx);
+            self.open_filmstrip(ids, self.clusters_from, cx);
             return;
         }
         let ll = self.viewport.screen_to_latlng(x, y);
@@ -596,10 +611,17 @@ impl MapView {
         cx.notify();
     }
 
-    fn open_filmstrip(&mut self, ids: Vec<i64>, cx: &mut Context<Self>) {
+    /// Open the strip on a marker's photos, bound to `from`, the catalog the marker was
+    /// computed from (AGENTS.md: a row's action captures its catalog when drawn). When the
+    /// state has since read another catalog (a switch whose `catalog:switched` has not
+    /// arrived, then a re-read), those ids are not that catalog's photos: nothing opens and
+    /// nothing is selected; the next frame draws the new catalog's markers.
+    fn open_filmstrip(&mut self, ids: Vec<i64>, from: Option<CatalogIdentity>, cx: &mut Context<Self>) {
         let Some(&first) = ids.first() else { return };
+        if from.is_none() || from != self.state.read(cx).catalog() {
+            return;
+        }
         self.select_quietly(first, cx);
-        let from = self.state.read(cx).catalog();
         self.filmstrip = Some(Filmstrip { ids: Arc::new(ids), active: first, from });
         self.strip_range.set(None);
         self.strip_scroll.scroll_to_item(0, gpui_kit::ScrollStrategy::Top);

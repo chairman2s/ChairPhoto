@@ -855,6 +855,62 @@ fn strip_across_a_switch(delivered: bool, cx: &mut TestAppContext) {
     );
 }
 
+/// **#199, catalog identity.** The markers on screen were drawn from catalog A. Between that
+/// frame and the click, the core switches to B, whose ids collide (`catalog:switched` not
+/// delivered), and a read of B lands in the state (a finished scan's re-read). The click is
+/// bound to the catalog the markers came from: A's ids are not B's photos, so no strip opens
+/// on them and nothing is selected; the next frame draws B's markers.
+///
+/// The ordering is forced. The test app draws a dirty window when an update's effects are
+/// flushed, so B's read is done here and lands in the same update as the press and release:
+/// they reach the last frame's handlers before any frame, as input between two frames does.
+#[gpui_kit::test]
+fn a_marker_click_is_bound_to_the_catalog_its_markers_were_drawn_from(cx: &mut TestAppContext) {
+    let dir = TempDir::new("map-strip-bind");
+    let m = open_map(&dir, &[OSLO, OSLO2], cx);
+    m.click("map-consent-deny", cx);
+    let (view, state) = (m.view(cx), map_state(&m, cx));
+    let a = state.read_with(cx, |s, _| s.catalog()).expect("A's points are read");
+    let (x, y) = m.screen(OSLO, cx);
+    let (x2, y2) = m.screen(OSLO2, cx);
+    let position = m.at(((x + x2) / 2.0, (y + y2) / 2.0), cx); // draws a frame: A's marker
+    const ELSEWHERE: i64 = 424_242;
+    m.app.wired.shell.update(cx, |s, _| s.library.select_quiet(ELSEWHERE));
+
+    let (b, b_ids) = crate::tests::colliding_catalog(&dir, "b", 2);
+    assert!(m.ids.iter().all(|id| b_ids.contains(id)), "the ids collide");
+    crate::tests::core_switch(&m.app, b);
+    let read = crate::modules::map::state::read_points(&m.app.state);
+    let b_id = read.as_ref().map(|(from, _)| *from).ok();
+    assert!(b_id.is_some() && b_id != Some(a), "the read is B's");
+
+    cx.update_window(m.app.window(), |_, window, cx| {
+        state.update(cx, |s, cx| {
+            s.land_points(read);
+            cx.notify();
+        });
+        let (markers, now) = view.read_with(cx, |v, cx| (v.clusters.len(), v.state.read(cx).catalog()));
+        assert_eq!(markers, 1, "no frame came between: A's marker is still the one on screen");
+        assert_eq!(now, b_id, "the state has read B");
+        window.dispatch_event(
+            MouseDownEvent { button: MouseButton::Left, position, modifiers: Modifiers::default(), click_count: 1, first_mouse: false }
+                .to_platform_input(),
+            cx,
+        );
+        window.dispatch_event(
+            MouseUpEvent { button: MouseButton::Left, position, modifiers: Modifiers::default(), click_count: 1 }.to_platform_input(),
+            cx,
+        );
+    })
+    .unwrap();
+    let selected = |cx: &mut TestAppContext| m.app.wired.shell.read_with(cx, |s, _| s.library.selection().active_id);
+    assert!(view.read_with(cx, |v, _| v.filmstrip.is_none()), "a strip opened on A's ids in B");
+    assert_eq!(selected(cx), Some(ELSEWHERE), "A's id was selected in B");
+    frame(&m.app, cx);
+    assert!(view.read_with(cx, |v, _| v.filmstrip.is_none()));
+    assert_eq!(selected(cx), Some(ELSEWHERE));
+}
+
 #[gpui_kit::test]
 fn the_strip_never_shows_the_new_catalog_before_the_switch_event(cx: &mut TestAppContext) {
     strip_across_a_switch(false, cx);

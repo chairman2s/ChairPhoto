@@ -189,6 +189,18 @@ impl GeocodeBackend for NetGeocode {
     }
 }
 
+/// What a points read found: the catalog it read and its GPS points, projected.
+pub(crate) type PointsRead = Result<(CatalogIdentity, Vec<ProjectedPoint>), String>;
+
+/// Read the open catalog's GPS points and its identity together (blocking: a worker's job).
+pub(crate) fn read_points(app: &AppState) -> PointsRead {
+    with_catalog_identified(app, |c| {
+        backend::ensure_schema_for(c)?;
+        Ok(backend::map_photo_points_for(c)?)
+    })
+    .map(|(from, points)| (from, project_points(&points))) // projected off the UI thread too
+}
+
 impl MapState {
     pub fn new(app: AppState, settings: ModuleSettings, model: Entity<AppModel>, cx: &mut Context<Self>) -> Self {
         let _model = cx.subscribe(&model, |this, _, event: &AppModelEvent, cx| match event {
@@ -311,26 +323,19 @@ impl MapState {
     }
 
     pub fn reload_points(&mut self, cx: &mut Context<Self>) {
-        self.run(
-            cx,
-            |app, _| {
-                with_catalog_identified(app, |c| {
-                    backend::ensure_schema_for(c)?;
-                    Ok(backend::map_photo_points_for(c)?)
-                })
-                .map(|(from, points)| (from, project_points(&points))) // projected off the UI thread too
-            },
-            |s, result, _| {
-                s.points = match result {
-                    Ok((from, points)) => {
-                        s.points_from = Some(from);
-                        Load::Ready(Arc::new(points))
-                    }
-                    Err(e) => Load::Failed(e),
-                };
-                s.points_revision += 1;
-            },
-        );
+        self.run(cx, |app, _| read_points(app), |s, result, _| s.land_points(result));
+    }
+
+    /// A points read ([`read_points`]) lands: the points and the catalog they came from.
+    pub(crate) fn land_points(&mut self, result: PointsRead) {
+        self.points = match result {
+            Ok((from, points)) => {
+                self.points_from = Some(from);
+                Load::Ready(Arc::new(points))
+            }
+            Err(e) => Load::Failed(e),
+        };
+        self.points_revision += 1;
     }
 
     pub fn reload_fences(&mut self, cx: &mut Context<Self>) {

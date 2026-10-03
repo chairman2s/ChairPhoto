@@ -156,6 +156,33 @@ fn a_module_card_takes_over_the_pop_out_until_its_owner_takes_it_down(cx: &mut T
     assert!(present_in(h, "loupe", cx));
 }
 
+/// #186: the wall's 120 px tiles are filled by their thumbnail, portrait and landscape
+/// (`.loupe-card-tile img { object-fit: cover }`), not a portrait element taller than the tile.
+#[gpui_kit::test]
+fn the_walls_tiles_are_filled_by_their_thumbnail(cx: &mut TestAppContext) {
+    use crate::image_tests::pixels;
+    use crate::loupe::fit_tests::{assert_fills, LANDSCAPE, PORTRAIT};
+    let (app, pool, _dir, ids) = app_with(2, "pop-card-fit", cx);
+    let tag = tag_all(&app, &ids);
+    cx.update(|cx| ModuleRegistry::enable(&app.wired.modules, DEV_MODULE_ID, cx));
+    let h = open(cx);
+    show(&app, DEV_MODULE_ID, Some(card("Bird", tag)), cx);
+    assert!(present_in(h, format!("loupe-card-tile-{}", ids[0]), cx), "the wall is drawn");
+    let frames = [(ids[0], PORTRAIT), (ids[1], LANDSCAPE)];
+    for &(id, (w, hh)) in &frames {
+        pool.finish(&JobKey::photo(id, ImageKind::Thumb), Ok(pixels(w, hh)));
+    }
+    cx.run_until_parked();
+    cx.update_window(h, |_, window, cx| {
+        window.render_frame(cx);
+        for &(id, image) in &frames {
+            let cell = SharedString::from(format!("loupe-card-tile-{id}"));
+            assert_fills(&format!("wall tile {id} {image:?}"), window, cell, ("loupe-card-picture", id as u64), 0.);
+        }
+    })
+    .unwrap();
+}
+
 /// The wall reads the catalog the card was shown under: a card shown while another catalog is
 /// already open (before `catalog:switched` arrives) fails closed instead of listing the new
 /// catalog's photos under a colliding tag id; the switch then takes the card down.

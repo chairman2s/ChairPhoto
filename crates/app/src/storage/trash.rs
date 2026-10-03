@@ -22,6 +22,7 @@ use super::{CloseDialog, Runner, StorageState};
 use crate::image_store::{ImageState, ImageStore};
 use crate::model::AppModel;
 use crate::shell::style::Colors;
+use crate::loupe::zoom::fitted;
 use chairphoto_core::app::storage::EmptyTrashReport;
 use chairphoto_core::app::{with_catalog_identified, AppState, CatalogIdentity};
 use chairphoto_core::catalog::Photo;
@@ -29,7 +30,7 @@ use chairphoto_core::image_pool::ImageKind;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::prelude::*;
 use gpui_kit::TestSupportExt as _;
-use gpui_kit::{div, img, px, Context, Entity, EventEmitter, ObjectFit, SharedString, Subscription, Window};
+use gpui_kit::{div, px, Context, Entity, EventEmitter, ObjectFit, SharedString, Subscription, Window};
 
 /// What must be typed to confirm.
 pub const CONFIRM_WORD: &str = "delete";
@@ -352,7 +353,7 @@ impl Render for TrashDialog {
                             .border_color(if sel { colors.accent } else { colors.border })
                             .cursor_pointer()
                             .child(match thumb {
-                                ImageState::Ready(l) => img(l.image).size_full().object_fit(ObjectFit::Cover).into_any_element(),
+                                ImageState::Ready(l) => fitted(("trash-picture", id as u64), l.image, ObjectFit::Cover).into_any_element(),
                                 _ => div().size_full().into_any_element(),
                             })
                             .child(

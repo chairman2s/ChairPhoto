@@ -12,13 +12,14 @@
 use super::ui;
 use super::{CloseDialog, Runner, StorageState};
 use crate::shell::style::Colors;
+use crate::loupe::zoom::fitted;
 use chairphoto_core::app::{expand_home, with_catalog, AppState};
 use chairphoto_core::scanner::CardPhoto;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::prelude::*;
 use gpui_kit::TestSupportExt as _;
 use gpui_kit::{
-    div, img, px, Context, Entity, EventEmitter, Image, ImageFormat, ObjectFit, PathPromptOptions, SharedString,
+    div, px, Context, Entity, EventEmitter, Image, ImageFormat, ObjectFit, PathPromptOptions, SharedString,
     Subscription, Window,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -134,6 +135,14 @@ impl ImportPanel {
             .ok();
         })
         .detach();
+        cx.notify();
+    }
+
+    /// A card thumbnail as [`Self::load_thumbs`] would land it, without decoding a file (which
+    /// writes the user's thumbnail cache).
+    #[cfg(test)]
+    pub(crate) fn set_thumb(&mut self, path: String, image: Arc<Image>, cx: &mut Context<Self>) {
+        self.thumbs.insert(path, image);
         cx.notify();
     }
 
@@ -322,7 +331,7 @@ impl Render for ImportPanel {
                                 .when(c.is_duplicate, |d| d.opacity(0.6))
                                 .cursor_pointer()
                                 .child(match thumb {
-                                    Some(image) => img(image).size_full().object_fit(ObjectFit::Cover).into_any_element(),
+                                    Some(image) => fitted(SharedString::from(format!("card-{i}-picture")), image, ObjectFit::Cover).into_any_element(),
                                     None => div().size_full().into_any_element(),
                                 })
                                 .when(sel, |d| {

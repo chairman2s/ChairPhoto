@@ -41,6 +41,7 @@ use crate::modules::ModuleHost;
 use crate::shell::state::Surface;
 use crate::shell::style::Colors;
 use crate::shell::ShellState;
+use crate::loupe::zoom::fitted;
 use chairphoto_core::app::{with_catalog, AppState, CoreEvent};
 use chairphoto_core::catalog::{PhotoQuery, PhotoWindow};
 use chairphoto_core::image_pool::ImageKind;
@@ -53,7 +54,7 @@ use chairphoto_model::tag_graph::{CAMERA_COLOR, PALETTE};
 use gpui_kit::component::slider::{Slider, SliderEvent, SliderState};
 use gpui_kit::prelude::*;
 use gpui_kit::{
-    canvas, div, img, px, AnyElement, App, Context, CursorStyle, Entity, FocusHandle, FontWeight, MouseButton,
+    canvas, div, px, AnyElement, App, Context, CursorStyle, Entity, FocusHandle, FontWeight, MouseButton,
     MouseDownEvent, MouseMoveEvent, ObjectFit, PinchEvent, Pixels, Point, RenderImage, ScrollDelta, ScrollWheelEvent, SharedString,
     Subscription, Task, TestSupportExt as _, Window,
 };
@@ -895,12 +896,21 @@ impl TagGraphView {
                         ids.iter().map(|&id| store.get(id, ImageKind::Thumb)).collect::<Vec<_>>()
                     });
                     let mut grid = div().id("tg-top-photos").flex().flex_row().flex_wrap().gap(px(6.));
-                    for state in cells {
-                        let cell = div().w(px(76.)).h(px(76.)).rounded(px(6.)).overflow_hidden().bg(colors.panel);
-                        grid = grid.child(match state {
-                            ImageState::Ready(loaded) => cell.child(img(loaded.image).size_full().object_fit(ObjectFit::Cover)),
+                    for (&photo, state) in ids.iter().zip(cells) {
+                        let cell = div()
+                            .id(("tg-top-thumb", photo as u64))
+                            .w(px(76.))
+                            .h(px(76.))
+                            .rounded(px(6.))
+                            .overflow_hidden()
+                            .bg(colors.panel);
+                        let cell = match state {
+                            ImageState::Ready(loaded) => {
+                                cell.child(fitted(("tg-top-picture", photo as u64), loaded.image, ObjectFit::Cover))
+                            }
                             _ => cell,
-                        });
+                        };
+                        grid = grid.child(cell.test_support());
                     }
                     body = body
                         .child(div().text_size(px(10.)).font_weight(FontWeight::SEMIBOLD).text_color(colors.mute).child("TOP PHOTOS"))

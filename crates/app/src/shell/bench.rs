@@ -14,12 +14,13 @@ use crate::shell::actions::*;
 use crate::shell::state::{Mark, ShellState, Surface};
 use crate::shell::style::{grouped, Colors, COLOR_LABELS};
 use crate::view::RootView;
+use crate::loupe::zoom::fitted;
 use chairphoto_core::catalog::{Photo, PickState};
 use chairphoto_core::image_pool::ImageKind;
 use chairphoto_model::darkroom::filmstrip::{cover_look, CoverLook};
 use gpui_kit::prelude::*;
 use gpui_kit::{
-    div, img, px, relative, Action, AnyElement, Context, FontWeight, ObjectFit, SharedString, TestSupportExt as _,
+    div, px, relative, Action, AnyElement, Context, FontWeight, ObjectFit, SharedString, TestSupportExt as _,
 };
 
 /// The bench's height (`.bench`).
@@ -382,7 +383,7 @@ impl RootView {
         let mut strip = div().id("bench-strip").flex().flex_none().gap(px(4.));
         for (photo, hl) in pile_thumbs(photos, shown) {
             let image = match store.peek(photo.id, ImageKind::Thumb) {
-                ImageState::Ready(l) => img(l.image.clone()).size_full().object_fit(ObjectFit::Cover).into_any_element(),
+                ImageState::Ready(l) => fitted(("bench-thumb-picture", photo.id as u64), l.image.clone(), ObjectFit::Cover).into_any_element(),
                 _ => div().size_full().bg(colors.well).into_any_element(),
             };
             let name = photo.path.rsplit('/').next().unwrap_or(&photo.path);

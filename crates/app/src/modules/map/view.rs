@@ -37,6 +37,7 @@ use crate::image_store::{ClaimId, ImageState, ImageStore};
 use crate::shell::style::Colors;
 use crate::shell::ShellState;
 use crate::storage::ui;
+use crate::loupe::zoom::fitted;
 use chairphoto_core::app::CatalogIdentity;
 use chairphoto_core::image_pool::ImageKind;
 use chairphoto_core::plugins::map::cluster::{cluster, Cluster, ProjectedPoint, CLUSTER_RADIUS_PX};
@@ -48,7 +49,7 @@ use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::{h_virtual_list, VirtualListScrollHandle};
 use gpui_kit::prelude::*;
 use gpui_kit::{
-    canvas, div, fill, img, point, px, rgb, size, AnyElement, App, Bounds, Context, CursorStyle, DispatchPhase, Entity,
+    canvas, div, fill, point, px, rgb, size, AnyElement, App, Bounds, Context, CursorStyle, DispatchPhase, Entity,
     FocusHandle, FontWeight, Hitbox, HitboxBehavior, Hsla, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
     MouseUpEvent, ObjectFit, PathBuilder, PinchEvent, Pixels, Point, RenderImage, ScrollDelta, ScrollWheelEvent,
     SharedString, Subscription, Task, TestSupportExt as _, Window,
@@ -1232,7 +1233,7 @@ impl MapView {
                     .cursor_pointer()
                     .on_click(cx.listener(move |this, _, _, cx| this.filmstrip_select(id, cx)));
                 let cell = match image {
-                    Some(image) => cell.child(img(image).size_full().object_fit(ObjectFit::Cover)),
+                    Some(image) => cell.child(fitted(("map-thumb-picture", id as u64), image, ObjectFit::Cover)),
                     None => cell,
                 };
                 cell.test_support().into_any_element()

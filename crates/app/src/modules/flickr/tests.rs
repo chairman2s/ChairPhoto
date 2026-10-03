@@ -28,6 +28,8 @@ struct Fake {
     uploads: Mutex<Vec<(String, String, String, usize)>>,
     stream: Mutex<Vec<FlickrPhoto>>,
     thumbs_asked: Mutex<Vec<String>>,
+    /// What a thumbnail fetch answers; `None` fails it, as offline.
+    thumb_bytes: Mutex<Option<Vec<u8>>>,
 }
 
 impl OAuthApi for Fake {
@@ -56,7 +58,7 @@ impl FlickrApi for Fake {
     }
     fn thumbnail(&self, url: &str) -> Result<Vec<u8>, String> {
         self.thumbs_asked.lock().unwrap().push(url.into());
-        Err("offline".into())
+        self.thumb_bytes.lock().unwrap().clone().ok_or_else(|| "offline".into())
     }
 }
 
@@ -258,6 +260,45 @@ fn the_import_previews_resolves_and_records(cx: &mut TestAppContext) {
     assert_eq!(publications(&app, q1b)[0].published_at, 1_500_000_002);
     assert!(publications(&app, q1a).is_empty(), "the undone candidate was recorded");
     assert!(publications(&app, ids[1]).is_empty());
+}
+
+/// #186: the preview's thumbnails fill their square — the catalog's from the image layer and
+/// Flickr's own — with a portrait frame (`flickr.tsx`: `objectFit: "cover"`), not a portrait
+/// element taller than the square.
+#[gpui_kit::test]
+fn the_previews_thumbnails_fill_their_square(cx: &mut TestAppContext) {
+    use crate::image_tests::{pixels, FakePool};
+    use crate::loupe::fit_tests::{assert_fills, PORTRAIT};
+    use chairphoto_core::image_pool::{ImageKind, JobKey};
+    use gpui_kit::test::TestWindowExt as _;
+    let dir = TempDir::new("flickr-import-fit");
+    let pool = Arc::new(FakePool::default());
+    let app = crate::tests::start_with_pool(cx, pool.clone());
+    let ids = with_files(&app, &dir, 1, cx);
+    work(cx);
+    connect(&app);
+    let api = Arc::new(Fake::default());
+    let mut jpeg = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::new_rgb8(PORTRAIT.0, PORTRAIT.1).write_to(&mut jpeg, image::ImageFormat::Jpeg).unwrap();
+    *api.thumb_bytes.lock().unwrap() = Some(jpeg.into_inner());
+    *api.stream.lock().unwrap() = vec![photo("1", "p0")];
+    let view = import_panel(&app, api.clone(), cx);
+    view.update(cx, |p, cx| p.preview(cx));
+    work(cx);
+    view.read_with(cx, |p, _| assert_eq!(p.status, "1 matched · 0 ambiguous · 0 not in catalog"));
+    pool.finish(&JobKey::photo(ids[0], ImageKind::Thumb), Ok(pixels(PORTRAIT.0, PORTRAIT.1)));
+    cx.run_until_parked();
+    let url = photo("1", "p0").thumb_url.unwrap();
+    for _ in 0..2 {
+        cx.update_window(app.window(), |_, window, cx| window.render_frame(cx)).unwrap();
+        cx.run_until_parked();
+    }
+    cx.update_window(app.window(), |_, window, _| {
+        assert_fills("catalog thumbnail", window, ("flickr-thumb", ids[0] as u64), ("flickr-thumb-picture", ids[0] as u64), 0.);
+        let (cell, picture) = (format!("flickr-remote-{url}"), format!("flickr-remote-picture-{url}"));
+        assert_fills("Flickr thumbnail", window, gpui_kit::SharedString::from(cell), gpui_kit::SharedString::from(picture), 0.);
+    })
+    .unwrap();
 }
 
 /// An Import whose catalog was switched under it records nothing in the new one (whose ids

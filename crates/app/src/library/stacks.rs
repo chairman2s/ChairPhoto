@@ -27,12 +27,13 @@ use crate::library::CloseDialog;
 use crate::model::AppModel;
 use crate::shell::state::ShellState;
 use crate::shell::style::Colors;
+use crate::loupe::zoom::fitted;
 use chairphoto_core::app::{with_catalog_as, AppState, CatalogIdentity};
 use chairphoto_core::image_pool::ImageKind;
 use chairphoto_core::stack_proposals::{StackProposal, StackProposals};
 use gpui_kit::prelude::*;
 use gpui_kit::{
-    div, img, px, relative, AnyElement, Context, Entity, EventEmitter, FocusHandle, FontWeight, ObjectFit,
+    div, px, relative, AnyElement, Context, Entity, EventEmitter, FocusHandle, FontWeight, ObjectFit,
     ScrollHandle, SharedString, TestSupportExt as _, Window,
 };
 use std::collections::{HashMap, HashSet};
@@ -300,7 +301,8 @@ impl StackDialog {
             let is_keeper = m.photo_id == keeper;
             let photo = m.photo_id;
             let thumb = match thumbs.get(&photo) {
-                Some(ImageState::Ready(l)) => img(l.image.clone()).size_full().object_fit(ObjectFit::Cover).into_any_element(),
+                Some(ImageState::Ready(l)) => fitted(SharedString::from(format!("frame-{group}-{photo}-picture")), l.image.clone(), ObjectFit::Cover)
+                    .into_any_element(),
                 _ => div().size_full().into_any_element(),
             };
             let title: SharedString = if is_keeper {
@@ -328,20 +330,28 @@ impl StackDialog {
                     .border_2()
                     .border_color(if is_keeper { colors.accent } else { colors.border })
                     .cursor_pointer()
-                    .child(div().relative().w_full().h(px(64.)).bg(colors.well).overflow_hidden().child(thumb).when(
-                        m.child_count > 0,
-                        |d| {
-                            d.child(
-                                div()
-                                    .absolute()
-                                    .bottom(px(2.))
-                                    .right(px(3.))
-                                    .text_size(px(10.))
-                                    .text_color(colors.txt)
-                                    .child(format!("▤ {}", m.child_count)),
-                            )
-                        },
-                    ))
+                    .child(
+                        div()
+                            .id(SharedString::from(format!("frame-{group}-{photo}-thumb")))
+                            .relative()
+                            .w_full()
+                            .h(px(64.))
+                            .bg(colors.well)
+                            .overflow_hidden()
+                            .child(thumb)
+                            .when(m.child_count > 0, |d| {
+                                d.child(
+                                    div()
+                                        .absolute()
+                                        .bottom(px(2.))
+                                        .right(px(3.))
+                                        .text_size(px(10.))
+                                        .text_color(colors.txt)
+                                        .child(format!("▤ {}", m.child_count)),
+                                )
+                            })
+                            .test_support(),
+                    )
                     .child(meta)
                     .tooltip(move |window, cx| gpui_kit::component::tooltip::Tooltip::new(title.clone()).build(window, cx))
                     .on_click(cx.listener(move |d, _, _, cx| d.pick_keeper(group, photo, cx)))

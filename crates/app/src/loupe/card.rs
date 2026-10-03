@@ -19,7 +19,7 @@
 
 use crate::image_store::{ClaimId, ImageState, ImageStore};
 use crate::keymap::contexts;
-use crate::loupe::zoom::ZoomImage;
+use crate::loupe::zoom::{fitted, ZoomImage};
 use crate::model::AppModel;
 use crate::shell::state::ShellState;
 use crate::shell::style::Colors;
@@ -29,7 +29,7 @@ use chairphoto_core::catalog::{Photo, PhotoQuery, PhotoWindow};
 use chairphoto_core::image_pool::ImageKind;
 use gpui_kit::prelude::*;
 use gpui_kit::{
-    actions, div, img, px, App, Context, Entity, FocusHandle, Hsla, ObjectFit, SharedString, Subscription,
+    actions, div, px, App, Context, Entity, FocusHandle, Hsla, ObjectFit, SharedString, Subscription,
     TestSupportExt as _, Window,
 };
 
@@ -395,7 +395,7 @@ impl Render for CardView {
                     .on_click(cx.listener(move |this, _, _, cx| this.view(Some(id), cx)))
                     .test_support();
                 wall = wall.child(match state {
-                    ImageState::Ready(l) => tile.child(img(l.image).size_full().object_fit(ObjectFit::Cover)),
+                    ImageState::Ready(l) => tile.child(fitted(("loupe-card-picture", id as u64), l.image, ObjectFit::Cover)),
                     _ => tile,
                 });
             }

@@ -637,6 +637,28 @@ fn a_large_clusters_strip_asks_for_what_is_on_screen_as_it_scrolls(cx: &mut Test
     assert!(!pending(&m, ids[998], cx));
 }
 
+/// #186: a strip frame is filled by its thumbnail inside its 2 px ring, portrait and
+/// landscape (`map.css`: `object-fit: cover`), not a portrait element taller than the frame.
+#[gpui_kit::test]
+fn the_strips_frames_are_filled_by_their_thumbnail(cx: &mut TestAppContext) {
+    use crate::loupe::fit_tests::{assert_fills, LANDSCAPE, PORTRAIT};
+    let (_dir, m, pool, view) = open_big_strip("map-strip-fit", 2, cx);
+    let ids = strip_ids(&view, cx);
+    let frames = [(ids[0], PORTRAIT), (ids[1], LANDSCAPE)];
+    for &(id, (w, h)) in &frames {
+        pool.finish(&JobKey::photo(id, ImageKind::Thumb), Ok(pixels(w, h)));
+    }
+    cx.run_until_parked();
+    frame(&m.app, cx);
+    cx.update_window(m.app.window(), |_, window, _| {
+        for &(id, image) in &frames {
+            let what = format!("strip frame {id} {image:?}");
+            assert_fills(&what, window, ("map-thumb", id as u64), ("map-thumb-picture", id as u64), 2.);
+        }
+    })
+    .unwrap();
+}
+
 /// The strip's frames are asked for nearest the active photo first: the active one, then
 /// N+1, N−1 (the navigation rule, AGENTS.md § Performance).
 #[gpui_kit::test]

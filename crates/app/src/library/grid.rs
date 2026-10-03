@@ -26,6 +26,7 @@ use crate::keymap::contexts;
 use crate::library::grid_menu::GridMenu;
 use crate::shell::timing::ShellTimer;
 use crate::library::layout::{self, GAP, NAME_H, OVERSCAN_ROWS};
+use crate::loupe::zoom::fitted;
 use crate::library::*;
 use crate::shell::actions::{OpenCompare, ToggleLoupe};
 use crate::shell::sidebar::RAIL_W;
@@ -37,7 +38,7 @@ use chairphoto_model::darkroom::filmstrip::{cover_look, CoverLook};
 use chairphoto_model::library::session::{LibrarySession, SelectMods};
 use gpui_kit::prelude::*;
 use gpui_kit::{
-    div, img, px, uniform_list, AnyElement, App, Bounds, ClickEvent, Context, Entity, FocusHandle, Hsla,
+    div, px, uniform_list, AnyElement, App, Bounds, ClickEvent, Context, Entity, FocusHandle, Hsla,
     MouseButton, MouseDownEvent, ObjectFit, Pixels, Point, ScrollStrategy, SharedString, Subscription, TestSupportExt as _,
     UniformListDecoration, UniformListScrollHandle, WeakEntity, Window,
 };
@@ -315,7 +316,10 @@ impl LibraryView {
     fn render_tile(&self, t: Tile, image: ImageState, colors: Colors, cx: &mut Context<Self>) -> AnyElement {
         let id = t.id;
         let thumb = match image {
-            ImageState::Ready(loaded) => img(loaded.image).size_full().object_fit(ObjectFit::Contain).into_any_element(),
+            // Cover, as React's `.thumb`: filling the tile's picture box, centred, cropped.
+            // Through `fitted`, not `img(..).size_full()` in the flow, which lays a frame
+            // narrower than the box out taller than it (#186).
+            ImageState::Ready(loaded) => fitted(("tile-picture", id as u64), loaded.image, ObjectFit::Cover).into_any_element(),
             ImageState::Failed(_) => {
                 let (icon, label) = layout::failed_label(t.status);
                 div()
@@ -431,6 +435,7 @@ impl LibraryView {
             .cursor_pointer()
             .child(
                 div()
+                    .id(("tile-frame", id as u64))
                     .relative()
                     .flex_1()
                     .min_h_0()
@@ -453,7 +458,8 @@ impl LibraryView {
                                 .tooltip(tip(video_tip())),
                         )
                     })
-                    .child(storage),
+                    .child(storage)
+                    .test_support(),
             )
             .child(
                 div()

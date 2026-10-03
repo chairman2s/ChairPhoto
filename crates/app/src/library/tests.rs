@@ -332,7 +332,7 @@ fn burst_analysis_never_reaches_the_new_catalog_after_the_switch_event(cx: &mut 
 
 /// The first three photos a second apart with one hash, the rest an hour or more later: one
 /// burst.
-fn make_burst(c: &chairphoto_core::catalog::Catalog, ids: &[i64]) {
+pub(super) fn make_burst(c: &chairphoto_core::catalog::Catalog, ids: &[i64]) {
     for (i, id) in ids.iter().enumerate() {
         let time = if i < 3 { format!("2026-01-01T10:00:0{i}") } else { format!("2026-01-01T{}:00:00", 11 + i) };
         c.conn().execute("UPDATE photos SET capture_time = ?1, phash = 7 WHERE id = ?2", (time.as_str(), *id)).unwrap();
@@ -386,7 +386,7 @@ fn a_superseded_burst_analysis_is_neither_persisted_nor_shown(cx: &mut TestAppCo
     assert_eq!(status(&app, cx), b_line, "the superseded run's result was shown");
 }
 
-fn stack_dialog(app: &App, cx: &mut TestAppContext) -> Entity<crate::library::stacks::StackDialog> {
+pub(super) fn stack_dialog(app: &App, cx: &mut TestAppContext) -> Entity<crate::library::stacks::StackDialog> {
     let root = app.wired.root.clone().unwrap();
     root.read_with(cx, |root, _| root.stacks.as_ref().map(|(d, _)| d.clone())).expect("the Stack dialog is open")
 }

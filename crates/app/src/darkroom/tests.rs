@@ -1308,6 +1308,28 @@ fn a_proof_cells_picture_is_laid_out_as_its_cell(cx: &mut TestAppContext) {
     .unwrap();
 }
 
+/// #186: the filmstrip's frames fill their cell inside its 2 px ring — portrait, landscape
+/// and rotated thumbnails — not a portrait element as wide as the cell and taller than it.
+#[gpui_kit::test]
+fn the_filmstrips_frames_fill_their_cell(cx: &mut TestAppContext) {
+    use crate::loupe::fit_tests::{assert_fills, store_rotated, LANDSCAPE, PORTRAIT};
+    let rig = rig_with("dk-strip-fit", 3, |rig, _| store_rotated(&rig.app, rig.ids[2]), cx);
+    let frames = [(rig.ids[0], LANDSCAPE), (rig.ids[1], PORTRAIT), (rig.ids[2], PORTRAIT)];
+    rig.render(cx);
+    for &(id, (w, h)) in &frames {
+        rig.pool.finish(&JobKey::photo(id, ImageKind::Thumb), Ok(pixels(w, h)));
+    }
+    cx.run_until_parked();
+    rig.render(cx);
+    cx.update_window(rig.app.window(), |_, window, _| {
+        for &(id, image) in &frames {
+            let cell = gpui_kit::SharedString::from(format!("dk-strip-{id}"));
+            assert_fills(&format!("strip frame {id} {image:?}"), window, cell, ("dk-strip-picture", id as u64), 2.);
+        }
+    })
+    .unwrap();
+}
+
 /// **Catalog identity.** The core switches to a catalog with colliding ids, the event
 /// withheld: a version operation (the cover), a history step and a preset save fail closed
 /// and touch nothing in the new catalog.

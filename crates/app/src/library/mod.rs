@@ -23,6 +23,8 @@ pub mod photo_actions;
 pub mod stacks;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod fit_tests;
 
 use crate::keymap::contexts;
 use gpui_kit::{actions, KeyBinding};

@@ -152,6 +152,41 @@ fn the_action_opens_the_dialog_over_the_selection(cx: &mut TestAppContext) {
     view.read_with(cx, |d, _| assert_eq!(d.order.len(), 1));
 }
 
+/// #186: the strip's 72×54 tiles are filled by their thumbnail inside their 1 px border,
+/// portrait and landscape — not a portrait element taller than the tile.
+#[gpui_kit::test]
+fn the_strips_tiles_are_filled_by_their_thumbnail(cx: &mut TestAppContext) {
+    use crate::image_tests::{pixels, FakePool};
+    use crate::loupe::fit_tests::{assert_fills, LANDSCAPE, PORTRAIT};
+    use chairphoto_core::image_pool::{ImageKind, JobKey};
+    let dir = TempDir::new("slideshow-fit");
+    let pool = Arc::new(FakePool::default());
+    let app = crate::tests::start_with_pool(cx, pool.clone());
+    catalog_with_files(&app, &dir, 2, cx);
+    // As the module opens it: with the image layer.
+    let view = cx
+        .update_window(app.window(), |_, window, cx| {
+            let host = DialogHost::new(&app.wired.model, &app.wired.shell, Some(app.wired.images.clone()), cx);
+            super::open(host, backend(None), window, cx)
+        })
+        .unwrap();
+    cx.run_until_parked();
+    let order: Vec<i64> = view.read_with(cx, |d, _| d.order.iter().map(|p| p.id).collect());
+    let frames = [PORTRAIT, LANDSCAPE];
+    for (&id, &(w, h)) in order.iter().zip(&frames) {
+        pool.finish(&JobKey::photo(id, ImageKind::Thumb), Ok(pixels(w, h)));
+    }
+    cx.run_until_parked();
+    cx.update_window(app.window(), |_, window, cx| {
+        window.render_frame(cx);
+        for (i, image) in frames.iter().enumerate() {
+            let what = format!("slideshow tile {i} {image:?}");
+            assert_fills(&what, window, ("slideshow-tile", i), ("slideshow-picture", i), 1.);
+        }
+    })
+    .unwrap();
+}
+
 /// Render → the movie: the claim and the run go to the worker in turn, the movie lands in the
 /// chosen folder (never over an earlier one), the dialog shows it, and the originals are
 /// untouched. Drag-reordering changes the play order the job gets.

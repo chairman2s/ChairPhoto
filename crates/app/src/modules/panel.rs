@@ -13,7 +13,7 @@ use super::registry::ModuleRegistry;
 use super::{PanelSlot, PublishTarget};
 use std::collections::HashMap;
 use crate::shell::style::Colors;
-use gpui_kit::component::checkbox::Checkbox;
+use crate::storage::ui;
 use gpui_kit::component::{Disableable as _, WindowExt as _};
 use gpui_kit::prelude::*;
 use gpui_kit::{div, px, AnyElement, AnyView, App, Context, Entity, FontWeight, SharedString, Subscription, TestSupportExt as _, Window};
@@ -82,8 +82,7 @@ impl Render for ModulesPanel {
             if let (true, Some(reason), true) = (!m.enabled, m.blocked_reason.clone(), m.backend_available) {
                 info = info.child(div().text_color(colors.danger).child(reason));
             }
-            let toggle = Checkbox::new(SharedString::from(format!("module-toggle-{}", m.id)))
-                .label("enabled")
+            let toggle = ui::checkbox(SharedString::from(format!("module-toggle-{}", m.id)), "enabled")
                 .checked(m.enabled)
                 .disabled(blocked)
                 .on_change(move |checked, _, cx| {

@@ -12,8 +12,9 @@ use chairphoto_core::catalog::{Album, SmartAlbum};
 use gpui_kit::prelude::*;
 use gpui_kit::{div, px, AnyElement, Context, SharedString, Stateful, Div, TestSupportExt as _};
 
-/// A row's small icon button (`.tag-edit`).
-fn icon(id: String, glyph: &'static str, tip: String, colors: Colors) -> Stateful<Div> {
+/// A row's small icon button (`.tag-edit`). `glyph` is its only text: a second text child
+/// would lay out on a line of its own, below the row (#180).
+fn icon(id: String, glyph: impl Into<SharedString>, tip: String, colors: Colors) -> Stateful<Div> {
     div()
         .id(SharedString::from(id))
         .flex_none()
@@ -22,7 +23,7 @@ fn icon(id: String, glyph: &'static str, tip: String, colors: Colors) -> Statefu
         .text_color(colors.mute)
         .cursor_pointer()
         .hover(|s| s.text_color(colors.txt))
-        .child(glyph)
+        .child(glyph.into())
         .tooltip(move |window, cx| gpui_kit::component::tooltip::Tooltip::new(tip.clone()).build(window, cx))
 }
 
@@ -112,8 +113,7 @@ fn album_row(album: &Album, on: bool, selected: usize, colors: Colors, cx: &Cont
         )
         .when(selected > 0, |r| {
             r.child(
-                icon(format!("album-add-{id}"), "", format!("Add {selected} selected photo(s) to {}", a1.name), colors)
-                    .child(format!("+{selected}"))
+                icon(format!("album-add-{id}"), format!("+{selected}"), format!("Add {selected} selected photo(s) to {}", a1.name), colors)
                     .text_color(colors.accent)
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.albums.update(cx, |a, cx| a.add_selection(id, cx));

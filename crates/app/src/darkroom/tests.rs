@@ -597,6 +597,33 @@ fn luts_are_chosen_and_imported(cx: &mut TestAppContext) {
     assert_eq!(rig.darkroom(cx).read_with(cx, |d, _| d.luts.clone()), ["Portra.cube", "film.cube"]);
 }
 
+/// #180: a LUT whose name is wider than the rail is a chip cut to the rail's width (its label
+/// ellipsised, the whole name in the tooltip), not one running past the rail's edge.
+///
+/// Mutation-checked: with the plain `chip` the long LUT's chip is wider than the rail.
+#[gpui_kit::test]
+fn a_long_lut_name_stays_inside_the_rail(cx: &mut TestAppContext) {
+    const LONG: &str = "Kodak_2383_Base_Lut_Rec.709_2.4_IG_ashikulisl_extended_contrast_v3";
+    let rig = rig_with(
+        "dk-lut-long",
+        1,
+        |rig, _| std::fs::write(rig.dir.0.join("luts").join(format!("{LONG}.cube")), "").unwrap(),
+        cx,
+    );
+    assert_eq!(rig.darkroom(cx).read_with(cx, |d, _| d.luts.clone()), [format!("{LONG}.cube"), "film.cube".into()]);
+    rig.render(cx);
+    let (row, chip, short) = cx
+        .update_window(rig.app.window(), |_, window, _| {
+            (window.find("dk-luts").bounds(), window.find("dk-lut-0").bounds(), window.find("dk-lut-1").bounds())
+        })
+        .unwrap();
+    // The rail is 280 px with 12 px padding: its content is 256 px wide.
+    assert!(row.size.width <= gpui_kit::px(256.), "the LUT row fits the rail: {row:?}");
+    assert!(chip.right() <= row.right(), "the long LUT's chip ends inside the rail: {chip:?} in {row:?}");
+    assert!(chip.left() >= row.left(), "{chip:?} in {row:?}");
+    assert!(short.size.width < chip.size.width, "a short name keeps its own width: {short:?}");
+}
+
 /// **Forced interleaving.** A LUT import on one photo is overtaken by a step: the next
 /// photo's open (and its listing of the LUT folder) runs first, then the copy lands. The list
 /// — the folder's, not the photo's — still gains the import; the selection is applied to

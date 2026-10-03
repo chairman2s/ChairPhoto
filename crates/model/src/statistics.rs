@@ -517,6 +517,21 @@ impl Timeline {
     pub fn peak_readout(&self) -> String {
         format!("Peak {}", grouped(self.peak))
     }
+
+    /// The points the chart plots. React draws a lone point as a level line across the whole
+    /// chart (`M 0 y L W y`) with its tick and hover dot at `W / 2`; an area chart draws
+    /// nothing for one point, so a lone point is plotted three times — the line's two ends
+    /// with no tick, and the point itself, tick and all, in the middle. Any other count is
+    /// plotted as is.
+    pub fn plotted(&self) -> Vec<TimelinePoint> {
+        match self.points.as_slice() {
+            [only] => {
+                let end = TimelinePoint { tick: String::new(), ..only.clone() };
+                vec![end.clone(), only.clone(), end]
+            }
+            points => points.to_vec(),
+        }
+    }
 }
 
 /// Vertical bars (`VBars`): empty `values` (or all zero) render "No data".

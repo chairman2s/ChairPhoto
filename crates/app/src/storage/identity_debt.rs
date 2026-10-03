@@ -92,6 +92,10 @@ impl IdentityDebtPanel {
                 this.owed_page = 0;
                 this.owed_result = None;
                 this.owed_error = None;
+                // An action on the old list may still be in flight (waiting for a long-held
+                // turn); it fails closed and its answer is dropped, so it must not keep the
+                // new list's buttons disabled (review of #153, N2).
+                this.owed_busy = None;
                 this.reload_summary(cx);
                 this.reload_owed(cx);
             }
@@ -241,10 +245,12 @@ impl IdentityDebtPanel {
         cx.spawn(async move |this, cx| {
             let result = rx.await.unwrap_or_else(|_| Err("the owed-IPTC worker stopped".into()));
             this.update(cx, |s, cx| {
-                s.owed_busy = None;
+                // An answer from before a catalog switch touches nothing: the switch freed the
+                // buttons, and an action on the new catalog's list may be in flight now.
                 if s.storage.read(cx).epoch() != epoch {
                     return;
                 }
+                s.owed_busy = None;
                 match result {
                     Ok(done) => {
                         s.owed_result = Some(owed_action_message(&done));

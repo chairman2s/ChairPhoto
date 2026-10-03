@@ -1022,6 +1022,36 @@ fn an_owed_click_in_the_frame_after_a_switch_never_reaches_the_new_catalog(cx: &
     assert_eq!(still_owed(&app), b_ids, "B's debt was dismissed by a click on A's row");
 }
 
+/// Review of #153, N2: a Retry from catalog A still in flight (waiting for its worker, or a
+/// long-held turn) does not keep B's buttons disabled after `catalog:switched`; and when A's
+/// answer finally lands it does not clear the busy flag of an action started on B's list.
+#[gpui_kit::test]
+fn a_switch_frees_the_owed_buttons_and_a_stale_answer_leaves_the_new_action_busy(cx: &mut TestAppContext) {
+    let dir = TempDir::new("debt-owed-busy");
+    let app = start(cx);
+    catalog_owing_iptc(&app, &dir, 1, cx);
+    let panel = open_debt_panel(&app, cx);
+    click(&app, "owed-retry-0", cx); // queued on the manual runner: in flight
+    panel.read_with(cx, |p, _| assert!(p.owed_busy.is_some(), "the precondition: A's Retry is in flight"));
+
+    let (b, b_ids) = colliding_catalog(&dir, "b", 1);
+    std::fs::create_dir_all(dir.0.join("b/2026")).unwrap();
+    std::fs::write(dir.0.join("b/2026/b0.ARW"), b"raw").unwrap();
+    b.set_iptc(b_ids[0], &chairphoto_core::catalog::IptcFields { title: "B's".into(), ..Default::default() }).unwrap();
+    core_switch(&app, b);
+    deliver_switch(&app, cx);
+    panel.read_with(cx, |p, _| assert_eq!(p.owed_busy, None, "B's buttons are free"));
+
+    // An action on B's list is in flight (marked as `act_on_owed` marks it) when A's Retry
+    // finally runs (failing closed: CATALOG_CHANGED) and its answer lands.
+    panel.update(cx, |p, _| p.owed_busy = Some(b_ids[0]));
+    work(cx);
+    panel.read_with(cx, |p, _| {
+        assert_eq!(p.owed_busy, Some(b_ids[0]), "A's stale answer cleared B's busy flag");
+        assert!(p.owed_error.is_none(), "A's stale answer was shown on B's list");
+    });
+}
+
 #[gpui_kit::test]
 fn an_owed_dismiss_never_reaches_the_new_catalog_before_the_switch_event(cx: &mut TestAppContext) {
     owed_action_across_a_switch(false, false, cx);

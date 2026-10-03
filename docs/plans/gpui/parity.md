@@ -474,8 +474,9 @@ These are outside the rows' missing features, read from code and not run:
   dropped GlSpike part).
 - The stale editor list is fixed: a save in Preferences → Editors (a path, RapidRAW's binary or
   format) emits `model::EditorsChanged`, and the inspector re-reads its "Edit in" list; only
-  the newest read lands. A save whose completion lands after its section was dropped (a tab
-  switched within the worker's run) still leaves the list stale until the next save or switch.
+  the newest read lands. The notice is sent from the save's completion whether or not the
+  Editors section still exists (saves fire on blur, so a tab switch or closing Preferences
+  usually comes first; review L3, `Ctx::write_setting_landed`).
 - File pickers: GPUI cannot filter (`PathPromptOptions` has no filter field and the Linux portal
   request sets none, gpui-pre-linux 0.3.7 `prompt_for_paths`), so the chosen file is validated
   instead. Correction to the audit: React filtered only the bundle picker (`pickBundleFile`,

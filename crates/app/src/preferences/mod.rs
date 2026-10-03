@@ -180,11 +180,25 @@ impl Ctx {
         work: impl FnOnce(&Scope) -> R + Send + 'static,
         apply: impl FnOnce(&mut V, R, &mut Context<V>) + 'static,
     ) {
+        self.run_landed(cx, work, |_, _| {}, apply);
+    }
+
+    /// [`run`](Self::run), with `landed` called first on the UI thread whenever the work
+    /// finishes — **also when the section is gone** (its tab switched, Preferences closed) —
+    /// for what must not depend on the section, such as telling the rest of the app.
+    fn run_landed<V: 'static, R: Send + 'static>(
+        &self,
+        cx: &mut Context<V>,
+        work: impl FnOnce(&Scope) -> R + Send + 'static,
+        landed: impl FnOnce(&R, &mut App) + 'static,
+        apply: impl FnOnce(&mut V, R, &mut Context<V>) + 'static,
+    ) {
         let scope = self.scope();
         let rx = Runner::get(cx).run(move || work(&scope));
         let ctx = self.clone();
         cx.spawn(async move |this, cx| {
             let Ok(result) = rx.await else { return };
+            cx.update(|cx| landed(&result, cx));
             this.update(cx, |view, cx| {
                 if ctx.live(cx) {
                     apply(view, result, cx);
@@ -239,6 +253,21 @@ impl Ctx {
         after: impl FnOnce(&Scope) -> Result<R, String> + Send + 'static,
         apply: impl FnOnce(&mut V, Result<(Option<String>, R), String>, &mut Context<V>) + 'static,
     ) {
+        self.write_setting_landed(cx, key, value, after, |_, _| {}, apply);
+    }
+
+    /// [`write_setting`](Self::write_setting), with `landed` called with the outcome of every
+    /// write of it once the worker has run — whether or not the section still exists, and
+    /// whether or not a newer write of the key was made since ([`run_landed`](Self::run_landed)).
+    pub fn write_setting_landed<V: 'static, R: Send + 'static>(
+        &self,
+        cx: &mut Context<V>,
+        key: impl Into<String>,
+        value: String,
+        after: impl FnOnce(&Scope) -> Result<R, String> + Send + 'static,
+        landed: impl FnOnce(&Result<(Option<String>, R), String>, &mut App) + 'static,
+        apply: impl FnOnce(&mut V, Result<(Option<String>, R), String>, &mut Context<V>) + 'static,
+    ) {
         let key: String = key.into();
         let writes = cx.default_global::<SettingWrites>();
         writes.seq += 1;
@@ -246,7 +275,7 @@ impl Ctx {
         writes.issued.insert(key.clone(), seq);
         let persisted = writes.persisted.clone();
         let k = key.clone();
-        self.run(
+        self.run_landed(
             cx,
             move |scope| {
                 let stored = scope.catalog(|c| {
@@ -261,6 +290,7 @@ impl Ctx {
                 })?;
                 Ok((stored, after(scope)?))
             },
+            landed,
             move |view, result, cx| {
                 let newest = cx.try_global::<SettingWrites>().and_then(|w| w.issued.get(&key).copied());
                 if newest == Some(seq) {

@@ -8,10 +8,10 @@
 //! `develop.decodeCacheGb`, `develop.preloadNeighbours`, `develop.wbSlider`,
 //! `metrics.exportParity`, `editor.renderTiming`, `editor.renderTiming.lastSummary`.
 //!
-//! A saved editor path, RapidRAW binary or format tells the model ([`AppModel::editors_changed`],
-//! from the save's completion), and the inspector re-checks its "Edit in" list. The completion
-//! lands only while this section is shown (`Ctx::run`): a tab switched away within the worker's
-//! few milliseconds leaves the list as it was until the next save or catalog switch.
+//! A saved editor path, RapidRAW binary or format tells the model ([`AppModel::editors_changed`])
+//! once its worker has run, and the inspector re-checks its "Edit in" list. The notice does
+//! not depend on this section (`Ctx::write_setting_landed`): saves happen on blur, so the
+//! section is often gone by then — its tab switched, Preferences closed.
 //!
 //! [`AppModel::editors_changed`]: crate::model::AppModel::editors_changed
 
@@ -110,6 +110,18 @@ fn read_editors(scope: &Scope) -> Result<EditorsRead, String> {
     Ok(EditorsRead { editors, rapidraw, rapidraw_bin })
 }
 
+/// What an editor save does once its worker has run, whether or not the section is still
+/// shown: on success, tell the model ([`AppModel::editors_changed`]), so the inspector re-reads
+/// its "Edit in" list.
+fn announce<T>(ctx: &Ctx) -> impl FnOnce(&Result<T, String>, &mut gpui_kit::App) + 'static {
+    let model = ctx.model.clone();
+    move |result, cx| {
+        if result.is_ok() {
+            model.update(cx, |m, cx| m.editors_changed(cx));
+        }
+    }
+}
+
 pub struct EditorsSection {
     ctx: Ctx,
     /// The editors and whether their GUI / CLI is found.
@@ -181,16 +193,16 @@ impl EditorsSection {
     /// Save one path (blank = the auto-detected command on PATH), then re-check availability.
     pub fn save(&mut self, key: &str, which: &str, value: String, cx: &mut Context<Self>) {
         let ctx = self.ctx.clone();
-        ctx.write_setting(
+        ctx.write_setting_landed(
             cx,
             format!("editor.{key}.{which}"),
             value.trim().to_string(),
             |scope| available_editors(scope.state()),
-            |s: &mut Self, result, cx| match result {
+            announce(&ctx),
+            |s: &mut Self, result, _| match result {
                 Ok((_, editors)) => {
                     s.editors = editors;
                     s.status = Some("Saved.".into());
-                    s.ctx.model.update(cx, |m, cx| m.editors_changed(cx));
                 }
                 Err(e) => s.status = Some(e),
             },
@@ -202,19 +214,19 @@ impl EditorsSection {
     /// write has persisted.
     pub fn save_rapidraw(&mut self, key: &'static str, value: String, cx: &mut Context<Self>) {
         let ctx = self.ctx.clone();
-        ctx.write_setting(
+        ctx.write_setting_landed(
             cx,
             key,
             value.trim().to_string(),
             |scope| rapidraw_available(scope.state()),
-            move |s: &mut Self, result, cx| match result {
+            announce(&ctx),
+            move |s: &mut Self, result, _| match result {
                 Ok((_, st)) => {
                     s.rapidraw_found = st.available;
                     if key == RAPIDRAW_FORMAT_KEY {
                         s.rapidraw_format = st.format;
                     }
                     s.status = Some("Saved.".into());
-                    s.ctx.model.update(cx, |m, cx| m.editors_changed(cx));
                 }
                 Err(e) => s.status = Some(e),
             },

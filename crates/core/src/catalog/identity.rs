@@ -234,8 +234,19 @@ fn is_blank_identity(value: &str) -> bool {
 /// Remember that `photo_id` once was `value`, when `value` is a legacy non-UUID identifier,
 /// so a scan can still lead a file whose sidecar carries it back to the row
 /// ([`Catalog::scan_identity`]). A photo keeps the first legacy value it was recorded with.
+///
+/// A value another row already holds is not recorded again (#150, review N3 of #146). The
+/// first row to hold it is the one a person saw it on: v23's re-mint of the row that had it,
+/// or the first file a scan found carrying it. A later holder is a duplicate — the v5 row an
+/// old build's merge left beside a row that v23 then kept apart with a v4 — or another file
+/// sharing a DAM id. Recording it there too would leave the value with two owners, which
+/// [`Catalog::scan_identity`] rightly refuses to choose between, so the real original would
+/// be catalogued again the next time it moved.
 pub(super) const RECORD_LEGACY_IDENTIFIER_SQL: &str =
-    "INSERT INTO photo_legacy_identifiers(photo_id, identifier) VALUES(?1, ?2)
+    "INSERT INTO photo_legacy_identifiers(photo_id, identifier)
+     SELECT ?1, ?2
+     WHERE NOT EXISTS (SELECT 1 FROM photo_legacy_identifiers
+                       WHERE identifier = ?2 AND photo_id <> ?1)
      ON CONFLICT(photo_id) DO NOTHING";
 
 /// Prefixes of `settings` keys that end in a photo's uuid, which a migration that changes the

@@ -248,7 +248,10 @@ Otherwise the file is a different photo and gets its own row, as above.
 A scan that mints a UUID for a file whose sidecar holds such a foreign value records it the
 same way (#150), so a file catalogued after #141 re-homes under the same guards when it
 moves. The value is recorded whichever way the scan matched the row, so a row catalogued
-before #150 gains it at its next rescan.
+before #150 gains it at its next rescan. A legacy value has at most one owner: a scan, merge
+or bundle import never records a value another row already holds — the first holder is
+v23's re-mint or the first file seen carrying it, and a later one is a duplicate or another
+file sharing a DAM id. Two owners would make every scan refuse both.
 
 **A re-minted legacy identity is a UUID v5, not v4.** This is the one exception to "a UUID v4
 on first import": a photo imported fresh still gets a random v4, but a value that already

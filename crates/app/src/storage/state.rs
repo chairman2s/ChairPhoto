@@ -102,6 +102,10 @@ pub struct StorageState {
     scan: Option<(u64, u64)>,
     /// The cache warm-up followed.
     pub cache: Option<CacheJob>,
+    /// Its claim's abort flag: dropping the follow on `catalog:switched` trips it, so a
+    /// warm-up started by a rescan result that landed between the core's switch and the
+    /// event (it reads the new catalog) never runs on unfollowed.
+    cache_abort: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     /// The epoch of the back-up drain running now: overlapping triggers in one catalog start
     /// no second one (React's `reconciling` ref). A drain from before a catalog switch does
     /// not count — the switch tripped it in the core (`storage::ReconcileClaim`), so the new
@@ -140,6 +144,7 @@ impl StorageState {
             import: None,
             scan: None,
             cache: None,
+            cache_abort: None,
             reconciling: None,
             repair: RepairState::default(),
             last_dialog: None,
@@ -195,6 +200,9 @@ impl StorageState {
                 self.import = None;
                 self.scan = None;
                 self.cache = None;
+                if let Some(abort) = self.cache_abort.take() {
+                    abort.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
                 self.repair = RepairState::default();
                 cx.emit(StorageEvent::CatalogSwitched);
                 cx.notify();
@@ -366,6 +374,7 @@ impl StorageState {
         };
         let token = CacheJob { job: claim.job, epoch: self.epoch, previews: include_previews };
         self.cache = Some(token);
+        self.cache_abort = Some(claim.abort.clone());
         let state = self.app.clone();
         let rx = Runner::get(cx).run(move || cache::cache_images_claimed(&state, &claim, include_previews));
         cx.spawn(async move |this, cx| {
@@ -381,6 +390,7 @@ impl StorageState {
             return; // superseded by a newer warm-up, or by a catalog switch
         }
         self.cache = None;
+        self.cache_abort = None;
         match result {
             Ok(_) => {
                 self.status("Cache ready".into(), cx);

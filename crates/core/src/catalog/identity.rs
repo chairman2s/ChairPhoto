@@ -3443,12 +3443,22 @@ mod tests {
         // A `Catalog` owns a `rusqlite::Connection`, which is `Send` but not `Sync`, so each
         // thread gets its own — which is what a real pass and a real resolution have anyway
         // (`commands::storage` opens a secondary connection per call).
+        //
+        // Each connection waits up to 120 s for the other's write lock instead of the
+        // production 5 s. The two threads write in lockstep, and every write is an fsync; on
+        // /home (btrfs) under the full suite's IO load one of them waited past 5 s, and the
+        // pass failed with "database is locked" (SQLITE_BUSY, extended 5), at #150's base and
+        // on its branch alike. The #150 review measured 23 of 24 runs failing under IO load
+        // without this and 0 of 24 with it. That timeout is not what this test is about; the
+        // ownership of each queue row is.
+        let patient = |c: &Catalog| c.conn().busy_timeout(std::time::Duration::from_secs(120)).unwrap();
         let db_path = catalog.db_path().to_path_buf();
         let pass_root = root.clone();
         let resolver_root = root.clone();
         std::thread::scope(|s| {
             s.spawn(move || {
                 let pass = Catalog::open_secondary(&db_path, &pass_root).unwrap();
+                patient(&pass);
                 // Several passes, so a resolution can land in any of the pass's phases
                 // (planning, refresh, IO, record) rather than only in the first.
                 for _ in 0..4 {
@@ -3458,6 +3468,7 @@ mod tests {
             let resolver_db = catalog.db_path().to_path_buf();
             s.spawn(move || {
                 let resolver = Catalog::open_secondary(&resolver_db, &resolver_root).unwrap();
+                patient(&resolver);
                 for (id, volume_id, relative_path, action) in &decisions {
                     // A refusal is a legitimate outcome here (the pass may have bound the
                     // copy first, making the recorded conflict stale), so failures are not

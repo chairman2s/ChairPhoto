@@ -8,7 +8,7 @@
 
 mod albums;
 mod autotags;
-pub use autotags::{AutoTagRefusal, TagBatchOutcome};
+pub use autotags::{AutoTagRefusal, BlockedAutoTagRule, TagBatchOutcome};
 mod batches;
 pub mod culling;
 mod edits;

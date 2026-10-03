@@ -73,6 +73,32 @@ pub struct TagBatchOutcome {
     pub skipped: Vec<AutoTagRefusal>,
 }
 
+/// A rule the engine cannot turn on because its canonical path is held by a hand tag with
+/// photos the rule would not tag (#215, owner decision 2026-10-03): the tag and its photos
+/// are left exactly as they are, and the rule stays off for this catalog. The front ends
+/// show this as a notice naming the rule and the tag, with what to do about it — rename or
+/// merge `blocking_tag_id` to let the rule back in.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BlockedAutoTagRule {
+    /// Stable rule key (`tags.auto_rule`'s value once the rule does get a tag).
+    pub rule: String,
+    /// The rule's canonical path — where `blocking_tag_id` sits.
+    pub path: String,
+    pub blocking_tag_id: i64,
+}
+
+impl std::fmt::Display for BlockedAutoTagRule {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "The '{}' rule is off: '{}' already holds photos it would not tag. Rename or \
+             merge that tag to let the rule back in.",
+            self.rule, self.path
+        )
+    }
+}
+
 /// One auto-tag rule: a tag to maintain and the photos that belong to it.
 struct AutoTagRule {
     /// Stable identifier stored in `tags.auto_rule`.
@@ -87,14 +113,58 @@ struct AutoTagRule {
 
 impl Catalog {
     /// Apply all auto-tags across the catalog. Called after a scan (and exposable as a
-    /// command). Each rule's membership is rebuilt from its match query.
-    pub fn apply_auto_tags(&self) -> Result<()> {
+    /// command). Each rule's membership is rebuilt from its match query. Returns the rules
+    /// left off because their path is held by a hand tag (#215) — the front ends show this
+    /// as a notice; [`Self::blocked_auto_tag_rules`] answers the same question without
+    /// applying anything, for a panel that just wants to show current state.
+    pub fn apply_auto_tags(&self) -> Result<Vec<BlockedAutoTagRule>> {
         let rules = self.auto_tag_rules();
         self.demote_legacy_carriers(&rules)?;
+        let mut blocked = Vec::new();
         for rule in &rules {
-            self.apply_rule(rule)?;
+            if let Some(b) = self.apply_rule(rule)? {
+                blocked.push(b);
+            }
         }
-        Ok(())
+        Ok(blocked)
+    }
+
+    /// Rules currently blocked (#215), read-only: no tag carries the rule's key, and an
+    /// ordinary tag at its canonical path holds photos it would not tag. Reflects the
+    /// catalog as it stands — not necessarily the result of the last [`Self::apply_auto_tags`],
+    /// since a hand edit since then could have freed or taken the path — so a settings panel
+    /// can call it on its own schedule instead of caching the last apply's answer.
+    pub fn blocked_auto_tag_rules(&self) -> Result<Vec<BlockedAutoTagRule>> {
+        let mut out = Vec::new();
+        for rule in self.auto_tag_rules() {
+            if let Some(b) = self.rule_blocked(&rule)? {
+                out.push(b);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Whether `rule` is blocked right now: read-only, unlike [`Self::rule_tag`], which may
+    /// demote a duplicate carrier left by an earlier engine as a side effect.
+    fn rule_blocked(&self, rule: &AutoTagRule) -> Result<Option<BlockedAutoTagRule>> {
+        let has_carrier: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM tags WHERE auto_rule = ?1)",
+            params![rule.rule],
+            |r| r.get(0),
+        )?;
+        if has_carrier {
+            return Ok(None);
+        }
+        match self.path_tag(rule)? {
+            RuleTag::PathTaken => Ok(Some(BlockedAutoTagRule {
+                rule: rule.rule.to_string(),
+                path: rule.path.to_string(),
+                blocking_tag_id: self
+                    .find_tag_id_by_path(rule.path)?
+                    .expect("path_tag found a tag at this path to say PathTaken"),
+            })),
+            _ => Ok(None),
+        }
     }
 
     /// The one-time step that hands a catalog from the path-keyed engine to the key-keyed one
@@ -248,7 +318,9 @@ impl Catalog {
     /// Rebuild one auto-tag's membership from its match query. Creates the tag (with
     /// export hashtags) on first match; if there are no matches and the tag doesn't
     /// exist yet, does nothing (no empty placeholder).
-    fn apply_rule(&self, rule: &AutoTagRule) -> Result<()> {
+    /// Returns the blocked-rule notice (#215) when the path is held by a hand tag; `None`
+    /// otherwise, whether or not the rule ended up with a tag.
+    fn apply_rule(&self, rule: &AutoTagRule) -> Result<Option<BlockedAutoTagRule>> {
         let any: bool = self.conn.query_row(
             &format!("SELECT EXISTS({})", rule.match_select),
             [],
@@ -258,8 +330,16 @@ impl Catalog {
         let tag_id = match self.rule_tag(rule)? {
             RuleTag::Found(id) => id,
             // The path holds a tag the rule must not take: the rule goes without one.
-            RuleTag::PathTaken => return Ok(()),
-            RuleTag::None if !any => return Ok(()),
+            RuleTag::PathTaken => {
+                return Ok(Some(BlockedAutoTagRule {
+                    rule: rule.rule.to_string(),
+                    path: rule.path.to_string(),
+                    blocking_tag_id: self
+                        .find_tag_id_by_path(rule.path)?
+                        .expect("rule_tag found a tag at this path to say PathTaken"),
+                }))
+            }
+            RuleTag::None if !any => return Ok(None),
             RuleTag::None => self.ensure_auto_tag(rule)?,
         };
         // Make sure the rule + export hashtags are set even on a pre-existing tag.
@@ -276,7 +356,7 @@ impl Catalog {
             ),
             params![tag_id, now()],
         )?;
-        Ok(())
+        Ok(None)
     }
 
     /// The tag `rule` maintains. **A rule's identity is its key (`tags.auto_rule`), not its
@@ -641,6 +721,44 @@ mod tests {
         let back = c.find_tag_id_by_path(LONG_EXPOSURE).unwrap().expect("back at its path");
         assert_eq!(carriers(&c), vec![back]);
         assert!(has(&c, long, back), "holding every match");
+    }
+
+    /// #215 (owner decision 2026-10-03): a hand tag at the rule's path holding a photo the
+    /// rule would not tag blocks the rule (`RuleTag::PathTaken`) — and this is now reported,
+    /// not silent. `apply_auto_tags` returns the block; `blocked_auto_tag_rules` answers the
+    /// same question read-only, without applying anything. Freeing the path (merging the
+    /// hand tag away) turns the rule back on the next pass.
+    #[test]
+    fn a_path_taken_by_a_hand_tag_is_reported_as_blocked() {
+        let (c, root) = temp_catalog("autotag-blocked");
+        let other = photo(&c, &root, "fast.arw", "1/200", "2026-09-01T12:00:00"); // not a match
+        let hand = c.create_tag(LONG_EXPOSURE).unwrap();
+        c.assign_tag(other, hand).unwrap();
+
+        let long = photo(&c, &root, "long.arw", "30", "2026-09-01T12:00:30"); // would match
+        let blocked = c.apply_auto_tags().unwrap();
+        assert_eq!(blocked.len(), 1, "{blocked:?}");
+        assert_eq!(
+            (blocked[0].rule.as_str(), blocked[0].path.as_str(), blocked[0].blocking_tag_id),
+            ("long-exposure", LONG_EXPOSURE, hand)
+        );
+
+        // The hand tag is untouched: still holds its own photo, never the rule's.
+        assert!(has(&c, other, hand), "the hand tag keeps its photo");
+        assert!(!has(&c, long, hand), "and never takes the rule's");
+        assert_eq!(c.find_tag_id_by_path(LONG_EXPOSURE).unwrap(), Some(hand), "no second tag created at the path");
+
+        // The read-only query agrees, without needing another apply.
+        assert_eq!(c.blocked_auto_tag_rules().unwrap(), blocked);
+
+        // Freeing the path (merging the hand tag away) turns the rule back on next pass.
+        let elsewhere = c.create_tag("Methods/Hand").unwrap();
+        crate::catalog::tag_maintenance::merge_tags(&c.conn, &[hand], elsewhere, 1).unwrap();
+        let blocked2 = c.apply_auto_tags().unwrap();
+        assert!(blocked2.is_empty(), "{blocked2:?}");
+        assert!(c.blocked_auto_tag_rules().unwrap().is_empty());
+        let auto = c.find_tag_id_by_path(LONG_EXPOSURE).unwrap().expect("the rule got its tag");
+        assert!(has(&c, long, auto), "membership is rebuilt once the rule has a tag");
     }
 
     /// Review #181 r2 L2 (probe P5): the long-exposure tag moved and renamed onto the

@@ -494,6 +494,55 @@ fn merge_x_away_opens_the_merge_preview_over_preferences(cx: &mut TestAppContext
     assert!(present(&app, "prefs-tab-tags", cx), "Preferences stayed open");
 }
 
+/// #215 (owner decision 2026-10-03): a hand tag at an auto-tag rule's path, holding a photo
+/// the rule would not tag, blocks the rule — the Tags tab shows a notice naming the rule and
+/// the tag, with "Merge '<path>' away…" reusing the same merge preview as "Merge X away…".
+/// Merging it away frees the path, and the section's next read drops the notice.
+#[gpui_kit::test]
+fn a_blocked_auto_tag_rule_shows_a_notice_and_merging_the_tag_away_clears_it(cx: &mut TestAppContext) {
+    let dir = TempDir::new("prefs-tags-blocked");
+    let app = start(cx);
+    let ids = open_catalog_with_photos(&app, &dir, 1, cx);
+    let (hand, elsewhere) = {
+        let guard = app.state.catalog.lock().unwrap();
+        let c = guard.as_ref().unwrap();
+        let hand = c.create_tag("Technique/Long Exposure").unwrap();
+        c.assign_tag(ids[0], hand).unwrap(); // not a long exposure: an ordinary photo
+        let elsewhere = c.create_tag("Methods/Hand").unwrap();
+        (hand, elsewhere)
+    };
+    // The tag tree re-reads on the model's next read, as after any catalog change.
+    app.wired.model.update(cx, |m, cx| m.refresh(cx));
+    cx.run_until_parked();
+    let p = open(&app, cx);
+    tab(&app, "prefs-tab-tags", cx);
+    let t = tags(&p, cx);
+    work(cx);
+
+    assert!(present(&app, "tags-blocked-rules", cx), "the notice is shown");
+    let button: &'static str = Box::leak(format!("tags-blocked-merge-{hand}").into_boxed_str());
+    assert!(present(&app, button, cx));
+    t.read_with(cx, |t, _| {
+        let blocked = t.blocked_rules.as_ref().expect("loaded");
+        assert_eq!(blocked.len(), 1, "{blocked:?}");
+        assert_eq!((blocked[0].rule.as_str(), blocked[0].blocking_tag_id), ("long-exposure", hand));
+    });
+
+    click(&app, button, cx);
+    settle(&app, cx);
+    let merge = merge_dialog(&app, cx).expect("the merge preview opened");
+    assert_eq!(merge.read_with(cx, |m, _| m.source.tag.id), hand);
+    let target: &'static str = Box::leak(format!("tag-merge-into-{elsewhere}").into_boxed_str());
+    click(&app, target, cx);
+    click(&app, "tag-merge-commit", cx);
+    drop(merge);
+    cx.run_until_parked();
+    work(cx);
+
+    assert!(!present(&app, "tags-blocked-rules", cx), "the notice clears once the path is free");
+    t.read_with(cx, |t, _| assert!(t.blocked_rules.as_ref().expect("reloaded").is_empty()));
+}
+
 /// **Catalog identity.** The pairs' ids are the section's catalog's: "Merge X away…" opens
 /// nothing while the tag tree is not that catalog's (superseded, not yet re-read), nor from a
 /// section a delivered switch has replaced. With the switch undelivered, the preview opens

@@ -16,7 +16,7 @@ use crate::shell::style::Colors;
 use crate::storage::{ui, Runner};
 use crate::tags::TagsState;
 use chairphoto_core::catalog::tag_maintenance::{self, OrphanTag, SimilarTagPair, TagMergeReport, DEFAULT_MIN_SIMILARITY};
-use chairphoto_core::catalog::TagWithCount;
+use chairphoto_core::catalog::{BlockedAutoTagRule, TagWithCount};
 use chairphoto_model::tag_tree::merge_summary;
 use gpui_kit::prelude::*;
 use gpui_kit::TestSupportExt as _;
@@ -50,14 +50,40 @@ pub struct TagMaintenance {
     pub duplicates: Option<Vec<SimilarTagPair>>,
     pub orphans: Option<Vec<OrphanTag>>,
     pub busy: Option<Looking>,
+    /// Rules currently off because their path is held by a hand tag (#215), `None` until the
+    /// first read lands. Read-only: `Catalog::blocked_auto_tag_rules` applies nothing.
+    pub blocked_rules: Option<Vec<BlockedAutoTagRule>>,
     _tree: Subscription,
 }
 
 impl TagMaintenance {
     pub fn new(ctx: Ctx, tags: Entity<TagsState>, cx: &mut Context<Self>) -> Self {
-        // A pair's buttons are live only while its tag is in the tree: follow the tree.
-        let _tree = cx.observe(&tags, |_, _, cx| cx.notify());
-        TagMaintenance { ctx, tags, status: None, duplicates: None, orphans: None, busy: None, _tree }
+        // A pair's buttons are live only while its tag is in the tree: follow the tree. A
+        // rename or merge done elsewhere (the tag panel, not this section) can free or take a
+        // rule's path, so re-check the blocked list whenever the tree does.
+        let _tree = cx.observe(&tags, |s: &mut Self, _, cx| {
+            s.refresh_blocked_rules(cx);
+            cx.notify();
+        });
+        let mut this =
+            TagMaintenance { ctx, tags, status: None, duplicates: None, orphans: None, busy: None, blocked_rules: None, _tree };
+        this.refresh_blocked_rules(cx);
+        this
+    }
+
+    /// Re-read which rules are blocked right now (#215): on open, after a merge made from
+    /// this section, and whenever the tag tree changes underneath it.
+    fn refresh_blocked_rules(&mut self, cx: &mut Context<Self>) {
+        self.ctx.run(
+            cx,
+            |scope| scope.catalog(|c| c.blocked_auto_tag_rules()),
+            |s: &mut Self, result, cx| {
+                if let Ok(rules) = result {
+                    s.blocked_rules = Some(rules);
+                    cx.notify();
+                }
+            },
+        );
     }
 
     /// The tree's record of `tag_id` — only while the tree is the one of the catalog this
@@ -145,6 +171,7 @@ impl TagMaintenance {
         self.status = Some(merge_summary(report));
         self.duplicates = None;
         self.orphans = None;
+        self.refresh_blocked_rules(cx);
         cx.notify();
     }
 
@@ -209,7 +236,36 @@ impl Render for TagMaintenance {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = Colors::get(cx);
         let idle = self.busy.is_none();
-        let mut body = section("prefs-tags", "Tidy tags", colors)
+        let mut body = section("prefs-tags", "Tidy tags", colors);
+        if let Some(blocked) = self.blocked_rules.clone().filter(|b| !b.is_empty()) {
+            let mut list = div().id("tags-blocked-rules").flex().flex_col().gap(px(6.)).mb(px(10.));
+            for b in &blocked {
+                let (tag_id, path) = (b.blocking_tag_id, b.path.clone());
+                let live = self.tree_tag(tag_id, cx).is_ok();
+                list = list.child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(3.))
+                        .child(ui::row().child(badge("auto-tag off", colors)).child(div().text_color(colors.txt).child(path.clone())))
+                        .child(ui::sub(
+                            format!(
+                                "The '{}' rule is off: '{path}' already holds photos it would not tag. Rename it, \
+                                 or merge it into another tag, to let the rule back in.",
+                                b.rule
+                            ),
+                            colors,
+                        ))
+                        .child(ui::row().child(ui::clickable(
+                            ui::chip(SharedString::from(format!("tags-blocked-merge-{tag_id}")), format!("Merge '{path}' away…"), live, colors),
+                            live,
+                            cx.listener(move |s, _, _, cx| s.merge(tag_id, cx)),
+                        ))),
+                );
+            }
+            body = body.child(heading("Blocked auto-tag rules", colors)).child(list.test_support());
+        }
+        let mut body = body
             .child(ui::sub(
                 "Remove redundant ancestor tags across your library — when a photo has a more specific tag (e.g. \
                  Harbor/Marina), the parent it implies (Harbor) is dropped. New tagging keeps tags to leaves automatically.",

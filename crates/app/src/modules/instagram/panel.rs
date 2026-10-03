@@ -15,7 +15,6 @@ use chairphoto_core::app::instagram::{self as core_instagram, InstagramDriver, P
 use chairphoto_core::app::publications::record_publications_as;
 use chairphoto_core::app::uploads::{claim_upload, UPLOAD_CANCELLED};
 use chairphoto_core::app::CatalogIdentity;
-use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::input::{InputEvent, Textarea, TextareaState};
 use gpui_kit::prelude::*;
 use gpui_kit::{div, px, AsyncApp, Context, Entity, Subscription, TestSupportExt as _, Window};
@@ -350,8 +349,7 @@ impl Render for InstagramPanel {
             .child(ui::label("Caption", colors))
             .child(div().id("instagram-caption").child(Textarea::new(&self.caption)).test_support())
             .child(
-                Checkbox::new("instagram-auto-publish")
-                    .label("Publish automatically (otherwise stop before Share so you can review)")
+                ui::checkbox("instagram-auto-publish", "Publish automatically (otherwise stop before Share so you can review)")
                     .checked(self.auto_publish)
                     .on_change(cx.listener(|p, checked: &bool, _, cx| {
                         p.auto_publish = *checked;

@@ -17,7 +17,7 @@ use super::session::Darkroom;
 use super::stage::FrameTier;
 use crate::image_store::ImageState;
 use crate::shell::style::Colors;
-use crate::storage::ui::{chip, clickable};
+use crate::storage::ui::{chip, clickable, truncating_chip};
 use chairphoto_core::image_pool::ImageKind;
 use chairphoto_model::darkroom::controls::{
     self as ctl, EffectKey, SliderDef, SplitKey, ToneKey, COLOR_SLIDERS, EFFECT_SLIDERS, SPLIT_SLIDERS, TONE_SLIDERS,
@@ -1007,7 +1007,7 @@ impl DarkroomView {
 
         // LUT.
         fx = fx.child(div().pt(px(8.)).text_size(px(11.)).text_color(colors.dim).child("LUT (.cube)"));
-        let mut luts = div().flex().flex_wrap().gap(px(4.));
+        let mut luts = div().id("dk-luts").flex().flex_wrap().gap(px(4.));
         let current = look.lut.value().map(|l| l.file.clone());
         luts = luts.child(clickable(on(chip("dk-lut-none", "None", true, colors), current.is_none()), true, {
             let this = this.clone();
@@ -1018,7 +1018,10 @@ impl DarkroomView {
         for (i, (file, label)) in ctl::lut_options(&d.luts, &look).into_iter().enumerate() {
             let active = current.as_deref() == Some(file.as_str());
             let this = this.clone();
-            luts = luts.child(clickable(on(chip(format!("dk-lut-{i}"), label, true, colors), active), true, move |_, _, cx| {
+            // React's `<select>` cut a long name at its edge; the chip ellipsises inside the
+            // rail and names the whole LUT in its tooltip (#180).
+            let el = truncating_chip(format!("dk-lut-{i}"), label.clone(), true, colors).tooltip(crate::tags::tip(label));
+            luts = luts.child(clickable(on(el, active), true, move |_, _, cx| {
                 let file = file.clone();
                 this.update(cx, move |v, cx| v.edit(cx, move |w, _| ctl::set_lut(w, Some(&file)))).ok();
             }));
@@ -1033,7 +1036,7 @@ impl DarkroomView {
                 }
             },
         ));
-        fx = fx.child(luts);
+        fx = fx.child(luts.test_support());
         if current.is_some() {
             fx = fx.child(self.slider_row(Control::LutAmount, &working, k, colors, cx));
         }

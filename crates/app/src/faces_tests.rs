@@ -712,6 +712,81 @@ fn the_inspector_confirms_and_names_faces(cx: &mut TestAppContext) {
     assert!(f.app.wired.shell.read_with(cx, |s, _| s.stage_view() == crate::shell::state::StageView::Grid), "Enter did not open the loupe");
 }
 
+fn reset(app: &App, face: i64) {
+    with_cat(app, |c| {
+        c.conn().execute("UPDATE faces__faces SET person_tag_id = NULL, state = 'unassigned' WHERE id = ?1", [face]).unwrap()
+    });
+}
+
+fn rejected(app: &App, face: i64, tag: i64) -> bool {
+    with_cat(app, |c| {
+        c.conn()
+            .query_row("SELECT COUNT(*) FROM faces__rejections WHERE face_id = ?1 AND person_tag_id = ?2", [face, tag], |r| {
+                r.get::<_, i64>(0)
+            })
+            .unwrap()
+            == 1
+    })
+}
+
+/// ✓ and ✕ carry the person they were drawn with (#208), in the inspector and the overlay.
+/// Behind the drawn rows a matching run resets one "Alice?" and re-suggests another as Bob:
+/// ✕ on the reset one still rejects Alice; ✓ on the re-suggested one confirms nobody and
+/// says so; ✕ on a face drawn as "Bob?" and now "Alice?" rejects nobody.
+#[gpui_kit::test]
+fn verdicts_apply_to_the_person_drawn(cx: &mut TestAppContext) {
+    use crate::modules::faces::state::{STALE_CONFIRM, STALE_REJECT};
+    cx.update(|cx| cx.set_global(MachinePrefs::in_memory()));
+    let f = open_faces(1, true, "faces-shown", cx);
+    let photo = f.ids[0];
+    let alice = with_cat(&f.app, |c| c.create_tag("People/Alice").unwrap());
+    let bob = with_cat(&f.app, |c| c.create_tag("People/Bob").unwrap());
+    let a = add_face(&f.app, photo, "[0.1,0.1,0.2,0.2]");
+    let b = add_face(&f.app, photo, "[0.5,0.5,0.2,0.2]");
+    suggest(&f.app, a, alice);
+    suggest(&f.app, b, alice);
+    f.app.wired.shell.update(cx, |s, cx| s.set_inspector_tab(InspectorTab::Tags, cx));
+    f.select(photo, cx);
+    assert_eq!(f.label(&format!("faces-insp-name-{b}"), cx).as_deref(), Some("Alice"));
+
+    // The inspector, both drawn as Alice?.
+    reset(&f.app, b);
+    suggest(&f.app, a, bob);
+    f.click(&format!("faces-insp-reject-{b}"), cx);
+    assert_eq!(face_row(&f.app, b), ("unassigned".to_string(), None));
+    assert!(rejected(&f.app, b, alice), "✕ on a reset Alice? remembers Alice");
+    // (The click re-read the rows: a is drawn as Bob? now. A run moves it back to Alice.)
+    suggest(&f.app, a, alice);
+    f.click(&format!("faces-insp-reject-{a}"), cx);
+    assert_eq!(face_row(&f.app, a), ("suggested".to_string(), Some(alice)), "drawn as Bob?: Alice is not rejected");
+    assert!(!rejected(&f.app, a, alice) && !rejected(&f.app, a, bob));
+    assert_eq!(status(&f.app, cx), STALE_REJECT);
+    // Drawn as Alice? now; re-suggested as Bob behind it.
+    suggest(&f.app, a, bob);
+    f.click(&format!("faces-insp-confirm-{a}"), cx);
+    assert_eq!(face_row(&f.app, a), ("suggested".to_string(), Some(bob)), "Bob is not confirmed");
+    assert!(!with_cat(&f.app, |c| c.get_photo_tags(photo).unwrap().iter().any(|t| t.id == bob || t.id == alice)));
+    assert_eq!(status(&f.app, cx), STALE_CONFIRM);
+
+    // The overlay: a is drawn as Bob? now.
+    // (Enter would go to the inspector chip the last click focused.)
+    f.app.wired.shell.update(cx, |s, cx| s.toggle_loupe(cx));
+    work(&f.app, cx);
+    f.pool.finish(&JobKey::photo(photo, ImageKind::Preview), Ok(pixels(400, 400)));
+    work(&f.app, cx);
+    assert_eq!(f.app.wired.shell.read_with(cx, |s, _| s.stage_view()), crate::shell::state::StageView::Loupe);
+    assert!(f.present(&format!("faces-box-{a}"), cx), "the overlay draws the face");
+    assert!(f.present(&format!("faces-confirm-{a}"), cx));
+    suggest(&f.app, a, alice);
+    f.click(&format!("faces-confirm-{a}"), cx);
+    assert_eq!(face_row(&f.app, a), ("suggested".to_string(), Some(alice)), "the overlay's ✓ confirms only Bob");
+    assert_eq!(status(&f.app, cx), STALE_CONFIRM);
+    // Drawn as Alice? now; the run resets it.
+    reset(&f.app, a);
+    f.click(&format!("faces-reject-{a}"), cx);
+    assert!(rejected(&f.app, a, alice), "the overlay's ✕ on a reset Alice? remembers Alice");
+}
+
 /// "✓✓ confirm on N" confirms the person across the selection where they were suggested and
 /// says what it did; a face write bound to the old catalog refuses the new one's colliding ids.
 #[gpui_kit::test]

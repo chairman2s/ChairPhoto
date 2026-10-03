@@ -35,7 +35,7 @@ use crate::model::{AppModel, AppModelEvent};
 use crate::modules::ModuleSettings;
 use crate::shell::ShellState;
 use crate::storage::Runner;
-use chairphoto_core::app::faces::{self as core_faces, FaceForPhoto, FacesInferenceInfo, PeopleTags};
+use chairphoto_core::app::faces::{self as core_faces, FaceForPhoto, FacesInferenceInfo, PeopleTags, ShownVerdict};
 use chairphoto_core::app::{
     with_catalog_as, with_catalog_identified, AppState, CatalogIdentity, CoreEvent, FacesIndexDone, FacesJobStatus,
     FacesMatchDone, FacesMatchJobStatus,
@@ -51,6 +51,12 @@ use std::sync::Arc;
 pub const PEOPLE_ROOT_KEY: &str = "people_root";
 pub const THRESHOLD_KEY: &str = "match_threshold";
 pub const DEFAULT_THRESHOLD: &str = "0.45";
+
+/// What ✓ and ✕ say when the face changed since it was drawn (#208): nothing was applied.
+pub const STALE_CONFIRM: &str =
+    "Faces: this face's suggestion changed (matching may be running) — nothing was confirmed; check it again.";
+pub const STALE_REJECT: &str =
+    "Faces: this face changed since it was shown (matching may be running) — nothing was rejected; check it again.";
 
 /// What the module asks of the face backend that a test must not do for real (stat or
 /// download the models, start the ONNX worker). Blocking: called on the [`Runner`].
@@ -818,12 +824,25 @@ impl FacesState {
         });
     }
 
-    pub fn accept(&mut self, face: i64, cx: &mut Context<Self>) {
-        self.face_write("confirm the face", cx, move |c| core_faces::accept(c, face), |_, _, _| {});
+    /// ✓ on a face drawn as suggested `shown` (#208): confirms that person only while the face
+    /// is still suggested as them, and says so when a matching run changed it meanwhile.
+    pub fn accept(&mut self, face: i64, shown: i64, cx: &mut Context<Self>) {
+        self.face_write("confirm the face", cx, move |c| core_faces::accept_shown(c, face, shown), |s, verdict, cx| {
+            if verdict == ShownVerdict::Stale {
+                s.status(STALE_CONFIRM, cx);
+            }
+        });
     }
 
-    pub fn reject(&mut self, face: i64, cx: &mut Context<Self>) {
-        self.face_write("reject the face", cx, move |c| core_faces::reject(c, face), |_, _, _| {});
+    /// ✕ on a face drawn with `shown` (the suggested person, `None` for no person) (#208):
+    /// rejects that person, even when a matching run has reset the suggestion meanwhile, and
+    /// never anyone else.
+    pub fn reject(&mut self, face: i64, shown: Option<i64>, cx: &mut Context<Self>) {
+        self.face_write("reject the face", cx, move |c| core_faces::reject_shown(c, face, shown), |s, verdict, cx| {
+            if verdict == ShownVerdict::Stale {
+                s.status(STALE_REJECT, cx);
+            }
+        });
     }
 
     pub fn ignore(&mut self, face: i64, cx: &mut Context<Self>) {

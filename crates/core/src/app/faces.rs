@@ -418,8 +418,54 @@ pub fn accept_person_in_catalog(
     Ok((outcome, changed))
 }
 
+/// What a verdict on a face **as it was shown** did ([`accept_shown`], [`reject_shown`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShownVerdict {
+    /// The verdict applied to the person the user saw.
+    Applied,
+    /// The face changed since it was shown — a matching run re-suggested it as someone else,
+    /// or another view decided it — so nothing was changed: the caller says so.
+    Stale,
+}
+
+/// The inspector's and loupe overlay's ✓ (#208): confirm the face **as the person shown**
+/// (`tag_id`), only while it is still suggested as them ([`matcher::accept_suggestion`], the
+/// People review queue's rule). A matching run that reset or re-suggested the face since it
+/// was drawn makes the verdict [`ShownVerdict::Stale`]: never a confirmation of someone the
+/// user did not see. When it applies, the photo is tagged in the same transaction and its
+/// regions are re-exported after the commit.
+pub fn accept_shown(c: &Catalog, face_id: i64, tag_id: i64) -> CatalogResult<ShownVerdict> {
+    let tx = c.conn().unchecked_transaction()?;
+    let Some(photo_id) = matcher::accept_suggestion(&tx, face_id, tag_id)? else {
+        return Ok(ShownVerdict::Stale);
+    };
+    c.assign_tag(photo_id, tag_id)?;
+    tx.commit()?;
+    write_regions(c, photo_id);
+    Ok(ShownVerdict::Applied)
+}
+
+/// The inspector's and loupe overlay's ✕ (#208): reject the face **as shown** — `shown` is
+/// the suggested person drawn, `None` for a face drawn with no person
+/// ([`matcher::reject_shown`]). A suggestion that a matching run has reset since it was drawn
+/// is still rejected: the pair is remembered, so the run never proposes it again. A face
+/// decided meanwhile, or suggested as someone else, is [`ShownVerdict::Stale`]: nothing
+/// changes. When it applies, the photo's regions are re-exported, as [`reject`] does.
+pub fn reject_shown(c: &Catalog, face_id: i64, shown: Option<i64>) -> CatalogResult<ShownVerdict> {
+    let photo_id = photo_of(c.conn(), face_id)?;
+    if !matcher::reject_shown(c.conn(), face_id, shown, now_secs())? {
+        return Ok(ShownVerdict::Stale);
+    }
+    if let Some(pid) = photo_id {
+        write_regions(c, pid);
+    }
+    Ok(ShownVerdict::Applied)
+}
+
 /// Reject the face's suggested person: remember the pair so it is never re-proposed, return
-/// the face to `unassigned`, and re-export the photo's (possibly smaller) confirmed set.
+/// the face to `unassigned`, and re-export the photo's (possibly smaller) confirmed set. It
+/// rejects whomever the face holds *now*; a front end that shows the person uses
+/// [`reject_shown`] (#208). (The Tauri `faces_reject`, frozen with React, still calls this.)
 pub fn reject(c: &Catalog, face_id: i64) -> CatalogResult<()> {
     let photo_id = photo_of(c.conn(), face_id)?;
     matcher::reject(c.conn(), face_id, now_secs())?;

@@ -438,6 +438,8 @@ impl Render for FaceOverlay {
                 let id = face.id;
                 let state = face.state.as_str();
                 let (suggested, ignored, rejected) = (state == "suggested", state == "ignored", state == "rejected");
+                // The person drawn as suggested, carried by ✓ and ✕ (#208).
+                let shown = face.person_tag_id.filter(|_| suggested);
                 layers.push(
                     div()
                         .id(SharedString::from(format!("faces-box-{id}")))
@@ -488,14 +490,14 @@ impl Render for FaceOverlay {
                         d.child(div().text_size(px(10.)).opacity(0.75).child(format!("{}%", (c * 100.).round() as i32)))
                     });
                 if !ignored && !rejected {
-                    if suggested {
+                    if let Some(tag) = shown {
                         chip = chip.child(self.chip_button(format!("faces-confirm-{id}"), "✓", false, colors, move |o, _, cx| {
-                            o.state.update(cx, |s, cx| s.accept(id, cx))
+                            o.state.update(cx, |s, cx| s.accept(id, tag, cx))
                         }, cx));
                     }
                     if suggested || state == "unassigned" {
                         chip = chip.child(self.chip_button(format!("faces-reject-{id}"), "✕", true, colors, move |o, _, cx| {
-                            o.state.update(cx, |s, cx| s.reject(id, cx))
+                            o.state.update(cx, |s, cx| s.reject(id, shown, cx))
                         }, cx));
                     }
                     let current = face.person_tag_id;

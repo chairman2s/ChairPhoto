@@ -310,7 +310,13 @@ previous ChairPhoto run are therefore ingested for free.
 ## Interface
 
 - **Loupe overlay** — face rectangles on the photo, each with a chip showing the assigned or
-  suggested name and confirm / reject / reassign / ignore actions.
+  suggested name and confirm / reject / reassign / ignore actions. Confirm and reject here and
+  in the inspector carry **the person the chip showed** (#208), by the review queue's rule
+  below: confirm applies only while the face is still suggested as that person, and reject
+  only while it is, or while it has no person at all — a matching run resets every pending
+  suggestion when it starts, and a reject made then is remembered against the person shown,
+  so the run does not suggest them again. Anything else (the face now suggested as someone
+  else, or decided in another view) is stale: nothing changes, and the app says so.
 - **Inspector panel** — the active photo's face list with the same per-face actions. With more
   than one photo selected, a suggested face also offers *confirm on N*: `faces_accept_person`
   confirms that person across the whole selection in one transaction. It **accepts suggestions,
@@ -322,7 +328,8 @@ previous ChairPhoto run are therefore ingested for free.
   unnamed clusters waiting to be named. Clicking a person filters to their photos, and a review
   queue supports bulk confirmation. A review verdict applies only while the face is still
   suggested as the person the queue showed, so a list read before a re-run of matching never
-  confirms someone the user did not see. Clusters can be named together as one person (a merge),
+  confirms someone the user did not see (a rejection also applies to a face the run has reset
+  to no person: the shown pair is remembered). Clusters can be named together as one person (a merge),
   and a cluster's faces can be named apart or ignored (a split); only faces still pending a
   decision change, and a cluster that a matching run has since regrouped names nothing (cluster
   ids are never reused). Clusters are rebuilt from scratch by every matching run, so merging or
@@ -330,7 +337,9 @@ previous ChairPhoto run are therefore ingested for free.
   a matching run is going, as UX only: a run regroups the clusters the view shows. The guarantee
   is in the core — every seed, suggestion and cluster write of the matcher re-checks in its own
   `UPDATE` that the face is still undecided, so a confirm, naming, assignment or ignore made
-  during a run (from any view, or the Tauri UI) is never overwritten.
+  during a run (from any view, or the Tauri UI) is never overwritten; and every seed and
+  suggestion write re-checks that the pair is not rejected, so a rejection made during a run
+  stands too.
 - **Settings** — people root, model download status, similarity threshold, and index actions
   with progress.
 

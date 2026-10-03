@@ -66,7 +66,7 @@ describe("an owed-IPTC action and paging", () => {
     await act(async () => {
       await new Promise((r) => setTimeout(r, 50));
     });
-    expect(lists.at(-1)).toBe(100);
+    expect(lists[lists.length - 1]).toBe(100);
     expect(screen.queryByTestId("owed-row-101")).toBeTruthy();
     expect(screen.queryByTestId("owed-row-1")).toBeNull();
     expect(screen.getByText(/^Showing 101–150/)).toBeTruthy();

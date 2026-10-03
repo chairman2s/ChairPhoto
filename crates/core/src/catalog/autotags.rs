@@ -91,6 +91,16 @@ impl Catalog {
         Ok(row.and_then(|(path, rule)| rule.map(|rule| AutoTagRefusal { tag_id, path, rule })))
     }
 
+    /// Whether `path` names an existing auto-tag. Suggestion lists use it to hide a pending
+    /// suggestion of one (kept from before #181, or proposed by a model anyway): it could
+    /// never be accepted, so it would never leave the list.
+    pub fn is_auto_tag_path(&self, path: &str) -> Result<bool> {
+        match self.find_tag_id_by_path(path)? {
+            Some(id) => Ok(self.auto_tag_refusal(id)?.is_some()),
+            None => Ok(false),
+        }
+    }
+
     /// `Err(`[`CatalogError::AutoTag`]`)` when `tag_id` is an auto-tag. A verb that changes
     /// other state before tagging (a face confirmation, a suggestion's state) calls this
     /// first, so a refusal leaves nothing half-done.

@@ -768,4 +768,33 @@ mod ownership {
             .unwrap();
         assert_eq!((tags, accepted), (0, 0));
     }
+
+    /// Review #181 M2: a pending suggestion of an auto-tag stored before #181 is not listed —
+    /// accepting it is refused, so it would never leave the list. It stays pending, not
+    /// rejected: a rejection is user feedback the classifiers train on.
+    #[test]
+    fn a_pending_auto_tag_suggestion_is_not_listed() {
+        let (c, _db, _root) = temp_catalog("list-auto", 1);
+        let auto = c.create_tag("Technique/Long Exposure").unwrap();
+        c.conn().execute("UPDATE tags SET auto_rule = 'long-exposure' WHERE id = ?1", [auto]).unwrap();
+        c.create_tag("Nature/Waterfall").unwrap();
+        smarttags::ensure_suggestions_schema(c.conn()).unwrap();
+        for (path, conf) in [("Technique/Long Exposure", 0.9), ("Nature/Waterfall", 0.8)] {
+            c.conn()
+                .execute(
+                    "INSERT INTO smarttags__suggestions(photo_id, path, state, confidence, created_at)
+                     VALUES (1, ?1, 'pending', ?2, 0)",
+                    rusqlite::params![path, conf],
+                )
+                .unwrap();
+        }
+
+        let listed: Vec<String> = load_suggestions(&c, 1).unwrap().into_iter().map(|s| s.path).collect();
+        assert_eq!(listed, ["Nature/Waterfall"]);
+        let state: String = c
+            .conn()
+            .query_row("SELECT state FROM smarttags__suggestions WHERE path = 'Technique/Long Exposure'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(state, "pending");
+    }
 }

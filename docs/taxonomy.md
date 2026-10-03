@@ -184,7 +184,11 @@ Design consequence — keep these on the *right* axis:
     tag. Mark/group as system-managed (e.g. a `Treatment` branch) so it isn't clutter.
   - **Manual assignment or removal is refused** (#181), since each pass rebuilds membership
     from the rule: `assign_tag`/`remove_tag` return `CatalogError::AutoTag`, and batch writes
-    (`assign_tags`/`remove_tags`) skip and report it. A per-photo exclusion list to correct a
+    (`assign_tags`/`remove_tags`) skip and report it. Nothing offers one by hand: Smart
+    Tagging never suggests or trains on an auto-tag, the AI prompt's vocabulary omits them,
+    and a pending suggestion of one (stored before #181, or proposed by a model anyway) is
+    left out of the list rather than rejected — a rejection is user feedback. Map Apply all
+    skips a fence on an auto-tag's path and applies the rest. A per-photo exclusion list to correct a
     rule's misdetection is deferred by the owner; revisit if misdetections become a problem in
     practice.
   - Because it's a tag, **filtering by it inside any album/tag just works** (the tag

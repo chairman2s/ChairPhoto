@@ -11,6 +11,12 @@
 //! one; any other surface saves and leaves — the develop session is released and the
 //! Library's rows re-read (covers and version counts may have changed).
 //!
+//! A photo opened again while a commit (or version operation) of its earlier open is still on
+//! the worker reads its versions only once that has landed (`Darkroom::finish_leaving`): the
+//! Runner is a pool that may run a newer task first, and a read that overtook the commit
+//! creating "Version 1" would show the Original and make a second "Version 1" (#189). Until
+//! the read answers its record is not editable.
+//!
 //! # The record, the stage, the save
 //!
 //! Every control produces the next record ([`Darkroom::apply`], the record maths in
@@ -156,6 +162,12 @@ pub struct OpenPhoto {
     next_label: Option<String>,
     /// The version is resolved: autosave may run.
     pub loaded: bool,
+    /// Opened while a commit or version operation of the photo's earlier open was still on
+    /// the worker (`Darkroom::leaving`): its versions are read once that lands, as a read
+    /// made now could overtake it on the pool (#189). Changes are refused until they are.
+    reopened_during_commit: bool,
+    /// While that read waits: `Some(active)`, the shell's version to resolve to then.
+    awaiting_left: Option<Option<i64>>,
     pub history: Option<VersionHistory>,
     pub source: SourceState,
     /// The version was made on engine 1 (the camera preview): it keeps rendering there.
@@ -251,9 +263,10 @@ impl OpenPhoto {
         self.committing
     }
 
-    /// Changes are taken: no operation that replaces the working record is on the worker.
+    /// Changes are taken: no operation that replaces the working record is on the worker,
+    /// and — re-opened during its earlier open's commit — the versions have been read.
     pub fn editable(&self) -> bool {
-        !self.replacing
+        !self.replacing && !(self.reopened_during_commit && !self.loaded)
     }
 }
 
@@ -433,12 +446,16 @@ impl Darkroom {
         let stage = self.new_stage(photo_id, epoch, SourceToken::Preview, None, cx);
         let _stage_observer = cx.observe(&stage, |_, _, cx| cx.notify());
         let committed_json = working.to_json();
+        let active = version.as_ref().map(|v| v.id);
+        // A commit of this photo's earlier open still on the worker: the pool may run a read
+        // made now before it, so the versions are read once it lands (`finish_leaving`).
+        let waits = self.leaving.iter().any(|o| o.photo.id == photo_id && o.from == from);
         let open = OpenPhoto {
             seq,
             photo,
             from,
             epoch,
-            version_id: version.as_ref().map(|v| v.id),
+            version_id: active,
             version_unlisted: false,
             versions_len: 0,
             versions: Vec::new(),
@@ -455,6 +472,8 @@ impl Darkroom {
             last_step: None,
             next_label: None,
             loaded: false,
+            reopened_during_commit: waits,
+            awaiting_left: waits.then_some(active),
             history: None,
             source: SourceState::default(),
             engine1_version,
@@ -476,7 +495,9 @@ impl Darkroom {
         self.error = None;
         self.rendered_changed(cx);
         self.request_strip_thumbs(cx);
-        self.resolve_version(seq, version.map(|v| v.id), cx);
+        if !waits {
+            self.resolve_version(seq, active, false, cx);
+        }
         self.open_session(seq, cx);
         self.read_settings(seq, cx);
         self.measure_auto_tone(cx);
@@ -528,8 +549,10 @@ impl Darkroom {
     }
 
     /// The shell's active version when it is this photo's, else the first, else none until
-    /// the first change; and its history.
-    fn resolve_version(&mut self, seq: u64, active: Option<i64>, cx: &mut Context<Self>) {
+    /// the first change; and its history. `waited`: read after the earlier open's commits
+    /// landed — what the open started from (the shell's copy of the version, read before
+    /// they did) may be stale, so the version's record is taken whatever its id.
+    fn resolve_version(&mut self, seq: u64, active: Option<i64>, waited: bool, cx: &mut Context<Self>) {
         let from = self.open.as_ref().map(|o| o.from).expect("open");
         let photo_id = self.open.as_ref().map(|o| o.photo.id).expect("open");
         self.run(
@@ -552,15 +575,15 @@ impl Darkroom {
                         let before = (open.source_token().map(str::to_string), open.stage_json());
                         open.versions_len = versions.len();
                         open.versions = versions;
-                        if let Some(v) = &v {
-                            if Some(v.id) != open.version_id {
-                                // Not the shell's version: adopt what this one holds.
-                                let record = parse_edit(Some(&v.edit_json));
-                                open.committed_json = record.to_json();
-                                open.committed = record.clone();
-                                open.working = record;
-                                open.last_step = None;
-                                let v = v.clone();
+                        // Not the shell's version (or the shell's copy may predate the
+                        // earlier open's commits): adopt what this one holds.
+                        if waited || v.as_ref().is_some_and(|v| Some(v.id) != open.version_id) {
+                            let record = parse_edit(v.as_ref().map(|v| v.edit_json.as_str()));
+                            open.committed_json = record.to_json();
+                            open.committed = record.clone();
+                            open.working = record;
+                            open.last_step = None;
+                            if let Some(v) = v.clone() {
                                 this.shell.update(cx, |s, cx| s.set_active_version(Some(v), cx));
                             }
                         }
@@ -1104,6 +1127,19 @@ impl Darkroom {
         let shell = self.shell.read(cx);
         if !left.dirty() && shell.surface != Surface::Develop && shell.rows_from() == Some(left.from) {
             self.shell.update(cx, |s, cx| s.refresh_rows(cx));
+        }
+        // The photo was opened again meanwhile: its versions are read now that nothing of its
+        // earlier open is left on the worker (#189).
+        let (photo_id, from) = (left.photo.id, left.from);
+        if self.leaving.iter().any(|o| o.photo.id == photo_id && o.from == from) {
+            return;
+        }
+        let waiting = self.open.as_mut().filter(|o| o.photo.id == photo_id && o.from == from).and_then(|o| {
+            let active = o.awaiting_left.take()?;
+            Some((o.seq, active))
+        });
+        if let Some((seq, active)) = waiting {
+            self.resolve_version(seq, active, true, cx);
         }
     }
 

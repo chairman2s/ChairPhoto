@@ -344,6 +344,90 @@ fn leaving_during_a_running_commit_saves_the_newer_change_after_it(cx: &mut Test
     a_change_during_a_running_commit_survives(true, cx);
 }
 
+/// **Forced interleaving** (#189). The photo is left with its commit on the worker and opened
+/// again before that commit lands; the Runner is a pool, so the re-open's reads run first
+/// here (the commit held, then released). The versions are not read until the commit has
+/// landed: meanwhile the record is not editable (a change is refused), and then the photo
+/// shows what the commit wrote. The next change goes into that version, on top of the
+/// committed record: one "Version 1", nothing lost.
+///
+/// `creating`: the commit creates "Version 1", and the photo is stepped away from and back
+/// to (→ ←) — not the Original. Else the commit writes Contrast into "Version 1", and the
+/// photo is left for the Library and developed again with the shell holding that version as
+/// read before the commit landed (as the inspector's list would) — not that stale copy.
+fn reopen_during_a_commit(creating: bool, cx: &mut TestAppContext) {
+    let rig = rig(if creating { "dk-reopen-create" } else { "dk-reopen-write" }, 2, cx);
+    let order = rig.app.wired.shell.read_with(cx, |s, _| s.library.photo_ids());
+    let p = order[0];
+    if !creating {
+        rig.slide(Control::Tone(ToneKey::Ev), 0.5, cx);
+        rig.settle_and_save(cx);
+        assert_eq!(rig.catalog(|c| c.list_versions(p).unwrap()).len(), 1);
+    }
+    let (control, value, key, want) =
+        if creating { (ToneKey::Ev, 0.5, "ev", json!(0.5)) } else { (ToneKey::Contrast, 0.3, "contrast", json!(0.3)) };
+    rig.slide(Control::Tone(control), value, cx);
+    advance(cx, AUTOSAVE_QUIET);
+    assert!(rig.darkroom(cx).read_with(cx, |d, _| d.open.as_ref().unwrap().saving), "the commit is running");
+    let held = cx.update(|cx| Runner::get(cx).hold_pending());
+    if creating {
+        assert!(rig.view(cx).update(cx, |v, cx| v.step(1, None, cx)));
+        cx.run_until_parked();
+        assert!(rig.view(cx).update(cx, |v, cx| v.step(-1, None, cx)));
+        cx.run_until_parked();
+    } else {
+        rig.app.wired.shell.update(cx, |s, cx| s.show_library(cx));
+        cx.run_until_parked();
+        work(cx); // the Library's re-read
+        let stale = rig.catalog(|c| c.list_versions(p).unwrap()).remove(0);
+        assert_ne!(serde_json::from_str::<Value>(&stale.edit_json).unwrap()["tone"]["contrast"], want, "read before the commit");
+        rig.app.wired.shell.update(cx, |s, cx| {
+            s.set_active_version(Some(stale), cx);
+            s.open_develop(cx);
+        });
+        cx.run_until_parked();
+    }
+    assert_eq!(rig.open_photo(cx), Some(p));
+    work(cx); // whatever the re-open queued runs before the held commit
+    let state = |cx: &mut TestAppContext| {
+        rig.darkroom(cx).read_with(cx, |d, _| {
+            let o = d.open.as_ref().unwrap();
+            (o.loaded, o.editable())
+        })
+    };
+    assert_eq!(state(cx), (false, false), "the versions wait for the commit; changes are refused");
+    let shown = rig.working(cx);
+    rig.slide(Control::Effect(chairphoto_model::darkroom::controls::EffectKey::Fade), 0.2, cx);
+    assert_eq!(rig.working(cx), shown, "refused, not made on a record about to be replaced");
+
+    cx.update(|cx| Runner::get(cx).release(held));
+    work(cx); // the commit lands, then the versions are read
+    assert_eq!(state(cx), (true, true));
+    let versions = rig.catalog(|c| c.list_versions(p).unwrap());
+    assert_eq!(versions.len(), 1);
+    assert_eq!(rig.version_id(cx), Some(versions[0].id), "the version the commit wrote");
+    assert_eq!(rig.working(cx)["tone"][key], want, "its record after the commit");
+
+    rig.slide(Control::Effect(chairphoto_model::darkroom::controls::EffectKey::Fade), 0.2, cx);
+    rig.settle_and_save(cx);
+    let versions = rig.catalog(|c| c.list_versions(p).unwrap());
+    let names: Vec<&str> = versions.iter().map(|v| v.name.as_str()).collect();
+    assert_eq!(names, ["Version 1"], "no second \"Version 1\"");
+    let saved: Value = serde_json::from_str(&versions[0].edit_json).unwrap();
+    assert_eq!((saved["tone"]["ev"].clone(), saved["tone"][key].clone()), (json!(0.5), want), "{saved}");
+    assert_eq!(saved["fade"], json!(0.2), "{saved}");
+}
+
+#[gpui_kit::test]
+fn reopening_during_the_commit_that_creates_the_version_waits_for_it(cx: &mut TestAppContext) {
+    reopen_during_a_commit(true, cx);
+}
+
+#[gpui_kit::test]
+fn developing_again_during_a_commit_reads_the_version_it_wrote(cx: &mut TestAppContext) {
+    reopen_during_a_commit(false, cx);
+}
+
 /// Make every history write fail (a full disk, say) until the test drops the trigger.
 fn fail_history_writes(rig: &Rig) {
     rig.catalog(|c| {

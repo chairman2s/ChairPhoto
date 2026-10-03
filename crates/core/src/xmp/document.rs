@@ -253,11 +253,11 @@ impl SidecarDocument {
         let written = write_atomically(&self.folder, &self.original, &self.path, &buf);
         let Self { folder, _turn, .. } = self;
         drop(_turn);
-        if written.is_ok() {
-            // Off this thread: a caller may hold the catalog lock (#155 review, L3).
-            sweep_later(folder);
-        }
-        written
+        // The folder the temp file was made in; swept off this thread, as a caller may hold
+        // the catalog lock (#155 review, L3).
+        let temp_folder = written?.unwrap_or(folder);
+        sweep_later(temp_folder);
+        Ok(())
     }
 }
 
@@ -484,16 +484,19 @@ enum OpenFor {
 /// * **Through the folder handle** (`folder`, the original's, held since the sidecar was read):
 ///   the original is checked, and the temp file created, renamed over the sidecar and synced,
 ///   relative to it — see the module docs.
-fn write_atomically(folder: &Folder, original: &Path, path: &Path, bytes: &[u8]) -> Result<(), String> {
-    let linked;
-    let (dir, target) = if folder.is_symlink(file_name(path)?) {
+///
+/// Returns the link target's folder when the sidecar is a symlink into another one: that is
+/// where the temp file was made, so it is the folder to sweep (#155 review, N2).
+fn write_atomically(folder: &Folder, original: &Path, path: &Path, bytes: &[u8]) -> Result<Option<Folder>, String> {
+    let (linked, target) = if folder.is_symlink(file_name(path)?) {
         let target = std::fs::canonicalize(path).map_err(|e| format!("cannot resolve {}: {e}", path.display()))?;
         let target_dir = target.parent().ok_or_else(|| format!("{} has no folder", target.display()))?;
-        linked = Folder::open_dir(target_dir).map_err(|e| format!("cannot open {}: {e}", target_dir.display()))?;
-        (&linked, target)
+        let linked = Folder::open_dir(target_dir).map_err(|e| format!("cannot open {}: {e}", target_dir.display()))?;
+        (Some(linked), target)
     } else {
-        (folder, path.to_path_buf())
+        (None, path.to_path_buf())
     };
+    let dir = linked.as_ref().unwrap_or(folder);
     let name = file_name(&target)?;
     let existing = dir.permissions(name);
     if existing.is_some() {
@@ -521,7 +524,7 @@ fn write_atomically(folder: &Folder, original: &Path, path: &Path, bytes: &[u8])
     if written.is_err() {
         let _ = dir.remove(temp_name);
     }
-    written
+    written.map(|()| linked)
 }
 
 fn write_temp_then_rename(
@@ -1418,6 +1421,30 @@ mod tests {
             "..1-0123456789ab.chairphoto-tmp", "DSC1.ARW.xmp", ".DSC1.ARW.xmp.-0123456789ab.chairphoto-tmp"] {
             assert!(!is_temp_name(std::ffi::OsStr::new(name)), "{name}");
         }
+    }
+
+    /// #155 review N2: for a symlinked sidecar the temp file goes beside the link's target, so
+    /// that is the folder swept — a day-old temp left there goes.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_sidecars_write_sweeps_the_targets_folder() {
+        let (dir, p) = photo("doc-155-n2", "Y.ARW");
+        let elsewhere = dir.join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        let real = elsewhere.join("Y.xmp");
+        std::fs::write(&real, FOREIGN).unwrap();
+        std::os::unix::fs::symlink(&real, sidecar_path(&p)).unwrap();
+        let stale = temp_path(&real);
+        std::fs::write(&stale, "<half").unwrap();
+        std::fs::File::options().write(true).open(&stale).unwrap()
+            .set_modified(std::time::SystemTime::now() - STALE_TEMP_AGE - Duration::from_secs(60)).unwrap();
+
+        let mut doc = SidecarDocument::open(&p).unwrap();
+        set_prop(&mut doc, "Foo", "bar");
+        doc.commit().unwrap();
+
+        wait_swept(&std::fs::canonicalize(&elsewhere).unwrap());
+        assert!(!stale.exists(), "the day-old temp beside the link's target stayed");
     }
 
     /// A symlinked sidecar is written through to its target; the link stays a link.

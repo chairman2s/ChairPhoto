@@ -375,7 +375,6 @@ impl Folder {
             use rustix::fs::{Mode, OFlags};
             let (flags, mode) = match flags {
                 OpenFor::Read => (OFlags::RDONLY, Mode::empty()),
-                OpenFor::ReadNoFollow => (OFlags::RDONLY | OFlags::NOFOLLOW, Mode::empty()),
                 OpenFor::WriteExisting => (OFlags::WRONLY, Mode::empty()),
                 OpenFor::CreateNew => (OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL, Mode::from_raw_mode(0o666)),
                 OpenFor::Replace => (OFlags::WRONLY | OFlags::CREATE | OFlags::TRUNC, Mode::from_raw_mode(0o666)),
@@ -386,7 +385,7 @@ impl Folder {
         {
             let mut options = std::fs::OpenOptions::new();
             match flags {
-                OpenFor::Read | OpenFor::ReadNoFollow => options.read(true),
+                OpenFor::Read => options.read(true),
                 OpenFor::WriteExisting => options.write(true),
                 OpenFor::CreateNew => options.write(true).create_new(true),
                 OpenFor::Replace => options.write(true).create(true).truncate(true),
@@ -432,8 +431,6 @@ impl Folder {
 #[derive(Clone, Copy)]
 enum OpenFor {
     Read,
-    /// For reading, failing on a symbolic link (on Unix).
-    ReadNoFollow,
     /// For writing, neither creating nor truncating: asks whether we may write the file.
     WriteExisting,
     CreateNew,
@@ -591,14 +588,28 @@ impl Folder {
         }
         let now = std::time::SystemTime::now();
         for name in self.temp_names() {
-            let stale = self
-                .open_with(&name, OpenFor::ReadNoFollow)
-                .and_then(|f| f.metadata())
-                .is_ok_and(|m| m.is_file() && m.modified().is_ok_and(|t| now.duration_since(t).is_ok_and(|age| age > STALE_TEMP_AGE)));
-            if stale {
+            if self.is_stale_temp(&name, now) {
                 let _ = self.remove(&name);
             }
         }
+    }
+
+    /// Whether `name` is a regular file last modified more than [`STALE_TEMP_AGE`] before
+    /// `now`. Decided from its metadata alone (a symlink is not followed), never by opening
+    /// it: a FIFO or device node with a temp's name would block an open (#155 review, L1).
+    fn is_stale_temp(&self, name: &std::ffi::OsStr, now: std::time::SystemTime) -> bool {
+        let old = |modified: std::time::SystemTime| now.duration_since(modified).is_ok_and(|age| age > STALE_TEMP_AGE);
+        #[cfg(unix)]
+        {
+            use rustix::fs::{AtFlags, FileType};
+            let Ok(st) = rustix::fs::statat(&self.fd, name, AtFlags::SYMLINK_NOFOLLOW) else { return false };
+            let Ok(secs) = u64::try_from(st.st_mtime) else { return false };
+            FileType::from_raw_mode(st.st_mode) == FileType::RegularFile
+                && old(std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs))
+        }
+        #[cfg(not(unix))]
+        std::fs::symlink_metadata(self.path.join(name))
+            .is_ok_and(|m| m.is_file() && m.modified().is_ok_and(old))
     }
 
     /// The names in this folder that are ChairPhoto temp files.
@@ -1235,6 +1246,29 @@ mod tests {
         aged(&later);
         SidecarDocument::open(&p).unwrap().commit().unwrap();
         assert!(later.exists(), "the folder was listed again");
+    }
+
+    /// #155 review L1: a FIFO named like a day-old temp neither hangs the commit's sweep (an
+    /// open of it would block until a writer came) nor is removed: only regular files are.
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_named_like_a_temp_neither_hangs_the_sweep_nor_is_removed() {
+        let (dir, p) = photo("doc-155-fifo", "V.ARW");
+        let fifo = dir.join(".V.ARW.xmp.1-abcdefabcdef.chairphoto-tmp");
+        let folder = rustix::fs::open(&*dir, rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::DIRECTORY, rustix::fs::Mode::empty()).unwrap();
+        rustix::fs::mknodat(&folder, fifo.file_name().unwrap(), rustix::fs::FileType::Fifo, rustix::fs::Mode::from_raw_mode(0o644), 0).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let committed = SidecarDocument::open(&p).and_then(|d| d.commit());
+            let _ = tx.send(committed);
+        });
+        let finished = rx.recv_timeout(Duration::from_secs(5));
+        if finished.is_err() {
+            let _ = std::fs::OpenOptions::new().write(true).open(&fifo); // release the stuck open
+        }
+        finished.expect("the commit's sweep hung on a FIFO named like a temp").unwrap();
+        let kind = std::fs::symlink_metadata(&fifo).expect("the FIFO was removed").file_type();
+        assert!(std::os::unix::fs::FileTypeExt::is_fifo(&kind));
     }
 
     #[test]

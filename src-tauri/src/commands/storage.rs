@@ -261,6 +261,40 @@ pub async fn identity_repair_status(
     crate::app::identity::identity_repair_status(state.inner())
 }
 
+/// Overwrite or Dismiss, in one job, every copy whose sidecar carries a non-UUID identifier
+/// (#150): `action` is `overwrite` or `dismiss`, with no default. Returns the run's **job
+/// id**; progress arrives as `identity:resolve_progress` and the result as
+/// `identity:resolve_done`. Each copy is decided as `resolve_identity_conflict` decides one
+/// (Overwrite backs the sidecar up first); a UUID conflict is never touched. The claim
+/// (`app::identity::claim_resolve_foreign_conflicts`) trips any earlier run and claims the
+/// status slot as one transition; a newer run, `identity_resolve_cancel` or a catalog switch
+/// stops it. It does not stop a repair pass, nor a pass it.
+#[tauri::command]
+pub async fn resolve_foreign_identity_conflicts(
+    state: State<'_, AppState>,
+    action: crate::catalog::ForeignConflictAction,
+) -> Result<u64, String> {
+    let run = crate::app::identity::claim_resolve_foreign_conflicts(state.inner(), None, action)?;
+    let job = run.job;
+    crate::app::spawn_blocking(move || run.run());
+    Ok(job)
+}
+
+/// Trip the running bulk resolution of non-UUID conflicts; it stops before its next copy.
+/// No-op when nothing is running.
+#[tauri::command]
+pub async fn identity_resolve_cancel(state: State<'_, AppState>) -> Result<(), String> {
+    crate::app::identity::cancel_resolve_foreign_conflicts(state.inner())
+}
+
+/// The running bulk resolution's status, or `None` when idle, so a remounted panel re-attaches.
+#[tauri::command]
+pub async fn identity_resolve_status(
+    state: State<'_, AppState>,
+) -> Result<Option<crate::app::IdentityResolveJobStatus>, String> {
+    crate::app::identity::resolve_foreign_conflicts_status(state.inner())
+}
+
 /// Resolve one conflicted copy the way the user decided (#33): `adopt` the identifier the
 /// file already carries, `overwrite` the file with the catalog's, `dismiss` the copy, or
 /// `restore` a dismissed one. There is no default — the action is required, and an

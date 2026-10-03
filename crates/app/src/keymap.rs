@@ -11,7 +11,7 @@
 //! add one row to [`bindings`] with its context, and handle it with `.on_action` on the view
 //! that sets that context (or `cx.on_action` for app-global ones such as [`Quit`]).
 
-use crate::shell::actions::{ToggleLeftPanel, ToggleRightPanel};
+use crate::shell::actions::{PanelKeyLeft, PanelKeyRight};
 use gpui_kit::{actions, KeyBinding, NoAction};
 
 /// Key-context names, one per surface that owns keys. Ported surfaces use these names so
@@ -44,9 +44,6 @@ pub mod contexts {
     pub const MENU: &str = "PopupMenu";
     /// The Tag graph's main view (`modules::tag_graph`).
     pub const TAG_GRAPH: &str = "TagGraph";
-    /// Any module's main view on the stage (`Surface::Module`): the shell's wrapper around it,
-    /// whatever context the view sets itself (`TagGraph`, `Map`, …).
-    pub const MODULE_VIEW: &str = "ModuleView";
     /// A focused text input (gpui-base's `Input` context): typed characters are text, not
     /// shortcuts (React's `INPUT`/`TEXTAREA` guard).
     pub const INPUT: &str = "Input";
@@ -56,11 +53,6 @@ pub mod contexts {
 /// The Library's culling keys need no entry: they bind in [`contexts::LIBRARY`], which no
 /// menu or input sits inside.
 const MUTED_IN_MENUS_AND_INPUTS: &[&str] = &["[", "]"];
-
-/// The surfaces where App.tsx's window handler did not run at all — "off in module views,
-/// Develop and cull sessions" — so `[`/`]` toggle no column there. The View menu's checkboxes
-/// still do: a menu dispatches the action, not the keystroke.
-const PANEL_KEYS_OFF_IN: &[&str] = &[contexts::DARKROOM, contexts::MODULE_VIEW, contexts::CULL];
 
 actions!(
     chairphoto,
@@ -74,8 +66,9 @@ actions!(
 
 /// The keymap. One row per binding: keystroke, action, context.
 ///
-/// The shell's own keys are App.tsx's panel toggles (`[`, `]`; they also work in Compare,
-/// and the Darkroom, module-view and cull contexts mute them with `NoAction`) and
+/// The shell's own keys are App.tsx's panel toggles (`[`, `]`, as key-only actions the root
+/// gates by the surface shown: Library — grid, loupe, Compare — yes; Darkroom, module views
+/// and cull sessions no, whatever has focus) and
 /// Menu.tsx's menu keys, which gpui-component's `PopupMenu` binds itself. The rest of
 /// App.tsx's window handler — culling, Compare, loupe — binds with its views
 /// ([`crate::library::bindings`], [`crate::loupe::bindings`]).
@@ -83,8 +76,8 @@ pub fn bindings() -> Vec<KeyBinding> {
     let mut bindings = vec![
         KeyBinding::new("ctrl-q", Quit, Some(contexts::ROOT)),
         KeyBinding::new("ctrl-shift-r", ReloadTheme, Some(contexts::ROOT)),
-        KeyBinding::new("[", ToggleLeftPanel, Some(contexts::ROOT)),
-        KeyBinding::new("]", ToggleRightPanel, Some(contexts::ROOT)),
+        KeyBinding::new("[", PanelKeyLeft, Some(contexts::ROOT)),
+        KeyBinding::new("]", PanelKeyRight, Some(contexts::ROOT)),
     ];
     // The Tag graph's window keydown handler (Escape) moves to its focused view.
     #[cfg(feature = "tag-graph")]
@@ -93,9 +86,6 @@ pub fn bindings() -> Vec<KeyBinding> {
     for key in MUTED_IN_MENUS_AND_INPUTS {
         bindings.push(KeyBinding::new(key, NoAction, Some(contexts::MENU)));
         bindings.push(KeyBinding::new(key, NoAction, Some(contexts::INPUT)));
-        for context in PANEL_KEYS_OFF_IN {
-            bindings.push(KeyBinding::new(key, NoAction, Some(context)));
-        }
     }
     bindings.extend(crate::library::bindings());
     bindings.extend(crate::loupe::bindings());

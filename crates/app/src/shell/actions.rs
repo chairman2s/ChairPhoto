@@ -26,6 +26,11 @@ actions!(
         ToggleLeftPanel,
         /// `]`: show or hide the inspector column (narrow: its overlay).
         ToggleRightPanel,
+        /// The `[` key: [`ToggleLeftPanel`] where App.tsx's key handler ran (the Library, no
+        /// cull session); nothing elsewhere. The View menu dispatches the toggle itself.
+        PanelKeyLeft,
+        /// The `]` key, likewise for [`ToggleRightPanel`].
+        PanelKeyRight,
         /// Import ▾ → "Cache previews on import" (session-only, default on).
         ToggleCachePreviews,
         /// The collection browser's "All photos": widen to the whole library, keeping the sort.

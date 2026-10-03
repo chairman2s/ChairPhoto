@@ -66,6 +66,16 @@
 //!   (by any view: the catalog open is not that row's). Rows read from another catalog forget
 //!   every earlier look and refusal, so the next ask renders again; a refusal that arrives
 //!   for a look already superseded is not kept.
+//! - **Where a thumbnail was rendered** (rv151 L1, L2). Every thumbnail render, plain or not,
+//!   reads the open catalog's identity on the worker afterwards and keeps it on the cached
+//!   image (`Loaded::rendered_in`). A look trusts a cached thumbnail only if it was rendered
+//!   in the look's catalog: a plain view's render in a switch's window (refused for no one,
+//!   so #134's M1 holds) is rendered again, bound, when the grid reaches it under the old
+//!   row. And a thumbnail a plain view asked for first is the grid's too when it is the plain
+//!   thumbnail (`Loaded::cover` false) of a row that names no cover and was rendered in that
+//!   row's catalog — or, still rendering, when the row names no cover: it is adopted, not
+//!   rendered twice. The identity is read after the render, so a switch during it counts
+//!   against the pixels: it errs towards rendering again.
 //!
 //! The pool is behind [`Submit`] so tests can hold responders and deliver them in any order.
 
@@ -93,12 +103,16 @@ pub struct Loaded {
     /// A thumbnail of the photo's cover version, not of the original's frame
     /// (`DecodedImage::cover`): boxes in the original's coordinates do not belong on it.
     pub cover: bool,
+    /// A thumbnail's: the catalog open when its render finished, as the worker's identity
+    /// probe read it (`None`: no catalog open, no probe, or another tier). A look trusts only
+    /// a thumbnail rendered in its row's catalog (see the module docs).
+    pub rendered_in: Option<CatalogIdentity>,
 }
 
 impl Loaded {
     /// Convert on the worker thread that decoded it.
     pub fn from_decoded(decoded: DecodedImage) -> Self {
-        Self { image: to_bgra(decoded.image), video_tile: decoded.video_tile, cover: decoded.cover }
+        Self { image: to_bgra(decoded.image), video_tile: decoded.video_tile, cover: decoded.cover, rendered_in: None }
     }
 
     /// Decoded size in bytes (what the LRU budgets).
@@ -545,19 +559,29 @@ impl ImageStore {
                 epoch: self.epoch,
             });
             let done = self.done.clone();
-            // A thumbnail asked for a look is bound to the catalog its row came from.
-            let check = match (kind, look, &self.probe) {
-                (ImageKind::Thumb, Some(from), Some(probe)) => Some((from, probe.clone())),
+            // Every thumbnail records the catalog open when it was rendered; one asked for a
+            // look is bound to the catalog its row came from.
+            let probe = match kind {
+                ImageKind::Thumb => self.probe.clone(),
                 _ => None,
             };
-            let bound = check.as_ref().map(|(from, _)| *from);
+            let bound = look.filter(|_| probe.is_some() && kind == ImageKind::Thumb);
             batch.push((
                 job,
                 Box::new(move |result| {
                     // On the worker, after the render: pixels from another catalog are not
-                    // this row's photo.
-                    let refused = matches!(&check, Some((from, probe)) if result.is_ok() && probe() != Some(*from));
-                    let result = if refused { Err(CATALOG_CHANGED.to_string()) } else { result };
+                    // this row's photo. The probe runs only for pixels (a cancellation's
+                    // Err answers on the caller's thread, which must not take the lock).
+                    let seen = match (&probe, &result) {
+                        (Some(probe), Ok(_)) => probe(),
+                        _ => None,
+                    };
+                    let refused = bound.is_some() && result.is_ok() && seen != bound;
+                    let result = if refused {
+                        Err(CATALOG_CHANGED.to_string())
+                    } else {
+                        result.map(|loaded| Loaded { rendered_in: seen, ..loaded })
+                    };
                     // Fails only when the store is gone; the result is then unwanted.
                     let _ = done.unbounded_send(Done { key, generation, promotion, bound, refused, result });
                 }),
@@ -710,16 +734,26 @@ impl ImageStore {
         }
         for &(photo, cover) in wanted {
             let look = Look { from, cover };
-            let stale = match self.looks.get(&photo) {
-                Some(asked) => *asked != look,
-                None => {
-                    let key = self.key(photo, ImageKind::Thumb);
-                    self.lru.peek(&key).is_some()
-                        || self.pending.contains_key(&key)
-                        || self.failed.contains_key(&key)
-                        || self.refused.contains(&key)
-                }
-            };
+            let key = self.key(photo, ImageKind::Thumb);
+            let cached = self.lru.peek(&key);
+            // Pixels rendered while another catalog was open (a plain view's render in a
+            // switch's window, rv151 L1) are not this row's, whatever look was asked.
+            let foreign = self.probe.is_some() && cached.is_some_and(|l| l.rendered_in != Some(from));
+            let stale = foreign
+                || match self.looks.get(&photo) {
+                    Some(asked) => *asked != look,
+                    // Asked for by a plain view only. The plain thumbnail of a row with no
+                    // cover is what this look shows: kept, or adopted while it renders
+                    // (rv151 L2). Anything else may be another look's.
+                    None => match cached {
+                        Some(l) => l.cover || cover.is_some(),
+                        None => {
+                            (self.pending.contains_key(&key) && cover.is_some())
+                                || self.failed.contains_key(&key)
+                                || self.refused.contains(&key)
+                        }
+                    },
+                };
             if stale {
                 self.invalidate_tier(photo, ImageKind::Thumb, cx);
             }

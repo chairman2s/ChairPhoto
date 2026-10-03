@@ -12,6 +12,7 @@ use crate::image_store::{ImageState, StoreStats};
 use crate::image_tests::{pixels, FakePool};
 use chairphoto_core::app::CoreEvent;
 use chairphoto_core::image_pool::{ImageKind, JobKey};
+use chairphoto_model::darkroom::filmstrip::CoverLook;
 use std::sync::Arc;
 use chairphoto_core::catalog::{CullingFilter, PhotoPage, PickState};
 use gpui_kit::test::TestWindowExt as _;
@@ -1194,4 +1195,128 @@ fn a_tile_refused_across_a_re_root_is_asked_again_for_the_new_rows(cx: &mut Test
     assert_eq!(rig.jobs(photo), jobs + 1, "asked again for the new rows");
     rig.finish(photo, 8, cx);
     assert_eq!(rig.tile(photo, cx), Ok(8), "it lands");
+}
+
+/// rv151 L1. In a switch's window (the core on B, `catalog:switched` withheld; B's photo has
+/// the tile's id and cover token), the tile was evicted and a plain view (the inspector's
+/// stack, a card) asks for it first: it renders B's photo, unrefused (#134 M1). The grid,
+/// still on A's rows, does not draw those pixels: they were rendered in another catalog, so
+/// it asks again, bound to A — refused — and the tile stays empty.
+#[gpui_kit::test]
+fn a_plain_render_in_a_switch_window_is_not_drawn_under_the_old_row(cx: &mut TestAppContext) {
+    let rig = LookRig::new("grid-plain-switch", 2, cx);
+    let photo = rig.ids[1];
+    let version = rig.cover(photo);
+    rig.refresh_rows(cx);
+    for &id in &rig.ids {
+        rig.finish(id, 4, cx);
+    }
+    assert_eq!(rig.tile(photo, cx), Ok(4));
+    let a = rig.app.wired.shell.read_with(cx, |s, _| s.rows_from()).unwrap();
+    let (b, b_ids) = colliding_catalog(&rig.dir, "b", 2);
+    let bv = b.create_version(b_ids[1], "B's").unwrap();
+    assert_eq!(b.set_cover_version(b_ids[1], Some(bv)).unwrap(), Some(format!("{version}:0")), "the token collides");
+    core_switch(&rig.app, b);
+
+    // The eviction and the plain request in one update: the plain view asks first.
+    let images = rig.app.wired.images.clone();
+    images.update(cx, |s, cx| {
+        s.evict(|k| k.photo == photo, cx);
+        s.request(photo, ImageKind::Thumb);
+    });
+    let refused = rig.stats(cx).refused;
+    rig.finish(photo, 16, cx);
+    assert_eq!(rig.stats(cx).refused, refused, "a plain request is not refused");
+    render(&rig.app, cx);
+    assert_eq!(rig.app.wired.shell.read_with(cx, |s, _| s.rows_from()), Some(a), "the grid's rows are still A's");
+    assert_ne!(rig.tile(photo, cx), Ok(16), "B's render is not drawn under A's row");
+    let jobs = rig.jobs(photo);
+    rig.finish(photo, 8, cx);
+    assert_eq!(rig.stats(cx).refused, refused + 1, "the grid's own ask, bound to A, is refused");
+    assert_eq!(rig.tile(photo, cx), Err("absent"));
+    render(&rig.app, cx);
+    assert_eq!(rig.jobs(photo), jobs, "and not asked again under A's row");
+}
+
+/// rv151 L2. A tile a plain view asked for first — after a switch emptied the store, before
+/// the grid's frame — is the grid's too when its row names no cover: the grid adopts the
+/// render in flight (it is not thrown away and sent again) and keeps it once it lands.
+#[gpui_kit::test]
+fn a_plain_render_of_a_row_without_a_cover_is_not_rendered_twice(cx: &mut TestAppContext) {
+    let rig = LookRig::new("grid-plain-adopt", 1, cx);
+    let photo = rig.ids[0];
+    rig.finish(photo, 4, cx);
+    let images = rig.app.wired.images.clone();
+    // The store emptied (as a switch does), and a plain view asks before the grid's frame.
+    images.update(cx, |s, cx| {
+        s.clear(cx);
+        s.request(photo, ImageKind::Thumb);
+    });
+    let jobs = rig.jobs(photo);
+    let dropped = rig.stats(cx).stale_dropped;
+    render(&rig.app, cx);
+    assert_eq!(rig.jobs(photo), jobs, "the grid adopts the plain render in flight");
+    rig.finish(photo, 6, cx);
+    assert_eq!(rig.stats(cx).stale_dropped, dropped, "nothing thrown away");
+    render(&rig.app, cx);
+    assert_eq!(rig.jobs(photo), jobs, "and keeps it once it lands");
+    assert_eq!(rig.tile(photo, cx), Ok(6));
+
+    // Cached by a plain view: kept as well.
+    images.update(cx, |s, cx| {
+        s.clear(cx);
+        s.request(photo, ImageKind::Thumb);
+    });
+    rig.finish(photo, 7, cx);
+    let jobs = rig.jobs(photo);
+    render(&rig.app, cx);
+    assert_eq!(rig.jobs(photo), jobs, "a cached plain thumbnail of a row with no cover is current");
+    assert_eq!(rig.tile(photo, cx), Ok(7));
+}
+
+/// rv151 L2, which cached thumbnails a look takes over from a plain view: the plain
+/// thumbnail rendered in the row's catalog, for a row with no cover. Not a cover render, not
+/// one for a row that names a cover, not one rendered in another catalog. A store of its own
+/// (no grid), with the core's identity probe.
+#[gpui_kit::test]
+fn a_look_takes_over_only_the_plain_thumbnail_of_its_own_catalog(cx: &mut TestAppContext) {
+    let dir = TempDir::new("grid-plain-takeover");
+    let app = start(cx);
+    let ids = open_catalog_with_photos(&app, &dir, 1, cx);
+    let photo = ids[0];
+    let a = app.wired.shell.read_with(cx, |s, _| s.rows_from()).unwrap();
+    let pool = Arc::new(FakePool::default());
+    let state = app.state.clone();
+    let images = cx.update(|cx| {
+        let submit: Arc<dyn crate::image_store::Submit> = pool.clone();
+        cx.new(|cx| {
+            let mut store = crate::image_store::ImageStore::new(submit, crate::image_store::DEFAULT_BUDGET_BYTES, cx);
+            store.set_identity_probe(Arc::new(move || chairphoto_core::app::catalog_identity(&state).ok()));
+            store
+        })
+    });
+    let key = JobKey::photo(photo, ImageKind::Thumb);
+    // A plain view's render (landing as `loaded`) and then a look for `cover`: whether the
+    // look asked for the thumbnail again.
+    let asks_again = |loaded: crate::image_store::Loaded, cover: Option<CoverLook>, cx: &mut TestAppContext| {
+        images.update(cx, |s, cx| s.clear(cx));
+        images.update(cx, |s, _| s.request(photo, ImageKind::Thumb));
+        pool.finish(&key, Ok(loaded));
+        cx.run_until_parked();
+        let before = pool.submitted();
+        images.update(cx, |s, cx| s.request_look_batch(a, &[(photo, cover)], cx));
+        let asked = pool.submitted() > before;
+        // Answer what the look sent, so nothing is left in flight for the next case.
+        pool.finish(&key, Ok(pixels(1, 1)));
+        cx.run_until_parked();
+        asked
+    };
+    let covered = Some(CoverLook { version: 1, rev: 0 });
+    assert!(!asks_again(pixels(4, 4), None, cx), "the plain thumbnail of a row with no cover");
+    assert!(asks_again(crate::image_store::Loaded { cover: true, ..pixels(4, 4) }, None, cx), "a cover render");
+    assert!(asks_again(pixels(4, 4), covered, cx), "a row that names a cover");
+    // Rendered once another catalog was open: not this row's.
+    let (b, _) = colliding_catalog(&dir, "b", 1);
+    core_switch(&app, b);
+    assert!(asks_again(pixels(4, 4), None, cx), "rendered in another catalog");
 }

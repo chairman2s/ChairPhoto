@@ -319,6 +319,22 @@ impl CatalogIdentity {
     }
 }
 
+/// Over IPC (the Tauri shell, #164) an identity is an opaque decimal string: a front end
+/// only hands it back. A string, not a number, so no JavaScript number ever rounds it.
+/// Forging one gains nothing: it is a guard compared under the catalog lock, never a key.
+impl serde::Serialize for CatalogIdentity {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.collect_str(&self.0)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for CatalogIdentity {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let s = <String as serde::Deserialize>::deserialize(d)?;
+        s.parse().map(CatalogIdentity).map_err(serde::de::Error::custom)
+    }
+}
+
 /// Like `with_catalog`, but runs the closure on a blocking worker thread so the
 /// UI thread and the async runtime are never stalled by SQLite work.
 pub async fn with_catalog_blocking<T: Send + 'static>(

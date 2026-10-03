@@ -33,6 +33,8 @@ vi.mock("@tauri-apps/api/core", async (orig) => {
     ...actual,
     invoke: (command: string, args: Record<string, unknown>) => {
       switch (command) {
+        case "get_catalog_identity":
+          return Promise.resolve("catalog-a");
         case "summarize_pending_identity":
           return Promise.resolve({ total: 0, conflicts: 0, dismissed: 0, iptcOwed: 101 });
         case "list_owed_iptc": {

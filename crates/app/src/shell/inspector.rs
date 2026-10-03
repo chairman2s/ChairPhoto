@@ -26,8 +26,11 @@ impl RootView {
         let module_panels =
             module_panels.filter(|_| shell.inspector_tab == InspectorTab::Tags && shell.library.selection().active.is_some());
         let active = shell.library.selection().active;
-        let filename = active.map(|p| p.path.rsplit('/').next().unwrap_or(&p.path).to_string()).unwrap_or_default();
-        let swatch = active.and_then(|p| COLOR_LABELS.iter().find(|l| l.name.eq_ignore_ascii_case(&p.label)));
+        // The header names the photo the body describes ([`ShellState::loupe_target`]:
+        // Compare's focused pane, else the active photo — React's `shellPhoto`).
+        let shown = shell.loupe_target();
+        let filename = shown.map(|p| p.path.rsplit('/').next().unwrap_or(&p.path).to_string()).unwrap_or_default();
+        let swatch = shown.and_then(|p| COLOR_LABELS.iter().find(|l| l.name.eq_ignore_ascii_case(&p.label)));
 
         let mut tabs = div().flex().flex_none().gap(px(16.)).px(px(14.)).pb(px(9.)).border_b_1().border_color(colors.line);
         for tab in InspectorTab::ALL {
@@ -71,7 +74,10 @@ impl RootView {
                             .text_size(px(17.))
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(colors.txt)
-                            .child(filename),
+                            .id("inspector-filename")
+                            .child(filename.clone())
+                            .aria_label(filename)
+                            .test_support(),
                     )
                     .when_some(swatch, |h, l| h.child(div().flex_none().size(px(10.)).rounded_full().bg(l.color())))
                     .child(

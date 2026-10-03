@@ -967,6 +967,24 @@ fn overlay_keys_and_drawing_a_missed_face(cx: &mut TestAppContext) {
     assert_eq!(with_cat(&f.app, |c| core_faces::faces_for_photo(c, photo).unwrap()).len(), 1);
 }
 
+/// #172: with the Faces module on, the loupe's key hint names F (App.tsx's hint); disabling
+/// the module takes it out again.
+#[gpui_kit::test]
+fn the_loupe_hint_names_f_while_faces_is_on(cx: &mut TestAppContext) {
+    let f = open_faces(1, true, "faces-hint", cx);
+    f.loupe(f.ids[0], 400, 400, cx);
+    assert_eq!(
+        f.label("loupe-hint", cx).as_deref(),
+        Some("scroll zoom · drag pan · dbl-click 100% · P pick · X reject · F faces · ← →")
+    );
+    cx.update(|cx| ModuleRegistry::disable(&f.app.wired.modules, FACES_MODULE_ID, cx));
+    work(&f.app, cx);
+    assert_eq!(
+        f.label("loupe-hint", cx).as_deref(),
+        Some("scroll zoom · drag pan · dbl-click 100% · P pick · X reject · ← →")
+    );
+}
+
 // --- any window: the pop-out loupe (#110) ---------------------------------------------------
 
 fn in_window<R: 'static>(

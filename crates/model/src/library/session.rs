@@ -310,14 +310,18 @@ impl LibrarySession {
         self.query_revision
     }
 
-    /// Advances on every row read started ([`Self::refresh`]) or disowned ([`LibraryQuery::clear`]
-    /// via a catalog switch), whether or not its answer changes `photos()` — unlike
-    /// [`query_revision`](Self::query_revision), which only moves when the query itself
-    /// changes. A caller that must redo work whenever the rows were *re-read* (a cover's
-    /// look or a version count may be new even though the filter didn't move — e.g. after
-    /// leaving Develop) wants this, not `query_revision`.
+    /// Advances each time a row read actually *lands* ([`Self::apply_page`]) or the rows are
+    /// disowned ([`LibraryQuery::clear`] via a catalog switch), whether or not the answer
+    /// changes `photos()` — unlike [`query_revision`](Self::query_revision), which only moves
+    /// when the query itself changes, and unlike [`LibraryQuery::generation`], which bumps as
+    /// soon as a refresh is *requested*, before its rows arrive (#191 M2: keying a cache off
+    /// that requested generation caches a window built from the still-old rows under the
+    /// number the refresh's own answer will carry, so the stale window survives the landing).
+    /// A caller that must redo work whenever the rows were *re-read* (a cover's look or a
+    /// version count may be new even though the filter didn't move — e.g. after leaving
+    /// Develop) wants this, not `query_revision`.
     pub fn rows_generation(&self) -> u64 {
-        self.library.generation()
+        self.library.rows_landed()
     }
 
     /// Re-run the query: perform the returned request, then [`Self::apply_page`].

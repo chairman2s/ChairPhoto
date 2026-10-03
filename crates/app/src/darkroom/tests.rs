@@ -2258,6 +2258,40 @@ fn repeated_notifies_with_unchanged_rows_do_not_rebuild_the_strip_window(cx: &mu
     assert!(after2 > after, "a real rows re-read rebuilds it: {after2} > {after}");
 }
 
+/// #191 M2: the cache key must be the rows that actually *landed*
+/// ([`chairphoto_model::library::query::LibraryQuery::rows_landed`]), not
+/// [`chairphoto_model::library::query::LibraryQuery::generation`], which bumps the instant a
+/// refresh is requested — before its page arrives. Develop open on photo 0 of 5; a 6th photo
+/// is added straight to the catalog (the Library's rows don't know about it yet); the same
+/// `refresh_rows` + notify the N1 test above uses runs sync while the read is still in
+/// flight — correctly, from the still-five-photo rows, since nothing new has landed. Once the
+/// read lands (`cx.run_until_parked()` + `work`) a further notify must rebuild the strip's
+/// window from the now-six-photo rows.
+/// (Mutation-checked: keying `request_strip_thumbs` on `LibraryQuery::generation()` instead
+/// reproduces the bug exactly — the key does not change between the two notifies, so the
+/// second is a cache hit and the strip never picks up the 6th photo; this test then fails,
+/// `wanted.len() == 5`.)
+#[gpui_kit::test]
+fn a_rows_landing_during_develop_rebuilds_the_strip_window(cx: &mut TestAppContext) {
+    let rig = rig("dk-strip-landed-rows", 5, cx);
+    let d = rig.darkroom(cx);
+    let sixth = rig.catalog(|c| c.upsert_photo(&rig.dir.0.join("photos/2026/p5.ARW"), None, 0, 1).unwrap().id);
+
+    rig.app.wired.shell.update(cx, |s, cx| {
+        s.refresh_rows(cx);
+        cx.notify();
+    });
+    cx.run_until_parked();
+    work(cx);
+    // A further notify, as the strip sees on any later shell change, must pick up the landed rows.
+    rig.app.wired.shell.update(cx, |_, cx| cx.notify());
+    cx.run_until_parked();
+
+    let wanted = d.read_with(cx, |d, _| d.strip_wanted_ids());
+    assert!(wanted.contains(&sixth), "the strip must ask for the 6th photo once its row landed: {wanted:?}");
+    assert_eq!(wanted.len(), 6, "all six rows are within the strip's radius: {wanted:?}");
+}
+
 /// The Thumb jobs for `photo` submitted so far.
 fn thumb_jobs(rig: &Rig, photo: i64) -> usize {
     let key = JobKey::photo(photo, ImageKind::Thumb);

@@ -1,8 +1,9 @@
 //! Face-region writer and reader tests: round trips, foreign layouts (#139), the stored frame
-//! (#136), declared dimensions (#145), ChairPhoto's marker (#135) and matching (#147).
+//! (#136), declared dimensions (#145), the preview's frame, HEIF turns and real tools' sidecars
+//! (#154), ChairPhoto's marker (#135) and matching (#147).
 
 use crate::catalog::IptcFields;
-use crate::xmp::ns::{NS_MWG_RS, NS_RDF, NS_STAREA, NS_STDIM};
+use crate::xmp::ns::{NS_CHAIRPHOTO, NS_MWG_RS, NS_RDF, NS_STAREA, NS_STDIM};
 use crate::xmp::region_fixtures as rf;
 use crate::xmp::region_fixtures::NS_DIGIKAM;
 use crate::xmp::regions::frame::{display_to_stored, stored_to_display, RegionTarget};
@@ -12,7 +13,7 @@ use crate::xmp::test_xml::{
 };
 use crate::xmp::{
     read_face_regions, read_face_regions_in, read_identifier, region_iou, sidecar_backup_path, sidecar_path,
-    write_face_regions, write_identifier, write_iptc, FaceRegion, RegionFrame, RegionWriteError,
+    write_face_regions, write_identifier, write_iptc, FaceRegion, FrameDoubt, RegionFrame, RegionWriteError,
 };
 
 // ── MWG face regions (H13f) ────────────────────────────────────────────────
@@ -571,7 +572,7 @@ fn center(b: (f32, f32, f32, f32)) -> (f32, f32, f32, f32) {
 }
 
 fn turned(o: u8, w: u32, h: u32) -> RegionFrame {
-    RegionFrame { orientation: Some(o), stored_size: Some((w, h)) }
+    RegionFrame { orientation: Some(o), stored_size: Some((w, h)), ..Default::default() }
 }
 
 /// The point maps are checked against an independent implementation of all eight EXIF
@@ -683,7 +684,7 @@ fn face_regions_keep_a_foreign_region_on_a_rotated_photo() {
 fn face_regions_with_an_unknown_orientation_convert_nothing() {
     let box_ = (0.1, 0.1, 0.2, 0.2);
     let alice = [FaceRegion { face_id: 0, name: "Alice".into(), bbox: box_ }];
-    let unknown = |size| RegionFrame { orientation: None, stored_size: size };
+    let unknown = |size| RegionFrame { orientation: None, stored_size: size, ..Default::default() };
 
     let (_dir, photo) = seeded_photo("xmp-136-unknown-existing", rf::DIGIKAM);
     write_face_regions(&photo, CAT, &alice, &[], &[], unknown(Some((4000, 6000)))).unwrap();
@@ -703,7 +704,7 @@ fn face_regions_with_an_unknown_orientation_convert_nothing() {
 
     let photo = dir.join("V.JPG");
     std::fs::write(&photo, b"jpeg").unwrap();
-    write_face_regions(&photo, CAT, &alice, &[], &[], RegionFrame { orientation: Some(6), stored_size: None })
+    write_face_regions(&photo, CAT, &alice, &[], &[], RegionFrame { orientation: Some(6), stored_size: None, ..Default::default() })
         .unwrap();
     let got = rf::mwg(&read(&sidecar_path(&photo)));
     assert_eq!(got.dims, [None], "no size, no AppliedToDimensions");
@@ -767,7 +768,7 @@ fn face_regions_follow_the_frame_the_sidecar_declares() {
 #[test]
 fn face_regions_refuse_a_frame_they_cannot_place_their_boxes_in() {
     let alice = [FaceRegion { face_id: 0, name: "Alice".into(), bbox: (0.5, 0.1, 0.2, 0.1) }];
-    let no_size = |o| RegionFrame { orientation: Some(o), stored_size: None };
+    let no_size = |o| RegionFrame { orientation: Some(o), stored_size: None, ..Default::default() };
     let cases = [
         ("unknown size, turned a quarter", lightroom_declaring("6000", "4000"), no_size(6)),
         ("another aspect", lightroom_declaring("5000", "5000"), turned(6, 6000, 4000)),
@@ -799,7 +800,7 @@ fn face_regions_with_an_unknown_size_keep_the_declared_dimensions() {
         ("unknown orientation", None, alice),
     ] {
         let (_dir, photo) = seeded_photo("xmp-145-unsized", &lightroom_declaring("6000", "4000"));
-        let frame = RegionFrame { orientation, stored_size: None };
+        let frame = RegionFrame { orientation, stored_size: None, ..Default::default() };
         write_face_regions(&photo, CAT, &[FaceRegion { face_id: 0, name: "Alice".into(), bbox: alice }], &[], &[], frame)
             .unwrap_or_else(|e| panic!("{case}: {e}"));
         let xml = read(&sidecar_path(&photo));
@@ -807,6 +808,226 @@ fn face_regions_with_an_unknown_size_keep_the_declared_dimensions() {
         assert_eq!(got.dims, [Some(("6000".into(), "4000".into()))], "{case}:\n{xml}");
         assert!(near4(rf::named(&got, "Alice")[0].area, center(want)), "{case}:\n{xml}");
         assert_eq!(rf::named(&got, "Bob")[0].area, BOB_STORED, "{case}");
+    }
+}
+
+// ── #154: the preview's frame, a HEIF's turn, real tools' sidecars ─────────
+
+/// A photo of a known orientation and stored size whose preview is `preview` pixels.
+fn previewed(orientation: Option<u8>, stored: (u32, u32), preview: (u32, u32)) -> RegionFrame {
+    RegionFrame { orientation, stored_size: Some(stored), display_size: Some(preview), doubt: None }
+}
+
+/// Turning by `a` and then by `b` is turning by `compose_orientations(a, b)`, for all 64
+/// pairs, as the image crate's own `apply_orientation` turns an image of distinct pixels.
+#[test]
+fn orientations_compose_as_the_image_crate_turns() {
+    use image::metadata::Orientation;
+    let mut base = image::RgbImage::new(5, 3);
+    for (x, y, p) in base.enumerate_pixels_mut() {
+        *p = image::Rgb([x as u8 * 40, y as u8 * 80, 7]);
+    }
+    let turn = |img: &mut image::DynamicImage, o: u8| img.apply_orientation(Orientation::from_exif(o).unwrap());
+    for a in 1..=8u8 {
+        for b in 1..=8u8 {
+            let mut twice = image::DynamicImage::ImageRgb8(base.clone());
+            turn(&mut twice, a);
+            turn(&mut twice, b);
+            let mut once = image::DynamicImage::ImageRgb8(base.clone());
+            turn(&mut once, crate::xmp::compose_orientations(a, b));
+            assert_eq!(twice.to_rgb8(), once.to_rgb8(), "{a} then {b}");
+        }
+    }
+}
+
+/// A HEIF's container turn is the display frame's (#154): an EXIF Orientation saying the same
+/// or nothing agrees; any other, or a container that could not be read, is a doubt.
+#[test]
+fn a_heif_container_turn_agrees_with_exif_or_is_doubted() {
+    let exif = |o| RegionFrame { orientation: o, stored_size: Some((4032, 3024)), ..Default::default() };
+    assert_eq!(exif(Some(6)).with_container(Some(6)), exif(Some(6)));
+    assert_eq!(exif(None).with_container(Some(6)), exif(Some(6)), "the container alone");
+    assert_eq!(exif(None).with_container(Some(1)), exif(Some(1)), "no turn anywhere");
+    for (e, c) in [(1, 6), (6, 1), (6, 8), (3, 1), (2, 1)] {
+        assert_eq!(
+            exif(Some(e)).with_container(Some(c)).doubt,
+            Some(FrameDoubt::ContainerDisagrees { container: c, exif: e }),
+            "EXIF {e}, container {c}"
+        );
+    }
+    for e in [None, Some(6)] {
+        assert_eq!(exif(e).with_container(None).doubt, Some(FrameDoubt::ContainerUnreadable), "{e:?}");
+    }
+}
+
+/// A doubted turn writes and reads nothing (#154): exiftool's real sidecar stays byte for byte
+/// as it was, a photo with no sidecar gets none, and the import reads no region.
+#[test]
+fn face_regions_refuse_a_doubted_turn() {
+    let alice = [FaceRegion { face_id: 7, name: "Alice".into(), bbox: (0.5, 0.1, 0.2, 0.1) }];
+    for doubt in [FrameDoubt::ContainerUnreadable, FrameDoubt::ContainerDisagrees { container: 6, exif: 1 }] {
+        let frame = RegionFrame { doubt: Some(doubt), ..turned(6, 600, 400) };
+        let (_dir, photo) = seeded_photo("xmp-154-doubt", rf::EXIFTOOL_O6);
+        let err = write_face_regions(&photo, CAT, &alice, &[], &[], frame).expect_err("refused");
+        assert!(matches!(err, RegionWriteError::Refused(_)), "{doubt:?}: {err:?}");
+        assert!(err.to_string().contains(&doubt.to_string()), "{err}");
+        assert_eq!(read(&sidecar_path(&photo)), rf::EXIFTOOL_O6, "{doubt:?}: sidecar changed");
+        assert!(read_face_regions_in(&photo, frame).is_empty(), "{doubt:?}: imported anyway");
+
+        let dir = region_dir("xmp-154-doubt-fresh");
+        let fresh = dir.join("IMG_0001.HEIC");
+        std::fs::write(&fresh, b"heic").unwrap();
+        let err = write_face_regions(&fresh, CAT, &alice, &[], &[], frame).expect_err("refused");
+        assert!(matches!(err, RegionWriteError::Refused(_)), "{doubt:?}: {err:?}");
+        assert!(!sidecar_path(&fresh).exists(), "{doubt:?}: a sidecar was created");
+    }
+}
+
+/// Review L2 (Q6) on exiftool's real sidecar of a portrait shot, and its neighbours: when the
+/// preview the faces were found on is not the recorded size turned by the orientation, the
+/// write is refused — the sidecar left byte for byte, none created — and nothing is imported.
+///
+/// The first case is Q6: the catalog holds the display-frame size 400x600 for a 600x400 stored
+/// image on Orientation 6. The sidecar's 600x400 then looks like the display frame, so before
+/// #154 Alice was written unturned into Bob's stored frame and Bob imported unturned, both
+/// wrong with no error. Without a preview the frame stays as it was before (the last part).
+#[test]
+fn face_regions_refuse_a_recorded_size_their_preview_contradicts() {
+    let alice = [FaceRegion { face_id: 7, name: "Alice".into(), bbox: (0.5, 0.1, 0.2, 0.1) }];
+    let cases = [
+        ("display-frame size on Orientation 6", previewed(Some(6), (400, 600), (400, 600))),
+        ("upright, the preview turned", previewed(Some(1), (600, 400), (400, 600))),
+        ("unknown orientation, the preview turned", previewed(None, (600, 400), (1365, 2048))),
+        ("turned a quarter, the preview not", previewed(Some(8), (6000, 4000), (2048, 1365))),
+        ("3% off", previewed(Some(6), (6000, 4000), (1320, 2048))),
+    ];
+    for (case, frame) in cases {
+        let (_dir, photo) = seeded_photo("xmp-154-preview", rf::EXIFTOOL_O6);
+        let err = write_face_regions(&photo, CAT, &alice, &[], &[], frame).expect_err(case);
+        assert!(matches!(err, RegionWriteError::Refused(_)), "{case}: {err:?}");
+        assert!(err.to_string().contains("preview"), "{case}: {err}");
+        assert_eq!(read(&sidecar_path(&photo)), rf::EXIFTOOL_O6, "{case}: sidecar changed");
+        assert!(read_face_regions_in(&photo, frame).is_empty(), "{case}: imported anyway");
+
+        let dir = region_dir("xmp-154-preview-fresh");
+        let fresh = dir.join("P.JPG");
+        std::fs::write(&fresh, b"jpeg").unwrap();
+        write_face_regions(&fresh, CAT, &alice, &[], &[], frame).expect_err(case);
+        assert!(!sidecar_path(&fresh).exists(), "{case}: a sidecar was created");
+    }
+
+    // Q6 as it was without a preview to go by: written, in the wrong frame.
+    let (_dir, photo) = seeded_photo("xmp-154-preview-none", rf::EXIFTOOL_O6);
+    let blind = RegionFrame { display_size: None, ..previewed(Some(6), (400, 600), (400, 600)) };
+    write_face_regions(&photo, CAT, &alice, &[], &[], blind).unwrap();
+    let got = rf::mwg(&read(&sidecar_path(&photo)));
+    assert!(near4(rf::named(&got, "Alice")[0].area, center(alice[0].bbox)), "unturned: {got:?}");
+}
+
+/// The check lets through a preview of the recorded frame (#154): turned a quarter as the
+/// orientation says, upright, with an unknown orientation and the stored aspect, and a few
+/// pixels off the stored aspect, as an embedded RAW preview may be.
+#[test]
+fn face_regions_accept_a_preview_of_their_frame() {
+    let alice = (0.5, 0.1, 0.2, 0.1);
+    let cases = [
+        ("turned a quarter", previewed(Some(6), (600, 400), (1365, 2048)), RegionTarget::Stored(6)),
+        ("turned the other way", previewed(Some(8), (600, 400), (400, 600)), RegionTarget::Stored(8)),
+        ("1% off", previewed(Some(6), (6000, 4000), (1350, 2048)), RegionTarget::Stored(6)),
+        ("upright", previewed(Some(1), (600, 400), (2048, 1365)), RegionTarget::Stored(1)),
+        ("unknown orientation", previewed(None, (600, 400), (2048, 1365)), RegionTarget::AsIs),
+    ];
+    for (case, frame, target) in cases {
+        let dir = region_dir("xmp-154-preview-ok");
+        let photo = dir.join("P.JPG");
+        std::fs::write(&photo, b"jpeg").unwrap();
+        write_face_regions(&photo, CAT, &[FaceRegion { face_id: 7, name: "Alice".into(), bbox: alice }], &[], &[], frame)
+            .unwrap_or_else(|e| panic!("{case}: {e}"));
+        let got = rf::mwg(&read(&sidecar_path(&photo)));
+        let want = match target {
+            RegionTarget::AsIs => alice,
+            RegionTarget::Stored(o) => display_to_stored(o, alice),
+        };
+        assert!(near4(got.regions[0].area, center(want)), "{case}: {got:?}");
+        let back = read_face_regions_in(&photo, frame);
+        assert!(near4(back[0].bbox, alice), "{case}: read back {:?}", back[0].bbox);
+    }
+}
+
+/// exiftool's own reading of a sidecar's MWG regions, as `(name, x, y, w, h)` in the file's
+/// center form, or `None` without an `exiftool` to run.
+fn exiftool_regions(sidecar: &std::path::Path) -> Option<Vec<(String, f64, f64, f64, f64)>> {
+    let out = std::process::Command::new("exiftool")
+        .args(["-j", "-struct", "-XMP-mwg-rs:RegionInfo"])
+        .arg(sidecar)
+        .output()
+        .ok()?;
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
+    let list = json[0]["RegionInfo"]["RegionList"].as_array()?.clone();
+    let num = |v: &serde_json::Value| v.as_f64().or_else(|| v.as_str()?.parse().ok()).unwrap();
+    Some(
+        list.iter()
+            .map(|r| {
+                let a = &r["Area"];
+                (r["Name"].as_str().unwrap().to_string(), num(&a["X"]), num(&a["Y"]), num(&a["W"]), num(&a["H"]))
+            })
+            .collect(),
+    )
+}
+
+/// #154 on sidecars real tools wrote of a portrait shot (exiftool 13.55, exiv2 0.28.9;
+/// Orientation 6, Bob in the stored frame): the import reads Bob turned into the display
+/// frame; ChairPhoto's write of Alice leaves Bob's region, the dimensions and every other
+/// property exactly as the tool wrote them, and puts Alice, marked, into the same stored
+/// frame; and exiftool reads both regions back from the result where it is installed.
+#[test]
+fn face_regions_on_real_tool_sidecars() {
+    let alice = (0.5, 0.1, 0.2, 0.1);
+    for (tool, sidecar) in rf::REAL_TOOL_REGIONS {
+        let (_dir, photo) = seeded_photo("xmp-154-real-tools", sidecar);
+        let frame = previewed(Some(6), (600, 400), (400, 600));
+        let read_before = read_face_regions_in(&photo, frame);
+        // Stored top-left (0.25, 0.2, 0.15, 0.1), turned 90 degrees clockwise.
+        assert_eq!(read_before.len(), 1, "{tool}");
+        assert!(near4(read_before[0].bbox, (0.7, 0.25, 0.1, 0.15)), "{tool}: {:?}", read_before[0].bbox);
+
+        write_face_regions(&photo, CAT, &[FaceRegion { face_id: 7, name: "Alice".into(), bbox: alice }], &[], &[], frame)
+            .unwrap_or_else(|e| panic!("{tool}: {e}"));
+        let xml = read(&sidecar_path(&photo));
+        let got = rf::mwg(&xml);
+        assert_eq!(got.dims, [Some(("600".into(), "400".into()))], "{tool}:\n{xml}");
+        assert_eq!(rf::named(&got, "Bob")[0].area, (0.325, 0.25, 0.15, 0.1), "{tool}:\n{xml}");
+        assert_eq!(rf::named(&got, "Bob")[0].face_id, None, "{tool}: Bob marked");
+        let lis_after = rf::subtree(&xml, NS_RDF, "li");
+        for li in rf::subtree(sidecar, NS_RDF, "li") {
+            assert!(lis_after.contains(&li), "{tool}: {li} changed:\n{xml}");
+        }
+        // All but the first-write stamp ChairPhoto owns (`chairphoto:LastWrite`).
+        let mut after = rf::non_region_properties(&xml);
+        let stamp = format!("<{{{NS_CHAIRPHOTO}}}LastWrite>");
+        assert_eq!(after.iter().filter(|p| p.starts_with(&stamp)).count(), 1, "{tool}:\n{xml}");
+        after.retain(|p| !p.starts_with(&stamp));
+        assert_eq!(after, rf::non_region_properties(sidecar), "{tool}:\n{xml}");
+        let ours_ = rf::named(&got, "Alice");
+        assert_eq!(ours_.len(), 1, "{tool}:\n{xml}");
+        assert_eq!(ours_[0].face_id.as_deref(), Some(ours(7).as_str()), "{tool}");
+        assert!(near4(ours_[0].area, center(display_to_stored(6, alice))), "{tool}: {:?}", ours_[0].area);
+        let back = read_face_regions_in(&photo, frame);
+        assert!(near4(back.iter().find(|r| r.name == "Alice").unwrap().bbox, alice), "{tool}: {back:?}");
+
+        match exiftool_regions(&sidecar_path(&photo)) {
+            None => eprintln!("SKIPPED: face_regions_on_real_tool_sidecars ({tool}) exiftool read-back — no exiftool"),
+            Some(regions) => {
+                let a = center(display_to_stored(6, alice));
+                let near = |x: f64, y: f32| (x - f64::from(y)).abs() < 1e-4;
+                assert!(regions.iter().any(|r| r.0 == "Bob" && near(r.1, 0.325) && near(r.2, 0.25)), "{tool}: {regions:?}");
+                assert!(
+                    regions.iter().any(|r| r.0 == "Alice" && near(r.1, a.0) && near(r.2, a.1) && near(r.3, a.2) && near(r.4, a.3)),
+                    "{tool}: {regions:?}"
+                );
+                assert_eq!(regions.len(), 2, "{tool}: {regions:?}");
+            }
+        }
     }
 }
 
@@ -1307,7 +1528,7 @@ fn a_marker_is_followed_only_while_the_name_or_place_still_matches() {
 fn a_stale_region_with_the_marker_of_a_claimed_one_is_removed() {
     let (_dir, photo) = seeded_photo("xmp-209-rename-move", rf::DIGIKAM);
     let before = rf::mwg(rf::DIGIKAM);
-    let unknown = RegionFrame { orientation: None, stored_size: Some((6000, 4000)) };
+    let unknown = RegionFrame { orientation: None, stored_size: Some((6000, 4000)), ..Default::default() };
     let bbox = (0.1, 0.2, 0.3, 0.4);
     let marked = |xml: &str| -> Vec<rf::MwgRegion> {
         rf::mwg(xml).regions.into_iter().filter(|r| r.face_id.as_deref() == Some(ours(1).as_str())).collect()

@@ -10,6 +10,8 @@
 //! cheap despite its per-spawn cost. Binary blobs and very long noise values
 //! (correction-parameter arrays, etc.) are skipped.
 
+pub mod heif;
+
 use crate::catalog::{MetadataEntry, PromotedMetadata};
 use std::collections::HashMap;
 use std::path::PathBuf;

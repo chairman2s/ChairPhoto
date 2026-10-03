@@ -21,7 +21,7 @@
 //! | `identity.rs` | [`read_identifier`], [`read_identifiers`], [`write_identifier`], [`overwrite_identifier`], [`write_import_batch`], [`read_import_batch`]. |
 //! | `gps.rs` | [`write_gps`], [`read_gps`], [`decimal_to_dms_lat`] / [`decimal_to_dms_lng`]. |
 //! | `regions/mod.rs` | Face regions' public API: [`FaceRegion`], [`ReadRegion`], [`RegionSet`], [`RegionWriteError`], [`write_face_regions`], [`write_face_regions_gathered`], [`read_face_regions`], [`read_face_regions_in`], [`region_iou`]. |
-//! | `regions/frame.rs` | [`RegionFrame`], EXIF-orientation point maps, and which frame a `Regions` declares (`region_target`). |
+//! | `regions/frame.rs` | [`RegionFrame`] and [`FrameDoubt`], EXIF-orientation point maps and their composition, the preview-aspect check, and which frame a `Regions` declares (`region_target`). |
 //! | `regions/mwg.rs` | MWG element construction and parsing: `Regions` layout, struct forms, one region `rdf:li`. |
 //! | `regions/reconcile.rs` | In-place edit of an existing `Regions`: the `chairphoto:FaceId` marker, claiming, the pre-marker shape. |
 //! | `parse.rs` | `parse_xml` (keeps qualified attribute names) and namespace-aware attribute lookup. |
@@ -62,8 +62,9 @@ pub use iptc::{read_iptc_present, write_iptc, write_iptc_fields};
 pub use keywords::write_keywords;
 pub use regions::{
     read_face_regions, read_face_regions_in, region_iou, write_face_regions, write_face_regions_gathered,
-    FaceRegion, ReadRegion, RegionFrame, RegionSet, RegionWriteError,
+    FaceRegion, FrameDoubt, ReadRegion, RegionFrame, RegionSet, RegionWriteError,
 };
+pub(crate) use regions::compose_orientations;
 
 // What `document.rs`, `lock.rs` and the test fixtures reach as `super::…`.
 use dom::{child_mut, declare_namespaces, is_xmp_root, new_root, plain, rdf_of_mut};

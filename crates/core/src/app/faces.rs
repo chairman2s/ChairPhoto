@@ -311,8 +311,8 @@ pub fn import_regions(
     path: &std::path::Path,
     people_root: &str,
 ) {
-    // In the EXIF-oriented frame the detections are in (#136).
-    let frame = match regions::region_frame(conn, photo_id) {
+    // In the oriented frame the detections are in (#136), with the file's own say (#154).
+    let frame = match regions::photo_frame(conn, photo_id, path) {
         Ok(f) => f,
         Err(e) => {
             eprintln!("faces_import: read the region frame of photo {photo_id} failed: {e}");

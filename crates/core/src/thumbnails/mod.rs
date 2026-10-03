@@ -193,6 +193,15 @@ pub fn preview_bytes(path: &Path) -> Result<Vec<u8>, String> {
     cached(path, PREVIEW)
 }
 
+/// The pixel size of `path`'s cached 2048 px preview ([`preview_bytes`], the oriented image the
+/// faces indexer detects on), read from the cached file's header. `None` when it is not
+/// cached — nothing is generated — or its header cannot be read. The face-region writer
+/// cross-checks the recorded frame against it (#154).
+pub fn cached_preview_size(path: &Path) -> Option<(u32, u32)> {
+    let cache_path = cache_path_for(path, PREVIEW.max, PREVIEW.tag).ok()?;
+    ImageReader::open(cache_path).ok()?.with_guessed_format().ok()?.into_dimensions().ok()
+}
+
 /// Whether a decoded JPEG (e.g. a cached thumbnail) is effectively grayscale (B&W).
 /// Samples a grid of pixels and reports grayscale when almost none show meaningful
 /// colour — robust to JPEG chroma noise and a few stray coloured pixels. This is the
@@ -486,15 +495,11 @@ fn extract_video_frame(path: &Path) -> Result<Vec<u8>, String> {
 }
 
 /// HEIF/HEIC container (iPhone photos). The `image` crate can't decode these; we route
-/// them through ImageMagick's libheif delegate instead (see `decode_heic`).
+/// them through ImageMagick's libheif delegate instead (see `decode_via_magick`), which turns
+/// them by their container's `irot`/`imir` — the rule the face-region frame follows for the
+/// same files (`metadata::heif`, #154), so it is one rule.
 fn is_heic(path: &Path) -> bool {
-    matches!(
-        path.extension()
-            .and_then(|e| e.to_str())
-            .map(|e| e.to_ascii_lowercase())
-            .as_deref(),
-        Some("heic" | "heif")
-    )
+    crate::metadata::heif::is_heif(path)
 }
 
 /// Decode an image file to JPEG bytes via ImageMagick (`magick`), upright (EXIF
@@ -854,6 +859,22 @@ pub(crate) mod tests {
         if let Ok(mut list) = analyzers().lock() {
             list.clear();
         }
+    }
+
+    /// #154: the face-region writer's preview size comes from the cached preview's header —
+    /// nothing until the preview is cached (and asking generates nothing), then its size.
+    #[test]
+    fn cached_preview_size_reads_only_the_cache() {
+        let _guard = test_lock();
+        let tmp_dir = TestTmpDir::new("cachedsize");
+        let tmp = tmp_dir.path().to_path_buf();
+        std::env::set_var("XDG_CACHE_HOME", tmp.join("cache"));
+        let img = write_test_jpeg(&tmp, "cachedsize.jpg", 1200, 900);
+
+        assert_eq!(cached_preview_size(&img), None, "not cached yet");
+        assert!(!cache_path_for(&img, PREVIEW.max, PREVIEW.tag).unwrap().exists(), "asking generated it");
+        let preview = image::load_from_memory(&preview_bytes(&img).unwrap()).unwrap();
+        assert_eq!(cached_preview_size(&img), Some((preview.width(), preview.height())));
     }
 
     #[test]

@@ -5,11 +5,11 @@
 //! property carries `mwg-rs:AppliedToDimensions` (the pixel size of the stored image the
 //! region coordinates apply to) plus a `mwg-rs:RegionList` (an rdf:Bag of region structs).
 //!
-//! MWG 2.0 § 5.9 measures regions on the **stored** image, before its EXIF Orientation is
-//! applied ("A Creator or Changer MUST express region coordinates, width and height relative
-//! to the stored image, prior to the application of the Exif Orientation tag"). ChairPhoto
-//! measures faces on the EXIF-oriented preview, so the writer turns each box into the stored
-//! frame and the reader turns it back (#136). See [`RegionFrame`].
+//! MWG measures regions on the **stored** image, before its EXIF Orientation is applied (the
+//! MWG Guidelines 2.0 rule for region coordinates; no copy of the text was at hand to check
+//! its wording or section, see `docs/face-tagging.md`). ChairPhoto measures faces on the
+//! oriented preview, so the writer turns each box into the stored frame and the reader turns
+//! it back (#136). See [`RegionFrame`].
 //! Each region has a `mwg-rs:Name`, `mwg-rs:Type='Face'` and a `mwg-rs:Area` whose
 //! `stArea:x/y` are the **CENTER** of the rectangle (MWG stores centers, not top-left),
 //! with `stArea:w/h` and `stArea:unit='normalized'`.
@@ -28,7 +28,8 @@ mod reconcile;
 #[cfg(test)]
 mod tests;
 
-pub use frame::RegionFrame;
+pub use frame::{FrameDoubt, RegionFrame};
+pub(crate) use frame::compose_orientations;
 
 use std::path::Path;
 use xmltree::XMLNode;
@@ -78,7 +79,9 @@ pub struct ReadRegion {
 /// merge-safely. The boxes are in the display frame; with a known EXIF Orientation in `frame`
 /// they are written in the stored frame MWG measures regions in, and a new
 /// `AppliedToDimensions` is the stored size. With an unknown orientation they are written as
-/// they are (#136).
+/// they are (#136). A frame whose turn is in doubt (a HEIF whose container and EXIF disagree),
+/// or whose preview is not the stored size so turned, is refused (#154): the boxes' own frame
+/// is not known, and the sidecar is left as it was.
 ///
 /// An `AppliedToDimensions` the sidecar already has is **never rewritten** (#145): the regions
 /// other tools wrote are normalized against it, so changing it would move them. ChairPhoto's
@@ -195,7 +198,7 @@ fn write_regions_into(
     match found.as_slice() {
         [] if regions.is_empty() => return Ok(()),
         [] => {
-            let target = region_target(frame, None).expect("no dimensions, no conflict");
+            let target = region_target(frame, None).map_err(|why| unrecognised_frame(photo_path, &why))?;
             let desc = doc.description_mut();
             declare_region_namespaces(desc);
             let lis = regions.iter().map(|r| marked_li(&target.write(r), catalog)).collect();

@@ -897,6 +897,38 @@ fn overlay_boxes_follow_the_orientation_zoom_and_pan(cx: &mut TestAppContext) {
     assert_rect(f.bounds(&format!("faces-box-{p}"), cx), container.origin, want);
 }
 
+/// #220: the reassign picker opens above a box whose own bottom leaves too little room below
+/// it in the stage, instead of dropping straight down and being clipped by the overlay's own
+/// `overflow_hidden` — the stage's bottom edge is exactly where that used to happen.
+#[gpui_kit::test]
+fn the_reassign_picker_stays_inside_the_stage_for_a_box_at_the_bottom_edge(cx: &mut TestAppContext) {
+    let f = open_faces(2, true, "faces-picker-flip", cx);
+    let (measure, target) = (f.ids[0], f.ids[1]);
+    // Measure the stage with an arbitrary preview first; the real preview's pixels then match
+    // it exactly, so FIT fills it edge to edge with no letterbox, and a box near the bottom of
+    // the *picture* is also a box near the bottom of the *stage*.
+    f.loupe(measure, 400, 300, cx);
+    let container = f.zoom(cx).read_with(cx, |z, _| z.bounds().unwrap());
+    let (w, h) = (f32::from(container.size.width).round() as u32, f32::from(container.size.height).round() as u32);
+    f.press("escape", cx);
+    let a = add_face(&f.app, target, "[0.05,0.88,0.4,0.1]");
+    f.loupe(target, w, h, cx);
+    f.click(&format!("faces-reassign-{a}"), cx);
+    let dropdown = f.bounds(&format!("faces-reassign-drop-{a}"), cx);
+    assert!(
+        dropdown.origin.y >= container.origin.y,
+        "the picker's top is inside the stage: {:?} vs the stage's top {:?}",
+        dropdown.origin.y,
+        container.origin.y
+    );
+    assert!(
+        dropdown.origin.y + dropdown.size.height <= container.origin.y + container.size.height,
+        "the picker's bottom is inside the stage: {:?} vs the stage's bottom {:?}",
+        dropdown.origin.y + dropdown.size.height,
+        container.origin.y + container.size.height
+    );
+}
+
 /// A Darkroom visit renders a strip photo's thumbnail again for its cover look, which moves
 /// the Thumb tier's version past the Preview's (#134). The boxes still show on that
 /// thumbnail while the loupe draws it as the placeholder before the preview lands (review

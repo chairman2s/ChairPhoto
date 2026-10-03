@@ -1165,6 +1165,175 @@ fn an_owed_retry_never_reaches_the_new_catalog_after_the_switch_event(cx: &mut T
     owed_action_across_a_switch(true, true, cx);
 }
 
+// --- the virtualised tables (#162) -----------------------------------------------------------
+
+/// The indices `i < n` whose `<prefix>-<i>` element is in the frame drawn now.
+fn drawn(app: &App, prefix: &str, n: usize, cx: &mut TestAppContext) -> Vec<usize> {
+    cx.update_window(app.window(), |_, window, cx| {
+        window.render_frame(cx);
+        (0..n).filter(|i| window.try_find(gpui_kit::SharedString::from(format!("{prefix}-{i}"))).is_some()).collect()
+    })
+    .unwrap()
+}
+
+/// A wheel over the list `id` (negative `dy` scrolls down), then a frame.
+fn wheel(app: &App, id: &'static str, dy: f32, cx: &mut TestAppContext) {
+    use gpui_kit::{point, px, ScrollDelta};
+    cx.update_window(app.window(), |_, window, cx| window.scroll(id, ScrollDelta::Pixels(point(px(0.), px(dy))), cx)).unwrap();
+    cx.run_until_parked();
+}
+
+fn fake_copy(i: usize) -> chairphoto_core::catalog::PendingIdentity {
+    use chairphoto_core::catalog::{PendingIdentity, PendingIdentityField};
+    let field = |name: &str| PendingIdentityField {
+        field: name.into(),
+        state: "unreachable".into(),
+        attempts: 1,
+        error: String::new(),
+        last_attempt_at: 0,
+        dismissed_at: 0,
+    };
+    // Every third copy owes both fields: a taller row.
+    let fields = if i % 3 == 0 { vec![field("identifier"), field("import_batch")] } else { vec![field("identifier")] };
+    PendingIdentity { photo_id: i as i64 + 1, path: format!("2026/f{i}.ARW"), volume_id: 1, relative_path: format!("2026/f{i}.ARW"), fields }
+}
+
+fn fake_owed(i: usize) -> chairphoto_core::catalog::OwedIptc {
+    chairphoto_core::catalog::OwedIptc {
+        photo_id: i as i64 + 1,
+        uuid: format!("uuid-{i}"),
+        path: format!("2026/f{i}.ARW"),
+        fields: vec!["Title".into()],
+        attempts: 1,
+        error: String::new(),
+        last_attempt_at: 0,
+        queued_at: 0,
+        generation: 1,
+    }
+}
+
+/// **#162.** 5000 copies in the identity queue and 5000 photos in the owed-IPTC list: only
+/// the rows on screen are built, from the top and, scrolled, from the end. A copy's row is
+/// as tall as its field lines (React's `rowHeight`).
+#[gpui_kit::test]
+fn five_thousand_rows_build_only_the_rows_on_screen(cx: &mut TestAppContext) {
+    use crate::storage::identity_debt::debt_row_height;
+    const N: usize = 5000;
+    let dir = TempDir::new("debt-virtual");
+    let app = start(cx);
+    catalog_with_debt(&app, &dir, 1, cx); // the title bar's chip opens the panel
+    let panel = open_debt_panel(&app, cx);
+    panel.update(cx, |p, cx| {
+        p.rows = Some((0..N).map(fake_copy).collect());
+        p.owed = Some((0..N).map(fake_owed).collect());
+        cx.notify();
+    });
+    cx.run_until_parked();
+
+    for prefix in ["debt-row", "owed-row"] {
+        let top = drawn(&app, prefix, N, cx);
+        assert_eq!(top.first(), Some(&0), "{prefix}: the first rows are on screen");
+        assert!(top.len() < 40, "{prefix}: {} rows built of {N}", top.len());
+        // Scrolled by the lists' handles here; the wheel is the action tests' (below). With
+        // both sections up, the queue's list runs past the bottom of the 900 px test window.
+        panel.read_with(cx, |p, _| match prefix {
+            "debt-row" => p.debt_scroll.scroll_to_item(N - 1, gpui_kit::ScrollStrategy::Bottom),
+            _ => p.owed_scroll.scroll_to_item(N - 1, gpui_kit::ScrollStrategy::Bottom),
+        });
+        let end = drawn(&app, prefix, N, cx);
+        assert_eq!(end.last(), Some(&(N - 1)), "{prefix}: scrolled to the end");
+        assert!(!end.contains(&0) && end.len() < 40, "{prefix}: {} rows built", end.len());
+    }
+
+    // Variable heights: a copy owing both fields is two lines tall.
+    let end = drawn(&app, "debt-row", N, cx);
+    let tall = *end.iter().find(|&&i| i % 3 == 0).unwrap();
+    let short = *end.iter().find(|&&i| i % 3 != 0).unwrap();
+    let height = |i: usize, cx: &mut TestAppContext| {
+        cx.update_window(app.window(), |_, window, _| f32::from(window.find(gpui_kit::SharedString::from(format!("debt-row-{i}"))).bounds().size.height))
+            .unwrap()
+    };
+    assert_eq!(height(tall, cx), debt_row_height(&fake_copy(tall)));
+    assert_eq!(height(short, cx), debt_row_height(&fake_copy(short)));
+    assert!(debt_row_height(&fake_copy(tall)) > debt_row_height(&fake_copy(short)));
+}
+
+/// Every owed photo, not one page of 10.
+fn all_owed(app: &App) -> Vec<i64> {
+    chairphoto_core::app::with_catalog(&app.state, |c| c.list_owed_iptc_page(1000, 0))
+        .unwrap()
+        .into_iter()
+        .map(|r| r.photo_id)
+        .collect()
+}
+
+/// **#162.** A Dismiss on an owed row scrolled into view acts on that row: its buttons are
+/// built with it (the row capture of #153's M1 holds in the virtual list). The counts are
+/// re-read.
+#[gpui_kit::test]
+fn an_owed_action_on_a_scrolled_row_acts_on_that_row(cx: &mut TestAppContext) {
+    const N: usize = 60;
+    let dir = TempDir::new("debt-owed-scrolled");
+    let app = start(cx);
+    catalog_owing_iptc(&app, &dir, N, cx);
+    let panel = open_debt_panel(&app, cx);
+    assert!(!drawn(&app, "owed-row", N, cx).contains(&40), "the precondition: row 40 is off screen");
+    wheel(&app, "owed-list", -1400., cx);
+    let on_screen = drawn(&app, "owed-row", N, cx);
+    let k = on_screen[on_screen.len() / 2];
+    assert!(k > 20, "scrolled well down: {on_screen:?}");
+    let photo = panel.read_with(cx, |p, _| p.owed.as_ref().unwrap()[k].photo_id);
+    cx.update_window(app.window(), |_, window, cx| window.click(gpui_kit::SharedString::from(format!("owed-dismiss-{k}")), cx)).unwrap();
+    work(cx);
+    let left = all_owed(&app);
+    assert_eq!(left.len(), N - 1, "one photo dismissed");
+    assert!(!left.contains(&photo), "the photo on row {k} was the one dismissed");
+    panel.read_with(cx, |p, _| {
+        assert_eq!(p.summary.map(|s| s.iptc_owed), Some(N as i64 - 1), "the panel's count");
+        assert_eq!(p.owed.as_ref().map(Vec::len), Some(N - 1), "the list was re-read");
+    });
+}
+
+/// **#162.** Dismiss on a conflicted copy scrolled into view in the identity queue acts on
+/// that copy, and the summary counts follow.
+#[gpui_kit::test]
+fn a_resolution_on_a_scrolled_row_acts_on_that_copy(cx: &mut TestAppContext) {
+    use crate::storage::identity_debt::dismissed_field;
+    const N: usize = 60;
+    let dir = TempDir::new("debt-scrolled");
+    let app = start(cx);
+    let ids = open_catalog_with_photos(&app, &dir, N, cx);
+    record_conflicts(app.state.catalog.lock().unwrap().as_ref().unwrap(), &dir.0.join("photos"), &ids);
+    app.wired.model.update(cx, |m, cx| m.refresh(cx));
+    work(cx);
+    let panel = open_debt_panel(&app, cx);
+    panel.read_with(cx, |p, _| assert_eq!(p.rows.as_ref().map(Vec::len), Some(N)));
+    assert!(!drawn(&app, "debt-row", N, cx).contains(&40), "the precondition: row 40 is off screen");
+    wheel(&app, "debt-list", -1500., cx);
+    let on_screen = drawn(&app, "debt-row", N, cx);
+    let k = on_screen[on_screen.len() / 2];
+    assert!(k > 20, "scrolled well down: {on_screen:?}");
+    let copy = panel.read_with(cx, |p, _| p.rows.as_ref().unwrap()[k].clone());
+    // The row fits the list: its buttons are inside the list's clip, where a click lands.
+    let (row, list) = cx
+        .update_window(app.window(), |_, window, cx| {
+            window.render_frame(cx);
+            (window.find(gpui_kit::SharedString::from(format!("debt-row-{k}"))).bounds(), window.find("debt-list").bounds())
+        })
+        .unwrap();
+    assert!(row.size.width <= list.size.width, "row {row:?} wider than the list {list:?}");
+    cx.update_window(app.window(), |_, window, cx| window.click(gpui_kit::SharedString::from(format!("dismiss-{k}")), cx)).unwrap();
+    work(cx);
+    let all = chairphoto_core::app::with_catalog(&app.state, |c| c.list_pending_identity_page(1000, 0, true)).unwrap();
+    let dismissed: Vec<_> = all.iter().filter(|p| dismissed_field(p).is_some()).map(|p| (p.photo_id, p.relative_path.clone())).collect();
+    assert_eq!(dismissed, vec![(copy.photo_id, copy.relative_path.clone())], "the copy on row {k} was the one dismissed");
+    panel.read_with(cx, |p, _| {
+        let s = p.summary.unwrap();
+        assert_eq!((s.total, s.dismissed), (N as i64 - 1, 1), "the counts were re-read");
+        assert_eq!(p.rows.as_ref().map(Vec::len), Some(N - 1));
+    });
+}
+
 /// The panel re-attaches to a pass already running when it opens (claimed elsewhere — by an
 /// earlier panel), follows its job id, and ends with its terminal event.
 #[gpui_kit::test]

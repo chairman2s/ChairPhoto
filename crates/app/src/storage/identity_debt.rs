@@ -9,6 +9,12 @@
 //! panel re-attaches to a pass already running ([`StorageState::reattach_repair`]). Resolving
 //! a conflict does not stop a running pass (the core gives each queue row an owner). The pure
 //! line builders are React's exported helpers, ported with their tests.
+//!
+//! **Virtualised** (#162), as React's table was: a page can hold 500 copies and the owed
+//! list 100 photos, and only the rows on screen are built. The identity queue is a
+//! variable-height virtual list — a copy's row is one line per field it owes, React's
+//! `rowHeight` — and the owed-IPTC list, one line per photo, a `uniform_list`. A row's
+//! buttons are built with the row, so they still carry what they were drawn for.
 
 use super::state::StorageEvent;
 use super::ui;
@@ -20,16 +26,41 @@ use chairphoto_core::catalog::{
     IdentityConflictAction, IdentityConflictOutcome, IdentityRepairSummary, OwedDismissal, OwedIptc, PendingIdentity,
     PendingIdentityField, PendingIdentitySummary,
 };
+use gpui_kit::component::{v_virtual_list, VirtualListScrollHandle};
 use gpui_kit::prelude::*;
 use gpui_kit::TestSupportExt as _;
-use gpui_kit::{div, px, Context, Entity, EventEmitter, Hsla, SharedString, Subscription, Window};
+use gpui_kit::{
+    div, px, size, uniform_list, AnyElement, Context, Entity, EventEmitter, Hsla, ListSizingBehavior, Pixels,
+    ScrollStrategy, SharedString, Size, Subscription, UniformListScrollHandle, Window,
+};
 use std::collections::HashMap;
+use std::ops::Range;
+use std::rc::Rc;
 
 /// IPC page size in React; here the page a single read returns.
 pub const PAGE_SIZE: i64 = 500;
 
 /// The page of the owed-IPTC list (#153) a single read returns.
 pub const OWED_PAGE_SIZE: i64 = 100;
+
+/// One owed field's line in a copy's row (React's `FIELD_LINE_HEIGHT`), the row's padding
+/// (`ROW_PADDING`, 5 px above and below) and its bottom border.
+const FIELD_LINE_H: f32 = 22.;
+const ROW_PADDING: f32 = 10.;
+const ROW_BORDER: f32 = 1.;
+/// A Resolve chip's height (`ui::chip`): a one-field row is at least this tall.
+const CHIP_H: f32 = 24.;
+/// The tallest the identity queue and the owed list grow before they scroll.
+const DEBT_LIST_MAX_H: f32 = 360.;
+const OWED_LIST_MAX_H: f32 = 240.;
+/// The Resolve column: Adopt, Overwrite… and Dismiss side by side.
+const RESOLVE_W: f32 = 240.;
+
+/// A copy's row height: one line per owed field (at least one, and at least a chip's
+/// height for the Resolve buttons), React's `rowHeight` — known before the row is built.
+pub fn debt_row_height(p: &PendingIdentity) -> f32 {
+    (p.fields.len().max(1) as f32 * FIELD_LINE_H).max(CHIP_H) + ROW_PADDING + ROW_BORDER
+}
 
 pub struct IdentityDebtPanel {
     app: AppState,
@@ -62,6 +93,11 @@ pub struct IdentityDebtPanel {
     pub owed_result: Option<String>,
     /// Bumped by every owed-IPTC page read; an older read's rows are dropped.
     owed_seq: u64,
+    /// The identity queue's scroll position, and its rows' heights (replaced when they change).
+    pub debt_scroll: VirtualListScrollHandle,
+    debt_sizes: Rc<Vec<Size<Pixels>>>,
+    /// The owed-IPTC list's scroll position.
+    pub owed_scroll: UniformListScrollHandle,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -125,6 +161,9 @@ impl IdentityDebtPanel {
             owed_busy: None,
             owed_result: None,
             owed_seq: 0,
+            debt_scroll: VirtualListScrollHandle::new(),
+            debt_sizes: Rc::new(Vec::new()),
+            owed_scroll: UniformListScrollHandle::new(),
             _subscriptions: vec![ended, observe],
         };
         this.reload_summary(cx);
@@ -210,6 +249,7 @@ impl IdentityDebtPanel {
 
     pub fn set_owed_page(&mut self, page: i64, cx: &mut Context<Self>) {
         self.owed_page = page.max(0);
+        self.owed_scroll.scroll_to_item(0, ScrollStrategy::Top);
         self.reload_owed(cx);
         cx.notify();
     }
@@ -310,53 +350,17 @@ impl IdentityDebtPanel {
                 .child(header("Detail", 160.))
                 .child(header("", 150.)),
         );
-        // Each button carries the row and the catalog it was drawn with (review of #153, M1).
-        let from = self.owed_from;
-        let enabled = self.owed_busy.is_none() && from.is_some();
-        let act = |row: OwedIptc, retry: bool| {
-            cx.listener(move |s: &mut Self, _: &gpui_kit::ClickEvent, _: &mut Window, cx: &mut Context<Self>| {
-                if let Some(from) = from {
-                    s.act_on_owed(row.clone(), from, retry, cx);
-                }
-            })
-        };
-        let mut list = div().id("owed-rows").flex().flex_col().max_h(px(240.)).overflow_y_scroll();
-        for (i, r) in rows.iter().enumerate() {
-            let id = |what: &str| SharedString::from(format!("{what}-{i}"));
-            let cell = |w: f32, text: String| div().w(px(w)).flex_none().text_size(px(11.)).text_color(colors.dim).truncate().child(text);
-            list = list.child(
-                div()
-                    .id(SharedString::from(format!("owed-row-{i}")))
-                    .flex()
-                    .items_center()
-                    .gap(px(8.))
-                    .py(px(5.))
-                    .border_b_1()
-                    .border_color(colors.line)
-                    .child(div().flex_1().min_w_0().text_size(px(11.)).truncate().child(r.path.clone()))
-                    .child(cell(160., r.fields.join(", ")))
-                    .child(cell(40., format!("{}×", r.attempts)))
-                    .child(cell(130., when_line(r.last_attempt_at)))
-                    .child(cell(160., if r.error.is_empty() { "—".into() } else { r.error.clone() }))
-                    .child(
-                        ui::row()
-                            .w(px(150.))
-                            .flex_none()
-                            .child(ui::clickable(
-                                ui::chip(id("owed-retry"), "Retry", enabled, colors),
-                                enabled,
-                                act(r.clone(), true),
-                            ))
-                            .child(ui::clickable(
-                                ui::chip(id("owed-dismiss"), "Dismiss", enabled, colors),
-                                enabled,
-                                act(r.clone(), false),
-                            )),
-                    )
-                    .test_support(),
-            );
-        }
-        section = section.child(list);
+        // Only the rows on screen are built (#162); each row's buttons are built with it.
+        let list = uniform_list(
+            "owed-rows",
+            rows.len(),
+            cx.processor(move |this: &mut Self, range: Range<usize>, _window, cx| this.owed_rows(range, colors, cx)),
+        )
+        .track_scroll(&self.owed_scroll)
+        .with_sizing_behavior(ListSizingBehavior::Infer)
+        .w_full()
+        .max_h(px(OWED_LIST_MAX_H));
+        section = section.child(div().id("owed-list").w_full().child(list).test_support());
         let shown = rows.len() as i64;
         let total = self.summary.map(|s| s.iptc_owed);
         let (can_prev, can_next) = (self.owed_page > 0, shown == OWED_PAGE_SIZE);
@@ -381,6 +385,106 @@ impl IdentityDebtPanel {
         )
     }
 
+    /// Owed-IPTC rows `range`, as the list asks for them. Each button carries the row and the
+    /// catalog it was drawn with (review of #153, M1): a click acts on the row the user saw,
+    /// whatever has landed in `owed` since.
+    fn owed_rows(&mut self, range: Range<usize>, colors: Colors, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let Some(rows) = self.owed.as_ref() else { return Vec::new() };
+        let range = range.start.min(rows.len())..range.end.min(rows.len());
+        let rows: Vec<(usize, OwedIptc)> = range.clone().zip(rows[range].iter().cloned()).collect();
+        let from = self.owed_from;
+        let enabled = self.owed_busy.is_none() && from.is_some();
+        let act = |row: OwedIptc, retry: bool| {
+            cx.listener(move |s: &mut Self, _: &gpui_kit::ClickEvent, _: &mut Window, cx: &mut Context<Self>| {
+                if let Some(from) = from {
+                    s.act_on_owed(row.clone(), from, retry, cx);
+                }
+            })
+        };
+        rows.into_iter()
+            .map(|(i, r)| {
+                let id = |what: &str| SharedString::from(format!("{what}-{i}"));
+                let cell = |w: f32, text: String| div().w(px(w)).flex_none().text_size(px(11.)).text_color(colors.dim).truncate().child(text);
+                div()
+                    .id(SharedString::from(format!("owed-row-{i}")))
+                    .w_full()
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .py(px(5.))
+                    .border_b_1()
+                    .border_color(colors.line)
+                    .child(div().flex_1().min_w_0().text_size(px(11.)).truncate().child(r.path.clone()))
+                    .child(cell(160., r.fields.join(", ")))
+                    .child(cell(40., format!("{}×", r.attempts)))
+                    .child(cell(130., when_line(r.last_attempt_at)))
+                    .child(cell(160., if r.error.is_empty() { "—".into() } else { r.error.clone() }))
+                    .child(
+                        ui::row()
+                            .w(px(150.))
+                            .flex_none()
+                            .child(ui::clickable(
+                                ui::chip(id("owed-retry"), "Retry", enabled, colors),
+                                enabled,
+                                act(r.clone(), true),
+                            ))
+                            .child(ui::clickable(
+                                ui::chip(id("owed-dismiss"), "Dismiss", enabled, colors),
+                                enabled,
+                                act(r, false),
+                            )),
+                    )
+                    .test_support()
+                    .into_any_element()
+            })
+            .collect()
+    }
+
+    /// Identity-queue rows `range`, as the list asks for them (the ones on screen, and one
+    /// to measure the list's width).
+    fn debt_rows(&mut self, range: Range<usize>, colors: Colors, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let Some(rows) = self.rows.as_ref() else { return Vec::new() };
+        let range = range.start.min(rows.len())..range.end.min(rows.len());
+        let rows: Vec<(usize, PendingIdentity)> = range.clone().zip(rows[range].iter().cloned()).collect();
+        rows.into_iter()
+            .map(|(i, p)| {
+                let per_field = |w: f32, f: &dyn Fn(&PendingIdentityField) -> (String, Hsla)| {
+                    div().w(px(w)).flex_none().flex().flex_col().children(p.fields.iter().map(|field| {
+                        let (text, color) = f(field);
+                        div().h(px(FIELD_LINE_H)).text_size(px(11.)).text_color(color).truncate().child(text)
+                    }))
+                };
+                let volume = self.volumes.get(&p.volume_id).cloned().unwrap_or_else(|| format!("volume {}", p.volume_id));
+                let actions = self.row_actions(i, &p, colors, cx);
+                div()
+                    .id(SharedString::from(format!("debt-row-{i}")))
+                    .w_full()
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .h(px(debt_row_height(&p)))
+                    .py(px(ROW_PADDING / 2.))
+                    .border_b_1()
+                    .border_color(colors.line)
+                    .child(per_field(86., &|f| (state_label(&f.state).into(), state_color(&f.state, colors))))
+                    .child(div().flex_1().min_w_0().text_size(px(11.)).truncate().child(p.path.clone()))
+                    .child(div().w(px(90.)).flex_none().text_size(px(11.)).truncate().child(volume))
+                    .child(div().w(px(150.)).flex_none().text_size(px(11.)).truncate().child(p.relative_path.clone()))
+                    .child(per_field(80., &|f| {
+                        (if f.field == "identifier" { "UUID".into() } else { "import batch".into() }, colors.dim)
+                    }))
+                    .child(per_field(40., &|f| (format!("{}×", f.attempts), colors.dim)))
+                    .child(per_field(130., &|f| (when_line(f.last_attempt_at), colors.dim)))
+                    .child(per_field(160., &|f| {
+                        (if f.error.is_empty() { "—".into() } else { f.error.clone() }, colors.dim)
+                    }))
+                    .child(div().w(px(RESOLVE_W)).flex_none().child(actions))
+                    .test_support()
+                    .into_any_element()
+            })
+            .collect()
+    }
+
     fn load_volumes(&mut self, cx: &mut Context<Self>) {
         let state = self.app.clone();
         let rx = Runner::get(cx).run(move || with_catalog(&state, |c| c.volume_rows()));
@@ -397,6 +501,7 @@ impl IdentityDebtPanel {
 
     pub fn set_page(&mut self, page: i64, cx: &mut Context<Self>) {
         self.page = page.max(0);
+        self.debt_scroll.scroll_to_item(0, ScrollStrategy::Top);
         self.reload_page(cx);
         cx.notify();
     }
@@ -468,7 +573,8 @@ impl IdentityDebtPanel {
         if conflict_field(p).is_some() {
             if self.confirm_overwrite.as_deref() == Some(key.as_str()) {
                 return ui::row()
-                    .child(ui::sub("Replace the identifier in the file?", colors))
+                    .flex_nowrap()
+                    .child(div().min_w_0().truncate().child(ui::sub("Replace the identifier in the file?", colors)))
                     .child(ui::clickable(
                         ui::danger_chip(id("overwrite-confirm"), "Overwrite", !busy, colors),
                         !busy,
@@ -484,6 +590,7 @@ impl IdentityDebtPanel {
                     ));
             }
             return ui::row()
+                .flex_nowrap()
                 .child(action("adopt", "Adopt", IdentityConflictAction::Adopt, cx))
                 .child(ui::clickable(
                     ui::chip(id("overwrite"), "Overwrite…", !busy, colors),
@@ -744,10 +851,15 @@ impl Render for IdentityDebtPanel {
         if owes_iptc {
             body = body.child(self.owed_section(colors, cx).id("owed-iptc").test_support());
         }
-        let Some(rows) = self.rows.clone() else {
+        // The rows are not copied per frame: the list builds the ones on screen from `rows`.
+        // Each row is as tall as its field lines.
+        let Some(sizes) = self.rows.as_ref().map(|rows| {
+            rows.iter().map(|p| size(px(0.), px(debt_row_height(p)))).collect::<Vec<Size<Pixels>>>()
+        }) else {
             return body.child(ui::empty("debt-loading", "Loading…", colors));
         };
-        if rows.is_empty() && self.page == 0 {
+        let n = sizes.len();
+        if n == 0 && self.page == 0 {
             let mut empty = div().id("debt-empty").flex().flex_wrap().items_center().gap(px(6.)).child(ui::sub(
                 "No identity debt — every known copy is bound.",
                 colors,
@@ -779,9 +891,9 @@ impl Render for IdentityDebtPanel {
                 .child(header("Tries", 40.))
                 .child(header("Last attempt", 130.))
                 .child(header("Detail", 160.))
-                .child(header("Resolve", 200.)),
+                .child(header("Resolve", RESOLVE_W)),
         );
-        if rows.is_empty() {
+        if n == 0 {
             body = body.child(
                 ui::row().child(ui::sub("No rows on this page.", colors)).child(ui::clickable(
                     ui::chip("debt-first-page", "Back to first page", true, colors),
@@ -790,44 +902,23 @@ impl Render for IdentityDebtPanel {
                 )),
             );
         } else {
-            let mut list = div().id("debt-rows").flex().flex_col().max_h(px(360.)).overflow_y_scroll();
-            for (i, p) in rows.iter().enumerate() {
-                let per_field = |w: f32, f: &dyn Fn(&PendingIdentityField) -> (String, Hsla)| {
-                    div().w(px(w)).flex_none().flex().flex_col().children(p.fields.iter().map(|field| {
-                        let (text, color) = f(field);
-                        div().h(px(22.)).text_size(px(11.)).text_color(color).truncate().child(text)
-                    }))
-                };
-                let volume = self.volumes.get(&p.volume_id).cloned().unwrap_or_else(|| format!("volume {}", p.volume_id));
-                let actions = self.row_actions(i, p, colors, cx);
-                list = list.child(
-                    div()
-                        .id(SharedString::from(format!("debt-row-{i}")))
-                        .flex()
-                        .items_center()
-                        .gap(px(8.))
-                        .py(px(5.))
-                        .border_b_1()
-                        .border_color(colors.line)
-                        .child(per_field(86., &|f| (state_label(&f.state).into(), state_color(&f.state, colors))))
-                        .child(div().flex_1().min_w_0().text_size(px(11.)).truncate().child(p.path.clone()))
-                        .child(div().w(px(90.)).flex_none().text_size(px(11.)).truncate().child(volume))
-                        .child(div().w(px(150.)).flex_none().text_size(px(11.)).truncate().child(p.relative_path.clone()))
-                        .child(per_field(80., &|f| {
-                            (if f.field == "identifier" { "UUID".into() } else { "import batch".into() }, colors.dim)
-                        }))
-                        .child(per_field(40., &|f| (format!("{}×", f.attempts), colors.dim)))
-                        .child(per_field(130., &|f| (when_line(f.last_attempt_at), colors.dim)))
-                        .child(per_field(160., &|f| {
-                            (if f.error.is_empty() { "—".into() } else { f.error.clone() }, colors.dim)
-                        }))
-                        .child(div().w(px(200.)).flex_none().child(actions))
-                        .test_support(),
-                );
+            // Only the rows on screen are built (#162).
+            if *self.debt_sizes != sizes {
+                self.debt_sizes = Rc::new(sizes);
             }
-            body = body.child(list);
+            let list = v_virtual_list(
+                cx.entity(),
+                "debt-rows",
+                self.debt_sizes.clone(),
+                move |this: &mut Self, range: Range<usize>, _window, cx| this.debt_rows(range, colors, cx),
+            )
+            .track_scroll(&self.debt_scroll)
+            .with_sizing_behavior(ListSizingBehavior::Infer)
+            .w_full()
+            .max_h(px(DEBT_LIST_MAX_H));
+            body = body.child(div().id("debt-list").w_full().child(list).test_support());
         }
-        let shown = rows.len() as i64;
+        let shown = n as i64;
         let total = summary.map(|s| s.total + if self.show_dismissed { s.dismissed } else { 0 });
         let (can_prev, can_next) = (self.page > 0, shown == PAGE_SIZE);
         body.child(

@@ -24,6 +24,11 @@ use gpui_kit::{point, px, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent
     ScrollDelta, ScrollWheelEvent};
 use gpui_kit::component::input::InputState;
 use gpui_kit::{ElementId, InputEvent as _, SharedString};
+use crate::image_store::ImageState;
+use crate::image_tests::{pixels, FakePool};
+use crate::modules::map::view::{frame_image, strip_wanted, STRIP_OVERSCAN};
+use chairphoto_core::image_pool::{ImageKind, JobKey};
+use gpui_kit::ScrollStrategy;
 use std::sync::Arc;
 
 const OSM: &str = "tile.openstreetmap.org";
@@ -66,16 +71,32 @@ struct Map {
 
 /// The app with a catalog of photos at `gps`, the Map module enabled and its view showing.
 fn open_map(dir: &TempDir, gps: &[LatLng], cx: &mut TestAppContext) -> Map {
+    open_map_with(dir, gps, None, cx)
+}
+
+/// [`open_map`] with the image layer on `pool` (a [`FakePool`] the test answers by hand).
+fn open_map_with(dir: &TempDir, gps: &[LatLng], pool: Option<Arc<FakePool>>, cx: &mut TestAppContext) -> Map {
     let fake = Arc::new(FakeTiles::default());
     cx.update(|cx| cx.set_global(MapTiles(fake.clone())));
-    let app = start(cx);
+    let app = match pool {
+        Some(pool) => crate::tests::start_with_pool(cx, pool),
+        None => start(cx),
+    };
     let ids = open_catalog_with_photos(&app, dir, gps.len(), cx);
     {
         let guard = app.state.catalog.lock().unwrap();
         let c = guard.as_ref().unwrap();
         backend::ensure_schema_for(c).unwrap();
-        for (id, &(lat, lng)) in ids.iter().zip(gps) {
-            backend::set_photo_gps(c, &[*id], lat, lng).unwrap();
+        // One write per place (a big cluster is many photos at one place).
+        let mut places: Vec<(LatLng, Vec<i64>)> = Vec::new();
+        for (&id, &ll) in ids.iter().zip(gps) {
+            match places.iter_mut().find(|(p, _)| *p == ll) {
+                Some((_, at)) => at.push(id),
+                None => places.push((ll, vec![id])),
+            }
+        }
+        for ((lat, lng), at) in places {
+            backend::set_photo_gps(c, &at, lat, lng).unwrap();
         }
     }
     work(&app, cx);
@@ -476,7 +497,7 @@ fn a_marker_opens_the_filmstrip_and_show_in_library_navigates(cx: &mut TestAppCo
     let (x2, y2) = m.screen(OSLO2, cx);
     m.press_at(((x + x2) / 2.0, (y + y2) / 2.0), 1, cx);
     let strip = view.read_with(cx, |v, _| v.filmstrip.clone()).expect("the filmstrip opened");
-    let mut ids = strip.ids.clone();
+    let mut ids = (*strip.ids).clone();
     ids.sort();
     assert_eq!(ids, m.ids);
     let selected = m.app.wired.shell.read_with(cx, |s, _| (s.library.selection().active_id, s.surface.clone()));
@@ -486,6 +507,211 @@ fn a_marker_opens_the_filmstrip_and_show_in_library_navigates(cx: &mut TestAppCo
     m.click("map-show-in-library", cx);
     let after = m.app.wired.shell.read_with(cx, |s, _| (s.library.selection().active_id, s.surface.clone()));
     assert_eq!(after, (Some(strip.ids[1]), Surface::Library));
+}
+
+// --- the filmstrip over a large cluster (#162) ----------------------------------------
+
+/// The strip's wanted order: on screen first, nearest the active photo (clamped into the
+/// visible range; ahead before behind), then the overscan nearest the screen first, never
+/// past the ends.
+#[test]
+fn strip_wanted_is_nearest_first_and_bounded() {
+    assert_eq!(strip_wanted(10..14, 100, Some(12))[..4], [12, 13, 11, 10]);
+    // An active photo off screen: the nearest visible frame leads.
+    assert_eq!(strip_wanted(10..14, 100, Some(90))[..4], [13, 12, 11, 10]);
+    assert_eq!(strip_wanted(10..14, 100, None)[..4], [10, 11, 12, 13]);
+    let w = strip_wanted(10..14, 100, Some(12));
+    assert_eq!(w.len(), 4 + 2 * STRIP_OVERSCAN);
+    assert_eq!(w[4..6], [14, 9], "the overscan nearest the screen first, ahead before behind");
+    assert_eq!(*w.iter().min().unwrap(), 10 - STRIP_OVERSCAN);
+    assert_eq!(*w.iter().max().unwrap(), 13 + STRIP_OVERSCAN);
+    // Clamped at both ends.
+    let end = strip_wanted(995..1000, 1000, Some(0));
+    assert_eq!(end[..5], [995, 996, 997, 998, 999]);
+    assert!(end.iter().all(|&i| (995 - STRIP_OVERSCAN..1000).contains(&i)));
+    assert_eq!(strip_wanted(0..3, 3, Some(1)), vec![1, 2, 0]);
+    assert!(strip_wanted(5..5, 10, None).is_empty());
+}
+
+/// A map whose `n` photos are all at one place, on a [`FakePool`], with the cluster's
+/// filmstrip open.
+fn open_big_strip(tag: &str, n: usize, cx: &mut TestAppContext) -> (TempDir, Map, Arc<FakePool>, Entity<MapView>) {
+    let dir = TempDir::new(tag);
+    let pool = Arc::new(FakePool::default());
+    let m = open_map_with(&dir, &vec![OSLO; n], Some(pool.clone()), cx);
+    m.click("map-consent-deny", cx);
+    let view = m.view(cx);
+    let (x, y) = m.screen(OSLO, cx);
+    m.press_at((x, y), 1, cx);
+    let len = view.read_with(cx, |v, _| v.filmstrip.as_ref().map(|f| f.ids.len()));
+    assert_eq!(len, Some(n), "one marker, every photo in its strip");
+    (dir, m, pool, view)
+}
+
+fn strip_ids(view: &Entity<MapView>, cx: &mut TestAppContext) -> Arc<Vec<i64>> {
+    view.read_with(cx, |v, _| v.filmstrip.as_ref().unwrap().ids.clone())
+}
+
+/// What the strip's claim holds now.
+fn strip_claim(m: &Map, view: &Entity<MapView>, cx: &mut TestAppContext) -> std::collections::HashSet<i64> {
+    let claim = view.read_with(cx, |v, _| v.strip_claim);
+    match claim {
+        Some(c) => m.app.wired.images.read_with(cx, |s, _| s.claim(c).into_iter().map(|(p, _)| p).collect()),
+        None => Default::default(),
+    }
+}
+
+fn requested(pool: &FakePool, photo: i64) -> bool {
+    let key = JobKey::photo(photo, ImageKind::Thumb);
+    pool.batches.lock().unwrap().iter().flatten().any(|k| *k == key)
+}
+
+fn pending(m: &Map, photo: i64, cx: &mut TestAppContext) -> bool {
+    m.app.wired.images.read_with(cx, |s, _| s.is_pending(photo, ImageKind::Thumb))
+}
+
+/// Scroll the strip so frame `index` is at `strategy`, and draw.
+fn scroll_strip(m: &Map, view: &Entity<MapView>, index: usize, strategy: ScrollStrategy, cx: &mut TestAppContext) {
+    view.read_with(cx, |v, _| v.strip_scroll.scroll_to_item(index, strategy));
+    view.update(cx, |_, cx| cx.notify());
+    frame(&m.app, cx);
+    frame(&m.app, cx);
+}
+
+/// **#162.** A 1000-photo cluster: the strip asks for the frames on screen (plus the
+/// overscan) — not the first 200 — and follows the scroll to the end; the frames that left
+/// are released (no longer claimed, their queued renders cancelled), and only the frames on
+/// screen are built. Closing the strip lets go of everything.
+#[gpui_kit::test]
+fn a_large_clusters_strip_asks_for_what_is_on_screen_as_it_scrolls(cx: &mut TestAppContext) {
+    let (_dir, m, pool, view) = open_big_strip("map-strip-big", 1000, cx);
+    let ids = strip_ids(&view, cx);
+    let claim = strip_claim(&m, &view, cx);
+    assert!(claim.contains(&ids[0]), "the first frames on screen are held");
+    assert!(claim.len() < 60, "a window, not the cluster: {}", claim.len());
+    assert!(!claim.contains(&ids[500]) && !claim.contains(&ids[999]));
+    assert!(!requested(&pool, ids[500]), "nothing far down the strip is asked for yet");
+    assert!(m.has(("map-thumb", ids[0] as u64), cx));
+    assert!(!m.has(("map-thumb", ids[999] as u64), cx), "frames off screen are not built");
+    assert!(pending(&m, ids[0], cx));
+
+    // Past the old 200 cap.
+    scroll_strip(&m, &view, 500, ScrollStrategy::Center, cx);
+    assert!(requested(&pool, ids[500]) && strip_claim(&m, &view, cx).contains(&ids[500]));
+
+    // To the end. (The last photos may already be pending for the Library grid, which
+    // opened at the newest; the strip's claim is what says it wants them.)
+    scroll_strip(&m, &view, 999, ScrollStrategy::Bottom, cx);
+    assert!(pending(&m, ids[999], cx), "the last frame is asked for once it is on screen");
+    let claim = strip_claim(&m, &view, cx);
+    assert!(!claim.contains(&ids[500]), "the middle was let go");
+    assert!(claim.contains(&ids[999]) && claim.contains(&ids[999 - STRIP_OVERSCAN]));
+    assert!(!claim.contains(&ids[0]), "a frame that left the window is let go");
+    assert!(!pending(&m, ids[0], cx), "and its queued render released");
+    assert!(pool.cancelled.lock().unwrap().contains(&JobKey::photo(ids[0], ImageKind::Thumb)));
+    assert!(m.has(("map-thumb", ids[999] as u64), cx));
+    assert!(!m.has(("map-thumb", ids[0] as u64), cx));
+
+    // A still strip asks for nothing and lets nothing go, frame after frame (the list's
+    // measuring build must not move the window).
+    let (batches, cancelled) = (pool.batches.lock().unwrap().len(), pool.cancelled.lock().unwrap().len());
+    for _ in 0..3 {
+        view.update(cx, |_, cx| cx.notify());
+        frame(&m.app, cx);
+    }
+    assert_eq!((pool.batches.lock().unwrap().len(), pool.cancelled.lock().unwrap().len()), (batches, cancelled));
+    assert_eq!(strip_claim(&m, &view, cx), claim);
+
+    // A landed frame shows.
+    pool.finish(&JobKey::photo(ids[999], ImageKind::Thumb), Ok(pixels(4, 4)));
+    cx.run_until_parked();
+    let images = m.app.wired.images.clone();
+    let shown = view.read_with(cx, |v, cx| {
+        let strip = v.filmstrip.clone().unwrap();
+        frame_image(&strip, images.read(cx).peek(ids[999], ImageKind::Thumb)).is_some()
+    });
+    assert!(shown);
+
+    m.click("map-filmstrip-close", cx);
+    assert!(strip_claim(&m, &view, cx).is_empty(), "closing lets go of every frame");
+    assert!(!pending(&m, ids[998], cx));
+}
+
+/// The strip's frames are asked for nearest the active photo first: the active one, then
+/// N+1, N−1 (the navigation rule, AGENTS.md § Performance).
+#[gpui_kit::test]
+fn the_strip_asks_nearest_the_active_photo_first(cx: &mut TestAppContext) {
+    let (_dir, m, pool, view) = open_big_strip("map-strip-order", 1000, cx);
+    let ids = strip_ids(&view, cx);
+    view.update(cx, |v, cx| v.filmstrip_select(ids[500], cx));
+    let before = pool.batches.lock().unwrap().len();
+    scroll_strip(&m, &view, 500, ScrollStrategy::Center, cx);
+    let batches = pool.batches.lock().unwrap()[before..].to_vec();
+    let thumb = |i: usize| JobKey::photo(ids[i], ImageKind::Thumb);
+    let batch = batches.iter().find(|b| b.contains(&thumb(500))).expect("the strip's batch");
+    assert_eq!(batch[..3], [thumb(500), thumb(501), thumb(499)], "{batch:?}");
+}
+
+/// **Catalog identity** (map #92). Catalog B's photos collide with the strip's ids. The core
+/// switches while a frame's render is running:
+/// - `catalog:switched` withheld: the render finishes in B; the strip does not show B's
+///   pixels under A's frame. Then the event arrives and the strip closes, holding nothing.
+/// - delivered: the strip closes and holds nothing, and its old ids are never asked for
+///   again (they would be B's photos).
+fn strip_across_a_switch(delivered: bool, cx: &mut TestAppContext) {
+    let (dir, m, pool, view) = open_big_strip(if delivered { "map-strip-sw-ev" } else { "map-strip-sw" }, 30, cx);
+    let ids = strip_ids(&view, cx);
+    let key = JobKey::photo(ids[0], ImageKind::Thumb);
+    // The Library grid asked for this thumbnail first, bound to A's rows (the store refuses
+    // that render in B by itself). Land it, then drop it (a rotation): the strip's own,
+    // plain request is the one in flight.
+    pool.finish(&key, Ok(pixels(4, 4)));
+    cx.run_until_parked();
+    m.app.wired.images.update(cx, |s, cx| s.invalidate(ids[0], cx));
+    view.update(cx, |_, cx| cx.notify());
+    frame(&m.app, cx);
+    assert!(pending(&m, ids[0], cx));
+    assert!(strip_claim(&m, &view, cx).contains(&ids[0]), "the strip's request");
+    pool.start(key.clone());
+    let (b, b_ids) = crate::tests::colliding_catalog(&dir, "b", 30);
+    assert!(b_ids.contains(&ids[0]), "the ids collide");
+    crate::tests::core_switch(&m.app, b);
+
+    if !delivered {
+        pool.finish(&key, Ok(pixels(4, 4)));
+        cx.run_until_parked();
+        frame(&m.app, cx);
+        let images = m.app.wired.images.clone();
+        let (strip, state) = view.read_with(cx, |v, cx| {
+            (v.filmstrip.clone().expect("not closed before the event"), images.read(cx).peek(ids[0], ImageKind::Thumb))
+        });
+        assert!(matches!(state, ImageState::Ready(_)), "B's render landed in the store (a plain request is not bound)");
+        assert!(frame_image(&strip, state).is_none(), "B's pixels are not shown under A's frame");
+    }
+    crate::tests::deliver_switch(&m.app, cx);
+    work(&m.app, cx);
+    assert!(view.read_with(cx, |v, _| v.filmstrip.is_none()), "the switch closed the strip");
+    assert!(strip_claim(&m, &view, cx).is_empty(), "and it holds nothing");
+    let before = pool.batches.lock().unwrap().len();
+    for _ in 0..3 {
+        view.update(cx, |_, cx| cx.notify());
+        frame(&m.app, cx);
+    }
+    let asked: Vec<JobKey> = pool.batches.lock().unwrap()[before..].iter().flatten().cloned().collect();
+    assert!(
+        !ids.iter().any(|&id| asked.contains(&JobKey::photo(id, ImageKind::Thumb))),
+        "the old strip's ids are not asked for in B: {asked:?}"
+    );
+}
+
+#[gpui_kit::test]
+fn the_strip_never_shows_the_new_catalog_before_the_switch_event(cx: &mut TestAppContext) {
+    strip_across_a_switch(false, cx);
+}
+
+#[gpui_kit::test]
+fn the_strip_closes_and_lets_go_after_the_switch_event(cx: &mut TestAppContext) {
+    strip_across_a_switch(true, cx);
 }
 
 #[gpui_kit::test]

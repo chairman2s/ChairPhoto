@@ -29,6 +29,7 @@
 
 use chairphoto_core::app::{with_catalog, with_catalog_identified, AppState, CatalogIdentity, CoreEvent, EventVisitor};
 use crate::image_store::Loaded;
+use crate::shell::splash::{BootStage, Splash};
 use chairphoto_core::catalog::{CatalogError, Photo, PhotoQuery};
 use chairphoto_core::image_pool::ImagePool;
 use chairphoto_model::deep_link::{self, DeepLink, DeepLinkView};
@@ -83,6 +84,9 @@ pub struct AppModel {
     pool: Option<Arc<ImagePool<Loaded>>>,
     /// The open catalog, once [`AppModel::refresh`] has read it.
     pub catalog: Option<CatalogSummary>,
+    /// The startup splash and its boot stage ([`crate::shell::splash`]); inactive unless this
+    /// launch opens the default catalog.
+    pub splash: Splash,
     /// The identity of the catalog [`catalog`](Self::catalog) was read from, while it is the
     /// current one (`None` from a switch until its refresh lands). What a dialog that opens
     /// now binds its writes to (`with_catalog_as`), e.g. Preferences.
@@ -142,6 +146,7 @@ impl AppModel {
             state,
             pool,
             catalog: None,
+            splash: Splash::inactive(),
             identity: None,
             status: "Starting…".into(),
             last_event: None,
@@ -173,8 +178,10 @@ impl AppModel {
     }
 
     /// Open the default catalog (`app::open_default_catalog`) on the core's runtime, then
-    /// [`refresh`](Self::refresh). What React's `initCatalog()` on mount does.
+    /// [`boot_after_open`](Self::boot_after_open). What React's `initCatalog()` chain on mount
+    /// does, with the splash over the window until it and the first photo list are in.
     pub fn open_default_catalog(&mut self, cx: &mut Context<Self>) {
+        self.splash = Splash::booting();
         self.status = "Opening catalog…".into();
         cx.notify();
         let state = self.state.clone();
@@ -185,18 +192,70 @@ impl AppModel {
                 Ok(result) => result,
                 Err(e) => Err(e.to_string()),
             };
-            this.update(cx, |m, cx| {
-                match result {
-                    Ok(path) => {
-                        eprintln!("catalog: opened {}", path.display());
-                        m.status = "Catalog opened.".into();
+            this.update(cx, |m, cx| m.boot_after_open(result, cx)).ok();
+        })
+        .detach();
+    }
+
+    /// The boot after the catalog open answered: update the auto-tags (monochrome, for photos
+    /// imported before the rule; a failure is only logged, as React's `.catch(() => {})`) on
+    /// a worker, then read the catalog — whose `CatalogRead` starts the modules and the
+    /// Library's rows. A failed open ends the boot (the splash never hangs over an error).
+    pub(crate) fn boot_after_open(&mut self, result: Result<std::path::PathBuf, String>, cx: &mut Context<Self>) {
+        match result {
+            Ok(path) => {
+                eprintln!("catalog: opened {}", path.display());
+                self.status = "Catalog opened.".into();
+                self.splash.set_stage(BootStage::UpdatingAutoTags);
+                let state = self.state.clone();
+                let rx = crate::storage::Runner::get(cx)
+                    .run(move || with_catalog(&state, |c| c.apply_auto_tags()));
+                cx.spawn(async move |this, cx| {
+                    if let Ok(Err(e)) = rx.await {
+                        eprintln!("catalog: auto-tags not updated: {e}");
+                    }
+                    this.update(cx, |m, cx| {
+                        m.splash.set_stage(BootStage::StartingModules);
                         m.refresh(cx);
-                    }
-                    Err(e) => {
-                        eprintln!("catalog: failed to open the default catalog: {e}");
-                        m.status = format!("Failed to open catalog: {e}").into();
-                    }
-                }
+                        cx.notify();
+                    })
+                    .ok();
+                })
+                .detach();
+            }
+            Err(e) => {
+                eprintln!("catalog: failed to open the default catalog: {e}");
+                self.status = format!("Failed to open catalog: {e}").into();
+                self.end_boot(true, cx);
+            }
+        }
+        cx.notify();
+    }
+
+    /// The Library's first rows landed (React's `finishBootPart("photos")`).
+    pub fn boot_photos_loaded(&mut self, cx: &mut Context<Self>) {
+        if self.splash.stage().is_some() && self.splash.finish_photos() {
+            self.fade_splash(cx);
+        }
+    }
+
+    /// The boot is over: `failed` ends it now; otherwise the init chain is done, and it ends
+    /// once the photos are in too.
+    fn end_boot(&mut self, failed: bool, cx: &mut Context<Self>) {
+        let ended = if failed { self.splash.fail() } else { self.splash.finish_init() };
+        if ended {
+            self.fade_splash(cx);
+        }
+    }
+
+    /// "Ready", then gone after the fade.
+    fn fade_splash(&mut self, cx: &mut Context<Self>) {
+        cx.notify();
+        let fade = cx.background_executor().timer(crate::shell::splash::FADE);
+        cx.spawn(async move |this, cx| {
+            fade.await;
+            this.update(cx, |m, cx| {
+                m.splash.set_gone();
                 cx.notify();
             })
             .ok();
@@ -230,6 +289,11 @@ impl AppModel {
                         m.identity = Some(identity);
                         m.catalog_current = true;
                         cx.emit(AppModelEvent::CatalogRead);
+                        // The modules restore on that read: the boot's init chain is done.
+                        if m.splash.stage() == Some(BootStage::StartingModules) {
+                            m.splash.set_stage(BootStage::LoadingPhotos);
+                            m.end_boot(false, cx);
+                        }
                         m.start_pending_link(cx);
                     }
                     Err(e) => {
@@ -237,6 +301,7 @@ impl AppModel {
                         m.identity = None;
                         m.catalog_current = false;
                         m.status = format!("Catalog unavailable: {e}").into();
+                        m.end_boot(true, cx);
                     }
                 }
                 cx.notify();

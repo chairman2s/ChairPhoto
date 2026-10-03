@@ -7,7 +7,9 @@
 //! `recent_catalogs.json`), keyed exactly as React's `localStorage` keys so the meaning of
 //! each value is the same: today `appearance.mode` (Preferences → Appearance,
 //! [`crate::theme`]) and the Map module's per-host tile answers, `map.tileHosts` (a JSON
-//! object; no React counterpart, decision #118). The React layout keys (`panel.*`) are not stored yet.
+//! object; no React counterpart, decision #118), the shell layout (`panel.*`,
+//! `panel.section.*`, [`crate::shell::layout_prefs`]), Compare's `panel.compareMode` and the
+//! Photo inspector's `inspector.section.*`.
 //!
 //! **Reads** happen once, in `run()` before the event loop (one small file, like the theme
 //! read beside it). **Writes** never touch disk on the UI thread: [`MachinePrefs::set`]

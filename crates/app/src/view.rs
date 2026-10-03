@@ -114,7 +114,12 @@ pub struct RootView {
     pub(crate) remove_confirm: Option<u64>,
     pub(crate) confirm_serial: u64,
     resize: Option<Resize>,
+    /// The stage's wrapper around a module's main view ([`contexts::MODULE_VIEW`]): focused
+    /// when a module view takes the stage, unless something inside it already has focus, so
+    /// the shell's `[`/`]` are off there as React's handler was.
+    module_focus: FocusHandle,
     _observers: [Subscription; 10],
+    _module_view_focus: Subscription,
     /// Develop takes the keys when it opens (its arrows step the filmstrip) and hands them
     /// back to the grid when the Library returns.
     #[cfg(feature = "edit")]
@@ -139,6 +144,7 @@ impl RootView {
         cx: &mut Context<Self>,
     ) -> Self {
         let focus = cx.focus_handle();
+        let module_focus = cx.focus_handle();
         let library = cx.new(|cx| LibraryView::new(shell.clone(), images.clone(), cx));
         // The grid has focus from the start: its keys work at once, and the root's bindings
         // in [`contexts::ROOT`] still reach the root, the grid's ancestor.
@@ -176,6 +182,19 @@ impl RootView {
                 _ => {}
             }
         });
+        // A module view took the stage: its wrapper takes the keys (unless the view inside
+        // focused itself), so the root's `[`/`]` no longer reach the root from the grid.
+        // Back on the Library, the grid (or whatever the stage shows) takes them back.
+        let _module_view_focus = cx.observe_in(&shell, window, |this, shell, window, cx| {
+            let in_module = this.module_focus.contains_focused(window, cx);
+            match shell.read(cx).surface {
+                Surface::Module(_) if !in_module => this.module_focus.clone().focus(window, cx),
+                Surface::Library if in_module && this.stacks.is_none() && this.cull.is_none() => {
+                    this.focus_stage(window, cx)
+                }
+                _ => {}
+            }
+        });
         let _observers = [
             cx.observe_in(&model, window, |this, model, window, cx| {
                 // A catalog switch closes the dialog: its groups name the old catalog's photos.
@@ -201,8 +220,18 @@ impl RootView {
             // chrome: hand it to the grid, so its keys work again. Only on the Library
             // surface and with no Stack dialog open, where the grid is what takes keys.
             cx.on_focus(&focus, window, |this, window, cx| {
-                if this.stacks.is_none() && this.cull.is_none() && this.shell.read(cx).surface == Surface::Library {
-                    this.focus_stage(window, cx);
+                if this.stacks.is_some() || this.cull.is_some() {
+                    return;
+                }
+                match this.shell.read(cx).surface {
+                    Surface::Library => this.focus_stage(window, cx),
+                    // Develop and a module view keep the keys too, so `[`/`]` stay off there
+                    // after a menu (React's handler checked the surface, not the focus).
+                    #[cfg(feature = "edit")]
+                    Surface::Develop => this.darkroom.read(cx).focus_handle().clone().focus(window, cx),
+                    Surface::Module(_) => this.module_focus.clone().focus(window, cx),
+                    #[allow(unreachable_patterns)]
+                    _ => {}
                 }
             }),
             // The stage changed (the loupe or Compare opened or closed — by a key, a click, a
@@ -281,7 +310,9 @@ impl RootView {
             remove_confirm: None,
             confirm_serial: 0,
             resize: None,
+            module_focus,
             _observers,
+            _module_view_focus,
             #[cfg(feature = "edit")]
             _develop_focus,
         }
@@ -382,7 +413,9 @@ impl RootView {
     fn on_mouse_move(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
         let Some(resize) = self.resize else { return };
         if event.pressed_button != Some(MouseButton::Left) {
-            self.resize = None; // released outside the window
+            // Released outside the window: the drag is over all the same.
+            self.resize = None;
+            self.shell.update(cx, |s, cx| s.persist_layout(cx));
             return;
         }
         let dx = f32::from(event.position.x - resize.start_x);
@@ -440,6 +473,8 @@ impl RootView {
                 .child(
                     div()
                         .id(SharedString::from(format!("module-view-{}", v.id)))
+                        .key_context(contexts::MODULE_VIEW)
+                        .track_focus(&self.module_focus)
                         .flex_1()
                         .min_h_0()
                         .child(v.view)
@@ -659,7 +694,16 @@ impl Render for RootView {
                 this.loupe_photo_command(|id, name, from| PhotoCommand::Remove { id, name, from }, window, cx)
             }))
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| this.on_mouse_move(event, cx)))
-            .on_mouse_up(MouseButton::Left, cx.listener(|this, _, _, _| this.resize = None))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    // A drag ended: store the width it left (React wrote on every change; one
+                    // write per drag here, not one per pointer move).
+                    if this.resize.take().is_some() {
+                        this.shell.update(cx, |s, cx| s.persist_layout(cx));
+                    }
+                }),
+            )
             .size_full()
             .flex()
             .flex_col()
@@ -668,7 +712,9 @@ impl Render for RootView {
             .child(title_bar)
             .child(body)
             .children(self.stacks.as_ref().map(|(dialog, _)| dialog.clone()))
-            .children(self.cull.as_ref().map(|(cull, _)| cull.clone()));
+            .children(self.cull.as_ref().map(|(cull, _)| cull.clone()))
+            // The startup splash, over everything until the boot is in (`shell::splash`).
+            .children(self.model.read(cx).splash.showing().then(|| self.render_splash(&self.model.read(cx).splash, colors)));
         let model = self.model.clone();
         on_not_yet_ported(root, move |what, ticket, _, cx| {
             model.update(cx, |m, cx| m.not_yet_ported(what, ticket, cx))

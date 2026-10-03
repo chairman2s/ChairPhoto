@@ -62,9 +62,9 @@
 //! started on (the core captured its file under the identity check), but this inspector no
 //! longer follows them.
 //!
-//! **Not persisted yet.** React kept each section's open state in localStorage
-//! (`inspector.section.<id>`, default collapsed); with no per-machine settings store yet
-//! (Preferences, #113) they start collapsed each launch.
+//! **Section state is per machine**, as React kept it in localStorage: each section's open
+//! state is read from [`crate::machine_prefs::MachinePrefs`] at `inspector.section.<id>`
+//! (`"1"` open, anything else collapsed; collapsed when unset) and written back on a toggle.
 
 pub mod render;
 pub mod signals;
@@ -156,6 +156,14 @@ impl Section {
             Section::Iptc => "iptc",
             Section::Metadata => "metadata",
         }
+    }
+
+    pub const ALL: [Section; 6] =
+        [Section::Stack, Section::Orientation, Section::Develop, Section::Storage, Section::Iptc, Section::Metadata];
+
+    /// Its per-machine key, `inspector.section.<id>` (PhotoInspector.tsx's `Section`).
+    pub fn pref_key(self) -> String {
+        format!("inspector.section.{}", self.id())
     }
 }
 
@@ -408,7 +416,11 @@ impl PhotoInspector {
             epoch: 0,
             tab: None,
             seen_version: None,
-            sections: HashSet::new(),
+            // The sections this machine left open (React: `v === null ? false : v === "1"`).
+            sections: Section::ALL
+                .into_iter()
+                .filter(|s| crate::machine_prefs::MachinePrefs::read(cx, &s.pref_key()).as_deref() == Some("1"))
+                .collect(),
             data: PhotoData::default(),
             iptc: IptcForm { description, fields, saved: IptcFields::default(), status: String::new(), fill: None },
             meta_open: META_DEFAULT_OPEN.iter().map(|s| s.to_string()).collect(),
@@ -443,9 +455,11 @@ impl PhotoInspector {
     }
 
     pub fn toggle_section(&mut self, section: Section, cx: &mut Context<Self>) {
-        if !self.sections.remove(&section) {
+        let open = !self.sections.remove(&section);
+        if open {
             self.sections.insert(section);
         }
+        crate::machine_prefs::MachinePrefs::set(cx, &section.pref_key(), if open { "1" } else { "0" });
         self.ensure_loaded(cx);
         cx.notify();
     }

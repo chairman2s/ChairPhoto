@@ -77,6 +77,12 @@ pub(crate) fn start_with_pool(cx: &mut TestAppContext, pool: Arc<dyn crate::imag
 }
 
 fn start_with(cx: &mut TestAppContext, pool: Option<Arc<dyn crate::image_store::Submit>>) -> App {
+    start_with_options(cx, |o| WireOptions { image_pool: pool, ..o })
+}
+
+/// [`start`] with the headless [`WireOptions`] changed by `options` (say, a per-machine
+/// preference store read from a file).
+pub(crate) fn start_with_options(cx: &mut TestAppContext, options: impl FnOnce(WireOptions) -> WireOptions) -> App {
     // Storage jobs queue until a test runs them (`Runner::manual`): the core runtime's
     // threads could not wake GPUI's deterministic test scheduler.
     cx.update(|cx| cx.set_global(crate::storage::Runner::manual()));
@@ -93,7 +99,7 @@ fn start_with(cx: &mut TestAppContext, pool: Option<Arc<dyn crate::image_store::
             events_rx,
             None,
             &SystemThemeResult::unavailable(),
-            WireOptions { image_pool: pool, ..WireOptions::headless(on_exit) },
+            options(WireOptions::headless(on_exit)),
         )
     });
     // Not parked here: the event router has not been polled yet, which the worker-thread

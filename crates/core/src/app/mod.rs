@@ -23,6 +23,7 @@ pub mod editing;
 #[cfg(feature = "flickr")]
 pub mod flickr;
 pub mod bundles;
+pub mod cache;
 #[cfg(feature = "collage")]
 pub mod collage;
 pub mod events;

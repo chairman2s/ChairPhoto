@@ -6,8 +6,8 @@
 //! so image bytes never cross the IPC boundary as base64.
 
 use super::*;
-use std::path::{Path, PathBuf};
-use tauri::{AppHandle, State};
+use std::path::Path;
+use tauri::State;
 
 /// The loopback port serving catalog videos (`http://127.0.0.1:<port>/<photo_id>`), for the
 /// frontend `<video>` player. 0 if the server failed to start.
@@ -19,103 +19,19 @@ pub fn video_server_port() -> u16 {
 /// Pre-generate cached images for every photo in the catalog, in parallel across
 /// CPU cores. Thumbnails are always generated; previews too when `include_previews`
 /// is set (this is the "cache on import" option — slower but makes the loupe
-/// instant). Progress is streamed to the frontend via `cache:progress` events.
+/// instant). Progress is streamed to the frontend via `cache:progress` events, numbered by
+/// the warm-up's job id. The body is the core's owned job (`app::cache`): a newer warm-up or
+/// a catalog switch stops this one, which then answers `CACHE_CANCELLED`.
 ///
 /// `async` + `spawn_blocking` so the heavy work runs off both the UI thread and
 /// the async runtime.
 #[tauri::command]
-pub async fn cache_images(
-    app: AppHandle,
-    state: State<'_, AppState>,
-    include_previews: bool,
-) -> Result<(), String> {
-    // Gather each photo's path CANDIDATES under one brief lock (pure SQL — no stats), so
-    // resolving the whole library never holds the lock across NAS stats. The existence
-    // check then happens off the lock, on the blocking worker, via `pick_existing`.
-    let candidate_lists: Vec<(i64, Vec<crate::catalog::PathCandidate>)> = with_catalog(&state, |c| {
-        let mut lists = Vec::new();
-        for photo in c.list_photos(&crate::catalog::PhotoQuery::default())? {
-            lists.push((photo.id, c.photo_path_candidates(photo.id)?));
-        }
-        Ok(lists)
-    })?;
-    let health = state.volume_health.clone();
-    let items: Vec<(i64, PathBuf)> = crate::app::spawn_blocking(move || {
-        candidate_lists
-            .into_iter()
-            .filter_map(|(id, cands)| {
-                // Skip photos whose originals aren't currently reachable (e.g. offline NAS).
-                // OriginalRequired: this builds the cache *from* originals, so a stale
-                // reachability flag must not silently drop a photo from the warm-up.
-                crate::volume_health::pick_existing(
-                    &cands,
-                    &health,
-                    crate::catalog::ResolveMode::OriginalRequired,
-                )
-                .map(|abs| (id, abs))
-            })
-            .collect()
-    })
-    .await
-    .map_err(|e| e.to_string())?;
-
-    let total = items.len();
-    if total == 0 {
-        return Ok(());
-    }
-
-    // (photo_id, is_grayscale) computed from each thumbnail, applied to the catalog
-    // after the parallel pass (workers don't hold the lock).
-    let grayscale = std::sync::Mutex::new(Vec::<(i64, bool)>::with_capacity(total));
-    let grayscale = crate::app::spawn_blocking(move || {
-        let done = AtomicUsize::new(0);
-        let workers = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(4)
-            .min(total);
-        let chunk_size = total.div_ceil(workers);
-
-        std::thread::scope(|scope| {
-            for chunk in items.chunks(chunk_size) {
-                let done = &done;
-                let app = &app;
-                let grayscale = &grayscale;
-                scope.spawn(move || {
-                    for (photo_id, path) in chunk {
-                        // Generate every requested size from ONE extraction + decode (I7b):
-                        // when previews are wanted, `warm_all_sizes` reads the RAW off the
-                        // NAS once and downscales thumb+preview(+zoom) from the single decode,
-                        // instead of a separate read/decode per size.
-                        if include_previews {
-                            let _ = crate::thumbnails::warm_all_sizes(path);
-                        }
-                        // Compute the B&W flag from the thumbnail (cheap, now cached by the
-                        // step above when previews were warmed). A decode failure records
-                        // `false` (can't confirm B&W) so the flag is always set, not NULL.
-                        let gray = thumbnail_bytes(path)
-                            .map(|t| crate::thumbnails::is_grayscale_jpeg(&t))
-                            .unwrap_or(false);
-                        grayscale.lock().unwrap().push((*photo_id, gray));
-                        let n = done.fetch_add(1, Ordering::Relaxed) + 1;
-                        let _ = app.send(CoreEvent::CacheProgress(CacheProgress { done: n, total }));
-                    }
-                });
-            }
-        });
-        grayscale.into_inner().unwrap()
-    })
-    .await
-    .map_err(|e| e.to_string())?;
-
-    // Persist the flags and refresh the monochrome auto-tag.
-    with_catalog(&state, |c| {
-        for (photo_id, gray) in &grayscale {
-            c.set_grayscale(*photo_id, *gray)?;
-        }
-        c.apply_auto_tags()
-    })?;
-
-    Ok(())
+pub async fn cache_images(state: State<'_, AppState>, include_previews: bool) -> Result<(), String> {
+    let state = state.inner().clone();
+    crate::app::spawn_blocking(move || crate::app::cache::cache_images(&state, include_previews))
+        .await
+        .map_err(|e| e.to_string())?
+        .map(|_| ())
 }
 
 /// Return a photo's grid thumbnail as a `data:image/jpeg;base64,...` URI, ready to

@@ -31,7 +31,8 @@
 //! **catalog → abort generations → status slots**, and within each of the last two groups
 //! the declaration order of [`JobRegistry`]: scan, face indexing, face matching, sharpness,
 //! pHash, trash, import, reconcile, Smart Tagging, identity repair, burst analysis, export,
-//! bundle export, slideshow, LocalSend send, the Flickr, SmugMug and Instagram uploads.
+//! bundle export, slideshow, LocalSend send, the Flickr, SmugMug and Instagram uploads, the
+//! cache warm-up.
 //!
 //! Every nested acquisition in the backend obeys it:
 //!
@@ -48,7 +49,7 @@
 //! | `uploads::claim_upload` (a Flickr/SmugMug upload or an Instagram post start) | catalog → that service's upload abort, joined ([`AbortGeneration::join_numbered`]), never tripped |
 //! | [`AbortGeneration::install_fresh_if_owner`] (a card import committing to index) | the scan abort → the import abort |
 //! | [`AbortGeneration::install_fresh_if_newer`] (a burst-analysis worker's claim) | one abort, released before the catalog is read |
-//! | `exports::claim_export`, `exports::claim_bundle_export` | one abort, released before the catalog is read |
+//! | `exports::claim_export`, `exports::claim_bundle_export`, `cache::claim_cache` | one abort, released before the catalog is read |
 //! | `exports::export_bundle_claimed_with`'s publish (its last abort check and the bundle's rename into place) | the bundle-export abort alone, after the catalog was released |
 //! | [`AbortGeneration::trip`] (every Cancel command) | one abort |
 //! | [`JobSlot`] writes (workers) | one slot |
@@ -578,6 +579,11 @@ pub struct JobRegistry {
     /// joined as [`Self::upload_flickr`]. Stopped before Chrome has the render, a post stops;
     /// once the composer has it, the browser window is the cancel (docs/instagram.md).
     pub upload_instagram: AbortGeneration,
+    /// The batch cache warm-up (`app::cache`, after a rescan): thumbnails, optionally
+    /// previews, and the B&W flags. A newer warm-up or a catalog switch trips it; the workers
+    /// stop before their next photo and a tripped pass stores nothing. No status slot — its
+    /// `cache:progress` events carry the job id and the run returns its own terminal result.
+    pub cache: AbortGeneration,
     /// The Develop session's working image (docs/plans/raw-foundation): one claim per
     /// opened photo; a switch, exit or catalog change trips it and the image is released.
     #[cfg(all(feature = "raw", feature = "edit"))]
@@ -625,6 +631,7 @@ impl JobRegistry {
             upload_flickr: _,
             upload_smugmug: _,
             upload_instagram: _,
+            cache: _,
             #[cfg(all(feature = "raw", feature = "edit"))]
             develop,
         } = self;
@@ -674,6 +681,7 @@ impl JobRegistry {
             upload_flickr,
             upload_smugmug,
             upload_instagram,
+            cache,
             #[cfg(all(feature = "raw", feature = "edit"))]
             develop,
         } = self;
@@ -701,6 +709,7 @@ impl JobRegistry {
             upload_flickr: upload_flickr.lock()?,
             upload_smugmug: upload_smugmug.lock()?,
             upload_instagram: upload_instagram.lock()?,
+            cache: cache.lock()?,
             #[cfg(all(feature = "raw", feature = "edit"))]
             develop: develop.abort.lock()?,
         })
@@ -732,6 +741,7 @@ pub struct AbortGuards<'a> {
     upload_flickr: MutexGuard<'a, Arc<AtomicBool>>,
     upload_smugmug: MutexGuard<'a, Arc<AtomicBool>>,
     upload_instagram: MutexGuard<'a, Arc<AtomicBool>>,
+    cache: MutexGuard<'a, Arc<AtomicBool>>,
     #[cfg(all(feature = "raw", feature = "edit"))]
     develop: MutexGuard<'a, Arc<AtomicBool>>,
 }
@@ -763,6 +773,7 @@ impl AbortGuards<'_> {
             upload_flickr,
             upload_smugmug,
             upload_instagram,
+            cache,
             #[cfg(all(feature = "raw", feature = "edit"))]
             develop,
         } = self;
@@ -789,6 +800,7 @@ impl AbortGuards<'_> {
         upload_flickr.store(true, Ordering::Relaxed);
         upload_smugmug.store(true, Ordering::Relaxed);
         upload_instagram.store(true, Ordering::Relaxed);
+        cache.store(true, Ordering::Relaxed);
         #[cfg(all(feature = "raw", feature = "edit"))]
         develop.store(true, Ordering::Relaxed);
     }
@@ -837,6 +849,7 @@ impl AbortGuards<'_> {
             ref mut upload_flickr,
             ref mut upload_smugmug,
             ref mut upload_instagram,
+            ref mut cache,
             #[cfg(all(feature = "raw", feature = "edit"))]
                 ref mut develop,
         } = self;
@@ -871,6 +884,7 @@ impl AbortGuards<'_> {
         **upload_flickr = Arc::new(AtomicBool::new(false));
         **upload_smugmug = Arc::new(AtomicBool::new(false));
         **upload_instagram = Arc::new(AtomicBool::new(false));
+        **cache = Arc::new(AtomicBool::new(false));
         #[cfg(all(feature = "raw", feature = "edit"))]
         {
             **develop = Arc::new(AtomicBool::new(false));
@@ -1281,6 +1295,7 @@ mod tests {
         let (localsend, _) = registry.localsend.install_fresh_numbered().unwrap();
         let uploads = [&registry.upload_flickr, &registry.upload_smugmug, &registry.upload_instagram]
             .map(|g| g.join_numbered().unwrap().0);
+        let (cache, _) = registry.cache.install_fresh_numbered().unwrap();
 
         let identity = begin_identity(&registry, &catalog).unwrap();
         #[cfg(feature = "smarttags")]
@@ -1294,6 +1309,7 @@ mod tests {
         assert!(scan.load(Ordering::Relaxed), "phase one must trip the scan generation");
         assert!(sharpness.load(Ordering::Relaxed), "phase one must trip sharpness too");
         assert!(burst.load(Ordering::Relaxed), "and a burst analysis");
+        assert!(cache.load(Ordering::Relaxed), "and a cache warm-up");
         #[cfg(feature = "slideshow")]
         assert!(slideshow.load(Ordering::Relaxed), "and a slideshow render");
         #[cfg(feature = "localsend")]

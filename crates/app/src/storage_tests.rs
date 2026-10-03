@@ -280,18 +280,92 @@ fn a_rescan_reports_and_a_stale_rescan_is_dropped(cx: &mut TestAppContext) {
     let dir = TempDir::new("rescan");
     let app = start(cx);
     open_catalog(&app, &dir, cx);
+    work(cx); // the launch checks
     std::fs::create_dir_all(dir.0.join("photos")).unwrap();
     std::fs::write(dir.0.join("photos/a.jpg"), b"jpeg").unwrap();
     dispatch(&app, crate::shell::actions::RescanLibrary, cx);
     assert_eq!(status(&app, cx), "Scanning library…");
-    work(cx);
+    // Only the rescan's own worker: its result is the status line (the warm-up it starts
+    // is queued behind it).
+    assert_eq!(work_once(cx), 1);
+    cx.run_until_parked();
     assert_eq!(status(&app, cx), "Scanned 1, imported 1 (1 new)");
+    work(cx);
 
     dispatch(&app, crate::shell::actions::RescanLibrary, cx);
     assert_eq!(work_once(cx), 1);
     storage_sees_switch(&app, cx);
     cx.run_until_parked();
     assert_eq!(status(&app, cx), "Scanning library…", "the left catalog's rescan result landed");
+}
+
+// --- cache warm-up after a rescan ----------------------------------------------------------
+
+/// A straggling `cache:progress` from `job`.
+fn cache_straggler(app: &App, job: u64, cx: &mut TestAppContext) {
+    use chairphoto_core::app::{CacheProgress, EventSink as _};
+    app.state.send(CoreEvent::CacheProgress(CacheProgress { job, done: 1, total: 2 }));
+    cx.run_until_parked();
+}
+
+/// App.tsx `onScan`: the rescan's result starts the warm-up — previews only while "Cache
+/// previews on import" is on — its own progress moves the status line on the bench, another
+/// job's does not, and its own result ends it.
+#[gpui_kit::test]
+fn a_rescan_warms_the_cache_and_reports_on_the_bench(cx: &mut TestAppContext) {
+    let dir = TempDir::new("cache");
+    let app = start(cx);
+    open_catalog(&app, &dir, cx);
+    work(cx); // the launch checks
+    std::fs::create_dir_all(dir.0.join("photos")).unwrap();
+    std::fs::write(dir.0.join("photos/a.jpg"), b"jpeg").unwrap();
+    std::fs::write(dir.0.join("photos/b.jpg"), b"jpeg").unwrap();
+    dispatch(&app, crate::shell::actions::RescanLibrary, cx);
+    assert_eq!(work_once(cx), 1, "the rescan");
+    cx.run_until_parked();
+    let job = app.wired.storage.read_with(cx, |s, _| s.cache).expect("the rescan started the warm-up");
+    assert!(job.previews, "previews too: the option defaults on");
+    cache_straggler(&app, job.job + 1, cx);
+    assert_eq!(status(&app, cx), "Scanned 2, imported 2 (2 new)", "another job's progress moved the bench");
+    cache_straggler(&app, job.job, cx);
+    assert_eq!(status(&app, cx), "Caching 1/2…", "its own progress shows");
+    work(cx);
+    assert_eq!(status(&app, cx), "Cache ready", "its own result ends it");
+    assert_eq!(app.wired.storage.read_with(cx, |s, _| s.cache), None);
+
+    // With the option off, the next rescan's warm-up caches thumbnails only.
+    click_menu_row(&app, "import-menu", 4, "Cache previews on import", cx);
+    dispatch(&app, crate::shell::actions::RescanLibrary, cx);
+    assert_eq!(work_once(cx), 1);
+    cx.run_until_parked();
+    let job = app.wired.storage.read_with(cx, |s, _| s.cache).expect("started again");
+    assert!(!job.previews, "the option is read when the warm-up starts");
+    work(cx);
+    assert_eq!(status(&app, cx), "Cache ready");
+}
+
+/// **Forced interleaving.** A catalog switch lands after the warm-up was claimed and before
+/// its worker ran: the core trips it (it answers cancelled, storing nothing), its result is
+/// dropped, and a straggler of it moves nothing.
+#[gpui_kit::test]
+fn a_switch_stops_the_warm_up_and_drops_its_result(cx: &mut TestAppContext) {
+    let dir = TempDir::new("cache-switch");
+    let app = start(cx);
+    open_catalog(&app, &dir, cx);
+    work(cx); // the launch checks
+    std::fs::create_dir_all(dir.0.join("photos")).unwrap();
+    std::fs::write(dir.0.join("photos/a.jpg"), b"jpeg").unwrap();
+    dispatch(&app, crate::shell::actions::RescanLibrary, cx);
+    assert_eq!(work_once(cx), 1);
+    cx.run_until_parked();
+    let job = app.wired.storage.read_with(cx, |s, _| s.cache).unwrap();
+    switch_catalog_now(&app, &dir, cx);
+    assert_eq!(app.wired.storage.read_with(cx, |s, _| s.cache), None, "the switch dropped it");
+    work(cx);
+    let after = status(&app, cx);
+    assert!(!after.starts_with("Cache"), "the left catalog's warm-up reported: {after}");
+    cache_straggler(&app, job.job, cx);
+    assert!(!status(&app, cx).starts_with("Caching"), "its straggler moved the bench");
 }
 
 // --- catalog switcher ---------------------------------------------------------------------

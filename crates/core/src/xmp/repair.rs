@@ -17,12 +17,16 @@
 //! | `parseType` | a property element or `rdf:li` | `rdf:parseType` |
 //! | `w`, `h`, `unit` | `mwg-rs:AppliedToDimensions` (or its one nested `rdf:Description`) | `stDim:w`, `stDim:h`, `stDim:unit` |
 //! | `x`, `y`, `w`, `h`, `unit` | `mwg-rs:Area` (or its one nested `rdf:Description`) | `stArea:x` … `stArea:unit` |
+//! | `Name`, `Type`, `Rotation` | the `rdf:Description` of a `RegionList` item (digiKam's form) | `mwg-rs:` |
+//! | `lang` | an `rdf:li` of an `rdf:Alt` | `xml:lang` |
 //!
 //! The first two are what RDF/XML itself reads an unqualified `about` / `parseType` as (RDF/XML
 //! Syntax Specification, § 6.1.4, kept for backwards compatibility), so re-prefixing them
 //! changes no meaning. The struct fields have one possible meaning on those elements: the MWG
-//! schema defines no other `w`/`h`/`unit`/`x`/`y` there. Every other unprefixed attribute (a
-//! dropped `digiKam:Confidence`, say) has no knowable namespace and is left as it is.
+//! schema defines no other `w`/`h`/`unit`/`x`/`y` there, nor other `Name`/`Type`/`Rotation` on a
+//! region, and `lang` on a Lang Alt item can only be `xml:lang`. The last two rows are skipped,
+//! not treated as ambiguous, where the prefixed counterpart exists. Every other unprefixed
+//! attribute (a dropped `digiKam:Confidence`, say) has no knowable namespace and is left as it is.
 //!
 //! The repair runs only on a sidecar that carries `chairphoto:LastWrite` — one a ChairPhoto
 //! release has written, so the damage is ours — and only when it is unambiguous: if any
@@ -104,12 +108,62 @@ fn repair_node(e: &mut Element, count: &mut usize) -> Result<(), String> {
             }
         }
     }
+    if is_rdf(e, "Alt") {
+        for li in rdf_children(e, "li") {
+            restore_xml_lang(li, count);
+        }
+    }
+    if e.namespace.as_deref() == Some(NS_MWG_RS) && e.name == "RegionList" {
+        // digiKam's region form: `<rdf:li><rdf:Description mwg-rs:Name=…>`.
+        for container in e.children.iter_mut().filter_map(element_mut) {
+            for li in rdf_children(container, "li") {
+                for d in rdf_children(li, "Description") {
+                    for f in ["Name", "Type", "Rotation"] {
+                        restore_if_free(d, f, NS_MWG_RS, "mwg-rs", count);
+                    }
+                }
+            }
+        }
+    }
     for node in &mut e.children {
         if let XMLNode::Element(c) = node {
             repair_node(c, count)?;
         }
     }
     Ok(())
+}
+
+fn element_mut(n: &mut XMLNode) -> Option<&mut Element> {
+    match n {
+        XMLNode::Element(e) => Some(e),
+        _ => None,
+    }
+}
+
+/// `parent`'s `rdf:<name>` element children.
+fn rdf_children<'a>(parent: &'a mut Element, name: &'a str) -> impl Iterator<Item = &'a mut Element> {
+    parent.children.iter_mut().filter_map(element_mut).filter(move |c| is_rdf(c, name))
+}
+
+/// [`restore`], except that an attribute with a prefixed counterpart is left as it is rather than
+/// making the file ambiguous: for the fields a later tool may have written beside the damaged
+/// one (#143 review, L1).
+fn restore_if_free(e: &mut Element, local: &str, ns: &str, preferred: &str, count: &mut usize) {
+    if ns_attr(e, ns, local).is_none() && child(e, ns, local).is_none() {
+        restore(e, local, ns, preferred, count).expect("no counterpart, so not ambiguous");
+    }
+}
+
+/// `lang` → `xml:lang` on an `rdf:li` of an `rdf:Alt` that has no `xml:lang` (#143 review, L2).
+/// The `xml` prefix is bound by definition, so it needs no declaration.
+fn restore_xml_lang(li: &mut Element, count: &mut usize) {
+    if li.attributes.contains_key("xml:lang") {
+        return;
+    }
+    if let Some(v) = li.attributes.remove("lang") {
+        li.attributes.insert("xml:lang".to_string(), v);
+        *count += 1;
+    }
 }
 
 /// The released writers parsed with xmltree (turning `rdf:about` into `about`) and then ensured
@@ -313,6 +367,70 @@ mod tests {
             assert_eq!(abouts.len(), 1, "{case}: one about, in rdf: {abouts:?}\n{xml}");
             assert!(has_attr(&xml, (NS_RDF, "Description"), (NS_RDF, "about"), ""), "{case}: {xml}");
         }
+    }
+
+    const NS_XML: &str = "http://www.w3.org/XML/1998/namespace";
+
+    /// An intact sidecar ChairPhoto wrote with digiKam's nested-Description region (Dora: Name,
+    /// Type and Rotation as attributes on the li's `rdf:Description`) and a Lang Alt title.
+    /// One title li carries both `lang` and `xml:lang`, the way a file another tool touched
+    /// after the damage could: that `lang` has a prefixed counterpart and is left alone.
+    const INTACT_DIGIKAM: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<x:xmpmeta xmlns:x="adobe:ns:meta/">
+ <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+  <rdf:Description rdf:about=""
+    xmlns:dc="http://purl.org/dc/elements/1.1/"
+    xmlns:chairphoto="https://chairphoto.local/ns/1.0/"
+    xmlns:mwg-rs="http://www.metadataworkinggroup.com/schemas/regions/"
+    xmlns:stArea="http://ns.adobe.com/xmp/sType/Area#">
+   <dc:title>
+    <rdf:Alt>
+     <rdf:li xml:lang="x-default">Fjord</rdf:li>
+     <rdf:li xml:lang="nb">Fjorden</rdf:li>
+    </rdf:Alt>
+   </dc:title>
+   <mwg-rs:Regions rdf:parseType="Resource">
+    <mwg-rs:RegionList>
+     <rdf:Bag>
+      <rdf:li>
+       <rdf:Description mwg-rs:Name="Dora" mwg-rs:Type="Face" mwg-rs:Rotation="0">
+        <mwg-rs:Area stArea:x="0.6" stArea:y="0.6" stArea:w="0.1" stArea:h="0.1" stArea:unit="normalized"/>
+       </rdf:Description>
+      </rdf:li>
+     </rdf:Bag>
+    </mwg-rs:RegionList>
+   </mwg-rs:Regions>
+   <chairphoto:LastWrite>1727000000</chairphoto:LastWrite>
+  </rdf:Description>
+ </rdf:RDF>
+</x:xmpmeta>"#;
+
+    /// L1 + L2 of the #143 review: the released writer also dropped the `mwg-rs:` of a
+    /// nested-Description region's Name/Type/Rotation (the region then read back nameless) and
+    /// the `xml:` of a Lang Alt item's `xml:lang`. Both are restored, on read and on write; a
+    /// `lang` beside an `xml:lang` is left as it is.
+    #[test]
+    fn region_fields_on_a_nested_description_and_alt_languages_are_restored() {
+        let damaged = released_rewrite(INTACT_DIGIKAM)
+            .replacen(r#"lang="nb""#, r#"lang="nb" xml:lang="nn""#, 1);
+        assert!(damaged.contains(r#" Name="Dora""#) && damaged.contains(r#" lang="x-default""#), "{damaged}");
+        assert!(damaged.contains(r#"xml:lang="nn""#), "{damaged}");
+        let (_dir, photo) = seeded_photo("xmp-143-digikam", &damaged);
+        assert_eq!(region_names(&photo), ["Dora"], "read: the name is restored in memory");
+
+        write_face_regions(&photo, CAT, &[carl()], &[], &[], sized(6000, 4000)).unwrap();
+        let xml = read(&sidecar_path(&photo));
+        let desc = (NS_RDF, "Description");
+        assert!(has_attr(&xml, desc, (NS_MWG_RS, "Name"), "Dora"), "{xml}");
+        assert!(has_attr(&xml, desc, (NS_MWG_RS, "Type"), "Face"), "{xml}");
+        assert!(has_attr(&xml, desc, (NS_MWG_RS, "Rotation"), "0"), "{xml}");
+        let li = (NS_RDF, "li");
+        assert!(has_attr(&xml, li, (NS_XML, "lang"), "x-default"), "{xml}");
+        // The li that had both keeps both, as they were.
+        assert!(has_attr(&xml, li, ("", "lang"), "nb"), "{xml}");
+        assert!(has_attr(&xml, li, (NS_XML, "lang"), "nn"), "{xml}");
+        assert!(xml.contains("Fjorden"), "{xml}");
+        assert_eq!(region_names(&photo), ["Carl", "Dora"]);
     }
 
     /// Reading repairs in memory (#143 review, M1): the regions of a sidecar a released build

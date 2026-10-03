@@ -121,9 +121,13 @@ restores; nothing else is touched:
 | `parseType` | a property element or `rdf:li` | `rdf:parseType` |
 | `w`, `h`, `unit` | `mwg-rs:AppliedToDimensions` | `stDim:` |
 | `x`, `y`, `w`, `h`, `unit` | `mwg-rs:Area` | `stArea:` |
+| `Name`, `Type`, `Rotation` | a region's nested `rdf:Description` (digiKam's form) | `mwg-rs:` |
+| `lang` | an `rdf:li` of an `rdf:Alt` | `xml:lang` |
 
 The first two are how RDF/XML itself reads an unqualified `about` or `parseType`. The MWG
-fields have no other meaning on those elements. Attributes whose namespace is lost for good,
+fields have no other meaning on those elements, and a Lang Alt item's `lang` can only be
+`xml:lang`. The last two rows are skipped, rather than treated as ambiguous, where the prefixed
+counterpart is already there. Attributes whose namespace is lost for good,
 such as `Confidence`, stay as they are. The repair runs only when it is unambiguous. If any
 element already carries the attribute that would be restored (`parseType` beside
 `rdf:parseType`, `x` beside `stArea:x`, `about` beside a different non-empty `rdf:about`),

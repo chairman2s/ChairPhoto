@@ -1219,8 +1219,9 @@ impl PhotoInspector {
     /// follows.
     pub fn cancel_rapidraw(&mut self, cx: &mut Context<Self>) {
         let Some(id) = self.photo_id else { return };
+        let Some(from) = self.from else { return };
         let Some(run) = self.rapid.get(&id).copied() else { return };
-        if let Err(e) = chairphoto_core::rapidraw::cancel_rapidraw_job(id, run.job) {
+        if let Err(e) = chairphoto_core::rapidraw::cancel_rapidraw_job(from, id, run.job) {
             self.status(format!("Cancel failed: {e}"), cx);
         }
     }

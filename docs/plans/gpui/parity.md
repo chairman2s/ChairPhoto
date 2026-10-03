@@ -1340,7 +1340,8 @@ Used only by CullSession.
 
 **Status:** built (#109: folded into `crates/app/src/loupe/cull.rs`, "No preview
 available"), visually checked 2026-10-03 (#163);
-the frame is cropped instead of fitted (#174)
+the frame was cropped instead of fitted (#174); since bdf59ea the stage letterboxes
+(contain) for every orientation, built, awaiting a visual re-check.
 
 ### `src/components/CompareView.tsx`
 
@@ -1366,7 +1367,8 @@ Empty "Nothing to compare… press C".
 **Status:** built (#109: `crates/app/src/loupe/compare_view.rs`, `loupe/compare.rs`;
 mode in machine prefs `panel.compareMode`), visually checked 2026-10-03
 (#163: Duel and Grid mode; paging not exercised;
-a portrait frame in a narrow Grid pane is cropped, #175).
+a portrait frame in a narrow Grid pane was cropped, #175; since bdf59ea Grid panes re-fit
+when their box changes (Duel ↔ Grid, panel toggles), built, awaiting a visual re-check).
 Difference: no "Nothing to compare" state — Compare ends when no pane is left
 (`shell/state.rs:926-929`)
 
@@ -1399,7 +1401,8 @@ r/y/g/b/v label, n clears (all advance)
 
 **Status:** built (#109: `crates/app/src/loupe/cull.rs` `CullState` / `CullView`;
 keys in `loupe/mod.rs`, CULL context), visually checked 2026-10-03 (#163):
-HUD, help, rating with advance, summary; the frame is cropped instead of fitted (#174)
+HUD, help, rating with advance, summary; the frame was cropped instead of fitted (#174),
+letterboxed since bdf59ea (awaiting a visual re-check).
 
 ### `src/modules/compareDuel.ts`
 
@@ -1805,8 +1808,10 @@ hint "↓ same · Esc done".
 pills, two 1024 px variants, click or ← This one / This one →, ⑂ fork ("Kept as …"), "↓ same
 · Esc done";
 keys ←/→/↓/Esc under the `Duel` key context.
-Visual check 2026-10-03 (#163): bar, dimension pills and Esc match; the variants are cropped
-and the buttons sit over them (#178).
+Visual check 2026-10-03 (#163): bar, dimension pills and Esc match; the variants were cropped
+and the buttons sat over them (#178). Since bdf59ea the variants contain-fit in their pane
+with the buttons below, at darkroom.css spacing (awaiting a visual re-check). Proof sheet
+cells and preset cards now use cover, as React does.
 
 ### `src/components/darkroom/GlSpike.tsx`
 

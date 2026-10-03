@@ -248,8 +248,7 @@ impl SidecarDocument {
         let stamp = plain("chairphoto", NS_CHAIRPHOTO, "LastWrite", &now().to_string());
         self.replace_owned(&[(NS_CHAIRPHOTO, "LastWrite")], vec![stamp]);
 
-        let mut buf = Vec::new();
-        self.root.write(&mut buf).map_err(|e| e.to_string())?;
+        let buf = super::emit::serialize(&mut self.root)?;
         let written = write_atomically(&self.folder, &self.original, &self.path, &buf);
         let Self { folder, _turn, .. } = self;
         drop(_turn);

@@ -3678,6 +3678,33 @@ mod tests {
         assert_eq!(queue_row(&catalog, row.id, &before), None, "the path it left owes nothing");
     }
 
+    /// #150 (nit from the #146 re-review): a trusted (manifest) id is not recorded on the row
+    /// that merely sits at the same path — that is the file already there, which can be a
+    /// different photo — while a scanned sidecar's id, which describes that very file, is.
+    #[test]
+    fn a_trusted_id_is_not_recorded_on_a_row_matched_by_path() {
+        let (catalog, root, _dir) = temp_catalog("trusted-by-path");
+        let (id, path) = seed_photo(&catalog, &root, "x.jpg");
+        let legacy = |photo: i64| -> Option<String> {
+            catalog
+                .conn()
+                .query_row(
+                    "SELECT identifier FROM photo_legacy_identifiers WHERE photo_id = ?1",
+                    params![photo],
+                    |r| r.get(0),
+                )
+                .optional()
+                .unwrap()
+        };
+        let same = catalog.upsert_photo_with_identity(&path, None, 1, 9, Some("dam:asset/9")).unwrap();
+        assert_eq!((same.id, same.created), (id, false));
+        let on_volume = catalog.upsert_photo_on_volume(&path, 1, 9, Some("dam:asset/9")).unwrap();
+        assert_eq!(on_volume.id, id);
+        assert_eq!(legacy(id), None, "the manifest's id is not this file's");
+        catalog.upsert_scanned_photo(&path, None, 1, 9, Some("dam:asset/9")).unwrap();
+        assert_eq!(legacy(id).as_deref(), Some("dam:asset/9"), "its own sidecar's is");
+    }
+
     /// #146 review N4: v23 agrees with merge that a blank `photos.uuid` names no identity. It
     /// gets a random v4 — never `legacy_photo_identity` of whitespace, which every catalog
     /// would share — and no legacy identifier is recorded for it.

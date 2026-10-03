@@ -876,6 +876,7 @@ impl Catalog {
         let (by_uuid, sidecar_uuid) =
             if held_in_place { (None, None) } else { (by_uuid, sidecar_uuid) };
 
+        let matched_by_path = by_path.is_some();
         let result = if let Some((id, uuid, old_mtime, old_size)) = by_path {
             let unchanged = old_mtime == mtime_ns && old_size == size;
             self.conn.execute(
@@ -923,7 +924,7 @@ impl Catalog {
         self.set_primary_location(result.id, absolute_path)?;
         // A copy kept apart from the row holding its identity does not take its legacy value.
         if !held_in_place {
-            self.record_legacy_identifier(result.id, source.legacy_value())?;
+            self.record_legacy_identifier(result.id, source.legacy_value(matched_by_path))?;
         }
         Ok(result)
     }
@@ -1015,6 +1016,7 @@ impl Catalog {
         let (by_uuid, sidecar_uuid) =
             if held_in_place { (None, None) } else { (by_uuid, sidecar_uuid) };
 
+        let matched_by_path = by_loc.is_some();
         let result = if let Some((id, uuid, old_mtime, old_size)) = by_loc {
             let unchanged = old_mtime == mtime_ns && old_size == size;
             self.conn.execute(
@@ -1054,7 +1056,7 @@ impl Catalog {
         // Record the file's location on its (NAS) volume so the resolver finds it there.
         self.add_location(result.id, volume_id, &rel, LocationRole::Primary)?;
         if !held_in_place {
-            self.record_legacy_identifier(result.id, source.legacy_value())?;
+            self.record_legacy_identifier(result.id, source.legacy_value(matched_by_path))?;
         }
         Ok(result)
     }
@@ -2472,8 +2474,15 @@ impl<'a> IdentitySource<'a> {
     /// It is recorded whichever way the row was matched, so a row catalogued before this
     /// change gains the record at its next rescan; a value another row already holds is not
     /// recorded again.
-    fn legacy_value(&self) -> Option<&'a str> {
+    ///
+    /// A trusted value is not recorded on a row that `matched_by_path` (#150, a nit of the
+    /// #146 re-review): the value names the bundle's photo, and the row at that path is the
+    /// file already there — a same-size collision the importer skipped onto may be the
+    /// user's own, different photo. A sidecar's value describes the file at that path, so
+    /// it is recorded either way.
+    fn legacy_value(&self, matched_by_path: bool) -> Option<&'a str> {
         match *self {
+            IdentitySource::Trusted(_) if matched_by_path => None,
             IdentitySource::Trusted(value) | IdentitySource::Sidecar(value) => value,
         }
     }

@@ -875,7 +875,7 @@ impl Catalog {
         let held_in_place = match by_uuid {
             Some(id) => {
                 let (volume_id, _) = self.volume_for_path(absolute_path)?;
-                self.primary_copy_left_in_place(id, volume_id, true)?
+                self.primary_copy_left_in_place(id, volume_id, true, absolute_path)?
             }
             None => false,
         };
@@ -1016,7 +1016,7 @@ impl Catalog {
         // in place is not moved off it. One whose primary copies are on other volumes gains
         // this file as another location; that moves nothing.
         let held_in_place = match &by_uuid {
-            Some((id, _)) => self.primary_copy_left_in_place(*id, volume_id, false)?,
+            Some((id, _)) => self.primary_copy_left_in_place(*id, volume_id, false, absolute)?,
             None => false,
         };
         let (by_uuid, sidecar_uuid) =

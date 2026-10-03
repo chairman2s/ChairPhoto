@@ -344,6 +344,17 @@ file found on a volume indexed in place as another location; that moves nothing.
 whose photo lands as such a separate copy still merges its tags onto the existing row, which
 merge matches by identity.
 
+"Still in place" is a question about the file, not the name (#184). On a case-insensitive
+filesystem (APFS and HFS+ by default, exFAT and vfat drives, a casefold directory) the old
+name of a case-only rename, `IMG.ARW` → `img.arw`, still opens the renamed file, so testing
+the recorded path with `exists()` kept the file apart from its own row. The guard therefore
+asks whether the recorded path opens the very file being scanned (same device and inode;
+the canonical path off Unix) and, if it does, whether the recorded name — and each folder
+name it does not share with the scanned path — is still in its folder's listing. A name the
+filesystem only folds onto the renamed file is not, so the row re-homes; a second hard link
+is, so it stays a copy of its own. An unreadable listing counts as listed. The legacy-identifier
+re-home (`every_primary_copy_is_gone`) still tests `exists()`.
+
 **A re-minted legacy identity is a UUID v5, not v4.** This is the one exception to "a UUID v4
 on first import": a photo imported fresh still gets a random v4, but a value that already
 served as a photo's identity is re-minted as `catalog::legacy_photo_identity` — UUID v5 of the

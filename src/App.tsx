@@ -2089,6 +2089,7 @@ export default function App() {
             setShowIdentityDebt(false);
             refreshIdentityDebtCount(); // a repair pass may have cleared some debt
           }}
+          onCountsChanged={() => void refreshIdentityDebtCount()}
         />
       )}
 

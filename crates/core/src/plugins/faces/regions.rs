@@ -260,15 +260,23 @@ where
     let catalog = crate::catalog::read_catalog_uuid(conn)
         .map_err(|e| e.to_string())?
         .ok_or_else(|| RegionWriteError::Failed("face regions not written: the catalog has no identity yet".into()))?;
-    let regions = confirmed_regions(conn, photo_id).map_err(|e| e.to_string())?;
-    let retired = retired_faces(conn, photo_id, &regions).map_err(|e| e.to_string())?;
-    let legacy = legacy_regions(conn, photo_id).map_err(|e| e.to_string())?;
-    let frame = region_frame(conn, photo_id).map_err(|e| e.to_string())?;
-
     let Some(path) = resolve(photo_id)? else {
         return Ok(()); // offline — skip, re-sync later.
     };
-    crate::xmp::write_face_regions(&path, &catalog, &regions, &retired, &legacy, frame)?;
+    #[cfg(test)]
+    tests::before_region_write(&path);
+    // The set is read once the sidecar's file lock is held (#156): read before it, a face
+    // verb on another connection could change the set and write the sidecar in between, and
+    // this write would then put the older set back. Reads only, on `conn` (WAL), under that
+    // lock (a leaf: see `app/jobs.rs`).
+    crate::xmp::write_face_regions_gathered(&path, &catalog, || {
+        let read = |e: rusqlite::Error| e.to_string();
+        let regions = confirmed_regions(conn, photo_id).map_err(read)?;
+        let retired = retired_faces(conn, photo_id, &regions).map_err(read)?;
+        let legacy = legacy_regions(conn, photo_id).map_err(read)?;
+        let frame = region_frame(conn, photo_id).map_err(read)?;
+        Ok(crate::xmp::RegionSet { regions, retired, legacy, frame })
+    })?;
     conn.execute_batch(&format!(
         "DELETE FROM faces__legacy_regions WHERE photo_id = {photo_id};
          DELETE FROM faces__legacy_refused WHERE photo_id = {photo_id};"
@@ -389,9 +397,25 @@ fn parse_bbox(s: &str) -> Option<(f32, f32, f32, f32)> {
 // ── Tests ─────────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::plugins::faces::store;
+
+    /// A hook [`write_photo_regions`] runs once its photo's path is resolved and before the
+    /// sidecar is opened, once, for the photo path it names — so a test can act in the window
+    /// between a writer deciding to write and taking the sidecar's file lock (#156).
+    type Hook = (std::path::PathBuf, Box<dyn FnOnce() + Send>);
+    pub(crate) static BEFORE_REGION_WRITE: std::sync::Mutex<Option<Hook>> = std::sync::Mutex::new(None);
+
+    pub(super) fn before_region_write(path: &std::path::Path) {
+        let hook = {
+            let mut slot = BEFORE_REGION_WRITE.lock().unwrap_or_else(|e| e.into_inner());
+            if slot.as_ref().is_some_and(|(p, _)| p == path) { slot.take() } else { None }
+        };
+        if let Some((_, hook)) = hook {
+            hook();
+        }
+    }
 
     fn mem_conn() -> Connection {
         let conn = Connection::open_in_memory().unwrap();

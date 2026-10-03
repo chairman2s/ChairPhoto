@@ -24,11 +24,14 @@
 //! and its frame is no longer the one the boxes were measured in (React drew them there anyway,
 //! misplaced). The same holds for the Darkroom's **print** in the pop-out (#110): it is drawn
 //! from the edit's own render (`Drawn::OverrideLo`/`Hi`), so the boxes are hidden there too,
-//! with the same note. Drawing them when the print's geometry equals the original's (no crop,
-//! straighten or rotation in the edit) was considered and not done: the overlay would have to
-//! read the edit's geometry, which lives in the Darkroom and reaches the loupe only as pixels,
-//! and a rule that shows boxes on some prints and not others would read as a bug. Hidden with
-//! the note is the decision, until the edit carries a box transform the overlay can apply.
+//! with the same note. And for the photo's thumbnail when it is its **cover** version's render
+//! (#152, `Loaded::cover`), which the loupe draws as a placeholder until the preview lands:
+//! hidden, with the same note. Drawing them when the print's geometry equals the original's
+//! (no crop, straighten or rotation in the edit) was considered and not done: the overlay
+//! would have to read the edit's geometry, which lives in the Darkroom and reaches the loupe
+//! only as pixels, and a rule that shows boxes on some prints and not others would read as a
+//! bug. Hidden with the note is the decision, until the edit carries a box transform the
+//! overlay can apply.
 //!
 //! **Where the transform comes from.** The slot hands a panel only a window, so the overlay
 //! asks the host which loupe image that window shows ([`loupe_zoom`], i.e.
@@ -200,6 +203,11 @@ impl FaceOverlay {
             return None;
         }
         let ImageState::Ready(loaded) = images.peek(photo, kind) else { return None };
+        if loaded.cover {
+            // The cover version's thumbnail (the placeholder while the preview loads): not the
+            // original's frame (#152).
+            return None;
+        }
         let size = loaded.image.size(0);
         let bounds = z.bounds()?;
         Some(Frame {
@@ -212,10 +220,17 @@ impl FaceOverlay {
         })
     }
 
-    /// Whether the loupe shows an edited version's render of the faces' photo.
+    /// Whether the loupe shows an edited version's render of the faces' photo: the version
+    /// shown, or the cover version's thumbnail standing in for the preview (#152).
     fn on_version(&self, cx: &App) -> bool {
         let Some(zoom) = self.zoom.as_ref().and_then(|z| z.upgrade()) else { return false };
-        matches!(zoom.read(cx).drawn(), Some((_, Drawn::OverrideLo | Drawn::OverrideHi)))
+        match zoom.read(cx).drawn() {
+            Some((_, Drawn::OverrideLo | Drawn::OverrideHi)) => true,
+            Some((photo, Drawn::Thumb)) => self.images.as_ref().is_some_and(|images| {
+                matches!(images.read(cx).peek(photo, ImageKind::Thumb), ImageState::Ready(l) if l.cover)
+            }),
+            _ => false,
+        }
     }
 
     fn local(frame: &Frame, p: Point<Pixels>) -> (f32, f32) {

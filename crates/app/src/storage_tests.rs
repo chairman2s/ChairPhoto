@@ -802,6 +802,158 @@ fn owed_iptc_alone_shows_the_chip_and_starts_the_pass(cx: &mut TestAppContext) {
     app.wired.shell.read_with(cx, |s, _| assert_eq!(s.counts.identity_debt, Some(0)));
 }
 
+// --- owed IPTC per photo (#153) -------------------------------------------------------------
+
+/// A catalog whose `n` photos are reachable, owe no identity, and each owe a title
+/// (`T<i>`) their sidecar never received.
+fn catalog_owing_iptc(app: &App, dir: &TempDir, n: usize, cx: &mut TestAppContext) -> Vec<i64> {
+    let ids = open_catalog_with_photos(app, dir, n, cx);
+    {
+        let guard = app.state.catalog.lock().unwrap();
+        let c = guard.as_ref().unwrap();
+        for i in 0..n {
+            let p = dir.0.join(format!("photos/2026/p{i}.ARW"));
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, b"raw").unwrap();
+        }
+        c.repair_pending_identity().unwrap();
+        for (i, id) in ids.iter().enumerate() {
+            let fields = chairphoto_core::catalog::IptcFields { title: format!("T{i}"), ..Default::default() };
+            c.set_iptc(*id, &fields).unwrap(); // stored, owed, never written
+        }
+        let s = c.summarize_pending_identity().unwrap();
+        assert_eq!((s.total, s.iptc_owed), (0, n as i64));
+    }
+    app.wired.model.update(cx, |m, cx| m.refresh(cx));
+    work(cx);
+    ids
+}
+
+fn sidecar_text(path: &std::path::Path) -> String {
+    std::fs::read_to_string(chairphoto_core::xmp::sidecar_path(path)).unwrap_or_default()
+}
+
+fn open_debt_panel(app: &App, cx: &mut TestAppContext) -> Entity<crate::storage::identity_debt::IdentityDebtPanel> {
+    click(app, "attn-identity", cx);
+    let StorageDialog::IdentityDebt(panel) = dialog(app, cx) else { panic!("the debt panel") };
+    work(cx);
+    panel
+}
+
+fn rendered(app: &App, id: &'static str, cx: &mut TestAppContext) -> bool {
+    cx.update_window(app.window(), |_, window, cx| {
+        window.render_frame(cx);
+        window.try_find(id).is_some()
+    })
+    .unwrap()
+}
+
+/// The panel lists each photo owing IPTC with its fields; Dismiss clears one without writing
+/// its sidecar, Retry writes the other's, and each re-reads the panel's and the title bar's
+/// counts.
+#[gpui_kit::test]
+fn owed_iptc_is_listed_and_dismiss_and_retry_update_the_counts(cx: &mut TestAppContext) {
+    let dir = TempDir::new("debt-owed-list");
+    let app = start(cx);
+    catalog_owing_iptc(&app, &dir, 2, cx);
+    let (p0, p1) = (dir.0.join("photos/2026/p0.ARW"), dir.0.join("photos/2026/p1.ARW"));
+    app.wired.shell.read_with(cx, |s, _| assert_eq!(s.counts.identity_debt, Some(2)));
+
+    let panel = open_debt_panel(&app, cx);
+    panel.read_with(cx, |p, _| {
+        let rows = p.owed.as_ref().expect("the owed list was read");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].fields, ["Title"]);
+        assert!(rows[0].path.ends_with("p0.ARW"), "{:?}", rows[0]);
+    });
+    assert!(rendered(&app, "owed-row-0", cx) && rendered(&app, "owed-row-1", cx), "both rows render");
+
+    click(&app, "owed-dismiss-0", cx);
+    work(cx);
+    panel.read_with(cx, |p, _| {
+        assert!(p.owed_result.as_deref().unwrap_or_default().starts_with("Dismissed."), "{:?}", p.owed_result);
+        assert_eq!(p.owed.as_ref().map(Vec::len), Some(1), "the list was re-read");
+        assert_eq!(p.summary.map(|s| s.iptc_owed), Some(1), "the panel's count");
+    });
+    app.wired.shell.read_with(cx, |s, _| assert_eq!(s.counts.identity_debt, Some(1), "the title bar's count"));
+    assert!(!sidecar_text(&p0).contains("T0"), "Dismiss wrote nothing");
+
+    click(&app, "owed-retry-0", cx);
+    work(cx);
+    panel.read_with(cx, |p, _| {
+        assert_eq!(p.owed_result.as_deref(), Some("Written to the sidecar."), "{:?}", p.owed_error);
+        assert_eq!(p.owed.as_ref().map(Vec::len), Some(0));
+        assert_eq!(p.summary.map(|s| s.iptc_owed), Some(0));
+    });
+    app.wired.shell.read_with(cx, |s, _| assert_eq!(s.counts.identity_debt, Some(0)));
+    assert!(sidecar_text(&p1).contains("T1"), "Retry wrote the owed title");
+    assert!(rendered(&app, "owed-empty", cx), "the section says nothing is owed");
+}
+
+/// **Forced interleaving.** The panel shows catalog A's owed row; the core switches to B,
+/// whose photo has the same id, UUID and generation and also owes IPTC (a copied catalog).
+/// A Dismiss or Retry of A's row — pressed after the switch with the event undelivered, or
+/// queued before it with the event delivered before the worker runs — never touches B.
+fn owed_action_across_a_switch(retry: bool, delivered: bool, cx: &mut TestAppContext) {
+    let dir = TempDir::new("debt-owed-switch");
+    let app = start(cx);
+    let ids = catalog_owing_iptc(&app, &dir, 1, cx);
+    let panel = open_debt_panel(&app, cx);
+    let shown = panel.read_with(cx, |p, _| p.owed.as_ref().unwrap()[0].clone());
+
+    let (b, b_ids) = colliding_catalog(&dir, "b", 1);
+    assert_eq!(b_ids, ids, "the ids collide");
+    let b_file = dir.0.join("b/2026/b0.ARW");
+    std::fs::create_dir_all(b_file.parent().unwrap()).unwrap();
+    std::fs::write(&b_file, b"raw").unwrap();
+    b.conn().execute_batch(&format!("UPDATE photos SET uuid = '{}' WHERE id = {}", shown.uuid, b_ids[0])).unwrap();
+    b.set_iptc(b_ids[0], &chairphoto_core::catalog::IptcFields { title: "B's".into(), ..Default::default() }).unwrap();
+    let b_row = b.list_owed_iptc_page(10, 0).unwrap().remove(0);
+    assert_eq!((b_row.photo_id, &b_row.uuid, b_row.generation), (shown.photo_id, &shown.uuid, shown.generation));
+
+    let press = |cx: &mut TestAppContext| click(&app, if retry { "owed-retry-0" } else { "owed-dismiss-0" }, cx);
+    if delivered {
+        press(cx);
+        core_switch(&app, b);
+        deliver_switch(&app, cx);
+    } else {
+        core_switch(&app, b);
+        press(cx);
+    }
+    work(cx);
+    let after = chairphoto_core::app::with_catalog(&app.state, |c| c.list_owed_iptc_page(10, 0)).unwrap();
+    assert_eq!(after, vec![b_row.clone()], "retry={retry} delivered={delivered}: B's debt was touched");
+    assert!(!sidecar_text(&b_file).contains("B's"), "B's sidecar was written");
+    if delivered {
+        panel.read_with(cx, |p, _| {
+            assert_eq!(p.owed.as_ref(), Some(&vec![b_row.clone()]), "the panel re-read B's list");
+            assert!(p.owed_error.is_none() && p.owed_result.is_none(), "A's answer was dropped");
+        });
+    } else {
+        panel.read_with(cx, |p, _| assert_eq!(p.owed_error.as_deref(), Some(chairphoto_core::app::CATALOG_CHANGED)));
+    }
+}
+
+#[gpui_kit::test]
+fn an_owed_dismiss_never_reaches_the_new_catalog_before_the_switch_event(cx: &mut TestAppContext) {
+    owed_action_across_a_switch(false, false, cx);
+}
+
+#[gpui_kit::test]
+fn an_owed_dismiss_never_reaches_the_new_catalog_after_the_switch_event(cx: &mut TestAppContext) {
+    owed_action_across_a_switch(false, true, cx);
+}
+
+#[gpui_kit::test]
+fn an_owed_retry_never_reaches_the_new_catalog_before_the_switch_event(cx: &mut TestAppContext) {
+    owed_action_across_a_switch(true, false, cx);
+}
+
+#[gpui_kit::test]
+fn an_owed_retry_never_reaches_the_new_catalog_after_the_switch_event(cx: &mut TestAppContext) {
+    owed_action_across_a_switch(true, true, cx);
+}
+
 /// The panel re-attaches to a pass already running when it opens (claimed elsewhere — by an
 /// earlier panel), follows its job id, and ends with its terminal event.
 #[gpui_kit::test]
@@ -940,6 +1092,56 @@ fn a_bundle_previews_and_imports(cx: &mut TestAppContext) {
     click(&app, "bundle-check", cx);
     work(cx);
     dlg.read_with(cx, |d, _| assert_eq!(d.preview.as_ref().map(|p| (p.new_count, p.existing)), Some((0, 2))));
+}
+
+/// Browse… cannot filter the portal picker to `.chairphoto` (React could), so the picked file
+/// is checked instead: another file is refused with a message and never previewed; a bundle
+/// name in any case is taken. (#161)
+#[gpui_kit::test]
+fn browse_refuses_a_picked_file_that_is_not_a_bundle(cx: &mut TestAppContext) {
+    let dir = TempDir::new("bundle-browse");
+    let app = start(cx);
+    open_catalog(&app, &dir, cx);
+    click_menu_row(&app, "import-menu", 1, "Import a .chairphoto bundle…", cx);
+    let StorageDialog::ImportBundle(dlg) = dialog(&app, cx) else { panic!("the bundle dialog") };
+    work(cx); // whatever opening the catalog queued
+    let browse = |cx: &mut TestAppContext| {
+        let dlg = dlg.clone();
+        cx.update_window(app.window(), |_, window, cx| dlg.update(cx, |d, cx| d.browse(window, cx))).unwrap();
+        cx.run_until_parked();
+        assert!(cx.did_prompt_for_paths(), "the picker opened");
+    };
+
+    browse(cx);
+    let notes = dir.0.join("notes.txt");
+    cx.simulate_path_prompt_response(|_| Some(vec![notes.clone()]));
+    cx.run_until_parked();
+    dlg.read_with(cx, |d, cx| {
+        assert_eq!(d.error.clone(), Some(format!("Not a .chairphoto bundle: {}", notes.display())));
+        assert_eq!(d.path.read(cx).value(), "", "the path was not taken");
+        assert!(!d.previewing && d.preview.is_none(), "nothing was previewed");
+    });
+    assert_eq!(work(cx), 0, "no preview was queued");
+
+    browse(cx);
+    let bundle = dir.0.join("Trip.CHAIRPHOTO");
+    cx.simulate_path_prompt_response(|_| Some(vec![bundle.clone()]));
+    cx.run_until_parked();
+    dlg.read_with(cx, |d, cx| {
+        assert_eq!(d.path.read(cx).value(), bundle.to_string_lossy().as_ref(), "a bundle name in any case is taken");
+        assert!(d.previewing, "and previewed");
+    });
+}
+
+#[test]
+fn a_bundle_is_recognised_by_its_extension_in_any_case() {
+    use crate::storage::bundle_import::is_bundle_path;
+    use std::path::Path;
+    assert!(is_bundle_path(Path::new("/a/trip.chairphoto")));
+    assert!(is_bundle_path(Path::new("/a/Trip.ChairPhoto")));
+    for not in ["/a/trip.txt", "/a/chairphoto", "/a/trip.chairphoto.zip", "/a/.chairphoto"] {
+        assert!(!is_bundle_path(Path::new(not)), "{not}");
+    }
 }
 
 // --- volumes ------------------------------------------------------------------------------

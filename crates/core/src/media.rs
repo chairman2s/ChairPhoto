@@ -119,11 +119,15 @@ pub struct DecodedImage {
     /// A video whose poster frame could not be made (no `ffmpeg`, an unreadable clip): this
     /// is [`video_tile`], not the clip's pixels. A front end can mark it as a video.
     pub video_tile: bool,
+    /// A thumbnail rendered from the photo's cover version (`plugins::edit::cover`), not the
+    /// original's frame: the version may be cropped, straightened or warped, so anything
+    /// placed in the original's coordinates (face boxes) does not line up with it.
+    pub cover: bool,
 }
 
 impl DecodedImage {
     fn pixels(image: DynamicImage) -> Self {
-        Self { image, video_tile: false }
+        Self { image, video_tile: false, cover: false }
     }
 }
 
@@ -146,17 +150,18 @@ pub fn render_image(state: &AppState, key: JobKey) -> Result<DecodedImage, Strin
     let resolved = resolve(state, id, kind)?;
     let is_video = resolved.is_video;
     match decode_tier(id, kind, resolved) {
-        Ok(image) => Ok(DecodedImage::pixels(image)),
+        Ok((image, cover)) => Ok(DecodedImage { cover, ..DecodedImage::pixels(image) }),
         Err(e) if is_video => {
             eprintln!("video poster for photo {id}: {e}; showing the video tile");
-            Ok(DecodedImage { image: video_tile(), video_tile: true })
+            Ok(DecodedImage { image: video_tile(), video_tile: true, cover: false })
         }
         Err(e) => Err(e),
     }
 }
 
-/// [`render_image`]'s photo body: the cached tier's JPEG, decoded once and rotated.
-fn decode_tier(id: i64, kind: ImageKind, resolved: Resolved) -> Result<DynamicImage, String> {
+/// [`render_image`]'s photo body: the cached tier's JPEG, decoded once and rotated, and
+/// whether it is the cover version's render ([`DecodedImage::cover`]).
+fn decode_tier(id: i64, kind: ImageKind, resolved: Resolved) -> Result<(DynamicImage, bool), String> {
     let Resolved { absolute, rotation, cover, .. } = resolved;
     let decode = |bytes: &[u8]| image::load_from_memory(bytes).map_err(|e| e.to_string());
     let rotate = |img| crate::thumbnails::rotate_image(img, rotation);
@@ -164,7 +169,7 @@ fn decode_tier(id: i64, kind: ImageKind, resolved: Resolved) -> Result<DynamicIm
         let e = format!("no reachable copy of photo {id}");
         return match kind {
             // The kept thumbnail is already rotated.
-            ImageKind::Thumb => decode(&crate::thumbnails::read_persistent_thumb(id).ok_or(e)?),
+            ImageKind::Thumb => decode(&crate::thumbnails::read_persistent_thumb(id).ok_or(e)?).map(|i| (i, false)),
             _ => Err(e),
         };
     };
@@ -173,7 +178,7 @@ fn decode_tier(id: i64, kind: ImageKind, resolved: Resolved) -> Result<DynamicIm
             if let Some(json) = &cover {
                 #[cfg(feature = "edit")]
                 match crate::plugins::edit::cover::cover_thumb(&absolute, id, json) {
-                    Ok(bytes) => return decode(&bytes).map(rotate),
+                    Ok(bytes) => return decode(&bytes).map(|i| (rotate(i), true)),
                     Err(e) => eprintln!("cover thumbnail for photo {id}: {e}"),
                 }
                 #[cfg(not(feature = "edit"))]
@@ -188,10 +193,10 @@ fn decode_tier(id: i64, kind: ImageKind, resolved: Resolved) -> Result<DynamicIm
             } else if let Ok(rotated) = crate::thumbnails::encode_rotated_jpeg(&img) {
                 crate::thumbnails::save_persistent_thumb(id, &rotated);
             }
-            Ok(img)
+            Ok((img, false))
         }
-        ImageKind::Preview => decode(&preview_bytes(&absolute)?).map(rotate),
-        ImageKind::Zoom => decode(&zoom_bytes(&absolute)?).map(rotate),
+        ImageKind::Preview => decode(&preview_bytes(&absolute)?).map(|i| (rotate(i), false)),
+        ImageKind::Zoom => decode(&zoom_bytes(&absolute)?).map(|i| (rotate(i), false)),
     }
 }
 
@@ -385,5 +390,28 @@ mod tests {
             Ok(_) => panic!("a token nothing minted found an image"),
         };
         assert!(err.contains("w:999999:1") && err.contains("not resident"), "{err}");
+    }
+
+    /// A thumbnail says whether its pixels are the cover version's render (#152): the face
+    /// overlay must not place original-frame boxes on one. The plain thumbnail, the kept
+    /// thumbnail of an unreachable original, and the preview are the original's frame.
+    #[cfg(feature = "edit")]
+    #[test]
+    fn a_cover_thumbnail_says_it_is_not_the_original_frame() {
+        use crate::thumbnails::tests::{test_lock, write_test_jpeg, TestTmpDir};
+        let _guard = test_lock();
+        let tmp = TestTmpDir::new("media-cover");
+        std::env::set_var("XDG_CACHE_HOME", tmp.path().join("cache"));
+        let path = write_test_jpeg(tmp.path(), "cover.jpg", 800, 600);
+        let tier = |kind, cover: Option<&str>| {
+            let resolved =
+                Resolved { absolute: Some(path.clone()), rotation: 0, cover: cover.map(str::to_string), is_video: false };
+            decode_tier(424_242, kind, resolved).map(|(_, cover)| cover)
+        };
+        assert_eq!(tier(ImageKind::Thumb, Some(r#"{"tone":{"ev":1}}"#)), Ok(true), "the cover's render");
+        assert_eq!(tier(ImageKind::Thumb, None), Ok(false), "the plain thumbnail");
+        assert_eq!(tier(ImageKind::Preview, Some(r#"{"tone":{"ev":1}}"#)), Ok(false), "only thumbnails show the cover");
+        let kept = Resolved { absolute: None, rotation: 0, cover: Some(r#"{"tone":{"ev":1}}"#.into()), is_video: false };
+        assert_eq!(decode_tier(424_242, ImageKind::Thumb, kept).map(|(_, c)| c), Ok(false), "the kept thumbnail");
     }
 }

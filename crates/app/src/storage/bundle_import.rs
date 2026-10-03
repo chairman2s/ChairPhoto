@@ -3,8 +3,11 @@
 //! already in the catalog, the no-op notice), then "Import N new" — the background import
 //! ([`StorageState::start_bundle_import`]), whose result this dialog shows when it ends.
 //!
-//! The portal picker has no file-type filter (shell-apis.md § 5), so a picked file that does
-//! not end in `.chairphoto` is refused here with a message instead of being opened.
+//! React's picker filtered to `.chairphoto` (`pickBundleFile`). GPUI's `PathPromptOptions`
+//! has no filter field, and its Linux portal request sets none (gpui-pre-linux 0.3.7
+//! `prompt_for_paths`; shell-apis.md § 5), so a picked file that does not end in
+//! `.chairphoto` (any case, [`is_bundle_path`]) is refused here with a message instead of
+//! being opened. A typed path is checked by the core's preview.
 
 use super::state::{bundle_import_line, StorageEvent};
 use super::ui;
@@ -16,6 +19,12 @@ use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::prelude::*;
 use gpui_kit::TestSupportExt as _;
 use gpui_kit::{div, Context, Entity, EventEmitter, PathPromptOptions, Subscription, Window};
+
+/// Whether a picked file is a bundle by its name: it ends in `.chairphoto`, in any case (what
+/// React's picker filter let through).
+pub fn is_bundle_path(path: &std::path::Path) -> bool {
+    path.extension().is_some_and(|e| e.eq_ignore_ascii_case("chairphoto"))
+}
 
 pub struct BundleImport {
     app: AppState,
@@ -129,7 +138,7 @@ impl BundleImport {
             this.update_in(cx, |s, window, cx| match picked {
                 Ok(Some(path)) => {
                     let text = path.to_string_lossy().to_string();
-                    if path.extension().is_none_or(|e| e != "chairphoto") {
+                    if !is_bundle_path(&path) {
                         s.error = Some(format!("Not a .chairphoto bundle: {text}"));
                         cx.notify();
                         return;

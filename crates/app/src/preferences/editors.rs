@@ -7,6 +7,13 @@
 //! Every key is React's: `editor.<key>.gui` / `.cli`, `editor.rapidraw.bin` / `.format`,
 //! `develop.decodeCacheGb`, `develop.preloadNeighbours`, `develop.wbSlider`,
 //! `metrics.exportParity`, `editor.renderTiming`, `editor.renderTiming.lastSummary`.
+//!
+//! A saved editor path, RapidRAW binary or format tells the model ([`AppModel::editors_changed`],
+//! from the save's completion), and the inspector re-checks its "Edit in" list. The completion
+//! lands only while this section is shown (`Ctx::run`): a tab switched away within the worker's
+//! few milliseconds leaves the list as it was until the next save or catalog switch.
+//!
+//! [`AppModel::editors_changed`]: crate::model::AppModel::editors_changed
 
 use super::{section, status, Ctx, Scope};
 use crate::shell::style::Colors;
@@ -179,10 +186,11 @@ impl EditorsSection {
             format!("editor.{key}.{which}"),
             value.trim().to_string(),
             |scope| available_editors(scope.state()),
-            |s: &mut Self, result, _| match result {
+            |s: &mut Self, result, cx| match result {
                 Ok((_, editors)) => {
                     s.editors = editors;
                     s.status = Some("Saved.".into());
+                    s.ctx.model.update(cx, |m, cx| m.editors_changed(cx));
                 }
                 Err(e) => s.status = Some(e),
             },
@@ -199,13 +207,14 @@ impl EditorsSection {
             key,
             value.trim().to_string(),
             |scope| rapidraw_available(scope.state()),
-            move |s: &mut Self, result, _| match result {
+            move |s: &mut Self, result, cx| match result {
                 Ok((_, st)) => {
                     s.rapidraw_found = st.available;
                     if key == RAPIDRAW_FORMAT_KEY {
                         s.rapidraw_format = st.format;
                     }
                     s.status = Some("Saved.".into());
+                    s.ctx.model.update(cx, |m, cx| m.editors_changed(cx));
                 }
                 Err(e) => s.status = Some(e),
             },

@@ -167,14 +167,18 @@ fn cache_images_with(
 
     // Store the flags and refresh the monochrome auto-tag — in the catalog the photos were
     // read from, and only while this pass still owns the generation (checked under the lock).
+    // One transaction: one commit for the whole library rather than one per photo, and the
+    // flags and the tag they drive land together or not at all.
     with_catalog_as(state, from, |c| {
         if abort.load(Ordering::Relaxed) {
             return Ok(false);
         }
+        let tx = c.begin()?;
         for (photo_id, gray) in &grayscale {
             c.set_grayscale(*photo_id, *gray)?;
         }
         c.apply_auto_tags()?;
+        tx.commit()?;
         Ok(true)
     })
     .and_then(|stored| if stored { Ok(CacheResult { total }) } else { Err(CACHE_CANCELLED.into()) })
@@ -275,6 +279,27 @@ mod tests {
                     assert!(started.is_grayscale(id).unwrap(), "{how}: nothing stored");
                 }
             }
+        }
+    }
+
+    /// The store is one transaction: when the auto-tag step fails, no flag is stored either.
+    #[test]
+    fn the_flags_and_the_auto_tags_land_together_or_not_at_all() {
+        let (_dir, state, _progress, ids) = setup("atomic", 2);
+        // The photos are tagged monochrome now (flagged B&W); the store's rebuild of that
+        // membership is made to fail, after the flags were written in the same transaction.
+        crate::app::with_catalog(&state, |c| {
+            c.apply_auto_tags()?;
+            let tx = c.begin()?;
+            tx.execute_batch("CREATE TRIGGER fail_tags BEFORE DELETE ON photo_tags BEGIN SELECT RAISE(ABORT, 'no tags'); END;")?;
+            tx.commit()?;
+            Ok(())
+        })
+        .unwrap();
+        let err = cache_images(&state, false).unwrap_err();
+        assert!(err.contains("no tags"), "{err}");
+        for id in ids {
+            assert!(grayscale(&state, id), "a flag was stored although the store failed");
         }
     }
 

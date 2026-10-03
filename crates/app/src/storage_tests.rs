@@ -368,6 +368,39 @@ fn a_switch_stops_the_warm_up_and_drops_its_result(cx: &mut TestAppContext) {
     assert!(!status(&app, cx).starts_with("Caching"), "its straggler moved the bench");
 }
 
+/// **Forced interleaving** (review claude-159-160, L1). The rescan's result lands after the
+/// core switched to B and before `catalog:switched` arrives: the warm-up it starts reads B.
+/// When the event drops the follow, the warm-up is tripped too: it writes nothing into B.
+#[gpui_kit::test]
+fn a_warm_up_started_by_a_stale_rescan_is_stopped_by_the_switch(cx: &mut TestAppContext) {
+    let dir = TempDir::new("cache-stale");
+    let app = start(cx);
+    open_catalog(&app, &dir, cx);
+    work(cx);
+    std::fs::create_dir_all(dir.0.join("photos")).unwrap();
+    std::fs::write(dir.0.join("photos/a.jpg"), b"jpeg").unwrap();
+    dispatch(&app, crate::shell::actions::RescanLibrary, cx);
+    assert_eq!(work_once(cx), 1, "the rescan ran on A; its result is not taken yet");
+    // The core switches to B (one photo flagged B&W, original present), event not delivered.
+    let other = dir.0.join("other");
+    let b = Catalog::open(&other.join("b.chairphoto"), &other).unwrap();
+    let f = other.join("2026/q.jpg");
+    std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+    std::fs::write(&f, b"not a jpeg").unwrap();
+    let bid = b.upsert_photo(&f, None, 0, 1).unwrap().id;
+    b.set_grayscale(bid, true).unwrap();
+    chairphoto_core::app::detach_catalog_and_trip_jobs(&app.state).unwrap();
+    chairphoto_core::app::publish_catalog_and_reset_jobs(&app.state, b).unwrap();
+    app.state.volume_health.invalidate();
+    cx.run_until_parked(); // the UI takes A's rescan result
+    assert!(app.wired.storage.read_with(cx, |s, _| s.cache).is_some(), "A's result started a warm-up");
+    storage_sees_switch(&app, cx);
+    assert_eq!(app.wired.storage.read_with(cx, |s, _| s.cache), None);
+    work(cx);
+    let gray = chairphoto_core::app::with_catalog(&app.state, |c| c.is_grayscale(bid)).unwrap();
+    assert!(gray, "the dropped warm-up ran on over catalog B and rewrote its flags");
+}
+
 // --- catalog switcher ---------------------------------------------------------------------
 
 /// The catalog pill opens the switcher; creating a catalog switches to it (the model, the

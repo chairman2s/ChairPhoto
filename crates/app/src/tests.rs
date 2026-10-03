@@ -14,7 +14,7 @@
 
 use crate::keymap::{self, contexts, Quit};
 use crate::model::{not_yet_ported_line, AppModel, CatalogSummary, DeepLinkTarget};
-use crate::shell::actions::{self as shell_actions, ToggleLeftPanel};
+use crate::shell::actions::{self as shell_actions, PanelKeyLeft};
 use crate::shell::state::Side;
 use crate::{start_core, wire, QuitReason, QuitRequested, WireOptions, Wired};
 use crate::launch;
@@ -377,7 +377,7 @@ fn brackets_are_text_in_a_focused_input(cx: &mut TestAppContext) {
                 .id("field-root")
                 .key_context(contexts::ROOT)
                 .track_focus(&self.root)
-                .on_action(move |_: &ToggleLeftPanel, _, _| toggles.set(toggles.get() + 1))
+                .on_action(move |_: &PanelKeyLeft, _, _| toggles.set(toggles.get() + 1))
                 .size_full()
                 .child(Input::new(&self.input).id("field").w(gpui_kit::px(240.)))
         }

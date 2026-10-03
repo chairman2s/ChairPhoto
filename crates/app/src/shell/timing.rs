@@ -45,6 +45,11 @@ pub struct ShellTimer {
     loaded: HashSet<i64>,
     /// The ticker of the live transition; dropping it (a newer Back) stops it.
     ticker: Option<Task<()>>,
+    /// The sequence number of the last write handed out, and of the last one stored: the
+    /// writes run on independent workers, and an older one (a "started" marker held up on the
+    /// catalog lock) never overwrites a newer one (the summary). As `MachinePrefs`.
+    seq: u64,
+    stored_seq: std::sync::Arc<std::sync::Mutex<u64>>,
     /// Every value written under [`SHELL_TIMING_KEY`], newest last (tests).
     #[cfg(test)]
     pub(crate) written: Vec<String>,
@@ -63,6 +68,8 @@ impl ShellTimer {
             mounted: HashSet::new(),
             loaded: HashSet::new(),
             ticker: None,
+            seq: 0,
+            stored_seq: Default::default(),
             #[cfg(test)]
             written: Vec::new(),
         });
@@ -138,15 +145,23 @@ impl ShellTimer {
         let t = cx.global_mut::<ShellTimer>();
         #[cfg(test)]
         t.written.push(value.clone());
-        let (state, from) = (t.state.clone(), t.from);
+        t.seq += 1;
+        let (state, from, seq, stored_seq) = (t.state.clone(), t.from, t.seq, t.stored_seq.clone());
         Runner::get(cx).spawn(move || {
+            // Held across the write, so two writes never interleave and a late older one is
+            // skipped rather than undoing a newer one.
+            let mut last = stored_seq.lock().unwrap_or_else(|e| e.into_inner());
+            if seq <= *last {
+                return;
+            }
             let write = |c: &chairphoto_core::catalog::Catalog| c.set_setting(SHELL_TIMING_KEY, &value);
             let result = match from {
                 Some(from) => with_catalog_as(&state, from, write),
                 None => with_catalog(&state, write),
             };
-            if let Err(e) = result {
-                eprintln!("shell timing: not stored: {e}");
+            match result {
+                Ok(()) => *last = seq,
+                Err(e) => eprintln!("shell timing: not stored: {e}"),
             }
         });
     }

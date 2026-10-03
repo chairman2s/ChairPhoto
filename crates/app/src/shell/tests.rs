@@ -173,6 +173,10 @@ fn panel_keys_are_off_in_a_module_view(cx: &mut TestAppContext) {
     press(&app, "[", cx);
     press(&app, "]", cx);
     assert!(visible(&app, Side::Left, cx) && visible(&app, Side::Right, cx), "[ or ] toggled a column in a module view");
+    // Gated by the surface, not by focus: with the root itself focused the keys stay off.
+    focus_root(&app, cx);
+    press(&app, "[", cx);
+    assert!(visible(&app, Side::Left, cx), "[ toggled a column in a module view with the root focused");
 
     // The View menu still toggles: it dispatches the action, not the key.
     cx.update_window(app.window(), |_, window, cx| window.dispatch_action(Box::new(ToggleLeftPanel), cx)).unwrap();
@@ -195,6 +199,10 @@ fn panel_keys_are_off_in_a_cull_session(cx: &mut TestAppContext) {
     assert!(app.wired.root.as_ref().unwrap().read_with(cx, |r, _| r.cull().is_some()), "the session opened");
     press(&app, "[", cx);
     assert!(visible(&app, Side::Left, cx), "[ toggled a column under the cull session");
+    // Gated by the session, not by focus: with the root itself focused the keys stay off.
+    focus_root(&app, cx);
+    press(&app, "[", cx);
+    assert!(visible(&app, Side::Left, cx), "[ toggled a column under the cull session with the root focused");
 }
 
 /// And the Darkroom: its key context mutes them, also after a title-bar menu has taken focus
@@ -233,6 +241,102 @@ fn panel_keys_are_off_in_the_darkroom(cx: &mut TestAppContext) {
     assert!(focused, "the Darkroom has the keys again after the root took focus");
     press(&app, "[", cx);
     assert!(visible(&app, Side::Left, cx), "[ toggled the left column after the root took focus");
+    // Focus on a handle outside the Darkroom that is not an input (the grid's, not drawn
+    // now): the keys stay off, since the surface gates them.
+    let grid = root.read_with(cx, |r, cx| r.library.read(cx).focus_handle().clone());
+    cx.update_window(app.window(), |_, window, cx| grid.focus(window, cx)).unwrap();
+    press(&app, "]", cx);
+    assert!(app.wired.shell.read_with(cx, |s, _| !s.layout.right_hidden), "] toggled the inspector from the Darkroom");
+    // The View menu's toggle still works there (a menu focuses the root, then dispatches).
+    focus_root(&app, cx);
+    cx.update_window(app.window(), |_, window, cx| window.dispatch_action(Box::new(ToggleLeftPanel), cx)).unwrap();
+    cx.run_until_parked();
+    assert!(!visible(&app, Side::Left, cx), "the menu's toggle works in the Darkroom");
+}
+
+/// Focus the root view itself, with the window active.
+fn focus_root(app: &App, cx: &mut TestAppContext) {
+    cx.update_window(app.window(), |_, window, _| window.activate_window()).unwrap();
+    cx.run_until_parked();
+    let root = app.wired.root.clone().unwrap();
+    cx.update_window(app.window(), |_, window, cx| {
+        let focus = root.read(cx).focus_handle().clone();
+        focus.focus(window, cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+}
+
+/// Focus the collection browser's tag search, and a check that it still has focus.
+fn focus_sidebar_search(app: &App, cx: &mut TestAppContext) -> impl Fn(&mut TestAppContext) -> bool {
+    let root = app.wired.root.clone().unwrap();
+    let search = root.read_with(cx, |r, cx| r.tag_panel.read(cx).search.clone());
+    cx.update_window(app.window(), |_, window, cx| {
+        window.render_frame(cx);
+        search.update(cx, |i, cx| i.focus(window, cx));
+    })
+    .unwrap();
+    cx.run_until_parked();
+    let window = app.window();
+    move |cx: &mut TestAppContext| {
+        let s = search.clone();
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            gpui_kit::Focusable::focus_handle(s.read(cx), cx).is_focused(window)
+        })
+        .unwrap()
+    }
+}
+
+fn scan_progress(app: &App, cx: &mut TestAppContext) {
+    use chairphoto_core::app::{CoreEvent, EventSink as _};
+    app.state.send(CoreEvent::ScanProgress(chairphoto_core::scanner::ScanProgress {
+        phase: "indexing".into(),
+        done: 1,
+        total: 10,
+    }));
+    cx.run_until_parked();
+}
+
+/// Review probe (claude-159-160, M1): a module view on the stage, the user typing in the left
+/// column's tag search; a shell notify (a real `scan:progress`) must not take the focus.
+#[gpui_kit::test]
+fn probe_module_view_keeps_sidebar_input_focus(cx: &mut TestAppContext) {
+    let dir = TempDir::new("probe-focus");
+    let app = start(cx);
+    open_catalog_with_photos(&app, &dir, 1, cx);
+    cx.update(|cx| crate::modules::ModuleRegistry::enable(&app.wired.modules, crate::modules::dev_module::DEV_MODULE_ID, cx));
+    cx.run_until_parked();
+    click(&app, "rail-view-dev-view", cx);
+    assert_eq!(app.wired.shell.read_with(cx, |s, _| s.surface.clone()), Surface::Module("dev-view".into()));
+    let focused = focus_sidebar_search(&app, cx);
+    assert!(focused(cx), "precondition: the sidebar search has focus");
+    scan_progress(&app, cx);
+    assert!(focused(cx), "a scan:progress event (shell notify) took focus from the sidebar's search input in a module view");
+}
+
+/// Review probe (P-pre): the same in the Darkroom, whose left column still shows.
+#[cfg(feature = "edit")]
+#[gpui_kit::test]
+fn probe_darkroom_keeps_sidebar_input_focus(cx: &mut TestAppContext) {
+    let dir = TempDir::new("probe-focus-dk");
+    let app = start(cx);
+    let ids = open_catalog_with_photos(&app, &dir, 1, cx);
+    app.wired.shell.update(cx, |s, cx| {
+        s.select_with(cx, |l| l.select(ids[0], chairphoto_model::library::session::SelectMods::default()))
+    });
+    click(&app, "rail-develop", cx);
+    assert_eq!(app.wired.shell.read_with(cx, |s, _| s.surface.clone()), Surface::Develop);
+    let darkroom = app.wired.root.as_ref().unwrap().read_with(cx, |r, _| r.darkroom.clone());
+    let dk_focused = cx
+        .update_window(app.window(), |_, window, cx| darkroom.read(cx).focus_handle().contains_focused(window, cx))
+        .unwrap();
+    assert!(dk_focused, "entering Develop gives the Darkroom the keys");
+    let focused = focus_sidebar_search(&app, cx);
+    assert!(focused(cx), "precondition: the sidebar search has focus");
+    scan_progress(&app, cx);
+    assert!(focused(cx), "a scan:progress event took focus from the sidebar's search input in the Darkroom");
 }
 
 // --- shell timing -----------------------------------------------------------------------
@@ -290,6 +394,63 @@ fn a_develop_to_library_transition_is_timed_and_stored(cx: &mut TestAppContext) 
     assert!(!cx.update(|cx| ShellTimer::live(cx)));
     work(cx);
     assert_eq!(stored(&app).as_deref(), Some(w[1].as_str()), "the summary is in the catalog");
+}
+
+/// **Forced interleaving** (review claude-159-160, L3). The "started" marker's write is held
+/// up (here: run after the summary's); it must not overwrite the summary.
+#[gpui_kit::test]
+fn a_late_started_marker_never_overwrites_the_summary(cx: &mut TestAppContext) {
+    let dir = TempDir::new("shell-timing-order");
+    let app = start(cx);
+    open_catalog_with_photos(&app, &dir, 1, cx);
+    work(cx); // the launch checks
+    let from = app.wired.shell.read_with(cx, |s, _| s.rows_from());
+    cx.update(|cx| {
+        ShellTimer::set_enabled(true, cx);
+        ShellTimer::leave("develop", from, cx);
+    });
+    let marker = cx.update(|cx| Runner::get(cx).hold_pending());
+    assert_eq!(marker.len(), 1, "the marker's write, held");
+    cx.executor().advance_clock(Duration::from_millis(10_100));
+    cx.run_until_parked();
+    let w = written(cx);
+    assert_eq!(w.len(), 2, "the summary was handed out: {w:?}");
+    cx.update(|cx| Runner::get(cx).run_pending()); // the summary's write
+    cx.update(|cx| Runner::get(cx).release(marker));
+    work(cx); // then the late marker's
+    assert_eq!(stored(&app).as_deref(), Some(w[1].as_str()), "the late marker overwrote the summary");
+}
+
+/// The timing record is bound to the catalog the Library rows came from (review
+/// claude-159-160, L4): the core swaps in a catalog with colliding ids and keys between Back
+/// and the writes — with `catalog:switched` delivered and without — and neither the started
+/// marker nor the summary lands in it.
+#[gpui_kit::test]
+fn the_timing_record_never_lands_in_another_catalog(cx: &mut TestAppContext) {
+    use crate::tests::{colliding_catalog, core_switch, deliver_switch};
+    for deliver in [false, true] {
+        let dir = TempDir::new(&format!("shell-timing-swap-{deliver}"));
+        let app = start(cx);
+        open_catalog_with_photos(&app, &dir, 2, cx);
+        work(cx);
+        let from = app.wired.shell.read_with(cx, |s, _| s.rows_from());
+        cx.update(|cx| {
+            ShellTimer::set_enabled(true, cx);
+            ShellTimer::leave("develop", from, cx);
+        });
+        let (b, _) = colliding_catalog(&dir, "b", 2);
+        b.set_setting(SHELL_TIMING_KEY, "b's own").unwrap();
+        core_switch(&app, b);
+        if deliver {
+            deliver_switch(&app, cx);
+        }
+        work(cx); // the started marker's write
+        cx.executor().advance_clock(Duration::from_millis(10_100));
+        cx.run_until_parked();
+        assert_eq!(written(cx).len(), 2, "deliver={deliver}: the summary was handed out");
+        work(cx); // the summary's write
+        assert_eq!(stored(&app).as_deref(), Some("b's own"), "deliver={deliver}: a timing write landed in B");
+    }
 }
 
 /// The Darkroom's switch turns the instrument on, and its ← Library starts the transition.

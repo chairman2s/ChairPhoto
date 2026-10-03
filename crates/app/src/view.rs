@@ -115,14 +115,10 @@ pub struct RootView {
     pub(crate) remove_confirm: Option<crate::library::photo_actions::RemoveConfirm>,
     pub(crate) confirm_serial: u64,
     resize: Option<Resize>,
-    /// The stage's wrapper around a module's main view ([`contexts::MODULE_VIEW`]): focused
-    /// when a module view takes the stage, unless something inside it already has focus, so
-    /// the shell's `[`/`]` are off there as React's handler was.
-    module_focus: FocusHandle,
     _observers: [Subscription; 10],
-    _module_view_focus: Subscription,
     /// Develop takes the keys when it opens (its arrows step the filmstrip) and hands them
-    /// back to the grid when the Library returns.
+    /// back to the grid when the Library returns — on the change of surface only, never on
+    /// another shell notify, so an input in a side column or a dialog keeps its focus.
     #[cfg(feature = "edit")]
     _develop_focus: Subscription,
     /// The Darkroom (#111): the stage on `Surface::Develop`.
@@ -145,7 +141,6 @@ impl RootView {
         cx: &mut Context<Self>,
     ) -> Self {
         let focus = cx.focus_handle();
-        let module_focus = cx.focus_handle();
         let library = cx.new(|cx| LibraryView::new(shell.clone(), images.clone(), cx));
         // The grid has focus from the start: its keys work at once, and the root's bindings
         // in [`contexts::ROOT`] still reach the root, the grid's ancestor.
@@ -172,30 +167,25 @@ impl RootView {
             cx.new(|cx| crate::darkroom::DarkroomView::new(state, window, cx))
         };
         #[cfg(feature = "edit")]
-        let _develop_focus = cx.observe_in(&shell, window, |this, shell, window, cx| {
-            let focus = this.darkroom.read(cx).focus_handle().clone();
-            match shell.read(cx).surface {
-                Surface::Develop if !focus.contains_focused(window, cx) => focus.focus(window, cx),
-                // Back in the Library: the grid takes the keys again.
-                Surface::Library if focus.contains_focused(window, cx) => {
-                    this.library.read(cx).focus_handle().clone().focus(window, cx)
+        let _develop_focus = {
+            let mut seen = shell.read(cx).surface.clone();
+            cx.observe_in(&shell, window, move |this, shell, window, cx| {
+                let surface = shell.read(cx).surface.clone();
+                if surface == seen {
+                    return;
                 }
-                _ => {}
-            }
-        });
-        // A module view took the stage: its wrapper takes the keys (unless the view inside
-        // focused itself), so the root's `[`/`]` no longer reach the root from the grid.
-        // Back on the Library, the grid (or whatever the stage shows) takes them back.
-        let _module_view_focus = cx.observe_in(&shell, window, |this, shell, window, cx| {
-            let in_module = this.module_focus.contains_focused(window, cx);
-            match shell.read(cx).surface {
-                Surface::Module(_) if !in_module => this.module_focus.clone().focus(window, cx),
-                Surface::Library if in_module && this.stacks.is_none() && this.cull.is_none() => {
-                    this.focus_stage(window, cx)
+                seen = surface.clone();
+                let focus = this.darkroom.read(cx).focus_handle().clone();
+                match surface {
+                    Surface::Develop if !focus.contains_focused(window, cx) => focus.focus(window, cx),
+                    // Back in the Library: the grid takes the keys again.
+                    Surface::Library if focus.contains_focused(window, cx) => {
+                        this.library.read(cx).focus_handle().clone().focus(window, cx)
+                    }
+                    _ => {}
                 }
-                _ => {}
-            }
-        });
+            })
+        };
         let _observers = [
             cx.observe_in(&model, window, |this, model, window, cx| {
                 // A catalog switch closes the dialog: its groups name the old catalog's photos.
@@ -226,12 +216,9 @@ impl RootView {
                 }
                 match this.shell.read(cx).surface {
                     Surface::Library => this.focus_stage(window, cx),
-                    // Develop and a module view keep the keys too, so `[`/`]` stay off there
-                    // after a menu (React's handler checked the surface, not the focus).
+                    // The Darkroom's keys (filmstrip arrows) work again after a menu.
                     #[cfg(feature = "edit")]
                     Surface::Develop => this.darkroom.read(cx).focus_handle().clone().focus(window, cx),
-                    Surface::Module(_) => this.module_focus.clone().focus(window, cx),
-                    #[allow(unreachable_patterns)]
                     _ => {}
                 }
             }),
@@ -311,9 +298,7 @@ impl RootView {
             remove_confirm: None,
             confirm_serial: 0,
             resize: None,
-            module_focus,
             _observers,
-            _module_view_focus,
             #[cfg(feature = "edit")]
             _develop_focus,
         }
@@ -406,6 +391,14 @@ impl RootView {
         cx.notify();
     }
 
+    /// `[` or `]`: toggle a column only where React's window handler ran — the Library (grid,
+    /// loupe, Compare) with no cull session up. The View menu dispatches the toggles directly.
+    fn panel_key(&mut self, side: Side, cx: &mut Context<Self>) {
+        if self.cull.is_none() && self.shell.read(cx).surface == Surface::Library {
+            self.shell.update(cx, |s, cx| s.toggle_panel(side, cx));
+        }
+    }
+
     /// Re-read the system theme off the UI thread; it paints when following.
     fn reload_theme(&mut self, cx: &mut Context<Self>) {
         crate::theme::reread_system_theme(cx);
@@ -474,8 +467,6 @@ impl RootView {
                 .child(
                     div()
                         .id(SharedString::from(format!("module-view-{}", v.id)))
-                        .key_context(contexts::MODULE_VIEW)
-                        .track_focus(&self.module_focus)
                         .flex_1()
                         .min_h_0()
                         .child(v.view)
@@ -647,6 +638,10 @@ impl Render for RootView {
             .on_action(cx.listener(|this, _: &ToggleLeftPanel, _, cx| {
                 this.shell.update(cx, |s, cx| s.toggle_panel(Side::Left, cx))
             }))
+            // The keys `[` / `]`: App.tsx's window handler, off in Develop, module views and
+            // cull sessions — gated by what is shown, whatever has focus.
+            .on_action(cx.listener(|this, _: &PanelKeyLeft, _, cx| this.panel_key(Side::Left, cx)))
+            .on_action(cx.listener(|this, _: &PanelKeyRight, _, cx| this.panel_key(Side::Right, cx)))
             .on_action(cx.listener(|this, _: &ToggleRightPanel, _, cx| {
                 this.shell.update(cx, |s, cx| s.toggle_panel(Side::Right, cx))
             }))

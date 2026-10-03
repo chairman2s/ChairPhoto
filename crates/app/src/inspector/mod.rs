@@ -258,9 +258,14 @@ impl IptcForm {
 /// An IPTC save as Save captured it: the photo's catalog, the form's values then, and the
 /// photo's file name for the status line. A save queued behind a running one carries all of
 /// it, so it runs — and reports — after the inspector has moved to another photo.
+/// `generation` is the inspector's generation when Save was clicked: if it no longer matches
+/// when the save lands, the photo was navigated away from and back (or otherwise reset) in
+/// between, so the live form was already reset and re-read for the view as it is now — this
+/// save's captured values must not be adopted as its baseline (#201).
 #[derive(Debug, Clone)]
 pub(crate) struct IptcSave {
     from: CatalogIdentity,
+    generation: u64,
     fields: IptcFields,
     name: String,
 }
@@ -871,7 +876,7 @@ impl PhotoInspector {
             return;
         }
         let name = self.photo(cx).map(|p| file_name(&p.path)).unwrap_or_else(|| format!("photo {id}"));
-        let save = IptcSave { from, fields: self.iptc.values(cx), name };
+        let save = IptcSave { from, generation: self.generation, fields: self.iptc.values(cx), name };
         self.iptc.status = "Saving…".into();
         cx.notify();
         if self.iptc_saving.contains(&id) {
@@ -887,7 +892,7 @@ impl PhotoInspector {
     fn start_iptc_save(&mut self, id: i64, save: IptcSave, cx: &mut Context<Self>) {
         self.iptc_saving.insert(id);
         let epoch = self.epoch;
-        let IptcSave { from, fields, name } = save;
+        let IptcSave { from, generation, fields, name } = save;
         let saved = fields.clone();
         self.run_blocking_always(
             move |state| chairphoto_core::app::iptc::save_iptc_as(state, from, id, &fields),
@@ -904,7 +909,7 @@ impl PhotoInspector {
                     this.start_iptc_save(id, next, cx);
                     return;
                 }
-                if shown {
+                if shown && this.generation == generation {
                     match result {
                         // The catalog has the values whatever became of the sidecar, so they
                         // are the form's new baseline; the status says whether the sidecar
@@ -917,7 +922,12 @@ impl PhotoInspector {
                     }
                     cx.notify();
                 } else {
-                    // The inspector moved on: the status line says what became of it.
+                    // The inspector moved on, or this photo was navigated away from and back
+                    // (the generation changed) since Save was clicked: the live form was
+                    // already reset and may have re-read the catalog before this save landed,
+                    // so its captured values must not be adopted as the new baseline (#201).
+                    // The outcome goes to the status line either way; if the photo is shown
+                    // again, a fresh read replaces whatever the reset left on screen.
                     let line = match result {
                         Ok(outcome) if outcome.sidecar == chairphoto_core::catalog::IptcSidecarState::Written => {
                             format!("IPTC saved to sidecar for {name}")
@@ -926,6 +936,9 @@ impl PhotoInspector {
                         Err(e) => format!("IPTC save for {name} failed: {e}"),
                     };
                     this.status(line, cx);
+                    if shown {
+                        this.read_iptc(id, cx);
+                    }
                 }
             },
             cx,

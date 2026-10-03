@@ -54,7 +54,9 @@
 //!   same rows (the shell's), so they agree, and one view letting go never makes another's
 //!   cached thumbnail unknown (which would render it again). Views without the token (stacks,
 //!   the inspector's stack, cards, collage, the loupe's placeholder) ask plainly and share the
-//!   tier: they show the look the grid or the strip last asked for.
+//!   tier: they show the look the grid or the strip last asked for, or the one the rows named
+//!   when they last landed ([`ImageStore::note_looks`], rv151 L5): a cover changed while the
+//!   grid is not drawn invalidates that thumbnail as soon as the rows are re-read.
 //! - **A look's catalog.** A submission made for a look is bound to the catalog its row came
 //!   from: after the render, on the worker, the open catalog's identity is checked
 //!   ([`ImageStore::set_identity_probe`]); another catalog (a switch whose `catalog:switched`
@@ -761,6 +763,30 @@ impl ImageStore {
         }
         let tiers: Vec<(i64, ImageKind)> = wanted.iter().map(|&(photo, _)| (photo, ImageKind::Thumb)).collect();
         self.submit(&tiers, false, Some(from));
+    }
+
+    /// Rows read from `from` landed (rv151 L5, `wire`): each `(photo, cover look)` whose
+    /// thumbnail tier was last asked for another look is invalidated and takes the row's
+    /// look, whichever view is on screen — the grid or the strip asks for it on its next frame,
+    /// any other view on its next request. Sends nothing; a photo with no look said, or rows
+    /// from another catalog than the looks' (their first look request forgets those), are left
+    /// to the next look request.
+    pub fn note_looks(
+        &mut self,
+        from: CatalogIdentity,
+        rows: impl IntoIterator<Item = (i64, Option<CoverLook>)>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.looks_from != Some(from) {
+            return;
+        }
+        for (photo, cover) in rows {
+            let Some(asked) = self.looks.get(&photo) else { continue };
+            if asked.cover != cover {
+                self.invalidate_tier(photo, ImageKind::Thumb, cx);
+                self.looks.insert(photo, Look { from, cover });
+            }
+        }
     }
 
     /// No strip: `owner` holds nothing. The looks stay: they say what the tiers show.

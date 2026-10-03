@@ -1197,6 +1197,44 @@ fn a_tile_refused_across_a_re_root_is_asked_again_for_the_new_rows(cx: &mut Test
     assert_eq!(rig.tile(photo, cx), Ok(8), "it lands");
 }
 
+/// rv151 L5. A cover changes while the grid is not drawn (the loupe is on the stage here;
+/// in the app also the People view, the collage, the map…). When the rows land, the tile's
+/// thumbnail is invalidated for the row's new look — not when the grid next draws — so a
+/// view that asks without the token gets the new look.
+#[gpui_kit::test]
+fn a_cover_change_reaches_the_thumbnail_when_the_rows_land(cx: &mut TestAppContext) {
+    let rig = LookRig::new("grid-cover-rows-land", 3, cx);
+    for &id in &rig.ids {
+        rig.finish(id, 4, cx);
+    }
+    let photo = rig.ids[2];
+    let images = rig.app.wired.images.clone();
+    assert_eq!(images.read_with(cx, |s, _| s.look(photo)).map(|l| l.cover), Some(None), "the grid's look");
+    // Off the grid: the loupe on another photo.
+    let other = rig.ids[0];
+    rig.app.wired.shell.update(cx, |s, cx| {
+        s.select_with(cx, |l| l.select_single(other));
+        s.toggle_loupe(cx);
+    });
+    cx.run_until_parked();
+    render(&rig.app, cx);
+
+    let version = rig.cover(photo);
+    rig.app.wired.shell.update(cx, |s, cx| s.refresh_rows(cx));
+    cx.run_until_parked();
+    assert_eq!(
+        images.read_with(cx, |s, _| s.look(photo)).and_then(|l| l.cover).map(|c| c.version),
+        Some(version),
+        "the row's new look"
+    );
+    assert_eq!(rig.tile(photo, cx), Err("absent"), "the earlier look's thumbnail is gone");
+    assert_eq!(rig.tile(other, cx), Ok(4), "no other tile touched");
+    // A plain view (a card, the collage) asks: the new look is rendered.
+    images.update(cx, |s, _| s.request(photo, ImageKind::Thumb));
+    rig.finish(photo, 8, cx);
+    assert_eq!(rig.tile(photo, cx), Ok(8));
+}
+
 /// rv151 L3. A refusal that arrives after rows from another catalog were read, for a photo
 /// those rows do not name, is not kept: the look it was refused for is gone, so a plain view
 /// asks again (else the tile would stay empty for every view until the grid reached it).

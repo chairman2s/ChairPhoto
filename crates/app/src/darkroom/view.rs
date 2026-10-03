@@ -454,6 +454,8 @@ impl DarkroomView {
         }
     }
 
+    /// "Import…" a LUT. Unfiltered, as React's `pickFile` was (and GPUI's portal picker takes no
+    /// filter): `editing::import_lut_into` refuses anything but a parseable `.cube`.
     fn pick_lut(&mut self, cx: &mut Context<Self>) {
         let rx = cx.prompt_for_paths(PathPromptOptions {
             files: true,

@@ -910,3 +910,7 @@ mod obsidian_tests;
 // Albums and export (#115).
 #[path = "albums_tests.rs"]
 mod albums_tests;
+
+// The grid context menu and the loupe's unavailable-state actions (#158).
+#[path = "library/menu_tests.rs"]
+mod menu_tests;

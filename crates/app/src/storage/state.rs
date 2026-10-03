@@ -171,7 +171,7 @@ impl StorageState {
 
     /// Everything catalog-derived may have changed: the model re-reads, and its `CatalogRead`
     /// makes the shell re-read its lists and counts.
-    fn invalidate(&self, cx: &mut Context<Self>) {
+    pub(crate) fn invalidate(&self, cx: &mut Context<Self>) {
         self.model.update(cx, |m, cx| m.refresh(cx));
     }
 

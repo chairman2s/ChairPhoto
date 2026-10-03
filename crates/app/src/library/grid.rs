@@ -9,15 +9,21 @@
 //!   and releases the ones it asked for earlier that scrolled out of that window (still
 //!   queued ones are cancelled in the pool; finished ones stay in the LRU). Nothing decodes
 //!   on the UI thread: a tile shows what the store has.
+//! - **Cover looks** (#151). Each request carries the cover look its row names and the
+//!   catalog the rows were read from (`ImageStore::request_look_batch`), as `Thumbnail.tsx`
+//!   put the cover token in the URL: a row re-read with a new cover, or a new revision of it,
+//!   renders that tile's thumbnail again and drops a late answer for the earlier look.
 //! - **Storage badges per window.** The same window is reported to the session
 //!   (`ShellState::set_visible_range`), which fetches only those rows' statuses.
 //! - **Position.** Opens scrolled to the newest photo (the rows are oldest first) unless a
 //!   photo is active; scrolls the active photo into view whenever it changes.
 //! - **Keys** ([`crate::library::bindings`]) and clicks act on the session through the
-//!   shell: selection verbs, and culling marks through `ShellState::apply_mark`.
+//!   shell: selection verbs, and culling marks through `ShellState::apply_mark`. A
+//!   right-click opens the context menu ([`crate::library::grid_menu`]).
 
 use crate::image_store::{ImageState, ImageStore};
 use crate::keymap::contexts;
+use crate::library::grid_menu::GridMenu;
 use crate::shell::timing::ShellTimer;
 use crate::library::layout::{self, GAP, NAME_H, OVERSCAN_ROWS};
 use crate::library::*;
@@ -27,11 +33,12 @@ use crate::shell::state::{Mark, ShellState};
 use crate::shell::style::{Colors, COLOR_LABELS};
 use chairphoto_core::catalog::{Photo, PickState, StorageStatus};
 use chairphoto_core::image_pool::ImageKind;
+use chairphoto_model::darkroom::filmstrip::{cover_look, CoverLook};
 use chairphoto_model::library::session::{LibrarySession, SelectMods};
 use gpui_kit::prelude::*;
 use gpui_kit::{
     div, img, px, uniform_list, AnyElement, App, Bounds, ClickEvent, Context, Entity, FocusHandle, Hsla,
-    MouseButton, ObjectFit, Pixels, Point, ScrollStrategy, SharedString, Subscription, TestSupportExt as _,
+    MouseButton, MouseDownEvent, ObjectFit, Pixels, Point, ScrollStrategy, SharedString, Subscription, TestSupportExt as _,
     UniformListDecoration, UniformListScrollHandle, WeakEntity, Window,
 };
 use std::collections::HashSet;
@@ -39,7 +46,7 @@ use std::ops::Range;
 
 /// The grid. See the module docs.
 pub struct LibraryView {
-    shell: Entity<ShellState>,
+    pub(super) shell: Entity<ShellState>,
     images: Entity<ImageStore>,
     focus: FocusHandle,
     scroll: UniformListScrollHandle,
@@ -56,12 +63,20 @@ pub struct LibraryView {
     scrolled_for: Option<(i64, usize)>,
     /// Rows visible in the last frame, for Page Up/Down.
     visible_rows: usize,
+    /// The right-click menu while it is open ([`crate::library::grid_menu`]).
+    pub(super) menu: Option<GridMenu>,
     _observers: [Subscription; 2],
 }
 
 impl LibraryView {
     pub fn new(shell: Entity<ShellState>, images: Entity<ImageStore>, cx: &mut Context<Self>) -> Self {
-        let _observers = [cx.observe(&shell, |_, _, cx| cx.notify()), cx.observe(&images, |_, _, cx| cx.notify())];
+        let _observers = [
+            cx.observe(&shell, |this, _, cx| {
+                this.check_menu(cx);
+                cx.notify()
+            }),
+            cx.observe(&images, |_, _, cx| cx.notify()),
+        ];
         Self {
             shell,
             images,
@@ -73,6 +88,7 @@ impl LibraryView {
             opened_at_bottom: false,
             scrolled_for: None,
             visible_rows: 1,
+            menu: None,
             _observers,
         }
     }
@@ -125,11 +141,10 @@ impl LibraryView {
         self.shell.update(cx, |s, cx| s.select_with(cx, |l| l.select(id, mods)));
     }
 
-    /// Right-click selects the photo (React opened the context menu on it; the menu's
-    /// commands — trash, reveal, relocate, retrieve, remove — are Storage and import's, #114).
-    fn on_tile_right_click(&mut self, id: i64, window: &mut Window, cx: &mut Context<Self>) {
+    /// Right-click opens the context menu on the photo ([`crate::library::grid_menu`]).
+    fn on_tile_right_click(&mut self, id: i64, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         self.focus.focus(window, cx);
-        self.shell.update(cx, |s, cx| s.select_with(cx, |l| l.select(id, SelectMods::default())));
+        self.open_menu(id, event.position, cx);
     }
 
     fn has_active(&self, cx: &Context<Self>) -> bool {
@@ -185,18 +200,26 @@ impl LibraryView {
         let photos = shell.library.photos();
         let n = photos.len();
         let row_count = n.div_ceil(cols);
-        // Most urgent first: the visible rows, then the overscan (`layout::wanted_rows`).
-        let wanted: Vec<i64> = layout::wanted_rows(range.clone(), row_count, OVERSCAN_ROWS)
+        let from = shell.rows_from();
+        // Most urgent first: the visible rows, then the overscan (`layout::wanted_rows`), each
+        // with the cover look its row names.
+        let wanted: Vec<(i64, Option<CoverLook>)> = layout::wanted_rows(range.clone(), row_count, OVERSCAN_ROWS)
             .into_iter()
-            .flat_map(|r| photos[layout::cells(r..r + 1, cols, n)].iter().map(|p| p.id))
+            .flat_map(|r| photos[layout::cells(r..r + 1, cols, n)].iter().map(|p| (p.id, cover_look(p.cover_token.as_deref()))))
             .collect();
         let span = layout::cells(layout::wanted_span(range, row_count, OVERSCAN_ROWS), cols, n);
         self.shell.update(cx, |s, cx| s.set_visible_range(span.start, span.end, cx));
-        let keep: HashSet<i64> = wanted.iter().copied().collect();
+        let keep: HashSet<i64> = wanted.iter().map(|&(id, _)| id).collect();
         let dropped: HashSet<i64> = self.requested.difference(&keep).copied().collect();
-        self.images.update(cx, |store, _| {
-            let batch: Vec<(i64, ImageKind)> = wanted.iter().map(|&id| (id, ImageKind::Thumb)).collect();
-            store.request_batch(&batch);
+        self.images.update(cx, |store, cx| {
+            match from {
+                // The rows' cover tokens, as `Thumbnail.tsx` put them in the URL (#151).
+                Some(from) => store.request_look_batch(from, &wanted, cx),
+                None => {
+                    let batch: Vec<(i64, ImageKind)> = wanted.iter().map(|&(id, _)| (id, ImageKind::Thumb)).collect();
+                    store.request_batch(&batch);
+                }
+            }
             if !dropped.is_empty() {
                 store.release_pending(|k| k.kind != ImageKind::Thumb || !dropped.contains(&k.photo));
             }
@@ -421,7 +444,7 @@ impl LibraryView {
                                 .text_size(px(12.))
                                 .text_color(colors.txt)
                                 .child("▶")
-                                .tooltip(tip("Video — double-click to play".into())),
+                                .tooltip(tip(video_tip())),
                         )
                     })
                     .child(storage),
@@ -443,7 +466,7 @@ impl LibraryView {
             .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| this.on_tile_click(id, event, window, cx)))
             .on_mouse_down(
                 MouseButton::Right,
-                cx.listener(move |this, _, window, cx| this.on_tile_right_click(id, window, cx)),
+                cx.listener(move |this, event: &MouseDownEvent, window, cx| this.on_tile_right_click(id, event, window, cx)),
             )
             .test_support()
             .into_any_element()
@@ -538,6 +561,13 @@ fn badge(text: impl Into<SharedString>, fg: Hsla, colors: Colors) -> gpui_kit::D
 }
 
 /// A tooltip with runtime text.
+/// The video badge's tooltip. React's said "double-click to play", which its double-click
+/// did; here a double-click opens the loupe on the poster, whose button plays it (#97).
+pub fn video_tip() -> String {
+    let play = crate::loupe::view::PLAY_LABEL.trim_start_matches('▶').trim();
+    format!("Video — double-click to open, then {play}")
+}
+
 fn tip(text: String) -> impl Fn(&mut Window, &mut gpui_kit::App) -> gpui_kit::AnyView + 'static {
     let text = SharedString::from(text);
     move |window, cx| gpui_kit::component::tooltip::Tooltip::new(text.clone()).build(window, cx)
@@ -582,6 +612,7 @@ impl Render for LibraryView {
             .on_action(cx.listener(|this, _: &PageDown, _, cx| this.page(1, cx)))
             .on_action(cx.listener(|this, _: &PageUp, _, cx| this.page(-1, cx)))
             .on_action(cx.listener(|this, _: &SelectAll, _, cx| this.select(cx, |l| l.select_all())))
+            .on_action(cx.listener(|this, _: &CloseMenu, _, cx| this.close_menu(cx)))
             .on_action(cx.listener(|this, _: &Rate0, _, cx| this.mark(Mark::Rating(0), cx)))
             .on_action(cx.listener(|this, _: &Rate1, _, cx| this.mark(Mark::Rating(1), cx)))
             .on_action(cx.listener(|this, _: &Rate2, _, cx| this.mark(Mark::Rating(2), cx)))
@@ -664,7 +695,8 @@ impl Render for LibraryView {
         .flex_1()
         .min_h_0()
         .w_full();
+        let menu = self.render_menu(colors, cx);
         ShellTimer::note_grid_commit(began.elapsed().as_secs_f64() * 1000.0, cx);
-        root.px(px(12.)).pt(px(8.)).child(list)
+        root.px(px(12.)).pt(px(8.)).child(list).children(menu)
     }
 }

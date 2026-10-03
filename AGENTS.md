@@ -72,7 +72,9 @@ Read only the documents triggered by the task:
   IPTC without owing it.) A caller resolves the original's path before that store, so
   an unreachable original changes nothing; writes the returned owed set (this change
   plus any earlier write that never landed) off the lock; and clears it only through
-  `settle_iptc_write`'s compare-and-set, never directly. A save or geocode fill takes
+  `settle_iptc_write`'s compare-and-set, never directly. The one other clear is a user's
+  Dismiss (`dismiss_owed_iptc`), itself a compare-and-set on the generation and UUID the
+  user was shown. A save or geocode fill takes
   the sidecar's write turn (`xmp::lock::WriteOrder`) before that store and keeps it
   through the write, so overlapping saves store and write in one order. A write that
   fails after the commit stays owed, and the next save of the photo or the identity

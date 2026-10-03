@@ -132,6 +132,14 @@ pub struct AppModel {
 
 impl EventEmitter<AppModelEvent> for AppModel {}
 
+/// An external editor's setting changed (Preferences → Editors saved a path, RapidRAW's binary
+/// or its format): which editors this machine has is worth re-checking
+/// ([`AppModel::editors_changed`]; the inspector's "Edit in" list follows it).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EditorsChanged;
+
+impl EventEmitter<EditorsChanged> for AppModel {}
+
 impl AppModel {
     pub fn new(state: AppState, pool: Option<Arc<ImagePool<Loaded>>>) -> Self {
         Self {
@@ -439,6 +447,11 @@ impl AppModel {
         eprintln!("shell: {what}: not yet ported (#{ticket})");
         self.status = not_yet_ported_line(what, ticket).into();
         cx.notify();
+    }
+
+    /// An external editor's setting was saved: say so ([`EditorsChanged`]).
+    pub fn editors_changed(&mut self, cx: &mut Context<Self>) {
+        cx.emit(EditorsChanged);
     }
 
     /// Put one line on the status line (the bench shows it).

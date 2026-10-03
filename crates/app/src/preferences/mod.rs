@@ -35,9 +35,12 @@
 //! before `catalog:switched` reaches the dialog — instead of landing on the other catalog's
 //! settings or on its rows with the same ids.
 //!
+//! **Dialogs over Preferences.** Tags → "Merge X away…" opens the Tag panel's merge preview
+//! (`tags::merge::TagMerge`) on top of this dialog ([`Preferences::open_tag_merge`]). This
+//! entity, not the section, owns its subscriptions: a rebuild drops the section, and the
+//! preview must still close itself when its tree is superseded.
+//!
 //! **Dropped** (parity.md): the GlSpike probe ("Run WebGL probe", `editor.glSpike.lastReport`).
-//! **Not here yet:** "Merge X away…" opens the tag merge preview, `TagMergeModal`, which the
-//! Tag panel ticket (#107) ports; until then it says so.
 
 pub mod appearance;
 pub mod editors;
@@ -51,6 +54,9 @@ use crate::shell::style::Colors;
 use crate::shell::ShellState;
 use crate::storage::volumes::VolumesPanel;
 use crate::storage::{CloseDialog, Runner};
+use crate::tags::merge::{TagMerge, TagMerged};
+use crate::tags::state::TagDialog;
+use crate::tags::TagsState;
 use crate::view::RootView;
 use chairphoto_core::app::{with_catalog_as, AppState, CatalogIdentity};
 use std::collections::HashMap;
@@ -306,6 +312,8 @@ pub struct Preferences {
     model: Entity<AppModel>,
     shell: Entity<ShellState>,
     registry: Entity<ModuleRegistry>,
+    /// The tag tree: Tags → "Merge X away…" runs its preview under it.
+    tags: Entity<TagsState>,
     /// The tab shown.
     pub tab: Tab,
     pub content: Content,
@@ -314,6 +322,8 @@ pub struct Preferences {
     identity: Option<CatalogIdentity>,
     /// The sections' own subscriptions (Safety's "Show me" closes the dialog).
     content_subscriptions: Vec<Subscription>,
+    /// The merge preview opened from Tags: its close and its report. Kept across a rebuild.
+    merge_subscriptions: Vec<Subscription>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -330,6 +340,7 @@ impl Preferences {
         model: Entity<AppModel>,
         shell: Entity<ShellState>,
         registry: Entity<ModuleRegistry>,
+        tags: Entity<TagsState>,
         tab: Tab,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -364,11 +375,13 @@ impl Preferences {
             model,
             shell,
             registry,
+            tags,
             tab,
             content: placeholder,
             epoch,
             identity: None,
             content_subscriptions: Vec::new(),
+            merge_subscriptions: Vec::new(),
             _subscriptions,
         };
         if let Tab::Module(id) = &this.tab {
@@ -425,7 +438,18 @@ impl Preferences {
                     maintenance: cx.new(|cx| storage::MaintenanceSection::new(ctx.clone(), cx)),
                 })
             }
-            Tab::Tags => Content::Tags(cx.new(|cx| tags::TagMaintenance::new(ctx.clone(), cx))),
+            Tab::Tags => {
+                let tree = self.tags.clone();
+                let section = cx.new(|cx| tags::TagMaintenance::new(ctx.clone(), tree, cx));
+                self.content_subscriptions.push(cx.subscribe_in(
+                    &section,
+                    window,
+                    |this, section, open: &tags::OpenTagMerge, window, cx| {
+                        this.open_tag_merge(section.downgrade(), open.0.clone(), window, cx)
+                    },
+                ));
+                Content::Tags(section)
+            }
             Tab::Editors => Content::Editors(
                 cx.new(|cx| editors::EditorsSection::new(ctx.clone(), window, cx)),
                 cx.new(|cx| editors::DarkroomSection::new(ctx.clone(), window, cx)),
@@ -435,6 +459,29 @@ impl Preferences {
             Tab::Module(id) => Content::Module(id.clone()),
         };
         cx.notify();
+    }
+
+    /// Tags → "Merge X away…": the Tag panel's merge preview for `source`, over this dialog.
+    /// Its report goes to the section that asked, if that section is still the one shown.
+    pub fn open_tag_merge(
+        &mut self,
+        section: WeakEntity<tags::TagMaintenance>,
+        source: chairphoto_core::catalog::TagWithCount,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let tree = self.tags.clone();
+        let view = cx.new(|cx| TagMerge::new(tree, source, window, cx));
+        self.tags.update(cx, |t, _| t.last_dialog = Some(TagDialog::Merge(view.downgrade())));
+        self.merge_subscriptions = vec![
+            cx.subscribe_in(&view, window, |_, _, _: &CloseDialog, window, cx| window.close_dialog(cx)),
+            cx.subscribe(&view, move |_, _, merged: &TagMerged, cx| {
+                section.update(cx, |s, cx| s.merged(&merged.0, cx)).ok();
+            }),
+        ];
+        window.open_dialog(cx, move |dialog, _, _| {
+            dialog.title("Merge tag").w(px(620.)).child(view.clone()).on_ok(|_, _, _| false)
+        });
     }
 
     fn tab_button(&self, tab: Tab, label: SharedString, colors: Colors, cx: &mut Context<Self>) -> AnyElement {
@@ -549,8 +596,8 @@ pub fn thousands(n: i64) -> String {
 impl RootView {
     /// Open Preferences on `tab` (the rail's gear and More ⋯ → Preferences…: Storage).
     pub(crate) fn open_preferences(&mut self, tab: Tab, window: &mut Window, cx: &mut Context<Self>) {
-        let (model, shell, registry) = (self.model.clone(), self.shell.clone(), self.modules.clone());
-        let view = cx.new(|cx| Preferences::new(model, shell, registry, tab, window, cx));
+        let (model, shell, registry, tags) = (self.model.clone(), self.shell.clone(), self.modules.clone(), self.tags.clone());
+        let view = cx.new(|cx| Preferences::new(model, shell, registry, tags, tab, window, cx));
         cx.set_global(LastPreferences(view.downgrade()));
         self.dialog_close = Some(cx.subscribe_in(&view, window, |_, _, _: &CloseDialog, window, cx| {
             window.close_dialog(cx);

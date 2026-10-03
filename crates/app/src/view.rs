@@ -29,6 +29,7 @@ use crate::keymap::{contexts, ReloadTheme};
 use crate::image_store::ImageStore;
 use crate::inspector::PhotoInspector;
 use crate::library::grid::LibraryView;
+use crate::library::grid_menu::PhotoCommand;
 use crate::library::stacks::{Closed, StackDialog};
 use crate::loupe::compare::{CompareMode, MODE_PREF};
 use crate::loupe::compare_view::CompareView;
@@ -77,6 +78,8 @@ pub struct RootView {
     /// block (mounted on the Photo inspector's tags tab, #108).
     pub(crate) tag_panel: Entity<TagPanel>,
     pub(crate) photo_tags: Entity<PhotoTags>,
+    /// The tag tree both of those use; Preferences → Tags merges under it too.
+    pub(crate) tags: Entity<TagsState>,
     /// Albums and smart albums (#115): their write path and dialogs.
     pub(crate) albums: Entity<crate::albums::AlbumsState>,
     /// The export jobs and dialogs (#115).
@@ -106,12 +109,16 @@ pub struct RootView {
     stage_seen: StageView,
     /// The catalog the dialog was opened on: a switch closes it.
     catalog_epoch: u64,
+    /// The Remove-from-catalog confirm while it is open (its serial): a switch closes it
+    /// (`crate::library::photo_actions`).
+    pub(crate) remove_confirm: Option<u64>,
+    pub(crate) confirm_serial: u64,
     resize: Option<Resize>,
     /// The stage's wrapper around a module's main view ([`contexts::MODULE_VIEW`]): focused
     /// when a module view takes the stage, unless something inside it already has focus, so
     /// the shell's `[`/`]` are off there as React's handler was.
     module_focus: FocusHandle,
-    _observers: [Subscription; 9],
+    _observers: [Subscription; 10],
     _module_view_focus: Subscription,
     /// Develop takes the keys when it opens (its arrows step the filmstrip) and hands them
     /// back to the grid when the Library returns.
@@ -195,6 +202,10 @@ impl RootView {
                 let epoch = model.read(cx).catalog_epoch;
                 if epoch != this.catalog_epoch {
                     this.catalog_epoch = epoch;
+                    // The Remove confirm names the old catalog's photo.
+                    if this.remove_confirm.take().is_some() {
+                        gpui_kit::component::WindowExt::close_dialog(window, cx);
+                    }
                     // The cull session's list is the old catalog's photos too.
                     let cull = this.cull.take().is_some();
                     if this.stacks.take().is_some() || cull {
@@ -254,6 +265,8 @@ impl RootView {
                 cx.notify();
             }),
             cx.observe(&storage, |_, _, cx| cx.notify()),
+            // The grid's right-click menu (`crate::library::grid_menu`).
+            cx.subscribe_in(&library, window, |this, _, command, window, cx| this.run_photo_command(command, window, cx)),
             cx.observe(&collections.exports, |_, _, cx| cx.notify()),
             // React re-read the back-up queue and the trash count on window focus, and backed
             // up what waited when the NAS was reachable (App.tsx `onFocus`: `checkReconcile` +
@@ -275,6 +288,7 @@ impl RootView {
             storage,
             tag_panel,
             photo_tags,
+            tags,
             albums: collections.albums,
             exports: collections.exports,
             album_prompt: None,
@@ -293,6 +307,8 @@ impl RootView {
             #[cfg(feature = "edit")]
             darkroom,
             catalog_epoch,
+            remove_confirm: None,
+            confirm_serial: 0,
             resize: None,
             module_focus,
             _observers,
@@ -667,6 +683,16 @@ impl Render for RootView {
             .on_action(cx.listener(|this, _: &OpenCompare, window, cx| this.toggle_compare(window, cx)))
             .on_action(cx.listener(|this, _: &StartCullSession, window, cx| this.start_cull(window, cx)))
             .on_action(|_: &PopOutLoupe, _, cx| crate::loupe::window::open(cx))
+            // The loupe's unavailable state (#158).
+            .on_action(cx.listener(|this, _: &RelocatePhoto, window, cx| {
+                this.loupe_photo_command(|id, _, from| PhotoCommand::Relocate { id, from }, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &RetrieveFromNas, window, cx| {
+                this.loupe_photo_command(|id, _, from| PhotoCommand::Retrieve { id, from }, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &RemoveFromCatalog, window, cx| {
+                this.loupe_photo_command(|id, name, from| PhotoCommand::Remove { id, name, from }, window, cx)
+            }))
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| this.on_mouse_move(event, cx)))
             .on_mouse_up(
                 MouseButton::Left,

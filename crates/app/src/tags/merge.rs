@@ -3,7 +3,8 @@
 //! real merge rolled back (`app::tags::merge_tags` with `dry_run`) — and only then Merge. A
 //! refusal (path collision, auto-tag target) arrives as the preview's error, naming its cause.
 //! "Pick a different tag" goes back. A committed merge closes the dialog and puts its counts
-//! on the status line (`tag_tree::merge_summary`).
+//! on the status line (`tag_tree::merge_summary`), and hands its report to whoever opened it
+//! ([`TagMerged`]: Preferences → Tags shows it in its own section).
 
 use super::state::{bind_dialog, run_as, CatalogGuard, TagsState};
 use crate::shell::style::Colors;
@@ -31,6 +32,12 @@ pub struct TagMerge {
 }
 
 impl EventEmitter<CloseDialog> for TagMerge {}
+
+/// A merge committed, with its report — emitted just before the dialog closes.
+#[derive(Debug, Clone)]
+pub struct TagMerged(pub TagMergeReport);
+
+impl EventEmitter<TagMerged> for TagMerge {}
 
 impl TagMerge {
     pub fn new(tags: Entity<TagsState>, source: TagWithCount, window: &mut Window, cx: &mut Context<Self>) -> Self {
@@ -91,6 +98,7 @@ impl TagMerge {
                 Ok(report) => {
                     let line = merge_summary(&report);
                     s.tags.update(cx, |t, cx| t.set_status(line, cx));
+                    cx.emit(TagMerged(report));
                     cx.emit(CloseDialog);
                 }
                 Err(e) => s.error = Some(e),

@@ -207,19 +207,29 @@ impl GeocodePanel {
                     cx.notify();
                     return;
                 }
-                p.status = match result {
-                    Ok(true) => {
-                        p.state.update(cx, |s, cx| s.catalog_changed(cx));
-                        "Location fields filled.".into()
-                    }
-                    Ok(false) => "No GPS data, fields already set, or no result from geocoder.".into(),
-                    Err(e) => format!("Error: {e}"),
-                };
+                let (status, changed) = geocode_status(&result);
+                if changed {
+                    p.state.update(cx, |s, cx| s.catalog_changed(cx));
+                }
+                p.status = status;
                 cx.notify();
             })
             .ok();
         })
         .detach();
+    }
+}
+
+/// The status line for a single-photo geocode, and whether the catalog changed (so the
+/// catalog view re-reads). A location stored in the catalog with its sidecar pending is not
+/// an error: it is shown as the core words it, and the catalog did change (#153; React's
+/// `geocodeStatus`).
+pub fn geocode_status(result: &Result<bool, String>) -> (String, bool) {
+    match result {
+        Ok(true) => ("Location fields filled.".into(), true),
+        Ok(false) => ("No GPS data, fields already set, or no result from geocoder.".into(), false),
+        Err(e) if chairphoto_core::plugins::map::geocode::is_pending_message(e) => (e.clone(), true),
+        Err(e) => (format!("Error: {e}"), false),
     }
 }
 
@@ -242,5 +252,25 @@ impl Render for GeocodePanel {
             .when(!self.status.is_empty(), |d| d.child(ui::sub(self.status.clone(), colors)))
             .test_support()
             .into_any_element()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::geocode_status;
+
+    /// #153 (review of #148): a location stored in the catalog with its sidecar pending is
+    /// shown without an "Error: " prefix and re-reads the catalog view; a real failure keeps
+    /// the prefix and changes nothing; a fill re-reads, a no-op does not.
+    #[test]
+    fn a_pending_geocode_is_not_an_error_and_refreshes_the_catalog() {
+        let pending = format!(
+            "{} (read-only); the repair pass will write it",
+            chairphoto_core::plugins::map::geocode::PENDING_LEAD
+        );
+        assert_eq!(geocode_status(&Err(pending.clone())), (pending, true));
+        assert_eq!(geocode_status(&Err("geocode: HTTP 500".into())), ("Error: geocode: HTTP 500".into(), false));
+        assert_eq!(geocode_status(&Ok(true)), ("Location fields filled.".into(), true));
+        assert!(!geocode_status(&Ok(false)).1);
     }
 }

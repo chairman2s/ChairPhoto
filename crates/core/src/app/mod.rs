@@ -34,6 +34,7 @@ pub mod identity;
 #[cfg(feature = "instagram")]
 pub mod instagram;
 pub mod iptc;
+pub mod iptc_owed;
 pub mod jobs;
 #[cfg(any(feature = "flickr", feature = "smugmug"))]
 pub mod oauth;

@@ -90,6 +90,30 @@ impl IptcMask {
         }
     }
 
+    /// The name a front end shows for the one field this mask names. Only meaningful for a
+    /// single-field mask (one of [`Self::EACH`]); any other mask answers the empty string.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::DESCRIPTION => "Description",
+            Self::HEADLINE => "Headline",
+            Self::TITLE => "Title",
+            Self::CREATOR => "Creator",
+            Self::COPYRIGHT => "Copyright",
+            Self::CREDIT => "Credit",
+            Self::SOURCE => "Source",
+            Self::CITY => "City",
+            Self::STATE => "State",
+            Self::COUNTRY => "Country",
+            Self::COUNTRY_CODE => "Country code",
+            _ => "",
+        }
+    }
+
+    /// The labels of the fields in this set, in [`Self::EACH`] order.
+    pub fn labels(self) -> Vec<String> {
+        Self::EACH.into_iter().filter(|m| self.contains(*m)).map(|m| m.label().to_string()).collect()
+    }
+
     /// The fields whose value differs between `before` and `after`.
     pub fn changed(before: &IptcFields, after: &IptcFields) -> Self {
         Self::EACH
@@ -208,6 +232,31 @@ impl IptcSettled {
     }
 }
 
+/// One photo owing IPTC to its sidecar, as the identity-debt panel lists it (#153).
+///
+/// `uuid` and `generation` are what [`Catalog::dismiss_owed_iptc`] compares against, so a
+/// dismissal pressed on this row cannot clear a debt a newer store recorded since it was
+/// read, nor the debt of another photo that took this id.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OwedIptc {
+    pub photo_id: i64,
+    pub uuid: String,
+    /// The photo's catalog-root-relative logical path, for display only.
+    pub path: String,
+    /// The labels of the owed fields ([`IptcMask::label`]), in [`IptcMask::EACH`] order.
+    pub fields: Vec<String>,
+    /// Failed writes of this generation's record (a successful write resets it).
+    pub attempts: i64,
+    /// Why the last write failed, or empty.
+    pub error: String,
+    /// Unix seconds; 0 when never attempted.
+    pub last_attempt_at: i64,
+    /// Unix seconds since the photo has owed something without a break.
+    pub queued_at: i64,
+    pub generation: i64,
+}
+
 /// How many photos the IPTC drain reads per query.
 const IPTC_REPAIR_PAGE_SIZE: i64 = 256;
 
@@ -283,6 +332,66 @@ impl Catalog {
     /// Photos owing IPTC to their sidecar.
     pub fn count_owed_iptc(&self) -> Result<i64> {
         Ok(self.conn.query_row("SELECT count(*) FROM pending_sidecar_iptc WHERE owed != 0", [], |r| r.get(0))?)
+    }
+
+    /// One page of the photos owing IPTC, in photo-id order (#153). `limit` is clamped to
+    /// 1..=1000 and a negative `offset` reads as 0. One query, so a row's fields, error and
+    /// generation agree.
+    pub fn list_owed_iptc_page(&self, limit: i64, offset: i64) -> Result<Vec<OwedIptc>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT q.photo_id, p.uuid, p.path, q.owed, q.attempts, q.error, q.last_attempt_at,
+                    q.queued_at, q.generation
+             FROM pending_sidecar_iptc q JOIN photos p ON p.id = q.photo_id
+             WHERE q.owed != 0
+             ORDER BY q.photo_id LIMIT ?1 OFFSET ?2",
+        )?;
+        let rows = stmt
+            .query_map(params![limit.clamp(1, 1000), offset.max(0)], |r| {
+                Ok(OwedIptc {
+                    photo_id: r.get(0)?,
+                    uuid: r.get(1)?,
+                    path: r.get(2)?,
+                    fields: IptcMask::from_bits(r.get(3)?).labels(),
+                    attempts: r.get(4)?,
+                    error: r.get(5)?,
+                    last_attempt_at: r.get(6)?,
+                    queued_at: r.get(7)?,
+                    generation: r.get(8)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Stop owing `photo_id`'s IPTC without writing anything (#153) — for a photo kept on
+    /// media the user means to leave read-only. The catalog keeps its values and the sidecar
+    /// keeps whatever it has; a later save of the photo owes only what it changes.
+    ///
+    /// Compare-and-set on the `uuid` and `generation` the user was shown ([`OwedIptc`]): a
+    /// store since then (a save, a geocode fill, a superseded write's re-owe) bumped the
+    /// generation and owes something the user has not seen, so nothing is dismissed; nor is
+    /// the debt of another photo that took this id. Returns whether it dismissed. A write in
+    /// flight that read this generation still settles normally: its success clears what is
+    /// already clear, and its failure finds nothing owed to record against.
+    pub fn dismiss_owed_iptc(&self, photo_id: i64, uuid: &str, generation: i64) -> Result<bool> {
+        let dismissed = self.conn.execute(
+            "UPDATE pending_sidecar_iptc
+             SET owed = 0, attempts = 0, error = '', last_attempt_at = ?4
+             WHERE photo_id = ?1 AND generation = ?3 AND owed != 0
+               AND EXISTS (SELECT 1 FROM photos WHERE id = ?1 AND uuid = ?2)",
+            params![photo_id, uuid, generation, super::now()],
+        )?;
+        Ok(dismissed == 1)
+    }
+
+    /// Whether `photo_id` is still the photo with `uuid` — for a write keyed by an id a front
+    /// end read earlier.
+    pub fn photo_has_uuid(&self, photo_id: i64, uuid: &str) -> Result<bool> {
+        Ok(self.conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM photos WHERE id = ?1 AND uuid = ?2)",
+            params![photo_id, uuid],
+            |r| r.get(0),
+        )?)
     }
 
     /// Record what became of `write`'s IO (`outcome`), by compare-and-set on the owed
@@ -599,6 +708,95 @@ mod tests {
         let summary = c.repair_pending_identity().unwrap();
         assert_eq!((summary.iptc_written, summary.aborted), (1, false));
         assert_eq!(c.count_owed_iptc().unwrap(), 0);
+    }
+
+    /// #153: the list names each owing photo once — its id, UUID, path, the owed fields by
+    /// label, the last error and the generation — in id order, a page at a time. A photo
+    /// whose debt was paid is not listed.
+    #[test]
+    fn the_list_pages_the_owing_photos_with_their_fields_and_error() {
+        let (dir, c, first, _) = photo("iptc-owed-list");
+        let mut ids = vec![first];
+        for i in 0..3 {
+            let f = dir.join("library").join(format!("L{i}.ARW"));
+            std::fs::write(&f, b"raw").unwrap();
+            ids.push(c.upsert_photo(&f, None, 0, 1).unwrap().id);
+        }
+        let w = c.set_iptc(ids[0], &IptcFields { city: "Oslo".into(), ..titled("A") }).unwrap();
+        c.settle_iptc_write(&w, &Err("read-only".into())).unwrap();
+        c.set_iptc(ids[1], &titled("B")).unwrap();
+        let paid = c.set_iptc(ids[2], &titled("C")).unwrap();
+        c.settle_iptc_write(&paid, &Ok(())).unwrap();
+        c.set_iptc(ids[3], &IptcFields { country_code: "NO".into(), ..Default::default() }).unwrap();
+
+        let all = c.list_owed_iptc_page(10, 0).unwrap();
+        assert_eq!(all.iter().map(|r| r.photo_id).collect::<Vec<_>>(), [ids[0], ids[1], ids[3]]);
+        let row = &all[0];
+        assert_eq!(row.fields, ["Title", "City"]);
+        assert_eq!((row.error.as_str(), row.attempts), ("read-only", 1));
+        assert!(row.last_attempt_at > 0 && row.queued_at > 0);
+        assert_eq!(row.uuid, c.get_photo(ids[0]).unwrap().uuid);
+        assert_eq!(row.path, c.get_photo(ids[0]).unwrap().path);
+        assert_eq!(row.generation, w.generation);
+        assert_eq!((all[1].error.as_str(), all[1].attempts), ("", 0));
+        assert_eq!(all[2].fields, ["Country code"]);
+
+        let page = |limit, offset| c.list_owed_iptc_page(limit, offset).unwrap().iter().map(|r| r.photo_id).collect::<Vec<_>>();
+        assert_eq!(page(2, 0), [ids[0], ids[1]]);
+        assert_eq!(page(2, 2), [ids[3]]);
+        assert!(page(2, 4).is_empty());
+        assert_eq!(page(0, -5), [ids[0]], "a limit below 1 reads one row, a negative offset reads from the start");
+    }
+
+    /// #153: Dismiss clears the debt without writing, and only for the generation and UUID
+    /// it was shown. A save that stored after the row was read (a newer generation) keeps
+    /// its debt, and its own write still settles normally afterwards.
+    #[test]
+    fn dismiss_does_not_clear_a_newer_saves_debt() {
+        let (_dir, c, id, _) = photo("iptc-owed-dismiss");
+        let failed = c.set_iptc(id, &titled("A")).unwrap();
+        c.settle_iptc_write(&failed, &Err("read-only".into())).unwrap();
+        let shown = c.list_owed_iptc_page(10, 0).unwrap().remove(0);
+
+        // A newer save stores (and owes) after the row was shown, before Dismiss lands.
+        let newer = c.set_iptc(id, &IptcFields { creator: "C".into(), ..titled("A") }).unwrap();
+        assert!(!c.dismiss_owed_iptc(id, &shown.uuid, shown.generation).unwrap(), "a stale Dismiss refused");
+        assert_eq!(c.owed_iptc(id).unwrap(), IptcMask::TITLE | IptcMask::CREATOR, "the newer save's debt kept");
+
+        // The refreshed row dismisses; the newer save's write, in flight across it, still
+        // settles (it read an older generation, and every value it wrote is current).
+        let fresh = c.list_owed_iptc_page(10, 0).unwrap().remove(0);
+        assert_eq!(fresh.generation, newer.generation);
+        assert!(c.dismiss_owed_iptc(id, &fresh.uuid, fresh.generation).unwrap());
+        assert_eq!(c.owed_iptc(id).unwrap(), IptcMask::NONE);
+        assert_eq!(c.count_owed_iptc().unwrap(), 0);
+        assert!(c.list_owed_iptc_page(10, 0).unwrap().is_empty());
+        assert_eq!(c.get_iptc(id).unwrap().creator, "C", "the catalog keeps its values");
+        assert_eq!(c.settle_iptc_write(&newer, &Ok(())).unwrap(), IptcSettled::Written);
+        assert!(!c.dismiss_owed_iptc(id, &fresh.uuid, fresh.generation).unwrap(), "nothing left to dismiss");
+
+        // A later save owes only what it changes, not what was dismissed.
+        let later = c.set_iptc(id, &IptcFields { headline: "H".into(), creator: "C".into(), ..titled("A") }).unwrap();
+        assert_eq!(later.fields, IptcMask::HEADLINE);
+    }
+
+    /// #153: Dismiss of a removed photo's row cannot clear the debt of the photo that took
+    /// its id, even at the same generation.
+    #[test]
+    fn dismiss_does_not_reach_the_photo_that_reused_the_id() {
+        let (dir, c, id, _) = photo("iptc-owed-dismiss-reused");
+        c.set_iptc(id, &titled("old")).unwrap();
+        let shown = c.list_owed_iptc_page(10, 0).unwrap().remove(0);
+        c.remove_photo(id).unwrap();
+        let file = dir.join("library").join("OTHER.ARW");
+        std::fs::write(&file, b"raw").unwrap();
+        let reused = c.upsert_photo(&file, None, 0, 1).unwrap().id;
+        assert_eq!(reused, id, "the precondition: the id is reused");
+        c.set_iptc(reused, &titled("new")).unwrap();
+        assert_eq!(c.list_owed_iptc_page(10, 0).unwrap()[0].generation, shown.generation, "the generations collide");
+
+        assert!(!c.dismiss_owed_iptc(id, &shown.uuid, shown.generation).unwrap());
+        assert_eq!(c.owed_iptc(reused).unwrap(), IptcMask::TITLE);
     }
 
     /// A stale write's failure does not touch a newer store's record.

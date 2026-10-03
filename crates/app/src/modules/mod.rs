@@ -463,6 +463,9 @@ pub fn bundled() -> Vec<Rc<dyn Module>> {
     modules.push(Rc::new(dev_module::DevModule));
     #[cfg(feature = "ai")]
     modules.push(Rc::new(ai_tagging::AiTaggingModule));
+    // React's third, after the Basic Editor (folded into the Darkroom, #104).
+    #[cfg(feature = "tag-graph")]
+    modules.push(Rc::new(tag_graph::TagGraphModule));
     modules.push(Rc::new(statistics::StatisticsModule));
     // Registered without their backends too (Flickr's and SmugMug's are opt-in features):
     // the Modules panel then says so.
@@ -482,8 +485,6 @@ pub fn bundled() -> Vec<Rc<dyn Module>> {
     modules.push(Rc::new(map::MapModule));
     #[cfg(feature = "faces")]
     modules.push(Rc::new(faces::FacesModule));
-    #[cfg(feature = "tag-graph")]
-    modules.push(Rc::new(tag_graph::TagGraphModule));
     #[cfg(feature = "smarttags")]
     modules.push(Rc::new(smart_tagging::SmartTaggingModule));
     modules

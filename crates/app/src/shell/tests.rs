@@ -396,6 +396,31 @@ fn a_develop_to_library_transition_is_timed_and_stored(cx: &mut TestAppContext) 
     assert_eq!(stored(&app).as_deref(), Some(w[1].as_str()), "the summary is in the catalog");
 }
 
+/// **Forced interleaving** (review claude-159-160, L3). The "started" marker's write is held
+/// up (here: run after the summary's); it must not overwrite the summary.
+#[gpui_kit::test]
+fn a_late_started_marker_never_overwrites_the_summary(cx: &mut TestAppContext) {
+    let dir = TempDir::new("shell-timing-order");
+    let app = start(cx);
+    open_catalog_with_photos(&app, &dir, 1, cx);
+    work(cx); // the launch checks
+    let from = app.wired.shell.read_with(cx, |s, _| s.rows_from());
+    cx.update(|cx| {
+        ShellTimer::set_enabled(true, cx);
+        ShellTimer::leave("develop", from, cx);
+    });
+    let marker = cx.update(|cx| Runner::get(cx).hold_pending());
+    assert_eq!(marker.len(), 1, "the marker's write, held");
+    cx.executor().advance_clock(Duration::from_millis(10_100));
+    cx.run_until_parked();
+    let w = written(cx);
+    assert_eq!(w.len(), 2, "the summary was handed out: {w:?}");
+    cx.update(|cx| Runner::get(cx).run_pending()); // the summary's write
+    cx.update(|cx| Runner::get(cx).release(marker));
+    work(cx); // then the late marker's
+    assert_eq!(stored(&app).as_deref(), Some(w[1].as_str()), "the late marker overwrote the summary");
+}
+
 /// The Darkroom's switch turns the instrument on, and its ← Library starts the transition.
 #[cfg(feature = "edit")]
 #[gpui_kit::test]

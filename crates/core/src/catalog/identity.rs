@@ -47,6 +47,7 @@
 //! than dropping that row's result. The pass's own ownership — job id, abort flag, status
 //! slot, catalog switch — is the `app::jobs` protocol, one layer up.
 
+use super::busy::{is_busy, retry_busy};
 use super::{Catalog, CatalogError, Result};
 use rusqlite::{params, OptionalExtension};
 use std::path::{Path, PathBuf};
@@ -599,6 +600,11 @@ pub struct ForeignConflictSummary {
     /// Copies whose sidecar Overwrite could not write (read-only storage, an unparseable
     /// sidecar). Still queued as conflicts.
     pub failed: usize,
+    /// Copies left as they were because another connection held the catalog's write lock
+    /// through every retry (#182). Still queued; a later run or pass takes them up. An
+    /// Overwrite counted here may already have written the sidecar: a later run then skips
+    /// the copy as no longer in conflict, and the repair pass records it bound.
+    pub busy: usize,
     /// True when the run stopped early (Cancel, a newer run, a catalog switch); the counts
     /// are then partial.
     pub aborted: bool,
@@ -607,7 +613,7 @@ pub struct ForeignConflictSummary {
 impl ForeignConflictSummary {
     /// Copies the run has finished with, whatever the outcome.
     pub fn done(&self) -> usize {
-        self.overwritten + self.dismissed + self.skipped + self.failed
+        self.overwritten + self.dismissed + self.skipped + self.failed + self.busy
     }
 }
 
@@ -746,6 +752,11 @@ pub struct IdentityRepairSummary {
     /// Photos owing IPTC whose sidecar write still fails (read-only storage, an unparseable
     /// sidecar). Left owed.
     pub iptc_failed: usize,
+    /// Copies and photos left as they were because another connection held the catalog's
+    /// write lock through every retry (#182) — a long bundle import, say. Still queued or
+    /// owed, so the next pass takes them up; not a failure. A copy counted here may already
+    /// have had its sidecar written, which that next pass finds and records.
+    pub busy: usize,
 }
 
 impl IdentityRepairSummary {
@@ -769,6 +780,7 @@ impl IdentityRepairSummary {
             + self.iptc_written
             + self.iptc_unreachable
             + self.iptc_failed
+            + self.busy
     }
 }
 
@@ -1280,12 +1292,17 @@ impl Catalog {
         relative_path: &str,
         action: IdentityConflictAction,
     ) -> Result<IdentityConflictOutcome> {
-        self.resolve_conflict(photo_id, volume_id, relative_path, action, false)
+        self.resolve_conflict(photo_id, volume_id, relative_path, action, false, &AtomicBool::new(false))
     }
 
     /// [`Self::resolve_identity_conflict`]; with `foreign_only`, Overwrite also refuses a
     /// sidecar that carries a UUID when it is read, as the bulk resolution of non-UUID
     /// conflicts requires ([`Self::run_resolve_foreign_conflicts`]).
+    ///
+    /// A catalog statement that meets another connection's write lock is retried
+    /// ([`retry_busy`], until `abort`); one still locked after that returns the busy error,
+    /// and a write it follows — Overwrite's sidecar — has then happened without its record
+    /// (#182). The copy stays queued, and the repair pass records it bound.
     fn resolve_conflict(
         &self,
         photo_id: i64,
@@ -1293,21 +1310,25 @@ impl Catalog {
         relative_path: &str,
         action: IdentityConflictAction,
         foreign_only: bool,
+        abort: &AtomicBool,
     ) -> Result<IdentityConflictOutcome> {
-        let (error, dismissed_at, catalog_uuid, base_path): (String, i64, String, String) = self
-            .conn
-            .query_row(
-                "SELECT q.error, q.dismissed_at, p.uuid, v.base_path
-                 FROM pending_sidecar_identity q
-                 JOIN photos p ON p.id = q.photo_id
-                 JOIN volumes v ON v.id = q.volume_id
-                 WHERE q.photo_id = ?1 AND q.field = 'identifier'
-                   AND q.volume_id = ?2 AND q.relative_path = ?3",
-                params![photo_id, volume_id, relative_path],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
-            )
-            .optional()?
-            .ok_or_else(|| {
+        let queued = retry_busy(abort, || {
+            Ok(self
+                .conn
+                .query_row(
+                    "SELECT q.error, q.dismissed_at, p.uuid, v.base_path
+                     FROM pending_sidecar_identity q
+                     JOIN photos p ON p.id = q.photo_id
+                     JOIN volumes v ON v.id = q.volume_id
+                     WHERE q.photo_id = ?1 AND q.field = 'identifier'
+                       AND q.volume_id = ?2 AND q.relative_path = ?3",
+                    params![photo_id, volume_id, relative_path],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                )
+                .optional()?)
+        })?;
+        let (error, dismissed_at, catalog_uuid, base_path): (String, i64, String, String) =
+            queued.ok_or_else(|| {
                 CatalogError::NotFound(format!(
                     "no queued identity for photo {photo_id} at {relative_path} on volume \
                      {volume_id}"
@@ -1330,7 +1351,7 @@ impl Catalog {
                     "{relative_path} is not dismissed, so there is nothing to restore"
                 )));
             }
-            self.set_identity_dismissal(photo_id, volume_id, relative_path, 0)?;
+            retry_busy(abort, || self.set_identity_dismissal(photo_id, volume_id, relative_path, 0))?;
             return Ok(outcome);
         }
 
@@ -1359,7 +1380,8 @@ impl Catalog {
                     "{relative_path} is already dismissed"
                 )));
             }
-            self.set_identity_dismissal(photo_id, volume_id, relative_path, now())?;
+            let at = now();
+            retry_busy(abort, || self.set_identity_dismissal(photo_id, volume_id, relative_path, at))?;
             return Ok(outcome);
         }
 
@@ -1461,13 +1483,15 @@ impl Catalog {
                 let backup = crate::xmp::overwrite_identifier(&target, &catalog_uuid)
                     .map_err(CatalogError::Io)?;
                 outcome.sidecar_backup = backup.map(|p| p.to_string_lossy().to_string());
-                self.record_sidecar_field_target(
-                    photo_id,
-                    SidecarField::Identifier,
-                    volume_id,
-                    relative_path,
-                    &SidecarIdentity::Bound,
-                )?;
+                retry_busy(abort, || {
+                    self.record_sidecar_field_target(
+                        photo_id,
+                        SidecarField::Identifier,
+                        volume_id,
+                        relative_path,
+                        &SidecarIdentity::Bound,
+                    )
+                })?;
             }
             IdentityConflictAction::Dismiss | IdentityConflictAction::Restore => unreachable!(
                 "Dismiss and Restore return above, before any sidecar is read"
@@ -1598,17 +1622,21 @@ impl Catalog {
         abort: &AtomicBool,
         mut progress: impl FnMut(&IdentityRepairSummary),
     ) -> Result<IdentityRepairSummary> {
-        let mut summary = IdentityRepairSummary {
-            total: (self.count_active_identity_repairs()? + self.count_owed_iptc()?) as usize,
-            ..Default::default()
-        };
+        let total = retry_busy(abort, || {
+            Ok(self.count_active_identity_repairs()? + self.count_owed_iptc()?)
+        })?;
+        let mut summary = IdentityRepairSummary { total: total as usize, ..Default::default() };
         let mut cursor: Option<IdentityRepairCursor> = None;
         loop {
             if abort.load(Ordering::Relaxed) {
                 summary.aborted = true;
                 return Ok(summary);
             }
-            let page = self.plan_identity_repairs_page(cursor.as_ref(), REPAIR_PAGE_SIZE)?;
+            // A read: under WAL it waits for no writer, so a lock that outlasts the retries
+            // here is not the transient kind and does end the pass.
+            let page = retry_busy(abort, || {
+                self.plan_identity_repairs_page(cursor.as_ref(), REPAIR_PAGE_SIZE)
+            })?;
             if page.is_empty() {
                 // Then the IPTC the catalog owes sidecars (#148), under the same abort flag.
                 summary.aborted = !self.run_iptc_repair(abort, &mut summary, &mut progress)?;
@@ -1622,16 +1650,29 @@ impl Catalog {
                 cursor = Some(plan.cursor());
                 // Resolved or dismissed since the page was planned: the decision is
                 // somebody else's and this pass has nothing to add to it.
-                if !self.refresh_identity_repair(&mut plan)? {
-                    summary.superseded += 1;
-                    progress(&summary);
-                    continue;
+                match retry_busy(abort, || self.refresh_identity_repair(&mut plan)) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        summary.superseded += 1;
+                        progress(&summary);
+                        continue;
+                    }
+                    Err(e) if is_busy(&e) => {
+                        summary.busy += 1;
+                        progress(&summary);
+                        continue;
+                    }
+                    Err(e) => return Err(e),
                 }
                 let outcome = plan.run();
-                if self.record_planned_repair(&plan, &outcome)? {
-                    summary.tally(&outcome);
-                } else {
-                    summary.superseded += 1;
+                // Only the record is retried, never the IO: it is the same compare-and-set
+                // on the version refreshed above. Left busy, the row keeps that version and
+                // the next pass re-reads the file, which it may find already bound (#182).
+                match retry_busy(abort, || self.record_planned_repair(&plan, &outcome)) {
+                    Ok(true) => summary.tally(&outcome),
+                    Ok(false) => summary.superseded += 1,
+                    Err(e) if is_busy(&e) => summary.busy += 1,
+                    Err(e) => return Err(e),
                 }
                 progress(&summary);
             }
@@ -1711,15 +1752,17 @@ impl Catalog {
         abort: &AtomicBool,
         mut progress: impl FnMut(&ForeignConflictSummary),
     ) -> Result<ForeignConflictSummary> {
-        let mut summary =
-            ForeignConflictSummary { total: self.count_foreign_conflicts()?, ..Default::default() };
+        let total = retry_busy(abort, || self.count_foreign_conflicts())?;
+        let mut summary = ForeignConflictSummary { total, ..Default::default() };
         let mut cursor: Option<(i64, i64, String)> = None;
         loop {
             if abort.load(Ordering::Relaxed) {
                 summary.aborted = true;
                 return Ok(summary);
             }
-            let page = self.identifier_conflicts_page(cursor.as_ref(), REPAIR_PAGE_SIZE)?;
+            let page = retry_busy(abort, || {
+                self.identifier_conflicts_page(cursor.as_ref(), REPAIR_PAGE_SIZE)
+            })?;
             if page.is_empty() {
                 return Ok(summary);
             }
@@ -1732,13 +1775,16 @@ impl Catalog {
                 if !is_foreign_conflict(&error) {
                     continue; // a UUID conflict: not this run's to decide, and not counted
                 }
-                match self.resolve_conflict(photo_id, volume_id, &relative_path, action.single(), true) {
+                let single = action.single();
+                match self.resolve_conflict(photo_id, volume_id, &relative_path, single, true, abort) {
                     Ok(_) => match action {
                         ForeignConflictAction::Overwrite => summary.overwritten += 1,
                         ForeignConflictAction::Dismiss => summary.dismissed += 1,
                     },
                     Err(CatalogError::Validation(_) | CatalogError::NotFound(_)) => summary.skipped += 1,
                     Err(CatalogError::Io(_)) => summary.failed += 1,
+                    // Locked through every retry: left queued, and the run carries on (#182).
+                    Err(e) if is_busy(&e) => summary.busy += 1,
                     Err(e) => return Err(e),
                 }
                 progress(&summary);
@@ -3498,6 +3544,162 @@ mod tests {
                 None => {}
             }
         }
+    }
+
+    // --- A lock held past the busy timeout (#182) -------------------------------------------
+
+    /// A third connection holding the write lock, as the bundle importer's index phase does
+    /// across a whole import. Shared so a hook or a progress callback can release it at the
+    /// exact point a test needs.
+    type Holder = std::rc::Rc<std::cell::RefCell<Option<rusqlite::Connection>>>;
+
+    fn hold_write_lock(catalog: &Catalog) -> Holder {
+        let conn = rusqlite::Connection::open(catalog.db_path()).unwrap();
+        conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+        // Waits of 30 ms stand in for production's 5 s; the lock outlasts each of them.
+        catalog.conn().busy_timeout(std::time::Duration::from_millis(30)).unwrap();
+        std::rc::Rc::new(std::cell::RefCell::new(Some(conn)))
+    }
+
+    fn release(holder: &Holder) {
+        if let Some(conn) = holder.borrow_mut().take() {
+            conn.execute_batch("COMMIT").unwrap();
+        }
+    }
+
+    /// Removes the retry hook when a test ends, panicking or not.
+    struct HookGuard;
+    impl Drop for HookGuard {
+        fn drop(&mut self) {
+            super::super::busy::hook::clear();
+        }
+    }
+
+    fn unreachable_rows(catalog: &Catalog, root: &Path, tag: &str, n: usize) -> Vec<(i64, PathBuf)> {
+        (0..n)
+            .map(|i| {
+                let (id, path) = seed_photo(catalog, root, &format!("{tag}-{i}.arw"));
+                catalog.record_sidecar_identity(id, &path, &SidecarIdentity::Unreachable).unwrap();
+                (id, path)
+            })
+            .collect()
+    }
+
+    /// A pass that meets the lock past the busy timeout waits it out and retries the row,
+    /// instead of ending on "database is locked". The lock is released between the first
+    /// busy attempt and its retry, so the retry — not a lucky timing — is what binds it.
+    #[test]
+    fn a_pass_retries_a_row_whose_record_met_a_held_lock() {
+        let (catalog, root, _dir) = temp_catalog("busy-retry");
+        let seeded = unreachable_rows(&catalog, &root, "retry", 3);
+        let holder = hold_write_lock(&catalog);
+        let retries = std::rc::Rc::new(std::cell::Cell::new(0));
+        let _guard = HookGuard;
+        {
+            let (holder, retries) = (holder.clone(), retries.clone());
+            super::super::busy::hook::set(move || {
+                retries.set(retries.get() + 1);
+                release(&holder);
+            });
+        }
+
+        let summary = catalog.run_identity_repair(&AtomicBool::new(false), |_| {}).unwrap();
+
+        assert_eq!(retries.get(), 1, "the first record met the lock and was retried once");
+        assert_eq!((summary.bound, summary.busy, summary.aborted), (3, 0, false), "{summary:?}");
+        for (id, path) in &seeded {
+            assert!(queue_row(&catalog, *id, path).is_none(), "photo {id} is still queued");
+        }
+    }
+
+    /// A row whose record is locked through every retry is left exactly as it was, counted
+    /// `busy`, and the pass carries on with the next row. The next pass finds the sidecar the
+    /// first one wrote and records it bound.
+    #[test]
+    fn a_row_locked_through_every_retry_stays_queued_and_the_pass_carries_on() {
+        let (catalog, root, _dir) = temp_catalog("busy-defer");
+        let seeded = unreachable_rows(&catalog, &root, "defer", 3);
+        let before = queue_row(&catalog, seeded[0].0, &seeded[0].1).unwrap();
+        let holder = hold_write_lock(&catalog);
+
+        // Released only once the first row has been given up on.
+        let summary = catalog
+            .run_identity_repair(&AtomicBool::new(false), |s| {
+                if s.busy == 1 {
+                    release(&holder);
+                }
+            })
+            .unwrap();
+
+        assert_eq!((summary.bound, summary.busy, summary.done()), (2, 1, 3), "{summary:?}");
+        assert_eq!(
+            queue_row(&catalog, seeded[0].0, &seeded[0].1),
+            Some(before),
+            "the locked row is left as it was, version included"
+        );
+        assert!(crate::xmp::read_identifier(&seeded[0].1).is_some(), "its IO ran before the lock");
+        for (id, path) in &seeded[1..] {
+            assert!(queue_row(&catalog, *id, path).is_none(), "photo {id} after the lock was not bound");
+        }
+
+        let next = catalog.repair_pending_identity().unwrap();
+        assert_eq!((next.bound, next.busy), (1, 0), "{next:?}");
+        assert!(queue_row(&catalog, seeded[0].0, &seeded[0].1).is_none());
+    }
+
+    /// The bulk resolution does the same: an Overwrite whose record stays locked is counted
+    /// `busy` and the run goes on. The sidecar was written (after its backup), so a later run
+    /// skips the copy as no longer in conflict and the repair pass records it bound.
+    #[test]
+    fn a_bulk_run_leaves_a_locked_copy_queued_and_carries_on() {
+        let (catalog, root, _dir) = temp_catalog("busy-bulk");
+        let copies: Vec<_> = (0..3)
+            .map(|i| seed_conflicted_copy(&catalog, &root, &format!("b{i}.jpg"), &format!("dam:{i}")))
+            .collect();
+        let holder = hold_write_lock(&catalog);
+
+        let summary = catalog
+            .run_resolve_foreign_conflicts(ForeignConflictAction::Overwrite, &AtomicBool::new(false), |s| {
+                if s.busy == 1 {
+                    release(&holder);
+                }
+            })
+            .unwrap();
+
+        assert_eq!((summary.overwritten, summary.busy, summary.done()), (2, 1, 3), "{summary:?}");
+        let (id, path, uuid) = &copies[0];
+        assert!(queue_row(&catalog, *id, path).is_some_and(|(_, e, _)| e.starts_with(CONFLICT_PREFIX)));
+        assert_eq!(crate::xmp::read_identifier(path).as_deref(), Some(uuid.as_str()));
+        let mut backup = crate::xmp::sidecar_path(path).into_os_string();
+        backup.push(".chairphoto-backup");
+        assert!(PathBuf::from(&backup).exists(), "the foreign value is kept in the backup");
+
+        let again = catalog
+            .run_resolve_foreign_conflicts(ForeignConflictAction::Overwrite, &AtomicBool::new(false), |_| {})
+            .unwrap();
+        assert_eq!((again.overwritten, again.skipped), (0, 1), "{again:?}");
+        assert_eq!(catalog.repair_pending_identity().unwrap().bound, 1);
+        assert!(queue_row(&catalog, *id, path).is_none());
+    }
+
+    /// The IPTC half of the pass: a settle locked through every retry leaves the fields owed,
+    /// and the next pass settles them.
+    #[test]
+    fn owed_iptc_locked_through_every_retry_stays_owed() {
+        let (catalog, root, _dir) = temp_catalog("busy-iptc");
+        let (id, _) = seed_photo(&catalog, &root, "iptc.arw");
+        let f = crate::catalog::IptcFields { title: "T".into(), ..Default::default() };
+        catalog.set_iptc(id, &f).unwrap();
+        let holder = hold_write_lock(&catalog);
+
+        let summary = catalog.run_identity_repair(&AtomicBool::new(false), |_| {}).unwrap();
+        release(&holder);
+
+        assert_eq!((summary.iptc_written, summary.busy), (0, 1), "{summary:?}");
+        assert_eq!(catalog.owed_iptc(id).unwrap(), crate::catalog::IptcMask::TITLE);
+        let next = catalog.repair_pending_identity().unwrap();
+        assert_eq!((next.iptc_written, next.busy), (1, 0), "{next:?}");
+        assert!(catalog.owed_iptc(id).unwrap().is_empty());
     }
 
     /// The pass stops at its abort flag between rows, not merely between pages: a cancel

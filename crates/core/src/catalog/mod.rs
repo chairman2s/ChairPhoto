@@ -10,6 +10,7 @@ mod albums;
 mod autotags;
 pub use autotags::{AutoTagRefusal, TagBatchOutcome};
 mod batches;
+mod busy;
 pub mod culling;
 mod edits;
 pub use edits::{HISTORY_BASELINE_LABEL, HISTORY_CAP};

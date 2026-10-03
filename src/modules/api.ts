@@ -1212,6 +1212,10 @@ export interface IdentityRepairSummary {
   iptcUnreachable?: number;
   /** Photos owing IPTC whose sidecar write still fails; still owed. */
   iptcFailed?: number;
+  /** Copies and photos left queued or owed because another connection held the catalog's
+   *  write lock through every retry (#182). Not a failure; the next pass takes them up.
+   *  Optional: a backend older than #182 omits it. */
+  busy?: number;
 }
 
 /** Progress event for a running repair pass (`identity:repair_progress`). `job` is what

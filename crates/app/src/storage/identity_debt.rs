@@ -17,7 +17,7 @@ use crate::shell::style::Colors;
 use chairphoto_core::app::{with_catalog, with_catalog_identified, AppState, CatalogIdentity};
 use chairphoto_core::app::iptc::IptcSaveOutcome;
 use chairphoto_core::catalog::{
-    IdentityConflictAction, IdentityConflictOutcome, IdentityRepairSummary, OwedIptc, PendingIdentity,
+    IdentityConflictAction, IdentityConflictOutcome, IdentityRepairSummary, OwedDismissal, OwedIptc, PendingIdentity,
     PendingIdentityField, PendingIdentitySummary,
 };
 use gpui_kit::prelude::*;
@@ -92,6 +92,10 @@ impl IdentityDebtPanel {
                 this.owed_page = 0;
                 this.owed_result = None;
                 this.owed_error = None;
+                // An action on the old list may still be in flight (waiting for a long-held
+                // turn); it fails closed and its answer is dropped, so it must not keep the
+                // new list's buttons disabled (review of #153, N2).
+                this.owed_busy = None;
                 this.reload_summary(cx);
                 this.reload_owed(cx);
             }
@@ -213,9 +217,12 @@ impl IdentityDebtPanel {
     /// Dismiss (`retry == false`) or Retry one owed-IPTC row — in the catalog its row was
     /// read from (`CATALOG_CHANGED` once another is open), for the photo with its UUID. Then
     /// the counts are re-read: the panel's and the title bar's.
-    pub fn act_on_owed(&mut self, index: usize, retry: bool, cx: &mut Context<Self>) {
-        let Some(row) = self.owed.as_ref().and_then(|r| r.get(index)).cloned() else { return };
-        let Some(from) = self.owed_from else { return };
+    ///
+    /// `row` and `from` are what the button was drawn with, captured at render time — never
+    /// looked up by index at click time. A list re-read (or a catalog switch's) can land and
+    /// notify before the next draw, and a click against the frame on screen must still act
+    /// on the row the user saw, in the catalog it was read from (review of #153, M1).
+    pub fn act_on_owed(&mut self, row: OwedIptc, from: CatalogIdentity, retry: bool, cx: &mut Context<Self>) {
         if self.owed_busy.is_some() {
             return;
         }
@@ -238,10 +245,12 @@ impl IdentityDebtPanel {
         cx.spawn(async move |this, cx| {
             let result = rx.await.unwrap_or_else(|_| Err("the owed-IPTC worker stopped".into()));
             this.update(cx, |s, cx| {
-                s.owed_busy = None;
+                // An answer from before a catalog switch touches nothing: the switch freed the
+                // buttons, and an action on the new catalog's list may be in flight now.
                 if s.storage.read(cx).epoch() != epoch {
                     return;
                 }
+                s.owed_busy = None;
                 match result {
                     Ok(done) => {
                         s.owed_result = Some(owed_action_message(&done));
@@ -250,8 +259,14 @@ impl IdentityDebtPanel {
                         // The title bar's debt count.
                         s.storage.update(cx, |st, cx| st.invalidate(cx));
                     }
-                    // A refusal names what it refused; shown verbatim.
-                    Err(e) => s.owed_error = Some(e),
+                    // A refusal names what it refused; shown verbatim. The list and count are
+                    // re-read too: a row the core refused (its photo gone) leaves the list
+                    // (review of #153, N1). The re-read clears the error, so it is set after.
+                    Err(e) => {
+                        s.reload_summary(cx);
+                        s.reload_owed(cx);
+                        s.owed_error = Some(e);
+                    }
                 }
                 cx.notify();
             })
@@ -295,7 +310,16 @@ impl IdentityDebtPanel {
                 .child(header("Detail", 160.))
                 .child(header("", 150.)),
         );
-        let enabled = self.owed_busy.is_none();
+        // Each button carries the row and the catalog it was drawn with (review of #153, M1).
+        let from = self.owed_from;
+        let enabled = self.owed_busy.is_none() && from.is_some();
+        let act = |row: OwedIptc, retry: bool| {
+            cx.listener(move |s: &mut Self, _: &gpui_kit::ClickEvent, _: &mut Window, cx: &mut Context<Self>| {
+                if let Some(from) = from {
+                    s.act_on_owed(row.clone(), from, retry, cx);
+                }
+            })
+        };
         let mut list = div().id("owed-rows").flex().flex_col().max_h(px(240.)).overflow_y_scroll();
         for (i, r) in rows.iter().enumerate() {
             let id = |what: &str| SharedString::from(format!("{what}-{i}"));
@@ -321,12 +345,12 @@ impl IdentityDebtPanel {
                             .child(ui::clickable(
                                 ui::chip(id("owed-retry"), "Retry", enabled, colors),
                                 enabled,
-                                cx.listener(move |s, _, _, cx| s.act_on_owed(i, true, cx)),
+                                act(r.clone(), true),
                             ))
                             .child(ui::clickable(
                                 ui::chip(id("owed-dismiss"), "Dismiss", enabled, colors),
                                 enabled,
-                                cx.listener(move |s, _, _, cx| s.act_on_owed(i, false, cx)),
+                                act(r.clone(), false),
                             )),
                     )
                     .test_support(),
@@ -574,9 +598,8 @@ pub fn resolution_message(o: &IdentityConflictOutcome) -> String {
 /// What a Dismiss or Retry of one owed-IPTC row did.
 #[derive(Debug, Clone)]
 pub enum OwedAction {
-    /// `true` when the debt was dismissed; `false` when nothing was: a newer save owes
-    /// something since the row was read, or the photo is gone.
-    Dismissed(bool),
+    /// Dismissed, or why not: the photo is gone, or its debt changed since the row was read.
+    Dismissed(OwedDismissal),
     Retried(IptcSaveOutcome),
 }
 
@@ -585,13 +608,18 @@ pub enum OwedAction {
 pub fn owed_action_message(done: &OwedAction) -> String {
     use chairphoto_core::catalog::IptcSidecarState;
     match done {
-        OwedAction::Dismissed(true) => "Dismissed. The catalog keeps its IPTC; the sidecar was not written.".into(),
-        OwedAction::Dismissed(false) => {
-            "Not dismissed: this photo's IPTC changed since the list was read. Check the refreshed row.".into()
+        OwedAction::Dismissed(OwedDismissal::Dismissed) => {
+            "Dismissed. The catalog keeps its IPTC; the sidecar was not written.".into()
+        }
+        OwedAction::Dismissed(OwedDismissal::Changed) => {
+            "Not dismissed: this photo's owed IPTC changed since the list was read. Check the refreshed row.".into()
+        }
+        OwedAction::Dismissed(OwedDismissal::Gone) => {
+            "Not dismissed: this photo is no longer in the catalog.".into()
         }
         OwedAction::Retried(o) => match (o.sidecar, &o.reason) {
             (IptcSidecarState::Written, _) => "Written to the sidecar.".into(),
-            (IptcSidecarState::Unchanged, _) => "Nothing was owed any more; the sidecar was not opened.".into(),
+            (IptcSidecarState::Unchanged, _) => "Nothing is owed any more: it was written or dismissed meanwhile.".into(),
             (IptcSidecarState::Pending, Some(why)) => format!("Still pending ({why})."),
             (IptcSidecarState::Pending, None) => "Still pending.".into(),
         },
@@ -876,6 +904,16 @@ mod tests {
         assert_eq!(paging_label(500, 0, Some(400)), "No rows on this page");
         assert_eq!(paging_label(0, 4, Some(3)), "Showing 1–4 of 4");
         assert_eq!(paging_label(500, 2, None), "Showing 501–502");
+    }
+
+    /// Review of #153, L3: a refused Dismiss says why — the photo is gone, or its debt
+    /// changed — rather than one wording for both.
+    #[test]
+    fn owed_dismiss_messages_tell_gone_from_changed() {
+        let say = |d| owed_action_message(&OwedAction::Dismissed(d));
+        assert!(say(OwedDismissal::Dismissed).starts_with("Dismissed."));
+        assert_eq!(say(OwedDismissal::Gone), "Not dismissed: this photo is no longer in the catalog.");
+        assert!(say(OwedDismissal::Changed).starts_with("Not dismissed: this photo's owed IPTC changed"));
     }
 
     #[test]

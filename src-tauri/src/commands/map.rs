@@ -241,14 +241,16 @@ pub async fn reverse_geocode_photo(
 
 /// Reverse-geocode a single photo and fill its **empty** IPTC location fields
 /// (city, state, country, country_code); existing values are never overwritten. Returns
-/// whether anything was filled. The work is the core's
-/// (`plugins::map::geocode::geocode_photo_to_iptc`), shared with the GPUI Map module.
+/// `{ filled, sidecar, reason }`: whether anything was filled and, when it was, whether the
+/// sidecar has it (`sidecar: "pending"` is not an error — the catalog changed and the fields
+/// stay owed). The work is the core's (`plugins::map::geocode::geocode_photo_to_iptc`),
+/// shared with the GPUI Map module.
 #[cfg(feature = "map")]
 #[tauri::command]
 pub async fn geocode_to_iptc(
     state: State<'_, AppState>,
     photo_id: i64,
-) -> Result<bool, String> {
+) -> Result<crate::plugins::map::geocode::GeocodeOutcome, String> {
     crate::plugins::map::geocode::geocode_photo_to_iptc(&state, None, photo_id).await
 }
 

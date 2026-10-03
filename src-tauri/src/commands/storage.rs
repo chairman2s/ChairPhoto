@@ -299,16 +299,16 @@ pub async fn list_owed_iptc(
     with_catalog_blocking(&state, move |c| c.list_owed_iptc_page(limit, offset)).await
 }
 
-/// Stop owing one photo's IPTC without writing (the catalog keeps its values). `false` when
-/// nothing was dismissed: a newer save owes something since the row was read (its
-/// `generation` moved on), or the id no longer names the photo with `uuid`.
+/// Stop owing one photo's IPTC without writing (the catalog keeps its values). Answers
+/// `"dismissed"`, `"changed"` (its debt changed since the row was read: a newer save owes,
+/// or it was paid) or `"gone"` (the id no longer names the photo with `uuid`).
 #[tauri::command]
 pub async fn dismiss_owed_iptc(
     state: State<'_, AppState>,
     photo_id: i64,
     uuid: String,
     generation: i64,
-) -> Result<bool, String> {
+) -> Result<crate::catalog::OwedDismissal, String> {
     let state = state.inner().clone();
     crate::app::spawn_blocking(move || {
         crate::app::iptc_owed::dismiss_owed_iptc_as(&state, None, photo_id, &uuid, generation)

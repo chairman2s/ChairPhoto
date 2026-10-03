@@ -8,6 +8,7 @@ import {
   IdentityRepairStatus,
   IdentityRepairSummary,
   IptcSaveOutcome,
+  OwedDismissal,
   OwedIptc,
   PendingIdentity,
   PendingIdentityField,
@@ -239,17 +240,21 @@ export function pagingLabel(offset: number, shown: number, total: number | null)
 /** Page size of the owed-IPTC list (#153). */
 export const OWED_PAGE_SIZE = 100;
 
-/** What a Dismiss or Retry of one owed-IPTC row did: `dismissed: false` means nothing was
- *  (the photo's IPTC changed since the list was read, or the photo is gone). */
-export type OwedAction = { dismissed: boolean } | { retried: IptcSaveOutcome | null };
+/** What a Dismiss or Retry of one owed-IPTC row did. */
+export type OwedAction = { dismissed: OwedDismissal } | { retried: IptcSaveOutcome | null };
 
 /** The line after a Dismiss or Retry, stated from what the backend answered (the GPUI
- *  panel's `owed_action_message`). */
+ *  panel's `owed_action_message`). A refused Dismiss says why: gone or changed. */
 export function owedActionMessage(done: OwedAction): string {
   if ("dismissed" in done) {
-    return done.dismissed
-      ? "Dismissed. The catalog keeps its IPTC; the sidecar was not written."
-      : "Not dismissed: this photo's IPTC changed since the list was read. Check the refreshed row.";
+    switch (done.dismissed) {
+      case "dismissed":
+        return "Dismissed. The catalog keeps its IPTC; the sidecar was not written.";
+      case "gone":
+        return "Not dismissed: this photo is no longer in the catalog.";
+      default:
+        return "Not dismissed: this photo's owed IPTC changed since the list was read. Check the refreshed row.";
+    }
   }
   const o = done.retried;
   if (!o) return "Still pending.";
@@ -257,7 +262,7 @@ export function owedActionMessage(done: OwedAction): string {
     case "written":
       return "Written to the sidecar.";
     case "unchanged":
-      return "Nothing was owed any more; the sidecar was not opened.";
+      return "Nothing is owed any more: it was written or dismissed meanwhile.";
     default:
       return o.reason ? `Still pending (${o.reason}).` : "Still pending.";
   }
@@ -343,6 +348,11 @@ export function IdentityDebtPanel({
   const [owedResult, setOwedResult] = useState("");
   /** Bumped by every owed-page read: an older read that resolves late is dropped. */
   const owedSeqRef = useRef(0);
+  /** The page shown now. An action re-reads THIS page when it ends, not the one captured
+   *  when its button was pressed: a Retry can wait for the sidecar's write turn, and the
+   *  user may page on meanwhile (review of #153, L1). */
+  const owedPageRef = useRef(owedPage);
+  owedPageRef.current = owedPage;
 
   const reloadOwed = useCallback((p: number) => {
     setOwedError("");
@@ -371,10 +381,14 @@ export function IdentityDebtPanel({
         : { dismissed: await dismissOwedIptc(row.photoId, row.uuid, row.generation) };
       setOwedResult(owedActionMessage(done));
       reloadSummary();
-      reloadOwed(owedPage);
+      reloadOwed(owedPageRef.current);
       onCountsChanged?.();
     } catch (e) {
-      // A refusal ("This photo is no longer in the catalog") names what it refused.
+      // A refusal ("This photo is no longer in the catalog") names what it refused. The list
+      // and count are re-read too, so a refused row (its photo gone) leaves the list (review
+      // of #153, N1). The re-read clears the error line, so the error is set after it.
+      reloadSummary();
+      reloadOwed(owedPageRef.current);
       setOwedError(String(e));
     } finally {
       setOwedBusy(null);

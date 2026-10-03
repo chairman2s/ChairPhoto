@@ -132,7 +132,7 @@ Three commands:
 | command | what it does |
 |---------|--------------|
 | `reverse_geocode_photo(photo_id)` | Look up and return the location, or `null` when the photo has no GPS. Serves the cache when the ~1 km cell is already known. Writes nothing. |
-| `geocode_to_iptc(photo_id)` | Fill the photo's **empty** `iptc_city` / `iptc_state` / `iptc_country` / `iptc_country_code`. Returns whether anything was filled. |
+| `geocode_to_iptc(photo_id)` | Fill the photo's **empty** `iptc_city` / `iptc_state` / `iptc_country` / `iptc_country_code`. Returns `{ filled, sidecar, reason }`: whether anything was filled and whether the sidecar has it (`sidecar: "pending"` is not an error — the catalog changed and the fields stay owed). |
 | `geocode_all_to_iptc()` | The same fill across the library, emitting `geocode:progress` events. Returns a summary of totals, filled, and skipped. |
 
 Catalog fields that already hold a value are **never overwritten** — this fills blanks, it

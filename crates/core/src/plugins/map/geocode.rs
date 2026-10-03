@@ -383,34 +383,47 @@ impl SidecarFill {
     /// Write only the owed fields: every field neither this fill nor an earlier failed write
     /// changed — a foreign creator, rights or caption included — stays as the sidecar has
     /// it (#144). Settled in the catalog the fill stored in; a failure leaves the fields
-    /// owed for the next save or repair pass (#148), and is answered as an error that says
-    /// so in a geocode's terms ([`pending_message`]). The turn is released once the write
-    /// is settled. Blocking: runs on the blocking pool with the fill ([`fill_and_write`]).
-    fn write(self, state: &crate::app::AppState, identity: CatalogIdentity) -> Result<(), String> {
-        let outcome = crate::app::iptc::write_and_settle(state, identity, &self.original, &self.write, self.turn);
-        match outcome.sidecar {
-            crate::catalog::IptcSidecarState::Pending => Err(pending_message(&outcome)),
-            _ => Ok(()),
-        }
+    /// owed for the next save or repair pass (#148), and the outcome says the sidecar is
+    /// pending. The turn is released once the write is settled. Blocking: runs on the
+    /// blocking pool with the fill ([`fill_and_write`]).
+    fn write(self, state: &crate::app::AppState, identity: CatalogIdentity) -> crate::app::iptc::IptcSaveOutcome {
+        crate::app::iptc::write_and_settle(state, identity, &self.original, &self.write, self.turn)
     }
 }
 
-/// What a single-photo geocode answers when the location reached the catalog but not the
-/// sidecar. It is shown where a geocode error is, so it speaks of the geocode, not of a
-/// save the user did not make (review of #148, N2).
-fn pending_message(outcome: &crate::app::iptc::IptcSaveOutcome) -> String {
-    let why = outcome.reason.as_deref().map(|r| format!(" ({r})")).unwrap_or_default();
-    format!("{PENDING_LEAD}{why}; the repair pass will write it")
+/// What a single-photo geocode did ([`geocode_photo_to_iptc`]). Not filling is not an error,
+/// and neither is a sidecar left pending: the location is in the catalog then, and the
+/// fields stay owed for the next save or the repair pass (#148). Typed, so a front end
+/// branches on `sidecar` rather than on a message's wording (review of #153, M2).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GeocodeOutcome {
+    /// At least one empty location field was filled in the catalog.
+    pub filled: bool,
+    /// What became of the sidecar write: `unchanged` when nothing was filled.
+    pub sidecar: crate::catalog::IptcSidecarState,
+    /// Why the sidecar is pending, when it is.
+    pub reason: Option<String>,
 }
 
-/// How [`pending_message`] begins. That answer is not a failure — the catalog changed — so a
-/// front end tells it apart by this ([`is_pending_message`]) and shows it without an error
-/// prefix (#153).
-pub const PENDING_LEAD: &str = "Geocoded location stored in the catalog, but not yet in the sidecar";
+impl GeocodeOutcome {
+    fn nothing() -> Self {
+        GeocodeOutcome { filled: false, sidecar: crate::catalog::IptcSidecarState::Unchanged, reason: None }
+    }
 
-/// Whether a single-photo geocode's `Err` is [`pending_message`]'s: stored, sidecar pending.
-pub fn is_pending_message(message: &str) -> bool {
-    message.starts_with(PENDING_LEAD)
+    /// The status line a front end shows (React's `singleGeocodeOutcome` words it the same).
+    /// A pending sidecar speaks of the geocode, not of a save the user did not make (review
+    /// of #148, N2).
+    pub fn status(&self) -> String {
+        match (self.filled, self.sidecar) {
+            (false, _) => "No GPS data, fields already set, or no result from geocoder.".into(),
+            (true, crate::catalog::IptcSidecarState::Pending) => {
+                let why = self.reason.as_deref().map(|r| format!(" ({r})")).unwrap_or_default();
+                format!("Geocoded location stored in the catalog, but not yet in the sidecar{why}; the repair pass will write it.")
+            }
+            (true, _) => "Location fields filled.".into(),
+        }
+    }
 }
 
 /// Step 3 of a fill and its sidecar write, on the blocking pool: `Err` when the fill
@@ -430,7 +443,7 @@ async fn fill_and_write(
     identity: CatalogIdentity,
     photo_id: i64,
     geo: &GeocodeResult,
-) -> Result<Option<Result<(), String>>, String> {
+) -> Result<Option<crate::app::iptc::IptcSaveOutcome>, String> {
     let (state, geo) = (state.clone(), geo.clone());
     tokio::task::spawn_blocking(move || {
         Ok(fill_in(&state, identity, photo_id, &geo)?.map(|fill| fill.write(&state, identity)))
@@ -490,8 +503,10 @@ async fn lookup_or_ask(
 /// Reverse-geocode one photo and fill its **empty** IPTC location fields (city, state,
 /// country, country_code). Fields that already hold a value are **never overwritten**.
 ///
-/// Returns `true` when at least one field was filled, `false` when the photo has no GPS,
-/// every location field is already set, or the geocoder had nothing for the place.
+/// Returns what it did ([`GeocodeOutcome`]): `filled: false` when the photo has no GPS,
+/// every location field is already set, or the geocoder had nothing for the place; when it
+/// filled, whether the sidecar has the fields or they stay owed (`sidecar: pending`, not an
+/// error: the catalog changed).
 ///
 /// The catalog lock is never held across the HTTP call: (1) read GPS, the endpoint and the
 /// cache under the lock; (2) ask Nominatim with no lock held; (3) re-read the IPTC under the
@@ -508,7 +523,7 @@ pub async fn geocode_photo_to_iptc(
     state: &crate::app::AppState,
     expected: Option<CatalogIdentity>,
     photo_id: i64,
-) -> Result<bool, String> {
+) -> Result<GeocodeOutcome, String> {
     struct Step1 {
         lat: f64,
         lng: f64,
@@ -540,14 +555,13 @@ pub async fn geocode_photo_to_iptc(
         let endpoint = c.get_setting(SETTING_ENDPOINT)?.unwrap_or_else(|| DEFAULT_ENDPOINT.to_string());
         Ok(Some(Step1 { lat, lng, endpoint }))
     })?;
-    let Some(step1) = step1 else { return Ok(false) };
+    let Some(step1) = step1 else { return Ok(GeocodeOutcome::nothing()) };
 
     let geo = lookup_or_ask(state, identity, &step1.endpoint, step1.lat, step1.lng).await?;
     let Some(written) = fill_and_write(state, identity, photo_id, &geo).await? else {
-        return Ok(false);
+        return Ok(GeocodeOutcome::nothing());
     };
-    written?;
-    Ok(true)
+    Ok(GeocodeOutcome { filled: true, sidecar: written.sidecar, reason: written.reason })
 }
 
 /// Summary of [`geocode_all_to_iptc`].
@@ -648,7 +662,7 @@ pub async fn geocode_all_to_iptc_with(
         };
         // Counted as filled only when the sidecar write also succeeded, so the summary does
         // not claim a photo whose sidecar diverged.
-        if let Some(Ok(())) = written {
+        if written.is_some_and(|o| o.sidecar != crate::catalog::IptcSidecarState::Pending) {
             filled += 1;
         }
         done += 1;
@@ -1039,7 +1053,7 @@ mod tests {
         let iptc = state.catalog.lock().unwrap().as_ref().unwrap().get_iptc(id).unwrap();
         assert_eq!((iptc.city.as_str(), iptc.country.as_str(), iptc.country_code.as_str()), ("Oslo", "Noreg", "NO"));
         // Every field set now: the single-photo path has nothing to do.
-        assert!(!geocode_photo_to_iptc(&state, None, id).await.unwrap());
+        assert!(!geocode_photo_to_iptc(&state, None, id).await.unwrap().filled);
         server.abort();
     }
 
@@ -1066,7 +1080,8 @@ mod tests {
                 c.settle_iptc_write(&w, &Ok(())).unwrap();
             }
             if single {
-                assert!(geocode_photo_to_iptc(&state, None, id).await.unwrap());
+                let o = geocode_photo_to_iptc(&state, None, id).await.unwrap();
+                assert!(o.filled && o.sidecar == crate::catalog::IptcSidecarState::Written, "{o:?}");
             } else {
                 assert_eq!(geocode_all_to_iptc(&state, None).await.unwrap().filled, 1);
             }
@@ -1144,7 +1159,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(outcome.sidecar, crate::catalog::IptcSidecarState::Written, "{outcome:?}");
-        assert!(fill.await.unwrap().unwrap(), "the fill filled once the save was done");
+        assert!(fill.await.unwrap().unwrap().filled, "the fill filled once the save was done");
 
         let xml = std::fs::read_to_string(&xmp).unwrap();
         let dc = "http://purl.org/dc/elements/1.1/";
@@ -1166,9 +1181,10 @@ mod tests {
         a_fill_racing_a_save("geo-149-race-ct").await;
     }
 
-    /// Review of #148, N2: a single-photo geocode whose sidecar write fails (here an
-    /// unparseable sidecar) says the geocoded location is in the catalog and the sidecar is
-    /// pending, in a geocode's words, not a save's. The filled fields stay owed.
+    /// Review of #148, N2, and of #153, M2: a single-photo geocode whose sidecar write fails
+    /// (here an unparseable sidecar) is not an error — the location is in the catalog. It
+    /// answers `Ok` with the sidecar pending and why, typed, and its status line speaks of
+    /// the geocode, not of a save. The filled fields stay owed.
     #[tokio::test]
     async fn a_geocode_whose_sidecar_is_pending_says_so_as_a_geocode() {
         let (server, endpoint) =
@@ -1177,12 +1193,14 @@ mod tests {
         let xmp = crate::xmp::sidecar_path(&dir.join("library").join("IMG_1.jpg"));
         std::fs::write(&xmp, "<x:xmpmeta not xml").unwrap();
 
-        let err = geocode_photo_to_iptc(&state, None, id).await.unwrap_err();
-        assert!(err.starts_with("Geocoded location stored in the catalog, but not yet in the sidecar ("), "{err}");
-        assert!(err.ends_with("; the repair pass will write it"), "{err}");
-        assert!(!err.contains("Saved"), "{err}");
-        assert!(is_pending_message(&err), "a front end tells it from a failure (#153): {err}");
-        assert!(!is_pending_message("geocode: no GPS"), "a failure is not pending");
+        let outcome = geocode_photo_to_iptc(&state, None, id).await.unwrap();
+        assert!(outcome.filled, "{outcome:?}");
+        assert_eq!(outcome.sidecar, crate::catalog::IptcSidecarState::Pending, "{outcome:?}");
+        assert!(outcome.reason.is_some(), "{outcome:?}");
+        let line = outcome.status();
+        assert!(line.starts_with("Geocoded location stored in the catalog, but not yet in the sidecar ("), "{line}");
+        assert!(line.ends_with("; the repair pass will write it."), "{line}");
+        assert!(!line.contains("Saved"), "{line}");
         let guard = state.catalog.lock().unwrap();
         let c = guard.as_ref().unwrap();
         assert_eq!(c.get_iptc(id).unwrap().city, "Oslo");

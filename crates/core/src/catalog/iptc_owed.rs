@@ -197,7 +197,8 @@ impl IptcSidecarWrite {
 pub enum IptcSettled {
     /// The owed fields are in the sidecar and nothing is owed any more.
     Written,
-    /// Nothing was owed, so the sidecar was not opened. (Not a claim about what it holds.)
+    /// Nothing is owed: nothing was, so the sidecar was not opened; or a failed write found
+    /// its debt dismissed (or paid) meanwhile. (Not a claim about what the sidecar holds.)
     Unchanged,
     /// The write landed, but a newer store changed the photo's IPTC meanwhile; its fields
     /// stay owed, and so do this write's whose value is no longer the catalog's (they may
@@ -215,7 +216,8 @@ pub enum IptcSettled {
 pub enum IptcSidecarState {
     /// The sidecar now has every IPTC value the catalog holds for the photo.
     Written,
-    /// Nothing was owed, so nothing was written and the sidecar was not read.
+    /// Nothing is owed: nothing was (the sidecar was not read), or the write failed after the
+    /// debt was dismissed. Not a claim about what the sidecar holds.
     Unchanged,
     /// Saved to the catalog only: some fields have not reached the sidecar yet. They stay
     /// owed, and the next save of the photo or the repair pass writes them.
@@ -255,6 +257,21 @@ pub struct OwedIptc {
     /// Unix seconds since the photo has owed something without a break.
     pub queued_at: i64,
     pub generation: i64,
+}
+
+/// What a Dismiss of one owed-IPTC row did ([`Catalog::dismiss_owed_iptc`]). Serialized
+/// `"dismissed"` / `"changed"` / `"gone"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum OwedDismissal {
+    /// Nothing of the photo is owed any more; nothing was written.
+    Dismissed,
+    /// Not dismissed: the photo's debt changed since the row was read — a newer store owes
+    /// something the user has not seen, or it was paid meanwhile.
+    Changed,
+    /// Not dismissed: the row's photo is no longer in the catalog (removed, or its id taken
+    /// by another photo).
+    Gone,
 }
 
 /// How many photos the IPTC drain reads per query.
@@ -370,10 +387,16 @@ impl Catalog {
     /// Compare-and-set on the `uuid` and `generation` the user was shown ([`OwedIptc`]): a
     /// store since then (a save, a geocode fill, a superseded write's re-owe) bumped the
     /// generation and owes something the user has not seen, so nothing is dismissed; nor is
-    /// the debt of another photo that took this id. Returns whether it dismissed. A write in
-    /// flight that read this generation still settles normally: its success clears what is
-    /// already clear, and its failure finds nothing owed to record against.
-    pub fn dismiss_owed_iptc(&self, photo_id: i64, uuid: &str, generation: i64) -> Result<bool> {
+    /// the debt of another photo that took this id. A write in flight that read this
+    /// generation still settles: its success clears what is already clear, and its failure
+    /// finds nothing owed and answers `Unchanged`.
+    ///
+    /// Answers which it was ([`OwedDismissal`]): dismissed; the photo gone (removed, or its id
+    /// taken by another photo); or its debt changed since the row was read.
+    pub fn dismiss_owed_iptc(&self, photo_id: i64, uuid: &str, generation: i64) -> Result<OwedDismissal> {
+        if !self.photo_has_uuid(photo_id, uuid)? {
+            return Ok(OwedDismissal::Gone);
+        }
         let dismissed = self.conn.execute(
             "UPDATE pending_sidecar_iptc
              SET owed = 0, attempts = 0, error = '', last_attempt_at = ?4
@@ -381,7 +404,7 @@ impl Catalog {
                AND EXISTS (SELECT 1 FROM photos WHERE id = ?1 AND uuid = ?2)",
             params![photo_id, uuid, generation, super::now()],
         )?;
-        Ok(dismissed == 1)
+        Ok(if dismissed == 1 { OwedDismissal::Dismissed } else { OwedDismissal::Changed })
     }
 
     /// Whether `photo_id` is still the photo with `uuid` — for a write keyed by an id a front
@@ -453,12 +476,27 @@ impl Catalog {
             Err(e) => {
                 // Only this generation's record: a newer store's row describes its own write.
                 // Nothing landed, so nothing to owe again.
-                self.conn.execute(
+                let recorded = self.conn.execute(
                     "UPDATE pending_sidecar_iptc
                      SET attempts = attempts + 1, error = ?3, last_attempt_at = ?4
                      WHERE photo_id = ?1 AND generation = ?2 AND owed != 0",
                     params![write.photo_id, write.generation, e, now],
                 )?;
+                // Nothing of this photo is owed any more (the user dismissed this generation
+                // while the write ran, or another write paid it): the failure leaves no debt,
+                // so it is not reported as a pending sidecar the list no longer shows (review
+                // of #153, L4). A newer store's debt keeps it `Failed`.
+                if recorded == 0 {
+                    let nothing_owed: bool = self.conn.query_row(
+                        "SELECT EXISTS (SELECT 1 FROM photos WHERE id = ?1 AND uuid = ?2)
+                            AND NOT EXISTS (SELECT 1 FROM pending_sidecar_iptc WHERE photo_id = ?1 AND owed != 0)",
+                        params![write.photo_id, write.uuid],
+                        |r| r.get(0),
+                    )?;
+                    if nothing_owed {
+                        return Ok(IptcSettled::Unchanged);
+                    }
+                }
                 Ok(IptcSettled::Failed(e.clone()))
             }
         }
@@ -760,20 +798,20 @@ mod tests {
 
         // A newer save stores (and owes) after the row was shown, before Dismiss lands.
         let newer = c.set_iptc(id, &IptcFields { creator: "C".into(), ..titled("A") }).unwrap();
-        assert!(!c.dismiss_owed_iptc(id, &shown.uuid, shown.generation).unwrap(), "a stale Dismiss refused");
+        assert_eq!(c.dismiss_owed_iptc(id, &shown.uuid, shown.generation).unwrap(), OwedDismissal::Changed, "a stale Dismiss refused");
         assert_eq!(c.owed_iptc(id).unwrap(), IptcMask::TITLE | IptcMask::CREATOR, "the newer save's debt kept");
 
         // The refreshed row dismisses; the newer save's write, in flight across it, still
         // settles (it read an older generation, and every value it wrote is current).
         let fresh = c.list_owed_iptc_page(10, 0).unwrap().remove(0);
         assert_eq!(fresh.generation, newer.generation);
-        assert!(c.dismiss_owed_iptc(id, &fresh.uuid, fresh.generation).unwrap());
+        assert_eq!(c.dismiss_owed_iptc(id, &fresh.uuid, fresh.generation).unwrap(), OwedDismissal::Dismissed);
         assert_eq!(c.owed_iptc(id).unwrap(), IptcMask::NONE);
         assert_eq!(c.count_owed_iptc().unwrap(), 0);
         assert!(c.list_owed_iptc_page(10, 0).unwrap().is_empty());
         assert_eq!(c.get_iptc(id).unwrap().creator, "C", "the catalog keeps its values");
         assert_eq!(c.settle_iptc_write(&newer, &Ok(())).unwrap(), IptcSettled::Written);
-        assert!(!c.dismiss_owed_iptc(id, &fresh.uuid, fresh.generation).unwrap(), "nothing left to dismiss");
+        assert_eq!(c.dismiss_owed_iptc(id, &fresh.uuid, fresh.generation).unwrap(), OwedDismissal::Changed, "nothing left to dismiss");
 
         // A later save owes only what it changes, not what was dismissed.
         let later = c.set_iptc(id, &IptcFields { headline: "H".into(), creator: "C".into(), ..titled("A") }).unwrap();
@@ -788,6 +826,11 @@ mod tests {
         c.set_iptc(id, &titled("old")).unwrap();
         let shown = c.list_owed_iptc_page(10, 0).unwrap().remove(0);
         c.remove_photo(id).unwrap();
+        assert_eq!(
+            c.dismiss_owed_iptc(id, &shown.uuid, shown.generation).unwrap(),
+            OwedDismissal::Gone,
+            "a removed photo is gone, not changed (review of #153, L3)"
+        );
         let file = dir.join("library").join("OTHER.ARW");
         std::fs::write(&file, b"raw").unwrap();
         let reused = c.upsert_photo(&file, None, 0, 1).unwrap().id;
@@ -795,8 +838,34 @@ mod tests {
         c.set_iptc(reused, &titled("new")).unwrap();
         assert_eq!(c.list_owed_iptc_page(10, 0).unwrap()[0].generation, shown.generation, "the generations collide");
 
-        assert!(!c.dismiss_owed_iptc(id, &shown.uuid, shown.generation).unwrap());
+        assert_eq!(c.dismiss_owed_iptc(id, &shown.uuid, shown.generation).unwrap(), OwedDismissal::Gone, "the id names another photo now");
         assert_eq!(c.owed_iptc(reused).unwrap(), IptcMask::TITLE);
+    }
+
+    /// Review of #153, L4 (its probe P2): a write read at generation G fails after the user
+    /// dismissed G. Nothing is owed any more, so the settle reports that (`Unchanged`), not a
+    /// pending sidecar that the list and count no longer show, and records no attempt. A
+    /// failure against a debt a newer store owes is still `Failed`.
+    #[test]
+    fn a_write_failing_after_a_dismiss_of_its_generation_is_not_reported_pending() {
+        let (_dir, c, id, _) = photo("iptc-owed-dismiss-then-fail");
+        let in_flight = c.set_iptc(id, &titled("A")).unwrap();
+        let shown = c.list_owed_iptc_page(10, 0).unwrap().remove(0);
+        assert_eq!(c.dismiss_owed_iptc(id, &shown.uuid, shown.generation).unwrap(), OwedDismissal::Dismissed);
+
+        assert_eq!(c.settle_iptc_write(&in_flight, &Err("read-only".into())).unwrap(), IptcSettled::Unchanged);
+        assert_eq!(c.settle_iptc_write(&in_flight, &Err("read-only".into())).unwrap().state(), IptcSidecarState::Unchanged);
+        let attempts: i64 =
+            c.conn.query_row("SELECT attempts FROM pending_sidecar_iptc WHERE photo_id = ?1", [id], |r| r.get(0)).unwrap();
+        assert_eq!(attempts, 0);
+
+        let older = c.set_iptc(id, &titled("B")).unwrap();
+        let _newer = c.set_iptc(id, &titled("C")).unwrap();
+        assert_eq!(
+            c.settle_iptc_write(&older, &Err("read-only".into())).unwrap(),
+            IptcSettled::Failed("read-only".into()),
+            "a newer store still owes: the sidecar is pending"
+        );
     }
 
     /// A stale write's failure does not touch a newer store's record.

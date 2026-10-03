@@ -1267,6 +1267,12 @@ fn face_verbs_refuse_an_auto_tag_and_leave_the_face_as_it_was() {
     assert_eq!(out, ReviewOutcome { confirmed: 1, rejected: 0, stale: 0, auto_tag: 1 });
     assert_eq!((face_state(&c, f1), face_state(&c, f3)), ("suggested".into(), "confirmed".into()));
     assert!(has_tag(&c, p, alice) && !has_tag(&c, p, auto));
+
+    // Review #181 nit: a verdict on an auto-tag suggestion that has since changed (f1 is now
+    // suggested as Alice) is stale, not an auto-tag skip.
+    suggest(&c, f1, alice);
+    let out = review_suggestions(&c, &[Review { face_id: f1, tag_id: auto, verdict: Verdict::Confirm }]).unwrap();
+    assert_eq!(out, ReviewOutcome { confirmed: 0, rejected: 0, stale: 1, auto_tag: 0 });
 }
 
 /// The summaries carry each avatar photo's user rotation (the thumbnail is drawn turned), and

@@ -305,6 +305,9 @@ pub fn review_suggestions(c: &Catalog, reviews: &[Review]) -> CatalogResult<Revi
     let mut photos: Vec<i64> = Vec::new();
     for r in reviews {
         match r.verdict {
+            // Stale first: a suggestion that changed since it was shown is stale whatever
+            // its person is, so it is never counted as an auto-tag skip.
+            Verdict::Confirm if !matcher::still_suggested(&tx, r.face_id, r.tag_id)? => out.stale += 1,
             Verdict::Confirm if c.auto_tag_refusal(r.tag_id)?.is_some() => out.auto_tag += 1,
             Verdict::Confirm => match matcher::accept_suggestion(&tx, r.face_id, r.tag_id)? {
                 Some(photo) => {

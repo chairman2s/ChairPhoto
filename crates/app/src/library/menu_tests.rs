@@ -235,11 +235,14 @@ fn reveal_in_files_resolves_the_copy_or_says_it_is_offline(cx: &mut TestAppConte
     let seen = record_reveals(cx);
     right_click(app, r.ids[0], cx);
     click(app, "grid-menu-reveal", cx);
+    assert!(seen.borrow().is_empty(), "the path is resolved on the storage runner, not before it runs");
+    assert_eq!(work(cx), 1);
     assert_eq!(*seen.borrow(), vec![r.root.join("2026/a0.jpg")]);
 
     std::fs::remove_file(r.root.join("2026/a1.jpg")).unwrap();
     right_click(app, r.ids[1], cx);
     click(app, "grid-menu-reveal", cx);
+    work(cx);
     assert_eq!(seen.borrow().len(), 1, "nothing to reveal");
     let line = status(app, cx);
     assert!(line.starts_with("Couldn't reveal: ") && line.ends_with("(the file may be offline)"), "{line}");
@@ -381,7 +384,9 @@ fn a_menu_left_open_across_a_switch_never_touches_the_new_catalog(cx: &mut TestA
     let seen = record_reveals(cx);
     right_click(app, r.ids[0], cx);
     click(app, "grid-menu-reveal", cx);
+    work(cx);
     assert!(seen.borrow().is_empty(), "B's file was not revealed");
+    assert!(status(app, cx).ends_with("(the file may be offline)") && status(app, cx).contains(CATALOG_CHANGED));
 
     let moved = b_root.join("moved.jpg");
     std::fs::write(&moved, "b moved").unwrap();

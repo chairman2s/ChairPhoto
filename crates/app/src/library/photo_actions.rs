@@ -7,7 +7,8 @@
 //!   everywhere, reversibly; nothing is deleted and nothing is written to disk. The Trash
 //!   dialog restores them or deletes them for good.
 //! - **Reveal in Files**: resolves the photo's best reachable copy
-//!   (`Catalog::require_photo_path`, never `photos.path`) and hands it to the file manager.
+//!   (`Catalog::require_photo_path`, never `photos.path`) on the storage runner, and hands it
+//!   to the file manager.
 //! - **Relocate…**: a file picker, then the core's `storage::relocate_photo` (the file must be
 //!   under the library root; its sidecar is bound to the photo's UUID). GPUI's picker takes no
 //!   starting folder, so it does not open at the library root as React's did.
@@ -21,8 +22,9 @@
 //! `catalog:switched` has not arrived. The Remove confirm binds the identity when it opens,
 //! and closes when `catalog:switched` arrives. Every result is a status line; a change
 //! re-reads the catalog (rows, counts, trash count), and a recovered file's cached images are
-//! dropped so its tile and loupe render again. Blocking work (sidecar IO, a NAS copy) runs on
-//! the storage [`Runner`]; short catalog reads and writes on GPUI's background executor.
+//! dropped so its tile and loupe render again. Work that can block on a mount (sidecar IO, a
+//! NAS copy, stat-ing copies for Reveal) runs on the storage [`Runner`]; short catalog writes
+//! (trash, remove) on GPUI's background executor.
 
 use super::grid_menu::PhotoCommand;
 use crate::storage::{ui, Runner};
@@ -116,13 +118,14 @@ impl RootView {
         .detach();
     }
 
-    /// Reveal in Files: the best reachable copy, resolved off the UI thread (it stats each
-    /// copy, which can block on an offline NAS).
+    /// Reveal in Files: the best reachable copy, resolved on the storage [`Runner`] — it stats
+    /// each copy under the catalog lock, which can block on a hung NAS mount, so it must not
+    /// park one of GPUI's background executor threads.
     pub(crate) fn reveal_photo(&mut self, id: i64, from: CatalogIdentity, cx: &mut Context<Self>) {
         let state = self.model.read(cx).state().clone();
-        let run = cx.background_executor().spawn(async move { with_catalog_as(&state, from, |c| c.require_photo_path(id)) });
+        let rx = Runner::get(cx).run(move || with_catalog_as(&state, from, |c| c.require_photo_path(id)));
         cx.spawn(async move |this, cx| {
-            let result = run.await;
+            let result = rx.await.unwrap_or_else(|_| Err("the reveal worker stopped".into()));
             this.update(cx, |this, cx| match result {
                 Ok(path) => reveal_path(&path, cx),
                 Err(e) => this.photo_status(format!("Couldn't reveal: {e} (the file may be offline)"), cx),

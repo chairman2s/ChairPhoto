@@ -3,19 +3,21 @@
 //! (`view.rs`) only wires them to input and paint.
 
 use chairphoto_core::plugins::map::LatLng;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 // --- consent ------------------------------------------------------------------------------
 
 /// The per-machine preference ([`crate::machine_prefs::MachinePrefs`]) holding the per-host
-/// answers: a JSON object `{"tile.openstreetmap.org": true, "tiles.example.org": false}`.
+/// answers: a JSON object `{"tile.openstreetmap.org": true, "tiles.example.org": false}`, and
+/// [`ASK`] for a host sent back to "ask".
 /// Decision #118 says "per host, remembered, changeable in Preferences"; what a tile request
 /// reveals (this computer's IP address) is about the machine, not the catalog, so another
 /// catalog on this computer does not ask again.
 pub const MACHINE_TILE_HOSTS: &str = "map.tileHosts";
 /// The module setting where the answers used to live, per catalog (`map.tileHosts`, the
-/// first GPUI port). Read once per catalog, merged into [`MACHINE_TILE_HOSTS`]
-/// ([`HostConsent::merge_legacy`]) and then emptied.
+/// first GPUI port). Merged into [`MACHINE_TILE_HOSTS`] ([`HostConsent::merge_legacy`]) on a
+/// catalog's read, and emptied once the machine's copy is saved; until then every read
+/// merges it again, which is why "Ask again" is stored as [`ASK`], not deleted.
 pub const TILE_HOSTS_KEY: &str = "tileHosts";
 /// The module setting holding the tile URL template (`map.tileUrl`, React's key).
 pub const TILE_URL_KEY: &str = "tileUrl";
@@ -30,39 +32,66 @@ pub enum Consent {
     Denied,
 }
 
-/// Every host's remembered answer.
+/// The stored value for a host the user sent back to "ask" ("Ask again"). It is an explicit
+/// entry, not a deleted one, so a catalog's old answer for that host
+/// ([`HostConsent::merge_legacy`]) never fills the gap again (#198). A build that predates
+/// it reads it as a non-boolean entry: never asked.
+pub const ASK: &str = "ask";
+
+/// Every host's remembered answer, and the hosts the user sent back to "ask".
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct HostConsent(BTreeMap<String, bool>);
+pub struct HostConsent {
+    answers: BTreeMap<String, bool>,
+    /// Hosts reset with "Ask again": `Unknown`, and closed to old per-catalog answers.
+    ask: BTreeSet<String>,
+}
 
 impl HostConsent {
-    /// Parse the stored value. Only `true` (allowed) and `false` (denied) entries count;
-    /// anything else — an unreadable value, a non-boolean entry — is "never asked" for that
-    /// host: the safe direction, since it asks again rather than fetching.
+    /// Parse the stored value. `true` (allowed), `false` (denied) and [`ASK`] entries count;
+    /// anything else — an unreadable value, another entry — is "never asked" for that host:
+    /// the safe direction, since it asks again rather than fetching.
     pub fn parse(stored: Option<&str>) -> Self {
         let map: BTreeMap<String, serde_json::Value> =
             stored.and_then(|s| serde_json::from_str(s).ok()).unwrap_or_default();
-        HostConsent(map.into_iter().filter_map(|(h, v)| v.as_bool().map(|a| (h, a))).collect())
+        let mut consent = HostConsent::default();
+        for (host, value) in map {
+            match value {
+                serde_json::Value::Bool(a) => {
+                    consent.answers.insert(host, a);
+                }
+                serde_json::Value::String(s) if s == ASK => {
+                    consent.ask.insert(host);
+                }
+                _ => {}
+            }
+        }
+        consent
     }
 
+    /// Whether there is no allowed or denied answer.
     pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
+        self.answers.is_empty()
     }
 
-    /// Fold a catalog's old per-catalog answers into these (the machine's). A host this
-    /// machine has no answer for takes the catalog's; where they disagree, **denied wins**
-    /// (two catalogs that disagree, or a catalog that blocked what another allowed, end up
-    /// blocked — the privacy-safe direction; the user can allow it again in Preferences).
-    /// Returns whether anything changed.
+    /// Fold a catalog's old per-catalog answers (only its allowed/denied entries) into these
+    /// (the machine's). A host this machine has no entry for takes the catalog's; where they
+    /// disagree, **denied wins** (two catalogs that disagree, or a catalog that blocked what
+    /// another allowed, end up blocked — the privacy-safe direction; the user can allow it
+    /// again in Preferences). A host the user sent back to "ask" keeps asking: no catalog's
+    /// old answer, allowed or denied, settles it (#198). Returns whether anything changed.
     pub fn merge_legacy(&mut self, legacy: &HostConsent) -> bool {
         let mut changed = false;
-        for (host, &allowed) in &legacy.0 {
-            match self.0.get(host) {
+        for (host, &allowed) in &legacy.answers {
+            if self.ask.contains(host) {
+                continue;
+            }
+            match self.answers.get(host) {
                 None => {
-                    self.0.insert(host.clone(), allowed);
+                    self.answers.insert(host.clone(), allowed);
                     changed = true;
                 }
                 Some(true) if !allowed => {
-                    self.0.insert(host.clone(), false);
+                    self.answers.insert(host.clone(), false);
                     changed = true;
                 }
                 Some(_) => {}
@@ -72,11 +101,16 @@ impl HostConsent {
     }
 
     pub fn to_json(&self) -> String {
-        serde_json::to_string(&self.0).unwrap_or_else(|_| "{}".into())
+        let mut map: BTreeMap<&str, serde_json::Value> =
+            self.answers.iter().map(|(h, &a)| (h.as_str(), serde_json::Value::Bool(a))).collect();
+        for host in &self.ask {
+            map.insert(host, serde_json::Value::String(ASK.into()));
+        }
+        serde_json::to_string(&map).unwrap_or_else(|_| "{}".into())
     }
 
     pub fn get(&self, host: &str) -> Consent {
-        match self.0.get(host) {
+        match self.answers.get(host) {
             Some(true) => Consent::Allowed,
             Some(false) => Consent::Denied,
             None => Consent::Unknown,
@@ -84,16 +118,20 @@ impl HostConsent {
     }
 
     pub fn set(&mut self, host: &str, allowed: bool) {
-        self.0.insert(host.to_string(), allowed);
+        self.ask.remove(host);
+        self.answers.insert(host.to_string(), allowed);
     }
 
-    /// Forget a host's answer: the map asks again.
+    /// "Ask again": drop the host's answer so the map asks, and record that the user asked
+    /// for that ([`ASK`]), so no catalog's old answer brings it back.
     pub fn forget(&mut self, host: &str) {
-        self.0.remove(host);
+        self.answers.remove(host);
+        self.ask.insert(host.to_string());
     }
 
+    /// The allowed/denied answers (hosts sent back to "ask" are not listed).
     pub fn hosts(&self) -> impl Iterator<Item = (&str, bool)> {
-        self.0.iter().map(|(h, a)| (h.as_str(), *a))
+        self.answers.iter().map(|(h, a)| (h.as_str(), *a))
     }
 }
 
@@ -252,6 +290,27 @@ mod tests {
         assert_eq!(machine.get("kept.example"), Consent::Denied, "a catalog's allow never lifts a block");
         assert_eq!(machine.get("odd.example"), Consent::Unknown);
         assert!(!machine.merge_legacy(&legacy), "merging again changes nothing");
+    }
+
+    /// #198: "Ask again" is stored as an explicit [`ASK`] entry, and no catalog's old answer
+    /// — allowed or denied — settles that host again; a new answer replaces it. It survives
+    /// a save and a re-read, and the Preferences list shows only real answers.
+    #[test]
+    fn ask_again_is_remembered_and_closed_to_old_catalog_answers() {
+        let mut machine = HostConsent::parse(Some(r#"{"b.example":true,"c.example":false}"#));
+        machine.forget("b.example");
+        machine.forget("c.example");
+        assert_eq!(machine.to_json(), r#"{"b.example":"ask","c.example":"ask"}"#);
+        let mut machine = HostConsent::parse(Some(&machine.to_json()));
+        assert!(machine.is_empty() && machine.hosts().next().is_none(), "nothing is listed as answered");
+        let legacy = HostConsent::parse(Some(r#"{"b.example":true,"c.example":false,"d.example":"ask"}"#));
+        assert!(!machine.merge_legacy(&legacy), "the user's reset stands");
+        assert_eq!(machine.get("b.example"), Consent::Unknown);
+        assert_eq!(machine.get("c.example"), Consent::Unknown);
+        assert_eq!(machine.get("d.example"), Consent::Unknown, "a catalog's own \"ask\" is not an answer");
+        machine.set("b.example", true);
+        assert_eq!(machine.get("b.example"), Consent::Allowed);
+        assert_eq!(machine.to_json(), r#"{"b.example":true,"c.example":"ask"}"#);
     }
 
     #[test]

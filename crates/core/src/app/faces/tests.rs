@@ -625,6 +625,34 @@ fn importing_a_region_on_a_rotated_photo_matches_the_face_in_the_display_frame()
     assert!(has_tag(&c, p, bob));
 }
 
+/// Review #181 L3: the importer fails closed when the auto-tag check itself errors — the face
+/// stays unconfirmed, as for a refusal, rather than confirmed without its tag. The error is
+/// forced by shadowing `tags` with a TEMP table that `create_tag` can read (same ids) but
+/// that lacks `auto_rule`; the face's foreign key still resolves against `main.tags`.
+#[test]
+fn importing_a_region_fails_closed_when_the_auto_tag_check_errors() {
+    let (c, root) = temp_catalog("import-check-error");
+    let p = add_photo(&c, &root, "portrait.ARW");
+    let photo_path = root.join("portrait.ARW");
+    std::fs::write(crate::xmp::sidecar_path(&photo_path), crate::xmp::region_fixtures::LIGHTROOM_ROTATED)
+        .unwrap();
+    c.conn()
+        .execute("UPDATE photos SET width = 6000, height = 4000, exif_orientation = 6 WHERE id = ?1", [p])
+        .unwrap();
+    let f = add_face(&c, p, "[0.7,0.225,0.1,0.15]");
+    let bob = c.create_tag("People/Bob").unwrap();
+    c.conn()
+        .execute_batch("CREATE TEMP TABLE tags AS SELECT id, full_path, full_path_norm FROM main.tags")
+        .unwrap();
+    assert!(c.auto_tag_refusal(bob).is_err(), "the check errors");
+
+    import_regions(&c, c.conn(), p, &photo_path, "People");
+    c.conn().execute_batch("DROP TABLE temp.tags").unwrap();
+
+    assert_ne!(face_state(&c, f), "confirmed", "a failed check confirmed the face");
+    assert!(!has_tag(&c, p, bob));
+}
+
 /// Assigning to a new person creates the tag under the people root and confirms the face on
 /// it; ignore drops the person; a blank name is refused before anything is created.
 #[test]
@@ -1290,7 +1318,7 @@ fn reviews_apply_only_to_the_suggestion_that_was_shown() {
         ],
     )
     .unwrap();
-    assert_eq!(out, ReviewOutcome { confirmed: 1, rejected: 1, stale: 1 });
+    assert_eq!(out, ReviewOutcome { confirmed: 1, rejected: 1, stale: 1, auto_tag: 0 });
     assert_eq!(face_state(&c, f1), "confirmed");
     assert_eq!(face_state(&c, f2), "suggested");
     assert_eq!(face_state(&c, f3), "unassigned");
@@ -1302,6 +1330,49 @@ fn reviews_apply_only_to_the_suggestion_that_was_shown() {
     assert_eq!(remembered, 1);
     let regions: Vec<String> = crate::xmp::read_face_regions(&root.join("r.NEF")).into_iter().map(|r| r.name).collect();
     assert_eq!(regions, vec!["Alice".to_string()]);
+}
+
+// ── Auto-tags as person tags (#181) ──────────────────────────────────────────────────────
+
+/// An auto-tag can't be assigned by hand, so a face verb that would tag the photo with one
+/// is refused whole: the face keeps its state, the photo gets no tag. A review skips such a
+/// confirmation and counts it, and still applies the rest.
+#[test]
+fn face_verbs_refuse_an_auto_tag_and_leave_the_face_as_it_was() {
+    let (c, root) = temp_catalog("autotag");
+    let p = add_photo(&c, &root, "a.NEF");
+    let auto = c.create_tag("Technique/Long Exposure").unwrap();
+    c.conn().execute("UPDATE tags SET auto_rule = 'long-exposure' WHERE id = ?1", [auto]).unwrap();
+    let alice = c.create_tag("People/Alice").unwrap();
+    let f1 = add_face(&c, p, "[0.1,0.1,0.2,0.2]");
+    let f2 = add_face(&c, p, "[0.4,0.1,0.2,0.2]");
+    let f3 = add_face(&c, p, "[0.7,0.1,0.2,0.2]");
+
+    suggest(&c, f1, auto);
+    assert!(matches!(accept(&c, f1), Err(CatalogError::AutoTag(_))));
+    assert_eq!(face_state(&c, f1), "suggested", "the confirmation rolled back");
+    assert!(matches!(assign(&c, f2, auto), Err(CatalogError::AutoTag(_))));
+    assert_eq!(face_state(&c, f2), "unassigned");
+    assert!(!has_tag(&c, p, auto));
+
+    suggest(&c, f3, alice);
+    let out = review_suggestions(
+        &c,
+        &[
+            Review { face_id: f1, tag_id: auto, verdict: Verdict::Confirm },
+            Review { face_id: f3, tag_id: alice, verdict: Verdict::Confirm },
+        ],
+    )
+    .unwrap();
+    assert_eq!(out, ReviewOutcome { confirmed: 1, rejected: 0, stale: 0, auto_tag: 1 });
+    assert_eq!((face_state(&c, f1), face_state(&c, f3)), ("suggested".into(), "confirmed".into()));
+    assert!(has_tag(&c, p, alice) && !has_tag(&c, p, auto));
+
+    // Review #181 nit: a verdict on an auto-tag suggestion that has since changed (f1 is now
+    // suggested as Alice) is stale, not an auto-tag skip.
+    suggest(&c, f1, alice);
+    let out = review_suggestions(&c, &[Review { face_id: f1, tag_id: auto, verdict: Verdict::Confirm }]).unwrap();
+    assert_eq!(out, ReviewOutcome { confirmed: 0, rejected: 0, stale: 1, auto_tag: 0 });
 }
 
 /// The summaries carry each avatar photo's user rotation (the thumbnail is drawn turned), and

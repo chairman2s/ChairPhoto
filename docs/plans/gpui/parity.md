@@ -1211,6 +1211,10 @@ Translation and synonym inputs: Enter adds.
 
 **Status:** built (#107: `crates/app/src/tags/editor.rs`, with the tag-editor module slot),
 awaiting the visual check
+Since 6b31727 (#181) auto-tags (`tags.auto_rule`) are never offered by hand: not in the add
+box, quick-tag groups, Recently used or the groups manager, and their chips have no ×; a typed
+auto-tag path shows the core's refusal. React does the same for suggestions, quick tags and
+chips.
 
 ### `src/components/TagCreateModal.tsx`
 
@@ -2436,6 +2440,8 @@ Difference: a cloud engine also needs its saved API key before any photo is sent
 Visual check 2026-10-03 (#163): settings (engine, Ollama URL/model, Pick…, existing-only,
 min confidence, prompt editor) and the inspector panel (engine, model, Suggest tags, Region,
 Ask) seen; nothing sent to a provider.
+Since 6b31727 (#181) the AI vocabulary leaves out auto-tags, and pending auto-tag suggestions
+are hidden when listed (core filter, so React too); accept-all reports skips.
 
 ### `src/modules/plugins/basicEditor.tsx`
 
@@ -2900,6 +2906,8 @@ Visual check 2026-10-03 (#163), tiles blocked in the agent's prefs: cluster mark
 card, + / −, "N photos with GPS", "Map tiles off", the marker's filmstrip ("4 photos at this
 location", quiet select, Show in Library, ×) and the settings (tile URL, tile servers,
 reverse geocoding) seen; no tiles loaded, no geocoding run.
+Since 6b31727 (#181) Apply all skips a fence whose tag is an auto-tag and applies the rest;
+GPUI's status line names the skipped fence, React's toast shows only the count.
 
 ### `src/modules/plugins/smartTagging.tsx`
 
@@ -2937,6 +2945,8 @@ Delete index);
 `smarttags:index_done` ends a run.
 Visual check 2026-10-03 (#163): settings (model ready, path, Save, Train classifiers, Delete
 index) and the inspector's Index/Suggest seen; no index run.
+Since 6b31727 (#181) neighbour suggestions and classifiers leave out auto-tags, and pending
+auto-tag suggestions are hidden when listed (core filter, so React too).
 
 ### `src/modules/plugins/statistics.tsx`
 

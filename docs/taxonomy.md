@@ -107,7 +107,8 @@ Each of these is handled, and each has a test:
   named in the report; a rule that will not parse is left exactly as found.
 - **Auto-tags recompute membership.** Merging *into* an auto-tag is refused (the engine
   deletes and re-derives its assignments, so the merge would silently undo itself); merging
-  one *away* warns that the engine re-creates it by path, empty.
+  one *away* warns that the engine re-creates it by path, empty. A split writes membership
+  by hand, so an auto-tag is refused as its source or its new tag (`CatalogError::AutoTag`).
 - **Tags survive in bundles.** See the tombstone below.
 - **Plugins hold tag references.** See ownership below.
 
@@ -182,6 +183,15 @@ Design consequence — keep these on the *right* axis:
   - Concept: an auto-tag = derived/system-managed tag. Applied automatically (at scan,
     and re-applied when edits change) and kept in sync; otherwise identical to a normal
     tag. Mark/group as system-managed (e.g. a `Treatment` branch) so it isn't clutter.
+  - **Manual assignment or removal is refused** (#181), since each pass rebuilds membership
+    from the rule: `assign_tag`/`remove_tag` return `CatalogError::AutoTag`, and batch writes
+    (`assign_tags`/`remove_tags`) skip and report it. Nothing offers one by hand: Smart
+    Tagging never suggests or trains on an auto-tag, the AI prompt's vocabulary omits them,
+    and a pending suggestion of one (stored before #181, or proposed by a model anyway) is
+    left out of the list rather than rejected — a rejection is user feedback. Map Apply all
+    skips a fence on an auto-tag's path and applies the rest. A per-photo exclusion list to correct a
+    rule's misdetection is deferred by the owner; revisit if misdetections become a problem in
+    practice.
   - Because it's a tag, **filtering by it inside any album/tag just works** (the tag
     filter ANDs with the current view) AND it **exports** with its hashtags. Both the
     "narrow the current album to B&W" need and the "share #bnw" need are met.
@@ -195,6 +205,13 @@ Design consequence — keep these on the *right* axis:
     `monochrome` (`Treatment/Black & White`), `long-exposure` (`Technique/Long Exposure`,
     shutter ≥ 1 s; `#longexposure …`), `panorama` (`Technique/Panorama`, long side ≥ 2× short
     side; `#panorama #pano`). Add a rule by appending one entry to `auto_tag_rules()`.
+  - **A rule's identity is its key, not its path.** The engine maintains the tag carrying the
+    rule's key in `tags.auto_rule`, wherever it sits: rename or move it (directly, or by
+    renaming, moving or merging an ancestor) and it stays the rule's tag, with no second tag
+    made at the canonical path. The path is used only when no tag carries the key — a tag
+    made by hand at that path before the rule existed becomes the rule's tag, and one merged
+    away is re-created there, empty. Earlier engines found the tag by path and could leave two
+    tags carrying one key; the next pass keeps the oldest and makes the others ordinary tags.
   - **Facets vs auto-tags**: want it shared/exported → **auto-tag**; purely-internal
     filtering you'd never share (has-GPS, shot-on-mobile, drone) → **facet**.
   - **Filter bar**: the catalog ANDs culling + tag + album in

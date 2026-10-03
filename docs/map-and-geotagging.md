@@ -40,7 +40,11 @@ as owned by the module.
   The scanner calls `apply_fences_to_photo` for new photos.
 - Adding or editing a fence gives you an explicit **Apply** action that re-scans and
   backfills matches — `apply_fence(fence_id)` for one, `apply_all_fences()` for all.
-  Re-applying is idempotent.
+  Re-applying is idempotent. A fence whose tag path is an auto-tag's can't tag by hand
+  (#181): `apply_fence` refuses it before writing anything, the import hook skips it, and
+  `apply_all_fences` skips it, applies every other fence, and reports the applied and
+  skipped fences (the GPUI status line names them; the frozen React command still returns
+  only the count).
 - Assignments are **editable and never auto-removed**. You can hand-correct drift, or add
   the tag to a photo that has no GPS at all.
 
@@ -93,7 +97,10 @@ contacting that host. The tile URL itself stays the catalog setting `map.tileUrl
 keyed by the host it names, so it need not move. Answers the first port stored per catalog
 (the module setting `map.tileHosts`) move to the machine on that catalog's first read —
 only allowed/denied entries; where they disagree with the machine's or another catalog's,
-denied wins — and the catalog's copy is then emptied, so a later Allow is not undone.
+denied wins — and the catalog's copy is then emptied, so a later Allow is not undone. It is
+emptied only once the machine's copy is saved, and a switch can interrupt the emptying, so
+a catalog may be merged again; "Ask again" is therefore stored as an explicit `"ask"` entry
+that no catalog's old answer overrides, never as a deleted one that a re-merge could refill.
 Reverse geocoding stays user-initiated per click, as before.
 
 **OSM tile policy.** The default URL is the policy's exact

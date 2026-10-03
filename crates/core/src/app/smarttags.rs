@@ -224,18 +224,25 @@ pub fn suggest_tags(c: &Catalog, photo_id: i64) -> CatalogResult<usize> {
     smarttags::suggest_tags(c.conn(), photo_id).map_err(CatalogError::Validation)
 }
 
-/// A photo's pending suggestions, best first (`smarttags_load_suggestions`).
+/// A photo's pending suggestions, best first (`smarttags_load_suggestions`). A pending
+/// suggestion of an auto-tag (stored before #181) is left out: accepting it is refused, so
+/// it could never be settled. Its row stays pending and untouched — not a rejection, which
+/// would be user feedback to the classifiers.
 pub fn load_suggestions(c: &Catalog, photo_id: i64) -> CatalogResult<Vec<SmarttagsSuggestion>> {
     let rows = smarttags::load_pending_suggestions(c.conn(), photo_id).map_err(CatalogError::Validation)?;
-    Ok(rows
-        .into_iter()
-        .map(|s| SmarttagsSuggestion {
+    let mut out = Vec::with_capacity(rows.len());
+    for s in rows {
+        if c.is_auto_tag_path(&s.path)? {
+            continue;
+        }
+        out.push(SmarttagsSuggestion {
             path: s.path,
             confidence: s.confidence,
             existing_tag_id: s.existing_tag_id,
             source_photo_ids: s.source_photo_ids,
-        })
-        .collect())
+        });
+    }
+    Ok(out)
 }
 
 /// Accept: assign the tag (creating the path if it is somehow absent) and mark the

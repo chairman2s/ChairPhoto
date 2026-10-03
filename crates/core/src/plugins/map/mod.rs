@@ -220,8 +220,10 @@ pub fn apply_fence(
         return Ok(0);
     }
 
-    // Build (or reuse) the place tag for this fence's path.
+    // Build (or reuse) the place tag for this fence's path. An auto-tag's path is refused
+    // here, before any photo, rather than by the first `assign_tag` (#181).
     let tag_id = catalog.create_tag(&fence.tag_path)?;
+    catalog.refuse_auto_tag(tag_id)?;
 
     // Load all photos with GPS coordinates.
     let points = map_photo_points(catalog.conn())?;
@@ -250,18 +252,39 @@ pub fn apply_fence(
     Ok(matched)
 }
 
-/// Apply **all** fences to all photos. Returns the total number of new assignments
-/// created across every fence. Each fence is applied independently (so a photo inside
-/// two overlapping fences gets both place tags).
+/// What [`apply_all_fences`] did: the photos newly tagged across every fence, how many
+/// fences it applied, and the fences it skipped because their path is an auto-tag's.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FencesApplied {
+    /// New assignments created across every applied fence.
+    pub tagged: usize,
+    /// Fences applied (including those that matched no new photo).
+    pub applied: usize,
+    /// Fences refused because their tag is an auto-tag (#181), by fence name.
+    pub skipped: Vec<String>,
+}
+
+/// Apply **all** fences to all photos. Each fence is applied independently (so a photo
+/// inside two overlapping fences gets both place tags). A fence on an auto-tag's path is
+/// refused by [`apply_fence`] before it writes anything (#181); it is skipped and reported,
+/// and the rest are still applied rather than stopping part-way. Any other error stops
+/// the run.
 pub fn apply_all_fences(
     catalog: &crate::catalog::Catalog,
-) -> crate::catalog::Result<usize> {
+) -> crate::catalog::Result<FencesApplied> {
     let fences = list_fences(catalog.conn())?;
-    let mut total = 0;
+    let mut out = FencesApplied::default();
     for fence in fences {
-        total += apply_fence(catalog, fence.id)?;
+        match apply_fence(catalog, fence.id) {
+            Ok(n) => {
+                out.tagged += n;
+                out.applied += 1;
+            }
+            Err(crate::catalog::CatalogError::AutoTag(_)) => out.skipped.push(fence.name),
+            Err(e) => return Err(e),
+        }
     }
-    Ok(total)
+    Ok(out)
 }
 
 /// Apply every fence to a **single photo** (used on import for newly-created photos
@@ -294,6 +317,11 @@ pub fn apply_fences_to_photo(
         }
         if point_in_polygon((lat, lng), &fence.polygon) {
             let tag_id = catalog.create_tag(&fence.tag_path)?;
+            // A fence on an auto-tag's path can't tag by hand (#181); skip it rather than
+            // stop part-way through this photo's fences.
+            if catalog.auto_tag_refusal(tag_id)?.is_some() {
+                continue;
+            }
             let before: i64 = catalog.conn().query_row(
                 "SELECT COUNT(*) FROM photo_tags WHERE photo_id = ?1 AND tag_id = ?2",
                 rusqlite::params![photo_id, tag_id],

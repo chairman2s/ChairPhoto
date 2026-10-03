@@ -1027,6 +1027,19 @@ pub fn tidy_clusters(conn: &Connection, clusters: &[i64]) -> rusqlite::Result<()
     Ok(())
 }
 
+/// Whether face `face_id` is still `suggested` as `tag_id` — the suggestion as it was shown.
+/// Read-only: a caller sorts a stale verdict from the rest before acting on it.
+pub fn still_suggested(conn: &Connection, face_id: i64, tag_id: i64) -> rusqlite::Result<bool> {
+    Ok(conn
+        .query_row(
+            "SELECT 1 FROM faces__faces WHERE id = ?1 AND state = ?2 AND person_tag_id = ?3",
+            rusqlite::params![face_id, STATE_SUGGESTED, tag_id],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some())
+}
+
 /// Confirm a suggestion **as it was shown**: only while face `face_id` is still `suggested` as
 /// `tag_id`. A review list read before a re-run of matching (which may now suggest someone
 /// else) can therefore never confirm a person the user did not see. Returns the photo when it

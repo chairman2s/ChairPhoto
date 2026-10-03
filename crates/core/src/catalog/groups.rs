@@ -117,13 +117,14 @@ impl Catalog {
     }
 
     /// The tags most recently applied by hand (via `assign_tag`), newest first, up to
-    /// `limit`. Backs the virtual "Recently used" quick-tag group. Auto-tags are excluded
-    /// implicitly: the auto-tag engine never sets `last_used_at`, so they stay null here.
+    /// `limit`. Backs the virtual "Recently used" quick-tag group. Auto-tags are excluded:
+    /// the engine never sets `last_used_at`, but a hand assignment did before #181 refused
+    /// it, so a catalog can still carry one.
     pub fn recently_used_tags(&self, limit: usize) -> Result<Vec<Tag>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, name, full_path, parent_id, description, auto_rule, uuid, private
              FROM tags
-             WHERE last_used_at IS NOT NULL
+             WHERE last_used_at IS NOT NULL AND auto_rule IS NULL
              ORDER BY last_used_at DESC, id DESC
              LIMIT ?1",
         )?;

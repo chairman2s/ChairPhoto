@@ -12,7 +12,7 @@ use chairphoto_core::app::GeocodeProgress;
 use chairphoto_core::plugins::map::geocode::GeocodeAllSummary;
 use crate::modules::map::tiles::fake::{tiny, FakeTiles};
 use crate::machine_prefs::{MachinePrefs, FILE_NAME as MACHINE_PREFS_FILE};
-use crate::modules::map::logic::MACHINE_TILE_HOSTS;
+use crate::modules::map::logic::{Consent, MACHINE_TILE_HOSTS};
 use crate::modules::map::tiles::MapTiles;
 use crate::modules::map::view::MapView;
 use crate::modules::map::{MAP_MODULE_ID, MAP_VIEW_ID};
@@ -455,6 +455,135 @@ fn per_catalog_answers_migrate_to_this_machine_and_show_in_preferences(cx: &mut 
     assert_eq!(machine_hosts(cx).as_deref(), Some(r#"{"b.example":true,"tile.openstreetmap.org":true}"#));
 }
 
+// --- "Ask again" across a re-merge (#198) ---------------------------------------------
+
+/// The catalog these tests open holds an old per-catalog Allow for `b.example`, and its tile
+/// URL names that host.
+const B_URL: &str = "https://b.example/{z}/{x}/{y}.png";
+const B_LEGACY: &str = r#"{"b.example":true}"#;
+
+fn seed_b(app: &App) {
+    let guard = app.state.catalog.lock().unwrap();
+    let c = guard.as_ref().unwrap();
+    c.set_setting(LEGACY_HOSTS, B_LEGACY).unwrap();
+    c.set_setting(&format!("{MAP_MODULE_ID}.tileUrl"), B_URL).unwrap();
+}
+
+/// Preferences → Map → "Ask again" for `b.example`, then back to the map.
+fn ask_again_for_b(app: &App, cx: &mut TestAppContext) {
+    click(app, "rail-preferences", cx);
+    work(app, cx);
+    click(app, "prefs-tab-module-map", cx);
+    work(app, cx);
+    click(app, "map-host-forget-b.example", cx);
+    work(app, cx);
+    show_map(app, cx);
+}
+
+/// The map shows the consent card for `b.example`, and nothing more was fetched than `before`.
+fn asks_for_b(m: &Map, before: usize, cx: &mut TestAppContext) {
+    assert_eq!(map_state(m, cx).read_with(cx, |s, _| s.consent()), Consent::Unknown, "b.example is allowed again");
+    assert!(m.has("map-consent", cx), "the map asks about b.example");
+    assert_eq!(m.fake.count(), before, "a tile was fetched from a host the user reset");
+}
+
+/// Where this machine's preferences live in [`ask_again_survives_a_reread`].
+enum Prefs {
+    /// No app data dir: `load_default` keeps them in memory (the headless default).
+    InMemory,
+    /// A store whose every write fails (its directory is a file).
+    WriteFails,
+}
+
+/// **#198** (review batch 6's probe). The machine's preferences cannot be saved, so the
+/// catalog keeps its old answers (gate #119) and every read of it merges them again. The
+/// user sends `b.example` back to "ask"; the same catalog is read again (a switch back, a
+/// finished scan): the host still asks, and nothing is fetched from it.
+fn ask_again_survives_a_reread(prefs: Prefs, cx: &mut TestAppContext) {
+    let dir = TempDir::new("map-ask-again");
+    let fake = Arc::new(FakeTiles::default());
+    cx.update(|cx| cx.set_global(MapTiles(fake.clone())));
+    let app = start(cx);
+    if let Prefs::WriteFails = prefs {
+        let blocker = dir.0.join("blocker");
+        std::fs::write(&blocker, "a file where the store's directory should be").unwrap();
+        cx.update(|cx| cx.set_global(MachinePrefs::load(blocker.join(MACHINE_PREFS_FILE))));
+    }
+    open_catalog_with_photos(&app, &dir, 1, cx);
+    seed_b(&app);
+    work(&app, cx);
+    cx.update(|cx| ModuleRegistry::enable(&app.wired.modules, MAP_MODULE_ID, cx));
+    work(&app, cx);
+    assert_eq!(machine_hosts(cx).as_deref(), Some(B_LEGACY), "merged for this session");
+    let m = Map { app, fake, ids: Vec::new() };
+
+    ask_again_for_b(&m.app, cx);
+    let before = m.fake.count();
+    asks_for_b(&m, before, cx);
+    let setting = m.setting(LEGACY_HOSTS);
+    assert_eq!(setting.as_deref(), Some(B_LEGACY), "the catalog kept its copy (nothing was saved)");
+
+    open_catalog_with_photos(&m.app, &dir, 1, cx); // the same catalog, read again
+    work(&m.app, cx);
+    show_map(&m.app, cx);
+    asks_for_b(&m, before, cx);
+    assert_eq!(machine_hosts(cx).as_deref(), Some(r#"{"b.example":"ask"}"#));
+}
+
+#[gpui_kit::test]
+fn ask_again_survives_a_reread_when_prefs_are_in_memory(cx: &mut TestAppContext) {
+    ask_again_survives_a_reread(Prefs::InMemory, cx);
+}
+
+#[gpui_kit::test]
+fn ask_again_survives_a_reread_when_prefs_cannot_be_saved(cx: &mut TestAppContext) {
+    ask_again_survives_a_reread(Prefs::WriteFails, cx);
+}
+
+/// **#198**, the success path: the machine's copy is saved, but the core switches to
+/// another catalog before the clear runs, so `with_catalog_as(from)` refuses it and the old
+/// catalog keeps its answers. The user sends `b.example` back to "ask"; on that catalog's
+/// next read the answers merge again, and the host still asks. The reset is on disk too.
+#[gpui_kit::test]
+fn ask_again_survives_a_reread_after_a_switch_interrupted_the_clear(cx: &mut TestAppContext) {
+    let dir = TempDir::new("map-ask-again-switch");
+    let fake = Arc::new(FakeTiles::default());
+    cx.update(|cx| cx.set_global(MapTiles(fake.clone())));
+    let app = start(cx);
+    let prefs = dir.0.join("prefs").join(MACHINE_PREFS_FILE);
+    cx.update(|cx| cx.set_global(MachinePrefs::load(prefs.clone())));
+    open_catalog_with_photos(&app, &dir, 1, cx);
+    seed_b(&app);
+    work(&app, cx);
+    cx.update(|cx| ModuleRegistry::enable(&app.wired.modules, MAP_MODULE_ID, cx));
+    // The reads run and land; the merge queues the machine's write (and, after it, the clear).
+    cx.update(|cx| Runner::get(cx).run_pending());
+    cx.run_until_parked();
+    assert_eq!(machine_hosts(cx).as_deref(), Some(B_LEGACY), "merged");
+    assert!(cx.update(|cx| Runner::get(cx).pending()) > 0, "the write and the clear are still queued");
+    // The core switches before they run (`catalog:switched` not delivered yet).
+    let (other, _) = colliding_catalog(&dir, "other", 1);
+    core_switch(&app, other);
+    work(&app, cx);
+    assert_eq!(MachinePrefs::load(prefs.clone()).get(MACHINE_TILE_HOSTS), Some(B_LEGACY), "the machine's copy is saved");
+    let a = chairphoto_core::catalog::Catalog::open(&dir.0.join("photos.chairphoto"), &dir.0.join("photos")).unwrap();
+    assert_eq!(a.get_setting(LEGACY_HOSTS).unwrap().as_deref(), Some(B_LEGACY), "the clear was refused: the old catalog keeps its copy");
+    drop(a);
+    app.state.send(CoreEvent::CatalogSwitched("other".into())); // now it arrives
+    cx.run_until_parked();
+    work(&app, cx);
+
+    let m = Map { app, fake, ids: Vec::new() };
+    ask_again_for_b(&m.app, cx);
+    let before = m.fake.count();
+    open_catalog_with_photos(&m.app, &dir, 1, cx); // back to the first catalog
+    work(&m.app, cx);
+    show_map(&m.app, cx);
+    asks_for_b(&m, before, cx);
+    assert_eq!(MachinePrefs::load(prefs).get(MACHINE_TILE_HOSTS), Some(r#"{"b.example":"ask"}"#), "the reset is saved");
+    assert_eq!(m.setting(LEGACY_HOSTS).as_deref(), Some("{}"), "and the catalog's copy is emptied now");
+}
+
 /// Tiles follow the view: panning far away cancels the loads that left it; a tile already
 /// loaded stands in (stretched) for its children while zooming in.
 #[gpui_kit::test]
@@ -726,6 +855,62 @@ fn strip_across_a_switch(delivered: bool, cx: &mut TestAppContext) {
     );
 }
 
+/// **#199, catalog identity.** The markers on screen were drawn from catalog A. Between that
+/// frame and the click, the core switches to B, whose ids collide (`catalog:switched` not
+/// delivered), and a read of B lands in the state (a finished scan's re-read). The click is
+/// bound to the catalog the markers came from: A's ids are not B's photos, so no strip opens
+/// on them and nothing is selected; the next frame draws B's markers.
+///
+/// The ordering is forced. The test app draws a dirty window when an update's effects are
+/// flushed, so B's read is done here and lands in the same update as the press and release:
+/// they reach the last frame's handlers before any frame, as input between two frames does.
+#[gpui_kit::test]
+fn a_marker_click_is_bound_to_the_catalog_its_markers_were_drawn_from(cx: &mut TestAppContext) {
+    let dir = TempDir::new("map-strip-bind");
+    let m = open_map(&dir, &[OSLO, OSLO2], cx);
+    m.click("map-consent-deny", cx);
+    let (view, state) = (m.view(cx), map_state(&m, cx));
+    let a = state.read_with(cx, |s, _| s.catalog()).expect("A's points are read");
+    let (x, y) = m.screen(OSLO, cx);
+    let (x2, y2) = m.screen(OSLO2, cx);
+    let position = m.at(((x + x2) / 2.0, (y + y2) / 2.0), cx); // draws a frame: A's marker
+    const ELSEWHERE: i64 = 424_242;
+    m.app.wired.shell.update(cx, |s, _| s.library.select_quiet(ELSEWHERE));
+
+    let (b, b_ids) = crate::tests::colliding_catalog(&dir, "b", 2);
+    assert!(m.ids.iter().all(|id| b_ids.contains(id)), "the ids collide");
+    crate::tests::core_switch(&m.app, b);
+    let read = crate::modules::map::state::read_points(&m.app.state);
+    let b_id = read.as_ref().map(|(from, _)| *from).ok();
+    assert!(b_id.is_some() && b_id != Some(a), "the read is B's");
+
+    cx.update_window(m.app.window(), |_, window, cx| {
+        state.update(cx, |s, cx| {
+            s.land_points(read);
+            cx.notify();
+        });
+        let (markers, now) = view.read_with(cx, |v, cx| (v.clusters.len(), v.state.read(cx).catalog()));
+        assert_eq!(markers, 1, "no frame came between: A's marker is still the one on screen");
+        assert_eq!(now, b_id, "the state has read B");
+        window.dispatch_event(
+            MouseDownEvent { button: MouseButton::Left, position, modifiers: Modifiers::default(), click_count: 1, first_mouse: false }
+                .to_platform_input(),
+            cx,
+        );
+        window.dispatch_event(
+            MouseUpEvent { button: MouseButton::Left, position, modifiers: Modifiers::default(), click_count: 1 }.to_platform_input(),
+            cx,
+        );
+    })
+    .unwrap();
+    let selected = |cx: &mut TestAppContext| m.app.wired.shell.read_with(cx, |s, _| s.library.selection().active_id);
+    assert!(view.read_with(cx, |v, _| v.filmstrip.is_none()), "a strip opened on A's ids in B");
+    assert_eq!(selected(cx), Some(ELSEWHERE), "A's id was selected in B");
+    frame(&m.app, cx);
+    assert!(view.read_with(cx, |v, _| v.filmstrip.is_none()));
+    assert_eq!(selected(cx), Some(ELSEWHERE));
+}
+
 #[gpui_kit::test]
 fn the_strip_never_shows_the_new_catalog_before_the_switch_event(cx: &mut TestAppContext) {
     strip_across_a_switch(false, cx);
@@ -829,6 +1014,42 @@ fn draw_a_fence_save_it_and_apply_it(cx: &mut TestAppContext) {
     m.click("map-apply-all", cx);
     let status = m.app.wired.model.read_with(cx, |m, _| m.status.to_string());
     assert_eq!(status, "Applied all fences: 2 photos newly tagged.");
+}
+
+/// Review #181 M1: Apply all over an auto-tag fence (Panorama) between two place fences
+/// applies both place fences and says what it applied and what it skipped, instead of
+/// "Failed to apply fence" after writing only part of them.
+#[gpui_kit::test]
+fn apply_all_skips_an_auto_tag_fence_and_says_so(cx: &mut TestAppContext) {
+    let dir = TempDir::new("map-apply-auto");
+    let m = open_map(&dir, &[OSLO], cx);
+    m.click("map-consent-deny", cx);
+    let square = vec![(59.90, 10.74), (59.90, 10.76), (59.92, 10.76), (59.92, 10.74)];
+    {
+        let guard = m.app.state.catalog.lock().unwrap();
+        let c = guard.as_ref().unwrap();
+        let auto = c.create_tag("Technique/Panorama").unwrap();
+        c.conn().execute("UPDATE tags SET auto_rule = 'panorama' WHERE id = ?1", [auto]).unwrap();
+        backend::create_fence_for(c, "A", "Places/A", &square).unwrap();
+        backend::create_fence_for(c, "Pano", "Technique/Panorama", &square).unwrap();
+        backend::create_fence_for(c, "C", "Places/C", &square).unwrap();
+    }
+    let state = m.view(cx).read_with(cx, |v, _| v.state.clone());
+    state.update(cx, |s, cx| s.reload_fences(cx));
+    work(&m.app, cx);
+
+    m.click("map-apply-all", cx);
+    let status = m.app.wired.model.read_with(cx, |m, _| m.status.to_string());
+    assert_eq!(
+        status,
+        "Applied 2 of 3 fences: 2 photos newly tagged. Skipped \u{201c}Pano\u{201d} \u{2014} an auto-tag can't be \
+         assigned by a fence."
+    );
+    let guard = m.app.state.catalog.lock().unwrap();
+    let mut paths: Vec<String> =
+        guard.as_ref().unwrap().get_photo_tags(m.ids[0]).unwrap().into_iter().map(|t| t.full_path).collect();
+    paths.sort();
+    assert_eq!(paths, ["Places/A", "Places/C"]);
 }
 
 /// Dragging a fence's vertex reshapes it live and saves the new polygon on release.

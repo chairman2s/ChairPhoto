@@ -593,6 +593,9 @@ pub fn review_line(out: &ReviewOutcome) -> String {
     if out.stale > 0 {
         parts.push(format!("{} changed since the list was read and were left alone", out.stale));
     }
+    if out.auto_tag > 0 {
+        parts.push(format!("{} skipped: the person is an auto-tag, which can't be assigned by hand", out.auto_tag));
+    }
     if parts.is_empty() {
         "Nothing to review.".into()
     } else {

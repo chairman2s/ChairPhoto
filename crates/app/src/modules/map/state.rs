@@ -189,6 +189,18 @@ impl GeocodeBackend for NetGeocode {
     }
 }
 
+/// What a points read found: the catalog it read and its GPS points, projected.
+pub(crate) type PointsRead = Result<(CatalogIdentity, Vec<ProjectedPoint>), String>;
+
+/// Read the open catalog's GPS points and its identity together (blocking: a worker's job).
+pub(crate) fn read_points(app: &AppState) -> PointsRead {
+    with_catalog_identified(app, |c| {
+        backend::ensure_schema_for(c)?;
+        Ok(backend::map_photo_points_for(c)?)
+    })
+    .map(|(from, points)| (from, project_points(&points))) // projected off the UI thread too
+}
+
 impl MapState {
     pub fn new(app: AppState, settings: ModuleSettings, model: Entity<AppModel>, cx: &mut Context<Self>) -> Self {
         let _model = cx.subscribe(&model, |this, _, event: &AppModelEvent, cx| match event {
@@ -311,26 +323,19 @@ impl MapState {
     }
 
     pub fn reload_points(&mut self, cx: &mut Context<Self>) {
-        self.run(
-            cx,
-            |app, _| {
-                with_catalog_identified(app, |c| {
-                    backend::ensure_schema_for(c)?;
-                    Ok(backend::map_photo_points_for(c)?)
-                })
-                .map(|(from, points)| (from, project_points(&points))) // projected off the UI thread too
-            },
-            |s, result, _| {
-                s.points = match result {
-                    Ok((from, points)) => {
-                        s.points_from = Some(from);
-                        Load::Ready(Arc::new(points))
-                    }
-                    Err(e) => Load::Failed(e),
-                };
-                s.points_revision += 1;
-            },
-        );
+        self.run(cx, |app, _| read_points(app), |s, result, _| s.land_points(result));
+    }
+
+    /// A points read ([`read_points`]) lands: the points and the catalog they came from.
+    pub(crate) fn land_points(&mut self, result: PointsRead) {
+        self.points = match result {
+            Ok((from, points)) => {
+                self.points_from = Some(from);
+                Load::Ready(Arc::new(points))
+            }
+            Err(e) => Load::Failed(e),
+        };
+        self.points_revision += 1;
     }
 
     pub fn reload_fences(&mut self, cx: &mut Context<Self>) {
@@ -394,7 +399,11 @@ impl MapState {
     /// The catalog's copy is emptied only **after** the machine's copy is on disk
     /// ([`MachinePrefs::set_then`], off the UI thread): if that write fails (or the
     /// preferences live in memory only), the catalog keeps its answers and the next read
-    /// merges them again, so a remembered decision is never lost (gate #119).
+    /// merges them again, so a remembered decision is never lost (gate #119). The copy also
+    /// survives when a switch lands before the clear, which `with_catalog_as(from)` then
+    /// refuses. Either way a re-merge must not undo the user's "Ask again": that is stored
+    /// as an explicit "ask" entry ([`HostConsent::forget`]), which the merge leaves alone
+    /// (#198), so a reset host is never allowed again without asking.
     fn migrate_consent(&mut self, from: CatalogIdentity, legacy: Option<&str>, cx: &mut Context<Self>) {
         let legacy = HostConsent::parse(legacy);
         if legacy.is_empty() {
@@ -417,7 +426,8 @@ impl MapState {
         &self.consent
     }
 
-    /// Remember the answer for `host` on this machine (the consent prompt, or Preferences).
+    /// Remember the answer for `host` on this machine (the consent prompt, or Preferences);
+    /// `None` is "Ask again", remembered as such.
     pub fn set_consent(&mut self, host: &str, allowed: Option<bool>, cx: &mut Context<Self>) {
         match allowed {
             Some(a) => self.consent.set(host, a),
@@ -540,7 +550,8 @@ impl MapState {
                 with_catalog_as(app, from, |c| {
                     backend::ensure_schema_for(c)?;
                     match fence {
-                        Some(id) => backend::apply_fence(c, id),
+                        Some(id) => backend::apply_fence(c, id)
+                            .map(|tagged| backend::FencesApplied { tagged, applied: 1, skipped: Vec::new() }),
                         None => backend::apply_all_fences(c),
                     }
                 })
@@ -548,13 +559,8 @@ impl MapState {
             move |s, r, cx| {
                 s.applying = None;
                 match r {
-                    Ok(n) => {
-                        let photos = if n == 1 { "1 photo".to_string() } else { format!("{n} photos") };
-                        let line = match &name {
-                            Some(name) => format!("Applied \u{201c}{name}\u{201d}: {photos} newly tagged."),
-                            None => format!("Applied all fences: {photos} newly tagged."),
-                        };
-                        s.status(line, cx);
+                    Ok(out) => {
+                        s.status(apply_status(name.as_deref(), &out), cx);
                         s.catalog_changed(cx);
                     }
                     Err(e) => s.status(format!("Failed to apply fence: {e}"), cx),
@@ -672,6 +678,28 @@ impl MapState {
         self.geocode = GeocodeRun { status: line.clone(), ..Default::default() };
         self.status(line, cx);
         cx.notify();
+    }
+}
+
+/// The status line for an apply: one fence by `name`, or all of them. Apply all says how
+/// many fences it applied and names any it skipped because their tag is an auto-tag (#181),
+/// which the catalog assigns by rule and no fence can.
+fn apply_status(name: Option<&str>, out: &backend::FencesApplied) -> String {
+    let n = out.tagged;
+    let photos = if n == 1 { "1 photo".to_string() } else { format!("{n} photos") };
+    match name {
+        Some(name) => format!("Applied \u{201c}{name}\u{201d}: {photos} newly tagged."),
+        None if out.skipped.is_empty() => format!("Applied all fences: {photos} newly tagged."),
+        None => {
+            let total = out.applied + out.skipped.len();
+            let names: Vec<String> = out.skipped.iter().map(|f| format!("\u{201c}{f}\u{201d}")).collect();
+            format!(
+                "Applied {} of {total} fences: {photos} newly tagged. Skipped {} \u{2014} an auto-tag \
+                 can't be assigned by a fence.",
+                out.applied,
+                names.join(", ")
+            )
+        }
     }
 }
 

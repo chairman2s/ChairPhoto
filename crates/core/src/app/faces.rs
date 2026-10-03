@@ -342,6 +342,18 @@ pub fn import_regions(
                 continue;
             }
         };
+        // Fail closed: a lookup that errors leaves the face unconfirmed, as a refusal does.
+        match catalog.auto_tag_refusal(tag_id) {
+            Ok(None) => {}
+            Ok(Some(refusal)) => {
+                eprintln!("faces_import: skipped face {}: {refusal}", m.face_id);
+                continue;
+            }
+            Err(e) => {
+                eprintln!("faces_import: auto-tag check for '{tag_path}' failed, face {} left unconfirmed: {e}", m.face_id);
+                continue;
+            }
+        }
         if let Err(e) = regions::confirm_imported_face(conn, m.face_id, tag_id) {
             eprintln!("faces_import: confirm face {} failed: {e}", m.face_id);
             continue;
@@ -380,9 +392,13 @@ pub fn faces_for_photo(c: &Catalog, photo_id: i64) -> CatalogResult<Vec<FaceForP
 
 /// Confirm a suggested face: mark it `confirmed` and assign the person tag to the photo
 /// through `assign_tag` (keyword XMP export, merge by tag UUID), then re-export regions.
+/// One transaction, so a refused tag (an auto-tag, #181) leaves the face unconfirmed.
 pub fn accept(c: &Catalog, face_id: i64) -> CatalogResult<()> {
-    let (photo_id, tag_id) = matcher::accept(c.conn(), face_id)?;
+    let tx = c.conn().unchecked_transaction()?;
+    let (photo_id, tag_id) = matcher::accept(&tx, face_id)?;
+    // Same connection as `tx`, so this is part of the transaction.
     c.assign_tag(photo_id, tag_id)?;
+    tx.commit()?;
     write_regions(c, photo_id);
     Ok(())
 }
@@ -487,8 +503,9 @@ pub fn ignore(c: &Catalog, face_id: i64) -> CatalogResult<()> {
 }
 
 /// Assign a face to `tag_id` and confirm it, tagging the photo; clears a prior rejection of
-/// that exact pair.
+/// that exact pair. An auto-tag is refused before the face changes (#181).
 pub fn assign(c: &Catalog, face_id: i64, tag_id: i64) -> CatalogResult<()> {
+    c.refuse_auto_tag(tag_id)?;
     let (photo_id, tag) = matcher::assign(c.conn(), face_id, tag_id)?;
     c.assign_tag(photo_id, tag)?;
     write_regions(c, photo_id);

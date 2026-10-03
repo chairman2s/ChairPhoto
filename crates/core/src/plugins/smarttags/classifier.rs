@@ -365,7 +365,8 @@ pub fn scan_stale_tags(conn: &Connection, min_samples: usize) -> Result<StaleSca
 
     // ── 1. Find qualifying tags ───────────────────────────────────────────────
     // A tag "qualifies" when it has at least `min_samples` photos that (a) carry the
-    // tag and (b) have a CLIP embedding.
+    // tag and (b) have a CLIP embedding. An auto-tag never qualifies: it is never
+    // suggested (#181), so a classifier for it would score nothing.
     let qualifying: Vec<(String, usize, Option<i64>)> = {
         let mut stmt = conn
             .prepare(
@@ -376,6 +377,7 @@ pub fn scan_stale_tags(conn: &Connection, min_samples: usize) -> Result<StaleSca
                    JOIN photo_tags pt ON pt.tag_id = t.id
                    JOIN smarttags__embeddings e ON e.photo_id = pt.photo_id
                    LEFT JOIN smarttags__classifiers clf ON clf.tag_path = t.full_path
+                  WHERE t.auto_rule IS NULL
                   GROUP BY t.id
                  HAVING confirmed_count >= ?1
                   ORDER BY t.full_path",
@@ -963,6 +965,29 @@ mod tests {
         // Boats should NOT have a classifier (too few samples).
         let no_clf = load_classifier(&conn, "Transportation/Boats").unwrap();
         assert!(no_clf.is_none(), "Boats should not have a classifier (below threshold)");
+    }
+
+    /// Review #181 M2: an auto-tag never qualifies for a classifier, however many photos
+    /// carry it — it is never suggested, so the classifier would score nothing.
+    #[test]
+    fn train_all_never_trains_an_auto_tag() {
+        let conn = full_mem_conn();
+        let dim = 4;
+        insert_tag(&conn, 1, "Technique/Long Exposure");
+        conn.execute("UPDATE tags SET auto_rule = 'long-exposure' WHERE id = 1", []).unwrap();
+        for id in 1i64..=12 {
+            insert_photo(&conn, id);
+            assign_tag(&conn, id, 1);
+            upsert_emb(&conn, id, &unit_axis(dim, 0, 1.0));
+        }
+        for id in 20i64..=25 {
+            insert_photo(&conn, id);
+            upsert_emb(&conn, id, &unit_axis(dim, 0, -1.0));
+        }
+
+        let outcome = train_all(&conn, 10).unwrap();
+        assert_eq!((outcome.examined, outcome.trained), (0, 0));
+        assert!(load_classifier(&conn, "Technique/Long Exposure").unwrap().is_none());
     }
 
     #[test]

@@ -135,7 +135,10 @@ pub fn crop_region_jpeg(jpeg: &[u8], r: &Region) -> Result<Vec<u8>, String> {
 
 /// A photo's persisted pending suggestions (no model call), resolved against the live
 /// taxonomy (`ai_get_suggestions`). A propagated suggestion carries its representative's
-/// file name, looked up once per distinct representative.
+/// file name, looked up once per distinct representative. A suggestion of an auto-tag
+/// (stored before #181, or proposed by the model although the prompt's vocabulary omits
+/// them) is left out: accepting it is refused, so it could never be settled. Its row stays
+/// pending, not rejected, so the photo's rejected list sent to the model stays the user's.
 #[cfg(feature = "ai")]
 pub fn load_suggestions(c: &Catalog, photo_id: i64) -> CatalogResult<Vec<AiSuggestion>> {
     use rusqlite::OptionalExtension;
@@ -145,6 +148,11 @@ pub fn load_suggestions(c: &Catalog, photo_id: i64) -> CatalogResult<Vec<AiSugge
     let mut out = Vec::new();
     for s in ai::load_pending(c.conn(), photo_id)? {
         let existing = c.find_tag_id_by_path(&s.path)?;
+        if let Some(id) = existing {
+            if c.auto_tag_refusal(id)?.is_some() {
+                continue;
+            }
+        }
         let source_photo_filename = match s.source_photo_id {
             Some(rep_id) => rep_filenames
                 .entry(rep_id)
@@ -573,6 +581,30 @@ mod tests {
         reject_suggestion(&c, 1, "Animals/Birds").unwrap();
         assert!(load_suggestions(&c, 1).unwrap().is_empty());
         assert_eq!(ai::rejected_paths(c.conn(), 1).unwrap(), vec!["Animals/Birds".to_string()]);
+    }
+
+    /// Review #181 M2: the model's vocabulary leaves auto-tags out, and a pending suggestion
+    /// of one (stored before #181, or proposed anyway) is not listed — accepting it is
+    /// refused, so it could never leave the list. The row itself stays pending, not
+    /// rejected, so the rejected list sent to the model stays the user's.
+    #[test]
+    fn auto_tags_are_neither_offered_to_the_model_nor_listed() {
+        let (c, _dir) = catalog("auto", 1);
+        ai::ensure_schema(c.conn()).unwrap();
+        let auto = c.create_tag("Technique/Long Exposure").unwrap();
+        c.conn().execute("UPDATE tags SET auto_rule = 'long-exposure' WHERE id = ?1", [auto]).unwrap();
+        c.create_tag("Nature/Waterfall").unwrap();
+
+        for local in [true, false] {
+            let taxonomy = ai::taxonomy_text(&c, local).unwrap();
+            assert!(taxonomy.contains("- Nature/Waterfall") && !taxonomy.contains("Long Exposure"), "{taxonomy}");
+        }
+
+        ai::upsert_pending(c.conn(), 1, &raw("Technique/Long Exposure", 0.9), 1).unwrap();
+        ai::upsert_pending(c.conn(), 1, &raw("Nature/Waterfall", 0.8), 1).unwrap();
+        let listed: Vec<String> = load_suggestions(&c, 1).unwrap().into_iter().map(|s| s.path).collect();
+        assert_eq!(listed, ["Nature/Waterfall"]);
+        assert!(ai::rejected_paths(c.conn(), 1).unwrap().is_empty(), "hidden, not rejected");
     }
 
     /// The provider side, counted: no preview is read and nothing is sent.

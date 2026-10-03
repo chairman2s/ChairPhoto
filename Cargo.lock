@@ -1194,6 +1194,7 @@ dependencies = [
  "reqwest 0.12.28",
  "roxmltree 0.20.0",
  "rusqlite",
+ "rustix",
  "serde",
  "serde_json",
  "sha1",

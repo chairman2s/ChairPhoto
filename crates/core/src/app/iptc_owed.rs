@@ -10,7 +10,7 @@
 //! [`CATALOG_CHANGED`](super::CATALOG_CHANGED). The Tauri shell carries no identity (`None`);
 //! there the UUID check is the guard against an id that names another photo now.
 
-use super::iptc::{write_and_settle, IptcSaveOutcome};
+use super::iptc::{run_in_turn, write_and_settle, InTurn, IptcSaveOutcome};
 use super::{AppState, CatalogIdentity};
 use crate::catalog::{Catalog, IptcSidecarState, OwedIptc};
 use crate::xmp::lock::WriteOrder;
@@ -108,19 +108,24 @@ pub fn retry_owed_iptc_as(
         })
     })?;
     let turn = match reserved {
-        Reserved::Turn(turn) => turn.wait(),
+        Reserved::Turn(turn) => turn,
         Reserved::Done(outcome) => return Ok(outcome),
         Reserved::Gone => return Err(OWED_PHOTO_GONE.into()),
     };
-    let ready = super::with_catalog_as(state, identity, |c| {
+    // With the turn held — the turn of the sidecar the original resolves to now, followed
+    // there if the photo's reachable copy changed while Retry waited (#155 R1).
+    let (ready, turn) = run_in_turn(state, identity, turn, |c, check| {
         if !c.photo_has_uuid(photo_id, uuid)? {
-            return Ok(Ready::Gone);
+            return Ok(InTurn::Done(Ready::Gone));
         }
-        let Some(write) = c.owed_iptc_write(photo_id)? else { return Ok(Ready::Done(nothing_owed())) };
-        Ok(match c.resolve_photo_path(photo_id)? {
-            Some(original) => Ready::Write(original, write),
-            None => Ready::Done(unreachable(c, photo_id)?),
-        })
+        let Some(original) = c.resolve_photo_path(photo_id)? else {
+            return Ok(InTurn::Done(Ready::Done(unreachable(c, photo_id)?)));
+        };
+        if !check.holds_for(&original) {
+            return Ok(InTurn::Moved);
+        }
+        let Some(write) = c.owed_iptc_write(photo_id)? else { return Ok(InTurn::Done(Ready::Done(nothing_owed()))) };
+        Ok(InTurn::Done(Ready::Write(original, write)))
     })?;
     match ready {
         Ready::Write(original, write) => Ok(write_and_settle(state, identity, &original, &write, turn)),
@@ -222,6 +227,54 @@ mod tests {
         drop(earlier);
         let outcome = retry.join().unwrap().unwrap();
         assert_eq!(outcome.sidecar, IptcSidecarState::Written, "{outcome:?}");
+        assert_eq!(c(&state, |c| c.owed_iptc(id).unwrap()), IptcMask::NONE);
+    }
+
+    /// #155 R1 for Retry: a photo with a library primary and a NAS backup. Retry reserves the
+    /// NAS sidecar's turn while the primary is away; the primary comes back while Retry
+    /// waits, and another writer holds the library sidecar's turn. Retry must not write the
+    /// library sidecar under the NAS turn: it follows the photo to the library sidecar's turn,
+    /// writes once that is released, and never touches the NAS sidecar.
+    #[test]
+    fn retry_whose_copy_changes_while_it_waits_takes_the_new_sidecars_turn() {
+        let (dir, state, id, file) = photo("iptc-155-retry-moved");
+        let row = owe(&state, id, &titled("Mine"));
+        let nas = dir.join("nas");
+        std::fs::create_dir_all(&nas).unwrap();
+        let nas_file = nas.join("DSC153.ARW");
+        std::fs::write(&nas_file, b"raw").unwrap();
+        std::fs::write(crate::xmp::sidecar_path(&nas_file), LIGHTROOM).unwrap();
+        c(&state, |c| {
+            let volume = c.add_volume("NAS", &nas, crate::catalog::VolumeKind::Backup).unwrap();
+            c.add_location(id, volume, "DSC153.ARW", crate::catalog::LocationRole::Backup).unwrap();
+        });
+
+        let library = dir.join("library");
+        let away = dir.join("library.away");
+        std::fs::rename(&library, &away).unwrap();
+        let nas_writer = WriteOrder::reserve(&nas_file);
+        let state = std::sync::Arc::new(state);
+        let retry = {
+            let (state, uuid) = (state.clone(), row.uuid.clone());
+            std::thread::spawn(move || retry_owed_iptc_as(&state, None, id, &uuid))
+        };
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(!retry.is_finished(), "Retry must wait behind the NAS sidecar's writer");
+
+        std::fs::rename(&away, &library).unwrap();
+        let library_writer = WriteOrder::reserve(&file).wait();
+        drop(nas_writer);
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(!retry.is_finished(), "Retry wrote the library sidecar under the NAS sidecar's turn");
+        assert_eq!(std::fs::read_to_string(crate::xmp::sidecar_path(&file)).unwrap(), LIGHTROOM);
+        assert_eq!(c(&state, |c| c.owed_iptc(id).unwrap()), IptcMask::TITLE);
+
+        drop(library_writer);
+        let outcome = retry.join().unwrap().unwrap();
+        assert_eq!(outcome.sidecar, IptcSidecarState::Written, "{outcome:?}");
+        let xml = std::fs::read_to_string(crate::xmp::sidecar_path(&file)).unwrap();
+        assert_eq!(iptc(&xml), with(foreign_iptc(), "dc:title", &["Mine"]), "{xml}");
+        assert_eq!(std::fs::read_to_string(crate::xmp::sidecar_path(&nas_file)).unwrap(), LIGHTROOM);
         assert_eq!(c(&state, |c| c.owed_iptc(id).unwrap()), IptcMask::NONE);
     }
 

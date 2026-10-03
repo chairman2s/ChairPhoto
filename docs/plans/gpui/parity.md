@@ -596,7 +596,8 @@ QuickTagGroups with Tag panel
 **Status:** built (#105, #107: `crates/app/src/shell/inspector.rs`;
 QuickTagGroups in `crates/app/src/tags/photo_tags.rs` with "Recently used" (10) and "⚙
 groups"), visually checked 2026-10-03 (#163), QuickTagGroups in a second pass
-(its empty-state line runs off the column, #176);
+(its empty-state line ran off the column, #176, fixed in 1c44374: it now wraps inside the
+row);
 in Compare the header follows the selection, not the focused pane (#170).
 Deliberate difference: the filename uses the UI sans, not the serif.
 
@@ -1683,7 +1684,9 @@ The dead `showBefore` is not ported (by design).
 Visual check 2026-10-03 (#163): ToneRail (Kelvin/Tint with K field), EffectsRail (B&W
 filters, Fade, Vignette, Grain, Split toning, LUT list with Import…), Crop & Rotate aspects,
 Overlay guides, Output W × H, Perspective and Straighten rails seen; stage zoom, crop
-handles and the level line not exercised. A long LUT name overflows the rail (#180).
+handles and the level line not exercised. A long LUT name overflowed the rail (#180); since
+1c44374 the chip is cut to the rail with an ellipsis and shows the full name in a tooltip.
+Difference: React picks a LUT from a dropdown, which has no tooltip.
 
 ### `src/components/darkroom/HistoryPanel.tsx`
 
@@ -2023,8 +2026,10 @@ the section reports the merge with the Tag panel's `merge_summary` wording). dro
 Seen 2026-10-03: every tab and the per-module tabs (AI Tagging, Obsidian, Map, Faces, Smart
 Tagging); Storage's Library, Volumes, Safety, tiering, Index existing NAS photos,
 Maintenance, Compact; Tags' three sections; Editors incl. RapidRAW and the Darkroom block;
-Appearance switching Standard ↔ Omarchy; no action button run. Checkbox labels oversized
-(#180).
+Appearance switching Standard ↔ Omarchy; no action button run. Checkbox labels were
+oversized (#180); since 1c44374 every checkbox uses `ui::checkbox` with a 12 px label (13 px
+in the Darkroom block). The label colour is still gpui-component's foreground, not React's
+dimmer `--dim`; the Slideshow's text toggles (11.5 px) are unchanged.
 
 ### `src/components/SafetyPanel.tsx`
 
@@ -2277,7 +2282,8 @@ visually checked 2026-10-03 (#163): ＋ New album (inline name prompt), name tog
 adds the selection, count, ⚙ Rename, ✕ Delete behind a confirm (clears an active filter),
 "No albums yet".
 Seen 2026-10-03: ＋ New album prompt, the new album's count, +N adding the selection, the
-filter chip; rename/delete not exercised; the +N sits off the row (#180).
+filter chip; rename/delete not exercised; the +N sat off the row (#180), inline since
+1c44374.
 
 ### `src/components/SmartAlbumsPanel.tsx`
 
@@ -2959,7 +2965,9 @@ Differences: the timeline readout is the chart tooltip;
 grow-in animations and star-label tinting not ported.
 Visual check 2026-10-03 (#163): scope chip, cards, facts, timeline, clock, weekday bars,
 camera donut and list, top tags, lenses, focal bars seen; a one-month scope draws an empty
-timeline (#179); the rail button has no icon (#173).
+timeline (#179); the rail button has no icon (#173). Since 1c44374 a one-month scope draws
+a level line across the chart with its tick in the middle; React fills a lopsided triangle
+there (an artifact of its area path), GPUI fills the whole band under the line.
 
 ### `src/modules/plugins/tagGraph.tsx`
 

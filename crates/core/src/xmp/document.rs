@@ -33,6 +33,11 @@
 //! backup slot holds the earliest state we ever saw, which is strictly more valuable than
 //! the current one.
 //!
+//! A sidecar a pre-#138 release rewrote has lost its attribute prefixes (`parseType=` for
+//! `rdf:parseType=`, …). [`SidecarDocument::open`] restores them in memory when the repair is
+//! unambiguous (`repair.rs`, #143), and a repair counts as a first write: the sidecar is backed
+//! up as it was on disk unless a backup already exists, which again is never replaced.
+//!
 //! ## One writer at a time, and never a half-written file (issue #149)
 //!
 //! [`SidecarDocument::open`] takes the sidecar's file lock (`lock::FILE_TURNS`) before it
@@ -146,6 +151,14 @@ impl SidecarDocument {
         let rdf = rdf_of_mut(&mut root);
         // Decided before the writer adds anything: has ChairPhoto written this file before?
         let written_before = has_chairphoto_last_write(rdf);
+        // A file a pre-#138 release rewrote has lost its attribute prefixes; restore them
+        // before anything looks for `rdf:about` (see `repair`). Only ours to repair.
+        let repaired = existed
+            && written_before
+            && super::repair::repair_dropped_prefixes(rdf).unwrap_or_else(|why| {
+                eprintln!("xmp: {}: dropped attribute prefixes not repaired: {why}", path.display());
+                false
+            });
         let desc = child_mut(rdf, "rdf", NS_RDF, "Description");
         if ns_attr(desc, NS_RDF, "about").is_none() {
             desc.attributes.insert("rdf:about".to_string(), String::new());
@@ -153,17 +166,18 @@ impl SidecarDocument {
 
         // Back up the existing sidecar before any writer-specific mutation runs — a
         // document-level decision (see module docs), not a per-writer one.
+        // A repair rewrites attributes no writer owns, so it is backed up like a first write.
         let wants_backup = existed
             && match backup_policy {
-                BackupPolicy::BeforeFirstWrite => !written_before,
+                BackupPolicy::BeforeFirstWrite => !written_before || repaired,
                 BackupPolicy::Always => true,
                 BackupPolicy::Never => false,
             };
         let backup_path = sidecar_backup_path(&path);
         // An existing backup is never replaced: it is the earliest state we ever saw, and
         // `BackupPolicy::Always` must not trade that away for a newer, chairphoto-written
-        // one. `BeforeFirstWrite` cannot reach an existing backup twice anyway (the first
-        // write stamps `chairphoto:LastWrite`), so this only ever binds for `Always`.
+        // one. `BeforeFirstWrite` reaches an existing backup only through a repair (the first
+        // write stamps `chairphoto:LastWrite`): the backup from that first write is older.
         let backup_name = file_name(&backup_path)?;
         let backup = if wants_backup && !folder.exists(backup_name) {
             folder.copy(name, backup_name).ok().map(|_| backup_path)
@@ -248,8 +262,7 @@ impl SidecarDocument {
         let stamp = plain("chairphoto", NS_CHAIRPHOTO, "LastWrite", &now().to_string());
         self.replace_owned(&[(NS_CHAIRPHOTO, "LastWrite")], vec![stamp]);
 
-        let mut buf = Vec::new();
-        self.root.write(&mut buf).map_err(|e| e.to_string())?;
+        let buf = super::emit::serialize(&mut self.root)?;
         let written = write_atomically(&self.folder, &self.original, &self.path, &buf);
         let Self { folder, _turn, .. } = self;
         drop(_turn);
@@ -700,7 +713,7 @@ impl Folder {
 
 /// Whether any top-level `rdf:Description` carries `chairphoto:LastWrite`: exiftool keeps one
 /// Description per namespace, so the stamp need not sit in the first (#147).
-fn has_chairphoto_last_write(rdf: &Element) -> bool {
+pub(super) fn has_chairphoto_last_write(rdf: &Element) -> bool {
     rdf.children.iter().any(|d| {
         matches!(d, XMLNode::Element(desc)
             if desc.namespace.as_deref() == Some(NS_RDF) && desc.name == "Description"
@@ -722,7 +735,7 @@ fn remove_owned(desc: &mut Element, owned: &[(&str, &str)]) {
         .cloned()
         .collect();
     for key in doomed {
-        desc.attributes.remove(&key);
+        desc.attributes.shift_remove(&key);
     }
 }
 

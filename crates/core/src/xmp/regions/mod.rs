@@ -35,7 +35,7 @@ use xmltree::XMLNode;
 use crate::xmp::document::SidecarDocument;
 use crate::xmp::dom::{element_at, element_at_mut, find_description_properties, is_rdf, node_element, rdf_of};
 use crate::xmp::ns::NS_MWG_RS;
-use crate::xmp::parse::parse_xml;
+use crate::xmp::repair::parse_for_read;
 use crate::xmp::sidecar_path;
 use frame::{applied_dimensions, region_target, RegionTarget};
 use mwg::{
@@ -309,7 +309,7 @@ fn read_regions(photo_path: &Path) -> Vec<(Option<Result<(f64, f64), String>>, V
     let Ok(file) = std::fs::File::open(&path) else {
         return Vec::new();
     };
-    let Ok(root) = parse_xml(file) else {
+    let Ok(root) = parse_for_read(file) else {
         return Vec::new();
     };
     let Some(rdf) = rdf_of(&root) else {

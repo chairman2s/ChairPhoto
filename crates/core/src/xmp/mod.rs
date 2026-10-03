@@ -25,6 +25,8 @@
 //! | `regions/mwg.rs` | MWG element construction and parsing: `Regions` layout, struct forms, one region `rdf:li`. |
 //! | `regions/reconcile.rs` | In-place edit of an existing `Regions`: the `chairphoto:FaceId` marker, claiming, the pre-marker shape. |
 //! | `parse.rs` | `parse_xml` (keeps qualified attribute names) and namespace-aware attribute lookup. |
+//! | `repair.rs` | Restoring the attribute prefixes pre-#138 releases dropped, when unambiguous (#143). |
+//! | `emit.rs` | Serialising the DOM: the pass that writes every element under a prefix bound to its namespace (#143). |
 //! | `dom.rs` | Generic element navigation and construction helpers, the empty packet skeleton. |
 //! | `ns.rs` | Namespace URI constants. |
 //! | `test_fixtures.rs`, `region_fixtures.rs`, `test_xml.rs` | Test-only: foreign sidecars and independent readers. |
@@ -35,6 +37,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 mod document;
 mod dom;
+mod emit;
 mod gps;
 mod identity;
 mod iptc;
@@ -43,6 +46,7 @@ pub mod lock;
 mod ns;
 mod parse;
 mod regions;
+mod repair;
 #[cfg(test)]
 pub(crate) mod region_fixtures;
 #[cfg(test)]

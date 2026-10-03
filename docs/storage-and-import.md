@@ -99,6 +99,46 @@ to reach the disk). The save reports the sidecar pending, a single-photo geocode
 error saying so, and geocode-all does not count that photo as filled.
 Face-region and GPS writes log the failure, and the catalog stays authoritative.
 
+### Sidecars damaged by releases before #138
+
+Every release before #138 parsed and wrote sidecars with `xmltree` 0.11, which drops attribute
+prefixes. Each write it made turned `rdf:parseType="Resource"` into `parseType="Resource"`,
+turned `rdf:about` into both an unprefixed `about` (with the original value) and an empty
+`rdf:about=""` (the writer re-inserted one after parsing), and an attribute-form MWG `AppliedToDimensions` or `Area`
+(`stDim:w`, `stArea:x`, …) into no-namespace `w`, `x`, …. The same happened to every other
+prefixed attribute in the file, foreign ones included (`digiKam:Confidence`). On such a file
+the face-region writer refuses every write ("mwg-rs:Regions is not a struct") and the reader
+finds no regions.
+
+When a writer opens a sidecar that carries `chairphoto:LastWrite`, which means a ChairPhoto
+release wrote the damage, `SidecarDocument::open` restores those known attributes in memory
+before the writer runs (`xmp/repair.rs`, #143). The table below lists every attribute it
+restores; nothing else is touched:
+
+| Unprefixed | On | Restored as |
+|---|---|---|
+| `about` | `rdf:Description` | `rdf:about`, replacing an empty or equal `rdf:about` |
+| `parseType` | a property element or `rdf:li` | `rdf:parseType` |
+| `w`, `h`, `unit` | `mwg-rs:AppliedToDimensions` | `stDim:` |
+| `x`, `y`, `w`, `h`, `unit` | `mwg-rs:Area` | `stArea:` |
+| `Name`, `Type`, `Rotation` | a region's nested `rdf:Description` (digiKam's form) | `mwg-rs:` |
+| `lang` | an `rdf:li` of an `rdf:Alt` | `xml:lang` |
+
+The first two are how RDF/XML itself reads an unqualified `about` or `parseType`. The MWG
+fields have no other meaning on those elements, and a Lang Alt item's `lang` can only be
+`xml:lang`. The last two rows are skipped, rather than treated as ambiguous, where the prefixed
+counterpart is already there. Attributes whose namespace is lost for good,
+such as `Confidence`, stay as they are. The repair runs only when it is unambiguous. If any
+element already carries the attribute that would be restored (`parseType` beside
+`rdf:parseType`, `x` beside `stArea:x`, `about` beside a different non-empty `rdf:about`),
+nothing is repaired and the write is refused as
+before. A repair counts as a first write for the backup rule: the damaged file is copied to
+`<sidecar>.chairphoto-backup` first, unless a backup already exists, and an existing backup is
+never replaced. Readers (face regions, GPS, identifier, IPTC presence) apply the same repair in
+memory to a sidecar with `chairphoto:LastWrite`, writing nothing and taking no backup, so face
+import reads the regions of a damaged sidecar before any write. The file itself is healed by the
+first ChairPhoto write to it.
+
 ### The repair pass is a job
 
 The queue reached 74,488 rows on the 100k harness shape, and every row is a sidecar parse

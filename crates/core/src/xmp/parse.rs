@@ -8,10 +8,19 @@ use xmltree::{Element, XMLNode};
 /// `xmltree::Element::parse` (0.11) keys attributes by local name only and writes those keys
 /// back unprefixed, so every read-modify-write turned `digiKam:Confidence` into a
 /// no-namespace `Confidence`. This is the same tree xmltree builds (same parser and config:
-/// comments kept, whitespace-only text dropped), except for the attribute key. Writing it
-/// back with `Element::write` stays well-formed: the writer emits a key verbatim, and every
-/// parsed element carries its full in-scope namespace map, so the writer re-declares any
-/// prefix that is not already in scope where the element lands.
+/// comments kept, whitespace-only text dropped), except for the attribute key. Every parsed
+/// element carries its full in-scope namespace map, and the writer emits a key verbatim. That
+/// alone does not keep every name in its namespace on the way back out: xml-rs's emitter skips
+/// a declaration an enclosing element already made, even where a nearer element rebinds the
+/// prefix in between (#143 item 5), and never checks the prefix it writes. `emit::serialize`
+/// therefore runs `emit::fit_prefixes` first, which re-prefixes any element or attribute that
+/// would otherwise land in another namespace.
+///
+/// One loss remains, by design: a nested `xmlns=""` (undeclaring the default namespace) is not
+/// written back — xml-rs's emitter never emits an empty default namespace — so an element in
+/// no namespace inside a default-namespace scope comes back in that default namespace (#143
+/// item 6). Fixing it means replacing the emitter, and the case cannot arise in a valid
+/// packet: RDF/XML requires every node and property element to be namespaced.
 ///
 /// Look such attributes up with [`ns_attr`], which matches by namespace URI, not prefix.
 pub(super) fn parse_xml<R: std::io::Read>(r: R) -> Result<Element, String> {
@@ -85,6 +94,17 @@ pub(super) fn attr_is(e: &Element, key: &str, ns: &str, local: &str) -> bool {
 pub(super) fn attr_ns<'a>(e: &'a Element, key: &str) -> Option<&'a str> {
     let (prefix, _) = key.split_once(':')?;
     e.namespaces.as_ref()?.get(prefix)
+}
+
+/// Rename attribute `from` of `e` to `to`, keeping its value and its place in the order
+/// (attributes are an ordered map, so a write keeps the file's attribute order). Returns
+/// whether `from` was there.
+pub(super) fn rename_attr(e: &mut Element, from: &str, to: String) -> bool {
+    let Some((index, _, value)) = e.attributes.shift_remove_full(from) else {
+        return false;
+    };
+    e.attributes.shift_insert(index, to, value);
+    true
 }
 
 /// The value of attribute `{ns}local` on `e`, whatever prefix the file bound `ns` to.

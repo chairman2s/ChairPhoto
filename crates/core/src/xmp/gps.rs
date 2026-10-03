@@ -3,9 +3,10 @@
 use std::path::Path;
 use xmltree::XMLNode;
 use super::document::SidecarDocument;
-use super::dom::{first_text, plain, rdf_of};
+use super::dom::{first_text, is_rdf, plain, rdf_of};
 use super::ns::NS_EXIF;
-use super::parse::parse_xml;
+use super::parse::ns_attr;
+use super::repair::parse_for_read;
 use super::sidecar_path;
 
 /// Write GPS coordinates into the photo's XMP sidecar as `exif:GPSLatitude` and
@@ -34,17 +35,27 @@ pub fn write_gps(photo_path: &Path, lat: f64, lng: f64) -> Result<(), String> {
 /// Read the GPS coordinates (`exif:GPSLatitude` / `exif:GPSLongitude`) from the
 /// photo's XMP sidecar. Returns `None` when there's no sidecar or the GPS fields
 /// are absent or unparseable.
+///
+/// Each field is read in either RDF form: a property element (what [`write_gps`] writes) or a
+/// compact attribute on the `rdf:Description` (`exif:GPSLatitude="…"`, what darktable and
+/// exiftool write, #143). Both are matched by namespace URI, whatever prefix the file uses.
 pub fn read_gps(photo_path: &Path) -> Option<(f64, f64)> {
     let path = sidecar_path(photo_path);
     let file = std::fs::File::open(&path).ok()?;
-    let root = parse_xml(file).ok()?;
+    let root = parse_for_read(file).ok()?;
     let rdf = rdf_of(&root)?;
     let mut lat_str: Option<String> = None;
     let mut lng_str: Option<String> = None;
     for node in &rdf.children {
         let XMLNode::Element(desc) = node else { continue };
-        if desc.name != "Description" {
+        if !is_rdf(desc, "Description") {
             continue;
+        }
+        if let Some(v) = ns_attr(desc, NS_EXIF, "GPSLatitude") {
+            lat_str = Some(v.trim().to_string());
+        }
+        if let Some(v) = ns_attr(desc, NS_EXIF, "GPSLongitude") {
+            lng_str = Some(v.trim().to_string());
         }
         for child in &desc.children {
             if let XMLNode::Element(e) = child {
@@ -137,8 +148,9 @@ pub fn decimal_to_dms_lng(deg: f64) -> String {
     format!("{d},{m_str}{hemi}")
 }
 
-/// Parse an XMP EXIF DMS+ref string (e.g. `"59,23.456N"` or `"10,45.678E"`) back to
-/// a signed decimal degree. Returns `None` on any parse error.
+/// Parse an XMP EXIF GPSCoordinate (`"59,23.456N"`, or the spec's other form, degrees,
+/// minutes and seconds: `"59,23,27.36N"`, #143 review T5) back to a signed decimal degree.
+/// Returns `None` on any parse error, including seconds next to fractional minutes.
 fn dms_to_decimal(s: &str) -> Option<f64> {
     let s = s.trim();
     let (hemi, body) = if let Some(rest) = s.strip_suffix(['N', 'S', 'E', 'W']) {
@@ -147,10 +159,13 @@ fn dms_to_decimal(s: &str) -> Option<f64> {
     } else {
         return None;
     };
-    let mut parts = body.splitn(2, ',');
-    let deg: f64 = parts.next()?.trim().parse().ok()?;
-    let min: f64 = parts.next().unwrap_or("0").trim().parse().ok()?;
-    let decimal = deg + min / 60.0;
+    let num = |p: &str| p.trim().parse::<f64>().ok();
+    let decimal = match body.split(',').collect::<Vec<_>>().as_slice() {
+        [d] => num(d)?,
+        [d, m] => num(d)? + num(m)? / 60.0,
+        [d, m, sec] if !m.contains('.') => num(d)? + num(m)? / 60.0 + num(sec)? / 3600.0,
+        _ => return None,
+    };
     let signed = match hemi {
         'S' | 'W' => -decimal,
         _ => decimal,
@@ -301,6 +316,90 @@ mod tests {
         assert_eq!(xmp.matches("exif:GPSLatitude").count(), 2, "one open + one close tag only");
         assert_eq!(xmp.matches("exif:GPSLongitude").count(), 2, "one open + one close tag only");
         assert!(xmp.contains("history_end"), "darktable data clobbered by GPS rewrite!");
+    }
+
+    // ── compact GPS attributes (#143 item 1) ────────────────────────────────
+
+    /// A darktable/exiftool-style sidecar: GPS as compact attributes on the Description,
+    /// under a prefix that is not `exif`, next to a decoy `GPSLatitude` in another namespace.
+    const COMPACT_GPS: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<x:xmpmeta xmlns:x="adobe:ns:meta/">
+ <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+  <rdf:Description rdf:about=""
+    xmlns:darktable="http://darktable.sf.net/"
+    xmlns:ex="http://ns.adobe.com/exif/1.0/"
+    xmlns:foo="urn:example:foreign"
+    foo:GPSLatitude="1,0.0N"
+    ex:GPSLatitude="59,54.834000N"
+    ex:GPSLongitude="10,45.132000W"
+    darktable:history_end="5"/>
+ </rdf:RDF>
+</x:xmpmeta>"#;
+
+    /// `read_gps` reads the compact attribute form other tools write, by namespace URI — not
+    /// the decoy `foo:GPSLatitude`, and whatever prefix the file binds the EXIF namespace to.
+    #[test]
+    fn read_gps_reads_compact_attributes_by_namespace() {
+        use crate::xmp::test_xml::{has_attr, seeded_photo, NS_FOREIGN};
+        use crate::xmp::ns::NS_RDF;
+        let (_dir, photo) = seeded_photo("xmp-gps-compact", COMPACT_GPS);
+        // The fixture is what it claims, per an independent namespace-aware reader.
+        let desc = (NS_RDF, "Description");
+        assert!(has_attr(COMPACT_GPS, desc, (NS_EXIF, "GPSLatitude"), "59,54.834000N"));
+        assert!(has_attr(COMPACT_GPS, desc, (NS_FOREIGN, "GPSLatitude"), "1,0.0N"));
+
+        let (lat, lng) = read_gps(&photo).expect("compact GPS must be read");
+        assert!((lat - 59.9139).abs() < 1e-9, "lat {lat}");
+        assert!((lng + 10.7522).abs() < 1e-9, "lng {lng} (W is negative)");
+    }
+
+    /// Writing GPS over the compact form leaves one value per field, in element form, and the
+    /// foreign attributes (the decoy, darktable's) as they were.
+    #[test]
+    fn write_gps_replaces_compact_attributes() {
+        use crate::xmp::test_xml::{count_elements, has_attr, namespaced_attributes, seeded_photo, NS_FOREIGN};
+        use crate::xmp::ns::NS_RDF;
+        let (_dir, photo) = seeded_photo("xmp-gps-compact-write", COMPACT_GPS);
+        write_gps(&photo, -33.4489, -70.6693).unwrap();
+
+        let xml = read(&sidecar_path(&photo));
+        let attrs = namespaced_attributes(&xml);
+        assert!(!attrs.iter().any(|(_, _, ns, _, _)| ns == NS_EXIF), "compact GPS left behind:\n{xml}");
+        assert_eq!(count_elements(&xml, NS_EXIF, "GPSLatitude"), 1, "{xml}");
+        assert_eq!(count_elements(&xml, NS_EXIF, "GPSLongitude"), 1, "{xml}");
+        let desc = (NS_RDF, "Description");
+        assert!(has_attr(&xml, desc, (NS_FOREIGN, "GPSLatitude"), "1,0.0N"), "{xml}");
+        assert!(has_attr(&xml, desc, ("http://darktable.sf.net/", "history_end"), "5"), "{xml}");
+        let (lat, lng) = read_gps(&photo).unwrap();
+        assert!((lat + 33.4489).abs() < 1e-6 && (lng + 70.6693).abs() < 1e-6, "{lat},{lng}");
+    }
+
+    // ── the DDD,MM,SSk form (#143 review, T5) ───────────────────────────────
+
+    /// XMP's GPSCoordinate has two forms, `DDD,MM.mmk` and `DDD,MM,SSk`. The second is read
+    /// too, in the attribute form and the element form alike.
+    #[test]
+    fn read_gps_reads_degrees_minutes_seconds_in_both_forms() {
+        use crate::xmp::test_xml::seeded_photo;
+        let attr = COMPACT_GPS
+            .replace(r#"ex:GPSLatitude="59,54.834000N""#, r#"ex:GPSLatitude="59,54,50.04N""#)
+            .replace(r#"ex:GPSLongitude="10,45.132000W""#, r#"ex:GPSLongitude="10,45,7.92W""#);
+        assert_ne!(attr, COMPACT_GPS);
+        let element = r#"<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+  <rdf:Description rdf:about="" xmlns:exif="http://ns.adobe.com/exif/1.0/">
+   <exif:GPSLatitude>59,54,50.04N</exif:GPSLatitude>
+   <exif:GPSLongitude>10,45,7.92W</exif:GPSLongitude>
+  </rdf:Description></rdf:RDF></x:xmpmeta>"#;
+        for (case, sidecar) in [("attribute", attr.as_str()), ("element", element)] {
+            let (_dir, photo) = seeded_photo(&format!("xmp-gps-dms-{case}"), sidecar);
+            let (lat, lng) = read_gps(&photo).unwrap_or_else(|| panic!("{case}: not read"));
+            assert!((lat - 59.9139).abs() < 1e-9, "{case}: lat {lat}");
+            assert!((lng + 10.7522).abs() < 1e-9, "{case}: lng {lng}");
+        }
+        // Still refused: a fourth part, or seconds next to fractional minutes.
+        assert_eq!(dms_to_decimal("59,54,50,1N"), None);
+        assert_eq!(dms_to_decimal("59,54.5,50N"), None);
+        assert_eq!(dms_to_decimal("59,54.834N"), Some(59.0 + 54.834 / 60.0));
     }
 
     // ── decimal_to_dms_lat / decimal_to_dms_lng minute rollover (issue #65) ────────────

@@ -266,12 +266,18 @@ write, which adopts and marks (or removes) the old regions in the stored frame a
 record. It shares the index job's abort flag, ownership and catalog connection, and the record
 is its queue: an abort, an offline original or a failed write leaves that photo's rows for the
 next run, and rows of photos no longer in the catalog are dropped. A photo whose sidecar
-*refuses* the write for its own layout or frame — a `Regions` this writer cannot read, such as
-the unprefixed `parseType` a pre-#138 build's xmltree left behind, or an `AppliedToDimensions`
-of another frame — is tried once and then set aside (`faces__legacy_refused`, counted as
-`refused`): the same write would be refused on every run until the file changes. It keeps its
-record, so a face verb that later writes the photo still adopts or removes its old regions, and
-that write clears the refusal. Repairing such sidecars is #143's. Its progress goes out through
+*refuses* the write for its own layout or frame — a `Regions` this writer cannot read, or an
+`AppliedToDimensions` of another frame — is tried once and then set aside (`faces__legacy_refused`,
+counted as `refused`): the same write would be refused on every run until the file changes. It
+keeps its record, so a face verb that later writes the photo still adopts or removes its old
+regions, and that write clears the refusal. The unprefixed `parseType`, `about` and MWG
+struct fields that a pre-#138 build's xmltree left behind are no longer refused. Every sidecar
+write restores them first, when it can do so unambiguously, and backs the file up (#143; see
+`docs/storage-and-import.md`, "Sidecars damaged by releases before #138"). A photo set aside
+for that damage by an earlier build is retried: the first open of the faces tables after the
+upgrade clears `faces__legacy_refused` once (a `faces__once` claim), and a photo still refused
+is set aside again. Reads repair in memory too, so face import sees those regions before any
+write. Its progress goes out through
 the index job's own status and `faces:progress` — photos converted of photos to convert, `0/n`
 to `n/n` — before the index's own count starts again from `0`; there is no phase label, which
 would need a new field in both front ends. It logs a summary of what it did. It is part of the index

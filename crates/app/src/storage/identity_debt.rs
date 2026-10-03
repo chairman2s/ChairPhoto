@@ -94,6 +94,15 @@ pub struct IdentityDebtPanel {
     pub owed_result: Option<String>,
     /// Bumped by every owed-IPTC page read; an older read's rows are dropped.
     owed_seq: u64,
+    /// Bumped by every summary read; an older read's counts are dropped (#222 N4). The
+    /// summary carries no `CatalogIdentity` of its own (it is display only, and every action
+    /// on these rows is bound independently), so a pre-switch read landing after the switch's
+    /// own re-read would otherwise show the old catalog's counts until the next reload.
+    summary_seq: u64,
+    /// Bumped by every volume-name read; an older read's names are dropped (#222 N4), same
+    /// reasoning as `summary_seq` — `volumes` is a display-only id-to-name lookup, not bound
+    /// to a catalog identity of its own.
+    volumes_seq: u64,
     /// The identity queue's scroll position, and its rows' heights (replaced when they change).
     pub debt_scroll: VirtualListScrollHandle,
     debt_sizes: Rc<Vec<Size<Pixels>>>,
@@ -180,6 +189,8 @@ impl IdentityDebtPanel {
             owed_busy: None,
             owed_result: None,
             owed_seq: 0,
+            summary_seq: 0,
+            volumes_seq: 0,
             debt_scroll: VirtualListScrollHandle::new(),
             debt_sizes: Rc::new(Vec::new()),
             owed_scroll: UniformListScrollHandle::new(),
@@ -195,11 +206,18 @@ impl IdentityDebtPanel {
 
     pub fn reload_summary(&mut self, cx: &mut Context<Self>) {
         self.summary_error = None;
+        self.summary_seq += 1;
+        let seq = self.summary_seq;
         let state = self.app.clone();
         let rx = Runner::get(cx).run(move || with_catalog(&state, |c| c.summarize_pending_identity()));
         cx.spawn(async move |this, cx| {
             let Ok(result) = rx.await else { return };
             this.update(cx, |s, cx| {
+                // A switch's own re-read may already have landed; an older read answering
+                // after it must not show its (now stale) counts (#222 N4).
+                if s.summary_seq != seq {
+                    return;
+                }
                 match result {
                     Ok(v) => s.summary = Some(v),
                     Err(e) => s.summary_error = Some(e),
@@ -505,11 +523,18 @@ impl IdentityDebtPanel {
     }
 
     fn load_volumes(&mut self, cx: &mut Context<Self>) {
+        self.volumes_seq += 1;
+        let seq = self.volumes_seq;
         let state = self.app.clone();
         let rx = Runner::get(cx).run(move || with_catalog(&state, |c| c.volume_rows()));
         cx.spawn(async move |this, cx| {
             let Ok(Ok(vols)) = rx.await else { return };
             this.update(cx, |s, cx| {
+                // As in `reload_summary` (#222 N4): a pre-switch read landing after the
+                // switch's own must not replace the new catalog's volume names.
+                if s.volumes_seq != seq {
+                    return;
+                }
                 s.volumes = vols.into_iter().map(|v| (v.id, v.name)).collect();
                 cx.notify();
             })

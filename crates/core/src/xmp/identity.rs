@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use xmltree::XMLNode;
 use super::document::SidecarDocument;
 use super::dom::{first_text, plain, rdf_of};
-use super::ns::{NS_CHAIRPHOTO, NS_XMP};
+use super::ns::{NS_CHAIRPHOTO, NS_XMP, NS_XMPIDQ};
 use super::parse::ns_attr;
 use super::repair::parse_for_read;
 use super::sidecar_path;
@@ -52,20 +52,34 @@ pub fn read_identifier(photo_path: &Path) -> Option<String> {
 /// caller about to let [`overwrite_identifier`] replace them all reads this instead (#150):
 /// a second value — another photo's UUID appended by a DAM or `exiftool -XMP-xmp:Identifier+=`,
 /// or one in a second Description — would otherwise be destroyed unseen.
+///
+/// A qualifier on XMP Basic's qualified form — `rdf:value` next to an `xmpidq:*` property
+/// such as `xmpidq:Scheme`, inside an `rdf:li` — is not a value of its own (#222 N1): before
+/// this, `[dam:asset/2, DAM]` read as two values and a bulk Overwrite skipped the sidecar as
+/// carrying more than one, reporting the scheme name as if it were a second identifier.
 pub fn read_identifiers(photo_path: &Path) -> Vec<String> {
+    let path = sidecar_path(photo_path);
+    let Ok(file) = std::fs::File::open(&path) else { return Vec::new() };
+    let Ok(root) = parse_for_read(file) else { return Vec::new() };
+    let Some(rdf) = rdf_of(&root) else { return Vec::new() };
+    identifiers_in_rdf(rdf)
+}
+
+/// [`read_identifiers`]'s walk, taking the already-parsed `rdf:RDF` element directly — shared
+/// with [`overwrite_identifier_checked`], which reads from a [`SidecarDocument`] already open
+/// under the sidecar's file lock rather than a fresh, unlocked parse (#222 N3).
+fn identifiers_in_rdf(rdf: &xmltree::Element) -> Vec<String> {
     fn texts(e: &xmltree::Element, out: &mut Vec<String>) {
         for node in &e.children {
             match node {
                 XMLNode::Text(t) if !t.trim().is_empty() => out.push(t.trim().to_string()),
+                // The qualifier, not a value: skip it and its text rather than recursing in.
+                XMLNode::Element(child) if child.namespace.as_deref() == Some(NS_XMPIDQ) => {}
                 XMLNode::Element(child) => texts(child, out),
                 _ => {}
             }
         }
     }
-    let path = sidecar_path(photo_path);
-    let Ok(file) = std::fs::File::open(&path) else { return Vec::new() };
-    let Ok(root) = parse_for_read(file) else { return Vec::new() };
-    let Some(rdf) = rdf_of(&root) else { return Vec::new() };
     let mut values = Vec::new();
     for node in &rdf.children {
         let XMLNode::Element(desc) = node else { continue };
@@ -119,6 +133,42 @@ pub fn overwrite_identifier(photo_path: &Path, uuid: &str) -> Result<Option<Path
         vec![plain("xmp", NS_XMP, "Identifier", uuid)],
     );
     doc.commit()?;
+    Ok(backup)
+}
+
+/// Why [`overwrite_identifier_checked`] did not write: its `guard` refused (a validation the
+/// caller maps to its own "this isn't allowed" error, distinct from a failure), or opening,
+/// reading or committing the sidecar failed for a filesystem reason (what every other sidecar
+/// writer reports as a plain `String`).
+#[derive(Debug)]
+pub enum CheckedOverwriteError {
+    Refused(String),
+    Io(String),
+}
+
+/// [`overwrite_identifier`], but first lets `guard` look at the identifier values the
+/// sidecar carries right now — under the same file lock the write itself takes, opened
+/// before `guard` runs and held through the write — and refuse by returning `Err` (#222 N3).
+///
+/// A bulk Overwrite's "this sidecar carries exactly one non-UUID value" precondition used to
+/// be checked by a separate, unlocked [`read_identifiers`] call before this function's own
+/// open took the lock. A value another tool appended to the sidecar in that gap was then
+/// destroyed unseen: the precondition passed against a snapshot the write never acted on.
+/// Reading from the already-open, already-locked document closes that gap — there is no
+/// read the write's own open did not also make.
+pub fn overwrite_identifier_checked(
+    photo_path: &Path,
+    uuid: &str,
+    guard: impl FnOnce(&[String]) -> Result<(), String>,
+) -> Result<Option<PathBuf>, CheckedOverwriteError> {
+    let mut doc = SidecarDocument::open_forcing_backup(photo_path).map_err(CheckedOverwriteError::Io)?;
+    guard(&identifiers_in_rdf(doc.rdf_mut())).map_err(CheckedOverwriteError::Refused)?;
+    let backup = doc.backup().map(|p| p.to_path_buf());
+    doc.replace_owned(
+        &[(NS_XMP, "Identifier")],
+        vec![plain("xmp", NS_XMP, "Identifier", uuid)],
+    );
+    doc.commit().map_err(CheckedOverwriteError::Io)?;
     Ok(backup)
 }
 
@@ -277,6 +327,138 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&backup_path).unwrap(), original,
             "the earliest snapshot must survive later overwrites");
         assert_eq!(read_identifier(&photo).as_deref(), Some("third-uuid"));
+    }
+
+    // --- read_identifiers and XMP Basic's qualified form (#222 N1) --------------------
+
+    /// A Bag item qualified the way XMP Basic allows — `rdf:value` beside `xmpidq:Scheme`,
+    /// in an `rdf:li` marked `rdf:parseType="Resource"` — reads as one value, not two: the
+    /// scheme name is a qualifier, never counted alongside it. Before this fix
+    /// `read_identifiers` returned `["dam:asset/2", "DAM"]`, and a bulk Overwrite skipped the
+    /// sidecar as carrying more than one identifier value (#150's guard).
+    #[test]
+    fn read_identifiers_reads_a_qualified_bag_item_as_one_value() {
+        let dir = crate::test_support::TestTmpDir::new("xmp-identifiers-qualified");
+        let photo = dir.join("DSC30.ARW");
+        std::fs::write(&photo, b"raw").unwrap();
+        let existing = r#"<?xml version="1.0" encoding="UTF-8"?>
+<x:xmpmeta xmlns:x="adobe:ns:meta/">
+ <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+  <rdf:Description rdf:about=""
+    xmlns:xmp="http://ns.adobe.com/xap/1.0/"
+    xmlns:xmpidq="http://ns.adobe.com/xmp/Identifier/qual/1.0/">
+   <xmp:Identifier>
+    <rdf:Bag>
+     <rdf:li rdf:parseType="Resource">
+      <rdf:value>dam:asset/2</rdf:value>
+      <xmpidq:Scheme>DAM</xmpidq:Scheme>
+     </rdf:li>
+    </rdf:Bag>
+   </xmp:Identifier>
+  </rdf:Description>
+ </rdf:RDF>
+</x:xmpmeta>"#;
+        std::fs::write(sidecar_path(&photo), existing).unwrap();
+
+        assert_eq!(read_identifiers(&photo), vec!["dam:asset/2".to_string()]);
+        // The singular reader must agree, since it answers with the first of these.
+        assert_eq!(read_identifier(&photo).as_deref(), Some("dam:asset/2"));
+    }
+
+    /// A second, genuinely distinct Bag item beside a qualified one is still seen: the
+    /// qualifier skip must not swallow a real second value.
+    #[test]
+    fn read_identifiers_still_sees_a_second_item_beside_a_qualified_one() {
+        let dir = crate::test_support::TestTmpDir::new("xmp-identifiers-qualified-plus-one");
+        let photo = dir.join("DSC31.ARW");
+        std::fs::write(&photo, b"raw").unwrap();
+        let existing = r#"<?xml version="1.0" encoding="UTF-8"?>
+<x:xmpmeta xmlns:x="adobe:ns:meta/">
+ <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+  <rdf:Description rdf:about=""
+    xmlns:xmp="http://ns.adobe.com/xap/1.0/"
+    xmlns:xmpidq="http://ns.adobe.com/xmp/Identifier/qual/1.0/">
+   <xmp:Identifier>
+    <rdf:Bag>
+     <rdf:li rdf:parseType="Resource">
+      <rdf:value>dam:asset/2</rdf:value>
+      <xmpidq:Scheme>DAM</xmpidq:Scheme>
+     </rdf:li>
+     <rdf:li>another-photos-uuid</rdf:li>
+    </rdf:Bag>
+   </xmp:Identifier>
+  </rdf:Description>
+ </rdf:RDF>
+</x:xmpmeta>"#;
+        std::fs::write(sidecar_path(&photo), existing).unwrap();
+
+        assert_eq!(read_identifiers(&photo), vec!["dam:asset/2".to_string(), "another-photos-uuid".to_string()]);
+    }
+
+    // --- overwrite_identifier_checked reads under the write's own lock (#222 N3) -------
+
+    /// The guard sees whatever the sidecar carries once the write's own open gets the file
+    /// turn — not a value read before this call ever waited for it. A second "writer" (held
+    /// here by a manually reserved turn, standing in for another process) appends a value
+    /// while the checked overwrite is blocked waiting for that same turn; once released, the
+    /// guard must see both values, proving the read happened after the wait, not before it.
+    #[test]
+    fn overwrite_identifier_checked_sees_a_value_appended_while_it_waits_for_the_lock() {
+        let dir = crate::test_support::TestTmpDir::new("xmp-identifiers-checked-race");
+        let photo = dir.join("DSC32.ARW");
+        std::fs::write(&photo, b"raw").unwrap();
+        let sidecar = sidecar_path(&photo);
+        let solo = r#"<?xml version="1.0" encoding="UTF-8"?>
+<x:xmpmeta xmlns:x="adobe:ns:meta/">
+ <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+  <rdf:Description rdf:about="" xmlns:xmp="http://ns.adobe.com/xap/1.0/">
+   <xmp:Identifier>dam:solo</xmp:Identifier>
+  </rdf:Description>
+ </rdf:RDF>
+</x:xmpmeta>"#;
+        std::fs::write(&sidecar, solo).unwrap();
+        assert_eq!(read_identifiers(&photo), vec!["dam:solo".to_string()], "precondition");
+
+        let appended = r#"<?xml version="1.0" encoding="UTF-8"?>
+<x:xmpmeta xmlns:x="adobe:ns:meta/">
+ <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+  <rdf:Description rdf:about="" xmlns:xmp="http://ns.adobe.com/xap/1.0/">
+   <xmp:Identifier>
+    <rdf:Bag>
+     <rdf:li>dam:solo</rdf:li>
+     <rdf:li>second-writer-uuid</rdf:li>
+    </rdf:Bag>
+   </xmp:Identifier>
+  </rdf:Description>
+ </rdf:RDF>
+</x:xmpmeta>"#;
+
+        // Stand in for a concurrent writer already in possession of the sidecar's turn.
+        let held = crate::xmp::lock::FILE_TURNS.reserve(crate::xmp::lock::key(&sidecar));
+
+        let seen: std::sync::Arc<std::sync::Mutex<Option<Vec<String>>>> = Default::default();
+        let seen2 = seen.clone();
+        let photo2 = photo.clone();
+        let handle = std::thread::spawn(move || {
+            overwrite_identifier_checked(&photo2, "new-uuid", move |all| {
+                *seen2.lock().unwrap() = Some(all.to_vec());
+                Ok(())
+            })
+        });
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(!handle.is_finished(), "the checked overwrite must wait for the held turn");
+
+        // "Another tool" writes its own second value while it still holds the turn.
+        std::fs::write(&sidecar, appended).unwrap();
+        drop(held); // the turn is free; the checked overwrite may now open and read
+
+        handle.join().unwrap().unwrap();
+        assert_eq!(
+            seen.lock().unwrap().clone(),
+            Some(vec!["dam:solo".to_string(), "second-writer-uuid".to_string()]),
+            "the guard must see what the write's own open reads under the lock, not a value \
+             read before this call ever waited for its turn"
+        );
     }
 
     #[test]

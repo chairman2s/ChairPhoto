@@ -1,20 +1,26 @@
 //! The bench (`src/components/shell/Bench.tsx`): the 72 px strip under the stage. Left to
 //! right: one background job's progress, else "N photos · M selected" and the status line;
 //! the marking controls for the photo the inspector shows (Compare's focused pane, else the
-//! active photo); the selection pile ("N on the table") with the selection's actions.
+//! active photo); the selection pile ("N on the table", the first three selected photos'
+//! thumbnails with the marked one highlighted) with the selection's actions.
 //!
 //! The marking and pile sections appear only with an active photo / a selection. Marks
 //! write through the one culling path the grid's keys use (`ShellState::apply_mark`,
 //! Bench.tsx's "one code path" invariant), without the keys' auto-advance.
 
+use crate::image_store::ImageState;
 use crate::model::AppModel;
 use crate::shell::actions::*;
-use crate::shell::state::{Mark, ShellState};
+use crate::shell::state::{Mark, ShellState, Surface};
 use crate::shell::style::{grouped, Colors, COLOR_LABELS};
 use crate::view::RootView;
-use chairphoto_core::catalog::PickState;
+use chairphoto_core::catalog::{Photo, PickState};
+use chairphoto_core::image_pool::ImageKind;
+use chairphoto_model::darkroom::filmstrip::{cover_look, CoverLook};
 use gpui_kit::prelude::*;
-use gpui_kit::{div, px, relative, Action, AnyElement, Context, FontWeight, SharedString, TestSupportExt as _};
+use gpui_kit::{
+    div, img, px, relative, Action, AnyElement, Context, FontWeight, ObjectFit, SharedString, TestSupportExt as _,
+};
 
 /// The bench's height (`.bench`).
 pub const BENCH_H: f32 = 72.;
@@ -28,7 +34,61 @@ pub fn count_line(total: usize, selected: usize) -> String {
     }
 }
 
+/// How many of the selection's thumbnails the pile shows (App.tsx passed
+/// `selection.photos.slice(0, 3)`).
+pub const PILE_THUMBS: usize = 3;
+
+/// The pile's thumbnails: the first [`PILE_THUMBS`] selected rows in row order (the selection's
+/// `photos`), each with whether it is `shown` — the photo the bench marks, highlighted.
+pub fn pile_thumbs<'a>(photos: &[&'a Photo], shown: Option<i64>) -> Vec<(&'a Photo, bool)> {
+    photos.iter().take(PILE_THUMBS).map(|&p| (p, Some(p.id) == shown)).collect()
+}
+
 impl RootView {
+    /// Ask for the pile's thumbnails through the image layer (decoded on the pool, never
+    /// here), under the bench's own claim, which each frame becomes exactly the pile's
+    /// thumbnails: the grid's releases leave them alone while the pile shows them. Each asks
+    /// for the cover look its row names, as the grid does; once they are pending or cached
+    /// nothing is sent.
+    ///
+    /// A selection that moves on — or ends, or a surface without the bench — lets go of the
+    /// rest, and releases those of them the grid did not ask for last frame either. The grid
+    /// asks for the same tiers without a claim, so a plain
+    /// [`set_claim`](crate::image_store::ImageStore::set_claim) would cancel a visible
+    /// tile's render.
+    pub(crate) fn request_bench_thumbs(&mut self, cx: &mut Context<Self>) {
+        let (wanted, from) = {
+            let shell = self.shell.read(cx);
+            let wanted: Vec<(i64, Option<CoverLook>)> = if shell.surface == Surface::Library {
+                pile_thumbs(&shell.library.selection().photos, None)
+                    .into_iter()
+                    .map(|(p, _)| (p.id, cover_look(p.cover_token.as_deref())))
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            (wanted, shell.rows_from())
+        };
+        let (owner, library) = (self.bench_claim, self.library.clone());
+        self.images.update(cx, |store, cx| {
+            let tiers: Vec<(i64, ImageKind)> = wanted.iter().map(|&(id, _)| (id, ImageKind::Thumb)).collect();
+            let gone: Vec<i64> =
+                store.claim(owner).into_iter().filter(|t| !tiers.contains(t)).map(|(id, _)| id).collect();
+            store.hold(owner, tiers.iter().copied());
+            if !gone.is_empty() {
+                let grid_wants = library.read(cx).requested_thumbs();
+                store.release_pending(|k| {
+                    k.kind != ImageKind::Thumb || !gone.contains(&k.photo) || grid_wants.contains(&k.photo)
+                });
+            }
+            match from {
+                _ if wanted.is_empty() => {}
+                Some(from) => store.request_look_batch(from, &wanted, cx),
+                None => store.request_batch(&tiers),
+            }
+        });
+    }
+
     pub(crate) fn render_bench(&self, shell: &ShellState, model: &AppModel, colors: Colors, cx: &Context<Self>) -> AnyElement {
         let selection = shell.library.selection();
         let selected = selection.ids.len();
@@ -285,6 +345,7 @@ impl RootView {
                             .whitespace_nowrap()
                             .child(format!("{} on the table", grouped(selected))),
                     )
+                    .child(self.render_pile_strip(shell, &selection.photos, colors, cx))
                     .child(txt("bench-compare", "Compare", can_compare, Box::new(OpenCompare)))
                     .child(txt("bench-stack", "Stack", ready, Box::new(ProposeStacks)))
                     .child(txt("bench-cull", "Cull", ready, Box::new(StartCullSession)))
@@ -310,6 +371,37 @@ impl RootView {
             );
         }
         bench.into_any_element()
+    }
+
+    /// The pile's strip (`.bench-strip`): up to [`PILE_THUMBS`] 52×35 thumbnails, the photo
+    /// the bench marks ringed in the accent (`.thumbwrap.hl`). What the image layer holds
+    /// is drawn; a thumbnail not there yet is an empty well.
+    fn render_pile_strip(&self, shell: &ShellState, photos: &[&Photo], colors: Colors, cx: &Context<Self>) -> AnyElement {
+        let shown = shell.loupe_target().map(|p| p.id);
+        let store = self.images.read(cx);
+        let mut strip = div().id("bench-strip").flex().flex_none().gap(px(4.));
+        for (photo, hl) in pile_thumbs(photos, shown) {
+            let image = match store.peek(photo.id, ImageKind::Thumb) {
+                ImageState::Ready(l) => img(l.image.clone()).size_full().object_fit(ObjectFit::Cover).into_any_element(),
+                _ => div().size_full().bg(colors.well).into_any_element(),
+            };
+            let name = photo.path.rsplit('/').next().unwrap_or(&photo.path);
+            let label = if hl { format!("{name} (marking)") } else { name.to_string() };
+            strip = strip.child(
+                div()
+                    .id(("bench-thumb", photo.id as u64))
+                    .flex_none()
+                    .w(px(52.))
+                    .h(px(35.))
+                    .rounded(px(3.))
+                    .overflow_hidden()
+                    .when(hl, |d| d.border_2().border_color(colors.accent))
+                    .child(image)
+                    .aria_label(label)
+                    .test_support(),
+            );
+        }
+        strip.into_any_element()
     }
 
     /// A bench mark (star, pick/reject, label): the culling keys' write path

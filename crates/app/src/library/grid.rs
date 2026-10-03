@@ -107,6 +107,12 @@ impl LibraryView {
         self.cols
     }
 
+    /// The photos whose thumbnails the grid asked for last frame. The grid holds no claim, so
+    /// a view that shares its tiers reads this before releasing one (the bench's pile).
+    pub fn requested_thumbs(&self) -> &HashSet<i64> {
+        &self.requested
+    }
+
     /// The list's size as the last layout measured it (width, height).
     fn measured(&self) -> Option<(f32, f32)> {
         let state = self.scroll.0.borrow();

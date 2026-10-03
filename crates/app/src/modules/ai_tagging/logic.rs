@@ -197,9 +197,53 @@ pub fn is_local_url(url: &str) -> bool {
     chairphoto_core::plugins::ai::is_loopback_url(url)
 }
 
+/// What a batch of accepts did: how many tagged, and how many an auto-tag refused (#181).
+/// Any other failure is skipped uncounted, as React's accept-all did.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Accepted {
+    pub ok: usize,
+    pub skipped_auto: usize,
+}
+
+impl Accepted {
+    /// The status suffix for the auto-tags skipped; empty when none were.
+    pub fn skipped_note(&self) -> String {
+        match self.skipped_auto {
+            0 => String::new(),
+            n => format!(" ({n} skipped: an auto-tag can't be added by hand)"),
+        }
+    }
+}
+
+/// Tally a batch of accept results.
+pub fn accept_each<T>(results: impl IntoIterator<Item = chairphoto_core::catalog::Result<T>>) -> Accepted {
+    let mut out = Accepted::default();
+    for r in results {
+        match r {
+            Ok(_) => out.ok += 1,
+            Err(chairphoto_core::catalog::CatalogError::AutoTag(_)) => out.skipped_auto += 1,
+            Err(_) => {}
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A batch accept counts the auto-tags it was refused (#181) apart from other failures.
+    #[test]
+    fn accept_each_counts_auto_tag_refusals_apart() {
+        use chairphoto_core::catalog::{AutoTagRefusal, CatalogError};
+        let refusal = || {
+            Err(CatalogError::AutoTag(AutoTagRefusal { tag_id: 1, path: "Technique/Panorama".into(), rule: "panorama".into() }))
+        };
+        let n = accept_each([Ok(1), refusal(), Err(CatalogError::NotFound("x".into())), refusal()]);
+        assert_eq!(n, Accepted { ok: 1, skipped_auto: 2 });
+        assert_eq!(n.skipped_note(), " (2 skipped: an auto-tag can't be added by hand)");
+        assert_eq!(accept_each([Ok::<_, CatalogError>(())]).skipped_note(), "");
+    }
 
     fn sug(path: &str, source: Option<i64>) -> AiSuggestion {
         AiSuggestion {

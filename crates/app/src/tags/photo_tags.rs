@@ -15,6 +15,9 @@
 //!   the catalog setting `nearby_window_seconds`), one click assigns.
 //! - **Quick tags:** the virtual "Recently used" group (ten) and the user's groups; a tag
 //!   button assigns it to every target; "⚙ groups" opens [`TagGroupsManager`].
+//! - **Auto-tags** (#181) are the catalog's to assign: never offered by the add box, nearby
+//!   or quick tags, and their chips have no ×. A typed path naming one is refused by the core
+//!   and its message shown; paste skips them and says so.
 //!
 //! Every read is off the UI thread and re-runs when the target changes or a tag write lands
 //! ([`TagsState::revision`]); a read for a superseded target is dropped.
@@ -191,7 +194,9 @@ impl PhotoTags {
                     Ok((groups, group, members)) => {
                         s.groups = groups;
                         s.group = group;
-                        s.members = members;
+                        // A group can hold an auto-tag (the manager adds any tag); its
+                        // button would only be refused (#181).
+                        s.members = members.into_iter().filter(|t| t.auto_rule.is_none()).collect();
                     }
                     Err(_) => {
                         s.groups.clear();
@@ -210,10 +215,13 @@ impl PhotoTags {
         cx.notify();
     }
 
-    /// The add-tag box's suggestions.
+    /// The add-tag box's suggestions: never a tag already on the photo, nor an auto-tag (the
+    /// catalog assigns those from the photo; a hand assignment is refused, #181).
     pub fn suggestions(&self, cx: &App) -> Vec<TagWithCount> {
-        let assigned: HashSet<i64> = self.assigned.iter().map(|t| t.id).collect();
-        search(&self.tags.read(cx).tags, &self.input.read(cx).value(), &assigned).into_iter().cloned().collect()
+        let tags = &self.tags.read(cx).tags;
+        let auto = tags.iter().filter(|t| t.tag.auto_rule.is_some()).map(|t| t.tag.id);
+        let exclude: HashSet<i64> = self.assigned.iter().map(|t| t.id).chain(auto).collect();
+        search(tags, &self.input.read(cx).value(), &exclude).into_iter().cloned().collect()
     }
 
     pub fn move_highlight(&mut self, delta: isize, cx: &mut Context<Self>) -> bool {
@@ -324,17 +332,24 @@ impl Render for PhotoTags {
                     .text_size(px(11.5))
                     .text_color(colors.txt)
                     .child(t.name.clone())
-                    .tooltip(super::tip(t.full_path.clone()))
-                    .child(
-                        div()
-                            .id(SharedString::from(format!("photo-tag-remove-{id}")))
-                            .cursor_pointer()
-                            .text_color(colors.mute)
-                            .hover(|s| s.text_color(colors.danger))
-                            .child("×")
-                            .on_click(cx.listener(move |s, _, _, cx| s.remove(id, cx)))
-                            .test_support(),
-                    ),
+                    .tooltip(super::tip(match &t.auto_rule {
+                        Some(rule) => format!("{} · auto-tag ({rule})", t.full_path),
+                        None => t.full_path.clone(),
+                    }))
+                    // An auto-tag has no ×: the catalog assigns it, and a hand removal would be
+                    // refused (#181).
+                    .when(t.auto_rule.is_none(), |chip| {
+                        chip.child(
+                            div()
+                                .id(SharedString::from(format!("photo-tag-remove-{id}")))
+                                .cursor_pointer()
+                                .text_color(colors.mute)
+                                .hover(|s| s.text_color(colors.danger))
+                                .child("×")
+                                .on_click(cx.listener(move |s, _, _, cx| s.remove(id, cx)))
+                                .test_support(),
+                        )
+                    }),
             );
         }
         if self.assigned.is_empty() {

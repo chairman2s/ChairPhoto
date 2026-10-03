@@ -23,7 +23,7 @@
 //! run is bound to it too (the core checks it in each catalog phase), and refuses when the
 //! settings it was allowed by were read from another catalog.
 
-use super::logic::{self, api_key_key, default_of, estimate_bulk_cost, is_cloud, model_key};
+use super::logic::{self, accept_each, api_key_key, default_of, estimate_bulk_cost, is_cloud, model_key, Accepted};
 use crate::model::{AppModel, AppModelEvent};
 use crate::modules::ModuleSettings;
 use crate::shell::ShellState;
@@ -728,13 +728,13 @@ impl AiState {
 
     /// A write keyed by the shown photo's id, bound to the catalog its suggestions were read
     /// from; then the paths leave the list.
-    fn write(
+    fn write<R: Send + 'static>(
         &mut self,
         paths: Vec<String>,
         what: &'static str,
         cx: &mut Context<Self>,
-        work: impl FnOnce(&Catalog, i64) -> chairphoto_core::catalog::Result<usize> + Send + 'static,
-        then: impl FnOnce(&mut Self, usize, &mut Context<Self>) + 'static,
+        work: impl FnOnce(&Catalog, i64) -> chairphoto_core::catalog::Result<R> + Send + 'static,
+        then: impl FnOnce(&mut Self, R, &mut Context<Self>) + 'static,
     ) {
         let Some((photo, from)) = self.suggestions().map(|p| (p.photo_id, p.from)) else {
             self.status("AI tagging: the photo's suggestions are still loading; try again.", cx);
@@ -793,9 +793,9 @@ impl AiState {
             vec![path.clone()],
             "add the tag",
             cx,
-            move |c, _| Ok(ids.iter().filter(|id| core_ai::accept_suggestion(c, **id, &p).is_ok()).count()),
-            move |s, n, cx| {
-                s.status(format!("Tagged {n} photos: {path}"), cx);
+            move |c, _| Ok(accept_each(ids.iter().map(|&id| core_ai::accept_suggestion(c, id, &p)))),
+            move |s, n: Accepted, cx| {
+                s.status(format!("Tagged {} photos: {path}{}", n.ok, n.skipped_note()), cx);
                 s.changed(cx);
             },
         );
@@ -809,9 +809,11 @@ impl AiState {
             paths,
             "add the tags",
             cx,
-            move |c, photo| Ok(ps.iter().filter(|p| core_ai::accept_suggestion(c, photo, p).is_ok()).count()),
-            move |s, _, cx| {
-                s.status(format!("Added {count} tags from {}", source.as_deref().unwrap_or("representative")), cx);
+            move |c, photo| Ok(accept_each(ps.iter().map(|p| core_ai::accept_suggestion(c, photo, p)))),
+            move |s, n: Accepted, cx| {
+                let from = source.as_deref().unwrap_or("representative");
+                let added = if n.ok == count { count.to_string() } else { format!("{} of {count}", n.ok) };
+                s.status(format!("Added {added} tags from {from}{}", n.skipped_note()), cx);
                 s.changed(cx);
             },
         );

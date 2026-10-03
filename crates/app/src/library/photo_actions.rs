@@ -30,7 +30,7 @@ use super::grid_menu::PhotoCommand;
 use crate::storage::{ui, Runner};
 use crate::view::RootView;
 use chairphoto_core::app::{with_catalog_as, CatalogIdentity};
-use gpui_kit::{App, Context, Global, PathPromptOptions, SharedString, Window};
+use gpui_kit::{App, Context, FocusHandle, Global, PathPromptOptions, SharedString, Window};
 use std::path::Path;
 use std::rc::Rc;
 
@@ -45,6 +45,27 @@ fn reveal_path(path: &Path, cx: &mut App) {
     match cx.try_global::<SystemRevealer>().cloned() {
         Some(revealer) => (revealer.0)(path, cx),
         None => cx.reveal_path(path),
+    }
+}
+
+/// The open Remove confirm, so a catalog switch can close **it** — not whatever dialog is on
+/// top (gpui-component's `close_dialog` pops the top one and has no per-dialog handle).
+///
+/// gpui-component focuses a new dialog's own focus handle as it opens it, and focus stays
+/// inside the top dialog until that closes; the handle captured right after opening therefore
+/// names this dialog. Closing pops only while focus is inside it, i.e. while it is the top
+/// dialog. Once it is answered (and gone) or another dialog lies over it, a switch closes
+/// nothing; the confirm's write is bound to its catalog anyway, so a late OK fails closed.
+pub struct RemoveConfirm {
+    pub(crate) serial: u64,
+    dialog: Option<FocusHandle>,
+}
+
+impl RemoveConfirm {
+    pub(crate) fn close(self, window: &mut Window, cx: &mut App) {
+        if self.dialog.is_some_and(|d| d.contains_focused(window, cx)) {
+            gpui_kit::component::WindowExt::close_dialog(window, cx);
+        }
     }
 }
 
@@ -201,11 +222,11 @@ impl RootView {
             ui::confirm(window, cx, "Remove from catalog".into(), remove_confirm_body(&name).into(), "Remove");
         self.confirm_serial += 1;
         let serial = self.confirm_serial;
-        self.remove_confirm = Some(serial);
+        self.remove_confirm = Some(RemoveConfirm { serial, dialog: window.focused(cx) });
         cx.spawn(async move |this, cx| {
             let ok = answer.await == Ok(true);
             this.update(cx, |this, cx| {
-                if this.remove_confirm == Some(serial) {
+                if this.remove_confirm.as_ref().is_some_and(|c| c.serial == serial) {
                     this.remove_confirm = None;
                 }
                 if ok {

@@ -424,6 +424,57 @@ fn a_remove_confirm_closes_when_the_catalog_switches(cx: &mut TestAppContext) {
     assert!(exists(app, r.ids[0]), "same id: B's photo");
 }
 
+/// The switch closes the Remove confirm by its own handle: with another dialog over it, that
+/// dialog is left alone (it is not popped in the confirm's place), and once the confirm has
+/// been answered a switch pops nothing.
+#[gpui_kit::test]
+fn a_switch_closes_only_the_remove_confirm_itself(cx: &mut TestAppContext) {
+    use gpui_kit::component::WindowExt as _;
+    let r = rig("menu-confirm-own", 1, cx);
+    let app = &r.app;
+    let open_other = |cx: &mut TestAppContext| {
+        cx.update_window(app.window(), |_, window, cx| window.open_dialog(cx, |d, _, _| d.title("Other"))).unwrap();
+        settle(app, cx);
+    };
+    let pop = |cx: &mut TestAppContext| {
+        cx.update_window(app.window(), |_, window, cx| window.close_dialog(cx)).unwrap();
+        cx.run_until_parked();
+    };
+
+    // Another dialog over the confirm: the switch leaves both; popping the other one shows
+    // the confirm is still there (fail-closed if answered: its write is bound to A).
+    right_click(app, r.ids[0], cx);
+    click(app, "grid-menu-remove", cx);
+    settle(app, cx);
+    open_other(cx);
+    let (b, _, _) = catalog_with_files(&r.dir, "b", 1);
+    switch_to(app, b, true, cx);
+    settle(app, cx);
+    pop(cx);
+    assert!(has_dialog(app, cx), "the confirm under the other dialog was not mistaken for the top one");
+    pop(cx);
+    assert!(!has_dialog(app, cx));
+
+    // Answered, then a dialog opened and a switch lands: the switch pops nothing.
+    let (c, c_ids, _) = catalog_with_files(&r.dir, "c", 1);
+    switch_to(app, c, true, cx); // back on rows that can be right-clicked
+    render(app, cx);
+    right_click(app, c_ids[0], cx);
+    click(app, "grid-menu-remove", cx);
+    settle(app, cx);
+    // Force the race: the confirm is answered and gone, but its slot is still set (as between
+    // the answer and the continuation that clears it).
+    let root = app.wired.root.clone().unwrap();
+    let slot = root.update(cx, |r, _| r.remove_confirm.take()).expect("the confirm's slot");
+    click(app, "cancel", cx);
+    root.update(cx, |r, _| r.remove_confirm = Some(slot));
+    open_other(cx);
+    let (d, _, _) = catalog_with_files(&r.dir, "d", 1);
+    switch_to(app, d, true, cx);
+    settle(app, cx);
+    assert!(has_dialog(app, cx), "the other dialog survived the switch");
+}
+
 /// A Retrieve started over A whose copy has not run when the core switches to B: the job
 /// fails closed and nothing is copied for B's photo with the same id.
 #[gpui_kit::test]

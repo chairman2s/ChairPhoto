@@ -232,6 +232,22 @@ uses it to re-home a row; the file gets its own minted UUID, and the foreign val
 the sidecar as a conflict. Adopt refuses it; Overwrite (after the backup) or Dismiss resolve
 it.
 
+**Non-UUID conflicts can be resolved in bulk** (#150). A DAM-managed library can hold them by
+the thousand — schema v23 queues every re-minted row's copies — so Overwrite and Dismiss
+also run over all of them at once as a job (`Catalog::run_resolve_foreign_conflicts`, owned
+by `JobRegistry::identity_resolve` through `app::identity::claim_resolve_foreign_conflicts`;
+over IPC `resolve_foreign_identity_conflicts`, `identity_resolve_cancel`,
+`identity_resolve_status`, with `identity:resolve_progress` and the terminal
+`identity:resolve_done`). It acts only on un-dismissed copies whose recorded conflict is a
+non-UUID, and decides each exactly as a single resolution does: the queue row is re-read,
+Overwrite re-reads the sidecar and backs it up first, and a copy that is no longer a non-UUID
+conflict — resolved meanwhile, its sidecar now carrying a UUID or nothing, its file
+unreachable — is skipped, never acted on. A UUID conflict names another photo's identity and
+is never resolved in bulk. The run is its own job family, so it neither stops nor is stopped
+by a repair pass (each queue row has an owner); a newer run, Cancel or a catalog switch stops
+it before its next copy, and a front end's start is bound to the catalog it read
+(`CATALOG_CHANGED` otherwise). The GPUI identity-debt panel does not offer it yet.
+
 Before #141 a scan did adopt such a value, so an older catalog can hold rows whose
 `photos.uuid` is a DAM id. Schema v23 (#146) re-mints each of them, keeps the old value in
 `photo_legacy_identifiers`, and queues every copy it records as a conflict; it writes no

@@ -39,7 +39,7 @@ mod performance_harness;
 pub use facets::{Facet, SOFT_THRESHOLD_DEFAULT, SOFT_THRESHOLD_KEY};
 pub use identity::{
     bind_sidecar_identity, canonical_photo_identity, is_photo_identity, legacy_photo_identity,
-    photo_identity_for, IdentityConflictAction, LEGACY_IDENTITY_NAMESPACE, IdentityConflictOutcome, IdentityRepairCursor,
+    photo_identity_for, ForeignConflictAction, ForeignConflictSummary, IdentityConflictAction, LEGACY_IDENTITY_NAMESPACE, IdentityConflictOutcome, IdentityRepairCursor,
     IdentityRepairPlan, IdentityRepairSummary, PendingIdentity, PendingIdentityField,
     PendingIdentityRow, PendingIdentitySummary, SidecarIdentity,
 };

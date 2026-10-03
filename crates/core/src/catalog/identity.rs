@@ -560,6 +560,71 @@ pub struct IdentityConflictOutcome {
     pub sidecar_backup: Option<String>,
 }
 
+/// What to do with every copy whose sidecar carries a non-UUID identifier (#150, L6 of the
+/// #139–#142 review): the bulk form of [`IdentityConflictAction::Overwrite`] and
+/// [`IdentityConflictAction::Dismiss`]. Adopt is not offered — a non-UUID cannot be adopted —
+/// and neither is anything for a UUID conflict, which names another photo's identity and
+/// needs a decision of its own. No default, as for one copy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ForeignConflictAction {
+    Overwrite,
+    Dismiss,
+}
+
+impl ForeignConflictAction {
+    fn single(self) -> IdentityConflictAction {
+        match self {
+            ForeignConflictAction::Overwrite => IdentityConflictAction::Overwrite,
+            ForeignConflictAction::Dismiss => IdentityConflictAction::Dismiss,
+        }
+    }
+}
+
+/// What a bulk resolution of non-UUID conflicts did ([`Catalog::run_resolve_foreign_conflicts`]).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ForeignConflictSummary {
+    /// Copies in conflict with a non-UUID identifier when the run started — its progress
+    /// denominator. The queue can change underneath it.
+    pub total: usize,
+    /// Copies whose sidecar now carries the catalog's identity, after a backup.
+    pub overwritten: usize,
+    /// Copies dismissed.
+    pub dismissed: usize,
+    /// Copies left as they are because they were no longer a non-UUID conflict when their
+    /// turn came — resolved or dismissed meanwhile, the sidecar changed (to a UUID, or to no
+    /// identifier), or, for Overwrite, the file not reachable. Not a failure.
+    pub skipped: usize,
+    /// Copies whose sidecar Overwrite could not write (read-only storage, an unparseable
+    /// sidecar). Still queued as conflicts.
+    pub failed: usize,
+    /// True when the run stopped early (Cancel, a newer run, a catalog switch); the counts
+    /// are then partial.
+    pub aborted: bool,
+}
+
+impl ForeignConflictSummary {
+    /// Copies the run has finished with, whatever the outcome.
+    pub fn done(&self) -> usize {
+        self.overwritten + self.dismissed + self.skipped + self.failed
+    }
+}
+
+/// The identifier a stored conflict recorded, from the queue row's `error` (the inverse of
+/// [`SidecarIdentity::error_text`] for `Conflict`), or `None` for any other state.
+fn recorded_conflict_value(error: &str) -> Option<&str> {
+    error
+        .strip_prefix(CONFLICT_PREFIX)?
+        .strip_prefix(" (")?
+        .strip_suffix("); left untouched")
+}
+
+/// True when a queue row's `error` records a conflict with a non-UUID identifier.
+fn is_foreign_conflict(error: &str) -> bool {
+    recorded_conflict_value(error).is_some_and(|found| !is_photo_identity(found))
+}
+
 /// The version of one queue row, as the repair pass saw it.
 ///
 /// `attempts` moves on every non-`Bound` record and the row disappears on a `Bound` one, so
@@ -1215,6 +1280,20 @@ impl Catalog {
         relative_path: &str,
         action: IdentityConflictAction,
     ) -> Result<IdentityConflictOutcome> {
+        self.resolve_conflict(photo_id, volume_id, relative_path, action, false)
+    }
+
+    /// [`Self::resolve_identity_conflict`]; with `foreign_only`, Overwrite also refuses a
+    /// sidecar that carries a UUID when it is read, as the bulk resolution of non-UUID
+    /// conflicts requires ([`Self::run_resolve_foreign_conflicts`]).
+    fn resolve_conflict(
+        &self,
+        photo_id: i64,
+        volume_id: i64,
+        relative_path: &str,
+        action: IdentityConflictAction,
+        foreign_only: bool,
+    ) -> Result<IdentityConflictOutcome> {
         let (error, dismissed_at, catalog_uuid, base_path): (String, i64, String, String) = self
             .conn
             .query_row(
@@ -1260,6 +1339,12 @@ impl Catalog {
         // copy that merely can't be written (or reached) has no such question to answer;
         // it needs a repair pass, not a decision.
         let state = debt_state_from_error(&error);
+        if foreign_only && state == "conflict" && !is_foreign_conflict(&error) {
+            return Err(CatalogError::Validation(format!(
+                "{relative_path}'s conflict is with a UUID, another photo's identity, which \
+                 needs a decision of its own"
+            )));
+        }
         if state != "conflict" {
             return Err(CatalogError::Validation(format!(
                 "{relative_path} is not in conflict (state: {state}); Adopt, Overwrite and \
@@ -1350,6 +1435,13 @@ impl Catalog {
                 )?;
             }
             IdentityConflictAction::Overwrite => {
+                if foreign_only && is_photo_identity(&found) {
+                    return Err(CatalogError::Validation(format!(
+                        "{}'s sidecar now carries a UUID ({found}), which is another photo's \
+                         identity and needs a decision of its own",
+                        target.display()
+                    )));
+                }
                 let backup = crate::xmp::overwrite_identifier(&target, &catalog_uuid)
                     .map_err(CatalogError::Io)?;
                 outcome.sidecar_backup = backup.map(|p| p.to_string_lossy().to_string());
@@ -1536,6 +1628,108 @@ impl Catalog {
     pub fn repair_pending_identity(&self) -> Result<IdentityRepairSummary> {
         self.run_identity_repair(&AtomicBool::new(false), |_| {})
     }
+
+    /// How many copies are in conflict with a non-UUID identifier, un-dismissed — what
+    /// [`Self::run_resolve_foreign_conflicts`] would act on now.
+    pub fn count_foreign_conflicts(&self) -> Result<usize> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT error FROM pending_sidecar_identity
+             WHERE field = 'identifier' AND dismissed_at = 0 AND error GLOB '{CONFLICT_PREFIX}*'"
+        ))?;
+        let mut count = 0;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            if is_foreign_conflict(&row.get::<_, String>(0)?) {
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
+
+    /// One keyset page of the un-dismissed identifier conflicts after `after`, in the queue's
+    /// key order: `(photo_id, volume_id, relative_path, error)` of each copy. UUID conflicts
+    /// are in it too — the caller skips them — so the page's last row is always the cursor.
+    fn identifier_conflicts_page(
+        &self,
+        after: Option<&(i64, i64, String)>,
+        limit: i64,
+    ) -> Result<Vec<(i64, i64, String, String)>> {
+        let (photo_id, volume_id, relative_path) =
+            after.cloned().unwrap_or((i64::MIN, i64::MIN, String::new()));
+        let rows = self
+            .conn
+            .prepare_cached(&format!(
+                "SELECT photo_id, volume_id, relative_path, error FROM pending_sidecar_identity
+                 WHERE field = 'identifier' AND dismissed_at = 0
+                   AND error GLOB '{CONFLICT_PREFIX}*'
+                   AND (photo_id, volume_id, relative_path) > (?1, ?2, ?3)
+                 ORDER BY photo_id, volume_id, relative_path
+                 LIMIT ?4"
+            ))?
+            .query_map(params![photo_id, volume_id, relative_path, limit], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Overwrite or Dismiss every copy whose sidecar carries a non-UUID identifier (#150, L6
+    /// of the #139–#142 review), one copy at a time until the queue is exhausted or `abort`
+    /// trips. A DAM-managed library can reach this state by the thousand (schema v23 queues
+    /// every re-minted row's copies), and one decision per copy does not scale.
+    ///
+    /// Each copy goes through the same decision as one resolved by hand
+    /// ([`Self::resolve_identity_conflict`]): the queue row is re-read, and Overwrite re-reads
+    /// the sidecar and backs it up before it writes. A copy that is no longer a non-UUID
+    /// conflict when its turn comes — resolved or dismissed meanwhile, its sidecar now
+    /// carrying a UUID (another photo's identity: never overwritten in bulk) or nothing, its
+    /// file unreachable — is skipped, not failed. Like a single resolution it wins over a
+    /// concurrent repair pass (this module's § Who owns a queue row) and does not stop one.
+    ///
+    /// The job around it — id, abort generation, status slot, catalog identity, events — is
+    /// `app::identity`'s. `abort` is checked before every copy; a stop keeps every decision
+    /// already made and sets `aborted`.
+    pub fn run_resolve_foreign_conflicts(
+        &self,
+        action: ForeignConflictAction,
+        abort: &AtomicBool,
+        mut progress: impl FnMut(&ForeignConflictSummary),
+    ) -> Result<ForeignConflictSummary> {
+        let mut summary =
+            ForeignConflictSummary { total: self.count_foreign_conflicts()?, ..Default::default() };
+        let mut cursor: Option<(i64, i64, String)> = None;
+        loop {
+            if abort.load(Ordering::Relaxed) {
+                summary.aborted = true;
+                return Ok(summary);
+            }
+            let page = self.identifier_conflicts_page(cursor.as_ref(), REPAIR_PAGE_SIZE)?;
+            if page.is_empty() {
+                return Ok(summary);
+            }
+            for (photo_id, volume_id, relative_path, error) in page {
+                if abort.load(Ordering::Relaxed) {
+                    summary.aborted = true;
+                    return Ok(summary);
+                }
+                cursor = Some((photo_id, volume_id, relative_path.clone()));
+                if !is_foreign_conflict(&error) {
+                    continue; // a UUID conflict: not this run's to decide, and not counted
+                }
+                match self.resolve_conflict(photo_id, volume_id, &relative_path, action.single(), true) {
+                    Ok(_) => match action {
+                        ForeignConflictAction::Overwrite => summary.overwritten += 1,
+                        ForeignConflictAction::Dismiss => summary.dismissed += 1,
+                    },
+                    Err(CatalogError::Validation(_) | CatalogError::NotFound(_)) => summary.skipped += 1,
+                    Err(CatalogError::Io(_)) => summary.failed += 1,
+                    Err(e) => return Err(e),
+                }
+                progress(&summary);
+            }
+        }
+    }
+
 
     /// What a scan may match or adopt as the identity of a file whose sidecar's
     /// `xmp:Identifier` holds `found`, or `None` to match by path alone and mint if new.
@@ -3703,6 +3897,87 @@ mod tests {
         assert_eq!(legacy(id), None, "the manifest's id is not this file's");
         catalog.upsert_scanned_photo(&path, None, 1, 9, Some("dam:asset/9")).unwrap();
         assert_eq!(legacy(id).as_deref(), Some("dam:asset/9"), "its own sidecar's is");
+    }
+
+    // --- bulk resolution of non-UUID conflicts (#150 L6) ------------------------------
+
+    /// Overwrite in bulk acts on every un-dismissed copy whose recorded conflict is a non-UUID,
+    /// re-reading each sidecar first: a UUID conflict is left for its own decision, a copy
+    /// whose sidecar has since taken a UUID is skipped, and a dismissed copy is not touched.
+    #[test]
+    fn bulk_overwrite_resolves_only_non_uuid_conflicts() {
+        let (catalog, root, _dir) = temp_catalog("bulk-overwrite");
+        const OTHER: &str = "0d9c8b7a-6f5e-4d3c-8b2a-190807060504";
+        let (a, a_path, a_uuid) = seed_conflicted_copy(&catalog, &root, "a.jpg", "dam:1");
+        let (b, b_path, _) = seed_conflicted_copy(&catalog, &root, "b.jpg", OTHER);
+        let (c, c_path, _) = seed_conflicted_copy(&catalog, &root, "c.jpg", "dam:3");
+        let (d, d_path, _) = seed_conflicted_copy(&catalog, &root, "d.jpg", "dam:4");
+        let (cv, cr) = copy_of(&catalog, &c_path);
+        catalog.resolve_identity_conflict(c, cv, &cr, IdentityConflictAction::Dismiss).unwrap();
+        // d's sidecar changes to another photo's UUID after its conflict was recorded.
+        crate::xmp::overwrite_identifier(&d_path, OTHER).unwrap();
+        assert_eq!(catalog.count_foreign_conflicts().unwrap(), 2);
+
+        let mut seen = Vec::new();
+        let summary = catalog
+            .run_resolve_foreign_conflicts(ForeignConflictAction::Overwrite, &AtomicBool::new(false), |s| {
+                seen.push(s.done())
+            })
+            .unwrap();
+        assert_eq!(
+            summary,
+            ForeignConflictSummary { total: 2, overwritten: 1, skipped: 1, ..Default::default() }
+        );
+        assert_eq!(seen, [1, 2]);
+        assert_eq!(crate::xmp::read_identifier(&a_path).as_deref(), Some(a_uuid.as_str()));
+        assert_eq!(queue_row(&catalog, a, &a_path), None, "a is bound");
+        assert!(queue_row(&catalog, b, &b_path).is_some_and(|(_, e, _)| e.contains(OTHER)));
+        assert_eq!(crate::xmp::read_identifier(&b_path).as_deref(), Some(OTHER), "a UUID is never overwritten in bulk");
+        assert!(queue_row(&catalog, c, &c_path).is_some_and(|(_, _, dismissed)| dismissed != 0));
+        assert_eq!(crate::xmp::read_identifier(&c_path).as_deref(), Some("dam:3"));
+        assert_eq!(crate::xmp::read_identifier(&d_path).as_deref(), Some(OTHER));
+        assert!(queue_row(&catalog, d, &d_path).is_some());
+    }
+
+    /// Dismiss in bulk pages through a queue longer than one page, interleaved with UUID
+    /// conflicts it must leave alone, and stops at its abort flag between copies.
+    #[test]
+    fn bulk_dismiss_pages_past_uuid_conflicts_and_stops_at_its_abort_flag() {
+        let (catalog, root, _dir) = temp_catalog("bulk-dismiss");
+        let mut foreign = Vec::new();
+        for i in 0..(REPAIR_PAGE_SIZE as usize + 40) {
+            if i % 3 == 0 {
+                let other = uuid::Uuid::new_v4().to_string();
+                seed_conflicted_copy(&catalog, &root, &format!("u{i}.jpg"), &other);
+            } else {
+                foreign.push(seed_conflicted_copy(&catalog, &root, &format!("f{i}.jpg"), &format!("dam:{i}")));
+            }
+        }
+        let abort = AtomicBool::new(false);
+        let stopped = catalog
+            .run_resolve_foreign_conflicts(ForeignConflictAction::Dismiss, &abort, |s| {
+                if s.done() == 5 {
+                    abort.store(true, Ordering::Relaxed);
+                }
+            })
+            .unwrap();
+        assert!(stopped.aborted);
+        assert_eq!((stopped.dismissed, stopped.total), (5, foreign.len()));
+
+        let rest = catalog
+            .run_resolve_foreign_conflicts(ForeignConflictAction::Dismiss, &AtomicBool::new(false), |_| {})
+            .unwrap();
+        assert_eq!(rest, ForeignConflictSummary {
+            total: foreign.len() - 5,
+            dismissed: foreign.len() - 5,
+            ..Default::default()
+        });
+        assert_eq!(catalog.count_foreign_conflicts().unwrap(), 0);
+        for (id, path, _) in &foreign {
+            assert!(queue_row(&catalog, *id, path).is_some_and(|(_, _, d)| d != 0), "{}", path.display());
+        }
+        let summary = catalog.summarize_pending_identity().unwrap();
+        assert_eq!(summary.conflicts as usize, (REPAIR_PAGE_SIZE as usize + 40).div_ceil(3), "UUID conflicts stay");
     }
 
     /// #146 review N4: v23 agrees with merge that a blank `photos.uuid` names no identity. It

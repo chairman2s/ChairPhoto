@@ -30,9 +30,9 @@
 //!
 //! **catalog → abort generations → status slots**, and within each of the last two groups
 //! the declaration order of [`JobRegistry`]: scan, face indexing, face matching, sharpness,
-//! pHash, trash, import, reconcile, Smart Tagging, identity repair, burst analysis, export,
-//! bundle export, slideshow, LocalSend send, the Flickr, SmugMug and Instagram uploads, the
-//! cache warm-up.
+//! pHash, trash, import, reconcile, Smart Tagging, identity repair, identity conflict
+//! resolution, burst analysis, export, bundle export, slideshow, LocalSend send, the Flickr,
+//! SmugMug and Instagram uploads, the cache warm-up.
 //!
 //! Every nested acquisition in the backend obeys it:
 //!
@@ -81,7 +81,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use super::IdentityRepairJobStatus;
+use super::{IdentityRepairJobStatus, IdentityResolveJobStatus};
 #[cfg(feature = "faces")]
 use super::{FacesJobStatus, FacesMatchJobStatus};
 #[cfg(feature = "smarttags")]
@@ -533,6 +533,12 @@ pub struct JobRegistry {
     /// publishes a slot because the debt panel is a modal that remounts, and a pass over a
     /// 74k-row queue on a NAS long outlives one open/close of it.
     pub identity: JobFamily<IdentityRepairJobStatus>,
+    /// A bulk Overwrite or Dismiss of the non-UUID identity conflicts (#150). Its own family
+    /// rather than [`Self::identity`]'s: it is a run of resolutions, which a repair pass
+    /// already tolerates beside it (each queue row has an owner), so neither stops the
+    /// other; a newer bulk run, Cancel or a catalog switch stops it. A status slot, like the
+    /// repair pass, because the debt panel that starts it remounts.
+    pub identity_resolve: JobFamily<IdentityResolveJobStatus>,
     /// Burst-relative sharpness analysis (H16e, `burst_analysis`). A newer run trips an
     /// older one — whichever worker claims first ([`AbortGeneration::install_fresh_if_newer`])
     /// — so a slower, superseded run over an overlapping set never writes its flags over the
@@ -621,6 +627,7 @@ impl JobRegistry {
             #[cfg(feature = "smarttags")]
             smarttags,
             identity,
+            identity_resolve,
             burst: _,
             export: _,
             bundle_export: _,
@@ -643,6 +650,7 @@ impl JobRegistry {
             #[cfg(feature = "smarttags")]
             smarttags: smarttags.slot.lock().map_err(|e| e.to_string())?,
             identity: identity.slot.lock().map_err(|e| e.to_string())?,
+            identity_resolve: identity_resolve.slot.lock().map_err(|e| e.to_string())?,
             #[cfg(all(feature = "raw", feature = "edit"))]
             develop: develop.slot.lock().map_err(|e| e.to_string())?,
         };
@@ -671,6 +679,7 @@ impl JobRegistry {
             #[cfg(feature = "smarttags")]
             smarttags,
             identity,
+            identity_resolve,
             burst,
             export,
             bundle_export,
@@ -699,6 +708,7 @@ impl JobRegistry {
             #[cfg(feature = "smarttags")]
             smarttags: smarttags.abort.lock()?,
             identity: identity.abort.lock()?,
+            identity_resolve: identity_resolve.abort.lock()?,
             burst: burst.lock()?,
             export: export.lock()?,
             bundle_export: bundle_export.lock()?,
@@ -731,6 +741,7 @@ pub struct AbortGuards<'a> {
     #[cfg(feature = "smarttags")]
     smarttags: MutexGuard<'a, Arc<AtomicBool>>,
     identity: MutexGuard<'a, Arc<AtomicBool>>,
+    identity_resolve: MutexGuard<'a, Arc<AtomicBool>>,
     burst: MutexGuard<'a, Arc<AtomicBool>>,
     export: MutexGuard<'a, Arc<AtomicBool>>,
     bundle_export: MutexGuard<'a, Arc<AtomicBool>>,
@@ -763,6 +774,7 @@ impl AbortGuards<'_> {
             #[cfg(feature = "smarttags")]
             smarttags,
             identity,
+            identity_resolve,
             burst,
             export,
             bundle_export,
@@ -790,6 +802,7 @@ impl AbortGuards<'_> {
         #[cfg(feature = "smarttags")]
         smarttags.store(true, Ordering::Relaxed);
         identity.store(true, Ordering::Relaxed);
+        identity_resolve.store(true, Ordering::Relaxed);
         burst.store(true, Ordering::Relaxed);
         export.store(true, Ordering::Relaxed);
         bundle_export.store(true, Ordering::Relaxed);
@@ -839,6 +852,7 @@ impl AbortGuards<'_> {
             #[cfg(feature = "smarttags")]
                 ref mut smarttags,
             ref mut identity,
+            ref mut identity_resolve,
             ref mut burst,
             ref mut export,
             ref mut bundle_export,
@@ -870,6 +884,7 @@ impl AbortGuards<'_> {
             **smarttags = Arc::new(AtomicBool::new(false));
         }
         **identity = Arc::new(AtomicBool::new(false));
+        **identity_resolve = Arc::new(AtomicBool::new(false));
         **burst = Arc::new(AtomicBool::new(false));
         **export = Arc::new(AtomicBool::new(false));
         **bundle_export = Arc::new(AtomicBool::new(false));
@@ -905,6 +920,7 @@ pub struct SlotGuards<'a> {
     /// to keep the lifetime used under `--no-default-features`, where every other slot here
     /// is compiled out.
     identity: MutexGuard<'a, Option<IdentityRepairJobStatus>>,
+    identity_resolve: MutexGuard<'a, Option<IdentityResolveJobStatus>>,
     #[cfg(all(feature = "raw", feature = "edit"))]
     develop: MutexGuard<'a, Option<super::DevelopStatus>>,
 }
@@ -921,6 +937,7 @@ impl SlotGuards<'_> {
             #[cfg(feature = "smarttags")]
             mut smarttags,
             mut identity,
+            mut identity_resolve,
             #[cfg(all(feature = "raw", feature = "edit"))]
             mut develop,
         } = self;
@@ -934,6 +951,7 @@ impl SlotGuards<'_> {
             *smarttags = None;
         }
         *identity = None;
+        *identity_resolve = None;
         #[cfg(all(feature = "raw", feature = "edit"))]
         {
             *develop = None;
@@ -1298,6 +1316,10 @@ mod tests {
         let (cache, _) = registry.cache.install_fresh_numbered().unwrap();
 
         let identity = begin_identity(&registry, &catalog).unwrap();
+        let resolve = registry
+            .identity_resolve
+            .begin(&catalog, |job| IdentityResolveJobStatus { job, done: 0, total: 0 })
+            .unwrap();
         #[cfg(feature = "smarttags")]
         let smarttags = registry
             .smarttags
@@ -1321,6 +1343,9 @@ mod tests {
             "phase one must clear the status slot, or the panel re-adopts a dead job"
         );
         assert!(!identity.slot.owns());
+        assert!(resolve.abort.load(Ordering::Relaxed), "and a bulk conflict resolution (#150)");
+        assert!(registry.identity_resolve.status().unwrap().is_none());
+        assert!(!resolve.slot.owns());
         #[cfg(feature = "smarttags")]
         {
             assert!(smarttags.abort.load(Ordering::Relaxed));

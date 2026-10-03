@@ -542,6 +542,43 @@ fn the_splash_follows_the_boot_stages_then_fades(cx: &mut TestAppContext) {
     assert_eq!(splash_line(&app, cx), None, "gone after the fade");
 }
 
+/// A row read failing before the catalog is even open (a filter key reaching the Library
+/// through the splash's pointer-only occlusion) must not mark "Loading photos…" done — else
+/// the splash could fade as soon as the init chain ends, before the real first rows do
+/// (#194). Checked directly against `Splash::finish_init` (rather than driving the whole
+/// catalog-open → auto-tags → modules cascade to the same point): in this harness that
+/// cascade's own successful row read lands within the same `run_until_parked` pass as the
+/// init chain's completion, so there is no separately observable moment between them to
+/// assert on; `finish_init` alone reproduces exactly the "the init chain just ended" instant.
+/// (Mutation-checked: dropping the `catalog_current` guard in `boot_photos_loaded` makes the
+/// stray failure mark `photos_done`, so `finish_init` alone then ends the boot — `hiding()`
+/// turns true — and this fails.)
+#[gpui_kit::test]
+fn a_premature_row_read_failure_does_not_end_the_splash_early(cx: &mut TestAppContext) {
+    use crate::shell::splash::Splash;
+    let app = start(cx);
+    app.wired.model.update(cx, |m, cx| {
+        m.splash = Splash::booting();
+        cx.notify();
+    });
+
+    // A filter key, say: it reaches the Library (the splash occludes only the pointer) before
+    // any catalog is open, so the row read it asks for fails with "No catalog is open".
+    app.wired.shell.update(cx, |s, cx| s.update_scope(cx, |l| l.toggle_label("Red")));
+    cx.run_until_parked();
+    assert!(!app.wired.shell.read_with(cx, |s, _| s.rows_loaded), "no real rows have landed");
+    assert!(splash(&app, cx).showing() && !splash(&app, cx).hiding(), "the stray failure must not end the boot");
+
+    // The rest of the init chain finishing, without needing to drive the whole cascade: if
+    // the stray failure had wrongly marked the photos part done, this alone would now end it.
+    app.wired.model.update(cx, |m, cx| {
+        m.splash.finish_init();
+        cx.notify();
+    });
+    let s = splash(&app, cx);
+    assert!(!s.hiding() && s.showing(), "the init chain ending alone must not fade the splash: {s:?}");
+}
+
 /// A failed open ends the boot at once: the splash fades rather than hanging over the error.
 #[gpui_kit::test]
 fn a_failed_boot_never_leaves_the_splash_up(cx: &mut TestAppContext) {

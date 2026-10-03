@@ -1615,6 +1615,42 @@ impl Catalog {
         Ok(copies.iter().all(|(base, file)| base.is_dir() && !file.exists()))
     }
 
+    /// True when re-homing `photo_id` onto a file on `volume_id` would move one of its
+    /// primary copies off a file that is still there (#150, reviews F5 and N2 of #146): the
+    /// row's primary location on that volume, and — with `logical`, for a re-home that also
+    /// rewrites `photos.path` — the file at the row's catalog-root path.
+    ///
+    /// A re-home by identity is for a file that moved. If the row's file is still in place,
+    /// the file being scanned or imported is another copy carrying the same identity — a
+    /// bundle's copy at another path, a duplicate a person made, the other half of a v24
+    /// case collision — and pointing the row at it would leave the original with no row:
+    /// the next scan catalogues it afresh, without its ratings, tags and faces, or the two
+    /// files take turns owning the row. A primary copy on another volume is not checked: a
+    /// copy of the photo on a second volume is a second location of the same row, and
+    /// recording it moves nothing.
+    pub(super) fn primary_copy_left_in_place(
+        &self,
+        photo_id: i64,
+        volume_id: i64,
+        logical: bool,
+    ) -> Result<bool> {
+        let on_volume: Option<PathBuf> = self
+            .conn
+            .prepare_cached(
+                "SELECT v.base_path, l.relative_path
+                 FROM photo_locations l JOIN volumes v ON v.id = l.volume_id
+                 WHERE l.photo_id = ?1 AND l.volume_id = ?2 AND l.role = 'primary'",
+            )?
+            .query_row(params![photo_id, volume_id], |r| {
+                Ok(Path::new(&r.get::<_, String>(0)?).join(r.get::<_, String>(1)?))
+            })
+            .optional()?;
+        if on_volume.is_some_and(|file| file.exists()) {
+            return Ok(true);
+        }
+        Ok(logical && self.to_absolute(&self.get_photo(photo_id)?.path).exists())
+    }
+
     /// Schema v23 (#146): give every row whose `photos.uuid` is not a photo identity the
     /// [`legacy_photo_identity`] of that value — a UUID v5, so that every catalog that held
     /// the photo under the same value agrees on its new identity. Returns how many rows were

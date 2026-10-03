@@ -253,6 +253,20 @@ or bundle import never records a value another row already holds — the first h
 v23's re-mint or the first file seen carrying it, and a later one is a duplicate or another
 file sharing a DAM id. Two owners would make every scan refuse both.
 
+**A re-home never leaves a file behind** (#150). A scan or bundle import that finds a file
+carrying an identity some row already holds re-homes that row onto the file only when the
+row's own copy is gone: its primary location on the file's volume, and, for a file under the
+catalog root, the file at its `photos.path`. If that copy is still in place, the new file is
+another copy carrying the same identity — a bundle's copy at another relative path, a
+duplicate made outside ChairPhoto, the other half of a v24 case collision — so it gets a row
+of its own with a minted UUID, and its sidecar's identity is queued as a conflict for a
+person (Overwrite or Dismiss). Re-homing it would leave the original with no row: the next
+scan would catalogue it afresh without its ratings, tags and faces, or the two files would
+take turns owning the row. A row whose primary copies are all on other volumes still gains a
+file found on a volume indexed in place as another location; that moves nothing. A bundle
+whose photo lands as such a separate copy still merges its tags onto the existing row, which
+merge matches by identity.
+
 **A re-minted legacy identity is a UUID v5, not v4.** This is the one exception to "a UUID v4
 on first import": a photo imported fresh still gets a random v4, but a value that already
 served as a photo's identity is re-minted as `catalog::legacy_photo_identity` — UUID v5 of the

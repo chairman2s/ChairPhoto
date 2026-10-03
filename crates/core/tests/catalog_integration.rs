@@ -401,6 +401,56 @@ fn moved_file_matches_by_uuid_instead_of_duplicating() {
     assert_eq!(imported.uuid, "3b2f7c1e-8a4d-4e6f-9b0a-1c2d3e4f5a6b");
 }
 
+/// #150 (reviews F5 and N2 of #146): a re-home by identity is for a file that moved. While
+/// the row's own file is still in place, a second file carrying the same UUID — a copy, the
+/// other half of a v24 case collision — gets a row of its own, for a scan and a trusted
+/// (bundle) upsert alike, on the catalog root and on a volume indexed in place. Once the
+/// original is gone, the next file carrying the UUID re-homes the row as before.
+#[test]
+fn a_uuid_rehome_never_leaves_a_file_still_in_place() {
+    let (catalog, root) = temp_catalog("rehome-guard");
+    const KNOWN: &str = "6f1c1f0e-2b7a-4c3d-9e8f-0a1b2c3d4e5f";
+    let write = |p: &std::path::Path| {
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, b"notarealjpeg").unwrap();
+    };
+    let original = root.join("a/x.jpg");
+    write(&original);
+    let row = catalog.upsert_photo_with_identity(&original, None, 1, 12, Some(KNOWN)).unwrap();
+
+    let copy = root.join("b/x.jpg");
+    write(&copy);
+    let trusted = catalog.upsert_photo_with_identity(&copy, None, 1, 12, Some(KNOWN)).unwrap();
+    assert!(trusted.created && trusted.uuid != KNOWN, "a bundle's copy is not the row");
+    let other = root.join("c/x.jpg");
+    write(&other);
+    let scanned = catalog.upsert_scanned_photo(&other, None, 1, 12, Some(KNOWN)).unwrap();
+    assert!(scanned.created && scanned.uuid != KNOWN, "a scanned copy is not the row");
+    assert_eq!(catalog.get_photo(row.id).unwrap().path, "a/x.jpg");
+
+    std::fs::remove_file(&original).unwrap();
+    let moved = root.join("d/x.jpg");
+    write(&moved);
+    let rehomed = catalog.upsert_scanned_photo(&moved, None, 1, 12, Some(KNOWN)).unwrap();
+    assert_eq!((rehomed.id, rehomed.created), (row.id, false), "moved: re-homed");
+    assert_eq!(catalog.get_photo(row.id).unwrap().path, "d/x.jpg");
+
+    // On a volume indexed in place: the row's primary copy there is the one that matters.
+    const ON_NAS: &str = "0d9c8b7a-6f5e-4d3c-8b2a-190807060504";
+    let nas = root.parent().unwrap().join("nas");
+    std::fs::create_dir_all(&nas).unwrap();
+    catalog.add_volume("NAS", &nas, VolumeKind::Backup).unwrap();
+    write(&nas.join("x.jpg"));
+    let nas_row = catalog.upsert_photo_on_volume(&nas.join("x.jpg"), 1, 12, Some(ON_NAS)).unwrap();
+    write(&nas.join("y.jpg"));
+    let nas_copy = catalog.upsert_scanned_photo_on_volume(&nas.join("y.jpg"), 1, 12, Some(ON_NAS)).unwrap();
+    assert!(nas_copy.created && nas_copy.uuid != ON_NAS, "a second NAS file is not the row");
+    std::fs::remove_file(nas.join("x.jpg")).unwrap();
+    write(&nas.join("z.jpg"));
+    let nas_moved = catalog.upsert_scanned_photo_on_volume(&nas.join("z.jpg"), 1, 12, Some(ON_NAS)).unwrap();
+    assert_eq!((nas_moved.id, nas_moved.created), (nas_row.id, false));
+}
+
 /// Issue #141: a sidecar identifier that is not a UUID is another tool's (here a DAM asset
 /// id, in the XMP spec's Bag form, written by hand rather than by ChairPhoto). Two files
 /// carrying the same one must not share a row: before the fix the scan adopted it as the
@@ -1036,6 +1086,8 @@ fn a_trusted_non_uuid_identity_is_stored_as_its_legacy_mapping() {
     assert!(up.created);
     assert_eq!(up.uuid, chairphoto_core::catalog::legacy_photo_identity("dam:asset/5"));
     assert_eq!(catalog.get_photo(up.id).unwrap().uuid, up.uuid);
+    // Moved: a re-home never leaves a file still in place behind (#150).
+    std::fs::remove_file(&f).unwrap();
     let again = catalog
         .upsert_photo_with_identity(&root.join("b/x.jpg"), None, 1, 1, Some("dam:asset/5"))
         .unwrap();

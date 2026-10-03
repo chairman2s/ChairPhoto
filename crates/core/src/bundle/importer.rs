@@ -984,6 +984,51 @@ mod tests {
         assert_eq!(count, 1);
     }
 
+    // --- identity re-homes (#150) ------------------------------------------------------
+
+    /// #150 (review N2 of #146): a bundle carrying a photo this catalog already has, at
+    /// another relative path, must not pull the row off the original, which is still in
+    /// place. Before the fix the row was re-homed onto the bundle's copy and the next rescan
+    /// catalogued the original afresh, with none of its rating.
+    #[test]
+    fn a_bundle_copy_at_another_path_leaves_the_original_its_row() {
+        const KNOWN: &str = "6f1c1f0e-2b7a-4c3d-9e8f-0a1b2c3d4e5f";
+        let bundle_path = make_test_bundle("n2", KNOWN, "2021/02/02/DSC01234.ARW");
+        let (manifest, mut archive) = open_bundle(&bundle_path).expect("open_bundle");
+        let (catalog, root) = temp_catalog("n2");
+        let original = root.join("2020/01/01/DSC01234.ARW");
+        std::fs::create_dir_all(original.parent().unwrap()).unwrap();
+        std::fs::write(&original, b"FAKE RAW BYTES").unwrap();
+        let row = catalog.upsert_photo_with_identity(&original, None, 1, 14, Some(KNOWN)).unwrap();
+        catalog.set_culling(row.id, Some(5), None, None).unwrap();
+
+        let (extracted, partial) =
+            extract_originals(&manifest, &mut archive, &root, |_, _| {}).expect("extract");
+        index_bundle(&catalog, &manifest, &extracted, &root, partial).expect("index");
+
+        let kept = catalog.get_photo(row.id).unwrap();
+        assert_eq!((kept.path.as_str(), kept.rating, kept.uuid.as_str()),
+            ("2020/01/01/DSC01234.ARW", 5, KNOWN), "the original keeps its row");
+        let copy: (i64, String) = catalog
+            .conn()
+            .query_row(
+                "SELECT id, uuid FROM photos WHERE path = '2021/02/02/DSC01234.ARW'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_ne!(copy.1, KNOWN, "the bundle's copy has a row of its own");
+        let queued: String = catalog
+            .conn()
+            .query_row(
+                "SELECT error FROM pending_sidecar_identity WHERE photo_id = ?1 AND field = 'identifier'",
+                [copy.0],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(queued.contains(KNOWN), "its sidecar's identity is reported: {queued}");
+    }
+
     #[test]
     fn progress_called_for_each_photo() {
         let bundle_path =

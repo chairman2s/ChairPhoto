@@ -863,6 +863,18 @@ impl Catalog {
                 .optional()?,
             _ => None,
         };
+        // A row whose own file is still in place is not re-homed (#150): this file is
+        // another copy carrying its identity, so it gets a row and a minted UUID of its own,
+        // and the binding reports the identity in its sidecar as a conflict.
+        let held_in_place = match by_uuid {
+            Some(id) => {
+                let (volume_id, _) = self.volume_for_path(absolute_path)?;
+                self.primary_copy_left_in_place(id, volume_id, true)?
+            }
+            None => false,
+        };
+        let (by_uuid, sidecar_uuid) =
+            if held_in_place { (None, None) } else { (by_uuid, sidecar_uuid) };
 
         let result = if let Some((id, uuid, old_mtime, old_size)) = by_path {
             let unchanged = old_mtime == mtime_ns && old_size == size;
@@ -909,7 +921,10 @@ impl Catalog {
 
         // Record where the bytes physically are, so the resolver can find them.
         self.set_primary_location(result.id, absolute_path)?;
-        self.record_legacy_identifier(result.id, source.legacy_value())?;
+        // A copy kept apart from the row holding its identity does not take its legacy value.
+        if !held_in_place {
+            self.record_legacy_identifier(result.id, source.legacy_value())?;
+        }
         Ok(result)
     }
 
@@ -990,6 +1005,15 @@ impl Catalog {
                 .optional()?,
             _ => None,
         };
+        // As in `upsert_photo_from` (#150): a row whose primary copy on this volume is still
+        // in place is not moved off it. One whose primary copies are on other volumes gains
+        // this file as another location; that moves nothing.
+        let held_in_place = match &by_uuid {
+            Some((id, _)) => self.primary_copy_left_in_place(*id, volume_id, false)?,
+            None => false,
+        };
+        let (by_uuid, sidecar_uuid) =
+            if held_in_place { (None, None) } else { (by_uuid, sidecar_uuid) };
 
         let result = if let Some((id, uuid, old_mtime, old_size)) = by_loc {
             let unchanged = old_mtime == mtime_ns && old_size == size;
@@ -1026,7 +1050,9 @@ impl Catalog {
 
         // Record the file's location on its (NAS) volume so the resolver finds it there.
         self.add_location(result.id, volume_id, &rel, LocationRole::Primary)?;
-        self.record_legacy_identifier(result.id, source.legacy_value())?;
+        if !held_in_place {
+            self.record_legacy_identifier(result.id, source.legacy_value())?;
+        }
         Ok(result)
     }
 

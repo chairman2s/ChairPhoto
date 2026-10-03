@@ -148,8 +148,9 @@ pub fn decimal_to_dms_lng(deg: f64) -> String {
     format!("{d},{m_str}{hemi}")
 }
 
-/// Parse an XMP EXIF DMS+ref string (e.g. `"59,23.456N"` or `"10,45.678E"`) back to
-/// a signed decimal degree. Returns `None` on any parse error.
+/// Parse an XMP EXIF GPSCoordinate (`"59,23.456N"`, or the spec's other form, degrees,
+/// minutes and seconds: `"59,23,27.36N"`, #143 review T5) back to a signed decimal degree.
+/// Returns `None` on any parse error, including seconds next to fractional minutes.
 fn dms_to_decimal(s: &str) -> Option<f64> {
     let s = s.trim();
     let (hemi, body) = if let Some(rest) = s.strip_suffix(['N', 'S', 'E', 'W']) {
@@ -158,10 +159,13 @@ fn dms_to_decimal(s: &str) -> Option<f64> {
     } else {
         return None;
     };
-    let mut parts = body.splitn(2, ',');
-    let deg: f64 = parts.next()?.trim().parse().ok()?;
-    let min: f64 = parts.next().unwrap_or("0").trim().parse().ok()?;
-    let decimal = deg + min / 60.0;
+    let num = |p: &str| p.trim().parse::<f64>().ok();
+    let decimal = match body.split(',').collect::<Vec<_>>().as_slice() {
+        [d] => num(d)?,
+        [d, m] => num(d)? + num(m)? / 60.0,
+        [d, m, sec] if !m.contains('.') => num(d)? + num(m)? / 60.0 + num(sec)? / 3600.0,
+        _ => return None,
+    };
     let signed = match hemi {
         'S' | 'W' => -decimal,
         _ => decimal,
@@ -368,6 +372,34 @@ mod tests {
         assert!(has_attr(&xml, desc, ("http://darktable.sf.net/", "history_end"), "5"), "{xml}");
         let (lat, lng) = read_gps(&photo).unwrap();
         assert!((lat + 33.4489).abs() < 1e-6 && (lng + 70.6693).abs() < 1e-6, "{lat},{lng}");
+    }
+
+    // ── the DDD,MM,SSk form (#143 review, T5) ───────────────────────────────
+
+    /// XMP's GPSCoordinate has two forms, `DDD,MM.mmk` and `DDD,MM,SSk`. The second is read
+    /// too, in the attribute form and the element form alike.
+    #[test]
+    fn read_gps_reads_degrees_minutes_seconds_in_both_forms() {
+        use crate::xmp::test_xml::seeded_photo;
+        let attr = COMPACT_GPS
+            .replace(r#"ex:GPSLatitude="59,54.834000N""#, r#"ex:GPSLatitude="59,54,50.04N""#)
+            .replace(r#"ex:GPSLongitude="10,45.132000W""#, r#"ex:GPSLongitude="10,45,7.92W""#);
+        assert_ne!(attr, COMPACT_GPS);
+        let element = r#"<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+  <rdf:Description rdf:about="" xmlns:exif="http://ns.adobe.com/exif/1.0/">
+   <exif:GPSLatitude>59,54,50.04N</exif:GPSLatitude>
+   <exif:GPSLongitude>10,45,7.92W</exif:GPSLongitude>
+  </rdf:Description></rdf:RDF></x:xmpmeta>"#;
+        for (case, sidecar) in [("attribute", attr.as_str()), ("element", element)] {
+            let (_dir, photo) = seeded_photo(&format!("xmp-gps-dms-{case}"), sidecar);
+            let (lat, lng) = read_gps(&photo).unwrap_or_else(|| panic!("{case}: not read"));
+            assert!((lat - 59.9139).abs() < 1e-9, "{case}: lat {lat}");
+            assert!((lng + 10.7522).abs() < 1e-9, "{case}: lng {lng}");
+        }
+        // Still refused: a fourth part, or seconds next to fractional minutes.
+        assert_eq!(dms_to_decimal("59,54,50,1N"), None);
+        assert_eq!(dms_to_decimal("59,54.5,50N"), None);
+        assert_eq!(dms_to_decimal("59,54.834N"), Some(59.0 + 54.834 / 60.0));
     }
 
     // ── decimal_to_dms_lat / decimal_to_dms_lng minute rollover (issue #65) ────────────

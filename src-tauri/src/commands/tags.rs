@@ -58,10 +58,20 @@ pub fn delete_tag(state: State<'_, AppState>, tag_id: i64) -> Result<(), String>
 }
 
 /// Re-apply all auto-tags (e.g. monochrome) across the catalog. Useful to populate
-/// auto-tags for photos imported before the rule existed, without a rescan.
+/// auto-tags for photos imported before the rule existed, without a rescan. The rules this
+/// left off because a hand tag holds their path (#215); the frontend shows this as a
+/// notice. `Vec<BlockedAutoTagRule>` rides along on the same JSON response a caller that
+/// still expects `void` already ignores.
 #[tauri::command(async)]
-pub fn apply_auto_tags(state: State<'_, AppState>) -> Result<(), String> {
+pub fn apply_auto_tags(state: State<'_, AppState>) -> Result<Vec<BlockedAutoTagRule>, String> {
     with_catalog(&state, |c| c.apply_auto_tags())
+}
+
+/// The rules currently blocked (#215), without applying anything — for a settings panel
+/// that wants today's state, not just the result of the last `apply_auto_tags`.
+#[tauri::command(async)]
+pub fn blocked_auto_tag_rules(state: State<'_, AppState>) -> Result<Vec<BlockedAutoTagRule>, String> {
+    with_catalog(&state, |c| c.blocked_auto_tag_rules())
 }
 
 // --- tag groups (fast tagging) -------------------------------------------

@@ -1202,8 +1202,6 @@ impl ShellState {
         self.refresh_rows(cx);
     }
 
-    /// The newest burst run's job id and the catalog generation, as [`Self::finish_burst`]
-    /// compares them — for tests that deliver a superseded run's late result.
     /// A re-read from `from` landed and the window has not drawn it yet — no notify, which
     /// in a test window would draw at once — for tests that click the frame on screen.
     #[cfg(test)]
@@ -1211,6 +1209,8 @@ impl ShellState {
         self.rows_from = Some(from);
     }
 
+    /// The newest burst run's job id and the catalog generation, as [`Self::finish_burst`]
+    /// compares them — for tests that deliver a superseded run's late result.
     #[cfg(test)]
     pub(crate) fn burst_owner(&self) -> (u64, u64) {
         (self.burst_job, self.catalog_generation)

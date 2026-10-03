@@ -260,6 +260,7 @@ pub fn run() {
             commands::move_tag,
             commands::suggest_tags_by_time,
             commands::apply_auto_tags,
+            commands::blocked_auto_tag_rules,
             commands::list_tag_groups,
             commands::create_tag_group,
             commands::rename_tag_group,

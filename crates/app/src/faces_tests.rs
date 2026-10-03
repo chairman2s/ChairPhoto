@@ -124,7 +124,11 @@ fn send_match_done(app: &App, job: u64, cx: &mut TestAppContext) {
 }
 
 fn send_progress(app: &App, job: u64, done: usize, total: usize, cx: &mut TestAppContext) {
-    app.state.send(CoreEvent::FacesProgress(FacesProgressEvent { done, total, job }));
+    send_progress_staged(app, job, done, total, core_faces::STAGE_INDEXING, cx);
+}
+
+fn send_progress_staged(app: &App, job: u64, done: usize, total: usize, stage: &'static str, cx: &mut TestAppContext) {
+    app.state.send(CoreEvent::FacesProgress(FacesProgressEvent { done, total, job, stage }));
     cx.run_until_parked();
 }
 
@@ -407,13 +411,24 @@ fn the_index_follows_only_its_own_events(cx: &mut TestAppContext) {
     assert_eq!(f.phase(cx), IndexPhase::Starting);
     work(&f.app, cx);
     let job = f.fake.starts.lock().unwrap()[0].clone().unwrap();
-    assert_eq!(f.phase(cx), IndexPhase::Running { job, done: 0, total: 0, progress: false });
+    assert_eq!(f.phase(cx), IndexPhase::Running { job, done: 0, total: 0, progress: false, stage: core_faces::STAGE_INDEXING });
 
     send_progress(&f.app, job + 100, 5, 9, cx);
-    assert_eq!(f.phase(cx), IndexPhase::Running { job, done: 0, total: 0, progress: false }, "another run's straggler");
+    assert_eq!(
+        f.phase(cx),
+        IndexPhase::Running { job, done: 0, total: 0, progress: false, stage: core_faces::STAGE_INDEXING },
+        "another run's straggler"
+    );
     send_progress(&f.app, job, 2, 4, cx);
-    assert_eq!(f.phase(cx), IndexPhase::Running { job, done: 2, total: 4, progress: true });
+    assert_eq!(f.phase(cx), IndexPhase::Running { job, done: 2, total: 4, progress: true, stage: core_faces::STAGE_INDEXING });
     send_done(&f.app, job + 100, 9, 9, cx);
+    // #192: the conversion pass's progress carries its own stage, and the status line (the
+    // pure part: `logic::index_progress_line`) is keyed on it, not on `done`/`total` alone —
+    // the restart from 2/4 to 0/2 below is a new phase, not indexing going backwards.
+    send_progress_staged(&f.app, job, 0, 2, core_faces::STAGE_CONVERTING, cx);
+    assert_eq!(f.phase(cx), IndexPhase::Running { job, done: 0, total: 2, progress: true, stage: core_faces::STAGE_CONVERTING });
+    send_progress(&f.app, job, 1, 1, cx);
+    assert_eq!(f.phase(cx), IndexPhase::Running { job, done: 1, total: 1, progress: true, stage: core_faces::STAGE_INDEXING });
     assert!(f.phase(cx) != IndexPhase::Idle, "another run's end does not end ours");
 
     f.fake.finish(&f.app, job, 4, 4, cx);
@@ -502,11 +517,15 @@ fn a_switch_drops_the_old_run_and_adopts_the_new_catalogs(cx: &mut TestAppContex
     work(&f.app, cx);
     assert_eq!(
         f.phase(cx),
-        IndexPhase::Running { job: theirs.job, done: 0, total: 0, progress: true },
+        IndexPhase::Running { job: theirs.job, done: 0, total: 0, progress: true, stage: core_faces::STAGE_INDEXING },
         "the new catalog's run is followed"
     );
     send_done(&f.app, old, 7, 7, cx);
-    assert_eq!(f.phase(cx), IndexPhase::Running { job: theirs.job, done: 0, total: 0, progress: true }, "the old end is ignored");
+    assert_eq!(
+        f.phase(cx),
+        IndexPhase::Running { job: theirs.job, done: 0, total: 0, progress: true, stage: core_faces::STAGE_INDEXING },
+        "the old end is ignored"
+    );
 }
 
 /// A run whose end was already heard is never adopted from a status slot read afterwards,

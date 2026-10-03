@@ -643,6 +643,12 @@ fn open_match(
         }
         if let Some((tag_id, sim)) = best {
             resolved.insert(f.id);
+            // A test can land a reject here — after this face's `is_rejected` read already
+            // found nothing, before `write_suggestion` — to prove the write's own fresh
+            // `NOT_REJECTED` check is what stops it (#217's test gap: the #137/#208 tests
+            // force their reject before this read, so that check alone already catches it).
+            #[cfg(test)]
+            tests::before_suggestion_write(conn, f.id);
             if write_suggestion(conn, f.id, tag_id, sim, now)? {
                 suggested += 1;
             }
@@ -1063,6 +1069,12 @@ pub fn still_suggested(conn: &Connection, face_id: i64, tag_id: i64) -> rusqlite
 /// `tag_id`. A review list read before a re-run of matching (which may now suggest someone
 /// else) can therefore never confirm a person the user did not see. Returns the photo when it
 /// confirmed, `None` when the suggestion had changed.
+///
+/// The `UPDATE` re-checks the same `state`/`person_tag_id` the read just confirmed and looks at
+/// its own affected-row count (#217), rather than writing unconditionally by id: a match worker
+/// on another connection that reassigns, resets or rejects the face between this function's read
+/// and its write (WAL — see the module doc) is then a `None` (stale), the same answer as a read
+/// that already saw the change, never a lost update that resurrects a decision the race made.
 pub fn accept_suggestion(conn: &Connection, face_id: i64, tag_id: i64) -> rusqlite::Result<Option<i64>> {
     let photo: Option<i64> = conn
         .query_row(
@@ -1071,13 +1083,20 @@ pub fn accept_suggestion(conn: &Connection, face_id: i64, tag_id: i64) -> rusqli
             |r| r.get(0),
         )
         .optional()?;
-    if photo.is_some() {
-        conn.execute(
-            "UPDATE faces__faces SET state = ?2, match_confidence = 1.0, cluster_id = NULL WHERE id = ?1",
-            rusqlite::params![face_id, STATE_CONFIRMED],
-        )?;
+    let Some(photo) = photo else {
+        return Ok(None);
+    };
+    #[cfg(test)]
+    tests::before_accept_update(conn);
+    let changed = conn.execute(
+        "UPDATE faces__faces SET state = ?2, match_confidence = 1.0, cluster_id = NULL
+          WHERE id = ?1 AND state = ?3 AND person_tag_id = ?4",
+        rusqlite::params![face_id, STATE_CONFIRMED, STATE_SUGGESTED, tag_id],
+    )?;
+    if changed == 0 {
+        return Ok(None);
     }
-    Ok(photo)
+    Ok(Some(photo))
 }
 
 /// Reject a suggestion as it was shown (see [`accept_suggestion`]), by [`reject_shown`].
@@ -1320,11 +1339,47 @@ pub fn hungarian_min_cost(cost: &[Vec<f32>]) -> Vec<usize> {
 // ── Tests ───────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::plugins::faces::store;
 
     // ── Test scaffolding ────────────────────────────────────────────────────────
+
+    /// A hook [`accept_suggestion`] runs once, right after its read confirms the face is still
+    /// suggested as the person shown and before its conditional `UPDATE` — the window #217
+    /// names. The hook gets the connection (really: the open transaction) `accept_suggestion`
+    /// is using, so a test can land a conflicting write there — standing in for another
+    /// connection's reject, reassignment or reset, which `IMMEDIATE` (see `accept_shown`'s doc
+    /// comment) keeps out of this window in production — and prove the `UPDATE`'s own
+    /// re-check reports it stale rather than losing the race silently.
+    pub(crate) static BEFORE_ACCEPT_UPDATE: std::sync::Mutex<Option<Box<dyn FnOnce(&Connection) + Send>>> =
+        std::sync::Mutex::new(None);
+
+    pub(super) fn before_accept_update(conn: &Connection) {
+        let hook = BEFORE_ACCEPT_UPDATE.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if let Some(hook) = hook {
+            hook(conn);
+        }
+    }
+
+    /// A hook [`open_match`] runs once for a given face, right after its `is_rejected` read
+    /// has already found the pair not rejected and before it calls `write_suggestion` — the
+    /// window #217's test gap names (the run's own rejection read, then its write). The hook
+    /// gets the connection `open_match` is using, so it can land a reject there and a test can
+    /// prove `write_suggestion`'s own fresh `NOT_REJECTED` check — not just this read — is what
+    /// stops a stale write.
+    pub(crate) static BEFORE_SUGGESTION_WRITE: std::sync::Mutex<Option<(i64, Box<dyn FnOnce(&Connection) + Send>)>> =
+        std::sync::Mutex::new(None);
+
+    pub(super) fn before_suggestion_write(conn: &Connection, face_id: i64) {
+        let hook = {
+            let mut slot = BEFORE_SUGGESTION_WRITE.lock().unwrap_or_else(|e| e.into_inner());
+            if slot.as_ref().is_some_and(|(id, _)| *id == face_id) { slot.take() } else { None }
+        };
+        if let Some((_, hook)) = hook {
+            hook(conn);
+        }
+    }
 
     fn mem_conn() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
@@ -1729,6 +1784,70 @@ mod tests {
         assert_eq!(face_state(&conn, f).0, STATE_UNASSIGNED);
         assert!(!write_seed(&conn, f, alice).unwrap(), "nor seeded");
         assert_eq!(face_state(&conn, f).0, STATE_UNASSIGNED);
+    }
+
+    /// #217: `accept_suggestion`'s own defense, independent of any caller's transaction. Its
+    /// read finds the face still suggested as Alice; before its `UPDATE` runs, something else
+    /// (here, directly on the same connection — standing in for another connection that has
+    /// already committed) rejects the face. The `UPDATE`'s own re-check — not the earlier read
+    /// — is what decides: the race lands first, so `accept_suggestion` reports `None` rather
+    /// than overwriting the reject with a confirmation the user never actually saw land.
+    #[test]
+    fn accept_suggestion_does_not_overwrite_a_change_landing_before_its_update() {
+        let conn = mem_conn();
+        let alice = add_person(&conn, 100, "Alice");
+        add_photo(&conn, 1);
+        let f = add_face(&conn, 1, &embed(0, 0.0));
+        set_suggested(&conn, f, alice);
+
+        *BEFORE_ACCEPT_UPDATE.lock().unwrap() = Some(Box::new(move |conn: &Connection| {
+            assert!(reject_shown(conn, f, Some(alice), 0).unwrap(), "the reject applies");
+        }));
+
+        assert_eq!(accept_suggestion(&conn, f, alice).unwrap(), None, "the race landed first; not overwritten");
+        assert!(BEFORE_ACCEPT_UPDATE.lock().unwrap().is_none(), "the hook ran");
+        assert_eq!(face_state(&conn, f).0, STATE_UNASSIGNED, "the reject stands");
+    }
+
+    /// #217 test gap: `a_rejection_landing_before_the_write_stops_it` (and the #137/#208
+    /// integration tests) force their reject before the run even reads its rejections, so
+    /// `write_suggestion`'s own `NOT_REJECTED` guard is never the thing that actually stops
+    /// the write — the run's own `is_rejected` pre-check already does. Here the reject lands
+    /// in `open_match` itself, after its `is_rejected` read for this face already found
+    /// nothing, but before its `write_suggestion` call: the pair must still not be suggested.
+    #[test]
+    fn a_reject_landing_between_open_matchs_read_and_write_still_stops_it() {
+        let conn = mem_conn();
+        let alice = add_person(&conn, 100, "Alice");
+        add_photo(&conn, 1);
+        tag_photo(&conn, 1, alice);
+        add_face(&conn, 1, &embed(0, 0.0)); // Alice's confirmed seed/centroid
+
+        add_photo(&conn, 2);
+        let f = add_face(&conn, 2, &embed(0, 0.05)); // would open-match Alice
+
+        *BEFORE_SUGGESTION_WRITE.lock().unwrap() = Some((
+            f,
+            Box::new(move |conn: &Connection| {
+                conn.execute(
+                    "INSERT INTO faces__rejections (face_id, person_tag_id, rejected_at) VALUES (?1, ?2, 0)",
+                    rusqlite::params![f, alice],
+                )
+                .unwrap();
+            }),
+        ));
+
+        let out = run_matching(&conn, &MatchSettings::default(), 1000).unwrap();
+
+        assert!(BEFORE_SUGGESTION_WRITE.lock().unwrap().is_none(), "the hook ran");
+        assert_eq!(out.open, 0, "the pair rejected mid-run is not suggested");
+        // open_match already marks a face `resolved` (so clustering skips it) once it has a
+        // best candidate, before the write is attempted — a face the race stops from being
+        // suggested is therefore left unassigned this run, not clustered, rather than
+        // retried; it is picked up again (seeded, matched or clustered) on the next run.
+        assert_eq!(face_state(&conn, f).0, "unassigned", "not suggested as Alice, and not lost to it");
+        assert_eq!(face_state(&conn, f).1, None, "no person assigned");
+        assert_eq!(out.clustered, 0, "resolved before the write was attempted, so not offered to clustering either");
     }
 
     /// `reject_shown` remembers the person shown on a face a run has reset (#208), and leaves

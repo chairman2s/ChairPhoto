@@ -139,12 +139,18 @@ impl EventSink for AppState {
 pub use crate::develop::session::DevelopStatus;
 
 /// Snapshot of the running face-indexing job (`faces_index_status`).
+///
+/// `stage` ([`crate::app::faces::STAGE_CONVERTING`] or `STAGE_INDEXING`, #192) tells apart the
+/// one-time legacy-region conversion pass that runs before indexing proper: both report
+/// through this same slot and `faces:progress`, and without it the conversion's own count
+/// looks like indexing restarting from 0.
 #[cfg(feature = "faces")]
 #[derive(Debug, Clone, Copy, serde::Serialize)]
 pub struct FacesJobStatus {
     pub job: u64,
     pub done: usize,
     pub total: usize,
+    pub stage: &'static str,
 }
 
 #[cfg(feature = "faces")]

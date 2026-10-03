@@ -304,10 +304,15 @@ pub struct ReviewOutcome {
 /// is still suggested as the person shown ([`matcher::accept_suggestion`]). A confirmation
 /// tags the photo with the person. One transaction; the confirmed photos' regions are
 /// re-exported after it commits.
+///
+/// `IMMEDIATE`, not deferred (#217, see `accept_shown`'s doc comment): the batch reads several
+/// rows (`still_suggested`, `accept_suggestion`'s own read) before its first write, so a
+/// deferred transaction here is exactly the shape that can surface `SQLITE_BUSY_SNAPSHOT`
+/// instead of counting the race as stale.
 pub fn review_suggestions(c: &Catalog, reviews: &[Review]) -> CatalogResult<ReviewOutcome> {
     ensure_schema(c.conn())?;
     let now = now_secs();
-    let tx = c.conn().unchecked_transaction()?;
+    let tx = rusqlite::Transaction::new_unchecked(c.conn(), rusqlite::TransactionBehavior::Immediate)?;
     let mut out = ReviewOutcome::default();
     let mut photos: Vec<i64> = Vec::new();
     for r in reviews {

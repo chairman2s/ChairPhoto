@@ -228,12 +228,15 @@ pub fn merge_tags(
         if let Some(rule) = &source.auto_rule {
             // What `autotags.rs` does once the source is gone: no tag carries the key, so the
             // next pass that finds a match makes the rule's tag at its default path (or takes
-            // over an ordinary tag there that holds only matches) and fills it.
+            // over an ordinary tag there that holds only matches) and fills it — unless a hand
+            // tag already holds that path with photos the rule would not tag, which leaves the
+            // rule off and shows as a blocked-rule notice instead (#215).
             report.warnings.push(format!(
                 "'{}' is an auto-tag (rule '{rule}'). Its photos move to the merged tag, but the \
-                 rule keeps running: unless another tag carries it, the next pass that finds a \
-                 matching photo brings the rule's tag back at its default path, holding every \
-                 matching photo.",
+                 rule keeps running: unless another tag carries it, or a hand tag already holds \
+                 its default path with photos it would not tag — shown as a blocked-rule notice, \
+                 naming what to rename or merge — the next pass that finds a matching photo \
+                 brings the rule's tag back at its default path, holding every matching photo.",
                 source.full_path
             ));
         }

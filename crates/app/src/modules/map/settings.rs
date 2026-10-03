@@ -63,6 +63,7 @@ impl Render for MapSettings {
         let template = s.source.template().to_string();
         let known = s.settings_known();
         let hosts: Vec<(String, bool)> = s.host_consent().hosts().map(|(h, a)| (h.to_string(), a)).collect();
+        let consent_write_error = s.consent_write_error().map(str::to_string);
         let geocode = s.geocode.clone();
         if known && self.shown.as_deref() != Some(template.as_str()) {
             self.shown = Some(template.clone());
@@ -103,6 +104,16 @@ impl Render for MapSettings {
             ))
             .child(ui::label("Tile servers", colors))
             .child(ui::sub("Answers are remembered on this computer, for every catalog.", colors));
+        if let Some(e) = consent_write_error {
+            body = body.child(ui::error(
+                "map-consent-write-error",
+                format!(
+                    "This machine's tile-server preferences could not be saved ({e}). Answers above apply only \
+                     for this session and will be asked again after a restart."
+                ),
+                colors,
+            ));
+        }
         if hosts.is_empty() {
             body = body.child(ui::sub("No tile server has been allowed or blocked yet.", colors));
         }

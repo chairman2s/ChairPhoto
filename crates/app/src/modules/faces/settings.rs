@@ -10,7 +10,7 @@
 //! last run's result and its error — and, like React's shared job phase, neither job can be
 //! started while the other runs.
 
-use super::logic::{match_progress_line, progress_line, root_suggestions, step_highlight};
+use super::logic::{index_progress_line, match_progress_line, root_suggestions, step_highlight};
 use super::state::{FacesState, IndexPhase, MatchPhase, DEFAULT_THRESHOLD};
 use crate::shell::style::Colors;
 use crate::storage::ui;
@@ -233,7 +233,7 @@ impl FacesSettings {
         let progress = match run.phase {
             IndexPhase::Idle => None,
             IndexPhase::Starting | IndexPhase::Running { progress: false, .. } => Some(("Starting…".to_string(), None)),
-            IndexPhase::Running { done, total, progress: true, .. } => Some(progress_line(done, total)),
+            IndexPhase::Running { done, total, progress: true, stage, .. } => Some(index_progress_line(stage, done, total)),
         };
         div()
             .flex()

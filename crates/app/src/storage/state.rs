@@ -9,10 +9,13 @@
 //! and identity generations are tripped by a newer start, by Cancel and by the switch itself,
 //! so the old worker stops at its next file, op or copy rather than running on.
 //!
-//! **Cache warm-up.** A rescan's result starts `app::cache` (App.tsx `onScan` →
-//! `cacheImages(cachePreviews)`): thumbnails always, previews too while Import ▾ → "Cache
-//! previews on import" is on. It is claimed on the UI thread (`cache::claim_cache`, one abort
-//! lock), so a newer rescan's warm-up or a catalog switch trips it in the core; its
+//! **Cache warm-up.** A rescan's result starts `app::cache` (`cacheImages(cachePreviews)`,
+//! deliberately not matching App.tsx's `onScan` here, #195) **only while** Import ▾ → "Cache
+//! previews on import" is on — when it is off the warm-up is skipped entirely, not run for
+//! thumbnails alone, so B&W flags and the monochrome auto-tag (which the warm-up's own
+//! `invalidate` would otherwise refresh) then catch up only once a preview is next generated
+//! for a photo. When it does run, it is claimed on the UI thread (`cache::claim_cache`, one
+//! abort lock), so a newer rescan's warm-up or a catalog switch trips it in the core; its
 //! `cache:progress` events move the status line on the bench only while their job id is the
 //! one followed, and only its own result ends it ("Cache ready", or "Cache failed: …").
 //!
@@ -359,7 +362,11 @@ impl StorageState {
             Err(e) => self.status(format!("Scan failed: {e}"), cx),
         }
         self.invalidate(cx);
-        if scanned {
+        // Owner decision (#195): with "Cache previews on import" off, skip the warm-up
+        // entirely rather than running it for thumbnails alone. Consequence: B&W flags and
+        // the monochrome auto-tag (`finish_cache`'s invalidate) then refresh only when a
+        // preview is next generated for a photo, not right after a rescan.
+        if scanned && self.shell.read(cx).cache_previews {
             self.start_cache(cx);
         }
     }

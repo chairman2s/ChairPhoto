@@ -1243,6 +1243,71 @@ fn a_duel_fork_before_the_version_resolves_waits_for_it(cx: &mut TestAppContext)
     assert!(error.contains("was not done"), "{error}");
 }
 
+// --- the duel's layout (#178) -------------------------------------------------------------
+
+/// The duel draws each variant whole inside its pane (`darkroom.css`: the image `flex: 1;
+/// min-height: 0; object-fit: contain`) with "This one" and ⑂ below it, never over it: on a
+/// photo stored landscape with a rotating EXIF orientation (its renders come upright, so
+/// portrait), then landscape and tall portrait variants as later rounds render them.
+#[gpui_kit::test]
+fn the_duel_fits_each_variant_above_its_buttons(cx: &mut TestAppContext) {
+    use super::view::Overlay;
+    use crate::loupe::duel::DUEL_EDGE;
+    use crate::loupe::fit_tests::{assert_fitted, drawn, store_rotated, LANDSCAPE, PORTRAIT};
+    let rig = rig_with("dk-duel-fit", 1, |rig, _| store_rotated(&rig.app, rig.ids[0]), cx);
+    rig.with_view(cx, |v, window, cx| v.open_duel(window, cx));
+    let duel = rig.view(cx).read_with(cx, |v, _| match v.overlay() {
+        Some(Overlay::Duel(d)) => d.clone(),
+        _ => panic!("the duel is mounted"),
+    });
+    for (round, image) in [(1, PORTRAIT), (2, LANDSCAPE), (3, (100, 400))] {
+        assert_eq!(duel.read_with(cx, |d, _| d.round()), round);
+        for job in rig.edit_jobs().into_iter().filter(|j| j.max_edge == DUEL_EDGE) {
+            rig.pool.finish(&JobKey::Edit(job), Ok(pixels(image.0, image.1)));
+        }
+        cx.run_until_parked();
+        rig.render(cx);
+        cx.update_window(rig.app.window(), |_, window, _| {
+            let viewport = window.viewport_size();
+            for i in 0..2u64 {
+                let what = format!("round {round}, pane {i}");
+                let boxed = window.find(("duel-image-box", i)).bounds();
+                let picture = drawn(window.find(("duel-image", i)).bounds(), image);
+                assert_fitted(&what, picture, boxed, image);
+                let bar = window.find(("duel-pane-bar", i)).bounds();
+                let pick = window.find(format!("duel-pick-{i}")).bounds();
+                assert!(bar.origin.y >= boxed.bottom(), "{what}: the buttons start below the image ({bar:?} under {boxed:?})");
+                assert!(bar.contains(&pick.center()), "{what}: \"This one\" is in the bar under the image");
+                assert!(bar.bottom() <= viewport.height, "{what}: the buttons are on screen ({bar:?} in {viewport:?})");
+            }
+        })
+        .unwrap();
+        rig.press("down", cx); // "same": the next round's variants
+    }
+}
+
+/// The proof sheet's cells share the duel's picture helper: a portrait proof's picture element
+/// is laid out as its 3:2 cell, not taller (it paints with `cover` there, as React's
+/// `.dk-proof-cell img` does — the fit mode itself is not observable here).
+#[gpui_kit::test]
+fn a_proof_cells_picture_is_laid_out_as_its_cell(cx: &mut TestAppContext) {
+    use crate::loupe::fit_tests::PORTRAIT;
+    use crate::loupe::proof_sheet::PROOF_EDGE;
+    let rig = rig("dk-proof-fit", 1, cx);
+    rig.with_view(cx, |v, window, cx| v.open_proof_sheet(window, cx));
+    for job in rig.edit_jobs().into_iter().filter(|j| j.max_edge == PROOF_EDGE) {
+        rig.pool.finish(&JobKey::Edit(job), Ok(pixels(PORTRAIT.0, PORTRAIT.1)));
+    }
+    cx.run_until_parked();
+    rig.render(cx);
+    cx.update_window(rig.app.window(), |_, window, _| {
+        let cell = window.find(("proof-image", 0u64)).bounds();
+        assert_eq!(cell.size.height, gpui_kit::px(160.), "the picture is its cell's height: {cell:?}");
+        assert!(cell.size.width > cell.size.height, "and its width, a 3:2 cell: {cell:?}");
+    })
+    .unwrap();
+}
+
 /// **Catalog identity.** The core switches to a catalog with colliding ids, the event
 /// withheld: a version operation (the cover), a history step and a preset save fail closed
 /// and touch nothing in the new catalog.

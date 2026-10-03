@@ -43,6 +43,8 @@ pub mod zoom;
 #[cfg(test)]
 mod card_tests;
 #[cfg(test)]
+pub(crate) mod fit_tests;
+#[cfg(test)]
 mod popout_tests;
 #[cfg(test)]
 mod tests;

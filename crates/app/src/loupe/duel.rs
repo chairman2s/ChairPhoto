@@ -15,6 +15,7 @@
 use crate::image_store::ImageStore;
 use crate::keymap::contexts;
 use crate::loupe::edit_renders::{EditRenders, RenderState};
+use crate::loupe::zoom::fitted;
 use crate::loupe::*;
 use crate::shell::style::Colors;
 use chairphoto_core::image_pool::EditJob;
@@ -24,7 +25,7 @@ use chairphoto_model::darkroom::spreads::{duel_pair, DuelDim, DUEL_DIMS};
 use chairphoto_model::editing::VersionEdit;
 use gpui_kit::prelude::*;
 use gpui_kit::{
-    div, img, px, AnyElement, Context, Entity, EventEmitter, FocusHandle, ObjectFit, SharedString, Subscription,
+    div, px, AnyElement, Context, ElementId, Entity, EventEmitter, FocusHandle, ObjectFit, SharedString, Subscription,
     TestSupportExt as _, Window,
 };
 use std::rc::Rc;
@@ -72,10 +73,18 @@ pub fn variant_placeholder(state: &RenderState, loading: &'static str) -> Option
     }
 }
 
-/// A variant cell's picture: the render, or its placeholder ([`variant_placeholder`]).
-pub fn variant_image(state: RenderState, loading: &'static str, colors: Colors) -> AnyElement {
+/// A variant cell's picture, `id` once drawn: the render fitted to the cell with `fit`
+/// ([`fitted`]; React: the duel `contain`, proof cells and preset cards `cover`), or its
+/// placeholder ([`variant_placeholder`]).
+pub fn variant_image(
+    id: impl Into<ElementId>,
+    state: RenderState,
+    fit: ObjectFit,
+    loading: &'static str,
+    colors: Colors,
+) -> AnyElement {
     match (variant_placeholder(&state, loading), state) {
-        (_, RenderState::Ready(image)) => img(image).size_full().object_fit(ObjectFit::Contain).into_any_element(),
+        (_, RenderState::Ready(image)) => fitted(id, image, fit).into_any_element(),
         (text, _) => div()
             .size_full()
             .flex()
@@ -277,20 +286,32 @@ impl Render for DuelView {
             .child(div().text_size(px(11.)).text_color(colors.mute).child("↓ same · Esc done"));
         let renders = self.renders.read(cx);
         let states: Vec<RenderState> = pair.iter().map(|r| renders.get(&self.source.job(r, DUEL_EDGE))).collect();
-        let panes = div().flex().flex_row().gap(px(8.)).flex_1().min_h_0().p(px(8.)).children(
+        // `darkroom.css` `.dk-duel-panes` / `.dk-duel-pane`: each pane a column, the variant
+        // taking what the buttons leave (fitted inside it, never under them), the buttons below.
+        let panes = div().flex().flex_row().gap(px(10.)).flex_1().min_h_0().p(px(14.)).children(
             states.into_iter().enumerate().map(|(i, state)| {
                 let pick_label = if i == 0 { "← This one" } else { "This one →" };
                 div()
                     .id(("duel-pane", i as u64))
                     .flex()
                     .flex_col()
+                    .gap(px(10.))
                     .flex_1()
                     .min_w_0()
                     .cursor_pointer()
                     .on_click(cx.listener(move |this, _, _, cx| this.pick(i, cx)))
-                    .child(div().flex_1().min_h_0().bg(colors.well).child(variant_image(state, "Rendering…", colors)))
                     .child(
                         div()
+                            .id(("duel-image-box", i as u64))
+                            .flex_1()
+                            .min_h_0()
+                            .bg(colors.well)
+                            .child(variant_image(("duel-image", i as u64), state, ObjectFit::Contain, "Rendering…", colors))
+                            .test_support(),
+                    )
+                    .child(
+                        div()
+                            .id(("duel-pane-bar", i as u64))
                             .flex()
                             .flex_none()
                             .h(px(36.))
@@ -318,7 +339,8 @@ impl Render for DuelView {
                                         this.fork(i, cx)
                                     }))
                                     .test_support(),
-                            ),
+                            )
+                            .test_support(),
                     )
                     .test_support()
             }),

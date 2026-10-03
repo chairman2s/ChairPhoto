@@ -20,6 +20,7 @@ use crate::image_store::{ImageState, ImageStore};
 use crate::keymap::contexts;
 use crate::library::*;
 use crate::loupe::view::file_name;
+use crate::loupe::zoom::fitted;
 use crate::loupe::*;
 use crate::shell::state::{Mark, ShellState};
 use crate::shell::style::{Colors, COLOR_LABELS};
@@ -29,7 +30,7 @@ use chairphoto_core::catalog::{Photo, PickState};
 use chairphoto_core::image_pool::ImageKind;
 use gpui_kit::prelude::*;
 use gpui_kit::{
-    div, img, px, relative, Context, Entity, EventEmitter, FocusHandle, ObjectFit, Subscription, Task,
+    div, px, relative, Context, Entity, EventEmitter, FocusHandle, ObjectFit, Subscription, Task,
     TestSupportExt as _, Window,
 };
 use std::collections::{HashMap, HashSet};
@@ -522,7 +523,7 @@ impl Render for CullView {
             },
         });
         let stage = match image {
-            Ok(Some(image)) => img(image).size_full().object_fit(ObjectFit::Contain).into_any_element(),
+            Ok(Some(image)) => fitted("cull-image", image, ObjectFit::Contain).into_any_element(),
             Ok(None) => div().into_any_element(),
             Err(()) => div()
                 .size_full()
@@ -633,7 +634,7 @@ impl Render for CullView {
                 )
                 .test_support()
         });
-        root.child(div().absolute().top_0().left_0().size_full().p(px(48.)).child(stage))
+        root.child(div().id("cull-stage").absolute().top_0().left_0().size_full().p(px(48.)).child(stage).test_support())
             .child(top)
             .child(bottom)
             .children(help)

@@ -21,8 +21,8 @@ use chairphoto_core::image_pool::EditJob;
 use chairphoto_model::darkroom::spreads::{ProofCandidate, ProofGroup};
 use gpui_kit::prelude::*;
 use gpui_kit::{
-    div, px, ClickEvent, Context, Entity, EventEmitter, FocusHandle, SharedString, Subscription, TestSupportExt as _,
-    Window,
+    div, px, ClickEvent, Context, Entity, EventEmitter, FocusHandle, ObjectFit, SharedString, Subscription,
+    TestSupportExt as _, Window,
 };
 
 /// A proof's long edge (React rendered 320 px cells).
@@ -162,7 +162,7 @@ impl Render for ProofSheet {
                     .overflow_hidden()
                     .cursor_pointer()
                     .on_click(cx.listener(move |this, _, _, cx| this.adopt(i, cx)))
-                    .child(div().h(px(160.)).bg(colors.well).child(variant_image(state, "…", colors)))
+                    .child(div().h(px(160.)).bg(colors.well).child(variant_image(("proof-image", i as u64), state, ObjectFit::Cover, "…", colors)))
                     .child(
                         div()
                             .flex()

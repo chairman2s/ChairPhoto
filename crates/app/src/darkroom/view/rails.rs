@@ -850,7 +850,13 @@ impl DarkroomView {
                         .border_2()
                         .border_color(if active { colors.accent } else { colors.border })
                         .cursor_pointer()
-                        .child(div().h(px(PRESET_CARD * 0.66)).bg(colors.well).child(variant_image(state, "…", colors)))
+                        .child(div().h(px(PRESET_CARD * 0.66)).bg(colors.well).child(variant_image(
+                            SharedString::from(format!("dk-preset-image-{}", p.id)),
+                            state,
+                            ObjectFit::Cover,
+                            "…",
+                            colors,
+                        )))
                         .child(label)
                         .tooltip(move |window, cx| gpui_kit::component::tooltip::Tooltip::new(tip.clone()).build(window, cx))
                         .on_click(cx.listener(move |this, _, _, cx| {

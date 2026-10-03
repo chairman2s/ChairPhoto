@@ -438,8 +438,8 @@ The table "Components that fit no existing ticket" above is settled:
 **Since the audit.** [#158][t158] built the grid context menu and the loupe's
 unavailable-state actions: `CatalogGrid.tsx` and `ZoomableImage.tsx` are now built, awaiting
 the visual check (the counts above are the audit's), and App.tsx no longer misses those two
-items. The `not_yet_ported!` list is empty, and its guard test accepts only tickets in
-`shell::actions::OPEN_TICKETS`.
+items. The `not_yet_ported!` list is empty. A stub may cite only a ticket named in a row's
+"Missing:" here (`shell::actions::stub_tickets`, checked by its tests).
 
 ### Behaviour gaps noticed
 

@@ -204,6 +204,13 @@ Design consequence — keep these on the *right* axis:
     `monochrome` (`Treatment/Black & White`), `long-exposure` (`Technique/Long Exposure`,
     shutter ≥ 1 s; `#longexposure …`), `panorama` (`Technique/Panorama`, long side ≥ 2× short
     side; `#panorama #pano`). Add a rule by appending one entry to `auto_tag_rules()`.
+  - **A rule's identity is its key, not its path.** The engine maintains the tag carrying the
+    rule's key in `tags.auto_rule`, wherever it sits: rename or move it (directly, or by
+    renaming, moving or merging an ancestor) and it stays the rule's tag, with no second tag
+    made at the canonical path. The path is used only when no tag carries the key — a tag
+    made by hand at that path before the rule existed becomes the rule's tag, and one merged
+    away is re-created there, empty. Earlier engines found the tag by path and could leave two
+    tags carrying one key; the next pass keeps the oldest and makes the others ordinary tags.
   - **Facets vs auto-tags**: want it shared/exported → **auto-tag**; purely-internal
     filtering you'd never share (has-GPS, shot-on-mobile, drone) → **facet**.
   - **Filter bar**: the catalog ANDs culling + tag + album in

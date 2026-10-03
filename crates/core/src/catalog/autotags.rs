@@ -6,7 +6,9 @@
 //! Each rule is data — a canonical path, a stable rule key, export hashtags, and a
 //! SQL `SELECT` returning the matching `photo_id`s. [`Catalog::apply_auto_tags`]
 //! rebuilds every rule's `photo_tags` membership from that select, so memberships
-//! stay in sync after scans/edits. Membership is recomputed in full (simple and
+//! stay in sync after scans/edits. A rule's tag is the one carrying its key in
+//! `tags.auto_rule`, wherever the user has renamed or moved it; the canonical path is used
+//! only when no tag carries the key (`rule_tag`). Membership is recomputed in full (simple and
 //! correct); optimise to changed photos only if it ever matters.
 //!
 //! Because the rebuild deletes every row the rule did not derive, the engine owns an
@@ -197,7 +199,7 @@ impl Catalog {
             |r| r.get(0),
         )?;
 
-        let existing = self.find_tag_id_by_path(rule.path)?;
+        let existing = self.rule_tag(rule)?;
         if !any && existing.is_none() {
             return Ok(());
         }
@@ -221,6 +223,34 @@ impl Catalog {
             params![tag_id, now()],
         )?;
         Ok(())
+    }
+
+    /// The tag `rule` maintains. **A rule's identity is its key (`tags.auto_rule`), not its
+    /// path:** a tag carrying the key stays the rule's tag wherever the user renames or moves
+    /// it, directly or through an ancestor's rename, move or merge, so no second tag appears
+    /// at the rule's path and the renamed one is never left frozen (review #181 M3). Only when
+    /// no tag carries the key is the rule's canonical path looked up (a tag made by hand
+    /// before the rule existed becomes the rule's tag; one merged away is re-created there).
+    ///
+    /// Earlier engines found the tag by path, so a catalog may hold several tags carrying one
+    /// key (the renamed one and the duplicate made at the path). The oldest keeps the key;
+    /// the others lose it and become ordinary tags with the rows they hold, which the user
+    /// can then edit or delete.
+    fn rule_tag(&self, rule: &AutoTagRule) -> Result<Option<i64>> {
+        let ids: Vec<i64> = {
+            let mut stmt = self.conn.prepare("SELECT id FROM tags WHERE auto_rule = ?1 ORDER BY id")?;
+            let rows = stmt.query_map(params![rule.rule], |r| r.get(0))?;
+            rows.collect::<rusqlite::Result<_>>()?
+        };
+        match ids.split_first() {
+            Some((&keep, extra)) => {
+                for id in extra {
+                    self.conn.execute("UPDATE tags SET auto_rule = NULL WHERE id = ?1", params![id])?;
+                }
+                Ok(Some(keep))
+            }
+            None => self.find_tag_id_by_path(rule.path),
+        }
     }
 
     fn ensure_auto_tag(&self, rule: &AutoTagRule) -> Result<i64> {
@@ -443,5 +473,73 @@ mod tests {
         c.conn.execute("UPDATE tags SET last_used_at = 100 WHERE id IN (?1, ?2)", params![auto, trip]).unwrap();
         let ids: Vec<i64> = c.recently_used_tags(10).unwrap().iter().map(|t| t.id).collect();
         assert_eq!(ids, vec![trip]);
+    }
+
+    // ── A rule's identity is its key, not its path (#181 review M3) ───────────────
+
+    /// After a structural change put the long-exposure tag `auto` at `path`: the next pass
+    /// keeps `auto` as the rule's only tag (no duplicate at the rule's path), still rebuilds
+    /// its membership (a new long exposure joins it), and it still refuses hand writes.
+    fn still_the_rules_tag(c: &Catalog, root: &TestSubPath, auto: i64, path: &str, fast: i64) {
+        assert_eq!(c.get_tag(auto).unwrap().full_path, path);
+        let later = photo(c, root, "later.arw", "15", "2026-09-01T13:00:00");
+        c.apply_auto_tags().unwrap();
+        let carriers: Vec<i64> = {
+            let mut stmt = c.conn.prepare("SELECT id FROM tags WHERE auto_rule = 'long-exposure'").unwrap();
+            let rows = stmt.query_map([], |r| r.get(0)).unwrap();
+            rows.collect::<rusqlite::Result<_>>().unwrap()
+        };
+        assert_eq!(carriers, vec![auto], "one tag carries the rule");
+        assert_eq!(c.find_tag_id_by_path(LONG_EXPOSURE).unwrap(), None, "no duplicate at the rule's path");
+        assert!(has(c, later, auto), "membership is still rebuilt");
+        assert!(matches!(c.assign_tag(fast, auto), Err(CatalogError::AutoTag(_))));
+    }
+
+    #[test]
+    fn a_renamed_auto_tag_stays_the_rules_tag() {
+        let (c, root, _long, fast, auto) = long_and_fast("autotag-rename");
+        c.rename_tag(auto, "Slow Shutter").unwrap();
+        still_the_rules_tag(&c, &root, auto, "Technique/Slow Shutter", fast);
+    }
+
+    #[test]
+    fn a_moved_auto_tag_stays_the_rules_tag() {
+        let (c, root, _long, fast, auto) = long_and_fast("autotag-move");
+        let methods = c.create_tag("Methods").unwrap();
+        c.move_tag(auto, Some(methods)).unwrap();
+        still_the_rules_tag(&c, &root, auto, "Methods/Long Exposure", fast);
+    }
+
+    #[test]
+    fn an_auto_tag_under_a_renamed_parent_stays_the_rules_tag() {
+        let (c, root, _long, fast, auto) = long_and_fast("autotag-parent-rename");
+        let technique = c.find_tag_id_by_path("Technique").unwrap().unwrap();
+        c.rename_tag(technique, "Techniques").unwrap();
+        still_the_rules_tag(&c, &root, auto, "Techniques/Long Exposure", fast);
+    }
+
+    #[test]
+    fn an_auto_tag_under_a_merged_parent_stays_the_rules_tag() {
+        let (c, root, _long, fast, auto) = long_and_fast("autotag-parent-merge");
+        let technique = c.find_tag_id_by_path("Technique").unwrap().unwrap();
+        let methods = c.create_tag("Methods").unwrap();
+        crate::catalog::tag_maintenance::merge_tags(&c.conn, &[technique], methods, 1).unwrap();
+        still_the_rules_tag(&c, &root, auto, "Methods/Long Exposure", fast);
+    }
+
+    /// A catalog an earlier engine left with two tags carrying one rule (the renamed tag and
+    /// the duplicate it made at the path): the oldest keeps the rule, the other becomes an
+    /// ordinary tag the user can edit or delete.
+    #[test]
+    fn duplicate_rule_tags_from_an_earlier_engine_collapse_to_the_oldest() {
+        let (c, root, _long, fast, auto) = long_and_fast("autotag-dupes");
+        c.rename_tag(auto, "Slow Shutter").unwrap();
+        let dupe = c.create_tag(LONG_EXPOSURE).unwrap();
+        c.conn.execute("UPDATE tags SET auto_rule = 'long-exposure' WHERE id = ?1", params![dupe]).unwrap();
+        c.apply_auto_tags().unwrap();
+        assert_eq!(c.auto_tag_refusal(dupe).unwrap(), None, "the duplicate is an ordinary tag");
+        c.assign_tag(fast, dupe).unwrap();
+        c.delete_tag(dupe).unwrap();
+        still_the_rules_tag(&c, &root, auto, "Technique/Slow Shutter", fast);
     }
 }

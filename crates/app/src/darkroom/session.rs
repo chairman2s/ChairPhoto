@@ -63,8 +63,9 @@
 //! (`rails`): it saves what is pending first and runs after any commit already on the
 //! worker, one at a time, as React chained them after its autosave (`chainRef`). A save that
 //! fails drops the operations queued behind it (the change stays on screen, the banner says
-//! why). While an operation that replaces the record — a history step, a version switch,
-//! "Develop with the new engine" — is on the worker the record is not editable
+//! why); leaving the photo drops those still queued, and the status line says so. While an
+//! operation that replaces the record — a history step, a version switch, "Develop with the
+//! new engine" — is on the worker the record is not editable
 //! (`OpenPhoto::editable`): a change is refused, not made and then dropped as React's
 //! `setWorking(record)` did (saved on top of a step it would also cut the redo branch the
 //! step left). "+ New version", the cover and a duel's ⑂ keep the record, so a change made
@@ -1120,10 +1121,7 @@ impl Darkroom {
                 } else {
                     // The view has moved on: say which photo, on the banner and the status
                     // line (the Library shows no banner).
-                    let name = std::path::Path::new(&open.photo.path)
-                        .file_name()
-                        .map_or_else(|| open.photo.path.clone(), |n| n.to_string_lossy().into_owned());
-                    let line = format!("Autosave failed for {name}: {e}");
+                    let line = format!("Autosave failed for {}: {e}", file_name(&open.photo));
                     self.error = Some(line.clone());
                     self.model.update(cx, |m, cx| m.set_status(line, cx));
                 }
@@ -1183,8 +1181,15 @@ impl Darkroom {
         // The print was this photo's: the pop-out follows its target again.
         open.print_timer = None;
         self.clear_print(cx);
-        // Operations queued for this photo were asked of the view being left.
-        open.ops.clear();
+        // Operations queued for this photo (a cover toggle or "+ New version" clicked during
+        // an autosave, say) were asked of the view being left: not done — and the status line
+        // says so, as the view that showed them has moved on.
+        let dropped = std::mem::take(&mut open.ops).len();
+        if dropped > 0 {
+            let what = if dropped == 1 { "a version operation".to_string() } else { format!("{dropped} version operations") };
+            let line = format!("Darkroom: {} was left before {what} could run — not done", file_name(&open.photo));
+            self.model.update(cx, |m, cx| m.set_status(line, cx));
+        }
         if !save {
             open.commit_again = false;
         }
@@ -1337,6 +1342,11 @@ impl Darkroom {
         }
         self.shell.update(cx, |s, cx| s.select_with(cx, |l| l.select_single(photo_id)));
     }
+}
+
+/// The photo's file name, for the status line.
+fn file_name(photo: &Photo) -> String {
+    std::path::Path::new(&photo.path).file_name().map_or_else(|| photo.path.clone(), |n| n.to_string_lossy().into_owned())
 }
 
 fn now_ms() -> i64 {

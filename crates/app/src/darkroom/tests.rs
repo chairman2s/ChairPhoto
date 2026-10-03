@@ -456,6 +456,32 @@ fn a_left_photos_failed_commit_is_reported_on_the_status_line(cx: &mut TestAppCo
     assert!(line.starts_with("Autosave failed for ") && line.contains("disk full"), "{line}");
 }
 
+/// A version operation queued behind a running autosave (a cover toggle, here) and then
+/// left with the photo (→) is not done — and the status line says so (#204 N2), instead of
+/// it vanishing with the view. The autosave itself still lands.
+#[gpui_kit::test]
+fn a_queued_version_operation_dropped_by_leaving_is_reported(cx: &mut TestAppContext) {
+    let rig = rig("dk-ops-dropped", 2, cx);
+    let p = rig.open_photo(cx).unwrap();
+    rig.slide(Control::Tone(ToneKey::Ev), 0.5, cx);
+    advance(cx, AUTOSAVE_QUIET);
+    assert!(rig.darkroom(cx).read_with(cx, |d, _| d.open.as_ref().unwrap().saving), "the commit is running");
+    rig.darkroom(cx).update(cx, |d, cx| d.toggle_cover(cx));
+    let line_before = crate::tests::status(&rig.app, cx);
+    assert!(rig.view(cx).update(cx, |v, cx| v.step(1, None, cx)));
+    cx.run_until_parked();
+    let line = crate::tests::status(&rig.app, cx);
+    assert_ne!(line, line_before);
+    assert!(line.starts_with("Darkroom: ") && line.ends_with("was left before a version operation could run — not done"), "{line}");
+    work(cx);
+    let versions = rig.catalog(|c| c.list_versions(p).unwrap());
+    assert_eq!(versions.len(), 1, "the autosave landed");
+    let cover = rig.catalog(|c| {
+        c.conn().query_row("SELECT version_id FROM photo_cover WHERE photo_id = ?1", [p], |r| r.get::<_, Option<i64>>(0)).ok().flatten()
+    });
+    assert_eq!(cover, None, "the cover was not set");
+}
+
 /// "Version N" is created at most once: the first commit creates the version and its write
 /// fails; the retry writes into that version — no second, empty "Version 2" — and the shell
 /// is given it.
@@ -711,6 +737,59 @@ fn autosave_never_reaches_the_new_catalog_before_the_switch_event(cx: &mut TestA
 #[gpui_kit::test]
 fn autosave_never_reaches_the_new_catalog_after_the_switch_event(cx: &mut TestAppContext) {
     autosave_across_a_switch(true, cx);
+}
+
+/// **Forced interleaving** (map #92, Catalog identity; #204). A photo left (→) with its commit
+/// A on the worker and a newer change B to follow it (`commit_again`); A's write runs in the
+/// catalog it was made for, then the core switches to a catalog whose photo and version carry
+/// the same ids before A's answer reaches the UI — with and without `catalog:switched`. The
+/// chained commit B, started by that answer, is refused by the new catalog: nothing is
+/// written there, and the status line names the photo and why.
+fn a_chained_commit_across_a_switch(delivered: bool, cx: &mut TestAppContext) {
+    let rig = rig(if delivered { "dk-chain-switch-ev" } else { "dk-chain-switch" }, 2, cx);
+    let p = rig.app.wired.shell.read_with(cx, |s, _| s.library.photo_ids())[0];
+    rig.slide(Control::Tone(ToneKey::Ev), 0.5, cx);
+    rig.settle_and_save(cx);
+    let v = rig.catalog(|c| c.list_versions(p).unwrap())[0].id;
+    rig.slide(Control::Tone(ToneKey::Contrast), 0.3, cx);
+    advance(cx, AUTOSAVE_QUIET);
+    assert!(rig.darkroom(cx).read_with(cx, |d, _| d.open.as_ref().unwrap().saving), "commit A is on the worker");
+    rig.slide(Control::Tone(ToneKey::Shadows), 0.2, cx); // B, while A runs
+    assert!(rig.view(cx).update(cx, |v, cx| v.step(1, None, cx)));
+    cx.run_until_parked();
+    // A's write runs in its own catalog; its answer waits on the UI.
+    cx.update(|cx| Runner::get(cx).run_pending());
+    assert_eq!(rig.saved(v)["tone"]["contrast"], json!(0.3), "A landed in the catalog it was made for");
+    let (b, b_ids) = colliding_catalog(&rig.dir, "b", 2);
+    let b_version = b.create_version(b_ids[0], "B's").unwrap();
+    assert_eq!((b_ids[0], b_version), (p, v), "the ids collide");
+    core_switch(&rig.app, b);
+    if delivered {
+        let event = CoreEvent::CatalogSwitched("switched.chairphoto".into());
+        rig.app.wired.model.update(cx, |m, cx| m.on_core_event(&event, cx));
+    }
+    cx.run_until_parked(); // A's answer: B goes to the worker
+    work(cx);
+    advance(cx, AUTOSAVE_QUIET * 3);
+    work(cx);
+    rig.catalog(|c| {
+        let vs = c.list_versions(p).unwrap();
+        assert_eq!(vs.iter().map(|v| (v.name.as_str(), v.edit_json.as_str())).collect::<Vec<_>>(), [("B's", "{}")]);
+        assert!(c.version_history(v).unwrap().steps.is_empty(), "no step in the new catalog");
+    });
+    let line = crate::tests::status(&rig.app, cx);
+    assert!(line.starts_with("Autosave failed for ") && line.ends_with(CATALOG_CHANGED), "{line}");
+    assert_eq!(cx.update(|cx| Runner::get(cx).pending()), 0, "no retry loop");
+}
+
+#[gpui_kit::test]
+fn a_chained_commit_never_reaches_the_new_catalog_before_the_switch_event(cx: &mut TestAppContext) {
+    a_chained_commit_across_a_switch(false, cx);
+}
+
+#[gpui_kit::test]
+fn a_chained_commit_never_reaches_the_new_catalog_after_the_switch_event(cx: &mut TestAppContext) {
+    a_chained_commit_across_a_switch(true, cx);
 }
 
 /// The LUT picker has no `.cube` filter (GPUI's portal picker takes none; React's `pickFile`
@@ -1405,6 +1484,34 @@ fn the_proof_sheet_and_duel_are_mounted_and_feed_the_record(cx: &mut TestAppCont
     assert!(rig.present("duel-note", cx), "the duel says it was kept");
     rig.press("escape", cx);
     assert!(rig.view(cx).read_with(cx, |v, _| v.overlay().is_none()));
+}
+
+/// The proof sheet and the duel belong to one open (`OpenPhoto::seq`), not to a photo id
+/// (#204 N1): the same photo opened again in one update — its rows now from another catalog
+/// identity (a re-root) — closes the overlay, whose picks would otherwise apply to the new
+/// open.
+#[gpui_kit::test]
+fn the_overlay_closes_when_the_same_photo_is_opened_again(cx: &mut TestAppContext) {
+    use super::view::Overlay;
+    let rig = rig("dk-overlay-reopen", 2, cx);
+    let photo = rig.open_photo(cx).unwrap();
+    work(cx); // the auto-tone fragment
+    rig.with_view(cx, |v, window, cx| v.open_proof_sheet(window, cx));
+    assert!(rig.view(cx).read_with(cx, |v, _| matches!(v.overlay(), Some(Overlay::Proof(_)))), "the proof sheet is up");
+    let seq = |cx: &mut TestAppContext| rig.darkroom(cx).read_with(cx, |d, _| d.open.as_ref().map(|o| (o.seq, o.from)).unwrap());
+    let (before, a) = seq(cx);
+    chairphoto_core::app::catalogs::reroot_open_catalog_as(&rig.app.state, a, rig.dir.0.join("newroot")).unwrap();
+    let b = chairphoto_core::app::catalog_identity(&rig.app.state).unwrap();
+    assert_ne!(a, b);
+    rig.app.wired.shell.update(cx, |s, cx| {
+        s.set_rows_from_undrawn(b);
+        cx.notify();
+    });
+    cx.run_until_parked();
+    let (after, from) = seq(cx);
+    assert_eq!((rig.open_photo(cx), from), (Some(photo), b), "the same photo, opened again under the new identity");
+    assert_ne!(after, before);
+    assert!(rig.view(cx).read_with(cx, |v, _| v.overlay().is_none()), "the overlay closed with the open it belonged to");
 }
 
 /// **Forced interleaving.** A duel's ⑂ pressed while the photo's versions are still being

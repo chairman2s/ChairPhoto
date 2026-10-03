@@ -3,9 +3,9 @@
 use std::path::Path;
 use xmltree::XMLNode;
 use super::document::SidecarDocument;
-use super::dom::{first_text, plain, rdf_of};
+use super::dom::{first_text, is_rdf, plain, rdf_of};
 use super::ns::NS_EXIF;
-use super::parse::parse_xml;
+use super::parse::{ns_attr, parse_xml};
 use super::sidecar_path;
 
 /// Write GPS coordinates into the photo's XMP sidecar as `exif:GPSLatitude` and
@@ -34,6 +34,10 @@ pub fn write_gps(photo_path: &Path, lat: f64, lng: f64) -> Result<(), String> {
 /// Read the GPS coordinates (`exif:GPSLatitude` / `exif:GPSLongitude`) from the
 /// photo's XMP sidecar. Returns `None` when there's no sidecar or the GPS fields
 /// are absent or unparseable.
+///
+/// Each field is read in either RDF form: a property element (what [`write_gps`] writes) or a
+/// compact attribute on the `rdf:Description` (`exif:GPSLatitude="…"`, what darktable and
+/// exiftool write, #143). Both are matched by namespace URI, whatever prefix the file uses.
 pub fn read_gps(photo_path: &Path) -> Option<(f64, f64)> {
     let path = sidecar_path(photo_path);
     let file = std::fs::File::open(&path).ok()?;
@@ -43,8 +47,14 @@ pub fn read_gps(photo_path: &Path) -> Option<(f64, f64)> {
     let mut lng_str: Option<String> = None;
     for node in &rdf.children {
         let XMLNode::Element(desc) = node else { continue };
-        if desc.name != "Description" {
+        if !is_rdf(desc, "Description") {
             continue;
+        }
+        if let Some(v) = ns_attr(desc, NS_EXIF, "GPSLatitude") {
+            lat_str = Some(v.trim().to_string());
+        }
+        if let Some(v) = ns_attr(desc, NS_EXIF, "GPSLongitude") {
+            lng_str = Some(v.trim().to_string());
         }
         for child in &desc.children {
             if let XMLNode::Element(e) = child {
@@ -301,6 +311,62 @@ mod tests {
         assert_eq!(xmp.matches("exif:GPSLatitude").count(), 2, "one open + one close tag only");
         assert_eq!(xmp.matches("exif:GPSLongitude").count(), 2, "one open + one close tag only");
         assert!(xmp.contains("history_end"), "darktable data clobbered by GPS rewrite!");
+    }
+
+    // ── compact GPS attributes (#143 item 1) ────────────────────────────────
+
+    /// A darktable/exiftool-style sidecar: GPS as compact attributes on the Description,
+    /// under a prefix that is not `exif`, next to a decoy `GPSLatitude` in another namespace.
+    const COMPACT_GPS: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<x:xmpmeta xmlns:x="adobe:ns:meta/">
+ <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+  <rdf:Description rdf:about=""
+    xmlns:darktable="http://darktable.sf.net/"
+    xmlns:ex="http://ns.adobe.com/exif/1.0/"
+    xmlns:foo="urn:example:foreign"
+    foo:GPSLatitude="1,0.0N"
+    ex:GPSLatitude="59,54.834000N"
+    ex:GPSLongitude="10,45.132000W"
+    darktable:history_end="5"/>
+ </rdf:RDF>
+</x:xmpmeta>"#;
+
+    /// `read_gps` reads the compact attribute form other tools write, by namespace URI — not
+    /// the decoy `foo:GPSLatitude`, and whatever prefix the file binds the EXIF namespace to.
+    #[test]
+    fn read_gps_reads_compact_attributes_by_namespace() {
+        use crate::xmp::test_xml::{has_attr, seeded_photo, NS_FOREIGN};
+        use crate::xmp::ns::NS_RDF;
+        let (_dir, photo) = seeded_photo("xmp-gps-compact", COMPACT_GPS);
+        // The fixture is what it claims, per an independent namespace-aware reader.
+        let desc = (NS_RDF, "Description");
+        assert!(has_attr(COMPACT_GPS, desc, (NS_EXIF, "GPSLatitude"), "59,54.834000N"));
+        assert!(has_attr(COMPACT_GPS, desc, (NS_FOREIGN, "GPSLatitude"), "1,0.0N"));
+
+        let (lat, lng) = read_gps(&photo).expect("compact GPS must be read");
+        assert!((lat - 59.9139).abs() < 1e-9, "lat {lat}");
+        assert!((lng + 10.7522).abs() < 1e-9, "lng {lng} (W is negative)");
+    }
+
+    /// Writing GPS over the compact form leaves one value per field, in element form, and the
+    /// foreign attributes (the decoy, darktable's) as they were.
+    #[test]
+    fn write_gps_replaces_compact_attributes() {
+        use crate::xmp::test_xml::{count_elements, has_attr, namespaced_attributes, seeded_photo, NS_FOREIGN};
+        use crate::xmp::ns::NS_RDF;
+        let (_dir, photo) = seeded_photo("xmp-gps-compact-write", COMPACT_GPS);
+        write_gps(&photo, -33.4489, -70.6693).unwrap();
+
+        let xml = read(&sidecar_path(&photo));
+        let attrs = namespaced_attributes(&xml);
+        assert!(!attrs.iter().any(|(_, _, ns, _, _)| ns == NS_EXIF), "compact GPS left behind:\n{xml}");
+        assert_eq!(count_elements(&xml, NS_EXIF, "GPSLatitude"), 1, "{xml}");
+        assert_eq!(count_elements(&xml, NS_EXIF, "GPSLongitude"), 1, "{xml}");
+        let desc = (NS_RDF, "Description");
+        assert!(has_attr(&xml, desc, (NS_FOREIGN, "GPSLatitude"), "1,0.0N"), "{xml}");
+        assert!(has_attr(&xml, desc, ("http://darktable.sf.net/", "history_end"), "5"), "{xml}");
+        let (lat, lng) = read_gps(&photo).unwrap();
+        assert!((lat + 33.4489).abs() < 1e-6 && (lng + 70.6693).abs() < 1e-6, "{lat},{lng}");
     }
 
     // ── decimal_to_dms_lat / decimal_to_dms_lng minute rollover (issue #65) ────────────

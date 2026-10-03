@@ -20,9 +20,23 @@
 //! Sony A7R VI writes a stale `CreativeStyle=B&W` on every frame), so the rule reads
 //! `photos.is_grayscale`, a flag computed by sampling the preview during caching.
 
+use super::tag_path::normalize_tag_path;
 use super::{Catalog, CatalogError, Result};
 use rusqlite::{params, OptionalExtension};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+/// The `settings` row claimed by the one pass of [`Catalog::demote_legacy_carriers`].
+const LEGACY_CARRIERS_CLAIM: &str = "autotags_legacy_carriers_demoted";
+
+/// Where [`Catalog::rule_tag`] found a rule's tag.
+enum RuleTag {
+    /// The rule's tag: the key's carrier, or a tag at its path it may take over.
+    Found(i64),
+    /// Nothing carries the key and the path is free.
+    None,
+    /// Nothing carries the key and the path holds a tag the rule must not take.
+    PathTaken,
+}
 
 /// A long exposure is a shutter time at or beyond this many seconds.
 const LONG_EXPOSURE_SECONDS: f64 = 1.0;
@@ -75,10 +89,52 @@ impl Catalog {
     /// Apply all auto-tags across the catalog. Called after a scan (and exposable as a
     /// command). Each rule's membership is rebuilt from its match query.
     pub fn apply_auto_tags(&self) -> Result<()> {
-        for rule in self.auto_tag_rules() {
-            self.apply_rule(&rule)?;
+        let rules = self.auto_tag_rules();
+        self.demote_legacy_carriers(&rules)?;
+        for rule in &rules {
+            self.apply_rule(rule)?;
         }
         Ok(())
+    }
+
+    /// The one-time step that hands a catalog from the path-keyed engine to the key-keyed one
+    /// (review #181 r2 M1). Earlier engines found a rule's tag by its canonical path: a tag
+    /// the user renamed or moved kept `auto_rule` but was never rebuilt again, so it took hand
+    /// assignments, and the engine made a second carrier at the path. Rebuilding such a tag
+    /// now would delete those hand rows. So the first pass under this engine clears
+    /// `auto_rule` from every carrier **not** at its rule's canonical path, keeping its rows:
+    /// it becomes an ordinary tag the user can edit, delete or merge. A carrier at the path
+    /// holds only rule output (the old engine rebuilt it every pass) and stays the rule's tag;
+    /// with none there, [`Self::apply_rule`] finds or makes one at the path.
+    ///
+    /// Claimed once per catalog by the settings row [`LEGACY_CARRIERS_CLAIM`], taken in the
+    /// same savepoint as the demotions, so a pass that fails or is rolled back is retried and
+    /// two connections never both take it. After it, rename and move work by key: a carrier
+    /// the user moves away from the path stays the rule's tag.
+    fn demote_legacy_carriers(&self, rules: &[AutoTagRule]) -> Result<()> {
+        self.conn.execute_batch("SAVEPOINT autotags_legacy_carriers")?;
+        let out = (|| -> Result<()> {
+            let claimed = self.conn.execute(
+                "INSERT OR IGNORE INTO settings (key, value) VALUES (?1, ?2)",
+                params![LEGACY_CARRIERS_CLAIM, now().to_string()],
+            )? == 1;
+            if !claimed {
+                return Ok(());
+            }
+            for rule in rules {
+                self.conn.execute(
+                    "UPDATE tags SET auto_rule = NULL WHERE auto_rule = ?1 AND full_path_norm != ?2",
+                    params![rule.rule, canonical_norm(rule)?],
+                )?;
+            }
+            Ok(())
+        })();
+        self.conn.execute_batch(if out.is_ok() {
+            "RELEASE autotags_legacy_carriers"
+        } else {
+            "ROLLBACK TO autotags_legacy_carriers; RELEASE autotags_legacy_carriers"
+        })?;
+        out
     }
 
     /// The refusal for a hand write of `tag_id`, or `None` when it is an ordinary tag (or
@@ -199,14 +255,12 @@ impl Catalog {
             |r| r.get(0),
         )?;
 
-        let existing = self.rule_tag(rule)?;
-        if !any && existing.is_none() {
-            return Ok(());
-        }
-
-        let tag_id = match existing {
-            Some(id) => id,
-            None => self.ensure_auto_tag(rule)?,
+        let tag_id = match self.rule_tag(rule)? {
+            RuleTag::Found(id) => id,
+            // The path holds a tag the rule must not take: the rule goes without one.
+            RuleTag::PathTaken => return Ok(()),
+            RuleTag::None if !any => return Ok(()),
+            RuleTag::None => self.ensure_auto_tag(rule)?,
         };
         // Make sure the rule + export hashtags are set even on a pre-existing tag.
         self.mark_auto_tag(tag_id, rule.rule)?;
@@ -229,17 +283,18 @@ impl Catalog {
     /// path:** a tag carrying the key stays the rule's tag wherever the user renames or moves
     /// it, directly or through an ancestor's rename, move or merge, so no second tag appears
     /// at the rule's path and the renamed one is never left frozen (review #181 M3). Only when
-    /// no tag carries the key is the rule's canonical path looked up (a tag made by hand
-    /// before the rule existed becomes the rule's tag; one merged away is re-created there).
+    /// no tag carries the key is the rule's canonical path looked up ([`Self::path_tag`]).
     ///
-    /// Earlier engines found the tag by path, so a catalog may hold several tags carrying one
-    /// key (the renamed one and the duplicate made at the path). The oldest keeps the key;
-    /// the others lose it and become ordinary tags with the rows they hold, which the user
-    /// can then edit or delete.
-    fn rule_tag(&self, rule: &AutoTagRule) -> Result<Option<i64>> {
+    /// Carriers left by earlier engines are settled once by
+    /// [`Self::demote_legacy_carriers`], after which a rule has at most one. Should two ever
+    /// carry a key anyway, the one at the canonical path, else the oldest, keeps it; the
+    /// others become ordinary tags with the rows they hold.
+    fn rule_tag(&self, rule: &AutoTagRule) -> Result<RuleTag> {
         let ids: Vec<i64> = {
-            let mut stmt = self.conn.prepare("SELECT id FROM tags WHERE auto_rule = ?1 ORDER BY id")?;
-            let rows = stmt.query_map(params![rule.rule], |r| r.get(0))?;
+            let mut stmt = self.conn.prepare(
+                "SELECT id FROM tags WHERE auto_rule = ?1 ORDER BY full_path_norm = ?2 DESC, id",
+            )?;
+            let rows = stmt.query_map(params![rule.rule, canonical_norm(rule)?], |r| r.get(0))?;
             rows.collect::<rusqlite::Result<_>>()?
         };
         match ids.split_first() {
@@ -247,10 +302,38 @@ impl Catalog {
                 for id in extra {
                     self.conn.execute("UPDATE tags SET auto_rule = NULL WHERE id = ?1", params![id])?;
                 }
-                Ok(Some(keep))
+                Ok(RuleTag::Found(keep))
             }
-            None => self.find_tag_id_by_path(rule.path),
+            None => self.path_tag(rule),
         }
+    }
+
+    /// The rule's tag when no tag carries its key: the tag at its canonical path, taken over
+    /// only when it is an ordinary tag and that loses nothing. Another rule's tag the user
+    /// moved there is never taken. Taking a tag over rebuilds its membership, so a tag there
+    /// that holds a photo the rule would not tag (made by hand, perhaps after the rule's own
+    /// tag was renamed away) is left alone, rows and all, and the rule has no tag until the
+    /// path is free or that tag holds only matches. A tag made at the path before the rule
+    /// existed, holding only matches or nothing, becomes the rule's tag; one merged or deleted
+    /// away is re-created there.
+    fn path_tag(&self, rule: &AutoTagRule) -> Result<RuleTag> {
+        let Some(id) = self.find_tag_id_by_path(rule.path)? else {
+            return Ok(RuleTag::None);
+        };
+        // Another rule's tag moved onto this path stays that rule's (review #181 r2 L2).
+        if self.auto_tag_refusal(id)?.is_some() {
+            return Ok(RuleTag::PathTaken);
+        }
+        let holds_other: bool = self.conn.query_row(
+            &format!(
+                "SELECT EXISTS(SELECT 1 FROM photo_tags WHERE tag_id = ?1
+                                 AND photo_id NOT IN (SELECT photo_id FROM ({})))",
+                rule.match_select
+            ),
+            params![id],
+            |r| r.get(0),
+        )?;
+        Ok(if holds_other { RuleTag::PathTaken } else { RuleTag::Found(id) })
     }
 
     fn ensure_auto_tag(&self, rule: &AutoTagRule) -> Result<i64> {
@@ -350,6 +433,11 @@ impl Catalog {
                 _ => None,
             })
     }
+}
+
+/// A rule's canonical path in `tags.full_path_norm` form.
+fn canonical_norm(rule: &AutoTagRule) -> Result<String> {
+    Ok(normalize_tag_path(rule.path).map_err(CatalogError::Tag)?.key())
 }
 
 fn now() -> i64 {
@@ -496,12 +584,7 @@ mod tests {
         assert_eq!(c.get_tag(auto).unwrap().full_path, path);
         let later = photo(c, root, "later.arw", "15", "2026-09-01T13:00:00");
         c.apply_auto_tags().unwrap();
-        let carriers: Vec<i64> = {
-            let mut stmt = c.conn.prepare("SELECT id FROM tags WHERE auto_rule = 'long-exposure'").unwrap();
-            let rows = stmt.query_map([], |r| r.get(0)).unwrap();
-            rows.collect::<rusqlite::Result<_>>().unwrap()
-        };
-        assert_eq!(carriers, vec![auto], "one tag carries the rule");
+        assert_eq!(carriers(c), vec![auto], "one tag carries the rule");
         assert_eq!(c.find_tag_id_by_path(LONG_EXPOSURE).unwrap(), None, "no duplicate at the rule's path");
         assert!(has(c, later, auto), "membership is still rebuilt");
         assert!(matches!(c.assign_tag(fast, auto), Err(CatalogError::AutoTag(_))));
@@ -539,19 +622,210 @@ mod tests {
         still_the_rules_tag(&c, &root, auto, "Methods/Long Exposure", fast);
     }
 
-    /// A catalog an earlier engine left with two tags carrying one rule (the renamed tag and
-    /// the duplicate it made at the path): the oldest keeps the rule, the other becomes an
-    /// ordinary tag the user can edit or delete.
+    /// Review #181 r2 L1 (probe P4), what `merge_tags`'s warning promises: an auto-tag merged
+    /// away is not made again while nothing matches, and comes back at its path holding every
+    /// match — not empty — on the first pass that finds one.
     #[test]
-    fn duplicate_rule_tags_from_an_earlier_engine_collapse_to_the_oldest() {
-        let (c, root, _long, fast, auto) = long_and_fast("autotag-dupes");
-        c.rename_tag(auto, "Slow Shutter").unwrap();
-        let dupe = c.create_tag(LONG_EXPOSURE).unwrap();
-        c.conn.execute("UPDATE tags SET auto_rule = 'long-exposure' WHERE id = ?1", params![dupe]).unwrap();
+    fn a_merged_away_auto_tag_comes_back_populated_once_something_matches() {
+        let (c, _root, long, _fast, auto) = long_and_fast("autotag-merged-away");
+        let slow = c.create_tag("Methods/Slow").unwrap();
+        crate::catalog::tag_maintenance::merge_tags(&c.conn, &[auto], slow, 1).unwrap();
+        assert!(has(&c, long, slow), "the photos moved to the merged tag");
+
+        c.conn.execute("UPDATE photos SET shutter_speed = '1/100' WHERE id = ?1", params![long]).unwrap();
         c.apply_auto_tags().unwrap();
-        assert_eq!(c.auto_tag_refusal(dupe).unwrap(), None, "the duplicate is an ordinary tag");
-        c.assign_tag(fast, dupe).unwrap();
-        c.delete_tag(dupe).unwrap();
-        still_the_rules_tag(&c, &root, auto, "Technique/Slow Shutter", fast);
+        assert_eq!(c.find_tag_id_by_path(LONG_EXPOSURE).unwrap(), None, "nothing matches: no tag");
+
+        c.conn.execute("UPDATE photos SET shutter_speed = '30' WHERE id = ?1", params![long]).unwrap();
+        c.apply_auto_tags().unwrap();
+        let back = c.find_tag_id_by_path(LONG_EXPOSURE).unwrap().expect("back at its path");
+        assert_eq!(carriers(&c), vec![back]);
+        assert!(has(&c, long, back), "holding every match");
+    }
+
+    /// Review #181 r2 L2 (probe P5): the long-exposure tag moved and renamed onto the
+    /// monochrome rule's path, with monochrome carried by no tag. Monochrome's path fallback
+    /// must not take it over — even when it holds only monochrome matches — and long-exposure
+    /// keeps it.
+    #[test]
+    fn the_path_fallback_never_takes_another_rules_tag() {
+        let (c, _root, long, _fast, auto) = long_and_fast("autotag-other-rule");
+        c.set_grayscale(long, true).unwrap();
+        let treatment = c.create_tag("Treatment").unwrap();
+        c.move_tag(auto, Some(treatment)).unwrap();
+        c.rename_tag(auto, "Black & White").unwrap();
+        c.apply_auto_tags().unwrap();
+
+        assert_eq!(c.auto_tag_refusal(auto).unwrap().map(|r| r.rule), Some("long-exposure".into()));
+        assert_eq!(carriers(&c), vec![auto]);
+        assert!(has(&c, long, auto));
+        let mono: i64 =
+            c.conn.query_row("SELECT COUNT(*) FROM tags WHERE auto_rule = 'monochrome'", [], |r| r.get(0)).unwrap();
+        assert_eq!(mono, 0, "monochrome has no tag while another rule's holds its path");
+    }
+
+    /// Should two tags ever carry a key after the one-time pass, the one at the rule's path
+    /// keeps it and the other becomes an ordinary tag, rows and all.
+    #[test]
+    fn two_carriers_after_the_pass_collapse_to_the_one_at_the_path() {
+        let (c, _root, long, fast, auto) = long_and_fast("autotag-dupes");
+        c.rename_tag(auto, "Slow Shutter").unwrap();
+        let at_path = c.create_tag(LONG_EXPOSURE).unwrap();
+        mark_as_old_engine(&c, at_path);
+        raw_assign(&c, fast, auto);
+        c.apply_auto_tags().unwrap();
+        assert_eq!(carriers(&c), vec![at_path]);
+        assert!(has(&c, long, at_path) && !has(&c, fast, at_path));
+        assert!(has(&c, fast, auto) && has(&c, long, auto), "the demoted tag keeps its rows");
+    }
+
+    // ── Carriers an earlier engine left (#181 review r2 M1) ────────────────────────
+    //
+    // Earlier engines found a rule's tag by path: a renamed carrier kept `auto_rule`, was never
+    // rebuilt, took hand rows, and a second carrier appeared at the path. The first pass under
+    // the key-keyed engine demotes every carrier not at the path, keeping its rows.
+
+    /// The tags carrying the long-exposure rule, by id.
+    fn carriers(c: &Catalog) -> Vec<i64> {
+        let mut stmt = c.conn.prepare("SELECT id FROM tags WHERE auto_rule = 'long-exposure' ORDER BY id").unwrap();
+        let rows = stmt.query_map([], |r| r.get(0)).unwrap();
+        rows.collect::<rusqlite::Result<_>>().unwrap()
+    }
+
+    /// `c` as an earlier engine left it: the one-time pass not yet taken.
+    fn before_the_pass(c: &Catalog) {
+        c.conn.execute("DELETE FROM settings WHERE key = ?1", params![LEGACY_CARRIERS_CLAIM]).unwrap();
+    }
+
+    /// The carrier an earlier engine made at the rule's path.
+    fn mark_as_old_engine(c: &Catalog, tag: i64) {
+        c.conn.execute("UPDATE tags SET auto_rule = 'long-exposure' WHERE id = ?1", params![tag]).unwrap();
+    }
+
+    /// A row written as the earlier engine let it be: a hand assignment of a frozen carrier,
+    /// or the old engine's own output.
+    fn raw_assign(c: &Catalog, photo: i64, tag: i64) {
+        c.conn
+            .execute("INSERT INTO photo_tags (photo_id, tag_id, created_at) VALUES (?1, ?2, 1)", params![photo, tag])
+            .unwrap();
+    }
+
+    /// Everything the pass could touch: tags with their rule, and memberships.
+    fn snapshot(c: &Catalog) -> (Vec<(i64, String, Option<String>)>, Vec<(i64, i64)>) {
+        let mut tags = c.conn.prepare("SELECT id, full_path, auto_rule FROM tags ORDER BY id").unwrap();
+        let tags = tags.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap();
+        let mut rows = c.conn.prepare("SELECT photo_id, tag_id FROM photo_tags ORDER BY 1, 2").unwrap();
+        let rows = rows.query_map([], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+        (tags.collect::<rusqlite::Result<_>>().unwrap(), rows.collect::<rusqlite::Result<_>>().unwrap())
+    }
+
+    /// Review P1: the old engine's renamed carrier `auto` ("Slow Shutter") took a hand row (the
+    /// fast photo) and a duplicate carrier holds the rule's output at the path. Returns the
+    /// duplicate.
+    fn renamed_with_a_hand_row_beside_a_duplicate(c: &Catalog, long: i64, fast: i64, auto: i64) -> i64 {
+        before_the_pass(c);
+        c.rename_tag(auto, "Slow Shutter").unwrap();
+        raw_assign(c, fast, auto);
+        let dupe = c.create_tag(LONG_EXPOSURE).unwrap();
+        mark_as_old_engine(c, dupe);
+        raw_assign(c, long, dupe);
+        dupe
+    }
+
+    #[test]
+    fn an_old_engines_renamed_carrier_keeps_its_hand_rows_beside_the_duplicate() {
+        let (c, _root, long, fast, auto) = long_and_fast("autotag-legacy-p1");
+        let dupe = renamed_with_a_hand_row_beside_a_duplicate(&c, long, fast, auto);
+        c.apply_auto_tags().unwrap();
+
+        assert_eq!(carriers(&c), vec![dupe], "the carrier at the path stays the rule's tag");
+        assert!(has(&c, long, dupe) && !has(&c, fast, dupe));
+        assert_eq!(c.auto_tag_refusal(auto).unwrap(), None, "the renamed tag is ordinary");
+        assert!(has(&c, fast, auto), "the hand row survives");
+        assert!(has(&c, long, auto), "and so does what it held from the rule");
+        c.remove_tag(fast, auto).unwrap();
+    }
+
+    #[test]
+    fn a_lone_renamed_carrier_keeps_its_rows_and_the_rule_starts_again_at_its_path() {
+        let (c, _root, long, fast, auto) = long_and_fast("autotag-legacy-lone");
+        before_the_pass(&c);
+        c.rename_tag(auto, "Slow Shutter").unwrap();
+        raw_assign(&c, fast, auto);
+        c.apply_auto_tags().unwrap();
+
+        assert!(has(&c, fast, auto) && has(&c, long, auto), "the renamed tag keeps every row");
+        assert_eq!(c.auto_tag_refusal(auto).unwrap(), None);
+        let fresh = c.find_tag_id_by_path(LONG_EXPOSURE).unwrap().expect("re-made at the path");
+        assert_eq!(carriers(&c), vec![fresh]);
+        assert!(has(&c, long, fresh) && !has(&c, fast, fresh));
+    }
+
+    /// Renamed twice under the old engine: two frozen carriers with hand rows, and the third
+    /// at the path. Both renamed ones are demoted with their rows.
+    #[test]
+    fn two_old_renamed_carriers_are_both_demoted() {
+        let (c, _root, long, fast, auto) = long_and_fast("autotag-legacy-two");
+        let second = renamed_with_a_hand_row_beside_a_duplicate(&c, long, fast, auto);
+        c.rename_tag(second, "Bulb").unwrap();
+        raw_assign(&c, fast, second);
+        let third = c.create_tag(LONG_EXPOSURE).unwrap();
+        mark_as_old_engine(&c, third);
+        raw_assign(&c, long, third);
+        c.apply_auto_tags().unwrap();
+
+        assert_eq!(carriers(&c), vec![third]);
+        for demoted in [auto, second] {
+            assert_eq!(c.auto_tag_refusal(demoted).unwrap(), None);
+            assert!(has(&c, fast, demoted) && has(&c, long, demoted), "tag {demoted} keeps its rows");
+        }
+        assert!(has(&c, long, third) && !has(&c, fast, third));
+    }
+
+    /// Review P3 after the pass: the old engine's renamed carrier plus an ordinary tag the user
+    /// made at the rule's path and hand-tagged. The renamed one is demoted, and the rule does
+    /// not take the hand tag over (that would wipe its row) — until it holds only matches.
+    #[test]
+    fn the_rule_does_not_take_over_a_hand_tag_at_its_path_that_would_lose_a_row() {
+        let (c, _root, long, fast, auto) = long_and_fast("autotag-legacy-p3");
+        before_the_pass(&c);
+        c.rename_tag(auto, "Slow Shutter").unwrap();
+        let hand = c.create_tag(LONG_EXPOSURE).unwrap();
+        c.assign_tag(fast, hand).unwrap();
+        c.apply_auto_tags().unwrap();
+
+        assert!(carriers(&c).is_empty(), "no tag carries the rule");
+        assert!(has(&c, fast, hand) && !has(&c, long, hand), "the hand tag is as the user left it");
+        assert!(has(&c, long, auto), "the demoted tag keeps its rows");
+
+        c.remove_tag(fast, hand).unwrap();
+        c.apply_auto_tags().unwrap();
+        assert_eq!(carriers(&c), vec![hand], "an empty tag at the path is taken over");
+        assert!(has(&c, long, hand));
+    }
+
+    #[test]
+    fn a_second_pass_after_the_demotion_changes_nothing() {
+        let (c, _root, long, fast, auto) = long_and_fast("autotag-legacy-twice");
+        renamed_with_a_hand_row_beside_a_duplicate(&c, long, fast, auto);
+        c.apply_auto_tags().unwrap();
+        let first = snapshot(&c);
+        let claimed = c.get_setting(LEGACY_CARRIERS_CLAIM).unwrap();
+        assert!(claimed.is_some(), "the pass is claimed");
+        c.apply_auto_tags().unwrap();
+        assert_eq!(snapshot(&c), first);
+        assert_eq!(c.get_setting(LEGACY_CARRIERS_CLAIM).unwrap(), claimed, "claimed once");
+    }
+
+    /// After the pass, a rename moves the rule's tag off its path and it stays the rule's tag:
+    /// the demotion ran once, not on every pass.
+    #[test]
+    fn a_rename_after_the_pass_still_works_by_key() {
+        let (c, root, long, fast, auto) = long_and_fast("autotag-legacy-rename");
+        let dupe = renamed_with_a_hand_row_beside_a_duplicate(&c, long, fast, auto);
+        c.apply_auto_tags().unwrap();
+        c.rename_tag(dupe, "Long Shutter").unwrap();
+        still_the_rules_tag(&c, &root, dupe, "Technique/Long Shutter", fast);
+        assert!(has(&c, fast, auto), "the demoted tag is untouched");
     }
 }

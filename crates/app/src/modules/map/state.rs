@@ -692,9 +692,10 @@ fn apply_status(name: Option<&str>, out: &backend::FencesApplied) -> String {
         None if out.skipped.is_empty() => format!("Applied all fences: {photos} newly tagged."),
         None => {
             let total = out.applied + out.skipped.len();
+            let fences = if total == 1 { "fence" } else { "fences" };
             let names: Vec<String> = out.skipped.iter().map(|f| format!("\u{201c}{f}\u{201d}")).collect();
             format!(
-                "Applied {} of {total} fences: {photos} newly tagged. Skipped {} \u{2014} an auto-tag \
+                "Applied {} of {total} {fences}: {photos} newly tagged. Skipped {} \u{2014} an auto-tag \
                  can't be assigned by a fence.",
                 out.applied,
                 names.join(", ")

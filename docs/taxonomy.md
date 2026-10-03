@@ -107,7 +107,10 @@ Each of these is handled, and each has a test:
   named in the report; a rule that will not parse is left exactly as found.
 - **Auto-tags recompute membership.** Merging *into* an auto-tag is refused (the engine
   deletes and re-derives its assignments, so the merge would silently undo itself); merging
-  one *away* warns that the engine re-creates it by path, empty. A split writes membership
+  one *away* moves its photos to the target and warns that the rule keeps running: unless
+  another tag carries the rule, the first pass that finds a match brings the rule's tag back
+  at its default path, holding every matching photo (the warning text is core's, shown as is
+  by both front ends). A split writes membership
   by hand, so an auto-tag is refused as its source or its new tag (`CatalogError::AutoTag`).
 - **Tags survive in bundles.** See the tombstone below.
 - **Plugins hold tag references.** See ownership below.
@@ -208,10 +211,21 @@ Design consequence — keep these on the *right* axis:
   - **A rule's identity is its key, not its path.** The engine maintains the tag carrying the
     rule's key in `tags.auto_rule`, wherever it sits: rename or move it (directly, or by
     renaming, moving or merging an ancestor) and it stays the rule's tag, with no second tag
-    made at the canonical path. The path is used only when no tag carries the key — a tag
-    made by hand at that path before the rule existed becomes the rule's tag, and one merged
-    away is re-created there, empty. Earlier engines found the tag by path and could leave two
-    tags carrying one key; the next pass keeps the oldest and makes the others ordinary tags.
+    made at the canonical path. The path is used only when no tag carries the key: a tag
+    there is taken over only if it is an ordinary tag (another rule's tag moved there stays
+    that rule's) and that loses nothing (it holds no photo the rule wouldn't tag); one holding
+    other photos is left alone, rows and all, with the rule tagless until the
+    path is free or the tag holds only matches; with no tag there, one is made on the first
+    match, which is how a tag merged or deleted away comes back.
+  - **Upgrading from the path-keyed engine** (review #181 r2). Earlier engines found the tag by
+    path: a renamed or moved carrier kept its key but was never rebuilt, so it took hand
+    assignments, and a second carrier appeared at the path. The first pass under the key-keyed
+    engine, claimed once per catalog by the `autotags_legacy_carriers_demoted` settings row,
+    clears the key from every carrier **not** at its rule's canonical path and keeps its rows,
+    so no hand assignment is lost; the user can delete, merge or rename the demoted tag. A
+    carrier at the path holds only rule output and stays the rule's tag. After that pass,
+    renames and moves work by key. (Should two tags ever carry a key afterwards, the one at
+    the path, else the oldest, keeps it; the other is demoted with its rows.)
   - **Facets vs auto-tags**: want it shared/exported → **auto-tag**; purely-internal
     filtering you'd never share (has-GPS, shot-on-mobile, drone) → **facet**.
   - **Filter bar**: the catalog ANDs culling + tag + album in

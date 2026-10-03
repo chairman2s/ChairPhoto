@@ -11297,6 +11297,7 @@ version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b619f8c85654798007fb10afa5125590b43b088c225a25fc2fec100a9fad0fc6"
 dependencies = [
+ "indexmap 2.14.0",
  "xml-rs",
 ]
 

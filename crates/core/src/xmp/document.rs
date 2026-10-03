@@ -735,7 +735,7 @@ fn remove_owned(desc: &mut Element, owned: &[(&str, &str)]) {
         .cloned()
         .collect();
     for key in doomed {
-        desc.attributes.remove(&key);
+        desc.attributes.shift_remove(&key);
     }
 }
 

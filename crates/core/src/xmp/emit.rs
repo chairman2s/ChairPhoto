@@ -17,6 +17,7 @@
 
 use xml::namespace::NamespaceStack;
 use xmltree::{Element, Namespace, XMLNode};
+use super::parse::rename_attr;
 
 /// Serialise `root` as a sidecar, after [`fit_prefixes`].
 pub(super) fn serialize(root: &mut Element) -> Result<Vec<u8>, String> {
@@ -79,8 +80,7 @@ fn fit_attributes(e: &mut Element, scope: &mut NamespaceStack) {
     for (key, local, uri) in wrong {
         let preferred = key.split_once(':').map_or("ns", |(p, _)| p).to_string();
         let prefix = usable_prefix(e, scope, &uri, &preferred);
-        let value = e.attributes.remove(&key).expect("collected from the keys");
-        e.attributes.insert(format!("{prefix}:{local}"), value);
+        rename_attr(e, &key, format!("{prefix}:{local}"));
     }
 }
 
@@ -177,6 +177,46 @@ mod tests {
         assert!((lat - 63.4305).abs() < 1e-6 && (lng - 10.3951).abs() < 1e-6, "{lat},{lng}");
         let names: Vec<String> = read_face_regions(&photo).into_iter().map(|r| r.name).collect();
         assert_eq!(names, ["Ann"], "{xml}");
+    }
+
+    // ── attribute order (#143 review, T6) ────────────────────────────────────
+
+    /// Attributes in an order no map would produce by itself (neither sorted nor hashed).
+    const ORDERED: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<x:xmpmeta xmlns:x="adobe:ns:meta/">
+ <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+  <rdf:Description rdf:about=""
+    xmlns:xmp="http://ns.adobe.com/xap/1.0/"
+    xmlns:darktable="http://darktable.sf.net/"
+    xmlns:crs="http://ns.adobe.com/camera-raw-settings/1.0/"
+    xmp:Rating="1" darktable:xmp_version="5" crs:Exposure2012="+0.50"
+    darktable:auto_presets_applied="1" xmp:Label="Red" crs:Contrast2012="+10"/>
+ </rdf:RDF>
+</x:xmpmeta>"#;
+
+    /// A write keeps the file's attribute order, and writing again changes nothing but
+    /// `chairphoto:LastWrite`: with xmltree's default `HashMap` every parse reordered them, so
+    /// each write churned the file (noisy diffs, sync traffic).
+    #[test]
+    fn writes_keep_attribute_order_and_are_byte_stable() {
+        let (_dir, photo) = seeded_photo("xmp-143-attr-order", ORDERED);
+        let uuid = "6f1c1f0e-8f5e-4a51-9a51-3c1b2a0d1433";
+        let masked = || {
+            let xml = read(&sidecar_path(&photo));
+            let start = xml.find("<chairphoto:LastWrite>").expect("stamped");
+            let end = xml.find("</chairphoto:LastWrite>").unwrap();
+            format!("{}{}", &xml[..start], &xml[end..])
+        };
+        write_identifier(&photo, uuid).unwrap();
+        let first = masked();
+        assert!(
+            first.contains(r#" rdf:about="" xmp:Rating="1" darktable:xmp_version="5" crs:Exposure2012="+0.50" darktable:auto_presets_applied="1" xmp:Label="Red" crs:Contrast2012="+10""#),
+            "{first}"
+        );
+        for _ in 0..3 {
+            write_identifier(&photo, uuid).unwrap();
+            assert_eq!(masked(), first);
+        }
     }
 
     // ── a prefix rebound and bound back (#143 item 5) ───────────────────────

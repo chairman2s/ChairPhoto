@@ -96,6 +96,17 @@ pub(super) fn attr_ns<'a>(e: &'a Element, key: &str) -> Option<&'a str> {
     e.namespaces.as_ref()?.get(prefix)
 }
 
+/// Rename attribute `from` of `e` to `to`, keeping its value and its place in the order
+/// (attributes are an ordered map, so a write keeps the file's attribute order). Returns
+/// whether `from` was there.
+pub(super) fn rename_attr(e: &mut Element, from: &str, to: String) -> bool {
+    let Some((index, _, value)) = e.attributes.shift_remove_full(from) else {
+        return false;
+    };
+    e.attributes.shift_insert(index, to, value);
+    true
+}
+
 /// The value of attribute `{ns}local` on `e`, whatever prefix the file bound `ns` to.
 pub(super) fn ns_attr<'a>(e: &'a Element, ns: &str, local: &str) -> Option<&'a str> {
     e.attributes

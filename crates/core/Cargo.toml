@@ -116,7 +116,9 @@ image = "0.25"
 lru = "0.12"
 thiserror = "2"
 base64 = "0.22"
-xmltree = "0.11"
+# `attribute-order`: attributes in an IndexMap, so a sidecar write keeps the file's attribute
+# order instead of reordering it on every parse (#143 review T6). indexmap 2 is already in the lock.
+xmltree = { version = "0.11", features = ["attribute-order"] }
 # The XML reader under `xmltree`, used directly by `xmp::parse_xml` so prefixed attributes keep
 # their prefix (xmltree 0.11's own parser keeps only the local name; issue #138). Already
 # resolved in Cargo.lock at 0.8.28 as xmltree's dependency, so no new download.

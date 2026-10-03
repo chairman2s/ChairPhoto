@@ -39,7 +39,7 @@
 use xmltree::{Element, Namespace, XMLNode};
 use super::dom::{child, is_rdf, prefix_for_ns};
 use super::ns::{NS_MWG_RS, NS_RDF, NS_STAREA, NS_STDIM};
-use super::parse::{attr_is, ns_attr, parse_xml};
+use super::parse::{attr_is, ns_attr, parse_xml, rename_attr};
 
 /// Parse a sidecar for a reader: [`parse_xml`], then, when ChairPhoto wrote the file
 /// (`chairphoto:LastWrite`), the same in-memory repair a writer applies — with nothing written
@@ -160,8 +160,7 @@ fn restore_xml_lang(li: &mut Element, count: &mut usize) {
     if li.attributes.contains_key("xml:lang") {
         return;
     }
-    if let Some(v) = li.attributes.remove("lang") {
-        li.attributes.insert("xml:lang".to_string(), v);
+    if rename_attr(li, "lang", "xml:lang".to_string()) {
         *count += 1;
     }
 }
@@ -182,7 +181,7 @@ fn drop_shadowed_about(e: &mut Element, count: &mut usize) -> Result<(), String>
     if !inserted.is_empty() && *inserted != original {
         return Err(format!("rdf:Description has about={original:?} and rdf:about={inserted:?}"));
     }
-    e.attributes.remove("about");
+    e.attributes.shift_remove("about");
     e.attributes.insert(key, original);
     *count += 1;
     Ok(())
@@ -192,9 +191,9 @@ fn drop_shadowed_about(e: &mut Element, count: &mut usize) -> Result<(), String>
 /// bind to `ns` (binding `preferred`, or a fresh one, if none does). `Err` when `e` already has
 /// `{ns}local`, as an attribute or a child element.
 fn restore(e: &mut Element, local: &str, ns: &str, preferred: &str, count: &mut usize) -> Result<(), String> {
-    let Some(value) = e.attributes.get(local).cloned() else {
+    if !e.attributes.contains_key(local) {
         return Ok(());
-    };
+    }
     if ns_attr(e, ns, local).is_some() || child(e, ns, local).is_some() {
         return Err(format!(
             "{{{}}}{} has both an unprefixed {local} and {{{ns}}}{local}",
@@ -203,8 +202,7 @@ fn restore(e: &mut Element, local: &str, ns: &str, preferred: &str, count: &mut 
         ));
     }
     let prefix = prefix_for_ns(e.namespaces.get_or_insert_with(Namespace::empty), ns, preferred);
-    e.attributes.remove(local);
-    e.attributes.insert(format!("{prefix}:{local}"), value);
+    rename_attr(e, local, format!("{prefix}:{local}"));
     *count += 1;
     Ok(())
 }
@@ -326,6 +324,8 @@ mod tests {
             .filter(|a| a.2.is_empty() && restored.contains(&a.3.as_str()))
             .collect();
         assert!(unprefixed.is_empty(), "{unprefixed:?}\n{xml}");
+        // Restored in place: the attribute order is the file's (#143 review, T6).
+        assert!(xml.contains(r#"stArea:x="0.8" stArea:y="0.7" stArea:w="0.1" stArea:h="0.2" stArea:unit="normalized" Confidence="87""#), "{xml}");
         // What has no knowable namespace is left as it was.
         assert!(has_attr(&xml, (NS_MWG_RS, "Area"), ("", "Confidence"), "87"), "{xml}");
         // Every region: the two foreign ones as they were, and ours.

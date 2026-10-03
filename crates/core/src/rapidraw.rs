@@ -24,7 +24,7 @@
 //! adopting the result as a **stacked child** of the original via `upsert_external_one` +
 //! `set_stack_parent` — the same association mechanism the develop round-trip uses.
 
-use crate::app::{AppState, CatalogIdentity, CoreEvent, EventSink, CATALOG_CHANGED};
+use crate::app::{identity_of, AppState, CatalogIdentity, CoreEvent, EventSink, CATALOG_CHANGED};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -51,15 +51,22 @@ struct InFlight {
     flag: Arc<AtomicBool>,
 }
 
-/// The cancel registry: per photo, the round-trip in flight and its abandon flag; per job id,
-/// the flag of a round-trip queued but not started yet ([`queue_job`]). One mutex for both,
-/// so a cancel always finds a job's flag: a starting worker registers it in flight before it
-/// leaves the queue. A `cancel_rapidraw` command trips the flag; the worker checks it before
-/// launching and the watcher loop each tick. Kept module-local (rather than on `AppState`) so
-/// this feature is self-contained.
+/// The cancel registry: per (catalog, photo), the round-trip in flight and its abandon flag;
+/// per job id, the flag of a round-trip queued but not started yet ([`queue_job`]). One mutex
+/// for both, so a cancel always finds a job's flag: a starting worker registers it in flight
+/// before it leaves the queue. A `cancel_rapidraw` command trips the flag; the worker checks it
+/// before launching and the watcher loop each tick. Kept module-local (rather than on
+/// `AppState`) so this feature is mostly self-contained — the one exception is
+/// [`trip_catalog`], which a catalog switch/re-root calls so a wait with no timeout does not
+/// outlive the catalog it was registered under (#188).
+///
+/// Keyed by `(CatalogIdentity, photo_id)`, not `photo_id` alone: photo ids collide across
+/// catalogs, so two catalogs' same-id photos would otherwise share one slot — a false "already
+/// being edited" refusal in the second catalog, and an unscoped Cancel able to trip the first
+/// catalog's round-trip from the second (#188).
 #[derive(Default)]
 struct Registry {
-    in_flight: HashMap<i64, InFlight>,
+    in_flight: HashMap<(CatalogIdentity, i64), InFlight>,
     queued: HashMap<u64, Arc<AtomicBool>>,
 }
 
@@ -104,15 +111,15 @@ pub fn queue_job() -> QueuedJob {
     QueuedJob { id, flag }
 }
 
-/// Register `flag` as the cancel flag of `photo_id`'s round-trip (owned by `job_id`) and return
-/// it, or `None` if an edit for this photo is already in flight. Rejecting the second edit
-/// (rather than replacing the entry) keeps each worker's `clear_cancel` unambiguous — otherwise
-/// the first worker's clear would drop the second's flag, leaving the second watcher
-/// uncancellable. It also matches RapidRAW's single-instance nature: a second launch on the
-/// same photo forwards into the first anyway.
-fn register_cancel(photo_id: i64, job_id: u64, flag: Arc<AtomicBool>) -> Option<Arc<AtomicBool>> {
+/// Register `flag` as the cancel flag of `identity`'s `photo_id` round-trip (owned by
+/// `job_id`) and return it, or `None` if an edit for this (catalog, photo) is already in
+/// flight. Rejecting the second edit (rather than replacing the entry) keeps each worker's
+/// `clear_cancel` unambiguous — otherwise the first worker's clear would drop the second's
+/// flag, leaving the second watcher uncancellable. It also matches RapidRAW's single-instance
+/// nature: a second launch on the same photo forwards into the first anyway.
+fn register_cancel(identity: CatalogIdentity, photo_id: i64, job_id: u64, flag: Arc<AtomicBool>) -> Option<Arc<AtomicBool>> {
     use std::collections::hash_map::Entry;
-    match registry().in_flight.entry(photo_id) {
+    match registry().in_flight.entry((identity, photo_id)) {
         Entry::Occupied(_) => None,
         Entry::Vacant(v) => {
             v.insert(InFlight { job_id, flag: flag.clone() });
@@ -121,9 +128,27 @@ fn register_cancel(photo_id: i64, job_id: u64, flag: Arc<AtomicBool>) -> Option<
     }
 }
 
-/// Remove the cancel flag for `photo_id` once its workflow has ended (on every path).
-fn clear_cancel(photo_id: i64) {
-    registry().in_flight.remove(&photo_id);
+/// Remove the cancel flag for `identity`'s `photo_id` once its workflow has ended (on every
+/// path).
+fn clear_cancel(identity: CatalogIdentity, photo_id: i64) {
+    registry().in_flight.remove(&(identity, photo_id));
+}
+
+/// Trip the cancel flag of every round-trip in flight for `identity`'s catalog. Called when
+/// that catalog is detached by a switch or a re-root (`catalogs::switch_catalog_in`,
+/// `catalogs::reroot`), so a wait with no timeout (the forwarded/closed-without-Done case)
+/// does not linger forever unreachable once the front end drops its own per-photo tracking on
+/// the switch — the watcher ends on its next poll and `clear_cancel`s itself, same as a user
+/// Cancel (#188). A round-trip queued but not yet running has no identity yet: it is
+/// unaffected here, and `resolve` fails closed for a bound queue if it runs against a
+/// different catalog once its worker starts.
+pub(crate) fn trip_catalog(identity: CatalogIdentity) {
+    let registry = registry();
+    for ((entry_identity, _), in_flight) in registry.in_flight.iter() {
+        if *entry_identity == identity {
+            in_flight.flag.store(true, Ordering::Relaxed);
+        }
+    }
 }
 
 /// Whether a command is runnable: an absolute/relative path is checked directly; a bare name
@@ -239,23 +264,30 @@ impl Resolved {
 /// `expected`: the catalog the photo id was read from (`None` = whichever is open, the Tauri
 /// command's unbound form), checked under the same lock hold as the path lookup — once
 /// another catalog is open this fails closed with [`CATALOG_CHANGED`] and nothing launches.
-fn resolve(state: &AppState, expected: Option<CatalogIdentity>, photo_id: i64) -> Result<Resolved, String> {
+/// Also returns the resolved catalog's identity (even when `expected` was `None`), captured
+/// under that same lock hold, so the in-flight registry entry is always scoped to the actual
+/// catalog this round-trip runs against (#188).
+fn resolve(state: &AppState, expected: Option<CatalogIdentity>, photo_id: i64) -> Result<(Resolved, CatalogIdentity), String> {
     let guard = state.catalog.lock().map_err(|e| e.to_string())?;
     let catalog = guard.as_ref().ok_or("No catalog is open")?;
     if expected.is_some_and(|e| !e.is(catalog)) {
         return Err(CATALOG_CHANGED.into());
     }
+    let identity = identity_of(catalog);
     let source = catalog.require_photo_path(photo_id).map_err(|e| e.to_string())?;
     let bin = resolved_bin(catalog)
         .ok_or("RapidRAW is not configured — set its path in Preferences → Editors")?;
-    Ok(Resolved {
-        db_path: catalog.db_path().to_path_buf(),
-        root: catalog.root().to_path_buf(),
-        source,
-        source_photo_id: photo_id,
-        bin,
-        format: resolved_format(catalog),
-    })
+    Ok((
+        Resolved {
+            db_path: catalog.db_path().to_path_buf(),
+            root: catalog.root().to_path_buf(),
+            source,
+            source_photo_id: photo_id,
+            bin,
+            format: resolved_format(catalog),
+        },
+        identity,
+    ))
 }
 
 /// `<parent>/<stem>-rapidraw.<ext>`, bumping ` (2)`, ` (3)`… on collision (never overwrite).
@@ -464,8 +496,8 @@ async fn edit(
         emit(&state, photo_id, job_id, "cancelled", "");
         return Ok(None);
     }
-    let r = resolve(&state, expected, photo_id)?;
-    let cancel = register_cancel(photo_id, job_id, job.flag.clone())
+    let (r, identity) = resolve(&state, expected, photo_id)?;
+    let cancel = register_cancel(identity, photo_id, job_id, job.flag.clone())
         .ok_or("This photo is already being edited in RapidRAW — finish or cancel that edit first")?;
     // In flight now (same flag), so it leaves the queue: a cancel finds it either way.
     drop(job);
@@ -479,7 +511,7 @@ async fn edit(
     // Whatever happened — including a panic inside the worker (JoinError) — the photo must
     // not stay "editing": clear the flag BEFORE propagating any error, and on the terminal
     // non-"done" outcomes emit the matching phase so the UI drops its indicator.
-    clear_cancel(photo_id);
+    clear_cancel(identity, photo_id);
     let result = joined.map_err(|e| e.to_string())?;
     match &result {
         Ok(None) => emit(&state, photo_id, job_id, "cancelled", ""),
@@ -489,22 +521,32 @@ async fn edit(
     result
 }
 
-/// Cancel an in-flight RapidRAW wait for `photo_id`. Trips the watcher's cancel flag so it
-/// abandons the wait (used both to give up on a forwarded session and to resolve the
-/// "closed without Done" case, which the app can't distinguish from forwarding).
-pub fn cancel_rapidraw(photo_id: i64) -> Result<(), String> {
-    if let Some(in_flight) = registry().in_flight.get(&photo_id) {
-        in_flight.flag.store(true, Ordering::Relaxed);
-    }
+/// Cancel an in-flight RapidRAW wait for `photo_id`, scoped to the catalog open right now (the
+/// Tauri/React command has no identity of its own to pass — #188): trips the watcher's cancel
+/// flag so it abandons the wait (used both to give up on a forwarded session and to resolve
+/// the "closed without Done" case, which the app can't distinguish from forwarding). A switch
+/// since the round-trip started means this call's identity no longer matches that entry's, so
+/// it is left alone — Cancel from the newly open catalog never reaches another catalog's
+/// round-trip. No catalog open: a no-op, as a missing entry always was.
+pub fn cancel_rapidraw(state: &AppState, photo_id: i64) -> Result<(), String> {
+    let Ok(identity) = crate::app::catalog_identity(state) else { return Ok(()) };
+    cancel_rapidraw_in(identity, photo_id);
     Ok(())
 }
 
-/// [`cancel_rapidraw`], only if `job_id` is the round-trip in flight for `photo_id` — or one
-/// still queued ([`queue_job`]), which then never launches: a front end that followed one job
-/// cannot cancel another (one started later, or on the same photo id in another catalog).
-pub fn cancel_rapidraw_job(photo_id: i64, job_id: u64) -> Result<(), String> {
+fn cancel_rapidraw_in(identity: CatalogIdentity, photo_id: i64) {
+    if let Some(in_flight) = registry().in_flight.get(&(identity, photo_id)) {
+        in_flight.flag.store(true, Ordering::Relaxed);
+    }
+}
+
+/// [`cancel_rapidraw`], only if `job_id` is the round-trip in flight for `identity`'s
+/// `photo_id` — or one still queued ([`queue_job`]), which then never launches: a front end
+/// that followed one job cannot cancel another (one started later, or one on the same photo id
+/// in another catalog, #188).
+pub fn cancel_rapidraw_job(identity: CatalogIdentity, photo_id: i64, job_id: u64) -> Result<(), String> {
     let registry = registry();
-    let flag = match registry.in_flight.get(&photo_id) {
+    let flag = match registry.in_flight.get(&(identity, photo_id)) {
         Some(in_flight) if in_flight.job_id == job_id => Some(&in_flight.flag),
         _ => registry.queued.get(&job_id),
     };
@@ -556,41 +598,177 @@ mod tests {
         assert_eq!(std::fs::read(&out).unwrap(), b"chunk-onechunk-two");
     }
 
+    /// A catalog with a brief, unique identity, for tests that only need one to key the
+    /// registry with (not a real photo or round-trip).
+    fn identity_only(tag: &str) -> CatalogIdentity {
+        let dir = crate::test_support::TestTmpDir::new(&format!("rapidraw-registry-{tag}"));
+        let c = Catalog::open(&dir.join("c.chairphoto"), &dir.join("photos")).unwrap();
+        let state = AppState::default();
+        *state.catalog.lock().unwrap() = Some(c);
+        crate::app::catalog_identity(&state).unwrap()
+    }
+
     #[test]
     fn register_cancel_rejects_a_second_edit_and_frees_after_clear() {
+        let dir = crate::test_support::TestTmpDir::new("rapidraw-registry-single");
+        let c = Catalog::open(&dir.join("c.chairphoto"), &dir.join("photos")).unwrap();
+        let state = AppState::default();
+        *state.catalog.lock().unwrap() = Some(c);
+        let identity = crate::app::catalog_identity(&state).unwrap();
         // Use a photo id unlikely to collide with any other test in this module.
         let pid = 987_654_321;
-        clear_cancel(pid); // ensure a clean slate regardless of test order
+        clear_cancel(identity, pid); // ensure a clean slate regardless of test order
 
         // First edit registers a flag.
-        let first = register_cancel(pid, 1, Arc::default()).expect("first edit registers a cancel flag");
-        // A second edit for the SAME photo is rejected — it must NOT overwrite the entry
-        // (otherwise the first worker's clear_cancel would drop the second's flag).
-        assert!(register_cancel(pid, 2, Arc::default()).is_none(), "a second in-flight edit must be rejected");
+        let first = register_cancel(identity, pid, 1, Arc::default()).expect("first edit registers a cancel flag");
+        // A second edit for the SAME (catalog, photo) is rejected — it must NOT overwrite the
+        // entry (otherwise the first worker's clear_cancel would drop the second's flag).
+        assert!(register_cancel(identity, pid, 2, Arc::default()).is_none(), "a second in-flight edit must be rejected");
 
-        // cancel_rapidraw still targets the (single) in-flight flag.
-        cancel_rapidraw(pid).unwrap();
+        // cancel_rapidraw, scoped to the catalog open now, still targets the in-flight flag.
+        cancel_rapidraw(&state, pid).unwrap();
         assert!(first.load(Ordering::Relaxed), "cancel must trip the registered flag");
 
         // Once the first worker clears its entry, a fresh edit can register again.
-        clear_cancel(pid);
-        assert!(register_cancel(pid, 3, Arc::default()).is_some(), "after clear, a new edit registers");
-        clear_cancel(pid);
+        clear_cancel(identity, pid);
+        assert!(register_cancel(identity, pid, 3, Arc::default()).is_some(), "after clear, a new edit registers");
+        clear_cancel(identity, pid);
     }
 
     #[test]
     fn cancel_by_job_trips_only_the_job_in_flight() {
+        let identity = identity_only("job");
         let pid = 987_654_322;
-        clear_cancel(pid);
+        clear_cancel(identity, pid);
         let (old, new) = (next_job_id(), next_job_id());
         assert_ne!(old, new, "job ids are never reused");
-        let flag = register_cancel(pid, new, Arc::default()).expect("registers");
+        let flag = register_cancel(identity, pid, new, Arc::default()).expect("registers");
 
-        cancel_rapidraw_job(pid, old).unwrap();
+        cancel_rapidraw_job(identity, pid, old).unwrap();
         assert!(!flag.load(Ordering::Relaxed), "another job's cancel must not trip this one");
-        cancel_rapidraw_job(pid, new).unwrap();
+        cancel_rapidraw_job(identity, pid, new).unwrap();
         assert!(flag.load(Ordering::Relaxed), "its own job id cancels it");
-        clear_cancel(pid);
+        clear_cancel(identity, pid);
+    }
+
+    /// Two catalogs whose same-id photo is being edited at once (#188): the second catalog's
+    /// edit is not refused by the first's entry, and cancelling the second never trips the
+    /// first's flag — the registry key is `(CatalogIdentity, photo_id)`, not `photo_id` alone.
+    /// (Mutation-checked: keying `in_flight` by `photo_id` alone, as before #188, makes the
+    /// second `register_cancel` return `None` and this fails.)
+    #[test]
+    fn two_catalogs_with_the_same_photo_id_do_not_collide() {
+        let (a, b) = (identity_only("collide-a"), identity_only("collide-b"));
+        assert_ne!(a, b);
+        let pid = 987_654_323; // shared id, as real catalogs' colliding ids are
+        clear_cancel(a, pid);
+        clear_cancel(b, pid);
+
+        let a_flag = register_cancel(a, pid, 1, Arc::default()).expect("A's edit registers");
+        let b_flag = register_cancel(b, pid, 2, Arc::default()).expect("B's edit on the same id is unaffected by A's");
+
+        cancel_rapidraw_in(b, pid);
+        assert!(b_flag.load(Ordering::Relaxed), "cancel in B trips B's flag");
+        assert!(!a_flag.load(Ordering::Relaxed), "cancel in B must never trip A's flag");
+
+        clear_cancel(a, pid);
+        clear_cancel(b, pid);
+    }
+
+    /// A catalog switch trips every round-trip still in flight for the catalog left behind, so
+    /// a wait with no timeout does not outlive it; a round-trip of another catalog (even one
+    /// sharing the photo id) is untouched (#188).
+    /// (Mutation-checked: an empty `trip_catalog` body leaves `a_flag` untripped and this fails.)
+    #[test]
+    fn trip_catalog_trips_only_that_catalogs_round_trips() {
+        let (a, b) = (identity_only("trip-a"), identity_only("trip-b"));
+        let pid = 987_654_324;
+        clear_cancel(a, pid);
+        clear_cancel(b, pid);
+        let a_flag = register_cancel(a, pid, 1, Arc::default()).expect("A's edit registers");
+        let b_flag = register_cancel(b, pid, 2, Arc::default()).expect("B's edit registers");
+
+        trip_catalog(a);
+        assert!(a_flag.load(Ordering::Relaxed), "A's round-trip is tripped on A's switch-away");
+        assert!(!b_flag.load(Ordering::Relaxed), "B's round-trip is untouched");
+
+        clear_cancel(a, pid);
+        clear_cancel(b, pid);
+    }
+
+    /// #188, through the real API (adapts the batch1 review's probe P1): catalog A's photo 7
+    /// is registered in flight (what `edit()` does before spawning its watcher); the app
+    /// switches to catalog B, whose photo 7 collides. Before #188 the registry was keyed by
+    /// photo id alone, so B's `edit_in_rapidraw_as` was refused with "already being edited" by
+    /// A's entry — `resolve` now captures B's own identity under the same lock as the path
+    /// lookup, so B's `register_cancel` is a distinct entry and the edit proceeds (to a real
+    /// launch of `/bin/false`, which then fails — the point here is the refusal that used to
+    /// happen before any launch, not the launch itself).
+    /// (Mutation-checked: hard-coding `resolve`'s returned identity to `a_identity` instead of
+    /// the resolved catalog's own reproduces the refusal and this fails.)
+    #[test]
+    fn a_switched_to_catalogs_colliding_photo_is_not_refused_by_the_old_catalogs_entry() {
+        let dir = crate::test_support::TestTmpDir::new("rapidraw-switch-collide");
+        let open = |name: &str| {
+            let root = dir.join(name);
+            let c = Catalog::open(&root.join(format!("{name}.chairphoto")), &root).unwrap();
+            c.set_setting(BIN_SETTING, "/bin/false").unwrap();
+            let mut id = 0;
+            for i in 0..7 {
+                let o = root.join(format!("{name}{i}.ARW"));
+                std::fs::write(&o, b"raw").unwrap();
+                id = c.upsert_photo(&o, None, 0, 1).unwrap().id;
+            }
+            (c, id)
+        };
+        let ((a, a_id), (b, b_id)) = (open("a"), open("b"));
+        assert_eq!(a_id, b_id, "the ids collide, as real catalogs' do");
+
+        let state = AppState::default();
+        *state.catalog.lock().unwrap() = Some(a);
+        let a_identity = crate::app::catalog_identity(&state).unwrap();
+        register_cancel(a_identity, a_id, 424242, Arc::default()).expect("A registers");
+
+        crate::app::detach_catalog_and_trip_jobs(&state).unwrap();
+        crate::app::publish_catalog_and_reset_jobs(&state, b).unwrap();
+        let b_identity = crate::app::catalog_identity(&state).unwrap();
+        let rt = crate::app::runtime();
+
+        let r = rt.block_on(edit_in_rapidraw_as(state.clone(), b_identity, b_id, queue_job()));
+        assert!(
+            r.as_ref().err().map_or(true, |e| !e.contains("already being edited")),
+            "B's edit must not be refused by A's in-flight entry at the same photo id: {r:?}"
+        );
+        // Confirms the edit actually reached the launch (so the above is a real negative, not
+        // an early return for an unrelated reason): `/bin/false` always exits nonzero.
+        assert!(r.as_ref().err().is_some_and(|e| e.contains("RapidRAW exited with an error")), "{r:?}");
+        clear_cancel(a_identity, a_id);
+    }
+
+    /// #188, end-to-end: a real `switch_catalog` — not just `trip_catalog` in isolation — trips
+    /// a round-trip registered for the catalog being left, through the
+    /// `detach_catalog_and_trip_jobs_with` hook `catalogs::switch_catalog_in` calls it under.
+    /// (Mutation-checked: reverting that call site to the plain `detach_catalog_and_trip_jobs`
+    /// — dropping the `before_drop` closure that calls `trip_catalog` — leaves `flag`
+    /// untripped and this fails.)
+    #[test]
+    fn a_real_catalog_switch_trips_a_waiting_round_trip() {
+        let dir = crate::test_support::TestTmpDir::new("rapidraw-switch-trip");
+        let a_root = dir.join("a");
+        std::fs::create_dir_all(&a_root).unwrap();
+        let a = Catalog::open(&dir.join("a.chairphoto"), &a_root).unwrap();
+        let state = AppState::default();
+        *state.catalog.lock().unwrap() = Some(a);
+        let a_identity = crate::app::catalog_identity(&state).unwrap();
+        let pid = 987_654_330;
+        clear_cancel(a_identity, pid);
+        let flag = register_cancel(a_identity, pid, 1, Arc::default()).expect("registers");
+
+        crate::app::catalogs::switch_catalog(&state, &dir.join("b.chairphoto"), &dir.join("b"), true, None)
+            .expect("switch to a fresh catalog");
+
+        assert!(flag.load(Ordering::Relaxed), "switching away from A must trip its waiting round-trip");
+        clear_cancel(a_identity, pid);
     }
 
     /// A job cancelled while queued (#108 gate): `cancel_rapidraw_job` before the worker
@@ -608,7 +786,7 @@ mod tests {
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
         let c = Catalog::open(&dir.join("c.chairphoto"), &dir.join("photos")).unwrap();
         c.set_setting(BIN_SETTING, script.to_str().unwrap()).unwrap();
-        // Photo 3: other tests in this binary edit photo 1, and the registry is per photo id.
+        // Photo 3: just needs its own catalog's photo — the registry is per (catalog, photo).
         let photo = (0..3)
             .map(|i| {
                 let original = dir.join(format!("photos/p{i}.ARW"));
@@ -625,7 +803,7 @@ mod tests {
 
         let job = queue_job();
         let id = job.id();
-        cancel_rapidraw_job(photo, id).unwrap();
+        cancel_rapidraw_job(from, photo, id).unwrap();
         assert_eq!(rt.block_on(edit_in_rapidraw_as(state.clone(), from, photo, job)), Ok(None));
         assert!(!log.exists(), "launched after its cancel: {:?}", std::fs::read_to_string(&log));
         assert!(!registry().queued.contains_key(&id), "the job left the queue");

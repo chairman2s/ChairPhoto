@@ -144,6 +144,11 @@ impl IdentityDebtPanel {
                 this.confirm_overwrite = None;
                 this.resolve_result = None;
                 this.action_error = None;
+                // The new catalog's page 0 opens at the top, not wherever the old one's list
+                // happened to be scrolled to (#200; `set_page`/`set_owed_page` already do this
+                // for an ordinary page change).
+                this.debt_scroll.scroll_to_item(0, ScrollStrategy::Top);
+                this.owed_scroll.scroll_to_item(0, ScrollStrategy::Top);
                 this.reload_summary(cx);
                 this.reload_page(cx);
                 this.reload_owed(cx);

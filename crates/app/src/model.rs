@@ -232,8 +232,17 @@ impl AppModel {
         cx.notify();
     }
 
-    /// The Library's first rows landed (React's `finishBootPart("photos")`).
+    /// The Library's first rows landed (React's `finishBootPart("photos")`). Ignored before
+    /// the catalog has actually been read (`catalog_current`): the splash overlay occludes
+    /// only the pointer, so a keyboard shortcut (a filter key, say) can still reach the
+    /// Library and ask for a row read before the boot's own first read even runs. That read
+    /// has nothing to read yet and fails ("No catalog is open") — on its own terms a row
+    /// read's answer, landed — but it must not count as the real first rows landing, or the
+    /// splash can fade as soon as the init chain ends, before they do (#194).
     pub fn boot_photos_loaded(&mut self, cx: &mut Context<Self>) {
+        if !self.catalog_current {
+            return;
+        }
         if self.splash.stage().is_some() && self.splash.finish_photos() {
             self.fade_splash(cx);
         }

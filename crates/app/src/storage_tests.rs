@@ -1607,6 +1607,31 @@ fn a_resolution_on_a_scrolled_row_acts_on_that_copy(cx: &mut TestAppContext) {
     });
 }
 
+/// **#200.** The identity-debt panel's scroll offset follows a catalog switch: scrolled well
+/// down in the queue, `catalog:switched` must open the re-read page at the top — `set_page`
+/// already does this for an ordinary page change; the switch branch did not.
+/// (Mutation-checked: dropping the two `scroll_to_item(0, Top)` resets the switch branch adds
+/// leaves the handle where it was — row 0 stays off screen after the switch — and this fails.)
+#[gpui_kit::test]
+fn a_switch_resets_the_debt_panels_scroll_to_the_top(cx: &mut TestAppContext) {
+    const N: usize = 60;
+    let dir = TempDir::new("debt-switch-scroll");
+    let app = start(cx);
+    catalog_with_debt(&app, &dir, N, cx);
+    let panel = open_debt_panel(&app, cx);
+    panel.read_with(cx, |p, _| assert_eq!(p.rows.as_ref().map(Vec::len), Some(N)));
+
+    panel.read_with(cx, |p, _| p.debt_scroll.scroll_to_item(N - 1, gpui_kit::ScrollStrategy::Bottom));
+    let scrolled = drawn(&app, "debt-row", N, cx);
+    assert!(!scrolled.contains(&0), "the precondition: scrolled away from row 0: {scrolled:?}");
+
+    storage_sees_switch(&app, cx);
+    work(cx);
+
+    let after = drawn(&app, "debt-row", N, cx);
+    assert!(after.contains(&0), "the re-read page must open at the top, not the old scroll offset: {after:?}");
+}
+
 /// The panel re-attaches to a pass already running when it opens (claimed elsewhere — by an
 /// earlier panel), follows its job id, and ends with its terminal event.
 #[gpui_kit::test]

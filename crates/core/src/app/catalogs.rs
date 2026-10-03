@@ -8,7 +8,7 @@
 //! ([`detach_catalog_and_trip_jobs`], [`publish_catalog_and_reset_jobs`]) `set_library_root`
 //! runs too.
 
-use super::{app_data_dir, begin_scan_generation, expand_home, spawn_blocking, AppState, CatalogIdentity, CATALOG_CHANGED};
+use super::{app_data_dir, begin_scan_generation, expand_home, identity_of, spawn_blocking, AppState, CatalogIdentity, CATALOG_CHANGED};
 use super::events::{CoreEvent, EventSink};
 use crate::catalog::Catalog;
 use serde::{Deserialize, Serialize};
@@ -217,7 +217,17 @@ pub fn switch_catalog_in(
         return Err(format!("Catalog file does not exist: {}", catalog_path.display()));
     }
 
-    detach_catalog_and_trip_jobs(state)?;
+    // RapidRAW's in-flight registry is module-local, not a `JobRegistry` family (it is keyed
+    // by catalog identity + photo id and has its own cross-process concerns — see
+    // `rapidraw::Registry`'s doc), so it is tripped here rather than by `job_guards`: a wait
+    // with no timeout (the forwarded/closed-without-Done case) must not outlive the catalog it
+    // started on once this session has switched away (#188).
+    detach_catalog_and_trip_jobs_with(state, |old| {
+        if let Some(c) = old {
+            crate::rapidraw::trip_catalog(identity_of(c));
+        }
+        Ok(())
+    })?;
 
     if create {
         if let Some(parent) = catalog_path.parent() {
@@ -419,6 +429,9 @@ fn reroot(
         if expected.is_some_and(|e| !e.is(catalog)) {
             return Err(CATALOG_CHANGED.into());
         }
+        // Re-root reopens the same file under a fresh instance id, so this handle's identity
+        // never comes back either — same reasoning as a switch (#188).
+        crate::rapidraw::trip_catalog(identity_of(catalog));
         catalog.set_setting("catalog_root", &new_root.to_string_lossy()).map_err(|e| e.to_string())?;
         reopen.get_or_insert_with(|| catalog.db_path().to_path_buf());
         Ok(())

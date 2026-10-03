@@ -384,7 +384,11 @@ export function IdentityDebtPanel({
       reloadOwed(owedPageRef.current);
       onCountsChanged?.();
     } catch (e) {
-      // A refusal ("This photo is no longer in the catalog") names what it refused.
+      // A refusal ("This photo is no longer in the catalog") names what it refused. The list
+      // and count are re-read too, so a refused row (its photo gone) leaves the list (review
+      // of #153, N1). The re-read clears the error line, so the error is set after it.
+      reloadSummary();
+      reloadOwed(owedPageRef.current);
       setOwedError(String(e));
     } finally {
       setOwedBusy(null);

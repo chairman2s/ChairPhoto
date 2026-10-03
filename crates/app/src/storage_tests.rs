@@ -1022,6 +1022,25 @@ fn an_owed_click_in_the_frame_after_a_switch_never_reaches_the_new_catalog(cx: &
     assert_eq!(still_owed(&app), b_ids, "B's debt was dismissed by a click on A's row");
 }
 
+/// Review of #153, N1: an action the core refuses (here: the photo was removed behind the
+/// panel's back) shows the refusal and re-reads the list, so the gone row leaves it.
+#[gpui_kit::test]
+fn a_refused_owed_action_re_reads_the_list(cx: &mut TestAppContext) {
+    let dir = TempDir::new("debt-owed-refused");
+    let app = start(cx);
+    let ids = catalog_owing_iptc(&app, &dir, 2, cx);
+    let panel = open_debt_panel(&app, cx);
+    chairphoto_core::app::with_catalog(&app.state, |c| c.remove_photo(ids[0])).unwrap();
+    click(&app, "owed-retry-0", cx);
+    work(cx);
+    panel.read_with(cx, |p, _| {
+        assert_eq!(p.owed_error.as_deref(), Some(chairphoto_core::app::iptc_owed::OWED_PHOTO_GONE));
+        let listed: Vec<i64> = p.owed.as_ref().unwrap().iter().map(|r| r.photo_id).collect();
+        assert_eq!(listed, vec![ids[1]], "the gone row is still listed");
+        assert_eq!(p.summary.map(|s| s.iptc_owed), Some(1), "the count was re-read");
+    });
+}
+
 /// Review of #153, N2: a Retry from catalog A still in flight (waiting for its worker, or a
 /// long-held turn) does not keep B's buttons disabled after `catalog:switched`; and when A's
 /// answer finally lands it does not clear the busy flag of an action started on B's list.

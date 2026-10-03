@@ -259,8 +259,14 @@ impl IdentityDebtPanel {
                         // The title bar's debt count.
                         s.storage.update(cx, |st, cx| st.invalidate(cx));
                     }
-                    // A refusal names what it refused; shown verbatim.
-                    Err(e) => s.owed_error = Some(e),
+                    // A refusal names what it refused; shown verbatim. The list and count are
+                    // re-read too: a row the core refused (its photo gone) leaves the list
+                    // (review of #153, N1). The re-read clears the error, so it is set after.
+                    Err(e) => {
+                        s.reload_summary(cx);
+                        s.reload_owed(cx);
+                        s.owed_error = Some(e);
+                    }
                 }
                 cx.notify();
             })

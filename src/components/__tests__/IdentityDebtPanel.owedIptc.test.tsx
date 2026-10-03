@@ -155,9 +155,16 @@ describe("the owed-IPTC list", () => {
     // What `retry_owed_iptc` rejects with when the id no longer names the row's photo.
     retryAnswer = new Error("This photo is no longer in the catalog");
     render(<IdentityDebtPanel onClose={() => {}} onCountsChanged={onCountsChanged} />);
-    fireEvent.click(within(await screen.findByTestId("owed-row-7")).getByRole("button", { name: "Retry" }));
+    const row = await screen.findByTestId("owed-row-7");
+    const listsBefore = sent("list_owed_iptc").length;
+    owed = [owed[1]]; // photo 7 is gone: the backend no longer lists it
+    fireEvent.click(within(row).getByRole("button", { name: "Retry" }));
     await screen.findByText("This photo is no longer in the catalog");
     expect(onCountsChanged).not.toHaveBeenCalled();
+    // Review of #153, N1: the list is re-read after a refusal, so the gone row leaves it.
+    await waitFor(() => expect(sent("list_owed_iptc").length).toBeGreaterThan(listsBefore));
+    await waitFor(() => expect(screen.queryByTestId("owed-row-7")).toBeNull());
+    expect(screen.getByText("This photo is no longer in the catalog")).toBeTruthy();
   });
 });
 

@@ -140,7 +140,7 @@ section.
 | `src/components/shell/Menu.tsx` | Shell | #105 | `shell/title_bar.rs` | checked |
 | `src/components/shell/CommandPill.tsx` | Shell | #105 | `shell/command_pill.rs` | checked |
 | `src/components/shell/Bench.tsx` | Shell | #105, #114, #115 | `shell/bench.rs` | built |
-| `src/components/shell/CollectionBrowser.tsx` | Shell | #105 | `shell/sidebar.rs` | partial |
+| `src/components/shell/CollectionBrowser.tsx` | Shell | #105, #159 | `shell/sidebar.rs` | checked |
 | `src/components/shell/IconRail.tsx` | Shell | #105, #111, #122 | `shell/sidebar.rs` | built |
 | `src/components/shell/Inspector.tsx` | Shell | #105, #107 | `shell/inspector.rs` | built |
 | `src/components/shell/index.ts` | Shell | — | — | dropped |
@@ -547,7 +547,7 @@ Section state in localStorage `panel.section.{tags,smartAlbums,albums,batches}`.
 
 **Port ticket:** Shell chrome
 
-**Status:** partial (#105: `crates/app/src/shell/sidebar.rs`): All photos, Trash (count,
+**Status:** built (#105, #159: `crates/app/src/shell/sidebar.rs`): All photos, Trash (count,
 `OpenTrash`), collapsible tags / smart albums / albums / batches sections, module sidebar
 slot — built, visually checked 2026-10-03 (#163).
 `panel.section.*` restored from and written to `MachinePrefs` with React's values (#159,

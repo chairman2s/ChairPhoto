@@ -33,10 +33,16 @@
 //! since that reset is exactly as undurable as the merge it would undo. So
 //! [`MapState::migrate_consent`] holds the merge out of memory until its write is confirmed
 //! durable: on failure the catalog keeps its old answers (as before) but this machine's
-//! answers are untouched, so the affected hosts simply keep asking. [`MapState::set_consent`]
-//! (the user's own Allow/Block/Ask again) still applies at once — it is not an invisible
-//! background merge — but a write that fails is surfaced the same way:
-//! [`MapState::consent_write_error`], which Preferences' Map tab shows.
+//! answers are untouched, so the affected hosts simply keep asking. On success it replays
+//! the merge onto `self.consent` **as it stands at that moment**, never a snapshot taken
+//! before the write started — [`MapState::set_consent`] (Block, or "Ask again" on a host the
+//! legacy copy would Allow) can land on the UI thread at any point while the write is in
+//! flight, and must never be overwritten by a stale merge arriving after it (`merge_legacy`
+//! itself skips any host already answered, so replaying it late is safe). If that replay
+//! changes anything, it is persisted again, so a `set_consent` write racing the same disk
+//! key cannot silently drop the migrated answers either. `set_consent` itself still applies
+//! at once — it is not an invisible background merge — but a write that fails is surfaced
+//! the same way: [`MapState::consent_write_error`], which Preferences' Map tab shows.
 
 use super::logic::{Consent, HostConsent, MACHINE_TILE_HOSTS, TILE_HOSTS_KEY, TILE_URL_KEY};
 use crate::machine_prefs::MachinePrefs;
@@ -433,6 +439,8 @@ impl MapState {
         // Always attempted, even when the merge turns out to be a no-op (every host already
         // settled, or asking again): the catalog may still be holding a copy a previous
         // switch-interrupted clear (#198) left behind, and this is what finally clears it.
+        // This is a snapshot for the *first* write attempt only — see the confirm step below
+        // for why the race this leaves open does not reach `self.consent`.
         let mut merged = self.consent.clone();
         merged.merge_legacy(&legacy);
         let json = merged.to_json();
@@ -454,7 +462,21 @@ impl MapState {
             this.update(cx, |s, cx| {
                 match saved {
                     Ok(()) => {
-                        s.consent = merged;
+                        // Re-apply onto `self.consent` as it stands *now*, never the snapshot
+                        // taken before this write started: `set_consent` (Block, or "Ask
+                        // again" on a host the legacy copy would Allow) can run on the UI
+                        // thread at any point while this write is in flight, and its answer
+                        // must win, never be clobbered by a stale merge landing after it.
+                        // `merge_legacy` already skips any host with an answer or an "ask"
+                        // marker, so replaying it now is safe and idempotent.
+                        if s.consent.merge_legacy(&legacy) {
+                            // What changed here is exactly what a racing `set_consent` write
+                            // could have overwritten on disk (both write the whole map under
+                            // one key): make disk match memory again, with a fresh sequence
+                            // number so it is not itself undone by anything still in flight.
+                            let current = s.consent.to_json();
+                            MachinePrefs::set(cx, MACHINE_TILE_HOSTS, &current);
+                        }
                         s.consent_write_error = None;
                     }
                     Err(e) => {

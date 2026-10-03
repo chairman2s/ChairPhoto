@@ -596,6 +596,92 @@ fn a_failed_set_consent_write_still_applies_but_is_surfaced(cx: &mut TestAppCont
     assert!(state.read_with(cx, |s, _| s.consent_write_error().is_some()), "the failed write is surfaced");
 }
 
+/// **Security fix**: `migrate_consent`'s confirm step used to reassign `self.consent` to a
+/// snapshot taken before its write started. Here the user Blocks `b.example` — whose legacy
+/// copy would Allow it — while the migration's write is still queued (held at the same
+/// checkpoint `ask_again_survives_a_reread_after_a_switch_interrupted_the_clear` uses).
+/// Releasing the write must not undo the Block: it must win, in memory and on disk, and
+/// nothing is fetched from the host.
+#[gpui_kit::test]
+fn a_block_racing_the_migrations_write_is_not_overwritten(cx: &mut TestAppContext) {
+    let dir = TempDir::new("map-race-block");
+    let fake = Arc::new(FakeTiles::default());
+    cx.update(|cx| cx.set_global(MapTiles(fake.clone())));
+    let app = start(cx);
+    let prefs = dir.0.join("prefs").join(MACHINE_PREFS_FILE);
+    cx.update(|cx| cx.set_global(MachinePrefs::load(prefs.clone())));
+    open_catalog_with_photos(&app, &dir, 1, cx);
+    seed_b(&app); // the catalog's legacy copy allows b.example
+    work(&app, cx);
+    cx.update(|cx| ModuleRegistry::enable(&app.wired.modules, MAP_MODULE_ID, cx));
+    // The reads run and land; the merge's write (b.example: true) is queued, held here.
+    cx.update(|cx| Runner::get(cx).run_pending());
+    cx.run_until_parked();
+    assert!(cx.update(|cx| Runner::get(cx).pending()) > 0, "the migration's write is still queued");
+
+    // The user Blocks b.example while that write is in flight.
+    let m = Map { app, fake, ids: Vec::new() };
+    let state = map_state_via_settings(&m.app, cx);
+    state.update(cx, |s, cx| s.set_consent("b.example", Some(false), cx));
+    assert_eq!(state.read_with(cx, |s, _| s.host_consent().get("b.example")), Consent::Denied, "applied at once");
+
+    // Release both writes (the migration's, then the user's — or any interleaving).
+    work(&m.app, cx);
+
+    assert_eq!(
+        state.read_with(cx, |s, _| s.host_consent().get("b.example")),
+        Consent::Denied,
+        "the migration's confirm must not overwrite the user's Block"
+    );
+    assert_eq!(
+        MachinePrefs::load(prefs).get(MACHINE_TILE_HOSTS).as_deref(),
+        Some(r#"{"b.example":false}"#),
+        "and the persisted copy agrees, not the migration's stale Allow"
+    );
+    show_map(&m.app, cx);
+    assert_eq!(m.fake.count(), 0, "nothing fetched from a host the user blocked");
+}
+
+/// Same race, "Ask again" instead of Block: the host must keep asking, never be silently
+/// re-allowed by the migration's stale snapshot landing after the reset.
+#[gpui_kit::test]
+fn an_ask_again_racing_the_migrations_write_is_not_overwritten(cx: &mut TestAppContext) {
+    let dir = TempDir::new("map-race-ask");
+    let fake = Arc::new(FakeTiles::default());
+    cx.update(|cx| cx.set_global(MapTiles(fake.clone())));
+    let app = start(cx);
+    let prefs = dir.0.join("prefs").join(MACHINE_PREFS_FILE);
+    cx.update(|cx| cx.set_global(MachinePrefs::load(prefs.clone())));
+    open_catalog_with_photos(&app, &dir, 1, cx);
+    seed_b(&app);
+    work(&app, cx);
+    cx.update(|cx| ModuleRegistry::enable(&app.wired.modules, MAP_MODULE_ID, cx));
+    cx.update(|cx| Runner::get(cx).run_pending());
+    cx.run_until_parked();
+    assert!(cx.update(|cx| Runner::get(cx).pending()) > 0, "the migration's write is still queued");
+
+    let m = Map { app, fake, ids: Vec::new() };
+    let state = map_state_via_settings(&m.app, cx);
+    state.update(cx, |s, cx| s.set_consent("b.example", None, cx)); // "Ask again"
+    assert_eq!(state.read_with(cx, |s, _| s.host_consent().get("b.example")), Consent::Unknown, "applied at once");
+
+    work(&m.app, cx);
+
+    assert_eq!(
+        state.read_with(cx, |s, _| s.host_consent().get("b.example")),
+        Consent::Unknown,
+        "the migration's confirm must not silently re-allow the host"
+    );
+    assert_eq!(
+        MachinePrefs::load(prefs).get(MACHINE_TILE_HOSTS).as_deref(),
+        Some(r#"{"b.example":"ask"}"#),
+        "and the persisted copy still asks, not allows"
+    );
+    show_map(&m.app, cx);
+    let before = m.fake.count();
+    asks_for_b(&m, before, cx);
+}
+
 /// **#198**, the success path: the machine's copy is saved, but the core switches to
 /// another catalog before the clear runs, so `with_catalog_as(from)` refuses it and the old
 /// catalog keeps its answers. The user sends `b.example` back to "ask"; on that catalog's

@@ -310,6 +310,16 @@ impl LibrarySession {
         self.query_revision
     }
 
+    /// Advances on every row read started ([`Self::refresh`]) or disowned ([`LibraryQuery::clear`]
+    /// via a catalog switch), whether or not its answer changes `photos()` — unlike
+    /// [`query_revision`](Self::query_revision), which only moves when the query itself
+    /// changes. A caller that must redo work whenever the rows were *re-read* (a cover's
+    /// look or a version count may be new even though the filter didn't move — e.g. after
+    /// leaving Develop) wants this, not `query_revision`.
+    pub fn rows_generation(&self) -> u64 {
+        self.library.generation()
+    }
+
     /// Re-run the query: perform the returned request, then [`Self::apply_page`].
     pub fn refresh(&mut self) -> RefreshRequest {
         let query = self.query();

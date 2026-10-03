@@ -168,6 +168,38 @@ fn scan_done() -> CoreEvent {
 
 // --- ids ---------------------------------------------------------------------------------
 
+/// `bundled()` registers in `BUNDLED_MODULES` order (`src/modules/bundled.ts`) — what the
+/// Modules panel and the module tabs list by. Basic Editor is dropped (#104); the dev module
+/// is test/dev-only and first. (#161: the Tag graph had been registered after Faces.)
+#[test]
+fn bundled_modules_register_in_reacts_order() {
+    const REACT: [&str; 15] = [
+        "ai",
+        "basic-editor",
+        "tag-graph",
+        "statistics",
+        "instagram",
+        "flickr",
+        "smugmug",
+        "collage",
+        "slideshow",
+        "localsend",
+        "snapchat",
+        "obsidian",
+        "map",
+        "faces",
+        "smarttags",
+    ];
+    let ids: Vec<String> = bundled().iter().map(|m| m.meta().id.to_string()).filter(|id| id != "dev").collect();
+    let at: Vec<usize> = ids
+        .iter()
+        .map(|id| REACT.iter().position(|r| r == id).unwrap_or_else(|| panic!("{id} is not in BUNDLED_MODULES")))
+        .collect();
+    assert!(at.windows(2).all(|w| w[0] < w[1]), "out of React's order: {ids:?}");
+    #[cfg(all(feature = "tag-graph", feature = "faces", feature = "ai"))]
+    assert_eq!(ids.iter().position(|i| i == "tag-graph"), Some(1), "the Tag graph is right after AI tagging: {ids:?}");
+}
+
 #[test]
 fn module_ids_are_settings_namespaces() {
     assert!(validate_id("faces").is_ok());

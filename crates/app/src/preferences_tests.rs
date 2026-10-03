@@ -378,10 +378,7 @@ fn tag_maintenance_tidies_finds_and_deletes(cx: &mut TestAppContext) {
     assert!(t.read_with(cx, |t, _| t.busy.is_some()), "Looking…");
     work(cx);
     let pairs = t.read_with(cx, |t, _| t.duplicates.clone()).expect("found");
-    let i = pairs.iter().position(|p| [&p.a_path, &p.b_path].iter().all(|x| x.starts_with("Sunset"))).expect("Sunset/Sunsets");
-    let merge: &'static str = Box::leak(format!("tags-merge-a-{i}").into_boxed_str());
-    click(&app, merge, cx);
-    assert_eq!(t.read_with(cx, |t, _| t.status.clone()), Some(crate::model::not_yet_ported_line("Merge tags", 107)));
+    assert!(pairs.iter().any(|p| [&p.a_path, &p.b_path].iter().all(|x| x.starts_with("Sunset"))), "Sunset/Sunsets");
 
     click(&app, "tags-find-unused", cx);
     work(cx);
@@ -416,7 +413,205 @@ fn tag_maintenance_tidies_finds_and_deletes(cx: &mut TestAppContext) {
     assert_eq!(left, 0, "the branch went with its sub-tag");
 }
 
+/// Catalog A with the look-alike tags Sunset (1 photo) and Sunsets (1 photo); Preferences open
+/// on Tags with the duplicates found. Returns (Preferences, the section, Sunset, Sunsets, the
+/// button that merges Sunsets away).
+fn duplicates_found(
+    app: &App,
+    dir: &TempDir,
+    cx: &mut TestAppContext,
+) -> (Entity<Preferences>, Entity<TagMaintenance>, i64, i64, &'static str) {
+    let ids = open_catalog_with_photos(app, dir, 2, cx);
+    let (sunset, sunsets) = {
+        let guard = app.state.catalog.lock().unwrap();
+        let c = guard.as_ref().unwrap();
+        let sunset = c.create_tag("Sunset").unwrap();
+        let sunsets = c.create_tag("Sunsets").unwrap();
+        c.conn()
+            .execute("INSERT INTO photo_tags(photo_id, tag_id, created_at) VALUES(?1, ?2, 0), (?3, ?4, 0)", (ids[0], sunset, ids[1], sunsets))
+            .unwrap();
+        (sunset, sunsets)
+    };
+    // The tag tree re-reads on the model's next read, as after any catalog change.
+    app.wired.model.update(cx, |m, cx| m.refresh(cx));
+    cx.run_until_parked();
+    let p = open(app, cx);
+    tab(app, "prefs-tab-tags", cx);
+    let t = tags(&p, cx);
+    click(app, "tags-find-duplicates", cx);
+    work(cx);
+    let pairs = t.read_with(cx, |t, _| t.duplicates.clone()).expect("found");
+    let (i, pair) = pairs.iter().enumerate().find(|(_, p)| [p.a_id, p.b_id].contains(&sunsets)).expect("Sunset/Sunsets");
+    let side = if pair.a_id == sunsets { "a" } else { "b" };
+    let button: &'static str = Box::leak(format!("tags-merge-{side}-{i}").into_boxed_str());
+    (p, t, sunset, sunsets, button)
+}
+
+fn merge_dialog(app: &App, cx: &mut TestAppContext) -> Option<Entity<crate::tags::merge::TagMerge>> {
+    match app.wired.tags.read_with(cx, |t, _| t.last_dialog.clone()) {
+        Some(crate::tags::state::TagDialog::Merge(m)) => m.upgrade(),
+        _ => None,
+    }
+}
+
+/// Tags → "Merge Sunsets away…" opens the Tag panel's merge preview over Preferences; the
+/// merge commits, the preview closes, Preferences stays, and the section reports the merge
+/// and drops its stale lists. (#161)
+#[gpui_kit::test]
+fn merge_x_away_opens_the_merge_preview_over_preferences(cx: &mut TestAppContext) {
+    let dir = TempDir::new("prefs-tags-merge");
+    let app = start(cx);
+    let (_p, t, sunset, sunsets, button) = duplicates_found(&app, &dir, cx);
+
+    click(&app, button, cx);
+    settle(&app, cx);
+    let merge = merge_dialog(&app, cx).expect("the merge preview opened");
+    assert_eq!(merge.read_with(cx, |m, _| m.source.tag.id), sunsets);
+    assert!(present(&app, "tag-merge-list", cx) && present(&app, "prefs-tab-tags", cx), "the preview is over Preferences");
+    let target: &'static str = Box::leak(format!("tag-merge-into-{sunset}").into_boxed_str());
+    click(&app, target, cx);
+    merge.read_with(cx, |m, _| assert_eq!(m.preview.as_ref().expect("previewed").photos_retagged, 1));
+    click(&app, "tag-merge-commit", cx);
+    drop(merge);
+    cx.run_until_parked();
+
+    let left: i64 = app
+        .state
+        .catalog
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .conn()
+        .query_row("SELECT COUNT(*) FROM tags WHERE full_path = 'Sunsets'", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(left, 0, "merged away");
+    t.read_with(cx, |t, _| {
+        assert_eq!(t.status.as_deref(), Some("Merged Sunsets into Sunset — 1 photo moved."));
+        assert!(t.duplicates.is_none() && t.orphans.is_none(), "the lists the merge made stale are gone");
+    });
+    assert!(!present(&app, "tag-merge-back", cx), "the preview closed");
+    assert!(present(&app, "prefs-tab-tags", cx), "Preferences stayed open");
+}
+
+/// **Catalog identity.** The pairs' ids are the section's catalog's: "Merge X away…" opens
+/// nothing while the tag tree is not that catalog's (superseded, not yet re-read), nor from a
+/// section a delivered switch has replaced. With the switch undelivered, the preview opens
+/// under the old tree and its dry run fails closed — the twin's tag with the same id stays.
+#[gpui_kit::test]
+fn merge_x_away_never_opens_over_another_catalogs_tags(cx: &mut TestAppContext) {
+    let dir = TempDir::new("prefs-tags-merge-switch");
+    let app = start(cx);
+    let (_p, t, sunset, sunsets, button) = duplicates_found(&app, &dir, cx);
+
+    // The tree superseded (as at a switch, before its re-read): the button is dead and the
+    // call refuses.
+    app.wired.tags.update(cx, |s, cx| s.on_catalog_switched(cx));
+    cx.run_until_parked();
+    t.update(cx, |t, cx| t.merge(sunsets, cx));
+    assert_eq!(t.read_with(cx, |t, _| t.status.clone()).as_deref(), Some(crate::preferences::tags::TREE_NOT_READY));
+    assert!(merge_dialog(&app, cx).is_none());
+    app.wired.tags.update(cx, |s, cx| s.refresh(cx));
+    cx.run_until_parked();
+
+    // The core switches to a twin whose tags have the same ids; the event is withheld.
+    let root = dir.0.join("photos-b");
+    let b = Catalog::open(&dir.0.join("b.chairphoto"), &root).unwrap();
+    assert_eq!(b.create_tag("Sunset").unwrap(), sunset);
+    assert_eq!(b.create_tag("Sunsets").unwrap(), sunsets);
+    core_switch(&app, b);
+    click(&app, button, cx);
+    settle(&app, cx);
+    let merge = merge_dialog(&app, cx).expect("opened under the old tree");
+    let target = app.wired.tags.read_with(cx, |s, _| s.tag(sunset).unwrap().clone());
+    merge.update(cx, |m, cx| m.pick(target, cx));
+    cx.run_until_parked();
+    assert_eq!(merge.read_with(cx, |m, _| m.error.clone()), Some(chairphoto_core::app::CATALOG_CHANGED.to_string()));
+    drop(merge);
+    // The tree re-read (a model read after a scan would do it) is now the twin's, while the
+    // section — and the model, the event still withheld — are A's: the ids would name B's tags.
+    app.wired.tags.update(cx, |s, _| s.last_dialog = None);
+    app.wired.tags.update(cx, |s, cx| s.refresh(cx));
+    cx.run_until_parked();
+    t.update(cx, |t, _| t.status = None);
+    t.update(cx, |t, cx| t.merge(sunsets, cx));
+    assert_eq!(t.read_with(cx, |t, _| t.status.clone()).as_deref(), Some(crate::preferences::tags::TREE_NOT_READY));
+    assert!(merge_dialog(&app, cx).is_none(), "no preview over the twin's tags");
+
+    // Delivered: the preview closed itself, although the section that asked for it was
+    // rebuilt (Preferences owns its subscriptions); Preferences stays. The old section refuses.
+    deliver_switch(&app, cx);
+    settle(&app, cx);
+    assert!(!present(&app, "tag-merge-back", cx), "the switch closed the preview");
+    assert!(present(&app, "prefs-tab-tags", cx), "and only the preview");
+    app.wired.tags.update(cx, |s, _| s.last_dialog = None);
+    t.update(cx, |t, _| t.status = None);
+    t.update(cx, |t, cx| t.merge(sunsets, cx));
+    assert_eq!(t.read_with(cx, |t, _| t.status.clone()).as_deref(), Some(crate::preferences::tags::TREE_NOT_READY));
+    assert!(merge_dialog(&app, cx).is_none());
+    let twin_kept = app.state.catalog.lock().unwrap().as_ref().unwrap().get_tag(sunsets).is_ok();
+    assert!(twin_kept, "the twin's Sunsets is untouched");
+}
+
+/// A re-root reopens the catalog (a new identity, no `catalog:switched`): Preferences rebuilds
+/// the Tags tab first, and only then does the tag tree's re-read supersede the open preview.
+/// The preview still closes — Preferences, not the dropped section, owns its subscriptions —
+/// and Preferences stays.
+#[gpui_kit::test]
+fn the_merge_preview_closes_when_a_reroot_supersedes_its_tree(cx: &mut TestAppContext) {
+    let dir = TempDir::new("prefs-tags-merge-reroot");
+    let app = start(cx);
+    let (p, t, _, _, button) = duplicates_found(&app, &dir, cx);
+    click(&app, button, cx);
+    settle(&app, cx);
+    assert!(merge_dialog(&app, cx).is_some() && present(&app, "tag-merge-list", cx));
+
+    let identity = app.wired.model.read_with(cx, |m, _| m.catalog_identity()).expect("a catalog is open");
+    chairphoto_core::app::catalogs::reroot_open_catalog_as(&app.state, identity, dir.0.join("library")).unwrap();
+    app.wired.model.update(cx, |m, cx| m.refresh(cx));
+    cx.run_until_parked();
+    assert_ne!(tags(&p, cx).entity_id(), t.entity_id(), "the tab was rebuilt for the reopened catalog");
+    settle(&app, cx);
+    assert!(!present(&app, "tag-merge-list", cx), "the preview closed");
+    assert!(present(&app, "prefs-tab-tags", cx), "Preferences stayed open");
+}
+
 // --- editors ----------------------------------------------------------------------------------
+
+/// The inspector's "Edit in" list follows a save in Preferences → Editors, with no catalog
+/// switch: RapidRAW pointed at a missing binary is not offered; pointing it at one that exists
+/// offers it once the save lands. (#161)
+#[gpui_kit::test]
+fn the_edit_in_list_follows_an_editor_saved_in_preferences(cx: &mut TestAppContext) {
+    let dir = TempDir::new("prefs-editors-inspector");
+    let app = start(cx);
+    open_catalog_with_photos(&app, &dir, 1, cx);
+    put_setting(&app, crate::preferences::editors::RAPIDRAW_BIN_KEY, "/nonexistent/rapidraw");
+    work(cx);
+    let insp = app.wired.root.as_ref().unwrap().read_with(cx, |r, _| r.inspector.clone());
+    assert_eq!(insp.read_with(cx, |i, _| i.editors.as_ref().map(|e| e.rapidraw)), Some(false), "read once, not offered");
+
+    let bin = dir.0.join("rapidraw");
+    std::fs::write(&bin, b"#!/bin/sh\n").unwrap();
+    let p = open(&app, cx);
+    tab(&app, "prefs-tab-editors", cx);
+    let (e, _) = editors(&p, cx);
+    e.update(cx, |e, cx| e.save_rapidraw(crate::preferences::editors::RAPIDRAW_BIN_KEY, bin.to_string_lossy().into(), cx));
+    work(cx);
+    assert_eq!(e.read_with(cx, |e, _| e.status.clone()).as_deref(), Some("Saved."));
+    assert_eq!(insp.read_with(cx, |i, _| i.editors.as_ref().map(|e| e.rapidraw)), Some(true), "re-checked after the save");
+
+    // A darktable/RawTherapee/ART path says so too. (Which of them the list then offers
+    // depends on this machine's PATH, so the event is what is checked.)
+    let seen = std::rc::Rc::new(std::cell::Cell::new(0));
+    let _sub = cx.update(|cx| {
+        let seen = seen.clone();
+        cx.subscribe(&app.wired.model, move |_, _: &crate::model::EditorsChanged, _| seen.set(seen.get() + 1))
+    });
+    e.update(cx, |e, cx| e.save("darktable", "gui", "/nonexistent/darktable".into(), cx));
+    work(cx);
+    assert_eq!(seen.get(), 1, "the path save announced the change");
+}
 
 /// Editors: a path override saves under React's key and re-checks availability; RapidRAW's
 /// format saves. Darkroom: the stored values load; the cache size normalises and saves; preload,

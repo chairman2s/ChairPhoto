@@ -48,6 +48,9 @@ use std::path::Path;
 use std::rc::Rc;
 
 /// How far the loupe preloads ahead and behind (React prefetched +1…+5, −1, −2).
+/// The loupe's button for a video (decision #97: poster frame + the system player).
+pub const PLAY_LABEL: &str = "▶ Play in system player";
+
 pub const PRELOAD_AHEAD: usize = 5;
 pub const PRELOAD_BEHIND: usize = 2;
 
@@ -532,7 +535,7 @@ impl Render for LoupeView {
             .when(video, |d| {
                 d.child(
                     div().absolute().bottom(px(18.)).left_0().right_0().flex().justify_center().child(ui::clickable(
-                        ui::primary("loupe-play", "▶ Play in system player", true, colors),
+                        ui::primary("loupe-play", PLAY_LABEL, true, colors),
                         true,
                         cx.listener(move |this, _, _, cx| this.play(id, cx)),
                     )),

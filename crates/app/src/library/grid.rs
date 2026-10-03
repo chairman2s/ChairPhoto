@@ -437,7 +437,7 @@ impl LibraryView {
                                 .text_size(px(12.))
                                 .text_color(colors.txt)
                                 .child("▶")
-                                .tooltip(tip("Video — double-click to play".into())),
+                                .tooltip(tip(video_tip())),
                         )
                     })
                     .child(storage),
@@ -554,6 +554,13 @@ fn badge(text: impl Into<SharedString>, fg: Hsla, colors: Colors) -> gpui_kit::D
 }
 
 /// A tooltip with runtime text.
+/// The video badge's tooltip. React's said "double-click to play", which its double-click
+/// did; here a double-click opens the loupe on the poster, whose button plays it (#97).
+pub fn video_tip() -> String {
+    let play = crate::loupe::view::PLAY_LABEL.trim_start_matches('▶').trim();
+    format!("Video — double-click to open, then {play}")
+}
+
 fn tip(text: String) -> impl Fn(&mut Window, &mut gpui_kit::App) -> gpui_kit::AnyView + 'static {
     let text = SharedString::from(text);
     move |window, cx| gpui_kit::component::tooltip::Tooltip::new(text.clone()).build(window, cx)

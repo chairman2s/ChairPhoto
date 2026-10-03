@@ -78,6 +78,8 @@ pub struct RootView {
     /// block (mounted on the Photo inspector's tags tab, #108).
     pub(crate) tag_panel: Entity<TagPanel>,
     pub(crate) photo_tags: Entity<PhotoTags>,
+    /// The tag tree both of those use; Preferences → Tags merges under it too.
+    pub(crate) tags: Entity<TagsState>,
     /// Albums and smart albums (#115): their write path and dialogs.
     pub(crate) albums: Entity<crate::albums::AlbumsState>,
     /// The export jobs and dialogs (#115).
@@ -257,6 +259,7 @@ impl RootView {
             storage,
             tag_panel,
             photo_tags,
+            tags,
             albums: collections.albums,
             exports: collections.exports,
             album_prompt: None,

@@ -72,7 +72,7 @@ pub mod signals;
 mod tests;
 
 use crate::image_store::ImageStore;
-use crate::model::{AppModel, AppModelEvent};
+use crate::model::{AppModel, AppModelEvent, EditorsChanged};
 use crate::shell::state::{InspectorTab, Mark, ShellState};
 use crate::storage::Runner;
 use chairphoto_core::app::{with_catalog_as, AppState, CatalogIdentity, CoreEvent};
@@ -345,6 +345,8 @@ pub struct PhotoInspector {
     pub storage_msg: Option<String>,
     pub editors: Option<Editors>,
     editors_reading: bool,
+    /// Bumped by every editors read started; only the newest one's result lands.
+    editors_seq: u64,
     /// Per photo: the sidecar-editor run in flight, the RapidRAW round-trip in flight, and
     /// the last terminal note.
     pub sidecar: HashMap<i64, SidecarRun>,
@@ -381,6 +383,8 @@ impl PhotoInspector {
                 AppModelEvent::CatalogRead => this.read_editors(cx),
                 AppModelEvent::DeepLink(_) => {}
             }),
+            // Preferences → Editors saved a path: re-check, without waiting for a switch.
+            cx.subscribe(&model, |this, _, _: &EditorsChanged, cx| this.reread_editors(cx)),
             cx.subscribe_in(&version_name, window, |this, _, event: &InputEvent, window, cx| {
                 if matches!(event, InputEvent::PressEnter { .. }) {
                     this.add_version(window, cx);
@@ -415,6 +419,7 @@ impl PhotoInspector {
             storage_msg: None,
             editors: None,
             editors_reading: false,
+            editors_seq: 0,
             sidecar: HashMap::new(),
             rapid: HashMap::new(),
             notes: HashMap::new(),
@@ -1048,11 +1053,24 @@ impl PhotoInspector {
     // --- external editors --------------------------------------------------------------
 
     /// Which editors this machine has: once per catalog (it runs `which`, so it is worker
-    /// work). Preferences (#113) re-reads it when it changes an editor's path.
+    /// work), and again whenever Preferences saves an editor setting ([`Self::reread_editors`]).
     pub fn read_editors(&mut self, cx: &mut Context<Self>) {
         if self.editors.is_some() || self.editors_reading {
             return;
         }
+        self.start_editors_read(cx);
+    }
+
+    /// An editor setting changed ([`EditorsChanged`]): read the list again, even if one is
+    /// cached or a read is in flight — that read may have run before the setting was stored.
+    /// The list shown stays until the new one lands.
+    pub fn reread_editors(&mut self, cx: &mut Context<Self>) {
+        self.start_editors_read(cx);
+    }
+
+    fn start_editors_read(&mut self, cx: &mut Context<Self>) {
+        self.editors_seq += 1;
+        let seq = self.editors_seq;
         self.editors_reading = true;
         self.run_blocking(
             |state| {
@@ -1062,7 +1080,11 @@ impl PhotoInspector {
                 let rapidraw = chairphoto_core::rapidraw::rapidraw_available(state).map(|s| s.available).unwrap_or(false);
                 Ok(Editors { editors, rapidraw })
             },
-            |this, result, cx| {
+            move |this, result, cx| {
+                // A newer read was started (a later save): this one may predate it.
+                if this.editors_seq != seq {
+                    return;
+                }
                 this.editors_reading = false;
                 this.editors = result.ok();
                 cx.notify();

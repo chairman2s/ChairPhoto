@@ -5152,6 +5152,30 @@ fn map_apply_fences_to_photo_import_hook() {
     assert!(catalog.get_photo_tags(outside_id).unwrap().is_empty());
 }
 
+/// A fence on an auto-tag's path can't tag by hand (#181): applying it is refused before any
+/// photo, and the import hook skips it and still applies the photo's other fences.
+#[cfg(feature = "map")]
+#[test]
+fn map_fences_on_an_auto_tag_path_are_refused_or_skipped() {
+    use chairphoto_core::catalog::CatalogError;
+    use chairphoto_core::plugins::map;
+
+    let (catalog, root) = temp_catalog("map_auto_tag");
+    map::ensure_schema_for(&catalog).unwrap();
+    let auto = catalog.create_tag("Technique/Panorama").unwrap();
+    catalog.conn().execute("UPDATE tags SET auto_rule = 'panorama' WHERE id = ?1", [auto]).unwrap();
+    let auto_fence = unit_square_fence(&catalog, "Technique/Panorama");
+    unit_square_fence(&catalog, "Places/Hook");
+    let inside_id = insert_photo_with_gps(&catalog, &root, "in.jpg", 0.5, 0.5);
+
+    assert!(matches!(map::apply_fence(&catalog, auto_fence), Err(CatalogError::AutoTag(_))));
+    assert!(catalog.get_photo_tags(inside_id).unwrap().is_empty());
+
+    assert_eq!(map::apply_fences_to_photo(&catalog, inside_id).unwrap(), 1, "the place fence only");
+    let paths: Vec<String> = catalog.get_photo_tags(inside_id).unwrap().into_iter().map(|t| t.full_path).collect();
+    assert_eq!(paths, vec!["Places/Hook".to_string()]);
+}
+
 /// apply_fences_to_photo on a photo without GPS returns 0 without error.
 #[cfg(feature = "map")]
 #[test]

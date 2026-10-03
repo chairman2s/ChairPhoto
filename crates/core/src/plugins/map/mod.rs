@@ -220,8 +220,10 @@ pub fn apply_fence(
         return Ok(0);
     }
 
-    // Build (or reuse) the place tag for this fence's path.
+    // Build (or reuse) the place tag for this fence's path. An auto-tag's path is refused
+    // here, before any photo, rather than by the first `assign_tag` (#181).
     let tag_id = catalog.create_tag(&fence.tag_path)?;
+    catalog.refuse_auto_tag(tag_id)?;
 
     // Load all photos with GPS coordinates.
     let points = map_photo_points(catalog.conn())?;
@@ -294,6 +296,11 @@ pub fn apply_fences_to_photo(
         }
         if point_in_polygon((lat, lng), &fence.polygon) {
             let tag_id = catalog.create_tag(&fence.tag_path)?;
+            // A fence on an auto-tag's path can't tag by hand (#181); skip it rather than
+            // stop part-way through this photo's fences.
+            if catalog.auto_tag_refusal(tag_id)?.is_some() {
+                continue;
+            }
             let before: i64 = catalog.conn().query_row(
                 "SELECT COUNT(*) FROM photo_tags WHERE photo_id = ?1 AND tag_id = ?2",
                 rusqlite::params![photo_id, tag_id],

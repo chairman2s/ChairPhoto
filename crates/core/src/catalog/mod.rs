@@ -8,6 +8,7 @@
 
 mod albums;
 mod autotags;
+pub use autotags::{AutoTagRefusal, TagBatchOutcome};
 mod batches;
 pub mod culling;
 mod edits;
@@ -80,6 +81,10 @@ pub enum CatalogError {
     NotFound(String),
     #[error("invalid tag: {0}")]
     Tag(String),
+    /// A hand assignment or removal of an auto-tag, which the auto-tag engine owns
+    /// (`autotags.rs`): refused, because its next pass would silently undo it.
+    #[error("{0}")]
+    AutoTag(AutoTagRefusal),
     #[error("invalid input: {0}")]
     Validation(String),
     #[error("io error: {0}")]
@@ -1750,8 +1755,8 @@ impl Catalog {
     /// Suggest existing tags that photos taken near this one (within
     /// `window_seconds` of its capture time) already have — session tags like
     /// Events/Places naturally rank highest by neighbour frequency. Excludes tags
-    /// already on this photo. Returns empty if the photo has no capture time.
-    /// `photo_count` carries the neighbour frequency.
+    /// already on this photo, and auto-tags (they cannot be assigned by hand). Returns
+    /// empty if the photo has no capture time. `photo_count` carries the neighbour frequency.
     pub fn suggest_tags_by_time(
         &self,
         photo_id: i64,
@@ -1784,6 +1789,7 @@ impl Catalog {
              JOIN photo_tags pt ON pt.photo_id = p.id
              JOIN tags t ON t.id = pt.tag_id
              WHERE p.capture_time BETWEEN ?1 AND ?2 AND p.id != ?3
+               AND t.auto_rule IS NULL
                AND t.id NOT IN (SELECT tag_id FROM photo_tags WHERE photo_id = ?3)
              GROUP BY t.id
              ORDER BY freq DESC, t.full_path_norm",
@@ -2125,7 +2131,11 @@ impl Catalog {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
+    /// Assign a tag by hand. Refuses an auto-tag ([`CatalogError::AutoTag`]): the engine
+    /// rebuilds its membership from its rule, so a hand assignment would be dropped silently on
+    /// the next pass (#181). A caller writing many tags uses [`Self::assign_tags`], which skips them.
     pub fn assign_tag(&self, photo_id: i64, tag_id: i64) -> Result<()> {
+        self.refuse_auto_tag(tag_id)?;
         let now = now();
         self.conn.execute(
             "INSERT OR IGNORE INTO photo_tags(photo_id, tag_id, created_at) VALUES(?1, ?2, ?3)",
@@ -2321,7 +2331,10 @@ impl Catalog {
         )?)
     }
 
+    /// Remove a tag by hand. Refuses an auto-tag, as [`Self::assign_tag`] does: the engine's
+    /// next pass would put it back.
     pub fn remove_tag(&self, photo_id: i64, tag_id: i64) -> Result<()> {
+        self.refuse_auto_tag(tag_id)?;
         self.conn.execute(
             "DELETE FROM photo_tags WHERE photo_id = ?1 AND tag_id = ?2",
             params![photo_id, tag_id],

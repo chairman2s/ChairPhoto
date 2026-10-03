@@ -1190,7 +1190,7 @@ fn reviews_apply_only_to_the_suggestion_that_was_shown() {
         ],
     )
     .unwrap();
-    assert_eq!(out, ReviewOutcome { confirmed: 1, rejected: 1, stale: 1 });
+    assert_eq!(out, ReviewOutcome { confirmed: 1, rejected: 1, stale: 1, auto_tag: 0 });
     assert_eq!(face_state(&c, f1), "confirmed");
     assert_eq!(face_state(&c, f2), "suggested");
     assert_eq!(face_state(&c, f3), "unassigned");
@@ -1202,6 +1202,43 @@ fn reviews_apply_only_to_the_suggestion_that_was_shown() {
     assert_eq!(remembered, 1);
     let regions: Vec<String> = crate::xmp::read_face_regions(&root.join("r.NEF")).into_iter().map(|r| r.name).collect();
     assert_eq!(regions, vec!["Alice".to_string()]);
+}
+
+// ── Auto-tags as person tags (#181) ──────────────────────────────────────────────────────
+
+/// An auto-tag can't be assigned by hand, so a face verb that would tag the photo with one
+/// is refused whole: the face keeps its state, the photo gets no tag. A review skips such a
+/// confirmation and counts it, and still applies the rest.
+#[test]
+fn face_verbs_refuse_an_auto_tag_and_leave_the_face_as_it_was() {
+    let (c, root) = temp_catalog("autotag");
+    let p = add_photo(&c, &root, "a.NEF");
+    let auto = c.create_tag("Technique/Long Exposure").unwrap();
+    c.conn().execute("UPDATE tags SET auto_rule = 'long-exposure' WHERE id = ?1", [auto]).unwrap();
+    let alice = c.create_tag("People/Alice").unwrap();
+    let f1 = add_face(&c, p, "[0.1,0.1,0.2,0.2]");
+    let f2 = add_face(&c, p, "[0.4,0.1,0.2,0.2]");
+    let f3 = add_face(&c, p, "[0.7,0.1,0.2,0.2]");
+
+    suggest(&c, f1, auto);
+    assert!(matches!(accept(&c, f1), Err(CatalogError::AutoTag(_))));
+    assert_eq!(face_state(&c, f1), "suggested", "the confirmation rolled back");
+    assert!(matches!(assign(&c, f2, auto), Err(CatalogError::AutoTag(_))));
+    assert_eq!(face_state(&c, f2), "unassigned");
+    assert!(!has_tag(&c, p, auto));
+
+    suggest(&c, f3, alice);
+    let out = review_suggestions(
+        &c,
+        &[
+            Review { face_id: f1, tag_id: auto, verdict: Verdict::Confirm },
+            Review { face_id: f3, tag_id: alice, verdict: Verdict::Confirm },
+        ],
+    )
+    .unwrap();
+    assert_eq!(out, ReviewOutcome { confirmed: 1, rejected: 0, stale: 0, auto_tag: 1 });
+    assert_eq!((face_state(&c, f1), face_state(&c, f3)), ("suggested".into(), "confirmed".into()));
+    assert!(has_tag(&c, p, alice) && !has_tag(&c, p, auto));
 }
 
 /// The summaries carry each avatar photo's user rotation (the thumbnail is drawn turned), and

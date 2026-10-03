@@ -288,6 +288,9 @@ pub struct ReviewOutcome {
     /// Suggestions that had changed since they were shown (confirmed elsewhere, or re-matched
     /// to someone else): left alone.
     pub stale: usize,
+    /// Confirmations of a suggestion whose person tag is an auto-tag, which can't be assigned
+    /// by hand (#181): skipped, the face left suggested.
+    pub auto_tag: usize,
 }
 
 /// Apply the review queue's verdicts (✓, ✕, "Confirm all ≥ X%"), each only while the face
@@ -302,6 +305,7 @@ pub fn review_suggestions(c: &Catalog, reviews: &[Review]) -> CatalogResult<Revi
     let mut photos: Vec<i64> = Vec::new();
     for r in reviews {
         match r.verdict {
+            Verdict::Confirm if c.auto_tag_refusal(r.tag_id)?.is_some() => out.auto_tag += 1,
             Verdict::Confirm => match matcher::accept_suggestion(&tx, r.face_id, r.tag_id)? {
                 Some(photo) => {
                     c.assign_tag(photo, r.tag_id)?;

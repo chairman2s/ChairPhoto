@@ -9,6 +9,11 @@
 //! stay in sync after scans/edits. Membership is recomputed in full (simple and
 //! correct); optimise to changed photos only if it ever matters.
 //!
+//! Because the rebuild deletes every row the rule did not derive, the engine owns an
+//! auto-tag's membership outright: [`Catalog::assign_tag`] and [`Catalog::remove_tag`]
+//! refuse one by hand ([`CatalogError::AutoTag`], #181), and the batch writers
+//! [`Catalog::assign_tags`] / [`Catalog::remove_tags`] skip and report them.
+//!
 //! Monochrome is **pixel-derived**: camera "B&W" flags proved unreliable (e.g. the
 //! Sony A7R VI writes a stale `CreativeStyle=B&W` on every frame), so the rule reads
 //! `photos.is_grayscale`, a flag computed by sampling the preview during caching.
@@ -23,6 +28,34 @@ const LONG_EXPOSURE_SECONDS: f64 = 1.0;
 /// A panorama is an image whose long side is at least this multiple of its short
 /// side (either orientation).
 const PANORAMA_ASPECT: i64 = 2;
+
+/// Why a hand write of an auto-tag was refused: the tag, its path and its rule. Its
+/// `Display` is the message a front end shows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AutoTagRefusal {
+    pub tag_id: i64,
+    pub path: String,
+    pub rule: String,
+}
+
+impl std::fmt::Display for AutoTagRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "'{}' is an auto-tag (rule '{}'): the catalog assigns it from each photo, so it \
+             can't be added or removed by hand",
+            self.path, self.rule
+        )
+    }
+}
+
+/// What a batch tag write did: how many distinct tags it wrote, and the auto-tags it
+/// skipped rather than failing part-way.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TagBatchOutcome {
+    pub tags_written: usize,
+    pub skipped: Vec<AutoTagRefusal>,
+}
 
 /// One auto-tag rule: a tag to maintain and the photos that belong to it.
 struct AutoTagRule {
@@ -44,6 +77,63 @@ impl Catalog {
             self.apply_rule(&rule)?;
         }
         Ok(())
+    }
+
+    /// The refusal for a hand write of `tag_id`, or `None` when it is an ordinary tag (or
+    /// no tag at all: the write itself reports that).
+    pub fn auto_tag_refusal(&self, tag_id: i64) -> Result<Option<AutoTagRefusal>> {
+        let row: Option<(String, Option<String>)> = self
+            .conn
+            .query_row("SELECT full_path, auto_rule FROM tags WHERE id = ?1", params![tag_id], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .optional()?;
+        Ok(row.and_then(|(path, rule)| rule.map(|rule| AutoTagRefusal { tag_id, path, rule })))
+    }
+
+    /// `Err(`[`CatalogError::AutoTag`]`)` when `tag_id` is an auto-tag. A verb that changes
+    /// other state before tagging (a face confirmation, a suggestion's state) calls this
+    /// first, so a refusal leaves nothing half-done.
+    pub fn refuse_auto_tag(&self, tag_id: i64) -> Result<()> {
+        match self.auto_tag_refusal(tag_id)? {
+            Some(refusal) => Err(CatalogError::AutoTag(refusal)),
+            None => Ok(()),
+        }
+    }
+
+    /// Assign every tag to every photo, skipping auto-tags instead of failing part-way
+    /// (paste, assign-to-selection). Each auto-tag is reported once in `skipped`.
+    pub fn assign_tags(&self, photo_ids: &[i64], tag_ids: &[i64]) -> Result<TagBatchOutcome> {
+        self.write_tags(photo_ids, tag_ids, |p, t| self.assign_tag(p, t))
+    }
+
+    /// Remove every tag from every photo, skipping auto-tags as [`Self::assign_tags`] does.
+    pub fn remove_tags(&self, photo_ids: &[i64], tag_ids: &[i64]) -> Result<TagBatchOutcome> {
+        self.write_tags(photo_ids, tag_ids, |p, t| self.remove_tag(p, t))
+    }
+
+    fn write_tags(
+        &self,
+        photo_ids: &[i64],
+        tag_ids: &[i64],
+        write: impl Fn(i64, i64) -> Result<()>,
+    ) -> Result<TagBatchOutcome> {
+        let mut out = TagBatchOutcome::default();
+        let mut seen = std::collections::HashSet::new();
+        for &tag_id in tag_ids {
+            if !seen.insert(tag_id) {
+                continue;
+            }
+            if let Some(refusal) = self.auto_tag_refusal(tag_id)? {
+                out.skipped.push(refusal);
+                continue;
+            }
+            for &photo_id in photo_ids {
+                write(photo_id, tag_id)?;
+            }
+            out.tags_written += 1;
+        }
+        Ok(out)
     }
 
     /// The built-in rule set. `match_select` for monochrome is built from
@@ -227,4 +317,121 @@ fn now() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::catalog::PromotedMetadata;
+    use crate::test_support::TestSubPath;
+
+    const LONG_EXPOSURE: &str = "Technique/Long Exposure";
+
+    fn temp_catalog(tag: &str) -> (Catalog, TestSubPath) {
+        let dir = crate::test_support::TestTmpDir::new(tag);
+        let root = dir.join("photos");
+        std::fs::create_dir_all(&root).unwrap();
+        let catalog = Catalog::open(&dir.join("test.chairphoto"), &root).unwrap();
+        (catalog, dir.into_subpath("photos"))
+    }
+
+    /// A photo with a shutter speed and capture time.
+    fn photo(c: &Catalog, root: &TestSubPath, name: &str, shutter: &str, at: &str) -> i64 {
+        let id = c.upsert_photo(&root.join(name), None, 1, 1).unwrap().id;
+        let meta = PromotedMetadata {
+            shutter_speed: Some(shutter.into()),
+            capture_time: Some(at.into()),
+            ..Default::default()
+        };
+        c.set_photo_metadata(id, &meta, &[]).unwrap();
+        id
+    }
+
+    fn has(c: &Catalog, photo_id: i64, tag_id: i64) -> bool {
+        c.get_photo_tags(photo_id).unwrap().iter().any(|t| t.id == tag_id)
+    }
+
+    /// A 30 s exposure (in the rule) and a 1/200 s one (not), with the rule applied.
+    fn long_and_fast(tag: &str) -> (Catalog, TestSubPath, i64, i64, i64) {
+        let (c, root) = temp_catalog(tag);
+        let long = photo(&c, &root, "long.arw", "30", "2026-09-01T12:00:00");
+        let fast = photo(&c, &root, "fast.arw", "1/200", "2026-09-01T12:00:30");
+        c.apply_auto_tags().unwrap();
+        let auto = c.find_tag_id_by_path(LONG_EXPOSURE).unwrap().unwrap();
+        (c, root, long, fast, auto)
+    }
+
+    // ── Hand writes of an auto-tag (#181) ─────────────────────────────────────────
+
+    /// #181: a hand assignment the next pass would silently drop is refused instead, so
+    /// nothing the user did is lost — and it doesn't count as "recently used".
+    #[test]
+    fn hand_assignment_of_an_auto_tag_is_refused_and_the_pass_loses_nothing() {
+        let (c, _root, long, fast, auto) = long_and_fast("autotag-assign");
+
+        let err = c.assign_tag(fast, auto).unwrap_err();
+        match &err {
+            CatalogError::AutoTag(r) => {
+                assert_eq!((r.tag_id, r.path.as_str(), r.rule.as_str()), (auto, LONG_EXPOSURE, "long-exposure"))
+            }
+            other => panic!("expected an auto-tag refusal, got {other:?}"),
+        }
+        assert!(err.to_string().contains("can't be added or removed by hand"), "{err}");
+        assert!(!has(&c, fast, auto), "the refusal wrote nothing");
+        assert!(c.recently_used_tags(10).unwrap().is_empty(), "a refusal is not a use");
+
+        c.apply_auto_tags().unwrap();
+        assert!(has(&c, long, auto) && !has(&c, fast, auto), "membership is the rule's");
+    }
+
+    /// The other direction of #181: a hand removal the next pass would undo is refused.
+    #[test]
+    fn hand_removal_of_an_auto_tag_is_refused() {
+        let (c, _root, long, _fast, auto) = long_and_fast("autotag-remove");
+        assert!(matches!(c.remove_tag(long, auto), Err(CatalogError::AutoTag(_))));
+        assert!(has(&c, long, auto));
+    }
+
+    /// Batch writes skip an auto-tag, report it once, and still write every other tag to
+    /// every photo — they never stop part-way.
+    #[test]
+    fn batch_writes_skip_auto_tags_and_write_the_rest() {
+        let (c, _root, long, fast, auto) = long_and_fast("autotag-batch");
+        let (trip, people) = (c.create_tag("Events/Trip").unwrap(), c.create_tag("People/Ann").unwrap());
+
+        let out = c.assign_tags(&[long, fast], &[trip, auto, people, auto]).unwrap();
+        assert_eq!(out.tags_written, 2);
+        assert_eq!(out.skipped.iter().map(|r| r.tag_id).collect::<Vec<_>>(), vec![auto]);
+        for p in [long, fast] {
+            assert!(has(&c, p, trip) && has(&c, p, people));
+        }
+        assert!(has(&c, long, auto) && !has(&c, fast, auto));
+
+        let out = c.remove_tags(&[long, fast], &[auto, trip]).unwrap();
+        assert_eq!((out.tags_written, out.skipped.len()), (1, 1));
+        assert!(!has(&c, long, trip) && !has(&c, fast, trip) && has(&c, long, auto));
+    }
+
+    /// Nearby suggestions never offer an auto-tag: a neighbour's "Long Exposure" is not a
+    /// tag this photo can take by hand. Its ordinary tags still come through.
+    #[test]
+    fn nearby_suggestions_exclude_auto_tags() {
+        let (c, _root, long, fast, auto) = long_and_fast("autotag-nearby");
+        let trip = c.create_tag("Events/Trip").unwrap();
+        c.assign_tag(long, trip).unwrap();
+
+        let ids: Vec<i64> = c.suggest_tags_by_time(fast, 120).unwrap().iter().map(|t| t.tag.id).collect();
+        assert_eq!(ids, vec![trip], "auto-tag {auto} must not be suggested");
+    }
+
+    /// A catalog from before #181 can carry `last_used_at` on an auto-tag (a hand assignment
+    /// then bumped it); "Recently used" still leaves it out.
+    #[test]
+    fn recently_used_excludes_an_auto_tag_used_before_the_refusal() {
+        let (c, _root, _long, _fast, auto) = long_and_fast("autotag-recent");
+        let trip = c.create_tag("Events/Trip").unwrap();
+        c.conn.execute("UPDATE tags SET last_used_at = 100 WHERE id IN (?1, ?2)", params![auto, trip]).unwrap();
+        let ids: Vec<i64> = c.recently_used_tags(10).unwrap().iter().map(|t| t.id).collect();
+        assert_eq!(ids, vec![trip]);
+    }
 }

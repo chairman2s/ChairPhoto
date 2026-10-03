@@ -750,4 +750,22 @@ mod ownership {
         let tags: i64 = conn.query_row("SELECT COUNT(*) FROM photo_tags", [], |r| r.get(0)).unwrap();
         assert_eq!(tags, 0, "the accept tagged the new catalog's photo 1");
     }
+
+    /// Accepting a suggestion of an auto-tag is refused (#181) before the suggestion changes:
+    /// the photo isn't tagged and the suggestion isn't recorded as accepted feedback.
+    #[test]
+    fn accepting_an_auto_tag_suggestion_is_refused_and_records_nothing() {
+        let (c, _db, _root) = temp_catalog("accept-auto", 1);
+        let auto = c.create_tag("Technique/Long Exposure").unwrap();
+        c.conn().execute("UPDATE tags SET auto_rule = 'long-exposure' WHERE id = ?1", [auto]).unwrap();
+
+        let err = accept_suggestion(&c, 1, "Technique/Long Exposure").unwrap_err();
+        assert!(matches!(err, CatalogError::AutoTag(_)), "{err:?}");
+        let tags: i64 = c.conn().query_row("SELECT COUNT(*) FROM photo_tags", [], |r| r.get(0)).unwrap();
+        let accepted: i64 = c
+            .conn()
+            .query_row("SELECT COUNT(*) FROM smarttags__suggestions WHERE state = 'accepted'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!((tags, accepted), (0, 0));
+    }
 }

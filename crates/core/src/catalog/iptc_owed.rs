@@ -197,7 +197,8 @@ impl IptcSidecarWrite {
 pub enum IptcSettled {
     /// The owed fields are in the sidecar and nothing is owed any more.
     Written,
-    /// Nothing was owed, so the sidecar was not opened. (Not a claim about what it holds.)
+    /// Nothing is owed: nothing was, so the sidecar was not opened; or a failed write found
+    /// its debt dismissed (or paid) meanwhile. (Not a claim about what the sidecar holds.)
     Unchanged,
     /// The write landed, but a newer store changed the photo's IPTC meanwhile; its fields
     /// stay owed, and so do this write's whose value is no longer the catalog's (they may
@@ -215,7 +216,8 @@ pub enum IptcSettled {
 pub enum IptcSidecarState {
     /// The sidecar now has every IPTC value the catalog holds for the photo.
     Written,
-    /// Nothing was owed, so nothing was written and the sidecar was not read.
+    /// Nothing is owed: nothing was (the sidecar was not read), or the write failed after the
+    /// debt was dismissed. Not a claim about what the sidecar holds.
     Unchanged,
     /// Saved to the catalog only: some fields have not reached the sidecar yet. They stay
     /// owed, and the next save of the photo or the repair pass writes them.
@@ -453,12 +455,27 @@ impl Catalog {
             Err(e) => {
                 // Only this generation's record: a newer store's row describes its own write.
                 // Nothing landed, so nothing to owe again.
-                self.conn.execute(
+                let recorded = self.conn.execute(
                     "UPDATE pending_sidecar_iptc
                      SET attempts = attempts + 1, error = ?3, last_attempt_at = ?4
                      WHERE photo_id = ?1 AND generation = ?2 AND owed != 0",
                     params![write.photo_id, write.generation, e, now],
                 )?;
+                // Nothing of this photo is owed any more (the user dismissed this generation
+                // while the write ran, or another write paid it): the failure leaves no debt,
+                // so it is not reported as a pending sidecar the list no longer shows (review
+                // of #153, L4). A newer store's debt keeps it `Failed`.
+                if recorded == 0 {
+                    let nothing_owed: bool = self.conn.query_row(
+                        "SELECT EXISTS (SELECT 1 FROM photos WHERE id = ?1 AND uuid = ?2)
+                            AND NOT EXISTS (SELECT 1 FROM pending_sidecar_iptc WHERE photo_id = ?1 AND owed != 0)",
+                        params![write.photo_id, write.uuid],
+                        |r| r.get(0),
+                    )?;
+                    if nothing_owed {
+                        return Ok(IptcSettled::Unchanged);
+                    }
+                }
                 Ok(IptcSettled::Failed(e.clone()))
             }
         }
@@ -797,6 +814,32 @@ mod tests {
 
         assert!(!c.dismiss_owed_iptc(id, &shown.uuid, shown.generation).unwrap());
         assert_eq!(c.owed_iptc(reused).unwrap(), IptcMask::TITLE);
+    }
+
+    /// Review of #153, L4 (its probe P2): a write read at generation G fails after the user
+    /// dismissed G. Nothing is owed any more, so the settle reports that (`Unchanged`), not a
+    /// pending sidecar that the list and count no longer show, and records no attempt. A
+    /// failure against a debt a newer store owes is still `Failed`.
+    #[test]
+    fn a_write_failing_after_a_dismiss_of_its_generation_is_not_reported_pending() {
+        let (_dir, c, id, _) = photo("iptc-owed-dismiss-then-fail");
+        let in_flight = c.set_iptc(id, &titled("A")).unwrap();
+        let shown = c.list_owed_iptc_page(10, 0).unwrap().remove(0);
+        assert!(c.dismiss_owed_iptc(id, &shown.uuid, shown.generation).unwrap());
+
+        assert_eq!(c.settle_iptc_write(&in_flight, &Err("read-only".into())).unwrap(), IptcSettled::Unchanged);
+        assert_eq!(c.settle_iptc_write(&in_flight, &Err("read-only".into())).unwrap().state(), IptcSidecarState::Unchanged);
+        let attempts: i64 =
+            c.conn.query_row("SELECT attempts FROM pending_sidecar_iptc WHERE photo_id = ?1", [id], |r| r.get(0)).unwrap();
+        assert_eq!(attempts, 0);
+
+        let older = c.set_iptc(id, &titled("B")).unwrap();
+        let _newer = c.set_iptc(id, &titled("C")).unwrap();
+        assert_eq!(
+            c.settle_iptc_write(&older, &Err("read-only".into())).unwrap(),
+            IptcSettled::Failed("read-only".into()),
+            "a newer store still owes: the sidecar is pending"
+        );
     }
 
     /// A stale write's failure does not touch a newer store's record.

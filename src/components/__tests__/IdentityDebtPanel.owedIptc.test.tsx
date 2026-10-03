@@ -157,7 +157,7 @@ describe("owedActionMessage", () => {
     expect(owedActionMessage({ dismissed: true })).toMatch(/^Dismissed\./);
     expect(owedActionMessage({ dismissed: false })).toMatch(/^Not dismissed/);
     expect(owedActionMessage({ retried: { sidecar: "written", reason: null } })).toBe("Written to the sidecar.");
-    expect(owedActionMessage({ retried: { sidecar: "unchanged", reason: null } })).toMatch(/^Nothing was owed/);
+    expect(owedActionMessage({ retried: { sidecar: "unchanged", reason: null } })).toMatch(/^Nothing is owed any more/);
     expect(owedActionMessage({ retried: { sidecar: "pending", reason: null } })).toBe("Still pending.");
     expect(owedActionMessage({ retried: null })).toBe("Still pending.");
   });

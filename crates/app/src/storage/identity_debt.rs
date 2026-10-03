@@ -603,7 +603,7 @@ pub fn owed_action_message(done: &OwedAction) -> String {
         }
         OwedAction::Retried(o) => match (o.sidecar, &o.reason) {
             (IptcSidecarState::Written, _) => "Written to the sidecar.".into(),
-            (IptcSidecarState::Unchanged, _) => "Nothing was owed any more; the sidecar was not opened.".into(),
+            (IptcSidecarState::Unchanged, _) => "Nothing is owed any more: it was written or dismissed meanwhile.".into(),
             (IptcSidecarState::Pending, Some(why)) => format!("Still pending ({why})."),
             (IptcSidecarState::Pending, None) => "Still pending.".into(),
         },

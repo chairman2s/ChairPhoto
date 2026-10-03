@@ -257,7 +257,7 @@ export function owedActionMessage(done: OwedAction): string {
     case "written":
       return "Written to the sidecar.";
     case "unchanged":
-      return "Nothing was owed any more; the sidecar was not opened.";
+      return "Nothing is owed any more: it was written or dismissed meanwhile.";
     default:
       return o.reason ? `Still pending (${o.reason}).` : "Still pending.";
   }

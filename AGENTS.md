@@ -263,6 +263,21 @@ Tests that cannot run on a given machine — no ONNX Runtime, no `ffmpeg`, no mo
 `cargo test --workspace -- --nocapture` when you need to know what actually executed. A plain green run
 does not distinguish "passed" from "never ran".
 
+### Agent worktrees
+
+Agents launched with `isolation: "worktree"` get a checkout under `.claude/worktrees/` that
+starts from the main checkout's HEAD (`worktree.baseRef: "head"` in `.claude/settings.json`).
+`.worktreeinclude` copies in the gitignored CodeGraph index and the project skills and
+agents. Use `codegraph explore "<symbols or question>"` before grep to find code and its
+callers; the copied index is a snapshot from when the worktree was created. The LibRaw
+submodule is not copied; initialise it from the local clone before the first build:
+
+```bash
+git submodule update --init --reference "$(git rev-parse --git-common-dir)/../crates/core/vendor/LibRaw" crates/core/vendor/LibRaw
+```
+
+Delete the worktree's `target/` (40–65 GB) once its branch is merged.
+
 ### Verify, then report
 
 Commit messages, reviews, and status reports are part of the engineering record.

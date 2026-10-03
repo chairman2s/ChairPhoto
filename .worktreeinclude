@@ -1,0 +1,7 @@
+# Gitignored paths Claude Code copies into every agent worktree (.claude/worktrees/*).
+# The CodeGraph index, so agents can use `codegraph explore` instead of grep.
+.codegraph/
+# Project skills and agent definitions: their scripts (merge-verify/verify.sh,
+# chairphoto-app/app.sh) are run by repo-relative path.
+.claude/skills/
+.claude/agents/

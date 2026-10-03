@@ -96,11 +96,15 @@ impl RootView {
     /// Move to trash: `ids` (the selection, or the clicked photo).
     pub(crate) fn trash_photos(&mut self, ids: Vec<i64>, from: CatalogIdentity, cx: &mut Context<Self>) {
         let state = self.model.read(cx).state().clone();
+        let ids_done = ids.clone();
         let run = cx.background_executor().spawn(async move { with_catalog_as(&state, from, |c| c.trash_photos(&ids)) });
         cx.spawn(async move |this, cx| {
             let result = run.await;
             this.update(cx, |this, cx| match result {
                 Ok(s) => {
+                    // Gone from the library: unselected now, before the refresh lands, so the
+                    // next rating or flag key cannot reach them.
+                    this.shell.update(cx, |sh, cx| sh.select_with(cx, |l| l.unselect(&ids_done)));
                     let extra = if s.cascaded > 0 { format!(" (+{} stacked)", s.cascaded) } else { String::new() };
                     this.photo_status(format!("Moved {} to the trash{extra}.", s.trashed), cx);
                     this.photos_changed(cx);
@@ -218,6 +222,7 @@ impl RootView {
             let result = run.await;
             this.update(cx, |this, cx| match result {
                 Ok(()) => {
+                    this.shell.update(cx, |sh, cx| sh.select_with(cx, |l| l.unselect(&[id])));
                     this.photos_changed(cx);
                     this.photo_status("Removed from catalog (files left untouched).".into(), cx);
                 }

@@ -13,7 +13,7 @@ use crate::storage::Runner;
 use super::storage_tests::{has_dialog, settle, work};
 use crate::tests::{click, core_switch, deliver_switch, press, start_with_pool, status, App, TempDir};
 use chairphoto_core::app::{AppState, CoreEvent, EventSink as _, CATALOG_CHANGED};
-use chairphoto_core::catalog::{Catalog, StorageStatus, VolumeKind};
+use chairphoto_core::catalog::{Catalog, PickState, StorageStatus, VolumeKind};
 use chairphoto_core::image_pool::{ImageKind, JobKey};
 use gpui_kit::test::TestWindowExt as _;
 use gpui_kit::{
@@ -203,7 +203,7 @@ fn move_to_trash_takes_the_selection_or_the_clicked_tile(cx: &mut TestAppContext
     assert_eq!(selection(app, cx), vec![ids[0], ids[1], ids[2]], "the selection is kept");
     assert_eq!(menu(app, cx).unwrap().trash, vec![ids[0], ids[1], ids[2]]);
     cx.update_window(app.window(), |_, window, _| {
-        assert_eq!(window.find("grid-menu-trash").label(), Some("Move selection to trash"));
+        assert_eq!(window.find("grid-menu-trash").label(), Some("Move 3 photos to trash"));
     })
     .unwrap();
     click(app, "grid-menu-trash", cx);
@@ -496,4 +496,123 @@ fn the_loupes_unavailable_state_runs_the_actions(cx: &mut TestAppContext) {
     assert!(!exists(app, r.ids[0]));
     assert_eq!(status(app, cx), "Removed from catalog (files left untouched).");
     assert!(r.root.join("a0.jpg").exists());
+}
+
+// --- the selection the menu and the keys act on (#158 review, M1/M2) ---------------------
+
+fn marks(app: &App, ids: &[i64]) -> Vec<(i64, PickState, String)> {
+    ids.iter()
+        .map(|&id| {
+            let p = with_catalog(app, |c| c.get_photo(id).unwrap());
+            (p.rating, p.pick_state, p.label)
+        })
+        .collect()
+}
+
+/// Select A, B, C; a filter then hides B and C. The landed page unselects them, so the menu
+/// over A trashes A only, and the row reads "Move to trash".
+#[gpui_kit::test]
+fn trash_never_takes_selected_photos_a_filter_hides(cx: &mut TestAppContext) {
+    let r = rig("menu-hidden", 3, cx);
+    let app = &r.app;
+    let ids = r.ids.clone();
+    with_catalog(app, |c| c.set_culling(ids[0], None, Some("Red"), None).unwrap());
+    mouse(app, ids[0], MouseButton::Left, Modifiers::default(), cx);
+    ctrl_click(app, ids[1], cx);
+    ctrl_click(app, ids[2], cx);
+    app.wired.shell.update(cx, |s, cx| s.update_scope(cx, |l| l.toggle_label("Red")));
+    cx.run_until_parked();
+    render(app, cx);
+    assert_eq!(rows(app, cx), vec![ids[0]], "only the red photo is visible");
+    assert_eq!(selection(app, cx), vec![ids[0]], "the hidden photos were unselected");
+    right_click(app, ids[0], cx);
+    assert_eq!(menu(app, cx).unwrap().trash, vec![ids[0]]);
+    cx.update_window(app.window(), |_, window, _| {
+        assert_eq!(window.find("grid-menu-trash").label(), Some("Move to trash"));
+    })
+    .unwrap();
+    click(app, "grid-menu-trash", cx);
+    assert_eq!(trashed(app), vec![ids[0]], "only what the user can see is trashed");
+    assert_eq!(status(app, cx), "Moved 1 to the trash.");
+}
+
+/// After Move to trash (and Remove from catalog) the photos are no longer selected or
+/// active, so a rating or flag key pressed next reaches none of them.
+#[gpui_kit::test]
+fn a_key_after_trash_or_remove_never_marks_those_photos(cx: &mut TestAppContext) {
+    let r = rig("menu-after-trash", 4, cx);
+    let app = &r.app;
+    let ids = r.ids.clone();
+    mouse(app, ids[0], MouseButton::Left, Modifiers::default(), cx);
+    ctrl_click(app, ids[1], cx);
+    right_click(app, ids[1], cx);
+    // What was selected the moment the trash reported success — before its refresh lands.
+    let at_report: Rc<RefCell<Option<Vec<i64>>>> = Rc::default();
+    let _watch = {
+        let (seen, shell) = (at_report.clone(), app.wired.shell.clone());
+        cx.update(|cx| {
+            cx.observe(&app.wired.model, move |m, cx| {
+                if m.read(cx).status.starts_with("Moved") && seen.borrow().is_none() {
+                    *seen.borrow_mut() = Some(shell.read(cx).library.selection().ids.to_vec());
+                }
+            })
+        })
+    };
+    click(app, "grid-menu-trash", cx);
+    assert_eq!(*at_report.borrow(), Some(vec![]), "unselected as the trash succeeded, not only when the rows re-read");
+    assert!(selection(app, cx).is_empty(), "the trashed photos were unselected at once");
+    assert_eq!(app.wired.shell.read_with(cx, |s, _| s.library.selection().active_id), None);
+    render(app, cx);
+    press(app, "5", cx);
+    work(cx);
+    assert!(marks(app, &ids).iter().all(|m| m.0 == 0), "no rating landed: {:?}", marks(app, &ids));
+
+    mouse(app, ids[2], MouseButton::Left, Modifiers::default(), cx);
+    right_click(app, ids[2], cx);
+    click(app, "grid-menu-remove", cx);
+    settle(app, cx);
+    click(app, "ok", cx);
+    assert!(selection(app, cx).is_empty(), "the removed photo was unselected");
+    press(app, "x", cx);
+    work(cx);
+    assert_eq!(marks(app, &ids[3..])[0].1, PickState::None, "no flag landed on another photo");
+}
+
+/// The other bulk actions act on the trimmed selection too: once a filter hides some selected
+/// photos, rating, flag and label keys mark only the visible ones, and the tagging block's
+/// targets (assign, remove, tag paste) are the visible ones.
+#[gpui_kit::test]
+fn bulk_keys_and_tag_targets_act_on_the_visible_selection_only(cx: &mut TestAppContext) {
+    let r = rig("menu-bulk", 4, cx);
+    let app = &r.app;
+    let ids = r.ids.clone();
+    for &id in &ids[..2] {
+        with_catalog(app, |c| c.set_culling(id, None, Some("Blue"), None).unwrap());
+    }
+    mouse(app, ids[0], MouseButton::Left, Modifiers::default(), cx);
+    for &id in &ids[1..] {
+        ctrl_click(app, id, cx);
+    }
+    assert_eq!(selection(app, cx).len(), 4);
+    app.wired.shell.update(cx, |s, cx| s.update_scope(cx, |l| l.toggle_label("Blue")));
+    cx.run_until_parked();
+    render(app, cx);
+    assert_eq!(rows(app, cx), vec![ids[0], ids[1]]);
+    assert_eq!(selection(app, cx), vec![ids[0], ids[1]]);
+    let photo_tags = app.wired.root.clone().unwrap().read_with(cx, |r, _| r.photo_tags.clone());
+    assert_eq!(photo_tags.read_with(cx, |p, _| p.target.targets.clone()), vec![ids[0], ids[1]]);
+
+    // The active photo (the last ctrl-clicked, now hidden) was dropped; give the keys one.
+    mouse(app, ids[1], MouseButton::Left, Modifiers { control: true, ..Default::default() }, cx);
+    mouse(app, ids[1], MouseButton::Left, Modifiers { control: true, ..Default::default() }, cx);
+    assert_eq!(selection(app, cx), vec![ids[0], ids[1]]);
+    for key in ["3", "p", "g"] {
+        press(app, key, cx);
+        work(cx);
+    }
+    let m = marks(app, &ids);
+    assert_eq!(m[0], (3, PickState::Pick, "Green".into()));
+    assert_eq!(m[1], (3, PickState::Pick, "Green".into()));
+    assert_eq!((m[2].0, m[2].1), (0, PickState::None), "hidden photo 3 was not marked");
+    assert_eq!((m[3].0, m[3].1), (0, PickState::None), "hidden photo 4 was not marked");
 }

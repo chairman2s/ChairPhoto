@@ -132,6 +132,11 @@ impl LibraryQuery {
         RefreshRequest { generation: self.generation, query: query.clone() }
     }
 
+    /// The newest refresh's generation: a page for any other is stale.
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
     /// Hand back a refresh's answer.
     ///
     /// - `Err`: returned unchanged, nothing touched — an empty grid would read as "no photos

@@ -5,7 +5,10 @@
 //! - **What it acts on.** Move to trash takes the selection when the clicked tile is part of
 //!   it, else just that tile; the other four always act on the clicked photo. A right-click
 //!   on a selected tile keeps the selection (so a multi-selection can be trashed); one on an
-//!   unselected tile selects it alone first.
+//!   unselected tile selects it alone first. Only selected photos the rows list count (a
+//!   filter's hidden photos are never trashed), and the row says how many ("Move 3 photos to
+//!   trash"). The list is taken when the menu opens: an arrow key while it is open does not
+//!   change what the row trashes.
 //! - **Enablement.** Retrieve from NAS is disabled, with "No NAS backup to retrieve", unless
 //!   the photo's storage state says a backup may exist (backed up, on the NAS, or on the NAS
 //!   offline). An unknown state (its badge not read yet) counts as no backup, as in React.
@@ -89,8 +92,11 @@ impl LibraryView {
             self.menu = None;
             return;
         };
-        let ids = shell.library.selection().ids;
-        let trash = if ids.contains(&id) { ids.to_vec() } else { vec![id] };
+        // The selected photos the rows list — never one a filter hides (the session trims
+        // hidden ones when a page lands; this also covers a filter whose page is in flight).
+        let selection = shell.library.selection();
+        let visible: Vec<i64> = selection.photos.iter().map(|p| p.id).collect();
+        let trash = if visible.contains(&id) { visible } else { vec![id] };
         let name = shell
             .library
             .photos()
@@ -136,7 +142,7 @@ impl LibraryView {
         let status = self.shell.read(cx).library.statuses().get(&menu.photo).copied();
         let retrieve = can_retrieve(status);
         let (id, from) = (menu.photo, menu.from);
-        let item = |el_id: &'static str, label: &'static str, enabled: bool, danger: bool| -> Stateful<Div> {
+        let item = |el_id: &'static str, label: SharedString, enabled: bool, danger: bool| -> Stateful<Div> {
             div()
                 .id(el_id)
                 .flex()
@@ -151,7 +157,10 @@ impl LibraryView {
         };
         let trash_ids = menu.trash.clone();
         let name = menu.name.clone();
-        let trash_label = if menu.trash.len() > 1 { "Move selection to trash" } else { "Move to trash" };
+        let trash_label: SharedString = match menu.trash.len() {
+            1 => "Move to trash".into(),
+            n => format!("Move {n} photos to trash").into(),
+        };
         let body = div()
             .id("grid-menu")
             .occlude()
@@ -200,7 +209,7 @@ impl LibraryView {
                     .test_support(),
             )
             .child(
-                item("grid-menu-trash", trash_label, true, false)
+                item("grid-menu-trash", trash_label.clone(), true, false)
                     .tooltip(crate::shell::title_bar::tooltip(
                         "Hide it everywhere, reversibly. Nothing is deleted and nothing is written to disk.",
                     ))
@@ -211,17 +220,17 @@ impl LibraryView {
                     .test_support(),
             )
             .child(
-                item("grid-menu-reveal", "Reveal in Files", true, false)
+                item("grid-menu-reveal", "Reveal in Files".into(), true, false)
                     .on_click(cx.listener(move |this, _, _, cx| this.choose(PhotoCommand::Reveal { id, from }, cx)))
                     .test_support(),
             )
             .child(
-                item("grid-menu-relocate", "Relocate…", true, false)
+                item("grid-menu-relocate", "Relocate…".into(), true, false)
                     .on_click(cx.listener(move |this, _, _, cx| this.choose(PhotoCommand::Relocate { id, from }, cx)))
                     .test_support(),
             )
             .child({
-                let el = item("grid-menu-retrieve", "Retrieve from NAS", retrieve, false);
+                let el = item("grid-menu-retrieve", "Retrieve from NAS".into(), retrieve, false);
                 let el = if retrieve {
                     el.on_click(cx.listener(move |this, _, _, cx| this.choose(PhotoCommand::Retrieve { id, from }, cx)))
                 } else {
@@ -231,7 +240,7 @@ impl LibraryView {
             })
             .child(div().h(px(1.)).my(px(4.)).bg(colors.border))
             .child(
-                item("grid-menu-remove", "Remove from catalog", true, true)
+                item("grid-menu-remove", "Remove from catalog".into(), true, true)
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.choose(PhotoCommand::Remove { id, name: name.clone(), from }, cx)
                     }))

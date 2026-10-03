@@ -322,7 +322,49 @@ impl LibrarySession {
         request: &RefreshRequest,
         result: Result<PhotoPage, E>,
     ) -> Result<Option<StatusRequest>, E> {
-        self.library.apply_page(request, result)
+        let landed = request.generation == self.library.generation();
+        let statuses = self.library.apply_page(request, result)?;
+        if landed {
+            self.trim_selection_to_rows();
+        }
+        Ok(statuses)
+    }
+
+    /// The selection keeps only photos the rows still list. A photo a filter now hides, or
+    /// that left the library (trashed, removed), is no longer selected — so no bulk action
+    /// (a rating key, a flag, a label, a tag paste, Move to trash) reaches a photo the user
+    /// cannot see. The off-grid stack child the loupe shows stays: it is never a row.
+    ///
+    /// Not in the TS, which kept hidden ids selected; the grid context menu (#158) made that
+    /// reachable as "trash what you cannot see".
+    /// Unselect `gone` (photos just trashed or removed) at once, before the refresh that drops
+    /// their rows lands: a key pressed in between must not reach them.
+    pub fn unselect(&mut self, gone: &[i64]) {
+        let gone: HashSet<i64> = gone.iter().copied().collect();
+        self.ids.retain(|id| !gone.contains(id));
+        if self.active_id.is_some_and(|a| gone.contains(&a)) {
+            self.active_id = None;
+        }
+        if self.anchor.is_some_and(|a| gone.contains(&a)) {
+            self.anchor = None;
+        }
+        if self.extra_photo.as_ref().is_some_and(|p| gone.contains(&p.id)) {
+            self.extra_photo = None;
+            self.stack_origin = None;
+        }
+    }
+
+    fn trim_selection_to_rows(&mut self) {
+        let rows: HashSet<i64> = self.photos().iter().map(|p| p.id).collect();
+        let off_grid = self.extra_photo.as_ref().map(|p| p.id);
+        let keep = |id: &i64| rows.contains(id) || Some(*id) == off_grid;
+        self.ids.retain(keep);
+        if self.active_id.is_some_and(|a| !keep(&a)) {
+            self.active_id = None;
+        }
+        if self.anchor.is_some_and(|a| !keep(&a)) {
+            self.anchor = None;
+        }
     }
 
     /// Hand back a storage-status answer (see [`LibraryQuery::apply_statuses`]).
@@ -1106,6 +1148,35 @@ mod tests {
         s.select_quiet(2);
         s.step_active(1, false);
         assert_eq!(s.selection().active_id, Some(1));
+    }
+
+    // New (#158 review, M1/M2): a page that no longer lists a selected photo — a filter hid
+    // it, it was trashed or removed — unselects it, so no bulk action reaches it. A stale page
+    // trims nothing; the off-grid stack child stays.
+    #[test]
+    fn a_landed_page_unselects_the_photos_it_no_longer_lists() {
+        let mut s = session_with(&[1, 2, 3, 4]);
+        s.select(1, SelectMods::default());
+        s.select(2, SelectMods::CTRL);
+        s.select(3, SelectMods::CTRL);
+        let stale = s.refresh();
+        refresh_with(&mut s, &[1, 4]);
+        assert_eq!(s.selection().ids, &[1]);
+        assert_eq!(s.selection().active_id, None, "the active photo (3) is hidden");
+        assert_eq!(s.selection().targets, vec![1]);
+        // A stale page changes nothing (it is dropped).
+        s.select(4, SelectMods::CTRL);
+        s.apply_page::<()>(&stale, Ok(page(&[2], 1))).unwrap();
+        assert_eq!(s.selection().ids, &[1, 4]);
+
+        // Nothing left: no targets at all.
+        refresh_with(&mut s, &[2]);
+        assert!(s.selection().ids.is_empty() && s.selection().targets.is_empty());
+
+        // The loupe's off-grid stack child is kept.
+        s.view_photo(child(9, 2));
+        refresh_with(&mut s, &[2]);
+        assert_eq!(s.selection().active_id, Some(9));
     }
 
     // New (Codex review of gpui #102): two culling actions started on the same photo both

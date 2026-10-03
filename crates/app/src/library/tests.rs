@@ -602,6 +602,35 @@ fn the_stack_dialog_windows_and_releases_its_thumbnails(cx: &mut TestAppContext)
     images.read_with(cx, |s, _| assert!(later.iter().all(|&id| !s.is_pending(id, ImageKind::Thumb))));
 }
 
+// --- the column count follows the width (#187) ------------------------------------------------
+
+/// After each window resize the grid's column count is the one its measured width gives,
+/// with no frame forced: only what GPUI redraws by itself, as in the running app. The width
+/// is measured during the list's layout, so a change asks for another frame then — a request
+/// GPUI dropped mid-draw, which left the columns one width behind (4 at 700 px wide, where
+/// the 624 px list fits 3).
+#[gpui_kit::test]
+fn the_column_count_follows_the_width_after_each_resize(cx: &mut TestAppContext) {
+    let dir = TempDir::new("grid-resize");
+    let app = start(cx);
+    open_catalog_with_photos(&app, &dir, 60, cx);
+    render(&app, cx);
+    let view = library_view(&app, cx);
+    let tile_min = app.wired.shell.read_with(cx, |s, _| s.layout.thumb_size);
+    let mut seen = Vec::new();
+    for (w, h) in [(700., 800.), (1500., 900.), (1100., 800.), (700., 800.)] {
+        cx.simulate_window_resize(app.window(), gpui_kit::size(px(w), px(h)));
+        cx.run_until_parked();
+        let (cols, measured) = view.read_with(cx, |v, _| (v.columns(), v.measured()));
+        let measured = measured.expect("laid out").0;
+        let want = crate::library::layout::columns(measured, tile_min);
+        assert_eq!(cols, want, "{w}x{h}: the list is {measured} px wide");
+        seen.push(want);
+    }
+    seen.dedup();
+    assert!(seen.len() >= 3, "the widths give different column counts: {seen:?}");
+}
+
 /// A page from a superseded read does not replace the newer rows (the session's
 /// generation), and the newest read is the one that marks the rows loaded.
 #[gpui_kit::test]
@@ -1452,6 +1481,38 @@ fn a_plain_render_in_a_switch_window_is_not_drawn_under_the_old_row(cx: &mut Tes
     assert_eq!(rig.tile(photo, cx), Err("absent"));
     render(&rig.app, cx);
     assert_eq!(rig.jobs(photo), jobs, "and not asked again under A's row");
+}
+
+/// #187's audit, on rv151 L1's setup: the frame in which the grid finds a tile's cached
+/// pixels foreign (rendered in another catalog) has already built the tile with them; the
+/// grid drops them from its list's prepaint, and the redraw that takes them off screen must
+/// still happen — GPUI drops one asked for mid-draw. No frame is forced: only what GPUI
+/// redraws by itself, as in the running app.
+#[gpui_kit::test]
+fn a_tile_dropped_while_the_grid_draws_leaves_the_screen(cx: &mut TestAppContext) {
+    let rig = LookRig::new("grid-drop-redraw", 2, cx);
+    let photo = rig.ids[1];
+    let version = rig.cover(photo);
+    rig.refresh_rows(cx);
+    for &id in &rig.ids {
+        rig.finish(id, 4, cx);
+    }
+    let (b, b_ids) = colliding_catalog(&rig.dir, "b", 2);
+    let bv = b.create_version(b_ids[1], "B's").unwrap();
+    assert_eq!(b.set_cover_version(b_ids[1], Some(bv)).unwrap(), Some(format!("{version}:0")), "the token collides");
+    core_switch(&rig.app, b);
+    let images = rig.app.wired.images.clone();
+    images.update(cx, |s, cx| {
+        s.evict(|k| k.photo == photo, cx);
+        s.request(photo, ImageKind::Thumb);
+    });
+    // B's render lands; GPUI redraws the grid, which finds it foreign and drops it.
+    rig.finish(photo, 16, cx);
+    assert_ne!(rig.tile(photo, cx), Ok(16), "dropped from the store");
+    let drawn = cx
+        .update_window(rig.app.window(), |_, window, _| window.try_find(("tile-picture", photo as u64)).is_some())
+        .unwrap();
+    assert!(!drawn, "B's pixels are still on screen under A's row");
 }
 
 /// rv151 L2. A tile a plain view asked for first — after a switch emptied the store, before

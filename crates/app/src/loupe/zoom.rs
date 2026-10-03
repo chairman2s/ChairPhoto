@@ -14,13 +14,18 @@
 //!   image its own ([`ZoomImage::new`]) and resets it when the photo changes; Compare gives
 //!   every pane the same one ([`ZoomImage::shared`]) and resets it itself when the set
 //!   changes, so the panes pan and zoom as one.
+//! - **A Compare pane holds what it shows.** A shared image keeps an image claim on its
+//!   photo's preview and, once zoomed in, its zoom tier, so another view letting go of the
+//!   same tier (the pop-out loupe stepping off the photo when Compare's focus moves) does
+//!   not evict it from under the pane (#206). The loupe's own image holds nothing: its
+//!   [`LoupeView`](crate::loupe::view::LoupeView) claims its window and evicts what it left.
 //! - **Override.** An edited version's render ([`Override`]) replaces the photo tiers; its
 //!   hi-res render is asked for on the first zoom-in, by whoever owns the render
 //!   ([`ZoomImage::wants_hi`]).
 //!
 //! Nothing here decodes: the image layer and the edit renders hand over ready textures.
 
-use crate::image_store::{ImageState, ImageStore};
+use crate::image_store::{ClaimId, ImageState, ImageStore};
 use crate::shell::actions::{RelocatePhoto, RemoveFromCatalog, RetrieveFromNas};
 use crate::shell::style::Colors;
 use crate::storage::ui;
@@ -249,6 +254,9 @@ pub struct ZoomImage {
     id: SharedString,
     /// What the last frame drew: the photo and the source (tests, the latency bench).
     last_drawn: Option<(i64, Drawn)>,
+    /// A Compare pane's hold on the tiers it shows (see the module docs); `None` for the
+    /// loupe.
+    claim: Option<ClaimId>,
     _observers: [Subscription; 2],
 }
 
@@ -277,6 +285,7 @@ impl ZoomImage {
         cx: &mut Context<Self>,
     ) -> Self {
         let _observers = [cx.observe(&images, |_, _, cx| cx.notify()), cx.observe(&shared, |_, _, cx| cx.notify())];
+        let claim = (!owns_view).then(|| images.update(cx, |s, _| s.new_claim()));
         ZoomImage {
             images,
             shared,
@@ -290,6 +299,7 @@ impl ZoomImage {
             drag: None,
             id,
             last_drawn: None,
+            claim,
             _observers,
         }
     }
@@ -337,7 +347,23 @@ impl ZoomImage {
         if self.owns_view {
             self.shared.update(cx, |s, cx| s.set(ZoomView::FIT, cx));
         }
+        // At once, not at the next frame: a view reacting to the same change may let go of
+        // the tiers this one now shows.
+        let wanted = self.held();
+        if let Some(claim) = self.claim {
+            self.images.update(cx, |s, _| s.set_claim(claim, wanted));
+        }
         cx.notify();
+    }
+
+    /// The tiers this image shows: its photo's preview, and its zoom tier once zoomed in.
+    /// Nothing for an override, which is not the store's.
+    fn held(&self) -> Vec<(i64, ImageKind)> {
+        match self.photo.filter(|_| self.over.is_none()) {
+            Some(p) if self.hi => vec![(p, ImageKind::Preview), (p, ImageKind::Zoom)],
+            Some(p) => vec![(p, ImageKind::Preview)],
+            None => Vec::new(),
+        }
     }
 
     /// Show an edited version's render instead of the photo's tiers (`None`: the tiers).
@@ -401,10 +427,10 @@ impl ZoomImage {
             return Shown { failed: image.is_none() && over.failed.is_some(), image, drawn, hires };
         }
         let Some(photo) = self.photo else { return Shown { image: None, drawn: None, hires: None, failed: false } };
+        let wanted = self.held();
         self.images.update(cx, |store, _| {
-            let mut wanted = vec![(photo, ImageKind::Preview)];
-            if self.hi {
-                wanted.push((photo, ImageKind::Zoom));
+            if let Some(claim) = self.claim {
+                store.set_claim(claim, wanted.iter().copied());
             }
             store.request_batch(&wanted);
             let zoom = match store.get(photo, ImageKind::Zoom) {

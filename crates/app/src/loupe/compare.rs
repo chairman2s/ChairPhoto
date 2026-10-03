@@ -17,9 +17,22 @@
 //!   the caller [`settle`](CompareSession::settle)s that one: written, the duel advances (or
 //!   the grid pages on); failed, it stays on the same pair (React awaited `applyMark` before
 //!   it moved the duel on).
+//! - **A verdict belongs to its session.** Each open and each mode switch starts a new
+//!   epoch, and a verdict carries the one it was decided in. Settling it on a later session
+//!   (Compare closed and reopened, or Duel→Grid→Duel, while the write was in flight) changes
+//!   nothing — not the round, not that session's own pending verdict.
 
 use chairphoto_core::catalog::PickState;
 use chairphoto_model::compare_duel::{advance_duel, duel_round, duel_total_rounds, initial_duel, DuelSide, DuelState};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Hands out session epochs, unique for the process: two sessions never share one, whatever
+/// opened them.
+static NEXT_EPOCH: AtomicU64 = AtomicU64::new(1);
+
+fn next_epoch() -> u64 {
+    NEXT_EPOCH.fetch_add(1, Ordering::Relaxed)
+}
 
 /// Most panes at once: beyond this each frame is too small to judge.
 pub const MAX_PANES: usize = 4;
@@ -58,11 +71,13 @@ impl CompareMode {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Verdict {
     pub writes: Vec<(i64, PickState)>,
+    /// The epoch of the session (and mode) it was decided in.
+    epoch: u64,
     next: Advance,
 }
 
-/// Where a settled verdict takes the session, from the state it was decided in: a verdict
-/// whose session has since moved (a mode switch) changes nothing.
+/// Where a settled verdict takes the session, from the state it was decided in. A verdict
+/// from another epoch never gets this far ([`CompareSession::settle`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Advance {
     Duel { from: DuelState, to: DuelState },
@@ -80,6 +95,8 @@ pub struct CompareSession {
     focus: Option<i64>,
     /// A verdict is being written: no other is decided until it settles.
     pending: bool,
+    /// This session in this mode; see the module docs.
+    epoch: u64,
 }
 
 impl CompareSession {
@@ -103,6 +120,7 @@ impl CompareSession {
             duel: initial_duel(),
             focus: Some(focus),
             pending: false,
+            epoch: next_epoch(),
         })
     }
 
@@ -180,8 +198,10 @@ impl CompareSession {
     /// nothing across modes); the grid keeps its page.
     pub fn switch_mode(&mut self, mode: CompareMode) {
         self.mode = mode;
-        // A verdict still being written was decided in the old mode; settling it is a no-op.
+        // A verdict still being written was decided in the old mode: a new epoch makes
+        // settling it a no-op, and this mode may decide its own meanwhile.
         self.pending = false;
+        self.epoch = next_epoch();
         self.duel = initial_duel();
         self.focus = match mode {
             CompareMode::Duel => self.pool.get(1).or(self.pool.first()).copied(),
@@ -223,13 +243,17 @@ impl CompareSession {
             writes.push((winner, PickState::Pick));
         }
         self.pending = true;
-        Some(Verdict { writes, next: Advance::Duel { from: self.duel, to: result.next } })
+        Some(Verdict { writes, epoch: self.epoch, next: Advance::Duel { from: self.duel, to: result.next } })
     }
 
     /// The writes of `verdict` landed (`written`) or failed. Written, the session moves on —
     /// unless it has moved since the verdict was decided; failed, it stays where it was.
-    /// Either way the next verdict may be decided.
+    /// Either way the next verdict may be decided. A verdict from another session or mode
+    /// (another epoch) changes nothing: that session's pending verdict is its own.
     pub fn settle(&mut self, verdict: &Verdict, written: bool) {
+        if verdict.epoch != self.epoch {
+            return;
+        }
         self.pending = false;
         if !written {
             return;
@@ -263,7 +287,7 @@ impl CompareSession {
         let mut writes = vec![(keeper, PickState::Pick)];
         writes.extend(batch.iter().filter(|&&id| id != keeper).map(|&id| (id, PickState::Reject)));
         self.pending = true;
-        Some(Verdict { writes, next: Advance::Grid { from_start: self.start, keeper } })
+        Some(Verdict { writes, epoch: self.epoch, next: Advance::Grid { from_start: self.start, keeper } })
     }
 }
 
@@ -356,6 +380,32 @@ mod tests {
         let v = g.keep(2).unwrap();
         g.settle(&v, false);
         assert_eq!((g.start(), g.focus()), (0, Some(1)));
+    }
+
+    /// #205: a verdict settles only the session (and mode) it was decided in.
+    #[test]
+    fn a_verdict_settles_only_its_own_session() {
+        // Closed and reopened on another set while the write was in flight.
+        let mut old = CompareSession::open(&[1, 2, 3], None, CompareMode::Duel).unwrap();
+        let v = old.verdict(DuelSide::Right).unwrap();
+        let mut new = CompareSession::open(&[4, 5, 6], None, CompareMode::Duel).unwrap();
+        let own = new.verdict(DuelSide::Left).unwrap();
+        new.settle(&v, true);
+        assert_eq!((new.batch(), new.duel_progress(), new.focus()), (vec![4, 5], (1, 2), Some(5)), "not advanced");
+        assert!(new.pending(), "its own verdict is still being written");
+        new.settle(&own, true);
+        assert_eq!((new.batch(), new.pending()), (vec![4, 6], false));
+        // Duel→Grid→Duel inside the write window: the restarted duel is on the same round
+        // the verdict was decided in, and still ignores it.
+        let mut s = CompareSession::open(&[1, 2, 3], None, CompareMode::Duel).unwrap();
+        let v = s.verdict(DuelSide::Right).unwrap();
+        s.switch_mode(CompareMode::Grid);
+        s.switch_mode(CompareMode::Duel);
+        let own = s.verdict(DuelSide::Left).unwrap();
+        s.settle(&v, true);
+        assert_eq!((s.batch(), s.duel_progress(), s.pending()), (vec![1, 2], (1, 2), true));
+        s.settle(&own, true);
+        assert_eq!((s.batch(), s.pending()), (vec![1, 3], false));
     }
 
     #[test]

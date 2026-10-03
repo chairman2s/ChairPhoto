@@ -279,6 +279,64 @@ fn closing_the_pop_out_releases_only_its_own_images(cx: &mut TestAppContext) {
     assert!(pool.cancelled.lock().unwrap().is_empty(), "{:?}", pool.cancelled.lock().unwrap());
 }
 
+// --- Compare beside the pop-out (#206) ----------------------------------------------------------
+
+/// The pop-out follows Compare's focused pane, and when the focus moves it evicts the
+/// full-resolution tier of the photo it left. A Compare pane still zoomed in on that photo
+/// holds its tiers: it keeps drawing the zoom tier, which is neither dropped nor decoded
+/// again (180–245 MB a typical RAW).
+#[gpui_kit::test]
+fn the_pop_out_leaves_a_zoomed_compare_panes_tier_alone(cx: &mut TestAppContext) {
+    let (app, pool, _dir, ids) = app_with(3, "pop-compare", cx);
+    let h = open(cx);
+    app.wired.shell.update(cx, |s, cx| s.select_with(cx, |l| l.select_all()));
+    cx.run_until_parked();
+    press(&app, "c", cx);
+    assert_eq!(stage(&app, cx), StageView::Compare);
+    for &id in &ids {
+        pool.finish(&preview(id), Ok(pixels(300, 200)));
+    }
+    cx.run_until_parked();
+    // The duel's challenger (pane 1) is focused: the pop-out shows it.
+    assert_eq!(shown(h, cx), Some(ids[1]));
+    cx.update_window(app.window(), |_, window, cx| {
+        window.render_frame(cx);
+        let position = window.find("compare-image-1").bounds().center();
+        let event = ScrollWheelEvent {
+            position,
+            delta: ScrollDelta::Lines(point(0., 1.)),
+            modifiers: Modifiers::default(),
+            touch_phase: TouchPhase::Moved,
+        };
+        window.dispatch_event(event.to_platform_input(), cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    pool.finish(&zoom_key(ids[1]), Ok(pixels(3000, 2000)));
+    cx.run_until_parked();
+    render_main(&app, cx);
+    let compare = app.wired.root.as_ref().unwrap().read_with(cx, |r, _| r.compare().clone());
+    let pane = compare.read_with(cx, |c, _| c.panes()[1].clone());
+    assert_eq!(pane.read_with(cx, |z, _| z.drawn()), Some((ids[1], Drawn::Zoom)));
+    let zoom_jobs = || pool.batches.lock().unwrap().iter().flatten().filter(|k| **k == zoom_key(ids[1])).count();
+    let jobs = zoom_jobs();
+
+    // ↓ moves Compare's focus to the champion; the pop-out follows it and lets go of ids[1].
+    press(&app, "down", cx);
+    assert_eq!(shown(h, cx), Some(ids[0]));
+    assert!(cached(&app, ids[1], ImageKind::Zoom, cx), "the pane's zoom tier was evicted");
+    render_main(&app, cx);
+    assert_eq!(pane.read_with(cx, |z, _| z.drawn()), Some((ids[1], Drawn::Zoom)), "the pane still draws it");
+    assert_eq!(zoom_jobs(), jobs, "not decoded again");
+
+    // Compare closed: the panes hold nothing, and the tier goes like any other.
+    press(&app, "escape", cx);
+    assert_eq!(stage(&app, cx), StageView::Grid);
+    let claimed = app.wired.images.read_with(cx, |s, _| s.is_claimed(ids[1], ImageKind::Zoom));
+    assert!(!claimed, "a closed Compare holds no tier");
+}
+
 /// A catalog switch to colliding ids leaves the pop-out open and empty; a photo of the new
 /// catalog is then asked for afresh, never drawn from the old catalog's pixels.
 #[gpui_kit::test]

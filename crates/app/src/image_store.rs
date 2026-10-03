@@ -745,6 +745,7 @@ impl ImageStore {
             self.refused.clear();
             self.looks_from = Some(from);
         }
+        let mut invalidated = false;
         for &(photo, cover) in wanted {
             let look = Look { from, cover };
             let key = self.key(photo, ImageKind::Thumb);
@@ -769,11 +770,22 @@ impl ImageStore {
                 };
             if stale {
                 self.invalidate_tier(photo, ImageKind::Thumb, cx);
+                invalidated = true;
             }
             self.looks.insert(photo, look);
         }
         let tiers: Vec<(i64, ImageKind)> = wanted.iter().map(|&(photo, _)| (photo, ImageKind::Thumb)).collect();
         self.submit(&tiers, false, Some(from));
+        if invalidated {
+            // The grid asks from its list's prepaint, after this frame's tiles were built
+            // with what was just dropped; GPUI drops a notify made mid-draw, so the stale
+            // tile would stay on screen until the new render answers. Redraw after the frame
+            // (#187).
+            let this = cx.entity().downgrade();
+            cx.defer(move |cx| {
+                this.update(cx, |_, cx| cx.notify()).ok();
+            });
+        }
     }
 
     /// Rows read from `from` landed (rv151 L5, `wire`): each `(photo, cover look)` whose

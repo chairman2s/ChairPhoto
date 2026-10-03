@@ -35,7 +35,7 @@ use crate::shell::actions::OpenCompare;
 use crate::shell::state::{Mark, ShellState, StageView};
 use crate::shell::style::{Colors, COLOR_LABELS};
 use crate::storage::ui;
-use chairphoto_core::app::with_catalog_as;
+use chairphoto_core::app::{with_catalog_as, CatalogIdentity};
 use chairphoto_core::catalog::{Photo, PickState};
 use chairphoto_core::image_pool::ImageKind;
 use gpui_kit::assets::IconName;
@@ -304,10 +304,11 @@ impl LoupeView {
         self.zoom.update(cx, |z, cx| z.set_override(Some(over), cx));
     }
 
-    /// ↺ / ↻: a non-destructive rotation (`rotate_photo`), bound to the catalog the rows were
-    /// read from; the photo's cached tiers are dropped so every view re-renders it.
-    pub fn rotate(&mut self, photo: i64, delta: i64, cx: &mut Context<Self>) {
-        let Some(from) = self.shell.read(cx).rows_from() else { return };
+    /// ↺ / ↻: a non-destructive rotation (`rotate_photo`) of `photo`, bound to `from`, the
+    /// catalog its row was read from — both as the bar was drawn, never looked up at the click
+    /// (#207); the photo's cached tiers are dropped so every view re-renders it.
+    pub fn rotate(&mut self, photo: i64, from: Option<CatalogIdentity>, delta: i64, cx: &mut Context<Self>) {
+        let Some(from) = from else { return };
         let state = self.model.read(cx).state().clone();
         let run = cx.background_executor().spawn(async move { with_catalog_as(&state, from, |c| c.rotate_photo(photo, delta)) });
         cx.spawn(async move |this, cx| {
@@ -324,10 +325,11 @@ impl LoupeView {
         .detach();
     }
 
-    /// "▶ Play in system player": resolve the file (never from `photos.path` directly) off
-    /// the UI thread, then hand it to the desktop.
-    pub fn play(&mut self, photo: i64, cx: &mut Context<Self>) {
-        let Some(from) = self.shell.read(cx).rows_from() else { return };
+    /// "▶ Play in system player": resolve `photo`'s file in `from` (both as the button was
+    /// drawn, #207; never from `photos.path` directly) off the UI thread, then hand it to the
+    /// desktop.
+    pub fn play(&mut self, photo: i64, from: Option<CatalogIdentity>, cx: &mut Context<Self>) {
+        let Some(from) = from else { return };
         let state = self.model.read(cx).state().clone();
         let run = cx.background_executor().spawn(async move { with_catalog_as(&state, from, |c| c.require_photo_path(photo)) });
         cx.spawn(async move |this, cx| {
@@ -347,8 +349,9 @@ impl LoupeView {
         let back_to_original = selection.extra_photo.is_some() && selection.stack_origin.is_some();
         let soft = shell.soft_threshold;
         let version = shell.active_version().map(|v| v.name.clone());
-        let hint = loupe_hint(self.modules.read(cx).is_enabled(FACES_MODULE));
-        let id = photo.id;
+        let hint = loupe_hint(faces_enabled(&self.modules, cx));
+        // The row and the catalog it was read from, as drawn: a click acts on these (#207).
+        let (id, from) = (photo.id, shell.rows_from());
         let name = file_name(&photo.path);
         let mut tags = div().flex().items_center().gap(px(6.)).min_w_0().overflow_hidden();
         tags = tags.child(
@@ -417,13 +420,13 @@ impl LoupeView {
                 ui::icon_chip("loupe-rotate-left", IconName::RotateCcw, "Rotate left", true, colors)
                     .tooltip(crate::shell::title_bar::tooltip("Rotate left (non-destructive)")),
                 true,
-                cx.listener(move |this, _, _, cx| this.rotate(id, -90, cx)),
+                cx.listener(move |this, _, _, cx| this.rotate(id, from, -90, cx)),
             ))
             .child(ui::clickable(
                 ui::icon_chip("loupe-rotate-right", IconName::RotateCw, "Rotate right", true, colors)
                     .tooltip(crate::shell::title_bar::tooltip("Rotate right (non-destructive)")),
                 true,
-                cx.listener(move |this, _, _, cx| this.rotate(id, 90, cx)),
+                cx.listener(move |this, _, _, cx| this.rotate(id, from, 90, cx)),
             ))
             .child(tags)
             .child(div().flex_1())
@@ -444,9 +447,19 @@ impl LoupeView {
     }
 }
 
-/// The Faces module's id (`modules::faces::FACES_MODULE_ID`, which exists only with the
-/// `faces` feature).
-const FACES_MODULE: &str = "faces";
+/// Whether the Faces module is on. Without the `faces` feature it does not exist (nor does
+/// its id, `FACES_MODULE_ID`).
+fn faces_enabled(modules: &Entity<ModuleRegistry>, cx: &App) -> bool {
+    #[cfg(feature = "faces")]
+    {
+        modules.read(cx).is_enabled(crate::modules::faces::FACES_MODULE_ID)
+    }
+    #[cfg(not(feature = "faces"))]
+    {
+        let _ = (modules, cx);
+        false
+    }
+}
 
 /// The loupe bar's key hint (App.tsx's `.loupe-hint`). "F faces" only while the Faces module
 /// is on: F toggles its overlay's boxes, and without it the key does nothing.
@@ -548,7 +561,7 @@ impl Render for LoupeView {
         images.retain(|_, zoom| zoom.upgrade().is_some());
         images.insert(window.window_handle().window_id(), self.zoom.downgrade());
         let panels = ModuleRegistry::panel_views(&self.modules, PanelSlot::Loupe, window, cx);
-        let id = photo.id;
+        let (id, from) = (photo.id, self.shell.read(cx).rows_from());
         let stage: AnyElement = div()
             .id("loupe-stage")
             .relative()
@@ -560,7 +573,7 @@ impl Render for LoupeView {
                     div().absolute().bottom(px(18.)).left_0().right_0().flex().justify_center().child(ui::clickable(
                         ui::primary("loupe-play", PLAY_LABEL, true, colors),
                         true,
-                        cx.listener(move |this, _, _, cx| this.play(id, cx)),
+                        cx.listener(move |this, _, _, cx| this.play(id, from, cx)),
                     )),
                 )
             })

@@ -2188,13 +2188,16 @@ impl Catalog {
     /// Remove assigned tags that are a strict ancestor of another assigned tag on the
     /// same photo (the descendant already implies them). Returns the number removed.
     /// Ancestry is by stored `full_path` prefix (`A/B` is an ancestor of `A/B/C`).
+    /// An auto-tag's row is never pruned: its membership is the rule's alone, and the next
+    /// pass would only put it back (#181).
     pub fn prune_redundant_tags(&self, photo_id: i64) -> Result<usize> {
         Ok(self.conn.execute(
             "DELETE FROM photo_tags
              WHERE photo_id = ?1 AND tag_id IN (
                  SELECT a.id FROM tags a
                  JOIN photo_tags pa ON pa.tag_id = a.id AND pa.photo_id = ?1
-                 WHERE EXISTS (
+                 WHERE a.auto_rule IS NULL
+                   AND EXISTS (
                      SELECT 1 FROM tags d
                      JOIN photo_tags pd ON pd.tag_id = d.id AND pd.photo_id = ?1
                      WHERE d.id != a.id
@@ -2344,14 +2347,16 @@ impl Catalog {
     }
 
     /// Library-wide tidy: prune redundant ancestor tags from every photo at once. Returns
-    /// the total number of assignments removed.
+    /// the total number of assignments removed. Like [`Self::prune_redundant_tags`], it
+    /// never removes an auto-tag's row.
     pub fn tidy_redundant_tags(&self) -> Result<usize> {
         Ok(self.conn.execute(
             "DELETE FROM photo_tags
              WHERE (photo_id, tag_id) IN (
                  SELECT pa.photo_id, a.id FROM tags a
                  JOIN photo_tags pa ON pa.tag_id = a.id
-                 WHERE EXISTS (
+                 WHERE a.auto_rule IS NULL
+                   AND EXISTS (
                      SELECT 1 FROM tags d
                      JOIN photo_tags pd ON pd.tag_id = d.id AND pd.photo_id = pa.photo_id
                      WHERE d.id != a.id

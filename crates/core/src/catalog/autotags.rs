@@ -475,6 +475,18 @@ mod tests {
         assert_eq!(ids, vec![trip]);
     }
 
+    /// Review #181 L1: hand-assigning a child of an auto-tag doesn't prune the auto-tag's row
+    /// as a redundant ancestor — that would be a hand removal the refusal exists to prevent.
+    #[test]
+    fn a_hand_assigned_child_does_not_prune_the_auto_tag() {
+        let (c, _root, long, _fast, auto) = long_and_fast("autotag-prune");
+        let nd = c.create_tag("Technique/Long Exposure/ND Filter").unwrap();
+        c.assign_tag(long, nd).unwrap();
+        assert!(has(&c, long, auto) && has(&c, long, nd));
+        assert_eq!(c.tidy_redundant_tags().unwrap(), 0, "the library-wide tidy leaves it too");
+        assert!(has(&c, long, auto));
+    }
+
     // ── A rule's identity is its key, not its path (#181 review M3) ───────────────
 
     /// After a structural change put the long-exposure tag `auto` at `path`: the next pass

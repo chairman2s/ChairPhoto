@@ -1,4 +1,5 @@
-//! Embedded assets: ChairPhoto's fonts, and gpui-kit's default icons for everything else.
+//! Embedded assets: ChairPhoto's fonts, the Lucide icons the app draws that gpui-kit's
+//! default icon bundle lacks ([`ExtraIcons`]), and that bundle for everything else.
 //!
 //! GPUI does not load fonts from the `AssetSource` by itself (shell-apis.md § 2): the app lists
 //! `fonts/` and hands the bytes to `add_fonts` ([`load_fonts`]). They must be TTF/OTF — WOFF2
@@ -15,6 +16,23 @@
 use gpui_kit::{App, AssetSource, Result, SharedString};
 use std::borrow::Cow;
 
+// **The extra icons** are Lucide's (ISC; the Feather-derived ones MIT), embedded from the
+// `gpui-kit-assets` crate's copy, which carries the upstream licence (`LICENSE-LUCIDE`) — the
+// same source and terms as the default bundle. gpui-kit 0.7.0's default bundle
+// (`default-icons.txt`) has only the icons its own widgets use; an `IconName` outside it and
+// this list draws nothing (#173). `every_icon_the_app_names_is_served` checks the sources.
+gpui_kit::assets::icon_assets!(
+    pub ExtraIcons,
+    [
+        // The rail: Library and Develop (`shell::sidebar::RailIcon`).
+        LayoutGrid,
+        SlidersHorizontal,
+        // Module main views on the rail: Statistics, People.
+        ChartNoAxesColumn,
+        UserGroup,
+    ]
+);
+
 /// Every embedded font, by its asset path.
 const FONTS: &[(&str, &[u8])] = &[
     ("fonts/InstrumentSans-Regular.ttf", include_bytes!("../assets/fonts/InstrumentSans-Regular.ttf")),
@@ -25,8 +43,8 @@ const FONTS: &[(&str, &[u8])] = &[
     ("fonts/InstrumentSerif-Italic.ttf", include_bytes!("../assets/fonts/InstrumentSerif-Italic.ttf")),
 ];
 
-/// The app's `AssetSource`: [`FONTS`] under `fonts/`, the shell's extra icons
-/// ([`crate::shell::sidebar::RailIcons`]), and gpui-kit's default icon bundle for the rest
+/// The app's `AssetSource`: [`FONTS`] under `fonts/`, the extra icons ([`ExtraIcons`]), and
+/// gpui-kit's default icon bundle for the rest
 /// (the gpui-component widgets load their icons through it).
 pub struct Assets;
 
@@ -35,7 +53,7 @@ impl AssetSource for Assets {
         if let Some((_, bytes)) = FONTS.iter().find(|(p, _)| *p == path) {
             return Ok(Some(Cow::Borrowed(bytes)));
         }
-        if let Some(bytes) = crate::shell::sidebar::RailIcons.load(path)? {
+        if let Some(bytes) = ExtraIcons.load(path)? {
             return Ok(Some(bytes));
         }
         gpui_kit::assets::Assets.load(path)
@@ -46,7 +64,7 @@ impl AssetSource for Assets {
             return Ok(FONTS.iter().map(|(p, _)| SharedString::from(*p)).collect());
         }
         let mut paths = gpui_kit::assets::Assets.list(path)?;
-        paths.extend(crate::shell::sidebar::RailIcons.list(path)?);
+        paths.extend(ExtraIcons.list(path)?);
         paths.sort();
         paths.dedup();
         Ok(paths)
@@ -79,6 +97,62 @@ mod tests {
             let bytes = Assets.load(&path).unwrap().expect("listed font loads");
             // TrueType outlines: sfnt version 0x00010000 (not a WOFF2 'wOF2' wrapper).
             assert_eq!(&bytes[..4], &[0, 1, 0, 0], "{path} is not a TTF");
+        }
+    }
+
+    /// `IconName::ChartNoAxesColumn` → `icons/chart-no-axes-column.svg` (`IconName::path`'s
+    /// kebab case: a hyphen before each capital and each digit run).
+    fn icon_path(name: &str) -> String {
+        let mut out = String::from("icons/");
+        let mut prev: Option<char> = None;
+        for c in name.chars() {
+            let starts_word = c.is_ascii_uppercase() || (c.is_ascii_digit() && !prev.is_some_and(|p| p.is_ascii_digit()));
+            if starts_word && prev.is_some() {
+                out.push('-');
+            }
+            out.push(c.to_ascii_lowercase());
+            prev = Some(c);
+        }
+        out + ".svg"
+    }
+
+    /// #173: every `IconName::…` the app's sources name is served — the rail's Statistics
+    /// button drew nothing because its icon was outside the default bundle. Scans
+    /// `crates/app/src` for the names, so a new icon outside the bundle fails here until it
+    /// joins [`ExtraIcons`].
+    #[test]
+    fn every_icon_the_app_names_is_served() {
+        fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    walk(&path, out);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    out.push(path);
+                }
+            }
+        }
+        let mut files = Vec::new();
+        walk(&std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"), &mut files);
+        let mut names = std::collections::BTreeSet::new();
+        for file in files {
+            let text = std::fs::read_to_string(&file).unwrap();
+            for (at, _) in text.match_indices("IconName::") {
+                let name: String =
+                    text[at + "IconName::".len()..].chars().take_while(|c| c.is_ascii_alphanumeric()).collect();
+                if name.chars().next().is_some_and(|c| c.is_ascii_uppercase()) {
+                    names.insert(name);
+                }
+            }
+        }
+        for must in ["ChartNoAxesColumn", "Map", "UserGroup", "Network"] {
+            assert!(names.contains(must), "the scan missed {must}: {names:?}");
+        }
+        assert_eq!(icon_path("ChartNoAxesColumn"), "icons/chart-no-axes-column.svg");
+        assert_eq!(icon_path("Building2"), "icons/building-2.svg");
+        for name in &names {
+            let path = icon_path(name);
+            assert!(matches!(Assets.load(&path), Ok(Some(_))), "IconName::{name} ({path}) is not served");
         }
     }
 }

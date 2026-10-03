@@ -67,7 +67,13 @@ impl ModuleInstance for MapInstance {
         let (state, shell) = (self.state.clone(), self.host.shell().clone());
         let geocode = view_factory(move |_, cx| settings::GeocodePanel::new(state.clone(), shell.clone(), cx));
         Contributions {
-            main_views: vec![MainView { id: MAP_VIEW_ID.into(), label: "Map".into(), icon: None, view: map }],
+            // The folded map, as `map.tsx` drew it (Feather's `map`, which Lucide keeps).
+            main_views: vec![MainView {
+                id: MAP_VIEW_ID.into(),
+                label: "Map".into(),
+                icon: Some(gpui_kit::component::Icon::new(gpui_kit::assets::IconName::Map)),
+                view: map,
+            }],
             settings: vec![SettingsPanel { id: "map-settings".into(), view: settings }],
             panels: vec![Panel { id: "map-geocode".into(), label: "Geocode".into(), slot: PanelSlot::Inspector, view: geocode }],
             ..Default::default()

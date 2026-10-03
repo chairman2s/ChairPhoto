@@ -200,9 +200,19 @@ original's identity *and* its face-id counter, so the two copies write the same 
 different faces. A marker is therefore this catalog's only for a **face it knows on that
 photo**: one in the set being written, or one of the photo's faces that has left it (rejected,
 ignored, unnamed). A marker with this catalog's identity but a face id it does not know on that
-photo came from a copy and is foreign like any other (review N1). And a region of a face that is
-still in the set but no longer recognisably that face (step 1) is kept as it is, not removed.
-Deleting a drawn box writes the photo's regions first, while its id is still known.
+photo came from a copy and is foreign like any other (review N1). A region of a face that is
+still in the set but no longer recognisably that face (step 1) is kept as it is — it may be the
+copy's face of the same id — until another region carries the same marker and is claimed
+(step 3). Deleting a drawn box writes the photo's regions first, while its id is still known.
+
+**A limit of copies** (review F4, #209): when both copies later create a face with the *same*
+id on the *same* photo — a re-index of a changed file, or a drawn box, after the copy — the
+two faces carry the same marker, and nothing in the sidecar tells them apart. A write by one
+copy then treats the other's region as its own: it removes it once its own face of that id
+leaves the set (rejected, ignored, unnamed), or once its own region with that marker is
+claimed beside it. A per-copy marker would need a new marker format, which is stable on disk,
+so this is documented rather than fixed. Ids colliding on *different* photos, and every region
+from before the copy, are unaffected.
 
 Each write sends the photo's whole confirmed set, and for each existing region, in this order:
 
@@ -213,7 +223,11 @@ Each write sends the photo's whole confirmed set, and for each existing region, 
    set** (a face id that changed): taken over the same way.
 3. **This catalog's marker, matched by nothing, for a face of this photo that has left the
    set:** removed. This is how a **rejected or ignored** face, or one whose person was removed,
-   leaves the sidecar.
+   leaves the sidecar. **Or for a face still in the set, when another region claimed in
+   step 1 or 2 carries the same marker after the write** (#209): that one is the face, and
+   this one a stale copy — left by a write that renamed *and* moved the face in one go (a new
+   person, and the orientation found by a rescan), which step 1 cannot follow and so appends
+   beside it. The photo's next write claims the new region and removes the stale one.
 4. **Anything else — unmarked, or another catalog's:** foreign, and **always kept**. When its
    Name and center (within `AREA_EPSILON`) match a face in the set it is that face already in
    the file — a Lightroom region ingested earlier, say: only its `Area` coordinates

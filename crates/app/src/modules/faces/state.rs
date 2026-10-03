@@ -118,8 +118,9 @@ pub enum IndexPhase {
     /// "Index faces" was clicked; the start's answer (the job id) is on its way.
     Starting,
     /// Following `job`. `progress` once a progress event (or the re-attach snapshot) gave
-    /// numbers.
-    Running { job: u64, done: usize, total: usize, progress: bool },
+    /// numbers. `stage` (#192) tells the one-time legacy-region conversion pass apart from
+    /// indexing proper — both report through the same job.
+    Running { job: u64, done: usize, total: usize, progress: bool, stage: &'static str },
 }
 
 /// The indexing section's state.
@@ -399,8 +400,8 @@ impl FacesState {
             CoreEvent::CatalogSwitched(_) => self.catalog_switched(cx),
             CoreEvent::FacesProgress(p) => {
                 match &mut self.index.phase {
-                    IndexPhase::Running { job, done, total, progress } if *job == p.job => {
-                        (*done, *total, *progress) = (p.done, p.total, true);
+                    IndexPhase::Running { job, done, total, progress, stage } if *job == p.job => {
+                        (*done, *total, *progress, *stage) = (p.done, p.total, true, p.stage);
                     }
                     IndexPhase::Starting => self.index.early.push(event.clone()),
                     _ => return, // another run's straggler
@@ -601,7 +602,8 @@ impl FacesState {
             }
             match result {
                 Ok(job) => {
-                    s.index.phase = IndexPhase::Running { job, done: 0, total: 0, progress: false };
+                    s.index.phase =
+                        IndexPhase::Running { job, done: 0, total: 0, progress: false, stage: core_faces::STAGE_INDEXING };
                     // Replay what arrived before the id was known, in order.
                     for event in std::mem::take(&mut s.index.early) {
                         s.core_event(&event, cx);
@@ -659,7 +661,13 @@ impl FacesState {
                 // A start of ours may have come in between: it is never replaced.
                 if !s.index.busy() {
                     if let Some(st) = index.filter(|st| !s.finished.contains(&st.job)) {
-                        s.index.phase = IndexPhase::Running { job: st.job, done: st.done, total: st.total, progress: true };
+                        s.index.phase = IndexPhase::Running {
+                            job: st.job,
+                            done: st.done,
+                            total: st.total,
+                            progress: true,
+                            stage: st.stage,
+                        };
                     }
                 }
                 if !s.matching.busy() {

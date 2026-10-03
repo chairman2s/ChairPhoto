@@ -4,7 +4,7 @@
 
 use crate::loupe::zoom::ZoomView;
 use crate::shell::style::Colors;
-use chairphoto_core::app::faces::{AcceptPersonOutcome, FaceBboxJson};
+use chairphoto_core::app::faces::{AcceptPersonOutcome, FaceBboxJson, STAGE_INDEXING};
 use chairphoto_core::app::{FacesIndexDone, FacesMatchDone};
 use chairphoto_core::catalog::Tag;
 use gpui_kit::Hsla;
@@ -208,11 +208,19 @@ pub fn batch_confirm_message(out: &AcceptPersonOutcome, selected: usize, person:
 
 /// The progress line (`Indexing: done / total (pct%)`).
 pub fn progress_line(done: usize, total: usize) -> (String, Option<usize>) {
+    index_progress_line(STAGE_INDEXING, done, total)
+}
+
+/// The indexing run's progress line, naming its `stage` (#192: `STAGE_CONVERTING` while the
+/// one-time legacy-region conversion pass runs first, else `STAGE_INDEXING`) — so the count's
+/// restart from 0 once conversion hands off to indexing proper reads as a new phase, not as
+/// indexing itself going backwards.
+pub fn index_progress_line(stage: &str, done: usize, total: usize) -> (String, Option<usize>) {
     let pct = (total > 0).then(|| ((done as f64 / total as f64) * 100.).round() as usize);
     let of = if total > 0 { total.to_string() } else { "…".into() };
     let line = match pct {
-        Some(p) => format!("Indexing: {done} / {of} ({p}%)"),
-        None => format!("Indexing: {done} / {of}"),
+        Some(p) => format!("{stage}: {done} / {of} ({p}%)"),
+        None => format!("{stage}: {done} / {of}"),
     };
     (line, pct)
 }
@@ -509,6 +517,17 @@ mod tests {
         assert_eq!(index_done_message(&done(9, 3, 0, 0, true)), "Indexing cancelled at 3 of 9 photos.");
         assert_eq!(progress_line(3, 0), ("Indexing: 3 / …".into(), None));
         assert_eq!(progress_line(1, 3), ("Indexing: 1 / 3 (33%)".into(), Some(33)));
+    }
+
+    /// #192: the legacy-region conversion pass's own stage label shows while it runs, not
+    /// "Indexing" for a count that is not indexing's; `progress_line` (used once indexing
+    /// proper is the stage) is `index_progress_line` named `STAGE_INDEXING`.
+    #[test]
+    fn the_conversion_pass_shows_its_own_stage_not_indexings() {
+        use chairphoto_core::app::faces::STAGE_CONVERTING;
+        assert_eq!(index_progress_line(STAGE_CONVERTING, 1, 2), ("Converting legacy face regions: 1 / 2 (50%)".into(), Some(50)));
+        assert_eq!(index_progress_line(STAGE_CONVERTING, 0, 0), ("Converting legacy face regions: 0 / …".into(), None));
+        assert_eq!(index_progress_line(STAGE_INDEXING, 1, 3), progress_line(1, 3));
     }
 
     #[test]

@@ -120,6 +120,14 @@ pub fn person_path(root: &str, name: &str) -> String {
 
 // ── The indexing job ─────────────────────────────────────────────────────────
 
+/// `FacesJobStatus`/`FacesProgressEvent`'s `stage` while [`run_index_job`] is converting
+/// pre-marker face regions (#135), before indexing proper starts (#192).
+pub const STAGE_CONVERTING: &str = "Converting legacy face regions";
+/// `stage` once the one-time conversion is done (or had nothing to do) and indexing itself
+/// is running — also the claim's initial value, since that is what a status read before the
+/// first progress event should say the job is doing.
+pub const STAGE_INDEXING: &str = "Indexing";
+
 /// Claim ownership of the face-**indexing** job: snapshot the catalog, allocate the job id,
 /// trip the previous job, install this job's abort flag and claim the status slot as ONE
 /// transition, holding catalog → abort → slot throughout
@@ -131,7 +139,10 @@ pub fn begin_index_job(
     state: &AppState,
     expected: Option<CatalogIdentity>,
 ) -> Result<JobClaim<FacesJobStatus>, String> {
-    state.jobs.faces.begin_as(&state.catalog, expected, |job| FacesJobStatus { job, done: 0, total: 0 })
+    state
+        .jobs
+        .faces
+        .begin_as(&state.catalog, expected, |job| FacesJobStatus { job, done: 0, total: 0, stage: STAGE_INDEXING })
 }
 
 /// Begin (or resume) the background face-indexing job and return its id. The worker opens
@@ -225,12 +236,13 @@ pub fn run_index_job(sink: &(impl EventSink + ?Sized), claim: JobClaim<FacesJobS
     };
 
     let progress_slot = slot.clone();
-    let emit_fn = |p: indexer::FacesProgress| {
+    let emit = |stage: &'static str, p: indexer::FacesProgress| {
         // Keep the slot current for a re-attaching panel; `publish` refuses once a newer job
         // owns it (a superseded run's in-flight chunk still emits a few stragglers).
-        progress_slot.publish(|job| FacesJobStatus { job, done: p.done, total: p.total });
-        sink.send(CoreEvent::FacesProgress(FacesProgressEvent { done: p.done, total: p.total, job }));
+        progress_slot.publish(|job| FacesJobStatus { job, done: p.done, total: p.total, stage });
+        sink.send(CoreEvent::FacesProgress(FacesProgressEvent { done: p.done, total: p.total, job, stage }));
     };
+    let emit_fn = |p: indexer::FacesProgress| emit(STAGE_INDEXING, p);
 
     // The people root for the MWG-region import: an imported face's person tag is
     // created/found at "<people_root>/<region name>".
@@ -250,11 +262,11 @@ pub fn run_index_job(sink: &(impl EventSink + ?Sized), claim: JobClaim<FacesJobS
     // It shares this job's abort flag, ownership and connection; what it does not reach (an
     // abort, an offline photo, a failure) stays on the record for the next index run. Its
     // progress goes out through this job's own slot and `faces:progress` events — photos
-    // converted of photos to convert — before the index's own count starts again from 0
-    // (review N3; a phase label would mean a new field in both front ends). A failure to run
-    // it is logged, never fatal to indexing.
+    // converted of photos to convert — before the index's own count starts again from 0; its
+    // `stage` (#192, [`STAGE_CONVERTING`]) says so, rather than reading as indexing itself
+    // going backwards. A failure to run it is logged, never fatal to indexing.
     let resolve = |photo_id: i64| sec.resolve_photo_path(photo_id).map_err(|e| e.to_string());
-    let converting = |done: usize, total: usize| emit_fn(indexer::FacesProgress { done, total });
+    let converting = |done: usize, total: usize| emit(STAGE_CONVERTING, indexer::FacesProgress { done, total });
     match regions::convert_legacy_regions(sec.conn(), resolve, &abort, converting) {
         Ok(c) if c == regions::LegacyConversion::default() => {}
         Ok(c) => eprintln!("faces_index: pre-marker regions: {c:?}"),

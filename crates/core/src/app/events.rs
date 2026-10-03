@@ -285,12 +285,16 @@ pub struct FacesIndexDone {
 
 /// Progress event payload (`faces:progress`) for the indexing job — the indexer's
 /// `{done, total}` plus the job id, so a superseded job's stragglers can be ignored.
+///
+/// `stage` (#192, see [`crate::app::FacesJobStatus`]) says which pass this count belongs to:
+/// the one-time legacy-region conversion, or indexing proper.
 #[cfg(feature = "faces")]
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct FacesProgressEvent {
     pub done: usize,
     pub total: usize,
     pub job: u64,
+    pub stage: &'static str,
 }
 
 /// Progress payload for `faces:match_progress`: the pipeline step label plus counts, and

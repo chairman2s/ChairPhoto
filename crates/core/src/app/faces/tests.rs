@@ -400,21 +400,24 @@ fn the_index_job_converts_the_pre_marker_regions_first() {
     assert_eq!(left, [p2], "the written photo spends its record, the offline one keeps it");
 }
 
-/// Review N3: the conversion reports through the index job's own progress — the status slot
-/// and `faces:progress` with the job's id — counting photos to convert, `0/n` to `n/n`, before
-/// the index's own count, instead of a silent `0/0` for however long the pass takes.
+/// Review N3 / #192: the conversion reports through the index job's own progress — the status
+/// slot and `faces:progress` with the job's id — counting photos to convert, `0/n` to `n/n`,
+/// before the index's own count, instead of a silent `0/0` for however long the pass takes.
+/// Its `stage` is [`STAGE_CONVERTING`], so the count's restart from 0 once indexing proper
+/// starts (also seen below, carrying [`STAGE_INDEXING`]) reads as a new phase, not as
+/// indexing itself going backwards.
 #[test]
 fn the_index_jobs_conversion_reports_progress() {
     use std::sync::Mutex;
     struct Recorder {
         state: AppState,
-        seen: Mutex<Vec<(usize, usize, u64, Option<(usize, usize)>)>>,
+        seen: Mutex<Vec<(usize, usize, u64, &'static str, Option<(usize, usize, &'static str)>)>>,
     }
     impl EventSink for Recorder {
         fn send(&self, event: CoreEvent) {
             if let CoreEvent::FacesProgress(p) = event {
-                let slot = self.state.jobs.faces.status().unwrap().map(|s| (s.done, s.total));
-                self.seen.lock().unwrap().push((p.done, p.total, p.job, slot));
+                let slot = self.state.jobs.faces.status().unwrap().map(|s| (s.done, s.total, s.stage));
+                self.seen.lock().unwrap().push((p.done, p.total, p.job, p.stage, slot));
             }
         }
     }
@@ -423,6 +426,10 @@ fn the_index_jobs_conversion_reports_progress() {
     pre_marker_photo(&c, &root, "p2.NEF");
     let state = state_with(c);
     let claim = begin_index_job(&state, None).unwrap();
+    // The claim's own initial snapshot (read before any progress event lands) already says
+    // "indexing": a status query between "start returned" and the first event never shows a
+    // stage the job has not entered yet.
+    assert_eq!(state.jobs.faces.status().unwrap().unwrap().stage, STAGE_INDEXING);
     let job = claim.job;
     let recorder = Recorder { state: state.clone(), seen: Mutex::new(Vec::new()) };
     run_index_job(&recorder, claim);
@@ -430,9 +437,16 @@ fn the_index_jobs_conversion_reports_progress() {
     assert!(seen.len() >= 3, "{seen:?}");
     assert_eq!(
         seen[..3],
-        [(0, 2, job, Some((0, 2))), (1, 2, job, Some((1, 2))), (2, 2, job, Some((2, 2)))],
+        [
+            (0, 2, job, STAGE_CONVERTING, Some((0, 2, STAGE_CONVERTING))),
+            (1, 2, job, STAGE_CONVERTING, Some((1, 2, STAGE_CONVERTING))),
+            (2, 2, job, STAGE_CONVERTING, Some((2, 2, STAGE_CONVERTING))),
+        ],
         "{seen:?}"
     );
+    // Both already have a confirmed face (`pre_marker_photo`), so indexing proper finds
+    // nothing to do and reports nothing further — never a 4th event still claiming to convert.
+    assert!(seen[3..].iter().all(|(.., stage, _)| *stage == STAGE_INDEXING), "{seen:?}");
 }
 
 /// #156, forced interleaving: the index job's pre-marker conversion, on its own connection,

@@ -182,6 +182,11 @@ Design consequence — keep these on the *right* axis:
   - Concept: an auto-tag = derived/system-managed tag. Applied automatically (at scan,
     and re-applied when edits change) and kept in sync; otherwise identical to a normal
     tag. Mark/group as system-managed (e.g. a `Treatment` branch) so it isn't clutter.
+  - **Manual assignment or removal is refused** (#181), since each pass rebuilds membership
+    from the rule: `assign_tag`/`remove_tag` return `CatalogError::AutoTag`, and batch writes
+    (`assign_tags`/`remove_tags`) skip and report it. A per-photo exclusion list to correct a
+    rule's misdetection is deferred by the owner; revisit if misdetections become a problem in
+    practice.
   - Because it's a tag, **filtering by it inside any album/tag just works** (the tag
     filter ANDs with the current view) AND it **exports** with its hashtags. Both the
     "narrow the current album to B&W" need and the "share #bnw" need are met.

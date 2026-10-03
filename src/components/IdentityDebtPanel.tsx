@@ -343,6 +343,11 @@ export function IdentityDebtPanel({
   const [owedResult, setOwedResult] = useState("");
   /** Bumped by every owed-page read: an older read that resolves late is dropped. */
   const owedSeqRef = useRef(0);
+  /** The page shown now. An action re-reads THIS page when it ends, not the one captured
+   *  when its button was pressed: a Retry can wait for the sidecar's write turn, and the
+   *  user may page on meanwhile (review of #153, L1). */
+  const owedPageRef = useRef(owedPage);
+  owedPageRef.current = owedPage;
 
   const reloadOwed = useCallback((p: number) => {
     setOwedError("");
@@ -371,7 +376,7 @@ export function IdentityDebtPanel({
         : { dismissed: await dismissOwedIptc(row.photoId, row.uuid, row.generation) };
       setOwedResult(owedActionMessage(done));
       reloadSummary();
-      reloadOwed(owedPage);
+      reloadOwed(owedPageRef.current);
       onCountsChanged?.();
     } catch (e) {
       // A refusal ("This photo is no longer in the catalog") names what it refused.

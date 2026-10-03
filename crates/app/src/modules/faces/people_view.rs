@@ -8,7 +8,8 @@
 //!   ≥ X%" slider and per-row ✓ / ✕). Each tab is one virtualised `uniform_list` of uniform
 //!   rows, so a catalog with thousands of clusters or suggestions builds only what shows.
 //! - **Avatars through the image layer.** A face is cropped from its photo's thumbnail (the
-//!   `Thumb` tier, as React's `thumb://`), turned by the photo's user rotation. The list's
+//!   `Thumb` tier, as React's `thumb://`), turned by the photo's user rotation — but not from
+//!   a cover version's thumbnail, whose frame is not the original's (#152). The list's
 //!   decoration reports the rows on screen; the view's [`ClaimId`] holds exactly their
 //!   thumbnails plus an overscan, so what scrolls away — or the whole view, when the stage
 //!   leaves it or it is released — is released (queued renders cancelled).
@@ -191,15 +192,26 @@ impl PeopleView {
     }
 }
 
-/// A face cropped from its photo's thumbnail, in a round `size` square.
-fn avatar(state: ImageState, bbox: FaceBboxJson, rotation: i64, size: f32, colors: Colors) -> AnyElement {
+/// A face cropped from its photo's thumbnail, in a round `size` square. Not from a cover
+/// version's thumbnail (#152): the version may be cropped or turned, so the face's box, in
+/// the original's frame, would cut out something else — the circle stays empty instead.
+fn avatar(photo: i64, state: ImageState, bbox: FaceBboxJson, rotation: i64, size: f32, colors: Colors) -> AnyElement {
     let mut d = div().flex_none().size(px(size)).rounded_full().overflow_hidden().relative().bg(colors.elev);
-    if let ImageState::Ready(loaded) = state {
+    if let ImageState::Ready(loaded) = state.filter(|l| !l.cover) {
         let s = loaded.image.size(0);
         let natural = (s.width.0 as f32, s.height.0 as f32);
         let b = rotate_box((bbox.x, bbox.y, bbox.w, bbox.h), rotation);
         let (l, t, w, h) = avatar_placement(b, natural, size);
-        d = d.child(img(loaded.image).absolute().left(px(l)).top(px(t)).w(px(w)).h(px(h)));
+        d = d.child(
+            img(loaded.image)
+                .id(SharedString::from(format!("faces-avatar-{photo}")))
+                .absolute()
+                .left(px(l))
+                .top(px(t))
+                .w(px(w))
+                .h(px(h))
+                .test_support(),
+        );
     }
     d.into_any_element()
 }
@@ -399,7 +411,7 @@ impl PeopleView {
                 let tag = x.tag_id;
                 Some(
                     card(format!("faces-person-{tag}"), format!("Filter Library to {}", x.full_path), false, false, colors)
-                        .child(avatar(thumb, x.avatar_bbox, x.avatar_rotation, 72., colors))
+                        .child(avatar(x.avatar_photo_id, thumb, x.avatar_bbox, x.avatar_rotation, 72., colors))
                         .child(div().text_size(px(12.)).font_weight(FontWeight::SEMIBOLD).text_color(colors.txt).max_w(px(96.)).truncate().child(x.name.clone()))
                         .child(small(format!("{} · {}", plural(x.photo_count, "photo", "photos"), plural(x.face_count, "face", "faces")), colors))
                         .on_click(move |_, _, cx| people.update(cx, |p, cx| p.filter_by_person(tag, cx)))
@@ -442,7 +454,7 @@ impl PeopleView {
                 };
                 Some(
                     card(format!("faces-cluster-{id}"), format!("Name this cluster ({})", plural(c.member_count, "face", "faces")), true, picked, colors)
-                        .child(avatar(thumb, c.avatar_bbox, c.avatar_rotation, 64., colors))
+                        .child(avatar(c.avatar_photo_id, thumb, c.avatar_bbox, c.avatar_rotation, 64., colors))
                         .child(small(plural(c.member_count, "face", "faces"), colors))
                         .child(ui::row().gap(px(6.)).child(toggle).child(open))
                         .when(free, |d| d.on_click(move |_, _, cx| people.update(cx, |p, cx| p.name_cluster(id, cx))))
@@ -458,7 +470,7 @@ impl PeopleView {
                 let id = f.face_id;
                 Some(
                     card(format!("faces-face-{id}"), if picked { "Picked face" } else { "Face" }, false, picked, colors)
-                        .child(avatar(thumb, f.bbox, f.rotation, 72., colors))
+                        .child(avatar(f.photo_id, thumb, f.bbox, f.rotation, 72., colors))
                         .child(small(if picked { "✓ picked" } else { "click to pick" }, colors))
                         .on_click(move |_, _, cx| people.update(cx, |p, cx| p.toggle_face(id, cx)))
                         .test_support()
@@ -498,7 +510,7 @@ impl PeopleView {
                 .border_b_1()
                 .border_color(colors.line)
                 .when(below, |d| d.opacity(0.55))
-                .child(avatar(thumb, e.bbox, e.rotation, 52., colors))
+                .child(avatar(e.photo_id, thumb, e.bbox, e.rotation, 52., colors))
                 .child(
                     div()
                         .flex()

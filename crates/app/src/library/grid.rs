@@ -9,6 +9,10 @@
 //!   and releases the ones it asked for earlier that scrolled out of that window (still
 //!   queued ones are cancelled in the pool; finished ones stay in the LRU). Nothing decodes
 //!   on the UI thread: a tile shows what the store has.
+//! - **Cover looks** (#151). Each request carries the cover look its row names and the
+//!   catalog the rows were read from (`ImageStore::request_look_batch`), as `Thumbnail.tsx`
+//!   put the cover token in the URL: a row re-read with a new cover, or a new revision of it,
+//!   renders that tile's thumbnail again and drops a late answer for the earlier look.
 //! - **Storage badges per window.** The same window is reported to the session
 //!   (`ShellState::set_visible_range`), which fetches only those rows' statuses.
 //! - **Position.** Opens scrolled to the newest photo (the rows are oldest first) unless a
@@ -26,6 +30,7 @@ use crate::shell::state::{Mark, ShellState};
 use crate::shell::style::{Colors, COLOR_LABELS};
 use chairphoto_core::catalog::{Photo, PickState, StorageStatus};
 use chairphoto_core::image_pool::ImageKind;
+use chairphoto_model::darkroom::filmstrip::{cover_look, CoverLook};
 use chairphoto_model::library::session::{LibrarySession, SelectMods};
 use gpui_kit::prelude::*;
 use gpui_kit::{
@@ -184,18 +189,26 @@ impl LibraryView {
         let photos = shell.library.photos();
         let n = photos.len();
         let row_count = n.div_ceil(cols);
-        // Most urgent first: the visible rows, then the overscan (`layout::wanted_rows`).
-        let wanted: Vec<i64> = layout::wanted_rows(range.clone(), row_count, OVERSCAN_ROWS)
+        let from = shell.rows_from();
+        // Most urgent first: the visible rows, then the overscan (`layout::wanted_rows`), each
+        // with the cover look its row names.
+        let wanted: Vec<(i64, Option<CoverLook>)> = layout::wanted_rows(range.clone(), row_count, OVERSCAN_ROWS)
             .into_iter()
-            .flat_map(|r| photos[layout::cells(r..r + 1, cols, n)].iter().map(|p| p.id))
+            .flat_map(|r| photos[layout::cells(r..r + 1, cols, n)].iter().map(|p| (p.id, cover_look(p.cover_token.as_deref()))))
             .collect();
         let span = layout::cells(layout::wanted_span(range, row_count, OVERSCAN_ROWS), cols, n);
         self.shell.update(cx, |s, cx| s.set_visible_range(span.start, span.end, cx));
-        let keep: HashSet<i64> = wanted.iter().copied().collect();
+        let keep: HashSet<i64> = wanted.iter().map(|&(id, _)| id).collect();
         let dropped: HashSet<i64> = self.requested.difference(&keep).copied().collect();
-        self.images.update(cx, |store, _| {
-            let batch: Vec<(i64, ImageKind)> = wanted.iter().map(|&id| (id, ImageKind::Thumb)).collect();
-            store.request_batch(&batch);
+        self.images.update(cx, |store, cx| {
+            match from {
+                // The rows' cover tokens, as `Thumbnail.tsx` put them in the URL (#151).
+                Some(from) => store.request_look_batch(from, &wanted, cx),
+                None => {
+                    let batch: Vec<(i64, ImageKind)> = wanted.iter().map(|&(id, _)| (id, ImageKind::Thumb)).collect();
+                    store.request_batch(&batch);
+                }
+            }
             if !dropped.is_empty() {
                 store.release_pending(|k| k.kind != ImageKind::Thumb || !dropped.contains(&k.photo));
             }

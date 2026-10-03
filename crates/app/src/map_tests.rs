@@ -12,7 +12,7 @@ use chairphoto_core::app::GeocodeProgress;
 use chairphoto_core::plugins::map::geocode::GeocodeAllSummary;
 use crate::modules::map::tiles::fake::{tiny, FakeTiles};
 use crate::machine_prefs::{MachinePrefs, FILE_NAME as MACHINE_PREFS_FILE};
-use crate::modules::map::logic::MACHINE_TILE_HOSTS;
+use crate::modules::map::logic::{Consent, MACHINE_TILE_HOSTS};
 use crate::modules::map::tiles::MapTiles;
 use crate::modules::map::view::MapView;
 use crate::modules::map::{MAP_MODULE_ID, MAP_VIEW_ID};
@@ -453,6 +453,135 @@ fn per_catalog_answers_migrate_to_this_machine_and_show_in_preferences(cx: &mut 
     work(&app, cx);
     assert_eq!(setting(&app).as_deref(), Some("{}"));
     assert_eq!(machine_hosts(cx).as_deref(), Some(r#"{"b.example":true,"tile.openstreetmap.org":true}"#));
+}
+
+// --- "Ask again" across a re-merge (#198) ---------------------------------------------
+
+/// The catalog these tests open holds an old per-catalog Allow for `b.example`, and its tile
+/// URL names that host.
+const B_URL: &str = "https://b.example/{z}/{x}/{y}.png";
+const B_LEGACY: &str = r#"{"b.example":true}"#;
+
+fn seed_b(app: &App) {
+    let guard = app.state.catalog.lock().unwrap();
+    let c = guard.as_ref().unwrap();
+    c.set_setting(LEGACY_HOSTS, B_LEGACY).unwrap();
+    c.set_setting(&format!("{MAP_MODULE_ID}.tileUrl"), B_URL).unwrap();
+}
+
+/// Preferences → Map → "Ask again" for `b.example`, then back to the map.
+fn ask_again_for_b(app: &App, cx: &mut TestAppContext) {
+    click(app, "rail-preferences", cx);
+    work(app, cx);
+    click(app, "prefs-tab-module-map", cx);
+    work(app, cx);
+    click(app, "map-host-forget-b.example", cx);
+    work(app, cx);
+    show_map(app, cx);
+}
+
+/// The map shows the consent card for `b.example`, and nothing more was fetched than `before`.
+fn asks_for_b(m: &Map, before: usize, cx: &mut TestAppContext) {
+    assert_eq!(map_state(m, cx).read_with(cx, |s, _| s.consent()), Consent::Unknown, "b.example is allowed again");
+    assert!(m.has("map-consent", cx), "the map asks about b.example");
+    assert_eq!(m.fake.count(), before, "a tile was fetched from a host the user reset");
+}
+
+/// Where this machine's preferences live in [`ask_again_survives_a_reread`].
+enum Prefs {
+    /// No app data dir: `load_default` keeps them in memory (the headless default).
+    InMemory,
+    /// A store whose every write fails (its directory is a file).
+    WriteFails,
+}
+
+/// **#198** (review batch 6's probe). The machine's preferences cannot be saved, so the
+/// catalog keeps its old answers (gate #119) and every read of it merges them again. The
+/// user sends `b.example` back to "ask"; the same catalog is read again (a switch back, a
+/// finished scan): the host still asks, and nothing is fetched from it.
+fn ask_again_survives_a_reread(prefs: Prefs, cx: &mut TestAppContext) {
+    let dir = TempDir::new("map-ask-again");
+    let fake = Arc::new(FakeTiles::default());
+    cx.update(|cx| cx.set_global(MapTiles(fake.clone())));
+    let app = start(cx);
+    if let Prefs::WriteFails = prefs {
+        let blocker = dir.0.join("blocker");
+        std::fs::write(&blocker, "a file where the store's directory should be").unwrap();
+        cx.update(|cx| cx.set_global(MachinePrefs::load(blocker.join(MACHINE_PREFS_FILE))));
+    }
+    open_catalog_with_photos(&app, &dir, 1, cx);
+    seed_b(&app);
+    work(&app, cx);
+    cx.update(|cx| ModuleRegistry::enable(&app.wired.modules, MAP_MODULE_ID, cx));
+    work(&app, cx);
+    assert_eq!(machine_hosts(cx).as_deref(), Some(B_LEGACY), "merged for this session");
+    let m = Map { app, fake, ids: Vec::new() };
+
+    ask_again_for_b(&m.app, cx);
+    let before = m.fake.count();
+    asks_for_b(&m, before, cx);
+    let setting = m.setting(LEGACY_HOSTS);
+    assert_eq!(setting.as_deref(), Some(B_LEGACY), "the catalog kept its copy (nothing was saved)");
+
+    open_catalog_with_photos(&m.app, &dir, 1, cx); // the same catalog, read again
+    work(&m.app, cx);
+    show_map(&m.app, cx);
+    asks_for_b(&m, before, cx);
+    assert_eq!(machine_hosts(cx).as_deref(), Some(r#"{"b.example":"ask"}"#));
+}
+
+#[gpui_kit::test]
+fn ask_again_survives_a_reread_when_prefs_are_in_memory(cx: &mut TestAppContext) {
+    ask_again_survives_a_reread(Prefs::InMemory, cx);
+}
+
+#[gpui_kit::test]
+fn ask_again_survives_a_reread_when_prefs_cannot_be_saved(cx: &mut TestAppContext) {
+    ask_again_survives_a_reread(Prefs::WriteFails, cx);
+}
+
+/// **#198**, the success path: the machine's copy is saved, but the core switches to
+/// another catalog before the clear runs, so `with_catalog_as(from)` refuses it and the old
+/// catalog keeps its answers. The user sends `b.example` back to "ask"; on that catalog's
+/// next read the answers merge again, and the host still asks. The reset is on disk too.
+#[gpui_kit::test]
+fn ask_again_survives_a_reread_after_a_switch_interrupted_the_clear(cx: &mut TestAppContext) {
+    let dir = TempDir::new("map-ask-again-switch");
+    let fake = Arc::new(FakeTiles::default());
+    cx.update(|cx| cx.set_global(MapTiles(fake.clone())));
+    let app = start(cx);
+    let prefs = dir.0.join("prefs").join(MACHINE_PREFS_FILE);
+    cx.update(|cx| cx.set_global(MachinePrefs::load(prefs.clone())));
+    open_catalog_with_photos(&app, &dir, 1, cx);
+    seed_b(&app);
+    work(&app, cx);
+    cx.update(|cx| ModuleRegistry::enable(&app.wired.modules, MAP_MODULE_ID, cx));
+    // The reads run and land; the merge queues the machine's write (and, after it, the clear).
+    cx.update(|cx| Runner::get(cx).run_pending());
+    cx.run_until_parked();
+    assert_eq!(machine_hosts(cx).as_deref(), Some(B_LEGACY), "merged");
+    assert!(cx.update(|cx| Runner::get(cx).pending()) > 0, "the write and the clear are still queued");
+    // The core switches before they run (`catalog:switched` not delivered yet).
+    let (other, _) = colliding_catalog(&dir, "other", 1);
+    core_switch(&app, other);
+    work(&app, cx);
+    assert_eq!(MachinePrefs::load(prefs.clone()).get(MACHINE_TILE_HOSTS), Some(B_LEGACY), "the machine's copy is saved");
+    let a = chairphoto_core::catalog::Catalog::open(&dir.0.join("photos.chairphoto"), &dir.0.join("photos")).unwrap();
+    assert_eq!(a.get_setting(LEGACY_HOSTS).unwrap().as_deref(), Some(B_LEGACY), "the clear was refused: the old catalog keeps its copy");
+    drop(a);
+    app.state.send(CoreEvent::CatalogSwitched("other".into())); // now it arrives
+    cx.run_until_parked();
+    work(&app, cx);
+
+    let m = Map { app, fake, ids: Vec::new() };
+    ask_again_for_b(&m.app, cx);
+    let before = m.fake.count();
+    open_catalog_with_photos(&m.app, &dir, 1, cx); // back to the first catalog
+    work(&m.app, cx);
+    show_map(&m.app, cx);
+    asks_for_b(&m, before, cx);
+    assert_eq!(MachinePrefs::load(prefs).get(MACHINE_TILE_HOSTS), Some(r#"{"b.example":"ask"}"#), "the reset is saved");
+    assert_eq!(m.setting(LEGACY_HOSTS).as_deref(), Some("{}"), "and the catalog's copy is emptied now");
 }
 
 /// Tiles follow the view: panning far away cancels the loads that left it; a tile already

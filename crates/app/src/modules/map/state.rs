@@ -394,7 +394,11 @@ impl MapState {
     /// The catalog's copy is emptied only **after** the machine's copy is on disk
     /// ([`MachinePrefs::set_then`], off the UI thread): if that write fails (or the
     /// preferences live in memory only), the catalog keeps its answers and the next read
-    /// merges them again, so a remembered decision is never lost (gate #119).
+    /// merges them again, so a remembered decision is never lost (gate #119). The copy also
+    /// survives when a switch lands before the clear, which `with_catalog_as(from)` then
+    /// refuses. Either way a re-merge must not undo the user's "Ask again": that is stored
+    /// as an explicit "ask" entry ([`HostConsent::forget`]), which the merge leaves alone
+    /// (#198), so a reset host is never allowed again without asking.
     fn migrate_consent(&mut self, from: CatalogIdentity, legacy: Option<&str>, cx: &mut Context<Self>) {
         let legacy = HostConsent::parse(legacy);
         if legacy.is_empty() {
@@ -417,7 +421,8 @@ impl MapState {
         &self.consent
     }
 
-    /// Remember the answer for `host` on this machine (the consent prompt, or Preferences).
+    /// Remember the answer for `host` on this machine (the consent prompt, or Preferences);
+    /// `None` is "Ask again", remembered as such.
     pub fn set_consent(&mut self, host: &str, allowed: Option<bool>, cx: &mut Context<Self>) {
         match allowed {
             Some(a) => self.consent.set(host, a),

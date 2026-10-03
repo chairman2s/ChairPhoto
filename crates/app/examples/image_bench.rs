@@ -172,6 +172,7 @@ fn main() {
             image: Arc::new(gpui_kit::RenderImage::new(vec![image::Frame::new(frame)])),
             video_tile: false,
             cover: false,
+            rendered_in: None,
         };
         evicted += lru.insert(ImageKey { photo: n as i64, kind: ImageKind::Preview, version: 0 }, loaded).len();
         peak_bytes = peak_bytes.max(lru.bytes());

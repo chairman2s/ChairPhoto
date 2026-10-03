@@ -8,11 +8,14 @@
 //!   ≥ X%" slider and per-row ✓ / ✕). Each tab is one virtualised `uniform_list` of uniform
 //!   rows, so a catalog with thousands of clusters or suggestions builds only what shows.
 //! - **Avatars through the image layer.** A face is cropped from its photo's thumbnail (the
-//!   `Thumb` tier, as React's `thumb://`), turned by the photo's user rotation — but not from
-//!   a cover version's thumbnail, whose frame is not the original's (#152). The list's
-//!   decoration reports the rows on screen; the view's [`ClaimId`] holds exactly their
-//!   thumbnails plus an overscan, so what scrolls away — or the whole view, when the stage
-//!   leaves it or it is released — is released (queued renders cancelled).
+//!   `Thumb` tier, as React's `thumb://`), turned by the photo's user rotation. A cover
+//!   version's thumbnail is not the original's frame (#152), so for a photo whose thumbnail
+//!   is one the face is cut from its `Preview` tier instead (rv151 L4: the original's frame,
+//!   right for a cropped cover and a tone-only one alike; a larger decode, on the pool). The
+//!   list's decoration reports the rows on screen; the view's [`ClaimId`] holds exactly their
+//!   thumbnails (and those previews) plus an overscan, so what scrolls away — or the whole
+//!   view, when the stage leaves it or it is released — is released (queued renders
+//!   cancelled).
 //! - **The naming dialog** (`NameClusterModal`): a field with a type-ahead over the people
 //!   root's tags; Enter saves, Esc cancels (taken before any binding while the field has
 //!   focus), a suggestion's click fills the field.
@@ -163,14 +166,27 @@ impl PeopleView {
             }
         }
         images.update(cx, |s, _| {
+            // A cover thumbnail is not the original's frame: its avatar is cut from the
+            // preview instead (rv151 L4), decoded on the pool like any tier.
+            let previews: Vec<(i64, ImageKind)> = wanted
+                .iter()
+                .filter(|&&(p, _)| matches!(s.peek(p, ImageKind::Thumb), ImageState::Ready(l) if l.cover))
+                .map(|&(p, _)| (p, ImageKind::Preview))
+                .collect();
+            wanted.extend(previews);
             s.set_claim(claim, wanted.iter().copied());
             s.request_batch(&wanted);
         });
     }
 
+    /// What an avatar of `photo` is cut from: its thumbnail, or — when that is the cover
+    /// version's render — its preview, the original's frame (rv151 L4). Empty until it lands.
     fn thumb(&self, photo: i64, cx: &mut Context<Self>) -> ImageState {
         match &self.images {
-            Some(i) => i.update(cx, |s, _| s.get(photo, ImageKind::Thumb)),
+            Some(i) => i.update(cx, |s, _| match s.get(photo, ImageKind::Thumb) {
+                ImageState::Ready(l) if l.cover => s.get(photo, ImageKind::Preview),
+                other => other,
+            }),
             None => ImageState::Absent,
         }
     }
@@ -192,9 +208,10 @@ impl PeopleView {
     }
 }
 
-/// A face cropped from its photo's thumbnail, in a round `size` square. Not from a cover
-/// version's thumbnail (#152): the version may be cropped or turned, so the face's box, in
-/// the original's frame, would cut out something else — the circle stays empty instead.
+/// A face cropped from its photo's thumbnail (or preview, [`PeopleView::thumb`]), in a round
+/// `size` square. Never from a cover version's render (#152): the version may be cropped or
+/// turned, so the face's box, in the original's frame, would cut out something else — the
+/// circle stays empty until the original's frame is there.
 fn avatar(photo: i64, state: ImageState, bbox: FaceBboxJson, rotation: i64, size: f32, colors: Colors) -> AnyElement {
     let mut d = div().flex_none().size(px(size)).rounded_full().overflow_hidden().relative().bg(colors.elev);
     if let ImageState::Ready(loaded) = state.filter(|l| !l.cover) {

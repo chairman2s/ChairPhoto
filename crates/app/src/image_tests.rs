@@ -91,7 +91,7 @@ impl FakePool {
 
 /// A `w`×`h` black image: `w*h*4` bytes.
 pub(crate) fn pixels(w: u32, h: u32) -> Loaded {
-    Loaded { image: to_bgra(DynamicImage::new_rgb8(w, h)), video_tile: false, cover: false }
+    Loaded { image: to_bgra(DynamicImage::new_rgb8(w, h)), video_tile: false, cover: false, rendered_in: None }
 }
 
 fn thumb(id: i64) -> JobKey {

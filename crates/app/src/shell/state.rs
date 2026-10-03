@@ -445,6 +445,14 @@ pub struct ScopeChanged {
 
 impl EventEmitter<ScopeChanged> for ShellState {}
 
+/// Emitted when a read of the Library's rows landed (`rows_from` and the rows are the new
+/// ones): the image layer checks their cover tokens against the looks its thumbnails show
+/// (rv151 L5, `ImageStore::note_looks`), whichever view is on screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RowsLanded;
+
+impl EventEmitter<RowsLanded> for ShellState {}
+
 impl ShellState {
     pub fn new(model: &Entity<AppModel>, cx: &mut Context<Self>) -> Self {
         let app = model.read(cx).state().clone();
@@ -957,6 +965,7 @@ impl ShellState {
                     }
                     self.apply_pending_link(cx);
                     self.after_input(cx);
+                    cx.emit(RowsLanded);
                 }
             }
             // The rows stay as they were: an empty grid would read as "no photos match".

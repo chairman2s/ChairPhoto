@@ -65,6 +65,7 @@ mod image_tests;
 use chairphoto_core::app::{AppState, CoreEvent};
 use chairphoto_core::appearance::SystemThemeResult;
 use chairphoto_core::image_pool::ImagePool;
+use chairphoto_model::darkroom::filmstrip::{cover_look, CoverLook};
 use image_store::{ImageStore, Loaded};
 use futures::channel::mpsc::{unbounded, UnboundedReceiver};
 use single_instance::{Claim, ClaimError, Primary, Request};
@@ -245,6 +246,7 @@ pub fn wire(
         store.set_identity_probe(Arc::new(move || chairphoto_core::app::catalog_identity(&probe_state).ok()))
     });
     clear_images_on_catalog_switch(&model, &images, cx).detach();
+    note_looks_when_rows_land(&shell, &images, cx).detach();
     let modules = modules::ModuleRegistry::install(&model, &shell, &images, cx);
     let storage = cx.new(|cx| storage::StorageState::new(&model, &shell, cx));
     let tags = cx.new(|cx| tags::TagsState::new(&model, cx));
@@ -408,6 +410,21 @@ pub fn clear_images_on_catalog_switch(
             seen = epoch;
             images.update(cx, |store, cx| store.clear(cx));
         }
+    })
+}
+
+/// A photo's cover can change while neither the grid nor the Darkroom strip is drawn (the
+/// cover version's autosave, "Use as cover" with no strip, a cover version deleted from the
+/// inspector), and other views ask for thumbnails without the token. So when the rows land,
+/// their cover tokens are checked against the looks the thumbnails show (rv151 L5).
+pub fn note_looks_when_rows_land(shell: &Entity<shell::ShellState>, images: &Entity<ImageStore>, cx: &mut App) -> Subscription {
+    let images = images.clone();
+    cx.subscribe(shell, move |shell, _: &shell::state::RowsLanded, cx| {
+        let shell = shell.read(cx);
+        let Some(from) = shell.rows_from() else { return };
+        let looks: Vec<(i64, Option<CoverLook>)> =
+            shell.library.photos().iter().map(|p| (p.id, cover_look(p.cover_token.as_deref()))).collect();
+        images.update(cx, |store, cx| store.note_looks(from, looks, cx));
     })
 }
 

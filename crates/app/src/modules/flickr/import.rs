@@ -15,11 +15,12 @@ use crate::model::{AppModel, AppModelEvent};
 use crate::modules::{ModuleHost, ModuleSettings, SETTINGS_NOT_READY};
 use crate::shell::style::Colors;
 use crate::storage::{ui, Runner};
+use crate::loupe::zoom::fitted;
 use chairphoto_core::app::flickr::{import_apply, import_preview, FlickrApi, FlickrImportMatch, FlickrImportResult, ImportApplied};
 use chairphoto_core::app::{AppState, CatalogIdentity, CoreEvent};
 use chairphoto_core::image_pool::ImageKind;
 use gpui_kit::prelude::*;
-use gpui_kit::{div, img, px, AnyElement, Context, Entity, Image, ImageFormat, ObjectFit, SharedString, Subscription, TestSupportExt as _, Window};
+use gpui_kit::{div, px, AnyElement, Context, Entity, Image, ImageFormat, ObjectFit, SharedString, Subscription, TestSupportExt as _, Window};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -276,16 +277,28 @@ impl ImportPublishedPanel {
     fn thumb(&self, catalog_id: i64, size: f32, colors: Colors, cx: &Context<Self>) -> AnyElement {
         let state = self.images.as_ref().map_or(ImageState::Absent, |i| i.read(cx).peek(catalog_id, ImageKind::Thumb));
         let inner = match state {
-            ImageState::Ready(l) => img(l.image.clone()).size_full().object_fit(ObjectFit::Cover).into_any_element(),
+            ImageState::Ready(l) => fitted(("flickr-thumb-picture", catalog_id as u64), l.image.clone(), ObjectFit::Cover).into_any_element(),
             _ => div().size_full().bg(colors.well).into_any_element(),
         };
-        div().size(px(size)).flex_none().overflow_hidden().rounded(px(4.)).child(inner).into_any_element()
+        div()
+            .id(("flickr-thumb", catalog_id as u64))
+            .size(px(size))
+            .flex_none()
+            .overflow_hidden()
+            .rounded(px(4.))
+            .child(inner)
+            .test_support()
+            .into_any_element()
     }
 
     fn flickr_thumb(&self, url: &Option<String>, title: &str, size: f32, colors: Colors) -> AnyElement {
         let d = div().size(px(size)).flex_none().overflow_hidden().rounded(px(4.)).bg(colors.well);
-        match url.as_ref().and_then(|u| self.remote.get(u)) {
-            Some(image) => d.child(img(image.clone()).size_full().object_fit(ObjectFit::Cover)).into_any_element(),
+        match url.as_ref().and_then(|u| self.remote.get(u).map(|image| (u, image))) {
+            Some((url, image)) => d
+                .id(SharedString::from(format!("flickr-remote-{url}")))
+                .child(fitted(SharedString::from(format!("flickr-remote-picture-{url}")), image.clone(), ObjectFit::Cover))
+                .test_support()
+                .into_any_element(),
             None => d
                 .flex()
                 .items_center()

@@ -170,6 +170,49 @@ fn cancelling_an_import_stops_it_before_the_next_file(cx: &mut TestAppContext) {
     app.wired.shell.read_with(cx, |s, _| assert_eq!(s.jobs.import, None));
 }
 
+/// #186: a card photo's thumbnail fills its 112×92 cell inside the 2 px ring, portrait and
+/// landscape (`.card-thumb-img { object-fit: cover }`), not a portrait element taller than
+/// the cell.
+#[gpui_kit::test]
+fn card_thumbnails_fill_their_cell(cx: &mut TestAppContext) {
+    use crate::loupe::fit_tests::{assert_fills, LANDSCAPE, PORTRAIT};
+    use chairphoto_core::scanner::CardPhoto;
+    use gpui_kit::{Image, ImageFormat};
+    let dir = TempDir::new("import-fit");
+    let app = start(cx);
+    open_catalog(&app, &dir, cx);
+    click_menu_row(&app, "import-menu", 0, "Import from card…", cx);
+    let StorageDialog::ImportCard(panel) = dialog(&app, cx) else { panic!("the import panel") };
+    work(cx);
+    let frames = [PORTRAIT, LANDSCAPE];
+    let cards: Vec<CardPhoto> = (0..frames.len())
+        .map(|i| CardPhoto {
+            path: format!("/card/IMG_{i:04}.jpg"),
+            name: format!("IMG_{i:04}.jpg"),
+            size: 1,
+            capture_time: None,
+            is_duplicate: false,
+        })
+        .collect();
+    panel.update(cx, |p, cx| {
+        for (c, (w, h)) in cards.iter().zip(frames) {
+            let mut jpeg = std::io::Cursor::new(Vec::new());
+            image::DynamicImage::new_rgb8(w, h).write_to(&mut jpeg, image::ImageFormat::Jpeg).unwrap();
+            p.set_thumb(c.path.clone(), Arc::new(Image::from_bytes(ImageFormat::Jpeg, jpeg.into_inner())), cx);
+        }
+        p.cards = Some(cards);
+    });
+    settle(&app, cx);
+    settle(&app, cx);
+    cx.update_window(app.window(), |_, window, _| {
+        for (i, image) in frames.iter().enumerate() {
+            let (cell, picture) = (format!("card-{i}"), format!("card-{i}-picture"));
+            assert_fills(&format!("card {i} {image:?}"), window, gpui_kit::SharedString::from(cell), gpui_kit::SharedString::from(picture), 2.);
+        }
+    })
+    .unwrap();
+}
+
 /// **Forced interleaving.** An import's worker finishes, then the catalog switches, *then*
 /// its result reaches the UI thread: the result is dropped — no status line, no bench
 /// change — because it belongs to the catalog that was left.
@@ -607,6 +650,36 @@ fn catalog_with_trash(app: &App, dir: &TempDir, cx: &mut TestAppContext) -> Vec<
     app.state.volume_health.invalidate();
     app.state.catalog.lock().unwrap().as_ref().unwrap().trash_photos(&ids).unwrap();
     ids
+}
+
+/// #186: a trashed photo's thumbnail fills its 112×92 tile inside the 2 px ring, portrait and
+/// landscape (`.trash-tile img { object-fit: cover }`), not a portrait element taller than
+/// the tile.
+#[gpui_kit::test]
+fn trash_thumbnails_fill_their_tile(cx: &mut TestAppContext) {
+    use crate::image_tests::{pixels, FakePool};
+    use crate::loupe::fit_tests::{assert_fills, LANDSCAPE, PORTRAIT};
+    use chairphoto_core::image_pool::{ImageKind, JobKey};
+    let dir = TempDir::new("trash-fit");
+    let pool = Arc::new(FakePool::default());
+    let app = start_with_pool(cx, pool.clone());
+    let ids = catalog_with_trash(&app, &dir, cx);
+    click(&app, "browser-trash", cx);
+    let StorageDialog::Trash(_) = dialog(&app, cx) else { panic!("the trash") };
+    work(cx);
+    settle(&app, cx);
+    let frames = [(ids[0], PORTRAIT), (ids[1], LANDSCAPE)];
+    for &(id, (w, h)) in &frames {
+        pool.finish(&JobKey::photo(id, ImageKind::Thumb), Ok(pixels(w, h)));
+    }
+    settle(&app, cx);
+    cx.update_window(app.window(), |_, window, _| {
+        for &(id, image) in &frames {
+            let what = format!("trash photo {id} {image:?}");
+            assert_fills(&what, window, gpui_kit::SharedString::from(format!("trash-{id}")), ("trash-picture", id as u64), 2.);
+        }
+    })
+    .unwrap();
 }
 
 /// Restore needs no confirmation; Delete needs `delete` typed — a near miss deletes nothing,

@@ -18,6 +18,7 @@ use super::stage::FrameTier;
 use crate::image_store::ImageState;
 use crate::shell::style::Colors;
 use crate::storage::ui::{chip, clickable, truncating_chip};
+use crate::loupe::zoom::fitted;
 use chairphoto_core::image_pool::ImageKind;
 use chairphoto_model::darkroom::controls::{
     self as ctl, EffectKey, SliderDef, SplitKey, ToneKey, COLOR_SLIDERS, EFFECT_SLIDERS, SPLIT_SLIDERS, TONE_SLIDERS,
@@ -840,7 +841,7 @@ impl DarkroomView {
             let title: SharedString = format!("{name} ({} of {total})", start + k + 1).into();
             let is_current = Some(id) == current;
             let thumb = match image {
-                ImageState::Ready(loaded) => img(loaded.image).size_full().object_fit(ObjectFit::Cover).into_any_element(),
+                ImageState::Ready(loaded) => fitted(("dk-strip-picture", id as u64), loaded.image, ObjectFit::Cover).into_any_element(),
                 _ => div().size_full().bg(colors.well).into_any_element(),
             };
             let dk = self.darkroom.clone();

@@ -17,11 +17,12 @@
 
 use crate::image_tests::{pixels, FakePool};
 use crate::library::layout::NAME_H;
-use crate::loupe::fit_tests::{store_rotated, LANDSCAPE, PORTRAIT};
+use crate::loupe::fit_tests::{assert_fills, store_rotated, LANDSCAPE, PORTRAIT};
+use crate::shell::actions::ProposeStacks;
 use crate::tests::{open_catalog_with_photos, start_with_pool, App, TempDir};
 use chairphoto_core::image_pool::{ImageKind, JobKey};
 use gpui_kit::test::TestWindowExt as _;
-use gpui_kit::{size, AppContext as _, Bounds, DevicePixels, ObjectFit, Pixels, TestAppContext};
+use gpui_kit::{size, AppContext as _, Bounds, DevicePixels, ObjectFit, Pixels, SharedString, TestAppContext};
 use std::sync::Arc;
 
 fn render(app: &App, cx: &mut TestAppContext) {
@@ -104,4 +105,64 @@ fn grid_tiles_cover_their_box_with_landscape_portrait_and_rotated_thumbnails(cx:
             "{msg}: not centred on the box"
         );
     }
+}
+
+// --- the bench's pile and the Stack bursts dialog -----------------------------------------
+
+/// The bench's pile thumbnails (52×35) fill their cell with a portrait and a landscape frame
+/// (`.bench-strip .thumbwrap .thumb { object-fit: cover }`); the marked one has a 2 px ring.
+#[gpui_kit::test]
+fn bench_pile_thumbnails_fill_their_cell(cx: &mut TestAppContext) {
+    let dir = TempDir::new("fit-bench");
+    let pool = Arc::new(FakePool::default());
+    let app = start_with_pool(cx, pool.clone());
+    let ids = open_catalog_with_photos(&app, &dir, 2, cx);
+    app.wired.shell.update(cx, |s, cx| s.select_with(cx, |l| l.select_all()));
+    render(&app, cx);
+    let frames = [(ids[0], PORTRAIT), (ids[1], LANDSCAPE)];
+    for &(id, (w, h)) in &frames {
+        pool.finish(&JobKey::photo(id, ImageKind::Thumb), Ok(pixels(w, h)));
+    }
+    cx.run_until_parked();
+    render(&app, cx);
+    cx.update_window(app.window(), |_, window, _| {
+        for &(id, image) in &frames {
+            let cell = ("bench-thumb", id as u64);
+            let marked = window.find(cell).label().unwrap_or_default().ends_with("(marking)");
+            let border = if marked { 2. } else { 0. };
+            assert_fills(&format!("bench photo {id} {image:?}"), window, cell, ("bench-thumb-picture", id as u64), border);
+        }
+    })
+    .unwrap();
+}
+
+/// The Stack bursts dialog's frames fill their 64 px picture box — landscape, portrait and
+/// rotated (`.stack-proposal-frame img { object-fit: cover }`).
+#[gpui_kit::test]
+fn stack_proposal_frames_fill_their_box(cx: &mut TestAppContext) {
+    let dir = TempDir::new("fit-stacks");
+    let pool = Arc::new(FakePool::default());
+    let app = start_with_pool(cx, pool.clone());
+    let ids = open_catalog_with_photos(&app, &dir, 4, cx);
+    super::tests::make_burst(app.state.catalog.lock().unwrap().as_ref().unwrap(), &ids);
+    store_rotated(&app, ids[2]);
+    cx.update_window(app.window(), |_, window, cx| window.dispatch_action(Box::new(ProposeStacks), cx)).unwrap();
+    cx.run_until_parked();
+    render(&app, cx);
+    let frames = [(ids[0], LANDSCAPE), (ids[1], PORTRAIT), (ids[2], PORTRAIT)];
+    for &(id, (w, h)) in &frames {
+        pool.finish(&JobKey::photo(id, ImageKind::Thumb), Ok(pixels(w, h)));
+    }
+    cx.run_until_parked();
+    render(&app, cx);
+    let dialog = super::tests::stack_dialog(&app, cx);
+    let group = dialog.read_with(cx, |d, _| d.result.as_ref().expect("proposed").proposals[0].keeper_id);
+    cx.update_window(app.window(), |_, window, _| {
+        for &(id, image) in &frames {
+            let cell = SharedString::from(format!("frame-{group}-{id}-thumb"));
+            let picture = SharedString::from(format!("frame-{group}-{id}-picture"));
+            assert_fills(&format!("stack frame {id} {image:?}"), window, cell, picture, 0.);
+        }
+    })
+    .unwrap();
 }

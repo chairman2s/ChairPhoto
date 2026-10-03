@@ -60,6 +60,16 @@ fn fixture_with(
     graph: impl Fn() -> Result<LibraryGraph, String> + Send + Sync + 'static,
     cx: &mut TestAppContext,
 ) -> Fixture {
+    fixture_with_images(app, graph, None, cx)
+}
+
+/// [`fixture_with`], the view drawing thumbnails from `images`.
+fn fixture_with_images(
+    app: AppState,
+    graph: impl Fn() -> Result<LibraryGraph, String> + Send + Sync + 'static,
+    images: Option<Entity<crate::image_store::ImageStore>>,
+    cx: &mut TestAppContext,
+) -> Fixture {
     cx.update(|cx| {
         gpui_kit::init(cx);
         crate::theme::apply_system_theme(&SystemThemeResult::unavailable(), cx);
@@ -78,7 +88,7 @@ fn fixture_with(
     let (m, s) = (model.clone(), shell.clone());
     let window = cx.update(|cx| {
         cx.open_window(Default::default(), move |window, cx| {
-            let view = cx.new(|cx| TagGraphView::new(&m, s, None, source, window, cx));
+            let view = cx.new(|cx| TagGraphView::new(&m, s, images, source, window, cx));
             cx.new(|_| Host { view: Some(view) })
         })
         .unwrap()
@@ -569,6 +579,50 @@ fn a_catalog_read_refreshes_the_selected_tags_photos(cx: &mut TestAppContext) {
     f.settle(cx);
     assert_eq!(f.view.read_with(cx, |v, _| v.session().selected()), Some(NodeId::Tag(bird)), "still selected");
     assert_eq!(top(cx), Some((bird, p.clone())), "the new photo shows");
+}
+
+/// #186: the inspector's top photos fill their 76 px cell, portrait and landscape
+/// (`tagGraph.css`: `object-fit: cover`), not a portrait element taller than the cell.
+#[gpui_kit::test]
+fn the_top_photos_fill_their_cell(cx: &mut TestAppContext) {
+    use crate::image_store::{ImageStore, Submit};
+    use crate::image_tests::{pixels, FakePool};
+    use crate::loupe::fit_tests::{assert_fills, LANDSCAPE, PORTRAIT};
+    use chairphoto_core::image_pool::{ImageKind, JobKey};
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+    let dir = TempDir(std::env::temp_dir().join(format!("cp-tg-fit-{}-{nanos}", std::process::id())));
+    std::fs::create_dir_all(&dir.0).unwrap();
+    let root = dir.0.join("photos");
+    let catalog = Catalog::open(&dir.0.join("t.chairphoto"), &root).unwrap();
+    let bird = catalog.create_tag("Animals/Bird").unwrap();
+    let p: Vec<i64> = (0..2).map(|i| catalog.upsert_photo(&root.join(format!("p{i}.ARW")), None, 0, 1).unwrap().id).collect();
+    for &id in &p {
+        catalog.assign_tag(id, bird).unwrap();
+    }
+    let app = AppState::default();
+    *app.catalog.lock().unwrap() = Some(catalog);
+    let pool = Arc::new(FakePool::default());
+    let images = cx.update(|cx| {
+        let pool: Arc<dyn Submit> = pool.clone();
+        cx.new(|cx| ImageStore::new(pool, 1 << 24, cx))
+    });
+    let source = super::catalog_source(app.clone());
+    let f = fixture_with_images(app.clone(), move || source(), Some(images), cx);
+    f.click("tg-type-tags", cx);
+    f.view.update(cx, |v, cx| v.update_session(cx, |s| s.select(Some(NodeId::Tag(bird)))));
+    f.settle(cx);
+    let frames = [(p[0], PORTRAIT), (p[1], LANDSCAPE)];
+    for &(id, (w, h)) in &frames {
+        pool.finish(&JobKey::photo(id, ImageKind::Thumb), Ok(pixels(w, h)));
+    }
+    f.settle(cx);
+    cx.update_window(f.any(), |_, window, _| {
+        for &(id, image) in &frames {
+            let what = format!("top photo {id} {image:?}");
+            assert_fills(&what, window, ("tg-top-thumb", id as u64), ("tg-top-picture", id as u64), 0.);
+        }
+    })
+    .unwrap();
 }
 
 /// The module in the real wiring: enabled from the registry, its rail item shows the view,

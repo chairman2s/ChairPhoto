@@ -8,6 +8,7 @@ use crate::image_store::ImageState;
 use crate::shell::actions::PublishSelection;
 use crate::shell::style::{dot_ring, Colors, COLOR_LABELS};
 use crate::storage::ui::{chip, clickable};
+use crate::loupe::zoom::fitted;
 use chairphoto_core::catalog::StorageStatus;
 use chairphoto_core::image_pool::ImageKind;
 use gpui_kit::component::button::Button;
@@ -16,7 +17,7 @@ use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::Sizable as _;
 use gpui_kit::prelude::*;
 use gpui_kit::{
-    div, img, px, AnyElement, App, ClickEvent, Div, FontWeight, ObjectFit, SharedString, Stateful,
+    div, px, AnyElement, App, ClickEvent, Div, FontWeight, ObjectFit, SharedString, Stateful,
     TestSupportExt as _,
 };
 
@@ -262,7 +263,7 @@ impl PhotoInspector {
                     let is_master = m.id == master_id;
                     let name = format!("{}{}", if is_master { "Original — " } else { "" }, m.path.rsplit('/').next().unwrap_or(&m.path));
                     let thumb = match self.images.read(cx).peek(m.id, ImageKind::Thumb) {
-                        ImageState::Ready(l) => img(l.image.clone()).size_full().object_fit(ObjectFit::Cover).into_any_element(),
+                        ImageState::Ready(l) => fitted(("stack-row-picture", m.id as u64), l.image.clone(), ObjectFit::Cover).into_any_element(),
                         _ => div().size_full().bg(colors.well).into_any_element(),
                     };
                     let mut r = div()
@@ -273,7 +274,16 @@ impl PhotoInspector {
                         .p(px(3.))
                         .rounded(px(6.))
                         .when(active, |d| d.bg(colors.sel))
-                        .child(div().size(px(32.)).flex_none().overflow_hidden().rounded(px(4.)).child(thumb))
+                        .child(
+                            div()
+                                .id(("stack-row-thumb", m.id as u64))
+                                .size(px(32.))
+                                .flex_none()
+                                .overflow_hidden()
+                                .rounded(px(4.))
+                                .child(thumb)
+                                .test_support(),
+                        )
                         .child(
                             div()
                                 .flex_1()

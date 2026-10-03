@@ -62,6 +62,28 @@ pub(crate) fn assert_fitted(what: &str, picture: Bounds<Pixels>, boxed: Bounds<P
     assert!(near(pl - bl, bl + bw - pl - pw) && near(pt - bt, bt + bh - pt - ph), "{msg}: not centred");
 }
 
+/// A thumbnail cell's picture fills the cell (#186): its laid-out element is the cell's
+/// content box, the cell less `border` on every side — not an element as wide as the cell
+/// and as tall as the frame's shape makes it, as `img(..).size_full()` in the flow lays out a
+/// frame narrower than the cell. Where Cover then paints is `ObjectFit::Cover`'s own maths
+/// for those bounds; the fit mode is not observable headless.
+pub(crate) fn assert_fills(what: &str, window: &Window, cell: impl Into<gpui_kit::ElementId>, picture: impl Into<gpui_kit::ElementId>, border: f32) {
+    let (cell, picture) = (cell.into(), picture.into());
+    let boxed = window.find(cell.clone()).bounds();
+    let drawn = window.try_find(picture.clone()).unwrap_or_else(|| panic!("{what}: no picture {picture:?} drawn")).bounds();
+    let f = |p: Pixels| f32::from(p);
+    let near = |a: f32, b: f32| (a - b).abs() <= 0.5;
+    let msg = format!("{what}: picture {drawn:?} in the cell {boxed:?} (border {border})");
+    assert!(f(boxed.size.width) > 1. && f(boxed.size.height) > 1., "{msg}: the cell has no size");
+    assert!(
+        near(f(drawn.origin.x), f(boxed.origin.x) + border)
+            && near(f(drawn.origin.y), f(boxed.origin.y) + border)
+            && near(f(drawn.size.width), f(boxed.size.width) - 2. * border)
+            && near(f(drawn.size.height), f(boxed.size.height) - 2. * border),
+        "{msg}: the picture's element is not the cell's box"
+    );
+}
+
 fn app_with(n: usize, tag: &str, cx: &mut TestAppContext) -> (App, Arc<FakePool>, TempDir, Vec<i64>) {
     let dir = TempDir::new(tag);
     let pool = Arc::new(FakePool::default());

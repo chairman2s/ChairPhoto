@@ -25,6 +25,7 @@ use crate::modules::dialog::{self, DialogHost, Picked, SelectionSnapshot, NO_ROW
 use crate::shell::style::Colors;
 use crate::storage::{ui, Runner};
 use crate::tags::toggle;
+use crate::loupe::zoom::fitted;
 use chairphoto_core::app::slideshow::{claim_slideshow, SlideshowJob, SlideshowOptions, SLIDESHOW_CANCELLED};
 use chairphoto_core::app::CoreEvent;
 use chairphoto_core::image_pool::ImageKind;
@@ -35,7 +36,7 @@ use chairphoto_model::slideshow::{
 use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::slider::{Slider, SliderEvent, SliderState};
 use gpui_kit::prelude::*;
-use gpui_kit::{div, img, px, AnyElement, Context, Entity, ObjectFit, SharedString, Subscription, TestSupportExt as _, Window};
+use gpui_kit::{div, px, AnyElement, Context, Entity, ObjectFit, SharedString, Subscription, TestSupportExt as _, Window};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -341,7 +342,7 @@ impl SlideshowDialog {
                 .drag_over::<DraggedSlide>(move |s, _, _, _| s.border_color(colors.accent))
                 .on_drop(cx.listener(move |d, dragged: &DraggedSlide, _, cx| d.reorder(dragged.from, i, cx)));
             let tile = match image {
-                ImageState::Ready(l) => tile.child(img(l.image).size_full().object_fit(ObjectFit::Cover)),
+                ImageState::Ready(l) => tile.child(fitted(("slideshow-picture", i), l.image, ObjectFit::Cover)),
                 _ => tile,
             };
             tile.child(

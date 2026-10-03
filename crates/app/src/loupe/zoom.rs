@@ -111,14 +111,18 @@ pub fn fit_factor(natural: (f32, f32), container: (f32, f32)) -> f32 {
 /// `image` fitted to the box its parent gives it with `fit` — `Contain` (whole, centred,
 /// letterboxed) or `Cover` (filling it, centred, cropped) — as the picture element `id`. The
 /// box fills its parent (`size_full`). The cull stage, the duel, the proof sheet and preset
-/// cards draw their pictures with it.
+/// cards draw their pictures with it, and so does every thumbnail cell (#186): the Library
+/// grid, the bench's pile, the filmstrips, the Stack dialog and the inspector's Stack rows,
+/// the loupe card's wall, the import and trash grids, and the modules' strips and lists.
 ///
 /// `img(..).size_full()` placed in the flow is not enough. GPUI's `img` gives its element
 /// the image's aspect ratio, and in a block parent the layout then takes the element's height
 /// from its width through that ratio instead of from the parent: a portrait frame — or any
 /// frame narrower than the box's shape — comes out taller than the box, and Contain inside
 /// that taller element fills the width and runs off the bottom (#174), over whatever sits
-/// below it (#178). Positioned absolutely, the element takes both sizes from its containing
+/// below it (#178). That holds in a fixed-size cell too: the ratio acts as a floor on the
+/// height, so a 2:3 thumbnail in a 52×35 cell is laid out 52×78 (Cover then crops its top,
+/// not its centre; the cell's clip hides the overflow). Positioned absolutely, the element takes both sizes from its containing
 /// box and the ratio is only used to paint.
 pub fn fitted(id: impl Into<ElementId>, image: impl Into<ImageSource>, fit: ObjectFit) -> Div {
     div()

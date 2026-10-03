@@ -298,6 +298,39 @@ fn the_stack_section_lists_and_unstacks(cx: &mut TestAppContext) {
     assert!(!present(&app, "section-stack", cx), "no stack left");
 }
 
+/// #186: a Stack row's 32 px thumbnail fills its square with a portrait and a landscape
+/// frame (`.stack-thumb { object-fit: cover }`), not a portrait element taller than it.
+#[gpui_kit::test]
+fn stack_row_thumbnails_fill_their_square(cx: &mut TestAppContext) {
+    use crate::image_tests::{pixels, FakePool};
+    use crate::loupe::fit_tests::{assert_fills, LANDSCAPE, PORTRAIT};
+    use chairphoto_core::image_pool::JobKey;
+    let dir = TempDir::new("insp-stack-fit");
+    let pool = std::sync::Arc::new(FakePool::default());
+    let app = crate::tests::start_with_pool(cx, pool.clone());
+    let ids = open_catalog_with_photos(&app, &dir, 2, cx);
+    catalog(&app, |c| c.set_stack_parent(ids[1], ids[0]).unwrap());
+    app.wired.model.update(cx, |m, cx| m.refresh(cx));
+    cx.run_until_parked();
+    select(&app, ids[0], SelectMods::default(), cx);
+    click(&app, "section-stack", cx);
+    let frames = [(ids[0], LANDSCAPE), (ids[1], PORTRAIT)];
+    let wanted: Vec<_> = ids.iter().map(|&id| (id, ImageKind::Thumb)).collect();
+    app.wired.images.update(cx, |s, _| s.request_batch(&wanted));
+    for &(id, (w, h)) in &frames {
+        pool.finish(&JobKey::photo(id, ImageKind::Thumb), Ok(pixels(w, h)));
+    }
+    cx.run_until_parked();
+    render(&app, cx);
+    cx.update_window(app.window(), |_, window, _| {
+        for &(id, image) in &frames {
+            let what = format!("stack row {id} {image:?}");
+            assert_fills(&what, window, ("stack-row-thumb", id as u64), ("stack-row-picture", id as u64), 0.);
+        }
+    })
+    .unwrap();
+}
+
 /// IPTC: the form loads the photo's fields; Save is enabled only when dirty; saving writes
 /// the catalog and the sidecar next to the original, on a worker.
 #[gpui_kit::test]

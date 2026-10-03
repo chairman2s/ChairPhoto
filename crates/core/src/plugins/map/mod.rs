@@ -258,7 +258,8 @@ pub fn apply_fence(
 pub struct FencesApplied {
     /// New assignments created across every applied fence.
     pub tagged: usize,
-    /// Fences applied (including those that matched no new photo).
+    /// Fences applied (including those that matched no new photo). A fence with fewer than
+    /// three points has no area and is not counted.
     pub applied: usize,
     /// Fences refused because their tag is an auto-tag (#181), by fence name.
     pub skipped: Vec<String>,
@@ -275,6 +276,10 @@ pub fn apply_all_fences(
     let fences = list_fences(catalog.conn())?;
     let mut out = FencesApplied::default();
     for fence in fences {
+        if fence.polygon.len() < 3 {
+            // No area, so nothing to apply: neither applied nor skipped (review #181 r2 N1).
+            continue;
+        }
         match apply_fence(catalog, fence.id) {
             Ok(n) => {
                 out.tagged += n;

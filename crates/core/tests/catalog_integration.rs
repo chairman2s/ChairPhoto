@@ -5351,6 +5351,24 @@ fn map_apply_all_fences_skips_an_auto_tag_fence_and_applies_the_rest() {
     assert_eq!(paths, vec!["Places/A".to_string(), "Places/C".to_string()], "both place fences, not the auto-tag");
 }
 
+/// Review #181 r2 N1: a fence with fewer than three points has no area, so Apply all neither
+/// applies nor skips it — it is not counted.
+#[cfg(feature = "map")]
+#[test]
+fn map_apply_all_fences_does_not_count_a_degenerate_fence() {
+    use chairphoto_core::plugins::map;
+
+    let (catalog, root) = temp_catalog("map_apply_all_degenerate");
+    map::ensure_schema_for(&catalog).unwrap();
+    let poly = vec![(0.0_f64, 0.0_f64), (0.0, 1.0), (1.0, 1.0), (1.0, 0.0)];
+    map::create_fence_for(&catalog, "A", "Places/A", &poly).unwrap();
+    map::create_fence_for(&catalog, "Line", "Places/Line", &poly[..2]).unwrap();
+    insert_photo_with_gps(&catalog, &root, "in.jpg", 0.5, 0.5);
+
+    let out = map::apply_all_fences(&catalog).unwrap();
+    assert_eq!(out, map::FencesApplied { tagged: 1, applied: 1, skipped: Vec::new() });
+}
+
 /// apply_fences_to_photo on a photo without GPS returns 0 without error.
 #[cfg(feature = "map")]
 #[test]

@@ -867,6 +867,35 @@ fn apply_all_skips_an_auto_tag_fence_and_says_so(cx: &mut TestAppContext) {
     assert_eq!(paths, ["Places/A", "Places/C"]);
 }
 
+/// Review #181 r2 N1: one auto-tag fence beside a two-point (no-area) fence reads "0 of 1
+/// fence" — singular, and the degenerate fence is not counted as applied.
+#[gpui_kit::test]
+fn apply_all_counts_one_fence_in_the_singular_and_not_a_degenerate_one(cx: &mut TestAppContext) {
+    let dir = TempDir::new("map-apply-one");
+    let m = open_map(&dir, &[OSLO], cx);
+    m.click("map-consent-deny", cx);
+    let square = vec![(59.90, 10.74), (59.90, 10.76), (59.92, 10.76), (59.92, 10.74)];
+    {
+        let guard = m.app.state.catalog.lock().unwrap();
+        let c = guard.as_ref().unwrap();
+        let auto = c.create_tag("Technique/Panorama").unwrap();
+        c.conn().execute("UPDATE tags SET auto_rule = 'panorama' WHERE id = ?1", [auto]).unwrap();
+        backend::create_fence_for(c, "Pano", "Technique/Panorama", &square).unwrap();
+        backend::create_fence_for(c, "Line", "Places/Line", &square[..2]).unwrap();
+    }
+    let state = m.view(cx).read_with(cx, |v, _| v.state.clone());
+    state.update(cx, |s, cx| s.reload_fences(cx));
+    work(&m.app, cx);
+
+    m.click("map-apply-all", cx);
+    let status = m.app.wired.model.read_with(cx, |m, _| m.status.to_string());
+    assert_eq!(
+        status,
+        "Applied 0 of 1 fence: 0 photos newly tagged. Skipped \u{201c}Pano\u{201d} \u{2014} an auto-tag can't be \
+         assigned by a fence."
+    );
+}
+
 /// Dragging a fence's vertex reshapes it live and saves the new polygon on release.
 #[gpui_kit::test]
 fn dragging_a_vertex_saves_the_new_shape(cx: &mut TestAppContext) {

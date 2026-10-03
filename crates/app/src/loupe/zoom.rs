@@ -489,10 +489,18 @@ impl ZoomImage {
         self.shared.update(cx, |s, cx| s.set(next, cx));
     }
 
+    /// The container as laid out, from the measuring canvas's prepaint. The picture was placed
+    /// (in `render`) for the box it had before; a change asks for another frame to place it
+    /// again. A notify during prepaint asks for none — GPUI drops the redraw request mid-draw —
+    /// so it is deferred until the frame is done. Without that a pane that changed size (Duel →
+    /// Grid, a panel toggled) kept the old box's placement until some unrelated redraw (#175).
     fn set_bounds(&mut self, bounds: Bounds<Pixels>, cx: &mut Context<Self>) {
         if self.bounds != Some(bounds) {
             self.bounds = Some(bounds);
-            cx.notify();
+            let this = cx.entity().downgrade();
+            cx.defer(move |cx| {
+                this.update(cx, |_, cx| cx.notify()).ok();
+            });
         }
     }
 }
@@ -558,12 +566,14 @@ impl Render for ZoomImage {
             (Some(image), Some(container)) => {
                 let (l, t, w, h) = view.placement(natural(image), container);
                 img(image.clone())
+                    .id(SharedString::from(format!("{}-picture", self.id)))
                     .absolute()
                     .left(px(l))
                     .top(px(t))
                     .w(px(w))
                     .h(px(h))
                     .object_fit(ObjectFit::Fill)
+                    .test_support()
                     .into_any_element()
             }
             // Before the first layout: contained, centred — what fit looks like.

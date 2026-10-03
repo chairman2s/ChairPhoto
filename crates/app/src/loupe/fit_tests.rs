@@ -1,6 +1,6 @@
 //! Headless tests that a fitted picture is drawn whole inside its box (React's
-//! `object-fit: contain`): the cull stage (#174) here, the Darkroom duel (#178) in
-//! `darkroom/tests.rs` with the Darkroom rig. Each covers a
+//! `object-fit: contain`): the cull stage (#174) and Compare's panes (#175) here, the
+//! Darkroom duel (#178) in `darkroom/tests.rs` with the Darkroom rig. Each covers a
 //! landscape frame, a portrait frame, and a frame whose catalog row is stored landscape with
 //! a rotating EXIF orientation (DSC07441: 7008×4672, orientation 6) — its preview comes from
 //! the core already turned upright, so it reaches the view as a portrait texture.
@@ -12,11 +12,13 @@
 use crate::image_tests::{pixels, FakePool};
 use crate::loupe::cull::CullView;
 use crate::shell::actions::StartCullSession;
+use crate::shell::state::Side;
 use crate::tests::{open_catalog_with_photos, press, start_with_pool, App, TempDir};
 use chairphoto_core::image_pool::{ImageKind, JobKey};
 use gpui_kit::test::TestWindowExt as _;
 use gpui_kit::{
-    point, px, size, AppContext as _, Bounds, DevicePixels, Entity, ObjectFit, Pixels, TestAppContext, Window,
+    point, px, size, AppContext as _, Bounds, DevicePixels, Entity, InputEvent as _, Modifiers, MouseButton,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit, Pixels, TestAppContext, Window,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -131,4 +133,88 @@ fn the_cull_stage_fits_landscape_portrait_and_rotated_frames(cx: &mut TestAppCon
     }
     seen.sort();
     assert_eq!(seen, ids, "every frame was checked");
+}
+
+// --- Compare's panes (#175) ---------------------------------------------------------------
+
+/// Each Compare pane on screen: (its box, where its picture is drawn, the photo it shows),
+/// read from the last frame drawn — no frame is forced here.
+fn compare_panes(app: &App, cx: &mut TestAppContext) -> Vec<(Bounds<Pixels>, Option<Bounds<Pixels>>, Option<i64>)> {
+    let compare = app.wired.root.as_ref().unwrap().read_with(cx, |r, _| r.compare().clone());
+    let zooms = compare.read_with(cx, |c, _| c.panes().to_vec());
+    let photos: Vec<Option<i64>> = zooms.iter().map(|z| z.read_with(cx, |z, _| z.drawn().map(|(id, _)| id))).collect();
+    cx.update_window(app.window(), |_, window, _| {
+        (0..zooms.len())
+            .filter_map(|i| {
+                let pane = window.try_find(format!("compare-image-{i}"))?.bounds();
+                let picture = window.try_find(format!("compare-image-{i}-picture")).map(|e| e.bounds());
+                Some((pane, picture, photos[i]))
+            })
+            .collect()
+    })
+    .unwrap()
+}
+
+fn assert_panes_fit(when: &str, app: &App, frames: &HashMap<i64, (u32, u32)>, want: usize, cx: &mut TestAppContext) {
+    let panes = compare_panes(app, cx);
+    assert_eq!(panes.len(), want, "{when}: panes on screen");
+    for (i, (pane, picture, photo)) in panes.into_iter().enumerate() {
+        let photo = photo.unwrap_or_else(|| panic!("{when}: pane {i} draws no photo"));
+        let picture = picture.unwrap_or_else(|| panic!("{when}: pane {i} has no placed picture"));
+        let image = frames[&photo];
+        assert_fitted(&format!("{when}: pane {i} (photo {photo})"), drawn(picture, image), pane, image);
+    }
+}
+
+/// A click at `id`'s centre as the platform delivers it: pointer events only, no frame forced
+/// afterwards — what is drawn next is what GPUI itself redraws, as in the running app.
+fn platform_click(app: &App, id: &'static str, cx: &mut TestAppContext) {
+    cx.update_window(app.window(), |_, window, cx| {
+        let position = window.find(id).bounds().center();
+        let modifiers = Modifiers::default();
+        window.dispatch_event(MouseMoveEvent { position, pressed_button: None, modifiers }.to_platform_input(), cx);
+        let down = MouseDownEvent { button: MouseButton::Left, position, modifiers, click_count: 1, first_mouse: false };
+        window.dispatch_event(down.to_platform_input(), cx);
+        let up = MouseUpEvent { button: MouseButton::Left, position, modifiers, click_count: 1 };
+        window.dispatch_event(up.to_platform_input(), cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+}
+
+/// Compare's panes fit their frames at fit — in the duel's two panes, and after Grid
+/// narrows them to three. The narrowing is the case that broke: each pane measures its box
+/// while the frame is drawn, and the picture placed for the duel's wider box stayed on screen
+/// (overflowing a narrow pane: the rotated portrait frame shifted right and cut off), because
+/// the re-measure asked for no new frame.
+#[gpui_kit::test]
+fn compare_panes_fit_landscape_portrait_and_rotated_frames_when_grid_narrows_them(cx: &mut TestAppContext) {
+    let (app, pool, _dir, ids) = app_with(3, "fit-cmp", cx);
+    let frames = three_frames(&app, &ids);
+    // Every preview already in the image layer, as after looking at the photos in the
+    // loupe: no decode lands later to redraw the panes by chance.
+    let all: Vec<(i64, ImageKind)> = ids.iter().map(|&id| (id, ImageKind::Preview)).collect();
+    app.wired.images.update(cx, |s, _| s.request_batch(&all));
+    answer_previews(&pool, &frames, cx);
+    // …and the inspector closed: its reads for the focused photo land after the click and
+    // would redraw the window by chance too.
+    app.wired.shell.update(cx, |s, cx| {
+        if s.panel_visible(Side::Right) {
+            s.toggle_panel(Side::Right, cx)
+        }
+    });
+    app.wired.shell.update(cx, |s, cx| s.select_with(cx, |l| l.select_all()));
+    cx.run_until_parked();
+    press(&app, "c", cx);
+    // Two frames: the first measures the panes, the second places the pictures in them.
+    for _ in 0..2 {
+        cx.update_window(app.window(), |_, window, cx| window.render_frame(cx)).unwrap();
+    }
+    assert_panes_fit("duel", &app, &frames, 2, cx);
+
+    // Nothing is loading, so the frames drawn after the click are only those GPUI asks for.
+    platform_click(&app, "compare-mode-grid", cx);
+    assert_panes_fit("grid", &app, &frames, 3, cx);
+    let shown: Vec<i64> = compare_panes(&app, cx).into_iter().filter_map(|(_, _, p)| p).collect();
+    assert!(ids.iter().all(|id| shown.contains(id)), "every frame was checked: {shown:?}");
 }

@@ -3654,6 +3654,30 @@ mod tests {
         assert_eq!(owner, first.id);
     }
 
+    /// #150 (nit from the #146 re-review): a re-home within a volume indexed in place drops
+    /// the debt queued for the path it left, as a root re-home does — that row could only
+    /// ever report a file that is no longer there as unreachable.
+    #[test]
+    fn a_volume_rehome_drops_the_debt_of_the_path_it_left() {
+        let (catalog, _root, dir) = temp_catalog("volume-rehome-debt");
+        const KNOWN: &str = "6f1c1f0e-2b7a-4c3d-9e8f-0a1b2c3d4e5f";
+        let nas = dir.path().join("nas");
+        std::fs::create_dir_all(&nas).unwrap();
+        catalog.add_volume("NAS", &nas, crate::catalog::VolumeKind::Backup).unwrap();
+        let before = nas.join("x.jpg");
+        std::fs::write(&before, b"raw-bytes").unwrap();
+        let row = catalog.upsert_photo_on_volume(&before, 1, 9, Some(KNOWN)).unwrap();
+        catalog.record_sidecar_identity(row.id, &before, &SidecarIdentity::Unwritable("ro".into())).unwrap();
+        assert!(queue_row(&catalog, row.id, &before).is_some());
+
+        std::fs::remove_file(&before).unwrap();
+        let after = nas.join("y.jpg");
+        std::fs::write(&after, b"raw-bytes").unwrap();
+        let moved = catalog.upsert_scanned_photo_on_volume(&after, 1, 9, Some(KNOWN)).unwrap();
+        assert_eq!((moved.id, moved.created), (row.id, false));
+        assert_eq!(queue_row(&catalog, row.id, &before), None, "the path it left owes nothing");
+    }
+
     /// #146 review N4: v23 agrees with merge that a blank `photos.uuid` names no identity. It
     /// gets a random v4 — never `legacy_photo_identity` of whitespace, which every catalog
     /// would share — and no legacy identifier is recorded for it.

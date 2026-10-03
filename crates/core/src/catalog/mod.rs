@@ -1024,6 +1024,9 @@ impl Catalog {
             )?;
             UpsertResult { id, uuid, created: false, unchanged }
         } else if let Some((id, uuid)) = by_uuid {
+            // A re-home within this volume leaves its old path: debt queued for that path
+            // names a file that is no longer there (#150, as for a root re-home).
+            self.forget_identity_debt_left_behind(id, absolute)?;
             self.conn.execute(
                 "UPDATE photos SET mtime_ns = ?1, size = ?2, extension = ?3, missing = 0,
                     updated_at = ?4 WHERE id = ?5",

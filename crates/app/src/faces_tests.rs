@@ -1503,9 +1503,10 @@ fn writes_wait_for_a_running_match_and_its_end_rereads(cx: &mut TestAppContext) 
     people.read_with(cx, |p, _| assert!(p.naming.is_some()));
 }
 
-/// #152: a card's avatar is a face cut from its photo's thumbnail by the face's box, in the
-/// original's frame. A cover version's thumbnail (possibly cropped) is not cut — the circle
-/// stays empty — and the plain thumbnail is.
+/// #152, rv151 L4: a card's avatar is a face cut by the face's box, which is in the
+/// original's frame. A cover version's thumbnail (possibly cropped) is not cut: the face is
+/// cut from the photo's preview instead, asked for (and held) once the thumbnail turns out to
+/// be a cover render, the circle empty until it lands. A plain thumbnail is cut directly.
 #[gpui_kit::test]
 fn an_avatar_is_not_cut_from_a_cover_thumbnail(cx: &mut TestAppContext) {
     let f = open_faces(2, true, "people-cover-avatar", cx);
@@ -1513,13 +1514,26 @@ fn an_avatar_is_not_cut_from_a_cover_thumbnail(cx: &mut TestAppContext) {
     let photo = f.ids[0];
     let face = add_face(&f.app, photo, "[0.1,0.1,0.2,0.2]");
     confirm_as(&f.app, face, alice);
-    let (_view, people) = f.people(cx);
+    let (view, people) = f.people(cx);
     assert_eq!(people.read_with(cx, |p, _| p.data.as_ref().unwrap().people[0].avatar_photo_id), photo);
     let thumb = JobKey::photo(photo, ImageKind::Thumb);
+    let preview = JobKey::photo(photo, ImageKind::Preview);
+    let images = f.app.wired.images.clone();
+    assert!(!images.read_with(cx, |s, _| s.is_pending(photo, ImageKind::Preview)), "no preview for a plain card");
     f.pool.finish(&thumb, Ok(cover_pixels(400, 200)));
     work(&f.app, cx);
     assert!(f.present(&format!("faces-person-{alice}"), cx), "the card is drawn");
     assert!(!f.present(&format!("faces-avatar-{photo}"), cx), "no face cut from the cover's thumbnail");
+    assert!(images.read_with(cx, |s, _| s.is_pending(photo, ImageKind::Preview)), "the preview is asked for");
+    assert!(view.read_with(cx, |v, cx| v.held(cx)).contains(&photo));
+
+    // The preview (the original's frame; portrait here, to tell it from the thumbnail) lands:
+    // the face is cut from it.
+    f.pool.finish(&preview, Ok(pixels(200, 400)));
+    work(&f.app, cx);
+    let cut = f.bounds(&format!("faces-avatar-{photo}"), cx);
+    let aspect = f32::from(cut.size.width) / f32::from(cut.size.height);
+    assert!((aspect - 0.5).abs() < 0.01, "cut from the preview (aspect {aspect})");
 
     // The cover taken off: the plain thumbnail, cut by the box.
     let images = f.app.wired.images.clone();

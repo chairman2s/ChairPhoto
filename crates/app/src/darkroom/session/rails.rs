@@ -58,12 +58,15 @@ impl Darkroom {
     /// One version operation on a worker. Photo `seq` is busy until it answers (a change
     /// meanwhile waits, as for a commit) — or, for an operation that `replaces` the working
     /// record, refuses changes until it answers ([`Darkroom::apply`]); `done` runs only while
-    /// `seq` is the open photo. A left photo's failure goes to the status line.
+    /// `seq` is the open photo. A photo left meanwhile (`Darkroom::leaving`) takes `on_left`
+    /// with a success — what the answer changes about the version its next commit writes —
+    /// and a failure goes to the status line.
     fn run_op<T: Send + 'static>(
         &mut self,
         seq: u64,
         replaces: bool,
         work: impl FnOnce(&AppState) -> Result<T, String> + Send + 'static,
+        on_left: impl FnOnce(&mut OpenPhoto, T) + 'static,
         done: impl FnOnce(&mut Self, Result<T, String>, &mut Context<Self>) + 'static,
         cx: &mut Context<Self>,
     ) {
@@ -82,8 +85,15 @@ impl Darkroom {
                 open.replacing = false;
                 if this.open.as_ref().is_some_and(|o| o.seq == seq) {
                     done(this, result, cx);
-                } else if let Err(e) = result {
-                    this.model.update(cx, |m, cx| m.set_status(format!("Darkroom: {e}"), cx));
+                } else {
+                    match result {
+                        Ok(t) => {
+                            if let Some(open) = this.photo_mut(seq) {
+                                on_left(open, t);
+                            }
+                        }
+                        Err(e) => this.model.update(cx, |m, cx| m.set_status(format!("Darkroom: {e}"), cx)),
+                    }
                 }
                 this.idle(seq, false, cx);
                 cx.notify();
@@ -143,6 +153,8 @@ impl Darkroom {
             move |state| {
                 editing::write_version_then_refresh_monochrome(state, Some(from), vid, |c| c.goto_version_step(vid, step))
             },
+            // Changes were refused while it ran: nothing follows it for a left photo.
+            |_, _| {},
             move |this, result, cx| match result {
                 Ok((json, history)) => {
                     let open = this.open.as_mut().expect("open");
@@ -199,6 +211,8 @@ impl Darkroom {
                     Ok((versions, v, history))
                 })
             },
+            // Changes were refused while it ran: nothing follows it for a left photo.
+            |_, _| {},
             |this, result, cx| match result {
                 Ok((versions, v, history)) => {
                     let open = this.open.as_mut().expect("open");
@@ -269,30 +283,21 @@ impl Darkroom {
         // The new-engine fork replaces the record (tone and look start over): changes are
         // refused until it lands. "+ New version" copies the record, so a change made while
         // it is written is kept and saved into the new version.
+        let left_record = record.clone();
         self.run_op(
             seq,
             new_engine,
             Self::create_with(from, photo_id, name, json),
+            // Left while the copy was written: a change made meanwhile is committed after it
+            // (`commit_again`) into the new version, as it would have been had the photo
+            // stayed open — not into the version it was copied from (#202).
+            move |open, (id, versions)| Self::forked(open, new_engine, &left_record, id, versions),
             move |this, result, cx| match result {
                 Ok((id, versions)) => {
                     let open = this.open.as_mut().expect("open");
                     let before = (open.source_token().map(str::to_string), open.stage_json());
-                    if new_engine {
-                        // Nothing was changed meanwhile (refused): the fork's record is shown.
-                        open.working = record.clone();
-                        open.commit_again = false;
-                        open.engine1_version = false;
-                    }
-                    // "+ New version": a change made while the copy was written stays on
-                    // screen and is saved into the new version.
-                    Self::adopt_committed(open, &record);
-                    open.version_id = Some(id);
-                    open.version_unlisted = false;
-                    open.history = None;
-                    open.adopted_label = None;
-                    open.versions_len = versions.len();
                     let created = versions.iter().find(|v| v.id == id).map(|v| PhotoVersion { edit_json: saved, ..v.clone() });
-                    open.versions = versions;
+                    Self::forked(open, new_engine, &record, id, versions);
                     this.show_version(created, cx);
                     this.restage(before, cx);
                     this.shell.update(cx, |s, cx| s.refresh_rows(cx));
@@ -301,6 +306,26 @@ impl Darkroom {
             },
             cx,
         );
+    }
+
+    /// A fork landed as version `id` holding `record`: it is the version edited from here on,
+    /// open or being left.
+    fn forked(open: &mut OpenPhoto, new_engine: bool, record: &VersionEdit, id: i64, versions: Vec<PhotoVersion>) {
+        if new_engine {
+            // Nothing was changed meanwhile (refused): the fork's record is shown.
+            open.working = record.clone();
+            open.commit_again = false;
+            open.engine1_version = false;
+        }
+        // "+ New version": a change made while the copy was written stays on screen and is
+        // saved into the new version.
+        Self::adopt_committed(open, record);
+        open.version_id = Some(id);
+        open.version_unlisted = false;
+        open.history = None;
+        open.adopted_label = None;
+        open.versions_len = versions.len();
+        open.versions = versions;
     }
 
     /// A duel's ⑂: bank `record` as "What-if — <dimension>" without leaving the version being
@@ -317,6 +342,8 @@ impl Darkroom {
                     seq,
                     false,
                     Self::create_with(from, photo_id, name, json),
+                    // The version edited stays the same.
+                    |_, _| {},
                     move |this, result, cx| match result {
                         Ok((_, versions)) => {
                             let open = this.open.as_mut().expect("open");
@@ -347,6 +374,8 @@ impl Darkroom {
                     seq,
                     false,
                     move |state| with_catalog_as(state, from, |c| c.set_cover_version(photo_id, next)),
+                    // The version edited stays the same.
+                    |_, _| {},
                     move |this, result, cx| match result {
                         Ok(_) => {
                             this.open.as_mut().expect("open").cover = next;

@@ -11,6 +11,16 @@
 //! one; any other surface saves and leaves — the develop session is released and the
 //! Library's rows re-read (covers and version counts may have changed).
 //!
+//! A photo opened again while a commit (or version operation) of its earlier open is still on
+//! the worker reads its versions only once that has landed (`Darkroom::finish_leaving`): the
+//! Runner is a pool that may run a newer task first, and a read that overtook the commit
+//! creating "Version 1" would show the Original and make a second "Version 1" (#189). Until
+//! the read answers its record is not editable.
+//!
+//! The develop session's opens and closes go to the worker one at a time, in the order made
+//! (`Darkroom::session_call`), so a close or an older open never lands after a newer open and
+//! trips its claim (#203).
+//!
 //! # The record, the stage, the save
 //!
 //! Every control produces the next record ([`Darkroom::apply`], the record maths in
@@ -53,12 +63,14 @@
 //! (`rails`): it saves what is pending first and runs after any commit already on the
 //! worker, one at a time, as React chained them after its autosave (`chainRef`). A save that
 //! fails drops the operations queued behind it (the change stays on screen, the banner says
-//! why). While an operation that replaces the record — a history step, a version switch,
-//! "Develop with the new engine" — is on the worker the record is not editable
+//! why); leaving the photo drops those still queued, and the status line says so. While an
+//! operation that replaces the record — a history step, a version switch, "Develop with the
+//! new engine" — is on the worker the record is not editable
 //! (`OpenPhoto::editable`): a change is refused, not made and then dropped as React's
 //! `setWorking(record)` did (saved on top of a step it would also cut the redo branch the
 //! step left). "+ New version", the cover and a duel's ⑂ keep the record, so a change made
-//! while they run is kept and saved after them.
+//! while they run is kept and saved after them — after "+ New version", into the new
+//! version, also when the photo is left before the fork lands.
 //!
 //! Presets live in the catalog's settings (`basic-editor.presets`), read-modify-written on a
 //! worker under one catalog lock; they and the crop overlay (`editor.crop_overlay`) are
@@ -106,6 +118,20 @@ struct SettingChain {
     queued: VecDeque<SettingWrite>,
 }
 
+/// A call on the develop session, waiting for the one before it (`Darkroom::session_call`).
+enum SessionCall {
+    /// Claim it for open `seq`'s photo, with the neighbours to preload.
+    Open { seq: u64, from: CatalogIdentity, photo_id: i64, neighbours: Vec<i64> },
+    Close,
+}
+
+/// The develop session's calls, one on the worker at a time, in the order made.
+#[derive(Default)]
+struct SessionChain {
+    running: bool,
+    queued: VecDeque<SessionCall>,
+}
+
 /// "🖥 Loupe print" on or off (`"0"` off; anything else, or nothing stored, on).
 pub const PRINT_ON_LOUPE_KEY: &str = "basic-editor.printOnLoupe";
 
@@ -114,6 +140,24 @@ pub const AUTOSAVE_QUIET: Duration = Duration::from_millis(600);
 
 /// Where the `.cube` LUTs live: `app::luts_dir` in the app; a test's own folder in tests.
 pub type LutsDir = Arc<dyn Fn() -> Result<PathBuf, String> + Send + Sync>;
+
+/// The develop session's calls into core, run on a worker: claim it for a photo (with its
+/// neighbours to preload) and release it. `editing::develop_open` / `develop_close` in the
+/// app; tests record the order the worker runs them in.
+#[derive(Clone)]
+pub struct DevelopCalls {
+    pub open: Arc<dyn Fn(&AppState, CatalogIdentity, i64, &[i64]) -> Result<DevelopSource, String> + Send + Sync>,
+    pub close: Arc<dyn Fn(&AppState) -> Result<(), String> + Send + Sync>,
+}
+
+impl Default for DevelopCalls {
+    fn default() -> Self {
+        DevelopCalls {
+            open: Arc::new(|state, from, photo_id, neighbours| editing::develop_open(state, Some(from), photo_id, neighbours)),
+            close: Arc::new(editing::develop_close),
+        }
+    }
+}
 
 /// One photo in the Darkroom.
 pub struct OpenPhoto {
@@ -156,6 +200,12 @@ pub struct OpenPhoto {
     next_label: Option<String>,
     /// The version is resolved: autosave may run.
     pub loaded: bool,
+    /// Opened while a commit or version operation of the photo's earlier open was still on
+    /// the worker (`Darkroom::leaving`): its versions are read once that lands, as a read
+    /// made now could overtake it on the pool (#189). Changes are refused until they are.
+    reopened_during_commit: bool,
+    /// While that read waits: `Some(active)`, the shell's version to resolve to then.
+    awaiting_left: Option<Option<i64>>,
     pub history: Option<VersionHistory>,
     pub source: SourceState,
     /// The version was made on engine 1 (the camera preview): it keeps rendering there.
@@ -251,9 +301,10 @@ impl OpenPhoto {
         self.committing
     }
 
-    /// Changes are taken: no operation that replaces the working record is on the worker.
+    /// Changes are taken: no operation that replaces the working record is on the worker,
+    /// and — re-opened during its earlier open's commit — the versions have been read.
     pub fn editable(&self) -> bool {
-        !self.replacing
+        !self.replacing && !(self.reopened_during_commit && !self.loaded)
     }
 }
 
@@ -289,6 +340,7 @@ pub struct Darkroom {
     strip_claim: ClaimId,
     pool: Arc<dyn Submit>,
     luts_dir: LutsDir,
+    develop: DevelopCalls,
     pub open: Option<OpenPhoto>,
     /// Photos left (a step, ← Library) while a commit of theirs was on the worker. Each is
     /// kept until that commit answers, so a change made meanwhile is committed after it —
@@ -306,6 +358,8 @@ pub struct Darkroom {
     pub timing_log: bool,
     /// A develop session is held (opened and not closed yet).
     session_held: bool,
+    /// Its opens and closes, in order (see [`Darkroom::session_call`]).
+    session_calls: SessionChain,
     /// The composition overlay drawn in the crop box (`editor.crop_overlay`).
     pub overlay: CropOverlay,
     /// The user's presets (`basic-editor.presets`), read with the settings.
@@ -350,6 +404,7 @@ impl Darkroom {
             strip_claim,
             pool,
             luts_dir: Arc::new(chairphoto_core::app::luts_dir),
+            develop: DevelopCalls::default(),
             open: None,
             leaving: Vec::new(),
             seq: 0,
@@ -358,6 +413,7 @@ impl Darkroom {
             wb_prefer: WbPrefer::Kelvin,
             timing_log: false,
             session_held: false,
+            session_calls: SessionChain::default(),
             overlay: CropOverlay::Thirds,
             user_presets: Vec::new(),
             notice: None,
@@ -373,6 +429,12 @@ impl Darkroom {
     pub fn set_backends(&mut self, pool: Arc<dyn Submit>, luts_dir: LutsDir) {
         self.pool = pool;
         self.luts_dir = luts_dir;
+    }
+
+    /// Tests: claim and release the develop session through `calls`.
+    #[cfg(test)]
+    pub fn set_develop_calls(&mut self, calls: DevelopCalls) {
+        self.develop = calls;
     }
 
     pub fn shell(&self) -> &Entity<ShellState> {
@@ -433,12 +495,16 @@ impl Darkroom {
         let stage = self.new_stage(photo_id, epoch, SourceToken::Preview, None, cx);
         let _stage_observer = cx.observe(&stage, |_, _, cx| cx.notify());
         let committed_json = working.to_json();
+        let active = version.as_ref().map(|v| v.id);
+        // A commit of this photo's earlier open still on the worker: the pool may run a read
+        // made now before it, so the versions are read once it lands (`finish_leaving`).
+        let waits = self.leaving.iter().any(|o| o.photo.id == photo_id && o.from == from);
         let open = OpenPhoto {
             seq,
             photo,
             from,
             epoch,
-            version_id: version.as_ref().map(|v| v.id),
+            version_id: active,
             version_unlisted: false,
             versions_len: 0,
             versions: Vec::new(),
@@ -455,6 +521,8 @@ impl Darkroom {
             last_step: None,
             next_label: None,
             loaded: false,
+            reopened_during_commit: waits,
+            awaiting_left: waits.then_some(active),
             history: None,
             source: SourceState::default(),
             engine1_version,
@@ -476,7 +544,9 @@ impl Darkroom {
         self.error = None;
         self.rendered_changed(cx);
         self.request_strip_thumbs(cx);
-        self.resolve_version(seq, version.map(|v| v.id), cx);
+        if !waits {
+            self.resolve_version(seq, active, false, cx);
+        }
         self.open_session(seq, cx);
         self.read_settings(seq, cx);
         self.measure_auto_tone(cx);
@@ -528,8 +598,10 @@ impl Darkroom {
     }
 
     /// The shell's active version when it is this photo's, else the first, else none until
-    /// the first change; and its history.
-    fn resolve_version(&mut self, seq: u64, active: Option<i64>, cx: &mut Context<Self>) {
+    /// the first change; and its history. `waited`: read after the earlier open's commits
+    /// landed — what the open started from (the shell's copy of the version, read before
+    /// they did) may be stale, so the version's record is taken whatever its id.
+    fn resolve_version(&mut self, seq: u64, active: Option<i64>, waited: bool, cx: &mut Context<Self>) {
         let from = self.open.as_ref().map(|o| o.from).expect("open");
         let photo_id = self.open.as_ref().map(|o| o.photo.id).expect("open");
         self.run(
@@ -552,15 +624,15 @@ impl Darkroom {
                         let before = (open.source_token().map(str::to_string), open.stage_json());
                         open.versions_len = versions.len();
                         open.versions = versions;
-                        if let Some(v) = &v {
-                            if Some(v.id) != open.version_id {
-                                // Not the shell's version: adopt what this one holds.
-                                let record = parse_edit(Some(&v.edit_json));
-                                open.committed_json = record.to_json();
-                                open.committed = record.clone();
-                                open.working = record;
-                                open.last_step = None;
-                                let v = v.clone();
+                        // Not the shell's version (or the shell's copy may predate the
+                        // earlier open's commits): adopt what this one holds.
+                        if waited || v.as_ref().is_some_and(|v| Some(v.id) != open.version_id) {
+                            let record = parse_edit(v.as_ref().map(|v| v.edit_json.as_str()));
+                            open.committed_json = record.to_json();
+                            open.committed = record.clone();
+                            open.working = record;
+                            open.last_step = None;
+                            if let Some(v) = v.clone() {
                                 this.shell.update(cx, |s, cx| s.set_active_version(Some(v), cx));
                             }
                         }
@@ -608,15 +680,61 @@ impl Darkroom {
             None => Vec::new(),
         };
         self.session_held = true;
-        self.run(
-            seq,
-            move |state| editing::develop_open(state, Some(from), photo_id, &neighbours),
-            move |this, result, cx| match result {
-                Ok(source) => this.on_source(&source, None, cx),
-                Err(e) => eprintln!("darkroom: develop open photo {photo_id}: {e}"),
-            },
-            cx,
-        );
+        self.session_call(SessionCall::Open { seq, from, photo_id, neighbours }, cx);
+    }
+
+    /// Queue `call` on the develop session: it runs once every call made before it has
+    /// answered. The Runner's pool may run a newer task first, and core's open trips whatever
+    /// claim came before it while its close trips whatever claim is installed: a close (← Library)
+    /// or an earlier open (→ →) that ran after a newer open would abort that open's decode,
+    /// which then ends without a word — the RAW left "preparing", nothing autosaved (#203).
+    fn session_call(&mut self, call: SessionCall, cx: &mut Context<Self>) {
+        self.session_calls.queued.push_back(call);
+        if !self.session_calls.running {
+            self.next_session_call(cx);
+        }
+    }
+
+    /// The next queued session call to the worker. An open for a photo no longer open is
+    /// skipped: a newer open or a close follows it.
+    fn next_session_call(&mut self, cx: &mut Context<Self>) {
+        self.session_calls.running = false;
+        while let Some(call) = self.session_calls.queued.pop_front() {
+            let state = self.app.clone();
+            let develop = self.develop.clone();
+            match call {
+                SessionCall::Open { seq, .. } if !self.open.as_ref().is_some_and(|o| o.seq == seq) => continue,
+                SessionCall::Open { seq, from, photo_id, neighbours } => {
+                    let rx = Runner::get(cx).run(move || (develop.open)(&state, from, photo_id, &neighbours));
+                    cx.spawn(async move |this, cx| {
+                        let result = rx.await.unwrap_or_else(|_| Err("the worker stopped".into()));
+                        this.update(cx, |this, cx| {
+                            if this.open.as_ref().is_some_and(|o| o.seq == seq) {
+                                match result {
+                                    Ok(source) => this.on_source(&source, None, cx),
+                                    Err(e) => eprintln!("darkroom: develop open photo {photo_id}: {e}"),
+                                }
+                            }
+                            this.next_session_call(cx);
+                        })
+                        .ok();
+                    })
+                    .detach();
+                }
+                SessionCall::Close => {
+                    let rx = Runner::get(cx).run(move || (develop.close)(&state));
+                    cx.spawn(async move |this, cx| {
+                        if let Ok(Err(e)) = rx.await {
+                            eprintln!("darkroom: develop close: {e}");
+                        }
+                        this.update(cx, |this, cx| this.next_session_call(cx)).ok();
+                    })
+                    .detach();
+                }
+            }
+            self.session_calls.running = true;
+            return;
+        }
     }
 
     /// `develop.wbSlider`, `editor.renderTiming`, the crop overlay, the user presets, the
@@ -1003,10 +1121,7 @@ impl Darkroom {
                 } else {
                     // The view has moved on: say which photo, on the banner and the status
                     // line (the Library shows no banner).
-                    let name = std::path::Path::new(&open.photo.path)
-                        .file_name()
-                        .map_or_else(|| open.photo.path.clone(), |n| n.to_string_lossy().into_owned());
-                    let line = format!("Autosave failed for {name}: {e}");
+                    let line = format!("Autosave failed for {}: {e}", file_name(&open.photo));
                     self.error = Some(line.clone());
                     self.model.update(cx, |m, cx| m.set_status(line, cx));
                 }
@@ -1066,8 +1181,15 @@ impl Darkroom {
         // The print was this photo's: the pop-out follows its target again.
         open.print_timer = None;
         self.clear_print(cx);
-        // Operations queued for this photo were asked of the view being left.
-        open.ops.clear();
+        // Operations queued for this photo (a cover toggle or "+ New version" clicked during
+        // an autosave, say) were asked of the view being left: not done — and the status line
+        // says so, as the view that showed them has moved on.
+        let dropped = std::mem::take(&mut open.ops).len();
+        if dropped > 0 {
+            let what = if dropped == 1 { "a version operation".to_string() } else { format!("{dropped} version operations") };
+            let line = format!("Darkroom: {} was left before {what} could run — not done", file_name(&open.photo));
+            self.model.update(cx, |m, cx| m.set_status(line, cx));
+        }
         if !save {
             open.commit_again = false;
         }
@@ -1105,6 +1227,19 @@ impl Darkroom {
         if !left.dirty() && shell.surface != Surface::Develop && shell.rows_from() == Some(left.from) {
             self.shell.update(cx, |s, cx| s.refresh_rows(cx));
         }
+        // The photo was opened again meanwhile: its versions are read now that nothing of its
+        // earlier open is left on the worker (#189).
+        let (photo_id, from) = (left.photo.id, left.from);
+        if self.leaving.iter().any(|o| o.photo.id == photo_id && o.from == from) {
+            return;
+        }
+        let waiting = self.open.as_mut().filter(|o| o.photo.id == photo_id && o.from == from).and_then(|o| {
+            let active = o.awaiting_left.take()?;
+            Some((o.seq, active))
+        });
+        if let Some((seq, active)) = waiting {
+            self.resolve_version(seq, active, true, cx);
+        }
     }
 
     /// Leave Develop: the photo (saving unless `save` is false), the develop session, and a
@@ -1116,14 +1251,7 @@ impl Darkroom {
         self.request_strip_thumbs(cx);
         if self.session_held {
             self.session_held = false;
-            Runner::get(cx).spawn({
-                let state = self.app.clone();
-                move || {
-                    if let Err(e) = editing::develop_close(&state) {
-                        eprintln!("darkroom: develop close: {e}");
-                    }
-                }
-            });
+            self.session_call(SessionCall::Close, cx);
         }
         if save && had_photo {
             self.shell.update(cx, |s, cx| s.refresh_rows(cx));
@@ -1214,6 +1342,11 @@ impl Darkroom {
         }
         self.shell.update(cx, |s, cx| s.select_with(cx, |l| l.select_single(photo_id)));
     }
+}
+
+/// The photo's file name, for the status line.
+fn file_name(photo: &Photo) -> String {
+    std::path::Path::new(&photo.path).file_name().map_or_else(|| photo.path.clone(), |n| n.to_string_lossy().into_owned())
 }
 
 fn now_ms() -> i64 {

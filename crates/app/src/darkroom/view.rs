@@ -255,8 +255,10 @@ pub struct DarkroomView {
     drag: Option<Drag>,
     show_split: bool,
     stage_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
-    /// The open photo the zoom belongs to: another photo starts at fit.
-    view_photo: Option<i64>,
+    /// The open (`OpenPhoto::seq`) the zoom and the overlays belong to: another open — another
+    /// photo, or the same one opened again (from another catalog identity, say) — starts at
+    /// fit with the proof sheet or duel closed.
+    view_open: Option<u64>,
     rails: rails::RailsState,
     /// The filmstrip's scroll position.
     strip_scroll: ScrollHandle,
@@ -269,9 +271,9 @@ pub struct DarkroomView {
 impl DarkroomView {
     pub fn new(darkroom: Entity<Darkroom>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let mut subs = vec![cx.observe_in(&darkroom, window, |this, darkroom, window, cx| {
-            let photo = darkroom.read(cx).open.as_ref().map(|o| o.photo.id);
-            if photo != this.view_photo {
-                this.view_photo = photo;
+            let open = darkroom.read(cx).open.as_ref().map(|o| o.seq);
+            if open != this.view_open {
+                this.view_open = open;
                 this.view = StageView::FIT;
                 this.photo_changed(window, cx);
             }
@@ -300,7 +302,7 @@ impl DarkroomView {
             drag: None,
             show_split: false,
             stage_bounds: Rc::default(),
-            view_photo: None,
+            view_open: None,
             rails,
             strip_scroll: ScrollHandle::new(),
             strip_centred: None,

@@ -17,6 +17,8 @@ use super::{with_catalog, with_catalog_as, AppState, CatalogIdentity};
 use crate::catalog::Catalog;
 use crate::develop_source::{probe_source, DevelopSource};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 
 /// [`with_catalog`], or [`with_catalog_as`] when bound to an identity.
 pub fn with_catalog_from<T>(
@@ -38,19 +40,98 @@ pub fn original_path(state: &AppState, from: Option<CatalogIdentity>, photo_id: 
         .ok_or_else(|| format!("no reachable copy of photo {photo_id}"))
 }
 
+/// What a develop open answers when a newer open or close was made before it took effect
+/// (#225): it claimed nothing and released nothing. A front end drops it, as it drops any
+/// answer for a photo it has left.
+pub const DEVELOP_SUPERSEDED: &str = "A newer Develop call came first";
+
+/// A develop session call's place among the calls a front end made: minted when the call is
+/// made ([`develop_ticket`]), not when a worker gets to it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct DevelopTicket(u64);
+
+/// The order of the develop session's opens and closes (#203, #225). Both run on a blocking
+/// pool, which may run a newer call first, and one of them may stall for long (an open reads
+/// a RAW header from a share that stopped answering). So the calls are not queued; each
+/// carries the [`DevelopTicket`] minted when it was made, and its ownership transition — an
+/// open's claim, a close's trip — takes effect only if no newer call's has. A close that
+/// runs after a newer open never trips that open's claim, and an open that answers after a
+/// newer open or close claims nothing.
+///
+/// `applied` is held across the transition, so two transitions never interleave; it comes
+/// before the catalog in the lock order (`app::jobs`), and nothing takes it while holding
+/// another lock.
+#[derive(Debug, Default)]
+pub struct DevelopOrder {
+    minted: AtomicU64,
+    /// The newest ticket whose transition took effect (or was attempted: a failed one still
+    /// supersedes every older call).
+    applied: Mutex<u64>,
+}
+
+impl DevelopOrder {
+    /// A ticket for a call made now: newer than every ticket minted before.
+    pub fn ticket(&self) -> DevelopTicket {
+        DevelopTicket(self.minted.fetch_add(1, Ordering::Relaxed) + 1)
+    }
+
+    /// Whether a newer call has already taken effect — an open can then skip its slow work.
+    pub fn superseded(&self, ticket: DevelopTicket) -> Result<bool, String> {
+        Ok(*self.applied.lock().map_err(|e| e.to_string())? >= ticket.0)
+    }
+
+    /// Run `transition` if `ticket` is newer than every call that took effect so far, and
+    /// record it; `Ok(None)` when it is not (the call is stale, nothing ran).
+    pub fn apply<T>(&self, ticket: DevelopTicket, transition: impl FnOnce() -> Result<T, String>) -> Result<Option<T>, String> {
+        let mut applied = self.applied.lock().map_err(|e| e.to_string())?;
+        if *applied >= ticket.0 {
+            return Ok(None);
+        }
+        *applied = ticket.0;
+        transition().map(Some)
+    }
+
+    /// Record `ticket` as made with no transition (an open that claims nothing: not a RAW,
+    /// no reachable copy), so an older open that answers later claims nothing either.
+    pub fn settle(&self, ticket: DevelopTicket) -> Result<(), String> {
+        self.apply(ticket, || Ok(())).map(|_| ())
+    }
+}
+
+/// A ticket for a develop open or close made now; mint it where the call is made (the UI
+/// thread, a command's entry), not on the worker that runs it.
+pub fn develop_ticket(state: &AppState) -> DevelopTicket {
+    state.jobs.develop_order.ticket()
+}
+
 /// The Darkroom opened `photo_id`: claim the develop session and start preparing its
 /// working image, then — at lower priority, silently — its `neighbours` (N+1 first).
 /// Returns the state right now; changes arrive as `develop:source`. A neighbour that is not
 /// a RAW or whose original is unreachable is simply not preloaded. A JPEG claims nothing; a
 /// previous photo's image is released by the next open or by [`develop_close`].
+///
+/// `ticket` orders it among the session's calls ([`DevelopOrder`]): if a newer open or close
+/// took effect first, this one claims nothing and answers [`DEVELOP_SUPERSEDED`].
 pub fn develop_open(
     state: &AppState,
     from: Option<CatalogIdentity>,
     photo_id: i64,
     neighbours: &[i64],
+    ticket: DevelopTicket,
 ) -> Result<DevelopSource, String> {
-    let path = original_path(state, from, photo_id)?;
+    let order = &state.jobs.develop_order;
+    if order.superseded(ticket)? {
+        return Err(DEVELOP_SUPERSEDED.into());
+    }
+    let path = match original_path(state, from, photo_id) {
+        Ok(path) => path,
+        Err(e) => {
+            order.settle(ticket)?;
+            return Err(e);
+        }
+    };
     if !crate::scanner::is_raw(&path) {
+        order.settle(ticket)?;
         return Ok(DevelopSource::Jpeg);
     }
     let probe = probe_source(&path);
@@ -63,11 +144,12 @@ pub fn develop_open(
             .filter_map(|n| original_path(state, from, n).ok().map(|p| (n, p)))
             .filter(|(_, p)| crate::scanner::is_raw(p))
             .collect();
-        crate::develop::session::open(state, photo_id, path, probe, neighbours)
+        crate::develop::session::open(state, ticket, photo_id, path, probe, neighbours)
     }
     #[cfg(not(all(feature = "raw", feature = "edit")))]
     {
         let _ = neighbours;
+        order.settle(ticket)?;
         Ok(probe)
     }
 }
@@ -90,16 +172,15 @@ pub fn develop_current(state: &AppState, from: Option<CatalogIdentity>, photo_id
 }
 
 /// Develop closed: release the working images. Idempotent; nothing to do without `raw` +
-/// `edit`.
-pub fn develop_close(state: &AppState) -> Result<(), String> {
+/// `edit`. A close made before an open that already took effect does nothing ([`DevelopOrder`]).
+pub fn develop_close(state: &AppState, ticket: DevelopTicket) -> Result<(), String> {
     #[cfg(all(feature = "raw", feature = "edit"))]
     {
-        crate::develop::session::close(state)
+        crate::develop::session::close(state, ticket)
     }
     #[cfg(not(all(feature = "raw", feature = "edit")))]
     {
-        let _ = state;
-        Ok(())
+        state.jobs.develop_order.settle(ticket)
     }
 }
 
@@ -279,6 +360,39 @@ mod tests {
         (c, photo, version)
     }
 
+    // --- the develop session's order (#225) ------------------------------------------------
+
+    /// A develop open older than a call that already took effect answers
+    /// [`DEVELOP_SUPERSEDED`] before reading anything; an open that claims nothing (a JPEG,
+    /// no reachable copy) still counts as taking effect, so an older open that answers after
+    /// it claims nothing either. A ticket takes effect once.
+    #[test]
+    fn a_develop_open_older_than_a_call_that_took_effect_is_superseded() {
+        let dir = TestTmpDir::new("app-editing-develop-order");
+        let state = AppState::default();
+        let (a, photo, _) = catalog(&dir, "a");
+        std::fs::write(dir.join("a").join("p.jpg"), b"jpeg").unwrap();
+        *state.catalog.lock().unwrap() = Some(a);
+        let (older, newer) = (develop_ticket(&state), develop_ticket(&state));
+        assert!(older < newer);
+        assert_eq!(develop_open(&state, None, photo, &[], newer).unwrap(), DevelopSource::Jpeg);
+        assert_eq!(develop_open(&state, None, photo, &[], older).unwrap_err(), DEVELOP_SUPERSEDED);
+        assert_eq!(develop_open(&state, None, photo, &[], newer).unwrap_err(), DEVELOP_SUPERSEDED, "once");
+
+        let next = develop_ticket(&state);
+        std::fs::remove_file(dir.join("a").join("p.jpg")).unwrap();
+        assert!(develop_open(&state, None, photo, &[], next).unwrap_err().starts_with("no reachable copy"));
+        assert!(state.jobs.develop_order.superseded(next).unwrap(), "an unreachable open still took its turn");
+
+        let order = DevelopOrder::default();
+        let (t1, t2) = (order.ticket(), order.ticket());
+        assert_eq!(order.apply(t2, || Ok(2)).unwrap(), Some(2));
+        assert_eq!(order.apply(t1, || -> Result<i32, String> { panic!("a stale call runs nothing") }).unwrap(), None);
+        let t3 = order.ticket();
+        assert!(order.apply(t3, || -> Result<(), String> { Err("failed".into()) }).is_err());
+        assert!(order.superseded(t3).unwrap(), "a failed transition still supersedes the calls before it");
+    }
+
     /// The identity-bound calls fail closed once another catalog is open — one whose photo
     /// and version carry the same ids — and touch nothing in it.
     #[test]
@@ -293,7 +407,7 @@ mod tests {
         *state.catalog.lock().unwrap() = Some(b);
 
         assert_eq!(original_path(&state, Some(from), photo).unwrap_err(), CATALOG_CHANGED);
-        assert_eq!(develop_open(&state, Some(from), photo, &[]).unwrap_err(), CATALOG_CHANGED);
+        assert_eq!(develop_open(&state, Some(from), photo, &[], develop_ticket(&state)).unwrap_err(), CATALOG_CHANGED);
         #[cfg(feature = "edit")]
         {
             assert_eq!(zone_masses(&state, Some(from), photo, "{}", None).unwrap_err(), CATALOG_CHANGED);

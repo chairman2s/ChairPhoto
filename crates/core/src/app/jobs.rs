@@ -39,6 +39,7 @@
 //! | Site | Takes |
 //! |---|---|
 //! | [`JobFamily::begin`] | catalog → that family's abort → that family's slot |
+//! | a develop open's claim or close's trip (`editing::DevelopOrder::apply`, #225) | the develop order → catalog → the develop abort → the develop slot → the resident set: the order lock is taken first, with no other lock held, and nothing takes it under another lock |
 //! | [`JobRegistry::lock_for_detach`] (switch phase one) | every abort, then every slot |
 //! | [`JobRegistry::lock_for_publish`] (switch phase two) | every abort |
 //! | [`AbortGeneration::install_fresh`] (sharpness / pHash starts), `scans::claim_import` | one abort, released before the catalog is read |
@@ -594,6 +595,10 @@ pub struct JobRegistry {
     /// opened photo; a switch, exit or catalog change trips it and the image is released.
     #[cfg(all(feature = "raw", feature = "edit"))]
     pub develop: JobFamily<super::DevelopStatus>,
+    /// The order of the develop session's opens and closes (`editing::DevelopOrder`, #225):
+    /// a call made earlier never undoes one made later. Not an abort generation — a catalog
+    /// switch neither reads nor resets it (it trips `develop` itself).
+    pub develop_order: super::editing::DevelopOrder,
 }
 
 impl JobRegistry {
@@ -641,6 +646,7 @@ impl JobRegistry {
             cache: _,
             #[cfg(all(feature = "raw", feature = "edit"))]
             develop,
+            develop_order: _,
         } = self;
         let slots = SlotGuards {
             #[cfg(feature = "faces")]
@@ -693,6 +699,7 @@ impl JobRegistry {
             cache,
             #[cfg(all(feature = "raw", feature = "edit"))]
             develop,
+            develop_order: _,
         } = self;
         Ok(AbortGuards {
             scan: scan.lock()?,

@@ -511,30 +511,59 @@ fn a_failed_first_write_keeps_the_created_version_for_the_retry(cx: &mut TestApp
     assert_eq!(rig.darkroom(cx).read_with(cx, |d, _| d.open.as_ref().unwrap().versions_len), 1);
 }
 
-// --- the develop session's order (#203) -------------------------------------------------------
+// --- the develop session's order (#203, #225) -------------------------------------------------
 
 /// What the develop session's calls did, in the order the worker ran them, and the photo the
-/// session is claimed for afterwards — core's rule: an open claims, a close trips the claim.
+/// session is claimed for afterwards — core's rule: an open claims, a close trips the claim,
+/// and either takes effect only if no call made after it already has (`DevelopOrder`, the
+/// real one on the rig's state). `calls` lists what took effect; `ran` everything that ran.
 #[derive(Default)]
 struct SessionLog {
+    ran: Vec<String>,
     calls: Vec<String>,
     claimed: Option<i64>,
+}
+
+/// What a recorded open answers for `photo_id`: its RAW, resident — so the stage moving to
+/// `w:{photo_id}:1` shows the answer reached the Darkroom.
+fn resident_raw(photo_id: i64) -> DevelopSource {
+    DevelopSource::Raw {
+        camera: "Test".into(),
+        megapixels: 1.0,
+        bits: 16,
+        decoder: "test".into(),
+        token: Some(format!("w:{photo_id}:1")),
+        camera_ev: None,
+        as_shot_wb: None,
+        lens: None,
+    }
 }
 
 fn record_session_calls(rig: &Rig, cx: &mut TestAppContext) -> Arc<std::sync::Mutex<SessionLog>> {
     let log = Arc::new(std::sync::Mutex::new(SessionLog::default()));
     let (on_open, on_close) = (log.clone(), log.clone());
     let calls = super::session::DevelopCalls {
-        open: Arc::new(move |_, _, photo_id, _| {
-            let mut l = on_open.lock().unwrap();
-            l.calls.push(format!("open {photo_id}"));
-            l.claimed = Some(photo_id);
-            Ok(DevelopSource::Jpeg)
+        open: Arc::new(move |state, ticket, _, photo_id, _| {
+            on_open.lock().unwrap().ran.push(format!("open {photo_id}"));
+            let claimed = state.jobs.develop_order.apply(ticket, || {
+                let mut l = on_open.lock().unwrap();
+                l.calls.push(format!("open {photo_id}"));
+                l.claimed = Some(photo_id);
+                Ok(())
+            })?;
+            match claimed {
+                Some(()) => Ok(resident_raw(photo_id)),
+                None => Err(chairphoto_core::app::editing::DEVELOP_SUPERSEDED.into()),
+            }
         }),
-        close: Arc::new(move |_| {
-            let mut l = on_close.lock().unwrap();
-            l.calls.push("close".into());
-            l.claimed = None;
+        close: Arc::new(move |state, ticket| {
+            on_close.lock().unwrap().ran.push("close".into());
+            state.jobs.develop_order.apply(ticket, || {
+                let mut l = on_close.lock().unwrap();
+                l.calls.push("close".into());
+                l.claimed = None;
+                Ok(())
+            })?;
             Ok(())
         }),
     };
@@ -551,8 +580,9 @@ fn work_newest_first_then_rest(cx: &mut TestAppContext) {
 
 /// **Forced order** (#203). ← Library and straight back to Develop: the close of the session
 /// left and the open of the new one are both on the pool, and the pool runs the newer first.
-/// The close still runs before the open, so it never trips the claim the open made (core's
-/// `prepare` then stops without a word: the RAW stays "preparing" and nothing autosaves).
+/// The close, made first, takes no effect after the open, so it never trips the claim the
+/// open made (core's `prepare` then stops without a word: the RAW stays "preparing" and
+/// nothing autosaves).
 #[gpui_kit::test]
 fn a_quick_return_to_develop_opens_the_session_after_the_close(cx: &mut TestAppContext) {
     let rig = rig("dk-session-reopen", 2, cx);
@@ -565,13 +595,14 @@ fn a_quick_return_to_develop_opens_the_session_after_the_close(cx: &mut TestAppC
     assert_eq!(rig.open_photo(cx), Some(p));
     work_newest_first_then_rest(cx);
     let log = log.lock().unwrap();
-    assert_eq!(log.calls, ["close".to_string(), format!("open {p}")], "the close first");
+    assert_eq!(log.ran, [format!("open {p}"), "close".to_string()], "the pool ran the open first");
+    assert_eq!(log.calls, [format!("open {p}")], "the late close took no effect");
     assert_eq!(log.claimed, Some(p), "the session is held for the photo on the stage");
 }
 
 /// **Forced order** (#203). Two quick steps (→ →): the first step's open is overtaken on the
-/// pool by the second's. The opens run in the order made, so the session ends up claimed for
-/// the photo on the stage, not the one stepped past.
+/// pool by the second's. The older open takes no effect after the newer one, so the session
+/// ends up claimed for the photo on the stage, not the one stepped past.
 #[gpui_kit::test]
 fn quick_steps_claim_the_session_for_the_last_photo(cx: &mut TestAppContext) {
     let rig = rig("dk-session-steps", 3, cx);
@@ -586,6 +617,42 @@ fn quick_steps_claim_the_session_for_the_last_photo(cx: &mut TestAppContext) {
     let log = log.lock().unwrap();
     assert_eq!(log.calls.last(), Some(&format!("open {}", order[2])), "{:?}", log.calls);
     assert_eq!(log.claimed, Some(order[2]), "{:?}", log.calls);
+}
+
+/// **Forced order** (#225, review probe P6). The open of photo 2 stalls on the worker (a RAW
+/// header on a share that stopped answering); the user steps on to photo 3. Photo 3's open
+/// runs at once — it does not wait behind the stuck one — claims the session, and its RAW
+/// reaches the stage. When photo 2's open finally answers it takes nothing: the session
+/// stays photo 3's, and the stage stays on photo 3's RAW.
+#[gpui_kit::test]
+fn a_stuck_open_does_not_hold_back_the_next_photos_session(cx: &mut TestAppContext) {
+    let rig = rig("dk-session-stuck", 3, cx);
+    let order = rig.app.wired.shell.read_with(cx, |s, _| s.library.photo_ids());
+    work(cx);
+    let log = record_session_calls(&rig, cx);
+    assert!(rig.view(cx).update(cx, |v, cx| v.step(1, None, cx)));
+    cx.run_until_parked();
+    let stuck = cx.update(|cx| Runner::get(cx).hold_pending());
+    assert!(!stuck.is_empty(), "photo 2's open is on the worker");
+    assert!(rig.view(cx).update(cx, |v, cx| v.step(1, None, cx)));
+    cx.run_until_parked();
+    assert_eq!(rig.open_photo(cx), Some(order[2]));
+    work(cx);
+    {
+        let log = log.lock().unwrap();
+        assert_eq!(log.ran, [format!("open {}", order[2])], "photo 3's open ran while photo 2's is stuck");
+        assert_eq!(log.claimed, Some(order[2]));
+    }
+    let working = SourceToken::Working { photo_id: order[2], generation: 1 };
+    assert_eq!(rig.last_edit_job().source, working, "photo 3's RAW is on the stage");
+
+    cx.update(|cx| Runner::get(cx).release(stuck));
+    work(cx);
+    let log = log.lock().unwrap();
+    assert_eq!(log.ran, [format!("open {}", order[2]), format!("open {}", order[1])], "photo 2's open answered late");
+    assert_eq!(log.calls, [format!("open {}", order[2])], "and took nothing");
+    assert_eq!(log.claimed, Some(order[2]), "the session is still photo 3's");
+    assert_eq!(rig.last_edit_job().source, working, "the stage did not move");
 }
 
 /// The filmstrip: → steps to the next photo in the Library's order (saving first), arrows

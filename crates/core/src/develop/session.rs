@@ -14,6 +14,7 @@
 use crate::app::{CoreEvent, EventSink};
 use super::{release_all, with_resident};
 use crate::app::jobs::{JobClaim, JobStatus};
+use crate::app::editing::{DevelopTicket, DEVELOP_SUPERSEDED};
 use crate::app::AppState;
 use crate::develop_source::{DevelopSource, LensInfo};
 use crate::plugins::edit::{SourceToken, WorkingImage};
@@ -141,8 +142,13 @@ pub(crate) fn claim(
 /// `neighbours` (resolved paths, N+1 first). Returns the state right now:
 /// `Preview{preparing:true}` while the load runs, `Raw{token}` when the image is already
 /// resident (the same photo, or a preloaded neighbour), or the honest exceptions.
+///
+/// The claim takes effect only if `ticket` is newer than every open or close that already
+/// has (`editing::DevelopOrder`); a stale open claims nothing and answers
+/// [`DEVELOP_SUPERSEDED`](crate::app::editing::DEVELOP_SUPERSEDED).
 pub fn open(
     state: &AppState,
+    ticket: DevelopTicket,
     photo_id: i64,
     path: PathBuf,
     probe: DevelopSource,
@@ -150,7 +156,11 @@ pub fn open(
 ) -> Result<DevelopSource, String> {
     let prep = prep_settings(state);
     let ids: Vec<i64> = if prep.preload { neighbours.iter().map(|(id, _)| *id).collect() } else { Vec::new() };
-    let (claim, answer, current_ready) = match claim(state, photo_id, probe.clone(), &ids)? {
+    let claimed = state.jobs.develop_order.apply(ticket, || claim(state, photo_id, probe.clone(), &ids))?;
+    let Some(claimed) = claimed else {
+        return Err(DEVELOP_SUPERSEDED.into());
+    };
+    let (claim, answer, current_ready) = match claimed {
         Claimed::Ready(source) => return Ok(source),
         Claimed::Adopted(claim, token) => (claim, with_token(probe.clone(), &token), true),
         Claimed::Decode(claim) => (claim, DevelopSource::Preview { preparing: true }, false),
@@ -164,8 +174,14 @@ pub fn open(
     Ok(answer)
 }
 
-/// Trip the claim and release every working image. Idempotent.
-pub fn close(state: &AppState) -> Result<(), String> {
+/// Trip the claim and release every working image. Idempotent. Does nothing if an open made
+/// after this close has already claimed (`editing::DevelopOrder`).
+pub fn close(state: &AppState, ticket: DevelopTicket) -> Result<(), String> {
+    state.jobs.develop_order.apply(ticket, || release(state)).map(|_| ())
+}
+
+/// The close's transition: trip the claim, release every working image.
+fn release(state: &AppState) -> Result<(), String> {
     state.jobs.develop.cancel()?;
     release_all();
     Ok(())
@@ -567,7 +583,7 @@ mod tests {
         }
         let json = serde_json::to_value(current(&state, 1, raw_probe())).unwrap();
         assert_eq!(json["cameraEv"], -1.5);
-        close(&state).unwrap();
+        close(&state, crate::app::editing::develop_ticket(&state)).unwrap();
         a.slot.clear();
     }
 
@@ -581,12 +597,12 @@ mod tests {
         let ta = token_of(&a, 1);
         assert_eq!(publish(&a, 1, &ta, test_image(8, 8)), Published::Resident);
 
-        close(&state).unwrap();
+        close(&state, crate::app::editing::develop_ticket(&state)).unwrap();
 
         assert!(a.abort.load(Ordering::Relaxed));
         assert!(resident(&ta).is_none());
         assert_eq!(resident_bytes(), 0);
-        close(&state).unwrap(); // idempotent
+        close(&state, crate::app::editing::develop_ticket(&state)).unwrap(); // idempotent
         // The slot is still the worker's to clear (close trips; it does not unpublish), and
         // the photo reads as preparing until it does — the frontend has left anyway.
         a.slot.clear();
@@ -672,6 +688,68 @@ mod tests {
         assert_eq!(resident_bytes(), 0);
     }
 
+    // --- the order of opens and closes (#203, #225) ---------------------------------------
+
+    /// **Forced order.** ← Library and straight back: the pool runs the new open's claim
+    /// before the close made ahead of it. The close then takes no effect — the newer claim's
+    /// worker is not tripped and its slot and image stay.
+    #[test]
+    fn a_close_made_before_an_open_does_not_trip_the_open_that_ran_first() {
+        let _serial = serial();
+        let (state, _dir) = state();
+        let order = &state.jobs.develop_order;
+        let (t_close, t_open) = (order.ticket(), order.ticket());
+        let b = match order.apply(t_open, || claim(&state, 2, raw_probe(), &[])).unwrap() {
+            Some(Claimed::Decode(b)) => b,
+            _ => panic!("the open claims"),
+        };
+        let tb = token_of(&b, 2);
+        assert_eq!(publish(&b, 2, &tb, test_image(8, 8)), Published::Resident);
+
+        close(&state, t_close).unwrap();
+
+        assert!(!b.abort.load(Ordering::Relaxed), "the late close did not trip the newer claim");
+        assert!(resident(&tb).is_some(), "nor release its image");
+        let status = state.jobs.develop.status().unwrap().unwrap();
+        assert_eq!((status.job, status.photo_id, status.resident), (b.job, 2, true));
+        // A close made after the open still releases it.
+        close(&state, order.ticket()).unwrap();
+        assert!(b.abort.load(Ordering::Relaxed));
+        assert!(resident(&tb).is_none());
+    }
+
+    /// **Forced order** (#225, probe P6). The open of photo 2 is stuck reading its RAW header;
+    /// photo 3's open, made later, claims meanwhile. When photo 2's open reaches its claim it
+    /// takes nothing — photo 3's worker runs on — and answers that it was superseded. An open
+    /// older than a close that took effect claims nothing either.
+    #[test]
+    fn an_open_that_answers_after_a_newer_one_claims_nothing() {
+        let _serial = serial();
+        let (state, dir) = state();
+        let order = &state.jobs.develop_order;
+        let (t2, t3) = (order.ticket(), order.ticket());
+        let b = match order.apply(t3, || claim(&state, 3, raw_probe(), &[])).unwrap() {
+            Some(Claimed::Decode(b)) => b,
+            _ => panic!("the newer open claims"),
+        };
+
+        let late = open(&state, t2, 2, dir.join("photos/2.ARW"), raw_probe(), Vec::new());
+
+        assert_eq!(late.unwrap_err(), DEVELOP_SUPERSEDED);
+        assert!(!b.abort.load(Ordering::Relaxed), "photo 3's worker runs on");
+        let status = state.jobs.develop.status().unwrap().unwrap();
+        assert_eq!((status.job, status.photo_id), (b.job, 3));
+
+        let (t_open, t_close) = (order.ticket(), order.ticket());
+        close(&state, t_close).unwrap();
+        assert!(b.abort.load(Ordering::Relaxed), "the close took effect");
+        let late = open(&state, t_open, 4, dir.join("photos/4.ARW"), raw_probe(), Vec::new());
+        assert_eq!(late.unwrap_err(), DEVELOP_SUPERSEDED);
+        let status = state.jobs.develop.status().unwrap().unwrap();
+        assert_eq!(status.photo_id, 3, "no claim was made for photo 4");
+        b.slot.clear();
+    }
+
     /// The session status stays after the worker's success (it describes the open photo,
     /// not the worker), so a remount re-attaches to the resident image; after Develop is
     /// closed the same status reads as "not resident", never as preparing forever.
@@ -688,7 +766,7 @@ mod tests {
             Claimed::Ready(DevelopSource::Raw { token: Some(q), .. }) => assert_eq!(q, t.to_query()),
             _ => panic!("reopening the resident photo must answer at once"),
         }
-        close(&state).unwrap();
+        close(&state, crate::app::editing::develop_ticket(&state)).unwrap();
         assert!(matches!(current(&state, 1, raw_probe()), DevelopSource::Raw { token: None, .. }));
     }
 

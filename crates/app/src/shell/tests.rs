@@ -557,3 +557,39 @@ fn a_failed_boot_never_leaves_the_splash_up(cx: &mut TestAppContext) {
     cx.run_until_parked();
     assert!(!splash(&app, cx).showing());
 }
+
+/// #218: the splash logo's white sliver sits centred on the red/blue seam, 46% of the disc's
+/// width from the left and 8% wide, running its full height — the part of the shape a
+/// headless test can check. The disc itself (`rounded_full()`, a red/blue gradient fill) is
+/// not observable here: `ElementSnapshot` exposes bounds, not a background/gradient accessor.
+#[gpui_kit::test]
+fn the_splash_logos_white_sliver_sits_on_the_red_blue_seam(cx: &mut TestAppContext) {
+    use crate::shell::splash::Splash;
+    use gpui_kit::px;
+    let app = start(cx);
+    app.wired.model.update(cx, |m, cx| {
+        m.splash = Splash::booting();
+        cx.notify();
+    });
+    cx.update_window(app.window(), |_, window, cx| {
+        window.render_frame(cx);
+        let logo = window.find("splash-logo").bounds();
+        let seam = window.find("splash-logo-seam").bounds();
+        assert_eq!(logo.size.width, px(64.), "the disc is 64 px square");
+        assert_eq!(logo.size.height, px(64.));
+        assert_eq!(seam.size.height, logo.size.height, "the sliver runs the disc's full height");
+        let expected_left = logo.origin.x + logo.size.width * 0.46;
+        let expected_width = logo.size.width * 0.08;
+        assert!(
+            (seam.origin.x - expected_left).abs() < px(0.5),
+            "the sliver starts at 46% of the disc: {:?} vs {expected_left:?}",
+            seam.origin.x,
+        );
+        assert!(
+            (seam.size.width - expected_width).abs() < px(0.5),
+            "the sliver is 8% of the disc wide: {:?} vs {expected_width:?}",
+            seam.size.width,
+        );
+    })
+    .unwrap();
+}

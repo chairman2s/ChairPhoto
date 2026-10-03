@@ -136,7 +136,8 @@ export function QuickTagGroups({
   useEffect(() => {
     if (activeId == null) return setMembers([]);
     const load = activeId === RECENT_ID ? recentlyUsedTags(10) : getGroupMembers(activeId);
-    load.then(setMembers).catch(() => setMembers([]));
+    // A group can hold an auto-tag; its button would only be refused (#181).
+    load.then((m) => setMembers(m.filter((t) => !t.autoRule))).catch(() => setMembers([]));
   }, [activeId, reloadKey]);
 
   const targetLabel = selectionCount > 1 ? ` → ${selectionCount} selected` : "";

@@ -556,6 +556,7 @@ export function PhotoInspector({
         .filter(
           (t) =>
             !assignedIds.has(t.id) &&
+            !t.autoRule && // auto-tags are the catalog's to assign (#181)
             (t.fullPath.toLowerCase().includes(query) || t.name.toLowerCase().includes(query)),
         )
         .sort((a, b) => {
@@ -782,21 +783,28 @@ export function PhotoInspector({
             <div className="ins-label">Tags</div>
             <div className="tag-list">
               {tags.map((t) => (
-                <span key={t.id} className="assigned-tag" title={t.fullPath}>
+                <span
+                  key={t.id}
+                  className="assigned-tag"
+                  title={t.autoRule ? `${t.fullPath} · auto-tag (${t.autoRule})` : t.fullPath}
+                >
                   {t.name}
-                  <button
-                    className="tag-remove"
-                    onClick={() =>
-                      // Remove from the whole selection, not just the active photo, then
-                      // refresh this panel's list (shows the active photo's tags).
-                      Promise.resolve(onRemoveTag(t.id)).then(() => {
-                        refreshTags();
-                        onChanged();
-                      })
-                    }
-                  >
-                    ×
-                  </button>
+                  {/* An auto-tag has no ×: the catalog assigns it (#181). */}
+                  {!t.autoRule && (
+                    <button
+                      className="tag-remove"
+                      onClick={() =>
+                        // Remove from the whole selection, not just the active photo, then
+                        // refresh this panel's list (shows the active photo's tags).
+                        Promise.resolve(onRemoveTag(t.id)).then(() => {
+                          refreshTags();
+                          onChanged();
+                        })
+                      }
+                    >
+                      ×
+                    </button>
+                  )}
                 </span>
               ))}
               {tags.length === 0 && <span className="panel-empty">none</span>}

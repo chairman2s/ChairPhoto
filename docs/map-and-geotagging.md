@@ -40,7 +40,11 @@ as owned by the module.
   The scanner calls `apply_fences_to_photo` for new photos.
 - Adding or editing a fence gives you an explicit **Apply** action that re-scans and
   backfills matches — `apply_fence(fence_id)` for one, `apply_all_fences()` for all.
-  Re-applying is idempotent.
+  Re-applying is idempotent. A fence whose tag path is an auto-tag's can't tag by hand
+  (#181): `apply_fence` refuses it before writing anything, the import hook skips it, and
+  `apply_all_fences` skips it, applies every other fence, and reports the applied and
+  skipped fences (the GPUI status line names them; the frozen React command still returns
+  only the count).
 - Assignments are **editable and never auto-removed**. You can hand-correct drift, or add
   the tag to a photo that has no GPS at all.
 

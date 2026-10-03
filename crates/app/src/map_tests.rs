@@ -809,6 +809,42 @@ fn draw_a_fence_save_it_and_apply_it(cx: &mut TestAppContext) {
     assert_eq!(status, "Applied all fences: 2 photos newly tagged.");
 }
 
+/// Review #181 M1: Apply all over an auto-tag fence (Panorama) between two place fences
+/// applies both place fences and says what it applied and what it skipped, instead of
+/// "Failed to apply fence" after writing only part of them.
+#[gpui_kit::test]
+fn apply_all_skips_an_auto_tag_fence_and_says_so(cx: &mut TestAppContext) {
+    let dir = TempDir::new("map-apply-auto");
+    let m = open_map(&dir, &[OSLO], cx);
+    m.click("map-consent-deny", cx);
+    let square = vec![(59.90, 10.74), (59.90, 10.76), (59.92, 10.76), (59.92, 10.74)];
+    {
+        let guard = m.app.state.catalog.lock().unwrap();
+        let c = guard.as_ref().unwrap();
+        let auto = c.create_tag("Technique/Panorama").unwrap();
+        c.conn().execute("UPDATE tags SET auto_rule = 'panorama' WHERE id = ?1", [auto]).unwrap();
+        backend::create_fence_for(c, "A", "Places/A", &square).unwrap();
+        backend::create_fence_for(c, "Pano", "Technique/Panorama", &square).unwrap();
+        backend::create_fence_for(c, "C", "Places/C", &square).unwrap();
+    }
+    let state = m.view(cx).read_with(cx, |v, _| v.state.clone());
+    state.update(cx, |s, cx| s.reload_fences(cx));
+    work(&m.app, cx);
+
+    m.click("map-apply-all", cx);
+    let status = m.app.wired.model.read_with(cx, |m, _| m.status.to_string());
+    assert_eq!(
+        status,
+        "Applied 2 of 3 fences: 2 photos newly tagged. Skipped \u{201c}Pano\u{201d} \u{2014} an auto-tag can't be \
+         assigned by a fence."
+    );
+    let guard = m.app.state.catalog.lock().unwrap();
+    let mut paths: Vec<String> =
+        guard.as_ref().unwrap().get_photo_tags(m.ids[0]).unwrap().into_iter().map(|t| t.full_path).collect();
+    paths.sort();
+    assert_eq!(paths, ["Places/A", "Places/C"]);
+}
+
 /// Dragging a fence's vertex reshapes it live and saves the new polygon on release.
 #[gpui_kit::test]
 fn dragging_a_vertex_saves_the_new_shape(cx: &mut TestAppContext) {

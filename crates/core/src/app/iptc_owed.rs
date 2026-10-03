@@ -39,16 +39,16 @@ fn with_bound<T>(
 }
 
 /// Dismiss the row a front end showed: stop owing the photo's IPTC without writing
-/// ([`Catalog::dismiss_owed_iptc`], compare-and-set on `uuid` + `generation`). `Ok(false)`
-/// when a newer store owes something since the row was read, or the photo is gone: nothing
-/// was dismissed, and the front end re-reads the list. Blocking (SQLite).
+/// ([`Catalog::dismiss_owed_iptc`], compare-and-set on `uuid` + `generation`). Answers
+/// whether it dismissed, or why not: the photo is gone, or its debt changed since the row was
+/// read. Either way the front end re-reads the list. Blocking (SQLite).
 pub fn dismiss_owed_iptc_as(
     state: &AppState,
     expected: Option<CatalogIdentity>,
     photo_id: i64,
     uuid: &str,
     generation: i64,
-) -> Result<bool, String> {
+) -> Result<crate::catalog::OwedDismissal, String> {
     with_bound(state, expected, |c| c.dismiss_owed_iptc(photo_id, uuid, generation)).map(|(_, done)| done)
 }
 
@@ -132,7 +132,7 @@ pub fn retry_owed_iptc_as(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::catalog::{IptcFields, IptcMask};
+    use crate::catalog::{IptcFields, IptcMask, OwedDismissal};
     use crate::xmp::test_fixtures::{foreign_iptc, iptc, with, LIGHTROOM};
 
     /// A catalog with one photo whose sidecar is the Lightroom fixture, open in an AppState.
@@ -233,9 +233,9 @@ mod tests {
         let row = owe(&state, id, &titled("Mine"));
         let other = format!("{}-not", row.uuid);
         assert_eq!(retry_owed_iptc_as(&state, None, id, &other).unwrap_err(), OWED_PHOTO_GONE);
-        assert!(!dismiss_owed_iptc_as(&state, None, id, &other, row.generation).unwrap());
+        assert_eq!(dismiss_owed_iptc_as(&state, None, id, &other, row.generation).unwrap(), OwedDismissal::Gone);
         assert_eq!(c(&state, |c| c.owed_iptc(id).unwrap()), IptcMask::TITLE, "still owed, unwritten");
-        assert!(dismiss_owed_iptc_as(&state, None, id, &row.uuid, row.generation).unwrap());
+        assert_eq!(dismiss_owed_iptc_as(&state, None, id, &row.uuid, row.generation).unwrap(), OwedDismissal::Dismissed);
         assert_eq!(c(&state, |c| c.owed_iptc(id).unwrap()), IptcMask::NONE);
     }
 

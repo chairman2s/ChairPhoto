@@ -8,6 +8,7 @@ import {
   IdentityRepairStatus,
   IdentityRepairSummary,
   IptcSaveOutcome,
+  OwedDismissal,
   OwedIptc,
   PendingIdentity,
   PendingIdentityField,
@@ -239,17 +240,21 @@ export function pagingLabel(offset: number, shown: number, total: number | null)
 /** Page size of the owed-IPTC list (#153). */
 export const OWED_PAGE_SIZE = 100;
 
-/** What a Dismiss or Retry of one owed-IPTC row did: `dismissed: false` means nothing was
- *  (the photo's IPTC changed since the list was read, or the photo is gone). */
-export type OwedAction = { dismissed: boolean } | { retried: IptcSaveOutcome | null };
+/** What a Dismiss or Retry of one owed-IPTC row did. */
+export type OwedAction = { dismissed: OwedDismissal } | { retried: IptcSaveOutcome | null };
 
 /** The line after a Dismiss or Retry, stated from what the backend answered (the GPUI
- *  panel's `owed_action_message`). */
+ *  panel's `owed_action_message`). A refused Dismiss says why: gone or changed. */
 export function owedActionMessage(done: OwedAction): string {
   if ("dismissed" in done) {
-    return done.dismissed
-      ? "Dismissed. The catalog keeps its IPTC; the sidecar was not written."
-      : "Not dismissed: this photo's IPTC changed since the list was read. Check the refreshed row.";
+    switch (done.dismissed) {
+      case "dismissed":
+        return "Dismissed. The catalog keeps its IPTC; the sidecar was not written.";
+      case "gone":
+        return "Not dismissed: this photo is no longer in the catalog.";
+      default:
+        return "Not dismissed: this photo's owed IPTC changed since the list was read. Check the refreshed row.";
+    }
   }
   const o = done.retried;
   if (!o) return "Still pending.";

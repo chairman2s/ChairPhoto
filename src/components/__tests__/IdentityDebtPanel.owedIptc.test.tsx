@@ -22,7 +22,7 @@ import type { OwedIptc } from "../../modules/api";
 let calls: Array<{ command: string; args: Record<string, unknown> }> = [];
 let owed: OwedIptc[] = [];
 let summary = { total: 0, conflicts: 0, dismissed: 0, iptcOwed: 2 };
-let dismissAnswer: boolean | Error = true;
+let dismissAnswer: "dismissed" | "changed" | "gone" = "dismissed";
 let retryAnswer: unknown = { sidecar: "written", reason: null };
 
 vi.mock("@tauri-apps/api/core", async (importOriginal) => {
@@ -41,9 +41,9 @@ vi.mock("@tauri-apps/api/core", async (importOriginal) => {
         case "list_volumes":
           return Promise.resolve([]);
         case "dismiss_owed_iptc":
-          return dismissAnswer instanceof Error ? Promise.reject(dismissAnswer.message) : Promise.resolve(dismissAnswer);
+          return Promise.resolve(dismissAnswer);
         case "retry_owed_iptc":
-          return Promise.resolve(retryAnswer);
+          return retryAnswer instanceof Error ? Promise.reject(retryAnswer.message) : Promise.resolve(retryAnswer);
         default:
           return Promise.resolve(null);
       }
@@ -70,7 +70,7 @@ beforeEach(() => {
   calls = [];
   owed = [row(), row({ photoId: 9, uuid: "uuid-9", path: "2026/03/DSC9.ARW", fields: ["Creator"], error: "", attempts: 0, generation: 1 })];
   summary = { total: 0, conflicts: 0, dismissed: 0, iptcOwed: 2 };
-  dismissAnswer = true;
+  dismissAnswer = "dismissed";
   retryAnswer = { sidecar: "written", reason: null };
 });
 
@@ -123,11 +123,19 @@ describe("the owed-IPTC list", () => {
   });
 
   it("a Dismiss the backend refused (a newer save owes) says so and is not reported as done", async () => {
-    dismissAnswer = false;
+    dismissAnswer = "changed";
     render(<IdentityDebtPanel onClose={() => {}} />);
     fireEvent.click(within(await screen.findByTestId("owed-row-7")).getByRole("button", { name: "Dismiss" }));
-    await screen.findByText(/^Not dismissed: this photo's IPTC changed/);
+    await screen.findByText(/^Not dismissed: this photo's owed IPTC changed/);
     expect(screen.queryByText(/^Dismissed\./)).toBeNull();
+  });
+
+  it("a Dismiss of a photo no longer in the catalog says it is gone, not changed (review L3)", async () => {
+    dismissAnswer = "gone";
+    render(<IdentityDebtPanel onClose={() => {}} />);
+    fireEvent.click(within(await screen.findByTestId("owed-row-7")).getByRole("button", { name: "Dismiss" }));
+    await screen.findByText("Not dismissed: this photo is no longer in the catalog.");
+    expect(screen.queryByText(/changed since the list was read/)).toBeNull();
   });
 
   it("Retry sends the row's photo and UUID and reports what the backend answered", async () => {
@@ -144,9 +152,10 @@ describe("the owed-IPTC list", () => {
 
   it("a refusal is shown verbatim and changes no count", async () => {
     const onCountsChanged = vi.fn();
-    dismissAnswer = new Error("This photo is no longer in the catalog");
+    // What `retry_owed_iptc` rejects with when the id no longer names the row's photo.
+    retryAnswer = new Error("This photo is no longer in the catalog");
     render(<IdentityDebtPanel onClose={() => {}} onCountsChanged={onCountsChanged} />);
-    fireEvent.click(within(await screen.findByTestId("owed-row-7")).getByRole("button", { name: "Dismiss" }));
+    fireEvent.click(within(await screen.findByTestId("owed-row-7")).getByRole("button", { name: "Retry" }));
     await screen.findByText("This photo is no longer in the catalog");
     expect(onCountsChanged).not.toHaveBeenCalled();
   });
@@ -154,8 +163,9 @@ describe("the owed-IPTC list", () => {
 
 describe("owedActionMessage", () => {
   it("states each answer from the backend's result", () => {
-    expect(owedActionMessage({ dismissed: true })).toMatch(/^Dismissed\./);
-    expect(owedActionMessage({ dismissed: false })).toMatch(/^Not dismissed/);
+    expect(owedActionMessage({ dismissed: "dismissed" })).toMatch(/^Dismissed\./);
+    expect(owedActionMessage({ dismissed: "changed" })).toMatch(/^Not dismissed: this photo's owed IPTC changed/);
+    expect(owedActionMessage({ dismissed: "gone" })).toBe("Not dismissed: this photo is no longer in the catalog.");
     expect(owedActionMessage({ retried: { sidecar: "written", reason: null } })).toBe("Written to the sidecar.");
     expect(owedActionMessage({ retried: { sidecar: "unchanged", reason: null } })).toMatch(/^Nothing is owed any more/);
     expect(owedActionMessage({ retried: { sidecar: "pending", reason: null } })).toBe("Still pending.");

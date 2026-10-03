@@ -1775,11 +1775,14 @@ export interface OwedIptc {
  *  `PendingIdentitySummary.iptcOwed` for the total. */
 export const listOwedIptc = (limit: number, offset: number) =>
   invoke<OwedIptc[]>("list_owed_iptc", { limit, offset });
+/** What `dismissOwedIptc` did: `changed` — not dismissed, the photo's owed IPTC changed since
+ *  the row was read (a newer save owes, or it was paid); `gone` — not dismissed, the photo is
+ *  no longer in the catalog (removed, or its id taken by another photo). */
+export type OwedDismissal = "dismissed" | "changed" | "gone";
 /** Stop owing one photo's IPTC without writing (the catalog keeps its values, the sidecar
- *  keeps what it has). `false` when nothing was dismissed: the photo's IPTC changed since
- *  the row was read, or the photo is gone — re-read the list. */
+ *  keeps what it has). Re-read the list afterwards, whatever the answer. */
 export const dismissOwedIptc = (photoId: number, uuid: string, generation: number) =>
-  invoke<boolean>("dismiss_owed_iptc", { photoId, uuid, generation });
+  invoke<OwedDismissal>("dismiss_owed_iptc", { photoId, uuid, generation });
 /** Write one photo's owed IPTC into its sidecar now. Answers like `setIptc`. */
 export const retryOwedIptc = (photoId: number, uuid: string) =>
   invoke<IptcSaveOutcome>("retry_owed_iptc", { photoId, uuid });

@@ -613,6 +613,43 @@ fn the_edit_in_list_follows_an_editor_saved_in_preferences(cx: &mut TestAppConte
     assert_eq!(seen.get(), 1, "the path save announced the change");
 }
 
+/// Review L3 (#161): a save fires on blur, so the Editors section is often gone before its
+/// worker returns — another tab clicked, or Preferences closed. The setting is stored and the
+/// inspector re-reads anyway.
+#[gpui_kit::test]
+fn the_edit_in_list_follows_a_save_that_lands_after_the_section_is_gone(cx: &mut TestAppContext) {
+    for leave_by_closing in [false, true] {
+        let dir = TempDir::new(if leave_by_closing { "prefs-editors-close" } else { "prefs-editors-tab" });
+        let app = start(cx);
+        open_catalog_with_photos(&app, &dir, 1, cx);
+        put_setting(&app, crate::preferences::editors::RAPIDRAW_BIN_KEY, "/nonexistent/rapidraw");
+        work(cx);
+        let insp = app.wired.root.as_ref().unwrap().read_with(cx, |r, _| r.inspector.clone());
+        assert_eq!(insp.read_with(cx, |i, _| i.editors.as_ref().map(|e| e.rapidraw)), Some(false));
+        let bin = dir.0.join("rapidraw");
+        std::fs::write(&bin, b"#!/bin/sh\n").unwrap();
+        let p = open(&app, cx);
+        tab(&app, "prefs-tab-editors", cx);
+        let (e, _) = editors(&p, cx);
+        e.update(cx, |e, cx| e.save_rapidraw(crate::preferences::editors::RAPIDRAW_BIN_KEY, bin.to_string_lossy().into(), cx));
+        let section = e.downgrade();
+        drop((e, p));
+        if leave_by_closing {
+            close_dialog(&app, cx);
+        } else {
+            click(&app, "prefs-tab-storage", cx);
+        }
+        assert!(section.upgrade().is_none(), "the section is gone before the save lands");
+        work(cx);
+        assert_eq!(setting(&app, crate::preferences::editors::RAPIDRAW_BIN_KEY).as_deref(), bin.to_str(), "stored");
+        assert_eq!(
+            insp.read_with(cx, |i, _| i.editors.as_ref().map(|e| e.rapidraw)),
+            Some(true),
+            "re-checked although the section was gone (closing Preferences: {leave_by_closing})"
+        );
+    }
+}
+
 /// Editors: a path override saves under React's key and re-checks availability; RapidRAW's
 /// format saves. Darkroom: the stored values load; the cache size normalises and saves; preload,
 /// white balance and render timing save React's values.

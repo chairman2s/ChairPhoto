@@ -5,9 +5,12 @@
 //!
 //! React's picker filtered to `.chairphoto` (`pickBundleFile`). GPUI's `PathPromptOptions`
 //! has no filter field, and its Linux portal request sets none (gpui-pre-linux 0.3.7
-//! `prompt_for_paths`; shell-apis.md § 5), so a picked file that does not end in
-//! `.chairphoto` (any case, [`is_bundle_path`]) is refused here with a message instead of
-//! being opened. A typed path is checked by the core's preview.
+//! `prompt_for_paths`; shell-apis.md § 5). The name is not what makes a bundle — the core's
+//! preview opens it and checks its zip and manifest — so a picked file is previewed like a
+//! typed path, whatever it is called: a real bundle a download or mail client renamed
+//! (`trip.chairphoto.zip`, `trip`) is accepted, and anything else is refused with the core's
+//! reason. A refused file not named `.chairphoto` says plainly that it is not a bundle
+//! ([`preview_error`]).
 
 use super::state::{bundle_import_line, StorageEvent};
 use super::ui;
@@ -20,10 +23,22 @@ use gpui_kit::prelude::*;
 use gpui_kit::TestSupportExt as _;
 use gpui_kit::{div, Context, Entity, EventEmitter, PathPromptOptions, Subscription, Window};
 
-/// Whether a picked file is a bundle by its name: it ends in `.chairphoto`, in any case (what
-/// React's picker filter let through).
+/// Whether a file is named like a bundle: it ends in `.chairphoto`, in any case (what React's
+/// picker filter let through). Only the wording of a refusal depends on it.
 pub fn is_bundle_path(path: &std::path::Path) -> bool {
     path.extension().is_some_and(|e| e.eq_ignore_ascii_case("chairphoto"))
+}
+
+/// The dialog's line for a preview the core refused (`core`: its reason). A file not named
+/// `.chairphoto` is most likely not a bundle at all, and says so first.
+pub fn preview_error(path: &str, core: &str) -> String {
+    let p = expand_home(path);
+    if is_bundle_path(&p) {
+        format!("Could not read bundle: {core}")
+    } else {
+        let name = p.file_name().map_or_else(|| path.to_string(), |n| n.to_string_lossy().to_string());
+        format!("{name} is not a ChairPhoto bundle ({core}).")
+    }
 }
 
 pub struct BundleImport {
@@ -100,6 +115,7 @@ impl BundleImport {
         let seq = self.preview_seq;
         self.previewing = true;
         let state = self.app.clone();
+        let shown = path.clone();
         let rx = Runner::get(cx)
             .run(move || chairphoto_core::app::bundles::preview_bundle(&state, &expand_home(&path)));
         cx.spawn(async move |this, cx| {
@@ -111,7 +127,7 @@ impl BundleImport {
                 s.previewing = false;
                 match result {
                     Ok(p) => s.preview = Some(p),
-                    Err(e) => s.error = Some(format!("Could not read bundle: {e}")),
+                    Err(e) => s.error = Some(preview_error(&shown, &e)),
                 }
                 cx.notify();
             })
@@ -137,12 +153,8 @@ impl BundleImport {
             };
             this.update_in(cx, |s, window, cx| match picked {
                 Ok(Some(path)) => {
+                    // Previewed like a typed path: the core's check of the contents decides.
                     let text = path.to_string_lossy().to_string();
-                    if !is_bundle_path(&path) {
-                        s.error = Some(format!("Not a .chairphoto bundle: {text}"));
-                        cx.notify();
-                        return;
-                    }
                     s.path.update(cx, |i, cx| i.set_value(text.clone(), window, cx));
                     s.check(Some(text), cx);
                 }

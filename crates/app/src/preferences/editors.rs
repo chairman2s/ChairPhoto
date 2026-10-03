@@ -21,7 +21,6 @@ use crate::storage::ui;
 use chairphoto_core::external_edit::{available_editors, AvailableEditor};
 use chairphoto_core::rapidraw::rapidraw_available;
 use chairphoto_model::darkroom::kelvin::{WbPrefer, WB_SLIDER_KEY};
-use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::Disableable as _;
 use gpui_kit::prelude::*;
@@ -490,8 +489,9 @@ impl Render for DarkroomSection {
                 colors,
             ))
             .child(
-                Checkbox::new("darkroom-preload")
-                    .label("Prepare the next and previous photo in the background")
+                ui::checkbox("darkroom-preload", "Prepare the next and previous photo in the background")
+                    // Preferences' rows inherit the 13 px body text.
+                    .text_size(px(13.))
                     .checked(self.preload.unwrap_or(true))
                     .disabled(self.preload.is_none())
                     .on_change(cx.listener(|s, on: &bool, _, cx| s.set_preload(*on, cx))),
@@ -501,8 +501,8 @@ impl Render for DarkroomSection {
             body = body.child(status("darkroom-parity", p.clone(), colors));
         }
         body = body.child(
-            Checkbox::new("darkroom-timing")
-                .label("Log render timings to the console (dev)")
+            ui::checkbox("darkroom-timing", "Log render timings to the console (dev)")
+                .text_size(px(13.))
                 .checked(self.timing.unwrap_or(false))
                 .disabled(self.timing.is_none())
                 .on_change(cx.listener(|s, on: &bool, _, cx| s.set_timing(*on, cx))),

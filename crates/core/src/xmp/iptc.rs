@@ -7,7 +7,8 @@ use crate::catalog::{IptcFields, IptcMask};
 use super::document::SidecarDocument;
 use super::dom::{child, element_children, first_text, is_rdf, lang_alt, plain, seq_creator};
 use super::ns::{NS_DC, NS_IPTC, NS_PHOTOSHOP, NS_RDF};
-use super::parse::{ns_attr, parse_xml};
+use super::parse::ns_attr;
+use super::repair::parse_for_read;
 use super::sidecar_path;
 
 /// One property [`write_iptc`] manages: its (namespace, local name) and the catalog field
@@ -106,7 +107,7 @@ pub fn read_iptc_present(photo_path: &Path) -> Result<IptcMask, String> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(IptcMask::NONE),
         Err(e) => return Err(e.to_string()),
     };
-    let root = parse_xml(file)?;
+    let root = parse_for_read(file)?;
     let Some(rdf) = root.get_child(("RDF", NS_RDF)) else {
         return Ok(IptcMask::NONE);
     };

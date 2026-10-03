@@ -18,13 +18,15 @@
 //! | [`lock`] | Per-sidecar serialisation: the file lock and the write order (#149). |
 //! | `iptc.rs` | The `MANAGED` IPTC property table, [`write_iptc`], [`write_iptc_fields`], [`read_iptc_present`]. |
 //! | `keywords.rs` | [`write_keywords`] (export copies only: `dc:subject`, `lr:hierarchicalSubject`). |
-//! | `identity.rs` | [`read_identifier`], [`write_identifier`], [`overwrite_identifier`], [`write_import_batch`], [`read_import_batch`]. |
+//! | `identity.rs` | [`read_identifier`], [`read_identifiers`], [`write_identifier`], [`overwrite_identifier`], [`write_import_batch`], [`read_import_batch`]. |
 //! | `gps.rs` | [`write_gps`], [`read_gps`], [`decimal_to_dms_lat`] / [`decimal_to_dms_lng`]. |
 //! | `regions/mod.rs` | Face regions' public API: [`FaceRegion`], [`ReadRegion`], [`RegionSet`], [`RegionWriteError`], [`write_face_regions`], [`write_face_regions_gathered`], [`read_face_regions`], [`read_face_regions_in`], [`region_iou`]. |
 //! | `regions/frame.rs` | [`RegionFrame`], EXIF-orientation point maps, and which frame a `Regions` declares (`region_target`). |
 //! | `regions/mwg.rs` | MWG element construction and parsing: `Regions` layout, struct forms, one region `rdf:li`. |
 //! | `regions/reconcile.rs` | In-place edit of an existing `Regions`: the `chairphoto:FaceId` marker, claiming, the pre-marker shape. |
 //! | `parse.rs` | `parse_xml` (keeps qualified attribute names) and namespace-aware attribute lookup. |
+//! | `repair.rs` | Restoring the attribute prefixes pre-#138 releases dropped, when unambiguous (#143). |
+//! | `emit.rs` | Serialising the DOM: the pass that writes every element under a prefix bound to its namespace (#143). |
 //! | `dom.rs` | Generic element navigation and construction helpers, the empty packet skeleton. |
 //! | `ns.rs` | Namespace URI constants. |
 //! | `test_fixtures.rs`, `region_fixtures.rs`, `test_xml.rs` | Test-only: foreign sidecars and independent readers. |
@@ -35,6 +37,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 mod document;
 mod dom;
+mod emit;
 mod gps;
 mod identity;
 mod iptc;
@@ -43,6 +46,7 @@ pub mod lock;
 mod ns;
 mod parse;
 mod regions;
+mod repair;
 #[cfg(test)]
 pub(crate) mod region_fixtures;
 #[cfg(test)]
@@ -53,7 +57,7 @@ mod test_xml;
 mod tests;
 
 pub use gps::{decimal_to_dms_lat, decimal_to_dms_lng, read_gps, write_gps};
-pub use identity::{overwrite_identifier, read_identifier, read_import_batch, write_identifier, write_import_batch};
+pub use identity::{overwrite_identifier, read_identifier, read_identifiers, read_import_batch, write_identifier, write_import_batch};
 pub use iptc::{read_iptc_present, write_iptc, write_iptc_fields};
 pub use keywords::write_keywords;
 pub use regions::{

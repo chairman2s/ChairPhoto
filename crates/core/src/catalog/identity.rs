@@ -234,8 +234,19 @@ fn is_blank_identity(value: &str) -> bool {
 /// Remember that `photo_id` once was `value`, when `value` is a legacy non-UUID identifier,
 /// so a scan can still lead a file whose sidecar carries it back to the row
 /// ([`Catalog::scan_identity`]). A photo keeps the first legacy value it was recorded with.
+///
+/// A value another row already holds is not recorded again (#150, review N3 of #146). The
+/// first row to hold it is the one a person saw it on: v23's re-mint of the row that had it,
+/// or the first file a scan found carrying it. A later holder is a duplicate — the v5 row an
+/// old build's merge left beside a row that v23 then kept apart with a v4 — or another file
+/// sharing a DAM id. Recording it there too would leave the value with two owners, which
+/// [`Catalog::scan_identity`] rightly refuses to choose between, so the real original would
+/// be catalogued again the next time it moved.
 pub(super) const RECORD_LEGACY_IDENTIFIER_SQL: &str =
-    "INSERT INTO photo_legacy_identifiers(photo_id, identifier) VALUES(?1, ?2)
+    "INSERT INTO photo_legacy_identifiers(photo_id, identifier)
+     SELECT ?1, ?2
+     WHERE NOT EXISTS (SELECT 1 FROM photo_legacy_identifiers
+                       WHERE identifier = ?2 AND photo_id <> ?1)
      ON CONFLICT(photo_id) DO NOTHING";
 
 /// Prefixes of `settings` keys that end in a photo's uuid, which a migration that changes the
@@ -547,6 +558,71 @@ pub struct IdentityConflictOutcome {
     /// Where Overwrite preserved the previous sidecar, if it wrote a backup. `None` when a
     /// backup from an earlier write was already there and was deliberately left alone.
     pub sidecar_backup: Option<String>,
+}
+
+/// What to do with every copy whose sidecar carries a non-UUID identifier (#150, L6 of the
+/// #139–#142 review): the bulk form of [`IdentityConflictAction::Overwrite`] and
+/// [`IdentityConflictAction::Dismiss`]. Adopt is not offered — a non-UUID cannot be adopted —
+/// and neither is anything for a UUID conflict, which names another photo's identity and
+/// needs a decision of its own. No default, as for one copy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ForeignConflictAction {
+    Overwrite,
+    Dismiss,
+}
+
+impl ForeignConflictAction {
+    fn single(self) -> IdentityConflictAction {
+        match self {
+            ForeignConflictAction::Overwrite => IdentityConflictAction::Overwrite,
+            ForeignConflictAction::Dismiss => IdentityConflictAction::Dismiss,
+        }
+    }
+}
+
+/// What a bulk resolution of non-UUID conflicts did ([`Catalog::run_resolve_foreign_conflicts`]).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ForeignConflictSummary {
+    /// Copies in conflict with a non-UUID identifier when the run started — its progress
+    /// denominator. The queue can change underneath it.
+    pub total: usize,
+    /// Copies whose sidecar now carries the catalog's identity, after a backup.
+    pub overwritten: usize,
+    /// Copies dismissed.
+    pub dismissed: usize,
+    /// Copies left as they are because they were no longer a non-UUID conflict when their
+    /// turn came — resolved or dismissed meanwhile, the sidecar changed (to a UUID, or to no
+    /// identifier), or, for Overwrite, the file not reachable. Not a failure.
+    pub skipped: usize,
+    /// Copies whose sidecar Overwrite could not write (read-only storage, an unparseable
+    /// sidecar). Still queued as conflicts.
+    pub failed: usize,
+    /// True when the run stopped early (Cancel, a newer run, a catalog switch); the counts
+    /// are then partial.
+    pub aborted: bool,
+}
+
+impl ForeignConflictSummary {
+    /// Copies the run has finished with, whatever the outcome.
+    pub fn done(&self) -> usize {
+        self.overwritten + self.dismissed + self.skipped + self.failed
+    }
+}
+
+/// The identifier a stored conflict recorded, from the queue row's `error` (the inverse of
+/// [`SidecarIdentity::error_text`] for `Conflict`), or `None` for any other state.
+fn recorded_conflict_value(error: &str) -> Option<&str> {
+    error
+        .strip_prefix(CONFLICT_PREFIX)?
+        .strip_prefix(" (")?
+        .strip_suffix("); left untouched")
+}
+
+/// True when a queue row's `error` records a conflict with a non-UUID identifier.
+fn is_foreign_conflict(error: &str) -> bool {
+    recorded_conflict_value(error).is_some_and(|found| !is_photo_identity(found))
 }
 
 /// The version of one queue row, as the repair pass saw it.
@@ -1204,6 +1280,20 @@ impl Catalog {
         relative_path: &str,
         action: IdentityConflictAction,
     ) -> Result<IdentityConflictOutcome> {
+        self.resolve_conflict(photo_id, volume_id, relative_path, action, false)
+    }
+
+    /// [`Self::resolve_identity_conflict`]; with `foreign_only`, Overwrite also refuses a
+    /// sidecar that carries a UUID when it is read, as the bulk resolution of non-UUID
+    /// conflicts requires ([`Self::run_resolve_foreign_conflicts`]).
+    fn resolve_conflict(
+        &self,
+        photo_id: i64,
+        volume_id: i64,
+        relative_path: &str,
+        action: IdentityConflictAction,
+        foreign_only: bool,
+    ) -> Result<IdentityConflictOutcome> {
         let (error, dismissed_at, catalog_uuid, base_path): (String, i64, String, String) = self
             .conn
             .query_row(
@@ -1249,6 +1339,12 @@ impl Catalog {
         // copy that merely can't be written (or reached) has no such question to answer;
         // it needs a repair pass, not a decision.
         let state = debt_state_from_error(&error);
+        if foreign_only && state == "conflict" && !is_foreign_conflict(&error) {
+            return Err(CatalogError::Validation(format!(
+                "{relative_path}'s conflict is with a UUID, another photo's identity, which \
+                 needs a decision of its own"
+            )));
+        }
         if state != "conflict" {
             return Err(CatalogError::Validation(format!(
                 "{relative_path} is not in conflict (state: {state}); Adopt, Overwrite and \
@@ -1339,6 +1435,29 @@ impl Catalog {
                 )?;
             }
             IdentityConflictAction::Overwrite => {
+                if foreign_only && is_photo_identity(&found) {
+                    return Err(CatalogError::Validation(format!(
+                        "{}'s sidecar now carries a UUID ({found}), which is another photo's \
+                         identity and needs a decision of its own",
+                        target.display()
+                    )));
+                }
+                // Overwrite replaces EVERY xmp:Identifier value, but `found` is only the
+                // first. In bulk, a sidecar with more than one value — a Bag a DAM appended
+                // to, a second Description — may hold another photo's UUID beside the DAM
+                // id; it is left for a person to look at (#150, review M1).
+                if foreign_only {
+                    let all = crate::xmp::read_identifiers(&target);
+                    if all.len() != 1 || all.iter().any(|v| is_photo_identity(v)) {
+                        return Err(CatalogError::Validation(format!(
+                            "{}'s sidecar carries {} identifier values ({}); a bulk Overwrite \
+                             replaces only a single non-UUID one",
+                            target.display(),
+                            all.len(),
+                            all.join(", ")
+                        )));
+                    }
+                }
                 let backup = crate::xmp::overwrite_identifier(&target, &catalog_uuid)
                     .map_err(CatalogError::Io)?;
                 outcome.sidecar_backup = backup.map(|p| p.to_string_lossy().to_string());
@@ -1526,12 +1645,115 @@ impl Catalog {
         self.run_identity_repair(&AtomicBool::new(false), |_| {})
     }
 
+    /// How many copies are in conflict with a non-UUID identifier, un-dismissed — what
+    /// [`Self::run_resolve_foreign_conflicts`] would act on now.
+    pub fn count_foreign_conflicts(&self) -> Result<usize> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT error FROM pending_sidecar_identity
+             WHERE field = 'identifier' AND dismissed_at = 0 AND error GLOB '{CONFLICT_PREFIX}*'"
+        ))?;
+        let mut count = 0;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            if is_foreign_conflict(&row.get::<_, String>(0)?) {
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
+
+    /// One keyset page of the un-dismissed identifier conflicts after `after`, in the queue's
+    /// key order: `(photo_id, volume_id, relative_path, error)` of each copy. UUID conflicts
+    /// are in it too — the caller skips them — so the page's last row is always the cursor.
+    fn identifier_conflicts_page(
+        &self,
+        after: Option<&(i64, i64, String)>,
+        limit: i64,
+    ) -> Result<Vec<(i64, i64, String, String)>> {
+        let (photo_id, volume_id, relative_path) =
+            after.cloned().unwrap_or((i64::MIN, i64::MIN, String::new()));
+        let rows = self
+            .conn
+            .prepare_cached(&format!(
+                "SELECT photo_id, volume_id, relative_path, error FROM pending_sidecar_identity
+                 WHERE field = 'identifier' AND dismissed_at = 0
+                   AND error GLOB '{CONFLICT_PREFIX}*'
+                   AND (photo_id, volume_id, relative_path) > (?1, ?2, ?3)
+                 ORDER BY photo_id, volume_id, relative_path
+                 LIMIT ?4"
+            ))?
+            .query_map(params![photo_id, volume_id, relative_path, limit], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Overwrite or Dismiss every copy whose sidecar carries a non-UUID identifier (#150, L6
+    /// of the #139–#142 review), one copy at a time until the queue is exhausted or `abort`
+    /// trips. A DAM-managed library can reach this state by the thousand (schema v23 queues
+    /// every re-minted row's copies), and one decision per copy does not scale.
+    ///
+    /// Each copy goes through the same decision as one resolved by hand
+    /// ([`Self::resolve_identity_conflict`]): the queue row is re-read, and Overwrite re-reads
+    /// the sidecar and backs it up before it writes. A copy that is no longer a non-UUID
+    /// conflict when its turn comes — resolved or dismissed meanwhile, its sidecar now
+    /// carrying a UUID (another photo's identity: never overwritten in bulk) or nothing, its
+    /// file unreachable — is skipped, not failed. Like a single resolution it wins over a
+    /// concurrent repair pass (this module's § Who owns a queue row) and does not stop one.
+    ///
+    /// The job around it — id, abort generation, status slot, catalog identity, events — is
+    /// `app::identity`'s. `abort` is checked before every copy; a stop keeps every decision
+    /// already made and sets `aborted`.
+    pub fn run_resolve_foreign_conflicts(
+        &self,
+        action: ForeignConflictAction,
+        abort: &AtomicBool,
+        mut progress: impl FnMut(&ForeignConflictSummary),
+    ) -> Result<ForeignConflictSummary> {
+        let mut summary =
+            ForeignConflictSummary { total: self.count_foreign_conflicts()?, ..Default::default() };
+        let mut cursor: Option<(i64, i64, String)> = None;
+        loop {
+            if abort.load(Ordering::Relaxed) {
+                summary.aborted = true;
+                return Ok(summary);
+            }
+            let page = self.identifier_conflicts_page(cursor.as_ref(), REPAIR_PAGE_SIZE)?;
+            if page.is_empty() {
+                return Ok(summary);
+            }
+            for (photo_id, volume_id, relative_path, error) in page {
+                if abort.load(Ordering::Relaxed) {
+                    summary.aborted = true;
+                    return Ok(summary);
+                }
+                cursor = Some((photo_id, volume_id, relative_path.clone()));
+                if !is_foreign_conflict(&error) {
+                    continue; // a UUID conflict: not this run's to decide, and not counted
+                }
+                match self.resolve_conflict(photo_id, volume_id, &relative_path, action.single(), true) {
+                    Ok(_) => match action {
+                        ForeignConflictAction::Overwrite => summary.overwritten += 1,
+                        ForeignConflictAction::Dismiss => summary.dismissed += 1,
+                    },
+                    Err(CatalogError::Validation(_) | CatalogError::NotFound(_)) => summary.skipped += 1,
+                    Err(CatalogError::Io(_)) => summary.failed += 1,
+                    Err(e) => return Err(e),
+                }
+                progress(&summary);
+            }
+        }
+    }
+
+
     /// What a scan may match or adopt as the identity of a file whose sidecar's
     /// `xmp:Identifier` holds `found`, or `None` to match by path alone and mint if new.
     ///
     /// A UUID is the identity (#141). Anything else is another tool's identifier and is
     /// never adopted, with one exception (#146): the identifier a row held before schema v23
-    /// re-minted it ([`Self::remint_non_identity_photos`]). Its sidecar still carries that
+    /// re-minted it ([`Self::remint_non_identity_photos`]), or that the file carried when a
+    /// scan minted the row a UUID (#150, `IdentitySource::legacy_value`). Its sidecar still carries that
     /// value — overwriting it is a person's decision — so it is the only link from the file
     /// back to its row, and without it a moved file would be catalogued a second time and
     /// its tags, ratings and faces left on a row nobody sees. It answers the row's minted
@@ -1603,6 +1825,42 @@ impl Catalog {
         Ok(copies.iter().all(|(base, file)| base.is_dir() && !file.exists()))
     }
 
+    /// True when re-homing `photo_id` onto a file on `volume_id` would move one of its
+    /// primary copies off a file that is still there (#150, reviews F5 and N2 of #146): the
+    /// row's primary location on that volume, and — with `logical`, for a re-home that also
+    /// rewrites `photos.path` — the file at the row's catalog-root path.
+    ///
+    /// A re-home by identity is for a file that moved. If the row's file is still in place,
+    /// the file being scanned or imported is another copy carrying the same identity — a
+    /// bundle's copy at another path, a duplicate a person made, the other half of a v24
+    /// case collision — and pointing the row at it would leave the original with no row:
+    /// the next scan catalogues it afresh, without its ratings, tags and faces, or the two
+    /// files take turns owning the row. A primary copy on another volume is not checked: a
+    /// copy of the photo on a second volume is a second location of the same row, and
+    /// recording it moves nothing.
+    pub(super) fn primary_copy_left_in_place(
+        &self,
+        photo_id: i64,
+        volume_id: i64,
+        logical: bool,
+    ) -> Result<bool> {
+        let on_volume: Option<PathBuf> = self
+            .conn
+            .prepare_cached(
+                "SELECT v.base_path, l.relative_path
+                 FROM photo_locations l JOIN volumes v ON v.id = l.volume_id
+                 WHERE l.photo_id = ?1 AND l.volume_id = ?2 AND l.role = 'primary'",
+            )?
+            .query_row(params![photo_id, volume_id], |r| {
+                Ok(Path::new(&r.get::<_, String>(0)?).join(r.get::<_, String>(1)?))
+            })
+            .optional()?;
+        if on_volume.is_some_and(|file| file.exists()) {
+            return Ok(true);
+        }
+        Ok(logical && self.to_absolute(&self.get_photo(photo_id)?.path).exists())
+    }
+
     /// Schema v23 (#146): give every row whose `photos.uuid` is not a photo identity the
     /// [`legacy_photo_identity`] of that value — a UUID v5, so that every catalog that held
     /// the photo under the same value agrees on its new identity. Returns how many rows were
@@ -1654,10 +1912,11 @@ impl Catalog {
         Ok(stale.len())
     }
 
-    /// Record `trusted` as `photo_id`'s legacy identifier when it is one (not a UUID, not
-    /// empty); see [`RECORD_LEGACY_IDENTIFIER_SQL`].
-    pub(super) fn record_legacy_identifier(&self, photo_id: i64, trusted: Option<&str>) -> Result<()> {
-        if let Some(value) = trusted.filter(|v| is_legacy_identifier(v)) {
+    /// Record `value` — a trusted manifest id, or what a scanned sidecar's `xmp:Identifier`
+    /// holds — as `photo_id`'s legacy identifier when it is one (not a UUID, not empty);
+    /// see [`RECORD_LEGACY_IDENTIFIER_SQL`].
+    pub(super) fn record_legacy_identifier(&self, photo_id: i64, value: Option<&str>) -> Result<()> {
+        if let Some(value) = value.filter(|v| is_legacy_identifier(v)) {
             self.conn
                 .prepare_cached(RECORD_LEGACY_IDENTIFIER_SQL)?
                 .execute(params![photo_id, value])?;
@@ -1736,16 +1995,45 @@ impl Catalog {
     ///
     /// Without it, a module record a photo had — today only the Obsidian module's note record,
     /// `obsidian.note.<photo uuid>` — would no longer be found, and "create note" would make a
-    /// second note for a photo that has one. A record already at the new key is kept, and the
-    /// old one is left where it is rather than overwriting it.
+    /// second note for a photo that has one.
+    ///
+    /// When the new key already has a record, the one with content wins (#150, review N5 of
+    /// #146). A blank record — what the module's "Forget" leaves — never hides a real one: a
+    /// real record at the old key replaces a blank one at the new key, and a blank record at
+    /// the old key is dropped beside a real one at the new key. Two real records are two
+    /// notes, and which of them is this photo's is not something a migration can know: both
+    /// stay where they are, the new key's is the one the module shows, and the old one is
+    /// logged so it can be found. No record with content is ever deleted or overwritten.
     fn carry_photo_keyed_settings(&self, previous: &str, uuid: &str) -> Result<()> {
         if previous == uuid {
             return Ok(());
         }
         for prefix in PHOTO_KEYED_SETTING_PREFIXES {
-            self.conn
-                .prepare_cached("UPDATE OR IGNORE settings SET key = ?1 || ?3 WHERE key = ?1 || ?2")?
-                .execute(params![prefix, previous, uuid])?;
+            let (old_key, new_key) = (format!("{prefix}{previous}"), format!("{prefix}{uuid}"));
+            let Some(old) = self.get_setting(&old_key)? else { continue };
+            let is_blank = |record: &str| record.trim().is_empty();
+            match self.get_setting(&new_key)? {
+                None => {
+                    self.conn.execute(
+                        "UPDATE settings SET key = ?2 WHERE key = ?1",
+                        params![old_key, new_key],
+                    )?;
+                }
+                Some(new) if is_blank(&new) => {
+                    self.conn.execute("DELETE FROM settings WHERE key = ?1", params![new_key])?;
+                    self.conn.execute(
+                        "UPDATE settings SET key = ?2 WHERE key = ?1",
+                        params![old_key, new_key],
+                    )?;
+                }
+                Some(_) if is_blank(&old) => {
+                    self.conn.execute("DELETE FROM settings WHERE key = ?1", params![old_key])?;
+                }
+                Some(_) => eprintln!(
+                    "identity migration: {new_key} and {old_key} both hold a record; the first \
+                     is kept as the photo's and the second left in place"
+                ),
+            }
         }
         Ok(())
     }
@@ -3155,12 +3443,22 @@ mod tests {
         // A `Catalog` owns a `rusqlite::Connection`, which is `Send` but not `Sync`, so each
         // thread gets its own — which is what a real pass and a real resolution have anyway
         // (`commands::storage` opens a secondary connection per call).
+        //
+        // Each connection waits up to 120 s for the other's write lock instead of the
+        // production 5 s. The two threads write in lockstep, and every write is an fsync; on
+        // /home (btrfs) under the full suite's IO load one of them waited past 5 s, and the
+        // pass failed with "database is locked" (SQLITE_BUSY, extended 5), at #150's base and
+        // on its branch alike. The #150 review measured 23 of 24 runs failing under IO load
+        // without this and 0 of 24 with it. That timeout is not what this test is about; the
+        // ownership of each queue row is.
+        let patient = |c: &Catalog| c.conn().busy_timeout(std::time::Duration::from_secs(120)).unwrap();
         let db_path = catalog.db_path().to_path_buf();
         let pass_root = root.clone();
         let resolver_root = root.clone();
         std::thread::scope(|s| {
             s.spawn(move || {
                 let pass = Catalog::open_secondary(&db_path, &pass_root).unwrap();
+                patient(&pass);
                 // Several passes, so a resolution can land in any of the pass's phases
                 // (planning, refresh, IO, record) rather than only in the first.
                 for _ in 0..4 {
@@ -3170,6 +3468,7 @@ mod tests {
             let resolver_db = catalog.db_path().to_path_buf();
             s.spawn(move || {
                 let resolver = Catalog::open_secondary(&resolver_db, &resolver_root).unwrap();
+                patient(&resolver);
                 for (id, volume_id, relative_path, action) in &decisions {
                     // A refusal is a legitimate outcome here (the pass may have bound the
                     // copy first, making the recorded conflict stale), so failures are not
@@ -3539,6 +3838,231 @@ mod tests {
         let other = catalog.upsert_scanned_photo(&elsewhere, None, 1, 9, Some("dam:1")).unwrap();
         assert!(other.created, "x.jpg is still there, so y.jpg is another photo");
         assert_eq!(lookups(), before + 1, "a path miss does look it up");
+    }
+
+    /// #150 (review F4 of #146): a file catalogued after #141 whose sidecar holds a DAM id
+    /// gets a minted UUID; the DAM id is recorded as the row's legacy identifier, so moving
+    /// the file re-homes the row instead of cataloguing it a second time. A row catalogued
+    /// before the record existed gains it at its next rescan.
+    #[test]
+    fn a_scan_records_the_foreign_id_of_a_file_it_mints_for() {
+        let (catalog, root, _dir) = temp_catalog("legacy-recorded-at-mint");
+        let path = root.join("x.jpg");
+        std::fs::write(&path, b"raw-bytes").unwrap();
+        let first = catalog.upsert_scanned_photo(&path, None, 1, 9, Some("dam:asset/77")).unwrap();
+        assert!(first.created && is_photo_identity(&first.uuid), "{}", first.uuid);
+        catalog.set_culling(first.id, Some(5), None, None).unwrap();
+
+        std::fs::remove_file(&path).unwrap();
+        let moved = root.join("y.jpg");
+        std::fs::write(&moved, b"raw-bytes").unwrap();
+        let again = catalog.upsert_scanned_photo(&moved, None, 2, 9, Some("dam:asset/77")).unwrap();
+        assert_eq!((again.id, again.created), (first.id, false), "re-homed, not duplicated");
+        assert_eq!(catalog.get_photo(first.id).unwrap().path, "y.jpg");
+        assert_eq!(catalog.get_photo(first.id).unwrap().rating, 5);
+
+        // A row from before the record existed: its next rescan records it.
+        catalog.conn().execute("DELETE FROM photo_legacy_identifiers", []).unwrap();
+        catalog.upsert_scanned_photo(&moved, None, 2, 9, Some("dam:asset/77")).unwrap();
+        let owner: i64 = catalog
+            .conn()
+            .query_row(
+                "SELECT photo_id FROM photo_legacy_identifiers WHERE identifier = 'dam:asset/77'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(owner, first.id);
+    }
+
+    /// #150 (nit from the #146 re-review): a re-home within a volume indexed in place drops
+    /// the debt queued for the path it left, as a root re-home does — that row could only
+    /// ever report a file that is no longer there as unreachable.
+    #[test]
+    fn a_volume_rehome_drops_the_debt_of_the_path_it_left() {
+        let (catalog, _root, dir) = temp_catalog("volume-rehome-debt");
+        const KNOWN: &str = "6f1c1f0e-2b7a-4c3d-9e8f-0a1b2c3d4e5f";
+        let nas = dir.path().join("nas");
+        std::fs::create_dir_all(&nas).unwrap();
+        catalog.add_volume("NAS", &nas, crate::catalog::VolumeKind::Backup).unwrap();
+        let before = nas.join("x.jpg");
+        std::fs::write(&before, b"raw-bytes").unwrap();
+        let row = catalog.upsert_photo_on_volume(&before, 1, 9, Some(KNOWN)).unwrap();
+        catalog.record_sidecar_identity(row.id, &before, &SidecarIdentity::Unwritable("ro".into())).unwrap();
+        assert!(queue_row(&catalog, row.id, &before).is_some());
+
+        std::fs::remove_file(&before).unwrap();
+        let after = nas.join("y.jpg");
+        std::fs::write(&after, b"raw-bytes").unwrap();
+        let moved = catalog.upsert_scanned_photo_on_volume(&after, 1, 9, Some(KNOWN)).unwrap();
+        assert_eq!((moved.id, moved.created), (row.id, false));
+        assert_eq!(queue_row(&catalog, row.id, &before), None, "the path it left owes nothing");
+    }
+
+    /// #150 (nit from the #146 re-review): a trusted (manifest) id is not recorded on the row
+    /// that merely sits at the same path — that is the file already there, which can be a
+    /// different photo — while a scanned sidecar's id, which describes that very file, is.
+    #[test]
+    fn a_trusted_id_is_not_recorded_on_a_row_matched_by_path() {
+        let (catalog, root, _dir) = temp_catalog("trusted-by-path");
+        let (id, path) = seed_photo(&catalog, &root, "x.jpg");
+        let legacy = |photo: i64| -> Option<String> {
+            catalog
+                .conn()
+                .query_row(
+                    "SELECT identifier FROM photo_legacy_identifiers WHERE photo_id = ?1",
+                    params![photo],
+                    |r| r.get(0),
+                )
+                .optional()
+                .unwrap()
+        };
+        let same = catalog.upsert_photo_with_identity(&path, None, 1, 9, Some("dam:asset/9")).unwrap();
+        assert_eq!((same.id, same.created), (id, false));
+        let on_volume = catalog.upsert_photo_on_volume(&path, 1, 9, Some("dam:asset/9")).unwrap();
+        assert_eq!(on_volume.id, id);
+        assert_eq!(legacy(id), None, "the manifest's id is not this file's");
+        catalog.upsert_scanned_photo(&path, None, 1, 9, Some("dam:asset/9")).unwrap();
+        assert_eq!(legacy(id).as_deref(), Some("dam:asset/9"), "its own sidecar's is");
+    }
+
+    // --- bulk resolution of non-UUID conflicts (#150 L6) ------------------------------
+
+    /// Overwrite in bulk acts on every un-dismissed copy whose recorded conflict is a non-UUID,
+    /// re-reading each sidecar first: a UUID conflict is left for its own decision, a copy
+    /// whose sidecar has since taken a UUID is skipped, and a dismissed copy is not touched.
+    #[test]
+    fn bulk_overwrite_resolves_only_non_uuid_conflicts() {
+        let (catalog, root, _dir) = temp_catalog("bulk-overwrite");
+        const OTHER: &str = "0d9c8b7a-6f5e-4d3c-8b2a-190807060504";
+        let (a, a_path, a_uuid) = seed_conflicted_copy(&catalog, &root, "a.jpg", "dam:1");
+        let (b, b_path, _) = seed_conflicted_copy(&catalog, &root, "b.jpg", OTHER);
+        let (c, c_path, _) = seed_conflicted_copy(&catalog, &root, "c.jpg", "dam:3");
+        let (d, d_path, _) = seed_conflicted_copy(&catalog, &root, "d.jpg", "dam:4");
+        let (cv, cr) = copy_of(&catalog, &c_path);
+        catalog.resolve_identity_conflict(c, cv, &cr, IdentityConflictAction::Dismiss).unwrap();
+        // d's sidecar changes to another photo's UUID after its conflict was recorded.
+        crate::xmp::overwrite_identifier(&d_path, OTHER).unwrap();
+        assert_eq!(catalog.count_foreign_conflicts().unwrap(), 2);
+
+        let mut seen = Vec::new();
+        let summary = catalog
+            .run_resolve_foreign_conflicts(ForeignConflictAction::Overwrite, &AtomicBool::new(false), |s| {
+                seen.push(s.done())
+            })
+            .unwrap();
+        assert_eq!(
+            summary,
+            ForeignConflictSummary { total: 2, overwritten: 1, skipped: 1, ..Default::default() }
+        );
+        assert_eq!(seen, [1, 2]);
+        assert_eq!(crate::xmp::read_identifier(&a_path).as_deref(), Some(a_uuid.as_str()));
+        assert_eq!(queue_row(&catalog, a, &a_path), None, "a is bound");
+        assert!(queue_row(&catalog, b, &b_path).is_some_and(|(_, e, _)| e.contains(OTHER)));
+        assert_eq!(crate::xmp::read_identifier(&b_path).as_deref(), Some(OTHER), "a UUID is never overwritten in bulk");
+        assert!(queue_row(&catalog, c, &c_path).is_some_and(|(_, _, dismissed)| dismissed != 0));
+        assert_eq!(crate::xmp::read_identifier(&c_path).as_deref(), Some("dam:3"));
+        assert_eq!(crate::xmp::read_identifier(&d_path).as_deref(), Some(OTHER));
+        assert!(queue_row(&catalog, d, &d_path).is_some());
+    }
+
+    /// #150 (review M1): Overwrite replaces every `xmp:Identifier` value, while a conflict
+    /// records only the first. A sidecar whose DAM id sits beside another photo's UUID — in
+    /// one Bag, or in a second Description — is skipped in bulk, never overwritten, and a
+    /// sidecar with two non-UUID values is skipped too.
+    #[test]
+    fn bulk_overwrite_skips_a_sidecar_with_more_than_one_identifier_value() {
+        let (catalog, root, _dir) = temp_catalog("bulk-overwrite-multi");
+        const OTHER: &str = "0d9c8b7a-6f5e-4d3c-8b2a-190807060504";
+        let head = r#"<?xml version="1.0" encoding="UTF-8"?>
+<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#""#;
+        let bag = format!(
+            r#"{head}><rdf:Description rdf:about="" xmlns:xmp="http://ns.adobe.com/xap/1.0/">
+<xmp:Identifier><rdf:Bag><rdf:li>dam:asset/1</rdf:li><rdf:li>{OTHER}</rdf:li></rdf:Bag></xmp:Identifier>
+</rdf:Description></rdf:RDF></x:xmpmeta>"#
+        );
+        let two_descriptions = format!(
+            r#"{head}><rdf:Description rdf:about="" xmlns:xmp="http://ns.adobe.com/xap/1.0/" xmp:Identifier="dam:asset/2"/>
+<rdf:Description rdf:about="" xmlns:xmp="http://ns.adobe.com/xap/1.0/">
+<xmp:Identifier><rdf:Bag><rdf:li>{OTHER}</rdf:li></rdf:Bag></xmp:Identifier></rdf:Description>
+</rdf:RDF></x:xmpmeta>"#
+        );
+        let two_foreign = format!(
+            r#"{head}><rdf:Description rdf:about="" xmlns:xmp="http://ns.adobe.com/xap/1.0/">
+<xmp:Identifier><rdf:Bag><rdf:li>dam:asset/3</rdf:li><rdf:li>dam:asset/33</rdf:li></rdf:Bag></xmp:Identifier>
+</rdf:Description></rdf:RDF></x:xmpmeta>"#
+        );
+        let mut paths = Vec::new();
+        for (name, xml, first) in [
+            ("bag.arw", &bag, "dam:asset/1"),
+            ("two.arw", &two_descriptions, "dam:asset/2"),
+            ("foreign.arw", &two_foreign, "dam:asset/3"),
+        ] {
+            let path = root.join(name);
+            std::fs::write(&path, b"raw-bytes").unwrap();
+            std::fs::write(crate::xmp::sidecar_path(&path), xml).unwrap();
+            let up = catalog.upsert_photo(&path, None, 1, 9).unwrap();
+            let found = crate::xmp::read_identifier(&path);
+            assert_eq!(found.as_deref(), Some(first), "{name}: the first value is the one recorded");
+            let outcome = catalog.ensure_sidecar_identity(up.id, &path, &up.uuid, found.as_deref()).unwrap();
+            assert_eq!(outcome, SidecarIdentity::Conflict(first.to_string()));
+            paths.push(path);
+        }
+        assert_eq!(catalog.count_foreign_conflicts().unwrap(), 3);
+
+        let summary = catalog
+            .run_resolve_foreign_conflicts(ForeignConflictAction::Overwrite, &AtomicBool::new(false), |_| {})
+            .unwrap();
+        assert_eq!(summary, ForeignConflictSummary { total: 3, skipped: 3, ..Default::default() });
+        for path in &paths[..2] {
+            assert!(
+                crate::xmp::read_identifiers(path).iter().any(|v| v == OTHER),
+                "{}: the other photo's UUID is still in the sidecar",
+                path.display()
+            );
+        }
+        assert_eq!(crate::xmp::read_identifiers(&paths[2]), ["dam:asset/3", "dam:asset/33"]);
+    }
+
+    /// Dismiss in bulk pages through a queue longer than one page, interleaved with UUID
+    /// conflicts it must leave alone, and stops at its abort flag between copies.
+    #[test]
+    fn bulk_dismiss_pages_past_uuid_conflicts_and_stops_at_its_abort_flag() {
+        let (catalog, root, _dir) = temp_catalog("bulk-dismiss");
+        let mut foreign = Vec::new();
+        for i in 0..(REPAIR_PAGE_SIZE as usize + 40) {
+            if i % 3 == 0 {
+                let other = uuid::Uuid::new_v4().to_string();
+                seed_conflicted_copy(&catalog, &root, &format!("u{i}.jpg"), &other);
+            } else {
+                foreign.push(seed_conflicted_copy(&catalog, &root, &format!("f{i}.jpg"), &format!("dam:{i}")));
+            }
+        }
+        let abort = AtomicBool::new(false);
+        let stopped = catalog
+            .run_resolve_foreign_conflicts(ForeignConflictAction::Dismiss, &abort, |s| {
+                if s.done() == 5 {
+                    abort.store(true, Ordering::Relaxed);
+                }
+            })
+            .unwrap();
+        assert!(stopped.aborted);
+        assert_eq!((stopped.dismissed, stopped.total), (5, foreign.len()));
+
+        let rest = catalog
+            .run_resolve_foreign_conflicts(ForeignConflictAction::Dismiss, &AtomicBool::new(false), |_| {})
+            .unwrap();
+        assert_eq!(rest, ForeignConflictSummary {
+            total: foreign.len() - 5,
+            dismissed: foreign.len() - 5,
+            ..Default::default()
+        });
+        assert_eq!(catalog.count_foreign_conflicts().unwrap(), 0);
+        for (id, path, _) in &foreign {
+            assert!(queue_row(&catalog, *id, path).is_some_and(|(_, _, d)| d != 0), "{}", path.display());
+        }
+        let summary = catalog.summarize_pending_identity().unwrap();
+        assert_eq!(summary.conflicts as usize, (REPAIR_PAGE_SIZE as usize + 40).div_ceil(3), "UUID conflicts stay");
     }
 
     /// #146 review N4: v23 agrees with merge that a blank `photos.uuid` names no identity. It

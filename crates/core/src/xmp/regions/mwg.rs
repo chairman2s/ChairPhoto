@@ -4,6 +4,7 @@
 use xmltree::{Element, Namespace, XMLNode};
 use crate::xmp::dom::{
     child, el, element_at, element_at_mut, element_children, first_text, has_text, is_rdf, plain,
+    declare_prefix, prefix_for_ns,
 };
 use crate::xmp::ns::{NS_MWG_RS, NS_RDF, NS_STAREA, NS_STDIM};
 use crate::xmp::parse::{attr_is, attr_ns, ns_attr};
@@ -11,13 +12,12 @@ use super::{FaceRegion, ReadRegion};
 
 /// The prefixes the region elements chairphoto builds are written with, declared on the
 /// Description that holds (or will hold) `mwg-rs:Regions`. A prefix the file already binds is
-/// left alone.
+/// left alone; where it binds it to another URI another prefix is used ([`declare_prefix`]).
 pub(super) fn declare_region_namespaces(desc: &mut Element) {
     let ns = desc.namespaces.get_or_insert_with(Namespace::empty);
-    ns.put("rdf", NS_RDF);
-    ns.put("mwg-rs", NS_MWG_RS);
-    ns.put("stArea", NS_STAREA);
-    ns.put("stDim", NS_STDIM);
+    for (prefix, uri) in [("rdf", NS_RDF), ("mwg-rs", NS_MWG_RS), ("stArea", NS_STAREA), ("stDim", NS_STDIM)] {
+        declare_prefix(ns, prefix, uri);
+    }
 }
 
 /// A new `mwg-rs:Regions` element with AppliedToDimensions (when the size is known) + a
@@ -232,18 +232,7 @@ pub(super) fn set_struct_fields(prop: &mut Element, ns: &str, prefix: &str, fiel
 /// it, else `preferred` (or `preferred` plus a number, if that prefix means something else
 /// there), declared on `e`.
 fn prefix_for(e: &mut Element, ns: &str, preferred: &str) -> String {
-    let map = e.namespaces.get_or_insert_with(Namespace::empty);
-    if let Some((p, _)) = map.iter().find(|(p, uri)| *uri == ns && !p.is_empty()) {
-        return p.to_string();
-    }
-    let mut p = preferred.to_string();
-    let mut n = 1;
-    while map.get(&p).is_some() {
-        p = format!("{preferred}{n}");
-        n += 1;
-    }
-    map.put(p.clone(), ns);
-    p
+    prefix_for_ns(e.namespaces.get_or_insert_with(Namespace::empty), ns, preferred)
 }
 
 /// Build one `rdf:li` region struct for a face: Name + Type=Face + center-form Area.

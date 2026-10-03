@@ -486,14 +486,22 @@ impl Render for PhotoTags {
             );
         }
         if self.members.is_empty() {
-            quick = quick.child(ui::sub(
-                if self.group == RECENT_GROUP {
-                    "No recently used tags yet — tag a photo and they’ll show here."
-                } else {
-                    "Empty group — add tags via “⚙ groups”."
-                },
-                colors,
-            ));
+            // The whole row's width, and no wider: a text child of a flex row lays out at its
+            // one-line width and runs past the column (#176); React's `.panel-empty` wraps.
+            quick = quick.child(
+                ui::sub(
+                    if self.group == RECENT_GROUP {
+                        "No recently used tags yet — tag a photo and they’ll show here."
+                    } else {
+                        "Empty group — add tags via “⚙ groups”."
+                    },
+                    colors,
+                )
+                .id("quick-tags-empty")
+                .w_full()
+                .min_w_0()
+                .test_support(),
+            );
         }
 
         div()

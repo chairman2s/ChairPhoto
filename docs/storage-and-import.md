@@ -99,6 +99,46 @@ to reach the disk). The save reports the sidecar pending, a single-photo geocode
 error saying so, and geocode-all does not count that photo as filled.
 Face-region and GPS writes log the failure, and the catalog stays authoritative.
 
+### Sidecars damaged by releases before #138
+
+Every release before #138 parsed and wrote sidecars with `xmltree` 0.11, which drops attribute
+prefixes. Each write it made turned `rdf:parseType="Resource"` into `parseType="Resource"`,
+turned `rdf:about` into both an unprefixed `about` (with the original value) and an empty
+`rdf:about=""` (the writer re-inserted one after parsing), and an attribute-form MWG `AppliedToDimensions` or `Area`
+(`stDim:w`, `stArea:x`, …) into no-namespace `w`, `x`, …. The same happened to every other
+prefixed attribute in the file, foreign ones included (`digiKam:Confidence`). On such a file
+the face-region writer refuses every write ("mwg-rs:Regions is not a struct") and the reader
+finds no regions.
+
+When a writer opens a sidecar that carries `chairphoto:LastWrite`, which means a ChairPhoto
+release wrote the damage, `SidecarDocument::open` restores those known attributes in memory
+before the writer runs (`xmp/repair.rs`, #143). The table below lists every attribute it
+restores; nothing else is touched:
+
+| Unprefixed | On | Restored as |
+|---|---|---|
+| `about` | `rdf:Description` | `rdf:about`, replacing an empty or equal `rdf:about` |
+| `parseType` | a property element or `rdf:li` | `rdf:parseType` |
+| `w`, `h`, `unit` | `mwg-rs:AppliedToDimensions` | `stDim:` |
+| `x`, `y`, `w`, `h`, `unit` | `mwg-rs:Area` | `stArea:` |
+| `Name`, `Type`, `Rotation` | a region's nested `rdf:Description` (digiKam's form) | `mwg-rs:` |
+| `lang` | an `rdf:li` of an `rdf:Alt` | `xml:lang` |
+
+The first two are how RDF/XML itself reads an unqualified `about` or `parseType`. The MWG
+fields have no other meaning on those elements, and a Lang Alt item's `lang` can only be
+`xml:lang`. The last two rows are skipped, rather than treated as ambiguous, where the prefixed
+counterpart is already there. Attributes whose namespace is lost for good,
+such as `Confidence`, stay as they are. The repair runs only when it is unambiguous. If any
+element already carries the attribute that would be restored (`parseType` beside
+`rdf:parseType`, `x` beside `stArea:x`, `about` beside a different non-empty `rdf:about`),
+nothing is repaired and the write is refused as
+before. A repair counts as a first write for the backup rule: the damaged file is copied to
+`<sidecar>.chairphoto-backup` first, unless a backup already exists, and an existing backup is
+never replaced. Readers (face regions, GPS, identifier, IPTC presence) apply the same repair in
+memory to a sidecar with `chairphoto:LastWrite`, writing nothing and taking no backup, so face
+import reads the regions of a damaged sidecar before any write. The file itself is healed by the
+first ChairPhoto write to it.
+
 ### The repair pass is a job
 
 The queue reached 74,488 rows on the 100k harness shape, and every row is a sidecar parse
@@ -237,6 +277,25 @@ uses it to re-home a row; the file gets its own minted UUID, and the foreign val
 the sidecar as a conflict. Adopt refuses it; Overwrite (after the backup) or Dismiss resolve
 it.
 
+**Non-UUID conflicts can be resolved in bulk** (#150). A DAM-managed library can hold them by
+the thousand — schema v23 queues every re-minted row's copies — so Overwrite and Dismiss
+also run over all of them at once as a job (`Catalog::run_resolve_foreign_conflicts`, owned
+by `JobRegistry::identity_resolve` through `app::identity::claim_resolve_foreign_conflicts`;
+over IPC `resolve_foreign_identity_conflicts`, `identity_resolve_cancel`,
+`identity_resolve_status`, with `identity:resolve_progress` and the terminal
+`identity:resolve_done`). It acts only on un-dismissed copies whose recorded conflict is a
+non-UUID, and decides each exactly as a single resolution does: the queue row is re-read,
+Overwrite re-reads the sidecar and backs it up first, and a copy that is no longer a non-UUID
+conflict — resolved meanwhile, its sidecar now carrying a UUID or nothing, its file
+unreachable — is skipped, never acted on. A UUID conflict names another photo's identity and
+is never resolved in bulk. Overwrite replaces every `xmp:Identifier` value while a conflict
+records only the first, so a bulk Overwrite also skips a sidecar holding more than one value
+(a Bag a DAM appended to, a second `rdf:Description`): another photo's UUID may sit beside the
+DAM id (`xmp::read_identifiers`). The run is its own job family, so it neither stops nor is stopped
+by a repair pass (each queue row has an owner); a newer run, Cancel or a catalog switch stops
+it before its next copy, and a front end's start is bound to the catalog it read
+(`CATALOG_CHANGED` otherwise). The GPUI identity-debt panel does not offer it yet.
+
 Before #141 a scan did adopt such a value, so an older catalog can hold rows whose
 `photos.uuid` is a DAM id. Schema v23 (#146) re-mints each of them, keeps the old value in
 `photo_legacy_identifiers`, and queues every copy it records as a conflict; it writes no
@@ -250,6 +309,28 @@ scanned file must also be the row's size: an offloaded photo has no primary copy
 original is never modified and keeps its size wherever it is moved or restored.
 Otherwise the file is a different photo and gets its own row, as above.
 
+A scan that mints a UUID for a file whose sidecar holds such a foreign value records it the
+same way (#150), so a file catalogued after #141 re-homes under the same guards when it
+moves. The value is recorded whichever way the scan matched the row, so a row catalogued
+before #150 gains it at its next rescan. A legacy value has at most one owner: a scan, merge
+or bundle import never records a value another row already holds — the first holder is
+v23's re-mint or the first file seen carrying it, and a later one is a duplicate or another
+file sharing a DAM id. Two owners would make every scan refuse both.
+
+**A re-home never leaves a file behind** (#150). A scan or bundle import that finds a file
+carrying an identity some row already holds re-homes that row onto the file only when the
+row's own copy is gone: its primary location on the file's volume, and, for a file under the
+catalog root, the file at its `photos.path`. If that copy is still in place, the new file is
+another copy carrying the same identity — a bundle's copy at another relative path, a
+duplicate made outside ChairPhoto, the other half of a v24 case collision — so it gets a row
+of its own with a minted UUID, and its sidecar's identity is queued as a conflict for a
+person (Overwrite or Dismiss). Re-homing it would leave the original with no row: the next
+scan would catalogue it afresh without its ratings, tags and faces, or the two files would
+take turns owning the row. A row whose primary copies are all on other volumes still gains a
+file found on a volume indexed in place as another location; that moves nothing. A bundle
+whose photo lands as such a separate copy still merges its tags onto the existing row, which
+merge matches by identity.
+
 **A re-minted legacy identity is a UUID v5, not v4.** This is the one exception to "a UUID v4
 on first import": a photo imported fresh still gets a random v4, but a value that already
 served as a photo's identity is re-minted as `catalog::legacy_photo_identity` — UUID v5 of the
@@ -260,14 +341,21 @@ random v4 per catalog would split that photo in two at the next merge. For the s
 merge and bundle import map an old bundle's non-UUID id through the same function
 (`catalog::photo_identity_for`) and record it as the row's legacy identifier: no path stores a
 non-UUID `photos.uuid` any more. An empty or whitespace-only value is no identity at all, not
-a legacy one: v23 gives such a row a random v4, merge never matches it to another catalog's (a
-blank-uuid bundle photo is only ever the photo already at its path, or a new row), and no
-lookup finds it. If v23 finds the v5 already held by another row (a migrated
+a legacy one: v23 gives such a row a random v4, merge never matches it to another catalog's,
+and no lookup finds it. Nor is a blank-uuid bundle photo matched to the photo at its path,
+which can be a different one (#150): the importer renames a different-size collision to
+` (n)`, so the user's own photo is what sits at the bundle's path. The importer tells merge
+which row it indexed each such original into, and the bundle's tags land there. A blank-uuid
+photo with no original in the bundle is inserted with a v4 if its path is free, and otherwise
+skipped and counted (`MergeSummary::photos_skipped`). If v23 finds the v5 already held by another row (a migrated
 catalog's bundle merged in first), the two rows claim one photo and it cannot tell which is
 right, so that row gets a v4 and its copies stay queued as conflicts. The legacy value itself
 is never a merge key or a deep-link target. Settings keyed by the photo's uuid (today only the
 Obsidian module's note record, `obsidian.note.<uuid>`) move to the new identity in the same
-transaction, in v23 and in v24 alike; Adopt does not move them.
+transaction, in v23 and in v24 alike; Adopt does not move them. If the new identity already
+has such a record, the one with content wins (#150): a blank record (what Forget leaves) is
+replaced by the real one or dropped beside it, and two real records both stay — the new
+key's is the one shown, the old one is logged — so no record with content is lost.
 
 A UUID is one identity in either case. `photos.uuid` holds it lowercase, as ChairPhoto mints
 it (`catalog::canonical_photo_identity`): a scan, a bundle import, a merge, Adopt and a deep

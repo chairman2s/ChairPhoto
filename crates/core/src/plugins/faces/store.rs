@@ -107,6 +107,9 @@ fn ensure_schema_seen(conn: &Connection, predates_record: bool) -> rusqlite::Res
 /// The `faces__once` claim of the one-time pre-marker record.
 const LEGACY_RECORD_CLAIM: &str = "legacy_regions_recorded";
 
+/// The `faces__once` claim of the one-time retry of photos set aside before #143's repair.
+const LEGACY_REFUSED_RETRY_CLAIM: &str = "legacy_refused_retried_after_143";
+
 /// The plugin's tables; with `record_legacy`, also the one-time pre-marker record.
 fn create_schema(conn: &Connection, record_legacy: bool) -> rusqlite::Result<()> {
     conn.execute_batch(
@@ -228,6 +231,13 @@ fn create_schema(conn: &Connection, record_legacy: bool) -> rusqlite::Result<()>
                                                WHERE r.face_id = g.id)))))",
             [],
         )?;
+    }
+    // #143: sidecars a pre-#138 release damaged (`parseType=` for `rdf:parseType=`, …) refused
+    // every region write, so the conversion pass set their photos aside for good. The xmp
+    // repair now writes them, so the refusals recorded before it shipped are cleared once and
+    // the next index run retries those photos; one still refused is set aside again.
+    if conn.execute("INSERT OR IGNORE INTO faces__once (key) VALUES (?1)", [LEGACY_REFUSED_RETRY_CLAIM])? == 1 {
+        conn.execute("DELETE FROM faces__legacy_refused", [])?;
     }
     // Future-proof: add new columns to pre-existing tables without breaking an existing DB.
     for sql in [
@@ -585,6 +595,37 @@ mod tests {
 
         ensure_schema_seen(&b, b_saw).unwrap();
         assert_eq!(legacy_rows(&b), left, "B revived a spent row");
+    }
+
+    // ── The one-time retry of refused photos (#143 review, L3) ──────────────────
+
+    fn refused(conn: &Connection) -> Vec<i64> {
+        let mut stmt = conn.prepare("SELECT photo_id FROM faces__legacy_refused ORDER BY photo_id").unwrap();
+        stmt.query_map([], |r| r.get(0)).unwrap().collect::<rusqlite::Result<_>>().unwrap()
+    }
+
+    /// A catalog from before the #143 repair, with photos set aside because their damaged
+    /// sidecars refused the write: the first open after the upgrade clears them (the index pass
+    /// retries them), and only that open — a photo set aside afterwards stays set aside.
+    #[test]
+    fn photos_refused_before_the_repair_are_retried_once() {
+        let conn = mem_conn();
+        // Before the upgrade: refusals recorded, the retry claim not yet taken.
+        conn.execute("DELETE FROM faces__once WHERE key = ?1", [LEGACY_REFUSED_RETRY_CLAIM]).unwrap();
+        conn.execute_batch(
+            "INSERT INTO photos (id) VALUES (1), (2), (3);
+             INSERT INTO faces__legacy_refused (photo_id, refused_at, reason)
+             VALUES (1, 0, 'mwg-rs:Regions is not a struct'), (2, 0, 'mwg-rs:Regions is not a struct');",
+        )
+        .unwrap();
+
+        ensure_schema(&conn).unwrap();
+        assert_eq!(refused(&conn), Vec::<i64>::new(), "the upgrade retries them");
+
+        conn.execute("INSERT INTO faces__legacy_refused (photo_id, refused_at, reason) VALUES (3, 1, 'frame')", [])
+            .unwrap();
+        ensure_schema(&conn).unwrap();
+        assert_eq!(refused(&conn), [3], "only once: a later refusal stays");
     }
 
     // ── Embedding codec round-trip ────────────────────────────────────────────

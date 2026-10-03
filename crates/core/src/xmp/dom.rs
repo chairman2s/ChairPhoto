@@ -183,17 +183,57 @@ pub(super) fn child_mut<'a>(parent: &'a mut Element, prefix: &str, ns: &str, nam
     }
 }
 
+/// Declare on `desc` the prefixes the plain-property writers write with ([`declare_prefix`]).
 pub(super) fn declare_namespaces(desc: &mut Element) {
-    let mut ns = desc.namespaces.take().unwrap_or_else(Namespace::empty);
-    ns.put("rdf", NS_RDF);
-    ns.put("dc", NS_DC);
-    ns.put("photoshop", NS_PHOTOSHOP);
-    ns.put("Iptc4xmpCore", NS_IPTC);
-    ns.put("lr", NS_LR);
-    ns.put("xmp", NS_XMP);
-    ns.put("chairphoto", NS_CHAIRPHOTO);
-    ns.put("exif", NS_EXIF);
-    desc.namespaces = Some(ns);
+    let ns = desc.namespaces.get_or_insert_with(Namespace::empty);
+    for (prefix, uri) in [
+        ("rdf", NS_RDF),
+        ("dc", NS_DC),
+        ("photoshop", NS_PHOTOSHOP),
+        ("Iptc4xmpCore", NS_IPTC),
+        ("lr", NS_LR),
+        ("xmp", NS_XMP),
+        ("chairphoto", NS_CHAIRPHOTO),
+        ("exif", NS_EXIF),
+    ] {
+        declare_prefix(ns, prefix, uri);
+    }
+}
+
+/// Bind `prefix` to `uri` in `map` unless `map` binds `prefix` already. When it binds it to
+/// another URI (a foreign file's own `xmlns:xmp`), that binding stays and [`prefix_for_ns`]
+/// finds or declares another prefix for `uri`; `emit::fit_prefixes` then writes ChairPhoto's
+/// elements under that one, never into the foreign namespace (#143).
+pub(super) fn declare_prefix(map: &mut Namespace, prefix: &str, uri: &str) {
+    match map.get(prefix) {
+        None => {
+            map.put(prefix, uri);
+        }
+        Some(bound) if bound == uri => {}
+        Some(_) => {
+            prefix_for_ns(map, uri, prefix);
+        }
+    }
+}
+
+/// A prefix `map` binds to `uri`: any prefix that already does, else `preferred` — or, when
+/// `preferred` is bound to another URI, `preferred` plus the first number that is free — newly
+/// bound in `map`. Never rebinds a prefix `map` has.
+pub(super) fn prefix_for_ns(map: &mut Namespace, uri: &str, preferred: &str) -> String {
+    if let Some((p, _)) = map
+        .iter()
+        .find(|(p, u)| *u == uri && !p.is_empty() && !matches!(*p, "xml" | "xmlns"))
+    {
+        return p.to_string();
+    }
+    let mut p = preferred.to_string();
+    let mut n = 1;
+    while map.get(&p).is_some() {
+        p = format!("{preferred}{n}");
+        n += 1;
+    }
+    map.put(p.clone(), uri);
+    p
 }
 
 pub(super) fn new_root() -> Element {

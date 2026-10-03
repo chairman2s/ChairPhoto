@@ -2,6 +2,8 @@
 //! `.chip-danger`, `.scan-btn`, `.modal-sub`, `.modal-error`, `.term-note`, `.panel-empty`.
 
 use crate::shell::style::{Colors, RADIUS};
+use gpui_kit::component::checkbox::Checkbox;
+use gpui_kit::component::Sizable as _;
 use gpui_kit::prelude::*;
 use gpui_kit::{div, px, AnyElement, Div, FontWeight, SharedString, Stateful, TestSupportExt as _};
 
@@ -9,6 +11,13 @@ use gpui_kit::{div, px, AnyElement, Div, FontWeight, SharedString, Stateful, Tes
 /// caller adds `on_click` only when enabled — see [`clickable`]).
 pub fn chip(id: impl Into<SharedString>, label: impl Into<SharedString>, enabled: bool, colors: Colors) -> Stateful<Div> {
     chip_with(id, label.into(), enabled, colors)
+}
+
+/// A [`chip`] no wider than its container, its label cut with an ellipsis where it does not
+/// fit (a long LUT file name in the Darkroom rail, #180). The caller adds a tooltip with the
+/// whole name.
+pub fn truncating_chip(id: impl Into<SharedString>, label: impl Into<SharedString>, enabled: bool, colors: Colors) -> Stateful<Div> {
+    chip_with(id, div().min_w_0().truncate().child(label.into()), enabled, colors).max_w_full().min_w_0()
 }
 
 /// A [`chip`] showing a 13 px icon instead of a label — the app's stroke-icon size — for a
@@ -94,6 +103,18 @@ pub fn label(text: impl Into<SharedString>, colors: Colors) -> Div {
 /// `.panel-empty`.
 pub fn empty(id: &'static str, text: impl Into<SharedString>, colors: Colors) -> AnyElement {
     div().id(id).py(px(12.)).text_size(px(12.)).text_color(colors.mute).child(text.into()).test_support().into_any_element()
+}
+
+/// `.term-export`'s 12 px: the label size of React's checkbox rows (`<label><input
+/// type="checkbox">…`). Preferences' own rows inherit the 13 px body text instead.
+pub const CHECKBOX_TEXT: f32 = 12.;
+
+/// A labelled checkbox at body-text size. gpui-component's default (`Medium`) sets the label
+/// in `text_base`, 16 px, far above the 11.5–13 px text around it (#180); `small` keeps the
+/// box near a native one and the label is set to [`CHECKBOX_TEXT`] (a caller may override it
+/// with `text_size`).
+pub fn checkbox(id: impl Into<gpui_kit::ElementId>, label: impl Into<SharedString>) -> Checkbox {
+    Checkbox::new(id).small().label(label.into()).text_size(px(CHECKBOX_TEXT))
 }
 
 /// A row of controls.

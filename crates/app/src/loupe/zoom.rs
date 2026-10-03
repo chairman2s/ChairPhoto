@@ -27,9 +27,9 @@ use crate::storage::ui;
 use chairphoto_core::image_pool::ImageKind;
 use gpui_kit::prelude::*;
 use gpui_kit::{
-    canvas, div, img, px, Bounds, Context, CursorStyle, Entity, MouseButton, MouseDownEvent, MouseMoveEvent,
-    ObjectFit, Pixels, Point, RenderImage, ScrollWheelEvent, SharedString, Subscription, TestSupportExt as _,
-    Window,
+    canvas, div, img, px, Bounds, Context, CursorStyle, Div, ElementId, Entity, ImageSource, MouseButton,
+    MouseDownEvent, MouseMoveEvent, ObjectFit, Pixels, Point, RenderImage, ScrollWheelEvent, SharedString,
+    Subscription, TestSupportExt as _, Window,
 };
 use std::sync::Arc;
 
@@ -106,6 +106,25 @@ pub fn fit_factor(natural: (f32, f32), container: (f32, f32)) -> f32 {
         return 1.;
     }
     (container.0 / natural.0).min(container.1 / natural.1)
+}
+
+/// `image` fitted to the box its parent gives it with `fit` — `Contain` (whole, centred,
+/// letterboxed) or `Cover` (filling it, centred, cropped) — as the picture element `id`. The
+/// box fills its parent (`size_full`). The cull stage, the duel, the proof sheet and preset
+/// cards draw their pictures with it.
+///
+/// `img(..).size_full()` placed in the flow is not enough. GPUI's `img` gives its element
+/// the image's aspect ratio, and in a block parent the layout then takes the element's height
+/// from its width through that ratio instead of from the parent: a portrait frame — or any
+/// frame narrower than the box's shape — comes out taller than the box, and Contain inside
+/// that taller element fills the width and runs off the bottom (#174), over whatever sits
+/// below it (#178). Positioned absolutely, the element takes both sizes from its containing
+/// box and the ratio is only used to paint.
+pub fn fitted(id: impl Into<ElementId>, image: impl Into<ImageSource>, fit: ObjectFit) -> Div {
+    div()
+        .relative()
+        .size_full()
+        .child(img(image).id(id).absolute().top_0().left_0().size_full().object_fit(fit).test_support())
 }
 
 /// The scale at which one image pixel covers one logical pixel: the inverse of the fit
@@ -470,10 +489,18 @@ impl ZoomImage {
         self.shared.update(cx, |s, cx| s.set(next, cx));
     }
 
+    /// The container as laid out, from the measuring canvas's prepaint. The picture was placed
+    /// (in `render`) for the box it had before; a change asks for another frame to place it
+    /// again. A notify during prepaint asks for none — GPUI drops the redraw request mid-draw —
+    /// so it is deferred until the frame is done. Without that a pane that changed size (Duel →
+    /// Grid, a panel toggled) kept the old box's placement until some unrelated redraw (#175).
     fn set_bounds(&mut self, bounds: Bounds<Pixels>, cx: &mut Context<Self>) {
         if self.bounds != Some(bounds) {
             self.bounds = Some(bounds);
-            cx.notify();
+            let this = cx.entity().downgrade();
+            cx.defer(move |cx| {
+                this.update(cx, |_, cx| cx.notify()).ok();
+            });
         }
     }
 }
@@ -539,16 +566,21 @@ impl Render for ZoomImage {
             (Some(image), Some(container)) => {
                 let (l, t, w, h) = view.placement(natural(image), container);
                 img(image.clone())
+                    .id(SharedString::from(format!("{}-picture", self.id)))
                     .absolute()
                     .left(px(l))
                     .top(px(t))
                     .w(px(w))
                     .h(px(h))
                     .object_fit(ObjectFit::Fill)
+                    .test_support()
                     .into_any_element()
             }
             // Before the first layout: contained, centred — what fit looks like.
-            (Some(image), None) => img(image.clone()).size_full().object_fit(ObjectFit::Contain).into_any_element(),
+            (Some(image), None) => {
+                fitted(SharedString::from(format!("{}-picture", self.id)), image.clone(), ObjectFit::Contain)
+                    .into_any_element()
+            }
             (None, _) => div().into_any_element(),
         };
         let this = cx.entity().downgrade();

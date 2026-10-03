@@ -40,7 +40,7 @@ mod performance_harness;
 pub use facets::{Facet, SOFT_THRESHOLD_DEFAULT, SOFT_THRESHOLD_KEY};
 pub use identity::{
     bind_sidecar_identity, canonical_photo_identity, is_photo_identity, legacy_photo_identity,
-    photo_identity_for, IdentityConflictAction, LEGACY_IDENTITY_NAMESPACE, IdentityConflictOutcome, IdentityRepairCursor,
+    photo_identity_for, ForeignConflictAction, ForeignConflictSummary, IdentityConflictAction, LEGACY_IDENTITY_NAMESPACE, IdentityConflictOutcome, IdentityRepairCursor,
     IdentityRepairPlan, IdentityRepairSummary, PendingIdentity, PendingIdentityField,
     PendingIdentityRow, PendingIdentitySummary, SidecarIdentity,
 };
@@ -868,7 +868,20 @@ impl Catalog {
                 .optional()?,
             _ => None,
         };
+        // A row whose own file is still in place is not re-homed (#150): this file is
+        // another copy carrying its identity, so it gets a row and a minted UUID of its own,
+        // and the binding reports the identity in its sidecar as a conflict.
+        let held_in_place = match by_uuid {
+            Some(id) => {
+                let (volume_id, _) = self.volume_for_path(absolute_path)?;
+                self.primary_copy_left_in_place(id, volume_id, true)?
+            }
+            None => false,
+        };
+        let (by_uuid, sidecar_uuid) =
+            if held_in_place { (None, None) } else { (by_uuid, sidecar_uuid) };
 
+        let matched_by_path = by_path.is_some();
         let result = if let Some((id, uuid, old_mtime, old_size)) = by_path {
             let unchanged = old_mtime == mtime_ns && old_size == size;
             self.conn.execute(
@@ -914,7 +927,10 @@ impl Catalog {
 
         // Record where the bytes physically are, so the resolver can find them.
         self.set_primary_location(result.id, absolute_path)?;
-        self.record_legacy_identifier(result.id, source.trusted())?;
+        // A copy kept apart from the row holding its identity does not take its legacy value.
+        if !held_in_place {
+            self.record_legacy_identifier(result.id, source.legacy_value(matched_by_path))?;
+        }
         Ok(result)
     }
 
@@ -995,7 +1011,17 @@ impl Catalog {
                 .optional()?,
             _ => None,
         };
+        // As in `upsert_photo_from` (#150): a row whose primary copy on this volume is still
+        // in place is not moved off it. One whose primary copies are on other volumes gains
+        // this file as another location; that moves nothing.
+        let held_in_place = match &by_uuid {
+            Some((id, _)) => self.primary_copy_left_in_place(*id, volume_id, false)?,
+            None => false,
+        };
+        let (by_uuid, sidecar_uuid) =
+            if held_in_place { (None, None) } else { (by_uuid, sidecar_uuid) };
 
+        let matched_by_path = by_loc.is_some();
         let result = if let Some((id, uuid, old_mtime, old_size)) = by_loc {
             let unchanged = old_mtime == mtime_ns && old_size == size;
             self.conn.execute(
@@ -1005,6 +1031,9 @@ impl Catalog {
             )?;
             UpsertResult { id, uuid, created: false, unchanged }
         } else if let Some((id, uuid)) = by_uuid {
+            // A re-home within this volume leaves its old path: debt queued for that path
+            // names a file that is no longer there (#150, as for a root re-home).
+            self.forget_identity_debt_left_behind(id, absolute)?;
             self.conn.execute(
                 "UPDATE photos SET mtime_ns = ?1, size = ?2, extension = ?3, missing = 0,
                     updated_at = ?4 WHERE id = ?5",
@@ -1031,7 +1060,9 @@ impl Catalog {
 
         // Record the file's location on its (NAS) volume so the resolver finds it there.
         self.add_location(result.id, volume_id, &rel, LocationRole::Primary)?;
-        self.record_legacy_identifier(result.id, source.trusted())?;
+        if !held_in_place {
+            self.record_legacy_identifier(result.id, source.legacy_value(matched_by_path))?;
+        }
         Ok(result)
     }
 
@@ -2445,10 +2476,27 @@ enum IdentitySource<'a> {
 }
 
 impl<'a> IdentitySource<'a> {
-    fn trusted(&self) -> Option<&'a str> {
+    /// The value to record as the upserted row's legacy identifier, when it is one (see
+    /// [`Catalog::record_legacy_identifier`]).
+    ///
+    /// A scanned sidecar's foreign value counts too (#150, review F4 of #146): a file
+    /// catalogued after #141 whose sidecar holds a DAM id gets a minted UUID, and that DAM id
+    /// is then the only thing linking the file to its row until a person resolves the
+    /// conflict. Recorded, it lets a later move re-home the row under the same guards as a
+    /// v23 row ([`Catalog::scan_identity`]) instead of cataloguing the file a second time.
+    /// It is recorded whichever way the row was matched, so a row catalogued before this
+    /// change gains the record at its next rescan; a value another row already holds is not
+    /// recorded again.
+    ///
+    /// A trusted value is not recorded on a row that `matched_by_path` (#150, a nit of the
+    /// #146 re-review): the value names the bundle's photo, and the row at that path is the
+    /// file already there — a same-size collision the importer skipped onto may be the
+    /// user's own, different photo. A sidecar's value describes the file at that path, so
+    /// it is recorded either way.
+    fn legacy_value(&self, matched_by_path: bool) -> Option<&'a str> {
         match *self {
-            IdentitySource::Trusted(value) => value,
-            IdentitySource::Sidecar(_) => None,
+            IdentitySource::Trusted(_) if matched_by_path => None,
+            IdentitySource::Trusted(value) | IdentitySource::Sidecar(value) => value,
         }
     }
 }

@@ -163,6 +163,32 @@ fn an_empty_or_unchanged_name_writes_nothing(cx: &mut TestAppContext) {
     assert_eq!(with_catalog(&app, |c| c.list_albums().unwrap()[0].name.clone()), before);
 }
 
+/// #180: the row's "+N" sits on the row, level with ⚙ and ✕ (React's inline `.album-add`),
+/// not on a line of its own below it.
+///
+/// Mutation-checked: with "+N" as a second text child after an empty glyph (as before) it
+/// lays out below the row and this fails.
+#[gpui_kit::test]
+fn the_add_selection_count_sits_inline_on_the_album_row(cx: &mut TestAppContext) {
+    let dir = TempDir::new("albums-plus-n");
+    let app = start(cx);
+    open_catalog_with_photos(&app, &dir, 3, cx);
+    name_prompt(&app, "album-new", "Harbour", cx);
+    let id = app.wired.shell.read_with(cx, |s, _| s.lists.albums[0].id);
+    select_all(&app, cx);
+    let (row, add, rename) = cx
+        .update_window(app.window(), |_, window, cx| {
+            window.render_frame(cx);
+            let b = |id: String| window.find(leak(id)).bounds();
+            (b(format!("album-{id}")), b(format!("album-add-{id}")), b(format!("album-rename-{id}")))
+        })
+        .unwrap();
+    assert!(add.top() >= row.top() && add.bottom() <= row.bottom(), "\"+N\" is inside the row: {add:?} in {row:?}");
+    assert_eq!(add.size.height, rename.size.height, "one line, like ⚙");
+    assert_eq!(add.center().y, rename.center().y, "level with ⚙");
+    assert!(add.right() <= rename.left(), "before the count and ⚙");
+}
+
 /// **Catalog identity.** The albums were listed from catalog A; the core switches to B, whose
 /// album and photo ids collide. Rename, add-the-selection and delete — asked with the old
 /// list's ids — fail closed (`CATALOG_CHANGED`) and B is untouched, with the switch event

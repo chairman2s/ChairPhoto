@@ -11,7 +11,6 @@ use crate::shell::style::Colors;
 use crate::storage::ui;
 use gpui_kit::component::button::Button;
 use gpui_kit::component::{Disableable as _, Sizable as _};
-use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenu, PopupMenuItem};
 use gpui_kit::prelude::*;
@@ -222,8 +221,7 @@ impl Render for AiSettings {
             body = body
                 .child(div().id("ai-remote-note").text_color(colors.dim).child(note.clone()).aria_label(note).test_support())
                 .child(
-                    Checkbox::new("ai-set-ollama-remote")
-                        .label("Send photos to this Ollama server")
+                    ui::checkbox("ai-set-ollama-remote", "Send photos to this Ollama server")
                         .checked(self.ollama_remote)
                         .on_change(cx.listener(|this, checked: &bool, _, cx| {
                             this.ollama_remote = *checked;
@@ -234,8 +232,7 @@ impl Render for AiSettings {
         }
         body = body
             .child(
-                Checkbox::new("ai-set-existing-only")
-                    .label("Suggest only existing tags (no new-tag discovery)")
+                ui::checkbox("ai-set-existing-only", "Suggest only existing tags (no new-tag discovery)")
                     .checked(self.existing_only)
                     .on_change(cx.listener(|this, checked: &bool, _, cx| {
                         this.existing_only = *checked;

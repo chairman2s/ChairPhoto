@@ -495,6 +495,42 @@ fn quick_tag_groups_are_managed_and_assign(cx: &mut TestAppContext) {
     assert!(with_catalog(&app, |c| c.get_photo_tags(s.photos[2]).unwrap().iter().any(|t| t.id == candid)));
 }
 
+/// #176: Quick tags' empty-state line wraps inside the inspector column (React's
+/// `.panel-empty` in `.qtg-tags`) instead of running past it on one line.
+///
+/// Mutation-checked: without the line's `w_full` / `min_w_0` it lays out one line wide and
+/// overruns the block.
+#[gpui_kit::test]
+fn the_quick_tags_empty_line_wraps_inside_the_column(cx: &mut TestAppContext) {
+    let dir = TempDir::new("tags-quick-empty");
+    let app = start(cx);
+    // A catalog where no tag was ever assigned, so Recently used is empty.
+    let db = dir.0.join("a.chairphoto");
+    let root = dir.0.join("photos");
+    let catalog = Catalog::open(&db, &root).unwrap();
+    let photo = catalog.upsert_photo(&root.join("2026/p0.ARW"), None, 0, 1).unwrap().id;
+    *app.state.catalog.lock().unwrap() = Some(catalog);
+    app.state.send(CoreEvent::CatalogSwitched(db.to_string_lossy().to_string()));
+    cx.run_until_parked();
+    select_photo(&app, photo, cx);
+    click(&app, "inspector-tab-tags", cx);
+    photo_tags(&app, cx).read_with(cx, |b, _| {
+        assert_eq!(b.group, RECENT_GROUP);
+        assert!(b.members.is_empty(), "no tag has been used yet");
+    });
+    render(&app, cx);
+    let (column, row, line) = cx
+        .update_window(app.window(), |_, window, _| {
+            let find = |id: &'static str| window.find(id).bounds();
+            (find("right-column"), find("quick-tags"), find("quick-tags-empty"))
+        })
+        .unwrap();
+    assert!(row.right() <= column.right(), "the quick-tags row fits the column: {row:?} in {column:?}");
+    assert!(line.right() <= row.right(), "the line ends inside the row: {line:?} in {row:?}");
+    assert!(line.left() >= row.left(), "{line:?} in {row:?}");
+    assert!(line.size.height > gpui_kit::px(20.), "the sentence wraps onto a second line: {line:?}");
+}
+
 // --- auto-tags (#181) ---------------------------------------------------------------------
 
 /// An auto-tag is the catalog's to assign: the tagging block never offers it (add box,

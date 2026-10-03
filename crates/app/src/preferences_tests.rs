@@ -793,6 +793,36 @@ fn a_stale_write_completion_does_not_undo_a_newer_change(cx: &mut TestAppContext
     assert_eq!(d.read_with(cx, |d, _| d.preload), Some(true));
 }
 
+// --- checkbox labels (#180) -------------------------------------------------------------------
+
+/// The checkbox rows set their labels as body text, not gpui-component's default 16 px: a
+/// one-line row is as tall as a 12–13 px line (`line-height` 1.25: 15–16.25 px) rather than a
+/// 16 px one (20 px). Modules → "enabled", Editors → the Darkroom's two rows.
+///
+/// Mutation-checked: with `ui::checkbox` back on the default size (no `small`, no
+/// `text_size`) "enabled" is 20 px tall and this fails.
+#[gpui_kit::test]
+fn checkbox_labels_are_body_text_sized(cx: &mut TestAppContext) {
+    let dir = TempDir::new("prefs-checkboxes");
+    let app = start(cx);
+    open_catalog(&app, &dir, cx);
+    open(&app, cx);
+    let height = |id: &'static str, cx: &mut TestAppContext| {
+        in_window(&app, cx, |window, cx| {
+            window.render_frame(cx);
+            window.find(id).bounds().size.height
+        })
+    };
+    tab(&app, "prefs-tab-modules", cx);
+    let enabled = height("module-toggle-dev", cx);
+    tab(&app, "prefs-tab-editors", cx);
+    let preload = height("darkroom-preload", cx);
+    let timing = height("darkroom-timing", cx);
+    for (id, h) in [("module-toggle-dev", enabled), ("darkroom-preload", preload), ("darkroom-timing", timing)] {
+        assert!(h <= gpui_kit::px(16.5), "{id}: one line of body text, not 16 px text ({h:?})");
+    }
+}
+
 // --- appearance -------------------------------------------------------------------------------
 
 /// Appearance: Standard paints Standard and hides the status line; Follow shows what is

@@ -55,6 +55,9 @@ pub struct MergeSummary {
     pub assignments_added: usize,
     /// `true` if the batch was inserted, `false` if it already existed (re-merge).
     pub batch_added: bool,
+    /// Photos with no identity (a blank uuid from a pre-#146 bundle) and no original in the
+    /// bundle, whose path another photo already holds: neither matched nor inserted (#150).
+    pub photos_skipped: usize,
 }
 
 impl Catalog {
@@ -278,14 +281,21 @@ impl MergeCtx<'_> {
     /// it in another case still finds the photo. A bundle written before #146 can carry a
     /// non-UUID id that an older catalog had adopted; it is matched and stored as its
     /// [`super::legacy_photo_identity`] — the identity schema v23 gave that photo in every
-    /// catalog — and recorded as the row's legacy identifier, so it never becomes a
-    /// non-UUID `photos.uuid` again.
+    /// catalog — and recorded as the row's legacy identifier unless another row already
+    /// holds it (#150; see [`super::identity::RECORD_LEGACY_IDENTIFIER_SQL`]), so it never
+    /// becomes a non-UUID `photos.uuid` again.
     ///
     /// A photo with an empty or blank uuid has no identity to match (#146 review N4), so it is
-    /// never matched to another catalog's such photo. It can only be the photo already at
-    /// its path — which is where the bundle importer has just indexed it, and where a second
-    /// row could not go anyway (`photos.path` is UNIQUE) — and otherwise it is inserted with a
-    /// fresh v4, as schema v23 does for such a row.
+    /// never matched to another catalog's such photo, and never to whatever photo this
+    /// catalog has at its path either (#150): that can be a different photo — the importer
+    /// renames a different-size collision to ` (n)`, and the photo already at the path is
+    /// the user's own. The bundle importer, which knows which row it indexed each blank-uuid
+    /// original into, hands merge that row's identity instead
+    /// (`bundle::importer::index_bundle_with`). A blank-uuid photo that still arrives here is
+    /// one without an original in the bundle: inserted with a fresh v4, as schema v23 does
+    /// for such a row, when its path is free, and otherwise skipped
+    /// ([`MergeSummary::photos_skipped`]) — a second row cannot take the path
+    /// (`photos.path` is UNIQUE), and nothing says the photo there is this one.
     fn merge_photo(&mut self, photo: &BundlePhoto, batch_id: i64) -> Result<()> {
         let (uuid, existing): (String, Option<i64>) = match super::photo_identity_for(&photo.uuid) {
             Some(uuid) => {
@@ -296,15 +306,25 @@ impl MergeCtx<'_> {
                 (uuid, existing)
             }
             None => {
-                let existing = self
+                let taken = self
                     .tx
                     .query_row(
-                        "SELECT id FROM photos WHERE path = ?1",
+                        "SELECT 1 FROM photos WHERE path = ?1",
                         params![photo.relative_path],
-                        |r| r.get(0),
+                        |_| Ok(()),
                     )
-                    .optional()?;
-                (uuid::Uuid::new_v4().to_string(), existing)
+                    .optional()?
+                    .is_some();
+                if taken {
+                    eprintln!(
+                        "bundle merge: a photo with no identity at {} was skipped: another \
+                         photo is at that path",
+                        photo.relative_path
+                    );
+                    self.summary.photos_skipped += 1;
+                    return Ok(());
+                }
+                (uuid::Uuid::new_v4().to_string(), None)
             }
         };
 
@@ -829,5 +849,61 @@ mod tests {
             .collect::<rusqlite::Result<_>>()
             .unwrap();
         assert_eq!(uuids, [KNOWN, "0d9c8b7a-6f5e-4d3c-8b2a-190807060504"]);
+    }
+
+    // --- legacy identifiers (#150) ----------------------------------------------------
+
+    /// #150 (review N3 of #146): an old build merged a migrated catalog's bundle, leaving a
+    /// row holding the v5 of `dam:asset/1`; this catalog then migrated, and v23 kept its own
+    /// row for that value apart with a v4 and recorded the value there. Merging an old bundle
+    /// that still says `dam:asset/1` matches the v5 row — but must not record the value on
+    /// it as well: two owners would make a scan refuse both, so the original would be
+    /// catalogued again the next time it moved.
+    #[test]
+    fn merge_does_not_give_a_legacy_value_a_second_owner() {
+        let (cat, _root) = temp_catalog("legacy-second-owner");
+        let v5 = crate::catalog::legacy_photo_identity("dam:asset/1");
+        cat.conn()
+            .execute_batch(&format!(
+                "INSERT INTO photos(uuid, path, mtime_ns, size, extension, created_at, updated_at)
+                 VALUES('6f1c1f0e-2b7a-4c3d-9e8f-0a1b2c3d4e5f', 'a/original.jpg', 1, 1, 'jpg', 1, 1);
+                 INSERT INTO photo_legacy_identifiers(photo_id, identifier)
+                 VALUES(last_insert_rowid(), 'dam:asset/1');
+                 INSERT INTO photos(uuid, path, mtime_ns, size, extension, created_at, updated_at)
+                 VALUES('{v5}', 'b/merged-by-an-old-build.jpg', 1, 1, 'jpg', 1, 1);"
+            ))
+            .unwrap();
+        let mut m = sample_manifest();
+        m.photos[0].uuid = "dam:asset/1".into();
+
+        let s = cat.merge_bundle(&m).unwrap();
+        assert_eq!((s.photos_existing, s.photos_added), (1, 0), "matched the v5 row");
+        let owners: Vec<String> = cat
+            .conn()
+            .prepare(
+                "SELECT p.path FROM photo_legacy_identifiers l JOIN photos p ON p.id = l.photo_id
+                 WHERE l.identifier = 'dam:asset/1'",
+            )
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(owners, ["a/original.jpg"], "the value keeps its one owner");
+
+        // A value nobody holds yet is still recorded on the row it matched or created.
+        let mut fresh = sample_manifest();
+        fresh.photos[0].uuid = "dam:asset/2".into();
+        fresh.photos[0].relative_path = "c/new.jpg".into();
+        cat.merge_bundle(&fresh).unwrap();
+        let recorded: i64 = cat
+            .conn()
+            .query_row(
+                "SELECT count(*) FROM photo_legacy_identifiers WHERE identifier = 'dam:asset/2'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(recorded, 1);
     }
 }

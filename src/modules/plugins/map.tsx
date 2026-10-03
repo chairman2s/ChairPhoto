@@ -1260,26 +1260,34 @@ function MapSettings({ api }: { api: ChairPhotoAPI }) {
 // "Geocode location" button that fills empty IPTC location fields via the backend
 // `geocode_to_iptc` command.
 
-/** How the backend's single-photo geocode begins its answer when the location reached the
- *  catalog but not the sidecar (`plugins::map::geocode::PENDING_LEAD`). It arrives as the
- *  command's error, but it is not a failure: the catalog changed, and the fields stay owed
- *  for the repair pass (#148, #153). */
-export const GEOCODE_PENDING_LEAD = "Geocoded location stored in the catalog, but not yet in the sidecar";
+/** What `geocode_to_iptc` answers (the core's `GeocodeOutcome`). `sidecar: "pending"` with
+ *  `filled` is not a failure: the location is in the catalog and the fields stay owed for
+ *  the next save or the repair pass (#148). */
+export interface GeocodeOutcome {
+  filled: boolean;
+  sidecar: "written" | "unchanged" | "pending";
+  /** Why the sidecar is pending, when it is. */
+  reason: string | null;
+}
 
 /** The status line for a single-photo geocode, and whether the catalog changed (so the host
- *  re-reads it). A pending sidecar is shown as the backend words it, without "Error: "
- *  (the GPUI panel's `geocode_status`). */
+ *  re-reads it). Branches on the typed outcome, never on a message's wording (review of
+ *  #153, M2); the lines match the core's `GeocodeOutcome::status`. */
 export function singleGeocodeOutcome(
-  result: { filled: boolean } | { error: unknown },
+  result: GeocodeOutcome | { error: unknown },
 ): { status: string; changed: boolean } {
-  if ("filled" in result) {
-    return result.filled
-      ? { status: "Location fields filled.", changed: true }
-      : { status: "No GPS data, fields already set, or no result from geocoder.", changed: false };
+  if ("error" in result) return { status: `Error: ${String(result.error)}`, changed: false };
+  if (!result.filled) {
+    return { status: "No GPS data, fields already set, or no result from geocoder.", changed: false };
   }
-  const message = String(result.error);
-  if (message.startsWith(GEOCODE_PENDING_LEAD)) return { status: message, changed: true };
-  return { status: `Error: ${message}`, changed: false };
+  if (result.sidecar === "pending") {
+    const why = result.reason ? ` (${result.reason})` : "";
+    return {
+      status: `Geocoded location stored in the catalog, but not yet in the sidecar${why}; the repair pass will write it.`,
+      changed: true,
+    };
+  }
+  return { status: "Location fields filled.", changed: true };
 }
 
 export function GeocodePanelContent({ api }: { api: ChairPhotoAPI }) {
@@ -1298,8 +1306,7 @@ export function GeocodePanelContent({ api }: { api: ChairPhotoAPI }) {
     setStatus("Geocoding…");
     let outcome: { status: string; changed: boolean };
     try {
-      const filled = await api.invoke<boolean>("geocode_to_iptc", { photoId });
-      outcome = singleGeocodeOutcome({ filled });
+      outcome = singleGeocodeOutcome(await api.invoke<GeocodeOutcome>("geocode_to_iptc", { photoId }));
     } catch (e: unknown) {
       outcome = singleGeocodeOutcome({ error: e });
     }

@@ -8,6 +8,23 @@ use gpui_kit::{div, px, AnyElement, Div, FontWeight, SharedString, Stateful, Tes
 /// `.chip`: a small bordered button. Disabled chips are dimmed and take no clicks (the
 /// caller adds `on_click` only when enabled — see [`clickable`]).
 pub fn chip(id: impl Into<SharedString>, label: impl Into<SharedString>, enabled: bool, colors: Colors) -> Stateful<Div> {
+    chip_with(id, label.into(), enabled, colors)
+}
+
+/// A [`chip`] showing a 13 px icon instead of a label — the app's stroke-icon size — for a
+/// glyph the UI font lacks (the loupe's ↺ / ↻ fell back to a font that drew them tiny, #172).
+/// `label` names it for assistive tech and tests.
+pub fn icon_chip(
+    id: impl Into<SharedString>,
+    icon: impl gpui_kit::component::IconNamed,
+    label: impl Into<SharedString>,
+    enabled: bool,
+    colors: Colors,
+) -> Stateful<Div> {
+    chip_with(id, gpui_kit::component::Icon::new(icon).size(px(13.)), enabled, colors).aria_label(label)
+}
+
+fn chip_with(id: impl Into<SharedString>, child: impl IntoElement, enabled: bool, colors: Colors) -> Stateful<Div> {
     div()
         .id(id.into())
         .flex()
@@ -20,7 +37,7 @@ pub fn chip(id: impl Into<SharedString>, label: impl Into<SharedString>, enabled
         .rounded_full()
         .text_size(px(11.5))
         .text_color(colors.dim)
-        .child(label.into())
+        .child(child)
         .when(enabled, |b| b.cursor_pointer().hover(|s| s.border_color(colors.dim).text_color(colors.txt)))
         .when(!enabled, |b| b.opacity(0.4))
 }

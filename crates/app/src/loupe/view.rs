@@ -38,6 +38,7 @@ use crate::storage::ui;
 use chairphoto_core::app::with_catalog_as;
 use chairphoto_core::catalog::{Photo, PickState};
 use chairphoto_core::image_pool::ImageKind;
+use gpui_kit::assets::IconName;
 use gpui_kit::prelude::*;
 use gpui_kit::{
     div, px, AnyElement, App, Context, Entity, FocusHandle, Global, Hsla, InteractiveElement, SharedString,
@@ -346,6 +347,7 @@ impl LoupeView {
         let back_to_original = selection.extra_photo.is_some() && selection.stack_origin.is_some();
         let soft = shell.soft_threshold;
         let version = shell.active_version().map(|v| v.name.clone());
+        let hint = loupe_hint(self.modules.read(cx).is_enabled(FACES_MODULE));
         let id = photo.id;
         let name = file_name(&photo.path);
         let mut tags = div().flex().items_center().gap(px(6.)).min_w_0().overflow_hidden();
@@ -409,13 +411,17 @@ impl LoupeView {
                     shell.update(cx, |s, cx| s.select_with(cx, |l| l.back_to_original()))
                 }))
             })
+            // App.tsx's ↺ / ↻ as Lucide's rotate arrows: the UI font has no U+21BA/U+21BB, and
+            // the fallback drew them as tiny marks (#172).
             .child(ui::clickable(
-                ui::chip("loupe-rotate-left", "↺", true, colors),
+                ui::icon_chip("loupe-rotate-left", IconName::RotateCcw, "Rotate left", true, colors)
+                    .tooltip(crate::shell::title_bar::tooltip("Rotate left (non-destructive)")),
                 true,
                 cx.listener(move |this, _, _, cx| this.rotate(id, -90, cx)),
             ))
             .child(ui::clickable(
-                ui::chip("loupe-rotate-right", "↻", true, colors),
+                ui::icon_chip("loupe-rotate-right", IconName::RotateCw, "Rotate right", true, colors)
+                    .tooltip(crate::shell::title_bar::tooltip("Rotate right (non-destructive)")),
                 true,
                 cx.listener(move |this, _, _, cx| this.rotate(id, 90, cx)),
             ))
@@ -423,15 +429,32 @@ impl LoupeView {
             .child(div().flex_1())
             .child(
                 div()
+                    .id("loupe-hint")
                     .text_size(px(11.))
                     .text_color(colors.mute)
                     .whitespace_nowrap()
-                    .child("scroll zoom · drag pan · dbl-click 100% · P pick · X reject · ← →"),
+                    .child(hint)
+                    .aria_label(hint)
+                    .test_support(),
             )
     }
 
     fn step(&mut self, delta: isize, extend: bool, cx: &mut Context<Self>) {
         self.shell.update(cx, |s, cx| s.select_with(cx, |l| l.step_active(delta, extend)));
+    }
+}
+
+/// The Faces module's id (`modules::faces::FACES_MODULE_ID`, which exists only with the
+/// `faces` feature).
+const FACES_MODULE: &str = "faces";
+
+/// The loupe bar's key hint (App.tsx's `.loupe-hint`). "F faces" only while the Faces module
+/// is on: F toggles its overlay's boxes, and without it the key does nothing.
+pub fn loupe_hint(faces: bool) -> &'static str {
+    if faces {
+        "scroll zoom · drag pan · dbl-click 100% · P pick · X reject · F faces · ← →"
+    } else {
+        "scroll zoom · drag pan · dbl-click 100% · P pick · X reject · ← →"
     }
 }
 

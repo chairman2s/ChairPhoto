@@ -30,6 +30,8 @@ gpui_kit::assets::icon_assets!(
         // Module main views on the rail: Statistics, People.
         ChartNoAxesColumn,
         UserGroup,
+        // The loupe's rotate-left chip (its rotate-right, `RotateCw`, is in the default bundle).
+        RotateCcw,
     ]
 );
 

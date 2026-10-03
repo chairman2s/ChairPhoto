@@ -369,6 +369,37 @@ fn a_catalog_switch_closes_the_loupe_and_its_marks_fail_closed(cx: &mut TestAppC
     assert!(!app.wired.shell.read_with(cx, |s, _| s.loupe_open));
 }
 
+/// #172: the loupe bar's rotate chips are icon chips (Lucide's rotate arrows — the UI font
+/// has no ↺ / ↻), named for tests and assistive tech, and still turn the photo; the key hint
+/// is App.tsx's, without "F faces" while the Faces module is off (its key would do nothing).
+#[gpui_kit::test]
+fn the_loupe_bar_rotates_with_icon_chips_and_hints_its_keys(cx: &mut TestAppContext) {
+    let (app, _pool, _dir, ids) = app_with(2, "loupe-bar", cx);
+    select(&app, ids[0], cx);
+    press(&app, "enter", cx);
+    assert_eq!(label_of(&app, "loupe-rotate-left", cx).as_deref(), Some("Rotate left"));
+    assert_eq!(label_of(&app, "loupe-rotate-right", cx).as_deref(), Some("Rotate right"));
+    assert_eq!(
+        label_of(&app, "loupe-hint", cx).as_deref(),
+        Some("scroll zoom · drag pan · dbl-click 100% · P pick · X reject · ← →")
+    );
+    let rotation = |app: &App| app.state.catalog.lock().unwrap().as_ref().unwrap().photo_rotation(ids[0]).unwrap();
+    cx.update_window(app.window(), |_, window, cx| {
+        window.render_frame(cx);
+        window.click("loupe-rotate-right", cx)
+    })
+    .unwrap();
+    cx.run_until_parked();
+    assert_eq!(rotation(&app), 90);
+    cx.update_window(app.window(), |_, window, cx| {
+        window.render_frame(cx);
+        window.click("loupe-rotate-left", cx)
+    })
+    .unwrap();
+    cx.run_until_parked();
+    assert_eq!(rotation(&app), 0);
+}
+
 // --- Compare ----------------------------------------------------------------------------------
 
 /// The duel: → crowns the challenger (the champion is rejected), ← keeps the champion; the last

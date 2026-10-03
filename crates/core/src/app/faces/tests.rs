@@ -435,6 +435,39 @@ fn the_index_jobs_conversion_reports_progress() {
     );
 }
 
+/// #156, forced interleaving: the index job's pre-marker conversion, on its own connection,
+/// is about to write a photo's sidecar when a face verb on the main connection ignores
+/// Alice there and writes the sidecar without her. The pass must not then put her back: it
+/// reads the photo's set once it holds the sidecar's file lock, so it writes the set the
+/// verb left. (Before, it read the set first and wrote that older set over the verb's.)
+#[test]
+fn a_face_verb_during_the_pre_marker_conversion_is_not_overwritten() {
+    use crate::plugins::faces::regions::tests::BEFORE_REGION_WRITE;
+    let (c, root) = temp_catalog("legacy-pass-race");
+    let (p, path, alice) = pre_marker_photo(&c, &root, "p1.NEF");
+    let resolved = c.resolve_photo_path(p).unwrap().unwrap();
+    let state = state_with(c);
+    let verb = {
+        let state = state.clone();
+        move || crate::app::with_catalog(&state, |c| ignore(c, alice)).unwrap()
+    };
+    *BEFORE_REGION_WRITE.lock().unwrap() = Some((resolved.clone(), Box::new(verb)));
+
+    let claim = begin_index_job(&state, None).unwrap();
+    run_index_job(&crate::app::NoEvents, claim);
+
+    let hook = BEFORE_REGION_WRITE.lock().unwrap();
+    assert!(hook.as_ref().is_none_or(|(p, _)| *p != resolved), "the pass never reached the photo");
+    drop(hook);
+    let state_of_alice = crate::app::with_catalog(&state, |c| Ok(face_state(c, alice))).unwrap();
+    assert_eq!(state_of_alice, "ignored");
+    let xml = std::fs::read_to_string(crate::xmp::sidecar_path(&path)).unwrap();
+    assert!(crate::xmp::read_face_regions(&path).iter().all(|r| r.name != "Alice"),
+        "the pass wrote back the region the verb removed:\n{xml}");
+    let left = crate::app::with_catalog(&state, |c| Ok(legacy_photos(c))).unwrap();
+    assert!(left.is_empty(), "the written photo spends its record: {left:?}");
+}
+
 /// The pass stops at the job's abort flag: nothing written, every record row kept.
 #[test]
 fn an_aborted_index_job_leaves_the_pre_marker_record() {

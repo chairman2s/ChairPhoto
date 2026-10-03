@@ -1660,6 +1660,14 @@ fn the_strips_frames_are_asked_for_nearest_the_open_photo_first(cx: &mut TestApp
     );
     let order = order(&rig, cx);
     assert_eq!(rig.open_photo(cx), Some(order[3]));
+    // The grid's tiles already show the looks the strip names (#151), so the strip asked
+    // for nothing. Drop them (an eviction, a rotation of each): the strip asks for its frames.
+    let images = rig.app.wired.images.clone();
+    for &photo in &order {
+        images.update(cx, |s, cx| s.invalidate(photo, cx));
+    }
+    rig.app.wired.shell.update(cx, |_, cx| cx.notify());
+    cx.run_until_parked();
     let thumb = |i: usize| JobKey::photo(order[i], ImageKind::Thumb);
     let want: Vec<JobKey> = [3, 4, 2, 5, 1, 6, 0].into_iter().map(thumb).collect();
     let batches = rig.pool.batches.lock().unwrap().clone();
@@ -1740,8 +1748,59 @@ fn a_frame_asks_for_the_cover_look_its_row_names(cx: &mut TestAppContext) {
     assert_eq!(thumb_jobs(&rig, photo), jobs + 2, "a new revision: asked again");
 }
 
-/// A thumbnail the Library cached with no look said may be an older cover's (the grid's
-/// tier does not follow the token): the strip renders it again for the look its row names.
+/// #151: "Use as cover" in the Darkroom, then back to the Library: the grid's tile shows the
+/// cover's look, never the plain thumbnail it had cached; the other tiles are not rendered
+/// again.
+#[gpui_kit::test]
+fn a_cover_set_in_the_darkroom_updates_the_grid_tile(cx: &mut TestAppContext) {
+    let rig = rig_with(
+        "dk-cover-grid",
+        3,
+        |rig, cx| {
+            rig.render(cx);
+            for &id in &rig.ids {
+                rig.pool.finish(&JobKey::photo(id, ImageKind::Thumb), Ok(pixels(4, 4)));
+            }
+            cx.run_until_parked();
+        },
+        cx,
+    );
+    let photo = rig.ids[0];
+    let thumb_width = |rig: &Rig, id: i64, cx: &mut TestAppContext| match image(rig, id, cx) {
+        ImageState::Ready(l) => Some(l.image.size(0).width.0),
+        _ => None,
+    };
+    for &id in &rig.ids {
+        assert_eq!(thumb_width(&rig, id, cx), Some(4), "the grid cached every tile");
+    }
+    let others: Vec<(i64, usize)> = rig.ids[1..].iter().map(|&id| (id, thumb_jobs(&rig, id))).collect();
+
+    rig.slide(Control::Tone(ToneKey::Ev), 0.5, cx);
+    rig.settle_and_save(cx);
+    rig.darkroom(cx).update(cx, |d, cx| d.toggle_cover(cx));
+    work(cx);
+    assert!(rig.catalog(|c| c.cover_of(photo).unwrap()).is_some(), "the cover is set");
+
+    rig.app.wired.shell.update(cx, |s, cx| s.show_library(cx));
+    cx.run_until_parked();
+    work(cx);
+    rig.render(cx);
+    assert_eq!(rig.surface(cx), Surface::Library);
+    assert_eq!(thumb_width(&rig, photo, cx), None, "the plain thumbnail is not shown under the cover's row");
+    assert!(rig.app.wired.images.read_with(cx, |s, _| s.is_pending(photo, ImageKind::Thumb)), "the grid asks for the cover's look");
+    rig.pool.finish(&JobKey::photo(photo, ImageKind::Thumb), Ok(pixels(8, 4)));
+    cx.run_until_parked();
+    rig.render(cx);
+    assert_eq!(thumb_width(&rig, photo, cx), Some(8), "the cover's look lands in the grid");
+    for (id, jobs) in others {
+        assert_eq!(thumb_jobs(&rig, id), jobs, "photo {id}: not rendered again");
+        assert_eq!(thumb_width(&rig, id, cx), Some(4));
+    }
+}
+
+/// A thumbnail cached with no look said (a plain request) may be an older cover's: it is
+/// rendered again for the look its row names — by the grid already (#151), so the strip asks
+/// nothing more — and the cached one is not shown.
 #[gpui_kit::test]
 fn a_thumbnail_cached_with_no_look_is_rendered_again(cx: &mut TestAppContext) {
     let mut jobs_before = 0;
@@ -1758,14 +1817,17 @@ fn a_thumbnail_cached_with_no_look_is_rendered_again(cx: &mut TestAppContext) {
                 let v = c.create_version(photo, "Warm").unwrap();
                 c.set_cover_version(photo, Some(v)).unwrap();
             });
+            let jobs = thumb_jobs(rig, photo);
             refresh_rows(rig, cx);
+            rig.render(cx);
             jobs_before = thumb_jobs(rig, photo);
+            assert_eq!(jobs_before, jobs + 1, "the grid rendered it again for the row's look");
         },
         cx,
     );
     let photo = order(&rig, cx)[1];
     assert!(look(&rig, photo, cx).unwrap().cover.is_some());
-    assert_eq!(thumb_jobs(&rig, photo), jobs_before + 1, "rendered again for the row's look");
+    assert_eq!(thumb_jobs(&rig, photo), jobs_before, "the strip names the same look: nothing more");
     assert!(!matches!(image(&rig, photo, cx), ImageState::Ready(_)), "the cached one is not shown");
     rig.pool.finish(&JobKey::photo(photo, ImageKind::Thumb), Ok(pixels(4, 4)));
     cx.run_until_parked();
@@ -1802,7 +1864,8 @@ fn a_result_for_an_earlier_look_is_dropped(cx: &mut TestAppContext) {
 }
 
 /// A photo that leaves the strip's window (±40 around the open one) is let go: its pending
-/// frame is released, its late answer is dropped, and it loses its look.
+/// frame is released and its late answer is dropped. Its look stays — it says what the
+/// tier was asked to show, and binds no other view's request (#151).
 #[gpui_kit::test]
 fn a_frame_that_leaves_the_strip_is_released(cx: &mut TestAppContext) {
     let rig = rig("dk-cover-window", 43, cx);
@@ -1817,7 +1880,8 @@ fn a_frame_that_leaves_the_strip_is_released(cx: &mut TestAppContext) {
     assert!(look(&rig, first, cx).is_some());
     select(&rig, order[41], cx);
     assert!(!pending(&rig, cx), "out of the window: released");
-    assert_eq!(look(&rig, first, cx), None, "and no longer the strip's look: no view's request is bound");
+    let claimed = rig.app.wired.images.read_with(cx, |s, _| s.is_claimed(first, ImageKind::Thumb));
+    assert!(!claimed, "and no longer held by the strip");
     let dropped = stale_dropped(&rig, cx);
     rig.pool.finish(&key, Ok(pixels(4, 4)));
     cx.run_until_parked();
@@ -1866,7 +1930,7 @@ fn cover_look_across_a_switch(delivered: bool, cx: &mut TestAppContext) {
         crate::tests::deliver_switch(&rig.app, cx);
         work(cx);
         assert_eq!(rig.surface(cx), Surface::Library);
-        assert_eq!(look(&rig, photo, cx), None, "the switch forgot A's looks");
+        assert_ne!(look(&rig, photo, cx).map(|l| l.from), Some(a), "the switch forgot A's looks");
         // The Library asks for B's thumbnail: not bound to A, so it lands.
         rig.render(cx);
         rig.pool.finish(&key, Ok(pixels(4, 4)));
@@ -1876,7 +1940,7 @@ fn cover_look_across_a_switch(delivered: bool, cx: &mut TestAppContext) {
         crate::tests::deliver_switch(&rig.app, cx);
         work(cx);
         assert_eq!(rig.surface(cx), Surface::Library);
-        assert_eq!(look(&rig, photo, cx), None, "the switch forgot A's looks");
+        assert_ne!(look(&rig, photo, cx).map(|l| l.from), Some(a), "the switch forgot A's looks");
         let dropped = stale_dropped(&rig, cx);
         rig.pool.finish(&key, Ok(pixels(4, 4)));
         cx.run_until_parked();
@@ -1909,9 +1973,10 @@ fn a_cover_look_never_shows_the_old_catalog_after_the_switch_event(cx: &mut Test
 }
 
 /// A re-root (Preferences → Library folder) reopens the catalog under a new identity and
-/// sends no `catalog:switched`. The strip's looks go with the strip: back in the Library, a
-/// photo the strip showed is no one's look, so its next thumbnail (a rotation, an eviction)
-/// is not checked against the catalog the strip read and lands (review rv134 M1).
+/// sends no `catalog:switched`. Back in the Library, with the rows re-read, a photo the strip
+/// showed is not bound to the catalog the strip read: its next thumbnail (a rotation, an
+/// eviction) lands (review rv134 M1). The rows from the reopened catalog replace the earlier
+/// looks (#151); a plain request is never bound (`library::tests`).
 #[gpui_kit::test]
 fn a_re_root_leaves_no_library_thumbnail_bound_to_the_old_catalog(cx: &mut TestAppContext) {
     let rig = rig("dk-reroot", 3, cx);
@@ -1926,7 +1991,7 @@ fn a_re_root_leaves_no_library_thumbnail_bound_to_the_old_catalog(cx: &mut TestA
     rig.app.wired.shell.update(cx, |s, cx| s.show_library(cx));
     cx.run_until_parked();
     work(cx);
-    assert_eq!(look(&rig, photo, cx), None, "no strip, no looks");
+    assert_eq!(look(&rig, photo, cx).map(|l| l.from), Some(a), "the tier's look stays with the strip gone");
     let new_root = rig.dir.0.join("newroot");
     chairphoto_core::app::catalogs::reroot_open_catalog_as(&rig.app.state, a, new_root).unwrap();
     refresh_rows(&rig, cx);
@@ -1936,9 +2001,13 @@ fn a_re_root_leaves_no_library_thumbnail_bound_to_the_old_catalog(cx: &mut TestA
     let images = rig.app.wired.images.clone();
     images.update(cx, |s, cx| s.invalidate(photo, cx));
     images.update(cx, |s, _| s.request(photo, ImageKind::Thumb));
+    // The grid's own ask for the new rows' look was cancelled by the invalidate; the request
+    // goes out once that answer is drained.
+    cx.run_until_parked();
     rig.pool.finish(&key, Ok(pixels(4, 4)));
     cx.run_until_parked();
     assert!(matches!(image(&rig, photo, cx), ImageState::Ready(_)), "the Library's thumbnail lands");
+    assert_eq!(refused(&rig, cx), 0, "nothing refused");
 }
 
 /// A frame rendered across a re-root is refused, not failed: the frame stays empty (asked
@@ -1971,9 +2040,9 @@ fn a_frame_refused_across_a_re_root_is_asked_again_for_the_new_rows(cx: &mut Tes
     assert_ne!(a, b);
     // Rows from another catalog close the Darkroom (as a switch does), and its strip with it.
     assert_eq!(rig.surface(cx), Surface::Library);
-    assert_eq!(look(&rig, photo, cx), None, "no strip, no looks");
     rig.render(cx);
     assert_eq!(thumb_jobs(&rig, photo), jobs + 1, "the Library asks for it again: the refusal did not stick");
+    assert_eq!(look(&rig, photo, cx).map(|l| l.from), Some(b), "the grid's look, from the new rows");
     rig.pool.finish(&key, Ok(pixels(4, 4)));
     cx.run_until_parked();
     assert!(matches!(image(&rig, photo, cx), ImageState::Ready(_)), "it lands");

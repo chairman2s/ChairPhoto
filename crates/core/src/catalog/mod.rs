@@ -43,7 +43,7 @@ pub use identity::{
     IdentityRepairPlan, IdentityRepairSummary, PendingIdentity, PendingIdentityField,
     PendingIdentityRow, PendingIdentitySummary, SidecarIdentity,
 };
-pub use iptc_owed::{IptcMask, IptcSettled, IptcSidecarState, IptcSidecarWrite};
+pub use iptc_owed::{IptcMask, IptcSettled, IptcSidecarState, IptcSidecarWrite, OwedIptc};
 pub use locations::{PathCandidate, ResolveMode};
 pub use lifecycle::{
     carry_companions, copy_and_verify, copy_with_companions, verify_and_delete_locals, BackupPlan,

@@ -74,10 +74,17 @@ Every sidecar write (`xmp::document::SidecarDocument`, issue #149) reads the fil
 only what that writer owns, and replaces the whole file at once: a temp file in the same
 folder (a dotfile ending `.chairphoto-tmp`, unique to that write), synced, then renamed over
 the sidecar. A reader, another tool or a crash sees the old sidecar or the new one, never a
-mix. Writers of one sidecar in one process take turns, and an IPTC save and a geocode fill
-store and write in one order. A write is **refused, leaving the sidecar as it was**, when:
+mix. A temp file left by a write killed before its rename stays until it is a day old; the
+next successful write to its folder after that has it removed, on a background thread (each
+folder is checked once per run, only regular files with names of that exact pattern are
+touched, and a folder ChairPhoto may write but not list is never checked). Writers of one
+sidecar in one process take turns, and an IPTC save and a geocode fill store and write in
+one order. A write is **refused, leaving the sidecar as it was**, when:
 
-- the original or its folder is missing — an unmounted volume; no folder is ever created;
+- the original or its folder is missing — an unmounted volume; no folder is ever created.
+  On Unix the original's folder is held open from the read to the rename, and the temp file
+  is created and renamed through that handle, so a volume that goes away after the last
+  check cannot redirect the write into the empty mount point (#155);
 - the sidecar exists but this process may not write it (permissions, ownership, ACL);
 - **the folder is not writable**, even if the sidecar itself is (a share that grants
   modify but not create, a mount ACL). The rename needs a new file in the folder, and
@@ -164,6 +171,19 @@ The debt is therefore a **set of fields per photo**, in `pending_sidecar_iptc`
   per-photo record writes the sidecar of the copy the resolver picks, as a save does. The
   title-bar "identity debt" chip and menu badge count copies owing identity plus photos owing
   IPTC, and the panel's Start is enabled by either.
+- **Listed, dismissed, retried one at a time (#153).** The identity-debt panel lists the
+  photos owing IPTC (`list_owed_iptc_page`: id, UUID, path, owed fields, last error,
+  generation; paged) with **Retry** and **Dismiss** per row (`app::iptc_owed`; the Tauri
+  `list_owed_iptc` / `retry_owed_iptc` / `dismiss_owed_iptc` commands). Retry writes the
+  photo's owed fields as a save does: it takes the sidecar's write turn, reads what is owed
+  now with the turn held, and writes and settles through the save's compare-and-set; an
+  unreachable original is recorded on the row and stays owed. Dismiss clears the owed set
+  without writing — for a photo kept on read-only media — by compare-and-set on the UUID and
+  generation the row was read with, so a store since then (whose debt the user has not seen)
+  or another photo that took the id is never dismissed. The catalog keeps its values; a later
+  save owes only what it changes. Both are bound to the photo's UUID; the GPUI panel also
+  binds them to the catalog its page was read from (`with_catalog_as`). Each re-reads the
+  panel's and the title bar's counts.
 - **Reported honestly.** A save that reached only the catalog answers `pending` with the
   reason (`IptcSaveOutcome`, returned by the Tauri `set_iptc` command and shown by both
   inspectors as "Saved to catalog; sidecar pending (…)"); `unchanged` when nothing was owed.

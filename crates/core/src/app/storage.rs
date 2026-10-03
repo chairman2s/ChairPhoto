@@ -153,6 +153,41 @@ pub fn restore_photo(state: &AppState, photo_id: i64) -> Result<(), String> {
     restore_to(state, photo_id, local_id)
 }
 
+/// Re-point a photo at a file the user moved (under the library root), then bind that
+/// file's sidecar to the photo's UUID — the body of the Tauri `relocate_photo` command, and
+/// the GPUI app's Relocate….
+///
+/// The relocation and the identity binding are one operation: when the sidecar cannot be
+/// bound the row still moves (the user asked for that, and the file is where they said), and
+/// the debt is queued in `pending_sidecar_identity` for the repair pass. The sidecar IO runs
+/// off the catalog lock (a hung mount must not stall every other catalog user), and the
+/// outcome is recorded on a connection of its own to the catalog that was relocated in.
+///
+/// `expected`: the catalog the id was read from. When another catalog is open the relocation
+/// fails closed with `CATALOG_CHANGED`, touching nothing. **Blocks** (sidecar IO): run it on
+/// a worker.
+pub fn relocate_photo(
+    state: &AppState,
+    expected: Option<super::CatalogIdentity>,
+    photo_id: i64,
+    path: &std::path::Path,
+) -> Result<(), String> {
+    let relocate = |c: &Catalog| {
+        let uuid = c.relocate_photo(photo_id, path)?;
+        Ok((uuid, c.db_path().to_path_buf(), c.root().to_path_buf()))
+    };
+    let (uuid, db_path, root) = match expected {
+        Some(expected) => super::with_catalog_as(state, expected, relocate)?,
+        None => with_catalog(state, relocate)?,
+    };
+    // The file usually already carries the UUID (its sidecar moved with it); a sidecar
+    // holding somebody else's identity is left alone and recorded as a conflict.
+    let found = crate::xmp::read_identifier(path);
+    let outcome = crate::catalog::bind_sidecar_identity(path, &uuid, found.as_deref());
+    let catalog = Catalog::open_secondary(&db_path, &root).map_err(|e| e.to_string())?;
+    catalog.record_sidecar_identity(photo_id, path, &outcome).map_err(|e| e.to_string())
+}
+
 /// The id of the single volume of a kind, or an error if there are zero or many.
 pub fn single_volume_of_kind(c: &Catalog, kind: VolumeKind, label: &str) -> crate::catalog::Result<i64> {
     let ids: Vec<i64> = c.list_volumes()?.into_iter().filter(|v| v.kind == kind).map(|v| v.id).collect();
@@ -742,5 +777,43 @@ mod tests {
         detach_catalog_and_trip_jobs(&state).unwrap();
         assert!(tripped.aborted());
         assert_eq!(tripped.apply_offload_policy().unwrap(), 0);
+    }
+
+    /// Relocate… bound to the catalog its id was read from: with that catalog open it moves
+    /// the row and binds the new file's sidecar; once a switch has opened another catalog
+    /// whose photo has the same id, it fails closed and that photo keeps its path.
+    #[test]
+    fn a_relocate_bound_to_another_catalog_fails_closed() {
+        let dir = crate::test_support::TestTmpDir::new("relocate-bound");
+        let open = |name: &str| {
+            let root = dir.join(name).join("photos");
+            std::fs::create_dir_all(root.join("old")).unwrap();
+            std::fs::create_dir_all(root.join("new")).unwrap();
+            let c = Catalog::open(&dir.join(name).join("c.chairphoto"), &root).unwrap();
+            let old = root.join("old/p.jpg");
+            std::fs::write(&old, "bytes").unwrap();
+            let id = c.upsert_photo(&old, None, 1, 5).unwrap().id;
+            let moved = root.join("new/p.jpg");
+            std::fs::write(&moved, "bytes").unwrap();
+            (c, id, moved)
+        };
+        let (a, a_id, a_moved) = open("a");
+        let (b, b_id, b_moved) = open("b");
+        assert_eq!(a_id, b_id, "the ids collide");
+        let state = AppState::default();
+        *state.catalog.lock().unwrap() = Some(a);
+        let from_a = crate::app::catalog_identity(&state).unwrap();
+
+        relocate_photo(&state, Some(from_a), a_id, &a_moved).unwrap();
+        let photo = with_catalog(&state, |c| c.get_photo(a_id)).unwrap();
+        assert_eq!(photo.path, "new/p.jpg");
+        assert_eq!(crate::xmp::read_identifier(&a_moved).as_deref(), Some(photo.uuid.as_str()), "the sidecar is bound");
+
+        detach_catalog_and_trip_jobs(&state).unwrap();
+        publish_catalog_and_reset_jobs(&state, b).unwrap();
+        let err = relocate_photo(&state, Some(from_a), b_id, &b_moved).unwrap_err();
+        assert_eq!(err, crate::app::CATALOG_CHANGED);
+        assert_eq!(with_catalog(&state, |c| c.get_photo(b_id)).unwrap().path, "old/p.jpg", "B's photo kept its path");
+        assert!(!crate::xmp::sidecar_path(&b_moved).exists(), "no sidecar was written for B's file");
     }
 }

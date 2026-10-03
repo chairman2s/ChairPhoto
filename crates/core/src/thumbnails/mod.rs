@@ -720,7 +720,7 @@ fn fnv1a(s: &str) -> u64 {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -762,10 +762,10 @@ mod tests {
     /// Dropping rather than calling `remove_dir_all` at the end of each test also means a
     /// panicking test cleans up after itself; the old placement left the directory behind,
     /// which is how 7.9 GB of fixtures accumulated in `/tmp`.
-    struct TestTmpDir(PathBuf);
+    pub(crate) struct TestTmpDir(PathBuf);
 
     impl TestTmpDir {
-        fn new(name: &str) -> Self {
+        pub(crate) fn new(name: &str) -> Self {
             let dir = std::env::temp_dir()
                 .join(format!("cp-thumb-{name}-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&dir);
@@ -773,7 +773,7 @@ mod tests {
             Self(dir)
         }
 
-        fn path(&self) -> &Path {
+        pub(crate) fn path(&self) -> &Path {
             &self.0
         }
     }
@@ -784,7 +784,7 @@ mod tests {
         }
     }
 
-    fn test_lock() -> std::sync::MutexGuard<'static, ()> {
+    pub(crate) fn test_lock() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
             .lock()
@@ -810,7 +810,7 @@ mod tests {
     /// own cache key (the key is path+mtime+size). A plain raster decodes the *same*
     /// source file for every size, so chain-derived and independently-generated caches
     /// downscale from an identical decode — giving byte-identical results.
-    fn write_test_jpeg(dir: &Path, name: &str, w: u32, h: u32) -> PathBuf {
+    pub(crate) fn write_test_jpeg(dir: &Path, name: &str, w: u32, h: u32) -> PathBuf {
         let mut img = RgbImage::new(w, h);
         // A non-uniform gradient so downscaling is a real resample (not a trivial fill).
         for (x, y, px) in img.enumerate_pixels_mut() {

@@ -400,7 +400,17 @@ impl SidecarFill {
 /// save the user did not make (review of #148, N2).
 fn pending_message(outcome: &crate::app::iptc::IptcSaveOutcome) -> String {
     let why = outcome.reason.as_deref().map(|r| format!(" ({r})")).unwrap_or_default();
-    format!("Geocoded location stored in the catalog, but not yet in the sidecar{why}; the repair pass will write it")
+    format!("{PENDING_LEAD}{why}; the repair pass will write it")
+}
+
+/// How [`pending_message`] begins. That answer is not a failure — the catalog changed — so a
+/// front end tells it apart by this ([`is_pending_message`]) and shows it without an error
+/// prefix (#153).
+pub const PENDING_LEAD: &str = "Geocoded location stored in the catalog, but not yet in the sidecar";
+
+/// Whether a single-photo geocode's `Err` is [`pending_message`]'s: stored, sidecar pending.
+pub fn is_pending_message(message: &str) -> bool {
+    message.starts_with(PENDING_LEAD)
 }
 
 /// Step 3 of a fill and its sidecar write, on the blocking pool: `Err` when the fill
@@ -429,11 +439,12 @@ async fn fill_and_write(
     .map_err(|e| format!("geocode: the fill's worker failed: {e}"))?
 }
 
-/// Step 3 of a fill, in the catalog the photo was read from: re-read the IPTC (a value the
-/// user typed meanwhile wins), resolve the original's path and write the filled fields —
-/// all under one lock hold of that catalog. Returns the sidecar write still to do (off the
-/// lock), or `None` when nothing was filled. The path is resolved before the row is
-/// written, so an unreachable original leaves the catalog and the sidecar in step.
+/// Step 3 of a fill, in the catalog the photo was read from: resolve the original's path,
+/// re-read the IPTC (a value the user typed meanwhile wins) and write the filled fields —
+/// all under one lock hold of that catalog ([`crate::app::iptc::store_in_turn`]). Returns
+/// the sidecar write still to do (off the lock), or `None` when nothing was filled. The
+/// path is resolved before the row is written, so an unreachable original fails the fill
+/// and leaves the catalog and the sidecar in step.
 /// Blocking (it waits for the write turn): call it through [`fill_and_write`].
 fn fill_in(
     state: &crate::app::AppState,
@@ -442,21 +453,20 @@ fn fill_in(
     geo: &GeocodeResult,
 ) -> Result<Option<SidecarFill>, String> {
     // The sidecar's write turn first, as a manual save takes it (#149): reserved under the
-    // lock, waited for with none held. The store below runs with it held.
+    // lock, waited for with none held. The store below runs with it held — the turn of the
+    // sidecar the original resolves to at the store, followed there if it moved (#155 R1).
     let turn = crate::app::with_catalog_as(state, identity, |c| {
         Ok(crate::xmp::lock::WriteOrder::reserve(&c.require_photo_path(photo_id)?))
-    })?
-    .wait();
-    crate::app::with_catalog_as(state, identity, |c| {
+    })?;
+    let (filled, turn) = crate::app::iptc::store_in_turn(state, identity, photo_id, turn, |c, original| {
         let current = c.get_iptc(photo_id)?;
         let (updated, changed) = fill_empty_iptc(&current, geo);
         if !changed {
             return Ok(None);
         }
-        let original = c.require_photo_path(photo_id)?;
-        let write = c.set_iptc(photo_id, &updated)?;
-        Ok(Some(SidecarFill { original, write, turn }))
-    })
+        Ok(Some((original, c.set_iptc(photo_id, &updated)?)))
+    })?;
+    Ok(filled.map(|(original, write)| SidecarFill { original, write, turn }))
 }
 
 /// The cached answer for `(lat, lng)` in the identified catalog, or Nominatim's (then
@@ -1171,6 +1181,8 @@ mod tests {
         assert!(err.starts_with("Geocoded location stored in the catalog, but not yet in the sidecar ("), "{err}");
         assert!(err.ends_with("; the repair pass will write it"), "{err}");
         assert!(!err.contains("Saved"), "{err}");
+        assert!(is_pending_message(&err), "a front end tells it from a failure (#153): {err}");
+        assert!(!is_pending_message("geocode: no GPS"), "a failure is not pending");
         let guard = state.catalog.lock().unwrap();
         let c = guard.as_ref().unwrap();
         assert_eq!(c.get_iptc(id).unwrap().city, "Oslo");

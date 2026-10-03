@@ -8,7 +8,11 @@ use crate::tests::{
     click, click_menu_row, colliding_catalog, core_switch, deliver_switch, open_catalog_with_photos, press, start, status,
     App, TempDir,
 };
+use crate::image_store::{ImageState, StoreStats};
+use crate::image_tests::{pixels, FakePool};
 use chairphoto_core::app::CoreEvent;
+use chairphoto_core::image_pool::{ImageKind, JobKey};
+use std::sync::Arc;
 use chairphoto_core::catalog::{CullingFilter, PhotoPage, PickState};
 use gpui_kit::test::TestWindowExt as _;
 use gpui_kit::{
@@ -855,6 +859,341 @@ fn measure_grid_frame_cost(cx: &mut TestAppContext) {
         pct(0.95),
         frames.last().unwrap()
     );
+}
+
+// --- cover looks (#151) ---------------------------------------------------------------------
+
+/// The Library on a hand-driven decode pool: every thumbnail request is held until the test
+/// answers it.
+struct LookRig {
+    app: App,
+    dir: TempDir,
+    ids: Vec<i64>,
+    pool: Arc<FakePool>,
+}
+
+impl LookRig {
+    fn new(tag: &str, n: usize, cx: &mut TestAppContext) -> Self {
+        let dir = TempDir::new(tag);
+        let pool = Arc::new(FakePool::default());
+        let app = crate::tests::start_with_pool(cx, pool.clone());
+        let ids = open_catalog_with_photos(&app, &dir, n, cx);
+        render(&app, cx);
+        Self { app, dir, ids, pool }
+    }
+
+    fn catalog<T>(&self, f: impl FnOnce(&chairphoto_core::catalog::Catalog) -> T) -> T {
+        f(self.app.state.catalog.lock().unwrap().as_ref().unwrap())
+    }
+
+    /// The Thumb jobs sent for `photo` so far.
+    fn jobs(&self, photo: i64) -> usize {
+        let key = JobKey::photo(photo, ImageKind::Thumb);
+        self.pool.batches.lock().unwrap().iter().flatten().filter(|k| **k == key).count()
+    }
+
+    fn all_jobs(&self) -> Vec<usize> {
+        self.ids.iter().map(|&id| self.jobs(id)).collect()
+    }
+
+    /// Answer `photo`'s thumbnail render with a `w` pixels wide image.
+    fn finish(&self, photo: i64, w: u32, cx: &mut TestAppContext) {
+        self.pool.finish(&JobKey::photo(photo, ImageKind::Thumb), Ok(pixels(w, 4)));
+        cx.run_until_parked();
+    }
+
+    /// The width of the thumbnail the grid draws for `photo`, or what it has instead.
+    fn tile(&self, photo: i64, cx: &mut TestAppContext) -> Result<u32, &'static str> {
+        match self.app.wired.images.read_with(cx, |s, _| s.peek(photo, ImageKind::Thumb)) {
+            ImageState::Ready(l) => Ok(l.image.size(0).width.0 as u32),
+            ImageState::Loading => Err("loading"),
+            ImageState::Failed(_) => Err("failed"),
+            ImageState::Absent => Err("absent"),
+        }
+    }
+
+    fn stats(&self, cx: &mut TestAppContext) -> StoreStats {
+        self.app.wired.images.read_with(cx, |s, _| s.stats())
+    }
+
+    /// The rows re-read (what leaving the Darkroom does), then a frame of the grid.
+    fn refresh_rows(&self, cx: &mut TestAppContext) {
+        self.app.wired.shell.update(cx, |s, cx| s.refresh_rows(cx));
+        cx.run_until_parked();
+        render(&self.app, cx);
+    }
+
+    /// Make a new version of `photo` its cover; the version's id.
+    fn cover(&self, photo: i64) -> i64 {
+        self.catalog(|c| {
+            let v = c.create_version(photo, "Warm").unwrap();
+            c.set_cover_version(photo, Some(v)).unwrap();
+            v
+        })
+    }
+}
+
+/// A tile's thumbnail follows the cover look its row names (React's `?v=` token): a new
+/// cover, a new revision of it, or the cover taken off renders that tile again — and only
+/// that tile, and only its thumbnail tier — and the earlier look is never shown again; the
+/// same look asks nothing.
+#[gpui_kit::test]
+fn a_grid_tile_follows_its_rows_cover_look(cx: &mut TestAppContext) {
+    let rig = LookRig::new("grid-cover", 3, cx);
+    let photo = rig.ids[1];
+    for &id in &rig.ids {
+        rig.finish(id, 4, cx);
+    }
+    assert_eq!(rig.tile(photo, cx), Ok(4));
+    let mut want = rig.all_jobs();
+    assert_eq!(want, [1, 1, 1], "one render per tile");
+    let images = rig.app.wired.images.clone();
+    images.update(cx, |s, _| s.request(photo, ImageKind::Preview));
+    rig.pool.finish(&JobKey::photo(photo, ImageKind::Preview), Ok(pixels(16, 16)));
+    cx.run_until_parked();
+
+    let version = rig.cover(photo);
+    rig.refresh_rows(cx);
+    want[1] += 1;
+    assert_eq!(rig.all_jobs(), want, "a new cover renders that tile again, no other");
+    assert_eq!(rig.tile(photo, cx), Err("loading"), "the earlier look is not shown");
+    rig.finish(photo, 8, cx);
+    assert_eq!(rig.tile(photo, cx), Ok(8), "the cover's look lands");
+    let preview = images.read_with(cx, |s, _| matches!(s.peek(photo, ImageKind::Preview), ImageState::Ready(_)));
+    assert!(preview, "only the thumbnail tier follows the look: the preview stays cached");
+
+    render(&rig.app, cx);
+    rig.refresh_rows(cx);
+    assert_eq!(rig.all_jobs(), want, "the same look: nothing asked");
+
+    // The cover version's settings change: its revision moves.
+    rig.catalog(|c| c.set_version_edit(version, r#"{"tone":{"ev":1}}"#).unwrap());
+    rig.refresh_rows(cx);
+    want[1] += 1;
+    assert_eq!(rig.all_jobs(), want, "a new revision renders it again");
+    rig.finish(photo, 12, cx);
+    assert_eq!(rig.tile(photo, cx), Ok(12));
+
+    // The cover taken off: the plain thumbnail again.
+    rig.catalog(|c| c.set_cover_version(photo, None).unwrap());
+    rig.refresh_rows(cx);
+    want[1] += 1;
+    assert_eq!(rig.all_jobs(), want, "no cover: rendered again");
+    rig.finish(photo, 4, cx);
+    assert_eq!(rig.tile(photo, cx), Ok(4));
+}
+
+/// A render for the earlier look, already on a worker when the row's look changed, answers
+/// late: it is dropped — never shown, never cached — and the new look goes out after it.
+#[gpui_kit::test]
+fn a_late_answer_for_a_tiles_earlier_look_is_dropped(cx: &mut TestAppContext) {
+    let rig = LookRig::new("grid-cover-late", 2, cx);
+    let photo = rig.ids[0];
+    rig.pool.start(JobKey::photo(photo, ImageKind::Thumb)); // cannot be cancelled
+    let jobs = rig.jobs(photo);
+
+    rig.cover(photo);
+    rig.refresh_rows(cx);
+    assert_eq!(rig.jobs(photo), jobs, "the new look waits for the running render");
+    let dropped = rig.stats(cx).stale_dropped;
+    rig.finish(photo, 4, cx);
+    assert_eq!(rig.tile(photo, cx), Err("loading"), "the earlier look is not shown");
+    assert_eq!(rig.stats(cx).stale_dropped, dropped + 1);
+    assert_eq!(rig.jobs(photo), jobs + 1, "then the new look is asked for");
+    rig.finish(photo, 8, cx);
+    assert_eq!(rig.tile(photo, cx), Ok(8));
+}
+
+/// A rotation still invalidates every tier of the photo: the grid asks for its thumbnail
+/// again under the same look, and the turned render lands (the look did not change, so it is
+/// not refused or held back).
+#[gpui_kit::test]
+fn a_rotation_still_renders_a_tile_again(cx: &mut TestAppContext) {
+    let rig = LookRig::new("grid-cover-rotate", 1, cx);
+    let photo = rig.ids[0];
+    rig.cover(photo);
+    rig.refresh_rows(cx);
+    rig.finish(photo, 8, cx);
+    assert_eq!(rig.tile(photo, cx), Ok(8));
+    let jobs = rig.jobs(photo);
+
+    // The inspector's rotate button: the core turns the photo, the store is invalidated.
+    rig.app.wired.shell.update(cx, |s, cx| s.select_with(cx, |l| l.select_single(photo)));
+    cx.run_until_parked();
+    click(&rig.app, "section-orientation", cx);
+    click(&rig.app, "rotate-right", cx);
+    assert_eq!(rig.catalog(|c| c.photo_rotation(photo).unwrap()), 90);
+    render(&rig.app, cx);
+    assert_eq!(rig.jobs(photo), jobs + 1, "the turned thumbnail is asked for");
+    assert_eq!(rig.tile(photo, cx), Err("loading"), "the unturned one is not shown");
+    rig.finish(photo, 6, cx);
+    assert_eq!(rig.tile(photo, cx), Ok(6));
+}
+
+/// The Darkroom's strip and the grid name the same looks: entering and leaving the Darkroom
+/// renders no grid thumbnail again (the strip letting go does not make the grid's cached
+/// tiles unknown — review rv134 M1's lesson that views must not break each other).
+#[cfg(feature = "edit")]
+#[gpui_kit::test]
+fn a_darkroom_visit_renders_no_grid_tile_again(cx: &mut TestAppContext) {
+    let rig = LookRig::new("grid-cover-visit", 3, cx);
+    for &id in &rig.ids {
+        rig.finish(id, 4, cx);
+    }
+    let before = rig.all_jobs();
+    rig.app.wired.shell.update(cx, |s, cx| s.select_with(cx, |l| l.select_single(rig.ids[1])));
+    cx.run_until_parked();
+    rig.app.wired.shell.update(cx, |s, cx| s.open_develop(cx));
+    cx.run_until_parked();
+    render(&rig.app, cx);
+    rig.app.wired.shell.update(cx, |s, cx| s.show_library(cx));
+    cx.run_until_parked();
+    rig.refresh_rows(cx);
+    render(&rig.app, cx);
+    assert_eq!(rig.all_jobs(), before, "nothing rendered again");
+    for &id in &rig.ids {
+        assert_eq!(rig.tile(id, cx), Ok(4));
+    }
+}
+
+/// **Catalog identity** (map #92). Catalog B's photo carries the same id and the same cover
+/// token as the tile's in A. The core switches while the tile's render is on a worker:
+/// - `catalog:switched` withheld: the render answers in B — refused on the worker, never
+///   shown under A's row, not a failure, and not asked again under A's row; the event then
+///   empties the store and B's rows ask for B's look, which lands.
+/// - delivered first: the store forgets A; A's late answer is dropped; B's look lands.
+fn grid_cover_across_a_switch(delivered: bool, cx: &mut TestAppContext) {
+    let rig = LookRig::new(if delivered { "grid-cover-switch-ev" } else { "grid-cover-switch" }, 2, cx);
+    let photo = rig.ids[1];
+    let a = rig.app.wired.shell.read_with(cx, |s, _| s.rows_from()).unwrap();
+    let version = rig.cover(photo);
+    rig.refresh_rows(cx);
+    let key = JobKey::photo(photo, ImageKind::Thumb);
+    rig.pool.start(key.clone());
+    let jobs = rig.jobs(photo);
+
+    let (b, b_ids) = colliding_catalog(&rig.dir, "b", 2);
+    let b_version = b.create_version(b_ids[1], "B's").unwrap();
+    let token = b.set_cover_version(b_ids[1], Some(b_version)).unwrap();
+    assert_eq!((b_ids[1], token), (photo, Some(format!("{version}:0"))), "the ids and the token collide");
+    core_switch(&rig.app, b);
+
+    if !delivered {
+        let refused = rig.stats(cx).refused;
+        rig.finish(photo, 4, cx);
+        assert_eq!(rig.stats(cx).refused, refused + 1, "refused on the worker");
+        assert_eq!(rig.tile(photo, cx), Err("absent"), "not shown under A's row, and not a failure");
+        render(&rig.app, cx);
+        assert_eq!(rig.jobs(photo), jobs, "not asked again while the row is A's");
+        deliver_switch(&rig.app, cx);
+        render(&rig.app, cx);
+    } else {
+        deliver_switch(&rig.app, cx);
+        let dropped = rig.stats(cx).stale_dropped;
+        render(&rig.app, cx);
+        rig.finish(photo, 4, cx);
+        assert_eq!(rig.stats(cx).stale_dropped, dropped + 1, "A's answer dropped");
+    }
+    let b = rig.app.wired.shell.read_with(cx, |s, _| s.rows_from()).unwrap();
+    assert_ne!(a, b, "the rows are B's");
+    assert_eq!(rig.jobs(photo), jobs + 1, "B's row asks for B's look");
+    assert_eq!(rig.tile(photo, cx), Err("loading"));
+    rig.finish(photo, 8, cx);
+    assert_eq!(rig.tile(photo, cx), Ok(8), "B's look lands");
+}
+
+/// Only a look's own submissions are bound to its catalog (review rv134 M1): a view asking
+/// without a look — the inspector's stack, a card, the collage — for a photo whose tier has a
+/// look from a catalog no longer open is not refused. A look's own refused ask is not asked
+/// again until rows come from another catalog — even rows that do not name the photo. A
+/// store of its own, with the core's identity probe, so no grid joins in.
+#[gpui_kit::test]
+fn a_plain_request_is_never_bound_to_a_look(cx: &mut TestAppContext) {
+    let dir = TempDir::new("grid-cover-plain");
+    let app = start(cx);
+    let ids = open_catalog_with_photos(&app, &dir, 1, cx);
+    let photo = ids[0];
+    let a = app.wired.shell.read_with(cx, |s, _| s.rows_from()).unwrap();
+    let pool = Arc::new(FakePool::default());
+    let state = app.state.clone();
+    let images = cx.update(|cx| {
+        let submit: Arc<dyn crate::image_store::Submit> = pool.clone();
+        cx.new(|cx| {
+            let mut store = crate::image_store::ImageStore::new(submit, crate::image_store::DEFAULT_BUDGET_BYTES, cx);
+            store.set_identity_probe(Arc::new(move || chairphoto_core::app::catalog_identity(&state).ok()));
+            store
+        })
+    });
+    let key = JobKey::photo(photo, ImageKind::Thumb);
+    let ready = |cx: &mut TestAppContext| images.read_with(cx, |s, _| matches!(s.peek(photo, ImageKind::Thumb), ImageState::Ready(_)));
+    images.update(cx, |s, cx| s.request_look_batch(a, &[(photo, None)], cx));
+    pool.finish(&key, Ok(pixels(4, 4)));
+    cx.run_until_parked();
+    assert!(ready(cx));
+
+    chairphoto_core::app::catalogs::reroot_open_catalog_as(&app.state, a, dir.0.join("newroot")).unwrap();
+    images.update(cx, |s, cx| s.invalidate(photo, cx));
+    images.update(cx, |s, _| s.request(photo, ImageKind::Thumb));
+    let refused = images.read_with(cx, |s, _| s.stats().refused);
+    pool.finish(&key, Ok(pixels(4, 4)));
+    cx.run_until_parked();
+    assert_eq!(images.read_with(cx, |s, _| s.stats().refused), refused, "not checked against the look's catalog");
+    assert!(ready(cx), "the plain request lands");
+    // The look's own ask, still from the earlier rows, is checked: refused.
+    images.update(cx, |s, cx| s.invalidate(photo, cx));
+    images.update(cx, |s, cx| s.request_look_batch(a, &[(photo, None)], cx));
+    pool.finish(&key, Ok(pixels(4, 4)));
+    cx.run_until_parked();
+    assert_eq!(images.read_with(cx, |s, _| s.stats().refused), refused + 1);
+    assert!(!ready(cx));
+    let jobs = pool.submitted();
+    images.update(cx, |s, _| s.request(photo, ImageKind::Thumb));
+    assert_eq!(pool.submitted(), jobs, "refused: not asked again while its look is the old rows'");
+
+    // Rows read from the reopened catalog that do not name the photo (it scrolled away):
+    // the earlier rows' refusal goes with their looks, and a plain request asks again.
+    let b = chairphoto_core::app::catalog_identity(&app.state).unwrap();
+    assert_ne!(a, b);
+    images.update(cx, |s, cx| s.request_look_batch(b, &[], cx));
+    images.update(cx, |s, _| s.request(photo, ImageKind::Thumb));
+    assert_eq!(pool.submitted(), jobs + 1, "the refusal did not stick");
+    pool.finish(&key, Ok(pixels(4, 4)));
+    cx.run_until_parked();
+    assert!(ready(cx));
+}
+
+#[gpui_kit::test]
+fn a_grid_tile_never_shows_the_new_catalog_before_the_switch_event(cx: &mut TestAppContext) {
+    grid_cover_across_a_switch(false, cx);
+}
+
+#[gpui_kit::test]
+fn a_grid_tile_never_shows_the_old_catalog_after_the_switch_event(cx: &mut TestAppContext) {
+    grid_cover_across_a_switch(true, cx);
+}
+
+/// A re-root reopens the catalog under a new identity and sends no `catalog:switched`. A
+/// tile refused across it is asked again once the rows are re-read from the reopened
+/// catalog: the refusal does not stick (review rv134 M1).
+#[gpui_kit::test]
+fn a_tile_refused_across_a_re_root_is_asked_again_for_the_new_rows(cx: &mut TestAppContext) {
+    let rig = LookRig::new("grid-cover-reroot", 2, cx);
+    let photo = rig.ids[1];
+    let a = rig.app.wired.shell.read_with(cx, |s, _| s.rows_from()).unwrap();
+    rig.pool.start(JobKey::photo(photo, ImageKind::Thumb));
+    chairphoto_core::app::catalogs::reroot_open_catalog_as(&rig.app.state, a, rig.dir.0.join("newroot")).unwrap();
+    let jobs = rig.jobs(photo);
+
+    rig.finish(photo, 4, cx);
+    assert_eq!(rig.tile(photo, cx), Err("absent"), "refused: empty, not failed");
+    render(&rig.app, cx);
+    assert_eq!(rig.jobs(photo), jobs, "not asked again under the old rows");
+
+    rig.refresh_rows(cx);
+    assert_ne!(rig.app.wired.shell.read_with(cx, |s, _| s.rows_from()), Some(a), "rows from the reopened catalog");
+    assert_eq!(rig.jobs(photo), jobs + 1, "asked again for the new rows");
+    rig.finish(photo, 8, cx);
+    assert_eq!(rig.tile(photo, cx), Ok(8), "it lands");
 }
 
 /// The video badge's tooltip says what a double-click does here — open the loupe, whose button

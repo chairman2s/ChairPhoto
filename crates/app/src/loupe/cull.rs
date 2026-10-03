@@ -28,9 +28,10 @@ use crate::storage::ui;
 use chairphoto_core::app::{with_catalog_as, AppState, CatalogIdentity};
 use chairphoto_core::catalog::{Photo, PickState};
 use chairphoto_core::image_pool::ImageKind;
+use gpui_kit::assets::IconName;
 use gpui_kit::prelude::*;
 use gpui_kit::{
-    div, px, relative, Context, Entity, EventEmitter, FocusHandle, ObjectFit, Subscription, Task,
+    div, px, relative, AnyElement, Context, Entity, EventEmitter, FocusHandle, ObjectFit, Subscription, Task,
     TestSupportExt as _, Window,
 };
 use std::collections::{HashMap, HashSet};
@@ -590,10 +591,25 @@ impl Render for CullView {
             .child(div().h(px(3.)).w_full().bg(colors.line).child(div().h_full().w(relative(fill)).bg(colors.accent)))
             .child(div().text_size(px(11.)).text_color(colors.mute).child("h — keys · Esc — end session"));
         let help = self.state.help.then(|| {
-            let row = |k: &'static str, v: &'static str| {
+            let row = |k: AnyElement, v: &'static str| {
                 div().flex().gap(px(16.)).child(div().w(px(90.)).text_color(colors.txt).child(k)).child(
                     div().text_color(colors.dim).child(v),
                 )
+            };
+            // → and ← draw tiny: the UI font lacks U+2192/U+2190, and the fallback font it
+            // reaches for draws them at a fraction of the surrounding text's size. ↓ and ↑ are
+            // in the font and stay plain text (#197).
+            let arrow_key = |id: &'static str, arrow_id: &'static str, icon: IconName, rest: &'static str, label: &'static str| {
+                div()
+                    .id(id)
+                    .flex()
+                    .items_center()
+                    .gap(px(4.))
+                    .child(ui::sized_icon(arrow_id, icon))
+                    .child(rest)
+                    .aria_label(label)
+                    .test_support()
+                    .into_any_element()
             };
             div()
                 .id("cull-help")
@@ -621,16 +637,45 @@ impl Render for CullView {
                         .text_size(px(13.))
                         .on_click(|_, _, cx| cx.stop_propagation())
                         .child(div().text_size(px(16.)).child("Keys"))
-                        .child(row("0 – 5", "rating"))
-                        .child(row("p / x / u", "pick · reject · clear"))
-                        .child(row("r y g b v", "colour label"))
-                        .child(row("n", "clear colour label"))
-                        .child(row("→ ↓ space", "next, without deciding"))
-                        .child(row("← ↑", "back"))
-                        .child(row("Esc", "end the session"))
-                        .child(div().max_w(px(380.)).text_size(px(12.)).text_color(colors.mute).child(
-                            "Every decision moves you on, exactly as it does in the grid — press ← to go back and change one. Where you stop is remembered, so the next session resumes here.",
-                        )),
+                        .child(row("0 – 5".into_any_element(), "rating"))
+                        .child(row("p / x / u".into_any_element(), "pick · reject · clear"))
+                        .child(row("r y g b v".into_any_element(), "colour label"))
+                        .child(row("n".into_any_element(), "clear colour label"))
+                        .child(row(
+                            arrow_key(
+                                "cull-help-next-key",
+                                "cull-help-next-arrow",
+                                IconName::ArrowRight,
+                                "↓ space",
+                                "→ ↓ space",
+                            ),
+                            "next, without deciding",
+                        ))
+                        .child(row(
+                            arrow_key("cull-help-back-key", "cull-help-back-arrow", IconName::ArrowLeft, "↑", "← ↑"),
+                            "back",
+                        ))
+                        .child(row("Esc".into_any_element(), "end the session"))
+                        .child(
+                            div()
+                                .id("cull-help-note")
+                                .max_w(px(380.))
+                                .flex()
+                                .flex_wrap()
+                                .items_center()
+                                .gap(px(4.))
+                                .text_size(px(12.))
+                                .text_color(colors.mute)
+                                .child("Every decision moves you on, exactly as it does in the grid — press")
+                                .child(ui::sized_icon("cull-help-note-arrow", IconName::ArrowLeft))
+                                .child(
+                                    "to go back and change one. Where you stop is remembered, so the next session resumes here.",
+                                )
+                                .aria_label(
+                                    "Every decision moves you on, exactly as it does in the grid — press ← to go back and change one. Where you stop is remembered, so the next session resumes here.",
+                                )
+                                .test_support(),
+                        ),
                 )
                 .test_support()
         });

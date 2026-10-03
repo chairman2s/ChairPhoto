@@ -27,6 +27,7 @@ use crate::storage::ui;
 use chairphoto_core::app::{with_catalog_as, AppState, CatalogIdentity};
 use chairphoto_core::catalog::{Photo, PhotoQuery, PhotoWindow};
 use chairphoto_core::image_pool::ImageKind;
+use gpui_kit::assets::IconName;
 use gpui_kit::prelude::*;
 use gpui_kit::{
     actions, div, px, App, Context, Entity, FocusHandle, Hsla, ObjectFit, SharedString, Subscription,
@@ -285,7 +286,9 @@ impl CardView {
                     .border_b_1()
                     .border_color(colors.border)
                     .child(ui::clickable(
-                        ui::chip("loupe-card-back", format!("← {}", card.title), true, colors),
+                        // "← {title}": the UI font has no U+2190, and the fallback font it
+                        // reaches for draws it tiny (#197) — Lucide's arrow instead.
+                        ui::icon_label_chip("loupe-card-back", IconName::ArrowLeft, false, card.title.clone(), true, colors),
                         true,
                         cx.listener(|this, _, _, cx| this.view(None, cx)),
                     ))

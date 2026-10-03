@@ -480,6 +480,25 @@ fn the_loupe_bar_rotates_with_icon_chips_and_hints_its_keys(cx: &mut TestAppCont
     assert_eq!(rotation(&app), 0);
 }
 
+/// #197: the loupe hint's trailing "← →" draws as Lucide icons at the app's 13 px stroke-icon
+/// size, not the UI font's tiny fallback mark for U+2190/U+2192 — its accessible label
+/// ([`crate::loupe::view::loupe_hint`]) keeps the literal arrows unchanged.
+#[gpui_kit::test]
+fn the_loupe_hint_draws_its_arrows_as_normal_sized_icons(cx: &mut TestAppContext) {
+    let (app, _pool, _dir, ids) = app_with(1, "loupe-hint-arrows", cx);
+    select(&app, ids[0], cx);
+    press(&app, "enter", cx);
+    cx.update_window(app.window(), |_, window, cx| {
+        window.render_frame(cx);
+        for id in ["loupe-hint-arrow-left", "loupe-hint-arrow-right"] {
+            let size = window.find(id).bounds().size;
+            assert_eq!(size.width, gpui_kit::px(13.), "{id} is the 13 px icon, not a tiny fallback glyph");
+            assert_eq!(size.height, gpui_kit::px(13.), "{id}");
+        }
+    })
+    .unwrap();
+}
+
 // --- Compare ----------------------------------------------------------------------------------
 
 /// The duel: → crowns the challenger (the champion is rejected), ← keeps the champion; the last
@@ -880,6 +899,25 @@ fn a_failed_cull_write_is_rolled_back_and_shown(cx: &mut TestAppContext) {
     assert!(failure.starts_with("Not saved — p0.ARW: The catalog changed"), "{failure}");
     deliver_switch(&app, cx);
     assert!(cull(&app, cx).is_none());
+}
+
+/// #197: the cull help's → / ← rows and its note draw Lucide's arrow icons at the app's 13 px
+/// stroke-icon size, not the UI font's tiny fallback mark for U+2192/U+2190 — ↓ and ↑ stay
+/// plain text (the font has them).
+#[gpui_kit::test]
+fn the_cull_help_draws_its_arrows_as_normal_sized_icons(cx: &mut TestAppContext) {
+    let (app, _pool, _dir, _ids) = app_with(2, "cull-help-arrows", cx);
+    start_cull(&app, cx);
+    press(&app, "h", cx);
+    cx.update_window(app.window(), |_, window, cx| {
+        window.render_frame(cx);
+        for id in ["cull-help-next-arrow", "cull-help-back-arrow", "cull-help-note-arrow"] {
+            let size = window.find(id).bounds().size;
+            assert_eq!(size.width, gpui_kit::px(13.), "{id} is the 13 px icon, not a tiny fallback glyph");
+            assert_eq!(size.height, gpui_kit::px(13.), "{id}");
+        }
+    })
+    .unwrap();
 }
 
 // --- the Darkroom overlays ---------------------------------------------------------------------

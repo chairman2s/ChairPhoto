@@ -19,7 +19,10 @@
 use crate::shell::style::Colors;
 use crate::view::RootView;
 use gpui_kit::prelude::*;
-use gpui_kit::{div, px, relative, rgb, Animation, AnimationExt as _, AnyElement, FontWeight, TestSupportExt as _};
+use gpui_kit::{
+    div, hsla, linear_color_stop, linear_gradient, point, px, relative, rgb, Animation, AnimationExt as _, AnyElement,
+    BoxShadow, FontWeight, TestSupportExt as _,
+};
 use std::time::Duration;
 
 /// The fade-out (`.splash` CSS transition, and Splash.tsx's unmount timer).
@@ -154,16 +157,49 @@ impl RootView {
     /// takes the pointer while up (the window under it is not ready), and fades out once the
     /// boot is over.
     pub(crate) fn render_splash(&self, splash: &Splash, colors: Colors) -> AnyElement {
-        // `.splash-logo`: a disc in three vertical bands, red · white · blue.
+        // `.splash-logo`: a disc in three vertical bands, red · white · blue, with App.css's
+        // drop shadow (`0 10px 40px rgba(0,0,0,.5)`). React draws this as one div: a 4-stop
+        // gradient background (`90deg, red 46%, white 46%, white 54%, blue 54%`) clipped by
+        // `border-radius: 50%`. GPUI clips children to their rectangular bounds, not to a
+        // rounded parent's curve (`Style::overflow_mask` builds a plain `Bounds`, ignoring
+        // `corner_radii` — `elements/div.rs`'s `with_content_mask` call site confirms it), so
+        // three full-size child bands inside a `rounded_full()` box drew as a square (#218): a
+        // div's own background is the only thing GPUI itself rounds. `linear_gradient` takes
+        // exactly two stops, so the disc is drawn as a red/blue 50%-radius gradient (a hard
+        // edge at one stop, the two-stops-at-one-position trick, nudged a hair apart so the
+        // renderer is never asked to divide by a zero-width span) with the white sliver as a
+        // separate, unrounded bar centred on the 46% seam: across its 8%-of-64px width the
+        // true circle's own chord height stays within 0.2 px of the full 64 px (the sliver is
+        // near the disc's widest point), so a plain full-height bar reads pixel-sharp.
         let logo = div()
+            .id("splash-logo")
+            .relative()
             .size(px(64.))
             .rounded_full()
-            .overflow_hidden()
-            .flex()
-            .flex_row()
-            .child(div().h_full().w(relative(0.46)).bg(rgb(0xdc2626)))
-            .child(div().h_full().w(relative(0.08)).bg(rgb(0xf8fafc)))
-            .child(div().h_full().flex_1().bg(rgb(0x1e40af)));
+            .bg(linear_gradient(
+                90.,
+                linear_color_stop(rgb(0xdc2626), 0.459),
+                linear_color_stop(rgb(0x1e40af), 0.461),
+            ))
+            .shadow(vec![BoxShadow {
+                color: hsla(0., 0., 0., 0.5),
+                offset: point(px(0.), px(10.)),
+                blur_radius: px(40.),
+                spread_radius: px(0.),
+                inset: false,
+            }])
+            .child(
+                div()
+                    .id("splash-logo-seam")
+                    .absolute()
+                    .top_0()
+                    .bottom_0()
+                    .left(relative(0.46))
+                    .w(relative(0.08))
+                    .bg(rgb(0xf8fafc))
+                    .test_support(),
+            )
+            .test_support();
         let overlay = div()
             .id("splash")
             .absolute()

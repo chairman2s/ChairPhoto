@@ -28,6 +28,7 @@ use crate::storage::ui;
 use chairphoto_core::catalog::{Photo, PickState};
 use chairphoto_core::image_pool::ImageKind;
 use chairphoto_model::compare_duel::DuelSide;
+use gpui_kit::assets::IconName;
 use gpui_kit::prelude::*;
 use gpui_kit::{div, px, AnyElement, Context, Entity, FocusHandle, SharedString, Subscription, TestSupportExt as _, Window};
 
@@ -277,9 +278,25 @@ impl Render for CompareView {
             } else {
                 let (round, total) = session.duel_progress();
                 bar = bar.child(text("compare-status", format!("Duel {round} of {total}"), colors.txt)).child(
-                    div().text_size(px(11.)).text_color(colors.mute).child(
-                        "← left wins · → right wins · loser is rejected · 0–5 rate the focused pane",
-                    ),
+                    // "← left wins · → right wins": the UI font has no U+2190/U+2192, and the
+                    // fallback font it reaches for draws them tiny (#197) — Lucide's arrows
+                    // instead.
+                    div()
+                        .id("compare-duel-hint")
+                        .flex()
+                        .items_center()
+                        .flex_wrap()
+                        .gap(px(4.))
+                        .text_size(px(11.))
+                        .text_color(colors.mute)
+                        .child(ui::icon_label(IconName::ArrowLeft, false, "left wins ·"))
+                        .child(ui::icon_label(
+                            IconName::ArrowRight,
+                            false,
+                            "right wins · loser is rejected · 0–5 rate the focused pane",
+                        ))
+                        .aria_label("← left wins · → right wins · loser is rejected · 0–5 rate the focused pane")
+                        .test_support(),
                 );
             }
         } else if pool > panes.len() || session.start() > 0 {
@@ -303,17 +320,41 @@ impl Render for CompareView {
                     cx.listener(|this, _, _, cx| this.page(1, cx)),
                 ))
                 .child(
+                    // "←/→ focus": same tiny-fallback problem as the duel hint (#197).
                     div()
+                        .id("compare-page-hint")
+                        .flex()
+                        .items_center()
+                        .flex_wrap()
+                        .gap(px(2.))
                         .text_size(px(11.))
                         .text_color(colors.mute)
-                        .child("←/→ focus · 0–5 rate · P/X pick or reject · K keep & next batch"),
+                        .child(ui::sized_icon("compare-page-hint-left", IconName::ArrowLeft))
+                        .child("/")
+                        .child(ui::sized_icon("compare-page-hint-right", IconName::ArrowRight))
+                        .child("focus · 0–5 rate · P/X pick or reject · K keep & next batch")
+                        .aria_label("←/→ focus · 0–5 rate · P/X pick or reject · K keep & next batch")
+                        .test_support(),
                 );
         } else {
-            bar = bar.child(text(
-                "compare-status",
-                format!("Comparing {} — ←/→ focus, 0–5 rate, P/X pick or reject, K keep", panes.len()),
-                colors.txt,
-            ));
+            // "←/→ focus": same tiny-fallback problem as the duel and paging hints (#197).
+            bar = bar.child(
+                div()
+                    .id("compare-status")
+                    .flex()
+                    .items_center()
+                    .flex_wrap()
+                    .gap(px(2.))
+                    .text_size(px(12.))
+                    .text_color(colors.txt)
+                    .child(format!("Comparing {} —", panes.len()))
+                    .child(ui::sized_icon("compare-status-arrow-left", IconName::ArrowLeft))
+                    .child("/")
+                    .child(ui::sized_icon("compare-status-arrow-right", IconName::ArrowRight))
+                    .child("focus, 0–5 rate, P/X pick or reject, K keep")
+                    .aria_label(format!("Comparing {} — ←/→ focus, 0–5 rate, P/X pick or reject, K keep", panes.len()))
+                    .test_support(),
+            );
         }
         if view.zoomed() {
             let shared = self.shared.clone();

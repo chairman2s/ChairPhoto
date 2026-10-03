@@ -39,7 +39,7 @@
 //! the pop-out, #110) and observes it. That reads the loupe's public accessors and changes
 //! nothing in it.
 
-use super::logic::{bbox_to_screen, chip_name, drag_to_bbox, rotate_box, state_color, unrotate_box};
+use super::logic::{bbox_to_screen, chip_name, drag_to_bbox, picker_opens_above, rotate_box, state_color, unrotate_box};
 use super::picker::{PersonPicker, PickerEvent};
 use super::state::FacesState;
 use crate::image_store::{ImageState, ImageStore};
@@ -520,12 +520,17 @@ impl Render for FaceOverlay {
                 }
                 layers.push(chip.test_support().into_any_element());
                 if let Some((_, picker, _)) = self.picker.as_ref().filter(|(f, ..)| *f == id) {
+                    // Below the box by default, as React placed it; flipped above when a box
+                    // near the stage's bottom edge would otherwise clip the dropdown against
+                    // the overlay's own `overflow_hidden` (#220).
+                    let above = picker_opens_above(r, frame.container.1);
                     layers.push(
                         div()
                             .id(SharedString::from(format!("faces-reassign-drop-{id}")))
                             .absolute()
                             .left(px(r.left))
-                            .top(px(r.top + r.height + 2.))
+                            .when(above, |d| d.bottom(px(frame.container.1 - r.top + 2.)))
+                            .when(!above, |d| d.top(px(r.top + r.height + 2.)))
                             .p(px(6.))
                             .rounded(px(6.))
                             .border_1()

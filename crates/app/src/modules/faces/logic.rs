@@ -56,6 +56,17 @@ pub fn bbox_to_screen(bbox: FaceBboxJson, natural: (f32, f32), container: (f32, 
     ScreenRect { left: l + bbox.x * w, top: t + bbox.y * h, width: bbox.w * w, height: bbox.h * h }
 }
 
+/// Whether the reassign picker should open above `r` instead of below it, given a stage
+/// (the loupe's image container, which clips its overlay — `faces-overlay`'s
+/// `overflow_hidden`) `stage_height` logical px tall. Opens toward whichever side has more
+/// room; ties keep the default, below. A box near the stage's bottom edge left too little
+/// room below for the picker, which the overlay's own clip then cut off (#220).
+pub fn picker_opens_above(r: ScreenRect, stage_height: f32) -> bool {
+    let room_above = r.top;
+    let room_below = stage_height - (r.top + r.height);
+    room_below < room_above
+}
+
 /// The inverse for one point: container coordinates → normalized image coordinates (outside
 /// 0–1 in the letterbox).
 pub fn screen_to_image(p: (f32, f32), natural: (f32, f32), container: (f32, f32), view: ZoomView) -> (f32, f32) {
@@ -410,6 +421,21 @@ mod tests {
         let r = bbox_to_screen(bb(0.3, 0.6, 0.1, 0.1), natural, container, view);
         let (x, y) = screen_to_image((r.left, r.top), natural, container, view);
         assert!(close(x, 0.3) && close(y, 0.6), "{x} {y}");
+    }
+
+    /// #220: a box near the stage's bottom edge (as little as 20 px below it in an 800 px
+    /// stage) flips the picker above; one with ordinary room below (half the stage) keeps the
+    /// default. Equal room either side keeps the default too.
+    #[test]
+    fn the_picker_flips_above_only_when_the_box_is_near_the_bottom_edge() {
+        let near_bottom = ScreenRect { left: 100., top: 760., width: 100., height: 20. };
+        assert!(picker_opens_above(near_bottom, 800.), "20 px below vs 760 px above");
+        let mid_stage = ScreenRect { left: 100., top: 350., width: 100., height: 100. };
+        assert!(!picker_opens_above(mid_stage, 800.), "350 above, 350 below: keep the default");
+        let near_top = ScreenRect { left: 100., top: 20., width: 100., height: 20. };
+        assert!(!picker_opens_above(near_top, 800.), "lots of room below");
+        let tied = ScreenRect { left: 0., top: 100., width: 0., height: 0. };
+        assert!(!picker_opens_above(tied, 200.), "a tie keeps the default (below)");
     }
 
     /// A box turned with the photo lands on the pixels the turned picture has there: paint the

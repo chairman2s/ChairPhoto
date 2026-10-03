@@ -1197,6 +1197,41 @@ fn a_tile_refused_across_a_re_root_is_asked_again_for_the_new_rows(cx: &mut Test
     assert_eq!(rig.tile(photo, cx), Ok(8), "it lands");
 }
 
+/// rv151 L3. A refusal that arrives after rows from another catalog were read, for a photo
+/// those rows do not name, is not kept: the look it was refused for is gone, so a plain view
+/// asks again (else the tile would stay empty for every view until the grid reached it).
+#[gpui_kit::test]
+fn a_late_refusal_for_a_superseded_look_is_not_kept(cx: &mut TestAppContext) {
+    let dir = TempDir::new("grid-late-refusal");
+    let app = start(cx);
+    let ids = open_catalog_with_photos(&app, &dir, 1, cx);
+    let photo = ids[0];
+    let a = app.wired.shell.read_with(cx, |s, _| s.rows_from()).unwrap();
+    let pool = Arc::new(FakePool::default());
+    let state = app.state.clone();
+    let images = cx.update(|cx| {
+        let submit: Arc<dyn crate::image_store::Submit> = pool.clone();
+        cx.new(|cx| {
+            let mut store = crate::image_store::ImageStore::new(submit, crate::image_store::DEFAULT_BUDGET_BYTES, cx);
+            store.set_identity_probe(Arc::new(move || chairphoto_core::app::catalog_identity(&state).ok()));
+            store
+        })
+    });
+    let key = JobKey::photo(photo, ImageKind::Thumb);
+    images.update(cx, |s, cx| s.request_look_batch(a, &[(photo, None)], cx));
+    pool.start(key.clone()); // on a worker
+    chairphoto_core::app::catalogs::reroot_open_catalog_as(&app.state, a, dir.0.join("newroot")).unwrap();
+    let b = chairphoto_core::app::catalog_identity(&app.state).unwrap();
+    // Rows from the reopened catalog that do not name the photo (it scrolled away).
+    images.update(cx, |s, cx| s.request_look_batch(b, &[], cx));
+    pool.finish(&key, Ok(pixels(4, 4)));
+    cx.run_until_parked();
+    assert_eq!(images.read_with(cx, |s, _| s.stats().refused), 1, "refused on the worker");
+    let jobs = pool.submitted();
+    images.update(cx, |s, _| s.request(photo, ImageKind::Thumb));
+    assert_eq!(pool.submitted(), jobs + 1, "a plain view asks again: the refusal was not kept");
+}
+
 /// rv151 L1. In a switch's window (the core on B, `catalog:switched` withheld; B's photo has
 /// the tile's id and cover token), the tile was evicted and a plain view (the inspector's
 /// stack, a card) asks for it first: it renders B's photo, unrefused (#134 M1). The grid,

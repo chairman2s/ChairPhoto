@@ -107,7 +107,10 @@ Each of these is handled, and each has a test:
   named in the report; a rule that will not parse is left exactly as found.
 - **Auto-tags recompute membership.** Merging *into* an auto-tag is refused (the engine
   deletes and re-derives its assignments, so the merge would silently undo itself); merging
-  one *away* warns that the engine re-creates it by path, empty. A split writes membership
+  one *away* moves its photos to the target and warns that the rule keeps running: unless
+  another tag carries the rule, the first pass that finds a match brings the rule's tag back
+  at its default path, holding every matching photo (the warning text is core's, shown as is
+  by both front ends). A split writes membership
   by hand, so an auto-tag is refused as its source or its new tag (`CatalogError::AutoTag`).
 - **Tags survive in bundles.** See the tombstone below.
 - **Plugins hold tag references.** See ownership below.

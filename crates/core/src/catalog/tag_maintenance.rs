@@ -226,9 +226,14 @@ pub fn merge_tags(
     };
     for source in &sources {
         if let Some(rule) = &source.auto_rule {
+            // What `autotags.rs` does once the source is gone: no tag carries the key, so the
+            // next pass that finds a match makes the rule's tag at its default path (or takes
+            // over an ordinary tag there that holds only matches) and fills it.
             report.warnings.push(format!(
-                "'{}' is an auto-tag (rule '{rule}'). The engine re-creates it by path on its \
-                 next pass, so it will come back — empty.",
+                "'{}' is an auto-tag (rule '{rule}'). Its photos move to the merged tag, but the \
+                 rule keeps running: unless another tag carries it, the next pass that finds a \
+                 matching photo brings the rule's tag back at its default path, holding every \
+                 matching photo.",
                 source.full_path
             ));
         }
@@ -966,8 +971,9 @@ mod tests {
         assert_eq!(path_of(&c, parent).as_deref(), Some("Animals"));
     }
 
-    /// Merging an auto-tag *away* is allowed but warned about: the engine re-creates it by
-    /// path on its next pass, so the user should know it will reappear.
+    /// Merging an auto-tag *away* is allowed but warned about: the engine brings it back at
+    /// its path, populated, on a pass that finds a match (review #181 r2 L1: the warning
+    /// used to say "empty"). The behaviour itself is tested in `autotags.rs`.
     #[test]
     fn merging_an_auto_tag_away_warns_that_it_returns() {
         let c = conn();
@@ -980,11 +986,9 @@ mod tests {
         let target = tag(&c, "Mono");
 
         let report = merge_tags(&c, &[source], target, 100).unwrap();
-        assert!(
-            report.warnings.iter().any(|w| w.contains("auto-tag")),
-            "{:?}",
-            report.warnings
-        );
+        let [warning] = report.warnings.as_slice() else { panic!("{:?}", report.warnings) };
+        assert!(warning.contains("auto-tag") && warning.contains("holding every matching photo"), "{warning}");
+        assert!(!warning.contains("empty"), "it does not come back empty: {warning}");
     }
 
     // ── Merge: the unique constraints ───────────────────────────────────────────

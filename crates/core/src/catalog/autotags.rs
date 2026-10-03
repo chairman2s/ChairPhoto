@@ -622,6 +622,27 @@ mod tests {
         still_the_rules_tag(&c, &root, auto, "Methods/Long Exposure", fast);
     }
 
+    /// Review #181 r2 L1 (probe P4), what `merge_tags`'s warning promises: an auto-tag merged
+    /// away is not made again while nothing matches, and comes back at its path holding every
+    /// match — not empty — on the first pass that finds one.
+    #[test]
+    fn a_merged_away_auto_tag_comes_back_populated_once_something_matches() {
+        let (c, _root, long, _fast, auto) = long_and_fast("autotag-merged-away");
+        let slow = c.create_tag("Methods/Slow").unwrap();
+        crate::catalog::tag_maintenance::merge_tags(&c.conn, &[auto], slow, 1).unwrap();
+        assert!(has(&c, long, slow), "the photos moved to the merged tag");
+
+        c.conn.execute("UPDATE photos SET shutter_speed = '1/100' WHERE id = ?1", params![long]).unwrap();
+        c.apply_auto_tags().unwrap();
+        assert_eq!(c.find_tag_id_by_path(LONG_EXPOSURE).unwrap(), None, "nothing matches: no tag");
+
+        c.conn.execute("UPDATE photos SET shutter_speed = '30' WHERE id = ?1", params![long]).unwrap();
+        c.apply_auto_tags().unwrap();
+        let back = c.find_tag_id_by_path(LONG_EXPOSURE).unwrap().expect("back at its path");
+        assert_eq!(carriers(&c), vec![back]);
+        assert!(has(&c, long, back), "holding every match");
+    }
+
     /// Review #181 r2 L2 (probe P5): the long-exposure tag moved and renamed onto the
     /// monochrome rule's path, with monochrome carried by no tag. Monochrome's path fallback
     /// must not take it over — even when it holds only monochrome matches — and long-exposure

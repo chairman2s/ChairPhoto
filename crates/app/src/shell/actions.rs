@@ -141,9 +141,14 @@ not_yet_ported! {}
 pub const PARITY_DOC: &str = include_str!("../../../../docs/plans/gpui/parity.md");
 
 /// The tickets a not-yet-ported stub may cite, read from the parity checklist: a ticket named
-/// in what a row still **misses** — the text after "Missing:" in a `partial` row's status, or
-/// a `to port` row's whole status. Built and dropped rows name none, and the tickets a
-/// partial row names *before* "Missing:" built its other parts, so they name none either.
+/// in what a row still **misses** — the text after "Missing:" in a `partial` row's Status
+/// paragraph, or a `to port` row's whole Status paragraph. Built, checked and dropped rows
+/// name none, and the tickets a partial row names *before* "Missing:" built its other parts,
+/// so they name none either.
+///
+/// A row is the inventory table's line (`` | `src/…` | … | status word | ``, the word in the
+/// last cell) plus the file's section (`` ### `src/…` ``), whose `**Status:**` paragraph is
+/// its last ([`row_status`]). The word decides; the paragraph supplies the tickets.
 ///
 /// The checklist is edited anyway when a feature lands (its "Missing:" item goes, or the row
 /// becomes `built`), so a stub citing that ticket then fails its test with no list to keep by
@@ -151,21 +156,58 @@ pub const PARITY_DOC: &str = include_str!("../../../../docs/plans/gpui/parity.md
 /// splash (#160)". The tests run offline, so GitHub's open/closed state is not consulted.
 pub fn stub_tickets(parity: &str) -> std::collections::BTreeSet<u32> {
     let mut tickets = std::collections::BTreeSet::new();
-    for line in parity.lines().filter(|l| l.starts_with("| `src/")) {
-        let Some(status) = cells(line).into_iter().rev().find(|c| !c.is_empty()) else { continue };
-        let missing = if status.starts_with("to port") {
-            status.as_str()
-        } else if status.starts_with("partial") {
-            match status.find("Missing:") {
+    for (file, word) in inventory(parity) {
+        let Some(status) = row_status(parity, &file) else { continue };
+        let missing = match word.as_str() {
+            "to port" => status,
+            "partial" => match status.find("Missing:") {
                 Some(at) => &status[at..],
                 None => continue,
-            }
-        } else {
-            continue; // built, dropped
+            },
+            _ => continue, // built, checked, dropped
         };
         tickets.extend(ticket_numbers(missing));
     }
     tickets
+}
+
+/// The inventory's rows as (file cell, status word): every table line that starts with a
+/// `` `src/…` `` cell, its word the last non-empty cell.
+fn inventory(parity: &str) -> Vec<(String, String)> {
+    parity
+        .lines()
+        .filter(|l| l.starts_with("| `src/"))
+        .filter_map(|line| {
+            let cells = cells(line);
+            let file = cells.get(1)?.clone();
+            let word = cells.into_iter().rev().find(|c| !c.is_empty())?;
+            Some((file, word))
+        })
+        .collect()
+}
+
+/// The `**Status:**` paragraph of `file`'s section (heading `` ### `src/…` ``), from its label
+/// to the end of the section (the next `##`/`###` heading). `None` without such a section.
+fn row_status<'a>(parity: &'a str, file: &str) -> Option<&'a str> {
+    let heading = format!("### {file}");
+    let mut offset = 0;
+    let mut start = None;
+    for line in parity.split_inclusive('\n') {
+        let text = line.trim_end();
+        if let Some(s) = start {
+            if text.starts_with("## ") || text.starts_with("### ") {
+                return status_in(&parity[s..offset]);
+            }
+        } else if text == heading {
+            start = Some(offset + line.len());
+        }
+        offset += line.len();
+    }
+    status_in(&parity[start?..])
+}
+
+fn status_in(section: &str) -> Option<&str> {
+    section.find("**Status:**").map(|at| section[at..].trim_end())
 }
 
 /// A table row's cells, split on the pipes Markdown reads as separators (not `\|`).
@@ -221,19 +263,82 @@ mod tests {
 
     /// Only what rows still miss counts: a built or dropped row's ticket, and a partial row's
     /// tickets before "Missing:" (the ones that built its other parts), are refused.
+    ///
+    /// The word in the table decides and the section's Status paragraph supplies the tickets:
+    /// a "Missing:" outside the Status paragraph (B's spec), in a built or checked row's
+    /// status (A, F), or in the next section (C's, after B's) does not count, and a `\|` in a
+    /// table cell does not shift the word.
     #[test]
     fn stub_tickets_come_from_what_rows_still_miss() {
         let doc = "\
-| File | Features | Keys | Commands | Ticket | Status |
-|---|---|---|---|---|---|
-| `src/A.tsx` | a | — | — | x | built (#114: `a.rs`), awaiting the visual check |
-| `src/B.tsx` | b \\| c | — | — | x | partial (#105, #158: `b.rs`): built X. Missing: Y (#159) \\| Z (#161) |
-| `src/C.tsx` | c | — | — | x | partial (#106: `c.rs`): no ticket named for what is missing. Missing: W |
-| `src/D.tsx` | d | — | — | x | to port (#160) |
-| `src/E.tsx` | e | — | — | x | dropped (decision: #157) |
+| React file | Area | Tickets | GPUI path | Status |
+|---|---|---|---|---|
+| `src/A.tsx` | x | #114 | `a.rs` | built |
+| `src/B.tsx` | x \\| y | #105, #158 | `b.rs` | partial |
+| `src/C.tsx` | x | #106 | `c.rs` | partial |
+| `src/D.tsx` | x | #160 | — | to port |
+| `src/E.tsx` | x | #157 | — | dropped |
+| `src/F.tsx` | x | #108 | `f.rs` | checked |
+| `src/G.tsx` | x | #162 | — | partial |
 Text that mentions #999 outside any row.
+
+## Area
+
+### `src/A.tsx`
+
+**Status:** built (#114: `a.rs`), awaiting the visual check. Missing: nothing (#170).
+
+### `src/B.tsx`
+
+**Spec:** b. Missing: (#171).
+
+**Status:** partial (#105, #158: `b.rs`): built X.
+Missing: Y (#159) | Z (#161)
+
+### `src/C.tsx`
+
+**Status:** partial (#106: `c.rs`): no ticket named for what is missing. Missing: W
+
+### `src/D.tsx`
+
+**Status:** to port (#160)
+
+### `src/E.tsx`
+
+**Status:** dropped (decision: #157). Missing: (#172)
+
+### `src/F.tsx`
+
+**Status:** built (#108), visually checked. Missing: (#173)
+
+## Later
+
+### `src/G.tsx` without its Status paragraph
+
+**Status:** partial (#162). Missing: (#174)
 ";
         assert_eq!(stub_tickets(doc).into_iter().collect::<Vec<_>>(), vec![159, 160, 161]);
+    }
+
+    /// Every inventory row has a section whose Status paragraph starts with the row's word
+    /// (`checked` rows are `built` ones that were visually checked), and every section is in
+    /// the inventory, so the word [`stub_tickets`] trusts cannot drift from the narrative.
+    #[test]
+    fn every_parity_row_has_a_status_that_agrees_with_its_word() {
+        let rows = inventory(PARITY_DOC);
+        assert_eq!(rows.len(), 114, "one row per React file");
+        for (file, word) in &rows {
+            let status = row_status(PARITY_DOC, file).unwrap_or_else(|| panic!("{file}: no section"));
+            let lead = match word.as_str() {
+                "built" | "checked" => "built",
+                "partial" | "to port" | "dropped" => word.as_str(),
+                other => panic!("{file}: unknown status word {other:?}"),
+            };
+            let narrative = status.trim_start_matches("**Status:**").trim_start();
+            assert!(narrative.starts_with(lead), "{file}: word {word:?}, status {narrative:.60}");
+        }
+        let sections = PARITY_DOC.lines().filter(|l| l.starts_with("### `src/")).count();
+        assert_eq!(sections, rows.len(), "every section is in the inventory");
     }
 
     /// Against the real checklist: #114 and #158 (which built parts of the partial App.tsx

@@ -209,8 +209,9 @@ Design consequence — keep these on the *right* axis:
     rule's key in `tags.auto_rule`, wherever it sits: rename or move it (directly, or by
     renaming, moving or merging an ancestor) and it stays the rule's tag, with no second tag
     made at the canonical path. The path is used only when no tag carries the key: a tag
-    there is taken over only if that loses nothing (it holds no photo the rule wouldn't tag),
-    and one holding other photos is left alone, rows and all, with the rule tagless until the
+    there is taken over only if it is an ordinary tag (another rule's tag moved there stays
+    that rule's) and that loses nothing (it holds no photo the rule wouldn't tag); one holding
+    other photos is left alone, rows and all, with the rule tagless until the
     path is free or the tag holds only matches; with no tag there, one is made on the first
     match, which is how a tag merged or deleted away comes back.
   - **Upgrading from the path-keyed engine** (review #181 r2). Earlier engines found the tag by

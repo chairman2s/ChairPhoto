@@ -309,7 +309,8 @@ impl Catalog {
     }
 
     /// The rule's tag when no tag carries its key: the tag at its canonical path, taken over
-    /// only when that loses nothing. Taking a tag over rebuilds its membership, so a tag there
+    /// only when it is an ordinary tag and that loses nothing. Another rule's tag the user
+    /// moved there is never taken. Taking a tag over rebuilds its membership, so a tag there
     /// that holds a photo the rule would not tag (made by hand, perhaps after the rule's own
     /// tag was renamed away) is left alone, rows and all, and the rule has no tag until the
     /// path is free or that tag holds only matches. A tag made at the path before the rule
@@ -319,6 +320,10 @@ impl Catalog {
         let Some(id) = self.find_tag_id_by_path(rule.path)? else {
             return Ok(RuleTag::None);
         };
+        // Another rule's tag moved onto this path stays that rule's (review #181 r2 L2).
+        if self.auto_tag_refusal(id)?.is_some() {
+            return Ok(RuleTag::PathTaken);
+        }
         let holds_other: bool = self.conn.query_row(
             &format!(
                 "SELECT EXISTS(SELECT 1 FROM photo_tags WHERE tag_id = ?1
@@ -615,6 +620,27 @@ mod tests {
         let methods = c.create_tag("Methods").unwrap();
         crate::catalog::tag_maintenance::merge_tags(&c.conn, &[technique], methods, 1).unwrap();
         still_the_rules_tag(&c, &root, auto, "Methods/Long Exposure", fast);
+    }
+
+    /// Review #181 r2 L2 (probe P5): the long-exposure tag moved and renamed onto the
+    /// monochrome rule's path, with monochrome carried by no tag. Monochrome's path fallback
+    /// must not take it over — even when it holds only monochrome matches — and long-exposure
+    /// keeps it.
+    #[test]
+    fn the_path_fallback_never_takes_another_rules_tag() {
+        let (c, _root, long, _fast, auto) = long_and_fast("autotag-other-rule");
+        c.set_grayscale(long, true).unwrap();
+        let treatment = c.create_tag("Treatment").unwrap();
+        c.move_tag(auto, Some(treatment)).unwrap();
+        c.rename_tag(auto, "Black & White").unwrap();
+        c.apply_auto_tags().unwrap();
+
+        assert_eq!(c.auto_tag_refusal(auto).unwrap().map(|r| r.rule), Some("long-exposure".into()));
+        assert_eq!(carriers(&c), vec![auto]);
+        assert!(has(&c, long, auto));
+        let mono: i64 =
+            c.conn.query_row("SELECT COUNT(*) FROM tags WHERE auto_rule = 'monochrome'", [], |r| r.get(0)).unwrap();
+        assert_eq!(mono, 0, "monochrome has no tag while another rule's holds its path");
     }
 
     /// Should two tags ever carry a key after the one-time pass, the one at the rule's path

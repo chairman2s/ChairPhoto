@@ -156,7 +156,7 @@ section.
 | `src/theme/prefs.ts` | Shell | #113 | `machine_prefs.rs` | built |
 | `src/theme/apply.ts` | Shell | — | — | dropped |
 | `src/vite-env.d.ts` | Shell | — | — | dropped |
-| `src/components/CatalogGrid.tsx` | Library | #106, #158 | `library/grid.rs` | built |
+| `src/components/CatalogGrid.tsx` | Library | #106, #158 | `library/grid.rs` | checked |
 | `src/components/Thumbnail.tsx` | Library | #101, #106 | `library/grid.rs` | built |
 | `src/components/StackProposalsDialog.tsx` | Library | #106 | `library/stacks.rs` | built |
 | `src/components/TrashDialog.tsx` | Library | #114 | `storage/trash.rs` | built |
@@ -591,7 +591,8 @@ QuickTagGroups with Tag panel
 
 **Status:** built (#105, #107: `crates/app/src/shell/inspector.rs`;
 QuickTagGroups in `crates/app/src/tags/photo_tags.rs` with "Recently used" (10) and "⚙
-groups"), visually checked 2026-10-03 (#163) except QuickTagGroups (not reached);
+groups"), visually checked 2026-10-03 (#163), QuickTagGroups in a second pass
+(its empty-state line runs off the column, #176);
 in Compare the header follows the selection, not the focused pane (#170).
 Deliberate difference: the filename uses the UI sans, not the serif.
 
@@ -819,7 +820,8 @@ Reports the visible range for the status fetch.
 
 **Status:** built (#106, #158: `crates/app/src/library/grid.rs` `LibraryView`,
 `library/layout.rs`, `library/grid_menu.rs`), visually checked 2026-10-03 (#163);
-Ctrl-click, double-click and scrolling not exercised: virtualised `uniform_list` with
+Ctrl-click and double-click in a second pass; scrolling not exercised (eight photos fill
+one row): virtualised `uniform_list` with
 overscan 3, slider-driven columns, 3:2 tiles, opens at the newest photo, scrolls the active
 one into view, selected/active/rejected states, click/Ctrl/Shift selection, double-click →
 loupe, every badge with tooltips, filename, filter-worded empty state
@@ -1013,8 +1015,8 @@ ev: `rapidraw:progress` (one global listener, keyed by photo);
 
 **Port ticket:** Photo inspector
 
-**Status:** built, details tab visually checked 2026-10-03 (#163), the rest awaiting the
-visual check (#108: `crates/app/src/inspector/mod.rs`, `inspector/render.rs`;
+**Status:** built, details and tags tabs visually checked 2026-10-03 (#163),
+the rest awaiting the visual check (#108: `crates/app/src/inspector/mod.rs`, `inspector/render.rs`;
 tags tab = #107's `tags/photo_tags.rs` + inspector-slot module panels in `view.rs`): section
 state `inspector.section.<id>` per machine (#159, `MachinePrefs`, default collapsed);
 details (EXIF line, stars, Pick/Reject/None, labels, signals), Stack (View →
@@ -1266,6 +1268,7 @@ The quick-tag bar refetches on close.
 
 **Status:** built (#107: `crates/app/src/tags/groups.rs`;
 the quick-tag block re-reads on every write), awaiting the visual check
+(its empty dialog was seen 2026-10-03, #163)
 
 ### `src/modules/tagPaste.ts`
 
@@ -1306,7 +1309,9 @@ Unavailable state with action buttons.
 **Port ticket:** Loupe
 
 **Status:** built (#109, #158: `crates/app/src/loupe/zoom.rs` `ZoomImage` / `ZoomShared` /
-`ZoomView`), awaiting the visual check: wheel/drag/double-click zoom, the tier swap, Fit N%,
+`ZoomView`), awaiting the visual check
+(wheel zoom toward the cursor and Fit N% seen 2026-10-03, #163):
+wheel/drag/double-click zoom, the tier swap, Fit N%,
 the override's hi-res, the shared view, and the unavailable state's Relocate…, Retrieve from
 NAS and Remove from catalog (#158: `RelocatePhoto` / `RetrieveFromNas` /
 `RemoveFromCatalog`, run by the root view on the inline loupe's photo,
@@ -1324,7 +1329,8 @@ Used only by CullSession.
 **Port ticket:** Loupe
 
 **Status:** built (#109: folded into `crates/app/src/loupe/cull.rs`, "No preview
-available"), awaiting the visual check
+available"), visually checked 2026-10-03 (#163);
+the frame is cropped instead of fitted (#174)
 
 ### `src/components/CompareView.tsx`
 
@@ -1348,8 +1354,9 @@ Empty "Nothing to compare… press C".
 **Port ticket:** Loupe
 
 **Status:** built (#109: `crates/app/src/loupe/compare_view.rs`, `loupe/compare.rs`;
-mode in machine prefs `panel.compareMode`), visually checked 2026-10-03 (#163: Duel mode;
-Grid mode and paging not exercised).
+mode in machine prefs `panel.compareMode`), visually checked 2026-10-03
+(#163: Duel and Grid mode; paging not exercised;
+a portrait frame in a narrow Grid pane is cropped, #175).
 Difference: no "Nothing to compare" state — Compare ends when no pane is left
 (`shell/state.rs:926-929`)
 
@@ -1381,7 +1388,8 @@ r/y/g/b/v label, n clears (all advance)
 **Port ticket:** Loupe
 
 **Status:** built (#109: `crates/app/src/loupe/cull.rs` `CullState` / `CullView`;
-keys in `loupe/mod.rs`, CULL context), awaiting the visual check
+keys in `loupe/mod.rs`, CULL context), visually checked 2026-10-03 (#163):
+HUD, help, rating with advance, summary; the frame is cropped instead of fitted (#174)
 
 ### `src/modules/compareDuel.ts`
 

@@ -212,6 +212,23 @@ impl JobStatus for IdentityRepairJobStatus {
     }
 }
 
+/// Snapshot of a running bulk resolution of non-UUID identity conflicts
+/// (`identity_resolve_status`, #150): copies done of `total` when it started. Its own family,
+/// so a bulk Overwrite/Dismiss and a repair pass never stop each other.
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IdentityResolveJobStatus {
+    pub job: u64,
+    pub done: usize,
+    pub total: usize,
+}
+
+impl JobStatus for IdentityResolveJobStatus {
+    fn job_id(&self) -> u64 {
+        self.job
+    }
+}
+
 const _: () = {
     #[allow(dead_code)]
     fn assert_send_sync<T: Send + Sync>() {}

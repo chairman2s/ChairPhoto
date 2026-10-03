@@ -73,6 +73,8 @@ core_events! {
     PhashIndexDone(PhashIndexDone) = "phash:index_done",
     IdentityRepairProgress(IdentityRepairProgress) = "identity:repair_progress",
     IdentityRepairDone(IdentityRepairDone) = "identity:repair_done",
+    IdentityResolveProgress(IdentityResolveProgress) = "identity:resolve_progress",
+    IdentityResolveDone(IdentityResolveDone) = "identity:resolve_done",
     #[cfg(feature = "faces")]
     FacesProgress(FacesProgressEvent) = "faces:progress",
     #[cfg(feature = "faces")]
@@ -344,6 +346,30 @@ pub struct IdentityRepairDone {
     pub ok: bool,
     pub job: u64,
     pub summary: crate::catalog::IdentityRepairSummary,
+    pub error: Option<String>,
+}
+
+/// Progress event for `identity:resolve_progress`, a bulk resolution of non-UUID identity
+/// conflicts (#150). Carries the job id so a front end drops a superseded run's.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IdentityResolveProgress {
+    pub done: usize,
+    pub total: usize,
+    pub job: u64,
+}
+
+/// Terminal event for `identity:resolve_done`. `summary.aborted` marks a run stopped by a
+/// Cancel, a newer run or a catalog switch, whose counts are partial; `ok: false` with an
+/// `error` is a run that could not start or stopped on a catalog error, with an empty summary
+/// (the decisions it made before the error stand; the debt panel's reload shows them).
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IdentityResolveDone {
+    pub ok: bool,
+    pub job: u64,
+    pub action: crate::catalog::ForeignConflictAction,
+    pub summary: crate::catalog::ForeignConflictSummary,
     pub error: Option<String>,
 }
 

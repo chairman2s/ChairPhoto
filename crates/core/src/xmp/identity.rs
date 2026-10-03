@@ -43,6 +43,48 @@ pub fn read_identifier(photo_path: &Path) -> Option<String> {
     None
 }
 
+/// Every `xmp:Identifier` value in the photo's sidecar, in document order: the attribute and
+/// element forms of every `rdf:Description`, and every text of an element (each `rdf:li` of
+/// a Bag/Seq/Alt). Empty when there is no sidecar, it does not parse, or it has none.
+///
+/// [`read_identifier`] answers with the first of these, which is what binding compares. A
+/// caller about to let [`overwrite_identifier`] replace them all reads this instead (#150):
+/// a second value — another photo's UUID appended by a DAM or `exiftool -XMP-xmp:Identifier+=`,
+/// or one in a second Description — would otherwise be destroyed unseen.
+pub fn read_identifiers(photo_path: &Path) -> Vec<String> {
+    fn texts(e: &xmltree::Element, out: &mut Vec<String>) {
+        for node in &e.children {
+            match node {
+                XMLNode::Text(t) if !t.trim().is_empty() => out.push(t.trim().to_string()),
+                XMLNode::Element(child) => texts(child, out),
+                _ => {}
+            }
+        }
+    }
+    let path = sidecar_path(photo_path);
+    let Ok(file) = std::fs::File::open(&path) else { return Vec::new() };
+    let Ok(root) = parse_xml(file) else { return Vec::new() };
+    let Some(rdf) = rdf_of(&root) else { return Vec::new() };
+    let mut values = Vec::new();
+    for node in &rdf.children {
+        let XMLNode::Element(desc) = node else { continue };
+        if desc.name != "Description" {
+            continue;
+        }
+        if let Some(v) = ns_attr(desc, NS_XMP, "Identifier").filter(|v| !v.trim().is_empty()) {
+            values.push(v.trim().to_string());
+        }
+        for child in &desc.children {
+            if let XMLNode::Element(e) = child {
+                if e.namespace.as_deref() == Some(NS_XMP) && e.name == "Identifier" {
+                    texts(e, &mut values);
+                }
+            }
+        }
+    }
+    values
+}
+
 /// Write the photo's UUID into its sidecar as `xmp:Identifier`, merge-safe: only the
 /// identifier (and `chairphoto:LastWrite`) are touched; all other content is preserved.
 /// This is the binding invariant — the UUID must live on disk so moves/re-roots match.

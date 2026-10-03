@@ -225,6 +225,41 @@ mod tests {
         assert_eq!(c(&state, |c| c.owed_iptc(id).unwrap()), IptcMask::NONE);
     }
 
+    /// Review of #153 (its mutation M2): the photo is removed while Retry waits for its write
+    /// turn, and its id taken by a new photo that owes IPTC of its own. The re-check after the
+    /// wait refuses: Retry neither writes the new photo's sidecar (under the old photo's
+    /// turn) nor settles its debt.
+    #[test]
+    fn retry_refuses_a_photo_removed_while_it_waited_for_its_turn() {
+        let (dir, state, id, file) = photo("iptc-153-retry-removed");
+        let row = owe(&state, id, &titled("Mine"));
+        let earlier = WriteOrder::reserve(&file).wait();
+        let state = std::sync::Arc::new(state);
+        let retry = {
+            let (state, uuid) = (state.clone(), row.uuid.clone());
+            std::thread::spawn(move || retry_owed_iptc_as(&state, None, id, &uuid))
+        };
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(!retry.is_finished(), "the precondition: Retry waits for the turn");
+
+        let other = dir.join("library").join("OTHER.ARW");
+        std::fs::write(&other, b"raw").unwrap();
+        let reused = c(&state, |c| {
+            c.remove_photo(id).unwrap();
+            let reused = c.upsert_photo(&other, None, 0, 1).unwrap().id;
+            let w = c.set_iptc(reused, &titled("New photo's")).unwrap();
+            c.settle_iptc_write(&w, &Err("read-only".into())).unwrap();
+            reused
+        });
+        assert_eq!(reused, id, "the precondition: the id is reused");
+        drop(earlier);
+
+        assert_eq!(retry.join().unwrap().unwrap_err(), OWED_PHOTO_GONE);
+        assert_eq!(c(&state, |c| c.owed_iptc(reused).unwrap()), IptcMask::TITLE, "the new photo still owes");
+        let sidecar = std::fs::read_to_string(crate::xmp::sidecar_path(&other)).unwrap_or_default();
+        assert!(!sidecar.contains("New photo's"), "the new photo's sidecar was written:\n{sidecar}");
+    }
+
     /// A photo id that no longer names the row's UUID: neither Retry nor Dismiss touches the
     /// photo that took it.
     #[test]

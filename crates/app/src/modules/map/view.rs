@@ -18,6 +18,14 @@
 //! opens the fence editor. Escape closes the editor, cancels drawing, or closes the
 //! filmstrip, in that order.
 //!
+//! **The filmstrip** lists every photo at the marker, as React's did (a large cluster is
+//! one long strip). It is a horizontal virtual list: only the frames on screen are built,
+//! and only they — plus [`STRIP_OVERSCAN`] each side — are asked for, nearest the active
+//! photo first, under the view's own image claim. A frame that scrolls out of that window
+//! is let go (its pending render released, unless another view holds it). The strip is
+//! bound to the catalog its photos were read from: it closes when that is no longer the
+//! map's, and it never shows a thumbnail rendered while another catalog was open.
+//!
 //! **Tiles** load only for a host the user allowed (decision #118). Until the settings say,
 //! nothing is fetched; when the host was never asked, a card asks. With no tiles the map is
 //! a plain background with a graticule, and markers and fences work as before.
@@ -25,10 +33,11 @@
 use super::logic::{self, Consent, Draft, DraftStep};
 use super::state::{Load, MapState};
 use super::tiles::{release, MapTiles, TileDone, TileLayer, TILE_BUDGET};
-use crate::image_store::{ImageState, ImageStore};
+use crate::image_store::{ClaimId, ImageState, ImageStore};
 use crate::shell::style::Colors;
 use crate::shell::ShellState;
 use crate::storage::ui;
+use chairphoto_core::app::CatalogIdentity;
 use chairphoto_core::image_pool::ImageKind;
 use chairphoto_core::plugins::map::cluster::{cluster, Cluster, ProjectedPoint, CLUSTER_RADIUS_PX};
 use chairphoto_core::plugins::map::tiles::math::{fit_bounds, unproject, TileKey, Viewport};
@@ -36,6 +45,7 @@ use chairphoto_core::plugins::map::tiles::source::{MAX_TILE_ZOOM, OSM_ATTRIBUTIO
 use chairphoto_core::plugins::map::{point_in_polygon, Fence, LatLng};
 use futures::StreamExt as _;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
+use gpui_kit::component::{h_virtual_list, VirtualListScrollHandle};
 use gpui_kit::prelude::*;
 use gpui_kit::{
     canvas, div, fill, img, point, px, rgb, size, AnyElement, App, Bounds, Context, CursorStyle, DispatchPhase, Entity,
@@ -44,6 +54,7 @@ use gpui_kit::{
     SharedString, Subscription, Task, TestSupportExt as _, Window,
 };
 use std::cell::Cell;
+use std::ops::Range;
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -61,12 +72,53 @@ const VERTEX_HIT_PX: f64 = 8.0;
 const MAX_LABELS: usize = 400;
 /// The marker colour (map.tsx's pin, `#3b82f6`).
 const MARKER: u32 = 0x3b82f6;
+/// A filmstrip frame's size and the gap between frames.
+const FRAME_W: f32 = 96.;
+const FRAME_H: f32 = 72.;
+const FRAME_GAP: f32 = 6.;
+/// Frames asked for on each side of the ones on screen, so a short scroll finds them ready
+/// (React's `loading="lazy"` let the browser fetch a little past the viewport).
+pub const STRIP_OVERSCAN: usize = 8;
 
 /// The bottom filmstrip (`FilmstripState` in map.tsx).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Filmstrip {
-    pub ids: Vec<i64>,
+    pub ids: Arc<Vec<i64>>,
     pub active: i64,
+    /// The catalog `ids` were read from (`MapState::catalog` when it opened).
+    pub from: Option<CatalogIdentity>,
+}
+
+/// What a filmstrip frame shows for its thumbnail tier in `state`: only pixels rendered
+/// while the strip's catalog was open. A switch whose `catalog:switched` has not arrived yet
+/// renders the new catalog's photo under a colliding id; that is not this frame's photo.
+/// (Without an identity probe nothing records where a thumbnail was rendered.)
+pub fn frame_image(strip: &Filmstrip, state: ImageState) -> Option<Arc<RenderImage>> {
+    match state {
+        ImageState::Ready(l) if l.rendered_in.is_none() || l.rendered_in == strip.from => Some(l.image),
+        _ => None,
+    }
+}
+
+/// The thumbnails the filmstrip wants when `visible` (indices into the strip's `len`
+/// photos) is on screen and `active` is the active photo's index: the visible frames
+/// nearest the active photo first (it is clamped into the visible range; ahead before
+/// behind at the same distance), then [`STRIP_OVERSCAN`] each side, nearest the visible
+/// range first.
+pub fn strip_wanted(visible: Range<usize>, len: usize, active: Option<usize>) -> Vec<usize> {
+    let visible = visible.start.min(len)..visible.end.min(len);
+    if visible.is_empty() {
+        return Vec::new();
+    }
+    let anchor = active.unwrap_or(visible.start).clamp(visible.start, visible.end - 1);
+    let mut out: Vec<usize> = visible.clone().collect();
+    out.sort_by_key(|&i| (i.abs_diff(anchor), i < anchor));
+    let before = visible.start.saturating_sub(STRIP_OVERSCAN)..visible.start;
+    let after = visible.end..(visible.end + STRIP_OVERSCAN).min(len);
+    let mut rest: Vec<usize> = before.chain(after).collect();
+    rest.sort_by_key(|&i| (if i < visible.start { visible.start - i } else { i + 1 - visible.end }, i < visible.start));
+    out.extend(rest);
+    out
 }
 
 /// The fence editor dialog: a new fence (`polygon` drawn) or an existing one's name and tag.
@@ -126,6 +178,13 @@ pub struct MapView {
     pub draft: Option<Draft>,
     pub selected_fence: Option<i64>,
     pub filmstrip: Option<Filmstrip>,
+    /// The filmstrip's scroll position, and the frames its list last laid out on screen.
+    pub strip_scroll: VirtualListScrollHandle,
+    strip_range: Rc<Cell<Option<Range<usize>>>>,
+    /// The frames' sizes, kept while the strip's length is the same (a big cluster's list).
+    strip_sizes: Rc<Vec<gpui_kit::Size<Pixels>>>,
+    /// The filmstrip's hold on its thumbnails (see the module docs); made on first use.
+    pub strip_claim: Option<ClaimId>,
     pub editor: Option<FenceEditor>,
     /// A polygon closed by a click (which has no window): the editor opens on the next render.
     pending_editor: Option<(Option<Fence>, Vec<LatLng>)>,
@@ -168,10 +227,17 @@ impl MapView {
         // pending loads for a host no longer allowed are cancelled, their late results dropped.
         let _observe = cx.observe(&state, |this: &mut MapView, _, cx| {
             this.sync_source(cx);
+            this.sync_strip_catalog(cx);
             cx.notify();
         });
         // Every texture this view still holds leaves the atlas with it.
-        cx.on_release(|this: &mut MapView, cx: &mut App| release(this.tiles.clear(), cx)).detach();
+        cx.on_release(|this: &mut MapView, cx: &mut App| {
+            release(this.tiles.clear(), cx);
+            if let (Some(images), Some(claim)) = (this.images.as_ref(), this.strip_claim.take()) {
+                images.update(cx, |store, _| store.drop_claim(claim));
+            }
+        })
+        .detach();
         MapView {
             state,
             shell,
@@ -190,6 +256,10 @@ impl MapView {
             draft: None,
             selected_fence: None,
             filmstrip: None,
+            strip_scroll: VirtualListScrollHandle::new(),
+            strip_range: Rc::new(Cell::new(None)),
+            strip_sizes: Rc::new(Vec::new()),
+            strip_claim: None,
             editor: None,
             pending_editor: None,
             focus: cx.focus_handle(),
@@ -245,6 +315,7 @@ impl MapView {
     /// Bring the tiles, the fit and the clusters up to date with the state. Called by render.
     fn sync(&mut self, cx: &mut Context<Self>) {
         self.sync_source(cx);
+        self.sync_strip_catalog(cx);
         let (points, revision) = {
             let s = self.state.read(cx);
             (s.points.clone(), s.points_revision)
@@ -527,7 +598,47 @@ impl MapView {
     fn open_filmstrip(&mut self, ids: Vec<i64>, cx: &mut Context<Self>) {
         let Some(&first) = ids.first() else { return };
         self.select_quietly(first, cx);
-        self.filmstrip = Some(Filmstrip { ids, active: first });
+        let from = self.state.read(cx).catalog();
+        self.filmstrip = Some(Filmstrip { ids: Arc::new(ids), active: first, from });
+        self.strip_range.set(None);
+        self.strip_scroll.scroll_to_item(0, gpui_kit::ScrollStrategy::Top);
+    }
+
+    /// The strip's ids are the catalog's it was opened in: once the map's photos are not
+    /// (a switch, seen when the state hears of it — the view need not be on screen), it
+    /// closes.
+    fn sync_strip_catalog(&mut self, cx: &mut Context<Self>) {
+        if self.filmstrip.as_ref().is_some_and(|f| f.from != self.state.read(cx).catalog()) {
+            self.close_filmstrip(cx);
+        }
+    }
+
+    /// Close the filmstrip and let go of every thumbnail it held.
+    pub fn close_filmstrip(&mut self, cx: &mut Context<Self>) {
+        self.filmstrip = None;
+        self.strip_range.set(None);
+        if let (Some(images), Some(claim)) = (&self.images, self.strip_claim) {
+            images.update(cx, |store, _| store.set_claim(claim, []));
+        }
+    }
+
+    /// The frames on screen, once per frame, from the strip's prepaint (after its list laid
+    /// them out): claim and ask for [`strip_wanted`]'s thumbnails; what left the window is
+    /// released by the claim.
+    ///
+    /// Not done while building the frames: the list also builds one frame every layout to
+    /// measure it, and a claim keyed on that would release and re-ask the visible frames
+    /// every frame.
+    fn on_strip_visible(&mut self, visible: Range<usize>, cx: &mut Context<Self>) {
+        let (Some(images), Some(strip)) = (self.images.clone(), self.filmstrip.as_ref()) else { return };
+        let active = strip.ids.iter().position(|&id| id == strip.active);
+        let wanted: Vec<(i64, ImageKind)> =
+            strip_wanted(visible, strip.ids.len(), active).into_iter().map(|i| (strip.ids[i], ImageKind::Thumb)).collect();
+        let claim = *self.strip_claim.get_or_insert_with(|| images.update(cx, |store, _| store.new_claim()));
+        images.update(cx, |store, _| {
+            store.set_claim(claim, wanted.iter().copied());
+            store.request_batch(&wanted);
+        });
     }
 
     /// Select a photo without leaving the map (`selectPhotoSilent`): the pop-out loupe follows.
@@ -548,7 +659,8 @@ impl MapView {
 
     /// "Show in Library": select the active photo and switch to the Library.
     pub fn show_in_library(&mut self, cx: &mut Context<Self>) {
-        if let Some(f) = self.filmstrip.take() {
+        if let Some(f) = self.filmstrip.clone() {
+            self.close_filmstrip(cx);
             self.shell.update(cx, |s, cx| {
                 s.library.select_quiet(f.active);
                 s.show_library(cx);
@@ -562,7 +674,7 @@ impl MapView {
         if self.editor.take().is_some() {
         } else if self.draft.take().is_some() {
         } else {
-            self.filmstrip = None;
+            self.close_filmstrip(cx);
         }
         cx.notify();
     }
@@ -1091,36 +1203,74 @@ impl MapView {
         panel.test_support().into_any_element()
     }
 
-    fn render_filmstrip(&self, strip: Filmstrip, colors: Colors, cx: &mut Context<Self>) -> AnyElement {
-        let n = strip.ids.len();
-        let cells: Vec<(i64, ImageState)> = match &self.images {
-            Some(images) => images.update(cx, |store, _| {
-                let wanted: Vec<_> = strip.ids.iter().take(200).map(|&id| (id, ImageKind::Thumb)).collect();
-                store.request_batch(&wanted);
-                strip.ids.iter().map(|&id| (id, store.get(id, ImageKind::Thumb))).collect()
-            }),
-            None => strip.ids.iter().map(|&id| (id, ImageState::Absent)).collect(),
+    /// Frames `range` of the strip, as its virtual list asks for them (to lay out the ones on
+    /// screen, and one to measure). Builds elements from what the image store holds; asks
+    /// for nothing (see [`Self::on_strip_visible`]).
+    fn render_frames(&mut self, range: Range<usize>, colors: Colors, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        self.strip_range.set(Some(range.clone()));
+        let Some(strip) = self.filmstrip.clone() else { return Vec::new() };
+        let range = range.start.min(strip.ids.len())..range.end.min(strip.ids.len());
+        let ids = &strip.ids[range];
+        let images: Vec<Option<Arc<RenderImage>>> = match &self.images {
+            Some(images) => images.update(cx, |store, _| ids.iter().map(|&id| frame_image(&strip, store.get(id, ImageKind::Thumb))).collect()),
+            None => vec![None; ids.len()],
         };
-        let thumbs = cells.into_iter().map(|(id, image)| {
-            let active = id == strip.active;
-            let cell = div()
-                .id(("map-thumb", id as u64))
-                .flex_none()
-                .w(px(96.))
-                .h(px(72.))
-                .rounded(px(4.))
-                .overflow_hidden()
-                .bg(colors.panel)
-                .border_2()
-                .border_color(if active { colors.accent } else { colors.border })
-                .cursor_pointer()
-                .on_click(cx.listener(move |this, _, _, cx| this.filmstrip_select(id, cx)));
-            let cell = match image {
-                ImageState::Ready(l) => cell.child(img(l.image).size_full().object_fit(ObjectFit::Cover)),
-                _ => cell,
-            };
-            cell.test_support().into_any_element()
-        });
+        ids.iter()
+            .zip(images)
+            .map(|(&id, image)| {
+                let active = id == strip.active;
+                let cell = div()
+                    .id(("map-thumb", id as u64))
+                    .flex_none()
+                    .w(px(FRAME_W))
+                    .h(px(FRAME_H))
+                    .rounded(px(4.))
+                    .overflow_hidden()
+                    .bg(colors.panel)
+                    .border_2()
+                    .border_color(if active { colors.accent } else { colors.border })
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |this, _, _, cx| this.filmstrip_select(id, cx)));
+                let cell = match image {
+                    Some(image) => cell.child(img(image).size_full().object_fit(ObjectFit::Cover)),
+                    None => cell,
+                };
+                cell.test_support().into_any_element()
+            })
+            .collect()
+    }
+
+    fn render_filmstrip(&mut self, strip: Filmstrip, colors: Colors, cx: &mut Context<Self>) -> AnyElement {
+        let n = strip.ids.len();
+        if self.strip_sizes.len() != n {
+            self.strip_sizes = Rc::new(vec![size(px(FRAME_W), px(FRAME_H)); n]);
+        }
+        let list = h_virtual_list(
+            cx.entity(),
+            "map-filmstrip-row",
+            self.strip_sizes.clone(),
+            move |this: &mut MapView, range, _window, cx| this.render_frames(range, colors, cx),
+        )
+        .track_scroll(&self.strip_scroll)
+        .gap(px(FRAME_GAP))
+        .w_full()
+        .h(px(FRAME_H));
+        // Laid out after the list, so its prepaint sees the range the list just put on
+        // screen (the last one it built: the measuring call comes first).
+        let visible = {
+            let range = self.strip_range.clone();
+            let view = cx.entity().downgrade();
+            canvas(
+                move |_, _, cx| {
+                    if let Some(range) = range.take() {
+                        view.update(cx, |v, cx| v.on_strip_visible(range, cx)).ok();
+                    }
+                },
+                |_, _, _, _| {},
+            )
+            .absolute()
+            .size_0()
+        };
         div()
             .id("map-filmstrip")
             .occlude()
@@ -1157,13 +1307,13 @@ impl MapView {
                                 ui::chip("map-filmstrip-close", "×", true, colors),
                                 true,
                                 cx.listener(|this, _, _, cx| {
-                                    this.filmstrip = None;
+                                    this.close_filmstrip(cx);
                                     cx.notify();
                                 }),
                             )),
                     ),
             )
-            .child(div().id("map-filmstrip-row").flex().flex_row().gap(px(6.)).overflow_x_scroll().children(thumbs))
+            .child(div().relative().w_full().h(px(FRAME_H)).child(list).child(visible))
             .test_support()
             .into_any_element()
     }

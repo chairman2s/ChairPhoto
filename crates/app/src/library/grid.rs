@@ -115,7 +115,7 @@ impl LibraryView {
     }
 
     /// The list's size as the last layout measured it (width, height).
-    fn measured(&self) -> Option<(f32, f32)> {
+    pub(crate) fn measured(&self) -> Option<(f32, f32)> {
         let state = self.scroll.0.borrow();
         state.last_item_size.map(|s| (f32::from(s.item.width), f32::from(s.item.height)))
     }
@@ -260,7 +260,13 @@ impl LibraryView {
         let cols = self.cols.max(1);
         if let Some((w, h)) = self.measured() {
             if layout::columns(w, tile_min) != cols {
-                cx.notify(); // the width changed: re-render with the new column count
+                // The width changed: re-render with the new column count. Deferred past the
+                // frame — this runs in `uniform_list`'s prepaint, and GPUI drops a redraw
+                // asked for mid-draw, which left the grid one width behind (#187).
+                let this = cx.entity().downgrade();
+                cx.defer(move |cx| {
+                    this.update(cx, |_, cx| cx.notify()).ok();
+                });
             }
             self.visible_rows = ((h / row_h).floor() as usize).max(1);
         }

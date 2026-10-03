@@ -369,6 +369,86 @@ fn a_catalog_switch_closes_the_loupe_and_its_marks_fail_closed(cx: &mut TestAppC
     assert!(!app.wired.shell.read_with(cx, |s, _| s.loupe_open));
 }
 
+/// A catalog holding one video, `clip.mp4`, under `root` (written to disk, so its path
+/// resolves); its id.
+fn video_catalog(path: &std::path::Path, root: &std::path::Path) -> (chairphoto_core::catalog::Catalog, i64) {
+    std::fs::create_dir_all(root.join("2026")).unwrap();
+    std::fs::write(root.join("2026/clip.mp4"), b"not really a video").unwrap();
+    let catalog = chairphoto_core::catalog::Catalog::open(path, root).unwrap();
+    let id = catalog.upsert_photo(&root.join("2026/clip.mp4"), None, 0, 1).unwrap().id;
+    (catalog, id)
+}
+
+/// Press and release at each of `points` against the frame on screen, with no draw before or
+/// between (`window.click` draws first, so it would click the new frame's button).
+fn click_undrawn(app: &App, points: &[gpui_kit::Point<gpui_kit::Pixels>], cx: &mut TestAppContext) {
+    cx.update_window(app.window(), |_, window, cx| {
+        let modifiers = Modifiers::default();
+        for &at in points {
+            let down = MouseDownEvent { button: MouseButton::Left, position: at, modifiers, click_count: 1, first_mouse: false };
+            window.dispatch_event(down.to_platform_input(), cx);
+            let up = MouseUpEvent { button: MouseButton::Left, position: at, modifiers, click_count: 1 };
+            window.dispatch_event(up.to_platform_input(), cx);
+        }
+    })
+    .unwrap();
+    cx.run_until_parked();
+}
+
+/// #207, catalog identity: the loupe bar's rotate and the video's Play act on the row and
+/// the catalog the frame on screen was drawn with. Catalog B gives the video's id to its own
+/// video. The core switches to B, and the clicks land on A's frame:
+/// - `catalog:switched` withheld: the rows are still A's, and both fail closed against B.
+/// - the switch taken in and B's rows landed (`rows_from` is B), but not yet drawn: a click
+///   that read the catalog at click time would rotate and play B's video.
+fn loupe_actions_across_a_switch(delivered: bool, cx: &mut TestAppContext) {
+    let dir = TempDir::new(if delivered { "loupe-act-switch-ev" } else { "loupe-act-switch" });
+    let pool = Arc::new(FakePool::default());
+    let app = start_with_pool(cx, pool.clone());
+    let opened: Rc<RefCell<Vec<PathBuf>>> = Rc::default();
+    cx.update(|cx| {
+        let opened = opened.clone();
+        cx.set_global(SystemOpener(Rc::new(move |p, _| opened.borrow_mut().push(p.to_path_buf()))))
+    });
+    let (a, id) = video_catalog(&dir.0.join("a.chairphoto"), &dir.0.join("a"));
+    *app.state.catalog.lock().unwrap() = Some(a);
+    app.state.send(chairphoto_core::app::CoreEvent::CatalogSwitched("a".into()));
+    cx.run_until_parked();
+    select(&app, id, cx);
+    press(&app, "enter", cx);
+    let (rotate_at, play_at) = cx
+        .update_window(app.window(), |_, window, cx| {
+            window.render_frame(cx);
+            (window.find("loupe-rotate-right").bounds().center(), window.find("loupe-play").bounds().center())
+        })
+        .unwrap();
+
+    let (b, b_id) = video_catalog(&dir.0.join("b.chairphoto"), &dir.0.join("b"));
+    assert_eq!(b_id, id, "the ids collide");
+    core_switch(&app, b);
+    if delivered {
+        let b_from = chairphoto_core::app::catalog_identity(&app.state).unwrap();
+        app.wired.shell.update(cx, |s, _| s.set_rows_from_undrawn(b_from));
+    }
+    // Both on the same frame: the first click's answer redraws the window.
+    click_undrawn(&app, &[rotate_at, play_at], cx);
+    let rotation = app.state.catalog.lock().unwrap().as_ref().unwrap().photo_rotation(id).unwrap();
+    assert_eq!(rotation, 0, "delivered={delivered}: B's video was rotated");
+    assert!(opened.borrow().is_empty(), "delivered={delivered}: B's video was played: {:?}", opened.borrow());
+    let line = status(&app, cx);
+    assert!(line.starts_with("Could not rotate") || line.starts_with("Could not play"), "{line}");
+}
+
+#[gpui_kit::test]
+fn loupe_actions_never_reach_the_new_catalog_before_the_switch_event(cx: &mut TestAppContext) {
+    loupe_actions_across_a_switch(false, cx);
+}
+
+#[gpui_kit::test]
+fn loupe_actions_never_reach_the_new_catalog_after_the_switch_event(cx: &mut TestAppContext) {
+    loupe_actions_across_a_switch(true, cx);
+}
+
 /// #172: the loupe bar's rotate chips are icon chips (Lucide's rotate arrows — the UI font
 /// has no ↺ / ↻), named for tests and assistive tech, and still turn the photo; the key hint
 /// is App.tsx's, without "F faces" while the Faces module is off (its key would do nothing).
@@ -494,6 +574,85 @@ fn a_failed_duel_verdict_stays_on_the_pair(cx: &mut TestAppContext) {
     assert_eq!((session.batch(), session.focus()), (vec![ids[0], ids[1]], Some(ids[1])));
     assert!(!session.pending(), "settled: the next verdict may be decided");
     assert_eq!(culling(&app, ids[2]).1, PickState::None);
+}
+
+/// Select exactly `set`, in order.
+fn select_set(app: &App, set: &[i64], cx: &mut TestAppContext) {
+    app.wired.shell.update(cx, |s, cx| s.select_with(cx, select_set_verb(set)));
+    cx.run_until_parked();
+}
+
+fn select_set_verb(set: &[i64]) -> impl FnOnce(&mut chairphoto_model::library::session::LibrarySession) {
+    use chairphoto_model::library::session::SelectMods;
+    let set = set.to_vec();
+    move |l| {
+        l.select_single(set[0]);
+        for &id in &set[1..] {
+            l.select(id, SelectMods::CTRL);
+        }
+    }
+}
+
+/// #205: a verdict still being written when Compare closes and reopens on another set lands
+/// its marks, but settles nothing in the new session — not its round, not its pending flag.
+#[gpui_kit::test]
+fn a_verdict_from_a_closed_compare_does_not_move_the_next_one(cx: &mut TestAppContext) {
+    use chairphoto_model::compare_duel::DuelSide;
+    let (app, _pool, _dir, ids) = app_with(6, "cmp-epoch", cx);
+    let (first, second) = (ids[..3].to_vec(), ids[3..].to_vec());
+    select_set(&app, &first, cx);
+    assert!(app.wired.shell.update(cx, |s, cx| s.open_compare(cx)));
+    // Nothing parks between the verdict and the reopen: its write is still in flight.
+    app.wired.shell.update(cx, |s, cx| {
+        s.compare_verdict(DuelSide::Right, cx);
+        assert!(s.compare().unwrap().pending());
+        s.close_compare(cx);
+        s.select_with(cx, select_set_verb(&second));
+        assert!(s.open_compare(cx));
+        assert_eq!(s.compare().unwrap().pool(), &second[..]);
+    });
+    cx.run_until_parked();
+    assert_eq!(culling(&app, first[0]).1, PickState::Reject, "the old verdict's write landed");
+    let session = app.wired.shell.read_with(cx, |s, _| s.compare().cloned()).unwrap();
+    assert_eq!(
+        (session.batch(), session.duel_progress(), session.focus(), session.pending()),
+        (vec![second[0], second[1]], (1, 2), Some(second[1]), false),
+        "the new duel is where it opened"
+    );
+    for &id in &second {
+        assert_eq!(culling(&app, id).1, PickState::None, "photo {id}");
+    }
+    // Its own verdict judges its first pair.
+    press(&app, "right", cx);
+    assert_eq!(culling(&app, second[0]).1, PickState::Reject);
+    let session = app.wired.shell.read_with(cx, |s, _| s.compare().cloned()).unwrap();
+    assert_eq!((session.batch(), session.duel_progress()), (vec![second[1], second[2]], (2, 2)));
+}
+
+/// #205: Duel→Grid→Duel while a verdict is being written restarts the duel on the round the
+/// verdict was decided in; the verdict's write lands but does not move it. (That a stale
+/// verdict leaves the new duel's own pending verdict alone is covered in `compare.rs`.)
+#[gpui_kit::test]
+fn a_verdict_from_before_a_mode_round_trip_does_not_move_the_duel(cx: &mut TestAppContext) {
+    use crate::loupe::compare::CompareMode;
+    use chairphoto_model::compare_duel::DuelSide;
+    let (app, _pool, _dir, ids) = app_with(3, "cmp-epoch-mode", cx);
+    select_all(&app, cx);
+    press(&app, "c", cx);
+    app.wired.shell.update(cx, |s, cx| {
+        s.compare_verdict(DuelSide::Right, cx);
+        s.set_compare_mode(CompareMode::Grid, cx);
+        s.set_compare_mode(CompareMode::Duel, cx);
+        assert!(!s.compare().unwrap().pending());
+    });
+    cx.run_until_parked();
+    assert_eq!(culling(&app, ids[0]).1, PickState::Reject, "the old verdict's write landed");
+    let session = app.wired.shell.read_with(cx, |s, _| s.compare().cloned()).unwrap();
+    assert_eq!(
+        (session.batch(), session.duel_progress(), session.pending()),
+        (vec![ids[0], ids[1]], (1, 2), false),
+        "the restarted duel did not move"
+    );
 }
 
 /// When every pane drops out of the view — here the duel's champion, rated under the Unrated

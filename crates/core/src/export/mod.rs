@@ -276,17 +276,24 @@ fn export_handoff(item: &ResolvedItem, dest_dir: &Path, before_write: &dyn Fn(&P
     // copied but missing its sidecar, must not look exported.
     let guard = ReservedPair::new(&target, &target_sidecar);
     before_write(&target);
-    std::fs::File::open(original)
-        .and_then(|mut src| std::io::copy(&mut src, &mut out))
-        .map_err(|e| e.to_string())?;
-    drop(out);
+    let mut src = std::fs::File::open(original).map_err(|e| e.to_string())?;
+    std::io::copy(&mut src, &mut out).map_err(|e| e.to_string())?;
     // Carry over the original's permission bits: `fs::copy` does this, but the destination
     // here must stay `reserve_destination`'s exclusive-create reservation (never a fresh
     // file `fs::copy` would create), so the copy itself is `io::copy` into the open handle,
-    // which does not.
-    if let Ok(meta) = std::fs::metadata(original) {
-        let _ = std::fs::set_permissions(&target, meta.permissions());
+    // which does not. Read the mode from the still-open source handle and apply it through
+    // the still-open destination handle (`fchmod`, not a path lookup): a path-based
+    // `metadata`/`set_permissions` after dropping both handles would follow whatever
+    // `target` resolves to *then* — a TOCTOU if something swapped it for a symlink in the
+    // gap. Mode bits only (`& 0o777`); never setuid/setgid.
+    #[cfg(unix)]
+    if let Ok(meta) = src.metadata() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = meta.permissions().mode() & 0o777;
+        let _ = out.set_permissions(std::fs::Permissions::from_mode(mode));
     }
+    drop(out);
+    drop(src);
 
     let sidecar = crate::xmp::sidecar_path(original);
     if sidecar.is_file() {
@@ -1384,7 +1391,12 @@ mod overlap_tests {
 
     /// #212: the hand-off copy carries over the original's permission bits. It can't use
     /// `fs::copy` for the copy itself (the destination must stay `reserve_destination`'s
-    /// exclusive-create reservation, not a fresh file), so the bits are copied explicitly.
+    /// exclusive-create reservation, not a fresh file), so the bits are copied explicitly —
+    /// through the still-open source and destination handles (`fchmod`, not a path lookup
+    /// after both are dropped), so a path swapped for a symlink in the gap between the copy
+    /// and the chmod can't redirect it. That race itself is impractical to force
+    /// deterministically in a test; this only checks the end state the handle-based path
+    /// produces.
     #[test]
     fn hand_off_carries_over_the_originals_permission_bits() {
         use std::os::unix::fs::PermissionsExt;

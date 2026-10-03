@@ -1094,43 +1094,77 @@ fn a_bundle_previews_and_imports(cx: &mut TestAppContext) {
     dlg.read_with(cx, |d, _| assert_eq!(d.preview.as_ref().map(|p| (p.new_count, p.existing)), Some((0, 2))));
 }
 
-/// Browse… cannot filter the portal picker to `.chairphoto` (React could), so the picked file
-/// is checked instead: another file is refused with a message and never previewed; a bundle
-/// name in any case is taken. (#161)
+/// Browse… cannot filter the portal picker to `.chairphoto` (React could), and the name is not
+/// what makes a bundle: the core's preview checks the contents. A real bundle a download or
+/// mail client renamed (`.chairphoto.zip`, no extension, upper case) is accepted from Browse,
+/// as from a typed path; a file that is not a bundle is refused with the core's reason, saying
+/// plainly that it is not a bundle. (#161, review L6)
 #[gpui_kit::test]
-fn browse_refuses_a_picked_file_that_is_not_a_bundle(cx: &mut TestAppContext) {
+fn browse_lets_the_core_decide_what_is_a_bundle(cx: &mut TestAppContext) {
     let dir = TempDir::new("bundle-browse");
     let app = start(cx);
+    // A real bundle, written from a throwaway catalog that imported a card.
+    let src_dir = TempDir::new("bundle-browse-src");
+    let src_state = AppState::default();
+    *src_state.catalog.lock().unwrap() =
+        Some(Catalog::open(&src_dir.0.join("src.chairphoto"), &src_dir.0.join("lib")).unwrap());
+    let source = card(&src_dir, 1);
+    chairphoto_core::app::scans::ingest_from_card(&src_state, &source, Some("Trip"), None).unwrap();
+    let bundle = dir.0.join("trip.chairphoto");
+    {
+        let guard = src_state.catalog.lock().unwrap();
+        let c = guard.as_ref().unwrap();
+        let batch = c.list_import_batches().unwrap()[0].id;
+        let gathered = chairphoto_core::bundle::writer::gather_bundle(c, batch).unwrap().unwrap();
+        chairphoto_core::bundle::writer::write_bundle(&gathered, &bundle, |_, _| {}).unwrap();
+    }
+
     open_catalog(&app, &dir, cx);
     click_menu_row(&app, "import-menu", 1, "Import a .chairphoto bundle…", cx);
     let StorageDialog::ImportBundle(dlg) = dialog(&app, cx) else { panic!("the bundle dialog") };
     work(cx); // whatever opening the catalog queued
-    let browse = |cx: &mut TestAppContext| {
+    let pick = |path: &std::path::Path, cx: &mut TestAppContext| {
         let dlg = dlg.clone();
         cx.update_window(app.window(), |_, window, cx| dlg.update(cx, |d, cx| d.browse(window, cx))).unwrap();
         cx.run_until_parked();
         assert!(cx.did_prompt_for_paths(), "the picker opened");
+        let path = path.to_path_buf();
+        cx.simulate_path_prompt_response(move |_| Some(vec![path]));
+        cx.run_until_parked();
+        work(cx);
     };
 
-    browse(cx);
-    let notes = dir.0.join("notes.txt");
-    cx.simulate_path_prompt_response(|_| Some(vec![notes.clone()]));
-    cx.run_until_parked();
-    dlg.read_with(cx, |d, cx| {
-        assert_eq!(d.error.clone(), Some(format!("Not a .chairphoto bundle: {}", notes.display())));
-        assert_eq!(d.path.read(cx).value(), "", "the path was not taken");
-        assert!(!d.previewing && d.preview.is_none(), "nothing was previewed");
-    });
-    assert_eq!(work(cx), 0, "no preview was queued");
+    for renamed in ["trip.chairphoto.zip", "trip", "TRIP.CHAIRPHOTO"] {
+        let path = dir.0.join(renamed);
+        std::fs::copy(&bundle, &path).unwrap();
+        pick(&path, cx);
+        dlg.read_with(cx, |d, cx| {
+            assert_eq!(d.path.read(cx).value(), path.to_string_lossy().as_ref(), "{renamed}: taken");
+            assert_eq!(d.preview.as_ref().map(|p| p.total), Some(1), "{renamed}: previewed as a bundle ({:?})", d.error);
+        });
+    }
 
-    browse(cx);
-    let bundle = dir.0.join("Trip.CHAIRPHOTO");
-    cx.simulate_path_prompt_response(|_| Some(vec![bundle.clone()]));
-    cx.run_until_parked();
-    dlg.read_with(cx, |d, cx| {
-        assert_eq!(d.path.read(cx).value(), bundle.to_string_lossy().as_ref(), "a bundle name in any case is taken");
-        assert!(d.previewing, "and previewed");
+    let notes = dir.0.join("notes.txt");
+    std::fs::write(&notes, "not a bundle").unwrap();
+    let core = chairphoto_core::bundle::importer::open_bundle(&notes).map(|_| ()).unwrap_err();
+    pick(&notes, cx);
+    dlg.read_with(cx, |d, _| {
+        assert!(d.preview.is_none(), "no preview");
+        assert_eq!(d.error.clone(), Some(format!("notes.txt is not a ChairPhoto bundle ({core}).")));
     });
+    // The same file typed in is refused the same way.
+    let path = dlg.read_with(cx, |d, _| d.path.clone());
+    set_input(&app, &path, &notes.to_string_lossy(), cx);
+    click(&app, "bundle-check", cx);
+    work(cx);
+    dlg.read_with(cx, |d, _| assert_eq!(d.error.clone(), Some(format!("notes.txt is not a ChairPhoto bundle ({core})."))));
+}
+
+#[test]
+fn a_refused_preview_says_whether_the_file_is_named_like_a_bundle() {
+    use crate::storage::bundle_import::preview_error;
+    assert_eq!(preview_error("/a/trip.chairphoto", "read zip: bad"), "Could not read bundle: read zip: bad");
+    assert_eq!(preview_error("/a/notes.txt", "read zip: bad"), "notes.txt is not a ChairPhoto bundle (read zip: bad).");
 }
 
 #[test]

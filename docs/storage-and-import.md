@@ -288,7 +288,10 @@ catalog's bundle merged in first), the two rows claim one photo and it cannot te
 right, so that row gets a v4 and its copies stay queued as conflicts. The legacy value itself
 is never a merge key or a deep-link target. Settings keyed by the photo's uuid (today only the
 Obsidian module's note record, `obsidian.note.<uuid>`) move to the new identity in the same
-transaction, in v23 and in v24 alike; Adopt does not move them.
+transaction, in v23 and in v24 alike; Adopt does not move them. If the new identity already
+has such a record, the one with content wins (#150): a blank record (what Forget leaves) is
+replaced by the real one or dropped beside it, and two real records both stay — the new
+key's is the one shown, the old one is logged — so no record with content is lost.
 
 A UUID is one identity in either case. `photos.uuid` holds it lowercase, as ChairPhoto mints
 it (`catalog::canonical_photo_identity`): a scan, a bundle import, a merge, Adopt and a deep

@@ -1785,16 +1785,45 @@ impl Catalog {
     ///
     /// Without it, a module record a photo had — today only the Obsidian module's note record,
     /// `obsidian.note.<photo uuid>` — would no longer be found, and "create note" would make a
-    /// second note for a photo that has one. A record already at the new key is kept, and the
-    /// old one is left where it is rather than overwriting it.
+    /// second note for a photo that has one.
+    ///
+    /// When the new key already has a record, the one with content wins (#150, review N5 of
+    /// #146). A blank record — what the module's "Forget" leaves — never hides a real one: a
+    /// real record at the old key replaces a blank one at the new key, and a blank record at
+    /// the old key is dropped beside a real one at the new key. Two real records are two
+    /// notes, and which of them is this photo's is not something a migration can know: both
+    /// stay where they are, the new key's is the one the module shows, and the old one is
+    /// logged so it can be found. No record with content is ever deleted or overwritten.
     fn carry_photo_keyed_settings(&self, previous: &str, uuid: &str) -> Result<()> {
         if previous == uuid {
             return Ok(());
         }
         for prefix in PHOTO_KEYED_SETTING_PREFIXES {
-            self.conn
-                .prepare_cached("UPDATE OR IGNORE settings SET key = ?1 || ?3 WHERE key = ?1 || ?2")?
-                .execute(params![prefix, previous, uuid])?;
+            let (old_key, new_key) = (format!("{prefix}{previous}"), format!("{prefix}{uuid}"));
+            let Some(old) = self.get_setting(&old_key)? else { continue };
+            let is_blank = |record: &str| record.trim().is_empty();
+            match self.get_setting(&new_key)? {
+                None => {
+                    self.conn.execute(
+                        "UPDATE settings SET key = ?2 WHERE key = ?1",
+                        params![old_key, new_key],
+                    )?;
+                }
+                Some(new) if is_blank(&new) => {
+                    self.conn.execute("DELETE FROM settings WHERE key = ?1", params![new_key])?;
+                    self.conn.execute(
+                        "UPDATE settings SET key = ?2 WHERE key = ?1",
+                        params![old_key, new_key],
+                    )?;
+                }
+                Some(_) if is_blank(&old) => {
+                    self.conn.execute("DELETE FROM settings WHERE key = ?1", params![old_key])?;
+                }
+                Some(_) => eprintln!(
+                    "identity migration: {new_key} and {old_key} both hold a record; the first \
+                     is kept as the photo's and the second left in place"
+                ),
+            }
         }
         Ok(())
     }

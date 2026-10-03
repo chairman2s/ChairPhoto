@@ -826,6 +826,46 @@ fn a_photos_note_record_follows_its_identity_through_v23_and_v24() {
     );
 }
 
+/// #150 (review N5 of #146): when the photo's new identity already has a note record, the one
+/// with content wins. A Forget-blanked record at the new key does not hide the real one at the
+/// old key; a blank one at the old key is dropped beside a real one at the new key; and when
+/// both are real, neither is deleted or overwritten.
+#[test]
+fn a_blank_note_record_never_hides_the_real_one_across_a_remint() {
+    let (catalog, root) = temp_catalog("note-record-collision");
+    let cases = [
+        ("a.jpg", "dam:asset/1", "REAL", ""),
+        ("b.jpg", "dam:asset/2", "", "REAL AT NEW"),
+        ("c.jpg", "dam:asset/3", "REAL AT OLD", "REAL AT NEW"),
+    ];
+    let mut ids = Vec::new();
+    for (name, legacy, at_old, at_new) in cases {
+        std::fs::write(root.join(name), b"notarealjpeg").unwrap();
+        let id = catalog.upsert_photo(&root.join(name), None, 1, 1).unwrap().id;
+        catalog
+            .conn()
+            .execute("UPDATE photos SET uuid = ?1 WHERE id = ?2", rusqlite::params![legacy, id])
+            .unwrap();
+        let v5 = chairphoto_core::catalog::legacy_photo_identity(legacy);
+        catalog.set_setting(&format!("obsidian.note.{legacy}"), at_old).unwrap();
+        catalog.set_setting(&format!("obsidian.note.{v5}"), at_new).unwrap();
+        ids.push(id);
+    }
+    catalog.set_setting("schema_version", "22").unwrap();
+    let db = catalog.db_path().to_path_buf();
+    drop(catalog);
+    let catalog = Catalog::open(&db, &root).unwrap();
+
+    let note = |key: &str| catalog.get_setting(&format!("obsidian.note.{key}")).unwrap();
+    let uuid = |i: usize| catalog.get_photo(ids[i]).unwrap().uuid;
+    assert_eq!(note(&uuid(0)).as_deref(), Some("REAL"), "the real record replaced the blank one");
+    assert_eq!(note("dam:asset/1"), None);
+    assert_eq!(note(&uuid(1)).as_deref(), Some("REAL AT NEW"));
+    assert_eq!(note("dam:asset/2"), None, "the blank old record is dropped");
+    assert_eq!(note(&uuid(2)).as_deref(), Some("REAL AT NEW"));
+    assert_eq!(note("dam:asset/3").as_deref(), Some("REAL AT OLD"), "never deleted");
+}
+
 /// #146 review N1: an offloaded legacy photo — its original deleted, its primary location
 /// rows dropped, a verified backup on the NAS — has no primary copy left to be "gone". A
 /// different file whose sidecar shares its DAM id (an export of it, say) must get its own

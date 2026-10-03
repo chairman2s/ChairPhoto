@@ -1,5 +1,5 @@
 //! Serialising a sidecar DOM: [`serialize`], and the pass before it that makes every element
-//! come out in the namespace the DOM gives it (#143).
+//! and attribute come out in the namespace the DOM gives it (#143).
 //!
 //! `xmltree` writes an element as `prefix:local` and hands its `namespaces` map to xml-rs's
 //! emitter, which declares a mapping only when no enclosing element declared the same one
@@ -9,7 +9,11 @@
 //! binds `xmp` or `exif` to another URI would receive ChairPhoto's properties in *its*
 //! namespace. [`fit_prefixes`] replays the emitter's own namespace stack over the tree and, for
 //! an element whose prefix would not resolve to its namespace, writes it under a prefix that
-//! does — one already in scope, or a fresh one declared on the element.
+//! does — one already in scope, or a fresh one declared on the element. The same skip moves a
+//! parsed element or attribute whose prefix is bound back, inside a rebinding, to the URI an
+//! outer element bound it to (#143 item 5); [`fit_attributes`] re-prefixes such attributes.
+//!
+//! Not repaired: a nested `xmlns=""` is never written back (see `parse::parse_xml`).
 
 use xml::namespace::NamespaceStack;
 use xmltree::{Element, Namespace, XMLNode};
@@ -41,12 +45,43 @@ fn fit(e: &mut Element, scope: &mut NamespaceStack) {
             e.prefix = Some(usable_prefix(e, scope, &uri, &preferred));
         }
     }
+    fit_attributes(e, scope);
     for child in &mut e.children {
         if let XMLNode::Element(c) = child {
             fit(c, scope);
         }
     }
     scope.pop();
+}
+
+/// Re-prefix each of `e`'s prefixed attributes that the emitter would put in another namespace
+/// than `e`'s own namespace map says it is in. An attribute key carries only its prefix, so its
+/// namespace is known only from that map: a parsed element holds its full in-scope map
+/// (`parse::parse_xml`), and an element ChairPhoto builds holds the bindings it was given. The
+/// one way a parsed attribute goes wrong is a prefix bound back to a URI an outer element
+/// bound it to, inside an element that rebinds it (#143 item 5): the emitter skips the
+/// redeclaration (`NamespaceStack::put_checked` matches the outer mapping), so the attribute
+/// would land in the rebinding's namespace.
+fn fit_attributes(e: &mut Element, scope: &mut NamespaceStack) {
+    let Some(map) = &e.namespaces else { return };
+    let wrong: Vec<(String, String, String)> = e
+        .attributes
+        .keys()
+        .filter_map(|key| {
+            let (prefix, local) = key.split_once(':')?;
+            if matches!(prefix, "xml" | "xmlns") {
+                return None;
+            }
+            let uri = map.get(prefix)?;
+            (scope.get(prefix) != Some(uri)).then(|| (key.clone(), local.to_string(), uri.to_string()))
+        })
+        .collect();
+    for (key, local, uri) in wrong {
+        let preferred = key.split_once(':').map_or("ns", |(p, _)| p).to_string();
+        let prefix = usable_prefix(e, scope, &uri, &preferred);
+        let value = e.attributes.remove(&key).expect("collected from the keys");
+        e.attributes.insert(format!("{prefix}:{local}"), value);
+    }
 }
 
 /// A prefix that names `uri` where `e` is written: one in scope already, else `preferred`
@@ -142,5 +177,36 @@ mod tests {
         assert!((lat - 63.4305).abs() < 1e-6 && (lng - 10.3951).abs() < 1e-6, "{lat},{lng}");
         let names: Vec<String> = read_face_regions(&photo).into_iter().map(|r| r.name).collect();
         assert_eq!(names, ["Ann"], "{xml}");
+    }
+
+    // ── a prefix rebound and bound back (#143 item 5) ───────────────────────
+
+    /// `p` is bound to `urn:a` on `rdf:RDF`, rebound to `urn:b` on `outer`, and bound back to
+    /// `urn:a` on `inner`. xml-rs's emitter skips `inner`'s `xmlns:p="urn:a"` (an outer frame
+    /// already holds that very mapping), so without the fix `inner` and its `p:attr` were
+    /// written into `urn:b`.
+    const REBOUND: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<x:xmpmeta xmlns:x="adobe:ns:meta/">
+ <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#" xmlns:p="urn:a">
+  <rdf:Description rdf:about="" p:top="a-top">
+   <p:outer xmlns:p="urn:b" p:attr="b-attr">
+    <p:inner xmlns:p="urn:a" p:attr="a-attr">a-text</p:inner>
+   </p:outer>
+  </rdf:Description>
+ </rdf:RDF>
+</x:xmpmeta>"#;
+
+    #[test]
+    fn a_prefix_bound_back_inside_a_rebinding_keeps_its_namespace() {
+        let (_dir, photo) = seeded_photo("xmp-143-rebind", REBOUND);
+        write_identifier(&photo, "6f1c1f0e-8f5e-4a51-9a51-3c1b2a0d1432").unwrap();
+
+        let xml = read(&sidecar_path(&photo));
+        let (a, b) = ("urn:a", "urn:b");
+        assert!(has_attr(&xml, (NS_RDF, "Description"), (a, "top"), "a-top"), "{xml}");
+        assert!(has_attr(&xml, (b, "outer"), (b, "attr"), "b-attr"), "{xml}");
+        assert_eq!(element_text(&xml, (b, "outer"), (a, "inner")).as_deref(), Some("a-text"), "{xml}");
+        assert!(has_attr(&xml, (a, "inner"), (a, "attr"), "a-attr"), "{xml}");
+        assert_eq!(count_elements(&xml, b, "inner"), 0, "{xml}");
     }
 }

@@ -17,7 +17,9 @@
 //! select-all and stepping index into the full row list.
 
 pub mod grid;
+pub mod grid_menu;
 pub mod layout;
+pub mod photo_actions;
 pub mod stacks;
 #[cfg(test)]
 mod tests;
@@ -70,6 +72,8 @@ actions!(
         CompareSelection,
         /// Escape in the "Stack bursts" dialog.
         CloseDialog,
+        /// Escape while the grid's right-click menu is open.
+        CloseMenu,
     ]
 );
 
@@ -111,6 +115,7 @@ pub fn bindings() -> Vec<KeyBinding> {
         KeyBinding::new("n", LabelNone, c),
         KeyBinding::new("enter", OpenActive, c),
         KeyBinding::new("c", CompareSelection, c),
+        KeyBinding::new("escape", CloseMenu, c),
     ];
     b.push(KeyBinding::new("escape", CloseDialog, Some(contexts::STACK_DIALOG)));
     b

@@ -1260,7 +1260,29 @@ function MapSettings({ api }: { api: ChairPhotoAPI }) {
 // "Geocode location" button that fills empty IPTC location fields via the backend
 // `geocode_to_iptc` command.
 
-function GeocodePanelContent({ api }: { api: ChairPhotoAPI }) {
+/** How the backend's single-photo geocode begins its answer when the location reached the
+ *  catalog but not the sidecar (`plugins::map::geocode::PENDING_LEAD`). It arrives as the
+ *  command's error, but it is not a failure: the catalog changed, and the fields stay owed
+ *  for the repair pass (#148, #153). */
+export const GEOCODE_PENDING_LEAD = "Geocoded location stored in the catalog, but not yet in the sidecar";
+
+/** The status line for a single-photo geocode, and whether the catalog changed (so the host
+ *  re-reads it). A pending sidecar is shown as the backend words it, without "Error: "
+ *  (the GPUI panel's `geocode_status`). */
+export function singleGeocodeOutcome(
+  result: { filled: boolean } | { error: unknown },
+): { status: string; changed: boolean } {
+  if ("filled" in result) {
+    return result.filled
+      ? { status: "Location fields filled.", changed: true }
+      : { status: "No GPS data, fields already set, or no result from geocoder.", changed: false };
+  }
+  const message = String(result.error);
+  if (message.startsWith(GEOCODE_PENDING_LEAD)) return { status: message, changed: true };
+  return { status: `Error: ${message}`, changed: false };
+}
+
+export function GeocodePanelContent({ api }: { api: ChairPhotoAPI }) {
   // Rendered inside PhotoInspector, which (issue #16) now subscribes only to
   // contributions — it no longer re-renders on selection changes, so this panel needs
   // its own subscription to pick up the active photo.
@@ -1274,19 +1296,17 @@ function GeocodePanelContent({ api }: { api: ChairPhotoAPI }) {
     if (photoId == null) return;
     setBusy(true);
     setStatus("Geocoding…");
+    let outcome: { status: string; changed: boolean };
     try {
       const filled = await api.invoke<boolean>("geocode_to_iptc", { photoId });
-      if (filled) {
-        setStatus("Location fields filled.");
-        api.notifyChange();
-      } else {
-        setStatus("No GPS data, fields already set, or no result from geocoder.");
-      }
+      outcome = singleGeocodeOutcome({ filled });
     } catch (e: unknown) {
-      setStatus(`Error: ${String(e)}`);
-    } finally {
-      setBusy(false);
+      outcome = singleGeocodeOutcome({ error: e });
     }
+    setStatus(outcome.status);
+    setBusy(false);
+    // A pending sidecar changed the catalog too: the host re-reads it either way.
+    if (outcome.changed) api.notifyChange();
   };
 
   if (photoId == null) {

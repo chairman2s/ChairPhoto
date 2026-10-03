@@ -13,7 +13,9 @@
 //!   answers with a visible status line naming the ticket, rather than faking the feature.
 //!   [`NOT_YET_PORTED`] is the one list: the root view registers a handler for each entry
 //!   ([`on_not_yet_ported`]) and the tests dispatch each one ([`not_yet_ported_actions`]).
-//!   When a feature lands, its row moves out of this list and into its own handler.
+//!   When a feature lands, its row moves out of this list and into its own handler. A row may
+//!   cite only an open ticket ([`OPEN_TICKETS`], checked by the tests). The list is empty
+//!   since #158; the machinery stays for the next stub.
 
 use gpui_kit::{actions, Action, App, InteractiveElement, Window};
 
@@ -81,6 +83,14 @@ actions!(
         /// More ⋯ → Open loupe in a new window: the pop-out loupe (#110,
         /// `crate::loupe::window`), or bring it forward when it is open.
         PopOutLoupe,
+        // The loupe's "unavailable" state (#158, `crate::library::photo_actions`), on the
+        // photo the inline loupe shows:
+        /// Relocate…: point the photo at its moved file.
+        RelocatePhoto,
+        /// Retrieve from NAS: copy the backup back to the local volume.
+        RetrieveFromNas,
+        /// Remove from catalog (after a confirm).
+        RemoveFromCatalog,
     ]
 );
 
@@ -105,6 +115,7 @@ macro_rules! not_yet_ported {
             element: E,
             handler: impl Fn(&'static str, u32, &mut Window, &mut App) + Clone + 'static,
         ) -> E {
+            let _ = &handler; // an empty list registers nothing
             $(
                 let element = {
                     let handler = handler.clone();
@@ -116,14 +127,27 @@ macro_rules! not_yet_ported {
     };
 }
 
-not_yet_ported! {
-    /// The loupe's "unavailable" state: Relocate… (a file picker; the grid context menu's
-    /// commands are Storage and import's).
-    RelocatePhoto => ("Relocate…", 114),
-    /// The loupe's "unavailable" state: Retrieve from NAS.
-    RetrieveFromNas => ("Retrieve from NAS", 114),
-    /// The loupe's "unavailable" state: Remove from catalog.
-    RemoveFromCatalog => ("Remove from catalog", 114),
+// Empty since #158 ported the loupe's unavailable-state actions. A row is
+// `Name => ("what the user asked for", ticket)`, and its ticket must be in [`OPEN_TICKETS`].
+not_yet_ported! {}
+
+/// The tickets a not-yet-ported stub may cite: the GPUI map's (#92) open tickets, as the
+/// issue tracker listed them on 2026-10-03. Closing one of them takes it out of this list in
+/// the same change; a stub still citing it then fails [`stub_ticket`]'s test, so a stub
+/// cannot outlive its ticket unnoticed. (The tests run offline, so this list is the record,
+/// not GitHub.)
+pub const OPEN_TICKETS: &[u32] = &[
+    107, 108, 109, 110, 111, 112, 113, 115, 119, 121, 123, 124, 125, 126, 128, 129, 130, 134, 151, 159, 160,
+    161, 162, 163,
+];
+
+/// Whether a stub may cite `ticket`: only an open ticket of the map ([`OPEN_TICKETS`]).
+pub fn stub_ticket(ticket: u32) -> Result<(), String> {
+    if OPEN_TICKETS.contains(&ticket) {
+        Ok(())
+    } else {
+        Err(format!("#{ticket} is not an open GPUI-map ticket (closed, or missing from OPEN_TICKETS)"))
+    }
 }
 
 #[cfg(test)]
@@ -138,8 +162,22 @@ mod tests {
             assert_eq!(action.name(), format!("chairphoto::{name}"));
             assert_eq!((label, ticket), (label2, ticket2));
             assert!(!label.is_empty());
-            // Every ticket is a GPUI-map ticket (#93–#130).
-            assert!((93..=130).contains(ticket), "{name} → #{ticket}");
+            // Every ticket is one of the map's open tickets.
+            stub_ticket(*ticket).unwrap_or_else(|e| panic!("{name}: {e}"));
         }
+    }
+
+    /// The guard rejects a closed ticket — #114 (Storage and import), which the loupe's stubs
+    /// still cited after it closed, #158, which ported them, and every other ticket of the map
+    /// closed by 2026-10-03 — and accepts an open one.
+    #[test]
+    fn the_guard_rejects_a_stub_citing_a_closed_ticket() {
+        const CLOSED: &[u32] =
+            &[93, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 114, 116, 117, 118, 120, 122, 127, 157, 158];
+        for &ticket in CLOSED {
+            assert!(stub_ticket(ticket).is_err(), "#{ticket} is closed");
+        }
+        assert!(stub_ticket(159).is_ok());
+        assert!(stub_ticket(0).is_err() && stub_ticket(9999).is_err());
     }
 }

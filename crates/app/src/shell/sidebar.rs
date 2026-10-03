@@ -246,10 +246,8 @@ impl RootView {
     }
 }
 
-gpui_kit::assets::icon_assets!(pub RailIcons, [LayoutGrid, SlidersHorizontal]);
-
 /// The rail's two glyphs that gpui-kit's default icon bundle lacks: the React rail's grid
-/// and sliders. Served by [`RailIcons`] through `crate::assets::Assets`.
+/// and sliders. Served by [`crate::assets::ExtraIcons`] through `crate::assets::Assets`.
 #[derive(Clone, Copy)]
 pub enum RailIcon {
     LayoutGrid,

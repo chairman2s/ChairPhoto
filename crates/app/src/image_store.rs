@@ -40,7 +40,10 @@
 //!   ([`ImageStore::set_claim`]): what it held and holds no longer is released — unless
 //!   another claim holds it. [`ImageStore::release_pending`] and [`ImageStore::evict`] never
 //!   touch a claimed tier. Only a change of what the pixels are (an invalidate, a catalog
-//!   switch) drops claimed requests, and a switch empties every claim.
+//!   switch) drops claimed requests, and a switch empties every claim. A view sharing its
+//!   tiers with the grid, which asks without a claim, replaces its claim with
+//!   [`ImageStore::hold`] and releases only what the grid no longer asks for (the bench's
+//!   pile, #171).
 //! - **Cover looks** (#134 the Darkroom filmstrip, #151 the Library grid): a thumbnail shows
 //!   the photo's cover version's look (`media::render_image` renders the cover the catalog
 //!   names when the worker runs). A view whose rows carry the cover token asks through
@@ -642,6 +645,14 @@ impl ImageStore {
         if !gone.is_empty() {
             self.drop_pending(|k| !gone.contains(&(k.photo, k.kind)));
         }
+    }
+
+    /// Make `owner` hold exactly `wanted` without releasing what it lets go: for a view whose
+    /// tiers a plain view (the grid, which holds no claim) may be asking for too, so letting
+    /// go must not cancel that view's request. The caller releases what only it wanted with
+    /// [`release_pending`](Self::release_pending). Sends nothing.
+    pub fn hold(&mut self, owner: ClaimId, wanted: impl IntoIterator<Item = (i64, ImageKind)>) {
+        self.claims.insert(owner, wanted.into_iter().collect());
     }
 
     /// Give up `owner`'s claim for good, releasing what only it held.

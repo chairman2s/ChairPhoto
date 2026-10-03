@@ -862,6 +862,140 @@ fn measure_grid_frame_cost(cx: &mut TestAppContext) {
     );
 }
 
+// --- the bench's selection pile (#171) ---------------------------------------------------------
+
+/// #171: the bench's pile shows the first three selected photos (row order) as thumbnails,
+/// the one the bench marks highlighted (Bench.tsx's `selectionThumbs`), asked for through the
+/// image layer under the bench's own claim — which a new selection replaces and a cleared
+/// one empties, releasing what only the pile wanted.
+#[gpui_kit::test]
+fn the_bench_pile_shows_the_first_three_selected_thumbnails(cx: &mut TestAppContext) {
+    let dir = TempDir::new("bench-pile");
+    let pool = Arc::new(FakePool::default());
+    let app = crate::tests::start_with_pool(cx, pool.clone());
+    let ids = open_catalog_with_photos(&app, &dir, 6, cx);
+    let claim = app.wired.root.as_ref().unwrap().read_with(cx, |r, _| r.bench_claim);
+    let claimed = |cx: &mut TestAppContext| {
+        let mut held: Vec<i64> = app
+            .wired
+            .images
+            .read_with(cx, |s, _| s.claim(claim))
+            .into_iter()
+            .map(|(id, kind)| {
+                assert_eq!(kind, ImageKind::Thumb);
+                id
+            })
+            .collect();
+        held.sort();
+        held
+    };
+    let thumbs = |cx: &mut TestAppContext| {
+        let mut out = Vec::new();
+        cx.update_window(app.window(), |_, window, cx| {
+            window.render_frame(cx);
+            for &id in &ids {
+                if let Some(e) = window.try_find(("bench-thumb", id as u64)) {
+                    out.push(e.label().unwrap_or_default().to_string());
+                }
+            }
+        })
+        .unwrap();
+        out
+    };
+
+    // Selected in the order 4, 2, 1, 3 (the active one, last clicked): the pile is the first
+    // three in row order, and the active photo among them is ringed.
+    click_tile(&app, ids[4], Modifiers::default(), cx);
+    for i in [2, 1, 3] {
+        click_tile(&app, ids[i], Modifiers::control(), cx);
+    }
+    render(&app, cx);
+    assert_eq!(thumbs(cx), ["p1.ARW", "p2.ARW", "p3.ARW (marking)"]);
+    assert_eq!(claimed(cx), vec![ids[1], ids[2], ids[3]]);
+    assert!(submitted_thumb(&pool, ids[1]), "asked of the decode pool, not decoded here");
+
+    // Its pixels land: the store holds them for the pile.
+    pool.finish(&JobKey::photo(ids[1], ImageKind::Thumb), Ok(pixels(60, 40)));
+    render(&app, cx);
+    assert!(matches!(app.wired.images.read_with(cx, |s, _| s.peek(ids[1], ImageKind::Thumb)), ImageState::Ready(_)));
+
+    // A new selection replaces the claim; a cleared one empties it.
+    click_tile(&app, ids[5], Modifiers::default(), cx);
+    assert_eq!(thumbs(cx), ["p5.ARW (marking)"]);
+    assert_eq!(claimed(cx), vec![ids[5]]);
+    cx.update_window(app.window(), |_, window, cx| {
+        window.dispatch_action(Box::new(crate::shell::actions::ClearSelection), cx)
+    })
+    .unwrap();
+    render(&app, cx);
+    assert!(thumbs(cx).is_empty());
+    assert!(claimed(cx).is_empty(), "no selection, no pile: the claim is released");
+}
+
+/// #171: the pile shares its tiers with the grid, which holds no claim. While the pile shows
+/// a thumbnail the grid's scrolling cannot release it; when the pile lets go, it releases
+/// only what the grid no longer asks for — never a visible tile's render.
+#[gpui_kit::test]
+fn the_bench_pile_releases_only_what_the_grid_no_longer_wants(cx: &mut TestAppContext) {
+    let dir = TempDir::new("bench-pile-release");
+    let pool = Arc::new(FakePool::default());
+    let app = crate::tests::start_with_pool(cx, pool.clone());
+    open_catalog_with_photos(&app, &dir, 600, cx);
+    render(&app, cx);
+    let rows = rows(&app, cx);
+    let thumb = |id: i64| JobKey::photo(id, ImageKind::Thumb);
+    let cancelled = |id: i64| pool.cancelled.lock().unwrap().contains(&thumb(id));
+    let grid_wants = |id: i64, cx: &mut TestAppContext| library_view(&app, cx).read_with(cx, |v, _| v.requested_thumbs().contains(&id));
+
+    // The grid opened at its newest rows; the last three photos are on the table, and the
+    // grid wants them too: clearing the selection releases nothing of theirs.
+    let pile: Vec<i64> = rows[rows.len() - 3..].to_vec();
+    app.wired.shell.update(cx, |s, cx| s.select_with(cx, |l| l.select_single(pile[2])));
+    click_tile(&app, pile[0], Modifiers::control(), cx);
+    click_tile(&app, pile[1], Modifiers::control(), cx);
+    render(&app, cx);
+    for &id in &pile {
+        assert!(grid_wants(id, cx) && submitted_thumb(&pool, id), "photo {id} on screen and asked for");
+    }
+    cx.update_window(app.window(), |_, window, cx| window.dispatch_action(Box::new(crate::shell::actions::ClearSelection), cx))
+        .unwrap();
+    render(&app, cx);
+    for &id in &pile {
+        assert!(!cancelled(id), "the pile let go of {id}, which the grid still shows");
+    }
+
+    // Again, then scroll the grid far away: it lets go of those tiles, the pile's claim keeps
+    // their renders; clearing the selection now releases them.
+    app.wired.shell.update(cx, |s, cx| s.select_with(cx, |l| l.select_single(pile[2])));
+    click_tile(&app, pile[0], Modifiers::control(), cx);
+    click_tile(&app, pile[1], Modifiers::control(), cx);
+    render(&app, cx);
+    for _ in 0..5 {
+        cx.update_window(app.window(), |_, window, cx| {
+            window.scroll("library", ScrollDelta::Pixels(point(px(0.), px(2000.))), cx)
+        })
+        .unwrap();
+        cx.run_until_parked();
+    }
+    render(&app, cx);
+    for &id in &pile {
+        assert!(!grid_wants(id, cx), "photo {id} scrolled out of the grid's window");
+        assert!(!cancelled(id), "the grid released {id}, which the pile holds");
+        assert!(app.wired.images.read_with(cx, |s, _| s.is_pending(id, ImageKind::Thumb)));
+    }
+    cx.update_window(app.window(), |_, window, cx| window.dispatch_action(Box::new(crate::shell::actions::ClearSelection), cx))
+        .unwrap();
+    render(&app, cx);
+    for &id in &pile {
+        assert!(cancelled(id), "the pile let go of {id}, which nobody wants now");
+    }
+}
+
+fn submitted_thumb(pool: &FakePool, id: i64) -> bool {
+    let key = JobKey::photo(id, ImageKind::Thumb);
+    pool.batches.lock().unwrap().iter().any(|b| b.contains(&key))
+}
+
 // --- cover looks (#151) ---------------------------------------------------------------------
 
 /// The Library on a hand-driven decode pool: every thumbnail request is held until the test

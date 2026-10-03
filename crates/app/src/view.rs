@@ -26,7 +26,7 @@
 //! Publish dialog, their settings panels a Preferences tab each (`crate::preferences`).
 
 use crate::keymap::{contexts, ReloadTheme};
-use crate::image_store::ImageStore;
+use crate::image_store::{ClaimId, ImageStore};
 use crate::inspector::PhotoInspector;
 use crate::library::grid::LibraryView;
 use crate::library::grid_menu::PhotoCommand;
@@ -71,6 +71,9 @@ pub struct RootView {
     pub(crate) model: Entity<AppModel>,
     pub(crate) shell: Entity<ShellState>,
     pub(crate) images: Entity<ImageStore>,
+    /// The bench pile's thumbnails (`crate::shell::bench`): what this claim holds is released
+    /// when the selection moves on.
+    pub(crate) bench_claim: ClaimId,
     pub(crate) modules: Entity<ModuleRegistry>,
     /// Storage and import (#114): its jobs and dialogs.
     pub(crate) storage: Entity<StorageState>,
@@ -141,6 +144,7 @@ impl RootView {
         cx: &mut Context<Self>,
     ) -> Self {
         let focus = cx.focus_handle();
+        let bench_claim = images.update(cx, |s, _| s.new_claim());
         let library = cx.new(|cx| LibraryView::new(shell.clone(), images.clone(), cx));
         // The grid has focus from the start: its keys work at once, and the root's bindings
         // in [`contexts::ROOT`] still reach the root, the grid's ancestor.
@@ -272,6 +276,7 @@ impl RootView {
             model,
             shell,
             images,
+            bench_claim,
             modules,
             storage,
             tag_panel,
@@ -507,6 +512,7 @@ impl Render for RootView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let narrow = window.viewport_size().width <= px(NARROW_MAX_W);
         self.shell.update(cx, |s, _| s.set_narrow(narrow));
+        self.request_bench_thumbs(cx);
         let colors = Colors::get(cx);
         // Module contributions, built (once per window) before the shell is borrowed below.
         let module_view = match &self.shell.read(cx).surface {

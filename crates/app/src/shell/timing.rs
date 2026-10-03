@@ -23,7 +23,7 @@
 //! boolean check.
 
 use crate::storage::Runner;
-use chairphoto_core::app::{with_catalog, with_catalog_as, AppState, CatalogIdentity};
+use chairphoto_core::app::{with_catalog_as, AppState, CatalogIdentity};
 use chairphoto_model::shell_timing::{InvokeSpan, ShellTiming, SHELL_TIMING_KEY};
 use gpui_kit::{App, Global, Task};
 use std::collections::HashSet;
@@ -140,13 +140,21 @@ impl ShellTimer {
     }
 
     /// Store `value` under [`SHELL_TIMING_KEY`], off the UI thread, in the transition's
-    /// catalog (a write that finds another catalog open fails closed, logged).
+    /// catalog (a write that finds another catalog open fails closed, logged). `leave` was
+    /// called with no `rows_from` (rows had not landed yet): there is no catalog to bind the
+    /// write to, so the record is dropped rather than guessing at whichever catalog happens
+    /// to be open when this runs — a dev-only measurement is not worth risking a write that
+    /// lands in a catalog the transition never named.
     fn persist(value: String, cx: &mut App) {
         let t = cx.global_mut::<ShellTimer>();
         #[cfg(test)]
         t.written.push(value.clone());
         t.seq += 1;
         let (state, from, seq, stored_seq) = (t.state.clone(), t.from, t.seq, t.stored_seq.clone());
+        let Some(from) = from else {
+            eprintln!("shell timing: dropped (no catalog bound yet)");
+            return;
+        };
         Runner::get(cx).spawn(move || {
             // Held across the write, so two writes never interleave and a late older one is
             // skipped rather than undoing a newer one.
@@ -155,11 +163,7 @@ impl ShellTimer {
                 return;
             }
             let write = |c: &chairphoto_core::catalog::Catalog| c.set_setting(SHELL_TIMING_KEY, &value);
-            let result = match from {
-                Some(from) => with_catalog_as(&state, from, write),
-                None => with_catalog(&state, write),
-            };
-            match result {
+            match with_catalog_as(&state, from, write) {
                 Ok(()) => *last = seq,
                 Err(e) => eprintln!("shell timing: not stored: {e}"),
             }

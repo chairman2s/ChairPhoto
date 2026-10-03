@@ -330,13 +330,6 @@ impl LibrarySession {
         Ok(statuses)
     }
 
-    /// The selection keeps only photos the rows still list. A photo a filter now hides, or
-    /// that left the library (trashed, removed), is no longer selected — so no bulk action
-    /// (a rating key, a flag, a label, a tag paste, Move to trash) reaches a photo the user
-    /// cannot see. The off-grid stack child the loupe shows stays: it is never a row.
-    ///
-    /// Not in the TS, which kept hidden ids selected; the grid context menu (#158) made that
-    /// reachable as "trash what you cannot see".
     /// Unselect `gone` (photos just trashed or removed) at once, before the refresh that drops
     /// their rows lands: a key pressed in between must not reach them.
     pub fn unselect(&mut self, gone: &[i64]) {
@@ -354,6 +347,13 @@ impl LibrarySession {
         }
     }
 
+    /// The selection keeps only photos the rows still list. A photo a filter now hides, or
+    /// that left the library (trashed, removed), is no longer selected — so no bulk action
+    /// (a rating key, a flag, a label, a tag paste, Move to trash) reaches a photo the user
+    /// cannot see. The off-grid stack child the loupe shows stays: it is never a row.
+    ///
+    /// Not in the TS, which kept hidden ids selected; the grid context menu (#158) made that
+    /// reachable as "trash what you cannot see".
     fn trim_selection_to_rows(&mut self) {
         let rows: HashSet<i64> = self.photos().iter().map(|p| p.id).collect();
         let off_grid = self.extra_photo.as_ref().map(|p| p.id);
@@ -1177,6 +1177,26 @@ mod tests {
         s.view_photo(child(9, 2));
         refresh_with(&mut s, &[2]);
         assert_eq!(s.selection().active_id, Some(9));
+    }
+
+    // New (batch 7 review, L1): `trim_selection_to_rows` trims the Shift anchor too, not only
+    // `ids`/`active_id` — untested before, so a regression here passed every other test.
+    #[test]
+    fn a_landed_page_trims_a_hidden_shift_anchor_too() {
+        let mut s = session_with(&[1, 2, 3, 4, 5]);
+        s.select(1, SelectMods::default()); // anchor <- 1
+        s.select(3, SelectMods::SHIFT); // anchor pinned at 1; range 1..3
+        assert_eq!(s.selection().ids, &[1, 2, 3]);
+
+        // A filter hides photo 1 — the anchor, not just a plain selected id.
+        refresh_with(&mut s, &[2, 3, 4, 5]);
+        assert_eq!(s.selection().ids, &[2, 3], "1 left the selection along with the row");
+
+        // With the anchor trimmed, Shift now ranges from the active photo (3) to 5. Kept, the
+        // anchor (1) is absent from the rows, range_between finds no position for it, and the
+        // selection is left exactly as the trim above made it — no [3, 4, 5] range at all.
+        s.select(5, SelectMods::SHIFT);
+        assert_eq!(s.selection().ids, &[3, 4, 5], "ranges from the active photo, the anchor having been dropped");
     }
 
     // New (Codex review of gpui #102): two culling actions started on the same photo both

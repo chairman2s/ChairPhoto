@@ -453,6 +453,30 @@ fn the_timing_record_never_lands_in_another_catalog(cx: &mut TestAppContext) {
     }
 }
 
+/// N3 (batch 7 review): `leave` with no `rows_from` (rows had not landed yet) has no catalog
+/// to bind the write to. It must not fall back to writing into whichever catalog happens to
+/// be open when the write finally runs — the record is dropped instead.
+/// (Mutation-checked: restoring the old `None => with_catalog(&state, write)` fallback makes
+/// the started marker land in the open catalog and this fails.)
+#[gpui_kit::test]
+fn a_leave_with_no_catalog_drops_the_record_rather_than_guessing(cx: &mut TestAppContext) {
+    let dir = TempDir::new("shell-timing-unbound");
+    let app = start(cx);
+    open_catalog_with_photos(&app, &dir, 2, cx);
+    work(cx);
+    cx.update(|cx| {
+        ShellTimer::set_enabled(true, cx);
+        ShellTimer::leave("develop", None, cx); // no rows_from yet
+    });
+    work(cx);
+    assert_eq!(stored(&app), None, "the started marker must not land in the open catalog");
+
+    cx.executor().advance_clock(Duration::from_millis(10_100));
+    cx.run_until_parked();
+    work(cx);
+    assert_eq!(stored(&app), None, "the summary must not land in the open catalog either");
+}
+
 /// The Darkroom's switch turns the instrument on, and its ← Library starts the transition.
 #[cfg(feature = "edit")]
 #[gpui_kit::test]

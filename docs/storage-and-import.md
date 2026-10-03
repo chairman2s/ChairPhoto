@@ -245,6 +245,11 @@ scanned file must also be the row's size: an offloaded photo has no primary copy
 original is never modified and keeps its size wherever it is moved or restored.
 Otherwise the file is a different photo and gets its own row, as above.
 
+A scan that mints a UUID for a file whose sidecar holds such a foreign value records it the
+same way (#150), so a file catalogued after #141 re-homes under the same guards when it
+moves. The value is recorded whichever way the scan matched the row, so a row catalogued
+before #150 gains it at its next rescan.
+
 **A re-minted legacy identity is a UUID v5, not v4.** This is the one exception to "a UUID v4
 on first import": a photo imported fresh still gets a random v4, but a value that already
 served as a photo's identity is re-minted as `catalog::legacy_photo_identity` — UUID v5 of the

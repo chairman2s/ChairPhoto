@@ -1531,7 +1531,8 @@ impl Catalog {
     ///
     /// A UUID is the identity (#141). Anything else is another tool's identifier and is
     /// never adopted, with one exception (#146): the identifier a row held before schema v23
-    /// re-minted it ([`Self::remint_non_identity_photos`]). Its sidecar still carries that
+    /// re-minted it ([`Self::remint_non_identity_photos`]), or that the file carried when a
+    /// scan minted the row a UUID (#150, `IdentitySource::legacy_value`). Its sidecar still carries that
     /// value — overwriting it is a person's decision — so it is the only link from the file
     /// back to its row, and without it a moved file would be catalogued a second time and
     /// its tags, ratings and faces left on a row nobody sees. It answers the row's minted
@@ -1654,10 +1655,11 @@ impl Catalog {
         Ok(stale.len())
     }
 
-    /// Record `trusted` as `photo_id`'s legacy identifier when it is one (not a UUID, not
-    /// empty); see [`RECORD_LEGACY_IDENTIFIER_SQL`].
-    pub(super) fn record_legacy_identifier(&self, photo_id: i64, trusted: Option<&str>) -> Result<()> {
-        if let Some(value) = trusted.filter(|v| is_legacy_identifier(v)) {
+    /// Record `value` — a trusted manifest id, or what a scanned sidecar's `xmp:Identifier`
+    /// holds — as `photo_id`'s legacy identifier when it is one (not a UUID, not empty);
+    /// see [`RECORD_LEGACY_IDENTIFIER_SQL`].
+    pub(super) fn record_legacy_identifier(&self, photo_id: i64, value: Option<&str>) -> Result<()> {
+        if let Some(value) = value.filter(|v| is_legacy_identifier(v)) {
             self.conn
                 .prepare_cached(RECORD_LEGACY_IDENTIFIER_SQL)?
                 .execute(params![photo_id, value])?;
@@ -3539,6 +3541,41 @@ mod tests {
         let other = catalog.upsert_scanned_photo(&elsewhere, None, 1, 9, Some("dam:1")).unwrap();
         assert!(other.created, "x.jpg is still there, so y.jpg is another photo");
         assert_eq!(lookups(), before + 1, "a path miss does look it up");
+    }
+
+    /// #150 (review F4 of #146): a file catalogued after #141 whose sidecar holds a DAM id
+    /// gets a minted UUID; the DAM id is recorded as the row's legacy identifier, so moving
+    /// the file re-homes the row instead of cataloguing it a second time. A row catalogued
+    /// before the record existed gains it at its next rescan.
+    #[test]
+    fn a_scan_records_the_foreign_id_of_a_file_it_mints_for() {
+        let (catalog, root, _dir) = temp_catalog("legacy-recorded-at-mint");
+        let path = root.join("x.jpg");
+        std::fs::write(&path, b"raw-bytes").unwrap();
+        let first = catalog.upsert_scanned_photo(&path, None, 1, 9, Some("dam:asset/77")).unwrap();
+        assert!(first.created && is_photo_identity(&first.uuid), "{}", first.uuid);
+        catalog.set_culling(first.id, Some(5), None, None).unwrap();
+
+        std::fs::remove_file(&path).unwrap();
+        let moved = root.join("y.jpg");
+        std::fs::write(&moved, b"raw-bytes").unwrap();
+        let again = catalog.upsert_scanned_photo(&moved, None, 2, 9, Some("dam:asset/77")).unwrap();
+        assert_eq!((again.id, again.created), (first.id, false), "re-homed, not duplicated");
+        assert_eq!(catalog.get_photo(first.id).unwrap().path, "y.jpg");
+        assert_eq!(catalog.get_photo(first.id).unwrap().rating, 5);
+
+        // A row from before the record existed: its next rescan records it.
+        catalog.conn().execute("DELETE FROM photo_legacy_identifiers", []).unwrap();
+        catalog.upsert_scanned_photo(&moved, None, 2, 9, Some("dam:asset/77")).unwrap();
+        let owner: i64 = catalog
+            .conn()
+            .query_row(
+                "SELECT photo_id FROM photo_legacy_identifiers WHERE identifier = 'dam:asset/77'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(owner, first.id);
     }
 
     /// #146 review N4: v23 agrees with merge that a blank `photos.uuid` names no identity. It

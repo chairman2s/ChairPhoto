@@ -909,7 +909,7 @@ impl Catalog {
 
         // Record where the bytes physically are, so the resolver can find them.
         self.set_primary_location(result.id, absolute_path)?;
-        self.record_legacy_identifier(result.id, source.trusted())?;
+        self.record_legacy_identifier(result.id, source.legacy_value())?;
         Ok(result)
     }
 
@@ -1026,7 +1026,7 @@ impl Catalog {
 
         // Record the file's location on its (NAS) volume so the resolver finds it there.
         self.add_location(result.id, volume_id, &rel, LocationRole::Primary)?;
-        self.record_legacy_identifier(result.id, source.trusted())?;
+        self.record_legacy_identifier(result.id, source.legacy_value())?;
         Ok(result)
     }
 
@@ -2432,10 +2432,20 @@ enum IdentitySource<'a> {
 }
 
 impl<'a> IdentitySource<'a> {
-    fn trusted(&self) -> Option<&'a str> {
+    /// The value to record as the upserted row's legacy identifier, when it is one (see
+    /// [`Catalog::record_legacy_identifier`]).
+    ///
+    /// A scanned sidecar's foreign value counts too (#150, review F4 of #146): a file
+    /// catalogued after #141 whose sidecar holds a DAM id gets a minted UUID, and that DAM id
+    /// is then the only thing linking the file to its row until a person resolves the
+    /// conflict. Recorded, it lets a later move re-home the row under the same guards as a
+    /// v23 row ([`Catalog::scan_identity`]) instead of cataloguing the file a second time.
+    /// It is recorded whichever way the row was matched, so a row catalogued before this
+    /// change gains the record at its next rescan; a value another row already holds is not
+    /// recorded again.
+    fn legacy_value(&self) -> Option<&'a str> {
         match *self {
-            IdentitySource::Trusted(value) => value,
-            IdentitySource::Sidecar(_) => None,
+            IdentitySource::Trusted(value) | IdentitySource::Sidecar(value) => value,
         }
     }
 }

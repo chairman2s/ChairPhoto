@@ -31,7 +31,7 @@
 //! The record is per photo, not per copy: an IPTC save writes the sidecar beside the copy
 //! the location resolver picks, and so does the retry.
 
-use super::busy::{is_busy, retry_busy};
+use super::busy::{is_busy, retry_busy, retry_busy_or_aborted};
 use super::{Catalog, IptcFields, Result};
 use rusqlite::{params, OptionalExtension};
 use std::path::Path;
@@ -420,6 +420,19 @@ impl Catalog {
 
     /// Record what became of `write`'s IO (`outcome`), by compare-and-set on the owed
     /// record's generation (this module's step 3). PURE SQL.
+    ///
+    /// Runs as one transaction (#224 N1): [`retry_busy`] requires its `op` to be "a single
+    /// statement, or a transaction that rolled back whole" so a retry can never repeat a
+    /// side effect, and this body (below, in [`Self::settle_iptc_write_locked`]) is several
+    /// autocommit statements, not one, which broke that contract on its face. In the
+    /// branches as they read today every statement that actually changes a row (the `owed`
+    /// reset, the `attempts` increment) is followed immediately by a `return`, so a busy
+    /// error on a *later* statement in the same call cannot double an *earlier* one's effect
+    /// under autocommit either — read closely, there was no reachable double-count. But that
+    /// is an accident of today's control flow, not something the contract lets a future edit
+    /// rely on (an early return moved, a statement added after one): wrapping the whole body
+    /// in a transaction makes the property hold by construction instead of by inspection, at
+    /// the cost of nothing a few extra statements on one connection don't already pay.
     pub fn settle_iptc_write(
         &self,
         write: &IptcSidecarWrite,
@@ -428,6 +441,20 @@ impl Catalog {
         if write.fields.is_empty() {
             return Ok(IptcSettled::Unchanged);
         }
+        let tx = self.conn.unchecked_transaction()?;
+        let settled = self.settle_iptc_write_locked(write, outcome)?;
+        tx.commit()?;
+        Ok(settled)
+    }
+
+    /// The body of [`Self::settle_iptc_write`], run inside its transaction. Every statement
+    /// here is on `self.conn`, the same connection the open transaction is on, so they share
+    /// it without needing the `Transaction` handle threaded through.
+    fn settle_iptc_write_locked(
+        &self,
+        write: &IptcSidecarWrite,
+        outcome: &std::result::Result<(), String>,
+    ) -> Result<IptcSettled> {
         let now = super::now();
         match outcome {
             Ok(()) => {
@@ -527,7 +554,10 @@ impl Catalog {
     ) -> Result<bool> {
         let mut after = 0i64;
         loop {
-            let page: Vec<i64> = retry_busy(abort, || {
+            // As in `run_identity_repair`'s own page read (#224 N2): an abort met while this
+            // is being retried stops the pass (the `false` this function's doc promises), not
+            // a raw busy error.
+            let Some(page): Option<Vec<i64>> = retry_busy_or_aborted(abort, || {
                 let mut stmt = self.conn.prepare(
                     "SELECT photo_id FROM pending_sidecar_iptc
                      WHERE owed != 0 AND photo_id > ?1 ORDER BY photo_id LIMIT ?2",
@@ -536,7 +566,10 @@ impl Catalog {
                     .query_map(params![after, IPTC_REPAIR_PAGE_SIZE], |r| r.get(0))?
                     .collect::<rusqlite::Result<_>>()?;
                 Ok(ids)
-            })?;
+            })?
+            else {
+                return Ok(false);
+            };
             if page.is_empty() {
                 return Ok(true);
             }
@@ -904,5 +937,59 @@ mod tests {
             })
             .unwrap();
         assert_eq!((attempts, error.as_str()), (0, ""));
+    }
+
+    // --- settle_iptc_write under retry_busy, as one transaction (#224 N1) -----------------
+
+    /// A third connection holding the write lock, released from `busy::hook` on the first
+    /// retry — mirrors `identity.rs`'s `hold_write_lock`/`release` harness for the same
+    /// busy-retry construction.
+    fn hold_write_lock(c: &Catalog) -> std::rc::Rc<std::cell::RefCell<Option<rusqlite::Connection>>> {
+        let conn = rusqlite::Connection::open(c.db_path()).unwrap();
+        conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+        c.conn.busy_timeout(std::time::Duration::from_millis(30)).unwrap();
+        std::rc::Rc::new(std::cell::RefCell::new(Some(conn)))
+    }
+
+    fn release(holder: &std::rc::Rc<std::cell::RefCell<Option<rusqlite::Connection>>>) {
+        if let Some(conn) = holder.borrow_mut().take() {
+            conn.execute_batch("COMMIT").unwrap();
+        }
+    }
+
+    struct HookGuard;
+    impl Drop for HookGuard {
+        fn drop(&mut self) {
+            super::super::busy::hook::clear();
+        }
+    }
+
+    /// `settle_iptc_write`, retried by [`retry_busy`] after a lock held by another connection
+    /// makes its first statement busy (released on the first retry, so the retry — not a
+    /// lucky timing — is what completes it), applies its effect exactly once: `attempts`
+    /// lands at 1, not 2. Read closely (see the doc comment on `settle_iptc_write`), today's
+    /// branches return immediately after any statement that has a real effect, so this
+    /// construction cannot by itself distinguish the transaction from the autocommit
+    /// statements it replaced — it is a regression test for the retry_busy integration, not a
+    /// reproduction of a prior double-count. The transaction is there so the function keeps
+    /// this property even if a later edit adds a statement after one of those returns.
+    #[test]
+    fn a_retried_settle_applies_its_effect_once() {
+        let (_dir, c, id, _) = photo("iptc-settle-busy-retry");
+        let w = c.set_iptc(id, &titled("A")).unwrap();
+        let holder = hold_write_lock(&c);
+        let _guard = HookGuard;
+        {
+            let holder = holder.clone();
+            super::super::busy::hook::set(move || release(&holder));
+        }
+
+        let settled =
+            retry_busy(&std::sync::atomic::AtomicBool::new(false), || c.settle_iptc_write(&w, &Err("disk full".into())))
+                .unwrap();
+
+        assert_eq!(settled, IptcSettled::Failed("disk full".into()));
+        let row = c.list_owed_iptc_page(10, 0).unwrap().into_iter().find(|r| r.photo_id == id).unwrap();
+        assert_eq!(row.attempts, 1, "one retried call must apply its attempts bump exactly once");
     }
 }

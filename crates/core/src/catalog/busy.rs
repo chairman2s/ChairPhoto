@@ -68,6 +68,24 @@ pub(crate) fn retry_busy<T>(abort: &AtomicBool, mut op: impl FnMut() -> Result<T
     }
 }
 
+/// [`retry_busy`], but an abort that strikes during the retries is reported as `Ok(None)`
+/// instead of propagating the busy error (#224 N2). A caller planning a page or a total count
+/// ahead of a loop that already checks `abort` between rows (the identity repair pass, the
+/// bulk conflict resolution) wants that same "stopped, not failed" outcome here too: without
+/// this, an abort that happens to land while `op` is being retried ends the pass on "database
+/// is locked" — indistinguishable from the one case ([`retry_busy`]'s own doc) that really
+/// should end it, a lock that outlasts every pause with no abort in play at all.
+pub(crate) fn retry_busy_or_aborted<T>(
+    abort: &AtomicBool,
+    op: impl FnMut() -> Result<T>,
+) -> Result<Option<T>> {
+    match retry_busy(abort, op) {
+        Ok(v) => Ok(Some(v)),
+        Err(e) if is_busy(&e) && abort.load(Ordering::Relaxed) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
 fn pause_unless_aborted(pause: Duration, abort: &AtomicBool) {
     let until = std::time::Instant::now() + pause;
     loop {
@@ -166,5 +184,64 @@ mod tests {
         });
         assert!(out.as_ref().is_err_and(is_busy));
         assert_eq!(calls.get(), 1, "an aborted job does not wait out the lock");
+    }
+
+    /// An abort that trips while [`retry_busy`] is actually asleep in a pause — not merely
+    /// one set before the first attempt, which `any_other_error_and_a_stopped_job_are_not_retried`
+    /// above already covers — wakes the pause up near-immediately rather than sleeping it out
+    /// (#224 N4). A production pause is seconds long; this uses one far longer than the test
+    /// would tolerate (`pause_unless_aborted` is private to this module, so the test calls it
+    /// directly rather than through [`retry_busy`]'s short, fixed [`BACKOFF`]).
+    #[test]
+    fn pause_unless_aborted_wakes_up_once_abort_trips_mid_pause() {
+        let abort = AtomicBool::new(false);
+        let long = Duration::from_secs(5);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                // Long enough that the pause is already inside its poll loop.
+                std::thread::sleep(ABORT_POLL * 2);
+                abort.store(true, Ordering::Relaxed);
+            });
+            let started = std::time::Instant::now();
+            pause_unless_aborted(long, &abort);
+            assert!(
+                started.elapsed() < long,
+                "the pause must not sit out its full duration once aborted mid-sleep"
+            );
+        });
+    }
+
+    // --- retry_busy_or_aborted ------------------------------------------------------------
+
+    #[test]
+    fn retry_busy_or_aborted_reports_success_as_some() {
+        let out = retry_busy_or_aborted(&AtomicBool::new(false), || Ok(7));
+        assert_eq!(out.unwrap(), Some(7));
+    }
+
+    #[test]
+    fn retry_busy_or_aborted_reports_a_lock_with_no_abort_as_an_error() {
+        let out: Result<Option<()>> = retry_busy_or_aborted(&AtomicBool::new(false), || Err(busy()));
+        assert!(out.as_ref().is_err_and(is_busy), "{out:?}");
+    }
+
+    /// The abort tripping mid-retry is reported as `Ok(None)`, not the busy error — the
+    /// outcome a caller tells apart from "really locked" to report an aborted summary instead
+    /// of ending on "database is locked" (#224 N2). Mutation-checked: a version that always
+    /// returns `retry_busy(..).map(Some)` without the abort check fails this (it returns the
+    /// busy `Err`, not `Ok(None)`).
+    #[test]
+    fn retry_busy_or_aborted_reports_an_abort_mid_retry_as_none() {
+        let calls = Cell::new(0);
+        let abort = AtomicBool::new(false);
+        let out: Result<Option<()>> = retry_busy_or_aborted(&abort, || {
+            calls.set(calls.get() + 1);
+            if calls.get() == 1 {
+                abort.store(true, Ordering::Relaxed);
+            }
+            Err(busy())
+        });
+        assert_eq!(out.unwrap(), None);
+        assert_eq!(calls.get(), 1, "the abort is seen before a second attempt");
     }
 }

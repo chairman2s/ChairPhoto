@@ -47,7 +47,7 @@
 //! than dropping that row's result. The pass's own ownership — job id, abort flag, status
 //! slot, catalog switch — is the `app::jobs` protocol, one layer up.
 
-use super::busy::{is_busy, retry_busy};
+use super::busy::{is_busy, retry_busy, retry_busy_or_aborted};
 use super::{Catalog, CatalogError, Result};
 use rusqlite::{params, OptionalExtension};
 use std::path::{Path, PathBuf};
@@ -1285,6 +1285,14 @@ impl Catalog {
     /// Adopt changes `photos.uuid`, which is what catalog merge matches on and what
     /// `chairphoto://<uuid>` deep links address. See `docs/storage-and-import.md` § Identity
     /// conflicts for what that means for a catalog that has already been merged or bundled.
+    ///
+    /// A single decision has no abort flag of its own to pass [`retry_busy`] (#224 N3): there
+    /// is no cancel button for one click, and this is not the 74k-row batch
+    /// [`Self::run_resolve_foreign_conflicts`]'s retry ladder (4 pauses, ~20 s on top of the
+    /// connection's own 5 s `busy_timeout`) exists for. So it passes an abort flag already
+    /// tripped, which makes [`retry_busy`] return on the first busy rather than pause and
+    /// retry — a held lock costs the connection's plain `busy_timeout` (~5 s), as it did
+    /// before #182, instead of riding that ladder on a resolution nobody asked to wait out.
     pub fn resolve_identity_conflict(
         &self,
         photo_id: i64,
@@ -1292,7 +1300,7 @@ impl Catalog {
         relative_path: &str,
         action: IdentityConflictAction,
     ) -> Result<IdentityConflictOutcome> {
-        self.resolve_conflict(photo_id, volume_id, relative_path, action, false, &AtomicBool::new(false))
+        self.resolve_conflict(photo_id, volume_id, relative_path, action, false, &AtomicBool::new(true))
     }
 
     /// [`Self::resolve_identity_conflict`]; with `foreign_only`, Overwrite also refuses a
@@ -1622,9 +1630,15 @@ impl Catalog {
         abort: &AtomicBool,
         mut progress: impl FnMut(&IdentityRepairSummary),
     ) -> Result<IdentityRepairSummary> {
-        let total = retry_busy(abort, || {
+        // An abort that strikes while this (or the page read below) is being retried is
+        // reported the same way the per-row loop reports one: an aborted summary, not the
+        // raw "database is locked" `retry_busy` would otherwise propagate (#224 N2).
+        let Some(total) = retry_busy_or_aborted(abort, || {
             Ok(self.count_active_identity_repairs()? + self.count_owed_iptc()?)
-        })?;
+        })?
+        else {
+            return Ok(IdentityRepairSummary { aborted: true, ..Default::default() });
+        };
         let mut summary = IdentityRepairSummary { total: total as usize, ..Default::default() };
         let mut cursor: Option<IdentityRepairCursor> = None;
         loop {
@@ -1634,9 +1648,13 @@ impl Catalog {
             }
             // A read: under WAL it waits for no writer, so a lock that outlasts the retries
             // here is not the transient kind and does end the pass.
-            let page = retry_busy(abort, || {
+            let Some(page) = retry_busy_or_aborted(abort, || {
                 self.plan_identity_repairs_page(cursor.as_ref(), REPAIR_PAGE_SIZE)
-            })?;
+            })?
+            else {
+                summary.aborted = true;
+                return Ok(summary);
+            };
             if page.is_empty() {
                 // Then the IPTC the catalog owes sidecars (#148), under the same abort flag.
                 summary.aborted = !self.run_iptc_repair(abort, &mut summary, &mut progress)?;
@@ -1752,7 +1770,11 @@ impl Catalog {
         abort: &AtomicBool,
         mut progress: impl FnMut(&ForeignConflictSummary),
     ) -> Result<ForeignConflictSummary> {
-        let total = retry_busy(abort, || self.count_foreign_conflicts())?;
+        // As in `run_identity_repair` (#224 N2): an abort met while this or the page read is
+        // being retried is reported as an aborted summary, not a raw busy error.
+        let Some(total) = retry_busy_or_aborted(abort, || self.count_foreign_conflicts())? else {
+            return Ok(ForeignConflictSummary { aborted: true, ..Default::default() });
+        };
         let mut summary = ForeignConflictSummary { total, ..Default::default() };
         let mut cursor: Option<(i64, i64, String)> = None;
         loop {
@@ -1760,9 +1782,13 @@ impl Catalog {
                 summary.aborted = true;
                 return Ok(summary);
             }
-            let page = retry_busy(abort, || {
+            let Some(page) = retry_busy_or_aborted(abort, || {
                 self.identifier_conflicts_page(cursor.as_ref(), REPAIR_PAGE_SIZE)
-            })?;
+            })?
+            else {
+                summary.aborted = true;
+                return Ok(summary);
+            };
             if page.is_empty() {
                 return Ok(summary);
             }
@@ -1814,7 +1840,12 @@ impl Catalog {
     ///
     /// The caller still binds with the raw `found`, so the foreign value stays in the
     /// sidecar and is reported as a conflict.
-    pub fn scan_identity(&self, found: Option<&str>, size: i64) -> Result<Option<String>> {
+    ///
+    /// `scanned` is the file this value was just read from — passed to
+    /// [`Self::every_primary_copy_is_gone`] so it can tell a copy genuinely still at its
+    /// recorded path from one a case-insensitive filesystem only folds onto the file being
+    /// scanned (#224 L1, the legacy-identifier half of #184).
+    pub fn scan_identity(&self, found: Option<&str>, size: i64, scanned: &Path) -> Result<Option<String>> {
         let Some(found) = found.filter(|v| !is_blank_identity(v)) else {
             return Ok(None);
         };
@@ -1835,7 +1866,7 @@ impl Catalog {
             .collect::<rusqlite::Result<_>>()?;
         match owners.as_slice() {
             [(photo_id, uuid, row_size)]
-                if *row_size == size && self.every_primary_copy_is_gone(*photo_id)? =>
+                if *row_size == size && self.every_primary_copy_is_gone(*photo_id, scanned)? =>
             {
                 Ok(Some(uuid.clone()))
             }
@@ -1852,7 +1883,11 @@ impl Catalog {
     /// another recorded location of this very row, so its presence says nothing about which
     /// row a moved original belongs to — and since new photos get a backup enqueued, insisting
     /// on it would leave the legacy re-home dead for most real libraries.
-    fn every_primary_copy_is_gone(&self, photo_id: i64) -> Result<bool> {
+    ///
+    /// "Gone" is decided by [`copy_still_in_place`] against `scanned`, not by `exists()`
+    /// (#224 L1, the same class of bug #184 fixed for a bound UUID): on a case-insensitive
+    /// filesystem the old name of a case-only rename still opens the renamed file.
+    fn every_primary_copy_is_gone(&self, photo_id: i64, scanned: &Path) -> Result<bool> {
         let mut copies: Vec<(PathBuf, PathBuf)> = self
             .conn
             .prepare(
@@ -1868,7 +1903,7 @@ impl Catalog {
             .collect::<rusqlite::Result<_>>()?;
         let logical = self.get_photo(photo_id)?.path;
         copies.push((self.root().to_path_buf(), self.to_absolute(&logical)));
-        Ok(copies.iter().all(|(base, file)| base.is_dir() && !file.exists()))
+        Ok(copies.iter().all(|(base, file)| base.is_dir() && !copy_still_in_place(file, scanned)))
     }
 
     /// True when re-homing `photo_id` onto a file on `volume_id` would move one of its
@@ -2186,18 +2221,27 @@ fn same_file(a: &Path, b: &Path) -> bool {
 /// True when some component of `recorded` that it does not share with `scanned` — its file
 /// name, or a folder renamed by case — is not in its parent's listing verbatim, so `recorded`
 /// reaches its file only through the filesystem folding names.
+///
+/// Checks the differing components **folder-first, file name last** (#224 L3): building the
+/// path outward from the shared prefix means a whole folder renamed by case (`DCIM` ->
+/// `dcim`, N files) finds that folder missing from its own (small) parent listing on the
+/// first check and returns immediately, never listing the N-entry folder once per scanned
+/// file. The reverse order (file name first, as before) would `read_dir` that N-entry folder
+/// for every one of its files before ever checking the folder name itself: O(N²) dirents for
+/// one rename instead of O(N). Only runs when [`same_file`] is true, so an ordinary scan (no
+/// case-only rename in play) pays nothing either way.
 fn reached_only_by_folding(recorded: &Path, scanned: &Path) -> bool {
     let shared = recorded
         .components()
         .zip(scanned.components())
         .take_while(|(a, b)| a == b)
         .count();
-    let mut path = recorded.to_path_buf();
-    for _ in shared..recorded.components().count() {
+    let mut path: PathBuf = recorded.components().take(shared).collect();
+    for component in recorded.components().skip(shared) {
+        path.push(component);
         if !listed_verbatim(&path) {
             return true;
         }
-        path.pop();
     }
     false
 }
@@ -3685,6 +3729,33 @@ mod tests {
         }
     }
 
+    /// A single `resolve_identity_conflict`, unlike the pass above, has no cancel button of
+    /// its own to wait for — there is no 74k-row queue behind one click — so it does not ride
+    /// `run_resolve_foreign_conflicts`'s retry ladder on a held lock (#224 N3): its record
+    /// write meets the lock, fails on the connection's own `busy_timeout` alone, and returns.
+    /// The lock is never released, so a regression back to a never-tripped abort flag would
+    /// show up here as at least one retry (and, outside a test, a real multi-pause wait)
+    /// instead of zero.
+    #[test]
+    fn a_single_resolution_does_not_wait_out_a_held_lock() {
+        let (catalog, root, _dir) = temp_catalog("single-resolve-busy-bound");
+        let (id, path, _) = seed_conflicted_copy(&catalog, &root, "x.jpg", "not-my-problem-uuid");
+        let (volume_id, relative_path) = copy_of(&catalog, &path);
+        let holder = hold_write_lock(&catalog);
+        let retries = std::rc::Rc::new(std::cell::Cell::new(0));
+        let _guard = HookGuard;
+        {
+            let retries = retries.clone();
+            super::super::busy::hook::set(move || retries.set(retries.get() + 1));
+        }
+
+        let result = catalog.resolve_identity_conflict(id, volume_id, &relative_path, IdentityConflictAction::Dismiss);
+
+        assert!(result.as_ref().is_err_and(is_busy), "{result:?}");
+        assert_eq!(retries.get(), 0, "a single resolution must not pause and retry at all");
+        release(&holder);
+    }
+
     /// A row whose record is locked through every retry is left exactly as it was, counted
     /// `busy`, and the pass carries on with the next row. The next pass finds the sidecar the
     /// first one wrote and records it bound.
@@ -3973,6 +4044,10 @@ mod tests {
     #[test]
     fn a_legacy_identifier_matches_only_a_row_whose_every_primary_copy_is_gone() {
         let (catalog, root, dir) = temp_catalog("legacy-identifier-match");
+        // A path distinct from every recorded copy: these assertions are about which row a
+        // legacy identifier matches, not about a case-only rename, so `scanned` only needs to
+        // not alias any copy below (`copy_still_in_place` then reduces to `exists()`).
+        let scanned = root.join("scanned-probe.jpg");
         let (id, path) = seed_photo(&catalog, &root, "x.jpg");
         let backup = dir.path().join("backup");
         std::fs::create_dir_all(&backup).unwrap();
@@ -4006,29 +4081,29 @@ mod tests {
         let uuid = photo_uuid(&catalog, id);
         assert!(is_photo_identity(&uuid), "{uuid}");
 
-        assert_eq!(catalog.scan_identity(Some("dam:1"), 9).unwrap(), None, "its file is still there");
+        assert_eq!(catalog.scan_identity(Some("dam:1"), 9, &scanned).unwrap(), None, "its file is still there");
         std::fs::remove_file(&path).unwrap();
-        assert_eq!(catalog.scan_identity(Some("dam:1"), 10).unwrap(), None,
+        assert_eq!(catalog.scan_identity(Some("dam:1"), 10, &scanned).unwrap(), None,
             "a file of another size is not the original, whatever DAM id it carries (N1)");
-        assert_eq!(catalog.scan_identity(Some("dam:1"), 9).unwrap(), Some(uuid.clone()),
+        assert_eq!(catalog.scan_identity(Some("dam:1"), 9, &scanned).unwrap(), Some(uuid.clone()),
             "the backup still in place is this row's own copy, not another photo");
 
         let nas_uuid = photo_uuid(&catalog, on_nas);
-        assert_eq!(catalog.scan_identity(Some("dam:3"), 9).unwrap(), None, "its NAS file is there");
+        assert_eq!(catalog.scan_identity(Some("dam:3"), 9, &scanned).unwrap(), None, "its NAS file is there");
         std::fs::remove_dir_all(&nas).unwrap();
-        assert_eq!(catalog.scan_identity(Some("dam:3"), 9).unwrap(), None,
+        assert_eq!(catalog.scan_identity(Some("dam:3"), 9, &scanned).unwrap(), None,
             "the primary copy may still exist on the volume that is not mounted");
         std::fs::create_dir_all(&nas).unwrap();
-        assert_eq!(catalog.scan_identity(Some("dam:3"), 9).unwrap(), Some(nas_uuid));
+        assert_eq!(catalog.scan_identity(Some("dam:3"), 9, &scanned).unwrap(), Some(nas_uuid));
 
-        assert_eq!(catalog.scan_identity(Some(&uuid), 9).unwrap(), Some(uuid.clone()));
+        assert_eq!(catalog.scan_identity(Some(&uuid), 9, &scanned).unwrap(), Some(uuid.clone()));
         assert_eq!(
-            catalog.scan_identity(Some(&uuid.to_ascii_uppercase()), 9).unwrap(),
+            catalog.scan_identity(Some(&uuid.to_ascii_uppercase()), 9, &scanned).unwrap(),
             Some(uuid.clone()),
             "a UUID is answered in its canonical lowercase spelling (#146)"
         );
-        assert_eq!(catalog.scan_identity(Some("dam:2"), 9).unwrap(), None);
-        assert_eq!(catalog.scan_identity(None, 9).unwrap(), None);
+        assert_eq!(catalog.scan_identity(Some("dam:2"), 9, &scanned).unwrap(), None);
+        assert_eq!(catalog.scan_identity(None, 9, &scanned).unwrap(), None);
 
         // Two rows holding the same legacy value: the file could be either, so neither.
         let (other, other_path) = seed_photo(&catalog, &root, "y.jpg");
@@ -4040,7 +4115,7 @@ mod tests {
                 params![other],
             )
             .unwrap();
-        assert_eq!(catalog.scan_identity(Some("dam:1"), 9).unwrap(), None);
+        assert_eq!(catalog.scan_identity(Some("dam:1"), 9, &scanned).unwrap(), None);
     }
 
     // --- The re-home guard and file identity (#184) ------------------------------------------
@@ -4182,6 +4257,94 @@ CHAIRPHOTO_CASEFOLD_DIR="$1/cf" exec "$2" --exact "$3" --ignored --nocapture --t
         assert_eq!(catalog.get_photo(id).unwrap().path, "trip/img.arw");
         assert_eq!(photo_count(&catalog), 1);
         assert_eq!(scan(&catalog, &moved).id, id, "a rescan finds it at its new name");
+    }
+
+    /// The legacy-identifier re-home guard (`every_primary_copy_is_gone`) on the same
+    /// case-insensitive filesystem as the test above (#224 L1, the half of #184 left open:
+    /// that fix covered a bound UUID, not a legacy DAM id). A casefold tmpfs mounted in a
+    /// private user and mount namespace, where this test binary runs
+    /// [`legacy_identity_case_only_renames_on_a_casefold_mount`]. Skipped where unprivileged
+    /// namespaces, tmpfs casefold (Linux 6.13+) or `chattr` are not available.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_legacy_identity_case_only_rename_on_a_case_insensitive_filesystem_re_homes_the_row() {
+        const NAME: &str =
+            "a_legacy_identity_case_only_rename_on_a_case_insensitive_filesystem_re_homes_the_row";
+        let dir = TestTmpDir::new("rehome-legacy-casefold-mount");
+        let mount = dir.path().join("mnt");
+        std::fs::create_dir_all(&mount).unwrap();
+        let script = r#"mount -t tmpfs -o casefold tmpfs "$1" 2>/dev/null || exit 77
+mkdir "$1/cf" && chattr +F "$1/cf" 2>/dev/null || exit 77
+CHAIRPHOTO_CASEFOLD_DIR="$1/cf" exec "$2" --exact "$3" --ignored --nocapture --test-threads=1"#;
+        let inner = "catalog::identity::tests::legacy_identity_case_only_renames_on_a_casefold_mount";
+        let out = std::process::Command::new("unshare")
+            .args(["-rm", "sh", "-c", script, "sh"])
+            .arg(&mount)
+            .arg(std::env::current_exe().unwrap())
+            .arg(inner)
+            .output();
+        let out = match out {
+            Ok(out) if out.status.code() == Some(77) => {
+                println!("SKIPPED: {NAME} — no casefold tmpfs in a user namespace here");
+                return;
+            }
+            Ok(out) => out,
+            Err(e) => {
+                println!("SKIPPED: {NAME} — unshare unavailable: {e}");
+                return;
+            }
+        };
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        if stdout.contains("unshare: ") || stderr.contains("unshare: ") {
+            println!("SKIPPED: {NAME} — unshare refused: {stderr}");
+            return;
+        }
+        assert!(
+            out.status.success() && stdout.contains("1 passed"),
+            "the casefold run failed:\n{stdout}\n{stderr}"
+        );
+    }
+
+    /// Run by the test above inside its namespace, with `CHAIRPHOTO_CASEFOLD_DIR` a casefold
+    /// directory. A file whose sidecar carries a legacy (non-UUID) identifier, renamed by case
+    /// only (file, then its folder), re-homes the row that identifier belongs to each time.
+    /// Before #224 L1's fix, `every_primary_copy_is_gone` tested the recorded path with
+    /// `exists()`, which the casefold mount folds onto the renamed file, so the renamed file
+    /// looked like a different photo and got a second row (confirmed by the #224 review's
+    /// probe: "first=1 up.id=2 created=true rows=2").
+    #[test]
+    #[ignore = "run inside a casefold mount by the test above"]
+    fn legacy_identity_case_only_renames_on_a_casefold_mount() {
+        let base = PathBuf::from(std::env::var_os("CHAIRPHOTO_CASEFOLD_DIR").expect("run by the outer test"));
+        let root = base.join("photos");
+        std::fs::create_dir_all(&root).unwrap();
+        let db = TestTmpDir::new("rehome-legacy-casefold");
+        let catalog = Catalog::open(&db.path().join("test.chairphoto"), &root).unwrap();
+
+        let path = root.join("Trip/IMG.ARW");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"raw-bytes").unwrap();
+        crate::xmp::write_identifier(&path, "dam:7").unwrap();
+        let first = scan(&catalog, &path);
+        assert!(first.created);
+        assert!(!is_photo_identity("dam:7"), "a DAM id is not a UUID");
+
+        assert!(root.join("trip/img.arw").exists(), "{} is not case-insensitive", base.display());
+
+        let renamed = root.join("Trip/img.arw");
+        rename_with_sidecar(&path, &renamed);
+        let up = scan(&catalog, &renamed);
+        assert_eq!((up.id, up.created), (first.id, false), "file renamed by case");
+        assert_eq!(catalog.get_photo(first.id).unwrap().path, "Trip/img.arw");
+
+        std::fs::rename(root.join("Trip"), root.join("trip-renaming")).unwrap();
+        std::fs::rename(root.join("trip-renaming"), root.join("trip")).unwrap();
+        let moved = root.join("trip/img.arw");
+        let up = scan(&catalog, &moved);
+        assert_eq!((up.id, up.created), (first.id, false), "folder renamed by case");
+        assert_eq!(catalog.get_photo(first.id).unwrap().path, "trip/img.arw");
+        assert_eq!(photo_count(&catalog), 1, "no second row for the legacy id");
     }
 
     /// #146 (L5): Adopt stores the sidecar's identity lowercase, and the conflict it
@@ -4487,6 +4650,7 @@ CHAIRPHOTO_CASEFOLD_DIR="$1/cf" exec "$2" --exact "$3" --ignored --nocapture --t
     #[test]
     fn v23_gives_a_blank_identity_a_v4_and_no_legacy_record() {
         let (catalog, root, _dir) = temp_catalog("blank-identity-v23");
+        let scanned = root.join("scanned-probe.jpg");
         let (id, _) = seed_photo(&catalog, &root, "x.jpg");
         catalog
             .conn()
@@ -4504,7 +4668,7 @@ CHAIRPHOTO_CASEFOLD_DIR="$1/cf" exec "$2" --exact "$3" --ignored --nocapture --t
 
         // A scanned sidecar with a blank identifier is no identity either: no lookup at all.
         let before = LEGACY_LOOKUPS.with(|n| n.get());
-        assert_eq!(catalog.scan_identity(Some("  "), 9).unwrap(), None);
+        assert_eq!(catalog.scan_identity(Some("  "), 9, &scanned).unwrap(), None);
         assert_eq!(LEGACY_LOOKUPS.with(|n| n.get()), before);
     }
 }

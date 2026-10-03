@@ -67,17 +67,32 @@ pub fn ffprobe_path() -> Option<String> {
     which("ffprobe")
 }
 
+/// A PATH lookup for `bin` done in Rust rather than by shelling out to the external `which`
+/// binary (#211) — one external process fewer, and it works even where `which` itself isn't
+/// installed (some minimal containers ship `ffmpeg` without it).
 fn which(bin: &str) -> Option<String> {
-    let out = Command::new("which").arg(bin).output().ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if path.is_empty() {
-        None
-    } else {
-        Some(path)
-    }
+    which_in(bin, std::env::var_os("PATH")?)
+}
+
+/// [`which`] searching `path_var` (a `PATH`-style, `:`-separated list) instead of the real
+/// environment — so a test can check the lookup without mutating process-wide state. Walks
+/// the entries in order and returns the first one that is a regular, executable file.
+fn which_in(bin: &str, path_var: impl AsRef<std::ffi::OsStr>) -> Option<String> {
+    std::env::split_paths(&path_var).find_map(|dir| {
+        let candidate = dir.join(bin);
+        is_executable_file(&candidate).then(|| candidate.to_string_lossy().into_owned())
+    })
+}
+
+#[cfg(unix)]
+fn is_executable_file(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+}
+
+#[cfg(not(unix))]
+fn is_executable_file(path: &Path) -> bool {
+    path.is_file()
 }
 
 /// The effective transition overlap (seconds): the requested `transition_duration` when
@@ -413,6 +428,30 @@ mod tests {
 
     fn paths(n: usize) -> Vec<PathBuf> {
         (0..n).map(|i| PathBuf::from(format!("/tmp/f{i}.jpg"))).collect()
+    }
+
+    /// #211: a pure-Rust `PATH` lookup (no `which` binary). It skips a same-named file that
+    /// exists but isn't executable, and finds the real one later on the path; no match
+    /// anywhere on `PATH` is `None`. `which_in` takes an explicit path string so this never
+    /// touches the process's real `PATH` (shared, racy under parallel tests).
+    #[test]
+    #[cfg(unix)]
+    fn which_skips_a_non_executable_and_finds_the_real_binary_on_path() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = crate::test_support::TestTmpDir::new("slideshow-which");
+        let decoy_dir = dir.join("decoy");
+        let real_dir = dir.join("real");
+        std::fs::create_dir_all(&decoy_dir).unwrap();
+        std::fs::create_dir_all(&real_dir).unwrap();
+        // A same-named file earlier on the path, but not executable: must be skipped.
+        let decoy = decoy_dir.join("myffmpeg");
+        std::fs::write(&decoy, "not executable").unwrap();
+        let real = real_dir.join("myffmpeg");
+        std::fs::write(&real, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let search = format!("{}:{}", decoy_dir.display(), real_dir.display());
+        assert_eq!(which_in("myffmpeg", &search), Some(real.to_string_lossy().into_owned()));
+        assert_eq!(which_in("nonexistent-binary-xyz", &search), None);
     }
 
     #[test]

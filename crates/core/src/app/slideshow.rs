@@ -4,7 +4,8 @@
 //! A render is a job (`JobRegistry::slideshow`): [`claim_slideshow`] resolves the photos'
 //! Originals and takes ownership (catalog → the slideshow abort, one transition), and
 //! [`SlideshowJob::run`] does the work on the caller's worker: one frame JPEG per photo into a
-//! private temp dir, then the ffmpeg encode. A newer render, Cancel (tripping the job's own
+//! private cache directory ([`FrameDir`], not a quota-limited `/tmp`), then the ffmpeg encode.
+//! A newer render, Cancel (tripping the job's own
 //! [`SlideshowJob::abort_handle`]) or a catalog switch trips it; the encode then kills ffmpeg,
 //! removes the partial movie and answers [`SLIDESHOW_CANCELLED`].
 //!
@@ -196,16 +197,20 @@ impl SlideshowJob {
     }
 }
 
-/// A render's frame directory: a fresh `chairphoto-slideshow-<random>` under the temp dir,
-/// created exclusively with mode 0700 (the frames are full-size renders of the user's photos;
-/// the random name cannot be predicted or pre-created by another user). Dropping it removes
-/// the directory, so it goes on every exit — success, error, cancel, or a panic in a frame
-/// writer.
+/// A render's frame directory: a fresh `<random>` directory under the app's cache dir
+/// (`crate::thumbnails::cache_dir()/chairphoto/slideshow`, not `std::env::temp_dir()` — on
+/// some machines `/tmp` is a quota-limited tmpfs, and up to 4096px frames for a long
+/// slideshow could fill it, #211), created exclusively with mode 0700 (the frames are
+/// full-size renders of the user's photos; the random name cannot be predicted or
+/// pre-created by another user). Dropping it removes the directory, so it goes on every
+/// exit — success, error, cancel, or a panic in a frame writer.
 struct FrameDir(PathBuf);
 
 impl FrameDir {
     fn create() -> Result<Self, String> {
-        let path = std::env::temp_dir().join(format!("chairphoto-slideshow-{}", uuid::Uuid::new_v4().simple()));
+        let base = crate::thumbnails::cache_dir().join("chairphoto").join("slideshow");
+        std::fs::create_dir_all(&base).map_err(|e| format!("{}: {e}", base.display()))?;
+        let path = base.join(uuid::Uuid::new_v4().simple().to_string());
         let mut builder = std::fs::DirBuilder::new();
         #[cfg(unix)]
         std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
@@ -317,6 +322,24 @@ mod tests {
         assert!(!work.exists(), "the job's frames are removed");
         for i in 0..2 {
             assert_eq!(std::fs::read(dir.join("library").join(format!("IMG_{i}.jpg"))).unwrap(), format!("jpeg {i}").as_bytes(), "originals untouched");
+        }
+    }
+
+    /// #211: frames render into the app's cache dir, not `std::env::temp_dir()` — on this
+    /// machine `/tmp` is a quota-limited tmpfs that a long slideshow's frames could fill.
+    #[test]
+    fn frames_render_into_the_cache_dir_not_the_system_temp_dir() {
+        let (dir, state, _progress, ids) = setup("cachedir", 1);
+        let out = dir.join("out");
+        let job = claim_slideshow(&state, None, &ids, opts(), out.to_str().unwrap(), Some(fake_ffmpeg(false))).unwrap();
+        let dirs = Arc::new(Mutex::new(Vec::new()));
+        job.run_with(&recording_frames(dirs.clone())).unwrap();
+        let (frame_dir, _mode) = dirs.lock().unwrap()[0].clone();
+        let cache_root = crate::thumbnails::cache_dir().join("chairphoto").join("slideshow");
+        assert!(frame_dir.starts_with(&cache_root), "{frame_dir:?} is under the cache dir {cache_root:?}");
+        let tmp_root = std::env::temp_dir();
+        if tmp_root != cache_root {
+            assert!(!frame_dir.starts_with(&tmp_root), "{frame_dir:?} is not under the system temp dir {tmp_root:?}");
         }
     }
 

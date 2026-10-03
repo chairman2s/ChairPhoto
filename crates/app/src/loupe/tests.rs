@@ -496,6 +496,85 @@ fn a_failed_duel_verdict_stays_on_the_pair(cx: &mut TestAppContext) {
     assert_eq!(culling(&app, ids[2]).1, PickState::None);
 }
 
+/// Select exactly `set`, in order.
+fn select_set(app: &App, set: &[i64], cx: &mut TestAppContext) {
+    app.wired.shell.update(cx, |s, cx| s.select_with(cx, select_set_verb(set)));
+    cx.run_until_parked();
+}
+
+fn select_set_verb(set: &[i64]) -> impl FnOnce(&mut chairphoto_model::library::session::LibrarySession) {
+    use chairphoto_model::library::session::SelectMods;
+    let set = set.to_vec();
+    move |l| {
+        l.select_single(set[0]);
+        for &id in &set[1..] {
+            l.select(id, SelectMods::CTRL);
+        }
+    }
+}
+
+/// #205: a verdict still being written when Compare closes and reopens on another set lands
+/// its marks, but settles nothing in the new session — not its round, not its pending flag.
+#[gpui_kit::test]
+fn a_verdict_from_a_closed_compare_does_not_move_the_next_one(cx: &mut TestAppContext) {
+    use chairphoto_model::compare_duel::DuelSide;
+    let (app, _pool, _dir, ids) = app_with(6, "cmp-epoch", cx);
+    let (first, second) = (ids[..3].to_vec(), ids[3..].to_vec());
+    select_set(&app, &first, cx);
+    assert!(app.wired.shell.update(cx, |s, cx| s.open_compare(cx)));
+    // Nothing parks between the verdict and the reopen: its write is still in flight.
+    app.wired.shell.update(cx, |s, cx| {
+        s.compare_verdict(DuelSide::Right, cx);
+        assert!(s.compare().unwrap().pending());
+        s.close_compare(cx);
+        s.select_with(cx, select_set_verb(&second));
+        assert!(s.open_compare(cx));
+        assert_eq!(s.compare().unwrap().pool(), &second[..]);
+    });
+    cx.run_until_parked();
+    assert_eq!(culling(&app, first[0]).1, PickState::Reject, "the old verdict's write landed");
+    let session = app.wired.shell.read_with(cx, |s, _| s.compare().cloned()).unwrap();
+    assert_eq!(
+        (session.batch(), session.duel_progress(), session.focus(), session.pending()),
+        (vec![second[0], second[1]], (1, 2), Some(second[1]), false),
+        "the new duel is where it opened"
+    );
+    for &id in &second {
+        assert_eq!(culling(&app, id).1, PickState::None, "photo {id}");
+    }
+    // Its own verdict judges its first pair.
+    press(&app, "right", cx);
+    assert_eq!(culling(&app, second[0]).1, PickState::Reject);
+    let session = app.wired.shell.read_with(cx, |s, _| s.compare().cloned()).unwrap();
+    assert_eq!((session.batch(), session.duel_progress()), (vec![second[1], second[2]], (2, 2)));
+}
+
+/// #205: Duel→Grid→Duel while a verdict is being written restarts the duel on the round the
+/// verdict was decided in; the verdict's write lands but does not move it. (That a stale
+/// verdict leaves the new duel's own pending verdict alone is covered in `compare.rs`.)
+#[gpui_kit::test]
+fn a_verdict_from_before_a_mode_round_trip_does_not_move_the_duel(cx: &mut TestAppContext) {
+    use crate::loupe::compare::CompareMode;
+    use chairphoto_model::compare_duel::DuelSide;
+    let (app, _pool, _dir, ids) = app_with(3, "cmp-epoch-mode", cx);
+    select_all(&app, cx);
+    press(&app, "c", cx);
+    app.wired.shell.update(cx, |s, cx| {
+        s.compare_verdict(DuelSide::Right, cx);
+        s.set_compare_mode(CompareMode::Grid, cx);
+        s.set_compare_mode(CompareMode::Duel, cx);
+        assert!(!s.compare().unwrap().pending());
+    });
+    cx.run_until_parked();
+    assert_eq!(culling(&app, ids[0]).1, PickState::Reject, "the old verdict's write landed");
+    let session = app.wired.shell.read_with(cx, |s, _| s.compare().cloned()).unwrap();
+    assert_eq!(
+        (session.batch(), session.duel_progress(), session.pending()),
+        (vec![ids[0], ids[1]], (1, 2), false),
+        "the restarted duel did not move"
+    );
+}
+
 /// When every pane drops out of the view — here the duel's champion, rated under the Unrated
 /// filter once the duel is done — Compare ends, and the grid's keys mark the selection again
 /// (React's `inCompare` required a pane).

@@ -207,6 +207,7 @@ pub fn run() {
             commands::relocate_photo,
             commands::list_pending_identity,
             commands::summarize_pending_identity,
+            commands::get_catalog_identity,
             commands::repair_pending_identity,
             commands::identity_repair_cancel,
             commands::identity_repair_status,

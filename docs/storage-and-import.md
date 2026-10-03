@@ -181,9 +181,14 @@ The debt is therefore a **set of fields per photo**, in `pending_sidecar_iptc`
   without writing — for a photo kept on read-only media — by compare-and-set on the UUID and
   generation the row was read with, so a store since then (whose debt the user has not seen)
   or another photo that took the id is never dismissed. The catalog keeps its values; a later
-  save owes only what it changes. Both are bound to the photo's UUID; the GPUI panel also
-  binds them to the catalog its page was read from (`with_catalog_as`). Each re-reads the
-  panel's and the title bar's counts.
+  save owes only what it changes. Both are bound to the photo's UUID and to the catalog
+  their row was read from (`with_catalog_as`): the GPUI panel binds them to the catalog of
+  the page it drew, and the React panel (#164) captures the open catalog's identity
+  (`get_catalog_identity`) when it opens and passes it as `catalog` to every read and
+  action — the identity queue's `list_pending_identity` / `summarize_pending_identity` /
+  `resolve_identity_conflict` too — and closes on `catalog:switched`. A byte copy of the
+  catalog has the same ids, UUIDs and generations; only the catalog identity tells them
+  apart. Each re-reads the panel's and the title bar's counts.
 - **Reported honestly.** A save that reached only the catalog answers `pending` with the
   reason (`IptcSaveOutcome`, returned by the Tauri `set_iptc` command and shown by both
   inspectors as "Saved to catalog; sidecar pending (…)"); `unchanged` when nothing was owed.

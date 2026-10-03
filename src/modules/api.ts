@@ -57,7 +57,7 @@ const LIST_NEUTRAL_COMMANDS = new Set([
   "faces_suggestion_list", "find_empty_photos", "find_orphan_tags", "find_similar_tags",
   "find_unavailable_photos", "flickr_connected", "get_edit_record", "get_group_members",
   "get_iptc", "get_library_root", "get_modules_dir", "get_photo", "get_photo_by_uuid",
-  "get_photo_locations", "get_photo_metadata", "get_photo_tags", "get_preview",
+  "get_catalog_identity", "get_photo_locations", "get_photo_metadata", "get_photo_tags", "get_preview",
   "get_setting", "get_system_theme", "get_tag_exportable", "get_tag_private",
   "get_thumbnail", "identity_repair_status", "library_graph", "library_safety_summary",
   "list_albums", "list_card_photos_cmd", "list_external_modules", "list_facets",
@@ -1250,13 +1250,27 @@ export interface IdentityRepairStatus {
  *  every copy including dismissed ones (a slice of `total + dismissed`). It is the only way
  *  back to a dismissal, so pair it with the `restore` action rather than offering it as a
  *  bare "show more". */
-export const listPendingIdentity = (limit: number, offset: number, includeDismissed = false) =>
-  invoke<PendingIdentity[]>("list_pending_identity", { limit, offset, includeDismissed });
+export const listPendingIdentity = (
+  limit: number,
+  offset: number,
+  includeDismissed = false,
+  catalog?: CatalogIdentity,
+) => invoke<PendingIdentity[]>("list_pending_identity", { limit, offset, includeDismissed, catalog });
 /** Total debt + conflict counts, without transferring every row. Independent of
  *  `listPendingIdentity` — call/await it separately so a slow list fetch never delays the
  *  cheap header count. */
-export const summarizePendingIdentity = () =>
-  invoke<PendingIdentitySummary>("summarize_pending_identity");
+export const summarizePendingIdentity = (catalog?: CatalogIdentity) =>
+  invoke<PendingIdentitySummary>("summarize_pending_identity", { catalog });
+/** Which open catalog a read came from (#164): an opaque token, only ever handed back.
+ *  Photo ids, volume ids, paths, UUIDs and generations are per catalog, and a copied catalog
+ *  has the same ones; a switch also publishes the new catalog before `catalog:switched`
+ *  reaches the UI. A read or action passed the identity its caller captured fails closed
+ *  with "The catalog changed since this was read" once another catalog is open. A switch
+ *  away and back counts as a change. */
+export type CatalogIdentity = string;
+/** The open catalog's identity. Capture it when a panel opens; pass it to every read and
+ *  action that panel makes. */
+export const getCatalogIdentity = () => invoke<CatalogIdentity>("get_catalog_identity");
 /** Start a repair pass over the queued copies. Unreachable/unwritable/conflicted copies
  *  stay queued; dismissed ones are skipped entirely.
  *
@@ -1322,12 +1336,14 @@ export const resolveIdentityConflict = (
   volumeId: number,
   relativePath: string,
   action: IdentityConflictAction,
+  catalog?: CatalogIdentity,
 ) =>
   invoke<IdentityConflictOutcome>("resolve_identity_conflict", {
     photoId,
     volumeId,
     relativePath,
     action,
+    catalog,
   });
 
 // --- export (one-way) ---
@@ -1775,19 +1791,23 @@ export interface OwedIptc {
 
 /** One page of the photos owing IPTC, in photo-id order. Pair with
  *  `PendingIdentitySummary.iptcOwed` for the total. */
-export const listOwedIptc = (limit: number, offset: number) =>
-  invoke<OwedIptc[]>("list_owed_iptc", { limit, offset });
+export const listOwedIptc = (limit: number, offset: number, catalog?: CatalogIdentity) =>
+  invoke<OwedIptc[]>("list_owed_iptc", { limit, offset, catalog });
 /** What `dismissOwedIptc` did: `changed` — not dismissed, the photo's owed IPTC changed since
  *  the row was read (a newer save owes, or it was paid); `gone` — not dismissed, the photo is
  *  no longer in the catalog (removed, or its id taken by another photo). */
 export type OwedDismissal = "dismissed" | "changed" | "gone";
 /** Stop owing one photo's IPTC without writing (the catalog keeps its values, the sidecar
  *  keeps what it has). Re-read the list afterwards, whatever the answer. */
-export const dismissOwedIptc = (photoId: number, uuid: string, generation: number) =>
-  invoke<OwedDismissal>("dismiss_owed_iptc", { photoId, uuid, generation });
+export const dismissOwedIptc = (
+  photoId: number,
+  uuid: string,
+  generation: number,
+  catalog?: CatalogIdentity,
+) => invoke<OwedDismissal>("dismiss_owed_iptc", { photoId, uuid, generation, catalog });
 /** Write one photo's owed IPTC into its sidecar now. Answers like `setIptc`. */
-export const retryOwedIptc = (photoId: number, uuid: string) =>
-  invoke<IptcSaveOutcome>("retry_owed_iptc", { photoId, uuid });
+export const retryOwedIptc = (photoId: number, uuid: string, catalog?: CatalogIdentity) =>
+  invoke<IptcSaveOutcome>("retry_owed_iptc", { photoId, uuid, catalog });
 
 // ── H16e — Burst-relative sharpness flagging ─────────────────────────────────
 

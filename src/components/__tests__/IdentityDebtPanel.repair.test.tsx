@@ -62,6 +62,8 @@ vi.mock("@tauri-apps/api/core", async (importOriginal) => {
     invoke: (command: string, args: Record<string, unknown>) => {
       calls.push({ command, args: args ?? {} });
       switch (command) {
+        case "get_catalog_identity":
+          return Promise.resolve("catalog-a");
         case "summarize_pending_identity":
           return Promise.resolve(debtSummary);
         case "list_pending_identity":

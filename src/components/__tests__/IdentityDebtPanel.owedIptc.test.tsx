@@ -32,6 +32,8 @@ vi.mock("@tauri-apps/api/core", async (importOriginal) => {
     invoke: (command: string, args: Record<string, unknown>) => {
       calls.push({ command, args: args ?? {} });
       switch (command) {
+        case "get_catalog_identity":
+          return Promise.resolve("catalog-a");
         case "summarize_pending_identity":
           return Promise.resolve(summary);
         case "list_pending_identity":
@@ -89,7 +91,7 @@ describe("the owed-IPTC list", () => {
     expect(within(first).getByText("Title, City")).toBeTruthy();
     expect(within(first).getByText("sidecar is read-only")).toBeTruthy();
     expect(within(screen.getByTestId("owed-row-9")).getByText("Creator")).toBeTruthy();
-    expect(sent("list_owed_iptc")[0].args).toEqual({ limit: 100, offset: 0 });
+    expect(sent("list_owed_iptc")[0].args).toEqual({ limit: 100, offset: 0, catalog: "catalog-a" });
   });
 
   it("is not shown when nothing is owed", async () => {
@@ -113,7 +115,7 @@ describe("the owed-IPTC list", () => {
 
     await screen.findByText(/^Dismissed\./);
     expect(sent("dismiss_owed_iptc")).toEqual([
-      { command: "dismiss_owed_iptc", args: { photoId: 9, uuid: "uuid-9", generation: 1 } },
+      { command: "dismiss_owed_iptc", args: { photoId: 9, uuid: "uuid-9", generation: 1, catalog: "catalog-a" } },
     ]);
     expect(sent("retry_owed_iptc")).toEqual([]);
     expect(sent("summarize_pending_identity").length).toBeGreaterThan(summariesBefore);
@@ -145,7 +147,7 @@ describe("the owed-IPTC list", () => {
     fireEvent.click(within(await screen.findByTestId("owed-row-7")).getByRole("button", { name: "Retry" }));
 
     await screen.findByText("Still pending (no reachable copy of photo 7).");
-    expect(sent("retry_owed_iptc")).toEqual([{ command: "retry_owed_iptc", args: { photoId: 7, uuid: "uuid-7" } }]);
+    expect(sent("retry_owed_iptc")).toEqual([{ command: "retry_owed_iptc", args: { photoId: 7, uuid: "uuid-7", catalog: "catalog-a" } }]);
     expect(sent("dismiss_owed_iptc")).toEqual([]);
     expect(onCountsChanged).toHaveBeenCalledTimes(1);
   });

@@ -625,6 +625,34 @@ fn importing_a_region_on_a_rotated_photo_matches_the_face_in_the_display_frame()
     assert!(has_tag(&c, p, bob));
 }
 
+/// Review #181 L3: the importer fails closed when the auto-tag check itself errors — the face
+/// stays unconfirmed, as for a refusal, rather than confirmed without its tag. The error is
+/// forced by shadowing `tags` with a TEMP table that `create_tag` can read (same ids) but
+/// that lacks `auto_rule`; the face's foreign key still resolves against `main.tags`.
+#[test]
+fn importing_a_region_fails_closed_when_the_auto_tag_check_errors() {
+    let (c, root) = temp_catalog("import-check-error");
+    let p = add_photo(&c, &root, "portrait.ARW");
+    let photo_path = root.join("portrait.ARW");
+    std::fs::write(crate::xmp::sidecar_path(&photo_path), crate::xmp::region_fixtures::LIGHTROOM_ROTATED)
+        .unwrap();
+    c.conn()
+        .execute("UPDATE photos SET width = 6000, height = 4000, exif_orientation = 6 WHERE id = ?1", [p])
+        .unwrap();
+    let f = add_face(&c, p, "[0.7,0.225,0.1,0.15]");
+    let bob = c.create_tag("People/Bob").unwrap();
+    c.conn()
+        .execute_batch("CREATE TEMP TABLE tags AS SELECT id, full_path, full_path_norm FROM main.tags")
+        .unwrap();
+    assert!(c.auto_tag_refusal(bob).is_err(), "the check errors");
+
+    import_regions(&c, c.conn(), p, &photo_path, "People");
+    c.conn().execute_batch("DROP TABLE temp.tags").unwrap();
+
+    assert_ne!(face_state(&c, f), "confirmed", "a failed check confirmed the face");
+    assert!(!has_tag(&c, p, bob));
+}
+
 /// Assigning to a new person creates the tag under the people root and confirms the face on
 /// it; ignore drops the person; a blank name is refused before anything is created.
 #[test]

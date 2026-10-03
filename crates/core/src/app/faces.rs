@@ -342,9 +342,17 @@ pub fn import_regions(
                 continue;
             }
         };
-        if let Ok(Some(refusal)) = catalog.auto_tag_refusal(tag_id) {
-            eprintln!("faces_import: skipped face {}: {refusal}", m.face_id);
-            continue;
+        // Fail closed: a lookup that errors leaves the face unconfirmed, as a refusal does.
+        match catalog.auto_tag_refusal(tag_id) {
+            Ok(None) => {}
+            Ok(Some(refusal)) => {
+                eprintln!("faces_import: skipped face {}: {refusal}", m.face_id);
+                continue;
+            }
+            Err(e) => {
+                eprintln!("faces_import: auto-tag check for '{tag_path}' failed, face {} left unconfirmed: {e}", m.face_id);
+                continue;
+            }
         }
         if let Err(e) = regions::confirm_imported_face(conn, m.face_id, tag_id) {
             eprintln!("faces_import: confirm face {} failed: {e}", m.face_id);

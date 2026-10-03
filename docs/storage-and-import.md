@@ -286,7 +286,10 @@ hyphenated form (`catalog::is_photo_identity`) belongs to another tool: a DAM as
 which several files may share. A scan or bundle import never adopts it as `photos.uuid` or
 uses it to re-home a row; the file gets its own minted UUID, and the foreign value stays in
 the sidecar as a conflict. Adopt refuses it; Overwrite (after the backup) or Dismiss resolve
-it.
+it. A value spelled as a URI (`urn:uuid:<uuid>`) is foreign for the same reason —
+`is_photo_identity` requires the bare hyphenated form — so a bulk Overwrite replaces it like
+any other single non-UUID value, after the same backup (#222 N2); ChairPhoto itself never
+writes that spelling.
 
 **Non-UUID conflicts can be resolved in bulk** (#150). A DAM-managed library can hold them by
 the thousand — schema v23 queues every re-minted row's copies — so Overwrite and Dismiss
@@ -321,6 +324,13 @@ scanned file must also be the row's size: an offloaded photo has no primary copy
 "gone", and an export or derivative carrying the same DAM id must not take it over, while an
 original is never modified and keeps its size wherever it is moved or restored.
 Otherwise the file is a different photo and gets its own row, as above.
+
+This size guard is a deliberate trade-off (#146), not a loss: a file another tool rewrites in
+place — a DAM or digiKam writing metadata into a JPEG or DNG, changing its byte size — and
+that is then moved before the next scan no longer comes home, because its size no longer
+matches. It gets a new row instead, the pre-#146 duplicate, and nothing is deleted. Only a
+modify-then-move *between* scans hits this: a rescan at the file's unchanged path refreshes
+`photos.size` first, so the guard only ever sees it stale when the file has also moved.
 
 A scan that mints a UUID for a file whose sidecar holds such a foreign value records it the
 same way (#150), so a file catalogued after #141 re-homes under the same guards when it

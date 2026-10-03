@@ -7,6 +7,9 @@ pub(super) const NS_PHOTOSHOP: &str = "http://ns.adobe.com/photoshop/1.0/";
 pub(super) const NS_IPTC: &str = "http://iptc.org/std/Iptc4xmpCore/1.0/xmlns/";
 pub(super) const NS_LR: &str = "http://ns.adobe.com/lightroom/1.0/";
 pub(super) const NS_XMP: &str = "http://ns.adobe.com/xap/1.0/";
+// XMP Basic's qualifier namespace for a qualified `xmp:Identifier` Bag item
+// (`rdf:value` + `xmpidq:Scheme`, say) — the qualifier, never a second identifier value.
+pub(super) const NS_XMPIDQ: &str = "http://ns.adobe.com/xmp/Identifier/qual/1.0/";
 pub(super) const NS_CHAIRPHOTO: &str = "https://chairphoto.local/ns/1.0/";
 pub(super) const NS_EXIF: &str = "http://ns.adobe.com/exif/1.0/";
 // Metadata Working Group region schema (mwg-rs) + the shared structure namespaces it uses.

@@ -1475,21 +1475,31 @@ impl Catalog {
                 // Overwrite replaces EVERY xmp:Identifier value, but `found` is only the
                 // first. In bulk, a sidecar with more than one value — a Bag a DAM appended
                 // to, a second Description — may hold another photo's UUID beside the DAM
-                // id; it is left for a person to look at (#150, review M1).
-                if foreign_only {
-                    let all = crate::xmp::read_identifiers(&target);
-                    if all.len() != 1 || all.iter().any(|v| is_photo_identity(v)) {
-                        return Err(CatalogError::Validation(format!(
-                            "{}'s sidecar carries {} identifier values ({}); a bulk Overwrite \
-                             replaces only a single non-UUID one",
-                            target.display(),
-                            all.len(),
-                            all.join(", ")
-                        )));
-                    }
-                }
-                let backup = crate::xmp::overwrite_identifier(&target, &catalog_uuid)
-                    .map_err(CatalogError::Io)?;
+                // id; it is left for a person to look at (#150, review M1). Checked under
+                // the write's own file lock (#222 N3), not by a separate read beforehand: a
+                // value another tool appends between an unlocked read and the write would
+                // otherwise be destroyed unseen, the precondition having passed against a
+                // snapshot the write never acted on.
+                let backup = if foreign_only {
+                    crate::xmp::overwrite_identifier_checked(&target, &catalog_uuid, |all| {
+                        if all.len() != 1 || all.iter().any(|v| is_photo_identity(v)) {
+                            return Err(format!(
+                                "{}'s sidecar carries {} identifier values ({}); a bulk Overwrite \
+                                 replaces only a single non-UUID one",
+                                target.display(),
+                                all.len(),
+                                all.join(", ")
+                            ));
+                        }
+                        Ok(())
+                    })
+                    .map_err(|e| match e {
+                        crate::xmp::CheckedOverwriteError::Refused(msg) => CatalogError::Validation(msg),
+                        crate::xmp::CheckedOverwriteError::Io(msg) => CatalogError::Io(msg),
+                    })?
+                } else {
+                    crate::xmp::overwrite_identifier(&target, &catalog_uuid).map_err(CatalogError::Io)?
+                };
                 outcome.sidecar_backup = backup.map(|p| p.to_string_lossy().to_string());
                 retry_busy(abort, || {
                     self.record_sidecar_field_target(

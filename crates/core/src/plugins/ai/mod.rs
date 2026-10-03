@@ -400,10 +400,12 @@ pub fn set_state(
 /// Render the taxonomy as a compact list for the prompt: "- Full/Path: description".
 /// When `include_private` is false (a cloud provider), tags marked private (people's
 /// names etc.) are omitted so they never leave the machine. See `Catalog::tag_private`.
+/// Auto-tags are always omitted: the catalog assigns them by rule and refuses them by hand
+/// (#181), so a suggestion of one could never be accepted.
 pub fn taxonomy_text(c: &Catalog, include_private: bool) -> crate::catalog::Result<String> {
     let mut s = String::new();
     for t in c.list_tags_with_counts()? {
-        if !include_private && t.tag.private {
+        if (!include_private && t.tag.private) || t.tag.auto_rule.is_some() {
             continue;
         }
         s.push_str("- ");

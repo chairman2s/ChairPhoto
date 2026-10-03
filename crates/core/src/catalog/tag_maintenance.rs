@@ -501,6 +501,10 @@ pub struct TagSplitReport {
 ///
 /// A photo in `photo_ids` that never carried the source tag is **counted and skipped**, not
 /// tagged: the caller asked to split a tag, not to apply one.
+///
+/// An auto-tag can be neither the source nor the new tag ([`CatalogError::AutoTag`], before
+/// anything is written): a split writes membership by hand, and the auto-tag engine rebuilds
+/// an auto-tag's membership from its rule, so the next pass would silently undo it (#181).
 pub fn split_tag(
     conn: &Connection,
     source_id: i64,
@@ -510,7 +514,10 @@ pub fn split_tag(
     now: i64,
 ) -> Result<TagSplitReport> {
     let source = load_tag(conn, source_id)?;
+    refuse_auto(&source)?;
     let (new_tag_id, created) = ensure_tag_by_path(conn, new_path, now)?;
+    // An existing auto-tag (and so its ancestors) was found, not created: nothing written.
+    refuse_auto(&load_tag(conn, new_tag_id)?)?;
     if new_tag_id == source_id {
         return Err(CatalogError::Tag(
             "the new tag is the tag being split; give the other half a different path".into(),
@@ -559,6 +566,18 @@ pub fn split_tag(
         }
     }
     Ok(report)
+}
+
+/// [`CatalogError::AutoTag`] when `tag` is an auto-tag.
+fn refuse_auto(tag: &TagRow) -> Result<()> {
+    match &tag.auto_rule {
+        Some(rule) => Err(CatalogError::AutoTag(super::AutoTagRefusal {
+            tag_id: tag.id,
+            path: tag.full_path.clone(),
+            rule: rule.clone(),
+        })),
+        None => Ok(()),
+    }
 }
 
 fn tag_full_path(conn: &Connection, tag_id: i64) -> Result<String> {
@@ -1263,6 +1282,33 @@ mod tests {
         let report = split_tag(&c, source, &[1], "Venue", false, 100).unwrap();
         assert!(!report.created_new_tag);
         assert_eq!(report.new_tag_id, existing);
+    }
+
+    /// Review #181 L2: a split writes membership by hand, so an auto-tag is refused as its
+    /// source and as its new tag, before anything is written (no tag created, no photo
+    /// touched).
+    #[test]
+    fn split_refuses_an_auto_tag_on_either_side() {
+        let c = conn();
+        let auto = tag(&c, "Technique/Long Exposure");
+        c.execute("UPDATE tags SET auto_rule = 'long-exposure' WHERE id = ?1", [auto]).unwrap();
+        let plain = tag(&c, "Concert");
+        photo(&c, 1);
+        assign(&c, 1, auto, 10);
+        assign(&c, 1, plain, 10);
+        let tags_before: i64 = c.query_row("SELECT COUNT(*) FROM tags", [], |r| r.get(0)).unwrap();
+
+        let out = split_tag(&c, auto, &[1], "Technique/Slow", false, 100).unwrap_err();
+        assert!(matches!(&out, CatalogError::AutoTag(r) if r.tag_id == auto), "{out:?}");
+        let into = split_tag(&c, plain, &[1], "technique/long exposure", false, 100).unwrap_err();
+        assert!(matches!(&into, CatalogError::AutoTag(r) if r.tag_id == auto), "{into:?}");
+        assert!(into.to_string().contains("is an auto-tag"), "{into}");
+
+        let tags_after: i64 = c.query_row("SELECT COUNT(*) FROM tags", [], |r| r.get(0)).unwrap();
+        assert_eq!(tags_after, tags_before, "no tag created");
+        let mut expected = vec![auto, plain];
+        expected.sort();
+        assert_eq!(tags_on(&c, 1), expected, "no photo touched");
     }
 
     // ── Finders ─────────────────────────────────────────────────────────────────

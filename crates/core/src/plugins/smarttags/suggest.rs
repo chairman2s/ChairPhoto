@@ -215,6 +215,8 @@ pub fn suggest_tags(
 
     // ── 6. Aggregate neighbour tags: path → (score, [source_ids]) ────────────
     // score = sum of cosine similarities across neighbours that carry the tag.
+    // An auto-tag is never suggested: its membership is the rule's, and accepting it by
+    // hand is refused (#181), so the suggestion could never be settled.
     let mut tag_scores: HashMap<String, (f32, Vec<i64>)> = HashMap::new();
 
     for (neighbour_id, sim) in &scored {
@@ -222,7 +224,7 @@ pub fn suggest_tags(
             .prepare(
                 "SELECT t.full_path FROM tags t
                   JOIN photo_tags pt ON pt.tag_id = t.id
-                 WHERE pt.photo_id = ?1",
+                 WHERE pt.photo_id = ?1 AND t.auto_rule IS NULL",
             )
             .map_err(|e| e.to_string())?;
         let paths: Vec<String> = stmt
@@ -693,6 +695,29 @@ mod tests {
             !pending.iter().any(|s| s.path == "Sky/Blue"),
             "own tags must not be re-suggested"
         );
+    }
+
+    // ── auto-tags are never suggested (#181) ──────────────────────────────────
+
+    /// Review #181 M2: a neighbour's auto-tag (here Long Exposure) is not suggested — it
+    /// could never be accepted by hand — while its ordinary tag still is.
+    #[test]
+    fn a_neighbours_auto_tag_is_not_suggested() {
+        let conn = mem_conn();
+        insert_photo(&conn, 1);
+        insert_photo(&conn, 2);
+        insert_tag(&conn, 40, "Technique/Long Exposure", None);
+        conn.execute("UPDATE tags SET auto_rule = 'long-exposure' WHERE id = 40", []).unwrap();
+        insert_tag(&conn, 41, "Nature/Waterfall", None);
+        assign_tag(&conn, 2, 40);
+        assign_tag(&conn, 2, 41);
+        let emb = unit_emb(16, 9);
+        upsert_emb(&conn, 1, &emb);
+        upsert_emb(&conn, 2, &emb);
+
+        assert_eq!(suggest_tags(&conn, 1).unwrap(), 1);
+        let paths: Vec<String> = load_pending_suggestions(&conn, 1).unwrap().into_iter().map(|s| s.path).collect();
+        assert_eq!(paths, ["Nature/Waterfall"]);
     }
 
     // ── far-away neighbour stays below MIN_COSINE and is ignored ─────────────

@@ -132,6 +132,10 @@ fn right_click_menu_row(app: &App, row: &'static str, label: &str, cx: &mut Test
     cx.run_until_parked();
 }
 
+fn leak(s: String) -> &'static str {
+    Box::leak(s.into_boxed_str())
+}
+
 fn select_photo(app: &App, id: i64, cx: &mut TestAppContext) {
     app.wired.shell.update(cx, |s, cx| s.select_with(cx, |l| l.select(id, SelectMods::default())));
     cx.run_until_parked();
@@ -525,6 +529,116 @@ fn the_quick_tags_empty_line_wraps_inside_the_column(cx: &mut TestAppContext) {
     assert!(line.right() <= row.right(), "the line ends inside the row: {line:?} in {row:?}");
     assert!(line.left() >= row.left(), "{line:?} in {row:?}");
     assert!(line.size.height > gpui_kit::px(20.), "the sentence wraps onto a second line: {line:?}");
+}
+
+// --- auto-tags (#181) ---------------------------------------------------------------------
+
+/// An auto-tag is the catalog's to assign: the tagging block never offers it (add box,
+/// nearby, Recently used, a group's buttons), its chip has no ×, typing its path shows the
+/// core's refusal, and paste skips it and says so — the next auto-tag pass loses nothing.
+#[gpui_kit::test]
+fn the_tagging_block_never_assigns_an_auto_tag_by_hand(cx: &mut TestAppContext) {
+    use chairphoto_core::catalog::PromotedMetadata;
+    let dir = TempDir::new("tags-auto");
+    let app = start(cx);
+    let db = dir.0.join("a.chairphoto");
+    let root = dir.0.join("photos");
+    let catalog = Catalog::open(&db, &root).unwrap();
+    let s = seed(&catalog, &root);
+    // Photo 0 is a 30 s exposure, photo 1 a fast one taken a minute later.
+    for (i, shutter) in [(0, "30"), (1, "1/200")] {
+        let meta = PromotedMetadata {
+            shutter_speed: Some(shutter.into()),
+            capture_time: Some(format!("2026-09-01T12:0{i}:00")),
+            ..Default::default()
+        };
+        catalog.set_photo_metadata(s.photos[i], &meta, &[]).unwrap();
+    }
+    catalog.apply_auto_tags().unwrap();
+    let auto = catalog.find_tag_id_by_path("Technique/Long Exposure").unwrap().unwrap();
+    // A catalog from before #181: the auto-tag was once used by hand, and sits in a group.
+    catalog.conn().execute("UPDATE tags SET last_used_at = 1 WHERE id = ?1", [auto]).unwrap();
+    let group = catalog.create_tag_group("Technique").unwrap();
+    catalog.add_tag_to_group(group, auto).unwrap();
+    catalog.add_tag_to_group(group, s.bergen).unwrap();
+    *app.state.catalog.lock().unwrap() = Some(catalog);
+    app.state.send(CoreEvent::CatalogSwitched(db.to_string_lossy().to_string()));
+    cx.run_until_parked();
+
+    // On the long exposure: the chip shows, without a ×.
+    select_photo(&app, s.photos[0], cx);
+    click(&app, "inspector-tab-tags", cx);
+    render(&app, cx);
+    let block = photo_tags(&app, cx);
+    block.read_with(cx, |b, _| assert!(b.assigned.iter().any(|t| t.id == auto), "the auto-tag chip shows"));
+    let remove_auto = leak(format!("photo-tag-remove-{auto}"));
+    let remove_bergen = leak(format!("photo-tag-remove-{}", s.bergen));
+    cx.update_window(app.window(), |_, window, cx| {
+        window.render_frame(cx);
+        assert!(window.try_find(remove_auto).is_none(), "an auto-tag chip has no ×");
+        assert!(window.try_find(remove_bergen).is_some(), "an ordinary chip keeps its ×");
+    })
+    .unwrap();
+
+    // On the fast exposure: nothing offers the auto-tag.
+    select_photo(&app, s.photos[1], cx);
+    let input = block.read_with(cx, |b, _| b.input.clone());
+    set_input(&app, &input, "exposure", cx);
+    assert!(cx.update(|cx| block.read(cx).suggestions(cx)).is_empty(), "the add box doesn't suggest it");
+    block.read_with(cx, |b, _| {
+        assert!(b.nearby.iter().any(|t| t.tag.id == s.bergen), "the neighbour's ordinary tag is offered");
+        assert!(b.nearby.iter().all(|t| t.tag.id != auto), "nearby doesn't offer it");
+        assert!(b.members.iter().all(|t| t.id != auto), "Recently used doesn't offer it");
+    });
+    click(&app, leak(format!("quick-group-{group}")), cx);
+    block.read_with(cx, |b, _| {
+        assert_eq!(b.members.iter().map(|t| t.id).collect::<Vec<_>>(), [s.bergen], "the group's auto-tag has no button")
+    });
+
+    // Typing its path: the core refuses, and says why.
+    set_input(&app, &input, "Technique/Long Exposure", cx);
+    press_in(&app, &input, "enter", cx);
+    assert!(status(&app, cx).contains("is an auto-tag"), "{}", status(&app, cx));
+    let fast_has_auto = || with_catalog(&app, |c| c.get_photo_tags(s.photos[1]).unwrap().iter().any(|t| t.id == auto));
+    assert!(!fast_has_auto());
+
+    // Copy from the long exposure, paste onto the fast one: Bergen lands, the auto-tag is skipped.
+    select_photo(&app, s.photos[0], cx);
+    click(&app, "photo-tags-copy", cx);
+    select_photo(&app, s.photos[1], cx);
+    click(&app, "photo-tags-paste", cx);
+    assert_eq!(status(&app, cx), "Pasted 1 tag(s) onto 1 photo(s); skipped auto-tag Technique/Long Exposure");
+    assert!(with_catalog(&app, |c| c.get_photo_tags(s.photos[1]).unwrap().iter().any(|t| t.id == s.bergen)));
+
+    with_catalog(&app, |c| c.apply_auto_tags().unwrap());
+    assert!(!fast_has_auto(), "the next pass has nothing of the user's to drop");
+}
+
+/// Review #181 nit: the groups manager doesn't take an auto-tag as a member — a group's
+/// buttons assign by hand — and says why.
+#[gpui_kit::test]
+fn the_groups_manager_refuses_an_auto_tag(cx: &mut TestAppContext) {
+    let dir = TempDir::new("tags-groups-auto");
+    let app = start(cx);
+    let s = open_tagged(&app, &dir, "a", cx);
+    with_catalog(&app, |c| {
+        let auto = c.create_tag("Technique/Long Exposure").unwrap();
+        c.conn().execute("UPDATE tags SET auto_rule = 'long-exposure' WHERE id = ?1", [auto]).unwrap();
+    });
+    select_photo(&app, s.photos[2], cx);
+    click(&app, "inspector-tab-tags", cx);
+    click(&app, "quick-groups-manage", cx);
+    let TagDialog::Groups(manager) = last_dialog(&app, cx) else { panic!("the groups manager") };
+    let manager = up(manager);
+    let (new_group, new_member) = manager.read_with(cx, |m, _| (m.new_group.clone(), m.new_member.clone()));
+    set_input(&app, &new_group, "Technique", cx);
+    press_in(&app, &new_group, "enter", cx);
+    set_input(&app, &new_member, "Technique/Long Exposure", cx);
+    press_in(&app, &new_member, "enter", cx);
+    manager.read_with(cx, |m, _| {
+        assert!(m.members.is_empty(), "{:?}", m.members);
+        assert!(m.error.as_deref().is_some_and(|e| e.contains("is an auto-tag")), "{:?}", m.error);
+    });
 }
 
 // --- catalog switches ---------------------------------------------------------------------

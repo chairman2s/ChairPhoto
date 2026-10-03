@@ -31,7 +31,7 @@
 use crate::model::{AppModel, AppModelEvent};
 use crate::storage::CloseDialog;
 use chairphoto_core::app::{with_catalog, with_catalog_as, with_catalog_identified, AppState, CatalogIdentity, CoreEvent, CATALOG_CHANGED};
-use chairphoto_core::catalog::{Catalog, TagWithCount};
+use chairphoto_core::catalog::{Catalog, TagBatchOutcome, TagWithCount};
 use chairphoto_model::tag_tree::TagIndex;
 use gpui_kit::{App, Context, Entity, EventEmitter, Subscription, WeakEntity};
 use std::cell::Cell;
@@ -249,16 +249,24 @@ impl TagsState {
         });
     }
 
-    /// Assign a tag to every target photo (the selection, else the active photo).
+    /// Assign a tag to every target photo (the selection, else the active photo). An auto-tag
+    /// is refused by the core (#181); its message goes to the status line.
     pub fn assign(&mut self, targets: Vec<i64>, tag_id: i64, cx: &mut Context<Self>) {
         if targets.is_empty() {
             return;
         }
-        self.run(cx, move |c| targets.iter().try_for_each(|&p| c.assign_tag(p, tag_id)), |s, r, cx| {
-            if let Err(e) = r {
-                s.set_status(format!("Could not tag: {e}"), cx);
-            }
+        self.run(cx, move |c| c.assign_tags(&targets, &[tag_id]), |s, r, cx| match r {
+            Ok(out) => s.report_skipped(&out, cx),
+            Err(e) => s.set_status(format!("Could not tag: {e}"), cx),
         });
+    }
+
+    /// The status for a batch write that skipped auto-tags (#181): the core's refusal for
+    /// one, a count for several. Nothing when none was skipped.
+    fn report_skipped(&mut self, out: &TagBatchOutcome, cx: &mut Context<Self>) {
+        if let Some(line) = skipped_line(out) {
+            self.set_status(line, cx);
+        }
     }
 
     /// Create the tag at `path` (`create_tag` returns the existing id when it already exists)
@@ -272,12 +280,11 @@ impl TagsState {
             cx,
             move |c| {
                 let tag_id = c.create_tag(&path)?;
-                targets.iter().try_for_each(|&p| c.assign_tag(p, tag_id))
+                c.assign_tags(&targets, &[tag_id])
             },
-            |s, r, cx| {
-                if let Err(e) = r {
-                    s.set_status(format!("Could not tag: {e}"), cx);
-                }
+            |s, r, cx| match r {
+                Ok(out) => s.report_skipped(&out, cx),
+                Err(e) => s.set_status(format!("Could not tag: {e}"), cx),
             },
         );
     }
@@ -288,10 +295,9 @@ impl TagsState {
         if targets.is_empty() {
             return;
         }
-        self.run(cx, move |c| targets.iter().try_for_each(|&p| c.remove_tag(p, tag_id)), |s, r, cx| {
-            if let Err(e) = r {
-                s.set_status(format!("Could not remove the tag: {e}"), cx);
-            }
+        self.run(cx, move |c| c.remove_tags(&targets, &[tag_id]), |s, r, cx| match r {
+            Ok(out) => s.report_skipped(&out, cx),
+            Err(e) => s.set_status(format!("Could not remove the tag: {e}"), cx),
         });
     }
 
@@ -313,23 +319,38 @@ impl TagsState {
         if clipboard.is_empty() || targets.is_empty() {
             return;
         }
-        let line = format!("Pasted {} tag(s) onto {} photo(s)", clipboard.len(), targets.len());
+        let n_targets = targets.len();
+        // Auto-tags copied from a photo are skipped, not pasted (#181), and counted.
         self.run(
             cx,
-            move |c| {
-                for &p in &targets {
-                    for &t in &clipboard {
-                        c.assign_tag(p, t)?;
-                    }
-                }
-                Ok(())
-            },
+            move |c| c.assign_tags(&targets, &clipboard),
             move |s, r, cx| match r {
-                Ok(()) => s.set_status(line, cx),
+                Ok(out) => s.set_status(paste_line(&out, n_targets), cx),
                 Err(e) => s.set_status(format!("Could not paste tags: {e}"), cx),
             },
         );
     }
+}
+
+/// The status for a batch tag write's skipped auto-tags: the core's refusal when there is
+/// one, a count when there are several, `None` when nothing was skipped.
+pub fn skipped_line(out: &TagBatchOutcome) -> Option<String> {
+    match out.skipped.as_slice() {
+        [] => None,
+        [one] => Some(one.to_string()),
+        many => Some(format!("Skipped {} auto-tags: the catalog assigns them, not by hand", many.len())),
+    }
+}
+
+/// Paste's status: what was pasted, and the auto-tags it skipped.
+pub fn paste_line(out: &TagBatchOutcome, n_targets: usize) -> String {
+    let mut line = format!("Pasted {} tag(s) onto {} photo(s)", out.tags_written, n_targets);
+    match out.skipped.len() {
+        0 => {}
+        1 => line.push_str(&format!("; skipped auto-tag {}", out.skipped[0].path)),
+        n => line.push_str(&format!("; skipped {n} auto-tags")),
+    }
+    line
 }
 
 /// [`run`] under a guard the caller took earlier — a dialog's, from when it opened over the

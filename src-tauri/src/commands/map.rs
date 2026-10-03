@@ -85,7 +85,9 @@ pub async fn apply_fence(
 }
 
 /// Apply all fences to all photos. Returns the total number of new tag assignments
-/// created across every fence. Idempotent.
+/// created across every fence. Idempotent. A fence on an auto-tag's path is skipped and
+/// the rest applied (#181); React, frozen until #165, keeps its count-only contract, so
+/// the skipped fences are not reported here (the GPUI status line names them).
 #[cfg(feature = "map")]
 #[tauri::command]
 pub async fn apply_all_fences(
@@ -93,7 +95,7 @@ pub async fn apply_all_fences(
 ) -> Result<usize, String> {
     with_catalog_blocking(&state, move |c| {
         crate::plugins::map::ensure_schema(c.conn())?;
-        crate::plugins::map::apply_all_fences(c)
+        crate::plugins::map::apply_all_fences(c).map(|out| out.tagged)
     })
     .await
 }

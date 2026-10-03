@@ -810,8 +810,13 @@ export default function App() {
 
   // Assign a tag to the whole current selection (or the active photo) — used by the
   // quick-tag bar.
+  // An auto-tag is refused by the core before anything is written (#181): show why.
   const assignToSelection = async (tagId: number) => {
-    for (const id of selection.targets) await assignTag(id, tagId);
+    try {
+      for (const id of selection.targets) await assignTag(id, tagId);
+    } catch (e) {
+      setStatus(`Could not tag: ${e}`);
+    }
     await refresh();
     setGroupsKey((k) => k + 1); // refresh the quick-tag bar's "Recently used" group
   };
@@ -820,7 +825,11 @@ export default function App() {
   // tag list shows the active photo's tags, but the remove action applies to every
   // selected photo so multi-select edits don't silently hit only the active one.
   const removeFromSelection = async (tagId: number) => {
-    for (const id of selection.targets) await removeTag(id, tagId);
+    try {
+      for (const id of selection.targets) await removeTag(id, tagId);
+    } catch (e) {
+      setStatus(`Could not remove the tag: ${e}`);
+    }
     await refresh();
     setGroupsKey((k) => k + 1);
   };
@@ -837,10 +846,23 @@ export default function App() {
     if (tagClipboard.length === 0) return;
     const targets = selection.targets;
     if (targets.length === 0) return;
-    for (const id of targets) for (const tagId of tagClipboard) await assignTag(id, tagId);
+    // The core refuses an auto-tag (#181) before writing it: skip that tag, paste the rest.
+    let skipped = 0;
+    for (const tagId of tagClipboard) {
+      try {
+        for (const id of targets) await assignTag(id, tagId);
+      } catch (e) {
+        if (!String(e).includes("is an auto-tag")) throw e;
+        skipped += 1;
+      }
+    }
     await refresh();
     setGroupsKey((k) => k + 1);
-    setStatus(`Pasted ${tagClipboard.length} tag(s) onto ${targets.length} photo(s)`);
+    const pasted = tagClipboard.length - skipped;
+    setStatus(
+      `Pasted ${pasted} tag(s) onto ${targets.length} photo(s)` +
+        (skipped ? `; skipped ${skipped} (auto-tags can't be added by hand)` : ""),
+    );
   };
 
   // Let modules (e.g. AI tagging) ask the app to refresh after they change data.

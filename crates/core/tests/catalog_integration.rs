@@ -5220,8 +5220,9 @@ fn map_apply_all_fences_covers_every_fence() {
     // One photo outside both.
     insert_photo_with_gps(&catalog, &root, "outside.jpg", 50.0, 50.0);
 
-    let total = map::apply_all_fences(&catalog).unwrap();
-    assert_eq!(total, 2, "one assignment per region (two total)");
+    let out = map::apply_all_fences(&catalog).unwrap();
+    assert_eq!(out.tagged, 2, "one assignment per region (two total)");
+    assert_eq!((out.applied, out.skipped.len()), (2, 0));
 }
 
 /// map_photo_points returns only photos with both GPS columns set.
@@ -5299,6 +5300,55 @@ fn map_apply_fences_to_photo_import_hook() {
     let count2 = map::apply_fences_to_photo(&catalog, outside_id).unwrap();
     assert_eq!(count2, 0, "zero fences matched");
     assert!(catalog.get_photo_tags(outside_id).unwrap().is_empty());
+}
+
+/// A fence on an auto-tag's path can't tag by hand (#181): applying it is refused before any
+/// photo, and the import hook skips it and still applies the photo's other fences.
+#[cfg(feature = "map")]
+#[test]
+fn map_fences_on_an_auto_tag_path_are_refused_or_skipped() {
+    use chairphoto_core::catalog::CatalogError;
+    use chairphoto_core::plugins::map;
+
+    let (catalog, root) = temp_catalog("map_auto_tag");
+    map::ensure_schema_for(&catalog).unwrap();
+    let auto = catalog.create_tag("Technique/Panorama").unwrap();
+    catalog.conn().execute("UPDATE tags SET auto_rule = 'panorama' WHERE id = ?1", [auto]).unwrap();
+    let auto_fence = unit_square_fence(&catalog, "Technique/Panorama");
+    unit_square_fence(&catalog, "Places/Hook");
+    let inside_id = insert_photo_with_gps(&catalog, &root, "in.jpg", 0.5, 0.5);
+
+    assert!(matches!(map::apply_fence(&catalog, auto_fence), Err(CatalogError::AutoTag(_))));
+    assert!(catalog.get_photo_tags(inside_id).unwrap().is_empty());
+
+    assert_eq!(map::apply_fences_to_photo(&catalog, inside_id).unwrap(), 1, "the place fence only");
+    let paths: Vec<String> = catalog.get_photo_tags(inside_id).unwrap().into_iter().map(|t| t.full_path).collect();
+    assert_eq!(paths, vec!["Places/Hook".to_string()]);
+}
+
+/// Review #181 M1: Apply all with an auto-tag fence between two place fences skips the auto
+/// one, still applies both others — whatever order the fences come in — and reports the
+/// applied and skipped fences, instead of stopping part-way with an error.
+#[cfg(feature = "map")]
+#[test]
+fn map_apply_all_fences_skips_an_auto_tag_fence_and_applies_the_rest() {
+    use chairphoto_core::plugins::map;
+
+    let (catalog, root) = temp_catalog("map_apply_all_auto");
+    map::ensure_schema_for(&catalog).unwrap();
+    let auto = catalog.create_tag("Technique/Panorama").unwrap();
+    catalog.conn().execute("UPDATE tags SET auto_rule = 'panorama' WHERE id = ?1", [auto]).unwrap();
+    let poly = vec![(0.0_f64, 0.0_f64), (0.0, 1.0), (1.0, 1.0), (1.0, 0.0)];
+    map::create_fence_for(&catalog, "A", "Places/A", &poly).unwrap();
+    map::create_fence_for(&catalog, "Pano", "Technique/Panorama", &poly).unwrap();
+    map::create_fence_for(&catalog, "C", "Places/C", &poly).unwrap();
+    let inside_id = insert_photo_with_gps(&catalog, &root, "in.jpg", 0.5, 0.5);
+
+    let out = map::apply_all_fences(&catalog).unwrap();
+    assert_eq!(out, map::FencesApplied { tagged: 2, applied: 2, skipped: vec!["Pano".to_string()] });
+    let mut paths: Vec<String> = catalog.get_photo_tags(inside_id).unwrap().into_iter().map(|t| t.full_path).collect();
+    paths.sort();
+    assert_eq!(paths, vec!["Places/A".to_string(), "Places/C".to_string()], "both place fences, not the auto-tag");
 }
 
 /// apply_fences_to_photo on a photo without GPS returns 0 without error.

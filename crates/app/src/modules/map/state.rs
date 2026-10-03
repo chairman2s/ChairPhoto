@@ -540,7 +540,8 @@ impl MapState {
                 with_catalog_as(app, from, |c| {
                     backend::ensure_schema_for(c)?;
                     match fence {
-                        Some(id) => backend::apply_fence(c, id),
+                        Some(id) => backend::apply_fence(c, id)
+                            .map(|tagged| backend::FencesApplied { tagged, applied: 1, skipped: Vec::new() }),
                         None => backend::apply_all_fences(c),
                     }
                 })
@@ -548,13 +549,8 @@ impl MapState {
             move |s, r, cx| {
                 s.applying = None;
                 match r {
-                    Ok(n) => {
-                        let photos = if n == 1 { "1 photo".to_string() } else { format!("{n} photos") };
-                        let line = match &name {
-                            Some(name) => format!("Applied \u{201c}{name}\u{201d}: {photos} newly tagged."),
-                            None => format!("Applied all fences: {photos} newly tagged."),
-                        };
-                        s.status(line, cx);
+                    Ok(out) => {
+                        s.status(apply_status(name.as_deref(), &out), cx);
                         s.catalog_changed(cx);
                     }
                     Err(e) => s.status(format!("Failed to apply fence: {e}"), cx),
@@ -672,6 +668,28 @@ impl MapState {
         self.geocode = GeocodeRun { status: line.clone(), ..Default::default() };
         self.status(line, cx);
         cx.notify();
+    }
+}
+
+/// The status line for an apply: one fence by `name`, or all of them. Apply all says how
+/// many fences it applied and names any it skipped because their tag is an auto-tag (#181),
+/// which the catalog assigns by rule and no fence can.
+fn apply_status(name: Option<&str>, out: &backend::FencesApplied) -> String {
+    let n = out.tagged;
+    let photos = if n == 1 { "1 photo".to_string() } else { format!("{n} photos") };
+    match name {
+        Some(name) => format!("Applied \u{201c}{name}\u{201d}: {photos} newly tagged."),
+        None if out.skipped.is_empty() => format!("Applied all fences: {photos} newly tagged."),
+        None => {
+            let total = out.applied + out.skipped.len();
+            let names: Vec<String> = out.skipped.iter().map(|f| format!("\u{201c}{f}\u{201d}")).collect();
+            format!(
+                "Applied {} of {total} fences: {photos} newly tagged. Skipped {} \u{2014} an auto-tag \
+                 can't be assigned by a fence.",
+                out.applied,
+                names.join(", ")
+            )
+        }
     }
 }
 
